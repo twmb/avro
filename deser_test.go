@@ -2652,7 +2652,7 @@ func TestUnsafeDeserializeIntErrors(t *testing.T) {
 			t.Fatalf("udInt(%v) returned nil", k)
 		}
 		var buf [8]byte
-		_, err := fn([]byte{}, unsafe.Pointer(&buf[0]))
+		_, err := fn([]byte{}, unsafe.Pointer(&buf[0]), &slab{})
 		if err == nil {
 			t.Fatalf("udInt(%v) with empty input should error", k)
 		}
@@ -2672,7 +2672,7 @@ func TestUnsafeDeserializeLongErrors(t *testing.T) {
 			t.Fatalf("udLong(%v) returned nil", k)
 		}
 		var buf [8]byte
-		_, err := fn([]byte{}, unsafe.Pointer(&buf[0]))
+		_, err := fn([]byte{}, unsafe.Pointer(&buf[0]), &slab{})
 		if err == nil {
 			t.Fatalf("udLong(%v) with empty input should error", k)
 		}
@@ -2688,7 +2688,7 @@ func TestUnsafeDeserializeFloatErrors(t *testing.T) {
 			t.Fatalf("udFloat(%v) returned nil", k)
 		}
 		var buf [8]byte
-		_, err := fn([]byte{}, unsafe.Pointer(&buf[0]))
+		_, err := fn([]byte{}, unsafe.Pointer(&buf[0]), &slab{})
 		if err == nil {
 			t.Fatalf("udFloat(%v) with empty input should error", k)
 		}
@@ -2699,7 +2699,7 @@ func TestUnsafeDeserializeFloatErrors(t *testing.T) {
 			t.Fatalf("udDouble(%v) returned nil", k)
 		}
 		var buf [8]byte
-		_, err := fn([]byte{}, unsafe.Pointer(&buf[0]))
+		_, err := fn([]byte{}, unsafe.Pointer(&buf[0]), &slab{})
 		if err == nil {
 			t.Fatalf("udDouble(%v) with empty input should error", k)
 		}
@@ -2730,13 +2730,13 @@ func TestUnsafeBytesDeserErrors(t *testing.T) {
 	var buf [24]byte
 
 	// Truncated input: readVarlong fails.
-	_, err := fn([]byte{}, unsafe.Pointer(&buf[0]))
+	_, err := fn([]byte{}, unsafe.Pointer(&buf[0]), &slab{})
 	if err == nil {
 		t.Fatal("expected error for truncated input")
 	}
 
 	// Negative length: unsigned varint 1 → zigzag-decoded = -1.
-	_, err = fn([]byte{0x01}, unsafe.Pointer(&buf[0]))
+	_, err = fn([]byte{0x01}, unsafe.Pointer(&buf[0]), &slab{})
 	if err == nil {
 		t.Fatal("expected error for negative bytes length")
 	}

@@ -15,7 +15,7 @@ import (
 type userfn func(dst []byte, p unsafe.Pointer) ([]byte, error)
 
 // udeserfn deserializes from src into the value at p.
-type udeserfn func(src []byte, p unsafe.Pointer) ([]byte, error)
+type udeserfn func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error)
 
 type fastRecordSer struct {
 	typ     reflect.Type
@@ -156,15 +156,15 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value) ([]byte, er
 	return dst, nil
 }
 
-func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value) ([]byte, error) {
+func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *slab) ([]byte, error) {
 	base := v.Addr().UnsafePointer()
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]
 		if f.deser != nil {
-			src, err = f.deser(src, unsafe.Add(base, f.offset))
+			src, err = f.deser(src, unsafe.Add(base, f.offset), sl)
 		} else {
-			src, err = f.slowFn(src, fieldByIndex(v, f.slowIdx))
+			src, err = f.slowFn(src, fieldByIndex(v, f.slowIdx), sl)
 		}
 		if err != nil {
 			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
@@ -188,11 +188,11 @@ func serRecordFastPtr(dst []byte, fast *fastRecordSer, base unsafe.Pointer) ([]b
 }
 
 // deserRecordFastPtr deserializes a record when all fields have unsafe deser fns.
-func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer) ([]byte, error) {
+func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, sl *slab) ([]byte, error) {
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]
-		src, err = f.deser(src, unsafe.Add(base, f.offset))
+		src, err = f.deser(src, unsafe.Add(base, f.offset), sl)
 		if err != nil {
 			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
 		}
@@ -393,11 +393,11 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 			return nil
 		}
 		rec := f.meta.deserRecord
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			if fast := rec.fast.Load(); fast != nil && fast.typ == goType && fast.allFast {
-				return deserRecordFastPtr(src, fast, p)
+				return deserRecordFastPtr(src, fast, p, sl)
 			}
-			return rec.deser(src, reflect.NewAt(goType, p).Elem())
+			return rec.deser(src, reflect.NewAt(goType, p).Elem(), sl)
 		}
 	}
 
@@ -539,7 +539,7 @@ func usTimeMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	return appendVarlong(dst, d.Microseconds()), nil
 }
 
-func udTimestampMillis(src []byte, p unsafe.Pointer) ([]byte, error) {
+func udTimestampMillis(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -548,7 +548,7 @@ func udTimestampMillis(src []byte, p unsafe.Pointer) ([]byte, error) {
 	return src, nil
 }
 
-func udTimestampMicros(src []byte, p unsafe.Pointer) ([]byte, error) {
+func udTimestampMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -557,7 +557,7 @@ func udTimestampMicros(src []byte, p unsafe.Pointer) ([]byte, error) {
 	return src, nil
 }
 
-func udDate(src []byte, p unsafe.Pointer) ([]byte, error) {
+func udDate(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -566,7 +566,7 @@ func udDate(src []byte, p unsafe.Pointer) ([]byte, error) {
 	return src, nil
 }
 
-func udTimeMillis(src []byte, p unsafe.Pointer) ([]byte, error) {
+func udTimeMillis(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -575,7 +575,7 @@ func udTimeMillis(src []byte, p unsafe.Pointer) ([]byte, error) {
 	return src, nil
 }
 
-func udTimeMicros(src []byte, p unsafe.Pointer) ([]byte, error) {
+func udTimeMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -592,7 +592,7 @@ func usDuration(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	return dst, nil
 }
 
-func udDuration(src []byte, p unsafe.Pointer) ([]byte, error) {
+func udDuration(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if len(src) < 12 {
 		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
 	}
@@ -756,7 +756,7 @@ func usBytes(dst []byte, p unsafe.Pointer) ([]byte, error) {
 // stores trigger GC write barriers automatically. All decoded values are
 // freshly allocated copies; no aliasing of src.
 
-func udBool(src []byte, p unsafe.Pointer) ([]byte, error) {
+func udBool(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if len(src) < 1 {
 		return nil, &ShortBufferError{Type: "boolean"}
 	}
@@ -767,7 +767,7 @@ func udBool(src []byte, p unsafe.Pointer) ([]byte, error) {
 func udInt(k reflect.Kind) udeserfn {
 	switch k {
 	case reflect.Int:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -776,7 +776,7 @@ func udInt(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Int8:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -785,7 +785,7 @@ func udInt(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Int16:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -794,7 +794,7 @@ func udInt(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Int32:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -803,7 +803,7 @@ func udInt(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Int64:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -812,7 +812,7 @@ func udInt(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -821,7 +821,7 @@ func udInt(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint8:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -830,7 +830,7 @@ func udInt(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint16:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -839,7 +839,7 @@ func udInt(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint32:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -848,7 +848,7 @@ func udInt(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint64:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarint(src)
 			if err != nil {
 				return nil, err
@@ -864,7 +864,7 @@ func udInt(k reflect.Kind) udeserfn {
 func udLong(k reflect.Kind) udeserfn {
 	switch k {
 	case reflect.Int:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -873,7 +873,7 @@ func udLong(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Int8:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -882,7 +882,7 @@ func udLong(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Int16:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -891,7 +891,7 @@ func udLong(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Int32:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -900,7 +900,7 @@ func udLong(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Int64:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -909,7 +909,7 @@ func udLong(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -918,7 +918,7 @@ func udLong(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint8:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -927,7 +927,7 @@ func udLong(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint16:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -936,7 +936,7 @@ func udLong(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint32:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -945,7 +945,7 @@ func udLong(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Uint64:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			v, src, err := readVarlong(src)
 			if err != nil {
 				return nil, err
@@ -961,7 +961,7 @@ func udLong(k reflect.Kind) udeserfn {
 func udFloat(k reflect.Kind) udeserfn {
 	switch k {
 	case reflect.Float32:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			u, src, err := readUint32(src)
 			if err != nil {
 				return nil, err
@@ -970,7 +970,7 @@ func udFloat(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Float64:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			u, src, err := readUint32(src)
 			if err != nil {
 				return nil, err
@@ -986,7 +986,7 @@ func udFloat(k reflect.Kind) udeserfn {
 func udDouble(k reflect.Kind) udeserfn {
 	switch k {
 	case reflect.Float32:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			u, src, err := readUint64(src)
 			if err != nil {
 				return nil, err
@@ -995,7 +995,7 @@ func udDouble(k reflect.Kind) udeserfn {
 			return src, nil
 		}
 	case reflect.Float64:
-		return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			u, src, err := readUint64(src)
 			if err != nil {
 				return nil, err
@@ -1011,7 +1011,7 @@ func udDouble(k reflect.Kind) udeserfn {
 // udStringDeser writes the string directly via typed pointer store.
 // *(*string)(p) = s triggers GC write barriers automatically.
 // string(src[:n]) always copies, so the decoded string owns its memory.
-func udStringDeser(src []byte, p unsafe.Pointer) ([]byte, error) {
+func udStringDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	length, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -1023,14 +1023,14 @@ func udStringDeser(src []byte, p unsafe.Pointer) ([]byte, error) {
 	if len(src) < n {
 		return nil, &ShortBufferError{Type: "string", Need: n, Have: len(src)}
 	}
-	*(*string)(p) = string(src[:n])
+	*(*string)(p) = sl.string(src, n)
 	return src[n:], nil
 }
 
 // udBytesDeser writes the byte slice directly via typed pointer store.
 // *(*[]byte)(p) = b triggers GC write barriers automatically.
 // make+copy ensures the decoded slice owns its memory.
-func udBytesDeser(src []byte, p unsafe.Pointer) ([]byte, error) {
+func udBytesDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	length, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -1078,7 +1078,7 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
 
 // udNullUnionPtr handles null-union deser for *T where T has a primitive unsafe deserializer.
 func udNullUnionPtr(inner udeserfn, innerType reflect.Type) udeserfn {
-	return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "union index"}
 		}
@@ -1093,7 +1093,7 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type) udeserfn {
 				pp = v.UnsafePointer()
 				*(*unsafe.Pointer)(p) = pp
 			}
-			return inner(src[1:], pp)
+			return inner(src[1:], pp, sl)
 		default:
 			return nil, fmt.Errorf("invalid null-union index byte 0x%02x", src[0])
 		}
@@ -1102,7 +1102,7 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type) udeserfn {
 
 // udNullUnionRecord handles null-union deser for *T where T is a record.
 func udNullUnionRecord(rec *deserRecord, innerType reflect.Type) udeserfn {
-	return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "union index"}
 		}
@@ -1118,9 +1118,9 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type) udeserfn {
 				*(*unsafe.Pointer)(p) = pp
 			}
 			if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
-				return deserRecordFastPtr(src[1:], fast, pp)
+				return deserRecordFastPtr(src[1:], fast, pp, sl)
 			}
-			return rec.deser(src[1:], reflect.NewAt(innerType, pp).Elem())
+			return rec.deser(src[1:], reflect.NewAt(innerType, pp).Elem(), sl)
 		default:
 			return nil, fmt.Errorf("invalid null-union index byte 0x%02x", src[0])
 		}
@@ -1264,7 +1264,7 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 // Uses reflect for slice management, unsafe for per-element record deser.
 func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udeserfn {
 	innerSize := innerType.Size()
-	return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		v := reflect.NewAt(sliceType, p).Elem()
 		v.SetLen(0)
 		var err error
@@ -1321,9 +1321,9 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 			for i := 0; i < n; i++ {
 				elemP := s[start+i]
 				if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
-					src, err = deserRecordFastPtr(src, fast, elemP)
+					src, err = deserRecordFastPtr(src, fast, elemP, sl)
 				} else {
-					src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem())
+					src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)
 				}
 				if err != nil {
 					return nil, err
@@ -1336,7 +1336,7 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 // udArrayDirect handles array deser for []T where items are primitives.
 // Uses reflect for slice management, unsafe for per-element deser.
 func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type) udeserfn {
-	return func(src []byte, p unsafe.Pointer) ([]byte, error) {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		v := reflect.NewAt(sliceType, p).Elem()
 		v.SetLen(0)
 		var err error
@@ -1373,7 +1373,7 @@ func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type) ude
 			bs := *(*[]byte)(p)
 			data := unsafe.Pointer(unsafe.SliceData(bs))
 			for i := start; i < newLen; i++ {
-				src, err = inner(src, unsafe.Add(data, uintptr(i)*elemSize))
+				src, err = inner(src, unsafe.Add(data, uintptr(i)*elemSize), sl)
 				if err != nil {
 					return nil, err
 				}

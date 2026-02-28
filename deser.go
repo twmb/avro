@@ -10,18 +10,40 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
-type deserfn func(src []byte, v reflect.Value) ([]byte, error)
+type deserfn func(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 
 var anyType = reflect.TypeOf((*any)(nil)).Elem()
+
+// slab batches small string allocations into a single backing buffer.
+// Strings are immutable so sharing backing memory is safe.
+type slab struct{ buf []byte }
+
+const slabSize = 1024
+
+func (s *slab) string(src []byte, n int) string {
+	if len(s.buf) < n {
+		s.buf = make([]byte, max(slabSize, n))
+	}
+	b := s.buf[:n:n]
+	copy(b, src[:n])
+	s.buf = s.buf[n:]
+	return unsafe.String(unsafe.SliceData(b), n)
+}
+
+var slabPool = sync.Pool{New: func() any { return &slab{} }}
 
 func (s *Schema) Decode(src []byte, v interface{}) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, errors.New("decode requires a non-nil pointer")
 	}
-	return s.deser(src, rv.Elem())
+	sl := slabPool.Get().(*slab)
+	rest, err := s.deser(src, rv.Elem(), sl)
+	slabPool.Put(sl)
+	return rest, err
 }
 
 ///////////
@@ -32,7 +54,7 @@ type deserUnion struct {
 	fns []deserfn
 }
 
-func (s *deserUnion) deser(src []byte, v reflect.Value) ([]byte, error) {
+func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	idx, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -40,11 +62,11 @@ func (s *deserUnion) deser(src []byte, v reflect.Value) ([]byte, error) {
 	if idx < 0 || int(idx) >= len(s.fns) {
 		return nil, fmt.Errorf("union index %d out of range [0, %d)", idx, len(s.fns))
 	}
-	return s.fns[idx](src, v)
+	return s.fns[idx](src, v, sl)
 }
 
 func deserNullUnion(u *deserUnion) deserfn {
-	return func(src []byte, v reflect.Value) ([]byte, error) {
+	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "union index"}
 		}
@@ -60,9 +82,9 @@ func deserNullUnion(u *deserUnion) deserfn {
 				if v.IsNil() {
 					v.Set(reflect.New(v.Type().Elem()))
 				}
-				return u.fns[1](src[1:], v.Elem())
+				return u.fns[1](src[1:], v.Elem(), sl)
 			}
-			return u.fns[1](src[1:], v)
+			return u.fns[1](src[1:], v, sl)
 		default:
 			return nil, fmt.Errorf("invalid null-union index byte 0x%02x", src[0])
 		}
@@ -84,7 +106,7 @@ var deserPrimitive = map[string]deserfn{
 	"string":  deserString,
 }
 
-func deserNull(src []byte, v reflect.Value) ([]byte, error) {
+func deserNull(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	switch v.Kind() {
 	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
 		v.Set(reflect.Zero(v.Type()))
@@ -92,7 +114,7 @@ func deserNull(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserBoolean(src []byte, v reflect.Value) ([]byte, error) {
+func deserBoolean(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if len(src) < 1 {
 		return nil, &ShortBufferError{Type: "boolean"}
 	}
@@ -109,7 +131,7 @@ func deserBoolean(src []byte, v reflect.Value) ([]byte, error) {
 	return src[1:], nil
 }
 
-func deserInt(src []byte, v reflect.Value) ([]byte, error) {
+func deserInt(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -129,7 +151,7 @@ func deserInt(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserLong(src []byte, v reflect.Value) ([]byte, error) {
+func deserLong(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -149,7 +171,7 @@ func deserLong(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserFloat(src []byte, v reflect.Value) ([]byte, error) {
+func deserFloat(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	u, src, err := readUint32(src)
 	if err != nil {
 		return nil, err
@@ -167,7 +189,7 @@ func deserFloat(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserDouble(src []byte, v reflect.Value) ([]byte, error) {
+func deserDouble(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	u, src, err := readUint64(src)
 	if err != nil {
 		return nil, err
@@ -185,7 +207,7 @@ func deserDouble(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserBytes(src []byte, v reflect.Value) ([]byte, error) {
+func deserBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	length, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -224,7 +246,7 @@ func deserBytes(src []byte, v reflect.Value) ([]byte, error) {
 	return src[n:], nil
 }
 
-func deserString(src []byte, v reflect.Value) ([]byte, error) {
+func deserString(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	length, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -236,19 +258,19 @@ func deserString(src []byte, v reflect.Value) ([]byte, error) {
 	if len(src) < n {
 		return nil, &ShortBufferError{Type: "string", Need: n, Have: len(src)}
 	}
-	s := string(src[:n])
+	str := sl.string(src, n)
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(s))
+		v.Set(reflect.ValueOf(str))
 		return src[n:], nil
 	}
 	if v.Kind() == reflect.String {
-		v.SetString(s)
+		v.SetString(str)
 		return src[n:], nil
 	}
 	// Try encoding.TextUnmarshaler.
 	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
-		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(s)); err != nil {
+		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(str)); err != nil {
 			return nil, err
 		}
 		return src[n:], nil
@@ -276,7 +298,7 @@ type deserRecord struct {
 	fast   atomic.Pointer[fastRecordDeser]  // precompiled unsafe fast path
 }
 
-func (s *deserRecord) deser(src []byte, v reflect.Value) ([]byte, error) {
+func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	v = indirectAlloc(v)
 	k := v.Kind()
 	if k == reflect.Interface {
@@ -285,7 +307,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value) ([]byte, error) {
 		var err error
 		for _, f := range s.fields {
 			elem := reflect.New(anyType).Elem()
-			if src, err = f.fn(src, elem); err != nil {
+			if src, err = f.fn(src, elem, sl); err != nil {
 				return nil, &SemanticError{AvroType: "record", Field: f.name, Err: err}
 			}
 			m[f.name] = elem.Interface()
@@ -304,7 +326,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value) ([]byte, error) {
 		}
 		for _, f := range s.fields {
 			elem := reflect.New(t.Elem()).Elem()
-			if src, err = f.fn(src, elem); err != nil {
+			if src, err = f.fn(src, elem, sl); err != nil {
 				return nil, &SemanticError{AvroType: "record", Field: f.name, Err: err}
 			}
 			v.SetMapIndex(reflect.ValueOf(f.name), elem)
@@ -314,11 +336,11 @@ func (s *deserRecord) deser(src []byte, v reflect.Value) ([]byte, error) {
 	// Struct: try precompiled unsafe fast path.
 	if v.CanAddr() {
 		if fast := s.fast.Load(); fast != nil && fast.typ == t {
-			return deserRecordFast(src, fast, v)
+			return deserRecordFast(src, fast, v, sl)
 		}
 		if fast := compileFastDeser(s.fields, s.names, &s.cache, t); fast != nil {
 			s.fast.Store(fast)
-			return deserRecordFast(src, fast, v)
+			return deserRecordFast(src, fast, v, sl)
 		}
 	}
 	// compileFastDeser returned nil because typeFieldMapping failed;
@@ -331,7 +353,7 @@ type deserEnum struct {
 	symbols []string
 }
 
-func (s *deserEnum) deser(src []byte, v reflect.Value) ([]byte, error) {
+func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	idx, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -359,7 +381,7 @@ type deserArray struct {
 	deserItem deserfn
 }
 
-func (s *deserArray) deser(src []byte, v reflect.Value) ([]byte, error) {
+func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
 	if !iface && v.Kind() != reflect.Slice {
@@ -418,7 +440,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value) ([]byte, error) {
 			}
 		}
 		for i := start; i < newLen; i++ {
-			src, err = s.deserItem(src, sliceVal.Index(i))
+			src, err = s.deserItem(src, sliceVal.Index(i), sl)
 			if err != nil {
 				return nil, err
 			}
@@ -430,7 +452,7 @@ type deserMap struct {
 	deserItem deserfn
 }
 
-func (s *deserMap) deser(src []byte, v reflect.Value) ([]byte, error) {
+func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
 	var (
@@ -483,11 +505,11 @@ func (s *deserMap) deser(src []byte, v reflect.Value) ([]byte, error) {
 			if keyLen < 0 || int(keyLen) > len(src) {
 				return nil, fmt.Errorf("invalid map key length %d", keyLen)
 			}
-			key := string(src[:int(keyLen)])
+			key := sl.string(src, int(keyLen))
 			src = src[int(keyLen):]
 
 			elem := reflect.New(elemTyp).Elem()
-			src, err = s.deserItem(src, elem)
+			src, err = s.deserItem(src, elem, sl)
 			if err != nil {
 				return nil, err
 			}
@@ -500,7 +522,7 @@ type deserFixed struct {
 	n int
 }
 
-func (s *deserFixed) deser(src []byte, v reflect.Value) ([]byte, error) {
+func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if len(src) < s.n {
 		return nil, &ShortBufferError{Type: "fixed", Need: s.n, Have: len(src)}
 	}
@@ -526,7 +548,7 @@ func (s *deserFixed) deser(src []byte, v reflect.Value) ([]byte, error) {
 // LOGICAL TYPE DESERIALIZERS //
 ///////////////////////////////
 
-func deserTimestampMillis(src []byte, v reflect.Value) ([]byte, error) {
+func deserTimestampMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -550,7 +572,7 @@ func deserTimestampMillis(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserTimestampMicros(src []byte, v reflect.Value) ([]byte, error) {
+func deserTimestampMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -574,7 +596,7 @@ func deserTimestampMicros(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserDate(src []byte, v reflect.Value) ([]byte, error) {
+func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -599,7 +621,7 @@ func deserDate(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserTimeMillis(src []byte, v reflect.Value) ([]byte, error) {
+func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -623,7 +645,7 @@ func deserTimeMillis(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserTimeMicros(src []byte, v reflect.Value) ([]byte, error) {
+func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -647,7 +669,7 @@ func deserTimeMicros(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func deserDuration(src []byte, v reflect.Value) ([]byte, error) {
+func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if len(src) < 12 {
 		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
 	}
@@ -660,14 +682,14 @@ func deserDuration(src []byte, v reflect.Value) ([]byte, error) {
 		return src[12:], nil
 	}
 	// Fall back to [12]byte fixed.
-	return (&deserFixed{12}).deser(src, v)
+	return (&deserFixed{12}).deser(src, v, sl)
 }
 
 type deserBytesDecimal struct {
 	scale int
 }
 
-func (s *deserBytesDecimal) deser(src []byte, v reflect.Value) ([]byte, error) {
+func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	length, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -698,7 +720,7 @@ type deserFixedDecimal struct {
 	scale int
 }
 
-func (s *deserFixedDecimal) deser(src []byte, v reflect.Value) ([]byte, error) {
+func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if len(src) < s.size {
 		return nil, &ShortBufferError{Type: "decimal", Need: s.size, Have: len(src)}
 	}
@@ -714,7 +736,7 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value) ([]byte, error) {
 		return src, nil
 	}
 	// Fall back to [N]byte fixed.
-	return (&deserFixed{s.size}).deser(append(b[:0:0], b...), v)
+	return (&deserFixed{s.size}).deser(append(b[:0:0], b...), v, sl)
 }
 
 func bytesToRat(b []byte, scale int) *big.Rat {
