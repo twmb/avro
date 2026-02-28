@@ -2076,15 +2076,28 @@ func BenchmarkDeserialize(b *testing.B) {
 		b.Fatalf("unable to encode: %v", err)
 	}
 
-	var out Superhero
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		out = Superhero{}
-		if _, err = s.Decode(encoded, &out); err != nil {
-			b.Fatalf("unable to decode: %v", err)
+	b.Run("cold", func(b *testing.B) {
+		var out Superhero
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			out = Superhero{}
+			if _, err = s.Decode(encoded, &out); err != nil {
+				b.Fatalf("unable to decode: %v", err)
+			}
 		}
-	}
+	})
+
+	b.Run("reuse", func(b *testing.B) {
+		var out Superhero
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err = s.Decode(encoded, &out); err != nil {
+				b.Fatalf("unable to decode: %v", err)
+			}
+		}
+	})
 }
 
 func BenchmarkDeserializeRecursive(b *testing.B) {

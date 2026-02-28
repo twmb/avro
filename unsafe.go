@@ -1297,13 +1297,25 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 			} else {
 				v.SetLen(newLen)
 			}
-			// Batch allocate backing array for record targets.
-			backing := reflect.MakeSlice(reflect.SliceOf(innerType), n, n)
-			backingBase := backing.Index(0).Addr().UnsafePointer()
-			// Set pointers in the slice.
 			s := *(*[]unsafe.Pointer)(p)
+			// Count how many elements need fresh allocation.
+			var need int
 			for i := 0; i < n; i++ {
-				s[start+i] = unsafe.Add(backingBase, uintptr(i)*innerSize)
+				if s[start+i] == nil {
+					need++
+				}
+			}
+			// Batch allocate only for nil slots.
+			if need > 0 {
+				backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
+				backingBase := backing.Index(0).Addr().UnsafePointer()
+				j := 0
+				for i := 0; i < n; i++ {
+					if s[start+i] == nil {
+						s[start+i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
+						j++
+					}
+				}
 			}
 			// Deserialize each element.
 			for i := 0; i < n; i++ {
