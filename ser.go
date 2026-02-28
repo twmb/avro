@@ -8,12 +8,18 @@ import (
 	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type serfn func([]byte, reflect.Value) ([]byte, error)
 
 func (s *Schema) AppendEncode(dst []byte, v interface{}) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
+}
+
+// Encode encodes v using the schema and returns the encoded bytes.
+func (s *Schema) Encode(v interface{}) ([]byte, error) {
+	return s.AppendEncode(nil, v)
 }
 
 ///////////
@@ -83,7 +89,7 @@ func serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Kind() != reflect.Bool {
-		return nil, fmt.Errorf("cannot encode %s as boolean", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "boolean"}
 	}
 	if v.Bool() {
 		return append(dst, 1), nil
@@ -101,7 +107,7 @@ func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	} else if v.CanUint() {
 		return appendVarint(dst, int32(v.Uint())), nil
 	}
-	return nil, fmt.Errorf("cannot encode %s as int", v.Type())
+	return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
 }
 
 func serLong(dst []byte, v reflect.Value) ([]byte, error) {
@@ -114,7 +120,7 @@ func serLong(dst []byte, v reflect.Value) ([]byte, error) {
 	} else if v.CanUint() {
 		return appendVarlong(dst, int64(v.Uint())), nil
 	}
-	return nil, fmt.Errorf("cannot encode %s as long", v.Type())
+	return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
 }
 
 func serFloat(dst []byte, v reflect.Value) ([]byte, error) {
@@ -125,7 +131,7 @@ func serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanFloat() {
 		return appendUint32(dst, math.Float32bits(float32(v.Float()))), nil
 	}
-	return nil, fmt.Errorf("cannot encode %s as float", v.Type())
+	return nil, &SemanticError{GoType: v.Type(), AvroType: "float"}
 }
 
 func serDouble(dst []byte, v reflect.Value) ([]byte, error) {
@@ -136,7 +142,7 @@ func serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanFloat() {
 		return appendUint64(dst, math.Float64bits(v.Float())), nil
 	}
-	return nil, fmt.Errorf("cannot encode %s as double", v.Type())
+	return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
 }
 
 func serBytes(dst []byte, v reflect.Value) ([]byte, error) {
@@ -145,7 +151,7 @@ func serBytes(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if (v.Kind() != reflect.Array && v.Kind() != reflect.Slice) || v.Type().Elem().Kind() != reflect.Uint8 {
-		return nil, fmt.Errorf("cannot encode %s as bytes", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 	}
 	return doSerBytes(dst, v), nil
 }
@@ -172,7 +178,7 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 			return doSerString(dst, string(text)), nil
 		}
 	}
-	return nil, fmt.Errorf("cannot encode %s as string", v.Type())
+	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 }
 
 ////////////////////
@@ -213,7 +219,7 @@ type serRecordField struct {
 type serRecord struct {
 	fields []serRecordField
 	names  []string
-	cache  sync.Map                       // map[reflect.Type][][]int
+	cache  sync.Map                       // map[reflect.Type]*cachedMapping
 	fast   atomic.Pointer[fastRecordSer]  // precompiled unsafe fast path
 }
 
@@ -225,7 +231,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	k := v.Kind()
 	t := v.Type()
 	if k != reflect.Struct && (k != reflect.Map || t.Key().Kind() != reflect.String) {
-		return nil, fmt.Errorf("cannot encode %s as record", t)
+		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
 	if k == reflect.Map {
 		for _, f := range s.fields {
@@ -250,13 +256,18 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 	}
 	// Slow path: reflect-based field access.
-	ats, err := typeFieldMapping(s.names, &s.cache, t)
+	mapping, err := typeFieldMapping(s.names, &s.cache, t)
 	if err != nil {
 		return nil, err
 	}
 	for i, f := range s.fields {
-		if dst, err = f.fn(dst, v.FieldByIndex(ats[i])); err != nil {
-			return nil, fmt.Errorf("record type %s field %s error: %v", t, f.name, err)
+		fv := v.FieldByIndex(mapping.indices[i])
+		if mapping.omitzero[i] && f.avroType == "nullunion" && valueIsZero(fv) {
+			dst = append(dst, 0)
+			continue
+		}
+		if dst, err = f.fn(dst, fv); err != nil {
+			return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: err}
 		}
 	}
 	return dst, nil
@@ -294,7 +305,7 @@ func (s *serEnum) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		return appendVarint(dst, int32(n)), nil
 
 	default:
-		return nil, fmt.Errorf("cannot encode %s as enum", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
 	}
 }
 
@@ -308,7 +319,7 @@ func (s *serArray) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Kind() != reflect.Array && v.Kind() != reflect.Slice {
-		return nil, fmt.Errorf("cannot encode %s as array", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "array"}
 	}
 	l := v.Len()
 	dst = appendVarlong(dst, int64(l))
@@ -334,7 +345,7 @@ func (s *serMap) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	t := v.Type()
 	if t.Kind() != reflect.Map || t.Key().Kind() != reflect.String {
-		return nil, fmt.Errorf("cannot encode %s as map", t)
+		return nil, &SemanticError{GoType: t, AvroType: "map"}
 	}
 	l := v.Len()
 	dst = appendVarlong(dst, int64(l))
@@ -362,10 +373,10 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	t := v.Type()
 	if t.Kind() != reflect.Array || t.Elem().Kind() != reflect.Uint8 {
-		return nil, fmt.Errorf("cannot encode %s as fixed", t)
+		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
 	if t.Len() != s.n {
-		return nil, fmt.Errorf("cannot encode %s as fixed of size %d", t, s.n)
+		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
 	// Fixed is written as raw bytes with no length prefix.
 	if v.CanAddr() {
@@ -377,3 +388,70 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	return dst, nil
 }
 
+/////////////////////////////
+// LOGICAL TYPE SERIALIZERS //
+/////////////////////////////
+
+var timeType = reflect.TypeOf(time.Time{})
+var durationType = reflect.TypeOf(time.Duration(0))
+
+func serTimestampMillis(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == timeType {
+		t := v.Interface().(time.Time)
+		return appendVarlong(dst, t.UnixMilli()), nil
+	}
+	return serLong(dst, v)
+}
+
+func serTimestampMicros(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == timeType {
+		t := v.Interface().(time.Time)
+		return appendVarlong(dst, t.UnixMicro()), nil
+	}
+	return serLong(dst, v)
+}
+
+func serDate(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == timeType {
+		t := v.Interface().(time.Time)
+		days := int32(t.Unix() / 86400)
+		return appendVarint(dst, days), nil
+	}
+	return serInt(dst, v)
+}
+
+func serTimeMillis(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == durationType {
+		d := time.Duration(v.Int())
+		return appendVarint(dst, int32(d.Milliseconds())), nil
+	}
+	return serInt(dst, v)
+}
+
+func serTimeMicros(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == durationType {
+		d := time.Duration(v.Int())
+		return appendVarlong(dst, d.Microseconds()), nil
+	}
+	return serLong(dst, v)
+}

@@ -2,10 +2,13 @@ package avro
 
 import (
 	"bytes"
+	"encoding"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -5242,4 +5245,1084 @@ func TestAdversarialArrayNullUnionLie(t *testing.T) {
 		})
 	}
 }
+
+// ---- TextUnmarshaler tests ----
+
+type testTextUnmarshaler struct{ val string }
+
+func (tu *testTextUnmarshaler) UnmarshalText(text []byte) error {
+	tu.val = "unmarshaled:" + string(text)
+	return nil
+}
+
+var _ encoding.TextUnmarshaler = (*testTextUnmarshaler)(nil)
+
+func TestDeserStringTextUnmarshaler(t *testing.T) {
+	s, err := NewSchema(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, new("hello"))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var v testTextUnmarshaler
+	_, err = s.Decode(encoded, &v)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if v.val != "unmarshaled:hello" {
+		t.Fatalf("got %q, want %q", v.val, "unmarshaled:hello")
+	}
+}
+
+func TestTextUnmarshalerRoundTrip(t *testing.T) {
+	type R struct {
+		Name textMarshalerType `avro:"name"`
+	}
+	type RD struct {
+		Name testTextUnmarshaler `avro:"name"`
+	}
+
+	schema := `{"type":"record","name":"r","fields":[{"name":"name","type":"string"}]}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := R{Name: textMarshalerType{val: "world"}}
+	encoded, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var output RD
+	_, err = s.Decode(encoded, &output)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if output.Name.val != "unmarshaled:world" {
+		t.Fatalf("got %q, want %q", output.Name.val, "unmarshaled:world")
+	}
+}
+
+// ---- time.Time logical type tests ----
+
+func TestTimestampMillisRoundTrip(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-millis"}`
+	now := time.UnixMilli(time.Now().UnixMilli()) // truncate to millis
+	got := roundTrip(t, schema, now)
+	if !got.Equal(now) {
+		t.Fatalf("timestamp-millis round trip: got %v, want %v", got, now)
+	}
+}
+
+func TestTimestampMicrosRoundTrip(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-micros"}`
+	now := time.UnixMicro(time.Now().UnixMicro()) // truncate to micros
+	got := roundTrip(t, schema, now)
+	if !got.Equal(now) {
+		t.Fatalf("timestamp-micros round trip: got %v, want %v", got, now)
+	}
+}
+
+func TestDateRoundTrip(t *testing.T) {
+	schema := `{"type":"int","logicalType":"date"}`
+	// Use a date at midnight UTC.
+	input := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC)
+	got := roundTrip(t, schema, input)
+	if !got.Equal(input) {
+		t.Fatalf("date round trip: got %v, want %v", got, input)
+	}
+}
+
+func TestTimeMillisRoundTrip(t *testing.T) {
+	schema := `{"type":"int","logicalType":"time-millis"}`
+	input := 45*time.Second + 123*time.Millisecond
+	got := roundTrip(t, schema, input)
+	if got != input {
+		t.Fatalf("time-millis round trip: got %v, want %v", got, input)
+	}
+}
+
+func TestTimeMicrosRoundTrip(t *testing.T) {
+	schema := `{"type":"long","logicalType":"time-micros"}`
+	input := 2*time.Minute + 500*time.Microsecond
+	got := roundTrip(t, schema, input)
+	if got != input {
+		t.Fatalf("time-micros round trip: got %v, want %v", got, input)
+	}
+}
+
+func TestLocalTimestampMillisRoundTrip(t *testing.T) {
+	schema := `{"type":"long","logicalType":"local-timestamp-millis"}`
+	now := time.UnixMilli(time.Now().UnixMilli())
+	got := roundTrip(t, schema, now)
+	if !got.Equal(now) {
+		t.Fatalf("local-timestamp-millis round trip: got %v, want %v", got, now)
+	}
+}
+
+func TestLocalTimestampMicrosRoundTrip(t *testing.T) {
+	schema := `{"type":"long","logicalType":"local-timestamp-micros"}`
+	now := time.UnixMicro(time.Now().UnixMicro())
+	got := roundTrip(t, schema, now)
+	if !got.Equal(now) {
+		t.Fatalf("local-timestamp-micros round trip: got %v, want %v", got, now)
+	}
+}
+
+func TestTimestampMillisFallbackToInt64(t *testing.T) {
+	// When the Go type is int64, the logical type should fall back to plain long.
+	schema := `{"type":"long","logicalType":"timestamp-millis"}`
+	input := int64(1718400000000)
+	got := roundTrip(t, schema, input)
+	if got != input {
+		t.Fatalf("timestamp-millis int64 fallback: got %d, want %d", got, input)
+	}
+}
+
+func TestTimestampMillisInRecord(t *testing.T) {
+	type R struct {
+		Created time.Time `avro:"created"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"created","type":{"type":"long","logicalType":"timestamp-millis"}}
+	]}`
+	now := time.UnixMilli(time.Now().UnixMilli())
+	got := roundTrip(t, schema, R{Created: now})
+	if !got.Created.Equal(now) {
+		t.Fatalf("timestamp in record: got %v, want %v", got.Created, now)
+	}
+}
+
+func TestDateInRecord(t *testing.T) {
+	type R struct {
+		Birthday time.Time `avro:"birthday"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"birthday","type":{"type":"int","logicalType":"date"}}
+	]}`
+	input := time.Date(1990, 3, 25, 0, 0, 0, 0, time.UTC)
+	got := roundTrip(t, schema, R{Birthday: input})
+	if !got.Birthday.Equal(input) {
+		t.Fatalf("date in record: got %v, want %v", got.Birthday, input)
+	}
+}
+
+func TestTimeMillisInRecord(t *testing.T) {
+	type R struct {
+		Elapsed time.Duration `avro:"elapsed"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"elapsed","type":{"type":"int","logicalType":"time-millis"}}
+	]}`
+	input := 5 * time.Second
+	got := roundTrip(t, schema, R{Elapsed: input})
+	if got.Elapsed != input {
+		t.Fatalf("time-millis in record: got %v, want %v", got.Elapsed, input)
+	}
+}
+
+// ---- Encode convenience method tests ----
+
+func TestEncode(t *testing.T) {
+	s, err := NewSchema(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.Encode(new("hello"))
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var got string
+	_, err = s.Decode(data, &got)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got != "hello" {
+		t.Fatalf("got %q, want %q", got, "hello")
+	}
+}
+
+// ---- SemanticError / ShortBufferError tests ----
+
+func TestSemanticErrorFormat(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *SemanticError
+		want string
+	}{
+		{
+			"full",
+			&SemanticError{GoType: reflect.TypeOf(0), AvroType: "string", Field: "name", Err: fmt.Errorf("oops")},
+			"avro: field name: cannot use Go type int with Avro type string: oops",
+		},
+		{
+			"no field",
+			&SemanticError{GoType: reflect.TypeOf(""), AvroType: "int"},
+			"avro: cannot use Go type string with Avro type int",
+		},
+		{
+			"go type only",
+			&SemanticError{GoType: reflect.TypeOf(true)},
+			"avro: unsupported Go type bool",
+		},
+		{
+			"avro type only",
+			&SemanticError{AvroType: "map"},
+			"avro: unsupported Avro type map",
+		},
+		{
+			"bare",
+			&SemanticError{},
+			"avro: semantic error",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.Error(); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSemanticErrorUnwrap(t *testing.T) {
+	inner := fmt.Errorf("inner")
+	err := &SemanticError{Err: inner}
+	if !errors.Is(err, inner) {
+		t.Fatal("Unwrap failed")
+	}
+}
+
+func TestSemanticErrorAs(t *testing.T) {
+	inner := fmt.Errorf("boom")
+	err := &SemanticError{GoType: reflect.TypeOf(0), AvroType: "string", Err: inner}
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatal("errors.As failed")
+	}
+	if se.GoType != reflect.TypeOf(0) {
+		t.Fatalf("GoType mismatch: %v", se.GoType)
+	}
+}
+
+func TestShortBufferErrorFormat(t *testing.T) {
+	err := &ShortBufferError{Type: "string", Need: 10, Have: 3}
+	if err.Error() != "avro: short buffer for string: need 10, have 3" {
+		t.Fatalf("got %q", err.Error())
+	}
+	err2 := &ShortBufferError{Type: "boolean"}
+	if err2.Error() != "avro: short buffer for boolean" {
+		t.Fatalf("got %q", err2.Error())
+	}
+}
+
+func TestShortBufferErrorAs(t *testing.T) {
+	var err error = &ShortBufferError{Type: "int", Need: 4, Have: 1}
+	var sbe *ShortBufferError
+	if !errors.As(err, &sbe) {
+		t.Fatal("errors.As failed for ShortBufferError")
+	}
+	if sbe.Type != "int" || sbe.Need != 4 || sbe.Have != 1 {
+		t.Fatalf("wrong values: %+v", sbe)
+	}
+}
+
+func TestSemanticErrorIntegration(t *testing.T) {
+	s, err := NewSchema(`"boolean"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.Encode(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	_, err = s.Decode(encoded, &n)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected *SemanticError, got %T: %v", err, err)
+	}
+	if se.AvroType != "boolean" {
+		t.Fatalf("expected AvroType boolean, got %s", se.AvroType)
+	}
+}
+
+func TestShortBufferErrorIntegration(t *testing.T) {
+	s, err := NewSchema(`"boolean"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b bool
+	_, err = s.Decode(nil, &b)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var sbe *ShortBufferError
+	if !errors.As(err, &sbe) {
+		t.Fatalf("expected *ShortBufferError, got %T: %v", err, err)
+	}
+	if sbe.Type != "boolean" {
+		t.Fatalf("expected Type boolean, got %s", sbe.Type)
+	}
+}
+
+// ---- omitzero tests ----
+
+func TestOmitzero(t *testing.T) {
+	type R struct {
+		Name *string `avro:"name,omitzero"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"name","type":["null","string"]}
+	]}`
+
+	t.Run("nil pointer", func(t *testing.T) {
+		got := roundTrip(t, schema, R{Name: nil})
+		if got.Name != nil {
+			t.Fatalf("expected nil, got %v", *got.Name)
+		}
+	})
+
+	t.Run("non-nil pointer", func(t *testing.T) {
+		s := "hello"
+		got := roundTrip(t, schema, R{Name: &s})
+		if got.Name == nil || *got.Name != "hello" {
+			t.Fatalf("expected hello, got %v", got.Name)
+		}
+	})
+}
+
+func TestOmitzeroStringValue(t *testing.T) {
+	// Test omitzero with a non-pointer string field in a null union.
+	type R struct {
+		Name string `avro:"name,omitzero"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"name","type":["null","string"]}
+	]}`
+
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty string should be serialized as null.
+	encoded, err := s.AppendEncode(nil, &R{Name: ""})
+	if err != nil {
+		t.Fatalf("encode empty: %v", err)
+	}
+	if len(encoded) != 1 || encoded[0] != 0 {
+		t.Fatalf("expected null encoding [0x00], got %x", encoded)
+	}
+
+	// Non-empty string should be serialized normally.
+	encoded, err = s.AppendEncode(nil, &R{Name: "hi"})
+	if err != nil {
+		t.Fatalf("encode non-empty: %v", err)
+	}
+	if encoded[0] != 2 {
+		t.Fatalf("expected non-null union index, got %x", encoded[0])
+	}
+}
+
+func TestOmitzeroWithIsZero(t *testing.T) {
+	type R struct {
+		When time.Time `avro:"when,omitzero"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}
+	]}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero time should be serialized as null.
+	encoded, err := s.AppendEncode(nil, &R{When: time.Time{}})
+	if err != nil {
+		t.Fatalf("encode zero: %v", err)
+	}
+	if len(encoded) != 1 || encoded[0] != 0 {
+		t.Fatalf("expected null encoding, got %x", encoded)
+	}
+}
+
+// ---- inline tag tests ----
+
+func TestInlineTag(t *testing.T) {
+	type Inner struct {
+		A int32  `avro:"a"`
+		B string `avro:"b"`
+	}
+	type Outer struct {
+		Inner Inner `avro:",inline"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string"}
+	]}`
+
+	got := roundTrip(t, schema, Outer{Inner: Inner{A: 42, B: "hello"}})
+	if got.Inner.A != 42 || got.Inner.B != "hello" {
+		t.Fatalf("inline round trip: got %+v", got)
+	}
+}
+
+func TestInlineTagPointer(t *testing.T) {
+	type Inner struct {
+		X int64 `avro:"x"`
+	}
+	type Outer struct {
+		Inner *Inner `avro:",inline"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"x","type":"long"}
+	]}`
+
+	got := roundTrip(t, schema, Outer{Inner: &Inner{X: 99}})
+	if got.Inner == nil || got.Inner.X != 99 {
+		t.Fatalf("inline pointer round trip: got %+v", got)
+	}
+}
+
+// ---- Schema defaults tests ----
+
+func TestSchemaDefaultsValid(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{"string default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"string","default":"hello"}
+		]}`},
+		{"int default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"int","default":42}
+		]}`},
+		{"null union default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":["null","string"],"default":null}
+		]}`},
+		{"boolean default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"boolean","default":true}
+		]}`},
+		{"array default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"array","items":"int"},"default":[]}
+		]}`},
+		{"map default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"map","values":"string"},"default":{}}
+		]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewSchema(tt.schema)
+			if err != nil {
+				t.Fatalf("NewSchema: %v", err)
+			}
+		})
+	}
+}
+
+func TestSchemaDefaultsInvalid(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{"string field with int default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"string","default":42}
+		]}`},
+		{"int field with string default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"int","default":"hello"}
+		]}`},
+		{"boolean field with string default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"boolean","default":"true"}
+		]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewSchema(tt.schema)
+			if err == nil {
+				t.Fatal("expected error for invalid default")
+			}
+		})
+	}
+}
+
+// ---- TextUnmarshaler error path ----
+
+type testTextUnmarshalerErr struct{}
+
+func (*testTextUnmarshalerErr) UnmarshalText([]byte) error { return fmt.Errorf("unmarshal error") }
+
+func TestDeserStringTextUnmarshalerError(t *testing.T) {
+	s, err := NewSchema(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, new("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v testTextUnmarshalerErr
+	_, err = s.Decode(encoded, &v)
+	if err == nil {
+		t.Fatal("expected error from UnmarshalText")
+	}
+}
+
+// ---- Logical type deser into interface{} ----
+
+func TestLogicalTypeDeserIntoInterface(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		encode any
+	}{
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, new(int64(1000))},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, new(int64(1000))},
+		{"date", `{"type":"int","logicalType":"date"}`, new(int32(100))},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, new(int32(5000))},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, new(int64(5000))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := NewSchema(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := s.AppendEncode(nil, tt.encode)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var v any
+			_, err = s.Decode(encoded, &v)
+			if err != nil {
+				t.Fatalf("decode into interface: %v", err)
+			}
+		})
+	}
+}
+
+// ---- Logical type deser fallback to int/uint ----
+
+func TestLogicalTypeDeserFallbackInt(t *testing.T) {
+	// timestamp-millis into int64
+	{
+		schema := `{"type":"long","logicalType":"timestamp-millis"}`
+		input := int64(1718400000000)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("timestamp-millis int64: got %d, want %d", got, input)
+		}
+	}
+	// timestamp-micros into int64
+	{
+		schema := `{"type":"long","logicalType":"timestamp-micros"}`
+		input := int64(1718400000000000)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("timestamp-micros int64: got %d, want %d", got, input)
+		}
+	}
+	// date into int32
+	{
+		schema := `{"type":"int","logicalType":"date"}`
+		input := int32(19888)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("date int32: got %d, want %d", got, input)
+		}
+	}
+	// time-millis into int32
+	{
+		schema := `{"type":"int","logicalType":"time-millis"}`
+		input := int32(45123)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("time-millis int32: got %d, want %d", got, input)
+		}
+	}
+	// time-micros into int64
+	{
+		schema := `{"type":"long","logicalType":"time-micros"}`
+		input := int64(120000500)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("time-micros int64: got %d, want %d", got, input)
+		}
+	}
+}
+
+func TestLogicalTypeDeserFallbackUint(t *testing.T) {
+	// timestamp-millis into uint64
+	{
+		schema := `{"type":"long","logicalType":"timestamp-millis"}`
+		input := uint64(1718400000000)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("timestamp-millis uint64: got %d, want %d", got, input)
+		}
+	}
+	// date into uint32
+	{
+		schema := `{"type":"int","logicalType":"date"}`
+		input := uint32(19888)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("date uint32: got %d, want %d", got, input)
+		}
+	}
+}
+
+func TestLogicalTypeDeserTypeMismatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{"timestamp-millis into bool", `{"type":"long","logicalType":"timestamp-millis"}`},
+		{"timestamp-micros into bool", `{"type":"long","logicalType":"timestamp-micros"}`},
+		{"date into bool", `{"type":"int","logicalType":"date"}`},
+		{"time-millis into bool", `{"type":"int","logicalType":"time-millis"}`},
+		{"time-micros into bool", `{"type":"long","logicalType":"time-micros"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := NewSchema(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Encode a valid value.
+			encoded, err := s.AppendEncode(nil, new(int64(42)))
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			// Decode into incompatible type.
+			var v bool
+			_, err = s.Decode(encoded, &v)
+			if err == nil {
+				t.Fatal("expected error decoding logical type into bool")
+			}
+		})
+	}
+}
+
+// ---- Logical type ser fallback (non time.Time/Duration) ----
+
+func TestLogicalTypeSerFallback(t *testing.T) {
+	// timestamp-micros with raw int64
+	{
+		schema := `{"type":"long","logicalType":"timestamp-micros"}`
+		input := int64(999)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("timestamp-micros int64: got %d, want %d", got, input)
+		}
+	}
+	// date with raw int32
+	{
+		schema := `{"type":"int","logicalType":"date"}`
+		input := int32(100)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("date int32: got %d, want %d", got, input)
+		}
+	}
+	// time-millis with raw int32
+	{
+		schema := `{"type":"int","logicalType":"time-millis"}`
+		input := int32(5000)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("time-millis int32: got %d, want %d", got, input)
+		}
+	}
+	// time-micros with raw int64
+	{
+		schema := `{"type":"long","logicalType":"time-micros"}`
+		input := int64(5000)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("time-micros int64: got %d, want %d", got, input)
+		}
+	}
+}
+
+// ---- In-record logical type round-trips for unsafe fast path ----
+
+func TestTimestampMicrosInRecord(t *testing.T) {
+	type R struct {
+		Created time.Time `avro:"created"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"created","type":{"type":"long","logicalType":"timestamp-micros"}}
+	]}`
+	now := time.UnixMicro(time.Now().UnixMicro())
+	got := roundTrip(t, schema, R{Created: now})
+	if !got.Created.Equal(now) {
+		t.Fatalf("timestamp-micros in record: got %v, want %v", got.Created, now)
+	}
+}
+
+func TestTimeMicrosInRecord(t *testing.T) {
+	type R struct {
+		Elapsed time.Duration `avro:"elapsed"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"elapsed","type":{"type":"long","logicalType":"time-micros"}}
+	]}`
+	input := 3*time.Minute + 250*time.Microsecond
+	got := roundTrip(t, schema, R{Elapsed: input})
+	if got.Elapsed != input {
+		t.Fatalf("time-micros in record: got %v, want %v", got.Elapsed, input)
+	}
+}
+
+// In-record with int64 fields for logical types (exercises tryCompileLogicalSer/Deser fallback).
+func TestLogicalTypeInRecordWithIntFields(t *testing.T) {
+	type RMillis struct {
+		TS int64 `avro:"ts"`
+	}
+	type RMicros struct {
+		TS int64 `avro:"ts"`
+	}
+	type RDate struct {
+		D int32 `avro:"d"`
+	}
+	type RTimeMillis struct {
+		T int32 `avro:"t"`
+	}
+	type RTimeMicros struct {
+		T int64 `avro:"t"`
+	}
+
+	t.Run("timestamp-millis int64", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}
+		]}`
+		got := roundTrip(t, schema, RMillis{TS: 1718400000000})
+		if got.TS != 1718400000000 {
+			t.Fatalf("got %d", got.TS)
+		}
+	})
+	t.Run("timestamp-micros int64", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"ts","type":{"type":"long","logicalType":"timestamp-micros"}}
+		]}`
+		got := roundTrip(t, schema, RMicros{TS: 1718400000000000})
+		if got.TS != 1718400000000000 {
+			t.Fatalf("got %d", got.TS)
+		}
+	})
+	t.Run("date int32", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"d","type":{"type":"int","logicalType":"date"}}
+		]}`
+		got := roundTrip(t, schema, RDate{D: 19888})
+		if got.D != 19888 {
+			t.Fatalf("got %d", got.D)
+		}
+	})
+	t.Run("time-millis int32", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"t","type":{"type":"int","logicalType":"time-millis"}}
+		]}`
+		got := roundTrip(t, schema, RTimeMillis{T: 45123})
+		if got.T != 45123 {
+			t.Fatalf("got %d", got.T)
+		}
+	})
+	t.Run("time-micros int64", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"t","type":{"type":"long","logicalType":"time-micros"}}
+		]}`
+		got := roundTrip(t, schema, RTimeMicros{T: 120000500})
+		if got.T != 120000500 {
+			t.Fatalf("got %d", got.T)
+		}
+	})
+	t.Run("local-timestamp-millis int64", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"ts","type":{"type":"long","logicalType":"local-timestamp-millis"}}
+		]}`
+		got := roundTrip(t, schema, RMillis{TS: 1718400000000})
+		if got.TS != 1718400000000 {
+			t.Fatalf("got %d", got.TS)
+		}
+	})
+	t.Run("local-timestamp-micros int64", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"ts","type":{"type":"long","logicalType":"local-timestamp-micros"}}
+		]}`
+		got := roundTrip(t, schema, RMicros{TS: 1718400000000000})
+		if got.TS != 1718400000000000 {
+			t.Fatalf("got %d", got.TS)
+		}
+	})
+}
+
+// ---- omitzero slow path (non-addressable struct) ----
+
+func TestOmitzeroSlowPath(t *testing.T) {
+	type R struct {
+		Name string `avro:"name,omitzero"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"name","type":["null","string"]}
+	]}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pass struct by value (not pointer) to force non-addressable slow path.
+	var v any = R{Name: ""}
+	encoded, err := s.AppendEncode(nil, v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(encoded) != 1 || encoded[0] != 0 {
+		t.Fatalf("expected null encoding, got %x", encoded)
+	}
+
+	// Non-zero value via slow path.
+	v = R{Name: "hi"}
+	encoded, err = s.AppendEncode(nil, v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if encoded[0] != 2 {
+		t.Fatalf("expected non-null, got %x", encoded[0])
+	}
+}
+
+// ---- validateDefault extra coverage ----
+
+func TestSchemaDefaultsValidExtra(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{"float default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"float","default":3.14}
+		]}`},
+		{"double default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"double","default":2.718}
+		]}`},
+		{"long default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"long","default":9999}
+		]}`},
+		{"bytes default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"bytes","default":"\\u0000\\u0001"}
+		]}`},
+		{"null default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"null","default":null}
+		]}`},
+		{"enum default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"enum","name":"e","symbols":["X","Y"]},"default":"X"}
+		]}`},
+		{"record default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"record","name":"inner","fields":[{"name":"x","type":"int"}]},"default":{"x":1}}
+		]}`},
+		{"fixed default", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"fixed","name":"f","size":4},"default":"\\u0000\\u0000\\u0000\\u0000"}
+		]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewSchema(tt.schema)
+			if err != nil {
+				t.Fatalf("NewSchema: %v", err)
+			}
+		})
+	}
+}
+
+func TestSchemaDefaultsInvalidExtra(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{"null with non-null", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"null","default":42}
+		]}`},
+		{"float with string", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"float","default":"not a number"}
+		]}`},
+		{"double with bool", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"double","default":true}
+		]}`},
+		{"bytes with number", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":"bytes","default":42}
+		]}`},
+		{"enum with number", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"enum","name":"e","symbols":["X"]},"default":42}
+		]}`},
+		{"array with string", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"array","items":"int"},"default":"notarray"}
+		]}`},
+		{"map with string", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"map","values":"string"},"default":"notmap"}
+		]}`},
+		{"fixed with number", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"fixed","name":"f","size":4},"default":42}
+		]}`},
+		{"record with string", `{"type":"record","name":"r","fields":[
+			{"name":"a","type":{"type":"record","name":"inner","fields":[{"name":"x","type":"int"}]},"default":"notrecord"}
+		]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewSchema(tt.schema)
+			if err == nil {
+				t.Fatal("expected error for invalid default")
+			}
+		})
+	}
+}
+
+// ---- Coverage: logical deser short buffer (readVarlong/readVarint error) ----
+
+func TestLogicalDeserShortBuffer(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`},
+		{"date", `{"type":"int","logicalType":"date"}`},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Truncated varint/varlong.
+			decodeErr(t, tt.schema, []byte{0xE6, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, new(int64(0)))
+		})
+	}
+}
+
+// ---- Coverage: logical deser uint fallback for timestamp-micros, time-millis, time-micros ----
+
+func TestLogicalTypeDeserFallbackUintExtra(t *testing.T) {
+	// timestamp-micros into uint64
+	{
+		schema := `{"type":"long","logicalType":"timestamp-micros"}`
+		input := uint64(1718400000000000)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("timestamp-micros uint64: got %d, want %d", got, input)
+		}
+	}
+	// time-millis into uint32
+	{
+		schema := `{"type":"int","logicalType":"time-millis"}`
+		input := uint32(45123)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("time-millis uint32: got %d, want %d", got, input)
+		}
+	}
+	// time-micros into uint64
+	{
+		schema := `{"type":"long","logicalType":"time-micros"}`
+		input := uint64(120000500)
+		got := roundTrip(t, schema, input)
+		if got != input {
+			t.Fatalf("time-micros uint64: got %d, want %d", got, input)
+		}
+	}
+}
+
+// ---- Coverage: logical ser nil pointer (indirect error) ----
+
+func TestLogicalSerNilPointer(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		v      any
+	}{
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, (*time.Time)(nil)},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, (*time.Time)(nil)},
+		{"date", `{"type":"int","logicalType":"date"}`, (*time.Time)(nil)},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, (*time.Duration)(nil)},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, (*time.Duration)(nil)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := NewSchema(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = s.AppendEncode(nil, tt.v)
+			if err == nil {
+				t.Fatal("expected error encoding nil pointer")
+			}
+		})
+	}
+}
+
+// ---- Coverage: tryCompileLogicalSer/Deser default (uuid logical type in record) ----
+
+func TestUUIDLogicalTypeInRecord(t *testing.T) {
+	type R struct {
+		ID string `avro:"id"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
+	]}`
+	input := R{ID: "550e8400-e29b-41d4-a716-446655440000"}
+	got := roundTrip(t, schema, input)
+	if got.ID != input.ID {
+		t.Fatalf("uuid in record: got %s, want %s", got.ID, input.ID)
+	}
+}
+
+// ---- Coverage: unsafe deser short buffer for time logical types in records ----
+
+func TestLogicalTypeUnsafeDeserShortBuffer(t *testing.T) {
+	corrupt := []byte{0xE6, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}
+
+	t.Run("timestamp-millis", func(t *testing.T) {
+		type R struct{ T time.Time `avro:"t"` }
+		decodeErr(t, `{"type":"record","name":"r","fields":[
+			{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}}
+		]}`, corrupt, new(R))
+	})
+	t.Run("timestamp-micros", func(t *testing.T) {
+		type R struct{ T time.Time `avro:"t"` }
+		decodeErr(t, `{"type":"record","name":"r","fields":[
+			{"name":"t","type":{"type":"long","logicalType":"timestamp-micros"}}
+		]}`, corrupt, new(R))
+	})
+	t.Run("date", func(t *testing.T) {
+		type R struct{ T time.Time `avro:"t"` }
+		decodeErr(t, `{"type":"record","name":"r","fields":[
+			{"name":"t","type":{"type":"int","logicalType":"date"}}
+		]}`, corrupt, new(R))
+	})
+	t.Run("time-millis", func(t *testing.T) {
+		type R struct{ D time.Duration `avro:"d"` }
+		decodeErr(t, `{"type":"record","name":"r","fields":[
+			{"name":"d","type":{"type":"int","logicalType":"time-millis"}}
+		]}`, corrupt, new(R))
+	})
+	t.Run("time-micros", func(t *testing.T) {
+		type R struct{ D time.Duration `avro:"d"` }
+		decodeErr(t, `{"type":"record","name":"r","fields":[
+			{"name":"d","type":{"type":"long","logicalType":"time-micros"}}
+		]}`, corrupt, new(R))
+	})
+}
+
+// ---- Coverage: validateLogical error in buildComplex ----
+
+func TestSchemaValidateLogicalError(t *testing.T) {
+	// date requires int, not string.
+	_, err := NewSchema(`{"type":"string","logicalType":"date"}`)
+	if err == nil {
+		t.Fatal("expected error for date on string type")
+	}
+}
+
 

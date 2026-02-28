@@ -72,7 +72,7 @@ func readUvarint(src []byte) (uint32, []byte, error) {
 	var u uint32
 	for i := range 5 {
 		if i >= len(src) {
-			return 0, nil, errors.New("short buffer reading uvarint")
+			return 0, nil, &ShortBufferError{Type: "uvarint"}
 		}
 		b := src[i]
 		u |= uint32(b&0x7f) << (7 * i)
@@ -99,7 +99,7 @@ func readUvarlong(src []byte) (uint64, []byte, error) {
 	var u uint64
 	for i := range 10 {
 		if i >= len(src) {
-			return 0, nil, errors.New("short buffer reading uvarlong")
+			return 0, nil, &ShortBufferError{Type: "uvarlong"}
 		}
 		b := src[i]
 		u |= uint64(b&0x7f) << (7 * i)
@@ -124,7 +124,7 @@ func readVarlong(src []byte) (int64, []byte, error) {
 
 func readUint32(src []byte) (uint32, []byte, error) {
 	if len(src) < 4 {
-		return 0, nil, errors.New("short buffer reading uint32")
+		return 0, nil, &ShortBufferError{Type: "uint32", Need: 4, Have: len(src)}
 	}
 	u := uint32(src[0]) | uint32(src[1])<<8 | uint32(src[2])<<16 | uint32(src[3])<<24
 	return u, src[4:], nil
@@ -132,7 +132,7 @@ func readUint32(src []byte) (uint32, []byte, error) {
 
 func readUint64(src []byte) (uint64, []byte, error) {
 	if len(src) < 8 {
-		return 0, nil, errors.New("short buffer reading uint64")
+		return 0, nil, &ShortBufferError{Type: "uint64", Need: 8, Have: len(src)}
 	}
 	u := uint64(src[0]) | uint64(src[1])<<8 | uint64(src[2])<<16 | uint64(src[3])<<24 |
 		uint64(src[4])<<32 | uint64(src[5])<<40 | uint64(src[6])<<48 | uint64(src[7])<<56

@@ -137,6 +137,7 @@ type unionMissingDeser struct {
 
 type fieldMeta struct {
 	avroType    string
+	logical     string // logical type (e.g. "timestamp-millis"), empty if none
 	serRecord   *serRecord
 	deserRecord *deserRecord
 	inner       *fieldMeta
@@ -351,8 +352,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	if ser, isPrimitive := serPrimitive[o.Type]; isPrimitive {
 		b.ser = ser
 		b.deser = deserPrimitive[o.Type]
+		if logSer := logicalSer(o.Logical); logSer != nil {
+			b.ser = logSer
+		}
+		if logDeser := logicalDeser(o.Logical); logDeser != nil {
+			b.deser = logDeser
+		}
 		b.canon = aschema{primitive: o.Type}
-		b.meta = fieldMeta{avroType: o.Type}
+		b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
 		return nil
 	}
 
@@ -449,12 +456,24 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				avroType: meta.avroType,
 				meta:     meta,
 			})
-			dr.fields = append(dr.fields, deserRecordField{
+			drf := deserRecordField{
 				name:     of.Name,
 				fn:       bf.deser,
 				avroType: meta.avroType,
 				meta:     meta,
-			})
+			}
+			if len(of.Default) > 0 {
+				var defaultVal any
+				// json.Unmarshal cannot fail: of.Default is a json.RawMessage
+				// preserved from the initial schema parse, so it is valid JSON.
+				json.Unmarshal(of.Default, &defaultVal) //nolint:errcheck
+				if err := validateDefault(defaultVal, &bf.canon); err != nil {
+					return fmt.Errorf("record field %q: invalid default: %v", of.Name, err)
+				}
+				drf.defaultVal = defaultVal
+				drf.hasDefault = true
+			}
+			dr.fields = append(dr.fields, drf)
 			names = append(names, of.Name)
 		}
 		sr.names = names
@@ -600,5 +619,110 @@ func (o *aobject) validateLogical() error {
 		return fmt.Errorf("type %q logicalType %q: invalid scale or precision specified", o.Type, o.Logical)
 	}
 
+	return nil
+}
+
+// logicalSer returns a time-aware serializer for a given logical type,
+// or nil if the logical type doesn't have special serialization.
+func logicalSer(logical string) serfn {
+	switch logical {
+	case "timestamp-millis", "local-timestamp-millis":
+		return serTimestampMillis
+	case "timestamp-micros", "local-timestamp-micros":
+		return serTimestampMicros
+	case "date":
+		return serDate
+	case "time-millis":
+		return serTimeMillis
+	case "time-micros":
+		return serTimeMicros
+	default:
+		return nil
+	}
+}
+
+// logicalDeser returns a time-aware deserializer for a given logical type,
+// or nil if the logical type doesn't have special deserialization.
+func logicalDeser(logical string) deserfn {
+	switch logical {
+	case "timestamp-millis", "local-timestamp-millis":
+		return deserTimestampMillis
+	case "timestamp-micros", "local-timestamp-micros":
+		return deserTimestampMicros
+	case "date":
+		return deserDate
+	case "time-millis":
+		return deserTimeMillis
+	case "time-micros":
+		return deserTimeMicros
+	default:
+		return nil
+	}
+}
+
+// validateDefault checks that a parsed JSON default value is compatible
+// with the given Avro schema type.
+func validateDefault(val any, s *aschema) error {
+	if s.primitive != "" {
+		return validateDefaultPrimitive(val, s.primitive)
+	}
+	if len(s.union) > 0 {
+		// For unions, the default must match the first branch type.
+		return validateDefault(val, &s.union[0])
+	}
+	if s.object != nil {
+		switch s.object.Type {
+		case "record":
+			if _, ok := val.(map[string]any); !ok && val != nil {
+				return fmt.Errorf("expected object for record default, got %T", val)
+			}
+		case "enum":
+			if _, ok := val.(string); !ok {
+				return fmt.Errorf("expected string for enum default, got %T", val)
+			}
+		case "array":
+			if _, ok := val.([]any); !ok && val != nil {
+				return fmt.Errorf("expected array for array default, got %T", val)
+			}
+		case "map":
+			if _, ok := val.(map[string]any); !ok && val != nil {
+				return fmt.Errorf("expected object for map default, got %T", val)
+			}
+		case "fixed":
+			if _, ok := val.(string); !ok {
+				return fmt.Errorf("expected string for fixed default, got %T", val)
+			}
+		}
+	}
+	return nil
+}
+
+func validateDefaultPrimitive(val any, prim string) error {
+	switch prim {
+	case "null":
+		if val != nil {
+			return fmt.Errorf("expected null, got %T", val)
+		}
+	case "boolean":
+		if _, ok := val.(bool); !ok {
+			return fmt.Errorf("expected boolean, got %T", val)
+		}
+	case "int", "long":
+		if _, ok := val.(float64); !ok {
+			return fmt.Errorf("expected number for %s, got %T", prim, val)
+		}
+	case "float", "double":
+		if _, ok := val.(float64); !ok {
+			return fmt.Errorf("expected number for %s, got %T", prim, val)
+		}
+	case "string":
+		if _, ok := val.(string); !ok {
+			return fmt.Errorf("expected string, got %T", val)
+		}
+	case "bytes":
+		if _, ok := val.(string); !ok {
+			return fmt.Errorf("expected string for bytes, got %T", val)
+		}
+	}
 	return nil
 }

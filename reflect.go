@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"encoding"
 	"fmt"
 	"reflect"
 	"strings"
@@ -10,6 +11,8 @@ import (
 type stringer interface {
 	String() string
 }
+
+var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 
 func indirect(v reflect.Value) (reflect.Value, error) {
 start:
@@ -65,22 +68,29 @@ func fieldByIndex(v reflect.Value, index []int) reflect.Value {
 	return v
 }
 
+// cachedMapping holds the results of typeFieldMapping, cached per Go type.
+type cachedMapping struct {
+	indices  [][]int
+	omitzero []bool
+}
+
 // typeFieldMapping returns the field index paths for each schema field in the
-// given Go type. It handles embedded (anonymous) structs by recursing into
-// them. Avro-tagged fields take priority over name-matched fields, and
-// shallower fields take priority over deeper ones.
+// given Go type. It handles embedded (anonymous) structs and inline-tagged
+// fields by recursing into them. Avro-tagged fields take priority over
+// name-matched fields, and shallower fields take priority over deeper ones.
 //
 // The result is cached in the provided sync.Map for subsequent calls with the
 // same type.
-func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) ([][]int, error) {
+func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*cachedMapping, error) {
 	if v, ok := cache.Load(t); ok {
-		return v.([][]int), nil
+		return v.(*cachedMapping), nil
 	}
 
 	type fieldInfo struct {
-		name   string
-		index  []int
-		tagged bool
+		name     string
+		index    []int
+		tagged   bool
+		omitzero bool
 	}
 
 	var fields []fieldInfo
@@ -111,11 +121,15 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) ([][
 					// If the embedded struct has an explicit avro
 					// tag, treat it as a named field rather than
 					// inlining its fields.
-					if name := strings.Split(tag, ",")[0]; name != "" {
+					parts := strings.Split(tag, ",")
+					name := parts[0]
+					if name != "" {
+						_, oz := parseTagOptions(parts[1:])
 						fields = append(fields, fieldInfo{
-							name:   name,
-							index:  idx,
-							tagged: true,
+							name:     name,
+							index:    idx,
+							tagged:   true,
+							omitzero: oz,
 						})
 						continue
 					}
@@ -133,15 +147,32 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) ([][
 			if tag == "-" {
 				continue
 			}
-			name := strings.Split(tag, ",")[0]
+			parts := strings.Split(tag, ",")
+			name := parts[0]
 			tagged := name != ""
+			inline, oz := parseTagOptions(parts[1:])
+
+			// inline: recurse into the struct's fields like an
+			// anonymous embed.
+			if inline {
+				ft := sf.Type
+				if ft.Kind() == reflect.Pointer {
+					ft = ft.Elem()
+				}
+				if ft.Kind() == reflect.Struct {
+					collect(ft, idx, visited)
+					continue
+				}
+			}
+
 			if name == "" {
 				name = sf.Name
 			}
 			fields = append(fields, fieldInfo{
-				name:   name,
-				index:  idx,
-				tagged: tagged,
+				name:     name,
+				index:    idx,
+				tagged:   tagged,
+				omitzero: oz,
 			})
 		}
 	}
@@ -151,31 +182,60 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) ([][
 	// shallower fields win over deeper ones (first-seen wins within
 	// the same priority since we collect top-down).
 	type entry struct {
-		index  []int
-		tagged bool
+		index    []int
+		tagged   bool
+		omitzero bool
 	}
 	m := make(map[string]entry, len(fields))
 	for _, f := range fields {
 		if existing, ok := m[f.name]; ok {
 			// Tagged always beats untagged.
 			if f.tagged && !existing.tagged {
-				m[f.name] = entry{f.index, f.tagged}
+				m[f.name] = entry{f.index, f.tagged, f.omitzero}
 			}
 			// Otherwise first-seen (shallower) wins; skip.
 			continue
 		}
-		m[f.name] = entry{f.index, f.tagged}
+		m[f.name] = entry{f.index, f.tagged, f.omitzero}
 	}
 
 	ats := make([][]int, 0, len(fieldNames))
+	ozs := make([]bool, 0, len(fieldNames))
 	for _, name := range fieldNames {
 		e, exists := m[name]
 		if !exists {
 			return nil, fmt.Errorf("record type %s is missing field %s", t, name)
 		}
 		ats = append(ats, e.index)
+		ozs = append(ozs, e.omitzero)
 	}
 
-	cache.Store(t, ats)
-	return ats, nil
+	result := &cachedMapping{indices: ats, omitzero: ozs}
+	cache.Store(t, result)
+	return result, nil
+}
+
+// parseTagOptions parses tag options after the field name. It returns whether
+// "inline" and "omitzero" were found.
+func parseTagOptions(opts []string) (inline, omitzero bool) {
+	for _, o := range opts {
+		switch o {
+		case "inline":
+			inline = true
+		case "omitzero":
+			omitzero = true
+		}
+	}
+	return
+}
+
+// valueIsZero reports whether v is the zero value for its type, or implements
+// an IsZero() bool method that returns true.
+func valueIsZero(v reflect.Value) bool {
+	if v.CanInterface() {
+		if z, ok := v.Interface().(interface{ IsZero() bool }); ok {
+			return z.IsZero()
+		}
+	}
+	return v.IsZero()
 }

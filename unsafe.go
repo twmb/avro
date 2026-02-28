@@ -6,6 +6,7 @@ import (
 	"math"
 	"reflect"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -27,11 +28,12 @@ type fastRecordSer struct {
 // (slowFn != nil). This avoids the overhead of reflect.NewAt that the
 // previous wrapSlowSer approach incurred.
 type fastFieldSer struct {
-	offset  uintptr
-	name    string
-	ser     userfn // non-nil for unsafe-optimized fields (primitives)
-	slowFn  serfn  // non-nil for reflect-based fields (complex types)
-	slowIdx []int  // field index path for FieldByIndex (used with slowFn)
+	offset   uintptr
+	name     string
+	ser      userfn // non-nil for unsafe-optimized fields (primitives)
+	slowFn   serfn  // non-nil for reflect-based fields (complex types)
+	slowIdx  []int  // field index path for FieldByIndex (used with slowFn)
+	omitzero bool   // if true and field is nullunion, check IsZero before ser
 }
 
 type fastRecordDeser struct {
@@ -49,7 +51,7 @@ type fastFieldDeser struct {
 }
 
 func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t reflect.Type) *fastRecordSer {
-	ats, err := typeFieldMapping(names, cache, t)
+	mapping, err := typeFieldMapping(names, cache, t)
 	if err != nil {
 		return nil
 	}
@@ -57,9 +59,10 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 	allFast := true
 	for i := range fields {
 		f := &fields[i]
-		offset, goType, ok := computeFieldOffset(t, ats[i])
+		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
+		oz := mapping.omitzero[i] && f.avroType == "nullunion"
 		var fn userfn
-		if ok {
+		if ok && !oz {
 			fn = tryCompileFieldSer(f, goType)
 		}
 		if fn != nil {
@@ -71,9 +74,10 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 		} else {
 			allFast = false
 			fast.fields[i] = fastFieldSer{
-				name:    f.name,
-				slowFn:  f.fn,
-				slowIdx: ats[i],
+				name:     f.name,
+				slowFn:   f.fn,
+				slowIdx:  mapping.indices[i],
+				omitzero: oz,
 			}
 		}
 	}
@@ -82,7 +86,7 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 }
 
 func compileFastDeser(fields []deserRecordField, names []string, cache *sync.Map, t reflect.Type) *fastRecordDeser {
-	ats, err := typeFieldMapping(names, cache, t)
+	mapping, err := typeFieldMapping(names, cache, t)
 	if err != nil {
 		return nil
 	}
@@ -90,7 +94,7 @@ func compileFastDeser(fields []deserRecordField, names []string, cache *sync.Map
 	allFast := true
 	for i := range fields {
 		f := &fields[i]
-		offset, goType, ok := computeFieldOffset(t, ats[i])
+		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
 		var fn udeserfn
 		if ok {
 			fn = tryCompileFieldDeser(f, goType)
@@ -106,7 +110,7 @@ func compileFastDeser(fields []deserRecordField, names []string, cache *sync.Map
 			fast.fields[i] = fastFieldDeser{
 				name:    f.name,
 				slowFn:  f.fn,
-				slowIdx: ats[i],
+				slowIdx: mapping.indices[i],
 			}
 		}
 	}
@@ -138,10 +142,15 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value) ([]byte, er
 		if f.ser != nil {
 			dst, err = f.ser(dst, unsafe.Add(base, f.offset))
 		} else {
-			dst, err = f.slowFn(dst, v.FieldByIndex(f.slowIdx))
+			fv := v.FieldByIndex(f.slowIdx)
+			if f.omitzero && valueIsZero(fv) {
+				dst = append(dst, 0)
+				continue
+			}
+			dst, err = f.slowFn(dst, fv)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("record type %s field %s error: %v", fast.typ, f.name, err)
+			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
 		}
 	}
 	return dst, nil
@@ -158,7 +167,7 @@ func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value) ([]byte
 			src, err = f.slowFn(src, fieldByIndex(v, f.slowIdx))
 		}
 		if err != nil {
-			return nil, fmt.Errorf("record type %s field %s error: %v", fast.typ, f.name, err)
+			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
 		}
 	}
 	return src, nil
@@ -172,7 +181,7 @@ func serRecordFastPtr(dst []byte, fast *fastRecordSer, base unsafe.Pointer) ([]b
 		f := &fast.fields[i]
 		dst, err = f.ser(dst, unsafe.Add(base, f.offset))
 		if err != nil {
-			return nil, fmt.Errorf("record type %s field %s error: %v", fast.typ, f.name, err)
+			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
 		}
 	}
 	return dst, nil
@@ -185,7 +194,7 @@ func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer) 
 		f := &fast.fields[i]
 		src, err = f.deser(src, unsafe.Add(base, f.offset))
 		if err != nil {
-			return nil, fmt.Errorf("record type %s field %s error: %v", fast.typ, f.name, err)
+			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
 		}
 	}
 	return src, nil
@@ -290,6 +299,11 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		}
 	}
 
+	// Logical type fast paths for time.Time and time.Duration.
+	if f.meta != nil && f.meta.logical != "" {
+		return tryCompileLogicalSer(f.meta.logical, goType)
+	}
+
 	switch f.avroType {
 	case "boolean":
 		if k == reflect.Bool {
@@ -392,6 +406,11 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		return nil
 	}
 
+	// Logical type fast paths for time.Time and time.Duration.
+	if f.meta != nil && f.meta.logical != "" {
+		return tryCompileLogicalDeser(f.meta.logical, goType)
+	}
+
 	switch f.avroType {
 	case "boolean":
 		if k == reflect.Bool {
@@ -416,6 +435,143 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 	}
 
 	return nil
+}
+
+// ---- Logical type unsafe serializers ----
+
+func tryCompileLogicalSer(logical string, goType reflect.Type) userfn {
+	switch logical {
+	case "timestamp-millis", "local-timestamp-millis":
+		if goType == timeType {
+			return usTimestampMillis
+		}
+		return usLong(goType.Kind())
+	case "timestamp-micros", "local-timestamp-micros":
+		if goType == timeType {
+			return usTimestampMicros
+		}
+		return usLong(goType.Kind())
+	case "date":
+		if goType == timeType {
+			return usDate
+		}
+		return usInt(goType.Kind())
+	case "time-millis":
+		if goType == durationType {
+			return usTimeMillis
+		}
+		return usInt(goType.Kind())
+	case "time-micros":
+		if goType == durationType {
+			return usTimeMicros
+		}
+		return usLong(goType.Kind())
+	default:
+		return nil
+	}
+}
+
+func tryCompileLogicalDeser(logical string, goType reflect.Type) udeserfn {
+	switch logical {
+	case "timestamp-millis", "local-timestamp-millis":
+		if goType == timeType {
+			return udTimestampMillis
+		}
+		return udLong(goType.Kind())
+	case "timestamp-micros", "local-timestamp-micros":
+		if goType == timeType {
+			return udTimestampMicros
+		}
+		return udLong(goType.Kind())
+	case "date":
+		if goType == timeType {
+			return udDate
+		}
+		return udInt(goType.Kind())
+	case "time-millis":
+		if goType == durationType {
+			return udTimeMillis
+		}
+		return udInt(goType.Kind())
+	case "time-micros":
+		if goType == durationType {
+			return udTimeMicros
+		}
+		return udLong(goType.Kind())
+	default:
+		return nil
+	}
+}
+
+func usTimestampMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	t := *(*time.Time)(p)
+	return appendVarlong(dst, t.UnixMilli()), nil
+}
+
+func usTimestampMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	t := *(*time.Time)(p)
+	return appendVarlong(dst, t.UnixMicro()), nil
+}
+
+func usDate(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	t := *(*time.Time)(p)
+	days := int32(t.Unix() / 86400)
+	return appendVarint(dst, days), nil
+}
+
+func usTimeMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	d := *(*time.Duration)(p)
+	return appendVarint(dst, int32(d.Milliseconds())), nil
+}
+
+func usTimeMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	d := *(*time.Duration)(p)
+	return appendVarlong(dst, d.Microseconds()), nil
+}
+
+func udTimestampMillis(src []byte, p unsafe.Pointer) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	*(*time.Time)(p) = time.UnixMilli(val)
+	return src, nil
+}
+
+func udTimestampMicros(src []byte, p unsafe.Pointer) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	*(*time.Time)(p) = time.UnixMicro(val)
+	return src, nil
+}
+
+func udDate(src []byte, p unsafe.Pointer) ([]byte, error) {
+	val, src, err := readVarint(src)
+	if err != nil {
+		return nil, err
+	}
+	*(*time.Time)(p) = time.Unix(int64(val)*86400, 0).UTC()
+	return src, nil
+}
+
+func udTimeMillis(src []byte, p unsafe.Pointer) ([]byte, error) {
+	val, src, err := readVarint(src)
+	if err != nil {
+		return nil, err
+	}
+	*(*time.Duration)(p) = time.Duration(val) * time.Millisecond
+	return src, nil
+}
+
+func udTimeMicros(src []byte, p unsafe.Pointer) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	*(*time.Duration)(p) = time.Duration(val) * time.Microsecond
+	return src, nil
 }
 
 // ---- Unsafe serializers ----
@@ -573,7 +729,7 @@ func usBytes(dst []byte, p unsafe.Pointer) ([]byte, error) {
 
 func udBool(src []byte, p unsafe.Pointer) ([]byte, error) {
 	if len(src) < 1 {
-		return nil, errors.New("short buffer for boolean")
+		return nil, &ShortBufferError{Type: "boolean"}
 	}
 	*(*bool)(p) = src[0] != 0
 	return src[1:], nil
@@ -836,7 +992,7 @@ func udStringDeser(src []byte, p unsafe.Pointer) ([]byte, error) {
 	}
 	n := int(length)
 	if len(src) < n {
-		return nil, fmt.Errorf("short buffer for string: need %d, have %d", n, len(src))
+		return nil, &ShortBufferError{Type: "string", Need: n, Have: len(src)}
 	}
 	*(*string)(p) = string(src[:n])
 	return src[n:], nil
@@ -855,7 +1011,7 @@ func udBytesDeser(src []byte, p unsafe.Pointer) ([]byte, error) {
 	}
 	n := int(length)
 	if len(src) < n {
-		return nil, fmt.Errorf("short buffer for bytes: need %d, have %d", n, len(src))
+		return nil, &ShortBufferError{Type: "bytes", Need: n, Have: len(src)}
 	}
 	b := make([]byte, n)
 	copy(b, src[:n])
@@ -895,7 +1051,7 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
 func udNullUnionPtr(inner udeserfn, innerType reflect.Type) udeserfn {
 	return func(src []byte, p unsafe.Pointer) ([]byte, error) {
 		if len(src) < 1 {
-			return nil, errors.New("short buffer for union index")
+			return nil, &ShortBufferError{Type: "union index"}
 		}
 		switch src[0] {
 		case 0:
@@ -919,7 +1075,7 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type) udeserfn {
 func udNullUnionRecord(rec *deserRecord, innerType reflect.Type) udeserfn {
 	return func(src []byte, p unsafe.Pointer) ([]byte, error) {
 		if len(src) < 1 {
-			return nil, errors.New("short buffer for union index")
+			return nil, &ShortBufferError{Type: "union index"}
 		}
 		switch src[0] {
 		case 0:

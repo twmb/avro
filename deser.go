@@ -1,12 +1,14 @@
 package avro
 
 import (
+	"encoding"
 	"errors"
 	"fmt"
 	"math"
 	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type deserfn func(src []byte, v reflect.Value) ([]byte, error)
@@ -43,7 +45,7 @@ func (s *deserUnion) deser(src []byte, v reflect.Value) ([]byte, error) {
 func deserNullUnion(u *deserUnion) deserfn {
 	return func(src []byte, v reflect.Value) ([]byte, error) {
 		if len(src) < 1 {
-			return nil, errors.New("short buffer for union index")
+			return nil, &ShortBufferError{Type: "union index"}
 		}
 		switch src[0] {
 		case 0:
@@ -91,7 +93,7 @@ func deserNull(src []byte, v reflect.Value) ([]byte, error) {
 
 func deserBoolean(src []byte, v reflect.Value) ([]byte, error) {
 	if len(src) < 1 {
-		return nil, errors.New("short buffer for boolean")
+		return nil, &ShortBufferError{Type: "boolean"}
 	}
 	b := src[0] != 0
 	v = indirectAlloc(v)
@@ -100,7 +102,7 @@ func deserBoolean(src []byte, v reflect.Value) ([]byte, error) {
 		return src[1:], nil
 	}
 	if v.Kind() != reflect.Bool {
-		return nil, fmt.Errorf("cannot decode boolean into %s", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "boolean"}
 	}
 	v.SetBool(b)
 	return src[1:], nil
@@ -121,7 +123,7 @@ func deserInt(src []byte, v reflect.Value) ([]byte, error) {
 	} else if v.CanUint() {
 		v.SetUint(uint64(val))
 	} else {
-		return nil, fmt.Errorf("cannot decode int into %s", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
 	}
 	return src, nil
 }
@@ -141,7 +143,7 @@ func deserLong(src []byte, v reflect.Value) ([]byte, error) {
 	} else if v.CanUint() {
 		v.SetUint(uint64(val))
 	} else {
-		return nil, fmt.Errorf("cannot decode long into %s", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
 	}
 	return src, nil
 }
@@ -158,7 +160,7 @@ func deserFloat(src []byte, v reflect.Value) ([]byte, error) {
 		return src, nil
 	}
 	if !v.CanFloat() {
-		return nil, fmt.Errorf("cannot decode float into %s", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "float"}
 	}
 	v.SetFloat(float64(f))
 	return src, nil
@@ -176,7 +178,7 @@ func deserDouble(src []byte, v reflect.Value) ([]byte, error) {
 		return src, nil
 	}
 	if !v.CanFloat() {
-		return nil, fmt.Errorf("cannot decode double into %s", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
 	}
 	v.SetFloat(f)
 	return src, nil
@@ -192,7 +194,7 @@ func deserBytes(src []byte, v reflect.Value) ([]byte, error) {
 	}
 	n := int(length)
 	if len(src) < n {
-		return nil, fmt.Errorf("short buffer for bytes: need %d, have %d", n, len(src))
+		return nil, &ShortBufferError{Type: "bytes", Need: n, Have: len(src)}
 	}
 	b := make([]byte, n)
 	copy(b, src[:n])
@@ -204,19 +206,19 @@ func deserBytes(src []byte, v reflect.Value) ([]byte, error) {
 	switch v.Kind() {
 	case reflect.Slice:
 		if v.Type().Elem().Kind() != reflect.Uint8 {
-			return nil, fmt.Errorf("cannot decode bytes into %s", v.Type())
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 		}
 		v.SetBytes(b)
 	case reflect.Array:
 		if v.Type().Elem().Kind() != reflect.Uint8 {
-			return nil, fmt.Errorf("cannot decode bytes into %s", v.Type())
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 		}
 		if v.Len() != n {
 			return nil, fmt.Errorf("cannot decode %d bytes into array of length %d", n, v.Len())
 		}
 		reflect.Copy(v, reflect.ValueOf(src[:n]))
 	default:
-		return nil, fmt.Errorf("cannot decode bytes into %s", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 	}
 	return src[n:], nil
 }
@@ -231,7 +233,7 @@ func deserString(src []byte, v reflect.Value) ([]byte, error) {
 	}
 	n := int(length)
 	if len(src) < n {
-		return nil, fmt.Errorf("short buffer for string: need %d, have %d", n, len(src))
+		return nil, &ShortBufferError{Type: "string", Need: n, Have: len(src)}
 	}
 	s := string(src[:n])
 	v = indirectAlloc(v)
@@ -239,11 +241,18 @@ func deserString(src []byte, v reflect.Value) ([]byte, error) {
 		v.Set(reflect.ValueOf(s))
 		return src[n:], nil
 	}
-	if v.Kind() != reflect.String {
-		return nil, fmt.Errorf("cannot decode string into %s", v.Type())
+	if v.Kind() == reflect.String {
+		v.SetString(s)
+		return src[n:], nil
 	}
-	v.SetString(s)
-	return src[n:], nil
+	// Try encoding.TextUnmarshaler.
+	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
+		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(s)); err != nil {
+			return nil, err
+		}
+		return src[n:], nil
+	}
+	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 }
 
 /////////////
@@ -251,16 +260,18 @@ func deserString(src []byte, v reflect.Value) ([]byte, error) {
 /////////////
 
 type deserRecordField struct {
-	name     string
-	fn       deserfn
-	avroType string
-	meta     *fieldMeta
+	name       string
+	fn         deserfn
+	avroType   string
+	meta       *fieldMeta
+	defaultVal any
+	hasDefault bool
 }
 
 type deserRecord struct {
 	fields []deserRecordField
 	names  []string
-	cache  sync.Map                         // map[reflect.Type][][]int
+	cache  sync.Map                         // map[reflect.Type]*cachedMapping
 	fast   atomic.Pointer[fastRecordDeser]  // precompiled unsafe fast path
 }
 
@@ -274,7 +285,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value) ([]byte, error) {
 		for _, f := range s.fields {
 			elem := reflect.New(anyType).Elem()
 			if src, err = f.fn(src, elem); err != nil {
-				return nil, fmt.Errorf("record field %s error: %v", f.name, err)
+				return nil, &SemanticError{AvroType: "record", Field: f.name, Err: err}
 			}
 			m[f.name] = elem.Interface()
 		}
@@ -283,7 +294,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value) ([]byte, error) {
 	}
 	t := v.Type()
 	if k != reflect.Struct && (k != reflect.Map || t.Key().Kind() != reflect.String) {
-		return nil, fmt.Errorf("cannot decode record into %s", t)
+		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
 	var err error
 	if k == reflect.Map {
@@ -293,7 +304,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value) ([]byte, error) {
 		for _, f := range s.fields {
 			elem := reflect.New(t.Elem()).Elem()
 			if src, err = f.fn(src, elem); err != nil {
-				return nil, fmt.Errorf("record field %s error: %v", f.name, err)
+				return nil, &SemanticError{AvroType: "record", Field: f.name, Err: err}
 			}
 			v.SetMapIndex(reflect.ValueOf(f.name), elem)
 		}
@@ -338,7 +349,7 @@ func (s *deserEnum) deser(src []byte, v reflect.Value) ([]byte, error) {
 	case v.CanUint():
 		v.SetUint(uint64(idx))
 	default:
-		return nil, fmt.Errorf("cannot decode enum into %s", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
 	}
 	return src, nil
 }
@@ -351,7 +362,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value) ([]byte, error) {
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
 	if !iface && v.Kind() != reflect.Slice {
-		return nil, fmt.Errorf("cannot decode array into %s", v.Type())
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "array"}
 	}
 	// For interface targets, build a []any.
 	var sliceVal reflect.Value
@@ -431,7 +442,7 @@ func (s *deserMap) deser(src []byte, v reflect.Value) ([]byte, error) {
 	} else {
 		t := v.Type()
 		if t.Kind() != reflect.Map || t.Key().Kind() != reflect.String {
-			return nil, fmt.Errorf("cannot decode map into %s", t)
+			return nil, &SemanticError{GoType: t, AvroType: "map"}
 		}
 		if v.IsNil() {
 			v.Set(reflect.MakeMap(t))
@@ -490,7 +501,7 @@ type deserFixed struct {
 
 func (s *deserFixed) deser(src []byte, v reflect.Value) ([]byte, error) {
 	if len(src) < s.n {
-		return nil, fmt.Errorf("short buffer for fixed: need %d, have %d", s.n, len(src))
+		return nil, &ShortBufferError{Type: "fixed", Need: s.n, Have: len(src)}
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
@@ -501,11 +512,136 @@ func (s *deserFixed) deser(src []byte, v reflect.Value) ([]byte, error) {
 	}
 	t := v.Type()
 	if t.Kind() != reflect.Array || t.Elem().Kind() != reflect.Uint8 {
-		return nil, fmt.Errorf("cannot decode fixed into %s", t)
+		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
 	if t.Len() != s.n {
-		return nil, fmt.Errorf("cannot decode fixed of size %d into array of length %d", s.n, t.Len())
+		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
 	reflect.Copy(v, reflect.ValueOf(src[:s.n]))
 	return src[s.n:], nil
+}
+
+///////////////////////////////
+// LOGICAL TYPE DESERIALIZERS //
+///////////////////////////////
+
+func deserTimestampMillis(src []byte, v reflect.Value) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	v = indirectAlloc(v)
+	if v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.UnixMilli(val)))
+		return src, nil
+	}
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return src, nil
+	}
+	if v.CanInt() {
+		v.SetInt(val)
+	} else if v.CanUint() {
+		v.SetUint(uint64(val))
+	} else {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+	}
+	return src, nil
+}
+
+func deserTimestampMicros(src []byte, v reflect.Value) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	v = indirectAlloc(v)
+	if v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.UnixMicro(val)))
+		return src, nil
+	}
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return src, nil
+	}
+	if v.CanInt() {
+		v.SetInt(val)
+	} else if v.CanUint() {
+		v.SetUint(uint64(val))
+	} else {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+	}
+	return src, nil
+}
+
+func deserDate(src []byte, v reflect.Value) ([]byte, error) {
+	val, src, err := readVarint(src)
+	if err != nil {
+		return nil, err
+	}
+	v = indirectAlloc(v)
+	if v.Type() == timeType {
+		t := time.Unix(int64(val)*86400, 0).UTC()
+		v.Set(reflect.ValueOf(t))
+		return src, nil
+	}
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return src, nil
+	}
+	if v.CanInt() {
+		v.SetInt(int64(val))
+	} else if v.CanUint() {
+		v.SetUint(uint64(val))
+	} else {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
+	}
+	return src, nil
+}
+
+func deserTimeMillis(src []byte, v reflect.Value) ([]byte, error) {
+	val, src, err := readVarint(src)
+	if err != nil {
+		return nil, err
+	}
+	v = indirectAlloc(v)
+	if v.Type() == durationType {
+		v.Set(reflect.ValueOf(time.Duration(val) * time.Millisecond))
+		return src, nil
+	}
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return src, nil
+	}
+	if v.CanInt() {
+		v.SetInt(int64(val))
+	} else if v.CanUint() {
+		v.SetUint(uint64(val))
+	} else {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
+	}
+	return src, nil
+}
+
+func deserTimeMicros(src []byte, v reflect.Value) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	v = indirectAlloc(v)
+	if v.Type() == durationType {
+		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
+		return src, nil
+	}
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return src, nil
+	}
+	if v.CanInt() {
+		v.SetInt(val)
+	} else if v.CanUint() {
+		v.SetUint(uint64(val))
+	} else {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+	}
+	return src, nil
 }
