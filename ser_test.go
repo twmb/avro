@@ -312,6 +312,24 @@ func TestSerNullNonNilableType(t *testing.T) {
 	}
 }
 
+func TestSerNullGenericUnionNonNilable(t *testing.T) {
+	// 3-branch union takes the generic serUnion.ser path, which tries
+	// serNull first. This would panic on non-nilable types before the fix.
+	s, err := NewSchema(`["null","int","string"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// int32 is non-nilable; serNull must not panic, and the int branch should match.
+	dst, err := s.AppendEncode(nil, new(int32(42)))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(dst) == 0 {
+		t.Fatal("expected non-empty output")
+	}
+}
+
+
 func TestSerEnumBoundaryIndex(t *testing.T) {
 	// With 3 symbols, index 3 should be out of range (valid: 0, 1, 2).
 	schema := `{"type":"enum","name":"e","symbols":["a","b","c"]}`

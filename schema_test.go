@@ -592,6 +592,14 @@ func TestBuildComplexUnknownLogicalIgnored(t *testing.T) {
 	}
 }
 
+func TestBuildComplexValidateLogicalError(t *testing.T) {
+	// Known logical type on wrong underlying type should error through buildComplex.
+	_, err := NewSchema(`{"type":"string","logicalType":"date"}`)
+	if err == nil {
+		t.Fatal("expected error for date on string type")
+	}
+}
+
 func TestMultiDotNamespace(t *testing.T) {
 	// Namespace with multiple dot-segments should be valid.
 	_, err := NewSchema(`{"type":"record","name":"r","namespace":"com.example.foo","fields":[{"name":"a","type":"int"}]}`)
