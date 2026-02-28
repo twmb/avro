@@ -393,10 +393,10 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 // LOGICAL TYPE SERIALIZERS //
 /////////////////////////////
 
-var timeType = reflect.TypeOf(time.Time{})
-var durationType = reflect.TypeOf(time.Duration(0))
-var avroDurationType = reflect.TypeOf(Duration{})
-var bigRatType = reflect.TypeOf(big.Rat{})
+var timeType = reflect.TypeFor[time.Time]()
+var durationType = reflect.TypeFor[time.Duration]()
+var avroDurationType = reflect.TypeFor[Duration]()
+var bigRatType = reflect.TypeFor[big.Rat]()
 
 // Duration represents the Avro duration logical type: a 12-byte fixed
 // value containing three little-endian unsigned 32-bit integers

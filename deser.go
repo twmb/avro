@@ -15,7 +15,7 @@ import (
 
 type deserfn func(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 
-var anyType = reflect.TypeOf((*any)(nil)).Elem()
+var anyType = reflect.TypeFor[any]()
 
 // slab batches small string allocations into a single backing buffer.
 // Strings are immutable so sharing backing memory is safe.
@@ -460,7 +460,7 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		elemTyp reflect.Type
 	)
 	if iface {
-		mapVal = reflect.MakeMap(reflect.MapOf(reflect.TypeOf(""), anyType))
+		mapVal = reflect.MakeMap(reflect.MapOf(reflect.TypeFor[string](), anyType))
 		elemTyp = anyType
 	} else {
 		t := v.Type()

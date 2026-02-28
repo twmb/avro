@@ -12,7 +12,7 @@ type stringer interface {
 	String() string
 }
 
-var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 
 func indirect(v reflect.Value) (reflect.Value, error) {
 start:
