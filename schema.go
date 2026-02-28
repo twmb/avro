@@ -2,6 +2,7 @@ package avro
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +15,8 @@ type Schema struct {
 	ser   serfn
 	deser deserfn
 
-	c aschema
+	c   aschema
+	soe [10]byte // 2-byte magic (0xC3, 0x01) + 8-byte LE CRC64-Avro fingerprint
 }
 
 func NewSchema(schema string) (*Schema, error) {
@@ -35,11 +37,17 @@ func NewSchema(schema string) (*Schema, error) {
 	if err := b.finalize(); err != nil {
 		return nil, err
 	}
-	return &Schema{
+	s := &Schema{
 		ser:   b.ser,
 		deser: b.deser,
 		c:     b.canon,
-	}, nil
+	}
+	s.soe[0] = 0xC3
+	s.soe[1] = 0x01
+	h := NewRabin()
+	h.Write(s.Canonical())
+	binary.LittleEndian.PutUint64(s.soe[2:], h.Sum64())
+	return s, nil
 }
 
 func (s *Schema) Canonical() []byte {
