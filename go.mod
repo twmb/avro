@@ -1,3 +1,3 @@
 module github.com/twmb/avro
 
-go 1.18
+go 1.26

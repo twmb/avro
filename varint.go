@@ -1,25 +1,22 @@
-package main
+package avro
 
-import "math/bits"
+import (
+	"errors"
+	"math/bits"
+)
 
 func appendUint32(dst []byte, u uint32) []byte {
-	return append(dst, byte(u>>24), byte(u>>16), byte(u>>8), byte(u))
+	return append(dst, byte(u), byte(u>>8), byte(u>>16), byte(u>>24))
 }
 
 func appendUint64(dst []byte, u uint64) []byte {
-	return append(dst, byte(u>>56), byte(u>>48), byte(u>>40), byte(u>>32),
-		byte(u>>24), byte(u>>16), byte(u>>8), byte(u))
+	return append(dst, byte(u), byte(u>>8), byte(u>>16), byte(u>>24),
+		byte(u>>32), byte(u>>40), byte(u>>48), byte(u>>56))
 }
 
 // uvarintLens could only be length 65, but using 256 allows bounds check
 // elimination on lookup.
 const uvarintLens = "\x01\x01\x01\x01\x01\x01\x01\x01\x02\x02\x02\x02\x02\x02\x02\x03\x03\x03\x03\x03\x03\x03\x04\x04\x04\x04\x04\x04\x04\x05\x05\x05\x05\x05\x05\x05\x06\x06\x06\x06\x06\x06\x06\x07\x07\x07\x07\x07\x07\x07\x08\x08\x08\x08\x08\x08\x08\x09\x09\x09\x09\x09\x09\x09\x10\x10\x10\x10\x10\x10\x10\x11\x11\x11\x11\x11\x11\x11\x12\x12\x12\x12\x12\x12\x12\x13\x13\x13\x13\x13\x13\x13\x14\x14\x14\x14\x14\x14\x14\x15\x15\x15\x15\x15\x15\x15\x16\x16\x16\x16\x16\x16\x16\x17\x17\x17\x17\x17\x17\x17\x18\x18\x18\x18\x18\x18\x18\x19\x19\x19\x19\x19\x19\x19\x20\x20\x20\x20\x20\x20\x20\x21\x21\x21\x21\x21\x21\x21\x22\x22\x22\x22\x22\x22\x22\x23\x23\x23\x23\x23\x23\x23\x24\x24\x24\x24\x24\x24\x24\x25\x25\x25\x25\x25\x25\x25\x26\x26\x26\x26\x26\x26\x26\x27\x27\x27\x27\x27\x27\x27\x28\x28\x28\x28\x28\x28\x28\x29\x29\x29\x29\x29\x29\x29\x30\x30\x30\x30\x30\x30\x30\x31\x31\x31\x31\x31\x31\x31\x32\x32\x32\x32\x32\x32\x32\x33\x33\x33\x33\x33\x33\x33\x34\x34\x34\x34\x34\x34\x34\x35\x35\x35\x35\x35\x35\x35\x36\x36\x36\x36\x36\x36\x36\x37\x37\x37"
-
-// varintLen returns how long i would be if it were varint encoded.
-func varintLen(i int32) int {
-	u := uint32(i)<<1 ^ uint32(i>>31)
-	return uvarintLen(u)
-}
 
 // uvarintLen returns how long u would be if it were uvarint encoded.
 func uvarintLen(u uint32) int {
@@ -56,10 +53,9 @@ func appendUvarint(dst []byte, u uint32) []byte {
 		return append(dst,
 			byte(u&0x7f|0x80),
 			byte(u>>7))
-	case 1:
+	default:
 		return append(dst, byte(u))
 	}
-	return dst
 }
 
 // appendVarlong appends a varint encoded i to dst.
@@ -70,4 +66,75 @@ func appendVarlong(dst []byte, i int64) []byte {
 		u >>= 7
 	}
 	return append(dst, byte(u))
+}
+
+func readUvarint(src []byte) (uint32, []byte, error) {
+	var u uint32
+	for i := range 5 {
+		if i >= len(src) {
+			return 0, nil, errors.New("short buffer reading uvarint")
+		}
+		b := src[i]
+		u |= uint32(b&0x7f) << (7 * i)
+		if b&0x80 == 0 {
+			return u, src[i+1:], nil
+		}
+	}
+	return 0, nil, errors.New("uvarint overflows 32 bits")
+}
+
+func readVarint(src []byte) (int32, []byte, error) {
+	if len(src) > 0 && src[0] < 0x80 {
+		u := uint32(src[0])
+		return int32(u>>1) ^ -int32(u&1), src[1:], nil
+	}
+	u, src, err := readUvarint(src)
+	if err != nil {
+		return 0, nil, err
+	}
+	return int32(u>>1) ^ -int32(u&1), src, nil
+}
+
+func readUvarlong(src []byte) (uint64, []byte, error) {
+	var u uint64
+	for i := range 10 {
+		if i >= len(src) {
+			return 0, nil, errors.New("short buffer reading uvarlong")
+		}
+		b := src[i]
+		u |= uint64(b&0x7f) << (7 * i)
+		if b&0x80 == 0 {
+			return u, src[i+1:], nil
+		}
+	}
+	return 0, nil, errors.New("uvarlong overflows 64 bits")
+}
+
+func readVarlong(src []byte) (int64, []byte, error) {
+	if len(src) > 0 && src[0] < 0x80 {
+		u := uint64(src[0])
+		return int64(u>>1) ^ -int64(u&1), src[1:], nil
+	}
+	u, src, err := readUvarlong(src)
+	if err != nil {
+		return 0, nil, err
+	}
+	return int64(u>>1) ^ -int64(u&1), src, nil
+}
+
+func readUint32(src []byte) (uint32, []byte, error) {
+	if len(src) < 4 {
+		return 0, nil, errors.New("short buffer reading uint32")
+	}
+	u := uint32(src[0]) | uint32(src[1])<<8 | uint32(src[2])<<16 | uint32(src[3])<<24
+	return u, src[4:], nil
+}
+
+func readUint64(src []byte) (uint64, []byte, error) {
+	if len(src) < 8 {
+		return 0, nil, errors.New("short buffer reading uint64")
+	}
+	u := uint64(src[0]) | uint64(src[1])<<8 | uint64(src[2])<<16 | uint64(src[3])<<24 |
+		uint64(src[4])<<32 | uint64(src[5])<<40 | uint64(src[6])<<48 | uint64(src[7])<<56
+	return u, src[8:], nil
 }
