@@ -1,19 +1,95 @@
 package avro
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"strings"
 	"testing"
 )
 
-func TestParsingCanonicalForm(t *testing.T) {
+func TestCanonical(t *testing.T) {
 	s, err := NewSchema(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := string(s.ParsingCanonicalForm())
+	got := string(s.Canonical())
 	if !strings.Contains(got, `"name":"r"`) {
 		t.Errorf("canonical form missing name: %s", got)
+	}
+}
+
+func TestFingerprint(t *testing.T) {
+	s, err := NewSchema(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := s.Fingerprint(sha256.New())
+	if len(fp) != 32 {
+		t.Fatalf("expected 32 bytes, got %d", len(fp))
+	}
+	if bytes.Equal(fp, make([]byte, 32)) {
+		t.Fatal("fingerprint is all zeros")
+	}
+}
+
+func TestFingerprintRabin(t *testing.T) {
+	tests := []struct {
+		schema    string
+		canonical string
+		sum64     uint64
+	}{
+		{`"null"`, `"null"`, 7195948357588979594},
+		{`{"type":"fixed","name":"foo","size":15}`, `{"name":"foo","type":"fixed","size":15}`, 1756455273707447556},
+		{
+			`{"type":"record","name":"foo","fields":[{"name":"f1","type":"boolean"}]}`,
+			`{"name":"foo","type":"record","fields":[{"name":"f1","type":"boolean"}]}`,
+			7843277075252814651,
+		},
+	}
+	for _, tt := range tests {
+		s, err := NewSchema(tt.schema)
+		if err != nil {
+			t.Fatalf("schema %s: %v", tt.schema, err)
+		}
+		if got := string(s.Canonical()); got != tt.canonical {
+			t.Errorf("canonical: got %s, want %s", got, tt.canonical)
+		}
+		h := NewRabin()
+		fp := s.Fingerprint(h)
+		if got := h.Sum64(); got != tt.sum64 {
+			t.Errorf("schema %s: Sum64 = %d, want %d", tt.schema, got, tt.sum64)
+		}
+		if len(fp) != 8 {
+			t.Fatalf("expected 8 bytes, got %d", len(fp))
+		}
+	}
+
+	// Verify Sum bytes for "null".
+	h := NewRabin()
+	h.Write([]byte(`"null"`))
+	got := h.Sum(nil)
+	want := []byte{0x63, 0xdd, 0x24, 0xe7, 0xcc, 0x25, 0x8f, 0x8a}
+	if !bytes.Equal(got, want) {
+		t.Errorf("Sum bytes = %x, want %x", got, want)
+	}
+}
+
+func TestRabinReset(t *testing.T) {
+	h := NewRabin()
+	h.Write([]byte("hello"))
+	before := h.Sum64()
+	h.Reset()
+	h.Write([]byte("hello"))
+	after := h.Sum64()
+	if before != after {
+		t.Errorf("after Reset: got %d, want %d", after, before)
+	}
+	if h.Size() != 8 {
+		t.Errorf("Size() = %d, want 8", h.Size())
+	}
+	if h.BlockSize() != 1 {
+		t.Errorf("BlockSize() = %d, want 1", h.BlockSize())
 	}
 }
 

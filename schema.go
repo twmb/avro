@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"regexp"
 	"strings"
 )
@@ -41,9 +42,14 @@ func NewSchema(schema string) (*Schema, error) {
 	}, nil
 }
 
-func (s *Schema) ParsingCanonicalForm() []byte {
+func (s *Schema) Canonical() []byte {
 	b, _ := json.Marshal(s.c)
 	return b
+}
+
+func (s *Schema) Fingerprint(h hash.Hash) []byte {
+	h.Write(s.Canonical())
+	return h.Sum(nil)
 }
 
 type aschema struct {
