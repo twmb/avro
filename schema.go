@@ -1,4 +1,4 @@
-package main
+package avro
 
 import (
 	"bytes"
@@ -7,31 +7,43 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"sync"
 )
 
 type Schema struct {
-	s aschema
+	ser   serfn
+	deser deserfn
+
+	c aschema
 }
 
 func NewSchema(schema string) (*Schema, error) {
-	var s aschema
-	if err := json.Unmarshal([]byte(schema), &s); err != nil {
+	var orig aschema
+	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
 		return nil, fmt.Errorf("invalid schema: %v", err)
 	}
-	_, err := s.canonicalize("")
-	if err != nil {
+
+	b := &builder{
+		types:   make(map[string]serfn),
+		dtypes:  make(map[string]deserfn),
+		stypes:  make(map[string]*serRecord),
+		drtypes: make(map[string]*deserRecord),
+	}
+	if err := b.build("", &orig); err != nil {
+		return nil, err
+	}
+	if err := b.finalize(); err != nil {
 		return nil, err
 	}
 	return &Schema{
-		s: s,
+		ser:   b.ser,
+		deser: b.deser,
+		c:     b.canon,
 	}, nil
 }
 
-func (s *Schema) ParsingCanonicalForm() string {
-	c, _ := s.s.canonicalize("")
-	b, _ := json.Marshal(c)
-	return string(b)
+func (s *Schema) ParsingCanonicalForm() []byte {
+	b, _ := json.Marshal(s.c)
+	return b
 }
 
 type aschema struct {
@@ -76,8 +88,6 @@ type afield struct {
 
 	// In canonical form, the following are stripped.
 
-	Order   string   `json:"order,omitempty"`
-	Doc     string   `json:"doc,omitempty"`
 	Aliases []string `json:"aliases,omitempty"`
 	Default string   `json:"default,omitempty"`
 }
@@ -96,130 +106,259 @@ type aobject struct {
 	Values  *aschema `json:"values,omitempty"`  // map
 	Size    *int     `json:"size,omitempty"`    // fixed
 
-	// In canonical form, the following four fields are stripped.
+	// In canonical form, the following are stripped.
 
 	Namespace string          `json:"namespace,omitempty"`
-	Doc       string          `json:"doc,omitempty"`
 	Aliases   []string        `json:"aliases,omitempty"`
 	Default   json.RawMessage `json:"default,omitempty"`
 
 	Logical   string `json:"logicalType,omitempty"`
 	Scale     *int   `json:"scale,omitempty"`     // decimal logical type
-	Precision *int   `json:"precision,omitempty"` // decmial logical type
-
-	typeFields sync.Map // map[reflect.Type][]int
+	Precision *int   `json:"precision,omitempty"` // decimal logical type
 }
 
-var (
-	aprimitive = map[string]struct{}{
-		"null":    {},
-		"boolean": {},
-		"int":     {},
-		"long":    {},
-		"float":   {},
-		"double":  {},
-		"bytes":   {},
-		"string":  {},
-	}
+var acomplex = map[string]struct{}{
+	"record": {},
+	"enum":   {},
+	"array":  {},
+	"map":    {},
+	"fixed":  {},
+}
 
-	acomplex = map[string]struct{}{
-		"record": {},
-		"enum":   {},
-		"array":  {},
-		"map":    {},
-		"fixed":  {},
-	}
-)
+type unionMissing struct {
+	ser     *serUnion
+	missing map[int]string
+}
 
-func (s *aschema) unionTypeName() (string, string) {
+type unionMissingDeser struct {
+	deser   *deserUnion
+	missing map[int]string
+}
+
+type fieldMeta struct {
+	avroType    string
+	serRecord   *serRecord
+	deserRecord *deserRecord
+	inner       *fieldMeta
+}
+
+type metaFixup struct {
+	meta *fieldMeta
+	name string
+}
+
+type builder struct {
+	ser   serfn
+	deser deserfn
+
+	types    map[string]serfn
+	dtypes   map[string]deserfn
+	stypes   map[string]*serRecord
+	drtypes  map[string]*deserRecord
+	missing  []unionMissing
+	dmissing []unionMissingDeser
+	mfixups  []metaFixup
+
+	meta  fieldMeta
+	canon aschema
+}
+
+func (b *builder) nest() *builder {
+	return &builder{
+		types:   b.types,
+		dtypes:  b.dtypes,
+		stypes:  b.stypes,
+		drtypes: b.drtypes,
+	}
+}
+
+func (b *builder) unnest(nest *builder) {
+	b.missing = append(b.missing, nest.missing...)
+	b.dmissing = append(b.dmissing, nest.dmissing...)
+	b.mfixups = append(b.mfixups, nest.mfixups...)
+}
+
+func (b *builder) finalize() error {
+	for _, m := range b.missing {
+		for idx, name := range m.missing {
+			ser := b.types[name]
+			if ser == nil {
+				return fmt.Errorf("unknown type %q", name)
+			}
+			m.ser.fns[idx] = ser
+		}
+	}
+	for _, m := range b.dmissing {
+		for idx, name := range m.missing {
+			m.deser.fns[idx] = b.dtypes[name]
+		}
+	}
+	for _, m := range b.mfixups {
+		m.meta.serRecord = b.stypes[m.name]
+		m.meta.deserRecord = b.drtypes[m.name]
+	}
+	return nil
+}
+
+func (s *aschema) unionTypeName() (string, string, error) {
 	if s.primitive != "" {
-		return s.primitive, ""
+		return s.primitive, "", nil
 	}
 	if len(s.union) > 0 {
-		return "union", ""
+		return "union", "", errors.New("unions cannot immediately contain other unions")
 	}
 	switch s.object.Type {
 	case "record", "fixed", "enum":
-		return s.object.Type, s.object.Name
+		return s.object.Type, s.object.Name, nil
 	default:
-		return s.object.Type, ""
+		return s.object.Type, "", nil
 	}
 }
+
+type unknownPrimitiveError struct{ p string }
+
+func (e *unknownPrimitiveError) Error() string { return fmt.Sprintf("unknown primitive %q", e.p) }
 
 var (
 	reName      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	reNamespace = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)$`)
 )
 
-// Canonicalize validates (almost entirely -- some parts missing, such as
-// defaults) and canonicalizes a schema.
-func (s *aschema) canonicalize(parentName string) (aschema, error) {
+func (b *builder) build(parentName string, s *aschema) error {
 	if s == nil || s.primitive == "" && s.object == nil && len(s.union) == 0 {
-		return aschema{}, errors.New("schema is not a primitive, complex, nor union")
+		return errors.New("schema is not a primitive, complex, nor union")
 	}
 
-	// If this is a primitive, we ensure the primitive is known.
-	if s.primitive != "" {
-		if _, exists := aprimitive[s.primitive]; !exists {
-			return aschema{}, fmt.Errorf("unknown primitive %q", s.primitive)
+	switch {
+	case s.primitive != "":
+		return b.buildPrimitive(s)
+	case len(s.union) != 0:
+		return b.buildUnion(parentName, s)
+	default:
+		return b.buildComplex(parentName, s)
+	}
+}
+
+func (b *builder) buildPrimitive(s *aschema) error {
+	b.canon = aschema{primitive: s.primitive}
+	b.meta = fieldMeta{avroType: s.primitive}
+	fn, exists := serPrimitive[s.primitive]
+	if exists {
+		b.ser = fn
+		b.deser = deserPrimitive[s.primitive]
+		return nil
+	}
+	// Check if this is a named type reference (record, enum, fixed).
+	if ser := b.types[s.primitive]; ser != nil {
+		b.ser = ser
+		b.deser = b.dtypes[s.primitive]
+		if sr := b.stypes[s.primitive]; sr != nil {
+			b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[s.primitive]}
 		}
-		return aschema{primitive: s.primitive}, nil
+		return nil
 	}
+	return &unknownPrimitiveError{s.primitive}
+}
 
-	// If this is a union, then: unions may not contain multiple schemas
-	// with the same type, except for record, fixed, and enum. Unions also
-	// cannot contain other immediate unions. For record, fixed, and enum,
-	// we must not have duplicate names.
-	if len(s.union) != 0 {
-		sawTypes := make(map[string]bool)
-		sawNames := make(map[string]bool)
+// Unions may not contain multiple schemas with the same type, except for
+// record, fixed, and enum (of which we ensure unique names). Unions also
+// cannot contain other immediate unions.
+//
+// If we see types we do not understand, it is possible they are referencing
+// things that are not yet declared. We fixup at the very end.
+func (b *builder) buildUnion(parentName string, s *aschema) error {
+	var (
+		ser         = new(serUnion)
+		deser       = new(deserUnion)
+		missing     = make(map[int]string)
+		sawTypes    = make(map[string]bool)
+		sawNames    = make(map[string]bool)
+		branchMetas = make([]fieldMeta, len(s.union))
+	)
 
-		c := aschema{union: make([]aschema, 0, len(s.union))}
-		for _, us := range s.union {
-			uc, err := us.canonicalize(parentName)
-			if err != nil {
-				return aschema{}, fmt.Errorf("invalid union: %v", err)
+	for i, us := range s.union {
+		u := b.nest()
+		if err := u.build(parentName, &us); err != nil {
+			if pe := (*unknownPrimitiveError)(nil); !errors.As(err, &pe) {
+				return fmt.Errorf("invalid union: %w", err)
 			}
-			typ, name := uc.unionTypeName()
-			if typ == "union" {
-				return aschema{}, errors.New("unions cannot contain other immediate unions")
-			}
-			if sawTypes[typ] {
-				if name == "" {
-					return aschema{}, fmt.Errorf("duplicate union type %q", typ)
-				} else {
-					if sawNames[name] {
-						return aschema{}, fmt.Errorf("duplicate union name %q", name)
-					}
-					sawNames[name] = true
-				}
-			}
-			sawTypes[typ] = true
-			c.union = append(c.union, uc)
+			missing[i] = us.primitive
 		}
-		return c, nil
+		b.unnest(u)
+		branchMetas[i] = u.meta
+
+		typ, name, err := us.unionTypeName()
+		if err != nil {
+			return err
+		}
+		if sawTypes[typ] {
+			if name == "" {
+				return fmt.Errorf("duplicate union type %q", typ)
+			}
+			if sawNames[name] {
+				return fmt.Errorf("duplicate union name %q", name)
+			}
+		}
+		sawTypes[typ] = true
+		if name != "" {
+			sawNames[name] = true
+		}
+
+		b.canon.union = append(b.canon.union, u.canon)
+		ser.fns = append(ser.fns, u.ser)
+		deser.fns = append(deser.fns, u.deser)
 	}
 
-	// If this object is a primitive in the shape of a complex,
-	// we convert this to a primitive.
-	o := s.object
-	_, isPrimitive := aprimitive[o.Type]
-	if isPrimitive {
-		if o.Logical == "" {
-			return aschema{primitive: o.Type}, nil
+	if len(s.union) == 2 && s.union[0].primitive == "null" {
+		b.ser = serNullUnion(ser)
+		b.deser = deserNullUnion(deser)
+		if _, isMissing := missing[1]; isMissing {
+			inner := &fieldMeta{}
+			b.meta = fieldMeta{avroType: "nullunion", inner: inner}
+			b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: s.union[1].primitive})
+		} else {
+			inner := new(fieldMeta)
+			*inner = branchMetas[1]
+			b.meta = fieldMeta{avroType: "nullunion", inner: inner}
 		}
 	} else {
-		if _, exists := acomplex[o.Type]; !exists {
-			return aschema{}, fmt.Errorf("unknown complex type %q", o.Type)
-		}
+		b.ser = ser.ser
+		b.deser = deser.deser
+		b.meta = fieldMeta{avroType: "union"}
+	}
+	if len(missing) > 0 {
+		b.missing = append(b.missing, unionMissing{
+			ser,
+			missing,
+		})
+		b.dmissing = append(b.dmissing, unionMissingDeser{
+			deser,
+			missing,
+		})
+	}
+	return nil
+}
+
+func (b *builder) buildComplex(parentName string, s *aschema) error {
+	// If this object is a primitive in the shape of a complex, we convert
+	// this to a primitive.
+	o := s.object
+
+	if err := o.validateLogical(); err != nil {
+		return err
 	}
 
-	// We copy our object so we can make modifications to the copy. For any
-	// fields / nested schemas (items, values), we will copy as we process.
+	if ser, isPrimitive := serPrimitive[o.Type]; isPrimitive {
+		b.ser = ser
+		b.deser = deserPrimitive[o.Type]
+		b.canon = aschema{primitive: o.Type}
+		b.meta = fieldMeta{avroType: o.Type}
+		return nil
+	}
+
 	o = &aobject{
-		Type:      o.Type,
-		Name:      o.Name,
-		Namespace: o.Namespace,
+		Name: o.Name,
+		Type: o.Type,
 
 		Fields:  o.Fields,
 		Symbols: o.Symbols,
@@ -227,10 +366,9 @@ func (s *aschema) canonicalize(parentName string) (aschema, error) {
 		Values:  o.Values,
 		Size:    o.Size,
 
-		Logical:   o.Logical,
-		Scale:     o.Scale,
-		Precision: o.Precision,
+		Namespace: o.Namespace,
 	}
+	b.canon = aschema{object: o}
 
 	switch o.Type {
 	case "record", "enum", "fixed":
@@ -238,12 +376,12 @@ func (s *aschema) canonicalize(parentName string) (aschema, error) {
 			if reNamespace.MatchString(o.Name) {
 				parentName, o.Namespace = "", "" // fullname: ignore parent & our own namespace
 			} else {
-				return aschema{}, fmt.Errorf("invalid name %q", o.Name)
+				return fmt.Errorf("invalid name %q", o.Name)
 			}
 		}
 		if o.Namespace != "" {
 			if !reNamespace.MatchString(o.Namespace) {
-				return aschema{}, fmt.Errorf("invalid namespace %q", o.Namespace)
+				return fmt.Errorf("invalid namespace %q", o.Namespace)
 			}
 			o.Name = o.Namespace + "." + o.Name // have namespace: prefix our name
 			o.Namespace = ""
@@ -255,187 +393,199 @@ func (s *aschema) canonicalize(parentName string) (aschema, error) {
 		}
 	default:
 		if o.Name != "" || o.Namespace != "" {
-			return aschema{}, errors.New("only record, enum, and fixed can have a name")
+			return errors.New("only record, enum, and fixed can have a name")
 		}
 	}
 
 	switch o.Type {
+	default:
+		return fmt.Errorf("unknown complex type %q", o.Type)
+
 	case "record":
 		if len(o.Symbols) > 0 ||
 			o.Items != nil ||
 			o.Values != nil ||
 			o.Size != nil {
-			return aschema{}, errors.New("invalid record has schema for other types")
+			return errors.New("invalid record has schema for other types")
 		}
 
-		for i, f := range o.Fields {
-			if !reName.MatchString(f.Name) {
-				return aschema{}, fmt.Errorf("invalid record field name %q", f.Name)
+		// Create record ser/deser and register early so
+		// self-referencing fields (e.g. array items, map values)
+		// can resolve the type by name during field building.
+		sr := &serRecord{}
+		dr := &deserRecord{}
+		b.ser = sr.ser
+		b.deser = dr.deser
+		b.types[o.Name] = b.ser
+		b.dtypes[o.Name] = b.deser
+		b.stypes[o.Name] = sr
+		b.drtypes[o.Name] = dr
+		b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: dr}
+
+		var names []string
+		for i, of := range o.Fields {
+			if !reName.MatchString(of.Name) {
+				return fmt.Errorf("invalid record field name %q", of.Name)
 			}
-			fc, err := f.Type.canonicalize(o.Name)
-			if err != nil {
-				return aschema{}, fmt.Errorf("invalid record field: %v", err)
+			bf := b.nest()
+			if err := bf.build(o.Name, of.Type); err != nil {
+				return fmt.Errorf("invalid record field: %v", err)
 			}
+			b.unnest(bf)
 			o.Fields[i] = afield{
-				Name: f.Name,
-				Type: &fc,
+				Name: of.Name,
+				Type: &bf.canon,
 			}
+			meta := new(fieldMeta)
+			*meta = bf.meta
+			sr.fields = append(sr.fields, serRecordField{
+				name:     of.Name,
+				fn:       bf.ser,
+				avroType: meta.avroType,
+				meta:     meta,
+			})
+			dr.fields = append(dr.fields, deserRecordField{
+				name:     of.Name,
+				fn:       bf.deser,
+				avroType: meta.avroType,
+				meta:     meta,
+			})
+			names = append(names, of.Name)
 		}
+		sr.names = names
+		dr.names = names
 
 	case "enum":
 		if len(o.Fields) > 0 ||
 			o.Items != nil ||
 			o.Values != nil ||
 			o.Size != nil {
-			return aschema{}, errors.New("invalid enum has schema for other types")
+			return errors.New("invalid enum has schema for other types")
 		}
 
 		for _, e := range o.Symbols {
 			if !reName.MatchString(e) {
-				return aschema{}, fmt.Errorf("invalid enum symbol %q", e)
+				return fmt.Errorf("invalid enum symbol %q", e)
 			}
 		}
+		b.ser = (&serEnum{symbols: o.Symbols}).ser
+		b.deser = (&deserEnum{symbols: o.Symbols}).deser
+		b.meta = fieldMeta{avroType: "enum"}
 
 	case "array":
 		if len(o.Fields) > 0 ||
 			len(o.Symbols) > 0 ||
 			o.Values != nil ||
 			o.Size != nil {
-			return aschema{}, errors.New("invalid array has schema for other types")
+			return errors.New("invalid array has schema for other types")
 		}
 		if o.Items == nil {
-			return aschema{}, errors.New("array is missing items schema")
+			return errors.New("array is missing items schema")
 		}
-		ic, err := o.Items.canonicalize(parentName)
-		if err != nil {
-			return aschema{}, fmt.Errorf("invalid array: %v", err)
+		af := b.nest()
+		if err := af.build(parentName, o.Items); err != nil {
+			return fmt.Errorf("invalid array: %v", err)
 		}
-		o.Items = &ic
+		b.unnest(af)
+		o.Items = &af.canon
+		b.ser = (&serArray{af.ser}).ser
+		b.deser = (&deserArray{af.deser}).deser
+		inner := new(fieldMeta)
+		*inner = af.meta
+		b.meta = fieldMeta{avroType: "array", inner: inner}
 
 	case "map":
 		if len(o.Fields) > 0 ||
 			len(o.Symbols) > 0 ||
 			o.Items != nil ||
 			o.Size != nil {
-			return aschema{}, errors.New("invalid map has schema for other types")
+			return errors.New("invalid map has schema for other types")
 		}
 		if o.Values == nil {
-			return aschema{}, errors.New("map is missing values schema")
+			return errors.New("map is missing values schema")
 		}
-		vc, err := o.Values.canonicalize(parentName)
-		if err != nil {
-			return aschema{}, fmt.Errorf("invalid map: %v", err)
+		mf := b.nest()
+		if err := mf.build(parentName, o.Values); err != nil {
+			return fmt.Errorf("invalid map: %v", err)
 		}
-		o.Values = &vc
+		b.unnest(mf)
+		o.Values = &mf.canon
+		b.ser = (&serMap{mf.ser}).ser
+		b.deser = (&deserMap{mf.deser}).deser
+		b.meta = fieldMeta{avroType: "map"}
 
 	case "fixed":
 		if len(o.Fields) > 0 ||
 			len(o.Symbols) > 0 ||
 			o.Items != nil ||
 			o.Values != nil {
-			return aschema{}, errors.New("invalid fixed has schema for other types")
+			return errors.New("invalid fixed has schema for other types")
 		}
 		if o.Size == nil {
-			return aschema{}, errors.New("fixed is missing size")
+			return errors.New("fixed is missing size")
 		}
 		if *o.Size < 0 {
-			return aschema{}, fmt.Errorf("invalid fixed size %v", *o.Size)
+			return fmt.Errorf("invalid fixed size %v", *o.Size)
 		}
-
-	default: // primitive logical type
-		if len(o.Fields) > 0 ||
-			len(o.Symbols) > 0 ||
-			o.Items != nil ||
-			o.Values != nil ||
-			o.Size != nil {
-			return aschema{}, errors.New("invalid primitive has schema for other types")
-		}
+		b.ser = (&serSize{*o.Size}).ser
+		b.deser = (&deserFixed{*o.Size}).deser
+		b.meta = fieldMeta{avroType: "fixed"}
 	}
+	return nil
+}
 
-	o.Doc, o.Aliases, o.Default = "", nil, nil
-
+func (o *aobject) validateLogical() error {
 	switch o.Logical {
 	case "":
 		// No logical type: validate no scale / precision below.
 
 	case "decimal":
 		if o.Precision == nil {
-			return aschema{}, errors.New("logicalType decimal missing precision")
+			return errors.New("logicalType decimal missing precision")
 		}
 		if o.Type != "bytes" && o.Type != "fixed" {
-			return aschema{}, fmt.Errorf("invalid logicalType decimal type %q, can only be bytes or fixed", o.Type)
+			return fmt.Errorf("invalid logicalType decimal type %q, can only be bytes or fixed", o.Type)
 		}
-
-		// With decimal, we have finally validated everything that
-		// should or should not exist. For all other logical types, we
-		// require no scale / precision, which is validated below the
-		// switch.
-		return aschema{object: o}, nil
+		return nil
 
 	case "uuid":
 		if o.Type != "string" {
-			return aschema{}, fmt.Errorf("invalid logicalType uuid type %q, can only be string", o.Type)
+			return fmt.Errorf("invalid logicalType uuid type %q, can only be string", o.Type)
 		}
 
-	case "date":
+	case "date",
+		"time-millis":
 		if o.Type != "int" {
-			return aschema{}, fmt.Errorf("invalid logicalType date type %q, can only be int", o.Type)
+			return fmt.Errorf("invalid logicalType %s type %q, can only be int", o.Logical, o.Type)
 		}
 
-	case "time-millis":
-		if o.Type != "int" {
-			return aschema{}, fmt.Errorf("invalid logicalType time-millis type %q, can only be int", o.Type)
-		}
-
-	case "time-micros":
+	case "time-micros",
+		"timestamp-millis",
+		"timestamp-micros",
+		"local-timestamp-millis",
+		"local-timestamp-micros":
 		if o.Type != "long" {
-			return aschema{}, fmt.Errorf("invalid logicalType time-micros type %q, can only be long", o.Type)
-		}
-
-	case "timestamp-millis":
-		if o.Type != "long" {
-			return aschema{}, fmt.Errorf("invalid logicalType timestamp-millis type %q, can only be long", o.Type)
-		}
-
-	case "timestamp-micros":
-		if o.Type != "long" {
-			return aschema{}, fmt.Errorf("invalid logicalType timestamp-micros type %q, can only be long", o.Type)
-		}
-
-	case "local-timestamp-millis":
-		if o.Type != "long" {
-			return aschema{}, fmt.Errorf("invalid logicalType local-timestamp-millis type %q, can only be long", o.Type)
-		}
-
-	case "local-timestamp-micros":
-		if o.Type != "long" {
-			return aschema{}, fmt.Errorf("invalid logicalType local-timestamp-micros type %q, can only be long", o.Type)
+			return fmt.Errorf("invalid logicalType %s type %q, can only be long", o.Logical, o.Type)
 		}
 
 	case "duration":
 		if o.Type != "fixed" {
-			return aschema{}, fmt.Errorf("invalid logicalType duration type %q, can only be fixed", o.Type)
+			return fmt.Errorf("invalid logicalType duration type %q, can only be fixed", o.Type)
 		}
 		if o.Size == nil {
-			return aschema{}, errors.New("invalid logicalType duration has no size")
+			return errors.New("invalid logicalType duration has no size")
 		}
 		if *o.Size != 12 {
-			return aschema{}, fmt.Errorf("invalid logicalType duration size %v is not the expected 12", *o.Size)
+			return fmt.Errorf("invalid logicalType duration size %v is not the expected 12", *o.Size)
 		}
 
 	default:
-		return aschema{}, fmt.Errorf("unknown logicalType %q", o.Logical)
+		return fmt.Errorf("unknown logicalType %q", o.Logical)
 	}
 
 	if o.Scale != nil || o.Precision != nil {
-		return aschema{}, fmt.Errorf("type %q logicalType %q: invalid scale or precision specified", o.Type, o.Logical)
+		return fmt.Errorf("type %q logicalType %q: invalid scale or precision specified", o.Type, o.Logical)
 	}
 
-	if o.Logical != "" {
-		// Now that we have validated the logical type, for canonical
-		// form we return the primitive.
-		return aschema{primitive: o.Type}, nil
-	}
-
-	return aschema{object: o}, nil
+	return nil
 }
