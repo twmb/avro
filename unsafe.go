@@ -466,6 +466,11 @@ func tryCompileLogicalSer(logical string, goType reflect.Type) userfn {
 			return usTimeMicros
 		}
 		return usLong(goType.Kind())
+	case "duration":
+		if goType == avroDurationType {
+			return usDuration
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -498,6 +503,11 @@ func tryCompileLogicalDeser(logical string, goType reflect.Type) udeserfn {
 			return udTimeMicros
 		}
 		return udLong(goType.Kind())
+	case "duration":
+		if goType == avroDurationType {
+			return udDuration
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -572,6 +582,25 @@ func udTimeMicros(src []byte, p unsafe.Pointer) ([]byte, error) {
 	}
 	*(*time.Duration)(p) = time.Duration(val) * time.Microsecond
 	return src, nil
+}
+
+func usDuration(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	d := *(*Duration)(p)
+	dst = appendUint32(dst, d.Months)
+	dst = appendUint32(dst, d.Days)
+	dst = appendUint32(dst, d.Milliseconds)
+	return dst, nil
+}
+
+func udDuration(src []byte, p unsafe.Pointer) ([]byte, error) {
+	if len(src) < 12 {
+		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
+	}
+	d := (*Duration)(p)
+	d.Months = uint32(src[0]) | uint32(src[1])<<8 | uint32(src[2])<<16 | uint32(src[3])<<24
+	d.Days = uint32(src[4]) | uint32(src[5])<<8 | uint32(src[6])<<16 | uint32(src[7])<<24
+	d.Milliseconds = uint32(src[8]) | uint32(src[9])<<8 | uint32(src[10])<<16 | uint32(src[11])<<24
+	return src[12:], nil
 }
 
 // ---- Unsafe serializers ----

@@ -356,6 +356,17 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	}
 
 	if ser, isPrimitive := serPrimitive[o.Type]; isPrimitive {
+		if o.Logical == "decimal" {
+			scale := 0
+			if o.Scale != nil {
+				scale = *o.Scale
+			}
+			b.ser = (&serBytesDecimal{scale: scale}).ser
+			b.deser = (&deserBytesDecimal{scale: scale}).deser
+			b.canon = aschema{primitive: o.Type}
+			b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
+			return nil
+		}
 		b.ser = ser
 		b.deser = deserPrimitive[o.Type]
 		if logSer := logicalSer(o.Logical); logSer != nil {
@@ -378,6 +389,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		Items:   o.Items,
 		Values:  o.Values,
 		Size:    o.Size,
+
+		Logical:   o.Logical,
+		Precision: o.Precision,
+		Scale:     o.Scale,
 
 		Namespace: o.Namespace,
 	}
@@ -562,9 +577,22 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if *o.Size < 0 {
 			return fmt.Errorf("invalid fixed size %v", *o.Size)
 		}
-		b.ser = (&serSize{*o.Size}).ser
-		b.deser = (&deserFixed{*o.Size}).deser
-		b.meta = fieldMeta{avroType: "fixed"}
+		switch o.Logical {
+		case "duration":
+			b.ser = serDuration
+			b.deser = deserDuration
+		case "decimal":
+			scale := 0
+			if o.Scale != nil {
+				scale = *o.Scale
+			}
+			b.ser = (&serFixedDecimal{size: *o.Size, scale: scale}).ser
+			b.deser = (&deserFixedDecimal{size: *o.Size, scale: scale}).deser
+		default:
+			b.ser = (&serSize{*o.Size}).ser
+			b.deser = (&deserFixed{*o.Size}).deser
+		}
+		b.meta = fieldMeta{avroType: "fixed", logical: o.Logical}
 	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -394,6 +395,17 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 
 var timeType = reflect.TypeOf(time.Time{})
 var durationType = reflect.TypeOf(time.Duration(0))
+var avroDurationType = reflect.TypeOf(Duration{})
+var bigRatType = reflect.TypeOf(big.Rat{})
+
+// Duration represents the Avro duration logical type: a 12-byte fixed
+// value containing three little-endian unsigned 32-bit integers
+// representing months, days, and milliseconds.
+type Duration struct {
+	Months       uint32
+	Days         uint32
+	Milliseconds uint32
+}
 
 func serTimestampMillis(dst []byte, v reflect.Value) ([]byte, error) {
 	v, err := indirect(v)
@@ -454,4 +466,105 @@ func serTimeMicros(dst []byte, v reflect.Value) ([]byte, error) {
 		return appendVarlong(dst, d.Microseconds()), nil
 	}
 	return serLong(dst, v)
+}
+
+func serDuration(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == avroDurationType {
+		d := v.Interface().(Duration)
+		dst = appendUint32(dst, d.Months)
+		dst = appendUint32(dst, d.Days)
+		dst = appendUint32(dst, d.Milliseconds)
+		return dst, nil
+	}
+	return (&serSize{12}).ser(dst, v)
+}
+
+type serBytesDecimal struct {
+	scale int
+}
+
+func (s *serBytesDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == bigRatType {
+		tmp := v.Interface().(big.Rat)
+		b := ratToBytes(&tmp, s.scale)
+		dst = appendVarlong(dst, int64(len(b)))
+		return append(dst, b...), nil
+	}
+	return serBytes(dst, v)
+}
+
+type serFixedDecimal struct {
+	size  int
+	scale int
+}
+
+func (s *serFixedDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == bigRatType {
+		tmp := v.Interface().(big.Rat)
+		r := &tmp
+		b := ratToBytes(r, s.scale)
+		if len(b) > s.size {
+			return nil, fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), s.size)
+		}
+		// Pad to fixed size with sign extension.
+		pad := byte(0)
+		if len(b) > 0 && b[0]&0x80 != 0 {
+			pad = 0xff
+		}
+		for i := len(b); i < s.size; i++ {
+			dst = append(dst, pad)
+		}
+		return append(dst, b...), nil
+	}
+	return (&serSize{s.size}).ser(dst, v)
+}
+
+// ratToBytes converts a *big.Rat to big-endian two's complement bytes
+// using the given scale: unscaled = rat * 10^scale.
+func ratToBytes(r *big.Rat, scale int) []byte {
+	// unscaled = num * 10^scale / denom
+	s := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+	unscaled := new(big.Int).Mul(r.Num(), s)
+	unscaled.Div(unscaled, r.Denom())
+	return bigIntToBytes(unscaled)
+}
+
+func bigIntToBytes(i *big.Int) []byte {
+	switch i.Sign() {
+	case 0:
+		return []byte{0}
+	case 1:
+		b := i.Bytes()
+		if b[0]&0x80 != 0 {
+			b = append([]byte{0}, b...)
+		}
+		return b
+	default:
+		// Two's complement for negative: flip bits of (|i| - 1).
+		abs := new(big.Int).Neg(i)
+		abs.Sub(abs, big.NewInt(1))
+		b := abs.Bytes()
+		if len(b) == 0 {
+			return []byte{0xff} // -1
+		}
+		for j := range b {
+			b[j] = ^b[j]
+		}
+		if b[0]&0x80 == 0 {
+			b = append([]byte{0xff}, b...)
+		}
+		return b
+	}
 }

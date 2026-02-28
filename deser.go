@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -644,4 +645,93 @@ func deserTimeMicros(src []byte, v reflect.Value) ([]byte, error) {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
 	}
 	return src, nil
+}
+
+func deserDuration(src []byte, v reflect.Value) ([]byte, error) {
+	if len(src) < 12 {
+		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
+	}
+	v = indirectAlloc(v)
+	if v.Kind() == reflect.Interface || v.Type() == avroDurationType {
+		months := uint32(src[0]) | uint32(src[1])<<8 | uint32(src[2])<<16 | uint32(src[3])<<24
+		days := uint32(src[4]) | uint32(src[5])<<8 | uint32(src[6])<<16 | uint32(src[7])<<24
+		ms := uint32(src[8]) | uint32(src[9])<<8 | uint32(src[10])<<16 | uint32(src[11])<<24
+		v.Set(reflect.ValueOf(Duration{Months: months, Days: days, Milliseconds: ms}))
+		return src[12:], nil
+	}
+	// Fall back to [12]byte fixed.
+	return (&deserFixed{12}).deser(src, v)
+}
+
+type deserBytesDecimal struct {
+	scale int
+}
+
+func (s *deserBytesDecimal) deser(src []byte, v reflect.Value) ([]byte, error) {
+	length, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("invalid negative bytes length %d", length)
+	}
+	n := int(length)
+	if len(src) < n {
+		return nil, &ShortBufferError{Type: "decimal", Need: n, Have: len(src)}
+	}
+	b := src[:n]
+	src = src[n:]
+	v = indirectAlloc(v)
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
+		return src, nil
+	}
+	if v.Type() == bigRatType {
+		v.Set(reflect.ValueOf(*bytesToRat(b, s.scale)))
+		return src, nil
+	}
+	return nil, &SemanticError{GoType: v.Type(), AvroType: "decimal"}
+}
+
+type deserFixedDecimal struct {
+	size  int
+	scale int
+}
+
+func (s *deserFixedDecimal) deser(src []byte, v reflect.Value) ([]byte, error) {
+	if len(src) < s.size {
+		return nil, &ShortBufferError{Type: "decimal", Need: s.size, Have: len(src)}
+	}
+	b := src[:s.size]
+	src = src[s.size:]
+	v = indirectAlloc(v)
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
+		return src, nil
+	}
+	if v.Type() == bigRatType {
+		v.Set(reflect.ValueOf(*bytesToRat(b, s.scale)))
+		return src, nil
+	}
+	// Fall back to [N]byte fixed.
+	return (&deserFixed{s.size}).deser(append(b[:0:0], b...), v)
+}
+
+func bytesToRat(b []byte, scale int) *big.Rat {
+	unscaled := bytesToBigInt(b)
+	s := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+	return new(big.Rat).SetFrac(unscaled, s)
+}
+
+func bytesToBigInt(b []byte) *big.Int {
+	if len(b) == 0 {
+		return new(big.Int)
+	}
+	i := new(big.Int).SetBytes(b) // unsigned big-endian
+	if b[0]&0x80 != 0 {
+		// Negative in two's complement: subtract 2^(8*len).
+		modulus := new(big.Int).Lsh(big.NewInt(1), uint(8*len(b)))
+		i.Sub(i, modulus)
+	}
+	return i
 }

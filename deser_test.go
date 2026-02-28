@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"reflect"
 	"testing"
 	"time"
@@ -6325,4 +6326,578 @@ func TestSchemaValidateLogicalError(t *testing.T) {
 	}
 }
 
+// ---- Duration logical type ----
 
+func TestDurationRoundTrip(t *testing.T) {
+	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
+	d := Duration{Months: 3, Days: 15, Milliseconds: 86400000}
+	got := roundTrip(t, schema, d)
+	if got != d {
+		t.Fatalf("got %+v, want %+v", got, d)
+	}
+}
+
+func TestDurationZero(t *testing.T) {
+	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
+	d := Duration{}
+	got := roundTrip(t, schema, d)
+	if got != d {
+		t.Fatalf("got %+v, want %+v", got, d)
+	}
+}
+
+func TestDurationMaxValues(t *testing.T) {
+	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
+	d := Duration{Months: math.MaxUint32, Days: math.MaxUint32, Milliseconds: math.MaxUint32}
+	got := roundTrip(t, schema, d)
+	if got != d {
+		t.Fatalf("got %+v, want %+v", got, d)
+	}
+}
+
+func TestDurationInRecord(t *testing.T) {
+	type R struct {
+		D Duration `avro:"d"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"d","type":{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}}
+	]}`
+	in := R{D: Duration{Months: 1, Days: 2, Milliseconds: 3}}
+	got := roundTrip(t, schema, in)
+	if got != in {
+		t.Fatalf("got %+v, want %+v", got, in)
+	}
+}
+
+func TestDurationAsFixedBytes(t *testing.T) {
+	// Deserialize into [12]byte instead of Duration.
+	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
+	d := Duration{Months: 1, Days: 2, Milliseconds: 3}
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, &d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw [12]byte
+	rem, err := s.Decode(encoded, &raw)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover bytes: %d", len(rem))
+	}
+	// Verify the raw bytes encode LE uint32s.
+	if raw[0] != 1 || raw[4] != 2 || raw[8] != 3 {
+		t.Fatalf("unexpected raw bytes: %x", raw)
+	}
+}
+
+func TestDurationPointer(t *testing.T) {
+	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
+	d := &Duration{Months: 10, Days: 20, Milliseconds: 30}
+	got := roundTrip(t, schema, d)
+	if *got != *d {
+		t.Fatalf("got %+v, want %+v", *got, *d)
+	}
+}
+
+func TestDurationShortBuffer(t *testing.T) {
+	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only 11 bytes — needs 12.
+	short := make([]byte, 11)
+	var out Duration
+	_, err = s.Decode(short, &out)
+	if err == nil {
+		t.Fatal("expected error for short buffer")
+	}
+}
+
+func TestDurationInRecordUnsafeShortBuffer(t *testing.T) {
+	type R struct {
+		D Duration `avro:"d"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"d","type":{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}}
+	]}`
+	decodeErr(t, schema, make([]byte, 11), new(R))
+}
+
+func TestDurationSchemaValidation(t *testing.T) {
+	// duration must be on fixed.
+	_, err := NewSchema(`{"type":"int","logicalType":"duration"}`)
+	if err == nil {
+		t.Fatal("expected error: duration on int")
+	}
+	// duration fixed must be size 12.
+	_, err = NewSchema(`{"type":"fixed","name":"d","size":8,"logicalType":"duration"}`)
+	if err == nil {
+		t.Fatal("expected error: duration size != 12")
+	}
+}
+
+// ---- Decimal logical type (bytes) ----
+
+func TestBytesDecimalRoundTrip(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	// 123.45 = 12345/100
+	r := new(big.Rat).SetFrac64(12345, 100)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestBytesDecimalZero(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	r := new(big.Rat)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestBytesDecimalNegative(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	// -99.99 = -9999/100
+	r := new(big.Rat).SetFrac64(-9999, 100)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestBytesDecimalScale0(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":0}`
+	r := new(big.Rat).SetInt64(42)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestBytesDecimalLargeValue(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":38,"scale":10}`
+	// Large value: 123456789012345678.1234567890
+	num, _ := new(big.Int).SetString("1234567890123456781234567890", 10)
+	r := new(big.Rat).SetFrac(num, new(big.Int).Exp(big.NewInt(10), big.NewInt(10), nil))
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestBytesDecimalInRecord(t *testing.T) {
+	type R struct {
+		V *big.Rat `avro:"v"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"v","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}}
+	]}`
+	in := R{V: new(big.Rat).SetFrac64(12345, 100)}
+	got := roundTrip(t, schema, in)
+	if got.V.Cmp(in.V) != 0 {
+		t.Fatalf("got %s, want %s", got.V.RatString(), in.V.RatString())
+	}
+}
+
+// ---- Decimal logical type (fixed) ----
+
+func TestFixedDecimalRoundTrip(t *testing.T) {
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	r := new(big.Rat).SetFrac64(12345, 100)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestFixedDecimalZero(t *testing.T) {
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	r := new(big.Rat)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestFixedDecimalNegative(t *testing.T) {
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	r := new(big.Rat).SetFrac64(-9999, 100)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestFixedDecimalOverflow(t *testing.T) {
+	// Fixed size 2 can hold at most ±32767 unscaled. Try a value that overflows.
+	schema := `{"type":"fixed","name":"dec","size":2,"logicalType":"decimal","precision":5,"scale":0}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 100000 requires 3 bytes, won't fit in 2.
+	r := new(big.Rat).SetInt64(100000)
+	_, err = s.AppendEncode(nil, &r)
+	if err == nil {
+		t.Fatal("expected overflow error")
+	}
+}
+
+func TestFixedDecimalFallbackToArray(t *testing.T) {
+	// Deserialize fixed decimal into [8]byte instead of *big.Rat.
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := new(big.Rat).SetFrac64(12345, 100)
+	encoded, err := s.AppendEncode(nil, &r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw [8]byte
+	rem, err := s.Decode(encoded, &raw)
+	if err != nil {
+		t.Fatalf("Decode into [8]byte: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover: %d", len(rem))
+	}
+}
+
+func TestFixedDecimalInRecord(t *testing.T) {
+	type R struct {
+		V *big.Rat `avro:"v"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"v","type":{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}}
+	]}`
+	in := R{V: new(big.Rat).SetFrac64(-12345, 100)}
+	got := roundTrip(t, schema, in)
+	if got.V.Cmp(in.V) != 0 {
+		t.Fatalf("got %s, want %s", got.V.RatString(), in.V.RatString())
+	}
+}
+
+func TestDecimalSchemaValidation(t *testing.T) {
+	// decimal requires precision.
+	_, err := NewSchema(`{"type":"bytes","logicalType":"decimal"}`)
+	if err == nil {
+		t.Fatal("expected error: decimal without precision")
+	}
+	// decimal must be bytes or fixed.
+	_, err = NewSchema(`{"type":"int","logicalType":"decimal","precision":10}`)
+	if err == nil {
+		t.Fatal("expected error: decimal on int")
+	}
+}
+
+func TestBytesDecimalShortBuffer(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Varint says 10 bytes but only 2 available.
+	data := []byte{20, 0x30, 0x39} // length=10 (zigzag), only 2 data bytes
+	var out *big.Rat
+	_, err = s.Decode(data, &out)
+	if err == nil {
+		t.Fatal("expected short buffer error")
+	}
+}
+
+func TestFixedDecimalShortBuffer(t *testing.T) {
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	short := make([]byte, 7) // needs 8
+	var out *big.Rat
+	_, err = s.Decode(short, &out)
+	if err == nil {
+		t.Fatal("expected short buffer error")
+	}
+}
+
+func TestBytesDecimalNegativeLength(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Zigzag encode -1 as length → 0x01.
+	data := []byte{0x01}
+	var out *big.Rat
+	_, err = s.Decode(data, &out)
+	if err == nil {
+		t.Fatal("expected negative length error")
+	}
+}
+
+// ---- Duration/Decimal: fallback to raw byte types ----
+
+func TestDurationSerAsFixedArray(t *testing.T) {
+	// Encode a [12]byte through a duration schema (fallback path).
+	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
+	raw := [12]byte{1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0}
+	got := roundTrip(t, schema, raw)
+	if got != raw {
+		t.Fatalf("got %x, want %x", got, raw)
+	}
+}
+
+func TestBytesDecimalSerAsBytes(t *testing.T) {
+	// Encode a []byte through a bytes+decimal schema (fallback to serBytes).
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	raw := []byte{0x30, 0x39} // 12345 in big-endian
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, &raw)
+	if err != nil {
+		t.Fatalf("AppendEncode: %v", err)
+	}
+	if len(encoded) == 0 {
+		t.Fatal("expected non-empty output")
+	}
+}
+
+func TestFixedDecimalSerAsFixedArray(t *testing.T) {
+	// Encode a [8]byte through a fixed+decimal schema (fallback path).
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	raw := [8]byte{0, 0, 0, 0, 0, 0, 0x30, 0x39}
+	got := roundTrip(t, schema, raw)
+	if got != raw {
+		t.Fatalf("got %x, want %x", got, raw)
+	}
+}
+
+// ---- Duration in record as [12]byte triggers unsafe fallback ----
+
+func TestDurationInRecordAsFixedArray(t *testing.T) {
+	type R struct {
+		D [12]byte `avro:"d"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"d","type":{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}}
+	]}`
+	in := R{D: [12]byte{1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0}}
+	got := roundTrip(t, schema, in)
+	if got != in {
+		t.Fatalf("got %+v, want %+v", got, in)
+	}
+}
+
+// ---- Decimal: bigIntToBytes edge cases ----
+
+func TestBytesDecimalHighBitPositive(t *testing.T) {
+	// Value 1.28 (unscaled 128) — 128=0x80, needs 0x00 prefix.
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	r := new(big.Rat).SetFrac64(128, 100) // 1.28, unscaled = 128
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestBytesDecimalMinusOne(t *testing.T) {
+	// Value -0.01 (unscaled -1) — special case in bigIntToBytes.
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	r := new(big.Rat).SetFrac64(-1, 100)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestBytesDecimalNegativeNeedsPadding(t *testing.T) {
+	// Value -1.29 (unscaled -129) — abs=128, bytes=[0x80], flip=[0x7f], needs 0xff prefix.
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	r := new(big.Rat).SetFrac64(-129, 100)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+// ---- Decimal: interface deserialization ----
+
+func TestBytesDecimalDeserInterface(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	r := new(big.Rat).SetFrac64(12345, 100)
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, &r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out any
+	rem, err := s.Decode(encoded, &out)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover: %d", len(rem))
+	}
+	got, ok := out.(*big.Rat)
+	if !ok {
+		t.Fatalf("expected *big.Rat, got %T", out)
+	}
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+func TestFixedDecimalDeserInterface(t *testing.T) {
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	r := new(big.Rat).SetFrac64(12345, 100)
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, &r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out any
+	rem, err := s.Decode(encoded, &out)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover: %d", len(rem))
+	}
+	got, ok := out.(*big.Rat)
+	if !ok {
+		t.Fatalf("expected *big.Rat, got %T", out)
+	}
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+// ---- Decimal: type mismatch error ----
+
+func TestBytesDecimalDeserWrongType(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	r := new(big.Rat).SetFrac64(12345, 100)
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, &r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out string
+	_, err = s.Decode(encoded, &out)
+	if err == nil {
+		t.Fatal("expected error decoding decimal into string")
+	}
+}
+
+// ---- Bytes decimal: truncated varint ----
+
+func TestBytesDecimalTruncatedVarint(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Byte with continuation bit but no following byte.
+	data := []byte{0x80}
+	var out *big.Rat
+	_, err = s.Decode(data, &out)
+	if err == nil {
+		t.Fatal("expected error for truncated varint")
+	}
+}
+
+// ---- Decimal: empty bytes (zero length) → bytesToBigInt empty ----
+
+func TestBytesDecimalEmptyBytes(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Length 0 → empty bytes → bytesToBigInt([]) → 0.
+	data := []byte{0x00} // varint 0
+	var out *big.Rat
+	rem, err := s.Decode(data, &out)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover: %d", len(rem))
+	}
+	if out.Sign() != 0 {
+		t.Fatalf("expected zero rat, got %s", out.RatString())
+	}
+}
+
+// ---- Fixed decimal: negative sign extension padding (ser) ----
+
+func TestFixedDecimalNegativePadding(t *testing.T) {
+	// Small negative value in large fixed: needs 0xff padding.
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":0}`
+	r := new(big.Rat).SetInt64(-1)
+	got := roundTrip(t, schema, r)
+	if got.Cmp(r) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	}
+}
+
+// ---- Nil pointer errors for duration/decimal ser ----
+
+func TestDurationSerNilPointer(t *testing.T) {
+	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d *Duration
+	_, err = s.AppendEncode(nil, &d)
+	if err == nil {
+		t.Fatal("expected error for nil Duration pointer")
+	}
+}
+
+func TestBytesDecimalSerNilPointer(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r *big.Rat
+	_, err = s.AppendEncode(nil, &r)
+	if err == nil {
+		t.Fatal("expected error for nil *big.Rat pointer")
+	}
+}
+
+func TestFixedDecimalSerNilPointer(t *testing.T) {
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	s, err := NewSchema(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r *big.Rat
+	_, err = s.AppendEncode(nil, &r)
+	if err == nil {
+		t.Fatal("expected error for nil *big.Rat pointer")
+	}
+}
