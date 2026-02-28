@@ -68,8 +68,11 @@ var serPrimitive = map[string]serfn{
 var errNonNil = errors.New("cannot encode non-nil value as null")
 
 func serNull(dst []byte, v reflect.Value) ([]byte, error) {
-	if v.IsNil() {
-		return dst, nil
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		if v.IsNil() {
+			return dst, nil
+		}
 	}
 	return dst, errNonNil
 }
@@ -285,7 +288,7 @@ func (s *serEnum) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		} else {
 			n = int(v.Uint())
 		}
-		if n < 0 || n > len(s.symbols) {
+		if n < 0 || n >= len(s.symbols) {
 			return nil, fmt.Errorf("invalid enum index %d/%d", n, len(s.symbols))
 		}
 		return appendVarint(dst, int32(n)), nil

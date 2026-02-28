@@ -158,8 +158,8 @@ func TestValidateLogical(t *testing.T) {
 		{"duration no size", aobject{Type: "fixed", Logical: "duration"}, true},
 		{"duration wrong size", aobject{Type: "fixed", Logical: "duration", Size: &somePrec}, true},
 
-		// unknown
-		{"unknown logical", aobject{Type: "int", Logical: "foobar"}, true},
+		// unknown logical types are ignored per spec
+		{"unknown logical", aobject{Type: "int", Logical: "foobar"}, false},
 
 		// scale/precision on non-decimal
 		{"date with precision", aobject{Type: "int", Logical: "date", Precision: &somePrec}, true},
@@ -497,11 +497,69 @@ func TestBuildUnionInvalidInnerError(t *testing.T) {
 	}
 }
 
-func TestBuildComplexValidateLogicalError(t *testing.T) {
-	// Complex type with invalid logical type triggers validateLogical error.
-	_, err := NewSchema(`{"type":"int","logicalType":"unknown_logical"}`)
+func TestBuildComplexUnknownLogicalIgnored(t *testing.T) {
+	// Per Avro spec, unknown logical types are ignored and the underlying type is used.
+	s, err := NewSchema(`{"type":"int","logicalType":"unknown_logical"}`)
+	if err != nil {
+		t.Fatalf("expected unknown logical type to be ignored, got error: %v", err)
+	}
+	dst, err := s.AppendEncode(nil, new(int32(42)))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got int32
+	if _, err := s.Decode(dst, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != 42 {
+		t.Errorf("got %d, want 42", got)
+	}
+}
+
+func TestMultiDotNamespace(t *testing.T) {
+	// Namespace with multiple dot-segments should be valid.
+	_, err := NewSchema(`{"type":"record","name":"r","namespace":"com.example.foo","fields":[{"name":"a","type":"int"}]}`)
+	if err != nil {
+		t.Fatalf("expected no error for multi-dot namespace, got %v", err)
+	}
+}
+
+func TestMultiDotFullname(t *testing.T) {
+	// Fullname with multiple dot-segments should be valid.
+	_, err := NewSchema(`{"type":"record","name":"com.example.foo.Bar","fields":[{"name":"a","type":"int"}]}`)
+	if err != nil {
+		t.Fatalf("expected no error for multi-dot fullname, got %v", err)
+	}
+}
+
+func TestDeepNamespaceInheritance(t *testing.T) {
+	// Parent is "com.example.Parent", child should inherit "com.example" namespace.
+	_, err := NewSchema(`{
+		"type":"record","name":"Parent","namespace":"com.example","fields":[
+			{"name":"child","type":{"type":"record","name":"Child","fields":[
+				{"name":"x","type":"int"}
+			]}}
+		]
+	}`)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestDuplicateRecordFieldName(t *testing.T) {
+	_, err := NewSchema(`{"type":"record","name":"r","fields":[
+		{"name":"a","type":"int"},
+		{"name":"a","type":"string"}
+	]}`)
 	if err == nil {
-		t.Fatal("expected error for unknown logical type")
+		t.Fatal("expected error for duplicate field name")
+	}
+}
+
+func TestDuplicateEnumSymbol(t *testing.T) {
+	_, err := NewSchema(`{"type":"enum","name":"e","symbols":["a","b","a"]}`)
+	if err == nil {
+		t.Fatal("expected error for duplicate enum symbol")
 	}
 }
 

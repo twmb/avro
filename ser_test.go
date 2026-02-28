@@ -297,6 +297,27 @@ func TestSerUnionAllFail(t *testing.T) {
 	encodeErr(t, `["null","int"]`, new("hello"))
 }
 
+func TestSerNullNonNilableType(t *testing.T) {
+	// serNull should not panic when given a non-nilable type (int, string, etc.).
+	// It should return errNonNil, not crash.
+	v := reflect.ValueOf(42)
+	_, err := serNull(nil, v)
+	if err != errNonNil {
+		t.Fatalf("expected errNonNil, got %v", err)
+	}
+	v = reflect.ValueOf("hello")
+	_, err = serNull(nil, v)
+	if err != errNonNil {
+		t.Fatalf("expected errNonNil, got %v", err)
+	}
+}
+
+func TestSerEnumBoundaryIndex(t *testing.T) {
+	// With 3 symbols, index 3 should be out of range (valid: 0, 1, 2).
+	schema := `{"type":"enum","name":"e","symbols":["a","b","c"]}`
+	encodeErr(t, schema, new(int32(3)))
+}
+
 type textMarshalerType struct{ val string }
 
 func (tm textMarshalerType) MarshalText() ([]byte, error) { return []byte(tm.val), nil }

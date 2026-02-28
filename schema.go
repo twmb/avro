@@ -89,7 +89,7 @@ type afield struct {
 	// In canonical form, the following are stripped.
 
 	Aliases []string `json:"aliases,omitempty"`
-	Default string   `json:"default,omitempty"`
+	Default json.RawMessage `json:"default,omitempty"`
 }
 
 type aobject struct {
@@ -221,7 +221,7 @@ func (e *unknownPrimitiveError) Error() string { return fmt.Sprintf("unknown pri
 
 var (
 	reName      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	reNamespace = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)$`)
+	reNamespace = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$`)
 )
 
 func (b *builder) build(parentName string, s *aschema) error {
@@ -386,7 +386,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			o.Name = o.Namespace + "." + o.Name // have namespace: prefix our name
 			o.Namespace = ""
 		} else if parentName != "" {
-			if dot := strings.IndexByte(parentName, '.'); dot >= 0 {
+			if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
 				o.Name = parentName[:dot+1] + o.Name // no namespace: prefix our name with parent namespace if there is one
 				o.Namespace = ""
 			}
@@ -423,10 +423,15 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: dr}
 
 		var names []string
+		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
 			if !reName.MatchString(of.Name) {
 				return fmt.Errorf("invalid record field name %q", of.Name)
 			}
+			if seenFields[of.Name] {
+				return fmt.Errorf("duplicate record field name %q", of.Name)
+			}
+			seenFields[of.Name] = true
 			bf := b.nest()
 			if err := bf.build(o.Name, of.Type); err != nil {
 				return fmt.Errorf("invalid record field: %v", err)
@@ -463,10 +468,15 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			return errors.New("invalid enum has schema for other types")
 		}
 
+		seenSymbols := make(map[string]bool, len(o.Symbols))
 		for _, e := range o.Symbols {
 			if !reName.MatchString(e) {
 				return fmt.Errorf("invalid enum symbol %q", e)
 			}
+			if seenSymbols[e] {
+				return fmt.Errorf("duplicate enum symbol %q", e)
+			}
+			seenSymbols[e] = true
 		}
 		b.ser = (&serEnum{symbols: o.Symbols}).ser
 		b.deser = (&deserEnum{symbols: o.Symbols}).deser
@@ -580,7 +590,10 @@ func (o *aobject) validateLogical() error {
 		}
 
 	default:
-		return fmt.Errorf("unknown logicalType %q", o.Logical)
+		// Per the Avro spec, unknown logical types are ignored and the
+		// underlying type is used as-is.
+		o.Logical = ""
+		return nil
 	}
 
 	if o.Scale != nil || o.Precision != nil {
