@@ -4380,7 +4380,7 @@ func TestUsArraySerErrorPaths(t *testing.T) {
 	}
 
 	t.Run("null_union_ptr", func(t *testing.T) {
-		fn := usArrayNullUnionPtr(failFn)
+		fn := usArrayNullUnionPtr(failFn, 0, 2)
 		s := []*int32{new(int32(1))}
 		_, err := fn(nil, unsafe.Pointer(&s))
 		if err != errFake {
@@ -7630,5 +7630,224 @@ func TestUnsafeUdUUIDInvalidHex(t *testing.T) {
 	_, err := s.Decode(data, &r)
 	if err == nil {
 		t.Fatal("expected error for invalid UUID hex")
+	}
+}
+
+func TestNullSecondUnion(t *testing.T) {
+	// Test ["string", "null"] union (null-second).
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"val","type":["string","null"]}
+	]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type R struct {
+		Val *string `avro:"val"`
+	}
+
+	// Non-nil value.
+	str := "hello"
+	input := R{Val: &str}
+	dst, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatalf("encode non-nil: %v", err)
+	}
+	// Index 0 (string) encoded as varint 0x00.
+	if dst[0] != 0 {
+		t.Fatalf("expected index byte 0x00 for string, got 0x%02x", dst[0])
+	}
+	var out R
+	rem, err := s.Decode(dst, &out)
+	if err != nil {
+		t.Fatalf("decode non-nil: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover bytes: %d", len(rem))
+	}
+	if out.Val == nil || *out.Val != "hello" {
+		t.Fatalf("expected 'hello', got %v", out.Val)
+	}
+
+	// Nil value.
+	input = R{Val: nil}
+	dst, err = s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatalf("encode nil: %v", err)
+	}
+	// Index 1 (null) encoded as varint 0x02.
+	if dst[0] != 2 {
+		t.Fatalf("expected index byte 0x02 for null, got 0x%02x", dst[0])
+	}
+	out = R{}
+	rem, err = s.Decode(dst, &out)
+	if err != nil {
+		t.Fatalf("decode nil: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover bytes: %d", len(rem))
+	}
+	if out.Val != nil {
+		t.Fatalf("expected nil, got %v", *out.Val)
+	}
+}
+
+func TestNullSecondUnionRoundTrip(t *testing.T) {
+	// Test round-trip with various types in ["T", "null"] unions.
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"num","type":["int","null"]},
+		{"name":"text","type":["string","null"]}
+	]}`
+	type R struct {
+		Num  *int32  `avro:"num"`
+		Text *string `avro:"text"`
+	}
+
+	n := int32(42)
+	s := "hello"
+	got := roundTrip(t, schema, R{Num: &n, Text: &s})
+	if got.Num == nil || *got.Num != 42 {
+		t.Fatalf("expected Num=42, got %v", got.Num)
+	}
+	if got.Text == nil || *got.Text != "hello" {
+		t.Fatalf("expected Text='hello', got %v", got.Text)
+	}
+
+	// Both nil.
+	got = roundTrip(t, schema, R{Num: nil, Text: nil})
+	if got.Num != nil {
+		t.Fatalf("expected Num=nil, got %v", *got.Num)
+	}
+	if got.Text != nil {
+		t.Fatalf("expected Text=nil, got %v", *got.Text)
+	}
+}
+
+func TestNullSecondUnionReflectPath(t *testing.T) {
+	// Test ["int", "null"] union through the reflect slow path by passing
+	// values directly (not through an addressable struct field).
+	schema := `["int","null"]`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-nil value: pass int32 directly (no &).
+	v := int32(42)
+	dst, err := s.AppendEncode(nil, v)
+	if err != nil {
+		t.Fatalf("encode non-nil: %v", err)
+	}
+	if dst[0] != 0 {
+		t.Fatalf("expected index byte 0x00 for int, got 0x%02x", dst[0])
+	}
+	var out any
+	rem, err := s.Decode(dst, &out)
+	if err != nil {
+		t.Fatalf("decode non-nil: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover bytes: %d", len(rem))
+	}
+
+	// Nil value: pass nil directly → reflect.ValueOf(nil) is invalid.
+	dst, err = s.AppendEncode(nil, nil)
+	if err != nil {
+		t.Fatalf("encode nil: %v", err)
+	}
+	if dst[0] != 2 {
+		t.Fatalf("expected index byte 0x02 for null, got 0x%02x", dst[0])
+	}
+	out = "not nil"
+	rem, err = s.Decode(dst, &out)
+	if err != nil {
+		t.Fatalf("decode nil: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover bytes: %d", len(rem))
+	}
+	if out != nil {
+		t.Fatalf("expected nil, got %v", out)
+	}
+
+	// Nil slice (nilable but not pointer).
+	var sl []int
+	dst, err = s.AppendEncode(nil, sl)
+	if err != nil {
+		t.Fatalf("encode nil slice: %v", err)
+	}
+	if dst[0] != 2 {
+		t.Fatalf("expected null index for nil slice, got 0x%02x", dst[0])
+	}
+
+	// Invalid index byte in deser.
+	_, err = s.Decode([]byte{4}, &out)
+	if err == nil {
+		t.Fatal("expected error for invalid index byte")
+	}
+
+	// Short buffer in deser.
+	_, err = s.Decode(nil, &out)
+	if err == nil {
+		t.Fatal("expected error for empty buffer")
+	}
+}
+
+func TestNullSecondUnionPtrReflect(t *testing.T) {
+	// Test the reflect Ptr path of deserNullSecondUnion by decoding
+	// a ["int", "null"] union into a top-level *int32.
+	schema := `["int","null"]`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode non-nil: index 0 (int), value 42.
+	var v *int32
+	dst, err := s.AppendEncode(nil, int32(42))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	rem, err := s.Decode(dst, &v)
+	if err != nil {
+		t.Fatalf("decode non-nil: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover bytes: %d", len(rem))
+	}
+	if v == nil || *v != 42 {
+		t.Fatalf("expected 42, got %v", v)
+	}
+
+	// Encode nil: index 1 (null).
+	dst, err = s.AppendEncode(nil, nil)
+	if err != nil {
+		t.Fatalf("encode nil: %v", err)
+	}
+	v = new(int32) // pre-allocate to test zeroing
+	rem, err = s.Decode(dst, &v)
+	if err != nil {
+		t.Fatalf("decode nil: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover bytes: %d", len(rem))
+	}
+	if v != nil {
+		t.Fatalf("expected nil, got %v", *v)
+	}
+}
+
+func TestFixedSliceRoundTrip(t *testing.T) {
+	// Verify that fixed-type values survive encode as []byte → decode as []byte.
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"data","type":{"type":"fixed","name":"f","size":4}}
+	]}`
+	type R struct {
+		Data []byte `avro:"data"`
+	}
+	got := roundTrip(t, schema, R{Data: []byte{0xDE, 0xAD, 0xBE, 0xEF}})
+	if len(got.Data) != 4 || got.Data[0] != 0xDE || got.Data[3] != 0xEF {
+		t.Fatalf("unexpected data: %x", got.Data)
 	}
 }

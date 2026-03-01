@@ -213,7 +213,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		return nil
 	}
 
-	// Null-union: *T mapped to ["null", T].
+	// Null-union: *T mapped to ["null", T] or [T, "null"].
 	if f.avroType == "nullunion" {
 		if k != reflect.Ptr {
 			return nil
@@ -221,14 +221,15 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		if f.meta == nil || f.meta.inner == nil {
 			return nil
 		}
+		nullByte, valByte := nullUnionBytes(f.meta.nullSecond)
 		inner := f.meta.inner
 		innerGoType := goType.Elem()
 		if inner.serRecord != nil {
-			return usNullUnionRecord(inner.serRecord, innerGoType)
+			return usNullUnionRecord(inner.serRecord, innerGoType, nullByte, valByte)
 		}
 		innerFn := tryCompileFieldSer(&serRecordField{avroType: inner.avroType, meta: inner}, innerGoType)
 		if innerFn != nil {
-			return usNullUnionPtr(innerFn)
+			return usNullUnionPtr(innerFn, nullByte, valByte)
 		}
 		return nil
 	}
@@ -248,12 +249,13 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			if elemGoType.Kind() != reflect.Ptr {
 				return nil
 			}
+			nullByte, valByte := nullUnionBytes(inner.nullSecond)
 			if inner.inner != nil && inner.inner.serRecord != nil {
-				return usArrayNullUnionRecord(inner.inner.serRecord, elemGoType.Elem())
+				return usArrayNullUnionRecord(inner.inner.serRecord, elemGoType.Elem(), nullByte, valByte)
 			}
 			innerFn := tryCompileFieldSer(&serRecordField{avroType: inner.inner.avroType, meta: inner.inner}, elemGoType.Elem())
 			if innerFn != nil {
-				return usArrayNullUnionPtr(innerFn)
+				return usArrayNullUnionPtr(innerFn, nullByte, valByte)
 			}
 		case "record":
 			if inner.serRecord != nil {
@@ -340,7 +342,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		return nil
 	}
 
-	// Null-union: *T mapped to ["null", T].
+	// Null-union: *T mapped to ["null", T] or [T, "null"].
 	if f.avroType == "nullunion" {
 		if k != reflect.Ptr {
 			return nil
@@ -348,14 +350,15 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		if f.meta == nil || f.meta.inner == nil {
 			return nil
 		}
+		nullByte, valByte := nullUnionBytes(f.meta.nullSecond)
 		inner := f.meta.inner
 		innerGoType := goType.Elem()
 		if inner.deserRecord != nil {
-			return udNullUnionRecord(inner.deserRecord, innerGoType)
+			return udNullUnionRecord(inner.deserRecord, innerGoType, nullByte, valByte)
 		}
 		innerFn := tryCompileFieldDeser(&deserRecordField{avroType: inner.avroType, meta: inner}, innerGoType)
 		if innerFn != nil {
-			return udNullUnionPtr(innerFn, innerGoType)
+			return udNullUnionPtr(innerFn, innerGoType, nullByte, valByte)
 		}
 		return nil
 	}
@@ -553,7 +556,7 @@ func usTimestampMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
 
 func usTimestampNanos(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	t := *(*time.Time)(p)
-	return appendVarlong(dst, t.UnixNano()), nil
+	return appendVarlong(dst, timeToUnixNanos(t)), nil
 }
 
 func usDate(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -563,7 +566,11 @@ func usDate(dst []byte, p unsafe.Pointer) ([]byte, error) {
 
 func usTimeMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	d := *(*time.Duration)(p)
-	return appendVarint(dst, int32(d.Milliseconds())), nil
+	ms := d.Milliseconds()
+	if ms < math.MinInt32 || ms > math.MaxInt32 {
+		return nil, fmt.Errorf("duration %v overflows Avro time-millis (int32)", d)
+	}
+	return appendVarint(dst, int32(ms)), nil
 }
 
 func usTimeMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -620,6 +627,9 @@ func udTimeMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
+	}
+	if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
+		return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
 	}
 	*(*time.Duration)(p) = time.Duration(val) * time.Microsecond
 	return src, nil
@@ -685,7 +695,11 @@ func usInt(k reflect.Kind) userfn {
 	switch k {
 	case reflect.Int:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*int)(p))), nil
+			n := *(*int)(p)
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	case reflect.Int8:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -701,11 +715,19 @@ func usInt(k reflect.Kind) userfn {
 		}
 	case reflect.Int64:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*int64)(p))), nil
+			n := *(*int64)(p)
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	case reflect.Uint:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint)(p))), nil
+			n := *(*uint)(p)
+			if n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	case reflect.Uint8:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -717,11 +739,19 @@ func usInt(k reflect.Kind) userfn {
 		}
 	case reflect.Uint32:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint32)(p))), nil
+			n := *(*uint32)(p)
+			if n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	case reflect.Uint64:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint64)(p))), nil
+			n := *(*uint64)(p)
+			if n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	default:
 		return nil
@@ -1117,25 +1147,35 @@ func udBytesDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 
 // ---- Null-union unsafe ser/deser ----
 
+// nullUnionBytes returns the varint-encoded index bytes for null and value branches.
+// For null-first ["null", T]: null=0, val=2. For null-second [T, "null"]: null=2, val=0.
+func nullUnionBytes(nullSecond bool) (nullByte, valByte byte) {
+	if nullSecond {
+		return 2, 0
+	}
+	return 0, 2
+}
+
 // usNullUnionPtr handles null-union ser for *T where T has a primitive unsafe serializer.
-func usNullUnionPtr(inner userfn) userfn {
+// nullByte/valByte are the varint-encoded index bytes for null and value branches.
+func usNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 		pp := *(*unsafe.Pointer)(p)
 		if pp == nil {
-			return append(dst, 0), nil
+			return append(dst, nullByte), nil
 		}
-		return inner(append(dst, 2), pp)
+		return inner(append(dst, valByte), pp)
 	}
 }
 
 // usNullUnionRecord handles null-union ser for *T where T is a record.
-func usNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
+func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 		pp := *(*unsafe.Pointer)(p)
 		if pp == nil {
-			return append(dst, 0), nil
+			return append(dst, nullByte), nil
 		}
-		dst = append(dst, 2)
+		dst = append(dst, valByte)
 		if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
 			return serRecordFastPtr(dst, fast, pp)
 		}
@@ -1144,16 +1184,16 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
 }
 
 // udNullUnionPtr handles null-union deser for *T where T has a primitive unsafe deserializer.
-func udNullUnionPtr(inner udeserfn, innerType reflect.Type) udeserfn {
+func udNullUnionPtr(inner udeserfn, innerType reflect.Type, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "union index"}
 		}
 		switch src[0] {
-		case 0:
+		case nullByte:
 			*(*unsafe.Pointer)(p) = nil
 			return src[1:], nil
-		case 2:
+		case valByte:
 			pp := *(*unsafe.Pointer)(p)
 			if pp == nil {
 				v := reflect.New(innerType)
@@ -1168,16 +1208,16 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type) udeserfn {
 }
 
 // udNullUnionRecord handles null-union deser for *T where T is a record.
-func udNullUnionRecord(rec *deserRecord, innerType reflect.Type) udeserfn {
+func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "union index"}
 		}
 		switch src[0] {
-		case 0:
+		case nullByte:
 			*(*unsafe.Pointer)(p) = nil
 			return src[1:], nil
-		case 2:
+		case valByte:
 			pp := *(*unsafe.Pointer)(p)
 			if pp == nil {
 				v := reflect.New(innerType)
@@ -1254,7 +1294,7 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 }
 
 // usArrayNullUnionRecord handles array ser for []*T where items are ["null", Record].
-func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
+func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 		s := *(*[]unsafe.Pointer)(p)
 		n := len(s)
@@ -1265,9 +1305,9 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
 		var err error
 		for _, pp := range s {
 			if pp == nil {
-				dst = append(dst, 0)
+				dst = append(dst, nullByte)
 			} else {
-				dst = append(dst, 2)
+				dst = append(dst, valByte)
 				if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
 					dst, err = serRecordFastPtr(dst, fast, pp)
 				} else {
@@ -1283,7 +1323,7 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
 }
 
 // usArrayNullUnionPtr handles array ser for []*T where items are ["null", primitive].
-func usArrayNullUnionPtr(inner userfn) userfn {
+func usArrayNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 		s := *(*[]unsafe.Pointer)(p)
 		n := len(s)
@@ -1294,9 +1334,9 @@ func usArrayNullUnionPtr(inner userfn) userfn {
 		var err error
 		for _, pp := range s {
 			if pp == nil {
-				dst = append(dst, 0)
+				dst = append(dst, nullByte)
 			} else {
-				dst, err = inner(append(dst, 2), pp)
+				dst, err = inner(append(dst, valByte), pp)
 				if err != nil {
 					return nil, err
 				}

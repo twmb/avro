@@ -101,14 +101,16 @@ type optMetadata struct{ m map[string][]byte }
 type optSyncMarker struct{ sync [16]byte }
 type optSchema struct{ s string }
 type optReaderCodec struct{ c Codec }
+type optReaderSchema struct{ s *avro.Schema }
 
-func (optCodec) writerOpt()       {}
-func (optBlockCount) writerOpt()  {}
-func (optBlockBytes) writerOpt()  {}
-func (optMetadata) writerOpt()    {}
-func (optSyncMarker) writerOpt()  {}
-func (optSchema) writerOpt()      {}
-func (optReaderCodec) readerOpt() {}
+func (optCodec) writerOpt()        {}
+func (optBlockCount) writerOpt()   {}
+func (optBlockBytes) writerOpt()   {}
+func (optMetadata) writerOpt()     {}
+func (optSyncMarker) writerOpt()   {}
+func (optSchema) writerOpt()       {}
+func (optReaderCodec) readerOpt()  {}
+func (optReaderSchema) readerOpt() {}
 
 // WithCodec sets the compression codec. The default is null (no compression).
 func WithCodec(c Codec) WriterOpt { return optCodec{c} }
@@ -143,6 +145,13 @@ func WithSchema(schema string) WriterOpt { return optSchema{schema} }
 // built-in overrides it, which can be used to share a [ZstdCodecFrom] codec
 // across readers.
 func WithReaderCodec(c Codec) ReaderOpt { return optReaderCodec{c} }
+
+// WithReaderSchema provides a reader schema for schema evolution. If set, the
+// file's writer schema is resolved against the reader schema using
+// [avro.Resolve], and all decoded values use the reader schema's format.
+// Fields added in the reader schema must have defaults; fields removed from
+// the writer schema are skipped.
+func WithReaderSchema(s *avro.Schema) ReaderOpt { return optReaderSchema{s} }
 
 // DeflateCodec returns a [Codec] using raw DEFLATE compression at the given
 // level (e.g. [flate.DefaultCompression]).
@@ -488,10 +497,13 @@ func readHeader(br *bufio.Reader) (schema *avro.Schema, meta map[string][]byte, 
 // immediately. Use [WithReaderCodec] if the file uses a non-built-in codec.
 func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	var customCodecs []Codec
+	var readerSchema *avro.Schema
 	for _, o := range opts {
 		switch o := o.(type) {
 		case optReaderCodec:
 			customCodecs = append(customCodecs, o.c)
+		case optReaderSchema:
+			readerSchema = o.s
 		}
 	}
 
@@ -509,6 +521,15 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	codec, err := resolveCodec(codecName, customCodecs)
 	if err != nil {
 		return nil, err
+	}
+
+	// Apply schema evolution if a reader schema was provided.
+	if readerSchema != nil {
+		resolved, err := avro.Resolve(schema, readerSchema)
+		if err != nil {
+			return nil, fmt.Errorf("ocf: resolving reader schema: %w", err)
+		}
+		schema = resolved
 	}
 
 	return &Reader{

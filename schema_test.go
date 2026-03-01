@@ -294,14 +294,21 @@ func TestBuildUnionErrors(t *testing.T) {
 
 func TestBuildComplexErrors(t *testing.T) {
 	t.Run("invalid name", func(t *testing.T) {
-		_, err := Parse(`{"type":"record","name":"123bad","fields":[]}`)
+		_, err := Parse(`{"type":"record","name":"123bad","fields":[]}`, WithStrictNames())
 		if err == nil {
 			t.Fatal("expected error for invalid name")
 		}
 	})
 
+	t.Run("invalid name lenient", func(t *testing.T) {
+		_, err := Parse(`{"type":"record","name":"123bad","fields":[]}`)
+		if err != nil {
+			t.Fatalf("expected lenient mode to accept invalid name, got %v", err)
+		}
+	})
+
 	t.Run("invalid namespace", func(t *testing.T) {
-		_, err := Parse(`{"type":"record","name":"r","namespace":"123bad","fields":[]}`)
+		_, err := Parse(`{"type":"record","name":"r","namespace":"123bad","fields":[]}`, WithStrictNames())
 		if err == nil {
 			t.Fatal("expected error for invalid namespace")
 		}
@@ -379,7 +386,7 @@ func TestBuildComplexErrors(t *testing.T) {
 	})
 
 	t.Run("invalid record field name", func(t *testing.T) {
-		_, err := Parse(`{"type":"record","name":"r","fields":[{"name":"123bad","type":"int"}]}`)
+		_, err := Parse(`{"type":"record","name":"r","fields":[{"name":"123bad","type":"int"}]}`, WithStrictNames())
 		if err == nil {
 			t.Fatal("expected error for invalid field name")
 		}
@@ -421,7 +428,7 @@ func TestBuildComplexErrors(t *testing.T) {
 	})
 
 	t.Run("invalid enum symbol", func(t *testing.T) {
-		_, err := Parse(`{"type":"enum","name":"e","symbols":["123bad"]}`)
+		_, err := Parse(`{"type":"enum","name":"e","symbols":["123bad"]}`, WithStrictNames())
 		if err == nil {
 			t.Fatal("expected error for invalid symbol")
 		}
@@ -567,7 +574,7 @@ func TestBuildUnionInUnion(t *testing.T) {
 
 func TestBuildUnionInvalidInnerError(t *testing.T) {
 	// Union element that produces a non-unknownPrimitive error.
-	_, err := Parse(`["null",{"type":"record","name":"r","fields":[{"name":"123bad","type":"int"}]}]`)
+	_, err := Parse(`["null",{"type":"record","name":"r","fields":[{"name":"123bad","type":"int"}]}]`, WithStrictNames())
 	if err == nil {
 		t.Fatal("expected error for invalid union element")
 	}
@@ -666,5 +673,113 @@ func TestBuildEmptySchema(t *testing.T) {
 	err := b.build("", &aschema{})
 	if err == nil {
 		t.Fatal("expected error for empty schema")
+	}
+}
+
+func TestLenientNames(t *testing.T) {
+	// By default, lenient mode accepts names that don't match the strict regex.
+	t.Run("lenient allows dashes", func(t *testing.T) {
+		_, err := Parse(`{"type":"record","name":"my-record","fields":[{"name":"my-field","type":"int"}]}`)
+		if err != nil {
+			t.Fatalf("expected lenient to accept dashed names, got %v", err)
+		}
+	})
+
+	t.Run("strict rejects dashes", func(t *testing.T) {
+		_, err := Parse(`{"type":"record","name":"my-record","fields":[{"name":"f","type":"int"}]}`, WithStrictNames())
+		if err == nil {
+			t.Fatal("expected strict to reject dashed name")
+		}
+	})
+
+	t.Run("lenient fullname detection", func(t *testing.T) {
+		// Fullnames (dot-separated) must be detected even in lenient mode
+		// so namespace handling works correctly.
+		s, err := Parse(`{"type":"record","name":"com.example.MyRecord","fields":[{"name":"x","type":"int"}]}`)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		// The canonical form should reference the full name.
+		canon := string(s.Canonical())
+		if canon == "" {
+			t.Fatal("expected non-empty canonical form")
+		}
+	})
+}
+
+func TestNamespaceFallback(t *testing.T) {
+	// A record in a namespace can reference another type by unqualified name.
+	schema := `{
+		"type":"record","name":"Parent","namespace":"com.example","fields":[
+			{"name":"child","type":{"type":"record","name":"Child","fields":[
+				{"name":"x","type":"int"}
+			]}},
+			{"name":"ref","type":"Child"}
+		]
+	}`
+	_, err := Parse(schema)
+	if err != nil {
+		t.Fatalf("expected namespace fallback to resolve unqualified ref, got %v", err)
+	}
+}
+
+func TestForwardReferenceInRecord(t *testing.T) {
+	// A record field references a type defined later in the same record.
+	schema := `{
+		"type":"record","name":"outer","fields":[
+			{"name":"ref","type":"inner"},
+			{"name":"inner_def","type":{"type":"record","name":"inner","fields":[
+				{"name":"x","type":"int"}
+			]}}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatalf("expected forward reference to work, got %v", err)
+	}
+	// Verify round-trip works.
+	type Inner struct {
+		X int32 `avro:"x"`
+	}
+	type Outer struct {
+		Ref      Inner `avro:"ref"`
+		InnerDef Inner `avro:"inner_def"`
+	}
+	input := Outer{Ref: Inner{X: 42}, InnerDef: Inner{X: 99}}
+	dst, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var output Outer
+	rem, err := s.Decode(dst, &output)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover bytes: %d", len(rem))
+	}
+	if output.Ref.X != 42 || output.InnerDef.X != 99 {
+		t.Fatalf("unexpected output: %+v", output)
+	}
+}
+
+func TestEmptyNamespace(t *testing.T) {
+	// Explicit empty namespace clears inherited namespace.
+	schema := `{
+		"type":"record","name":"parent","namespace":"com.example","fields":[
+			{"name":"child","type":{"type":"record","name":"child","namespace":"","fields":[
+				{"name":"x","type":"int"}
+			]}}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	canon := string(s.Canonical())
+	// The child should not have com.example prefix because namespace was
+	// explicitly cleared.
+	if strings.Contains(canon, "com.example.child") {
+		t.Fatalf("expected empty namespace to clear parent, got %s", canon)
 	}
 }

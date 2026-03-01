@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 )
 
 type Superhero struct {
@@ -201,9 +202,9 @@ func TestSerTypeMismatch(t *testing.T) {
 		{"array from string", `{"type":"array","items":"int"}`, new("hello")},
 		{"map from string", `{"type":"map","values":"int"}`, new("hello")},
 		{"map from int-key map", `{"type":"map","values":"int"}`, new(map[int]int32{1: 2})},
-		{"fixed from slice", `{"type":"fixed","name":"f","size":4}`, new([]byte{1, 2, 3, 4})},
 		{"fixed from int array", `{"type":"fixed","name":"f","size":4}`, new([4]int{1, 2, 3, 4})},
-		{"fixed wrong size", `{"type":"fixed","name":"f","size":4}`, new([3]byte{1, 2, 3})},
+		{"fixed wrong size array", `{"type":"fixed","name":"f","size":4}`, new([3]byte{1, 2, 3})},
+		{"fixed wrong size slice", `{"type":"fixed","name":"f","size":4}`, new([]byte{1, 2, 3})},
 		{"record from int", `{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`, new(42)},
 	}
 	for _, tt := range tests {
@@ -614,5 +615,105 @@ func TestInterface(t *testing.T) {
 	}
 	if len(dst) == 0 {
 		t.Fatal("expected non-empty output")
+	}
+}
+
+func TestSerIntOverflow(t *testing.T) {
+	schema := `"int"`
+	// int64 that overflows int32.
+	var big int64 = 1 << 33
+	encodeErr(t, schema, &big)
+
+	// Negative overflow.
+	var neg int64 = -(1 << 33)
+	encodeErr(t, schema, &neg)
+
+	// uint64 that overflows int32.
+	var ubig uint64 = 1 << 33
+	encodeErr(t, schema, &ubig)
+
+	// Values within range should succeed.
+	var ok int64 = 42
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendEncode(nil, &ok); err != nil {
+		t.Fatalf("expected success for in-range int, got %v", err)
+	}
+}
+
+func TestSerFixedFromSlice(t *testing.T) {
+	schema := `{"type":"fixed","name":"f","size":4}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// []byte of correct length should work now.
+	input := []byte{1, 2, 3, 4}
+	dst, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatalf("expected success for []byte fixed, got %v", err)
+	}
+	if len(dst) != 4 || dst[0] != 1 || dst[3] != 4 {
+		t.Fatalf("unexpected encoding: %v", dst)
+	}
+
+	// Wrong size should still error.
+	bad := []byte{1, 2, 3}
+	if _, err := s.AppendEncode(nil, &bad); err == nil {
+		t.Fatal("expected error for wrong-size slice")
+	}
+}
+
+func TestSerTimestampNanosOverflow(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Dates far in the past/future that would overflow time.UnixNano().
+	farPast := time.Date(1800, 1, 1, 0, 0, 0, 0, time.UTC)
+	dst, err := s.AppendEncode(nil, &farPast)
+	if err != nil {
+		t.Fatalf("expected success for far past time, got %v", err)
+	}
+	if len(dst) == 0 {
+		t.Fatal("expected non-empty encoding")
+	}
+
+	farFuture := time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC)
+	dst, err = s.AppendEncode(nil, &farFuture)
+	if err != nil {
+		t.Fatalf("expected success for far future time, got %v", err)
+	}
+	if len(dst) == 0 {
+		t.Fatal("expected non-empty encoding")
+	}
+}
+
+func TestSerMapMissingFieldDefault(t *testing.T) {
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"a","type":"int","default":42},
+		{"name":"b","type":"string"}
+	]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Map with only "b" provided; "a" should use its default.
+	m := map[string]any{"b": "hello"}
+	dst, err := s.AppendEncode(nil, &m)
+	if err != nil {
+		t.Fatalf("expected success when field has default, got %v", err)
+	}
+	if len(dst) == 0 {
+		t.Fatal("expected non-empty encoding")
+	}
+
+	// Map missing field with no default should still error.
+	m2 := map[string]any{"a": int32(1)}
+	if _, err := s.AppendEncode(nil, &m2); err == nil {
+		t.Fatal("expected error for missing field with no default")
 	}
 }

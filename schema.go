@@ -59,8 +59,8 @@ type fieldNode struct {
 
 // MustParse is like [Parse] but panics on error. Useful for package-level
 // var declarations.
-func MustParse(schema string) *Schema {
-	s, err := Parse(schema)
+func MustParse(schema string, opts ...ParseOpt) *Schema {
+	s, err := Parse(schema, opts...)
 	if err != nil {
 		panic("avro: " + err.Error())
 	}
@@ -72,7 +72,11 @@ func MustParse(schema string) *Schema {
 // (record, enum, array, map, fixed), or a JSON array (union). Named types
 // may reference each other and self-reference. The schema is fully validated:
 // unknown types, duplicate names, invalid defaults, etc. all return errors.
-func Parse(schema string) (*Schema, error) {
+//
+// By default, names are not strictly validated for compatibility with lenient
+// implementations like the Java reference library. Use [WithStrictNames] to
+// enforce spec-compliant name validation.
+func Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 	var orig aschema
 	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
 		return nil, fmt.Errorf("invalid schema: %v", err)
@@ -84,6 +88,10 @@ func Parse(schema string) (*Schema, error) {
 		stypes:  make(map[string]*serRecord),
 		drtypes: make(map[string]*deserRecord),
 		ntypes:  make(map[string]*schemaNode),
+		lenient: true, // default: lenient name validation
+	}
+	for _, o := range opts {
+		o(b)
 	}
 	if err := b.build("", &orig); err != nil {
 		return nil, err
@@ -190,7 +198,7 @@ type aobject struct {
 
 	// In canonical form, the following are stripped.
 
-	Namespace string          `json:"namespace,omitempty"`
+	Namespace *string         `json:"namespace,omitempty"`
 	Aliases   []string        `json:"aliases,omitempty"`
 	Default   json.RawMessage `json:"default,omitempty"`
 
@@ -224,11 +232,31 @@ type fieldMeta struct {
 	serRecord   *serRecord
 	deserRecord *deserRecord
 	inner       *fieldMeta
+	nullSecond  bool // true for ["T","null"] unions (null is index 1)
 }
 
 type metaFixup struct {
 	meta *fieldMeta
 	name string
+}
+
+type recordFieldFixup struct {
+	sr   *serRecord
+	dr   *deserRecord
+	nd   *schemaNode
+	idx  int
+	name string
+}
+
+// ParseOpt is an option for [Parse].
+type ParseOpt func(*builder)
+
+// WithStrictNames enables strict Avro name validation per the specification
+// (names must match [A-Za-z_][A-Za-z0-9_]*). By default, names are not
+// validated for compatibility with schemas produced by lenient implementations
+// like the Java reference library.
+func WithStrictNames() ParseOpt {
+	return func(b *builder) { b.lenient = false }
 }
 
 type builder struct {
@@ -239,15 +267,17 @@ type builder struct {
 	dtypes   map[string]deserfn
 	stypes   map[string]*serRecord
 	drtypes  map[string]*deserRecord
-	missing  []unionMissing
-	dmissing []unionMissingDeser
-	mfixups  []metaFixup
+	missing      []unionMissing
+	dmissing     []unionMissingDeser
+	mfixups      []metaFixup
+	fieldFixups  []recordFieldFixup
 
 	ntypes map[string]*schemaNode
 
-	meta  fieldMeta
-	canon aschema
-	node  *schemaNode
+	meta    fieldMeta
+	canon   aschema
+	node    *schemaNode
+	lenient bool
 }
 
 func (b *builder) nest() *builder {
@@ -257,6 +287,7 @@ func (b *builder) nest() *builder {
 		stypes:  b.stypes,
 		drtypes: b.drtypes,
 		ntypes:  b.ntypes,
+		lenient: b.lenient,
 	}
 }
 
@@ -264,6 +295,7 @@ func (b *builder) unnest(nest *builder) {
 	b.missing = append(b.missing, nest.missing...)
 	b.dmissing = append(b.dmissing, nest.dmissing...)
 	b.mfixups = append(b.mfixups, nest.mfixups...)
+	b.fieldFixups = append(b.fieldFixups, nest.fieldFixups...)
 }
 
 func (b *builder) finalize() error {
@@ -284,6 +316,23 @@ func (b *builder) finalize() error {
 	for _, m := range b.mfixups {
 		m.meta.serRecord = b.stypes[m.name]
 		m.meta.deserRecord = b.drtypes[m.name]
+	}
+	for _, m := range b.fieldFixups {
+		ser := b.types[m.name]
+		if ser == nil {
+			return fmt.Errorf("unknown type %q", m.name)
+		}
+		m.sr.fields[m.idx].fn = ser
+		m.dr.fields[m.idx].fn = b.dtypes[m.name]
+		if sr := b.stypes[m.name]; sr != nil {
+			m.sr.fields[m.idx].avroType = "record"
+			m.sr.fields[m.idx].meta.avroType = "record"
+			m.sr.fields[m.idx].meta.serRecord = sr
+			m.dr.fields[m.idx].avroType = "record"
+			m.dr.fields[m.idx].meta.avroType = "record"
+			m.dr.fields[m.idx].meta.deserRecord = b.drtypes[m.name]
+		}
+		m.nd.fields[m.idx].node = b.ntypes[m.name]
 	}
 	return nil
 }
@@ -319,7 +368,7 @@ func (b *builder) build(parentName string, s *aschema) error {
 
 	switch {
 	case s.primitive != "":
-		return b.buildPrimitive(s)
+		return b.buildPrimitive(parentName, s)
 	case len(s.union) != 0:
 		return b.buildUnion(parentName, s)
 	default:
@@ -327,7 +376,7 @@ func (b *builder) build(parentName string, s *aschema) error {
 	}
 }
 
-func (b *builder) buildPrimitive(s *aschema) error {
+func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 	b.canon = aschema{primitive: s.primitive}
 	b.meta = fieldMeta{avroType: s.primitive}
 	fn, exists := serPrimitive[s.primitive]
@@ -342,14 +391,32 @@ func (b *builder) buildPrimitive(s *aschema) error {
 		return nil
 	}
 	// Check if this is a named type reference (record, enum, fixed).
-	if ser := b.types[s.primitive]; ser != nil {
+	name := s.primitive
+	if ser := b.types[name]; ser != nil {
 		b.ser = ser
-		b.deser = b.dtypes[s.primitive]
-		if sr := b.stypes[s.primitive]; sr != nil {
-			b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[s.primitive]}
+		b.deser = b.dtypes[name]
+		if sr := b.stypes[name]; sr != nil {
+			b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[name]}
 		}
-		b.node = b.ntypes[s.primitive]
+		b.node = b.ntypes[name]
 		return nil
+	}
+	// Try namespace-qualified lookup: if name is unqualified and parent
+	// has a namespace, try parentNamespace + "." + name.
+	if !strings.Contains(name, ".") && parentName != "" {
+		if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
+			qualified := parentName[:dot+1] + name
+			if ser := b.types[qualified]; ser != nil {
+				b.canon.primitive = qualified
+				b.ser = ser
+				b.deser = b.dtypes[qualified]
+				if sr := b.stypes[qualified]; sr != nil {
+					b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[qualified]}
+				}
+				b.node = b.ntypes[qualified]
+				return nil
+			}
+		}
 	}
 	return &unknownPrimitiveError{s.primitive}
 }
@@ -407,6 +474,18 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			inner := new(fieldMeta)
 			*inner = branchMetas[1]
 			b.meta = fieldMeta{avroType: "nullunion", inner: inner}
+		}
+	} else if len(s.union) == 2 && s.union[1].primitive == "null" {
+		b.ser = serNullSecondUnion(ser)
+		b.deser = deserNullSecondUnion(deser)
+		if _, isMissing := missing[0]; isMissing {
+			inner := &fieldMeta{}
+			b.meta = fieldMeta{avroType: "nullunion", nullSecond: true, inner: inner}
+			b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: s.union[0].primitive})
+		} else {
+			inner := new(fieldMeta)
+			*inner = branchMetas[0]
+			b.meta = fieldMeta{avroType: "nullunion", nullSecond: true, inner: inner}
 		}
 	} else {
 		b.ser = ser.ser
@@ -507,30 +586,40 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 
 	switch o.Type {
 	case "record", "error", "enum", "fixed":
-		if !reName.MatchString(o.Name) {
-			if reNamespace.MatchString(o.Name) {
-				parentName, o.Namespace = "", "" // fullname: ignore parent & our own namespace
-			} else {
+		ns := ""
+		hasNS := false
+		if o.Namespace != nil {
+			ns = *o.Namespace
+			hasNS = true
+		}
+		if strings.Contains(o.Name, ".") {
+			// Fullname (dot-separated): ignore parent & our own namespace.
+			if !b.lenient && !reNamespace.MatchString(o.Name) {
 				return fmt.Errorf("invalid name %q", o.Name)
 			}
+			parentName = ""
+			hasNS = false
+		} else if !b.lenient && !reName.MatchString(o.Name) {
+			return fmt.Errorf("invalid name %q", o.Name)
 		}
-		if o.Namespace != "" {
-			if !reNamespace.MatchString(o.Namespace) {
-				return fmt.Errorf("invalid namespace %q", o.Namespace)
+		if hasNS && ns != "" {
+			if !b.lenient && !reNamespace.MatchString(ns) {
+				return fmt.Errorf("invalid namespace %q", ns)
 			}
-			o.Name = o.Namespace + "." + o.Name // have namespace: prefix our name
-			o.Namespace = ""
+			o.Name = ns + "." + o.Name // have namespace: prefix our name
+		} else if hasNS && ns == "" {
+			// Explicit empty namespace: clear inherited namespace.
 		} else if parentName != "" {
 			if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
 				o.Name = parentName[:dot+1] + o.Name // no namespace: prefix our name with parent namespace if there is one
-				o.Namespace = ""
 			}
 		}
+		o.Namespace = nil // canonical form omits namespace
 		if _, exists := b.ntypes[o.Name]; exists {
 			return fmt.Errorf("duplicate named type %q", o.Name)
 		}
 	default:
-		if o.Name != "" || o.Namespace != "" {
+		if o.Name != "" || o.Namespace != nil {
 			return errors.New("only record, enum, and fixed can have a name")
 		}
 	}
@@ -576,7 +665,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		var names []string
 		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
-			if !reName.MatchString(of.Name) {
+			if !b.lenient && !reName.MatchString(of.Name) {
 				return fmt.Errorf("invalid record field name %q", of.Name)
 			}
 			if seenFields[of.Name] {
@@ -587,16 +676,27 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				return fmt.Errorf("invalid field order %q for field %q", of.Order, of.Name)
 			}
 			bf := b.nest()
+			isFwdRef := false
+			fwdRefName := ""
 			if err := bf.build(o.Name, of.Type); err != nil {
-				return fmt.Errorf("invalid record field: %v", err)
+				if pe := (*unknownPrimitiveError)(nil); errors.As(err, &pe) && of.Type != nil && of.Type.primitive != "" {
+					isFwdRef = true
+					fwdRefName = of.Type.primitive
+				} else {
+					return fmt.Errorf("invalid record field: %v", err)
+				}
 			}
 			b.unnest(bf)
+			if isFwdRef {
+				bf.canon = aschema{primitive: fwdRefName}
+			}
 			o.Fields[i] = afield{
 				Name: of.Name,
 				Type: &bf.canon,
 			}
 			meta := new(fieldMeta)
 			*meta = bf.meta
+			fieldIdx := len(sr.fields)
 			sr.fields = append(sr.fields, serRecordField{
 				name:     of.Name,
 				fn:       bf.ser,
@@ -614,18 +714,40 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				aliases: origFieldAliases[i],
 				node:    bf.node,
 			}
+			if isFwdRef {
+				b.fieldFixups = append(b.fieldFixups, recordFieldFixup{
+					sr:   sr,
+					dr:   dr,
+					nd:   nd,
+					idx:  fieldIdx,
+					name: fwdRefName,
+				})
+			}
 			if len(of.Default) > 0 {
 				var defaultVal any
 				// json.Unmarshal cannot fail: of.Default is a json.RawMessage
 				// preserved from the initial schema parse, so it is valid JSON.
 				json.Unmarshal(of.Default, &defaultVal) //nolint:errcheck
-				if err := validateDefault(defaultVal, &bf.canon); err != nil {
-					return fmt.Errorf("record field %q: invalid default: %v", of.Name, err)
+				// Skip default validation for forward references since we
+				// don't know the type yet.
+				if !isFwdRef {
+					if err := validateDefault(defaultVal, &bf.canon); err != nil {
+						return fmt.Errorf("record field %q: invalid default: %v", of.Name, err)
+					}
 				}
 				drf.defaultVal = defaultVal
 				drf.hasDefault = true
 				fn.defaultVal = defaultVal
 				fn.hasDefault = true
+				// Pre-encode the default to Avro binary for use
+				// when encoding maps with missing keys. Non-fatal:
+				// if encoding fails, map encoding will require the key.
+				if !isFwdRef && bf.node != nil {
+					if defaultBytes, err := encodeDefault(defaultVal, bf.node); err == nil {
+						sr.fields[fieldIdx].defaultBytes = defaultBytes
+						sr.fields[fieldIdx].hasDefault = true
+					}
+				}
 			}
 			dr.fields = append(dr.fields, drf)
 			nd.fields = append(nd.fields, fn)
@@ -644,7 +766,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 
 		seenSymbols := make(map[string]bool, len(o.Symbols))
 		for _, e := range o.Symbols {
-			if !reName.MatchString(e) {
+			if !b.lenient && !reName.MatchString(e) {
 				return fmt.Errorf("invalid enum symbol %q", e)
 			}
 			if seenSymbols[e] {

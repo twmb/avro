@@ -112,6 +112,32 @@ func deserNullUnion(u *deserUnion) deserfn {
 	}
 }
 
+func deserNullSecondUnion(u *deserUnion) deserfn {
+	return func(src []byte, v reflect.Value) ([]byte, error) {
+		if len(src) < 1 {
+			return nil, &ShortBufferError{Type: "union index"}
+		}
+		switch src[0] {
+		case 0: // index 0: the T branch
+			if v.Kind() == reflect.Ptr {
+				if v.IsNil() {
+					v.Set(reflect.New(v.Type().Elem()))
+				}
+				return u.fns[0](src[1:], v.Elem())
+			}
+			return u.fns[0](src[1:], v)
+		case 2: // index 1: null
+			switch v.Kind() {
+			case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
+				v.Set(reflect.Zero(v.Type()))
+			}
+			return src[1:], nil
+		default:
+			return nil, fmt.Errorf("invalid null-union index byte 0x%02x", src[0])
+		}
+	}
+}
+
 ////////////////
 // PRIMITIVES //
 ////////////////
@@ -561,6 +587,12 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		return src[s.n:], nil
 	}
 	t := v.Type()
+	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
+		b := make([]byte, s.n)
+		copy(b, src[:s.n])
+		v.Set(reflect.ValueOf(b))
+		return src[s.n:], nil
+	}
 	if t.Kind() != reflect.Array || t.Elem().Kind() != reflect.Uint8 {
 		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
@@ -703,6 +735,9 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Type() == durationType {
+		if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
+			return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
+		}
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
 		return src, nil
 	}

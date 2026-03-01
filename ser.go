@@ -61,6 +61,21 @@ func serNullUnion(u *serUnion) serfn {
 	}
 }
 
+func serNullSecondUnion(u *serUnion) serfn {
+	return func(dst []byte, v reflect.Value) ([]byte, error) {
+		if !v.IsValid() {
+			return append(dst, 2), nil // index 1 (null)
+		}
+		switch v.Kind() {
+		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
+			if v.IsNil() {
+				return append(dst, 2), nil // index 1 (null)
+			}
+		}
+		return u.fns[0](append(dst, 0), v) // index 0 (T)
+	}
+}
+
 ////////////////
 // PRIMITIVES //
 ////////////////
@@ -113,9 +128,17 @@ func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.CanInt() {
-		return appendVarint(dst, int32(v.Int())), nil
+		n := v.Int()
+		if n < math.MinInt32 || n > math.MaxInt32 {
+			return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+		}
+		return appendVarint(dst, int32(n)), nil
 	} else if v.CanUint() {
-		return appendVarint(dst, int32(v.Uint())), nil
+		n := v.Uint()
+		if n > math.MaxInt32 {
+			return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+		}
+		return appendVarint(dst, int32(n)), nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
 }
@@ -220,10 +243,12 @@ func doSerString(dst []byte, s string) []byte {
 /////////////
 
 type serRecordField struct {
-	name     string
-	fn       serfn
-	avroType string
-	meta     *fieldMeta
+	name         string
+	fn           serfn
+	avroType     string
+	meta         *fieldMeta
+	defaultBytes []byte // pre-encoded Avro binary for the field's default value
+	hasDefault   bool
 }
 
 type serRecord struct {
@@ -247,7 +272,11 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		for _, f := range s.fields {
 			value := v.MapIndex(reflect.ValueOf(f.name))
 			if !value.IsValid() {
-				return nil, fmt.Errorf("missing key %s", f.name)
+				if !f.hasDefault {
+					return nil, fmt.Errorf("missing key %s", f.name)
+				}
+				dst = append(dst, f.defaultBytes...)
+				continue
 			}
 			if dst, err = f.fn(dst, value); err != nil {
 				return nil, err
@@ -382,10 +411,18 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	t := v.Type()
-	if t.Kind() != reflect.Array || t.Elem().Kind() != reflect.Uint8 {
-		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
-	}
-	if t.Len() != s.n {
+	// Accept both [N]byte arrays and []byte slices of the correct length.
+	switch t.Kind() {
+	case reflect.Array:
+		if t.Elem().Kind() != reflect.Uint8 || t.Len() != s.n {
+			return nil, &SemanticError{GoType: t, AvroType: "fixed"}
+		}
+	case reflect.Slice:
+		if t.Elem().Kind() != reflect.Uint8 || v.Len() != s.n {
+			return nil, &SemanticError{GoType: t, AvroType: "fixed"}
+		}
+		return append(dst, v.Bytes()...), nil
+	default:
 		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
 	// Fixed is written as raw bytes with no length prefix.
@@ -447,9 +484,16 @@ func serTimestampNanos(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
-		return appendVarlong(dst, t.UnixNano()), nil
+		return appendVarlong(dst, timeToUnixNanos(t)), nil
 	}
 	return serLong(dst, v)
+}
+
+// timeToUnixNanos converts a time.Time to nanoseconds since the Unix epoch
+// without the overflow issues of time.Time.UnixNano (which is undefined
+// outside ~1678-2262).
+func timeToUnixNanos(t time.Time) int64 {
+	return t.Unix()*1e9 + int64(t.Nanosecond())
 }
 
 // floorDiv returns the floor of a/b (rounds toward negative infinity),
@@ -481,7 +525,11 @@ func serTimeMillis(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Type() == durationType {
 		d := time.Duration(v.Int())
-		return appendVarint(dst, int32(d.Milliseconds())), nil
+		ms := d.Milliseconds()
+		if ms < math.MinInt32 || ms > math.MaxInt32 {
+			return nil, fmt.Errorf("duration %v overflows Avro time-millis (int32)", d)
+		}
+		return appendVarint(dst, int32(ms)), nil
 	}
 	return serInt(dst, v)
 }

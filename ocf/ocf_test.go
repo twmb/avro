@@ -2777,3 +2777,77 @@ func TestGoldenCorruptData(t *testing.T) {
 		})
 	}
 }
+
+func TestWithReaderSchema(t *testing.T) {
+	// Writer schema has name+age.
+	writerSchema := avro.MustParse(recordSchema)
+
+	// Reader schema adds a new field "email" with a default.
+	readerSchemaStr := `{"type":"record","name":"person","fields":[
+		{"name":"name","type":"string"},
+		{"name":"age","type":"int"},
+		{"name":"email","type":"string","default":"unknown"}
+	]}`
+	readerSchema := avro.MustParse(readerSchemaStr)
+
+	// Write some data.
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, writerSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read with evolved schema.
+	r, err := NewReader(&buf, WithReaderSchema(readerSchema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	type personV2 struct {
+		Name  string `avro:"name"`
+		Age   int32  `avro:"age"`
+		Email string `avro:"email"`
+	}
+	var p personV2
+	if err := r.Decode(&p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Name != "Alice" || p.Age != 30 || p.Email != "unknown" {
+		t.Fatalf("unexpected: %+v", p)
+	}
+}
+
+func TestWithReaderSchemaIncompatible(t *testing.T) {
+	writerSchema := avro.MustParse(recordSchema)
+
+	// Incompatible reader schema: missing field "name" with no default.
+	readerSchemaStr := `{"type":"record","name":"person","fields":[
+		{"name":"age","type":"int"},
+		{"name":"newfield","type":"string"}
+	]}`
+	readerSchema := avro.MustParse(readerSchemaStr)
+
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, writerSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = NewReader(&buf, WithReaderSchema(readerSchema))
+	if err == nil {
+		t.Fatal("expected error for incompatible schemas")
+	}
+}
