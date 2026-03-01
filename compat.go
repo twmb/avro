@@ -2,18 +2,12 @@ package avro
 
 import "fmt"
 
-// CheckCompatibility checks whether data written with the writer schema can be
-// read using the reader schema, following Avro's schema resolution rules. It
-// returns nil if the schemas are compatible. If not, it returns a
-// [*CompatibilityError] (extractable via [errors.As]) describing the first
-// incompatibility found, including the path within the schema tree.
+// CheckCompatibility reports whether data written with the writer schema can
+// be read by the reader schema. It returns nil on success or a
+// [*CompatibilityError] describing the first incompatibility.
 //
-// Compatibility rules: record fields present in the reader but missing from
-// the writer must have defaults; named types (records, enums, fixed) must
-// match by name or alias; enum symbols in the writer but not the reader
-// require the reader to have a default; fixed types must have equal sizes;
-// different primitive types must be promotable (e.g. int to long).
-func CheckCompatibility(reader, writer *Schema) error {
+// See [Resolve] for a note on argument order.
+func CheckCompatibility(writer, reader *Schema) error {
 	return checkCompat(reader.node, writer.node, "", make(map[nodePair]bool))
 }
 

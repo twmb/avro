@@ -361,7 +361,7 @@ func FuzzResolve(f *testing.F) {
 		if err != nil {
 			return
 		}
-		resolved, err := Resolve(reader, writer)
+		resolved, err := Resolve(writer, reader)
 		if err != nil {
 			return
 		}

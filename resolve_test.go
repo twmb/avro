@@ -29,7 +29,7 @@ func TestResolveFieldAddedWithDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestResolveFieldRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestResolveFieldRenamedViaAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestResolveTypePromotion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			resolved, err := Resolve(reader, writer)
+			resolved, err := Resolve(writer, reader)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -181,7 +181,7 @@ func TestResolveEnumEvolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestResolveNestedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestResolveUnionEvolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestResolveSelfReferencingRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestResolveDecodeIntoStruct(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +407,7 @@ func TestResolveDecodeIntoMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +439,7 @@ func TestResolveArrayEvolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +468,7 @@ func TestResolveMapEvolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -879,7 +879,7 @@ func TestResolveRecordFieldReorder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -918,7 +918,7 @@ func TestResolveComplexDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -962,7 +962,7 @@ func TestResolvePromotionInRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1008,7 +1008,7 @@ func TestResolveRecordDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1049,7 +1049,7 @@ func TestResolveWriterUnionReaderNonUnion(t *testing.T) {
 		t.Fatal(err)
 	}
 	// This should fail: null branch is incompatible with int reader.
-	_, err = Resolve(reader, writer)
+	_, err = Resolve(writer, reader)
 	if err == nil {
 		t.Fatal("expected error for null branch incompatible with int reader")
 	}
@@ -1069,7 +1069,7 @@ func TestResolveWriterUnionReaderNonUnionSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1101,7 +1101,7 @@ func TestResolveReaderUnionWriterNonUnion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1614,7 +1614,7 @@ func TestResolveFixedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1665,7 +1665,7 @@ func TestResolveEnumDeserTyped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1724,7 +1724,7 @@ func TestResolveEnumDeserErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1780,7 +1780,7 @@ func TestResolveBuildDeserSemanticError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1820,7 +1820,7 @@ func TestResolveSelfReferencingRecordDivergent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1857,7 +1857,7 @@ func TestResolveWriterUnionNullUnionOptimization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2029,7 +2029,7 @@ func TestResolveDeserTruncatedData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2087,7 +2087,7 @@ func TestResolveDeserReadError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2131,7 +2131,7 @@ func TestResolveDeserDefaultError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2170,7 +2170,7 @@ func TestResolveDeserMapNilInit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2325,7 +2325,7 @@ func TestResolveFieldRemovedIntoMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2360,7 +2360,7 @@ func TestResolveFieldRemovedIntoStruct(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2393,7 +2393,7 @@ func TestResolveEnumDeserInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2644,7 +2644,7 @@ func TestResolveDeserStructMissingField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2685,7 +2685,7 @@ func TestResolveNamespacedAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = CheckCompatibility(reader, writer)
+	err = CheckCompatibility(writer, reader)
 	if err != nil {
 		t.Fatalf("expected compatible via alias: %v", err)
 	}
@@ -2710,7 +2710,7 @@ func TestResolveFullyQualifiedAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = CheckCompatibility(reader, writer)
+	err = CheckCompatibility(writer, reader)
 	if err != nil {
 		t.Fatalf("expected compatible via fully-qualified alias: %v", err)
 	}
@@ -2730,7 +2730,7 @@ func TestResolveNullUnionDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := Resolve(reader, writer)
+	resolved, err := Resolve(writer, reader)
 	if err != nil {
 		t.Fatal(err)
 	}

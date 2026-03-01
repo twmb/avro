@@ -8,25 +8,28 @@ import (
 	"sync"
 )
 
-// Resolve builds a [*Schema] for schema evolution: the returned schema
-// decodes data written with the writer schema and maps it into the reader
-// schema's field layout. Encoding with the returned schema uses the reader's
-// format. This is the standard Avro mechanism for evolving schemas over time.
+// Resolve returns a schema that decodes data written with the writer schema
+// and produces values matching the reader schema's layout. The writer schema
+// is what the data was encoded with (typically from an [ocf] file header or
+// a schema registry); the reader schema is what your application expects now.
 //
-// Resolve handles field addition (filled from reader defaults), field removal
-// (writer-only fields are skipped), field renaming (via aliases), field
-// reordering, type promotion (e.g. int to long, float to double, string to
-// bytes), enum symbol evolution (with default), and recursive/self-referencing
-// record resolution.
+// Decoding with the returned schema handles field addition (defaults), field
+// removal (skip), renaming (aliases), reordering, and type promotion.
+// Encoding with it uses the reader's format.
 //
-// If the reader and writer have identical canonical forms, the reader schema
-// is returned directly. Otherwise [CheckCompatibility] is called first; any
-// incompatibility is returned as a [*CompatibilityError].
-func Resolve(reader, writer *Schema) (*Schema, error) {
+// If the schemas have identical canonical forms, reader is returned as-is.
+// Otherwise [CheckCompatibility] is called first and any incompatibility is
+// returned as a [*CompatibilityError]. See the package-level documentation
+// for a full example.
+//
+// Note: the argument order is (writer, reader), matching source-then-destination
+// convention and Java's GenericDatumReader. This differs from the Avro spec
+// text and hamba/avro, which put reader first.
+func Resolve(writer, reader *Schema) (*Schema, error) {
 	if bytes.Equal(reader.Canonical(), writer.Canonical()) {
 		return reader, nil
 	}
-	if err := CheckCompatibility(reader, writer); err != nil {
+	if err := CheckCompatibility(writer, reader); err != nil {
 		return nil, err
 	}
 	resolved, err := resolveNode(reader.node, writer.node, "", make(map[nodePair]*schemaNode))

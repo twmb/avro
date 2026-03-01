@@ -69,7 +69,7 @@ func TestCheckWriterUnionDeepRecursionFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = CheckCompatibility(reader, writer)
+	err = CheckCompatibility(writer, reader)
 	if err == nil {
 		t.Fatal("expected error for deep record incompatibility in union")
 	}
@@ -308,7 +308,7 @@ func TestCheckCompatibility(t *testing.T) {
 			if err != nil {
 				t.Fatalf("writer schema: %v", err)
 			}
-			err = CheckCompatibility(reader, writer)
+			err = CheckCompatibility(writer, reader)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")

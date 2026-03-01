@@ -12,15 +12,9 @@ import (
 	"strings"
 )
 
-// Schema is a compiled Avro schema that supports encoding Go values to Avro
-// binary format and decoding Avro binary data into Go values. A Schema is
-// created by parsing an Avro JSON schema string with [Parse].
-//
-// A Schema is safe for concurrent use. It can be used with [Schema.Encode],
-// [Schema.AppendEncode], and [Schema.Decode] for standard binary encoding, or
-// with [Schema.AppendSingleObject] and [Schema.DecodeSingleObject] for Avro
-// Single Object Encoding. Schemas can also be used with [Resolve] to support
-// schema evolution between reader and writer schemas.
+// Schema is a compiled Avro schema. Create one with [Parse] or [MustParse],
+// then use [Schema.Encode] / [Schema.Decode] to convert between Go values and
+// Avro binary. A Schema is safe for concurrent use.
 type Schema struct {
 	ser   serfn
 	deser deserfn
@@ -63,9 +57,8 @@ type fieldNode struct {
 	hasDefault bool
 }
 
-// MustParse parses an Avro JSON schema string and returns a compiled
-// [*Schema], panicking on error. This is useful for package-level variable
-// declarations where the schema is known to be valid.
+// MustParse is like [Parse] but panics on error. Useful for package-level
+// var declarations.
 func MustParse(schema string) *Schema {
 	s, err := Parse(schema)
 	if err != nil {
@@ -74,15 +67,11 @@ func MustParse(schema string) *Schema {
 	return s
 }
 
-// Parse parses an Avro JSON schema string and returns a compiled
-// [*Schema]. The input must be a valid Avro schema in JSON format: a
-// primitive type name (e.g. "string"), a JSON object (record, enum, array,
-// map, fixed), or a JSON array (union).
-//
-// Named types (records, enums, fixed) may reference each other and
-// self-reference. Type names are resolved according to Avro namespace rules.
-// The schema is validated during parsing: unknown types, duplicate names,
-// invalid defaults, and malformed definitions all return errors.
+// Parse parses an Avro JSON schema string and returns a compiled [*Schema].
+// The input can be a primitive name (e.g. `"string"`), a JSON object
+// (record, enum, array, map, fixed), or a JSON array (union). Named types
+// may reference each other and self-reference. The schema is fully validated:
+// unknown types, duplicate names, invalid defaults, etc. all return errors.
 func Parse(schema string) (*Schema, error) {
 	var orig aschema
 	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
@@ -117,27 +106,23 @@ func Parse(schema string) (*Schema, error) {
 	return s, nil
 }
 
-// Canonical returns the Parsing Canonical Form of the schema as defined by
-// the Avro specification. The canonical form strips doc, aliases, default
-// values, and other non-essential attributes, producing a deterministic JSON
-// representation suitable for schema comparison and fingerprinting.
+// Canonical returns the Parsing Canonical Form of the schema, stripping
+// doc, aliases, defaults, and other non-essential attributes. The result is
+// deterministic and suitable for comparison and fingerprinting.
 func (s *Schema) Canonical() []byte {
 	b, _ := json.Marshal(s.c)
 	return b
 }
 
-// Fingerprint computes a fingerprint of the schema's canonical form using the
-// provided hash. The Avro specification recommends CRC-64-AVRO (see
-// [NewRabin]) for general use or SHA-256 for cross-language compatibility.
+// Fingerprint hashes the schema's canonical form with h. Use [NewRabin] for
+// CRC-64-AVRO or crypto/sha256 for cross-language compatibility.
 func (s *Schema) Fingerprint(h hash.Hash) []byte {
 	h.Write(s.Canonical())
 	return h.Sum(nil)
 }
 
-// String returns the full JSON representation of the schema as originally
-// provided to [Parse]. Unlike [Schema.Canonical], which strips non-essential
-// attributes, String preserves all schema attributes including doc, aliases,
-// defaults, namespace, and logical types.
+// String returns the original JSON passed to [Parse], preserving all
+// attributes (doc, aliases, defaults, etc.) unlike [Schema.Canonical].
 func (s *Schema) String() string {
 	return s.full
 }

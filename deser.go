@@ -36,11 +36,8 @@ func (s *slab) string(src []byte, n int) string {
 
 var slabPool = sync.Pool{New: func() any { return &slab{} }}
 
-// Decode reads Avro binary data from src into v and returns the remaining
-// unconsumed bytes. v must be a non-nil pointer.
-//
-// The Go type pointed to by v must be compatible with the Avro schema type.
-// The following type mappings are used:
+// Decode reads Avro binary from src into v and returns the remaining bytes.
+// v must be a non-nil pointer to a type compatible with the schema:
 //
 //   - null: any (always decodes to nil)
 //   - boolean: bool, any

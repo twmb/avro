@@ -15,16 +15,13 @@ import (
 
 type serfn func([]byte, reflect.Value) ([]byte, error)
 
-// AppendEncode encodes v using the schema's Avro binary format and appends
-// the result to dst, returning the extended buffer. The mapping from Go types
-// to Avro types follows the same rules as [Schema.Decode]; see its
-// documentation for the full type mapping.
+// AppendEncode appends the Avro binary encoding of v to dst. See
+// [Schema.Decode] for the Go-to-Avro type mapping.
 func (s *Schema) AppendEncode(dst []byte, v interface{}) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
 
-// Encode encodes v using the schema's Avro binary format and returns the
-// encoded bytes. This is equivalent to calling AppendEncode with a nil dst.
+// Encode encodes v as Avro binary. It is shorthand for AppendEncode(nil, v).
 func (s *Schema) Encode(v interface{}) ([]byte, error) {
 	return s.AppendEncode(nil, v)
 }
