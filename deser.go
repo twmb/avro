@@ -2,6 +2,7 @@ package avro
 
 import (
 	"encoding"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -35,6 +36,29 @@ func (s *slab) string(src []byte, n int) string {
 
 var slabPool = sync.Pool{New: func() any { return &slab{} }}
 
+// Decode reads Avro binary data from src into v and returns the remaining
+// unconsumed bytes. v must be a non-nil pointer.
+//
+// The Go type pointed to by v must be compatible with the Avro schema type.
+// The following type mappings are used:
+//
+//   - null: any (always decodes to nil)
+//   - boolean: bool, any
+//   - int, long: int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, any
+//   - float: float32, float64, any
+//   - double: float64, float32, any
+//   - string: string, []byte, any; also [encoding.TextUnmarshaler]
+//   - bytes: []byte, string, any
+//   - enum: string, int/int8/.../uint64 (ordinal), any
+//   - fixed: [N]byte, []byte, any
+//   - array: slice, any
+//   - map: map[string]T, any
+//   - union: any, *T (for ["null", T] unions), or the matched branch type
+//   - record: struct (matched by field name or `avro` tag), map[string]any, any
+//
+// When decoding into any (interface{}), values are returned as their natural
+// Go types: nil, bool, int64, float32, float64, string, []byte, []any,
+// map[string]any, or map[string]any for records.
 func (s *Schema) Decode(src []byte, v interface{}) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
@@ -756,4 +780,72 @@ func bytesToBigInt(b []byte) *big.Int {
 		i.Sub(i, modulus)
 	}
 	return i
+}
+
+// parseUUID parses an RFC 4122 hex-dash UUID string into a [16]byte.
+func parseUUID(s string) ([16]byte, error) {
+	var u [16]byte
+	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return u, fmt.Errorf("invalid UUID %q", s)
+	}
+	_, err := hex.Decode(u[0:4], []byte(s[0:8]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	_, err = hex.Decode(u[4:6], []byte(s[9:13]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	_, err = hex.Decode(u[6:8], []byte(s[14:18]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	_, err = hex.Decode(u[8:10], []byte(s[19:23]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	_, err = hex.Decode(u[10:16], []byte(s[24:36]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	return u, nil
+}
+
+func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	length, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("invalid negative string length %d", length)
+	}
+	n := int(length)
+	if len(src) < n {
+		return nil, &ShortBufferError{Type: "string", Need: n, Have: len(src)}
+	}
+	s := string(src[:n])
+	v = indirectAlloc(v)
+	if isUUIDType(v.Type()) {
+		u, err := parseUUID(s)
+		if err != nil {
+			return nil, err
+		}
+		reflect.Copy(v, reflect.ValueOf(u))
+		return src[n:], nil
+	}
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(s))
+		return src[n:], nil
+	}
+	if v.Kind() == reflect.String {
+		v.SetString(s)
+		return src[n:], nil
+	}
+	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
+		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(s)); err != nil {
+			return nil, err
+		}
+		return src[n:], nil
+	}
+	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 }

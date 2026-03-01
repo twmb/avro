@@ -6292,6 +6292,88 @@ func TestUUIDLogicalTypeInRecord(t *testing.T) {
 	}
 }
 
+func TestUUIDByteArrayRoundTrip(t *testing.T) {
+	uuidSchema := `{"type":"string","logicalType":"uuid"}`
+	uuidBytes := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	wantStr := "550e8400-e29b-41d4-a716-446655440000"
+
+	t.Run("bare [16]byte", func(t *testing.T) {
+		got := roundTrip(t, uuidSchema, uuidBytes)
+		if got != uuidBytes {
+			t.Fatalf("got %x, want %x", got, uuidBytes)
+		}
+	})
+
+	t.Run("custom type MyUUID", func(t *testing.T) {
+		type MyUUID [16]byte
+		input := MyUUID(uuidBytes)
+		got := roundTrip(t, uuidSchema, input)
+		if got != input {
+			t.Fatalf("got %x, want %x", got, input)
+		}
+	})
+
+	t.Run("[16]byte in record", func(t *testing.T) {
+		type R struct {
+			ID [16]byte `avro:"id"`
+		}
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"id","type":{"type":"string","logicalType":"uuid"}}
+		]}`
+		input := R{ID: uuidBytes}
+		got := roundTrip(t, schema, input)
+		if got.ID != input.ID {
+			t.Fatalf("got %x, want %x", got.ID, input.ID)
+		}
+	})
+
+	t.Run("wire format is 36-char hex-dash string", func(t *testing.T) {
+		encoded := encode(t, uuidSchema, &uuidBytes)
+		// Avro string: varint length prefix + string bytes.
+		// 36 encodes as varint 72 (zigzag), which is a single byte.
+		if len(encoded) < 1 {
+			t.Fatal("encoded too short")
+		}
+		// Read varint length.
+		length, rest, err := readVarlong(encoded)
+		if err != nil {
+			t.Fatalf("readVarlong: %v", err)
+		}
+		if length != 36 {
+			t.Fatalf("wire string length: got %d, want 36", length)
+		}
+		if string(rest) != wantStr {
+			t.Fatalf("wire string: got %q, want %q", string(rest), wantStr)
+		}
+	})
+
+	t.Run("invalid UUID decode error", func(t *testing.T) {
+		// Encode a non-UUID string and try to decode into [16]byte.
+		s, err := NewSchema(uuidSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		badStr := "not-a-uuid"
+		encoded, err := s.Encode(&badStr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out [16]byte
+		_, err = s.Decode(encoded, &out)
+		if err == nil {
+			t.Fatal("expected error decoding invalid UUID into [16]byte")
+		}
+	})
+
+	t.Run("string field still works", func(t *testing.T) {
+		input := wantStr
+		got := roundTrip(t, uuidSchema, input)
+		if got != input {
+			t.Fatalf("got %q, want %q", got, input)
+		}
+	})
+}
+
 // ---- Coverage: unsafe deser short buffer for time logical types in records ----
 
 func TestLogicalTypeUnsafeDeserShortBuffer(t *testing.T) {

@@ -471,6 +471,14 @@ func tryCompileLogicalSer(logical string, goType reflect.Type) userfn {
 			return usDuration
 		}
 		return nil
+	case "uuid":
+		if isUUIDType(goType) {
+			return usUUID
+		}
+		if goType.Kind() == reflect.String {
+			return usString
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -506,6 +514,14 @@ func tryCompileLogicalDeser(logical string, goType reflect.Type) udeserfn {
 	case "duration":
 		if goType == avroDurationType {
 			return udDuration
+		}
+		return nil
+	case "uuid":
+		if isUUIDType(goType) {
+			return udUUID
+		}
+		if goType.Kind() == reflect.String {
+			return udStringDeser
 		}
 		return nil
 	default:
@@ -601,6 +617,32 @@ func udDuration(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	d.Days = uint32(src[4]) | uint32(src[5])<<8 | uint32(src[6])<<16 | uint32(src[7])<<24
 	d.Milliseconds = uint32(src[8]) | uint32(src[9])<<8 | uint32(src[10])<<16 | uint32(src[11])<<24
 	return src[12:], nil
+}
+
+func usUUID(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	u := *(*[16]byte)(p)
+	return doSerString(dst, uuidToString(u)), nil
+}
+
+func udUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+	length, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("invalid negative string length %d", length)
+	}
+	n := int(length)
+	if len(src) < n {
+		return nil, &ShortBufferError{Type: "string", Need: n, Have: len(src)}
+	}
+	s := string(src[:n])
+	u, err := parseUUID(s)
+	if err != nil {
+		return nil, err
+	}
+	*(*[16]byte)(p) = u
+	return src[n:], nil
 }
 
 // ---- Unsafe serializers ----

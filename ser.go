@@ -2,6 +2,7 @@ package avro
 
 import (
 	"encoding"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -14,11 +15,16 @@ import (
 
 type serfn func([]byte, reflect.Value) ([]byte, error)
 
+// AppendEncode encodes v using the schema's Avro binary format and appends
+// the result to dst, returning the extended buffer. The mapping from Go types
+// to Avro types follows the same rules as [Schema.Decode]; see its
+// documentation for the full type mapping.
 func (s *Schema) AppendEncode(dst []byte, v interface{}) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
 
-// Encode encodes v using the schema and returns the encoded bytes.
+// Encode encodes v using the schema's Avro binary format and returns the
+// encoded bytes. This is equivalent to calling AppendEncode with a nil dst.
 func (s *Schema) Encode(v interface{}) ([]byte, error) {
 	return s.AppendEncode(nil, v)
 }
@@ -473,6 +479,7 @@ func serDuration(dst []byte, v reflect.Value) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+<<<<<<< HEAD
 	if v.Type() == avroDurationType {
 		d := v.Interface().(Duration)
 		dst = appendUint32(dst, d.Months)
@@ -567,4 +574,39 @@ func bigIntToBytes(i *big.Int) []byte {
 		}
 		return b
 	}
+}
+
+// isUUIDType returns true when t is an array of 16 uint8 bytes (e.g. [16]byte
+// or any type whose underlying type is [16]byte).
+func isUUIDType(t reflect.Type) bool {
+	return t.Kind() == reflect.Array && t.Len() == 16 && t.Elem().Kind() == reflect.Uint8
+}
+
+// uuidToString formats a [16]byte as the RFC 4122 hex-dash string
+// xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
+func uuidToString(u [16]byte) string {
+	var buf [36]byte
+	hex.Encode(buf[0:8], u[0:4])
+	buf[8] = '-'
+	hex.Encode(buf[9:13], u[4:6])
+	buf[13] = '-'
+	hex.Encode(buf[14:18], u[6:8])
+	buf[18] = '-'
+	hex.Encode(buf[19:23], u[8:10])
+	buf[23] = '-'
+	hex.Encode(buf[24:36], u[10:16])
+	return string(buf[:])
+}
+
+func serUUID(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if isUUIDType(v.Type()) {
+		var u [16]byte
+		reflect.Copy(reflect.ValueOf(&u).Elem(), v)
+		return doSerString(dst, uuidToString(u)), nil
+	}
+	return serString(dst, v)
 }

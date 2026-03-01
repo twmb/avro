@@ -5,7 +5,8 @@ import (
 	"reflect"
 )
 
-// SemanticError describes a problem with the Avro-to-Go mapping.
+// SemanticError describes a problem mapping between an Avro schema type and a
+// Go type during encoding or decoding. Use [errors.As] to extract it.
 type SemanticError struct {
 	// GoType is the Go type involved, if applicable.
 	GoType reflect.Type
@@ -39,8 +40,8 @@ func (e *SemanticError) Error() string {
 
 func (e *SemanticError) Unwrap() error { return e.Err }
 
-// ShortBufferError indicates that the input buffer is too short for the
-// value being decoded.
+// ShortBufferError indicates that the input buffer is too short for the value
+// being decoded. Use [errors.As] to extract it.
 type ShortBufferError struct {
 	// Type is what was being read (e.g. "boolean", "string", "uint32").
 	Type string
@@ -58,7 +59,8 @@ func (e *ShortBufferError) Error() string {
 }
 
 // CompatibilityError describes an incompatibility between a reader and writer
-// schema at a specific path in the schema tree.
+// schema, as returned by [CheckCompatibility] and [Resolve]. Use [errors.As]
+// to extract it from the returned error.
 type CompatibilityError struct {
 	// Path is the dotted path to the incompatible element (e.g. "User.address.zip").
 	Path string

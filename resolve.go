@@ -8,13 +8,20 @@ import (
 	"sync"
 )
 
-// Resolve builds a resolved *Schema that reads data written with the writer
-// schema and maps it to the reader schema. The returned schema decodes using
-// the writer's wire format but produces values according to the reader's
-// field layout. Encoding uses the reader schema.
+// Resolve builds a [*Schema] for schema evolution: the returned schema
+// decodes data written with the writer schema and maps it into the reader
+// schema's field layout. Encoding with the returned schema uses the reader's
+// format. This is the standard Avro mechanism for evolving schemas over time.
 //
-// If the reader and writer schemas are identical (by canonical form), the
-// reader schema is returned directly.
+// Resolve handles field addition (filled from reader defaults), field removal
+// (writer-only fields are skipped), field renaming (via aliases), field
+// reordering, type promotion (e.g. int to long, float to double, string to
+// bytes), enum symbol evolution (with default), and recursive/self-referencing
+// record resolution.
+//
+// If the reader and writer have identical canonical forms, the reader schema
+// is returned directly. Otherwise [CheckCompatibility] is called first; any
+// incompatibility is returned as a [*CompatibilityError].
 func Resolve(reader, writer *Schema) (*Schema, error) {
 	if bytes.Equal(reader.Canonical(), writer.Canonical()) {
 		return reader, nil
