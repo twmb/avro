@@ -293,27 +293,6 @@ func TestBuildUnionErrors(t *testing.T) {
 }
 
 func TestBuildComplexErrors(t *testing.T) {
-	t.Run("invalid name", func(t *testing.T) {
-		_, err := Parse(`{"type":"record","name":"123bad","fields":[]}`, WithStrictNames())
-		if err == nil {
-			t.Fatal("expected error for invalid name")
-		}
-	})
-
-	t.Run("invalid name lenient", func(t *testing.T) {
-		_, err := Parse(`{"type":"record","name":"123bad","fields":[]}`)
-		if err != nil {
-			t.Fatalf("expected lenient mode to accept invalid name, got %v", err)
-		}
-	})
-
-	t.Run("invalid namespace", func(t *testing.T) {
-		_, err := Parse(`{"type":"record","name":"r","namespace":"123bad","fields":[]}`, WithStrictNames())
-		if err == nil {
-			t.Fatal("expected error for invalid namespace")
-		}
-	})
-
 	t.Run("name with namespace only", func(t *testing.T) {
 		// Name like "com.example" is treated as a fullname.
 		_, err := Parse(`{"type":"record","name":"com.example","fields":[{"name":"a","type":"int"}]}`)
@@ -385,13 +364,6 @@ func TestBuildComplexErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid record field name", func(t *testing.T) {
-		_, err := Parse(`{"type":"record","name":"r","fields":[{"name":"123bad","type":"int"}]}`, WithStrictNames())
-		if err == nil {
-			t.Fatal("expected error for invalid field name")
-		}
-	})
-
 	t.Run("invalid record field type", func(t *testing.T) {
 		_, err := Parse(`{"type":"record","name":"r","fields":[{"name":"a","type":"unknown"}]}`)
 		if err == nil {
@@ -424,13 +396,6 @@ func TestBuildComplexErrors(t *testing.T) {
 		_, err := Parse(`{"type":"enum","name":"e","symbols":["a"],"size":4}`)
 		if err == nil {
 			t.Fatal("expected error for enum with size")
-		}
-	})
-
-	t.Run("invalid enum symbol", func(t *testing.T) {
-		_, err := Parse(`{"type":"enum","name":"e","symbols":["123bad"]}`, WithStrictNames())
-		if err == nil {
-			t.Fatal("expected error for invalid symbol")
 		}
 	})
 
@@ -572,14 +537,6 @@ func TestBuildUnionInUnion(t *testing.T) {
 	}
 }
 
-func TestBuildUnionInvalidInnerError(t *testing.T) {
-	// Union element that produces a non-unknownPrimitive error.
-	_, err := Parse(`["null",{"type":"record","name":"r","fields":[{"name":"123bad","type":"int"}]}]`, WithStrictNames())
-	if err == nil {
-		t.Fatal("expected error for invalid union element")
-	}
-}
-
 func TestBuildComplexUnknownLogicalIgnored(t *testing.T) {
 	// Per Avro spec, unknown logical types are ignored and the underlying type is used.
 	s, err := Parse(`{"type":"int","logicalType":"unknown_logical"}`)
@@ -676,30 +633,21 @@ func TestBuildEmptySchema(t *testing.T) {
 	}
 }
 
-func TestLenientNames(t *testing.T) {
-	// By default, lenient mode accepts names that don't match the strict regex.
-	t.Run("lenient allows dashes", func(t *testing.T) {
+func TestNonStrictNames(t *testing.T) {
+	t.Run("dashes allowed", func(t *testing.T) {
 		_, err := Parse(`{"type":"record","name":"my-record","fields":[{"name":"my-field","type":"int"}]}`)
 		if err != nil {
-			t.Fatalf("expected lenient to accept dashed names, got %v", err)
+			t.Fatalf("expected dashed names to be accepted, got %v", err)
 		}
 	})
 
-	t.Run("strict rejects dashes", func(t *testing.T) {
-		_, err := Parse(`{"type":"record","name":"my-record","fields":[{"name":"f","type":"int"}]}`, WithStrictNames())
-		if err == nil {
-			t.Fatal("expected strict to reject dashed name")
-		}
-	})
-
-	t.Run("lenient fullname detection", func(t *testing.T) {
-		// Fullnames (dot-separated) must be detected even in lenient mode
-		// so namespace handling works correctly.
+	t.Run("fullname detection", func(t *testing.T) {
+		// Fullnames (dot-separated) must be detected so namespace
+		// handling works correctly.
 		s, err := Parse(`{"type":"record","name":"com.example.MyRecord","fields":[{"name":"x","type":"int"}]}`)
 		if err != nil {
 			t.Fatalf("Parse: %v", err)
 		}
-		// The canonical form should reference the full name.
 		canon := string(s.Canonical())
 		if canon == "" {
 			t.Fatal("expected non-empty canonical form")

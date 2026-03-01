@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"hash"
 	"math"
-	"regexp"
 	"strings"
 )
 
@@ -59,8 +58,8 @@ type fieldNode struct {
 
 // MustParse is like [Parse] but panics on error. Useful for package-level
 // var declarations.
-func MustParse(schema string, opts ...ParseOpt) *Schema {
-	s, err := Parse(schema, opts...)
+func MustParse(schema string) *Schema {
+	s, err := Parse(schema)
 	if err != nil {
 		panic("avro: " + err.Error())
 	}
@@ -72,11 +71,7 @@ func MustParse(schema string, opts ...ParseOpt) *Schema {
 // (record, enum, array, map, fixed), or a JSON array (union). Named types
 // may reference each other and self-reference. The schema is fully validated:
 // unknown types, duplicate names, invalid defaults, etc. all return errors.
-//
-// By default, names are not strictly validated for compatibility with lenient
-// implementations like the Java reference library. Use [WithStrictNames] to
-// enforce spec-compliant name validation.
-func Parse(schema string, opts ...ParseOpt) (*Schema, error) {
+func Parse(schema string) (*Schema, error) {
 	var orig aschema
 	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
 		return nil, fmt.Errorf("invalid schema: %v", err)
@@ -88,10 +83,6 @@ func Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 		stypes:  make(map[string]*serRecord),
 		drtypes: make(map[string]*deserRecord),
 		ntypes:  make(map[string]*schemaNode),
-		lenient: true, // default: lenient name validation
-	}
-	for _, o := range opts {
-		o(b)
 	}
 	if err := b.build("", &orig); err != nil {
 		return nil, err
@@ -248,17 +239,6 @@ type recordFieldFixup struct {
 	name string
 }
 
-// ParseOpt is an option for [Parse].
-type ParseOpt func(*builder)
-
-// WithStrictNames enables strict Avro name validation per the specification
-// (names must match [A-Za-z_][A-Za-z0-9_]*). By default, names are not
-// validated for compatibility with schemas produced by lenient implementations
-// like the Java reference library.
-func WithStrictNames() ParseOpt {
-	return func(b *builder) { b.lenient = false }
-}
-
 type builder struct {
 	ser   serfn
 	deser deserfn
@@ -277,7 +257,6 @@ type builder struct {
 	meta    fieldMeta
 	canon   aschema
 	node    *schemaNode
-	lenient bool
 }
 
 func (b *builder) nest() *builder {
@@ -287,7 +266,6 @@ func (b *builder) nest() *builder {
 		stypes:  b.stypes,
 		drtypes: b.drtypes,
 		ntypes:  b.ntypes,
-		lenient: b.lenient,
 	}
 }
 
@@ -356,10 +334,6 @@ type unknownPrimitiveError struct{ p string }
 
 func (e *unknownPrimitiveError) Error() string { return fmt.Sprintf("unknown primitive %q", e.p) }
 
-var (
-	reName      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	reNamespace = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$`)
-)
 
 func (b *builder) build(parentName string, s *aschema) error {
 	if s == nil || s.primitive == "" && s.object == nil && len(s.union) == 0 {
@@ -594,18 +568,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		if strings.Contains(o.Name, ".") {
 			// Fullname (dot-separated): ignore parent & our own namespace.
-			if !b.lenient && !reNamespace.MatchString(o.Name) {
-				return fmt.Errorf("invalid name %q", o.Name)
-			}
 			parentName = ""
 			hasNS = false
-		} else if !b.lenient && !reName.MatchString(o.Name) {
-			return fmt.Errorf("invalid name %q", o.Name)
 		}
 		if hasNS && ns != "" {
-			if !b.lenient && !reNamespace.MatchString(ns) {
-				return fmt.Errorf("invalid namespace %q", ns)
-			}
 			o.Name = ns + "." + o.Name // have namespace: prefix our name
 		} else if hasNS && ns == "" {
 			// Explicit empty namespace: clear inherited namespace.
@@ -665,9 +631,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		var names []string
 		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
-			if !b.lenient && !reName.MatchString(of.Name) {
-				return fmt.Errorf("invalid record field name %q", of.Name)
-			}
 			if seenFields[of.Name] {
 				return fmt.Errorf("duplicate record field name %q", of.Name)
 			}
@@ -766,9 +729,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 
 		seenSymbols := make(map[string]bool, len(o.Symbols))
 		for _, e := range o.Symbols {
-			if !b.lenient && !reName.MatchString(e) {
-				return fmt.Errorf("invalid enum symbol %q", e)
-			}
 			if seenSymbols[e] {
 				return fmt.Errorf("duplicate enum symbol %q", e)
 			}
