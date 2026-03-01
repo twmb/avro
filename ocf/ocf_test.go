@@ -1088,6 +1088,8 @@ func TestOptMarkerMethods(t *testing.T) {
 	wo.(optMetadata).writerOpt()
 	wo = WithSyncMarker([16]byte{})
 	wo.(optSyncMarker).writerOpt()
+	wo = WithSchema("")
+	wo.(optSchema).writerOpt()
 	var ro ReaderOpt
 	ro = WithReaderCodec(nullCodec{})
 	ro.(optReaderCodec).readerOpt()
@@ -2670,6 +2672,70 @@ func TestGoldenWeather(t *testing.T) {
 				t.Fatalf("got %v, want %v", got, wantWeather)
 			}
 		})
+	}
+}
+
+func TestZstdCodecBadEncoderOption(t *testing.T) {
+	// Invalid window size (too small) causes zstd.NewWriter to fail.
+	_, err := ZstdCodec(zstd.WithWindowSize(1))
+	if err == nil {
+		t.Fatal("expected error for invalid zstd encoder option")
+	}
+	if !strings.Contains(err.Error(), "zstd") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReadBlockOversizedBlock(t *testing.T) {
+	// Construct a valid OCF header followed by a block whose size
+	// exceeds the 64 MiB safety limit.
+	var data []byte
+	data = append(data, magic[:]...)
+	data = encodeMap(data, []kv{{"avro.schema", []byte(`"null"`)}})
+	var sync [16]byte
+	data = append(data, sync[:]...)
+	data = appendVarlong(data, 1)       // block count
+	data = appendVarlong(data, 1<<26+1) // block size > 64 MiB
+
+	r, err := NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v any
+	err = r.Decode(&v)
+	if err == nil || !strings.Contains(err.Error(), "exceeds safety limit") {
+		t.Fatalf("expected safety limit error, got %v", err)
+	}
+}
+
+func TestDecodeMapOversizedCount(t *testing.T) {
+	var data []byte
+	data = appendVarlong(data, 1<<20+1) // count exceeds limit
+	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)))
+	if err == nil || !strings.Contains(err.Error(), "exceeds safety limit") {
+		t.Fatalf("expected safety limit error, got %v", err)
+	}
+}
+
+func TestDecodeMapOversizedKeyLen(t *testing.T) {
+	var data []byte
+	data = appendVarlong(data, 1)        // 1 entry
+	data = appendVarlong(data, 1<<20+1)  // key length too large
+	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)))
+	if err == nil || !strings.Contains(err.Error(), "key length") {
+		t.Fatalf("expected key length error, got %v", err)
+	}
+}
+
+func TestDecodeMapOversizedValLen(t *testing.T) {
+	var data []byte
+	data = appendVarlong(data, 1)       // 1 entry
+	data = appendVarlong(data, 1)       // key length = 1
+	data = append(data, 'k')           // key
+	data = appendVarlong(data, 1<<20+1) // value length too large
+	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)))
+	if err == nil || !strings.Contains(err.Error(), "value length") {
+		t.Fatalf("expected value length error, got %v", err)
 	}
 }
 
