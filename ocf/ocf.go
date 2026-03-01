@@ -633,11 +633,9 @@ type snappyCodec struct{}
 
 func (snappyCodec) Name() string { return "snappy" }
 
-var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
-
 func (snappyCodec) Compress(src []byte) ([]byte, error) {
 	dst := snappy.Encode(nil, src)
-	dst = binary.BigEndian.AppendUint32(dst, crc32.Checksum(src, castagnoliTable))
+	dst = binary.BigEndian.AppendUint32(dst, crc32.ChecksumIEEE(src))
 	return dst, nil
 }
 
@@ -649,7 +647,7 @@ func (snappyCodec) Decompress(src []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if crc32.Checksum(decoded, castagnoliTable) != binary.BigEndian.Uint32(src[len(src)-4:]) {
+	if crc32.ChecksumIEEE(decoded) != binary.BigEndian.Uint32(src[len(src)-4:]) {
 		return nil, errors.New("ocf: snappy CRC mismatch")
 	}
 	return decoded, nil

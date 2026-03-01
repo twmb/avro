@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -2605,3 +2607,107 @@ type testCodec struct {
 func (c *testCodec) Name() string                         { return c.name }
 func (c *testCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
 func (c *testCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
+
+// ---------- golden file tests ----------
+
+type weather struct {
+	Station string `avro:"station"`
+	Time    int64  `avro:"time"`
+	Temp    int32  `avro:"temp"`
+}
+
+var wantWeather = []weather{
+	{"011990-99999", -619524000000, 0},
+	{"011990-99999", -619506000000, 22},
+	{"011990-99999", -619484400000, -11},
+	{"012650-99999", -655531200000, 111},
+	{"012650-99999", -655509600000, 78},
+}
+
+func TestGoldenWeather(t *testing.T) {
+	tests := []struct {
+		file  string
+		codec string
+	}{
+		{"weather.avro", "null"},
+		{"weather-deflate.avro", "deflate"},
+		{"weather-snappy.avro", "snappy"},
+		{"weather-zstd.avro", "zstandard"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.codec, func(t *testing.T) {
+			f, err := os.Open(filepath.Join("testdata", tt.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+
+			r, err := NewReader(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+
+			// Verify codec metadata.
+			if tt.codec != "null" {
+				if got := string(r.Metadata()["avro.codec"]); got != tt.codec {
+					t.Fatalf("codec = %q, want %q", got, tt.codec)
+				}
+			}
+
+			var got []weather
+			for {
+				var w weather
+				if err := r.Decode(&w); err != nil {
+					if err == io.EOF {
+						break
+					}
+					t.Fatal(err)
+				}
+				got = append(got, w)
+			}
+			if !reflect.DeepEqual(got, wantWeather) {
+				t.Fatalf("got %v, want %v", got, wantWeather)
+			}
+		})
+	}
+}
+
+func TestGoldenCorruptData(t *testing.T) {
+	tests := []struct {
+		file    string
+		wantErr string
+	}{
+		{"deflate-invalid-data.avro", "decompressing"},
+		{"snappy-invalid-crc.avro", "CRC mismatch"},
+		{"snappy-invalid-data.avro", "decompressing"},
+		{"snappy-short-crc.avro", "too short"},
+		{"zstd-invalid-data.avro", "decompressing"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.file, func(t *testing.T) {
+			f, err := os.Open(filepath.Join("testdata", tt.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+
+			r, err := NewReader(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+
+			// The header is valid; the first Decode should fail
+			// because the block data is corrupt.
+			var v any
+			err = r.Decode(&v)
+			if err == nil {
+				t.Fatal("expected error decoding corrupt data")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error %q does not contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}

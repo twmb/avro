@@ -1,0 +1,10 @@
+This directory contains golden test files from external projects.
+
+weather.avro, weather-deflate.avro, weather-snappy.avro, weather-zstd.avro:
+  From the Apache Avro project (https://github.com/apache/avro),
+  share/test/data/. Licensed under the Apache License, Version 2.0.
+
+deflate-invalid-data.avro, snappy-invalid-crc.avro, snappy-invalid-data.avro,
+snappy-short-crc.avro, zstd-invalid-data.avro:
+  From the hamba/avro project (https://github.com/hamba/avro),
+  ocf/testdata/. Licensed under the MIT License.
