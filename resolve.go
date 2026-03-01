@@ -38,6 +38,7 @@ func Resolve(reader, writer *Schema) (*Schema, error) {
 		deser: resolved.deser,
 		c:     reader.c,
 		node:  reader.node,
+		full:  reader.full,
 	}
 	s.soe = reader.soe
 	return s, nil
@@ -533,6 +534,18 @@ func resolveUnionUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaN
 	}, nil
 }
 
+// defaultStringToBytes converts a JSON-decoded string to raw bytes for Avro
+// bytes/fixed defaults. The Avro spec says code points 0-255 map to byte values
+// 0-255. json.Unmarshal decodes \u00FF to multi-byte UTF-8, so we must convert
+// each rune back to a single byte.
+func defaultStringToBytes(s string) []byte {
+	b := make([]byte, 0, len(s))
+	for _, r := range s {
+		b = append(b, byte(r))
+	}
+	return b
+}
+
 // encodeDefault converts a parsed JSON default value to Avro binary encoding.
 func encodeDefault(val any, node *schemaNode) ([]byte, error) {
 	return doEncodeDefault(nil, val, node)
@@ -587,8 +600,9 @@ func doEncodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("expected string for bytes default, got %T", val)
 		}
-		dst = appendVarlong(dst, int64(len(s)))
-		return append(dst, s...), nil
+		b := defaultStringToBytes(s)
+		dst = appendVarlong(dst, int64(len(b)))
+		return append(dst, b...), nil
 	case "enum":
 		s, ok := val.(string)
 		if !ok {
@@ -605,10 +619,11 @@ func doEncodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("expected string for fixed default, got %T", val)
 		}
-		if len(s) != node.size {
-			return nil, fmt.Errorf("fixed default length %d != size %d", len(s), node.size)
+		b := defaultStringToBytes(s)
+		if len(b) != node.size {
+			return nil, fmt.Errorf("fixed default length %d != size %d", len(b), node.size)
 		}
-		return append(dst, s...), nil
+		return append(dst, b...), nil
 	case "array":
 		arr, ok := val.([]any)
 		if !ok {

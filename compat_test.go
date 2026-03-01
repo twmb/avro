@@ -279,6 +279,23 @@ func TestCheckCompatibility(t *testing.T) {
 			reader: `["null","long"]`,
 			writer: `"int"`,
 		},
+		{
+			name:    "decimal precision mismatch",
+			reader:  `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+			writer:  `{"type":"bytes","logicalType":"decimal","precision":8,"scale":2}`,
+			wantErr: true,
+		},
+		{
+			name:    "decimal scale mismatch",
+			reader:  `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+			writer:  `{"type":"bytes","logicalType":"decimal","precision":10,"scale":4}`,
+			wantErr: true,
+		},
+		{
+			name:   "decimal same precision and scale",
+			reader: `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+			writer: `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+		},
 	}
 
 	for _, tt := range tests {

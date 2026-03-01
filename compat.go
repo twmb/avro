@@ -145,6 +145,17 @@ func checkSameKind(r, w *schemaNode, path string, seen map[nodePair]bool) error 
 			}
 		}
 	}
+	// Decimal logical types must match on precision and scale.
+	if r.logical == "decimal" && w.logical == "decimal" {
+		if r.precision != w.precision || r.scale != w.scale {
+			return &CompatibilityError{
+				Path:       pathOrRoot(path),
+				ReaderType: fmt.Sprintf("decimal(%d,%d)", r.precision, r.scale),
+				WriterType: fmt.Sprintf("decimal(%d,%d)", w.precision, w.scale),
+				Detail:     "decimal precision or scale differ",
+			}
+		}
+	}
 	return nil
 }
 

@@ -6514,6 +6514,150 @@ func TestDurationShortBuffer(t *testing.T) {
 	}
 }
 
+// ---- Coverage: timestamp-nanos / local-timestamp-nanos ----
+
+func TestTimestampNanosRoundTrip(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
+	now := time.Now()
+	got := roundTrip(t, schema, now)
+	if !got.Equal(now) {
+		t.Fatalf("timestamp-nanos round trip: got %v, want %v", got, now)
+	}
+}
+
+func TestLocalTimestampNanosRoundTrip(t *testing.T) {
+	schema := `{"type":"long","logicalType":"local-timestamp-nanos"}`
+	now := time.Now()
+	got := roundTrip(t, schema, now)
+	if !got.Equal(now) {
+		t.Fatalf("local-timestamp-nanos round trip: got %v, want %v", got, now)
+	}
+}
+
+func TestTimestampNanosFallbackToInt64(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
+	input := int64(1718400000000000000)
+	got := roundTrip(t, schema, input)
+	if got != input {
+		t.Fatalf("timestamp-nanos int64 fallback: got %d, want %d", got, input)
+	}
+}
+
+func TestTimestampNanosInRecord(t *testing.T) {
+	type R struct {
+		Created time.Time `avro:"created"`
+	}
+	schema := `{"type":"record","name":"r","fields":[
+		{"name":"created","type":{"type":"long","logicalType":"timestamp-nanos"}}
+	]}`
+	input := R{Created: time.Now()}
+	got := roundTrip(t, schema, input)
+	if !got.Created.Equal(input.Created) {
+		t.Fatalf("got %v, want %v", got.Created, input.Created)
+	}
+}
+
+func TestTimestampNanosDecodeIntoInterface(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
+	now := time.Now()
+	encoded := encode(t, schema, &now)
+	var v any
+	decode(t, schema, encoded, &v)
+	got, ok := v.(int64)
+	if !ok {
+		t.Fatalf("expected int64, got %T", v)
+	}
+	if got != now.UnixNano() {
+		t.Fatalf("got %d, want %d", got, now.UnixNano())
+	}
+}
+
+func TestTimestampNanosDecodeUint(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
+	now := time.Now()
+	encoded := encode(t, schema, &now)
+	var v uint64
+	decode(t, schema, encoded, &v)
+	if v != uint64(now.UnixNano()) {
+		t.Fatalf("got %d, want %d", v, uint64(now.UnixNano()))
+	}
+}
+
+func TestTimestampNanosDecodeError(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
+	now := time.Now()
+	encoded := encode(t, schema, &now)
+	var v string
+	s, _ := Parse(schema)
+	_, err := s.Decode(encoded, &v)
+	if err == nil {
+		t.Fatal("expected error decoding nanos into string")
+	}
+}
+
+// ---- Coverage: UUID edge cases ----
+
+func TestUUIDDecodeIntoInterface(t *testing.T) {
+	uuidSchema := `{"type":"string","logicalType":"uuid"}`
+	input := "550e8400-e29b-41d4-a716-446655440000"
+	encoded := encode(t, uuidSchema, &input)
+	var v any
+	decode(t, uuidSchema, encoded, &v)
+	got, ok := v.(string)
+	if !ok {
+		t.Fatalf("expected string, got %T", v)
+	}
+	if got != input {
+		t.Fatalf("got %s, want %s", got, input)
+	}
+}
+
+func TestUUIDDecodeIntoTextUnmarshaler(t *testing.T) {
+	uuidSchema := `{"type":"string","logicalType":"uuid"}`
+	input := "550e8400-e29b-41d4-a716-446655440000"
+	encoded := encode(t, uuidSchema, &input)
+	var v testTextUnmarshaler
+	decode(t, uuidSchema, encoded, &v)
+	want := "unmarshaled:" + input
+	if v.val != want {
+		t.Fatalf("got %s, want %s", v.val, want)
+	}
+}
+
+func TestUUIDDecodeTypeError(t *testing.T) {
+	uuidSchema := `{"type":"string","logicalType":"uuid"}`
+	input := "550e8400-e29b-41d4-a716-446655440000"
+	encoded := encode(t, uuidSchema, &input)
+	var v int
+	s, _ := Parse(uuidSchema)
+	_, err := s.Decode(encoded, &v)
+	if err == nil {
+		t.Fatal("expected error decoding UUID into int")
+	}
+}
+
+func TestUUIDDecodeNegativeLength(t *testing.T) {
+	uuidSchema := `{"type":"string","logicalType":"uuid"}`
+	s, _ := Parse(uuidSchema)
+	// Encode a negative length varint: -1 zigzag = 0x01
+	var v string
+	_, err := s.Decode([]byte{0x01}, &v)
+	if err == nil {
+		t.Fatal("expected error for negative UUID string length")
+	}
+}
+
+func TestUUIDDecodeShortBuffer(t *testing.T) {
+	uuidSchema := `{"type":"string","logicalType":"uuid"}`
+	s, _ := Parse(uuidSchema)
+	// Length 36, but only 2 bytes of data.
+	var v string
+	_, err := s.Decode([]byte{72, 'a', 'b'}, &v) // 72 = zigzag(36)
+	if err == nil {
+		t.Fatal("expected error for short buffer")
+	}
+}
+
 func TestDurationInRecordUnsafeShortBuffer(t *testing.T) {
 	type R struct {
 		D Duration `avro:"d"`
@@ -6994,5 +7138,497 @@ func TestFixedDecimalSerNilPointer(t *testing.T) {
 	_, err = s.AppendEncode(nil, &r)
 	if err == nil {
 		t.Fatal("expected error for nil *big.Rat pointer")
+	}
+}
+
+func TestParseUUIDInvalidHex(t *testing.T) {
+	// Test each hex segment separately to hit all parseUUID error branches.
+	uuidSchema := `{"type":"string","logicalType":"uuid"}`
+	s, _ := Parse(uuidSchema)
+	invalids := []string{
+		"ZZZZZZZZ-e29b-41d4-a716-446655440000", // bad group 1
+		"550e8400-ZZZZ-41d4-a716-446655440000", // bad group 2
+		"550e8400-e29b-ZZZZ-a716-446655440000", // bad group 3
+		"550e8400-e29b-41d4-ZZZZ-446655440000", // bad group 4
+		"550e8400-e29b-41d4-a716-ZZZZZZZZZZZZ", // bad group 5
+	}
+	for _, bad := range invalids {
+		encoded := encode(t, `"string"`, &bad)
+		var u [16]byte
+		_, err := s.Decode(encoded, &u)
+		if err == nil {
+			t.Fatalf("expected error for invalid UUID %q", bad)
+		}
+	}
+}
+
+// ---- Coverage: serNullUnion with invalid value ----
+
+func TestSerNullUnionInvalidValue(t *testing.T) {
+	schema := `["null","int"]`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Encode nil (zero reflect.Value via nil interface)
+	encoded, err := s.Encode(nil)
+	if err != nil {
+		t.Fatalf("encode nil: %v", err)
+	}
+	if len(encoded) != 1 || encoded[0] != 0 {
+		t.Fatalf("expected [0], got %v", encoded)
+	}
+}
+
+// ---- Coverage: floorDiv positive exact division ----
+
+func TestFloorDivPositive(t *testing.T) {
+	// Positive exact division (no remainder, no adjustment needed).
+	if got := floorDiv(10, 5); got != 2 {
+		t.Fatalf("floorDiv(10,5) = %d, want 2", got)
+	}
+	// Negative with remainder (adjustment needed).
+	if got := floorDiv(-1, 86400); got != -1 {
+		t.Fatalf("floorDiv(-1,86400) = %d, want -1", got)
+	}
+	// Negative exact (no adjustment).
+	if got := floorDiv(-86400, 86400); got != -1 {
+		t.Fatalf("floorDiv(-86400,86400) = %d, want -1", got)
+	}
+}
+
+// ---- Coverage: MustParse panic ----
+
+func TestMustParsePanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic from MustParse")
+		}
+	}()
+	MustParse(`invalid`)
+}
+
+// ---- Coverage: Schema.String() ----
+
+func TestSchemaString(t *testing.T) {
+	input := `{"type":"record","name":"R","fields":[{"name":"f","type":"int"}]}`
+	s, err := Parse(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.String() != input {
+		t.Fatalf("String() = %q, want %q", s.String(), input)
+	}
+}
+
+// ---- Coverage: error record type ----
+
+func TestErrorRecordType(t *testing.T) {
+	schema := `{"type":"error","name":"MyError","fields":[{"name":"msg","type":"string"},{"name":"code","type":"int"}]}`
+	type MyError struct {
+		Msg  string `avro:"msg"`
+		Code int32  `avro:"code"`
+	}
+	input := MyError{Msg: "not found", Code: 404}
+	got := roundTrip(t, schema, input)
+	if got != input {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+// ---- Coverage: field order validation ----
+
+func TestFieldOrderValidation(t *testing.T) {
+	for _, order := range []string{"ascending", "descending", "ignore"} {
+		schema := fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":"int","order":"%s"}]}`, order)
+		_, err := Parse(schema)
+		if err != nil {
+			t.Fatalf("unexpected error for order=%q: %v", order, err)
+		}
+	}
+	_, err := Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int","order":"backwards"}]}`)
+	if err == nil {
+		t.Fatal("expected error for invalid field order")
+	}
+}
+
+// ---- Coverage: big-decimal logical type ----
+
+func TestBigDecimalLogicalType(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"big-decimal"}`
+	input := []byte{0, 0, 0, 2, 0x01, 0x39} // scale=2, unscaled=313
+	got := roundTrip(t, schema, input)
+	if !bytes.Equal(got, input) {
+		t.Fatalf("got %x, want %x", got, input)
+	}
+}
+
+func TestBigDecimalOnFixedRejected(t *testing.T) {
+	_, err := Parse(`{"type":"fixed","name":"F","size":16,"logicalType":"big-decimal"}`)
+	if err == nil {
+		t.Fatal("expected error for big-decimal on fixed")
+	}
+}
+
+// ---- Coverage: duplicate union named type ----
+
+func TestDuplicateUnionNamedType(t *testing.T) {
+	_, err := Parse(`[{"type":"record","name":"A","fields":[]},{"type":"record","name":"A","fields":[]}]`)
+	if err == nil {
+		t.Fatal("expected error for duplicate named type in union")
+	}
+}
+
+// ---- Coverage: decimal on fixed with precision/scale in schemaNode ----
+
+func TestDecimalFixedPrecisionScale(t *testing.T) {
+	schema := `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":8,"scale":2}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Round-trip a fixed(4) value.
+	input := [4]byte{0x00, 0x01, 0x86, 0xa0} // 100000 unscaled = 1000.00
+	encoded, err := s.Encode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [4]byte
+	_, err = s.Decode(encoded, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != input {
+		t.Fatalf("got %x, want %x", got, input)
+	}
+}
+
+func TestDecimalFixedInvalidPrecision(t *testing.T) {
+	// size=1 can hold at most floor(log10(2^7-1)) = 2 digits.
+	_, err := Parse(`{"type":"fixed","name":"D","size":1,"logicalType":"decimal","precision":3}`)
+	if err == nil {
+		t.Fatal("expected error for precision too large for fixed size")
+	}
+}
+
+func TestMaxDecimalDigitsZeroSize(t *testing.T) {
+	if got := maxDecimalDigits(0); got != 0 {
+		t.Fatalf("maxDecimalDigits(0) = %d, want 0", got)
+	}
+}
+
+// ---- Coverage: timestamp-nanos logicalSer/logicalDeser paths ----
+
+func TestTimestampNanosLogicalTypeInComplexSchema(t *testing.T) {
+	// This exercises the logicalSer/logicalDeser paths for nanos when
+	// the schema is given as a complex object (not already a primitive).
+	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	encoded, err := s.Encode(&now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got time.Time
+	_, err = s.Decode(encoded, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(now) {
+		t.Fatalf("got %v, want %v", got, now)
+	}
+}
+
+// ---- Coverage: UUID ser with [16]byte through non-record path ----
+
+func TestSerUUIDArrayType(t *testing.T) {
+	schema := `{"type":"string","logicalType":"uuid"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	encoded, err := s.Encode(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	_, err = s.Decode(encoded, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Fatalf("got %s, want 550e8400-e29b-41d4-a716-446655440000", got)
+	}
+}
+
+// ---- Coverage: serUUID error path (non-uuid, non-string type) ----
+
+func TestSerUUIDTypeError(t *testing.T) {
+	schema := `{"type":"string","logicalType":"uuid"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Encode(42)
+	if err == nil {
+		t.Fatal("expected error encoding int as UUID")
+	}
+}
+
+// ---- Coverage: timestamp-nanos int64 in record (unsafe fast path fallback) ----
+
+func TestTimestampNanosInt64InRecord(t *testing.T) {
+	type R struct {
+		V int64 `avro:"v"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"v","type":{"type":"long","logicalType":"timestamp-nanos"}}
+	]}`
+	input := R{V: 1718400000000000000}
+	got := roundTrip(t, schema, input)
+	if got.V != input.V {
+		t.Fatalf("got %d, want %d", got.V, input.V)
+	}
+}
+
+// ---- Coverage: UUID string in record (unsafe fast path for string) ----
+
+func TestUUIDStringInRecord(t *testing.T) {
+	type R struct {
+		ID string `avro:"id"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
+	]}`
+	input := R{ID: "550e8400-e29b-41d4-a716-446655440000"}
+	got := roundTrip(t, schema, input)
+	if got.ID != input.ID {
+		t.Fatalf("got %s, want %s", got.ID, input.ID)
+	}
+}
+
+// ---- Coverage: UUID on fixed(16) in record (unsafe returns nil, default fixed path) ----
+
+func TestUUIDFixed16InRecord(t *testing.T) {
+	type R struct {
+		ID [16]byte `avro:"id"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"id","type":{"type":"fixed","name":"uuid","size":16,"logicalType":"uuid"}}
+	]}`
+	input := R{ID: [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}}
+	got := roundTrip(t, schema, input)
+	if got.ID != input.ID {
+		t.Fatalf("got %x, want %x", got.ID, input.ID)
+	}
+}
+
+// ---- Coverage: array/map block count exceeding buffer ----
+
+func TestArrayBlockCountExceedsBuffer(t *testing.T) {
+	s, _ := Parse(`{"type":"array","items":"int"}`)
+	// Manually craft: block count = 1000 (varint), no items.
+	buf := appendVarlong(nil, 1000) // count=1000 but no data
+	var v []int32
+	_, err := s.Decode(buf, &v)
+	if err == nil {
+		t.Fatal("expected error for array block count exceeding buffer")
+	}
+}
+
+func TestMapBlockCountExceedsBuffer(t *testing.T) {
+	s, _ := Parse(`{"type":"map","values":"int"}`)
+	buf := appendVarlong(nil, 1000)
+	var v map[string]int32
+	_, err := s.Decode(buf, &v)
+	if err == nil {
+		t.Fatal("expected error for map block count exceeding buffer")
+	}
+}
+
+// ---- Coverage: deserTimestampNanos short buffer ----
+
+func TestDeserTimestampNanosShortBuffer(t *testing.T) {
+	s, _ := Parse(`{"type":"long","logicalType":"timestamp-nanos"}`)
+	var v time.Time
+	_, err := s.Decode(nil, &v) // empty buffer
+	if err == nil {
+		t.Fatal("expected error for short buffer")
+	}
+}
+
+// ---- Coverage: deserUUID readVarlong error ----
+
+func TestDeserUUIDShortBuffer(t *testing.T) {
+	s, _ := Parse(`{"type":"string","logicalType":"uuid"}`)
+	var v string
+	_, err := s.Decode(nil, &v) // empty buffer
+	if err == nil {
+		t.Fatal("expected error for short buffer")
+	}
+}
+
+// ---- Coverage: deserUUID TextUnmarshaler error ----
+
+func TestDeserUUIDTextUnmarshalerError(t *testing.T) {
+	s, _ := Parse(`{"type":"string","logicalType":"uuid"}`)
+	input := "550e8400-e29b-41d4-a716-446655440000"
+	encoded := encode(t, `{"type":"string","logicalType":"uuid"}`, &input)
+	var v testTextUnmarshalerErr
+	_, err := s.Decode(encoded, &v)
+	if err == nil {
+		t.Fatal("expected error from TextUnmarshaler")
+	}
+}
+
+// ---- Coverage: decimal precision <= 0, scale > precision ----
+
+func TestDecimalPrecisionZero(t *testing.T) {
+	_, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":0}`)
+	if err == nil {
+		t.Fatal("expected error for precision=0")
+	}
+}
+
+func TestDecimalScaleExceedsPrecision(t *testing.T) {
+	_, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":6}`)
+	if err == nil {
+		t.Fatal("expected error for scale > precision")
+	}
+}
+
+// ---- Coverage: serTimestampNanos nil pointer, serUUID nil pointer ----
+
+func TestSerTimestampNanosNilPointer(t *testing.T) {
+	s, _ := Parse(`{"type":"long","logicalType":"timestamp-nanos"}`)
+	var p *time.Time
+	_, err := s.Encode(p)
+	if err == nil {
+		t.Fatal("expected error for nil pointer")
+	}
+}
+
+func TestSerUUIDNilPointer(t *testing.T) {
+	s, _ := Parse(`{"type":"string","logicalType":"uuid"}`)
+	var p *string
+	_, err := s.Encode(p)
+	if err == nil {
+		t.Fatal("expected error for nil pointer")
+	}
+}
+
+// ---- Coverage: duplicate union named type same name ----
+
+func TestDuplicateUnionNamedTypeSameName(t *testing.T) {
+	// Two different named records with the same name in a union.
+	_, err := Parse(`[
+		{"type":"record","name":"X","fields":[{"name":"a","type":"int"}]},
+		{"type":"record","name":"X","fields":[{"name":"b","type":"string"}]}
+	]`)
+	if err == nil {
+		t.Fatal("expected error for duplicate named union type")
+	}
+}
+
+// ---- Coverage: unsafe udTimestampNanos error path ----
+
+func TestUnsafeUdTimestampNanosError(t *testing.T) {
+	type R struct {
+		V time.Time `avro:"v"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"v","type":{"type":"long","logicalType":"timestamp-nanos"}}
+	]}`
+	s, _ := Parse(schema)
+	var r R
+	_, err := s.Decode(nil, &r) // empty buffer
+	if err == nil {
+		t.Fatal("expected error for short buffer on unsafe path")
+	}
+}
+
+// ---- Coverage: unsafe udUUID error paths ----
+
+func TestUnsafeUdUUIDShortBuffer(t *testing.T) {
+	type R struct {
+		ID [16]byte `avro:"id"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
+	]}`
+	s, _ := Parse(schema)
+	var r R
+	_, err := s.Decode(nil, &r)
+	if err == nil {
+		t.Fatal("expected error for short buffer")
+	}
+}
+
+func TestUnsafeUdUUIDNegativeLength(t *testing.T) {
+	type R struct {
+		ID [16]byte `avro:"id"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
+	]}`
+	s, _ := Parse(schema)
+	var r R
+	_, err := s.Decode([]byte{0x01}, &r) // -1 zigzag
+	if err == nil {
+		t.Fatal("expected error for negative length")
+	}
+}
+
+func TestUnsafeUdUUIDTooShort(t *testing.T) {
+	type R struct {
+		ID [16]byte `avro:"id"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
+	]}`
+	s, _ := Parse(schema)
+	var r R
+	_, err := s.Decode([]byte{72, 'a', 'b'}, &r) // length 36, only 2 bytes
+	if err == nil {
+		t.Fatal("expected error for short buffer")
+	}
+}
+
+// ---- Coverage: uuid unsafe fallback nil (non-string, non-[16]byte struct field) ----
+
+func TestUUIDUnsafeFallbackNil(t *testing.T) {
+	type R struct {
+		ID any `avro:"id"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
+	]}`
+	input := R{ID: "550e8400-e29b-41d4-a716-446655440000"}
+	got := roundTrip(t, schema, input)
+	if got.ID != input.ID {
+		t.Fatalf("got %v, want %v", got.ID, input.ID)
+	}
+}
+
+func TestUnsafeUdUUIDInvalidHex(t *testing.T) {
+	type R struct {
+		ID [16]byte `avro:"id"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
+	]}`
+	s, _ := Parse(schema)
+	// Encode a valid-length but invalid-hex UUID string.
+	bad := "ZZZZZZZZ-e29b-41d4-a716-446655440000"
+	data := appendVarlong(nil, int64(len(bad)))
+	data = append(data, bad...)
+	var r R
+	_, err := s.Decode(data, &r)
+	if err == nil {
+		t.Fatal("expected error for invalid UUID hex")
 	}
 }

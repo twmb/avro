@@ -301,7 +301,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 
 	// Logical type fast paths for time.Time and time.Duration.
 	if f.meta != nil && f.meta.logical != "" {
-		return tryCompileLogicalSer(f.meta.logical, goType)
+		return tryCompileLogicalSer(f.meta.logical, f.avroType, goType)
 	}
 
 	switch f.avroType {
@@ -408,7 +408,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 
 	// Logical type fast paths for time.Time and time.Duration.
 	if f.meta != nil && f.meta.logical != "" {
-		return tryCompileLogicalDeser(f.meta.logical, goType)
+		return tryCompileLogicalDeser(f.meta.logical, f.avroType, goType)
 	}
 
 	switch f.avroType {
@@ -439,7 +439,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 
 // ---- Logical type unsafe serializers ----
 
-func tryCompileLogicalSer(logical string, goType reflect.Type) userfn {
+func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn {
 	switch logical {
 	case "timestamp-millis", "local-timestamp-millis":
 		if goType == timeType {
@@ -449,6 +449,11 @@ func tryCompileLogicalSer(logical string, goType reflect.Type) userfn {
 	case "timestamp-micros", "local-timestamp-micros":
 		if goType == timeType {
 			return usTimestampMicros
+		}
+		return usLong(goType.Kind())
+	case "timestamp-nanos", "local-timestamp-nanos":
+		if goType == timeType {
+			return usTimestampNanos
 		}
 		return usLong(goType.Kind())
 	case "date":
@@ -472,19 +477,20 @@ func tryCompileLogicalSer(logical string, goType reflect.Type) userfn {
 		}
 		return nil
 	case "uuid":
+		if avroType == "fixed" {
+			return nil // fixed(16) UUID: use default fixed ser (raw bytes)
+		}
 		if isUUIDType(goType) {
 			return usUUID
 		}
 		if goType.Kind() == reflect.String {
 			return usString
 		}
-		return nil
-	default:
-		return nil
 	}
+	return nil
 }
 
-func tryCompileLogicalDeser(logical string, goType reflect.Type) udeserfn {
+func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udeserfn {
 	switch logical {
 	case "timestamp-millis", "local-timestamp-millis":
 		if goType == timeType {
@@ -494,6 +500,11 @@ func tryCompileLogicalDeser(logical string, goType reflect.Type) udeserfn {
 	case "timestamp-micros", "local-timestamp-micros":
 		if goType == timeType {
 			return udTimestampMicros
+		}
+		return udLong(goType.Kind())
+	case "timestamp-nanos", "local-timestamp-nanos":
+		if goType == timeType {
+			return udTimestampNanos
 		}
 		return udLong(goType.Kind())
 	case "date":
@@ -517,16 +528,17 @@ func tryCompileLogicalDeser(logical string, goType reflect.Type) udeserfn {
 		}
 		return nil
 	case "uuid":
+		if avroType == "fixed" {
+			return nil // fixed(16) UUID: use default fixed deser (raw bytes)
+		}
 		if isUUIDType(goType) {
 			return udUUID
 		}
 		if goType.Kind() == reflect.String {
 			return udStringDeser
 		}
-		return nil
-	default:
-		return nil
 	}
+	return nil
 }
 
 func usTimestampMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -539,10 +551,14 @@ func usTimestampMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	return appendVarlong(dst, t.UnixMicro()), nil
 }
 
+func usTimestampNanos(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	t := *(*time.Time)(p)
+	return appendVarlong(dst, t.UnixNano()), nil
+}
+
 func usDate(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	t := *(*time.Time)(p)
-	days := int32(t.Unix() / 86400)
-	return appendVarint(dst, days), nil
+	return appendVarint(dst, int32(floorDiv(t.Unix(), 86400))), nil
 }
 
 func usTimeMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -570,6 +586,15 @@ func udTimestampMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	*(*time.Time)(p) = time.UnixMicro(val)
+	return src, nil
+}
+
+func udTimestampNanos(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	*(*time.Time)(p) = time.Unix(val/1e9, val%1e9)
 	return src, nil
 }
 

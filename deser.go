@@ -626,6 +626,30 @@ func deserTimestampMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 	return src, nil
 }
 
+func deserTimestampNanos(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	v = indirectAlloc(v)
+	if v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.Unix(val/1e9, val%1e9)))
+		return src, nil
+	}
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return src, nil
+	}
+	if v.CanInt() {
+		v.SetInt(val)
+	} else if v.CanUint() {
+		v.SetUint(uint64(val))
+	} else {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+	}
+	return src, nil
+}
+
 func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {

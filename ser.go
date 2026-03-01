@@ -443,6 +443,28 @@ func serTimestampMicros(dst []byte, v reflect.Value) ([]byte, error) {
 	return serLong(dst, v)
 }
 
+func serTimestampNanos(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == timeType {
+		t := v.Interface().(time.Time)
+		return appendVarlong(dst, t.UnixNano()), nil
+	}
+	return serLong(dst, v)
+}
+
+// floorDiv returns the floor of a/b (rounds toward negative infinity),
+// unlike Go's built-in integer division which truncates toward zero.
+func floorDiv(a, b int64) int64 {
+	d := a / b
+	if (a^b) < 0 && d*b != a {
+		d--
+	}
+	return d
+}
+
 func serDate(dst []byte, v reflect.Value) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
@@ -450,8 +472,7 @@ func serDate(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
-		days := int32(t.Unix() / 86400)
-		return appendVarint(dst, days), nil
+		return appendVarint(dst, int32(floorDiv(t.Unix(), 86400))), nil
 	}
 	return serInt(dst, v)
 }
