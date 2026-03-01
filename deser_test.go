@@ -860,6 +860,10 @@ func TestDecodeTypeMismatch(t *testing.T) {
 		{"map into string", `{"type":"map","values":"int"}`, []byte{0x00}, new("")},
 		{"map with int key", `{"type":"map","values":"int"}`, []byte{0x00}, new(map[int]int32{})},
 		{"record into int", `{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`, []byte{0x02}, new(int32(0))},
+		{"float into string", `"float"`, []byte{0, 0, 0, 0}, new("")},
+		{"double into string", `"double"`, []byte{0, 0, 0, 0, 0, 0, 0, 0}, new("")},
+		{"boolean into int", `"boolean"`, []byte{0x01}, new(int32(0))},
+		{"long into bool", `"long"`, []byte{0x02}, new(false)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1433,22 +1437,6 @@ func TestDecodeBytesNonUint8Slice(t *testing.T) {
 
 func TestDecodeBytesNonUint8Array(t *testing.T) {
 	decodeErr(t, `"bytes"`, []byte{0x04, 0x01, 0x02}, new([2]int32{}))
-}
-
-func TestDecodeFloatTypeMismatch(t *testing.T) {
-	decodeErr(t, `"float"`, []byte{0, 0, 0, 0}, new(""))
-}
-
-func TestDecodeDoubleTypeMismatch(t *testing.T) {
-	decodeErr(t, `"double"`, []byte{0, 0, 0, 0, 0, 0, 0, 0}, new(""))
-}
-
-func TestDecodeBooleanTypeMismatch(t *testing.T) {
-	decodeErr(t, `"boolean"`, []byte{0x01}, new(int32(0)))
-}
-
-func TestDecodeLongTypeMismatch(t *testing.T) {
-	decodeErr(t, `"long"`, []byte{0x02}, new(false))
 }
 
 func TestDecodeEnumIntoUint(t *testing.T) {
@@ -2293,8 +2281,9 @@ func BenchmarkDeserializeGeneric(b *testing.B) {
 // the Go struct field types vary. The unsafe fast path compiles per-Kind
 // closures, so we need struct fields of each Kind.
 
-func TestUnsafeIntAllKinds(t *testing.T) {
-	// Avro "int" with every Go integer type as a struct field.
+func testUnsafeIntLongAllKinds(t *testing.T, avroType string) {
+	t.Helper()
+
 	type I struct{ V int `avro:"v"` }
 	type I8 struct{ V int8 `avro:"v"` }
 	type I16 struct{ V int16 `avro:"v"` }
@@ -2306,7 +2295,7 @@ func TestUnsafeIntAllKinds(t *testing.T) {
 	type U32 struct{ V uint32 `avro:"v"` }
 	type U64 struct{ V uint64 `avro:"v"` }
 
-	schema := `{"type":"record","name":"R","fields":[{"name":"v","type":"int"}]}`
+	schema := `{"type":"record","name":"R","fields":[{"name":"v","type":"` + avroType + `"}]}`
 
 	check := func(t *testing.T, name string, input, output any, want int64) {
 		t.Helper()
@@ -2362,73 +2351,8 @@ func TestUnsafeIntAllKinds(t *testing.T) {
 	checkU(t, "uint64", &U64{27}, &U64{}, 27)
 }
 
-func TestUnsafeLongAllKinds(t *testing.T) {
-	type I struct{ V int `avro:"v"` }
-	type I8 struct{ V int8 `avro:"v"` }
-	type I16 struct{ V int16 `avro:"v"` }
-	type I32 struct{ V int32 `avro:"v"` }
-	type I64 struct{ V int64 `avro:"v"` }
-	type U struct{ V uint `avro:"v"` }
-	type U8 struct{ V uint8 `avro:"v"` }
-	type U16 struct{ V uint16 `avro:"v"` }
-	type U32 struct{ V uint32 `avro:"v"` }
-	type U64 struct{ V uint64 `avro:"v"` }
-
-	schema := `{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`
-
-	check := func(t *testing.T, name string, input, output any, want int64) {
-		t.Helper()
-		t.Run(name, func(t *testing.T) {
-			s, err := Parse(schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dst, err := s.AppendEncode(nil, input)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			if _, err = s.Decode(dst, output); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			got := reflect.ValueOf(output).Elem().Field(0).Int()
-			if got != want {
-				t.Fatalf("got %d, want %d", got, want)
-			}
-		})
-	}
-
-	checkU := func(t *testing.T, name string, input, output any, want uint64) {
-		t.Helper()
-		t.Run(name, func(t *testing.T) {
-			s, err := Parse(schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dst, err := s.AppendEncode(nil, input)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			if _, err = s.Decode(dst, output); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			got := reflect.ValueOf(output).Elem().Field(0).Uint()
-			if got != want {
-				t.Fatalf("got %d, want %d", got, want)
-			}
-		})
-	}
-
-	check(t, "int", &I{27}, &I{}, 27)
-	check(t, "int8", &I8{27}, &I8{}, 27)
-	check(t, "int16", &I16{27}, &I16{}, 27)
-	check(t, "int32", &I32{27}, &I32{}, 27)
-	check(t, "int64", &I64{27}, &I64{}, 27)
-	checkU(t, "uint", &U{27}, &U{}, 27)
-	checkU(t, "uint8", &U8{27}, &U8{}, 27)
-	checkU(t, "uint16", &U16{27}, &U16{}, 27)
-	checkU(t, "uint32", &U32{27}, &U32{}, 27)
-	checkU(t, "uint64", &U64{27}, &U64{}, 27)
-}
+func TestUnsafeIntAllKinds(t *testing.T)  { testUnsafeIntLongAllKinds(t, "int") }
+func TestUnsafeLongAllKinds(t *testing.T) { testUnsafeIntLongAllKinds(t, "long") }
 
 func TestUnsafeFloatDoubleKinds(t *testing.T) {
 	// Test avro "float" mapped to Go float64, and avro "double" mapped to Go float32.
