@@ -1,4 +1,4 @@
-// Package avro encodes and decodes Avro binary data using Go reflection.
+// Package avro encodes and decodes Avro binary data.
 //
 // Parse an Avro JSON schema with [Parse] (or [MustParse] for package-level
 // vars), then call [Schema.Encode] / [Schema.Decode] to convert between Go
