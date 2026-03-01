@@ -56,3 +56,20 @@ func (e *ShortBufferError) Error() string {
 	}
 	return fmt.Sprintf("avro: short buffer for %s", e.Type)
 }
+
+// CompatibilityError describes an incompatibility between a reader and writer
+// schema at a specific path in the schema tree.
+type CompatibilityError struct {
+	// Path is the dotted path to the incompatible element (e.g. "User.address.zip").
+	Path string
+	// ReaderType is the Avro type in the reader schema.
+	ReaderType string
+	// WriterType is the Avro type in the writer schema.
+	WriterType string
+	// Detail describes the specific incompatibility.
+	Detail string
+}
+
+func (e *CompatibilityError) Error() string {
+	return fmt.Sprintf("avro: incompatible at %s: reader %s vs writer %s: %s", e.Path, e.ReaderType, e.WriterType, e.Detail)
+}

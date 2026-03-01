@@ -15,8 +15,39 @@ type Schema struct {
 	ser   serfn
 	deser deserfn
 
-	c   aschema
-	soe [10]byte // 2-byte magic (0xC3, 0x01) + 8-byte LE CRC64-Avro fingerprint
+	c    aschema
+	soe  [10]byte    // 2-byte magic (0xC3, 0x01) + 8-byte LE CRC64-Avro fingerprint
+	node *schemaNode // full metadata tree (aliases, defaults, etc.)
+}
+
+// schemaNode preserves full schema metadata that canonical form strips:
+// aliases, defaults, enum defaults, and links to compiled ser/deser.
+type schemaNode struct {
+	kind       string        // "null","boolean","int","long","float","double","bytes","string","record","enum","array","map","fixed","union"
+	name       string        // fully-qualified name (named types only)
+	aliases    []string      // named type aliases (fully qualified)
+	logical    string        // logical type
+	fields     []fieldNode   // record fields
+	symbols    []string      // enum symbols
+	enumDef    string        // enum default symbol
+	hasEnumDef bool          // whether enum default is specified
+	items      *schemaNode   // array item type
+	values     *schemaNode   // map value type
+	size       int           // fixed size
+	branches   []*schemaNode // union branches
+	ser        serfn
+	deser      deserfn
+	serRecord  *serRecord
+	deserRecord *deserRecord
+}
+
+// fieldNode represents a record field with full metadata.
+type fieldNode struct {
+	name       string
+	aliases    []string
+	node       *schemaNode
+	defaultVal any
+	hasDefault bool
 }
 
 func NewSchema(schema string) (*Schema, error) {
@@ -30,6 +61,7 @@ func NewSchema(schema string) (*Schema, error) {
 		dtypes:  make(map[string]deserfn),
 		stypes:  make(map[string]*serRecord),
 		drtypes: make(map[string]*deserRecord),
+		ntypes:  make(map[string]*schemaNode),
 	}
 	if err := b.build("", &orig); err != nil {
 		return nil, err
@@ -41,6 +73,7 @@ func NewSchema(schema string) (*Schema, error) {
 		ser:   b.ser,
 		deser: b.deser,
 		c:     b.canon,
+		node:  b.node,
 	}
 	s.soe[0] = 0xC3
 	s.soe[1] = 0x01
@@ -174,8 +207,11 @@ type builder struct {
 	dmissing []unionMissingDeser
 	mfixups  []metaFixup
 
+	ntypes map[string]*schemaNode
+
 	meta  fieldMeta
 	canon aschema
+	node  *schemaNode
 }
 
 func (b *builder) nest() *builder {
@@ -184,6 +220,7 @@ func (b *builder) nest() *builder {
 		dtypes:  b.dtypes,
 		stypes:  b.stypes,
 		drtypes: b.drtypes,
+		ntypes:  b.ntypes,
 	}
 }
 
@@ -261,6 +298,11 @@ func (b *builder) buildPrimitive(s *aschema) error {
 	if exists {
 		b.ser = fn
 		b.deser = deserPrimitive[s.primitive]
+		b.node = &schemaNode{
+			kind:  s.primitive,
+			ser:   b.ser,
+			deser: b.deser,
+		}
 		return nil
 	}
 	// Check if this is a named type reference (record, enum, fixed).
@@ -270,6 +312,7 @@ func (b *builder) buildPrimitive(s *aschema) error {
 		if sr := b.stypes[s.primitive]; sr != nil {
 			b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[s.primitive]}
 		}
+		b.node = b.ntypes[s.primitive]
 		return nil
 	}
 	return &unknownPrimitiveError{s.primitive}
@@ -283,12 +326,13 @@ func (b *builder) buildPrimitive(s *aschema) error {
 // things that are not yet declared. We fixup at the very end.
 func (b *builder) buildUnion(parentName string, s *aschema) error {
 	var (
-		ser         = new(serUnion)
-		deser       = new(deserUnion)
-		missing     = make(map[int]string)
-		sawTypes    = make(map[string]bool)
-		sawNames    = make(map[string]bool)
-		branchMetas = make([]fieldMeta, len(s.union))
+		ser          = new(serUnion)
+		deser        = new(deserUnion)
+		missing      = make(map[int]string)
+		sawTypes     = make(map[string]bool)
+		sawNames     = make(map[string]bool)
+		branchMetas  = make([]fieldMeta, len(s.union))
+		branchNodes  = make([]*schemaNode, len(s.union))
 	)
 
 	for i, us := range s.union {
@@ -301,6 +345,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		}
 		b.unnest(u)
 		branchMetas[i] = u.meta
+		branchNodes[i] = u.node
 
 		typ, name, err := us.unionTypeName()
 		if err != nil {
@@ -351,6 +396,12 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			missing,
 		})
 	}
+	b.node = &schemaNode{
+		kind:     "union",
+		branches: branchNodes,
+		ser:      b.ser,
+		deser:    b.deser,
+	}
 	return nil
 }
 
@@ -385,7 +436,21 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.canon = aschema{primitive: o.Type}
 		b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
+		b.node = &schemaNode{
+			kind:    o.Type,
+			logical: o.Logical,
+			ser:     b.ser,
+			deser:   b.deser,
+		}
 		return nil
+	}
+
+	// Preserve original aliases and enum default before canonical stripping.
+	origAliases := s.object.Aliases
+	origEnumDefault := s.object.Default
+	origFieldAliases := make([][]string, len(s.object.Fields))
+	for i, f := range s.object.Fields {
+		origFieldAliases[i] = f.Aliases
 	}
 
 	o = &aobject{
@@ -458,6 +523,19 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.drtypes[o.Name] = dr
 		b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: dr}
 
+		// Register schemaNode early for self-referencing records.
+		nd := &schemaNode{
+			kind:        "record",
+			name:        o.Name,
+			aliases:     qualifyAliases(origAliases, o.Name),
+			ser:         b.ser,
+			deser:       b.deser,
+			serRecord:   sr,
+			deserRecord: dr,
+		}
+		b.ntypes[o.Name] = nd
+		b.node = nd
+
 		var names []string
 		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
@@ -491,6 +569,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				avroType: meta.avroType,
 				meta:     meta,
 			}
+			fn := fieldNode{
+				name:    of.Name,
+				aliases: origFieldAliases[i],
+				node:    bf.node,
+			}
 			if len(of.Default) > 0 {
 				var defaultVal any
 				// json.Unmarshal cannot fail: of.Default is a json.RawMessage
@@ -501,8 +584,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				}
 				drf.defaultVal = defaultVal
 				drf.hasDefault = true
+				fn.defaultVal = defaultVal
+				fn.hasDefault = true
 			}
 			dr.fields = append(dr.fields, drf)
+			nd.fields = append(nd.fields, fn)
 			names = append(names, of.Name)
 		}
 		sr.names = names
@@ -530,6 +616,23 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.deser = (&deserEnum{symbols: o.Symbols}).deser
 		b.meta = fieldMeta{avroType: "enum"}
 
+		nd := &schemaNode{
+			kind:    "enum",
+			name:    o.Name,
+			aliases: qualifyAliases(origAliases, o.Name),
+			symbols: o.Symbols,
+			ser:     b.ser,
+			deser:   b.deser,
+		}
+		if len(origEnumDefault) > 0 {
+			var defStr string
+			json.Unmarshal(origEnumDefault, &defStr) //nolint:errcheck
+			nd.enumDef = defStr
+			nd.hasEnumDef = true
+		}
+		b.ntypes[o.Name] = nd
+		b.node = nd
+
 	case "array":
 		if len(o.Fields) > 0 ||
 			len(o.Symbols) > 0 ||
@@ -551,6 +654,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		inner := new(fieldMeta)
 		*inner = af.meta
 		b.meta = fieldMeta{avroType: "array", inner: inner}
+		b.node = &schemaNode{
+			kind:  "array",
+			items: af.node,
+			ser:   b.ser,
+			deser: b.deser,
+		}
 
 	case "map":
 		if len(o.Fields) > 0 ||
@@ -571,6 +680,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.ser = (&serMap{mf.ser}).ser
 		b.deser = (&deserMap{mf.deser}).deser
 		b.meta = fieldMeta{avroType: "map"}
+		b.node = &schemaNode{
+			kind:   "map",
+			values: mf.node,
+			ser:    b.ser,
+			deser:  b.deser,
+		}
 
 	case "fixed":
 		if len(o.Fields) > 0 ||
@@ -601,8 +716,38 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			b.deser = (&deserFixed{*o.Size}).deser
 		}
 		b.meta = fieldMeta{avroType: "fixed", logical: o.Logical}
+		b.node = &schemaNode{
+			kind:    "fixed",
+			name:    o.Name,
+			aliases: qualifyAliases(origAliases, o.Name),
+			logical: o.Logical,
+			size:    *o.Size,
+			ser:     b.ser,
+			deser:   b.deser,
+		}
+		b.ntypes[o.Name] = b.node
 	}
 	return nil
+}
+
+// qualifyAliases fully qualifies alias names using the parent name's namespace.
+func qualifyAliases(aliases []string, fullname string) []string {
+	if len(aliases) == 0 {
+		return nil
+	}
+	ns := ""
+	if dot := strings.LastIndexByte(fullname, '.'); dot >= 0 {
+		ns = fullname[:dot+1]
+	}
+	out := make([]string, len(aliases))
+	for i, a := range aliases {
+		if strings.ContainsRune(a, '.') {
+			out[i] = a // already fully qualified
+		} else {
+			out[i] = ns + a
+		}
+	}
+	return out
 }
 
 func (o *aobject) validateLogical() error {
