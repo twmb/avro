@@ -71,18 +71,24 @@ func MustParse(schema string) *Schema {
 // (record, enum, array, map, fixed), or a JSON array (union). Named types
 // may reference each other and self-reference. The schema is fully validated:
 // unknown types, duplicate names, invalid defaults, etc. all return errors.
+//
+// To parse schemas that reference named types from other schemas, use
+// [SchemaCache].
 func Parse(schema string) (*Schema, error) {
-	var orig aschema
-	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
-		return nil, fmt.Errorf("invalid schema: %v", err)
-	}
-
 	b := &builder{
 		types:   make(map[string]serfn),
 		dtypes:  make(map[string]deserfn),
 		stypes:  make(map[string]*serRecord),
 		drtypes: make(map[string]*deserRecord),
 		ntypes:  make(map[string]*schemaNode),
+	}
+	return parse(schema, b)
+}
+
+func parse(schema string, b *builder) (*Schema, error) {
+	var orig aschema
+	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
+		return nil, fmt.Errorf("invalid schema: %v", err)
 	}
 	if err := b.build("", &orig); err != nil {
 		return nil, err
