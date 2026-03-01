@@ -37,8 +37,10 @@ func TestSingleObjectRoundTrip(t *testing.T) {
 		{"int", `"int"`, new(int32)},
 		{"long", `"long"`, new(int64)},
 		{"string", `"string"`, new(string)},
-		{"record", `{"type":"record","name":"r","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`,
-			&map[string]any{"a": int32(7), "b": "world"}},
+		{
+			"record", `{"type":"record","name":"r","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`,
+			&map[string]any{"a": int32(7), "b": "world"},
+		},
 	}
 
 	for _, tt := range tests {

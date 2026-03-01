@@ -124,7 +124,7 @@ func compileFastDeser(fields []deserRecordField, names []string, cache *sync.Map
 func computeFieldOffset(t reflect.Type, index []int) (uintptr, reflect.Type, bool) {
 	var offset uintptr
 	for _, i := range index {
-		if t.Kind() == reflect.Ptr {
+		if t.Kind() == reflect.Pointer {
 			return 0, nil, false
 		}
 		f := t.Field(i)
@@ -215,7 +215,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 
 	// Null-union: *T mapped to ["null", T] or [T, "null"].
 	if f.avroType == "nullunion" {
-		if k != reflect.Ptr {
+		if k != reflect.Pointer {
 			return nil
 		}
 		if f.meta == nil || f.meta.inner == nil {
@@ -246,7 +246,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		elemGoType := goType.Elem()
 		switch inner.avroType {
 		case "nullunion":
-			if elemGoType.Kind() != reflect.Ptr {
+			if elemGoType.Kind() != reflect.Pointer {
 				return nil
 			}
 			nullByte, valByte := nullUnionBytes(inner.nullSecond)
@@ -287,7 +287,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		}
 	}
 
-	if k == reflect.Ptr {
+	if k == reflect.Pointer {
 		inner := tryCompileFieldSer(f, goType.Elem())
 		if inner == nil {
 			return nil
@@ -344,7 +344,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 
 	// Null-union: *T mapped to ["null", T] or [T, "null"].
 	if f.avroType == "nullunion" {
-		if k != reflect.Ptr {
+		if k != reflect.Pointer {
 			return nil
 		}
 		if f.meta == nil || f.meta.inner == nil {
@@ -375,7 +375,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		elemGoType := goType.Elem()
 		switch inner.avroType {
 		case "record":
-			if inner.deserRecord != nil && elemGoType.Kind() == reflect.Ptr {
+			if inner.deserRecord != nil && elemGoType.Kind() == reflect.Pointer {
 				return udArrayPtrRecord(inner.deserRecord, elemGoType.Elem(), goType)
 			}
 		default:
@@ -405,7 +405,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 	}
 
 	// Pointer fields need GC write barriers for allocation; use slow path.
-	if k == reflect.Ptr {
+	if k == reflect.Pointer {
 		return nil
 	}
 
@@ -1238,7 +1238,7 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, nullByte, valBy
 
 // usArrayRecord handles array ser for []T or []*T where items are records.
 func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
-	if elemGoType.Kind() == reflect.Ptr {
+	if elemGoType.Kind() == reflect.Pointer {
 		return usArrayPtrRecord(rec, elemGoType.Elem())
 	}
 	elemSize := elemGoType.Size()
@@ -1251,7 +1251,7 @@ func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 		}
 		data := unsafe.Pointer(unsafe.SliceData(bs))
 		var err error
-		for i := 0; i < n; i++ {
+		for i := range n {
 			elemP := unsafe.Add(data, uintptr(i)*elemSize)
 			if fast := rec.fast.Load(); fast != nil && fast.typ == elemGoType && fast.allFast {
 				dst, err = serRecordFastPtr(dst, fast, elemP)
@@ -1357,7 +1357,7 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 		}
 		data := unsafe.Pointer(unsafe.SliceData(bs))
 		var err error
-		for i := 0; i < n; i++ {
+		for i := range n {
 			dst, err = inner(dst, unsafe.Add(data, uintptr(i)*elemSize))
 			if err != nil {
 				return nil, err
@@ -1407,7 +1407,7 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 			s := *(*[]unsafe.Pointer)(p)
 			// Count how many elements need fresh allocation.
 			var need int
-			for i := 0; i < n; i++ {
+			for i := range n {
 				if s[start+i] == nil {
 					need++
 				}
@@ -1417,7 +1417,7 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 				backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
 				backingBase := backing.Index(0).Addr().UnsafePointer()
 				j := 0
-				for i := 0; i < n; i++ {
+				for i := range n {
 					if s[start+i] == nil {
 						s[start+i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
 						j++
@@ -1425,7 +1425,7 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 				}
 			}
 			// Deserialize each element.
-			for i := 0; i < n; i++ {
+			for i := range n {
 				elemP := s[start+i]
 				if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
 					src, err = deserRecordFastPtr(src, fast, elemP, sl)

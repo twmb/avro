@@ -300,6 +300,7 @@ func (x xorCodec) Compress(src []byte) ([]byte, error) {
 	}
 	return dst, nil
 }
+
 func (x xorCodec) Decompress(src []byte) ([]byte, error) {
 	return x.Compress(src) // xor is its own inverse
 }
@@ -823,8 +824,8 @@ func TestTruncatedBlockSyncMarker(t *testing.T) {
 	data := buf.Bytes()
 	data = appendVarlong(data, 1) // count
 	data = appendVarlong(data, 1) // size = 1
-	data = append(data, 0x02)    // 1 byte of data
-	data = append(data, 0x00)    // only 1 byte of sync marker, need 16
+	data = append(data, 0x02)     // 1 byte of data
+	data = append(data, 0x00)     // only 1 byte of sync marker, need 16
 	r, err := NewReader(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
@@ -868,8 +869,8 @@ func TestNegativeBlockSize(t *testing.T) {
 
 type failDecompressCodec struct{}
 
-func (failDecompressCodec) Name() string                         { return "faildecompress" }
-func (failDecompressCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
+func (failDecompressCodec) Name() string                        { return "faildecompress" }
+func (failDecompressCodec) Compress(src []byte) ([]byte, error) { return src, nil }
 func (failDecompressCodec) Decompress([]byte) ([]byte, error) {
 	return nil, errors.New("decompress failed")
 }
@@ -1134,7 +1135,7 @@ func TestDecodeMapTruncatedKeyData(t *testing.T) {
 	var data []byte
 	data = appendVarlong(data, 1)  // 1 entry
 	data = appendVarlong(data, 10) // key length = 10
-	data = append(data, 'a')      // only 1 byte of key, need 10
+	data = append(data, 'a')       // only 1 byte of key, need 10
 	r := bufio.NewReader(bytes.NewReader(data))
 	_, err := decodeMap(r)
 	if err == nil {
@@ -1146,7 +1147,7 @@ func TestDecodeMapTruncatedValLen(t *testing.T) {
 	var data []byte
 	data = appendVarlong(data, 1) // 1 entry
 	data = appendVarlong(data, 1) // key length = 1
-	data = append(data, 'k')     // key
+	data = append(data, 'k')      // key
 	// No value length — truncated.
 	r := bufio.NewReader(bytes.NewReader(data))
 	_, err := decodeMap(r)
@@ -1159,9 +1160,9 @@ func TestDecodeMapTruncatedValData(t *testing.T) {
 	var data []byte
 	data = appendVarlong(data, 1)  // 1 entry
 	data = appendVarlong(data, 1)  // key length = 1
-	data = append(data, 'k')      // key
+	data = append(data, 'k')       // key
 	data = appendVarlong(data, 10) // val length = 10
-	data = append(data, 'v')      // only 1 byte of val, need 10
+	data = append(data, 'v')       // only 1 byte of val, need 10
 	r := bufio.NewReader(bytes.NewReader(data))
 	_, err := decodeMap(r)
 	if err == nil {
@@ -2606,7 +2607,7 @@ type testCodec struct {
 	name string
 }
 
-func (c *testCodec) Name() string                         { return c.name }
+func (c *testCodec) Name() string                          { return c.name }
 func (c *testCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
 func (c *testCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
 
@@ -2719,8 +2720,8 @@ func TestDecodeMapOversizedCount(t *testing.T) {
 
 func TestDecodeMapOversizedKeyLen(t *testing.T) {
 	var data []byte
-	data = appendVarlong(data, 1)        // 1 entry
-	data = appendVarlong(data, 1<<20+1)  // key length too large
+	data = appendVarlong(data, 1)       // 1 entry
+	data = appendVarlong(data, 1<<20+1) // key length too large
 	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)))
 	if err == nil || !strings.Contains(err.Error(), "key length") {
 		t.Fatalf("expected key length error, got %v", err)
@@ -2731,7 +2732,7 @@ func TestDecodeMapOversizedValLen(t *testing.T) {
 	var data []byte
 	data = appendVarlong(data, 1)       // 1 entry
 	data = appendVarlong(data, 1)       // key length = 1
-	data = append(data, 'k')           // key
+	data = append(data, 'k')            // key
 	data = appendVarlong(data, 1<<20+1) // value length too large
 	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)))
 	if err == nil || !strings.Contains(err.Error(), "value length") {

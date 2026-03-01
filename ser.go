@@ -17,12 +17,12 @@ type serfn func([]byte, reflect.Value) ([]byte, error)
 
 // AppendEncode appends the Avro binary encoding of v to dst. See
 // [Schema.Decode] for the Go-to-Avro type mapping.
-func (s *Schema) AppendEncode(dst []byte, v interface{}) ([]byte, error) {
+func (s *Schema) AppendEncode(dst []byte, v any) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
 
 // Encode encodes v as Avro binary. It is shorthand for AppendEncode(nil, v).
-func (s *Schema) Encode(v interface{}) ([]byte, error) {
+func (s *Schema) Encode(v any) ([]byte, error) {
 	return s.AppendEncode(nil, v)
 }
 
@@ -261,7 +261,7 @@ func doSerBytes(dst []byte, v reflect.Value) []byte {
 	if v.CanAddr() {
 		return append(dst, v.Slice(0, l).Bytes()...)
 	}
-	for i := 0; i < l; i++ {
+	for i := range l {
 		dst = append(dst, v.Index(i).Interface().(byte))
 	}
 	return dst
@@ -399,7 +399,7 @@ func (s *serArray) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	if l == 0 {
 		return dst, nil
 	}
-	for i := 0; i < l; i++ {
+	for i := range l {
 		if dst, err = s.serItem(dst, v.Index(i)); err != nil {
 			return nil, err
 		}
@@ -473,10 +473,12 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 // LOGICAL TYPE SERIALIZERS //
 /////////////////////////////
 
-var timeType = reflect.TypeFor[time.Time]()
-var durationType = reflect.TypeFor[time.Duration]()
-var avroDurationType = reflect.TypeFor[Duration]()
-var bigRatType = reflect.TypeFor[big.Rat]()
+var (
+	timeType         = reflect.TypeFor[time.Time]()
+	durationType     = reflect.TypeFor[time.Duration]()
+	avroDurationType = reflect.TypeFor[Duration]()
+	bigRatType       = reflect.TypeFor[big.Rat]()
+)
 
 // Duration represents the Avro duration logical type: a 12-byte fixed
 // value containing three little-endian unsigned 32-bit integers
@@ -585,7 +587,6 @@ func serDuration(dst []byte, v reflect.Value) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-<<<<<<< HEAD
 	if v.Type() == avroDurationType {
 		d := v.Interface().(Duration)
 		dst = appendUint32(dst, d.Months)

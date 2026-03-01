@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"sync"
 )
 
@@ -234,10 +235,8 @@ func findReaderFieldIndex(r *schemaNode, writerFieldName string) int {
 		}
 	}
 	for i, rf := range r.fields {
-		for _, alias := range rf.aliases {
-			if alias == writerFieldName {
-				return i
-			}
+		if slices.Contains(rf.aliases, writerFieldName) {
+			return i
 		}
 	}
 	return -1

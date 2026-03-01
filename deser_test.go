@@ -793,12 +793,12 @@ func TestDecodeShortBuffer(t *testing.T) {
 		data   []byte
 	}{
 		{"boolean", `"boolean"`, nil},
-		{"int truncated", `"int"`, []byte{0xe6}},          // high bit set, needs more
-		{"long truncated", `"long"`, []byte{0xe6}},         // high bit set, needs more
-		{"float", `"float"`, []byte{0x33, 0x33}},           // need 4 bytes, have 2
-		{"double", `"double"`, []byte{0x66, 0x66, 0x66}},   // need 8 bytes, have 3
-		{"string truncated", `"string"`, []byte{0x08}},      // says 4 bytes, has 0
-		{"bytes truncated", `"bytes"`, []byte{0x08, 0xEC}},  // says 4 bytes, has 1
+		{"int truncated", `"int"`, []byte{0xe6}},                              // high bit set, needs more
+		{"long truncated", `"long"`, []byte{0xe6}},                            // high bit set, needs more
+		{"float", `"float"`, []byte{0x33, 0x33}},                              // need 4 bytes, have 2
+		{"double", `"double"`, []byte{0x66, 0x66, 0x66}},                      // need 8 bytes, have 3
+		{"string truncated", `"string"`, []byte{0x08}},                        // says 4 bytes, has 0
+		{"bytes truncated", `"bytes"`, []byte{0x08, 0xEC}},                    // says 4 bytes, has 1
 		{"fixed", `{"type":"fixed","name":"f","size":4}`, []byte{0x01, 0x02}}, // need 4, have 2
 	}
 	for _, tt := range tests {
@@ -1006,8 +1006,8 @@ func TestDecodeTypeReference(t *testing.T) {
 
 func TestDecodeRecursiveArray(t *testing.T) {
 	type Rec struct {
-		A int32  `avro:"a"`
-		B []Rec  `avro:"b"`
+		A int32 `avro:"a"`
+		B []Rec `avro:"b"`
 	}
 	schema := `{
 		"type":"record","name":"test","fields":[
@@ -1030,8 +1030,8 @@ func TestDecodeRecursiveArray(t *testing.T) {
 
 func TestDecodeRecursiveMap(t *testing.T) {
 	type Rec struct {
-		A int32              `avro:"a"`
-		B map[string]Rec     `avro:"b"`
+		A int32          `avro:"a"`
+		B map[string]Rec `avro:"b"`
 	}
 	schema := `{
 		"type":"record","name":"test","fields":[
@@ -1762,7 +1762,7 @@ func TestTypeFieldMappingUnexportedAnonymousNonStruct(t *testing.T) {
 	// Unexported anonymous non-struct field should be skipped.
 	type myString string
 	type R struct {
-		myString //nolint:unused
+		myString       //nolint:unused
 		B        int32 `avro:"b"`
 	}
 	schema := `{"type":"record","name":"r","fields":[{"name":"b","type":"int"}]}`
@@ -2284,16 +2284,36 @@ func BenchmarkDeserializeGeneric(b *testing.B) {
 func testUnsafeIntLongAllKinds(t *testing.T, avroType string) {
 	t.Helper()
 
-	type I struct{ V int `avro:"v"` }
-	type I8 struct{ V int8 `avro:"v"` }
-	type I16 struct{ V int16 `avro:"v"` }
-	type I32 struct{ V int32 `avro:"v"` }
-	type I64 struct{ V int64 `avro:"v"` }
-	type U struct{ V uint `avro:"v"` }
-	type U8 struct{ V uint8 `avro:"v"` }
-	type U16 struct{ V uint16 `avro:"v"` }
-	type U32 struct{ V uint32 `avro:"v"` }
-	type U64 struct{ V uint64 `avro:"v"` }
+	type I struct {
+		V int `avro:"v"`
+	}
+	type I8 struct {
+		V int8 `avro:"v"`
+	}
+	type I16 struct {
+		V int16 `avro:"v"`
+	}
+	type I32 struct {
+		V int32 `avro:"v"`
+	}
+	type I64 struct {
+		V int64 `avro:"v"`
+	}
+	type U struct {
+		V uint `avro:"v"`
+	}
+	type U8 struct {
+		V uint8 `avro:"v"`
+	}
+	type U16 struct {
+		V uint16 `avro:"v"`
+	}
+	type U32 struct {
+		V uint32 `avro:"v"`
+	}
+	type U64 struct {
+		V uint64 `avro:"v"`
+	}
 
 	schema := `{"type":"record","name":"R","fields":[{"name":"v","type":"` + avroType + `"}]}`
 
@@ -2356,8 +2376,12 @@ func TestUnsafeLongAllKinds(t *testing.T) { testUnsafeIntLongAllKinds(t, "long")
 
 func TestUnsafeFloatDoubleKinds(t *testing.T) {
 	// Test avro "float" mapped to Go float64, and avro "double" mapped to Go float32.
-	type FF32 struct{ V float32 `avro:"v"` }
-	type FF64 struct{ V float64 `avro:"v"` }
+	type FF32 struct {
+		V float32 `avro:"v"`
+	}
+	type FF64 struct {
+		V float64 `avro:"v"`
+	}
 
 	t.Run("float_to_float32", func(t *testing.T) {
 		out := roundTrip(t,
@@ -2452,9 +2476,15 @@ func TestUnsafePointerToComplexFallback(t *testing.T) {
 func TestUnsafeDecodeTruncatedBuffer(t *testing.T) {
 	// Exercise error branches in unsafe deserializers (udBool, udString,
 	// udBytesSlice) by feeding truncated data into struct-field decode.
-	type BoolRec struct{ V bool `avro:"v"` }
-	type StrRec struct{ V string `avro:"v"` }
-	type BytesRec struct{ V []byte `avro:"v"` }
+	type BoolRec struct {
+		V bool `avro:"v"`
+	}
+	type StrRec struct {
+		V string `avro:"v"`
+	}
+	type BytesRec struct {
+		V []byte `avro:"v"`
+	}
 
 	t.Run("bool_short", func(t *testing.T) {
 		decodeErr(t,
@@ -3541,12 +3571,12 @@ func TestArrayMultiBlockDeser(t *testing.T) {
 
 		// Craft two blocks: block1=[1,2], block2=[3], terminator.
 		var data []byte
-		data = appendVarlong(data, 2)  // count=2
-		data = appendVarint(data, 1)   // elem 1
-		data = appendVarint(data, 2)   // elem 2
-		data = appendVarlong(data, 1)  // count=1
-		data = appendVarint(data, 3)   // elem 3
-		data = append(data, 0)         // terminator
+		data = appendVarlong(data, 2) // count=2
+		data = appendVarint(data, 1)  // elem 1
+		data = appendVarint(data, 2)  // elem 2
+		data = appendVarlong(data, 1) // count=1
+		data = appendVarint(data, 3)  // elem 3
+		data = append(data, 0)        // terminator
 
 		var out Wrapper
 		_, err = s.Decode(data, &out)
@@ -4258,17 +4288,17 @@ func TestRecordMappedToMap(t *testing.T) {
 // in tryCompileFieldSer that protect against internal schema builder bugs.
 func TestTryCompileFieldSerDefensive(t *testing.T) {
 	// Null-union with nil meta → return nil.
-	fn := tryCompileFieldSer(&serRecordField{avroType: "nullunion"}, reflect.TypeOf((*int)(nil)))
+	fn := tryCompileFieldSer(&serRecordField{avroType: "nullunion"}, reflect.TypeFor[*int]())
 	if fn != nil {
 		t.Error("expected nil for nullunion with nil meta")
 	}
 	// Null-union with nil inner meta → return nil.
-	fn = tryCompileFieldSer(&serRecordField{avroType: "nullunion", meta: &fieldMeta{avroType: "nullunion"}}, reflect.TypeOf((*int)(nil)))
+	fn = tryCompileFieldSer(&serRecordField{avroType: "nullunion", meta: &fieldMeta{avroType: "nullunion"}}, reflect.TypeFor[*int]())
 	if fn != nil {
 		t.Error("expected nil for nullunion with nil inner meta")
 	}
 	// Array with nil meta → return nil.
-	fn = tryCompileFieldSer(&serRecordField{avroType: "array"}, reflect.SliceOf(reflect.TypeOf(int32(0))))
+	fn = tryCompileFieldSer(&serRecordField{avroType: "array"}, reflect.SliceOf(reflect.TypeFor[int32]()))
 	if fn != nil {
 		t.Error("expected nil for array with nil meta")
 	}
@@ -4276,7 +4306,7 @@ func TestTryCompileFieldSerDefensive(t *testing.T) {
 	fn = tryCompileFieldSer(&serRecordField{
 		avroType: "array",
 		meta:     &fieldMeta{avroType: "array", inner: &fieldMeta{avroType: "nullunion", inner: &fieldMeta{avroType: "int"}}},
-	}, reflect.SliceOf(reflect.TypeOf(int32(0))))
+	}, reflect.SliceOf(reflect.TypeFor[int32]()))
 	if fn != nil {
 		t.Error("expected nil for array nullunion with non-ptr element")
 	}
@@ -4284,12 +4314,12 @@ func TestTryCompileFieldSerDefensive(t *testing.T) {
 	fn = tryCompileFieldSer(&serRecordField{
 		avroType: "array",
 		meta:     &fieldMeta{avroType: "array", inner: &fieldMeta{avroType: "nullunion", inner: &fieldMeta{avroType: "map"}}},
-	}, reflect.SliceOf(reflect.TypeOf((*map[string]int)(nil))))
+	}, reflect.SliceOf(reflect.TypeFor[*map[string]int]()))
 	if fn != nil {
 		t.Error("expected nil for array nullunion with non-compilable inner")
 	}
 	// Record with nil meta → return nil.
-	fn = tryCompileFieldSer(&serRecordField{avroType: "record"}, reflect.TypeOf(struct{}{}))
+	fn = tryCompileFieldSer(&serRecordField{avroType: "record"}, reflect.TypeFor[struct{}]())
 	if fn != nil {
 		t.Error("expected nil for record with nil meta")
 	}
@@ -4326,21 +4356,21 @@ func TestUsArraySerErrorPaths(t *testing.T) {
 // in tryCompileFieldDeser.
 func TestTryCompileFieldDeserDefensive(t *testing.T) {
 	// Null-union with nil meta → return nil.
-	fn := tryCompileFieldDeser(&deserRecordField{avroType: "nullunion"}, reflect.TypeOf((*int)(nil)))
+	fn := tryCompileFieldDeser(&deserRecordField{avroType: "nullunion"}, reflect.TypeFor[*int]())
 	if fn != nil {
 		t.Error("expected nil for nullunion with nil meta")
 	}
-	fn = tryCompileFieldDeser(&deserRecordField{avroType: "nullunion", meta: &fieldMeta{avroType: "nullunion"}}, reflect.TypeOf((*int)(nil)))
+	fn = tryCompileFieldDeser(&deserRecordField{avroType: "nullunion", meta: &fieldMeta{avroType: "nullunion"}}, reflect.TypeFor[*int]())
 	if fn != nil {
 		t.Error("expected nil for nullunion with nil inner meta")
 	}
 	// Array with nil meta → return nil.
-	fn = tryCompileFieldDeser(&deserRecordField{avroType: "array"}, reflect.SliceOf(reflect.TypeOf(int32(0))))
+	fn = tryCompileFieldDeser(&deserRecordField{avroType: "array"}, reflect.SliceOf(reflect.TypeFor[int32]()))
 	if fn != nil {
 		t.Error("expected nil for array with nil meta")
 	}
 	// Record with nil meta → return nil.
-	fn = tryCompileFieldDeser(&deserRecordField{avroType: "record"}, reflect.TypeOf(struct{}{}))
+	fn = tryCompileFieldDeser(&deserRecordField{avroType: "record"}, reflect.TypeFor[struct{}]())
 	if fn != nil {
 		t.Error("expected nil for record with nil meta")
 	}
@@ -4757,7 +4787,7 @@ func TestAdversarialTruncationSweep(t *testing.T) {
 	valid := R{A: 42, B: "hello", C: 3.14, D: 999, E: []byte{0xDE, 0xAD}, F: true}
 	full, _ := s.AppendEncode(nil, &valid)
 
-	for i := 0; i < len(full); i++ {
+	for i := range full {
 		var out R
 		_, err := s.Decode(full[:i], &out)
 		if err == nil {
@@ -4793,7 +4823,7 @@ func TestAdversarialNestedRecordTruncation(t *testing.T) {
 	valid := Outer{A: 1, B: Inner{X: 2, Y: "nested"}, C: 3}
 	full, _ := s.AppendEncode(nil, &valid)
 
-	for i := 0; i < len(full); i++ {
+	for i := range full {
 		var out Outer
 		_, err := s.Decode(full[:i], &out)
 		if err == nil {
@@ -4975,15 +5005,15 @@ func TestAdversarialMapKeyLengthLie(t *testing.T) {
 		// Negative key length.
 		{"negative_key", func() []byte {
 			var d []byte
-			d = appendVarlong(d, 1)    // 1 entry
-			d = appendVarlong(d, -1)   // negative key length
+			d = appendVarlong(d, 1)  // 1 entry
+			d = appendVarlong(d, -1) // negative key length
 			return d
 		}()},
 		// Key consumes all remaining, no value data.
 		{"key_consumes_all", func() []byte {
 			var d []byte
-			d = appendVarlong(d, 1)   // 1 entry
-			d = appendVarlong(d, 3)   // key length 3
+			d = appendVarlong(d, 1)      // 1 entry
+			d = appendVarlong(d, 3)      // key length 3
 			d = append(d, 'k', 'e', 'y') // 3 bytes, nothing for value
 			return d
 		}()},
@@ -5391,17 +5421,17 @@ func TestSemanticErrorFormat(t *testing.T) {
 	}{
 		{
 			"full",
-			&SemanticError{GoType: reflect.TypeOf(0), AvroType: "string", Field: "name", Err: fmt.Errorf("oops")},
+			&SemanticError{GoType: reflect.TypeFor[int](), AvroType: "string", Field: "name", Err: fmt.Errorf("oops")},
 			"avro: field name: cannot use Go type int with Avro type string: oops",
 		},
 		{
 			"no field",
-			&SemanticError{GoType: reflect.TypeOf(""), AvroType: "int"},
+			&SemanticError{GoType: reflect.TypeFor[string](), AvroType: "int"},
 			"avro: cannot use Go type string with Avro type int",
 		},
 		{
 			"go type only",
-			&SemanticError{GoType: reflect.TypeOf(true)},
+			&SemanticError{GoType: reflect.TypeFor[bool]()},
 			"avro: unsupported Go type bool",
 		},
 		{
@@ -5434,12 +5464,12 @@ func TestSemanticErrorUnwrap(t *testing.T) {
 
 func TestSemanticErrorAs(t *testing.T) {
 	inner := fmt.Errorf("boom")
-	err := &SemanticError{GoType: reflect.TypeOf(0), AvroType: "string", Err: inner}
+	err := &SemanticError{GoType: reflect.TypeFor[int](), AvroType: "string", Err: inner}
 	var se *SemanticError
 	if !errors.As(err, &se) {
 		t.Fatal("errors.As failed")
 	}
-	if se.GoType != reflect.TypeOf(0) {
+	if se.GoType != reflect.TypeFor[int]() {
 		t.Fatalf("GoType mismatch: %v", se.GoType)
 	}
 }
@@ -6304,31 +6334,41 @@ func TestLogicalTypeUnsafeDeserShortBuffer(t *testing.T) {
 	corrupt := []byte{0xE6, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}
 
 	t.Run("timestamp-millis", func(t *testing.T) {
-		type R struct{ T time.Time `avro:"t"` }
+		type R struct {
+			T time.Time `avro:"t"`
+		}
 		decodeErr(t, `{"type":"record","name":"r","fields":[
 			{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}}
 		]}`, corrupt, new(R))
 	})
 	t.Run("timestamp-micros", func(t *testing.T) {
-		type R struct{ T time.Time `avro:"t"` }
+		type R struct {
+			T time.Time `avro:"t"`
+		}
 		decodeErr(t, `{"type":"record","name":"r","fields":[
 			{"name":"t","type":{"type":"long","logicalType":"timestamp-micros"}}
 		]}`, corrupt, new(R))
 	})
 	t.Run("date", func(t *testing.T) {
-		type R struct{ T time.Time `avro:"t"` }
+		type R struct {
+			T time.Time `avro:"t"`
+		}
 		decodeErr(t, `{"type":"record","name":"r","fields":[
 			{"name":"t","type":{"type":"int","logicalType":"date"}}
 		]}`, corrupt, new(R))
 	})
 	t.Run("time-millis", func(t *testing.T) {
-		type R struct{ D time.Duration `avro:"d"` }
+		type R struct {
+			D time.Duration `avro:"d"`
+		}
 		decodeErr(t, `{"type":"record","name":"r","fields":[
 			{"name":"d","type":{"type":"int","logicalType":"time-millis"}}
 		]}`, corrupt, new(R))
 	})
 	t.Run("time-micros", func(t *testing.T) {
-		type R struct{ D time.Duration `avro:"d"` }
+		type R struct {
+			D time.Duration `avro:"d"`
+		}
 		decodeErr(t, `{"type":"record","name":"r","fields":[
 			{"name":"d","type":{"type":"long","logicalType":"time-micros"}}
 		]}`, corrupt, new(R))

@@ -56,7 +56,7 @@ var slabPool = sync.Pool{New: func() any { return &slab{} }}
 // When decoding into any (interface{}), values are returned as their natural
 // Go types: nil, bool, int64, float32, float64, string, []byte, []any,
 // map[string]any, or map[string]any for records.
-func (s *Schema) Decode(src []byte, v interface{}) ([]byte, error) {
+func (s *Schema) Decode(src []byte, v any) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, errors.New("decode requires a non-nil pointer")
@@ -99,7 +99,7 @@ func deserNullUnion(u *deserUnion) deserfn {
 			}
 			return src[1:], nil
 		case 2:
-			if v.Kind() == reflect.Ptr {
+			if v.Kind() == reflect.Pointer {
 				if v.IsNil() {
 					v.Set(reflect.New(v.Type().Elem()))
 				}
@@ -119,7 +119,7 @@ func deserNullSecondUnion(u *deserUnion) deserfn {
 		}
 		switch src[0] {
 		case 0: // index 0: the T branch
-			if v.Kind() == reflect.Ptr {
+			if v.Kind() == reflect.Pointer {
 				if v.IsNil() {
 					v.Set(reflect.New(v.Type().Elem()))
 				}
@@ -341,8 +341,8 @@ type deserRecordField struct {
 type deserRecord struct {
 	fields []deserRecordField
 	names  []string
-	cache  sync.Map                         // map[reflect.Type]*cachedMapping
-	fast   atomic.Pointer[fastRecordDeser]  // precompiled unsafe fast path
+	cache  sync.Map                        // map[reflect.Type]*cachedMapping
+	fast   atomic.Pointer[fastRecordDeser] // precompiled unsafe fast path
 }
 
 func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -482,10 +482,10 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			sliceVal.SetLen(newLen)
 		}
 		elemType := sliceVal.Type().Elem()
-		if elemType.Kind() == reflect.Ptr {
+		if elemType.Kind() == reflect.Pointer {
 			innerType := elemType.Elem()
 			backing := reflect.MakeSlice(reflect.SliceOf(innerType), n, n)
-			for i := 0; i < n; i++ {
+			for i := range n {
 				sliceVal.Index(start + i).Set(backing.Index(i).Addr())
 			}
 		}

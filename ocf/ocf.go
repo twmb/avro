@@ -94,14 +94,16 @@ type WriterOpt interface{ writerOpt() }
 // ReaderOpt is an option for [NewReader].
 type ReaderOpt interface{ readerOpt() }
 
-type optCodec struct{ c Codec }
-type optBlockCount struct{ n int }
-type optBlockBytes struct{ n int }
-type optMetadata struct{ m map[string][]byte }
-type optSyncMarker struct{ sync [16]byte }
-type optSchema struct{ s string }
-type optReaderCodec struct{ c Codec }
-type optReaderSchema struct{ s *avro.Schema }
+type (
+	optCodec        struct{ c Codec }
+	optBlockCount   struct{ n int }
+	optBlockBytes   struct{ n int }
+	optMetadata     struct{ m map[string][]byte }
+	optSyncMarker   struct{ sync [16]byte }
+	optSchema       struct{ s string }
+	optReaderCodec  struct{ c Codec }
+	optReaderSchema struct{ s *avro.Schema }
+)
 
 func (optCodec) writerOpt()        {}
 func (optBlockCount) writerOpt()   {}
@@ -617,7 +619,7 @@ func (rd *Reader) readBlock() error {
 
 type nullCodec struct{}
 
-func (nullCodec) Name() string                         { return "null" }
+func (nullCodec) Name() string                          { return "null" }
 func (nullCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
 func (nullCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
 

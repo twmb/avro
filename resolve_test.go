@@ -491,10 +491,10 @@ func TestResolveMapEvolution(t *testing.T) {
 
 func TestEncodeDefault(t *testing.T) {
 	tests := []struct {
-		name     string
-		val      any
-		schema   string
-		checkFn  func(t *testing.T, encoded []byte)
+		name    string
+		val     any
+		schema  string
+		checkFn func(t *testing.T, encoded []byte)
 	}{
 		{
 			name:   "null",
@@ -821,8 +821,10 @@ func TestSkipFunctions(t *testing.T) {
 		{"map", `{"type":"map","values":"string"}`, map[string]string{"k": "v"}},
 		{"enum", `{"type":"enum","name":"E","symbols":["A","B"]}`, "B"},
 		{"fixed", `{"type":"fixed","name":"F","size":4}`, [4]byte{1, 2, 3, 4}},
-		{"record", `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`,
-			map[string]any{"a": 1, "b": "x"}},
+		{
+			"record", `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`,
+			map[string]any{"a": 1, "b": "x"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1181,10 +1183,10 @@ func TestSkipArrayErrors(t *testing.T) {
 	// Negative block count with byte-size skip.
 	// Encode: count=-3 (zigzag), byteSize=2, then 2 bytes of data, then 0 terminator.
 	var data []byte
-	data = appendVarlong(data, -3)       // negative count => abs(3) items, but skip by byte size
-	data = appendVarlong(data, 2)        // byte size = 2
-	data = append(data, 0x01, 0x02)      // 2 bytes
-	data = appendVarlong(data, 0)        // terminator
+	data = appendVarlong(data, -3)  // negative count => abs(3) items, but skip by byte size
+	data = appendVarlong(data, 2)   // byte size = 2
+	data = append(data, 0x01, 0x02) // 2 bytes
+	data = appendVarlong(data, 0)   // terminator
 	rem, err := skip(data)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1276,7 +1278,7 @@ func TestSkipMapErrors(t *testing.T) {
 	data = data[:0]
 	data = appendVarlong(data, 1)
 	data = appendVarlong(data, 1) // key length=1
-	data = append(data, 'k')     // key data
+	data = append(data, 'k')      // key data
 	// No value int data.
 	_, err = skip(data)
 	if err == nil {

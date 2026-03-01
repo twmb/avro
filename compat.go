@@ -1,5 +1,7 @@
 package avro
 
+import "slices"
+
 import "fmt"
 
 // CheckCompatibility reports whether data written with the writer schema can
@@ -204,12 +206,7 @@ func namesMatch(r, w *schemaNode) bool {
 	if r.name == w.name {
 		return true
 	}
-	for _, a := range r.aliases {
-		if a == w.name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(r.aliases, w.name)
 }
 
 // findWriterField finds the writer field matching a reader field by name or

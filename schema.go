@@ -27,23 +27,23 @@ type Schema struct {
 // schemaNode preserves full schema metadata that canonical form strips:
 // aliases, defaults, enum defaults, and links to compiled ser/deser.
 type schemaNode struct {
-	kind       string        // "null","boolean","int","long","float","double","bytes","string","record","enum","array","map","fixed","union"
-	name       string        // fully-qualified name (named types only)
-	aliases    []string      // named type aliases (fully qualified)
-	logical    string        // logical type
-	fields     []fieldNode   // record fields
-	symbols    []string      // enum symbols
-	enumDef    string        // enum default symbol
-	hasEnumDef bool          // whether enum default is specified
-	items      *schemaNode   // array item type
-	values     *schemaNode   // map value type
-	size       int           // fixed size
-	precision  int           // decimal precision
-	scale      int           // decimal scale
-	branches   []*schemaNode // union branches
-	ser        serfn
-	deser      deserfn
-	serRecord  *serRecord
+	kind        string        // "null","boolean","int","long","float","double","bytes","string","record","enum","array","map","fixed","union"
+	name        string        // fully-qualified name (named types only)
+	aliases     []string      // named type aliases (fully qualified)
+	logical     string        // logical type
+	fields      []fieldNode   // record fields
+	symbols     []string      // enum symbols
+	enumDef     string        // enum default symbol
+	hasEnumDef  bool          // whether enum default is specified
+	items       *schemaNode   // array item type
+	values      *schemaNode   // map value type
+	size        int           // fixed size
+	precision   int           // decimal precision
+	scale       int           // decimal scale
+	branches    []*schemaNode // union branches
+	ser         serfn
+	deser       deserfn
+	serRecord   *serRecord
 	deserRecord *deserRecord
 }
 
@@ -249,20 +249,20 @@ type builder struct {
 	ser   serfn
 	deser deserfn
 
-	types    map[string]serfn
-	dtypes   map[string]deserfn
-	stypes   map[string]*serRecord
-	drtypes  map[string]*deserRecord
-	missing      []unionMissing
-	dmissing     []unionMissingDeser
-	mfixups      []metaFixup
-	fieldFixups  []recordFieldFixup
+	types       map[string]serfn
+	dtypes      map[string]deserfn
+	stypes      map[string]*serRecord
+	drtypes     map[string]*deserRecord
+	missing     []unionMissing
+	dmissing    []unionMissingDeser
+	mfixups     []metaFixup
+	fieldFixups []recordFieldFixup
 
 	ntypes map[string]*schemaNode
 
-	meta    fieldMeta
-	canon   aschema
-	node    *schemaNode
+	meta  fieldMeta
+	canon aschema
+	node  *schemaNode
 }
 
 func (b *builder) nest() *builder {
@@ -340,7 +340,6 @@ type unknownPrimitiveError struct{ p string }
 
 func (e *unknownPrimitiveError) Error() string { return fmt.Sprintf("unknown primitive %q", e.p) }
 
-
 func (b *builder) build(parentName string, s *aschema) error {
 	if s == nil || s.primitive == "" && s.object == nil && len(s.union) == 0 {
 		return errors.New("schema is not a primitive, complex, nor union")
@@ -409,12 +408,12 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 // things that are not yet declared. We fixup at the very end.
 func (b *builder) buildUnion(parentName string, s *aschema) error {
 	var (
-		ser          = new(serUnion)
-		deser        = new(deserUnion)
-		missing      = make(map[int]string)
-		sawTypes     = make(map[string]bool)
-		branchMetas  = make([]fieldMeta, len(s.union))
-		branchNodes  = make([]*schemaNode, len(s.union))
+		ser         = new(serUnion)
+		deser       = new(deserUnion)
+		missing     = make(map[int]string)
+		sawTypes    = make(map[string]bool)
+		branchMetas = make([]fieldMeta, len(s.union))
+		branchNodes = make([]*schemaNode, len(s.union))
 	)
 
 	for i, us := range s.union {
@@ -926,8 +925,7 @@ func (o *aobject) validateLogical() error {
 			return fmt.Errorf("invalid logicalType uuid type %q, must be string or fixed(16)", o.Type)
 		}
 
-	case "date",
-		"time-millis":
+	case "date", "time-millis":
 		if o.Type != "int" {
 			return fmt.Errorf("invalid logicalType %s type %q, can only be int", o.Logical, o.Type)
 		}
