@@ -1,35 +1,60 @@
-// Package ocf reads and writes Avro Object Container Files as defined by the
-// [Avro specification].
+// Package ocf implements Avro [Object Container Files] (OCF).
 //
-// A [Writer] serializes Avro values into blocks, optionally compressing them
-// with a [Codec], and writes those blocks with sync markers for integrity.
-// A [Reader] reads and decompresses blocks, returning individual values.
+// An OCF is a self-describing binary file format: it embeds the Avro schema
+// in the file header so readers do not need out-of-band schema information.
+// Data is stored in compressed blocks separated by sync markers, making files
+// splittable for parallel processing. OCF is the standard format for storing
+// Avro data on disk; for sending individual values over the wire, see
+// [avro.AppendSingleObject] instead.
+//
+// See the [Avro specification] for the full format definition.
 //
 // # Writing
 //
-//	w, err := ocf.NewWriter(dst, schema, ocf.WithCodec(ocf.SnappyCodec()))
-//	for _, v := range values {
-//	    if err := w.Encode(&v); err != nil { ... }
+//	schema := avro.MustParse(`{
+//	    "type": "record",
+//	    "name": "User",
+//	    "fields": [
+//	        {"name": "name", "type": "string"},
+//	        {"name": "age", "type": "int"}
+//	    ]
+//	}`)
+//
+//	f, err := os.Create("users.avro")
+//	if err != nil { ... }
+//	w, err := ocf.NewWriter(f, schema, ocf.WithCodec(ocf.SnappyCodec()))
+//	if err != nil { ... }
+//	for _, u := range users {
+//	    if err := w.Encode(&u); err != nil { ... }
 //	}
 //	if err := w.Close(); err != nil { ... }
 //
 // # Reading
 //
-//	r, err := ocf.NewReader(src)
+//	f, err := os.Open("users.avro")
+//	if err != nil { ... }
+//	r, err := ocf.NewReader(f)
+//	if err != nil { ... }
 //	for {
-//	    var v T
-//	    if err := r.Decode(&v); err != nil {
+//	    var u User
+//	    if err := r.Decode(&u); err != nil {
 //	        if err == io.EOF { break }
 //	        ...
 //	    }
+//	    fmt.Println(u)
 //	}
+//
+// # Appending
+//
+// Use [NewAppendWriter] to add records to an existing file without
+// rewriting it.
 //
 // # Codecs
 //
-// The null and deflate codecs are required by the specification; snappy and
-// zstandard are optional. All four are built in. Custom codecs can be
+// Null, deflate, snappy, and zstandard are built in. Custom codecs can be
 // provided via [WithCodec] (writer) or [WithReaderCodec] (reader).
 //
+// [Object Container Files]: https://avro.apache.org/docs/current/specification/#object-container-files
 // [Avro specification]: https://avro.apache.org/docs/current/specification/#object-container-files
 package ocf
 
@@ -49,21 +74,17 @@ import (
 	"github.com/twmb/avro"
 )
 
-// Codec compresses and decompresses OCF data blocks. The [Name] method
-// returns the codec name written to the file header (e.g. "null",
-// "deflate", "snappy", "zstandard"). If a codec holds resources that
-// should be freed, it may also implement [io.Closer]; both [Writer.Close]
-// and [Reader.Close] will close the codec automatically.
+// Codec compresses and decompresses OCF data blocks. If a codec implements
+// [io.Closer], both [Writer.Close] and [Reader.Close] close it automatically.
 type Codec interface {
-	// Name returns the codec identifier stored in the "avro.codec"
-	// metadata key. Standard names are "null", "deflate", "snappy",
-	// and "zstandard".
+	// Name returns the codec identifier for the "avro.codec" metadata key
+	// (e.g. "null", "deflate", "snappy", "zstandard").
 	Name() string
 
-	// Compress compresses a block of serialized Avro data.
+	// Compress encodes a raw data block for storage.
 	Compress(src []byte) ([]byte, error)
 
-	// Decompress decompresses a block back to serialized Avro data.
+	// Decompress decodes a stored data block back to raw bytes.
 	Decompress(src []byte) ([]byte, error)
 }
 
@@ -89,61 +110,51 @@ func (optSyncMarker) writerOpt()  {}
 func (optSchema) writerOpt()      {}
 func (optReaderCodec) readerOpt() {}
 
-// WithCodec sets the compression codec for the writer. The default codec is
-// null (no compression). Use [DeflateCodec], [SnappyCodec], or [ZstdCodec]
-// to select a built-in compressor, or supply a custom [Codec] implementation.
+// WithCodec sets the compression codec. The default is null (no compression).
 func WithCodec(c Codec) WriterOpt { return optCodec{c} }
 
-// WithBlockCount sets the maximum number of items buffered before a block is
-// flushed. The default is 100. When both WithBlockCount and [WithBlockBytes]
-// are set, whichever threshold is reached first triggers a flush.
+// WithBlockCount sets the maximum number of items per block. The default is
+// 100. If both WithBlockCount and [WithBlockBytes] are set, whichever limit
+// is hit first triggers a flush.
 func WithBlockCount(n int) WriterOpt { return optBlockCount{n} }
 
-// WithBlockBytes sets the maximum uncompressed byte size of a block before
-// it is flushed. Zero (the default) means no size limit; only [WithBlockCount]
-// controls flushing. When both are set, whichever threshold is reached first
-// triggers a flush.
+// WithBlockBytes sets the maximum uncompressed size of a block in bytes.
+// Zero (the default) means no size limit. If both [WithBlockCount] and
+// WithBlockBytes are set, whichever limit is hit first triggers a flush.
 func WithBlockBytes(n int) WriterOpt { return optBlockBytes{n} }
 
-// WithMetadata adds user metadata entries to the file header. Keys starting
-// with "avro." are reserved by the specification and should not be used.
-// Multiple calls are cumulative.
+// WithMetadata adds custom metadata to the file header. Keys starting with
+// "avro." are reserved by the spec. Multiple calls are cumulative.
 func WithMetadata(m map[string][]byte) WriterOpt { return optMetadata{m} }
 
-// WithSyncMarker sets the 16-byte sync marker written between blocks.
-// By default a cryptographically random marker is generated. A fixed marker
-// is useful for deterministic output in tests or when resuming writes to a
-// file whose sync marker is already known.
+// WithSyncMarker sets the 16-byte sync marker written between blocks. By
+// default a random marker is generated. This is primarily useful for
+// deterministic test output.
 func WithSyncMarker(sync [16]byte) WriterOpt { return optSyncMarker{sync} }
 
-// WithSchema sets the schema JSON written to the file header's "avro.schema"
-// metadata key. By default [avro.Schema.Canonical] is used, which produces
-// the most compact form but drops non-standard properties (doc strings,
-// aliases, Iceberg field-ids, etc.). The provided string should be valid
-// JSON representing a schema compatible with the one used for encoding.
+// WithSchema overrides the schema JSON written to the file header. By default
+// [avro.Schema.Canonical] is used, which strips non-essential properties like
+// doc strings and aliases. Use this to preserve those properties or to write
+// a custom schema string.
 func WithSchema(schema string) WriterOpt { return optSchema{schema} }
 
-// WithReaderCodec registers a custom codec for the reader. Null, deflate,
-// snappy, and zstandard are built-in and do not need to be registered.
-// A custom codec whose [Codec.Name] matches a built-in name overrides
-// the built-in, which is useful for sharing a [ZstdCodecFrom] codec
-// across multiple readers.
+// WithReaderCodec registers a custom codec for the reader. The four built-in
+// codecs do not need to be registered. A custom codec whose name matches a
+// built-in overrides it, which can be used to share a [ZstdCodecFrom] codec
+// across readers.
 func WithReaderCodec(c Codec) ReaderOpt { return optReaderCodec{c} }
 
-// DeflateCodec returns a [Codec] using DEFLATE (raw, RFC 1951) compression
-// at the given level (e.g. [flate.DefaultCompression], [flate.BestSpeed]).
+// DeflateCodec returns a [Codec] using raw DEFLATE compression at the given
+// level (e.g. [flate.DefaultCompression]).
 func DeflateCodec(level int) Codec { return deflateCodec{level} }
 
-// SnappyCodec returns a [Codec] using Snappy compression. Each block is
-// followed by a 4-byte big-endian CRC-32C checksum of the uncompressed data,
-// as required by the Avro specification.
+// SnappyCodec returns a [Codec] using Snappy compression with a trailing
+// CRC-32 checksum per block, as required by the Avro spec.
 func SnappyCodec() Codec { return snappyCodec{} }
 
-// ZstdCodec returns a [Codec] using Zstandard compression. The optional opts
-// are passed to the underlying [zstd.NewWriter] (e.g.
-// [zstd.WithEncoderLevel]). The returned codec is owned: [Writer.Close] and
-// [Reader.Close] release its resources automatically. To share a codec across
-// multiple files, use [ZstdCodecFrom] instead.
+// ZstdCodec returns a [Codec] using Zstandard compression. Options are passed
+// to [zstd.NewWriter]. The returned codec is owned by the writer/reader and
+// closed automatically; to share one across files, use [ZstdCodecFrom].
 func ZstdCodec(opts ...zstd.EOption) (Codec, error) {
 	enc, err := zstd.NewWriter(nil, opts...)
 	if err != nil {
@@ -158,16 +169,11 @@ func ZstdCodec(opts ...zstd.EOption) (Codec, error) {
 }
 
 // ZstdCodecFrom wraps a caller-owned encoder and decoder as a [Codec].
-// [Codec.Close] is a no-op, so it is safe to share a single codec across
-// many [Writer] or [Reader] instances without any writer or reader closing
-// the underlying resources.
+// Close is a no-op, so it is safe to share across many writers or readers.
 //
-// enc may be nil if the codec will only be used for reading (decompression).
-// dec may be nil if the codec will only be used for writing (compression).
-// Calling the missing direction returns an error.
-//
-// The caller is responsible for closing enc and dec when they are no longer
-// needed.
+// Either enc or dec may be nil if the codec is only used in one direction;
+// calling the missing direction returns an error. The caller is responsible
+// for closing enc and dec.
 func ZstdCodecFrom(enc *zstd.Encoder, dec *zstd.Decoder) Codec {
 	return &zstdCodec{enc: enc, dec: dec}
 }
@@ -178,9 +184,9 @@ var magic = [4]byte{'O', 'b', 'j', 0x01}
 // override it to simulate errors.
 var randRead = rand.Read
 
-// Writer encodes Avro values into an Object Container File. Values are
-// buffered and written in compressed blocks. A Writer must be closed after
-// use to flush any remaining buffered items and release codec resources.
+// Writer encodes Avro values into an OCF. Values are buffered into blocks
+// that are compressed and flushed automatically. Close must be called to
+// flush remaining items.
 type Writer struct {
 	w          io.Writer
 	schema     *avro.Schema
@@ -196,8 +202,8 @@ type Writer struct {
 	hasSync    bool
 }
 
-// NewWriter creates a Writer that writes an OCF file to w. The file header
-// (magic bytes, metadata, and sync marker) is written immediately.
+// NewWriter creates a Writer that writes an OCF to w. The file header is
+// written immediately.
 func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) {
 	wr := &Writer{
 		w:      w,
@@ -267,12 +273,11 @@ func (w *Writer) writeHeader() error {
 	return nil
 }
 
-// Encode serializes v and appends it to the current block. When the block
-// reaches the configured item count ([WithBlockCount]) or byte size
-// ([WithBlockBytes]), it is compressed and flushed automatically.
+// Encode serializes v and appends it to the current block. The block is
+// flushed automatically when it hits the count or byte limit.
 //
-// After any error, the Writer enters a permanent error state: all
-// subsequent Encode, Write, Flush, and Close calls return the same error.
+// After any error the Writer is poisoned: all subsequent calls return the
+// same error.
 func (w *Writer) Encode(v any) error {
 	if w.err != nil {
 		return w.err
@@ -290,10 +295,9 @@ func (w *Writer) Encode(v any) error {
 	return nil
 }
 
-// Write appends pre-encoded Avro bytes to the current block, incrementing
-// the item count by one. The caller is responsible for ensuring p contains
-// exactly one datum encoded with the writer's schema. The same
-// auto-flushing rules as [Encode] apply.
+// Write appends pre-encoded Avro bytes as a single datum to the current
+// block. The caller must ensure p is exactly one datum encoded with the
+// writer's schema. Auto-flushing rules are the same as [Encode].
 func (w *Writer) Write(p []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
@@ -308,8 +312,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Flush compresses and writes any buffered items as a block. Unlike
-// [Close], the Writer remains usable after a Flush.
+// Flush writes any buffered items as a block. The Writer remains usable.
 func (w *Writer) Flush() error {
 	if w.err != nil {
 		return w.err
@@ -320,8 +323,7 @@ func (w *Writer) Flush() error {
 	return nil
 }
 
-// Close flushes any remaining buffered items. If the codec implements
-// [io.Closer] (e.g. [ZstdCodec]), it is closed as well.
+// Close flushes any remaining items and releases codec resources.
 func (w *Writer) Close() error {
 	if w.err != nil {
 		return w.err
@@ -357,13 +359,9 @@ func (w *Writer) flush() error {
 	return nil
 }
 
-// Reset flushes any buffered items to the current destination, then begins
-// a new OCF file on dst. The schema, codec, and options from the original
-// [NewWriter] call are reused. A new random sync marker is generated unless
-// [WithSyncMarker] was used, in which case the same marker is reused.
-//
-// If the Writer is in an error state, the pending flush is skipped but the
-// error is cleared, allowing the Writer to be reused on the new destination.
+// Reset flushes buffered items to the current destination, then starts a
+// new OCF on dst reusing the original schema, codec, and options. If the
+// Writer is in an error state the flush is skipped and the error is cleared.
 func (w *Writer) Reset(dst io.Writer) error {
 	if w.err == nil && w.count > 0 {
 		if err := w.flush(); err != nil {
@@ -382,15 +380,12 @@ func (w *Writer) Reset(dst io.Writer) error {
 	return w.writeHeader()
 }
 
-// NewAppendWriter opens an existing OCF file for appending. It reads the
-// file header from rws to obtain the schema, codec, and sync marker, then
-// seeks to the end of the file so that subsequent [Writer.Encode] or
-// [Writer.Write] calls append new blocks after the existing data.
+// NewAppendWriter opens an existing OCF for appending. It reads the header
+// to recover the schema, codec, and sync marker, then seeks to the end.
 //
-// Options [WithBlockCount] and [WithBlockBytes] are applied. [WithCodec]
-// provides codec implementations for non-built-in codecs (the codec is
-// matched by name against the file header's "avro.codec" metadata).
-// [WithMetadata] and [WithSyncMarker] are ignored.
+// [WithBlockCount] and [WithBlockBytes] are honored. [WithCodec] can
+// provide a codec implementation for non-built-in codecs (matched by name
+// against the header). Other options are ignored.
 func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error) {
 	br := bufio.NewReader(rws)
 	schema, meta, sync, err := readHeader(br)
@@ -446,7 +441,7 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 	return wr, nil
 }
 
-// Reader decodes Avro values from an Object Container File.
+// Reader decodes Avro values from an OCF.
 type Reader struct {
 	r      *bufio.Reader
 	schema *avro.Schema
@@ -489,10 +484,8 @@ func readHeader(br *bufio.Reader) (schema *avro.Schema, meta map[string][]byte, 
 	return schema, meta, sync, nil
 }
 
-// NewReader creates a Reader that decodes an OCF file from r. The file
-// header is read and validated immediately; the codec is resolved from the
-// "avro.codec" metadata key. Null, deflate, snappy, and zstandard codecs
-// are resolved automatically; use [WithReaderCodec] for custom codecs.
+// NewReader creates a Reader that decodes an OCF from r. The header is read
+// immediately. Use [WithReaderCodec] if the file uses a non-built-in codec.
 func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	var customCodecs []Codec
 	for _, o := range opts {
@@ -527,8 +520,7 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	}, nil
 }
 
-// Decode reads the next datum from the file into v. If no more data is
-// available, Decode returns [io.EOF].
+// Decode reads the next datum into v, returning [io.EOF] at end of file.
 func (rd *Reader) Decode(v any) error {
 	if rd.remain == 0 {
 		if err := rd.readBlock(); err != nil {
@@ -550,13 +542,11 @@ func (rd *Reader) Decode(v any) error {
 // Schema returns the schema parsed from the file header.
 func (rd *Reader) Schema() *avro.Schema { return rd.schema }
 
-// Metadata returns the raw metadata map from the file header. The returned
-// map includes both "avro.*" keys (e.g. "avro.schema", "avro.codec") and
-// any user-defined keys.
+// Metadata returns the raw metadata from the file header, including both
+// "avro.*" and user-defined keys.
 func (rd *Reader) Metadata() map[string][]byte { return rd.meta }
 
-// Close releases any resources held by the reader's codec. This is a no-op
-// for codecs that do not implement [io.Closer].
+// Close releases codec resources. This is a no-op for most codecs.
 func (rd *Reader) Close() error {
 	if c, ok := rd.codec.(io.Closer); ok {
 		return c.Close()
