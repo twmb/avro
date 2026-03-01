@@ -2,6 +2,7 @@ package avro
 
 import (
 	"encoding"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -14,12 +15,14 @@ import (
 
 type serfn func([]byte, reflect.Value) ([]byte, error)
 
-func (s *Schema) AppendEncode(dst []byte, v interface{}) ([]byte, error) {
+// AppendEncode appends the Avro binary encoding of v to dst. See
+// [Schema.Decode] for the Go-to-Avro type mapping.
+func (s *Schema) AppendEncode(dst []byte, v any) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
 
-// Encode encodes v using the schema and returns the encoded bytes.
-func (s *Schema) Encode(v interface{}) ([]byte, error) {
+// Encode encodes v as Avro binary. It is shorthand for AppendEncode(nil, v).
+func (s *Schema) Encode(v any) ([]byte, error) {
 	return s.AppendEncode(nil, v)
 }
 
@@ -45,6 +48,9 @@ func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
 
 func serNullUnion(u *serUnion) serfn {
 	return func(dst []byte, v reflect.Value) ([]byte, error) {
+		if !v.IsValid() {
+			return append(dst, 0), nil
+		}
 		switch v.Kind() {
 		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
 			if v.IsNil() {
@@ -52,6 +58,21 @@ func serNullUnion(u *serUnion) serfn {
 			}
 		}
 		return u.fns[1](append(dst, 2), v)
+	}
+}
+
+func serNullSecondUnion(u *serUnion) serfn {
+	return func(dst []byte, v reflect.Value) ([]byte, error) {
+		if !v.IsValid() {
+			return append(dst, 2), nil // index 1 (null)
+		}
+		switch v.Kind() {
+		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
+			if v.IsNil() {
+				return append(dst, 2), nil // index 1 (null)
+			}
+		}
+		return u.fns[0](append(dst, 0), v) // index 0 (T)
 	}
 }
 
@@ -75,6 +96,9 @@ var serPrimitive = map[string]serfn{
 var errNonNil = errors.New("cannot encode non-nil value as null")
 
 func serNull(dst []byte, v reflect.Value) ([]byte, error) {
+	if !v.IsValid() {
+		return dst, nil
+	}
 	switch v.Kind() {
 	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
 		if v.IsNil() {
@@ -104,9 +128,27 @@ func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.CanInt() {
-		return appendVarint(dst, int32(v.Int())), nil
+		n := v.Int()
+		if n < math.MinInt32 || n > math.MaxInt32 {
+			return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+		}
+		return appendVarint(dst, int32(n)), nil
 	} else if v.CanUint() {
-		return appendVarint(dst, int32(v.Uint())), nil
+		n := v.Uint()
+		if n > math.MaxInt32 {
+			return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+		}
+		return appendVarint(dst, int32(n)), nil
+	} else if v.CanFloat() {
+		f := v.Float()
+		n := math.Trunc(f)
+		if f != n {
+			return nil, fmt.Errorf("value %v is not a whole number for Avro int", f)
+		}
+		if n < math.MinInt32 || n > math.MaxInt32 {
+			return nil, fmt.Errorf("value %v overflows Avro int (int32)", f)
+		}
+		return appendVarint(dst, int32(n)), nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
 }
@@ -120,6 +162,16 @@ func serLong(dst []byte, v reflect.Value) ([]byte, error) {
 		return appendVarlong(dst, int64(v.Int())), nil
 	} else if v.CanUint() {
 		return appendVarlong(dst, int64(v.Uint())), nil
+	} else if v.CanFloat() {
+		f := v.Float()
+		n := math.Trunc(f)
+		if f != n {
+			return nil, fmt.Errorf("value %v is not a whole number for Avro long", f)
+		}
+		if n < -(1<<63) || n >= 1<<63 {
+			return nil, fmt.Errorf("value %v overflows Avro long (int64)", f)
+		}
+		return appendVarlong(dst, int64(n)), nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
 }
@@ -171,6 +223,20 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 		if s, ok := i.(stringer); ok {
 			return doSerString(dst, s.String()), nil
 		}
+		if a, ok := i.(encoding.TextAppender); ok {
+			mark := len(dst)
+			var err error
+			if dst, err = a.AppendText(dst); err != nil {
+				return nil, err
+			}
+			textLen := len(dst) - mark
+			var buf [10]byte
+			hdr := appendVarlong(buf[:0], int64(textLen))
+			dst = append(dst, hdr...)                         // make room
+			copy(dst[mark+len(hdr):], dst[mark:mark+textLen]) // shift text right
+			copy(dst[mark:], hdr)                             // write length prefix
+			return dst, nil
+		}
 		if m, ok := i.(encoding.TextMarshaler); ok {
 			text, err := m.MarshalText()
 			if err != nil {
@@ -195,7 +261,7 @@ func doSerBytes(dst []byte, v reflect.Value) []byte {
 	if v.CanAddr() {
 		return append(dst, v.Slice(0, l).Bytes()...)
 	}
-	for i := 0; i < l; i++ {
+	for i := range l {
 		dst = append(dst, v.Index(i).Interface().(byte))
 	}
 	return dst
@@ -211,17 +277,19 @@ func doSerString(dst []byte, s string) []byte {
 /////////////
 
 type serRecordField struct {
-	name     string
-	fn       serfn
-	avroType string
-	meta     *fieldMeta
+	name         string
+	fn           serfn
+	avroType     string
+	meta         *fieldMeta
+	defaultBytes []byte // pre-encoded Avro binary for the field's default value
+	hasDefault   bool
 }
 
 type serRecord struct {
 	fields []serRecordField
 	names  []string
-	cache  sync.Map                       // map[reflect.Type]*cachedMapping
-	fast   atomic.Pointer[fastRecordSer]  // precompiled unsafe fast path
+	cache  sync.Map                      // map[reflect.Type]*cachedMapping
+	fast   atomic.Pointer[fastRecordSer] // precompiled unsafe fast path
 }
 
 func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
@@ -238,7 +306,11 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		for _, f := range s.fields {
 			value := v.MapIndex(reflect.ValueOf(f.name))
 			if !value.IsValid() {
-				return nil, fmt.Errorf("missing key %s", f.name)
+				if !f.hasDefault {
+					return nil, fmt.Errorf("missing key %s", f.name)
+				}
+				dst = append(dst, f.defaultBytes...)
+				continue
 			}
 			if dst, err = f.fn(dst, value); err != nil {
 				return nil, err
@@ -327,7 +399,7 @@ func (s *serArray) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	if l == 0 {
 		return dst, nil
 	}
-	for i := 0; i < l; i++ {
+	for i := range l {
 		if dst, err = s.serItem(dst, v.Index(i)); err != nil {
 			return nil, err
 		}
@@ -373,10 +445,18 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	t := v.Type()
-	if t.Kind() != reflect.Array || t.Elem().Kind() != reflect.Uint8 {
-		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
-	}
-	if t.Len() != s.n {
+	// Accept both [N]byte arrays and []byte slices of the correct length.
+	switch t.Kind() {
+	case reflect.Array:
+		if t.Elem().Kind() != reflect.Uint8 || t.Len() != s.n {
+			return nil, &SemanticError{GoType: t, AvroType: "fixed"}
+		}
+	case reflect.Slice:
+		if t.Elem().Kind() != reflect.Uint8 || v.Len() != s.n {
+			return nil, &SemanticError{GoType: t, AvroType: "fixed"}
+		}
+		return append(dst, v.Bytes()...), nil
+	default:
 		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
 	// Fixed is written as raw bytes with no length prefix.
@@ -393,10 +473,12 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 // LOGICAL TYPE SERIALIZERS //
 /////////////////////////////
 
-var timeType = reflect.TypeFor[time.Time]()
-var durationType = reflect.TypeFor[time.Duration]()
-var avroDurationType = reflect.TypeFor[Duration]()
-var bigRatType = reflect.TypeFor[big.Rat]()
+var (
+	timeType         = reflect.TypeFor[time.Time]()
+	durationType     = reflect.TypeFor[time.Duration]()
+	avroDurationType = reflect.TypeFor[Duration]()
+	bigRatType       = reflect.TypeFor[big.Rat]()
+)
 
 // Duration represents the Avro duration logical type: a 12-byte fixed
 // value containing three little-endian unsigned 32-bit integers
@@ -431,6 +513,35 @@ func serTimestampMicros(dst []byte, v reflect.Value) ([]byte, error) {
 	return serLong(dst, v)
 }
 
+func serTimestampNanos(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() == timeType {
+		t := v.Interface().(time.Time)
+		return appendVarlong(dst, timeToUnixNanos(t)), nil
+	}
+	return serLong(dst, v)
+}
+
+// timeToUnixNanos converts a time.Time to nanoseconds since the Unix epoch
+// without the overflow issues of time.Time.UnixNano (which is undefined
+// outside ~1678-2262).
+func timeToUnixNanos(t time.Time) int64 {
+	return t.Unix()*1e9 + int64(t.Nanosecond())
+}
+
+// floorDiv returns the floor of a/b (rounds toward negative infinity),
+// unlike Go's built-in integer division which truncates toward zero.
+func floorDiv(a, b int64) int64 {
+	d := a / b
+	if (a^b) < 0 && d*b != a {
+		d--
+	}
+	return d
+}
+
 func serDate(dst []byte, v reflect.Value) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
@@ -438,8 +549,7 @@ func serDate(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
-		days := int32(t.Unix() / 86400)
-		return appendVarint(dst, days), nil
+		return appendVarint(dst, int32(floorDiv(t.Unix(), 86400))), nil
 	}
 	return serInt(dst, v)
 }
@@ -451,7 +561,11 @@ func serTimeMillis(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Type() == durationType {
 		d := time.Duration(v.Int())
-		return appendVarint(dst, int32(d.Milliseconds())), nil
+		ms := d.Milliseconds()
+		if ms < math.MinInt32 || ms > math.MaxInt32 {
+			return nil, fmt.Errorf("duration %v overflows Avro time-millis (int32)", d)
+		}
+		return appendVarint(dst, int32(ms)), nil
 	}
 	return serInt(dst, v)
 }
@@ -567,4 +681,39 @@ func bigIntToBytes(i *big.Int) []byte {
 		}
 		return b
 	}
+}
+
+// isUUIDType returns true when t is an array of 16 uint8 bytes (e.g. [16]byte
+// or any type whose underlying type is [16]byte).
+func isUUIDType(t reflect.Type) bool {
+	return t.Kind() == reflect.Array && t.Len() == 16 && t.Elem().Kind() == reflect.Uint8
+}
+
+// uuidToString formats a [16]byte as the RFC 4122 hex-dash string
+// xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
+func uuidToString(u [16]byte) string {
+	var buf [36]byte
+	hex.Encode(buf[0:8], u[0:4])
+	buf[8] = '-'
+	hex.Encode(buf[9:13], u[4:6])
+	buf[13] = '-'
+	hex.Encode(buf[14:18], u[6:8])
+	buf[18] = '-'
+	hex.Encode(buf[19:23], u[8:10])
+	buf[23] = '-'
+	hex.Encode(buf[24:36], u[10:16])
+	return string(buf[:])
+}
+
+func serUUID(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if isUUIDType(v.Type()) {
+		var u [16]byte
+		reflect.Copy(reflect.ValueOf(&u).Elem(), v)
+		return doSerString(dst, uuidToString(u)), nil
+	}
+	return serString(dst, v)
 }

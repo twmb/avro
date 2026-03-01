@@ -15,22 +15,16 @@ type stringer interface {
 var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 
 func indirect(v reflect.Value) (reflect.Value, error) {
-start:
-	switch v.Kind() {
-	case reflect.Pointer:
-		if v.IsNil() {
-			return v, fmt.Errorf("invalid nil in non-union, non-null")
+	for {
+		switch v.Kind() {
+		case reflect.Pointer, reflect.Interface:
+			if v.IsNil() {
+				return v, fmt.Errorf("invalid nil in non-union, non-null")
+			}
+			v = v.Elem()
+		default:
+			return v, nil
 		}
-		v = v.Elem()
-		goto start
-	case reflect.Interface:
-		if v.IsNil() {
-			return v, fmt.Errorf("invalid nil in non-union, non-null")
-		}
-		v = v.Elem()
-		goto start
-	default:
-		return v, nil
 	}
 }
 

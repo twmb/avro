@@ -9,7 +9,7 @@ import (
 )
 
 func TestCanonical(t *testing.T) {
-	s, err := NewSchema(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`)
+	s, err := Parse(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,7 +20,7 @@ func TestCanonical(t *testing.T) {
 }
 
 func TestFingerprint(t *testing.T) {
-	s, err := NewSchema(`"int"`)
+	s, err := Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestFingerprintRabin(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		s, err := NewSchema(tt.schema)
+		s, err := Parse(tt.schema)
 		if err != nil {
 			t.Fatalf("schema %s: %v", tt.schema, err)
 		}
@@ -151,7 +151,7 @@ func TestUnmarshalJSONInvalid(t *testing.T) {
 	}
 }
 
-func TestNewSchemaErrors(t *testing.T) {
+func TestParseErrors(t *testing.T) {
 	tests := []struct {
 		name   string
 		schema string
@@ -163,7 +163,7 @@ func TestNewSchemaErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewSchema(tt.schema)
+			_, err := Parse(tt.schema)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -252,7 +252,7 @@ func TestValidateLogical(t *testing.T) {
 
 func TestBuildUnionErrors(t *testing.T) {
 	t.Run("duplicate type", func(t *testing.T) {
-		_, err := NewSchema(`["int","int"]`)
+		_, err := Parse(`["int","int"]`)
 		if err == nil {
 			t.Fatal("expected error for duplicate union type")
 		}
@@ -271,7 +271,7 @@ func TestBuildUnionErrors(t *testing.T) {
 
 	t.Run("duplicate named type", func(t *testing.T) {
 		// Two records with the same name in a union is a duplicate.
-		_, err := NewSchema(`[
+		_, err := Parse(`[
 			{"type":"record","name":"a","fields":[{"name":"x","type":"int"}]},
 			{"type":"record","name":"a","fields":[{"name":"y","type":"int"}]}
 		]`)
@@ -282,7 +282,7 @@ func TestBuildUnionErrors(t *testing.T) {
 
 	t.Run("two records different names", func(t *testing.T) {
 		// Two records with different names in union is OK.
-		_, err := NewSchema(`[
+		_, err := Parse(`[
 			{"type":"record","name":"a","fields":[{"name":"x","type":"int"}]},
 			{"type":"record","name":"b","fields":[{"name":"x","type":"int"}]}
 		]`)
@@ -293,30 +293,16 @@ func TestBuildUnionErrors(t *testing.T) {
 }
 
 func TestBuildComplexErrors(t *testing.T) {
-	t.Run("invalid name", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"record","name":"123bad","fields":[]}`)
-		if err == nil {
-			t.Fatal("expected error for invalid name")
-		}
-	})
-
-	t.Run("invalid namespace", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"record","name":"r","namespace":"123bad","fields":[]}`)
-		if err == nil {
-			t.Fatal("expected error for invalid namespace")
-		}
-	})
-
 	t.Run("name with namespace only", func(t *testing.T) {
 		// Name like "com.example" is treated as a fullname.
-		_, err := NewSchema(`{"type":"record","name":"com.example","fields":[{"name":"a","type":"int"}]}`)
+		_, err := Parse(`{"type":"record","name":"com.example","fields":[{"name":"a","type":"int"}]}`)
 		if err != nil {
 			t.Fatalf("expected no error for dotted name, got %v", err)
 		}
 	})
 
 	t.Run("name and namespace", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"record","name":"r","namespace":"com.example","fields":[{"name":"a","type":"int"}]}`)
+		_, err := Parse(`{"type":"record","name":"r","namespace":"com.example","fields":[{"name":"a","type":"int"}]}`)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -324,7 +310,7 @@ func TestBuildComplexErrors(t *testing.T) {
 
 	t.Run("parent namespace inheritance", func(t *testing.T) {
 		// Parent has a namespace, child inherits it.
-		_, err := NewSchema(`{
+		_, err := Parse(`{
 			"type":"record","name":"parent","namespace":"com.example","fields":[
 				{"name":"child","type":{"type":"record","name":"child","fields":[
 					{"name":"x","type":"int"}
@@ -337,154 +323,140 @@ func TestBuildComplexErrors(t *testing.T) {
 	})
 
 	t.Run("named non-record", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"array","name":"x","items":"int"}`)
+		_, err := Parse(`{"type":"array","name":"x","items":"int"}`)
 		if err == nil {
 			t.Fatal("expected error for named array")
 		}
 	})
 
 	t.Run("namespace on non-record", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"array","namespace":"com","items":"int"}`)
+		_, err := Parse(`{"type":"array","namespace":"com","items":"int"}`)
 		if err == nil {
 			t.Fatal("expected error for namespaced array")
 		}
 	})
 
 	t.Run("record with extra fields", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}],"symbols":["x"]}`)
+		_, err := Parse(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}],"symbols":["x"]}`)
 		if err == nil {
 			t.Fatal("expected error for record with symbols")
 		}
 	})
 
 	t.Run("record with items", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}],"items":"int"}`)
+		_, err := Parse(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}],"items":"int"}`)
 		if err == nil {
 			t.Fatal("expected error for record with items")
 		}
 	})
 
 	t.Run("record with values", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}],"values":"int"}`)
+		_, err := Parse(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}],"values":"int"}`)
 		if err == nil {
 			t.Fatal("expected error for record with values")
 		}
 	})
 
 	t.Run("record with size", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}],"size":4}`)
+		_, err := Parse(`{"type":"record","name":"r","fields":[{"name":"a","type":"int"}],"size":4}`)
 		if err == nil {
 			t.Fatal("expected error for record with size")
 		}
 	})
 
-	t.Run("invalid record field name", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"record","name":"r","fields":[{"name":"123bad","type":"int"}]}`)
-		if err == nil {
-			t.Fatal("expected error for invalid field name")
-		}
-	})
-
 	t.Run("invalid record field type", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"record","name":"r","fields":[{"name":"a","type":"unknown"}]}`)
+		_, err := Parse(`{"type":"record","name":"r","fields":[{"name":"a","type":"unknown"}]}`)
 		if err == nil {
 			t.Fatal("expected error for invalid field type")
 		}
 	})
 
 	t.Run("enum with extra fields", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"enum","name":"e","symbols":["a"],"fields":[{"name":"x","type":"int"}]}`)
+		_, err := Parse(`{"type":"enum","name":"e","symbols":["a"],"fields":[{"name":"x","type":"int"}]}`)
 		if err == nil {
 			t.Fatal("expected error for enum with fields")
 		}
 	})
 
 	t.Run("enum with items", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"enum","name":"e","symbols":["a"],"items":"int"}`)
+		_, err := Parse(`{"type":"enum","name":"e","symbols":["a"],"items":"int"}`)
 		if err == nil {
 			t.Fatal("expected error for enum with items")
 		}
 	})
 
 	t.Run("enum with values", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"enum","name":"e","symbols":["a"],"values":"int"}`)
+		_, err := Parse(`{"type":"enum","name":"e","symbols":["a"],"values":"int"}`)
 		if err == nil {
 			t.Fatal("expected error for enum with values")
 		}
 	})
 
 	t.Run("enum with size", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"enum","name":"e","symbols":["a"],"size":4}`)
+		_, err := Parse(`{"type":"enum","name":"e","symbols":["a"],"size":4}`)
 		if err == nil {
 			t.Fatal("expected error for enum with size")
 		}
 	})
 
-	t.Run("invalid enum symbol", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"enum","name":"e","symbols":["123bad"]}`)
-		if err == nil {
-			t.Fatal("expected error for invalid symbol")
-		}
-	})
-
 	t.Run("array with extra fields", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"array","items":"int","symbols":["a"]}`)
+		_, err := Parse(`{"type":"array","items":"int","symbols":["a"]}`)
 		if err == nil {
 			t.Fatal("expected error for array with symbols")
 		}
 	})
 
 	t.Run("array missing items", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"array"}`)
+		_, err := Parse(`{"type":"array"}`)
 		if err == nil {
 			t.Fatal("expected error for array missing items")
 		}
 	})
 
 	t.Run("array invalid items", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"array","items":"unknown"}`)
+		_, err := Parse(`{"type":"array","items":"unknown"}`)
 		if err == nil {
 			t.Fatal("expected error for array with invalid items")
 		}
 	})
 
 	t.Run("map with extra fields", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"map","values":"int","symbols":["a"]}`)
+		_, err := Parse(`{"type":"map","values":"int","symbols":["a"]}`)
 		if err == nil {
 			t.Fatal("expected error for map with symbols")
 		}
 	})
 
 	t.Run("map missing values", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"map"}`)
+		_, err := Parse(`{"type":"map"}`)
 		if err == nil {
 			t.Fatal("expected error for map missing values")
 		}
 	})
 
 	t.Run("map invalid values", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"map","values":"unknown"}`)
+		_, err := Parse(`{"type":"map","values":"unknown"}`)
 		if err == nil {
 			t.Fatal("expected error for map with invalid values")
 		}
 	})
 
 	t.Run("fixed with extra fields", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"fixed","name":"f","size":4,"symbols":["a"]}`)
+		_, err := Parse(`{"type":"fixed","name":"f","size":4,"symbols":["a"]}`)
 		if err == nil {
 			t.Fatal("expected error for fixed with symbols")
 		}
 	})
 
 	t.Run("fixed missing size", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"fixed","name":"f"}`)
+		_, err := Parse(`{"type":"fixed","name":"f"}`)
 		if err == nil {
 			t.Fatal("expected error for fixed missing size")
 		}
 	})
 
 	t.Run("fixed negative size", func(t *testing.T) {
-		_, err := NewSchema(`{"type":"fixed","name":"f","size":-1}`)
+		_, err := Parse(`{"type":"fixed","name":"f","size":-1}`)
 		if err == nil {
 			t.Fatal("expected error for negative fixed size")
 		}
@@ -492,7 +464,7 @@ func TestBuildComplexErrors(t *testing.T) {
 
 	t.Run("primitive as object", func(t *testing.T) {
 		// A primitive type name in object form is treated as a primitive.
-		s, err := NewSchema(`{"type":"int"}`)
+		s, err := Parse(`{"type":"int"}`)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -514,7 +486,7 @@ func TestBuildComplexErrors(t *testing.T) {
 func TestFinalizeForwardRef(t *testing.T) {
 	// Union references a type defined later in the schema.
 	// This exercises finalize() resolving forward references.
-	_, err := NewSchema(`{
+	_, err := Parse(`{
 		"type":"record","name":"outer","fields":[
 			{"name":"u","type":["null","inner"]},
 			{"name":"inner","type":{"type":"record","name":"inner","fields":[
@@ -529,7 +501,7 @@ func TestFinalizeForwardRef(t *testing.T) {
 
 func TestFinalizeUnknownRef(t *testing.T) {
 	// Union references a type that is never defined → finalize error.
-	_, err := NewSchema(`["null","neverDefined"]`)
+	_, err := Parse(`["null","neverDefined"]`)
 	if err == nil {
 		t.Fatal("expected error for unknown type reference in union")
 	}
@@ -559,23 +531,15 @@ func TestUnionTypeName(t *testing.T) {
 
 func TestBuildUnionInUnion(t *testing.T) {
 	// A union directly containing another union is invalid.
-	_, err := NewSchema(`["null", ["int","string"]]`)
+	_, err := Parse(`["null", ["int","string"]]`)
 	if err == nil {
 		t.Fatal("expected error for union-in-union")
 	}
 }
 
-func TestBuildUnionInvalidInnerError(t *testing.T) {
-	// Union element that produces a non-unknownPrimitive error.
-	_, err := NewSchema(`["null",{"type":"record","name":"r","fields":[{"name":"123bad","type":"int"}]}]`)
-	if err == nil {
-		t.Fatal("expected error for invalid union element")
-	}
-}
-
 func TestBuildComplexUnknownLogicalIgnored(t *testing.T) {
 	// Per Avro spec, unknown logical types are ignored and the underlying type is used.
-	s, err := NewSchema(`{"type":"int","logicalType":"unknown_logical"}`)
+	s, err := Parse(`{"type":"int","logicalType":"unknown_logical"}`)
 	if err != nil {
 		t.Fatalf("expected unknown logical type to be ignored, got error: %v", err)
 	}
@@ -594,7 +558,7 @@ func TestBuildComplexUnknownLogicalIgnored(t *testing.T) {
 
 func TestBuildComplexValidateLogicalError(t *testing.T) {
 	// Known logical type on wrong underlying type should error through buildComplex.
-	_, err := NewSchema(`{"type":"string","logicalType":"date"}`)
+	_, err := Parse(`{"type":"string","logicalType":"date"}`)
 	if err == nil {
 		t.Fatal("expected error for date on string type")
 	}
@@ -602,7 +566,7 @@ func TestBuildComplexValidateLogicalError(t *testing.T) {
 
 func TestMultiDotNamespace(t *testing.T) {
 	// Namespace with multiple dot-segments should be valid.
-	_, err := NewSchema(`{"type":"record","name":"r","namespace":"com.example.foo","fields":[{"name":"a","type":"int"}]}`)
+	_, err := Parse(`{"type":"record","name":"r","namespace":"com.example.foo","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatalf("expected no error for multi-dot namespace, got %v", err)
 	}
@@ -610,7 +574,7 @@ func TestMultiDotNamespace(t *testing.T) {
 
 func TestMultiDotFullname(t *testing.T) {
 	// Fullname with multiple dot-segments should be valid.
-	_, err := NewSchema(`{"type":"record","name":"com.example.foo.Bar","fields":[{"name":"a","type":"int"}]}`)
+	_, err := Parse(`{"type":"record","name":"com.example.foo.Bar","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatalf("expected no error for multi-dot fullname, got %v", err)
 	}
@@ -618,7 +582,7 @@ func TestMultiDotFullname(t *testing.T) {
 
 func TestDeepNamespaceInheritance(t *testing.T) {
 	// Parent is "com.example.Parent", child should inherit "com.example" namespace.
-	_, err := NewSchema(`{
+	_, err := Parse(`{
 		"type":"record","name":"Parent","namespace":"com.example","fields":[
 			{"name":"child","type":{"type":"record","name":"Child","fields":[
 				{"name":"x","type":"int"}
@@ -631,7 +595,7 @@ func TestDeepNamespaceInheritance(t *testing.T) {
 }
 
 func TestDuplicateRecordFieldName(t *testing.T) {
-	_, err := NewSchema(`{"type":"record","name":"r","fields":[
+	_, err := Parse(`{"type":"record","name":"r","fields":[
 		{"name":"a","type":"int"},
 		{"name":"a","type":"string"}
 	]}`)
@@ -641,7 +605,7 @@ func TestDuplicateRecordFieldName(t *testing.T) {
 }
 
 func TestDuplicateEnumSymbol(t *testing.T) {
-	_, err := NewSchema(`{"type":"enum","name":"e","symbols":["a","b","a"]}`)
+	_, err := Parse(`{"type":"enum","name":"e","symbols":["a","b","a"]}`)
 	if err == nil {
 		t.Fatal("expected error for duplicate enum symbol")
 	}
@@ -666,5 +630,104 @@ func TestBuildEmptySchema(t *testing.T) {
 	err := b.build("", &aschema{})
 	if err == nil {
 		t.Fatal("expected error for empty schema")
+	}
+}
+
+func TestNonStrictNames(t *testing.T) {
+	t.Run("dashes allowed", func(t *testing.T) {
+		_, err := Parse(`{"type":"record","name":"my-record","fields":[{"name":"my-field","type":"int"}]}`)
+		if err != nil {
+			t.Fatalf("expected dashed names to be accepted, got %v", err)
+		}
+	})
+
+	t.Run("fullname detection", func(t *testing.T) {
+		// Fullnames (dot-separated) must be detected so namespace
+		// handling works correctly.
+		s, err := Parse(`{"type":"record","name":"com.example.MyRecord","fields":[{"name":"x","type":"int"}]}`)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		canon := string(s.Canonical())
+		if canon == "" {
+			t.Fatal("expected non-empty canonical form")
+		}
+	})
+}
+
+func TestNamespaceFallback(t *testing.T) {
+	// A record in a namespace can reference another type by unqualified name.
+	schema := `{
+		"type":"record","name":"Parent","namespace":"com.example","fields":[
+			{"name":"child","type":{"type":"record","name":"Child","fields":[
+				{"name":"x","type":"int"}
+			]}},
+			{"name":"ref","type":"Child"}
+		]
+	}`
+	_, err := Parse(schema)
+	if err != nil {
+		t.Fatalf("expected namespace fallback to resolve unqualified ref, got %v", err)
+	}
+}
+
+func TestForwardReferenceInRecord(t *testing.T) {
+	// A record field references a type defined later in the same record.
+	schema := `{
+		"type":"record","name":"outer","fields":[
+			{"name":"ref","type":"inner"},
+			{"name":"inner_def","type":{"type":"record","name":"inner","fields":[
+				{"name":"x","type":"int"}
+			]}}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatalf("expected forward reference to work, got %v", err)
+	}
+	// Verify round-trip works.
+	type Inner struct {
+		X int32 `avro:"x"`
+	}
+	type Outer struct {
+		Ref      Inner `avro:"ref"`
+		InnerDef Inner `avro:"inner_def"`
+	}
+	input := Outer{Ref: Inner{X: 42}, InnerDef: Inner{X: 99}}
+	dst, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var output Outer
+	rem, err := s.Decode(dst, &output)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("leftover bytes: %d", len(rem))
+	}
+	if output.Ref.X != 42 || output.InnerDef.X != 99 {
+		t.Fatalf("unexpected output: %+v", output)
+	}
+}
+
+func TestEmptyNamespace(t *testing.T) {
+	// Explicit empty namespace clears inherited namespace.
+	schema := `{
+		"type":"record","name":"parent","namespace":"com.example","fields":[
+			{"name":"child","type":{"type":"record","name":"child","namespace":"","fields":[
+				{"name":"x","type":"int"}
+			]}}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	canon := string(s.Canonical())
+	// The child should not have com.example prefix because namespace was
+	// explicitly cleared.
+	if strings.Contains(canon, "com.example.child") {
+		t.Fatalf("expected empty namespace to clear parent, got %s", canon)
 	}
 }

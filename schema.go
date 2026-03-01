@@ -2,32 +2,93 @@ package avro
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
-	"regexp"
+	"math"
 	"strings"
 )
 
+// Schema is a compiled Avro schema. Create one with [Parse] or [MustParse],
+// then use [Schema.Encode] / [Schema.Decode] to convert between Go values and
+// Avro binary. A Schema is safe for concurrent use.
 type Schema struct {
 	ser   serfn
 	deser deserfn
 
-	c aschema
+	c    aschema
+	soe  [10]byte    // 2-byte magic (0xC3, 0x01) + 8-byte LE CRC64-Avro fingerprint
+	node *schemaNode // full metadata tree (aliases, defaults, etc.)
+	full string      // original schema JSON, returned by String()
 }
 
-func NewSchema(schema string) (*Schema, error) {
-	var orig aschema
-	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
-		return nil, fmt.Errorf("invalid schema: %v", err)
-	}
+// schemaNode preserves full schema metadata that canonical form strips:
+// aliases, defaults, enum defaults, and links to compiled ser/deser.
+type schemaNode struct {
+	kind        string        // "null","boolean","int","long","float","double","bytes","string","record","enum","array","map","fixed","union"
+	name        string        // fully-qualified name (named types only)
+	aliases     []string      // named type aliases (fully qualified)
+	logical     string        // logical type
+	fields      []fieldNode   // record fields
+	symbols     []string      // enum symbols
+	enumDef     string        // enum default symbol
+	hasEnumDef  bool          // whether enum default is specified
+	items       *schemaNode   // array item type
+	values      *schemaNode   // map value type
+	size        int           // fixed size
+	precision   int           // decimal precision
+	scale       int           // decimal scale
+	branches    []*schemaNode // union branches
+	ser         serfn
+	deser       deserfn
+	serRecord   *serRecord
+	deserRecord *deserRecord
+}
 
+// fieldNode represents a record field with full metadata.
+type fieldNode struct {
+	name       string
+	aliases    []string
+	node       *schemaNode
+	defaultVal any
+	hasDefault bool
+}
+
+// MustParse is like [Parse] but panics on error. Useful for package-level
+// var declarations.
+func MustParse(schema string) *Schema {
+	s, err := Parse(schema)
+	if err != nil {
+		panic("avro: " + err.Error())
+	}
+	return s
+}
+
+// Parse parses an Avro JSON schema string and returns a compiled [*Schema].
+// The input can be a primitive name (e.g. `"string"`), a JSON object
+// (record, enum, array, map, fixed), or a JSON array (union). Named types
+// may reference each other and self-reference. The schema is fully validated:
+// unknown types, duplicate names, invalid defaults, etc. all return errors.
+//
+// To parse schemas that reference named types from other schemas, use
+// [SchemaCache].
+func Parse(schema string) (*Schema, error) {
 	b := &builder{
 		types:   make(map[string]serfn),
 		dtypes:  make(map[string]deserfn),
 		stypes:  make(map[string]*serRecord),
 		drtypes: make(map[string]*deserRecord),
+		ntypes:  make(map[string]*schemaNode),
+	}
+	return parse(schema, b)
+}
+
+func parse(schema string, b *builder) (*Schema, error) {
+	var orig aschema
+	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
+		return nil, fmt.Errorf("invalid schema: %v", err)
 	}
 	if err := b.build("", &orig); err != nil {
 		return nil, err
@@ -35,21 +96,40 @@ func NewSchema(schema string) (*Schema, error) {
 	if err := b.finalize(); err != nil {
 		return nil, err
 	}
-	return &Schema{
+	s := &Schema{
 		ser:   b.ser,
 		deser: b.deser,
 		c:     b.canon,
-	}, nil
+		node:  b.node,
+		full:  schema,
+	}
+	s.soe[0] = 0xC3
+	s.soe[1] = 0x01
+	h := NewRabin()
+	h.Write(s.Canonical())
+	binary.LittleEndian.PutUint64(s.soe[2:], h.Sum64())
+	return s, nil
 }
 
+// Canonical returns the Parsing Canonical Form of the schema, stripping
+// doc, aliases, defaults, and other non-essential attributes. The result is
+// deterministic and suitable for comparison and fingerprinting.
 func (s *Schema) Canonical() []byte {
 	b, _ := json.Marshal(s.c)
 	return b
 }
 
+// Fingerprint hashes the schema's canonical form with h. Use [NewRabin] for
+// CRC-64-AVRO or crypto/sha256 for cross-language compatibility.
 func (s *Schema) Fingerprint(h hash.Hash) []byte {
 	h.Write(s.Canonical())
 	return h.Sum(nil)
+}
+
+// String returns the original JSON passed to [Parse], preserving all
+// attributes (doc, aliases, defaults, etc.) unlike [Schema.Canonical].
+func (s *Schema) String() string {
+	return s.full
 }
 
 type aschema struct {
@@ -94,8 +174,9 @@ type afield struct {
 
 	// In canonical form, the following are stripped.
 
-	Aliases []string `json:"aliases,omitempty"`
+	Aliases []string        `json:"aliases,omitempty"`
 	Default json.RawMessage `json:"default,omitempty"`
+	Order   string          `json:"order,omitempty"`
 }
 
 type aobject struct {
@@ -114,7 +195,7 @@ type aobject struct {
 
 	// In canonical form, the following are stripped.
 
-	Namespace string          `json:"namespace,omitempty"`
+	Namespace *string         `json:"namespace,omitempty"`
 	Aliases   []string        `json:"aliases,omitempty"`
 	Default   json.RawMessage `json:"default,omitempty"`
 
@@ -125,6 +206,7 @@ type aobject struct {
 
 var acomplex = map[string]struct{}{
 	"record": {},
+	"error":  {},
 	"enum":   {},
 	"array":  {},
 	"map":    {},
@@ -147,6 +229,7 @@ type fieldMeta struct {
 	serRecord   *serRecord
 	deserRecord *deserRecord
 	inner       *fieldMeta
+	nullSecond  bool // true for ["T","null"] unions (null is index 1)
 }
 
 type metaFixup struct {
@@ -154,20 +237,32 @@ type metaFixup struct {
 	name string
 }
 
+type recordFieldFixup struct {
+	sr   *serRecord
+	dr   *deserRecord
+	nd   *schemaNode
+	idx  int
+	name string
+}
+
 type builder struct {
 	ser   serfn
 	deser deserfn
 
-	types    map[string]serfn
-	dtypes   map[string]deserfn
-	stypes   map[string]*serRecord
-	drtypes  map[string]*deserRecord
-	missing  []unionMissing
-	dmissing []unionMissingDeser
-	mfixups  []metaFixup
+	types       map[string]serfn
+	dtypes      map[string]deserfn
+	stypes      map[string]*serRecord
+	drtypes     map[string]*deserRecord
+	missing     []unionMissing
+	dmissing    []unionMissingDeser
+	mfixups     []metaFixup
+	fieldFixups []recordFieldFixup
+
+	ntypes map[string]*schemaNode
 
 	meta  fieldMeta
 	canon aschema
+	node  *schemaNode
 }
 
 func (b *builder) nest() *builder {
@@ -176,6 +271,7 @@ func (b *builder) nest() *builder {
 		dtypes:  b.dtypes,
 		stypes:  b.stypes,
 		drtypes: b.drtypes,
+		ntypes:  b.ntypes,
 	}
 }
 
@@ -183,6 +279,7 @@ func (b *builder) unnest(nest *builder) {
 	b.missing = append(b.missing, nest.missing...)
 	b.dmissing = append(b.dmissing, nest.dmissing...)
 	b.mfixups = append(b.mfixups, nest.mfixups...)
+	b.fieldFixups = append(b.fieldFixups, nest.fieldFixups...)
 }
 
 func (b *builder) finalize() error {
@@ -204,6 +301,23 @@ func (b *builder) finalize() error {
 		m.meta.serRecord = b.stypes[m.name]
 		m.meta.deserRecord = b.drtypes[m.name]
 	}
+	for _, m := range b.fieldFixups {
+		ser := b.types[m.name]
+		if ser == nil {
+			return fmt.Errorf("unknown type %q", m.name)
+		}
+		m.sr.fields[m.idx].fn = ser
+		m.dr.fields[m.idx].fn = b.dtypes[m.name]
+		if sr := b.stypes[m.name]; sr != nil {
+			m.sr.fields[m.idx].avroType = "record"
+			m.sr.fields[m.idx].meta.avroType = "record"
+			m.sr.fields[m.idx].meta.serRecord = sr
+			m.dr.fields[m.idx].avroType = "record"
+			m.dr.fields[m.idx].meta.avroType = "record"
+			m.dr.fields[m.idx].meta.deserRecord = b.drtypes[m.name]
+		}
+		m.nd.fields[m.idx].node = b.ntypes[m.name]
+	}
 	return nil
 }
 
@@ -215,7 +329,7 @@ func (s *aschema) unionTypeName() (string, string, error) {
 		return "union", "", errors.New("unions cannot immediately contain other unions")
 	}
 	switch s.object.Type {
-	case "record", "fixed", "enum":
+	case "record", "error", "fixed", "enum":
 		return s.object.Type, s.object.Name, nil
 	default:
 		return s.object.Type, "", nil
@@ -226,11 +340,6 @@ type unknownPrimitiveError struct{ p string }
 
 func (e *unknownPrimitiveError) Error() string { return fmt.Sprintf("unknown primitive %q", e.p) }
 
-var (
-	reName      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	reNamespace = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$`)
-)
-
 func (b *builder) build(parentName string, s *aschema) error {
 	if s == nil || s.primitive == "" && s.object == nil && len(s.union) == 0 {
 		return errors.New("schema is not a primitive, complex, nor union")
@@ -238,7 +347,7 @@ func (b *builder) build(parentName string, s *aschema) error {
 
 	switch {
 	case s.primitive != "":
-		return b.buildPrimitive(s)
+		return b.buildPrimitive(parentName, s)
 	case len(s.union) != 0:
 		return b.buildUnion(parentName, s)
 	default:
@@ -246,23 +355,47 @@ func (b *builder) build(parentName string, s *aschema) error {
 	}
 }
 
-func (b *builder) buildPrimitive(s *aschema) error {
+func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 	b.canon = aschema{primitive: s.primitive}
 	b.meta = fieldMeta{avroType: s.primitive}
 	fn, exists := serPrimitive[s.primitive]
 	if exists {
 		b.ser = fn
 		b.deser = deserPrimitive[s.primitive]
+		b.node = &schemaNode{
+			kind:  s.primitive,
+			ser:   b.ser,
+			deser: b.deser,
+		}
 		return nil
 	}
 	// Check if this is a named type reference (record, enum, fixed).
-	if ser := b.types[s.primitive]; ser != nil {
+	name := s.primitive
+	if ser := b.types[name]; ser != nil {
 		b.ser = ser
-		b.deser = b.dtypes[s.primitive]
-		if sr := b.stypes[s.primitive]; sr != nil {
-			b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[s.primitive]}
+		b.deser = b.dtypes[name]
+		if sr := b.stypes[name]; sr != nil {
+			b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[name]}
 		}
+		b.node = b.ntypes[name]
 		return nil
+	}
+	// Try namespace-qualified lookup: if name is unqualified and parent
+	// has a namespace, try parentNamespace + "." + name.
+	if !strings.Contains(name, ".") && parentName != "" {
+		if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
+			qualified := parentName[:dot+1] + name
+			if ser := b.types[qualified]; ser != nil {
+				b.canon.primitive = qualified
+				b.ser = ser
+				b.deser = b.dtypes[qualified]
+				if sr := b.stypes[qualified]; sr != nil {
+					b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[qualified]}
+				}
+				b.node = b.ntypes[qualified]
+				return nil
+			}
+		}
 	}
 	return &unknownPrimitiveError{s.primitive}
 }
@@ -279,8 +412,8 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		deser       = new(deserUnion)
 		missing     = make(map[int]string)
 		sawTypes    = make(map[string]bool)
-		sawNames    = make(map[string]bool)
 		branchMetas = make([]fieldMeta, len(s.union))
+		branchNodes = make([]*schemaNode, len(s.union))
 	)
 
 	for i, us := range s.union {
@@ -293,23 +426,16 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		}
 		b.unnest(u)
 		branchMetas[i] = u.meta
+		branchNodes[i] = u.node
 
 		typ, name, err := us.unionTypeName()
 		if err != nil {
 			return err
 		}
-		if sawTypes[typ] {
-			if name == "" {
-				return fmt.Errorf("duplicate union type %q", typ)
-			}
-			if sawNames[name] {
-				return fmt.Errorf("duplicate union name %q", name)
-			}
+		if sawTypes[typ] && name == "" {
+			return fmt.Errorf("duplicate union type %q", typ)
 		}
 		sawTypes[typ] = true
-		if name != "" {
-			sawNames[name] = true
-		}
 
 		b.canon.union = append(b.canon.union, u.canon)
 		ser.fns = append(ser.fns, u.ser)
@@ -328,6 +454,18 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			*inner = branchMetas[1]
 			b.meta = fieldMeta{avroType: "nullunion", inner: inner}
 		}
+	} else if len(s.union) == 2 && s.union[1].primitive == "null" {
+		b.ser = serNullSecondUnion(ser)
+		b.deser = deserNullSecondUnion(deser)
+		if _, isMissing := missing[0]; isMissing {
+			inner := &fieldMeta{}
+			b.meta = fieldMeta{avroType: "nullunion", nullSecond: true, inner: inner}
+			b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: s.union[0].primitive})
+		} else {
+			inner := new(fieldMeta)
+			*inner = branchMetas[0]
+			b.meta = fieldMeta{avroType: "nullunion", nullSecond: true, inner: inner}
+		}
 	} else {
 		b.ser = ser.ser
 		b.deser = deser.deser
@@ -342,6 +480,12 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			deser,
 			missing,
 		})
+	}
+	b.node = &schemaNode{
+		kind:     "union",
+		branches: branchNodes,
+		ser:      b.ser,
+		deser:    b.deser,
 	}
 	return nil
 }
@@ -365,6 +509,15 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			b.deser = (&deserBytesDecimal{scale: scale}).deser
 			b.canon = aschema{primitive: o.Type}
 			b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
+			nd := &schemaNode{
+				kind:      o.Type,
+				logical:   o.Logical,
+				ser:       b.ser,
+				deser:     b.deser,
+				precision: *o.Precision,
+				scale:     scale,
+			}
+			b.node = nd
 			return nil
 		}
 		b.ser = ser
@@ -377,7 +530,28 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.canon = aschema{primitive: o.Type}
 		b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
+		nd := &schemaNode{
+			kind:    o.Type,
+			logical: o.Logical,
+			ser:     b.ser,
+			deser:   b.deser,
+		}
+		if o.Logical == "decimal" {
+			nd.precision = *o.Precision
+			if o.Scale != nil {
+				nd.scale = *o.Scale
+			}
+		}
+		b.node = nd
 		return nil
+	}
+
+	// Preserve original aliases and enum default before canonical stripping.
+	origAliases := s.object.Aliases
+	origEnumDefault := s.object.Default
+	origFieldAliases := make([][]string, len(s.object.Fields))
+	for i, f := range s.object.Fields {
+		origFieldAliases[i] = f.Aliases
 	}
 
 	o = &aobject{
@@ -399,28 +573,33 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	b.canon = aschema{object: o}
 
 	switch o.Type {
-	case "record", "enum", "fixed":
-		if !reName.MatchString(o.Name) {
-			if reNamespace.MatchString(o.Name) {
-				parentName, o.Namespace = "", "" // fullname: ignore parent & our own namespace
-			} else {
-				return fmt.Errorf("invalid name %q", o.Name)
-			}
+	case "record", "error", "enum", "fixed":
+		ns := ""
+		hasNS := false
+		if o.Namespace != nil {
+			ns = *o.Namespace
+			hasNS = true
 		}
-		if o.Namespace != "" {
-			if !reNamespace.MatchString(o.Namespace) {
-				return fmt.Errorf("invalid namespace %q", o.Namespace)
-			}
-			o.Name = o.Namespace + "." + o.Name // have namespace: prefix our name
-			o.Namespace = ""
+		if strings.Contains(o.Name, ".") {
+			// Fullname (dot-separated): ignore parent & our own namespace.
+			parentName = ""
+			hasNS = false
+		}
+		if hasNS && ns != "" {
+			o.Name = ns + "." + o.Name // have namespace: prefix our name
+		} else if hasNS && ns == "" {
+			// Explicit empty namespace: clear inherited namespace.
 		} else if parentName != "" {
 			if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
 				o.Name = parentName[:dot+1] + o.Name // no namespace: prefix our name with parent namespace if there is one
-				o.Namespace = ""
 			}
 		}
+		o.Namespace = nil // canonical form omits namespace
+		if _, exists := b.ntypes[o.Name]; exists {
+			return fmt.Errorf("duplicate named type %q", o.Name)
+		}
 	default:
-		if o.Name != "" || o.Namespace != "" {
+		if o.Name != "" || o.Namespace != nil {
 			return errors.New("only record, enum, and fixed can have a name")
 		}
 	}
@@ -429,7 +608,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	default:
 		return fmt.Errorf("unknown complex type %q", o.Type)
 
-	case "record":
+	case "record", "error":
 		if len(o.Symbols) > 0 ||
 			o.Items != nil ||
 			o.Values != nil ||
@@ -450,27 +629,51 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.drtypes[o.Name] = dr
 		b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: dr}
 
+		// Register schemaNode early for self-referencing records.
+		nd := &schemaNode{
+			kind:        "record",
+			name:        o.Name,
+			aliases:     qualifyAliases(origAliases, o.Name),
+			ser:         b.ser,
+			deser:       b.deser,
+			serRecord:   sr,
+			deserRecord: dr,
+		}
+		b.ntypes[o.Name] = nd
+		b.node = nd
+
 		var names []string
 		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
-			if !reName.MatchString(of.Name) {
-				return fmt.Errorf("invalid record field name %q", of.Name)
-			}
 			if seenFields[of.Name] {
 				return fmt.Errorf("duplicate record field name %q", of.Name)
 			}
 			seenFields[of.Name] = true
+			if of.Order != "" && of.Order != "ascending" && of.Order != "descending" && of.Order != "ignore" {
+				return fmt.Errorf("invalid field order %q for field %q", of.Order, of.Name)
+			}
 			bf := b.nest()
+			isFwdRef := false
+			fwdRefName := ""
 			if err := bf.build(o.Name, of.Type); err != nil {
-				return fmt.Errorf("invalid record field: %v", err)
+				if pe := (*unknownPrimitiveError)(nil); errors.As(err, &pe) && of.Type != nil && of.Type.primitive != "" {
+					isFwdRef = true
+					fwdRefName = of.Type.primitive
+				} else {
+					return fmt.Errorf("invalid record field: %v", err)
+				}
 			}
 			b.unnest(bf)
+			if isFwdRef {
+				bf.canon = aschema{primitive: fwdRefName}
+			}
 			o.Fields[i] = afield{
 				Name: of.Name,
 				Type: &bf.canon,
 			}
 			meta := new(fieldMeta)
 			*meta = bf.meta
+			fieldIdx := len(sr.fields)
 			sr.fields = append(sr.fields, serRecordField{
 				name:     of.Name,
 				fn:       bf.ser,
@@ -483,18 +686,48 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				avroType: meta.avroType,
 				meta:     meta,
 			}
+			fn := fieldNode{
+				name:    of.Name,
+				aliases: origFieldAliases[i],
+				node:    bf.node,
+			}
+			if isFwdRef {
+				b.fieldFixups = append(b.fieldFixups, recordFieldFixup{
+					sr:   sr,
+					dr:   dr,
+					nd:   nd,
+					idx:  fieldIdx,
+					name: fwdRefName,
+				})
+			}
 			if len(of.Default) > 0 {
 				var defaultVal any
 				// json.Unmarshal cannot fail: of.Default is a json.RawMessage
 				// preserved from the initial schema parse, so it is valid JSON.
 				json.Unmarshal(of.Default, &defaultVal) //nolint:errcheck
-				if err := validateDefault(defaultVal, &bf.canon); err != nil {
-					return fmt.Errorf("record field %q: invalid default: %v", of.Name, err)
+				// Skip default validation for forward references since we
+				// don't know the type yet.
+				if !isFwdRef {
+					if err := validateDefault(defaultVal, &bf.canon); err != nil {
+						return fmt.Errorf("record field %q: invalid default: %v", of.Name, err)
+					}
 				}
 				drf.defaultVal = defaultVal
 				drf.hasDefault = true
+				fn.defaultVal = defaultVal
+				fn.hasDefault = true
+				// Pre-encode the default to Avro binary for use
+				// when encoding maps with missing keys. Non-fatal:
+				// if encoding fails, map encoding will require the key.
+				if !isFwdRef && bf.node != nil {
+					if defaultBytes, err := encodeDefault(defaultVal, bf.node); err == nil {
+						sr.fields[fieldIdx].defaultBytes = defaultBytes
+						sr.fields[fieldIdx].hasDefault = true
+					}
+				}
 			}
 			dr.fields = append(dr.fields, drf)
+			nd.fields = append(nd.fields, fn)
 			names = append(names, of.Name)
 		}
 		sr.names = names
@@ -510,9 +743,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 
 		seenSymbols := make(map[string]bool, len(o.Symbols))
 		for _, e := range o.Symbols {
-			if !reName.MatchString(e) {
-				return fmt.Errorf("invalid enum symbol %q", e)
-			}
 			if seenSymbols[e] {
 				return fmt.Errorf("duplicate enum symbol %q", e)
 			}
@@ -520,7 +750,26 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.ser = (&serEnum{symbols: o.Symbols}).ser
 		b.deser = (&deserEnum{symbols: o.Symbols}).deser
+		b.types[o.Name] = b.ser
+		b.dtypes[o.Name] = b.deser
 		b.meta = fieldMeta{avroType: "enum"}
+
+		nd := &schemaNode{
+			kind:    "enum",
+			name:    o.Name,
+			aliases: qualifyAliases(origAliases, o.Name),
+			symbols: o.Symbols,
+			ser:     b.ser,
+			deser:   b.deser,
+		}
+		if len(origEnumDefault) > 0 {
+			var defStr string
+			json.Unmarshal(origEnumDefault, &defStr) //nolint:errcheck
+			nd.enumDef = defStr
+			nd.hasEnumDef = true
+		}
+		b.ntypes[o.Name] = nd
+		b.node = nd
 
 	case "array":
 		if len(o.Fields) > 0 ||
@@ -543,6 +792,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		inner := new(fieldMeta)
 		*inner = af.meta
 		b.meta = fieldMeta{avroType: "array", inner: inner}
+		b.node = &schemaNode{
+			kind:  "array",
+			items: af.node,
+			ser:   b.ser,
+			deser: b.deser,
+		}
 
 	case "map":
 		if len(o.Fields) > 0 ||
@@ -563,6 +818,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.ser = (&serMap{mf.ser}).ser
 		b.deser = (&deserMap{mf.deser}).deser
 		b.meta = fieldMeta{avroType: "map"}
+		b.node = &schemaNode{
+			kind:   "map",
+			values: mf.node,
+			ser:    b.ser,
+			deser:  b.deser,
+		}
 
 	case "fixed":
 		if len(o.Fields) > 0 ||
@@ -577,7 +838,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if *o.Size < 0 {
 			return fmt.Errorf("invalid fixed size %v", *o.Size)
 		}
-		switch o.Logical {
+		switch s.object.Logical {
 		case "duration":
 			b.ser = serDuration
 			b.deser = deserDuration
@@ -592,9 +853,48 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			b.ser = (&serSize{*o.Size}).ser
 			b.deser = (&deserFixed{*o.Size}).deser
 		}
-		b.meta = fieldMeta{avroType: "fixed", logical: o.Logical}
+		b.types[o.Name] = b.ser
+		b.dtypes[o.Name] = b.deser
+		b.meta = fieldMeta{avroType: "fixed", logical: s.object.Logical}
+		nd := &schemaNode{
+			kind:    "fixed",
+			name:    o.Name,
+			aliases: qualifyAliases(origAliases, o.Name),
+			logical: s.object.Logical,
+			size:    *o.Size,
+			ser:     b.ser,
+			deser:   b.deser,
+		}
+		if s.object.Logical == "decimal" && s.object.Precision != nil {
+			nd.precision = *s.object.Precision
+			if s.object.Scale != nil {
+				nd.scale = *s.object.Scale
+			}
+		}
+		b.node = nd
+		b.ntypes[o.Name] = b.node
 	}
 	return nil
+}
+
+// qualifyAliases fully qualifies alias names using the parent name's namespace.
+func qualifyAliases(aliases []string, fullname string) []string {
+	if len(aliases) == 0 {
+		return nil
+	}
+	ns := ""
+	if dot := strings.LastIndexByte(fullname, '.'); dot >= 0 {
+		ns = fullname[:dot+1]
+	}
+	out := make([]string, len(aliases))
+	for i, a := range aliases {
+		if strings.ContainsRune(a, '.') {
+			out[i] = a // already fully qualified
+		} else {
+			out[i] = ns + a
+		}
+	}
+	return out
 }
 
 func (o *aobject) validateLogical() error {
@@ -606,18 +906,35 @@ func (o *aobject) validateLogical() error {
 		if o.Precision == nil {
 			return errors.New("logicalType decimal missing precision")
 		}
+		if *o.Precision <= 0 {
+			return fmt.Errorf("logicalType decimal precision must be positive, got %d", *o.Precision)
+		}
 		if o.Type != "bytes" && o.Type != "fixed" {
 			return fmt.Errorf("invalid logicalType decimal type %q, can only be bytes or fixed", o.Type)
+		}
+		scale := 0
+		if o.Scale != nil {
+			scale = *o.Scale
+		}
+		if scale < 0 || scale > *o.Precision {
+			return fmt.Errorf("logicalType decimal scale %d must be in [0, precision=%d]", scale, *o.Precision)
+		}
+		if o.Type == "fixed" && o.Size != nil {
+			// Per spec: precision ≤ floor(log10(2^(8*size-1) - 1)).
+			// Simplified: max unscaled value fits in (8*size - 1) bits.
+			maxDigits := maxDecimalDigits(*o.Size)
+			if *o.Precision > maxDigits {
+				return fmt.Errorf("logicalType decimal precision %d exceeds maximum %d for fixed size %d", *o.Precision, maxDigits, *o.Size)
+			}
 		}
 		return nil
 
 	case "uuid":
-		if o.Type != "string" {
-			return fmt.Errorf("invalid logicalType uuid type %q, can only be string", o.Type)
+		if o.Type != "string" && !(o.Type == "fixed" && o.Size != nil && *o.Size == 16) {
+			return fmt.Errorf("invalid logicalType uuid type %q, must be string or fixed(16)", o.Type)
 		}
 
-	case "date",
-		"time-millis":
+	case "date", "time-millis":
 		if o.Type != "int" {
 			return fmt.Errorf("invalid logicalType %s type %q, can only be int", o.Logical, o.Type)
 		}
@@ -625,10 +942,17 @@ func (o *aobject) validateLogical() error {
 	case "time-micros",
 		"timestamp-millis",
 		"timestamp-micros",
+		"timestamp-nanos",
 		"local-timestamp-millis",
-		"local-timestamp-micros":
+		"local-timestamp-micros",
+		"local-timestamp-nanos":
 		if o.Type != "long" {
 			return fmt.Errorf("invalid logicalType %s type %q, can only be long", o.Logical, o.Type)
+		}
+
+	case "big-decimal":
+		if o.Type != "bytes" {
+			return fmt.Errorf("invalid logicalType big-decimal type %q, can only be bytes", o.Type)
 		}
 
 	case "duration":
@@ -656,6 +980,18 @@ func (o *aobject) validateLogical() error {
 	return nil
 }
 
+// maxDecimalDigits returns the maximum number of decimal digits that fit in
+// a two's-complement signed integer of the given byte size:
+// floor(log10(2^(8*size-1) - 1)).
+func maxDecimalDigits(size int) int {
+	if size <= 0 {
+		return 0
+	}
+	bits := 8*size - 1 // sign bit excluded
+	// log10(2^bits - 1) ≈ bits * log10(2)
+	return int(math.Floor(float64(bits) * math.Log10(2)))
+}
+
 // logicalSer returns a time-aware serializer for a given logical type,
 // or nil if the logical type doesn't have special serialization.
 func logicalSer(logical string) serfn {
@@ -664,12 +1000,16 @@ func logicalSer(logical string) serfn {
 		return serTimestampMillis
 	case "timestamp-micros", "local-timestamp-micros":
 		return serTimestampMicros
+	case "timestamp-nanos", "local-timestamp-nanos":
+		return serTimestampNanos
 	case "date":
 		return serDate
 	case "time-millis":
 		return serTimeMillis
 	case "time-micros":
 		return serTimeMicros
+	case "uuid":
+		return serUUID
 	default:
 		return nil
 	}
@@ -683,12 +1023,16 @@ func logicalDeser(logical string) deserfn {
 		return deserTimestampMillis
 	case "timestamp-micros", "local-timestamp-micros":
 		return deserTimestampMicros
+	case "timestamp-nanos", "local-timestamp-nanos":
+		return deserTimestampNanos
 	case "date":
 		return deserDate
 	case "time-millis":
 		return deserTimeMillis
 	case "time-micros":
 		return deserTimeMicros
+	case "uuid":
+		return deserUUID
 	default:
 		return nil
 	}
@@ -706,7 +1050,7 @@ func validateDefault(val any, s *aschema) error {
 	}
 	if s.object != nil {
 		switch s.object.Type {
-		case "record":
+		case "record", "error":
 			if _, ok := val.(map[string]any); !ok && val != nil {
 				return fmt.Errorf("expected object for record default, got %T", val)
 			}

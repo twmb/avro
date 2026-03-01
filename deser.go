@@ -2,6 +2,7 @@ package avro
 
 import (
 	"encoding"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -35,7 +36,27 @@ func (s *slab) string(src []byte, n int) string {
 
 var slabPool = sync.Pool{New: func() any { return &slab{} }}
 
-func (s *Schema) Decode(src []byte, v interface{}) ([]byte, error) {
+// Decode reads Avro binary from src into v and returns the remaining bytes.
+// v must be a non-nil pointer to a type compatible with the schema:
+//
+//   - null: any (always decodes to nil)
+//   - boolean: bool, any
+//   - int, long: int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, any
+//   - float: float32, float64, any
+//   - double: float64, float32, any
+//   - string: string, []byte, any; also [encoding.TextUnmarshaler]
+//   - bytes: []byte, string, any
+//   - enum: string, int/int8/.../uint64 (ordinal), any
+//   - fixed: [N]byte, []byte, any
+//   - array: slice, any
+//   - map: map[string]T, any
+//   - union: any, *T (for ["null", T] unions), or the matched branch type
+//   - record: struct (matched by field name or `avro` tag), map[string]any, any
+//
+// When decoding into any (interface{}), values are returned as their natural
+// Go types: nil, bool, int64, float32, float64, string, []byte, []any,
+// map[string]any, or map[string]any for records.
+func (s *Schema) Decode(src []byte, v any) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, errors.New("decode requires a non-nil pointer")
@@ -78,13 +99,39 @@ func deserNullUnion(u *deserUnion) deserfn {
 			}
 			return src[1:], nil
 		case 2:
-			if v.Kind() == reflect.Ptr {
+			if v.Kind() == reflect.Pointer {
 				if v.IsNil() {
 					v.Set(reflect.New(v.Type().Elem()))
 				}
 				return u.fns[1](src[1:], v.Elem(), sl)
 			}
 			return u.fns[1](src[1:], v, sl)
+		default:
+			return nil, fmt.Errorf("invalid null-union index byte 0x%02x", src[0])
+		}
+	}
+}
+
+func deserNullSecondUnion(u *deserUnion) deserfn {
+	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+		if len(src) < 1 {
+			return nil, &ShortBufferError{Type: "union index"}
+		}
+		switch src[0] {
+		case 0: // index 0: the T branch
+			if v.Kind() == reflect.Pointer {
+				if v.IsNil() {
+					v.Set(reflect.New(v.Type().Elem()))
+				}
+				return u.fns[0](src[1:], v.Elem(), sl)
+			}
+			return u.fns[0](src[1:], v, sl)
+		case 2: // index 1: null
+			switch v.Kind() {
+			case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
+				v.Set(reflect.Zero(v.Type()))
+			}
+			return src[1:], nil
 		default:
 			return nil, fmt.Errorf("invalid null-union index byte 0x%02x", src[0])
 		}
@@ -294,8 +341,8 @@ type deserRecordField struct {
 type deserRecord struct {
 	fields []deserRecordField
 	names  []string
-	cache  sync.Map                         // map[reflect.Type]*cachedMapping
-	fast   atomic.Pointer[fastRecordDeser]  // precompiled unsafe fast path
+	cache  sync.Map                        // map[reflect.Type]*cachedMapping
+	fast   atomic.Pointer[fastRecordDeser] // precompiled unsafe fast path
 }
 
 func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -418,6 +465,9 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 				return nil, err
 			}
 		}
+		if count > int64(len(src)) {
+			return nil, fmt.Errorf("array block count %d exceeds remaining buffer length %d", count, len(src))
+		}
 		n := int(count)
 		start := sliceVal.Len()
 		newLen := start + n
@@ -432,10 +482,10 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			sliceVal.SetLen(newLen)
 		}
 		elemType := sliceVal.Type().Elem()
-		if elemType.Kind() == reflect.Ptr {
+		if elemType.Kind() == reflect.Pointer {
 			innerType := elemType.Elem()
 			backing := reflect.MakeSlice(reflect.SliceOf(innerType), n, n)
-			for i := 0; i < n; i++ {
+			for i := range n {
 				sliceVal.Index(start + i).Set(backing.Index(i).Addr())
 			}
 		}
@@ -496,6 +546,9 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 				return nil, err
 			}
 		}
+		if count > int64(len(src)) {
+			return nil, fmt.Errorf("map block count %d exceeds remaining buffer length %d", count, len(src))
+		}
 		for range int(count) {
 			var keyLen int64
 			keyLen, src, err = readVarlong(src)
@@ -534,6 +587,12 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		return src[s.n:], nil
 	}
 	t := v.Type()
+	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
+		b := make([]byte, s.n)
+		copy(b, src[:s.n])
+		v.Set(reflect.ValueOf(b))
+		return src[s.n:], nil
+	}
 	if t.Kind() != reflect.Array || t.Elem().Kind() != reflect.Uint8 {
 		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
@@ -580,6 +639,30 @@ func deserTimestampMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 	v = indirectAlloc(v)
 	if v.Type() == timeType {
 		v.Set(reflect.ValueOf(time.UnixMicro(val)))
+		return src, nil
+	}
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return src, nil
+	}
+	if v.CanInt() {
+		v.SetInt(val)
+	} else if v.CanUint() {
+		v.SetUint(uint64(val))
+	} else {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+	}
+	return src, nil
+}
+
+func deserTimestampNanos(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	v = indirectAlloc(v)
+	if v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.Unix(val/1e9, val%1e9)))
 		return src, nil
 	}
 	if v.Kind() == reflect.Interface {
@@ -652,6 +735,9 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Type() == durationType {
+		if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
+			return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
+		}
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
 		return src, nil
 	}
@@ -756,4 +842,72 @@ func bytesToBigInt(b []byte) *big.Int {
 		i.Sub(i, modulus)
 	}
 	return i
+}
+
+// parseUUID parses an RFC 4122 hex-dash UUID string into a [16]byte.
+func parseUUID(s string) ([16]byte, error) {
+	var u [16]byte
+	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return u, fmt.Errorf("invalid UUID %q", s)
+	}
+	_, err := hex.Decode(u[0:4], []byte(s[0:8]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	_, err = hex.Decode(u[4:6], []byte(s[9:13]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	_, err = hex.Decode(u[6:8], []byte(s[14:18]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	_, err = hex.Decode(u[8:10], []byte(s[19:23]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	_, err = hex.Decode(u[10:16], []byte(s[24:36]))
+	if err != nil {
+		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	return u, nil
+}
+
+func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	length, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("invalid negative string length %d", length)
+	}
+	n := int(length)
+	if len(src) < n {
+		return nil, &ShortBufferError{Type: "string", Need: n, Have: len(src)}
+	}
+	s := string(src[:n])
+	v = indirectAlloc(v)
+	if isUUIDType(v.Type()) {
+		u, err := parseUUID(s)
+		if err != nil {
+			return nil, err
+		}
+		reflect.Copy(v, reflect.ValueOf(u))
+		return src[n:], nil
+	}
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(s))
+		return src[n:], nil
+	}
+	if v.Kind() == reflect.String {
+		v.SetString(s)
+		return src[n:], nil
+	}
+	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
+		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(s)); err != nil {
+			return nil, err
+		}
+		return src[n:], nil
+	}
+	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 }

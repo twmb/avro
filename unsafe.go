@@ -124,7 +124,7 @@ func compileFastDeser(fields []deserRecordField, names []string, cache *sync.Map
 func computeFieldOffset(t reflect.Type, index []int) (uintptr, reflect.Type, bool) {
 	var offset uintptr
 	for _, i := range index {
-		if t.Kind() == reflect.Ptr {
+		if t.Kind() == reflect.Pointer {
 			return 0, nil, false
 		}
 		f := t.Field(i)
@@ -213,22 +213,23 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		return nil
 	}
 
-	// Null-union: *T mapped to ["null", T].
+	// Null-union: *T mapped to ["null", T] or [T, "null"].
 	if f.avroType == "nullunion" {
-		if k != reflect.Ptr {
+		if k != reflect.Pointer {
 			return nil
 		}
 		if f.meta == nil || f.meta.inner == nil {
 			return nil
 		}
+		nullByte, valByte := nullUnionBytes(f.meta.nullSecond)
 		inner := f.meta.inner
 		innerGoType := goType.Elem()
 		if inner.serRecord != nil {
-			return usNullUnionRecord(inner.serRecord, innerGoType)
+			return usNullUnionRecord(inner.serRecord, innerGoType, nullByte, valByte)
 		}
 		innerFn := tryCompileFieldSer(&serRecordField{avroType: inner.avroType, meta: inner}, innerGoType)
 		if innerFn != nil {
-			return usNullUnionPtr(innerFn)
+			return usNullUnionPtr(innerFn, nullByte, valByte)
 		}
 		return nil
 	}
@@ -245,15 +246,16 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		elemGoType := goType.Elem()
 		switch inner.avroType {
 		case "nullunion":
-			if elemGoType.Kind() != reflect.Ptr {
+			if elemGoType.Kind() != reflect.Pointer {
 				return nil
 			}
+			nullByte, valByte := nullUnionBytes(inner.nullSecond)
 			if inner.inner != nil && inner.inner.serRecord != nil {
-				return usArrayNullUnionRecord(inner.inner.serRecord, elemGoType.Elem())
+				return usArrayNullUnionRecord(inner.inner.serRecord, elemGoType.Elem(), nullByte, valByte)
 			}
 			innerFn := tryCompileFieldSer(&serRecordField{avroType: inner.inner.avroType, meta: inner.inner}, elemGoType.Elem())
 			if innerFn != nil {
-				return usArrayNullUnionPtr(innerFn)
+				return usArrayNullUnionPtr(innerFn, nullByte, valByte)
 			}
 		case "record":
 			if inner.serRecord != nil {
@@ -285,7 +287,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		}
 	}
 
-	if k == reflect.Ptr {
+	if k == reflect.Pointer {
 		inner := tryCompileFieldSer(f, goType.Elem())
 		if inner == nil {
 			return nil
@@ -301,7 +303,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 
 	// Logical type fast paths for time.Time and time.Duration.
 	if f.meta != nil && f.meta.logical != "" {
-		return tryCompileLogicalSer(f.meta.logical, goType)
+		return tryCompileLogicalSer(f.meta.logical, f.avroType, goType)
 	}
 
 	switch f.avroType {
@@ -340,22 +342,23 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		return nil
 	}
 
-	// Null-union: *T mapped to ["null", T].
+	// Null-union: *T mapped to ["null", T] or [T, "null"].
 	if f.avroType == "nullunion" {
-		if k != reflect.Ptr {
+		if k != reflect.Pointer {
 			return nil
 		}
 		if f.meta == nil || f.meta.inner == nil {
 			return nil
 		}
+		nullByte, valByte := nullUnionBytes(f.meta.nullSecond)
 		inner := f.meta.inner
 		innerGoType := goType.Elem()
 		if inner.deserRecord != nil {
-			return udNullUnionRecord(inner.deserRecord, innerGoType)
+			return udNullUnionRecord(inner.deserRecord, innerGoType, nullByte, valByte)
 		}
 		innerFn := tryCompileFieldDeser(&deserRecordField{avroType: inner.avroType, meta: inner}, innerGoType)
 		if innerFn != nil {
-			return udNullUnionPtr(innerFn, innerGoType)
+			return udNullUnionPtr(innerFn, innerGoType, nullByte, valByte)
 		}
 		return nil
 	}
@@ -372,7 +375,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		elemGoType := goType.Elem()
 		switch inner.avroType {
 		case "record":
-			if inner.deserRecord != nil && elemGoType.Kind() == reflect.Ptr {
+			if inner.deserRecord != nil && elemGoType.Kind() == reflect.Pointer {
 				return udArrayPtrRecord(inner.deserRecord, elemGoType.Elem(), goType)
 			}
 		default:
@@ -402,13 +405,13 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 	}
 
 	// Pointer fields need GC write barriers for allocation; use slow path.
-	if k == reflect.Ptr {
+	if k == reflect.Pointer {
 		return nil
 	}
 
 	// Logical type fast paths for time.Time and time.Duration.
 	if f.meta != nil && f.meta.logical != "" {
-		return tryCompileLogicalDeser(f.meta.logical, goType)
+		return tryCompileLogicalDeser(f.meta.logical, f.avroType, goType)
 	}
 
 	switch f.avroType {
@@ -439,7 +442,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 
 // ---- Logical type unsafe serializers ----
 
-func tryCompileLogicalSer(logical string, goType reflect.Type) userfn {
+func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn {
 	switch logical {
 	case "timestamp-millis", "local-timestamp-millis":
 		if goType == timeType {
@@ -449,6 +452,11 @@ func tryCompileLogicalSer(logical string, goType reflect.Type) userfn {
 	case "timestamp-micros", "local-timestamp-micros":
 		if goType == timeType {
 			return usTimestampMicros
+		}
+		return usLong(goType.Kind())
+	case "timestamp-nanos", "local-timestamp-nanos":
+		if goType == timeType {
+			return usTimestampNanos
 		}
 		return usLong(goType.Kind())
 	case "date":
@@ -471,12 +479,21 @@ func tryCompileLogicalSer(logical string, goType reflect.Type) userfn {
 			return usDuration
 		}
 		return nil
-	default:
-		return nil
+	case "uuid":
+		if avroType == "fixed" {
+			return nil // fixed(16) UUID: use default fixed ser (raw bytes)
+		}
+		if isUUIDType(goType) {
+			return usUUID
+		}
+		if goType.Kind() == reflect.String {
+			return usString
+		}
 	}
+	return nil
 }
 
-func tryCompileLogicalDeser(logical string, goType reflect.Type) udeserfn {
+func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udeserfn {
 	switch logical {
 	case "timestamp-millis", "local-timestamp-millis":
 		if goType == timeType {
@@ -486,6 +503,11 @@ func tryCompileLogicalDeser(logical string, goType reflect.Type) udeserfn {
 	case "timestamp-micros", "local-timestamp-micros":
 		if goType == timeType {
 			return udTimestampMicros
+		}
+		return udLong(goType.Kind())
+	case "timestamp-nanos", "local-timestamp-nanos":
+		if goType == timeType {
+			return udTimestampNanos
 		}
 		return udLong(goType.Kind())
 	case "date":
@@ -508,9 +530,18 @@ func tryCompileLogicalDeser(logical string, goType reflect.Type) udeserfn {
 			return udDuration
 		}
 		return nil
-	default:
-		return nil
+	case "uuid":
+		if avroType == "fixed" {
+			return nil // fixed(16) UUID: use default fixed deser (raw bytes)
+		}
+		if isUUIDType(goType) {
+			return udUUID
+		}
+		if goType.Kind() == reflect.String {
+			return udStringDeser
+		}
 	}
+	return nil
 }
 
 func usTimestampMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -523,15 +554,23 @@ func usTimestampMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	return appendVarlong(dst, t.UnixMicro()), nil
 }
 
+func usTimestampNanos(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	t := *(*time.Time)(p)
+	return appendVarlong(dst, timeToUnixNanos(t)), nil
+}
+
 func usDate(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	t := *(*time.Time)(p)
-	days := int32(t.Unix() / 86400)
-	return appendVarint(dst, days), nil
+	return appendVarint(dst, int32(floorDiv(t.Unix(), 86400))), nil
 }
 
 func usTimeMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	d := *(*time.Duration)(p)
-	return appendVarint(dst, int32(d.Milliseconds())), nil
+	ms := d.Milliseconds()
+	if ms < math.MinInt32 || ms > math.MaxInt32 {
+		return nil, fmt.Errorf("duration %v overflows Avro time-millis (int32)", d)
+	}
+	return appendVarint(dst, int32(ms)), nil
 }
 
 func usTimeMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -554,6 +593,15 @@ func udTimestampMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	*(*time.Time)(p) = time.UnixMicro(val)
+	return src, nil
+}
+
+func udTimestampNanos(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+	val, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	*(*time.Time)(p) = time.Unix(val/1e9, val%1e9)
 	return src, nil
 }
 
@@ -580,6 +628,9 @@ func udTimeMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
+		return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
+	}
 	*(*time.Duration)(p) = time.Duration(val) * time.Microsecond
 	return src, nil
 }
@@ -603,6 +654,32 @@ func udDuration(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src[12:], nil
 }
 
+func usUUID(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	u := *(*[16]byte)(p)
+	return doSerString(dst, uuidToString(u)), nil
+}
+
+func udUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+	length, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	if length < 0 {
+		return nil, fmt.Errorf("invalid negative string length %d", length)
+	}
+	n := int(length)
+	if len(src) < n {
+		return nil, &ShortBufferError{Type: "string", Need: n, Have: len(src)}
+	}
+	s := string(src[:n])
+	u, err := parseUUID(s)
+	if err != nil {
+		return nil, err
+	}
+	*(*[16]byte)(p) = u
+	return src[n:], nil
+}
+
 // ---- Unsafe serializers ----
 // These read values directly via unsafe.Pointer. No string→[]byte
 // conversions; all reads go through typed pointer dereferences.
@@ -618,7 +695,11 @@ func usInt(k reflect.Kind) userfn {
 	switch k {
 	case reflect.Int:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*int)(p))), nil
+			n := *(*int)(p)
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	case reflect.Int8:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -634,11 +715,19 @@ func usInt(k reflect.Kind) userfn {
 		}
 	case reflect.Int64:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*int64)(p))), nil
+			n := *(*int64)(p)
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	case reflect.Uint:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint)(p))), nil
+			n := *(*uint)(p)
+			if n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	case reflect.Uint8:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
@@ -650,11 +739,19 @@ func usInt(k reflect.Kind) userfn {
 		}
 	case reflect.Uint32:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint32)(p))), nil
+			n := *(*uint32)(p)
+			if n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	case reflect.Uint64:
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint64)(p))), nil
+			n := *(*uint64)(p)
+			if n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			return appendVarint(dst, int32(n)), nil
 		}
 	default:
 		return nil
@@ -1050,25 +1147,35 @@ func udBytesDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 
 // ---- Null-union unsafe ser/deser ----
 
+// nullUnionBytes returns the varint-encoded index bytes for null and value branches.
+// For null-first ["null", T]: null=0, val=2. For null-second [T, "null"]: null=2, val=0.
+func nullUnionBytes(nullSecond bool) (nullByte, valByte byte) {
+	if nullSecond {
+		return 2, 0
+	}
+	return 0, 2
+}
+
 // usNullUnionPtr handles null-union ser for *T where T has a primitive unsafe serializer.
-func usNullUnionPtr(inner userfn) userfn {
+// nullByte/valByte are the varint-encoded index bytes for null and value branches.
+func usNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 		pp := *(*unsafe.Pointer)(p)
 		if pp == nil {
-			return append(dst, 0), nil
+			return append(dst, nullByte), nil
 		}
-		return inner(append(dst, 2), pp)
+		return inner(append(dst, valByte), pp)
 	}
 }
 
 // usNullUnionRecord handles null-union ser for *T where T is a record.
-func usNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
+func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 		pp := *(*unsafe.Pointer)(p)
 		if pp == nil {
-			return append(dst, 0), nil
+			return append(dst, nullByte), nil
 		}
-		dst = append(dst, 2)
+		dst = append(dst, valByte)
 		if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
 			return serRecordFastPtr(dst, fast, pp)
 		}
@@ -1077,16 +1184,16 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
 }
 
 // udNullUnionPtr handles null-union deser for *T where T has a primitive unsafe deserializer.
-func udNullUnionPtr(inner udeserfn, innerType reflect.Type) udeserfn {
+func udNullUnionPtr(inner udeserfn, innerType reflect.Type, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "union index"}
 		}
 		switch src[0] {
-		case 0:
+		case nullByte:
 			*(*unsafe.Pointer)(p) = nil
 			return src[1:], nil
-		case 2:
+		case valByte:
 			pp := *(*unsafe.Pointer)(p)
 			if pp == nil {
 				v := reflect.New(innerType)
@@ -1101,16 +1208,16 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type) udeserfn {
 }
 
 // udNullUnionRecord handles null-union deser for *T where T is a record.
-func udNullUnionRecord(rec *deserRecord, innerType reflect.Type) udeserfn {
+func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "union index"}
 		}
 		switch src[0] {
-		case 0:
+		case nullByte:
 			*(*unsafe.Pointer)(p) = nil
 			return src[1:], nil
-		case 2:
+		case valByte:
 			pp := *(*unsafe.Pointer)(p)
 			if pp == nil {
 				v := reflect.New(innerType)
@@ -1131,7 +1238,7 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type) udeserfn {
 
 // usArrayRecord handles array ser for []T or []*T where items are records.
 func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
-	if elemGoType.Kind() == reflect.Ptr {
+	if elemGoType.Kind() == reflect.Pointer {
 		return usArrayPtrRecord(rec, elemGoType.Elem())
 	}
 	elemSize := elemGoType.Size()
@@ -1144,7 +1251,7 @@ func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 		}
 		data := unsafe.Pointer(unsafe.SliceData(bs))
 		var err error
-		for i := 0; i < n; i++ {
+		for i := range n {
 			elemP := unsafe.Add(data, uintptr(i)*elemSize)
 			if fast := rec.fast.Load(); fast != nil && fast.typ == elemGoType && fast.allFast {
 				dst, err = serRecordFastPtr(dst, fast, elemP)
@@ -1187,7 +1294,7 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 }
 
 // usArrayNullUnionRecord handles array ser for []*T where items are ["null", Record].
-func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
+func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 		s := *(*[]unsafe.Pointer)(p)
 		n := len(s)
@@ -1198,9 +1305,9 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
 		var err error
 		for _, pp := range s {
 			if pp == nil {
-				dst = append(dst, 0)
+				dst = append(dst, nullByte)
 			} else {
-				dst = append(dst, 2)
+				dst = append(dst, valByte)
 				if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
 					dst, err = serRecordFastPtr(dst, fast, pp)
 				} else {
@@ -1216,7 +1323,7 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type) userfn {
 }
 
 // usArrayNullUnionPtr handles array ser for []*T where items are ["null", primitive].
-func usArrayNullUnionPtr(inner userfn) userfn {
+func usArrayNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 		s := *(*[]unsafe.Pointer)(p)
 		n := len(s)
@@ -1227,9 +1334,9 @@ func usArrayNullUnionPtr(inner userfn) userfn {
 		var err error
 		for _, pp := range s {
 			if pp == nil {
-				dst = append(dst, 0)
+				dst = append(dst, nullByte)
 			} else {
-				dst, err = inner(append(dst, 2), pp)
+				dst, err = inner(append(dst, valByte), pp)
 				if err != nil {
 					return nil, err
 				}
@@ -1250,7 +1357,7 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 		}
 		data := unsafe.Pointer(unsafe.SliceData(bs))
 		var err error
-		for i := 0; i < n; i++ {
+		for i := range n {
 			dst, err = inner(dst, unsafe.Add(data, uintptr(i)*elemSize))
 			if err != nil {
 				return nil, err
@@ -1300,7 +1407,7 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 			s := *(*[]unsafe.Pointer)(p)
 			// Count how many elements need fresh allocation.
 			var need int
-			for i := 0; i < n; i++ {
+			for i := range n {
 				if s[start+i] == nil {
 					need++
 				}
@@ -1310,7 +1417,7 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 				backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
 				backingBase := backing.Index(0).Addr().UnsafePointer()
 				j := 0
-				for i := 0; i < n; i++ {
+				for i := range n {
 					if s[start+i] == nil {
 						s[start+i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
 						j++
@@ -1318,7 +1425,7 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 				}
 			}
 			// Deserialize each element.
-			for i := 0; i < n; i++ {
+			for i := range n {
 				elemP := s[start+i]
 				if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
 					src, err = deserRecordFastPtr(src, fast, elemP, sl)
