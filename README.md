@@ -2,16 +2,15 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/twmb/avro.svg)](https://pkg.go.dev/github.com/twmb/avro)
 
-Encode and decode [Avro](https://avro.apache.org/docs/current/specification/) binary data using Go reflection.
+Encode and decode [Avro](https://avro.apache.org/docs/current/specification/) binary data.
 
 Parse an Avro JSON schema, then encode and decode Go values directly — no
-code generation required. Supports the full Avro specification: all primitive
-and complex types, logical types, schema evolution, Object Container Files,
-Single Object Encoding, and fingerprinting.
+code generation required. Supports all primitive and complex types, logical
+types, schema evolution, Object Container Files, Single Object Encoding, and
+fingerprinting.
 
 ## Index
 
-- [Install](#install)
 - [Quick Start](#quick-start)
 - [Type Mapping](#type-mapping)
 - [Struct Tags](#struct-tags)
@@ -21,12 +20,6 @@ Single Object Encoding, and fingerprinting.
 - [Single Object Encoding](#single-object-encoding)
 - [Fingerprinting](#fingerprinting)
 - [Performance](#performance)
-
-## Install
-
-```sh
-go get github.com/twmb/avro
-```
 
 ## Quick Start
 
@@ -92,9 +85,8 @@ encoding and decoding.
 | union     | `any`, `*T` (for `["null", T]` unions), or the matched branch type |
 | record    | struct (matched by field name or `avro` tag), `map[string]any`, `any` |
 
-When decoding into `any` (`interface{}`), values use their natural Go types:
-`nil`, `bool`, `int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`,
-`map[string]any`.
+When decoding into `any`, values use their natural Go types: `nil`, `bool`,
+`int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`, `map[string]any`.
 
 Encoding also accepts `fmt.Stringer` and `encoding.TextMarshaler` for string
 schema types.
@@ -203,11 +195,21 @@ The following type promotions are supported:
 | float → double |
 | string ↔ bytes |
 
-Use `CheckCompatibility(writer, reader)` if you just want to check whether two
-schemas are compatible without building a resolved schema.
+`CheckCompatibility` checks whether two schemas are compatible without
+building a resolved schema. The direction you check depends on the guarantee
+you need:
 
-> **Note:** the argument order for `Resolve` and `CheckCompatibility` is
-> `(writer, reader)`, matching source-then-destination convention.
+```go
+// Backward: new schema can read old data.
+avro.CheckCompatibility(oldSchema, newSchema)
+
+// Forward: old schema can read new data.
+avro.CheckCompatibility(newSchema, oldSchema)
+
+// Full: check both directions.
+avro.CheckCompatibility(oldSchema, newSchema)
+avro.CheckCompatibility(newSchema, oldSchema)
+```
 
 ## Object Container Files
 
