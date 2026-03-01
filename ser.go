@@ -139,6 +139,16 @@ func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 			return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
 		}
 		return appendVarint(dst, int32(n)), nil
+	} else if v.CanFloat() {
+		f := v.Float()
+		n := math.Trunc(f)
+		if f != n {
+			return nil, fmt.Errorf("value %v is not a whole number for Avro int", f)
+		}
+		if n < math.MinInt32 || n > math.MaxInt32 {
+			return nil, fmt.Errorf("value %v overflows Avro int (int32)", f)
+		}
+		return appendVarint(dst, int32(n)), nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
 }
@@ -152,6 +162,16 @@ func serLong(dst []byte, v reflect.Value) ([]byte, error) {
 		return appendVarlong(dst, int64(v.Int())), nil
 	} else if v.CanUint() {
 		return appendVarlong(dst, int64(v.Uint())), nil
+	} else if v.CanFloat() {
+		f := v.Float()
+		n := math.Trunc(f)
+		if f != n {
+			return nil, fmt.Errorf("value %v is not a whole number for Avro long", f)
+		}
+		if n < -(1 << 63) || n >= 1<<63 {
+			return nil, fmt.Errorf("value %v overflows Avro long (int64)", f)
+		}
+		return appendVarlong(dst, int64(n)), nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
 }

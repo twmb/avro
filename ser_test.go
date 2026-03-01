@@ -2,7 +2,9 @@ package avro
 
 import (
 	"encoding"
+	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -715,5 +717,171 @@ func TestSerMapMissingFieldDefault(t *testing.T) {
 	m2 := map[string]any{"a": int32(1)}
 	if _, err := s.AppendEncode(nil, &m2); err == nil {
 		t.Fatal("expected error for missing field with no default")
+	}
+}
+
+func TestSerFloat64CoercionInt(t *testing.T) {
+	s, err := Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Whole float64 should encode as int.
+	v := float64(42)
+	dst, err := s.AppendEncode(nil, &v)
+	if err != nil {
+		t.Fatalf("encode float64(42) as int: %v", err)
+	}
+
+	var got int32
+	if _, err := s.Decode(dst, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != 42 {
+		t.Fatalf("expected 42, got %d", got)
+	}
+
+	// Non-whole float64 should error.
+	bad := float64(42.5)
+	if _, err := s.AppendEncode(nil, &bad); err == nil {
+		t.Fatal("expected error for non-whole float64")
+	}
+
+	// Overflow should error.
+	big := float64(1 << 33)
+	if _, err := s.AppendEncode(nil, &big); err == nil {
+		t.Fatal("expected error for float64 overflow of int32")
+	}
+
+	// Negative overflow should error.
+	negbig := float64(-(1 << 33))
+	if _, err := s.AppendEncode(nil, &negbig); err == nil {
+		t.Fatal("expected error for negative float64 overflow of int32")
+	}
+
+	// Boundary values should work.
+	maxv := float64(math.MaxInt32)
+	dst, err = s.AppendEncode(nil, &maxv)
+	if err != nil {
+		t.Fatalf("encode MaxInt32 as float64: %v", err)
+	}
+	if _, err := s.Decode(dst, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != math.MaxInt32 {
+		t.Fatalf("expected %d, got %d", int32(math.MaxInt32), got)
+	}
+
+	minv := float64(math.MinInt32)
+	dst, err = s.AppendEncode(nil, &minv)
+	if err != nil {
+		t.Fatalf("encode MinInt32 as float64: %v", err)
+	}
+	if _, err := s.Decode(dst, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != math.MinInt32 {
+		t.Fatalf("expected %d, got %d", int32(math.MinInt32), got)
+	}
+}
+
+func TestSerFloat64CoercionLong(t *testing.T) {
+	s, err := Parse(`"long"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Whole float64 should encode as long.
+	v := float64(123456789)
+	dst, err := s.AppendEncode(nil, &v)
+	if err != nil {
+		t.Fatalf("encode float64 as long: %v", err)
+	}
+
+	var got int64
+	if _, err := s.Decode(dst, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != 123456789 {
+		t.Fatalf("expected 123456789, got %d", got)
+	}
+
+	// Non-whole float64 should error.
+	bad := float64(1.5)
+	if _, err := s.AppendEncode(nil, &bad); err == nil {
+		t.Fatal("expected error for non-whole float64")
+	}
+
+	// NaN should error.
+	nan := math.NaN()
+	if _, err := s.AppendEncode(nil, &nan); err == nil {
+		t.Fatal("expected error for NaN")
+	}
+
+	// Inf should error.
+	inf := math.Inf(1)
+	if _, err := s.AppendEncode(nil, &inf); err == nil {
+		t.Fatal("expected error for Inf")
+	}
+}
+
+func TestSerJSONRoundtrip(t *testing.T) {
+	// This tests the rpk use case: json.Unmarshal → Encode → Decode → json.Marshal.
+	schema := `{
+		"type": "record",
+		"name": "test",
+		"fields": [
+			{"name": "name", "type": "string"},
+			{"name": "age", "type": "int"},
+			{"name": "score", "type": "long"},
+			{"name": "rating", "type": "float"},
+			{"name": "precise", "type": "double"},
+			{"name": "active", "type": "boolean"},
+			{"name": "tags", "type": {"type": "array", "items": "string"}},
+			{"name": "metadata", "type": {"type": "map", "values": "int"}}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	input := `{"name":"alice","age":30,"score":100000,"rating":4.5,"precise":3.14159,"active":true,"tags":["go","avro"],"metadata":{"x":1,"y":2}}`
+
+	// Step 1: json.Unmarshal (produces float64 for all numbers).
+	var native any
+	if err := json.Unmarshal([]byte(input), &native); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+
+	// Step 2: Encode to Avro binary.
+	binary, err := s.Encode(native)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// Step 3: Decode back to Go types.
+	var decoded any
+	rest, err := s.Decode(binary, &decoded)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("unexpected remaining bytes: %v", rest)
+	}
+
+	// Step 4: Verify specific field values and types.
+	m := decoded.(map[string]any)
+	if m["name"] != "alice" {
+		t.Errorf("name: got %v", m["name"])
+	}
+	if m["age"] != int32(30) {
+		t.Errorf("age: got %v (%T)", m["age"], m["age"])
+	}
+	if m["score"] != int64(100000) {
+		t.Errorf("score: got %v (%T)", m["score"], m["score"])
+	}
+	if m["active"] != true {
+		t.Errorf("active: got %v", m["active"])
 	}
 }
