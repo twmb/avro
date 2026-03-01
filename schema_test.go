@@ -558,7 +558,7 @@ func TestBuildComplexUnknownLogicalIgnored(t *testing.T) {
 
 func TestBuildComplexValidateLogicalError(t *testing.T) {
 	// Known logical type on wrong underlying type should error through buildComplex.
-	_, err := NewSchema(`{"type":"string","logicalType":"date"}`)
+	_, err := Parse(`{"type":"string","logicalType":"date"}`)
 	if err == nil {
 		t.Fatal("expected error for date on string type")
 	}

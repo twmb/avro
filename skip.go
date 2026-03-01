@@ -237,7 +237,7 @@ func buildSkip(w *schemaNode) skipfn {
 
 // skipToDeser wraps a skipfn as a deserfn that ignores the reflect.Value.
 func skipToDeser(skip skipfn) deserfn {
-	return func(src []byte, _ reflect.Value) ([]byte, error) {
+	return func(src []byte, _ reflect.Value, _ *slab) ([]byte, error) {
 		return skip(src)
 	}
 }

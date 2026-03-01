@@ -6432,7 +6432,7 @@ func TestDurationAsFixedBytes(t *testing.T) {
 	// Deserialize into [12]byte instead of Duration.
 	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
 	d := Duration{Months: 1, Days: 2, Milliseconds: 3}
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6465,7 +6465,7 @@ func TestDurationPointer(t *testing.T) {
 
 func TestDurationShortBuffer(t *testing.T) {
 	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6634,12 +6634,12 @@ func TestDurationInRecordUnsafeShortBuffer(t *testing.T) {
 
 func TestDurationSchemaValidation(t *testing.T) {
 	// duration must be on fixed.
-	_, err := NewSchema(`{"type":"int","logicalType":"duration"}`)
+	_, err := Parse(`{"type":"int","logicalType":"duration"}`)
 	if err == nil {
 		t.Fatal("expected error: duration on int")
 	}
 	// duration fixed must be size 12.
-	_, err = NewSchema(`{"type":"fixed","name":"d","size":8,"logicalType":"duration"}`)
+	_, err = Parse(`{"type":"fixed","name":"d","size":8,"logicalType":"duration"}`)
 	if err == nil {
 		t.Fatal("expected error: duration size != 12")
 	}
@@ -6741,8 +6741,8 @@ func TestFixedDecimalNegative(t *testing.T) {
 
 func TestFixedDecimalOverflow(t *testing.T) {
 	// Fixed size 2 can hold at most ±32767 unscaled. Try a value that overflows.
-	schema := `{"type":"fixed","name":"dec","size":2,"logicalType":"decimal","precision":5,"scale":0}`
-	s, err := NewSchema(schema)
+	schema := `{"type":"fixed","name":"dec","size":2,"logicalType":"decimal","precision":4,"scale":0}`
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6757,7 +6757,7 @@ func TestFixedDecimalOverflow(t *testing.T) {
 func TestFixedDecimalFallbackToArray(t *testing.T) {
 	// Deserialize fixed decimal into [8]byte instead of *big.Rat.
 	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6792,12 +6792,12 @@ func TestFixedDecimalInRecord(t *testing.T) {
 
 func TestDecimalSchemaValidation(t *testing.T) {
 	// decimal requires precision.
-	_, err := NewSchema(`{"type":"bytes","logicalType":"decimal"}`)
+	_, err := Parse(`{"type":"bytes","logicalType":"decimal"}`)
 	if err == nil {
 		t.Fatal("expected error: decimal without precision")
 	}
 	// decimal must be bytes or fixed.
-	_, err = NewSchema(`{"type":"int","logicalType":"decimal","precision":10}`)
+	_, err = Parse(`{"type":"int","logicalType":"decimal","precision":10}`)
 	if err == nil {
 		t.Fatal("expected error: decimal on int")
 	}
@@ -6805,7 +6805,7 @@ func TestDecimalSchemaValidation(t *testing.T) {
 
 func TestBytesDecimalShortBuffer(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6820,7 +6820,7 @@ func TestBytesDecimalShortBuffer(t *testing.T) {
 
 func TestFixedDecimalShortBuffer(t *testing.T) {
 	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6834,7 +6834,7 @@ func TestFixedDecimalShortBuffer(t *testing.T) {
 
 func TestBytesDecimalNegativeLength(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6863,7 +6863,7 @@ func TestBytesDecimalSerAsBytes(t *testing.T) {
 	// Encode a []byte through a bytes+decimal schema (fallback to serBytes).
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
 	raw := []byte{0x30, 0x39} // 12345 in big-endian
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6939,7 +6939,7 @@ func TestBytesDecimalNegativeNeedsPadding(t *testing.T) {
 func TestBytesDecimalDeserInterface(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
 	r := new(big.Rat).SetFrac64(12345, 100)
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6967,7 +6967,7 @@ func TestBytesDecimalDeserInterface(t *testing.T) {
 func TestFixedDecimalDeserInterface(t *testing.T) {
 	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
 	r := new(big.Rat).SetFrac64(12345, 100)
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6997,7 +6997,7 @@ func TestFixedDecimalDeserInterface(t *testing.T) {
 func TestBytesDecimalDeserWrongType(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
 	r := new(big.Rat).SetFrac64(12345, 100)
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7016,7 +7016,7 @@ func TestBytesDecimalDeserWrongType(t *testing.T) {
 
 func TestBytesDecimalTruncatedVarint(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7033,7 +7033,7 @@ func TestBytesDecimalTruncatedVarint(t *testing.T) {
 
 func TestBytesDecimalEmptyBytes(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7068,7 +7068,7 @@ func TestFixedDecimalNegativePadding(t *testing.T) {
 
 func TestDurationSerNilPointer(t *testing.T) {
 	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7081,7 +7081,7 @@ func TestDurationSerNilPointer(t *testing.T) {
 
 func TestBytesDecimalSerNilPointer(t *testing.T) {
 	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7094,7 +7094,7 @@ func TestBytesDecimalSerNilPointer(t *testing.T) {
 
 func TestFixedDecimalSerNilPointer(t *testing.T) {
 	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -26,7 +26,7 @@ var promotions = map[string]deserfn{
 	"bytes>string": promoteBytesToString,
 }
 
-func promoteIntToLong(src []byte, v reflect.Value) ([]byte, error) {
+func promoteIntToLong(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -46,7 +46,7 @@ func promoteIntToLong(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func promoteIntToFloat(src []byte, v reflect.Value) ([]byte, error) {
+func promoteIntToFloat(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -63,7 +63,7 @@ func promoteIntToFloat(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func promoteIntToDouble(src []byte, v reflect.Value) ([]byte, error) {
+func promoteIntToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	val, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -80,7 +80,7 @@ func promoteIntToDouble(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func promoteLongToFloat(src []byte, v reflect.Value) ([]byte, error) {
+func promoteLongToFloat(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -97,7 +97,7 @@ func promoteLongToFloat(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func promoteLongToDouble(src []byte, v reflect.Value) ([]byte, error) {
+func promoteLongToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -114,7 +114,7 @@ func promoteLongToDouble(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func promoteFloatToDouble(src []byte, v reflect.Value) ([]byte, error) {
+func promoteFloatToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	u, src, err := readUint32(src)
 	if err != nil {
 		return nil, err
@@ -132,7 +132,7 @@ func promoteFloatToDouble(src []byte, v reflect.Value) ([]byte, error) {
 	return src, nil
 }
 
-func promoteStringToBytes(src []byte, v reflect.Value) ([]byte, error) {
+func promoteStringToBytes(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	length, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -158,7 +158,7 @@ func promoteStringToBytes(src []byte, v reflect.Value) ([]byte, error) {
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 }
 
-func promoteBytesToString(src []byte, v reflect.Value) ([]byte, error) {
+func promoteBytesToString(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	length, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err

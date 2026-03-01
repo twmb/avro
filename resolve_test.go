@@ -1328,7 +1328,7 @@ func TestBuildSkipUnknownType(t *testing.T) {
 
 func TestSkipToDeser(t *testing.T) {
 	deser := skipToDeser(skipBoolean)
-	rem, err := deser([]byte{1, 2, 3}, reflect.Value{})
+	rem, err := deser([]byte{1, 2, 3}, reflect.Value{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1360,7 +1360,7 @@ func TestPromoteIntToLongTyped(t *testing.T) {
 	// CanInt path.
 	var i64 int64
 	v := reflect.ValueOf(&i64).Elem()
-	_, err := promoteIntToLong(data, v)
+	_, err := promoteIntToLong(data, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1371,7 +1371,7 @@ func TestPromoteIntToLongTyped(t *testing.T) {
 	// CanUint path.
 	var u64 uint64
 	v = reflect.ValueOf(&u64).Elem()
-	_, err = promoteIntToLong(data, v)
+	_, err = promoteIntToLong(data, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1382,13 +1382,13 @@ func TestPromoteIntToLongTyped(t *testing.T) {
 	// SemanticError: wrong type.
 	var s string
 	v = reflect.ValueOf(&s).Elem()
-	_, err = promoteIntToLong(data, v)
+	_, err = promoteIntToLong(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for string target")
 	}
 
 	// readVarint error.
-	_, err = promoteIntToLong(nil, v)
+	_, err = promoteIntToLong(nil, v, nil)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -1400,7 +1400,7 @@ func TestPromoteIntToFloatTyped(t *testing.T) {
 	// SetFloat path.
 	var f32 float32
 	v := reflect.ValueOf(&f32).Elem()
-	_, err := promoteIntToFloat(data, v)
+	_, err := promoteIntToFloat(data, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1411,13 +1411,13 @@ func TestPromoteIntToFloatTyped(t *testing.T) {
 	// SemanticError.
 	var s string
 	v = reflect.ValueOf(&s).Elem()
-	_, err = promoteIntToFloat(data, v)
+	_, err = promoteIntToFloat(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for string target")
 	}
 
 	// readVarint error.
-	_, err = promoteIntToFloat(nil, v)
+	_, err = promoteIntToFloat(nil, v, nil)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -1428,7 +1428,7 @@ func TestPromoteIntToDoubleTyped(t *testing.T) {
 
 	var f64 float64
 	v := reflect.ValueOf(&f64).Elem()
-	_, err := promoteIntToDouble(data, v)
+	_, err := promoteIntToDouble(data, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1438,12 +1438,12 @@ func TestPromoteIntToDoubleTyped(t *testing.T) {
 
 	var s string
 	v = reflect.ValueOf(&s).Elem()
-	_, err = promoteIntToDouble(data, v)
+	_, err = promoteIntToDouble(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for string target")
 	}
 
-	_, err = promoteIntToDouble(nil, v)
+	_, err = promoteIntToDouble(nil, v, nil)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -1454,7 +1454,7 @@ func TestPromoteLongToFloatTyped(t *testing.T) {
 
 	var f32 float32
 	v := reflect.ValueOf(&f32).Elem()
-	_, err := promoteLongToFloat(data, v)
+	_, err := promoteLongToFloat(data, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1464,12 +1464,12 @@ func TestPromoteLongToFloatTyped(t *testing.T) {
 
 	var s string
 	v = reflect.ValueOf(&s).Elem()
-	_, err = promoteLongToFloat(data, v)
+	_, err = promoteLongToFloat(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for string target")
 	}
 
-	_, err = promoteLongToFloat(nil, v)
+	_, err = promoteLongToFloat(nil, v, nil)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -1480,7 +1480,7 @@ func TestPromoteLongToDoubleTyped(t *testing.T) {
 
 	var f64 float64
 	v := reflect.ValueOf(&f64).Elem()
-	_, err := promoteLongToDouble(data, v)
+	_, err := promoteLongToDouble(data, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1490,12 +1490,12 @@ func TestPromoteLongToDoubleTyped(t *testing.T) {
 
 	var s string
 	v = reflect.ValueOf(&s).Elem()
-	_, err = promoteLongToDouble(data, v)
+	_, err = promoteLongToDouble(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for string target")
 	}
 
-	_, err = promoteLongToDouble(nil, v)
+	_, err = promoteLongToDouble(nil, v, nil)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -1505,14 +1505,14 @@ func TestPromoteFloatToDoubleErrors(t *testing.T) {
 	// readUint32 error.
 	var f64 float64
 	v := reflect.ValueOf(&f64).Elem()
-	_, err := promoteFloatToDouble([]byte{1}, v)
+	_, err := promoteFloatToDouble([]byte{1}, v, nil)
 	if err == nil {
 		t.Fatal("expected error for short buffer")
 	}
 
 	// SetFloat typed path.
 	data := appendUint32(nil, math.Float32bits(2.5))
-	_, err = promoteFloatToDouble(data, v)
+	_, err = promoteFloatToDouble(data, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1523,7 +1523,7 @@ func TestPromoteFloatToDoubleErrors(t *testing.T) {
 	// SemanticError.
 	var s string
 	v = reflect.ValueOf(&s).Elem()
-	_, err = promoteFloatToDouble(data, v)
+	_, err = promoteFloatToDouble(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for string target")
 	}
@@ -1537,7 +1537,7 @@ func TestPromoteStringToBytesTyped(t *testing.T) {
 	// SetBytes slice path.
 	var b []byte
 	v := reflect.ValueOf(&b).Elem()
-	_, err := promoteStringToBytes(data, v)
+	_, err := promoteStringToBytes(data, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1548,20 +1548,20 @@ func TestPromoteStringToBytesTyped(t *testing.T) {
 	// SemanticError (wrong type).
 	var i int
 	v = reflect.ValueOf(&i).Elem()
-	_, err = promoteStringToBytes(data, v)
+	_, err = promoteStringToBytes(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for int target")
 	}
 
 	// readVarlong error.
-	_, err = promoteStringToBytes(nil, v)
+	_, err = promoteStringToBytes(nil, v, nil)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
 
 	// Short buffer after length.
 	short := appendVarlong(nil, 100) // length=100 but no data
-	_, err = promoteStringToBytes(short, v)
+	_, err = promoteStringToBytes(short, v, nil)
 	if err == nil {
 		t.Fatal("expected error for short buffer")
 	}
@@ -1575,7 +1575,7 @@ func TestPromoteBytesToStringTyped(t *testing.T) {
 	// SetString path.
 	var s string
 	v := reflect.ValueOf(&s).Elem()
-	_, err := promoteBytesToString(data, v)
+	_, err := promoteBytesToString(data, v, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1586,20 +1586,20 @@ func TestPromoteBytesToStringTyped(t *testing.T) {
 	// SemanticError (wrong type).
 	var i int
 	v = reflect.ValueOf(&i).Elem()
-	_, err = promoteBytesToString(data, v)
+	_, err = promoteBytesToString(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for int target")
 	}
 
 	// readVarlong error.
-	_, err = promoteBytesToString(nil, v)
+	_, err = promoteBytesToString(nil, v, nil)
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
 
 	// Short buffer after length.
 	short := appendVarlong(nil, 100)
-	_, err = promoteBytesToString(short, v)
+	_, err = promoteBytesToString(short, v, nil)
 	if err == nil {
 		t.Fatal("expected error for short buffer")
 	}
@@ -1998,7 +1998,7 @@ func TestPromoteStringToBytesNegativeLength(t *testing.T) {
 	data := appendVarlong(nil, -1)
 	var b []byte
 	v := reflect.ValueOf(&b).Elem()
-	_, err := promoteStringToBytes(data, v)
+	_, err := promoteStringToBytes(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for negative length")
 	}
@@ -2008,7 +2008,7 @@ func TestPromoteBytesToStringNegativeLength(t *testing.T) {
 	data := appendVarlong(nil, -1)
 	var s string
 	v := reflect.ValueOf(&s).Elem()
-	_, err := promoteBytesToString(data, v)
+	_, err := promoteBytesToString(data, v, nil)
 	if err == nil {
 		t.Fatal("expected error for negative length")
 	}

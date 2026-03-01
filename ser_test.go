@@ -319,7 +319,7 @@ func TestSerNullNonNilableType(t *testing.T) {
 func TestSerNullGenericUnionNonNilable(t *testing.T) {
 	// 3-branch union takes the generic serUnion.ser path, which tries
 	// serNull first. This would panic on non-nilable types before the fix.
-	s, err := NewSchema(`["null","int","string"]`)
+	s, err := Parse(`["null","int","string"]`)
 	if err != nil {
 		t.Fatal(err)
 	}

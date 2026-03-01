@@ -509,6 +509,15 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			b.deser = (&deserBytesDecimal{scale: scale}).deser
 			b.canon = aschema{primitive: o.Type}
 			b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
+			nd := &schemaNode{
+				kind:      o.Type,
+				logical:   o.Logical,
+				ser:       b.ser,
+				deser:     b.deser,
+				precision: *o.Precision,
+				scale:     scale,
+			}
+			b.node = nd
 			return nil
 		}
 		b.ser = ser

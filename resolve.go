@@ -79,8 +79,8 @@ func resolveNode(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (
 			// *placeholder = *resolved, callers who captured this
 			// closure will invoke the real deserfn.
 			n = &schemaNode{}
-			n.deser = func(src []byte, v reflect.Value) ([]byte, error) {
-				return n.deser(src, v)
+			n.deser = func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+				return n.deser(src, v, sl)
 			}
 			seen[pair] = n
 		}
@@ -243,25 +243,25 @@ func findReaderFieldIndex(r *schemaNode, writerFieldName string) int {
 }
 
 func (rr *resolvedRecord) buildDeser() deserfn {
-	return func(src []byte, v reflect.Value) ([]byte, error) {
+	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		v = indirectAlloc(v)
 		k := v.Kind()
 
 		if k == reflect.Interface {
-			return rr.deserInterface(src, v)
+			return rr.deserInterface(src, v, sl)
 		}
 		t := v.Type()
 		if k == reflect.Map && t.Key().Kind() == reflect.String {
-			return rr.deserMap(src, v, t)
+			return rr.deserMap(src, v, t, sl)
 		}
 		if k == reflect.Struct {
-			return rr.deserStruct(src, v, t)
+			return rr.deserStruct(src, v, t, sl)
 		}
 		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
 }
 
-func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value) ([]byte, error) {
+func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	m := make(map[string]any, len(rr.readerNames))
 	var err error
 
@@ -274,7 +274,7 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value) ([]byte, e
 			continue
 		}
 		elem := reflect.New(anyType).Elem()
-		if src, err = op.read(src, elem); err != nil {
+		if src, err = op.read(src, elem, sl); err != nil {
 			return nil, &SemanticError{AvroType: "record", Field: rr.readerNames[op.readerIdx], Err: err}
 		}
 		m[rr.readerNames[op.readerIdx]] = elem.Interface()
@@ -283,7 +283,7 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value) ([]byte, e
 	// Apply defaults.
 	for _, d := range rr.defaults {
 		elem := reflect.New(anyType).Elem()
-		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), elem); err != nil {
+		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), elem, sl); err != nil {
 			return nil, &SemanticError{AvroType: "record", Field: rr.readerNames[d.readerIdx], Err: err}
 		}
 		m[rr.readerNames[d.readerIdx]] = elem.Interface()
@@ -293,7 +293,7 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value) ([]byte, e
 	return src, nil
 }
 
-func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type) ([]byte, error) {
+func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
 	if v.IsNil() {
 		v.Set(reflect.MakeMap(t))
 	}
@@ -307,7 +307,7 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type) 
 			continue
 		}
 		elem := reflect.New(t.Elem()).Elem()
-		if src, err = op.read(src, elem); err != nil {
+		if src, err = op.read(src, elem, sl); err != nil {
 			return nil, &SemanticError{AvroType: "record", Field: rr.readerNames[op.readerIdx], Err: err}
 		}
 		v.SetMapIndex(reflect.ValueOf(rr.readerNames[op.readerIdx]), elem)
@@ -315,7 +315,7 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type) 
 
 	for _, d := range rr.defaults {
 		elem := reflect.New(t.Elem()).Elem()
-		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), elem); err != nil {
+		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), elem, sl); err != nil {
 			return nil, &SemanticError{AvroType: "record", Field: rr.readerNames[d.readerIdx], Err: err}
 		}
 		v.SetMapIndex(reflect.ValueOf(rr.readerNames[d.readerIdx]), elem)
@@ -324,7 +324,7 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type) 
 	return src, nil
 }
 
-func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Type) ([]byte, error) {
+func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
 	mapping, err := typeFieldMapping(rr.readerNames, &rr.cache, t)
 	if err != nil {
 		return nil, err
@@ -338,14 +338,14 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 			continue
 		}
 		fv := fieldByIndex(v, mapping.indices[op.readerIdx])
-		if src, err = op.read(src, fv); err != nil {
+		if src, err = op.read(src, fv, sl); err != nil {
 			return nil, &SemanticError{GoType: t, AvroType: "record", Field: rr.readerNames[op.readerIdx], Err: err}
 		}
 	}
 
 	for _, d := range rr.defaults {
 		fv := fieldByIndex(v, mapping.indices[d.readerIdx])
-		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), fv); err != nil {
+		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), fv, sl); err != nil {
 			return nil, &SemanticError{GoType: t, AvroType: "record", Field: rr.readerNames[d.readerIdx], Err: err}
 		}
 	}
@@ -398,7 +398,7 @@ func resolveEnum(r, w *schemaNode) (*schemaNode, error) {
 		aliases: r.aliases,
 		symbols: r.symbols,
 		ser:     r.ser,
-		deser: func(src []byte, v reflect.Value) ([]byte, error) {
+		deser: func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 			idx, src, err := readVarint(src)
 			if err != nil {
 				return nil, err

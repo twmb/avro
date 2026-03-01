@@ -113,7 +113,7 @@ func deserNullUnion(u *deserUnion) deserfn {
 }
 
 func deserNullSecondUnion(u *deserUnion) deserfn {
-	return func(src []byte, v reflect.Value) ([]byte, error) {
+	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "union index"}
 		}
@@ -123,9 +123,9 @@ func deserNullSecondUnion(u *deserUnion) deserfn {
 				if v.IsNil() {
 					v.Set(reflect.New(v.Type().Elem()))
 				}
-				return u.fns[0](src[1:], v.Elem())
+				return u.fns[0](src[1:], v.Elem(), sl)
 			}
-			return u.fns[0](src[1:], v)
+			return u.fns[0](src[1:], v, sl)
 		case 2: // index 1: null
 			switch v.Kind() {
 			case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
