@@ -13,7 +13,7 @@ var fuzzSchemas []*Schema
 
 func init() {
 	schemas := []string{
-		// 8 primitives
+		// 0-7: 8 primitives
 		`"null"`,
 		`"boolean"`,
 		`"int"`,
@@ -22,24 +22,37 @@ func init() {
 		`"double"`,
 		`"bytes"`,
 		`"string"`,
-		// enum
+		// 8: enum
 		`{"type":"enum","name":"E","symbols":["A","B","C"]}`,
-		// fixed
+		// 9: fixed
 		`{"type":"fixed","name":"F","size":4}`,
-		// array
+		// 10: array of int
 		`{"type":"array","items":"int"}`,
-		// map
+		// 11: map of string
 		`{"type":"map","values":"string"}`,
-		// null union
+		// 12: null union
 		`["null","string"]`,
-		// general union
+		// 13: general union
 		`["null","int","string","boolean"]`,
-		// multi-field record
+		// 14: multi-field record
 		`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"boolean"},{"name":"d","type":"double"}]}`,
-		// nested record
+		// 15: nested record
 		`{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"},{"name":"y","type":"string"}]}},{"name":"z","type":"long"}]}`,
-		// record with logical types
+		// 16: record with logical types
 		`{"type":"record","name":"Logical","fields":[{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},{"name":"d","type":{"type":"int","logicalType":"date"}},{"name":"id","type":{"type":"string","logicalType":"uuid"}}]}`,
+
+		// 17-21: arrays of all specialized primitive types
+		`{"type":"array","items":"boolean"}`,
+		`{"type":"array","items":"long"}`,
+		`{"type":"array","items":"float"}`,
+		`{"type":"array","items":"double"}`,
+		`{"type":"array","items":"string"}`,
+		// 22-26: maps of all specialized primitive types
+		`{"type":"map","values":"int"}`,
+		`{"type":"map","values":"boolean"}`,
+		`{"type":"map","values":"long"}`,
+		`{"type":"map","values":"float"}`,
+		`{"type":"map","values":"double"}`,
 	}
 	for _, s := range schemas {
 		fuzzSchemas = append(fuzzSchemas, MustParse(s))
@@ -216,6 +229,36 @@ func FuzzDecode(f *testing.F) {
 		// logical types record
 		{16, fuzzSeed(fuzzSchemas[16], map[string]any{"ts": int64(1000), "d": int32(19000), "id": "550e8400-e29b-41d4-a716-446655440000"})},
 		{16, nil},
+		// array of boolean
+		{17, fuzzSeed(fuzzSchemas[17], []bool{true, false, true})},
+		{17, nil},
+		// array of long
+		{18, fuzzSeed(fuzzSchemas[18], []int64{100, -200, 300})},
+		{18, nil},
+		// array of float
+		{19, fuzzSeed(fuzzSchemas[19], []float32{1.5, -2.5})},
+		{19, nil},
+		// array of double
+		{20, fuzzSeed(fuzzSchemas[20], []float64{3.14, 2.718})},
+		{20, nil},
+		// array of string
+		{21, fuzzSeed(fuzzSchemas[21], []string{"hello", "world"})},
+		{21, nil},
+		// map of int
+		{22, fuzzSeed(fuzzSchemas[22], map[string]int32{"a": 1, "b": 2})},
+		{22, nil},
+		// map of boolean
+		{23, fuzzSeed(fuzzSchemas[23], map[string]bool{"t": true, "f": false})},
+		{23, nil},
+		// map of long
+		{24, fuzzSeed(fuzzSchemas[24], map[string]int64{"x": 999})},
+		{24, nil},
+		// map of float
+		{25, fuzzSeed(fuzzSchemas[25], map[string]float32{"pi": 3.14})},
+		{25, nil},
+		// map of double
+		{26, fuzzSeed(fuzzSchemas[26], map[string]float64{"e": 2.718})},
+		{26, nil},
 	}
 
 	// Adversarial patterns.
@@ -269,6 +312,16 @@ func FuzzDecodeEncodeRoundTrip(f *testing.F) {
 		{14, fuzzSeed(fuzzSchemas[14], map[string]any{"a": int32(1), "b": "x", "c": false, "d": 3.14})},
 		{15, fuzzSeed(fuzzSchemas[15], map[string]any{"inner": map[string]any{"x": int32(9), "y": "z"}, "z": int64(8)})},
 		{16, fuzzSeed(fuzzSchemas[16], map[string]any{"ts": int64(0), "d": int32(0), "id": "550e8400-e29b-41d4-a716-446655440000"})},
+		{17, fuzzSeed(fuzzSchemas[17], []bool{true, false})},
+		{18, fuzzSeed(fuzzSchemas[18], []int64{100, -200})},
+		{19, fuzzSeed(fuzzSchemas[19], []float32{1.5})},
+		{20, fuzzSeed(fuzzSchemas[20], []float64{3.14})},
+		{21, fuzzSeed(fuzzSchemas[21], []string{"hello"})},
+		{22, fuzzSeed(fuzzSchemas[22], map[string]int32{"a": 1})},
+		{23, fuzzSeed(fuzzSchemas[23], map[string]bool{"t": true})},
+		{24, fuzzSeed(fuzzSchemas[24], map[string]int64{"x": 99})},
+		{25, fuzzSeed(fuzzSchemas[25], map[string]float32{"pi": 3.14})},
+		{26, fuzzSeed(fuzzSchemas[26], map[string]float64{"e": 2.718})},
 	}
 
 	for _, s := range seeds {
@@ -343,6 +396,26 @@ func FuzzSingleObject(f *testing.F) {
 			val = map[string]any{"inner": map[string]any{"x": int32(1), "y": "s"}, "z": int64(2)}
 		case 16: // logical types record
 			val = map[string]any{"ts": int64(0), "d": int32(0), "id": "550e8400-e29b-41d4-a716-446655440000"}
+		case 17: // array of boolean
+			val = []bool{true, false}
+		case 18: // array of long
+			val = []int64{100, -200}
+		case 19: // array of float
+			val = []float32{1.5}
+		case 20: // array of double
+			val = []float64{3.14}
+		case 21: // array of string
+			val = []string{"hello"}
+		case 22: // map of int
+			val = map[string]int32{"a": 1}
+		case 23: // map of boolean
+			val = map[string]bool{"t": true}
+		case 24: // map of long
+			val = map[string]int64{"x": 99}
+		case 25: // map of float
+			val = map[string]float32{"pi": 3.14}
+		case 26: // map of double
+			val = map[string]float64{"e": 2.718}
 		}
 		soe, err := s.AppendSingleObject(nil, val)
 		if err != nil {

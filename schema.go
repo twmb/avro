@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash"
 	"math"
+	"reflect"
 	"strings"
 )
 
@@ -536,12 +537,8 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			ser:     b.ser,
 			deser:   b.deser,
 		}
-		if o.Logical == "decimal" {
-			nd.precision = *o.Precision
-			if o.Scale != nil {
-				nd.scale = *o.Scale
-			}
-		}
+		// Note: decimal primitives are handled by the early return
+		// at the top of this block (L504-522), so they never reach here.
 		b.node = nd
 		return nil
 	}
@@ -676,12 +673,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			fieldIdx := len(sr.fields)
 			sr.fields = append(sr.fields, serRecordField{
 				name:     of.Name,
+				nameVal:  reflect.ValueOf(of.Name),
 				fn:       bf.ser,
 				avroType: meta.avroType,
 				meta:     meta,
 			})
 			drf := deserRecordField{
 				name:     of.Name,
+				nameVal:  reflect.ValueOf(of.Name),
 				fn:       bf.deser,
 				avroType: meta.avroType,
 				meta:     meta,
@@ -787,8 +786,37 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.unnest(af)
 		o.Items = &af.canon
-		b.ser = (&serArray{af.ser}).ser
-		b.deser = (&deserArray{af.deser}).deser
+		sa := &serArray{serItem: af.ser}
+		da := &deserArray{deserItem: af.deser}
+		switch af.canon.primitive {
+		case "string":
+			b.ser = sa.serString
+			da.fastLoop = deserArrayStringLoop
+			da.fastElemKind = reflect.String
+		case "boolean":
+			b.ser = sa.serBoolean
+			da.fastLoop = deserArrayBooleanLoop
+			da.fastElemKind = reflect.Bool
+		case "int":
+			b.ser = sa.serInt
+			da.fastLoop = deserArrayIntLoop
+			da.fastElemKind = reflect.Int32
+		case "long":
+			b.ser = sa.serLong
+			da.fastLoop = deserArrayLongLoop
+			da.fastElemKind = reflect.Int64
+		case "float":
+			b.ser = sa.serFloat
+			da.fastLoop = deserArrayFloatLoop
+			da.fastElemKind = reflect.Float32
+		case "double":
+			b.ser = sa.serDouble
+			da.fastLoop = deserArrayDoubleLoop
+			da.fastElemKind = reflect.Float64
+		default:
+			b.ser = sa.ser
+		}
+		b.deser = da.deser
 		inner := new(fieldMeta)
 		*inner = af.meta
 		b.meta = fieldMeta{avroType: "array", inner: inner}
@@ -815,8 +843,37 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.unnest(mf)
 		o.Values = &mf.canon
-		b.ser = (&serMap{mf.ser}).ser
-		b.deser = (&deserMap{mf.deser}).deser
+		sm := &serMap{serItem: mf.ser}
+		dm := &deserMap{deserItem: mf.deser}
+		switch mf.canon.primitive {
+		case "string":
+			b.ser = sm.serString
+			dm.fastBlock = deserMapStringBlock
+			dm.fastElemKind = reflect.String
+		case "boolean":
+			b.ser = sm.serBoolean
+			dm.fastBlock = deserMapBooleanBlock
+			dm.fastElemKind = reflect.Bool
+		case "int":
+			b.ser = sm.serInt
+			dm.fastBlock = deserMapIntBlock
+			dm.fastElemKind = reflect.Int32
+		case "long":
+			b.ser = sm.serLong
+			dm.fastBlock = deserMapLongBlock
+			dm.fastElemKind = reflect.Int64
+		case "float":
+			b.ser = sm.serFloat
+			dm.fastBlock = deserMapFloatBlock
+			dm.fastElemKind = reflect.Float32
+		case "double":
+			b.ser = sm.serDouble
+			dm.fastBlock = deserMapDoubleBlock
+			dm.fastElemKind = reflect.Float64
+		default:
+			b.ser = sm.ser
+		}
+		b.deser = dm.deser
 		b.meta = fieldMeta{avroType: "map"}
 		b.node = &schemaNode{
 			kind:   "map",
