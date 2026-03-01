@@ -304,6 +304,71 @@ func FuzzDecodeEncodeRoundTrip(f *testing.F) {
 	})
 }
 
+func FuzzSingleObject(f *testing.F) {
+	// Valid single-object encoded values for several schemas.
+	for i, s := range fuzzSchemas {
+		var val any
+		switch i {
+		case 0: // null
+			val = nil
+		case 1: // boolean
+			val = true
+		case 2: // int
+			val = int32(42)
+		case 3: // long
+			val = int64(99)
+		case 4: // float
+			val = float32(1.5)
+		case 5: // double
+			val = float64(2.5)
+		case 6: // bytes
+			val = []byte("abc")
+		case 7: // string
+			val = "hello"
+		case 8: // enum
+			val = "A"
+		case 9: // fixed
+			val = [4]byte{1, 2, 3, 4}
+		case 10: // array
+			val = []int32{1, 2}
+		case 11: // map
+			val = map[string]string{"k": "v"}
+		case 12: // null union
+			val = "test"
+		case 13: // general union
+			val = int32(5)
+		case 14: // multi-field record
+			val = map[string]any{"a": int32(1), "b": "x", "c": true, "d": 1.5}
+		case 15: // nested record
+			val = map[string]any{"inner": map[string]any{"x": int32(1), "y": "s"}, "z": int64(2)}
+		case 16: // logical types record
+			val = map[string]any{"ts": int64(0), "d": int32(0), "id": "550e8400-e29b-41d4-a716-446655440000"}
+		}
+		soe, err := s.AppendSingleObject(nil, val)
+		if err != nil {
+			continue
+		}
+		f.Add(soe)
+	}
+
+	// Truncated: just the magic.
+	f.Add([]byte{0xC3, 0x01})
+	// Too short for fingerprint.
+	f.Add([]byte{0xC3, 0x01, 0x00, 0x00})
+	// Wrong magic bytes.
+	f.Add([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	// Empty.
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		SingleObjectFingerprint(data) //nolint:errcheck
+		for _, s := range fuzzSchemas {
+			var v any
+			s.DecodeSingleObject(data, &v) //nolint:errcheck
+		}
+	})
+}
+
 func FuzzResolve(f *testing.F) {
 	type seed struct {
 		reader string
@@ -346,6 +411,36 @@ func FuzzResolve(f *testing.F) {
 		{readerIncompat, writerIncompat, nil},
 		// Primitives.
 		{`"int"`, `"int"`, fuzzSeed(MustParse(`"int"`), int32(42))},
+
+		// Enum: writer adds new symbol, reader has default.
+		{
+			`{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`,
+			`{"type":"enum","name":"E","symbols":["A","B","C"]}`,
+			fuzzSeed(MustParse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`), "C"),
+		},
+		// Array: item type promotion int -> long.
+		{
+			`{"type":"array","items":"long"}`,
+			`{"type":"array","items":"int"}`,
+			fuzzSeed(MustParse(`{"type":"array","items":"int"}`), []int32{1, 2, 3}),
+		},
+		// Map: value type promotion int -> long.
+		{
+			`{"type":"map","values":"long"}`,
+			`{"type":"map","values":"int"}`,
+			fuzzSeed(MustParse(`{"type":"map","values":"int"}`), map[string]int32{"k": 10}),
+		},
+		// Union: writer has subset of reader branches.
+		{
+			`["null","int","string"]`,
+			`["null","int"]`,
+			fuzzSeed(MustParse(`["null","int"]`), int32(7)),
+		},
+		// Primitive promotions.
+		{`"float"`, `"int"`, fuzzSeed(MustParse(`"int"`), int32(5))},
+		{`"double"`, `"long"`, fuzzSeed(MustParse(`"long"`), int64(99))},
+		{`"long"`, `"int"`, fuzzSeed(MustParse(`"int"`), int32(42))},
+		{`"double"`, `"float"`, fuzzSeed(MustParse(`"float"`), float32(1.5))},
 	}
 
 	for _, s := range seeds {

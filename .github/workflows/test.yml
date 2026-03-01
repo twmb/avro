@@ -24,5 +24,6 @@ jobs:
           go test -run='^$' -fuzz='^FuzzDecode$' -fuzztime=10s &
           go test -run='^$' -fuzz=FuzzDecodeEncodeRoundTrip -fuzztime=10s &
           go test -run='^$' -fuzz=FuzzResolve -fuzztime=10s &
+          go test -run='^$' -fuzz=FuzzSingleObject -fuzztime=10s &
           (cd ocf && go test -run='^$' -fuzz=FuzzOCFReader -fuzztime=10s) &
           wait
