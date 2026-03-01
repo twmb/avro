@@ -168,7 +168,7 @@ func serLong(dst []byte, v reflect.Value) ([]byte, error) {
 		if f != n {
 			return nil, fmt.Errorf("value %v is not a whole number for Avro long", f)
 		}
-		if n < -(1 << 63) || n >= 1<<63 {
+		if n < -(1<<63) || n >= 1<<63 {
 			return nil, fmt.Errorf("value %v overflows Avro long (int64)", f)
 		}
 		return appendVarlong(dst, int64(n)), nil
@@ -223,6 +223,20 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 		if s, ok := i.(stringer); ok {
 			return doSerString(dst, s.String()), nil
 		}
+		if a, ok := i.(encoding.TextAppender); ok {
+			mark := len(dst)
+			var err error
+			if dst, err = a.AppendText(dst); err != nil {
+				return nil, err
+			}
+			textLen := len(dst) - mark
+			var buf [10]byte
+			hdr := appendVarlong(buf[:0], int64(textLen))
+			dst = append(dst, hdr...)                         // make room
+			copy(dst[mark+len(hdr):], dst[mark:mark+textLen]) // shift text right
+			copy(dst[mark:], hdr)                             // write length prefix
+			return dst, nil
+		}
 		if m, ok := i.(encoding.TextMarshaler); ok {
 			text, err := m.MarshalText()
 			if err != nil {
@@ -274,8 +288,8 @@ type serRecordField struct {
 type serRecord struct {
 	fields []serRecordField
 	names  []string
-	cache  sync.Map                       // map[reflect.Type]*cachedMapping
-	fast   atomic.Pointer[fastRecordSer]  // precompiled unsafe fast path
+	cache  sync.Map                      // map[reflect.Type]*cachedMapping
+	fast   atomic.Pointer[fastRecordSer] // precompiled unsafe fast path
 }
 
 func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {

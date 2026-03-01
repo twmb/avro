@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -351,6 +352,18 @@ func (textMarshalerErr) MarshalText() ([]byte, error) { return nil, fmt.Errorf("
 
 var _ encoding.TextMarshaler = textMarshalerErr{}
 
+type textAppenderType struct{ val string }
+
+func (ta textAppenderType) AppendText(b []byte) ([]byte, error) { return append(b, ta.val...), nil }
+
+var _ encoding.TextAppender = textAppenderType{}
+
+type textAppenderErr struct{}
+
+func (textAppenderErr) AppendText([]byte) ([]byte, error) { return nil, fmt.Errorf("append error") }
+
+var _ encoding.TextAppender = textAppenderErr{}
+
 type valStringer struct{ v string }
 
 func (vs valStringer) String() string { return vs.v }
@@ -395,6 +408,43 @@ func TestSerStringTextMarshalerError(t *testing.T) {
 	_, err = s.AppendEncode(nil, &v)
 	if err == nil {
 		t.Fatal("expected error from MarshalText")
+	}
+}
+
+func TestSerStringTextAppender(t *testing.T) {
+	s, err := Parse(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, val := range []string{
+		"hello",
+		"",
+		strings.Repeat("a", 200), // multi-byte varlong length
+	} {
+		v := textAppenderType{val: val}
+		dst, err := s.AppendEncode(nil, &v)
+		if err != nil {
+			t.Fatalf("encode TextAppender %q: %v", val, err)
+		}
+		var got string
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatalf("decode %q: %v", val, err)
+		}
+		if got != val {
+			t.Fatalf("got %q, want %q", got, val)
+		}
+	}
+}
+
+func TestSerStringTextAppenderError(t *testing.T) {
+	s, err := Parse(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := textAppenderErr{}
+	_, err = s.AppendEncode(nil, &v)
+	if err == nil {
+		t.Fatal("expected error from AppendText")
 	}
 }
 
