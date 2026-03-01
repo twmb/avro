@@ -331,6 +331,7 @@ func deserString(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 
 type deserRecordField struct {
 	name       string
+	nameVal    reflect.Value // pre-computed reflect.ValueOf(name) for map lookups
 	fn         deserfn
 	avroType   string
 	meta       *fieldMeta
@@ -351,13 +352,14 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	if k == reflect.Interface {
 		// Generic decode: create map[string]any.
 		m := make(map[string]any, len(s.fields))
+		elem := reflect.New(anyType).Elem()
 		var err error
 		for _, f := range s.fields {
-			elem := reflect.New(anyType).Elem()
 			if src, err = f.fn(src, elem, sl); err != nil {
 				return nil, &SemanticError{AvroType: "record", Field: f.name, Err: err}
 			}
 			m[f.name] = elem.Interface()
+			elem.SetZero()
 		}
 		v.Set(reflect.ValueOf(m))
 		return src, nil
@@ -376,7 +378,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 			if src, err = f.fn(src, elem, sl); err != nil {
 				return nil, &SemanticError{AvroType: "record", Field: f.name, Err: err}
 			}
-			v.SetMapIndex(reflect.ValueOf(f.name), elem)
+			v.SetMapIndex(f.nameVal, elem)
 		}
 		return src, nil
 	}
@@ -425,7 +427,9 @@ func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 }
 
 type deserArray struct {
-	deserItem deserfn
+	deserItem    deserfn
+	fastLoop     func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error)
+	fastElemKind reflect.Kind
 }
 
 func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -442,6 +446,9 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		v.SetLen(0)
 		sliceVal = v
 	}
+	// For primitive item types with matching Go element types, use
+	// a specialized loop that avoids per-element function pointer calls.
+	useFast := !iface && s.fastLoop != nil && sliceVal.Type().Elem().Kind() == s.fastElemKind
 	var err error
 	for {
 		var count int64
@@ -481,6 +488,13 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		} else {
 			sliceVal.SetLen(newLen)
 		}
+		if useFast {
+			src, err = s.fastLoop(src, sliceVal, start, n, sl)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
 		elemType := sliceVal.Type().Elem()
 		if elemType.Kind() == reflect.Pointer {
 			innerType := elemType.Elem()
@@ -498,8 +512,97 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	}
 }
 
+// The following loop functions decode array items for primitive types,
+// avoiding per-element function pointer calls and type checks. Each is
+// selected at schema build time based on the array's item type.
+
+func deserArrayStringLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
+	var err error
+	for i := start; i < start+count; i++ {
+		var length int64
+		length, src, err = readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		if length < 0 {
+			return nil, fmt.Errorf("invalid negative string length %d", length)
+		}
+		n := int(length)
+		if len(src) < n {
+			return nil, &ShortBufferError{Type: "string", Need: n, Have: len(src)}
+		}
+		sliceVal.Index(i).SetString(sl.string(src, n))
+		src = src[n:]
+	}
+	return src, nil
+}
+
+func deserArrayBooleanLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
+	// The caller guarantees len(src) >= count (via the block count check),
+	// and each boolean consumes exactly 1 byte, so bounds are always safe.
+	for i := start; i < start+count; i++ {
+		sliceVal.Index(i).SetBool(src[0] != 0)
+		src = src[1:]
+	}
+	return src, nil
+}
+
+func deserArrayIntLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
+	var err error
+	for i := start; i < start+count; i++ {
+		var val int32
+		val, src, err = readVarint(src)
+		if err != nil {
+			return nil, err
+		}
+		sliceVal.Index(i).SetInt(int64(val))
+	}
+	return src, nil
+}
+
+func deserArrayLongLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
+	var err error
+	for i := start; i < start+count; i++ {
+		var val int64
+		val, src, err = readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		sliceVal.Index(i).SetInt(val)
+	}
+	return src, nil
+}
+
+func deserArrayFloatLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
+	var err error
+	for i := start; i < start+count; i++ {
+		var u uint32
+		u, src, err = readUint32(src)
+		if err != nil {
+			return nil, err
+		}
+		sliceVal.Index(i).SetFloat(float64(math.Float32frombits(u)))
+	}
+	return src, nil
+}
+
+func deserArrayDoubleLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
+	var err error
+	for i := start; i < start+count; i++ {
+		var u uint64
+		u, src, err = readUint64(src)
+		if err != nil {
+			return nil, err
+		}
+		sliceVal.Index(i).SetFloat(math.Float64frombits(u))
+	}
+	return src, nil
+}
+
 type deserMap struct {
-	deserItem deserfn
+	deserItem    deserfn
+	fastBlock    func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
+	fastElemKind reflect.Kind
 }
 
 func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -523,6 +626,13 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		mapVal = v
 		elemTyp = t.Elem()
 	}
+	// For primitive value types with matching Go element types, use
+	// reusable reflect.Value containers to avoid per-entry allocations.
+	useFast := !iface && s.fastBlock != nil && elemTyp.Kind() == s.fastElemKind
+	// Pre-allocate reusable key and elem containers to avoid
+	// per-entry reflect.ValueOf / reflect.New allocations.
+	keyVal := reflect.New(reflect.TypeFor[string]()).Elem()
+	elemVal := reflect.New(elemTyp).Elem()
 	var err error
 	for {
 		var count int64
@@ -549,26 +659,168 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		if count > int64(len(src)) {
 			return nil, fmt.Errorf("map block count %d exceeds remaining buffer length %d", count, len(src))
 		}
+		if useFast {
+			src, err = s.fastBlock(src, mapVal, keyVal, elemVal, int(count), sl)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
 		for range int(count) {
-			var keyLen int64
-			keyLen, src, err = readVarlong(src)
+			src, err = readMapKey(src, keyVal, sl)
 			if err != nil {
 				return nil, err
 			}
-			if keyLen < 0 || int(keyLen) > len(src) {
-				return nil, fmt.Errorf("invalid map key length %d", keyLen)
-			}
-			key := sl.string(src, int(keyLen))
-			src = src[int(keyLen):]
-
-			elem := reflect.New(elemTyp).Elem()
-			src, err = s.deserItem(src, elem, sl)
+			src, err = s.deserItem(src, elemVal, sl)
 			if err != nil {
 				return nil, err
 			}
-			mapVal.SetMapIndex(reflect.ValueOf(key), elem)
+			mapVal.SetMapIndex(keyVal, elemVal)
+			elemVal.SetZero()
 		}
 	}
+}
+
+// readMapKey reads an Avro map key from src into keyVal and returns the
+// remaining bytes. It is called once per map entry; the work inside
+// (readVarlong, slab string copy) dominates the call overhead.
+func readMapKey(src []byte, keyVal reflect.Value, sl *slab) ([]byte, error) {
+	keyLen, src, err := readVarlong(src)
+	if err != nil {
+		return nil, err
+	}
+	if keyLen < 0 || int(keyLen) > len(src) {
+		return nil, fmt.Errorf("invalid map key length %d", keyLen)
+	}
+	keyVal.SetString(sl.string(src, int(keyLen)))
+	return src[int(keyLen):], nil
+}
+
+// The following block functions decode map entries for primitive value
+// types using reusable reflect.Value containers. Each is selected at
+// schema build time based on the map's value type.
+
+func deserMapStringBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
+	var err error
+	for range count {
+		src, err = readMapKey(src, keyVal, sl)
+		if err != nil {
+			return nil, err
+		}
+
+		var valLen int64
+		valLen, src, err = readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		if valLen < 0 || int(valLen) > len(src) {
+			return nil, &ShortBufferError{Type: "string", Need: int(valLen), Have: len(src)}
+		}
+		elemVal.SetString(sl.string(src, int(valLen)))
+		src = src[int(valLen):]
+
+		mapVal.SetMapIndex(keyVal, elemVal)
+	}
+	return src, nil
+}
+
+func deserMapBooleanBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
+	var err error
+	for range count {
+		src, err = readMapKey(src, keyVal, sl)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(src) < 1 {
+			return nil, &ShortBufferError{Type: "boolean"}
+		}
+		elemVal.SetBool(src[0] != 0)
+		src = src[1:]
+
+		mapVal.SetMapIndex(keyVal, elemVal)
+	}
+	return src, nil
+}
+
+func deserMapIntBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
+	var err error
+	for range count {
+		src, err = readMapKey(src, keyVal, sl)
+		if err != nil {
+			return nil, err
+		}
+
+		var val int32
+		val, src, err = readVarint(src)
+		if err != nil {
+			return nil, err
+		}
+		elemVal.SetInt(int64(val))
+
+		mapVal.SetMapIndex(keyVal, elemVal)
+	}
+	return src, nil
+}
+
+func deserMapLongBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
+	var err error
+	for range count {
+		src, err = readMapKey(src, keyVal, sl)
+		if err != nil {
+			return nil, err
+		}
+
+		var val int64
+		val, src, err = readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		elemVal.SetInt(val)
+
+		mapVal.SetMapIndex(keyVal, elemVal)
+	}
+	return src, nil
+}
+
+func deserMapFloatBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
+	var err error
+	for range count {
+		src, err = readMapKey(src, keyVal, sl)
+		if err != nil {
+			return nil, err
+		}
+
+		var u uint32
+		u, src, err = readUint32(src)
+		if err != nil {
+			return nil, err
+		}
+		elemVal.SetFloat(float64(math.Float32frombits(u)))
+
+		mapVal.SetMapIndex(keyVal, elemVal)
+	}
+	return src, nil
+}
+
+func deserMapDoubleBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
+	var err error
+	for range count {
+		src, err = readMapKey(src, keyVal, sl)
+		if err != nil {
+			return nil, err
+		}
+
+		var u uint64
+		u, src, err = readUint64(src)
+		if err != nil {
+			return nil, err
+		}
+		elemVal.SetFloat(math.Float64frombits(u))
+
+		mapVal.SetMapIndex(keyVal, elemVal)
+	}
+	return src, nil
 }
 
 type deserFixed struct {

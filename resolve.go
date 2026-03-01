@@ -437,7 +437,7 @@ func resolveArray(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) 
 		kind:  "array",
 		items: resolved,
 		ser:   r.ser,
-		deser: (&deserArray{resolved.deser}).deser,
+		deser: (&deserArray{deserItem: resolved.deser}).deser,
 	}, nil
 }
 
@@ -453,7 +453,7 @@ func resolveMap(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*
 		kind:   "map",
 		values: resolved,
 		ser:    r.ser,
-		deser:  (&deserMap{resolved.deser}).deser,
+		deser:  (&deserMap{deserItem: resolved.deser}).deser,
 	}, nil
 }
 

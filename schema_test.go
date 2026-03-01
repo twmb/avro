@@ -160,6 +160,7 @@ func TestParseErrors(t *testing.T) {
 		{"nil schema", `null`},
 		{"unknown primitive", `"foobar"`},
 		{"unknown complex type", `{"type":"foobar"}`},
+		{"record field with invalid union", `{"type":"record","name":"R","fields":[{"name":"f","type":["int","int"]}]}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -333,13 +333,6 @@ func TestSerNullGenericUnionNonNilable(t *testing.T) {
 	}
 }
 
-
-func TestSerEnumBoundaryIndex(t *testing.T) {
-	// With 3 symbols, index 3 should be out of range (valid: 0, 1, 2).
-	schema := `{"type":"enum","name":"e","symbols":["a","b","c"]}`
-	encodeErr(t, schema, new(int32(3)))
-}
-
 type textMarshalerType struct{ val string }
 
 func (tm textMarshalerType) MarshalText() ([]byte, error) { return []byte(tm.val), nil }

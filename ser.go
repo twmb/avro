@@ -278,6 +278,7 @@ func doSerString(dst []byte, s string) []byte {
 
 type serRecordField struct {
 	name         string
+	nameVal      reflect.Value // pre-computed reflect.ValueOf(name) for map lookups
 	fn           serfn
 	avroType     string
 	meta         *fieldMeta
@@ -304,7 +305,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if k == reflect.Map {
 		for _, f := range s.fields {
-			value := v.MapIndex(reflect.ValueOf(f.name))
+			value := v.MapIndex(f.nameVal)
 			if !value.IsValid() {
 				if !f.hasDefault {
 					return nil, fmt.Errorf("missing key %s", f.name)
@@ -387,17 +388,9 @@ type serArray struct {
 }
 
 func (s *serArray) ser(dst []byte, v reflect.Value) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
-	if v.Kind() != reflect.Array && v.Kind() != reflect.Slice {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "array"}
-	}
-	l := v.Len()
-	dst = appendVarlong(dst, int64(l))
-	if l == 0 {
-		return dst, nil
+	dst, v, l, err := serArrayPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
 	}
 	for i := range l {
 		if dst, err = s.serItem(dst, v.Index(i)); err != nil {
@@ -407,23 +400,181 @@ func (s *serArray) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
+// serArrayPreamble handles the shared preamble for all serArray methods:
+// indirect, kind check, length encoding, and empty-return. Called once
+// per encode — no performance impact.
+func serArrayPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, v, 0, err
+	}
+	if v.Kind() != reflect.Array && v.Kind() != reflect.Slice {
+		return nil, v, 0, &SemanticError{GoType: v.Type(), AvroType: "array"}
+	}
+	l := v.Len()
+	dst = appendVarlong(dst, int64(l))
+	return dst, v, l, nil
+}
+
+// The following serArray methods serialize array items by encoding
+// primitive values directly from v.Index(i), avoiding reflect.Value
+// escapes through serfn function pointers. Each is selected at schema
+// build time based on the array's item type.
+
+func (s *serArray) serString(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serArrayPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	for i := range l {
+		elem := v.Index(i)
+		if elem.Kind() == reflect.Interface {
+			elem = elem.Elem()
+		}
+		if elem.Kind() != reflect.String {
+			return nil, &SemanticError{GoType: elem.Type(), AvroType: "string"}
+		}
+		dst = doSerString(dst, elem.String())
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serArray) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serArrayPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	for i := range l {
+		elem := v.Index(i)
+		if elem.Kind() == reflect.Interface {
+			elem = elem.Elem()
+		}
+		if elem.Kind() != reflect.Bool {
+			return nil, &SemanticError{GoType: elem.Type(), AvroType: "boolean"}
+		}
+		if elem.Bool() {
+			dst = append(dst, 1)
+		} else {
+			dst = append(dst, 0)
+		}
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serArray) serInt(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serArrayPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	for i := range l {
+		elem := v.Index(i)
+		if elem.Kind() == reflect.Interface {
+			elem = elem.Elem()
+		}
+		if elem.CanInt() {
+			n := elem.Int()
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			dst = appendVarint(dst, int32(n))
+		} else if elem.CanUint() {
+			n := elem.Uint()
+			if n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			dst = appendVarint(dst, int32(n))
+		} else if elem.CanFloat() {
+			f := elem.Float()
+			n := math.Trunc(f)
+			if f != n {
+				return nil, fmt.Errorf("value %v is not a whole number for Avro int", f)
+			}
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %v overflows Avro int (int32)", f)
+			}
+			dst = appendVarint(dst, int32(n))
+		} else {
+			return nil, &SemanticError{GoType: elem.Type(), AvroType: "int"}
+		}
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serArrayPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	for i := range l {
+		elem := v.Index(i)
+		if elem.Kind() == reflect.Interface {
+			elem = elem.Elem()
+		}
+		if elem.CanInt() {
+			dst = appendVarlong(dst, elem.Int())
+		} else if elem.CanUint() {
+			dst = appendVarlong(dst, int64(elem.Uint()))
+		} else if elem.CanFloat() {
+			f := elem.Float()
+			n := math.Trunc(f)
+			if f != n {
+				return nil, fmt.Errorf("value %v is not a whole number for Avro long", f)
+			}
+			if n < -(1<<63) || n >= 1<<63 {
+				return nil, fmt.Errorf("value %v overflows Avro long (int64)", f)
+			}
+			dst = appendVarlong(dst, int64(n))
+		} else {
+			return nil, &SemanticError{GoType: elem.Type(), AvroType: "long"}
+		}
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serArray) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serArrayPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	for i := range l {
+		elem := v.Index(i)
+		if elem.Kind() == reflect.Interface {
+			elem = elem.Elem()
+		}
+		if !elem.CanFloat() {
+			return nil, &SemanticError{GoType: elem.Type(), AvroType: "float"}
+		}
+		dst = appendUint32(dst, math.Float32bits(float32(elem.Float())))
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serArray) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serArrayPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	for i := range l {
+		elem := v.Index(i)
+		if elem.Kind() == reflect.Interface {
+			elem = elem.Elem()
+		}
+		if !elem.CanFloat() {
+			return nil, &SemanticError{GoType: elem.Type(), AvroType: "double"}
+		}
+		dst = appendUint64(dst, math.Float64bits(elem.Float()))
+	}
+	return append(dst, 0), nil
+}
+
 type serMap struct {
 	serItem serfn
 }
 
 func (s *serMap) ser(dst []byte, v reflect.Value) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
-	t := v.Type()
-	if t.Kind() != reflect.Map || t.Key().Kind() != reflect.String {
-		return nil, &SemanticError{GoType: t, AvroType: "map"}
-	}
-	l := v.Len()
-	dst = appendVarlong(dst, int64(l))
-	if l == 0 {
-		return dst, nil
+	dst, v, l, err := serMapPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
 	}
 	iter := v.MapRange()
 	for iter.Next() {
@@ -431,6 +582,186 @@ func (s *serMap) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		if dst, err = s.serItem(dst, iter.Value()); err != nil {
 			return nil, err
 		}
+	}
+	return append(dst, 0), nil
+}
+
+// serMapPreamble handles the shared preamble for all serMap methods:
+// indirect, map+key check, length encoding, and empty-return. Called
+// once per encode — no performance impact.
+func serMapPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, v, 0, err
+	}
+	t := v.Type()
+	if t.Kind() != reflect.Map || t.Key().Kind() != reflect.String {
+		return nil, v, 0, &SemanticError{GoType: t, AvroType: "map"}
+	}
+	l := v.Len()
+	dst = appendVarlong(dst, int64(l))
+	return dst, v, l, nil
+}
+
+// The following serMap methods serialize map values by extracting
+// primitive values directly from iter.Value(), avoiding reflect.Value
+// escapes through serfn function pointers. Each is selected at schema
+// build time based on the map's value type.
+
+func (s *serMap) serString(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serMapPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	iter := v.MapRange()
+	for iter.Next() {
+		dst = doSerString(dst, iter.Key().String())
+		val := iter.Value()
+		if val.Kind() == reflect.Interface {
+			val = val.Elem()
+		}
+		if val.Kind() != reflect.String {
+			return nil, &SemanticError{GoType: val.Type(), AvroType: "string"}
+		}
+		dst = doSerString(dst, val.String())
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serMap) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serMapPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	iter := v.MapRange()
+	for iter.Next() {
+		dst = doSerString(dst, iter.Key().String())
+		val := iter.Value()
+		if val.Kind() == reflect.Interface {
+			val = val.Elem()
+		}
+		if val.Kind() != reflect.Bool {
+			return nil, &SemanticError{GoType: val.Type(), AvroType: "boolean"}
+		}
+		if val.Bool() {
+			dst = append(dst, 1)
+		} else {
+			dst = append(dst, 0)
+		}
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serMap) serInt(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serMapPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	iter := v.MapRange()
+	for iter.Next() {
+		dst = doSerString(dst, iter.Key().String())
+		val := iter.Value()
+		if val.Kind() == reflect.Interface {
+			val = val.Elem()
+		}
+		if val.CanInt() {
+			n := val.Int()
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			dst = appendVarint(dst, int32(n))
+		} else if val.CanUint() {
+			n := val.Uint()
+			if n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			}
+			dst = appendVarint(dst, int32(n))
+		} else if val.CanFloat() {
+			f := val.Float()
+			n := math.Trunc(f)
+			if f != n {
+				return nil, fmt.Errorf("value %v is not a whole number for Avro int", f)
+			}
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, fmt.Errorf("value %v overflows Avro int (int32)", f)
+			}
+			dst = appendVarint(dst, int32(n))
+		} else {
+			return nil, &SemanticError{GoType: val.Type(), AvroType: "int"}
+		}
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serMapPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	iter := v.MapRange()
+	for iter.Next() {
+		dst = doSerString(dst, iter.Key().String())
+		val := iter.Value()
+		if val.Kind() == reflect.Interface {
+			val = val.Elem()
+		}
+		if val.CanInt() {
+			dst = appendVarlong(dst, val.Int())
+		} else if val.CanUint() {
+			dst = appendVarlong(dst, int64(val.Uint()))
+		} else if val.CanFloat() {
+			f := val.Float()
+			n := math.Trunc(f)
+			if f != n {
+				return nil, fmt.Errorf("value %v is not a whole number for Avro long", f)
+			}
+			if n < -(1<<63) || n >= 1<<63 {
+				return nil, fmt.Errorf("value %v overflows Avro long (int64)", f)
+			}
+			dst = appendVarlong(dst, int64(n))
+		} else {
+			return nil, &SemanticError{GoType: val.Type(), AvroType: "long"}
+		}
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serMap) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serMapPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	iter := v.MapRange()
+	for iter.Next() {
+		dst = doSerString(dst, iter.Key().String())
+		val := iter.Value()
+		if val.Kind() == reflect.Interface {
+			val = val.Elem()
+		}
+		if !val.CanFloat() {
+			return nil, &SemanticError{GoType: val.Type(), AvroType: "float"}
+		}
+		dst = appendUint32(dst, math.Float32bits(float32(val.Float())))
+	}
+	return append(dst, 0), nil
+}
+
+func (s *serMap) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
+	dst, v, l, err := serMapPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	iter := v.MapRange()
+	for iter.Next() {
+		dst = doSerString(dst, iter.Key().String())
+		val := iter.Value()
+		if val.Kind() == reflect.Interface {
+			val = val.Elem()
+		}
+		if !val.CanFloat() {
+			return nil, &SemanticError{GoType: val.Type(), AvroType: "double"}
+		}
+		dst = appendUint64(dst, math.Float64bits(val.Float()))
 	}
 	return append(dst, 0), nil
 }

@@ -1250,10 +1250,12 @@ func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 			return dst, nil
 		}
 		data := unsafe.Pointer(unsafe.SliceData(bs))
+		fast := rec.fast.Load()
+		useFast := fast != nil && fast.typ == elemGoType && fast.allFast
 		var err error
 		for i := range n {
 			elemP := unsafe.Add(data, uintptr(i)*elemSize)
-			if fast := rec.fast.Load(); fast != nil && fast.typ == elemGoType && fast.allFast {
+			if useFast {
 				dst, err = serRecordFastPtr(dst, fast, elemP)
 			} else {
 				dst, err = rec.ser(dst, reflect.NewAt(elemGoType, elemP).Elem())
@@ -1275,12 +1277,14 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 		if n == 0 {
 			return dst, nil
 		}
+		fast := rec.fast.Load()
+		useFast := fast != nil && fast.typ == innerType && fast.allFast
 		var err error
 		for _, pp := range s {
 			if pp == nil {
 				return nil, errUnsafeNilPtr
 			}
-			if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
+			if useFast {
 				dst, err = serRecordFastPtr(dst, fast, pp)
 			} else {
 				dst, err = rec.ser(dst, reflect.NewAt(innerType, pp).Elem())
@@ -1302,13 +1306,15 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 		if n == 0 {
 			return dst, nil
 		}
+		fast := rec.fast.Load()
+		useFast := fast != nil && fast.typ == innerType && fast.allFast
 		var err error
 		for _, pp := range s {
 			if pp == nil {
 				dst = append(dst, nullByte)
 			} else {
 				dst = append(dst, valByte)
-				if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
+				if useFast {
 					dst, err = serRecordFastPtr(dst, fast, pp)
 				} else {
 					dst, err = rec.ser(dst, reflect.NewAt(innerType, pp).Elem())
@@ -1425,9 +1431,11 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 				}
 			}
 			// Deserialize each element.
+			fast := rec.fast.Load()
+			useFast := fast != nil && fast.typ == innerType && fast.allFast
 			for i := range n {
 				elemP := s[start+i]
-				if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
+				if useFast {
 					src, err = deserRecordFastPtr(src, fast, elemP, sl)
 				} else {
 					src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)

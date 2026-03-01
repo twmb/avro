@@ -287,67 +287,63 @@ func TestWireFormatUnionNull(t *testing.T) {
 // Round-trip tests: encode then decode, verify equality.
 // -----------------------------------------------------------------------
 
-func TestRoundTripBoolean(t *testing.T) {
-	for _, v := range []bool{true, false} {
-		got := roundTrip(t, `"boolean"`, v)
-		if got != v {
-			t.Errorf("boolean round-trip: got %v, want %v", got, v)
+func TestRoundTripPrimitives(t *testing.T) {
+	t.Run("boolean", func(t *testing.T) {
+		for _, v := range []bool{true, false} {
+			got := roundTrip(t, `"boolean"`, v)
+			if got != v {
+				t.Errorf("got %v, want %v", got, v)
+			}
 		}
-	}
-}
-
-func TestRoundTripInt(t *testing.T) {
-	for _, v := range []int32{0, 1, -1, 127, -128, math.MaxInt32, math.MinInt32} {
-		got := roundTrip(t, `"int"`, v)
-		if got != v {
-			t.Errorf("int round-trip: got %v, want %v", got, v)
+	})
+	t.Run("int", func(t *testing.T) {
+		for _, v := range []int32{0, 1, -1, 127, -128, math.MaxInt32, math.MinInt32} {
+			got := roundTrip(t, `"int"`, v)
+			if got != v {
+				t.Errorf("got %v, want %v", got, v)
+			}
 		}
-	}
-}
-
-func TestRoundTripLong(t *testing.T) {
-	for _, v := range []int64{0, 1, -1, math.MaxInt64, math.MinInt64} {
-		got := roundTrip(t, `"long"`, v)
-		if got != v {
-			t.Errorf("long round-trip: got %v, want %v", got, v)
+	})
+	t.Run("long", func(t *testing.T) {
+		for _, v := range []int64{0, 1, -1, math.MaxInt64, math.MinInt64} {
+			got := roundTrip(t, `"long"`, v)
+			if got != v {
+				t.Errorf("got %v, want %v", got, v)
+			}
 		}
-	}
-}
-
-func TestRoundTripFloat(t *testing.T) {
-	for _, v := range []float32{0, 1.5, -1.5, math.MaxFloat32, math.SmallestNonzeroFloat32} {
-		got := roundTrip(t, `"float"`, v)
-		if got != v {
-			t.Errorf("float round-trip: got %v, want %v", got, v)
+	})
+	t.Run("float", func(t *testing.T) {
+		for _, v := range []float32{0, 1.5, -1.5, math.MaxFloat32, math.SmallestNonzeroFloat32} {
+			got := roundTrip(t, `"float"`, v)
+			if got != v {
+				t.Errorf("got %v, want %v", got, v)
+			}
 		}
-	}
-}
-
-func TestRoundTripDouble(t *testing.T) {
-	for _, v := range []float64{0, 1.5, -1.5, math.MaxFloat64, math.SmallestNonzeroFloat64} {
-		got := roundTrip(t, `"double"`, v)
-		if got != v {
-			t.Errorf("double round-trip: got %v, want %v", got, v)
+	})
+	t.Run("double", func(t *testing.T) {
+		for _, v := range []float64{0, 1.5, -1.5, math.MaxFloat64, math.SmallestNonzeroFloat64} {
+			got := roundTrip(t, `"double"`, v)
+			if got != v {
+				t.Errorf("got %v, want %v", got, v)
+			}
 		}
-	}
-}
-
-func TestRoundTripBytes(t *testing.T) {
-	for _, v := range [][]byte{{}, {0}, {1, 2, 3}, make([]byte, 256)} {
-		got := roundTrip(t, `"bytes"`, v)
-		if !reflect.DeepEqual(got, v) {
-			t.Errorf("bytes round-trip: got %v, want %v", got, v)
+	})
+	t.Run("bytes", func(t *testing.T) {
+		for _, v := range [][]byte{{}, {0}, {1, 2, 3}, make([]byte, 256)} {
+			got := roundTrip(t, `"bytes"`, v)
+			if !reflect.DeepEqual(got, v) {
+				t.Errorf("got %v, want %v", got, v)
+			}
 		}
-	}
-}
-
-func TestRoundTripString(t *testing.T) {
-	for _, v := range []string{"", "hello", "hello world", "日本語"} {
-		got := roundTrip(t, `"string"`, v)
-		if got != v {
-			t.Errorf("string round-trip: got %q, want %q", got, v)
+	})
+	t.Run("string", func(t *testing.T) {
+		for _, v := range []string{"", "hello", "hello world", "日本語"} {
+			got := roundTrip(t, `"string"`, v)
+			if got != v {
+				t.Errorf("got %q, want %q", got, v)
+			}
 		}
-	}
+	})
 }
 
 func TestRoundTripNull(t *testing.T) {
@@ -3106,38 +3102,1322 @@ func TestUnsafeRecordFastPtrError(t *testing.T) {
 	}
 }
 
-// TestArrayDirectIntDeser covers udArrayDirect for []int32 inside a record.
-func TestArrayDirectIntDeser(t *testing.T) {
-	type Wrapper struct {
-		Vals []int32 `avro:"vals"`
+// TestArrayPrimitiveRoundTrips covers the specialized ser/deser paths for
+// all primitive array types through the reflect-based code path (bare slices)
+// and struct-field round-trips (int, string).
+func TestArrayPrimitiveRoundTrips(t *testing.T) {
+	t.Run("int", func(t *testing.T) {
+		type Wrapper struct {
+			Vals []int32 `avro:"vals"`
+		}
+		schema := `{
+			"type": "record",
+			"name": "Wrapper",
+			"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
+		}`
+		input := Wrapper{Vals: []int32{10, 20, 30}}
+		got := roundTrip(t, schema, input)
+		if !reflect.DeepEqual(got.Vals, input.Vals) {
+			t.Errorf("got %v, want %v", got.Vals, input.Vals)
+		}
+	})
+	t.Run("string", func(t *testing.T) {
+		type Wrapper struct {
+			Vals []string `avro:"vals"`
+		}
+		schema := `{
+			"type": "record",
+			"name": "Wrapper",
+			"fields": [{"name": "vals", "type": {"type": "array", "items": "string"}}]
+		}`
+		input := Wrapper{Vals: []string{"a", "bb", "ccc"}}
+		got := roundTrip(t, schema, input)
+		if !reflect.DeepEqual(got.Vals, input.Vals) {
+			t.Errorf("got %v, want %v", got.Vals, input.Vals)
+		}
+	})
+	t.Run("boolean", func(t *testing.T) {
+		input := []bool{true, false, true, false}
+		got := roundTrip(t, `{"type":"array","items":"boolean"}`, input)
+		if !reflect.DeepEqual(got, input) {
+			t.Errorf("got %v, want %v", got, input)
+		}
+	})
+	t.Run("long", func(t *testing.T) {
+		input := []int64{100, -200, 300, 0, math.MaxInt64}
+		got := roundTrip(t, `{"type":"array","items":"long"}`, input)
+		if !reflect.DeepEqual(got, input) {
+			t.Errorf("got %v, want %v", got, input)
+		}
+	})
+	t.Run("float", func(t *testing.T) {
+		input := []float32{1.1, -2.2, 3.3}
+		got := roundTrip(t, `{"type":"array","items":"float"}`, input)
+		if !reflect.DeepEqual(got, input) {
+			t.Errorf("got %v, want %v", got, input)
+		}
+	})
+	t.Run("double", func(t *testing.T) {
+		input := []float64{1.11, -2.22, 3.33, math.Pi}
+		got := roundTrip(t, `{"type":"array","items":"double"}`, input)
+		if !reflect.DeepEqual(got, input) {
+			t.Errorf("got %v, want %v", got, input)
+		}
+	})
+}
+
+// TestMapPrimitiveRoundTrips covers the specialized ser/deser paths for
+// all primitive map value types through the reflect-based code path.
+func TestMapPrimitiveRoundTrips(t *testing.T) {
+	t.Run("boolean", func(t *testing.T) {
+		input := map[string]bool{"a": true, "b": false}
+		got := roundTrip(t, `{"type":"map","values":"boolean"}`, input)
+		if !reflect.DeepEqual(got, input) {
+			t.Errorf("got %v, want %v", got, input)
+		}
+	})
+	t.Run("long", func(t *testing.T) {
+		input := map[string]int64{"x": 100, "y": -200}
+		got := roundTrip(t, `{"type":"map","values":"long"}`, input)
+		if !reflect.DeepEqual(got, input) {
+			t.Errorf("got %v, want %v", got, input)
+		}
+	})
+	t.Run("float", func(t *testing.T) {
+		input := map[string]float32{"pi": 3.14, "e": 2.71}
+		got := roundTrip(t, `{"type":"map","values":"float"}`, input)
+		if !reflect.DeepEqual(got, input) {
+			t.Errorf("got %v, want %v", got, input)
+		}
+	})
+	t.Run("double", func(t *testing.T) {
+		input := map[string]float64{"pi": math.Pi, "e": math.E}
+		got := roundTrip(t, `{"type":"map","values":"double"}`, input)
+		if !reflect.DeepEqual(got, input) {
+			t.Errorf("got %v, want %v", got, input)
+		}
+	})
+}
+
+// TestArrayInterfaceRoundTrips covers the reflect.Interface unwrap branches
+// in serArray specialized methods by encoding []any slices through typed schemas.
+func TestArrayInterfaceRoundTrips(t *testing.T) {
+	t.Run("boolean", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"boolean"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []any{true, false, true}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []bool
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []bool{true, false, true}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("int", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"int"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []any{int32(10), int32(20)}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []int32
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []int32{10, 20}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("long", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"long"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []any{int64(100), int64(200)}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []int64
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []int64{100, 200}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("float", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"float"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []any{float32(1.5), float32(2.5)}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []float32
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []float32{1.5, 2.5}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("double", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"double"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []any{float64(1.11), float64(2.22)}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []float64
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []float64{1.11, 2.22}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("string", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []any{"hello", "world"}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"hello", "world"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
+
+// TestMapInterfaceRoundTrips covers the reflect.Interface unwrap branches
+// in serMap specialized methods by encoding map[string]any through typed schemas.
+func TestMapInterfaceRoundTrips(t *testing.T) {
+	t.Run("boolean", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"boolean"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]any{"a": true, "b": false}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]bool
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]bool{"a": true, "b": false}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("long", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"long"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]any{"x": int64(100)}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]int64
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]int64{"x": 100}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("float", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"float"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]any{"pi": float32(3.14)}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]float32
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]float32{"pi": 3.14}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("double", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"double"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]any{"e": math.E}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]float64
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]float64{"e": math.E}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("string", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]any{"k": "v"}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]string
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]string{"k": "v"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
+
+// TestArrayUintRoundTrips covers CanUint() branches in serArray serInt/serLong.
+func TestArrayUintRoundTrips(t *testing.T) {
+	t.Run("uint_as_int", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"int"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []uint16{10, 20, 30}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []int32
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []int32{10, 20, 30}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("uint_as_long", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"long"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []uint32{100, 200}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []int64
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []int64{100, 200}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("float64_as_int", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"int"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []float64{10.0, 20.0}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []int32
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []int32{10, 20}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("float64_as_long", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"long"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []float64{100.0, 200.0}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []int64
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := []int64{100, 200}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
+
+// TestMapUintRoundTrips covers CanUint() and CanFloat() branches in serMap serInt/serLong.
+func TestMapUintRoundTrips(t *testing.T) {
+	t.Run("uint_as_int", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"int"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]uint16{"a": 10, "b": 20}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]int32
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]int32{"a": 10, "b": 20}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("uint_as_long", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"long"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]uint32{"x": 100}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]int64
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]int64{"x": 100}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("float64_as_int", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"int"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]float64{"a": 10.0}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]int32
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]int32{"a": 10}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("float64_as_long", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"long"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]float64{"x": 100.0}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]int64
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]int64{"x": 100}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
+
+// TestArraySerTypeMismatch covers error paths in serArray specialized methods
+// when elements have the wrong type.
+func TestArraySerTypeMismatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		input  any
+	}{
+		{"string_bad", `{"type":"array","items":"string"}`, &[]int{1}},
+		{"boolean_bad", `{"type":"array","items":"boolean"}`, &[]int{1}},
+		{"int_bad", `{"type":"array","items":"int"}`, &[]string{"x"}},
+		{"long_bad", `{"type":"array","items":"long"}`, &[]string{"x"}},
+		{"float_bad", `{"type":"array","items":"float"}`, &[]string{"x"}},
+		{"double_bad", `{"type":"array","items":"double"}`, &[]string{"x"}},
 	}
-	schema := `{
-		"type": "record",
-		"name": "Wrapper",
-		"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
-	}`
-	input := Wrapper{Vals: []int32{10, 20, 30}}
-	got := roundTrip(t, schema, input)
-	if !reflect.DeepEqual(got.Vals, input.Vals) {
-		t.Errorf("got %v, want %v", got.Vals, input.Vals)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encodeErr(t, tt.schema, tt.input)
+		})
 	}
 }
 
-// TestArrayDirectStringDeser covers udArrayDirect/usArrayDirect for []string.
-func TestArrayDirectStringDeser(t *testing.T) {
-	type Wrapper struct {
-		Vals []string `avro:"vals"`
+// TestMapSerTypeMismatch covers error paths in serMap specialized methods
+// when values have the wrong type.
+func TestMapSerTypeMismatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		input  any
+	}{
+		{"string_bad", `{"type":"map","values":"string"}`, &map[string]int{"a": 1}},
+		{"boolean_bad", `{"type":"map","values":"boolean"}`, &map[string]int{"a": 1}},
+		{"int_bad", `{"type":"map","values":"int"}`, &map[string]string{"a": "x"}},
+		{"long_bad", `{"type":"map","values":"long"}`, &map[string]string{"a": "x"}},
+		{"float_bad", `{"type":"map","values":"float"}`, &map[string]string{"a": "x"}},
+		{"double_bad", `{"type":"map","values":"double"}`, &map[string]string{"a": "x"}},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encodeErr(t, tt.schema, tt.input)
+		})
+	}
+}
+
+// TestArraySerNotSlice covers the "not a slice/array" error path in
+// serArray specialized methods.
+func TestArraySerNotSlice(t *testing.T) {
+	schemas := []string{
+		`{"type":"array","items":"string"}`,
+		`{"type":"array","items":"boolean"}`,
+		`{"type":"array","items":"int"}`,
+		`{"type":"array","items":"long"}`,
+		`{"type":"array","items":"float"}`,
+		`{"type":"array","items":"double"}`,
+	}
+	for _, schema := range schemas {
+		t.Run(schema, func(t *testing.T) {
+			bad := "not a slice"
+			encodeErr(t, schema, &bad)
+		})
+	}
+}
+
+// TestMapSerNotMap covers the "not a map" error path in serMap specialized methods.
+func TestMapSerNotMap(t *testing.T) {
+	schemas := []string{
+		`{"type":"map","values":"string"}`,
+		`{"type":"map","values":"boolean"}`,
+		`{"type":"map","values":"int"}`,
+		`{"type":"map","values":"long"}`,
+		`{"type":"map","values":"float"}`,
+		`{"type":"map","values":"double"}`,
+	}
+	for _, schema := range schemas {
+		t.Run(schema, func(t *testing.T) {
+			bad := "not a map"
+			encodeErr(t, schema, &bad)
+		})
+	}
+}
+
+// TestArrayDeserTruncatedPrimitives covers error paths in fast array deser
+// loops when the source buffer is truncated.
+func TestArrayDeserTruncatedPrimitives(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		input  any
+	}{
+		{"boolean", `{"type":"array","items":"boolean"}`, &[]bool{true, false}},
+		{"long", `{"type":"array","items":"long"}`, &[]int64{100, 200}},
+		{"float", `{"type":"array","items":"float"}`, &[]float32{1.1, 2.2}},
+		{"double", `{"type":"array","items":"double"}`, &[]float64{1.11, 2.22}},
+		{"string", `{"type":"array","items":"string"}`, &[]string{"hello", "world"}},
+		{"int", `{"type":"array","items":"int"}`, &[]int32{10, 20}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := s.AppendEncode(nil, tt.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Truncate: keep the block count but remove some item data.
+			truncated := dst[:len(dst)/2]
+			out := reflect.New(reflect.TypeOf(tt.input).Elem()).Interface()
+			_, err = s.Decode(truncated, out)
+			if err == nil {
+				t.Fatal("expected error for truncated data")
+			}
+		})
+	}
+}
+
+// TestMapDeserTruncatedPrimitives covers error paths in fast map deser
+// block functions when the source buffer is truncated.
+func TestMapDeserTruncatedPrimitives(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		input  any
+	}{
+		{"boolean", `{"type":"map","values":"boolean"}`, &map[string]bool{"aa": true, "bb": false}},
+		{"long", `{"type":"map","values":"long"}`, &map[string]int64{"aa": 100, "bb": 200}},
+		{"float", `{"type":"map","values":"float"}`, &map[string]float32{"aa": 1.1, "bb": 2.2}},
+		{"double", `{"type":"map","values":"double"}`, &map[string]float64{"aa": 1.11, "bb": 2.22}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := s.AppendEncode(nil, tt.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Truncate: keep the block count but remove some data.
+			truncated := dst[:len(dst)/2]
+			out := reflect.New(reflect.TypeOf(tt.input).Elem()).Interface()
+			_, err = s.Decode(truncated, out)
+			if err == nil {
+				t.Fatal("expected error for truncated data")
+			}
+		})
+	}
+}
+
+// TestArrayFastLoopErrors covers error paths inside the specialized fast
+// loop functions (deserArrayStringLoop, etc.) by crafting payloads where
+// the block count passes the outer sanity check but element data is malformed.
+func TestArrayFastLoopErrors(t *testing.T) {
+	t.Run("string_negative_length", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, then a negative varlong for string length (-1 = zigzag 0x01).
+		data := []byte{0x02, 0x01} // count=1, string_len=-1
+		var got []string
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for negative string length")
+		}
+	})
+	t.Run("string_short_buffer", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, string length=10 (zigzag=20=0x28), but only 2 bytes of data.
+		data := []byte{0x02, 0x28, 'a', 'b'}
+		var got []string
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for short string buffer")
+		}
+	})
+	t.Run("boolean_short", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"boolean"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=2, but only 1 boolean byte. count(2) <= len(src)(1) passes
+		// outer check, but inner loop fails on second element.
+		data := []byte{0x04, 0x01}
+		var got []bool
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for short boolean buffer")
+		}
+	})
+	t.Run("int_truncated", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"int"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=2, first int=0 (1 byte), then 0x80 (continuation bit, truncated).
+		// count(2) <= len(src)(2) passes outer check, but readVarint fails on second element.
+		data := []byte{0x04, 0x00, 0x80}
+		var got []int32
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated int data")
+		}
+	})
+	t.Run("long_truncated", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"long"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Same pattern: count=2, first long=0, second truncated varlong.
+		data := []byte{0x04, 0x00, 0x80}
+		var got []int64
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated long data")
+		}
+	})
+	t.Run("float_truncated", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"float"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=2, first float=4 valid bytes, second only 2 bytes.
+		// count(2) <= len(src)(6) passes, but readUint32 fails on second.
+		data := []byte{0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+		var got []float32
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated float data")
+		}
+	})
+	t.Run("double_truncated", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":"double"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=2, first double=8 valid bytes, second only 4 bytes.
+		// count(2) <= len(src)(12) passes, but readUint64 fails on second.
+		data := []byte{0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+		var got []float64
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated double data")
+		}
+	})
+}
+
+// TestMapFastBlockErrors covers error paths inside the specialized fast
+// block functions by crafting payloads where block count passes the outer
+// sanity check but key or value data is malformed.
+func TestMapFastBlockErrors(t *testing.T) {
+	t.Run("string_key_readvarlong_error", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, then 0x80 (continuation bit, truncated varlong for key length).
+		data := []byte{0x02, 0x80}
+		var got map[string]string
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated key varlong")
+		}
+	})
+	t.Run("string_key_bad_length", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, key_len=10 but only 2 bytes available.
+		data := []byte{0x02, 0x28, 'a', 'b'}
+		var got map[string]string
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for bad map key length")
+		}
+	})
+	t.Run("string_value_readvarlong_error", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, key_len=1, key="a", then 0x80 (truncated value length varlong).
+		data := []byte{0x02, 0x02, 'a', 0x80}
+		var got map[string]string
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated value varlong")
+		}
+	})
+	t.Run("string_value_truncated", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, key_len=1, key="a", value_len=10 but truncated.
+		data := []byte{0x02, 0x02, 'a', 0x28, 'b'}
+		var got map[string]string
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated map string value")
+		}
+	})
+	t.Run("boolean_key_bad_length", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"boolean"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, key_len=10 but truncated.
+		data := []byte{0x02, 0x28, 'a'}
+		var got map[string]bool
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for bad map key length")
+		}
+	})
+	t.Run("boolean_value_short", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"boolean"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, key_len=1, key="a", but no boolean byte.
+		data := []byte{0x02, 0x02, 'a'}
+		var got map[string]bool
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for missing boolean value")
+		}
+	})
+	t.Run("long_key_bad_length", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"long"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, negative key_len (-1 = zigzag 0x01).
+		data := []byte{0x02, 0x01}
+		var got map[string]int64
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for negative map key length")
+		}
+	})
+	t.Run("long_value_truncated", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"long"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, key_len=1, key="a", then truncated varlong value.
+		data := []byte{0x02, 0x02, 'a', 0x80}
+		var got map[string]int64
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated long value")
+		}
+	})
+	t.Run("float_key_bad_length", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"float"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, negative key_len.
+		data := []byte{0x02, 0x01}
+		var got map[string]float32
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for negative map key length")
+		}
+	})
+	t.Run("float_value_truncated", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"float"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, key_len=1, key="a", only 2 of 4 float bytes.
+		data := []byte{0x02, 0x02, 'a', 0x00, 0x00}
+		var got map[string]float32
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated float value")
+		}
+	})
+	t.Run("double_key_bad_length", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"double"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, negative key_len.
+		data := []byte{0x02, 0x01}
+		var got map[string]float64
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for negative map key length")
+		}
+	})
+	t.Run("double_value_truncated", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"double"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, key_len=1, key="a", only 4 of 8 double bytes.
+		data := []byte{0x02, 0x02, 'a', 0x00, 0x00, 0x00, 0x00}
+		var got map[string]float64
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for truncated double value")
+		}
+	})
+}
+
+// TestMapSlowPathErrors covers error paths in the deserMap slow path
+// (non-fast-block) by decoding truncated data into any (interface target).
+func TestMapSlowPathErrors(t *testing.T) {
+	t.Run("key_readvarlong_error", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, then a truncated varlong for the key length.
+		data := []byte{0x02, 0x80}
+		var got any
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("key_invalid_length", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":"string"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Block count=1, key_len=-1 (zigzag 0x01).
+		data := []byte{0x02, 0x01}
+		var got any
+		if _, err := s.Decode(data, &got); err == nil {
+			t.Fatal("expected error for negative key length")
+		}
+	})
+	t.Run("value_deser_error", func(t *testing.T) {
+		// Use a map with record values to exercise the slow path (non-fast-block).
+		// Encode valid first entry, but truncate second entry's value data.
+		schema := `{"type":"map","values":{"type":"record","name":"R","fields":[{"name":"n","type":"int"}]}}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type R struct {
+			N int32 `avro:"n"`
+		}
+		input := map[string]R{"a": {N: 1}, "b": {N: 2}}
+		dst, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Truncate last 2 bytes to corrupt second entry's value.
+		truncated := dst[:len(dst)-2]
+		var got map[string]R
+		if _, err := s.Decode(truncated, &got); err == nil {
+			t.Fatal("expected error for truncated map value")
+		}
+	})
+}
+
+// TestGenericArrayDeserError covers the error path in the generic
+// (non-fast-loop) array deser when deserItem fails.
+func TestGenericArrayDeserError(t *testing.T) {
+	// Use array of records (non-primitive) to exercise generic deser path.
+	// Decode into any (interface) to ensure we go through the reflect path,
+	// not the unsafe struct path.
+	schema := `{"type":"array","items":{"type":"record","name":"R","fields":[{"name":"n","type":"int"}]}}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Craft binary: count=2 passes sanity check, record1 decodes OK,
+	// record2 has malformed varint causing deserItem error at L508.
+	// count=2 (varlong 0x04), record1 n=1 (varint 0x02),
+	// record2 n=malformed (0x80 continuation bit, no following byte).
+	data := []byte{0x04, 0x02, 0x80}
+	var got any
+	if _, err := s.Decode(data, &got); err == nil {
+		t.Fatal("expected error for malformed array item")
+	}
+}
+
+// TestSerOverflowErrors covers overflow error paths in specialized
+// ser functions for int/long arrays and maps.
+func TestSerOverflowErrors(t *testing.T) {
+	// Array int overflow errors.
+	t.Run("array_int_overflow_int64", func(t *testing.T) {
+		encodeErr(t, `{"type":"array","items":"int"}`, &[]int64{math.MaxInt32 + 1})
+	})
+	t.Run("array_int_overflow_uint64", func(t *testing.T) {
+		encodeErr(t, `{"type":"array","items":"int"}`, &[]uint64{math.MaxInt32 + 1})
+	})
+	t.Run("array_int_fractional_float", func(t *testing.T) {
+		encodeErr(t, `{"type":"array","items":"int"}`, &[]float64{1.5})
+	})
+	t.Run("array_int_overflow_float", func(t *testing.T) {
+		encodeErr(t, `{"type":"array","items":"int"}`, &[]float64{float64(math.MaxInt32) + 100})
+	})
+	// Array long overflow errors.
+	t.Run("array_long_fractional_float", func(t *testing.T) {
+		encodeErr(t, `{"type":"array","items":"long"}`, &[]float64{1.5})
+	})
+	t.Run("array_long_overflow_float", func(t *testing.T) {
+		encodeErr(t, `{"type":"array","items":"long"}`, &[]float64{1e19})
+	})
+	// Map int overflow errors.
+	t.Run("map_int_overflow_int64", func(t *testing.T) {
+		encodeErr(t, `{"type":"map","values":"int"}`, &map[string]int64{"a": math.MaxInt32 + 1})
+	})
+	t.Run("map_int_overflow_uint64", func(t *testing.T) {
+		encodeErr(t, `{"type":"map","values":"int"}`, &map[string]uint64{"a": math.MaxInt32 + 1})
+	})
+	t.Run("map_int_fractional_float", func(t *testing.T) {
+		encodeErr(t, `{"type":"map","values":"int"}`, &map[string]float64{"a": 1.5})
+	})
+	t.Run("map_int_overflow_float", func(t *testing.T) {
+		encodeErr(t, `{"type":"map","values":"int"}`, &map[string]float64{"a": float64(math.MaxInt32) + 100})
+	})
+	// Map long overflow errors.
+	t.Run("map_long_fractional_float", func(t *testing.T) {
+		encodeErr(t, `{"type":"map","values":"long"}`, &map[string]float64{"a": 1.5})
+	})
+	t.Run("map_long_overflow_float", func(t *testing.T) {
+		encodeErr(t, `{"type":"map","values":"long"}`, &map[string]float64{"a": 1e19})
+	})
+}
+
+// TestSerGenericArrayMapErrors covers error and edge paths in the generic
+// (non-specialized) serArray.ser and serMap.ser methods.
+func TestSerGenericArrayMapErrors(t *testing.T) {
+	// Generic serArray.ser is used for non-primitive array items (e.g., records).
+	recordArraySchema := `{"type":"array","items":{"type":"record","name":"R","fields":[{"name":"n","type":"int"}]}}`
+	t.Run("array_generic_nil_pointer", func(t *testing.T) {
+		type R struct{ N int32 }
+		encodeErr(t, recordArraySchema, (*[]R)(nil))
+	})
+	t.Run("array_generic_not_slice", func(t *testing.T) {
+		bad := "not a slice"
+		encodeErr(t, recordArraySchema, &bad)
+	})
+	t.Run("array_generic_empty", func(t *testing.T) {
+		type R struct {
+			N int32 `avro:"n"`
+		}
+		input := []R{}
+		got := roundTrip(t, recordArraySchema, input)
+		if len(got) != 0 {
+			t.Errorf("expected empty slice, got %v", got)
+		}
+	})
+	t.Run("array_generic_item_error", func(t *testing.T) {
+		// Pass wrong struct type to trigger serItem error.
+		type Wrong struct {
+			X string `avro:"x"` // field name mismatch
+		}
+		bad := []Wrong{{X: "oops"}}
+		encodeErr(t, recordArraySchema, &bad)
+	})
+	// Generic serMap.ser is used for non-primitive map values.
+	recordMapSchema := `{"type":"map","values":{"type":"record","name":"R2","fields":[{"name":"n","type":"int"}]}}`
+	t.Run("map_generic_nil_pointer", func(t *testing.T) {
+		type R2 struct{ N int32 }
+		encodeErr(t, recordMapSchema, (*map[string]R2)(nil))
+	})
+	t.Run("map_generic_not_map", func(t *testing.T) {
+		bad := "not a map"
+		encodeErr(t, recordMapSchema, &bad)
+	})
+	t.Run("map_generic_empty", func(t *testing.T) {
+		type R2 struct {
+			N int32 `avro:"n"`
+		}
+		input := map[string]R2{}
+		got := roundTrip(t, recordMapSchema, input)
+		if len(got) != 0 {
+			t.Errorf("expected empty map, got %v", got)
+		}
+	})
+	t.Run("map_generic_value_error", func(t *testing.T) {
+		type Wrong struct {
+			X string `avro:"x"`
+		}
+		bad := map[string]Wrong{"a": {X: "oops"}}
+		encodeErr(t, recordMapSchema, &bad)
+	})
+}
+
+// TestSerSpecializedEmpty covers the l==0 early return in specialized
+// ser methods for both arrays and maps.
+func TestSerSpecializedEmpty(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		input  any
+	}{
+		{"array_string", `{"type":"array","items":"string"}`, &[]string{}},
+		{"array_boolean", `{"type":"array","items":"boolean"}`, &[]bool{}},
+		{"array_int", `{"type":"array","items":"int"}`, &[]int32{}},
+		{"array_long", `{"type":"array","items":"long"}`, &[]int64{}},
+		{"array_float", `{"type":"array","items":"float"}`, &[]float32{}},
+		{"array_double", `{"type":"array","items":"double"}`, &[]float64{}},
+		{"map_string", `{"type":"map","values":"string"}`, &map[string]string{}},
+		{"map_boolean", `{"type":"map","values":"boolean"}`, &map[string]bool{}},
+		{"map_int", `{"type":"map","values":"int"}`, &map[string]int32{}},
+		{"map_long", `{"type":"map","values":"long"}`, &map[string]int64{}},
+		{"map_float", `{"type":"map","values":"float"}`, &map[string]float32{}},
+		{"map_double", `{"type":"map","values":"double"}`, &map[string]float64{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := s.AppendEncode(nil, tt.input)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			// Empty array/map encodes as just a zero block count.
+			if len(dst) != 1 || dst[0] != 0 {
+				t.Errorf("expected [0x00], got %v", dst)
+			}
+		})
+	}
+}
+
+// TestSerSpecializedNilPointer covers the indirect error path in
+// specialized ser methods when given a nil pointer.
+func TestSerSpecializedNilPointer(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		input  any
+	}{
+		{"array_string", `{"type":"array","items":"string"}`, (*[]string)(nil)},
+		{"array_boolean", `{"type":"array","items":"boolean"}`, (*[]bool)(nil)},
+		{"array_int", `{"type":"array","items":"int"}`, (*[]int32)(nil)},
+		{"array_long", `{"type":"array","items":"long"}`, (*[]int64)(nil)},
+		{"array_float", `{"type":"array","items":"float"}`, (*[]float32)(nil)},
+		{"array_double", `{"type":"array","items":"double"}`, (*[]float64)(nil)},
+		{"map_string", `{"type":"map","values":"string"}`, (*map[string]string)(nil)},
+		{"map_boolean", `{"type":"map","values":"boolean"}`, (*map[string]bool)(nil)},
+		{"map_int", `{"type":"map","values":"int"}`, (*map[string]int32)(nil)},
+		{"map_long", `{"type":"map","values":"long"}`, (*map[string]int64)(nil)},
+		{"map_float", `{"type":"map","values":"float"}`, (*map[string]float32)(nil)},
+		{"map_double", `{"type":"map","values":"double"}`, (*map[string]float64)(nil)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encodeErr(t, tt.schema, tt.input)
+		})
+	}
+}
+
+// TestTimeOverflow covers overflow error paths in time-millis/time-micros
+// serialization and deserialization.
+func TestTimeOverflow(t *testing.T) {
+	t.Run("ser_time_millis_overflow", func(t *testing.T) {
+		// A duration too large for int32 milliseconds.
+		schema := `{"type":"int","logicalType":"time-millis"}`
+		d := time.Duration(math.MaxInt32+1) * time.Millisecond
+		encodeErr(t, schema, &d)
+	})
+	t.Run("ser_time_millis_overflow_unsafe", func(t *testing.T) {
+		// Through the unsafe path (struct field).
+		type W struct {
+			T time.Duration `avro:"t"`
+		}
+		schema := `{"type":"record","name":"W","fields":[{"name":"t","type":{"type":"int","logicalType":"time-millis"}}]}`
+		w := W{T: time.Duration(math.MaxInt32+1) * time.Millisecond}
+		encodeErr(t, schema, &w)
+	})
+	t.Run("deser_time_micros_overflow", func(t *testing.T) {
+		// Encode a raw long value that overflows when converted to time.Duration.
+		schema := `{"type":"long","logicalType":"time-micros"}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Encode MaxInt64 as raw long (it will overflow when * Microsecond).
+		var big int64 = math.MaxInt64
+		dst, err := s.AppendEncode(nil, &big)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var d time.Duration
+		_, err = s.Decode(dst, &d)
+		if err == nil {
+			t.Fatal("expected overflow error for time-micros")
+		}
+	})
+	t.Run("deser_time_micros_overflow_unsafe", func(t *testing.T) {
+		type W struct {
+			T time.Duration `avro:"t"`
+		}
+		schema := `{"type":"record","name":"W","fields":[{"name":"t","type":{"type":"long","logicalType":"time-micros"}}]}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Encode a record with a huge long value for time-micros.
+		rawSchema := `{"type":"record","name":"W","fields":[{"name":"t","type":"long"}]}`
+		rawS, err := Parse(rawSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type RawW struct {
+			T int64 `avro:"t"`
+		}
+		raw := RawW{T: math.MaxInt64}
+		dst, err := rawS.AppendEncode(nil, &raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got W
+		_, err = s.Decode(dst, &got)
+		if err == nil {
+			t.Fatal("expected overflow error for time-micros")
+		}
+	})
+}
+
+// TestUsIntOverflow covers overflow paths in unsafe.go usInt for
+// int, int64, uint, uint32, uint64 types that overflow int32.
+func TestUsIntOverflow(t *testing.T) {
+	schema := `{"type":"record","name":"W","fields":[{"name":"v","type":"int"}]}`
+	t.Run("int_overflow", func(t *testing.T) {
+		type W struct {
+			V int `avro:"v"`
+		}
+		encodeErr(t, schema, &W{V: math.MaxInt32 + 1})
+	})
+	t.Run("int64_overflow", func(t *testing.T) {
+		type W struct {
+			V int64 `avro:"v"`
+		}
+		encodeErr(t, schema, &W{V: math.MaxInt32 + 1})
+	})
+	t.Run("uint_overflow", func(t *testing.T) {
+		type W struct {
+			V uint `avro:"v"`
+		}
+		encodeErr(t, schema, &W{V: math.MaxInt32 + 1})
+	})
+	t.Run("uint32_overflow", func(t *testing.T) {
+		type W struct {
+			V uint32 `avro:"v"`
+		}
+		encodeErr(t, schema, &W{V: math.MaxInt32 + 1})
+	})
+	t.Run("uint64_overflow", func(t *testing.T) {
+		type W struct {
+			V uint64 `avro:"v"`
+		}
+		encodeErr(t, schema, &W{V: math.MaxInt32 + 1})
+	})
+}
+
+// TestSerFixedDefault covers the default case in serSize.ser (fixed)
+// when given a type that is neither array, slice, nor uint8-based.
+func TestSerFixedDefault(t *testing.T) {
+	encodeErr(t, `{"type":"fixed","name":"f","size":4}`, &struct{}{})
+}
+
+// TestNullSecondUnionForwardRef covers the buildUnion branch for
+// ["type","null"] unions where the type is a forward reference to a
+// record defined later in the same parent record's fields.
+func TestNullSecondUnionForwardRef(t *testing.T) {
+	// Field "b" references "B" which is defined later in field "c".
+	// This exercises the isMissing check at schema.go L461.
 	schema := `{
 		"type": "record",
-		"name": "Wrapper",
-		"fields": [{"name": "vals", "type": {"type": "array", "items": "string"}}]
+		"name": "A",
+		"fields": [
+			{"name": "b", "type": ["B", "null"]},
+			{"name": "c", "type": {"type": "record", "name": "B", "fields": [{"name": "x", "type": "int"}]}}
+		]
 	}`
-	input := Wrapper{Vals: []string{"a", "bb", "ccc"}}
-	got := roundTrip(t, schema, input)
-	if !reflect.DeepEqual(got.Vals, input.Vals) {
-		t.Errorf("got %v, want %v", got.Vals, input.Vals)
+	type B struct {
+		X int32 `avro:"x"`
 	}
+	type A struct {
+		B *B `avro:"b"`
+		C B  `avro:"c"`
+	}
+	input := A{B: &B{X: 42}, C: B{X: 7}}
+	got := roundTrip(t, schema, input)
+	if got.B == nil || got.B.X != 42 || got.C.X != 7 {
+		t.Errorf("got %+v", got)
+	}
+	// Also test nil (null second).
+	input2 := A{B: nil, C: B{X: 7}}
+	got2 := roundTrip(t, schema, input2)
+	if got2.B != nil {
+		t.Errorf("got %+v, want B=nil", got2)
+	}
+}
+
+// TestDecimalScale covers the decimal logical type with explicit scale
+// for both bytes and fixed types.
+func TestDecimalScale(t *testing.T) {
+	t.Run("bytes", func(t *testing.T) {
+		schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		val := big.NewRat(314, 100)
+		dst, err := s.AppendEncode(nil, val)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got big.Rat
+		_, err = s.Decode(dst, &got)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("fixed", func(t *testing.T) {
+		schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":10,"scale":2}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		val := big.NewRat(314, 100)
+		dst, err := s.AppendEncode(nil, val)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got big.Rat
+		_, err = s.Decode(dst, &got)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("fixed_no_scale", func(t *testing.T) {
+		// Decimal with precision but no explicit scale (scale defaults to 0).
+		schema := `{"type":"fixed","name":"dec2","size":8,"logicalType":"decimal","precision":10}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		val := big.NewRat(314, 1) // integer value, scale=0
+		dst, err := s.AppendEncode(nil, val)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got big.Rat
+		_, err = s.Decode(dst, &got)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 // TestArrayRecordValueDeser covers usArrayRecord for []T (value slice).
