@@ -56,14 +56,14 @@ func TestCheckWriterUnionDeepRecursionFailure(t *testing.T) {
 	// Both reader and writer are unions. kindsMatch passes for all branches
 	// (records have the same name), but deep compatibility check fails because
 	// a reader field has no default and is missing from writer.
-	reader, err := NewSchema(`["null", {"type":"record","name":"R","fields":[
+	reader, err := Parse(`["null", {"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string"}
 	]}]`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer, err := NewSchema(`["null", {"type":"record","name":"R","fields":[
+	writer, err := Parse(`["null", {"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"}
 	]}]`)
 	if err != nil {
@@ -283,11 +283,11 @@ func TestCheckCompatibility(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reader, err := NewSchema(tt.reader)
+			reader, err := Parse(tt.reader)
 			if err != nil {
 				t.Fatalf("reader schema: %v", err)
 			}
-			writer, err := NewSchema(tt.writer)
+			writer, err := Parse(tt.writer)
 			if err != nil {
 				t.Fatalf("writer schema: %v", err)
 			}

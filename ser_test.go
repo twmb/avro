@@ -38,7 +38,7 @@ func BenchmarkSerialize(b *testing.B) {
 		},
 	}
 
-	s, err := NewSchema(`
+	s, err := Parse(`
 
 ["null",
 {
@@ -102,7 +102,7 @@ func BenchmarkRecursive(b *testing.B) {
 		},
 	}
 
-	s, err := NewSchema(`
+	s, err := Parse(`
 {
   "type": "record",
   "name": "LongList",
@@ -144,7 +144,7 @@ func TestEmbed(t *testing.T) {
 		Name: "test",
 	}
 
-	s, err := NewSchema(`
+	s, err := Parse(`
 {
   "type": "record",
   "name": "UDM",
@@ -169,9 +169,9 @@ func TestEmbed(t *testing.T) {
 
 func encodeErr(t *testing.T, schema string, v any) {
 	t.Helper()
-	s, err := NewSchema(schema)
+	s, err := Parse(schema)
 	if err != nil {
-		t.Fatalf("NewSchema: %v", err)
+		t.Fatalf("Parse: %v", err)
 	}
 	_, err = s.AppendEncode(nil, v)
 	if err == nil {
@@ -238,7 +238,7 @@ func TestSerEnumErrors(t *testing.T) {
 	})
 
 	t.Run("uint encode", func(t *testing.T) {
-		s, err := NewSchema(schema)
+		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -252,7 +252,7 @@ func TestSerEnumErrors(t *testing.T) {
 	})
 
 	t.Run("int encode", func(t *testing.T) {
-		s, err := NewSchema(schema)
+		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -273,7 +273,7 @@ func TestSerRecordAsMap(t *testing.T) {
 	]}`
 
 	t.Run("success", func(t *testing.T) {
-		s, err := NewSchema(schema)
+		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -353,7 +353,7 @@ type valStringer struct{ v string }
 func (vs valStringer) String() string { return vs.v }
 
 func TestSerStringStringer(t *testing.T) {
-	s, err := NewSchema(`"string"`)
+	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +369,7 @@ func TestSerStringStringer(t *testing.T) {
 }
 
 func TestSerStringTextMarshaler(t *testing.T) {
-	s, err := NewSchema(`"string"`)
+	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +384,7 @@ func TestSerStringTextMarshaler(t *testing.T) {
 }
 
 func TestSerStringTextMarshalerError(t *testing.T) {
-	s, err := NewSchema(`"string"`)
+	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestSerStringTextMarshalerError(t *testing.T) {
 }
 
 func TestSerFixedNonAddressable(t *testing.T) {
-	s, err := NewSchema(`{"type":"fixed","name":"f","size":4}`)
+	s, err := Parse(`{"type":"fixed","name":"f","size":4}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +411,7 @@ func TestSerFixedNonAddressable(t *testing.T) {
 }
 
 func TestSerBytesNonAddressable(t *testing.T) {
-	s, err := NewSchema(`"bytes"`)
+	s, err := Parse(`"bytes"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -538,7 +538,7 @@ func TestSerMapValueError(t *testing.T) {
 
 func TestSerFixedNonAddressableValue(t *testing.T) {
 	// Pass array by value (not pointer) to exercise non-addressable path.
-	s, err := NewSchema(`{"type":"fixed","name":"f","size":4}`)
+	s, err := Parse(`{"type":"fixed","name":"f","size":4}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,7 +556,7 @@ func TestSerFixedNonAddressableValue(t *testing.T) {
 
 func TestSerBytesNonAddressableValue(t *testing.T) {
 	// Pass byte array by value to exercise non-addressable doSerBytes path.
-	s, err := NewSchema(`"bytes"`)
+	s, err := Parse(`"bytes"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +581,7 @@ func TestInterface(t *testing.T) {
 		S stringer `avro:"s"`
 	}
 
-	s, err := NewSchema(`
+	s, err := Parse(`
 {
   "type": "record",
   "name": "iface",

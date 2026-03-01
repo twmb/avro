@@ -25,7 +25,7 @@ type person struct {
 }
 
 func TestRoundTrip(t *testing.T) {
-	s, err := avro.NewSchema(recordSchema)
+	s, err := avro.Parse(recordSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestDeflate(t *testing.T) {
-	s, err := avro.NewSchema(recordSchema)
+	s, err := avro.Parse(recordSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestDeflate(t *testing.T) {
 }
 
 func TestMultipleBlocks(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestMultipleBlocks(t *testing.T) {
 }
 
 func TestCustomBlockCount(t *testing.T) {
-	s, err := avro.NewSchema(`"string"`)
+	s, err := avro.Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestCustomBlockCount(t *testing.T) {
 }
 
 func TestMetadata(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestMetadata(t *testing.T) {
 }
 
 func TestReaderSchema(t *testing.T) {
-	s, err := avro.NewSchema(recordSchema)
+	s, err := avro.Parse(recordSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestReaderSchema(t *testing.T) {
 }
 
 func TestEmpty(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func (x xorCodec) Decompress(src []byte) ([]byte, error) {
 }
 
 func TestCustomCodec(t *testing.T) {
-	s, err := avro.NewSchema(`"long"`)
+	s, err := avro.Parse(`"long"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestBadMagic(t *testing.T) {
 }
 
 func TestUnknownCodec(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +381,7 @@ func TestUnknownCodec(t *testing.T) {
 }
 
 func TestBadSync(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +440,7 @@ func TestBadSync(t *testing.T) {
 }
 
 func TestPrimitiveSchema(t *testing.T) {
-	s, err := avro.NewSchema(`"string"`)
+	s, err := avro.Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +481,7 @@ func TestPrimitiveSchema(t *testing.T) {
 }
 
 func TestBlockCountZeroOrNegative(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +512,7 @@ func TestBlockCountZeroOrNegative(t *testing.T) {
 }
 
 func TestCloseIdempotent(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +532,7 @@ func TestCloseIdempotent(t *testing.T) {
 }
 
 func TestCloseFlushError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +553,7 @@ func TestCloseFlushError(t *testing.T) {
 }
 
 func TestStickyWriteError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +601,7 @@ func TestShortHeader(t *testing.T) {
 }
 
 func TestDeflateRoundTripLarge(t *testing.T) {
-	s, err := avro.NewSchema(`"string"`)
+	s, err := avro.Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +647,7 @@ func TestDeflateRoundTripLarge(t *testing.T) {
 }
 
 func TestEncodeError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,7 +678,7 @@ func (failCompressCodec) Compress([]byte) ([]byte, error) {
 func (failCompressCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
 
 func TestCompressError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -725,7 +725,7 @@ func TestMissingSchemaInFile(t *testing.T) {
 }
 
 func TestTruncatedBlockCount(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -753,7 +753,7 @@ func TestTruncatedBlockCount(t *testing.T) {
 }
 
 func TestTruncatedBlockSize(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -780,7 +780,7 @@ func TestTruncatedBlockSize(t *testing.T) {
 }
 
 func TestTruncatedBlockData(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -808,7 +808,7 @@ func TestTruncatedBlockData(t *testing.T) {
 }
 
 func TestTruncatedBlockSyncMarker(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -837,7 +837,7 @@ func TestTruncatedBlockSyncMarker(t *testing.T) {
 }
 
 func TestNegativeBlockSize(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -875,7 +875,7 @@ func (failDecompressCodec) Decompress([]byte) ([]byte, error) {
 }
 
 func TestDecompressError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -908,7 +908,7 @@ func TestDecompressError(t *testing.T) {
 
 func TestDecodeError(t *testing.T) {
 	// Write a string value, then try to decode as int.
-	s, err := avro.NewSchema(`"string"`)
+	s, err := avro.Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -938,7 +938,7 @@ func TestDecodeError(t *testing.T) {
 
 func TestTrailingBytesInBlock(t *testing.T) {
 	// Construct a block where item count is 1 but the data has extra bytes.
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1094,7 +1094,7 @@ func TestOptMarkerMethods(t *testing.T) {
 }
 
 func TestHeaderWriteError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1172,7 +1172,7 @@ func TestRandReadError(t *testing.T) {
 	randRead = func(b []byte) (int, error) { return 0, errors.New("rand failed") }
 	defer func() { randRead = orig }()
 
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1186,7 +1186,7 @@ func TestRandReadError(t *testing.T) {
 }
 
 func TestBlockCountNegative(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1265,7 +1265,7 @@ func (s *seekBuf) Seek(offset int64, whence int) (int64, error) {
 // ---------- New feature tests ----------
 
 func TestFlush(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1321,7 +1321,7 @@ func TestFlush(t *testing.T) {
 }
 
 func TestFlushEmpty(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1350,7 +1350,7 @@ func TestFlushEmpty(t *testing.T) {
 }
 
 func TestFlushAfterError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1372,7 +1372,7 @@ func TestFlushAfterError(t *testing.T) {
 }
 
 func TestWithSyncMarker(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1416,7 +1416,7 @@ func TestWithSyncMarker(t *testing.T) {
 }
 
 func TestWithBlockBytes(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1460,7 +1460,7 @@ func TestWithBlockBytes(t *testing.T) {
 }
 
 func TestWithBlockBytesAndBlockCount(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1503,7 +1503,7 @@ func TestWithBlockBytesAndBlockCount(t *testing.T) {
 }
 
 func TestWithBlockCountZero(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1546,7 +1546,7 @@ func TestWithBlockCountZero(t *testing.T) {
 }
 
 func TestReset(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1601,7 +1601,7 @@ func TestReset(t *testing.T) {
 }
 
 func TestResetClearsError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1645,7 +1645,7 @@ func TestResetClearsError(t *testing.T) {
 }
 
 func TestResetFlushError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1669,7 +1669,7 @@ func TestResetFlushError(t *testing.T) {
 }
 
 func TestResetRandError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1694,7 +1694,7 @@ func TestResetRandError(t *testing.T) {
 }
 
 func TestAppendWriter(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1763,7 +1763,7 @@ func TestAppendWriterBadHeader(t *testing.T) {
 }
 
 func TestAppendWriterCustomCodec(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1826,7 +1826,7 @@ func TestAppendWriterCustomCodec(t *testing.T) {
 }
 
 func TestAppendWriterSeekError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1879,7 +1879,7 @@ func (f *failSeekRWS) Seek(int64, int) (int64, error) {
 }
 
 func TestAppendWriterUnknownCodec(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1908,7 +1908,7 @@ func TestAppendWriterUnknownCodec(t *testing.T) {
 }
 
 func TestWithBlockBytesNegative(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1939,7 +1939,7 @@ func TestWithBlockBytesNegative(t *testing.T) {
 }
 
 func TestAppendWriterBlockOpts(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1997,7 +1997,7 @@ func TestAppendWriterBlockOpts(t *testing.T) {
 }
 
 func TestResetHeaderWriteError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2020,7 +2020,7 @@ func TestResetHeaderWriteError(t *testing.T) {
 // ---------- Write (pre-encoded bytes) ----------
 
 func TestWrite(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2063,7 +2063,7 @@ func TestWrite(t *testing.T) {
 }
 
 func TestWriteAfterError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2086,7 +2086,7 @@ func TestWriteAfterError(t *testing.T) {
 }
 
 func TestWriteAutoFlush(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2135,7 +2135,7 @@ func TestWriteAutoFlush(t *testing.T) {
 }
 
 func TestWriteFlushError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2155,7 +2155,7 @@ func TestWriteFlushError(t *testing.T) {
 // ---------- Snappy codec ----------
 
 func TestSnappy(t *testing.T) {
-	s, err := avro.NewSchema(recordSchema)
+	s, err := avro.Parse(recordSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2238,7 +2238,7 @@ func TestSnappyDecompressBadData(t *testing.T) {
 // ---------- Zstd codec ----------
 
 func TestZstd(t *testing.T) {
-	s, err := avro.NewSchema(recordSchema)
+	s, err := avro.Parse(recordSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2292,7 +2292,7 @@ func TestZstd(t *testing.T) {
 // ---------- Codec close ----------
 
 func TestWriterCloseCodec(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2326,7 +2326,7 @@ func (c *trackCloseCodec) Close() error {
 }
 
 func TestWriterCloseCodecError(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2346,7 +2346,7 @@ type failCloseCodec struct{ nullCodec }
 func (failCloseCodec) Close() error { return errors.New("close failed") }
 
 func TestReaderClose(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2370,7 +2370,7 @@ func TestReaderClose(t *testing.T) {
 }
 
 func TestReaderCloseZstd(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2410,7 +2410,7 @@ func TestReaderCloseZstd(t *testing.T) {
 }
 
 func TestZstdCodecEncoderOpts(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2447,7 +2447,7 @@ func TestZstdCodecEncoderOpts(t *testing.T) {
 }
 
 func TestZstdCodecFromShared(t *testing.T) {
-	s, err := avro.NewSchema(`"int"`)
+	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2549,7 +2549,7 @@ func TestZstdCodecFromNilDecoder(t *testing.T) {
 
 func TestWithSchema(t *testing.T) {
 	fullSchema := `{"type":"record","name":"person","fields":[{"name":"name","type":"string","doc":"The name"},{"name":"age","type":"int"}]}`
-	s, err := avro.NewSchema(fullSchema)
+	s, err := avro.Parse(fullSchema)
 	if err != nil {
 		t.Fatal(err)
 	}

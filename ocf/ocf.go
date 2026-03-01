@@ -477,7 +477,7 @@ func readHeader(br *bufio.Reader) (schema *avro.Schema, meta map[string][]byte, 
 	if !ok {
 		return nil, nil, sync, errors.New("ocf: missing avro.schema in metadata")
 	}
-	schema, err = avro.NewSchema(string(schemaBytes))
+	schema, err = avro.Parse(string(schemaBytes))
 	if err != nil {
 		return nil, nil, sync, fmt.Errorf("ocf: parsing schema: %w", err)
 	}

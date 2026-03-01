@@ -7,7 +7,7 @@ import (
 )
 
 func TestResolveIdenticalSchemas(t *testing.T) {
-	s, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,11 +21,11 @@ func TestResolveIdenticalSchemas(t *testing.T) {
 }
 
 func TestResolveFieldAddedWithDefault(t *testing.T) {
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string","default":"hello"}]}`)
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string","default":"hello"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,11 +59,11 @@ func TestResolveFieldAddedWithDefault(t *testing.T) {
 }
 
 func TestResolveFieldRemoved(t *testing.T) {
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,11 +95,11 @@ func TestResolveFieldRemoved(t *testing.T) {
 }
 
 func TestResolveFieldRenamedViaAlias(t *testing.T) {
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"old_name","type":"int"}]}`)
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"old_name","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"new_name","type":"int","aliases":["old_name"]}]}`)
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"new_name","type":"int","aliases":["old_name"]}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,11 +144,11 @@ func TestResolveTypePromotion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			writer, err := NewSchema(tt.writerType)
+			writer, err := Parse(tt.writerType)
 			if err != nil {
 				t.Fatal(err)
 			}
-			reader, err := NewSchema(tt.readerType)
+			reader, err := Parse(tt.readerType)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -173,11 +173,11 @@ func TestResolveTypePromotion(t *testing.T) {
 }
 
 func TestResolveEnumEvolution(t *testing.T) {
-	writer, err := NewSchema(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`)
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestResolveEnumEvolution(t *testing.T) {
 }
 
 func TestResolveNestedRecords(t *testing.T) {
-	writer, err := NewSchema(`{
+	writer, err := Parse(`{
 		"type":"record","name":"Outer","fields":[
 			{"name":"inner","type":{
 				"type":"record","name":"Inner","fields":[
@@ -228,7 +228,7 @@ func TestResolveNestedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{
+	reader, err := Parse(`{
 		"type":"record","name":"Outer","fields":[
 			{"name":"inner","type":{
 				"type":"record","name":"Inner","fields":[
@@ -269,11 +269,11 @@ func TestResolveNestedRecords(t *testing.T) {
 }
 
 func TestResolveUnionEvolution(t *testing.T) {
-	writer, err := NewSchema(`["null","int"]`)
+	writer, err := Parse(`["null","int"]`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`["null","long"]`)
+	reader, err := Parse(`["null","long"]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,11 +319,11 @@ func TestResolveSelfReferencingRecord(t *testing.T) {
 			{"name":"next","type":["null","Node"]}
 		]
 	}`
-	writer, err := NewSchema(schema)
+	writer, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(schema)
+	reader, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,11 +359,11 @@ func TestResolveSelfReferencingRecord(t *testing.T) {
 }
 
 func TestResolveDecodeIntoStruct(t *testing.T) {
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"},{"name":"c","type":"double","default":3.14}]}`)
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"},{"name":"c","type":"double","default":3.14}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,11 +399,11 @@ func TestResolveDecodeIntoStruct(t *testing.T) {
 }
 
 func TestResolveDecodeIntoMap(t *testing.T) {
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int","default":99}]}`)
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int","default":99}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,11 +431,11 @@ func TestResolveDecodeIntoMap(t *testing.T) {
 }
 
 func TestResolveArrayEvolution(t *testing.T) {
-	writer, err := NewSchema(`{"type":"array","items":"int"}`)
+	writer, err := Parse(`{"type":"array","items":"int"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"array","items":"long"}`)
+	reader, err := Parse(`{"type":"array","items":"long"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,11 +460,11 @@ func TestResolveArrayEvolution(t *testing.T) {
 }
 
 func TestResolveMapEvolution(t *testing.T) {
-	writer, err := NewSchema(`{"type":"map","values":"float"}`)
+	writer, err := Parse(`{"type":"map","values":"float"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"map","values":"double"}`)
+	reader, err := Parse(`{"type":"map","values":"double"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +521,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    float64(42),
 			schema: `"int"`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`"int"`)
+				s, err := Parse(`"int"`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -540,7 +540,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    "hello",
 			schema: `"string"`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`"string"`)
+				s, err := Parse(`"string"`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -562,7 +562,7 @@ func TestEncodeDefault(t *testing.T) {
 				{"name":"y","type":"string"}
 			]}`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"},{"name":"y","type":"string"}]}`)
+				s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"},{"name":"y","type":"string"}]}`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -585,7 +585,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    "B",
 			schema: `{"type":"enum","name":"E","symbols":["A","B","C"]}`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+				s, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -604,7 +604,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    []any{float64(1), float64(2)},
 			schema: `{"type":"array","items":"int"}`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`{"type":"array","items":"int"}`)
+				s, err := Parse(`{"type":"array","items":"int"}`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -623,7 +623,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    nil,
 			schema: `["null","int"]`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`["null","int"]`)
+				s, err := Parse(`["null","int"]`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -642,7 +642,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    float64(100000),
 			schema: `"long"`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`"long"`)
+				s, err := Parse(`"long"`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -661,7 +661,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    float64(1.5),
 			schema: `"float"`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`"float"`)
+				s, err := Parse(`"float"`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -680,7 +680,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    float64(2.718),
 			schema: `"double"`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`"double"`)
+				s, err := Parse(`"double"`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -699,7 +699,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    "raw",
 			schema: `"bytes"`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`"bytes"`)
+				s, err := Parse(`"bytes"`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -718,7 +718,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    "abcd",
 			schema: `{"type":"fixed","name":"F","size":4}`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`{"type":"fixed","name":"F","size":4}`)
+				s, err := Parse(`{"type":"fixed","name":"F","size":4}`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -737,7 +737,7 @@ func TestEncodeDefault(t *testing.T) {
 			val:    map[string]any{"x": float64(1), "y": float64(2)},
 			schema: `{"type":"map","values":"int"}`,
 			checkFn: func(t *testing.T, encoded []byte) {
-				s, err := NewSchema(`{"type":"map","values":"int"}`)
+				s, err := Parse(`{"type":"map","values":"int"}`)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -765,7 +765,7 @@ func TestEncodeDefault(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := NewSchema(tt.schema)
+			s, err := Parse(tt.schema)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -779,7 +779,7 @@ func TestEncodeDefault(t *testing.T) {
 }
 
 func TestSkipUnion(t *testing.T) {
-	s, err := NewSchema(`["null","int","string"]`)
+	s, err := Parse(`["null","int","string"]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -827,7 +827,7 @@ func TestSkipFunctions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := NewSchema(tt.schema)
+			s, err := Parse(tt.schema)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -865,14 +865,14 @@ func TestSkipFunctions(t *testing.T) {
 
 func TestResolveRecordFieldReorder(t *testing.T) {
 	// Writer has fields in different order than reader.
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"b","type":"string"},
 		{"name":"a","type":"int"}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string"}
 	]}`)
@@ -904,13 +904,13 @@ func TestResolveRecordFieldReorder(t *testing.T) {
 }
 
 func TestResolveComplexDefault(t *testing.T) {
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"x","type":"int"}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"x","type":"int"},
 		{"name":"tags","type":{"type":"array","items":"string"},"default":[]},
 		{"name":"meta","type":{"type":"map","values":"int"},"default":{}}
@@ -948,14 +948,14 @@ func TestResolveComplexDefault(t *testing.T) {
 }
 
 func TestResolvePromotionInRecord(t *testing.T) {
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"float"}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"long"},
 		{"name":"b","type":"double"}
 	]}`)
@@ -992,13 +992,13 @@ func TestResolvePromotionInRecord(t *testing.T) {
 
 func TestResolveRecordDefault(t *testing.T) {
 	// Test default for a record field whose type is also a record.
-	writer, err := NewSchema(`{"type":"record","name":"Outer","fields":[
+	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
 		{"name":"x","type":"int"}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"Outer","fields":[
+	reader, err := Parse(`{"type":"record","name":"Outer","fields":[
 		{"name":"x","type":"int"},
 		{"name":"inner","type":{"type":"record","name":"Inner","fields":[
 			{"name":"a","type":"int","default":0},
@@ -1036,13 +1036,13 @@ func TestResolveRecordDefault(t *testing.T) {
 func TestResolveWriterUnionReaderNonUnion(t *testing.T) {
 	// Writer is ["null","int"], reader is just "int".
 	// All writer branches must be compatible with reader.
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":["null","int"]}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"}
 	]}`)
 	if err != nil {
@@ -1057,13 +1057,13 @@ func TestResolveWriterUnionReaderNonUnion(t *testing.T) {
 
 func TestResolveWriterUnionReaderNonUnionSuccess(t *testing.T) {
 	// Writer is ["int","long"], reader is "double". Both promote to double.
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":["int","long"]}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"double"}
 	]}`)
 	if err != nil {
@@ -1093,11 +1093,11 @@ func TestResolveWriterUnionReaderNonUnionSuccess(t *testing.T) {
 
 func TestResolveReaderUnionWriterNonUnion(t *testing.T) {
 	// Writer is "int", reader is ["null","long"].
-	writer, err := NewSchema(`"int"`)
+	writer, err := Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`["null","long"]`)
+	reader, err := Parse(`["null","long"]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1606,11 +1606,11 @@ func TestPromoteBytesToStringTyped(t *testing.T) {
 // --- Resolve edge case tests ---
 
 func TestResolveFixedIdentity(t *testing.T) {
-	writer, err := NewSchema(`{"type":"fixed","name":"F","size":4}`)
+	writer, err := Parse(`{"type":"fixed","name":"F","size":4}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"fixed","name":"F","size":4}`)
+	reader, err := Parse(`{"type":"fixed","name":"F","size":4}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1634,11 +1634,11 @@ func TestResolveFixedIdentity(t *testing.T) {
 
 func TestResolveEnumIdentity(t *testing.T) {
 	// Identical enums should return reader directly (identity path).
-	writer, err := NewSchema(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1657,11 +1657,11 @@ func TestResolveEnumIdentity(t *testing.T) {
 
 func TestResolveEnumDeserTyped(t *testing.T) {
 	// Non-identity enum to exercise the closure branches.
-	writer, err := NewSchema(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1716,11 +1716,11 @@ func TestResolveEnumDeserTyped(t *testing.T) {
 }
 
 func TestResolveEnumDeserErrors(t *testing.T) {
-	writer, err := NewSchema(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1772,11 +1772,11 @@ func TestResolveMapIdentity(t *testing.T) {
 
 func TestResolveBuildDeserSemanticError(t *testing.T) {
 	// buildDeser with unsupported target type (e.g. slice).
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1812,11 +1812,11 @@ func TestResolveSelfReferencingRecordDivergent(t *testing.T) {
 			{"name":"next","type":["null","Node"]}
 		]
 	}`
-	writer, err := NewSchema(writerSchema)
+	writer, err := Parse(writerSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(readerSchema)
+	reader, err := Parse(readerSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1849,11 +1849,11 @@ func TestResolveSelfReferencingRecordDivergent(t *testing.T) {
 
 func TestResolveWriterUnionNullUnionOptimization(t *testing.T) {
 	// Writer ["null","int"], reader "long" — exercises null-union optimization path in resolveWriterUnion.
-	writer, err := NewSchema(`["null","int"]`)
+	writer, err := Parse(`["null","int"]`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`["null","long"]`)
+	reader, err := Parse(`["null","long"]`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1954,7 +1954,7 @@ func TestEncodeDefaultErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := NewSchema(tt.schema)
+			s, err := Parse(tt.schema)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2015,14 +2015,14 @@ func TestPromoteBytesToStringNegativeLength(t *testing.T) {
 func TestResolveDeserTruncatedData(t *testing.T) {
 	// Set up a resolved schema where writer has fields A (kept) and B (skipped),
 	// reader has fields A (promoted) and C (default).
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string"}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"long"},
 		{"name":"c","type":"int","default":0}
 	]}`)
@@ -2079,11 +2079,11 @@ func TestResolveDeserTruncatedData(t *testing.T) {
 func TestResolveDeserReadError(t *testing.T) {
 	// Writer and reader both have field A but promoted (int→long).
 	// Test with truncated data to trigger read error.
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2120,11 +2120,11 @@ func TestResolveDeserDefaultError(t *testing.T) {
 	// whose deser will fail due to bad encoded data. This is hard to trigger
 	// normally, so we test the deserMap/deserStruct error paths for defaults
 	// by using valid data that exercises the default code path.
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string","default":"hello"}
 	]}`)
@@ -2162,11 +2162,11 @@ func TestResolveDeserDefaultError(t *testing.T) {
 
 func TestResolveDeserMapNilInit(t *testing.T) {
 	// Test that a nil map gets initialized during deserialization.
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2247,7 +2247,7 @@ func TestEncodeDefaultRecordNilVal(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Should encode field "a" with default 0.
-	s, err := NewSchema(`"int"`)
+	s, err := Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2312,14 +2312,14 @@ func TestEncodeDefaultRecordFieldDefault(t *testing.T) {
 func TestResolveFieldRemovedIntoMap(t *testing.T) {
 	// Writer has fields [a, b], reader has field [a]. Field b gets skipped.
 	// Decode into map to exercise deserMap's skip-continue path.
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string"}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"}
 	]}`)
 	if err != nil {
@@ -2347,14 +2347,14 @@ func TestResolveFieldRemovedIntoMap(t *testing.T) {
 
 func TestResolveFieldRemovedIntoStruct(t *testing.T) {
 	// Same setup but decode into struct to exercise deserStruct skip-continue path.
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string"}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"}
 	]}`)
 	if err != nil {
@@ -2385,11 +2385,11 @@ func TestResolveFieldRemovedIntoStruct(t *testing.T) {
 
 func TestResolveEnumDeserInterface(t *testing.T) {
 	// Non-identity enum decoded into interface.
-	writer, err := NewSchema(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2630,14 +2630,14 @@ func TestResolveUnionUnionBranchError(t *testing.T) {
 func TestResolveDeserStructMissingField(t *testing.T) {
 	// Struct is missing a field the reader schema expects → typeFieldMapping error.
 	// Schemas must differ so Resolve doesn't short-circuit.
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"int"},
 		{"name":"b","type":"string"}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":"long"},
 		{"name":"b","type":"string"}
 	]}`)
@@ -2668,7 +2668,7 @@ func TestResolveDeserStructMissingField(t *testing.T) {
 func TestResolveNamespacedAlias(t *testing.T) {
 	// Reader uses a namespaced name with aliases, writer uses one of the aliases.
 	// This exercises qualifyAliases with a dot in fullname and unqualified aliases.
-	reader, err := NewSchema(`{
+	reader, err := Parse(`{
 		"type":"record",
 		"name":"com.example.NewName",
 		"aliases":["OldName"],
@@ -2677,7 +2677,7 @@ func TestResolveNamespacedAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer, err := NewSchema(`{
+	writer, err := Parse(`{
 		"type":"record",
 		"name":"com.example.OldName",
 		"fields":[{"name":"a","type":"int"}]
@@ -2693,7 +2693,7 @@ func TestResolveNamespacedAlias(t *testing.T) {
 
 func TestResolveFullyQualifiedAlias(t *testing.T) {
 	// Alias already contains a dot (fully qualified).
-	reader, err := NewSchema(`{
+	reader, err := Parse(`{
 		"type":"record",
 		"name":"com.example.NewName",
 		"aliases":["com.other.OldName"],
@@ -2702,7 +2702,7 @@ func TestResolveFullyQualifiedAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer, err := NewSchema(`{
+	writer, err := Parse(`{
 		"type":"record",
 		"name":"com.other.OldName",
 		"fields":[{"name":"a","type":"int"}]
@@ -2717,13 +2717,13 @@ func TestResolveFullyQualifiedAlias(t *testing.T) {
 }
 
 func TestResolveNullUnionDefault(t *testing.T) {
-	writer, err := NewSchema(`{"type":"record","name":"R","fields":[
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"x","type":"int"}
 	]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewSchema(`{"type":"record","name":"R","fields":[
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"x","type":"int"},
 		{"name":"opt","type":["null","string"],"default":null}
 	]}`)

@@ -13,7 +13,7 @@ import (
 
 // Schema is a compiled Avro schema that supports encoding Go values to Avro
 // binary format and decoding Avro binary data into Go values. A Schema is
-// created by parsing an Avro JSON schema string with [NewSchema].
+// created by parsing an Avro JSON schema string with [Parse].
 //
 // A Schema is safe for concurrent use. It can be used with [Schema.Encode],
 // [Schema.AppendEncode], and [Schema.Decode] for standard binary encoding, or
@@ -59,7 +59,18 @@ type fieldNode struct {
 	hasDefault bool
 }
 
-// NewSchema parses an Avro JSON schema string and returns a compiled
+// MustParse parses an Avro JSON schema string and returns a compiled
+// [*Schema], panicking on error. This is useful for package-level variable
+// declarations where the schema is known to be valid.
+func MustParse(schema string) *Schema {
+	s, err := Parse(schema)
+	if err != nil {
+		panic("avro: " + err.Error())
+	}
+	return s
+}
+
+// Parse parses an Avro JSON schema string and returns a compiled
 // [*Schema]. The input must be a valid Avro schema in JSON format: a
 // primitive type name (e.g. "string"), a JSON object (record, enum, array,
 // map, fixed), or a JSON array (union).
@@ -68,7 +79,7 @@ type fieldNode struct {
 // self-reference. Type names are resolved according to Avro namespace rules.
 // The schema is validated during parsing: unknown types, duplicate names,
 // invalid defaults, and malformed definitions all return errors.
-func NewSchema(schema string) (*Schema, error) {
+func Parse(schema string) (*Schema, error) {
 	var orig aschema
 	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
 		return nil, fmt.Errorf("invalid schema: %v", err)

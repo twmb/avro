@@ -7,7 +7,7 @@ import (
 
 func TestSingleObjectRoundTrip(t *testing.T) {
 	t.Run("null", func(t *testing.T) {
-		s, err := NewSchema(`"null"`)
+		s, err := Parse(`"null"`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -43,9 +43,9 @@ func TestSingleObjectRoundTrip(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := NewSchema(tt.schema)
+			s, err := Parse(tt.schema)
 			if err != nil {
-				t.Fatalf("NewSchema: %v", err)
+				t.Fatalf("Parse: %v", err)
 			}
 
 			encoded, err := s.AppendSingleObject(nil, tt.val)
@@ -73,7 +73,7 @@ func TestSingleObjectRoundTrip(t *testing.T) {
 }
 
 func TestSingleObjectFingerprint(t *testing.T) {
-	s, err := NewSchema(`"int"`)
+	s, err := Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,11 +102,11 @@ func TestSingleObjectFingerprint(t *testing.T) {
 }
 
 func TestSingleObjectFingerprintMismatch(t *testing.T) {
-	a, err := NewSchema(`"int"`)
+	a, err := Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := NewSchema(`"string"`)
+	b, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestSingleObjectFingerprintMismatch(t *testing.T) {
 }
 
 func TestSingleObjectBadMagic(t *testing.T) {
-	s, err := NewSchema(`"int"`)
+	s, err := Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestSingleObjectBadMagic(t *testing.T) {
 }
 
 func TestSingleObjectShortBuffer(t *testing.T) {
-	s, err := NewSchema(`"int"`)
+	s, err := Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestSingleObjectShortBuffer(t *testing.T) {
 
 func TestSingleObjectFingerprintMatchesSpec(t *testing.T) {
 	// Verify the fingerprint bytes are little-endian CRC-64-AVRO.
-	s, err := NewSchema(`"int"`)
+	s, err := Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
