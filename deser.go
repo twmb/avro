@@ -442,6 +442,9 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 				return nil, err
 			}
 		}
+		if count > int64(len(src)) {
+			return nil, fmt.Errorf("array block count %d exceeds remaining buffer length %d", count, len(src))
+		}
 		n := int(count)
 		start := sliceVal.Len()
 		newLen := start + n
@@ -519,6 +522,9 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			if err != nil {
 				return nil, err
 			}
+		}
+		if count > int64(len(src)) {
+			return nil, fmt.Errorf("map block count %d exceeds remaining buffer length %d", count, len(src))
 		}
 		for range int(count) {
 			var keyLen int64

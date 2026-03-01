@@ -51,6 +51,9 @@ func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
 
 func serNullUnion(u *serUnion) serfn {
 	return func(dst []byte, v reflect.Value) ([]byte, error) {
+		if !v.IsValid() {
+			return append(dst, 0), nil
+		}
 		switch v.Kind() {
 		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
 			if v.IsNil() {
@@ -81,6 +84,9 @@ var serPrimitive = map[string]serfn{
 var errNonNil = errors.New("cannot encode non-nil value as null")
 
 func serNull(dst []byte, v reflect.Value) ([]byte, error) {
+	if !v.IsValid() {
+		return dst, nil
+	}
 	switch v.Kind() {
 	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
 		if v.IsNil() {

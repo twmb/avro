@@ -579,6 +579,9 @@ func (rd *Reader) readBlock() error {
 	if size < 0 {
 		return fmt.Errorf("ocf: invalid negative block size %d", size)
 	}
+	if size > 1<<26 { // 64 MiB safety limit
+		return fmt.Errorf("ocf: block size %d exceeds safety limit", size)
+	}
 	compressed := make([]byte, int(size))
 	if _, err := io.ReadFull(rd.r, compressed); err != nil {
 		return fmt.Errorf("ocf: reading block data: %w", err)
@@ -774,10 +777,16 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 				return nil, err
 			}
 		}
+		if count > 1<<20 {
+			return nil, fmt.Errorf("map block count %d exceeds safety limit", count)
+		}
 		for range int(count) {
 			keyLen, err := readVarlongFrom(r)
 			if err != nil {
 				return nil, err
+			}
+			if keyLen < 0 || keyLen > 1<<20 {
+				return nil, fmt.Errorf("map key length %d out of range", keyLen)
 			}
 			key := make([]byte, int(keyLen))
 			if _, err := io.ReadFull(r, key); err != nil {
@@ -786,6 +795,9 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 			valLen, err := readVarlongFrom(r)
 			if err != nil {
 				return nil, err
+			}
+			if valLen < 0 || valLen > 1<<20 {
+				return nil, fmt.Errorf("map value length %d out of range", valLen)
 			}
 			val := make([]byte, int(valLen))
 			if _, err := io.ReadFull(r, val); err != nil {
