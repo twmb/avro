@@ -86,6 +86,52 @@
 // If you just want to check whether two schemas are compatible without
 // building a resolved schema, use [CheckCompatibility].
 //
+// # Struct tags
+//
+// Struct fields are matched to Avro record fields by name. Use the "avro"
+// struct tag to control the mapping:
+//
+//	type Example struct {
+//	    Name    string  `avro:"name"`          // maps to Avro field "name"
+//	    Ignored int     `avro:"-"`             // excluded from encoding/decoding
+//	    Inner   Nested  `avro:",inline"`       // inline Nested's fields into this record
+//	    Value   int     `avro:"val,omitzero"`  // encode zero value as Avro default
+//	}
+//
+// The tag format is:
+//
+//	avro:"[name][,option][,option]..."
+//
+// The name portion maps the struct field to the Avro field with that name. If
+// empty, the Go field name is used as-is. A tag of "-" excludes the field
+// entirely.
+//
+// Supported options:
+//
+//   - inline: flatten a nested struct's fields into the parent record,
+//     as if they were declared directly on the parent. The field must be a
+//     struct or pointer to struct. This works like anonymous (embedded) struct
+//     fields, but for named fields. When using inline, the name portion of
+//     the tag must be empty.
+//
+//   - omitzero: when encoding, if the field is the zero value for its type
+//     (or implements an IsZero() bool method that returns true), the Avro
+//     default value from the schema is used instead. This is useful for
+//     optional fields in ["null", T] unions or fields with explicit defaults.
+//
+// Embedded (anonymous) struct fields are automatically inlined — their
+// fields are promoted into the parent as if declared directly. To prevent
+// inlining an embedded struct, give it an explicit name tag:
+//
+//	type Parent struct {
+//	    Nested                    // inlined: Nested's fields are promoted
+//	    Other  Aux `avro:"other"` // not inlined: treated as a single field
+//	}
+//
+// When multiple fields at different depths resolve to the same Avro field
+// name, the shallowest field wins. Among fields at the same depth, a tagged
+// field wins over an untagged one.
+//
 // # Single Object Encoding
 //
 // For sending self-describing values over the wire (as opposed to files,

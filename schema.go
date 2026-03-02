@@ -19,9 +19,9 @@ type Schema struct {
 	ser   serfn
 	deser deserfn
 
-	c    aschema
-	soe  [10]byte    // 2-byte magic (0xC3, 0x01) + 8-byte LE CRC64-Avro fingerprint
-	node *schemaNode // full metadata tree (aliases, defaults, etc.)
+	c    aschema     // canonical form, used for fingerprinting and schema comparison
+	soe  [10]byte    // Single Object Encoding header: 2-byte magic (0xC3, 0x01) + 8-byte LE CRC64-Avro fingerprint
+	node *schemaNode // full metadata tree (aliases, defaults, etc.) for schema introspection and evolution
 	full string      // original schema JSON, returned by String()
 }
 
@@ -77,11 +77,7 @@ func MustParse(schema string) *Schema {
 // [SchemaCache].
 func Parse(schema string) (*Schema, error) {
 	b := &builder{
-		types:   make(map[string]serfn),
-		dtypes:  make(map[string]deserfn),
-		stypes:  make(map[string]*serRecord),
-		drtypes: make(map[string]*deserRecord),
-		ntypes:  make(map[string]*schemaNode),
+		named: make(map[string]*namedType),
 	}
 	return parse(schema, b)
 }
@@ -214,9 +210,16 @@ var acomplex = map[string]struct{}{
 	"fixed":  {},
 }
 
+// Fixup types for forward references. Avro allows named types to be
+// referenced before they are defined (e.g. a union branch or record field
+// whose type hasn't been parsed yet). We record what needs patching and
+// resolve everything in finalize() once all types are built.
+
+// unionMissing / unionMissingDeser patch union branch function tables
+// when a branch type was a forward reference.
 type unionMissing struct {
 	ser     *serUnion
-	missing map[int]string
+	missing map[int]string // branch index → type name
 }
 
 type unionMissingDeser struct {
@@ -224,20 +227,26 @@ type unionMissingDeser struct {
 	missing map[int]string
 }
 
+// fieldMeta carries Avro-level type info for a record field, used by the
+// unsafe fast path to select specialized ser/deser routines.
 type fieldMeta struct {
 	avroType    string
 	logical     string // logical type (e.g. "timestamp-millis"), empty if none
 	serRecord   *serRecord
 	deserRecord *deserRecord
-	inner       *fieldMeta
-	nullSecond  bool // true for ["T","null"] unions (null is index 1)
+	inner       *fieldMeta // for nullunion fields: the inner branch's metadata
+	nullSecond  bool       // true for ["T","null"] unions (null is index 1)
 }
 
+// metaFixup patches a fieldMeta's serRecord/deserRecord when the inner
+// type of a null-union was a forward reference.
 type metaFixup struct {
 	meta *fieldMeta
 	name string
 }
 
+// recordFieldFixup patches a record field's ser/deser function, avroType,
+// meta, and schemaNode when the field's type was a forward reference.
 type recordFieldFixup struct {
 	sr   *serRecord
 	dr   *deserRecord
@@ -246,20 +255,25 @@ type recordFieldFixup struct {
 	name string
 }
 
+// namedType holds the compiled artifacts for a named Avro type (record,
+// enum, fixed) so they can be looked up by name during schema building.
+type namedType struct {
+	ser   serfn
+	deser deserfn
+	sr    *serRecord   // non-nil for records only
+	dr    *deserRecord // non-nil for records only
+	node  *schemaNode
+}
+
 type builder struct {
 	ser   serfn
 	deser deserfn
 
-	types       map[string]serfn
-	dtypes      map[string]deserfn
-	stypes      map[string]*serRecord
-	drtypes     map[string]*deserRecord
+	named       map[string]*namedType
 	missing     []unionMissing
 	dmissing    []unionMissingDeser
 	mfixups     []metaFixup
 	fieldFixups []recordFieldFixup
-
-	ntypes map[string]*schemaNode
 
 	meta  fieldMeta
 	canon aschema
@@ -268,11 +282,7 @@ type builder struct {
 
 func (b *builder) nest() *builder {
 	return &builder{
-		types:   b.types,
-		dtypes:  b.dtypes,
-		stypes:  b.stypes,
-		drtypes: b.drtypes,
-		ntypes:  b.ntypes,
+		named: b.named,
 	}
 }
 
@@ -286,38 +296,39 @@ func (b *builder) unnest(nest *builder) {
 func (b *builder) finalize() error {
 	for _, m := range b.missing {
 		for idx, name := range m.missing {
-			ser := b.types[name]
-			if ser == nil {
+			nt := b.named[name]
+			if nt == nil {
 				return fmt.Errorf("unknown type %q", name)
 			}
-			m.ser.fns[idx] = ser
+			m.ser.fns[idx] = nt.ser
 		}
 	}
 	for _, m := range b.dmissing {
 		for idx, name := range m.missing {
-			m.deser.fns[idx] = b.dtypes[name]
+			m.deser.fns[idx] = b.named[name].deser
 		}
 	}
 	for _, m := range b.mfixups {
-		m.meta.serRecord = b.stypes[m.name]
-		m.meta.deserRecord = b.drtypes[m.name]
+		nt := b.named[m.name]
+		m.meta.serRecord = nt.sr
+		m.meta.deserRecord = nt.dr
 	}
 	for _, m := range b.fieldFixups {
-		ser := b.types[m.name]
-		if ser == nil {
+		nt := b.named[m.name]
+		if nt == nil {
 			return fmt.Errorf("unknown type %q", m.name)
 		}
-		m.sr.fields[m.idx].fn = ser
-		m.dr.fields[m.idx].fn = b.dtypes[m.name]
-		if sr := b.stypes[m.name]; sr != nil {
+		m.sr.fields[m.idx].fn = nt.ser
+		m.dr.fields[m.idx].fn = nt.deser
+		if nt.sr != nil {
 			m.sr.fields[m.idx].avroType = "record"
 			m.sr.fields[m.idx].meta.avroType = "record"
-			m.sr.fields[m.idx].meta.serRecord = sr
+			m.sr.fields[m.idx].meta.serRecord = nt.sr
 			m.dr.fields[m.idx].avroType = "record"
 			m.dr.fields[m.idx].meta.avroType = "record"
-			m.dr.fields[m.idx].meta.deserRecord = b.drtypes[m.name]
+			m.dr.fields[m.idx].meta.deserRecord = nt.dr
 		}
-		m.nd.fields[m.idx].node = b.ntypes[m.name]
+		m.nd.fields[m.idx].node = nt.node
 	}
 	return nil
 }
@@ -372,13 +383,13 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 	}
 	// Check if this is a named type reference (record, enum, fixed).
 	name := s.primitive
-	if ser := b.types[name]; ser != nil {
-		b.ser = ser
-		b.deser = b.dtypes[name]
-		if sr := b.stypes[name]; sr != nil {
-			b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[name]}
+	if nt := b.named[name]; nt != nil {
+		b.ser = nt.ser
+		b.deser = nt.deser
+		if nt.sr != nil {
+			b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
 		}
-		b.node = b.ntypes[name]
+		b.node = nt.node
 		return nil
 	}
 	// Try namespace-qualified lookup: if name is unqualified and parent
@@ -386,14 +397,14 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 	if !strings.Contains(name, ".") && parentName != "" {
 		if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
 			qualified := parentName[:dot+1] + name
-			if ser := b.types[qualified]; ser != nil {
+			if nt := b.named[qualified]; nt != nil {
 				b.canon.primitive = qualified
-				b.ser = ser
-				b.deser = b.dtypes[qualified]
-				if sr := b.stypes[qualified]; sr != nil {
-					b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: b.drtypes[qualified]}
+				b.ser = nt.ser
+				b.deser = nt.deser
+				if nt.sr != nil {
+					b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
 				}
-				b.node = b.ntypes[qualified]
+				b.node = nt.node
 				return nil
 			}
 		}
@@ -592,7 +603,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 		}
 		o.Namespace = nil // canonical form omits namespace
-		if _, exists := b.ntypes[o.Name]; exists {
+		if _, exists := b.named[o.Name]; exists {
 			return fmt.Errorf("duplicate named type %q", o.Name)
 		}
 	default:
@@ -620,13 +631,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		dr := &deserRecord{}
 		b.ser = sr.ser
 		b.deser = dr.deser
-		b.types[o.Name] = b.ser
-		b.dtypes[o.Name] = b.deser
-		b.stypes[o.Name] = sr
-		b.drtypes[o.Name] = dr
 		b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: dr}
 
-		// Register schemaNode early for self-referencing records.
+		// Register early so self-referencing fields (e.g. array
+		// items, map values) can resolve the type by name.
 		nd := &schemaNode{
 			kind:        "record",
 			name:        o.Name,
@@ -636,7 +644,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			serRecord:   sr,
 			deserRecord: dr,
 		}
-		b.ntypes[o.Name] = nd
+		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, sr: sr, dr: dr, node: nd}
 		b.node = nd
 
 		var names []string
@@ -653,6 +661,9 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			isFwdRef := false
 			fwdRefName := ""
 			if err := bf.build(o.Name, of.Type); err != nil {
+				// An unknownPrimitiveError for a primitive ref means
+				// the type hasn't been parsed yet — treat it as a
+				// forward reference to be resolved in finalize().
 				if pe := (*unknownPrimitiveError)(nil); errors.As(err, &pe) && of.Type != nil && of.Type.primitive != "" {
 					isFwdRef = true
 					fwdRefName = of.Type.primitive
@@ -749,8 +760,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.ser = (&serEnum{symbols: o.Symbols}).ser
 		b.deser = (&deserEnum{symbols: o.Symbols}).deser
-		b.types[o.Name] = b.ser
-		b.dtypes[o.Name] = b.deser
 		b.meta = fieldMeta{avroType: "enum"}
 
 		nd := &schemaNode{
@@ -767,7 +776,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			nd.enumDef = defStr
 			nd.hasEnumDef = true
 		}
-		b.ntypes[o.Name] = nd
+		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, node: nd}
 		b.node = nd
 
 	case "array":
@@ -910,8 +919,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			b.ser = (&serSize{*o.Size}).ser
 			b.deser = (&deserFixed{*o.Size}).deser
 		}
-		b.types[o.Name] = b.ser
-		b.dtypes[o.Name] = b.deser
 		b.meta = fieldMeta{avroType: "fixed", logical: s.object.Logical}
 		nd := &schemaNode{
 			kind:    "fixed",
@@ -929,7 +936,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 		}
 		b.node = nd
-		b.ntypes[o.Name] = b.node
+		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, node: nd}
 	}
 	return nil
 }

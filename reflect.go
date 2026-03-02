@@ -87,11 +87,14 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 		omitzero bool
 	}
 
+	// collect walks the struct tree depth-first, recording fields in
+	// encounter order. Shallower fields are seen first, which matters
+	// for the priority logic below.
 	var fields []fieldInfo
 	var collect func(t reflect.Type, index []int, visited map[reflect.Type]bool)
 	collect = func(t reflect.Type, index []int, visited map[reflect.Type]bool) {
 		if visited[t] {
-			return
+			return // prevent infinite recursion on embedded struct cycles
 		}
 		visited[t] = true
 		for i := 0; i < t.NumField(); i++ {
