@@ -357,8 +357,8 @@ func (w *Writer) flush() error {
 		return fmt.Errorf("ocf: compressing block: %w", err)
 	}
 	var block []byte
-	block = appendVarlong(block, int64(w.count))
-	block = appendVarlong(block, int64(len(compressed)))
+	block = binary.AppendVarint(block, int64(w.count))
+	block = binary.AppendVarint(block, int64(len(compressed)))
 	block = append(block, compressed...)
 	block = append(block, w.sync[:]...)
 	if _, err := w.w.Write(block); err != nil {
@@ -578,14 +578,14 @@ func (rd *Reader) Close() error {
 }
 
 func (rd *Reader) readBlock() error {
-	count, err := readVarlongFrom(rd.r)
+	count, err := binary.ReadVarint(rd.r)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			return io.EOF
 		}
 		return fmt.Errorf("ocf: reading block count: %w", err)
 	}
-	size, err := readVarlongFrom(rd.r)
+	size, err := binary.ReadVarint(rd.r)
 	if err != nil {
 		return fmt.Errorf("ocf: reading block size: %w", err)
 	}
@@ -723,35 +723,6 @@ func resolveCodec(name string, custom []Codec) (Codec, error) {
 	return nil, fmt.Errorf("ocf: unknown codec %q", name)
 }
 
-// ---------- varlong I/O ----------
-
-func appendVarlong(dst []byte, i int64) []byte {
-	u := uint64(i)<<1 ^ uint64(i>>63)
-	for u&0x7f != u {
-		dst = append(dst, byte(u&0x7f|0x80))
-		u >>= 7
-	}
-	return append(dst, byte(u))
-}
-
-func readVarlongFrom(r io.ByteReader) (int64, error) {
-	var u uint64
-	for i := range 10 {
-		b, err := r.ReadByte()
-		if err != nil {
-			if i > 0 && errors.Is(err, io.EOF) {
-				return 0, io.ErrUnexpectedEOF
-			}
-			return 0, err
-		}
-		u |= uint64(b&0x7f) << (7 * i)
-		if b&0x80 == 0 {
-			return int64(u>>1) ^ -int64(u&1), nil
-		}
-	}
-	return 0, errors.New("ocf: varlong overflows 64 bits")
-}
-
 // ---------- Avro map encoding helpers ----------
 
 type kv struct {
@@ -763,11 +734,11 @@ func encodeMap(dst []byte, entries []kv) []byte {
 	if len(entries) == 0 {
 		return append(dst, 0) // zero-count block terminates empty map
 	}
-	dst = appendVarlong(dst, int64(len(entries)))
+	dst = binary.AppendVarint(dst, int64(len(entries)))
 	for _, e := range entries {
-		dst = appendVarlong(dst, int64(len(e.key)))
+		dst = binary.AppendVarint(dst, int64(len(e.key)))
 		dst = append(dst, e.key...)
-		dst = appendVarlong(dst, int64(len(e.val)))
+		dst = binary.AppendVarint(dst, int64(len(e.val)))
 		dst = append(dst, e.val...)
 	}
 	return append(dst, 0) // terminating zero-count block
@@ -776,7 +747,7 @@ func encodeMap(dst []byte, entries []kv) []byte {
 func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 	m := make(map[string][]byte)
 	for {
-		count, err := readVarlongFrom(r)
+		count, err := binary.ReadVarint(r)
 		if err != nil {
 			return nil, err
 		}
@@ -786,7 +757,7 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 		if count < 0 {
 			count = -count
 			// Skip block byte-size.
-			if _, err := readVarlongFrom(r); err != nil {
+			if _, err := binary.ReadVarint(r); err != nil {
 				return nil, err
 			}
 		}
@@ -794,7 +765,7 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 			return nil, fmt.Errorf("map block count %d exceeds safety limit", count)
 		}
 		for range int(count) {
-			keyLen, err := readVarlongFrom(r)
+			keyLen, err := binary.ReadVarint(r)
 			if err != nil {
 				return nil, err
 			}
@@ -805,7 +776,7 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 			if _, err := io.ReadFull(r, key); err != nil {
 				return nil, err
 			}
-			valLen, err := readVarlongFrom(r)
+			valLen, err := binary.ReadVarint(r)
 			if err != nil {
 				return nil, err
 			}
