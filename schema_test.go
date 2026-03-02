@@ -614,8 +614,7 @@ func TestDuplicateEnumSymbol(t *testing.T) {
 
 func TestBuildNilSchema(t *testing.T) {
 	b := &builder{
-		types:  make(map[string]serfn),
-		dtypes: make(map[string]deserfn),
+		named: make(map[string]*namedType),
 	}
 	err := b.build("", nil)
 	if err == nil {
@@ -625,8 +624,7 @@ func TestBuildNilSchema(t *testing.T) {
 
 func TestBuildEmptySchema(t *testing.T) {
 	b := &builder{
-		types:  make(map[string]serfn),
-		dtypes: make(map[string]deserfn),
+		named: make(map[string]*namedType),
 	}
 	err := b.build("", &aschema{})
 	if err == nil {

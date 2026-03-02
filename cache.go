@@ -19,22 +19,14 @@ import (
 //
 // A SchemaCache is safe for concurrent use.
 type SchemaCache struct {
-	mu      sync.Mutex
-	types   map[string]serfn
-	dtypes  map[string]deserfn
-	stypes  map[string]*serRecord
-	drtypes map[string]*deserRecord
-	ntypes  map[string]*schemaNode
+	mu    sync.Mutex
+	named map[string]*namedType
 }
 
 // NewSchemaCache returns a new empty SchemaCache.
 func NewSchemaCache() *SchemaCache {
 	return &SchemaCache{
-		types:   make(map[string]serfn),
-		dtypes:  make(map[string]deserfn),
-		stypes:  make(map[string]*serRecord),
-		drtypes: make(map[string]*deserRecord),
-		ntypes:  make(map[string]*schemaNode),
+		named: make(map[string]*namedType),
 	}
 }
 
@@ -45,13 +37,9 @@ func (c *SchemaCache) Parse(schema string) (*Schema, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Clone the cache's maps so a failed parse doesn't corrupt the cache.
+	// Clone the cache's map so a failed parse doesn't corrupt the cache.
 	b := &builder{
-		types:   maps.Clone(c.types),
-		dtypes:  maps.Clone(c.dtypes),
-		stypes:  maps.Clone(c.stypes),
-		drtypes: maps.Clone(c.drtypes),
-		ntypes:  maps.Clone(c.ntypes),
+		named: maps.Clone(c.named),
 	}
 
 	s, err := parse(schema, b)
@@ -59,11 +47,7 @@ func (c *SchemaCache) Parse(schema string) (*Schema, error) {
 		return nil, err
 	}
 
-	// Success: the builder's maps are supersets of the cache's.
-	c.types = b.types
-	c.dtypes = b.dtypes
-	c.stypes = b.stypes
-	c.drtypes = b.drtypes
-	c.ntypes = b.ntypes
+	// Success: the builder's map is a superset of the cache's.
+	c.named = b.named
 	return s, nil
 }

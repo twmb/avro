@@ -70,14 +70,25 @@ type defaultOp struct {
 	deser          deserfn
 }
 
+// resolveNode resolves a (reader, writer) schema pair, handling cycles
+// from self-referencing records (e.g. a linked list node). The three
+// states in the seen map are:
+//   - absent: not yet visited — proceed with resolution
+//   - nil:    in-progress — a recursive call hit this pair, creating a cycle
+//   - *node:  resolved — reuse the result
+//
+// On cycle detection, we create a placeholder node whose deser is a
+// trampoline closure (calls n.deser through the pointer). After the
+// real resolution completes, we copy the resolved node's contents into
+// the placeholder so all holders of the placeholder pointer get the
+// real implementation.
 func resolveNode(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
 	pair := nodePair{r, w}
 	if n, ok := seen[pair]; ok {
 		if n == nil {
-			// Cycle: return a placeholder that will be fixed up.
-			// The deser trampolines through n.deser so that after
-			// *placeholder = *resolved, callers who captured this
-			// closure will invoke the real deserfn.
+			// Cycle detected: create a placeholder with a
+			// trampoline deser that will forward to the real
+			// deserfn once resolution completes.
 			n = &schemaNode{}
 			n.deser = func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 				return n.deser(src, v, sl)
@@ -93,7 +104,8 @@ func resolveNode(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (
 		return nil, err
 	}
 
-	// Fix up any placeholder created during cycle detection.
+	// If a placeholder was created during cycle detection, copy the
+	// resolved contents into it so the trampoline now calls the real deser.
 	if placeholder := seen[pair]; placeholder != nil && placeholder != resolved {
 		*placeholder = *resolved
 		resolved = placeholder

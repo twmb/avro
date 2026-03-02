@@ -34,6 +34,8 @@ type serUnion struct {
 	fns []serfn
 }
 
+// ser tries each branch in order: write the branch index, attempt the
+// encode, and backtrack (reset dst) if it fails.
 func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	start := len(dst)
 	var err error
@@ -46,6 +48,13 @@ func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	return nil, errors.New("unable to encode into any union option")
 }
 
+// Avro encodes the union branch index as a varint before the value.
+// Varint 0 encodes to byte 0x00, varint 1 encodes to byte 0x02
+// (zigzag: 1 << 1 = 2). These two-branch null-union helpers inline
+// the single-byte varints directly.
+
+// serNullUnion handles ["null", T] unions: null is index 0 (byte 0),
+// T is index 1 (byte 2).
 func serNullUnion(u *serUnion) serfn {
 	return func(dst []byte, v reflect.Value) ([]byte, error) {
 		if !v.IsValid() {
@@ -61,18 +70,20 @@ func serNullUnion(u *serUnion) serfn {
 	}
 }
 
+// serNullSecondUnion handles ["T", "null"] unions: T is index 0 (byte 0),
+// null is index 1 (byte 2).
 func serNullSecondUnion(u *serUnion) serfn {
 	return func(dst []byte, v reflect.Value) ([]byte, error) {
 		if !v.IsValid() {
-			return append(dst, 2), nil // index 1 (null)
+			return append(dst, 2), nil
 		}
 		switch v.Kind() {
 		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
 			if v.IsNil() {
-				return append(dst, 2), nil // index 1 (null)
+				return append(dst, 2), nil
 			}
 		}
-		return u.fns[0](append(dst, 0), v) // index 0 (T)
+		return u.fns[0](append(dst, 0), v)
 	}
 }
 
@@ -225,16 +236,21 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		if a, ok := i.(encoding.TextAppender); ok {
 			mark := len(dst)
+			dst = append(dst, 0) // reserve 1 byte for length prefix
 			var err error
 			if dst, err = a.AppendText(dst); err != nil {
 				return nil, err
 			}
-			textLen := len(dst) - mark
+			textLen := len(dst) - mark - 1
 			var buf [10]byte
 			hdr := appendVarlong(buf[:0], int64(textLen))
-			dst = append(dst, hdr...)                         // make room
-			copy(dst[mark+len(hdr):], dst[mark:mark+textLen]) // shift text right
-			copy(dst[mark:], hdr)                             // write length prefix
+			if len(hdr) == 1 {
+				dst[mark] = hdr[0]
+			} else {
+				dst = append(dst, hdr[1:]...)                         // make room for extra header bytes
+				copy(dst[mark+len(hdr):], dst[mark+1:mark+1+textLen]) // shift text right
+				copy(dst[mark:], hdr)                                 // write length prefix
+			}
 			return dst, nil
 		}
 		if m, ok := i.(encoding.TextMarshaler); ok {
@@ -278,7 +294,7 @@ func doSerString(dst []byte, s string) []byte {
 
 type serRecordField struct {
 	name         string
-	nameVal      reflect.Value // pre-computed reflect.ValueOf(name) for map lookups
+	nameVal      reflect.Value // pre-computed reflect.ValueOf(name); avoids alloc per map lookup
 	fn           serfn
 	avroType     string
 	meta         *fieldMeta
@@ -290,7 +306,7 @@ type serRecord struct {
 	fields []serRecordField
 	names  []string
 	cache  sync.Map                      // map[reflect.Type]*cachedMapping
-	fast   atomic.Pointer[fastRecordSer] // precompiled unsafe fast path
+	fast   atomic.Pointer[fastRecordSer] // lazily compiled unsafe fast path, atomic for concurrent encode
 }
 
 func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
@@ -319,7 +335,8 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		return dst, nil
 	}
-	// Struct: try precompiled unsafe fast path.
+	// Struct: try precompiled unsafe fast path. Requires addressable
+	// value so we can take a pointer for unsafe field access.
 	if v.CanAddr() {
 		if fast := s.fast.Load(); fast != nil && fast.typ == t {
 			return serRecordFast(dst, fast, v)
@@ -336,6 +353,8 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	for i, f := range s.fields {
 		fv := v.FieldByIndex(mapping.indices[i])
+		// omitzero + nullunion: if the Go field is zero, encode as
+		// the null branch (index 0) instead of trying the real encoder.
 		if mapping.omitzero[i] && f.avroType == "nullunion" && valueIsZero(fv) {
 			dst = append(dst, 0)
 			continue
@@ -986,18 +1005,23 @@ func ratToBytes(r *big.Rat, scale int) []byte {
 	return bigIntToBytes(unscaled)
 }
 
+// bigIntToBytes encodes i as big-endian two's complement, using the
+// minimum number of bytes needed to represent the value with correct sign.
 func bigIntToBytes(i *big.Int) []byte {
 	switch i.Sign() {
 	case 0:
 		return []byte{0}
 	case 1:
-		b := i.Bytes()
+		b := i.Bytes() // big-endian unsigned
 		if b[0]&0x80 != 0 {
+			// High bit set would look negative in two's complement;
+			// prepend a zero byte to keep it positive.
 			b = append([]byte{0}, b...)
 		}
 		return b
 	default:
 		// Two's complement for negative: flip bits of (|i| - 1).
+		// This works because -n in two's complement is ^(n-1).
 		abs := new(big.Int).Neg(i)
 		abs.Sub(abs, big.NewInt(1))
 		b := abs.Bytes()
@@ -1008,6 +1032,8 @@ func bigIntToBytes(i *big.Int) []byte {
 			b[j] = ^b[j]
 		}
 		if b[0]&0x80 == 0 {
+			// High bit clear would look positive; prepend 0xff
+			// to preserve the negative sign.
 			b = append([]byte{0xff}, b...)
 		}
 		return b

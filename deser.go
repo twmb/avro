@@ -86,19 +86,22 @@ func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	return s.fns[idx](src, v, sl)
 }
 
+// deserNullUnion handles ["null", T] unions. The branch index is a varint:
+// 0x00 = index 0 (null), 0x02 = index 1 (T). Since the only valid indices
+// are 0 and 1, the varint is always a single byte.
 func deserNullUnion(u *deserUnion) deserfn {
 	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "union index"}
 		}
 		switch src[0] {
-		case 0:
+		case 0: // null
 			switch v.Kind() {
 			case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
 				v.Set(reflect.Zero(v.Type()))
 			}
 			return src[1:], nil
-		case 2:
+		case 2: // T
 			if v.Kind() == reflect.Pointer {
 				if v.IsNil() {
 					v.Set(reflect.New(v.Type().Elem()))
@@ -112,6 +115,8 @@ func deserNullUnion(u *deserUnion) deserfn {
 	}
 }
 
+// deserNullSecondUnion handles ["T", "null"] unions: 0x00 = index 0 (T),
+// 0x02 = index 1 (null).
 func deserNullSecondUnion(u *deserUnion) deserfn {
 	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
@@ -331,7 +336,7 @@ func deserString(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 
 type deserRecordField struct {
 	name       string
-	nameVal    reflect.Value // pre-computed reflect.ValueOf(name) for map lookups
+	nameVal    reflect.Value // pre-computed reflect.ValueOf(name); avoids alloc per map lookup
 	fn         deserfn
 	avroType   string
 	meta       *fieldMeta
@@ -343,7 +348,7 @@ type deserRecord struct {
 	fields []deserRecordField
 	names  []string
 	cache  sync.Map                        // map[reflect.Type]*cachedMapping
-	fast   atomic.Pointer[fastRecordDeser] // precompiled unsafe fast path
+	fast   atomic.Pointer[fastRecordDeser] // lazily compiled unsafe fast path, atomic for concurrent decode
 }
 
 func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -449,6 +454,10 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	// For primitive item types with matching Go element types, use
 	// a specialized loop that avoids per-element function pointer calls.
 	useFast := !iface && s.fastLoop != nil && sliceVal.Type().Elem().Kind() == s.fastElemKind
+	// Avro arrays are encoded as a series of blocks. Each block starts
+	// with a count: positive means N elements follow, zero means end of
+	// array, negative means |N| elements follow and the next varint is
+	// the block's byte size (for skipping without decoding).
 	var err error
 	for {
 		var count int64
@@ -467,7 +476,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			if count < 0 {
 				return nil, errors.New("invalid array block count")
 			}
-			_, src, err = readVarlong(src) // skip block size
+			_, src, err = readVarlong(src) // skip block byte size
 			if err != nil {
 				return nil, err
 			}
@@ -1083,13 +1092,16 @@ func bytesToRat(b []byte, scale int) *big.Rat {
 	return new(big.Rat).SetFrac(unscaled, s)
 }
 
+// bytesToBigInt decodes big-endian two's complement bytes into a *big.Int.
 func bytesToBigInt(b []byte) *big.Int {
 	if len(b) == 0 {
 		return new(big.Int)
 	}
 	i := new(big.Int).SetBytes(b) // unsigned big-endian
 	if b[0]&0x80 != 0 {
-		// Negative in two's complement: subtract 2^(8*len).
+		// High bit set means negative in two's complement.
+		// SetBytes treated it as unsigned, so subtract 2^(8*len)
+		// to recover the signed value.
 		modulus := new(big.Int).Lsh(big.NewInt(1), uint(8*len(b)))
 		i.Sub(i, modulus)
 	}

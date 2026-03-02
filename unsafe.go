@@ -60,6 +60,9 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 	for i := range fields {
 		f := &fields[i]
 		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
+		// omitzero + nullunion fields need a runtime zero check before
+		// encoding, which the unsafe fast path can't do — fall back to
+		// the reflect-based slow path for these fields.
 		oz := mapping.omitzero[i] && f.avroType == "nullunion"
 		var fn userfn
 		if ok && !oz {
@@ -1147,8 +1150,10 @@ func udBytesDeser(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 
 // ---- Null-union unsafe ser/deser ----
 
-// nullUnionBytes returns the varint-encoded index bytes for null and value branches.
-// For null-first ["null", T]: null=0, val=2. For null-second [T, "null"]: null=2, val=0.
+// nullUnionBytes returns the single-byte varint-encoded union index for
+// the null and value branches. Zigzag varint: index 0 encodes as 0x00,
+// index 1 encodes as 0x02. So ["null",T] → null=0x00, val=0x02;
+// ["T","null"] → val=0x00, null=0x02.
 func nullUnionBytes(nullSecond bool) (nullByte, valByte byte) {
 	if nullSecond {
 		return 2, 0
@@ -1411,14 +1416,16 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 				v.SetLen(newLen)
 			}
 			s := *(*[]unsafe.Pointer)(p)
-			// Count how many elements need fresh allocation.
+			// Batch-allocate backing memory for nil pointer slots in
+			// one contiguous slice, then distribute pointers into the
+			// individual slots. This is much cheaper than allocating
+			// each element separately.
 			var need int
 			for i := range n {
 				if s[start+i] == nil {
 					need++
 				}
 			}
-			// Batch allocate only for nil slots.
 			if need > 0 {
 				backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
 				backingBase := backing.Index(0).Addr().UnsafePointer()
