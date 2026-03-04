@@ -75,6 +75,9 @@ func readUvarint(src []byte) (uint32, []byte, error) {
 			return 0, nil, &ShortBufferError{Type: "uvarint"}
 		}
 		b := src[i]
+		if i == 4 && b > 0x0f {
+			return 0, nil, errors.New("uvarint overflows 32 bits")
+		}
 		u |= uint32(b&0x7f) << (7 * i)
 		if b&0x80 == 0 {
 			return u, src[i+1:], nil
@@ -102,6 +105,9 @@ func readUvarlong(src []byte) (uint64, []byte, error) {
 			return 0, nil, &ShortBufferError{Type: "uvarlong"}
 		}
 		b := src[i]
+		if i == 9 && b > 0x01 {
+			return 0, nil, errors.New("uvarlong overflows 64 bits")
+		}
 		u |= uint64(b&0x7f) << (7 * i)
 		if b&0x80 == 0 {
 			return u, src[i+1:], nil

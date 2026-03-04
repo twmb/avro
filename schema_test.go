@@ -195,8 +195,8 @@ func TestValidateLogical(t *testing.T) {
 		// decimal
 		{"decimal ok bytes", aobject{Type: "bytes", Logical: "decimal", Precision: &somePrec}, false},
 		{"decimal ok fixed", aobject{Type: "fixed", Logical: "decimal", Precision: &somePrec, Size: &intSize}, false},
-		{"decimal missing precision", aobject{Type: "bytes", Logical: "decimal"}, true},
-		{"decimal wrong type", aobject{Type: "int", Logical: "decimal", Precision: &somePrec}, true},
+		{"decimal missing precision", aobject{Type: "bytes", Logical: "decimal"}, false},
+		{"decimal wrong type", aobject{Type: "int", Logical: "decimal", Precision: &somePrec}, false},
 
 		// uuid
 		{"uuid ok", aobject{Type: "string", Logical: "uuid"}, false},
@@ -632,11 +632,12 @@ func TestBuildEmptySchema(t *testing.T) {
 	}
 }
 
-func TestNonStrictNames(t *testing.T) {
-	t.Run("dashes allowed", func(t *testing.T) {
+func TestNameValidation(t *testing.T) {
+	t.Run("dashes rejected", func(t *testing.T) {
+		// Per spec: names must match [A-Za-z_][A-Za-z0-9_]*
 		_, err := Parse(`{"type":"record","name":"my-record","fields":[{"name":"my-field","type":"int"}]}`)
-		if err != nil {
-			t.Fatalf("expected dashed names to be accepted, got %v", err)
+		if err == nil {
+			t.Fatal("expected error for dashed record name")
 		}
 	})
 

@@ -746,17 +746,14 @@ func TestSerMapMissingFieldDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Map with only "b" provided; "a" should use its default.
+	// Defaults are read-time only. Missing writer fields should always error,
+	// even if a default is specified.
 	m := map[string]any{"b": "hello"}
-	dst, err := s.AppendEncode(nil, &m)
-	if err != nil {
-		t.Fatalf("expected success when field has default, got %v", err)
-	}
-	if len(dst) == 0 {
-		t.Fatal("expected non-empty encoding")
+	if _, err := s.AppendEncode(nil, &m); err == nil {
+		t.Fatal("expected error for missing field during encoding")
 	}
 
-	// Map missing field with no default should still error.
+	// Map missing field with no default should also error.
 	m2 := map[string]any{"a": int32(1)}
 	if _, err := s.AppendEncode(nil, &m2); err == nil {
 		t.Fatal("expected error for missing field with no default")

@@ -172,7 +172,11 @@ func serLong(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanInt() {
 		return appendVarlong(dst, int64(v.Int())), nil
 	} else if v.CanUint() {
-		return appendVarlong(dst, int64(v.Uint())), nil
+		n := v.Uint()
+		if n > math.MaxInt64 {
+			return nil, fmt.Errorf("value %d overflows Avro long (int64)", n)
+		}
+		return appendVarlong(dst, int64(n)), nil
 	} else if v.CanFloat() {
 		f := v.Float()
 		n := math.Trunc(f)
@@ -323,11 +327,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		for _, f := range s.fields {
 			value := v.MapIndex(f.nameVal)
 			if !value.IsValid() {
-				if !f.hasDefault {
-					return nil, fmt.Errorf("missing key %s", f.name)
-				}
-				dst = append(dst, f.defaultBytes...)
-				continue
+				return nil, fmt.Errorf("missing key %s", f.name)
 			}
 			if dst, err = f.fn(dst, value); err != nil {
 				return nil, err
@@ -532,7 +532,11 @@ func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 		if elem.CanInt() {
 			dst = appendVarlong(dst, elem.Int())
 		} else if elem.CanUint() {
-			dst = appendVarlong(dst, int64(elem.Uint()))
+			n := elem.Uint()
+			if n > math.MaxInt64 {
+				return nil, fmt.Errorf("value %d overflows Avro long (int64)", n)
+			}
+			dst = appendVarlong(dst, int64(n))
 		} else if elem.CanFloat() {
 			f := elem.Float()
 			n := math.Trunc(f)
@@ -727,7 +731,11 @@ func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 		if val.CanInt() {
 			dst = appendVarlong(dst, val.Int())
 		} else if val.CanUint() {
-			dst = appendVarlong(dst, int64(val.Uint()))
+			n := val.Uint()
+			if n > math.MaxInt64 {
+				return nil, fmt.Errorf("value %d overflows Avro long (int64)", n)
+			}
+			dst = appendVarlong(dst, int64(n))
 		} else if val.CanFloat() {
 			f := val.Float()
 			n := math.Trunc(f)
