@@ -325,3 +325,18 @@ func TestCheckCompatibility(t *testing.T) {
 		})
 	}
 }
+
+func TestNamesMatchUnqualified(t *testing.T) {
+	// Same unqualified name, different namespaces should be compatible.
+	reader, err := Parse(`{"type":"record","name":"R","namespace":"com.a","fields":[{"name":"x","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := Parse(`{"type":"record","name":"R","namespace":"com.b","fields":[{"name":"x","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckCompatibility(writer, reader); err != nil {
+		t.Fatalf("expected compatible by unqualified name, got %v", err)
+	}
+}

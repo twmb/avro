@@ -201,6 +201,37 @@ type aobject struct {
 	Precision *int   `json:"precision,omitempty"` // decimal logical type
 }
 
+// validName reports whether s matches [A-Za-z_][A-Za-z0-9_]*.
+func validName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, c := range s {
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c == '_' {
+			continue
+		}
+		if i > 0 && c >= '0' && c <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// validFullname reports whether s is a valid Avro fullname: one or more
+// dot-separated name components, each matching [A-Za-z_][A-Za-z0-9_]*.
+func validFullname(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, part := range strings.Split(s, ".") {
+		if !validName(part) {
+			return false
+		}
+	}
+	return true
+}
+
 var acomplex = map[string]struct{}{
 	"record": {},
 	"error":  {},
@@ -562,7 +593,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		origFieldAliases[i] = f.Aliases
 	}
 
-	o = &aobject{
+	// Canonical form: per the Avro spec's Parsing Canonical Form STRIP
+	// rule, keep only: type, name, fields, symbols, items, values, size.
+	// Strip all others (logicalType, precision, scale, doc, aliases, etc.).
+	canonObj := &aobject{
 		Name: o.Name,
 		Type: o.Type,
 
@@ -572,16 +606,20 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		Values:  o.Values,
 		Size:    o.Size,
 
-		Logical:   o.Logical,
-		Precision: o.Precision,
-		Scale:     o.Scale,
-
 		Namespace: o.Namespace,
 	}
-	b.canon = aschema{object: o}
+	b.canon = aschema{object: canonObj}
 
 	switch o.Type {
 	case "record", "error", "enum", "fixed":
+		if !validFullname(o.Name) {
+			return fmt.Errorf("invalid %s name %q", o.Type, o.Name)
+		}
+		for _, a := range origAliases {
+			if !validFullname(a) {
+				return fmt.Errorf("invalid %s alias %q", o.Type, a)
+			}
+		}
 		ns := ""
 		hasNS := false
 		if o.Namespace != nil {
@@ -650,6 +688,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		var names []string
 		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
+			if !validName(of.Name) {
+				return fmt.Errorf("invalid field name %q", of.Name)
+			}
+			for _, a := range origFieldAliases[i] {
+				if !validName(a) {
+					return fmt.Errorf("invalid field alias %q for field %q", a, of.Name)
+				}
+			}
 			if seenFields[of.Name] {
 				return fmt.Errorf("duplicate record field name %q", of.Name)
 			}
@@ -751,8 +797,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			return errors.New("invalid enum has schema for other types")
 		}
 
+		if len(o.Symbols) == 0 {
+			return errors.New("enum must have at least one symbol")
+		}
 		seenSymbols := make(map[string]bool, len(o.Symbols))
 		for _, e := range o.Symbols {
+			if !validName(e) {
+				return fmt.Errorf("invalid enum symbol %q", e)
+			}
 			if seenSymbols[e] {
 				return fmt.Errorf("duplicate enum symbol %q", e)
 			}
@@ -773,6 +825,9 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if len(origEnumDefault) > 0 {
 			var defStr string
 			json.Unmarshal(origEnumDefault, &defStr) //nolint:errcheck
+			if !seenSymbols[defStr] {
+				return fmt.Errorf("enum default %q is not a member of symbols", defStr)
+			}
 			nd.enumDef = defStr
 			nd.hasEnumDef = true
 		}
@@ -901,7 +956,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if o.Size == nil {
 			return errors.New("fixed is missing size")
 		}
-		if *o.Size < 0 {
+		if *o.Size <= 0 {
 			return fmt.Errorf("invalid fixed size %v", *o.Size)
 		}
 		switch s.object.Logical {
@@ -967,28 +1022,31 @@ func (o *aobject) validateLogical() error {
 		// No logical type: validate no scale / precision below.
 
 	case "decimal":
-		if o.Precision == nil {
-			return errors.New("logicalType decimal missing precision")
-		}
-		if *o.Precision <= 0 {
-			return fmt.Errorf("logicalType decimal precision must be positive, got %d", *o.Precision)
-		}
 		if o.Type != "bytes" && o.Type != "fixed" {
-			return fmt.Errorf("invalid logicalType decimal type %q, can only be bytes or fixed", o.Type)
+			// Wrong underlying type: fall back to underlying type.
+			o.Logical = ""
+			return nil
+		}
+		if o.Precision == nil || *o.Precision <= 0 {
+			// Invalid precision: fall back to underlying type.
+			o.Logical = ""
+			return nil
 		}
 		scale := 0
 		if o.Scale != nil {
 			scale = *o.Scale
 		}
 		if scale < 0 || scale > *o.Precision {
-			return fmt.Errorf("logicalType decimal scale %d must be in [0, precision=%d]", scale, *o.Precision)
+			// Invalid scale: fall back to underlying type.
+			o.Logical = ""
+			return nil
 		}
 		if o.Type == "fixed" && o.Size != nil {
-			// Per spec: precision ≤ floor(log10(2^(8*size-1) - 1)).
-			// Simplified: max unscaled value fits in (8*size - 1) bits.
 			maxDigits := maxDecimalDigits(*o.Size)
 			if *o.Precision > maxDigits {
-				return fmt.Errorf("logicalType decimal precision %d exceeds maximum %d for fixed size %d", *o.Precision, maxDigits, *o.Size)
+				// Precision exceeds fixed capacity: fall back.
+				o.Logical = ""
+				return nil
 			}
 		}
 		return nil
@@ -1115,24 +1173,69 @@ func validateDefault(val any, s *aschema) error {
 	if s.object != nil {
 		switch s.object.Type {
 		case "record", "error":
-			if _, ok := val.(map[string]any); !ok && val != nil {
+			m, ok := val.(map[string]any)
+			if !ok && val != nil {
 				return fmt.Errorf("expected object for record default, got %T", val)
 			}
+			if m != nil {
+				for _, f := range s.object.Fields {
+					fv, exists := m[f.Name]
+					if !exists {
+						// Fields absent from the default are
+						// allowed — they use their own defaults.
+						continue
+					}
+					if err := validateDefault(fv, f.Type); err != nil {
+						return fmt.Errorf("field %q: %w", f.Name, err)
+					}
+				}
+			}
 		case "enum":
-			if _, ok := val.(string); !ok {
+			sym, ok := val.(string)
+			if !ok {
 				return fmt.Errorf("expected string for enum default, got %T", val)
 			}
+			found := false
+			for _, es := range s.object.Symbols {
+				if es == sym {
+					found = true
+					break
+				}
+			}
+			if !found && len(s.object.Symbols) > 0 {
+				return fmt.Errorf("enum default %q is not a member of symbols", sym)
+			}
 		case "array":
-			if _, ok := val.([]any); !ok && val != nil {
+			arr, ok := val.([]any)
+			if !ok && val != nil {
 				return fmt.Errorf("expected array for array default, got %T", val)
 			}
+			if arr != nil && s.object.Items != nil {
+				for i, elem := range arr {
+					if err := validateDefault(elem, s.object.Items); err != nil {
+						return fmt.Errorf("array element %d: %w", i, err)
+					}
+				}
+			}
 		case "map":
-			if _, ok := val.(map[string]any); !ok && val != nil {
+			m, ok := val.(map[string]any)
+			if !ok && val != nil {
 				return fmt.Errorf("expected object for map default, got %T", val)
 			}
+			if m != nil && s.object.Values != nil {
+				for k, v := range m {
+					if err := validateDefault(v, s.object.Values); err != nil {
+						return fmt.Errorf("map key %q: %w", k, err)
+					}
+				}
+			}
 		case "fixed":
-			if _, ok := val.(string); !ok {
+			str, ok := val.(string)
+			if !ok {
 				return fmt.Errorf("expected string for fixed default, got %T", val)
+			}
+			if s.object.Size != nil && len(str) != *s.object.Size {
+				return fmt.Errorf("fixed default length %d does not match size %d", len(str), *s.object.Size)
 			}
 		}
 	}
@@ -1149,9 +1252,27 @@ func validateDefaultPrimitive(val any, prim string) error {
 		if _, ok := val.(bool); !ok {
 			return fmt.Errorf("expected boolean, got %T", val)
 		}
-	case "int", "long":
-		if _, ok := val.(float64); !ok {
-			return fmt.Errorf("expected number for %s, got %T", prim, val)
+	case "int":
+		f, ok := val.(float64)
+		if !ok {
+			return fmt.Errorf("expected number for int, got %T", val)
+		}
+		if f != math.Trunc(f) {
+			return fmt.Errorf("int default %v is not a whole number", f)
+		}
+		if f < math.MinInt32 || f > math.MaxInt32 {
+			return fmt.Errorf("int default %v out of range", f)
+		}
+	case "long":
+		f, ok := val.(float64)
+		if !ok {
+			return fmt.Errorf("expected number for long, got %T", val)
+		}
+		if f != math.Trunc(f) {
+			return fmt.Errorf("long default %v is not a whole number", f)
+		}
+		if f < -(1<<63) || f >= 1<<63 {
+			return fmt.Errorf("long default %v out of range", f)
 		}
 	case "float", "double":
 		if _, ok := val.(float64); !ok {

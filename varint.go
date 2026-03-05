@@ -70,7 +70,7 @@ func appendVarlong(dst []byte, i int64) []byte {
 
 func readUvarint(src []byte) (uint32, []byte, error) {
 	var u uint32
-	for i := range 5 {
+	for i := range 4 {
 		if i >= len(src) {
 			return 0, nil, &ShortBufferError{Type: "uvarint"}
 		}
@@ -80,7 +80,15 @@ func readUvarint(src []byte) (uint32, []byte, error) {
 			return u, src[i+1:], nil
 		}
 	}
-	return 0, nil, errors.New("uvarint overflows 32 bits")
+	if len(src) < 5 {
+		return 0, nil, &ShortBufferError{Type: "uvarint"}
+	}
+	b := src[4]
+	if b > 0x0f {
+		return 0, nil, errors.New("uvarint overflows 32 bits")
+	}
+	u |= uint32(b) << 28
+	return u, src[5:], nil
 }
 
 func readVarint(src []byte) (int32, []byte, error) {
@@ -97,7 +105,7 @@ func readVarint(src []byte) (int32, []byte, error) {
 
 func readUvarlong(src []byte) (uint64, []byte, error) {
 	var u uint64
-	for i := range 10 {
+	for i := range 9 {
 		if i >= len(src) {
 			return 0, nil, &ShortBufferError{Type: "uvarlong"}
 		}
@@ -107,7 +115,15 @@ func readUvarlong(src []byte) (uint64, []byte, error) {
 			return u, src[i+1:], nil
 		}
 	}
-	return 0, nil, errors.New("uvarlong overflows 64 bits")
+	if len(src) < 10 {
+		return 0, nil, &ShortBufferError{Type: "uvarlong"}
+	}
+	b := src[9]
+	if b > 0x01 {
+		return 0, nil, errors.New("uvarlong overflows 64 bits")
+	}
+	u |= uint64(b) << 63
+	return u, src[10:], nil
 }
 
 func readVarlong(src []byte) (int64, []byte, error) {
