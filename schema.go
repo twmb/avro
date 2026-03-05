@@ -640,7 +640,9 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				o.Name = parentName[:dot+1] + o.Name // no namespace: prefix our name with parent namespace if there is one
 			}
 		}
-		o.Namespace = nil // canonical form omits namespace
+		o.Namespace = nil       // canonical form omits namespace
+		canonObj.Name = o.Name  // use fully-qualified name
+		canonObj.Namespace = nil
 		if _, exists := b.named[o.Name]; exists {
 			return fmt.Errorf("duplicate named type %q", o.Name)
 		}
