@@ -19,6 +19,50 @@ func TestCanonical(t *testing.T) {
 	}
 }
 
+func TestCanonicalStripsLogicalType(t *testing.T) {
+	// Per the Avro spec STRIP rule, canonical form keeps only:
+	// type, name, fields, symbols, items, values, size.
+	// logicalType, precision, and scale must be stripped.
+	tests := []struct {
+		name   string
+		schema string
+		want   string
+	}{
+		{
+			"decimal on fixed",
+			`{"type":"fixed","name":"Money","size":8,"logicalType":"decimal","precision":16,"scale":2}`,
+			`{"name":"Money","type":"fixed","size":8}`,
+		},
+		{
+			"duration on fixed",
+			`{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`,
+			`{"name":"dur","type":"fixed","size":12}`,
+		},
+		{
+			"date on int",
+			`{"type":"int","logicalType":"date"}`,
+			`"int"`,
+		},
+		{
+			"error preserves type",
+			`{"type":"error","name":"E","fields":[{"name":"x","type":"int"}]}`,
+			`{"name":"E","type":"error","fields":[{"name":"x","type":"int"}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(s.Canonical())
+			if got != tt.want {
+				t.Errorf("got  %s\nwant %s", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFingerprint(t *testing.T) {
 	s, err := Parse(`"int"`)
 	if err != nil {
@@ -729,5 +773,121 @@ func TestEmptyNamespace(t *testing.T) {
 	// explicitly cleared.
 	if strings.Contains(canon, "com.example.child") {
 		t.Fatalf("expected empty namespace to clear parent, got %s", canon)
+	}
+}
+
+func TestSchemaValidationErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{"invalid type alias", `{"type":"record","name":"R","aliases":["bad-alias"],"fields":[{"name":"x","type":"int"}]}`},
+		{"empty field name", `{"type":"record","name":"R","fields":[{"name":"","type":"int"}]}`},
+		{"invalid field name", `{"type":"record","name":"R","fields":[{"name":"bad-field!","type":"int"}]}`},
+		{"invalid field alias", `{"type":"record","name":"R","fields":[{"name":"x","type":"int","aliases":["bad-alias!"]}]}`},
+		{"empty enum symbols", `{"type":"enum","name":"E","symbols":[]}`},
+		{"invalid enum symbol", `{"type":"enum","name":"E","symbols":["bad-sym!"]}`},
+		{"enum default not in symbols", `{"type":"enum","name":"E","symbols":["A","B"],"default":"C"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse(tt.schema)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestDefaultValidationErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"record field invalid default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"inner","type":{"type":"record","name":"I","fields":[
+					{"name":"x","type":"int"}
+				]},"default":{"x":"not_a_number"}}
+			]}`,
+		},
+		{
+			"record default missing field ok",
+			`{"type":"record","name":"R","fields":[
+				{"name":"inner","type":{"type":"record","name":"I","fields":[
+					{"name":"x","type":"int","default":0},
+					{"name":"y","type":"int","default":0}
+				]},"default":{"x":1}}
+			]}`,
+		},
+		{
+			"enum field default not in symbols",
+			`{"type":"record","name":"R","fields":[
+				{"name":"e","type":{"type":"enum","name":"E","symbols":["A","B"]},"default":"C"}
+			]}`,
+		},
+		{
+			"array element invalid default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"a","type":{"type":"array","items":"int"},"default":["not_a_number"]}
+			]}`,
+		},
+		{
+			"map value invalid default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"m","type":{"type":"map","values":"int"},"default":{"k":"not_a_number"}}
+			]}`,
+		},
+		{
+			"fixed default wrong length",
+			`{"type":"record","name":"R","fields":[
+				{"name":"f","type":{"type":"fixed","name":"F","size":4},"default":"ab"}
+			]}`,
+		},
+		{
+			"int default not whole",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"int","default":1.5}
+			]}`,
+		},
+		{
+			"int default out of range",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"int","default":3000000000}
+			]}`,
+		},
+		{
+			"long default not number",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"long","default":"foo"}
+			]}`,
+		},
+		{
+			"long default not whole",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"long","default":1.5}
+			]}`,
+		},
+		{
+			"long default out of range",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"long","default":1e19}
+			]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse(tt.schema)
+			if tt.name == "record default missing field ok" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
 	}
 }

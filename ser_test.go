@@ -925,3 +925,31 @@ func TestSerJSONRoundtrip(t *testing.T) {
 		t.Errorf("active: got %v", m["active"])
 	}
 }
+
+func TestSerLongUint64Overflow(t *testing.T) {
+	// Top-level long: uint64 > MaxInt64.
+	var big uint64 = math.MaxInt64 + 1
+	encodeErr(t, `"long"`, &big)
+
+	// Array of longs: uint64 > MaxInt64 in element.
+	schema := `{"type":"array","items":"long"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr := []uint64{big}
+	if _, err := s.AppendEncode(nil, &arr); err == nil {
+		t.Fatal("expected overflow error for uint64 in array long")
+	}
+
+	// Map of longs: uint64 > MaxInt64 in value.
+	schema = `{"type":"map","values":"long"}`
+	s, err = Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := map[string]uint64{"k": big}
+	if _, err := s.AppendEncode(nil, &m); err == nil {
+		t.Fatal("expected overflow error for uint64 in map long")
+	}
+}

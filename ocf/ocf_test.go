@@ -2853,3 +2853,56 @@ func TestWithReaderSchemaIncompatible(t *testing.T) {
 		t.Fatal("expected error for incompatible schemas")
 	}
 }
+
+func TestReservedMetadataKey(t *testing.T) {
+	s, err := avro.Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	_, err = NewWriter(&buf, s, WithMetadata(map[string][]byte{
+		"avro.custom": []byte("value"),
+	}))
+	if err == nil {
+		t.Fatal("expected error for avro.* metadata key")
+	}
+}
+
+func TestOptReaderSchemaMarker(t *testing.T) {
+	// Cover optReaderSchema.readerOpt marker method.
+	s := avro.MustParse(`"int"`)
+	var ro ReaderOpt = WithReaderSchema(s)
+	ro.(optReaderSchema).readerOpt()
+}
+
+func TestNegativeBlockCountRead(t *testing.T) {
+	s, err := avro.Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Append a block with negative count after the valid (empty) file.
+	data := buf.Bytes()
+	data = binary.AppendVarint(data, -1) // negative count
+	data = binary.AppendVarint(data, 0)  // size
+	data = append(data, make([]byte, 16)...) // sync marker
+	r, err := NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v int32
+	err = r.Decode(&v)
+	if err == nil {
+		t.Fatal("expected error for negative block count")
+	}
+	if !strings.Contains(err.Error(), "negative block count") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

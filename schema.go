@@ -593,7 +593,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		origFieldAliases[i] = f.Aliases
 	}
 
-	o = &aobject{
+	// Canonical form: per the Avro spec's Parsing Canonical Form STRIP
+	// rule, keep only: type, name, fields, symbols, items, values, size.
+	// Strip all others (logicalType, precision, scale, doc, aliases, etc.).
+	canonObj := &aobject{
 		Name: o.Name,
 		Type: o.Type,
 
@@ -603,13 +606,9 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		Values:  o.Values,
 		Size:    o.Size,
 
-		Logical:   o.Logical,
-		Precision: o.Precision,
-		Scale:     o.Scale,
-
 		Namespace: o.Namespace,
 	}
-	b.canon = aschema{object: o}
+	b.canon = aschema{object: canonObj}
 
 	switch o.Type {
 	case "record", "error", "enum", "fixed":

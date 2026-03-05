@@ -2840,6 +2840,14 @@ func TestReadUvarlongOverflow(t *testing.T) {
 	}
 }
 
+func TestReadUvarlongShort10(t *testing.T) {
+	// 9 continuation bytes with no 10th byte → short buffer.
+	_, _, err := readUvarlong([]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80})
+	if err == nil {
+		t.Fatal("expected short buffer error")
+	}
+}
+
 // TestRoundTripArrayNullUnionRecord covers usArrayNullUnionRecord for ser
 // and the reflect fallback for deser of []*T where items are ["null", record].
 func TestRoundTripArrayNullUnionRecord(t *testing.T) {
