@@ -38,11 +38,7 @@ func FuzzOCFReader(f *testing.F) {
 	f.Add(mustOCF(f, stringSchema, []any{"snappy"}, WithCodec(SnappyCodec())))
 
 	// Zstd codec.
-	zstdC, err := ZstdCodec()
-	if err != nil {
-		f.Fatal(err)
-	}
-	f.Add(mustOCF(f, stringSchema, []any{"zstandard"}, WithCodec(zstdC)))
+	f.Add(mustOCF(f, stringSchema, []any{"zstandard"}, WithCodec(MustZstdCodec(nil, nil))))
 
 	// Record schema exercises more decoder paths.
 	recSchema := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
