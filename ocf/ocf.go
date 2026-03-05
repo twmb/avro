@@ -109,11 +109,16 @@ type WriterOpt interface{ writerOpt() }
 // ReaderOpt is an option for [NewReader].
 type ReaderOpt interface{ readerOpt() }
 
-// Opt implements both [WriterOpt] and [ReaderOpt].
-type Opt struct{ o any }
+// Opt is an option that applies to both [NewWriter] and [NewReader].
+type Opt interface {
+	WriterOpt
+	ReaderOpt
+}
 
-func (Opt) writerOpt() {}
-func (Opt) readerOpt() {}
+type optCodec struct{ c Codec }
+
+func (optCodec) writerOpt() {}
+func (optCodec) readerOpt() {}
 
 type (
 	optBlockCount    struct{ n int }
@@ -142,7 +147,7 @@ func (optMaxBlockBytes) readerOpt() {}
 // The codec's Close method is called by [Writer.Close] and [Reader.Close].
 // Codecs that should not be closed (e.g. shared across multiple writers)
 // should return nil from Close.
-func WithCodec(c Codec) Opt { return Opt{c} }
+func WithCodec(c Codec) Opt { return optCodec{c} }
 
 // WithBlockCount sets the maximum number of items per block. The default is
 // 100. If both WithBlockCount and [WithBlockBytes] are set, whichever limit
@@ -250,6 +255,25 @@ type Writer struct {
 	hasSync bool
 }
 
+func (w *Writer) normalizeLimits() {
+	if w.maxCount < 0 {
+		w.maxCount = 0
+	}
+	if w.maxBytes < 0 {
+		w.maxBytes = 0
+	}
+	if w.maxCount == 0 && w.maxBytes == 0 {
+		w.maxCount = 100
+	}
+}
+
+func (w *Writer) shouldFlush() bool {
+	return (w.maxCount > 0 && w.count >= w.maxCount) || (w.maxBytes > 0 && len(w.buf) >= w.maxBytes)
+}
+
+// Schema returns the schema used by this Writer.
+func (wr *Writer) Schema() *avro.Schema { return wr.schema }
+
 // NewWriter creates a Writer that writes an OCF to w. The file header is
 // written immediately.
 func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) {
@@ -261,8 +285,8 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) 
 
 	for _, o := range opts {
 		switch o := o.(type) {
-		case Opt:
-			wr.codec = o.o.(Codec)
+		case optCodec:
+			wr.codec = o.c
 		case optBlockCount:
 			wr.maxCount = o.n
 		case optBlockBytes:
@@ -281,15 +305,7 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) 
 			wr.schemaJSON = o.s
 		}
 	}
-	if wr.maxCount < 0 {
-		wr.maxCount = 0
-	}
-	if wr.maxBytes < 0 {
-		wr.maxBytes = 0
-	}
-	if wr.maxCount == 0 && wr.maxBytes == 0 {
-		wr.maxCount = 100
-	}
+	wr.normalizeLimits()
 
 	if !wr.hasSync {
 		if _, err := randRead(wr.sync[:]); err != nil {
@@ -340,7 +356,7 @@ func (w *Writer) Encode(v any) error {
 		return err
 	}
 	w.count++
-	if (w.maxCount > 0 && w.count >= w.maxCount) || (w.maxBytes > 0 && len(w.buf) >= w.maxBytes) {
+	if w.shouldFlush() {
 		return w.flush()
 	}
 	return nil
@@ -355,7 +371,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 	}
 	w.buf = append(w.buf, p...)
 	w.count++
-	if (w.maxCount > 0 && w.count >= w.maxCount) || (w.maxBytes > 0 && len(w.buf) >= w.maxBytes) {
+	if w.shouldFlush() {
 		if err := w.flush(); err != nil {
 			return 0, err
 		}
@@ -447,8 +463,8 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 	}
 	var customCodecs []Codec
 	for _, o := range opts {
-		if o, ok := o.(Opt); ok {
-			customCodecs = append(customCodecs, o.o.(Codec))
+		if o, ok := o.(optCodec); ok {
+			customCodecs = append(customCodecs, o.c)
 		}
 	}
 	codec, err := resolveCodec(codecName, customCodecs)
@@ -476,16 +492,7 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 			wr.maxBytes = o.n
 		}
 	}
-	if wr.maxCount < 0 {
-		wr.maxCount = 0
-	}
-	if wr.maxBytes < 0 {
-		wr.maxBytes = 0
-	}
-	if wr.maxCount == 0 && wr.maxBytes == 0 {
-		wr.maxCount = 100
-	}
-
+	wr.normalizeLimits()
 	return wr, nil
 }
 
@@ -541,8 +548,8 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	var maxBlockBytes int64
 	for _, o := range opts {
 		switch o := o.(type) {
-		case Opt:
-			customCodecs = append(customCodecs, o.o.(Codec))
+		case optCodec:
+			customCodecs = append(customCodecs, o.c)
 		case optReaderSchema:
 			readerSchema = o.s
 		case optMaxBlockBytes:
@@ -611,7 +618,7 @@ func (rd *Reader) Decode(v any) error {
 func (rd *Reader) Schema() *avro.Schema { return rd.schema }
 
 // Metadata returns the raw metadata from the file header, including both
-// "avro.*" and user-defined keys.
+// "avro.*" and user-defined keys. The returned map must not be modified.
 func (rd *Reader) Metadata() map[string][]byte { return rd.meta }
 
 // Close closes the codec, releasing any resources it holds.
