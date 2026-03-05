@@ -2,6 +2,7 @@ package avro
 
 import (
 	"encoding"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -14,12 +15,14 @@ type stringer interface {
 
 var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 
+var errIndirectNil = errors.New("invalid nil in non-union, non-null")
+
 func indirect(v reflect.Value) (reflect.Value, error) {
 	for {
 		switch v.Kind() {
 		case reflect.Pointer, reflect.Interface:
 			if v.IsNil() {
-				return v, fmt.Errorf("invalid nil in non-union, non-null")
+				return v, errIndirectNil
 			}
 			v = v.Elem()
 		default:

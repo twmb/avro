@@ -868,6 +868,40 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 // LOGICAL TYPE DESERIALIZERS //
 ///////////////////////////////
 
+// setLongValue sets v to val, handling interface, int, and uint targets.
+func setLongValue(v reflect.Value, val int64) error {
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return nil
+	}
+	if v.CanInt() {
+		v.SetInt(val)
+		return nil
+	}
+	if v.CanUint() {
+		v.SetUint(uint64(val))
+		return nil
+	}
+	return &SemanticError{GoType: v.Type(), AvroType: "long"}
+}
+
+// setIntValue sets v to val, handling interface, int, and uint targets.
+func setIntValue(v reflect.Value, val int32) error {
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return nil
+	}
+	if v.CanInt() {
+		v.SetInt(int64(val))
+		return nil
+	}
+	if v.CanUint() {
+		v.SetUint(uint64(val))
+		return nil
+	}
+	return &SemanticError{GoType: v.Type(), AvroType: "int"}
+}
+
 func deserTimestampMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	val, src, err := readVarlong(src)
 	if err != nil {
@@ -878,18 +912,7 @@ func deserTimestampMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 		v.Set(reflect.ValueOf(time.UnixMilli(val)))
 		return src, nil
 	}
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
-		return src, nil
-	}
-	if v.CanInt() {
-		v.SetInt(val)
-	} else if v.CanUint() {
-		v.SetUint(uint64(val))
-	} else {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
-	}
-	return src, nil
+	return src, setLongValue(v, val)
 }
 
 func deserTimestampMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -902,18 +925,7 @@ func deserTimestampMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 		v.Set(reflect.ValueOf(time.UnixMicro(val)))
 		return src, nil
 	}
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
-		return src, nil
-	}
-	if v.CanInt() {
-		v.SetInt(val)
-	} else if v.CanUint() {
-		v.SetUint(uint64(val))
-	} else {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
-	}
-	return src, nil
+	return src, setLongValue(v, val)
 }
 
 func deserTimestampNanos(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -926,18 +938,7 @@ func deserTimestampNanos(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		v.Set(reflect.ValueOf(time.Unix(val/1e9, val%1e9)))
 		return src, nil
 	}
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
-		return src, nil
-	}
-	if v.CanInt() {
-		v.SetInt(val)
-	} else if v.CanUint() {
-		v.SetUint(uint64(val))
-	} else {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
-	}
-	return src, nil
+	return src, setLongValue(v, val)
 }
 
 func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -951,18 +952,7 @@ func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		v.Set(reflect.ValueOf(t))
 		return src, nil
 	}
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
-		return src, nil
-	}
-	if v.CanInt() {
-		v.SetInt(int64(val))
-	} else if v.CanUint() {
-		v.SetUint(uint64(val))
-	} else {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
-	}
-	return src, nil
+	return src, setIntValue(v, val)
 }
 
 func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -975,18 +965,7 @@ func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Millisecond))
 		return src, nil
 	}
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
-		return src, nil
-	}
-	if v.CanInt() {
-		v.SetInt(int64(val))
-	} else if v.CanUint() {
-		v.SetUint(uint64(val))
-	} else {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
-	}
-	return src, nil
+	return src, setIntValue(v, val)
 }
 
 func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -1002,18 +981,7 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
 		return src, nil
 	}
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
-		return src, nil
-	}
-	if v.CanInt() {
-		v.SetInt(val)
-	} else if v.CanUint() {
-		v.SetUint(uint64(val))
-	} else {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
-	}
-	return src, nil
+	return src, setLongValue(v, val)
 }
 
 func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {

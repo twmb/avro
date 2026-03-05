@@ -57,8 +57,6 @@ type fieldNode struct {
 	hasDefault bool
 }
 
-// MustParse is like [Parse] but panics on error. Useful for package-level
-// var declarations.
 // ParseOpt configures schema parsing behavior.
 type ParseOpt interface{ parseOpt() }
 
@@ -80,6 +78,7 @@ func WithStrictNames() ParseOpt { return parseOptStrict{} }
 // split before calling fn.
 func WithLaxNames(fn func(string) error) ParseOpt { return parseOptLax{fn} }
 
+// MustParse is like [Parse] but panics on error.
 func MustParse(schema string, opts ...ParseOpt) *Schema {
 	s, err := Parse(schema, opts...)
 	if err != nil {

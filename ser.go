@@ -282,7 +282,7 @@ func doSerBytes(dst []byte, v reflect.Value) []byte {
 		return append(dst, v.Slice(0, l).Bytes()...)
 	}
 	for i := range l {
-		dst = append(dst, v.Index(i).Interface().(byte))
+		dst = append(dst, byte(v.Index(i).Uint()))
 	}
 	return dst
 }
@@ -822,7 +822,7 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		return append(dst, v.Slice(0, s.n).Bytes()...), nil
 	}
 	for i := 0; i < s.n; i++ {
-		dst = append(dst, v.Index(i).Interface().(byte))
+		dst = append(dst, byte(v.Index(i).Uint()))
 	}
 	return dst, nil
 }
