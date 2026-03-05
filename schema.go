@@ -9,6 +9,7 @@ import (
 	"hash"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -358,7 +359,7 @@ func (b *builder) validFullnameErr(s string) error {
 		}
 		return fmt.Errorf("invalid name %q", s)
 	}
-	for _, part := range strings.Split(s, ".") {
+	for part := range strings.SplitSeq(s, ".") {
 		if err := b.validNameErr(part); err != nil {
 			return err
 		}
@@ -696,8 +697,8 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				o.Name = parentName[:dot+1] + o.Name // no namespace: prefix our name with parent namespace if there is one
 			}
 		}
-		o.Namespace = nil       // canonical form omits namespace
-		canonObj.Name = o.Name  // use fully-qualified name
+		o.Namespace = nil      // canonical form omits namespace
+		canonObj.Name = o.Name // use fully-qualified name
 		canonObj.Namespace = nil
 		if _, exists := b.named[o.Name]; exists {
 			return fmt.Errorf("duplicate named type %q", o.Name)
@@ -1253,13 +1254,7 @@ func validateDefault(val any, s *aschema) error {
 			if !ok {
 				return fmt.Errorf("expected string for enum default, got %T", val)
 			}
-			found := false
-			for _, es := range s.object.Symbols {
-				if es == sym {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(s.object.Symbols, sym)
 			if !found && len(s.object.Symbols) > 0 {
 				return fmt.Errorf("enum default %q is not a member of symbols", sym)
 			}
