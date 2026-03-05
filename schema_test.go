@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -697,6 +698,54 @@ func TestNameValidation(t *testing.T) {
 			t.Fatal("expected non-empty canonical form")
 		}
 	})
+}
+
+func TestWithLaxNames(t *testing.T) {
+	// Dashes are rejected by default.
+	_, err := Parse(`{"type":"record","name":"my-record","fields":[{"name":"x","type":"int"}]}`)
+	if err == nil {
+		t.Fatal("expected error for dashed name in strict mode")
+	}
+
+	// WithLaxNames(nil) allows dashes.
+	s, err := Parse(`{"type":"record","name":"my-record","fields":[{"name":"my-field","type":"int"}]}`, WithLaxNames(nil))
+	if err != nil {
+		t.Fatalf("lax: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil schema")
+	}
+
+	// WithLaxNames(nil) still rejects empty names.
+	_, err = Parse(`{"type":"record","name":"","fields":[{"name":"x","type":"int"}]}`, WithLaxNames(nil))
+	if err == nil {
+		t.Fatal("expected error for empty name in lax mode")
+	}
+
+	// WithLaxNames with custom validator.
+	noDigitStart := func(s string) error {
+		if s == "" {
+			return errors.New("empty")
+		}
+		if s[0] >= '0' && s[0] <= '9' {
+			return errors.New("starts with digit")
+		}
+		return nil
+	}
+	_, err = Parse(`{"type":"record","name":"my-record","fields":[{"name":"x","type":"int"}]}`, WithLaxNames(noDigitStart))
+	if err != nil {
+		t.Fatalf("custom validator: %v", err)
+	}
+	_, err = Parse(`{"type":"record","name":"0bad","fields":[{"name":"x","type":"int"}]}`, WithLaxNames(noDigitStart))
+	if err == nil {
+		t.Fatal("expected error for digit-start name with custom validator")
+	}
+
+	// WithStrictNames re-enables strict after lax.
+	_, err = Parse(`{"type":"record","name":"my-record","fields":[{"name":"x","type":"int"}]}`, WithStrictNames())
+	if err == nil {
+		t.Fatal("expected error for dashed name in strict mode")
+	}
 }
 
 func TestNamespaceFallback(t *testing.T) {

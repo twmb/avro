@@ -2710,6 +2710,45 @@ func TestReadBlockOversizedBlock(t *testing.T) {
 	}
 }
 
+func TestWithMaxBlockBytes(t *testing.T) {
+	s, err := avro.Parse(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode("hello world, this is a test string"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reading with a very small max should fail.
+	r, err := NewReader(bytes.NewReader(buf.Bytes()), WithMaxBlockBytes(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v any
+	err = r.Decode(&v)
+	if err == nil || !strings.Contains(err.Error(), "exceeds safety limit") {
+		t.Fatalf("expected safety limit error, got %v", err)
+	}
+
+	// Reading with a large enough max should succeed.
+	r, err = NewReader(bytes.NewReader(buf.Bytes()), WithMaxBlockBytes(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = r.Decode(&v)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestDecodeMapOversizedCount(t *testing.T) {
 	var data []byte
 	data = binary.AppendVarint(data, 1<<20+1) // count exceeds limit
