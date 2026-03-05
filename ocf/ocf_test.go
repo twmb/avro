@@ -294,6 +294,7 @@ func TestEmpty(t *testing.T) {
 type xorCodec struct{ key byte }
 
 func (x xorCodec) Name() string { return "xor" }
+func (x xorCodec) Close() error { return nil }
 func (x xorCodec) Compress(src []byte) ([]byte, error) {
 	dst := make([]byte, len(src))
 	for i, b := range src {
@@ -328,7 +329,7 @@ func TestCustomCodec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, err := NewReader(&buf, WithReaderCodec(codec))
+	r, err := NewReader(&buf, WithCodec(codec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,7 +674,8 @@ func TestEncodeError(t *testing.T) {
 
 type failCompressCodec struct{}
 
-func (failCompressCodec) Name() string { return "failcompress" }
+func (failCompressCodec) Name() string  { return "failcompress" }
+func (failCompressCodec) Close() error  { return nil }
 func (failCompressCodec) Compress([]byte) ([]byte, error) {
 	return nil, errors.New("compress failed")
 }
@@ -871,6 +873,7 @@ func TestNegativeBlockSize(t *testing.T) {
 type failDecompressCodec struct{}
 
 func (failDecompressCodec) Name() string                        { return "faildecompress" }
+func (failDecompressCodec) Close() error                        { return nil }
 func (failDecompressCodec) Compress(src []byte) ([]byte, error) { return src, nil }
 func (failDecompressCodec) Decompress([]byte) ([]byte, error) {
 	return nil, errors.New("decompress failed")
@@ -895,7 +898,7 @@ func TestDecompressError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, err := NewReader(bytes.NewReader(buf.Bytes()), WithReaderCodec(codec))
+	r, err := NewReader(bytes.NewReader(buf.Bytes()), WithCodec(codec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1081,7 +1084,7 @@ func TestOptMarkerMethods(t *testing.T) {
 	// Cover the unexported interface marker methods.
 	var wo WriterOpt
 	wo = WithCodec(nullCodec{})
-	wo.(optCodec).writerOpt()
+	wo.(Opt).writerOpt()
 	wo = WithBlockCount(1)
 	wo.(optBlockCount).writerOpt()
 	wo = WithBlockBytes(1)
@@ -1093,8 +1096,8 @@ func TestOptMarkerMethods(t *testing.T) {
 	wo = WithSchema("")
 	wo.(optSchema).writerOpt()
 	var ro ReaderOpt
-	ro = WithReaderCodec(nullCodec{})
-	ro.(optReaderCodec).readerOpt()
+	ro = WithCodec(nullCodec{})
+	ro.(Opt).readerOpt()
 }
 
 func TestHeaderWriteError(t *testing.T) {
@@ -1808,7 +1811,7 @@ func TestAppendWriterCustomCodec(t *testing.T) {
 
 	// Read all back.
 	sb.pos = 0
-	r, err := NewReader(sb, WithReaderCodec(codec))
+	r, err := NewReader(sb, WithCodec(codec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2247,7 +2250,7 @@ func TestZstd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	codec, err := ZstdCodec()
+	codec, err := ZstdCodec(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2295,7 +2298,7 @@ func TestZstd(t *testing.T) {
 
 // ---------- Codec close ----------
 
-func TestWriterCloseCodec(t *testing.T) {
+func TestWriterClosesCodec(t *testing.T) {
 	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
@@ -2315,7 +2318,7 @@ func TestWriterCloseCodec(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !codec.closed {
-		t.Fatal("expected codec to be closed")
+		t.Fatal("expected codec to be closed by Writer")
 	}
 }
 
@@ -2339,8 +2342,7 @@ func TestWriterCloseCodecError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = w.Close()
-	if err == nil {
+	if err := w.Close(); err == nil {
 		t.Fatal("expected error from codec close")
 	}
 }
@@ -2379,10 +2381,11 @@ func TestReaderCloseZstd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	codec, err := ZstdCodec()
+	codec, err := ZstdCodec(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	var buf bytes.Buffer
 	w, err := NewWriter(&buf, s, WithCodec(codec))
 	if err != nil {
@@ -2419,7 +2422,7 @@ func TestZstdCodecEncoderOpts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	codec, err := ZstdCodec(zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+	codec, err := ZstdCodec([]zstd.EOption{zstd.WithEncoderLevel(zstd.SpeedBestCompression)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2450,29 +2453,68 @@ func TestZstdCodecEncoderOpts(t *testing.T) {
 	}
 }
 
-func TestZstdCodecFromShared(t *testing.T) {
+func TestZstdCodecConcurrencyOverride(t *testing.T) {
+	// Verify that the default concurrency(1) can be overridden.
 	s, err := avro.Parse(`"int"`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	enc, err := zstd.NewWriter(nil)
+	codec, err := ZstdCodec(
+		[]zstd.EOption{zstd.WithEncoderConcurrency(2)},
+		[]zstd.DOption{zstd.WithDecoderConcurrency(2)},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer enc.Close()
-	dec, err := zstd.NewReader(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dec.Close()
+	defer codec.Close()
+	shared := NopCloser(codec)
 
-	codec := ZstdCodecFrom(enc, dec)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s, WithCodec(shared))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(int32(99)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewReader(&buf, WithCodec(shared))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	var out int32
+	if err := r.Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out != 99 {
+		t.Fatalf("got %d, want 99", out)
+	}
+}
+
+func TestZstdCodecShared(t *testing.T) {
+	s, err := avro.Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a zstd codec and wrap it with NopCloser so that individual
+	// Writer/Reader Close calls don't release the shared resources.
+	codec, err := ZstdCodec(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer codec.Close()
+	shared := NopCloser(codec)
 
 	// Write two separate files with the same shared codec.
 	var buf1, buf2 bytes.Buffer
 	for i, buf := range []*bytes.Buffer{&buf1, &buf2} {
-		w, err := NewWriter(buf, s, WithCodec(codec))
+		w, err := NewWriter(buf, s, WithCodec(shared))
 		if err != nil {
 			t.Fatalf("file %d: %v", i, err)
 		}
@@ -2486,7 +2528,7 @@ func TestZstdCodecFromShared(t *testing.T) {
 
 	// Read both back using the same shared codec.
 	for i, buf := range []*bytes.Buffer{&buf1, &buf2} {
-		r, err := NewReader(buf, WithReaderCodec(codec))
+		r, err := NewReader(buf, WithCodec(shared))
 		if err != nil {
 			t.Fatalf("file %d: %v", i, err)
 		}
@@ -2500,54 +2542,6 @@ func TestZstdCodecFromShared(t *testing.T) {
 		if err := r.Close(); err != nil {
 			t.Fatalf("file %d: %v", i, err)
 		}
-	}
-}
-
-func TestZstdCodecFromNilEncoder(t *testing.T) {
-	dec, err := zstd.NewReader(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dec.Close()
-
-	codec := ZstdCodecFrom(nil, dec)
-	if _, err := codec.Compress([]byte("data")); err == nil {
-		t.Fatal("expected error compressing with nil encoder")
-	}
-	// Decompress should work.
-	enc2, err := zstd.NewWriter(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer enc2.Close()
-	compressed := enc2.EncodeAll([]byte{0x02}, nil) // zigzag 1
-	got, err := codec.Decompress(compressed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, []byte{0x02}) {
-		t.Fatalf("got %x, want 02", got)
-	}
-}
-
-func TestZstdCodecFromNilDecoder(t *testing.T) {
-	enc, err := zstd.NewWriter(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer enc.Close()
-
-	codec := ZstdCodecFrom(enc, nil)
-	if _, err := codec.Decompress([]byte("data")); err == nil {
-		t.Fatal("expected error decompressing with nil decoder")
-	}
-	// Compress should work.
-	got, err := codec.Compress([]byte{0x02})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) == 0 {
-		t.Fatal("expected non-empty compressed output")
 	}
 }
 
@@ -2599,7 +2593,7 @@ func TestResolveCodecCustomOverridesBuiltin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if codec != custom {
+	if codec != Codec(custom) {
 		t.Fatal("expected custom codec to override built-in zstandard")
 	}
 }
@@ -2609,6 +2603,7 @@ type testCodec struct {
 }
 
 func (c *testCodec) Name() string                          { return c.name }
+func (c *testCodec) Close() error                          { return nil }
 func (c *testCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
 func (c *testCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
 
@@ -2678,14 +2673,33 @@ func TestGoldenWeather(t *testing.T) {
 }
 
 func TestZstdCodecBadEncoderOption(t *testing.T) {
-	// Invalid window size (too small) causes zstd.NewWriter to fail.
-	_, err := ZstdCodec(zstd.WithWindowSize(1))
+	// Invalid window size (too small) causes ZstdCodec to fail.
+	_, err := ZstdCodec([]zstd.EOption{zstd.WithWindowSize(1)}, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid zstd encoder option")
 	}
 	if !strings.Contains(err.Error(), "zstd") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func TestZstdCodecBadDecoderOption(t *testing.T) {
+	_, err := ZstdCodec(nil, []zstd.DOption{zstd.WithDecoderConcurrency(-1)})
+	if err == nil {
+		t.Fatal("expected error for invalid zstd decoder option")
+	}
+	if !strings.Contains(err.Error(), "zstd") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMustZstdCodecPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic from MustZstdCodec with bad options")
+		}
+	}()
+	MustZstdCodec([]zstd.EOption{zstd.WithWindowSize(1)}, nil)
 }
 
 func TestReadBlockOversizedBlock(t *testing.T) {
@@ -2707,6 +2721,45 @@ func TestReadBlockOversizedBlock(t *testing.T) {
 	err = r.Decode(&v)
 	if err == nil || !strings.Contains(err.Error(), "exceeds safety limit") {
 		t.Fatalf("expected safety limit error, got %v", err)
+	}
+}
+
+func TestWithMaxBlockBytes(t *testing.T) {
+	s, err := avro.Parse(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode("hello world, this is a test string"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reading with a very small max should fail.
+	r, err := NewReader(bytes.NewReader(buf.Bytes()), WithMaxBlockBytes(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v any
+	err = r.Decode(&v)
+	if err == nil || !strings.Contains(err.Error(), "exceeds safety limit") {
+		t.Fatalf("expected safety limit error, got %v", err)
+	}
+
+	// Reading with a large enough max should succeed.
+	r, err = NewReader(bytes.NewReader(buf.Bytes()), WithMaxBlockBytes(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = r.Decode(&v)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

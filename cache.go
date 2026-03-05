@@ -33,7 +33,7 @@ func NewSchemaCache() *SchemaCache {
 // Parse parses a schema string, registering any named types (records, enums,
 // fixed) in the cache. Named types from previous Parse calls are available
 // for reference resolution. On failure, the cache is not modified.
-func (c *SchemaCache) Parse(schema string) (*Schema, error) {
+func (c *SchemaCache) Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -41,6 +41,7 @@ func (c *SchemaCache) Parse(schema string) (*Schema, error) {
 	b := &builder{
 		named: maps.Clone(c.named),
 	}
+	applyParseOpts(b, opts)
 
 	s, err := parse(schema, b)
 	if err != nil {

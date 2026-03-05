@@ -52,7 +52,7 @@
 // # Codecs
 //
 // Null, deflate, snappy, and zstandard are built in. Custom codecs can be
-// provided via [WithCodec] (writer) or [WithReaderCodec] (reader).
+// provided via [WithCodec].
 //
 // [Object Container Files]: https://avro.apache.org/docs/current/specification/#object-container-files
 // [Avro specification]: https://avro.apache.org/docs/current/specification/#object-container-files
@@ -75,8 +75,7 @@ import (
 	"github.com/twmb/avro"
 )
 
-// Codec compresses and decompresses OCF data blocks. If a codec implements
-// [io.Closer], both [Writer.Close] and [Reader.Close] close it automatically.
+// Codec compresses and decompresses OCF data blocks.
 type Codec interface {
 	// Name returns the codec identifier for the "avro.codec" metadata key
 	// (e.g. "null", "deflate", "snappy", "zstandard").
@@ -87,7 +86,22 @@ type Codec interface {
 
 	// Decompress decodes a stored data block back to raw bytes.
 	Decompress(src []byte) ([]byte, error)
+
+	// Close releases any resources held by the codec. Codecs that hold no
+	// resources may return nil.
+	Close() error
 }
+
+// NopCloser returns a Codec that wraps c but has a no-op Close method. This
+// is useful when sharing a single codec across multiple writers or readers
+// so that individual [Writer.Close] or [Reader.Close] calls do not release
+// shared resources. The caller is responsible for closing the underlying
+// codec when it is no longer needed.
+func NopCloser(c Codec) Codec { return nopCloser{c} }
+
+type nopCloser struct{ Codec }
+
+func (nopCloser) Close() error { return nil }
 
 // WriterOpt is an option for [NewWriter].
 type WriterOpt interface{ writerOpt() }
@@ -95,28 +109,40 @@ type WriterOpt interface{ writerOpt() }
 // ReaderOpt is an option for [NewReader].
 type ReaderOpt interface{ readerOpt() }
 
+// Opt implements both [WriterOpt] and [ReaderOpt].
+type Opt struct{ o any }
+
+func (Opt) writerOpt() {}
+func (Opt) readerOpt() {}
+
 type (
-	optCodec        struct{ c Codec }
-	optBlockCount   struct{ n int }
-	optBlockBytes   struct{ n int }
-	optMetadata     struct{ m map[string][]byte }
-	optSyncMarker   struct{ sync [16]byte }
-	optSchema       struct{ s string }
-	optReaderCodec  struct{ c Codec }
-	optReaderSchema struct{ s *avro.Schema }
+	optBlockCount    struct{ n int }
+	optBlockBytes    struct{ n int }
+	optMetadata      struct{ m map[string][]byte }
+	optSyncMarker    struct{ sync [16]byte }
+	optSchema        struct{ s string }
+	optReaderSchema  struct{ s *avro.Schema }
+	optMaxBlockBytes struct{ n int64 }
 )
 
-func (optCodec) writerOpt()        {}
-func (optBlockCount) writerOpt()   {}
-func (optBlockBytes) writerOpt()   {}
-func (optMetadata) writerOpt()     {}
-func (optSyncMarker) writerOpt()   {}
-func (optSchema) writerOpt()       {}
-func (optReaderCodec) readerOpt()  {}
-func (optReaderSchema) readerOpt() {}
+func (optBlockCount) writerOpt()    {}
+func (optBlockBytes) writerOpt()    {}
+func (optMetadata) writerOpt()      {}
+func (optSyncMarker) writerOpt()    {}
+func (optSchema) writerOpt()        {}
+func (optReaderSchema) readerOpt()  {}
+func (optMaxBlockBytes) readerOpt() {}
 
 // WithCodec sets the compression codec. The default is null (no compression).
-func WithCodec(c Codec) WriterOpt { return optCodec{c} }
+// WithCodec can be used as both a [WriterOpt] and a [ReaderOpt]. The four
+// built-in codecs (null, deflate, snappy, zstandard) do not need to be
+// registered for reading. A custom codec whose name matches a built-in
+// overrides it.
+//
+// The codec's Close method is called by [Writer.Close] and [Reader.Close].
+// Codecs that should not be closed (e.g. shared across multiple writers)
+// should return nil from Close.
+func WithCodec(c Codec) Opt { return Opt{c} }
 
 // WithBlockCount sets the maximum number of items per block. The default is
 // 100. If both WithBlockCount and [WithBlockBytes] are set, whichever limit
@@ -143,11 +169,6 @@ func WithSyncMarker(sync [16]byte) WriterOpt { return optSyncMarker{sync} }
 // a custom schema string.
 func WithSchema(schema string) WriterOpt { return optSchema{schema} }
 
-// WithReaderCodec registers a custom codec for the reader. The four built-in
-// codecs do not need to be registered. A custom codec whose name matches a
-// built-in overrides it, which can be used to share a [ZstdCodecFrom] codec
-// across readers.
-func WithReaderCodec(c Codec) ReaderOpt { return optReaderCodec{c} }
 
 // WithReaderSchema provides a reader schema for schema evolution. If set, the
 // file's writer schema is resolved against the reader schema using
@@ -155,6 +176,11 @@ func WithReaderCodec(c Codec) ReaderOpt { return optReaderCodec{c} }
 // Fields added in the reader schema must have defaults; fields removed from
 // the writer schema are skipped.
 func WithReaderSchema(s *avro.Schema) ReaderOpt { return optReaderSchema{s} }
+
+// WithMaxBlockBytes sets the maximum compressed block size in bytes that the
+// reader will accept. The default is 64 MiB. This guards against malicious
+// or corrupt files that declare very large blocks.
+func WithMaxBlockBytes(n int64) ReaderOpt { return optMaxBlockBytes{n} }
 
 // DeflateCodec returns a [Codec] using raw DEFLATE compression at the given
 // level (e.g. [flate.DefaultCompression]).
@@ -164,30 +190,40 @@ func DeflateCodec(level int) Codec { return deflateCodec{level} }
 // CRC-32 checksum per block, as required by the Avro spec.
 func SnappyCodec() Codec { return snappyCodec{} }
 
-// ZstdCodec returns a [Codec] using Zstandard compression. Options are passed
-// to [zstd.NewWriter]. The returned codec is owned by the writer/reader and
-// closed automatically; to share one across files, use [ZstdCodecFrom].
-func ZstdCodec(opts ...zstd.EOption) (Codec, error) {
-	enc, err := zstd.NewWriter(nil, opts...)
+// ZstdCodec returns a [Codec] using Zstandard compression. Encoder options
+// (eopts) and decoder options (dopts) are passed to [zstd.NewWriter] and
+// [zstd.NewReader] respectively. Both may be nil for defaults.
+//
+// [zstd.WithEncoderConcurrency](1) and [zstd.WithDecoderConcurrency](1) are
+// prepended to the options; pass a different concurrency to override.
+//
+// A single ZstdCodec is safe to share across multiple readers and writers
+// via [NopCloser].
+func ZstdCodec(eopts []zstd.EOption, dopts []zstd.DOption) (Codec, error) {
+	eopts = append([]zstd.EOption{zstd.WithEncoderConcurrency(1)}, eopts...)
+	dopts = append([]zstd.DOption{zstd.WithDecoderConcurrency(1)}, dopts...)
+	enc, err := zstd.NewWriter(nil, eopts...)
 	if err != nil {
 		return nil, fmt.Errorf("ocf: creating zstd encoder: %w", err)
 	}
-	dec, err := zstd.NewReader(nil)
+	dec, err := zstd.NewReader(nil, dopts...)
 	if err != nil {
 		enc.Close()
 		return nil, fmt.Errorf("ocf: creating zstd decoder: %w", err)
 	}
-	return &zstdCodec{enc: enc, dec: dec, owned: true}, nil
+	return &zstdCodec{enc: enc, dec: dec}, nil
 }
 
-// ZstdCodecFrom wraps a caller-owned encoder and decoder as a [Codec].
-// Close is a no-op, so it is safe to share across many writers or readers.
+// MustZstdCodec is like [ZstdCodec] but panics on error. This is useful for
+// inline codec creation with static options:
 //
-// Either enc or dec may be nil if the codec is only used in one direction;
-// calling the missing direction returns an error. The caller is responsible
-// for closing enc and dec.
-func ZstdCodecFrom(enc *zstd.Encoder, dec *zstd.Decoder) Codec {
-	return &zstdCodec{enc: enc, dec: dec}
+//	w, err := ocf.NewWriter(f, schema, ocf.WithCodec(ocf.MustZstdCodec(nil, nil)))
+func MustZstdCodec(eopts []zstd.EOption, dopts []zstd.DOption) Codec {
+	c, err := ZstdCodec(eopts, dopts)
+	if err != nil {
+		panic(err)
+	}
+	return c
 }
 
 var magic = [4]byte{'O', 'b', 'j', 0x01}
@@ -211,7 +247,7 @@ type Writer struct {
 	maxBytes   int
 	err        error
 	userMeta   []kv
-	hasSync    bool
+	hasSync bool
 }
 
 // NewWriter creates a Writer that writes an OCF to w. The file header is
@@ -225,8 +261,8 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) 
 
 	for _, o := range opts {
 		switch o := o.(type) {
-		case optCodec:
-			wr.codec = o.c
+		case Opt:
+			wr.codec = o.o.(Codec)
 		case optBlockCount:
 			wr.maxCount = o.n
 		case optBlockBytes:
@@ -338,7 +374,7 @@ func (w *Writer) Flush() error {
 	return nil
 }
 
-// Close flushes any remaining items and releases codec resources.
+// Close flushes any remaining items and closes the codec.
 func (w *Writer) Close() error {
 	if w.err != nil {
 		return w.err
@@ -348,10 +384,7 @@ func (w *Writer) Close() error {
 			return err
 		}
 	}
-	if c, ok := w.codec.(io.Closer); ok {
-		return c.Close()
-	}
-	return nil
+	return w.codec.Close()
 }
 
 func (w *Writer) flush() error {
@@ -414,8 +447,8 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 	}
 	var customCodecs []Codec
 	for _, o := range opts {
-		if o, ok := o.(optCodec); ok {
-			customCodecs = append(customCodecs, o.c)
+		if o, ok := o.(Opt); ok {
+			customCodecs = append(customCodecs, o.o.(Codec))
 		}
 	}
 	codec, err := resolveCodec(codecName, customCodecs)
@@ -458,13 +491,14 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 
 // Reader decodes Avro values from an OCF.
 type Reader struct {
-	r      *bufio.Reader
-	schema *avro.Schema
-	codec  Codec
-	sync   [16]byte
-	meta   map[string][]byte
-	block  []byte
-	remain int64
+	r             *bufio.Reader
+	schema        *avro.Schema
+	codec         Codec
+	sync          [16]byte
+	meta          map[string][]byte
+	block         []byte
+	remain        int64
+	maxBlockBytes int64
 }
 
 // readHeader reads and validates the OCF header, returning the parsed
@@ -500,17 +534,23 @@ func readHeader(br *bufio.Reader) (schema *avro.Schema, meta map[string][]byte, 
 }
 
 // NewReader creates a Reader that decodes an OCF from r. The header is read
-// immediately. Use [WithReaderCodec] if the file uses a non-built-in codec.
+// immediately. Use [WithCodec] if the file uses a non-built-in codec.
 func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	var customCodecs []Codec
 	var readerSchema *avro.Schema
+	var maxBlockBytes int64
 	for _, o := range opts {
 		switch o := o.(type) {
-		case optReaderCodec:
-			customCodecs = append(customCodecs, o.c)
+		case Opt:
+			customCodecs = append(customCodecs, o.o.(Codec))
 		case optReaderSchema:
 			readerSchema = o.s
+		case optMaxBlockBytes:
+			maxBlockBytes = o.n
 		}
+	}
+	if maxBlockBytes <= 0 {
+		maxBlockBytes = 1 << 26 // 64 MiB default
 	}
 
 	br := bufio.NewReader(r)
@@ -539,11 +579,12 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	}
 
 	return &Reader{
-		r:      br,
-		schema: schema,
-		codec:  codec,
-		sync:   sync,
-		meta:   meta,
+		r:             br,
+		schema:        schema,
+		codec:         codec,
+		sync:          sync,
+		meta:          meta,
+		maxBlockBytes: maxBlockBytes,
 	}, nil
 }
 
@@ -573,12 +614,9 @@ func (rd *Reader) Schema() *avro.Schema { return rd.schema }
 // "avro.*" and user-defined keys.
 func (rd *Reader) Metadata() map[string][]byte { return rd.meta }
 
-// Close releases codec resources. This is a no-op for most codecs.
+// Close closes the codec, releasing any resources it holds.
 func (rd *Reader) Close() error {
-	if c, ok := rd.codec.(io.Closer); ok {
-		return c.Close()
-	}
-	return nil
+	return rd.codec.Close()
 }
 
 func (rd *Reader) readBlock() error {
@@ -599,8 +637,8 @@ func (rd *Reader) readBlock() error {
 	if size < 0 {
 		return fmt.Errorf("ocf: invalid negative block size %d", size)
 	}
-	if size > 1<<26 { // 64 MiB safety limit
-		return fmt.Errorf("ocf: block size %d exceeds safety limit", size)
+	if size > rd.maxBlockBytes {
+		return fmt.Errorf("ocf: block size %d exceeds safety limit of %d", size, rd.maxBlockBytes)
 	}
 	compressed := make([]byte, int(size))
 	if _, err := io.ReadFull(rd.r, compressed); err != nil {
@@ -629,10 +667,12 @@ type nullCodec struct{}
 func (nullCodec) Name() string                          { return "null" }
 func (nullCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
 func (nullCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
+func (nullCodec) Close() error                          { return nil }
 
 type deflateCodec struct{ level int }
 
-func (deflateCodec) Name() string { return "deflate" }
+func (deflateCodec) Name() string  { return "deflate" }
+func (deflateCodec) Close() error  { return nil }
 
 func (c deflateCodec) Compress(src []byte) ([]byte, error) {
 	var buf bytes.Buffer
@@ -655,6 +695,7 @@ func (deflateCodec) Decompress(src []byte) ([]byte, error) {
 type snappyCodec struct{}
 
 func (snappyCodec) Name() string { return "snappy" }
+func (snappyCodec) Close() error { return nil }
 
 func (snappyCodec) Compress(src []byte) ([]byte, error) {
 	dst := snappy.Encode(nil, src)
@@ -677,37 +718,23 @@ func (snappyCodec) Decompress(src []byte) ([]byte, error) {
 }
 
 type zstdCodec struct {
-	enc   *zstd.Encoder
-	dec   *zstd.Decoder
-	owned bool // if true, Close releases enc and dec
+	enc *zstd.Encoder
+	dec *zstd.Decoder
 }
 
 func (*zstdCodec) Name() string { return "zstandard" }
 
 func (c *zstdCodec) Compress(src []byte) ([]byte, error) {
-	if c.enc == nil {
-		return nil, errors.New("ocf: zstd codec has no encoder")
-	}
 	return c.enc.EncodeAll(src, nil), nil
 }
 
 func (c *zstdCodec) Decompress(src []byte) ([]byte, error) {
-	if c.dec == nil {
-		return nil, errors.New("ocf: zstd codec has no decoder")
-	}
 	return c.dec.DecodeAll(src, nil)
 }
 
 func (c *zstdCodec) Close() error {
-	if !c.owned {
-		return nil
-	}
-	if c.enc != nil {
-		c.enc.Close()
-	}
-	if c.dec != nil {
-		c.dec.Close()
-	}
+	c.enc.Close()
+	c.dec.Close()
 	return nil
 }
 
@@ -725,7 +752,7 @@ func resolveCodec(name string, custom []Codec) (Codec, error) {
 	case "snappy":
 		return snappyCodec{}, nil
 	case "zstandard":
-		return ZstdCodec()
+		return ZstdCodec(nil, nil)
 	}
 	return nil, fmt.Errorf("ocf: unknown codec %q", name)
 }

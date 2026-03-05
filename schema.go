@@ -59,8 +59,29 @@ type fieldNode struct {
 
 // MustParse is like [Parse] but panics on error. Useful for package-level
 // var declarations.
-func MustParse(schema string) *Schema {
-	s, err := Parse(schema)
+// ParseOpt configures schema parsing behavior.
+type ParseOpt interface{ parseOpt() }
+
+type (
+	parseOptStrict struct{}
+	parseOptLax    struct{ fn func(string) error }
+)
+
+func (parseOptStrict) parseOpt() {}
+func (parseOptLax) parseOpt()    {}
+
+// WithStrictNames requires names to match the Avro spec's [A-Za-z_][A-Za-z0-9_]*.
+// This is the default.
+func WithStrictNames() ParseOpt { return parseOptStrict{} }
+
+// WithLaxNames relaxes name validation. If fn is nil, only non-empty names
+// are required. If fn is non-nil, it is called for each name component and
+// should return an error for invalid names. Dot-separated fullnames are
+// split before calling fn.
+func WithLaxNames(fn func(string) error) ParseOpt { return parseOptLax{fn} }
+
+func MustParse(schema string, opts ...ParseOpt) *Schema {
+	s, err := Parse(schema, opts...)
 	if err != nil {
 		panic("avro: " + err.Error())
 	}
@@ -75,11 +96,32 @@ func MustParse(schema string) *Schema {
 //
 // To parse schemas that reference named types from other schemas, use
 // [SchemaCache].
-func Parse(schema string) (*Schema, error) {
+func Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 	b := &builder{
 		named: make(map[string]*namedType),
 	}
+	applyParseOpts(b, opts)
 	return parse(schema, b)
+}
+
+func applyParseOpts(b *builder, opts []ParseOpt) {
+	for _, o := range opts {
+		switch o := o.(type) {
+		case parseOptStrict:
+			b.checkName = nil
+		case parseOptLax:
+			if o.fn != nil {
+				b.checkName = o.fn
+			} else {
+				b.checkName = func(s string) error {
+					if s == "" {
+						return errors.New("name must be non-empty")
+					}
+					return nil
+				}
+			}
+		}
+	}
 }
 
 func parse(schema string, b *builder) (*Schema, error) {
@@ -218,20 +260,6 @@ func validName(s string) bool {
 	return true
 }
 
-// validFullname reports whether s is a valid Avro fullname: one or more
-// dot-separated name components, each matching [A-Za-z_][A-Za-z0-9_]*.
-func validFullname(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, part := range strings.Split(s, ".") {
-		if !validName(part) {
-			return false
-		}
-	}
-	return true
-}
-
 var acomplex = map[string]struct{}{
 	"record": {},
 	"error":  {},
@@ -306,14 +334,43 @@ type builder struct {
 	mfixups     []metaFixup
 	fieldFixups []recordFieldFixup
 
-	meta  fieldMeta
-	canon aschema
-	node  *schemaNode
+	meta      fieldMeta
+	canon     aschema
+	node      *schemaNode
+	checkName func(string) error // nil means strict (default)
+}
+
+// validNameErr validates a simple name using the builder's configured validator.
+func (b *builder) validNameErr(s string) error {
+	if b.checkName != nil {
+		return b.checkName(s)
+	}
+	if !validName(s) {
+		return fmt.Errorf("invalid name %q", s)
+	}
+	return nil
+}
+
+// validFullnameErr validates a dot-separated fullname.
+func (b *builder) validFullnameErr(s string) error {
+	if s == "" {
+		if b.checkName != nil {
+			return b.checkName(s)
+		}
+		return fmt.Errorf("invalid name %q", s)
+	}
+	for _, part := range strings.Split(s, ".") {
+		if err := b.validNameErr(part); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *builder) nest() *builder {
 	return &builder{
-		named: b.named,
+		named:     b.named,
+		checkName: b.checkName,
 	}
 }
 
@@ -612,12 +669,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 
 	switch o.Type {
 	case "record", "error", "enum", "fixed":
-		if !validFullname(o.Name) {
-			return fmt.Errorf("invalid %s name %q", o.Type, o.Name)
+		if err := b.validFullnameErr(o.Name); err != nil {
+			return fmt.Errorf("invalid %s name %q: %w", o.Type, o.Name, err)
 		}
 		for _, a := range origAliases {
-			if !validFullname(a) {
-				return fmt.Errorf("invalid %s alias %q", o.Type, a)
+			if err := b.validFullnameErr(a); err != nil {
+				return fmt.Errorf("invalid %s alias %q: %w", o.Type, a, err)
 			}
 		}
 		ns := ""
@@ -640,7 +697,9 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				o.Name = parentName[:dot+1] + o.Name // no namespace: prefix our name with parent namespace if there is one
 			}
 		}
-		o.Namespace = nil // canonical form omits namespace
+		o.Namespace = nil       // canonical form omits namespace
+		canonObj.Name = o.Name  // use fully-qualified name
+		canonObj.Namespace = nil
 		if _, exists := b.named[o.Name]; exists {
 			return fmt.Errorf("duplicate named type %q", o.Name)
 		}
@@ -688,12 +747,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		var names []string
 		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
-			if !validName(of.Name) {
-				return fmt.Errorf("invalid field name %q", of.Name)
+			if err := b.validNameErr(of.Name); err != nil {
+				return fmt.Errorf("invalid field name %q: %w", of.Name, err)
 			}
 			for _, a := range origFieldAliases[i] {
-				if !validName(a) {
-					return fmt.Errorf("invalid field alias %q for field %q", a, of.Name)
+				if err := b.validNameErr(a); err != nil {
+					return fmt.Errorf("invalid field alias %q for field %q: %w", a, of.Name, err)
 				}
 			}
 			if seenFields[of.Name] {
@@ -802,8 +861,8 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		seenSymbols := make(map[string]bool, len(o.Symbols))
 		for _, e := range o.Symbols {
-			if !validName(e) {
-				return fmt.Errorf("invalid enum symbol %q", e)
+			if err := b.validNameErr(e); err != nil {
+				return fmt.Errorf("invalid enum symbol %q: %w", e, err)
 			}
 			if seenSymbols[e] {
 				return fmt.Errorf("duplicate enum symbol %q", e)
