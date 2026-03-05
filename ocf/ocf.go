@@ -68,6 +68,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"strings"
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
@@ -232,6 +233,9 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) 
 			wr.maxBytes = o.n
 		case optMetadata:
 			for k, v := range o.m {
+				if strings.HasPrefix(k, "avro.") {
+					return nil, fmt.Errorf("ocf: metadata key %q is reserved (avro.* namespace)", k)
+				}
 				wr.userMeta = append(wr.userMeta, kv{k, v})
 			}
 		case optSyncMarker:
@@ -588,6 +592,9 @@ func (rd *Reader) readBlock() error {
 	size, err := binary.ReadVarint(rd.r)
 	if err != nil {
 		return fmt.Errorf("ocf: reading block size: %w", err)
+	}
+	if count < 0 {
+		return fmt.Errorf("ocf: invalid negative block count %d", count)
 	}
 	if size < 0 {
 		return fmt.Errorf("ocf: invalid negative block size %d", size)

@@ -2840,6 +2840,14 @@ func TestReadUvarlongOverflow(t *testing.T) {
 	}
 }
 
+func TestReadUvarlongShort10(t *testing.T) {
+	// 9 continuation bytes with no 10th byte → short buffer.
+	_, _, err := readUvarlong([]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80})
+	if err == nil {
+		t.Fatal("expected short buffer error")
+	}
+}
+
 // TestRoundTripArrayNullUnionRecord covers usArrayNullUnionRecord for ser
 // and the reflect fallback for deser of []*T where items are ["null", record].
 func TestRoundTripArrayNullUnionRecord(t *testing.T) {
@@ -7373,7 +7381,7 @@ func TestSchemaDefaultsValidExtra(t *testing.T) {
 			{"name":"a","type":{"type":"record","name":"inner","fields":[{"name":"x","type":"int"}]},"default":{"x":1}}
 		]}`},
 		{"fixed default", `{"type":"record","name":"r","fields":[
-			{"name":"a","type":{"type":"fixed","name":"f","size":4},"default":"\\u0000\\u0000\\u0000\\u0000"}
+			{"name":"a","type":{"type":"fixed","name":"f","size":4},"default":"\u0000\u0000\u0000\u0000"}
 		]}`},
 	}
 	for _, tt := range tests {
@@ -8071,15 +8079,15 @@ func TestFixedDecimalInRecord(t *testing.T) {
 }
 
 func TestDecimalSchemaValidation(t *testing.T) {
-	// decimal requires precision.
+	// decimal without precision falls back to underlying bytes type.
 	_, err := Parse(`{"type":"bytes","logicalType":"decimal"}`)
-	if err == nil {
-		t.Fatal("expected error: decimal without precision")
+	if err != nil {
+		t.Fatalf("expected fallback to bytes, got error: %v", err)
 	}
-	// decimal must be bytes or fixed.
+	// decimal on int falls back to underlying int type.
 	_, err = Parse(`{"type":"int","logicalType":"decimal","precision":10}`)
-	if err == nil {
-		t.Fatal("expected error: decimal on int")
+	if err != nil {
+		t.Fatalf("expected fallback to int, got error: %v", err)
 	}
 }
 
@@ -8549,9 +8557,10 @@ func TestDecimalFixedPrecisionScale(t *testing.T) {
 
 func TestDecimalFixedInvalidPrecision(t *testing.T) {
 	// size=1 can hold at most floor(log10(2^7-1)) = 2 digits.
+	// Invalid precision falls back to plain fixed.
 	_, err := Parse(`{"type":"fixed","name":"D","size":1,"logicalType":"decimal","precision":3}`)
-	if err == nil {
-		t.Fatal("expected error for precision too large for fixed size")
+	if err != nil {
+		t.Fatalf("expected fallback to fixed, got error: %v", err)
 	}
 }
 
@@ -8732,16 +8741,18 @@ func TestDeserUUIDTextUnmarshalerError(t *testing.T) {
 // ---- Coverage: decimal precision <= 0, scale > precision ----
 
 func TestDecimalPrecisionZero(t *testing.T) {
+	// precision=0 falls back to underlying bytes type.
 	_, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":0}`)
-	if err == nil {
-		t.Fatal("expected error for precision=0")
+	if err != nil {
+		t.Fatalf("expected fallback to bytes, got error: %v", err)
 	}
 }
 
 func TestDecimalScaleExceedsPrecision(t *testing.T) {
+	// scale > precision falls back to underlying bytes type.
 	_, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":6}`)
-	if err == nil {
-		t.Fatal("expected error for scale > precision")
+	if err != nil {
+		t.Fatalf("expected fallback to bytes, got error: %v", err)
 	}
 }
 

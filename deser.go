@@ -54,7 +54,7 @@ var slabPool = sync.Pool{New: func() any { return &slab{} }}
 //   - record: struct (matched by field name or `avro` tag), map[string]any, any
 //
 // When decoding into any (interface{}), values are returned as their natural
-// Go types: nil, bool, int64, float32, float64, string, []byte, []any,
+// Go types: nil, bool, int32, int64, float32, float64, string, []byte, []any,
 // map[string]any, or map[string]any for records.
 func (s *Schema) Decode(src []byte, v any) ([]byte, error) {
 	rv := reflect.ValueOf(v)

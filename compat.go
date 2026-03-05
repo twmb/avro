@@ -1,8 +1,9 @@
 package avro
 
-import "slices"
-
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // CheckCompatibility reports whether data written with the writer schema can
 // be read by the reader schema. It returns nil on success or a
@@ -201,12 +202,30 @@ func checkEnumCompat(r, w *schemaNode, path string) error {
 	return nil
 }
 
-// namesMatch checks if two named types match by name or aliases.
+// namesMatch checks if two named types match by fully-qualified name,
+// unqualified name, or aliases. Per the Avro spec, named types in
+// different namespaces match if their unqualified names are the same.
 func namesMatch(r, w *schemaNode) bool {
 	if r.name == w.name {
 		return true
 	}
-	return slices.Contains(r.aliases, w.name)
+	if unqualified(r.name) == unqualified(w.name) {
+		return true
+	}
+	for _, a := range r.aliases {
+		if a == w.name || unqualified(a) == unqualified(w.name) {
+			return true
+		}
+	}
+	return false
+}
+
+// unqualified returns the unqualified portion of a possibly dot-separated name.
+func unqualified(name string) string {
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		return name[i+1:]
+	}
+	return name
 }
 
 // findWriterField finds the writer field matching a reader field by name or
