@@ -328,7 +328,7 @@ func TestCustomCodec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, err := NewReader(&buf, WithReaderCodec(codec))
+	r, err := NewReader(&buf, WithCodec(codec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -895,7 +895,7 @@ func TestDecompressError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, err := NewReader(bytes.NewReader(buf.Bytes()), WithReaderCodec(codec))
+	r, err := NewReader(bytes.NewReader(buf.Bytes()), WithCodec(codec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1081,7 +1081,7 @@ func TestOptMarkerMethods(t *testing.T) {
 	// Cover the unexported interface marker methods.
 	var wo WriterOpt
 	wo = WithCodec(nullCodec{})
-	wo.(optCodec).writerOpt()
+	wo.(Opt).writerOpt()
 	wo = WithBlockCount(1)
 	wo.(optBlockCount).writerOpt()
 	wo = WithBlockBytes(1)
@@ -1093,8 +1093,8 @@ func TestOptMarkerMethods(t *testing.T) {
 	wo = WithSchema("")
 	wo.(optSchema).writerOpt()
 	var ro ReaderOpt
-	ro = WithReaderCodec(nullCodec{})
-	ro.(optReaderCodec).readerOpt()
+	ro = WithCodec(nullCodec{})
+	ro.(Opt).readerOpt()
 }
 
 func TestHeaderWriteError(t *testing.T) {
@@ -1808,7 +1808,7 @@ func TestAppendWriterCustomCodec(t *testing.T) {
 
 	// Read all back.
 	sb.pos = 0
-	r, err := NewReader(sb, WithReaderCodec(codec))
+	r, err := NewReader(sb, WithCodec(codec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2486,7 +2486,7 @@ func TestZstdCodecFromShared(t *testing.T) {
 
 	// Read both back using the same shared codec.
 	for i, buf := range []*bytes.Buffer{&buf1, &buf2} {
-		r, err := NewReader(buf, WithReaderCodec(codec))
+		r, err := NewReader(buf, WithCodec(codec))
 		if err != nil {
 			t.Fatalf("file %d: %v", i, err)
 		}
