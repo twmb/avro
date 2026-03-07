@@ -127,10 +127,16 @@ func applyParseOpts(b *builder, opts []ParseOpt) {
 func parse(schema string, b *builder) (*Schema, error) {
 	var orig aschema
 	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
-		return nil, fmt.Errorf("invalid schema: %w", err)
+		return nil, &SchemaParseError{Err: fmt.Errorf("invalid JSON: %w", err)}
 	}
 	if err := b.build("", &orig); err != nil {
-		return nil, err
+		// Most build errors are already *SchemaParseError. The one
+		// exception is unknownPrimitiveError (e.g. Parse(`"Foo"`)),
+		// which is internal and must be wrapped before returning.
+		if pe, ok := err.(*SchemaParseError); ok {
+			return nil, pe
+		}
+		return nil, &SchemaParseError{Err: err}
 	}
 	if err := b.finalize(); err != nil {
 		return nil, err
@@ -386,7 +392,7 @@ func (b *builder) finalize() error {
 		for idx, name := range m.missing {
 			nt := b.named[name]
 			if nt == nil {
-				return fmt.Errorf("unknown type %q", name)
+				return &SchemaParseError{Err: fmt.Errorf("unknown type %q", name)}
 			}
 			m.ser.fns[idx] = nt.ser
 		}
@@ -404,7 +410,7 @@ func (b *builder) finalize() error {
 	for _, m := range b.fieldFixups {
 		nt := b.named[m.name]
 		if nt == nil {
-			return fmt.Errorf("unknown type %q", m.name)
+			return &SchemaParseError{Err: fmt.Errorf("unknown type %q", m.name)}
 		}
 		m.sr.fields[m.idx].fn = nt.ser
 		m.dr.fields[m.idx].fn = nt.deser
@@ -426,7 +432,7 @@ func (s *aschema) unionTypeName() (string, string, error) {
 		return s.primitive, "", nil
 	}
 	if len(s.union) > 0 {
-		return "union", "", errors.New("unions cannot immediately contain other unions")
+		return "union", "", &SchemaParseError{Type: "union", Err: errors.New("unions cannot immediately contain other unions")}
 	}
 	switch s.object.Type {
 	case "record", "error", "fixed", "enum":
@@ -442,7 +448,7 @@ func (e *unknownPrimitiveError) Error() string { return fmt.Sprintf("unknown pri
 
 func (b *builder) build(parentName string, s *aschema) error {
 	if s == nil || s.primitive == "" && s.object == nil && len(s.union) == 0 {
-		return errors.New("schema is not a primitive, complex, nor union")
+		return &SchemaParseError{Err: errors.New("schema is not a primitive, complex, nor union")}
 	}
 
 	switch {
@@ -520,7 +526,10 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		u := b.nest()
 		if err := u.build(parentName, &us); err != nil {
 			if pe := (*unknownPrimitiveError)(nil); !errors.As(err, &pe) {
-				return fmt.Errorf("invalid union: %w", err)
+				if _, ok := err.(*SchemaParseError); !ok {
+					err = &SchemaParseError{Type: "union", Err: err}
+				}
+				return err
 			}
 			missing[i] = us.primitive
 		}
@@ -533,7 +542,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			return err
 		}
 		if sawTypes[typ] && name == "" {
-			return fmt.Errorf("duplicate union type %q", typ)
+			return &SchemaParseError{Type: "union", Err: fmt.Errorf("duplicate type %q", typ)}
 		}
 		sawTypes[typ] = true
 
@@ -596,7 +605,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	o := s.object
 
 	if err := o.validateLogical(); err != nil {
-		return err
+		return &SchemaParseError{Type: o.Type, Name: o.Name, Err: err}
 	}
 
 	if ser, isPrimitive := serPrimitive[o.Type]; isPrimitive {
@@ -670,11 +679,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	switch o.Type {
 	case "record", "error", "enum", "fixed":
 		if err := b.validFullnameErr(o.Name); err != nil {
-			return fmt.Errorf("invalid %s name %q: %w", o.Type, o.Name, err)
+			return &SchemaParseError{Type: o.Type, Name: o.Name, Err: fmt.Errorf("invalid name: %w", err)}
 		}
 		for _, a := range origAliases {
 			if err := b.validFullnameErr(a); err != nil {
-				return fmt.Errorf("invalid %s alias %q: %w", o.Type, a, err)
+				return &SchemaParseError{Type: o.Type, Name: o.Name, Err: fmt.Errorf("invalid alias %q: %w", a, err)}
 			}
 		}
 		ns := ""
@@ -701,24 +710,24 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		canonObj.Name = o.Name // use fully-qualified name
 		canonObj.Namespace = nil
 		if _, exists := b.named[o.Name]; exists {
-			return fmt.Errorf("duplicate named type %q", o.Name)
+			return &SchemaParseError{Type: o.Type, Name: o.Name, Err: errors.New("duplicate type")}
 		}
 	default:
 		if o.Name != "" || o.Namespace != nil {
-			return errors.New("only record, enum, and fixed can have a name")
+			return &SchemaParseError{Type: o.Type, Err: errors.New("only record, enum, and fixed can have a name")}
 		}
 	}
 
 	switch o.Type {
 	default:
-		return fmt.Errorf("unknown complex type %q", o.Type)
+		return &SchemaParseError{Type: o.Type, Err: errors.New("unknown type")}
 
 	case "record", "error":
 		if len(o.Symbols) > 0 ||
 			o.Items != nil ||
 			o.Values != nil ||
 			o.Size != nil {
-			return errors.New("invalid record has schema for other types")
+			return &SchemaParseError{Type: "record", Name: o.Name, Err: errors.New("has schema for other types")}
 		}
 
 		// Create record ser/deser and register early so
@@ -748,19 +757,19 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
 			if err := b.validNameErr(of.Name); err != nil {
-				return fmt.Errorf("invalid field name %q: %w", of.Name, err)
+				return &SchemaParseError{Type: "record", Name: o.Name, Field: of.Name, Err: fmt.Errorf("invalid name: %w", err)}
 			}
 			for _, a := range origFieldAliases[i] {
 				if err := b.validNameErr(a); err != nil {
-					return fmt.Errorf("invalid field alias %q for field %q: %w", a, of.Name, err)
+					return &SchemaParseError{Type: "record", Name: o.Name, Field: of.Name, Err: fmt.Errorf("invalid alias %q: %w", a, err)}
 				}
 			}
 			if seenFields[of.Name] {
-				return fmt.Errorf("duplicate record field name %q", of.Name)
+				return &SchemaParseError{Type: "record", Name: o.Name, Field: of.Name, Err: errors.New("duplicate field")}
 			}
 			seenFields[of.Name] = true
 			if of.Order != "" && of.Order != "ascending" && of.Order != "descending" && of.Order != "ignore" {
-				return fmt.Errorf("invalid field order %q for field %q", of.Order, of.Name)
+				return &SchemaParseError{Type: "record", Name: o.Name, Field: of.Name, Err: fmt.Errorf("invalid order %q", of.Order)}
 			}
 			bf := b.nest()
 			isFwdRef := false
@@ -773,7 +782,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 					isFwdRef = true
 					fwdRefName = of.Type.primitive
 				} else {
-					return fmt.Errorf("invalid record field: %v", err)
+					return &SchemaParseError{Type: "record", Name: o.Name, Field: of.Name, Err: err}
 				}
 			}
 			b.unnest(bf)
@@ -824,7 +833,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				// don't know the type yet.
 				if !isFwdRef {
 					if err := validateDefault(defaultVal, &bf.canon); err != nil {
-						return fmt.Errorf("record field %q: invalid default: %v", of.Name, err)
+						return &SchemaParseError{Type: "record", Name: o.Name, Field: of.Name, Err: fmt.Errorf("invalid default: %w", err)}
 					}
 				}
 				drf.defaultVal = defaultVal
@@ -853,19 +862,19 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			o.Items != nil ||
 			o.Values != nil ||
 			o.Size != nil {
-			return errors.New("invalid enum has schema for other types")
+			return &SchemaParseError{Type: "enum", Name: o.Name, Err: errors.New("has schema for other types")}
 		}
 
 		if len(o.Symbols) == 0 {
-			return errors.New("enum must have at least one symbol")
+			return &SchemaParseError{Type: "enum", Name: o.Name, Err: errors.New("must have at least one symbol")}
 		}
 		seenSymbols := make(map[string]bool, len(o.Symbols))
 		for _, e := range o.Symbols {
 			if err := b.validNameErr(e); err != nil {
-				return fmt.Errorf("invalid enum symbol %q: %w", e, err)
+				return &SchemaParseError{Type: "enum", Name: o.Name, Err: fmt.Errorf("invalid symbol %q: %w", e, err)}
 			}
 			if seenSymbols[e] {
-				return fmt.Errorf("duplicate enum symbol %q", e)
+				return &SchemaParseError{Type: "enum", Name: o.Name, Err: fmt.Errorf("duplicate symbol %q", e)}
 			}
 			seenSymbols[e] = true
 		}
@@ -885,7 +894,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			var defStr string
 			json.Unmarshal(origEnumDefault, &defStr) //nolint:errcheck
 			if !seenSymbols[defStr] {
-				return fmt.Errorf("enum default %q is not a member of symbols", defStr)
+				return &SchemaParseError{Type: "enum", Name: o.Name, Err: fmt.Errorf("default %q is not a member of symbols", defStr)}
 			}
 			nd.enumDef = defStr
 			nd.hasEnumDef = true
@@ -898,14 +907,17 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			len(o.Symbols) > 0 ||
 			o.Values != nil ||
 			o.Size != nil {
-			return errors.New("invalid array has schema for other types")
+			return &SchemaParseError{Type: "array", Err: errors.New("has schema for other types")}
 		}
 		if o.Items == nil {
-			return errors.New("array is missing items schema")
+			return &SchemaParseError{Type: "array", Err: errors.New("missing items schema")}
 		}
 		af := b.nest()
 		if err := af.build(parentName, o.Items); err != nil {
-			return fmt.Errorf("invalid array: %v", err)
+			if _, ok := err.(*SchemaParseError); !ok {
+				err = &SchemaParseError{Type: "array", Err: err}
+			}
+			return err
 		}
 		b.unnest(af)
 		o.Items = &af.canon
@@ -955,14 +967,17 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			len(o.Symbols) > 0 ||
 			o.Items != nil ||
 			o.Size != nil {
-			return errors.New("invalid map has schema for other types")
+			return &SchemaParseError{Type: "map", Err: errors.New("has schema for other types")}
 		}
 		if o.Values == nil {
-			return errors.New("map is missing values schema")
+			return &SchemaParseError{Type: "map", Err: errors.New("missing values schema")}
 		}
 		mf := b.nest()
 		if err := mf.build(parentName, o.Values); err != nil {
-			return fmt.Errorf("invalid map: %v", err)
+			if _, ok := err.(*SchemaParseError); !ok {
+				err = &SchemaParseError{Type: "map", Err: err}
+			}
+			return err
 		}
 		b.unnest(mf)
 		o.Values = &mf.canon
@@ -1010,13 +1025,13 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			len(o.Symbols) > 0 ||
 			o.Items != nil ||
 			o.Values != nil {
-			return errors.New("invalid fixed has schema for other types")
+			return &SchemaParseError{Type: "fixed", Name: o.Name, Err: errors.New("has schema for other types")}
 		}
 		if o.Size == nil {
-			return errors.New("fixed is missing size")
+			return &SchemaParseError{Type: "fixed", Name: o.Name, Err: errors.New("missing size")}
 		}
 		if *o.Size <= 0 {
-			return fmt.Errorf("invalid fixed size %v", *o.Size)
+			return &SchemaParseError{Type: "fixed", Name: o.Name, Err: fmt.Errorf("invalid size %v", *o.Size)}
 		}
 		switch s.object.Logical {
 		case "duration":

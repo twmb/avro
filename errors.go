@@ -58,6 +58,42 @@ func (e *ShortBufferError) Error() string {
 	return fmt.Sprintf("avro: short buffer for %s", e.Type)
 }
 
+// SchemaParseError indicates a schema failed to parse or validate,
+// as returned by [Parse] and [SchemaCache.Parse].
+type SchemaParseError struct {
+	// Type is the Avro type being defined when the error occurred
+	// (e.g. "record", "enum", "fixed"), if applicable.
+	Type string
+	// Name is the fully-qualified name of the type, if applicable.
+	Name string
+	// Field is the record field name, if the error is within a field.
+	Field string
+	// Err is the underlying error.
+	Err error
+}
+
+func (e *SchemaParseError) Error() string {
+	var s string
+	switch {
+	case e.Field != "" && e.Name != "":
+		s = fmt.Sprintf("avro: %s %s: field %s", e.Type, e.Name, e.Field)
+	case e.Field != "":
+		s = fmt.Sprintf("avro: %s: field %s", e.Type, e.Field)
+	case e.Name != "":
+		s = fmt.Sprintf("avro: %s %s", e.Type, e.Name)
+	case e.Type != "":
+		s = fmt.Sprintf("avro: %s", e.Type)
+	default:
+		s = "avro: schema"
+	}
+	if e.Err != nil {
+		s += ": " + e.Err.Error()
+	}
+	return s
+}
+
+func (e *SchemaParseError) Unwrap() error { return e.Err }
+
 // CompatibilityError describes an incompatibility between a reader and writer
 // schema, as returned by [CheckCompatibility] and [Resolve].
 type CompatibilityError struct {
