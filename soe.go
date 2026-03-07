@@ -1,6 +1,9 @@
 package avro
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // AppendSingleObject appends a Single Object Encoding of v to dst: 2-byte
 // magic, 8-byte CRC-64-AVRO fingerprint, then the Avro binary payload.
@@ -19,7 +22,7 @@ func (s *Schema) DecodeSingleObject(data []byte, v any) ([]byte, error) {
 		return nil, fmt.Errorf("avro: invalid single-object encoding magic: got [%#x, %#x], want [0xc3, 0x01]", data[0], data[1])
 	}
 	if [10]byte(data[:10]) != s.soe {
-		return nil, fmt.Errorf("avro: single-object encoding fingerprint mismatch")
+		return nil, errors.New("avro: single-object encoding fingerprint mismatch")
 	}
 	return s.Decode(data[10:], v)
 }

@@ -203,7 +203,7 @@ func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, 
 	return src, nil
 }
 
-var errUnsafeNilPtr = fmt.Errorf("invalid nil in non-union, non-null")
+var errUnsafeNilPtr = errors.New("invalid nil in non-union, non-null")
 
 // tryCompileFieldSer returns a userfn for fields that can be fully handled
 // via unsafe pointer access. Returns nil for complex types that must use
@@ -571,7 +571,7 @@ func usTimeMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
 	d := *(*time.Duration)(p)
 	ms := d.Milliseconds()
 	if ms < math.MinInt32 || ms > math.MaxInt32 {
-		return nil, fmt.Errorf("duration %v overflows Avro time-millis (int32)", d)
+		return nil, fmt.Errorf("duration %v overflows int32", d)
 	}
 	return appendVarint(dst, int32(ms)), nil
 }
@@ -700,7 +700,7 @@ func usInt(k reflect.Kind) userfn {
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 			n := *(*int)(p)
 			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+				return nil, fmt.Errorf("value %d overflows int32", n)
 			}
 			return appendVarint(dst, int32(n)), nil
 		}
@@ -720,7 +720,7 @@ func usInt(k reflect.Kind) userfn {
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 			n := *(*int64)(p)
 			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+				return nil, fmt.Errorf("value %d overflows int32", n)
 			}
 			return appendVarint(dst, int32(n)), nil
 		}
@@ -728,7 +728,7 @@ func usInt(k reflect.Kind) userfn {
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 			n := *(*uint)(p)
 			if n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+				return nil, fmt.Errorf("value %d overflows int32", n)
 			}
 			return appendVarint(dst, int32(n)), nil
 		}
@@ -744,7 +744,7 @@ func usInt(k reflect.Kind) userfn {
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 			n := *(*uint32)(p)
 			if n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+				return nil, fmt.Errorf("value %d overflows int32", n)
 			}
 			return appendVarint(dst, int32(n)), nil
 		}
@@ -752,7 +752,7 @@ func usInt(k reflect.Kind) userfn {
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 			n := *(*uint64)(p)
 			if n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+				return nil, fmt.Errorf("value %d overflows int32", n)
 			}
 			return appendVarint(dst, int32(n)), nil
 		}

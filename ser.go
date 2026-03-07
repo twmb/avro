@@ -45,7 +45,11 @@ func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
 			return dst, nil
 		}
 	}
-	return nil, errors.New("unable to encode into any union option")
+	e := &SemanticError{AvroType: "union", Err: errors.New("no matching branch")}
+	if v.IsValid() {
+		e.GoType = v.Type()
+	}
+	return nil, e
 }
 
 // Avro encodes the union branch index as a varint before the value.
@@ -141,23 +145,23 @@ func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanInt() {
 		n := v.Int()
 		if n < math.MinInt32 || n > math.MaxInt32 {
-			return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 		}
 		return appendVarint(dst, int32(n)), nil
 	} else if v.CanUint() {
 		n := v.Uint()
 		if n > math.MaxInt32 {
-			return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 		}
 		return appendVarint(dst, int32(n)), nil
 	} else if v.CanFloat() {
 		f := v.Float()
 		n := math.Trunc(f)
 		if f != n {
-			return nil, fmt.Errorf("value %v is not a whole number for Avro int", f)
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %v is not a whole number", f)}
 		}
 		if n < math.MinInt32 || n > math.MaxInt32 {
-			return nil, fmt.Errorf("value %v overflows Avro int (int32)", f)
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %v overflows int32", f)}
 		}
 		return appendVarint(dst, int32(n)), nil
 	}
@@ -174,17 +178,17 @@ func serLong(dst []byte, v reflect.Value) ([]byte, error) {
 	} else if v.CanUint() {
 		n := v.Uint()
 		if n > math.MaxInt64 {
-			return nil, fmt.Errorf("value %d overflows Avro long (int64)", n)
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
 		}
 		return appendVarlong(dst, int64(n)), nil
 	} else if v.CanFloat() {
 		f := v.Float()
 		n := math.Trunc(f)
 		if f != n {
-			return nil, fmt.Errorf("value %v is not a whole number for Avro long", f)
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
 		}
 		if n < -(1<<63) || n >= 1<<63 {
-			return nil, fmt.Errorf("value %v overflows Avro long (int64)", f)
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 		}
 		return appendVarlong(dst, int64(n)), nil
 	}
@@ -327,7 +331,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		for _, f := range s.fields {
 			value := v.MapIndex(f.nameVal)
 			if !value.IsValid() {
-				return nil, fmt.Errorf("missing key %s", f.name)
+				return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: errors.New("missing key")}
 			}
 			if dst, err = f.fn(dst, value); err != nil {
 				return nil, err
@@ -383,7 +387,7 @@ func (s *serEnum) ser(dst []byte, v reflect.Value) ([]byte, error) {
 				return appendVarint(dst, int32(i)), nil
 			}
 		}
-		return nil, fmt.Errorf("unknown enum symbol %q", needle)
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", needle)}
 
 	case v.CanInt() || v.CanUint():
 		var n int
@@ -393,7 +397,7 @@ func (s *serEnum) ser(dst []byte, v reflect.Value) ([]byte, error) {
 			n = int(v.Uint())
 		}
 		if n < 0 || n >= len(s.symbols) {
-			return nil, fmt.Errorf("invalid enum index %d/%d", n, len(s.symbols))
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("index %d out of range [0, %d)", n, len(s.symbols))}
 		}
 		return appendVarint(dst, int32(n)), nil
 
@@ -493,23 +497,23 @@ func (s *serArray) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 		if elem.CanInt() {
 			n := elem.Int()
 			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 			}
 			dst = appendVarint(dst, int32(n))
 		} else if elem.CanUint() {
 			n := elem.Uint()
 			if n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 			}
 			dst = appendVarint(dst, int32(n))
 		} else if elem.CanFloat() {
 			f := elem.Float()
 			n := math.Trunc(f)
 			if f != n {
-				return nil, fmt.Errorf("value %v is not a whole number for Avro int", f)
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %v is not a whole number", f)}
 			}
 			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %v overflows Avro int (int32)", f)
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %v overflows int32", f)}
 			}
 			dst = appendVarint(dst, int32(n))
 		} else {
@@ -534,17 +538,17 @@ func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 		} else if elem.CanUint() {
 			n := elem.Uint()
 			if n > math.MaxInt64 {
-				return nil, fmt.Errorf("value %d overflows Avro long (int64)", n)
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
 			}
 			dst = appendVarlong(dst, int64(n))
 		} else if elem.CanFloat() {
 			f := elem.Float()
 			n := math.Trunc(f)
 			if f != n {
-				return nil, fmt.Errorf("value %v is not a whole number for Avro long", f)
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
 			}
 			if n < -(1<<63) || n >= 1<<63 {
-				return nil, fmt.Errorf("value %v overflows Avro long (int64)", f)
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 			}
 			dst = appendVarlong(dst, int64(n))
 		} else {
@@ -690,23 +694,23 @@ func (s *serMap) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 		if val.CanInt() {
 			n := val.Int()
 			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 			}
 			dst = appendVarint(dst, int32(n))
 		} else if val.CanUint() {
 			n := val.Uint()
 			if n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %d overflows Avro int (int32)", n)
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 			}
 			dst = appendVarint(dst, int32(n))
 		} else if val.CanFloat() {
 			f := val.Float()
 			n := math.Trunc(f)
 			if f != n {
-				return nil, fmt.Errorf("value %v is not a whole number for Avro int", f)
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %v is not a whole number", f)}
 			}
 			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, fmt.Errorf("value %v overflows Avro int (int32)", f)
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %v overflows int32", f)}
 			}
 			dst = appendVarint(dst, int32(n))
 		} else {
@@ -733,17 +737,17 @@ func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 		} else if val.CanUint() {
 			n := val.Uint()
 			if n > math.MaxInt64 {
-				return nil, fmt.Errorf("value %d overflows Avro long (int64)", n)
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
 			}
 			dst = appendVarlong(dst, int64(n))
 		} else if val.CanFloat() {
 			f := val.Float()
 			n := math.Trunc(f)
 			if f != n {
-				return nil, fmt.Errorf("value %v is not a whole number for Avro long", f)
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
 			}
 			if n < -(1<<63) || n >= 1<<63 {
-				return nil, fmt.Errorf("value %v overflows Avro long (int64)", f)
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 			}
 			dst = appendVarlong(dst, int64(n))
 		} else {
@@ -921,7 +925,7 @@ func serTimeMillis(dst []byte, v reflect.Value) ([]byte, error) {
 		d := time.Duration(v.Int())
 		ms := d.Milliseconds()
 		if ms < math.MinInt32 || ms > math.MaxInt32 {
-			return nil, fmt.Errorf("duration %v overflows Avro time-millis (int32)", d)
+			return nil, &SemanticError{GoType: durationType, AvroType: "time-millis", Err: fmt.Errorf("duration %v overflows int32", d)}
 		}
 		return appendVarint(dst, int32(ms)), nil
 	}
@@ -988,7 +992,7 @@ func (s *serFixedDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		r := &tmp
 		b := ratToBytes(r, s.scale)
 		if len(b) > s.size {
-			return nil, fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), s.size)
+			return nil, &SemanticError{GoType: bigRatType, AvroType: "fixed", Err: fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), s.size)}
 		}
 		// Pad to fixed size with sign extension.
 		pad := byte(0)

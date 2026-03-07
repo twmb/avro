@@ -204,7 +204,7 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 	for _, name := range fieldNames {
 		e, exists := m[name]
 		if !exists {
-			return nil, fmt.Errorf("record type %s is missing field %s", t, name)
+			return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf("missing field %s", name)}
 		}
 		ats = append(ats, e.index)
 		ozs = append(ozs, e.omitzero)
