@@ -289,7 +289,7 @@ func deserBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 		}
 		if v.Len() != n {
-			return nil, fmt.Errorf("cannot decode %d bytes into array of length %d", n, v.Len())
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: fmt.Errorf("cannot decode %d bytes into array of length %d", n, v.Len())}
 		}
 		reflect.Copy(v, reflect.ValueOf(src[:n]))
 	default:

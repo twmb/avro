@@ -127,7 +127,7 @@ func applyParseOpts(b *builder, opts []ParseOpt) {
 func parse(schema string, b *builder) (*Schema, error) {
 	var orig aschema
 	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
-		return nil, fmt.Errorf("invalid schema: %v", err)
+		return nil, fmt.Errorf("invalid schema: %w", err)
 	}
 	if err := b.build("", &orig); err != nil {
 		return nil, err
