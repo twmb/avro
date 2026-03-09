@@ -394,3 +394,260 @@ func TestSchemaCacheEnum(t *testing.T) {
 		t.Errorf("color: got %v", m["color"])
 	}
 }
+
+func TestSchemaCacheDiamondDependency(t *testing.T) {
+	// Diamond: A references B and C, both B and C reference D.
+	// Parsing D twice (once for B's deps, once for C's deps) must succeed.
+	cache := NewSchemaCache()
+
+	schemaD := `{
+		"type": "record",
+		"name": "D",
+		"fields": [{"name": "id", "type": "int"}]
+	}`
+
+	s1, err := cache.Parse(schemaD)
+	if err != nil {
+		t.Fatalf("first parse of D: %v", err)
+	}
+
+	s2, err := cache.Parse(schemaD)
+	if err != nil {
+		t.Fatalf("second parse of D: %v", err)
+	}
+
+	if s1 != s2 {
+		t.Error("expected same *Schema pointer for duplicate parse")
+	}
+
+	// B references D.
+	_, err = cache.Parse(`{
+		"type": "record",
+		"name": "B",
+		"fields": [
+			{"name": "d", "type": "D"},
+			{"name": "b", "type": "string"}
+		]
+	}`)
+	if err != nil {
+		t.Fatalf("parse B: %v", err)
+	}
+
+	// C references D.
+	_, err = cache.Parse(`{
+		"type": "record",
+		"name": "C",
+		"fields": [
+			{"name": "d", "type": "D"},
+			{"name": "c", "type": "long"}
+		]
+	}`)
+	if err != nil {
+		t.Fatalf("parse C: %v", err)
+	}
+
+	// A references B and C.
+	schemaA, err := cache.Parse(`{
+		"type": "record",
+		"name": "A",
+		"fields": [
+			{"name": "b", "type": "B"},
+			{"name": "c", "type": "C"}
+		]
+	}`)
+	if err != nil {
+		t.Fatalf("parse A: %v", err)
+	}
+
+	// Verify the full graph works end-to-end.
+	input := map[string]any{
+		"b": map[string]any{
+			"d": map[string]any{"id": float64(1)},
+			"b": "hello",
+		},
+		"c": map[string]any{
+			"d": map[string]any{"id": float64(2)},
+			"c": float64(42),
+		},
+	}
+	binary, err := schemaA.Encode(input)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var decoded any
+	if _, err := schemaA.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := decoded.(map[string]any)
+	bd := m["b"].(map[string]any)["d"].(map[string]any)
+	if bd["id"] != int32(1) {
+		t.Errorf("b.d.id: got %v", bd["id"])
+	}
+	cd := m["c"].(map[string]any)["d"].(map[string]any)
+	if cd["id"] != int32(2) {
+		t.Errorf("c.d.id: got %v", cd["id"])
+	}
+}
+
+func TestSchemaCacheDiamondEnum(t *testing.T) {
+	cache := NewSchemaCache()
+
+	schemaColor := `{
+		"type": "enum",
+		"name": "Color",
+		"symbols": ["RED", "GREEN", "BLUE"]
+	}`
+
+	s1, err := cache.Parse(schemaColor)
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+	s2, err := cache.Parse(schemaColor)
+	if err != nil {
+		t.Fatalf("second parse: %v", err)
+	}
+	if s1 != s2 {
+		t.Error("expected same *Schema pointer")
+	}
+
+	s, err := cache.Parse(`{
+		"type": "record",
+		"name": "Item",
+		"fields": [
+			{"name": "name", "type": "string"},
+			{"name": "color", "type": "Color"}
+		]
+	}`)
+	if err != nil {
+		t.Fatalf("parse Item: %v", err)
+	}
+
+	binary, err := s.Encode(map[string]any{"name": "hat", "color": "RED"})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var decoded any
+	if _, err := s.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.(map[string]any)["color"] != "RED" {
+		t.Errorf("color: got %v", decoded.(map[string]any)["color"])
+	}
+}
+
+func TestSchemaCacheDiamondFixed(t *testing.T) {
+	cache := NewSchemaCache()
+
+	schemaHash := `{
+		"type": "fixed",
+		"name": "Hash",
+		"size": 16
+	}`
+
+	s1, err := cache.Parse(schemaHash)
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+	s2, err := cache.Parse(schemaHash)
+	if err != nil {
+		t.Fatalf("second parse: %v", err)
+	}
+	if s1 != s2 {
+		t.Error("expected same *Schema pointer")
+	}
+
+	s, err := cache.Parse(`{
+		"type": "record",
+		"name": "Doc",
+		"fields": [
+			{"name": "id", "type": "string"},
+			{"name": "hash", "type": "Hash"}
+		]
+	}`)
+	if err != nil {
+		t.Fatalf("parse Doc: %v", err)
+	}
+
+	hash := make([]byte, 16)
+	hash[0] = 0xAB
+	binary, err := s.Encode(map[string]any{"id": "doc1", "hash": hash})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var decoded any
+	if _, err := s.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := decoded.(map[string]any)["hash"].([]byte)
+	if got[0] != 0xAB {
+		t.Errorf("hash[0]: got %x", got[0])
+	}
+}
+
+func TestSchemaCacheFailedParseThenRetry(t *testing.T) {
+	// A failed parse must not be cached by the dedup map.
+	cache := NewSchemaCache()
+
+	schema := `{
+		"type": "record",
+		"name": "R",
+		"fields": [{"name": "f", "type": "Unknown"}]
+	}`
+
+	_, err := cache.Parse(schema)
+	if err == nil {
+		t.Fatal("expected error for unresolved reference")
+	}
+
+	// Add the missing type, then retry the same schema string.
+	_, err = cache.Parse(`{
+		"type": "record",
+		"name": "Unknown",
+		"fields": [{"name": "x", "type": "int"}]
+	}`)
+	if err != nil {
+		t.Fatalf("parse Unknown: %v", err)
+	}
+
+	s, err := cache.Parse(schema)
+	if err != nil {
+		t.Fatalf("retry should succeed after adding Unknown: %v", err)
+	}
+
+	binary, err := s.Encode(map[string]any{
+		"f": map[string]any{"x": float64(7)},
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var decoded any
+	if _, err := s.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.(map[string]any)["f"].(map[string]any)["x"] != int32(7) {
+		t.Errorf("f.x: got %v", decoded.(map[string]any)["f"])
+	}
+}
+
+func TestSchemaCacheConflictingDefinition(t *testing.T) {
+	// Two different schemas defining the same name should still error.
+	cache := NewSchemaCache()
+
+	_, err := cache.Parse(`{
+		"type": "record",
+		"name": "Foo",
+		"fields": [{"name": "x", "type": "int"}]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = cache.Parse(`{
+		"type": "record",
+		"name": "Foo",
+		"fields": [{"name": "y", "type": "string"}]
+	}`)
+	if err == nil {
+		t.Fatal("expected error for conflicting definition of Foo")
+	}
+}
