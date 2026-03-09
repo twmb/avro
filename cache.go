@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"crypto/sha256"
 	"maps"
 	"sync"
 )
@@ -13,6 +14,14 @@ import (
 // Schemas must be parsed in dependency order: referenced types must be
 // parsed before the schemas that reference them.
 //
+// Parsing the same schema string multiple times is allowed and returns the
+// previously parsed result. This handles diamond dependencies in schema
+// reference graphs (e.g. A→B→D, A→C→D) without requiring callers to
+// track which schemas have already been parsed. Deduplication compares the
+// raw schema string, not the canonical form: two schema strings that parse
+// identically but differ textually (e.g. in whitespace or doc fields) are
+// not deduplicated and the second parse will return a duplicate type error.
+//
 // The returned [*Schema] from each Parse call is fully resolved and
 // independent of the cache — it can be used for [Schema.Encode] and
 // [Schema.Decode] without the cache.
@@ -21,12 +30,14 @@ import (
 type SchemaCache struct {
 	mu    sync.Mutex
 	named map[string]*namedType
+	dedup map[[32]byte]*Schema
 }
 
 // NewSchemaCache returns a new empty SchemaCache.
 func NewSchemaCache() *SchemaCache {
 	return &SchemaCache{
 		named: make(map[string]*namedType),
+		dedup: make(map[[32]byte]*Schema),
 	}
 }
 
@@ -36,6 +47,11 @@ func NewSchemaCache() *SchemaCache {
 func (c *SchemaCache) Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	h := sha256.Sum256([]byte(schema))
+	if s, ok := c.dedup[h]; ok {
+		return s, nil
+	}
 
 	// Clone the cache's map so a failed parse doesn't corrupt the cache.
 	b := &builder{
@@ -50,5 +66,6 @@ func (c *SchemaCache) Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 
 	// Success: the builder's map is a superset of the cache's.
 	c.named = b.named
+	c.dedup[h] = s
 	return s, nil
 }
