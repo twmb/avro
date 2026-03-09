@@ -629,6 +629,141 @@ func TestSchemaCacheFailedParseThenRetry(t *testing.T) {
 	}
 }
 
+func TestSchemaCacheDiamondWhitespace(t *testing.T) {
+	// Same schema with different whitespace should dedup.
+	cache := NewSchemaCache()
+
+	_, err := cache.Parse(`{"type":"record","name":"W","fields":[{"name":"x","type":"int"}]}`)
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+
+	s, err := cache.Parse(`{
+		"type": "record",
+		"name": "W",
+		"fields": [
+			{"name": "x", "type": "int"}
+		]
+	}`)
+	if err != nil {
+		t.Fatalf("second parse with different whitespace: %v", err)
+	}
+
+	binary, err := s.Encode(map[string]any{"x": float64(42)})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var decoded any
+	if _, err := s.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.(map[string]any)["x"] != int32(42) {
+		t.Errorf("x: got %v", decoded.(map[string]any)["x"])
+	}
+}
+
+func TestSchemaCacheDiamondKeyOrder(t *testing.T) {
+	// Same schema with different JSON key ordering should dedup.
+	cache := NewSchemaCache()
+
+	_, err := cache.Parse(`{"type":"record","name":"K","fields":[{"name":"x","type":"int"}]}`)
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+
+	// Keys reordered: name before type, field keys reordered too.
+	s, err := cache.Parse(`{"name":"K","type":"record","fields":[{"type":"int","name":"x"}]}`)
+	if err != nil {
+		t.Fatalf("second parse with reordered keys: %v", err)
+	}
+
+	binary, err := s.Encode(map[string]any{"x": float64(99)})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var decoded any
+	if _, err := s.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.(map[string]any)["x"] != int32(99) {
+		t.Errorf("x: got %v", decoded.(map[string]any)["x"])
+	}
+}
+
+func TestSchemaCacheFieldOrderPreserved(t *testing.T) {
+	// Field ARRAY order matters for Avro binary encoding.
+	// Two schemas with the same fields in different order are different
+	// schemas and must NOT be deduplicated.
+	cache := NewSchemaCache()
+
+	s1, err := cache.Parse(`{
+		"type": "record",
+		"name": "R",
+		"fields": [
+			{"name": "a", "type": "int"},
+			{"name": "b", "type": "string"}
+		]
+	}`)
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+
+	// Encode with field order a=1, b="hello".
+	binary, err := s1.Encode(map[string]any{"a": float64(1), "b": "hello"})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	// Parse a schema with swapped field order. This is a DIFFERENT schema
+	// (different binary layout), so it must not dedup. It will error
+	// because "R" is already in the cache — that's expected and correct.
+	_, err = cache.Parse(`{
+		"type": "record",
+		"name": "R",
+		"fields": [
+			{"name": "b", "type": "string"},
+			{"name": "a", "type": "int"}
+		]
+	}`)
+	if err == nil {
+		t.Fatal("expected error: swapped field order is a different schema")
+	}
+
+	// Verify the original still decodes correctly.
+	var decoded any
+	if _, err := s1.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := decoded.(map[string]any)
+	if m["a"] != int32(1) {
+		t.Errorf("a: got %v", m["a"])
+	}
+	if m["b"] != "hello" {
+		t.Errorf("b: got %v", m["b"])
+	}
+}
+
+func TestSchemaCacheDedupPreservesLargeNumbers(t *testing.T) {
+	// Verify that JSON normalization preserves large integers exactly,
+	// so two schemas with the same large "size" value dedup correctly.
+	cache := NewSchemaCache()
+
+	schema1 := `{"type":"fixed","name":"Big","size":9007199254740993}`
+	schema2 := `{ "type": "fixed", "name": "Big", "size": 9007199254740993 }`
+
+	s1, err := cache.Parse(schema1)
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+	s2, err := cache.Parse(schema2)
+	if err != nil {
+		t.Fatalf("second parse (whitespace only): %v", err)
+	}
+	if s1 != s2 {
+		t.Error("expected same *Schema pointer for whitespace-only difference")
+	}
+}
+
 func TestSchemaCacheConflictingDefinition(t *testing.T) {
 	// Two different schemas defining the same name should still error.
 	cache := NewSchemaCache()

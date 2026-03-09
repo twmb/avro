@@ -2,7 +2,9 @@ package avro
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"maps"
+	"strings"
 	"sync"
 )
 
@@ -17,10 +19,11 @@ import (
 // Parsing the same schema string multiple times is allowed and returns the
 // previously parsed result. This handles diamond dependencies in schema
 // reference graphs (e.g. A→B→D, A→C→D) without requiring callers to
-// track which schemas have already been parsed. Deduplication compares the
-// raw schema string, not the canonical form: two schema strings that parse
-// identically but differ textually (e.g. in whitespace or doc fields) are
-// not deduplicated and the second parse will return a duplicate type error.
+// track which schemas have already been parsed. Deduplication normalizes
+// the JSON (whitespace and key order) but not the Avro canonical form:
+// schemas that differ only in formatting are deduplicated, but differences
+// in non-canonical fields like doc or aliases are not and will return a
+// duplicate type error.
 //
 // The returned [*Schema] from each Parse call is fully resolved and
 // independent of the cache — it can be used for [Schema.Encode] and
@@ -48,6 +51,14 @@ func (c *SchemaCache) Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	dec := json.NewDecoder(strings.NewReader(schema))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err == nil {
+		if normalized, err := json.Marshal(v); err == nil {
+			schema = string(normalized)
+		}
+	}
 	h := sha256.Sum256([]byte(schema))
 	if s, ok := c.dedup[h]; ok {
 		return s, nil
