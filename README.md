@@ -86,7 +86,7 @@ encoding and decoding.
 | record    | struct (matched by field name or `avro` tag), `map[string]any`, `any` |
 
 When decoding into `any`, values use their natural Go types: `nil`, `bool`,
-`int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`, `map[string]any`.
+`int32`, `int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`, `map[string]any`.
 
 Encoding also accepts `fmt.Stringer` and `encoding.TextMarshaler` for string
 schema types.
