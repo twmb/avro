@@ -61,22 +61,15 @@ type fieldNode struct {
 // ParseOpt configures schema parsing behavior.
 type ParseOpt interface{ parseOpt() }
 
-type (
-	parseOptStrict struct{}
-	parseOptLax    struct{ fn func(string) error }
-)
+type parseOptLax struct{ fn func(string) error }
 
-func (parseOptStrict) parseOpt() {}
-func (parseOptLax) parseOpt()    {}
+func (parseOptLax) parseOpt() {}
 
-// WithStrictNames requires names to match the Avro spec's [A-Za-z_][A-Za-z0-9_]*.
-// This is the default.
-func WithStrictNames() ParseOpt { return parseOptStrict{} }
-
-// WithLaxNames relaxes name validation. If fn is nil, only non-empty names
-// are required. If fn is non-nil, it is called for each name component and
-// should return an error for invalid names. Dot-separated fullnames are
-// split before calling fn.
+// WithLaxNames relaxes name validation, overriding the default requirement
+// that names match the Avro strict name regex [A-Za-z_][A-Za-z0-9_]*.
+// If fn is nil, only non-empty names are required. If fn is non-nil, it is
+// called for each name component and should return an error for invalid
+// names. Dot-separated fullnames are split before calling fn.
 func WithLaxNames(fn func(string) error) ParseOpt { return parseOptLax{fn} }
 
 // MustParse is like [Parse] but panics on error.
@@ -91,8 +84,8 @@ func MustParse(schema string, opts ...ParseOpt) *Schema {
 // Parse parses an Avro JSON schema string and returns a compiled [*Schema].
 // The input can be a primitive name (e.g. `"string"`), a JSON object
 // (record, enum, array, map, fixed), or a JSON array (union). Named types
-// may reference each other and self-reference. The schema is fully validated:
-// unknown types, duplicate names, invalid defaults, etc. all return errors.
+// may self-reference. The schema is fully validated: unknown types, duplicate
+// names, invalid defaults, etc. all return errors.
 //
 // To parse schemas that reference named types from other schemas, use
 // [SchemaCache].
@@ -107,8 +100,6 @@ func Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 func applyParseOpts(b *builder, opts []ParseOpt) {
 	for _, o := range opts {
 		switch o := o.(type) {
-		case parseOptStrict:
-			b.checkName = nil
 		case parseOptLax:
 			if o.fn != nil {
 				b.checkName = o.fn

@@ -150,12 +150,12 @@ func (optMaxBlockBytes) readerOpt() {}
 func WithCodec(c Codec) Opt { return optCodec{c} }
 
 // WithBlockCount sets the maximum number of items per block. The default is
-// 100. If both WithBlockCount and [WithBlockBytes] are set, whichever limit
-// is hit first triggers a flush.
+// 0 (unlimited). If both WithBlockCount and [WithBlockBytes] are set,
+// whichever limit is hit first triggers a flush.
 func WithBlockCount(n int) WriterOpt { return optBlockCount{n} }
 
-// WithBlockBytes sets the maximum uncompressed size of a block in bytes.
-// Zero (the default) means no size limit. If both [WithBlockCount] and
+// WithBlockBytes sets the maximum uncompressed size of a block in bytes
+// before it is flushed. The default is 64 KiB. If both [WithBlockCount] and
 // WithBlockBytes are set, whichever limit is hit first triggers a flush.
 func WithBlockBytes(n int) WriterOpt { return optBlockBytes{n} }
 
@@ -252,23 +252,13 @@ type Writer struct {
 	maxBytes   int
 	err        error
 	userMeta   []kv
-	hasSync bool
+	hasSync    bool
 }
 
-func (w *Writer) normalizeLimits() {
-	if w.maxCount < 0 {
-		w.maxCount = 0
-	}
-	if w.maxBytes < 0 {
-		w.maxBytes = 0
-	}
-	if w.maxCount == 0 && w.maxBytes == 0 {
-		w.maxCount = 100
-	}
-}
+const defaultBlockBytes = 64 << 10 // 64 KiB
 
 func (w *Writer) shouldFlush() bool {
-	return (w.maxCount > 0 && w.count >= w.maxCount) || (w.maxBytes > 0 && len(w.buf) >= w.maxBytes)
+	return (w.maxCount > 0 && w.count >= w.maxCount) || len(w.buf) >= w.maxBytes
 }
 
 // Schema returns the schema used by this Writer.
@@ -305,7 +295,12 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) 
 			wr.schemaJSON = o.s
 		}
 	}
-	wr.normalizeLimits()
+	if wr.maxCount < 0 {
+		wr.maxCount = 0
+	}
+	if wr.maxBytes <= 0 {
+		wr.maxBytes = defaultBlockBytes
+	}
 
 	if !wr.hasSync {
 		if _, err := randRead(wr.sync[:]); err != nil {
@@ -492,7 +487,12 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 			wr.maxBytes = o.n
 		}
 	}
-	wr.normalizeLimits()
+	if wr.maxCount < 0 {
+		wr.maxCount = 0
+	}
+	if wr.maxBytes <= 0 {
+		wr.maxBytes = defaultBlockBytes
+	}
 	return wr, nil
 }
 

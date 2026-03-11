@@ -11,7 +11,7 @@ import (
 
 // Resolve returns a schema that decodes data written with the writer schema
 // and produces values matching the reader schema's layout. The writer schema
-// is what the data was encoded with (typically from an [ocf] file header or
+// is what the data was encoded with (typically from an OCF file header or
 // a schema registry); the reader schema is what your application expects now.
 //
 // Decoding with the returned schema handles field addition (defaults), field

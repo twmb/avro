@@ -45,7 +45,7 @@
 //   - Fields that exist in both are matched by name (or alias) and decoded,
 //     with type promotion applied where needed (e.g. int → long).
 //
-// You typically get the writer schema from the data itself: an [ocf] file
+// You typically get the writer schema from the data itself: an OCF file
 // header embeds it, and schema registries store it by ID or fingerprint.
 //
 // As a concrete example, suppose v1 of your application wrote User records
@@ -135,7 +135,7 @@
 // # Single Object Encoding
 //
 // For sending self-describing values over the wire (as opposed to files,
-// where [ocf] is preferred), use [Schema.AppendSingleObject] and
+// where OCF is preferred), use [Schema.AppendSingleObject] and
 // [Schema.DecodeSingleObject]. To decode without knowing the schema in
 // advance, extract the fingerprint with [SingleObjectFingerprint] and look
 // it up in your own registry.
