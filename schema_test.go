@@ -741,8 +741,8 @@ func TestWithLaxNames(t *testing.T) {
 		t.Fatal("expected error for digit-start name with custom validator")
 	}
 
-	// WithStrictNames re-enables strict after lax.
-	_, err = Parse(`{"type":"record","name":"my-record","fields":[{"name":"x","type":"int"}]}`, WithStrictNames())
+	// Default (no option) is strict: dashed names are rejected.
+	_, err = Parse(`{"type":"record","name":"my-record","fields":[{"name":"x","type":"int"}]}`)
 	if err == nil {
 		t.Fatal("expected error for dashed name in strict mode")
 	}

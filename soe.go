@@ -28,8 +28,7 @@ func (s *Schema) DecodeSingleObject(data []byte, v any) ([]byte, error) {
 }
 
 // SingleObjectFingerprint extracts the 8-byte CRC-64-AVRO fingerprint and
-// returns the remaining payload. Use this to look up the schema by
-// fingerprint before decoding.
+// returns the remaining payload.
 func SingleObjectFingerprint(data []byte) (fp [8]byte, rest []byte, err error) {
 	if len(data) < 10 {
 		return fp, nil, fmt.Errorf("avro: single-object encoding too short: need at least 10 bytes, have %d", len(data))
