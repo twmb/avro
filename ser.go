@@ -331,7 +331,11 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		for _, f := range s.fields {
 			value := v.MapIndex(f.nameVal)
 			if !value.IsValid() {
-				return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: errors.New("missing key")}
+				if !f.hasDefault {
+					return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: errors.New("missing key")}
+				}
+				dst = append(dst, f.defaultBytes...)
+				continue
 			}
 			if dst, err = f.fn(dst, value); err != nil {
 				return nil, err
