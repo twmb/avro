@@ -207,6 +207,11 @@ type afield struct {
 	Aliases []string        `json:"aliases,omitempty"`
 	Default json.RawMessage `json:"default,omitempty"`
 	Order   string          `json:"order,omitempty"`
+
+	// hasDefault is true if the field has a default value. This is set
+	// in canonical afields (which strip Default) so that validateDefault
+	// can check whether nested record fields have defaults.
+	hasDefault bool
 }
 
 type aobject struct {
@@ -298,11 +303,13 @@ type metaFixup struct {
 // recordFieldFixup patches a record field's ser/deser function, avroType,
 // meta, and schemaNode when the field's type was a forward reference.
 type recordFieldFixup struct {
-	sr   *serRecord
-	dr   *deserRecord
-	nd   *schemaNode
-	idx  int
-	name string
+	sr         *serRecord
+	dr         *deserRecord
+	nd         *schemaNode
+	idx        int
+	name       string
+	defaultVal any  // parsed JSON default; valid only when hasDefault is true
+	hasDefault bool // whether the field had a "default" in the schema
 }
 
 // namedType holds the compiled artifacts for a named Avro type (record,
@@ -408,6 +415,14 @@ func (b *builder) finalize() error {
 			m.dr.fields[m.idx].meta.deserRecord = nt.dr
 		}
 		m.nd.fields[m.idx].node = nt.node
+		if m.hasDefault && nt.node != nil {
+			defaultBytes, err := encodeDefault(m.defaultVal, nt.node)
+			if err != nil {
+				return fmt.Errorf("field %q: invalid default for type %q: %v", m.sr.fields[m.idx].name, m.name, err)
+			}
+			m.sr.fields[m.idx].defaultBytes = defaultBytes
+			m.sr.fields[m.idx].hasDefault = true
+		}
 	}
 	return nil
 }
@@ -772,8 +787,9 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				bf.canon = aschema{primitive: fwdRefName}
 			}
 			o.Fields[i] = afield{
-				Name: of.Name,
-				Type: &bf.canon,
+				Name:       of.Name,
+				Type:       &bf.canon,
+				hasDefault: len(of.Default) > 0,
 			}
 			meta := new(fieldMeta)
 			*meta = bf.meta
@@ -798,13 +814,22 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				node:    bf.node,
 			}
 			if isFwdRef {
-				b.fieldFixups = append(b.fieldFixups, recordFieldFixup{
+				fix := recordFieldFixup{
 					sr:   sr,
 					dr:   dr,
 					nd:   nd,
 					idx:  fieldIdx,
 					name: fwdRefName,
-				})
+				}
+				if len(of.Default) > 0 {
+					var dv any
+					// json.Unmarshal cannot fail: of.Default is a json.RawMessage
+					// preserved from the initial schema parse, so it is valid JSON.
+					json.Unmarshal(of.Default, &dv) //nolint:errcheck
+					fix.defaultVal = dv
+					fix.hasDefault = true
+				}
+				b.fieldFixups = append(b.fieldFixups, fix)
 			}
 			if len(of.Default) > 0 {
 				var defaultVal any
@@ -823,13 +848,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				fn.defaultVal = defaultVal
 				fn.hasDefault = true
 				// Pre-encode the default to Avro binary for use
-				// when encoding maps with missing keys. Non-fatal:
-				// if encoding fails, map encoding will require the key.
+				// when encoding maps with missing keys.
 				if !isFwdRef && bf.node != nil {
-					if defaultBytes, err := encodeDefault(defaultVal, bf.node); err == nil {
-						sr.fields[fieldIdx].defaultBytes = defaultBytes
-						sr.fields[fieldIdx].hasDefault = true
+					defaultBytes, err := encodeDefault(defaultVal, bf.node)
+					if err != nil {
+						return fmt.Errorf("record field %q: encoding default: %v", of.Name, err)
 					}
+					sr.fields[fieldIdx].defaultBytes = defaultBytes
+					sr.fields[fieldIdx].hasDefault = true
 				}
 			}
 			dr.fields = append(dr.fields, drf)
@@ -1227,17 +1253,19 @@ func validateDefault(val any, s *aschema) error {
 			if !ok && val != nil {
 				return fmt.Errorf("expected object for record default, got %T", val)
 			}
-			if m != nil {
-				for _, f := range s.object.Fields {
-					fv, exists := m[f.Name]
-					if !exists {
-						// Fields absent from the default are
-						// allowed — they use their own defaults.
-						continue
+			if m == nil {
+				m = make(map[string]any)
+			}
+			for _, f := range s.object.Fields {
+				fv, exists := m[f.Name]
+				if !exists {
+					if !f.hasDefault {
+						return fmt.Errorf("record default missing field %q with no default", f.Name)
 					}
-					if err := validateDefault(fv, f.Type); err != nil {
-						return fmt.Errorf("field %q: %w", f.Name, err)
-					}
+					continue
+				}
+				if err := validateDefault(fv, f.Type); err != nil {
+					return fmt.Errorf("field %q: %w", f.Name, err)
 				}
 			}
 		case "enum":
@@ -1278,8 +1306,13 @@ func validateDefault(val any, s *aschema) error {
 			if !ok {
 				return fmt.Errorf("expected string for fixed default, got %T", val)
 			}
-			if s.object.Size != nil && len(str) != *s.object.Size {
-				return fmt.Errorf("fixed default length %d does not match size %d", len(str), *s.object.Size)
+			for _, r := range str {
+				if r > 255 {
+					return fmt.Errorf("fixed default contains code point U+%04X, max allowed is U+00FF", r)
+				}
+			}
+			if s.object.Size != nil && len([]rune(str)) != *s.object.Size {
+				return fmt.Errorf("fixed default length %d does not match size %d", len([]rune(str)), *s.object.Size)
 			}
 		}
 	}
@@ -1327,8 +1360,14 @@ func validateDefaultPrimitive(val any, prim string) error {
 			return fmt.Errorf("expected string, got %T", val)
 		}
 	case "bytes":
-		if _, ok := val.(string); !ok {
+		s, ok := val.(string)
+		if !ok {
 			return fmt.Errorf("expected string for bytes, got %T", val)
+		}
+		for _, r := range s {
+			if r > 255 {
+				return fmt.Errorf("bytes default contains code point U+%04X, max allowed is U+00FF", r)
+			}
 		}
 	}
 	return nil

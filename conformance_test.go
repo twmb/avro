@@ -546,7 +546,7 @@ func TestSpecDefaultBytesUnicode(t *testing.T) {
 	}
 }
 
-func TestSpecDefaultsAreReadTimeOnly(t *testing.T) {
+func TestSpecDefaultsUsedOnEncode(t *testing.T) {
 	s := mustParse(t, `{
 		"type":"record","name":"R",
 		"fields":[
@@ -555,8 +555,26 @@ func TestSpecDefaultsAreReadTimeOnly(t *testing.T) {
 		]
 	}`)
 
-	if _, err := s.AppendEncode(nil, map[string]any{"b": "hello"}); err == nil {
-		t.Fatal("expected encode error for missing writer field, even with default")
+	// Field "a" has a default, so encoding with only "b" should succeed.
+	dst, err := s.AppendEncode(nil, map[string]any{"b": "hello"})
+	if err != nil {
+		t.Fatalf("unexpected encode error: %v", err)
+	}
+	var decoded any
+	if _, err := s.Decode(dst, &decoded); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	m := decoded.(map[string]any)
+	if m["a"] != int32(42) {
+		t.Errorf("field a: got %v (%T), want int32(42)", m["a"], m["a"])
+	}
+	if m["b"] != "hello" {
+		t.Errorf("field b: got %v, want hello", m["b"])
+	}
+
+	// Field "b" has no default, so encoding with only "a" should still error.
+	if _, err := s.AppendEncode(nil, map[string]any{"a": int32(1)}); err == nil {
+		t.Fatal("expected encode error for missing field without default")
 	}
 }
 
@@ -1724,6 +1742,57 @@ func TestHambaFixedDefault(t *testing.T) {
 		}
 	default:
 		t.Fatalf("unexpected type %T for fixed default", b)
+	}
+}
+
+func TestFixedDefaultHighCodePoints(t *testing.T) {
+	// Code points 128-255 are valid (multi-byte UTF-8 but single Avro bytes).
+	// Size check must count runes, not bytes.
+	s := mustParse(t, `{"type":"record","name":"r","fields":[
+		{"name":"a","type":{"type":"fixed","name":"f","size":2},"default":"\u00FF\u00FE"}
+	]}`)
+	binary, err := s.Encode(map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded any
+	if _, err := s.Decode(binary, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	m := decoded.(map[string]any)
+	got, ok := m["a"].([]byte)
+	if !ok {
+		t.Fatalf("expected []byte, got %T", m["a"])
+	}
+	if !bytes.Equal(got, []byte{0xFF, 0xFE}) {
+		t.Fatalf("got %x, want fffe", got)
+	}
+}
+
+func TestBytesFixedDefaultRejectsHighUnicode(t *testing.T) {
+	// Code points > 255 must be rejected per Avro spec.
+	for _, tt := range []struct {
+		name   string
+		schema string
+	}{
+		{
+			"bytes U+0100",
+			`{"type":"record","name":"r","fields":[
+				{"name":"a","type":"bytes","default":"\u0100"}
+			]}`,
+		},
+		{
+			"fixed U+0100",
+			`{"type":"record","name":"r","fields":[
+				{"name":"a","type":{"type":"fixed","name":"f","size":1},"default":"\u0100"}
+			]}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := avro.Parse(tt.schema); err == nil {
+				t.Fatal("expected error for code point > 255")
+			}
+		})
 	}
 }
 

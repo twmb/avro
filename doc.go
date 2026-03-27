@@ -28,6 +28,30 @@
 //	var u User
 //	_, err = schema.Decode(data, &u)
 //
+// # Map encoding and defaults
+//
+// When encoding a map[string]any as a record, any field whose key is absent
+// from the map is filled from the schema's default value. If a field has no
+// default and the key is missing, encoding returns an error. This does not
+// apply to struct encoding, where fields are always present (though they may
+// be zero-valued; see the omitzero tag option).
+//
+//	schema := avro.MustParse(`{
+//	    "type": "record", "name": "Event",
+//	    "fields": [
+//	        {"name": "id",   "type": "string"},
+//	        {"name": "tags", "type": {"type": "array", "items": "string"}, "default": []}
+//	    ]
+//	}`)
+//
+//	// "tags" is absent from the map, so the schema default ([]) is used.
+//	data, err := schema.Encode(map[string]any{"id": "abc"})
+//
+// Note: the Avro spec says defaults are for schema evolution at read time, but
+// in Go the common pattern is json.Unmarshal into map[string]any, where keys
+// for defaulted fields are simply absent. Filling them from schema defaults at
+// encode time is consistent with hamba/avro and linkedin/goavro.
+//
 // # Schema evolution
 //
 // Avro data is always written with a specific schema — the "writer schema."

@@ -737,26 +737,200 @@ func TestSerTimestampNanosOverflow(t *testing.T) {
 	}
 }
 
-func TestSerMapMissingFieldDefault(t *testing.T) {
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"int","default":42},
-		{"name":"b","type":"string"}
-	]}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
+func TestSerMapMissingFieldUsesDefault(t *testing.T) {
+	tests := []struct {
+		name      string
+		schema    string
+		input     map[string]any
+		expErr    bool
+		expDecode map[string]any // expected values after decode round-trip
+	}{
+		{
+			name: "null default for union field",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":["null"],"default":null}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": nil},
+		},
+		{
+			name: "int default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":"int","default":42}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": int32(42)},
+		},
+		{
+			name: "string default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":"string","default":"hello"}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": "hello"},
+		},
+		{
+			name: "mixed fields with some defaults",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":"int","default":42},
+				{"name":"b","type":"string"}
+			]}`,
+			input:     map[string]any{"b": "world"},
+			expDecode: map[string]any{"a": int32(42), "b": "world"},
+		},
+		{
+			name: "forward-reference record field with default",
+			schema: `{"type":"record","name":"outer","fields":[
+				{"name":"name","type":"string"},
+				{"name":"inner","type":"inner","default":{"x":99}},
+				{"name":"dummy","type":{"type":"record","name":"inner","fields":[
+					{"name":"x","type":"int"}
+				]}}
+			]}`,
+			input:     map[string]any{"name": "hi", "dummy": map[string]any{"x": float64(1)}},
+			expDecode: map[string]any{"name": "hi", "inner": map[string]any{"x": int32(99)}, "dummy": map[string]any{"x": int32(1)}},
+		},
+		{
+			name: "boolean default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":"boolean","default":false}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": false},
+		},
+		{
+			name: "long default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":"long","default":100000}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": int64(100000)},
+		},
+		{
+			name: "float default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":"float","default":1.5}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": float32(1.5)},
+		},
+		{
+			name: "double default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":"double","default":3.14}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": 3.14},
+		},
+		{
+			name: "enum default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]},"default":"GREEN"}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": "GREEN"},
+		},
+		{
+			name: "empty array default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":{"type":"array","items":"string"},"default":[]}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": []any{}},
+		},
+		{
+			name: "non-empty array default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":{"type":"array","items":"int"},"default":[1,2,3]}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": []any{int32(1), int32(2), int32(3)}},
+		},
+		{
+			name: "empty map default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":{"type":"map","values":"string"},"default":{}}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": map[string]any{}},
+		},
+		{
+			name: "nullable union with null default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":["null","string"],"default":null}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": nil},
+		},
+		{
+			name: "nested record default",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"inner","type":{"type":"record","name":"inner","fields":[
+					{"name":"x","type":"int"},
+					{"name":"y","type":"string","default":"hi"}
+				]},"default":{"x":7}}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"inner": map[string]any{"x": int32(7), "y": "hi"}},
+		},
+		{
+			name: "bytes default with high code points",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":"bytes","default":"\u00FF\u0001\u0000"}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": []byte{0xFF, 0x01, 0x00}},
+		},
+		{
+			name: "fixed default with unicode escapes",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":{"type":"fixed","name":"f","size":4},"default":"\u0001\u0002\u0003\u0004"}
+			]}`,
+			input:     map[string]any{},
+			expDecode: map[string]any{"a": []byte{1, 2, 3, 4}},
+		},
+		{
+			name: "missing field without default still errors",
+			schema: `{"type":"record","name":"r","fields":[
+				{"name":"a","type":"int","default":42},
+				{"name":"b","type":"string"}
+			]}`,
+			input:  map[string]any{"a": int32(1)},
+			expErr: true,
+		},
 	}
-	// Defaults are read-time only. Missing writer fields should always error,
-	// even if a default is specified.
-	m := map[string]any{"b": "hello"}
-	if _, err := s.AppendEncode(nil, &m); err == nil {
-		t.Fatal("expected error for missing field during encoding")
-	}
-
-	// Map missing field with no default should also error.
-	m2 := map[string]any{"a": int32(1)}
-	if _, err := s.AppendEncode(nil, &m2); err == nil {
-		t.Fatal("expected error for missing field with no default")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := s.AppendEncode(nil, &tt.input)
+			if tt.expErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected encode error: %v", err)
+			}
+			// Round-trip: decode and verify defaults appear.
+			var decoded any
+			if _, err := s.Decode(dst, &decoded); err != nil {
+				t.Fatalf("decode error: %v", err)
+			}
+			m, ok := decoded.(map[string]any)
+			if !ok {
+				t.Fatalf("expected map, got %T", decoded)
+			}
+			for k, want := range tt.expDecode {
+				got := m[k]
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("field %q: got %v (%T), want %v (%T)", k, got, got, want, want)
+				}
+			}
+		})
 	}
 }
 
@@ -867,62 +1041,130 @@ func TestSerFloat64CoercionLong(t *testing.T) {
 
 func TestSerJSONRoundtrip(t *testing.T) {
 	// This tests the rpk use case: json.Unmarshal → Encode → Decode → json.Marshal.
-	schema := `{
-		"type": "record",
-		"name": "test",
-		"fields": [
-			{"name": "name", "type": "string"},
-			{"name": "age", "type": "int"},
-			{"name": "score", "type": "long"},
-			{"name": "rating", "type": "float"},
-			{"name": "precise", "type": "double"},
-			{"name": "active", "type": "boolean"},
-			{"name": "tags", "type": {"type": "array", "items": "string"}},
-			{"name": "metadata", "type": {"type": "map", "values": "int"}}
-		]
-	}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name      string
+		schema    string
+		record    string
+		expRecord string
+		expEncErr bool
+	}{
+		{
+			name: "all primitive types plus array and map",
+			schema: `{
+				"type": "record",
+				"name": "test",
+				"fields": [
+					{"name": "name", "type": "string"},
+					{"name": "age", "type": "int"},
+					{"name": "score", "type": "long"},
+					{"name": "rating", "type": "float"},
+					{"name": "precise", "type": "double"},
+					{"name": "active", "type": "boolean"},
+					{"name": "tags", "type": {"type": "array", "items": "string"}},
+					{"name": "metadata", "type": {"type": "map", "values": "int"}}
+				]
+			}`,
+			record:    `{"name":"alice","age":30,"score":100000,"rating":4.5,"precise":3.14159,"active":true,"tags":["go","avro"],"metadata":{"x":1,"y":2}}`,
+			expRecord: `{"name":"alice","age":30,"score":100000,"rating":4.5,"precise":3.14159,"active":true,"tags":["go","avro"],"metadata":{"x":1,"y":2}}`,
+		},
+		{
+			name: "simple string field",
+			schema: `{
+				"type":"record",
+				"name":"test",
+				"fields":[{"name":"name","type":"string"}]
+			}`,
+			record:    `{"name":"redpanda"}`,
+			expRecord: `{"name":"redpanda"}`,
+		},
+		{
+			name: "nested record with array",
+			schema: `{
+				"type":"record",
+				"name":"test",
+				"fields":[
+					{"name":"name","type":"string"},
+					{"name":"complex","type":{
+						"type":"record",
+						"name":"nestedSchemaName",
+						"fields":[
+							{"name":"list","type":{"type":"array","items":"int"}}
+						]
+					}}
+				]
+			}`,
+			record:    `{"name":"redpanda","complex":{"list":[1,2,3,4]}}`,
+			expRecord: `{"name":"redpanda","complex":{"list":[1,2,3,4]}}`,
+		},
+		{
+			name: "empty record with default null",
+			schema: `{
+				"type":"record",
+				"name":"test",
+				"fields":[{
+					"name":"name",
+					"type":["null"],
+					"default":null
+				}]
+			}`,
+			record:    "{}",
+			expRecord: `{"name":null}`,
+		},
+		{
+			name: "invalid record for valid schema",
+			schema: `{
+				"type":"record",
+				"name":"test",
+				"fields":[{"name":"name","type":"string"}]
+			}`,
+			record:    `{"notValid":123}`,
+			expEncErr: true,
+		},
 	}
-
-	input := `{"name":"alice","age":30,"score":100000,"rating":4.5,"precise":3.14159,"active":true,"tags":["go","avro"],"metadata":{"x":1,"y":2}}`
-
-	// Step 1: json.Unmarshal (produces float64 for all numbers).
-	var native any
-	if err := json.Unmarshal([]byte(input), &native); err != nil {
-		t.Fatalf("json.Unmarshal: %v", err)
-	}
-
-	// Step 2: Encode to Avro binary.
-	binary, err := s.Encode(native)
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-
-	// Step 3: Decode back to Go types.
-	var decoded any
-	rest, err := s.Decode(binary, &decoded)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(rest) != 0 {
-		t.Fatalf("unexpected remaining bytes: %v", rest)
-	}
-
-	// Step 4: Verify specific field values and types.
-	m := decoded.(map[string]any)
-	if m["name"] != "alice" {
-		t.Errorf("name: got %v", m["name"])
-	}
-	if m["age"] != int32(30) {
-		t.Errorf("age: got %v (%T)", m["age"], m["age"])
-	}
-	if m["score"] != int64(100000) {
-		t.Errorf("score: got %v (%T)", m["score"], m["score"])
-	}
-	if m["active"] != true {
-		t.Errorf("active: got %v", m["active"])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var native any
+			if err := json.Unmarshal([]byte(tt.record), &native); err != nil {
+				t.Fatal(err)
+			}
+			binary, err := s.Encode(native)
+			if tt.expEncErr {
+				if err == nil {
+					t.Fatal("expected encode error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			var decoded any
+			rest, err := s.Decode(binary, &decoded)
+			if err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if len(rest) != 0 {
+				t.Fatalf("unexpected remaining bytes: %v", rest)
+			}
+			got, err := json.Marshal(decoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Compare unmarshaled to avoid map ordering issues.
+			var gotU, expU any
+			if err := json.Unmarshal(got, &gotU); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(tt.expRecord), &expU); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotU, expU) {
+				t.Errorf("got %s, expected %s", got, tt.expRecord)
+			}
+		})
 	}
 }
 

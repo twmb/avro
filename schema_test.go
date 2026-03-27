@@ -871,6 +871,23 @@ func TestDefaultValidationErrors(t *testing.T) {
 			]}`,
 		},
 		{
+			"null default for record type",
+			`{"type":"record","name":"R","fields":[
+				{"name":"inner","type":{"type":"record","name":"I","fields":[
+					{"name":"x","type":"int"}
+				]},"default":null}
+			]}`,
+		},
+		{
+			"record default omits field without own default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"inner","type":{"type":"record","name":"I","fields":[
+					{"name":"x","type":"int","default":0},
+					{"name":"y","type":"int"}
+				]},"default":{"x":1}}
+			]}`,
+		},
+		{
 			"enum field default not in symbols",
 			`{"type":"record","name":"R","fields":[
 				{"name":"e","type":{"type":"enum","name":"E","symbols":["A","B"]},"default":"C"}
@@ -892,6 +909,32 @@ func TestDefaultValidationErrors(t *testing.T) {
 			"fixed default wrong length",
 			`{"type":"record","name":"R","fields":[
 				{"name":"f","type":{"type":"fixed","name":"F","size":4},"default":"ab"}
+			]}`,
+		},
+		{
+			"bytes default code point above 255",
+			`{"type":"record","name":"R","fields":[
+				{"name":"b","type":"bytes","default":"\u0100"}
+			]}`,
+		},
+		{
+			"fixed default code point above 255",
+			`{"type":"record","name":"R","fields":[
+				{"name":"f","type":{"type":"fixed","name":"F","size":1},"default":"\u0100"}
+			]}`,
+		},
+		{
+			"forward-ref enum default invalid symbol",
+			`{"type":"record","name":"outer","fields":[
+				{"name":"color","type":"Color","default":"INVALID"},
+				{"name":"dummy","type":{"type":"enum","name":"Color","symbols":["RED","GREEN"]}}
+			]}`,
+		},
+		{
+			"forward-ref fixed default code point above 255",
+			`{"type":"record","name":"outer","fields":[
+				{"name":"id","type":"F","default":"\u0100"},
+				{"name":"dummy","type":{"type":"fixed","name":"F","size":1}}
 			]}`,
 		},
 		{
