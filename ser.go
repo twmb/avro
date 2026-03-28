@@ -250,6 +250,11 @@ func serBytes(dst []byte, v reflect.Value) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Accept string for json.Unmarshal pipelines where JSON strings
+	// may represent Avro bytes fields.
+	if v.Kind() == reflect.String {
+		return doSerString(dst, v.String()), nil
+	}
 	if (v.Kind() != reflect.Array && v.Kind() != reflect.Slice) || v.Type().Elem().Kind() != reflect.Uint8 {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 	}
@@ -263,6 +268,10 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Kind() == reflect.String {
 		return doSerString(dst, v.String()), nil
+	}
+	// Accept []byte for symmetry with bytes accepting string.
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		return doSerString(dst, string(v.Bytes())), nil
 	}
 
 	if v.CanInterface() {

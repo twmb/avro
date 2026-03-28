@@ -199,7 +199,6 @@ func TestSerTypeMismatch(t *testing.T) {
 		{"long from string", `"long"`, new("42")},
 		{"float from string", `"float"`, new("3.14")},
 		{"double from string", `"double"`, new("3.14")},
-		{"bytes from string", `"bytes"`, new("hello")},
 		{"bytes from int slice", `"bytes"`, new([]int{1, 2})},
 		{"string from int", `"string"`, new(42)},
 
