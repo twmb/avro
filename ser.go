@@ -3,6 +3,7 @@ package avro
 import (
 	"encoding"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -16,7 +17,12 @@ import (
 type serfn func([]byte, reflect.Value) ([]byte, error)
 
 // AppendEncode appends the Avro binary encoding of v to dst. See
-// [Schema.Decode] for the Go-to-Avro type mapping.
+// [Schema.Decode] for the Go-to-Avro type mapping. In addition to the types
+// listed there, encoding also accepts:
+//   - [encoding/json.Number] for any numeric Avro type (int, long, float, double)
+//   - RFC 3339 strings for timestamp and date logical types
+//   - [*big.Rat], [big.Rat], float64, [encoding/json.Number], and numeric strings for decimal logical types
+//   - [fmt.Stringer] and [encoding.TextMarshaler] for string types
 func (s *Schema) AppendEncode(dst []byte, v any) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
@@ -137,6 +143,20 @@ func serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
+var jsonNumberType = reflect.TypeFor[json.Number]()
+
+// jsonNumberToFloat converts a json.Number to a float64 reflect.Value.
+func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool) {
+	if v.Type() != jsonNumberType {
+		return v, false
+	}
+	f, err := v.Interface().(json.Number).Float64()
+	if err != nil {
+		return v, false
+	}
+	return reflect.ValueOf(f), true
+}
+
 func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
@@ -164,6 +184,8 @@ func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %v overflows int32", f)}
 		}
 		return appendVarint(dst, int32(n)), nil
+	} else if fv, ok := jsonNumberToFloat(v); ok {
+		return serInt(dst, fv)
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
 }
@@ -191,6 +213,8 @@ func serLong(dst []byte, v reflect.Value) ([]byte, error) {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 		}
 		return appendVarlong(dst, int64(n)), nil
+	} else if fv, ok := jsonNumberToFloat(v); ok {
+		return serLong(dst, fv)
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
 }
@@ -202,6 +226,8 @@ func serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.CanFloat() {
 		return appendUint32(dst, math.Float32bits(float32(v.Float()))), nil
+	} else if fv, ok := jsonNumberToFloat(v); ok {
+		return serFloat(dst, fv)
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "float"}
 }
@@ -213,6 +239,8 @@ func serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.CanFloat() {
 		return appendUint64(dst, math.Float64bits(v.Float())), nil
+	} else if fv, ok := jsonNumberToFloat(v); ok {
+		return serDouble(dst, fv)
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
 }
@@ -855,6 +883,35 @@ type Duration struct {
 	Milliseconds uint32
 }
 
+// tryParseTimeString attempts to parse a string value as RFC 3339.
+func tryParseTimeString(v reflect.Value) (time.Time, bool) {
+	if v.Kind() != reflect.String {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, v.String())
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// tryParseDateString attempts to parse a string value as either RFC 3339 or
+// ISO 8601 date-only ("2006-01-02").
+func tryParseDateString(v reflect.Value) (time.Time, bool) {
+	if v.Kind() != reflect.String {
+		return time.Time{}, false
+	}
+	s := v.String()
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		t, err = time.Parse(time.DateOnly, s)
+	}
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 func serTimestampMillis(dst []byte, v reflect.Value) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
@@ -862,6 +919,9 @@ func serTimestampMillis(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
+		return appendVarlong(dst, t.UnixMilli()), nil
+	}
+	if t, ok := tryParseTimeString(v); ok {
 		return appendVarlong(dst, t.UnixMilli()), nil
 	}
 	return serLong(dst, v)
@@ -876,6 +936,9 @@ func serTimestampMicros(dst []byte, v reflect.Value) ([]byte, error) {
 		t := v.Interface().(time.Time)
 		return appendVarlong(dst, t.UnixMicro()), nil
 	}
+	if t, ok := tryParseTimeString(v); ok {
+		return appendVarlong(dst, t.UnixMicro()), nil
+	}
 	return serLong(dst, v)
 }
 
@@ -886,6 +949,9 @@ func serTimestampNanos(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
+		return appendVarlong(dst, timeToUnixNanos(t)), nil
+	}
+	if t, ok := tryParseTimeString(v); ok {
 		return appendVarlong(dst, timeToUnixNanos(t)), nil
 	}
 	return serLong(dst, v)
@@ -915,6 +981,9 @@ func serDate(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
+		return appendVarint(dst, int32(floorDiv(t.Unix(), 86400))), nil
+	}
+	if t, ok := tryParseDateString(v); ok {
 		return appendVarint(dst, int32(floorDiv(t.Unix(), 86400))), nil
 	}
 	return serInt(dst, v)
@@ -963,6 +1032,25 @@ func serDuration(dst []byte, v reflect.Value) ([]byte, error) {
 	return (&serSize{12}).ser(dst, v)
 }
 
+// tryCoerceToRat attempts to convert a value to *big.Rat for decimal logical
+// types. Accepts float64, json.Number, and numeric strings (e.g. "3.14").
+func tryCoerceToRat(v reflect.Value) (*big.Rat, bool) {
+	if v.CanFloat() {
+		return new(big.Rat).SetFloat64(v.Float()), true
+	}
+	if v.Type() == jsonNumberType {
+		if r, ok := new(big.Rat).SetString(v.Interface().(json.Number).String()); ok {
+			return r, true
+		}
+	}
+	if v.Kind() == reflect.String {
+		if r, ok := new(big.Rat).SetString(v.String()); ok {
+			return r, true
+		}
+	}
+	return nil, false
+}
+
 type serBytesDecimal struct {
 	scale int
 }
@@ -978,12 +1066,33 @@ func (s *serBytesDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = appendVarlong(dst, int64(len(b)))
 		return append(dst, b...), nil
 	}
+	if r, ok := tryCoerceToRat(v); ok {
+		b := ratToBytes(r, s.scale)
+		dst = appendVarlong(dst, int64(len(b)))
+		return append(dst, b...), nil
+	}
 	return serBytes(dst, v)
 }
 
 type serFixedDecimal struct {
 	size  int
 	scale int
+}
+
+func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
+	b := ratToBytes(r, s.scale)
+	if len(b) > s.size {
+		return nil, &SemanticError{GoType: bigRatType, AvroType: "fixed", Err: fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), s.size)}
+	}
+	// Pad to fixed size with sign extension.
+	pad := byte(0)
+	if len(b) > 0 && b[0]&0x80 != 0 {
+		pad = 0xff
+	}
+	for i := len(b); i < s.size; i++ {
+		dst = append(dst, pad)
+	}
+	return append(dst, b...), nil
 }
 
 func (s *serFixedDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
@@ -993,20 +1102,10 @@ func (s *serFixedDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.Type() == bigRatType {
 		tmp := v.Interface().(big.Rat)
-		r := &tmp
-		b := ratToBytes(r, s.scale)
-		if len(b) > s.size {
-			return nil, &SemanticError{GoType: bigRatType, AvroType: "fixed", Err: fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), s.size)}
-		}
-		// Pad to fixed size with sign extension.
-		pad := byte(0)
-		if len(b) > 0 && b[0]&0x80 != 0 {
-			pad = 0xff
-		}
-		for i := len(b); i < s.size; i++ {
-			dst = append(dst, pad)
-		}
-		return append(dst, b...), nil
+		return s.serRat(dst, &tmp)
+	}
+	if r, ok := tryCoerceToRat(v); ok {
+		return s.serRat(dst, r)
 	}
 	return (&serSize{s.size}).ser(dst, v)
 }

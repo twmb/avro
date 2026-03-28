@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"reflect"
 	"strings"
 	"testing"
@@ -708,6 +709,330 @@ func TestSerFixedFromSlice(t *testing.T) {
 	bad := []byte{1, 2, 3}
 	if _, err := s.AppendEncode(nil, &bad); err == nil {
 		t.Fatal("expected error for wrong-size slice")
+	}
+}
+
+func TestSerTimestampFromString(t *testing.T) {
+	ts := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
+
+	for _, tt := range []struct {
+		name   string
+		schema string
+		input  string
+		decode func(int64) time.Time
+	}{
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, ts.Format(time.RFC3339Nano), func(v int64) time.Time { return time.UnixMilli(v) }},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, ts.Format(time.RFC3339Nano), func(v int64) time.Time { return time.UnixMicro(v) }},
+		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, ts.Format(time.RFC3339Nano), func(v int64) time.Time { return time.Unix(v/1e9, v%1e9) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := s.AppendEncode(nil, &tt.input)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var decoded int64
+			if _, err := s.Decode(dst, &decoded); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			got := tt.decode(decoded)
+			if !got.Equal(ts) {
+				t.Errorf("got %v, want %v", got, ts)
+			}
+		})
+	}
+}
+
+func TestSerDateFromString(t *testing.T) {
+	s, err := Parse(`{"type":"int","logicalType":"date"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 3, 19, 0, 0, 0, 0, time.UTC)
+
+	for _, tt := range []struct {
+		name  string
+		input string
+	}{
+		{"RFC3339", "2026-03-19T00:00:00Z"},
+		{"date only", "2026-03-19"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dst, err := s.AppendEncode(nil, &tt.input)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var days int32
+			if _, err := s.Decode(dst, &days); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			got := time.Unix(int64(days)*86400, 0).UTC()
+			if !got.Equal(want) {
+				t.Errorf("got %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestSerTimestampStringInRecord(t *testing.T) {
+	// End-to-end: json.Unmarshal → Encode → Decode, simulating a CDC pipeline.
+	schema := `{
+		"type":"record","name":"event",
+		"fields":[
+			{"name":"id","type":"string"},
+			{"name":"created_at","type":{"type":"long","logicalType":"timestamp-millis"}}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := `{"id":"abc","created_at":"2026-03-19T10:00:00Z"}`
+	var native any
+	if err := json.Unmarshal([]byte(input), &native); err != nil {
+		t.Fatal(err)
+	}
+	binary, err := s.Encode(native)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var decoded any
+	if _, err := s.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := decoded.(map[string]any)
+	if m["id"] != "abc" {
+		t.Errorf("id: got %v", m["id"])
+	}
+	// Decoding into any produces the underlying long (int64), not time.Time.
+	gotMillis := m["created_at"].(int64)
+	want := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
+	if gotMillis != want.UnixMilli() {
+		t.Errorf("created_at: got %d, want %d", gotMillis, want.UnixMilli())
+	}
+}
+
+func TestSerNestedCDCPipeline(t *testing.T) {
+	schema := `{
+		"type":"record","name":"user_event",
+		"fields":[
+			{"name":"user","type":"string"},
+			{"name":"address","type":{
+				"type":"record","name":"address",
+				"fields":[
+					{"name":"city","type":"string"},
+					{"name":"zip","type":"int"},
+					{"name":"since","type":{"type":"long","logicalType":"timestamp-millis"}}
+				]
+			}},
+			{"name":"tags","type":{"type":"array","items":"string"},"default":[]}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate CDC: nested record with timestamp string, outer field uses default.
+	input := `{
+		"user":"alice",
+		"address":{
+			"city":"Seattle",
+			"zip":98101,
+			"since":"2026-03-19T10:00:00Z"
+		}
+	}`
+	var native any
+	if err := json.Unmarshal([]byte(input), &native); err != nil {
+		t.Fatal(err)
+	}
+	binary, err := s.Encode(native)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var decoded any
+	if _, err := s.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := decoded.(map[string]any)
+
+	if m["user"] != "alice" {
+		t.Errorf("user: got %v", m["user"])
+	}
+
+	// Nested record: timestamp string should have been parsed.
+	addr := m["address"].(map[string]any)
+	if addr["city"] != "Seattle" {
+		t.Errorf("city: got %v", addr["city"])
+	}
+	if addr["zip"] != int32(98101) {
+		t.Errorf("zip: got %v (%T)", addr["zip"], addr["zip"])
+	}
+	want := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
+	if addr["since"] != want.UnixMilli() {
+		t.Errorf("since: got %v, want %d", addr["since"], want.UnixMilli())
+	}
+
+	// "tags" was missing from input — should use default [].
+	tags := m["tags"].([]any)
+	if len(tags) != 0 {
+		t.Errorf("tags: got %v, want []", tags)
+	}
+}
+
+
+func TestSerNullableRecordUnion(t *testing.T) {
+	schema := `{
+		"type":"record","name":"event",
+		"fields":[
+			{"name":"id","type":"string"},
+			{"name":"metadata","type":["null",{
+				"type":"record","name":"meta",
+				"fields":[
+					{"name":"source","type":"string"},
+					{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}
+				]
+			}]}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-null branch: plain map (not pre-wrapped).
+	input := `{"id":"abc","metadata":{"source":"cdc","ts":"2026-03-19T10:00:00Z"}}`
+	var native any
+	if err := json.Unmarshal([]byte(input), &native); err != nil {
+		t.Fatal(err)
+	}
+	binary, err := s.Encode(native)
+	if err != nil {
+		t.Fatalf("encode non-null: %v", err)
+	}
+	var decoded any
+	if _, err := s.Decode(binary, &decoded); err != nil {
+		t.Fatalf("decode non-null: %v", err)
+	}
+	m := decoded.(map[string]any)
+	meta := m["metadata"].(map[string]any)
+	if meta["source"] != "cdc" {
+		t.Errorf("source: got %v", meta["source"])
+	}
+	want := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
+	if meta["ts"] != want.UnixMilli() {
+		t.Errorf("ts: got %v, want %d", meta["ts"], want.UnixMilli())
+	}
+
+	// Null branch.
+	inputNull := `{"id":"abc","metadata":null}`
+	var nativeNull any
+	if err := json.Unmarshal([]byte(inputNull), &nativeNull); err != nil {
+		t.Fatal(err)
+	}
+	binaryNull, err := s.Encode(nativeNull)
+	if err != nil {
+		t.Fatalf("encode null: %v", err)
+	}
+	var decodedNull any
+	if _, err := s.Decode(binaryNull, &decodedNull); err != nil {
+		t.Fatalf("decode null: %v", err)
+	}
+	mNull := decodedNull.(map[string]any)
+	if mNull["metadata"] != nil {
+		t.Errorf("metadata: got %v, want nil", mNull["metadata"])
+	}
+}
+
+func TestSerJSONNumber(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		schema string
+		input  json.Number
+		expect any
+	}{
+		{"int", `"int"`, json.Number("42"), int32(42)},
+		{"long", `"long"`, json.Number("100000"), int64(100000)},
+		{"float", `"float"`, json.Number("1.5"), float32(1.5)},
+		{"double", `"double"`, json.Number("3.14"), 3.14},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, json.Number("1742385600000"), int64(1742385600000)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := s.AppendEncode(nil, &tt.input)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var decoded any
+			if _, err := s.Decode(dst, &decoded); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !reflect.DeepEqual(decoded, tt.expect) {
+				t.Errorf("got %v (%T), want %v (%T)", decoded, decoded, tt.expect, tt.expect)
+			}
+		})
+	}
+}
+
+func TestSerDecimalCoercion(t *testing.T) {
+	bytesSchema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	fixedSchema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":10,"scale":2}`
+
+	for _, schema := range []string{bytesSchema, fixedSchema} {
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Reference: encode *big.Rat directly.
+		want := new(big.Rat).SetFrac64(314, 100) // 3.14
+		refDst, err := s.AppendEncode(nil, want)
+		if err != nil {
+			t.Fatalf("encode *big.Rat: %v", err)
+		}
+
+		for _, tt := range []struct {
+			name  string
+			input any
+		}{
+			{"float64", float64(3.14)},
+			{"json.Number", json.Number("3.14")},
+			{"string", "3.14"},
+		} {
+			t.Run(schema[:5]+"/"+tt.name, func(t *testing.T) {
+				dst, err := s.AppendEncode(nil, &tt.input)
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				// Decode both and compare as *big.Rat.
+				var got, ref big.Rat
+				if _, err := s.Decode(dst, &got); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if _, err := s.Decode(refDst, &ref); err != nil {
+					t.Fatalf("decode ref: %v", err)
+				}
+				// float64(3.14) has precision loss, so compare the
+				// decoded values rather than exact byte equality.
+				if tt.name == "float64" {
+					// Just verify it decodes without error and is close.
+					f, _ := got.Float64()
+					if f < 3.13 || f > 3.15 {
+						t.Errorf("got %v, want ~3.14", f)
+					}
+				} else {
+					if got.Cmp(&ref) != 0 {
+						t.Errorf("got %s, want %s", got.RatString(), ref.RatString())
+					}
+				}
+			})
+		}
 	}
 }
 

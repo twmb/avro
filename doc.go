@@ -52,6 +52,21 @@
 // for defaulted fields are simply absent. Filling them from schema defaults at
 // encode time is consistent with hamba/avro and linkedin/goavro.
 //
+// Timestamp and date logical types also accept RFC 3339 strings when
+// encoding:
+//
+//	schema := avro.MustParse(`{
+//	    "type": "record", "name": "Event",
+//	    "fields": [
+//	        {"name": "id",         "type": "string"},
+//	        {"name": "created_at", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+//	    ]
+//	}`)
+//
+//	var record any
+//	json.Unmarshal([]byte(`{"id":"abc","created_at":"2026-03-19T10:00:00Z"}`), &record)
+//	data, err := schema.Encode(record) // string parsed as RFC 3339
+//
 // # Schema evolution
 //
 // Avro data is always written with a specific schema — the "writer schema."
