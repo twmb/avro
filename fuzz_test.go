@@ -2,6 +2,7 @@ package avro
 
 import (
 	"bytes"
+	"encoding/json"
 	"math"
 	"reflect"
 	"testing"
@@ -165,7 +166,7 @@ func FuzzParse(f *testing.F) {
 	f.Add(`{"type":"record","name":"R","fields":[{"name":"a","type":"nonexistent"}]}`)
 
 	f.Fuzz(func(t *testing.T, schema string) {
-		Parse(schema) //nolint:errcheck
+		Parse(schema)
 	})
 }
 
@@ -284,7 +285,7 @@ func FuzzDecode(f *testing.F) {
 	f.Fuzz(func(t *testing.T, idx uint8, data []byte) {
 		s := fuzzSchemas[int(idx)%len(fuzzSchemas)]
 		var v any
-		s.Decode(data, &v) //nolint:errcheck
+		s.Decode(data, &v)
 	})
 }
 
@@ -434,11 +435,82 @@ func FuzzSingleObject(f *testing.F) {
 	f.Add([]byte{})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		SingleObjectFingerprint(data) //nolint:errcheck
+		SingleObjectFingerprint(data)
 		for _, s := range fuzzSchemas {
 			var v any
-			s.DecodeSingleObject(data, &v) //nolint:errcheck
+			s.DecodeSingleObject(data, &v)
 		}
+	})
+}
+
+// FuzzDecodeTyped decodes random bytes into typed Go targets, exercising
+// the unsafe fast path and fixed-size array decoding.
+func FuzzDecodeTyped(f *testing.F) {
+	type Record struct {
+		A int32   `avro:"a"`
+		B string  `avro:"b"`
+		C bool    `avro:"c"`
+		D float64 `avro:"d"`
+	}
+	recordSchema := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string"},
+		{"name":"c","type":"boolean"},
+		{"name":"d","type":"double"}
+	]}`)
+
+	arraySchema := MustParse(`{"type":"array","items":"int"}`)
+
+	// Seeds: valid encodings.
+	f.Add(uint8(0), fuzzSeed(recordSchema, &Record{A: 1, B: "x", C: true, D: 3.14}))
+	f.Add(uint8(1), fuzzSeed(arraySchema, []int32{1, 2, 3}))
+	f.Add(uint8(0), []byte{})
+	f.Add(uint8(1), []byte{})
+	f.Add(uint8(0), bytes.Repeat([]byte{0xFF}, 32))
+	f.Add(uint8(1), bytes.Repeat([]byte{0xFF}, 32))
+
+	f.Fuzz(func(t *testing.T, mode uint8, data []byte) {
+		switch mode % 3 {
+		case 0:
+			var r Record
+			recordSchema.Decode(data, &r)
+		case 1:
+			var sl []int32
+			arraySchema.Decode(data, &sl)
+		case 2:
+			var arr [4]int32
+			arraySchema.Decode(data, &arr)
+		}
+	})
+}
+
+// FuzzEncodeMap exercises encoding from map[string]any with defaults,
+// timestamp strings, json.Number, and decimal coercion.
+func FuzzEncodeMap(f *testing.F) {
+	schema := MustParse(`{
+		"type":"record","name":"R",
+		"fields":[
+			{"name":"a","type":"int","default":0},
+			{"name":"b","type":"string","default":""},
+			{"name":"c","type":{"type":"long","logicalType":"timestamp-millis"},"default":0},
+			{"name":"d","type":"double","default":0}
+		]
+	}`)
+
+	f.Add(`{}`)
+	f.Add(`{"a":42}`)
+	f.Add(`{"a":1,"b":"hello","c":"2026-03-19T10:00:00Z","d":3.14}`)
+	f.Add(`{"a":1,"b":"hello","c":1742385600000,"d":3.14}`)
+	f.Add(`{"a":1,"b":"hello","c":"not-a-timestamp","d":3.14}`)
+	f.Add(`{"extra":"ignored","a":1,"b":"x","c":0,"d":0}`)
+	f.Add(`not json`)
+
+	f.Fuzz(func(t *testing.T, input string) {
+		var m any
+		if err := json.Unmarshal([]byte(input), &m); err != nil {
+			return
+		}
+		schema.Encode(m)
 	})
 }
 
@@ -534,6 +606,6 @@ func FuzzResolve(f *testing.F) {
 			return
 		}
 		var v any
-		resolved.Decode(data, &v) //nolint:errcheck
+		resolved.Decode(data, &v)
 	})
 }

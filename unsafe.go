@@ -1405,6 +1405,9 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type) udese
 					return nil, err
 				}
 			}
+			if count > int64(len(src)) {
+				return nil, fmt.Errorf("array block count %d exceeds remaining buffer length %d", count, len(src))
+			}
 			n := int(count)
 			start := v.Len()
 			newLen := start + n
@@ -1480,6 +1483,9 @@ func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type) ude
 				if err != nil {
 					return nil, err
 				}
+			}
+			if count > int64(len(src)) {
+				return nil, fmt.Errorf("array block count %d exceeds remaining buffer length %d", count, len(src))
 			}
 			n := int(count)
 			start := v.Len()

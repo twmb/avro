@@ -440,8 +440,14 @@ type deserArray struct {
 func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
-	if !iface && v.Kind() != reflect.Slice {
+	fixedArray := v.Kind() == reflect.Array
+	if !iface && !fixedArray && v.Kind() != reflect.Slice {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "array"}
+	}
+	// Fixed-size Go arrays: decode directly into array elements and
+	// verify the Avro data has exactly the right number of elements.
+	if fixedArray {
+		return s.deserFixedArray(src, v, sl)
 	}
 	// For interface targets, build a []any.
 	var sliceVal reflect.Value
@@ -517,6 +523,48 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			if err != nil {
 				return nil, err
 			}
+		}
+	}
+}
+
+// deserFixedArray decodes an Avro array into a fixed-size Go array.
+// Returns an error if the Avro data does not contain exactly len(v) elements.
+func (s *deserArray) deserFixedArray(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	arrLen := v.Len()
+	idx := 0
+	var err error
+	for {
+		var count int64
+		count, src, err = readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		if count == 0 {
+			if idx != arrLen {
+				return nil, &SemanticError{GoType: v.Type(), AvroType: "array", Err: fmt.Errorf("expected %d elements, got %d", arrLen, idx)}
+			}
+			return src, nil
+		}
+		if count < 0 {
+			count = -count
+			if count < 0 {
+				return nil, errors.New("invalid array block count")
+			}
+			_, src, err = readVarlong(src)
+			if err != nil {
+				return nil, err
+			}
+		}
+		n := int(count)
+		if idx+n > arrLen {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "array", Err: fmt.Errorf("expected %d elements, got more", arrLen)}
+		}
+		for range n {
+			src, err = s.deserItem(src, v.Index(idx), sl)
+			if err != nil {
+				return nil, err
+			}
+			idx++
 		}
 	}
 }

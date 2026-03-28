@@ -884,7 +884,6 @@ func TestSerNestedCDCPipeline(t *testing.T) {
 	}
 }
 
-
 func TestSerNullableRecordUnion(t *testing.T) {
 	schema := `{
 		"type":"record","name":"event",
@@ -1073,6 +1072,23 @@ func TestSerDecimalCoercion(t *testing.T) {
 				}
 			})
 		}
+	}
+
+	// Invalid json.Number should error, not panic.
+	t.Run("invalid", func(t *testing.T) {
+		s, _ := Parse(`"int"`)
+		bad := json.Number("not_a_number")
+		if _, err := s.AppendEncode(nil, &bad); err == nil {
+			t.Fatal("expected error for invalid json.Number")
+		}
+	})
+}
+
+func TestSerDateBadString(t *testing.T) {
+	s, _ := Parse(`{"type":"int","logicalType":"date"}`)
+	bad := "not-a-date"
+	if _, err := s.AppendEncode(nil, &bad); err == nil {
+		t.Fatal("expected error for non-date string")
 	}
 }
 

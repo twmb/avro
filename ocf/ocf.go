@@ -174,7 +174,6 @@ func WithSyncMarker(sync [16]byte) WriterOpt { return optSyncMarker{sync} }
 // a custom schema string.
 func WithSchema(schema string) WriterOpt { return optSchema{schema} }
 
-
 // WithReaderSchema provides a reader schema for schema evolution. If set, the
 // file's writer schema is resolved against the reader schema using
 // [avro.Resolve], and all decoded values use the reader schema's format.
@@ -678,8 +677,8 @@ func (nullCodec) Close() error                          { return nil }
 
 type deflateCodec struct{ level int }
 
-func (deflateCodec) Name() string  { return "deflate" }
-func (deflateCodec) Close() error  { return nil }
+func (deflateCodec) Name() string { return "deflate" }
+func (deflateCodec) Close() error { return nil }
 
 func (c deflateCodec) Compress(src []byte) ([]byte, error) {
 	var buf bytes.Buffer

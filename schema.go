@@ -825,7 +825,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 					var dv any
 					// json.Unmarshal cannot fail: of.Default is a json.RawMessage
 					// preserved from the initial schema parse, so it is valid JSON.
-					json.Unmarshal(of.Default, &dv) //nolint:errcheck
+					json.Unmarshal(of.Default, &dv)
 					fix.defaultVal = dv
 					fix.hasDefault = true
 				}
@@ -835,7 +835,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				var defaultVal any
 				// json.Unmarshal cannot fail: of.Default is a json.RawMessage
 				// preserved from the initial schema parse, so it is valid JSON.
-				json.Unmarshal(of.Default, &defaultVal) //nolint:errcheck
+				json.Unmarshal(of.Default, &defaultVal)
 				// Skip default validation for forward references since we
 				// don't know the type yet.
 				if !isFwdRef {
@@ -900,7 +900,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		if len(origEnumDefault) > 0 {
 			var defStr string
-			json.Unmarshal(origEnumDefault, &defStr) //nolint:errcheck
+			json.Unmarshal(origEnumDefault, &defStr)
 			if !seenSymbols[defStr] {
 				return fmt.Errorf("enum default %q is not a member of symbols", defStr)
 			}
