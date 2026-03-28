@@ -73,9 +73,9 @@ encoding and decoding.
 |-----------|----------|
 | null      | `any` (always nil) |
 | boolean   | `bool`, `any` |
-| int, long | `int`, `int8`, `int16`, `int32`, `int64`, `uint`, `uint8`, `uint16`, `uint32`, `uint64`, `any` |
-| float     | `float32`, `float64`, `any` |
-| double    | `float64`, `float32`, `any` |
+| int, long | `int`, `int8`–`int64`, `uint`–`uint64`, `float64`, `json.Number`, `any` |
+| float     | `float32`, `float64`, `json.Number`, `any` |
+| double    | `float64`, `float32`, `json.Number`, `any` |
 | string    | `string`, `[]byte`, `any`; also `encoding.TextUnmarshaler` |
 | bytes     | `[]byte`, `string`, `any` |
 | enum      | `string`, any integer type (ordinal), `any` |
@@ -86,10 +86,12 @@ encoding and decoding.
 | record    | struct (matched by field name or `avro` tag), `map[string]any`, `any` |
 
 When decoding into `any`, values use their natural Go types: `nil`, `bool`,
-`int32`, `int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`, `map[string]any`.
+`int32`, `int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`,
+`map[string]any`.
 
 Encoding also accepts `fmt.Stringer` and `encoding.TextMarshaler` for string
-schema types.
+types, and `json.Number` for any numeric type (supporting
+`json.Decoder.UseNumber()` pipelines).
 
 ## Struct Tags
 
@@ -148,20 +150,25 @@ over an untagged one.
 Logical types are decoded into natural Go types when available, and fall back
 to the underlying Avro type otherwise.
 
-| Logical Type | Avro Type | Go Type |
-|---|---|---|
-| `date` | int | `time.Time` or int types |
-| `time-millis` | int | `time.Duration` or int types |
-| `time-micros` | long | `time.Duration` or int types |
-| `timestamp-millis` | long | `time.Time` or int types |
-| `timestamp-micros` | long | `time.Time` or int types |
-| `timestamp-nanos` | long | `time.Time` or int types |
-| `local-timestamp-millis` | long | `time.Time` or int types |
-| `local-timestamp-micros` | long | `time.Time` or int types |
-| `local-timestamp-nanos` | long | `time.Time` or int types |
-| `uuid` | string or fixed(16) | `[16]byte` (RFC 4122 hex-dash ↔ binary) or `string` |
-| `decimal` | bytes or fixed | underlying bytes/fixed |
-| `duration` | fixed(12) | underlying fixed |
+| Logical Type | Avro Type | Encode | Decode |
+|---|---|---|---|
+| `date` | int | `time.Time`, RFC 3339 or `YYYY-MM-DD` string, or int | `time.Time` or int |
+| `time-millis` | int | `time.Duration` or int | `time.Duration` or int |
+| `time-micros` | long | `time.Duration` or int | `time.Duration` or int |
+| `timestamp-millis` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
+| `timestamp-micros` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
+| `timestamp-nanos` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
+| `local-timestamp-millis` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
+| `local-timestamp-micros` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
+| `local-timestamp-nanos` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
+| `uuid` | string or fixed(16) | `[16]byte`, `string` | `[16]byte` (RFC 4122 hex-dash ↔ binary) or `string` |
+| `decimal` | bytes or fixed | `*big.Rat`, `float64`, numeric `string`, `json.Number`, or underlying type | `*big.Rat` or underlying type |
+| `duration` | fixed(12) | `avro.Duration` or underlying type | `avro.Duration` or underlying type |
+
+When encoding, timestamp and date fields accept RFC 3339 strings, and decimal
+fields accept `float64` and numeric strings (e.g. `"3.14"`). Values that
+don't match the expected format fall through to the underlying type's encoder,
+which will return an error.
 
 Unknown logical types are silently ignored per the Avro spec, and the
 underlying type is used as-is.
