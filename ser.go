@@ -495,10 +495,13 @@ func (s *serArray) serString(dst []byte, v reflect.Value) ([]byte, error) {
 		if elem.Kind() == reflect.Interface {
 			elem = elem.Elem()
 		}
-		if elem.Kind() != reflect.String {
+		if elem.Kind() == reflect.String {
+			dst = doSerString(dst, elem.String())
+		} else if elem.Kind() == reflect.Slice && elem.Type().Elem().Kind() == reflect.Uint8 {
+			dst = doSerString(dst, string(elem.Bytes()))
+		} else {
 			return nil, &SemanticError{GoType: elem.Type(), AvroType: "string"}
 		}
-		dst = doSerString(dst, elem.String())
 	}
 	return append(dst, 0), nil
 }
@@ -557,6 +560,13 @@ func (s *serArray) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %v overflows int32", f)}
 			}
 			dst = appendVarint(dst, int32(n))
+		} else if fv, ok := jsonNumberToFloat(elem); ok {
+			f := fv.Float()
+			n := math.Trunc(f)
+			if f != n || n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %v invalid for int32", f)}
+			}
+			dst = appendVarint(dst, int32(n))
 		} else {
 			return nil, &SemanticError{GoType: elem.Type(), AvroType: "int"}
 		}
@@ -592,6 +602,8 @@ func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 			}
 			dst = appendVarlong(dst, int64(n))
+		} else if fv, ok := jsonNumberToFloat(elem); ok {
+			dst = appendVarlong(dst, int64(fv.Float()))
 		} else {
 			return nil, &SemanticError{GoType: elem.Type(), AvroType: "long"}
 		}
@@ -610,7 +622,11 @@ func (s *serArray) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 			elem = elem.Elem()
 		}
 		if !elem.CanFloat() {
-			return nil, &SemanticError{GoType: elem.Type(), AvroType: "float"}
+			if fv, ok := jsonNumberToFloat(elem); ok {
+				elem = fv
+			} else {
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "float"}
+			}
 		}
 		dst = appendUint32(dst, math.Float32bits(float32(elem.Float())))
 	}
@@ -628,7 +644,11 @@ func (s *serArray) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 			elem = elem.Elem()
 		}
 		if !elem.CanFloat() {
-			return nil, &SemanticError{GoType: elem.Type(), AvroType: "double"}
+			if fv, ok := jsonNumberToFloat(elem); ok {
+				elem = fv
+			} else {
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "double"}
+			}
 		}
 		dst = appendUint64(dst, math.Float64bits(elem.Float()))
 	}
@@ -688,10 +708,13 @@ func (s *serMap) serString(dst []byte, v reflect.Value) ([]byte, error) {
 		if val.Kind() == reflect.Interface {
 			val = val.Elem()
 		}
-		if val.Kind() != reflect.String {
+		if val.Kind() == reflect.String {
+			dst = doSerString(dst, val.String())
+		} else if val.Kind() == reflect.Slice && val.Type().Elem().Kind() == reflect.Uint8 {
+			dst = doSerString(dst, string(val.Bytes()))
+		} else {
 			return nil, &SemanticError{GoType: val.Type(), AvroType: "string"}
 		}
-		dst = doSerString(dst, val.String())
 	}
 	return append(dst, 0), nil
 }
@@ -754,6 +777,14 @@ func (s *serMap) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %v overflows int32", f)}
 			}
 			dst = appendVarint(dst, int32(n))
+		} else if fv, ok := jsonNumberToFloat(val); ok {
+			val = fv
+			f := val.Float()
+			n := math.Trunc(f)
+			if f != n || n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %v invalid for int32", f)}
+			}
+			dst = appendVarint(dst, int32(n))
 		} else {
 			return nil, &SemanticError{GoType: val.Type(), AvroType: "int"}
 		}
@@ -791,6 +822,8 @@ func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 			}
 			dst = appendVarlong(dst, int64(n))
+		} else if fv, ok := jsonNumberToFloat(val); ok {
+			dst = appendVarlong(dst, int64(fv.Float()))
 		} else {
 			return nil, &SemanticError{GoType: val.Type(), AvroType: "long"}
 		}
@@ -811,7 +844,11 @@ func (s *serMap) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 			val = val.Elem()
 		}
 		if !val.CanFloat() {
-			return nil, &SemanticError{GoType: val.Type(), AvroType: "float"}
+			if fv, ok := jsonNumberToFloat(val); ok {
+				val = fv
+			} else {
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "float"}
+			}
 		}
 		dst = appendUint32(dst, math.Float32bits(float32(val.Float())))
 	}
@@ -831,7 +868,11 @@ func (s *serMap) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 			val = val.Elem()
 		}
 		if !val.CanFloat() {
-			return nil, &SemanticError{GoType: val.Type(), AvroType: "double"}
+			if fv, ok := jsonNumberToFloat(val); ok {
+				val = fv
+			} else {
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "double"}
+			}
 		}
 		dst = appendUint64(dst, math.Float64bits(val.Float()))
 	}

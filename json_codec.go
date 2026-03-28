@@ -33,11 +33,6 @@ func (s *Schema) DecodeJSON(src []byte, v any) error {
 	if err != nil {
 		return err
 	}
-	// Fast path: *any target gets the coerced value directly.
-	if p, ok := v.(*any); ok {
-		*p = native
-		return nil
-	}
 	binary, err := s.Encode(native)
 	if err != nil {
 		return err
@@ -98,7 +93,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 				return strconv.AppendInt(buf, t.UnixMicro(), 10), nil
 			case "timestamp-nanos", "local-timestamp-nanos":
 				return strconv.AppendInt(buf, timeToUnixNanos(t), 10), nil
-			default:
+			default: // unreachable: all timestamp logical types are matched above
 				return strconv.AppendInt(buf, t.UnixMilli(), 10), nil
 			}
 		}
@@ -268,6 +263,8 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode) ([]byte
 // appendAvroJSONUnion handles union encoding.
 func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode) ([]byte, error) {
 	if !v.IsValid() || (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil() {
+		// unreachable: appendAvroJSON's deref loop converts nil pointers/interfaces
+		// to invalid values before dispatching here, but kept as a safety net.
 		return append(buf, "null"...), nil
 	}
 	for _, branch := range node.branches {
@@ -326,13 +323,13 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 			}
 			return int64(f), nil
 		}
-		return v, nil
+		return v, nil // unreachable: json.Unmarshal always produces float64 for numbers
 
 	case "float":
 		if f, ok := v.(float64); ok {
 			return float32(f), nil
 		}
-		return v, nil
+		return v, nil // unreachable: json.Unmarshal always produces float64 for numbers
 
 	case "double":
 		return v, nil
@@ -401,8 +398,9 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 		return result, nil
 
 	case "union":
-		// Null.
 		if v == nil {
+			// unreachable: the top-level nil check in fromAvroJSON returns
+			// before reaching this switch case, but kept as a safety net.
 			return nil, nil
 		}
 		// Avro JSON unions are {"type_name": value}.
@@ -420,7 +418,7 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 			}
 			return fromAvroJSON(inner, branch)
 		}
-		return nil, nil // unreachable
+		return nil, nil // unreachable: for loop always has at least one iteration since unions must have branches
 
 	default:
 		return nil, fmt.Errorf("avro json: unsupported schema kind %q", node.kind)

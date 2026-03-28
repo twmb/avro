@@ -851,7 +851,6 @@ func TestDecodeTypeMismatch(t *testing.T) {
 		{"int into bool", `"int"`, []byte{0x36}, new(false)},
 		{"string into int", `"string"`, []byte{0x06, 0x66, 0x6f, 0x6f}, new(int32(0))},
 		{"int into float", `"int"`, []byte{0x36}, new(float32(0))},
-		{"bytes into string", `"bytes"`, []byte{0x04, 0x01, 0x02}, new("")},
 		{"fixed into int array", `{"type":"fixed","name":"f","size":6}`, []byte{1, 2, 3, 4, 5, 6}, new([6]int{})},
 		{"array into string", `{"type":"array","items":"int"}`, []byte{0x00}, new("")},
 		{"map into string", `{"type":"map","values":"int"}`, []byte{0x00}, new("")},

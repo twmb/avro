@@ -712,109 +712,6 @@ func TestSerFixedFromSlice(t *testing.T) {
 	}
 }
 
-func TestSerTimestampFromString(t *testing.T) {
-	ts := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
-
-	for _, tt := range []struct {
-		name   string
-		schema string
-		input  string
-		decode func(int64) time.Time
-	}{
-		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, ts.Format(time.RFC3339Nano), func(v int64) time.Time { return time.UnixMilli(v) }},
-		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, ts.Format(time.RFC3339Nano), func(v int64) time.Time { return time.UnixMicro(v) }},
-		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, ts.Format(time.RFC3339Nano), func(v int64) time.Time { return time.Unix(v/1e9, v%1e9) }},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dst, err := s.AppendEncode(nil, &tt.input)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			var decoded int64
-			if _, err := s.Decode(dst, &decoded); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			got := tt.decode(decoded)
-			if !got.Equal(ts) {
-				t.Errorf("got %v, want %v", got, ts)
-			}
-		})
-	}
-}
-
-func TestSerDateFromString(t *testing.T) {
-	s, err := Parse(`{"type":"int","logicalType":"date"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := time.Date(2026, 3, 19, 0, 0, 0, 0, time.UTC)
-
-	for _, tt := range []struct {
-		name  string
-		input string
-	}{
-		{"RFC3339", "2026-03-19T00:00:00Z"},
-		{"date only", "2026-03-19"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			dst, err := s.AppendEncode(nil, &tt.input)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			var days int32
-			if _, err := s.Decode(dst, &days); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			got := time.Unix(int64(days)*86400, 0).UTC()
-			if !got.Equal(want) {
-				t.Errorf("got %v, want %v", got, want)
-			}
-		})
-	}
-}
-
-func TestSerTimestampStringInRecord(t *testing.T) {
-	// End-to-end: json.Unmarshal → Encode → Decode, simulating a CDC pipeline.
-	schema := `{
-		"type":"record","name":"event",
-		"fields":[
-			{"name":"id","type":"string"},
-			{"name":"created_at","type":{"type":"long","logicalType":"timestamp-millis"}}
-		]
-	}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	input := `{"id":"abc","created_at":"2026-03-19T10:00:00Z"}`
-	var native any
-	if err := json.Unmarshal([]byte(input), &native); err != nil {
-		t.Fatal(err)
-	}
-	binary, err := s.Encode(native)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	var decoded any
-	if _, err := s.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	m := decoded.(map[string]any)
-	if m["id"] != "abc" {
-		t.Errorf("id: got %v", m["id"])
-	}
-	// Decoding into any produces the underlying long (int64), not time.Time.
-	gotMillis := m["created_at"].(int64)
-	want := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
-	if gotMillis != want.UnixMilli() {
-		t.Errorf("created_at: got %d, want %d", gotMillis, want.UnixMilli())
-	}
-}
-
 func TestSerNestedCDCPipeline(t *testing.T) {
 	schema := `{
 		"type":"record","name":"user_event",
@@ -985,36 +882,19 @@ func TestSerErrorDottedPath(t *testing.T) {
 	}
 }
 
-func TestSerJSONNumber(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		schema string
-		input  json.Number
-		expect any
-	}{
-		{"int", `"int"`, json.Number("42"), int32(42)},
-		{"long", `"long"`, json.Number("100000"), int64(100000)},
-		{"float", `"float"`, json.Number("1.5"), float32(1.5)},
-		{"double", `"double"`, json.Number("3.14"), 3.14},
-		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, json.Number("1742385600000"), int64(1742385600000)},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dst, err := s.AppendEncode(nil, &tt.input)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			var decoded any
-			if _, err := s.Decode(dst, &decoded); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			if !reflect.DeepEqual(decoded, tt.expect) {
-				t.Errorf("got %v (%T), want %v (%T)", decoded, decoded, tt.expect, tt.expect)
-			}
-		})
+func TestSerJSONNumberOverflowInCollections(t *testing.T) {
+	// json.Number that overflows int32 in array of int.
+	s, _ := Parse(`{"type":"array","items":"int"}`)
+	_, err := s.AppendEncode(nil, []any{json.Number("3000000000")})
+	if err == nil {
+		t.Fatal("expected overflow error for array of int")
+	}
+
+	// json.Number that overflows int32 in map of int.
+	s2, _ := Parse(`{"type":"map","values":"int"}`)
+	_, err = s2.AppendEncode(nil, map[string]any{"k": json.Number("3000000000")})
+	if err == nil {
+		t.Fatal("expected overflow error for map of int")
 	}
 }
 

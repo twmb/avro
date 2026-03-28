@@ -294,6 +294,8 @@ func deserBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: fmt.Errorf("cannot decode %d bytes into array of length %d", n, v.Len())}
 		}
 		reflect.Copy(v, reflect.ValueOf(src[:n]))
+	case reflect.String:
+		v.SetString(string(b))
 	default:
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 	}
@@ -320,6 +322,10 @@ func deserString(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	if v.Kind() == reflect.String {
 		v.SetString(str)
+		return src[n:], nil
+	}
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		v.SetBytes([]byte(str))
 		return src[n:], nil
 	}
 	// Try encoding.TextUnmarshaler.
