@@ -1250,6 +1250,42 @@ func TestDecodeArrayBlockError(t *testing.T) {
 	decodeErr(t, schema, data, new([]int32{}))
 }
 
+func TestDecodeArrayOversizedCountUnsafe(t *testing.T) {
+	// A crafted array block count that exceeds the buffer length.
+	// This tests the unsafe fast path (udArrayDirect and udArrayPtrRecord)
+	// to ensure they don't allocate based on untrusted counts.
+	schema := `{"type":"array","items":"int"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// count=999999 (zigzag-encoded), but only a few bytes of data.
+	var data []byte
+	data = appendVarlong(data, 999999)
+	data = append(data, 0x00, 0x00)
+
+	// Decode into []int32 — triggers the unsafe primitive array path.
+	var sl []int32
+	_, err = s.Decode(data, &sl)
+	if err == nil {
+		t.Fatal("expected error for oversized array count")
+	}
+
+	// Also test with struct containing a slice (triggers unsafe struct fast path).
+	type R struct {
+		A []int32 `avro:"a"`
+	}
+	rs, _ := Parse(`{"type":"record","name":"r","fields":[{"name":"a","type":{"type":"array","items":"int"}}]}`)
+	var rdata []byte
+	rdata = appendVarlong(rdata, 999999)
+	rdata = append(rdata, 0x00, 0x00)
+	var r R
+	_, err = rs.Decode(rdata, &r)
+	if err == nil {
+		t.Fatal("expected error for oversized array count in struct")
+	}
+}
+
 func TestDecodeMapValueShortRead(t *testing.T) {
 	// Map with truncated value data.
 	schema := `{"type":"map","values":"string"}`
@@ -1694,7 +1730,7 @@ func TestTypeFieldMappingSkipEmbeddedDash(t *testing.T) {
 func TestTypeFieldMappingUnexportedNonStruct(t *testing.T) {
 	// Unexported non-struct field should be skipped.
 	type R struct {
-		a int32 //nolint:unused
+		a int32
 		B int32 `avro:"b"`
 	}
 	schema := `{"type":"record","name":"r","fields":[{"name":"b","type":"int"}]}`
@@ -1758,8 +1794,8 @@ func TestTypeFieldMappingUnexportedAnonymousNonStruct(t *testing.T) {
 	// Unexported anonymous non-struct field should be skipped.
 	type myString string
 	type R struct {
-		myString       //nolint:unused
-		B        int32 `avro:"b"`
+		myString
+		B int32 `avro:"b"`
 	}
 	schema := `{"type":"record","name":"r","fields":[{"name":"b","type":"int"}]}`
 	input := R{B: 7}
@@ -1907,6 +1943,63 @@ func TestDecodeArrayExistingCap(t *testing.T) {
 	}
 	if len(got) != 3 || got[0] != 1 || got[2] != 3 {
 		t.Errorf("got %v", got)
+	}
+}
+
+func TestDecodeArrayIntoFixedArray(t *testing.T) {
+	schema := `{"type":"array","items":"int"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := []int32{10, 20, 30}
+	encoded, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [3]int32
+	_, err = s.Decode(encoded, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != [3]int32{10, 20, 30} {
+		t.Errorf("got %v, want [10 20 30]", got)
+	}
+}
+
+func TestDecodeArrayIntoFixedArrayTooFew(t *testing.T) {
+	schema := `{"type":"array","items":"int"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := []int32{10, 20} // 2 elements
+	encoded, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [3]int32 // expects 3
+	_, err = s.Decode(encoded, &got)
+	if err == nil {
+		t.Fatal("expected error for too few elements")
+	}
+}
+
+func TestDecodeArrayIntoFixedArrayTooMany(t *testing.T) {
+	schema := `{"type":"array","items":"int"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := []int32{10, 20, 30, 40} // 4 elements
+	encoded, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [3]int32 // expects 3
+	_, err = s.Decode(encoded, &got)
+	if err == nil {
+		t.Fatal("expected error for too many elements")
 	}
 }
 

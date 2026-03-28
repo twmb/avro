@@ -14,6 +14,7 @@ fingerprinting.
 - [Quick Start](#quick-start)
 - [Type Mapping](#type-mapping)
 - [Struct Tags](#struct-tags)
+- [Schema Inference](#schema-inference)
 - [Logical Types](#logical-types)
 - [Schema Evolution](#schema-evolution)
 - [Object Container Files](#object-container-files)
@@ -144,6 +145,57 @@ type Parent struct {
 When multiple fields at different depths resolve to the same Avro field name,
 the shallowest field wins. Among fields at the same depth, a tagged field wins
 over an untagged one.
+
+## Schema Inference
+
+`SchemaFor` infers an Avro schema from a Go struct type, using the same struct
+tags as encoding/decoding:
+
+```go
+type User struct {
+    Name      string     `avro:"name"`
+    Age       int32      `avro:"age,default=18"`
+    Email     *string    `avro:"email"`
+    CreatedAt time.Time  `avro:"created_at"`
+}
+
+schema := avro.MustSchemaFor[User](avro.WithNamespace("com.example"))
+```
+
+This produces the equivalent of:
+
+```json
+{
+  "type": "record",
+  "name": "User",
+  "namespace": "com.example",
+  "fields": [
+    {"name": "name", "type": "string"},
+    {"name": "age", "type": "int", "default": 18},
+    {"name": "email", "type": ["null", "string"]},
+    {"name": "created_at", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+  ]
+}
+```
+
+Go types map to Avro types automatically: `*T` becomes a `["null", T]` union,
+`time.Time` becomes `timestamp-millis`, and so on (see [Type Mapping](#type-mapping)).
+
+Additional tag options for schema inference:
+
+| Tag | Example | Description |
+|-----|---------|-------------|
+| `default=` | `avro:",default=0"` | Default value (must be last; scalars only) |
+| `alias=` | `avro:",alias=old"` | Field alias for schema evolution (repeatable) |
+| `timestamp-micros` | `avro:",timestamp-micros"` | Override logical type |
+| `decimal(p,s)` | `avro:",decimal(10,2)"` | Decimal logical type (required for `*big.Rat`) |
+| `uuid` | `avro:",uuid"` | UUID logical type |
+| `date` | `avro:",date"` | Date logical type |
+
+Options:
+
+- `WithNamespace(ns)` sets the Avro namespace for the record.
+- `WithName(name)` overrides the record name (defaults to the Go struct name).
 
 ## Logical Types
 

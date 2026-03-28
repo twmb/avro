@@ -674,8 +674,8 @@ func TestEncodeError(t *testing.T) {
 
 type failCompressCodec struct{}
 
-func (failCompressCodec) Name() string  { return "failcompress" }
-func (failCompressCodec) Close() error  { return nil }
+func (failCompressCodec) Name() string { return "failcompress" }
+func (failCompressCodec) Close() error { return nil }
 func (failCompressCodec) Compress([]byte) ([]byte, error) {
 	return nil, errors.New("compress failed")
 }
@@ -799,7 +799,7 @@ func TestTruncatedBlockData(t *testing.T) {
 	data := buf.Bytes()
 	data = binary.AppendVarint(data, 1)   // count
 	data = binary.AppendVarint(data, 100) // size = 100 bytes, but EOF
-	data = append(data, 0x01)       // only 1 byte of data
+	data = append(data, 0x01)             // only 1 byte of data
 	r, err := NewReader(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
@@ -827,8 +827,8 @@ func TestTruncatedBlockSyncMarker(t *testing.T) {
 	data := buf.Bytes()
 	data = binary.AppendVarint(data, 1) // count
 	data = binary.AppendVarint(data, 1) // size = 1
-	data = append(data, 0x02)     // 1 byte of data
-	data = append(data, 0x00)     // only 1 byte of sync marker, need 16
+	data = append(data, 0x02)           // 1 byte of data
+	data = append(data, 0x00)           // only 1 byte of sync marker, need 16
 	r, err := NewReader(bytes.NewReader(data))
 	if err != nil {
 		t.Fatal(err)
@@ -1139,7 +1139,7 @@ func TestDecodeMapTruncatedKeyData(t *testing.T) {
 	var data []byte
 	data = binary.AppendVarint(data, 1)  // 1 entry
 	data = binary.AppendVarint(data, 10) // key length = 10
-	data = append(data, 'a')       // only 1 byte of key, need 10
+	data = append(data, 'a')             // only 1 byte of key, need 10
 	r := bufio.NewReader(bytes.NewReader(data))
 	_, err := decodeMap(r)
 	if err == nil {
@@ -1151,7 +1151,7 @@ func TestDecodeMapTruncatedValLen(t *testing.T) {
 	var data []byte
 	data = binary.AppendVarint(data, 1) // 1 entry
 	data = binary.AppendVarint(data, 1) // key length = 1
-	data = append(data, 'k')      // key
+	data = append(data, 'k')            // key
 	// No value length — truncated.
 	r := bufio.NewReader(bytes.NewReader(data))
 	_, err := decodeMap(r)
@@ -1164,9 +1164,9 @@ func TestDecodeMapTruncatedValData(t *testing.T) {
 	var data []byte
 	data = binary.AppendVarint(data, 1)  // 1 entry
 	data = binary.AppendVarint(data, 1)  // key length = 1
-	data = append(data, 'k')       // key
+	data = append(data, 'k')             // key
 	data = binary.AppendVarint(data, 10) // val length = 10
-	data = append(data, 'v')       // only 1 byte of val, need 10
+	data = append(data, 'v')             // only 1 byte of val, need 10
 	r := bufio.NewReader(bytes.NewReader(data))
 	_, err := decodeMap(r)
 	if err == nil {
@@ -2786,7 +2786,7 @@ func TestDecodeMapOversizedValLen(t *testing.T) {
 	var data []byte
 	data = binary.AppendVarint(data, 1)       // 1 entry
 	data = binary.AppendVarint(data, 1)       // key length = 1
-	data = append(data, 'k')            // key
+	data = append(data, 'k')                  // key
 	data = binary.AppendVarint(data, 1<<20+1) // value length too large
 	_, err := decodeMap(bufio.NewReader(bytes.NewReader(data)))
 	if err == nil || !strings.Contains(err.Error(), "value length") {
@@ -2943,8 +2943,8 @@ func TestNegativeBlockCountRead(t *testing.T) {
 	}
 	// Append a block with negative count after the valid (empty) file.
 	data := buf.Bytes()
-	data = binary.AppendVarint(data, -1) // negative count
-	data = binary.AppendVarint(data, 0)  // size
+	data = binary.AppendVarint(data, -1)     // negative count
+	data = binary.AppendVarint(data, 0)      // size
 	data = append(data, make([]byte, 16)...) // sync marker
 	r, err := NewReader(bytes.NewReader(data))
 	if err != nil {
