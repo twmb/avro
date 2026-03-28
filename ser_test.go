@@ -3,6 +3,7 @@ package avro
 import (
 	"encoding"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -944,6 +945,45 @@ func TestSerNullableRecordUnion(t *testing.T) {
 	mNull := decodedNull.(map[string]any)
 	if mNull["metadata"] != nil {
 		t.Errorf("metadata: got %v, want nil", mNull["metadata"])
+	}
+}
+
+func TestSerErrorDottedPath(t *testing.T) {
+	schema := `{
+		"type":"record","name":"outer",
+		"fields":[
+			{"name":"id","type":"string"},
+			{"name":"address","type":{
+				"type":"record","name":"addr",
+				"fields":[
+					{"name":"city","type":"string"},
+					{"name":"zip","type":"int"}
+				]
+			}}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// zip is a string, should be int — error should show "address.zip".
+	input := map[string]any{
+		"id": "abc",
+		"address": map[string]any{
+			"city": "Seattle",
+			"zip":  "not-a-number",
+		},
+	}
+	_, err = s.Encode(input)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected SemanticError, got %T: %v", err, err)
+	}
+	if se.Field != "address.zip" {
+		t.Errorf("field path: got %q, want %q", se.Field, "address.zip")
 	}
 }
 

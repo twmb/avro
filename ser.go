@@ -366,7 +366,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 				continue
 			}
 			if dst, err = f.fn(dst, value); err != nil {
-				return nil, err
+				return nil, recordFieldError(t, f.name, err)
 			}
 		}
 		return dst, nil
@@ -396,7 +396,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 			continue
 		}
 		if dst, err = f.fn(dst, fv); err != nil {
-			return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: err}
+			return nil, recordFieldError(t, f.name, err)
 		}
 	}
 	return dst, nil

@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 )
@@ -12,7 +13,8 @@ type SemanticError struct {
 	GoType reflect.Type
 	// AvroType is the Avro schema type (e.g. "int", "record", "boolean").
 	AvroType string
-	// Field is the record field name, if within a record.
+	// Field is the dotted path to the record field (e.g. "address.zip"),
+	// if the error occurred within a record.
 	Field string
 	// Err is the underlying error.
 	Err error
@@ -39,6 +41,22 @@ func (e *SemanticError) Error() string {
 }
 
 func (e *SemanticError) Unwrap() error { return e.Err }
+
+// recordFieldError wraps an error from a record field serializer/deserializer,
+// building a dotted path for nested records. If the inner error is a
+// SemanticError with a Field, the field names are joined with a dot.
+func recordFieldError(goType reflect.Type, fieldName string, err error) error {
+	var inner *SemanticError
+	if errors.As(err, &inner) && inner.Field != "" {
+		return &SemanticError{
+			GoType:   inner.GoType,
+			AvroType: inner.AvroType,
+			Field:    fieldName + "." + inner.Field,
+			Err:      inner.Err,
+		}
+	}
+	return &SemanticError{GoType: goType, AvroType: "record", Field: fieldName, Err: err}
+}
 
 // ShortBufferError indicates the input buffer is too short for the value
 // being decoded.

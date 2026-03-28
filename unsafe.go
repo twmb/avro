@@ -153,7 +153,7 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value) ([]byte, er
 			dst, err = f.slowFn(dst, fv)
 		}
 		if err != nil {
-			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
+			return nil, recordFieldError(fast.typ, f.name, err)
 		}
 	}
 	return dst, nil
@@ -170,7 +170,7 @@ func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *sla
 			src, err = f.slowFn(src, fieldByIndex(v, f.slowIdx), sl)
 		}
 		if err != nil {
-			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
+			return nil, recordFieldError(fast.typ, f.name, err)
 		}
 	}
 	return src, nil
@@ -184,7 +184,7 @@ func serRecordFastPtr(dst []byte, fast *fastRecordSer, base unsafe.Pointer) ([]b
 		f := &fast.fields[i]
 		dst, err = f.ser(dst, unsafe.Add(base, f.offset))
 		if err != nil {
-			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
+			return nil, recordFieldError(fast.typ, f.name, err)
 		}
 	}
 	return dst, nil
@@ -197,7 +197,7 @@ func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, 
 		f := &fast.fields[i]
 		src, err = f.deser(src, unsafe.Add(base, f.offset), sl)
 		if err != nil {
-			return nil, &SemanticError{GoType: fast.typ, AvroType: "record", Field: f.name, Err: err}
+			return nil, recordFieldError(fast.typ, f.name, err)
 		}
 	}
 	return src, nil
