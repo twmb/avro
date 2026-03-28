@@ -1018,7 +1018,7 @@ func TestSchemaForErrors(t *testing.T) {
 
 type customString struct{ v string }
 
-func (c customString) MarshalText() ([]byte, error) { return []byte(c.v), nil }
+func (c customString) MarshalText() ([]byte, error)  { return []byte(c.v), nil }
 func (c *customString) UnmarshalText(b []byte) error { c.v = string(b); return nil }
 
 type stringerType struct{ v string }
@@ -1027,8 +1027,8 @@ func (s stringerType) String() string { return s.v }
 
 func TestSchemaForTextMarshaler(t *testing.T) {
 	type Record struct {
-		A customString  `avro:"a"`
-		B stringerType  `avro:"b"`
+		A customString `avro:"a"`
+		B stringerType `avro:"b"`
 	}
 	s, err := SchemaFor[Record]()
 	if err != nil {

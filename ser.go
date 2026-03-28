@@ -43,12 +43,12 @@ type serUnion struct {
 // ser tries each branch in order: write the branch index, attempt the
 // encode, and backtrack (reset dst) if it fails.
 func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
-	start := len(dst)
+	base := dst
 	var err error
 	for i, fn := range s.fns {
-		dst = appendVarint(dst[:start], int32(i))
-		if dst, err = fn(dst, v); err == nil {
-			return dst, nil
+		attempt := appendVarint(base, int32(i))
+		if attempt, err = fn(attempt, v); err == nil {
+			return attempt, nil
 		}
 	}
 	e := &SemanticError{AvroType: "union", Err: errors.New("no matching branch")}
