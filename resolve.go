@@ -287,7 +287,7 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 		}
 		elem := reflect.New(anyType).Elem()
 		if src, err = op.read(src, elem, sl); err != nil {
-			return nil, &SemanticError{AvroType: "record", Field: rr.readerNames[op.readerIdx], Err: err}
+			return nil, recordFieldError(nil, rr.readerNames[op.readerIdx], err)
 		}
 		m[rr.readerNames[op.readerIdx]] = elem.Interface()
 	}
@@ -296,7 +296,7 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 	for _, d := range rr.defaults {
 		elem := reflect.New(anyType).Elem()
 		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), elem, sl); err != nil {
-			return nil, &SemanticError{AvroType: "record", Field: rr.readerNames[d.readerIdx], Err: err}
+			return nil, recordFieldError(nil, rr.readerNames[d.readerIdx], err)
 		}
 		m[rr.readerNames[d.readerIdx]] = elem.Interface()
 	}
@@ -320,7 +320,7 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 		}
 		elem := reflect.New(t.Elem()).Elem()
 		if src, err = op.read(src, elem, sl); err != nil {
-			return nil, &SemanticError{AvroType: "record", Field: rr.readerNames[op.readerIdx], Err: err}
+			return nil, recordFieldError(nil, rr.readerNames[op.readerIdx], err)
 		}
 		v.SetMapIndex(reflect.ValueOf(rr.readerNames[op.readerIdx]), elem)
 	}
@@ -328,7 +328,7 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 	for _, d := range rr.defaults {
 		elem := reflect.New(t.Elem()).Elem()
 		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), elem, sl); err != nil {
-			return nil, &SemanticError{AvroType: "record", Field: rr.readerNames[d.readerIdx], Err: err}
+			return nil, recordFieldError(nil, rr.readerNames[d.readerIdx], err)
 		}
 		v.SetMapIndex(reflect.ValueOf(rr.readerNames[d.readerIdx]), elem)
 	}
@@ -351,14 +351,14 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 		}
 		fv := fieldByIndex(v, mapping.indices[op.readerIdx])
 		if src, err = op.read(src, fv, sl); err != nil {
-			return nil, &SemanticError{GoType: t, AvroType: "record", Field: rr.readerNames[op.readerIdx], Err: err}
+			return nil, recordFieldError(t, rr.readerNames[op.readerIdx], err)
 		}
 	}
 
 	for _, d := range rr.defaults {
 		fv := fieldByIndex(v, mapping.indices[d.readerIdx])
 		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), fv, sl); err != nil {
-			return nil, &SemanticError{GoType: t, AvroType: "record", Field: rr.readerNames[d.readerIdx], Err: err}
+			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], err)
 		}
 	}
 

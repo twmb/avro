@@ -361,7 +361,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		var err error
 		for _, f := range s.fields {
 			if src, err = f.fn(src, elem, sl); err != nil {
-				return nil, &SemanticError{AvroType: "record", Field: f.name, Err: err}
+				return nil, recordFieldError(nil, f.name, err)
 			}
 			m[f.name] = elem.Interface()
 			elem.SetZero()
@@ -381,7 +381,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		for _, f := range s.fields {
 			elem := reflect.New(t.Elem()).Elem()
 			if src, err = f.fn(src, elem, sl); err != nil {
-				return nil, &SemanticError{AvroType: "record", Field: f.name, Err: err}
+				return nil, recordFieldError(nil, f.name, err)
 			}
 			v.SetMapIndex(f.nameVal, elem)
 		}
