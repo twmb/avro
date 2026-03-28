@@ -136,6 +136,10 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 			return appendAvroJSONBytes(buf, v.Bytes()), nil
 		}
+		// json.Number from decimal decode — write as JSON number.
+		if v.Type() == jsonNumberType {
+			return append(buf, v.String()...), nil
+		}
 		return nil, fmt.Errorf("avro json: expected []byte, got %s", v.Type())
 
 	case "fixed":
@@ -146,6 +150,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 		}
 		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 			return appendAvroJSONBytes(buf, v.Bytes()), nil
+		}
+		if v.Type() == jsonNumberType {
+			return append(buf, v.String()...), nil
 		}
 		return nil, fmt.Errorf("avro json: expected []byte or [N]byte, got %s", v.Type())
 

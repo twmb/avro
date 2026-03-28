@@ -3,6 +3,7 @@ package avro
 import (
 	"bytes"
 	"encoding"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -8336,12 +8337,13 @@ func TestBytesDecimalDeserInterface(t *testing.T) {
 	if len(rem) != 0 {
 		t.Fatalf("leftover: %d", len(rem))
 	}
-	got, ok := out.(*big.Rat)
+	// Decoding into any produces json.Number for json.Marshal compatibility.
+	got, ok := out.(json.Number)
 	if !ok {
-		t.Fatalf("expected *big.Rat, got %T", out)
+		t.Fatalf("expected json.Number, got %T", out)
 	}
-	if got.Cmp(r) != 0 {
-		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	if string(got) != "123.45" {
+		t.Fatalf("got %s, want 123.45", got)
 	}
 }
 
@@ -8364,12 +8366,12 @@ func TestFixedDecimalDeserInterface(t *testing.T) {
 	if len(rem) != 0 {
 		t.Fatalf("leftover: %d", len(rem))
 	}
-	got, ok := out.(*big.Rat)
+	got, ok := out.(json.Number)
 	if !ok {
-		t.Fatalf("expected *big.Rat, got %T", out)
+		t.Fatalf("expected json.Number, got %T", out)
 	}
-	if got.Cmp(r) != 0 {
-		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	if string(got) != "123.45" {
+		t.Fatalf("got %s, want 123.45", got)
 	}
 }
 

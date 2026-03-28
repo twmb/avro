@@ -3,6 +3,7 @@ package avro
 import (
 	"encoding"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -53,9 +54,10 @@ var slabPool = sync.Pool{New: func() any { return &slab{} }}
 //   - union: any, *T (for ["null", T] unions), or the matched branch type
 //   - record: struct (matched by field name or `avro` tag), map[string]any, any
 //
-// When decoding into any (interface{}), values are returned as their natural
-// Go types: nil, bool, int32, int64, float32, float64, string, []byte, []any,
-// map[string]any, or map[string]any for records.
+// When decoding into any, values are returned as their natural Go types:
+// nil, bool, int32, int64, float32, float64, string, []byte, []any,
+// map[string]any for records, or [encoding/json.Number] for decimal logical
+// types.
 func (s *Schema) Decode(src []byte, v any) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
@@ -1068,7 +1070,9 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	src = src[n:]
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
+		// Return json.Number for any targets so json.Marshal works.
+		r := bytesToRat(b, s.scale)
+		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
 		return src, nil
 	}
 	if v.Type() == bigRatType {
@@ -1091,7 +1095,8 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	src = src[s.size:]
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
+		r := bytesToRat(b, s.scale)
+		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
 		return src, nil
 	}
 	if v.Type() == bigRatType {

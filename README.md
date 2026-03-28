@@ -248,7 +248,7 @@ to the underlying Avro type otherwise.
 | local-timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time or int |
 | local-timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time or int |
 | uuid | string or fixed(16) | [16]byte or string | [16]byte (RFC 4122 hex-dash ↔ binary) or string |
-| decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat or underlying type |
+| decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat (typed target) or json.Number (any target) |
 | duration | fixed(12) | avro.Duration or underlying type | avro.Duration or underlying type |
 
 When encoding, timestamp and date fields accept RFC 3339 strings, and decimal
