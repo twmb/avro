@@ -27,10 +27,7 @@ func TestSchemaNodeRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 
 	if got.Type != "record" {
 		t.Errorf("type: got %q, want record", got.Type)
@@ -66,10 +63,7 @@ func TestSchemaNodePrimitives(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := s.Root()
-			if err != nil {
-				t.Fatal(err)
-			}
+			got := s.Root()
 			if got.Type != prim {
 				t.Errorf("got %q, want %q", got.Type, prim)
 			}
@@ -97,10 +91,7 @@ func TestSchemaNodeLogicalTypes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := s.Root()
-			if err != nil {
-				t.Fatal(err)
-			}
+			got := s.Root()
 			if got.LogicalType != tt.logical {
 				t.Errorf("logicalType: got %q, want %q", got.LogicalType, tt.logical)
 			}
@@ -119,10 +110,7 @@ func TestSchemaNodeDecimal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	if got.Precision != 10 {
 		t.Errorf("precision: got %d, want 10", got.Precision)
 	}
@@ -141,10 +129,7 @@ func TestSchemaNodeEnum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	if !reflect.DeepEqual(got.Symbols, []string{"RED", "GREEN", "BLUE"}) {
 		t.Errorf("symbols: got %v", got.Symbols)
 	}
@@ -160,10 +145,7 @@ func TestSchemaNodeFixed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	if got.Size != 32 {
 		t.Errorf("size: got %d, want 32", got.Size)
 	}
@@ -178,10 +160,7 @@ func TestSchemaNodeArray(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	if got.Items == nil || got.Items.Type != "string" {
 		t.Errorf("items: got %+v", got.Items)
 	}
@@ -196,10 +175,7 @@ func TestSchemaNodeMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	if got.Values == nil || got.Values.Type != "int" {
 		t.Errorf("values: got %+v", got.Values)
 	}
@@ -275,10 +251,7 @@ func TestSchemaNodeFourLevelWithReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	// Field "b" should be a reference to "Inner".
 	if got.Fields[1].Type.Type != "Inner" {
 		t.Errorf("field b type: got %q, want Inner reference", got.Fields[1].Type.Type)
@@ -300,10 +273,7 @@ func TestSchemaNodeCustomProps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	if got.Props["connect.name"] != "com.example.Event" {
 		t.Errorf("record prop: got %q", got.Props["connect.name"])
 	}
@@ -325,10 +295,7 @@ func TestSchemaNodeFieldProps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	if got.Fields[0].Props["connect.name"] != "io.debezium.time.Timestamp" {
 		t.Errorf("field prop: got %q", got.Fields[0].Props["connect.name"])
 	}
@@ -350,10 +317,7 @@ func TestSchemaNodeFieldAliases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	if len(got.Fields[0].Aliases) != 1 || got.Fields[0].Aliases[0] != "old_name" {
 		t.Errorf("aliases: got %v", got.Fields[0].Aliases)
 	}
@@ -375,10 +339,7 @@ func TestSchemaNodeFieldDoc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 	if got.Fields[0].Doc != "the x coordinate" {
 		t.Errorf("doc: got %q", got.Fields[0].Doc)
 	}
@@ -423,10 +384,10 @@ func TestSchemaNodeEncodeDecodeRoundTrip(t *testing.T) {
 	}
 
 	type Product struct {
-		Name     string            `avro:"name"`
-		Price    float64           `avro:"price"`
-		Tags     []string          `avro:"tags"`
-		Metadata map[string]int32  `avro:"metadata"`
+		Name     string           `avro:"name"`
+		Price    float64          `avro:"price"`
+		Tags     []string         `avro:"tags"`
+		Metadata map[string]int32 `avro:"metadata"`
 	}
 	p := Product{
 		Name:     "Widget",
@@ -469,10 +430,7 @@ func TestRootFromParsedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.Root()
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := s.Root()
 
 	if got.Type != "record" {
 		t.Errorf("type: %q", got.Type)

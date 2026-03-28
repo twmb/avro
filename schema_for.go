@@ -500,7 +500,11 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		return map[string]any{"type": "map", "values": values}, nil
 
 	case reflect.Struct:
-		return inferRecord(t, t.Name(), namespace, seen)
+		name := t.Name()
+		if name == "" {
+			return nil, fmt.Errorf("anonymous struct types are not supported; use a named type")
+		}
+		return inferRecord(t, name, namespace, seen)
 
 	default:
 		return nil, fmt.Errorf("unsupported Go type %s", t)

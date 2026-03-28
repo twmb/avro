@@ -71,12 +71,10 @@ func (n *SchemaNode) Schema() (*Schema, error) {
 //
 // Root re-parses the JSON on each call. Cache the result if you need
 // to access it repeatedly (e.g. in a per-message processing loop).
-func (s *Schema) Root() (SchemaNode, error) {
+func (s *Schema) Root() SchemaNode {
 	var raw any
-	if err := json.Unmarshal([]byte(s.full), &raw); err != nil {
-		return SchemaNode{}, fmt.Errorf("avro: re-parsing schema JSON: %w", err)
-	}
-	return nodeFromJSON(raw), nil
+	json.Unmarshal([]byte(s.full), &raw) // cannot fail: s.full was validated by Parse
+	return nodeFromJSON(raw)
 }
 
 // toJSON converts a SchemaNode to a JSON-serializable representation.

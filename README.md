@@ -15,9 +15,11 @@ fingerprinting.
 - [Type Mapping](#type-mapping)
 - [Struct Tags](#struct-tags)
 - [Schema Inference](#schema-inference)
+- [Schema Introspection](#schema-introspection)
 - [Logical Types](#logical-types)
 - [Schema Evolution](#schema-evolution)
 - [Object Container Files](#object-container-files)
+- [Avro JSON](#avro-json)
 - [Single Object Encoding](#single-object-encoding)
 - [Fingerprinting](#fingerprinting)
 - [Performance](#performance)
@@ -197,6 +199,38 @@ Options:
 - `WithNamespace(ns)` sets the Avro namespace for the record.
 - `WithName(name)` overrides the record name (defaults to the Go struct name).
 
+## Schema Introspection
+
+`Schema.Root()` returns a `SchemaNode` representing the parsed schema. This
+provides read access to all schema metadata including field types, logical
+types, doc strings, and custom properties:
+
+```go
+schema, _ := avro.Parse(schemaJSON)
+root, _ := schema.Root()
+
+for _, f := range root.Fields {
+    fmt.Printf("field %s: type=%s\n", f.Name, f.Type.Type)
+    if cn := f.Props["connect.name"]; cn != "" {
+        fmt.Printf("  kafka connect type: %s\n", cn)
+    }
+}
+```
+
+`SchemaNode` can also be used to build schemas programmatically:
+
+```go
+node := &avro.SchemaNode{
+    Type: "record",
+    Name: "User",
+    Fields: []avro.SchemaField{
+        {Name: "name", Type: avro.SchemaNode{Type: "string"}},
+        {Name: "age", Type: avro.SchemaNode{Type: "int"}, Default: 18},
+    },
+}
+schema, err := node.Schema()
+```
+
 ## Logical Types
 
 Logical types are decoded into natural Go types when available, and fall back
@@ -370,6 +404,24 @@ Custom codecs can be provided via the `Codec` interface.
 
 `NewAppendWriter` opens an existing OCF for appending — it reads the header to
 recover the schema, codec, and sync marker, then seeks to the end.
+
+## Avro JSON
+
+`EncodeJSON` and `DecodeJSON` support the [Avro JSON encoding](https://avro.apache.org/docs/current/specification/#json-encoding),
+which differs from standard JSON in its handling of unions and bytes:
+
+```go
+// Encode: unions are wrapped as {"type_name": value}
+jsonBytes, err := schema.EncodeJSON(&user)
+// {"name":"Alice","email":{"string":"a@b.com"}}
+
+// Decode: unwraps unions automatically
+var user User
+err = schema.DecodeJSON(jsonBytes, &user)
+```
+
+`EncodeJSON` accepts structs, maps, and all the same types as `Encode`.
+`DecodeJSON` accepts Avro JSON and decodes into any target type.
 
 ## Single Object Encoding
 

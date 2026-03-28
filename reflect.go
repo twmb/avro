@@ -79,8 +79,10 @@ type cachedMapping struct {
 // The result is cached in the provided sync.Map for subsequent calls with the
 // same type.
 func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*cachedMapping, error) {
-	if v, ok := cache.Load(t); ok {
-		return v.(*cachedMapping), nil
+	if cache != nil {
+		if v, ok := cache.Load(t); ok {
+			return v.(*cachedMapping), nil
+		}
 	}
 
 	type fieldInfo struct {
@@ -211,7 +213,9 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 	}
 
 	result := &cachedMapping{indices: ats, omitzero: ozs}
-	cache.Store(t, result)
+	if cache != nil {
+		cache.Store(t, result)
+	}
 	return result, nil
 }
 

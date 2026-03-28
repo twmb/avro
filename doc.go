@@ -1,10 +1,11 @@
-// Package avro encodes and decodes Avro binary data.
+// Package avro encodes and decodes Avro data.
 //
 // Parse an Avro JSON schema with [Parse] (or [MustParse] for package-level
-// vars), then call [Schema.Encode] / [Schema.Decode] to convert between Go
-// values and Avro binary. Alternatively, use [SchemaFor] to infer a schema
-// from a Go struct type. See [Schema.Decode] for the full Go-to-Avro type
-// mapping.
+// vars), then call [Schema.Encode] / [Schema.Decode] for binary encoding,
+// or [Schema.EncodeJSON] / [Schema.DecodeJSON] for Avro JSON encoding.
+// Use [SchemaFor] to infer a schema from a Go struct type, or
+// [Schema.Root] to inspect a parsed schema's structure. See
+// [Schema.Decode] for the full Go-to-Avro type mapping.
 //
 // # Basic usage
 //
