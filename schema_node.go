@@ -7,27 +7,29 @@ import (
 
 // SchemaNode is a read-write representation of an Avro schema. It can be
 // obtained from a parsed schema via [Schema.Root], or constructed directly
-// and converted to a [*Schema] via the Schema method.
+// and converted to a [*Schema] via the [SchemaNode.Schema] method.
 //
-// The Type field determines which other fields are relevant. Unused fields
-// for a given type are ignored.
+// The Type field determines which other fields are relevant:
 //
-// A named type ("record", "enum", "fixed") that has already been defined
+//   - Primitives (null, boolean, int, long, float, double, string, bytes):
+//     LogicalType, Precision, Scale, and Props are optional. Other fields
+//     are ignored.
+//   - record/error: Name and Fields are required. Namespace, Doc, and Props
+//     are optional.
+//   - enum: Name and Symbols are required. Namespace, Doc, and Props are
+//     optional.
+//   - array: Items is required.
+//   - map: Values is required.
+//   - fixed: Name and Size are required. LogicalType, Precision, Scale,
+//     Namespace, and Props are optional.
+//   - union: Branches lists the member schemas.
+//
+// A named type (record, enum, fixed) that has already been defined
 // elsewhere in the schema can be referenced by setting Type to its full
-// name (e.g. "com.example.Address") with no other fields.
+// name (e.g. com.example.Address) with no other fields.
 type SchemaNode struct {
-	// Type is the Avro type: "null", "boolean", "int", "long", "float",
-	// "double", "string", "bytes", "record", "error", "enum", "array",
-	// "map", "fixed", or "union". For named type references, this is the
-	// full name (e.g. "com.example.Address").
-	Type string
-
-	// LogicalType annotates the underlying type with additional semantics:
-	// "date", "time-millis", "time-micros", "timestamp-millis",
-	// "timestamp-micros", "timestamp-nanos", "local-timestamp-millis",
-	// "local-timestamp-micros", "local-timestamp-nanos", "decimal",
-	// "uuid", or "duration". Empty if none.
-	LogicalType string
+	Type        string // Avro type or named type reference
+	LogicalType string // e.g. date, timestamp-millis, decimal, uuid; empty if none
 
 	Name      string // name for record, enum, fixed
 	Namespace string // namespace for named types
@@ -42,7 +44,7 @@ type SchemaNode struct {
 
 	Precision int               // decimal precision
 	Scale     int               // decimal scale
-	Props     map[string]string // custom properties (e.g. "connect.name")
+	Props     map[string]string // custom properties
 }
 
 // SchemaField represents a field in an Avro record schema.

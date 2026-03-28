@@ -207,7 +207,7 @@ types, doc strings, and custom properties:
 
 ```go
 schema, _ := avro.Parse(schemaJSON)
-root, _ := schema.Root()
+root := schema.Root()
 
 for _, f := range root.Fields {
     fmt.Printf("field %s: type=%s\n", f.Name, f.Type.Type)
@@ -238,23 +238,23 @@ to the underlying Avro type otherwise.
 
 | Logical Type | Avro Type | Encode | Decode |
 |---|---|---|---|
-| `date` | int | `time.Time`, RFC 3339 or `YYYY-MM-DD` string, or int | `time.Time` or int |
-| `time-millis` | int | `time.Duration` or int | `time.Duration` or int |
-| `time-micros` | long | `time.Duration` or int | `time.Duration` or int |
-| `timestamp-millis` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
-| `timestamp-micros` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
-| `timestamp-nanos` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
-| `local-timestamp-millis` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
-| `local-timestamp-micros` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
-| `local-timestamp-nanos` | long | `time.Time`, RFC 3339 string, or int | `time.Time` or int |
-| `uuid` | string or fixed(16) | `[16]byte`, `string` | `[16]byte` (RFC 4122 hex-dash ↔ binary) or `string` |
-| `decimal` | bytes or fixed | `*big.Rat`, `float64`, numeric `string`, `json.Number`, or underlying type | `*big.Rat` or underlying type |
-| `duration` | fixed(12) | `avro.Duration` or underlying type | `avro.Duration` or underlying type |
+| date | int | time.Time, RFC 3339 or YYYY-MM-DD string, or int | time.Time or int |
+| time-millis | int | time.Duration or int | time.Duration or int |
+| time-micros | long | time.Duration or int | time.Duration or int |
+| timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time or int |
+| timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time or int |
+| timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time or int |
+| local-timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time or int |
+| local-timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time or int |
+| local-timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time or int |
+| uuid | string or fixed(16) | [16]byte or string | [16]byte (RFC 4122 hex-dash ↔ binary) or string |
+| decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat or underlying type |
+| duration | fixed(12) | avro.Duration or underlying type | avro.Duration or underlying type |
 
 When encoding, timestamp and date fields accept RFC 3339 strings, and decimal
-fields accept `float64` and numeric strings (e.g. `"3.14"`). Values that
-don't match the expected format fall through to the underlying type's encoder,
-which will return an error.
+fields accept float64 and numeric strings (e.g. "3.14"). Values that don't
+match the expected format fall through to the underlying type's encoder, which
+will return an error.
 
 Unknown logical types are silently ignored per the Avro spec, and the
 underlying type is used as-is.
