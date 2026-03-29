@@ -258,7 +258,7 @@ func TestAvroJSONNamedUnionBranch(t *testing.T) {
 	data := map[string]any{
 		"value": map[string]any{"x": int32(42)},
 	}
-	encoded, err := s.EncodeJSON(data, TaggedUnions)
+	encoded, err := s.EncodeJSON(data, TaggedUnions())
 	if err != nil {
 		t.Fatalf("EncodeJSON: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestAvroJSONNamespacedUnionBranch(t *testing.T) {
 	}
 
 	// Encode with TaggedUnions: should use fully qualified name.
-	encoded, err := s.EncodeJSON("ACTIVE", TaggedUnions)
+	encoded, err := s.EncodeJSON("ACTIVE", TaggedUnions())
 	if err != nil {
 		t.Fatalf("EncodeJSON: %v", err)
 	}
@@ -376,9 +376,9 @@ func TestAvroJSONNestedUnionRecord(t *testing.T) {
 		},
 	}
 	// Tagged: should have Node wrapping at each level.
-	encoded, err := s.EncodeJSON(data, TaggedUnions)
+	encoded, err := s.EncodeJSON(data, TaggedUnions())
 	if err != nil {
-		t.Fatalf("EncodeJSON(TaggedUnions): %v", err)
+		t.Fatalf("EncodeJSON(TaggedUnions()): %v", err)
 	}
 	var parsed any
 	json.Unmarshal(encoded, &parsed)
@@ -481,9 +481,9 @@ func TestAvroJSONArrayOfUnions(t *testing.T) {
 	}
 
 	// Tagged: wrapped values.
-	tagged, err := s.EncodeJSON(data, TaggedUnions)
+	tagged, err := s.EncodeJSON(data, TaggedUnions())
 	if err != nil {
-		t.Fatalf("EncodeJSON(TaggedUnions): %v", err)
+		t.Fatalf("EncodeJSON(TaggedUnions()): %v", err)
 	}
 	wantTagged := `[{"string":"hello"},{"int":42}]`
 	if string(tagged) != wantTagged {
@@ -1264,7 +1264,7 @@ func TestEncodeJSONLinkedinFloats(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := s.EncodeJSON(tt.value, LinkedinFloats)
+			got, err := s.EncodeJSON(tt.value, LinkedinFloats())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1281,7 +1281,7 @@ func TestEncodeJSONTaggedUnions(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Tagged: should wrap.
-	got, err := s.EncodeJSON("hello", TaggedUnions)
+	got, err := s.EncodeJSON("hello", TaggedUnions())
 	if err != nil {
 		t.Fatal(err)
 	}

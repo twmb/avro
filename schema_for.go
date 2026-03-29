@@ -11,24 +11,28 @@ import (
 )
 
 // SchemaOpt configures [SchemaFor].
-type SchemaOpt func(*schemaOpts)
+type SchemaOpt interface{ schemaOpt() }
 
 type schemaOpts struct {
 	namespace string
 	name      string
 }
 
+type withNamespace string
+
+func (withNamespace) schemaOpt() {}
+
 // WithNamespace sets the Avro namespace for the top-level record.
-func WithNamespace(ns string) SchemaOpt {
-	return func(o *schemaOpts) { o.namespace = ns }
-}
+func WithNamespace(ns string) SchemaOpt { return withNamespace(ns) }
+
+type withName string
+
+func (withName) schemaOpt() {}
 
 // WithName overrides the Avro record name. By default the Go struct name
 // is used. This is useful for schema evolution when a Go struct is renamed
 // but the Avro record name must stay the same.
-func WithName(name string) SchemaOpt {
-	return func(o *schemaOpts) { o.name = name }
-}
+func WithName(name string) SchemaOpt { return withName(name) }
 
 // SchemaFor infers an Avro schema from the Go type T. T must be a struct.
 //
@@ -65,8 +69,13 @@ func WithName(name string) SchemaOpt {
 //   - [16]byte with uuid tag → string with uuid logical type
 func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	var o schemaOpts
-	for _, fn := range opts {
-		fn(&o)
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case withNamespace:
+			o.namespace = string(v)
+		case withName:
+			o.name = string(v)
+		}
 	}
 	t := reflect.TypeFor[T]()
 	if t.Kind() == reflect.Pointer {

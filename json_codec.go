@@ -11,36 +11,42 @@ import (
 )
 
 // JSONOpt configures [Schema.EncodeJSON] and [Schema.DecodeJSON] behavior.
-type JSONOpt int
+type JSONOpt interface{ jsonOpt() }
 
-const (
-	// TaggedUnions wraps non-null union values as {"type_name": value}
-	// in [Schema.EncodeJSON] output. Without this option, union values
-	// are written as bare JSON values. [Schema.DecodeJSON] always
-	// accepts both tagged and bare formats regardless of this option.
-	TaggedUnions JSONOpt = iota + 1
+type taggedUnions struct{}
 
-	// LinkedinFloats encodes NaN as JSON null and ±Infinity as ±1e999
-	// in [Schema.EncodeJSON], matching the linkedin/goavro convention.
-	// Without this option, NaN is encoded as the JSON string "NaN" and
-	// ±Infinity as "Infinity"/"-Infinity", following the Java Avro
-	// convention. [Schema.DecodeJSON] always accepts
-	// both conventions regardless of this option.
-	LinkedinFloats
-)
+func (taggedUnions) jsonOpt() {}
+
+// TaggedUnions wraps non-null union values as {"type_name": value}
+// in [Schema.EncodeJSON] output. Without this option, union values
+// are written as bare JSON values. [Schema.DecodeJSON] always
+// accepts both tagged and bare formats regardless of this option.
+func TaggedUnions() JSONOpt { return taggedUnions{} }
+
+type linkedinFloats struct{}
+
+func (linkedinFloats) jsonOpt() {}
+
+// LinkedinFloats encodes NaN as JSON null and ±Infinity as ±1e999
+// in [Schema.EncodeJSON], matching the linkedin/goavro convention.
+// Without this option, NaN is encoded as the JSON string "NaN" and
+// ±Infinity as "Infinity"/"-Infinity", following the Java Avro
+// convention. [Schema.DecodeJSON] always accepts
+// both conventions regardless of this option.
+func LinkedinFloats() JSONOpt { return linkedinFloats{} }
 
 type jsonConfig struct {
-	tagged  bool
+	tagged   bool
 	linkedin bool
 }
 
 func parseJSONOpts(opts []JSONOpt) jsonConfig {
 	var cfg jsonConfig
 	for _, o := range opts {
-		switch o {
-		case TaggedUnions:
+		switch o.(type) {
+		case taggedUnions:
 			cfg.tagged = true
-		case LinkedinFloats:
+		case linkedinFloats:
 			cfg.linkedin = true
 		}
 	}
