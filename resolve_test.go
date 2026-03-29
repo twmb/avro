@@ -1123,6 +1123,51 @@ func TestResolveReaderUnionWriterNonUnion(t *testing.T) {
 	}
 }
 
+func TestResolveReaderUnionTaggedUnions(t *testing.T) {
+	// Writer is "string", reader is ["null","string"].
+	// Schema evolution: writer non-union → reader union.
+	// TaggedUnions should wrap the result.
+	writer, err := Parse(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`["null","string"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode("hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Without TaggedUnions: bare value.
+	var bare any
+	if _, err := resolved.Decode(encoded, &bare); err != nil {
+		t.Fatal(err)
+	}
+	if bare != "hello" {
+		t.Fatalf("bare: expected \"hello\", got %v (%T)", bare, bare)
+	}
+
+	// With TaggedUnions: wrapped value.
+	var tagged any
+	if _, err := resolved.Decode(encoded, &tagged, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	wrapper, ok := tagged.(map[string]any)
+	if !ok {
+		t.Fatalf("tagged: expected map wrapper, got %T: %v", tagged, tagged)
+	}
+	if wrapper["string"] != "hello" {
+		t.Fatalf("tagged: expected {\"string\":\"hello\"}, got %v", wrapper)
+	}
+}
+
 // --- Direct skip function error path tests ---
 
 func TestSkipBooleanShortBuffer(t *testing.T) {

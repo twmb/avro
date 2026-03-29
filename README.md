@@ -18,6 +18,7 @@ fingerprinting.
 - [Schema Introspection](#schema-introspection)
 - [Logical Types](#logical-types)
 - [Schema Evolution](#schema-evolution)
+- [Schema Cache](#schema-cache)
 - [Object Container Files](#object-container-files)
 - [JSON Encoding](#json-encoding)
 - [Single Object Encoding](#single-object-encoding)
@@ -340,6 +341,37 @@ avro.CheckCompatibility(newSchema, oldSchema)
 avro.CheckCompatibility(oldSchema, newSchema)
 avro.CheckCompatibility(newSchema, oldSchema)
 ```
+
+## Schema Cache
+
+When working with a schema registry, schemas often reference types defined in
+other schemas. `SchemaCache` accumulates named types across multiple Parse
+calls so they can be resolved:
+
+```go
+cache := avro.NewSchemaCache()
+
+// Parse referenced schema first — order matters.
+_, err := cache.Parse(`{
+    "type": "record",
+    "name": "Address",
+    "fields": [{"name": "city", "type": "string"}]
+}`)
+
+// Now parse a schema that references Address.
+schema, err := cache.Parse(`{
+    "type": "record",
+    "name": "User",
+    "fields": [
+        {"name": "name",    "type": "string"},
+        {"name": "address", "type": "Address"}
+    ]
+}`)
+```
+
+Parsing the same schema string multiple times returns the cached result,
+handling diamond dependencies without caller-side deduplication. The returned
+`*Schema` is independent of the cache and safe to use concurrently.
 
 ## Object Container Files
 

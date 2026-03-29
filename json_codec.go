@@ -78,7 +78,7 @@ func parseOpts(opts []Opt) optConfig {
 // EncodeJSON encodes v as JSON using the schema for type-aware encoding.
 // By default, union values are written as bare JSON values and bytes/fixed
 // fields use \uXXXX escapes for non-ASCII bytes. Options can modify the
-// output format; see [JSONOpt] for details.
+// output format; see [Opt] for details.
 //
 // NaN and Infinity float values are encoded as JSON strings "NaN",
 // "Infinity", and "-Infinity" by default (Java Avro convention), or as
@@ -247,6 +247,23 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		if v.Type() == jsonNumberType {
 			return append(buf, v.String()...), nil
 		}
+		if v.Type() == avroDurationType {
+			d := v.Interface().(Duration)
+			var raw [12]byte
+			raw[0] = byte(d.Months)
+			raw[1] = byte(d.Months >> 8)
+			raw[2] = byte(d.Months >> 16)
+			raw[3] = byte(d.Months >> 24)
+			raw[4] = byte(d.Days)
+			raw[5] = byte(d.Days >> 8)
+			raw[6] = byte(d.Days >> 16)
+			raw[7] = byte(d.Days >> 24)
+			raw[8] = byte(d.Milliseconds)
+			raw[9] = byte(d.Milliseconds >> 8)
+			raw[10] = byte(d.Milliseconds >> 16)
+			raw[11] = byte(d.Milliseconds >> 24)
+			return appendAvroJSONBytes(buf, raw[:]), nil
+		}
 		if v.Kind() == reflect.String {
 			return appendAvroJSONBytes(buf, []byte(v.String())), nil
 		}
@@ -389,9 +406,10 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 		encoded, err := appendAvroJSON(nil, v, branch, cfg)
 		if err == nil {
 			if cfg.tagged {
-				name := unionBranchName(branch)
-				if cfg.tagLogical && branch.logical != "" {
-					name = branch.kind + "." + branch.logical
+				bn, ln := unionBranchNames(branch)
+				name := bn
+				if cfg.tagLogical {
+					name = ln
 				}
 				buf = append(buf, '{')
 				key, _ := json.Marshal(name)
@@ -444,20 +462,28 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 		if !ok {
 			return nil, fmt.Errorf("avro json: expected number for int, got %T", v)
 		}
-		if f < math.MinInt32 || f > math.MaxInt32 {
+		n := math.Trunc(f)
+		if f != n {
+			return nil, fmt.Errorf("avro json: value %v is not a whole number for int", f)
+		}
+		if n < math.MinInt32 || n > math.MaxInt32 {
 			return nil, fmt.Errorf("avro json: value %v overflows int32", f)
 		}
-		return int32(f), nil
+		return int32(n), nil
 
 	case "long":
 		f, ok := v.(float64)
 		if !ok {
 			return nil, fmt.Errorf("avro json: expected number for long, got %T", v)
 		}
-		if f < -(1<<63) || f >= 1<<63 {
+		n := math.Trunc(f)
+		if f != n {
+			return nil, fmt.Errorf("avro json: value %v is not a whole number for long", f)
+		}
+		if n < -(1<<63) || n >= 1<<63 {
 			return nil, fmt.Errorf("avro json: value %v overflows int64", f)
 		}
-		return int64(f), nil
+		return int64(n), nil
 
 	case "float":
 		if s, ok := v.(string); ok {
@@ -587,6 +613,20 @@ func unionBranchName(node *schemaNode) string {
 	}
 }
 
+// unionBranchNames returns the standard and logical branch names for a
+// union branch node. The logical name includes the logical type qualifier
+// (e.g. "long.timestamp-millis") when present, otherwise it equals the
+// standard name.
+func unionBranchNames(node *schemaNode) (standard, logical string) {
+	standard = unionBranchName(node)
+	if node.logical != "" {
+		logical = node.kind + "." + node.logical
+	} else {
+		logical = standard
+	}
+	return standard, logical
+}
+
 // findUnionBranch finds a union branch by type name.
 func findUnionBranch(union *schemaNode, name string) *schemaNode {
 	for _, b := range union.branches {
@@ -611,32 +651,28 @@ func findUnionBranch(union *schemaNode, name string) *schemaNode {
 	return nil
 }
 
-// parseSpecialFloat32 parses NaN/Infinity string representations (Java
+// parseSpecialFloat parses NaN/Infinity string representations (Java
 // convention and case-insensitive variants per AVRO-4217).
-func parseSpecialFloat32(s string) (float32, error) {
-	switch strings.ToLower(s) {
-	case "nan":
-		return float32(math.NaN()), nil
-	case "infinity", "inf":
-		return float32(math.Inf(1)), nil
-	case "-infinity", "-inf":
-		return float32(math.Inf(-1)), nil
+func parseSpecialFloat(s string) (float64, error) {
+	if strings.EqualFold(s, "nan") {
+		return math.NaN(), nil
+	}
+	if strings.EqualFold(s, "infinity") || strings.EqualFold(s, "inf") {
+		return math.Inf(1), nil
+	}
+	if strings.EqualFold(s, "-infinity") || strings.EqualFold(s, "-inf") {
+		return math.Inf(-1), nil
 	}
 	return 0, fmt.Errorf("avro json: unknown float value %q", s)
 }
 
-// parseSpecialFloat64 parses NaN/Infinity string representations (Java
-// convention and case-insensitive variants per AVRO-4217).
+func parseSpecialFloat32(s string) (float32, error) {
+	f, err := parseSpecialFloat(s)
+	return float32(f), err
+}
+
 func parseSpecialFloat64(s string) (float64, error) {
-	switch strings.ToLower(s) {
-	case "nan":
-		return math.NaN(), nil
-	case "infinity", "inf":
-		return math.Inf(1), nil
-	case "-infinity", "-inf":
-		return math.Inf(-1), nil
-	}
-	return 0, fmt.Errorf("avro json: unknown double value %q", s)
+	return parseSpecialFloat(s)
 }
 
 // appendAvroJSONBytes encodes raw bytes as an Avro JSON string using

@@ -115,6 +115,7 @@
 //
 // # Other features
 //
+//   - Schema Cache: [SchemaCache] accumulates named types across Parse calls for schema registry workflows
 //   - Single Object Encoding: [Schema.AppendSingleObject], [Schema.DecodeSingleObject]
 //   - Fingerprinting: [Schema.Canonical], [Schema.Fingerprint], [NewRabin]
 //   - Object Container Files: the [github.com/twmb/avro/ocf] sub-package

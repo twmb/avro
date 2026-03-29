@@ -1850,3 +1850,34 @@ func TestEncodeJSONLogicalTypeRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestEncodeJSONDurationRoundTrip(t *testing.T) {
+	schema := `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Duration{Months: 3, Days: 15, Milliseconds: 86400000}
+	bin, err := s.Encode(d)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var native any
+	if _, err := s.Decode(bin, &native); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got := native.(Duration); got != d {
+		t.Fatalf("Decode: got %+v, want %+v", got, d)
+	}
+	j, err := s.EncodeJSON(native)
+	if err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	var rt any
+	if err := s.DecodeJSON(j, &rt); err != nil {
+		t.Fatalf("DecodeJSON: %v", err)
+	}
+	if got := rt.(Duration); got != d {
+		t.Fatalf("round-trip: got %+v, want %+v", got, d)
+	}
+}

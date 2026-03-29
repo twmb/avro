@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 )
 
 // SemanticError indicates a Go type is incompatible with an Avro schema type
@@ -21,14 +22,15 @@ type SemanticError struct {
 }
 
 func (e *SemanticError) Error() string {
+	gt := formatGoType(e.GoType)
 	var s string
 	switch {
-	case e.Field != "" && e.GoType != nil:
-		s = fmt.Sprintf("avro: field %s: cannot use Go type %s with Avro type %s", e.Field, e.GoType, e.AvroType)
-	case e.GoType != nil && e.AvroType != "":
-		s = fmt.Sprintf("avro: cannot use Go type %s with Avro type %s", e.GoType, e.AvroType)
-	case e.GoType != nil:
-		s = fmt.Sprintf("avro: unsupported Go type %s", e.GoType)
+	case e.Field != "" && gt != "":
+		s = fmt.Sprintf("avro: field %s: cannot use %s with Avro type %s", e.Field, gt, e.AvroType)
+	case gt != "" && e.AvroType != "":
+		s = fmt.Sprintf("avro: cannot use %s with Avro type %s", gt, e.AvroType)
+	case gt != "":
+		s = fmt.Sprintf("avro: unsupported type %s", gt)
 	case e.AvroType != "":
 		s = fmt.Sprintf("avro: unsupported Avro type %s", e.AvroType)
 	default:
@@ -40,18 +42,33 @@ func (e *SemanticError) Error() string {
 	return s
 }
 
+// formatGoType returns a human-friendly type name, replacing verbose
+// reflect output like "interface {}" with "any".
+func formatGoType(t reflect.Type) string {
+	if t == nil {
+		return ""
+	}
+	return strings.ReplaceAll(t.String(), "interface {}", "any")
+}
+
 func (e *SemanticError) Unwrap() error { return e.Err }
 
 // recordFieldError wraps an error from a record field serializer/deserializer,
 // building a dotted path for nested records. If the inner error is a
-// SemanticError with a Field, the field names are joined with a dot.
+// SemanticError, the field name is prepended to the path and the inner
+// error's type information is preserved (avoiding misleading intermediate
+// "record" types in the error chain).
 func recordFieldError(goType reflect.Type, fieldName string, err error) error {
 	var inner *SemanticError
-	if errors.As(err, &inner) && inner.Field != "" {
+	if errors.As(err, &inner) {
+		field := fieldName
+		if inner.Field != "" {
+			field = fieldName + "." + inner.Field
+		}
 		return &SemanticError{
 			GoType:   inner.GoType,
 			AvroType: inner.AvroType,
-			Field:    fieldName + "." + inner.Field,
+			Field:    field,
 			Err:      inner.Err,
 		}
 	}

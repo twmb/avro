@@ -1077,10 +1077,14 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == durationType {
-		if v.Type() == durationType && (val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond)) {
+	if v.Type() == durationType {
+		if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
 			return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
 		}
+		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
+		return src, nil
+	}
+	if v.Kind() == reflect.Interface {
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
 		return src, nil
 	}

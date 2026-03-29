@@ -552,18 +552,11 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		// type name from the schema entry as fallback.
 		var bn, ln string
 		if u.node != nil {
-			bn = unionBranchName(u.node)
-			if u.node.logical != "" {
-				ln = u.node.kind + "." + u.node.logical
-			} else {
-				ln = bn
-			}
+			bn, ln = unionBranchNames(u.node)
 		} else if name != "" {
-			bn = name
-			ln = name
+			bn, ln = name, name
 		} else {
-			bn = typ
-			ln = typ
+			bn, ln = typ, typ
 		}
 		deser.branchNames = append(deser.branchNames, bn)
 		deser.logicalNames = append(deser.logicalNames, ln)

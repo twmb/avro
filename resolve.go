@@ -481,12 +481,7 @@ func resolveWriterUnion(r, w *schemaNode, path string, seen map[nodePair]*schema
 			return nil, err
 		}
 		branchDesers[i] = resolved.deser
-		bnames[i] = unionBranchName(wb)
-		if wb.logical != "" {
-			lnames[i] = wb.kind + "." + wb.logical
-		} else {
-			lnames[i] = bnames[i]
-		}
+		bnames[i], lnames[i] = unionBranchNames(wb)
 	}
 	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
 	return &schemaNode{
@@ -506,11 +501,29 @@ func resolveReaderUnion(r, w *schemaNode, path string, seen map[nodePair]*schema
 			if err != nil {
 				return nil, err
 			}
+			// The wire format has no union index (writer wrote a
+			// non-union value), so we can't use deserUnion.deser
+			// which reads a varint index. Wrap the resolved deser
+			// to apply TaggedUnions when active.
+			bn, ln := unionBranchNames(rb)
+			inner := resolved.deser
+			deser := func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+				src, err := inner(src, v, sl)
+				if err != nil || !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
+					return src, err
+				}
+				name := bn
+				if sl.tagLogicalTypes {
+					name = ln
+				}
+				v.Set(reflect.ValueOf(map[string]any{name: v.Elem().Interface()}))
+				return src, nil
+			}
 			return &schemaNode{
 				kind:     "union",
 				branches: r.branches,
 				ser:      r.ser,
-				deser:    resolved.deser,
+				deser:    deser,
 			}, nil
 		}
 	}
@@ -543,12 +556,7 @@ func resolveUnionUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaN
 			return nil, err
 		}
 		branchDesers[i] = resolved.deser
-		bnames[i] = unionBranchName(wb)
-		if wb.logical != "" {
-			lnames[i] = wb.kind + "." + wb.logical
-		} else {
-			lnames[i] = bnames[i]
-		}
+		bnames[i], lnames[i] = unionBranchNames(wb)
 	}
 	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
 	deser := du.deser

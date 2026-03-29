@@ -6792,17 +6792,17 @@ func TestSemanticErrorFormat(t *testing.T) {
 		{
 			"full",
 			&SemanticError{GoType: reflect.TypeFor[int](), AvroType: "string", Field: "name", Err: fmt.Errorf("oops")},
-			"avro: field name: cannot use Go type int with Avro type string: oops",
+			"avro: field name: cannot use int with Avro type string: oops",
 		},
 		{
 			"no field",
 			&SemanticError{GoType: reflect.TypeFor[string](), AvroType: "int"},
-			"avro: cannot use Go type string with Avro type int",
+			"avro: cannot use string with Avro type int",
 		},
 		{
 			"go type only",
 			&SemanticError{GoType: reflect.TypeFor[bool]()},
-			"avro: unsupported Go type bool",
+			"avro: unsupported type bool",
 		},
 		{
 			"avro type only",

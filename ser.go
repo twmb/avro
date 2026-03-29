@@ -575,7 +575,15 @@ func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 			}
 			dst = appendVarlong(dst, int64(n))
 		} else if fv, ok := jsonNumberToFloat(elem); ok {
-			dst = appendVarlong(dst, int64(fv.Float()))
+			f := fv.Float()
+			n := math.Trunc(f)
+			if f != n {
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
+			}
+			if n < -(1<<63) || n >= 1<<63 {
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
+			}
+			dst = appendVarlong(dst, int64(n))
 		} else {
 			return nil, &SemanticError{GoType: elem.Type(), AvroType: "long"}
 		}
@@ -798,7 +806,15 @@ func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 			}
 			dst = appendVarlong(dst, int64(n))
 		} else if fv, ok := jsonNumberToFloat(val); ok {
-			dst = appendVarlong(dst, int64(fv.Float()))
+			f := fv.Float()
+			n := math.Trunc(f)
+			if f != n {
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
+			}
+			if n < -(1<<63) || n >= 1<<63 {
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
+			}
+			dst = appendVarlong(dst, int64(n))
 		} else {
 			return nil, &SemanticError{GoType: val.Type(), AvroType: "long"}
 		}
