@@ -6,6 +6,7 @@ import (
 	"math"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -23,7 +24,8 @@ func (s *Schema) EncodeJSON(v any) ([]byte, error) {
 // targets (structs, etc.), the value is round-tripped through binary
 // encode/decode.
 //
-// See [Schema.EncodeJSON] for the Avro JSON format.
+// DecodeJSON also accepts the non-standard union branch naming used by
+// linkedin/goavro (e.g. "long.timestamp-millis" instead of "long").
 func (s *Schema) DecodeJSON(src []byte, v any) error {
 	var raw any
 	if err := json.Unmarshal(src, &raw); err != nil {
@@ -440,6 +442,20 @@ func findUnionBranch(union *schemaNode, name string) *schemaNode {
 	for _, b := range union.branches {
 		if unionBranchName(b) == name {
 			return b
+		}
+	}
+	// Fallback: goavro uses "type.logicalType" (e.g. "long.time-millis")
+	// as union branch names. Try matching primitive branches by the base
+	// type before the dot. Only matches primitives to avoid confusion with
+	// named types that might coincidentally share a primitive type name.
+	if base, _, ok := strings.Cut(name, "."); ok {
+		for _, b := range union.branches {
+			switch b.kind {
+			case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
+				if b.kind == base {
+					return b
+				}
+			}
 		}
 	}
 	return nil
