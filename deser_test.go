@@ -690,7 +690,7 @@ func TestRoundTripRecursive(t *testing.T) {
 
 func TestRoundTripInterface(t *testing.T) {
 	type Iface struct {
-		S stringer `avro:"s"`
+		S fmt.Stringer `avro:"s"`
 	}
 	schema := `{
 		"type": "record",

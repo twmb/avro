@@ -1578,3 +1578,41 @@ func TestEncodeJSONFixedFromString(t *testing.T) {
 		t.Errorf("got %s", got)
 	}
 }
+
+func TestEncodeJSONLogicalTypeRoundTrip(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		value  any
+		want   string
+	}{
+		{"date", `{"type":"int","logicalType":"date"}`, time.Date(1977, 5, 12, 0, 0, 0, 0, time.UTC), "2688"},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, time.Duration(35245000) * time.Millisecond, "35245000"},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, time.Duration(20192000) * time.Microsecond, "20192000"},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, time.UnixMilli(1687221496000).UTC(), "1687221496000"},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, time.UnixMicro(1687221496000000).UTC(), "1687221496000000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bin, err := s.Encode(tt.value)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			var native any
+			if _, err := s.Decode(bin, &native); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			got, err := s.EncodeJSON(native)
+			if err != nil {
+				t.Fatalf("EncodeJSON: %v", err)
+			}
+			if string(got) != tt.want {
+				t.Errorf("got %s, want %s", got, tt.want)
+			}
+		})
+	}
+}

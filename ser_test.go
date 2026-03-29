@@ -223,7 +223,7 @@ func TestSerNilPointer(t *testing.T) {
 }
 
 func TestSerNilInterface(t *testing.T) {
-	var v stringer
+	var v fmt.Stringer
 	encodeErr(t, `"string"`, &v)
 }
 
@@ -482,7 +482,7 @@ func TestSerIndirectNilPointer(t *testing.T) {
 }
 
 func TestSerIndirectNilInterface(t *testing.T) {
-	var iface stringer
+	var iface fmt.Stringer
 	v := reflect.ValueOf(&iface).Elem()
 	_, err := indirect(v)
 	if err == nil {
@@ -614,7 +614,7 @@ func (*IfaceF) String() string { return "f" }
 
 func TestInterface(t *testing.T) {
 	type Iface struct {
-		S stringer `avro:"s"`
+		S fmt.Stringer `avro:"s"`
 	}
 
 	s, err := Parse(`
