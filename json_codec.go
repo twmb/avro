@@ -10,12 +10,57 @@ import (
 	"time"
 )
 
-// EncodeJSON encodes v as Avro JSON. Avro JSON differs from standard JSON
-// in its handling of unions (non-null values are wrapped as {"type_name": value})
-// and bytes/fixed fields (encoded as strings with \uXXXX escapes).
+// JSONOpt configures [Schema.EncodeJSON] and [Schema.DecodeJSON] behavior.
+type JSONOpt int
+
+const (
+	// TaggedUnions wraps non-null union values as {"type_name": value}
+	// in [Schema.EncodeJSON] output. Without this option, union values
+	// are written as bare JSON values. [Schema.DecodeJSON] always
+	// accepts both tagged and bare formats regardless of this option.
+	TaggedUnions JSONOpt = iota + 1
+
+	// LinkedinFloats encodes NaN as JSON null and ±Infinity as ±1e999
+	// in [Schema.EncodeJSON], matching the linkedin/goavro convention.
+	// Without this option, NaN is encoded as the JSON string "NaN" and
+	// ±Infinity as "Infinity"/"-Infinity", following the Java Avro
+	// convention. [Schema.DecodeJSON] always accepts
+	// both conventions regardless of this option.
+	LinkedinFloats
+)
+
+type jsonConfig struct {
+	tagged  bool
+	linkedin bool
+}
+
+func parseJSONOpts(opts []JSONOpt) jsonConfig {
+	var cfg jsonConfig
+	for _, o := range opts {
+		switch o {
+		case TaggedUnions:
+			cfg.tagged = true
+		case LinkedinFloats:
+			cfg.linkedin = true
+		}
+	}
+	return cfg
+}
+
+// EncodeJSON encodes v as JSON using the schema for type-aware encoding.
+// By default, union values are written as bare JSON values and bytes/fixed
+// fields use \uXXXX escapes for non-ASCII bytes. Options can modify the
+// output format; see [JSONOpt] for details.
+//
+// NaN and Infinity float values are encoded as JSON strings "NaN",
+// "Infinity", and "-Infinity" by default (Java Avro convention), or as
+// null/±1e999 with [LinkedinFloats]. Standard [encoding/json.Marshal]
+// cannot represent these values; use EncodeJSON instead.
+//
 // EncodeJSON accepts the same Go types as [Schema.Encode].
-func (s *Schema) EncodeJSON(v any) ([]byte, error) {
-	return appendAvroJSON(nil, reflect.ValueOf(v), s.node)
+func (s *Schema) EncodeJSON(v any, opts ...JSONOpt) ([]byte, error) {
+	cfg := parseJSONOpts(opts)
+	return appendAvroJSON(nil, reflect.ValueOf(v), s.node, &cfg)
 }
 
 // DecodeJSON decodes Avro JSON from src into v. It unwraps union wrappers,
@@ -26,7 +71,11 @@ func (s *Schema) EncodeJSON(v any) ([]byte, error) {
 //
 // DecodeJSON also accepts the non-standard union branch naming used by
 // linkedin/goavro (e.g. "long.timestamp-millis" instead of "long").
-func (s *Schema) DecodeJSON(src []byte, v any) error {
+//
+// The opts parameter is reserved for future use. DecodeJSON currently
+// accepts all input formats (tagged and bare unions, Java and goavro
+// NaN/Infinity conventions) regardless of options.
+func (s *Schema) DecodeJSON(src []byte, v any, opts ...JSONOpt) error {
 	var raw any
 	if err := json.Unmarshal(src, &raw); err != nil {
 		return fmt.Errorf("avro: invalid JSON: %w", err)
@@ -47,7 +96,7 @@ func (s *Schema) DecodeJSON(src []byte, v any) error {
 // the Go value via reflect and the schema tree simultaneously, writing
 // JSON directly without an intermediate binary encoding step. Handles
 // structs, maps, all numeric coercions, time.Time, etc.
-func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, error) {
+func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *jsonConfig) ([]byte, error) {
 	// Handle nil / invalid values.
 	if !v.IsValid() {
 		if node.kind == "null" || node.kind == "union" {
@@ -58,7 +107,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 	// Dereference pointers and interfaces.
 	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
 		if v.IsNil() {
-			return appendAvroJSON(buf, reflect.Value{}, node)
+			return appendAvroJSON(buf, reflect.Value{}, node, cfg)
 		}
 		v = v.Elem()
 	}
@@ -112,13 +161,13 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 
 	case "float":
 		if v.CanFloat() {
-			return appendJSONFloat(buf, v.Float(), 32), nil
+			return appendJSONFloat(buf, v.Float(), 32, cfg), nil
 		}
 		return nil, fmt.Errorf("avro json: expected float, got %s", v.Type())
 
 	case "double":
 		if v.CanFloat() {
-			return appendJSONFloat(buf, v.Float(), 64), nil
+			return appendJSONFloat(buf, v.Float(), 64, cfg), nil
 		}
 		return nil, fmt.Errorf("avro json: expected double, got %s", v.Type())
 
@@ -130,16 +179,25 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 		return nil, fmt.Errorf("avro json: expected string, got %s", v.Type())
 
 	case "bytes":
-		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-			return appendAvroJSONBytes(buf, v.Bytes()), nil
-		}
 		// json.Number from decimal decode — write as JSON number.
 		if v.Type() == jsonNumberType {
 			return append(buf, v.String()...), nil
 		}
-		return nil, fmt.Errorf("avro json: expected []byte, got %s", v.Type())
+		if v.Kind() == reflect.String {
+			return appendAvroJSONBytes(buf, []byte(v.String())), nil
+		}
+		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+			return appendAvroJSONBytes(buf, v.Bytes()), nil
+		}
+		return nil, fmt.Errorf("avro json: expected []byte or string, got %s", v.Type())
 
 	case "fixed":
+		if v.Type() == jsonNumberType {
+			return append(buf, v.String()...), nil
+		}
+		if v.Kind() == reflect.String {
+			return appendAvroJSONBytes(buf, []byte(v.String())), nil
+		}
 		if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
 			raw := make([]byte, v.Len())
 			reflect.Copy(reflect.ValueOf(raw), v)
@@ -148,10 +206,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 			return appendAvroJSONBytes(buf, v.Bytes()), nil
 		}
-		if v.Type() == jsonNumberType {
-			return append(buf, v.String()...), nil
-		}
-		return nil, fmt.Errorf("avro json: expected []byte or [N]byte, got %s", v.Type())
+		return nil, fmt.Errorf("avro json: expected []byte, [N]byte, or string, got %s", v.Type())
 
 	case "enum":
 		if v.Kind() == reflect.String {
@@ -170,7 +225,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 				buf = append(buf, ',')
 			}
 			var err error
-			buf, err = appendAvroJSON(buf, v.Index(i), node.items)
+			buf, err = appendAvroJSON(buf, v.Index(i), node.items, cfg)
 			if err != nil {
 				return nil, err
 			}
@@ -193,7 +248,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 			buf = append(buf, key...)
 			buf = append(buf, ':')
 			var err error
-			buf, err = appendAvroJSON(buf, iter.Value(), node.values)
+			buf, err = appendAvroJSON(buf, iter.Value(), node.values, cfg)
 			if err != nil {
 				return nil, err
 			}
@@ -201,10 +256,10 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 		return append(buf, '}'), nil
 
 	case "record":
-		return appendAvroJSONRecord(buf, v, node)
+		return appendAvroJSONRecord(buf, v, node, cfg)
 
 	case "union":
-		return appendAvroJSONUnion(buf, v, node)
+		return appendAvroJSONUnion(buf, v, node, cfg)
 
 	default:
 		return nil, fmt.Errorf("avro json: unsupported schema kind %q", node.kind)
@@ -212,7 +267,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode) ([]byte, erro
 }
 
 // appendAvroJSONRecord handles record encoding for both structs and maps.
-func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode) ([]byte, error) {
+func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *jsonConfig) ([]byte, error) {
 	buf = append(buf, '{')
 	if v.Kind() == reflect.Map {
 		for i, f := range node.fields {
@@ -224,12 +279,18 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode) ([]byte
 			buf = append(buf, ':')
 			val := v.MapIndex(reflect.ValueOf(f.name))
 			if !val.IsValid() {
-				// Missing key — write default or null.
-				buf = append(buf, "null"...)
+				if !f.hasDefault {
+					return nil, fmt.Errorf("avro json: record %q missing required field %q", node.name, f.name)
+				}
+				defJSON, err := json.Marshal(f.defaultVal)
+				if err != nil {
+					return nil, fmt.Errorf("avro json: record %q field %q: marshaling default: %w", node.name, f.name, err)
+				}
+				buf = append(buf, defJSON...)
 				continue
 			}
 			var err error
-			buf, err = appendAvroJSON(buf, val, f.node)
+			buf, err = appendAvroJSON(buf, val, f.node, cfg)
 			if err != nil {
 				return nil, err
 			}
@@ -251,7 +312,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode) ([]byte
 			buf = append(buf, key...)
 			buf = append(buf, ':')
 			fv := v.FieldByIndex(mapping.indices[i])
-			buf, err = appendAvroJSON(buf, fv, f.node)
+			buf, err = appendAvroJSON(buf, fv, f.node, cfg)
 			if err != nil {
 				return nil, err
 			}
@@ -263,7 +324,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode) ([]byte
 }
 
 // appendAvroJSONUnion handles union encoding.
-func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode) ([]byte, error) {
+func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *jsonConfig) ([]byte, error) {
 	if !v.IsValid() || (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil() {
 		// unreachable: appendAvroJSON's deref loop converts nil pointers/interfaces
 		// to invalid values before dispatching here, but kept as a safety net.
@@ -273,15 +334,19 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode) ([]byte,
 		if branch.kind == "null" {
 			continue
 		}
-		encoded, err := appendAvroJSON(nil, v, branch)
+		encoded, err := appendAvroJSON(nil, v, branch, cfg)
 		if err == nil {
-			name := unionBranchName(branch)
-			buf = append(buf, '{')
-			key, _ := json.Marshal(name)
-			buf = append(buf, key...)
-			buf = append(buf, ':')
-			buf = append(buf, encoded...)
-			buf = append(buf, '}')
+			if cfg.tagged {
+				name := unionBranchName(branch)
+				buf = append(buf, '{')
+				key, _ := json.Marshal(name)
+				buf = append(buf, key...)
+				buf = append(buf, ':')
+				buf = append(buf, encoded...)
+				buf = append(buf, '}')
+			} else {
+				buf = append(buf, encoded...)
+			}
 			return buf, nil
 		}
 	}
@@ -293,7 +358,14 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode) ([]byte,
 // bytes/fixed \uXXXX strings to []byte.
 func fromAvroJSON(v any, node *schemaNode) (any, error) {
 	if v == nil {
-		return nil, nil
+		switch node.kind {
+		case "float":
+			return float32(math.NaN()), nil // null → NaN (goavro convention)
+		case "double":
+			return math.NaN(), nil // null → NaN (goavro convention)
+		default:
+			return nil, nil
+		}
 	}
 
 	switch node.kind {
@@ -307,33 +379,48 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 		return v, nil
 
 	case "string", "enum":
+		if _, ok := v.(string); !ok {
+			return nil, fmt.Errorf("avro json: expected string, got %T", v)
+		}
 		return v, nil
 
 	case "int":
-		if f, ok := v.(float64); ok {
-			if f < math.MinInt32 || f > math.MaxInt32 {
-				return nil, fmt.Errorf("avro json: value %v overflows int32", f)
-			}
-			return int32(f), nil
+		f, ok := v.(float64)
+		if !ok {
+			return nil, fmt.Errorf("avro json: expected number for int, got %T", v)
 		}
-		return v, nil
+		if f < math.MinInt32 || f > math.MaxInt32 {
+			return nil, fmt.Errorf("avro json: value %v overflows int32", f)
+		}
+		return int32(f), nil
 
 	case "long":
-		if f, ok := v.(float64); ok {
-			if f < -(1<<63) || f >= 1<<63 {
-				return nil, fmt.Errorf("avro json: value %v overflows int64", f)
-			}
-			return int64(f), nil
+		f, ok := v.(float64)
+		if !ok {
+			return nil, fmt.Errorf("avro json: expected number for long, got %T", v)
 		}
-		return v, nil // unreachable: json.Unmarshal always produces float64 for numbers
+		if f < -(1<<63) || f >= 1<<63 {
+			return nil, fmt.Errorf("avro json: value %v overflows int64", f)
+		}
+		return int64(f), nil
 
 	case "float":
-		if f, ok := v.(float64); ok {
-			return float32(f), nil
+		if s, ok := v.(string); ok {
+			return parseSpecialFloat32(s)
 		}
-		return v, nil // unreachable: json.Unmarshal always produces float64 for numbers
+		f, ok := v.(float64)
+		if !ok {
+			return nil, fmt.Errorf("avro json: expected number for float, got %T", v)
+		}
+		return float32(f), nil
 
 	case "double":
+		if s, ok := v.(string); ok {
+			return parseSpecialFloat64(s)
+		}
+		if _, ok := v.(float64); !ok {
+			return nil, fmt.Errorf("avro json: expected number for double, got %T", v)
+		}
 		return v, nil
 
 	case "bytes":
@@ -389,6 +476,9 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 		for _, f := range node.fields {
 			val, exists := m[f.name]
 			if !exists {
+				if !f.hasDefault {
+					return nil, fmt.Errorf("avro json: record %q missing required field %q", node.name, f.name)
+				}
 				continue
 			}
 			var err error
@@ -405,24 +495,27 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 			// before reaching this switch case, but kept as a safety net.
 			return nil, nil
 		}
-		// Avro JSON unions are {"type_name": value}. Also accept bare
-		// (unwrapped) values for leniency — the value is passed through
-		// to the binary encoder which resolves the correct branch.
-		m, ok := v.(map[string]any)
-		if !ok {
-			return v, nil
-		}
-		if len(m) != 1 {
-			return nil, fmt.Errorf("avro json: union object must have exactly one key, got %d", len(m))
-		}
-		for typeName, inner := range m {
-			branch := findUnionBranch(node, typeName)
-			if branch == nil {
-				return nil, fmt.Errorf("avro json: unknown union branch %q", typeName)
+		// Try tagged union: {"type_name": value} with exactly one key
+		// matching a union branch name.
+		if m, ok := v.(map[string]any); ok && len(m) == 1 {
+			for typeName, inner := range m {
+				if branch := findUnionBranch(node, typeName); branch != nil {
+					return fromAvroJSON(inner, branch)
+				}
 			}
-			return fromAvroJSON(inner, branch)
 		}
-		return nil, nil // unreachable: for loop always has at least one iteration since unions must have branches
+		// Bare (unwrapped) value — try each non-null branch. This handles
+		// both bare primitives and bare records (from EncodeJSON without
+		// TaggedUnions).
+		for _, branch := range node.branches {
+			if branch.kind == "null" {
+				continue
+			}
+			if result, err := fromAvroJSON(v, branch); err == nil {
+				return result, nil
+			}
+		}
+		return v, nil
 
 	default:
 		return nil, fmt.Errorf("avro json: unsupported schema kind %q", node.kind)
@@ -461,6 +554,34 @@ func findUnionBranch(union *schemaNode, name string) *schemaNode {
 		}
 	}
 	return nil
+}
+
+// parseSpecialFloat32 parses NaN/Infinity string representations (Java
+// convention and case-insensitive variants per AVRO-4217).
+func parseSpecialFloat32(s string) (float32, error) {
+	switch strings.ToLower(s) {
+	case "nan":
+		return float32(math.NaN()), nil
+	case "infinity", "inf":
+		return float32(math.Inf(1)), nil
+	case "-infinity", "-inf":
+		return float32(math.Inf(-1)), nil
+	}
+	return 0, fmt.Errorf("avro json: unknown float value %q", s)
+}
+
+// parseSpecialFloat64 parses NaN/Infinity string representations (Java
+// convention and case-insensitive variants per AVRO-4217).
+func parseSpecialFloat64(s string) (float64, error) {
+	switch strings.ToLower(s) {
+	case "nan":
+		return math.NaN(), nil
+	case "infinity", "inf":
+		return math.Inf(1), nil
+	case "-infinity", "-inf":
+		return math.Inf(-1), nil
+	}
+	return 0, fmt.Errorf("avro json: unknown double value %q", s)
 }
 
 // appendAvroJSONBytes encodes raw bytes as an Avro JSON string using
@@ -508,14 +629,25 @@ func avroJSONBytesToBytes(s string) ([]byte, error) {
 }
 
 // appendJSONFloat formats a float for JSON output, handling special values.
-func appendJSONFloat(buf []byte, f float64, bits int) []byte {
+// With LinkedinFloats, NaN encodes as null and ±Infinity as ±1e999 (goavro
+// convention). Otherwise NaN/Infinity encode as JSON strings (Java convention).
+func appendJSONFloat(buf []byte, f float64, bits int, cfg *jsonConfig) []byte {
 	if math.IsNaN(f) {
+		if cfg.linkedin {
+			return append(buf, "null"...)
+		}
 		return append(buf, `"NaN"`...)
 	}
 	if math.IsInf(f, 1) {
+		if cfg.linkedin {
+			return append(buf, "1e999"...)
+		}
 		return append(buf, `"Infinity"`...)
 	}
 	if math.IsInf(f, -1) {
+		if cfg.linkedin {
+			return append(buf, "-1e999"...)
+		}
 		return append(buf, `"-Infinity"`...)
 	}
 	return strconv.AppendFloat(buf, f, 'g', -1, bits)

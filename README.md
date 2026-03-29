@@ -405,23 +405,32 @@ Custom codecs can be provided via the `Codec` interface.
 `NewAppendWriter` opens an existing OCF for appending — it reads the header to
 recover the schema, codec, and sync marker, then seeks to the end.
 
-## Avro JSON
+## JSON Encoding
 
-`EncodeJSON` and `DecodeJSON` support the [Avro JSON encoding](https://avro.apache.org/docs/current/specification/#json-encoding),
-which differs from standard JSON in its handling of unions and bytes:
+`EncodeJSON` is a schema-aware JSON serializer. By default it produces standard
+JSON with bare union values and `\uXXXX`-encoded bytes:
 
 ```go
-// Encode: unions are wrapped as {"type_name": value}
+// Standard JSON (default): bare unions
 jsonBytes, err := schema.EncodeJSON(&user)
-// {"name":"Alice","email":{"string":"a@b.com"}}
+// {"name":"Alice","email":"a@b.com"}
 
-// Decode: unwraps unions automatically
+// Avro JSON: unions wrapped as {"type_name": value}
+jsonBytes, err = schema.EncodeJSON(&user, avro.TaggedUnions)
+// {"name":"Alice","email":{"string":"a@b.com"}}
+```
+
+`DecodeJSON` accepts both formats (tagged and bare unions) and all NaN/Infinity
+conventions:
+
+```go
 var user User
 err = schema.DecodeJSON(jsonBytes, &user)
 ```
 
-`EncodeJSON` accepts structs, maps, and all the same types as `Encode`.
-`DecodeJSON` accepts Avro JSON and decodes into any target type.
+NaN and Infinity float values are encoded as `"NaN"`, `"Infinity"`, `"-Infinity"`
+strings by default (Java Avro convention). Pass `LinkedinFloats` for
+the linkedin/goavro convention (`null` for NaN, `±1e999` for Infinity).
 
 ## Single Object Encoding
 

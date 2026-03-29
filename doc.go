@@ -2,10 +2,16 @@
 //
 // Parse an Avro JSON schema with [Parse] (or [MustParse] for package-level
 // vars), then call [Schema.Encode] / [Schema.Decode] for binary encoding,
-// or [Schema.EncodeJSON] / [Schema.DecodeJSON] for Avro JSON encoding.
+// or [Schema.EncodeJSON] / [Schema.DecodeJSON] for JSON encoding.
 // Use [SchemaFor] to infer a schema from a Go struct type, or
 // [Schema.Root] to inspect a parsed schema's structure. See
 // [Schema.Decode] for the full Go-to-Avro type mapping.
+//
+// [Schema.EncodeJSON] produces standard JSON by default (bare union values,
+// bytes as \uXXXX strings). Pass [TaggedUnions] to wrap union values as
+// {"type": value} (Avro JSON), or [LinkedinFloats] to encode NaN/Infinity
+// using the linkedin/goavro convention (null/±1e999 instead of
+// "NaN"/"Infinity" strings). [Schema.DecodeJSON] accepts all formats.
 //
 // # Basic usage
 //

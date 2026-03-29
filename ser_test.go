@@ -8,7 +8,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
-	"strings"
+
 	"testing"
 	"time"
 )
@@ -362,83 +362,72 @@ type valStringer struct{ v string }
 
 func (vs valStringer) String() string { return vs.v }
 
-func TestSerStringStringer(t *testing.T) {
+func TestSerStringRejectsStringer(t *testing.T) {
 	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Use a value-receiver stringer so indirect doesn't lose the method.
 	v := valStringer{v: "hello"}
-	dst, err := s.AppendEncode(nil, &v)
-	if err != nil {
-		t.Fatalf("encode stringer: %v", err)
-	}
-	if len(dst) == 0 {
-		t.Fatal("expected non-empty output")
+	_, err = s.AppendEncode(nil, &v)
+	if err == nil {
+		t.Fatal("expected error: Stringer should not be accepted for string fields")
 	}
 }
 
-func TestSerStringTextMarshaler(t *testing.T) {
+func TestSerStringRejectsTextMarshaler(t *testing.T) {
 	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	v := textMarshalerType{val: "hello"}
-	dst, err := s.AppendEncode(nil, &v)
-	if err != nil {
-		t.Fatalf("encode TextMarshaler: %v", err)
-	}
-	if len(dst) == 0 {
-		t.Fatal("expected non-empty output")
-	}
-}
-
-func TestSerStringTextMarshalerError(t *testing.T) {
-	s, err := Parse(`"string"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	v := textMarshalerErr{}
 	_, err = s.AppendEncode(nil, &v)
 	if err == nil {
-		t.Fatal("expected error from MarshalText")
+		t.Fatal("expected error: TextMarshaler should not be accepted for string fields")
 	}
 }
 
-func TestSerStringTextAppender(t *testing.T) {
+func TestSerStringRejectsJsonNumber(t *testing.T) {
 	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, val := range []string{
-		"hello",
-		"",
-		strings.Repeat("a", 200), // multi-byte varlong length
-	} {
-		v := textAppenderType{val: val}
-		dst, err := s.AppendEncode(nil, &v)
-		if err != nil {
-			t.Fatalf("encode TextAppender %q: %v", val, err)
-		}
-		var got string
-		if _, err := s.Decode(dst, &got); err != nil {
-			t.Fatalf("decode %q: %v", val, err)
-		}
-		if got != val {
-			t.Fatalf("got %q, want %q", got, val)
-		}
+	_, err = s.AppendEncode(nil, json.Number("42"))
+	if err == nil {
+		t.Fatal("expected error: json.Number should not be accepted for string fields")
 	}
 }
 
-func TestSerStringTextAppenderError(t *testing.T) {
+func TestSerStringRejectsJsonNumberInArray(t *testing.T) {
+	s, err := Parse(`{"type":"array","items":"string"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Encode([]any{json.Number("42")})
+	if err == nil {
+		t.Fatal("expected error: json.Number should not be accepted for string array items")
+	}
+}
+
+func TestSerStringRejectsJsonNumberInMap(t *testing.T) {
+	s, err := Parse(`{"type":"map","values":"string"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Encode(map[string]any{"k": json.Number("42")})
+	if err == nil {
+		t.Fatal("expected error: json.Number should not be accepted for string map values")
+	}
+}
+
+func TestSerStringRejectsTextAppender(t *testing.T) {
 	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v := textAppenderErr{}
+	v := textAppenderType{val: "hello"}
 	_, err = s.AppendEncode(nil, &v)
 	if err == nil {
-		t.Fatal("expected error from AppendText")
+		t.Fatal("expected error: TextAppender should not be accepted for string fields")
 	}
 }
 

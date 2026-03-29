@@ -1,7 +1,6 @@
 package avro
 
 import (
-	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,7 +21,7 @@ type serfn func([]byte, reflect.Value) ([]byte, error)
 //   - [encoding/json.Number] for any numeric Avro type (int, long, float, double)
 //   - RFC 3339 strings for timestamp and date logical types
 //   - [*big.Rat], [big.Rat], float64, [encoding/json.Number], and numeric strings for decimal logical types
-//   - [fmt.Stringer] and [encoding.TextMarshaler] for string types
+//   - []byte for string types (and vice versa)
 func (s *Schema) AppendEncode(dst []byte, v any) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
@@ -266,45 +265,15 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if v.Type() == jsonNumberType {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
+	}
 	if v.Kind() == reflect.String {
 		return doSerString(dst, v.String()), nil
 	}
 	// Accept []byte for symmetry with bytes accepting string.
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		return doSerString(dst, string(v.Bytes())), nil
-	}
-
-	if v.CanInterface() {
-		i := v.Interface()
-		if s, ok := i.(stringer); ok {
-			return doSerString(dst, s.String()), nil
-		}
-		if a, ok := i.(encoding.TextAppender); ok {
-			mark := len(dst)
-			dst = append(dst, 0) // reserve 1 byte for length prefix
-			var err error
-			if dst, err = a.AppendText(dst); err != nil {
-				return nil, err
-			}
-			textLen := len(dst) - mark - 1
-			var buf [10]byte
-			hdr := appendVarlong(buf[:0], int64(textLen))
-			if len(hdr) == 1 {
-				dst[mark] = hdr[0]
-			} else {
-				dst = append(dst, hdr[1:]...)                         // make room for extra header bytes
-				copy(dst[mark+len(hdr):], dst[mark+1:mark+1+textLen]) // shift text right
-				copy(dst[mark:], hdr)                                 // write length prefix
-			}
-			return dst, nil
-		}
-		if m, ok := i.(encoding.TextMarshaler); ok {
-			text, err := m.MarshalText()
-			if err != nil {
-				return nil, err
-			}
-			return doSerString(dst, string(text)), nil
-		}
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 }
@@ -494,6 +463,9 @@ func (s *serArray) serString(dst []byte, v reflect.Value) ([]byte, error) {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
 			elem = elem.Elem()
+		}
+		if elem.Type() == jsonNumberType {
+			return nil, &SemanticError{GoType: elem.Type(), AvroType: "string"}
 		}
 		if elem.Kind() == reflect.String {
 			dst = doSerString(dst, elem.String())
@@ -707,6 +679,9 @@ func (s *serMap) serString(dst []byte, v reflect.Value) ([]byte, error) {
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
 			val = val.Elem()
+		}
+		if val.Type() == jsonNumberType {
+			return nil, &SemanticError{GoType: val.Type(), AvroType: "string"}
 		}
 		if val.Kind() == reflect.String {
 			dst = doSerString(dst, val.String())
