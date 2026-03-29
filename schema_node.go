@@ -42,19 +42,20 @@ type SchemaNode struct {
 	Symbols  []string      // enum symbols
 	Size     int           // fixed byte size
 
-	Precision int               // decimal precision
-	Scale     int               // decimal scale
-	Props     map[string]string // custom properties
+	Precision int            // decimal precision
+	Scale     int            // decimal scale
+	Props     map[string]any // custom properties (any JSON value)
 }
 
 // SchemaField represents a field in an Avro record schema.
 type SchemaField struct {
-	Name    string            // field name
-	Type    SchemaNode        // field schema
-	Default any               // default value; nil means no default
-	Aliases []string          // field aliases for schema evolution
-	Doc     string            // documentation string
-	Props   map[string]string // custom properties (e.g. "connect.name")
+	Name       string         // field name
+	Type       SchemaNode     // field schema
+	Default    any            // default value (only meaningful when HasDefault is true)
+	HasDefault bool           // true if a default value is defined in the schema
+	Aliases    []string       // field aliases for schema evolution
+	Doc        string         // documentation string
+	Props      map[string]any // custom properties (any JSON value)
 }
 
 // Schema parses the SchemaNode into a [*Schema] that can be used for
@@ -75,7 +76,9 @@ func (n *SchemaNode) Schema() (*Schema, error) {
 // to access it repeatedly (e.g. in a per-message processing loop).
 func (s *Schema) Root() SchemaNode {
 	var raw any
-	json.Unmarshal([]byte(s.full), &raw) // cannot fail: s.full was validated by Parse
+	if err := json.Unmarshal([]byte(s.full), &raw); err != nil {
+		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
+	}
 	return nodeFromJSON(raw)
 }
 
@@ -142,7 +145,7 @@ func (n *SchemaNode) toJSON() any {
 				"name": f.Name,
 				"type": f.Type.toJSON(),
 			}
-			if f.Default != nil {
+			if f.HasDefault || f.Default != nil {
 				fd["default"] = f.Default
 			}
 			if len(f.Aliases) > 0 {
@@ -253,6 +256,7 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 			}
 			if d, ok := fm["default"]; ok {
 				sf.Default = d
+				sf.HasDefault = true
 			}
 			if doc, ok := fm["doc"].(string); ok {
 				sf.Doc = doc
@@ -267,12 +271,10 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 				if fieldReservedKeys[k] {
 					continue
 				}
-				if s, ok := v.(string); ok {
-					if sf.Props == nil {
-						sf.Props = make(map[string]string)
-					}
-					sf.Props[k] = s
+				if sf.Props == nil {
+					sf.Props = make(map[string]any)
 				}
+				sf.Props[k] = v
 			}
 			n.Fields[i] = sf
 		}
@@ -283,12 +285,10 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 		if schemaReservedKeys[k] {
 			continue
 		}
-		if s, ok := v.(string); ok {
-			if n.Props == nil {
-				n.Props = make(map[string]string)
-			}
-			n.Props[k] = s
+		if n.Props == nil {
+			n.Props = make(map[string]any)
 		}
+		n.Props[k] = v
 	}
 
 	return n

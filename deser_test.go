@@ -314,19 +314,28 @@ func TestRoundTripPrimitives(t *testing.T) {
 		}
 	})
 	t.Run("float", func(t *testing.T) {
-		for _, v := range []float32{0, 1.5, -1.5, math.MaxFloat32, math.SmallestNonzeroFloat32} {
+		for _, v := range []float32{0, 1.5, -1.5, math.MaxFloat32, math.SmallestNonzeroFloat32, float32(math.Inf(1)), float32(math.Inf(-1))} {
 			got := roundTrip(t, `"float"`, v)
 			if got != v {
 				t.Errorf("got %v, want %v", got, v)
 			}
 		}
+		// NaN != NaN, so test separately.
+		got := roundTrip(t, `"float"`, float32(math.NaN()))
+		if !math.IsNaN(float64(got)) {
+			t.Errorf("NaN round-trip: got %v", got)
+		}
 	})
 	t.Run("double", func(t *testing.T) {
-		for _, v := range []float64{0, 1.5, -1.5, math.MaxFloat64, math.SmallestNonzeroFloat64} {
+		for _, v := range []float64{0, 1.5, -1.5, math.MaxFloat64, math.SmallestNonzeroFloat64, math.Inf(1), math.Inf(-1)} {
 			got := roundTrip(t, `"double"`, v)
 			if got != v {
 				t.Errorf("got %v, want %v", got, v)
 			}
+		}
+		got := roundTrip(t, `"double"`, math.NaN())
+		if !math.IsNaN(got) {
+			t.Errorf("NaN round-trip: got %v", got)
 		}
 	})
 	t.Run("bytes", func(t *testing.T) {

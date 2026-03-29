@@ -156,6 +156,24 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool) {
 	return reflect.ValueOf(f), true
 }
 
+// jsonNumberToInt64 converts a json.Number reflect.Value to a validated int64,
+// checking that the value is a whole number within int64 range.
+func jsonNumberToInt64(v reflect.Value) (int64, bool, error) {
+	fv, ok := jsonNumberToFloat(v)
+	if !ok {
+		return 0, false, nil
+	}
+	f := fv.Float()
+	n := math.Trunc(f)
+	if f != n {
+		return 0, true, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
+	}
+	if n < -(1<<63) || n >= 1<<63 {
+		return 0, true, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
+	}
+	return int64(n), true, nil
+}
+
 func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
@@ -574,16 +592,11 @@ func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 			}
 			dst = appendVarlong(dst, int64(n))
-		} else if fv, ok := jsonNumberToFloat(elem); ok {
-			f := fv.Float()
-			n := math.Trunc(f)
-			if f != n {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
+		} else if n, ok, err := jsonNumberToInt64(elem); ok {
+			if err != nil {
+				return nil, err
 			}
-			if n < -(1<<63) || n >= 1<<63 {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
-			}
-			dst = appendVarlong(dst, int64(n))
+			dst = appendVarlong(dst, n)
 		} else {
 			return nil, &SemanticError{GoType: elem.Type(), AvroType: "long"}
 		}
@@ -805,16 +818,11 @@ func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 			}
 			dst = appendVarlong(dst, int64(n))
-		} else if fv, ok := jsonNumberToFloat(val); ok {
-			f := fv.Float()
-			n := math.Trunc(f)
-			if f != n {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
+		} else if n, ok, err := jsonNumberToInt64(val); ok {
+			if err != nil {
+				return nil, err
 			}
-			if n < -(1<<63) || n >= 1<<63 {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
-			}
-			dst = appendVarlong(dst, int64(n))
+			dst = appendVarlong(dst, n)
 		} else {
 			return nil, &SemanticError{GoType: val.Type(), AvroType: "long"}
 		}

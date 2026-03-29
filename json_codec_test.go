@@ -1741,16 +1741,22 @@ func TestDecodeJSONBareUnionFallthrough(t *testing.T) {
 
 func TestDecodeJSONTaggedFloatNull(t *testing.T) {
 	// {"float": null} in a ["null","float"] union — the null is inside
-	// the float branch. This is contrived but should not panic.
+	// the float branch, which decodes as NaN (goavro convention).
 	s, err := Parse(`["null","float"]`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var v any
-	err = s.DecodeJSON([]byte(`{"float":null}`), &v)
-	// This decodes null as NaN for the float branch (goavro compat).
-	// The value should encode successfully.
-	t.Logf("tagged float null: err=%v val=%v", err, v)
+	if err := s.DecodeJSON([]byte(`{"float":null}`), &v); err != nil {
+		t.Fatalf("DecodeJSON: %v", err)
+	}
+	f, ok := v.(float32)
+	if !ok {
+		t.Fatalf("expected float32, got %T: %v", v, v)
+	}
+	if !math.IsNaN(float64(f)) {
+		t.Fatalf("expected NaN, got %v", f)
+	}
 }
 
 func TestSerStringJsonNumberInUnion(t *testing.T) {
@@ -1879,5 +1885,84 @@ func TestEncodeJSONDurationRoundTrip(t *testing.T) {
 	}
 	if got := rt.(Duration); got != d {
 		t.Fatalf("round-trip: got %+v, want %+v", got, d)
+	}
+}
+
+func TestEncodeJSONStructCacheSharing(t *testing.T) {
+	// Verify that binary Encode and EncodeJSON share the typeFieldMapping
+	// cache on serRecord: calling one warms the cache for the other.
+	type R struct {
+		Name string `avro:"name"`
+		Age  int32  `avro:"age"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"name","type":"string"},
+		{"name":"age","type":"int"}
+	]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := R{Name: "Alice", Age: 30}
+
+	// Binary encode first — warms the cache.
+	bin, err := s.Encode(&v)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if len(bin) == 0 {
+		t.Fatal("empty binary output")
+	}
+
+	// JSON encode second — should reuse the cached mapping.
+	j, err := s.EncodeJSON(&v)
+	if err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	if string(j) != `{"name":"Alice","age":30}` {
+		t.Errorf("got %s", j)
+	}
+
+	// Reverse order: JSON first, binary second, fresh schema.
+	s2, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j2, err := s2.EncodeJSON(&v)
+	if err != nil {
+		t.Fatalf("EncodeJSON first: %v", err)
+	}
+	if string(j2) != `{"name":"Alice","age":30}` {
+		t.Errorf("got %s", j2)
+	}
+	bin2, err := s2.Encode(&v)
+	if err != nil {
+		t.Fatalf("Encode second: %v", err)
+	}
+	if len(bin2) == 0 {
+		t.Fatal("empty binary output")
+	}
+
+	// Concurrent: both paths simultaneously.
+	s3, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const goroutines = 8
+	errs := make(chan error, goroutines*2)
+	for range goroutines {
+		go func() {
+			_, err := s3.Encode(&v)
+			errs <- err
+		}()
+		go func() {
+			_, err := s3.EncodeJSON(&v)
+			errs <- err
+		}()
+	}
+	for range goroutines * 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -50,6 +50,10 @@ func NewSchemaCache() *SchemaCache {
 func (c *SchemaCache) Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.named == nil {
+		c.named = make(map[string]*namedType)
+		c.dedup = make(map[[32]byte]*Schema)
+	}
 
 	dec := json.NewDecoder(strings.NewReader(schema))
 	dec.UseNumber()

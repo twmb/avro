@@ -573,18 +573,10 @@ func resolveUnionUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaN
 }
 
 // defaultStringToBytes converts a JSON-decoded string to raw bytes for Avro
-// bytes/fixed defaults. The Avro spec says code points 0-255 map to byte values
-// 0-255. json.Unmarshal decodes \u00FF to multi-byte UTF-8, so we must convert
-// each rune back to a single byte.
+// bytes/fixed defaults. Delegates to avroJSONBytesToBytes since both perform
+// the same code-point-to-byte conversion.
 func defaultStringToBytes(s string) ([]byte, error) {
-	b := make([]byte, 0, len(s))
-	for _, r := range s {
-		if r > 255 {
-			return nil, fmt.Errorf("bytes/fixed default contains code point U+%04X, max allowed is U+00FF", r)
-		}
-		b = append(b, byte(r))
-	}
-	return b, nil
+	return avroJSONBytesToBytes(s)
 }
 
 // encodeDefault converts a parsed JSON default value to Avro binary encoding.

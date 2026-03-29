@@ -256,15 +256,6 @@ func validName(s string) bool {
 	return true
 }
 
-var acomplex = map[string]struct{}{
-	"record": {},
-	"error":  {},
-	"enum":   {},
-	"array":  {},
-	"map":    {},
-	"fixed":  {},
-}
-
 // Fixup types for forward references. Avro allows named types to be
 // referenced before they are defined (e.g. a union branch or record field
 // whose type hasn't been parsed yet). We record what needs patching and

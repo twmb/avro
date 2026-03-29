@@ -85,7 +85,8 @@ func parseOpts(opts []Opt) optConfig {
 // null/±1e999 with [LinkedinFloats]. Standard [encoding/json.Marshal]
 // cannot represent these values; use EncodeJSON instead.
 //
-// EncodeJSON accepts the same Go types as [Schema.Encode].
+// EncodeJSON accepts the same Go types as [Schema.Encode]. Map key order in
+// the output is non-deterministic, as with [encoding/json.Marshal].
 func (s *Schema) EncodeJSON(v any, opts ...Opt) ([]byte, error) {
 	cfg := parseOpts(opts)
 	return appendAvroJSON(nil, reflect.ValueOf(v), s.node, &cfg)
@@ -225,8 +226,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 
 	case "string":
 		if v.Kind() == reflect.String {
-			b, _ := json.Marshal(v.String())
-			return append(buf, b...), nil
+			return appendJSONString(buf, v.String()), nil
 		}
 		return nil, fmt.Errorf("avro json: expected string, got %s", v.Type())
 
@@ -279,8 +279,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 
 	case "enum":
 		if v.Kind() == reflect.String {
-			b, _ := json.Marshal(v.String())
-			return append(buf, b...), nil
+			return appendJSONString(buf, v.String()), nil
 		}
 		return nil, fmt.Errorf("avro json: expected string for enum, got %s", v.Type())
 
@@ -313,8 +312,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				buf = append(buf, ',')
 			}
 			first = false
-			key, _ := json.Marshal(iter.Key().String())
-			buf = append(buf, key...)
+			buf = appendJSONString(buf, iter.Key().String())
 			buf = append(buf, ':')
 			var err error
 			buf, err = appendAvroJSON(buf, iter.Value(), node.values, cfg)
@@ -343,8 +341,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			if i > 0 {
 				buf = append(buf, ',')
 			}
-			key, _ := json.Marshal(f.name)
-			buf = append(buf, key...)
+			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
 			val := v.MapIndex(reflect.ValueOf(f.name))
 			if !val.IsValid() {
@@ -369,7 +366,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 		for i, f := range node.fields {
 			names[i] = f.name
 		}
-		mapping, err := typeFieldMapping(names, nil, v.Type())
+		mapping, err := typeFieldMapping(names, &node.serRecord.cache, v.Type())
 		if err != nil {
 			return nil, err
 		}
@@ -377,8 +374,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			if i > 0 {
 				buf = append(buf, ',')
 			}
-			key, _ := json.Marshal(f.name)
-			buf = append(buf, key...)
+			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
 			fv := v.FieldByIndex(mapping.indices[i])
 			buf, err = appendAvroJSON(buf, fv, f.node, cfg)
@@ -412,8 +408,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 					name = ln
 				}
 				buf = append(buf, '{')
-				key, _ := json.Marshal(name)
-				buf = append(buf, key...)
+				buf = appendJSONString(buf, name)
 				buf = append(buf, ':')
 				buf = append(buf, encoded...)
 				buf = append(buf, '}')
@@ -497,7 +492,7 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 
 	case "double":
 		if s, ok := v.(string); ok {
-			return parseSpecialFloat64(s)
+			return parseSpecialFloat(s)
 		}
 		if _, ok := v.(float64); !ok {
 			return nil, fmt.Errorf("avro json: expected number for double, got %T", v)
@@ -596,7 +591,7 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 				return result, nil
 			}
 		}
-		return v, nil
+		return nil, fmt.Errorf("avro json: no union branch matched value of type %T", v)
 
 	default:
 		return nil, fmt.Errorf("avro json: unsupported schema kind %q", node.kind)
@@ -671,10 +666,6 @@ func parseSpecialFloat32(s string) (float32, error) {
 	return float32(f), err
 }
 
-func parseSpecialFloat64(s string) (float64, error) {
-	return parseSpecialFloat(s)
-}
-
 // appendAvroJSONBytes encodes raw bytes as an Avro JSON string using
 // ISO-8859-1 encoding, matching the Java canonical implementation.
 // Printable ASCII bytes (0x20-0x7E, except " and \) are written as
@@ -702,6 +693,28 @@ func hexDigit(b byte) byte {
 		return '0' + b
 	}
 	return 'A' - 10 + b
+}
+
+const jsonHex = "0123456789abcdef"
+
+// appendJSONString appends a JSON-encoded string to buf, escaping as needed.
+// This avoids the allocation that json.Marshal(s) would require.
+func appendJSONString(buf []byte, s string) []byte {
+	buf = append(buf, '"')
+	for i := range len(s) {
+		c := s[i]
+		switch {
+		case c == '"':
+			buf = append(buf, '\\', '"')
+		case c == '\\':
+			buf = append(buf, '\\', '\\')
+		case c < 0x20:
+			buf = append(buf, '\\', 'u', '0', '0', jsonHex[c>>4], jsonHex[c&0xf])
+		default:
+			buf = append(buf, c)
+		}
+	}
+	return append(buf, '"')
 }
 
 // avroJSONBytesToBytes decodes an Avro JSON bytes string (\uXXXX per byte)

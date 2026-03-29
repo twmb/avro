@@ -786,3 +786,44 @@ func TestSchemaCacheConflictingDefinition(t *testing.T) {
 		t.Fatal("expected error for conflicting definition of Foo")
 	}
 }
+
+func TestSchemaCacheZeroValue(t *testing.T) {
+	// A zero-value SchemaCache should work without NewSchemaCache.
+	var c SchemaCache
+	s, err := c.Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Encode(int32(42)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSchemaCacheConcurrent(t *testing.T) {
+	cache := NewSchemaCache()
+	_, err := cache.Parse(`{
+		"type": "record",
+		"name": "Base",
+		"fields": [{"name": "id", "type": "int"}]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const goroutines = 8
+	errs := make(chan error, goroutines)
+	for range goroutines {
+		go func() {
+			_, err := cache.Parse(`{
+				"type": "record",
+				"name": "Wrapper",
+				"fields": [{"name": "base", "type": "Base"}]
+			}`)
+			errs <- err
+		}()
+	}
+	for range goroutines {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}

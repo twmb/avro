@@ -7,7 +7,6 @@ import (
 	"math/big"
 	"reflect"
 	"strings"
-	"time"
 )
 
 // SchemaOpt configures [SchemaFor].
@@ -353,10 +352,8 @@ func parseSchemaTag(sf reflect.StructField, parts []string, index []int) (schema
 }
 
 var (
-	timeTimeType     = reflect.TypeFor[time.Time]()
-	timeDurationType = reflect.TypeFor[time.Duration]()
-	bigRatPtrType    = reflect.TypeFor[*big.Rat]()
-	bigRatValueType  = reflect.TypeFor[big.Rat]()
+	bigRatPtrType   = reflect.TypeFor[*big.Rat]()
+	bigRatValueType = reflect.TypeFor[big.Rat]()
 )
 
 // inferField builds the Avro field definition for a single struct field.
@@ -399,7 +396,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 
 	// Logical types for known Go types.
 	switch t {
-	case timeTimeType:
+	case timeType:
 		lt := logical
 		if lt == "" {
 			lt = "timestamp-millis"
@@ -410,7 +407,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}
 		return map[string]any{"type": base, "logicalType": lt}, nil
 
-	case timeDurationType:
+	case durationType:
 		lt := logical
 		if lt == "" {
 			lt = "time-millis"

@@ -203,7 +203,6 @@ func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, 
 	return src, nil
 }
 
-var errUnsafeNilPtr = errors.New("invalid nil in non-union, non-null")
 
 // tryCompileFieldSer returns a userfn for fields that can be fully handled
 // via unsafe pointer access. Returns nil for complex types that must use
@@ -298,7 +297,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 			pp := *(*unsafe.Pointer)(p)
 			if pp == nil {
-				return nil, errUnsafeNilPtr
+				return nil, errIndirectNil
 			}
 			return inner(dst, pp)
 		}
@@ -1287,7 +1286,7 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 		var err error
 		for _, pp := range s {
 			if pp == nil {
-				return nil, errUnsafeNilPtr
+				return nil, errIndirectNil
 			}
 			if useFast {
 				dst, err = serRecordFastPtr(dst, fast, pp)
