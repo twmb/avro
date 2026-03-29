@@ -438,13 +438,10 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		return map[string]any{"type": "string", "logicalType": "uuid"}, nil
 	}
 
-	// Types implementing standard string interfaces are inferred as
-	// string, matching the encoder's behavior.
-	for _, iface := range []reflect.Type{
-		reflect.TypeFor[encoding.TextMarshaler](),
-		reflect.TypeFor[encoding.TextAppender](),
-		reflect.TypeFor[fmt.Stringer](),
-	} {
+	// Types implementing TextUnmarshaler are inferred as string,
+	// allowing decode into custom string-like types.
+	{
+		iface := reflect.TypeFor[encoding.TextUnmarshaler]()
 		if t.Implements(iface) || reflect.PointerTo(t).Implements(iface) {
 			return "string", nil
 		}

@@ -19,7 +19,7 @@ fingerprinting.
 - [Logical Types](#logical-types)
 - [Schema Evolution](#schema-evolution)
 - [Object Container Files](#object-container-files)
-- [Avro JSON](#avro-json)
+- [JSON Encoding](#json-encoding)
 - [Single Object Encoding](#single-object-encoding)
 - [Fingerprinting](#fingerprinting)
 - [Performance](#performance)
@@ -90,11 +90,13 @@ encoding and decoding.
 
 When decoding into `any`, values use their natural Go types: `nil`, `bool`,
 `int32`, `int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`,
-`map[string]any`.
+`map[string]any`. Logical types use `time.Time` (UTC) for timestamps and
+dates, `time.Duration` for time-of-day types, `json.Number` for decimals,
+and `avro.Duration` for the duration logical type.
 
-Encoding also accepts `fmt.Stringer` and `encoding.TextMarshaler` for string
-types, and `json.Number` for any numeric type (supporting
-`json.Decoder.UseNumber()` pipelines).
+Encoding also accepts `json.Number` for any numeric type (supporting
+`json.Decoder.UseNumber()` pipelines) and `[]byte` for string fields (and
+vice versa).
 
 ## Struct Tags
 
@@ -233,8 +235,7 @@ schema, err := node.Schema()
 
 ## Logical Types
 
-Logical types are decoded into natural Go types when available, and fall back
-to the underlying Avro type otherwise.
+Logical types decode to their natural Go equivalents:
 
 | Logical Type | Avro Type | Encode | Decode |
 |---|---|---|---|
@@ -416,7 +417,7 @@ jsonBytes, err := schema.EncodeJSON(&user)
 // {"name":"Alice","email":"a@b.com"}
 
 // Avro JSON: unions wrapped as {"type_name": value}
-jsonBytes, err = schema.EncodeJSON(&user, avro.TaggedUnions)
+jsonBytes, err = schema.EncodeJSON(&user, avro.TaggedUnions())
 // {"name":"Alice","email":{"string":"a@b.com"}}
 ```
 
@@ -428,8 +429,17 @@ var user User
 err = schema.DecodeJSON(jsonBytes, &user)
 ```
 
+`Decode` and `DecodeJSON` also accept `TaggedUnions()` to wrap union values
+when decoding into `*any`:
+
+```go
+var native any
+schema.Decode(binary, &native, avro.TaggedUnions())
+// native["email"] is map[string]any{"string": "a@b.com"}
+```
+
 NaN and Infinity float values are encoded as `"NaN"`, `"Infinity"`, `"-Infinity"`
-strings by default (Java Avro convention). Pass `LinkedinFloats` for
+strings by default (Java Avro convention). Pass `LinkedinFloats()` for
 the linkedin/goavro convention (`null` for NaN, `±1e999` for Infinity).
 
 ## Single Object Encoding

@@ -473,14 +473,22 @@ func resolveMap(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*
 // All writer branches must be compatible with the single reader type.
 func resolveWriterUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
 	branchDesers := make([]deserfn, len(w.branches))
+	bnames := make([]string, len(w.branches))
+	lnames := make([]string, len(w.branches))
 	for i, wb := range w.branches {
 		resolved, err := resolveNode(r, wb, path, seen)
 		if err != nil {
 			return nil, err
 		}
 		branchDesers[i] = resolved.deser
+		bnames[i] = unionBranchName(wb)
+		if wb.logical != "" {
+			lnames[i] = wb.kind + "." + wb.logical
+		} else {
+			lnames[i] = bnames[i]
+		}
 	}
-	du := &deserUnion{fns: branchDesers}
+	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
 	return &schemaNode{
 		kind:  r.kind,
 		name:  r.name,
@@ -518,6 +526,8 @@ func resolveReaderUnion(r, w *schemaNode, path string, seen map[nodePair]*schema
 // Map each writer branch to its best matching reader branch.
 func resolveUnionUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
 	branchDesers := make([]deserfn, len(w.branches))
+	bnames := make([]string, len(w.branches))
+	lnames := make([]string, len(w.branches))
 	for i, wb := range w.branches {
 		rb := findMatchingBranch(r, wb)
 		if rb == nil {
@@ -533,8 +543,14 @@ func resolveUnionUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaN
 			return nil, err
 		}
 		branchDesers[i] = resolved.deser
+		bnames[i] = unionBranchName(wb)
+		if wb.logical != "" {
+			lnames[i] = wb.kind + "." + wb.logical
+		} else {
+			lnames[i] = bnames[i]
+		}
 	}
-	du := &deserUnion{fns: branchDesers}
+	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
 	deser := du.deser
 	// Null-union optimization.
 	if len(w.branches) == 2 && w.branches[0].kind == "null" {

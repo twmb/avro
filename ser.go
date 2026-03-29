@@ -22,13 +22,13 @@ type serfn func([]byte, reflect.Value) ([]byte, error)
 //   - RFC 3339 strings for timestamp and date logical types
 //   - [*big.Rat], [big.Rat], float64, [encoding/json.Number], and numeric strings for decimal logical types
 //   - []byte for string types (and vice versa)
-func (s *Schema) AppendEncode(dst []byte, v any) ([]byte, error) {
+func (s *Schema) AppendEncode(dst []byte, v any, opts ...Opt) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
 
 // Encode encodes v as Avro binary. It is shorthand for AppendEncode(nil, v).
-func (s *Schema) Encode(v any) ([]byte, error) {
-	return s.AppendEncode(nil, v)
+func (s *Schema) Encode(v any, opts ...Opt) ([]byte, error) {
+	return s.AppendEncode(nil, v, opts...)
 }
 
 ///////////

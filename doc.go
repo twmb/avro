@@ -4,14 +4,7 @@
 // vars), then call [Schema.Encode] / [Schema.Decode] for binary encoding,
 // or [Schema.EncodeJSON] / [Schema.DecodeJSON] for JSON encoding.
 // Use [SchemaFor] to infer a schema from a Go struct type, or
-// [Schema.Root] to inspect a parsed schema's structure. See
-// [Schema.Decode] for the full Go-to-Avro type mapping.
-//
-// [Schema.EncodeJSON] produces standard JSON by default (bare union values,
-// bytes as \uXXXX strings). Pass [TaggedUnions] to wrap union values as
-// {"type": value} (Avro JSON), or [LinkedinFloats] to encode NaN/Infinity
-// using the linkedin/goavro convention (null/±1e999 instead of
-// "NaN"/"Infinity" strings). [Schema.DecodeJSON] accepts all formats.
+// [Schema.Root] to inspect a parsed schema's structure.
 //
 // # Basic usage
 //
@@ -36,44 +29,19 @@
 //	var u User
 //	_, err = schema.Decode(data, &u)
 //
-// # Map encoding and defaults
+// # JSON encoding
 //
-// When encoding a map[string]any as a record, any field whose key is absent
-// from the map is filled from the schema's default value. If a field has no
-// default and the key is missing, encoding returns an error. This does not
-// apply to struct encoding, where fields are always present (though they may
-// be zero-valued; see the omitzero tag option).
+// [Schema.EncodeJSON] is schema-aware and handles bytes, unions, and
+// NaN/Infinity floats correctly — use it instead of [encoding/json.Marshal]
+// when serializing decoded Avro data to JSON. Pass [TaggedUnions] for
+// Avro JSON union wrappers ({"type": value}).
 //
-//	schema := avro.MustParse(`{
-//	    "type": "record", "name": "Event",
-//	    "fields": [
-//	        {"name": "id",   "type": "string"},
-//	        {"name": "tags", "type": {"type": "array", "items": "string"}, "default": []}
-//	    ]
-//	}`)
+// # Encoding from JSON input
 //
-//	// "tags" is absent from the map, so the schema default ([]) is used.
-//	data, err := schema.Encode(map[string]any{"id": "abc"})
-//
-// Note: the Avro spec says defaults are for schema evolution at read time, but
-// in Go the common pattern is json.Unmarshal into map[string]any, where keys
-// for defaulted fields are simply absent. Filling them from schema defaults at
-// encode time is consistent with hamba/avro and linkedin/goavro.
-//
-// Timestamp and date logical types also accept RFC 3339 strings when
-// encoding:
-//
-//	schema := avro.MustParse(`{
-//	    "type": "record", "name": "Event",
-//	    "fields": [
-//	        {"name": "id",         "type": "string"},
-//	        {"name": "created_at", "type": {"type": "long", "logicalType": "timestamp-millis"}}
-//	    ]
-//	}`)
-//
-//	var record any
-//	json.Unmarshal([]byte(`{"id":"abc","created_at":"2026-03-19T10:00:00Z"}`), &record)
-//	data, err := schema.Encode(record) // string parsed as RFC 3339
+// Data from [encoding/json.Unmarshal] (map[string]any with float64 numbers
+// and string timestamps) can be encoded directly. Missing map keys are
+// filled from schema defaults, [encoding/json.Number] is accepted for all
+// numeric types, and timestamp fields accept RFC 3339 strings.
 //
 // # Schema evolution
 //
@@ -135,63 +103,21 @@
 //
 // # Struct tags
 //
-// Struct fields are matched to Avro record fields by name. Use the "avro"
-// struct tag to control the mapping:
+// Use the "avro" struct tag to control field mapping:
 //
-//	type Example struct {
-//	    Name    string  `avro:"name"`          // maps to Avro field "name"
-//	    Ignored int     `avro:"-"`             // excluded from encoding/decoding
-//	    Inner   Nested  `avro:",inline"`       // inline Nested's fields into this record
-//	    Value   int     `avro:"val,omitzero"`  // encode zero value as Avro default
-//	}
+//	avro:"name"           // map to Avro field "name"
+//	avro:"-"              // exclude field
+//	avro:",inline"        // flatten nested struct fields
+//	avro:",omitzero"      // use schema default for zero values
 //
-// The tag format is:
+// Embedded structs are inlined by default. See the README for the full
+// tag reference.
 //
-//	avro:"[name][,option][,option]..."
+// # Other features
 //
-// The name portion maps the struct field to the Avro field with that name. If
-// empty, the Go field name is used as-is. A tag of "-" excludes the field
-// entirely.
-//
-// Supported options:
-//
-//   - inline: flatten a nested struct's fields into the parent record,
-//     as if they were declared directly on the parent. The field must be a
-//     struct or pointer to struct. This works like anonymous (embedded) struct
-//     fields, but for named fields. When using inline, the name portion of
-//     the tag must be empty.
-//
-//   - omitzero: when encoding, if the field is the zero value for its type
-//     (or implements an IsZero() bool method that returns true), the Avro
-//     default value from the schema is used instead. This is useful for
-//     optional fields in ["null", T] unions or fields with explicit defaults.
-//
-// Embedded (anonymous) struct fields are automatically inlined — their
-// fields are promoted into the parent as if declared directly. To prevent
-// inlining an embedded struct, give it an explicit name tag:
-//
-//	type Parent struct {
-//	    Nested                    // inlined: Nested's fields are promoted
-//	    Other  Aux `avro:"other"` // not inlined: treated as a single field
-//	}
-//
-// When multiple fields at different depths resolve to the same Avro field
-// name, the shallowest field wins. Among fields at the same depth, a tagged
-// field wins over an untagged one.
-//
-// # Single Object Encoding
-//
-// For sending self-describing values over the wire (as opposed to files,
-// where OCF is preferred), use [Schema.AppendSingleObject] and
-// [Schema.DecodeSingleObject]. To decode without knowing the schema in
-// advance, extract the fingerprint with [SingleObjectFingerprint] and look
-// it up in your own registry.
-//
-// # Fingerprinting
-//
-// [Schema.Canonical] returns the Parsing Canonical Form for deterministic
-// comparison. [Schema.Fingerprint] hashes it with any [hash.Hash]; use
-// [NewRabin] for the Avro-standard CRC-64-AVRO.
+//   - Single Object Encoding: [Schema.AppendSingleObject], [Schema.DecodeSingleObject]
+//   - Fingerprinting: [Schema.Canonical], [Schema.Fingerprint], [NewRabin]
+//   - Object Container Files: the [github.com/twmb/avro/ocf] sub-package
 //
 // [Avro specification]: https://avro.apache.org/docs/current/specification/
 package avro

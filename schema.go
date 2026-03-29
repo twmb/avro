@@ -546,6 +546,27 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		b.canon.union = append(b.canon.union, u.canon)
 		ser.fns = append(ser.fns, u.ser)
 		deser.fns = append(deser.fns, u.deser)
+
+		// Branch names for TaggedUnions wrapping.
+		// u.node may be nil for forward-referenced types; use the
+		// type name from the schema entry as fallback.
+		var bn, ln string
+		if u.node != nil {
+			bn = unionBranchName(u.node)
+			if u.node.logical != "" {
+				ln = u.node.kind + "." + u.node.logical
+			} else {
+				ln = bn
+			}
+		} else if name != "" {
+			bn = name
+			ln = name
+		} else {
+			bn = typ
+			ln = typ
+		}
+		deser.branchNames = append(deser.branchNames, bn)
+		deser.logicalNames = append(deser.logicalNames, ln)
 	}
 
 	if len(s.union) == 2 && s.union[0].primitive == "null" {

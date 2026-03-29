@@ -48,6 +48,19 @@ func benchNewSuperhero() *Superhero {
 	}
 }
 
+var benchSuperheroValue = map[string]any{
+	"id":             int32(234765),
+	"affiliation_id": int32(9867),
+	"name":           "Wolverine",
+	"life":           float32(85.25),
+	"energy":         float32(32.75),
+	"powers": []map[string]any{
+		{"id": int32(2345), "name": "Bone Claws", "damage": float32(5), "energy": float32(1.15), "passive": false},
+		{"id": int32(2346), "name": "Regeneration", "damage": float32(-2), "energy": float32(0.55), "passive": true},
+		{"id": int32(2347), "name": "Adamant skeleton", "damage": float32(-10), "energy": float32(0), "passive": true},
+	},
+}
+
 func BenchmarkSerializeGeneric(b *testing.B) {
 	super := map[string]any{
 		"id":             int32(234765),
@@ -354,6 +367,88 @@ func BenchmarkStringHeavyDecode(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		out = StringRecord{}
 		if _, err = s.Decode(encoded, &out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeAny(b *testing.B) {
+	s, err := Parse(benchSuperheroSchema)
+	if err != nil {
+		b.Fatal(err)
+	}
+	encoded, err := s.Encode(benchSuperheroValue)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var out any
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err = s.Decode(encoded, &out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeAnyTaggedUnions(b *testing.B) {
+	s, err := Parse(benchSuperheroSchema)
+	if err != nil {
+		b.Fatal(err)
+	}
+	encoded, err := s.Encode(benchSuperheroValue)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var out any
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err = s.Decode(encoded, &out, TaggedUnions()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkEncodeJSON(b *testing.B) {
+	s, err := Parse(benchSuperheroSchema)
+	if err != nil {
+		b.Fatal(err)
+	}
+	encoded, err := s.Encode(benchSuperheroValue)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var native any
+	if _, err := s.Decode(encoded, &native); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err = s.EncodeJSON(native); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkEncodeJSONTagged(b *testing.B) {
+	s, err := Parse(benchSuperheroSchema)
+	if err != nil {
+		b.Fatal(err)
+	}
+	encoded, err := s.Encode(benchSuperheroValue)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var native any
+	if _, err := s.Decode(encoded, &native); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err = s.EncodeJSON(native, TaggedUnions()); err != nil {
 			b.Fatal(err)
 		}
 	}

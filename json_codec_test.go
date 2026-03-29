@@ -708,7 +708,7 @@ func TestAppendAvroJSONTypeErrors(t *testing.T) {
 			if tt.kind == "map" {
 				node.values = &schemaNode{kind: "int"}
 			}
-			_, err := appendAvroJSON(nil, reflect.ValueOf(tt.val), node, &jsonConfig{})
+			_, err := appendAvroJSON(nil, reflect.ValueOf(tt.val), node, &optConfig{})
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -718,7 +718,7 @@ func TestAppendAvroJSONTypeErrors(t *testing.T) {
 
 func TestAppendAvroJSONFixedReflect(t *testing.T) {
 	node := &schemaNode{kind: "fixed", size: 3}
-	buf, err := appendAvroJSON(nil, reflect.ValueOf([3]byte{1, 2, 3}), node, &jsonConfig{})
+	buf, err := appendAvroJSON(nil, reflect.ValueOf([3]byte{1, 2, 3}), node, &optConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,7 +727,7 @@ func TestAppendAvroJSONFixedReflect(t *testing.T) {
 	}
 
 	// Non-byte array should error.
-	_, err = appendAvroJSON(nil, reflect.ValueOf([3]int{1, 2, 3}), node, &jsonConfig{})
+	_, err = appendAvroJSON(nil, reflect.ValueOf([3]int{1, 2, 3}), node, &optConfig{})
 	if err == nil {
 		t.Fatal("expected error for non-byte array")
 	}
@@ -738,7 +738,7 @@ func TestAppendAvroJSONUnionNoMatch(t *testing.T) {
 		kind:     "union",
 		branches: []*schemaNode{{kind: "null"}, {kind: "string"}},
 	}
-	_, err := appendAvroJSON(nil, reflect.ValueOf(int32(42)), node, &jsonConfig{})
+	_, err := appendAvroJSON(nil, reflect.ValueOf(int32(42)), node, &optConfig{})
 	if err == nil {
 		t.Fatal("expected error for unmatched union")
 	}
@@ -746,7 +746,7 @@ func TestAppendAvroJSONUnionNoMatch(t *testing.T) {
 
 func TestAppendAvroJSONUnknownKind(t *testing.T) {
 	node := &schemaNode{kind: "bogus"}
-	_, err := appendAvroJSON(nil, reflect.ValueOf(42), node, &jsonConfig{})
+	_, err := appendAvroJSON(nil, reflect.ValueOf(42), node, &optConfig{})
 	if err == nil {
 		t.Fatal("expected error for unknown kind")
 	}
@@ -1295,6 +1295,240 @@ func TestEncodeJSONTaggedUnions(t *testing.T) {
 	}
 	if string(got) != `"hello"` {
 		t.Errorf("bare: got %s", got)
+	}
+}
+
+func TestDecodeTaggedUnions(t *testing.T) {
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"v","type":["null","string","int"]}
+	]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, err := s.Encode(map[string]any{"v": "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Without TaggedUnions: bare.
+	var bare any
+	if _, err := s.Decode(bin, &bare); err != nil {
+		t.Fatal(err)
+	}
+	m := bare.(map[string]any)
+	if m["v"] != "hello" {
+		t.Errorf("bare: got %v", m["v"])
+	}
+
+	// With TaggedUnions: wrapped.
+	var tagged any
+	if _, err := s.Decode(bin, &tagged, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	m = tagged.(map[string]any)
+	wrapper, ok := m["v"].(map[string]any)
+	if !ok {
+		t.Fatalf("tagged: expected map wrapper, got %T: %v", m["v"], m["v"])
+	}
+	if wrapper["string"] != "hello" {
+		t.Errorf("tagged: got %v", wrapper)
+	}
+}
+
+func TestDecodeTaggedUnionsComplex(t *testing.T) {
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"u_bool","type":["null","boolean"]},
+		{"name":"u_int","type":["null","int"]},
+		{"name":"u_long","type":["null","long"]},
+		{"name":"u_float","type":["null","float"]},
+		{"name":"u_double","type":["null","double"]},
+		{"name":"u_string","type":["null","string"]},
+		{"name":"u_bytes","type":["null","bytes"]},
+		{"name":"u_null","type":["null","string"]},
+		{"name":"arr","type":{"type":"array","items":["null","string"]}},
+		{"name":"m","type":{"type":"map","values":["null","int"]}}
+	]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := map[string]any{
+		"u_bool":   true,
+		"u_int":    int32(42),
+		"u_long":   int64(100),
+		"u_float":  float32(1.5),
+		"u_double": float64(3.14),
+		"u_string": "hello",
+		"u_bytes":  []byte{0x01, 0x02},
+		"u_null":   nil,
+		"arr":      []any{nil, "a"},
+		"m":        map[string]any{"k": int32(1)},
+	}
+	bin, err := s.Encode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got any
+	if _, err := s.Decode(bin, &got, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	m := got.(map[string]any)
+
+	// Check each union is wrapped.
+	check := func(field, branch string) {
+		t.Helper()
+		wrapper, ok := m[field].(map[string]any)
+		if !ok {
+			if m[field] == nil {
+				return // null union values stay nil
+			}
+			t.Errorf("%s: expected map wrapper, got %T: %v", field, m[field], m[field])
+			return
+		}
+		if _, ok := wrapper[branch]; !ok {
+			t.Errorf("%s: expected branch %q, got keys %v", field, branch, wrapper)
+		}
+	}
+	check("u_bool", "boolean")
+	check("u_int", "int")
+	check("u_long", "long")
+	check("u_float", "float")
+	check("u_double", "double")
+	check("u_string", "string")
+	check("u_bytes", "bytes")
+	if m["u_null"] != nil {
+		t.Errorf("u_null: expected nil, got %v", m["u_null"])
+	}
+
+	// Array items should be wrapped.
+	arr := m["arr"].([]any)
+	if arr[0] != nil {
+		t.Errorf("arr[0]: expected nil, got %v", arr[0])
+	}
+	arrItem, ok := arr[1].(map[string]any)
+	if !ok {
+		t.Fatalf("arr[1]: expected map, got %T", arr[1])
+	}
+	if arrItem["string"] != "hello" && arrItem["string"] != "a" {
+		t.Errorf("arr[1]: got %v", arrItem)
+	}
+
+	// Map values should be wrapped.
+	mv := m["m"].(map[string]any)
+	kv, ok := mv["k"].(map[string]any)
+	if !ok {
+		t.Fatalf("m[k]: expected map, got %T", mv["k"])
+	}
+	if _, ok := kv["int"]; !ok {
+		t.Errorf("m[k]: expected int branch, got %v", kv)
+	}
+}
+
+func TestDecodeTaggedUnionsNullAtRoot(t *testing.T) {
+	s, err := Parse(`["null","string"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, err := s.Encode(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got any
+	if _, err := s.Decode(bin, &got, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+func TestDecodeTaggedUnionsWithLogicalNames(t *testing.T) {
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}
+	]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.UnixMilli(1687221496000).UTC()
+	bin, err := s.Encode(map[string]any{"ts": now})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// TaggedUnions only: branch name is "long".
+	var std any
+	if _, err := s.Decode(bin, &std, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	m := std.(map[string]any)
+	wrapper := m["ts"].(map[string]any)
+	if _, ok := wrapper["long"]; !ok {
+		t.Errorf("expected 'long' key, got %v", wrapper)
+	}
+
+	// TaggedUnions + TagLogicalTypes: branch name is "long.timestamp-millis".
+	var logical any
+	if _, err := s.Decode(bin, &logical, TaggedUnions(), TagLogicalTypes()); err != nil {
+		t.Fatal(err)
+	}
+	m = logical.(map[string]any)
+	wrapper = m["ts"].(map[string]any)
+	if _, ok := wrapper["long.timestamp-millis"]; !ok {
+		t.Errorf("expected 'long.timestamp-millis' key, got %v", wrapper)
+	}
+}
+
+func TestEncodeJSONTaggedUnionsWithLogicalNames(t *testing.T) {
+	s, err := Parse(`["null",{"type":"long","logicalType":"timestamp-millis"}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.UnixMilli(1687221496000).UTC()
+
+	// Without TagLogicalTypes: "long".
+	got, err := s.EncodeJSON(now, TaggedUnions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"long":1687221496000}` {
+		t.Errorf("got %s", got)
+	}
+
+	// With TagLogicalTypes: "long.timestamp-millis".
+	got, err = s.EncodeJSON(now, TaggedUnions(), TagLogicalTypes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"long.timestamp-millis":1687221496000}` {
+		t.Errorf("got %s", got)
+	}
+}
+
+func TestDecodeJSONTaggedUnions(t *testing.T) {
+	s, err := Parse(`["null","string"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bare any
+	if err := s.DecodeJSON([]byte(`"hello"`), &bare); err != nil {
+		t.Fatal(err)
+	}
+	if bare != "hello" {
+		t.Errorf("bare: got %v", bare)
+	}
+
+	var tagged any
+	if err := s.DecodeJSON([]byte(`"hello"`), &tagged, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	wrapper, ok := tagged.(map[string]any)
+	if !ok {
+		t.Fatalf("tagged: expected map, got %T: %v", tagged, tagged)
+	}
+	if wrapper["string"] != "hello" {
+		t.Errorf("tagged: got %v", wrapper)
 	}
 }
 

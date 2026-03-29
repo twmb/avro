@@ -10,22 +10,41 @@ import (
 	"time"
 )
 
-// JSONOpt configures [Schema.EncodeJSON] and [Schema.DecodeJSON] behavior.
-type JSONOpt interface{ jsonOpt() }
+// Opt configures encoding and decoding behavior. See each option's
+// documentation for which functions it affects. Inapplicable options
+// are silently ignored.
+type Opt interface{ opt() }
 
 type taggedUnions struct{}
 
-func (taggedUnions) jsonOpt() {}
+func (taggedUnions) opt() {}
 
-// TaggedUnions wraps non-null union values as {"type_name": value}
-// in [Schema.EncodeJSON] output. Without this option, union values
-// are written as bare JSON values. [Schema.DecodeJSON] always
-// accepts both tagged and bare formats regardless of this option.
-func TaggedUnions() JSONOpt { return taggedUnions{} }
+// TaggedUnions wraps non-null union values as {"type_name": value}.
+//
+// In [Schema.EncodeJSON], this produces tagged JSON union output.
+// In [Schema.Decode] and [Schema.DecodeJSON] to *any, this wraps
+// union values as map[string]any{branchName: value}.
+//
+// Without this option, union values are bare in all cases.
+// [Schema.DecodeJSON] always accepts both tagged and bare input
+// regardless of this option.
+func TaggedUnions() Opt { return taggedUnions{} }
+
+type tagLogicalTypes struct{}
+
+func (tagLogicalTypes) opt() {}
+
+// TagLogicalTypes qualifies union branch names with their logical type
+// (e.g. "long.timestamp-millis" instead of "long"). This applies to
+// [Schema.EncodeJSON] with [TaggedUnions] and to [Schema.Decode] with
+// [TaggedUnions]. Without this option, branch names use the base Avro
+// type per the specification. This option has no effect without
+// [TaggedUnions].
+func TagLogicalTypes() Opt { return tagLogicalTypes{} }
 
 type linkedinFloats struct{}
 
-func (linkedinFloats) jsonOpt() {}
+func (linkedinFloats) opt() {}
 
 // LinkedinFloats encodes NaN as JSON null and ±Infinity as ±1e999
 // in [Schema.EncodeJSON], matching the linkedin/goavro convention.
@@ -33,19 +52,22 @@ func (linkedinFloats) jsonOpt() {}
 // ±Infinity as "Infinity"/"-Infinity", following the Java Avro
 // convention. [Schema.DecodeJSON] always accepts
 // both conventions regardless of this option.
-func LinkedinFloats() JSONOpt { return linkedinFloats{} }
+func LinkedinFloats() Opt { return linkedinFloats{} }
 
-type jsonConfig struct {
-	tagged   bool
-	linkedin bool
+type optConfig struct {
+	tagged     bool
+	tagLogical bool
+	linkedin   bool
 }
 
-func parseJSONOpts(opts []JSONOpt) jsonConfig {
-	var cfg jsonConfig
+func parseOpts(opts []Opt) optConfig {
+	var cfg optConfig
 	for _, o := range opts {
 		switch o.(type) {
 		case taggedUnions:
 			cfg.tagged = true
+		case tagLogicalTypes:
+			cfg.tagLogical = true
 		case linkedinFloats:
 			cfg.linkedin = true
 		}
@@ -64,8 +86,8 @@ func parseJSONOpts(opts []JSONOpt) jsonConfig {
 // cannot represent these values; use EncodeJSON instead.
 //
 // EncodeJSON accepts the same Go types as [Schema.Encode].
-func (s *Schema) EncodeJSON(v any, opts ...JSONOpt) ([]byte, error) {
-	cfg := parseJSONOpts(opts)
+func (s *Schema) EncodeJSON(v any, opts ...Opt) ([]byte, error) {
+	cfg := parseOpts(opts)
 	return appendAvroJSON(nil, reflect.ValueOf(v), s.node, &cfg)
 }
 
@@ -78,10 +100,10 @@ func (s *Schema) EncodeJSON(v any, opts ...JSONOpt) ([]byte, error) {
 // DecodeJSON also accepts the non-standard union branch naming used by
 // linkedin/goavro (e.g. "long.timestamp-millis" instead of "long").
 //
-// The opts parameter is reserved for future use. DecodeJSON currently
-// accepts all input formats (tagged and bare unions, Java and goavro
-// NaN/Infinity conventions) regardless of options.
-func (s *Schema) DecodeJSON(src []byte, v any, opts ...JSONOpt) error {
+// DecodeJSON accepts all input formats (tagged and bare unions, Java and
+// goavro NaN/Infinity conventions). Pass [TaggedUnions] to wrap decoded
+// union values when the target is *any.
+func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 	var raw any
 	if err := json.Unmarshal(src, &raw); err != nil {
 		return fmt.Errorf("avro: invalid JSON: %w", err)
@@ -94,7 +116,7 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...JSONOpt) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.Decode(binary, v)
+	_, err = s.Decode(binary, v, opts...)
 	return err
 }
 
@@ -102,7 +124,7 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...JSONOpt) error {
 // the Go value via reflect and the schema tree simultaneously, writing
 // JSON directly without an intermediate binary encoding step. Handles
 // structs, maps, all numeric coercions, time.Time, etc.
-func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *jsonConfig) ([]byte, error) {
+func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig) ([]byte, error) {
 	// Handle nil / invalid values.
 	if !v.IsValid() {
 		if node.kind == "null" || node.kind == "union" {
@@ -297,7 +319,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *jsonConf
 }
 
 // appendAvroJSONRecord handles record encoding for both structs and maps.
-func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *jsonConfig) ([]byte, error) {
+func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig) ([]byte, error) {
 	buf = append(buf, '{')
 	if v.Kind() == reflect.Map {
 		for i, f := range node.fields {
@@ -354,7 +376,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *js
 }
 
 // appendAvroJSONUnion handles union encoding.
-func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *jsonConfig) ([]byte, error) {
+func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig) ([]byte, error) {
 	if !v.IsValid() || (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil() {
 		// unreachable: appendAvroJSON's deref loop converts nil pointers/interfaces
 		// to invalid values before dispatching here, but kept as a safety net.
@@ -368,6 +390,9 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *jso
 		if err == nil {
 			if cfg.tagged {
 				name := unionBranchName(branch)
+				if cfg.tagLogical && branch.logical != "" {
+					name = branch.kind + "." + branch.logical
+				}
 				buf = append(buf, '{')
 				key, _ := json.Marshal(name)
 				buf = append(buf, key...)
@@ -661,7 +686,7 @@ func avroJSONBytesToBytes(s string) ([]byte, error) {
 // appendJSONFloat formats a float for JSON output, handling special values.
 // With LinkedinFloats, NaN encodes as null and ±Infinity as ±1e999 (goavro
 // convention). Otherwise NaN/Infinity encode as JSON strings (Java convention).
-func appendJSONFloat(buf []byte, f float64, bits int, cfg *jsonConfig) []byte {
+func appendJSONFloat(buf []byte, f float64, bits int, cfg *optConfig) []byte {
 	if math.IsNaN(f) {
 		if cfg.linkedin {
 			return append(buf, "null"...)
