@@ -42,22 +42,31 @@ var slabPool = sync.Pool{New: func() any { return &slab{} }}
 //
 //   - null: any (always decodes to nil)
 //   - boolean: bool, any
-//   - int, long: int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, any
+//   - int, long: int, int8–int64, uint8–uint64, any
 //   - float: float32, float64, any
 //   - double: float64, float32, any
 //   - string: string, []byte, any; also [encoding.TextUnmarshaler]
 //   - bytes: []byte, string, any
-//   - enum: string, int/int8/.../uint64 (ordinal), any
+//   - enum: string, int/uint (ordinal), any
 //   - fixed: [N]byte, []byte, any
 //   - array: slice, any
 //   - map: map[string]T, any
 //   - union: any, *T (for ["null", T] unions), or the matched branch type
 //   - record: struct (matched by field name or `avro` tag), map[string]any, any
 //
-// When decoding into any, values are returned as their natural Go types:
-// nil, bool, int32, int64, float32, float64, string, []byte, []any,
-// map[string]any for records, or [encoding/json.Number] for decimal logical
-// types.
+// When decoding into *any, primitive types become nil, bool, int32, int64,
+// float32, float64, string, []byte, []any, or map[string]any (for records).
+// Logical types decode to enriched Go types:
+//
+//   - date, timestamp-millis/micros/nanos, local-timestamp-*: [time.Time] (UTC)
+//   - time-millis, time-micros: [time.Duration]
+//   - decimal: [encoding/json.Number]
+//   - duration: [Duration]
+//
+// To produce JSON from decoded *any data, use [Schema.EncodeJSON] rather
+// than [encoding/json.Marshal]. EncodeJSON is schema-aware and converts
+// enriched types back to their Avro representations (e.g. time.Time to
+// epoch integers, []byte to \uXXXX strings).
 func (s *Schema) Decode(src []byte, v any) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
@@ -964,8 +973,8 @@ func deserTimestampMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == timeType {
-		v.Set(reflect.ValueOf(time.UnixMilli(val)))
+	if v.Kind() == reflect.Interface || v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.UnixMilli(val).UTC()))
 		return src, nil
 	}
 	return src, setLongValue(v, val)
@@ -977,8 +986,8 @@ func deserTimestampMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == timeType {
-		v.Set(reflect.ValueOf(time.UnixMicro(val)))
+	if v.Kind() == reflect.Interface || v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.UnixMicro(val).UTC()))
 		return src, nil
 	}
 	return src, setLongValue(v, val)
@@ -990,8 +999,8 @@ func deserTimestampNanos(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == timeType {
-		v.Set(reflect.ValueOf(time.Unix(val/1e9, val%1e9)))
+	if v.Kind() == reflect.Interface || v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.Unix(val/1e9, val%1e9).UTC()))
 		return src, nil
 	}
 	return src, setLongValue(v, val)
@@ -1003,7 +1012,7 @@ func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == timeType {
+	if v.Kind() == reflect.Interface || v.Type() == timeType {
 		t := time.Unix(int64(val)*86400, 0).UTC()
 		v.Set(reflect.ValueOf(t))
 		return src, nil
@@ -1017,7 +1026,7 @@ func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == durationType {
+	if v.Kind() == reflect.Interface || v.Type() == durationType {
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Millisecond))
 		return src, nil
 	}
@@ -1030,8 +1039,8 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == durationType {
-		if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
+	if v.Kind() == reflect.Interface || v.Type() == durationType {
+		if v.Type() == durationType && (val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond)) {
 			return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
 		}
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))

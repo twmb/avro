@@ -238,15 +238,15 @@ to the underlying Avro type otherwise.
 
 | Logical Type | Avro Type | Encode | Decode |
 |---|---|---|---|
-| date | int | time.Time, RFC 3339 or YYYY-MM-DD string, or int | time.Time or int |
-| time-millis | int | time.Duration or int | time.Duration or int |
-| time-micros | long | time.Duration or int | time.Duration or int |
-| timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| local-timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| local-timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| local-timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time or int |
+| date | int | time.Time, RFC 3339 or YYYY-MM-DD string, or int | time.Time (UTC) |
+| time-millis | int | time.Duration or int | time.Duration |
+| time-micros | long | time.Duration or int | time.Duration |
+| timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| local-timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| local-timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| local-timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | uuid | string or fixed(16) | [16]byte or string | [16]byte (RFC 4122 hex-dash ↔ binary) or string |
 | decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat (typed target) or json.Number (any target) |
 | duration | fixed(12) | avro.Duration or underlying type | avro.Duration or underlying type |

@@ -758,8 +758,11 @@ func TestSerNestedCDCPipeline(t *testing.T) {
 		t.Errorf("zip: got %v (%T)", addr["zip"], addr["zip"])
 	}
 	want := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
-	if addr["since"] != want.UnixMilli() {
-		t.Errorf("since: got %v, want %d", addr["since"], want.UnixMilli())
+	got, ok := addr["since"].(time.Time)
+	if !ok {
+		t.Errorf("since: expected time.Time, got %T: %v", addr["since"], addr["since"])
+	} else if !got.Equal(want) {
+		t.Errorf("since: got %v, want %v", got, want)
 	}
 
 	// "tags" was missing from input — should use default [].
@@ -808,8 +811,11 @@ func TestSerNullableRecordUnion(t *testing.T) {
 		t.Errorf("source: got %v", meta["source"])
 	}
 	want := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
-	if meta["ts"] != want.UnixMilli() {
-		t.Errorf("ts: got %v, want %d", meta["ts"], want.UnixMilli())
+	got, ok := meta["ts"].(time.Time)
+	if !ok {
+		t.Errorf("ts: expected time.Time, got %T: %v", meta["ts"], meta["ts"])
+	} else if !got.Equal(want) {
+		t.Errorf("ts: got %v, want %v", got, want)
 	}
 
 	// Null branch.

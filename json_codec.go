@@ -123,6 +123,23 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *jsonConf
 		return nil, fmt.Errorf("avro json: expected bool, got %s", v.Type())
 
 	case "int":
+		if v.Type() == timeType {
+			t := v.Interface().(time.Time)
+			switch node.logical {
+			case "date":
+				return strconv.AppendInt(buf, t.Unix()/86400, 10), nil
+			case "time-millis":
+				d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
+				return strconv.AppendInt(buf, d.Milliseconds(), 10), nil
+			}
+		}
+		if v.Type() == durationType {
+			d := v.Interface().(time.Duration)
+			switch node.logical {
+			case "time-millis":
+				return strconv.AppendInt(buf, d.Milliseconds(), 10), nil
+			}
+		}
 		if v.CanInt() {
 			return strconv.AppendInt(buf, v.Int(), 10), nil
 		}
@@ -144,8 +161,15 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *jsonConf
 				return strconv.AppendInt(buf, t.UnixMicro(), 10), nil
 			case "timestamp-nanos", "local-timestamp-nanos":
 				return strconv.AppendInt(buf, timeToUnixNanos(t), 10), nil
-			default: // unreachable: all timestamp logical types are matched above
+			default:
 				return strconv.AppendInt(buf, t.UnixMilli(), 10), nil
+			}
+		}
+		if v.Type() == durationType {
+			d := v.Interface().(time.Duration)
+			switch node.logical {
+			case "time-micros":
+				return strconv.AppendInt(buf, int64(d/time.Microsecond), 10), nil
 			}
 		}
 		if v.CanInt() {

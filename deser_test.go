@@ -7897,12 +7897,12 @@ func TestTimestampNanosDecodeIntoInterface(t *testing.T) {
 	encoded := encode(t, schema, &now)
 	var v any
 	decode(t, schema, encoded, &v)
-	got, ok := v.(int64)
+	got, ok := v.(time.Time)
 	if !ok {
-		t.Fatalf("expected int64, got %T", v)
+		t.Fatalf("expected time.Time, got %T", v)
 	}
-	if got != now.UnixNano() {
-		t.Fatalf("got %d, want %d", got, now.UnixNano())
+	if got.UnixNano() != now.UnixNano() {
+		t.Fatalf("got %v, want %v", got, now)
 	}
 }
 
