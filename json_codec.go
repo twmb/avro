@@ -405,10 +405,12 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 			// before reaching this switch case, but kept as a safety net.
 			return nil, nil
 		}
-		// Avro JSON unions are {"type_name": value}.
+		// Avro JSON unions are {"type_name": value}. Also accept bare
+		// (unwrapped) values for leniency — the value is passed through
+		// to the binary encoder which resolves the correct branch.
 		m, ok := v.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("avro json: expected object for union, got %T", v)
+			return v, nil
 		}
 		if len(m) != 1 {
 			return nil, fmt.Errorf("avro json: union object must have exactly one key, got %d", len(m))
