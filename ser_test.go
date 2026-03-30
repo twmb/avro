@@ -1308,6 +1308,140 @@ func TestSerFloat64CoercionLong(t *testing.T) {
 	}
 }
 
+func TestSerIntCoercionToFloat(t *testing.T) {
+	// float and double fields should accept Go integer types (goavro compat).
+	sf, err := Parse(`"float"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sd, err := Parse(`"double"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		val  any
+	}{
+		{"int", int(42)},
+		{"int8", int8(42)},
+		{"int16", int16(42)},
+		{"int32", int32(42)},
+		{"int64", int64(42)},
+		{"uint", uint(42)},
+		{"uint8", uint8(42)},
+		{"uint16", uint16(42)},
+		{"uint32", uint32(42)},
+		{"uint64", uint64(42)},
+	}
+	for _, tt := range tests {
+		t.Run("float/"+tt.name, func(t *testing.T) {
+			dst, err := sf.AppendEncode(nil, tt.val)
+			if err != nil {
+				t.Fatalf("encode %T(%v) as float: %v", tt.val, tt.val, err)
+			}
+			var got float32
+			if _, err := sf.Decode(dst, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got != 42 {
+				t.Fatalf("expected 42, got %v", got)
+			}
+		})
+		t.Run("double/"+tt.name, func(t *testing.T) {
+			dst, err := sd.AppendEncode(nil, tt.val)
+			if err != nil {
+				t.Fatalf("encode %T(%v) as double: %v", tt.val, tt.val, err)
+			}
+			var got float64
+			if _, err := sd.Decode(dst, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got != 42 {
+				t.Fatalf("expected 42, got %v", got)
+			}
+		})
+	}
+}
+
+func TestSerIntCoercionToFloatPrecisionOverflow(t *testing.T) {
+	sf, err := Parse(`"float"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sd, err := Parse(`"double"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// float32: exact range is [-2^24, 2^24].
+	// Values at the boundary should work.
+	atFloat32Limit := int64(1 << 24)
+	if _, err := sf.AppendEncode(nil, atFloat32Limit); err != nil {
+		t.Fatalf("float32 at limit: %v", err)
+	}
+	if _, err := sf.AppendEncode(nil, -atFloat32Limit); err != nil {
+		t.Fatalf("float32 at negative limit: %v", err)
+	}
+	// One past the boundary should fail.
+	if _, err := sf.AppendEncode(nil, atFloat32Limit+1); err == nil {
+		t.Fatal("expected error for int64 overflowing float32 precision")
+	}
+	if _, err := sf.AppendEncode(nil, -atFloat32Limit-1); err == nil {
+		t.Fatal("expected error for negative int64 overflowing float32 precision")
+	}
+	// Large uint should fail.
+	if _, err := sf.AppendEncode(nil, uint64(1<<24+1)); err == nil {
+		t.Fatal("expected error for uint64 overflowing float32 precision")
+	}
+
+	// float64: exact range is [-2^53, 2^53].
+	atFloat64Limit := int64(1 << 53)
+	if _, err := sd.AppendEncode(nil, atFloat64Limit); err != nil {
+		t.Fatalf("float64 at limit: %v", err)
+	}
+	if _, err := sd.AppendEncode(nil, -atFloat64Limit); err != nil {
+		t.Fatalf("float64 at negative limit: %v", err)
+	}
+	if _, err := sd.AppendEncode(nil, atFloat64Limit+1); err == nil {
+		t.Fatal("expected error for int64 overflowing float64 precision")
+	}
+	if _, err := sd.AppendEncode(nil, uint64(1<<53+1)); err == nil {
+		t.Fatal("expected error for uint64 overflowing float64 precision")
+	}
+}
+
+func TestSerFixedAcceptsString(t *testing.T) {
+	s, err := Parse(`{"type":"fixed","name":"F","size":4}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// String of correct length should work.
+	str := "abcd"
+	dst, err := s.AppendEncode(nil, str)
+	if err != nil {
+		t.Fatalf("encode string as fixed: %v", err)
+	}
+	var got [4]byte
+	if _, err := s.Decode(dst, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(got[:]) != "abcd" {
+		t.Fatalf("expected %q, got %q", "abcd", got)
+	}
+
+	// Wrong length should fail.
+	short := "abc"
+	if _, err := s.AppendEncode(nil, short); err == nil {
+		t.Fatal("expected error for wrong-length string")
+	}
+	long := "abcde"
+	if _, err := s.AppendEncode(nil, long); err == nil {
+		t.Fatal("expected error for wrong-length string")
+	}
+}
+
 func TestSerJSONRoundtrip(t *testing.T) {
 	// This tests the rpk use case: json.Unmarshal → Encode → Decode → json.Marshal.
 	tests := []struct {

@@ -11,6 +11,7 @@ import (
 	"math"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -253,6 +254,82 @@ type afield struct {
 	hasDefault bool
 }
 
+// afieldKeys that signal a complex type definition at the field level
+// (the "flat" field format accepted by linkedin/goavro).
+var afieldComplexKeys = map[string]string{
+	"symbols": "enum",
+	"items":   "array",
+	"values":  "map",
+	"fields":  "record",
+	"size":    "fixed",
+}
+
+func (f *afield) UnmarshalJSON(data []byte) error {
+	// Standard unmarshal into a type alias to avoid recursion.
+	type plain afield
+	if err := json.Unmarshal(data, (*plain)(f)); err != nil {
+		return err
+	}
+	// Detect the "flat" field format: "type" is a string naming a complex
+	// type (e.g. "enum") and complex-type attributes (e.g. "symbols") live
+	// alongside the field's own keys. When detected, lift those attributes
+	// into a nested type object so the rest of the parser sees the
+	// canonical form.
+	if f.Type == nil || f.Type.primitive == "" {
+		return nil
+	}
+	tp := f.Type.primitive
+	if tp != "enum" && tp != "array" && tp != "map" && tp != "record" && tp != "error" && tp != "fixed" {
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	needsLift := false
+	for key, forType := range afieldComplexKeys {
+		if _, ok := raw[key]; ok && (forType == tp || (key == "fields" && tp == "error")) {
+			needsLift = true
+			break
+		}
+	}
+	if !needsLift {
+		return nil
+	}
+	// Build a JSON object for the type schema from the field's own keys,
+	// excluding field-only keys ("default", "order", "aliases").
+	// For non-named types (array, map), also exclude "name" and
+	// "namespace" since those belong to the field, not the type.
+	named := tp == "record" || tp == "error" || tp == "enum" || tp == "fixed"
+	typeObj := make(map[string]json.RawMessage, len(raw))
+	for k, v := range raw {
+		switch k {
+		case "default", "order":
+			// Field-only keys, do not propagate.
+		case "aliases":
+			// In the flat format, aliases belong to the field, not
+			// the type. Named types that need aliases can use the
+			// nested format.
+		case "name", "namespace":
+			if named {
+				typeObj[k] = v
+			}
+		default:
+			typeObj[k] = v
+		}
+	}
+	typeJSON, err := json.Marshal(typeObj)
+	if err != nil {
+		return err
+	}
+	var s aschema
+	if err := json.Unmarshal(typeJSON, &s); err != nil {
+		return err
+	}
+	f.Type = &s
+	return nil
+}
+
 type aobject struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
@@ -265,7 +342,7 @@ type aobject struct {
 	Symbols []string `json:"symbols,omitempty"` // enum
 	Items   *aschema `json:"items,omitempty"`   // array
 	Values  *aschema `json:"values,omitempty"`  // map
-	Size    *int     `json:"size,omitempty"`    // fixed
+	Size    *laxInt  `json:"size,omitempty"`    // fixed
 
 	// In canonical form, the following are stripped.
 
@@ -278,6 +355,37 @@ type aobject struct {
 	Precision *int   `json:"precision,omitempty"` // decimal logical type
 
 	extra map[string]any // non-reserved properties, populated by aschema.UnmarshalJSON
+}
+
+// laxInt is an int that also accepts JSON strings containing integers,
+// per the Avro spec's [INTEGERS] canonical form rule which acknowledges
+// that "size" may appear as a quoted integer.
+type laxInt int
+
+func (l *laxInt) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) > 0 && data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return fmt.Errorf("invalid integer string: %w", err)
+		}
+		*l = laxInt(n)
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(data, &n); err != nil {
+		return err
+	}
+	*l = laxInt(n)
+	return nil
+}
+
+func (l laxInt) MarshalJSON() ([]byte, error) {
+	return json.Marshal(int(l))
 }
 
 var aobjectKnownKeys = map[string]bool{
@@ -1115,6 +1223,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				// json.Unmarshal cannot fail: of.Default is a json.RawMessage
 				// preserved from the initial schema parse, so it is valid JSON.
 				json.Unmarshal(of.Default, &defaultVal)
+				defaultVal = coerceDefault(defaultVal, &bf.canon)
 				// Skip default validation for forward references since we
 				// don't know the type yet.
 				if !isFwdRef {
@@ -1323,14 +1432,15 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if o.Size == nil {
 			return errors.New("fixed is missing size")
 		}
-		if *o.Size <= 0 {
-			return fmt.Errorf("invalid fixed size %v", *o.Size)
+		size := int(*o.Size)
+		if size <= 0 {
+			return fmt.Errorf("invalid fixed size %v", size)
 		}
 		// Use raw fixed ser/deser when a custom type replaces the
 		// built-in logical type handler.
 		if b.hasMatchingCustomType("fixed", s.object.Logical) {
-			b.ser = (&serSize{*o.Size}).ser
-			b.deser = (&deserFixed{*o.Size}).deser
+			b.ser = (&serSize{size}).ser
+			b.deser = (&deserFixed{size}).deser
 		} else {
 			switch s.object.Logical {
 			case "duration":
@@ -1341,11 +1451,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				if o.Scale != nil {
 					scale = *o.Scale
 				}
-				b.ser = (&serFixedDecimal{size: *o.Size, scale: scale}).ser
-				b.deser = (&deserFixedDecimal{size: *o.Size, scale: scale}).deser
+				b.ser = (&serFixedDecimal{size: size, scale: scale}).ser
+				b.deser = (&deserFixedDecimal{size: size, scale: scale}).deser
 			default:
-				b.ser = (&serSize{*o.Size}).ser
-				b.deser = (&deserFixed{*o.Size}).deser
+				b.ser = (&serSize{size}).ser
+				b.deser = (&deserFixed{size}).deser
 			}
 		}
 		b.meta = fieldMeta{avroType: "fixed", logical: s.object.Logical}
@@ -1354,7 +1464,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			name:    o.Name,
 			aliases: qualifyAliases(origAliases, o.Name),
 			logical: s.object.Logical,
-			size:    *o.Size,
+			size:    size,
 			ser:     b.ser,
 			deser:   b.deser,
 		}
@@ -1416,7 +1526,7 @@ func (o *aobject) validateLogical() error {
 			return nil
 		}
 		if o.Type == "fixed" && o.Size != nil {
-			maxDigits := maxDecimalDigits(*o.Size)
+			maxDigits := maxDecimalDigits(int(*o.Size))
 			if *o.Precision > maxDigits {
 				// Precision exceeds fixed capacity: fall back.
 				o.Logical = ""
@@ -1426,7 +1536,7 @@ func (o *aobject) validateLogical() error {
 		return nil
 
 	case "uuid":
-		if o.Type != "string" && !(o.Type == "fixed" && o.Size != nil && *o.Size == 16) {
+		if o.Type != "string" && !(o.Type == "fixed" && o.Size != nil && int(*o.Size) == 16) {
 			return fmt.Errorf("invalid logicalType uuid type %q, must be string or fixed(16)", o.Type)
 		}
 
@@ -1458,8 +1568,8 @@ func (o *aobject) validateLogical() error {
 		if o.Size == nil {
 			return errors.New("invalid logicalType duration has no size")
 		}
-		if *o.Size != 12 {
-			return fmt.Errorf("invalid logicalType duration size %v is not the expected 12", *o.Size)
+		if int(*o.Size) != 12 {
+			return fmt.Errorf("invalid logicalType duration size %v is not the expected 12", int(*o.Size))
 		}
 
 	default:
@@ -1534,6 +1644,31 @@ func logicalDeser(logical string) deserfn {
 	}
 }
 
+// coerceDefault converts string default values to the expected type when
+// the schema type is float or double, matching Java's schema parser behavior.
+func coerceDefault(val any, s *aschema) any {
+	prim := s.primitive
+	if prim == "" && len(s.union) > 0 {
+		for _, branch := range s.union {
+			if branch.primitive == "float" || branch.primitive == "double" {
+				prim = branch.primitive
+				break
+			}
+		}
+	}
+	if prim != "float" && prim != "double" {
+		return val
+	}
+	str, ok := val.(string)
+	if !ok {
+		return val
+	}
+	if f, err := strconv.ParseFloat(str, 64); err == nil {
+		return f
+	}
+	return val // leave as-is; validateDefault will report the error
+}
+
 // validateDefault checks that a parsed JSON default value is compatible
 // with the given Avro schema type.
 func validateDefault(val any, s *aschema) error {
@@ -1541,8 +1676,13 @@ func validateDefault(val any, s *aschema) error {
 		return validateDefaultPrimitive(val, s.primitive)
 	}
 	if len(s.union) > 0 {
-		// For unions, the default must match the first branch type.
-		return validateDefault(val, &s.union[0])
+		// Per Avro 1.12+, the default may match any branch.
+		for _, branch := range s.union {
+			if validateDefault(val, &branch) == nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("default does not match any union branch: %T(%v)", val, val)
 	}
 	if s.object != nil {
 		switch s.object.Type {
@@ -1562,6 +1702,8 @@ func validateDefault(val any, s *aschema) error {
 					}
 					continue
 				}
+				fv = coerceDefault(fv, f.Type)
+				m[f.Name] = fv
 				if err := validateDefault(fv, f.Type); err != nil {
 					return fmt.Errorf("field %q: %w", f.Name, err)
 				}
@@ -1609,8 +1751,8 @@ func validateDefault(val any, s *aschema) error {
 					return fmt.Errorf("fixed default contains code point U+%04X, max allowed is U+00FF", r)
 				}
 			}
-			if s.object.Size != nil && len([]rune(str)) != *s.object.Size {
-				return fmt.Errorf("fixed default length %d does not match size %d", len([]rune(str)), *s.object.Size)
+			if s.object.Size != nil && len([]rune(str)) != int(*s.object.Size) {
+				return fmt.Errorf("fixed default length %d does not match size %d", len([]rune(str)), int(*s.object.Size))
 			}
 		}
 	}
@@ -1651,7 +1793,15 @@ func validateDefaultPrimitive(val any, prim string) error {
 		}
 	case "float", "double":
 		if _, ok := val.(float64); !ok {
-			return fmt.Errorf("expected number for %s, got %T", prim, val)
+			// Java's schema parser accepts string defaults for float/double
+			// (e.g. "default":"3.14") and coerces them to numbers.
+			if s, ok := val.(string); ok {
+				if _, err := strconv.ParseFloat(s, 64); err != nil {
+					return fmt.Errorf("invalid string default %q for %s: %w", s, prim, err)
+				}
+			} else {
+				return fmt.Errorf("expected number for %s, got %T", prim, val)
+			}
 		}
 	case "string":
 		if _, ok := val.(string); !ok {

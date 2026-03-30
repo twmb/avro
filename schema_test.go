@@ -196,6 +196,151 @@ func TestUnmarshalJSONInvalid(t *testing.T) {
 	}
 }
 
+func TestParseFixedStringSizeINTEGERS(t *testing.T) {
+	// Per the Avro spec's [INTEGERS] canonical form rule, "size" may
+	// appear as a quoted integer (e.g. "16" instead of 16).
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"string size",
+			`{"type":"fixed","name":"F","size":"16"}`,
+		},
+		{
+			"string size in record field",
+			`{"type":"record","name":"R","fields":[
+				{"name":"f","type":{"type":"fixed","name":"F","size":"4"}}
+			]}`,
+		},
+		{
+			"string size with leading zeros",
+			`{"type":"fixed","name":"F","size":"016"}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("Parse failed: %v", err)
+			}
+			if s == nil {
+				t.Fatal("nil schema")
+			}
+		})
+	}
+
+	// Errors: non-numeric strings, empty strings, negative.
+	errTests := []struct {
+		name   string
+		schema string
+	}{
+		{"non-numeric string", `{"type":"fixed","name":"F","size":"abc"}`},
+		{"empty string", `{"type":"fixed","name":"F","size":""}`},
+		{"negative string", `{"type":"fixed","name":"F","size":"-1"}`},
+		{"zero string", `{"type":"fixed","name":"F","size":"0"}`},
+	}
+	for _, tt := range errTests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse(tt.schema)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestParseFixedStringSizeRoundTrip(t *testing.T) {
+	// String size and int size should produce identical schemas.
+	s1, err := Parse(`{"type":"fixed","name":"F","size":"4"}`)
+	if err != nil {
+		t.Fatalf("string size: %v", err)
+	}
+	s2, err := Parse(`{"type":"fixed","name":"F","size":4}`)
+	if err != nil {
+		t.Fatalf("int size: %v", err)
+	}
+
+	data := []byte{1, 2, 3, 4}
+	b1, err := s1.Encode(data)
+	if err != nil {
+		t.Fatalf("encode string-size: %v", err)
+	}
+	b2, err := s2.Encode(data)
+	if err != nil {
+		t.Fatalf("encode int-size: %v", err)
+	}
+	if !bytes.Equal(b1, b2) {
+		t.Errorf("encodings differ: %x vs %x", b1, b2)
+	}
+}
+
+func TestParseFloatDefaultFromString(t *testing.T) {
+	// Java's schema parser coerces string defaults for float/double fields.
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"float string default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"f","type":"float","default":"3.14"}
+			]}`,
+		},
+		{
+			"double string default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"d","type":"double","default":"2.718"}
+			]}`,
+		},
+		{
+			"float NaN string default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"f","type":"float","default":"NaN"}
+			]}`,
+		},
+		{
+			"float Inf string default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"f","type":"float","default":"Inf"}
+			]}`,
+		},
+		{
+			"nullable float string default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"f","type":["float","null"],"default":"1.5"}
+			]}`,
+		},
+		{
+			"nested record with float string default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"inner","type":{"type":"record","name":"I","fields":[
+					{"name":"f","type":"double"}
+				]},"default":{"f":"2.5"}}
+			]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("Parse failed: %v", err)
+			}
+			if s == nil {
+				t.Fatal("nil schema")
+			}
+		})
+	}
+
+	// Invalid string defaults should still fail.
+	_, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":"float","default":"not-a-number"}
+	]}`)
+	if err == nil {
+		t.Fatal("expected error for invalid string float default")
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -217,6 +362,370 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
+func TestParseFlatFieldFormat(t *testing.T) {
+	// The "flat" field format puts complex-type attributes (symbols,
+	// items, values, fields, size) at the field level rather than in a
+	// nested type object. linkedin/goavro accepts this, and we must too
+	// for migration compatibility.
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		// Basic flat types.
+		{
+			"flat enum",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum","symbols":["A","B","C"]}
+			]}`,
+		},
+		{
+			"flat array",
+			`{"type":"record","name":"R","fields":[
+				{"name":"A","type":"array","items":"int"}
+			]}`,
+		},
+		{
+			"flat map",
+			`{"type":"record","name":"R","fields":[
+				{"name":"M","type":"map","values":"long"}
+			]}`,
+		},
+		{
+			"flat record",
+			`{"type":"record","name":"R","fields":[
+				{"name":"Inner","type":"record","fields":[
+					{"name":"x","type":"int"}
+				]}
+			]}`,
+		},
+		{
+			"flat fixed",
+			`{"type":"record","name":"R","fields":[
+				{"name":"F","type":"fixed","size":4}
+			]}`,
+		},
+		{
+			"flat error type",
+			`{"type":"record","name":"R","fields":[
+				{"name":"Err","type":"error","fields":[
+					{"name":"msg","type":"string"}
+				]}
+			]}`,
+		},
+
+		// Field-level keys ("default", "order", "aliases") must not
+		// leak into the lifted type object.
+		{
+			"flat enum with default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum","symbols":["A","B"],"default":"A"}
+			]}`,
+		},
+		{
+			"flat array with default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"A","type":"array","items":"int","default":[]}
+			]}`,
+		},
+		{
+			"flat map with default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"M","type":"map","values":"string","default":{}}
+			]}`,
+		},
+		{
+			"flat enum with order",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum","symbols":["X","Y"],"order":"descending"}
+			]}`,
+		},
+		{
+			"flat array with aliases",
+			`{"type":"record","name":"R","fields":[
+				{"name":"A","type":"array","items":"string","aliases":["old_A"]}
+			]}`,
+		},
+
+		// Namespace handling for named types.
+		{
+			"flat enum with namespace",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum","namespace":"com.example","symbols":["A","B"]}
+			]}`,
+		},
+		{
+			"flat fixed with namespace",
+			`{"type":"record","name":"R","fields":[
+				{"name":"F","type":"fixed","namespace":"com.example","size":8}
+			]}`,
+		},
+		{
+			"flat record with namespace",
+			`{"type":"record","name":"R","fields":[
+				{"name":"Inner","type":"record","namespace":"com.example","fields":[
+					{"name":"x","type":"int"}
+				]}
+			]}`,
+		},
+
+		// Mixed flat and nested in the same record.
+		{
+			"mixed flat and nested",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum","symbols":["X","Y"]},
+				{"name":"A","type":{"type":"array","items":"string"}},
+				{"name":"M","type":"map","values":"boolean"},
+				{"name":"I","type":"int"}
+			]}`,
+		},
+
+		// Complex items/values in flat form.
+		{
+			"flat array with complex items",
+			`{"type":"record","name":"R","fields":[
+				{"name":"A","type":"array","items":{"type":"record","name":"Item","fields":[{"name":"x","type":"int"}]}}
+			]}`,
+		},
+		{
+			"flat map with complex values",
+			`{"type":"record","name":"R","fields":[
+				{"name":"M","type":"map","values":{"type":"array","items":"string"}}
+			]}`,
+		},
+		{
+			"flat array with union items",
+			`{"type":"record","name":"R","fields":[
+				{"name":"A","type":"array","items":["null","string"]}
+			]}`,
+		},
+
+		// Nested flat: a flat record whose fields are also flat.
+		{
+			"nested flat records",
+			`{"type":"record","name":"Outer","fields":[
+				{"name":"Inner","type":"record","fields":[
+					{"name":"E","type":"enum","symbols":["A","B"]},
+					{"name":"A","type":"array","items":"int"}
+				]}
+			]}`,
+		},
+
+		// Extra/unknown properties should survive the lift.
+		{
+			"flat enum with doc",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum","symbols":["A"],"doc":"an enum"}
+			]}`,
+		},
+
+		// Flat enum with many symbols.
+		{
+			"flat enum single symbol",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum","symbols":["ONLY"]}
+			]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("Parse failed: %v", err)
+			}
+			if s == nil {
+				t.Fatal("nil schema")
+			}
+		})
+	}
+}
+
+func TestParseFlatFieldFormatErrors(t *testing.T) {
+	// Flat format fields that are still invalid should produce errors.
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"flat enum no symbols",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum"}
+			]}`,
+		},
+		{
+			"flat enum empty symbols",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum","symbols":[]}
+			]}`,
+		},
+		{
+			"flat array no items",
+			`{"type":"record","name":"R","fields":[
+				{"name":"A","type":"array"}
+			]}`,
+		},
+		{
+			"flat map no values",
+			`{"type":"record","name":"R","fields":[
+				{"name":"M","type":"map"}
+			]}`,
+		},
+		{
+			"flat fixed no size",
+			`{"type":"record","name":"R","fields":[
+				{"name":"F","type":"fixed"}
+			]}`,
+		},
+		{
+			"flat record no fields",
+			`{"type":"record","name":"R","fields":[
+				{"name":"Inner","type":"record"}
+			]}`,
+		},
+		{
+			"flat enum bad default",
+			`{"type":"record","name":"R","fields":[
+				{"name":"E","type":"enum","symbols":["A","B"],"default":"Z"}
+			]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse(tt.schema)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestParseFlatFieldNotTriggeredForPrimitives(t *testing.T) {
+	// "type":"int" with no complex keys must NOT trigger flat lifting.
+	// This is the normal case; ensure we don't break it.
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"x","type":"int"},
+		{"name":"y","type":"string"},
+		{"name":"z","type":"double"}
+	]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if s == nil {
+		t.Fatal("nil schema")
+	}
+}
+
+func TestParseFlatFieldRoundTrip(t *testing.T) {
+	// Verify that the flat and nested forms produce equivalent schemas
+	// by encoding and decoding the same data.
+	flat := `{"type":"record","name":"R","fields":[
+		{"name":"E","type":"enum","symbols":["MOO","WOOF"]},
+		{"name":"A","type":"array","items":"boolean"},
+		{"name":"M","type":"map","values":"long"}
+	]}`
+	nested := `{"type":"record","name":"R","fields":[
+		{"name":"E","type":{"type":"enum","name":"E","symbols":["MOO","WOOF"]}},
+		{"name":"A","type":{"type":"array","items":"boolean"}},
+		{"name":"M","type":{"type":"map","values":"long"}}
+	]}`
+
+	sf, err := Parse(flat)
+	if err != nil {
+		t.Fatalf("flat Parse: %v", err)
+	}
+	sn, err := Parse(nested)
+	if err != nil {
+		t.Fatalf("nested Parse: %v", err)
+	}
+
+	// Encode with the flat schema, decode with the nested schema (and vice versa).
+	datum := map[string]any{
+		"E": "MOO",
+		"A": []any{true, false},
+		"M": map[string]any{"k": int64(42)},
+	}
+	buf, err := sf.Encode(datum)
+	if err != nil {
+		t.Fatalf("encode flat: %v", err)
+	}
+	var out any
+	if _, err := sn.Decode(buf, &out); err != nil {
+		t.Fatalf("decode nested: %v", err)
+	}
+	buf2, err := sn.Encode(datum)
+	if err != nil {
+		t.Fatalf("encode nested: %v", err)
+	}
+	if !bytes.Equal(buf, buf2) {
+		t.Errorf("flat and nested encoded differently:\n  flat:   %x\n  nested: %x", buf, buf2)
+	}
+}
+
+func TestParseFlatFieldRoundTripAllTypes(t *testing.T) {
+	// Round-trip each flat type individually: encode, decode, re-encode.
+	tests := []struct {
+		name   string
+		flat   string
+		nested string
+		datum  map[string]any
+	}{
+		{
+			"enum",
+			`{"type":"record","name":"R","fields":[{"name":"E","type":"enum","symbols":["A","B"]}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"E","type":{"type":"enum","name":"E","symbols":["A","B"]}}]}`,
+			map[string]any{"E": "B"},
+		},
+		{
+			"array",
+			`{"type":"record","name":"R","fields":[{"name":"A","type":"array","items":"string"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"A","type":{"type":"array","items":"string"}}]}`,
+			map[string]any{"A": []any{"hello", "world"}},
+		},
+		{
+			"map",
+			`{"type":"record","name":"R","fields":[{"name":"M","type":"map","values":"int"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"M","type":{"type":"map","values":"int"}}]}`,
+			map[string]any{"M": map[string]any{"k": int32(7)}},
+		},
+		{
+			"fixed",
+			`{"type":"record","name":"R","fields":[{"name":"F","type":"fixed","size":4}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"F","type":{"type":"fixed","name":"F","size":4}}]}`,
+			map[string]any{"F": []byte{1, 2, 3, 4}},
+		},
+		{
+			"record",
+			`{"type":"record","name":"R","fields":[{"name":"Sub","type":"record","fields":[{"name":"x","type":"int"}]}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"Sub","type":{"type":"record","name":"Sub","fields":[{"name":"x","type":"int"}]}}]}`,
+			map[string]any{"Sub": map[string]any{"x": int32(99)}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sf, err := Parse(tt.flat)
+			if err != nil {
+				t.Fatalf("flat Parse: %v", err)
+			}
+			sn, err := Parse(tt.nested)
+			if err != nil {
+				t.Fatalf("nested Parse: %v", err)
+			}
+
+			buf, err := sf.Encode(tt.datum)
+			if err != nil {
+				t.Fatalf("encode flat: %v", err)
+			}
+			buf2, err := sn.Encode(tt.datum)
+			if err != nil {
+				t.Fatalf("encode nested: %v", err)
+			}
+			if !bytes.Equal(buf, buf2) {
+				t.Errorf("flat and nested differ:\n  flat:   %x\n  nested: %x", buf, buf2)
+			}
+		})
+	}
+}
+
 func TestUnknownPrimitiveErrorString(t *testing.T) {
 	e := &unknownPrimitiveError{"foobar"}
 	s := e.Error()
@@ -226,7 +735,7 @@ func TestUnknownPrimitiveErrorString(t *testing.T) {
 }
 
 func TestValidateLogical(t *testing.T) {
-	intSize := 12
+	intSize := laxInt(12)
 	zeroPrec := 0
 	somePrec := 10
 
@@ -278,7 +787,7 @@ func TestValidateLogical(t *testing.T) {
 		{"duration ok", aobject{Type: "fixed", Logical: "duration", Size: &intSize}, false},
 		{"duration wrong type", aobject{Type: "int", Logical: "duration"}, true},
 		{"duration no size", aobject{Type: "fixed", Logical: "duration"}, true},
-		{"duration wrong size", aobject{Type: "fixed", Logical: "duration", Size: &somePrec}, true},
+		{"duration wrong size", aobject{Type: "fixed", Logical: "duration", Size: new(laxInt(10))}, true},
 
 		// unknown logical types are ignored per spec
 		{"unknown logical", aobject{Type: "int", Logical: "foobar"}, false},
