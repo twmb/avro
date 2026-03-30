@@ -290,10 +290,8 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.Kind() == reflect.String {
 		return doSerString(dst, v.String()), nil
 	}
-	// Accept []byte for symmetry with bytes accepting string.
-	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		return doSerString(dst, string(v.Bytes())), nil
-	}
+	// Text interfaces before []byte: named []byte subtypes like net.IP
+	// should use their text representation, not raw bytes.
 	if v.CanInterface() {
 		i := v.Interface()
 		if a, ok := i.(encoding.TextAppender); ok {
@@ -324,6 +322,10 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 			}
 			return doSerString(dst, string(text)), nil
 		}
+	}
+	// Accept []byte for symmetry with bytes accepting string.
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		return doSerString(dst, string(v.Bytes())), nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 }

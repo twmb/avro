@@ -371,15 +371,16 @@ func deserString(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		v.SetString(str)
 		return src[n:], nil
 	}
-	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		v.SetBytes([]byte(str))
-		return src[n:], nil
-	}
-	// Try encoding.TextUnmarshaler.
+	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
+	// should use their text parsing, not raw byte assignment.
 	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
 		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(str)); err != nil {
 			return nil, err
 		}
+		return src[n:], nil
+	}
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		v.SetBytes([]byte(str))
 		return src[n:], nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
@@ -1077,14 +1078,10 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == durationType {
+	if v.Kind() == reflect.Interface || v.Type() == durationType {
 		if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
 			return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
 		}
-		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
-		return src, nil
-	}
-	if v.Kind() == reflect.Interface {
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
 		return src, nil
 	}
