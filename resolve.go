@@ -6,6 +6,7 @@ import (
 	"math"
 	"reflect"
 	"slices"
+	"strconv"
 	"sync"
 )
 
@@ -638,6 +639,9 @@ func encodeDefault(val any, node *schemaNode) ([]byte, error) {
 func doEncodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 	switch node.kind {
 	case "null":
+		if val != nil {
+			return nil, fmt.Errorf("expected nil for null default, got %T", val)
+		}
 		return dst, nil
 	case "boolean":
 		b, ok := val.(bool)
@@ -669,13 +673,29 @@ func doEncodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 	case "float":
 		f, ok := val.(float64)
 		if !ok {
-			return nil, fmt.Errorf("expected number for float default, got %T", val)
+			if s, ok := val.(string); ok {
+				if v, err := strconv.ParseFloat(s, 64); err == nil {
+					f = v
+				} else {
+					return nil, fmt.Errorf("invalid string default %q for float: %w", s, err)
+				}
+			} else {
+				return nil, fmt.Errorf("expected number for float default, got %T", val)
+			}
 		}
 		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	case "double":
 		f, ok := val.(float64)
 		if !ok {
-			return nil, fmt.Errorf("expected number for double default, got %T", val)
+			if s, ok := val.(string); ok {
+				if v, err := strconv.ParseFloat(s, 64); err == nil {
+					f = v
+				} else {
+					return nil, fmt.Errorf("invalid string default %q for double: %w", s, err)
+				}
+			} else {
+				return nil, fmt.Errorf("expected number for double default, got %T", val)
+			}
 		}
 		return appendUint64(dst, math.Float64bits(f)), nil
 	case "string":
@@ -783,12 +803,18 @@ func doEncodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return dst, nil
 	case "union":
-		// Default value must match the first branch (Avro spec).
+		// Per Avro 1.12+, the default may match any branch.
 		if len(node.branches) == 0 {
 			return nil, fmt.Errorf("empty union")
 		}
-		dst = appendVarlong(dst, 0) // index of first branch
-		return doEncodeDefault(dst, val, node.branches[0])
+		base := len(dst)
+		for i, branch := range node.branches {
+			attempt := appendVarlong(dst[:base], int64(i))
+			if encoded, err := doEncodeDefault(attempt, val, branch); err == nil {
+				return encoded, nil
+			}
+		}
+		return nil, fmt.Errorf("union default does not match any branch: %T(%v)", val, val)
 	default:
 		return nil, fmt.Errorf("unsupported default encoding for type %q", node.kind)
 	}

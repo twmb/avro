@@ -371,7 +371,7 @@ func TestCompatMapValuesCompat(t *testing.T) {
 // Spec: "Schema Resolution" (field defaults) and "Parsing Canonical
 // Form for Schemas" (canonical JSON representation).
 //   - Defaults: applied at read time only, not write time
-//   - Union defaults: must match the first branch type
+//   - Union defaults: may match any branch type (Avro 1.12+)
 //   - Complex defaults: arrays, maps, nested records
 //   - Bytes defaults: decoded from JSON \uXXXX escapes
 //   - Canonical form: strips doc/aliases/defaults, expands fullnames,
@@ -409,6 +409,40 @@ func TestSpecNullUnionDefault(t *testing.T) {
 	}
 	if m["b"] != nil {
 		t.Fatalf("b: got %v, want nil", m["b"])
+	}
+}
+
+func TestSpecUnionDefaultNonFirstBranch(t *testing.T) {
+	// Default matches the second branch (string), not the first (null).
+	// This is the *string pattern: ["null","string"] with default "hello".
+	writer := mustParse(t, `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	reader := mustParse(t, `{
+		"type":"record","name":"R",
+		"fields":[
+			{"name":"a","type":"int"},
+			{"name":"b","type":["null","string"],"default":"hello"}
+		]
+	}`)
+	resolved, err := avro.Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": int32(7)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := result.(map[string]any)
+	if m["a"] != int32(7) {
+		t.Fatalf("a: got %v, want 7", m["a"])
+	}
+	if m["b"] != "hello" {
+		t.Fatalf("b: got %v (%T), want \"hello\"", m["b"], m["b"])
 	}
 }
 
@@ -578,15 +612,49 @@ func TestSpecDefaultsUsedOnEncode(t *testing.T) {
 	}
 }
 
-func TestSpecUnionDefaultMustMatchFirstBranch(t *testing.T) {
+func TestSpecUnionDefaultMatchesAnyBranch(t *testing.T) {
+	// Per Avro 1.12+, the default may match any branch in a union.
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"null default matches second branch",
+			`{"type":"record","name":"R","fields":[
+				{"name":"u","type":["string","null"],"default":null}
+			]}`,
+		},
+		{
+			"string default matches second branch",
+			`{"type":"record","name":"R","fields":[
+				{"name":"u","type":["null","string"],"default":"hello"}
+			]}`,
+		},
+		{
+			"int default matches third branch",
+			`{"type":"record","name":"R","fields":[
+				{"name":"u","type":["null","string","int"],"default":42}
+			]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := avro.Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("expected success, got: %v", err)
+			}
+		})
+	}
+
+	// Default must still match SOME branch.
 	_, err := avro.Parse(`{
 		"type":"record","name":"R",
 		"fields":[
-			{"name":"u","type":["string","null"],"default":null}
+			{"name":"u","type":["null","string"],"default":42}
 		]
 	}`)
 	if err == nil {
-		t.Fatal("expected error when union default does not match the first branch")
+		t.Fatal("expected error when union default matches no branch")
 	}
 }
 

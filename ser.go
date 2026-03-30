@@ -244,6 +244,18 @@ func serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.CanFloat() {
 		return appendUint32(dst, math.Float32bits(float32(v.Float()))), nil
+	} else if v.CanInt() {
+		n := v.Int()
+		if n < -1<<24 || n > 1<<24 {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: errors.New("integer overflows float32 exact precision")}
+		}
+		return appendUint32(dst, math.Float32bits(float32(n))), nil
+	} else if v.CanUint() {
+		n := v.Uint()
+		if n > 1<<24 {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: errors.New("integer overflows float32 exact precision")}
+		}
+		return appendUint32(dst, math.Float32bits(float32(n))), nil
 	} else if fv, ok := jsonNumberToFloat(v); ok {
 		return serFloat(dst, fv)
 	}
@@ -257,6 +269,18 @@ func serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	if v.CanFloat() {
 		return appendUint64(dst, math.Float64bits(v.Float())), nil
+	} else if v.CanInt() {
+		n := v.Int()
+		if n < -1<<53 || n > 1<<53 {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: errors.New("integer overflows float64 exact precision")}
+		}
+		return appendUint64(dst, math.Float64bits(float64(n))), nil
+	} else if v.CanUint() {
+		n := v.Uint()
+		if n > 1<<53 {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: errors.New("integer overflows float64 exact precision")}
+		}
+		return appendUint64(dst, math.Float64bits(float64(n))), nil
 	} else if fv, ok := jsonNumberToFloat(v); ok {
 		return serDouble(dst, fv)
 	}
@@ -922,7 +946,7 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	t := v.Type()
-	// Accept both [N]byte arrays and []byte slices of the correct length.
+	// Accept [N]byte arrays, []byte slices, and strings of the correct length.
 	switch t.Kind() {
 	case reflect.Array:
 		if t.Elem().Kind() != reflect.Uint8 || t.Len() != s.n {
@@ -933,6 +957,12 @@ func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
 			return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 		}
 		return append(dst, v.Bytes()...), nil
+	case reflect.String:
+		str := v.String()
+		if len(str) != s.n {
+			return nil, &SemanticError{GoType: t, AvroType: "fixed"}
+		}
+		return append(dst, str...), nil
 	default:
 		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}

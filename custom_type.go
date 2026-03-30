@@ -11,8 +11,15 @@ import (
 // built-in behavior.
 var ErrSkipCustomType = errors.New("avro: skip custom type")
 
-// CustomType defines a custom conversion between a Go type and an
-// Avro type. Pass to [Parse] or [SchemaFor] as a [SchemaOpt].
+// CustomType defines a custom conversion between a Go type and an Avro
+// type. Use this when you need full control over the type mapping — for
+// example, to map a custom Go struct to/from an Avro fixed or record, to
+// handle complex Avro types (records, arrays, maps) as backing types, or
+// to dispatch on schema properties rather than logical type names. For
+// simpler cases where the backing type is a primitive, prefer
+// [NewCustomType] which infers the wiring from type parameters.
+//
+// Pass to [Parse] or [SchemaFor] as a [SchemaOpt].
 //
 // Matching at parse time: LogicalType and AvroType are checked against
 // schema nodes. All non-empty criteria must match.
@@ -87,8 +94,7 @@ func (CustomType) schemaOpt() {}
 // WithCustomType registers a custom type conversion for use with
 // [Parse], [SchemaCache.Parse], or [SchemaFor]. [CustomType] and
 // [NewCustomType] both satisfy [SchemaOpt] directly, so this wrapper
-// is optional — it exists for discoverability alongside [WithLaxNames],
-// [WithNamespace], and [WithName].
+// is optional — it exists for discoverability.
 func WithCustomType(ct CustomType) SchemaOpt { return ct }
 
 // matches returns true if ct's criteria match the given schema node.
@@ -102,14 +108,18 @@ func (ct CustomType) matches(node *schemaNode) bool {
 	return true
 }
 
-// NewCustomType returns a type-safe [CustomType]. G is the custom Go
-// type (e.g. Money). A is the Avro-native Go type: int32 for int,
-// int64 for long, float32 for float, float64 for double, string for
-// string, []byte for bytes, bool for boolean.
+// NewCustomType returns a type-safe [CustomType] for the common case of
+// mapping a custom Go type to/from a primitive Avro type. For example,
+// use this to decode Avro longs into a domain-specific ID type, or to
+// encode a Money type as Avro bytes with a "decimal" logical type.
+//
+// G is the custom Go type (e.g. Money). A is the Avro-native Go type:
+// int32 for int, int64 for long, float32 for float, float64 for double,
+// string for string, []byte for bytes, bool for boolean.
 //
 // GoType and AvroType are inferred from the type parameters. If A is
 // not a supported Avro-native type, [Parse] or [SchemaFor] returns an
-// error (not a panic at construction time).
+// error.
 //
 // Note: AvroType is inferred from A's Go kind, which may not match
 // the Avro schema's type for logical types backed by smaller types.
