@@ -334,11 +334,11 @@ func TestSerNullGenericUnionNonNilable(t *testing.T) {
 	}
 }
 
-type textMarshalerType struct{ val string }
+type testTextMarshaler struct{ val string }
 
-func (tm textMarshalerType) MarshalText() ([]byte, error) { return []byte(tm.val), nil }
+func (tm testTextMarshaler) MarshalText() ([]byte, error) { return []byte(tm.val), nil }
 
-var _ encoding.TextMarshaler = textMarshalerType{}
+var _ encoding.TextMarshaler = testTextMarshaler{}
 
 type textMarshalerErr struct{}
 
@@ -346,11 +346,11 @@ func (textMarshalerErr) MarshalText() ([]byte, error) { return nil, fmt.Errorf("
 
 var _ encoding.TextMarshaler = textMarshalerErr{}
 
-type textAppenderType struct{ val string }
+type testTextAppender struct{ val string }
 
-func (ta textAppenderType) AppendText(b []byte) ([]byte, error) { return append(b, ta.val...), nil }
+func (ta testTextAppender) AppendText(b []byte) ([]byte, error) { return append(b, ta.val...), nil }
 
-var _ encoding.TextAppender = textAppenderType{}
+var _ encoding.TextAppender = testTextAppender{}
 
 type textAppenderErr struct{}
 
@@ -374,15 +374,22 @@ func TestSerStringRejectsStringer(t *testing.T) {
 	}
 }
 
-func TestSerStringRejectsTextMarshaler(t *testing.T) {
+func TestSerStringAcceptsTextMarshaler(t *testing.T) {
 	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v := textMarshalerType{val: "hello"}
-	_, err = s.AppendEncode(nil, &v)
-	if err == nil {
-		t.Fatal("expected error: TextMarshaler should not be accepted for string fields")
+	v := testTextMarshaler{val: "hello"}
+	encoded, err := s.AppendEncode(nil, &v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got string
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != "hello" {
+		t.Fatalf("got %q, want %q", got, "hello")
 	}
 }
 
@@ -419,15 +426,22 @@ func TestSerStringRejectsJsonNumberInMap(t *testing.T) {
 	}
 }
 
-func TestSerStringRejectsTextAppender(t *testing.T) {
+func TestSerStringAcceptsTextAppender(t *testing.T) {
 	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v := textAppenderType{val: "hello"}
-	_, err = s.AppendEncode(nil, &v)
-	if err == nil {
-		t.Fatal("expected error: TextAppender should not be accepted for string fields")
+	v := testTextAppender{val: "hello"}
+	encoded, err := s.AppendEncode(nil, &v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got string
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != "hello" {
+		t.Fatalf("got %q, want %q", got, "hello")
 	}
 }
 

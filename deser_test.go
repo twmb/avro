@@ -6634,9 +6634,12 @@ func TestDeserStringTextUnmarshaler(t *testing.T) {
 	}
 }
 
-func TestTextMarshalerRejectsForString(t *testing.T) {
+func TestTextMarshalerRoundTrip(t *testing.T) {
 	type R struct {
-		Name textMarshalerType `avro:"name"`
+		Name testTextMarshaler `avro:"name"`
+	}
+	type RD struct {
+		Name testTextUnmarshaler `avro:"name"`
 	}
 
 	schema := `{"type":"record","name":"r","fields":[{"name":"name","type":"string"}]}`
@@ -6644,10 +6647,17 @@ func TestTextMarshalerRejectsForString(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := R{Name: textMarshalerType{val: "world"}}
-	_, err = s.AppendEncode(nil, &input)
-	if err == nil {
-		t.Fatal("expected error: TextMarshaler should not be accepted for string fields")
+	input := R{Name: testTextMarshaler{val: "world"}}
+	encoded, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var output RD
+	if _, err = s.Decode(encoded, &output); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if output.Name.val != "unmarshaled:world" {
+		t.Fatalf("got %q, want %q", output.Name.val, "unmarshaled:world")
 	}
 }
 

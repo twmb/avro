@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,7 +22,7 @@ type serfn func([]byte, reflect.Value) ([]byte, error)
 //   - [encoding/json.Number] for any numeric Avro type (int, long, float, double)
 //   - RFC 3339 strings for timestamp and date logical types
 //   - [*big.Rat], [big.Rat], float64, [encoding/json.Number], and numeric strings for decimal logical types
-//   - []byte for string types (and vice versa)
+//   - [encoding.TextAppender], [encoding.TextMarshaler], and []byte for string types (and vice versa for [encoding.TextUnmarshaler])
 func (s *Schema) AppendEncode(dst []byte, v any, opts ...Opt) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
@@ -292,6 +293,37 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 	// Accept []byte for symmetry with bytes accepting string.
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		return doSerString(dst, string(v.Bytes())), nil
+	}
+	if v.CanInterface() {
+		i := v.Interface()
+		if a, ok := i.(encoding.TextAppender); ok {
+			mark := len(dst)
+			dst = appendVarlong(dst, 0) // placeholder for length
+			hdrLen := len(dst) - mark
+			dst, err = a.AppendText(dst)
+			if err != nil {
+				return nil, err
+			}
+			textLen := len(dst) - mark - hdrLen
+			var buf [10]byte
+			hdr := appendVarlong(buf[:0], int64(textLen))
+			if len(hdr) == hdrLen {
+				copy(dst[mark:], hdr)
+			} else {
+				// Header grew; shift text to make room.
+				dst = append(dst, make([]byte, len(hdr)-hdrLen)...)
+				copy(dst[mark+len(hdr):], dst[mark+hdrLen:mark+hdrLen+textLen])
+				copy(dst[mark:], hdr)
+			}
+			return dst, nil
+		}
+		if m, ok := i.(encoding.TextMarshaler); ok {
+			text, err := m.MarshalText()
+			if err != nil {
+				return nil, err
+			}
+			return doSerString(dst, string(text)), nil
+		}
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 }

@@ -43,7 +43,9 @@
 // Data from [encoding/json.Unmarshal] (map[string]any with float64 numbers
 // and string timestamps) can be encoded directly. Missing map keys are
 // filled from schema defaults, [encoding/json.Number] is accepted for all
-// numeric types, and timestamp fields accept RFC 3339 strings.
+// numeric types, and timestamp fields accept RFC 3339 strings. String
+// fields accept [encoding.TextAppender] and [encoding.TextMarshaler]
+// implementations (with [encoding.TextUnmarshaler] on decode).
 //
 // # Schema evolution
 //

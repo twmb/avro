@@ -82,7 +82,7 @@ The table below shows which Go types can be used with each Avro type.
 | int, long | `int`, `int8`–`int64`, `uint`–`uint64`, `float64`, `json.Number` | `int`, `int8`–`int64`, `uint`–`uint64`, `any` |
 | float     | `float32`, `float64`, `json.Number` | `float32`, `float64`, `any` |
 | double    | `float64`, `float32`, `json.Number` | `float64`, `float32`, `any` |
-| string    | `string`, `[]byte` | `string`, `[]byte`, `encoding.TextUnmarshaler`, `any` |
+| string    | `string`, `[]byte`, `encoding.TextAppender`, `encoding.TextMarshaler` | `string`, `[]byte`, `encoding.TextUnmarshaler`, `any` |
 | bytes     | `[]byte`, `string` | `[]byte`, `string`, `any` |
 | enum      | `string`, any integer type (ordinal) | `string`, any integer type (ordinal), `any` |
 | fixed     | `[N]byte`, `[]byte` | `[N]byte`, `[]byte`, `any` |

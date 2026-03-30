@@ -1025,7 +1025,7 @@ type stringerType struct{ v string }
 
 func (s stringerType) String() string { return s.v }
 
-func TestSchemaForTextMarshalerNotInferredAsString(t *testing.T) {
+func TestSchemaForTextMarshalerInferredAsString(t *testing.T) {
 	type Record struct {
 		A customString `avro:"a"`
 	}
@@ -1033,14 +1033,12 @@ func TestSchemaForTextMarshalerNotInferredAsString(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// customString should NOT be inferred as "string" — it's a struct,
-	// so SchemaFor infers it as a record.
 	root := s.Root()
 	if len(root.Fields) == 0 {
 		t.Fatal("expected fields")
 	}
-	if root.Fields[0].Type.Type == "string" {
-		t.Fatal("TextMarshaler type should not be inferred as string")
+	if root.Fields[0].Type.Type != "string" {
+		t.Fatalf("expected string, got %s", root.Fields[0].Type.Type)
 	}
 }
 

@@ -2076,3 +2076,64 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeJSONGoavroLogicalBranchName(t *testing.T) {
+	// goavro uses "long.timestamp-millis" as union branch names.
+	// DecodeJSON should accept these via findUnionBranch fallback.
+	schema := `["null",{"type":"long","logicalType":"timestamp-millis"}]`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v any
+	if err := s.DecodeJSON([]byte(`{"long.timestamp-millis":1687221496000}`), &v); err != nil {
+		t.Fatalf("DecodeJSON: %v", err)
+	}
+	got, ok := v.(time.Time)
+	if !ok {
+		t.Fatalf("expected time.Time, got %T: %v", v, v)
+	}
+	if got.UnixMilli() != 1687221496000 {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestEncodeJSONTimeLongDefault(t *testing.T) {
+	// time.Time for a long field without logical type should use millis fallback.
+	s, _ := Parse(`"long"`)
+	now := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
+	got, err := s.EncodeJSON(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strconv.FormatInt(now.UnixMilli(), 10)
+	if string(got) != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestSerStringTextMarshalerError(t *testing.T) {
+	s, _ := Parse(`"string"`)
+	v := textMarshalerErr{}
+	_, err := s.AppendEncode(nil, &v)
+	if err == nil {
+		t.Fatal("expected error from MarshalText")
+	}
+}
+
+func TestSerStringTextAppenderLong(t *testing.T) {
+	// TextAppender with text > 63 bytes forces multi-byte varlong header.
+	s, _ := Parse(`"string"`)
+	long := testTextAppender{val: string(make([]byte, 200))}
+	encoded, err := s.AppendEncode(nil, &long)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 200 {
+		t.Errorf("got len %d, want 200", len(got))
+	}
+}

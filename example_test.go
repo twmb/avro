@@ -3,6 +3,7 @@ package avro_test
 import (
 	"fmt"
 	"log"
+	"net"
 	"time"
 
 	"github.com/twmb/avro"
@@ -283,4 +284,37 @@ func ExampleSchemaFor() {
 	// id=1 name=click source=mobile meta=test
 	// field name: default=unnamed
 	// field source: default=web
+}
+
+func ExampleSchema_Encode_textMarshaler() {
+	// Types implementing encoding.TextMarshaler are encoded as Avro
+	// strings, and encoding.TextUnmarshaler types decode from them.
+	schema := avro.MustParse(`{
+		"type": "record",
+		"name": "Server",
+		"fields": [
+			{"name": "name", "type": "string"},
+			{"name": "ip",   "type": "string"}
+		]
+	}`)
+
+	type Server struct {
+		Name string `avro:"name"`
+		IP   net.IP `avro:"ip"`
+	}
+
+	data, err := schema.Encode(&Server{
+		Name: "web-1",
+		IP:   net.IPv4(192, 168, 1, 1),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var out Server
+	if _, err := schema.Decode(data, &out); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s: %s\n", out.Name, out.IP)
+	// Output: web-1: 192.168.1.1
 }

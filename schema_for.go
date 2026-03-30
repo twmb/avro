@@ -434,6 +434,19 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		return map[string]any{"type": "string", "logicalType": "uuid"}, nil
 	}
 
+	// Types implementing text interfaces are inferred as string,
+	// matching the encoder (TextAppender/TextMarshaler) and decoder
+	// (TextUnmarshaler) behavior.
+	for _, iface := range []reflect.Type{
+		textAppenderType,
+		textMarshalerType,
+		textUnmarshalerType,
+	} {
+		if t.Implements(iface) || reflect.PointerTo(t).Implements(iface) {
+			return "string", nil
+		}
+	}
+
 	switch t.Kind() {
 	case reflect.Bool:
 		return "boolean", nil
