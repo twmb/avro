@@ -1966,3 +1966,113 @@ func TestEncodeJSONStructCacheSharing(t *testing.T) {
 		}
 	}
 }
+
+func TestEncodeJSONTimeAsDate(t *testing.T) {
+	s, _ := Parse(`{"type":"int","logicalType":"date"}`)
+	d := time.Date(2026, 3, 19, 0, 0, 0, 0, time.UTC)
+	got, err := s.EncodeJSON(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// days since epoch
+	want := strconv.FormatInt(d.Unix()/86400, 10)
+	if string(got) != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestEncodeJSONTimeAsTimeMillis(t *testing.T) {
+	s, _ := Parse(`{"type":"int","logicalType":"time-millis"}`)
+	// Duration input (from Decode).
+	d := time.Duration(35245000) * time.Millisecond
+	got, err := s.EncodeJSON(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "35245000" {
+		t.Errorf("duration: got %s", got)
+	}
+	// time.Time input (manually constructed time-of-day).
+	tod := time.Date(0, 1, 1, 9, 47, 25, 0, time.UTC)
+	got, err = s.EncodeJSON(tod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "35245000" {
+		t.Errorf("time.Time: got %s", got)
+	}
+}
+
+func TestEncodeJSONTimestampNanos(t *testing.T) {
+	s, _ := Parse(`{"type":"long","logicalType":"timestamp-nanos"}`)
+	now := time.Date(2026, 3, 19, 10, 0, 0, 123456789, time.UTC)
+	got, err := s.EncodeJSON(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strconv.FormatInt(now.UnixNano(), 10)
+	if string(got) != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestFromAvroJSONIntTruncation(t *testing.T) {
+	s, _ := Parse(`"int"`)
+	var v any
+	// Non-whole number for int should error.
+	if err := s.DecodeJSON([]byte(`3.14`), &v); err == nil {
+		t.Fatal("expected error for non-whole int")
+	}
+	// Overflow should error.
+	if err := s.DecodeJSON([]byte(`3000000000`), &v); err == nil {
+		t.Fatal("expected error for int32 overflow")
+	}
+}
+
+func TestFromAvroJSONLongTruncation(t *testing.T) {
+	s, _ := Parse(`"long"`)
+	var v any
+	if err := s.DecodeJSON([]byte(`1.5`), &v); err == nil {
+		t.Fatal("expected error for non-whole long")
+	}
+}
+
+func TestFromAvroJSONFloatTypeCheck(t *testing.T) {
+	s, _ := Parse(`"float"`)
+	var v any
+	if err := s.DecodeJSON([]byte(`"not a number"`), &v); err == nil {
+		t.Fatal("expected error for string as float")
+	}
+}
+
+func TestFromAvroJSONDoubleTypeCheck(t *testing.T) {
+	s, _ := Parse(`"double"`)
+	var v any
+	if err := s.DecodeJSON([]byte(`true`), &v); err == nil {
+		t.Fatal("expected error for bool as double")
+	}
+}
+
+func TestAppendJSONStringEscaping(t *testing.T) {
+	s, _ := Parse(`"string"`)
+	// Test control characters and special escapes.
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{`hello`, `"hello"`},
+		{"a\"b", `"a\"b"`},
+		{"a\\b", `"a\\b"`},
+		{"a\nb", `"a\u000ab"`},
+		{"a\x00b", `"a\u0000b"`},
+	}
+	for _, tt := range tests {
+		got, err := s.EncodeJSON(tt.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tt.want {
+			t.Errorf("EncodeJSON(%q) = %s, want %s", tt.in, got, tt.want)
+		}
+	}
+}

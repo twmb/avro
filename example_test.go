@@ -258,7 +258,7 @@ func ExampleSchemaFor() {
 	data, err := schema.Encode(&Event{
 		ID:     1,
 		Name:   "click",
-		Source:  "mobile",
+		Source: "mobile",
 		Time:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 		Meta:   &meta,
 	})

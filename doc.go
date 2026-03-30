@@ -1,4 +1,4 @@
-// Package avro encodes and decodes Avro data.
+// Package avro encodes and decodes [Avro specification] data.
 //
 // Parse an Avro JSON schema with [Parse] (or [MustParse] for package-level
 // vars), then call [Schema.Encode] / [Schema.Decode] for binary encoding,
@@ -33,8 +33,10 @@
 //
 // [Schema.EncodeJSON] is schema-aware and handles bytes, unions, and
 // NaN/Infinity floats correctly — use it instead of [encoding/json.Marshal]
-// when serializing decoded Avro data to JSON. Pass [TaggedUnions] for
-// Avro JSON union wrappers ({"type": value}).
+// when serializing decoded Avro data to JSON. Options control the output
+// format: [TaggedUnions] for Avro JSON union wrappers ({"type": value}),
+// [TagLogicalTypes] for qualified branch names, and [LinkedinFloats] for
+// the goavro NaN/Infinity convention.
 //
 // # Encoding from JSON input
 //
@@ -103,21 +105,51 @@
 //
 // # Struct tags
 //
-// Use the "avro" struct tag to control field mapping:
+// Use the "avro" struct tag to control field mapping and schema inference.
+// The format is avro:"[name][,option]..." where the name maps the Go field
+// to the Avro field name (empty = use Go field name, "-" = exclude).
+//
+// Encoding/decoding options:
 //
 //	avro:"name"           // map to Avro field "name"
 //	avro:"-"              // exclude field
-//	avro:",inline"        // flatten nested struct fields
-//	avro:",omitzero"      // use schema default for zero values
+//	avro:",inline"        // flatten nested struct fields into parent record
+//	avro:",omitzero"      // encode zero values as the schema default
+//
+// Schema inference options (used by [SchemaFor]):
+//
+//	avro:",default=value"         // set field default (must be last option; scalars only)
+//	avro:",alias=old_name"        // field alias for evolution (repeatable)
+//	avro:",timestamp-micros"      // override logical type (also: timestamp-nanos, date, time-millis, time-micros)
+//	avro:",decimal(10,2)"         // decimal logical type with precision and scale
+//	avro:",uuid"                  // UUID logical type
+//
+// When encoding a map[string]any as a record, missing keys are filled
+// from the schema's default values. For structs, omitzero does the same
+// for zero-valued fields (or fields whose IsZero() method returns true).
 //
 // Embedded (anonymous) struct fields are automatically inlined. To prevent
 // inlining, give the field an explicit name tag. When multiple fields at
 // different depths resolve to the same name, the shallowest wins; among
 // fields at the same depth, a tagged field wins over an untagged one.
 //
+// # Parsing options
+//
+// [Parse] and [SchemaCache.Parse] accept [WithLaxNames] to allow
+// non-standard characters in type and field names.
+//
+// # Errors
+//
+// Encode and decode errors can be inspected with [errors.As]:
+//
+//   - [*SemanticError]: type mismatch (includes a dotted field path for nested records)
+//   - [*ShortBufferError]: input truncated mid-value
+//   - [*CompatibilityError]: schema evolution incompatibility
+//
 // # Other features
 //
 //   - Schema Cache: [SchemaCache] accumulates named types across Parse calls for schema registry workflows
+//   - Schema Introspection: [Schema.Root] returns a [SchemaNode]; [Schema.String] returns the original JSON
 //   - Single Object Encoding: [Schema.AppendSingleObject], [Schema.DecodeSingleObject]
 //   - Fingerprinting: [Schema.Canonical], [Schema.Fingerprint], [NewRabin]
 //   - Object Container Files: the [github.com/twmb/avro/ocf] sub-package

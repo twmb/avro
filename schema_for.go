@@ -1,7 +1,6 @@
 package avro
 
 import (
-	"encoding"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -433,15 +432,6 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	// UUID: string by default, but [16]byte gets fixed(16).
 	if logical == "uuid" && t.Kind() != reflect.Array {
 		return map[string]any{"type": "string", "logicalType": "uuid"}, nil
-	}
-
-	// Types implementing TextUnmarshaler are inferred as string,
-	// allowing decode into custom string-like types.
-	{
-		iface := reflect.TypeFor[encoding.TextUnmarshaler]()
-		if t.Implements(iface) || reflect.PointerTo(t).Implements(iface) {
-			return "string", nil
-		}
 	}
 
 	switch t.Kind() {

@@ -1126,8 +1126,7 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	b := src[:n]
 	src = src[n:]
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		// Return json.Number for any targets so json.Marshal works.
+	if v.Kind() == reflect.Interface || v.Type() == jsonNumberType {
 		r := bytesToRat(b, s.scale)
 		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
 		return src, nil
@@ -1151,7 +1150,7 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	b := src[:s.size]
 	src = src[s.size:]
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
+	if v.Kind() == reflect.Interface || v.Type() == jsonNumberType {
 		r := bytesToRat(b, s.scale)
 		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
 		return src, nil
