@@ -110,8 +110,10 @@
 //	avro:",inline"        // flatten nested struct fields
 //	avro:",omitzero"      // use schema default for zero values
 //
-// Embedded structs are inlined by default. See the README for the full
-// tag reference.
+// Embedded (anonymous) struct fields are automatically inlined. To prevent
+// inlining, give the field an explicit name tag. When multiple fields at
+// different depths resolve to the same name, the shallowest wins; among
+// fields at the same depth, a tagged field wins over an untagged one.
 //
 // # Other features
 //

@@ -151,6 +151,11 @@ func (s *Schema) Canonical() []byte {
 
 // Fingerprint hashes the schema's canonical form with h. Use [NewRabin] for
 // CRC-64-AVRO or crypto/sha256 for cross-language compatibility.
+//
+// The returned bytes follow [hash.Hash.Sum] convention (big-endian for
+// [NewRabin]). Note that Single Object Encoding stores the fingerprint in
+// little-endian order per the Avro spec; use [Schema.DecodeSingleObject] or
+// [SingleObjectFingerprint] for SOE, not this method.
 func (s *Schema) Fingerprint(h hash.Hash) []byte {
 	h.Write(s.Canonical())
 	return h.Sum(nil)

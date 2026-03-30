@@ -31,9 +31,10 @@ type SchemaNode struct {
 	Type        string // Avro type or named type reference
 	LogicalType string // e.g. date, timestamp-millis, decimal, uuid; empty if none
 
-	Name      string // name for record, enum, fixed
-	Namespace string // namespace for named types
-	Doc       string // documentation string
+	Name      string   // name for record, enum, fixed
+	Namespace string   // namespace for named types
+	Aliases   []string // alternate names for named types (record, enum, fixed)
+	Doc       string   // documentation string
 
 	Fields   []SchemaField // record fields
 	Items    *SchemaNode   // array element schema
@@ -41,6 +42,9 @@ type SchemaNode struct {
 	Branches []SchemaNode  // union member schemas
 	Symbols  []string      // enum symbols
 	Size     int           // fixed byte size
+
+	EnumDefault    string // default symbol for enum schema evolution
+	HasEnumDefault bool   // true if an enum default is defined
 
 	Precision int            // decimal precision
 	Scale     int            // decimal scale
@@ -54,6 +58,7 @@ type SchemaField struct {
 	Default    any            // default value (only meaningful when HasDefault is true)
 	HasDefault bool           // true if a default value is defined in the schema
 	Aliases    []string       // field aliases for schema evolution
+	Order      string         // sort order: "ascending" (default), "descending", or "ignore"
 	Doc        string         // documentation string
 	Props      map[string]any // custom properties (any JSON value)
 }
@@ -114,8 +119,14 @@ func (n *SchemaNode) toJSON() any {
 	if n.Namespace != "" {
 		m["namespace"] = n.Namespace
 	}
+	if len(n.Aliases) > 0 {
+		m["aliases"] = n.Aliases
+	}
 	if n.Doc != "" {
 		m["doc"] = n.Doc
+	}
+	if n.HasEnumDefault {
+		m["default"] = n.EnumDefault
 	}
 	if n.LogicalType != "" {
 		m["logicalType"] = n.LogicalType
@@ -150,6 +161,9 @@ func (n *SchemaNode) toJSON() any {
 			}
 			if len(f.Aliases) > 0 {
 				fd["aliases"] = f.Aliases
+			}
+			if f.Order != "" {
+				fd["order"] = f.Order
 			}
 			if f.Doc != "" {
 				fd["doc"] = f.Doc
@@ -227,11 +241,22 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 		n.Size = int(s)
 	}
 
+	if aliases, ok := m["aliases"].([]any); ok {
+		n.Aliases = make([]string, len(aliases))
+		for i, a := range aliases {
+			n.Aliases[i], _ = a.(string)
+		}
+	}
+
 	if syms, ok := m["symbols"].([]any); ok {
 		n.Symbols = make([]string, len(syms))
 		for i, s := range syms {
 			n.Symbols[i], _ = s.(string)
 		}
+	}
+	if d, ok := m["default"].(string); ok && n.Type == "enum" {
+		n.EnumDefault = d
+		n.HasEnumDefault = true
 	}
 
 	if items, ok := m["items"]; ok {
@@ -266,6 +291,9 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 				for j, a := range aliases {
 					sf.Aliases[j], _ = a.(string)
 				}
+			}
+			if order, ok := fm["order"].(string); ok {
+				sf.Order = order
 			}
 			for k, v := range fm {
 				if fieldReservedKeys[k] {

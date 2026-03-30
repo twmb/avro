@@ -88,8 +88,13 @@ func parseOpts(opts []Opt) optConfig {
 // EncodeJSON accepts the same Go types as [Schema.Encode]. Map key order in
 // the output is non-deterministic, as with [encoding/json.Marshal].
 func (s *Schema) EncodeJSON(v any, opts ...Opt) ([]byte, error) {
+	return s.AppendEncodeJSON(nil, v, opts...)
+}
+
+// AppendEncodeJSON is like [Schema.EncodeJSON] but appends to dst.
+func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error) {
 	cfg := parseOpts(opts)
-	return appendAvroJSON(nil, reflect.ValueOf(v), s.node, &cfg)
+	return appendAvroJSON(dst, reflect.ValueOf(v), s.node, &cfg)
 }
 
 // DecodeJSON decodes Avro JSON from src into v. It unwraps union wrappers,

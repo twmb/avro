@@ -3,6 +3,7 @@ package avro_test
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/twmb/avro"
 )
@@ -94,7 +95,7 @@ func ExampleSchema_AppendEncode() {
 }
 
 func ExampleSchemaCache() {
-	cache := avro.NewSchemaCache()
+	cache := new(avro.SchemaCache)
 
 	// Parse the Address type first.
 	if _, err := cache.Parse(`{
@@ -174,4 +175,112 @@ func ExampleSchema_AppendSingleObject() {
 	}
 	fmt.Printf("id=%d name=%s\n", e.ID, e.Name)
 	// Output: id=1 name=click
+}
+
+func ExampleSchema_EncodeJSON() {
+	schema := avro.MustParse(`{
+		"type": "record",
+		"name": "User",
+		"fields": [
+			{"name": "name",  "type": "string"},
+			{"name": "email", "type": ["null", "string"]}
+		]
+	}`)
+
+	type User struct {
+		Name  string  `avro:"name"`
+		Email *string `avro:"email"`
+	}
+	email := "alice@example.com"
+	u := User{Name: "Alice", Email: &email}
+
+	// Default: bare union values.
+	bare, err := schema.EncodeJSON(&u)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(bare))
+
+	// TaggedUnions: wrapped as {"type": value}.
+	tagged, err := schema.EncodeJSON(&u, avro.TaggedUnions())
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(tagged))
+	// Output:
+	// {"name":"Alice","email":"alice@example.com"}
+	// {"name":"Alice","email":{"string":"alice@example.com"}}
+}
+
+func ExampleSchema_DecodeJSON() {
+	schema := avro.MustParse(`{
+		"type": "record",
+		"name": "User",
+		"fields": [
+			{"name": "name",  "type": "string"},
+			{"name": "email", "type": ["null", "string"]}
+		]
+	}`)
+
+	type User struct {
+		Name  string  `avro:"name"`
+		Email *string `avro:"email"`
+	}
+
+	// DecodeJSON accepts both bare and tagged union formats.
+	var u1, u2 User
+	if err := schema.DecodeJSON([]byte(`{"name":"Alice","email":"a@b.com"}`), &u1); err != nil {
+		log.Fatal(err)
+	}
+	if err := schema.DecodeJSON([]byte(`{"name":"Bob","email":{"string":"b@c.com"}}`), &u2); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s: %s\n", u1.Name, *u1.Email)
+	fmt.Printf("%s: %s\n", u2.Name, *u2.Email)
+	// Output:
+	// Alice: a@b.com
+	// Bob: b@c.com
+}
+
+func ExampleSchemaFor() {
+	type Event struct {
+		ID     int64     `avro:"id"`
+		Name   string    `avro:"name,default=unnamed"`
+		Source string    `avro:"source,default=web"`
+		Time   time.Time `avro:"ts"`
+		Meta   *string   `avro:"meta"` // *T becomes ["null", T] union
+	}
+
+	schema := avro.MustSchemaFor[Event](avro.WithNamespace("com.example"))
+
+	// Encode, then decode back.
+	meta := "test"
+	data, err := schema.Encode(&Event{
+		ID:     1,
+		Name:   "click",
+		Source:  "mobile",
+		Time:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Meta:   &meta,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var out Event
+	if _, err := schema.Decode(data, &out); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("id=%d name=%s source=%s meta=%s\n", out.ID, out.Name, out.Source, *out.Meta)
+
+	// Inspect the inferred schema.
+	root := schema.Root()
+	for _, f := range root.Fields {
+		if f.HasDefault {
+			fmt.Printf("field %s: default=%v\n", f.Name, f.Default)
+		}
+	}
+	// Output:
+	// id=1 name=click source=mobile meta=test
+	// field name: default=unnamed
+	// field source: default=web
 }

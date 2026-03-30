@@ -29,19 +29,11 @@ import (
 // independent of the cache — it can be used for [Schema.Encode] and
 // [Schema.Decode] without the cache.
 //
-// A SchemaCache is safe for concurrent use.
+// The zero value is ready to use. A SchemaCache is safe for concurrent use.
 type SchemaCache struct {
 	mu    sync.Mutex
 	named map[string]*namedType
 	dedup map[[32]byte]*Schema
-}
-
-// NewSchemaCache returns a new empty SchemaCache.
-func NewSchemaCache() *SchemaCache {
-	return &SchemaCache{
-		named: make(map[string]*namedType),
-		dedup: make(map[[32]byte]*Schema),
-	}
 }
 
 // Parse parses a schema string, registering any named types (records, enums,

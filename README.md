@@ -68,26 +68,28 @@ func main() {
 }
 ```
 
+`Parse` accepts options: pass `WithLaxNames()` to allow non-standard characters
+in type and field names (useful for interop with schemas from other languages).
+
 ## Type Mapping
 
-The table below shows which Go types can be used with each Avro type when
-encoding and decoding.
+The table below shows which Go types can be used with each Avro type.
 
-| Avro Type | Go Types |
-|-----------|----------|
-| null      | `any` (always nil) |
-| boolean   | `bool`, `any` |
-| int, long | `int`, `int8`–`int64`, `uint`–`uint64`, `float64`, `json.Number`, `any` |
-| float     | `float32`, `float64`, `json.Number`, `any` |
-| double    | `float64`, `float32`, `json.Number`, `any` |
-| string    | `string`, `[]byte`, `any`; also `encoding.TextUnmarshaler` |
-| bytes     | `[]byte`, `string`, `any` |
-| enum      | `string`, any integer type (ordinal), `any` |
-| fixed     | `[N]byte`, `[]byte`, `any` |
-| array     | slice, `any` |
-| map       | `map[string]T`, `any` |
-| union     | `any`, `*T` (for `["null", T]` unions), or the matched branch type |
-| record    | struct (matched by field name or `avro` tag), `map[string]any`, `any` |
+| Avro Type | Encode | Decode |
+|-----------|--------|--------|
+| null      | `any` (nil) | `any` |
+| boolean   | `bool` | `bool`, `any` |
+| int, long | `int`, `int8`–`int64`, `uint`–`uint64`, `float64`, `json.Number` | `int`, `int8`–`int64`, `uint`–`uint64`, `any` |
+| float     | `float32`, `float64`, `json.Number` | `float32`, `float64`, `any` |
+| double    | `float64`, `float32`, `json.Number` | `float64`, `float32`, `any` |
+| string    | `string`, `[]byte` | `string`, `[]byte`, `encoding.TextUnmarshaler`, `any` |
+| bytes     | `[]byte`, `string` | `[]byte`, `string`, `any` |
+| enum      | `string`, any integer type (ordinal) | `string`, any integer type (ordinal), `any` |
+| fixed     | `[N]byte`, `[]byte` | `[N]byte`, `[]byte`, `any` |
+| array     | slice | slice, `any` |
+| map       | `map[string]T` | `map[string]T`, `any` |
+| union     | `any`, `*T`, or the matched branch type | `any`, `*T`, or the matched branch type |
+| record    | struct, `map[string]any` | struct, `map[string]any`, `any` |
 
 When decoding into `any`, values use their natural Go types: `nil`, `bool`,
 `int32`, `int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`,
@@ -214,7 +216,7 @@ root := schema.Root()
 
 for _, f := range root.Fields {
     fmt.Printf("field %s: type=%s\n", f.Name, f.Type.Type)
-    if cn := f.Props["connect.name"]; cn != "" {
+    if cn, ok := f.Props["connect.name"].(string); ok {
         fmt.Printf("  kafka connect type: %s\n", cn)
     }
 }
@@ -249,7 +251,7 @@ Logical types decode to their natural Go equivalents:
 | local-timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | local-timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | local-timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
-| uuid | string or fixed(16) | [16]byte or string | [16]byte (RFC 4122 hex-dash ↔ binary) or string |
+| uuid | string or fixed(16) | [16]byte or string | [16]byte (typed target) or string (any target) |
 | decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat (typed target) or json.Number (any target) |
 | duration | fixed(12) | avro.Duration or underlying type | avro.Duration or underlying type |
 
@@ -349,7 +351,7 @@ other schemas. `SchemaCache` accumulates named types across multiple Parse
 calls so they can be resolved:
 
 ```go
-cache := avro.NewSchemaCache()
+var cache avro.SchemaCache
 
 // Parse referenced schema first — order matters.
 _, err := cache.Parse(`{
@@ -470,6 +472,10 @@ schema.Decode(binary, &native, avro.TaggedUnions())
 // native["email"] is map[string]any{"string": "a@b.com"}
 ```
 
+Pass `TagLogicalTypes()` with `TaggedUnions()` to qualify union branch names
+with their logical type (e.g. `"long.timestamp-millis"` instead of `"long"`),
+matching the linkedin/goavro naming convention.
+
 NaN and Infinity float values are encoded as `"NaN"`, `"Infinity"`, `"-Infinity"`
 strings by default (Java Avro convention). Pass `LinkedinFloats()` for
 the linkedin/goavro convention (`null` for NaN, `±1e999` for Infinity).
@@ -509,6 +515,16 @@ fp := schema.Fingerprint(avro.NewRabin())
 // SHA-256 — common for cross-language registries
 fp256 := schema.Fingerprint(sha256.New())
 ```
+
+## Errors
+
+Encode and decode errors can be inspected with `errors.As`:
+
+- **`*SemanticError`**: type mismatch between Go and Avro (includes a dotted
+  field path for nested records, e.g. `"address.zip"`).
+- **`*ShortBufferError`**: input truncated mid-value.
+- **`*CompatibilityError`**: schema evolution incompatibility (from `Resolve`
+  or `CheckCompatibility`).
 
 ## Performance
 
