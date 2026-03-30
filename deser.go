@@ -1078,10 +1078,18 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == durationType {
+	if v.Type() == durationType {
 		if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
 			return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
 		}
+		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
+		return src, nil
+	}
+	if v.Kind() == reflect.Interface {
+		// No overflow check for *any targets: spec-violating values
+		// silently wrap. Valid time-of-day values (< 86400000000 micros)
+		// never overflow. The value may be transient — passed to a
+		// CustomType decoder or EncodeJSON.
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
 		return src, nil
 	}
@@ -1094,10 +1102,7 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface || v.Type() == avroDurationType {
-		months := uint32(src[0]) | uint32(src[1])<<8 | uint32(src[2])<<16 | uint32(src[3])<<24
-		days := uint32(src[4]) | uint32(src[5])<<8 | uint32(src[6])<<16 | uint32(src[7])<<24
-		ms := uint32(src[8]) | uint32(src[9])<<8 | uint32(src[10])<<16 | uint32(src[11])<<24
-		v.Set(reflect.ValueOf(Duration{Months: months, Days: days, Milliseconds: ms}))
+		v.Set(reflect.ValueOf(DurationFromBytes(src[:12])))
 		return src[12:], nil
 	}
 	// Fall back to [12]byte fixed.

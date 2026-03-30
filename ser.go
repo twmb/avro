@@ -966,6 +966,78 @@ type Duration struct {
 	Milliseconds uint32
 }
 
+// Bytes encodes the Duration as a 12-byte little-endian fixed value,
+// matching the Avro duration wire format.
+func (d Duration) Bytes() [12]byte {
+	var b [12]byte
+	b[0] = byte(d.Months)
+	b[1] = byte(d.Months >> 8)
+	b[2] = byte(d.Months >> 16)
+	b[3] = byte(d.Months >> 24)
+	b[4] = byte(d.Days)
+	b[5] = byte(d.Days >> 8)
+	b[6] = byte(d.Days >> 16)
+	b[7] = byte(d.Days >> 24)
+	b[8] = byte(d.Milliseconds)
+	b[9] = byte(d.Milliseconds >> 8)
+	b[10] = byte(d.Milliseconds >> 16)
+	b[11] = byte(d.Milliseconds >> 24)
+	return b
+}
+
+// DurationFromBytes decodes a 12-byte little-endian fixed value into a
+// Duration. Returns zero Duration if b is shorter than 12 bytes.
+func DurationFromBytes(b []byte) Duration {
+	if len(b) < 12 {
+		return Duration{}
+	}
+	return Duration{
+		Months:       uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24,
+		Days:         uint32(b[4]) | uint32(b[5])<<8 | uint32(b[6])<<16 | uint32(b[7])<<24,
+		Milliseconds: uint32(b[8]) | uint32(b[9])<<8 | uint32(b[10])<<16 | uint32(b[11])<<24,
+	}
+}
+
+// String returns an ISO 8601 duration string. Zero components are omitted
+// for readability. Examples: "P1Y3M15DT1H30M0.500S", "P30D", "PT1H".
+func (d Duration) String() string {
+	if d.Months == 0 && d.Days == 0 && d.Milliseconds == 0 {
+		return "P0D"
+	}
+	buf := []byte{'P'}
+	if y := d.Months / 12; y > 0 {
+		buf = append(buf, fmt.Sprintf("%dY", y)...)
+	}
+	if m := d.Months % 12; m > 0 {
+		buf = append(buf, fmt.Sprintf("%dM", m)...)
+	}
+	if d.Days > 0 {
+		buf = append(buf, fmt.Sprintf("%dD", d.Days)...)
+	}
+	if d.Milliseconds > 0 {
+		ms := d.Milliseconds
+		h := ms / 3600000
+		ms %= 3600000
+		m := ms / 60000
+		ms %= 60000
+		s := ms / 1000
+		frac := ms % 1000
+		buf = append(buf, 'T')
+		if h > 0 {
+			buf = append(buf, fmt.Sprintf("%dH", h)...)
+		}
+		if m > 0 {
+			buf = append(buf, fmt.Sprintf("%dM", m)...)
+		}
+		if frac > 0 {
+			buf = append(buf, fmt.Sprintf("%d.%03dS", s, frac)...)
+		} else if s > 0 {
+			buf = append(buf, fmt.Sprintf("%dS", s)...)
+		}
+	}
+	return string(buf)
+}
+
 // tryParseTimeString attempts to parse a string value as RFC 3339.
 func tryParseTimeString(v reflect.Value) (time.Time, bool) {
 	if v.Kind() != reflect.String {
@@ -1106,11 +1178,8 @@ func serDuration(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == avroDurationType {
-		d := v.Interface().(Duration)
-		dst = appendUint32(dst, d.Months)
-		dst = appendUint32(dst, d.Days)
-		dst = appendUint32(dst, d.Milliseconds)
-		return dst, nil
+		b := v.Interface().(Duration).Bytes()
+		return append(dst, b[:]...), nil
 	}
 	return (&serSize{12}).ser(dst, v)
 }

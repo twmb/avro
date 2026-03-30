@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"maps"
 	"math"
 	"reflect"
 	"slices"
@@ -24,6 +25,13 @@ type Schema struct {
 	soe  [10]byte    // Single Object Encoding header: 2-byte magic (0xC3, 0x01) + 8-byte LE CRC64-Avro fingerprint
 	node *schemaNode // full metadata tree (aliases, defaults, etc.) for schema introspection and evolution
 	full string      // original schema JSON, returned by String()
+
+	// Per-schema custom type overlays. Keyed by *schemaNode so the
+	// shared node is not mutated — different schemas parsed with
+	// different custom types get different overlays.
+	customEncodes  map[*schemaNode]func(v reflect.Value) (reflect.Value, error)
+	customDecoders map[*schemaNode][]func(any, *SchemaNode) (any, error)
+	customSNs      map[*schemaNode]*SchemaNode
 }
 
 // schemaNode preserves full schema metadata that canonical form strips:
@@ -47,6 +55,8 @@ type schemaNode struct {
 	deser       deserfn
 	serRecord   *serRecord
 	deserRecord *deserRecord
+
+	props map[string]any // extra schema properties (for CustomType callbacks)
 }
 
 // fieldNode represents a record field with full metadata.
@@ -58,22 +68,20 @@ type fieldNode struct {
 	hasDefault bool
 }
 
-// ParseOpt configures schema parsing behavior.
-type ParseOpt interface{ parseOpt() }
-
 type parseOptLax struct{ fn func(string) error }
 
-func (parseOptLax) parseOpt() {}
+func (parseOptLax) schemaOpt() {}
 
-// WithLaxNames relaxes name validation, overriding the default requirement
-// that names match the Avro strict name regex [A-Za-z_][A-Za-z0-9_]*.
-// If fn is nil, only non-empty names are required. If fn is non-nil, it is
-// called for each name component and should return an error for invalid
-// names. Dot-separated fullnames are split before calling fn.
-func WithLaxNames(fn func(string) error) ParseOpt { return parseOptLax{fn} }
+// WithLaxNames relaxes name validation in [Parse] and [SchemaCache.Parse],
+// overriding the default requirement that names match the Avro strict name
+// regex [A-Za-z_][A-Za-z0-9_]*. If fn is nil, only non-empty names are
+// required. If fn is non-nil, it is called for each name component and
+// should return an error for invalid names. Dot-separated fullnames are
+// split before calling fn. Ignored by [SchemaFor].
+func WithLaxNames(fn func(string) error) SchemaOpt { return parseOptLax{fn} }
 
 // MustParse is like [Parse] but panics on error.
-func MustParse(schema string, opts ...ParseOpt) *Schema {
+func MustParse(schema string, opts ...SchemaOpt) *Schema {
 	s, err := Parse(schema, opts...)
 	if err != nil {
 		panic("avro: " + err.Error())
@@ -89,15 +97,15 @@ func MustParse(schema string, opts ...ParseOpt) *Schema {
 //
 // To parse schemas that reference named types from other schemas, use
 // [SchemaCache].
-func Parse(schema string, opts ...ParseOpt) (*Schema, error) {
+func Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	b := &builder{
 		named: make(map[string]*namedType),
 	}
-	applyParseOpts(b, opts)
+	applySchemaOpts(b, opts)
 	return parse(schema, b)
 }
 
-func applyParseOpts(b *builder, opts []ParseOpt) {
+func applySchemaOpts(b *builder, opts []SchemaOpt) {
 	for _, o := range opts {
 		switch o := o.(type) {
 		case parseOptLax:
@@ -111,6 +119,12 @@ func applyParseOpts(b *builder, opts []ParseOpt) {
 					return nil
 				}
 			}
+		case CustomType:
+			if o.needsAvroType && o.AvroType == "" {
+				// Validated lazily: store now, error in parse.
+				// We still append so the error is reported.
+			}
+			b.customTypes = append(b.customTypes, o)
 		}
 	}
 }
@@ -127,11 +141,14 @@ func parse(schema string, b *builder) (*Schema, error) {
 		return nil, err
 	}
 	s := &Schema{
-		ser:   b.ser,
-		deser: b.deser,
-		c:     b.canon,
-		node:  b.node,
-		full:  schema,
+		ser:            b.ser,
+		deser:          b.deser,
+		c:              b.canon,
+		node:           b.node,
+		full:           schema,
+		customEncodes:  b.customEncodes,
+		customDecoders: b.customDecoderMap,
+		customSNs:      b.customSNMap,
 	}
 	s.soe[0] = 0xC3
 	s.soe[1] = 0x01
@@ -194,7 +211,25 @@ func (s *aschema) UnmarshalJSON(data []byte) error {
 	case '"':
 		return json.Unmarshal(data, &s.primitive)
 	case '{':
-		return json.Unmarshal(data, &s.object)
+		if err := json.Unmarshal(data, &s.object); err != nil {
+			return err
+		}
+		// Capture extra properties not in the struct tags.
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err == nil {
+			for k := range raw {
+				if aobjectKnownKeys[k] {
+					continue
+				}
+				if s.object.extra == nil {
+					s.object.extra = make(map[string]any)
+				}
+				var v any
+				json.Unmarshal(raw[k], &v)
+				s.object.extra[k] = v
+			}
+		}
+		return nil
 	case '[':
 		return json.Unmarshal(data, &s.union)
 	default:
@@ -241,6 +276,15 @@ type aobject struct {
 	Logical   string `json:"logicalType,omitempty"`
 	Scale     *int   `json:"scale,omitempty"`     // decimal logical type
 	Precision *int   `json:"precision,omitempty"` // decimal logical type
+
+	extra map[string]any // non-reserved properties, populated by aschema.UnmarshalJSON
+}
+
+var aobjectKnownKeys = map[string]bool{
+	"type": true, "name": true, "namespace": true, "doc": true,
+	"fields": true, "symbols": true, "items": true, "values": true,
+	"size": true, "logicalType": true, "precision": true, "scale": true,
+	"aliases": true, "default": true, "order": true,
 }
 
 // validName reports whether s matches [A-Za-z_][A-Za-z0-9_]*.
@@ -280,12 +324,13 @@ type unionMissingDeser struct {
 // fieldMeta carries Avro-level type info for a record field, used by the
 // unsafe fast path to select specialized ser/deser routines.
 type fieldMeta struct {
-	avroType    string
-	logical     string // logical type (e.g. "timestamp-millis"), empty if none
-	serRecord   *serRecord
-	deserRecord *deserRecord
-	inner       *fieldMeta // for nullunion fields: the inner branch's metadata
-	nullSecond  bool       // true for ["T","null"] unions (null is index 1)
+	avroType      string
+	logical       string // logical type (e.g. "timestamp-millis"), empty if none
+	serRecord     *serRecord
+	deserRecord   *deserRecord
+	inner         *fieldMeta // for nullunion fields: the inner branch's metadata
+	nullSecond    bool       // true for ["T","null"] unions (null is index 1)
+	hasCustomType bool       // true if a CustomType was applied; disables unsafe fast path
 }
 
 // metaFixup patches a fieldMeta's serRecord/deserRecord when the inner
@@ -327,10 +372,15 @@ type builder struct {
 	mfixups     []metaFixup
 	fieldFixups []recordFieldFixup
 
-	meta      fieldMeta
-	canon     aschema
-	node      *schemaNode
-	checkName func(string) error // nil means strict (default)
+	meta             fieldMeta
+	canon            aschema
+	node             *schemaNode
+	checkName        func(string) error // nil means strict (default)
+	customTypes      []CustomType
+	customEncodes    map[*schemaNode]func(v reflect.Value) (reflect.Value, error)
+	customDecoderMap map[*schemaNode][]func(any, *SchemaNode) (any, error)
+	customSNMap      map[*schemaNode]*SchemaNode
+	cachedNames      map[string]bool // names inherited from SchemaCache, not from this parse
 }
 
 // validNameErr validates a simple name using the builder's configured validator.
@@ -362,8 +412,13 @@ func (b *builder) validFullnameErr(s string) error {
 
 func (b *builder) nest() *builder {
 	return &builder{
-		named:     b.named,
-		checkName: b.checkName,
+		named:            b.named,
+		checkName:        b.checkName,
+		customTypes:      b.customTypes,
+		customEncodes:    b.customEncodes,
+		customDecoderMap: b.customDecoderMap,
+		customSNMap:      b.customSNMap,
+		cachedNames:      b.cachedNames,
 	}
 }
 
@@ -372,6 +427,25 @@ func (b *builder) unnest(nest *builder) {
 	b.dmissing = append(b.dmissing, nest.dmissing...)
 	b.mfixups = append(b.mfixups, nest.mfixups...)
 	b.fieldFixups = append(b.fieldFixups, nest.fieldFixups...)
+	// Merge custom type overlay maps from nested builders.
+	if len(nest.customEncodes) > 0 {
+		if b.customEncodes == nil {
+			b.customEncodes = make(map[*schemaNode]func(reflect.Value) (reflect.Value, error), len(nest.customEncodes))
+		}
+		maps.Copy(b.customEncodes, nest.customEncodes)
+	}
+	if len(nest.customDecoderMap) > 0 {
+		if b.customDecoderMap == nil {
+			b.customDecoderMap = make(map[*schemaNode][]func(any, *SchemaNode) (any, error), len(nest.customDecoderMap))
+		}
+		maps.Copy(b.customDecoderMap, nest.customDecoderMap)
+	}
+	if len(nest.customSNMap) > 0 {
+		if b.customSNMap == nil {
+			b.customSNMap = make(map[*schemaNode]*SchemaNode, len(nest.customSNMap))
+		}
+		maps.Copy(b.customSNMap, nest.customSNMap)
+	}
 }
 
 func (b *builder) finalize() error {
@@ -446,14 +520,172 @@ func (b *builder) build(parentName string, s *aschema) error {
 		return errors.New("schema is not a primitive, complex, nor union")
 	}
 
+	var err error
 	switch {
 	case s.primitive != "":
-		return b.buildPrimitive(parentName, s)
+		err = b.buildPrimitive(parentName, s)
 	case len(s.union) != 0:
-		return b.buildUnion(parentName, s)
+		err = b.buildUnion(parentName, s)
 	default:
-		return b.buildComplex(parentName, s)
+		err = b.buildComplex(parentName, s)
 	}
+	if err != nil {
+		return err
+	}
+	// Propagate extra schema properties to the node (for CustomType callbacks).
+	if b.node != nil && s.object != nil && len(s.object.extra) > 0 {
+		b.node.props = s.object.extra
+	}
+	// Apply custom types to newly built nodes (not unions — custom
+	// types fire on individual branches, not the union container).
+	if len(b.customTypes) > 0 && b.node != nil && b.node.kind != "union" {
+		if err := b.applyCustomTypes(b.node); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// buildCustomSN builds a public SchemaNode from an internal schemaNode.
+// Built once per node at parse time and cached for CustomType callbacks.
+func buildCustomSN(node *schemaNode) *SchemaNode {
+	sn := &SchemaNode{
+		Type:        node.kind,
+		LogicalType: node.logical,
+		Name:        node.name,
+		Size:        node.size,
+		Precision:   node.precision,
+		Scale:       node.scale,
+		Symbols:     node.symbols,
+	}
+	if node.props != nil {
+		sn.Props = node.props
+	}
+	return sn
+}
+
+// applyCustomTypes wires matching CustomType registrations into the
+// schema node's ser/deser/customEncode functions.
+// hasMatchingCustomType checks if any registered custom type would match
+// a node with the given kind and logical type. Used to skip built-in
+// logical type handlers when a custom type replaces them.
+func (b *builder) hasMatchingCustomType(kind, logical string) bool {
+	for _, ct := range b.customTypes {
+		// Wildcards (both empty) should not suppress built-in
+		// handlers — they use ErrSkipCustomType at runtime.
+		if ct.LogicalType == "" && ct.AvroType == "" {
+			continue
+		}
+		if ct.LogicalType != "" && ct.LogicalType != logical {
+			continue
+		}
+		if ct.AvroType != "" && ct.AvroType != kind {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (b *builder) applyCustomTypes(node *schemaNode) error {
+	// Validate NewCustomType-created types with unsupported A type.
+	for _, ct := range b.customTypes {
+		if ct.needsAvroType && ct.AvroType == "" {
+			return fmt.Errorf("avro: custom type %q: unsupported Avro native type for NewCustomType (use CustomType struct for non-primitive backing types)", ct.LogicalType)
+		}
+	}
+
+	// Collect all matching encoders and decoders for this node.
+	type encoder struct {
+		goType reflect.Type
+		fn     func(any, *SchemaNode) (any, error)
+	}
+	var encoders []encoder
+	var decoders []func(any, *SchemaNode) (any, error)
+
+	for _, ct := range b.customTypes {
+		if !ct.matches(node) {
+			continue
+		}
+		if ct.Encode != nil {
+			encoders = append(encoders, encoder{goType: ct.GoType, fn: ct.Encode})
+		}
+		if ct.Decode != nil {
+			decoders = append(decoders, ct.Decode)
+		}
+	}
+
+	if len(encoders) == 0 && len(decoders) == 0 {
+		return nil
+	}
+
+	// Build the cached SchemaNode for callbacks.
+	sn := buildCustomSN(node)
+
+	if len(encoders) > 0 {
+		customEncode := func(v reflect.Value) (reflect.Value, error) {
+			// Dereference pointers and interface wrappers so GoType
+			// matching compares against the concrete type.
+			for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
+				if v.IsNil() {
+					return v, nil
+				}
+				v = v.Elem()
+			}
+			for _, enc := range encoders {
+				if enc.goType != nil && v.Type() != enc.goType {
+					continue
+				}
+				result, err := enc.fn(v.Interface(), sn)
+				if err != nil {
+					if errors.Is(err, ErrSkipCustomType) {
+						continue
+					}
+					return reflect.Value{}, err
+				}
+				if result == nil {
+					return reflect.Value{}, fmt.Errorf("avro: custom type encoder returned nil for %v", v.Type())
+				}
+				return reflect.ValueOf(result), nil
+			}
+			return v, nil // no encoder matched, pass through
+		}
+
+		// Store the customEncode in the builder's overlay map (not on
+		// the shared node) so it doesn't leak via the cache.
+		if b.customEncodes == nil {
+			b.customEncodes = make(map[*schemaNode]func(reflect.Value) (reflect.Value, error))
+		}
+		b.customEncodes[node] = customEncode
+
+		// Wrap the binary serializer. We update b.ser (which becomes the
+		// Schema's ser) but NOT node.ser, so named types in the cache
+		// keep their unwrapped ser/deser.
+		innerSer := node.ser
+		ce := customEncode
+		b.ser = func(dst []byte, v reflect.Value) ([]byte, error) {
+			v, err := ce(v)
+			if err != nil {
+				return nil, err
+			}
+			return innerSer(dst, v)
+		}
+	}
+
+	if len(decoders) > 0 {
+		if b.customDecoderMap == nil {
+			b.customDecoderMap = make(map[*schemaNode][]func(any, *SchemaNode) (any, error))
+		}
+		if b.customSNMap == nil {
+			b.customSNMap = make(map[*schemaNode]*SchemaNode)
+		}
+		b.customDecoderMap[node] = decoders
+		b.customSNMap[node] = sn
+		b.deser = wrapDeserWithCustomDecoders(node.deser, decoders, sn)
+	}
+
+	b.meta.hasCustomType = true
+	return nil
 }
 
 func (b *builder) buildPrimitive(parentName string, s *aschema) error {
@@ -610,12 +842,23 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	// this to a primitive.
 	o := s.object
 
+	// Save original logical type before validation clears unknown ones.
+	origLogical := o.Logical
 	if err := o.validateLogical(); err != nil {
 		return err
 	}
+	// Restore unknown logical types if a registered CustomType matches.
+	if o.Logical == "" && origLogical != "" {
+		for _, ct := range b.customTypes {
+			if ct.LogicalType == origLogical {
+				o.Logical = origLogical
+				break
+			}
+		}
+	}
 
 	if ser, isPrimitive := serPrimitive[o.Type]; isPrimitive {
-		if o.Logical == "decimal" {
+		if o.Logical == "decimal" && !b.hasMatchingCustomType(o.Type, o.Logical) {
 			scale := 0
 			if o.Scale != nil {
 				scale = *o.Scale
@@ -637,11 +880,16 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.ser = ser
 		b.deser = deserPrimitive[o.Type]
-		if logSer := logicalSer(o.Logical); logSer != nil {
-			b.ser = logSer
-		}
-		if logDeser := logicalDeser(o.Logical); logDeser != nil {
-			b.deser = logDeser
+		// Skip built-in logical type handlers when a custom type
+		// matches — the custom type replaces them entirely, receiving
+		// the raw Avro-native value (not the enriched type).
+		if !b.hasMatchingCustomType(o.Type, o.Logical) {
+			if logSer := logicalSer(o.Logical); logSer != nil {
+				b.ser = logSer
+			}
+			if logDeser := logicalDeser(o.Logical); logDeser != nil {
+				b.deser = logDeser
+			}
 		}
 		b.canon = aschema{primitive: o.Type}
 		b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
@@ -716,7 +964,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		canonObj.Name = o.Name // use fully-qualified name
 		canonObj.Namespace = nil
 		if _, exists := b.named[o.Name]; exists {
-			return fmt.Errorf("duplicate named type %q", o.Name)
+			if !b.cachedNames[o.Name] {
+				return fmt.Errorf("duplicate named type %q", o.Name)
+			}
+			// Name exists from cache — allow re-registration
+			// (custom types need to re-parse to get fresh wiring).
 		}
 	default:
 		if o.Name != "" || o.Namespace != nil {
@@ -750,6 +1002,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		nd := &schemaNode{
 			kind:        "record",
 			name:        o.Name,
+			logical:     o.Logical,
 			aliases:     qualifyAliases(origAliases, o.Name),
 			ser:         b.ser,
 			deser:       b.deser,
@@ -902,6 +1155,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		nd := &schemaNode{
 			kind:    "enum",
 			name:    o.Name,
+			logical: o.Logical,
 			aliases: qualifyAliases(origAliases, o.Name),
 			symbols: o.Symbols,
 			ser:     b.ser,
@@ -937,33 +1191,40 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		o.Items = &af.canon
 		sa := &serArray{serItem: af.ser}
 		da := &deserArray{deserItem: af.deser}
-		switch af.canon.primitive {
-		case "string":
-			b.ser = sa.serString
-			da.fastLoop = deserArrayStringLoop
-			da.fastElemKind = reflect.String
-		case "boolean":
-			b.ser = sa.serBoolean
-			da.fastLoop = deserArrayBooleanLoop
-			da.fastElemKind = reflect.Bool
-		case "int":
-			b.ser = sa.serInt
-			da.fastLoop = deserArrayIntLoop
-			da.fastElemKind = reflect.Int32
-		case "long":
-			b.ser = sa.serLong
-			da.fastLoop = deserArrayLongLoop
-			da.fastElemKind = reflect.Int64
-		case "float":
-			b.ser = sa.serFloat
-			da.fastLoop = deserArrayFloatLoop
-			da.fastElemKind = reflect.Float32
-		case "double":
-			b.ser = sa.serDouble
-			da.fastLoop = deserArrayDoubleLoop
-			da.fastElemKind = reflect.Float64
-		default:
+		// When items have a custom type, skip specialized array
+		// ser/deser fast paths — they bypass the item's wrapped
+		// ser/deser functions.
+		if af.meta.hasCustomType {
 			b.ser = sa.ser
+		} else {
+			switch af.canon.primitive {
+			case "string":
+				b.ser = sa.serString
+				da.fastLoop = deserArrayStringLoop
+				da.fastElemKind = reflect.String
+			case "boolean":
+				b.ser = sa.serBoolean
+				da.fastLoop = deserArrayBooleanLoop
+				da.fastElemKind = reflect.Bool
+			case "int":
+				b.ser = sa.serInt
+				da.fastLoop = deserArrayIntLoop
+				da.fastElemKind = reflect.Int32
+			case "long":
+				b.ser = sa.serLong
+				da.fastLoop = deserArrayLongLoop
+				da.fastElemKind = reflect.Int64
+			case "float":
+				b.ser = sa.serFloat
+				da.fastLoop = deserArrayFloatLoop
+				da.fastElemKind = reflect.Float32
+			case "double":
+				b.ser = sa.serDouble
+				da.fastLoop = deserArrayDoubleLoop
+				da.fastElemKind = reflect.Float64
+			default:
+				b.ser = sa.ser
+			}
 		}
 		b.deser = da.deser
 		inner := new(fieldMeta)
@@ -994,33 +1255,37 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		o.Values = &mf.canon
 		sm := &serMap{serItem: mf.ser}
 		dm := &deserMap{deserItem: mf.deser}
-		switch mf.canon.primitive {
-		case "string":
-			b.ser = sm.serString
-			dm.fastBlock = deserMapStringBlock
-			dm.fastElemKind = reflect.String
-		case "boolean":
-			b.ser = sm.serBoolean
-			dm.fastBlock = deserMapBooleanBlock
-			dm.fastElemKind = reflect.Bool
-		case "int":
-			b.ser = sm.serInt
-			dm.fastBlock = deserMapIntBlock
-			dm.fastElemKind = reflect.Int32
-		case "long":
-			b.ser = sm.serLong
-			dm.fastBlock = deserMapLongBlock
-			dm.fastElemKind = reflect.Int64
-		case "float":
-			b.ser = sm.serFloat
-			dm.fastBlock = deserMapFloatBlock
-			dm.fastElemKind = reflect.Float32
-		case "double":
-			b.ser = sm.serDouble
-			dm.fastBlock = deserMapDoubleBlock
-			dm.fastElemKind = reflect.Float64
-		default:
+		if mf.meta.hasCustomType {
 			b.ser = sm.ser
+		} else {
+			switch mf.canon.primitive {
+			case "string":
+				b.ser = sm.serString
+				dm.fastBlock = deserMapStringBlock
+				dm.fastElemKind = reflect.String
+			case "boolean":
+				b.ser = sm.serBoolean
+				dm.fastBlock = deserMapBooleanBlock
+				dm.fastElemKind = reflect.Bool
+			case "int":
+				b.ser = sm.serInt
+				dm.fastBlock = deserMapIntBlock
+				dm.fastElemKind = reflect.Int32
+			case "long":
+				b.ser = sm.serLong
+				dm.fastBlock = deserMapLongBlock
+				dm.fastElemKind = reflect.Int64
+			case "float":
+				b.ser = sm.serFloat
+				dm.fastBlock = deserMapFloatBlock
+				dm.fastElemKind = reflect.Float32
+			case "double":
+				b.ser = sm.serDouble
+				dm.fastBlock = deserMapDoubleBlock
+				dm.fastElemKind = reflect.Float64
+			default:
+				b.ser = sm.ser
+			}
 		}
 		b.deser = dm.deser
 		b.meta = fieldMeta{avroType: "map"}
@@ -1044,20 +1309,27 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if *o.Size <= 0 {
 			return fmt.Errorf("invalid fixed size %v", *o.Size)
 		}
-		switch s.object.Logical {
-		case "duration":
-			b.ser = serDuration
-			b.deser = deserDuration
-		case "decimal":
-			scale := 0
-			if o.Scale != nil {
-				scale = *o.Scale
-			}
-			b.ser = (&serFixedDecimal{size: *o.Size, scale: scale}).ser
-			b.deser = (&deserFixedDecimal{size: *o.Size, scale: scale}).deser
-		default:
+		// Use raw fixed ser/deser when a custom type replaces the
+		// built-in logical type handler.
+		if b.hasMatchingCustomType("fixed", s.object.Logical) {
 			b.ser = (&serSize{*o.Size}).ser
 			b.deser = (&deserFixed{*o.Size}).deser
+		} else {
+			switch s.object.Logical {
+			case "duration":
+				b.ser = serDuration
+				b.deser = deserDuration
+			case "decimal":
+				scale := 0
+				if o.Scale != nil {
+					scale = *o.Scale
+				}
+				b.ser = (&serFixedDecimal{size: *o.Size, scale: scale}).ser
+				b.deser = (&deserFixedDecimal{size: *o.Size, scale: scale}).deser
+			default:
+				b.ser = (&serSize{*o.Size}).ser
+				b.deser = (&deserFixed{*o.Size}).deser
+			}
 		}
 		b.meta = fieldMeta{avroType: "fixed", logical: s.object.Logical}
 		nd := &schemaNode{

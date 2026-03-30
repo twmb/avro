@@ -135,6 +135,16 @@
 // different depths resolve to the same name, the shallowest wins; among
 // fields at the same depth, a tagged field wins over an untagged one.
 //
+// # Custom types
+//
+// [CustomType] registers custom Go type conversions for logical types,
+// domain types, or to replace built-in behavior. A matching custom type
+// replaces the built-in logical type handler entirely — callbacks receive
+// raw Avro-native values, not enriched types. Use [NewCustomType] for
+// type-safe primitive conversions, or the [CustomType] struct directly
+// for complex cases (records, fixed types, property-based dispatch).
+// Custom types are registered per-schema via [SchemaOpt].
+//
 // # Parsing options
 //
 // [Parse] and [SchemaCache.Parse] accept [WithLaxNames] to allow

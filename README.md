@@ -19,6 +19,7 @@ fingerprinting.
 - [Logical Types](#logical-types)
 - [Schema Evolution](#schema-evolution)
 - [Schema Cache](#schema-cache)
+- [Custom Types](#custom-types)
 - [Object Container Files](#object-container-files)
 - [JSON Encoding](#json-encoding)
 - [Single Object Encoding](#single-object-encoding)
@@ -374,6 +375,65 @@ schema, err := cache.Parse(`{
 Parsing the same schema string multiple times returns the cached result,
 handling diamond dependencies without caller-side deduplication. The returned
 `*Schema` is independent of the cache and safe to use concurrently.
+
+## Custom Types
+
+Register custom Go type conversions with `NewCustomType` for type-safe
+primitive conversions, or `CustomType` for advanced cases:
+
+```go
+type Money struct {
+    Cents    int64
+    Currency string
+}
+
+moneyType := avro.NewCustomType[Money, int64]("money",
+    func(m Money, _ *avro.SchemaNode) (int64, error) { return m.Cents, nil },
+    func(c int64, _ *avro.SchemaNode) (Money, error) {
+        return Money{Cents: c, Currency: "USD"}, nil
+    },
+)
+
+schema := avro.MustParse(moneySchema, moneyType)
+
+// Encode and decode — Money fields are automatically converted.
+data, _ := schema.Encode(&order)
+var out Order
+schema.Decode(data, &out) // out.Price is Money{Cents: 500, ...}
+
+// Works with SchemaFor too.
+schema = avro.MustSchemaFor[Order](moneyType)
+```
+
+Custom types replace built-in logical type handling entirely — callbacks
+receive raw Avro-native values (int64 for long, int32 for int, etc.):
+
+```go
+// Decode timestamps as raw int64 instead of time.Time.
+schema := avro.MustParse(raw, avro.CustomType{
+    LogicalType: "timestamp-millis",
+    Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+        return v, nil // pass through raw int64
+    },
+})
+```
+
+For property-based dispatch (e.g., Kafka Connect / Debezium types), use
+an empty matching criteria with `ErrSkipCustomType`:
+
+```go
+avro.CustomType{
+    Decode: func(v any, node *avro.SchemaNode) (any, error) {
+        name, _ := node.Props["connect.name"].(string)
+        switch name {
+        case "io.debezium.time.Timestamp":
+            return time.UnixMilli(v.(int64)).UTC(), nil
+        default:
+            return nil, avro.ErrSkipCustomType
+        }
+    },
+}
+```
 
 ## Object Container Files
 

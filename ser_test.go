@@ -1464,3 +1464,42 @@ func TestSerLongUint64Overflow(t *testing.T) {
 		t.Fatal("expected overflow error for uint64 in map long")
 	}
 }
+
+func TestDurationString(t *testing.T) {
+	tests := []struct {
+		d    Duration
+		want string
+	}{
+		{Duration{}, "P0D"},
+		{Duration{Days: 30}, "P30D"},
+		{Duration{Months: 15, Days: 10}, "P1Y3M10D"},
+		{Duration{Milliseconds: 3600000}, "PT1H"},
+		{Duration{Milliseconds: 5400500}, "PT1H30M0.500S"},
+		{Duration{Milliseconds: 1000}, "PT1S"},
+		{Duration{Milliseconds: 61000}, "PT1M1S"},
+		{Duration{Months: 1, Days: 2, Milliseconds: 3723500}, "P1M2DT1H2M3.500S"},
+		{Duration{Milliseconds: 500}, "PT0.500S"},
+	}
+	for _, tt := range tests {
+		got := tt.d.String()
+		if got != tt.want {
+			t.Errorf("Duration%+v.String() = %q, want %q", tt.d, got, tt.want)
+		}
+	}
+}
+
+func TestDurationFromBytesShort(t *testing.T) {
+	d := DurationFromBytes([]byte{1, 2, 3})
+	if d != (Duration{}) {
+		t.Errorf("expected zero Duration for short input, got %+v", d)
+	}
+}
+
+func TestDurationBytesRoundTrip(t *testing.T) {
+	d := Duration{Months: 3, Days: 15, Milliseconds: 86400000}
+	b := d.Bytes()
+	got := DurationFromBytes(b[:])
+	if got != d {
+		t.Errorf("round-trip: got %+v, want %+v", got, d)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"reflect"
 	"time"
 
 	"github.com/twmb/avro"
@@ -317,4 +318,143 @@ func ExampleSchema_Encode_textMarshaler() {
 	}
 	fmt.Printf("%s: %s\n", out.Name, out.IP)
 	// Output: web-1: 192.168.1.1
+}
+
+type ExMoney struct {
+	Cents int64
+}
+
+func ExampleNewCustomType() {
+	// Register a custom type: Money stored as Avro long (cents).
+	moneyType := avro.NewCustomType[ExMoney, int64]("money",
+		func(m ExMoney, _ *avro.SchemaNode) (int64, error) { return m.Cents, nil },
+		func(c int64, _ *avro.SchemaNode) (ExMoney, error) { return ExMoney{Cents: c}, nil },
+	)
+
+	schema := avro.MustParse(`{
+		"type": "record", "name": "Order",
+		"fields": [
+			{"name": "price", "type": {"type": "long", "logicalType": "money"}}
+		]
+	}`, moneyType)
+
+	type Order struct {
+		Price ExMoney `avro:"price"`
+	}
+
+	data, err := schema.Encode(&Order{Price: ExMoney{Cents: 1999}})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var out Order
+	if _, err := schema.Decode(data, &out); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%d cents\n", out.Price.Cents)
+	// Output: 1999 cents
+}
+
+func ExampleCustomType_override() {
+	// Override built-in timestamp-millis to keep raw int64.
+	// The custom type replaces the built-in entirely: encode and
+	// decode receive raw Avro-native types (int64 for long).
+	schema := avro.MustParse(`{
+		"type": "record", "name": "Event",
+		"fields": [
+			{"name": "ts", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+		]
+	}`, avro.CustomType{
+		LogicalType: "timestamp-millis",
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return v, nil // pass through raw int64
+		},
+	})
+
+	data, _ := schema.Encode(map[string]any{"ts": int64(1767225600000)})
+	var out any
+	schema.Decode(data, &out)
+	m := out.(map[string]any)
+	fmt.Printf("ts type: %T\n", m["ts"])
+	// Output: ts type: int64
+}
+
+func ExampleCustomType_goType() {
+	type Cents int64
+
+	// GoType set: Encode only fires for Cents values (not raw int64).
+	// SchemaFor can infer the schema for struct fields of type Cents.
+	withGoType := avro.CustomType{
+		LogicalType: "money",
+		AvroType:    "long",
+		GoType:      reflect.TypeFor[Cents](),
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return int64(v.(Cents)), nil
+		},
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return Cents(v.(int64)), nil
+		},
+	}
+
+	// GoType nil: SchemaFor ignores this custom type. If Encode is set,
+	// it fires for ALL values — use GoType to restrict it to a specific
+	// type. Nil GoType is typical for decode-only custom types.
+	withoutGoType := avro.CustomType{
+		LogicalType: "money",
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return Cents(v.(int64)), nil
+		},
+	}
+
+	// Both work with Parse.
+	s1 := avro.MustParse(`{"type":"long","logicalType":"money"}`, withGoType)
+	s2 := avro.MustParse(`{"type":"long","logicalType":"money"}`, withoutGoType)
+
+	data, _ := s1.Encode(Cents(500))
+	var v1, v2 any
+	s1.Decode(data, &v1)
+	s2.Decode(data, &v2)
+	fmt.Printf("with GoType:    %T(%v)\n", v1, v1)
+	fmt.Printf("without GoType: %T(%v)\n", v2, v2)
+
+	// SchemaFor with GoType: affects schema generation AND wires
+	// encode/decode into the returned schema.
+	type Order struct {
+		Price Cents `avro:"price"`
+	}
+	schema, err := avro.SchemaFor[Order](withGoType)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(schema.Root().Fields[0].Type.LogicalType)
+
+	// Nil GoType with SchemaFor: doesn't affect schema generation, but
+	// the custom type IS wired into the returned schema for decode.
+	// This is useful when sharing a wildcard decoder (like Kafka Connect
+	// property-based dispatch) across Parse and SchemaFor calls —
+	// SchemaFor generates the schema normally, and the decoder is
+	// available at runtime.
+	wildcardDecoder := avro.CustomType{
+		// No LogicalType, no AvroType, no GoType — matches all nodes
+		// at decode time, skips nodes it doesn't handle.
+		Decode: func(v any, node *avro.SchemaNode) (any, error) {
+			if node.Props["custom.tag"] == "double-it" {
+				return v.(int64) * 2, nil
+			}
+			return nil, avro.ErrSkipCustomType
+		},
+	}
+	// wildcardDecoder doesn't affect schema generation (no GoType),
+	// but is wired into the returned schema.
+	schema2, err := avro.SchemaFor[Order](withGoType, wildcardDecoder)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(schema2.Root().Fields[0].Type.LogicalType)
+
+	// Output:
+	// with GoType:    avro_test.Cents(500)
+	// without GoType: avro_test.Cents(500)
+	// money
+	// money
 }

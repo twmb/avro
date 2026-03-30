@@ -453,3 +453,81 @@ func BenchmarkEncodeJSONTagged(b *testing.B) {
 		}
 	}
 }
+
+type benchMoney struct{ Cents int64 }
+
+func BenchmarkCustomTypeEncode(b *testing.B) {
+	type Order struct {
+		ID    int64      `avro:"id"`
+		Price benchMoney `avro:"price"`
+	}
+	s, err := Parse(`{
+		"type":"record","name":"Order","fields":[
+			{"name":"id","type":"long"},
+			{"name":"price","type":{"type":"long","logicalType":"money"}}
+		]
+	}`, NewCustomType[benchMoney, int64]("money",
+		func(m benchMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
+		func(c int64, _ *SchemaNode) (benchMoney, error) { return benchMoney{Cents: c}, nil },
+	))
+	if err != nil {
+		b.Fatal(err)
+	}
+	v := Order{ID: 1, Price: benchMoney{Cents: 1999}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := s.Encode(&v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkCustomTypeDecode(b *testing.B) {
+	type Order struct {
+		ID    int64      `avro:"id"`
+		Price benchMoney `avro:"price"`
+	}
+	s, err := Parse(`{
+		"type":"record","name":"Order","fields":[
+			{"name":"id","type":"long"},
+			{"name":"price","type":{"type":"long","logicalType":"money"}}
+		]
+	}`, NewCustomType[benchMoney, int64]("money",
+		func(m benchMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
+		func(c int64, _ *SchemaNode) (benchMoney, error) { return benchMoney{Cents: c}, nil },
+	))
+	if err != nil {
+		b.Fatal(err)
+	}
+	data, _ := s.Encode(&Order{ID: 1, Price: benchMoney{Cents: 1999}})
+	var out Order
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := s.Decode(data, &out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkCustomTypeDecodeAny(b *testing.B) {
+	s, err := Parse(`{"type":"long","logicalType":"money"}`,
+		NewCustomType[benchMoney, int64]("money",
+			func(m benchMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
+			func(c int64, _ *SchemaNode) (benchMoney, error) { return benchMoney{Cents: c}, nil },
+		),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	data, _ := s.Encode(int64(1999))
+	var out any
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := s.Decode(data, &out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
