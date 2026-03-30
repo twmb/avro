@@ -625,10 +625,27 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 	if len(encoders) > 0 {
 		customEncode := func(v reflect.Value) (reflect.Value, error) {
 			// Dereference pointers and interface wrappers so GoType
-			// matching compares against the concrete type.
+			// matching compares against the concrete type. Check GoType
+			// at each level so pointer-valued GoTypes (e.g. *url.URL)
+			// match before the pointer is stripped.
 			for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
 				if v.IsNil() {
 					return v, nil
+				}
+				for _, enc := range encoders {
+					if enc.goType != nil && v.Type() == enc.goType {
+						result, err := enc.fn(v.Interface(), sn)
+						if err != nil {
+							if errors.Is(err, ErrSkipCustomType) {
+								break
+							}
+							return reflect.Value{}, err
+						}
+						if result == nil {
+							return reflect.Value{}, fmt.Errorf("avro: custom type encoder returned nil for %v", v.Type())
+						}
+						return reflect.ValueOf(result), nil
+					}
 				}
 				v = v.Elem()
 			}

@@ -586,3 +586,246 @@ func TestNewCustomTypeAllAvroTypes(t *testing.T) {
 		})
 	}
 }
+
+func TestCustomTypeSchemaCacheNonCustomAfterCustom(t *testing.T) {
+	var cache SchemaCache
+	_, err := cache.Parse(`{"type":"record","name":"Order","fields":[
+		{"name":"price","type":{"type":"long","logicalType":"money"}}
+	]}`, moneyCT)
+	if err != nil {
+		t.Fatalf("custom parse: %v", err)
+	}
+	s, err := cache.Parse(`{"type":"record","name":"Order","fields":[
+		{"name":"price","type":{"type":"long","logicalType":"money"}}
+	]}`)
+	if err != nil {
+		t.Fatalf("non-custom parse after custom: %v", err)
+	}
+	data, _ := s.Encode(map[string]any{"price": int64(42)})
+	var v any
+	s.Decode(data, &v)
+	if v.(map[string]any)["price"].(int64) != 42 {
+		t.Errorf("got %v", v)
+	}
+}
+
+func TestCustomTypePointerGoType(t *testing.T) {
+	type Wrapper struct{ V string }
+	ct := CustomType{
+		LogicalType: "wrapped",
+		AvroType:    "string",
+		GoType:      reflect.TypeFor[*Wrapper](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			return v.(*Wrapper).V, nil
+		},
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			return &Wrapper{V: v.(string)}, nil
+		},
+	}
+	s, err := Parse(`{"type":"string","logicalType":"wrapped"}`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &Wrapper{V: "hello"}
+	data, err := s.Encode(w)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// Decode into *any — exercises the customEncode pointer-level GoType match.
+	var out any
+	if _, err := s.Decode(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.(*Wrapper).V; got != "hello" {
+		t.Errorf("any: got %q", got)
+	}
+
+	// Decode into typed *Wrapper — exercises setCustomResult AssignableTo
+	// for pointer-valued results into pointer targets.
+	var typed *Wrapper
+	if _, err := s.Decode(data, &typed); err != nil {
+		t.Fatalf("typed decode: %v", err)
+	}
+	if typed == nil || typed.V != "hello" {
+		t.Errorf("typed: got %+v", typed)
+	}
+}
+
+func TestCustomTypePointerGoTypeEncodeError(t *testing.T) {
+	type Wrapper struct{ V string }
+	myErr := errors.New("ptr encode fail")
+	ct := CustomType{
+		LogicalType: "wrapped",
+		AvroType:    "string",
+		GoType:      reflect.TypeFor[*Wrapper](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			return nil, myErr
+		},
+	}
+	s, _ := Parse(`{"type":"string","logicalType":"wrapped"}`, ct)
+	_, err := s.Encode(&Wrapper{V: "x"})
+	if !errors.Is(err, myErr) {
+		t.Fatalf("expected myErr, got %v", err)
+	}
+}
+
+func TestCustomTypePointerGoTypeEncodeSkip(t *testing.T) {
+	type Wrapper struct{ V string }
+	ct := CustomType{
+		LogicalType: "wrapped",
+		AvroType:    "string",
+		GoType:      reflect.TypeFor[*Wrapper](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			return nil, ErrSkipCustomType
+		},
+	}
+	s, _ := Parse(`{"type":"string","logicalType":"wrapped"}`, ct)
+	// Pointer GoType match, but encoder skips → falls through to raw
+	// string ser which fails for *Wrapper.
+	_, err := s.Encode(&Wrapper{V: "x"})
+	if err == nil {
+		t.Fatal("expected error after skip")
+	}
+}
+
+func TestCustomTypeNilPointerEncode(t *testing.T) {
+	// Nil pointer value should pass through without panic.
+	s, _ := Parse(`{"type":"string","logicalType":"wrapped"}`, CustomType{
+		LogicalType: "wrapped",
+		GoType:      reflect.TypeFor[*testMoney](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			return "converted", nil
+		},
+	})
+	// Encode nil *testMoney via a map with nil value.
+	_, err := s.Encode((*testMoney)(nil))
+	// Should not panic. May error (nil for non-null string) but not panic.
+	_ = err
+}
+
+func TestWithCustomTypeWrapper(t *testing.T) {
+	// Exercises the WithCustomType discoverability wrapper.
+	ct := NewCustomType[testMoney, int64]("money",
+		func(m testMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
+		func(c int64, _ *SchemaNode) (testMoney, error) { return testMoney{Cents: c}, nil },
+	)
+	s, err := Parse(`{"type":"long","logicalType":"money"}`, WithCustomType(ct))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := s.Encode(testMoney{Cents: 1})
+	var v any
+	s.Decode(data, &v)
+	if v.(testMoney).Cents != 1 {
+		t.Errorf("got %v", v)
+	}
+}
+
+func TestCustomTypeArrayFastPathDisabled(t *testing.T) {
+	// Exercises schema.go array hasCustomType path.
+	s, err := Parse(`{"type":"array","items":{"type":"long","logicalType":"money"}}`, moneyCT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.Encode([]testMoney{{Cents: 1}, {Cents: 2}})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var out any
+	if _, err := s.Decode(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	arr := out.([]any)
+	if len(arr) != 2 || arr[0].(testMoney).Cents != 1 || arr[1].(testMoney).Cents != 2 {
+		t.Errorf("got %v", arr)
+	}
+}
+
+func TestCustomTypeMapFastPathDisabled(t *testing.T) {
+	s, err := Parse(`{"type":"map","values":{"type":"long","logicalType":"money"}}`, moneyCT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.Encode(map[string]testMoney{"a": {Cents: 10}})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var out any
+	if _, err := s.Decode(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	m := out.(map[string]any)
+	if m["a"].(testMoney).Cents != 10 {
+		t.Errorf("got %v", m)
+	}
+}
+
+func TestCustomTypeFixedLogicalType(t *testing.T) {
+	// Exercises hasMatchingCustomType("fixed", logical) path.
+	type PackedID [8]byte
+	ct := CustomType{
+		LogicalType: "packed-id",
+		AvroType:    "fixed",
+		GoType:      reflect.TypeFor[string](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			s := v.(string)
+			var b [8]byte
+			copy(b[:], s)
+			return b[:], nil
+		},
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			b := v.([]byte)
+			return string(b), nil
+		},
+	}
+	s, err := Parse(`{"type":"fixed","name":"pid","size":8,"logicalType":"packed-id"}`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.Encode("hello!!!")
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var v any
+	if _, err := s.Decode(data, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.(string) != "hello!!!" {
+		t.Errorf("got %q", v)
+	}
+}
+
+func TestCustomTypeJsonNumberInt64Validation(t *testing.T) {
+	// Exercises jsonNumberToInt64 non-whole-number error.
+	s, err := Parse(`{"type":"array","items":"long"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Encode([]any{json.Number("1.5")})
+	if err == nil {
+		t.Fatal("expected error for non-whole json.Number in long array")
+	}
+}
+
+func TestCustomTypeDecodeIntIntoAny(t *testing.T) {
+	// Exercises setIntValue interface path through custom decode wrapper.
+	ct := CustomType{
+		AvroType: "int",
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			return v, nil // pass through raw int32
+		},
+	}
+	s, err := Parse(`"int"`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := s.Encode(int32(42))
+	var v any
+	if _, err := s.Decode(data, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.(int32) != 42 {
+		t.Errorf("got %v", v)
+	}
+}

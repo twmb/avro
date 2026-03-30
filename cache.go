@@ -31,9 +31,10 @@ import (
 //
 // The zero value is ready to use. A SchemaCache is safe for concurrent use.
 type SchemaCache struct {
-	mu    sync.Mutex
-	named map[string]*namedType
-	dedup map[[32]byte]*Schema
+	mu          sync.Mutex
+	named       map[string]*namedType
+	dedup       map[[32]byte]*Schema
+	customParsed map[[32]byte]bool // schemas previously parsed with custom types
 }
 
 // Parse parses a schema string, registering any named types (records, enums,
@@ -45,6 +46,7 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	if c.named == nil {
 		c.named = make(map[string]*namedType)
 		c.dedup = make(map[[32]byte]*Schema)
+		c.customParsed = make(map[[32]byte]bool)
 	}
 
 	dec := json.NewDecoder(strings.NewReader(schema))
@@ -61,24 +63,26 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 		named: cloned,
 	}
 	applySchemaOpts(b, opts)
-
-	// When custom types are registered, record which names were
-	// inherited so re-parsing the same schema doesn't hit
-	// "duplicate named type" errors.
-	if len(b.customTypes) > 0 {
-		b.cachedNames = make(map[string]bool, len(cloned))
-		for name := range cloned {
-			b.cachedNames[name] = true
-		}
-	}
+	hasCustomTypes := len(b.customTypes) > 0
 
 	// Skip dedup when custom types are registered: custom types produce
 	// different compiled schemas for the same schema string.
-	hasCustomTypes := len(b.customTypes) > 0
 	h := sha256.Sum256([]byte(schema))
 	if !hasCustomTypes {
 		if s, ok := c.dedup[h]; ok {
 			return s, nil
+		}
+	}
+
+	// Allow re-registration of inherited names when re-parsing a schema
+	// that was previously parsed with custom types (which skipped dedup),
+	// or when parsing with custom types now. This preserves the
+	// "duplicate named type" error for genuinely conflicting definitions.
+	needsCachedNames := hasCustomTypes || c.customParsed[h]
+	if needsCachedNames && len(cloned) > 0 {
+		b.cachedNames = make(map[string]bool, len(cloned))
+		for name := range cloned {
+			b.cachedNames[name] = true
 		}
 	}
 
@@ -91,7 +95,9 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	// wraps b.ser/b.deser without mutating the node's ser/deser, so
 	// cached named type nodes keep their unwrapped functions.
 	c.named = b.named
-	if !hasCustomTypes {
+	if hasCustomTypes {
+		c.customParsed[h] = true
+	} else {
 		c.dedup[h] = s
 	}
 	return s, nil

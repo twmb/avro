@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Opt configures encoding and decoding behavior. See each option's
@@ -573,17 +574,23 @@ func fromAvroJSON(v any, node *schemaNode) (any, error) {
 			return nil, nil
 		}
 		// Try tagged union: {"type_name": value} with exactly one key
-		// matching a union branch name.
+		// matching a union branch name. If the tagged parse fails
+		// (e.g. a record named "A" with a field named "A" produces
+		// {"A":1} which looks like a tagged union but isn't), fall
+		// through to bare matching.
 		if m, ok := v.(map[string]any); ok && len(m) == 1 {
 			for typeName, inner := range m {
 				if branch := findUnionBranch(node, typeName); branch != nil {
-					return fromAvroJSON(inner, branch)
+					if result, err := fromAvroJSON(inner, branch); err == nil {
+						return result, nil
+					}
+					// Tagged parse failed — fall through to bare matching.
 				}
 			}
 		}
-		// Bare (unwrapped) value — try each non-null branch. This handles
-		// both bare primitives and bare records (from EncodeJSON without
-		// TaggedUnions).
+		// Bare (unwrapped) value — try each non-null branch in schema
+		// order, taking the first match. For ambiguous unions (e.g.
+		// ["null","int","long"]), the first compatible branch wins.
 		for _, branch := range node.branches {
 			if branch.kind == "null" {
 				continue
@@ -699,21 +706,43 @@ func hexDigit(b byte) byte {
 const jsonHex = "0123456789abcdef"
 
 // appendJSONString appends a JSON-encoded string to buf, escaping as needed.
-// This avoids the allocation that json.Marshal(s) would require.
+// This avoids the allocation that json.Marshal(s) would require. It escapes
+// control characters, U+2028/U+2029 (for JavaScript safety), and replaces
+// invalid UTF-8 with U+FFFD, matching encoding/json behavior.
 func appendJSONString(buf []byte, s string) []byte {
 	buf = append(buf, '"')
-	for i := range len(s) {
+	for i := 0; i < len(s); {
 		c := s[i]
-		switch {
-		case c == '"':
-			buf = append(buf, '\\', '"')
-		case c == '\\':
-			buf = append(buf, '\\', '\\')
-		case c < 0x20:
-			buf = append(buf, '\\', 'u', '0', '0', jsonHex[c>>4], jsonHex[c&0xf])
-		default:
-			buf = append(buf, c)
+		if c < utf8.RuneSelf {
+			// ASCII fast path.
+			switch {
+			case c == '"':
+				buf = append(buf, '\\', '"')
+			case c == '\\':
+				buf = append(buf, '\\', '\\')
+			case c < 0x20:
+				buf = append(buf, '\\', 'u', '0', '0', jsonHex[c>>4], jsonHex[c&0xf])
+			default:
+				buf = append(buf, c)
+			}
+			i++
+			continue
 		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			// Invalid UTF-8 byte — replace with U+FFFD.
+			buf = append(buf, `\ufffd`...)
+			i++
+			continue
+		}
+		// Escape U+2028 and U+2029 for JavaScript safety.
+		if r == '\u2028' || r == '\u2029' {
+			buf = append(buf, '\\', 'u', '2', '0', '2', jsonHex[byte(r)&0xf])
+			i += size
+			continue
+		}
+		buf = append(buf, s[i:i+size]...)
+		i += size
 	}
 	return append(buf, '"')
 }

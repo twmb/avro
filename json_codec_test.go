@@ -2065,6 +2065,10 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 		{"a\\b", `"a\\b"`},
 		{"a\nb", `"a\u000ab"`},
 		{"a\x00b", `"a\u0000b"`},
+		{"日本語", `"日本語"`},                       // multi-byte UTF-8 passed through
+		{"a\u2028b", `"a\u2028b"`},                // U+2028 escaped
+		{"a\u2029b", `"a\u2029b"`},                // U+2029 escaped
+		{string([]byte{0xff, 0xfe}), `"\ufffd\ufffd"`}, // invalid UTF-8 replaced
 	}
 	for _, tt := range tests {
 		got, err := s.EncodeJSON(tt.in)

@@ -188,8 +188,14 @@ func setCustomResult(v reflect.Value, result any) {
 		return
 	}
 	rv := reflect.ValueOf(result)
-	// Walk through pointers, allocating as needed.
+	// Walk through pointers, allocating as needed. Stop early if
+	// the result is directly assignable (e.g. pointer-valued custom
+	// decoder returning *T into a *T target).
 	for v.Kind() == reflect.Pointer {
+		if rv.Type().AssignableTo(v.Type()) {
+			v.Set(rv)
+			return
+		}
 		if v.IsNil() {
 			v.Set(reflect.New(v.Type().Elem()))
 		}

@@ -9208,3 +9208,25 @@ func TestFixedSliceRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected data: %x", got.Data)
 	}
 }
+
+func TestSetLongValueInterface(t *testing.T) {
+	var v any
+	rv := reflect.ValueOf(&v).Elem()
+	if err := setLongValue(rv, 42); err != nil {
+		t.Fatal(err)
+	}
+	if v.(int64) != 42 {
+		t.Errorf("got %v", v)
+	}
+}
+
+func TestSetIntValueInterface(t *testing.T) {
+	var v any
+	rv := reflect.ValueOf(&v).Elem()
+	if err := setIntValue(rv, 7); err != nil {
+		t.Fatal(err)
+	}
+	if v.(int32) != 7 {
+		t.Errorf("got %v", v)
+	}
+}
