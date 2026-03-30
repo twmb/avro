@@ -22,14 +22,14 @@ type serfn func([]byte, reflect.Value) ([]byte, error)
 //   - [encoding/json.Number] for any numeric Avro type (int, long, float, double)
 //   - RFC 3339 strings for timestamp and date logical types
 //   - [*big.Rat], [big.Rat], float64, [encoding/json.Number], and numeric strings for decimal logical types
-//   - [fmt.Stringer] and [encoding.TextMarshaler] for string types
-func (s *Schema) AppendEncode(dst []byte, v any) ([]byte, error) {
+//   - [encoding.TextAppender], [encoding.TextMarshaler], and []byte for string types (and vice versa for [encoding.TextUnmarshaler])
+func (s *Schema) AppendEncode(dst []byte, v any, opts ...Opt) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
 
 // Encode encodes v as Avro binary. It is shorthand for AppendEncode(nil, v).
-func (s *Schema) Encode(v any) ([]byte, error) {
-	return s.AppendEncode(nil, v)
+func (s *Schema) Encode(v any, opts ...Opt) ([]byte, error) {
+	return s.AppendEncode(nil, v, opts...)
 }
 
 ///////////
@@ -157,6 +157,24 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool) {
 	return reflect.ValueOf(f), true
 }
 
+// jsonNumberToInt64 converts a json.Number reflect.Value to a validated int64,
+// checking that the value is a whole number within int64 range.
+func jsonNumberToInt64(v reflect.Value) (int64, bool, error) {
+	fv, ok := jsonNumberToFloat(v)
+	if !ok {
+		return 0, false, nil
+	}
+	f := fv.Float()
+	n := math.Trunc(f)
+	if f != n {
+		return 0, true, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
+	}
+	if n < -(1<<63) || n >= 1<<63 {
+		return 0, true, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
+	}
+	return int64(n), true, nil
+}
+
 func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
@@ -250,6 +268,11 @@ func serBytes(dst []byte, v reflect.Value) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Accept string for json.Unmarshal pipelines where JSON strings
+	// may represent Avro bytes fields.
+	if v.Kind() == reflect.String {
+		return doSerString(dst, v.String()), nil
+	}
 	if (v.Kind() != reflect.Array && v.Kind() != reflect.Slice) || v.Type().Elem().Kind() != reflect.Uint8 {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 	}
@@ -261,31 +284,34 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if v.Type() == jsonNumberType {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
+	}
 	if v.Kind() == reflect.String {
 		return doSerString(dst, v.String()), nil
 	}
-
+	// Text interfaces before []byte: named []byte subtypes like net.IP
+	// should use their text representation, not raw bytes.
 	if v.CanInterface() {
 		i := v.Interface()
-		if s, ok := i.(stringer); ok {
-			return doSerString(dst, s.String()), nil
-		}
 		if a, ok := i.(encoding.TextAppender); ok {
 			mark := len(dst)
-			dst = append(dst, 0) // reserve 1 byte for length prefix
-			var err error
-			if dst, err = a.AppendText(dst); err != nil {
+			dst = appendVarlong(dst, 0) // placeholder for length
+			hdrLen := len(dst) - mark
+			dst, err = a.AppendText(dst)
+			if err != nil {
 				return nil, err
 			}
-			textLen := len(dst) - mark - 1
+			textLen := len(dst) - mark - hdrLen
 			var buf [10]byte
 			hdr := appendVarlong(buf[:0], int64(textLen))
-			if len(hdr) == 1 {
-				dst[mark] = hdr[0]
+			if len(hdr) == hdrLen {
+				copy(dst[mark:], hdr)
 			} else {
-				dst = append(dst, hdr[1:]...)                         // make room for extra header bytes
-				copy(dst[mark+len(hdr):], dst[mark+1:mark+1+textLen]) // shift text right
-				copy(dst[mark:], hdr)                                 // write length prefix
+				// Header grew; shift text to make room.
+				dst = append(dst, make([]byte, len(hdr)-hdrLen)...)
+				copy(dst[mark+len(hdr):], dst[mark+hdrLen:mark+hdrLen+textLen])
+				copy(dst[mark:], hdr)
 			}
 			return dst, nil
 		}
@@ -296,6 +322,10 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 			}
 			return doSerString(dst, string(text)), nil
 		}
+	}
+	// Accept []byte for symmetry with bytes accepting string.
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		return doSerString(dst, string(v.Bytes())), nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 }
@@ -486,10 +516,16 @@ func (s *serArray) serString(dst []byte, v reflect.Value) ([]byte, error) {
 		if elem.Kind() == reflect.Interface {
 			elem = elem.Elem()
 		}
-		if elem.Kind() != reflect.String {
+		if elem.Type() == jsonNumberType {
 			return nil, &SemanticError{GoType: elem.Type(), AvroType: "string"}
 		}
-		dst = doSerString(dst, elem.String())
+		if elem.Kind() == reflect.String {
+			dst = doSerString(dst, elem.String())
+		} else if elem.Kind() == reflect.Slice && elem.Type().Elem().Kind() == reflect.Uint8 {
+			dst = doSerString(dst, string(elem.Bytes()))
+		} else {
+			return nil, &SemanticError{GoType: elem.Type(), AvroType: "string"}
+		}
 	}
 	return append(dst, 0), nil
 }
@@ -548,6 +584,13 @@ func (s *serArray) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %v overflows int32", f)}
 			}
 			dst = appendVarint(dst, int32(n))
+		} else if fv, ok := jsonNumberToFloat(elem); ok {
+			f := fv.Float()
+			n := math.Trunc(f)
+			if f != n || n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %v invalid for int32", f)}
+			}
+			dst = appendVarint(dst, int32(n))
 		} else {
 			return nil, &SemanticError{GoType: elem.Type(), AvroType: "int"}
 		}
@@ -583,6 +626,11 @@ func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 			}
 			dst = appendVarlong(dst, int64(n))
+		} else if n, ok, err := jsonNumberToInt64(elem); ok {
+			if err != nil {
+				return nil, err
+			}
+			dst = appendVarlong(dst, n)
 		} else {
 			return nil, &SemanticError{GoType: elem.Type(), AvroType: "long"}
 		}
@@ -601,7 +649,11 @@ func (s *serArray) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 			elem = elem.Elem()
 		}
 		if !elem.CanFloat() {
-			return nil, &SemanticError{GoType: elem.Type(), AvroType: "float"}
+			if fv, ok := jsonNumberToFloat(elem); ok {
+				elem = fv
+			} else {
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "float"}
+			}
 		}
 		dst = appendUint32(dst, math.Float32bits(float32(elem.Float())))
 	}
@@ -619,7 +671,11 @@ func (s *serArray) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 			elem = elem.Elem()
 		}
 		if !elem.CanFloat() {
-			return nil, &SemanticError{GoType: elem.Type(), AvroType: "double"}
+			if fv, ok := jsonNumberToFloat(elem); ok {
+				elem = fv
+			} else {
+				return nil, &SemanticError{GoType: elem.Type(), AvroType: "double"}
+			}
 		}
 		dst = appendUint64(dst, math.Float64bits(elem.Float()))
 	}
@@ -679,10 +735,16 @@ func (s *serMap) serString(dst []byte, v reflect.Value) ([]byte, error) {
 		if val.Kind() == reflect.Interface {
 			val = val.Elem()
 		}
-		if val.Kind() != reflect.String {
+		if val.Type() == jsonNumberType {
 			return nil, &SemanticError{GoType: val.Type(), AvroType: "string"}
 		}
-		dst = doSerString(dst, val.String())
+		if val.Kind() == reflect.String {
+			dst = doSerString(dst, val.String())
+		} else if val.Kind() == reflect.Slice && val.Type().Elem().Kind() == reflect.Uint8 {
+			dst = doSerString(dst, string(val.Bytes()))
+		} else {
+			return nil, &SemanticError{GoType: val.Type(), AvroType: "string"}
+		}
 	}
 	return append(dst, 0), nil
 }
@@ -745,6 +807,14 @@ func (s *serMap) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %v overflows int32", f)}
 			}
 			dst = appendVarint(dst, int32(n))
+		} else if fv, ok := jsonNumberToFloat(val); ok {
+			val = fv
+			f := val.Float()
+			n := math.Trunc(f)
+			if f != n || n < math.MinInt32 || n > math.MaxInt32 {
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %v invalid for int32", f)}
+			}
+			dst = appendVarint(dst, int32(n))
 		} else {
 			return nil, &SemanticError{GoType: val.Type(), AvroType: "int"}
 		}
@@ -782,6 +852,11 @@ func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 			}
 			dst = appendVarlong(dst, int64(n))
+		} else if n, ok, err := jsonNumberToInt64(val); ok {
+			if err != nil {
+				return nil, err
+			}
+			dst = appendVarlong(dst, n)
 		} else {
 			return nil, &SemanticError{GoType: val.Type(), AvroType: "long"}
 		}
@@ -802,7 +877,11 @@ func (s *serMap) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 			val = val.Elem()
 		}
 		if !val.CanFloat() {
-			return nil, &SemanticError{GoType: val.Type(), AvroType: "float"}
+			if fv, ok := jsonNumberToFloat(val); ok {
+				val = fv
+			} else {
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "float"}
+			}
 		}
 		dst = appendUint32(dst, math.Float32bits(float32(val.Float())))
 	}
@@ -822,7 +901,11 @@ func (s *serMap) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 			val = val.Elem()
 		}
 		if !val.CanFloat() {
-			return nil, &SemanticError{GoType: val.Type(), AvroType: "double"}
+			if fv, ok := jsonNumberToFloat(val); ok {
+				val = fv
+			} else {
+				return nil, &SemanticError{GoType: val.Type(), AvroType: "double"}
+			}
 		}
 		dst = appendUint64(dst, math.Float64bits(val.Float()))
 	}
@@ -881,6 +964,78 @@ type Duration struct {
 	Months       uint32
 	Days         uint32
 	Milliseconds uint32
+}
+
+// Bytes encodes the Duration as a 12-byte little-endian fixed value,
+// matching the Avro duration wire format.
+func (d Duration) Bytes() [12]byte {
+	var b [12]byte
+	b[0] = byte(d.Months)
+	b[1] = byte(d.Months >> 8)
+	b[2] = byte(d.Months >> 16)
+	b[3] = byte(d.Months >> 24)
+	b[4] = byte(d.Days)
+	b[5] = byte(d.Days >> 8)
+	b[6] = byte(d.Days >> 16)
+	b[7] = byte(d.Days >> 24)
+	b[8] = byte(d.Milliseconds)
+	b[9] = byte(d.Milliseconds >> 8)
+	b[10] = byte(d.Milliseconds >> 16)
+	b[11] = byte(d.Milliseconds >> 24)
+	return b
+}
+
+// DurationFromBytes decodes a 12-byte little-endian fixed value into a
+// Duration. Returns zero Duration if b is shorter than 12 bytes.
+func DurationFromBytes(b []byte) Duration {
+	if len(b) < 12 {
+		return Duration{}
+	}
+	return Duration{
+		Months:       uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24,
+		Days:         uint32(b[4]) | uint32(b[5])<<8 | uint32(b[6])<<16 | uint32(b[7])<<24,
+		Milliseconds: uint32(b[8]) | uint32(b[9])<<8 | uint32(b[10])<<16 | uint32(b[11])<<24,
+	}
+}
+
+// String returns an ISO 8601 duration string. Zero components are omitted
+// for readability. Examples: "P1Y3M15DT1H30M0.500S", "P30D", "PT1H".
+func (d Duration) String() string {
+	if d.Months == 0 && d.Days == 0 && d.Milliseconds == 0 {
+		return "P0D"
+	}
+	buf := []byte{'P'}
+	if y := d.Months / 12; y > 0 {
+		buf = append(buf, fmt.Sprintf("%dY", y)...)
+	}
+	if m := d.Months % 12; m > 0 {
+		buf = append(buf, fmt.Sprintf("%dM", m)...)
+	}
+	if d.Days > 0 {
+		buf = append(buf, fmt.Sprintf("%dD", d.Days)...)
+	}
+	if d.Milliseconds > 0 {
+		ms := d.Milliseconds
+		h := ms / 3600000
+		ms %= 3600000
+		m := ms / 60000
+		ms %= 60000
+		s := ms / 1000
+		frac := ms % 1000
+		buf = append(buf, 'T')
+		if h > 0 {
+			buf = append(buf, fmt.Sprintf("%dH", h)...)
+		}
+		if m > 0 {
+			buf = append(buf, fmt.Sprintf("%dM", m)...)
+		}
+		if frac > 0 {
+			buf = append(buf, fmt.Sprintf("%d.%03dS", s, frac)...)
+		} else if s > 0 {
+			buf = append(buf, fmt.Sprintf("%dS", s)...)
+		}
+	}
+	return string(buf)
 }
 
 // tryParseTimeString attempts to parse a string value as RFC 3339.
@@ -1023,11 +1178,8 @@ func serDuration(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == avroDurationType {
-		d := v.Interface().(Duration)
-		dst = appendUint32(dst, d.Months)
-		dst = appendUint32(dst, d.Days)
-		dst = appendUint32(dst, d.Milliseconds)
-		return dst, nil
+		b := v.Interface().(Duration).Bytes()
+		return append(dst, b[:]...), nil
 	}
 	return (&serSize{12}).ser(dst, v)
 }

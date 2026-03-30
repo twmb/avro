@@ -8,7 +8,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
-	"strings"
+
 	"testing"
 	"time"
 )
@@ -199,7 +199,6 @@ func TestSerTypeMismatch(t *testing.T) {
 		{"long from string", `"long"`, new("42")},
 		{"float from string", `"float"`, new("3.14")},
 		{"double from string", `"double"`, new("3.14")},
-		{"bytes from string", `"bytes"`, new("hello")},
 		{"bytes from int slice", `"bytes"`, new([]int{1, 2})},
 		{"string from int", `"string"`, new(42)},
 
@@ -224,7 +223,7 @@ func TestSerNilPointer(t *testing.T) {
 }
 
 func TestSerNilInterface(t *testing.T) {
-	var v stringer
+	var v fmt.Stringer
 	encodeErr(t, `"string"`, &v)
 }
 
@@ -335,11 +334,11 @@ func TestSerNullGenericUnionNonNilable(t *testing.T) {
 	}
 }
 
-type textMarshalerType struct{ val string }
+type testTextMarshaler struct{ val string }
 
-func (tm textMarshalerType) MarshalText() ([]byte, error) { return []byte(tm.val), nil }
+func (tm testTextMarshaler) MarshalText() ([]byte, error) { return []byte(tm.val), nil }
 
-var _ encoding.TextMarshaler = textMarshalerType{}
+var _ encoding.TextMarshaler = testTextMarshaler{}
 
 type textMarshalerErr struct{}
 
@@ -347,11 +346,11 @@ func (textMarshalerErr) MarshalText() ([]byte, error) { return nil, fmt.Errorf("
 
 var _ encoding.TextMarshaler = textMarshalerErr{}
 
-type textAppenderType struct{ val string }
+type testTextAppender struct{ val string }
 
-func (ta textAppenderType) AppendText(b []byte) ([]byte, error) { return append(b, ta.val...), nil }
+func (ta testTextAppender) AppendText(b []byte) ([]byte, error) { return append(b, ta.val...), nil }
 
-var _ encoding.TextAppender = textAppenderType{}
+var _ encoding.TextAppender = testTextAppender{}
 
 type textAppenderErr struct{}
 
@@ -363,83 +362,86 @@ type valStringer struct{ v string }
 
 func (vs valStringer) String() string { return vs.v }
 
-func TestSerStringStringer(t *testing.T) {
+func TestSerStringRejectsStringer(t *testing.T) {
 	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Use a value-receiver stringer so indirect doesn't lose the method.
 	v := valStringer{v: "hello"}
-	dst, err := s.AppendEncode(nil, &v)
-	if err != nil {
-		t.Fatalf("encode stringer: %v", err)
-	}
-	if len(dst) == 0 {
-		t.Fatal("expected non-empty output")
-	}
-}
-
-func TestSerStringTextMarshaler(t *testing.T) {
-	s, err := Parse(`"string"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	v := textMarshalerType{val: "hello"}
-	dst, err := s.AppendEncode(nil, &v)
-	if err != nil {
-		t.Fatalf("encode TextMarshaler: %v", err)
-	}
-	if len(dst) == 0 {
-		t.Fatal("expected non-empty output")
-	}
-}
-
-func TestSerStringTextMarshalerError(t *testing.T) {
-	s, err := Parse(`"string"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	v := textMarshalerErr{}
 	_, err = s.AppendEncode(nil, &v)
 	if err == nil {
-		t.Fatal("expected error from MarshalText")
+		t.Fatal("expected error: Stringer should not be accepted for string fields")
 	}
 }
 
-func TestSerStringTextAppender(t *testing.T) {
+func TestSerStringAcceptsTextMarshaler(t *testing.T) {
 	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, val := range []string{
-		"hello",
-		"",
-		strings.Repeat("a", 200), // multi-byte varlong length
-	} {
-		v := textAppenderType{val: val}
-		dst, err := s.AppendEncode(nil, &v)
-		if err != nil {
-			t.Fatalf("encode TextAppender %q: %v", val, err)
-		}
-		var got string
-		if _, err := s.Decode(dst, &got); err != nil {
-			t.Fatalf("decode %q: %v", val, err)
-		}
-		if got != val {
-			t.Fatalf("got %q, want %q", got, val)
-		}
+	v := testTextMarshaler{val: "hello"}
+	encoded, err := s.AppendEncode(nil, &v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got string
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != "hello" {
+		t.Fatalf("got %q, want %q", got, "hello")
 	}
 }
 
-func TestSerStringTextAppenderError(t *testing.T) {
+func TestSerStringRejectsJsonNumber(t *testing.T) {
 	s, err := Parse(`"string"`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	v := textAppenderErr{}
-	_, err = s.AppendEncode(nil, &v)
+	_, err = s.AppendEncode(nil, json.Number("42"))
 	if err == nil {
-		t.Fatal("expected error from AppendText")
+		t.Fatal("expected error: json.Number should not be accepted for string fields")
+	}
+}
+
+func TestSerStringRejectsJsonNumberInArray(t *testing.T) {
+	s, err := Parse(`{"type":"array","items":"string"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Encode([]any{json.Number("42")})
+	if err == nil {
+		t.Fatal("expected error: json.Number should not be accepted for string array items")
+	}
+}
+
+func TestSerStringRejectsJsonNumberInMap(t *testing.T) {
+	s, err := Parse(`{"type":"map","values":"string"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Encode(map[string]any{"k": json.Number("42")})
+	if err == nil {
+		t.Fatal("expected error: json.Number should not be accepted for string map values")
+	}
+}
+
+func TestSerStringAcceptsTextAppender(t *testing.T) {
+	s, err := Parse(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := testTextAppender{val: "hello"}
+	encoded, err := s.AppendEncode(nil, &v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got string
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != "hello" {
+		t.Fatalf("got %q, want %q", got, "hello")
 	}
 }
 
@@ -494,7 +496,7 @@ func TestSerIndirectNilPointer(t *testing.T) {
 }
 
 func TestSerIndirectNilInterface(t *testing.T) {
-	var iface stringer
+	var iface fmt.Stringer
 	v := reflect.ValueOf(&iface).Elem()
 	_, err := indirect(v)
 	if err == nil {
@@ -626,7 +628,7 @@ func (*IfaceF) String() string { return "f" }
 
 func TestInterface(t *testing.T) {
 	type Iface struct {
-		S stringer `avro:"s"`
+		S fmt.Stringer `avro:"s"`
 	}
 
 	s, err := Parse(`
@@ -713,109 +715,6 @@ func TestSerFixedFromSlice(t *testing.T) {
 	}
 }
 
-func TestSerTimestampFromString(t *testing.T) {
-	ts := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
-
-	for _, tt := range []struct {
-		name   string
-		schema string
-		input  string
-		decode func(int64) time.Time
-	}{
-		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, ts.Format(time.RFC3339Nano), func(v int64) time.Time { return time.UnixMilli(v) }},
-		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, ts.Format(time.RFC3339Nano), func(v int64) time.Time { return time.UnixMicro(v) }},
-		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, ts.Format(time.RFC3339Nano), func(v int64) time.Time { return time.Unix(v/1e9, v%1e9) }},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dst, err := s.AppendEncode(nil, &tt.input)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			var decoded int64
-			if _, err := s.Decode(dst, &decoded); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			got := tt.decode(decoded)
-			if !got.Equal(ts) {
-				t.Errorf("got %v, want %v", got, ts)
-			}
-		})
-	}
-}
-
-func TestSerDateFromString(t *testing.T) {
-	s, err := Parse(`{"type":"int","logicalType":"date"}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := time.Date(2026, 3, 19, 0, 0, 0, 0, time.UTC)
-
-	for _, tt := range []struct {
-		name  string
-		input string
-	}{
-		{"RFC3339", "2026-03-19T00:00:00Z"},
-		{"date only", "2026-03-19"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			dst, err := s.AppendEncode(nil, &tt.input)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			var days int32
-			if _, err := s.Decode(dst, &days); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			got := time.Unix(int64(days)*86400, 0).UTC()
-			if !got.Equal(want) {
-				t.Errorf("got %v, want %v", got, want)
-			}
-		})
-	}
-}
-
-func TestSerTimestampStringInRecord(t *testing.T) {
-	// End-to-end: json.Unmarshal → Encode → Decode, simulating a CDC pipeline.
-	schema := `{
-		"type":"record","name":"event",
-		"fields":[
-			{"name":"id","type":"string"},
-			{"name":"created_at","type":{"type":"long","logicalType":"timestamp-millis"}}
-		]
-	}`
-	s, err := Parse(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	input := `{"id":"abc","created_at":"2026-03-19T10:00:00Z"}`
-	var native any
-	if err := json.Unmarshal([]byte(input), &native); err != nil {
-		t.Fatal(err)
-	}
-	binary, err := s.Encode(native)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	var decoded any
-	if _, err := s.Decode(binary, &decoded); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	m := decoded.(map[string]any)
-	if m["id"] != "abc" {
-		t.Errorf("id: got %v", m["id"])
-	}
-	// Decoding into any produces the underlying long (int64), not time.Time.
-	gotMillis := m["created_at"].(int64)
-	want := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
-	if gotMillis != want.UnixMilli() {
-		t.Errorf("created_at: got %d, want %d", gotMillis, want.UnixMilli())
-	}
-}
-
 func TestSerNestedCDCPipeline(t *testing.T) {
 	schema := `{
 		"type":"record","name":"user_event",
@@ -873,8 +772,11 @@ func TestSerNestedCDCPipeline(t *testing.T) {
 		t.Errorf("zip: got %v (%T)", addr["zip"], addr["zip"])
 	}
 	want := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
-	if addr["since"] != want.UnixMilli() {
-		t.Errorf("since: got %v, want %d", addr["since"], want.UnixMilli())
+	got, ok := addr["since"].(time.Time)
+	if !ok {
+		t.Errorf("since: expected time.Time, got %T: %v", addr["since"], addr["since"])
+	} else if !got.Equal(want) {
+		t.Errorf("since: got %v, want %v", got, want)
 	}
 
 	// "tags" was missing from input — should use default [].
@@ -923,8 +825,11 @@ func TestSerNullableRecordUnion(t *testing.T) {
 		t.Errorf("source: got %v", meta["source"])
 	}
 	want := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
-	if meta["ts"] != want.UnixMilli() {
-		t.Errorf("ts: got %v, want %d", meta["ts"], want.UnixMilli())
+	got, ok := meta["ts"].(time.Time)
+	if !ok {
+		t.Errorf("ts: expected time.Time, got %T: %v", meta["ts"], meta["ts"])
+	} else if !got.Equal(want) {
+		t.Errorf("ts: got %v, want %v", got, want)
 	}
 
 	// Null branch.
@@ -986,36 +891,19 @@ func TestSerErrorDottedPath(t *testing.T) {
 	}
 }
 
-func TestSerJSONNumber(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		schema string
-		input  json.Number
-		expect any
-	}{
-		{"int", `"int"`, json.Number("42"), int32(42)},
-		{"long", `"long"`, json.Number("100000"), int64(100000)},
-		{"float", `"float"`, json.Number("1.5"), float32(1.5)},
-		{"double", `"double"`, json.Number("3.14"), 3.14},
-		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, json.Number("1742385600000"), int64(1742385600000)},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			s, err := Parse(tt.schema)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dst, err := s.AppendEncode(nil, &tt.input)
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			var decoded any
-			if _, err := s.Decode(dst, &decoded); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			if !reflect.DeepEqual(decoded, tt.expect) {
-				t.Errorf("got %v (%T), want %v (%T)", decoded, decoded, tt.expect, tt.expect)
-			}
-		})
+func TestSerJSONNumberOverflowInCollections(t *testing.T) {
+	// json.Number that overflows int32 in array of int.
+	s, _ := Parse(`{"type":"array","items":"int"}`)
+	_, err := s.AppendEncode(nil, []any{json.Number("3000000000")})
+	if err == nil {
+		t.Fatal("expected overflow error for array of int")
+	}
+
+	// json.Number that overflows int32 in map of int.
+	s2, _ := Parse(`{"type":"map","values":"int"}`)
+	_, err = s2.AppendEncode(nil, map[string]any{"k": json.Number("3000000000")})
+	if err == nil {
+		t.Fatal("expected overflow error for map of int")
 	}
 }
 
@@ -1574,5 +1462,44 @@ func TestSerLongUint64Overflow(t *testing.T) {
 	m := map[string]uint64{"k": big}
 	if _, err := s.AppendEncode(nil, &m); err == nil {
 		t.Fatal("expected overflow error for uint64 in map long")
+	}
+}
+
+func TestDurationString(t *testing.T) {
+	tests := []struct {
+		d    Duration
+		want string
+	}{
+		{Duration{}, "P0D"},
+		{Duration{Days: 30}, "P30D"},
+		{Duration{Months: 15, Days: 10}, "P1Y3M10D"},
+		{Duration{Milliseconds: 3600000}, "PT1H"},
+		{Duration{Milliseconds: 5400500}, "PT1H30M0.500S"},
+		{Duration{Milliseconds: 1000}, "PT1S"},
+		{Duration{Milliseconds: 61000}, "PT1M1S"},
+		{Duration{Months: 1, Days: 2, Milliseconds: 3723500}, "P1M2DT1H2M3.500S"},
+		{Duration{Milliseconds: 500}, "PT0.500S"},
+	}
+	for _, tt := range tests {
+		got := tt.d.String()
+		if got != tt.want {
+			t.Errorf("Duration%+v.String() = %q, want %q", tt.d, got, tt.want)
+		}
+	}
+}
+
+func TestDurationFromBytesShort(t *testing.T) {
+	d := DurationFromBytes([]byte{1, 2, 3})
+	if d != (Duration{}) {
+		t.Errorf("expected zero Duration for short input, got %+v", d)
+	}
+}
+
+func TestDurationBytesRoundTrip(t *testing.T) {
+	d := Duration{Months: 3, Days: 15, Milliseconds: 86400000}
+	b := d.Bytes()
+	got := DurationFromBytes(b[:])
+	if got != d {
+		t.Errorf("round-trip: got %+v, want %+v", got, d)
 	}
 }

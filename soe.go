@@ -7,14 +7,14 @@ import (
 
 // AppendSingleObject appends a Single Object Encoding of v to dst: 2-byte
 // magic, 8-byte CRC-64-AVRO fingerprint, then the Avro binary payload.
-func (s *Schema) AppendSingleObject(dst []byte, v any) ([]byte, error) {
+func (s *Schema) AppendSingleObject(dst []byte, v any, opts ...Opt) ([]byte, error) {
 	dst = append(dst, s.soe[:]...)
-	return s.AppendEncode(dst, v)
+	return s.AppendEncode(dst, v, opts...)
 }
 
 // DecodeSingleObject decodes a Single Object Encoding message into v after
 // verifying the magic and fingerprint match this schema.
-func (s *Schema) DecodeSingleObject(data []byte, v any) ([]byte, error) {
+func (s *Schema) DecodeSingleObject(data []byte, v any, opts ...Opt) ([]byte, error) {
 	if len(data) < 10 {
 		return nil, fmt.Errorf("avro: single-object encoding too short: need at least 10 bytes, have %d", len(data))
 	}
@@ -24,7 +24,7 @@ func (s *Schema) DecodeSingleObject(data []byte, v any) ([]byte, error) {
 	if [10]byte(data[:10]) != s.soe {
 		return nil, errors.New("avro: single-object encoding fingerprint mismatch")
 	}
-	return s.Decode(data[10:], v)
+	return s.Decode(data[10:], v, opts...)
 }
 
 // SingleObjectFingerprint extracts the 8-byte CRC-64-AVRO fingerprint and

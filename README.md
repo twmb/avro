@@ -18,8 +18,10 @@ fingerprinting.
 - [Schema Introspection](#schema-introspection)
 - [Logical Types](#logical-types)
 - [Schema Evolution](#schema-evolution)
+- [Schema Cache](#schema-cache)
+- [Custom Types](#custom-types)
 - [Object Container Files](#object-container-files)
-- [Avro JSON](#avro-json)
+- [JSON Encoding](#json-encoding)
 - [Single Object Encoding](#single-object-encoding)
 - [Fingerprinting](#fingerprinting)
 - [Performance](#performance)
@@ -67,34 +69,38 @@ func main() {
 }
 ```
 
+`Parse` accepts options: pass `WithLaxNames()` to allow non-standard characters
+in type and field names (useful for interop with schemas from other languages).
+
 ## Type Mapping
 
-The table below shows which Go types can be used with each Avro type when
-encoding and decoding.
+The table below shows which Go types can be used with each Avro type.
 
-| Avro Type | Go Types |
-|-----------|----------|
-| null      | `any` (always nil) |
-| boolean   | `bool`, `any` |
-| int, long | `int`, `int8`–`int64`, `uint`–`uint64`, `float64`, `json.Number`, `any` |
-| float     | `float32`, `float64`, `json.Number`, `any` |
-| double    | `float64`, `float32`, `json.Number`, `any` |
-| string    | `string`, `[]byte`, `any`; also `encoding.TextUnmarshaler` |
-| bytes     | `[]byte`, `string`, `any` |
-| enum      | `string`, any integer type (ordinal), `any` |
-| fixed     | `[N]byte`, `[]byte`, `any` |
-| array     | slice, `any` |
-| map       | `map[string]T`, `any` |
-| union     | `any`, `*T` (for `["null", T]` unions), or the matched branch type |
-| record    | struct (matched by field name or `avro` tag), `map[string]any`, `any` |
+| Avro Type | Encode | Decode |
+|-----------|--------|--------|
+| null      | `any` (nil) | `any` |
+| boolean   | `bool` | `bool`, `any` |
+| int, long | `int`, `int8`–`int64`, `uint`–`uint64`, `float64`, `json.Number` | `int`, `int8`–`int64`, `uint`–`uint64`, `any` |
+| float     | `float32`, `float64`, `json.Number` | `float32`, `float64`, `any` |
+| double    | `float64`, `float32`, `json.Number` | `float64`, `float32`, `any` |
+| string    | `string`, `[]byte`, `encoding.TextAppender`, `encoding.TextMarshaler` | `string`, `[]byte`, `encoding.TextUnmarshaler`, `any` |
+| bytes     | `[]byte`, `string` | `[]byte`, `string`, `any` |
+| enum      | `string`, any integer type (ordinal) | `string`, any integer type (ordinal), `any` |
+| fixed     | `[N]byte`, `[]byte` | `[N]byte`, `[]byte`, `any` |
+| array     | slice | slice, `any` |
+| map       | `map[string]T` | `map[string]T`, `any` |
+| union     | `any`, `*T`, or the matched branch type | `any`, `*T`, or the matched branch type |
+| record    | struct, `map[string]any` | struct, `map[string]any`, `any` |
 
 When decoding into `any`, values use their natural Go types: `nil`, `bool`,
 `int32`, `int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`,
-`map[string]any`.
+`map[string]any`. Logical types use `time.Time` (UTC) for timestamps and
+dates, `time.Duration` for time-of-day types, `json.Number` for decimals,
+and `avro.Duration` for the duration logical type.
 
-Encoding also accepts `fmt.Stringer` and `encoding.TextMarshaler` for string
-types, and `json.Number` for any numeric type (supporting
-`json.Decoder.UseNumber()` pipelines).
+Encoding also accepts `json.Number` for any numeric type (supporting
+`json.Decoder.UseNumber()` pipelines) and `[]byte` for string fields (and
+vice versa).
 
 ## Struct Tags
 
@@ -211,7 +217,7 @@ root := schema.Root()
 
 for _, f := range root.Fields {
     fmt.Printf("field %s: type=%s\n", f.Name, f.Type.Type)
-    if cn := f.Props["connect.name"]; cn != "" {
+    if cn, ok := f.Props["connect.name"].(string); ok {
         fmt.Printf("  kafka connect type: %s\n", cn)
     }
 }
@@ -233,22 +239,21 @@ schema, err := node.Schema()
 
 ## Logical Types
 
-Logical types are decoded into natural Go types when available, and fall back
-to the underlying Avro type otherwise.
+Logical types decode to their natural Go equivalents:
 
 | Logical Type | Avro Type | Encode | Decode |
 |---|---|---|---|
-| date | int | time.Time, RFC 3339 or YYYY-MM-DD string, or int | time.Time or int |
-| time-millis | int | time.Duration or int | time.Duration or int |
-| time-micros | long | time.Duration or int | time.Duration or int |
-| timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| local-timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| local-timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| local-timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time or int |
-| uuid | string or fixed(16) | [16]byte or string | [16]byte (RFC 4122 hex-dash ↔ binary) or string |
-| decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat or underlying type |
+| date | int | time.Time, RFC 3339 or YYYY-MM-DD string, or int | time.Time (UTC) |
+| time-millis | int | time.Duration or int | time.Duration |
+| time-micros | long | time.Duration or int | time.Duration |
+| timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| local-timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| local-timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| local-timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
+| uuid | string or fixed(16) | [16]byte or string | [16]byte (typed target) or string (any target) |
+| decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat, json.Number, or underlying type |
 | duration | fixed(12) | avro.Duration or underlying type | avro.Duration or underlying type |
 
 When encoding, timestamp and date fields accept RFC 3339 strings, and decimal
@@ -340,6 +345,96 @@ avro.CheckCompatibility(oldSchema, newSchema)
 avro.CheckCompatibility(newSchema, oldSchema)
 ```
 
+## Schema Cache
+
+When working with a schema registry, schemas often reference types defined in
+other schemas. `SchemaCache` accumulates named types across multiple Parse
+calls so they can be resolved:
+
+```go
+var cache avro.SchemaCache
+
+// Parse referenced schema first — order matters.
+_, err := cache.Parse(`{
+    "type": "record",
+    "name": "Address",
+    "fields": [{"name": "city", "type": "string"}]
+}`)
+
+// Now parse a schema that references Address.
+schema, err := cache.Parse(`{
+    "type": "record",
+    "name": "User",
+    "fields": [
+        {"name": "name",    "type": "string"},
+        {"name": "address", "type": "Address"}
+    ]
+}`)
+```
+
+Parsing the same schema string multiple times returns the cached result,
+handling diamond dependencies without caller-side deduplication. The returned
+`*Schema` is independent of the cache and safe to use concurrently.
+
+## Custom Types
+
+Register custom Go type conversions with `NewCustomType` for type-safe
+primitive conversions, or `CustomType` for advanced cases:
+
+```go
+type Money struct {
+    Cents    int64
+    Currency string
+}
+
+moneyType := avro.NewCustomType[Money, int64]("money",
+    func(m Money, _ *avro.SchemaNode) (int64, error) { return m.Cents, nil },
+    func(c int64, _ *avro.SchemaNode) (Money, error) {
+        return Money{Cents: c, Currency: "USD"}, nil
+    },
+)
+
+schema := avro.MustParse(moneySchema, moneyType)
+
+// Encode and decode — Money fields are automatically converted.
+data, _ := schema.Encode(&order)
+var out Order
+schema.Decode(data, &out) // out.Price is Money{Cents: 500, ...}
+
+// Works with SchemaFor too.
+schema = avro.MustSchemaFor[Order](moneyType)
+```
+
+Custom types replace built-in logical type handling entirely — callbacks
+receive raw Avro-native values (int64 for long, int32 for int, etc.):
+
+```go
+// Decode timestamps as raw int64 instead of time.Time.
+schema := avro.MustParse(raw, avro.CustomType{
+    LogicalType: "timestamp-millis",
+    Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+        return v, nil // pass through raw int64
+    },
+})
+```
+
+For property-based dispatch (e.g., Kafka Connect / Debezium types), use
+an empty matching criteria with `ErrSkipCustomType`:
+
+```go
+avro.CustomType{
+    Decode: func(v any, node *avro.SchemaNode) (any, error) {
+        name, _ := node.Props["connect.name"].(string)
+        switch name {
+        case "io.debezium.time.Timestamp":
+            return time.UnixMilli(v.(int64)).UTC(), nil
+        default:
+            return nil, avro.ErrSkipCustomType
+        }
+    },
+}
+```
+
 ## Object Container Files
 
 The `ocf` sub-package reads and writes [Avro Object Container Files](https://avro.apache.org/docs/current/specification/#object-container-files) —
@@ -405,23 +500,45 @@ Custom codecs can be provided via the `Codec` interface.
 `NewAppendWriter` opens an existing OCF for appending — it reads the header to
 recover the schema, codec, and sync marker, then seeks to the end.
 
-## Avro JSON
+## JSON Encoding
 
-`EncodeJSON` and `DecodeJSON` support the [Avro JSON encoding](https://avro.apache.org/docs/current/specification/#json-encoding),
-which differs from standard JSON in its handling of unions and bytes:
+`EncodeJSON` is a schema-aware JSON serializer. By default it produces standard
+JSON with bare union values and `\uXXXX`-encoded bytes:
 
 ```go
-// Encode: unions are wrapped as {"type_name": value}
+// Standard JSON (default): bare unions
 jsonBytes, err := schema.EncodeJSON(&user)
-// {"name":"Alice","email":{"string":"a@b.com"}}
+// {"name":"Alice","email":"a@b.com"}
 
-// Decode: unwraps unions automatically
+// Avro JSON: unions wrapped as {"type_name": value}
+jsonBytes, err = schema.EncodeJSON(&user, avro.TaggedUnions())
+// {"name":"Alice","email":{"string":"a@b.com"}}
+```
+
+`DecodeJSON` accepts both formats (tagged and bare unions) and all NaN/Infinity
+conventions:
+
+```go
 var user User
 err = schema.DecodeJSON(jsonBytes, &user)
 ```
 
-`EncodeJSON` accepts structs, maps, and all the same types as `Encode`.
-`DecodeJSON` accepts Avro JSON and decodes into any target type.
+`Decode` and `DecodeJSON` also accept `TaggedUnions()` to wrap union values
+when decoding into `*any`:
+
+```go
+var native any
+schema.Decode(binary, &native, avro.TaggedUnions())
+// native["email"] is map[string]any{"string": "a@b.com"}
+```
+
+Pass `TagLogicalTypes()` with `TaggedUnions()` to qualify union branch names
+with their logical type (e.g. `"long.timestamp-millis"` instead of `"long"`),
+matching the linkedin/goavro naming convention.
+
+NaN and Infinity float values are encoded as `"NaN"`, `"Infinity"`, `"-Infinity"`
+strings by default (Java Avro convention). Pass `LinkedinFloats()` for
+the linkedin/goavro convention (`null` for NaN, `±1e999` for Infinity).
 
 ## Single Object Encoding
 
@@ -458,6 +575,16 @@ fp := schema.Fingerprint(avro.NewRabin())
 // SHA-256 — common for cross-language registries
 fp256 := schema.Fingerprint(sha256.New())
 ```
+
+## Errors
+
+Encode and decode errors can be inspected with `errors.As`:
+
+- **`*SemanticError`**: type mismatch between Go and Avro (includes a dotted
+  field path for nested records, e.g. `"address.zip"`).
+- **`*ShortBufferError`**: input truncated mid-value.
+- **`*CompatibilityError`**: schema evolution incompatibility (from `Resolve`
+  or `CheckCompatibility`).
 
 ## Performance
 

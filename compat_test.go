@@ -77,11 +77,10 @@ func TestCheckWriterUnionDeepRecursionFailure(t *testing.T) {
 
 func TestCheckCompatibility(t *testing.T) {
 	tests := []struct {
-		name       string
-		reader     string
-		writer     string
-		wantErr    bool
-		wantDetail string
+		name    string
+		reader  string
+		writer  string
+		wantErr bool
 	}{
 		{
 			name:   "identical primitives",

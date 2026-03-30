@@ -3,6 +3,7 @@ package avro
 import (
 	"encoding"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -20,7 +21,11 @@ var anyType = reflect.TypeFor[any]()
 
 // slab batches small string allocations into a single backing buffer.
 // Strings are immutable so sharing backing memory is safe.
-type slab struct{ buf []byte }
+type slab struct {
+	buf             []byte
+	taggedUnions    bool
+	tagLogicalTypes bool
+}
 
 const slabSize = 1024
 
@@ -41,28 +46,45 @@ var slabPool = sync.Pool{New: func() any { return &slab{} }}
 //
 //   - null: any (always decodes to nil)
 //   - boolean: bool, any
-//   - int, long: int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, any
+//   - int, long: int, int8–int64, uint8–uint64, any
 //   - float: float32, float64, any
 //   - double: float64, float32, any
 //   - string: string, []byte, any; also [encoding.TextUnmarshaler]
 //   - bytes: []byte, string, any
-//   - enum: string, int/int8/.../uint64 (ordinal), any
+//   - enum: string, int/uint (ordinal), any
 //   - fixed: [N]byte, []byte, any
 //   - array: slice, any
 //   - map: map[string]T, any
 //   - union: any, *T (for ["null", T] unions), or the matched branch type
 //   - record: struct (matched by field name or `avro` tag), map[string]any, any
 //
-// When decoding into any (interface{}), values are returned as their natural
-// Go types: nil, bool, int32, int64, float32, float64, string, []byte, []any,
-// map[string]any, or map[string]any for records.
-func (s *Schema) Decode(src []byte, v any) ([]byte, error) {
+// When decoding into *any, primitive types become nil, bool, int32, int64,
+// float32, float64, string, []byte, []any, or map[string]any (for records).
+// Logical types decode to their natural Go equivalents:
+//
+//   - date, timestamp-millis/micros/nanos, local-timestamp-*: [time.Time] (UTC)
+//   - time-millis, time-micros: [time.Duration]
+//   - decimal: [encoding/json.Number]
+//   - duration: [Duration]
+//
+// To produce JSON from decoded *any data, use [Schema.EncodeJSON] rather
+// than [encoding/json.Marshal]. EncodeJSON is schema-aware and converts
+// these types back to their Avro representations (e.g. time.Time to
+// epoch integers, []byte to \uXXXX strings).
+func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, errors.New("decode requires a non-nil pointer")
 	}
 	sl := slabPool.Get().(*slab)
+	if len(opts) > 0 {
+		cfg := parseOpts(opts)
+		sl.taggedUnions = cfg.tagged
+		sl.tagLogicalTypes = cfg.tagLogical
+	}
 	rest, err := s.deser(src, rv.Elem(), sl)
+	sl.taggedUnions = false
+	sl.tagLogicalTypes = false
 	slabPool.Put(sl)
 	return rest, err
 }
@@ -72,7 +94,9 @@ func (s *Schema) Decode(src []byte, v any) ([]byte, error) {
 ///////////
 
 type deserUnion struct {
-	fns []deserfn
+	fns          []deserfn
+	branchNames  []string // standard names: "null", "string", "com.example.Foo"
+	logicalNames []string // with logical type: "long.timestamp-millis"; empty if same as branchNames
 }
 
 func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -83,7 +107,24 @@ func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	if idx < 0 || int(idx) >= len(s.fns) {
 		return nil, fmt.Errorf("union index %d out of range [0, %d)", idx, len(s.fns))
 	}
-	return s.fns[idx](src, v, sl)
+	src, err = s.fns[idx](src, v, sl)
+	if err == nil {
+		s.maybeWrap(v, sl, idx)
+	}
+	return src, err
+}
+
+// maybeWrap wraps a decoded union value with its branch name when
+// TaggedUnions is enabled and the target is *any.
+func (s *deserUnion) maybeWrap(v reflect.Value, sl *slab, idx int32) {
+	if !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
+		return
+	}
+	name := s.branchNames[idx]
+	if sl.tagLogicalTypes {
+		name = s.logicalNames[idx]
+	}
+	v.Set(reflect.ValueOf(map[string]any{name: v.Elem().Interface()}))
 }
 
 // deserNullUnion handles ["null", T] unions. The branch index is a varint:
@@ -108,7 +149,11 @@ func deserNullUnion(u *deserUnion) deserfn {
 				}
 				return u.fns[1](src[1:], v.Elem(), sl)
 			}
-			return u.fns[1](src[1:], v, sl)
+			src, err := u.fns[1](src[1:], v, sl)
+			if err == nil {
+				u.maybeWrap(v, sl, 1)
+			}
+			return src, err
 		default:
 			return nil, fmt.Errorf("invalid null-union index byte 0x%02x", src[0])
 		}
@@ -130,7 +175,11 @@ func deserNullSecondUnion(u *deserUnion) deserfn {
 				}
 				return u.fns[0](src[1:], v.Elem(), sl)
 			}
-			return u.fns[0](src[1:], v, sl)
+			src, err := u.fns[0](src[1:], v, sl)
+			if err == nil {
+				u.maybeWrap(v, sl, 0)
+			}
+			return src, err
 		case 2: // index 1: null
 			switch v.Kind() {
 			case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
@@ -292,6 +341,8 @@ func deserBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: fmt.Errorf("cannot decode %d bytes into array of length %d", n, v.Len())}
 		}
 		reflect.Copy(v, reflect.ValueOf(src[:n]))
+	case reflect.String:
+		v.SetString(string(b))
 	default:
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 	}
@@ -320,11 +371,16 @@ func deserString(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		v.SetString(str)
 		return src[n:], nil
 	}
-	// Try encoding.TextUnmarshaler.
+	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
+	// should use their text parsing, not raw byte assignment.
 	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
 		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(str)); err != nil {
 			return nil, err
 		}
+		return src[n:], nil
+	}
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		v.SetBytes([]byte(str))
 		return src[n:], nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
@@ -956,8 +1012,8 @@ func deserTimestampMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == timeType {
-		v.Set(reflect.ValueOf(time.UnixMilli(val)))
+	if v.Kind() == reflect.Interface || v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.UnixMilli(val).UTC()))
 		return src, nil
 	}
 	return src, setLongValue(v, val)
@@ -969,8 +1025,8 @@ func deserTimestampMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == timeType {
-		v.Set(reflect.ValueOf(time.UnixMicro(val)))
+	if v.Kind() == reflect.Interface || v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.UnixMicro(val).UTC()))
 		return src, nil
 	}
 	return src, setLongValue(v, val)
@@ -982,8 +1038,8 @@ func deserTimestampNanos(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == timeType {
-		v.Set(reflect.ValueOf(time.Unix(val/1e9, val%1e9)))
+	if v.Kind() == reflect.Interface || v.Type() == timeType {
+		v.Set(reflect.ValueOf(time.Unix(val/1e9, val%1e9).UTC()))
 		return src, nil
 	}
 	return src, setLongValue(v, val)
@@ -995,7 +1051,7 @@ func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == timeType {
+	if v.Kind() == reflect.Interface || v.Type() == timeType {
 		t := time.Unix(int64(val)*86400, 0).UTC()
 		v.Set(reflect.ValueOf(t))
 		return src, nil
@@ -1009,7 +1065,7 @@ func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Type() == durationType {
+	if v.Kind() == reflect.Interface || v.Type() == durationType {
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Millisecond))
 		return src, nil
 	}
@@ -1029,6 +1085,14 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
 		return src, nil
 	}
+	if v.Kind() == reflect.Interface {
+		// No overflow check for *any targets: spec-violating values
+		// silently wrap. Valid time-of-day values (< 86400000000 micros)
+		// never overflow. The value may be transient — passed to a
+		// CustomType decoder or EncodeJSON.
+		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
+		return src, nil
+	}
 	return src, setLongValue(v, val)
 }
 
@@ -1038,10 +1102,7 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface || v.Type() == avroDurationType {
-		months := uint32(src[0]) | uint32(src[1])<<8 | uint32(src[2])<<16 | uint32(src[3])<<24
-		days := uint32(src[4]) | uint32(src[5])<<8 | uint32(src[6])<<16 | uint32(src[7])<<24
-		ms := uint32(src[8]) | uint32(src[9])<<8 | uint32(src[10])<<16 | uint32(src[11])<<24
-		v.Set(reflect.ValueOf(Duration{Months: months, Days: days, Milliseconds: ms}))
+		v.Set(reflect.ValueOf(DurationFromBytes(src[:12])))
 		return src[12:], nil
 	}
 	// Fall back to [12]byte fixed.
@@ -1067,8 +1128,9 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	b := src[:n]
 	src = src[n:]
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
+	if v.Kind() == reflect.Interface || v.Type() == jsonNumberType {
+		r := bytesToRat(b, s.scale)
+		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
 		return src, nil
 	}
 	if v.Type() == bigRatType {
@@ -1090,8 +1152,9 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	b := src[:s.size]
 	src = src[s.size:]
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
+	if v.Kind() == reflect.Interface || v.Type() == jsonNumberType {
+		r := bytesToRat(b, s.scale)
+		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
 		return src, nil
 	}
 	if v.Type() == bigRatType {

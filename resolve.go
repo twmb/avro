@@ -33,16 +33,24 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 	if err := CheckCompatibility(writer, reader); err != nil {
 		return nil, err
 	}
-	resolved, err := resolveNode(reader.node, writer.node, "", make(map[nodePair]*schemaNode))
+	ctx := &resolveCtx{
+		seen:           make(map[nodePair]*schemaNode),
+		customDecoders: reader.customDecoders,
+		customSNs:      reader.customSNs,
+	}
+	resolved, err := resolveNode(reader.node, writer.node, "", ctx)
 	if err != nil {
 		return nil, err
 	}
 	s := &Schema{
-		ser:   reader.ser,
-		deser: resolved.deser,
-		c:     reader.c,
-		node:  reader.node,
-		full:  reader.full,
+		ser:            reader.ser,
+		deser:          resolved.deser,
+		c:              reader.c,
+		node:           reader.node,
+		full:           reader.full,
+		customEncodes:  reader.customEncodes,
+		customDecoders: reader.customDecoders,
+		customSNs:      reader.customSNs,
 	}
 	s.soe = reader.soe
 	return s, nil
@@ -70,6 +78,28 @@ type defaultOp struct {
 	deser          deserfn
 }
 
+// resolveCtx carries per-resolution state through the recursive resolve calls.
+type resolveCtx struct {
+	seen           map[nodePair]*schemaNode
+	customDecoders map[*schemaNode][]func(any, *SchemaNode) (any, error)
+	customSNs      map[*schemaNode]*SchemaNode
+}
+
+// maybeWrapResolvedNode re-applies custom decoders from the reader
+// schema to a resolved node that uses the reader node directly.
+func maybeWrapResolvedNode(r *schemaNode, ctx *resolveCtx) *schemaNode {
+	decs := ctx.customDecoders[r]
+	if len(decs) == 0 {
+		return r
+	}
+	return &schemaNode{
+		kind:  r.kind,
+		name:  r.name,
+		ser:   r.ser,
+		deser: wrapDeserWithCustomDecoders(r.deser, decs, ctx.customSNs[r]),
+	}
+}
+
 // resolveNode resolves a (reader, writer) schema pair, handling cycles
 // from self-referencing records (e.g. a linked list node). The three
 // states in the seen map are:
@@ -82,9 +112,9 @@ type defaultOp struct {
 // real resolution completes, we copy the resolved node's contents into
 // the placeholder so all holders of the placeholder pointer get the
 // real implementation.
-func resolveNode(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
+func resolveNode(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
 	pair := nodePair{r, w}
-	if n, ok := seen[pair]; ok {
+	if n, ok := ctx.seen[pair]; ok {
 		if n == nil {
 			// Cycle detected: create a placeholder with a
 			// trampoline deser that will forward to the real
@@ -93,67 +123,72 @@ func resolveNode(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (
 			n.deser = func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 				return n.deser(src, v, sl)
 			}
-			seen[pair] = n
+			ctx.seen[pair] = n
 		}
 		return n, nil
 	}
-	seen[pair] = nil // mark as in-progress
+	ctx.seen[pair] = nil // mark as in-progress
 
-	resolved, err := doResolve(r, w, path, seen)
+	resolved, err := doResolve(r, w, path, ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	// If a placeholder was created during cycle detection, copy the
 	// resolved contents into it so the trampoline now calls the real deser.
-	if placeholder := seen[pair]; placeholder != nil && placeholder != resolved {
+	if placeholder := ctx.seen[pair]; placeholder != nil && placeholder != resolved {
 		*placeholder = *resolved
 		resolved = placeholder
 	}
-	seen[pair] = resolved
+	ctx.seen[pair] = resolved
 	return resolved, nil
 }
 
-func doResolve(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
+func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
 	// Writer union: unwrap if reader is not a union.
 	if w.kind == "union" && r.kind != "union" {
-		return resolveWriterUnion(r, w, path, seen)
+		return resolveWriterUnion(r, w, path, ctx)
 	}
 	// Reader union: wrap.
 	if r.kind == "union" && w.kind != "union" {
-		return resolveReaderUnion(r, w, path, seen)
+		return resolveReaderUnion(r, w, path, ctx)
 	}
 	// Both unions.
 	if r.kind == "union" && w.kind == "union" {
-		return resolveUnionUnion(r, w, path, seen)
+		return resolveUnionUnion(r, w, path, ctx)
 	}
 
 	// Same kind.
 	if r.kind == w.kind {
 		switch r.kind {
 		case "record":
-			return resolveRecord(r, w, path, seen)
+			return resolveRecord(r, w, path, ctx)
 		case "enum":
-			return resolveEnum(r, w)
+			return resolveEnum(r, w, ctx)
 		case "array":
-			return resolveArray(r, w, path, seen)
+			return resolveArray(r, w, path, ctx)
 		case "map":
-			return resolveMap(r, w, path, seen)
+			return resolveMap(r, w, path, ctx)
 		case "fixed":
-			return r, nil // names and sizes already verified by CheckCompatibility
+			return maybeWrapResolvedNode(r, ctx), nil
 		default:
 			// Same primitive: use reader directly.
-			return r, nil
+			return maybeWrapResolvedNode(r, ctx), nil
 		}
 	}
 
 	// Type promotion.
 	pd := promotionDeser(w.kind, r.kind)
 	if pd != nil {
+		deser := deserfn(pd)
+		// Re-apply custom decoders from the reader schema to the promoted node.
+		if decs := ctx.customDecoders[r]; len(decs) > 0 {
+			deser = wrapDeserWithCustomDecoders(pd, decs, ctx.customSNs[r])
+		}
 		return &schemaNode{
 			kind:  r.kind,
 			ser:   r.ser,
-			deser: pd,
+			deser: deser,
 		}, nil
 	}
 
@@ -165,7 +200,7 @@ func doResolve(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*s
 	}
 }
 
-func resolveRecord(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
+func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
 	// Build writer field lookup.
 	type writerFieldInfo struct {
 		idx  int
@@ -199,7 +234,7 @@ func resolveRecord(r, w *schemaNode, path string, seen map[nodePair]*schemaNode)
 		}
 		readerMatched[ri] = true
 		rf := &r.fields[ri]
-		resolved, err := resolveNode(rf.node, wf.node, fieldPath(path, rf.name), seen)
+		resolved, err := resolveNode(rf.node, wf.node, fieldPath(path, rf.name), ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -218,10 +253,14 @@ func resolveRecord(r, w *schemaNode, path string, seen map[nodePair]*schemaNode)
 		if err != nil {
 			return nil, fmt.Errorf("field %s: %w", fieldPath(path, rf.name), err)
 		}
+		deser := rf.node.deser
+		if decs := ctx.customDecoders[rf.node]; len(decs) > 0 {
+			deser = wrapDeserWithCustomDecoders(deser, decs, ctx.customSNs[rf.node])
+		}
 		rr.defaults = append(rr.defaults, defaultOp{
 			readerIdx:      i,
 			encodedDefault: encoded,
-			deser:          rf.node.deser,
+			deser:          deser,
 		})
 	}
 
@@ -365,7 +404,7 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 	return src, nil
 }
 
-func resolveEnum(r, w *schemaNode) (*schemaNode, error) {
+func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 	// Build writer symbol index → reader symbol index mapping.
 	readerIdx := make(map[string]int, len(r.symbols))
 	for i, s := range r.symbols {
@@ -400,87 +439,102 @@ func resolveEnum(r, w *schemaNode) (*schemaNode, error) {
 	}
 
 	if identity {
-		return r, nil
+		return maybeWrapResolvedNode(r, ctx), nil
 	}
 
 	readerSymbols := r.symbols
+	deser := deserfn(func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+		idx, src, err := readVarint(src)
+		if err != nil {
+			return nil, err
+		}
+		if idx < 0 || int(idx) >= len(mapping) {
+			return nil, fmt.Errorf("enum index %d out of range [0, %d)", idx, len(mapping))
+		}
+		ri := mapping[idx]
+		v = indirectAlloc(v)
+		switch {
+		case v.Kind() == reflect.Interface:
+			v.Set(reflect.ValueOf(readerSymbols[ri]))
+		case v.Kind() == reflect.String:
+			v.SetString(readerSymbols[ri])
+		case v.CanInt():
+			v.SetInt(int64(ri))
+		case v.CanUint():
+			v.SetUint(uint64(ri))
+		default:
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
+		}
+		return src, nil
+	})
+	if decs := ctx.customDecoders[r]; len(decs) > 0 {
+		deser = wrapDeserWithCustomDecoders(deser, decs, ctx.customSNs[r])
+	}
 	return &schemaNode{
 		kind:    "enum",
 		name:    r.name,
 		aliases: r.aliases,
 		symbols: r.symbols,
 		ser:     r.ser,
-		deser: func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-			idx, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if idx < 0 || int(idx) >= len(mapping) {
-				return nil, fmt.Errorf("enum index %d out of range [0, %d)", idx, len(mapping))
-			}
-			ri := mapping[idx]
-			v = indirectAlloc(v)
-			switch {
-			case v.Kind() == reflect.Interface:
-				v.Set(reflect.ValueOf(readerSymbols[ri]))
-			case v.Kind() == reflect.String:
-				v.SetString(readerSymbols[ri])
-			case v.CanInt():
-				v.SetInt(int64(ri))
-			case v.CanUint():
-				v.SetUint(uint64(ri))
-			default:
-				return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
-			}
-			return src, nil
-		},
+		deser:   deser,
 	}, nil
 }
 
-func resolveArray(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
-	resolved, err := resolveNode(r.items, w.items, path+".items", seen)
+func resolveArray(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
+	resolved, err := resolveNode(r.items, w.items, path+".items", ctx)
 	if err != nil {
 		return nil, err
 	}
 	if resolved == r.items {
-		return r, nil
+		return maybeWrapResolvedNode(r, ctx), nil
 	}
-	return &schemaNode{
+	nd := &schemaNode{
 		kind:  "array",
 		items: resolved,
 		ser:   r.ser,
 		deser: (&deserArray{deserItem: resolved.deser}).deser,
-	}, nil
+	}
+	if decs := ctx.customDecoders[r]; len(decs) > 0 {
+		nd.deser = wrapDeserWithCustomDecoders(nd.deser, decs, ctx.customSNs[r])
+	}
+	return nd, nil
 }
 
-func resolveMap(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
-	resolved, err := resolveNode(r.values, w.values, path+".values", seen)
+func resolveMap(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
+	resolved, err := resolveNode(r.values, w.values, path+".values", ctx)
 	if err != nil {
 		return nil, err
 	}
 	if resolved == r.values {
-		return r, nil
+		return maybeWrapResolvedNode(r, ctx), nil
 	}
-	return &schemaNode{
+	nd := &schemaNode{
 		kind:   "map",
 		values: resolved,
 		ser:    r.ser,
 		deser:  (&deserMap{deserItem: resolved.deser}).deser,
-	}, nil
+	}
+	if decs := ctx.customDecoders[r]; len(decs) > 0 {
+		nd.deser = wrapDeserWithCustomDecoders(nd.deser, decs, ctx.customSNs[r])
+	}
+	return nd, nil
 }
 
 // resolveWriterUnion: writer is union, reader is not.
 // All writer branches must be compatible with the single reader type.
-func resolveWriterUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
+func resolveWriterUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
 	branchDesers := make([]deserfn, len(w.branches))
+	bnames := make([]string, len(w.branches))
+	lnames := make([]string, len(w.branches))
 	for i, wb := range w.branches {
-		resolved, err := resolveNode(r, wb, path, seen)
+		resolved, err := resolveNode(r, wb, path, ctx)
 		if err != nil {
 			return nil, err
 		}
 		branchDesers[i] = resolved.deser
+		bnames[i], lnames[i] = unionBranchNames(wb)
 	}
-	du := &deserUnion{fns: branchDesers}
+	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
 	return &schemaNode{
 		kind:  r.kind,
 		name:  r.name,
@@ -491,18 +545,36 @@ func resolveWriterUnion(r, w *schemaNode, path string, seen map[nodePair]*schema
 
 // resolveReaderUnion: reader is union, writer is not.
 // Find first matching reader branch.
-func resolveReaderUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
+func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
 	for _, rb := range r.branches {
 		if kindsMatch(rb, w) {
-			resolved, err := resolveNode(rb, w, path, seen)
+			resolved, err := resolveNode(rb, w, path, ctx)
 			if err != nil {
 				return nil, err
+			}
+			// The wire format has no union index (writer wrote a
+			// non-union value), so we can't use deserUnion.deser
+			// which reads a varint index. Wrap the resolved deser
+			// to apply TaggedUnions when active.
+			bn, ln := unionBranchNames(rb)
+			inner := resolved.deser
+			deser := func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+				src, err := inner(src, v, sl)
+				if err != nil || !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
+					return src, err
+				}
+				name := bn
+				if sl.tagLogicalTypes {
+					name = ln
+				}
+				v.Set(reflect.ValueOf(map[string]any{name: v.Elem().Interface()}))
+				return src, nil
 			}
 			return &schemaNode{
 				kind:     "union",
 				branches: r.branches,
 				ser:      r.ser,
-				deser:    resolved.deser,
+				deser:    deser,
 			}, nil
 		}
 	}
@@ -516,8 +588,10 @@ func resolveReaderUnion(r, w *schemaNode, path string, seen map[nodePair]*schema
 
 // resolveUnionUnion: both reader and writer are unions.
 // Map each writer branch to its best matching reader branch.
-func resolveUnionUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaNode) (*schemaNode, error) {
+func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
 	branchDesers := make([]deserfn, len(w.branches))
+	bnames := make([]string, len(w.branches))
+	lnames := make([]string, len(w.branches))
 	for i, wb := range w.branches {
 		rb := findMatchingBranch(r, wb)
 		if rb == nil {
@@ -528,13 +602,14 @@ func resolveUnionUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaN
 				Detail:     "writer union branch has no matching reader branch",
 			}
 		}
-		resolved, err := resolveNode(rb, wb, path, seen)
+		resolved, err := resolveNode(rb, wb, path, ctx)
 		if err != nil {
 			return nil, err
 		}
 		branchDesers[i] = resolved.deser
+		bnames[i], lnames[i] = unionBranchNames(wb)
 	}
-	du := &deserUnion{fns: branchDesers}
+	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
 	deser := du.deser
 	// Null-union optimization.
 	if len(w.branches) == 2 && w.branches[0].kind == "null" {
@@ -549,18 +624,10 @@ func resolveUnionUnion(r, w *schemaNode, path string, seen map[nodePair]*schemaN
 }
 
 // defaultStringToBytes converts a JSON-decoded string to raw bytes for Avro
-// bytes/fixed defaults. The Avro spec says code points 0-255 map to byte values
-// 0-255. json.Unmarshal decodes \u00FF to multi-byte UTF-8, so we must convert
-// each rune back to a single byte.
+// bytes/fixed defaults. Delegates to avroJSONBytesToBytes since both perform
+// the same code-point-to-byte conversion.
 func defaultStringToBytes(s string) ([]byte, error) {
-	b := make([]byte, 0, len(s))
-	for _, r := range s {
-		if r > 255 {
-			return nil, fmt.Errorf("bytes/fixed default contains code point U+%04X, max allowed is U+00FF", r)
-		}
-		b = append(b, byte(r))
-	}
-	return b, nil
+	return avroJSONBytesToBytes(s)
 }
 
 // encodeDefault converts a parsed JSON default value to Avro binary encoding.

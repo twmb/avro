@@ -9,11 +9,11 @@ import (
 	"sync"
 )
 
-type stringer interface {
-	String() string
-}
-
-var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+var (
+	textAppenderType    = reflect.TypeFor[encoding.TextAppender]()
+	textMarshalerType   = reflect.TypeFor[encoding.TextMarshaler]()
+	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+)
 
 var errIndirectNil = errors.New("invalid nil in non-union, non-null")
 

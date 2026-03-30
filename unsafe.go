@@ -203,12 +203,14 @@ func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, 
 	return src, nil
 }
 
-var errUnsafeNilPtr = errors.New("invalid nil in non-union, non-null")
-
 // tryCompileFieldSer returns a userfn for fields that can be fully handled
 // via unsafe pointer access. Returns nil for complex types that must use
 // the reflect-based slow path.
 func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
+	// Custom types need the reflect slow path for the conversion wrapper.
+	if f.meta != nil && (f.meta.hasCustomType || (f.meta.inner != nil && f.meta.inner.hasCustomType)) {
+		return nil
+	}
 	k := goType.Kind()
 
 	// Regular unions need the reflect slow path.
@@ -226,6 +228,9 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		}
 		nullByte, valByte := nullUnionBytes(f.meta.nullSecond)
 		inner := f.meta.inner
+		if inner.hasCustomType {
+			return nil
+		}
 		innerGoType := goType.Elem()
 		if inner.serRecord != nil {
 			return usNullUnionRecord(inner.serRecord, innerGoType, nullByte, valByte)
@@ -253,6 +258,9 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 				return nil
 			}
 			nullByte, valByte := nullUnionBytes(inner.nullSecond)
+			if inner.inner != nil && inner.inner.hasCustomType {
+				return nil
+			}
 			if inner.inner != nil && inner.inner.serRecord != nil {
 				return usArrayNullUnionRecord(inner.inner.serRecord, elemGoType.Elem(), nullByte, valByte)
 			}
@@ -298,7 +306,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		return func(dst []byte, p unsafe.Pointer) ([]byte, error) {
 			pp := *(*unsafe.Pointer)(p)
 			if pp == nil {
-				return nil, errUnsafeNilPtr
+				return nil, errIndirectNil
 			}
 			return inner(dst, pp)
 		}
@@ -339,6 +347,9 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 // directly via unsafe. Returns nil for complex types that must use the
 // reflect-based slow path.
 func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
+	if f.meta != nil && (f.meta.hasCustomType || (f.meta.inner != nil && f.meta.inner.hasCustomType)) {
+		return nil
+	}
 	k := goType.Kind()
 
 	if f.avroType == "union" {
@@ -355,6 +366,9 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		}
 		nullByte, valByte := nullUnionBytes(f.meta.nullSecond)
 		inner := f.meta.inner
+		if inner.hasCustomType {
+			return nil
+		}
 		innerGoType := goType.Elem()
 		if inner.deserRecord != nil {
 			return udNullUnionRecord(inner.deserRecord, innerGoType, nullByte, valByte)
@@ -375,6 +389,9 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 			return nil
 		}
 		inner := f.meta.inner
+		if inner.hasCustomType {
+			return nil
+		}
 		elemGoType := goType.Elem()
 		switch inner.avroType {
 		case "record":
@@ -1287,7 +1304,7 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 		var err error
 		for _, pp := range s {
 			if pp == nil {
-				return nil, errUnsafeNilPtr
+				return nil, errIndirectNil
 			}
 			if useFast {
 				dst, err = serRecordFastPtr(dst, fast, pp)

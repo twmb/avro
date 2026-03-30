@@ -1025,30 +1025,20 @@ type stringerType struct{ v string }
 
 func (s stringerType) String() string { return s.v }
 
-func TestSchemaForTextMarshaler(t *testing.T) {
+func TestSchemaForTextMarshalerInferredAsString(t *testing.T) {
 	type Record struct {
 		A customString `avro:"a"`
-		B stringerType `avro:"b"`
 	}
 	s, err := SchemaFor[Record]()
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := Record{A: customString{"hello"}, B: stringerType{"world"}}
-	data, err := s.Encode(&r)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
+	root := s.Root()
+	if len(root.Fields) == 0 {
+		t.Fatal("expected fields")
 	}
-	// Both fields should be string in the schema.
-	var m map[string]any
-	if _, err := s.Decode(data, &m); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if m["a"] != "hello" {
-		t.Errorf("a: got %v, want hello", m["a"])
-	}
-	if m["b"] != "world" {
-		t.Errorf("b: got %v, want world", m["b"])
+	if root.Fields[0].Type.Type != "string" {
+		t.Fatalf("expected string, got %s", root.Fields[0].Type.Type)
 	}
 }
 

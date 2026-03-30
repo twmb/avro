@@ -6,7 +6,7 @@ import (
 )
 
 func TestSchemaCacheBasic(t *testing.T) {
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	// Parse a leaf schema.
 	_, err := cache.Parse(`{
@@ -68,7 +68,7 @@ func TestSchemaCacheBasic(t *testing.T) {
 }
 
 func TestSchemaCacheMultipleRefs(t *testing.T) {
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	_, err := cache.Parse(`{
 		"type": "record",
@@ -135,7 +135,7 @@ func TestSchemaCacheMultipleRefs(t *testing.T) {
 }
 
 func TestSchemaCacheNestedRefs(t *testing.T) {
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	// Leaf: Owner.
 	_, err := cache.Parse(`{
@@ -199,7 +199,7 @@ func TestSchemaCacheNestedRefs(t *testing.T) {
 
 func TestSchemaCacheSharedBase(t *testing.T) {
 	// Multiple schemas sharing a common base type.
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	_, err := cache.Parse(`{
 		"type": "record",
@@ -261,7 +261,7 @@ func TestSchemaCacheSharedBase(t *testing.T) {
 }
 
 func TestSchemaCacheUnresolvedRef(t *testing.T) {
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	// Parsing a schema that references an unknown type should fail.
 	_, err := cache.Parse(`{
@@ -288,7 +288,7 @@ func TestSchemaCacheUnresolvedRef(t *testing.T) {
 func TestSchemaCacheJSONRoundtrip(t *testing.T) {
 	// End-to-end test matching rpk's usage pattern:
 	// parse refs → parse parent → json.Unmarshal → Encode → Decode → json.Marshal
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	_, err := cache.Parse(`{
 		"type": "record",
@@ -357,7 +357,7 @@ func TestSchemaCacheJSONRoundtrip(t *testing.T) {
 }
 
 func TestSchemaCacheEnum(t *testing.T) {
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	_, err := cache.Parse(`{
 		"type": "enum",
@@ -398,7 +398,7 @@ func TestSchemaCacheEnum(t *testing.T) {
 func TestSchemaCacheDiamondDependency(t *testing.T) {
 	// Diamond: A references B and C, both B and C reference D.
 	// Parsing D twice (once for B's deps, once for C's deps) must succeed.
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	schemaD := `{
 		"type": "record",
@@ -490,7 +490,7 @@ func TestSchemaCacheDiamondDependency(t *testing.T) {
 }
 
 func TestSchemaCacheDiamondEnum(t *testing.T) {
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	schemaColor := `{
 		"type": "enum",
@@ -536,7 +536,7 @@ func TestSchemaCacheDiamondEnum(t *testing.T) {
 }
 
 func TestSchemaCacheDiamondFixed(t *testing.T) {
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	schemaHash := `{
 		"type": "fixed",
@@ -586,7 +586,7 @@ func TestSchemaCacheDiamondFixed(t *testing.T) {
 
 func TestSchemaCacheFailedParseThenRetry(t *testing.T) {
 	// A failed parse must not be cached by the dedup map.
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	schema := `{
 		"type": "record",
@@ -631,7 +631,7 @@ func TestSchemaCacheFailedParseThenRetry(t *testing.T) {
 
 func TestSchemaCacheDiamondWhitespace(t *testing.T) {
 	// Same schema with different whitespace should dedup.
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	_, err := cache.Parse(`{"type":"record","name":"W","fields":[{"name":"x","type":"int"}]}`)
 	if err != nil {
@@ -664,7 +664,7 @@ func TestSchemaCacheDiamondWhitespace(t *testing.T) {
 
 func TestSchemaCacheDiamondKeyOrder(t *testing.T) {
 	// Same schema with different JSON key ordering should dedup.
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	_, err := cache.Parse(`{"type":"record","name":"K","fields":[{"name":"x","type":"int"}]}`)
 	if err != nil {
@@ -694,7 +694,7 @@ func TestSchemaCacheFieldOrderPreserved(t *testing.T) {
 	// Field ARRAY order matters for Avro binary encoding.
 	// Two schemas with the same fields in different order are different
 	// schemas and must NOT be deduplicated.
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	s1, err := cache.Parse(`{
 		"type": "record",
@@ -746,7 +746,7 @@ func TestSchemaCacheFieldOrderPreserved(t *testing.T) {
 func TestSchemaCacheDedupPreservesLargeNumbers(t *testing.T) {
 	// Verify that JSON normalization preserves large integers exactly,
 	// so two schemas with the same large "size" value dedup correctly.
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	schema1 := `{"type":"fixed","name":"Big","size":9007199254740993}`
 	schema2 := `{ "type": "fixed", "name": "Big", "size": 9007199254740993 }`
@@ -766,7 +766,7 @@ func TestSchemaCacheDedupPreservesLargeNumbers(t *testing.T) {
 
 func TestSchemaCacheConflictingDefinition(t *testing.T) {
 	// Two different schemas defining the same name should still error.
-	cache := NewSchemaCache()
+	cache := &SchemaCache{}
 
 	_, err := cache.Parse(`{
 		"type": "record",
@@ -784,5 +784,46 @@ func TestSchemaCacheConflictingDefinition(t *testing.T) {
 	}`)
 	if err == nil {
 		t.Fatal("expected error for conflicting definition of Foo")
+	}
+}
+
+func TestSchemaCacheZeroValue(t *testing.T) {
+	// A zero-value SchemaCache should work.
+	var c SchemaCache
+	s, err := c.Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Encode(int32(42)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSchemaCacheConcurrent(t *testing.T) {
+	cache := &SchemaCache{}
+	_, err := cache.Parse(`{
+		"type": "record",
+		"name": "Base",
+		"fields": [{"name": "id", "type": "int"}]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const goroutines = 8
+	errs := make(chan error, goroutines)
+	for range goroutines {
+		go func() {
+			_, err := cache.Parse(`{
+				"type": "record",
+				"name": "Wrapper",
+				"fields": [{"name": "base", "type": "Base"}]
+			}`)
+			errs <- err
+		}()
+	}
+	for range goroutines {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
 	}
 }

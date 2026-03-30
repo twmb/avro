@@ -487,3 +487,92 @@ func TestRootFromParsedSchema(t *testing.T) {
 		t.Errorf("field 7 aliases: %v", got.Fields[7].Aliases)
 	}
 }
+
+func TestSchemaNodeAliasesEnumDefaultOrderRoundTrip(t *testing.T) {
+	schema := `{
+		"type": "record",
+		"name": "R",
+		"aliases": ["OldR", "AncientR"],
+		"fields": [
+			{"name": "status", "type": {
+				"type": "enum",
+				"name": "Status",
+				"symbols": ["ACTIVE", "DELETED"],
+				"default": "ACTIVE",
+				"aliases": ["OldStatus"]
+			}},
+			{"name": "score", "type": "int", "order": "descending"},
+			{"name": "tags", "type": {"type": "array", "items": "string"}, "order": "ignore"}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := s.Root()
+
+	// Record aliases
+	if len(root.Aliases) != 2 || root.Aliases[0] != "OldR" {
+		t.Errorf("record aliases: %v", root.Aliases)
+	}
+
+	// Enum aliases, default
+	enumField := root.Fields[0]
+	if len(enumField.Type.Aliases) != 1 || enumField.Type.Aliases[0] != "OldStatus" {
+		t.Errorf("enum aliases: %v", enumField.Type.Aliases)
+	}
+	if !enumField.Type.HasEnumDefault || enumField.Type.EnumDefault != "ACTIVE" {
+		t.Errorf("enum default: has=%v val=%q", enumField.Type.HasEnumDefault, enumField.Type.EnumDefault)
+	}
+
+	// Field order
+	if root.Fields[1].Order != "descending" {
+		t.Errorf("score order: %q", root.Fields[1].Order)
+	}
+	if root.Fields[2].Order != "ignore" {
+		t.Errorf("tags order: %q", root.Fields[2].Order)
+	}
+
+	// Round-trip: SchemaNode → Schema → Root
+	node := s.Root()
+	s2, err := node.Schema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root2 := s2.Root()
+	if len(root2.Aliases) != 2 {
+		t.Errorf("round-trip aliases lost: %v", root2.Aliases)
+	}
+	if !root2.Fields[0].Type.HasEnumDefault {
+		t.Error("round-trip enum default lost")
+	}
+	if root2.Fields[1].Order != "descending" {
+		t.Error("round-trip order lost")
+	}
+}
+
+func TestSchemaNodeCustomPropsExtended(t *testing.T) {
+	schema := `{
+		"type": "record",
+		"name": "R",
+		"custom.tag": "hello",
+		"custom.num": 42,
+		"fields": [
+			{"name": "x", "type": "int", "custom.field": true}
+		]
+	}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := s.Root()
+	if root.Props["custom.tag"] != "hello" {
+		t.Errorf("record props: %v", root.Props)
+	}
+	if root.Props["custom.num"] != float64(42) {
+		t.Errorf("record num prop: %v", root.Props["custom.num"])
+	}
+	if root.Fields[0].Props["custom.field"] != true {
+		t.Errorf("field props: %v", root.Fields[0].Props)
+	}
+}

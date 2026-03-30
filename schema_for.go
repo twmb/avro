@@ -1,34 +1,37 @@
 package avro
 
 import (
-	"encoding"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"reflect"
 	"strings"
-	"time"
 )
 
-// SchemaOpt configures [SchemaFor].
-type SchemaOpt func(*schemaOpts)
+// SchemaOpt configures schema construction via [Parse], [SchemaCache.Parse],
+// or [SchemaFor]. Inapplicable options are silently ignored.
+type SchemaOpt interface{ schemaOpt() }
 
 type schemaOpts struct {
 	namespace string
 	name      string
 }
 
-// WithNamespace sets the Avro namespace for the top-level record.
-func WithNamespace(ns string) SchemaOpt {
-	return func(o *schemaOpts) { o.namespace = ns }
-}
+type withNamespace string
 
-// WithName overrides the Avro record name. By default the Go struct name
-// is used. This is useful for schema evolution when a Go struct is renamed
-// but the Avro record name must stay the same.
-func WithName(name string) SchemaOpt {
-	return func(o *schemaOpts) { o.name = name }
-}
+func (withNamespace) schemaOpt() {}
+
+// WithNamespace sets the Avro namespace for the top-level record in
+// [SchemaFor]. Ignored by [Parse].
+func WithNamespace(ns string) SchemaOpt { return withNamespace(ns) }
+
+type withName string
+
+func (withName) schemaOpt() {}
+
+// WithName overrides the Avro record name in [SchemaFor]. By default
+// the Go struct name is used. Ignored by [Parse].
+func WithName(name string) SchemaOpt { return withName(name) }
 
 // SchemaFor infers an Avro schema from the Go type T. T must be a struct.
 //
@@ -65,8 +68,16 @@ func WithName(name string) SchemaOpt {
 //   - [16]byte with uuid tag → string with uuid logical type
 func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	var o schemaOpts
-	for _, fn := range opts {
-		fn(&o)
+	var customTypes []CustomType
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case withNamespace:
+			o.namespace = string(v)
+		case withName:
+			o.name = string(v)
+		case CustomType:
+			customTypes = append(customTypes, v)
+		}
 	}
 	t := reflect.TypeFor[T]()
 	if t.Kind() == reflect.Pointer {
@@ -80,7 +91,7 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 		name = t.Name()
 	}
 	seen := make(map[reflect.Type]string)
-	s, err := inferRecord(t, name, o.namespace, seen)
+	s, err := inferRecord(t, name, o.namespace, seen, customTypes)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +99,7 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	if err != nil {
 		return nil, fmt.Errorf("avro: marshaling inferred schema: %w", err)
 	}
-	return Parse(string(b))
+	return Parse(string(b), opts...)
 }
 
 // MustSchemaFor is like [SchemaFor] but panics on error.
@@ -103,7 +114,7 @@ func MustSchemaFor[T any](opts ...SchemaOpt) *Schema {
 // inferRecord builds a schema map for a struct type. The seen map tracks
 // types currently being defined (for recursion detection) and types that
 // have already been fully defined (for reuse as named references).
-func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]string) (any, error) {
+func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]string, customTypes []CustomType) (any, error) {
 	if fullName, ok := seen[t]; ok {
 		if fullName == "" {
 			// Currently being defined — this is a recursive type.
@@ -125,7 +136,7 @@ func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]s
 
 	avroFields := make([]map[string]any, 0, len(fields))
 	for _, f := range fields {
-		af, err := inferField(f, namespace, seen)
+		af, err := inferField(f, namespace, seen, customTypes)
 		if err != nil {
 			return nil, fmt.Errorf("avro: field %q: %w", f.name, err)
 		}
@@ -344,19 +355,17 @@ func parseSchemaTag(sf reflect.StructField, parts []string, index []int) (schema
 }
 
 var (
-	timeTimeType     = reflect.TypeFor[time.Time]()
-	timeDurationType = reflect.TypeFor[time.Duration]()
-	bigRatPtrType    = reflect.TypeFor[*big.Rat]()
-	bigRatValueType  = reflect.TypeFor[big.Rat]()
+	bigRatPtrType   = reflect.TypeFor[*big.Rat]()
+	bigRatValueType = reflect.TypeFor[big.Rat]()
 )
 
 // inferField builds the Avro field definition for a single struct field.
-func inferField(f schemaField, namespace string, seen map[reflect.Type]string) (map[string]any, error) {
+func inferField(f schemaField, namespace string, seen map[reflect.Type]string, customTypes []CustomType) (map[string]any, error) {
 	fieldDef := map[string]any{
 		"name": f.name,
 	}
 
-	schema, err := inferType(f.goType, f.logical, f.decimal, namespace, seen)
+	schema, err := inferType(f.goType, f.logical, f.decimal, namespace, seen, customTypes)
 	if err != nil {
 		return nil, err
 	}
@@ -378,10 +387,27 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string) (
 }
 
 // inferType returns the Avro schema for a Go type.
-func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]string) (any, error) {
+func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]string, customTypes []CustomType) (any, error) {
+	// Check custom types before anything else (including pointer unwrapping).
+	for _, ct := range customTypes {
+		if ct.GoType != nil && ct.GoType == t {
+			if ct.Schema != nil {
+				return ct.Schema.toJSON(), nil
+			}
+			if ct.AvroType == "" {
+				return nil, fmt.Errorf("avro: CustomType for %s has no AvroType or Schema; cannot infer schema (set AvroType or Schema for SchemaFor)", t)
+			}
+			schema := map[string]any{"type": ct.AvroType}
+			if ct.LogicalType != "" {
+				schema["logicalType"] = ct.LogicalType
+			}
+			return schema, nil
+		}
+	}
+
 	// Pointer → nullable union.
 	if t.Kind() == reflect.Pointer {
-		inner, err := inferType(t.Elem(), logical, decimal, namespace, seen)
+		inner, err := inferType(t.Elem(), logical, decimal, namespace, seen, customTypes)
 		if err != nil {
 			return nil, err
 		}
@@ -390,7 +416,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 
 	// Logical types for known Go types.
 	switch t {
-	case timeTimeType:
+	case timeType:
 		lt := logical
 		if lt == "" {
 			lt = "timestamp-millis"
@@ -401,7 +427,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}
 		return map[string]any{"type": base, "logicalType": lt}, nil
 
-	case timeDurationType:
+	case durationType:
 		lt := logical
 		if lt == "" {
 			lt = "time-millis"
@@ -429,12 +455,13 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		return map[string]any{"type": "string", "logicalType": "uuid"}, nil
 	}
 
-	// Types implementing standard string interfaces are inferred as
-	// string, matching the encoder's behavior.
+	// Types implementing text interfaces are inferred as string,
+	// matching the encoder (TextAppender/TextMarshaler) and decoder
+	// (TextUnmarshaler) behavior.
 	for _, iface := range []reflect.Type{
-		reflect.TypeFor[encoding.TextMarshaler](),
-		reflect.TypeFor[encoding.TextAppender](),
-		reflect.TypeFor[fmt.Stringer](),
+		textAppenderType,
+		textMarshalerType,
+		textUnmarshalerType,
 	} {
 		if t.Implements(iface) || reflect.PointerTo(t).Implements(iface) {
 			return "string", nil
@@ -461,7 +488,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if t.Elem().Kind() == reflect.Uint8 {
 			return "bytes", nil
 		}
-		items, err := inferType(t.Elem(), "", [2]int{}, namespace, seen)
+		items, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes)
 		if err != nil {
 			return nil, err
 		}
@@ -483,7 +510,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 				"size": t.Len(),
 			}, nil
 		}
-		items, err := inferType(t.Elem(), "", [2]int{}, namespace, seen)
+		items, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes)
 		if err != nil {
 			return nil, err
 		}
@@ -493,7 +520,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if t.Key().Kind() != reflect.String {
 			return nil, fmt.Errorf("map key must be string, got %s", t.Key())
 		}
-		values, err := inferType(t.Elem(), "", [2]int{}, namespace, seen)
+		values, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes)
 		if err != nil {
 			return nil, err
 		}
@@ -504,7 +531,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if name == "" {
 			return nil, fmt.Errorf("anonymous struct types are not supported; use a named type")
 		}
-		return inferRecord(t, name, namespace, seen)
+		return inferRecord(t, name, namespace, seen, customTypes)
 
 	default:
 		return nil, fmt.Errorf("unsupported Go type %s", t)

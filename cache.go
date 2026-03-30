@@ -29,27 +29,25 @@ import (
 // independent of the cache — it can be used for [Schema.Encode] and
 // [Schema.Decode] without the cache.
 //
-// A SchemaCache is safe for concurrent use.
+// The zero value is ready to use. A SchemaCache is safe for concurrent use.
 type SchemaCache struct {
-	mu    sync.Mutex
-	named map[string]*namedType
-	dedup map[[32]byte]*Schema
-}
-
-// NewSchemaCache returns a new empty SchemaCache.
-func NewSchemaCache() *SchemaCache {
-	return &SchemaCache{
-		named: make(map[string]*namedType),
-		dedup: make(map[[32]byte]*Schema),
-	}
+	mu          sync.Mutex
+	named       map[string]*namedType
+	dedup       map[[32]byte]*Schema
+	customParsed map[[32]byte]bool // schemas previously parsed with custom types
 }
 
 // Parse parses a schema string, registering any named types (records, enums,
 // fixed) in the cache. Named types from previous Parse calls are available
 // for reference resolution. On failure, the cache is not modified.
-func (c *SchemaCache) Parse(schema string, opts ...ParseOpt) (*Schema, error) {
+func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.named == nil {
+		c.named = make(map[string]*namedType)
+		c.dedup = make(map[[32]byte]*Schema)
+		c.customParsed = make(map[[32]byte]bool)
+	}
 
 	dec := json.NewDecoder(strings.NewReader(schema))
 	dec.UseNumber()
@@ -59,24 +57,48 @@ func (c *SchemaCache) Parse(schema string, opts ...ParseOpt) (*Schema, error) {
 			schema = string(normalized)
 		}
 	}
+	// Clone the cache's map so a failed parse doesn't corrupt the cache.
+	cloned := maps.Clone(c.named)
+	b := &builder{
+		named: cloned,
+	}
+	applySchemaOpts(b, opts)
+	hasCustomTypes := len(b.customTypes) > 0
+
+	// Skip dedup when custom types are registered: custom types produce
+	// different compiled schemas for the same schema string.
 	h := sha256.Sum256([]byte(schema))
-	if s, ok := c.dedup[h]; ok {
-		return s, nil
+	if !hasCustomTypes {
+		if s, ok := c.dedup[h]; ok {
+			return s, nil
+		}
 	}
 
-	// Clone the cache's map so a failed parse doesn't corrupt the cache.
-	b := &builder{
-		named: maps.Clone(c.named),
+	// Allow re-registration of inherited names when re-parsing a schema
+	// that was previously parsed with custom types (which skipped dedup),
+	// or when parsing with custom types now. This preserves the
+	// "duplicate named type" error for genuinely conflicting definitions.
+	needsCachedNames := hasCustomTypes || c.customParsed[h]
+	if needsCachedNames && len(cloned) > 0 {
+		b.cachedNames = make(map[string]bool, len(cloned))
+		for name := range cloned {
+			b.cachedNames[name] = true
+		}
 	}
-	applyParseOpts(b, opts)
 
 	s, err := parse(schema, b)
 	if err != nil {
 		return nil, err
 	}
 
-	// Success: the builder's map is a superset of the cache's.
+	// Named types are safe to cache unconditionally: applyCustomTypes
+	// wraps b.ser/b.deser without mutating the node's ser/deser, so
+	// cached named type nodes keep their unwrapped functions.
 	c.named = b.named
-	c.dedup[h] = s
+	if hasCustomTypes {
+		c.customParsed[h] = true
+	} else {
+		c.dedup[h] = s
+	}
 	return s, nil
 }

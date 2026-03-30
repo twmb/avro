@@ -1123,6 +1123,51 @@ func TestResolveReaderUnionWriterNonUnion(t *testing.T) {
 	}
 }
 
+func TestResolveReaderUnionTaggedUnions(t *testing.T) {
+	// Writer is "string", reader is ["null","string"].
+	// Schema evolution: writer non-union → reader union.
+	// TaggedUnions should wrap the result.
+	writer, err := Parse(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`["null","string"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode("hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Without TaggedUnions: bare value.
+	var bare any
+	if _, err := resolved.Decode(encoded, &bare); err != nil {
+		t.Fatal(err)
+	}
+	if bare != "hello" {
+		t.Fatalf("bare: expected \"hello\", got %v (%T)", bare, bare)
+	}
+
+	// With TaggedUnions: wrapped value.
+	var tagged any
+	if _, err := resolved.Decode(encoded, &tagged, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	wrapper, ok := tagged.(map[string]any)
+	if !ok {
+		t.Fatalf("tagged: expected map wrapper, got %T: %v", tagged, tagged)
+	}
+	if wrapper["string"] != "hello" {
+		t.Fatalf("tagged: expected {\"string\":\"hello\"}, got %v", wrapper)
+	}
+}
+
 // --- Direct skip function error path tests ---
 
 func TestSkipBooleanShortBuffer(t *testing.T) {
@@ -1647,7 +1692,7 @@ func TestResolveEnumIdentity(t *testing.T) {
 	// Make canonical forms different so Resolve doesn't short-circuit.
 	// Actually they'll be the same... so we need to use the resolveEnum directly.
 	// Let's test via resolveEnum.
-	resolved, err := resolveEnum(reader.node, writer.node)
+	resolved, err := resolveEnum(reader.node, writer.node, &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1751,7 +1796,7 @@ func TestResolveArrayIdentity(t *testing.T) {
 	r := &schemaNode{kind: "int", deser: nil}
 	rArr := &schemaNode{kind: "array", items: r}
 	// resolveArray with same items node.
-	resolved, err := resolveArray(rArr, rArr, "", make(map[nodePair]*schemaNode))
+	resolved, err := resolveArray(rArr, rArr, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1763,7 +1808,7 @@ func TestResolveArrayIdentity(t *testing.T) {
 func TestResolveMapIdentity(t *testing.T) {
 	r := &schemaNode{kind: "string", deser: nil}
 	rMap := &schemaNode{kind: "map", values: r}
-	resolved, err := resolveMap(rMap, rMap, "", make(map[nodePair]*schemaNode))
+	resolved, err := resolveMap(rMap, rMap, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2448,7 +2493,7 @@ func TestDoResolveFixed(t *testing.T) {
 	// because fixed schemas with same name/size have identical canonical forms).
 	r := &schemaNode{kind: "fixed", name: "F", size: 4}
 	w := &schemaNode{kind: "fixed", name: "F", size: 4}
-	resolved, err := doResolve(r, w, "", make(map[nodePair]*schemaNode))
+	resolved, err := doResolve(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2461,7 +2506,7 @@ func TestDoResolveIncompatible(t *testing.T) {
 	// Call doResolve directly for incompatible types.
 	r := &schemaNode{kind: "int"}
 	w := &schemaNode{kind: "string"}
-	_, err := doResolve(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := doResolve(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for incompatible types")
 	}
@@ -2471,7 +2516,7 @@ func TestResolveNodeError(t *testing.T) {
 	// Call resolveNode directly to trigger the doResolve error path.
 	r := &schemaNode{kind: "int"}
 	w := &schemaNode{kind: "boolean"}
-	_, err := resolveNode(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveNode(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for incompatible types")
 	}
@@ -2491,7 +2536,7 @@ func TestResolveRecordFieldError(t *testing.T) {
 			{name: "a", node: &schemaNode{kind: "boolean"}},
 		},
 	}
-	_, err := resolveRecord(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveRecord(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for incompatible field types")
 	}
@@ -2509,7 +2554,7 @@ func TestResolveRecordDefaultError(t *testing.T) {
 		kind: "record", name: "R",
 		fields: nil,
 	}
-	_, err := resolveRecord(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveRecord(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for bad default value")
 	}
@@ -2519,7 +2564,7 @@ func TestResolveEnumNoDefault(t *testing.T) {
 	// Call resolveEnum directly: writer has symbol not in reader, no default.
 	r := &schemaNode{kind: "enum", name: "E", symbols: []string{"A", "B"}}
 	w := &schemaNode{kind: "enum", name: "E", symbols: []string{"A", "B", "C"}}
-	_, err := resolveEnum(r, w)
+	_, err := resolveEnum(r, w, &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for writer symbol not in reader")
 	}
@@ -2529,7 +2574,7 @@ func TestResolveEnumBadDefault(t *testing.T) {
 	// Call resolveEnum directly: reader has default not in its own symbols.
 	r := &schemaNode{kind: "enum", name: "E", symbols: []string{"A", "B"}, enumDef: "MISSING", hasEnumDef: true}
 	w := &schemaNode{kind: "enum", name: "E", symbols: []string{"A", "B", "C"}}
-	_, err := resolveEnum(r, w)
+	_, err := resolveEnum(r, w, &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for invalid enum default")
 	}
@@ -2539,7 +2584,7 @@ func TestResolveArrayError(t *testing.T) {
 	// Call resolveArray directly with incompatible items.
 	r := &schemaNode{kind: "array", items: &schemaNode{kind: "int"}}
 	w := &schemaNode{kind: "array", items: &schemaNode{kind: "boolean"}}
-	_, err := resolveArray(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveArray(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for incompatible array items")
 	}
@@ -2549,7 +2594,7 @@ func TestResolveMapError(t *testing.T) {
 	// Call resolveMap directly with incompatible values.
 	r := &schemaNode{kind: "map", values: &schemaNode{kind: "int"}}
 	w := &schemaNode{kind: "map", values: &schemaNode{kind: "boolean"}}
-	_, err := resolveMap(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveMap(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for incompatible map values")
 	}
@@ -2561,7 +2606,7 @@ func TestResolveWriterUnionError(t *testing.T) {
 	w := &schemaNode{kind: "union", branches: []*schemaNode{
 		{kind: "boolean"},
 	}}
-	_, err := resolveWriterUnion(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveWriterUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for incompatible writer union branch")
 	}
@@ -2574,7 +2619,7 @@ func TestResolveReaderUnionError(t *testing.T) {
 		{kind: "int"},
 	}}
 	w := &schemaNode{kind: "boolean"}
-	_, err := resolveReaderUnion(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveReaderUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for no matching reader union branch")
 	}
@@ -2590,7 +2635,7 @@ func TestResolveReaderUnionBranchError(t *testing.T) {
 	w := &schemaNode{kind: "record", name: "R", fields: []fieldNode{
 		{name: "a", node: &schemaNode{kind: "boolean"}},
 	}}
-	_, err := resolveReaderUnion(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveReaderUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for incompatible record in reader union")
 	}
@@ -2605,7 +2650,7 @@ func TestResolveUnionUnionNoMatch(t *testing.T) {
 	w := &schemaNode{kind: "union", branches: []*schemaNode{
 		{kind: "boolean"},
 	}}
-	_, err := resolveUnionUnion(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveUnionUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for unmatched writer union branch")
 	}
@@ -2623,7 +2668,7 @@ func TestResolveUnionUnionBranchError(t *testing.T) {
 			{name: "a", node: &schemaNode{kind: "boolean"}},
 		}},
 	}}
-	_, err := resolveUnionUnion(r, w, "", make(map[nodePair]*schemaNode))
+	_, err := resolveUnionUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
 		t.Fatal("expected error for incompatible records in union-union")
 	}

@@ -3,6 +3,7 @@ package avro
 import (
 	"bytes"
 	"encoding"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -313,19 +314,28 @@ func TestRoundTripPrimitives(t *testing.T) {
 		}
 	})
 	t.Run("float", func(t *testing.T) {
-		for _, v := range []float32{0, 1.5, -1.5, math.MaxFloat32, math.SmallestNonzeroFloat32} {
+		for _, v := range []float32{0, 1.5, -1.5, math.MaxFloat32, math.SmallestNonzeroFloat32, float32(math.Inf(1)), float32(math.Inf(-1))} {
 			got := roundTrip(t, `"float"`, v)
 			if got != v {
 				t.Errorf("got %v, want %v", got, v)
 			}
 		}
+		// NaN != NaN, so test separately.
+		got := roundTrip(t, `"float"`, float32(math.NaN()))
+		if !math.IsNaN(float64(got)) {
+			t.Errorf("NaN round-trip: got %v", got)
+		}
 	})
 	t.Run("double", func(t *testing.T) {
-		for _, v := range []float64{0, 1.5, -1.5, math.MaxFloat64, math.SmallestNonzeroFloat64} {
+		for _, v := range []float64{0, 1.5, -1.5, math.MaxFloat64, math.SmallestNonzeroFloat64, math.Inf(1), math.Inf(-1)} {
 			got := roundTrip(t, `"double"`, v)
 			if got != v {
 				t.Errorf("got %v, want %v", got, v)
 			}
+		}
+		got := roundTrip(t, `"double"`, math.NaN())
+		if !math.IsNaN(got) {
+			t.Errorf("NaN round-trip: got %v", got)
 		}
 	})
 	t.Run("bytes", func(t *testing.T) {
@@ -689,7 +699,7 @@ func TestRoundTripRecursive(t *testing.T) {
 
 func TestRoundTripInterface(t *testing.T) {
 	type Iface struct {
-		S stringer `avro:"s"`
+		S fmt.Stringer `avro:"s"`
 	}
 	schema := `{
 		"type": "record",
@@ -850,7 +860,6 @@ func TestDecodeTypeMismatch(t *testing.T) {
 		{"int into bool", `"int"`, []byte{0x36}, new(false)},
 		{"string into int", `"string"`, []byte{0x06, 0x66, 0x6f, 0x6f}, new(int32(0))},
 		{"int into float", `"int"`, []byte{0x36}, new(float32(0))},
-		{"bytes into string", `"bytes"`, []byte{0x04, 0x01, 0x02}, new("")},
 		{"fixed into int array", `{"type":"fixed","name":"f","size":6}`, []byte{1, 2, 3, 4, 5, 6}, new([6]int{})},
 		{"array into string", `{"type":"array","items":"int"}`, []byte{0x00}, new("")},
 		{"map into string", `{"type":"map","values":"int"}`, []byte{0x00}, new("")},
@@ -6625,9 +6634,9 @@ func TestDeserStringTextUnmarshaler(t *testing.T) {
 	}
 }
 
-func TestTextUnmarshalerRoundTrip(t *testing.T) {
+func TestTextMarshalerRoundTrip(t *testing.T) {
 	type R struct {
-		Name textMarshalerType `avro:"name"`
+		Name testTextMarshaler `avro:"name"`
 	}
 	type RD struct {
 		Name testTextUnmarshaler `avro:"name"`
@@ -6638,14 +6647,13 @@ func TestTextUnmarshalerRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := R{Name: textMarshalerType{val: "world"}}
+	input := R{Name: testTextMarshaler{val: "world"}}
 	encoded, err := s.AppendEncode(nil, &input)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 	var output RD
-	_, err = s.Decode(encoded, &output)
-	if err != nil {
+	if _, err = s.Decode(encoded, &output); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if output.Name.val != "unmarshaled:world" {
@@ -6803,17 +6811,17 @@ func TestSemanticErrorFormat(t *testing.T) {
 		{
 			"full",
 			&SemanticError{GoType: reflect.TypeFor[int](), AvroType: "string", Field: "name", Err: fmt.Errorf("oops")},
-			"avro: field name: cannot use Go type int with Avro type string: oops",
+			"avro: field name: cannot use int with Avro type string: oops",
 		},
 		{
 			"no field",
 			&SemanticError{GoType: reflect.TypeFor[string](), AvroType: "int"},
-			"avro: cannot use Go type string with Avro type int",
+			"avro: cannot use string with Avro type int",
 		},
 		{
 			"go type only",
 			&SemanticError{GoType: reflect.TypeFor[bool]()},
-			"avro: unsupported Go type bool",
+			"avro: unsupported type bool",
 		},
 		{
 			"avro type only",
@@ -7908,12 +7916,12 @@ func TestTimestampNanosDecodeIntoInterface(t *testing.T) {
 	encoded := encode(t, schema, &now)
 	var v any
 	decode(t, schema, encoded, &v)
-	got, ok := v.(int64)
+	got, ok := v.(time.Time)
 	if !ok {
-		t.Fatalf("expected int64, got %T", v)
+		t.Fatalf("expected time.Time, got %T", v)
 	}
-	if got != now.UnixNano() {
-		t.Fatalf("got %d, want %d", got, now.UnixNano())
+	if got.UnixNano() != now.UnixNano() {
+		t.Fatalf("got %v, want %v", got, now)
 	}
 }
 
@@ -8336,12 +8344,13 @@ func TestBytesDecimalDeserInterface(t *testing.T) {
 	if len(rem) != 0 {
 		t.Fatalf("leftover: %d", len(rem))
 	}
-	got, ok := out.(*big.Rat)
+	// Decoding into any produces json.Number for json.Marshal compatibility.
+	got, ok := out.(json.Number)
 	if !ok {
-		t.Fatalf("expected *big.Rat, got %T", out)
+		t.Fatalf("expected json.Number, got %T", out)
 	}
-	if got.Cmp(r) != 0 {
-		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	if string(got) != "123.45" {
+		t.Fatalf("got %s, want 123.45", got)
 	}
 }
 
@@ -8364,12 +8373,12 @@ func TestFixedDecimalDeserInterface(t *testing.T) {
 	if len(rem) != 0 {
 		t.Fatalf("leftover: %d", len(rem))
 	}
-	got, ok := out.(*big.Rat)
+	got, ok := out.(json.Number)
 	if !ok {
-		t.Fatalf("expected *big.Rat, got %T", out)
+		t.Fatalf("expected json.Number, got %T", out)
 	}
-	if got.Cmp(r) != 0 {
-		t.Fatalf("got %s, want %s", got.RatString(), r.RatString())
+	if string(got) != "123.45" {
+		t.Fatalf("got %s, want 123.45", got)
 	}
 }
 
@@ -9197,5 +9206,27 @@ func TestFixedSliceRoundTrip(t *testing.T) {
 	got := roundTrip(t, schema, R{Data: []byte{0xDE, 0xAD, 0xBE, 0xEF}})
 	if len(got.Data) != 4 || got.Data[0] != 0xDE || got.Data[3] != 0xEF {
 		t.Fatalf("unexpected data: %x", got.Data)
+	}
+}
+
+func TestSetLongValueInterface(t *testing.T) {
+	var v any
+	rv := reflect.ValueOf(&v).Elem()
+	if err := setLongValue(rv, 42); err != nil {
+		t.Fatal(err)
+	}
+	if v.(int64) != 42 {
+		t.Errorf("got %v", v)
+	}
+}
+
+func TestSetIntValueInterface(t *testing.T) {
+	var v any
+	rv := reflect.ValueOf(&v).Elem()
+	if err := setIntValue(rv, 7); err != nil {
+		t.Fatal(err)
+	}
+	if v.(int32) != 7 {
+		t.Errorf("got %v", v)
 	}
 }
