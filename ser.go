@@ -67,14 +67,8 @@ func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
 // T is index 1 (byte 2).
 func serNullUnion(u *serUnion) serfn {
 	return func(dst []byte, v reflect.Value) ([]byte, error) {
-		if !v.IsValid() {
+		if isNilValue(v) {
 			return append(dst, 0), nil
-		}
-		switch v.Kind() {
-		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
-			if v.IsNil() {
-				return append(dst, 0), nil
-			}
 		}
 		return u.fns[1](append(dst, 2), v)
 	}
@@ -84,16 +78,32 @@ func serNullUnion(u *serUnion) serfn {
 // null is index 1 (byte 2).
 func serNullSecondUnion(u *serUnion) serfn {
 	return func(dst []byte, v reflect.Value) ([]byte, error) {
-		if !v.IsValid() {
+		if isNilValue(v) {
 			return append(dst, 2), nil
 		}
-		switch v.Kind() {
-		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
-			if v.IsNil() {
-				return append(dst, 2), nil
-			}
-		}
 		return u.fns[0](append(dst, 0), v)
+	}
+}
+
+// isNilValue reports whether v is nil, peeling through pointer and
+// interface layers. This handles the case where AppendEncode receives
+// &nilPtr (a **T with non-nil outer pointer) for a nullable union.
+func isNilValue(v reflect.Value) bool {
+	if !v.IsValid() {
+		return true
+	}
+	for {
+		switch v.Kind() {
+		case reflect.Pointer, reflect.Interface:
+			if v.IsNil() {
+				return true
+			}
+			v = v.Elem()
+		case reflect.Map, reflect.Slice:
+			return v.IsNil()
+		default:
+			return false
+		}
 	}
 }
 
