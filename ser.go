@@ -23,6 +23,8 @@ type serfn func([]byte, reflect.Value) ([]byte, error)
 //   - RFC 3339 strings for timestamp and date logical types
 //   - [*big.Rat], [big.Rat], float64, [encoding/json.Number], and numeric strings for decimal logical types
 //   - [encoding.TextAppender], [encoding.TextMarshaler], and []byte for string types (and vice versa for [encoding.TextUnmarshaler])
+//   - Tagged union maps (map[string]any{"typeName": value}) for union types,
+//     as produced by [Schema.Decode] with [TaggedUnions]
 func (s *Schema) AppendEncode(dst []byte, v any, opts ...Opt) ([]byte, error) {
 	return s.ser(dst, reflect.ValueOf(v))
 }
@@ -37,12 +39,37 @@ func (s *Schema) Encode(v any, opts ...Opt) ([]byte, error) {
 ///////////
 
 type serUnion struct {
-	fns []serfn
+	fns         []serfn
+	branchNames map[string]int // branch name → index for tagged union map unwrapping
 }
 
-// ser tries each branch in order: write the branch index, attempt the
-// encode, and backtrack (reset dst) if it fails.
+// tryUnwrapTagged checks if v is a single-key map whose key matches a
+// branch name. Returns the branch index and unwrapped value on match.
+func (s *serUnion) tryUnwrapTagged(v reflect.Value) (int, reflect.Value, bool) {
+	if v.Kind() == reflect.Interface && !v.IsNil() {
+		v = v.Elem()
+	}
+	if !v.IsValid() || v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String || v.Len() != 1 {
+		return 0, v, false
+	}
+	iter := v.MapRange()
+	iter.Next()
+	if idx, ok := s.branchNames[iter.Key().String()]; ok {
+		return idx, iter.Value(), true
+	}
+	return 0, v, false
+}
+
+// ser encodes a union value. Tagged union maps are tried first; if
+// that fails or v is not a tagged map, each branch is tried in order.
 func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
+	if idx, inner, ok := s.tryUnwrapTagged(v); ok {
+		attempt := appendVarint(dst, int32(idx))
+		if result, err := s.fns[idx](attempt, inner); err == nil {
+			return result, nil
+		}
+	}
+
 	base := dst
 	var err error
 	for i, fn := range s.fns {
@@ -70,6 +97,16 @@ func serNullUnion(u *serUnion) serfn {
 		if isNilValue(v) {
 			return append(dst, 0), nil
 		}
+		if idx, inner, ok := u.tryUnwrapTagged(v); ok {
+			if idx == 0 && isNilValue(inner) {
+				return append(dst, 0), nil
+			}
+			if idx == 1 {
+				if result, err := u.fns[1](append(dst, 2), inner); err == nil {
+					return result, nil
+				}
+			}
+		}
 		return u.fns[1](append(dst, 2), v)
 	}
 }
@@ -80,6 +117,16 @@ func serNullSecondUnion(u *serUnion) serfn {
 	return func(dst []byte, v reflect.Value) ([]byte, error) {
 		if isNilValue(v) {
 			return append(dst, 2), nil
+		}
+		if idx, inner, ok := u.tryUnwrapTagged(v); ok {
+			if idx == 1 && isNilValue(inner) {
+				return append(dst, 2), nil
+			}
+			if idx == 0 {
+				if result, err := u.fns[0](append(dst, 0), inner); err == nil {
+					return result, nil
+				}
+			}
 		}
 		return u.fns[0](append(dst, 0), v)
 	}

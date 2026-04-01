@@ -334,6 +334,282 @@ func TestSerNullGenericUnionNonNilable(t *testing.T) {
 	}
 }
 
+func TestSerTaggedUnionMap(t *testing.T) {
+	// Encode should accept the tagged union format {"typeName": value}
+	// that Decode with TaggedUnions produces.
+	s, err := Parse(`["null","string","int"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name  string
+		input any
+		want  any
+	}{
+		{"tagged string", map[string]any{"string": "hello"}, "hello"},
+		{"tagged int", map[string]any{"int": int32(42)}, int32(42)},
+		{"tagged null", map[string]any{"null": nil}, nil},
+		{"bare string", "hello", "hello"},
+		{"bare int", int32(42), int32(42)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bin, err := s.Encode(tt.input)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var out any
+			if _, err := s.Decode(bin, &out); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if out != tt.want {
+				t.Fatalf("got %v (%T), want %v (%T)", out, out, tt.want, tt.want)
+			}
+		})
+	}
+}
+
+func TestSerTaggedUnionNullUnion(t *testing.T) {
+	// The common ["null", T] fast path should also handle tagged maps.
+	s, err := Parse(`["null","string"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tagged := map[string]any{"string": "hello"}
+	bin, err := s.Encode(tagged)
+	if err != nil {
+		t.Fatalf("encode tagged: %v", err)
+	}
+	var out any
+	if _, err := s.Decode(bin, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out != "hello" {
+		t.Fatalf("got %v, want hello", out)
+	}
+
+	tagged = map[string]any{"null": nil}
+	bin, err = s.Encode(tagged)
+	if err != nil {
+		t.Fatalf("encode tagged null: %v", err)
+	}
+	if _, err := s.Decode(bin, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out != nil {
+		t.Fatalf("got %v, want nil", out)
+	}
+}
+
+func TestSerTaggedUnionRoundTrip(t *testing.T) {
+	// Decode with TaggedUnions → Encode should round-trip.
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"id","type":"long"},
+		{"name":"payload","type":["null","string","int"]}
+	]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := map[string]any{"id": int64(1), "payload": "hello"}
+	bin1, err := s.Encode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Decode with tagged unions.
+	var native any
+	if _, err := s.Decode(bin1, &native, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	// native.payload is now map[string]any{"string": "hello"}.
+	// Re-encode should work.
+	bin2, err := s.Encode(native)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	if string(bin1) != string(bin2) {
+		t.Fatalf("round-trip mismatch: %x vs %x", bin1, bin2)
+	}
+}
+
+func TestSerTaggedUnionNullSecondUnion(t *testing.T) {
+	// The ["T", "null"] fast path should also handle tagged maps.
+	s, err := Parse(`["string","null"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name  string
+		input any
+		want  any
+	}{
+		{"tagged string", map[string]any{"string": "hello"}, "hello"},
+		{"tagged null", map[string]any{"null": nil}, nil},
+		{"bare string", "hello", "hello"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bin, err := s.Encode(tt.input)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var out any
+			if _, err := s.Decode(bin, &out); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if out != tt.want {
+				t.Fatalf("got %v (%T), want %v (%T)", out, out, tt.want, tt.want)
+			}
+		})
+	}
+}
+
+func TestSerTaggedUnionNested(t *testing.T) {
+	t.Run("array of unions", func(t *testing.T) {
+		s, err := Parse(`{"type":"array","items":["null","string","int"]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := []any{"hello", int32(42), nil}
+		bin, err := s.Encode(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Decode with tagged unions, re-encode.
+		var native any
+		if _, err := s.Decode(bin, &native, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		// native is []any with tagged maps.
+		arr := native.([]any)
+		if _, ok := arr[0].(map[string]any); !ok {
+			t.Fatalf("expected tagged map, got %T", arr[0])
+		}
+		bin2, err := s.Encode(native)
+		if err != nil {
+			t.Fatalf("re-encode: %v", err)
+		}
+		if string(bin) != string(bin2) {
+			t.Fatalf("round-trip mismatch: %x vs %x", bin, bin2)
+		}
+	})
+
+	t.Run("map of unions", func(t *testing.T) {
+		s, err := Parse(`{"type":"map","values":["null","string","int"]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]any{"a": "hello", "b": int32(42)}
+		bin, err := s.Encode(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var native any
+		if _, err := s.Decode(bin, &native, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		bin2, err := s.Encode(native)
+		if err != nil {
+			t.Fatalf("re-encode: %v", err)
+		}
+		// Map iteration order is non-deterministic, so compare decoded values.
+		var decoded any
+		if _, err := s.Decode(bin2, &decoded); err != nil {
+			t.Fatalf("decode re-encoded: %v", err)
+		}
+		m := decoded.(map[string]any)
+		if m["a"] != "hello" || m["b"] != int32(42) {
+			t.Fatalf("got %v, want {a:hello, b:42}", m)
+		}
+	})
+
+	t.Run("nested record", func(t *testing.T) {
+		s, err := Parse(`{"type":"record","name":"Outer","fields":[
+			{"name":"inner","type":{"type":"record","name":"Inner","fields":[
+				{"name":"v","type":["null","string"]}
+			]}}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]any{"inner": map[string]any{"v": "hello"}}
+		bin, err := s.Encode(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var native any
+		if _, err := s.Decode(bin, &native, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		bin2, err := s.Encode(native)
+		if err != nil {
+			t.Fatalf("re-encode: %v", err)
+		}
+		if string(bin) != string(bin2) {
+			t.Fatalf("round-trip mismatch: %x vs %x", bin, bin2)
+		}
+	})
+
+	t.Run("record union with logical names", func(t *testing.T) {
+		s, err := Parse(`{"type":"record","name":"R","fields":[
+			{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := map[string]any{"ts": time.UnixMilli(1700000000000).UTC()}
+		bin, err := s.Encode(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// TagLogicalTypes produces "long.timestamp-millis" as branch name.
+		var native any
+		if _, err := s.Decode(bin, &native, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatal(err)
+		}
+		m := native.(map[string]any)
+		tsMap := m["ts"].(map[string]any)
+		if _, ok := tsMap["long.timestamp-millis"]; !ok {
+			t.Fatalf("expected logical branch name, got %v", tsMap)
+		}
+		// Re-encode with the logical branch name.
+		bin2, err := s.Encode(native)
+		if err != nil {
+			t.Fatalf("re-encode: %v", err)
+		}
+		if string(bin) != string(bin2) {
+			t.Fatalf("round-trip mismatch: %x vs %x", bin, bin2)
+		}
+	})
+}
+
+func TestSerTaggedUnionMapBranchFallback(t *testing.T) {
+	// A map with a key that matches a branch name but whose value fails
+	// to encode on that branch should fall back to trying the map as a
+	// raw value on other branches.
+	s, err := Parse(`["null",{"type":"map","values":"string"},"int"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Key "int" matches the int branch, but the value "not-an-int"
+	// fails on the int branch. The map should then be tried on the
+	// map branch as a one-entry map.
+	data := map[string]any{"int": "not-an-int"}
+	bin, err := s.Encode(data)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var out any
+	if _, err := s.Decode(bin, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m, ok := out.(map[string]any)
+	if !ok || m["int"] != "not-an-int" {
+		t.Fatalf("got %v, want map with int→not-an-int", out)
+	}
+}
+
 type testTextMarshaler struct{ val string }
 
 func (tm testTextMarshaler) MarshalText() ([]byte, error) { return []byte(tm.val), nil }

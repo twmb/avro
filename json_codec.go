@@ -27,8 +27,8 @@ func (taggedUnions) opt() {}
 // union values as map[string]any{branchName: value}.
 //
 // Without this option, union values are bare in all cases.
-// [Schema.DecodeJSON] always accepts both tagged and bare input
-// regardless of this option.
+// [Schema.DecodeJSON] and [Schema.Encode] always accept both tagged
+// and bare union input regardless of this option.
 func TaggedUnions() Opt { return taggedUnions{} }
 
 type tagLogicalTypes struct{}
