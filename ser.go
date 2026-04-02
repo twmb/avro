@@ -26,7 +26,19 @@ type serfn func([]byte, reflect.Value) ([]byte, error)
 //   - Tagged union maps (map[string]any{"typeName": value}) for union types,
 //     as produced by [Schema.Decode] with [TaggedUnions]
 func (s *Schema) AppendEncode(dst []byte, v any, opts ...Opt) ([]byte, error) {
-	return s.ser(dst, reflect.ValueOf(v))
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() {
+		// nil is valid for null schemas and unions (null branch).
+		switch s.node.kind {
+		case "null":
+			return dst, nil
+		case "union":
+			return s.ser(dst, rv)
+		default:
+			return nil, &SemanticError{AvroType: s.node.kind, Err: errors.New("cannot encode nil")}
+		}
+	}
+	return s.ser(dst, rv)
 }
 
 // Encode encodes v as Avro binary. It is shorthand for AppendEncode(nil, v).
@@ -215,21 +227,29 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool) {
 }
 
 // jsonNumberToInt64 converts a json.Number reflect.Value to a validated int64,
-// checking that the value is a whole number within int64 range.
+// checking that the value is a whole number within int64 range. It tries
+// Int64() first for full precision, falling back to Float64() for
+// fractional number detection.
 func jsonNumberToInt64(v reflect.Value) (int64, bool, error) {
-	fv, ok := jsonNumberToFloat(v)
-	if !ok {
+	if v.Type() != jsonNumberType {
 		return 0, false, nil
 	}
-	f := fv.Float()
-	n := math.Trunc(f)
-	if f != n {
+	jn := v.Interface().(json.Number)
+	// Try exact integer parse first — handles the full int64 range
+	// without float64 precision loss.
+	if n, err := jn.Int64(); err == nil {
+		return n, true, nil
+	}
+	// Fall back to float64 to detect fractional values and produce
+	// a clear error.
+	f, err := jn.Float64()
+	if err != nil {
+		return 0, true, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %s is not a valid number", jn)}
+	}
+	if f != math.Trunc(f) {
 		return 0, true, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v is not a whole number", f)}
 	}
-	if n < -(1<<63) || n >= 1<<63 {
-		return 0, true, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
-	}
-	return int64(n), true, nil
+	return 0, true, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %s overflows int64", jn)}
 }
 
 func serInt(dst []byte, v reflect.Value) ([]byte, error) {
@@ -257,6 +277,14 @@ func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		if n < math.MinInt32 || n > math.MaxInt32 {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %v overflows int32", f)}
+		}
+		return appendVarint(dst, int32(n)), nil
+	} else if n, ok, err := jsonNumberToInt64(v); ok {
+		if err != nil {
+			return nil, err
+		}
+		if n < math.MinInt32 || n > math.MaxInt32 {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 		}
 		return appendVarint(dst, int32(n)), nil
 	} else if fv, ok := jsonNumberToFloat(v); ok {
@@ -288,6 +316,11 @@ func serLong(dst []byte, v reflect.Value) ([]byte, error) {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %v overflows int64", f)}
 		}
 		return appendVarlong(dst, int64(n)), nil
+	} else if n, ok, err := jsonNumberToInt64(v); ok {
+		if err != nil {
+			return nil, err
+		}
+		return appendVarlong(dst, n), nil
 	} else if fv, ok := jsonNumberToFloat(v); ok {
 		return serLong(dst, fv)
 	}
@@ -365,6 +398,9 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// json.Number has Kind==String but represents a numeric value.
+	// Reject it here so that union dispatch routes it to numeric
+	// branches instead of silently encoding the text as a string.
 	if v.Type() == jsonNumberType {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 	}
@@ -1219,6 +1255,15 @@ func serTimeMillis(dst []byte, v reflect.Value) ([]byte, error) {
 		ms, err := durationToTimeMillis(time.Duration(v.Int()))
 		if err != nil {
 			return nil, &SemanticError{GoType: durationType, AvroType: "time-millis", Err: err}
+		}
+		return appendVarint(dst, ms), nil
+	}
+	if v.Type() == timeType {
+		t := v.Interface().(time.Time)
+		d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
+		ms, err := durationToTimeMillis(d)
+		if err != nil {
+			return nil, &SemanticError{GoType: timeType, AvroType: "time-millis", Err: err}
 		}
 		return appendVarint(dst, ms), nil
 	}

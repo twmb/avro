@@ -752,6 +752,112 @@ func TestAppendAvroJSONUnknownKind(t *testing.T) {
 	}
 }
 
+func TestEncodeJSONRejectsNonWholeFloat(t *testing.T) {
+	t.Run("int", func(t *testing.T) {
+		s, _ := Parse(`"int"`)
+		_, err := s.EncodeJSON(float64(42.5))
+		if err == nil {
+			t.Fatal("expected error for non-whole float in int field")
+		}
+		b, err := s.EncodeJSON(float64(42.0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "42" {
+			t.Fatalf("got %s", b)
+		}
+	})
+	t.Run("long", func(t *testing.T) {
+		s, _ := Parse(`"long"`)
+		_, err := s.EncodeJSON(float64(42.5))
+		if err == nil {
+			t.Fatal("expected error for non-whole float in long field")
+		}
+		b, err := s.EncodeJSON(float64(42.0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "42" {
+			t.Fatalf("got %s", b)
+		}
+	})
+}
+
+func TestEncodeJSONTaggedUnionMaps(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"T","fields":[
+		{"name":"u","type":["null","int","string"]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Tagged union map should be accepted.
+	out, err := s.EncodeJSON(map[string]any{"u": map[string]any{"int": float64(42)}}, TaggedUnions())
+	if err != nil {
+		t.Fatalf("tagged int: %v", err)
+	}
+	if string(out) != `{"u":{"int":42}}` {
+		t.Fatalf("tagged int: got %s", out)
+	}
+
+	out, err = s.EncodeJSON(map[string]any{"u": map[string]any{"string": "hello"}}, TaggedUnions())
+	if err != nil {
+		t.Fatalf("tagged string: %v", err)
+	}
+	if string(out) != `{"u":{"string":"hello"}}` {
+		t.Fatalf("tagged string: got %s", out)
+	}
+
+	// Without TaggedUnions, tagged maps should still be unwrapped.
+	out, err = s.EncodeJSON(map[string]any{"u": map[string]any{"int": float64(7)}})
+	if err != nil {
+		t.Fatalf("tagged bare: %v", err)
+	}
+	if string(out) != `{"u":7}` {
+		t.Fatalf("tagged bare: got %s", out)
+	}
+
+	// Wrong branch name should fail.
+	_, err = s.EncodeJSON(map[string]any{"u": map[string]any{"long": float64(42)}})
+	if err == nil {
+		t.Fatal("expected error for wrong branch name")
+	}
+
+	// Tagged map where the key matches a branch name but the value doesn't
+	// match that branch's type. Should fall through to try the whole map
+	// against other branches (e.g. a map branch), matching Encode behavior.
+	s3, err := Parse(`{"type":"record","name":"T","fields":[
+		{"name":"u","type":["null","int",{"type":"map","values":"string"}]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// {"int": "not_a_number"} — key "int" matches the int branch, but "not_a_number"
+	// fails for int. The whole map should then match the map<string> branch.
+	out, err = s3.EncodeJSON(map[string]any{"u": map[string]any{"int": "not_a_number"}}, TaggedUnions())
+	if err != nil {
+		t.Fatalf("fallthrough to map branch: %v", err)
+	}
+	if string(out) != `{"u":{"map":{"int":"not_a_number"}}}` {
+		t.Fatalf("fallthrough to map branch: got %s", out)
+	}
+
+	// Logical type branch names (goavro convention).
+	s2, err := Parse(`{"type":"record","name":"T","fields":[
+		{"name":"t","type":["null",{"type":"int","logicalType":"time-millis"}]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err = s2.EncodeJSON(map[string]any{"t": map[string]any{"int.time-millis": float64(35245000)}}, TaggedUnions(), TagLogicalTypes())
+	if err != nil {
+		t.Fatalf("logical tag: %v", err)
+	}
+	if string(out) != `{"t":{"int.time-millis":35245000}}` {
+		t.Fatalf("logical tag: got %s", out)
+	}
+}
+
 func TestSchemaNodeErrors(t *testing.T) {
 	// Schema() with invalid node.
 	n := &SchemaNode{Type: "record"} // missing name
@@ -2004,7 +2110,7 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 		{`hello`, `"hello"`},
 		{"a\"b", `"a\"b"`},
 		{"a\\b", `"a\\b"`},
-		{"a\nb", `"a\u000ab"`},
+		{"a\nb", `"a\nb"`},
 		{"a\x00b", `"a\u0000b"`},
 		{"日本語", `"日本語"`},                               // multi-byte UTF-8 passed through
 		{"a\u2028b", `"a\u2028b"`},                     // U+2028 escaped
@@ -2044,16 +2150,13 @@ func TestDecodeJSONGoavroLogicalBranchName(t *testing.T) {
 }
 
 func TestEncodeJSONTimeLongDefault(t *testing.T) {
-	// time.Time for a long field without logical type should use millis fallback.
+	// time.Time for a bare long (no logical type) should be rejected,
+	// matching Encode's behavior.
 	s, _ := Parse(`"long"`)
 	now := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
-	got, err := s.EncodeJSON(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := strconv.FormatInt(now.UnixMilli(), 10)
-	if string(got) != want {
-		t.Errorf("got %s, want %s", got, want)
+	_, err := s.EncodeJSON(now)
+	if err == nil {
+		t.Fatal("expected error for time.Time on bare long")
 	}
 }
 
@@ -2080,5 +2183,211 @@ func TestSerStringTextAppenderLong(t *testing.T) {
 	}
 	if len(got) != 200 {
 		t.Errorf("got len %d, want 200", len(got))
+	}
+}
+
+// TestLogicalTypeRoundTrips verifies that every logical type round-trips
+// through all four encode/decode functions:
+//
+//	value → Encode → Decode → same value
+//	value → EncodeJSON → DecodeJSON → same value
+//	value → Encode → Decode → EncodeJSON → DecodeJSON → same value
+func TestLogicalTypeRoundTrips(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		value  any    // input to Encode / EncodeJSON
+		want   any    // expected from Decode / DecodeJSON to *any
+		json   string // expected EncodeJSON output
+	}{
+		{
+			name:   "date",
+			schema: `{"type":"int","logicalType":"date"}`,
+			value:  time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+			want:   time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+			json:   "20089",
+		},
+		{
+			name:   "time-millis",
+			schema: `{"type":"int","logicalType":"time-millis"}`,
+			value:  time.Duration(35245000) * time.Millisecond,
+			want:   time.Duration(35245000) * time.Millisecond,
+			json:   "35245000",
+		},
+		{
+			name:   "time-micros",
+			schema: `{"type":"long","logicalType":"time-micros"}`,
+			value:  time.Duration(35245000) * time.Microsecond,
+			want:   time.Duration(35245000) * time.Microsecond,
+			json:   "35245000",
+		},
+		{
+			name:   "timestamp-millis",
+			schema: `{"type":"long","logicalType":"timestamp-millis"}`,
+			value:  time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
+			want:   time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
+			json:   "1742378400000",
+		},
+		{
+			name:   "timestamp-micros",
+			schema: `{"type":"long","logicalType":"timestamp-micros"}`,
+			value:  time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
+			want:   time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
+			json:   "1742378400000000",
+		},
+		{
+			name:   "timestamp-nanos",
+			schema: `{"type":"long","logicalType":"timestamp-nanos"}`,
+			value:  time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
+			want:   time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC),
+			json:   "1742378400000000000",
+		},
+		{
+			name:   "decimal-bytes",
+			schema: `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+			value:  json.Number("0.33"),
+			want:   json.Number("0.33"),
+			json:   "0.33",
+		},
+		{
+			name:   "decimal-fixed",
+			schema: `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":10,"scale":2}`,
+			value:  json.Number("0.33"),
+			want:   json.Number("0.33"),
+			json:   "0.33",
+		},
+		{
+			name:   "uuid",
+			schema: `{"type":"string","logicalType":"uuid"}`,
+			value:  "550e8400-e29b-41d4-a716-446655440000",
+			want:   "550e8400-e29b-41d4-a716-446655440000",
+			json:   `"550e8400-e29b-41d4-a716-446655440000"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+
+			// Encode → Decode
+			binary, err := s.Encode(tt.value)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			var decoded any
+			if _, err := s.Decode(binary, &decoded); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if !reflect.DeepEqual(tt.want, decoded) {
+				t.Errorf("Encode→Decode: got %T(%v), want %T(%v)", decoded, decoded, tt.want, tt.want)
+			}
+
+			// EncodeJSON → DecodeJSON
+			jb, err := s.EncodeJSON(tt.value)
+			if err != nil {
+				t.Fatalf("EncodeJSON: %v", err)
+			}
+			if string(jb) != tt.json {
+				t.Errorf("EncodeJSON: got %s, want %s", jb, tt.json)
+			}
+			var djDecoded any
+			if err := s.DecodeJSON(jb, &djDecoded); err != nil {
+				t.Fatalf("DecodeJSON(%s): %v", jb, err)
+			}
+			if !reflect.DeepEqual(tt.want, djDecoded) {
+				t.Errorf("EncodeJSON→DecodeJSON: got %T(%v), want %T(%v)", djDecoded, djDecoded, tt.want, tt.want)
+			}
+
+			// Full round-trip: Encode → Decode → EncodeJSON → DecodeJSON
+			jb2, err := s.EncodeJSON(decoded)
+			if err != nil {
+				t.Fatalf("EncodeJSON(decoded): %v", err)
+			}
+			var final any
+			if err := s.DecodeJSON(jb2, &final); err != nil {
+				t.Fatalf("DecodeJSON(jb2): %v", err)
+			}
+			if !reflect.DeepEqual(tt.want, final) {
+				t.Errorf("full round-trip: got %T(%v), want %T(%v)", final, final, tt.want, tt.want)
+			}
+		})
+	}
+}
+
+// TestPrimitiveRoundTrips verifies that all primitive types round-trip
+// through Encode/Decode and EncodeJSON/DecodeJSON.
+func TestPrimitiveRoundTrips(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		value  any
+		want   any
+		json   string
+	}{
+		{"null", `"null"`, nil, nil, "null"},
+		{"boolean true", `"boolean"`, true, true, "true"},
+		{"boolean false", `"boolean"`, false, false, "false"},
+		{"int", `"int"`, int32(42), int32(42), "42"},
+		{"int negative", `"int"`, int32(-7), int32(-7), "-7"},
+		{"long", `"long"`, int64(9876543210), int64(9876543210), "9876543210"},
+		{"float", `"float"`, float32(1.5), float32(1.5), "1.5"},
+		{"double", `"double"`, float64(3.14159), float64(3.14159), "3.14159"},
+		{"string", `"string"`, "hello", "hello", `"hello"`},
+		{"bytes", `"bytes"`, []byte{0x01, 0x02}, []byte{0x01, 0x02}, `"\u0001\u0002"`},
+		{"enum", `{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]}`, "GREEN", "GREEN", `"GREEN"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+
+			// Encode → Decode
+			binary, err := s.Encode(tt.value)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			var decoded any
+			if _, err := s.Decode(binary, &decoded); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if !reflect.DeepEqual(tt.want, decoded) {
+				t.Errorf("Encode→Decode: got %T(%v), want %T(%v)", decoded, decoded, tt.want, tt.want)
+			}
+
+			// EncodeJSON → DecodeJSON
+			jb, err := s.EncodeJSON(tt.value)
+			if err != nil {
+				t.Fatalf("EncodeJSON: %v", err)
+			}
+			if string(jb) != tt.json {
+				t.Errorf("EncodeJSON: got %s, want %s", jb, tt.json)
+			}
+			var djDecoded any
+			if err := s.DecodeJSON(jb, &djDecoded); err != nil {
+				t.Fatalf("DecodeJSON(%s): %v", jb, err)
+			}
+			if !reflect.DeepEqual(tt.want, djDecoded) {
+				t.Errorf("EncodeJSON→DecodeJSON: got %T(%v), want %T(%v)", djDecoded, djDecoded, tt.want, tt.want)
+			}
+
+			// Cross: Encode → Decode → EncodeJSON → DecodeJSON
+			jb2, err := s.EncodeJSON(decoded)
+			if err != nil {
+				t.Fatalf("EncodeJSON(decoded): %v", err)
+			}
+			var final any
+			if err := s.DecodeJSON(jb2, &final); err != nil {
+				t.Fatalf("DecodeJSON(jb2): %v", err)
+			}
+			if !reflect.DeepEqual(tt.want, final) {
+				t.Errorf("full round-trip: got %T(%v), want %T(%v)", final, final, tt.want, tt.want)
+			}
+		})
 	}
 }

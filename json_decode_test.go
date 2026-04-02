@@ -1322,12 +1322,23 @@ func TestSkipCompoundUnterminated(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONFloatInvalidNumber exercises bad float number bytes.
-func TestDecodeJSONFloatInvalidNumber(t *testing.T) {
+// TestDecodeJSONFloatOverflowIsInfinity verifies that numeric overflow
+// (e.g. 1e999, goavro's convention for Infinity) decodes as ±Inf.
+func TestDecodeJSONFloatOverflowIsInfinity(t *testing.T) {
 	s, _ := Parse(`"float"`)
 	var out any
-	if err := s.DecodeJSON([]byte(`1e999999`), &out); err == nil {
-		t.Fatal("expected error for overflow float")
+	if err := s.DecodeJSON([]byte(`1e999`), &out); err != nil {
+		t.Fatalf("expected +Inf, got error: %v", err)
+	}
+	if !math.IsInf(float64(out.(float32)), 1) {
+		t.Fatalf("expected +Inf, got %v", out)
+	}
+	out = nil
+	if err := s.DecodeJSON([]byte(`-1e999`), &out); err != nil {
+		t.Fatalf("expected -Inf, got error: %v", err)
+	}
+	if !math.IsInf(float64(out.(float32)), -1) {
+		t.Fatalf("expected -Inf, got %v", out)
 	}
 }
 
@@ -1534,12 +1545,23 @@ func TestDecodeJSONStringWithEscapes(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONDoubleInvalidNumber exercises bad double number bytes.
-func TestDecodeJSONDoubleInvalidNumber(t *testing.T) {
+// TestDecodeJSONDoubleOverflowIsInfinity verifies that numeric overflow
+// (e.g. 1e999, goavro's convention for Infinity) decodes as ±Inf.
+func TestDecodeJSONDoubleOverflowIsInfinity(t *testing.T) {
 	s, _ := Parse(`"double"`)
 	var out any
-	if err := s.DecodeJSON([]byte(`1e999999`), &out); err == nil {
-		t.Fatal("expected error for overflow double")
+	if err := s.DecodeJSON([]byte(`1e999`), &out); err != nil {
+		t.Fatalf("expected +Inf, got error: %v", err)
+	}
+	if !math.IsInf(out.(float64), 1) {
+		t.Fatalf("expected +Inf, got %v", out)
+	}
+	out = nil
+	if err := s.DecodeJSON([]byte(`-1e999`), &out); err != nil {
+		t.Fatalf("expected -Inf, got error: %v", err)
+	}
+	if !math.IsInf(out.(float64), -1) {
+		t.Fatalf("expected -Inf, got %v", out)
 	}
 }
 

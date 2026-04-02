@@ -334,7 +334,7 @@ func (f *afield) UnmarshalJSON(data []byte) error {
 }
 
 type aobject struct {
-	Name string `json:"name"`
+	Name string `json:"name,omitempty"`
 	Type string `json:"type"`
 
 	// A complex type can be one of many options. In canonical form, the
