@@ -1160,11 +1160,10 @@ func serTimestampMillis(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == timeType {
-		t := v.Interface().(time.Time)
-		return appendVarlong(dst, t.UnixMilli()), nil
+		return appendVarlong(dst, timeToTimestampMillis(v.Interface().(time.Time))), nil
 	}
 	if t, ok := tryParseTimeString(v); ok {
-		return appendVarlong(dst, t.UnixMilli()), nil
+		return appendVarlong(dst, timeToTimestampMillis(t)), nil
 	}
 	return serLong(dst, v)
 }
@@ -1175,11 +1174,10 @@ func serTimestampMicros(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == timeType {
-		t := v.Interface().(time.Time)
-		return appendVarlong(dst, t.UnixMicro()), nil
+		return appendVarlong(dst, timeToTimestampMicros(v.Interface().(time.Time))), nil
 	}
 	if t, ok := tryParseTimeString(v); ok {
-		return appendVarlong(dst, t.UnixMicro()), nil
+		return appendVarlong(dst, timeToTimestampMicros(t)), nil
 	}
 	return serLong(dst, v)
 }
@@ -1190,30 +1188,12 @@ func serTimestampNanos(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == timeType {
-		t := v.Interface().(time.Time)
-		return appendVarlong(dst, timeToUnixNanos(t)), nil
+		return appendVarlong(dst, timeToTimestampNanos(v.Interface().(time.Time))), nil
 	}
 	if t, ok := tryParseTimeString(v); ok {
-		return appendVarlong(dst, timeToUnixNanos(t)), nil
+		return appendVarlong(dst, timeToTimestampNanos(t)), nil
 	}
 	return serLong(dst, v)
-}
-
-// timeToUnixNanos converts a time.Time to nanoseconds since the Unix epoch
-// without the overflow issues of time.Time.UnixNano (which is undefined
-// outside ~1678-2262).
-func timeToUnixNanos(t time.Time) int64 {
-	return t.Unix()*1e9 + int64(t.Nanosecond())
-}
-
-// floorDiv returns the floor of a/b (rounds toward negative infinity),
-// unlike Go's built-in integer division which truncates toward zero.
-func floorDiv(a, b int64) int64 {
-	d := a / b
-	if (a^b) < 0 && d*b != a {
-		d--
-	}
-	return d
 }
 
 func serDate(dst []byte, v reflect.Value) ([]byte, error) {
@@ -1222,11 +1202,10 @@ func serDate(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == timeType {
-		t := v.Interface().(time.Time)
-		return appendVarint(dst, int32(floorDiv(t.Unix(), 86400))), nil
+		return appendVarint(dst, timeToDate(v.Interface().(time.Time))), nil
 	}
 	if t, ok := tryParseDateString(v); ok {
-		return appendVarint(dst, int32(floorDiv(t.Unix(), 86400))), nil
+		return appendVarint(dst, timeToDate(t)), nil
 	}
 	return serInt(dst, v)
 }
@@ -1237,12 +1216,11 @@ func serTimeMillis(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == durationType {
-		d := time.Duration(v.Int())
-		ms := d.Milliseconds()
-		if ms < math.MinInt32 || ms > math.MaxInt32 {
-			return nil, &SemanticError{GoType: durationType, AvroType: "time-millis", Err: fmt.Errorf("duration %v overflows int32", d)}
+		ms, err := durationToTimeMillis(time.Duration(v.Int()))
+		if err != nil {
+			return nil, &SemanticError{GoType: durationType, AvroType: "time-millis", Err: err}
 		}
-		return appendVarint(dst, int32(ms)), nil
+		return appendVarint(dst, ms), nil
 	}
 	return serInt(dst, v)
 }
@@ -1253,8 +1231,7 @@ func serTimeMicros(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.Type() == durationType {
-		d := time.Duration(v.Int())
-		return appendVarlong(dst, d.Microseconds()), nil
+		return appendVarlong(dst, durationToTimeMicros(time.Duration(v.Int()))), nil
 	}
 	return serLong(dst, v)
 }

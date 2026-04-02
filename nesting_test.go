@@ -22,15 +22,15 @@ type mutB struct {
 
 // 3-way cross-referential types.
 type crossX struct {
-	ID int32  `avro:"id"`
+	ID int32   `avro:"id"`
 	Y  *crossY `avro:"y"`
 }
 type crossY struct {
-	ID int32  `avro:"id"`
+	ID int32   `avro:"id"`
 	Z  *crossZ `avro:"z"`
 }
 type crossZ struct {
-	ID int32  `avro:"id"`
+	ID int32   `avro:"id"`
 	X  *crossX `avro:"x"`
 }
 
@@ -54,7 +54,7 @@ func (ip testIP) MarshalText() ([]byte, error) {
 func (ip *testIP) UnmarshalText(b []byte) error {
 	var parts [4]byte
 	p := 0
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		var v byte
 		for p < len(b) && b[p] != '.' {
 			v = v*10 + (b[p] - '0')
@@ -377,23 +377,33 @@ func TestDeepNesting3BranchUnionAtDepth(t *testing.T) {
 			}
 		}]
 	}`
-	type Inner struct{ Payload any `avro:"payload"` }
-	type Outer struct{ Inner Inner `avro:"inner"` }
+	type Inner struct {
+		Payload any `avro:"payload"`
+	}
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
 	s := mustParse(t, schema)
 
 	for _, tc := range []struct {
-		name string
-		in   any
+		name  string
+		in    any
 		check func(any)
 	}{
 		{"text", map[string]any{"body": "hello"}, func(v any) {
-			if v.(map[string]any)["body"] != "hello" { panic("text mismatch") }
+			if v.(map[string]any)["body"] != "hello" {
+				panic("text mismatch")
+			}
 		}},
 		{"num", map[string]any{"val": int64(999)}, func(v any) {
-			if v.(map[string]any)["val"] != int64(999) { panic("num mismatch") }
+			if v.(map[string]any)["val"] != int64(999) {
+				panic("num mismatch")
+			}
 		}},
 		{"null", nil, func(v any) {
-			if v != nil { panic("null mismatch") }
+			if v != nil {
+				panic("null mismatch")
+			}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -475,7 +485,9 @@ func TestDeepNestingEmptyCollections(t *testing.T) {
 				{"name": "label", "type": "string"}
 			]
 		}`
-		type Inner struct{ V int32 `avro:"v"` }
+		type Inner struct {
+			V int32 `avro:"v"`
+		}
 		type Outer struct {
 			Items []Inner `avro:"items"`
 			Label string  `avro:"label"`
@@ -507,8 +519,12 @@ func TestDeepNestingEmptyCollections(t *testing.T) {
 				}}}
 			]
 		}`
-		type Leaf struct{ Tags []string `avro:"tags"` }
-		type Root struct{ Data map[string][]Leaf `avro:"data"` }
+		type Leaf struct {
+			Tags []string `avro:"tags"`
+		}
+		type Root struct {
+			Data map[string][]Leaf `avro:"data"`
+		}
 		got := roundTrip(t, schema, Root{Data: map[string][]Leaf{
 			"group1": {{Tags: []string{}}, {Tags: []string{}}},
 			"group2": {},
@@ -702,18 +718,26 @@ func TestDeepNestingResolve3LevelFieldChanges(t *testing.T) {
 			}
 		}]
 	}`
-	type L3W struct{ X int32 `avro:"x"` }
+	type L3W struct {
+		X int32 `avro:"x"`
+	}
 	type L2W struct {
 		Removed string `avro:"removed"`
 		L3      L3W    `avro:"l3"`
 	}
-	type L1W struct{ L2 L2W `avro:"l2"` }
+	type L1W struct {
+		L2 L2W `avro:"l2"`
+	}
 	type L3R struct {
 		X int64  `avro:"x"`
 		Y string `avro:"y"`
 	}
-	type L2R struct{ L3 L3R `avro:"l3"` }
-	type L1R struct{ L2 L2R `avro:"l2"` }
+	type L2R struct {
+		L3 L3R `avro:"l3"`
+	}
+	type L1R struct {
+		L2 L2R `avro:"l2"`
+	}
 
 	var got L1R
 	resolveEncodeDecode(t, writerSchema, readerSchema,
@@ -751,7 +775,9 @@ func TestDeepNestingJSONCodec(t *testing.T) {
 		Items []Item    `avro:"items"`
 		Opt   *string   `avro:"opt"`
 	}
-	type Root struct{ Child Child `avro:"child"` }
+	type Root struct {
+		Child Child `avro:"child"`
+	}
 	s := avro.MustParse(schema)
 	ts := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
 	opt := "yes"
@@ -805,7 +831,9 @@ func TestDeepNestingRecordMapArrayRecordUnion(t *testing.T) {
 		Name string  `avro:"name"`
 		Desc *string `avro:"desc"`
 	}
-	type Catalog struct{ Sections map[string][]Product `avro:"sections"` }
+	type Catalog struct {
+		Sections map[string][]Product `avro:"sections"`
+	}
 	desc := "A widget"
 	input := Catalog{Sections: map[string][]Product{
 		"widgets": {{Name: "Widget A", Desc: &desc}, {Name: "Widget B", Desc: nil}},
@@ -932,7 +960,9 @@ func TestDeepNestingTimestampsAtDepth(t *testing.T) {
 		TsNs time.Time `avro:"ts_ns"`
 		Day  time.Time `avro:"day"`
 	}
-	type EventLog struct{ Events []Event `avro:"events"` }
+	type EventLog struct {
+		Events []Event `avro:"events"`
+	}
 	ts := time.Date(2025, 6, 15, 12, 30, 45, 123456789, time.UTC)
 	day := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
 	input := EventLog{Events: []Event{
@@ -963,7 +993,9 @@ func TestDeepNestingTimeDurationAtDepth(t *testing.T) {
 		TUs  time.Duration `avro:"t_us"`
 		Span avro.Duration `avro:"span"`
 	}
-	type Outer struct{ Inner Inner `avro:"inner"` }
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
 	input := Outer{Inner: Inner{
 		TMs:  8 * time.Hour,
 		TUs:  12*time.Hour + 30*time.Minute,
@@ -993,7 +1025,9 @@ func TestDeepNestingDecimalAtDepth(t *testing.T) {
 		AmountB *big.Rat `avro:"amount_b"`
 		AmountF *big.Rat `avro:"amount_f"`
 	}
-	type Ledger struct{ Entries []Entry `avro:"entries"` }
+	type Ledger struct {
+		Entries []Entry `avro:"entries"`
+	}
 	input := Ledger{Entries: []Entry{
 		{Desc: "Credit", AmountB: new(big.Rat).SetFrac64(1999, 100), AmountF: new(big.Rat).SetFrac64(1745000, 10000)},
 		{Desc: "Debit", AmountB: new(big.Rat).SetFrac64(-150, 100), AmountF: new(big.Rat).SetFrac64(0, 1)},
@@ -1029,7 +1063,9 @@ func TestDeepNestingUUIDAtDepth(t *testing.T) {
 		ID   [16]byte `avro:"id"`
 		Host string   `avro:"host"`
 	}
-	type Cluster struct{ Nodes []Node `avro:"nodes"` }
+	type Cluster struct {
+		Nodes []Node `avro:"nodes"`
+	}
 	id1 := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
 	input := Cluster{Nodes: []Node{{ID: id1, Host: "node-1.local"}}}
 	got := roundTrip(t, schema, input)
@@ -1060,7 +1096,9 @@ func TestDeepNestingEnumInRecordInArrayInMapInRecord(t *testing.T) {
 		Title    string `avro:"title"`
 		Severity string `avro:"severity"`
 	}
-	type Dashboard struct{ Panels map[string][]Widget `avro:"panels"` }
+	type Dashboard struct {
+		Panels map[string][]Widget `avro:"panels"`
+	}
 	input := Dashboard{Panels: map[string][]Widget{
 		"alerts": {{Title: "CPU", Severity: "WARN"}, {Title: "Disk", Severity: "FATAL"}},
 		"info":   {{Title: "Uptime", Severity: "INFO"}},
@@ -1084,14 +1122,22 @@ func TestDeepNestingEnumAsOrdinalAtDepth(t *testing.T) {
 		}]
 	}`
 	s := mustParse(t, schema)
-	type SI struct{ Status string `avro:"status"` }
-	type OI struct{ Inner SI `avro:"inner"` }
+	type SI struct {
+		Status string `avro:"status"`
+	}
+	type OI struct {
+		Inner SI `avro:"inner"`
+	}
 	encoded, err := s.AppendEncode(nil, &OI{Inner: SI{Status: "STANDBY"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	type II struct{ Status int `avro:"status"` }
-	type OO struct{ Inner II `avro:"inner"` }
+	type II struct {
+		Status int `avro:"status"`
+	}
+	type OO struct {
+		Inner II `avro:"inner"`
+	}
 	var got OO
 	if _, err := s.Decode(encoded, &got); err != nil {
 		t.Fatal(err)
@@ -1118,9 +1164,13 @@ func TestDeepNestingFixedVariousSizesAtDepth(t *testing.T) {
 		Tag  [4]byte  `avro:"tag"`
 		Hash [32]byte `avro:"hash"`
 	}
-	type Outer struct{ Inner Inner `avro:"inner"` }
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
 	var hash [32]byte
-	for i := range hash { hash[i] = byte(i) }
+	for i := range hash {
+		hash[i] = byte(i)
+	}
 	input := Outer{Inner: Inner{Flag: [1]byte{0xFF}, Tag: [4]byte{0xDE, 0xAD, 0xBE, 0xEF}, Hash: hash}}
 	got := roundTrip(t, schema, input)
 	if !reflect.DeepEqual(got, input) {
@@ -1163,7 +1213,9 @@ func TestDeepNestingTextMarshalerAtDepth(t *testing.T) {
 		Name string `avro:"name"`
 		Addr testIP `avro:"addr"`
 	}
-	type Network struct{ Hosts []Host `avro:"hosts"` }
+	type Network struct {
+		Hosts []Host `avro:"hosts"`
+	}
 	input := Network{Hosts: []Host{
 		{Name: "gw", Addr: testIP{192, 168, 1, 1}},
 		{Name: "dns", Addr: testIP{8, 8, 8, 8}},
@@ -1202,7 +1254,9 @@ func TestDeepNestingStructCompositionAtDepth(t *testing.T) {
 		Name   string `avro:"name"`
 		Coords `avro:",inline"`
 	}
-	type Wrapper struct{ Items []Item `avro:"items"` }
+	type Wrapper struct {
+		Items []Item `avro:"items"`
+	}
 	ts := time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC)
 	input := Wrapper{Items: []Item{
 		{Base: Base{ID: 1, Created: ts}, Name: "first", Coords: Coords{X: 10, Y: 20}},
@@ -1232,7 +1286,9 @@ func TestDeepNestingUintTypesAtDepth(t *testing.T) {
 		C uint32 `avro:"c"`
 		D uint   `avro:"d"`
 	}
-	type Outer struct{ Inner Inner `avro:"inner"` }
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
 	input := Outer{Inner: Inner{A: 255, B: 65535, C: 4294967295, D: 123456789}}
 	got := roundTrip(t, schema, input)
 	if got.Inner != input.Inner {
@@ -1251,14 +1307,22 @@ func TestDeepNestingBytesStringCoercionAtDepth(t *testing.T) {
 		}]
 	}`
 	s := mustParse(t, schema)
-	type IB struct{ Data []byte `avro:"data"` }
-	type OB struct{ Inner IB `avro:"inner"` }
+	type IB struct {
+		Data []byte `avro:"data"`
+	}
+	type OB struct {
+		Inner IB `avro:"inner"`
+	}
 	encoded, err := s.AppendEncode(nil, &OB{Inner: IB{Data: []byte("hello bytes")}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	type IS struct{ Data string `avro:"data"` }
-	type OS struct{ Inner IS `avro:"inner"` }
+	type IS struct {
+		Data string `avro:"data"`
+	}
+	type OS struct {
+		Inner IS `avro:"inner"`
+	}
 	var got OS
 	if _, err := s.Decode(encoded, &got); err != nil {
 		t.Fatal(err)
@@ -1283,7 +1347,9 @@ func TestDeepNestingOmitzeroAtDepth(t *testing.T) {
 		Required string `avro:"required"`
 		Optional *int32 `avro:"optional,omitzero"`
 	}
-	type Outer struct{ Inner Inner `avro:"inner"` }
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
 
 	v := int32(42)
 	got := roundTrip(t, schema, Outer{Inner: Inner{Required: "yes", Optional: &v}})
@@ -1351,16 +1417,46 @@ func TestDeepNesting10LevelMixedTypes(t *testing.T) {
 			}}
 		]
 	}`
-	type L10 struct{ Value float64 `avro:"value"`; Label string `avro:"label"` }
-	type L9 struct{ Flag bool `avro:"flag"`; L10 L10 `avro:"l10"` }
-	type L8 struct{ Meta map[string]int32 `avro:"meta"`; L9 L9 `avro:"l9"` }
-	type L7 struct{ Tags []string `avro:"tags"`; L8 L8 `avro:"l8"` }
-	type L6 struct{ Data []byte `avro:"data"`; L7 L7 `avro:"l7"` }
-	type L5 struct{ Dur time.Duration `avro:"dur"`; L6 L6 `avro:"l6"` }
-	type L4 struct{ Hash [8]byte `avro:"hash"`; L5 L5 `avro:"l5"` }
-	type L3 struct{ Status string `avro:"status"`; L4 L4 `avro:"l4"` }
-	type L2 struct{ Day time.Time `avro:"day"`; L3 L3 `avro:"l3"` }
-	type L1 struct{ Ts time.Time `avro:"ts"`; L2 L2 `avro:"l2"` }
+	type L10 struct {
+		Value float64 `avro:"value"`
+		Label string  `avro:"label"`
+	}
+	type L9 struct {
+		Flag bool `avro:"flag"`
+		L10  L10  `avro:"l10"`
+	}
+	type L8 struct {
+		Meta map[string]int32 `avro:"meta"`
+		L9   L9               `avro:"l9"`
+	}
+	type L7 struct {
+		Tags []string `avro:"tags"`
+		L8   L8       `avro:"l8"`
+	}
+	type L6 struct {
+		Data []byte `avro:"data"`
+		L7   L7     `avro:"l7"`
+	}
+	type L5 struct {
+		Dur time.Duration `avro:"dur"`
+		L6  L6            `avro:"l6"`
+	}
+	type L4 struct {
+		Hash [8]byte `avro:"hash"`
+		L5   L5      `avro:"l5"`
+	}
+	type L3 struct {
+		Status string `avro:"status"`
+		L4     L4     `avro:"l4"`
+	}
+	type L2 struct {
+		Day time.Time `avro:"day"`
+		L3  L3        `avro:"l3"`
+	}
+	type L1 struct {
+		Ts time.Time `avro:"ts"`
+		L2 L2        `avro:"l2"`
+	}
 
 	ts := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
 	day := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
@@ -1403,11 +1499,13 @@ func TestDeepNestingLargeNestedCollections(t *testing.T) {
 		ID    int32             `avro:"id"`
 		Attrs map[string]string `avro:"attrs"`
 	}
-	type Batch struct{ Items []Row `avro:"items"` }
+	type Batch struct {
+		Items []Row `avro:"items"`
+	}
 	items := make([]Row, 100)
 	for i := range items {
 		attrs := make(map[string]string, 10)
-		for j := 0; j < 10; j++ {
+		for j := range 10 {
 			attrs["key"+string(rune('0'+j))] = "val"
 		}
 		items[i] = Row{ID: int32(i), Attrs: attrs}

@@ -168,7 +168,7 @@ func TestEncodeStringBytesCoercionInCollections(t *testing.T) {
 	})
 }
 
-// TestEncodeJSONEdgeCases covers paths in appendAvroJSON and fromAvroJSON
+// TestEncodeJSONEdgeCases covers paths in appendAvroJSON and DecodeJSON
 // that normal integration tests don't reach.
 func TestEncodeJSONEdgeCases(t *testing.T) {
 	// Null standalone.
@@ -649,7 +649,7 @@ func TestDeserFixedArrayItemError(t *testing.T) {
 
 func TestDecodeJSONNullWithNonNilInput(t *testing.T) {
 	// Passing a non-null JSON value with a null schema.
-	// fromAvroJSON sees v=float64(42), node.kind="null", returns nil.
+	// DecodeJSON sees 42 with a null schema.
 	s, _ := Parse(`"null"`)
 	var got any
 	err := s.DecodeJSON([]byte(`42`), &got)
@@ -668,7 +668,7 @@ func TestDecodeJSONArrayItemError(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONCoercionPaths exercises paths in fromAvroJSON that normal
+// TestDecodeJSONCoercionPaths exercises DecodeJSON coercion paths that normal
 // tests don't reach.
 func TestDecodeJSONCoercionPaths(t *testing.T) {
 	// Null for null schema.

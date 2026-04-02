@@ -443,6 +443,167 @@ func FuzzSingleObject(f *testing.F) {
 	})
 }
 
+// FuzzDecodeJSON feeds random JSON strings into the streaming JSON decoder.
+// It exercises the byte scanner, schema-guided parsing, and error paths.
+func FuzzDecodeJSON(f *testing.F) {
+	seeds := []struct {
+		idx   uint8
+		input string
+	}{
+		// Primitives.
+		{0, `null`},
+		{1, `true`}, {1, `false`},
+		{2, `42`}, {2, `-1`}, {2, `0`},
+		{3, `1234567890`}, {3, `-9999`},
+		{4, `3.14`}, {4, `"NaN"`}, {4, `"Infinity"`}, {4, `null`},
+		{5, `2.718`}, {5, `"NaN"`}, {5, `"-Infinity"`}, {5, `null`},
+		{6, `"hello"`}, {6, `""`},
+		{7, `"world"`}, {7, `"line1\nline2"`},
+		// Enum.
+		{8, `"A"`}, {8, `"B"`}, {8, `"C"`},
+		// Fixed.
+		{9, `"abcd"`},
+		// Array.
+		{10, `[1,2,3]`}, {10, `[]`},
+		// Map.
+		{11, `{"k":"v"}`}, {11, `{}`},
+		// Null union.
+		{12, `null`}, {12, `{"string":"hello"}`}, {12, `"bare"`},
+		// General union.
+		{13, `null`}, {13, `42`}, {13, `"hello"`}, {13, `true`},
+		{13, `{"int":42}`}, {13, `{"string":"tagged"}`},
+		// Multi-field record.
+		{14, `{"a":1,"b":"x","c":true,"d":3.14}`},
+		{14, `{"a":1,"b":"x","c":true,"d":3.14,"extra":"skip"}`},
+		// Nested record.
+		{15, `{"inner":{"x":1,"y":"s"},"z":2}`},
+		// Logical types.
+		{16, `{"ts":1700000000000,"d":19700,"id":"550e8400-e29b-41d4-a716-446655440000"}`},
+		// Invalid inputs.
+		{2, `"notanumber"`}, {2, ``}, {2, `{}`},
+		{7, `42`}, {1, `42`},
+		{14, `{"a":"wrong"}`}, {14, `{}`},
+		{10, `"notarray"`},
+		{11, `"notmap"`},
+	}
+	for _, s := range seeds {
+		f.Add(s.idx, s.input)
+	}
+
+	f.Fuzz(func(t *testing.T, idx uint8, input string) {
+		s := fuzzSchemas[int(idx)%len(fuzzSchemas)]
+		var v any
+		s.DecodeJSON([]byte(input), &v)
+	})
+}
+
+// FuzzDecodeJSONRoundTrip verifies that valid JSON → DecodeJSON → EncodeJSON
+// produces output that re-decodes to the same value.
+func FuzzDecodeJSONRoundTrip(f *testing.F) {
+	seeds := []struct {
+		idx   uint8
+		input string
+	}{
+		{2, `42`},
+		{3, `99`},
+		{4, `3.14`},
+		{5, `2.718`},
+		{7, `"hello"`},
+		{1, `true`},
+		{10, `[1,2,3]`},
+		{11, `{"k":"v"}`},
+		{12, `{"string":"test"}`},
+		{12, `null`},
+		{14, `{"a":1,"b":"x","c":true,"d":3.14}`},
+	}
+	for _, s := range seeds {
+		f.Add(s.idx, s.input)
+	}
+
+	f.Fuzz(func(t *testing.T, idx uint8, input string) {
+		s := fuzzSchemas[int(idx)%len(fuzzSchemas)]
+		var v1 any
+		if err := s.DecodeJSON([]byte(input), &v1); err != nil {
+			return
+		}
+		encoded, err := s.EncodeJSON(v1)
+		if err != nil {
+			return
+		}
+		var v2 any
+		if err := s.DecodeJSON(encoded, &v2); err != nil {
+			t.Fatalf("re-decode failed: %v\n  input: %s\n  encoded: %s", err, input, encoded)
+		}
+		if !fuzzEqual(v1, v2) {
+			t.Fatalf("round-trip mismatch:\n  v1: %#v\n  v2: %#v\n  input: %s\n  encoded: %s", v1, v2, input, encoded)
+		}
+	})
+}
+
+// FuzzEncodeTaggedUnion verifies that Encode accepts tagged union maps
+// from Decode(TaggedUnions) and produces identical binary.
+func FuzzEncodeTaggedUnion(f *testing.F) {
+	seeds := []struct {
+		idx  uint8
+		data []byte
+	}{
+		{12, fuzzSeed(fuzzSchemas[12], "hello")},
+		{12, fuzzSeed(fuzzSchemas[12], (*string)(nil))},
+		{13, fuzzSeed(fuzzSchemas[13], int32(7))},
+		{13, fuzzSeed(fuzzSchemas[13], "test")},
+		{13, fuzzSeed(fuzzSchemas[13], true)},
+		{13, fuzzSeed(fuzzSchemas[13], (*int)(nil))},
+		{14, fuzzSeed(fuzzSchemas[14], map[string]any{"a": int32(1), "b": "x", "c": true, "d": 1.5})},
+	}
+	for _, s := range seeds {
+		f.Add(s.idx, s.data)
+	}
+
+	f.Fuzz(func(t *testing.T, idx uint8, data []byte) {
+		s := fuzzSchemas[int(idx)%len(fuzzSchemas)]
+		var tagged any
+		rem, err := s.Decode(data, &tagged, TaggedUnions())
+		if err != nil || len(rem) != 0 {
+			return
+		}
+		reencoded, err := s.Encode(tagged)
+		if err != nil {
+			return
+		}
+		if !bytes.Equal(data, reencoded) {
+			t.Fatalf("tagged round-trip mismatch:\n  original: %x\n  reencoded: %x", data, reencoded)
+		}
+	})
+}
+
+// FuzzDecodeJSONTyped decodes random JSON into typed Go targets.
+func FuzzDecodeJSONTyped(f *testing.F) {
+	type Record struct {
+		A int32   `avro:"a"`
+		B string  `avro:"b"`
+		C bool    `avro:"c"`
+		D float64 `avro:"d"`
+	}
+	recordSchema := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string"},
+		{"name":"c","type":"boolean"},
+		{"name":"d","type":"double"}
+	]}`)
+
+	f.Add(`{"a":1,"b":"x","c":true,"d":3.14}`)
+	f.Add(`{"a":0,"b":"","c":false,"d":0}`)
+	f.Add(`{}`)
+	f.Add(`{"a":"wrong"}`)
+	f.Add(`not json`)
+	f.Add(`{"a":1,"b":"x","c":true,"d":3.14,"extra":{"nested":true}}`)
+
+	f.Fuzz(func(t *testing.T, input string) {
+		var r Record
+		recordSchema.DecodeJSON([]byte(input), &r)
+	})
+}
+
 // FuzzDecodeTyped decodes random bytes into typed Go targets, exercising
 // the unsafe fast path and fixed-size array decoding.
 func FuzzDecodeTyped(f *testing.F) {

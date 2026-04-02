@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // benchSuperheroSchema is the Superhero record schema without a union wrapper.
@@ -527,6 +528,63 @@ func BenchmarkCustomTypeDecodeAny(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		if _, err := s.Decode(data, &out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+const benchDecodeJSONSchema = `{
+	"name": "Event",
+	"type": "record",
+	"fields": [
+		{"name": "id", "type": "long"},
+		{"name": "name", "type": "string"},
+		{"name": "created_at", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+		{"name": "updated_at", "type": {"type": "long", "logicalType": "timestamp-micros"}},
+		{"name": "date", "type": {"type": "int", "logicalType": "date"}},
+		{"name": "amount", "type": "double"},
+		{"name": "active", "type": "boolean"},
+		{"name": "tag", "type": ["null", "string"]}
+	]
+}`
+
+var benchDecodeJSONInput = []byte(`{"id":12345,"name":"test-event","created_at":1700000000000,"updated_at":1700000000000000,"date":19700,"amount":3.14,"active":true,"tag":{"string":"hello"}}`)
+
+func BenchmarkDecodeJSON_Any(b *testing.B) {
+	s, err := Parse(benchDecodeJSONSchema)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var out any
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := s.DecodeJSON(benchDecodeJSONInput, &out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeJSON_Struct(b *testing.B) {
+	type Event struct {
+		ID        int64     `avro:"id"`
+		Name      string    `avro:"name"`
+		CreatedAt time.Time `avro:"created_at"`
+		UpdatedAt time.Time `avro:"updated_at"`
+		Date      time.Time `avro:"date"`
+		Amount    float64   `avro:"amount"`
+		Active    bool      `avro:"active"`
+		Tag       *string   `avro:"tag"`
+	}
+	s, err := Parse(benchDecodeJSONSchema)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var out Event
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := s.DecodeJSON(benchDecodeJSONInput, &out); err != nil {
 			b.Fatal(err)
 		}
 	}
