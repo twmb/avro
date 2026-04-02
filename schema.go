@@ -912,6 +912,13 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		}
 		deser.branchNames = append(deser.branchNames, bn)
 		deser.logicalNames = append(deser.logicalNames, ln)
+		if ser.branchNames == nil {
+			ser.branchNames = make(map[string]int, len(s.union))
+		}
+		ser.branchNames[bn] = i
+		if ln != bn {
+			ser.branchNames[ln] = i
+		}
 	}
 
 	if len(s.union) == 2 && s.union[0].primitive == "null" {
@@ -1005,13 +1012,15 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.ser = ser
 		b.deser = deserPrimitive[o.Type]
-		// Skip built-in logical type handlers when a custom type
-		// matches — the custom type replaces them entirely, receiving
-		// the raw Avro-native value (not the enriched type).
+		// Always use the logical type serializer if available — it's a
+		// strict superset of the base serializer (accepts time.Time etc.
+		// in addition to raw values). Only the deserializer is suppressed
+		// when a custom type matches, so that Decode produces raw
+		// Avro-native values for the custom decoder.
+		if logSer := logicalSer(o.Logical); logSer != nil {
+			b.ser = logSer
+		}
 		if !b.hasMatchingCustomType(o.Type, o.Logical) {
-			if logSer := logicalSer(o.Logical); logSer != nil {
-				b.ser = logSer
-			}
 			if logDeser := logicalDeser(o.Logical); logDeser != nil {
 				b.deser = logDeser
 			}

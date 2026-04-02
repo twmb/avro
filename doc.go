@@ -139,8 +139,10 @@
 //
 // [CustomType] registers custom Go type conversions for logical types,
 // domain types, or to replace built-in behavior. A matching custom type
-// replaces the built-in logical type handler entirely — callbacks receive
-// raw Avro-native values, not enriched types. Use [NewCustomType] for
+// replaces the built-in logical type deserializer — Decode callbacks
+// receive raw Avro-native values, not enriched types like [time.Time].
+// A [CustomType] with nil Decode suppresses the built-in handler with
+// zero overhead, producing raw values directly. Use [NewCustomType] for
 // type-safe primitive conversions, or the [CustomType] struct directly
 // for complex cases (records, fixed types, property-based dispatch).
 // Custom types are registered per-schema via [SchemaOpt].

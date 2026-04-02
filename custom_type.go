@@ -34,11 +34,8 @@ var ErrSkipCustomType = errors.New("avro: skip custom type")
 // from intercepting native values (e.g. a raw int64 passes through
 // without conversion for a custom-typed long field).
 //
-// A matching custom type replaces the built-in logical type handler
-// entirely. Encode and Decode callbacks receive raw Avro-native values
-// (int32 for int, int64 for long, []byte for bytes/fixed, etc.), not
-// the enriched types that built-in handlers produce (time.Time,
-// time.Duration, etc.). Among user registrations, first match wins.
+// A matching CustomType replaces the built-in logical type
+// deserializer. Among user registrations, first match wins.
 //
 // For custom types backed by complex Avro types (records, arrays,
 // maps), use the struct form directly — the Encode function can return
@@ -72,16 +69,30 @@ type CustomType struct {
 	// infers from AvroType + LogicalType.
 	Schema *SchemaNode
 
-	// Encode converts a custom Go value to an Avro-native value,
-	// called before serialization. Return [ErrSkipCustomType] to fall
-	// through to the next matching custom type or built-in behavior.
-	// Any other non-nil error is fatal. If nil, default encoding is used.
+	// Encode converts a caller-provided Go value to an Avro-native
+	// value, called before serialization. The callback receives the
+	// value as passed to [Schema.Encode] (e.g. a custom Money type),
+	// and should return the corresponding Avro-native value (e.g.
+	// int64 cents). Return [ErrSkipCustomType] to fall through to the
+	// next matching custom type or built-in behavior. Any other
+	// non-nil error is fatal.
+	//
+	// If nil, the built-in logical type encoder is used, which accepts
+	// both enriched types ([time.Time], [time.Duration]) and raw
+	// values (int64, int32, etc.).
 	Encode func(v any, schema *SchemaNode) (any, error)
 
-	// Decode converts an Avro-native value to a custom Go value,
-	// called after deserialization. Return [ErrSkipCustomType] to fall
-	// through. Any other non-nil error is fatal. If nil, default
-	// decoding is used.
+	// Decode converts a raw Avro-native value to a custom Go value,
+	// called after deserialization. The callback receives the raw
+	// Avro-native value (int32 for int, int64 for long, []byte for
+	// bytes/fixed, etc.) and should return the desired Go type.
+	// Return [ErrSkipCustomType] to fall through. Any other non-nil
+	// error is fatal.
+	//
+	// If nil, the built-in logical type handler is bypassed and the
+	// base Avro type decoder is used directly, producing raw
+	// Avro-native values (int32, int64, etc.) rather than enriched
+	// types ([time.Time], [time.Duration], etc.).
 	Decode func(v any, schema *SchemaNode) (any, error)
 
 	// Set by NewCustomType; if true and AvroType is "", Parse returns

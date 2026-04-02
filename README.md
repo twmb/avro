@@ -405,16 +405,16 @@ schema.Decode(data, &out) // out.Price is Money{Cents: 500, ...}
 schema = avro.MustSchemaFor[Order](moneyType)
 ```
 
-Custom types replace built-in logical type handling entirely — callbacks
-receive raw Avro-native values (int64 for long, int32 for int, etc.):
+A matching custom type replaces the built-in logical type deserializer.
+Decode callbacks receive raw Avro-native values (int64 for long, int32
+for int, etc.). A nil Decode suppresses the built-in handler with zero
+overhead, producing raw values directly:
 
 ```go
 // Decode timestamps as raw int64 instead of time.Time.
 schema := avro.MustParse(raw, avro.CustomType{
     LogicalType: "timestamp-millis",
-    Decode: func(v any, _ *avro.SchemaNode) (any, error) {
-        return v, nil // pass through raw int64
-    },
+    AvroType:    "long",
 })
 ```
 
@@ -531,6 +531,9 @@ var native any
 schema.Decode(binary, &native, avro.TaggedUnions())
 // native["email"] is map[string]any{"string": "a@b.com"}
 ```
+
+`Encode` and `DecodeJSON` accept both tagged and bare union input, so
+tagged union output from `Decode` can round-trip through `Encode` directly.
 
 Pass `TagLogicalTypes()` with `TaggedUnions()` to qualify union branch names
 with their logical type (e.g. `"long.timestamp-millis"` instead of `"long"`),
