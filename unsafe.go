@@ -565,37 +565,31 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 }
 
 func usTimestampMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
-	t := *(*time.Time)(p)
-	return appendVarlong(dst, t.UnixMilli()), nil
+	return appendVarlong(dst, timeToTimestampMillis(*(*time.Time)(p))), nil
 }
 
 func usTimestampMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
-	t := *(*time.Time)(p)
-	return appendVarlong(dst, t.UnixMicro()), nil
+	return appendVarlong(dst, timeToTimestampMicros(*(*time.Time)(p))), nil
 }
 
 func usTimestampNanos(dst []byte, p unsafe.Pointer) ([]byte, error) {
-	t := *(*time.Time)(p)
-	return appendVarlong(dst, timeToUnixNanos(t)), nil
+	return appendVarlong(dst, timeToTimestampNanos(*(*time.Time)(p))), nil
 }
 
 func usDate(dst []byte, p unsafe.Pointer) ([]byte, error) {
-	t := *(*time.Time)(p)
-	return appendVarint(dst, int32(floorDiv(t.Unix(), 86400))), nil
+	return appendVarint(dst, timeToDate(*(*time.Time)(p))), nil
 }
 
 func usTimeMillis(dst []byte, p unsafe.Pointer) ([]byte, error) {
-	d := *(*time.Duration)(p)
-	ms := d.Milliseconds()
-	if ms < math.MinInt32 || ms > math.MaxInt32 {
-		return nil, fmt.Errorf("duration %v overflows int32", d)
+	ms, err := durationToTimeMillis(*(*time.Duration)(p))
+	if err != nil {
+		return nil, err
 	}
-	return appendVarint(dst, int32(ms)), nil
+	return appendVarint(dst, ms), nil
 }
 
 func usTimeMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
-	d := *(*time.Duration)(p)
-	return appendVarlong(dst, d.Microseconds()), nil
+	return appendVarlong(dst, durationToTimeMicros(*(*time.Duration)(p))), nil
 }
 
 func udTimestampMillis(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
@@ -603,7 +597,7 @@ func udTimestampMillis(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	*(*time.Time)(p) = time.UnixMilli(val)
+	*(*time.Time)(p) = timestampMillisToTime(val)
 	return src, nil
 }
 
@@ -612,7 +606,7 @@ func udTimestampMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	*(*time.Time)(p) = time.UnixMicro(val)
+	*(*time.Time)(p) = timestampMicrosToTime(val)
 	return src, nil
 }
 
@@ -621,7 +615,7 @@ func udTimestampNanos(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	*(*time.Time)(p) = time.Unix(val/1e9, val%1e9)
+	*(*time.Time)(p) = timestampNanosToTime(val)
 	return src, nil
 }
 
@@ -630,7 +624,7 @@ func udDate(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	*(*time.Time)(p) = time.Unix(int64(val)*86400, 0).UTC()
+	*(*time.Time)(p) = dateToTime(val)
 	return src, nil
 }
 
@@ -639,7 +633,7 @@ func udTimeMillis(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	*(*time.Duration)(p) = time.Duration(val) * time.Millisecond
+	*(*time.Duration)(p) = timeMillisToDuration(val)
 	return src, nil
 }
 
@@ -651,7 +645,7 @@ func udTimeMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
 		return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
 	}
-	*(*time.Duration)(p) = time.Duration(val) * time.Microsecond
+	*(*time.Duration)(p) = timeMicrosToDuration(val)
 	return src, nil
 }
 

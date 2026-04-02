@@ -31,9 +31,9 @@ import (
 //
 // The zero value is ready to use. A SchemaCache is safe for concurrent use.
 type SchemaCache struct {
-	mu          sync.Mutex
-	named       map[string]*namedType
-	dedup       map[[32]byte]*Schema
+	mu           sync.Mutex
+	named        map[string]*namedType
+	dedup        map[[32]byte]*Schema
 	customParsed map[[32]byte]bool // schemas previously parsed with custom types
 }
 

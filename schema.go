@@ -57,16 +57,19 @@ type schemaNode struct {
 	serRecord   *serRecord
 	deserRecord *deserRecord
 
-	props map[string]any // extra schema properties (for CustomType callbacks)
+	props    map[string]any // extra schema properties (for CustomType callbacks)
+	fieldIdx map[string]int // record field name → index; built at parse time
 }
 
 // fieldNode represents a record field with full metadata.
 type fieldNode struct {
-	name       string
-	aliases    []string
-	node       *schemaNode
-	defaultVal any
-	hasDefault bool
+	name        string
+	nameVal     reflect.Value // pre-computed for map lookups without allocation
+	aliases     []string
+	node        *schemaNode
+	defaultVal  any
+	defaultJSON []byte // pre-computed JSON encoding of defaultVal; nil if no default
+	hasDefault  bool
 }
 
 type parseOptLax struct{ fn func(string) error }
@@ -1206,6 +1209,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 			fn := fieldNode{
 				name:    of.Name,
+				nameVal: reflect.ValueOf(of.Name),
 				aliases: origFieldAliases[i],
 				node:    bf.node,
 			}
@@ -1244,6 +1248,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				drf.hasDefault = true
 				fn.defaultVal = defaultVal
 				fn.hasDefault = true
+				fn.defaultJSON, _ = json.Marshal(defaultVal)
 				// Pre-encode the default to Avro binary for use
 				// when encoding maps with missing keys.
 				if !isFwdRef && bf.node != nil {
@@ -1261,6 +1266,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		sr.names = names
 		dr.names = names
+		nd.fieldIdx = make(map[string]int, len(nd.fields))
+		for i, f := range nd.fields {
+			nd.fieldIdx[f.name] = i
+		}
 
 	case "enum":
 		if len(o.Fields) > 0 ||

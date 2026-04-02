@@ -434,12 +434,13 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		if v.IsNil() {
 			v.Set(reflect.MakeMap(t))
 		}
+		elem := reflect.New(t.Elem()).Elem()
 		for _, f := range s.fields {
-			elem := reflect.New(t.Elem()).Elem()
 			if src, err = f.fn(src, elem, sl); err != nil {
 				return nil, recordFieldError(nil, f.name, err)
 			}
 			v.SetMapIndex(f.nameVal, elem)
+			elem.SetZero()
 		}
 		return src, nil
 	}
@@ -1013,7 +1014,7 @@ func deserTimestampMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface || v.Type() == timeType {
-		v.Set(reflect.ValueOf(time.UnixMilli(val).UTC()))
+		v.Set(reflect.ValueOf(timestampMillisToTime(val)))
 		return src, nil
 	}
 	return src, setLongValue(v, val)
@@ -1026,7 +1027,7 @@ func deserTimestampMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface || v.Type() == timeType {
-		v.Set(reflect.ValueOf(time.UnixMicro(val).UTC()))
+		v.Set(reflect.ValueOf(timestampMicrosToTime(val)))
 		return src, nil
 	}
 	return src, setLongValue(v, val)
@@ -1039,7 +1040,7 @@ func deserTimestampNanos(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface || v.Type() == timeType {
-		v.Set(reflect.ValueOf(time.Unix(val/1e9, val%1e9).UTC()))
+		v.Set(reflect.ValueOf(timestampNanosToTime(val)))
 		return src, nil
 	}
 	return src, setLongValue(v, val)
@@ -1052,8 +1053,7 @@ func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface || v.Type() == timeType {
-		t := time.Unix(int64(val)*86400, 0).UTC()
-		v.Set(reflect.ValueOf(t))
+		v.Set(reflect.ValueOf(dateToTime(val)))
 		return src, nil
 	}
 	return src, setIntValue(v, val)
@@ -1066,7 +1066,7 @@ func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface || v.Type() == durationType {
-		v.Set(reflect.ValueOf(time.Duration(val) * time.Millisecond))
+		v.Set(reflect.ValueOf(timeMillisToDuration(val)))
 		return src, nil
 	}
 	return src, setIntValue(v, val)
@@ -1082,7 +1082,7 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		if val > math.MaxInt64/int64(time.Microsecond) || val < math.MinInt64/int64(time.Microsecond) {
 			return nil, fmt.Errorf("time-micros value %d overflows time.Duration", val)
 		}
-		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
+		v.Set(reflect.ValueOf(timeMicrosToDuration(val)))
 		return src, nil
 	}
 	if v.Kind() == reflect.Interface {
@@ -1090,7 +1090,7 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		// silently wrap. Valid time-of-day values (< 86400000000 micros)
 		// never overflow. The value may be transient — passed to a
 		// CustomType decoder or EncodeJSON.
-		v.Set(reflect.ValueOf(time.Duration(val) * time.Microsecond))
+		v.Set(reflect.ValueOf(timeMicrosToDuration(val)))
 		return src, nil
 	}
 	return src, setLongValue(v, val)

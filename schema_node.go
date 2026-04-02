@@ -3,6 +3,7 @@ package avro
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 )
 
 // SchemaNode is a read-write representation of an Avro schema. It can be
@@ -168,16 +169,12 @@ func (n *SchemaNode) toJSON() any {
 			if f.Doc != "" {
 				fd["doc"] = f.Doc
 			}
-			for k, v := range f.Props {
-				fd[k] = v
-			}
+			maps.Copy(fd, f.Props)
 			fields[i] = fd
 		}
 		m["fields"] = fields
 	}
-	for k, v := range n.Props {
-		m[k] = v
-	}
+	maps.Copy(m, n.Props)
 	return m
 }
 

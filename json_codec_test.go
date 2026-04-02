@@ -752,65 +752,6 @@ func TestAppendAvroJSONUnknownKind(t *testing.T) {
 	}
 }
 
-func TestFromAvroJSONNullStandalone(t *testing.T) {
-	node := &schemaNode{kind: "null"}
-	got, err := fromAvroJSON(nil, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != nil {
-		t.Errorf("got %v, want nil", got)
-	}
-}
-
-func TestFromAvroJSONErrorPropagation(t *testing.T) {
-	// Array with bad item type.
-	node := &schemaNode{kind: "array", items: &schemaNode{kind: "int"}}
-	_, err := fromAvroJSON([]any{"not int"}, node)
-	// This won't error in fromAvroJSON since it just passes through.
-	// But encoding will fail later. That's fine — fromAvroJSON is lenient.
-	_ = err
-
-	// Map with error in value.
-	mapNode := &schemaNode{kind: "map", values: &schemaNode{kind: "bogus"}}
-	_, err = fromAvroJSON(map[string]any{"k": "v"}, mapNode)
-	if err == nil {
-		t.Fatal("expected error for bogus map value type")
-	}
-
-	// Record with error in field.
-	recNode := &schemaNode{
-		kind: "record",
-		fields: []fieldNode{
-			{name: "a", node: &schemaNode{kind: "bogus"}},
-		},
-	}
-	_, err = fromAvroJSON(map[string]any{"a": "v"}, recNode)
-	if err == nil {
-		t.Fatal("expected error for bogus record field type")
-	}
-
-	// Unknown kind.
-	_, err = fromAvroJSON("v", &schemaNode{kind: "bogus"})
-	if err == nil {
-		t.Fatal("expected error for unknown kind")
-	}
-}
-
-func TestFromAvroJSONUnionNull(t *testing.T) {
-	node := &schemaNode{
-		kind:     "union",
-		branches: []*schemaNode{{kind: "null"}, {kind: "string"}},
-	}
-	got, err := fromAvroJSON(nil, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != nil {
-		t.Errorf("got %v, want nil", got)
-	}
-}
-
 func TestSchemaNodeErrors(t *testing.T) {
 	// Schema() with invalid node.
 	n := &SchemaNode{Type: "record"} // missing name
@@ -2065,9 +2006,9 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 		{"a\\b", `"a\\b"`},
 		{"a\nb", `"a\u000ab"`},
 		{"a\x00b", `"a\u0000b"`},
-		{"日本語", `"日本語"`},                       // multi-byte UTF-8 passed through
-		{"a\u2028b", `"a\u2028b"`},                // U+2028 escaped
-		{"a\u2029b", `"a\u2029b"`},                // U+2029 escaped
+		{"日本語", `"日本語"`},                               // multi-byte UTF-8 passed through
+		{"a\u2028b", `"a\u2028b"`},                     // U+2028 escaped
+		{"a\u2029b", `"a\u2029b"`},                     // U+2029 escaped
 		{string([]byte{0xff, 0xfe}), `"\ufffd\ufffd"`}, // invalid UTF-8 replaced
 	}
 	for _, tt := range tests {
