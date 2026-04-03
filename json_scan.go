@@ -138,6 +138,15 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 	if s.pos >= len(s.data) || s.data[s.pos] < '0' || s.data[s.pos] > '9' {
 		return nil, fmt.Errorf("avro json: expected number at offset %d", start)
 	}
+	// Per RFC 8259: leading zeros are not permitted (except "0" itself
+	// or "0.xxx"). If the first digit is '0', the next must be '.' or
+	// end-of-number.
+	if s.data[s.pos] == '0' && s.pos+1 < len(s.data) {
+		next := s.data[s.pos+1]
+		if next >= '0' && next <= '9' {
+			return nil, fmt.Errorf("avro json: leading zeros not permitted at offset %d", start)
+		}
+	}
 	for s.pos < len(s.data) {
 		b := s.data[s.pos]
 		if (b >= '0' && b <= '9') || b == '.' || b == 'e' || b == 'E' || b == '+' || b == '-' {

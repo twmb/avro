@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"reflect"
 	"strconv"
 	"time"
@@ -134,8 +135,10 @@ func (ctx *jsonDecoder) decodeValue(v reflect.Value, node *schemaNode) error {
 		return ctx.decodeFloat(v, toAny)
 	case "double":
 		return ctx.decodeDouble(v, toAny)
-	case "string", "enum":
+	case "string":
 		return ctx.decodeString(v, toAny)
+	case "enum":
+		return ctx.decodeEnum(v, node, toAny)
 	case "bytes":
 		return ctx.decodeBytes(v, node, toAny)
 	case "fixed":
@@ -336,9 +339,15 @@ func (ctx *jsonDecoder) decodeFloat(v reflect.Value, toAny bool) error {
 		}
 		f64, err := strconv.ParseFloat(string(nb), 32)
 		if err != nil {
-			return fmt.Errorf("avro json: invalid float: %w", err)
+			// Accept ±Inf from overflow (e.g. 1e999, goavro convention).
+			if math.IsInf(f64, 0) {
+				f = float32(f64)
+			} else {
+				return fmt.Errorf("avro json: invalid float: %w", err)
+			}
+		} else {
+			f = float32(f64)
 		}
-		f = float32(f64)
 	}
 	if toAny {
 		v.Set(reflect.ValueOf(f))
@@ -376,7 +385,10 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value, toAny bool) error {
 		var err2 error
 		f, err2 = strconv.ParseFloat(string(nb), 64)
 		if err2 != nil {
-			return fmt.Errorf("avro json: invalid double: %w", err2)
+			// Accept ±Inf from overflow (e.g. 1e999, goavro convention).
+			if !math.IsInf(f, 0) {
+				return fmt.Errorf("avro json: invalid double: %w", err2)
+			}
 		}
 	}
 	if toAny {
@@ -406,7 +418,51 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, toAny bool) error {
 	return nil
 }
 
+func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode, toAny bool) error {
+	s, err := ctx.consumeSlabString()
+	if err != nil {
+		return err
+	}
+	valid := false
+	for _, sym := range node.symbols {
+		if sym == s {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return fmt.Errorf("avro json: unknown enum symbol %q", s)
+	}
+	if toAny {
+		v.Set(reflect.ValueOf(s))
+	} else if v.Kind() == reflect.String {
+		v.SetString(s)
+	} else {
+		return &SemanticError{GoType: v.Type(), AvroType: "enum"}
+	}
+	return nil
+}
+
 func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny bool) error {
+	// Decimal logical type: accept JSON numbers (e.g. 0.33) in addition
+	// to Avro JSON byte strings, for round-trip with EncodeJSON output.
+	if node.logical == "decimal" {
+		if c := ctx.scanner.peek(); c != '"' && c != 0 {
+			nb, err := ctx.scanner.consumeNumberBytes()
+			if err != nil {
+				return err
+			}
+			r, ok := new(big.Rat).SetString(string(nb))
+			if !ok {
+				return fmt.Errorf("avro json: invalid decimal number %q", nb)
+			}
+			if toAny {
+				v.Set(reflect.ValueOf(json.Number(r.FloatString(node.scale))))
+				return nil
+			}
+			return assignDecimalRat(v, r, node)
+		}
+	}
 	start, end, _, err := ctx.scanner.consumeStringRaw()
 	if err != nil {
 		return err
@@ -423,6 +479,24 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny boo
 }
 
 func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny bool) error {
+	// Decimal logical type: accept JSON numbers, same as decodeBytes.
+	if node.logical == "decimal" {
+		if c := ctx.scanner.peek(); c != '"' && c != 0 {
+			nb, err := ctx.scanner.consumeNumberBytes()
+			if err != nil {
+				return err
+			}
+			r, ok := new(big.Rat).SetString(string(nb))
+			if !ok {
+				return fmt.Errorf("avro json: invalid decimal number %q", nb)
+			}
+			if toAny {
+				v.Set(reflect.ValueOf(json.Number(r.FloatString(node.scale))))
+				return nil
+			}
+			return assignDecimalRat(v, r, node)
+		}
+	}
 	start, end, _, err := ctx.scanner.consumeStringRaw()
 	if err != nil {
 		return err
@@ -466,6 +540,20 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode) error {
 	}
 	if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
 		reflect.Copy(v, reflect.ValueOf(b))
+		return nil
+	}
+	return &SemanticError{GoType: v.Type(), AvroType: node.kind}
+}
+
+// assignDecimalRat assigns a *big.Rat to a typed target for decimal fields
+// decoded from JSON numbers.
+func assignDecimalRat(v reflect.Value, r *big.Rat, node *schemaNode) error {
+	if v.Type() == jsonNumberType {
+		v.Set(reflect.ValueOf(json.Number(r.FloatString(node.scale))))
+		return nil
+	}
+	if v.Type() == bigRatType {
+		v.Set(reflect.ValueOf(*r))
 		return nil
 	}
 	return &SemanticError{GoType: v.Type(), AvroType: node.kind}
