@@ -2,6 +2,7 @@ package avro
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -134,6 +135,132 @@ func TestSchemaNodeEnum(t *testing.T) {
 		t.Errorf("symbols: got %v", got.Symbols)
 	}
 }
+
+// TestSchemaNodeEmptyRecord exercises the Avro spec requirement (Complex
+// Types > Records) that "fields: a JSON array, listing fields (required)"
+// — a record with zero user-declared fields must still emit "fields": [].
+// Strict readers like Java Avro reject {"type":"record","name":"x"} with
+// "Record has no fields".
+func TestSchemaNodeEmptyRecord(t *testing.T) {
+	node := &SchemaNode{
+		Type: "record",
+		Name: "Empty",
+	}
+	s, err := node.Schema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := s.Canonical()
+	want := `{"name":"Empty","type":"record","fields":[]}`
+	if string(got) != want {
+		t.Errorf("canonical: got %s, want %s", got, want)
+	}
+}
+
+// TestSchemaNodeEmptyRecordNested exercises the required-fields fix in
+// every position an empty record can appear: as a named-type reference,
+// as array items, as map values, as a union branch, and as a field
+// type inside another record. Each must emit "fields":[] so Java Avro
+// and other strict readers can parse it.
+func TestSchemaNodeEmptyRecordNested(t *testing.T) {
+	empty := SchemaNode{Type: "record", Name: "Inner"}
+
+	cases := []struct {
+		name string
+		node SchemaNode
+	}{
+		{"as field type", SchemaNode{
+			Type: "record", Name: "Outer",
+			Fields: []SchemaField{{Name: "inner", Type: empty}},
+		}},
+		{"as array items", SchemaNode{
+			Type: "array", Items: &empty,
+		}},
+		{"as map values", SchemaNode{
+			Type: "map", Values: &empty,
+		}},
+		{"as union branch", SchemaNode{
+			Type:     "union",
+			Branches: []SchemaNode{{Type: "null"}, empty},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := tc.node.Schema()
+			if err != nil {
+				t.Fatal(err)
+			}
+			canon := string(s.Canonical())
+			if !strings.Contains(canon, `"fields":[]`) {
+				t.Errorf("canonical missing 'fields':[]: %s", canon)
+			}
+			// Re-parseability: Canonical() output must itself parse.
+			if _, err := Parse(canon); err != nil {
+				t.Errorf("Canonical() output failed to re-parse: %v\noutput: %s", err, canon)
+			}
+		})
+	}
+}
+
+// TestSchemaNodeCanonicalIdempotent verifies that Canonical() is a
+// fixed point: parsing the canonical form and re-canonicalizing must
+// produce byte-identical output. This is especially important for
+// empty records where the parser accepts the lenient form but the
+// emitter must produce the strict form.
+func TestSchemaNodeCanonicalIdempotent(t *testing.T) {
+	inputs := []string{
+		`{"type":"record","name":"Empty","fields":[]}`,
+		`{"type":"record","name":"Empty"}`, // lenient, missing fields
+		`{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"type":"record","name":"I","fields":[]}}]}`,
+		`{"type":"array","items":{"type":"record","name":"E","fields":[]}}`,
+		`{"type":"map","values":{"type":"record","name":"E","fields":[]}}`,
+		`["null",{"type":"record","name":"E","fields":[]}]`,
+	}
+	for _, in := range inputs {
+		t.Run(in, func(t *testing.T) {
+			s1, err := Parse(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c1 := s1.Canonical()
+			s2, err := Parse(string(c1))
+			if err != nil {
+				t.Fatalf("re-parse canonical failed: %v\ncanonical: %s", err, c1)
+			}
+			c2 := s2.Canonical()
+			if string(c1) != string(c2) {
+				t.Errorf("canonical not idempotent:\n  first:  %s\n  second: %s", c1, c2)
+			}
+		})
+	}
+}
+
+// TestSchemaNodeCanonicalOrder verifies Parsing Canonical Form's [ORDER]
+// rule: "name, type, fields, symbols, items, values, size". Since PCF
+// strips all other attributes, a record's canonical form always has the
+// key order: name, type, fields.
+func TestSchemaNodeCanonicalOrder(t *testing.T) {
+	node := &SchemaNode{
+		Type:      "record",
+		Name:      "Ordered",
+		Namespace: "ns",
+		Doc:       "doc",
+		Aliases:   []string{"Old"},
+		Fields: []SchemaField{
+			{Name: "a", Type: SchemaNode{Type: "int"}},
+		},
+	}
+	s, err := node.Schema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(s.Canonical())
+	want := `{"name":"ns.Ordered","type":"record","fields":[{"name":"a","type":"int"}]}`
+	if got != want {
+		t.Errorf("canonical:\n got %s\nwant %s", got, want)
+	}
+}
+
 
 func TestSchemaNodeFixed(t *testing.T) {
 	node := &SchemaNode{

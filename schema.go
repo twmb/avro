@@ -421,6 +421,110 @@ func (l laxInt) MarshalJSON() ([]byte, error) {
 	return json.Marshal(int(l))
 }
 
+// MarshalJSON serializes an aobject honoring two Avro spec requirements
+// that encoding/json's struct-tag path cannot satisfy on its own:
+//
+//  1. record/error must emit "fields" even when empty (Complex Types >
+//     Records: "fields: a JSON array, listing fields (required)") and
+//     enum must emit "symbols" even when empty (Complex Types > Enums:
+//     "symbols: a JSON array, listing symbols, as JSON strings
+//     (required)"). The struct-tag omitempty would drop them.
+//
+//  2. Parsing Canonical Form's [ORDER] rule requires "name, type,
+//     fields, symbols, items, values, size" to appear in that order.
+//     encoding/json emits struct fields in declaration order, which
+//     happens to match for the first two but places other attributes
+//     (namespace, aliases, etc.) in between, violating PCF order when
+//     those non-canonical attributes are present.
+//
+// We emit the PCF-ordered keys first, then the non-PCF attributes
+// afterward. Non-PCF attributes are stripped from canonical form
+// before MarshalJSON is called, so their ordering is irrelevant to
+// canonical form — it only matters that PCF keys are correctly
+// ordered and complete.
+func (o aobject) MarshalJSON() ([]byte, error) {
+	type kv struct {
+		k string
+		v any
+	}
+	parts := make([]kv, 0, 8)
+
+	// PCF [ORDER]: name, type, fields, symbols, items, values, size.
+	if o.Name != "" {
+		parts = append(parts, kv{"name", o.Name})
+	}
+	parts = append(parts, kv{"type", o.Type})
+	switch o.Type {
+	case "record", "error":
+		fields := o.Fields
+		if fields == nil {
+			fields = []afield{}
+		}
+		parts = append(parts, kv{"fields", fields})
+	default:
+		if len(o.Fields) > 0 {
+			parts = append(parts, kv{"fields", o.Fields})
+		}
+	}
+	if o.Type == "enum" {
+		symbols := o.Symbols
+		if symbols == nil {
+			symbols = []string{}
+		}
+		parts = append(parts, kv{"symbols", symbols})
+	} else if len(o.Symbols) > 0 {
+		parts = append(parts, kv{"symbols", o.Symbols})
+	}
+	if o.Items != nil {
+		parts = append(parts, kv{"items", o.Items})
+	}
+	if o.Values != nil {
+		parts = append(parts, kv{"values", o.Values})
+	}
+	if o.Size != nil {
+		parts = append(parts, kv{"size", o.Size})
+	}
+
+	// Non-PCF attributes (stripped in canonical form).
+	if o.Namespace != nil {
+		parts = append(parts, kv{"namespace", *o.Namespace})
+	}
+	if len(o.Aliases) > 0 {
+		parts = append(parts, kv{"aliases", o.Aliases})
+	}
+	if len(o.Default) > 0 {
+		parts = append(parts, kv{"default", o.Default})
+	}
+	if o.Logical != "" {
+		parts = append(parts, kv{"logicalType", o.Logical})
+	}
+	if o.Precision != nil {
+		parts = append(parts, kv{"precision", *o.Precision})
+	}
+	if o.Scale != nil {
+		parts = append(parts, kv{"scale", *o.Scale})
+	}
+
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, p := range parts {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		// Key: a string literal we control, never fails.
+		kJSON, _ := json.Marshal(p.k)
+		buf.Write(kJSON)
+		buf.WriteByte(':')
+		vJSON, err := json.Marshal(p.v)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(vJSON)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
 var aobjectKnownKeys = map[string]bool{
 	"type": true, "name": true, "namespace": true, "doc": true,
 	"fields": true, "symbols": true, "items": true, "values": true,

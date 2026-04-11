@@ -196,7 +196,16 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 	if n.Size != 0 {
 		m["size"] = n.Size
 	}
-	if len(n.Symbols) > 0 {
+	// enum.symbols is a required attribute per the Avro spec (Complex
+	// Types > Enums: "symbols: a JSON array, listing symbols, as JSON
+	// strings (required)"), always emit for enum types even when empty.
+	if n.Type == "enum" {
+		if n.Symbols == nil {
+			m["symbols"] = []string{}
+		} else {
+			m["symbols"] = n.Symbols
+		}
+	} else if len(n.Symbols) > 0 {
 		m["symbols"] = n.Symbols
 	}
 	if n.Items != nil {
@@ -205,7 +214,10 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 	if n.Values != nil {
 		m["values"] = n.Values.toJSONDedup(d)
 	}
-	if len(n.Fields) > 0 {
+	// record.fields is a required attribute per the Avro spec (Complex
+	// Types > Records: "fields: a JSON array, listing fields (required)"),
+	// always emit for record/error types even when empty.
+	if n.Type == "record" || n.Type == "error" || len(n.Fields) > 0 {
 		fields := make([]map[string]any, len(n.Fields))
 		for i, f := range n.Fields {
 			fd := map[string]any{
@@ -286,7 +298,16 @@ func (n *SchemaNode) toJSON() any {
 	if n.Size != 0 {
 		m["size"] = n.Size
 	}
-	if len(n.Symbols) > 0 {
+	// enum.symbols is a required attribute per the Avro spec (Complex
+	// Types > Enums: "symbols: a JSON array, listing symbols, as JSON
+	// strings (required)"), always emit for enum types even when empty.
+	if n.Type == "enum" {
+		if n.Symbols == nil {
+			m["symbols"] = []string{}
+		} else {
+			m["symbols"] = n.Symbols
+		}
+	} else if len(n.Symbols) > 0 {
 		m["symbols"] = n.Symbols
 	}
 	if n.Items != nil {
@@ -295,7 +316,10 @@ func (n *SchemaNode) toJSON() any {
 	if n.Values != nil {
 		m["values"] = n.Values.toJSON()
 	}
-	if len(n.Fields) > 0 {
+	// record.fields is a required attribute per the Avro spec (Complex
+	// Types > Records: "fields: a JSON array, listing fields (required)"),
+	// always emit for record/error types even when empty.
+	if n.Type == "record" || n.Type == "error" || len(n.Fields) > 0 {
 		fields := make([]map[string]any, len(n.Fields))
 		for i, f := range n.Fields {
 			fd := map[string]any{

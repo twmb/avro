@@ -161,6 +161,85 @@ func TestMarshalJSON(t *testing.T) {
 		}
 	})
 
+	// Exercise aobject.MarshalJSON's non-PCF attribute branches. These
+	// paths are stripped from canonical form (Canonical() zeroes
+	// namespace, aliases, default, logicalType, precision, scale before
+	// calling MarshalJSON), so they only run when aobject is serialized
+	// directly. We keep them so the MarshalJSON is a proper full-schema
+	// marshal rather than a canonical-only marshal, and cover them here.
+	t.Run("object full attrs", func(t *testing.T) {
+		ns := "com.example"
+		prec := 9
+		scale := 2
+		o := aobject{
+			Name:      "r",
+			Type:      "record",
+			Namespace: &ns,
+			Aliases:   []string{"old"},
+			Default:   json.RawMessage(`null`),
+			Logical:   "decimal",
+			Precision: &prec,
+			Scale:     &scale,
+		}
+		b, err := json.Marshal(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(b)
+		// PCF-ordered keys first (name, type, fields), then non-PCF
+		// attributes in declaration order.
+		want := `{"name":"r","type":"record","fields":[],"namespace":"com.example","aliases":["old"],"default":null,"logicalType":"decimal","precision":9,"scale":2}`
+		if got != want {
+			t.Errorf("\n got %s\nwant %s", got, want)
+		}
+	})
+
+	// Defensive branches: a non-record type with populated Fields, or a
+	// non-enum type with populated Symbols, is nonsense per the Avro
+	// spec, but MarshalJSON still emits them for debuggability.
+	t.Run("object defensive fields on non-record", func(t *testing.T) {
+		o := aobject{
+			Type:   "int",
+			Fields: []afield{{Name: "x", Type: &aschema{primitive: "int"}}},
+		}
+		b, err := json.Marshal(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), `"fields":[`) {
+			t.Errorf("got %s, want fields to be emitted", b)
+		}
+	})
+	t.Run("object defensive symbols on non-enum", func(t *testing.T) {
+		o := aobject{
+			Type:    "int",
+			Symbols: []string{"A", "B"},
+		}
+		b, err := json.Marshal(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), `"symbols":["A","B"]`) {
+			t.Errorf("got %s, want symbols to be emitted", b)
+		}
+	})
+
+	// Enum with nil Symbols slice: MarshalJSON emits "symbols":[] to
+	// satisfy the spec's required attribute.
+	t.Run("object nil enum symbols", func(t *testing.T) {
+		o := aobject{
+			Name: "E",
+			Type: "enum",
+		}
+		b, err := json.Marshal(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != `{"name":"E","type":"enum","symbols":[]}` {
+			t.Errorf("got %s", b)
+		}
+	})
+
 	t.Run("union", func(t *testing.T) {
 		s := aschema{union: []aschema{{primitive: "null"}, {primitive: "int"}}}
 		b, err := json.Marshal(s)
