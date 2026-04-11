@@ -1050,3 +1050,63 @@ func TestSchemaForOmitzeroTag(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSchemaForDuplicateUUID(t *testing.T) {
+	type TwoUUIDs struct {
+		A [16]byte `avro:"a,uuid"`
+		B [16]byte `avro:"b,uuid"`
+	}
+	s, err := SchemaFor[TwoUUIDs]()
+	if err != nil {
+		t.Fatalf("SchemaFor with duplicate UUID fields should succeed: %v", err)
+	}
+	input := TwoUUIDs{A: [16]byte{1}, B: [16]byte{2}}
+	enc, err := s.Encode(&input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out TwoUUIDs
+	if _, err := s.Decode(enc, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != input {
+		t.Fatalf("round-trip: got %v, want %v", out, input)
+	}
+}
+
+func TestSchemaForDuplicateFixedConflictErrors(t *testing.T) {
+	type Conflict struct {
+		A [16]byte `avro:"a"`
+		B [8]byte  `avro:"b"`
+	}
+	// Both infer fixed with name "fixed_16" / "fixed_8" — no conflict.
+	// But if we use custom types that map both to the same Avro name...
+	_, err := SchemaFor[Conflict](
+		CustomType{
+			GoType:      reflect.TypeFor[[16]byte](),
+			LogicalType: "uuid",
+			Schema:      &SchemaNode{Type: "fixed", Name: "shared", Size: 16, LogicalType: "uuid"},
+		},
+		CustomType{
+			GoType:      reflect.TypeFor[[8]byte](),
+			LogicalType: "uuid",
+			Schema:      &SchemaNode{Type: "fixed", Name: "shared", Size: 8}, // same name, different size
+		},
+	)
+	if err == nil {
+		t.Fatal("expected error for conflicting named type definitions in SchemaFor")
+	}
+}
+
+func TestSchemaForCustomTypeNoAvroType(t *testing.T) {
+	type MyType struct{ X int }
+	type Rec struct {
+		F MyType `avro:"f"`
+	}
+	// CustomType has GoType but neither AvroType nor Schema set.
+	ct := CustomType{GoType: reflect.TypeFor[MyType]()}
+	_, err := SchemaFor[Rec](ct)
+	if err == nil {
+		t.Fatal("expected error for CustomType without AvroType or Schema")
+	}
+}

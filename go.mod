@@ -1,6 +1,6 @@
 module github.com/twmb/avro
 
-go 1.26
+go 1.25
 
 require github.com/klauspost/compress v1.18.4
 

@@ -830,17 +830,17 @@ func TestSpecZigzagBoundaryValues(t *testing.T) {
 	}{
 		// int (varint, 32-bit zigzag)
 		{"int 0", `"int"`, new(int32), []byte{0x00}},
-		{"int -1", `"int"`, new(int32(-1)), []byte{0x01}},
-		{"int 1", `"int"`, new(int32(1)), []byte{0x02}},
-		{"int -2", `"int"`, new(int32(-2)), []byte{0x03}},
-		{"int 2", `"int"`, new(int32(2)), []byte{0x04}},
+		{"int -1", `"int"`, ptr(int32(-1)), []byte{0x01}},
+		{"int 1", `"int"`, ptr(int32(1)), []byte{0x02}},
+		{"int -2", `"int"`, ptr(int32(-2)), []byte{0x03}},
+		{"int 2", `"int"`, ptr(int32(2)), []byte{0x04}},
 		{"int MaxInt32", `"int"`, ptr(int32(math.MaxInt32)), []byte{0xFE, 0xFF, 0xFF, 0xFF, 0x0F}},
 		{"int MinInt32", `"int"`, ptr(int32(math.MinInt32)), []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x0F}},
 
 		// long (varlong, 64-bit zigzag)
 		{"long 0", `"long"`, new(int64), []byte{0x00}},
-		{"long -1", `"long"`, new(int64(-1)), []byte{0x01}},
-		{"long 1", `"long"`, new(int64(1)), []byte{0x02}},
+		{"long -1", `"long"`, ptr(int64(-1)), []byte{0x01}},
+		{"long 1", `"long"`, ptr(int64(1)), []byte{0x02}},
 		{"long MaxInt64", `"long"`, ptr(int64(math.MaxInt64)),
 			[]byte{0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}},
 		{"long MinInt64", `"long"`, ptr(int64(math.MinInt64)),
@@ -1156,9 +1156,7 @@ func TestSpecLongRejectsUnsignedOverflow(t *testing.T) {
 }
 
 // ptr returns a pointer to v. Used for building test values.
-//
-//go:fix inline
-func ptr[T any](v T) *T { return new(v) }
+func ptr[T any](v T) *T { return &v }
 
 // ---------- errors_test.go ----------
 

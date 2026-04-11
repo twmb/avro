@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"strings"
 )
 
 // SchemaNode is a read-write representation of an Avro schema. It can be
@@ -66,12 +67,34 @@ type SchemaField struct {
 
 // Schema parses the SchemaNode into a [*Schema] that can be used for
 // encoding and decoding. Returns an error if the node is invalid.
+//
+// Named types (record, enum, fixed) that appear multiple times in the
+// tree are automatically deduplicated: the first occurrence emits the
+// full definition and subsequent occurrences emit a name reference.
 func (n *SchemaNode) Schema() (*Schema, error) {
-	b, err := json.Marshal(n.toJSON())
+	d := &deduper{
+		defined: make(map[string]string),
+		visited: make(map[*SchemaNode]struct{}),
+	}
+	tree := n.toJSONDedup(d)
+	if d.err != nil {
+		return nil, d.err
+	}
+	b, err := json.Marshal(tree)
 	if err != nil {
 		return nil, fmt.Errorf("avro: marshaling schema node: %w", err)
 	}
 	return Parse(string(b))
+}
+
+// deduper tracks named type definitions during toJSONDedup and records
+// conflicting redefinitions. It also detects cycles introduced via
+// *SchemaNode Items/Values pointers (which are the only way a SchemaNode
+// tree can have true cycles — Fields and Branches are value slices).
+type deduper struct {
+	defined map[string]string        // name → marshaled JSON of first definition
+	visited map[*SchemaNode]struct{} // seen *SchemaNode pointers (cycle detection)
+	err     error                    // first conflict or cycle encountered
 }
 
 // Root returns the SchemaNode representation of a parsed schema by
@@ -86,6 +109,128 @@ func (s *Schema) Root() SchemaNode {
 		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
 	}
 	return nodeFromJSON(raw)
+}
+
+// toJSONDedup is like toJSON but deduplicates named types. The first
+// occurrence of a named type (record, enum, fixed) emits the full
+// definition; subsequent occurrences emit the name as a reference.
+func (n *SchemaNode) toJSONDedup(d *deduper) any {
+	// Cycle detection for *SchemaNode pointers (Items/Values). Fields
+	// and Branches are value slices and cannot form true cycles.
+	if _, cycle := d.visited[n]; cycle {
+		if d.err == nil {
+			d.err = fmt.Errorf("avro: cyclic SchemaNode detected")
+		}
+		return nil
+	}
+	d.visited[n] = struct{}{}
+	defer delete(d.visited, n)
+
+	// For named types with a Name, check if already defined.
+	switch n.Type {
+	case "record", "error", "enum", "fixed":
+		if n.Name != "" {
+			if prev, exists := d.defined[n.Name]; exists {
+				cur, _ := json.Marshal(n.toJSON())
+				if string(cur) != prev && d.err == nil {
+					d.err = fmt.Errorf("avro: conflicting definitions for named type %q", n.Name)
+				}
+				return n.Name
+			}
+		}
+	}
+
+	switch n.Type {
+	case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
+		if n.LogicalType == "" && len(n.Props) == 0 {
+			return n.Type
+		}
+	case "union":
+		branches := make([]any, len(n.Branches))
+		for i := range n.Branches {
+			branches[i] = n.Branches[i].toJSONDedup(d)
+		}
+		return branches
+	}
+
+	if n.Name == "" && n.Type != "array" && n.Type != "map" &&
+		n.Type != "record" && n.Type != "error" && n.Type != "enum" && n.Type != "fixed" &&
+		n.Type != "union" && n.LogicalType == "" && len(n.Props) == 0 {
+		return n.Type
+	}
+
+	// Mark named types as defined, storing the canonical JSON for comparison.
+	switch n.Type {
+	case "record", "error", "enum", "fixed":
+		if n.Name != "" {
+			b, _ := json.Marshal(n.toJSON())
+			d.defined[n.Name] = string(b)
+		}
+	}
+
+	m := map[string]any{"type": n.Type}
+	if n.Name != "" {
+		m["name"] = n.Name
+	}
+	if n.Namespace != "" {
+		m["namespace"] = n.Namespace
+	}
+	if len(n.Aliases) > 0 {
+		m["aliases"] = n.Aliases
+	}
+	if n.Doc != "" {
+		m["doc"] = n.Doc
+	}
+	if n.HasEnumDefault {
+		m["default"] = n.EnumDefault
+	}
+	if n.LogicalType != "" {
+		m["logicalType"] = n.LogicalType
+	}
+	if n.Precision != 0 {
+		m["precision"] = n.Precision
+	}
+	if n.Scale != 0 {
+		m["scale"] = n.Scale
+	}
+	if n.Size != 0 {
+		m["size"] = n.Size
+	}
+	if len(n.Symbols) > 0 {
+		m["symbols"] = n.Symbols
+	}
+	if n.Items != nil {
+		m["items"] = n.Items.toJSONDedup(d)
+	}
+	if n.Values != nil {
+		m["values"] = n.Values.toJSONDedup(d)
+	}
+	if len(n.Fields) > 0 {
+		fields := make([]map[string]any, len(n.Fields))
+		for i, f := range n.Fields {
+			fd := map[string]any{
+				"name": f.Name,
+				"type": f.Type.toJSONDedup(d),
+			}
+			if f.HasDefault || f.Default != nil {
+				fd["default"] = f.Default
+			}
+			if len(f.Aliases) > 0 {
+				fd["aliases"] = f.Aliases
+			}
+			if f.Order != "" {
+				fd["order"] = f.Order
+			}
+			if f.Doc != "" {
+				fd["doc"] = f.Doc
+			}
+			maps.Copy(fd, f.Props)
+			fields[i] = fd
+		}
+		m["fields"] = fields
+	}
+	maps.Copy(m, n.Props)
+	return m
 }
 
 // toJSON converts a SchemaNode to a JSON-serializable representation.
@@ -210,104 +355,151 @@ var fieldReservedKeys = map[string]bool{
 	"aliases": true, "order": true,
 }
 
+// lookupCI looks up key k in m, matching case-insensitively. Mirrors
+// encoding/json's struct field matching so schemas with non-canonical
+// casing ("tYpe" instead of "type") round-trip through Root/Schema.
+func lookupCI(m map[string]any, key string) (any, bool) {
+	if v, ok := m[key]; ok {
+		return v, true
+	}
+	for k, v := range m {
+		if strings.EqualFold(k, key) {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
 func nodeFromJSONObject(m map[string]any) SchemaNode {
 	n := SchemaNode{}
 
-	if t, ok := m["type"].(string); ok {
-		n.Type = t
+	if v, ok := lookupCI(m, "type"); ok {
+		if t, ok := v.(string); ok {
+			n.Type = t
+		}
 	}
-	if name, ok := m["name"].(string); ok {
-		n.Name = name
+	if v, ok := lookupCI(m, "name"); ok {
+		if name, ok := v.(string); ok {
+			n.Name = name
+		}
 	}
-	if ns, ok := m["namespace"].(string); ok {
-		n.Namespace = ns
+	if v, ok := lookupCI(m, "namespace"); ok {
+		if ns, ok := v.(string); ok {
+			n.Namespace = ns
+		}
 	}
-	if doc, ok := m["doc"].(string); ok {
-		n.Doc = doc
+	if v, ok := lookupCI(m, "doc"); ok {
+		if doc, ok := v.(string); ok {
+			n.Doc = doc
+		}
 	}
-	if lt, ok := m["logicalType"].(string); ok {
-		n.LogicalType = lt
+	if v, ok := lookupCI(m, "logicalType"); ok {
+		if lt, ok := v.(string); ok {
+			n.LogicalType = lt
+		}
 	}
-	if p, ok := m["precision"].(float64); ok {
-		n.Precision = int(p)
+	if v, ok := lookupCI(m, "precision"); ok {
+		if p, ok := v.(float64); ok {
+			n.Precision = int(p)
+		}
 	}
-	if s, ok := m["scale"].(float64); ok {
-		n.Scale = int(s)
+	if v, ok := lookupCI(m, "scale"); ok {
+		if s, ok := v.(float64); ok {
+			n.Scale = int(s)
+		}
 	}
-	if s, ok := m["size"].(float64); ok {
-		n.Size = int(s)
-	}
-
-	if aliases, ok := m["aliases"].([]any); ok {
-		n.Aliases = make([]string, len(aliases))
-		for i, a := range aliases {
-			n.Aliases[i], _ = a.(string)
+	if v, ok := lookupCI(m, "size"); ok {
+		if s, ok := v.(float64); ok {
+			n.Size = int(s)
 		}
 	}
 
-	if syms, ok := m["symbols"].([]any); ok {
-		n.Symbols = make([]string, len(syms))
-		for i, s := range syms {
-			n.Symbols[i], _ = s.(string)
+	if v, ok := lookupCI(m, "aliases"); ok {
+		if aliases, ok := v.([]any); ok {
+			n.Aliases = make([]string, len(aliases))
+			for i, a := range aliases {
+				n.Aliases[i], _ = a.(string)
+			}
 		}
 	}
-	if d, ok := m["default"].(string); ok && n.Type == "enum" {
-		n.EnumDefault = d
-		n.HasEnumDefault = true
+
+	if v, ok := lookupCI(m, "symbols"); ok {
+		if syms, ok := v.([]any); ok {
+			n.Symbols = make([]string, len(syms))
+			for i, s := range syms {
+				n.Symbols[i], _ = s.(string)
+			}
+		}
+	}
+	if v, ok := lookupCI(m, "default"); ok && n.Type == "enum" {
+		if d, ok := v.(string); ok {
+			n.EnumDefault = d
+			n.HasEnumDefault = true
+		}
 	}
 
-	if items, ok := m["items"]; ok {
+	if items, ok := lookupCI(m, "items"); ok {
 		node := nodeFromJSON(items)
 		n.Items = &node
 	}
-	if values, ok := m["values"]; ok {
+	if values, ok := lookupCI(m, "values"); ok {
 		node := nodeFromJSON(values)
 		n.Values = &node
 	}
 
-	if fields, ok := m["fields"].([]any); ok {
-		n.Fields = make([]SchemaField, len(fields))
-		for i, f := range fields {
-			fm, _ := f.(map[string]any)
-			sf := SchemaField{}
-			if name, ok := fm["name"].(string); ok {
-				sf.Name = name
-			}
-			if t, ok := fm["type"]; ok {
-				sf.Type = nodeFromJSON(t)
-			}
-			if d, ok := fm["default"]; ok {
-				sf.Default = d
-				sf.HasDefault = true
-			}
-			if doc, ok := fm["doc"].(string); ok {
-				sf.Doc = doc
-			}
-			if aliases, ok := fm["aliases"].([]any); ok {
-				sf.Aliases = make([]string, len(aliases))
-				for j, a := range aliases {
-					sf.Aliases[j], _ = a.(string)
+	if v, ok := lookupCI(m, "fields"); ok {
+		if fields, ok := v.([]any); ok {
+			n.Fields = make([]SchemaField, len(fields))
+			for i, f := range fields {
+				fm, _ := f.(map[string]any)
+				sf := SchemaField{}
+				if v, ok := lookupCI(fm, "name"); ok {
+					if name, ok := v.(string); ok {
+						sf.Name = name
+					}
 				}
-			}
-			if order, ok := fm["order"].(string); ok {
-				sf.Order = order
-			}
-			for k, v := range fm {
-				if fieldReservedKeys[k] {
-					continue
+				if t, ok := lookupCI(fm, "type"); ok {
+					sf.Type = nodeFromJSON(t)
 				}
-				if sf.Props == nil {
-					sf.Props = make(map[string]any)
+				if d, ok := lookupCI(fm, "default"); ok {
+					sf.Default = d
+					sf.HasDefault = true
 				}
-				sf.Props[k] = v
+				if v, ok := lookupCI(fm, "doc"); ok {
+					if doc, ok := v.(string); ok {
+						sf.Doc = doc
+					}
+				}
+				if v, ok := lookupCI(fm, "aliases"); ok {
+					if aliases, ok := v.([]any); ok {
+						sf.Aliases = make([]string, len(aliases))
+						for j, a := range aliases {
+							sf.Aliases[j], _ = a.(string)
+						}
+					}
+				}
+				if v, ok := lookupCI(fm, "order"); ok {
+					if order, ok := v.(string); ok {
+						sf.Order = order
+					}
+				}
+				for k, v := range fm {
+					if fieldReservedKeyCI(k) {
+						continue
+					}
+					if sf.Props == nil {
+						sf.Props = make(map[string]any)
+					}
+					sf.Props[k] = v
+				}
+				n.Fields[i] = sf
 			}
-			n.Fields[i] = sf
 		}
 	}
 
 	// Collect custom properties (anything not in the reserved set).
 	for k, v := range m {
-		if schemaReservedKeys[k] {
+		if schemaReservedKeyCI(k) {
 			continue
 		}
 		if n.Props == nil {
@@ -317,4 +509,30 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 	}
 
 	return n
+}
+
+// fieldReservedKeyCI is a case-insensitive wrapper over fieldReservedKeys.
+func fieldReservedKeyCI(k string) bool {
+	if fieldReservedKeys[k] {
+		return true
+	}
+	for rk := range fieldReservedKeys {
+		if strings.EqualFold(k, rk) {
+			return true
+		}
+	}
+	return false
+}
+
+// schemaReservedKeyCI is a case-insensitive wrapper over schemaReservedKeys.
+func schemaReservedKeyCI(k string) bool {
+	if schemaReservedKeys[k] {
+		return true
+	}
+	for rk := range schemaReservedKeys {
+		if strings.EqualFold(k, rk) {
+			return true
+		}
+	}
+	return false
 }

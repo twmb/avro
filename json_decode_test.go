@@ -114,6 +114,41 @@ func TestDecodeJSONTypedBytes(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("decimal bytes from JSON number to big.Rat", func(t *testing.T) {
+		s, _ := Parse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+		var r big.Rat
+		if err := s.DecodeJSON([]byte("12.34"), &r); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("decimal bytes from JSON number to json.Number", func(t *testing.T) {
+		s, _ := Parse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+		var n json.Number
+		if err := s.DecodeJSON([]byte("12.34"), &n); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("decimal fixed from JSON number to big.Rat", func(t *testing.T) {
+		s, _ := Parse(`{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`)
+		var r big.Rat
+		if err := s.DecodeJSON([]byte("12.34"), &r); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("decimal fixed from JSON number to json.Number", func(t *testing.T) {
+		s, _ := Parse(`{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`)
+		var n json.Number
+		if err := s.DecodeJSON([]byte("12.34"), &n); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("decimal bytes from JSON number to unsupported type errors", func(t *testing.T) {
+		s, _ := Parse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+		var i int
+		if err := s.DecodeJSON([]byte("12.34"), &i); err == nil {
+			t.Fatal("expected error for unsupported target")
+		}
+	})
 	t.Run("fixed duration to Duration", func(t *testing.T) {
 		s, _ := Parse(`{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`)
 		var d Duration
@@ -1686,4 +1721,188 @@ func TestDecodeJSONWalkEscapesBadHex(t *testing.T) {
 	if err := s.DecodeJSON([]byte(`"\u00GG"`), &out); err == nil {
 		t.Fatal("expected error for bad hex in \\u")
 	}
+}
+
+// TestDecodeJSONLogicalTyped exercises typed target paths for logical
+// types in decodeInt, decodeLong, decodeFixed, and decodeBytes.
+func TestDecodeJSONLogicalTyped(t *testing.T) {
+	// date → time.Time
+	t.Run("date to time.Time", func(t *testing.T) {
+		s := MustParse(`{"type":"int","logicalType":"date"}`)
+		var tm time.Time
+		if err := s.DecodeJSON([]byte("18262"), &tm); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// time-millis → time.Duration
+	t.Run("time-millis to time.Duration", func(t *testing.T) {
+		s := MustParse(`{"type":"int","logicalType":"time-millis"}`)
+		var d time.Duration
+		if err := s.DecodeJSON([]byte("12345"), &d); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// timestamp-millis → time.Time (each variant)
+	for _, lt := range []string{"timestamp-millis", "local-timestamp-millis"} {
+		t.Run(lt+" to time.Time", func(t *testing.T) {
+			s := MustParse(`{"type":"long","logicalType":"` + lt + `"}`)
+			var tm time.Time
+			if err := s.DecodeJSON([]byte("1577880645000"), &tm); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for _, lt := range []string{"timestamp-micros", "local-timestamp-micros"} {
+		t.Run(lt+" to time.Time", func(t *testing.T) {
+			s := MustParse(`{"type":"long","logicalType":"` + lt + `"}`)
+			var tm time.Time
+			if err := s.DecodeJSON([]byte("1577880645000000"), &tm); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for _, lt := range []string{"timestamp-nanos", "local-timestamp-nanos"} {
+		t.Run(lt+" to time.Time", func(t *testing.T) {
+			s := MustParse(`{"type":"long","logicalType":"` + lt + `"}`)
+			var tm time.Time
+			if err := s.DecodeJSON([]byte("1577880645000000000"), &tm); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	t.Run("time-micros to time.Duration", func(t *testing.T) {
+		s := MustParse(`{"type":"long","logicalType":"time-micros"}`)
+		var d time.Duration
+		if err := s.DecodeJSON([]byte("12345"), &d); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// long to int/uint targets
+	t.Run("long to int", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var n int
+		if err := s.DecodeJSON([]byte("42"), &n); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("long to uint", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var n uint
+		if err := s.DecodeJSON([]byte("42"), &n); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("long to unsupported errors", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var f string
+		if err := s.DecodeJSON([]byte("42"), &f); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("int to uint", func(t *testing.T) {
+		s := MustParse(`"int"`)
+		var n uint
+		if err := s.DecodeJSON([]byte("42"), &n); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("int to unsupported errors", func(t *testing.T) {
+		s := MustParse(`"int"`)
+		var f string
+		if err := s.DecodeJSON([]byte("42"), &f); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+// TestDecodeJSONErrorPaths exercises error branches in decodeEnum,
+// decodeBytes, decodeFixed, decodeFloat, decodeDouble.
+func TestDecodeJSONErrorPaths(t *testing.T) {
+	// enum errors
+	enumS := MustParse(`{"type":"enum","name":"E","symbols":["A","B"]}`)
+	if err := enumS.DecodeJSON([]byte(`"C"`), new(string)); err == nil {
+		t.Error("expected unknown symbol error")
+	}
+	if err := enumS.DecodeJSON([]byte(`"A"`), new(int)); err == nil {
+		t.Error("expected unsupported target error")
+	}
+	// decodeBytes decimal invalid number
+	bytesDecS := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+	if err := bytesDecS.DecodeJSON([]byte("not_a_number"), new(json.Number)); err == nil {
+		t.Error("expected invalid decimal error")
+	}
+	// decodeFixed decimal invalid number
+	fixedDecS := MustParse(`{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`)
+	if err := fixedDecS.DecodeJSON([]byte("not_a_number"), new(json.Number)); err == nil {
+		t.Error("expected invalid decimal error")
+	}
+	// decodeFloat invalid
+	floatS := MustParse(`"float"`)
+	if err := floatS.DecodeJSON([]byte(`"not a float"`), new(float32)); err == nil {
+		t.Error("expected invalid float error")
+	}
+	// decodeDouble invalid
+	doubleS := MustParse(`"double"`)
+	if err := doubleS.DecodeJSON([]byte(`"not a double"`), new(float64)); err == nil {
+		t.Error("expected invalid double error")
+	}
+	// int unsupported target
+	intS := MustParse(`"int"`)
+	var f float32
+	if err := intS.DecodeJSON([]byte(`42`), &f); err == nil {
+		t.Error("expected unsupported target for int")
+	}
+	// fixed decimal with typed unsupported target
+	if err := fixedDecS.DecodeJSON([]byte("12.34"), new(int)); err == nil {
+		t.Error("expected error for unsupported target")
+	}
+}
+
+// TestDecodeJSONMapTimeValues exercises the non-addressable time.Time/
+// time.Duration paths in decodeInt and decodeLong (map values are not
+// addressable).
+func TestDecodeJSONMapTimeValues(t *testing.T) {
+	// map with time.Time values (timestamp-micros)
+	t.Run("map timestamp-millis time.Time", func(t *testing.T) {
+		s := MustParse(`{"type":"map","values":{"type":"long","logicalType":"timestamp-millis"}}`)
+		var m map[string]time.Time
+		if err := s.DecodeJSON([]byte(`{"a":1577880645000}`), &m); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("map timestamp-micros time.Time", func(t *testing.T) {
+		s := MustParse(`{"type":"map","values":{"type":"long","logicalType":"timestamp-micros"}}`)
+		var m map[string]time.Time
+		if err := s.DecodeJSON([]byte(`{"a":1577880645000000}`), &m); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("map timestamp-nanos time.Time", func(t *testing.T) {
+		s := MustParse(`{"type":"map","values":{"type":"long","logicalType":"timestamp-nanos"}}`)
+		var m map[string]time.Time
+		if err := s.DecodeJSON([]byte(`{"a":1577880645000000000}`), &m); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("map time-micros time.Duration", func(t *testing.T) {
+		s := MustParse(`{"type":"map","values":{"type":"long","logicalType":"time-micros"}}`)
+		var m map[string]time.Duration
+		if err := s.DecodeJSON([]byte(`{"a":12345}`), &m); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("map date time.Time", func(t *testing.T) {
+		s := MustParse(`{"type":"map","values":{"type":"int","logicalType":"date"}}`)
+		var m map[string]time.Time
+		if err := s.DecodeJSON([]byte(`{"a":18262}`), &m); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("map time-millis time.Duration", func(t *testing.T) {
+		s := MustParse(`{"type":"map","values":{"type":"int","logicalType":"time-millis"}}`)
+		var m map[string]time.Duration
+		if err := s.DecodeJSON([]byte(`{"a":12345}`), &m); err != nil {
+			t.Fatal(err)
+		}
+	})
 }

@@ -181,8 +181,7 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 	collect(t, nil, make(map[reflect.Type]bool))
 
 	// Build name -> index map. Tagged fields win over untagged, and
-	// shallower fields win over deeper ones (first-seen wins within
-	// the same priority since we collect top-down).
+	// shallower fields win over deeper ones.
 	type entry struct {
 		index    []int
 		tagged   bool
@@ -194,8 +193,15 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 			// Tagged always beats untagged.
 			if f.tagged && !existing.tagged {
 				m[f.name] = entry{f.index, f.tagged, f.omitzero}
+				continue
 			}
-			// Otherwise first-seen (shallower) wins; skip.
+			if !f.tagged && existing.tagged {
+				continue
+			}
+			// Same tagged status: shallower (shorter index) wins.
+			if len(f.index) < len(existing.index) {
+				m[f.name] = entry{f.index, f.tagged, f.omitzero}
+			}
 			continue
 		}
 		m[f.name] = entry{f.index, f.tagged, f.omitzero}

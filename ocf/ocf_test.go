@@ -2959,3 +2959,55 @@ func TestNegativeBlockCountRead(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestWriterSchema(t *testing.T) {
+	schema := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Schema(); got != schema {
+		t.Fatal("Writer.Schema() did not return the original schema")
+	}
+	w.Close()
+}
+
+func TestWithSchemaOptsCustomType(t *testing.T) {
+	// Register a custom type that converts date logicalType to a raw int32
+	// (suppresses the built-in time.Time conversion).
+	schema := avro.MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"d","type":{"type":"int","logicalType":"date"}}
+	]}`)
+
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Write one record.
+	if err := w.Encode(map[string]any{"d": int32(18262)}); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	// Read with WithSchemaOpts + CustomType that suppresses logical type.
+	ct := avro.CustomType{
+		LogicalType: "date",
+		AvroType:    "int",
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return v, nil // raw int32
+		},
+	}
+	r, err := NewReader(&buf, WithSchemaOpts(ct))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err := r.Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out["d"].(int32); !ok {
+		t.Fatalf("expected int32 (custom type suppressed logical), got %T", out["d"])
+	}
+}

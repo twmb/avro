@@ -138,6 +138,10 @@ func (optSchema) writerOpt()        {}
 func (optReaderSchema) readerOpt()  {}
 func (optMaxBlockBytes) readerOpt() {}
 
+type optSchemaOpts []avro.SchemaOpt
+
+func (optSchemaOpts) readerOpt() {}
+
 // WithCodec sets the compression codec. The default is null (no compression).
 // WithCodec can be used as both a [WriterOpt] and a [ReaderOpt]. The four
 // built-in codecs (null, deflate, snappy, zstandard) do not need to be
@@ -185,6 +189,11 @@ func WithReaderSchema(s *avro.Schema) ReaderOpt { return optReaderSchema{s} }
 // reader will accept. The default is 64 MiB. This guards against malicious
 // or corrupt files that declare very large blocks.
 func WithMaxBlockBytes(n int64) ReaderOpt { return optMaxBlockBytes{n} }
+
+// WithSchemaOpts passes [avro.SchemaOpt] values (such as [avro.CustomType])
+// to the [avro.Parse] call that parses the file header's embedded schema.
+// This allows registering custom type conversions for the reader's schema.
+func WithSchemaOpts(opts ...avro.SchemaOpt) ReaderOpt { return optSchemaOpts(opts) }
 
 // DeflateCodec returns a [Codec] using raw DEFLATE compression at the given
 // level (e.g. [flate.DefaultCompression]).
@@ -446,7 +455,7 @@ func (w *Writer) Reset(dst io.Writer) error {
 // against the header). Other options are ignored.
 func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error) {
 	br := bufio.NewReader(rws)
-	schema, meta, sync, err := readHeader(br)
+	schema, meta, sync, err := readHeader(br, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +518,7 @@ type Reader struct {
 
 // readHeader reads and validates the OCF header, returning the parsed
 // schema, raw metadata, and sync marker.
-func readHeader(br *bufio.Reader) (schema *avro.Schema, meta map[string][]byte, sync [16]byte, err error) {
+func readHeader(br *bufio.Reader, schemaOpts []avro.SchemaOpt) (schema *avro.Schema, meta map[string][]byte, sync [16]byte, err error) {
 	var m [4]byte
 	if _, err = io.ReadFull(br, m[:]); err != nil {
 		return nil, nil, sync, fmt.Errorf("ocf: reading magic: %w", err)
@@ -527,7 +536,7 @@ func readHeader(br *bufio.Reader) (schema *avro.Schema, meta map[string][]byte, 
 	if !ok {
 		return nil, nil, sync, errors.New("ocf: missing avro.schema in metadata")
 	}
-	schema, err = avro.Parse(string(schemaBytes))
+	schema, err = avro.Parse(string(schemaBytes), schemaOpts...)
 	if err != nil {
 		return nil, nil, sync, fmt.Errorf("ocf: parsing schema: %w", err)
 	}
@@ -545,6 +554,7 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	var customCodecs []Codec
 	var readerSchema *avro.Schema
 	var maxBlockBytes int64
+	var schemaOpts []avro.SchemaOpt
 	for _, o := range opts {
 		switch o := o.(type) {
 		case optCodec:
@@ -553,6 +563,8 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 			readerSchema = o.s
 		case optMaxBlockBytes:
 			maxBlockBytes = o.n
+		case optSchemaOpts:
+			schemaOpts = append(schemaOpts, o...)
 		}
 	}
 	if maxBlockBytes <= 0 {
@@ -560,7 +572,7 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	}
 
 	br := bufio.NewReader(r)
-	schema, meta, sync, err := readHeader(br)
+	schema, meta, sync, err := readHeader(br, schemaOpts)
 	if err != nil {
 		return nil, err
 	}

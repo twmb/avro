@@ -3,6 +3,7 @@ package avro
 import (
 	"encoding/json"
 	"math"
+	"math/big"
 	"reflect"
 	"strconv"
 	"testing"
@@ -2389,5 +2390,277 @@ func TestPrimitiveRoundTrips(t *testing.T) {
 				t.Errorf("full round-trip: got %T(%v), want %T(%v)", final, final, tt.want, tt.want)
 			}
 		})
+	}
+}
+
+// TestEncodeJSONCoercion exercises the numeric coercion paths in
+// jsonCoerceToInt32, jsonCoerceToInt64, and jsonCoerceToFloat64.
+func TestEncodeJSONCoercion(t *testing.T) {
+	intSchema := MustParse(`"int"`)
+	longSchema := MustParse(`"long"`)
+	floatSchema := MustParse(`"float"`)
+	doubleSchema := MustParse(`"double"`)
+
+	type enc struct {
+		name   string
+		schema *Schema
+		v      any
+		wantErr bool
+	}
+	cases := []enc{
+		// int32
+		{"int to int32", intSchema, int(42), false},
+		{"uint to int32", intSchema, uint(42), false},
+		{"float to int32", intSchema, float64(42), false},
+		{"json.Number int to int32", intSchema, json.Number("42"), false},
+		{"json.Number float int32", intSchema, json.Number("3.14"), true},
+		{"int64 overflow int32", intSchema, int64(1 << 40), true},
+		{"uint overflow int32", intSchema, uint64(1 << 40), true},
+		{"float overflow int32", intSchema, float64(1 << 40), true},
+		{"float non-whole int32", intSchema, float64(3.14), true},
+		{"json.Number overflow int32", intSchema, json.Number("99999999999"), true},
+		{"json.Number invalid int32", intSchema, json.Number("not a number"), true},
+		{"string to int32", intSchema, "hello", true},
+		// int64
+		{"int to int64", longSchema, int(42), false},
+		{"uint to int64", longSchema, uint(42), false},
+		{"float to int64", longSchema, float64(42), false},
+		{"json.Number int to int64", longSchema, json.Number("42"), false},
+		{"float non-whole int64", longSchema, float64(3.14), true},
+		{"uint64 max overflow int64", longSchema, uint64(1<<63 + 1), true},
+		{"float overflow int64", longSchema, float64(1e20), true},
+		{"json.Number float non-whole int64", longSchema, json.Number("3.14"), true},
+		{"json.Number float overflow int64", longSchema, json.Number("1e20"), true},
+		{"json.Number invalid int64", longSchema, json.Number("nope"), true},
+		{"string to int64", longSchema, "hello", true},
+		// float
+		{"int to float", floatSchema, int(42), false},
+		{"uint to float", floatSchema, uint(42), false},
+		{"json.Number to float", floatSchema, json.Number("3.14"), false},
+		{"int overflow float precision", floatSchema, int64(1 << 30), true},
+		{"uint overflow float precision", floatSchema, uint64(1 << 30), true},
+		{"int to double", doubleSchema, int(42), false},
+		{"invalid json.Number float", floatSchema, json.Number("nope"), true},
+		{"string to float", floatSchema, "hello", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.schema.EncodeJSON(tc.v)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestEncodeJSONLogical exercises logical type encoding paths in
+// appendAvroJSON for date, time, timestamp, decimal, and duration.
+func TestEncodeJSONLogical(t *testing.T) {
+	tm := time.Date(2020, 1, 1, 12, 30, 45, 123456789, time.UTC)
+	dur := 3*time.Hour + 45*time.Minute + 30*time.Second
+
+	cases := []struct {
+		name   string
+		schema string
+		v      any
+	}{
+		// date: time.Time → int
+		{"date from time.Time", `{"type":"int","logicalType":"date"}`, tm},
+		{"date from string", `{"type":"int","logicalType":"date"}`, "2020-01-01"},
+		// time-millis: int path from time.Time (hour/min/sec derived)
+		{"time-millis from time.Time", `{"type":"int","logicalType":"time-millis"}`, tm},
+		{"time-millis from time.Duration", `{"type":"int","logicalType":"time-millis"}`, dur},
+		// time-micros: int64 path from time.Duration
+		{"time-micros from time.Duration", `{"type":"long","logicalType":"time-micros"}`, dur},
+		// timestamp variants from time.Time
+		{"timestamp-millis from time.Time", `{"type":"long","logicalType":"timestamp-millis"}`, tm},
+		{"timestamp-micros from time.Time", `{"type":"long","logicalType":"timestamp-micros"}`, tm},
+		{"timestamp-nanos from time.Time", `{"type":"long","logicalType":"timestamp-nanos"}`, tm},
+		{"local-timestamp-millis from time.Time", `{"type":"long","logicalType":"local-timestamp-millis"}`, tm},
+		{"local-timestamp-micros from time.Time", `{"type":"long","logicalType":"local-timestamp-micros"}`, tm},
+		{"local-timestamp-nanos from time.Time", `{"type":"long","logicalType":"local-timestamp-nanos"}`, tm},
+		// timestamp from RFC 3339 string
+		{"timestamp-millis from string", `{"type":"long","logicalType":"timestamp-millis"}`, "2020-01-01T12:30:45Z"},
+		{"timestamp-micros from string", `{"type":"long","logicalType":"timestamp-micros"}`, "2020-01-01T12:30:45Z"},
+		{"timestamp-nanos from string", `{"type":"long","logicalType":"timestamp-nanos"}`, "2020-01-01T12:30:45Z"},
+		// decimal bytes from various numeric sources
+		{"decimal bytes from json.Number", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, json.Number("12.34")},
+		{"decimal bytes from big.Rat", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, *big.NewRat(1234, 100)},
+		{"decimal bytes from *big.Rat", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(1234, 100)},
+		{"decimal bytes from float", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, float64(12.34)},
+		// decimal fixed from various numeric sources
+		{"decimal fixed from json.Number", `{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`, json.Number("12.34")},
+		{"decimal fixed from big.Rat", `{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`, *big.NewRat(1234, 100)},
+		{"decimal fixed from *big.Rat", `{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(1234, 100)},
+		{"decimal fixed from float", `{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`, float64(12.34)},
+		// bytes from string
+		{"bytes from string", `"bytes"`, "hello"},
+		// duration
+		{"duration from Duration", `{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`, Duration{Months: 1, Days: 2, Milliseconds: 3}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := MustParse(tc.schema)
+			if _, err := s.EncodeJSON(tc.v); err != nil {
+				t.Fatalf("EncodeJSON: %v", err)
+			}
+		})
+	}
+}
+
+// TestBinaryEncodeCoercion covers the binary encode path's json.Number
+// and numeric coercion branches in serInt, serLong, serFloat, serDouble.
+func TestBinaryEncodeCoercion(t *testing.T) {
+	tm := time.Date(2020, 6, 15, 14, 30, 45, 0, time.UTC)
+	// serInt json.Number paths
+	intS := MustParse(`"int"`)
+	if _, err := intS.Encode(json.Number("42")); err != nil {
+		t.Error(err)
+	}
+	if _, err := intS.Encode(json.Number("3.14")); err == nil {
+		t.Error("expected non-whole error")
+	}
+	if _, err := intS.Encode(json.Number("99999999999")); err == nil {
+		t.Error("expected overflow")
+	}
+	if _, err := intS.Encode(json.Number("nope")); err == nil {
+		t.Error("expected invalid")
+	}
+	// serLong json.Number paths
+	longS := MustParse(`"long"`)
+	if _, err := longS.Encode(json.Number("42")); err != nil {
+		t.Error(err)
+	}
+	if _, err := longS.Encode(json.Number("3.14")); err == nil {
+		t.Error("expected non-whole error")
+	}
+	if _, err := longS.Encode(json.Number("1e20")); err == nil {
+		t.Error("expected overflow")
+	}
+	if _, err := longS.Encode(json.Number("nope")); err == nil {
+		t.Error("expected invalid")
+	}
+	// serLong with float non-whole and overflow
+	if _, err := longS.Encode(3.14); err == nil {
+		t.Error("expected non-whole error")
+	}
+	if _, err := longS.Encode(1e20); err == nil {
+		t.Error("expected overflow error")
+	}
+	// serTimeMillis with time.Time
+	tmsS := MustParse(`{"type":"int","logicalType":"time-millis"}`)
+	if _, err := tmsS.Encode(tm); err != nil {
+		t.Error(err)
+	}
+	// serInt with encode nil for non-union errors
+	if _, err := intS.Encode(nil); err == nil {
+		t.Error("expected error encoding nil as int")
+	}
+}
+
+// TestEncodeJSONStringEscapes covers all JSON escape sequences in
+// appendJSONString and appendAvroJSONBytes.
+func TestEncodeJSONStringEscapes(t *testing.T) {
+	strS := MustParse(`"string"`)
+	bytesS := MustParse(`"bytes"`)
+
+	// Every escape byte: \b \f \t \n \r \" \\
+	escapes := "\b\f\t\n\r\"\\"
+	if _, err := strS.EncodeJSON(escapes); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bytesS.EncodeJSON([]byte(escapes)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control chars (non-printable, < 0x20 but not one of the named escapes)
+	if _, err := strS.EncodeJSON("\x01\x02\x03"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bytesS.EncodeJSON([]byte{0x01, 0x02, 0xFF}); err != nil {
+		t.Fatal(err)
+	}
+
+	// U+2028 and U+2029 (line/paragraph separator)
+	if _, err := strS.EncodeJSON("\u2028\u2029"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Invalid UTF-8
+	if _, err := strS.EncodeJSON("\xff\xfe"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Multi-byte valid UTF-8
+	if _, err := strS.EncodeJSON("héllo"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestEncodeJSONStringBytesEnumCoverage covers remaining gaps in
+// appendAvroJSON for string, bytes, fixed, and enum types.
+func TestEncodeJSONStringBytesEnumCoverage(t *testing.T) {
+	strS := MustParse(`"string"`)
+	bytesS := MustParse(`"bytes"`)
+	fixedS := MustParse(`{"type":"fixed","name":"f","size":4}`)
+	enumS := MustParse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+
+	// string: json.Number rejected
+	if _, err := strS.EncodeJSON(json.Number("42")); err == nil {
+		t.Error("expected error for json.Number as string")
+	}
+	// string: []byte accepted
+	if _, err := strS.EncodeJSON([]byte("hi")); err != nil {
+		t.Error(err)
+	}
+	// string: TextMarshaler (time.Time implements it)
+	if _, err := strS.EncodeJSON(time.Now()); err != nil {
+		t.Error(err)
+	}
+	// string: unsupported type
+	if _, err := strS.EncodeJSON(42); err == nil {
+		t.Error("expected unsupported error")
+	}
+
+	// bytes: unsupported type
+	if _, err := bytesS.EncodeJSON(42); err == nil {
+		t.Error("expected unsupported error")
+	}
+
+	// fixed: string source
+	if _, err := fixedS.EncodeJSON("abcd"); err != nil {
+		t.Error(err)
+	}
+	// fixed: [4]byte array
+	if _, err := fixedS.EncodeJSON([4]byte{1, 2, 3, 4}); err != nil {
+		t.Error(err)
+	}
+	// fixed: size mismatch
+	if _, err := fixedS.EncodeJSON("xyz"); err == nil {
+		t.Error("expected size mismatch")
+	}
+	// fixed: wrong type
+	if _, err := fixedS.EncodeJSON(42); err == nil {
+		t.Error("expected error")
+	}
+
+	// enum: unknown symbol
+	if _, err := enumS.EncodeJSON("D"); err == nil {
+		t.Error("expected unknown symbol error")
+	}
+	// enum: integer index
+	if _, err := enumS.EncodeJSON(0); err != nil {
+		t.Error(err)
+	}
+	if _, err := enumS.EncodeJSON(uint(1)); err != nil {
+		t.Error(err)
+	}
+	// enum: integer out of range
+	if _, err := enumS.EncodeJSON(99); err == nil {
+		t.Error("expected range error")
+	}
+	// enum: wrong type
+	if _, err := enumS.EncodeJSON(3.14); err == nil {
+		t.Error("expected error")
 	}
 }

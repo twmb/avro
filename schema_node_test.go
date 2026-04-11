@@ -576,3 +576,101 @@ func TestSchemaNodeCustomPropsExtended(t *testing.T) {
 		t.Errorf("field props: %v", root.Fields[0].Props)
 	}
 }
+
+func TestSchemaNodeDedupNamedTypes(t *testing.T) {
+	uuid := SchemaNode{Type: "fixed", Name: "uuid_f", Size: 16, LogicalType: "uuid"}
+	node := SchemaNode{
+		Type: "record",
+		Name: "r",
+		Fields: []SchemaField{
+			{Name: "a", Type: SchemaNode{Type: "union", Branches: []SchemaNode{{Type: "null"}, uuid}}},
+			{Name: "b", Type: SchemaNode{Type: "union", Branches: []SchemaNode{{Type: "null"}, uuid}}},
+		},
+	}
+	s, err := node.Schema()
+	if err != nil {
+		t.Fatalf("Schema() with duplicate named type should succeed: %v", err)
+	}
+	// Round-trip: encode and decode to verify both fields work.
+	input := map[string]any{"a": [16]byte{1}, "b": [16]byte{2}}
+	enc, err := s.Encode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if _, err := s.Decode(enc, &out); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := out["a"].([16]byte)
+	b, _ := out["b"].([16]byte)
+	if a[0] != 1 || b[0] != 2 {
+		t.Fatalf("round-trip failed: a=%v b=%v", a, b)
+	}
+}
+
+func TestSchemaNodeDedupConflictingNameErrors(t *testing.T) {
+	node := SchemaNode{
+		Type: "record",
+		Name: "r",
+		Fields: []SchemaField{
+			{Name: "a", Type: SchemaNode{Type: "fixed", Name: "f", Size: 16}},
+			{Name: "b", Type: SchemaNode{Type: "fixed", Name: "f", Size: 8}}, // same name, different size
+		},
+	}
+	_, err := node.Schema()
+	if err == nil {
+		t.Fatal("expected error for conflicting named type definitions")
+	}
+}
+
+func TestSchemaNodeCyclicItems(t *testing.T) {
+	outer := &SchemaNode{Type: "array"}
+	outer.Items = outer
+	_, err := outer.Schema()
+	if err == nil {
+		t.Fatal("expected error for cyclic SchemaNode via Items")
+	}
+}
+
+func TestSchemaNodeCyclicValues(t *testing.T) {
+	outer := &SchemaNode{Type: "map"}
+	outer.Values = outer
+	_, err := outer.Schema()
+	if err == nil {
+		t.Fatal("expected error for cyclic SchemaNode via Values")
+	}
+}
+
+func TestSchemaNodeCyclicIndirect(t *testing.T) {
+	// A.Items → B.Values → A
+	a := &SchemaNode{Type: "array"}
+	b := &SchemaNode{Type: "map", Values: a}
+	a.Items = b
+	if _, err := a.Schema(); err == nil {
+		t.Fatal("expected error for indirect 2-node cycle")
+	}
+}
+
+func TestSchemaNodeCyclic3Node(t *testing.T) {
+	// A.Items → B.Items → C.Items → A
+	a := &SchemaNode{Type: "array"}
+	b := &SchemaNode{Type: "array"}
+	c := &SchemaNode{Type: "array"}
+	a.Items = b
+	b.Items = c
+	c.Items = a
+	if _, err := a.Schema(); err == nil {
+		t.Fatal("expected error for 3-node cycle")
+	}
+}
+
+func TestSchemaNodeUnmarshalablePropsErrors(t *testing.T) {
+	// json.Marshal rejects channels, funcs, complex numbers.
+	node := SchemaNode{
+		Type:  "int",
+		Props: map[string]any{"bad": make(chan int)},
+	}
+	if _, err := node.Schema(); err == nil {
+		t.Fatal("expected error for unmarshalable Props value")
+	}
+}

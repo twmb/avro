@@ -193,6 +193,12 @@ type aschema struct {
 	union     []aschema
 }
 
+// isNullableUnion reports whether s is a union whose first branch is "null".
+// Per the Avro spec, such unions implicitly default to null.
+func (s *aschema) isNullableUnion() bool {
+	return len(s.union) >= 2 && s.union[0].primitive == "null"
+}
+
 func (s aschema) MarshalJSON() ([]byte, error) {
 	switch {
 	case len(s.primitive) != 0:
@@ -215,23 +221,36 @@ func (s *aschema) UnmarshalJSON(data []byte) error {
 	case '"':
 		return json.Unmarshal(data, &s.primitive)
 	case '{':
-		if err := json.Unmarshal(data, &s.object); err != nil {
+		// Round-trip through map[string]RawMessage to normalize duplicate
+		// keys (JSON allows them, encoding/json is "last wins" for map
+		// decode but struct-decode ordering can diverge). After this,
+		// the struct decode and any subsequent map-based re-parse see
+		// identical keys.
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return err
+		}
+		normalized, err := json.Marshal(raw)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(normalized, &s.object); err != nil {
 			return err
 		}
 		// Capture extra properties not in the struct tags.
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(data, &raw); err == nil {
-			for k := range raw {
-				if aobjectKnownKeys[k] {
-					continue
-				}
-				if s.object.extra == nil {
-					s.object.extra = make(map[string]any)
-				}
-				var v any
-				json.Unmarshal(raw[k], &v)
-				s.object.extra[k] = v
+		// encoding/json matches struct field names case-insensitively,
+		// so keys like "tYpe" parse into Type and should not also land
+		// in extras.
+		for k := range raw {
+			if aobjectKnownKeyInsensitive(k) {
+				continue
 			}
+			if s.object.extra == nil {
+				s.object.extra = make(map[string]any)
+			}
+			var v any
+			json.Unmarshal(raw[k], &v)
+			s.object.extra[k] = v
 		}
 		return nil
 	case '[':
@@ -268,6 +287,17 @@ var afieldComplexKeys = map[string]string{
 }
 
 func (f *afield) UnmarshalJSON(data []byte) error {
+	// Round-trip through map[string]RawMessage to normalize duplicate
+	// keys. See aschema.UnmarshalJSON for the rationale.
+	var dedupRaw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &dedupRaw); err != nil {
+		return err
+	}
+	normalized, err := json.Marshal(dedupRaw)
+	if err != nil {
+		return err
+	}
+	data = normalized
 	// Standard unmarshal into a type alias to avoid recursion.
 	type plain afield
 	if err := json.Unmarshal(data, (*plain)(f)); err != nil {
@@ -396,6 +426,19 @@ var aobjectKnownKeys = map[string]bool{
 	"fields": true, "symbols": true, "items": true, "values": true,
 	"size": true, "logicalType": true, "precision": true, "scale": true,
 	"aliases": true, "default": true, "order": true,
+}
+
+// aobjectKnownKeyInsensitive reports whether k is a known schema key,
+// matching case-insensitively to mirror encoding/json's struct field
+// matching. This keeps lenient decoders from double-parsing a field
+// (once as a struct field, again as an extra prop).
+func aobjectKnownKeyInsensitive(k string) bool {
+	for known := range aobjectKnownKeys {
+		if strings.EqualFold(k, known) {
+			return true
+		}
+	}
+	return false
 }
 
 // validName reports whether s matches [A-Za-z_][A-Za-z0-9_]*.
@@ -1259,6 +1302,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 					sr.fields[fieldIdx].defaultBytes = defaultBytes
 					sr.fields[fieldIdx].hasDefault = true
 				}
+			} else if bf.canon.isNullableUnion() {
+				// Per the Avro spec, a union whose first branch is "null"
+				// implicitly defaults to null when no explicit default is given.
+				drf.hasDefault = true
+				fn.hasDefault = true
+				fn.defaultJSON = []byte("null")
+				sr.fields[fieldIdx].defaultBytes = []byte{0} // varint 0 = null branch
+				sr.fields[fieldIdx].hasDefault = true
 			}
 			dr.fields = append(dr.fields, drf)
 			nd.fields = append(nd.fields, fn)
@@ -1471,6 +1522,9 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				}
 				b.ser = (&serFixedDecimal{size: size, scale: scale}).ser
 				b.deser = (&deserFixedDecimal{size: size, scale: scale}).deser
+			case "uuid":
+				b.ser = serFixedUUIDReflect
+				b.deser = deserFixedUUIDReflect
 			default:
 				b.ser = (&serSize{size}).ser
 				b.deser = (&deserFixed{size}).deser

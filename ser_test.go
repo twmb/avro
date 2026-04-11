@@ -192,24 +192,24 @@ func TestSerTypeMismatch(t *testing.T) {
 		val    any
 	}{
 		// primitives
-		{"boolean from string", `"boolean"`, new("true")},
-		{"int from bool", `"int"`, new(true)},
-		{"int from string", `"int"`, new("42")},
-		{"long from bool", `"long"`, new(true)},
-		{"long from string", `"long"`, new("42")},
-		{"float from string", `"float"`, new("3.14")},
-		{"double from string", `"double"`, new("3.14")},
-		{"bytes from int slice", `"bytes"`, new([]int{1, 2})},
-		{"string from int", `"string"`, new(42)},
+		{"boolean from string", `"boolean"`, ptr("true")},
+		{"int from bool", `"int"`, ptr(true)},
+		{"int from string", `"int"`, ptr("42")},
+		{"long from bool", `"long"`, ptr(true)},
+		{"long from string", `"long"`, ptr("42")},
+		{"float from string", `"float"`, ptr("3.14")},
+		{"double from string", `"double"`, ptr("3.14")},
+		{"bytes from int slice", `"bytes"`, ptr([]int{1, 2})},
+		{"string from int", `"string"`, ptr(42)},
 
 		// complex
-		{"array from string", `{"type":"array","items":"int"}`, new("hello")},
-		{"map from string", `{"type":"map","values":"int"}`, new("hello")},
-		{"map from int-key map", `{"type":"map","values":"int"}`, new(map[int]int32{1: 2})},
-		{"fixed from int array", `{"type":"fixed","name":"f","size":4}`, new([4]int{1, 2, 3, 4})},
-		{"fixed wrong size array", `{"type":"fixed","name":"f","size":4}`, new([3]byte{1, 2, 3})},
-		{"fixed wrong size slice", `{"type":"fixed","name":"f","size":4}`, new([]byte{1, 2, 3})},
-		{"record from int", `{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`, new(42)},
+		{"array from string", `{"type":"array","items":"int"}`, ptr("hello")},
+		{"map from string", `{"type":"map","values":"int"}`, ptr("hello")},
+		{"map from int-key map", `{"type":"map","values":"int"}`, ptr(map[int]int32{1: 2})},
+		{"fixed from int array", `{"type":"fixed","name":"f","size":4}`, ptr([4]int{1, 2, 3, 4})},
+		{"fixed wrong size array", `{"type":"fixed","name":"f","size":4}`, ptr([3]byte{1, 2, 3})},
+		{"fixed wrong size slice", `{"type":"fixed","name":"f","size":4}`, ptr([]byte{1, 2, 3})},
+		{"record from int", `{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`, ptr(42)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -219,7 +219,7 @@ func TestSerTypeMismatch(t *testing.T) {
 }
 
 func TestSerNilPointer(t *testing.T) {
-	encodeErr(t, `"int"`, new((*int32)(nil)))
+	encodeErr(t, `"int"`, ptr((*int32)(nil)))
 }
 
 func TestSerNilInterface(t *testing.T) {
@@ -231,15 +231,15 @@ func TestSerEnumErrors(t *testing.T) {
 	schema := `{"type":"enum","name":"e","symbols":["a","b","c"]}`
 
 	t.Run("unknown symbol", func(t *testing.T) {
-		encodeErr(t, schema, new("unknown"))
+		encodeErr(t, schema, ptr("unknown"))
 	})
 
 	t.Run("out of range int", func(t *testing.T) {
-		encodeErr(t, schema, new(int32(-1)))
+		encodeErr(t, schema, ptr(int32(-1)))
 	})
 
 	t.Run("type mismatch", func(t *testing.T) {
-		encodeErr(t, schema, new(3.14))
+		encodeErr(t, schema, ptr(3.14))
 	})
 
 	t.Run("uint encode", func(t *testing.T) {
@@ -247,7 +247,7 @@ func TestSerEnumErrors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		dst, err := s.AppendEncode(nil, new(uint(1)))
+		dst, err := s.AppendEncode(nil, ptr(uint(1)))
 		if err != nil {
 			t.Fatalf("encode uint enum: %v", err)
 		}
@@ -261,7 +261,7 @@ func TestSerEnumErrors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		dst, err := s.AppendEncode(nil, new(int(1)))
+		dst, err := s.AppendEncode(nil, ptr(int(1)))
 		if err != nil {
 			t.Fatalf("encode int enum: %v", err)
 		}
@@ -299,7 +299,7 @@ func TestSerRecordAsMap(t *testing.T) {
 }
 
 func TestSerUnionAllFail(t *testing.T) {
-	encodeErr(t, `["null","int"]`, new("hello"))
+	encodeErr(t, `["null","int"]`, ptr("hello"))
 }
 
 func TestSerNullNonNilableType(t *testing.T) {
@@ -325,7 +325,7 @@ func TestSerNullGenericUnionNonNilable(t *testing.T) {
 		t.Fatal(err)
 	}
 	// int32 is non-nilable; serNull must not panic, and the int branch should match.
-	dst, err := s.AppendEncode(nil, new(int32(42)))
+	dst, err := s.AppendEncode(nil, ptr(int32(42)))
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -787,12 +787,12 @@ func TestSerNilPointerPrimitives(t *testing.T) {
 		schema string
 		val    any
 	}{
-		{"boolean", `"boolean"`, new((*bool)(nil))},
-		{"int", `"int"`, new((*int32)(nil))},
-		{"long", `"long"`, new((*int64)(nil))},
-		{"float", `"float"`, new((*float32)(nil))},
-		{"double", `"double"`, new((*float64)(nil))},
-		{"bytes", `"bytes"`, new((*[]byte)(nil))},
+		{"boolean", `"boolean"`, ptr((*bool)(nil))},
+		{"int", `"int"`, ptr((*int32)(nil))},
+		{"long", `"long"`, ptr((*int64)(nil))},
+		{"float", `"float"`, ptr((*float32)(nil))},
+		{"double", `"double"`, ptr((*float64)(nil))},
+		{"bytes", `"bytes"`, ptr((*[]byte)(nil))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -807,10 +807,10 @@ func TestSerNilPointerComplex(t *testing.T) {
 		schema string
 		val    any
 	}{
-		{"array", `{"type":"array","items":"int"}`, new((*[]int32)(nil))},
-		{"map", `{"type":"map","values":"int"}`, new((*map[string]int32)(nil))},
-		{"enum", `{"type":"enum","name":"e","symbols":["a"]}`, new((*string)(nil))},
-		{"fixed", `{"type":"fixed","name":"f","size":4}`, new((*[4]byte)(nil))},
+		{"array", `{"type":"array","items":"int"}`, ptr((*[]int32)(nil))},
+		{"map", `{"type":"map","values":"int"}`, ptr((*map[string]int32)(nil))},
+		{"enum", `{"type":"enum","name":"e","symbols":["a"]}`, ptr((*string)(nil))},
+		{"fixed", `{"type":"fixed","name":"f","size":4}`, ptr((*[4]byte)(nil))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -824,7 +824,7 @@ func TestSerRecordIndirectError(t *testing.T) {
 	type R struct {
 		A int32 `avro:"a"`
 	}
-	encodeErr(t, schema, new((*R)(nil)))
+	encodeErr(t, schema, ptr((*R)(nil)))
 }
 
 func TestSerRecordMapFieldError(t *testing.T) {

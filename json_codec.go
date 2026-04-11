@@ -179,11 +179,8 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			case "date":
 				return strconv.AppendInt(buf, int64(timeToDate(t)), 10), nil
 			case "time-millis":
-				d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
-				ms, err := durationToTimeMillis(d)
-				if err != nil {
-					return nil, err
-				}
+				// Time-of-day ms (< 86.4M) never overflows int32.
+				ms := int32(t.Hour()*3600000 + t.Minute()*60000 + t.Second()*1000 + t.Nanosecond()/1_000_000)
 				return strconv.AppendInt(buf, int64(ms), 10), nil
 			}
 		}
@@ -290,6 +287,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 
 	case "bytes":
 		// Decimal logical type: coerce numeric types to JSON number.
+		// Pointers (*big.Rat) are already unwrapped by the deref loop above.
 		if node.logical == "decimal" {
 			if v.Type() == jsonNumberType {
 				return append(buf, v.String()...), nil
@@ -297,10 +295,6 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if v.Type() == bigRatType {
 				tmp := v.Interface().(big.Rat)
 				return append(buf, tmp.FloatString(node.scale)...), nil
-			}
-			if v.Type() == bigRatPtrType {
-				r := v.Interface().(*big.Rat)
-				return append(buf, r.FloatString(node.scale)...), nil
 			}
 			if r, ok := tryCoerceToRat(v); ok {
 				return append(buf, r.FloatString(node.scale)...), nil
@@ -316,6 +310,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 
 	case "fixed":
 		// Decimal logical type: coerce numeric types to JSON number.
+		// Pointers (*big.Rat) are already unwrapped by the deref loop above.
 		if node.logical == "decimal" {
 			if v.Type() == jsonNumberType {
 				return append(buf, v.String()...), nil
@@ -323,10 +318,6 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if v.Type() == bigRatType {
 				tmp := v.Interface().(big.Rat)
 				return append(buf, tmp.FloatString(node.scale)...), nil
-			}
-			if v.Type() == bigRatPtrType {
-				r := v.Interface().(*big.Rat)
-				return append(buf, r.FloatString(node.scale)...), nil
 			}
 			if r, ok := tryCoerceToRat(v); ok {
 				return append(buf, r.FloatString(node.scale)...), nil

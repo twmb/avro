@@ -65,6 +65,8 @@ var slabPool = sync.Pool{New: func() any { return &slab{} }}
 //   - date, timestamp-millis/micros/nanos, local-timestamp-*: [time.Time] (UTC)
 //   - time-millis, time-micros: [time.Duration]
 //   - decimal: [encoding/json.Number]
+//   - uuid on string: string
+//   - uuid on fixed(16): [16]byte
 //   - duration: [Duration]
 //
 // To produce JSON from decoded *any data, use [Schema.EncodeJSON] rather
@@ -935,6 +937,28 @@ func deserMapDoubleBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, coun
 		mapVal.SetMapIndex(keyVal, elemVal)
 	}
 	return src, nil
+}
+
+// deserFixedUUIDReflect decodes a fixed(16) UUID. Into any it returns
+// [16]byte; into [16]byte it copies the raw bytes; into string it
+// formats a hex-dash UUID string; into []byte it falls back to raw bytes.
+func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	if len(src) < 16 {
+		return nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	}
+	b := [16]byte(src[:16])
+	v = indirectAlloc(v)
+	switch {
+	case v.Kind() == reflect.Interface, isUUIDType(v.Type()):
+		v.Set(reflect.ValueOf(b))
+	case v.Kind() == reflect.String:
+		v.SetString(uuidToString(b))
+	case v.Type().Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8:
+		v.SetBytes(src[:16])
+	default:
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: errors.New("uuid")}
+	}
+	return src[16:], nil
 }
 
 type deserFixed struct {

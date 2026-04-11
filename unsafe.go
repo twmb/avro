@@ -501,7 +501,10 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 		return nil
 	case "uuid":
 		if avroType == "fixed" {
-			return nil // fixed(16) UUID: use default fixed ser (raw bytes)
+			if goType.Kind() == reflect.String {
+				return usFixedUUIDString
+			}
+			return nil // [16]byte, []byte handled by default fixed ser
 		}
 		if isUUIDType(goType) {
 			return usUUID
@@ -552,7 +555,13 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 		return nil
 	case "uuid":
 		if avroType == "fixed" {
-			return nil // fixed(16) UUID: use default fixed deser (raw bytes)
+			if isUUIDType(goType) {
+				return udFixedUUID
+			}
+			if goType.Kind() == reflect.String {
+				return udFixedUUIDString
+			}
+			return nil // any, []byte etc. handled by reflect path
 		}
 		if isUUIDType(goType) {
 			return udUUID
@@ -692,6 +701,36 @@ func udUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	}
 	*(*[16]byte)(p) = u
 	return src[n:], nil
+}
+
+// udFixedUUID reads 16 raw bytes from a fixed(16) UUID and writes a [16]byte.
+// Used when the target is [16]byte or any (interface).
+func udFixedUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+	if len(src) < 16 {
+		return nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	}
+	*(*[16]byte)(p) = [16]byte(src[:16])
+	return src[16:], nil
+}
+
+// udFixedUUIDString reads 16 raw bytes from a fixed(16) UUID and writes a
+// formatted UUID string (e.g. "550e8400-e29b-41d4-a716-446655440000").
+func udFixedUUIDString(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+	if len(src) < 16 {
+		return nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	}
+	*(*string)(p) = uuidToString([16]byte(src[:16]))
+	return src[16:], nil
+}
+
+// usFixedUUIDString serializes a UUID string to 16 raw fixed bytes.
+func usFixedUUIDString(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	s := *(*string)(p)
+	u, err := parseUUID(s)
+	if err != nil {
+		return nil, err
+	}
+	return append(dst, u[:]...), nil
 }
 
 // ---- Unsafe serializers ----

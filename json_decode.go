@@ -226,20 +226,15 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 		v.Set(reflect.ValueOf(decodeLogicalInt(val, node)))
 		return nil
 	}
+	// All DecodeJSON entry points produce addressable values
+	// (Schema.DecodeJSON requires a pointer; recursive paths use
+	// reflect.New().Elem() or addressable struct fields).
 	if v.Type() == timeType && node.logical == "date" {
-		if v.CanAddr() {
-			*(*time.Time)(v.Addr().UnsafePointer()) = dateToTime(val)
-		} else {
-			v.Set(reflect.ValueOf(dateToTime(val)))
-		}
+		*(*time.Time)(v.Addr().UnsafePointer()) = dateToTime(val)
 		return nil
 	}
 	if v.Type() == durationType && node.logical == "time-millis" {
-		if v.CanAddr() {
-			*(*time.Duration)(v.Addr().UnsafePointer()) = timeMillisToDuration(val)
-		} else {
-			v.Set(reflect.ValueOf(timeMillisToDuration(val)))
-		}
+		*(*time.Duration)(v.Addr().UnsafePointer()) = timeMillisToDuration(val)
 		return nil
 	}
 	if v.CanInt() {
@@ -266,7 +261,8 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 		v.Set(reflect.ValueOf(decodeLogicalLong(val, node)))
 		return nil
 	}
-	if v.Type() == timeType && v.CanAddr() {
+	// All DecodeJSON entry points produce addressable values (see decodeInt).
+	if v.Type() == timeType {
 		p := (*time.Time)(v.Addr().UnsafePointer())
 		switch node.logical {
 		case "timestamp-millis", "local-timestamp-millis":
@@ -279,26 +275,9 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 			*p = timestampNanosToTime(val)
 			return nil
 		}
-	} else if v.Type() == timeType {
-		switch node.logical {
-		case "timestamp-millis", "local-timestamp-millis":
-			v.Set(reflect.ValueOf(timestampMillisToTime(val)))
-			return nil
-		case "timestamp-micros", "local-timestamp-micros":
-			v.Set(reflect.ValueOf(timestampMicrosToTime(val)))
-			return nil
-		case "timestamp-nanos", "local-timestamp-nanos":
-			v.Set(reflect.ValueOf(timestampNanosToTime(val)))
-			return nil
-		}
 	}
-	if v.Type() == durationType && v.CanAddr() {
-		if node.logical == "time-micros" {
-			*(*time.Duration)(v.Addr().UnsafePointer()) = timeMicrosToDuration(val)
-			return nil
-		}
-	} else if v.Type() == durationType && node.logical == "time-micros" {
-		v.Set(reflect.ValueOf(timeMicrosToDuration(val)))
+	if v.Type() == durationType && node.logical == "time-micros" {
+		*(*time.Duration)(v.Addr().UnsafePointer()) = timeMicrosToDuration(val)
 		return nil
 	}
 	if v.CanInt() {
