@@ -95,11 +95,58 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	if err != nil {
 		return nil, err
 	}
+	s = dedupNamedTypes(s, make(map[string]string))
 	b, err := json.Marshal(s)
 	if err != nil {
 		return nil, fmt.Errorf("avro: marshaling inferred schema: %w", err)
 	}
 	return Parse(string(b), opts...)
+}
+
+// dedupNamedTypes walks a JSON-like schema tree (maps, slices, strings)
+// and replaces duplicate named type definitions with name references.
+// Returns the (possibly rewritten) value. This handles the case where
+// SchemaFor emits the same named type (e.g. a fixed UUID) for multiple
+// struct fields. Conflicting redefinitions are left intact so Parse
+// reports a clear "duplicate named type" error.
+func dedupNamedTypes(v any, defined map[string]string) any {
+	switch v := v.(type) {
+	case map[string]any:
+		// Is this a named type definition?
+		if name, _ := v["name"].(string); name != "" {
+			switch v["type"] {
+			case "record", "error", "enum", "fixed":
+				if prev, exists := defined[name]; exists {
+					cur, _ := json.Marshal(v)
+					if string(cur) == prev {
+						return name // identical — emit reference
+					}
+					return v // different — let Parse error
+				}
+				b, _ := json.Marshal(v)
+				defined[name] = string(b)
+			}
+		}
+		// Recurse into children that can hold schemas.
+		if fields, ok := v["fields"].([]map[string]any); ok {
+			for i, f := range fields {
+				fields[i]["type"] = dedupNamedTypes(f["type"], defined)
+			}
+		}
+		if items, ok := v["items"]; ok {
+			v["items"] = dedupNamedTypes(items, defined)
+		}
+		if values, ok := v["values"]; ok {
+			v["values"] = dedupNamedTypes(values, defined)
+		}
+		return v
+	case []any: // union branches
+		for i, elem := range v {
+			v[i] = dedupNamedTypes(elem, defined)
+		}
+		return v
+	}
+	return v
 }
 
 // MustSchemaFor is like [SchemaFor] but panics on error.

@@ -23,6 +23,7 @@ type serfn func([]byte, reflect.Value) ([]byte, error)
 //   - RFC 3339 strings for timestamp and date logical types
 //   - [*big.Rat], [big.Rat], float64, [encoding/json.Number], and numeric strings for decimal logical types
 //   - [encoding.TextAppender], [encoding.TextMarshaler], and []byte for string types (and vice versa for [encoding.TextUnmarshaler])
+//   - string (hex-dash UUID format) for fixed(16) UUID logical types
 //   - Tagged union maps (map[string]any{"typeName": value}) for union types,
 //     as produced by [Schema.Decode] with [TaggedUnions]
 func (s *Schema) AppendEncode(dst []byte, v any, opts ...Opt) ([]byte, error) {
@@ -1414,6 +1415,28 @@ func bigIntToBytes(i *big.Int) []byte {
 		}
 		return b
 	}
+}
+
+// serFixedUUIDReflect serializes a fixed(16) UUID. Accepts [16]byte (raw),
+// string (hex-dash UUID parsed to bytes), or []byte of length 16.
+func serFixedUUIDReflect(dst []byte, v reflect.Value) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	if isUUIDType(v.Type()) {
+		var u [16]byte
+		reflect.Copy(reflect.ValueOf(&u).Elem(), v)
+		return append(dst, u[:]...), nil
+	}
+	if v.Kind() == reflect.String {
+		u, err := parseUUID(v.String())
+		if err != nil {
+			return nil, err
+		}
+		return append(dst, u[:]...), nil
+	}
+	return (&serSize{16}).ser(dst, v)
 }
 
 // isUUIDType returns true when t is an array of 16 uint8 bytes (e.g. [16]byte

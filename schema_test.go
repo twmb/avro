@@ -787,7 +787,7 @@ func TestValidateLogical(t *testing.T) {
 		{"duration ok", aobject{Type: "fixed", Logical: "duration", Size: &intSize}, false},
 		{"duration wrong type", aobject{Type: "int", Logical: "duration"}, true},
 		{"duration no size", aobject{Type: "fixed", Logical: "duration"}, true},
-		{"duration wrong size", aobject{Type: "fixed", Logical: "duration", Size: new(laxInt(10))}, true},
+		{"duration wrong size", aobject{Type: "fixed", Logical: "duration", Size: ptr(laxInt(10))}, true},
 
 		// unknown logical types are ignored per spec
 		{"unknown logical", aobject{Type: "int", Logical: "foobar"}, false},
@@ -1023,7 +1023,7 @@ func TestBuildComplexErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
-		dst, err := s.AppendEncode(nil, new(int32(42)))
+		dst, err := s.AppendEncode(nil, ptr(int32(42)))
 		if err != nil {
 			t.Fatalf("encode: %v", err)
 		}
@@ -1098,7 +1098,7 @@ func TestBuildComplexUnknownLogicalIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected unknown logical type to be ignored, got error: %v", err)
 	}
-	dst, err := s.AppendEncode(nil, new(int32(42)))
+	dst, err := s.AppendEncode(nil, ptr(int32(42)))
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}

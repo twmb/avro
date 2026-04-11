@@ -252,7 +252,8 @@ Logical types decode to their natural Go equivalents:
 | local-timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | local-timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | local-timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
-| uuid | string or fixed(16) | [16]byte or string | [16]byte (typed target) or string (any target) |
+| uuid (string) | string | [16]byte or string | string into any; [16]byte or string into typed target |
+| uuid (fixed(16)) | fixed(16) | [16]byte, []byte, or hex-dash string | [16]byte into any or [16]byte target; string into string target |
 | decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat, json.Number, or underlying type |
 | duration | fixed(12) | avro.Duration or underlying type | avro.Duration or underlying type |
 
@@ -434,6 +435,30 @@ avro.CustomType{
     },
 }
 ```
+
+## Type name constants
+
+The `atype` sub-package exports constants for Avro primitive type names,
+complex type names, logical type names, and field sort orders — the string
+values used in `SchemaNode`, `SchemaField`, and `CustomType`:
+
+```go
+import (
+    "github.com/twmb/avro"
+    "github.com/twmb/avro/atype"
+)
+
+node := avro.SchemaNode{
+    Type:        atype.Long,
+    LogicalType: atype.TimestampMicros,
+}
+
+ct := avro.CustomType{LogicalType: atype.Decimal}
+```
+
+They are untyped string constants and can be used anywhere a string is
+expected. Helps catch typos (`atype.TimestampMicros` vs
+`"timestam-micros"`) at compile time.
 
 ## Object Container Files
 

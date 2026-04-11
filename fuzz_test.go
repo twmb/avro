@@ -54,6 +54,35 @@ func init() {
 		`{"type":"map","values":"long"}`,
 		`{"type":"map","values":"float"}`,
 		`{"type":"map","values":"double"}`,
+		// 27: fixed(16) UUID — exercises deserFixedUUIDReflect path
+		`{"type":"fixed","name":"UUID","size":16,"logicalType":"uuid"}`,
+		// 28: record with nullable fields (exercises implicit null default)
+		`{"type":"record","name":"N","fields":[
+			{"name":"a","type":"int"},
+			{"name":"b","type":["null","int"]},
+			{"name":"c","type":["null","string"]}
+		]}`,
+		// 29: record with reused named type (exercises dedup path)
+		`{"type":"record","name":"D","fields":[
+			{"name":"u1","type":{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}},
+			{"name":"u2","type":"U"}
+		]}`,
+		// 30: recursive record (linked list via nullable self-reference)
+		`{"type":"record","name":"Node","fields":[
+			{"name":"value","type":"int"},
+			{"name":"next","type":["null","Node"]}
+		]}`,
+		// 31: multi-level nested records (3 levels deep)
+		`{"type":"record","name":"L1","fields":[
+			{"name":"a","type":"int"},
+			{"name":"l2","type":{"type":"record","name":"L2","fields":[
+				{"name":"b","type":"string"},
+				{"name":"l3","type":{"type":"record","name":"L3","fields":[
+					{"name":"c","type":"double"},
+					{"name":"items","type":{"type":"array","items":"long"}}
+				]}}
+			]}}
+		]}`,
 	}
 	for _, s := range schemas {
 		fuzzSchemas = append(fuzzSchemas, MustParse(s))
@@ -260,6 +289,44 @@ func FuzzDecode(f *testing.F) {
 		// map of double
 		{26, fuzzSeed(fuzzSchemas[26], map[string]float64{"e": 2.718})},
 		{26, nil},
+		// fixed UUID
+		{27, fuzzSeed(fuzzSchemas[27], [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})},
+		{27, nil},
+		// record with nullable fields (implicit null default)
+		{28, fuzzSeed(fuzzSchemas[28], map[string]any{"a": int32(1), "b": nil, "c": nil})},
+		{28, fuzzSeed(fuzzSchemas[28], map[string]any{"a": int32(1), "b": int32(2), "c": "hi"})},
+		{28, nil},
+		// record with reused named type
+		{29, fuzzSeed(fuzzSchemas[29], map[string]any{
+			"u1": [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+			"u2": [16]byte{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+		})},
+		{29, nil},
+		// recursive linked list: 3 nodes
+		{30, fuzzSeed(fuzzSchemas[30], map[string]any{
+			"value": int32(1),
+			"next": map[string]any{
+				"value": int32(2),
+				"next": map[string]any{
+					"value": int32(3),
+					"next":  nil,
+				},
+			},
+		})},
+		{30, fuzzSeed(fuzzSchemas[30], map[string]any{"value": int32(42), "next": nil})},
+		{30, nil},
+		// 3-level nested record
+		{31, fuzzSeed(fuzzSchemas[31], map[string]any{
+			"a": int32(1),
+			"l2": map[string]any{
+				"b": "x",
+				"l3": map[string]any{
+					"c":     3.14,
+					"items": []int64{10, 20, 30},
+				},
+			},
+		})},
+		{31, nil},
 	}
 
 	// Adversarial patterns.
@@ -323,6 +390,29 @@ func FuzzDecodeEncodeRoundTrip(f *testing.F) {
 		{24, fuzzSeed(fuzzSchemas[24], map[string]int64{"x": 99})},
 		{25, fuzzSeed(fuzzSchemas[25], map[string]float32{"pi": 3.14})},
 		{26, fuzzSeed(fuzzSchemas[26], map[string]float64{"e": 2.718})},
+		{27, fuzzSeed(fuzzSchemas[27], [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})},
+		{28, fuzzSeed(fuzzSchemas[28], map[string]any{"a": int32(1), "b": int32(2), "c": "x"})},
+		{29, fuzzSeed(fuzzSchemas[29], map[string]any{
+			"u1": [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+			"u2": [16]byte{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+		})},
+		{30, fuzzSeed(fuzzSchemas[30], map[string]any{
+			"value": int32(1),
+			"next": map[string]any{
+				"value": int32(2),
+				"next":  nil,
+			},
+		})},
+		{31, fuzzSeed(fuzzSchemas[31], map[string]any{
+			"a": int32(1),
+			"l2": map[string]any{
+				"b": "x",
+				"l3": map[string]any{
+					"c":     3.14,
+					"items": []int64{10, 20, 30},
+				},
+			},
+		})},
 	}
 
 	for _, s := range seeds {
@@ -417,6 +507,31 @@ func FuzzSingleObject(f *testing.F) {
 			val = map[string]float32{"pi": 3.14}
 		case 26: // map of double
 			val = map[string]float64{"e": 2.718}
+		case 27: // fixed(16) UUID
+			val = [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+		case 28: // nullable record
+			val = map[string]any{"a": int32(1), "b": int32(2), "c": "x"}
+		case 29: // reused named type
+			val = map[string]any{
+				"u1": [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+				"u2": [16]byte{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+			}
+		case 30: // recursive linked list
+			val = map[string]any{
+				"value": int32(1),
+				"next":  map[string]any{"value": int32(2), "next": nil},
+			}
+		case 31: // 3-level nested record
+			val = map[string]any{
+				"a": int32(1),
+				"l2": map[string]any{
+					"b": "x",
+					"l3": map[string]any{
+						"c":     3.14,
+						"items": []int64{10, 20, 30},
+					},
+				},
+			}
 		}
 		soe, err := s.AppendSingleObject(nil, val)
 		if err != nil {
@@ -672,6 +787,112 @@ func FuzzEncodeMap(f *testing.F) {
 			return
 		}
 		schema.Encode(m)
+	})
+}
+
+// FuzzSchemaNode exercises [SchemaNode.Schema] by feeding random JSON
+// through [Schema.Root] → mutate → Schema(). This is the closest we can
+// get to fuzzing programmatic construction without hand-rolling a
+// SchemaNode generator. Exercises toJSONDedup, cycle detection, named
+// type dedup, and implicit null default wiring.
+func FuzzSchemaNode(f *testing.F) {
+	seeds := []string{
+		`"int"`,
+		`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`,
+		`{"type":"record","name":"R","fields":[
+			{"name":"a","type":{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}},
+			{"name":"b","type":"U"}
+		]}`,
+		`{"type":"record","name":"R","fields":[
+			{"name":"a","type":["null","int"]},
+			{"name":"b","type":["null","string"]}
+		]}`,
+		`{"type":"array","items":{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}}`,
+		`{"type":"map","values":{"type":"enum","name":"E","symbols":["A","B"]}}`,
+		`["null","int","string",{"type":"fixed","name":"F","size":4}]`,
+		// Recursive linked list via self-reference.
+		`{"type":"record","name":"Node","fields":[
+			{"name":"value","type":"int"},
+			{"name":"next","type":["null","Node"]}
+		]}`,
+		// 3-level nested records.
+		`{"type":"record","name":"L1","fields":[
+			{"name":"l2","type":{"type":"record","name":"L2","fields":[
+				{"name":"l3","type":{"type":"record","name":"L3","fields":[
+					{"name":"x","type":"int"}
+				]}}
+			]}}
+		]}`,
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, input string) {
+		s, err := Parse(input)
+		if err != nil {
+			return
+		}
+		root := s.Root()
+		// Round-trip: Root().Schema() must succeed for any schema Parse
+		// accepted, and produce the same canonical form.
+		s2, err := root.Schema()
+		if err != nil {
+			t.Fatalf("Root().Schema() failed for valid schema %q: %v", input, err)
+		}
+		if !bytes.Equal(s.Canonical(), s2.Canonical()) {
+			t.Fatalf("canonical form changed through Root()/Schema() round-trip:\n  orig: %s\n  new:  %s",
+				s.Canonical(), s2.Canonical())
+		}
+	})
+}
+
+// FuzzEncodeMapMissingKeys exercises the implicit null default path by
+// encoding random map subsets of a record with nullable fields.
+func FuzzEncodeMapMissingKeys(f *testing.F) {
+	schema := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":["null","int"]},
+		{"name":"c","type":["null","string"]},
+		{"name":"d","type":"string","default":"hi"}
+	]}`)
+
+	// Seeds: various combinations of present/missing keys.
+	seeds := []string{
+		`{"a":1,"b":2,"c":"x","d":"y"}`,
+		`{"a":1}`,                      // b, c, d all missing
+		`{"a":1,"b":5}`,                // c, d missing
+		`{"a":1,"c":"only c"}`,         // b, d missing
+		`{"a":1,"b":null,"c":null}`,    // explicit nulls
+		`{"b":1,"c":"x"}`,              // missing required 'a'
+		`{"a":"wrong type"}`,           // wrong type
+		`{"a":1,"extra":"ignored"}`,    // extra key
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, input string) {
+		var m any
+		if err := json.Unmarshal([]byte(input), &m); err != nil {
+			return
+		}
+		mm, ok := m.(map[string]any)
+		if !ok {
+			return
+		}
+		// Coerce float64 (from json.Unmarshal) to int32 for field "a".
+		if v, ok := mm["a"]; ok {
+			if f, ok := v.(float64); ok {
+				mm["a"] = int32(f)
+			}
+		}
+		if v, ok := mm["b"]; ok {
+			if f, ok := v.(float64); ok {
+				mm["b"] = int32(f)
+			}
+		}
+		schema.Encode(mm)
 	})
 }
 

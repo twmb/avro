@@ -14,6 +14,9 @@ import (
 	"unsafe"
 )
 
+// ptr returns a pointer to v. Used in tests instead of Go 1.26's new(v).
+func ptr[T any](v T) *T { return &v }
+
 func roundTrip[T any](t *testing.T, schema string, input T) T {
 	t.Helper()
 	s, err := Parse(schema)
@@ -85,11 +88,11 @@ func decodeErr(t *testing.T, schema string, src []byte, v any) {
 // -----------------------------------------------------------------------
 
 func TestWireFormatBoolean(t *testing.T) {
-	dst := encode(t, `"boolean"`, new(true))
+	dst := encode(t, `"boolean"`, ptr(true))
 	if !bytes.Equal(dst, []byte{0x01}) {
 		t.Fatalf("encode true: got %x, want 01", dst)
 	}
-	dst = encode(t, `"boolean"`, new(false))
+	dst = encode(t, `"boolean"`, ptr(false))
 	if !bytes.Equal(dst, []byte{0x00}) {
 		t.Fatalf("encode false: got %x, want 00", dst)
 	}
@@ -103,7 +106,7 @@ func TestWireFormatBoolean(t *testing.T) {
 
 func TestWireFormatInt(t *testing.T) {
 	// int 27 → zigzag 54 → 0x36
-	dst := encode(t, `"int"`, new(int32(27)))
+	dst := encode(t, `"int"`, ptr(int32(27)))
 	if !bytes.Equal(dst, []byte{0x36}) {
 		t.Fatalf("encode 27: got %x, want 36", dst)
 	}
@@ -117,7 +120,7 @@ func TestWireFormatInt(t *testing.T) {
 
 func TestWireFormatLong(t *testing.T) {
 	// long 2147483648 → zigzag 4294967296 → multi-byte varint
-	dst := encode(t, `"long"`, new(int64(2147483648)))
+	dst := encode(t, `"long"`, ptr(int64(2147483648)))
 	if !bytes.Equal(dst, []byte{0x80, 0x80, 0x80, 0x80, 0x10}) {
 		t.Fatalf("encode 2147483648: got %x, want 8080808010", dst)
 	}
@@ -131,7 +134,7 @@ func TestWireFormatLong(t *testing.T) {
 
 func TestWireFormatFloat(t *testing.T) {
 	// float32(1.15) → bits 0x3F933333 → LE bytes 33 33 93 3F
-	dst := encode(t, `"float"`, new(float32(1.15)))
+	dst := encode(t, `"float"`, ptr(float32(1.15)))
 	if !bytes.Equal(dst, []byte{0x33, 0x33, 0x93, 0x3F}) {
 		t.Fatalf("encode 1.15f: got %x, want 3333933f", dst)
 	}
@@ -145,7 +148,7 @@ func TestWireFormatFloat(t *testing.T) {
 
 func TestWireFormatDouble(t *testing.T) {
 	// float64(1.15) → bits 0x3FF2666666666666 → LE bytes
-	dst := encode(t, `"double"`, new(float64(1.15)))
+	dst := encode(t, `"double"`, ptr(float64(1.15)))
 	if !bytes.Equal(dst, []byte{0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0xF2, 0x3F}) {
 		t.Fatalf("encode 1.15: got %x, want 66666666666666f23f", dst)
 	}
@@ -159,7 +162,7 @@ func TestWireFormatDouble(t *testing.T) {
 
 func TestWireFormatString(t *testing.T) {
 	// "foo" → length 3, zigzag 6, then 0x66 0x6F 0x6F
-	dst := encode(t, `"string"`, new("foo"))
+	dst := encode(t, `"string"`, ptr("foo"))
 	if !bytes.Equal(dst, []byte{0x06, 0x66, 0x6F, 0x6F}) {
 		t.Fatalf("encode foo: got %x, want 06666f6f", dst)
 	}
@@ -805,7 +808,8 @@ func TestDecodeShortBuffer(t *testing.T) {
 		{"double", `"double"`, []byte{0x66, 0x66, 0x66}},                      // need 8 bytes, have 3
 		{"string truncated", `"string"`, []byte{0x08}},                        // says 4 bytes, has 0
 		{"bytes truncated", `"bytes"`, []byte{0x08, 0xEC}},                    // says 4 bytes, has 1
-		{"fixed", `{"type":"fixed","name":"f","size":4}`, []byte{0x01, 0x02}}, // need 4, have 2
+		{"fixed", `{"type":"fixed","name":"f","size":4}`, []byte{0x01, 0x02}},                                                      // need 4, have 2
+		{"fixed uuid", `{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}}, // need 16, have 6
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -838,8 +842,8 @@ func TestDecodeShortBuffer(t *testing.T) {
 				var b []byte
 				_, err = s.Decode(tt.data, &b)
 			default:
-				var arr [4]byte
-				_, err = s.Decode(tt.data, &arr)
+				// Decode into any — hits reflect path.
+				_, err = s.Decode(tt.data, &v)
 			}
 			_ = v
 			if err == nil {
@@ -847,6 +851,63 @@ func TestDecodeShortBuffer(t *testing.T) {
 			}
 		})
 	}
+
+	// Also test fixed UUID short buffer with typed targets.
+	t.Run("fixed uuid [16]byte", func(t *testing.T) {
+		s := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
+		var u [16]byte
+		_, err := s.Decode([]byte{0x01, 0x02, 0x03}, &u)
+		if err == nil {
+			t.Fatal("expected error for short buffer")
+		}
+	})
+	t.Run("fixed uuid string", func(t *testing.T) {
+		s := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
+		var str string
+		_, err := s.Decode([]byte{0x01, 0x02, 0x03}, &str)
+		if err == nil {
+			t.Fatal("expected error for short buffer")
+		}
+	})
+	// Test short buffer through struct decode (hits unsafe fast path).
+	t.Run("fixed uuid in struct short", func(t *testing.T) {
+		type R struct {
+			ID [16]byte `avro:"id"`
+		}
+		s := MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"id","type":{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}}
+		]}`)
+		var r R
+		_, err := s.Decode([]byte{0x01, 0x02, 0x03}, &r)
+		if err == nil {
+			t.Fatal("expected error for short buffer")
+		}
+	})
+	t.Run("fixed uuid in struct string short", func(t *testing.T) {
+		type R struct {
+			ID string `avro:"id"`
+		}
+		s := MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"id","type":{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}}
+		]}`)
+		var r R
+		_, err := s.Decode([]byte{0x01, 0x02, 0x03}, &r)
+		if err == nil {
+			t.Fatal("expected error for short buffer")
+		}
+	})
+	t.Run("fixed uuid in struct string bad encode", func(t *testing.T) {
+		type R struct {
+			ID string `avro:"id"`
+		}
+		s := MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"id","type":{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}}
+		]}`)
+		_, err := s.Encode(&R{ID: "not-a-uuid"})
+		if err == nil {
+			t.Fatal("expected error for bad UUID string")
+		}
+	})
 }
 
 func TestDecodeTypeMismatch(t *testing.T) {
@@ -856,19 +917,19 @@ func TestDecodeTypeMismatch(t *testing.T) {
 		data   []byte
 		target any
 	}{
-		{"bool into string", `"boolean"`, []byte{0x01}, new("")},
-		{"int into bool", `"int"`, []byte{0x36}, new(false)},
-		{"string into int", `"string"`, []byte{0x06, 0x66, 0x6f, 0x6f}, new(int32(0))},
-		{"int into float", `"int"`, []byte{0x36}, new(float32(0))},
-		{"fixed into int array", `{"type":"fixed","name":"f","size":6}`, []byte{1, 2, 3, 4, 5, 6}, new([6]int{})},
-		{"array into string", `{"type":"array","items":"int"}`, []byte{0x00}, new("")},
-		{"map into string", `{"type":"map","values":"int"}`, []byte{0x00}, new("")},
-		{"map with int key", `{"type":"map","values":"int"}`, []byte{0x00}, new(map[int]int32{})},
-		{"record into int", `{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`, []byte{0x02}, new(int32(0))},
-		{"float into string", `"float"`, []byte{0, 0, 0, 0}, new("")},
-		{"double into string", `"double"`, []byte{0, 0, 0, 0, 0, 0, 0, 0}, new("")},
-		{"boolean into int", `"boolean"`, []byte{0x01}, new(int32(0))},
-		{"long into bool", `"long"`, []byte{0x02}, new(false)},
+		{"bool into string", `"boolean"`, []byte{0x01}, ptr("")},
+		{"int into bool", `"int"`, []byte{0x36}, ptr(false)},
+		{"string into int", `"string"`, []byte{0x06, 0x66, 0x6f, 0x6f}, ptr(int32(0))},
+		{"int into float", `"int"`, []byte{0x36}, ptr(float32(0))},
+		{"fixed into int array", `{"type":"fixed","name":"f","size":6}`, []byte{1, 2, 3, 4, 5, 6}, ptr([6]int{})},
+		{"array into string", `{"type":"array","items":"int"}`, []byte{0x00}, ptr("")},
+		{"map into string", `{"type":"map","values":"int"}`, []byte{0x00}, ptr("")},
+		{"map with int key", `{"type":"map","values":"int"}`, []byte{0x00}, ptr(map[int]int32{})},
+		{"record into int", `{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}`, []byte{0x02}, ptr(int32(0))},
+		{"float into string", `"float"`, []byte{0, 0, 0, 0}, ptr("")},
+		{"double into string", `"double"`, []byte{0, 0, 0, 0, 0, 0, 0, 0}, ptr("")},
+		{"boolean into int", `"boolean"`, []byte{0x01}, ptr(int32(0))},
+		{"long into bool", `"long"`, []byte{0x02}, ptr(false)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -886,13 +947,13 @@ func TestDecodeTypeMismatch(t *testing.T) {
 
 func TestDecodeInvalidUnionIndex(t *testing.T) {
 	// Union ["null", "string"] only has indices 0 and 1; index 2 is out of range.
-	decodeErr(t, `["null","string"]`, []byte{0x04}, new((*string)(nil))) // zigzag 4 → 2
+	decodeErr(t, `["null","string"]`, []byte{0x04}, ptr((*string)(nil))) // zigzag 4 → 2
 }
 
 func TestDecodeInvalidEnumIndex(t *testing.T) {
 	// Enum with 2 symbols; index 2 is out of range.
 	schema := `{"type":"enum","name":"e","symbols":["a","b"]}`
-	decodeErr(t, schema, []byte{0x04}, new("")) // zigzag 4 → 2
+	decodeErr(t, schema, []byte{0x04}, ptr("")) // zigzag 4 → 2
 }
 
 func TestDecodeNonPointer(t *testing.T) {
@@ -1155,7 +1216,7 @@ func TestDecodeUnionPtrReuse(t *testing.T) {
 	]}]`
 	data := []byte{0x02, 0x36, 0x06, 0x66, 0x6F, 0x6F} // index=1, a=27, b="foo"
 
-	original := new(R{})
+	original := ptr(R{})
 	got := original
 	s, err := Parse(schema)
 	if err != nil {
@@ -1196,7 +1257,7 @@ func TestDecodeRecordMapInvalidKey(t *testing.T) {
 		{"name":"a","type":"long"},
 		{"name":"b","type":"string"}
 	]}`
-	decodeErr(t, schema, []byte{0x36, 0x06, 0x66, 0x6f, 0x6f}, new(map[int]any{}))
+	decodeErr(t, schema, []byte{0x36, 0x06, 0x66, 0x6f, 0x6f}, ptr(map[int]any{}))
 }
 
 func TestDecodeRecordMapInvalidElem(t *testing.T) {
@@ -1205,7 +1266,7 @@ func TestDecodeRecordMapInvalidElem(t *testing.T) {
 		{"name":"a","type":"long"},
 		{"name":"b","type":"string"}
 	]}`
-	decodeErr(t, schema, []byte{0x36, 0x06, 0x66, 0x6f, 0x6f}, new(map[string]string{}))
+	decodeErr(t, schema, []byte{0x36, 0x06, 0x66, 0x6f, 0x6f}, ptr(map[string]string{}))
 }
 
 func TestDecodeRecordMapInvalidData(t *testing.T) {
@@ -1214,7 +1275,7 @@ func TestDecodeRecordMapInvalidData(t *testing.T) {
 		{"name":"b","type":"string"}
 	]}`
 	// Corrupt varint for field "a".
-	decodeErr(t, schema, []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, new(map[string]any{}))
+	decodeErr(t, schema, []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, ptr(map[string]any{}))
 }
 
 func TestDecodeRecordIntoMapWithUnion(t *testing.T) {
@@ -1249,14 +1310,14 @@ func TestDecodeArrayItemError(t *testing.T) {
 	schema := `{"type":"array","items":"string"}`
 	// count=2 (zigzag 4), item1="foo" (06 66 6f 6f), item2=corrupt length
 	data := []byte{0x04, 0x06, 0x66, 0x6f, 0x6f, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}
-	decodeErr(t, schema, data, new([]string{}))
+	decodeErr(t, schema, data, ptr([]string{}))
 }
 
 func TestDecodeArrayBlockError(t *testing.T) {
 	// Array with corrupt block count.
 	schema := `{"type":"array","items":"int"}`
 	data := []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}
-	decodeErr(t, schema, data, new([]int32{}))
+	decodeErr(t, schema, data, ptr([]int32{}))
 }
 
 func TestDecodeArrayOversizedCountUnsafe(t *testing.T) {
@@ -1300,20 +1361,20 @@ func TestDecodeMapValueShortRead(t *testing.T) {
 	schema := `{"type":"map","values":"string"}`
 	// count=1 (0x02), key="foo" (06 66 6f 6f), value=corrupt (06 06)
 	data := []byte{0x02, 0x06, 0x66, 0x6F, 0x6F, 0x06, 0x06}
-	decodeErr(t, schema, data, new(map[string]string{}))
+	decodeErr(t, schema, data, ptr(map[string]string{}))
 }
 
 func TestDecodeMapBlockError(t *testing.T) {
 	// Map with corrupt block count.
 	schema := `{"type":"map","values":"string"}`
 	data := []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}
-	decodeErr(t, schema, data, new(map[string]string{}))
+	decodeErr(t, schema, data, ptr(map[string]string{}))
 }
 
 func TestDecodeEnumCorruptVarint(t *testing.T) {
 	schema := `{"type":"enum","name":"e","symbols":["a","b","c"]}`
 	data := []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD}
-	decodeErr(t, schema, data, new(""))
+	decodeErr(t, schema, data, ptr(""))
 }
 
 func TestDecodeRecordStructInvalidData(t *testing.T) {
@@ -1326,7 +1387,7 @@ func TestDecodeRecordStructInvalidData(t *testing.T) {
 		{"name":"b","type":"string"}
 	]}`
 	// Corrupt varint.
-	decodeErr(t, schema, []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, new(R{}))
+	decodeErr(t, schema, []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, ptr(R{}))
 }
 
 func TestDecodeUnionIntoInterface(t *testing.T) {
@@ -1360,12 +1421,12 @@ func TestDecodeUnionIntoInterface(t *testing.T) {
 
 func TestDecodeNegativeStringLength(t *testing.T) {
 	// Negative length for string should error.
-	decodeErr(t, `"string"`, []byte{0x01}, new("")) // zigzag 1 → -1
+	decodeErr(t, `"string"`, []byte{0x01}, ptr("")) // zigzag 1 → -1
 }
 
 func TestDecodeNegativeBytesLength(t *testing.T) {
 	// Negative length for bytes should error.
-	decodeErr(t, `"bytes"`, []byte{0x01}, new([]byte{})) // zigzag 1 → -1
+	decodeErr(t, `"bytes"`, []byte{0x01}, ptr([]byte{})) // zigzag 1 → -1
 }
 
 func TestDecodeFloatIntoInterface(t *testing.T) {
@@ -1373,7 +1434,7 @@ func TestDecodeFloatIntoInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new(float32(3.14)))
+	encoded, err := s.AppendEncode(nil, ptr(float32(3.14)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1396,7 +1457,7 @@ func TestDecodeDoubleIntoInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new(float64(2.718)))
+	encoded, err := s.AppendEncode(nil, ptr(float64(2.718)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1419,7 +1480,7 @@ func TestDecodeBytesIntoInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new([]byte{1, 2, 3}))
+	encoded, err := s.AppendEncode(nil, ptr([]byte{1, 2, 3}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1442,7 +1503,7 @@ func TestDecodeBytesIntoArray(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new([]byte{1, 2, 3}))
+	encoded, err := s.AppendEncode(nil, ptr([]byte{1, 2, 3}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1461,7 +1522,7 @@ func TestDecodeBytesArrayWrongLength(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new([]byte{1, 2, 3}))
+	encoded, err := s.AppendEncode(nil, ptr([]byte{1, 2, 3}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1473,11 +1534,11 @@ func TestDecodeBytesArrayWrongLength(t *testing.T) {
 }
 
 func TestDecodeBytesNonUint8Slice(t *testing.T) {
-	decodeErr(t, `"bytes"`, []byte{0x04, 0x01, 0x02}, new([]int32{}))
+	decodeErr(t, `"bytes"`, []byte{0x04, 0x01, 0x02}, ptr([]int32{}))
 }
 
 func TestDecodeBytesNonUint8Array(t *testing.T) {
-	decodeErr(t, `"bytes"`, []byte{0x04, 0x01, 0x02}, new([2]int32{}))
+	decodeErr(t, `"bytes"`, []byte{0x04, 0x01, 0x02}, ptr([2]int32{}))
 }
 
 func TestDecodeEnumIntoUint(t *testing.T) {
@@ -1487,7 +1548,7 @@ func TestDecodeEnumIntoUint(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Encode "b" (index 1).
-	encoded, err := s.AppendEncode(nil, new("b"))
+	encoded, err := s.AppendEncode(nil, ptr("b"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1503,7 +1564,7 @@ func TestDecodeEnumIntoUint(t *testing.T) {
 
 func TestDecodeEnumTypeMismatch(t *testing.T) {
 	schema := `{"type":"enum","name":"e","symbols":["a","b"]}`
-	decodeErr(t, schema, []byte{0x00}, new(false))
+	decodeErr(t, schema, []byte{0x00}, ptr(false))
 }
 
 func TestDecodeFixedIntoInterface(t *testing.T) {
@@ -1528,12 +1589,12 @@ func TestDecodeFixedIntoInterface(t *testing.T) {
 
 func TestDecodeFixedTypeMismatch(t *testing.T) {
 	// Fixed into a non-array.
-	decodeErr(t, `{"type":"fixed","name":"f","size":4}`, []byte{1, 2, 3, 4}, new(int32(0)))
+	decodeErr(t, `{"type":"fixed","name":"f","size":4}`, []byte{1, 2, 3, 4}, ptr(int32(0)))
 }
 
 func TestDecodeFixedWrongSize(t *testing.T) {
 	// Fixed of size 4 into a [3]byte array.
-	decodeErr(t, `{"type":"fixed","name":"f","size":4}`, []byte{1, 2, 3, 4}, new([3]byte{}))
+	decodeErr(t, `{"type":"fixed","name":"f","size":4}`, []byte{1, 2, 3, 4}, ptr([3]byte{}))
 }
 
 func TestDecodeMapIntoInterface(t *testing.T) {
@@ -1592,7 +1653,7 @@ func TestDecodeEnumIntoInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new("b"))
+	encoded, err := s.AppendEncode(nil, ptr("b"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1614,7 +1675,7 @@ func TestDecodeRecordMissingField(t *testing.T) {
 	type R struct {
 		A int32 `avro:"a"`
 	}
-	decodeErr(t, schema, []byte{0x02, 0x02, 0x78}, new(R{}))
+	decodeErr(t, schema, []byte{0x02, 0x02, 0x78}, ptr(R{}))
 }
 
 func TestDecodeRecordIntoTypedMap(t *testing.T) {
@@ -1631,7 +1692,7 @@ func TestDecodeRecordIntoTypedMap(t *testing.T) {
 }
 
 func TestDecodeUnionShortBuffer(t *testing.T) {
-	decodeErr(t, `["null","int"]`, []byte{0xE6, 0xA2}, new((*int32)(nil)))
+	decodeErr(t, `["null","int"]`, []byte{0xE6, 0xA2}, ptr((*int32)(nil)))
 }
 
 func TestDecodeMapNegativeBlockCount(t *testing.T) {
@@ -1675,7 +1736,7 @@ func TestDecodeArrayNegativeBlockCount(t *testing.T) {
 func TestDecodeMapKeyInvalid(t *testing.T) {
 	schema := `{"type":"map","values":"int"}`
 	// count=1 (0x02), key length = -1 (zigzag 0x01)
-	decodeErr(t, schema, []byte{0x02, 0x01}, new(map[string]int32{}))
+	decodeErr(t, schema, []byte{0x02, 0x01}, ptr(map[string]int32{}))
 }
 
 func TestTypeFieldMappingAvroSkip(t *testing.T) {
@@ -1832,7 +1893,7 @@ func TestDecodeBooleanIntoInterface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new(true))
+	encoded, err := s.AppendEncode(nil, ptr(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1851,7 +1912,7 @@ func TestDecodeLongIntoUint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new(int64(42)))
+	encoded, err := s.AppendEncode(nil, ptr(int64(42)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1867,7 +1928,7 @@ func TestDecodeLongIntoUint(t *testing.T) {
 
 func TestDecodeBytesShortRead(t *testing.T) {
 	// Corrupt varlong for bytes length.
-	decodeErr(t, `"bytes"`, []byte{0xE6, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, new([]byte{}))
+	decodeErr(t, `"bytes"`, []byte{0xE6, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, ptr([]byte{}))
 }
 
 func TestDecodeRecordIntoInterfaceWithError(t *testing.T) {
@@ -1907,7 +1968,7 @@ func TestDecodeArrayNegativeBlockShortRead(t *testing.T) {
 	// Negative block count followed by truncated block size.
 	schema := `{"type":"array","items":"int"}`
 	data := []byte{0x01, 0xE6} // count=-1 (zigzag 0x01), then truncated block size
-	decodeErr(t, schema, data, new([]int32{}))
+	decodeErr(t, schema, data, ptr([]int32{}))
 }
 
 func TestDecodeArrayCapGrowth(t *testing.T) {
@@ -2016,7 +2077,7 @@ func TestDecodeMapNegativeBlockShortRead(t *testing.T) {
 	// Negative block count with truncated block size.
 	schema := `{"type":"map","values":"int"}`
 	data := []byte{0x01, 0xE6} // count=-1 (zigzag 0x01), then truncated
-	decodeErr(t, schema, data, new(map[string]int32{}))
+	decodeErr(t, schema, data, ptr(map[string]int32{}))
 }
 
 func TestDecodeMapKeyLengthShortRead(t *testing.T) {
@@ -2024,7 +2085,7 @@ func TestDecodeMapKeyLengthShortRead(t *testing.T) {
 	schema := `{"type":"map","values":"int"}`
 	// count=1 (0x02), then truncated key length
 	data := []byte{0x02, 0xE6, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}
-	decodeErr(t, schema, data, new(map[string]int32{}))
+	decodeErr(t, schema, data, ptr(map[string]int32{}))
 }
 
 func TestVarint4Byte(t *testing.T) {
@@ -2061,11 +2122,11 @@ func TestRoundTripIntWidths(t *testing.T) {
 		v    any
 		want int64
 	}{
-		{"int8", new(int8(27)), 27},
-		{"int16", new(int16(27)), 27},
-		{"int32", new(int32(27)), 27},
-		{"uint8", new(uint8(27)), 27},
-		{"uint16", new(uint16(27)), 27},
+		{"int8", ptr(int8(27)), 27},
+		{"int16", ptr(int16(27)), 27},
+		{"int32", ptr(int32(27)), 27},
+		{"uint8", ptr(uint8(27)), 27},
+		{"uint16", ptr(uint16(27)), 27},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, err := Parse(schema)
@@ -2090,9 +2151,9 @@ func TestRoundTripLongWidths(t *testing.T) {
 		name string
 		v    any
 	}{
-		{"int32", new(int32(27))},
-		{"int64", new(int64(27))},
-		{"uint32", new(uint32(27))},
+		{"int32", ptr(int32(27))},
+		{"int64", ptr(int64(27))},
+		{"uint32", ptr(uint32(27))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, err := Parse(schema)
@@ -2625,7 +2686,7 @@ func TestDecodeIntUint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dst, err := s.AppendEncode(nil, new(int32(42)))
+	dst, err := s.AppendEncode(nil, ptr(int32(42)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2644,7 +2705,7 @@ func TestDecodeLongUint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dst, err := s.AppendEncode(nil, new(int64(42)))
+	dst, err := s.AppendEncode(nil, ptr(int64(42)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2851,7 +2912,7 @@ func TestGenericUnionRoundTrip(t *testing.T) {
 	}
 
 	t.Run("int branch", func(t *testing.T) {
-		dst, err := s.AppendEncode(nil, new(int32(42)))
+		dst, err := s.AppendEncode(nil, ptr(int32(42)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2863,7 +2924,7 @@ func TestGenericUnionRoundTrip(t *testing.T) {
 	})
 
 	t.Run("string branch", func(t *testing.T) {
-		dst, err := s.AppendEncode(nil, new("hello"))
+		dst, err := s.AppendEncode(nil, ptr("hello"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2876,7 +2937,7 @@ func TestGenericUnionRoundTrip(t *testing.T) {
 
 	t.Run("all fail encode", func(t *testing.T) {
 		// Neither int nor string can encode a bool.
-		encodeErr(t, schema, new(true))
+		encodeErr(t, schema, ptr(true))
 	})
 
 	t.Run("decode short buffer", func(t *testing.T) {
@@ -2899,7 +2960,7 @@ func TestGenericUnionRoundTrip(t *testing.T) {
 
 func TestSerNullNonNil(t *testing.T) {
 	// Standalone "null" schema with non-nil value should fail.
-	encodeErr(t, `"null"`, new(int32(42)))
+	encodeErr(t, `"null"`, ptr(int32(42)))
 }
 
 func TestDeserNullUnionErrors(t *testing.T) {
@@ -3033,7 +3094,7 @@ func TestRoundTripArrayNullUnionPrimitive(t *testing.T) {
 	}`
 
 	t.Run("mixed", func(t *testing.T) {
-		input := Outer{Vals: []*int32{new(int32(10)), nil, new(int32(30))}}
+		input := Outer{Vals: []*int32{ptr(int32(10)), nil, ptr(int32(30))}}
 		got := roundTrip(t, schema, input)
 		if len(got.Vals) != 3 {
 			t.Fatalf("expected 3 vals, got %d", len(got.Vals))
@@ -4762,7 +4823,7 @@ func TestSerRecordFastPtrError(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Warm up: encode valid value to compile fast paths.
-	valid := Outer{Item: &Inner{P: new(int32(42))}}
+	valid := Outer{Item: &Inner{P: ptr(int32(42))}}
 	if _, err := s.AppendEncode(nil, &valid); err != nil {
 		t.Fatal(err)
 	}
@@ -5338,7 +5399,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Warm up with valid data.
-		valid := Outer{Items: []*Inner{{P: new(int32(1))}}}
+		valid := Outer{Items: []*Inner{{P: ptr(int32(1))}}}
 		enc, _ := s.AppendEncode(nil, &valid)
 		var dummy Outer
 		s.Decode(enc, &dummy)
@@ -5372,7 +5433,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Warm up.
-		valid := Outer{Items: []*Inner{{P: new(int32(1))}}}
+		valid := Outer{Items: []*Inner{{P: ptr(int32(1))}}}
 		enc, _ := s.AppendEncode(nil, &valid)
 		var dummy Outer
 		s.Decode(enc, &dummy)
@@ -5405,7 +5466,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		valid := Outer{Items: []Inner{{P: new(int32(1))}}}
+		valid := Outer{Items: []Inner{{P: ptr(int32(1))}}}
 		enc, _ := s.AppendEncode(nil, &valid)
 		var dummy Outer
 		s.Decode(enc, &dummy)
@@ -5437,7 +5498,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		valid := Outer{Items: []Inner{{P: new(int32(1))}}}
+		valid := Outer{Items: []Inner{{P: ptr(int32(1))}}}
 		s.AppendEncode(nil, &valid) // warm up
 
 		bad := Outer{Items: []Inner{{P: nil}}}
@@ -5466,7 +5527,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		valid := Outer{Items: []*Inner{{P: new(int32(1))}}}
+		valid := Outer{Items: []*Inner{{P: ptr(int32(1))}}}
 		s.AppendEncode(nil, &valid) // warm up
 
 		bad := Outer{Items: []*Inner{{P: nil}}}
@@ -5725,7 +5786,7 @@ func TestUsArraySerErrorPaths(t *testing.T) {
 
 	t.Run("null_union_ptr", func(t *testing.T) {
 		fn := usArrayNullUnionPtr(failFn, 0, 2)
-		s := []*int32{new(int32(1))}
+		s := []*int32{ptr(int32(1))}
 		_, err := fn(nil, unsafe.Pointer(&s))
 		if err != errFake {
 			t.Errorf("expected fake error, got %v", err)
@@ -6358,17 +6419,17 @@ func TestAdversarialVarintBoundary(t *testing.T) {
 	t.Run("varint_overflow", func(t *testing.T) {
 		// 5-byte varint with all continuation bits set: overflows 32 bits.
 		data := []byte{0x80, 0x80, 0x80, 0x80, 0x80}
-		decodeErr(t, `"int"`, data, new(int32(0)))
+		decodeErr(t, `"int"`, data, ptr(int32(0)))
 	})
 	t.Run("varlong_overflow", func(t *testing.T) {
 		// 10-byte varlong with all continuation bits set: overflows 64 bits.
 		data := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80}
-		decodeErr(t, `"long"`, data, new(int64(0)))
+		decodeErr(t, `"long"`, data, ptr(int64(0)))
 	})
 	t.Run("non_terminating_varint", func(t *testing.T) {
 		// 4 bytes all with continuation bit, then EOF.
 		data := []byte{0xFF, 0xFF, 0xFF, 0xFF}
-		decodeErr(t, `"int"`, data, new(int32(0)))
+		decodeErr(t, `"int"`, data, ptr(int32(0)))
 	})
 }
 
@@ -6620,7 +6681,7 @@ func TestDeserStringTextUnmarshaler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new("hello"))
+	encoded, err := s.AppendEncode(nil, ptr("hello"))
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -6786,7 +6847,7 @@ func TestEncode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := s.Encode(new("hello"))
+	data, err := s.Encode(ptr("hello"))
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
@@ -7118,7 +7179,7 @@ func TestDeserStringTextUnmarshalerError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := s.AppendEncode(nil, new("hello"))
+	encoded, err := s.AppendEncode(nil, ptr("hello"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7137,11 +7198,11 @@ func TestLogicalTypeDeserIntoInterface(t *testing.T) {
 		schema string
 		encode any
 	}{
-		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, new(int64(1000))},
-		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, new(int64(1000))},
-		{"date", `{"type":"int","logicalType":"date"}`, new(int32(100))},
-		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, new(int32(5000))},
-		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, new(int64(5000))},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, ptr(int64(1000))},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, ptr(int64(1000))},
+		{"date", `{"type":"int","logicalType":"date"}`, ptr(int32(100))},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, ptr(int32(5000))},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, ptr(int64(5000))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -7251,7 +7312,7 @@ func TestLogicalTypeDeserTypeMismatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Encode a valid value.
-			encoded, err := s.AppendEncode(nil, new(int64(42)))
+			encoded, err := s.AppendEncode(nil, ptr(int64(42)))
 			if err != nil {
 				t.Fatalf("encode: %v", err)
 			}
@@ -7554,7 +7615,7 @@ func TestLogicalDeserShortBuffer(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Truncated varint/varlong.
-			decodeErr(t, tt.schema, []byte{0xE6, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, new(int64(0)))
+			decodeErr(t, tt.schema, []byte{0xE6, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, ptr(int64(0)))
 		})
 	}
 }
@@ -8779,6 +8840,176 @@ func TestUUIDFixed16InRecord(t *testing.T) {
 	got := roundTrip(t, schema, input)
 	if got.ID != input.ID {
 		t.Fatalf("got %x, want %x", got.ID, input.ID)
+	}
+}
+
+// ---- Coverage: fixed(16) UUID into various target types ----
+
+func TestUUIDFixed16IntoAny(t *testing.T) {
+	schema := `{"type":"fixed","name":"uuid_f","size":16,"logicalType":"uuid"}`
+	s := MustParse(schema)
+	input := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	enc, err := s.Encode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got any
+	if _, err := s.Decode(enc, &got); err != nil {
+		t.Fatal(err)
+	}
+	arr, ok := got.([16]byte)
+	if !ok {
+		t.Fatalf("expected [16]byte, got %T", got)
+	}
+	if arr != input {
+		t.Fatalf("got %x, want %x", arr, input)
+	}
+}
+
+func TestUUIDFixed16IntoString(t *testing.T) {
+	schema := `{"type":"fixed","name":"uuid_f","size":16,"logicalType":"uuid"}`
+	s := MustParse(schema)
+	input := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	enc, err := s.Encode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if _, err := s.Decode(enc, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := "550e8400-e29b-41d4-a716-446655440000"
+	if got != want {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+}
+
+func TestUUIDFixed16IntoBytes(t *testing.T) {
+	schema := `{"type":"fixed","name":"uuid_f","size":16,"logicalType":"uuid"}`
+	s := MustParse(schema)
+	input := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	enc, err := s.Encode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	if _, err := s.Decode(enc, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 16 {
+		t.Fatalf("expected 16 bytes, got %d", len(got))
+	}
+	if [16]byte(got) != input {
+		t.Fatalf("got %x, want %x", got, input)
+	}
+}
+
+func TestUUIDFixed16EncodeFromString(t *testing.T) {
+	schema := `{"type":"fixed","name":"uuid_f","size":16,"logicalType":"uuid"}`
+	s := MustParse(schema)
+	enc, err := s.Encode("550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	if [16]byte(enc) != want {
+		t.Fatalf("got %x, want %x", enc, want)
+	}
+}
+
+func TestUUIDFixed16StructString(t *testing.T) {
+	type R struct {
+		ID string `avro:"id"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"id","type":{"type":"fixed","name":"uuid_f","size":16,"logicalType":"uuid"}}
+	]}`
+	s := MustParse(schema)
+
+	// Encode string, decode string
+	enc, err := s.Encode(&R{ID: "550e8400-e29b-41d4-a716-446655440000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got R
+	if _, err := s.Decode(enc, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Fatalf("got %s", got.ID)
+	}
+}
+
+func TestUUIDFixed16IntoUnsupportedType(t *testing.T) {
+	s := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
+	data := make([]byte, 16)
+	var v int
+	_, err := s.Decode(data, &v)
+	if err == nil {
+		t.Fatal("expected error decoding fixed uuid into int")
+	}
+}
+
+func TestUUIDFixed16EncodeFromBytes(t *testing.T) {
+	s := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
+	input := make([]byte, 16)
+	input[0] = 0xAB
+	enc, err := s.Encode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(enc) != 16 || enc[0] != 0xAB {
+		t.Fatalf("unexpected encoding: %x", enc)
+	}
+}
+
+// ---- Coverage: struct field shadowing (shallower wins) ----
+
+func TestStructFieldShadowing(t *testing.T) {
+	type Inner struct {
+		X int32 `avro:"x"`
+	}
+	type Outer struct {
+		Inner
+		X *int32 `avro:"x"`
+	}
+	schema := `{"type":"record","name":"Outer","fields":[{"name":"x","type":["null","int"]}]}`
+	s := MustParse(schema)
+	val := int32(42)
+	enc, err := s.Encode(&Outer{X: &val})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out Outer
+	if _, err := s.Decode(enc, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.X == nil {
+		t.Fatal("shallower *int32 field was not populated")
+	}
+	if *out.X != 42 {
+		t.Fatalf("got %d, want 42", *out.X)
+	}
+}
+
+// ---- Coverage: implicit null default for nullable unions ----
+
+func TestImplicitNullDefaultMap(t *testing.T) {
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":["null","int"]}
+	]}`
+	s := MustParse(schema)
+	enc, err := s.Encode(map[string]any{"a": int32(1)})
+	if err != nil {
+		t.Fatalf("encoding map with missing nullable key should succeed: %v", err)
+	}
+	var out map[string]any
+	if _, err := s.Decode(enc, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["b"] != nil {
+		t.Fatalf("expected nil for implicit null default, got %v", out["b"])
 	}
 }
 

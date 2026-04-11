@@ -1,0 +1,2 @@
+go test fuzz v1
+string("{\"tYpe\":\"record\",\"nAme\":\"A000\",\"fields\":[   {\"nAme\":\"A0000\",\"tYpe\":\"int\",\"tYpe\":[]}]}")
