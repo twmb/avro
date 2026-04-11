@@ -799,6 +799,16 @@ func FuzzSchemaNode(f *testing.F) {
 	seeds := []string{
 		`"int"`,
 		`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`,
+		// Empty record. The spec requires "fields":[] but twmb/avro's
+		// parser is lenient and accepts the missing attribute too; both
+		// variants must round-trip identically through Canonical().
+		`{"type":"record","name":"Empty","fields":[]}`,
+		`{"type":"record","name":"Empty"}`,
+		// Nested empty records at various positions.
+		`{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"type":"record","name":"I","fields":[]}}]}`,
+		`{"type":"array","items":{"type":"record","name":"E","fields":[]}}`,
+		`{"type":"map","values":{"type":"record","name":"E","fields":[]}}`,
+		`["null",{"type":"record","name":"E","fields":[]}]`,
 		`{"type":"record","name":"R","fields":[
 			{"name":"a","type":{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}},
 			{"name":"b","type":"U"}
