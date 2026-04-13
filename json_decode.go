@@ -43,8 +43,7 @@ func decodeLogicalLong(val int64, node *schemaNode) any {
 // when decoding to *any targets.
 func decodeLogicalBytes(b []byte, node *schemaNode) any {
 	if node.logical == "decimal" {
-		r := bytesToRat(b, node.scale)
-		return json.Number(r.FloatString(node.scale))
+		return bytesToRat(b, node.scale)
 	}
 	return b
 }
@@ -54,8 +53,7 @@ func decodeLogicalBytes(b []byte, node *schemaNode) any {
 func decodeLogicalFixed(b []byte, node *schemaNode) any {
 	switch node.logical {
 	case "decimal":
-		r := bytesToRat(b, node.scale)
-		return json.Number(r.FloatString(node.scale))
+		return bytesToRat(b, node.scale)
 	case "duration":
 		if len(b) == 12 {
 			return DurationFromBytes(b)
@@ -346,11 +344,11 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value, toAny bool) error {
 		if err != nil {
 			return err
 		}
-		var err2 error
-		f, err2 = parseSpecialFloat(s)
-		if err2 != nil {
-			return err2
+		f64, err := parseSpecialFloat(s)
+		if err != nil {
+			return err
 		}
+		f = f64
 	} else if p == 'n' {
 		if err := ctx.scanner.consumeNull(); err != nil {
 			return err
@@ -361,14 +359,14 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value, toAny bool) error {
 		if err != nil {
 			return err
 		}
-		var err2 error
-		f, err2 = strconv.ParseFloat(string(nb), 64)
-		if err2 != nil {
+		f64, err := strconv.ParseFloat(string(nb), 64)
+		if err != nil {
 			// Accept ±Inf from overflow (e.g. 1e999, goavro convention).
-			if !math.IsInf(f, 0) {
-				return fmt.Errorf("avro json: invalid double: %w", err2)
+			if !math.IsInf(f64, 0) {
+				return fmt.Errorf("avro json: invalid double: %w", err)
 			}
 		}
+		f = f64
 	}
 	if toAny {
 		v.Set(reflect.ValueOf(f))
@@ -436,7 +434,7 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny boo
 				return fmt.Errorf("avro json: invalid decimal number %q", nb)
 			}
 			if toAny {
-				v.Set(reflect.ValueOf(json.Number(r.FloatString(node.scale))))
+				v.Set(reflect.ValueOf(r))
 				return nil
 			}
 			return assignDecimalRat(v, r, node)
@@ -470,7 +468,7 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny boo
 				return fmt.Errorf("avro json: invalid decimal number %q", nb)
 			}
 			if toAny {
-				v.Set(reflect.ValueOf(json.Number(r.FloatString(node.scale))))
+				v.Set(reflect.ValueOf(r))
 				return nil
 			}
 			return assignDecimalRat(v, r, node)

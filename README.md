@@ -95,7 +95,7 @@ The table below shows which Go types can be used with each Avro type.
 When decoding into `any`, values use their natural Go types: `nil`, `bool`,
 `int32`, `int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`,
 `map[string]any`. Logical types use `time.Time` (UTC) for timestamps and
-dates, `time.Duration` for time-of-day types, `json.Number` for decimals,
+dates, `time.Duration` for time-of-day types, `*big.Rat` for decimals,
 and `avro.Duration` for the duration logical type.
 
 Encoding also accepts `json.Number` for any numeric type (supporting

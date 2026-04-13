@@ -64,7 +64,7 @@ var slabPool = sync.Pool{New: func() any { return &slab{} }}
 //
 //   - date, timestamp-millis/micros/nanos, local-timestamp-*: [time.Time] (UTC)
 //   - time-millis, time-micros: [time.Duration]
-//   - decimal: [encoding/json.Number]
+//   - decimal: [*math/big.Rat]
 //   - uuid on string: string
 //   - uuid on fixed(16): [16]byte
 //   - duration: [Duration]
@@ -1152,13 +1152,17 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	b := src[:n]
 	src = src[n:]
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == jsonNumberType {
-		r := bytesToRat(b, s.scale)
-		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
 		return src, nil
 	}
 	if v.Type() == bigRatType {
 		v.Set(reflect.ValueOf(*bytesToRat(b, s.scale)))
+		return src, nil
+	}
+	if v.Type() == jsonNumberType {
+		r := bytesToRat(b, s.scale)
+		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
 		return src, nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "decimal"}
@@ -1176,17 +1180,30 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	b := src[:s.size]
 	src = src[s.size:]
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == jsonNumberType {
-		r := bytesToRat(b, s.scale)
-		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
 		return src, nil
 	}
 	if v.Type() == bigRatType {
 		v.Set(reflect.ValueOf(*bytesToRat(b, s.scale)))
 		return src, nil
 	}
+	if v.Type() == jsonNumberType {
+		r := bytesToRat(b, s.scale)
+		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
+		return src, nil
+	}
 	// Fall back to [N]byte fixed.
 	return (&deserFixed{s.size}).deser(append(b[:0:0], b...), v, sl)
+}
+
+// RatFromBytes converts Avro decimal bytes (big-endian two's complement)
+// to *big.Rat with the given scale. This is useful in [CustomType] Decode
+// callbacks that override the default decimal handling: the callback
+// receives raw []byte and can use this function to interpret the value
+// before converting to a custom Go type.
+func RatFromBytes(b []byte, scale int) *big.Rat {
+	return bytesToRat(b, scale)
 }
 
 func bytesToRat(b []byte, scale int) *big.Rat {

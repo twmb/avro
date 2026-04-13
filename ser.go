@@ -1110,7 +1110,10 @@ func (d Duration) Bytes() [12]byte {
 }
 
 // DurationFromBytes decodes a 12-byte little-endian fixed value into a
-// Duration. Returns zero Duration if b is shorter than 12 bytes.
+// Duration. Returns zero Duration if b is shorter than 12 bytes. This is
+// useful in [CustomType] Decode callbacks that override the default duration
+// handling: the callback receives raw []byte and can use this function to
+// interpret the value before converting to a custom Go type.
 func DurationFromBytes(b []byte) Duration {
 	if len(b) < 12 {
 		return Duration{}

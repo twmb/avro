@@ -870,13 +870,13 @@ func FuzzEncodeMapMissingKeys(f *testing.F) {
 	// Seeds: various combinations of present/missing keys.
 	seeds := []string{
 		`{"a":1,"b":2,"c":"x","d":"y"}`,
-		`{"a":1}`,                      // b, c, d all missing
-		`{"a":1,"b":5}`,                // c, d missing
-		`{"a":1,"c":"only c"}`,         // b, d missing
-		`{"a":1,"b":null,"c":null}`,    // explicit nulls
-		`{"b":1,"c":"x"}`,              // missing required 'a'
-		`{"a":"wrong type"}`,           // wrong type
-		`{"a":1,"extra":"ignored"}`,    // extra key
+		`{"a":1}`,                   // b, c, d all missing
+		`{"a":1,"b":5}`,             // c, d missing
+		`{"a":1,"c":"only c"}`,      // b, d missing
+		`{"a":1,"b":null,"c":null}`, // explicit nulls
+		`{"b":1,"c":"x"}`,           // missing required 'a'
+		`{"a":"wrong type"}`,        // wrong type
+		`{"a":1,"extra":"ignored"}`, // extra key
 	}
 	for _, s := range seeds {
 		f.Add(s)

@@ -648,13 +648,13 @@ func TestDecodeJSONLogicalTypesAny(t *testing.T) {
 		// decodeLogicalLong: plain (no logical)
 		{`"long"`, `99`, func(v any) bool { return v == int64(99) }},
 		// decodeLogicalFixed: decimal (4 bytes: value 33, scale 2 → 0.33; precision must fit in 4 bytes: max 9)
-		{`{"type":"fixed","name":"d","size":4,"logicalType":"decimal","precision":9,"scale":2}`, "\"\u0000\u0000\u0000!\"", func(v any) bool { _, ok := v.(json.Number); return ok }},
+		{`{"type":"fixed","name":"d","size":4,"logicalType":"decimal","precision":9,"scale":2}`, "\"\u0000\u0000\u0000!\"", func(v any) bool { _, ok := v.(*big.Rat); return ok }},
 		// decodeLogicalFixed: duration (12 bytes, all printable ASCII for simplicity)
 		{`{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`, "\"abcdefghijkl\"", func(v any) bool { _, ok := v.(Duration); return ok }},
 		// decodeLogicalFixed: plain (no logical)
 		{`{"type":"fixed","name":"f","size":3}`, `"abc"`, func(v any) bool { b, ok := v.([]byte); return ok && len(b) == 3 }},
 		// decodeLogicalBytes: decimal
-		{`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, `"!"`, func(v any) bool { _, ok := v.(json.Number); return ok }},
+		{`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, `"!"`, func(v any) bool { _, ok := v.(*big.Rat); return ok }},
 		// decodeLogicalBytes: plain
 		{`"bytes"`, `"hello"`, func(v any) bool { _, ok := v.([]byte); return ok }},
 	}
