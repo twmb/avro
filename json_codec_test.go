@@ -2247,14 +2247,14 @@ func TestLogicalTypeRoundTrips(t *testing.T) {
 			name:   "decimal-bytes",
 			schema: `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
 			value:  json.Number("0.33"),
-			want:   json.Number("0.33"),
+			want:   new(big.Rat).SetFrac64(33, 100),
 			json:   "0.33",
 		},
 		{
 			name:   "decimal-fixed",
 			schema: `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":10,"scale":2}`,
 			value:  json.Number("0.33"),
-			want:   json.Number("0.33"),
+			want:   new(big.Rat).SetFrac64(33, 100),
 			json:   "0.33",
 		},
 		{
@@ -2402,9 +2402,9 @@ func TestEncodeJSONCoercion(t *testing.T) {
 	doubleSchema := MustParse(`"double"`)
 
 	type enc struct {
-		name   string
-		schema *Schema
-		v      any
+		name    string
+		schema  *Schema
+		v       any
 		wantErr bool
 	}
 	cases := []enc{
@@ -2413,6 +2413,8 @@ func TestEncodeJSONCoercion(t *testing.T) {
 		{"uint to int32", intSchema, uint(42), false},
 		{"float to int32", intSchema, float64(42), false},
 		{"json.Number int to int32", intSchema, json.Number("42"), false},
+		{"json.Number whole float int32", intSchema, json.Number("42.0"), false},
+		{"json.Number sci int32", intSchema, json.Number("1e2"), false},
 		{"json.Number float int32", intSchema, json.Number("3.14"), true},
 		{"int64 overflow int32", intSchema, int64(1 << 40), true},
 		{"uint overflow int32", intSchema, uint64(1 << 40), true},
@@ -2429,6 +2431,8 @@ func TestEncodeJSONCoercion(t *testing.T) {
 		{"float non-whole int64", longSchema, float64(3.14), true},
 		{"uint64 max overflow int64", longSchema, uint64(1<<63 + 1), true},
 		{"float overflow int64", longSchema, float64(1e20), true},
+		{"json.Number whole float int64", longSchema, json.Number("42.0"), false},
+		{"json.Number sci int64", longSchema, json.Number("1e2"), false},
 		{"json.Number float non-whole int64", longSchema, json.Number("3.14"), true},
 		{"json.Number float overflow int64", longSchema, json.Number("1e20"), true},
 		{"json.Number invalid int64", longSchema, json.Number("nope"), true},

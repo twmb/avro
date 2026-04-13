@@ -261,7 +261,6 @@ func TestSchemaNodeCanonicalOrder(t *testing.T) {
 	}
 }
 
-
 func TestSchemaNodeFixed(t *testing.T) {
 	node := &SchemaNode{
 		Type: "fixed",

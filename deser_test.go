@@ -3,7 +3,7 @@ package avro
 import (
 	"bytes"
 	"encoding"
-	"encoding/json"
+
 	"errors"
 	"fmt"
 	"math"
@@ -808,7 +808,7 @@ func TestDecodeShortBuffer(t *testing.T) {
 		{"double", `"double"`, []byte{0x66, 0x66, 0x66}},                      // need 8 bytes, have 3
 		{"string truncated", `"string"`, []byte{0x08}},                        // says 4 bytes, has 0
 		{"bytes truncated", `"bytes"`, []byte{0x08, 0xEC}},                    // says 4 bytes, has 1
-		{"fixed", `{"type":"fixed","name":"f","size":4}`, []byte{0x01, 0x02}},                                                      // need 4, have 2
+		{"fixed", `{"type":"fixed","name":"f","size":4}`, []byte{0x01, 0x02}}, // need 4, have 2
 		{"fixed uuid", `{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}}, // need 16, have 6
 	}
 	for _, tt := range tests {
@@ -8405,13 +8405,13 @@ func TestBytesDecimalDeserInterface(t *testing.T) {
 	if len(rem) != 0 {
 		t.Fatalf("leftover: %d", len(rem))
 	}
-	// Decoding into any produces json.Number for json.Marshal compatibility.
-	got, ok := out.(json.Number)
+	got, ok := out.(*big.Rat)
 	if !ok {
-		t.Fatalf("expected json.Number, got %T", out)
+		t.Fatalf("expected *big.Rat, got %T", out)
 	}
-	if string(got) != "123.45" {
-		t.Fatalf("got %s, want 123.45", got)
+	want := new(big.Rat).SetFrac64(12345, 100)
+	if got.Cmp(want) != 0 {
+		t.Fatalf("got %s, want %s", got.FloatString(2), want.FloatString(2))
 	}
 }
 
@@ -8434,12 +8434,13 @@ func TestFixedDecimalDeserInterface(t *testing.T) {
 	if len(rem) != 0 {
 		t.Fatalf("leftover: %d", len(rem))
 	}
-	got, ok := out.(json.Number)
+	got, ok := out.(*big.Rat)
 	if !ok {
-		t.Fatalf("expected json.Number, got %T", out)
+		t.Fatalf("expected *big.Rat, got %T", out)
 	}
-	if string(got) != "123.45" {
-		t.Fatalf("got %s, want 123.45", got)
+	want := new(big.Rat).SetFrac64(12345, 100)
+	if got.Cmp(want) != 0 {
+		t.Fatalf("got %s, want %s", got.FloatString(2), want.FloatString(2))
 	}
 }
 

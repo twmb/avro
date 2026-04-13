@@ -242,14 +242,14 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return strconv.AppendInt(buf, n, 10), nil
 
 	case "float":
-		f, err := jsonCoerceToFloat64(v, 24)
+		f, err := jsonCoerceToFloat64(v, 32)
 		if err != nil {
 			return nil, err
 		}
 		return appendJSONFloat(buf, f, 32, cfg), nil
 
 	case "double":
-		f, err := jsonCoerceToFloat64(v, 53)
+		f, err := jsonCoerceToFloat64(v, 64)
 		if err != nil {
 			return nil, err
 		}
@@ -737,25 +737,29 @@ func appendJSONFloat(buf []byte, f float64, bits int, cfg *optConfig) []byte {
 }
 
 // jsonCoerceToFloat64 converts a reflect.Value to float64, accepting
-// float, int, uint, and json.Number types. precBits is the target
-// precision (24 for float32, 53 for float64) — integer values exceeding
-// this range are rejected to avoid silent precision loss on round-trip.
-func jsonCoerceToFloat64(v reflect.Value, precBits int) (float64, error) {
+// float, int, uint, and json.Number types. bitSize is the target float
+// size (32 or 64) — integer values exceeding the mantissa precision are
+// rejected to avoid silent precision loss on round-trip.
+func jsonCoerceToFloat64(v reflect.Value, bitSize int) (float64, error) {
 	if v.CanFloat() {
 		return v.Float(), nil
+	}
+	precBits := 53 // float64
+	if bitSize == 32 {
+		precBits = 24 // float32
 	}
 	limit := int64(1) << precBits
 	if v.CanInt() {
 		n := v.Int()
 		if n < -limit || n > limit {
-			return 0, fmt.Errorf("avro json: integer %d overflows float%d exact precision", n, precBits*2)
+			return 0, fmt.Errorf("avro json: integer %d overflows float%d exact precision", n, bitSize)
 		}
 		return float64(n), nil
 	}
 	if v.CanUint() {
 		n := v.Uint()
 		if n > uint64(limit) {
-			return 0, fmt.Errorf("avro json: integer %d overflows float%d exact precision", n, precBits*2)
+			return 0, fmt.Errorf("avro json: integer %d overflows float%d exact precision", n, bitSize)
 		}
 		return float64(n), nil
 	}
@@ -811,7 +815,10 @@ func jsonCoerceToInt32(v reflect.Value) (int32, error) {
 		if f != math.Trunc(f) {
 			return 0, fmt.Errorf("avro json: value %v is not a whole number for int", f)
 		}
-		return 0, fmt.Errorf("avro json: value %s overflows int32", jn)
+		if f < math.MinInt32 || f > math.MaxInt32 {
+			return 0, fmt.Errorf("avro json: value %s overflows int32", jn)
+		}
+		return int32(f), nil
 	}
 	return 0, fmt.Errorf("avro json: expected integer, got %s", v.Type())
 }
@@ -834,7 +841,7 @@ func jsonCoerceToInt64(v reflect.Value) (int64, error) {
 		if f != math.Trunc(f) {
 			return 0, fmt.Errorf("avro json: value %v is not a whole number for long", f)
 		}
-		if f < -(1 << 63) || f >= 1<<63 {
+		if f < -(1<<63) || f >= 1<<63 {
 			return 0, fmt.Errorf("avro json: value %v overflows int64", f)
 		}
 		return int64(f), nil
@@ -851,7 +858,10 @@ func jsonCoerceToInt64(v reflect.Value) (int64, error) {
 		if f != math.Trunc(f) {
 			return 0, fmt.Errorf("avro json: value %v is not a whole number for long", f)
 		}
-		return 0, fmt.Errorf("avro json: value %s overflows int64", jn)
+		if f < -(1<<63) || f >= 1<<63 {
+			return 0, fmt.Errorf("avro json: value %s overflows int64", jn)
+		}
+		return int64(f), nil
 	}
 	return 0, fmt.Errorf("avro json: expected integer, got %s", v.Type())
 }

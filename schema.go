@@ -1183,8 +1183,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			ser:     b.ser,
 			deser:   b.deser,
 		}
-		// Note: decimal primitives are handled by the early return
-		// at the top of this block (L504-522), so they never reach here.
+		if o.Precision != nil {
+			nd.precision = *o.Precision
+		}
+		if o.Scale != nil {
+			nd.scale = *o.Scale
+		}
 		b.node = nd
 		return nil
 	}
