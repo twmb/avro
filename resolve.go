@@ -460,8 +460,14 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 		case v.Kind() == reflect.String:
 			v.SetString(readerSymbols[ri])
 		case v.CanInt():
+			if v.OverflowInt(int64(ri)) {
+				return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", ri, v.Type())}
+			}
 			v.SetInt(int64(ri))
 		case v.CanUint():
+			if v.OverflowUint(uint64(ri)) {
+				return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", ri, v.Type())}
+			}
 			v.SetUint(uint64(ri))
 		default:
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}

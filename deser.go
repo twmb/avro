@@ -139,10 +139,7 @@ func deserNullUnion(u *deserUnion) deserfn {
 		}
 		switch src[0] {
 		case 0: // null
-			switch v.Kind() {
-			case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
-				v.Set(reflect.Zero(v.Type()))
-			}
+			v.Set(reflect.Zero(v.Type()))
 			return src[1:], nil
 		case 2: // T
 			if v.Kind() == reflect.Pointer {
@@ -183,10 +180,7 @@ func deserNullSecondUnion(u *deserUnion) deserfn {
 			}
 			return src, err
 		case 2: // index 1: null
-			switch v.Kind() {
-			case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
-				v.Set(reflect.Zero(v.Type()))
-			}
+			v.Set(reflect.Zero(v.Type()))
 			return src[1:], nil
 		default:
 			return nil, fmt.Errorf("invalid null-union index byte 0x%02x", src[0])
@@ -209,11 +203,8 @@ var deserPrimitive = map[string]deserfn{
 	"string":  deserString,
 }
 
-func deserNull(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	switch v.Kind() {
-	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
-		v.Set(reflect.Zero(v.Type()))
-	}
+func deserNull(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+	v.Set(reflect.Zero(v.Type()))
 	return src, nil
 }
 
@@ -239,19 +230,7 @@ func deserInt(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
-		return src, nil
-	}
-	if v.CanInt() {
-		v.SetInt(int64(val))
-	} else if v.CanUint() {
-		v.SetUint(uint64(val))
-	} else {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
-	}
-	return src, nil
+	return src, setIntValue(indirectAlloc(v), val)
 }
 
 func deserLong(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -259,19 +238,7 @@ func deserLong(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
-		return src, nil
-	}
-	if v.CanInt() {
-		v.SetInt(val)
-	} else if v.CanUint() {
-		v.SetUint(uint64(val))
-	} else {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
-	}
-	return src, nil
+	return src, setLongValue(indirectAlloc(v), val)
 }
 
 func deserFloat(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -305,6 +272,11 @@ func deserDouble(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	if !v.CanFloat() {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
+	}
+	// Overflow check: narrowing a finite float64 into float32 must not
+	// silently clamp to ±Inf. Allow ±Inf and NaN pass-through.
+	if v.Kind() == reflect.Float32 && !math.IsInf(f, 0) && !math.IsNaN(f) && math.IsInf(float64(float32(f)), 0) {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: fmt.Errorf("value %g overflows float32", f)}
 	}
 	v.SetFloat(f)
 	return src, nil
@@ -481,8 +453,14 @@ func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 	case v.Kind() == reflect.String:
 		v.SetString(s.symbols[idx])
 	case v.CanInt():
+		if v.OverflowInt(int64(idx)) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
+		}
 		v.SetInt(int64(idx))
 	case v.CanUint():
+		if v.OverflowUint(uint64(idx)) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
+		}
 		v.SetUint(uint64(idx))
 	default:
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
@@ -998,16 +976,23 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 ///////////////////////////////
 
 // setLongValue sets v to val, handling interface, int, and uint targets.
+// Returns an error if val does not fit in v's Go type.
 func setLongValue(v reflect.Value, val int64) error {
 	if v.Kind() == reflect.Interface {
 		v.Set(reflect.ValueOf(val))
 		return nil
 	}
 	if v.CanInt() {
+		if v.OverflowInt(val) {
+			return &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
+		}
 		v.SetInt(val)
 		return nil
 	}
 	if v.CanUint() {
+		if val < 0 || v.OverflowUint(uint64(val)) {
+			return &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
+		}
 		v.SetUint(uint64(val))
 		return nil
 	}
@@ -1015,16 +1000,23 @@ func setLongValue(v reflect.Value, val int64) error {
 }
 
 // setIntValue sets v to val, handling interface, int, and uint targets.
+// Returns an error if val does not fit in v's Go type.
 func setIntValue(v reflect.Value, val int32) error {
 	if v.Kind() == reflect.Interface {
 		v.Set(reflect.ValueOf(val))
 		return nil
 	}
 	if v.CanInt() {
+		if v.OverflowInt(int64(val)) {
+			return &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
+		}
 		v.SetInt(int64(val))
 		return nil
 	}
 	if v.CanUint() {
+		if val < 0 || v.OverflowUint(uint64(val)) {
+			return &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
+		}
 		v.SetUint(uint64(val))
 		return nil
 	}

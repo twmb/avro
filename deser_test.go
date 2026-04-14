@@ -2963,6 +2963,139 @@ func TestSerNullNonNil(t *testing.T) {
 	encodeErr(t, `"null"`, ptr(int32(42)))
 }
 
+// TestDeserIntegerOverflow verifies that decoding an Avro int or long into a
+// too-narrow Go integer target returns an error rather than silently
+// truncating or wrapping. This mirrors the range checks already performed on
+// the encode side in [Schema.Encode].
+func TestDeserIntegerOverflow(t *testing.T) {
+	t.Run("long into int32 positive overflow", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		data, err := s.Encode(int64(2147483648)) // MaxInt32+1
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out int32
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow error, got out=%d", out)
+		}
+	})
+
+	t.Run("long into int32 negative overflow", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		data, err := s.Encode(int64(-2147483649)) // MinInt32-1
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out int32
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow error, got out=%d", out)
+		}
+	})
+
+	t.Run("int into int8 overflow", func(t *testing.T) {
+		s := MustParse(`"int"`)
+		data, err := s.Encode(int32(200))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out int8
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow error, got out=%d", out)
+		}
+	})
+
+	t.Run("int negative into uint32", func(t *testing.T) {
+		s := MustParse(`"int"`)
+		data, err := s.Encode(int32(-1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out uint32
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow error, got out=%d", out)
+		}
+	})
+
+	t.Run("long negative into uint64", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		data, err := s.Encode(int64(-1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out uint64
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow error, got out=%d", out)
+		}
+	})
+
+	t.Run("in-range values decode cleanly", func(t *testing.T) {
+		// Sanity check: values that fit must still decode without error.
+		s := MustParse(`"long"`)
+		data, err := s.Encode(int64(42))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out32 int32
+		if _, err := s.Decode(data, &out32); err != nil {
+			t.Fatalf("unexpected error for in-range value: %v", err)
+		}
+		if out32 != 42 {
+			t.Fatalf("got %d, want 42", out32)
+		}
+	})
+}
+
+// TestDeserNullIntoNonPointerZeroes verifies that decoding a null-branch union
+// into a non-pointer Go field always replaces the prior value with the Go zero
+// value. This matches encoding/json/v2's documented semantics:
+//
+//	"A JSON null may be decoded into every supported Go value where it is
+//	 equivalent to storing the zero value of the Go value."
+//	"Unless otherwise specified, the decoded value replaces any pre-existing
+//	 value."
+//
+// Prior to v1.x.0 twmb/avro matched encoding/json v1 and left non-pointer
+// targets untouched on null, which preserved prior values across reused
+// struct decodes — a silent data-corruption footgun.
+func TestDeserNullIntoNonPointerZeroes(t *testing.T) {
+	// Covers: deserNullUnion (["null", T]), deserNullSecondUnion (["T", "null"]),
+	// and deserNull (general null branch in a 3+ way union).
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"a","type":["null","int"],"default":null},
+		{"name":"b","type":["int","null"]},
+		{"name":"c","type":["null","int","string"]},
+		{"name":"d","type":["null","string"],"default":null}
+	]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode an all-null record using writer-side maps.
+	encoded, err := s.Encode(map[string]any{"a": nil, "b": nil, "c": nil, "d": nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type Row struct {
+		A int32  `avro:"a"`
+		B int32  `avro:"b"`
+		C int32  `avro:"c"`
+		D string `avro:"d"`
+	}
+
+	// Pre-populate the struct to verify null always zeroes, regardless of
+	// prior state.
+	got := Row{A: 99, B: 88, C: 77, D: "prior"}
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := Row{}
+	if got != want {
+		t.Fatalf("null decoded into pre-populated struct: got %+v, want %+v", got, want)
+	}
+}
+
 func TestDeserNullUnionErrors(t *testing.T) {
 	schema := `["null","int"]`
 	s, err := Parse(schema)

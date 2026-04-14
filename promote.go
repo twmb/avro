@@ -36,14 +36,7 @@ func promoteIntToLong(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 		v.Set(reflect.ValueOf(int64(val)))
 		return src, nil
 	}
-	if v.CanInt() {
-		v.SetInt(int64(val))
-	} else if v.CanUint() {
-		v.SetUint(uint64(val))
-	} else {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
-	}
-	return src, nil
+	return src, setLongValue(v, int64(val))
 }
 
 func promoteIntToFloat(src []byte, v reflect.Value, _ *slab) ([]byte, error) {

@@ -334,7 +334,13 @@ func serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 		return nil, err
 	}
 	if v.CanFloat() {
-		return appendUint32(dst, math.Float32bits(float32(v.Float()))), nil
+		f := v.Float()
+		// Narrowing float64 → float32 must not silently clamp to ±Inf.
+		// Allow ±Inf and NaN pass-through.
+		if v.Kind() == reflect.Float64 && !math.IsInf(f, 0) && !math.IsNaN(f) && math.IsInf(float64(float32(f)), 0) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: fmt.Errorf("value %g overflows float32", f)}
+		}
+		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	} else if v.CanInt() {
 		n := v.Int()
 		if n < -1<<24 || n > 1<<24 {

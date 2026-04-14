@@ -235,15 +235,7 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 		*(*time.Duration)(v.Addr().UnsafePointer()) = timeMillisToDuration(val)
 		return nil
 	}
-	if v.CanInt() {
-		v.SetInt(int64(val))
-		return nil
-	}
-	if v.CanUint() {
-		v.SetUint(uint64(val))
-		return nil
-	}
-	return &SemanticError{GoType: v.Type(), AvroType: "int"}
+	return setIntValue(v, val)
 }
 
 func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool) error {
@@ -278,15 +270,7 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 		*(*time.Duration)(v.Addr().UnsafePointer()) = timeMicrosToDuration(val)
 		return nil
 	}
-	if v.CanInt() {
-		v.SetInt(val)
-		return nil
-	}
-	if v.CanUint() {
-		v.SetUint(uint64(val))
-		return nil
-	}
-	return &SemanticError{GoType: v.Type(), AvroType: "long"}
+	return setLongValue(v, val)
 }
 
 func (ctx *jsonDecoder) decodeFloat(v reflect.Value, toAny bool) error {
@@ -371,6 +355,9 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value, toAny bool) error {
 	if toAny {
 		v.Set(reflect.ValueOf(f))
 	} else if v.CanFloat() {
+		if v.Kind() == reflect.Float32 && !math.IsInf(f, 0) && !math.IsNaN(f) && math.IsInf(float64(float32(f)), 0) {
+			return &SemanticError{GoType: v.Type(), AvroType: "double", Err: fmt.Errorf("value %g overflows float32", f)}
+		}
 		v.SetFloat(f)
 	} else {
 		return &SemanticError{GoType: v.Type(), AvroType: "double"}
