@@ -2928,6 +2928,157 @@ func TestOptReaderSchemaMarker(t *testing.T) {
 	ro.(optReaderSchema).readerOpt()
 }
 
+// TestWithReaderSchemaFunc verifies the callback variant is invoked after the
+// header is parsed, can inspect rd.Schema() and rd.Metadata() to choose a
+// reader schema, and that its returned schema is used for resolution.
+func TestWithReaderSchemaFunc(t *testing.T) {
+	writerSchema := avro.MustParse(recordSchema)
+
+	readerSchemaStr := `{"type":"record","name":"person","fields":[
+		{"name":"name","type":"string"},
+		{"name":"age","type":"int"},
+		{"name":"email","type":"string","default":"unknown"}
+	]}`
+	readerSchema := avro.MustParse(readerSchemaStr)
+
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, writerSchema,
+		WithMetadata(map[string][]byte{"format-version": []byte("2")}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	callbackInvoked := false
+	r, err := NewReader(&buf, WithReaderSchemaFunc(func(rd *Reader) (*avro.Schema, error) {
+		callbackInvoked = true
+		// Verify the callback sees the parsed header state.
+		if rd.Schema() == nil {
+			t.Error("rd.Schema() was nil in callback")
+		}
+		if got := string(rd.Metadata()["format-version"]); got != "2" {
+			t.Errorf("rd.Metadata()[format-version] = %q, want %q", got, "2")
+		}
+		// Choose reader schema based on inspected metadata.
+		return readerSchema, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if !callbackInvoked {
+		t.Fatal("reader schema callback was not invoked")
+	}
+
+	type personV2 struct {
+		Name  string `avro:"name"`
+		Age   int32  `avro:"age"`
+		Email string `avro:"email"`
+	}
+	var p personV2
+	if err := r.Decode(&p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Name != "Alice" || p.Age != 30 || p.Email != "unknown" {
+		t.Fatalf("unexpected: %+v", p)
+	}
+}
+
+// TestWithReaderSchemaFuncReturnsNil verifies that returning (nil, nil) from
+// the callback disables resolution — records decode against the writer schema.
+func TestWithReaderSchemaFuncReturnsNil(t *testing.T) {
+	writerSchema := avro.MustParse(recordSchema)
+
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, writerSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewReader(&buf, WithReaderSchemaFunc(func(rd *Reader) (*avro.Schema, error) {
+		return nil, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	var p person
+	if err := r.Decode(&p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Name != "Alice" || p.Age != 30 {
+		t.Fatalf("unexpected: %+v", p)
+	}
+}
+
+// TestWithReaderSchemaFuncReturnsError verifies that an error from the
+// callback is surfaced from NewReader.
+func TestWithReaderSchemaFuncReturnsError(t *testing.T) {
+	writerSchema := avro.MustParse(recordSchema)
+
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, writerSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sentinel := errors.New("picky callback")
+	_, err = NewReader(&buf, WithReaderSchemaFunc(func(rd *Reader) (*avro.Schema, error) {
+		return nil, sentinel
+	}))
+	if err == nil {
+		t.Fatal("expected error from callback to surface")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("got %v, want wrapping %v", err, sentinel)
+	}
+}
+
+// TestReaderSchemaOptionsAreExclusive verifies that WithReaderSchema and
+// WithReaderSchemaFunc cannot both be used in the same NewReader call.
+func TestReaderSchemaOptionsAreExclusive(t *testing.T) {
+	writerSchema := avro.MustParse(recordSchema)
+
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, writerSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(&person{Name: "Alice", Age: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := avro.MustParse(recordSchema)
+	_, err = NewReader(&buf,
+		WithReaderSchema(s),
+		WithReaderSchemaFunc(func(*Reader) (*avro.Schema, error) { return s, nil }),
+	)
+	if err == nil {
+		t.Fatal("expected error when both options are provided")
+	}
+}
+
 func TestNegativeBlockCountRead(t *testing.T) {
 	s, err := avro.Parse(`"int"`)
 	if err != nil {

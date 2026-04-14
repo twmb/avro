@@ -102,6 +102,18 @@ Encoding also accepts `json.Number` for any numeric type (supporting
 `json.Decoder.UseNumber()` pipelines) and `[]byte` for string fields (and
 vice versa).
 
+A null union branch decodes to the target's Go zero value, always replacing
+any prior value — matching [`encoding/json/v2.Unmarshal`][jsonv2-null]. Use
+`*T` to distinguish null from zero.
+
+Numeric values that don't fit the Go target's range (e.g. Avro `long` `2^33`
+into Go `int32`, or Avro `double` overflowing `float32` to `±Inf`) return an
+error rather than silently wrapping or clamping. Values within range but
+without exact representation are rounded silently, matching
+[`encoding/json/v2`][jsonv2-null]'s "rounded or clamped" rule.
+
+[jsonv2-null]: https://pkg.go.dev/encoding/json/v2#Unmarshal
+
 ## Struct Tags
 
 Struct fields are matched to Avro record fields by name. Use the `avro` struct

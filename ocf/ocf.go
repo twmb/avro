@@ -121,22 +121,26 @@ func (optCodec) writerOpt() {}
 func (optCodec) readerOpt() {}
 
 type (
-	optBlockCount    struct{ n int }
-	optBlockBytes    struct{ n int }
-	optMetadata      struct{ m map[string][]byte }
-	optSyncMarker    struct{ sync [16]byte }
-	optSchema        struct{ s string }
-	optReaderSchema  struct{ s *avro.Schema }
+	optBlockCount       struct{ n int }
+	optBlockBytes       struct{ n int }
+	optMetadata         struct{ m map[string][]byte }
+	optSyncMarker       struct{ sync [16]byte }
+	optSchema           struct{ s string }
+	optReaderSchema     struct{ s *avro.Schema }
+	optReaderSchemaFunc struct {
+		fn func(*Reader) (*avro.Schema, error)
+	}
 	optMaxBlockBytes struct{ n int64 }
 )
 
-func (optBlockCount) writerOpt()    {}
-func (optBlockBytes) writerOpt()    {}
-func (optMetadata) writerOpt()      {}
-func (optSyncMarker) writerOpt()    {}
-func (optSchema) writerOpt()        {}
-func (optReaderSchema) readerOpt()  {}
-func (optMaxBlockBytes) readerOpt() {}
+func (optBlockCount) writerOpt()       {}
+func (optBlockBytes) writerOpt()       {}
+func (optMetadata) writerOpt()         {}
+func (optSyncMarker) writerOpt()       {}
+func (optSchema) writerOpt()           {}
+func (optReaderSchema) readerOpt()     {}
+func (optReaderSchemaFunc) readerOpt() {}
+func (optMaxBlockBytes) readerOpt()    {}
 
 type optSchemaOpts []avro.SchemaOpt
 
@@ -178,12 +182,39 @@ func WithSyncMarker(sync [16]byte) WriterOpt { return optSyncMarker{sync} }
 // a custom schema string.
 func WithSchema(schema string) WriterOpt { return optSchema{schema} }
 
-// WithReaderSchema provides a reader schema for schema evolution. If set, the
-// file's writer schema is resolved against the reader schema using
-// [avro.Resolve], and all decoded values use the reader schema's format.
-// Fields added in the reader schema must have defaults; fields removed from
-// the writer schema are skipped.
+// WithReaderSchema provides the reader schema to resolve the file's writer
+// schema against via [avro.Resolve]. Subsequent [Reader.Decode] calls use
+// the resolved schema. Fields added in the reader schema must have defaults;
+// writer fields absent from the reader schema are skipped.
+//
+// Use [WithReaderSchemaFunc] when the reader schema must be chosen based on
+// the file's header (metadata or writer-schema shape).
+//
+// At most one of [WithReaderSchema] and [WithReaderSchemaFunc] may be used.
 func WithReaderSchema(s *avro.Schema) ReaderOpt { return optReaderSchema{s} }
+
+// WithReaderSchemaFunc is the dynamic counterpart to [WithReaderSchema]. The
+// callback is invoked by [NewReader] after the OCF header has been parsed, so
+// it can inspect the file's writer schema and metadata via rd.Schema() and
+// rd.Metadata() before deciding which reader schema to resolve against.
+//
+// If the callback returns a non-nil schema, the writer schema is resolved
+// against it via [avro.Resolve] and subsequent [Reader.Decode] calls use the
+// resolved schema.
+//
+// If the callback returns (nil, nil), no resolution is performed and records
+// decode against the writer schema directly — equivalent to not passing any
+// reader-schema option at all.
+//
+// If the callback returns a non-nil error, [NewReader] returns that error.
+//
+// The callback must not call rd.Decode or rd.Close; rd is only valid for
+// read-only header inspection during the callback.
+//
+// At most one of [WithReaderSchema] and [WithReaderSchemaFunc] may be used.
+func WithReaderSchemaFunc(fn func(rd *Reader) (*avro.Schema, error)) ReaderOpt {
+	return optReaderSchemaFunc{fn}
+}
 
 // WithMaxBlockBytes sets the maximum compressed block size in bytes that the
 // reader will accept. The default is 64 MiB. This guards against malicious
@@ -553,6 +584,7 @@ func readHeader(br *bufio.Reader, schemaOpts []avro.SchemaOpt) (schema *avro.Sch
 func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	var customCodecs []Codec
 	var readerSchema *avro.Schema
+	var readerSchemaFn func(*Reader) (*avro.Schema, error)
 	var maxBlockBytes int64
 	var schemaOpts []avro.SchemaOpt
 	for _, o := range opts {
@@ -561,11 +593,16 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 			customCodecs = append(customCodecs, o.c)
 		case optReaderSchema:
 			readerSchema = o.s
+		case optReaderSchemaFunc:
+			readerSchemaFn = o.fn
 		case optMaxBlockBytes:
 			maxBlockBytes = o.n
 		case optSchemaOpts:
 			schemaOpts = append(schemaOpts, o...)
 		}
+	}
+	if readerSchema != nil && readerSchemaFn != nil {
+		return nil, errors.New("ocf: WithReaderSchema and WithReaderSchemaFunc are mutually exclusive")
 	}
 	if maxBlockBytes <= 0 {
 		maxBlockBytes = 1 << 26 // 64 MiB default
@@ -587,23 +624,35 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 		return nil, err
 	}
 
-	// Apply schema evolution if a reader schema was provided.
-	if readerSchema != nil {
-		resolved, err := avro.Resolve(schema, readerSchema)
-		if err != nil {
-			return nil, fmt.Errorf("ocf: resolving reader schema: %w", err)
-		}
-		schema = resolved
-	}
-
-	return &Reader{
+	rd := &Reader{
 		r:             br,
 		schema:        schema,
 		codec:         codec,
 		sync:          sync,
 		meta:          meta,
 		maxBlockBytes: maxBlockBytes,
-	}, nil
+	}
+
+	// If a reader-schema callback was provided, invoke it now that the
+	// header has been parsed so it can inspect writer schema and metadata.
+	if readerSchemaFn != nil {
+		chosen, err := readerSchemaFn(rd)
+		if err != nil {
+			return nil, fmt.Errorf("ocf: reader schema func: %w", err)
+		}
+		readerSchema = chosen
+	}
+
+	// Apply schema evolution if a reader schema was provided.
+	if readerSchema != nil {
+		resolved, err := avro.Resolve(schema, readerSchema)
+		if err != nil {
+			return nil, fmt.Errorf("ocf: resolving reader schema: %w", err)
+		}
+		rd.schema = resolved
+	}
+
+	return rd, nil
 }
 
 // Decode reads the next datum into v, returning [io.EOF] at end of file.

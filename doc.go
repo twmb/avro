@@ -105,6 +105,12 @@
 // If you just want to check whether two schemas are compatible without
 // building a resolved schema, use [CheckCompatibility].
 //
+// A null union branch decodes to the target's Go zero value, always replacing
+// any prior value — matching [encoding/json/v2.Unmarshal]. Use *T to
+// distinguish null from zero. Numeric values that don't fit the Go target's
+// range return an error; values within range but without exact representation
+// are rounded silently, matching json/v2's "rounded or clamped" rule.
+//
 // # Struct tags
 //
 // Use the "avro" struct tag to control field mapping and schema inference.
@@ -168,5 +174,6 @@
 //   - Fingerprinting: [Schema.Canonical], [Schema.Fingerprint], [NewRabin]
 //   - Object Container Files: the [github.com/twmb/avro/ocf] sub-package
 //
+// [encoding/json/v2.Unmarshal]: https://pkg.go.dev/encoding/json/v2#Unmarshal
 // [Avro specification]: https://avro.apache.org/docs/current/specification/
 package avro
