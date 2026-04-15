@@ -113,6 +113,236 @@ func TestSchemaForNullable(t *testing.T) {
 	})
 }
 
+func TestSchemaForNullableDefaultNull(t *testing.T) {
+	type V2 struct {
+		Name  string  `avro:"name"`
+		Email *string `avro:"email"` // should get default null automatically
+	}
+	reader, err := SchemaFor[V2]()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the default appears in the schema.
+	var raw any
+	if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
+		t.Fatal(err)
+	}
+	fields := raw.(map[string]any)["fields"].([]any)
+	emailField := fields[1].(map[string]any)
+	if emailField["default"] != nil {
+		t.Fatalf("email default: got %v, want null", emailField["default"])
+	}
+	if _, ok := emailField["default"]; !ok {
+		t.Fatal("email field should have a default key")
+	}
+
+	// Verify backward compatibility: reader has email, writer does not.
+	writer, err := Parse(`{"type":"record","name":"V2","fields":[
+		{"name":"name","type":"string"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := writer.Encode(map[string]any{"name": "Alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got V2
+	if _, err := resolved.Decode(data, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Name != "Alice" {
+		t.Errorf("name: got %q, want Alice", got.Name)
+	}
+	if got.Email != nil {
+		t.Errorf("email: got %v, want nil", got.Email)
+	}
+}
+
+func TestSchemaForNullableExplicitDefault(t *testing.T) {
+	// Explicit default should override the auto null default.
+	type R struct {
+		Value *string `avro:"value,default=hello"`
+	}
+	s, err := SchemaFor[R]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw any
+	if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
+		t.Fatal(err)
+	}
+	fields := raw.(map[string]any)["fields"].([]any)
+	dflt := fields[0].(map[string]any)["default"]
+	if dflt != "hello" {
+		t.Fatalf("default: got %v, want \"hello\"", dflt)
+	}
+}
+
+func TestSchemaForFixedTypeName(t *testing.T) {
+	type MyHash [16]byte
+
+	t.Run("named type", func(t *testing.T) {
+		type R struct {
+			Hash MyHash `avro:"hash"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw any
+		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
+			t.Fatal(err)
+		}
+		fields := raw.(map[string]any)["fields"].([]any)
+		fixed := fields[0].(map[string]any)["type"].(map[string]any)
+		if fixed["name"] != "MyHash" {
+			t.Errorf("fixed name: got %v, want MyHash", fixed["name"])
+		}
+		if fixed["size"] != float64(16) {
+			t.Errorf("fixed size: got %v, want 16", fixed["size"])
+		}
+	})
+
+	t.Run("unnamed array", func(t *testing.T) {
+		type R struct {
+			Hash [16]byte `avro:"hash"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw any
+		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
+			t.Fatal(err)
+		}
+		fields := raw.(map[string]any)["fields"].([]any)
+		fixed := fields[0].(map[string]any)["type"].(map[string]any)
+		if fixed["name"] != "fixed_16" {
+			t.Errorf("fixed name: got %v, want fixed_16", fixed["name"])
+		}
+	})
+
+	t.Run("round trip", func(t *testing.T) {
+		type R struct {
+			Hash MyHash `avro:"hash"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := R{Hash: MyHash{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}}
+		data, err := s.Encode(&input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got R
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Hash != input.Hash {
+			t.Errorf("got %v, want %v", got.Hash, input.Hash)
+		}
+	})
+}
+
+func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
+	type MD5 [16]byte
+	type SHA1 [20]byte
+
+	t.Run("different types", func(t *testing.T) {
+		type R struct {
+			A MD5  `avro:"a"`
+			B SHA1 `avro:"b"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw any
+		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
+			t.Fatal(err)
+		}
+		fields := raw.(map[string]any)["fields"].([]any)
+		a := fields[0].(map[string]any)["type"].(map[string]any)
+		b := fields[1].(map[string]any)["type"].(map[string]any)
+		if a["name"] != "MD5" {
+			t.Errorf("first fixed name: got %v, want MD5", a["name"])
+		}
+		if b["name"] != "SHA1" {
+			t.Errorf("second fixed name: got %v, want SHA1", b["name"])
+		}
+
+		// Round-trip.
+		input := R{A: MD5{1}, B: SHA1{2}}
+		data, err := s.Encode(&input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got R
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != input {
+			t.Errorf("got %+v, want %+v", got, input)
+		}
+	})
+
+	t.Run("same type dedup", func(t *testing.T) {
+		// Same named fixed type on two fields — second should be a
+		// name reference, not a duplicate definition.
+		type R struct {
+			A MD5 `avro:"a"`
+			B MD5 `avro:"b"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := R{A: MD5{1}, B: MD5{2}}
+		data, err := s.Encode(&input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got R
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != input {
+			t.Errorf("got %+v, want %+v", got, input)
+		}
+	})
+
+	t.Run("same type with alias dedup", func(t *testing.T) {
+		// type-alias on first field, second field uses name reference.
+		type R struct {
+			A MD5 `avro:"a,type-alias=old_hash"`
+			B MD5 `avro:"b"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := R{A: MD5{1}, B: MD5{2}}
+		data, err := s.Encode(&input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got R
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != input {
+			t.Errorf("got %+v, want %+v", got, input)
+		}
+	})
+}
+
 func TestSchemaForTimestamp(t *testing.T) {
 	type Event struct {
 		ID        string    `avro:"id"`
@@ -247,6 +477,520 @@ func TestSchemaForAlias(t *testing.T) {
 	if got.EmailAddress != "a@b.com" {
 		t.Errorf("email: got %q, want %q", got.EmailAddress, "a@b.com")
 	}
+}
+
+func TestSplitTag(t *testing.T) {
+	tests := []struct {
+		tag  string
+		want []string
+	}{
+		{"name", []string{"name"}},
+		{"name,alias=foo", []string{"name", "alias=foo"}},
+		{"name,decimal(10,2)", []string{"name", "decimal(10,2)"}},
+		{"name,alias=[a,b]", []string{"name", "alias=[a,b]"}},
+		{"name,alias=[a,b],uuid", []string{"name", "alias=[a,b]", "uuid"}},
+		{"name,decimal(10,2),alias=[a,b],uuid", []string{"name", "decimal(10,2)", "alias=[a,b]", "uuid"}},
+	}
+	for _, tt := range tests {
+		got, err := splitTag(tt.tag)
+		if err != nil {
+			t.Errorf("splitTag(%q) unexpected error: %v", tt.tag, err)
+			continue
+		}
+		if len(got) != len(tt.want) {
+			t.Errorf("splitTag(%q) = %v, want %v", tt.tag, got, tt.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("splitTag(%q)[%d] = %q, want %q", tt.tag, i, got[i], tt.want[i])
+			}
+		}
+	}
+
+	// Unclosed and mismatched delimiters should error.
+	for _, tag := range []string{
+		"name,alias=[a,b",       // unclosed [
+		"name,decimal(10,2",     // unclosed (
+		"name,alias=[a,b)",      // [ closed by )
+		"name,decimal(10,2]",    // ( closed by ]
+		"name,alias=[a)b]",      // ) inside [ context
+	} {
+		if _, err := splitTag(tag); err == nil {
+			t.Errorf("splitTag(%q) expected error for bad delimiters", tag)
+		}
+	}
+}
+
+func TestSchemaForAliasMultiple(t *testing.T) {
+	type V2 struct {
+		EmailAddress string `avro:"email_address,alias=[email,e_mail]"`
+		Name         string `avro:"name"`
+	}
+	reader, err := SchemaFor[V2]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, writerName := range []string{"email", "e_mail"} {
+		writer, err := Parse(`{"type":"record","name":"V2","fields":[
+			{"name":"` + writerName + `","type":"string"},
+			{"name":"name","type":"string"}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := writer.Encode(map[string]any{writerName: "a@b.com", "name": "Alice"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got V2
+		if _, err := resolved.Decode(data, &got); err != nil {
+			t.Fatalf("decode with writer field %q: %v", writerName, err)
+		}
+		if got.EmailAddress != "a@b.com" {
+			t.Errorf("writer field %q: got %q, want %q", writerName, got.EmailAddress, "a@b.com")
+		}
+	}
+}
+
+func TestSchemaForTypeAlias(t *testing.T) {
+	type Inner struct {
+		Value int32 `avro:"value"`
+	}
+	type Outer struct {
+		Name  string  `avro:"name"`
+		Inner Inner   `avro:"inner,type-alias=[legacy_inner,old_inner]"`
+		List  []Inner `avro:"list"`
+	}
+
+	reader, err := SchemaFor[Outer]()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the alias appears in the generated schema.
+	var raw any
+	if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
+		t.Fatal(err)
+	}
+	fields := raw.(map[string]any)["fields"].([]any)
+	innerField := fields[1].(map[string]any)["type"].(map[string]any)
+	aliases, _ := innerField["aliases"].([]any)
+	if len(aliases) != 2 || aliases[0] != "legacy_inner" || aliases[1] != "old_inner" {
+		t.Fatalf("inner record aliases: got %v, want [legacy_inner old_inner]", aliases)
+	}
+
+	// Verify resolution works against a writer using the old name.
+	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+		{"name":"name","type":"string"},
+		{"name":"inner","type":{"type":"record","name":"legacy_inner","fields":[
+			{"name":"value","type":"int"}
+		]}},
+		{"name":"list","type":{"type":"array","items":"legacy_inner"}}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := writer.Encode(map[string]any{
+		"name":  "test",
+		"inner": map[string]any{"value": int32(42)},
+		"list":  []any{map[string]any{"value": int32(7)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Outer
+	if _, err := resolved.Decode(data, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Inner.Value != 42 {
+		t.Errorf("inner.value: got %d, want 42", got.Inner.Value)
+	}
+	if len(got.List) != 1 || got.List[0].Value != 7 {
+		t.Errorf("list: got %+v, want [{Value:7}]", got.List)
+	}
+}
+
+func TestSchemaForTypeAliasNullable(t *testing.T) {
+	type Inner struct {
+		Value int32 `avro:"value"`
+	}
+	type Outer struct {
+		Inner *Inner `avro:"inner,type-alias=old_inner"`
+	}
+
+	reader, err := SchemaFor[Outer]()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+		{"name":"inner","type":["null",{"type":"record","name":"old_inner","fields":[
+			{"name":"value","type":"int"}
+		]}]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := writer.Encode(map[string]any{
+		"inner": map[string]any{"value": int32(99)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Outer
+	if _, err := resolved.Decode(data, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Inner == nil || got.Inner.Value != 99 {
+		t.Errorf("inner: got %+v, want &{Value:99}", got.Inner)
+	}
+}
+
+func TestSchemaForTypeAliasMap(t *testing.T) {
+	type Inner struct {
+		Value int32 `avro:"value"`
+	}
+	type Outer struct {
+		Items map[string]Inner `avro:"items,type-alias=old_inner"`
+	}
+
+	reader, err := SchemaFor[Outer]()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+		{"name":"items","type":{"type":"map","values":{"type":"record","name":"old_inner","fields":[
+			{"name":"value","type":"int"}
+		]}}}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := writer.Encode(map[string]any{
+		"items": map[string]any{"k": map[string]any{"value": int32(5)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Outer
+	if _, err := resolved.Decode(data, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Items["k"].Value != 5 {
+		t.Errorf("items[k].value: got %d, want 5", got.Items["k"].Value)
+	}
+}
+
+func TestSchemaForTypeAliasEnum(t *testing.T) {
+	// SchemaFor can't infer enums from Go types, but CustomType with
+	// Schema can produce one. Verify type-alias works on enum fields.
+	type Status string
+
+	enumNode := SchemaNode{
+		Type:    "enum",
+		Name:    "Status",
+		Symbols: []string{"ACTIVE", "INACTIVE"},
+	}
+	type Outer struct {
+		State Status `avro:"state,type-alias=OldStatus"`
+	}
+	reader, err := SchemaFor[Outer](CustomType{
+		GoType: reflect.TypeOf(Status("")),
+		Schema: &enumNode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the alias appears on the enum type.
+	var raw any
+	if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
+		t.Fatal(err)
+	}
+	fields := raw.(map[string]any)["fields"].([]any)
+	enumType := fields[0].(map[string]any)["type"].(map[string]any)
+	if enumType["type"] != "enum" {
+		t.Fatalf("expected enum type, got %v", enumType["type"])
+	}
+	aliases, _ := enumType["aliases"].([]any)
+	if len(aliases) != 1 || aliases[0] != "OldStatus" {
+		t.Fatalf("enum aliases: got %v, want [OldStatus]", aliases)
+	}
+
+	// Verify resolution against a writer using the old name.
+	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+		{"name":"state","type":{"type":"enum","name":"OldStatus","symbols":["ACTIVE","INACTIVE"]}}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := writer.Encode(map[string]any{"state": "ACTIVE"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Outer
+	if _, err := resolved.Decode(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "ACTIVE" {
+		t.Errorf("state: got %q, want ACTIVE", got.State)
+	}
+}
+
+// TestSchemaForTypeAliasErrors tests that type-alias is rejected on
+// fields that don't reference a named type (record, enum, fixed).
+func TestSchemaForTypeAliasErrors(t *testing.T) {
+	t.Run("primitive int", func(t *testing.T) {
+		type R struct {
+			X int32 `avro:"x,type-alias=old_x"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("primitive string", func(t *testing.T) {
+		type R struct {
+			X string `avro:"x,type-alias=old_x"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("primitive bytes", func(t *testing.T) {
+		type R struct {
+			X []byte `avro:"x,type-alias=old_x"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("nullable primitive", func(t *testing.T) {
+		type R struct {
+			X *int32 `avro:"x,type-alias=old_x"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error: union of null+int has no named type")
+		}
+	})
+
+	t.Run("slice of primitives", func(t *testing.T) {
+		type R struct {
+			X []int32 `avro:"x,type-alias=old_x"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error: array of int has no named type")
+		}
+	})
+
+	t.Run("map of primitives", func(t *testing.T) {
+		type R struct {
+			X map[string]int32 `avro:"x,type-alias=old_x"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error: map of int has no named type")
+		}
+	})
+
+	t.Run("nullable slice of primitives", func(t *testing.T) {
+		type R struct {
+			X *[]int32 `avro:"x,type-alias=old_x"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error: nullable array of int has no named type")
+		}
+	})
+}
+
+// TestSchemaForTypeAliasNamedRef tests that type-alias works correctly
+// when the same record type appears multiple times (second occurrence
+// is a named type reference string, not the full definition).
+func TestSchemaForTypeAliasNamedRef(t *testing.T) {
+	type Inner struct {
+		Value int32 `avro:"value"`
+	}
+
+	t.Run("two fields same type identical aliases", func(t *testing.T) {
+		// Identical type-alias on both fields is accepted.
+		type Outer struct {
+			A Inner `avro:"a,type-alias=old_inner"`
+			B Inner `avro:"b,type-alias=old_inner"`
+		}
+		if _, err := SchemaFor[Outer](); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("two fields same type conflicting aliases", func(t *testing.T) {
+		type Outer struct {
+			A Inner `avro:"a,type-alias=old_inner"`
+			B Inner `avro:"b,type-alias=different_inner"`
+		}
+		if _, err := SchemaFor[Outer](); err == nil {
+			t.Fatal("expected error for conflicting type-alias")
+		}
+	})
+
+	t.Run("only first field aliased", func(t *testing.T) {
+		type Outer struct {
+			A Inner `avro:"a,type-alias=old_inner"`
+			B Inner `avro:"b"`
+		}
+		reader, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+			{"name":"a","type":{"type":"record","name":"old_inner","fields":[
+				{"name":"value","type":"int"}
+			]}},
+			{"name":"b","type":"old_inner"}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := writer.Encode(map[string]any{
+			"a": map[string]any{"value": int32(1)},
+			"b": map[string]any{"value": int32(2)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got Outer
+		if _, err := resolved.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.A.Value != 1 || got.B.Value != 2 {
+			t.Errorf("got A=%d B=%d, want A=1 B=2", got.A.Value, got.B.Value)
+		}
+	})
+
+	t.Run("first not aliased second aliased errors", func(t *testing.T) {
+		// The first field defines the record without an alias.
+		// The second field has type-alias but gets a name reference.
+		// This should error — the alias would be silently dropped.
+		type Outer struct {
+			A Inner `avro:"a"`
+			B Inner `avro:"b,type-alias=old_inner"`
+		}
+		if _, err := SchemaFor[Outer](); err == nil {
+			t.Fatal("expected error for type-alias on already-defined type")
+		}
+	})
+
+	t.Run("array of named ref identical aliases accepted", func(t *testing.T) {
+		// Identical type-alias on both fields is accepted.
+		type Outer struct {
+			Direct Inner   `avro:"direct,type-alias=old_inner"`
+			List   []Inner `avro:"list,type-alias=old_inner"`
+		}
+		if _, err := SchemaFor[Outer](); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("array of named ref only first aliased", func(t *testing.T) {
+		type Outer struct {
+			Direct Inner   `avro:"direct,type-alias=old_inner"`
+			List   []Inner `avro:"list"`
+		}
+		reader, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+			{"name":"direct","type":{"type":"record","name":"old_inner","fields":[
+				{"name":"value","type":"int"}
+			]}},
+			{"name":"list","type":{"type":"array","items":"old_inner"}}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := writer.Encode(map[string]any{
+			"direct": map[string]any{"value": int32(10)},
+			"list":   []any{map[string]any{"value": int32(20)}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got Outer
+		if _, err := resolved.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Direct.Value != 10 {
+			t.Errorf("direct.value: got %d, want 10", got.Direct.Value)
+		}
+		if len(got.List) != 1 || got.List[0].Value != 20 {
+			t.Errorf("list: got %+v, want [{Value:20}]", got.List)
+		}
+	})
+
+	t.Run("deep nesting nullable map of array of record", func(t *testing.T) {
+		type Outer struct {
+			M *map[string][]Inner `avro:"m,type-alias=old_inner"`
+		}
+		_, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("fixed type", func(t *testing.T) {
+		type Outer struct {
+			Hash [16]byte `avro:"hash,type-alias=old_hash"`
+		}
+		reader, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Verify the alias appears on the fixed type.
+		var raw any
+		if err := json.Unmarshal([]byte(reader.String()), &raw); err != nil {
+			t.Fatal(err)
+		}
+		fields := raw.(map[string]any)["fields"].([]any)
+		hashField := fields[0].(map[string]any)["type"].(map[string]any)
+		if hashField["type"] != "fixed" {
+			t.Fatalf("expected fixed type, got %v", hashField["type"])
+		}
+		aliases, _ := hashField["aliases"].([]any)
+		if len(aliases) != 1 || aliases[0] != "old_hash" {
+			t.Fatalf("fixed aliases: got %v, want [old_hash]", aliases)
+		}
+	})
 }
 
 func TestSchemaForEmbeddedAndInline(t *testing.T) {
@@ -1012,6 +1756,60 @@ func TestSchemaForErrors(t *testing.T) {
 		}
 		if _, err := SchemaFor[R](); err == nil {
 			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("type-alias on primitive", func(t *testing.T) {
+		type R struct {
+			X int32 `avro:"x,type-alias=old_x"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error for type-alias on non-named type")
+		}
+	})
+
+	t.Run("empty alias", func(t *testing.T) {
+		type R struct {
+			X int32 `avro:"x,alias="`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error for empty alias")
+		}
+	})
+
+	t.Run("empty brackets", func(t *testing.T) {
+		type R struct {
+			X int32 `avro:"x,alias=[]"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error for empty brackets")
+		}
+	})
+
+	t.Run("empty element in brackets", func(t *testing.T) {
+		type R struct {
+			X int32 `avro:"x,alias=[a,,b]"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error for empty element in brackets")
+		}
+	})
+
+	t.Run("trailing comma in brackets", func(t *testing.T) {
+		type R struct {
+			X int32 `avro:"x,alias=[a,]"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error for trailing comma in brackets")
+		}
+	})
+
+	t.Run("unclosed bracket", func(t *testing.T) {
+		type R struct {
+			X int32 `avro:"x,alias=[a,b"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error for unclosed bracket")
 		}
 	})
 }
