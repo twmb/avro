@@ -198,7 +198,9 @@ This produces the equivalent of:
 }
 ```
 
-Go types map to Avro types automatically: `*T` becomes a `["null", T]` union,
+Go types map to Avro types automatically: `*T` becomes a `["null", T]` union
+with `"default": null` (backward-compatible by default), `[N]byte` becomes a
+fixed type named after the Go type (or `fixed_N` for unnamed arrays),
 `time.Time` becomes `timestamp-millis`, and so on (see [Type Mapping](#type-mapping)).
 
 Additional tag options for schema inference:
@@ -206,11 +208,32 @@ Additional tag options for schema inference:
 | Tag | Example | Description |
 |-----|---------|-------------|
 | `default=` | `avro:",default=0"` | Default value (must be last; scalars only) |
-| `alias=` | `avro:",alias=old"` | Field alias for schema evolution (repeatable) |
+| `alias=` | `avro:",alias=old"` | Field alias for schema evolution (repeatable, or `alias=[a,b]`) |
+| `type-alias=` | `avro:",type-alias=old"` | Alias for the field's named type — record, enum, or fixed (repeatable, or `type-alias=[a,b]`) |
 | `timestamp-micros` | `avro:",timestamp-micros"` | Override logical type |
 | `decimal(p,s)` | `avro:",decimal(10,2)"` | Decimal logical type (required for `*big.Rat`) |
 | `uuid` | `avro:",uuid"` | UUID logical type |
 | `date` | `avro:",date"` | Date logical type |
+
+`alias` and `type-alias` serve different purposes in schema evolution. `alias`
+adds an alias to the **field** — it lets a writer field with a different name
+match this reader field. `type-alias` adds an alias to the **named type**
+(record, enum, or fixed) that the field references — it lets a writer type with
+a different name match the reader type. The alias is applied to the innermost
+named type, walking through pointers, slices, and maps:
+
+```go
+type FieldSummary struct {
+    ContainsNull bool    `avro:"contains_null"`
+    ContainsNaN  *bool   `avro:"contains_nan"`
+}
+
+type ManifestFile struct {
+    // alias=old_partitions: match writer field named "old_partitions"
+    // type-alias=r508:      match writer record type named "r508" for FieldSummary
+    Partitions *[]FieldSummary `avro:"partitions,type-alias=r508"`
+}
+```
 
 Options:
 

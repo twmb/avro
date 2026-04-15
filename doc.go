@@ -127,10 +127,17 @@
 // Schema inference options (used by [SchemaFor]):
 //
 //	avro:",default=value"         // set field default (must be last option; scalars only)
-//	avro:",alias=old_name"        // field alias for evolution (repeatable)
+//	avro:",alias=old_name"        // field alias for evolution (repeatable, or alias=[a,b])
+//	avro:",type-alias=old_name"   // named type alias (record/enum/fixed) for evolution (repeatable, or type-alias=[a,b])
 //	avro:",timestamp-micros"      // override logical type (also: timestamp-nanos, date, time-millis, time-micros)
 //	avro:",decimal(10,2)"         // decimal logical type with precision and scale
 //	avro:",uuid"                  // UUID logical type
+//
+// The alias tag adds an alias to the field itself. The type-alias tag adds an
+// alias to the named type (record, enum, or fixed) that the field references,
+// walking through pointers, slices, and maps to find it. This is needed when a
+// writer schema uses a different name for the same type — for example, a legacy
+// schema naming a record "r508" instead of "FieldSummary".
 //
 // When encoding a map[string]any as a record, missing keys are filled
 // from the schema's default values. For structs, omitzero does the same

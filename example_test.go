@@ -285,6 +285,7 @@ func ExampleSchemaFor() {
 	// id=1 name=click source=mobile meta=test
 	// field name: default=unnamed
 	// field source: default=web
+	// field meta: default=<nil>
 }
 
 func ExampleSchema_Encode_textMarshaler() {

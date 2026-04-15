@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -42,6 +43,7 @@ func WithName(name string) SchemaOpt { return withName(name) }
 //   - avro:",inline" flattens a nested struct's fields into the parent
 //   - avro:",omitzero" is recorded but does not affect the schema
 //   - avro:",alias=old_name" adds a field alias (repeatable)
+//   - avro:",type-alias=old_name" adds an alias to the field's named type (record, enum, fixed; repeatable)
 //   - avro:",default=value" sets the field's default value (must be last option; scalars only)
 //   - avro:",timestamp-millis" overrides the logical type (also: timestamp-micros,
 //     timestamp-nanos, date, time-millis, time-micros)
@@ -57,8 +59,8 @@ func WithName(name string) SchemaOpt { return withName(name) }
 //   - float64 → double
 //   - string → string
 //   - []byte → bytes
-//   - [N]byte → fixed (size N)
-//   - *T → ["null", T] union
+//   - [N]byte → fixed (size N, name from Go type name or "fixed_N")
+//   - *T → ["null", T] union with default null
 //   - []T → array
 //   - map[string]T → map
 //   - struct → record (recursive)
@@ -182,8 +184,9 @@ func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]s
 	}
 
 	avroFields := make([]map[string]any, 0, len(fields))
+	applied := make(appliedTypeAliases)
 	for _, f := range fields {
-		af, err := inferField(f, namespace, seen, customTypes)
+		af, err := inferField(f, namespace, seen, customTypes, applied)
 		if err != nil {
 			return nil, fmt.Errorf("avro: field %q: %w", f.name, err)
 		}
@@ -208,14 +211,15 @@ func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]s
 }
 
 type schemaField struct {
-	name    string
-	index   []int
-	goType  reflect.Type
-	tagged  bool
-	aliases []string
-	dflt    *string // nil = no default; pointer to raw value string
-	logical string  // e.g. "timestamp-millis", "date", "uuid"
-	decimal [2]int  // [precision, scale]; zero if not decimal
+	name      string
+	index     []int
+	goType    reflect.Type
+	tagged    bool
+	aliases   []string
+	typeAlias []string // aliases for the field's named type (record, enum, fixed)
+	dflt      *string  // nil = no default; pointer to raw value string
+	logical   string   // e.g. "timestamp-millis", "date", "uuid"
+	decimal   [2]int   // [precision, scale]; zero if not decimal
 }
 
 // collectFields walks a struct type depth-first, handling embedded structs
@@ -244,7 +248,10 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 				if tag == "-" {
 					continue
 				}
-				parts := splitTag(tag)
+				parts, err := splitTag(tag)
+				if err != nil {
+					return nil, err
+				}
 				if parts[0] != "" {
 					// Explicit name on embedded struct: treat as named field.
 					f, err := parseSchemaTag(sf, parts, idx)
@@ -272,7 +279,10 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 		if tag == "-" {
 			continue
 		}
-		parts := splitTag(tag)
+		parts, err := splitTag(tag)
+		if err != nil {
+			return nil, err
+		}
 
 		// Check for inline.
 		for _, p := range parts[1:] {
@@ -331,28 +341,64 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	return result, nil
 }
 
-// splitTag splits a struct tag value on commas, but respects parentheses.
-// For example, "name,decimal(10,2),default=0" splits into
-// ["name", "decimal(10,2)", "default=0"].
-func splitTag(tag string) []string {
+// splitTag splits a struct tag value on commas, but respects parentheses
+// and brackets. For example, "name,decimal(10,2),alias=[a,b]" splits into
+// ["name", "decimal(10,2)", "alias=[a,b]"].
+func splitTag(tag string) ([]string, error) {
 	var parts []string
-	depth := 0
+	var stack []rune
 	start := 0
 	for i, c := range tag {
 		switch c {
-		case '(':
-			depth++
+		case '(', '[':
+			stack = append(stack, c)
 		case ')':
-			depth--
+			if len(stack) == 0 || stack[len(stack)-1] != '(' {
+				return nil, fmt.Errorf("unexpected %q in avro tag %q", c, tag)
+			}
+			stack = stack[:len(stack)-1]
+		case ']':
+			if len(stack) == 0 || stack[len(stack)-1] != '[' {
+				return nil, fmt.Errorf("unexpected %q in avro tag %q", c, tag)
+			}
+			stack = stack[:len(stack)-1]
 		case ',':
-			if depth == 0 {
+			if len(stack) == 0 {
 				parts = append(parts, tag[start:i])
 				start = i + 1
 			}
 		}
 	}
+	if len(stack) > 0 {
+		return nil, fmt.Errorf("unclosed %q in avro tag %q", string(stack[len(stack)-1]), tag)
+	}
 	parts = append(parts, tag[start:])
-	return parts
+	return parts, nil
+}
+
+// parseBracketedValues parses a tag value that is either a single value or
+// a bracket-delimited list: "foo" returns ["foo"], "[foo,bar]" returns
+// ["foo", "bar"]. Returns an error for empty values or empty brackets.
+func parseBracketedValues(s string) ([]string, error) {
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		inner := s[1 : len(s)-1]
+		if inner == "" {
+			return nil, fmt.Errorf("empty brackets in %q", s)
+		}
+		// Simple comma split is safe: Avro names are [A-Za-z_][A-Za-z0-9_]*
+		// and cannot contain commas or brackets.
+		vals := strings.Split(inner, ",")
+		for _, v := range vals {
+			if v == "" {
+				return nil, fmt.Errorf("empty element in %q", s)
+			}
+		}
+		return vals, nil
+	}
+	if s == "" {
+		return nil, fmt.Errorf("empty value")
+	}
+	return []string{s}, nil
 }
 
 // parseSchemaTag parses the avro struct tag parts into a schemaField.
@@ -373,7 +419,17 @@ func parseSchemaTag(sf reflect.StructField, parts []string, index []int) (schema
 			// Already handled or recorded elsewhere.
 			continue
 		case strings.HasPrefix(opt, "alias="):
-			f.aliases = append(f.aliases, opt[len("alias="):])
+			vals, err := parseBracketedValues(opt[len("alias="):])
+			if err != nil {
+				return f, fmt.Errorf("alias: %w", err)
+			}
+			f.aliases = append(f.aliases, vals...)
+		case strings.HasPrefix(opt, "type-alias="):
+			vals, err := parseBracketedValues(opt[len("type-alias="):])
+			if err != nil {
+				return f, fmt.Errorf("type-alias: %w", err)
+			}
+			f.typeAlias = append(f.typeAlias, vals...)
 		case strings.HasPrefix(opt, "default="):
 			// default= must be the last option; take the rest of the tag.
 			rest := strings.Join(append([]string{opt[len("default="):]}, parts[i+2:]...), ",")
@@ -406,8 +462,13 @@ var (
 	bigRatValueType = reflect.TypeFor[big.Rat]()
 )
 
+// appliedTypeAliases tracks type-alias values applied to each named type,
+// keyed by type name. Used to accept identical aliases on later fields
+// referencing the same type, while rejecting contradictory ones.
+type appliedTypeAliases map[string][]string
+
 // inferField builds the Avro field definition for a single struct field.
-func inferField(f schemaField, namespace string, seen map[reflect.Type]string, customTypes []CustomType) (map[string]any, error) {
+func inferField(f schemaField, namespace string, seen map[reflect.Type]string, customTypes []CustomType, applied appliedTypeAliases) (map[string]any, error) {
 	fieldDef := map[string]any{
 		"name": f.name,
 	}
@@ -415,6 +476,23 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string, c
 	schema, err := inferType(f.goType, f.logical, f.decimal, namespace, seen, customTypes)
 	if err != nil {
 		return nil, err
+	}
+	if len(f.typeAlias) > 0 {
+		r := addTypeAliases(schema, f.typeAlias)
+		switch {
+		case r.applied:
+			applied[r.refName] = f.typeAlias
+		case r.refName != "":
+			if prev, ok := applied[r.refName]; ok && slices.Equal(prev, f.typeAlias) {
+				// Identical aliases — accept silently.
+			} else if ok {
+				return nil, fmt.Errorf("type-alias on field %q conflicts with type-alias already applied to type %q on an earlier field", f.name, r.refName)
+			} else {
+				return nil, fmt.Errorf("type-alias on field %q has no effect: type %q was already defined on an earlier field without type-alias (move the type-alias there)", f.name, r.refName)
+			}
+		default:
+			return nil, fmt.Errorf("type-alias on field %q: type is not a named type (record, enum, or fixed)", f.name)
+		}
 	}
 	fieldDef["type"] = schema
 
@@ -429,8 +507,75 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string, c
 			v = raw
 		}
 		fieldDef["default"] = v
+	} else if union, ok := schema.([]any); ok && len(union) > 0 && union[0] == "null" {
+		// Null-first unions (from *T or CustomType) default to null so
+		// the field is backward-compatible (readers can read data written
+		// before this field existed). Explicit default= overrides this.
+		fieldDef["default"] = nil
 	}
 	return fieldDef, nil
+}
+
+var avroPrimitives = map[string]bool{
+	"null": true, "boolean": true, "int": true, "long": true,
+	"float": true, "double": true, "string": true, "bytes": true,
+}
+
+// typeAliasResult describes what addTypeAliases found.
+type typeAliasResult struct {
+	applied bool   // alias was added to a type definition
+	refName string // non-empty if schema was a named type reference (definition is elsewhere)
+}
+
+// addTypeAliases walks through unions, arrays, and maps to find the
+// innermost named type (record, enum, fixed) and adds aliases to it.
+// For unions, aliases are added to the first named-type branch found
+// (typically the only one in a ["null", T] union produced by *T).
+// This supports the type-alias struct tag, which sets aliases on the
+// named type referenced by a field (as opposed to alias= which sets
+// aliases on the field itself).
+func addTypeAliases(schema any, aliases []string) typeAliasResult {
+	switch s := schema.(type) {
+	case map[string]any:
+		switch s["type"] {
+		case "record", "error", "enum", "fixed":
+			// The existing aliases come from inferRecord/inferType which
+			// builds the schema as map[string]any with []string values.
+			// This assertion is safe for freshly-inferred schemas.
+			existing, _ := s["aliases"].([]string)
+			s["aliases"] = append(existing, aliases...)
+			name, _ := s["name"].(string)
+			return typeAliasResult{applied: true, refName: name}
+		case "array":
+			if items, ok := s["items"]; ok {
+				return addTypeAliases(items, aliases)
+			}
+		case "map":
+			if values, ok := s["values"]; ok {
+				return addTypeAliases(values, aliases)
+			}
+		}
+	case []any: // union
+		var best typeAliasResult
+		for _, branch := range s {
+			r := addTypeAliases(branch, aliases)
+			if r.applied {
+				return r
+			}
+			if r.refName != "" {
+				best = r
+			}
+		}
+		return best
+	case string:
+		// A string is either a primitive type name ("int", "long", ...)
+		// or a named type reference ("Inner"). Named references mean the
+		// type was already defined on an earlier field.
+		if !avroPrimitives[s] {
+			return typeAliasResult{refName: s}
+		}
+	}
+	return typeAliasResult{}
 }
 
 // inferType returns the Avro schema for a Go type.
@@ -544,6 +689,10 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	case reflect.Array:
 		if t.Elem().Kind() == reflect.Uint8 {
 			if logical == "uuid" && t.Len() == 16 {
+				if _, ok := seen[t]; ok {
+					return "uuid", nil
+				}
+				seen[t] = "uuid"
 				return map[string]any{
 					"type":        "fixed",
 					"name":        "uuid",
@@ -551,9 +700,17 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 					"logicalType": "uuid",
 				}, nil
 			}
+			name := t.Name()
+			if name == "" {
+				name = fmt.Sprintf("fixed_%d", t.Len())
+			} else if _, ok := seen[t]; ok {
+				// Named fixed type already defined — emit reference.
+				return name, nil
+			}
+			seen[t] = name
 			return map[string]any{
 				"type": "fixed",
-				"name": fmt.Sprintf("fixed_%d", t.Len()),
+				"name": name,
 				"size": t.Len(),
 			}, nil
 		}
