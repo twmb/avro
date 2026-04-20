@@ -8373,6 +8373,135 @@ func TestFixedDecimalInRecord(t *testing.T) {
 	}
 }
 
+func TestBytesDecimalDecodeIntoFloat(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, 123.45)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("float64", func(t *testing.T) {
+		var f64 float64
+		if _, err := s.Decode(encoded, &f64); err != nil {
+			t.Fatal(err)
+		}
+		if f64 != 123.45 {
+			t.Errorf("got %v, want 123.45", f64)
+		}
+	})
+	t.Run("float32", func(t *testing.T) {
+		var f32 float32
+		if _, err := s.Decode(encoded, &f32); err != nil {
+			t.Fatal(err)
+		}
+		if f32 != 123.45 {
+			t.Errorf("got %v, want 123.45", f32)
+		}
+	})
+}
+
+func TestBytesDecimalDecodeIntoString(t *testing.T) {
+	schema := `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, "123.45")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var str string
+	if _, err := s.Decode(encoded, &str); err != nil {
+		t.Fatal(err)
+	}
+	if str != "123.45" {
+		t.Errorf("got %q, want %q", str, "123.45")
+	}
+}
+
+func TestFixedDecimalDecodeIntoFloat(t *testing.T) {
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, 42.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f64 float64
+	if _, err := s.Decode(encoded, &f64); err != nil {
+		t.Fatal(err)
+	}
+	if f64 != 42.5 {
+		t.Errorf("got %v, want 42.5", f64)
+	}
+}
+
+func TestFixedDecimalDecodeIntoString(t *testing.T) {
+	schema := `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":18,"scale":2}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := s.AppendEncode(nil, "-99.99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var str string
+	if _, err := s.Decode(encoded, &str); err != nil {
+		t.Fatal(err)
+	}
+	if str != "-99.99" {
+		t.Errorf("got %q, want %q", str, "-99.99")
+	}
+}
+
+func TestBytesDecimalDecodeFloat32Overflow(t *testing.T) {
+	// A decimal value that fits in float64 but overflows float32 (> ~3.4e38).
+	schema := `{"type":"bytes","logicalType":"decimal","precision":50,"scale":0}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big, _ := new(big.Rat).SetString("1e39")
+	encoded, err := s.AppendEncode(nil, big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f32 float32
+	_, err = s.Decode(encoded, &f32)
+	if err == nil {
+		t.Fatal("expected float32 overflow error")
+	}
+}
+
+func TestBytesDecimalDecodeFloat64Overflow(t *testing.T) {
+	// A decimal value that overflows float64 itself (> ~1.8e308). Without
+	// the Inf guard this would silently set the target to +Inf.
+	schema := `{"type":"bytes","logicalType":"decimal","precision":500,"scale":0}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	huge, _ := new(big.Rat).SetString("1e400")
+	encoded, err := s.AppendEncode(nil, huge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f64 float64
+	if _, err := s.Decode(encoded, &f64); err == nil {
+		t.Fatal("expected float64 overflow error")
+	}
+	var f32 float32
+	if _, err := s.Decode(encoded, &f32); err == nil {
+		t.Fatal("expected float32 overflow error")
+	}
+}
+
 func TestDecimalSchemaValidation(t *testing.T) {
 	// decimal without precision falls back to underlying bytes type.
 	_, err := Parse(`{"type":"bytes","logicalType":"decimal"}`)
@@ -8590,10 +8719,11 @@ func TestBytesDecimalDeserWrongType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var out string
+	// bool is not a supported decimal target.
+	var out bool
 	_, err = s.Decode(encoded, &out)
 	if err == nil {
-		t.Fatal("expected error decoding decimal into string")
+		t.Fatal("expected error decoding decimal into bool")
 	}
 }
 

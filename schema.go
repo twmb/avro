@@ -1954,22 +1954,16 @@ func validateDefaultPrimitive(val any, prim string) error {
 		if !ok {
 			return fmt.Errorf("expected number for int, got %T", val)
 		}
-		if f != math.Trunc(f) {
-			return fmt.Errorf("int default %v is not a whole number", f)
-		}
-		if f < math.MinInt32 || f > math.MaxInt32 {
-			return fmt.Errorf("int default %v out of range", f)
+		if _, err := floatFitsInt32(f); err != nil {
+			return fmt.Errorf("int default: %w", err)
 		}
 	case "long":
 		f, ok := val.(float64)
 		if !ok {
 			return fmt.Errorf("expected number for long, got %T", val)
 		}
-		if f != math.Trunc(f) {
-			return fmt.Errorf("long default %v is not a whole number", f)
-		}
-		if f < -(1<<63) || f >= 1<<63 {
-			return fmt.Errorf("long default %v out of range", f)
+		if _, err := floatFitsInt64(f); err != nil {
+			return fmt.Errorf("long default: %w", err)
 		}
 	case "float", "double":
 		if _, ok := val.(float64); !ok {

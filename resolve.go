@@ -663,19 +663,21 @@ func doEncodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("expected number for int default, got %T", val)
 		}
-		if f != math.Trunc(f) || f < math.MinInt32 || f > math.MaxInt32 {
-			return nil, fmt.Errorf("int default %v out of range", f)
+		n, err := floatFitsInt32(f)
+		if err != nil {
+			return nil, fmt.Errorf("int default: %w", err)
 		}
-		return appendVarint(dst, int32(f)), nil
+		return appendVarint(dst, n), nil
 	case "long":
 		f, ok := val.(float64)
 		if !ok {
 			return nil, fmt.Errorf("expected number for long default, got %T", val)
 		}
-		if f != math.Trunc(f) || f < -(1<<63) || f >= 1<<63 {
-			return nil, fmt.Errorf("long default %v out of range", f)
+		n, err := floatFitsInt64(f)
+		if err != nil {
+			return nil, fmt.Errorf("long default: %w", err)
 		}
-		return appendVarlong(dst, int64(f)), nil
+		return appendVarlong(dst, n), nil
 	case "float":
 		f, ok := val.(float64)
 		if !ok {

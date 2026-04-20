@@ -1125,6 +1125,45 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	return (&deserFixed{12}).deser(src, v, sl)
 }
 
+// setDecimalValue sets v from decimal bytes. Returns true if v was set,
+// false if v's Go type is not supported by the decimal decoder (caller
+// may fall back to the underlying bytes/fixed handler).
+func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(bytesToRat(b, scale)))
+		return true, nil
+	}
+	if v.Type() == bigRatType {
+		v.Set(reflect.ValueOf(*bytesToRat(b, scale)))
+		return true, nil
+	}
+	if v.Type() == jsonNumberType {
+		r := bytesToRat(b, scale)
+		v.Set(reflect.ValueOf(json.Number(r.FloatString(scale))))
+		return true, nil
+	}
+	if v.CanFloat() {
+		r := bytesToRat(b, scale)
+		f, _ := r.Float64()
+		// big.Rat.Float64 returns ±Inf when the rational is too large
+		// for float64; reject rather than silently writing Inf.
+		if math.IsInf(f, 0) {
+			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("decimal value %s overflows %s", r.RatString(), v.Kind())}
+		}
+		if v.Kind() == reflect.Float32 && math.IsInf(float64(float32(f)), 0) {
+			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("value %g overflows float32", f)}
+		}
+		v.SetFloat(f)
+		return true, nil
+	}
+	if v.Kind() == reflect.String {
+		r := bytesToRat(b, scale)
+		v.SetString(r.FloatString(scale))
+		return true, nil
+	}
+	return false, nil
+}
+
 type deserBytesDecimal struct {
 	scale int
 }
@@ -1144,18 +1183,8 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	b := src[:n]
 	src = src[n:]
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
-		return src, nil
-	}
-	if v.Type() == bigRatType {
-		v.Set(reflect.ValueOf(*bytesToRat(b, s.scale)))
-		return src, nil
-	}
-	if v.Type() == jsonNumberType {
-		r := bytesToRat(b, s.scale)
-		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
-		return src, nil
+	if ok, err := setDecimalValue(v, b, s.scale); ok {
+		return src, err
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "decimal"}
 }
@@ -1172,18 +1201,8 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	b := src[:s.size]
 	src = src[s.size:]
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(bytesToRat(b, s.scale)))
-		return src, nil
-	}
-	if v.Type() == bigRatType {
-		v.Set(reflect.ValueOf(*bytesToRat(b, s.scale)))
-		return src, nil
-	}
-	if v.Type() == jsonNumberType {
-		r := bytesToRat(b, s.scale)
-		v.Set(reflect.ValueOf(json.Number(r.FloatString(s.scale))))
-		return src, nil
+	if ok, err := setDecimalValue(v, b, s.scale); ok {
+		return src, err
 	}
 	// Fall back to [N]byte fixed.
 	return (&deserFixed{s.size}).deser(append(b[:0:0], b...), v, sl)

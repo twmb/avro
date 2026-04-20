@@ -289,7 +289,7 @@ Logical types decode to their natural Go equivalents:
 | local-timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | uuid (string) | string | [16]byte or string | string into any; [16]byte or string into typed target |
 | uuid (fixed(16)) | fixed(16) | [16]byte, []byte, or hex-dash string | [16]byte into any or [16]byte target; string into string target |
-| decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat, json.Number, or underlying type |
+| decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat, float64/float32, numeric string, json.Number, or underlying type |
 | duration | fixed(12) | avro.Duration or underlying type | avro.Duration or underlying type |
 
 When encoding, timestamp and date fields accept RFC 3339 strings, and decimal

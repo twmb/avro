@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 )
@@ -220,6 +221,32 @@ func TestFloatOverflowAllPaths(t *testing.T) {
 		// Use a large exact-format number that parses but overflows float32.
 		if err := s.DecodeJSON([]byte(`6.805646932770577e+38`), &out); err == nil {
 			t.Fatalf("expected overflow, got %v", out)
+		}
+	})
+
+	t.Run("EncodeJSON float: float64 overflow into avro float", func(t *testing.T) {
+		// Match binary serFloat: reject finite float64 values that clamp
+		// to ±Inf when narrowed to float32, rather than silently emitting
+		// the invalid JSON literal "+Inf".
+		s := MustParse(`"float"`)
+		if _, err := s.EncodeJSON(overflow); err == nil {
+			t.Fatal("expected overflow error on EncodeJSON")
+		}
+	})
+
+	t.Run("EncodeJSON float: ±Inf and NaN pass through", func(t *testing.T) {
+		s := MustParse(`"float"`)
+		for _, v := range []float64{math.Inf(+1), math.Inf(-1), math.NaN()} {
+			if _, err := s.EncodeJSON(v); err != nil {
+				t.Fatalf("unexpected error encoding %v: %v", v, err)
+			}
+		}
+	})
+
+	t.Run("EncodeJSON float: json.Number overflow", func(t *testing.T) {
+		s := MustParse(`"float"`)
+		if _, err := s.EncodeJSON(json.Number("1e100")); err == nil {
+			t.Fatal("expected overflow error for json.Number(1e100)")
 		}
 	})
 }

@@ -161,22 +161,20 @@ func MustSchemaFor[T any](opts ...SchemaOpt) *Schema {
 }
 
 // inferRecord builds a schema map for a struct type. The seen map tracks
-// types currently being defined (for recursion detection) and types that
-// have already been fully defined (for reuse as named references).
+// types that have been visited so repeat references (both recursive and
+// shared) emit a named reference instead of a duplicate definition.
 func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]string, customTypes []CustomType) (any, error) {
 	if fullName, ok := seen[t]; ok {
-		if fullName == "" {
-			// Currently being defined — this is a recursive type.
-			n := name
-			if namespace != "" {
-				n = namespace + "." + name
-			}
-			return nil, fmt.Errorf("avro: recursive type %s not supported in SchemaFor", n)
-		}
-		// Already fully defined — emit a named reference.
 		return fullName, nil
 	}
-	seen[t] = "" // mark as in-progress
+
+	fullName := name
+	if namespace != "" {
+		fullName = namespace + "." + name
+	}
+	// Register the name before processing fields so that recursive
+	// references resolve to a name reference rather than re-entering here.
+	seen[t] = fullName
 
 	fields, err := collectFields(t, nil, make(map[reflect.Type]bool))
 	if err != nil {
@@ -193,11 +191,6 @@ func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]s
 		avroFields = append(avroFields, af)
 	}
 
-	fullName := name
-	if namespace != "" {
-		fullName = namespace + "." + name
-	}
-
 	record := map[string]any{
 		"type":   "record",
 		"name":   name,
@@ -206,7 +199,6 @@ func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]s
 	if namespace != "" {
 		record["namespace"] = namespace
 	}
-	seen[t] = fullName // mark as fully defined
 	return record, nil
 }
 
