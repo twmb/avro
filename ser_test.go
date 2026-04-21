@@ -610,6 +610,64 @@ func TestSerTaggedUnionMapBranchFallback(t *testing.T) {
 	}
 }
 
+// TestJsonNumberExponentInInt locks in consistent handling of exponent-
+// notation json.Number values across scalar, array, and map int/long
+// encoders. Prior to the fix, scalar serInt rejected "1.5e3" with a
+// misleading "overflows int64" error while serArray.serInt accepted it.
+func TestJsonNumberExponentInInt(t *testing.T) {
+	cases := []struct {
+		name  string
+		sch   string
+		value any
+	}{
+		{"scalar int", `"int"`, json.Number("1.5e3")},
+		{"scalar long", `"long"`, json.Number("1.5e3")},
+		{"array int", `{"type":"array","items":"int"}`, []any{json.Number("1.5e3")}},
+		{"array long", `{"type":"array","items":"long"}`, []any{json.Number("1.5e3")}},
+		{"map int", `{"type":"map","values":"int"}`, map[string]any{"k": json.Number("1.5e3")}},
+		{"map long", `{"type":"map","values":"long"}`, map[string]any{"k": json.Number("1.5e3")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Parse(tc.sch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.AppendEncode(nil, tc.value); err != nil {
+				t.Fatalf("encode 1.5e3 (=1500) should succeed, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestJsonNumberFractionalRejected locks in that fractional json.Number
+// values are rejected consistently across scalar, array, and map encoders.
+func TestJsonNumberFractionalRejected(t *testing.T) {
+	cases := []struct {
+		name  string
+		sch   string
+		value any
+	}{
+		{"scalar int", `"int"`, json.Number("1.5")},
+		{"scalar long", `"long"`, json.Number("1.5")},
+		{"array int", `{"type":"array","items":"int"}`, []any{json.Number("1.5")}},
+		{"array long", `{"type":"array","items":"long"}`, []any{json.Number("1.5")}},
+		{"map int", `{"type":"map","values":"int"}`, map[string]any{"k": json.Number("1.5")}},
+		{"map long", `{"type":"map","values":"long"}`, map[string]any{"k": json.Number("1.5")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Parse(tc.sch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.AppendEncode(nil, tc.value); err == nil {
+				t.Fatal("expected error for fractional json.Number")
+			}
+		})
+	}
+}
+
 type testTextMarshaler struct{ val string }
 
 func (tm testTextMarshaler) MarshalText() ([]byte, error) { return []byte(tm.val), nil }
@@ -1262,23 +1320,27 @@ func TestSerTimestampNanosOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Dates far in the past/future that would overflow time.UnixNano().
-	farPast := time.Date(1800, 1, 1, 0, 0, 0, 0, time.UTC)
-	dst, err := s.AppendEncode(nil, &farPast)
-	if err != nil {
-		t.Fatalf("expected success for far past time, got %v", err)
+	// int64 nanoseconds since epoch span roughly 1677-09-21 to 2262-04-11.
+	// Times within that window encode cleanly; times outside it must
+	// return an error rather than silently wrap.
+	inRangePast := time.Date(1800, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := s.AppendEncode(nil, &inRangePast); err != nil {
+		t.Fatalf("1800 is within the nanosecond range, got %v", err)
 	}
-	if len(dst) == 0 {
-		t.Fatal("expected non-empty encoding")
+	inRangeFuture := time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := s.AppendEncode(nil, &inRangeFuture); err != nil {
+		t.Fatalf("2200 is within the nanosecond range, got %v", err)
 	}
 
+	// Year 2300 is past 2262-04-11, must error.
 	farFuture := time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC)
-	dst, err = s.AppendEncode(nil, &farFuture)
-	if err != nil {
-		t.Fatalf("expected success for far future time, got %v", err)
+	if _, err := s.AppendEncode(nil, &farFuture); err == nil {
+		t.Fatal("expected overflow error for year 2300")
 	}
-	if len(dst) == 0 {
-		t.Fatal("expected non-empty encoding")
+	// Year 1600 is before 1677-09-21, must error.
+	farPast := time.Date(1600, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := s.AppendEncode(nil, &farPast); err == nil {
+		t.Fatal("expected overflow error for year 1600")
 	}
 }
 

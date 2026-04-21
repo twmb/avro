@@ -582,7 +582,11 @@ func usTimestampMicros(dst []byte, p unsafe.Pointer) ([]byte, error) {
 }
 
 func usTimestampNanos(dst []byte, p unsafe.Pointer) ([]byte, error) {
-	return appendVarlong(dst, timeToTimestampNanos(*(*time.Time)(p))), nil
+	n, err := timeToTimestampNanos(*(*time.Time)(p))
+	if err != nil {
+		return nil, &SemanticError{GoType: timeType, AvroType: "long", Err: err}
+	}
+	return appendVarlong(dst, n), nil
 }
 
 func usDate(dst []byte, p unsafe.Pointer) ([]byte, error) {

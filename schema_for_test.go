@@ -1510,6 +1510,123 @@ func TestSchemaForIgnored(t *testing.T) {
 	}
 }
 
+type recNode struct {
+	Value int      `avro:"value"`
+	Next  *recNode `avro:"next"`
+}
+
+type recTree struct {
+	Value    int        `avro:"value"`
+	Children []*recTree `avro:"children"`
+}
+
+type recMap struct {
+	Name     string             `avro:"name"`
+	Branches map[string]*recMap `avro:"branches"`
+}
+
+type recMutualA struct {
+	AVal int         `avro:"a_val"`
+	B    *recMutualB `avro:"b"`
+}
+
+type recMutualB struct {
+	BVal int         `avro:"b_val"`
+	A    *recMutualA `avro:"a"`
+}
+
+func TestSchemaForRecursive(t *testing.T) {
+	t.Run("linked list", func(t *testing.T) {
+		s, err := SchemaFor[recNode]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Round-trip encode/decode a 3-node list.
+		head := &recNode{Value: 1, Next: &recNode{Value: 2, Next: &recNode{Value: 3}}}
+		data, err := s.Encode(head)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got recNode
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Value != 1 || got.Next == nil || got.Next.Value != 2 || got.Next.Next == nil || got.Next.Next.Value != 3 || got.Next.Next.Next != nil {
+			t.Errorf("decoded list mismatch: %+v", got)
+		}
+	})
+
+	t.Run("with namespace", func(t *testing.T) {
+		s, err := SchemaFor[recNode](WithNamespace("com.example"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Ensure the namespace is applied to the root and the recursive
+		// reference resolves to the namespaced name.
+		head := &recNode{Value: 42}
+		if _, err := s.Encode(head); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("tree via slice", func(t *testing.T) {
+		s, err := SchemaFor[recTree]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := &recTree{Value: 1, Children: []*recTree{{Value: 2}, {Value: 3, Children: []*recTree{{Value: 4}}}}}
+		data, err := s.Encode(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got recTree
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Value != 1 || len(got.Children) != 2 || got.Children[1].Children[0].Value != 4 {
+			t.Errorf("decoded tree mismatch: %+v", got)
+		}
+	})
+
+	t.Run("recursion via map", func(t *testing.T) {
+		s, err := SchemaFor[recMap]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := &recMap{Name: "root", Branches: map[string]*recMap{"a": {Name: "leaf"}}}
+		data, err := s.Encode(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got recMap
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Name != "root" || got.Branches["a"].Name != "leaf" {
+			t.Errorf("decoded map mismatch: %+v", got)
+		}
+	})
+
+	t.Run("mutual recursion", func(t *testing.T) {
+		s, err := SchemaFor[recMutualA]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		in := &recMutualA{AVal: 1, B: &recMutualB{BVal: 2, A: &recMutualA{AVal: 3}}}
+		data, err := s.Encode(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got recMutualA
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.AVal != 1 || got.B.BVal != 2 || got.B.A.AVal != 3 {
+			t.Errorf("mutual recursion mismatch: %+v", got)
+		}
+	})
+}
+
 func TestSchemaForMust(t *testing.T) {
 	type Simple struct {
 		X int32 `avro:"x"`
@@ -1706,25 +1823,6 @@ func TestSchemaForErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("recursive type", func(t *testing.T) {
-		type Node struct {
-			Value int   `avro:"value"`
-			Next  *Node `avro:"next"`
-		}
-		if _, err := SchemaFor[Node](); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-
-	t.Run("recursive with namespace", func(t *testing.T) {
-		type Node struct {
-			Value int   `avro:"value"`
-			Next  *Node `avro:"next"`
-		}
-		if _, err := SchemaFor[Node](WithNamespace("com.example")); err == nil {
-			t.Fatal("expected error")
-		}
-	})
 
 	t.Run("embedded bad tag", func(t *testing.T) {
 		type R struct {

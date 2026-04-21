@@ -510,10 +510,13 @@ func TestDecodeJSONFloatSpecials(t *testing.T) {
 	})
 }
 
-// TestTimeToUnixNanos covers the shared conversion function.
-func TestTimeToUnixNanos(t *testing.T) {
+// TestTimestampNanosConversion covers the shared conversion function.
+func TestTimestampNanosConversion(t *testing.T) {
 	now := time.Now().UTC()
-	ns := timeToUnixNanos(now)
+	ns, err := timeToTimestampNanos(now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	got := timestampNanosToTime(ns)
 	if !now.Equal(got) {
 		t.Fatalf("round-trip: %v != %v", now, got)

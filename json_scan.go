@@ -253,14 +253,11 @@ func parseJSONInt64(b []byte) (int64, error) {
 			if err != nil {
 				return 0, fmt.Errorf("avro json: invalid number %q", b)
 			}
-			t := math.Trunc(f)
-			if f != t {
-				return 0, fmt.Errorf("avro json: value %s is not a whole number", b)
+			n, err := floatFitsInt64(f)
+			if err != nil {
+				return 0, fmt.Errorf("avro json: %w", err)
 			}
-			if t < -(1<<63) || t >= 1<<63 {
-				return 0, fmt.Errorf("avro json: value %s overflows int64", b)
-			}
-			return int64(t), nil
+			return n, nil
 		}
 		if c < '0' || c > '9' {
 			return 0, fmt.Errorf("avro json: invalid number %q", b)
