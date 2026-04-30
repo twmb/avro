@@ -298,6 +298,104 @@ func TestSerRecordAsMap(t *testing.T) {
 	})
 }
 
+func TestSerRecordMapNullField(t *testing.T) {
+	t.Run("nil value for non-nullable field returns error not panic", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"id","type":"int"},
+			{"name":"name","type":"string"}
+		]}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]any{"id": int32(1), "name": nil}
+		_, err = s.AppendEncode(nil, &m)
+		if err == nil {
+			t.Fatal("expected error encoding nil into non-nullable string field, got nil")
+		}
+	})
+
+	t.Run("nil value for nullable union field encodes as null branch", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"id","type":"int"},
+			{"name":"name","type":["null","string"]}
+		]}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]any{"id": int32(1), "name": nil}
+		dst, err := s.AppendEncode(nil, &m)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[string]any
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got["name"] != nil {
+			t.Fatalf("expected nil, got %v", got["name"])
+		}
+	})
+}
+
+// TestSerArrayNilAnyElement covers the specialized serArray fast paths
+// (string/boolean/int/long/float/double item types). A nil interface element
+// in []any unwraps to an invalid reflect.Value; calling .Type() / .Bool() /
+// .Int() on it panics. Each path must return an error, not crash.
+func TestSerArrayNilAnyElement(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		v      any
+	}{
+		{"string", `{"type":"array","items":"string"}`, []any{"a", nil}},
+		{"boolean", `{"type":"array","items":"boolean"}`, []any{true, nil}},
+		{"int", `{"type":"array","items":"int"}`, []any{int32(1), nil}},
+		{"long", `{"type":"array","items":"long"}`, []any{int64(1), nil}},
+		{"float", `{"type":"array","items":"float"}`, []any{float32(1), nil}},
+		{"double", `{"type":"array","items":"double"}`, []any{float64(1), nil}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			encodeErr(t, tc.schema, tc.v)
+		})
+	}
+}
+
+// TestSerMapNilAnyValue covers the specialized serMap fast paths (same set
+// of value types). Nil interface values in map[string]any have the same
+// panic shape as TestSerArrayNilAnyElement.
+func TestSerMapNilAnyValue(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		v      any
+	}{
+		{"string", `{"type":"map","values":"string"}`, map[string]any{"k": nil}},
+		{"boolean", `{"type":"map","values":"boolean"}`, map[string]any{"k": nil}},
+		{"int", `{"type":"map","values":"int"}`, map[string]any{"k": nil}},
+		{"long", `{"type":"map","values":"long"}`, map[string]any{"k": nil}},
+		{"float", `{"type":"map","values":"float"}`, map[string]any{"k": nil}},
+		{"double", `{"type":"map","values":"double"}`, map[string]any{"k": nil}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			encodeErr(t, tc.schema, tc.v)
+		})
+	}
+}
+
 func TestSerUnionAllFail(t *testing.T) {
 	encodeErr(t, `["null","int"]`, ptr("hello"))
 }

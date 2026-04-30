@@ -543,7 +543,13 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 					dst = append(dst, f.defaultBytes...)
 					continue
 				}
-				if dst, err = f.fn(dst, reflect.ValueOf(value)); err != nil {
+				var rv reflect.Value
+				if value != nil {
+					rv = reflect.ValueOf(value)
+				} else {
+					rv = reflect.Zero(anyType)
+				}
+				if dst, err = f.fn(dst, rv); err != nil {
 					return nil, recordFieldError(t, f.name, err)
 				}
 			}
@@ -677,6 +683,9 @@ func (s *serArray) serString(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "string", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if elem.Type() == jsonNumberType {
@@ -701,6 +710,9 @@ func (s *serArray) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "boolean", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if elem.Kind() != reflect.Bool {
@@ -723,6 +735,9 @@ func (s *serArray) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "int", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if elem.CanInt() {
@@ -766,6 +781,9 @@ func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "long", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if elem.CanInt() {
@@ -802,6 +820,9 @@ func (s *serArray) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "float", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if !elem.CanFloat() {
@@ -824,6 +845,9 @@ func (s *serArray) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "double", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if !elem.CanFloat() {
@@ -889,6 +913,9 @@ func (s *serMap) serString(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "string", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if val.Type() == jsonNumberType {
@@ -915,6 +942,9 @@ func (s *serMap) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "boolean", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if val.Kind() != reflect.Bool {
@@ -939,6 +969,9 @@ func (s *serMap) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "int", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if val.CanInt() {
@@ -984,6 +1017,9 @@ func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "long", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if val.CanInt() {
@@ -1022,6 +1058,9 @@ func (s *serMap) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "float", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if !val.CanFloat() {
@@ -1046,6 +1085,9 @@ func (s *serMap) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "double", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if !val.CanFloat() {
