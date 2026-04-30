@@ -2155,7 +2155,11 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 		{"日本語", `"日本語"`},                               // multi-byte UTF-8 passed through
 		{"a\u2028b", `"a\u2028b"`},                     // U+2028 escaped
 		{"a\u2029b", `"a\u2029b"`},                     // U+2029 escaped
-		{string([]byte{0xff, 0xfe}), `"\ufffd\ufffd"`}, // invalid UTF-8 replaced
+		// Invalid UTF-8 bytes are replaced with U+FFFD encoded as raw
+		// UTF-8 (efbfbd), not as the literal `\ufffd` escape. Using raw
+		// UTF-8 makes encode idempotent: a re-decode of an actual U+FFFD
+		// codepoint round-trips to the same bytes.
+		{string([]byte{0xff, 0xfe}), "\"\xef\xbf\xbd\xef\xbf\xbd\""},
 	}
 	for _, tt := range tests {
 		got, err := s.EncodeJSON(tt.in)

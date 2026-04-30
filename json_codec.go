@@ -716,8 +716,13 @@ func appendJSONString(buf []byte, s string) []byte {
 		}
 		r, size := utf8.DecodeRuneInString(s[i:])
 		if r == utf8.RuneError && size == 1 {
-			// Invalid UTF-8 byte — replace with U+FFFD.
-			buf = append(buf, `\ufffd`...)
+			// Replace invalid UTF-8 byte with raw U+FFFD bytes
+			// (efbfbd) rather than the literal `�` escape, so
+			// encode is idempotent: a re-decoded escape produces
+			// the U+FFFD codepoint, which would then re-encode as
+			// raw UTF-8 — different from the escape. Using raw
+			// here makes both paths converge.
+			buf = utf8.AppendRune(buf, utf8.RuneError)
 			i++
 			continue
 		}

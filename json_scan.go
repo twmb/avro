@@ -94,15 +94,11 @@ func (s *jsonScanner) consumeStringRaw() (start, end int, hasEscapes bool, err e
 		if b == '"' {
 			end = s.pos
 			s.pos++ // skip closing quote
-			// JSON / Avro JSON requires strings to be valid UTF-8.
-			// Reject raw invalid bytes — the JSON encoder converts
-			// them to U+FFFD on output, which would lose data on a
-			// decode/encode round-trip. \uXXXX escapes are
-			// untouched here (they produce valid UTF-8 after
-			// resolveJSONEscapes regardless of the codepoint).
-			if !utf8.Valid(s.data[start:end]) {
-				return 0, 0, false, fmt.Errorf("avro json: invalid UTF-8 in string at offset %d", start-1)
-			}
+			// Postel: don't validate UTF-8 here. Some producers emit
+			// raw bytes 0x80-0xff (technically invalid JSON but seen
+			// in real pipelines). The encoder canonicalizes invalid
+			// bytes on output (replacement char), so a round-trip
+			// from non-canonical input lands on canonical output.
 			return start, end, hasEscapes, nil
 		}
 		s.pos++
@@ -373,9 +369,14 @@ func resolveJSONEscapes(raw []byte) (string, error) {
 func walkJSONStringEscapes(raw []byte, emit func(r rune) error) error {
 	for i := 0; i < len(raw); {
 		if raw[i] != '\\' {
+			// Decode multi-byte UTF-8 as a single rune so the round
+			// trip preserves the value. For invalid UTF-8 (e.g. lone
+			// 0x9e), DecodeRune returns RuneError with size 1 — emit
+			// the raw byte as its codepoint to stay liberal on input
+			// (Postel). The encoder canonicalizes on output.
 			r, size := utf8.DecodeRune(raw[i:])
 			if r == utf8.RuneError && size == 1 {
-				return fmt.Errorf("avro json: invalid UTF-8 byte 0x%02x at offset %d", raw[i], i)
+				r = rune(raw[i])
 			}
 			if err := emit(r); err != nil {
 				return err

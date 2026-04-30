@@ -221,13 +221,10 @@ func deserBoolean(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if len(src) < 1 {
 		return nil, &ShortBufferError{Type: "boolean"}
 	}
-	// Avro spec: boolean is "a single byte whose value is either 0
-	// (false) or 1 (true)." Reject other bytes — accepting them as
-	// true causes round-trip lossiness (re-encode always emits 0x01,
-	// not the original byte) and silently masks malformed wire data.
-	if src[0] > 1 {
-		return nil, &SemanticError{AvroType: "boolean", Err: fmt.Errorf("invalid boolean byte 0x%02x (must be 0 or 1)", src[0])}
-	}
+	// Postel: accept any byte. Spec says only 0 or 1 are well-formed,
+	// but "any non-zero is true" matches the convention that
+	// long-running pipelines depend on. The encoder is strict (always
+	// emits 0x00 or 0x01), so a decode-encode pass canonicalizes.
 	b := src[0] != 0
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
