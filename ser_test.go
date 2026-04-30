@@ -524,6 +524,37 @@ func TestDecodeDeepInputDoesntPanic(t *testing.T) {
 			t.Fatalf("expected errTooDeep, got %v", err)
 		}
 	})
+	// JSON union trial loop: decodeUnionObject and decodeUnionBare iterate
+	// each branch on failure. The per-branch error must propagate
+	// errTooDeep rather than being swallowed and reported as
+	// "no union branch matched". Builds deeply-nested JSON for a
+	// recursive ["null","Node"] schema; at maxDepth the decode must
+	// surface errTooDeep, not the trial-loop's generic error.
+	t.Run("json_union_trial_propagates", func(t *testing.T) {
+		var src []byte
+		for range 5000 {
+			src = append(src, []byte(`{"value":0,"next":{"Node":`)...)
+		}
+		src = append(src, []byte(`{"value":0,"next":null}`)...)
+		for range 5000 {
+			src = append(src, []byte(`}}`)...)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		// Decode into *any so decodeUnionObject's toAny=true branch
+		// runs (the path the bug was in).
+		var out any
+		err := s.DecodeJSON(src, &out)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
 }
 
 // TestParseDeeplyNestedSchema exercises the schema-parse depth bound. A

@@ -135,9 +135,11 @@ func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 }
 
 // maybeWrap wraps a decoded union value with its branch name when
-// TaggedUnions is enabled and the target is *any. Skips silently for
-// non-empty interface targets (the wrapping map[string]any wouldn't
-// satisfy them).
+// TaggedUnions is enabled and the target is an interface type that
+// map[string]any can be assigned to (in practice: *any, since any
+// non-empty interface's method set wouldn't be satisfied by a plain
+// map). Non-interface targets and interfaces with methods are
+// skipped silently.
 func (s *deserUnion) maybeWrap(v reflect.Value, sl *slab, idx int32) {
 	if !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
 		return

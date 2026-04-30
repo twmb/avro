@@ -874,7 +874,8 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 				if err := ctx.scanner.expect(':'); err == nil {
 					if toAny {
 						var val any
-						if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err == nil {
+						err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch)
+						if err == nil {
 							if ctx.scanner.peek() == '}' {
 								ctx.scanner.pos++
 								// wrapUnion returns nil for null branches;
@@ -883,13 +884,22 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 								// nil for interface targets.
 								return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
 							}
+						} else if errors.Is(err, errTooDeep) {
+							// Don't fall through to bare-union retry; the
+							// recursion limit applies regardless of how the
+							// branch is matched, so masking it as "no
+							// branch matched" would be wrong.
+							return err
 						}
 					} else {
-						if err := ctx.decodeUnionBranchTyped(v, branch); err == nil {
+						err := ctx.decodeUnionBranchTyped(v, branch)
+						if err == nil {
 							if ctx.scanner.peek() == '}' {
 								ctx.scanner.pos++
 								return nil
 							}
+						} else if errors.Is(err, errTooDeep) {
+							return err
 						}
 					}
 				}
@@ -914,12 +924,20 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny
 		savedPos := ctx.scanner.pos
 		if toAny {
 			var val any
-			if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err == nil {
+			err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch)
+			if err == nil {
 				return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
 			}
+			if errors.Is(err, errTooDeep) {
+				return err
+			}
 		} else {
-			if err := ctx.decodeValue(v, branch); err == nil {
+			err := ctx.decodeValue(v, branch)
+			if err == nil {
 				return nil
+			}
+			if errors.Is(err, errTooDeep) {
+				return err
 			}
 		}
 		ctx.scanner.pos = savedPos
