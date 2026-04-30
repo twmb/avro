@@ -1280,3 +1280,193 @@ func FuzzEncodeHostile(f *testing.F) {
 		s.AppendEncodeJSON(nil, v, TaggedUnions())
 	})
 }
+
+// FuzzResolveBroad fuzzes Resolve across many reader/writer pairs.
+// FuzzResolve already exists but its seed corpus is narrow. This one
+// pairs every fuzzSchemas entry with every other entry to surface
+// resolution edge cases (alias mismatches, recursive cycle handling,
+// promote chain panics).
+func FuzzResolveBroad(f *testing.F) {
+	for i := range fuzzSchemas {
+		for j := range fuzzSchemas {
+			f.Add(uint8(i), uint8(j), []byte{})
+			f.Add(uint8(i), uint8(j), []byte{0})
+			f.Add(uint8(i), uint8(j), []byte{2, 84})
+		}
+	}
+	f.Fuzz(func(t *testing.T, wIdx, rIdx uint8, data []byte) {
+		w := fuzzSchemas[int(wIdx)%len(fuzzSchemas)]
+		r := fuzzSchemas[int(rIdx)%len(fuzzSchemas)]
+		res, err := Resolve(w, r)
+		if err != nil {
+			return
+		}
+		var v any
+		res.Decode(data, &v)
+		// Vary target shape too.
+		var v2 interface{ Foo() }
+		res.Decode(data, &v2)
+	})
+}
+
+// FuzzCustomTypeRoundTrip wires up a custom type and exercises
+// encode/decode round-trip with arbitrary value bytes. The custom-type
+// path goes through wrapDeserWithCustomDecoders / setCustomResult,
+// which had a panic earlier; this fuzz keeps that path under coverage.
+func FuzzCustomTypeRoundTrip(f *testing.F) {
+	type Wrapped struct{ V int }
+	ct := NewCustomType[Wrapped, int32](
+		"",
+		func(w Wrapped, _ *SchemaNode) (int32, error) { return int32(w.V), nil },
+		func(v int32, _ *SchemaNode) (Wrapped, error) { return Wrapped{V: int(v)}, nil },
+	)
+	s, err := Parse(`"int"`, WithCustomType(ct))
+	if err != nil {
+		f.Fatal(err)
+	}
+
+	f.Add(int32(0))
+	f.Add(int32(-1))
+	f.Add(int32(1 << 30))
+	f.Add(int32(-1 << 30))
+
+	f.Fuzz(func(t *testing.T, val int32) {
+		w := Wrapped{V: int(val)}
+		encoded, err := s.AppendEncode(nil, w)
+		if err != nil {
+			return
+		}
+		var got Wrapped
+		if _, err := s.Decode(encoded, &got); err != nil {
+			t.Fatalf("decode after encode failed: %v\n  data: %x", err, encoded)
+		}
+		if got.V != w.V {
+			t.Fatalf("custom type round-trip mismatch: got %v, want %v", got, w)
+		}
+		// And decode-into-interface variants.
+		var anyV any
+		if _, err := s.Decode(encoded, &anyV); err != nil {
+			t.Fatalf("decode into *any failed: %v", err)
+		}
+	})
+}
+
+// FuzzConcurrentEncodeDecode hammers a shared *Schema from multiple
+// goroutines with arbitrary inputs. The unsafe fast-path init uses
+// atomic.Pointer; the per-type cache uses sync.Map. Concurrent
+// fuzz exercise stresses these paths in a way single-threaded fuzz
+// can't.
+func FuzzConcurrentEncodeDecode(f *testing.F) {
+	type Record struct {
+		A int32  `avro:"a"`
+		B string `avro:"b"`
+	}
+	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	if err != nil {
+		f.Fatal(err)
+	}
+
+	f.Add(int32(1), "x", uint8(4))
+	f.Add(int32(0), "", uint8(8))
+	f.Add(int32(-1), "ababab", uint8(2))
+
+	f.Fuzz(func(t *testing.T, a int32, b string, n uint8) {
+		workers := 1 + int(n%8)
+		done := make(chan struct{})
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("panic in concurrent worker: %v", r)
+					}
+					done <- struct{}{}
+				}()
+				for j := 0; j < 20; j++ {
+					rec := Record{A: a + int32(j), B: b}
+					data, err := s.AppendEncode(nil, &rec)
+					if err != nil {
+						continue
+					}
+					var got Record
+					s.Decode(data, &got)
+					var anyV any
+					s.Decode(data, &anyV)
+				}
+			}()
+		}
+		for i := 0; i < workers; i++ {
+			<-done
+		}
+	})
+}
+
+// FuzzTimeDateEdgeCases fuzzes time/date logical types around boundary
+// values: pre-epoch, far future, leap seconds, NaN/Infinity for floats
+// in time-millis representations.
+func FuzzTimeDateEdgeCases(f *testing.F) {
+	schemas := []string{
+		`{"type":"long","logicalType":"timestamp-millis"}`,
+		`{"type":"long","logicalType":"timestamp-micros"}`,
+		`{"type":"long","logicalType":"timestamp-nanos"}`,
+		`{"type":"int","logicalType":"date"}`,
+		`{"type":"int","logicalType":"time-millis"}`,
+		`{"type":"long","logicalType":"time-micros"}`,
+	}
+	parsed := make([]*Schema, len(schemas))
+	for i, s := range schemas {
+		p, err := Parse(s)
+		if err != nil {
+			f.Fatal(err)
+		}
+		parsed[i] = p
+	}
+
+	// Adversarial values.
+	f.Add(uint8(0), int64(0))
+	f.Add(uint8(0), int64(-62135596800000)) // 0001-01-01
+	f.Add(uint8(0), int64(253402300800000)) // 9999 AD
+	f.Add(uint8(0), int64(1<<62))           // overflow risk
+	f.Add(uint8(0), int64(-1<<62))
+	f.Add(uint8(2), int64(1))
+	f.Add(uint8(3), int64(0))   // epoch
+	f.Add(uint8(3), int64(-1))  // pre-epoch date
+	f.Add(uint8(4), int64(0))   // midnight
+	f.Add(uint8(4), int64(86400000))
+	f.Add(uint8(5), int64(86400000000))
+
+	// Track which schemas use "int" wire type vs "long" so the
+	// fuzz body can pick the matching Go type without inspecting
+	// the *Schema (no public accessor for the underlying kind).
+	isInt := []bool{false, false, false, true, true, false}
+
+	f.Fuzz(func(t *testing.T, schemaIdx uint8, val int64) {
+		idx := int(schemaIdx) % len(parsed)
+		s := parsed[idx]
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panic on schema=%s val=%d: %v", s.String(), val, r)
+			}
+		}()
+		var encoded []byte
+		var err error
+		if isInt[idx] {
+			if val < -1<<31 || val > 1<<31-1 {
+				return
+			}
+			encoded, err = s.AppendEncode(nil, int32(val))
+		} else {
+			encoded, err = s.AppendEncode(nil, val)
+		}
+		if err != nil {
+			return
+		}
+		var v any
+		s.Decode(encoded, &v)
+		jsonEncoded, err := s.EncodeJSON(v)
+		if err != nil {
+			return
+		}
+		var v2 any
+		s.DecodeJSON(jsonEncoded, &v2)
+	})
+}

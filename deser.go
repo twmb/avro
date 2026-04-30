@@ -73,6 +73,11 @@ var slabPool = sync.Pool{New: func() any { return &slab{} }}
 // than [encoding/json.Marshal]. EncodeJSON is schema-aware and converts
 // these types back to their Avro representations (e.g. time.Time to
 // epoch integers, []byte to \uXXXX strings).
+//
+// Decode is liberal in what it accepts: non-canonical input (e.g. a
+// non-0/1 boolean byte; the Java reference treats it as false, and so
+// does Decode) is tolerated rather than rejected. Encode is canonical,
+// so a non-canonical input round-trips to the canonical form on encode.
 func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
@@ -221,11 +226,9 @@ func deserBoolean(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if len(src) < 1 {
 		return nil, &ShortBufferError{Type: "boolean"}
 	}
-	// Postel: accept any byte. Spec says only 0 or 1 are well-formed,
-	// but "any non-zero is true" matches the convention that
-	// long-running pipelines depend on. The encoder is strict (always
-	// emits 0x00 or 0x01), so a decode-encode pass canonicalizes.
-	b := src[0] != 0
+	// Not spec-exact (spec says 0 or 1), but matches Java reference:
+	// only 0x01 is true. Encoder is canonical 0/1.
+	b := src[0] == 1
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
 		// Fast path: empty interface (any) — most decode targets.
