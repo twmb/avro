@@ -15,7 +15,10 @@ var (
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 )
 
-var errIndirectNil = errors.New("invalid nil in non-union, non-null")
+var (
+	errIndirectNil  = errors.New("invalid nil in non-union, non-null")
+	errIndirectDeep = errors.New("avro: pointer/interface chain on input is cyclic or nests deeper than supported")
+)
 
 // maxIndirectDepth bounds indirect/indirectAlloc unwrap loops. A self-
 // referential interface (e.g. `var p any; p = &p`) creates a real cycle in
@@ -40,7 +43,7 @@ func indirect(v reflect.Value) (reflect.Value, error) {
 			return v, nil
 		}
 	}
-	return v, errors.New("avro: pointer/interface chain on input is cyclic or nests deeper than supported")
+	return v, errIndirectDeep
 }
 
 func indirectAlloc(v reflect.Value) reflect.Value {
@@ -77,12 +80,20 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 	return v
 }
 
-// setIface assigns rv to v, where v is an interface-kind target. Returns a
-// SemanticError if rv's type isn't assignable to v's interface type — the
-// common case being a user passing *interface{Foo()} as a decode target,
-// where the decoder produces a value that doesn't implement Foo. Without
-// the check, reflect.Value.Set panics with "value of type X is not
-// assignable to type Y".
+// setIface assigns rv to v with a type-compatibility check, primarily
+// for interface-kind targets. Returns a SemanticError if rv's type
+// isn't assignable to v's type — the common case being a user passing
+// *interface{Foo()} as a decode target, where the decoder produces a
+// value that doesn't implement Foo. Without the check, reflect.Value.Set
+// panics with "value of type X is not assignable to type Y".
+//
+// Concrete-kind v is also accepted when rv.Type() exactly matches
+// v.Type() (e.g. logical-type decoders setting time.Time / time.Duration
+// / *big.Rat into a typed field). In that case the NumMethod() == 0
+// shortcut hits and we Set directly. Callers must ensure rv's type
+// remains compatible — a future change that produces an rv of a
+// different type would silently panic on Set, since the AssignableTo
+// branch only runs when v has methods.
 //
 // Use this on the cold paths (logical types, promoted decoders, resolved
 // records, etc.) where the per-call function-boundary cost doesn't matter.

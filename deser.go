@@ -1046,10 +1046,17 @@ func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	b := [16]byte(src[:16])
 	v = indirectAlloc(v)
 	switch {
-	case v.Kind() == reflect.Interface, isUUIDType(v.Type()):
+	case v.Kind() == reflect.Interface:
 		if err := setIface(v, reflect.ValueOf(b), "fixed"); err != nil {
 			return nil, err
 		}
+	case isUUIDType(v.Type()):
+		// Concrete [16]byte target: direct Set is safe since
+		// rv.Type() == v.Type() by isUUIDType. The original
+		// combined-case used setIface and only worked because
+		// of that exact-type match — splitting makes the
+		// dispatch explicit.
+		v.Set(reflect.ValueOf(b))
 	case v.Kind() == reflect.String:
 		v.SetString(uuidToString(b))
 	case v.Type().Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8:

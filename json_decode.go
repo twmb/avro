@@ -765,8 +765,11 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 
 func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error {
 	// Fail fast on a target that can't hold the result, mirroring
-	// deserRecord.deser. Doing this up front avoids advancing the
-	// scanner past the record's bytes only to throw the result away.
+	// deserRecord.deser. The caller (decodeRecord) has already
+	// consumed the leading '{', so this advances at most one byte
+	// before erroring — but it avoids the much larger waste of
+	// iterating each field, allocating a map, and decoding values
+	// only to throw them away on assignment.
 	if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
 		return &SemanticError{GoType: v.Type(), AvroType: "record"}
 	}

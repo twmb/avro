@@ -1281,6 +1281,14 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type, nullByte, valByte by
 }
 
 // udNullUnionRecord handles null-union deser for *T where T is a record.
+//
+// Depth bookkeeping note: this function does NOT bump sl.depth itself.
+// It relies on the inner record-entry — deserRecordFastPtr (fast path)
+// or rec.deser (slow path) — to bump on the way in and decrement on
+// the way out. Both currently do. If a future change adds a third
+// record-entry path that's invoked here, that path MUST also bump
+// sl.depth, or recursive ["null", T] schemas will silently lose depth
+// tracking.
 func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 		if len(src) < 1 {
