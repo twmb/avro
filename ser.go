@@ -543,7 +543,13 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 					dst = append(dst, f.defaultBytes...)
 					continue
 				}
-				if dst, err = f.fn(dst, reflect.ValueOf(value)); err != nil {
+				var rv reflect.Value
+				if value != nil {
+					rv = reflect.ValueOf(value)
+				} else {
+					rv = reflect.Zero(anyType)
+				}
+				if dst, err = f.fn(dst, rv); err != nil {
 					return nil, recordFieldError(t, f.name, err)
 				}
 			}

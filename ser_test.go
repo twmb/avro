@@ -298,6 +298,47 @@ func TestSerRecordAsMap(t *testing.T) {
 	})
 }
 
+func TestSerRecordMapNullField(t *testing.T) {
+	t.Run("nil value for non-nullable field returns error not panic", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"id","type":"int"},
+			{"name":"name","type":"string"}
+		]}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]any{"id": int32(1), "name": nil}
+		_, err = s.AppendEncode(nil, &m)
+		if err == nil {
+			t.Fatal("expected error encoding nil into non-nullable string field, got nil")
+		}
+	})
+
+	t.Run("nil value for nullable union field encodes as null branch", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"id","type":"int"},
+			{"name":"name","type":["null","string"]}
+		]}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]any{"id": int32(1), "name": nil}
+		dst, err := s.AppendEncode(nil, &m)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[string]any
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got["name"] != nil {
+			t.Fatalf("expected nil, got %v", got["name"])
+		}
+	})
+}
+
 func TestSerUnionAllFail(t *testing.T) {
 	encodeErr(t, `["null","int"]`, ptr("hello"))
 }
