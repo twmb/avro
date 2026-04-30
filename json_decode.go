@@ -759,7 +759,15 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 }
 
 func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error {
-	m := make(map[string]any, len(node.fields))
+	// Reuse the existing map[string]any if v already wraps one — the
+	// streaming pattern (DecodeJSON repeatedly into the same *any).
+	// Mirrors the equivalent reuse in deserRecord for binary decode.
+	var m map[string]any
+	if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
+		m = inner.Interface().(map[string]any)
+	} else {
+		m = make(map[string]any, len(node.fields))
+	}
 	var val any
 	valV := reflect.ValueOf(&val).Elem()
 	err := ctx.iterateRecordFields(node, func(idx int, key string) error {

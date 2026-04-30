@@ -914,7 +914,7 @@ func udBool(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if len(src) < 1 {
 		return nil, &ShortBufferError{Type: "boolean"}
 	}
-	*(*bool)(p) = src[0] != 0
+	*(*bool)(p) = src[0] == 1
 	return src[1:], nil
 }
 

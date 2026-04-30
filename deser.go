@@ -719,7 +719,7 @@ func deserArrayBooleanLoop(src []byte, sliceVal reflect.Value, start, count int,
 	// The caller guarantees len(src) >= count (via the block count check),
 	// and each boolean consumes exactly 1 byte, so bounds are always safe.
 	for i := start; i < start+count; i++ {
-		sliceVal.Index(i).SetBool(src[0] != 0)
+		sliceVal.Index(i).SetBool(src[0] == 1)
 		src = src[1:]
 	}
 	return src, nil
@@ -913,7 +913,7 @@ func deserMapBooleanBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, cou
 		if len(src) < 1 {
 			return nil, &ShortBufferError{Type: "boolean"}
 		}
-		elemVal.SetBool(src[0] != 0)
+		elemVal.SetBool(src[0] == 1)
 		src = src[1:]
 
 		mapVal.SetMapIndex(keyVal, elemVal)
