@@ -2172,6 +2172,41 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 	}
 }
 
+// TestEncodeJSONUFFFDIdempotence pins the canonical-idempotence guarantee
+// of the JSON encoder for U+FFFD: an invalid UTF-8 byte and a valid
+// U+FFFD codepoint must encode to the same bytes, so decode-encode-
+// decode-encode of any input is a no-op after the first pass.
+func TestEncodeJSONUFFFDIdempotence(t *testing.T) {
+	s, _ := Parse(`"string"`)
+	// String containing one invalid UTF-8 byte.
+	invalid, err := s.EncodeJSON(string([]byte{0xff}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// String containing the valid U+FFFD codepoint encoded as UTF-8.
+	valid, err := s.EncodeJSON("�")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(invalid) != string(valid) {
+		t.Errorf("encoder is not idempotent on U+FFFD:\n  invalid byte %x: %s\n  U+FFFD value:    %s",
+			0xff, invalid, valid)
+	}
+	// And the round-trip-twice property: decode then re-encode the
+	// canonical output must be a no-op.
+	var v any
+	if err := s.DecodeJSON(invalid, &v); err != nil {
+		t.Fatalf("decode after encode failed: %v", err)
+	}
+	again, err := s.EncodeJSON(v)
+	if err != nil {
+		t.Fatalf("re-encode failed: %v", err)
+	}
+	if string(again) != string(invalid) {
+		t.Errorf("canonical encode is not stable:\n  first:  %s\n  second: %s", invalid, again)
+	}
+}
+
 func TestDecodeJSONGoavroLogicalBranchName(t *testing.T) {
 	// goavro uses "long.timestamp-millis" as union branch names.
 	// DecodeJSON should accept these via findUnionBranch fallback.
