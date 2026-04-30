@@ -343,6 +343,7 @@ func TestSerRecordMapNullField(t *testing.T) {
 // map[string]any (m["next"] = m) against a recursive schema would
 // otherwise stack-overflow the goroutine — fatal in Go (not
 // recoverable via recover). The encoder now bails with a clean error.
+// Both the binary and JSON encoders are covered.
 func TestEncodeCyclicInput(t *testing.T) {
 	s, err := Parse(`{"type":"record","name":"Node","fields":[
 		{"name":"value","type":"int"},
@@ -353,18 +354,34 @@ func TestEncodeCyclicInput(t *testing.T) {
 	}
 	node := map[string]any{"value": int32(1)}
 	node["next"] = node
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("panicked: %v", r)
+	t.Run("binary", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		_, err := s.AppendEncode(nil, node)
+		if err == nil {
+			t.Fatal("expected error on cyclic input, got nil")
 		}
-	}()
-	_, err = s.AppendEncode(nil, node)
-	if err == nil {
-		t.Fatal("expected error on cyclic input, got nil")
-	}
-	if !errors.Is(err, errEncodeTooDeep) {
-		t.Fatalf("expected errEncodeTooDeep, got %v", err)
-	}
+		if !errors.Is(err, errEncodeTooDeep) {
+			t.Fatalf("expected errEncodeTooDeep, got %v", err)
+		}
+	})
+	t.Run("json", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		_, err := s.AppendEncodeJSON(nil, node)
+		if err == nil {
+			t.Fatal("expected error on cyclic input, got nil")
+		}
+		if !errors.Is(err, errEncodeTooDeep) {
+			t.Fatalf("expected errEncodeTooDeep, got %v", err)
+		}
+	})
 }
 
 // TestSerArrayNilAnyElement covers the specialized serArray fast paths

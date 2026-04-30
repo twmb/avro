@@ -92,6 +92,8 @@ func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		attempt := appendVarint(dst, int32(idx))
 		if result, err := s.fns[idx](attempt, inner, depth+1); err == nil {
 			return result, nil
+		} else if errors.Is(err, errEncodeTooDeep) {
+			return nil, err
 		}
 	}
 
@@ -101,6 +103,10 @@ func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		attempt := appendVarint(base, int32(i))
 		if attempt, err = fn(attempt, v, depth+1); err == nil {
 			return attempt, nil
+		}
+		// Propagate too-deep immediately; trial loop would mask it.
+		if errors.Is(err, errEncodeTooDeep) {
+			return nil, err
 		}
 	}
 	e := &SemanticError{AvroType: "union", Err: errors.New("no matching branch")}
@@ -129,6 +135,8 @@ func serNullUnion(u *serUnion) serfn {
 			if idx == 1 {
 				if result, err := u.fns[1](append(dst, 2), inner, depth+1); err == nil {
 					return result, nil
+				} else if errors.Is(err, errEncodeTooDeep) {
+					return nil, err
 				}
 			}
 		}
@@ -150,6 +158,8 @@ func serNullSecondUnion(u *serUnion) serfn {
 			if idx == 0 {
 				if result, err := u.fns[0](append(dst, 0), inner, depth+1); err == nil {
 					return result, nil
+				} else if errors.Is(err, errEncodeTooDeep) {
+					return nil, err
 				}
 			}
 		}

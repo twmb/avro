@@ -506,6 +506,9 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 
 // appendAvroJSONUnion handles union encoding.
 func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
+	if depth >= maxEncodeDepth {
+		return nil, errEncodeTooDeep
+	}
 	if !v.IsValid() || (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil() {
 		// unreachable: appendAvroJSON's deref loop converts nil pointers/interfaces
 		// to invalid values before dispatching here, but kept as a safety net.
@@ -523,6 +526,9 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 				inner := iter.Value()
 				encoded, err := appendAvroJSON(nil, inner, branch, cfg, customEncodes, depth+1)
 				if err != nil {
+					if errors.Is(err, errEncodeTooDeep) {
+						return nil, err
+					}
 					// Fall through to try-each-branch loop,
 					// matching Encode's serUnion behavior.
 					goto tryAll
@@ -566,6 +572,12 @@ tryAll:
 				buf = append(buf, encoded...)
 			}
 			return buf, nil
+		}
+		// Propagate too-deep without trying further branches; the
+		// trial loop would otherwise mask the recursion limit error
+		// behind a misleading "no branch matched".
+		if errors.Is(err, errEncodeTooDeep) {
+			return nil, err
 		}
 	}
 	return nil, fmt.Errorf("avro json: no union branch matched value of type %s", v.Type())

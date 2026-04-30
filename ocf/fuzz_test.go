@@ -126,3 +126,71 @@ func FuzzOCFRoundTrip(f *testing.F) {
 		r.Close()
 	})
 }
+
+// FuzzOCFWriterHostile exercises the OCF writer against malformed and
+// adversarial Go values: nil, wrong-type for the schema, NaN floats,
+// non-string-keyed maps as records, and cyclic structures. The writer
+// should return an error, never panic. Encoder cycle protection on
+// the avro side is exercised here transitively via the writer.
+func FuzzOCFWriterHostile(f *testing.F) {
+	f.Add(uint8(0))
+	f.Add(uint8(5))
+	f.Add(uint8(11))
+
+	f.Fuzz(func(t *testing.T, mode uint8) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panic: %v", r)
+			}
+		}()
+		schemas := []*avro.Schema{
+			avro.MustParse(`"int"`),
+			avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`),
+			avro.MustParse(`{"type":"record","name":"Node","fields":[
+				{"name":"v","type":"int"},
+				{"name":"next","type":["null","Node"]}
+			]}`),
+		}
+		// Build a value based on mode.
+		var (
+			s *avro.Schema
+			v any
+		)
+		switch mode % 12 {
+		case 0:
+			s, v = schemas[0], nil
+		case 1:
+			s, v = schemas[0], "string mismatched against int"
+		case 2:
+			s, v = schemas[0], int32(42)
+		case 3:
+			s, v = schemas[1], map[string]any{"a": "wrong type"}
+		case 4:
+			s, v = schemas[1], map[int]int{1: 2} // non-string-keyed
+		case 5:
+			s, v = schemas[1], map[string]any{"a": int32(1)}
+		case 6:
+			// Cyclic against recursive schema.
+			node := map[string]any{"v": int32(1)}
+			node["next"] = node
+			s, v = schemas[2], node
+		case 7:
+			s, v = schemas[1], map[string]any{} // missing required field
+		case 8:
+			s, v = schemas[0], any(nil)
+		case 9:
+			s, v = schemas[2], map[string]any{"v": int32(1), "next": nil}
+		case 10:
+			s, v = schemas[1], int32(1) // wrong shape
+		case 11:
+			s, v = schemas[2], map[string]any{} // missing required
+		}
+		var buf bytes.Buffer
+		w, err := NewWriter(&buf, s)
+		if err != nil {
+			return
+		}
+		w.Encode(v)
+		w.Close()
+	})
+}
