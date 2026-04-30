@@ -764,6 +764,12 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 }
 
 func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error {
+	// Fail fast on a target that can't hold the result, mirroring
+	// deserRecord.deser. Doing this up front avoids advancing the
+	// scanner past the record's bytes only to throw the result away.
+	if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
+		return &SemanticError{GoType: v.Type(), AvroType: "record"}
+	}
 	// Reuse the existing map[string]any if v already wraps one — the
 	// streaming pattern (DecodeJSON repeatedly into the same *any).
 	// Mirrors the equivalent reuse in deserRecord for binary decode,
@@ -788,9 +794,6 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 	})
 	if err != nil {
 		return err
-	}
-	if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
-		return &SemanticError{GoType: v.Type(), AvroType: "record"}
 	}
 	v.Set(reflect.ValueOf(m))
 	return nil
