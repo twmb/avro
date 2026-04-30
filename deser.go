@@ -221,6 +221,13 @@ func deserBoolean(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if len(src) < 1 {
 		return nil, &ShortBufferError{Type: "boolean"}
 	}
+	// Avro spec: boolean is "a single byte whose value is either 0
+	// (false) or 1 (true)." Reject other bytes — accepting them as
+	// true causes round-trip lossiness (re-encode always emits 0x01,
+	// not the original byte) and silently masks malformed wire data.
+	if src[0] > 1 {
+		return nil, &SemanticError{AvroType: "boolean", Err: fmt.Errorf("invalid boolean byte 0x%02x (must be 0 or 1)", src[0])}
+	}
 	b := src[0] != 0
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
@@ -437,8 +444,24 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	v = indirectAlloc(v)
 	k := v.Kind()
 	if k == reflect.Interface {
-		// Generic decode: create map[string]any.
-		m := make(map[string]any, len(s.fields))
+		if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "record"}
+		}
+		// Reuse the existing map[string]any if v already wraps one.
+		// This is the streaming-decode pattern (OCF reader, batch
+		// consumer reusing &out across many records). We do this
+		// explicitly here rather than in indirectAlloc — unwrapping a
+		// non-nil interface there would break decoders that
+		// v.Set(...) on the result (decodeNull, decodeArray's typed
+		// branch, etc.) since the unwrapped Value isn't addressable.
+		// Here we only need SetMapIndex, which works on the
+		// non-addressable Map.
+		var m map[string]any
+		if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
+			m = inner.Interface().(map[string]any)
+		} else {
+			m = make(map[string]any, len(s.fields))
+		}
 		elem := reflect.New(anyType).Elem()
 		var err error
 		for _, f := range s.fields {
@@ -447,9 +470,6 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 			}
 			m[f.name] = elem.Interface()
 			elem.SetZero()
-		}
-		if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "record"}
 		}
 		v.Set(reflect.ValueOf(m))
 		return src, nil

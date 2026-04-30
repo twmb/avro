@@ -1001,3 +1001,256 @@ func FuzzResolve(f *testing.F) {
 		resolved.Decode(data, &v)
 	})
 }
+
+// FuzzDecodeVariedTargets fuzzes binary decode against many target shapes,
+// not just *any. The pre-existing FuzzDecode only used `var v any` and
+// missed:
+//   - panics when decoding into *interface{Foo()} / *error / etc.
+//   - panics when decoding into a struct with non-empty-interface fields
+//   - panics on re-decode into a populated *any (the inner unwraps to
+//     unaddressable Value)
+// The driver's `mode` byte selects the target shape; data bytes are the
+// wire input. All schemas come from fuzzSchemas. No panic is ever
+// expected — every target/data combo must surface as a returned error.
+func FuzzDecodeVariedTargets(f *testing.F) {
+	type IfaceField struct {
+		X interface{ Foo() } `avro:"x"`
+	}
+	type ErrorField struct {
+		X error `avro:"x"`
+	}
+
+	makeTarget := func(mode uint8) any {
+		switch mode % 12 {
+		case 0:
+			var v any
+			return &v
+		case 1:
+			var v interface{ Foo() }
+			return &v
+		case 2:
+			var v error
+			return &v
+		case 3:
+			var v map[string]any
+			return &v
+		case 4:
+			var v []any
+			return &v
+		case 5:
+			var v IfaceField
+			return &v
+		case 6:
+			var v ErrorField
+			return &v
+		case 7:
+			var v int32
+			return &v
+		case 8:
+			var v *int32
+			return &v
+		case 9:
+			var v string
+			return &v
+		case 10:
+			// Pre-populated *any so the inner-Value path runs.
+			v := any(int32(99))
+			return &v
+		case 11:
+			// Pre-populated *any holding a slice (not a map — exercises
+			// the unwrap-only-Map rule).
+			v := any([]any{int32(1)})
+			return &v
+		}
+		var v any
+		return &v
+	}
+
+	// Seed every (schema, target_kind) pair with a valid binary encoding
+	// plus an empty buffer.
+	for i := range fuzzSchemas {
+		for mode := uint8(0); mode < 12; mode++ {
+			f.Add(uint8(i), mode, []byte{})
+			f.Add(uint8(i), mode, []byte{0})
+			f.Add(uint8(i), mode, []byte{2, 'x'})
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx, mode uint8, data []byte) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		tgt := makeTarget(mode)
+		// Decode in either tagged or untagged mode based on a low bit of
+		// mode — every option combo must be panic-free.
+		if mode&0x80 != 0 {
+			s.Decode(data, tgt, TaggedUnions())
+		} else {
+			s.Decode(data, tgt)
+		}
+	})
+}
+
+// FuzzDecodeJSONVariedTargets is the JSON-decode counterpart to
+// FuzzDecodeVariedTargets.
+func FuzzDecodeJSONVariedTargets(f *testing.F) {
+	type IfaceField struct {
+		X interface{ Foo() } `avro:"x"`
+	}
+
+	makeTarget := func(mode uint8) any {
+		switch mode % 9 {
+		case 0:
+			var v any
+			return &v
+		case 1:
+			var v interface{ Foo() }
+			return &v
+		case 2:
+			var v error
+			return &v
+		case 3:
+			var v map[string]any
+			return &v
+		case 4:
+			var v IfaceField
+			return &v
+		case 5:
+			var v int32
+			return &v
+		case 6:
+			var v string
+			return &v
+		case 7:
+			v := any(int32(0))
+			return &v
+		case 8:
+			v := any(map[string]any{})
+			return &v
+		}
+		var v any
+		return &v
+	}
+
+	for i := range fuzzSchemas {
+		for mode := uint8(0); mode < 9; mode++ {
+			for _, src := range []string{
+				`null`, `42`, `"x"`, `true`, `[]`, `{}`,
+				`{"int":1}`, `{"null":null}`, `{"x":1}`,
+			} {
+				f.Add(uint8(i), mode, src)
+			}
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx, mode uint8, src string) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		tgt := makeTarget(mode)
+		if mode&0x80 != 0 {
+			s.DecodeJSON([]byte(src), tgt, TaggedUnions())
+		} else {
+			s.DecodeJSON([]byte(src), tgt)
+		}
+	})
+}
+
+// FuzzDecodeReuse repeatedly decodes into the same *any target.
+// This is the common streaming pattern (OCF reader, batch consumer) and
+// the pre-existing fuzzers all created a fresh target per iteration.
+// That blind spot hid the indirectAlloc panic where the *any's inner
+// becomes unaddressable on the second decode.
+func FuzzDecodeReuse(f *testing.F) {
+	for i := range fuzzSchemas {
+		f.Add(uint8(i), []byte{0}, []byte{0})
+		f.Add(uint8(i), []byte{}, []byte{})
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx uint8, data1, data2 []byte) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		var v any
+		s.Decode(data1, &v)
+		// Second call into same target — the bug manifests here.
+		s.Decode(data2, &v)
+		// Third for good measure.
+		s.Decode(data1, &v)
+	})
+}
+
+// FuzzDecodeJSONReuse: JSON counterpart to FuzzDecodeReuse.
+func FuzzDecodeJSONReuse(f *testing.F) {
+	for i := range fuzzSchemas {
+		f.Add(uint8(i), `null`, `null`)
+		f.Add(uint8(i), `42`, `43`)
+		f.Add(uint8(i), `{}`, `{}`)
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx uint8, src1, src2 string) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		var v any
+		s.DecodeJSON([]byte(src1), &v)
+		s.DecodeJSON([]byte(src2), &v)
+	})
+}
+
+// FuzzEncodeHostile fuzzes the encoder with values that mix nils, weird
+// types, and tagged-union maps with bogus branch keys against every
+// schema. None should panic — only return errors.
+func FuzzEncodeHostile(f *testing.F) {
+	type S struct {
+		X any            `avro:"x"`
+		A []any          `avro:"a"`
+		M map[string]any `avro:"m"`
+	}
+
+	makeValue := func(mode uint8) any {
+		switch mode % 16 {
+		case 0:
+			return nil
+		case 1:
+			return any(nil)
+		case 2:
+			return (*int)(nil)
+		case 3:
+			return map[string]any{"x": nil}
+		case 4:
+			return []any{nil, int32(1), nil}
+		case 5:
+			return map[string]any{"int": nil}
+		case 6:
+			return map[string]any{"null": nil}
+		case 7:
+			return map[string]any{"unknown_branch": int32(1)}
+		case 8:
+			return map[string]any{"x": []any{nil}}
+		case 9:
+			return map[string]any{"x": map[string]any{"k": nil}}
+		case 10:
+			return S{X: nil, A: []any{nil}, M: map[string]any{"k": nil}}
+		case 11:
+			return map[int]int{1: 1} // non-string-keyed map
+		case 12:
+			return map[any]any{1: 1}
+		case 13:
+			return json.Number("garbage")
+		case 14:
+			return map[string]any{"x": json.Number("not-a-number")}
+		case 15:
+			return []any{int32(1), "string", nil, true, 3.14}
+		}
+		return nil
+	}
+
+	for i := range fuzzSchemas {
+		for mode := uint8(0); mode < 16; mode++ {
+			f.Add(uint8(i), mode)
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx, mode uint8) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		v := makeValue(mode)
+		// Both binary and JSON, both option modes.
+		s.AppendEncode(nil, v)
+		s.AppendEncode(nil, v, TaggedUnions())
+		s.AppendEncodeJSON(nil, v)
+		s.AppendEncodeJSON(nil, v, TaggedUnions())
+	})
+}

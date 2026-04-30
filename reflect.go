@@ -48,35 +48,21 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 			if v.IsNil() {
 				return v
 			}
-			// Unwrap only when the inner concrete supports
-			// in-place mutation through the unaddressable Value
-			// you get from v.Elem():
-			//   - non-nil pointer: pointee is addressable
-			//     through the pointer; deref and continue.
-			//   - non-nil map: reference type; SetMapIndex,
-			//     append-via-MakeMap, etc. work without the
-			//     map Value itself being addressable — and
-			//     reusing the existing map saves allocations
-			//     when callers Decode repeatedly into the
-			//     same *any.
-			// Anything else (primitives, structs, slices, nil
-			// pointers, ...) requires v.Set(...) on an
-			// unaddressable Value to make progress, which
-			// panics. Treat the interface itself as the
-			// destination so the decoder writes via Set on the
-			// settable interface Value instead.
+			// Non-nil interface: unwrap only if the inner is a
+			// non-nil pointer (write through the pointer is
+			// addressable). For ANY other concrete — primitives,
+			// structs, slices, maps, nil pointers — v.Elem() is
+			// not addressable. Some decoders reach for v.Set(...)
+			// on the unwrapped value (e.g. decodeNull zeros it,
+			// decodeArray replaces the slice), which panics. Keep
+			// the interface itself as the destination so those
+			// decoders write via Set on the settable interface
+			// Value.
 			inner := v.Elem()
-			switch inner.Kind() {
-			case reflect.Pointer:
-				if inner.IsNil() {
-					return v
-				}
-				v = inner
-			case reflect.Map:
-				v = inner
-			default:
+			if inner.Kind() != reflect.Pointer || inner.IsNil() {
 				return v
 			}
+			v = inner
 		default:
 			return v
 		}
