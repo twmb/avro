@@ -15,10 +15,7 @@ var (
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 )
 
-var (
-	errIndirectNil   = errors.New("invalid nil in non-union, non-null")
-	errIndirectDeep  = errors.New("pointer/interface chain on input nests too deep (cycle?)")
-)
+var errIndirectNil = errors.New("invalid nil in non-union, non-null")
 
 // maxIndirectDepth bounds indirect/indirectAlloc unwrap loops. A self-
 // referential interface (e.g. `var p any; p = &p`) creates a real cycle in
@@ -43,7 +40,7 @@ func indirect(v reflect.Value) (reflect.Value, error) {
 			return v, nil
 		}
 	}
-	return v, errIndirectDeep
+	return v, errors.New("avro: pointer/interface chain on input is cyclic or nests deeper than supported")
 }
 
 func indirectAlloc(v reflect.Value) reflect.Value {

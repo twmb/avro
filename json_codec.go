@@ -26,10 +26,13 @@ func (taggedUnions) opt() {}
 // TaggedUnions wraps non-null union values as {"type_name": value}.
 //
 // In [Schema.EncodeJSON], this produces tagged JSON union output.
-// In [Schema.Decode] and [Schema.DecodeJSON] to *any, this wraps
-// union values as map[string]any{branchName: value}.
+// In [Schema.Decode] and [Schema.DecodeJSON], this wraps union
+// values as map[string]any{branchName: value} — but only when the
+// decode target is *any (the common case). For typed targets — a
+// concrete struct field, *T, or any non-empty Go interface — the
+// wrapper would not be assignable to the target, so the bare branch
+// value is assigned without the envelope.
 //
-// Without this option, union values are bare in all cases.
 // [Schema.DecodeJSON] and [Schema.Encode] always accept both tagged
 // and bare union input regardless of this option.
 func TaggedUnions() Opt { return taggedUnions{} }

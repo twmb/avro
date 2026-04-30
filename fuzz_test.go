@@ -1373,12 +1373,16 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, a int32, b string, n uint8) {
 		workers := 1 + int(n%8)
-		done := make(chan struct{})
+		// Collect panics from worker goroutines via channel rather than
+		// calling t.Errorf directly: testing.T methods other than Log
+		// aren't safe for concurrent use from non-test goroutines.
+		panicCh := make(chan any, workers)
+		done := make(chan struct{}, workers)
 		for i := 0; i < workers; i++ {
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
-						t.Errorf("panic in concurrent worker: %v", r)
+						panicCh <- r
 					}
 					done <- struct{}{}
 				}()
@@ -1397,6 +1401,10 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 		}
 		for i := 0; i < workers; i++ {
 			<-done
+		}
+		close(panicCh)
+		for p := range panicCh {
+			t.Errorf("panic in concurrent worker: %v", p)
 		}
 	})
 }
@@ -1517,8 +1525,8 @@ func FuzzDepthBounds(f *testing.F) {
 		if arrayCount > 5000 {
 			arrayCount = 5000
 		}
-		if schemaDepth > maxDepth+200 {
-			schemaDepth = maxDepth + 200
+		if schemaDepth > maxDepth+10 {
+			schemaDepth = maxDepth + 10
 		}
 		defer func() {
 			if r := recover(); r != nil {

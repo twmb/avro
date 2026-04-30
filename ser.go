@@ -577,6 +577,13 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 					dst = append(dst, f.defaultBytes...)
 					continue
 				}
+				// reflect.ValueOf(nil) returns the invalid zero Value,
+				// which the field fn would have to special-case via
+				// .IsValid() before any Type/Kind call. reflect.Zero(any)
+				// produces a valid zero `any` Value that flows through
+				// indirect()/serUnion's IsNil checks naturally — they
+				// recognize a nil interface and route to the union's
+				// null branch (or surface errIndirectNil on a non-union).
 				var rv reflect.Value
 				if value != nil {
 					rv = reflect.ValueOf(value)
