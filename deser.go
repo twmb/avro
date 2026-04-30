@@ -474,6 +474,11 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		// branch, etc.) since the unwrapped Value isn't addressable.
 		// Here we only need SetMapIndex, which works on the
 		// non-addressable Map.
+		//
+		// Reuse retains keys not present in the schema (matches
+		// encoding/json into a non-empty map). Callers that need a
+		// fresh decode should clear or replace the map before each
+		// call. Pinned by TestDecodeReuseAnyTargetStaleKeys.
 		var m map[string]any
 		if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
 			m = inner.Interface().(map[string]any)

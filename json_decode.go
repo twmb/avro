@@ -766,7 +766,9 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error {
 	// Reuse the existing map[string]any if v already wraps one — the
 	// streaming pattern (DecodeJSON repeatedly into the same *any).
-	// Mirrors the equivalent reuse in deserRecord for binary decode.
+	// Mirrors the equivalent reuse in deserRecord for binary decode,
+	// including the same stale-key semantics: keys not present in the
+	// schema are retained (matches encoding/json into a non-empty map).
 	var m map[string]any
 	if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
 		m = inner.Interface().(map[string]any)

@@ -9871,6 +9871,85 @@ func TestDecodeNonEmptyInterfaceTarget(t *testing.T) {
 	}
 }
 
+// TestDecodeReuseAnyTargetStaleKeys pins the documented stale-key
+// behavior of map reuse in deserRecord.deser and decodeRecordAny:
+// when *any already wraps a map[string]any, the decoder overwrites
+// keys present in the schema and leaves any other keys untouched.
+// This matches encoding/json's behavior when unmarshaling into a
+// non-empty map. Callers that want a fresh decode should clear or
+// replace the map.
+func TestDecodeReuseAnyTargetStaleKeys(t *testing.T) {
+	schemaA := `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`
+	schemaB := `{"type":"record","name":"S","fields":[{"name":"y","type":"int"}]}`
+	t.Run("binary_pre_seeded", func(t *testing.T) {
+		sa, err := Parse(schemaA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := sa.AppendEncode(nil, map[string]any{"x": int32(7)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v any = map[string]any{"stale": "keep me"}
+		if _, err := sa.Decode(encoded, &v); err != nil {
+			t.Fatal(err)
+		}
+		m, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("got %T, want map[string]any", v)
+		}
+		if m["x"] != int32(7) {
+			t.Fatalf("schema field not overwritten: x=%v", m["x"])
+		}
+		if got, ok := m["stale"]; !ok || got != "keep me" {
+			t.Fatalf("stale key dropped: m=%v", m)
+		}
+	})
+	t.Run("binary_different_schema", func(t *testing.T) {
+		sa, err := Parse(schemaA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sb, err := Parse(schemaB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encA, _ := sa.AppendEncode(nil, map[string]any{"x": int32(1)})
+		encB, _ := sb.AppendEncode(nil, map[string]any{"y": int32(2)})
+		var v any
+		if _, err := sa.Decode(encA, &v); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sb.Decode(encB, &v); err != nil {
+			t.Fatal(err)
+		}
+		m := v.(map[string]any)
+		if m["y"] != int32(2) {
+			t.Fatalf("y not set: %v", m)
+		}
+		if _, ok := m["x"]; !ok {
+			t.Fatalf("x cleared after second decode: %v", m)
+		}
+	})
+	t.Run("json_pre_seeded", func(t *testing.T) {
+		sa, err := Parse(schemaA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v any = map[string]any{"stale": "keep me"}
+		if err := sa.DecodeJSON([]byte(`{"x":7}`), &v); err != nil {
+			t.Fatal(err)
+		}
+		m := v.(map[string]any)
+		if m["x"] != int32(7) {
+			t.Fatalf("x not overwritten: %v", m)
+		}
+		if got, ok := m["stale"]; !ok || got != "keep me" {
+			t.Fatalf("stale key dropped: m=%v", m)
+		}
+	})
+}
+
 func TestSetLongValueInterface(t *testing.T) {
 	var v any
 	rv := reflect.ValueOf(&v).Elem()
