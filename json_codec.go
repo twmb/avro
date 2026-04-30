@@ -148,8 +148,14 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		}
 		return nil, fmt.Errorf("avro json: nil value for non-nullable type %q", node.kind)
 	}
-	// Dereference pointers and interfaces.
-	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
+	// Dereference pointers and interfaces. Capped at maxIndirectDepth
+	// so a self-referential interface (var p any; p = &p) terminates;
+	// the deeply-wrapped value falls through to the type switch which
+	// will return a SemanticError for the unmatched kind.
+	for range maxIndirectDepth {
+		if v.Kind() != reflect.Pointer && v.Kind() != reflect.Interface {
+			break
+		}
 		if v.IsNil() {
 			return appendAvroJSON(buf, reflect.Value{}, node, cfg, customEncodes, depth+1)
 		}

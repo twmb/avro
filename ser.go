@@ -173,11 +173,16 @@ func serNullSecondUnion(u *serUnion) serfn {
 // isNilValue reports whether v is nil, peeling through pointer and
 // interface layers. This handles the case where AppendEncode receives
 // &nilPtr (a **T with non-nil outer pointer) for a nullable union.
+//
+// Capped at maxIndirectDepth so a self-referential interface
+// (var p any; p = &p) terminates instead of looping forever; treat
+// the deeply-nested case as not-nil so the encoder reports a real
+// error downstream rather than silently encoding null.
 func isNilValue(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
 	}
-	for {
+	for range maxIndirectDepth {
 		switch v.Kind() {
 		case reflect.Pointer, reflect.Interface:
 			if v.IsNil() {
@@ -190,6 +195,7 @@ func isNilValue(v reflect.Value) bool {
 			return false
 		}
 	}
+	return false
 }
 
 ////////////////

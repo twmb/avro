@@ -553,9 +553,11 @@ func TestParseDeeplyNestedSchema(t *testing.T) {
 	}
 }
 
-// TestIndirectCyclicInterfaceDoesntLoop ensures Decode/Encode reject
-// `var p any; p = &p` (a real cycle through the empty interface) instead
-// of looping forever in indirect/indirectAlloc.
+// TestIndirectCyclicInterfaceDoesntLoop ensures every pointer/interface
+// unwrap loop in the library (indirect, indirectAlloc, isNilValue,
+// appendAvroJSON's deref, customEncode's deref) caps at
+// maxIndirectDepth so `var p any; p = &p` (a real cycle through the
+// empty interface) terminates instead of spinning forever.
 func TestIndirectCyclicInterfaceDoesntLoop(t *testing.T) {
 	s, err := Parse(`"int"`)
 	if err != nil {
@@ -563,14 +565,42 @@ func TestIndirectCyclicInterfaceDoesntLoop(t *testing.T) {
 	}
 	var p any
 	p = &p
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("panicked: %v", r)
+	t.Run("binary", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		if _, err := s.AppendEncode(nil, p); err == nil {
+			t.Fatal("expected error, got nil")
 		}
-	}()
-	if _, err := s.AppendEncode(nil, p); err == nil {
-		t.Fatal("expected error, got nil")
-	}
+	})
+	t.Run("json", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		if _, err := s.AppendEncodeJSON(nil, p); err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+	// Nullable union: encoder consults isNilValue first, which has its
+	// own unwrap loop. Without the cap this hangs.
+	t.Run("nullable_union", func(t *testing.T) {
+		s2, err := Parse(`["null","int"]`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		if _, err := s2.AppendEncode(nil, p); err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
 }
 
 // TestSerArrayNilAnyElement covers the specialized serArray fast paths

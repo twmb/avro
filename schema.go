@@ -892,8 +892,13 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 			// Dereference pointers and interface wrappers so GoType
 			// matching compares against the concrete type. Check GoType
 			// at each level so pointer-valued GoTypes (e.g. *url.URL)
-			// match before the pointer is stripped.
-			for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
+			// match before the pointer is stripped. Capped at
+			// maxIndirectDepth so a self-referential interface
+			// (var p any; p = &p) can't spin forever here.
+			for range maxIndirectDepth {
+				if v.Kind() != reflect.Pointer && v.Kind() != reflect.Interface {
+					break
+				}
 				if v.IsNil() {
 					return v, nil
 				}
