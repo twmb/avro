@@ -639,6 +639,7 @@ type builder struct {
 	customDecoderMap map[*schemaNode][]func(any, *SchemaNode) (any, error)
 	customSNMap      map[*schemaNode]*SchemaNode
 	cachedNames      map[string]bool // names inherited from SchemaCache, not from this parse
+	depth            int             // current build recursion depth, bounded by maxDepth
 }
 
 // validNameErr validates a simple name using the builder's configured validator.
@@ -677,6 +678,7 @@ func (b *builder) nest() *builder {
 		customDecoderMap: b.customDecoderMap,
 		customSNMap:      b.customSNMap,
 		cachedNames:      b.cachedNames,
+		depth:            b.depth,
 	}
 }
 
@@ -777,6 +779,11 @@ func (b *builder) build(parentName string, s *aschema) error {
 	if s == nil || s.primitive == "" && s.object == nil && len(s.union) == 0 {
 		return errors.New("schema is not a primitive, complex, nor union")
 	}
+	if b.depth >= maxDepth {
+		return fmt.Errorf("schema nests deeper than the supported limit (%d)", maxDepth)
+	}
+	b.depth++
+	defer func() { b.depth-- }()
 
 	var err error
 	switch {

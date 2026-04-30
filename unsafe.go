@@ -138,6 +138,9 @@ func computeFieldOffset(t reflect.Type, index []int) (uintptr, reflect.Type, boo
 }
 
 func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	base := v.Addr().UnsafePointer()
 	var err error
 	for i := range fast.fields {
@@ -160,6 +163,9 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 }
 
 func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *slab) ([]byte, error) {
+	if sl.depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	base := v.Addr().UnsafePointer()
 	var err error
 	for i := range fast.fields {
@@ -179,6 +185,9 @@ func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *sla
 // serRecordFastPtr serializes a record when all fields have unsafe ser fns.
 // Only requires a raw pointer to the struct base — no reflect.Value needed.
 func serRecordFastPtr(dst []byte, fast *fastRecordSer, base unsafe.Pointer, depth int) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]
@@ -192,6 +201,11 @@ func serRecordFastPtr(dst []byte, fast *fastRecordSer, base unsafe.Pointer, dept
 
 // deserRecordFastPtr deserializes a record when all fields have unsafe deser fns.
 func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, sl *slab) ([]byte, error) {
+	if sl.depth >= maxDepth {
+		return nil, errTooDeep
+	}
+	sl.depth++
+	defer func() { sl.depth-- }()
 	var err error
 	for i := range fast.fields {
 		f := &fast.fields[i]

@@ -23,6 +23,7 @@ var anyType = reflect.TypeFor[any]()
 // Strings are immutable so sharing backing memory is safe.
 type slab struct {
 	buf             []byte
+	depth           int // recursion depth; bumped at recursive dispatch sites
 	taggedUnions    bool
 	tagLogicalTypes bool
 }
@@ -40,6 +41,15 @@ func (s *slab) string(src []byte, n int) string {
 }
 
 var slabPool = sync.Pool{New: func() any { return &slab{} }}
+
+// put resets sl's per-call state and returns it to the pool. The buf field
+// is intentionally retained so subsequent callers reuse its backing memory.
+func (sl *slab) put() {
+	sl.depth = 0
+	sl.taggedUnions = false
+	sl.tagLogicalTypes = false
+	slabPool.Put(sl)
+}
 
 // Decode reads Avro binary from src into v and returns the remaining bytes.
 // v must be a non-nil pointer to a type compatible with the schema:
@@ -90,9 +100,7 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 		sl.tagLogicalTypes = cfg.tagLogical
 	}
 	rest, err := s.deser(src, rv.Elem(), sl)
-	sl.taggedUnions = false
-	sl.tagLogicalTypes = false
-	slabPool.Put(sl)
+	sl.put()
 	return rest, err
 }
 
@@ -107,6 +115,11 @@ type deserUnion struct {
 }
 
 func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	if sl.depth >= maxDepth {
+		return nil, errTooDeep
+	}
+	sl.depth++
+	defer func() { sl.depth-- }()
 	idx, src, err := readVarint(src)
 	if err != nil {
 		return nil, err
@@ -441,6 +454,11 @@ type deserRecord struct {
 }
 
 func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	if sl.depth >= maxDepth {
+		return nil, errTooDeep
+	}
+	sl.depth++
+	defer func() { sl.depth-- }()
 	v = indirectAlloc(v)
 	k := v.Kind()
 	if k == reflect.Interface {
@@ -559,6 +577,11 @@ type deserArray struct {
 }
 
 func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	if sl.depth >= maxDepth {
+		return nil, errTooDeep
+	}
+	sl.depth++
+	defer func() { sl.depth-- }()
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
 	fixedArray := v.Kind() == reflect.Array
@@ -784,6 +807,11 @@ type deserMap struct {
 }
 
 func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+	if sl.depth >= maxDepth {
+		return nil, errTooDeep
+	}
+	sl.depth++
+	defer func() { sl.depth-- }()
 	v = indirectAlloc(v)
 	iface := v.Kind() == reflect.Interface
 	var (

@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"strings"
 
 	"testing"
 	"time"
@@ -364,8 +365,8 @@ func TestEncodeCyclicInput(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error on cyclic input, got nil")
 		}
-		if !errors.Is(err, errEncodeTooDeep) {
-			t.Fatalf("expected errEncodeTooDeep, got %v", err)
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
 		}
 	})
 	t.Run("json", func(t *testing.T) {
@@ -378,10 +379,198 @@ func TestEncodeCyclicInput(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error on cyclic input, got nil")
 		}
-		if !errors.Is(err, errEncodeTooDeep) {
-			t.Fatalf("expected errEncodeTooDeep, got %v", err)
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
 		}
 	})
+	// Struct fast path: map[string]any goes through serRecord.ser (slow
+	// path which checks depth), but a struct with a *Self field is encoded
+	// via the unsafe fast-field chain (usNullUnionRecord -> serRecordFastPtr
+	// -> field fn -> usNullUnionRecord -> ...). That chain bypasses
+	// serRecord.ser entirely, so the depth check must live on
+	// serRecordFastPtr itself.
+	type cyclicStructNode struct {
+		Value int32             `avro:"value"`
+		Next  *cyclicStructNode `avro:"next"`
+	}
+	t.Run("binary_struct", func(t *testing.T) {
+		n := &cyclicStructNode{Value: 1}
+		n.Next = n
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		_, err := s.AppendEncode(nil, n)
+		if err == nil {
+			t.Fatal("expected error on cyclic struct, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+	t.Run("json_struct", func(t *testing.T) {
+		n := &cyclicStructNode{Value: 1}
+		n.Next = n
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		_, err := s.AppendEncodeJSON(nil, n)
+		if err == nil {
+			t.Fatal("expected error on cyclic struct json, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+}
+
+// TestDecodeDeepInputDoesntPanic ensures the decoder bails with errTooDeep
+// rather than stack-overflowing on deeply nested encoded data. Mirrors
+// TestEncodeCyclicInput on the decode side. Uses the binary fast-field
+// chain (udNullUnionRecord -> deserRecordFastPtr -> field fn -> ...).
+func TestDecodeDeepInputDoesntPanic(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"Node","fields":[
+		{"name":"value","type":"int"},
+		{"name":"next","type":["null","Node"]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type node struct {
+		Value int32 `avro:"value"`
+		Next  *node `avro:"next"`
+	}
+	// Build deeply-nested binary: 5000 levels of "value=0, next=valueByte".
+	var src []byte
+	for range 5000 {
+		src = append(src, 0)    // value (zigzag 0)
+		src = append(src, 0x02) // ["null","Node"] union: idx 1 = "Node"
+	}
+	src = append(src, 0) // terminate inner-most: union idx 0 = null
+	t.Run("binary", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		var n node
+		_, err := s.Decode(src, &n)
+		if err == nil {
+			t.Fatal("expected error on deep nesting, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+	// Resolved-decode path: same recursive schema for writer and reader,
+	// goes through resolvedRecord.buildDeser which has its own depth bump.
+	t.Run("resolved", func(t *testing.T) {
+		r, err := Parse(`{"type":"record","name":"Node","fields":[
+			{"name":"value","type":"int"},
+			{"name":"next","type":["null","Node"]}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := Resolve(s, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		var n node
+		_, err = resolved.Decode(src, &n)
+		if err == nil {
+			t.Fatal("expected error on deep nesting, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+	// Skip path: reader drops the recursive "next" field, so the
+	// resolved decoder must skip the writer's deeply nested subtree
+	// via skipRecord/skipUnion.
+	t.Run("skip", func(t *testing.T) {
+		r, err := Parse(`{"type":"record","name":"Node","fields":[
+			{"name":"value","type":"int"}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := Resolve(s, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		type readerR struct {
+			Value int32 `avro:"value"`
+		}
+		var rr readerR
+		_, err = resolved.Decode(src, &rr)
+		if err == nil {
+			t.Fatal("expected error on deep skip, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+}
+
+// TestParseDeeplyNestedSchema exercises the schema-parse depth bound. A
+// schema nested past maxDepth must error rather than recurse the parser
+// to stack overflow.
+func TestParseDeeplyNestedSchema(t *testing.T) {
+	var b strings.Builder
+	const n = maxDepth + 50
+	for range n {
+		b.WriteString(`{"type":"array","items":`)
+	}
+	b.WriteString(`"int"`)
+	for range n {
+		b.WriteString(`}`)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panicked: %v", r)
+		}
+	}()
+	_, err := Parse(b.String())
+	if err == nil {
+		t.Fatal("expected parse error on deeply nested schema, got nil")
+	}
+	if !strings.Contains(err.Error(), "deeper than the supported limit") {
+		t.Fatalf("expected depth-limit error, got %v", err)
+	}
+}
+
+// TestIndirectCyclicInterfaceDoesntLoop ensures Decode/Encode reject
+// `var p any; p = &p` (a real cycle through the empty interface) instead
+// of looping forever in indirect/indirectAlloc.
+func TestIndirectCyclicInterfaceDoesntLoop(t *testing.T) {
+	s, err := Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p any
+	p = &p
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panicked: %v", r)
+		}
+	}()
+	if _, err := s.AppendEncode(nil, p); err == nil {
+		t.Fatal("expected error, got nil")
+	}
 }
 
 // TestSerArrayNilAnyElement covers the specialized serArray fast paths

@@ -296,6 +296,11 @@ func findReaderFieldIndex(r *schemaNode, writerFieldName string) int {
 
 func (rr *resolvedRecord) buildDeser() deserfn {
 	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
+		defer func() { sl.depth-- }()
 		v = indirectAlloc(v)
 		k := v.Kind()
 
@@ -320,7 +325,7 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 	// Process wire fields.
 	for _, op := range rr.wireOps {
 		if op.readerIdx < 0 {
-			if src, err = op.skip(src); err != nil {
+			if src, err = op.skip(src, sl); err != nil {
 				return nil, err
 			}
 			continue
@@ -352,7 +357,7 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 
 	for _, op := range rr.wireOps {
 		if op.readerIdx < 0 {
-			if src, err = op.skip(src); err != nil {
+			if src, err = op.skip(src, sl); err != nil {
 				return nil, err
 			}
 			continue
@@ -383,7 +388,7 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 
 	for _, op := range rr.wireOps {
 		if op.readerIdx < 0 {
-			if src, err = op.skip(src); err != nil {
+			if src, err = op.skip(src, sl); err != nil {
 				return nil, err
 			}
 			continue

@@ -6,45 +6,47 @@ import (
 	"sync"
 )
 
-// skipfn advances past an encoded Avro value without storing it.
-type skipfn func(src []byte) ([]byte, error)
+// skipfn advances past an encoded Avro value without storing it. It threads
+// the slab through purely to share the recursion-depth bound with deserfn
+// (sl.depth); skips otherwise don't need it.
+type skipfn func(src []byte, sl *slab) ([]byte, error)
 
-func skipNull(src []byte) ([]byte, error) {
+func skipNull(src []byte, _ *slab) ([]byte, error) {
 	return src, nil
 }
 
-func skipBoolean(src []byte) ([]byte, error) {
+func skipBoolean(src []byte, _ *slab) ([]byte, error) {
 	if len(src) < 1 {
 		return nil, &ShortBufferError{Type: "boolean"}
 	}
 	return src[1:], nil
 }
 
-func skipInt(src []byte) ([]byte, error) {
+func skipInt(src []byte, _ *slab) ([]byte, error) {
 	_, src, err := readVarint(src)
 	return src, err
 }
 
-func skipLong(src []byte) ([]byte, error) {
+func skipLong(src []byte, _ *slab) ([]byte, error) {
 	_, src, err := readVarlong(src)
 	return src, err
 }
 
-func skipFloat(src []byte) ([]byte, error) {
+func skipFloat(src []byte, _ *slab) ([]byte, error) {
 	if len(src) < 4 {
 		return nil, &ShortBufferError{Type: "float", Need: 4, Have: len(src)}
 	}
 	return src[4:], nil
 }
 
-func skipDouble(src []byte) ([]byte, error) {
+func skipDouble(src []byte, _ *slab) ([]byte, error) {
 	if len(src) < 8 {
 		return nil, &ShortBufferError{Type: "double", Need: 8, Have: len(src)}
 	}
 	return src[8:], nil
 }
 
-func skipBytes(src []byte) ([]byte, error) {
+func skipBytes(src []byte, _ *slab) ([]byte, error) {
 	length, src, err := readVarlong(src)
 	if err != nil {
 		return nil, err
@@ -59,12 +61,12 @@ func skipBytes(src []byte) ([]byte, error) {
 	return src[n:], nil
 }
 
-func skipString(src []byte) ([]byte, error) {
-	return skipBytes(src)
+func skipString(src []byte, sl *slab) ([]byte, error) {
+	return skipBytes(src, sl)
 }
 
 func skipFixed(size int) skipfn {
-	return func(src []byte) ([]byte, error) {
+	return func(src []byte, _ *slab) ([]byte, error) {
 		if len(src) < size {
 			return nil, &ShortBufferError{Type: "fixed", Need: size, Have: len(src)}
 		}
@@ -72,8 +74,8 @@ func skipFixed(size int) skipfn {
 	}
 }
 
-func skipEnum(src []byte) ([]byte, error) {
-	return skipInt(src)
+func skipEnum(src []byte, sl *slab) ([]byte, error) {
+	return skipInt(src, sl)
 }
 
 type skipRecordFields struct {
@@ -84,7 +86,12 @@ type skipRecordFields struct {
 
 func skipRecord(w *schemaNode) skipfn {
 	s := &skipRecordFields{node: w}
-	return func(src []byte) ([]byte, error) {
+	return func(src []byte, sl *slab) ([]byte, error) {
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
+		defer func() { sl.depth-- }()
 		s.once.Do(func() {
 			s.fields = make([]skipfn, len(s.node.fields))
 			for i := range s.node.fields {
@@ -93,7 +100,7 @@ func skipRecord(w *schemaNode) skipfn {
 		})
 		var err error
 		for _, f := range s.fields {
-			if src, err = f(src); err != nil {
+			if src, err = f(src, sl); err != nil {
 				return nil, err
 			}
 		}
@@ -103,7 +110,12 @@ func skipRecord(w *schemaNode) skipfn {
 
 func skipArray(w *schemaNode) skipfn {
 	itemSkip := buildSkip(w.items)
-	return func(src []byte) ([]byte, error) {
+	return func(src []byte, sl *slab) ([]byte, error) {
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
+		defer func() { sl.depth-- }()
 		var err error
 		for {
 			var count int64
@@ -132,7 +144,7 @@ func skipArray(w *schemaNode) skipfn {
 				continue
 			}
 			for range int(count) {
-				if src, err = itemSkip(src); err != nil {
+				if src, err = itemSkip(src, sl); err != nil {
 					return nil, err
 				}
 			}
@@ -142,7 +154,12 @@ func skipArray(w *schemaNode) skipfn {
 
 func skipMap(w *schemaNode) skipfn {
 	valueSkip := buildSkip(w.values)
-	return func(src []byte) ([]byte, error) {
+	return func(src []byte, sl *slab) ([]byte, error) {
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
+		defer func() { sl.depth-- }()
 		var err error
 		for {
 			var count int64
@@ -171,11 +188,11 @@ func skipMap(w *schemaNode) skipfn {
 			}
 			for range int(count) {
 				// Skip key (string).
-				if src, err = skipString(src); err != nil {
+				if src, err = skipString(src, sl); err != nil {
 					return nil, err
 				}
 				// Skip value.
-				if src, err = valueSkip(src); err != nil {
+				if src, err = valueSkip(src, sl); err != nil {
 					return nil, err
 				}
 			}
@@ -188,7 +205,12 @@ func skipUnion(w *schemaNode) skipfn {
 	for i, br := range w.branches {
 		branchSkips[i] = buildSkip(br)
 	}
-	return func(src []byte) ([]byte, error) {
+	return func(src []byte, sl *slab) ([]byte, error) {
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
+		defer func() { sl.depth-- }()
 		idx, src, err := readVarint(src)
 		if err != nil {
 			return nil, err
@@ -196,7 +218,7 @@ func skipUnion(w *schemaNode) skipfn {
 		if idx < 0 || int(idx) >= len(branchSkips) {
 			return nil, fmt.Errorf("union index %d out of range [0, %d)", idx, len(branchSkips))
 		}
-		return branchSkips[idx](src)
+		return branchSkips[idx](src, sl)
 	}
 }
 
@@ -229,7 +251,7 @@ func buildSkip(w *schemaNode) skipfn {
 	case "fixed":
 		return skipFixed(w.size)
 	default:
-		return func(src []byte) ([]byte, error) {
+		return func(src []byte, _ *slab) ([]byte, error) {
 			return nil, fmt.Errorf("cannot skip unknown type %q", w.kind)
 		}
 	}
@@ -237,7 +259,7 @@ func buildSkip(w *schemaNode) skipfn {
 
 // skipToDeser wraps a skipfn as a deserfn that ignores the reflect.Value.
 func skipToDeser(skip skipfn) deserfn {
-	return func(src []byte, _ reflect.Value, _ *slab) ([]byte, error) {
-		return skip(src)
+	return func(src []byte, _ reflect.Value, sl *slab) ([]byte, error) {
+		return skip(src, sl)
 	}
 }

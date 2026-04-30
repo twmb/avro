@@ -15,10 +15,19 @@ var (
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 )
 
-var errIndirectNil = errors.New("invalid nil in non-union, non-null")
+var (
+	errIndirectNil   = errors.New("invalid nil in non-union, non-null")
+	errIndirectDeep  = errors.New("pointer/interface chain on input nests too deep (cycle?)")
+)
+
+// maxIndirectDepth bounds indirect/indirectAlloc unwrap loops. A self-
+// referential interface (e.g. `var p any; p = &p`) creates a real cycle in
+// Go that would otherwise spin forever in reflect.Value.Elem(). Five levels
+// of pointer/interface wrapping is more than any realistic user value.
+const maxIndirectDepth = 5
 
 func indirect(v reflect.Value) (reflect.Value, error) {
-	for {
+	for range maxIndirectDepth {
 		switch v.Kind() {
 		case reflect.Invalid:
 			// Defensive: an invalid Value (e.g. reflect.ValueOf(nil)
@@ -34,10 +43,11 @@ func indirect(v reflect.Value) (reflect.Value, error) {
 			return v, nil
 		}
 	}
+	return v, errIndirectDeep
 }
 
 func indirectAlloc(v reflect.Value) reflect.Value {
-	for {
+	for range maxIndirectDepth {
 		switch v.Kind() {
 		case reflect.Pointer:
 			if v.IsNil() {
@@ -67,6 +77,7 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 			return v
 		}
 	}
+	return v
 }
 
 // setIface assigns rv to v, where v is an interface-kind target. Returns a

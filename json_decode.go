@@ -114,6 +114,11 @@ type jsonDecoder struct {
 // values. For typed targets (struct, int, string, etc.), it assigns
 // directly.
 func (ctx *jsonDecoder) decodeValue(v reflect.Value, node *schemaNode) error {
+	if ctx.slab.depth >= maxDepth {
+		return errTooDeep
+	}
+	ctx.slab.depth++
+	defer func() { ctx.slab.depth-- }()
 	// For custom decoders, we must produce an any value first, pass
 	// it through the decoder chain, then assign. This is the only
 	// case where typed targets go through an intermediate.

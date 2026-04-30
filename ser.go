@@ -16,13 +16,16 @@ import (
 
 type serfn func([]byte, reflect.Value, int) ([]byte, error)
 
-// maxEncodeDepth bounds the encoder's recursion depth on user-supplied
-// data. Recursive Avro schemas + cyclic input (e.g. a map[string]any
-// whose value references itself) would otherwise stack-overflow the
-// goroutine, which is fatal in Go (not recoverable via recover).
-const maxEncodeDepth = 1000
+// maxDepth bounds recursion in both the encoder and decoder. On the
+// encoder side this protects against cyclic Go input against recursive
+// schemas (stack overflow is fatal in Go). On the decoder side it
+// protects against malicious wire data driving unbounded recursion via
+// recursive schemas (e.g. linked-list "Node" with all "next" fields
+// non-null). 1000 is well below Go's stack growth limit and far above
+// any legitimate Avro depth.
+const maxDepth = 1000
 
-var errEncodeTooDeep = errors.New("avro: encode recursion limit exceeded (cyclic input?)")
+var errTooDeep = errors.New("avro: recursion limit exceeded (cyclic or pathologically deep input)")
 
 
 // AppendEncode appends the Avro binary encoding of v to dst. See
@@ -85,14 +88,14 @@ func (s *serUnion) tryUnwrapTagged(v reflect.Value) (int, reflect.Value, bool) {
 // ser encodes a union value. Tagged union maps are tried first; if
 // that fails or v is not a tagged map, each branch is tried in order.
 func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
-	if depth >= maxEncodeDepth {
-		return nil, errEncodeTooDeep
+	if depth >= maxDepth {
+		return nil, errTooDeep
 	}
 	if idx, inner, ok := s.tryUnwrapTagged(v); ok {
 		attempt := appendVarint(dst, int32(idx))
 		if result, err := s.fns[idx](attempt, inner, depth+1); err == nil {
 			return result, nil
-		} else if errors.Is(err, errEncodeTooDeep) {
+		} else if errors.Is(err, errTooDeep) {
 			return nil, err
 		}
 	}
@@ -105,7 +108,7 @@ func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 			return attempt, nil
 		}
 		// Propagate too-deep immediately; trial loop would mask it.
-		if errors.Is(err, errEncodeTooDeep) {
+		if errors.Is(err, errTooDeep) {
 			return nil, err
 		}
 	}
@@ -135,7 +138,7 @@ func serNullUnion(u *serUnion) serfn {
 			if idx == 1 {
 				if result, err := u.fns[1](append(dst, 2), inner, depth+1); err == nil {
 					return result, nil
-				} else if errors.Is(err, errEncodeTooDeep) {
+				} else if errors.Is(err, errTooDeep) {
 					return nil, err
 				}
 			}
@@ -158,7 +161,7 @@ func serNullSecondUnion(u *serUnion) serfn {
 			if idx == 0 {
 				if result, err := u.fns[0](append(dst, 0), inner, depth+1); err == nil {
 					return result, nil
-				} else if errors.Is(err, errEncodeTooDeep) {
+				} else if errors.Is(err, errTooDeep) {
 					return nil, err
 				}
 			}
@@ -541,8 +544,8 @@ type serRecord struct {
 }
 
 func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
-	if depth >= maxEncodeDepth {
-		return nil, errEncodeTooDeep
+	if depth >= maxDepth {
+		return nil, errTooDeep
 	}
 	v, err := indirect(v)
 	if err != nil {
@@ -667,8 +670,8 @@ type serArray struct {
 }
 
 func (s *serArray) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
-	if depth >= maxEncodeDepth {
-		return nil, errEncodeTooDeep
+	if depth >= maxDepth {
+		return nil, errTooDeep
 	}
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
@@ -895,8 +898,8 @@ type serMap struct {
 }
 
 func (s *serMap) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
-	if depth >= maxEncodeDepth {
-		return nil, errEncodeTooDeep
+	if depth >= maxDepth {
+		return nil, errTooDeep
 	}
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {

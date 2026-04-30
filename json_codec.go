@@ -129,7 +129,7 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 		qualifyLogical: cfg.tagLogical,
 	}
 	err := ctx.decodeValue(rv.Elem(), s.node)
-	slabPool.Put(sl)
+	sl.put()
 	return err
 }
 
@@ -138,8 +138,8 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 // JSON directly without an intermediate binary encoding step. Handles
 // structs, maps, all numeric coercions, time.Time, etc.
 func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
-	if depth >= maxEncodeDepth {
-		return nil, errEncodeTooDeep
+	if depth >= maxDepth {
+		return nil, errTooDeep
 	}
 	// Handle nil / invalid values.
 	if !v.IsValid() {
@@ -506,8 +506,8 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 
 // appendAvroJSONUnion handles union encoding.
 func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
-	if depth >= maxEncodeDepth {
-		return nil, errEncodeTooDeep
+	if depth >= maxDepth {
+		return nil, errTooDeep
 	}
 	if !v.IsValid() || (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil() {
 		// unreachable: appendAvroJSON's deref loop converts nil pointers/interfaces
@@ -526,7 +526,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 				inner := iter.Value()
 				encoded, err := appendAvroJSON(nil, inner, branch, cfg, customEncodes, depth+1)
 				if err != nil {
-					if errors.Is(err, errEncodeTooDeep) {
+					if errors.Is(err, errTooDeep) {
 						return nil, err
 					}
 					// Fall through to try-each-branch loop,
@@ -576,7 +576,7 @@ tryAll:
 		// Propagate too-deep without trying further branches; the
 		// trial loop would otherwise mask the recursion limit error
 		// behind a misleading "no branch matched".
-		if errors.Is(err, errEncodeTooDeep) {
+		if errors.Is(err, errTooDeep) {
 			return nil, err
 		}
 	}
