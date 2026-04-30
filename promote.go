@@ -33,8 +33,7 @@ func promoteIntToLong(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(int64(val)))
-		return src, nil
+		return src, setIface(v, reflect.ValueOf(int64(val)), "long")
 	}
 	return src, setLongValue(v, int64(val))
 }
@@ -46,8 +45,7 @@ func promoteIntToFloat(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(float32(val)))
-		return src, nil
+		return src, setIface(v, reflect.ValueOf(float32(val)), "float")
 	}
 	if !v.CanFloat() {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "float"}
@@ -63,8 +61,7 @@ func promoteIntToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(float64(val)))
-		return src, nil
+		return src, setIface(v, reflect.ValueOf(float64(val)), "double")
 	}
 	if !v.CanFloat() {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
@@ -80,8 +77,7 @@ func promoteLongToFloat(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(float32(val)))
-		return src, nil
+		return src, setIface(v, reflect.ValueOf(float32(val)), "float")
 	}
 	if !v.CanFloat() {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "float"}
@@ -97,8 +93,7 @@ func promoteLongToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(float64(val)))
-		return src, nil
+		return src, setIface(v, reflect.ValueOf(float64(val)), "double")
 	}
 	if !v.CanFloat() {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
@@ -115,8 +110,7 @@ func promoteFloatToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) 
 	f := float64(math.Float32frombits(u))
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(f))
-		return src, nil
+		return src, setIface(v, reflect.ValueOf(f), "double")
 	}
 	if !v.CanFloat() {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
@@ -141,8 +135,7 @@ func promoteStringToBytes(src []byte, v reflect.Value, _ *slab) ([]byte, error) 
 	copy(b, src[:n])
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(b))
-		return src[n:], nil
+		return src[n:], setIface(v, reflect.ValueOf(b), "bytes")
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		v.SetBytes(b)
@@ -166,8 +159,7 @@ func promoteBytesToString(src []byte, v reflect.Value, _ *slab) ([]byte, error) 
 	s := string(src[:n])
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(s))
-		return src[n:], nil
+		return src[n:], setIface(v, reflect.ValueOf(s), "string")
 	}
 	if v.Kind() == reflect.String {
 		v.SetString(s)

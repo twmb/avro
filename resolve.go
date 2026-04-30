@@ -341,8 +341,7 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 		m[rr.readerNames[d.readerIdx]] = elem.Interface()
 	}
 
-	v.Set(reflect.ValueOf(m))
-	return src, nil
+	return src, setIface(v, reflect.ValueOf(m), "record")
 }
 
 func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
@@ -456,7 +455,7 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 		v = indirectAlloc(v)
 		switch {
 		case v.Kind() == reflect.Interface:
-			v.Set(reflect.ValueOf(readerSymbols[ri]))
+			return src, setIface(v, reflect.ValueOf(readerSymbols[ri]), "enum")
 		case v.Kind() == reflect.String:
 			v.SetString(readerSymbols[ri])
 		case v.CanInt():
@@ -574,8 +573,7 @@ func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 				if sl.tagLogicalTypes {
 					name = ln
 				}
-				v.Set(reflect.ValueOf(map[string]any{name: v.Elem().Interface()}))
-				return src, nil
+				return src, setIface(v, reflect.ValueOf(map[string]any{name: v.Elem().Interface()}), "union")
 			}
 			return &schemaNode{
 				kind:     "union",

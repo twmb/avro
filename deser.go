@@ -117,9 +117,18 @@ func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 }
 
 // maybeWrap wraps a decoded union value with its branch name when
-// TaggedUnions is enabled and the target is *any.
+// TaggedUnions is enabled and the target is *any. Skips silently for
+// non-empty interface targets (the wrapping map[string]any wouldn't
+// satisfy them).
 func (s *deserUnion) maybeWrap(v reflect.Value, sl *slab, idx int32) {
 	if !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
+		return
+	}
+	// Skip silently if the wrapping map[string]any can't be assigned
+	// to v's interface type. Use the cached type rather than building
+	// a throwaway reflect.Value(map[string]any{}) which allocates per
+	// call.
+	if !mapStringAnyType.AssignableTo(v.Type()) {
 		return
 	}
 	name := s.branchNames[idx]
@@ -215,7 +224,18 @@ func deserBoolean(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	b := src[0] != 0
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(b))
+		// Fast path: empty interface (any) — most decode targets.
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(b))
+			return src[1:], nil
+		}
+		// Slow path: non-empty interface — guard against panic in
+		// reflect.Value.Set when bool isn't assignable.
+		rv := reflect.ValueOf(b)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+		}
+		v.Set(rv)
 		return src[1:], nil
 	}
 	if v.Kind() != reflect.Bool {
@@ -249,7 +269,15 @@ func deserFloat(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	f := math.Float32frombits(u)
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(f))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(f))
+			return src, nil
+		}
+		rv := reflect.ValueOf(f)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "float"}
+		}
+		v.Set(rv)
 		return src, nil
 	}
 	if !v.CanFloat() {
@@ -267,7 +295,15 @@ func deserDouble(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	f := math.Float64frombits(u)
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(f))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(f))
+			return src, nil
+		}
+		rv := reflect.ValueOf(f)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
+		}
+		v.Set(rv)
 		return src, nil
 	}
 	if !v.CanFloat() {
@@ -298,7 +334,15 @@ func deserBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	copy(b, src[:n])
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(b))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(b))
+			return src[n:], nil
+		}
+		rv := reflect.ValueOf(b)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
+		}
+		v.Set(rv)
 		return src[n:], nil
 	}
 	switch v.Kind() {
@@ -338,7 +382,15 @@ func deserString(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	str := sl.string(src, n)
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(str))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(str))
+			return src[n:], nil
+		}
+		rv := reflect.ValueOf(str)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
+		}
+		v.Set(rv)
 		return src[n:], nil
 	}
 	if v.Kind() == reflect.String {
@@ -396,6 +448,9 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 			m[f.name] = elem.Interface()
 			elem.SetZero()
 		}
+		if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "record"}
+		}
 		v.Set(reflect.ValueOf(m))
 		return src, nil
 	}
@@ -449,7 +504,16 @@ func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 	v = indirectAlloc(v)
 	switch {
 	case v.Kind() == reflect.Interface:
-		v.Set(reflect.ValueOf(s.symbols[idx]))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(s.symbols[idx]))
+			return src, nil
+		}
+		rv := reflect.ValueOf(s.symbols[idx])
+		if !rv.Type().AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
+		}
+		v.Set(rv)
+		return src, nil
 	case v.Kind() == reflect.String:
 		v.SetString(s.symbols[idx])
 	case v.CanInt():
@@ -510,7 +574,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		}
 		if count == 0 {
 			if iface {
-				v.Set(sliceVal)
+				return src, setIface(v, sliceVal, "array")
 			}
 			return src, nil
 		}
@@ -736,7 +800,7 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		}
 		if count == 0 {
 			if iface {
-				v.Set(mapVal)
+				return src, setIface(v, mapVal, "map")
 			}
 			return src, nil
 		}
@@ -928,7 +992,9 @@ func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	v = indirectAlloc(v)
 	switch {
 	case v.Kind() == reflect.Interface, isUUIDType(v.Type()):
-		v.Set(reflect.ValueOf(b))
+		if err := setIface(v, reflect.ValueOf(b), "fixed"); err != nil {
+			return nil, err
+		}
 	case v.Kind() == reflect.String:
 		v.SetString(uuidToString(b))
 	case v.Type().Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8:
@@ -951,8 +1017,7 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	if v.Kind() == reflect.Interface {
 		b := make([]byte, s.n)
 		copy(b, src[:s.n])
-		v.Set(reflect.ValueOf(b))
-		return src[s.n:], nil
+		return src[s.n:], setIface(v, reflect.ValueOf(b), "fixed")
 	}
 	t := v.Type()
 	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
@@ -979,7 +1044,15 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 // Returns an error if val does not fit in v's Go type.
 func setLongValue(v reflect.Value, val int64) error {
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(val))
+			return nil
+		}
+		rv := reflect.ValueOf(val)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return &SemanticError{GoType: v.Type(), AvroType: "long"}
+		}
+		v.Set(rv)
 		return nil
 	}
 	if v.CanInt() {
@@ -1003,7 +1076,15 @@ func setLongValue(v reflect.Value, val int64) error {
 // Returns an error if val does not fit in v's Go type.
 func setIntValue(v reflect.Value, val int32) error {
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(val))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(val))
+			return nil
+		}
+		rv := reflect.ValueOf(val)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return &SemanticError{GoType: v.Type(), AvroType: "int"}
+		}
+		v.Set(rv)
 		return nil
 	}
 	if v.CanInt() {
@@ -1029,7 +1110,14 @@ func deserTimestampMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == timeType {
+	if v.Kind() == reflect.Interface {
+		if v.Type().NumMethod() != 0 && !timeType.AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+		}
+		v.Set(reflect.ValueOf(timestampMillisToTime(val)))
+		return src, nil
+	}
+	if v.Type() == timeType {
 		v.Set(reflect.ValueOf(timestampMillisToTime(val)))
 		return src, nil
 	}
@@ -1042,7 +1130,14 @@ func deserTimestampMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == timeType {
+	if v.Kind() == reflect.Interface {
+		if v.Type().NumMethod() != 0 && !timeType.AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+		}
+		v.Set(reflect.ValueOf(timestampMicrosToTime(val)))
+		return src, nil
+	}
+	if v.Type() == timeType {
 		v.Set(reflect.ValueOf(timestampMicrosToTime(val)))
 		return src, nil
 	}
@@ -1055,7 +1150,14 @@ func deserTimestampNanos(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == timeType {
+	if v.Kind() == reflect.Interface {
+		if v.Type().NumMethod() != 0 && !timeType.AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+		}
+		v.Set(reflect.ValueOf(timestampNanosToTime(val)))
+		return src, nil
+	}
+	if v.Type() == timeType {
 		v.Set(reflect.ValueOf(timestampNanosToTime(val)))
 		return src, nil
 	}
@@ -1068,7 +1170,14 @@ func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == timeType {
+	if v.Kind() == reflect.Interface {
+		if v.Type().NumMethod() != 0 && !timeType.AssignableTo(v.Type()) {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
+		}
+		v.Set(reflect.ValueOf(dateToTime(val)))
+		return src, nil
+	}
+	if v.Type() == timeType {
 		v.Set(reflect.ValueOf(dateToTime(val)))
 		return src, nil
 	}
@@ -1082,8 +1191,7 @@ func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface || v.Type() == durationType {
-		v.Set(reflect.ValueOf(timeMillisToDuration(val)))
-		return src, nil
+		return src, setIface(v, reflect.ValueOf(timeMillisToDuration(val)), "int")
 	}
 	return src, setIntValue(v, val)
 }
@@ -1106,8 +1214,7 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		// silently wrap. Valid time-of-day values (< 86400000000 micros)
 		// never overflow. The value may be transient — passed to a
 		// CustomType decoder or EncodeJSON.
-		v.Set(reflect.ValueOf(timeMicrosToDuration(val)))
-		return src, nil
+		return src, setIface(v, reflect.ValueOf(timeMicrosToDuration(val)), "long")
 	}
 	return src, setLongValue(v, val)
 }
@@ -1118,8 +1225,7 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface || v.Type() == avroDurationType {
-		v.Set(reflect.ValueOf(DurationFromBytes(src[:12])))
-		return src[12:], nil
+		return src[12:], setIface(v, reflect.ValueOf(DurationFromBytes(src[:12])), "fixed")
 	}
 	// Fall back to [12]byte fixed.
 	return (&deserFixed{12}).deser(src, v, sl)
@@ -1130,8 +1236,7 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 // may fall back to the underlying bytes/fixed handler).
 func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(bytesToRat(b, scale)))
-		return true, nil
+		return true, setIface(v, reflect.ValueOf(bytesToRat(b, scale)), "decimal")
 	}
 	if v.Type() == bigRatType {
 		v.Set(reflect.ValueOf(*bytesToRat(b, scale)))
@@ -1291,8 +1396,7 @@ func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return src[n:], nil
 	}
 	if v.Kind() == reflect.Interface {
-		v.Set(reflect.ValueOf(s))
-		return src[n:], nil
+		return src[n:], setIface(v, reflect.ValueOf(s), "string")
 	}
 	if v.Kind() == reflect.String {
 		v.SetString(s)

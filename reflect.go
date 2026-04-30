@@ -20,6 +20,11 @@ var errIndirectNil = errors.New("invalid nil in non-union, non-null")
 func indirect(v reflect.Value) (reflect.Value, error) {
 	for {
 		switch v.Kind() {
+		case reflect.Invalid:
+			// Defensive: an invalid Value (e.g. reflect.ValueOf(nil)
+			// somewhere internally) reaches this guard rather than
+			// panicking on a subsequent v.Type() call. Treat as nil.
+			return v, errIndirectNil
 		case reflect.Pointer, reflect.Interface:
 			if v.IsNil() {
 				return v, errIndirectNil
@@ -43,11 +48,75 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 			if v.IsNil() {
 				return v
 			}
-			v = v.Elem()
+			// Unwrap only when the inner concrete supports
+			// in-place mutation through the unaddressable Value
+			// you get from v.Elem():
+			//   - non-nil pointer: pointee is addressable
+			//     through the pointer; deref and continue.
+			//   - non-nil map: reference type; SetMapIndex,
+			//     append-via-MakeMap, etc. work without the
+			//     map Value itself being addressable — and
+			//     reusing the existing map saves allocations
+			//     when callers Decode repeatedly into the
+			//     same *any.
+			// Anything else (primitives, structs, slices, nil
+			// pointers, ...) requires v.Set(...) on an
+			// unaddressable Value to make progress, which
+			// panics. Treat the interface itself as the
+			// destination so the decoder writes via Set on the
+			// settable interface Value instead.
+			inner := v.Elem()
+			switch inner.Kind() {
+			case reflect.Pointer:
+				if inner.IsNil() {
+					return v
+				}
+				v = inner
+			case reflect.Map:
+				v = inner
+			default:
+				return v
+			}
 		default:
 			return v
 		}
 	}
+}
+
+// setIface assigns rv to v, where v is an interface-kind target. Returns a
+// SemanticError if rv's type isn't assignable to v's interface type — the
+// common case being a user passing *interface{Foo()} as a decode target,
+// where the decoder produces a value that doesn't implement Foo. Without
+// the check, reflect.Value.Set panics with "value of type X is not
+// assignable to type Y".
+//
+// Use this on the cold paths (logical types, promoted decoders, resolved
+// records, etc.) where the per-call function-boundary cost doesn't matter.
+//
+// On the HOT primitive paths (deserBoolean / setIntValue / deserString /
+// the toAny=true branches in json_decode), do NOT use setIface. Pass rv
+// across a function boundary and escape analysis loses sight of it,
+// forcing every reflect.ValueOf(primitive) call to heap-allocate per
+// decode (~+2 allocs / +330 B per record decode in the bench). Inline the
+// check at the callsite instead, with the fast path written first so
+// rv only exists on the slow branch:
+//
+//	if v.Type().NumMethod() == 0 {        // empty interface (any) — common
+//	    v.Set(reflect.ValueOf(b))
+//	    return nil
+//	}
+//	rv := reflect.ValueOf(b)              // slow path: typed interface
+//	if !rv.Type().AssignableTo(v.Type()) {
+//	    return &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+//	}
+//	v.Set(rv)
+//	return nil
+func setIface(v, rv reflect.Value, avroType string) error {
+	if v.Type().NumMethod() == 0 || rv.Type().AssignableTo(v.Type()) {
+		v.Set(rv)
+		return nil
+	}
+	return &SemanticError{GoType: v.Type(), AvroType: avroType}
 }
 
 // fieldByIndex is like reflect.Value.FieldByIndex but allocates nil embedded

@@ -62,16 +62,26 @@ func decodeLogicalFixed(b []byte, node *schemaNode) any {
 	return b
 }
 
-// assignAny sets a native Go value on a reflect.Value target,
-// handling nil for interface targets.
-func assignAny(v reflect.Value, val any) {
+// assignAny sets a native Go value on a reflect.Value target.
+// For nil val + nilable v (interface, pointer, map, slice), zeros v.
+// For non-nil val, returns a SemanticError if val's type isn't assignable
+// to v's type — guarding against decode targets like *interface{Foo()}
+// that the produced value doesn't satisfy. Skips the AssignableTo lookup
+// for the empty-interface (any) target — the hot decode-into-*any path.
+func assignAny(v reflect.Value, val any, avroType string) error {
 	if val == nil {
-		if v.Kind() == reflect.Interface {
+		switch v.Kind() {
+		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
 			v.Set(reflect.Zero(v.Type()))
 		}
-		return
+		return nil
 	}
-	v.Set(reflect.ValueOf(val))
+	rv := reflect.ValueOf(val)
+	if v.Kind() == reflect.Interface && v.Type().NumMethod() != 0 && !rv.Type().AssignableTo(v.Type()) {
+		return &SemanticError{GoType: v.Type(), AvroType: avroType}
+	}
+	v.Set(rv)
+	return nil
 }
 
 // consumeSlabString consumes a JSON string and copies it into the slab
@@ -174,11 +184,9 @@ func (ctx *jsonDecoder) decodeWithCustom(v reflect.Value, node *schemaNode, decs
 			}
 			return err
 		}
-		assignAny(indirectAlloc(v), out)
-		return nil
+		return assignAny(indirectAlloc(v), out, node.kind)
 	}
-	assignAny(indirectAlloc(v), tmp)
-	return nil
+	return assignAny(indirectAlloc(v), tmp, node.kind)
 }
 
 func (ctx *jsonDecoder) decodeNull(v reflect.Value, toAny bool) error {
@@ -202,7 +210,15 @@ func (ctx *jsonDecoder) decodeBool(v reflect.Value, toAny bool) error {
 		return err
 	}
 	if toAny {
-		v.Set(reflect.ValueOf(b))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(b))
+			return nil
+		}
+		rv := reflect.ValueOf(b)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+		}
+		v.Set(rv)
 	} else if v.Kind() == reflect.Bool {
 		v.SetBool(b)
 	} else {
@@ -221,7 +237,15 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 		return err
 	}
 	if toAny {
-		v.Set(reflect.ValueOf(decodeLogicalInt(val, node)))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(decodeLogicalInt(val, node)))
+			return nil
+		}
+		rv := reflect.ValueOf(decodeLogicalInt(val, node))
+		if !rv.Type().AssignableTo(v.Type()) {
+			return &SemanticError{GoType: v.Type(), AvroType: "int"}
+		}
+		v.Set(rv)
 		return nil
 	}
 	// All DecodeJSON entry points produce addressable values
@@ -248,7 +272,15 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 		return err
 	}
 	if toAny {
-		v.Set(reflect.ValueOf(decodeLogicalLong(val, node)))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(decodeLogicalLong(val, node)))
+			return nil
+		}
+		rv := reflect.ValueOf(decodeLogicalLong(val, node))
+		if !rv.Type().AssignableTo(v.Type()) {
+			return &SemanticError{GoType: v.Type(), AvroType: "long"}
+		}
+		v.Set(rv)
 		return nil
 	}
 	// All DecodeJSON entry points produce addressable values (see decodeInt).
@@ -311,7 +343,15 @@ func (ctx *jsonDecoder) decodeFloat(v reflect.Value, toAny bool) error {
 		}
 	}
 	if toAny {
-		v.Set(reflect.ValueOf(f))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(f))
+			return nil
+		}
+		rv := reflect.ValueOf(f)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return &SemanticError{GoType: v.Type(), AvroType: "float"}
+		}
+		v.Set(rv)
 	} else if v.CanFloat() {
 		v.SetFloat(float64(f))
 	} else {
@@ -353,7 +393,15 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value, toAny bool) error {
 		f = f64
 	}
 	if toAny {
-		v.Set(reflect.ValueOf(f))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(f))
+			return nil
+		}
+		rv := reflect.ValueOf(f)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return &SemanticError{GoType: v.Type(), AvroType: "double"}
+		}
+		v.Set(rv)
 	} else if v.CanFloat() {
 		if v.Kind() == reflect.Float32 && !math.IsInf(f, 0) && !math.IsNaN(f) && math.IsInf(float64(float32(f)), 0) {
 			return &SemanticError{GoType: v.Type(), AvroType: "double", Err: fmt.Errorf("value %g overflows float32", f)}
@@ -371,7 +419,15 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, toAny bool) error {
 		return err
 	}
 	if toAny {
-		v.Set(reflect.ValueOf(s))
+		if v.Type().NumMethod() == 0 {
+			v.Set(reflect.ValueOf(s))
+			return nil
+		}
+		rv := reflect.ValueOf(s)
+		if !rv.Type().AssignableTo(v.Type()) {
+			return &SemanticError{GoType: v.Type(), AvroType: "string"}
+		}
+		v.Set(rv)
 	} else if v.Kind() == reflect.String {
 		v.SetString(s)
 	} else if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
@@ -398,7 +454,7 @@ func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode, toAny bool
 		return fmt.Errorf("avro json: unknown enum symbol %q", s)
 	}
 	if toAny {
-		v.Set(reflect.ValueOf(s))
+		return setIface(v, reflect.ValueOf(s), "enum")
 	} else if v.Kind() == reflect.String {
 		v.SetString(s)
 	} else {
@@ -421,8 +477,7 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny boo
 				return fmt.Errorf("avro json: invalid decimal number %q", nb)
 			}
 			if toAny {
-				v.Set(reflect.ValueOf(r))
-				return nil
+				return setIface(v, reflect.ValueOf(r), "bytes")
 			}
 			return assignDecimalRat(v, r, node)
 		}
@@ -436,8 +491,7 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny boo
 		return err
 	}
 	if toAny {
-		v.Set(reflect.ValueOf(decodeLogicalBytes(b, node)))
-		return nil
+		return setIface(v, reflect.ValueOf(decodeLogicalBytes(b, node)), "bytes")
 	}
 	return assignBytes(v, b, node)
 }
@@ -455,8 +509,7 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny boo
 				return fmt.Errorf("avro json: invalid decimal number %q", nb)
 			}
 			if toAny {
-				v.Set(reflect.ValueOf(r))
-				return nil
+				return setIface(v, reflect.ValueOf(r), "fixed")
 			}
 			return assignDecimalRat(v, r, node)
 		}
@@ -470,8 +523,7 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny boo
 		return err
 	}
 	if toAny {
-		v.Set(reflect.ValueOf(decodeLogicalFixed(b, node)))
-		return nil
+		return setIface(v, reflect.ValueOf(decodeLogicalFixed(b, node)), "fixed")
 	}
 	return assignBytes(v, b, node)
 }
@@ -550,8 +602,7 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 		if err := ctx.scanner.expect(']'); err != nil {
 			return err
 		}
-		v.Set(reflect.ValueOf(arr))
-		return nil
+		return setIface(v, reflect.ValueOf(arr), "array")
 	}
 	// Typed slice target.
 	if v.Kind() != reflect.Slice {
@@ -606,8 +657,7 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 		if err := ctx.scanner.expect('}'); err != nil {
 			return err
 		}
-		v.Set(reflect.ValueOf(m))
-		return nil
+		return setIface(v, reflect.ValueOf(m), "map")
 	}
 	// Typed map target.
 	if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
@@ -724,6 +774,9 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 	if err != nil {
 		return err
 	}
+	if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
+		return &SemanticError{GoType: v.Type(), AvroType: "record"}
+	}
 	v.Set(reflect.ValueOf(m))
 	return nil
 }
@@ -810,8 +863,7 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 								// reflect.ValueOf(nil) is the invalid zero
 								// Value, so use assignAny which sets a typed
 								// nil for interface targets.
-								assignAny(v, ctx.wrapUnion(val, branch))
-								return nil
+								return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
 							}
 						}
 					} else {
@@ -845,8 +897,7 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny
 		if toAny {
 			var val any
 			if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err == nil {
-				v.Set(reflect.ValueOf(ctx.wrapUnion(val, branch)))
-				return nil
+				return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
 			}
 		} else {
 			if err := ctx.decodeValue(v, branch); err == nil {

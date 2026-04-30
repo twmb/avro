@@ -9704,6 +9704,173 @@ func TestFixedSliceRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDecodeReuseAnyTarget covers the indirectAlloc fix. Before the fix,
+// decoding twice into the same *any panicked with "SetInt using
+// unaddressable value": the first decode populated *any with a concrete
+// (e.g. int32) value, and the second decode's indirectAlloc unwrapped the
+// non-nil interface to that unaddressable inner value, so SetInt panicked.
+// indirectAlloc now keeps the interface as the destination unless its
+// inner is a non-nil pointer (where the pointee IS addressable).
+func TestDecodeReuseAnyTarget(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		srcs    [][]byte
+		jsonSrc [][]byte
+	}{
+		{
+			name:    "int",
+			schema:  `"int"`,
+			srcs:    [][]byte{{84}, {86}, {88}},
+			jsonSrc: [][]byte{[]byte(`42`), []byte(`43`)},
+		},
+		{
+			name:    "string",
+			schema:  `"string"`,
+			srcs:    [][]byte{{2, 'a'}, {4, 'b', 'c'}, {0}},
+			jsonSrc: [][]byte{[]byte(`"a"`), []byte(`"bc"`)},
+		},
+		{
+			name:    "boolean",
+			schema:  `"boolean"`,
+			srcs:    [][]byte{{0}, {1}, {0}},
+			jsonSrc: [][]byte{[]byte(`true`), []byte(`false`)},
+		},
+		{
+			name:    "nullable union",
+			schema:  `["null","int"]`,
+			srcs:    [][]byte{{0}, {2, 84}, {0}},
+			jsonSrc: [][]byte{[]byte(`null`), []byte(`{"int":42}`)},
+		},
+		{
+			name:    "record",
+			schema:  `{"type":"record","name":"r","fields":[{"name":"x","type":"int"}]}`,
+			srcs:    [][]byte{{84}, {86}},
+			jsonSrc: [][]byte{[]byte(`{"x":1}`), []byte(`{"x":2}`)},
+		},
+		{
+			name:    "array",
+			schema:  `{"type":"array","items":"int"}`,
+			srcs:    [][]byte{{2, 84, 0}, {0}},
+			jsonSrc: [][]byte{[]byte(`[1,2]`), []byte(`[]`)},
+		},
+		{
+			name:    "map",
+			schema:  `{"type":"map","values":"int"}`,
+			srcs:    [][]byte{{2, 2, 'k', 84, 0}, {0}},
+			jsonSrc: [][]byte{[]byte(`{"k":1}`), []byte(`{}`)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"_binary", func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v any
+			for i, src := range tc.srcs {
+				if _, err := s.Decode(src, &v); err != nil {
+					t.Fatalf("decode #%d: %v", i, err)
+				}
+			}
+		})
+		t.Run(tc.name+"_json", func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v any
+			for i, src := range tc.jsonSrc {
+				if err := s.DecodeJSON(src, &v); err != nil {
+					t.Fatalf("decode #%d: %v", i, err)
+				}
+			}
+		})
+	}
+}
+
+// TestDecodeNonEmptyInterfaceTarget covers the setIface fix. Before the
+// fix, decoding any schema into *interface{Foo()} panicked with
+// "reflect.Set: value of type X is not assignable to type
+// interface{Foo()}" — reflect.Value.Set has no built-in assignability
+// guard for interface targets. The decoder now returns a SemanticError
+// from setIface instead.
+func TestDecodeNonEmptyInterfaceTarget(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		bin    []byte
+		json   string
+	}{
+		{"int", `"int"`, []byte{84}, `42`},
+		{"long", `"long"`, []byte{84}, `42`},
+		{"float", `"float"`, []byte{0, 0, 0, 0}, `0`},
+		{"double", `"double"`, []byte{0, 0, 0, 0, 0, 0, 0, 0}, `0`},
+		{"string", `"string"`, []byte{2, 'x'}, `"x"`},
+		{"bytes", `"bytes"`, []byte{0}, `""`},
+		{"boolean", `"boolean"`, []byte{1}, `true`},
+		{"enum", `{"type":"enum","name":"e","symbols":["A"]}`, []byte{0}, `"A"`},
+		{"fixed", `{"type":"fixed","name":"f","size":4}`, []byte{1, 2, 3, 4}, `"abcd"`},
+		{"array", `{"type":"array","items":"int"}`, []byte{2, 84, 0}, `[42]`},
+		{"map", `{"type":"map","values":"int"}`, []byte{0}, `{}`},
+		{"record", `{"type":"record","name":"r","fields":[{"name":"x","type":"int"}]}`, []byte{84}, `{"x":1}`},
+		{"date", `{"type":"int","logicalType":"date"}`, []byte{84}, `42`},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, []byte{84}, `42`},
+		// null branches produce nil, which IS assignable to any
+		// interface — those legitimately decode without error.
+		// Only non-null produced values need the assignability error.
+		{"nullable union value", `["null","int"]`, []byte{2, 84}, `{"int":42}`},
+		{"3-branch bare", `["null","int","string"]`, nil, `"hello"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"_binary", func(t *testing.T) {
+			if tc.bin == nil {
+				t.Skip("no binary input")
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v interface{ Foo() }
+			_, err = s.Decode(tc.bin, &v)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+		t.Run(tc.name+"_json", func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v interface{ Foo() }
+			err = s.DecodeJSON([]byte(tc.json), &v)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+	}
+}
+
 func TestSetLongValueInterface(t *testing.T) {
 	var v any
 	rv := reflect.ValueOf(&v).Elem()

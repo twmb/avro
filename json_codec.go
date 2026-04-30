@@ -429,6 +429,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error)) ([]byte, error) {
 	buf = append(buf, '{')
 	if v.Kind() == reflect.Map {
+		if v.Type().Key().Kind() != reflect.String {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "record"}
+		}
 		// map[string]any fast path: MapIndex allocates via reflect.copyVal
 		// for each interface{} element; direct lookup skips that.
 		if v.Type() == mapStringAnyType {
