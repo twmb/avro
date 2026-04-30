@@ -1252,8 +1252,12 @@ func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, err
 	}
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == durationType {
+	if v.Kind() == reflect.Interface {
 		return src, setIface(v, reflect.ValueOf(timeMillisToDuration(val)), "int")
+	}
+	if v.Type() == durationType {
+		v.Set(reflect.ValueOf(timeMillisToDuration(val)))
+		return src, nil
 	}
 	return src, setIntValue(v, val)
 }
@@ -1286,8 +1290,12 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
 	}
 	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface || v.Type() == avroDurationType {
+	if v.Kind() == reflect.Interface {
 		return src[12:], setIface(v, reflect.ValueOf(DurationFromBytes(src[:12])), "fixed")
+	}
+	if v.Type() == avroDurationType {
+		v.Set(reflect.ValueOf(DurationFromBytes(src[:12])))
+		return src[12:], nil
 	}
 	// Fall back to [12]byte fixed.
 	return (&deserFixed{12}).deser(src, v, sl)

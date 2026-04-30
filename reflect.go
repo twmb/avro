@@ -80,20 +80,23 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 	return v
 }
 
-// setIface assigns rv to v with a type-compatibility check, primarily
-// for interface-kind targets. Returns a SemanticError if rv's type
-// isn't assignable to v's type — the common case being a user passing
+// setIface assigns rv to an interface-kind v with an assignability
+// check. Returns a SemanticError if rv's type isn't assignable to v's
+// interface type — the common case being a user passing
 // *interface{Foo()} as a decode target, where the decoder produces a
 // value that doesn't implement Foo. Without the check, reflect.Value.Set
 // panics with "value of type X is not assignable to type Y".
 //
-// Concrete-kind v is also accepted when rv.Type() exactly matches
-// v.Type() (e.g. logical-type decoders setting time.Time / time.Duration
-// / *big.Rat into a typed field). In that case the NumMethod() == 0
-// shortcut hits and we Set directly. Callers must ensure rv's type
-// remains compatible — a future change that produces an rv of a
-// different type would silently panic on Set, since the AssignableTo
-// branch only runs when v has methods.
+// Caller contract: v.Kind() must be reflect.Interface. Concrete-kind v
+// is rejected with a SemanticError rather than silently calling Set.
+// The previous NumMethod()==0 shortcut would have spuriously
+// short-circuited on any methodless concrete type (e.g. [16]byte,
+// time.Duration), so a future change that produced an rv of a
+// mismatched type would have panicked on Set. Concrete-target paths
+// must split the dispatch at the call site — see deserFixedUUIDReflect
+// (Interface vs isUUIDType arms), deserTimeMillis (Interface vs
+// durationType), and deserDuration (Interface vs avroDurationType) for
+// the pattern.
 //
 // Use this on the cold paths (logical types, promoted decoders, resolved
 // records, etc.) where the per-call function-boundary cost doesn't matter.
@@ -117,6 +120,9 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 //	v.Set(rv)
 //	return nil
 func setIface(v, rv reflect.Value, avroType string) error {
+	if v.Kind() != reflect.Interface {
+		return &SemanticError{GoType: v.Type(), AvroType: avroType}
+	}
 	if v.Type().NumMethod() == 0 || rv.Type().AssignableTo(v.Type()) {
 		v.Set(rv)
 		return nil
