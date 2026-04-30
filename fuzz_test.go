@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -1468,5 +1469,169 @@ func FuzzTimeDateEdgeCases(f *testing.F) {
 		}
 		var v2 any
 		s.DecodeJSON(jsonEncoded, &v2)
+	})
+}
+
+// FuzzDepthBounds drives every encode/decode/skip/parse path with
+// pathologically deep or cyclic inputs and asserts the library
+// terminates with an error rather than panicking, hanging, or
+// stack-overflowing. Specifically targets the depth-bound work in
+// commits a302d51 and 21006ca: cyclic Go inputs, deeply nested wire
+// data, deeply nested schemas, self-referential interfaces.
+func FuzzDepthBounds(f *testing.F) {
+	// nesting: how many record levels deep to recurse (binary input).
+	// arrayCount: how many array blocks to chain (each with one item).
+	// schemaDepth: nesting depth for the auto-generated array<array<...>> schema.
+	// mode: which subtest to run (0..7).
+	f.Add(uint16(2000), uint16(100), uint16(50), uint8(0))
+	f.Add(uint16(5000), uint16(500), uint16(2000), uint8(1))
+	f.Add(uint16(100), uint16(10), uint16(maxDepth+10), uint8(2))
+	f.Add(uint16(50), uint16(50), uint16(10), uint8(3))
+	f.Add(uint16(0), uint16(0), uint16(0), uint8(4))
+	f.Add(uint16(maxDepth+50), uint16(0), uint16(0), uint8(5))
+	f.Add(uint16(10), uint16(maxDepth+50), uint16(0), uint8(6))
+	f.Add(uint16(0), uint16(0), uint16(0), uint8(7))
+
+	recursiveSchema := `{"type":"record","name":"Node","fields":[
+		{"name":"value","type":"int"},
+		{"name":"next","type":["null","Node"]}
+	]}`
+	rs, err := Parse(recursiveSchema)
+	if err != nil {
+		f.Fatal(err)
+	}
+	type node struct {
+		Value int32 `avro:"value"`
+		Next  *node `avro:"next"`
+	}
+
+	f.Fuzz(func(t *testing.T, nesting, arrayCount, schemaDepth uint16, mode uint8) {
+		// Hard caps to keep individual fuzz iterations bounded. The
+		// schemaDepth cap is tight because encoding/json's recursive
+		// parser is O(N²) on nested-array JSON — well past maxDepth
+		// we just burn time in the stdlib without exercising more
+		// of our code.
+		if nesting > 20000 {
+			nesting = 20000
+		}
+		if arrayCount > 5000 {
+			arrayCount = 5000
+		}
+		if schemaDepth > maxDepth+200 {
+			schemaDepth = maxDepth + 200
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked (mode=%d, n=%d, a=%d, sd=%d): %v",
+					mode, nesting, arrayCount, schemaDepth, r)
+			}
+		}()
+
+		switch mode % 8 {
+		case 0:
+			// Deeply nested binary into recursive struct.
+			var src []byte
+			for range int(nesting) {
+				src = append(src, 0, 0x02)
+			}
+			src = append(src, 0)
+			var n node
+			rs.Decode(src, &n)
+		case 1:
+			// Deeply nested binary into resolved decode (writer == reader).
+			var src []byte
+			for range int(nesting) {
+				src = append(src, 0, 0x02)
+			}
+			src = append(src, 0)
+			resolved, err := Resolve(rs, rs)
+			if err != nil {
+				return
+			}
+			var n node
+			resolved.Decode(src, &n)
+		case 2:
+			// Deeply nested binary skipped via resolve (reader drops "next").
+			rdrSchema, err := Parse(`{"type":"record","name":"Node","fields":[{"name":"value","type":"int"}]}`)
+			if err != nil {
+				return
+			}
+			resolved, err := Resolve(rs, rdrSchema)
+			if err != nil {
+				return
+			}
+			var src []byte
+			for range int(nesting) {
+				src = append(src, 0, 0x02)
+			}
+			src = append(src, 0)
+			type rR struct{ Value int32 `avro:"value"` }
+			var rv rR
+			resolved.Decode(src, &rv)
+		case 3:
+			// Deeply nested JSON into recursive struct.
+			var src []byte
+			for range int(nesting) {
+				src = append(src, []byte(`{"value":0,"next":{"Node":`)...)
+			}
+			src = append(src, []byte(`{"value":0,"next":null}`)...)
+			for range int(nesting) {
+				src = append(src, []byte(`}}`)...)
+			}
+			var n node
+			rs.DecodeJSON(src, &n)
+		case 4:
+			// Cyclic struct encode (binary + JSON) through unsafe fast path.
+			n := &node{Value: 1}
+			n.Next = n
+			rs.AppendEncode(nil, n)
+			rs.AppendEncodeJSON(nil, n)
+		case 5:
+			// Schema-parse depth bound.
+			var b strings.Builder
+			d := int(schemaDepth)
+			if d == 0 {
+				d = maxDepth + 50
+			}
+			for range d {
+				b.WriteString(`{"type":"array","items":`)
+			}
+			b.WriteString(`"int"`)
+			for range d {
+				b.WriteString(`}`)
+			}
+			Parse(b.String())
+		case 6:
+			// Long array-block chain (count > buffer is rejected; this
+			// makes many small blocks each terminating with count=0).
+			var src []byte
+			for range int(arrayCount) {
+				src = append(src, 0x02) // count=1
+				src = append(src, 0)    // single item: int(0)
+			}
+			src = append(src, 0) // terminator
+			arrSchema, err := Parse(`{"type":"array","items":"int"}`)
+			if err != nil {
+				return
+			}
+			var out []int32
+			arrSchema.Decode(src, &out)
+		case 7:
+			// Self-referential `any` against various schemas.
+			intS, err := Parse(`"int"`)
+			if err != nil {
+				return
+			}
+			nullableS, err := Parse(`["null","int"]`)
+			if err != nil {
+				return
+			}
+			var p any
+			p = &p
+			intS.AppendEncode(nil, p)
+			intS.AppendEncodeJSON(nil, p)
+			nullableS.AppendEncode(nil, p)
+			nullableS.AppendEncodeJSON(nil, p)
+		}
 	})
 }
