@@ -806,7 +806,11 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 						if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err == nil {
 							if ctx.scanner.peek() == '}' {
 								ctx.scanner.pos++
-								v.Set(reflect.ValueOf(ctx.wrapUnion(val, branch)))
+								// wrapUnion returns nil for null branches;
+								// reflect.ValueOf(nil) is the invalid zero
+								// Value, so use assignAny which sets a typed
+								// nil for interface targets.
+								assignAny(v, ctx.wrapUnion(val, branch))
 								return nil
 							}
 						}

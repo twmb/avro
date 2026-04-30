@@ -313,6 +313,45 @@ func TestDecodeJSONIntoStruct(t *testing.T) {
 	}
 }
 
+// TestDecodeJSONUnionTaggedNullIntoAny exercises the union object decode
+// path at json_decode.go:809 / 844. When the JSON is a tagged union object
+// whose branch is "null" (e.g. {"null":null}), the inner decode produces
+// nil, wrapUnion returns nil, and the previous code did
+// v.Set(reflect.ValueOf(nil)) — which panics with "reflect.Value.Set on
+// zero Value". The decode should produce a nil any, not panic.
+func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		src    string
+		opts   []Opt
+	}{
+		{"two-branch null bare", `["null","int"]`, `null`, nil},
+		{"two-branch null tagged", `["null","int"]`, `{"null":null}`, nil},
+		{"two-branch null tagged with TaggedUnions", `["null","int"]`, `{"null":null}`, []Opt{TaggedUnions()}},
+		{"three-branch null tagged", `["null","int","string"]`, `{"null":null}`, nil},
+		{"three-branch null tagged with TaggedUnions", `["null","int","string"]`, `{"null":null}`, []Opt{TaggedUnions()}},
+		{"record with nullable any field, tagged null inner", `{"type":"record","name":"r","fields":[{"name":"x","type":["null","int"]}]}`, `{"x":{"null":null}}`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v any
+			if err := s.DecodeJSON([]byte(tc.src), &v, tc.opts...); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+		})
+	}
+}
+
 func TestDecodeJSONInvalidUnion(t *testing.T) {
 	s, err := Parse(`["null","string"]`)
 	if err != nil {
