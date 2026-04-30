@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"strings"
 
 	"testing"
 	"time"
@@ -298,6 +299,398 @@ func TestSerRecordAsMap(t *testing.T) {
 	})
 }
 
+func TestSerRecordMapNullField(t *testing.T) {
+	t.Run("nil value for non-nullable field returns error not panic", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"id","type":"int"},
+			{"name":"name","type":"string"}
+		]}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]any{"id": int32(1), "name": nil}
+		_, err = s.AppendEncode(nil, &m)
+		if err == nil {
+			t.Fatal("expected error encoding nil into non-nullable string field, got nil")
+		}
+	})
+
+	t.Run("nil value for nullable union field encodes as null branch", func(t *testing.T) {
+		schema := `{"type":"record","name":"r","fields":[
+			{"name":"id","type":"int"},
+			{"name":"name","type":["null","string"]}
+		]}`
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]any{"id": int32(1), "name": nil}
+		dst, err := s.AppendEncode(nil, &m)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[string]any
+		if _, err := s.Decode(dst, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got["name"] != nil {
+			t.Fatalf("expected nil, got %v", got["name"])
+		}
+	})
+}
+
+// TestEncodeCyclicInput covers the depth-bound fix. A cyclic
+// map[string]any (m["next"] = m) against a recursive schema would
+// otherwise stack-overflow the goroutine — fatal in Go (not
+// recoverable via recover). The encoder now bails with a clean error.
+// Both the binary and JSON encoders are covered.
+func TestEncodeCyclicInput(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"Node","fields":[
+		{"name":"value","type":"int"},
+		{"name":"next","type":["null","Node"]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := map[string]any{"value": int32(1)}
+	node["next"] = node
+	t.Run("binary", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		_, err := s.AppendEncode(nil, node)
+		if err == nil {
+			t.Fatal("expected error on cyclic input, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+	t.Run("json", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		_, err := s.AppendEncodeJSON(nil, node)
+		if err == nil {
+			t.Fatal("expected error on cyclic input, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+	// Struct fast path: map[string]any goes through serRecord.ser (slow
+	// path which checks depth), but a struct with a *Self field is encoded
+	// via the unsafe fast-field chain (usNullUnionRecord -> serRecordFastPtr
+	// -> field fn -> usNullUnionRecord -> ...). That chain bypasses
+	// serRecord.ser entirely, so the depth check must live on
+	// serRecordFastPtr itself.
+	type cyclicStructNode struct {
+		Value int32             `avro:"value"`
+		Next  *cyclicStructNode `avro:"next"`
+	}
+	t.Run("binary_struct", func(t *testing.T) {
+		n := &cyclicStructNode{Value: 1}
+		n.Next = n
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		_, err := s.AppendEncode(nil, n)
+		if err == nil {
+			t.Fatal("expected error on cyclic struct, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+	t.Run("json_struct", func(t *testing.T) {
+		n := &cyclicStructNode{Value: 1}
+		n.Next = n
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		_, err := s.AppendEncodeJSON(nil, n)
+		if err == nil {
+			t.Fatal("expected error on cyclic struct json, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+}
+
+// TestDecodeDeepInputDoesntPanic ensures the decoder bails with errTooDeep
+// rather than stack-overflowing on deeply nested encoded data. Mirrors
+// TestEncodeCyclicInput on the decode side. Uses the binary fast-field
+// chain (udNullUnionRecord -> deserRecordFastPtr -> field fn -> ...).
+func TestDecodeDeepInputDoesntPanic(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"Node","fields":[
+		{"name":"value","type":"int"},
+		{"name":"next","type":["null","Node"]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type node struct {
+		Value int32 `avro:"value"`
+		Next  *node `avro:"next"`
+	}
+	// Build deeply-nested binary: 5000 levels of "value=0, next=valueByte".
+	var src []byte
+	for range 5000 {
+		src = append(src, 0)    // value (zigzag 0)
+		src = append(src, 0x02) // ["null","Node"] union: idx 1 = "Node"
+	}
+	src = append(src, 0) // terminate inner-most: union idx 0 = null
+	t.Run("binary", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		var n node
+		_, err := s.Decode(src, &n)
+		if err == nil {
+			t.Fatal("expected error on deep nesting, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+	// Resolved-decode path: same recursive schema for writer and reader,
+	// goes through resolvedRecord.buildDeser which has its own depth bump.
+	t.Run("resolved", func(t *testing.T) {
+		r, err := Parse(`{"type":"record","name":"Node","fields":[
+			{"name":"value","type":"int"},
+			{"name":"next","type":["null","Node"]}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := Resolve(s, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		var n node
+		_, err = resolved.Decode(src, &n)
+		if err == nil {
+			t.Fatal("expected error on deep nesting, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+	// Skip path: reader drops the recursive "next" field, so the
+	// resolved decoder must skip the writer's deeply nested subtree
+	// via skipRecord/skipUnion.
+	t.Run("skip", func(t *testing.T) {
+		r, err := Parse(`{"type":"record","name":"Node","fields":[
+			{"name":"value","type":"int"}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := Resolve(s, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		type readerR struct {
+			Value int32 `avro:"value"`
+		}
+		var rr readerR
+		_, err = resolved.Decode(src, &rr)
+		if err == nil {
+			t.Fatal("expected error on deep skip, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+	// JSON union trial loop: decodeUnionObject and decodeUnionBare iterate
+	// each branch on failure. The per-branch error must propagate
+	// errTooDeep rather than being swallowed and reported as
+	// "no union branch matched". Builds deeply-nested JSON for a
+	// recursive ["null","Node"] schema; at maxDepth the decode must
+	// surface errTooDeep, not the trial-loop's generic error.
+	t.Run("json_union_trial_propagates", func(t *testing.T) {
+		var src []byte
+		for range 5000 {
+			src = append(src, []byte(`{"value":0,"next":{"Node":`)...)
+		}
+		src = append(src, []byte(`{"value":0,"next":null}`)...)
+		for range 5000 {
+			src = append(src, []byte(`}}`)...)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		// Decode into *any so decodeUnionObject's toAny=true branch
+		// runs (the path the bug was in).
+		var out any
+		err := s.DecodeJSON(src, &out)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, errTooDeep) {
+			t.Fatalf("expected errTooDeep, got %v", err)
+		}
+	})
+}
+
+// TestParseDeeplyNestedSchema exercises the schema-parse depth bound. A
+// schema nested past maxDepth must error rather than recurse the parser
+// to stack overflow.
+func TestParseDeeplyNestedSchema(t *testing.T) {
+	var b strings.Builder
+	const n = maxDepth + 50
+	for range n {
+		b.WriteString(`{"type":"array","items":`)
+	}
+	b.WriteString(`"int"`)
+	for range n {
+		b.WriteString(`}`)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panicked: %v", r)
+		}
+	}()
+	_, err := Parse(b.String())
+	if err == nil {
+		t.Fatal("expected parse error on deeply nested schema, got nil")
+	}
+	if !strings.Contains(err.Error(), "deeper than the supported limit") {
+		t.Fatalf("expected depth-limit error, got %v", err)
+	}
+}
+
+// TestIndirectCyclicInterfaceDoesntLoop ensures every pointer/interface
+// unwrap loop in the library (indirect, indirectAlloc, isNilValue,
+// appendAvroJSON's deref, customEncode's deref) caps at
+// maxIndirectDepth so `var p any; p = &p` (a real cycle through the
+// empty interface) terminates instead of spinning forever.
+func TestIndirectCyclicInterfaceDoesntLoop(t *testing.T) {
+	s, err := Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p any
+	p = &p
+	t.Run("binary", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		if _, err := s.AppendEncode(nil, p); err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+	t.Run("json", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		if _, err := s.AppendEncodeJSON(nil, p); err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+	// Nullable union: encoder consults isNilValue first, which has its
+	// own unwrap loop. Without the cap this hangs.
+	t.Run("nullable_union", func(t *testing.T) {
+		s2, err := Parse(`["null","int"]`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		if _, err := s2.AppendEncode(nil, p); err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+}
+
+// TestSerArrayNilAnyElement covers the specialized serArray fast paths
+// (string/boolean/int/long/float/double item types). A nil interface element
+// in []any unwraps to an invalid reflect.Value; calling .Type() / .Bool() /
+// .Int() on it panics. Each path must return an error, not crash.
+func TestSerArrayNilAnyElement(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		v      any
+	}{
+		{"string", `{"type":"array","items":"string"}`, []any{"a", nil}},
+		{"boolean", `{"type":"array","items":"boolean"}`, []any{true, nil}},
+		{"int", `{"type":"array","items":"int"}`, []any{int32(1), nil}},
+		{"long", `{"type":"array","items":"long"}`, []any{int64(1), nil}},
+		{"float", `{"type":"array","items":"float"}`, []any{float32(1), nil}},
+		{"double", `{"type":"array","items":"double"}`, []any{float64(1), nil}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			encodeErr(t, tc.schema, tc.v)
+		})
+	}
+}
+
+// TestSerMapNilAnyValue covers the specialized serMap fast paths (same set
+// of value types). Nil interface values in map[string]any have the same
+// panic shape as TestSerArrayNilAnyElement.
+func TestSerMapNilAnyValue(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		v      any
+	}{
+		{"string", `{"type":"map","values":"string"}`, map[string]any{"k": nil}},
+		{"boolean", `{"type":"map","values":"boolean"}`, map[string]any{"k": nil}},
+		{"int", `{"type":"map","values":"int"}`, map[string]any{"k": nil}},
+		{"long", `{"type":"map","values":"long"}`, map[string]any{"k": nil}},
+		{"float", `{"type":"map","values":"float"}`, map[string]any{"k": nil}},
+		{"double", `{"type":"map","values":"double"}`, map[string]any{"k": nil}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			encodeErr(t, tc.schema, tc.v)
+		})
+	}
+}
+
 func TestSerUnionAllFail(t *testing.T) {
 	encodeErr(t, `["null","int"]`, ptr("hello"))
 }
@@ -306,12 +699,12 @@ func TestSerNullNonNilableType(t *testing.T) {
 	// serNull should not panic when given a non-nilable type (int, string, etc.).
 	// It should return errNonNil, not crash.
 	v := reflect.ValueOf(42)
-	_, err := serNull(nil, v)
+	_, err := serNull(nil, v, 0)
 	if err != errNonNil {
 		t.Fatalf("expected errNonNil, got %v", err)
 	}
 	v = reflect.ValueOf("hello")
-	_, err = serNull(nil, v)
+	_, err = serNull(nil, v, 0)
 	if err != errNonNil {
 		t.Fatalf("expected errNonNil, got %v", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -637,26 +638,40 @@ func FuzzDecodeJSONRoundTrip(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, idx uint8, input string) {
 		s := fuzzSchemas[int(idx)%len(fuzzSchemas)]
+		// Postel: input may be non-canonical (lenient decode is OK).
+		// Re-encoding produces canonical output. Test canonical
+		// idempotence: encode → decode → encode must be stable.
+		// Asserting bit-exact equality with the original bytes is
+		// wrong under Postel — non-canonical input legitimately
+		// canonicalizes on the first encode.
 		var v1 any
 		if err := s.DecodeJSON([]byte(input), &v1); err != nil {
 			return
 		}
-		encoded, err := s.EncodeJSON(v1)
+		encoded1, err := s.EncodeJSON(v1)
 		if err != nil {
 			return
 		}
 		var v2 any
-		if err := s.DecodeJSON(encoded, &v2); err != nil {
-			t.Fatalf("re-decode failed: %v\n  input: %s\n  encoded: %s", err, input, encoded)
+		if err := s.DecodeJSON(encoded1, &v2); err != nil {
+			t.Fatalf("re-decode of canonical encoded failed: %v\n  input: %s\n  encoded: %s", err, input, encoded1)
 		}
-		if !fuzzEqual(v1, v2) {
-			t.Fatalf("round-trip mismatch:\n  v1: %#v\n  v2: %#v\n  input: %s\n  encoded: %s", v1, v2, input, encoded)
+		encoded2, err := s.EncodeJSON(v2)
+		if err != nil {
+			t.Fatalf("re-encode of canonical value failed: %v", err)
+		}
+		if !bytes.Equal(encoded1, encoded2) {
+			t.Fatalf("encode is not idempotent on canonical input:\n  encoded1: %s\n  encoded2: %s\n  input:    %s", encoded1, encoded2, input)
 		}
 	})
 }
 
 // FuzzEncodeTaggedUnion verifies that Encode accepts tagged union maps
-// from Decode(TaggedUnions) and produces identical binary.
+// from Decode(TaggedUnions) and produces canonical binary that is
+// stable across additional encode/decode passes (canonical idempotence
+// — Postel: lenient decode + strict canonical encode means
+// non-canonical input legitimately canonicalizes on the first encode,
+// so bit-exact-with-input comparison is the wrong assertion).
 func FuzzEncodeTaggedUnion(f *testing.F) {
 	seeds := []struct {
 		idx  uint8
@@ -676,17 +691,29 @@ func FuzzEncodeTaggedUnion(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, idx uint8, data []byte) {
 		s := fuzzSchemas[int(idx)%len(fuzzSchemas)]
-		var tagged any
-		rem, err := s.Decode(data, &tagged, TaggedUnions())
+		var tagged1 any
+		rem, err := s.Decode(data, &tagged1, TaggedUnions())
 		if err != nil || len(rem) != 0 {
 			return
 		}
-		reencoded, err := s.Encode(tagged)
+		encoded1, err := s.Encode(tagged1)
 		if err != nil {
 			return
 		}
-		if !bytes.Equal(data, reencoded) {
-			t.Fatalf("tagged round-trip mismatch:\n  original: %x\n  reencoded: %x", data, reencoded)
+		// Canonical idempotence: re-decoding the encoded bytes and
+		// re-encoding must produce the same bytes. Comparing to the
+		// ORIGINAL data is wrong under Postel — e.g. boolean byte
+		// 0x30 decodes to true and encodes to 0x01.
+		var tagged2 any
+		if _, err := s.Decode(encoded1, &tagged2, TaggedUnions()); err != nil {
+			t.Fatalf("re-decode of canonical encoded failed: %v\n  encoded1: %x", err, encoded1)
+		}
+		encoded2, err := s.Encode(tagged2)
+		if err != nil {
+			t.Fatalf("re-encode of canonical value failed: %v", err)
+		}
+		if !bytes.Equal(encoded1, encoded2) {
+			t.Fatalf("encode is not idempotent on canonical input:\n  encoded1: %x\n  encoded2: %x", encoded1, encoded2)
 		}
 	})
 }
@@ -999,5 +1026,620 @@ func FuzzResolve(f *testing.F) {
 		}
 		var v any
 		resolved.Decode(data, &v)
+	})
+}
+
+// FuzzDecodeVariedTargets fuzzes binary decode against many target shapes,
+// not just *any. The pre-existing FuzzDecode only used `var v any` and
+// missed:
+//   - panics when decoding into *interface{Foo()} / *error / etc.
+//   - panics when decoding into a struct with non-empty-interface fields
+//   - panics on re-decode into a populated *any (the inner unwraps to
+//     unaddressable Value)
+// The driver's `mode` byte selects the target shape; data bytes are the
+// wire input. All schemas come from fuzzSchemas. No panic is ever
+// expected — every target/data combo must surface as a returned error.
+func FuzzDecodeVariedTargets(f *testing.F) {
+	type IfaceField struct {
+		X interface{ Foo() } `avro:"x"`
+	}
+	type ErrorField struct {
+		X error `avro:"x"`
+	}
+
+	makeTarget := func(mode uint8) any {
+		switch mode % 12 {
+		case 0:
+			var v any
+			return &v
+		case 1:
+			var v interface{ Foo() }
+			return &v
+		case 2:
+			var v error
+			return &v
+		case 3:
+			var v map[string]any
+			return &v
+		case 4:
+			var v []any
+			return &v
+		case 5:
+			var v IfaceField
+			return &v
+		case 6:
+			var v ErrorField
+			return &v
+		case 7:
+			var v int32
+			return &v
+		case 8:
+			var v *int32
+			return &v
+		case 9:
+			var v string
+			return &v
+		case 10:
+			// Pre-populated *any so the inner-Value path runs.
+			v := any(int32(99))
+			return &v
+		case 11:
+			// Pre-populated *any holding a slice (not a map — exercises
+			// the unwrap-only-Map rule).
+			v := any([]any{int32(1)})
+			return &v
+		}
+		var v any
+		return &v
+	}
+
+	// Seed every (schema, target_kind) pair with a valid binary encoding
+	// plus an empty buffer.
+	for i := range fuzzSchemas {
+		for mode := uint8(0); mode < 12; mode++ {
+			f.Add(uint8(i), mode, []byte{})
+			f.Add(uint8(i), mode, []byte{0})
+			f.Add(uint8(i), mode, []byte{2, 'x'})
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx, mode uint8, data []byte) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		tgt := makeTarget(mode)
+		// Decode in either tagged or untagged mode based on a low bit of
+		// mode — every option combo must be panic-free.
+		if mode&0x80 != 0 {
+			s.Decode(data, tgt, TaggedUnions())
+		} else {
+			s.Decode(data, tgt)
+		}
+	})
+}
+
+// FuzzDecodeJSONVariedTargets is the JSON-decode counterpart to
+// FuzzDecodeVariedTargets.
+func FuzzDecodeJSONVariedTargets(f *testing.F) {
+	type IfaceField struct {
+		X interface{ Foo() } `avro:"x"`
+	}
+
+	makeTarget := func(mode uint8) any {
+		switch mode % 9 {
+		case 0:
+			var v any
+			return &v
+		case 1:
+			var v interface{ Foo() }
+			return &v
+		case 2:
+			var v error
+			return &v
+		case 3:
+			var v map[string]any
+			return &v
+		case 4:
+			var v IfaceField
+			return &v
+		case 5:
+			var v int32
+			return &v
+		case 6:
+			var v string
+			return &v
+		case 7:
+			v := any(int32(0))
+			return &v
+		case 8:
+			v := any(map[string]any{})
+			return &v
+		}
+		var v any
+		return &v
+	}
+
+	for i := range fuzzSchemas {
+		for mode := uint8(0); mode < 9; mode++ {
+			for _, src := range []string{
+				`null`, `42`, `"x"`, `true`, `[]`, `{}`,
+				`{"int":1}`, `{"null":null}`, `{"x":1}`,
+			} {
+				f.Add(uint8(i), mode, src)
+			}
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx, mode uint8, src string) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		tgt := makeTarget(mode)
+		if mode&0x80 != 0 {
+			s.DecodeJSON([]byte(src), tgt, TaggedUnions())
+		} else {
+			s.DecodeJSON([]byte(src), tgt)
+		}
+	})
+}
+
+// FuzzDecodeReuse repeatedly decodes into the same *any target.
+// This is the common streaming pattern (OCF reader, batch consumer) and
+// the pre-existing fuzzers all created a fresh target per iteration.
+// That blind spot hid the indirectAlloc panic where the *any's inner
+// becomes unaddressable on the second decode.
+func FuzzDecodeReuse(f *testing.F) {
+	for i := range fuzzSchemas {
+		f.Add(uint8(i), []byte{0}, []byte{0})
+		f.Add(uint8(i), []byte{}, []byte{})
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx uint8, data1, data2 []byte) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		var v any
+		s.Decode(data1, &v)
+		// Second call into same target — the bug manifests here.
+		s.Decode(data2, &v)
+		// Third for good measure.
+		s.Decode(data1, &v)
+	})
+}
+
+// FuzzDecodeJSONReuse: JSON counterpart to FuzzDecodeReuse.
+func FuzzDecodeJSONReuse(f *testing.F) {
+	for i := range fuzzSchemas {
+		f.Add(uint8(i), `null`, `null`)
+		f.Add(uint8(i), `42`, `43`)
+		f.Add(uint8(i), `{}`, `{}`)
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx uint8, src1, src2 string) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		var v any
+		s.DecodeJSON([]byte(src1), &v)
+		s.DecodeJSON([]byte(src2), &v)
+	})
+}
+
+// FuzzEncodeHostile fuzzes the encoder with values that mix nils, weird
+// types, and tagged-union maps with bogus branch keys against every
+// schema. None should panic — only return errors.
+func FuzzEncodeHostile(f *testing.F) {
+	type S struct {
+		X any            `avro:"x"`
+		A []any          `avro:"a"`
+		M map[string]any `avro:"m"`
+	}
+
+	makeValue := func(mode uint8) any {
+		switch mode % 16 {
+		case 0:
+			return nil
+		case 1:
+			return any(nil)
+		case 2:
+			return (*int)(nil)
+		case 3:
+			return map[string]any{"x": nil}
+		case 4:
+			return []any{nil, int32(1), nil}
+		case 5:
+			return map[string]any{"int": nil}
+		case 6:
+			return map[string]any{"null": nil}
+		case 7:
+			return map[string]any{"unknown_branch": int32(1)}
+		case 8:
+			return map[string]any{"x": []any{nil}}
+		case 9:
+			return map[string]any{"x": map[string]any{"k": nil}}
+		case 10:
+			return S{X: nil, A: []any{nil}, M: map[string]any{"k": nil}}
+		case 11:
+			return map[int]int{1: 1} // non-string-keyed map
+		case 12:
+			return map[any]any{1: 1}
+		case 13:
+			return json.Number("garbage")
+		case 14:
+			return map[string]any{"x": json.Number("not-a-number")}
+		case 15:
+			return []any{int32(1), "string", nil, true, 3.14}
+		}
+		return nil
+	}
+
+	for i := range fuzzSchemas {
+		for mode := uint8(0); mode < 16; mode++ {
+			f.Add(uint8(i), mode)
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, schemaIdx, mode uint8) {
+		s := fuzzSchemas[int(schemaIdx)%len(fuzzSchemas)]
+		v := makeValue(mode)
+		// Both binary and JSON, both option modes.
+		s.AppendEncode(nil, v)
+		s.AppendEncode(nil, v, TaggedUnions())
+		s.AppendEncodeJSON(nil, v)
+		s.AppendEncodeJSON(nil, v, TaggedUnions())
+	})
+}
+
+// FuzzResolveBroad fuzzes Resolve across many reader/writer pairs.
+// FuzzResolve already exists but its seed corpus is narrow. This one
+// pairs every fuzzSchemas entry with every other entry to surface
+// resolution edge cases (alias mismatches, recursive cycle handling,
+// promote chain panics).
+func FuzzResolveBroad(f *testing.F) {
+	for i := range fuzzSchemas {
+		for j := range fuzzSchemas {
+			f.Add(uint8(i), uint8(j), []byte{})
+			f.Add(uint8(i), uint8(j), []byte{0})
+			f.Add(uint8(i), uint8(j), []byte{2, 84})
+		}
+	}
+	f.Fuzz(func(t *testing.T, wIdx, rIdx uint8, data []byte) {
+		w := fuzzSchemas[int(wIdx)%len(fuzzSchemas)]
+		r := fuzzSchemas[int(rIdx)%len(fuzzSchemas)]
+		res, err := Resolve(w, r)
+		if err != nil {
+			return
+		}
+		var v any
+		res.Decode(data, &v)
+		// Vary target shape too.
+		var v2 interface{ Foo() }
+		res.Decode(data, &v2)
+	})
+}
+
+// FuzzCustomTypeRoundTrip wires up a custom type and exercises
+// encode/decode round-trip with arbitrary value bytes. The custom-type
+// path goes through wrapDeserWithCustomDecoders / setCustomResult,
+// which had a panic earlier; this fuzz keeps that path under coverage.
+func FuzzCustomTypeRoundTrip(f *testing.F) {
+	type Wrapped struct{ V int }
+	ct := NewCustomType[Wrapped, int32](
+		"",
+		func(w Wrapped, _ *SchemaNode) (int32, error) { return int32(w.V), nil },
+		func(v int32, _ *SchemaNode) (Wrapped, error) { return Wrapped{V: int(v)}, nil },
+	)
+	s, err := Parse(`"int"`, WithCustomType(ct))
+	if err != nil {
+		f.Fatal(err)
+	}
+
+	f.Add(int32(0))
+	f.Add(int32(-1))
+	f.Add(int32(1 << 30))
+	f.Add(int32(-1 << 30))
+
+	f.Fuzz(func(t *testing.T, val int32) {
+		w := Wrapped{V: int(val)}
+		encoded, err := s.AppendEncode(nil, w)
+		if err != nil {
+			return
+		}
+		var got Wrapped
+		if _, err := s.Decode(encoded, &got); err != nil {
+			t.Fatalf("decode after encode failed: %v\n  data: %x", err, encoded)
+		}
+		if got.V != w.V {
+			t.Fatalf("custom type round-trip mismatch: got %v, want %v", got, w)
+		}
+		// And decode-into-interface variants.
+		var anyV any
+		if _, err := s.Decode(encoded, &anyV); err != nil {
+			t.Fatalf("decode into *any failed: %v", err)
+		}
+	})
+}
+
+// FuzzConcurrentEncodeDecode hammers a shared *Schema from multiple
+// goroutines with arbitrary inputs. The unsafe fast-path init uses
+// atomic.Pointer; the per-type cache uses sync.Map. Concurrent
+// fuzz exercise stresses these paths in a way single-threaded fuzz
+// can't.
+func FuzzConcurrentEncodeDecode(f *testing.F) {
+	type Record struct {
+		A int32  `avro:"a"`
+		B string `avro:"b"`
+	}
+	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	if err != nil {
+		f.Fatal(err)
+	}
+
+	f.Add(int32(1), "x", uint8(4))
+	f.Add(int32(0), "", uint8(8))
+	f.Add(int32(-1), "ababab", uint8(2))
+
+	f.Fuzz(func(t *testing.T, a int32, b string, n uint8) {
+		workers := 1 + int(n%8)
+		// Collect panics from worker goroutines via channel rather than
+		// calling t.Errorf directly: testing.T methods other than Log
+		// aren't safe for concurrent use from non-test goroutines.
+		panicCh := make(chan any, workers)
+		done := make(chan struct{}, workers)
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						panicCh <- r
+					}
+					done <- struct{}{}
+				}()
+				for j := 0; j < 20; j++ {
+					rec := Record{A: a + int32(j), B: b}
+					data, err := s.AppendEncode(nil, &rec)
+					if err != nil {
+						continue
+					}
+					var got Record
+					s.Decode(data, &got)
+					var anyV any
+					s.Decode(data, &anyV)
+				}
+			}()
+		}
+		for i := 0; i < workers; i++ {
+			<-done
+		}
+		close(panicCh)
+		for p := range panicCh {
+			t.Errorf("panic in concurrent worker: %v", p)
+		}
+	})
+}
+
+// FuzzTimeDateEdgeCases fuzzes time/date logical types around boundary
+// values: pre-epoch, far future, leap seconds, NaN/Infinity for floats
+// in time-millis representations.
+func FuzzTimeDateEdgeCases(f *testing.F) {
+	schemas := []string{
+		`{"type":"long","logicalType":"timestamp-millis"}`,
+		`{"type":"long","logicalType":"timestamp-micros"}`,
+		`{"type":"long","logicalType":"timestamp-nanos"}`,
+		`{"type":"int","logicalType":"date"}`,
+		`{"type":"int","logicalType":"time-millis"}`,
+		`{"type":"long","logicalType":"time-micros"}`,
+	}
+	parsed := make([]*Schema, len(schemas))
+	for i, s := range schemas {
+		p, err := Parse(s)
+		if err != nil {
+			f.Fatal(err)
+		}
+		parsed[i] = p
+	}
+
+	// Adversarial values.
+	f.Add(uint8(0), int64(0))
+	f.Add(uint8(0), int64(-62135596800000)) // 0001-01-01
+	f.Add(uint8(0), int64(253402300800000)) // 9999 AD
+	f.Add(uint8(0), int64(1<<62))           // overflow risk
+	f.Add(uint8(0), int64(-1<<62))
+	f.Add(uint8(2), int64(1))
+	f.Add(uint8(3), int64(0))   // epoch
+	f.Add(uint8(3), int64(-1))  // pre-epoch date
+	f.Add(uint8(4), int64(0))   // midnight
+	f.Add(uint8(4), int64(86400000))
+	f.Add(uint8(5), int64(86400000000))
+
+	// Track which schemas use "int" wire type vs "long" so the
+	// fuzz body can pick the matching Go type without inspecting
+	// the *Schema (no public accessor for the underlying kind).
+	isInt := []bool{false, false, false, true, true, false}
+
+	f.Fuzz(func(t *testing.T, schemaIdx uint8, val int64) {
+		idx := int(schemaIdx) % len(parsed)
+		s := parsed[idx]
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panic on schema=%s val=%d: %v", s.String(), val, r)
+			}
+		}()
+		var encoded []byte
+		var err error
+		if isInt[idx] {
+			if val < -1<<31 || val > 1<<31-1 {
+				return
+			}
+			encoded, err = s.AppendEncode(nil, int32(val))
+		} else {
+			encoded, err = s.AppendEncode(nil, val)
+		}
+		if err != nil {
+			return
+		}
+		var v any
+		s.Decode(encoded, &v)
+		jsonEncoded, err := s.EncodeJSON(v)
+		if err != nil {
+			return
+		}
+		var v2 any
+		s.DecodeJSON(jsonEncoded, &v2)
+	})
+}
+
+// FuzzDepthBounds drives every encode/decode/skip/parse path with
+// pathologically deep or cyclic inputs and asserts the library
+// terminates with an error rather than panicking, hanging, or
+// stack-overflowing. Specifically targets the depth-bound work in
+// commits a302d51 and 21006ca: cyclic Go inputs, deeply nested wire
+// data, deeply nested schemas, self-referential interfaces.
+func FuzzDepthBounds(f *testing.F) {
+	// nesting: how many record levels deep to recurse (binary input).
+	// arrayCount: how many array blocks to chain (each with one item).
+	// schemaDepth: nesting depth for the auto-generated array<array<...>> schema.
+	// mode: which subtest to run (0..7).
+	f.Add(uint16(2000), uint16(100), uint16(50), uint8(0))
+	f.Add(uint16(5000), uint16(500), uint16(2000), uint8(1))
+	f.Add(uint16(100), uint16(10), uint16(maxDepth+10), uint8(2))
+	f.Add(uint16(50), uint16(50), uint16(10), uint8(3))
+	f.Add(uint16(0), uint16(0), uint16(0), uint8(4))
+	f.Add(uint16(maxDepth+50), uint16(0), uint16(0), uint8(5))
+	f.Add(uint16(10), uint16(maxDepth+50), uint16(0), uint8(6))
+	f.Add(uint16(0), uint16(0), uint16(0), uint8(7))
+
+	recursiveSchema := `{"type":"record","name":"Node","fields":[
+		{"name":"value","type":"int"},
+		{"name":"next","type":["null","Node"]}
+	]}`
+	rs, err := Parse(recursiveSchema)
+	if err != nil {
+		f.Fatal(err)
+	}
+	type node struct {
+		Value int32 `avro:"value"`
+		Next  *node `avro:"next"`
+	}
+
+	f.Fuzz(func(t *testing.T, nesting, arrayCount, schemaDepth uint16, mode uint8) {
+		// Hard caps to keep individual fuzz iterations bounded. The
+		// schemaDepth cap is tight because encoding/json's recursive
+		// parser is O(N²) on nested-array JSON — well past maxDepth
+		// we just burn time in the stdlib without exercising more
+		// of our code.
+		if nesting > 20000 {
+			nesting = 20000
+		}
+		if arrayCount > 5000 {
+			arrayCount = 5000
+		}
+		if schemaDepth > maxDepth+10 {
+			schemaDepth = maxDepth + 10
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked (mode=%d, n=%d, a=%d, sd=%d): %v",
+					mode, nesting, arrayCount, schemaDepth, r)
+			}
+		}()
+
+		switch mode % 8 {
+		case 0:
+			// Deeply nested binary into recursive struct.
+			var src []byte
+			for range int(nesting) {
+				src = append(src, 0, 0x02)
+			}
+			src = append(src, 0)
+			var n node
+			rs.Decode(src, &n)
+		case 1:
+			// Deeply nested binary into resolved decode (writer == reader).
+			var src []byte
+			for range int(nesting) {
+				src = append(src, 0, 0x02)
+			}
+			src = append(src, 0)
+			resolved, err := Resolve(rs, rs)
+			if err != nil {
+				return
+			}
+			var n node
+			resolved.Decode(src, &n)
+		case 2:
+			// Deeply nested binary skipped via resolve (reader drops "next").
+			rdrSchema, err := Parse(`{"type":"record","name":"Node","fields":[{"name":"value","type":"int"}]}`)
+			if err != nil {
+				return
+			}
+			resolved, err := Resolve(rs, rdrSchema)
+			if err != nil {
+				return
+			}
+			var src []byte
+			for range int(nesting) {
+				src = append(src, 0, 0x02)
+			}
+			src = append(src, 0)
+			type rR struct{ Value int32 `avro:"value"` }
+			var rv rR
+			resolved.Decode(src, &rv)
+		case 3:
+			// Deeply nested JSON into recursive struct.
+			var src []byte
+			for range int(nesting) {
+				src = append(src, []byte(`{"value":0,"next":{"Node":`)...)
+			}
+			src = append(src, []byte(`{"value":0,"next":null}`)...)
+			for range int(nesting) {
+				src = append(src, []byte(`}}`)...)
+			}
+			var n node
+			rs.DecodeJSON(src, &n)
+		case 4:
+			// Cyclic struct encode (binary + JSON) through unsafe fast path.
+			n := &node{Value: 1}
+			n.Next = n
+			rs.AppendEncode(nil, n)
+			rs.AppendEncodeJSON(nil, n)
+		case 5:
+			// Schema-parse depth bound.
+			var b strings.Builder
+			d := int(schemaDepth)
+			if d == 0 {
+				d = maxDepth + 50
+			}
+			for range d {
+				b.WriteString(`{"type":"array","items":`)
+			}
+			b.WriteString(`"int"`)
+			for range d {
+				b.WriteString(`}`)
+			}
+			Parse(b.String())
+		case 6:
+			// Long array-block chain (count > buffer is rejected; this
+			// makes many small blocks each terminating with count=0).
+			var src []byte
+			for range int(arrayCount) {
+				src = append(src, 0x02) // count=1
+				src = append(src, 0)    // single item: int(0)
+			}
+			src = append(src, 0) // terminator
+			arrSchema, err := Parse(`{"type":"array","items":"int"}`)
+			if err != nil {
+				return
+			}
+			var out []int32
+			arrSchema.Decode(src, &out)
+		case 7:
+			// Self-referential `any` against various schemas.
+			intS, err := Parse(`"int"`)
+			if err != nil {
+				return
+			}
+			nullableS, err := Parse(`["null","int"]`)
+			if err != nil {
+				return
+			}
+			var p any
+			p = &p
+			intS.AppendEncode(nil, p)
+			intS.AppendEncodeJSON(nil, p)
+			nullableS.AppendEncode(nil, p)
+			nullableS.AppendEncodeJSON(nil, p)
+		}
 	})
 }

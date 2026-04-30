@@ -26,10 +26,13 @@ func (taggedUnions) opt() {}
 // TaggedUnions wraps non-null union values as {"type_name": value}.
 //
 // In [Schema.EncodeJSON], this produces tagged JSON union output.
-// In [Schema.Decode] and [Schema.DecodeJSON] to *any, this wraps
-// union values as map[string]any{branchName: value}.
+// In [Schema.Decode] and [Schema.DecodeJSON], this wraps union
+// values as map[string]any{branchName: value} — but only when the
+// decode target is *any (the common case). For typed targets — a
+// concrete struct field, *T, or any non-empty Go interface — the
+// wrapper would not be assignable to the target, so the bare branch
+// value is assigned without the envelope.
 //
-// Without this option, union values are bare in all cases.
 // [Schema.DecodeJSON] and [Schema.Encode] always accept both tagged
 // and bare union input regardless of this option.
 func TaggedUnions() Opt { return taggedUnions{} }
@@ -98,7 +101,7 @@ func (s *Schema) EncodeJSON(v any, opts ...Opt) ([]byte, error) {
 // AppendEncodeJSON is like [Schema.EncodeJSON] but appends to dst.
 func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error) {
 	cfg := parseOpts(opts)
-	return appendAvroJSON(dst, reflect.ValueOf(v), s.node, &cfg, s.customEncodes)
+	return appendAvroJSON(dst, reflect.ValueOf(v), s.node, &cfg, s.customEncodes, 0)
 }
 
 // DecodeJSON decodes Avro JSON from src into v. It unwraps union wrappers,
@@ -129,7 +132,7 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 		qualifyLogical: cfg.tagLogical,
 	}
 	err := ctx.decodeValue(rv.Elem(), s.node)
-	slabPool.Put(sl)
+	sl.put()
 	return err
 }
 
@@ -137,7 +140,10 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 // the Go value via reflect and the schema tree simultaneously, writing
 // JSON directly without an intermediate binary encoding step. Handles
 // structs, maps, all numeric coercions, time.Time, etc.
-func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error)) ([]byte, error) {
+func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	// Handle nil / invalid values.
 	if !v.IsValid() {
 		if node.kind == "null" || node.kind == "union" {
@@ -145,10 +151,16 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		}
 		return nil, fmt.Errorf("avro json: nil value for non-nullable type %q", node.kind)
 	}
-	// Dereference pointers and interfaces.
-	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
+	// Dereference pointers and interfaces. Capped at maxIndirectDepth
+	// so a self-referential interface (var p any; p = &p) terminates;
+	// the deeply-wrapped value falls through to the type switch which
+	// will return a SemanticError for the unmatched kind.
+	for range maxIndirectDepth {
+		if v.Kind() != reflect.Pointer && v.Kind() != reflect.Interface {
+			break
+		}
 		if v.IsNil() {
-			return appendAvroJSON(buf, reflect.Value{}, node, cfg, customEncodes)
+			return appendAvroJSON(buf, reflect.Value{}, node, cfg, customEncodes, depth+1)
 		}
 		v = v.Elem()
 	}
@@ -385,7 +397,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				buf = append(buf, ',')
 			}
 			var err error
-			buf, err = appendAvroJSON(buf, v.Index(i), node.items, cfg, customEncodes)
+			buf, err = appendAvroJSON(buf, v.Index(i), node.items, cfg, customEncodes, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -407,7 +419,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			buf = appendJSONString(buf, iter.Key().String())
 			buf = append(buf, ':')
 			var err error
-			buf, err = appendAvroJSON(buf, iter.Value(), node.values, cfg, customEncodes)
+			buf, err = appendAvroJSON(buf, iter.Value(), node.values, cfg, customEncodes, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -415,10 +427,10 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return append(buf, '}'), nil
 
 	case "record":
-		return appendAvroJSONRecord(buf, v, node, cfg, customEncodes)
+		return appendAvroJSONRecord(buf, v, node, cfg, customEncodes, depth+1)
 
 	case "union":
-		return appendAvroJSONUnion(buf, v, node, cfg, customEncodes)
+		return appendAvroJSONUnion(buf, v, node, cfg, customEncodes, depth+1)
 
 	default:
 		return nil, fmt.Errorf("avro json: unsupported schema kind %q", node.kind)
@@ -426,9 +438,12 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 }
 
 // appendAvroJSONRecord handles record encoding for both structs and maps.
-func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error)) ([]byte, error) {
+func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
 	buf = append(buf, '{')
 	if v.Kind() == reflect.Map {
+		if v.Type().Key().Kind() != reflect.String {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "record"}
+		}
 		// map[string]any fast path: MapIndex allocates via reflect.copyVal
 		// for each interface{} element; direct lookup skips that.
 		if v.Type() == mapStringAnyType {
@@ -448,7 +463,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 					continue
 				}
 				var err error
-				buf, err = appendAvroJSON(buf, reflect.ValueOf(val), f.node, cfg, customEncodes)
+				buf, err = appendAvroJSON(buf, reflect.ValueOf(val), f.node, cfg, customEncodes, depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -470,7 +485,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 				continue
 			}
 			var err error
-			buf, err = appendAvroJSON(buf, val, f.node, cfg, customEncodes)
+			buf, err = appendAvroJSON(buf, val, f.node, cfg, customEncodes, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -487,7 +502,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
 			fv := v.FieldByIndex(mapping.indices[i])
-			buf, err = appendAvroJSON(buf, fv, f.node, cfg, customEncodes)
+			buf, err = appendAvroJSON(buf, fv, f.node, cfg, customEncodes, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -499,7 +514,10 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 }
 
 // appendAvroJSONUnion handles union encoding.
-func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error)) ([]byte, error) {
+func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	if !v.IsValid() || (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil() {
 		// unreachable: appendAvroJSON's deref loop converts nil pointers/interfaces
 		// to invalid values before dispatching here, but kept as a safety net.
@@ -515,8 +533,11 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 		if key.Kind() == reflect.String {
 			if branch := findUnionBranch(node, key.String()); branch != nil {
 				inner := iter.Value()
-				encoded, err := appendAvroJSON(nil, inner, branch, cfg, customEncodes)
+				encoded, err := appendAvroJSON(nil, inner, branch, cfg, customEncodes, depth+1)
 				if err != nil {
+					if errors.Is(err, errTooDeep) {
+						return nil, err
+					}
 					// Fall through to try-each-branch loop,
 					// matching Encode's serUnion behavior.
 					goto tryAll
@@ -543,7 +564,7 @@ tryAll:
 		if branch.kind == "null" {
 			continue
 		}
-		encoded, err := appendAvroJSON(nil, v, branch, cfg, customEncodes)
+		encoded, err := appendAvroJSON(nil, v, branch, cfg, customEncodes, depth+1)
 		if err == nil {
 			if cfg.tagged {
 				bn, ln := unionBranchNames(branch)
@@ -560,6 +581,12 @@ tryAll:
 				buf = append(buf, encoded...)
 			}
 			return buf, nil
+		}
+		// Propagate too-deep without trying further branches; the
+		// trial loop would otherwise mask the recursion limit error
+		// behind a misleading "no branch matched".
+		if errors.Is(err, errTooDeep) {
+			return nil, err
 		}
 	}
 	return nil, fmt.Errorf("avro json: no union branch matched value of type %s", v.Type())
@@ -713,8 +740,13 @@ func appendJSONString(buf []byte, s string) []byte {
 		}
 		r, size := utf8.DecodeRuneInString(s[i:])
 		if r == utf8.RuneError && size == 1 {
-			// Invalid UTF-8 byte — replace with U+FFFD.
-			buf = append(buf, `\ufffd`...)
+			// Replace invalid UTF-8 byte with raw U+FFFD bytes
+			// (efbfbd) rather than the literal `�` escape, so
+			// encode is idempotent: a re-decoded escape produces
+			// the U+FFFD codepoint, which would then re-encode as
+			// raw UTF-8 — different from the escape. Using raw
+			// here makes both paths converge.
+			buf = utf8.AppendRune(buf, utf8.RuneError)
 			i++
 			continue
 		}

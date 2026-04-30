@@ -296,6 +296,11 @@ func findReaderFieldIndex(r *schemaNode, writerFieldName string) int {
 
 func (rr *resolvedRecord) buildDeser() deserfn {
 	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
+		defer func() { sl.depth-- }()
 		v = indirectAlloc(v)
 		k := v.Kind()
 
@@ -320,7 +325,7 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 	// Process wire fields.
 	for _, op := range rr.wireOps {
 		if op.readerIdx < 0 {
-			if src, err = op.skip(src); err != nil {
+			if src, err = op.skip(src, sl); err != nil {
 				return nil, err
 			}
 			continue
@@ -341,8 +346,7 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 		m[rr.readerNames[d.readerIdx]] = elem.Interface()
 	}
 
-	v.Set(reflect.ValueOf(m))
-	return src, nil
+	return src, setIface(v, reflect.ValueOf(m), "record")
 }
 
 func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
@@ -353,7 +357,7 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 
 	for _, op := range rr.wireOps {
 		if op.readerIdx < 0 {
-			if src, err = op.skip(src); err != nil {
+			if src, err = op.skip(src, sl); err != nil {
 				return nil, err
 			}
 			continue
@@ -384,7 +388,7 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 
 	for _, op := range rr.wireOps {
 		if op.readerIdx < 0 {
-			if src, err = op.skip(src); err != nil {
+			if src, err = op.skip(src, sl); err != nil {
 				return nil, err
 			}
 			continue
@@ -456,7 +460,7 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 		v = indirectAlloc(v)
 		switch {
 		case v.Kind() == reflect.Interface:
-			v.Set(reflect.ValueOf(readerSymbols[ri]))
+			return src, setIface(v, reflect.ValueOf(readerSymbols[ri]), "enum")
 		case v.Kind() == reflect.String:
 			v.SetString(readerSymbols[ri])
 		case v.CanInt():
@@ -574,8 +578,7 @@ func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 				if sl.tagLogicalTypes {
 					name = ln
 				}
-				v.Set(reflect.ValueOf(map[string]any{name: v.Elem().Interface()}))
-				return src, nil
+				return src, setIface(v, reflect.ValueOf(map[string]any{name: v.Elem().Interface()}), "union")
 			}
 			return &schemaNode{
 				kind:     "union",

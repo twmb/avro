@@ -794,7 +794,7 @@ func TestSkipUnion(t *testing.T) {
 	data := append(encoded, sentinel)
 
 	skip := buildSkip(s.node)
-	rem, err := skip(data)
+	rem, err := skip(data, &slab{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -841,7 +841,7 @@ func TestSkipFunctions(t *testing.T) {
 			data := append(encoded, sentinel)
 
 			skip := buildSkip(s.node)
-			rem, err := skip(data)
+			rem, err := skip(data, &slab{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -855,7 +855,7 @@ func TestSkipFunctions(t *testing.T) {
 	t.Run("null", func(t *testing.T) {
 		sentinel := byte(0xFE)
 		data := []byte{sentinel}
-		rem, err := skipNull(data)
+		rem, err := skipNull(data, &slab{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1171,21 +1171,21 @@ func TestResolveReaderUnionTaggedUnions(t *testing.T) {
 // --- Direct skip function error path tests ---
 
 func TestSkipBooleanShortBuffer(t *testing.T) {
-	_, err := skipBoolean(nil)
+	_, err := skipBoolean(nil, &slab{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
 }
 
 func TestSkipFloatShortBuffer(t *testing.T) {
-	_, err := skipFloat([]byte{1, 2})
+	_, err := skipFloat([]byte{1, 2}, &slab{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
 }
 
 func TestSkipDoubleShortBuffer(t *testing.T) {
-	_, err := skipDouble([]byte{1, 2, 3, 4})
+	_, err := skipDouble([]byte{1, 2, 3, 4}, &slab{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -1193,14 +1193,14 @@ func TestSkipDoubleShortBuffer(t *testing.T) {
 
 func TestSkipBytesErrors(t *testing.T) {
 	// Empty buffer: readVarlong fails.
-	_, err := skipBytes(nil)
+	_, err := skipBytes(nil, &slab{})
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
 
 	// Short buffer after reading length.
 	data := appendVarlong(nil, 100) // length=100 but no data
-	_, err = skipBytes(data)
+	_, err = skipBytes(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for short data")
 	}
@@ -1208,7 +1208,7 @@ func TestSkipBytesErrors(t *testing.T) {
 
 func TestSkipFixedShortBuffer(t *testing.T) {
 	skip := skipFixed(8)
-	_, err := skip([]byte{1, 2, 3})
+	_, err := skip([]byte{1, 2, 3}, &slab{})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -1220,7 +1220,7 @@ func TestSkipArrayErrors(t *testing.T) {
 	skip := buildSkip(arrNode)
 
 	// Empty buffer: readVarlong fails.
-	_, err := skip(nil)
+	_, err := skip(nil, &slab{})
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -1232,7 +1232,7 @@ func TestSkipArrayErrors(t *testing.T) {
 	data = appendVarlong(data, 2)   // byte size = 2
 	data = append(data, 0x01, 0x02) // 2 bytes
 	data = appendVarlong(data, 0)   // terminator
-	rem, err := skip(data)
+	rem, err := skip(data, &slab{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1244,7 +1244,7 @@ func TestSkipArrayErrors(t *testing.T) {
 	data = data[:0]
 	data = appendVarlong(data, -2)
 	data = appendVarlong(data, 100) // byte size > available
-	_, err = skip(data)
+	_, err = skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for byte-size exceeding data")
 	}
@@ -1253,7 +1253,7 @@ func TestSkipArrayErrors(t *testing.T) {
 	data = data[:0]
 	data = appendVarlong(data, -2)
 	// No byte size follows.
-	_, err = skip(data)
+	_, err = skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for missing byte size")
 	}
@@ -1262,7 +1262,7 @@ func TestSkipArrayErrors(t *testing.T) {
 	data = data[:0]
 	data = appendVarlong(data, 1) // 1 item
 	// No int data for the item.
-	_, err = skip(data)
+	_, err = skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for truncated item")
 	}
@@ -1274,7 +1274,7 @@ func TestSkipMapErrors(t *testing.T) {
 	skip := buildSkip(mapNode)
 
 	// Empty buffer.
-	_, err := skip(nil)
+	_, err := skip(nil, &slab{})
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -1285,7 +1285,7 @@ func TestSkipMapErrors(t *testing.T) {
 	data = appendVarlong(data, 3)
 	data = append(data, 0x01, 0x02, 0x03)
 	data = appendVarlong(data, 0)
-	rem, err := skip(data)
+	rem, err := skip(data, &slab{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1297,7 +1297,7 @@ func TestSkipMapErrors(t *testing.T) {
 	data = data[:0]
 	data = appendVarlong(data, -1)
 	data = appendVarlong(data, 100)
-	_, err = skip(data)
+	_, err = skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for oversized byte-size")
 	}
@@ -1305,7 +1305,7 @@ func TestSkipMapErrors(t *testing.T) {
 	// Negative count: error reading byte size.
 	data = data[:0]
 	data = appendVarlong(data, -1)
-	_, err = skip(data)
+	_, err = skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for missing byte size")
 	}
@@ -1314,7 +1314,7 @@ func TestSkipMapErrors(t *testing.T) {
 	data = data[:0]
 	data = appendVarlong(data, 1)
 	// No key string data.
-	_, err = skip(data)
+	_, err = skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for truncated key")
 	}
@@ -1325,7 +1325,7 @@ func TestSkipMapErrors(t *testing.T) {
 	data = appendVarlong(data, 1) // key length=1
 	data = append(data, 'k')      // key data
 	// No value int data.
-	_, err = skip(data)
+	_, err = skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for truncated value")
 	}
@@ -1342,21 +1342,21 @@ func TestSkipUnionErrors(t *testing.T) {
 	skip := buildSkip(node)
 
 	// Empty buffer: readVarint error.
-	_, err := skip(nil)
+	_, err := skip(nil, &slab{})
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
 
 	// Out of range index.
 	data := appendVarint(nil, 5)
-	_, err = skip(data)
+	_, err = skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for out-of-range index")
 	}
 
 	// Negative index.
 	data = appendVarint(nil, -1)
-	_, err = skip(data)
+	_, err = skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for negative index")
 	}
@@ -1365,7 +1365,7 @@ func TestSkipUnionErrors(t *testing.T) {
 func TestBuildSkipUnknownType(t *testing.T) {
 	node := &schemaNode{kind: "unknown_type"}
 	skip := buildSkip(node)
-	_, err := skip([]byte{1, 2, 3})
+	_, err := skip([]byte{1, 2, 3}, &slab{})
 	if err == nil {
 		t.Fatal("expected error for unknown type")
 	}
@@ -1391,7 +1391,7 @@ func TestSkipRecordFieldError(t *testing.T) {
 		},
 	}
 	skip := buildSkip(node)
-	_, err := skip(nil)
+	_, err := skip(nil, &slab{})
 	if err == nil {
 		t.Fatal("expected error for truncated record field")
 	}
@@ -2033,7 +2033,7 @@ func TestEncodeDefaultEmptyUnion(t *testing.T) {
 func TestSkipBytesNegativeLength(t *testing.T) {
 	// Encode a negative varint as the length.
 	data := appendVarlong(nil, -5)
-	_, err := skipBytes(data)
+	_, err := skipBytes(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for negative bytes length")
 	}
@@ -2470,7 +2470,7 @@ func TestSkipArrayMinInt64(t *testing.T) {
 
 	// math.MinInt64 zigzag-encoded as varint.
 	data := appendVarlong(nil, math.MinInt64)
-	_, err := skip(data)
+	_, err := skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for math.MinInt64 block count")
 	}
@@ -2482,7 +2482,7 @@ func TestSkipMapMinInt64(t *testing.T) {
 	skip := buildSkip(mapNode)
 
 	data := appendVarlong(nil, math.MinInt64)
-	_, err := skip(data)
+	_, err := skip(data, &slab{})
 	if err == nil {
 		t.Fatal("expected error for math.MinInt64 block count")
 	}

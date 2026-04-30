@@ -94,6 +94,11 @@ func (s *jsonScanner) consumeStringRaw() (start, end int, hasEscapes bool, err e
 		if b == '"' {
 			end = s.pos
 			s.pos++ // skip closing quote
+			// Postel: don't validate UTF-8 here. Some producers emit
+			// raw bytes 0x80-0xff (technically invalid JSON but seen
+			// in real pipelines). The encoder canonicalizes invalid
+			// bytes on output (replacement char), so a round-trip
+			// from non-canonical input lands on canonical output.
 			return start, end, hasEscapes, nil
 		}
 		s.pos++
@@ -344,7 +349,7 @@ func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 // producing a UTF-8 Go string.
 func resolveJSONEscapes(raw []byte) (string, error) {
 	var buf []byte
-	err := walkJSONEscapes(raw, func(r rune) error {
+	err := walkJSONStringEscapes(raw, func(r rune) error {
 		buf = utf8.AppendRune(buf, r)
 		return nil
 	})
@@ -352,6 +357,79 @@ func resolveJSONEscapes(raw []byte) (string, error) {
 		return "", err
 	}
 	return string(buf), nil
+}
+
+// walkJSONStringEscapes is like walkJSONEscapes but decodes raw bytes
+// between escape sequences as UTF-8 runes (rather than emitting each
+// byte as its own rune). Used for strings — JSON requires valid UTF-8,
+// and treating multi-byte UTF-8 sequences as separate codepoints would
+// corrupt the value (the round-trip "耼\x00" → "耼" → "è¼\x00"
+// bug). The byte-by-byte walker is preserved for bytes/fixed decoding,
+// where each codepoint maps 1:1 to a byte.
+func walkJSONStringEscapes(raw []byte, emit func(r rune) error) error {
+	for i := 0; i < len(raw); {
+		if raw[i] != '\\' {
+			// Decode multi-byte UTF-8 as a single rune so the round
+			// trip preserves the value. For invalid UTF-8 (e.g. lone
+			// 0x9e), DecodeRune returns RuneError with size 1 — emit
+			// the raw byte as its codepoint to stay liberal on input
+			// (Postel). The encoder canonicalizes on output.
+			r, size := utf8.DecodeRune(raw[i:])
+			if r == utf8.RuneError && size == 1 {
+				r = rune(raw[i])
+			}
+			if err := emit(r); err != nil {
+				return err
+			}
+			i += size
+			continue
+		}
+		i++
+		if i >= len(raw) {
+			return fmt.Errorf("avro json: unterminated escape")
+		}
+		var r rune
+		switch raw[i] {
+		case '"', '\\', '/':
+			r = rune(raw[i])
+		case 'b':
+			r = '\b'
+		case 'f':
+			r = '\f'
+		case 'n':
+			r = '\n'
+		case 'r':
+			r = '\r'
+		case 't':
+			r = '\t'
+		case 'u':
+			if i+4 >= len(raw) {
+				return fmt.Errorf("avro json: short \\u escape")
+			}
+			var err error
+			r, err = parseHex4(raw[i+1 : i+5])
+			if err != nil {
+				return err
+			}
+			i += 4
+			if r >= 0xD800 && r <= 0xDBFF && i+2 < len(raw) && raw[i+1] == '\\' && raw[i+2] == 'u' {
+				if i+6 < len(raw) {
+					r2, err := parseHex4(raw[i+3 : i+7])
+					if err == nil && r2 >= 0xDC00 && r2 <= 0xDFFF {
+						r = 0x10000 + (r-0xD800)*0x400 + (r2 - 0xDC00)
+						i += 6
+					}
+				}
+			}
+		default:
+			r = rune(raw[i])
+		}
+		if err := emit(r); err != nil {
+			return err
+		}
+		i++
+	}
+	return nil
 }
 
 // scanAvroJSONBytes resolves a raw JSON string content into Avro bytes.

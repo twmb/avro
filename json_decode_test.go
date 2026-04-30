@@ -613,6 +613,7 @@ func TestDecodeJSONDecodeValueUnknownKind(t *testing.T) {
 	// This can't happen through Parse, so test directly.
 	ctx := &jsonDecoder{
 		scanner: &jsonScanner{data: []byte(`42`)},
+		slab:    &slab{},
 	}
 	var out any
 	err := ctx.decodeValue(reflect.ValueOf(&out).Elem(), &schemaNode{kind: "bogus"})

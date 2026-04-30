@@ -313,6 +313,45 @@ func TestDecodeJSONIntoStruct(t *testing.T) {
 	}
 }
 
+// TestDecodeJSONUnionTaggedNullIntoAny exercises the union object decode
+// path at json_decode.go:809 / 844. When the JSON is a tagged union object
+// whose branch is "null" (e.g. {"null":null}), the inner decode produces
+// nil, wrapUnion returns nil, and the previous code did
+// v.Set(reflect.ValueOf(nil)) — which panics with "reflect.Value.Set on
+// zero Value". The decode should produce a nil any, not panic.
+func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		src    string
+		opts   []Opt
+	}{
+		{"two-branch null bare", `["null","int"]`, `null`, nil},
+		{"two-branch null tagged", `["null","int"]`, `{"null":null}`, nil},
+		{"two-branch null tagged with TaggedUnions", `["null","int"]`, `{"null":null}`, []Opt{TaggedUnions()}},
+		{"three-branch null tagged", `["null","int","string"]`, `{"null":null}`, nil},
+		{"three-branch null tagged with TaggedUnions", `["null","int","string"]`, `{"null":null}`, []Opt{TaggedUnions()}},
+		{"record with nullable any field, tagged null inner", `{"type":"record","name":"r","fields":[{"name":"x","type":["null","int"]}]}`, `{"x":{"null":null}}`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v any
+			if err := s.DecodeJSON([]byte(tc.src), &v, tc.opts...); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+		})
+	}
+}
+
 func TestDecodeJSONInvalidUnion(t *testing.T) {
 	s, err := Parse(`["null","string"]`)
 	if err != nil {
@@ -709,7 +748,7 @@ func TestAppendAvroJSONTypeErrors(t *testing.T) {
 			if tt.kind == "map" {
 				node.values = &schemaNode{kind: "int"}
 			}
-			_, err := appendAvroJSON(nil, reflect.ValueOf(tt.val), node, &optConfig{}, nil)
+			_, err := appendAvroJSON(nil, reflect.ValueOf(tt.val), node, &optConfig{}, nil, 0)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -719,7 +758,7 @@ func TestAppendAvroJSONTypeErrors(t *testing.T) {
 
 func TestAppendAvroJSONFixedReflect(t *testing.T) {
 	node := &schemaNode{kind: "fixed", size: 3}
-	buf, err := appendAvroJSON(nil, reflect.ValueOf([3]byte{1, 2, 3}), node, &optConfig{}, nil)
+	buf, err := appendAvroJSON(nil, reflect.ValueOf([3]byte{1, 2, 3}), node, &optConfig{}, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,7 +767,7 @@ func TestAppendAvroJSONFixedReflect(t *testing.T) {
 	}
 
 	// Non-byte array should error.
-	_, err = appendAvroJSON(nil, reflect.ValueOf([3]int{1, 2, 3}), node, &optConfig{}, nil)
+	_, err = appendAvroJSON(nil, reflect.ValueOf([3]int{1, 2, 3}), node, &optConfig{}, nil, 0)
 	if err == nil {
 		t.Fatal("expected error for non-byte array")
 	}
@@ -739,7 +778,7 @@ func TestAppendAvroJSONUnionNoMatch(t *testing.T) {
 		kind:     "union",
 		branches: []*schemaNode{{kind: "null"}, {kind: "string"}},
 	}
-	_, err := appendAvroJSON(nil, reflect.ValueOf(int32(42)), node, &optConfig{}, nil)
+	_, err := appendAvroJSON(nil, reflect.ValueOf(int32(42)), node, &optConfig{}, nil, 0)
 	if err == nil {
 		t.Fatal("expected error for unmatched union")
 	}
@@ -747,7 +786,7 @@ func TestAppendAvroJSONUnionNoMatch(t *testing.T) {
 
 func TestAppendAvroJSONUnknownKind(t *testing.T) {
 	node := &schemaNode{kind: "bogus"}
-	_, err := appendAvroJSON(nil, reflect.ValueOf(42), node, &optConfig{}, nil)
+	_, err := appendAvroJSON(nil, reflect.ValueOf(42), node, &optConfig{}, nil, 0)
 	if err == nil {
 		t.Fatal("expected error for unknown kind")
 	}
@@ -2116,7 +2155,11 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 		{"日本語", `"日本語"`},                               // multi-byte UTF-8 passed through
 		{"a\u2028b", `"a\u2028b"`},                     // U+2028 escaped
 		{"a\u2029b", `"a\u2029b"`},                     // U+2029 escaped
-		{string([]byte{0xff, 0xfe}), `"\ufffd\ufffd"`}, // invalid UTF-8 replaced
+		// Invalid UTF-8 bytes are replaced with U+FFFD encoded as raw
+		// UTF-8 (efbfbd), not as the literal `\ufffd` escape. Using raw
+		// UTF-8 makes encode idempotent: a re-decode of an actual U+FFFD
+		// codepoint round-trips to the same bytes.
+		{string([]byte{0xff, 0xfe}), "\"\xef\xbf\xbd\xef\xbf\xbd\""},
 	}
 	for _, tt := range tests {
 		got, err := s.EncodeJSON(tt.in)
@@ -2126,6 +2169,41 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 		if string(got) != tt.want {
 			t.Errorf("EncodeJSON(%q) = %s, want %s", tt.in, got, tt.want)
 		}
+	}
+}
+
+// TestEncodeJSONUFFFDIdempotence pins the canonical-idempotence guarantee
+// of the JSON encoder for U+FFFD: an invalid UTF-8 byte and a valid
+// U+FFFD codepoint must encode to the same bytes, so decode-encode-
+// decode-encode of any input is a no-op after the first pass.
+func TestEncodeJSONUFFFDIdempotence(t *testing.T) {
+	s, _ := Parse(`"string"`)
+	// String containing one invalid UTF-8 byte.
+	invalid, err := s.EncodeJSON(string([]byte{0xff}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// String containing the valid U+FFFD codepoint encoded as UTF-8.
+	valid, err := s.EncodeJSON("�")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(invalid) != string(valid) {
+		t.Errorf("encoder is not idempotent on U+FFFD:\n  invalid byte %x: %s\n  U+FFFD value:    %s",
+			0xff, invalid, valid)
+	}
+	// And the round-trip-twice property: decode then re-encode the
+	// canonical output must be a no-op.
+	var v any
+	if err := s.DecodeJSON(invalid, &v); err != nil {
+		t.Fatalf("decode after encode failed: %v", err)
+	}
+	again, err := s.EncodeJSON(v)
+	if err != nil {
+		t.Fatalf("re-encode failed: %v", err)
+	}
+	if string(again) != string(invalid) {
+		t.Errorf("canonical encode is not stable:\n  first:  %s\n  second: %s", invalid, again)
 	}
 }
 

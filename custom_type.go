@@ -198,15 +198,17 @@ func inferAvroType(t reflect.Type) string {
 // setCustomResult sets a custom type conversion result into the target
 // reflect.Value. For interface targets (e.g. *any), we set the interface
 // directly. For pointer targets, we allocate and set the pointee. For
-// concrete struct targets, we set the value directly.
-func setCustomResult(v reflect.Value, result any) {
+// concrete struct targets, we set the value directly. Returns a
+// SemanticError if the result type is not assignable to the final target
+// (rather than letting reflect.Value.Set panic).
+func setCustomResult(v reflect.Value, result any, avroType string) error {
 	if result == nil {
 		// Nil result — set zero value for nullable types.
 		switch v.Kind() {
 		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
 			v.Set(reflect.Zero(v.Type()))
 		}
-		return
+		return nil
 	}
 	rv := reflect.ValueOf(result)
 	// Walk through pointers, allocating as needed. Stop early if
@@ -215,14 +217,18 @@ func setCustomResult(v reflect.Value, result any) {
 	for v.Kind() == reflect.Pointer {
 		if rv.Type().AssignableTo(v.Type()) {
 			v.Set(rv)
-			return
+			return nil
 		}
 		if v.IsNil() {
 			v.Set(reflect.New(v.Type().Elem()))
 		}
 		v = v.Elem()
 	}
+	if !rv.Type().AssignableTo(v.Type()) {
+		return &SemanticError{GoType: v.Type(), AvroType: avroType}
+	}
 	v.Set(rv)
+	return nil
 }
 
 // wrapDeserWithCustomDecoders wraps a deserfn with custom decode functions.
@@ -243,11 +249,15 @@ func wrapDeserWithCustomDecoders(inner deserfn, decoders []func(any, *SchemaNode
 				}
 				return nil, err
 			}
-			setCustomResult(v, result)
+			if err := setCustomResult(v, result, sn.Type); err != nil {
+				return nil, err
+			}
 			return src, nil
 		}
 		// No decoder matched — set the raw Avro-native value.
-		setCustomResult(v, tmp)
+		if err := setCustomResult(v, tmp, sn.Type); err != nil {
+			return nil, err
+		}
 		return src, nil
 	}
 }

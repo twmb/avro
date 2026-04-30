@@ -639,6 +639,7 @@ type builder struct {
 	customDecoderMap map[*schemaNode][]func(any, *SchemaNode) (any, error)
 	customSNMap      map[*schemaNode]*SchemaNode
 	cachedNames      map[string]bool // names inherited from SchemaCache, not from this parse
+	depth            int             // current build recursion depth, bounded by maxDepth
 }
 
 // validNameErr validates a simple name using the builder's configured validator.
@@ -677,6 +678,7 @@ func (b *builder) nest() *builder {
 		customDecoderMap: b.customDecoderMap,
 		customSNMap:      b.customSNMap,
 		cachedNames:      b.cachedNames,
+		depth:            b.depth,
 	}
 }
 
@@ -777,6 +779,11 @@ func (b *builder) build(parentName string, s *aschema) error {
 	if s == nil || s.primitive == "" && s.object == nil && len(s.union) == 0 {
 		return errors.New("schema is not a primitive, complex, nor union")
 	}
+	if b.depth >= maxDepth {
+		return fmt.Errorf("schema nests deeper than the supported limit (%d)", maxDepth)
+	}
+	b.depth++
+	defer func() { b.depth-- }()
 
 	var err error
 	switch {
@@ -885,8 +892,13 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 			// Dereference pointers and interface wrappers so GoType
 			// matching compares against the concrete type. Check GoType
 			// at each level so pointer-valued GoTypes (e.g. *url.URL)
-			// match before the pointer is stripped.
-			for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
+			// match before the pointer is stripped. Capped at
+			// maxIndirectDepth so a self-referential interface
+			// (var p any; p = &p) can't spin forever here.
+			for range maxIndirectDepth {
+				if v.Kind() != reflect.Pointer && v.Kind() != reflect.Interface {
+					break
+				}
 				if v.IsNil() {
 					return v, nil
 				}
@@ -938,12 +950,12 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		// keep their unwrapped ser/deser.
 		innerSer := node.ser
 		ce := customEncode
-		b.ser = func(dst []byte, v reflect.Value) ([]byte, error) {
+		b.ser = func(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 			v, err := ce(v)
 			if err != nil {
 				return nil, err
 			}
-			return innerSer(dst, v)
+			return innerSer(dst, v, depth+1)
 		}
 	}
 

@@ -14,7 +14,19 @@ import (
 	"time"
 )
 
-type serfn func([]byte, reflect.Value) ([]byte, error)
+type serfn func([]byte, reflect.Value, int) ([]byte, error)
+
+// maxDepth bounds recursion in both the encoder and decoder. On the
+// encoder side this protects against cyclic Go input against recursive
+// schemas (stack overflow is fatal in Go). On the decoder side it
+// protects against malicious wire data driving unbounded recursion via
+// recursive schemas (e.g. linked-list "Node" with all "next" fields
+// non-null). 1000 is well below Go's stack growth limit and far above
+// any legitimate Avro depth.
+const maxDepth = 1000
+
+var errTooDeep = errors.New("avro: recursion limit exceeded (cyclic or pathologically deep input)")
+
 
 // AppendEncode appends the Avro binary encoding of v to dst. See
 // [Schema.Decode] for the Go-to-Avro type mapping. In addition to the types
@@ -34,12 +46,12 @@ func (s *Schema) AppendEncode(dst []byte, v any, opts ...Opt) ([]byte, error) {
 		case "null":
 			return dst, nil
 		case "union":
-			return s.ser(dst, rv)
+			return s.ser(dst, rv, 0)
 		default:
 			return nil, &SemanticError{AvroType: s.node.kind, Err: errors.New("cannot encode nil")}
 		}
 	}
-	return s.ser(dst, rv)
+	return s.ser(dst, rv, 0)
 }
 
 // Encode encodes v as Avro binary. It is shorthand for AppendEncode(nil, v).
@@ -75,11 +87,16 @@ func (s *serUnion) tryUnwrapTagged(v reflect.Value) (int, reflect.Value, bool) {
 
 // ser encodes a union value. Tagged union maps are tried first; if
 // that fails or v is not a tagged map, each branch is tried in order.
-func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	if idx, inner, ok := s.tryUnwrapTagged(v); ok {
 		attempt := appendVarint(dst, int32(idx))
-		if result, err := s.fns[idx](attempt, inner); err == nil {
+		if result, err := s.fns[idx](attempt, inner, depth+1); err == nil {
 			return result, nil
+		} else if errors.Is(err, errTooDeep) {
+			return nil, err
 		}
 	}
 
@@ -87,8 +104,12 @@ func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	var err error
 	for i, fn := range s.fns {
 		attempt := appendVarint(base, int32(i))
-		if attempt, err = fn(attempt, v); err == nil {
+		if attempt, err = fn(attempt, v, depth+1); err == nil {
 			return attempt, nil
+		}
+		// Propagate too-deep immediately; trial loop would mask it.
+		if errors.Is(err, errTooDeep) {
+			return nil, err
 		}
 	}
 	e := &SemanticError{AvroType: "union", Err: errors.New("no matching branch")}
@@ -106,7 +127,7 @@ func (s *serUnion) ser(dst []byte, v reflect.Value) ([]byte, error) {
 // serNullUnion handles ["null", T] unions: null is index 0 (byte 0),
 // T is index 1 (byte 2).
 func serNullUnion(u *serUnion) serfn {
-	return func(dst []byte, v reflect.Value) ([]byte, error) {
+	return func(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		if isNilValue(v) {
 			return append(dst, 0), nil
 		}
@@ -115,19 +136,21 @@ func serNullUnion(u *serUnion) serfn {
 				return append(dst, 0), nil
 			}
 			if idx == 1 {
-				if result, err := u.fns[1](append(dst, 2), inner); err == nil {
+				if result, err := u.fns[1](append(dst, 2), inner, depth+1); err == nil {
 					return result, nil
+				} else if errors.Is(err, errTooDeep) {
+					return nil, err
 				}
 			}
 		}
-		return u.fns[1](append(dst, 2), v)
+		return u.fns[1](append(dst, 2), v, depth+1)
 	}
 }
 
 // serNullSecondUnion handles ["T", "null"] unions: T is index 0 (byte 0),
 // null is index 1 (byte 2).
 func serNullSecondUnion(u *serUnion) serfn {
-	return func(dst []byte, v reflect.Value) ([]byte, error) {
+	return func(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		if isNilValue(v) {
 			return append(dst, 2), nil
 		}
@@ -136,23 +159,30 @@ func serNullSecondUnion(u *serUnion) serfn {
 				return append(dst, 2), nil
 			}
 			if idx == 0 {
-				if result, err := u.fns[0](append(dst, 0), inner); err == nil {
+				if result, err := u.fns[0](append(dst, 0), inner, depth+1); err == nil {
 					return result, nil
+				} else if errors.Is(err, errTooDeep) {
+					return nil, err
 				}
 			}
 		}
-		return u.fns[0](append(dst, 0), v)
+		return u.fns[0](append(dst, 0), v, depth+1)
 	}
 }
 
 // isNilValue reports whether v is nil, peeling through pointer and
 // interface layers. This handles the case where AppendEncode receives
 // &nilPtr (a **T with non-nil outer pointer) for a nullable union.
+//
+// Capped at maxIndirectDepth so a self-referential interface
+// (var p any; p = &p) terminates instead of looping forever; treat
+// the deeply-nested case as not-nil so the encoder reports a real
+// error downstream rather than silently encoding null.
 func isNilValue(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
 	}
-	for {
+	for range maxIndirectDepth {
 		switch v.Kind() {
 		case reflect.Pointer, reflect.Interface:
 			if v.IsNil() {
@@ -165,6 +195,7 @@ func isNilValue(v reflect.Value) bool {
 			return false
 		}
 	}
+	return false
 }
 
 ////////////////
@@ -186,7 +217,7 @@ var serPrimitive = map[string]serfn{
 // hit "null" at the start with an error. This error is saved to avoid allocs.
 var errNonNil = errors.New("cannot encode non-nil value as null")
 
-func serNull(dst []byte, v reflect.Value) ([]byte, error) {
+func serNull(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	if !v.IsValid() {
 		return dst, nil
 	}
@@ -199,7 +230,7 @@ func serNull(dst []byte, v reflect.Value) ([]byte, error) {
 	return dst, errNonNil
 }
 
-func serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
+func serBoolean(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -284,7 +315,7 @@ func jsonNumberToInt64(v reflect.Value) (int64, bool, error) {
 	return n, true, nil
 }
 
-func serInt(dst []byte, v reflect.Value) ([]byte, error) {
+func serInt(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -319,7 +350,7 @@ func serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
 }
 
-func serLong(dst []byte, v reflect.Value) ([]byte, error) {
+func serLong(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -347,7 +378,7 @@ func serLong(dst []byte, v reflect.Value) ([]byte, error) {
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
 }
 
-func serFloat(dst []byte, v reflect.Value) ([]byte, error) {
+func serFloat(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -373,12 +404,12 @@ func serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		return appendUint32(dst, math.Float32bits(float32(n))), nil
 	} else if fv, ok := jsonNumberToFloat(v); ok {
-		return serFloat(dst, fv)
+		return serFloat(dst, fv, depth)
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "float"}
 }
 
-func serDouble(dst []byte, v reflect.Value) ([]byte, error) {
+func serDouble(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -398,12 +429,12 @@ func serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		return appendUint64(dst, math.Float64bits(float64(n))), nil
 	} else if fv, ok := jsonNumberToFloat(v); ok {
-		return serDouble(dst, fv)
+		return serDouble(dst, fv, depth)
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
 }
 
-func serBytes(dst []byte, v reflect.Value) ([]byte, error) {
+func serBytes(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -416,10 +447,10 @@ func serBytes(dst []byte, v reflect.Value) ([]byte, error) {
 	if (v.Kind() != reflect.Array && v.Kind() != reflect.Slice) || v.Type().Elem().Kind() != reflect.Uint8 {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
 	}
-	return doSerBytes(dst, v), nil
+	return doSerBytes(dst, v, depth), nil
 }
 
-func serString(dst []byte, v reflect.Value) ([]byte, error) {
+func serString(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -477,7 +508,7 @@ func serString(dst []byte, v reflect.Value) ([]byte, error) {
 // STRING & BYTES //
 ////////////////////
 
-func doSerBytes(dst []byte, v reflect.Value) []byte {
+func doSerBytes(dst []byte, v reflect.Value, depth int) []byte {
 	l := v.Len()
 	dst = appendVarlong(dst, int64(l))
 	if l == 0 {
@@ -518,7 +549,10 @@ type serRecord struct {
 	fast   atomic.Pointer[fastRecordSer] // lazily compiled unsafe fast path, atomic for concurrent encode
 }
 
-func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -543,7 +577,20 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 					dst = append(dst, f.defaultBytes...)
 					continue
 				}
-				if dst, err = f.fn(dst, reflect.ValueOf(value)); err != nil {
+				// reflect.ValueOf(nil) returns the invalid zero Value,
+				// which the field fn would have to special-case via
+				// .IsValid() before any Type/Kind call. reflect.Zero(any)
+				// produces a valid zero `any` Value that flows through
+				// indirect()/serUnion's IsNil checks naturally — they
+				// recognize a nil interface and route to the union's
+				// null branch (or surface errIndirectNil on a non-union).
+				var rv reflect.Value
+				if value != nil {
+					rv = reflect.ValueOf(value)
+				} else {
+					rv = reflect.Zero(anyType)
+				}
+				if dst, err = f.fn(dst, rv, depth+1); err != nil {
 					return nil, recordFieldError(t, f.name, err)
 				}
 			}
@@ -558,7 +605,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 				dst = append(dst, f.defaultBytes...)
 				continue
 			}
-			if dst, err = f.fn(dst, value); err != nil {
+			if dst, err = f.fn(dst, value, depth+1); err != nil {
 				return nil, recordFieldError(t, f.name, err)
 			}
 		}
@@ -568,11 +615,11 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	// value so we can take a pointer for unsafe field access.
 	if v.CanAddr() {
 		if fast := s.fast.Load(); fast != nil && fast.typ == t {
-			return serRecordFast(dst, fast, v)
+			return serRecordFast(dst, fast, v, depth+1)
 		}
 		if fast := compileFastSer(s.fields, s.names, &s.cache, t); fast != nil {
 			s.fast.Store(fast)
-			return serRecordFast(dst, fast, v)
+			return serRecordFast(dst, fast, v, depth+1)
 		}
 	}
 	// Slow path: reflect-based field access.
@@ -588,7 +635,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value) ([]byte, error) {
 			dst = append(dst, 0)
 			continue
 		}
-		if dst, err = f.fn(dst, fv); err != nil {
+		if dst, err = f.fn(dst, fv, depth+1); err != nil {
 			return nil, recordFieldError(t, f.name, err)
 		}
 	}
@@ -599,7 +646,7 @@ type serEnum struct {
 	symbols []string
 }
 
-func (s *serEnum) ser(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serEnum) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -635,13 +682,16 @@ type serArray struct {
 	serItem serfn
 }
 
-func (s *serArray) ser(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serArray) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
 	}
 	for i := range l {
-		if dst, err = s.serItem(dst, v.Index(i)); err != nil {
+		if dst, err = s.serItem(dst, v.Index(i), depth+1); err != nil {
 			return nil, err
 		}
 	}
@@ -669,7 +719,7 @@ func serArrayPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, 
 // escapes through serfn function pointers. Each is selected at schema
 // build time based on the array's item type.
 
-func (s *serArray) serString(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serArray) serString(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -677,6 +727,9 @@ func (s *serArray) serString(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "string", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if elem.Type() == jsonNumberType {
@@ -693,7 +746,7 @@ func (s *serArray) serString(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serArray) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serArray) serBoolean(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -701,6 +754,9 @@ func (s *serArray) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "boolean", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if elem.Kind() != reflect.Bool {
@@ -715,7 +771,7 @@ func (s *serArray) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serArray) serInt(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serArray) serInt(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -723,6 +779,9 @@ func (s *serArray) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "int", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if elem.CanInt() {
@@ -758,7 +817,7 @@ func (s *serArray) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serArray) serLong(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -766,6 +825,9 @@ func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "long", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if elem.CanInt() {
@@ -794,7 +856,7 @@ func (s *serArray) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serArray) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serArray) serFloat(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -802,6 +864,9 @@ func (s *serArray) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "float", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if !elem.CanFloat() {
@@ -816,7 +881,7 @@ func (s *serArray) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serArray) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serArray) serDouble(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serArrayPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -824,6 +889,9 @@ func (s *serArray) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 	for i := range l {
 		elem := v.Index(i)
 		if elem.Kind() == reflect.Interface {
+			if elem.IsNil() {
+				return nil, &SemanticError{AvroType: "double", Err: errIndirectNil}
+			}
 			elem = elem.Elem()
 		}
 		if !elem.CanFloat() {
@@ -842,7 +910,10 @@ type serMap struct {
 	serItem serfn
 }
 
-func (s *serMap) ser(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serMap) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -850,7 +921,7 @@ func (s *serMap) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	iter := v.MapRange()
 	for iter.Next() {
 		dst = doSerString(dst, iter.Key().String())
-		if dst, err = s.serItem(dst, iter.Value()); err != nil {
+		if dst, err = s.serItem(dst, iter.Value(), depth+1); err != nil {
 			return nil, err
 		}
 	}
@@ -879,7 +950,7 @@ func serMapPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, er
 // escapes through serfn function pointers. Each is selected at schema
 // build time based on the map's value type.
 
-func (s *serMap) serString(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serMap) serString(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -889,6 +960,9 @@ func (s *serMap) serString(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "string", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if val.Type() == jsonNumberType {
@@ -905,7 +979,7 @@ func (s *serMap) serString(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serMap) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serMap) serBoolean(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -915,6 +989,9 @@ func (s *serMap) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "boolean", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if val.Kind() != reflect.Bool {
@@ -929,7 +1006,7 @@ func (s *serMap) serBoolean(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serMap) serInt(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serMap) serInt(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -939,6 +1016,9 @@ func (s *serMap) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "int", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if val.CanInt() {
@@ -974,7 +1054,7 @@ func (s *serMap) serInt(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serMap) serLong(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -984,6 +1064,9 @@ func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "long", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if val.CanInt() {
@@ -1012,7 +1095,7 @@ func (s *serMap) serLong(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serMap) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serMap) serFloat(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -1022,6 +1105,9 @@ func (s *serMap) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "float", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if !val.CanFloat() {
@@ -1036,7 +1122,7 @@ func (s *serMap) serFloat(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func (s *serMap) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serMap) serDouble(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	dst, v, l, err := serMapPreamble(dst, v)
 	if err != nil || l == 0 {
 		return dst, err
@@ -1046,6 +1132,9 @@ func (s *serMap) serDouble(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = doSerString(dst, iter.Key().String())
 		val := iter.Value()
 		if val.Kind() == reflect.Interface {
+			if val.IsNil() {
+				return nil, &SemanticError{AvroType: "double", Err: errIndirectNil}
+			}
 			val = val.Elem()
 		}
 		if !val.CanFloat() {
@@ -1064,7 +1153,7 @@ type serSize struct {
 	n int
 }
 
-func (s *serSize) ser(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serSize) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1224,7 +1313,7 @@ func tryParseDateString(v reflect.Value) (time.Time, bool) {
 	return t, true
 }
 
-func serTimestampMillis(dst []byte, v reflect.Value) ([]byte, error) {
+func serTimestampMillis(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1235,10 +1324,10 @@ func serTimestampMillis(dst []byte, v reflect.Value) ([]byte, error) {
 	if t, ok := tryParseTimeString(v); ok {
 		return appendVarlong(dst, timeToTimestampMillis(t)), nil
 	}
-	return serLong(dst, v)
+	return serLong(dst, v, depth)
 }
 
-func serTimestampMicros(dst []byte, v reflect.Value) ([]byte, error) {
+func serTimestampMicros(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1249,10 +1338,10 @@ func serTimestampMicros(dst []byte, v reflect.Value) ([]byte, error) {
 	if t, ok := tryParseTimeString(v); ok {
 		return appendVarlong(dst, timeToTimestampMicros(t)), nil
 	}
-	return serLong(dst, v)
+	return serLong(dst, v, depth)
 }
 
-func serTimestampNanos(dst []byte, v reflect.Value) ([]byte, error) {
+func serTimestampNanos(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1271,10 +1360,10 @@ func serTimestampNanos(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		return appendVarlong(dst, n), nil
 	}
-	return serLong(dst, v)
+	return serLong(dst, v, depth)
 }
 
-func serDate(dst []byte, v reflect.Value) ([]byte, error) {
+func serDate(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1285,10 +1374,10 @@ func serDate(dst []byte, v reflect.Value) ([]byte, error) {
 	if t, ok := tryParseDateString(v); ok {
 		return appendVarint(dst, timeToDate(t)), nil
 	}
-	return serInt(dst, v)
+	return serInt(dst, v, depth)
 }
 
-func serTimeMillis(dst []byte, v reflect.Value) ([]byte, error) {
+func serTimeMillis(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1309,10 +1398,10 @@ func serTimeMillis(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		return appendVarint(dst, ms), nil
 	}
-	return serInt(dst, v)
+	return serInt(dst, v, depth)
 }
 
-func serTimeMicros(dst []byte, v reflect.Value) ([]byte, error) {
+func serTimeMicros(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1320,10 +1409,10 @@ func serTimeMicros(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.Type() == durationType {
 		return appendVarlong(dst, durationToTimeMicros(time.Duration(v.Int()))), nil
 	}
-	return serLong(dst, v)
+	return serLong(dst, v, depth)
 }
 
-func serDuration(dst []byte, v reflect.Value) ([]byte, error) {
+func serDuration(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1332,7 +1421,7 @@ func serDuration(dst []byte, v reflect.Value) ([]byte, error) {
 		b := v.Interface().(Duration).Bytes()
 		return append(dst, b[:]...), nil
 	}
-	return (&serSize{12}).ser(dst, v)
+	return (&serSize{12}).ser(dst, v, depth)
 }
 
 // tryCoerceToRat attempts to convert a value to *big.Rat for decimal logical
@@ -1358,7 +1447,7 @@ type serBytesDecimal struct {
 	scale int
 }
 
-func (s *serBytesDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serBytesDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1374,7 +1463,7 @@ func (s *serBytesDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
 		dst = appendVarlong(dst, int64(len(b)))
 		return append(dst, b...), nil
 	}
-	return serBytes(dst, v)
+	return serBytes(dst, v, depth)
 }
 
 type serFixedDecimal struct {
@@ -1398,7 +1487,7 @@ func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
 	return append(dst, b...), nil
 }
 
-func (s *serFixedDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
+func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1410,7 +1499,7 @@ func (s *serFixedDecimal) ser(dst []byte, v reflect.Value) ([]byte, error) {
 	if r, ok := tryCoerceToRat(v); ok {
 		return s.serRat(dst, r)
 	}
-	return (&serSize{s.size}).ser(dst, v)
+	return (&serSize{s.size}).ser(dst, v, depth)
 }
 
 // ratToBytes converts a *big.Rat to big-endian two's complement bytes
@@ -1460,7 +1549,7 @@ func bigIntToBytes(i *big.Int) []byte {
 
 // serFixedUUIDReflect serializes a fixed(16) UUID. Accepts [16]byte (raw),
 // string (hex-dash UUID parsed to bytes), or []byte of length 16.
-func serFixedUUIDReflect(dst []byte, v reflect.Value) ([]byte, error) {
+func serFixedUUIDReflect(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1477,7 +1566,7 @@ func serFixedUUIDReflect(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		return append(dst, u[:]...), nil
 	}
-	return (&serSize{16}).ser(dst, v)
+	return (&serSize{16}).ser(dst, v, depth)
 }
 
 // isUUIDType returns true when t is an array of 16 uint8 bytes (e.g. [16]byte
@@ -1502,7 +1591,7 @@ func uuidToString(u [16]byte) string {
 	return string(buf[:])
 }
 
-func serUUID(dst []byte, v reflect.Value) ([]byte, error) {
+func serUUID(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
@@ -1512,5 +1601,5 @@ func serUUID(dst []byte, v reflect.Value) ([]byte, error) {
 		reflect.Copy(reflect.ValueOf(&u).Elem(), v)
 		return doSerString(dst, uuidToString(u)), nil
 	}
-	return serString(dst, v)
+	return serString(dst, v, depth)
 }

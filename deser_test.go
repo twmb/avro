@@ -5913,14 +5913,14 @@ func TestTryCompileFieldSerDefensive(t *testing.T) {
 // and usArrayDirect by passing a synthetic error-returning userfn.
 func TestUsArraySerErrorPaths(t *testing.T) {
 	errFake := fmt.Errorf("fake")
-	failFn := func(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	failFn := func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		return nil, errFake
 	}
 
 	t.Run("null_union_ptr", func(t *testing.T) {
 		fn := usArrayNullUnionPtr(failFn, 0, 2)
 		s := []*int32{ptr(int32(1))}
-		_, err := fn(nil, unsafe.Pointer(&s))
+		_, err := fn(nil, unsafe.Pointer(&s), 0)
 		if err != errFake {
 			t.Errorf("expected fake error, got %v", err)
 		}
@@ -5929,7 +5929,7 @@ func TestUsArraySerErrorPaths(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
 		fn := usArrayDirect(failFn, unsafe.Sizeof(int32(0)))
 		s := []int32{1}
-		_, err := fn(nil, unsafe.Pointer(&s))
+		_, err := fn(nil, unsafe.Pointer(&s), 0)
 		if err != errFake {
 			t.Errorf("expected fake error, got %v", err)
 		}
@@ -9702,6 +9702,252 @@ func TestFixedSliceRoundTrip(t *testing.T) {
 	if len(got.Data) != 4 || got.Data[0] != 0xDE || got.Data[3] != 0xEF {
 		t.Fatalf("unexpected data: %x", got.Data)
 	}
+}
+
+// TestDecodeReuseAnyTarget covers the indirectAlloc fix. Before the fix,
+// decoding twice into the same *any panicked with "SetInt using
+// unaddressable value": the first decode populated *any with a concrete
+// (e.g. int32) value, and the second decode's indirectAlloc unwrapped the
+// non-nil interface to that unaddressable inner value, so SetInt panicked.
+// indirectAlloc now keeps the interface as the destination unless its
+// inner is a non-nil pointer (where the pointee IS addressable).
+func TestDecodeReuseAnyTarget(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		srcs    [][]byte
+		jsonSrc [][]byte
+	}{
+		{
+			name:    "int",
+			schema:  `"int"`,
+			srcs:    [][]byte{{84}, {86}, {88}},
+			jsonSrc: [][]byte{[]byte(`42`), []byte(`43`)},
+		},
+		{
+			name:    "string",
+			schema:  `"string"`,
+			srcs:    [][]byte{{2, 'a'}, {4, 'b', 'c'}, {0}},
+			jsonSrc: [][]byte{[]byte(`"a"`), []byte(`"bc"`)},
+		},
+		{
+			name:    "boolean",
+			schema:  `"boolean"`,
+			srcs:    [][]byte{{0}, {1}, {0}},
+			jsonSrc: [][]byte{[]byte(`true`), []byte(`false`)},
+		},
+		{
+			name:    "nullable union",
+			schema:  `["null","int"]`,
+			srcs:    [][]byte{{0}, {2, 84}, {0}},
+			jsonSrc: [][]byte{[]byte(`null`), []byte(`{"int":42}`)},
+		},
+		{
+			name:    "record",
+			schema:  `{"type":"record","name":"r","fields":[{"name":"x","type":"int"}]}`,
+			srcs:    [][]byte{{84}, {86}},
+			jsonSrc: [][]byte{[]byte(`{"x":1}`), []byte(`{"x":2}`)},
+		},
+		{
+			name:    "array",
+			schema:  `{"type":"array","items":"int"}`,
+			srcs:    [][]byte{{2, 84, 0}, {0}},
+			jsonSrc: [][]byte{[]byte(`[1,2]`), []byte(`[]`)},
+		},
+		{
+			name:    "map",
+			schema:  `{"type":"map","values":"int"}`,
+			srcs:    [][]byte{{2, 2, 'k', 84, 0}, {0}},
+			jsonSrc: [][]byte{[]byte(`{"k":1}`), []byte(`{}`)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"_binary", func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v any
+			for i, src := range tc.srcs {
+				if _, err := s.Decode(src, &v); err != nil {
+					t.Fatalf("decode #%d: %v", i, err)
+				}
+			}
+		})
+		t.Run(tc.name+"_json", func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v any
+			for i, src := range tc.jsonSrc {
+				if err := s.DecodeJSON(src, &v); err != nil {
+					t.Fatalf("decode #%d: %v", i, err)
+				}
+			}
+		})
+	}
+}
+
+// TestDecodeNonEmptyInterfaceTarget covers the setIface fix. Before the
+// fix, decoding any schema into *interface{Foo()} panicked with
+// "reflect.Set: value of type X is not assignable to type
+// interface{Foo()}" — reflect.Value.Set has no built-in assignability
+// guard for interface targets. The decoder now returns a SemanticError
+// from setIface instead.
+func TestDecodeNonEmptyInterfaceTarget(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		bin    []byte
+		json   string
+	}{
+		{"int", `"int"`, []byte{84}, `42`},
+		{"long", `"long"`, []byte{84}, `42`},
+		{"float", `"float"`, []byte{0, 0, 0, 0}, `0`},
+		{"double", `"double"`, []byte{0, 0, 0, 0, 0, 0, 0, 0}, `0`},
+		{"string", `"string"`, []byte{2, 'x'}, `"x"`},
+		{"bytes", `"bytes"`, []byte{0}, `""`},
+		{"boolean", `"boolean"`, []byte{1}, `true`},
+		{"enum", `{"type":"enum","name":"e","symbols":["A"]}`, []byte{0}, `"A"`},
+		{"fixed", `{"type":"fixed","name":"f","size":4}`, []byte{1, 2, 3, 4}, `"abcd"`},
+		{"array", `{"type":"array","items":"int"}`, []byte{2, 84, 0}, `[42]`},
+		{"map", `{"type":"map","values":"int"}`, []byte{0}, `{}`},
+		{"record", `{"type":"record","name":"r","fields":[{"name":"x","type":"int"}]}`, []byte{84}, `{"x":1}`},
+		{"date", `{"type":"int","logicalType":"date"}`, []byte{84}, `42`},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, []byte{84}, `42`},
+		// null branches produce nil, which IS assignable to any
+		// interface — those legitimately decode without error.
+		// Only non-null produced values need the assignability error.
+		{"nullable union value", `["null","int"]`, []byte{2, 84}, `{"int":42}`},
+		{"3-branch bare", `["null","int","string"]`, nil, `"hello"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"_binary", func(t *testing.T) {
+			if tc.bin == nil {
+				t.Skip("no binary input")
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v interface{ Foo() }
+			_, err = s.Decode(tc.bin, &v)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+		t.Run(tc.name+"_json", func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic: %v", r)
+				}
+			}()
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var v interface{ Foo() }
+			err = s.DecodeJSON([]byte(tc.json), &v)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+	}
+}
+
+// TestDecodeReuseAnyTargetStaleKeys pins the documented stale-key
+// behavior of map reuse in deserRecord.deser and decodeRecordAny:
+// when *any already wraps a map[string]any, the decoder overwrites
+// keys present in the schema and leaves any other keys untouched.
+// This matches encoding/json's behavior when unmarshaling into a
+// non-empty map. Callers that want a fresh decode should clear or
+// replace the map.
+func TestDecodeReuseAnyTargetStaleKeys(t *testing.T) {
+	schemaA := `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`
+	schemaB := `{"type":"record","name":"S","fields":[{"name":"y","type":"int"}]}`
+	t.Run("binary_pre_seeded", func(t *testing.T) {
+		sa, err := Parse(schemaA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := sa.AppendEncode(nil, map[string]any{"x": int32(7)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v any = map[string]any{"stale": "keep me"}
+		if _, err := sa.Decode(encoded, &v); err != nil {
+			t.Fatal(err)
+		}
+		m, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("got %T, want map[string]any", v)
+		}
+		if m["x"] != int32(7) {
+			t.Fatalf("schema field not overwritten: x=%v", m["x"])
+		}
+		if got, ok := m["stale"]; !ok || got != "keep me" {
+			t.Fatalf("stale key dropped: m=%v", m)
+		}
+	})
+	t.Run("binary_different_schema", func(t *testing.T) {
+		sa, err := Parse(schemaA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sb, err := Parse(schemaB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encA, _ := sa.AppendEncode(nil, map[string]any{"x": int32(1)})
+		encB, _ := sb.AppendEncode(nil, map[string]any{"y": int32(2)})
+		var v any
+		if _, err := sa.Decode(encA, &v); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sb.Decode(encB, &v); err != nil {
+			t.Fatal(err)
+		}
+		m := v.(map[string]any)
+		if m["y"] != int32(2) {
+			t.Fatalf("y not set: %v", m)
+		}
+		if _, ok := m["x"]; !ok {
+			t.Fatalf("x cleared after second decode: %v", m)
+		}
+	})
+	t.Run("json_pre_seeded", func(t *testing.T) {
+		sa, err := Parse(schemaA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v any = map[string]any{"stale": "keep me"}
+		if err := sa.DecodeJSON([]byte(`{"x":7}`), &v); err != nil {
+			t.Fatal(err)
+		}
+		m := v.(map[string]any)
+		if m["x"] != int32(7) {
+			t.Fatalf("x not overwritten: %v", m)
+		}
+		if got, ok := m["stale"]; !ok || got != "keep me" {
+			t.Fatalf("stale key dropped: m=%v", m)
+		}
+	})
 }
 
 func TestSetLongValueInterface(t *testing.T) {

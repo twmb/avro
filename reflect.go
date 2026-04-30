@@ -15,11 +15,25 @@ var (
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 )
 
-var errIndirectNil = errors.New("invalid nil in non-union, non-null")
+var (
+	errIndirectNil  = errors.New("invalid nil in non-union, non-null")
+	errIndirectDeep = errors.New("avro: pointer/interface chain on input is cyclic or nests deeper than supported")
+)
+
+// maxIndirectDepth bounds indirect/indirectAlloc unwrap loops. A self-
+// referential interface (e.g. `var p any; p = &p`) creates a real cycle in
+// Go that would otherwise spin forever in reflect.Value.Elem(). Five levels
+// of pointer/interface wrapping is more than any realistic user value.
+const maxIndirectDepth = 5
 
 func indirect(v reflect.Value) (reflect.Value, error) {
-	for {
+	for range maxIndirectDepth {
 		switch v.Kind() {
+		case reflect.Invalid:
+			// Defensive: an invalid Value (e.g. reflect.ValueOf(nil)
+			// somewhere internally) reaches this guard rather than
+			// panicking on a subsequent v.Type() call. Treat as nil.
+			return v, errIndirectNil
 		case reflect.Pointer, reflect.Interface:
 			if v.IsNil() {
 				return v, errIndirectNil
@@ -29,10 +43,11 @@ func indirect(v reflect.Value) (reflect.Value, error) {
 			return v, nil
 		}
 	}
+	return v, errIndirectDeep
 }
 
 func indirectAlloc(v reflect.Value) reflect.Value {
-	for {
+	for range maxIndirectDepth {
 		switch v.Kind() {
 		case reflect.Pointer:
 			if v.IsNil() {
@@ -43,11 +58,76 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 			if v.IsNil() {
 				return v
 			}
-			v = v.Elem()
+			// Non-nil interface: unwrap only if the inner is a
+			// non-nil pointer (write through the pointer is
+			// addressable). For ANY other concrete — primitives,
+			// structs, slices, maps, nil pointers — v.Elem() is
+			// not addressable. Some decoders reach for v.Set(...)
+			// on the unwrapped value (e.g. decodeNull zeros it,
+			// decodeArray replaces the slice), which panics. Keep
+			// the interface itself as the destination so those
+			// decoders write via Set on the settable interface
+			// Value.
+			inner := v.Elem()
+			if inner.Kind() != reflect.Pointer || inner.IsNil() {
+				return v
+			}
+			v = inner
 		default:
 			return v
 		}
 	}
+	return v
+}
+
+// setIface assigns rv to an interface-kind v with an assignability
+// check. Returns a SemanticError if rv's type isn't assignable to v's
+// interface type — the common case being a user passing
+// *interface{Foo()} as a decode target, where the decoder produces a
+// value that doesn't implement Foo. Without the check, reflect.Value.Set
+// panics with "value of type X is not assignable to type Y".
+//
+// Caller contract: v.Kind() must be reflect.Interface. Concrete-kind v
+// is rejected with a SemanticError rather than silently calling Set.
+// The previous NumMethod()==0 shortcut would have spuriously
+// short-circuited on any methodless concrete type (e.g. [16]byte,
+// time.Duration), so a future change that produced an rv of a
+// mismatched type would have panicked on Set. Concrete-target paths
+// must split the dispatch at the call site — see deserFixedUUIDReflect
+// (Interface vs isUUIDType arms), deserTimeMillis (Interface vs
+// durationType), and deserDuration (Interface vs avroDurationType) for
+// the pattern.
+//
+// Use this on the cold paths (logical types, promoted decoders, resolved
+// records, etc.) where the per-call function-boundary cost doesn't matter.
+//
+// On the HOT primitive paths (deserBoolean / setIntValue / deserString /
+// the toAny=true branches in json_decode), do NOT use setIface. Pass rv
+// across a function boundary and escape analysis loses sight of it,
+// forcing every reflect.ValueOf(primitive) call to heap-allocate per
+// decode (~+2 allocs / +330 B per record decode in the bench). Inline the
+// check at the callsite instead, with the fast path written first so
+// rv only exists on the slow branch:
+//
+//	if v.Type().NumMethod() == 0 {        // empty interface (any) — common
+//	    v.Set(reflect.ValueOf(b))
+//	    return nil
+//	}
+//	rv := reflect.ValueOf(b)              // slow path: typed interface
+//	if !rv.Type().AssignableTo(v.Type()) {
+//	    return &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+//	}
+//	v.Set(rv)
+//	return nil
+func setIface(v, rv reflect.Value, avroType string) error {
+	if v.Kind() != reflect.Interface {
+		return &SemanticError{GoType: v.Type(), AvroType: avroType}
+	}
+	if v.Type().NumMethod() == 0 || rv.Type().AssignableTo(v.Type()) {
+		v.Set(rv)
+		return nil
+	}
+	return &SemanticError{GoType: v.Type(), AvroType: avroType}
 }
 
 // fieldByIndex is like reflect.Value.FieldByIndex but allocates nil embedded
