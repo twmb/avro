@@ -5913,14 +5913,14 @@ func TestTryCompileFieldSerDefensive(t *testing.T) {
 // and usArrayDirect by passing a synthetic error-returning userfn.
 func TestUsArraySerErrorPaths(t *testing.T) {
 	errFake := fmt.Errorf("fake")
-	failFn := func(dst []byte, p unsafe.Pointer) ([]byte, error) {
+	failFn := func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		return nil, errFake
 	}
 
 	t.Run("null_union_ptr", func(t *testing.T) {
 		fn := usArrayNullUnionPtr(failFn, 0, 2)
 		s := []*int32{ptr(int32(1))}
-		_, err := fn(nil, unsafe.Pointer(&s))
+		_, err := fn(nil, unsafe.Pointer(&s), 0)
 		if err != errFake {
 			t.Errorf("expected fake error, got %v", err)
 		}
@@ -5929,7 +5929,7 @@ func TestUsArraySerErrorPaths(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
 		fn := usArrayDirect(failFn, unsafe.Sizeof(int32(0)))
 		s := []int32{1}
-		_, err := fn(nil, unsafe.Pointer(&s))
+		_, err := fn(nil, unsafe.Pointer(&s), 0)
 		if err != errFake {
 			t.Errorf("expected fake error, got %v", err)
 		}

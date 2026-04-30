@@ -938,12 +938,12 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		// keep their unwrapped ser/deser.
 		innerSer := node.ser
 		ce := customEncode
-		b.ser = func(dst []byte, v reflect.Value) ([]byte, error) {
+		b.ser = func(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 			v, err := ce(v)
 			if err != nil {
 				return nil, err
 			}
-			return innerSer(dst, v)
+			return innerSer(dst, v, depth+1)
 		}
 	}
 

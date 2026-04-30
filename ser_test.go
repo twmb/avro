@@ -339,6 +339,34 @@ func TestSerRecordMapNullField(t *testing.T) {
 	})
 }
 
+// TestEncodeCyclicInput covers the depth-bound fix. A cyclic
+// map[string]any (m["next"] = m) against a recursive schema would
+// otherwise stack-overflow the goroutine — fatal in Go (not
+// recoverable via recover). The encoder now bails with a clean error.
+func TestEncodeCyclicInput(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"Node","fields":[
+		{"name":"value","type":"int"},
+		{"name":"next","type":["null","Node"]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := map[string]any{"value": int32(1)}
+	node["next"] = node
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panicked: %v", r)
+		}
+	}()
+	_, err = s.AppendEncode(nil, node)
+	if err == nil {
+		t.Fatal("expected error on cyclic input, got nil")
+	}
+	if !errors.Is(err, errEncodeTooDeep) {
+		t.Fatalf("expected errEncodeTooDeep, got %v", err)
+	}
+}
+
 // TestSerArrayNilAnyElement covers the specialized serArray fast paths
 // (string/boolean/int/long/float/double item types). A nil interface element
 // in []any unwraps to an invalid reflect.Value; calling .Type() / .Bool() /
@@ -404,12 +432,12 @@ func TestSerNullNonNilableType(t *testing.T) {
 	// serNull should not panic when given a non-nilable type (int, string, etc.).
 	// It should return errNonNil, not crash.
 	v := reflect.ValueOf(42)
-	_, err := serNull(nil, v)
+	_, err := serNull(nil, v, 0)
 	if err != errNonNil {
 		t.Fatalf("expected errNonNil, got %v", err)
 	}
 	v = reflect.ValueOf("hello")
-	_, err = serNull(nil, v)
+	_, err = serNull(nil, v, 0)
 	if err != errNonNil {
 		t.Fatalf("expected errNonNil, got %v", err)
 	}

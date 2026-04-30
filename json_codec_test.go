@@ -748,7 +748,7 @@ func TestAppendAvroJSONTypeErrors(t *testing.T) {
 			if tt.kind == "map" {
 				node.values = &schemaNode{kind: "int"}
 			}
-			_, err := appendAvroJSON(nil, reflect.ValueOf(tt.val), node, &optConfig{}, nil)
+			_, err := appendAvroJSON(nil, reflect.ValueOf(tt.val), node, &optConfig{}, nil, 0)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -758,7 +758,7 @@ func TestAppendAvroJSONTypeErrors(t *testing.T) {
 
 func TestAppendAvroJSONFixedReflect(t *testing.T) {
 	node := &schemaNode{kind: "fixed", size: 3}
-	buf, err := appendAvroJSON(nil, reflect.ValueOf([3]byte{1, 2, 3}), node, &optConfig{}, nil)
+	buf, err := appendAvroJSON(nil, reflect.ValueOf([3]byte{1, 2, 3}), node, &optConfig{}, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,7 +767,7 @@ func TestAppendAvroJSONFixedReflect(t *testing.T) {
 	}
 
 	// Non-byte array should error.
-	_, err = appendAvroJSON(nil, reflect.ValueOf([3]int{1, 2, 3}), node, &optConfig{}, nil)
+	_, err = appendAvroJSON(nil, reflect.ValueOf([3]int{1, 2, 3}), node, &optConfig{}, nil, 0)
 	if err == nil {
 		t.Fatal("expected error for non-byte array")
 	}
@@ -778,7 +778,7 @@ func TestAppendAvroJSONUnionNoMatch(t *testing.T) {
 		kind:     "union",
 		branches: []*schemaNode{{kind: "null"}, {kind: "string"}},
 	}
-	_, err := appendAvroJSON(nil, reflect.ValueOf(int32(42)), node, &optConfig{}, nil)
+	_, err := appendAvroJSON(nil, reflect.ValueOf(int32(42)), node, &optConfig{}, nil, 0)
 	if err == nil {
 		t.Fatal("expected error for unmatched union")
 	}
@@ -786,7 +786,7 @@ func TestAppendAvroJSONUnionNoMatch(t *testing.T) {
 
 func TestAppendAvroJSONUnknownKind(t *testing.T) {
 	node := &schemaNode{kind: "bogus"}
-	_, err := appendAvroJSON(nil, reflect.ValueOf(42), node, &optConfig{}, nil)
+	_, err := appendAvroJSON(nil, reflect.ValueOf(42), node, &optConfig{}, nil, 0)
 	if err == nil {
 		t.Fatal("expected error for unknown kind")
 	}
