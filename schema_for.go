@@ -494,8 +494,15 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string, c
 	if f.dflt != nil {
 		var v any
 		raw := *f.dflt
-		// Try JSON parse first; fall back to bare string.
-		if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		// Try JSON parse first; fall back to bare string. UseNumber
+		// preserves long precision: a default like "9223372036854775807"
+		// (MaxInt64) round-trips through float64 → "9.223372036854776e+18"
+		// without it, which Parse then rejects via floatFitsInt64.
+		// Mirrors unmarshalDefault (schema.go) on the Parse side; the
+		// two sites must stay in lockstep on number-precision handling.
+		dec := json.NewDecoder(strings.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&v); err != nil {
 			v = raw
 		}
 		fieldDef["default"] = v
@@ -571,6 +578,24 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 }
 
 // inferType returns the Avro schema for a Go type.
+// baseTypeForLogical returns the underlying Avro type required by the
+// given logical type per the Avro 1.12 spec. Used by SchemaFor's
+// inferType to produce schemas that validateLogical (schema.go) will
+// accept regardless of the Go source type's natural Avro mapping —
+// e.g. time-millis MUST annotate int even when the Go field is
+// time.Time (whose default mapping is long).
+func baseTypeForLogical(logical, fallback string) string {
+	switch logical {
+	case "date", "time-millis":
+		return "int"
+	case "time-micros",
+		"timestamp-millis", "timestamp-micros", "timestamp-nanos",
+		"local-timestamp-millis", "local-timestamp-micros", "local-timestamp-nanos":
+		return "long"
+	}
+	return fallback
+}
+
 func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]string, customTypes []CustomType) (any, error) {
 	// Check custom types before anything else (including pointer unwrapping).
 	for _, ct := range customTypes {
@@ -598,29 +623,25 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		return []any{"null", inner}, nil
 	}
 
-	// Logical types for known Go types.
+	// Logical types for known Go types. The base type is determined by
+	// the logical's spec-required underlying Avro type (NOT by the Go
+	// source type), so e.g. `time.Time` tagged time-millis correctly
+	// emits {int, time-millis} and `time.Duration` tagged
+	// timestamp-millis correctly emits {long, timestamp-millis}.
 	switch t {
 	case timeType:
 		lt := logical
 		if lt == "" {
 			lt = "timestamp-millis"
 		}
-		base := "long"
-		if lt == "date" {
-			base = "int"
-		}
-		return map[string]any{"type": base, "logicalType": lt}, nil
+		return map[string]any{"type": baseTypeForLogical(lt, "long"), "logicalType": lt}, nil
 
 	case durationType:
 		lt := logical
 		if lt == "" {
 			lt = "time-millis"
 		}
-		base := "int"
-		if lt == "time-micros" {
-			base = "long"
-		}
-		return map[string]any{"type": base, "logicalType": lt}, nil
+		return map[string]any{"type": baseTypeForLogical(lt, "long"), "logicalType": lt}, nil
 
 	case bigRatPtrType, bigRatValueType:
 		if logical != "decimal" || decimal == [2]int{} {

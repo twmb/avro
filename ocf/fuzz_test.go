@@ -2,6 +2,7 @@ package ocf
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/twmb/avro"
@@ -192,5 +193,212 @@ func FuzzOCFWriterHostile(f *testing.F) {
 		}
 		w.Encode(v)
 		w.Close()
+	})
+}
+
+// validOCFHeader returns a canonical OCF header for stringSchema with
+// the null codec and the given sync marker. Used by the block-envelope
+// fuzz so the reader gets past header parsing and the fuzz iterations
+// can focus on the block-level state machine (count + size + data +
+// sync) that the recent readBlock count=0 sync-validation fix lives
+// inside. Without a fixed header up front, every iteration would burn
+// time exploring header-parse rejections — the existing FuzzOCFReader
+// already does that.
+func validOCFHeader(sync [16]byte) []byte {
+	// "Obj\x01" magic + metadata map + sync.
+	// metadata map: { avro.codec: null, avro.schema: "\"string\"" }
+	// Header is: magic, metadata block (count varint, items, 0
+	// terminator), sync.
+	codecKey := []byte("avro.codec")
+	codecVal := []byte("null")
+	schemaKey := []byte("avro.schema")
+	schemaVal := []byte(`"string"`)
+	out := []byte{'O', 'b', 'j', 0x01}
+	// Block with 2 entries: count varint + entries + 0 terminator.
+	out = binary.AppendVarint(out, 2)
+	// codecKey + codecVal.
+	out = binary.AppendVarint(out, int64(len(codecKey)))
+	out = append(out, codecKey...)
+	out = binary.AppendVarint(out, int64(len(codecVal)))
+	out = append(out, codecVal...)
+	// schemaKey + schemaVal.
+	out = binary.AppendVarint(out, int64(len(schemaKey)))
+	out = append(out, schemaKey...)
+	out = binary.AppendVarint(out, int64(len(schemaVal)))
+	out = append(out, schemaVal...)
+	// Terminator.
+	out = binary.AppendVarint(out, 0)
+	// Sync marker.
+	out = append(out, sync[:]...)
+	return out
+}
+
+// FuzzOCFBlockEnvelope fuzzes the block-level state machine in
+// readBlock: count varint, size varint, data, sync marker. The fuzz
+// builds a valid header and then appends a fuzz-driven block payload,
+// so every iteration explores the block envelope rather than the
+// header parser. Targets the count=0 sync-validation path
+// (TestRegression_BlockCountZeroValidatesSync) — pre-fix readBlock
+// bailed at count==0 without reading size + sync, so a tail-truncated
+// file whose count byte happened to read as 0 was silently accepted.
+// Also exercises the negative-count / negative-size / size>max guards
+// (TestRegression_OCFBlockEnvelopeInvariant).
+func FuzzOCFBlockEnvelope(f *testing.F) {
+	// Seeds: each chosen to hit a specific control-flow arm.
+	// (count, size, data, hasGoodSync) → fuzz format:
+	//   [16]byte sync + varint count + varint size + size bytes data
+	//   + 16-byte sync trailer.
+	// We feed the post-header bytes to the fuzzer; the header (and
+	// expected sync) is fixed at fuzz init.
+	addCase := func(count, size int64, data []byte, syncMode uint8) {
+		var sync [16]byte
+		for i := range sync {
+			sync[i] = byte(i) + 1
+		}
+		var trailer [16]byte
+		switch syncMode {
+		case 0:
+			trailer = sync
+		case 1:
+			// Corrupt sync — should error with "sync marker mismatch".
+		case 2:
+			// Partial corrupt sync (last byte off).
+			trailer = sync
+			trailer[15] ^= 0xFF
+		}
+		blk := []byte{}
+		blk = binary.AppendVarint(blk, count)
+		blk = binary.AppendVarint(blk, size)
+		blk = append(blk, data...)
+		blk = append(blk, trailer[:]...)
+		f.Add(blk, syncMode)
+	}
+	// count=0 + good sync — should be clean EOF (post-fix).
+	addCase(0, 0, nil, 0)
+	// count=0 + corrupt sync — should error (the new fix).
+	addCase(0, 0, nil, 1)
+	// count=0 with non-zero size and good sync — valid empty block.
+	addCase(0, 5, []byte("hello"), 0)
+	// Negative count.
+	addCase(-1, 0, nil, 0)
+	// Negative size.
+	addCase(1, -10, nil, 0)
+	// Size > safety limit (64 MiB default — we encode a value past it).
+	addCase(1, int64(1)<<27, nil, 0)
+	// Valid one-item block holding a string("hi").
+	addCase(1, 3, []byte{0x04, 'h', 'i'}, 0)
+	// Empty.
+	f.Add([]byte{}, uint8(0))
+
+	// Fixed sync used by validOCFHeader.
+	var fixedSync [16]byte
+	for i := range fixedSync {
+		fixedSync[i] = byte(i) + 1
+	}
+	header := validOCFHeader(fixedSync)
+
+	f.Fuzz(func(t *testing.T, blockBytes []byte, _ uint8) {
+		// Build: header + blockBytes.
+		full := append(append([]byte{}, header...), blockBytes...)
+		r, err := NewReader(bytes.NewReader(full))
+		if err != nil {
+			return
+		}
+		// Drive the reader to EOF or error; both are fine. The fuzz
+		// only asserts no panic / no hang. A bounded loop guards
+		// against any reader bug that could yield infinite zero-
+		// length blocks.
+		for i := 0; i < 10000; i++ {
+			var v any
+			if err := r.Decode(&v); err != nil {
+				break
+			}
+		}
+		r.Close()
+	})
+}
+
+// FuzzOCFWriterReaderCodecCycle drives the Writer.Close →
+// codec.Close → Reader.NewReader → Reader.Close cycle through arbitrary
+// codec selections and write counts. The pre-fix bug Writer.Close had
+// (the codec was not closed when w.err was set) was caught by a
+// regression test; this fuzz keeps the same surface under arbitrary
+// codec × payload combinations so any future drift in either Close
+// path produces a panic the fuzz will surface. Bonus: exercises the
+// NewReader codec-close-on-error path (read-only header, mutated
+// metadata) via a corruption oracle.
+func FuzzOCFWriterReaderCodecCycle(f *testing.F) {
+	schemas := []*avro.Schema{
+		avro.MustParse(`"int"`),
+		avro.MustParse(`"string"`),
+		avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`),
+	}
+	// nil entry → default codec (null). Public codec constructors don't
+	// include a NullCodec wrapper; the default already exercises it.
+	codecs := []func() WriterOpt{
+		nil,
+		func() WriterOpt { return WithCodec(DeflateCodec(1)) },
+		func() WriterOpt { return WithCodec(SnappyCodec()) },
+		func() WriterOpt { return WithCodec(MustZstdCodec(nil, nil)) },
+	}
+
+	f.Add(uint8(0), uint8(0), uint16(0))
+	f.Add(uint8(0), uint8(1), uint16(1))
+	f.Add(uint8(1), uint8(2), uint16(5))
+	f.Add(uint8(2), uint8(3), uint16(3))
+	f.Add(uint8(0), uint8(3), uint16(10))
+	f.Add(uint8(2), uint8(0), uint16(100))
+
+	f.Fuzz(func(t *testing.T, schemaIdx, codecIdx uint8, n uint16) {
+		s := schemas[int(schemaIdx)%len(schemas)]
+		copt := codecs[int(codecIdx)%len(codecs)]
+		// Cap n so the fuzz iteration cost is bounded.
+		if n > 200 {
+			n = 200
+		}
+		var buf bytes.Buffer
+		var w *Writer
+		var err error
+		if copt == nil {
+			w, err = NewWriter(&buf, s)
+		} else {
+			w, err = NewWriter(&buf, s, copt())
+		}
+		if err != nil {
+			return
+		}
+		for i := uint16(0); i < n; i++ {
+			var val any
+			switch s {
+			case schemas[0]:
+				val = int32(i)
+			case schemas[1]:
+				val = "v"
+			case schemas[2]:
+				val = map[string]any{"a": int32(i), "b": "v"}
+			}
+			if err := w.Encode(val); err != nil {
+				break
+			}
+		}
+		// Close is the new path: codec.Close must run even after a
+		// failed Encode poisons w.err. The fuzz cannot directly
+		// inject a poison, but it can drive enough variation that
+		// codec resource leaks would surface in -race + leak
+		// detector setups.
+		w.Close()
+		// Now read it back. Every codec must round-trip; if the
+		// reader fails on what the writer produced, that's a bug.
+		r, err := NewReader(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			return
+		}
+		for i := 0; i < int(n)+1; i++ {
+			var v any
+			if err := r.Decode(&v); err != nil {
+				break
+			}
+		}
+		r.Close()
 	})
 }

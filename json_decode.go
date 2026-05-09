@@ -1,7 +1,7 @@
 package avro
 
 import (
-	"encoding/json"
+	"encoding"
 	"errors"
 	"fmt"
 	"math"
@@ -24,28 +24,37 @@ func decodeLogicalInt(val int32, node *schemaNode) any {
 }
 
 // decodeLogicalLong applies logical type conversion for long-backed logical types
-// when decoding to *any targets.
-func decodeLogicalLong(val int64, node *schemaNode) any {
+// when decoding to *any targets. Returns an error only for time-micros when
+// val * time.Microsecond would wrap; the timestamp conversions are total.
+func decodeLogicalLong(val int64, node *schemaNode) (any, error) {
 	switch node.logical {
 	case "timestamp-millis", "local-timestamp-millis":
-		return timestampMillisToTime(val)
+		return timestampMillisToTime(val), nil
 	case "timestamp-micros", "local-timestamp-micros":
-		return timestampMicrosToTime(val)
+		return timestampMicrosToTime(val), nil
 	case "timestamp-nanos", "local-timestamp-nanos":
-		return timestampNanosToTime(val)
+		return timestampNanosToTime(val), nil
 	case "time-micros":
 		return timeMicrosToDuration(val)
 	}
-	return val
+	return val, nil
 }
 
-// decodeLogicalBytes applies logical type conversion for bytes-backed logical types
-// when decoding to *any targets.
-func decodeLogicalBytes(b []byte, node *schemaNode) any {
+// decodeLogicalBytes applies logical type conversion for bytes-backed
+// logical types when decoding to *any targets. Errors on malformed
+// payloads.
+func decodeLogicalBytes(b []byte, node *schemaNode) (any, error) {
 	if node.logical == "decimal" {
-		return bytesToRat(b, node.scale)
+		return bytesToRat(b, node.scale), nil
 	}
-	return b
+	if node.logical == "big-decimal" {
+		r, _, err := parseBigDecimalPayload(b)
+		if err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+	return b, nil
 }
 
 // decodeLogicalFixed applies logical type conversion for fixed-backed logical types
@@ -57,6 +66,10 @@ func decodeLogicalFixed(b []byte, node *schemaNode) any {
 	case "duration":
 		if len(b) == 12 {
 			return DurationFromBytes(b)
+		}
+	case "uuid":
+		if len(b) == 16 {
+			return [16]byte(b)
 		}
 	}
 	return b
@@ -101,8 +114,6 @@ func (ctx *jsonDecoder) consumeSlabString() (string, error) {
 type jsonDecoder struct {
 	scanner        *jsonScanner
 	slab           *slab
-	customDecoders map[*schemaNode][]func(any, *SchemaNode) (any, error)
-	customSNs      map[*schemaNode]*SchemaNode
 	wrapUnions     bool
 	qualifyLogical bool
 }
@@ -113,19 +124,31 @@ type jsonDecoder struct {
 // For interface (any) targets, it produces JSON-native or enriched Go
 // values. For typed targets (struct, int, string, etc.), it assigns
 // directly.
+//
+// When the node carries a custom-decoder wrapper (decodeJSON), the
+// wrapper handles the dispatch — it captures the decoder chain at
+// schema build, calls decodeKind for the inner value, then applies
+// each custom decoder in turn. No runtime map lookup, no recursion
+// guard. Concurrency safety is structural: the schema graph is
+// read-only at decode time and the jsonDecoder is per-call.
 func (ctx *jsonDecoder) decodeValue(v reflect.Value, node *schemaNode) error {
 	if ctx.slab.depth >= maxDepth {
 		return errTooDeep
 	}
 	ctx.slab.depth++
 	defer func() { ctx.slab.depth-- }()
-	// For custom decoders, we must produce an any value first, pass
-	// it through the decoder chain, then assign. This is the only
-	// case where typed targets go through an intermediate.
-	if decs := ctx.customDecoders[node]; len(decs) > 0 {
-		return ctx.decodeWithCustom(v, node, decs)
+	if node.decodeJSON != nil {
+		return node.decodeJSON(ctx, v, node)
 	}
+	return ctx.decodeKind(v, node)
+}
 
+// decodeKind is decodeValue minus the depth guard and the
+// custom-decoder dispatch — just the kind switch. Called directly by
+// decodeValue for nodes without custom decoders, and by the
+// custom-decoder closure to produce the inner *any value before
+// applying the decoder chain.
+func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 	// Unions handle pointer/nil targets specially (before indirectAlloc),
 	// so dispatch early.
 	if node.kind == "union" {
@@ -145,11 +168,11 @@ func (ctx *jsonDecoder) decodeValue(v reflect.Value, node *schemaNode) error {
 	case "long":
 		return ctx.decodeLong(v, node, toAny)
 	case "float":
-		return ctx.decodeFloat(v, toAny)
+		return ctx.decodeFloat(v)
 	case "double":
-		return ctx.decodeDouble(v, toAny)
+		return ctx.decodeDouble(v)
 	case "string":
-		return ctx.decodeString(v, toAny)
+		return ctx.decodeString(v, node, toAny)
 	case "enum":
 		return ctx.decodeEnum(v, node, toAny)
 	case "bytes":
@@ -167,31 +190,30 @@ func (ctx *jsonDecoder) decodeValue(v reflect.Value, node *schemaNode) error {
 	}
 }
 
-func (ctx *jsonDecoder) decodeWithCustom(v reflect.Value, node *schemaNode, decs []func(any, *SchemaNode) (any, error)) error {
-	// Decode as-if to *any to get the enriched native value.
-	// Temporarily clear custom decoders for this node to avoid
-	// infinite recursion (decodeValue would call decodeWithCustom again).
-	saved := ctx.customDecoders[node]
-	delete(ctx.customDecoders, node)
-	var tmp any
-	tmpV := reflect.ValueOf(&tmp).Elem()
-	err := ctx.decodeValue(tmpV, node)
-	ctx.customDecoders[node] = saved
-	if err != nil {
-		return err
-	}
-	sn := ctx.customSNs[node]
-	for _, dec := range decs {
-		out, err := dec(tmp, sn)
-		if err != nil {
-			if errors.Is(err, ErrSkipCustomType) {
-				continue
-			}
+// wrapDecodeJSONWithCustomDecoders builds a per-node JSON decode
+// closure that captures the custom decoder chain — the JSON parallel
+// of wrapDeserWithCustomDecoders (custom_type.go). The inner value is
+// produced via decodeKind so we don't re-enter the wrapper for the
+// same node.
+func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, error), sn *SchemaNode) jsonDecodeFn {
+	return func(ctx *jsonDecoder, v reflect.Value, node *schemaNode) error {
+		var tmp any
+		tmpV := reflect.ValueOf(&tmp).Elem()
+		if err := ctx.decodeKind(tmpV, node); err != nil {
 			return err
 		}
-		return assignAny(indirectAlloc(v), out, node.kind)
+		for _, dec := range decoders {
+			out, err := dec(tmp, sn)
+			if err != nil {
+				if errors.Is(err, ErrSkipCustomType) {
+					continue
+				}
+				return err
+			}
+			return assignAny(indirectAlloc(v), out, node.kind)
+		}
+		return assignAny(indirectAlloc(v), tmp, node.kind)
 	}
-	return assignAny(indirectAlloc(v), tmp, node.kind)
 }
 
 func (ctx *jsonDecoder) decodeNull(v reflect.Value, toAny bool) error {
@@ -242,11 +264,12 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 		return err
 	}
 	if toAny {
+		logical := decodeLogicalInt(val, node)
 		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(decodeLogicalInt(val, node)))
+			v.Set(reflect.ValueOf(logical))
 			return nil
 		}
-		rv := reflect.ValueOf(decodeLogicalInt(val, node))
+		rv := reflect.ValueOf(logical)
 		if !rv.Type().AssignableTo(v.Type()) {
 			return &SemanticError{GoType: v.Type(), AvroType: "int"}
 		}
@@ -256,12 +279,26 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 	// All DecodeJSON entry points produce addressable values
 	// (Schema.DecodeJSON requires a pointer; recursive paths use
 	// reflect.New().Elem() or addressable struct fields).
-	if v.Type() == timeType && node.logical == "date" {
-		*(*time.Time)(v.Addr().UnsafePointer()) = dateToTime(val)
-		return nil
+	if v.Type() == timeType {
+		switch node.logical {
+		case "date":
+			*(*time.Time)(v.Addr().UnsafePointer()) = dateToTime(val)
+			return nil
+		case "time-millis":
+			// Mirrors serTimeMillis's timeType arm.
+			*(*time.Time)(v.Addr().UnsafePointer()) = timeOfDayToTime(timeMillisToDuration(val))
+			return nil
+		}
 	}
 	if v.Type() == durationType && node.logical == "time-millis" {
 		*(*time.Duration)(v.Addr().UnsafePointer()) = timeMillisToDuration(val)
+		return nil
+	}
+	// String target for date: mirrors json_codec.go's "int" date arm
+	// which accepts a date-string on encode (tryParseDateString).
+	// Parity with deserDate on the binary side.
+	if v.Kind() == reflect.String && node.logical == "date" {
+		v.SetString(dateToTime(val).Format(time.DateOnly))
 		return nil
 	}
 	return setIntValue(v, val)
@@ -277,11 +314,15 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 		return err
 	}
 	if toAny {
+		logical, err := decodeLogicalLong(val, node)
+		if err != nil {
+			return err
+		}
 		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(decodeLogicalLong(val, node)))
+			v.Set(reflect.ValueOf(logical))
 			return nil
 		}
-		rv := reflect.ValueOf(decodeLogicalLong(val, node))
+		rv := reflect.ValueOf(logical)
 		if !rv.Type().AssignableTo(v.Type()) {
 			return &SemanticError{GoType: v.Type(), AvroType: "long"}
 		}
@@ -301,35 +342,109 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 		case "timestamp-nanos", "local-timestamp-nanos":
 			*p = timestampNanosToTime(val)
 			return nil
+		case "time-micros":
+			// Mirrors serTimeMicros's timeType arm.
+			d, err := timeMicrosToDuration(val)
+			if err != nil {
+				return err
+			}
+			*p = timeOfDayToTime(d)
+			return nil
 		}
 	}
 	if v.Type() == durationType && node.logical == "time-micros" {
-		*(*time.Duration)(v.Addr().UnsafePointer()) = timeMicrosToDuration(val)
+		d, err := timeMicrosToDuration(val)
+		if err != nil {
+			return err
+		}
+		*(*time.Duration)(v.Addr().UnsafePointer()) = d
+		return nil
+	}
+	// String target for the six long-typed time logicals: mirrors the
+	// JSON encoder's "long" arm (json_codec.go), which accepts an RFC
+	// 3339 string via extractTime. Parity with deserTimeAsLong on the
+	// binary side.
+	if v.Kind() == reflect.String {
+		var t time.Time
+		switch node.logical {
+		case "timestamp-millis", "local-timestamp-millis":
+			t = timestampMillisToTime(val)
+		case "timestamp-micros", "local-timestamp-micros":
+			t = timestampMicrosToTime(val)
+		case "timestamp-nanos", "local-timestamp-nanos":
+			t = timestampNanosToTime(val)
+		default:
+			return setLongValue(v, val)
+		}
+		v.SetString(t.Format(time.RFC3339Nano))
 		return nil
 	}
 	return setLongValue(v, val)
 }
 
-func (ctx *jsonDecoder) decodeFloat(v reflect.Value, toAny bool) error {
+// isJSONNullStart reports whether the next token is the JSON "null"
+// literal. The peeked first byte 'n' is ambiguous (could also start a
+// bare lowercase "nan"); we disambiguate by checking the second byte
+// — null is the only token starting with "nu".
+func isJSONNullStart(s *jsonScanner, p byte) bool {
+	return p == 'n' && s.peekAt(1) == 'u'
+}
+
+// isBareSpecialFloatStart reports whether the next token is a bare
+// NaN / Infinity / -Infinity in any of the casings parseSpecialFloat
+// accepts (NaN / nan / NAN, Inf / inf / Infinity / infinity, etc.).
+// Mirrors the comment on consumeBareSpecialFloat — pre-fix the
+// dispatch gate only checked uppercase first letters, so lowercase
+// "nan", "inf", "-inf", "-infinity" rejected even though the quoted-
+// string arm accepts them case-insensitively via EqualFold. Now the
+// two arms have parity.
+func isBareSpecialFloatStart(s *jsonScanner, p byte) bool {
+	switch p {
+	case 'N', 'n', 'I', 'i':
+		return true
+	case '-':
+		p2 := s.peekAt(1)
+		return p2 == 'I' || p2 == 'i'
+	}
+	return false
+}
+
+func (ctx *jsonDecoder) decodeFloat(v reflect.Value) error {
 	var f float32
 	p := ctx.scanner.peek()
 	if p == '"' {
-		// NaN/Infinity as string.
+		// NaN/Infinity as string (Java JsonEncoder quoted form,
+		// twmb's default emit form).
 		s, err := ctx.scanner.consumeString()
 		if err != nil {
 			return err
 		}
-		v32, err := parseSpecialFloat32(s)
+		f64, err := parseSpecialFloat(s)
 		if err != nil {
 			return err
 		}
-		f = v32
-	} else if p == 'n' {
+		f = float32(f64)
+	} else if isJSONNullStart(ctx.scanner, p) {
 		// null → NaN (goavro convention).
 		if err := ctx.scanner.consumeNull(); err != nil {
 			return err
 		}
 		f = float32(math.NaN())
+	} else if isBareSpecialFloatStart(ctx.scanner, p) {
+		// Bare NaN / Infinity / -Infinity (fastavro / Python json.dumps
+		// with allow_nan=True). Routed through parseSpecialFloat for
+		// consistency with the quoted-string arm — casing parity is
+		// preserved so lowercase "nan", "inf", "-inf", etc. work the
+		// same as the quoted forms.
+		tok, err := ctx.scanner.consumeBareSpecialFloat()
+		if err != nil {
+			return err
+		}
+		f64, err := parseSpecialFloat(tok)
+		if err != nil {
+			return err
+		}
+		f = float32(f64)
 	} else {
 		nb, err := ctx.scanner.consumeNumberBytes()
 		if err != nil {
@@ -347,25 +462,13 @@ func (ctx *jsonDecoder) decodeFloat(v reflect.Value, toAny bool) error {
 			f = float32(f64)
 		}
 	}
-	if toAny {
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(f))
-			return nil
-		}
-		rv := reflect.ValueOf(f)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: "float"}
-		}
-		v.Set(rv)
-	} else if v.CanFloat() {
-		v.SetFloat(float64(f))
-	} else {
-		return &SemanticError{GoType: v.Type(), AvroType: "float"}
-	}
-	return nil
+	// setFloatValue's interface arm subsumes what the toAny branch
+	// would otherwise do — single point of truth for the float-target
+	// matrix shared with deserFloat.
+	return setFloatValue(v, float64(f), "float", 32)
 }
 
-func (ctx *jsonDecoder) decodeDouble(v reflect.Value, toAny bool) error {
+func (ctx *jsonDecoder) decodeDouble(v reflect.Value) error {
 	var f float64
 	p := ctx.scanner.peek()
 	if p == '"' {
@@ -378,11 +481,21 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value, toAny bool) error {
 			return err
 		}
 		f = f64
-	} else if p == 'n' {
+	} else if isJSONNullStart(ctx.scanner, p) {
 		if err := ctx.scanner.consumeNull(); err != nil {
 			return err
 		}
 		f = math.NaN()
+	} else if isBareSpecialFloatStart(ctx.scanner, p) {
+		tok, err := ctx.scanner.consumeBareSpecialFloat()
+		if err != nil {
+			return err
+		}
+		f64, err := parseSpecialFloat(tok)
+		if err != nil {
+			return err
+		}
+		f = f64
 	} else {
 		nb, err := ctx.scanner.consumeNumberBytes()
 		if err != nil {
@@ -397,31 +510,23 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value, toAny bool) error {
 		}
 		f = f64
 	}
-	if toAny {
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(f))
-			return nil
-		}
-		rv := reflect.ValueOf(f)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: "double"}
-		}
-		v.Set(rv)
-	} else if v.CanFloat() {
-		if v.Kind() == reflect.Float32 && !math.IsInf(f, 0) && !math.IsNaN(f) && math.IsInf(float64(float32(f)), 0) {
-			return &SemanticError{GoType: v.Type(), AvroType: "double", Err: fmt.Errorf("value %g overflows float32", f)}
-		}
-		v.SetFloat(f)
-	} else {
-		return &SemanticError{GoType: v.Type(), AvroType: "double"}
-	}
-	return nil
+	return setFloatValue(v, f, "double", 64)
 }
 
-func (ctx *jsonDecoder) decodeString(v reflect.Value, toAny bool) error {
+func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny bool) error {
 	s, err := ctx.consumeSlabString()
 	if err != nil {
 		return err
+	}
+	// UUID logical type: [16]byte target parses the hex-dash string
+	// into raw bytes, matching deserUUID on the binary side.
+	if node.logical == "uuid" && !toAny && isUUIDType(v.Type()) {
+		u, err := parseUUID(s)
+		if err != nil {
+			return err
+		}
+		reflect.Copy(v, reflect.ValueOf(u))
+		return nil
 	}
 	if toAny {
 		if v.Type().NumMethod() == 0 {
@@ -433,14 +538,28 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, toAny bool) error {
 			return &SemanticError{GoType: v.Type(), AvroType: "string"}
 		}
 		v.Set(rv)
-	} else if v.Kind() == reflect.String {
-		v.SetString(s)
-	} else if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		v.SetBytes([]byte(s))
-	} else {
-		return &SemanticError{GoType: v.Type(), AvroType: "string"}
+		return nil
 	}
-	return nil
+	if v.Kind() == reflect.String {
+		v.SetString(s)
+		return nil
+	}
+	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
+	// should use their text parsing, not raw byte assignment. Mirrors
+	// deserString's order so binary and JSON decoders agree on which
+	// Go target types accept Avro string.
+	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
+		// s borrows the slab; allocate fresh storage for the callee.
+		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(s)); err != nil {
+			return err
+		}
+		return nil
+	}
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		v.SetBytes([]byte(s))
+		return nil
+	}
+	return &SemanticError{GoType: v.Type(), AvroType: "string"}
 }
 
 func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode, toAny bool) error {
@@ -448,21 +567,37 @@ func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode, toAny bool
 	if err != nil {
 		return err
 	}
-	valid := false
-	for _, sym := range node.symbols {
+	idx := -1
+	for i, sym := range node.symbols {
 		if sym == s {
-			valid = true
+			idx = i
 			break
 		}
 	}
-	if !valid {
+	if idx < 0 {
 		return fmt.Errorf("avro json: unknown enum symbol %q", s)
 	}
-	if toAny {
+	switch {
+	case toAny:
 		return setIface(v, reflect.ValueOf(s), "enum")
-	} else if v.Kind() == reflect.String {
+	case v.Kind() == reflect.String:
 		v.SetString(s)
-	} else {
+	case v.CanInt():
+		// Mirrors deserEnum's int target arm: set the symbol's
+		// ordinal so a struct with an int-typed enum field round-
+		// trips identically through binary and JSON. Java's
+		// JsonDecoder.readEnum and fastavro's read_enum both return
+		// the index — twmb's JSON path used to reject this shape.
+		if v.OverflowInt(int64(idx)) {
+			return &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
+		}
+		v.SetInt(int64(idx))
+	case v.CanUint():
+		if v.OverflowUint(uint64(idx)) {
+			return &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
+		}
+		v.SetUint(uint64(idx))
+	default:
 		return &SemanticError{GoType: v.Type(), AvroType: "enum"}
 	}
 	return nil
@@ -477,7 +612,10 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny boo
 			if err != nil {
 				return err
 			}
-			r, ok := new(big.Rat).SetString(string(nb))
+			r, ok, err := boundedRatFromString(string(nb))
+			if err != nil {
+				return fmt.Errorf("avro json: decimal %q: %w", nb, err)
+			}
 			if !ok {
 				return fmt.Errorf("avro json: invalid decimal number %q", nb)
 			}
@@ -496,7 +634,11 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny boo
 		return err
 	}
 	if toAny {
-		return setIface(v, reflect.ValueOf(decodeLogicalBytes(b, node)), "bytes")
+		val, err := decodeLogicalBytes(b, node)
+		if err != nil {
+			return err
+		}
+		return setIface(v, reflect.ValueOf(val), "bytes")
 	}
 	return assignBytes(v, b, node)
 }
@@ -509,7 +651,10 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny boo
 			if err != nil {
 				return err
 			}
-			r, ok := new(big.Rat).SetString(string(nb))
+			r, ok, err := boundedRatFromString(string(nb))
+			if err != nil {
+				return fmt.Errorf("avro json: decimal %q: %w", nb, err)
+			}
 			if !ok {
 				return fmt.Errorf("avro json: invalid decimal number %q", nb)
 			}
@@ -527,55 +672,82 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny boo
 	if err != nil {
 		return err
 	}
+	// Per spec, the JSON string for a fixed value must have exactly
+	// node.size code points (= bytes after code-point semantics).
+	// Java's JsonDecoder.readFixed enforces this; the JSON encoder
+	// produces exactly that length. Reject mismatches symmetrically.
+	if len(b) != node.size {
+		return fmt.Errorf("avro json: fixed value has %d bytes, schema declares %d", len(b), node.size)
+	}
 	if toAny {
 		return setIface(v, reflect.ValueOf(decodeLogicalFixed(b, node)), "fixed")
 	}
 	return assignBytes(v, b, node)
 }
 
-// assignBytes assigns decoded bytes to a typed target, handling decimal
-// and duration logical types.
+// assignBytes assigns decoded bytes to a typed target, handling decimal,
+// duration, and uuid logical types. Logical-arm fall-through (the arm
+// fires but doesn't return) lands on the generic byte/string/array
+// targets below.
 func assignBytes(v reflect.Value, b []byte, node *schemaNode) error {
-	if node.logical == "decimal" {
-		r := bytesToRat(b, node.scale)
-		if v.Type() == jsonNumberType {
-			v.Set(reflect.ValueOf(json.Number(r.FloatString(node.scale))))
+	switch node.logical {
+	case "decimal":
+		// Share setDecimalRat with the binary path so the JSON
+		// decoder accepts the same target types (*big.Rat, big.Rat,
+		// json.Number, *float32, *float64, *string) with the same
+		// float-overflow guards.
+		if ok, err := setDecimalRat(v, bytesToRat(b, node.scale), node.scale); ok {
+			return err
+		}
+	case "big-decimal":
+		// b is the inner big-decimal payload (length-prefixed unscaled
+		// + zigzag scale); the outer codepoint-string decode has
+		// already stripped the JSON quoting. Mirrors the binary
+		// deserBigDecimal post-readLength path INCLUDING its opaque-
+		// bytes pass-through: when the payload can't be parsed AND
+		// the target is byte-like (slice / string / array), fall
+		// through to setBytesValue below so a raw payload that the
+		// encoder accepts via serBigDecimal's serBytes fall-through
+		// round-trips. Only surface the parse error when the target
+		// is a structured big.Rat / json.Number / float / etc., which
+		// can't take raw bytes meaningfully.
+		if r, displayScale, perr := parseBigDecimalPayload(b); perr == nil {
+			if ok, err := setDecimalRat(v, r, displayScale); ok {
+				return err
+			}
+		} else if v.Kind() != reflect.Slice && v.Kind() != reflect.String && v.Kind() != reflect.Array {
+			return perr
+		}
+	case "duration":
+		if v.Type() == avroDurationType {
+			v.Set(reflect.ValueOf(DurationFromBytes(b)))
 			return nil
 		}
-		if v.Type() == bigRatType {
-			v.Set(reflect.ValueOf(*r))
+	case "uuid":
+		// UUID into a string target: format as RFC 4122 hex-dash,
+		// matching deserFixedUUIDReflect on the binary side. Plain
+		// []byte / [16]byte targets fall through to the generic
+		// byte-copy paths below.
+		if len(b) == 16 && v.Kind() == reflect.String {
+			var u [16]byte
+			copy(u[:], b)
+			v.SetString(uuidToString(u))
 			return nil
 		}
 	}
-	if node.logical == "duration" && v.Type() == avroDurationType {
-		v.Set(reflect.ValueOf(DurationFromBytes(b)))
-		return nil
-	}
-	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		v.SetBytes(b)
-		return nil
-	}
-	if v.Kind() == reflect.String {
-		v.SetString(string(b))
-		return nil
-	}
-	if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
-		reflect.Copy(v, reflect.ValueOf(b))
-		return nil
-	}
-	return &SemanticError{GoType: v.Type(), AvroType: node.kind}
+	// Generic byte-target fall-through shared with the binary path.
+	// setBytesValue handles slice/array/string (and would handle the
+	// interface arm too; the toAny branch upstream already covered
+	// interface targets for this call site).
+	return setBytesValue(v, b, node.kind)
 }
 
 // assignDecimalRat assigns a *big.Rat to a typed target for decimal fields
-// decoded from JSON numbers.
+// decoded from JSON numbers (the lenient bare-number form). Shares
+// setDecimalRat with the binary path and assignBytes' spec-form path.
 func assignDecimalRat(v reflect.Value, r *big.Rat, node *schemaNode) error {
-	if v.Type() == jsonNumberType {
-		v.Set(reflect.ValueOf(json.Number(r.FloatString(node.scale))))
-		return nil
-	}
-	if v.Type() == bigRatType {
-		v.Set(reflect.ValueOf(*r))
-		return nil
+	if ok, err := setDecimalRat(v, r, node.scale); ok {
+		return err
 	}
 	return &SemanticError{GoType: v.Type(), AvroType: node.kind}
 }
@@ -674,6 +846,9 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 	valType := v.Type().Elem()
 	if ctx.scanner.peek() != '}' {
 		elem := reflect.New(valType).Elem()
+		// Reusable key Value typed to match the user's map key type
+		// (handles `type UserID string; map[UserID]V` without panic).
+		keyVal := reflect.New(v.Type().Key()).Elem()
 		for {
 			key, err := ctx.consumeSlabString()
 			if err != nil {
@@ -685,7 +860,8 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 			if err := ctx.decodeValue(elem, node.values); err != nil {
 				return err
 			}
-			v.SetMapIndex(reflect.ValueOf(key), elem)
+			keyVal.SetString(key)
+			v.SetMapIndex(keyVal, elem)
 			elem.SetZero()
 			if ctx.scanner.peek() != ',' {
 				break
@@ -713,11 +889,11 @@ func (ctx *jsonDecoder) decodeRecord(v reflect.Value, node *schemaNode, toAny bo
 	return &SemanticError{GoType: v.Type(), AvroType: "record"}
 }
 
-// iterateRecordFields handles the common JSON object field loop for
-// records: read each key, look up the field index, skip unknown fields,
-// and call handle for known fields. After the loop, validates that all
-// required fields were seen.
-func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx int, key string) error) error {
+// iterateRecordFields drives the JSON object field loop for records:
+// dispatch each key to handle, skip unknown keys, and after the loop
+// invoke fillDefault for any absent field that has a schema default
+// (errors otherwise). fillDefault may be nil.
+func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx int, key string) error, fillDefault func(idx int) error) error {
 	seen := make([]bool, len(node.fields))
 	if ctx.scanner.peek() != '}' {
 		for {
@@ -756,8 +932,16 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 		return err
 	}
 	for i, f := range node.fields {
-		if !seen[i] && !f.hasDefault {
+		if seen[i] {
+			continue
+		}
+		if !f.hasDefault {
 			return fmt.Errorf("avro json: record %q missing required field %q", node.name, f.name)
+		}
+		if fillDefault != nil {
+			if err := fillDefault(i); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -786,15 +970,27 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 	}
 	var val any
 	valV := reflect.ValueOf(&val).Elem()
-	err := ctx.iterateRecordFields(node, func(idx int, key string) error {
-		f := &node.fields[idx]
-		if err := ctx.decodeValue(valV, f.node); err != nil {
-			return fmt.Errorf("field %q: %w", key, err)
-		}
-		m[f.name] = val
-		val = nil
-		return nil
-	})
+	err := ctx.iterateRecordFields(node,
+		func(idx int, key string) error {
+			f := &node.fields[idx]
+			if err := ctx.decodeValue(valV, f.node); err != nil {
+				return fmt.Errorf("field %q: %w", key, err)
+			}
+			m[f.name] = val
+			val = nil
+			return nil
+		},
+		func(idx int) error {
+			f := &node.fields[idx]
+			var defVal any
+			defValV := reflect.ValueOf(&defVal).Elem()
+			if err := ctx.applyFieldDefault(defValV, node, idx); err != nil {
+				return fmt.Errorf("field %q default: %w", f.name, err)
+			}
+			m[f.name] = defVal
+			return nil
+		},
+	)
 	if err != nil {
 		return err
 	}
@@ -804,18 +1000,30 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 
 func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error {
 	if v.IsNil() {
-		v.Set(reflect.MakeMap(v.Type()))
+		v.Set(reflect.MakeMapWithSize(v.Type(), len(node.fields)))
 	}
 	elem := reflect.New(v.Type().Elem()).Elem()
-	return ctx.iterateRecordFields(node, func(idx int, key string) error {
-		f := &node.fields[idx]
-		if err := ctx.decodeValue(elem, f.node); err != nil {
-			return fmt.Errorf("field %q: %w", key, err)
-		}
-		v.SetMapIndex(f.nameVal, elem)
-		elem.SetZero()
-		return nil
-	})
+	mapType := v.Type()
+	return ctx.iterateRecordFields(node,
+		func(idx int, key string) error {
+			f := &node.fields[idx]
+			if err := ctx.decodeValue(elem, f.node); err != nil {
+				return fmt.Errorf("field %q: %w", key, err)
+			}
+			v.SetMapIndex(mapKeyAs(mapType, f.nameVal), elem)
+			elem.SetZero()
+			return nil
+		},
+		func(idx int) error {
+			f := &node.fields[idx]
+			if err := ctx.applyFieldDefault(elem, node, idx); err != nil {
+				return fmt.Errorf("field %q default: %w", f.name, err)
+			}
+			v.SetMapIndex(mapKeyAs(mapType, f.nameVal), elem)
+			elem.SetZero()
+			return nil
+		},
+	)
 }
 
 func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) error {
@@ -827,19 +1035,66 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 	if err != nil {
 		return err
 	}
-	return ctx.iterateRecordFields(node, func(idx int, _ string) error {
-		f := &node.fields[idx]
-		fv := fieldByIndex(v, mapping.indices[idx])
-		return ctx.decodeValue(fv, f.node)
-	})
+	return ctx.iterateRecordFields(node,
+		func(idx int, key string) error {
+			f := &node.fields[idx]
+			fv := fieldByIndex(v, mapping.indices[idx])
+			if err := ctx.decodeValue(fv, f.node); err != nil {
+				return fmt.Errorf("field %q: %w", key, err)
+			}
+			return nil
+		},
+		func(idx int) error {
+			f := &node.fields[idx]
+			if len(mapping.indices[idx]) == 0 {
+				// Struct has no field for this Avro field — nothing to fill.
+				// Mirrors decodeRecord's tolerance of struct-field omission.
+				return nil
+			}
+			fv := fieldByIndex(v, mapping.indices[idx])
+			if err := ctx.applyFieldDefault(fv, node, idx); err != nil {
+				return fmt.Errorf("field %q default: %w", f.name, err)
+			}
+			return nil
+		},
+	)
+}
+
+// applyFieldDefault decodes the field's pre-encoded binary default
+// into target via the field's binary deserfn.
+func (ctx *jsonDecoder) applyFieldDefault(target reflect.Value, node *schemaNode, idx int) error {
+	if node.serRecord == nil || idx >= len(node.serRecord.fields) {
+		return fmt.Errorf("record has no pre-encoded default for field %d", idx)
+	}
+	enc := node.serRecord.fields[idx].defaultBytes
+	if len(enc) == 0 {
+		return fmt.Errorf("record has no pre-encoded default for field %d", idx)
+	}
+	// Copy the encoded bytes — deserfns may slab-substring into src
+	// and we don't want them to reach into the schema's shared default.
+	src := append([]byte(nil), enc...)
+	_, err := node.fields[idx].node.deser(src, target, ctx.slab)
+	return err
 }
 
 func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 	p := ctx.scanner.peek()
 
-	// JSON null → null branch. Handle before indirectAlloc so *T
-	// pointer targets stay nil.
+	// JSON null → null branch (only if the union has one). Handle
+	// before indirectAlloc so *T pointer targets stay nil. Java's
+	// JsonDecoder.readIndex and fastavro's read_index both reject
+	// null when no "null" label is in the union; we match.
 	if p == 'n' {
+		hasNull := false
+		for _, br := range node.branches {
+			if br.kind == "null" {
+				hasNull = true
+				break
+			}
+		}
+		if !hasNull {
+			return fmt.Errorf("avro json: union has no null branch but value is null at offset %d", ctx.scanner.pos)
+		}
 		if err := ctx.scanner.consumeNull(); err != nil {
 			return err
 		}
@@ -865,6 +1120,11 @@ func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toAny bool) error {
 	// Save position for backtracking.
 	savedPos := ctx.scanner.pos
+	// Preserve the deepest concrete decode error from a matched branch
+	// so a failed tagged interpretation surfaces the real reason (e.g.
+	// "cannot assign float to map[string]any") rather than being masked
+	// by the bare-fallback's generic "no union branch matched".
+	var taggedErr error
 
 	// Try tagged union: {"branchName": value}.
 	ctx.scanner.pos++ // consume '{'
@@ -893,9 +1153,11 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 							// branch is matched, so masking it as "no
 							// branch matched" would be wrong.
 							return err
+						} else {
+							taggedErr = err
 						}
 					} else {
-						err := ctx.decodeUnionBranchTyped(v, branch)
+						err := ctx.decodeValue(v, branch)
 						if err == nil {
 							if ctx.scanner.peek() == '}' {
 								ctx.scanner.pos++
@@ -903,6 +1165,8 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 							}
 						} else if errors.Is(err, errTooDeep) {
 							return err
+						} else {
+							taggedErr = err
 						}
 					}
 				}
@@ -910,13 +1174,27 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 		}
 	}
 
-	// Tagged interpretation failed — backtrack and try bare.
+	// Tagged interpretation failed — backtrack and try bare. Pass the
+	// tagged-side concrete error so it can be surfaced if bare also
+	// fails to match.
 	ctx.scanner.pos = savedPos
-	return ctx.decodeUnionBare(v, node, toAny, '{')
+	if err := ctx.decodeUnionBare(v, node, toAny, '{'); err != nil {
+		if taggedErr != nil {
+			return fmt.Errorf("%w (tagged-form: %v)", err, taggedErr)
+		}
+		return err
+	}
+	return nil
 }
 
 func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny bool, p byte) error {
-	// Match by JSON token type against branch kinds.
+	// Match by JSON token type against branch kinds. The last branch's
+	// decode error (if any) is preserved so the final message names the
+	// concrete reason — typically a target-type mismatch like the binary
+	// path reports ("cannot use map[string]any with Avro type float").
+	// Without this, callers saw a generic "no union branch matched at
+	// offset N" that hid the actual root cause.
+	var lastErr error
 	for _, branch := range node.branches {
 		if branch.kind == "null" {
 			continue
@@ -925,31 +1203,29 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny
 			continue
 		}
 		savedPos := ctx.scanner.pos
+		var err error
 		if toAny {
 			var val any
-			err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch)
+			err = ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch)
 			if err == nil {
 				return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
 			}
-			if errors.Is(err, errTooDeep) {
-				return err
-			}
 		} else {
-			err := ctx.decodeValue(v, branch)
+			err = ctx.decodeValue(v, branch)
 			if err == nil {
 				return nil
 			}
-			if errors.Is(err, errTooDeep) {
-				return err
-			}
 		}
+		if errors.Is(err, errTooDeep) {
+			return err
+		}
+		lastErr = err
 		ctx.scanner.pos = savedPos
 	}
+	if lastErr != nil {
+		return fmt.Errorf("avro json: no union branch matched at offset %d: %w", ctx.scanner.pos, lastErr)
+	}
 	return fmt.Errorf("avro json: no union branch matched at offset %d", ctx.scanner.pos)
-}
-
-func (ctx *jsonDecoder) decodeUnionBranchTyped(v reflect.Value, branch *schemaNode) error {
-	return ctx.decodeValue(v, branch)
 }
 
 func (ctx *jsonDecoder) wrapUnion(val any, branch *schemaNode) any {
@@ -984,6 +1260,13 @@ func jsonTokenMatchesBranch(p byte, branch *schemaNode) bool {
 		switch branch.kind {
 		case "int", "long", "float", "double":
 			return true
+		case "bytes", "fixed":
+			// Lenient decode: a hand-edited or alternate-tool JSON
+			// producer may emit a decimal-typed bytes/fixed branch
+			// as a bare number. decodeBytes / decodeFixed already
+			// accept both forms; dispatch must offer the branch so
+			// the number-form reaches them.
+			return branch.logical == "decimal"
 		}
 	}
 	return false

@@ -2,13 +2,18 @@ package avro
 
 import (
 	"bytes"
+	"context"
 	"encoding"
+	"encoding/binary"
 
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"reflect"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -920,7 +925,10 @@ func TestDecodeTypeMismatch(t *testing.T) {
 		{"bool into string", `"boolean"`, []byte{0x01}, ptr("")},
 		{"int into bool", `"int"`, []byte{0x36}, ptr(false)},
 		{"string into int", `"string"`, []byte{0x06, 0x66, 0x6f, 0x6f}, ptr(int32(0))},
-		{"int into float", `"int"`, []byte{0x36}, ptr(float32(0))},
+		// "int into float" used to be pinned as rejection; now
+		// supported (round-trip parity with the documented encode-side
+		// whole-number-float-as-int divergence). See
+		// TestRegression_IntLongDecodeIntoFloatJSONNumber.
 		{"fixed into int array", `{"type":"fixed","name":"f","size":6}`, []byte{1, 2, 3, 4, 5, 6}, ptr([6]int{})},
 		{"array into string", `{"type":"array","items":"int"}`, []byte{0x00}, ptr("")},
 		{"map into string", `{"type":"map","values":"int"}`, []byte{0x00}, ptr("")},
@@ -6905,7 +6913,11 @@ func TestTimeMicrosRoundTrip(t *testing.T) {
 
 func TestLocalTimestampMillisRoundTrip(t *testing.T) {
 	schema := `{"type":"long","logicalType":"local-timestamp-millis"}`
-	now := time.UnixMilli(time.Now().UnixMilli())
+	// Per Avro 1.12 spec / Java reference, local-timestamp encodes the
+	// wall-clock fields as-if-UTC; decode returns a UTC time.Time with
+	// matching wall-clock components. Use a UTC input so the host
+	// timezone doesn't affect the round-trip.
+	now := time.UnixMilli(time.Now().UnixMilli()).UTC()
 	got := roundTrip(t, schema, now)
 	if !got.Equal(now) {
 		t.Fatalf("local-timestamp-millis round trip: got %v, want %v", got, now)
@@ -6914,7 +6926,7 @@ func TestLocalTimestampMillisRoundTrip(t *testing.T) {
 
 func TestLocalTimestampMicrosRoundTrip(t *testing.T) {
 	schema := `{"type":"long","logicalType":"local-timestamp-micros"}`
-	now := time.UnixMicro(time.Now().UnixMicro())
+	now := time.UnixMicro(time.Now().UnixMicro()).UTC()
 	got := roundTrip(t, schema, now)
 	if !got.Equal(now) {
 		t.Fatalf("local-timestamp-micros round trip: got %v, want %v", got, now)
@@ -7177,6 +7189,77 @@ func TestOmitzeroStringValue(t *testing.T) {
 	}
 	if encoded[0] != 2 {
 		t.Fatalf("expected non-null union index, got %x", encoded[0])
+	}
+}
+
+// TestRegression_OmitzeroNullSecondUnion locks in that omitzero on a
+// null-SECOND union (["T","null"]) emits the correct null-branch index
+// (0x02 = zigzag 1), not 0x00. Pre-fix both the slow path
+// (serRecord.ser at ser.go:704) and the fast-path slow-fn fallback
+// (serRecordFast at unsafe.go:152) unconditionally emitted 0x00,
+// corrupting the wire for null-second unions — twmb couldn't even
+// decode its own output.
+//
+// Slow-path case: bare struct value (non-addressable in some call
+// paths or hitting the reflect fallback). Triggers the ser.go shortcut.
+func TestRegression_OmitzeroNullSecondUnion(t *testing.T) {
+	type R struct {
+		Name string `avro:"name,omitzero"`
+		Tail int32  `avro:"tail"`
+	}
+	s, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"name","type":["string","null"]},
+		{"name":"tail","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := s.AppendEncode(nil, &R{Name: "", Tail: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// name → null branch (index 1, byte 0x02), tail → 42 (zigzag 0x54).
+	want := []byte{0x02, 0x54}
+	if !bytes.Equal(enc, want) {
+		t.Fatalf("wire mismatch: got %x, want %x", enc, want)
+	}
+	var out R
+	if _, err := s.Decode(enc, &out); err != nil {
+		t.Fatalf("decode of self-produced wire bytes failed: %v (wire = %x)", err, enc)
+	}
+	if out.Tail != 42 {
+		t.Fatalf("Tail: got %d, want 42 (decoder misaligned)", out.Tail)
+	}
+}
+
+// TestRegression_OmitzeroNullSecondUnionPtr is the *T variant; this
+// exercises the fast-path's slowFn fallback at unsafe.go:152.
+func TestRegression_OmitzeroNullSecondUnionPtr(t *testing.T) {
+	type R struct {
+		Name *string `avro:"name,omitzero"`
+		Tail int32   `avro:"tail"`
+	}
+	s, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"name","type":["string","null"]},
+		{"name":"tail","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := s.AppendEncode(nil, &R{Name: nil, Tail: 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x02, 0x54}
+	if !bytes.Equal(enc, want) {
+		t.Fatalf("wire mismatch: got %x, want %x", enc, want)
+	}
+	var out R
+	if _, err := s.Decode(enc, &out); err != nil {
+		t.Fatalf("decode of self-produced wire bytes failed: %v (wire = %x)", err, enc)
+	}
+	if out.Tail != 42 {
+		t.Fatalf("Tail: got %d, want 42", out.Tail)
 	}
 }
 
@@ -8074,7 +8157,8 @@ func TestTimestampNanosRoundTrip(t *testing.T) {
 
 func TestLocalTimestampNanosRoundTrip(t *testing.T) {
 	schema := `{"type":"long","logicalType":"local-timestamp-nanos"}`
-	now := time.Now()
+	// Use UTC input — see TestLocalTimestampMillisRoundTrip rationale.
+	now := time.Now().UTC()
 	got := roundTrip(t, schema, now)
 	if !got.Equal(now) {
 		t.Fatalf("local-timestamp-nanos round trip: got %v, want %v", got, now)
@@ -8130,15 +8214,25 @@ func TestTimestampNanosDecodeUint(t *testing.T) {
 	}
 }
 
-func TestTimestampNanosDecodeError(t *testing.T) {
+// TestTimestampNanosDecodeIntoString previously asserted that decoding
+// timestamp-nanos into a *string ERRORED — that lock-in covered the
+// encoder/decoder asymmetry (encoder accepted RFC 3339 strings, decoder
+// rejected string targets). The asymmetry is now fixed: deserTimeAsLong
+// has a String arm that emits the RFC 3339 Nano form, so the round-trip
+// succeeds. See TestRegression_TimeLogicalStringRoundTrip for the full
+// matrix across all seven string-accepting time logicals; this test
+// keeps the original schema/input shape as a single-cell sanity check.
+func TestTimestampNanosDecodeIntoString(t *testing.T) {
 	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
 	now := time.Now()
 	encoded := encode(t, schema, &now)
 	var v string
 	s, _ := Parse(schema)
-	_, err := s.Decode(encoded, &v)
-	if err == nil {
-		t.Fatal("expected error decoding nanos into string")
+	if _, err := s.Decode(encoded, &v); err != nil {
+		t.Fatalf("decode nanos into string: %v", err)
+	}
+	if v == "" {
+		t.Fatal("decoded string is empty")
 	}
 }
 
@@ -8503,14 +8597,13 @@ func TestBytesDecimalDecodeFloat64Overflow(t *testing.T) {
 }
 
 func TestDecimalSchemaValidation(t *testing.T) {
-	// decimal without precision falls back to underlying bytes type.
-	_, err := Parse(`{"type":"bytes","logicalType":"decimal"}`)
-	if err != nil {
-		t.Fatalf("expected fallback to bytes, got error: %v", err)
+	// decimal without precision is invalid per spec; Java + fastavro reject.
+	if _, err := Parse(`{"type":"bytes","logicalType":"decimal"}`); err == nil {
+		t.Fatal("expected error for decimal missing precision")
 	}
-	// decimal on int falls back to underlying int type.
-	_, err = Parse(`{"type":"int","logicalType":"decimal","precision":10}`)
-	if err != nil {
+	// decimal on int is wrong-underlying-type → falls back to int (forward
+	// compat for unknown logical-on-primitive combinations).
+	if _, err := Parse(`{"type":"int","logicalType":"decimal","precision":10}`); err != nil {
 		t.Fatalf("expected fallback to int, got error: %v", err)
 	}
 }
@@ -8933,12 +9026,27 @@ func TestFieldOrderValidation(t *testing.T) {
 
 // ---- Coverage: big-decimal logical type ----
 
+// TestBigDecimalLogicalType verifies a basic big.Rat round-trip through
+// the wired big-decimal encoder/decoder. Detailed wire-format coverage
+// (Java ground truth, negative scale on decode, non-terminating rejection,
+// carrier canonicalization) is in conformance_test.go's
+// TestSpecBigDecimalWireFormat.
 func TestBigDecimalLogicalType(t *testing.T) {
-	schema := `{"type":"bytes","logicalType":"big-decimal"}`
-	input := []byte{0, 0, 0, 2, 0x01, 0x39} // scale=2, unscaled=313
-	got := roundTrip(t, schema, input)
-	if !bytes.Equal(got, input) {
-		t.Fatalf("got %x, want %x", got, input)
+	s, err := Parse(`{"type":"bytes","logicalType":"big-decimal"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := big.NewRat(313, 100)
+	enc, err := s.AppendEncode(nil, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got big.Rat
+	if _, err := s.Decode(enc, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Cmp(in) != 0 {
+		t.Fatalf("got %s, want %s", got.RatString(), in.RatString())
 	}
 }
 
@@ -8983,11 +9091,10 @@ func TestDecimalFixedPrecisionScale(t *testing.T) {
 }
 
 func TestDecimalFixedInvalidPrecision(t *testing.T) {
-	// size=1 can hold at most floor(log10(2^7-1)) = 2 digits.
-	// Invalid precision falls back to plain fixed.
-	_, err := Parse(`{"type":"fixed","name":"D","size":1,"logicalType":"decimal","precision":3}`)
-	if err != nil {
-		t.Fatalf("expected fallback to fixed, got error: %v", err)
+	// size=1 can hold at most floor(log10(2^7-1)) = 2 digits;
+	// precision=3 exceeds capacity. Java rejects, we do too.
+	if _, err := Parse(`{"type":"fixed","name":"D","size":1,"logicalType":"decimal","precision":3}`); err == nil {
+		t.Fatal("expected error for precision > fixed capacity")
 	}
 }
 
@@ -9338,18 +9445,16 @@ func TestDeserUUIDTextUnmarshalerError(t *testing.T) {
 // ---- Coverage: decimal precision <= 0, scale > precision ----
 
 func TestDecimalPrecisionZero(t *testing.T) {
-	// precision=0 falls back to underlying bytes type.
-	_, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":0}`)
-	if err != nil {
-		t.Fatalf("expected fallback to bytes, got error: %v", err)
+	// Java's LogicalTypes.Decimal.validate rejects precision <= 0;
+	// fastavro's parse_schema does too. We now match.
+	if _, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":0}`); err == nil {
+		t.Fatal("expected error for decimal precision=0")
 	}
 }
 
 func TestDecimalScaleExceedsPrecision(t *testing.T) {
-	// scale > precision falls back to underlying bytes type.
-	_, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":6}`)
-	if err != nil {
-		t.Fatalf("expected fallback to bytes, got error: %v", err)
+	if _, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":6}`); err == nil {
+		t.Fatal("expected error for decimal scale > precision")
 	}
 }
 
@@ -9969,5 +10074,2823 @@ func TestSetIntValueInterface(t *testing.T) {
 	}
 	if v.(int32) != 7 {
 		t.Errorf("got %v", v)
+	}
+}
+
+// ---- Regression tests: unsafe-fast-path parity with safe path ----
+//
+// All tests below lock in safe/unsafe behavioral parity for primitive
+// numeric and float types decoded through the struct-field unsafe fast
+// path. Pre-fix the unsafe path silently truncated/wrapped values that
+// the safe path explicitly rejected.
+
+// Finding 1: udLong narrow signed truncation.
+func TestRegression_UdLongInt8Truncates(t *testing.T) {
+	type S struct {
+		F int8 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"long"}]}`)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F int64 `avro:"f"`
+	}{F: 200}) // 200 > MaxInt8 (127)
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		t.Fatalf("expected overflow error decoding long=200 into int8, got s.F=%d (silent truncation)", s.F)
+	}
+}
+
+// Finding 2: udInt narrow signed truncation.
+func TestRegression_UdIntInt8Truncates(t *testing.T) {
+	type S struct {
+		F int8 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}]}`)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F int32 `avro:"f"`
+	}{F: 200})
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		t.Fatalf("expected overflow error decoding int=200 into int8, got s.F=%d", s.F)
+	}
+}
+
+// Finding 3: udInt unsigned wrap on negative wire value.
+func TestRegression_UdIntUint8WrapsNegative(t *testing.T) {
+	type S struct {
+		F uint8 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}]}`)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F int32 `avro:"f"`
+	}{F: -1})
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		t.Fatalf("expected error for int=-1 → uint8, got s.F=%d (silent wrap to 255)", s.F)
+	}
+}
+
+// Finding 4: udLong unsigned overflow.
+func TestRegression_UdLongUint16Truncates(t *testing.T) {
+	type S struct {
+		F uint16 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"long"}]}`)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F int64 `avro:"f"`
+	}{F: 100000}) // > MaxUint16 (65535)
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		t.Fatalf("expected overflow error decoding long=100000 into uint16, got s.F=%d", s.F)
+	}
+}
+
+// Finding 5: udDouble→Float32 missing Inf clamp.
+func TestRegression_UdDoubleFloat32MissingInfClamp(t *testing.T) {
+	type S struct {
+		F float32 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"double"}]}`)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F float64 `avro:"f"`
+	}{F: 1e40})
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		t.Fatalf("expected overflow error decoding double=1e40 into float32, got s.F=%v (isInf=%v)",
+			s.F, math.IsInf(float64(s.F), 0))
+	}
+}
+
+// Finding 6: deserFixedUUIDReflect aliased input on []byte target.
+func TestRegression_DeserFixedUUIDBytesAliasesInput(t *testing.T) {
+	sch := MustParse(`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`)
+	src := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	encoded, err := sch.AppendEncode(nil, &src)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got []byte
+	if _, err := sch.Decode(encoded, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := append([]byte(nil), got...)
+	for i := range encoded {
+		encoded[i] = 0xFF
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("decoded []byte aliases input buffer: got=%x want=%x", got, want)
+	}
+}
+
+// Finding 7: union default may match any branch — Avro 1.12+. POSITIVE
+// regression test: locks in the deliberate spec-1.12 behavior. Earlier
+// 1.11 strict-first-branch readers (and goavro) reject this; Java 1.12.0+
+// and fastavro v1.7+ accept. Reference: Apache Avro AVRO-3649 / PR #2503.
+func TestRegression_UnionDefaultAcceptsAnyBranch_Avro112(t *testing.T) {
+	if _, err := Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":["null","int"],"default":42}]}`); err != nil {
+		t.Fatalf("expected Avro 1.12+ to accept non-first-branch union default, got: %v", err)
+	}
+}
+
+// Finding 8: udLong narrow signed truncation propagates through *T.
+func TestRegression_UdNullUnionPtrInt8Truncates(t *testing.T) {
+	type S struct {
+		F *int8 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":["null","long"]}]}`)
+	v := int64(200)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F *int64 `avro:"f"`
+	}{F: &v})
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		var got int64 = -1
+		if s.F != nil {
+			got = int64(*s.F)
+		}
+		t.Fatalf("expected error decoding [null,long]=200 into *int8, got *F=%d", got)
+	}
+}
+
+// Finding 9: udDouble→Float32 inf clamp propagates through *T.
+func TestRegression_UdNullUnionPtrFloat32MissingInfClamp(t *testing.T) {
+	type S struct {
+		F *float32 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":["null","double"]}]}`)
+	v := 1e40
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F *float64 `avro:"f"`
+	}{F: &v})
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		got := math.NaN()
+		if s.F != nil {
+			got = float64(*s.F)
+		}
+		t.Fatalf("expected error decoding [null,double]=1e40 into *float32, got *F=%v (isInf=%v)",
+			got, math.IsInf(got, 0))
+	}
+}
+
+// Finding 10: udLong narrow signed propagates through []T.
+func TestRegression_UdArrayInt8Truncates(t *testing.T) {
+	type S struct {
+		F []int8 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":"long"}}]}`)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F []int64 `avro:"f"`
+	}{F: []int64{200}})
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		t.Fatalf("expected error decoding array<long>=[200] into []int8, got s.F=%v", s.F)
+	}
+}
+
+// Finding 11: udDouble→Float32 inf clamp propagates through []T.
+func TestRegression_UdArrayFloat32MissingInfClamp(t *testing.T) {
+	type S struct {
+		F []float32 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":"double"}}]}`)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F []float64 `avro:"f"`
+	}{F: []float64{1e40}})
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		isInf := len(s.F) > 0 && math.IsInf(float64(s.F[0]), 0)
+		t.Fatalf("expected error decoding array<double>=[1e40] into []float32, got s.F=%v isInf=%v", s.F, isInf)
+	}
+}
+
+// Finding 12: udLong unsigned wrap propagates through *T.
+func TestRegression_UdNullUnionPtrUint8WrapsNegative(t *testing.T) {
+	type S struct {
+		F *uint8 `avro:"f"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":["null","long"]}]}`)
+	v := int64(-1)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		F *int64 `avro:"f"`
+	}{F: &v})
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		var got int = -2
+		if s.F != nil {
+			got = int(*s.F)
+		}
+		t.Fatalf("expected error decoding [null,long]=-1 into *uint8, got *F=%d", got)
+	}
+}
+
+// TestRegression_EncodeJSONBareUnionsByDefault locks in the deliberate
+// design choice that EncodeJSON emits bare (non-tagged) unions by
+// default. This diverges from the Avro 1.12 JSON-encoding spec, which
+// requires {"type_name": value}. Spec-compliant tagged output is opt-in
+// via TaggedUnions(); see TaggedUnions doc for rationale. This test
+// exists so the choice can't drift silently — flipping it to tagged
+// would be a behavior change for existing users and must be deliberate.
+func TestRegression_EncodeJSONBareUnionsByDefault(t *testing.T) {
+	schema := MustParse(`{
+		"type":"record","name":"R",
+		"fields":[{"name":"u","type":["null","string"]}]
+	}`)
+	got, err := schema.AppendEncodeJSON(nil, map[string]any{"u": "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const bare = `{"u":"hi"}`
+	if string(got) != bare {
+		t.Fatalf("default EncodeJSON union shape changed: got %s, want %s "+
+			"(spec-compliant tagged form is %s, available via TaggedUnions())",
+			got, bare, `{"u":{"string":"hi"}}`)
+	}
+	// And TaggedUnions produces the spec-compliant form.
+	tagged, err := schema.AppendEncodeJSON(nil, map[string]any{"u": "hi"}, TaggedUnions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantTagged = `{"u":{"string":"hi"}}`
+	if string(tagged) != wantTagged {
+		t.Fatalf("TaggedUnions: got %s, want %s", tagged, wantTagged)
+	}
+}
+
+// TestRegression_DecodeJSONUnionTagFastavroShortName locks in that
+// the JSON union decoder accepts the unqualified short-name tag form
+// emitted by fastavro (e.g. {"User": {...}} for a record named
+// com.example.User). Java emits and requires the fullname form, which
+// we already accept. fastavro emits the short-name form, which is
+// non-spec-conformant but common in Python pipelines.
+func TestRegression_DecodeJSONUnionTagFastavroShortName(t *testing.T) {
+	sch := MustParse(`{"type":"record","name":"Wrapper","fields":[
+		{"name":"u","type":["null",{"type":"record","name":"User","namespace":"com.example","fields":[
+			{"name":"name","type":"string"}
+		]}]}
+	]}`)
+	// fastavro-style short-name tag.
+	in := []byte(`{"u":{"User":{"name":"alice"}}}`)
+	var out map[string]any
+	if err := sch.DecodeJSON(in, &out); err != nil {
+		t.Fatalf("short-name tag rejected: %v", err)
+	}
+	user, ok := out["u"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected user map, got %T", out["u"])
+	}
+	if user["name"] != "alice" {
+		t.Fatalf("got name=%v, want alice", user["name"])
+	}
+	// Java-style fullname tag still works.
+	in2 := []byte(`{"u":{"com.example.User":{"name":"bob"}}}`)
+	var out2 map[string]any
+	if err := sch.DecodeJSON(in2, &out2); err != nil {
+		t.Fatalf("fullname tag rejected: %v", err)
+	}
+}
+
+// TestRegression_DecodeJSONUnionTagAmbiguousShortName locks in that
+// when two named-type branches share a short name (across different
+// namespaces), the short-name fallback bails rather than silently
+// pick a branch. The fullname form must still work for both.
+func TestRegression_DecodeJSONUnionTagAmbiguousShortName(t *testing.T) {
+	sch := MustParse(`{"type":"record","name":"Wrapper","fields":[
+		{"name":"u","type":[
+			"null",
+			{"type":"record","name":"User","namespace":"a","fields":[{"name":"x","type":"int"}]},
+			{"type":"record","name":"User","namespace":"b","fields":[{"name":"y","type":"int"}]}
+		]}
+	]}`)
+	// Ambiguous short name → must error rather than silently pick.
+	in := []byte(`{"u":{"User":{"x":1}}}`)
+	var out map[string]any
+	if err := sch.DecodeJSON(in, &out); err == nil {
+		t.Fatalf("expected error on ambiguous short-name tag, got %v", out)
+	}
+	// Fullname disambiguates.
+	in2 := []byte(`{"u":{"a.User":{"x":1}}}`)
+	if err := sch.DecodeJSON(in2, &out); err != nil {
+		t.Fatalf("fullname a.User rejected: %v", err)
+	}
+	in3 := []byte(`{"u":{"b.User":{"y":2}}}`)
+	if err := sch.DecodeJSON(in3, &out); err != nil {
+		t.Fatalf("fullname b.User rejected: %v", err)
+	}
+}
+
+// TestRegression_WriterUnionBranchMismatchFailsFast locks in this
+// library's fail-fast posture for writer-union resolution. Every writer
+// branch must be compatible with the reader at Resolve time; the first
+// incompatibility is returned eagerly. This deliberately diverges from
+// Java's Resolver.WriterUnion (per-branch ErrorAction deferred to
+// decode time) and fastavro's read_union — see checkWriterUnion's doc
+// comment for the rationale. A producer that narrowed during evolution
+// but never emits the dropped branch must update its schema before
+// Resolve will accept the pair.
+func TestRegression_WriterUnionBranchMismatchFailsFast(t *testing.T) {
+	writer := MustParse(`["null","string"]`)
+	reader := MustParse(`"string"`)
+	if _, err := Resolve(writer, reader); err == nil {
+		t.Fatal("expected Resolve to fail eagerly when a writer branch (null) is incompatible with the reader (string)")
+	}
+}
+
+// TestRegression_NullUnionNonCanonicalVarint verifies that the
+// null-union fast path accepts non-canonical multi-byte varint
+// encodings of the branch index. Spec ("Binary encoding > Unions")
+// says the index is a generic int (varint); Java's BinaryDecoder.readIndex
+// calls readInt() which is a full multi-byte loop. Pre-fix our
+// fast paths peeked src[0] only and rejected anything other than 0x00 /
+// 0x02, breaking interop with producers that emit non-canonical varints.
+func TestRegression_NullUnionNonCanonicalVarint(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":["null","int"]}]}`)
+	type rec struct {
+		X *int32 `avro:"x"`
+	}
+	var out rec
+	// 0x80 0x00 = non-canonical encoding of varint 0 (the null branch).
+	if _, err := s.Decode([]byte{0x80, 0x00}, &out); err != nil {
+		t.Fatalf("decode non-canonical varint: %v", err)
+	}
+	if out.X != nil {
+		t.Fatalf("expected nil x, got %v", *out.X)
+	}
+}
+
+// TestRegression_LongDefaultPrecisionLoss verifies that long-typed
+// schema defaults > 2^53 round-trip exact (no float64 truncation).
+// Pre-fix, json.Unmarshal into any decoded all numeric defaults as
+// float64, silently rounding 9007199254740993 → 9007199254740992.
+func TestRegression_LongDefaultPrecisionLoss(t *testing.T) {
+	const want = int64(9007199254740993)
+	src := `{"type":"record","name":"R","fields":[{"name":"x","type":"long","default":9007199254740993}]}`
+	s := MustParse(src)
+	enc, err := s.AppendEncode(nil, map[string]any{}) // missing field → use default
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	type recOut struct {
+		X int64 `avro:"x"`
+	}
+	var got recOut
+	if _, err := s.Decode(enc, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.X != want {
+		t.Fatalf("default: got %d want %d", got.X, want)
+	}
+}
+
+// TestRegression_InvalidDecimalRejected verifies that malformed decimal
+// logical types (precision <= 0, scale > precision, missing precision,
+// precision exceeding fixed capacity) are rejected at parse time, matching
+// Java's LogicalTypes.Decimal.validate and fastavro's parse_schema.
+// Pre-fix the library silently stripped the logical type and treated the
+// schema as plain bytes/fixed — interop hazard.
+func TestRegression_InvalidDecimalRejected(t *testing.T) {
+	cases := []struct {
+		name, schema string
+	}{
+		{"scale > precision", `{"type":"bytes","logicalType":"decimal","precision":2,"scale":3}`},
+		{"precision = 0", `{"type":"bytes","logicalType":"decimal","precision":0}`},
+		{"missing precision", `{"type":"bytes","logicalType":"decimal"}`},
+		{"precision > fixed capacity", `{"type":"fixed","name":"D","size":1,"logicalType":"decimal","precision":3}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := Parse(c.schema); err == nil {
+				t.Fatalf("expected parse error for %s", c.name)
+			}
+		})
+	}
+}
+
+// TestRegression_DecimalNaNInfNoPanic verifies that encoding non-finite
+// floats (NaN, ±Inf) into decimal-typed schemas does not panic. Pre-fix
+// tryCoerceToRat returned (nil, true) because (*big.Rat).SetFloat64
+// returns nil for non-finite values, and downstream serRat / FloatString
+// dereferenced the nil pointer. Java/fastavro/goavro all reject these
+// inputs with a typed error rather than crash.
+func TestRegression_DecimalNaNInfNoPanic(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		json   bool
+		input  any
+	}{
+		{"bytes-decimal NaN binary", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`, false, math.NaN()},
+		{"bytes-decimal +Inf binary", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`, false, math.Inf(1)},
+		{"bytes-decimal -Inf binary", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`, false, math.Inf(-1)},
+		{"fixed-decimal NaN binary", `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":2}`, false, math.NaN()},
+		{"bytes-decimal NaN json", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`, true, math.NaN()},
+		{"fixed-decimal NaN json", `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":4,"scale":2}`, true, math.NaN()},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked: %v", r)
+				}
+			}()
+			s := MustParse(c.schema)
+			var err error
+			if c.json {
+				_, err = s.AppendEncodeJSON(nil, c.input)
+			} else {
+				_, err = s.AppendEncode(nil, c.input)
+			}
+			if err == nil {
+				t.Fatal("expected error for non-finite decimal input, got success")
+			}
+		})
+	}
+}
+
+// TestRegression_CanonicalU2028Escaping verifies Canonical() emits U+2028
+// and U+2029 as raw UTF-8 (per PCF [STRINGS]) rather than as the
+// six-byte \uXXXX JSON escape Go's encoding/json forces. Java's
+// SchemaNormalization.toParsingForm emits raw UTF-8; without this
+// post-process our fingerprints would diverge from Java for any name
+// containing those code points.
+func TestRegression_CanonicalU2028Escaping(t *testing.T) {
+	src := "{\"type\":\"record\",\"name\":\"R \",\"fields\":[]}"
+	s, err := Parse(src, WithLaxNames(func(string) error { return nil }))
+	if err != nil {
+		t.Skipf("schema rejected: %v", err)
+	}
+	canon := s.Canonical()
+	// Should contain the literal UTF-8 bytes for U+2028 (e2 80 a8).
+	if !bytes.Contains(canon, []byte{0xe2, 0x80, 0xa8}) {
+		t.Errorf("canonical missing raw U+2028 UTF-8 bytes; got %q", canon)
+	}
+	// And NOT the JSON escape sequence.
+	if bytes.Contains(canon, []byte{'\\', 'u', '2', '0', '2', '8'}) {
+		t.Errorf("canonical contains \\u2028 escape — breaks Java fingerprint parity; got %q", canon)
+	}
+}
+
+// TestRegression_UnionResolutionPrefersExactKindOverPromotion verifies
+// that union resolution does a two-pass scan: exact-kind branches win
+// over promotion branches even when the promotion branch comes first
+// in declaration order. Matches Java's bestBranch
+// (ResolvingGrammarGenerator.java) and fastavro. Pre-fix the library
+// did a single pass and silently picked the first promotion match,
+// producing float64 for an int writer when the reader was
+// ["double","int"].
+func TestRegression_UnionResolutionPrefersExactKindOverPromotion(t *testing.T) {
+	t.Run("writer non-union, reader union with promotion before exact", func(t *testing.T) {
+		writer := MustParse(`"int"`)
+		reader := MustParse(`["double","int"]`)
+		encoded, err := writer.AppendEncode(nil, ptr(int32(42)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got any
+		if _, err := rs.Decode(encoded, &got); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := got.(int32); !ok || v != 42 {
+			t.Fatalf("reader-union: expected int32(42), got %T(%v)", got, got)
+		}
+	})
+	t.Run("writer and reader both unions", func(t *testing.T) {
+		writer := MustParse(`["int","long"]`)
+		reader := MustParse(`["double","int"]`)
+		encoded, err := writer.AppendEncode(nil, ptr(int32(5)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got any
+		if _, err := rs.Decode(encoded, &got); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := got.(int32); !ok || v != 5 {
+			t.Fatalf("union-union: expected int32(5), got %T(%v)", got, got)
+		}
+	})
+}
+
+// TestRegression_DecodeJSON_FixedLengthMismatch locks in JSON-decoder
+// length validation for fixed types. Per Avro 1.12 JSON spec, a fixed
+// value is encoded as a JSON string whose code points are the bytes
+// of the value; length must equal schema's size. Java's JsonDecoder.readFixed
+// throws when the lengths differ; fastavro raises ValueError. Pre-fix,
+// the library silently truncated, zero-padded, or returned the wrong
+// length depending on the target type.
+func TestRegression_DecodeJSON_FixedLengthMismatch(t *testing.T) {
+	schema := `{"type":"fixed","name":"F","size":4}`
+	s := MustParse(schema)
+
+	// 3-char JSON for a fixed(4): should error.
+	var got [4]byte
+	if err := s.DecodeJSON([]byte(`"abc"`), &got); err == nil {
+		t.Errorf("[4]byte too few: expected error, got %x", got)
+	}
+	// 5-char JSON for a fixed(4): should error.
+	var gotMore [4]byte
+	if err := s.DecodeJSON([]byte(`"abcde"`), &gotMore); err == nil {
+		t.Errorf("[4]byte too many: expected error, got %x", gotMore)
+	}
+	// []byte target also unvalidated.
+	var gotS []byte
+	if err := s.DecodeJSON([]byte(`"abc"`), &gotS); err == nil {
+		t.Errorf("[]byte: expected error, got len=%d", len(gotS))
+	}
+	// *any target also unvalidated.
+	var gotAny any
+	if err := s.DecodeJSON([]byte(`"abc"`), &gotAny); err == nil {
+		t.Errorf("*any: expected error, got %v", gotAny)
+	}
+	// Same for fixed-decimal (the JSON-string path).
+	sd := MustParse(`{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":9,"scale":2}`)
+	var rat big.Rat
+	if err := sd.DecodeJSON([]byte(`"abc"`), &rat); err == nil {
+		t.Errorf("fixed-decimal: expected error, got %s", rat.RatString())
+	}
+}
+
+// TestRegression_DecodeArrayOfNullLargeCount locks in that decoding an
+// Avro array<null> with a count larger than the remaining buffer
+// succeeds, up to the absolute cap. Each null element takes zero bytes
+// on the wire, so the usual `count > len(src)` DoS guard is wrong for
+// null items.
+func TestRegression_DecodeArrayOfNullLargeCount(t *testing.T) {
+	sch := MustParse(`{"type":"array","items":"null"}`)
+	// Wire: block count = 100 (varlong = 0xC8 0x01), then 0 element
+	// bytes (null is empty), then terminator count = 0 (0x00).
+	wire := []byte{0xC8, 0x01, 0x00}
+	var got []any
+	if _, err := sch.Decode(wire, &got); err != nil {
+		t.Fatalf("decode array of 100 nulls: %v", err)
+	}
+	if len(got) != 100 {
+		t.Fatalf("got %d elements, want 100", len(got))
+	}
+	for i, e := range got {
+		if e != nil {
+			t.Fatalf("element %d is non-nil: %v", i, e)
+		}
+	}
+}
+
+// TestRegression_DecodeArrayOfNullCappedAtLimit verifies the
+// maxZeroByteItems absolute cap rejects DoS-sized counts.
+func TestRegression_DecodeArrayOfNullCappedAtLimit(t *testing.T) {
+	sch := MustParse(`{"type":"array","items":"null"}`)
+	// 1<<30 nulls: 5 wire bytes total (varlong + terminator), would
+	// allocate ~16 GiB without the cap.
+	var data []byte
+	data = binary.AppendVarint(data, 1<<30)
+	data = binary.AppendVarint(data, 0)
+	var got []any
+	if _, err := sch.Decode(data, &got); err == nil {
+		t.Fatalf("expected zero-byte-array cap error, got success with len=%d", len(got))
+	}
+}
+
+// TestRegression_DecodeArrayOfNullCumulativeAcrossBlocks verifies the
+// cap is cumulative — chunking the count across multiple sub-cap blocks
+// must still fail.
+func TestRegression_DecodeArrayOfNullCumulativeAcrossBlocks(t *testing.T) {
+	sch := MustParse(`{"type":"array","items":"null"}`)
+	// Two blocks of 3000 each (sum 6000 > cap 4096).
+	var data []byte
+	data = binary.AppendVarint(data, 3000)
+	data = binary.AppendVarint(data, 3000)
+	data = binary.AppendVarint(data, 0)
+	var got []any
+	if _, err := sch.Decode(data, &got); err == nil {
+		t.Fatalf("expected cumulative cap error, got success with len=%d", len(got))
+	}
+}
+
+// TestRegression_DecodeArrayOfEmptyRecord verifies that arrays whose
+// items take 0 wire bytes (empty record) decode correctly up to the cap.
+// Pre-fix, the nullItem bool only handled primitive null, not records-
+// that-encode-to-zero-bytes.
+func TestRegression_DecodeArrayOfEmptyRecord(t *testing.T) {
+	sch := MustParse(`{"type":"array","items":{"type":"record","name":"E","fields":[]}}`)
+	var data []byte
+	data = binary.AppendVarint(data, 100)
+	data = binary.AppendVarint(data, 0)
+	var got []map[string]any
+	if _, err := sch.Decode(data, &got); err != nil {
+		t.Fatalf("decode 100 empty records: %v", err)
+	}
+	if len(got) != 100 {
+		t.Fatalf("got %d, want 100", len(got))
+	}
+}
+
+// TestRegression_DecodeArrayOfRecordWithAllNullFields verifies that a
+// record whose fields are all null encodes to 0 bytes per record and
+// the array of such still decodes (up to the cap).
+func TestRegression_DecodeArrayOfRecordWithAllNullFields(t *testing.T) {
+	sch := MustParse(`{"type":"array","items":{"type":"record","name":"R","fields":[{"name":"x","type":"null"}]}}`)
+	var data []byte
+	data = binary.AppendVarint(data, 50)
+	data = binary.AppendVarint(data, 0)
+	var got []map[string]any
+	if _, err := sch.Decode(data, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 50 {
+		t.Fatalf("got %d, want 50", len(got))
+	}
+}
+
+// TestRegression_TimeMicrosAnyVsDurationParity locks in that *any and
+// *time.Duration paths agree on overflow handling. Pre-fix the
+// *time.Duration arm errored on val > MaxInt64/Microsecond; the *any
+// arm silently wrapped via time.Duration(val) * time.Microsecond,
+// delivering a wrong typed value to user code.
+func TestRegression_TimeMicrosAnyVsDurationParity(t *testing.T) {
+	sch := MustParse(`{"type":"long","logicalType":"time-micros"}`)
+	encSch := MustParse(`"long"`)
+	v := int64(math.MaxInt64)
+	encoded, err := encSch.AppendEncode(nil, &v)
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	// *time.Duration target: errors (correct).
+	var d time.Duration
+	if _, err := sch.Decode(encoded, &d); err == nil {
+		t.Fatalf("*time.Duration: expected overflow error, got d=%v", d)
+	}
+	// *any target: same schema, same wire bytes — should also error.
+	var a any
+	if _, err := sch.Decode(encoded, &a); err == nil {
+		t.Fatalf("*any: expected same overflow error as *time.Duration, got a=%v (paths diverged)", a)
+	}
+}
+
+// TestRegression_JSONBytesUnicodeCharCodepointSemantics locks in spec /
+// Java parity: per the Avro 1.12 JSON-encoding section, "each character
+// represents one byte" and "Unicode code points 0-255 are mapped to
+// unsigned 8-bit byte values 0-255". Java decodes JSON strings into
+// Java Strings (UTF-8 → UTF-16) then maps each char to a byte via
+// ISO-8859-1; fastavro does the same via str.encode("iso-8859-1").
+// Pre-fix the library walked raw input bytes one-by-one, so JSON
+// literal "é" (UTF-8 c3 a9) decoded to two output bytes [0xC3, 0xA9]
+// instead of the spec-correct [0xE9].
+func TestRegression_JSONBytesUnicodeCharCodepointSemantics(t *testing.T) {
+	sch := MustParse(`"bytes"`)
+	// Path A: \u-escape form.
+	var fromEscape []byte
+	if err := sch.DecodeJSON([]byte(`"é"`), &fromEscape); err != nil {
+		t.Fatalf("escape form: %v", err)
+	}
+	// Path B: literal Unicode character (UTF-8 bytes c3 a9 in source).
+	var fromLiteral []byte
+	if err := sch.DecodeJSON([]byte("\"é\""), &fromLiteral); err != nil {
+		t.Fatalf("literal form: %v", err)
+	}
+	if !bytes.Equal(fromEscape, fromLiteral) {
+		t.Fatalf("JSON bytes parity: escape form=%x literal form=%x — Avro spec / Java treat one Unicode character as one byte regardless of UTF-8 source encoding",
+			fromEscape, fromLiteral)
+	}
+	if len(fromLiteral) != 1 || fromLiteral[0] != 0xE9 {
+		t.Fatalf("expected [0xE9], got %x", fromLiteral)
+	}
+}
+
+// TestRegression_DecimalPrecisionEnforcedOnEncode locks in that the
+// encoder rejects decimal values whose unscaled magnitude exceeds the
+// schema's declared precision. Java (Conversions.DecimalConversion),
+// fastavro, and hamba/avro all enforce this on encode; pre-fix the
+// library silently encoded oversized values without error.
+func TestRegression_DecimalPrecisionEnforcedOnEncode(t *testing.T) {
+	t.Run("bytes", func(t *testing.T) {
+		schema := MustParse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`)
+		// Unscaled = 123456789999 (12 digits) — far exceeds precision 5.
+		rat := new(big.Rat).SetFrac(big.NewInt(123456789999), big.NewInt(100))
+		if _, err := schema.AppendEncode(nil, rat); err == nil {
+			t.Fatal("expected error encoding decimal value whose unscaled magnitude exceeds precision (5 digits)")
+		}
+	})
+	t.Run("fixed", func(t *testing.T) {
+		schema := MustParse(`{"type":"fixed","name":"D","size":16,"logicalType":"decimal","precision":5,"scale":2}`)
+		rat := new(big.Rat).SetFrac(big.NewInt(123456789999), big.NewInt(100))
+		if _, err := schema.AppendEncode(nil, rat); err == nil {
+			t.Fatal("expected error encoding decimal value whose unscaled magnitude exceeds precision (5 digits)")
+		}
+	})
+}
+
+// TestRegression_LocalTimestampMillisNonUTCWallClock locks in spec/Java
+// parity for local-timestamp encoding of non-UTC time.Time inputs.
+// Per Avro 1.12 + Java reference (TimeConversions.LocalTimestampMillisConversion
+// uses LocalDateTime.toInstant(ZoneOffset.UTC)) and fastavro's
+// data.replace(tzinfo=datetime.timezone.utc), local-timestamp encodes
+// the wall-clock fields as-if-UTC. Pre-fix the encoder used t.UnixMilli()
+// which encoded the absolute UTC moment, breaking interop for non-UTC
+// inputs.
+func TestRegression_LocalTimestampMillisNonUTCWallClock(t *testing.T) {
+	schema := MustParse(`{"type":"long","logicalType":"local-timestamp-millis"}`)
+	nyc := time.FixedZone("NYC", -5*3600)
+	in := time.Date(2024, 1, 1, 12, 0, 0, 0, nyc)
+	encoded, err := schema.AppendEncode(nil, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawSchema := MustParse(`"long"`)
+	var v int64
+	if _, err := rawSchema.Decode(encoded, &v); err != nil {
+		t.Fatal(err)
+	}
+	const want = int64(1704110400000) // 2024-01-01 12:00 UTC ms (wall-clock-as-UTC)
+	if v != want {
+		t.Errorf("local-timestamp-millis wire value: got %d, want %d "+
+			"(Java/fastavro encode wall-clock as-if-UTC; library used to encode the absolute moment)", v, want)
+	}
+}
+
+// Finding 13 (auditor's #12): udLong narrow signed propagates through []*T.
+func TestRegression_UdArrayNullUnionPtrInt8Truncates(t *testing.T) {
+	type S struct {
+		A []*int8 `avro:"a"`
+	}
+	sch := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":["null","long"]}}]}`)
+	v200 := int64(200)
+	encoded, err := sch.AppendEncode(nil, &struct {
+		A []*int64 `avro:"a"`
+	}{A: []*int64{&v200}})
+	if err != nil {
+		t.Fatalf("encode helper: %v", err)
+	}
+	var s S
+	if _, err := sch.Decode(encoded, &s); err == nil {
+		got := -1
+		if len(s.A) > 0 && s.A[0] != nil {
+			got = int(*s.A[0])
+		}
+		t.Fatalf("expected error decoding array<[null,long]>=[200] into []*int8, got A[0]=%d", got)
+	}
+}
+
+// TestRegression_TimestampDeserParity locks in that
+// deserTimestamp{Millis,Micros,Nanos} and deserDate handle the same
+// five target shapes (any, time.Time, typed-interface-implemented-by-
+// time.Time, typed-interface-not-implemented, plain integer) in lockstep.
+// Pre-fix each had its own inline interface guard; consolidating into
+// deserTimeAsLong + setIface gave them shared behavior and prevents
+// drift across future setIface changes.
+func TestRegression_TimestampDeserParity(t *testing.T) {
+	type stringerIface interface{ String() string } // time.Time implements
+	type unsupported interface{ Mock() }            // time.Time does not
+
+	for _, tc := range []struct {
+		name, schema string
+		in           time.Time
+	}{
+		{"millis", `{"type":"long","logicalType":"timestamp-millis"}`,
+			time.Date(2026, 5, 8, 12, 30, 45, 0, time.UTC)},
+		{"micros", `{"type":"long","logicalType":"timestamp-micros"}`,
+			time.Date(2026, 5, 8, 12, 30, 45, 123_000, time.UTC)},
+		{"nanos", `{"type":"long","logicalType":"timestamp-nanos"}`,
+			time.Date(2026, 5, 8, 12, 30, 45, 123_456, time.UTC)},
+		{"date", `{"type":"int","logicalType":"date"}`,
+			time.Date(2026, 5, 8, 0, 0, 0, 0, time.UTC)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := MustParse(tc.schema)
+			enc, err := s.AppendEncode(nil, tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// 1. any-target → empty-interface arm of setIface.
+			var anyT any
+			if _, err := s.Decode(enc, &anyT); err != nil {
+				t.Fatalf("any: %v", err)
+			}
+			if _, ok := anyT.(time.Time); !ok {
+				t.Errorf("expected time.Time, got %T", anyT)
+			}
+
+			// 2. time.Time target → timeType arm.
+			var typed time.Time
+			if _, err := s.Decode(enc, &typed); err != nil {
+				t.Fatalf("time.Time: %v", err)
+			}
+			if !typed.Equal(tc.in) {
+				t.Errorf("got %v want %v", typed, tc.in)
+			}
+
+			// 3. typed-interface implemented by time.Time → setIface
+			//    AssignableTo(true) accepts.
+			var st stringerIface
+			if _, err := s.Decode(enc, &st); err != nil {
+				t.Errorf("Stringer: time.Time should be assignable: %v", err)
+			}
+
+			// 4. typed-interface NOT implemented → setIface rejects.
+			var bad unsupported
+			if _, err := s.Decode(enc, &bad); err == nil {
+				t.Errorf("unsupported iface: expected error")
+			}
+
+			// 5. Plain integer fallback (setLongValue/setIntValue).
+			if tc.name == "date" {
+				var n int32
+				if _, err := s.Decode(enc, &n); err != nil {
+					t.Errorf("int32 fallback: %v", err)
+				}
+			} else {
+				var n int64
+				if _, err := s.Decode(enc, &n); err != nil {
+					t.Errorf("int64 fallback: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestRegression_DecimalBytesJSONEncodeSpecForm locks in that EncodeJSON
+// for a decimal-on-bytes logical type emits the spec / Java / fastavro
+// codepoint-mapped string form (e.g. "!" for unscaled=33 / scale=2),
+// not the bare-number form (0.33) the library used pre-fix. The
+// pre-fix output was incompatible with Java's JsonDecoder.readBytes
+// (which throws on VALUE_NUMBER_FLOAT) and fastavro's
+// AvroJSONDecoder.read_bytes (which calls .encode("iso-8859-1") on the
+// JSON string). See checkWriterUnion / decodeBytes doc comments for
+// the spec citation.
+func TestRegression_DecimalBytesJSONEncodeSpecForm(t *testing.T) {
+	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
+	out, err := s.EncodeJSON(new(big.Rat).SetFrac64(33, 100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != `"!"` {
+		t.Fatalf("got %s, want %q (spec / Java / fastavro form for unscaled=33)", out, `"!"`)
+	}
+}
+
+// TestRegression_DecimalBytesUnionJSONRoundTrip locks in that
+// EncodeJSON / DecodeJSON round-trip a decimal-bytes value when it is
+// a non-null branch of a union. Pre-fix two bugs combined: EncodeJSON
+// emitted 0.33 (non-spec) and the union dispatch table refused to
+// route digit tokens to bytes/fixed branches, so DecodeJSON could not
+// consume EncodeJSON's own output.
+func TestRegression_DecimalBytesUnionJSONRoundTrip(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"v","type":["null",{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}]}
+	]}`)
+	r := new(big.Rat).SetFrac64(33, 100)
+	enc, err := s.AppendEncodeJSON(nil, map[string]any{"v": r})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var out any
+	if err := s.DecodeJSON(enc, &out); err != nil {
+		t.Fatalf("DecodeJSON failed to round-trip its own EncodeJSON output: %v\nencoded=%s", err, enc)
+	}
+}
+
+// TestRegression_DecimalBytesUnionJSONLenientNumberDecode locks in
+// that DecodeJSON still accepts the bare-number form (0.33) inside a
+// union branch even after the encode-side switched to the spec form.
+// Hand-edited JSON or alternate-tool input (e.g. the pre-fix output of
+// this library) must keep working as a decode input.
+func TestRegression_DecimalBytesUnionJSONLenientNumberDecode(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"v","type":["null",{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}]}
+	]}`)
+	var out any
+	if err := s.DecodeJSON([]byte(`{"v":0.33}`), &out); err != nil {
+		t.Fatalf("lenient decode of bare 0.33 in union: %v", err)
+	}
+	r, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("decoded value is not map[string]any: %T(%v)", out, out)
+	}
+	got, ok := r["v"].(*big.Rat)
+	if !ok {
+		t.Fatalf("v is not *big.Rat: %T(%v)", r["v"], r["v"])
+	}
+	if want := new(big.Rat).SetFrac64(33, 100); got.Cmp(want) != 0 {
+		t.Fatalf("got %s, want %s", got.FloatString(2), want.FloatString(2))
+	}
+}
+
+// TestRegression_TimeMicrosJSONOverflowParity locks in that the JSON
+// decoder rejects out-of-range time-micros values when decoding to
+// *time.Duration, matching the binary path's overflow guard. Pre-fix
+// the binary path errored but the JSON path silently wrapped via
+// timeMicrosToDuration's val * time.Microsecond multiplication. The
+// guard now lives inside timeMicrosToDuration so all callers (binary
+// safe, binary unsafe, JSON any, JSON typed) reject uniformly.
+func TestRegression_TimeMicrosJSONOverflowParity(t *testing.T) {
+	schema := MustParse(`{"type":"long","logicalType":"time-micros"}`)
+	bigVal := int64(math.MaxInt64/1000) + 1
+	jsonInput := []byte(fmt.Sprintf("%d", bigVal))
+
+	var d time.Duration
+	if err := schema.DecodeJSON(jsonInput, &d); err == nil {
+		t.Fatalf("DecodeJSON of out-of-range time-micros %d into *time.Duration succeeded with d=%d (silent wrap from val*1000); binary path errors on the same value",
+			bigVal, int64(d))
+	}
+}
+
+// TestRegression_TimeMicrosJSONOverflowAnyPath is the *any companion:
+// the same overflow must also fail when DecodeJSON targets a *any
+// (which routes through decodeLogicalLong). Pre-fix that path
+// produced time.Duration(-2562047h47m16s) silently.
+func TestRegression_TimeMicrosJSONOverflowAnyPath(t *testing.T) {
+	schema := MustParse(`{"type":"long","logicalType":"time-micros"}`)
+	bigVal := int64(math.MaxInt64/1000) + 1
+	jsonInput := []byte(fmt.Sprintf("%d", bigVal))
+
+	var v any
+	if err := schema.DecodeJSON(jsonInput, &v); err == nil {
+		t.Fatalf("DecodeJSON to *any of out-of-range time-micros %d returned %T(%v) instead of erroring (binary path errors)",
+			bigVal, v, v)
+	}
+}
+
+// TestRegression_UnionWithoutNullBranchAcceptsJsonNull locks in that
+// DecodeJSON rejects a null token when the union schema has no null
+// branch. Java's JsonDecoder.readIndex and fastavro's read_index both
+// reject (synthesize "null" label, look it up in the branch list, fail
+// if absent). Pre-fix decodeUnion short-circuited on the 'n' peek byte
+// regardless of branch list, silently consuming null and either
+// zeroing the target or leaving it untouched.
+func TestRegression_UnionWithoutNullBranchAcceptsJsonNull(t *testing.T) {
+	schema := MustParse(`["int","string"]`)
+	var v any
+	if err := schema.DecodeJSON([]byte(`null`), &v); err == nil {
+		t.Fatalf("DecodeJSON of null into union without null branch returned no error; got v=%v (%T)", v, v)
+	}
+}
+
+type rTagLong struct {
+	N int64 `avro:"n,default=9223372036854775807"`
+}
+
+// TestRegression_SchemaForLongDefaultPrecisionLoss locks in that
+// SchemaFor preserves long defaults > 2^53 when reading the default=
+// struct tag. Pre-fix the JSON-unmarshal of the default went through
+// float64, turning 9223372036854775807 (MaxInt64) into the next
+// representable float64 9.223372036854776e+18, which downstream Parse
+// then rejected via floatFitsInt64. Mirrors unmarshalDefault on the
+// Parse path; the two sites must stay in lockstep on number-precision
+// handling.
+func TestRegression_SchemaForLongDefaultPrecisionLoss(t *testing.T) {
+	reader, err := SchemaFor[rTagLong]()
+	if err != nil {
+		t.Fatalf("SchemaFor: %v", err)
+	}
+	// Writer schema matches SchemaFor's record name (rTagLong) with no
+	// fields, so Resolve uses the reader's default for N.
+	writer := MustParse(`{"type":"record","name":"rTagLong","fields":[]}`)
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("Resolve: %v (default value lost precision in SchemaFor)", err)
+	}
+	enc, err := writer.AppendEncode(nil, struct{}{})
+	if err != nil {
+		t.Fatalf("encode empty: %v", err)
+	}
+	var got rTagLong
+	if _, err := resolved.Decode(enc, &got); err != nil {
+		t.Fatalf("decode with default: %v", err)
+	}
+	if got.N != 9223372036854775807 {
+		t.Fatalf("default N=%d, want %d", got.N, int64(9223372036854775807))
+	}
+}
+
+// TestRegression_UUIDStringJSONEncodeFromArrayParity locks in that
+// JSON encode of a string-backed UUID accepts a [16]byte input and
+// canonicalizes it to the RFC 4122 hex-dash form, matching the
+// binary serUUID. Pre-fix the JSON path's "string" case rejected
+// [16]byte with "cannot use [16]uint8 with Avro type string"
+// because avroStringValue had no UUID pre-pass.
+func TestRegression_UUIDStringJSONEncodeFromArrayParity(t *testing.T) {
+	schema := MustParse(`{"type":"string","logicalType":"uuid"}`)
+	u := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+
+	if _, err := schema.AppendEncode(nil, u); err != nil {
+		t.Fatalf("binary encode reference: %v", err)
+	}
+	jb, err := schema.AppendEncodeJSON(nil, u)
+	if err != nil {
+		t.Fatalf("JSON encode of [16]byte UUID failed: %v", err)
+	}
+	want := `"550e8400-e29b-41d4-a716-446655440000"`
+	if string(jb) != want {
+		t.Fatalf("JSON encode = %s, want %s", jb, want)
+	}
+}
+
+// TestRegression_UUIDStringJSONDecodeIntoArrayParity locks in that
+// JSON decode of a string-backed UUID into a [16]byte target parses
+// the hex-dash string into raw bytes, matching deserUUID.
+func TestRegression_UUIDStringJSONDecodeIntoArrayParity(t *testing.T) {
+	schema := MustParse(`{"type":"string","logicalType":"uuid"}`)
+	want := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	var got [16]byte
+	if err := schema.DecodeJSON([]byte(`"550e8400-e29b-41d4-a716-446655440000"`), &got); err != nil {
+		t.Fatalf("JSON decode of UUID into [16]byte failed: %v", err)
+	}
+	if got != want {
+		t.Fatalf("JSON decoded %x, want %x", got, want)
+	}
+}
+
+// TestRegression_UUIDFixedJSONEncodeFromString locks in that JSON
+// encode of a fixed(16) UUID accepts a hex-dash string input and
+// parses it to 16 bytes, matching serFixedUUIDReflect. Pre-fix the
+// JSON "fixed" case rejected the 36-char string with
+// "fixed size mismatch: got 36 bytes, need 16".
+func TestRegression_UUIDFixedJSONEncodeFromString(t *testing.T) {
+	schema := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
+	const s = "550e8400-e29b-41d4-a716-446655440000"
+	if _, err := schema.AppendEncode(nil, s); err != nil {
+		t.Fatalf("binary encode reference: %v", err)
+	}
+	jb, err := schema.AppendEncodeJSON(nil, s)
+	if err != nil {
+		t.Fatalf("JSON encode of hex-dash string UUID into fixed(16) failed: %v", err)
+	}
+	if len(jb) < 2 || jb[0] != '"' || jb[len(jb)-1] != '"' {
+		t.Fatalf("JSON encoded UUID is not a JSON string: %s", jb)
+	}
+	var rt [16]byte
+	if err := schema.DecodeJSON(jb, &rt); err != nil {
+		t.Fatalf("decode round-trip: %v", err)
+	}
+	want := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	if rt != want {
+		t.Fatalf("round-trip got %x, want %x", rt, want)
+	}
+}
+
+// TestRegression_UUIDFixedJSONDecodeIntoString locks in that JSON
+// decode of a fixed(16) UUID into a string target produces the RFC
+// 4122 hex-dash form, matching deserFixedUUIDReflect. Pre-fix
+// assignBytes returned the raw 16 bytes as a string.
+func TestRegression_UUIDFixedJSONDecodeIntoString(t *testing.T) {
+	schema := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
+	u := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	jb, err := schema.AppendEncodeJSON(nil, u)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got string
+	if err := schema.DecodeJSON(jb, &got); err != nil {
+		t.Fatalf("JSON decode of fixed(16) UUID into string failed: %v", err)
+	}
+	const want = "550e8400-e29b-41d4-a716-446655440000"
+	if got != want {
+		t.Fatalf("got %q, want %q (JSON returned raw bytes; binary path returns hex-dash)", got, want)
+	}
+}
+
+// TestRegression_UUIDFixedJSONDecodeIntoAny locks in that JSON
+// decode of a fixed(16) UUID into *any returns [16]byte (not []byte),
+// matching deserFixedUUIDReflect's any path.
+func TestRegression_UUIDFixedJSONDecodeIntoAny(t *testing.T) {
+	schema := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
+	u := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	jb, err := schema.AppendEncodeJSON(nil, u)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got any
+	if err := schema.DecodeJSON(jb, &got); err != nil {
+		t.Fatalf("JSON decode of fixed(16) UUID into *any failed: %v", err)
+	}
+	gotArr, ok := got.([16]byte)
+	if !ok {
+		t.Fatalf("JSON decoded %T(%v), want [16]byte (binary path returns [16]byte)", got, got)
+	}
+	if gotArr != u {
+		t.Fatalf("got %x, want %x", gotArr, u)
+	}
+}
+
+// TestRegression_ArrayLongTimeMicrosBypassesLogicalSer locks in that
+// the specialized array<long> ser path does NOT silently skip the
+// time-micros logical conversion when the user provides
+// []time.Duration. Pre-fix the specialization was selected purely on
+// af.canon.primitive == "long", ignoring the inner's logical type, so
+// the encoder appendVarlong'd raw nanoseconds (1500*time.Microsecond
+// = 1500000 ns) instead of the spec-required microseconds (1500).
+func TestRegression_ArrayLongTimeMicrosBypassesLogicalSer(t *testing.T) {
+	s := MustParse(`{"type":"array","items":{"type":"long","logicalType":"time-micros"}}`)
+	in := []time.Duration{1500 * time.Microsecond}
+	bin, err := s.AppendEncode(nil, in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	itemS := MustParse(`{"type":"long","logicalType":"time-micros"}`)
+	itemBin, _ := itemS.AppendEncode(nil, time.Duration(1500)*time.Microsecond)
+	want := append([]byte{0x02}, itemBin...)
+	want = append(want, 0x00)
+	if string(bin) != string(want) {
+		t.Fatalf("array encode wire mismatch: got %x want %x", bin, want)
+	}
+}
+
+// TestRegression_DeserArrayLongTimeMicrosBypassesLogicalDeser is the
+// decode-side parity test: the specialized deserArrayLongLoop fast
+// path was selected on sliceType.Elem().Kind() == reflect.Int64
+// (time.Duration's underlying kind matches), which bypassed
+// deserTimeMicros's val * time.Microsecond conversion. 1500us on the
+// wire silently became 1500ns in the slice.
+func TestRegression_DeserArrayLongTimeMicrosBypassesLogicalDeser(t *testing.T) {
+	itemS := MustParse(`{"type":"long","logicalType":"time-micros"}`)
+	itemBin, _ := itemS.AppendEncode(nil, time.Duration(1500)*time.Microsecond)
+	arr := append([]byte{0x02}, itemBin...)
+	arr = append(arr, 0x00)
+	s := MustParse(`{"type":"array","items":{"type":"long","logicalType":"time-micros"}}`)
+	var got []time.Duration
+	if _, err := s.Decode(arr, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := time.Duration(1500) * time.Microsecond
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("array decode mismatch: got %v, want [%v]", got, want)
+	}
+}
+
+// TestRegression_ArrayIntTimeMillisBypassesLogicalSer is the int /
+// time-millis variant of the bypass: encoded raw nanoseconds (which
+// for a 1500ms input is 1500000000, fitting int32 by accident; for
+// values >= 2s would have errored on int32 overflow).
+func TestRegression_ArrayIntTimeMillisBypassesLogicalSer(t *testing.T) {
+	s := MustParse(`{"type":"array","items":{"type":"int","logicalType":"time-millis"}}`)
+	in := []time.Duration{1500 * time.Millisecond}
+	bin, err := s.AppendEncode(nil, in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	itemS := MustParse(`{"type":"int","logicalType":"time-millis"}`)
+	itemBin, _ := itemS.AppendEncode(nil, time.Duration(1500)*time.Millisecond)
+	want := append([]byte{0x02}, itemBin...)
+	want = append(want, 0x00)
+	if string(bin) != string(want) {
+		t.Fatalf("array encode wire mismatch: got %x want %x", bin, want)
+	}
+}
+
+// TestRegression_ArrayLongTimestampMillisAcceptsTime locks in that
+// array<long, timestamp-millis> accepts []time.Time, matching the
+// scalar serTimestampMillis. Pre-fix the specialized serArray.serLong
+// was selected and rejected time.Time as "cannot use time.Time with
+// Avro type long".
+func TestRegression_ArrayLongTimestampMillisAcceptsTime(t *testing.T) {
+	s := MustParse(`{"type":"array","items":{"type":"long","logicalType":"timestamp-millis"}}`)
+	in := []time.Time{time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}
+	if _, err := s.AppendEncode(nil, in); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+}
+
+// TestRegression_ArrayStringUUIDAccepts16Byte locks in that
+// array<string, uuid> accepts [][16]byte, matching the scalar serUUID
+// (which canonicalizes [16]byte to hex-dash). Pre-fix the specialized
+// serArray.serString was selected and rejected [16]byte as "cannot
+// use [16]uint8 with Avro type string".
+func TestRegression_ArrayStringUUIDAccepts16Byte(t *testing.T) {
+	s := MustParse(`{"type":"array","items":{"type":"string","logicalType":"uuid"}}`)
+	u := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	if _, err := s.AppendEncode(nil, [][16]byte{u}); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+}
+
+// TestRegression_RecordArrayTimeMillisAddrVsByValParity locks in that
+// the same record + same data produces the same wire bytes regardless
+// of input addressability. Pre-fix the addressable path took the
+// unsafe fast path (correct via usTimeMillis); the by-value path took
+// the safe specialized serArray.serInt (silently encoded raw
+// nanoseconds — 1000x off).
+func TestRegression_RecordArrayTimeMillisAddrVsByValParity(t *testing.T) {
+	type R struct {
+		Vs []time.Duration `avro:"vs"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"vs","type":{"type":"array","items":{"type":"int","logicalType":"time-millis"}}}]}`)
+	in := R{Vs: []time.Duration{1500 * time.Millisecond}}
+	gotAddr, errAddr := s.AppendEncode(nil, &in)
+	gotVal, errVal := s.AppendEncode(nil, in)
+	if errAddr != nil || errVal != nil {
+		t.Fatalf("encode err: addr=%v byval=%v", errAddr, errVal)
+	}
+	if string(gotAddr) != string(gotVal) {
+		t.Fatalf("path divergence: addr=%x byval=%x", gotAddr, gotVal)
+	}
+}
+
+// TestRegression_RecordArrayIntPtrAddrVsByValParity locks in that
+// addressable and by-value record encoding produce the same result for
+// a []*int32 array field. Pre-fix the unsafe fast path handled the
+// pointer indirection (pp := *(*unsafe.Pointer)(p)); the safe
+// specialized serArray.serInt only unwrapped reflect.Interface, not
+// reflect.Pointer, and rejected *int32 elements.
+func TestRegression_RecordArrayIntPtrAddrVsByValParity(t *testing.T) {
+	type R struct {
+		Vs []*int32 `avro:"vs"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"vs","type":{"type":"array","items":"int"}}]}`)
+	v := int32(1)
+	in := R{Vs: []*int32{&v, &v, &v}}
+	gotAddr, errAddr := s.AppendEncode(nil, &in)
+	gotVal, errVal := s.AppendEncode(nil, in)
+	if (errAddr == nil) != (errVal == nil) {
+		t.Fatalf("path divergence: addr err=%v, byval err=%v", errAddr, errVal)
+	}
+	if errAddr == nil && string(gotAddr) != string(gotVal) {
+		t.Fatalf("output mismatch: addr=%x byval=%x", gotAddr, gotVal)
+	}
+}
+
+// TestRegression_LocalTimestampMillisJSONEncodeNonUTC locks in that
+// EncodeJSON for local-timestamp-millis encodes wall-clock fields
+// as-if-UTC, matching the binary path (serLocalTimestampMillis), Java
+// (TimeConversions.LocalTimestampMillisConversion: toInstant(ZoneOffset.UTC))
+// and fastavro (data.replace(tzinfo=datetime.timezone.utc)). Pre-fix
+// the JSON path used timeToTimestampMillis (= UnixMilli, the absolute
+// moment), so the same time.Time produced different binary vs JSON
+// wire values for non-UTC inputs.
+func TestRegression_LocalTimestampMillisJSONEncodeNonUTC(t *testing.T) {
+	schema := MustParse(`{"type":"long","logicalType":"local-timestamp-millis"}`)
+	nyc := time.FixedZone("NYC", -5*3600)
+	in := time.Date(2024, 1, 1, 12, 0, 0, 0, nyc)
+	jb, err := schema.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	const want = "1704110400000" // 2024-01-01 12:00 UTC ms (wall-clock-as-UTC)
+	if string(jb) != want {
+		t.Fatalf("json wire: got %s, want %s (binary path returns the same)", jb, want)
+	}
+}
+
+// TestRegression_LocalTimestampMicrosJSONEncodeNonUTC is the micros
+// parity test for the same wall-clock-as-UTC rule.
+func TestRegression_LocalTimestampMicrosJSONEncodeNonUTC(t *testing.T) {
+	schema := MustParse(`{"type":"long","logicalType":"local-timestamp-micros"}`)
+	nyc := time.FixedZone("NYC", -5*3600)
+	in := time.Date(2024, 1, 1, 12, 0, 0, 0, nyc)
+	jb, err := schema.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	const want = "1704110400000000"
+	if string(jb) != want {
+		t.Fatalf("json wire: got %s, want %s", jb, want)
+	}
+}
+
+// TestRegression_LocalTimestampNanosJSONEncodeNonUTC is the nanos
+// parity test.
+func TestRegression_LocalTimestampNanosJSONEncodeNonUTC(t *testing.T) {
+	schema := MustParse(`{"type":"long","logicalType":"local-timestamp-nanos"}`)
+	nyc := time.FixedZone("NYC", -5*3600)
+	in := time.Date(2024, 1, 1, 12, 0, 0, 0, nyc)
+	jb, err := schema.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	const want = "1704110400000000000"
+	if string(jb) != want {
+		t.Fatalf("json wire: got %s, want %s", jb, want)
+	}
+}
+
+// TestRegression_LocalTimestampMillisJSONEncodeFromString locks in
+// that the RFC 3339 string input path (tryParseTimeString) also uses
+// the wall-clock-as-UTC conversion for local-timestamp logical types,
+// matching the time.Time input path.
+func TestRegression_LocalTimestampMillisJSONEncodeFromString(t *testing.T) {
+	schema := MustParse(`{"type":"long","logicalType":"local-timestamp-millis"}`)
+	const in = "2024-01-01T12:00:00-05:00"
+	jb, err := schema.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	const want = "1704110400000"
+	if string(jb) != want {
+		t.Fatalf("json wire: got %s, want %s", jb, want)
+	}
+}
+
+// TestRegression_DefaultJSONIgnoresTaggedUnions locks in that
+// missing-field record defaults respect encoder options. Pre-fix the
+// missing-field path spliced a pre-marshalled f.defaultJSON (just
+// json.Marshal of the parsed default), bypassing the appendAvroJSON
+// dispatch — so under TaggedUnions a "hello" union default emitted
+// "hello" instead of {"string":"hello"}, the form Java/fastavro
+// JsonDecoder require.
+func TestRegression_DefaultJSONIgnoresTaggedUnions(t *testing.T) {
+	s := MustParse(`{
+		"type": "record", "name": "R",
+		"fields": [
+			{"name": "f", "type": ["null", "string"], "default": "hello"}
+		]
+	}`)
+	want := `{"f":{"string":"hello"}}`
+
+	// Control: present value already wraps under TaggedUnions.
+	got, err := s.EncodeJSON(map[string]any{"f": "hello"}, TaggedUnions())
+	if err != nil {
+		t.Fatalf("present: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("present: got %s want %s", got, want)
+	}
+
+	// Bug: missing-field default must wrap too.
+	got, err = s.EncodeJSON(map[string]any{}, TaggedUnions())
+	if err != nil {
+		t.Fatalf("missing: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("missing-field default: got %s want %s", got, want)
+	}
+}
+
+// TestRegression_NestedDefaultJSONIgnoresTaggedUnions locks in the
+// recursive variant: a record default whose inner field is a non-null
+// union must wrap the inner value under TaggedUnions. Pre-fix the
+// splice emitted the bare default verbatim regardless of nesting.
+func TestRegression_NestedDefaultJSONIgnoresTaggedUnions(t *testing.T) {
+	s := MustParse(`{
+		"type": "record", "name": "Outer",
+		"fields": [
+			{"name": "inner",
+			 "type": {
+				"type": "record", "name": "Inner",
+				"fields": [
+					{"name": "x", "type": ["null", "string"], "default": "hi"}
+				]
+			 },
+			 "default": {"x": "hi"}}
+		]
+	}`)
+	want := `{"inner":{"x":{"string":"hi"}}}`
+	got, err := s.EncodeJSON(map[string]any{}, TaggedUnions())
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("nested: got %s want %s", got, want)
+	}
+}
+
+// TestRegression_TimestampMillisMicrosSilentOverflow locks in that
+// timestamp-millis / timestamp-micros / local-timestamp-millis /
+// local-timestamp-micros encoders return an error for time.Time
+// values whose UnixMilli/UnixMicro would overflow int64, instead of
+// silently wrapping. Java's Instant.toEpochMilli and
+// TimestampMicrosConversion.toLong (Math.multiplyExact / Math.addExact)
+// throw ArithmeticException on the same input; Go's UnixMilli /
+// UnixMicro are documented as "undefined" for out-of-range times. The
+// timeToTimestampNanos path already had this guard; the millis/micros
+// variants were missed.
+//
+// Year 300_000 overflows micros (MaxInt64µs ≈ year 294246); year
+// 300_000_000 overflows millis (MaxInt64ms ≈ year 292M).
+func TestRegression_TimestampMillisMicrosSilentOverflow(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		val    time.Time
+	}{
+		{"timestamp-micros y300k", `{"type":"long","logicalType":"timestamp-micros"}`, time.Date(300_000, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"local-timestamp-micros y300k", `{"type":"long","logicalType":"local-timestamp-micros"}`, time.Date(300_000, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"timestamp-millis y300M", `{"type":"long","logicalType":"timestamp-millis"}`, time.Date(300_000_000, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"local-timestamp-millis y300M", `{"type":"long","logicalType":"local-timestamp-millis"}`, time.Date(300_000_000, 1, 1, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := MustParse(tc.schema)
+			if out, err := s.AppendEncode(nil, tc.val); err == nil {
+				t.Errorf("binary encode of out-of-range %v silently produced %d bytes", tc.val, len(out))
+			}
+			if out, err := s.AppendEncodeJSON(nil, tc.val); err == nil {
+				t.Errorf("JSON encode of out-of-range %v silently produced %s", tc.val, out)
+			}
+		})
+	}
+}
+
+// TestRegression_TimestampMillisMicrosUnsafeOverflow is the unsafe-path
+// parity test: the struct-field fast path (usTimestampMillis etc.) must
+// also reject overflow, matching the safe path.
+func TestRegression_TimestampMillisMicrosUnsafeOverflow(t *testing.T) {
+	type RMillis struct {
+		T time.Time `avro:"t"`
+	}
+	type RMicros struct {
+		T time.Time `avro:"t"`
+	}
+	type RLocalMillis struct {
+		T time.Time `avro:"t"`
+	}
+	type RLocalMicros struct {
+		T time.Time `avro:"t"`
+	}
+
+	bigMicros := time.Date(300_000, 1, 1, 0, 0, 0, 0, time.UTC)
+	bigMillis := time.Date(300_000_000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	sMicros := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"timestamp-micros"}}]}`)
+	sLocalMicros := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"local-timestamp-micros"}}]}`)
+	sMillis := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}}]}`)
+	sLocalMillis := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"local-timestamp-millis"}}]}`)
+
+	if _, err := sMicros.AppendEncode(nil, &RMicros{T: bigMicros}); err == nil {
+		t.Errorf("unsafe timestamp-micros: silent overflow")
+	}
+	if _, err := sLocalMicros.AppendEncode(nil, &RLocalMicros{T: bigMicros}); err == nil {
+		t.Errorf("unsafe local-timestamp-micros: silent overflow")
+	}
+	if _, err := sMillis.AppendEncode(nil, &RMillis{T: bigMillis}); err == nil {
+		t.Errorf("unsafe timestamp-millis: silent overflow")
+	}
+	if _, err := sLocalMillis.AppendEncode(nil, &RLocalMillis{T: bigMillis}); err == nil {
+		t.Errorf("unsafe local-timestamp-millis: silent overflow")
+	}
+}
+
+// TestRegression_DecodeJSONLongOverflowGap locks in that JSON-encoded
+// long values exceeding int64 are rejected, not silently wrapped.
+// parseJSONInt64 used a "n*10+d wrapped if it went down" check that
+// has a gap once n is near 2^64/9: n*10+d wraps mod 2^64 to a value
+// still ≥ prev, evading detection. The post-loop n > MaxInt64 guard
+// then accepts the wrapped value because it's below MaxInt64 even
+// though the input wasn't. Pre-fix all ten 20-digit inputs of the
+// form 2049638230412172402d (d ∈ 0..9) silently mis-parsed.
+//
+// Java: JsonParser.getLongValue throws InputCoercionException.
+// goavro: strconv.ParseInt rejects.
+func TestRegression_DecodeJSONLongOverflowGap(t *testing.T) {
+	t.Run("bare long exceeding MaxInt64", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var got int64
+		if err := s.DecodeJSON([]byte(`20496382304121724020`), &got); err == nil {
+			t.Errorf("expected overflow error; got value=%d", got)
+		}
+	})
+	t.Run("long inside record", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"long"}]}`)
+		type rec struct {
+			X int64 `avro:"x"`
+		}
+		var r rec
+		if err := s.DecodeJSON([]byte(`{"x":20496382304121724020}`), &r); err == nil {
+			t.Errorf("expected overflow error; got X=%d", r.X)
+		}
+	})
+	t.Run("negative below MinInt64", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var got int64
+		if err := s.DecodeJSON([]byte(`-20496382304121724020`), &got); err == nil {
+			t.Errorf("expected overflow error; got value=%d", got)
+		}
+	})
+	// MaxInt64 / MinInt64 themselves must still parse exactly.
+	t.Run("MaxInt64 boundary", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var got int64
+		if err := s.DecodeJSON([]byte(`9223372036854775807`), &got); err != nil {
+			t.Fatalf("MaxInt64 should parse: %v", err)
+		}
+		if got != 9223372036854775807 {
+			t.Errorf("got %d, want MaxInt64", got)
+		}
+	})
+	t.Run("MinInt64 boundary", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var got int64
+		if err := s.DecodeJSON([]byte(`-9223372036854775808`), &got); err != nil {
+			t.Fatalf("MinInt64 should parse: %v", err)
+		}
+		if got != -9223372036854775808 {
+			t.Errorf("got %d, want MinInt64", got)
+		}
+	})
+	t.Run("MaxInt64 + 1 rejected", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var got int64
+		if err := s.DecodeJSON([]byte(`9223372036854775808`), &got); err == nil {
+			t.Errorf("MaxInt64+1 should be rejected; got %d", got)
+		}
+	})
+	t.Run("MinInt64 - 1 rejected", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var got int64
+		if err := s.DecodeJSON([]byte(`-9223372036854775809`), &got); err == nil {
+			t.Errorf("MinInt64-1 should be rejected; got %d", got)
+		}
+	})
+}
+
+// TestRegression_DeserFixedArrayBlockCountOverflow locks in that
+// decoding into a fixed-size Go array [N]T errors instead of panicking
+// when the wire's block count would overflow the int64 idx+count
+// arithmetic. Pre-fix the bound check `idx+int(count) > arrLen`
+// wrapped for count near MaxInt64, bypassing the guard and panicking
+// on v.Index(idx) when idx exceeded arrLen. The new check uses
+// `count > int64(arrLen-idx)` which compares two non-negative int64
+// values without wrap risk.
+func TestRegression_DeserFixedArrayBlockCountOverflow(t *testing.T) {
+	s := MustParse(`{"type":"array","items":"null"}`)
+	enc := func(n int64) []byte {
+		zz := uint64(n<<1) ^ uint64(n>>63)
+		var out []byte
+		for zz >= 0x80 {
+			out = append(out, byte(zz)|0x80)
+			zz >>= 7
+		}
+		return append(out, byte(zz))
+	}
+	src := append(append([]byte{}, enc(1)...), enc(math.MaxInt64)...)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("decode panicked: %v", r)
+		}
+	}()
+	var v [3]any
+	if _, err := s.Decode(src, &v); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+}
+
+// TestRegression_SkipArrayBlockCountOverflow locks in that schema
+// resolution dropping an array<null> field doesn't hang on a hostile
+// wire. Pre-fix the totalItems += count accumulator wrapped to
+// MinInt64+999 when block 1 count = 4000 + block 2 count =
+// MaxInt64-3000, bypassing the maxZeroByteItems cap. The inner loop
+// then ran ~MaxInt64 iterations of skipNull (a no-op), hanging the
+// process. The new pre-add check `count > maxZeroByteItems-totalItems`
+// catches this without wrapping.
+func TestRegression_SkipArrayBlockCountOverflow(t *testing.T) {
+	writer := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"drop","type":{"type":"array","items":"null"}},
+		{"name":"keep","type":"int"}]}`)
+	reader := MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
+
+	enc := func(n int64) []byte {
+		zz := uint64(n<<1) ^ uint64(n>>63)
+		var out []byte
+		for zz >= 0x80 {
+			out = append(out, byte(zz)|0x80)
+			zz >>= 7
+		}
+		return append(out, byte(zz))
+	}
+	src := []byte{}
+	src = append(src, enc(4000)...)
+	src = append(src, enc(math.MaxInt64-3000)...)
+	src = append(src, enc(0)...)
+	src = append(src, enc(42)...)
+
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type recOut struct {
+		Keep int32 `avro:"keep"`
+	}
+
+	done := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		var got recOut
+		_, err := resolved.Decode(src, &got)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("expected error, got nil")
+		}
+	case <-ctx.Done():
+		t.Fatalf("decode timed out: infinite loop in skipArray")
+	}
+}
+
+// TestRegression_DeserArraySliceBlockCountOverflow locks in that the
+// slice-target array decode path rejects a hostile block stream where
+// totalItems would wrap past int64. Caught primarily by the pre-add
+// overflow-safe cap in checkArrayBlockBounds; the downstream
+// `start > math.MaxInt-n` slice-grow check is a secondary defense.
+func TestRegression_DeserArraySliceBlockCountOverflow(t *testing.T) {
+	s := MustParse(`{"type":"array","items":"null"}`)
+	enc := func(n int64) []byte {
+		zz := uint64(n<<1) ^ uint64(n>>63)
+		var out []byte
+		for zz >= 0x80 {
+			out = append(out, byte(zz)|0x80)
+			zz >>= 7
+		}
+		return append(out, byte(zz))
+	}
+	src := append(append([]byte{}, enc(4000)...), enc(math.MaxInt64-3000)...)
+	src = append(src, enc(0)...)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("decode panicked: %v", r)
+		}
+	}()
+	var v []any
+	if _, err := s.Decode(src, &v); err == nil {
+		t.Fatalf("expected error, got nil; len(v)=%d", len(v))
+	}
+}
+
+// TestRegression_UnsafeArrayPtrRecordBlockCountOverflow is the
+// unsafe-path parity of the slice test above. Caught primarily by the
+// pre-add overflow-safe cap in checkArrayBlockBounds.
+func TestRegression_UnsafeArrayPtrRecordBlockCountOverflow(t *testing.T) {
+	type Empty struct{}
+	type R struct {
+		A []*Empty `avro:"a"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":{"type":"record","name":"E","fields":[]}}}]}`)
+	enc := func(n int64) []byte {
+		zz := uint64(n<<1) ^ uint64(n>>63)
+		var out []byte
+		for zz >= 0x80 {
+			out = append(out, byte(zz)|0x80)
+			zz >>= 7
+		}
+		return append(out, byte(zz))
+	}
+	src := append(append([]byte{}, enc(4000)...), enc(math.MaxInt64-3000)...)
+	src = append(src, enc(0)...)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("decode panicked: %v", r)
+		}
+	}()
+	var r R
+	if _, err := s.Decode(src, &r); err == nil {
+		t.Fatalf("expected error, got nil; len(a)=%d", len(r.A))
+	}
+}
+
+// TestRegression_UdArrayDirectBlockCountOverflow locks in that the
+// unsafe primitive-array path (udArrayDirect, used for []int64 /
+// []float64 / etc. as struct fields) rejects a hostile block stream.
+// Two defenses: the per-block `count > int64(len(src))` check (since
+// each primitive takes ≥1 wire byte) and the downstream
+// `start > math.MaxInt-n` slice-grow guard. This test ensures
+// neither is silently removed.
+func TestRegression_UdArrayDirectBlockCountOverflow(t *testing.T) {
+	type R struct {
+		A []int64 `avro:"a"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":"long"}}]}`)
+	enc := func(n int64) []byte {
+		zz := uint64(n<<1) ^ uint64(n>>63)
+		var out []byte
+		for zz >= 0x80 {
+			out = append(out, byte(zz)|0x80)
+			zz >>= 7
+		}
+		return append(out, byte(zz))
+	}
+	src := append(append([]byte{}, enc(1)...), enc(0)...) // valid first block of 1 long, then more
+	src = append(src, enc(math.MaxInt64-3000)...)         // hostile block count
+	src = append(src, enc(0)...)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("decode panicked: %v", r)
+		}
+	}()
+	var r R
+	if _, err := s.Decode(src, &r); err == nil {
+		t.Fatalf("expected error, got nil; len(a)=%d", len(r.A))
+	}
+}
+
+// TestRegression_TimestampMillisMinInt64 locks in that
+// timeToTimestampMillis accepts time.Time values constructed from
+// MinInt64 milliseconds since epoch. Pre-fix the symmetric guard
+// `sec > maxSec || sec < -maxSec` rejected sec = -maxSec - 1
+// (= -9223372036854776), which is the seconds component of
+// time.UnixMilli(MinInt64) after Go's normalization (since the
+// remainder is negative, normalization decrements sec by 1 and adds
+// 1e9 to nsec). Java's Instant.toEpochMilli has an adjustment branch
+// for sec < 0 && nsec > 0 — `(sec+1)*1000 + (nsec/1e6 - 1000)` —
+// that accepts the full int64 range; we now mirror it.
+func TestRegression_TimestampMillisMinInt64(t *testing.T) {
+	in := time.UnixMilli(math.MinInt64).UTC()
+	type R struct {
+		T time.Time `avro:"t"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}}]}`)
+	if _, err := s.AppendEncode(nil, R{T: in}); err != nil {
+		t.Fatalf("encode failed for MinInt64 millis: %v", err)
+	}
+}
+
+// TestRegression_TimestampMicrosMinInt64 — same parity rule for
+// microseconds. Java's TimestampMicrosConversion.toLong (line 185-198)
+// has the explicit adjustment branch.
+func TestRegression_TimestampMicrosMinInt64(t *testing.T) {
+	in := time.UnixMicro(math.MinInt64).UTC()
+	type R struct {
+		T time.Time `avro:"t"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"timestamp-micros"}}]}`)
+	if _, err := s.AppendEncode(nil, R{T: in}); err != nil {
+		t.Fatalf("encode failed for MinInt64 micros: %v", err)
+	}
+}
+
+// TestRegression_TimestampMillisMinInt64UnsafePath — the unsafe
+// struct-fast-path (usTimestampMillis) calls the same helper, so the
+// fix propagates automatically. This test pins that.
+func TestRegression_TimestampMillisMinInt64UnsafePath(t *testing.T) {
+	type R struct {
+		T time.Time `avro:"t"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}}]}`)
+	if _, err := s.AppendEncode(nil, R{T: time.UnixMilli(0).UTC()}); err != nil {
+		t.Fatalf("warm encode failed: %v", err)
+	}
+	in := time.UnixMilli(math.MinInt64).UTC()
+	if _, err := s.AppendEncode(nil, R{T: in}); err != nil {
+		t.Fatalf("encode failed for MinInt64 millis (unsafe path): %v", err)
+	}
+}
+
+// TestRegression_LocalTimestampMillisMinInt64 — local-timestamp
+// variants delegate to the timestamp-* helpers, inheriting the same
+// fix. Java's LocalTimestampMillisConversion.toLong (line 274-277)
+// also delegates to TimestampMillisConversion.toLong.
+func TestRegression_LocalTimestampMillisMinInt64(t *testing.T) {
+	in := time.UnixMilli(math.MinInt64).UTC()
+	type R struct {
+		T time.Time `avro:"t"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"local-timestamp-millis"}}]}`)
+	if _, err := s.AppendEncode(nil, R{T: in}); err != nil {
+		t.Fatalf("encode failed for MinInt64 local-timestamp-millis: %v", err)
+	}
+}
+
+// TestRegression_DecodeJSONCustomDecoderConcurrentRace locks in that
+// concurrent Schema.DecodeJSON calls on a schema with custom-typed
+// fields don't race on shared state. JSON dispatch is closure-
+// captured at schema build (parallel to the binary path's
+// wrapDeserWithCustomDecoders), so the schema graph is read-only at
+// decode time.
+func TestRegression_DecodeJSONCustomDecoderConcurrentRace(t *testing.T) {
+	type Money struct{ Cents int64 }
+	moneyType := NewCustomType[Money, int64](
+		"money",
+		func(m Money, _ *SchemaNode) (int64, error) { return m.Cents, nil },
+		func(c int64, _ *SchemaNode) (Money, error) { return Money{Cents: c}, nil },
+	)
+	s, err := Parse(`{"type":"long","logicalType":"money"}`, moneyType)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const N = 200
+	var wg sync.WaitGroup
+	errs := make([]error, N)
+	results := make([]Money, N)
+	for i := range N {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			var got Money
+			err := s.DecodeJSON([]byte(`42`), &got)
+			errs[idx] = err
+			results[idx] = got
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: error %v", i, err)
+		}
+		if results[i].Cents != 42 {
+			t.Errorf("goroutine %d: got %+v, want Money{Cents:42}", i, results[i])
+		}
+	}
+}
+
+// TestRegression_EncodeJSONNilPtrIntoNonNullableUnion locks in that
+// EncodeJSON of a nil *T into a union that doesn't contain "null"
+// errors instead of silently emitting "null". The early return in
+// appendAvroJSON treated every union as nullable; the binary path
+// (serUnion.ser → branch tryAll) correctly errors with "no matching
+// branch", and Java/fastavro reject the same input
+// (UnresolvedUnionException / "do not match"). The library's own
+// DecodeJSON also rejects null against a no-null union (see
+// TestRegression_UnionWithoutNullBranchAcceptsJsonNull) — so the bug
+// produced output the same library couldn't read back.
+func TestRegression_EncodeJSONNilPtrIntoNonNullableUnion(t *testing.T) {
+	s := MustParse(`["int","string"]`)
+	var p *int
+	out, err := s.EncodeJSON(p)
+	if err == nil {
+		t.Errorf("EncodeJSON(*int(nil)) into [int,string]: got %q, want error", out)
+	}
+}
+
+// TestRegression_EncodeJSONNilInterfaceIntoNonNullableUnion is the
+// nil-any sibling — same bug, same fix.
+func TestRegression_EncodeJSONNilInterfaceIntoNonNullableUnion(t *testing.T) {
+	s := MustParse(`["int","string"]`)
+	var x any
+	out, err := s.EncodeJSON(x)
+	if err == nil {
+		t.Errorf("EncodeJSON(any(nil)) into [int,string]: got %q, want error", out)
+	}
+}
+
+// TestRegression_EncodeJSONNilPtrIntoNullableUnion is the positive
+// counterpart: nil into a union containing "null" must still emit
+// "null".
+func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
+	s := MustParse(`["null","string"]`)
+	var p *string
+	out, err := s.EncodeJSON(p)
+	if err != nil {
+		t.Fatalf("nullable union should accept nil: %v", err)
+	}
+	if string(out) != "null" {
+		t.Errorf("got %q, want \"null\"", out)
+	}
+}
+
+// TestRegression_TimestampNanosMinInt64 locks in that
+// timeToTimestampNanos accepts time.Time values constructed from
+// MinInt64 nanoseconds since epoch, matching avro-rs and fastavro.
+// Java's TimestampNanosConversion.toLong has an off-by-1000 typo
+// (TimeConversions.java:238 uses `nanos - 1_000_000` instead of
+// `nanos - 1_000_000_000`) that would propagate ~999ms of error per
+// negative-second instant, so we deliberately diverge from Java for
+// this single conversion and align with avro-rs / fastavro instead.
+func TestRegression_TimestampNanosMinInt64(t *testing.T) {
+	in := time.Unix(0, math.MinInt64).UTC()
+	type R struct {
+		T time.Time `avro:"t"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"timestamp-nanos"}}]}`)
+	enc, err := s.AppendEncode(nil, R{T: in})
+	if err != nil {
+		t.Fatalf("encode failed for MinInt64 nanos: %v", err)
+	}
+	type R2 struct {
+		T int64 `avro:"t"`
+	}
+	rawSchema := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":"long"}]}`)
+	var r2 R2
+	if _, err := rawSchema.Decode(enc, &r2); err != nil {
+		t.Fatal(err)
+	}
+	if r2.T != math.MinInt64 {
+		t.Fatalf("wire long: got %d, want MinInt64", r2.T)
+	}
+}
+
+// TestRegression_LocalTimestampNanosMinInt64 — local-timestamp-nanos
+// delegates to timeToTimestampNanos, inheriting the same fix.
+func TestRegression_LocalTimestampNanosMinInt64(t *testing.T) {
+	in := time.Unix(0, math.MinInt64).UTC()
+	type R struct {
+		T time.Time `avro:"t"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"t","type":{"type":"long","logicalType":"local-timestamp-nanos"}}]}`)
+	if _, err := s.AppendEncode(nil, R{T: in}); err != nil {
+		t.Fatalf("encode failed for MinInt64 local-timestamp-nanos: %v", err)
+	}
+}
+
+type myKey string
+
+// TestRegression_DecodeJSONFixedSizeMismatchTypedTarget locks in that
+// JSON decode of fixed/bytes into [N]byte rejects a length mismatch
+// instead of silently zero-padding (when wire shorter than N) or
+// truncating (when wire longer than N). reflect.Copy at the previous
+// site copied min(len(b), v.Len()) bytes without erroring, producing
+// silently-corrupt values. The binary path's deserBytes / deserFixed
+// already reject this; the JSON encode side already rejects this; the
+// JSON decode side was the outlier.
+func TestRegression_DecodeJSONFixedSizeMismatchTypedTarget(t *testing.T) {
+	s := MustParse(`{"type":"fixed","name":"F","size":4}`)
+	enc, err := s.EncodeJSON([4]byte{0xde, 0xad, 0xbe, 0xef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [16]byte
+	if err := s.DecodeJSON(enc, &got); err == nil {
+		t.Errorf("expected size-mismatch error, got %x with no error", got)
+	}
+}
+
+func TestRegression_DecodeJSONBytesSizeMismatchTypedTarget(t *testing.T) {
+	s := MustParse(`"bytes"`)
+	enc, err := s.EncodeJSON([]byte{0xde, 0xad, 0xbe, 0xef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [16]byte
+	if err := s.DecodeJSON(enc, &got); err == nil {
+		t.Errorf("expected size-mismatch error, got %x with no error", got)
+	}
+}
+
+func TestRegression_DecodeJSONBytesOverflowTypedTarget(t *testing.T) {
+	s := MustParse(`"bytes"`)
+	enc, err := s.EncodeJSON([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [4]byte
+	if err := s.DecodeJSON(enc, &got); err == nil {
+		t.Errorf("expected size-mismatch error, got %x with no error", got)
+	}
+}
+
+// TestRegression_SerRecordMapNamedStringKey locks in that binary
+// encoding a record from map[NamedKey]any (where NamedKey has
+// underlying type string) doesn't panic. Pre-fix v.MapIndex(f.nameVal)
+// panicked because f.nameVal was a plain string but the map's key
+// type was the named subtype.
+func TestRegression_SerRecordMapNamedStringKey(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`)
+	m := map[myKey]any{myKey("x"): int32(7)}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("encode panicked: %v", r)
+		}
+	}()
+	if _, err := s.AppendEncode(nil, m); err != nil {
+		t.Errorf("encode err: %v", err)
+	}
+}
+
+func TestRegression_AppendAvroJSONRecordMapNamedStringKey(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`)
+	m := map[myKey]any{myKey("x"): int32(7)}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("EncodeJSON panicked: %v", r)
+		}
+	}()
+	if _, err := s.EncodeJSON(m); err != nil {
+		t.Errorf("encode err: %v", err)
+	}
+}
+
+func TestRegression_DecodeBinaryMapNamedStringKey(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"int"}`)
+	enc, err := s.AppendEncode(nil, map[string]int32{"x": 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[myKey]int32
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("Decode panicked: %v", r)
+		}
+	}()
+	if _, err := s.Decode(enc, &got); err != nil {
+		t.Errorf("decode err: %v", err)
+	}
+	if got[myKey("x")] != 7 {
+		t.Errorf("got %v, want map[x:7]", got)
+	}
+}
+
+func TestRegression_DeserMapStringBlockNamedKey(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"string"}`)
+	enc, err := s.AppendEncode(nil, map[string]string{"x": "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[myKey]string
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("string-fast-block decode panicked: %v", r)
+		}
+	}()
+	if _, err := s.Decode(enc, &got); err != nil {
+		t.Errorf("decode err: %v", err)
+	}
+	if got[myKey("x")] != "hi" {
+		t.Errorf("got %v, want map[x:hi]", got)
+	}
+}
+
+func TestRegression_DecodeJSONMapNamedStringKey(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"int"}`)
+	var got map[myKey]int32
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("DecodeJSON panicked: %v", r)
+		}
+	}()
+	if err := s.DecodeJSON([]byte(`{"x":7}`), &got); err != nil {
+		t.Errorf("decode err: %v", err)
+	}
+	if got[myKey("x")] != 7 {
+		t.Errorf("got %v, want map[x:7]", got)
+	}
+}
+
+func TestRegression_DecodeJSONRecordMapNamedStringKey(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`)
+	var got map[myKey]any
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("DecodeJSON panicked: %v", r)
+		}
+	}()
+	if err := s.DecodeJSON([]byte(`{"x":7}`), &got); err != nil {
+		t.Errorf("decode err: %v", err)
+	}
+}
+
+func TestRegression_ResolveDeserRecordMapNamedKey(t *testing.T) {
+	wr := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"},{"name":"y","type":"int"}]}`)
+	rr := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`)
+	resolved, err := Resolve(wr, rr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := wr.AppendEncode(nil, map[string]int32{"x": 1, "y": 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[myKey]int32
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("resolve+decode panicked: %v", r)
+		}
+	}()
+	if _, err := resolved.Decode(enc, &got); err != nil {
+		t.Errorf("decode err: %v", err)
+	}
+}
+
+// TestRegression_DecodeJSONDecimalIntoFloatParity locks in that JSON
+// decode of a decimal-bytes value into *float64 matches the binary
+// path's setDecimalValue float coercion. Pre-fix assignBytes only
+// matched *big.Rat / json.Number for the decimal arm and fell through
+// to the generic byte/string handlers (which don't apply decimal
+// logic), so the JSON path rejected float targets that the binary
+// path supports.
+func TestRegression_DecodeJSONDecimalIntoFloatParity(t *testing.T) {
+	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+	r := new(big.Rat).SetFrac64(33, 100)
+
+	binEnc, err := s.AppendEncode(nil, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var binF float64
+	if _, err := s.Decode(binEnc, &binF); err != nil || binF != 0.33 {
+		t.Fatalf("binary: %v err=%v", binF, err)
+	}
+
+	jsonEnc, err := s.AppendEncodeJSON(nil, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonF float64
+	if err := s.DecodeJSON(jsonEnc, &jsonF); err != nil {
+		t.Fatalf("JSON decode of decimal into *float64: %v", err)
+	}
+	if jsonF != 0.33 {
+		t.Fatalf("json: got %v want 0.33", jsonF)
+	}
+}
+
+// TestRegression_DecodeJSONDecimalBareNumberIntoFloatParity — same
+// parity rule for the bare-number lenient form.
+func TestRegression_DecodeJSONDecimalBareNumberIntoFloatParity(t *testing.T) {
+	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+	var f float64
+	if err := s.DecodeJSON([]byte(`0.33`), &f); err != nil {
+		t.Fatalf("JSON decode of bare-number decimal into *float64: %v", err)
+	}
+	if f != 0.33 {
+		t.Fatalf("got %v want 0.33", f)
+	}
+}
+
+// TestRegression_DecodeJSONFixedDecimalIntoFloatParity — fixed-backed
+// decimal routes through the same assignBytes code path, same fix.
+func TestRegression_DecodeJSONFixedDecimalIntoFloatParity(t *testing.T) {
+	s := MustParse(`{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`)
+	r := new(big.Rat).SetFrac64(33, 100)
+	jsonEnc, err := s.AppendEncodeJSON(nil, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f float64
+	if err := s.DecodeJSON(jsonEnc, &f); err != nil {
+		t.Fatalf("JSON decode of fixed-decimal into *float64: %v", err)
+	}
+	if f != 0.33 {
+		t.Fatalf("got %v want 0.33", f)
+	}
+}
+
+// TestRegression_DecodeJSONDecimalIntoStringParity locks in that JSON
+// decode into *string produces the formatted decimal "0.33" via
+// rat.FloatString(scale), matching the binary path. Pre-fix it
+// returned the raw codepoint bytes interpreted as UTF-8 ("!" for
+// unscaled=33), silently wrong rather than an error.
+func TestRegression_DecodeJSONDecimalIntoStringParity(t *testing.T) {
+	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+	r := new(big.Rat).SetFrac64(33, 100)
+
+	binEnc, err := s.AppendEncode(nil, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var binS string
+	if _, err := s.Decode(binEnc, &binS); err != nil || binS != "0.33" {
+		t.Fatalf("binary: got %q err=%v", binS, err)
+	}
+
+	jsonEnc, err := s.AppendEncodeJSON(nil, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonS string
+	if err := s.DecodeJSON(jsonEnc, &jsonS); err != nil {
+		t.Fatalf("JSON decode into *string: %v", err)
+	}
+	if jsonS != "0.33" {
+		t.Fatalf("JSON: got %q want \"0.33\"", jsonS)
+	}
+}
+
+// TestRegression_DecodeJSONDecimalRecordFloatField — the typical user
+// shape: a record with a float-typed field backed by a decimal
+// logical type. Pre-fix the parity gap propagated into struct decode.
+func TestRegression_DecodeJSONDecimalRecordFloatField(t *testing.T) {
+	type R struct {
+		V float64 `avro:"v"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"v","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}}
+	]}`)
+	in := R{V: 0.5}
+	binEnc, err := s.AppendEncode(nil, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var binOut R
+	if _, err := s.Decode(binEnc, &binOut); err != nil || binOut.V != 0.5 {
+		t.Fatalf("binary: V=%v err=%v", binOut.V, err)
+	}
+	jsonEnc, err := s.AppendEncodeJSON(nil, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonOut R
+	if err := s.DecodeJSON(jsonEnc, &jsonOut); err != nil {
+		t.Fatalf("JSON: %v", err)
+	}
+	if jsonOut.V != 0.5 {
+		t.Fatalf("json: got %v want 0.5", jsonOut.V)
+	}
+}
+
+// TestRegression_DecodeJSONDecimalFloat32Overflow / Float64Overflow
+// are JSON siblings of the existing binary-path overflow tests. The
+// overflow guards inside setDecimalRat (Inf-clamp on big.Rat.Float64;
+// finite→±Inf narrowing to float32) carry over to JSON via the
+// shared helper.
+func TestRegression_DecodeJSONDecimalFloat32Overflow(t *testing.T) {
+	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":40,"scale":0}`)
+	huge := new(big.Rat)
+	huge.SetString("1e39") // > MaxFloat32 ≈ 3.4e38
+	jsonEnc, err := s.AppendEncodeJSON(nil, huge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f float32
+	if err := s.DecodeJSON(jsonEnc, &f); err == nil {
+		t.Fatalf("expected float32 overflow error; got %v", f)
+	}
+}
+
+func TestRegression_DecodeJSONDecimalFloat64Overflow(t *testing.T) {
+	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":400,"scale":0}`)
+	huge := new(big.Rat)
+	huge.SetString("1e310") // > MaxFloat64 ≈ 1.8e308
+	jsonEnc, err := s.AppendEncodeJSON(nil, huge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f float64
+	if err := s.DecodeJSON(jsonEnc, &f); err == nil {
+		t.Fatalf("expected float64 overflow error; got %v", f)
+	}
+}
+
+// TestRegression_UnionDefaultStringMatchesStringBranchNotFloat locks
+// in that a textual union default matches the string branch first when
+// the union contains both string and float (in that order), matching
+// Java/fastavro/hamba. Pre-fix coerceDefault converted a string default
+// to float64 whenever the union contained a float/double branch,
+// regardless of branch order — so encodeDefault then wrote the float
+// branch's index + IEEE bytes for ["string","float"] + "3.14",
+// producing wire output none of the reference impls would.
+//
+// Spec ("Schema Records / Default Values", Avro 1.12): "Default values
+// for union fields correspond to the first schema that matches in the
+// union". Java's isCompatible(STRING, TextNode) is true → branch 0
+// wins. fastavro's _default_matches_schema and hamba/avro's
+// isValidDefault both pick branch 0 by type-equality first.
+func TestRegression_UnionDefaultStringMatchesStringBranchNotFloat(t *testing.T) {
+	w := MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
+	r := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"keep","type":"int"},
+		{"name":"f","type":["string","float"],"default":"3.14"}
+	]}`)
+	src, err := w.AppendEncode(nil, map[string]any{"keep": int32(7)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Resolve(w, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if _, err := res.Decode(src, &out); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out["f"].(string)
+	if !ok || got != "3.14" {
+		t.Fatalf("expected reader default to decode as string %q, got %T(%v)", "3.14", out["f"], out["f"])
+	}
+}
+
+// TestRegression_MapDecodeBucketAmplificationDoS pins that an Avro
+// map<V> decode does not pre-allocate bucket storage proportional to
+// an attacker-declared count. Pre-fix the block-count bound was
+// `count > len(src)` (no per-entry minimum), and the size hint was
+// passed straight into reflect.MakeMapWithSize, so a 4 MB input
+// declaring 2 M entries with empty keys collapsed to one decoded
+// entry while heap-allocating ~160 MB of bucket overhead (≈ 40×
+// amplification for map[string]any).
+//
+// Fixes: (a) bound now uses minMapEntryBytes (1-byte empty-key
+// varint plus schemaMinBytes(values)) like the array path's
+// minItemBytes; (b) MakeMapWithSize hint capped at maxMapPreAllocSize
+// so worst-case allocation is bounded regardless of bound-check
+// loophole. fastavro avoids the issue by not pre-sizing; Java has a
+// smaller version (~4×) and we now amplify less than Java.
+func TestRegression_MapDecodeBucketAmplificationDoS(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"long"}`)
+
+	const declaredCount = int64(2_000_000)
+	zigzag := uint64(declaredCount) << 1
+	var blob []byte
+	for zigzag >= 0x80 {
+		blob = append(blob, byte(zigzag)|0x80)
+		zigzag >>= 7
+	}
+	blob = append(blob, byte(zigzag))
+	for i := 0; i < int(declaredCount); i++ {
+		blob = append(blob, 0, 0) // 1-byte empty key + 1-byte value 0
+	}
+	blob = append(blob, 0)
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	var got any
+	if _, err := s.Decode(blob, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	delta := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	gotMap := got.(map[string]any)
+	t.Logf("input=%dMB declared_count=%d actual_entries=%d heap_delta=%dMB amplification=%.1fx",
+		len(blob)>>20, declaredCount, len(gotMap), delta>>20, float64(delta)/float64(len(blob)))
+
+	if delta > int64(len(blob))*10 {
+		t.Errorf("DoS: %d-byte input → %d-byte heap delta (%.1fx amplification)",
+			len(blob), delta, float64(delta)/float64(len(blob)))
+	}
+}
+
+// TestRegression_ResolveArrayPromotion_MinItemBytesBoundTooStrict
+// locks in that resolveArray bounds the writer's wire block-count
+// against the WRITER's per-item minimum, not the reader's resolved
+// item size. Pre-fix it used schemaMinBytes(resolved) (the reader's
+// resolved item node); for array<int> writer → array<double> reader,
+// the reader's min is 8 bytes so a valid 18-byte array<int> stream
+// of 16 small ints (1 byte each on wire) was rejected with
+// "array block count 16 exceeds remaining buffer length 17 (min 8
+// byte/item)". The sibling resolveMap has had this right since the
+// map DoS round; the array path was the missed twin.
+//
+// Java/fastavro/avro-rs all decode promoted arrays without this
+// bound (no per-block count×item-size check at all). Spec lists
+// int → long/float/double, long → float/double, float → double as
+// valid numeric promotions, plus bytes ↔ string and record-evolution.
+func TestRegression_ResolveArrayPromotion_MinItemBytesBoundTooStrict(t *testing.T) {
+	w := MustParse(`{"type":"array","items":"int"}`)
+	r := MustParse(`{"type":"array","items":"double"}`)
+	src, err := w.AppendEncode(nil, []int32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Resolve(w, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []float64
+	if _, err := res.Decode(src, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 16 {
+		t.Fatalf("got %d elements, want 16", len(got))
+	}
+}
+
+func TestRegression_ResolveArrayPromotion_LongToFloat_TooStrict(t *testing.T) {
+	w := MustParse(`{"type":"array","items":"long"}`)
+	r := MustParse(`{"type":"array","items":"float"}`)
+	src, err := w.AppendEncode(nil, []int64{1, 2, 3, 4, 5, 6, 7, 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Resolve(w, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []float32
+	if _, err := res.Decode(src, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
+func TestRegression_ResolveArrayPromotion_LongToDouble_TooStrict(t *testing.T) {
+	w := MustParse(`{"type":"array","items":"long"}`)
+	r := MustParse(`{"type":"array","items":"double"}`)
+	src, err := w.AppendEncode(nil, []int64{1, 2, 3, 4, 5, 6, 7, 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Resolve(w, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []float64
+	if _, err := res.Decode(src, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
+func TestRegression_ResolveArrayRecordEvolution_DefaultedField_TooStrict(t *testing.T) {
+	w := MustParse(`{"type":"array","items":{
+		"type":"record","name":"R",
+		"fields":[{"name":"a","type":"int"}]
+	}}`)
+	r := MustParse(`{"type":"array","items":{
+		"type":"record","name":"R",
+		"fields":[
+			{"name":"a","type":"int"},
+			{"name":"b","type":"long","default":0},
+			{"name":"c","type":"long","default":0},
+			{"name":"d","type":"long","default":0}
+		]
+	}}`)
+	type Wr struct {
+		A int32 `avro:"a"`
+	}
+	wrecs := make([]Wr, 16)
+	for i := range wrecs {
+		wrecs[i].A = int32(i)
+	}
+	src, err := w.AppendEncode(nil, wrecs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Resolve(w, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []map[string]any
+	if _, err := res.Decode(src, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
+// TestRegression_JSONDurationIgnoresNonDurationFixedSize locks in
+// that the JSON encoder's case "fixed" arm only invokes the
+// avro.Duration → 12-byte-encoded path when node.logical ==
+// "duration". Pre-fix the avro.Duration branch fired for any fixed
+// node, regardless of node.logical or node.size, so a 12-byte
+// duration encoding was written into a fixed schema declaring a
+// different size — invalid Avro JSON (the same library's decoder
+// rejects it as "fixed value has 12 bytes, schema declares 8") and
+// rejected by Java/fastavro consumers. The binary path's schema
+// build only assigns serDuration when node.logical == "duration"
+// (schema.go:1665), so this was a JSON-only gap.
+func TestRegression_JSONDurationIgnoresNonDurationFixedSize(t *testing.T) {
+	s := MustParse(`{"type":"fixed","name":"F","size":8}`)
+	d := Duration{Months: 1, Days: 2, Milliseconds: 3}
+	if _, err := s.AppendEncodeJSON(nil, d); err == nil {
+		t.Errorf("expected error encoding avro.Duration into non-duration fixed(8); binary path errors")
+	}
+}
+
+// TestRegression_EncodeJSONBytesDefaultCodepointMapping locks in
+// that JSON encode of a missing bytes-typed field with a string
+// default emits the spec codepoint-mapped byte string. Pre-fix
+// appendAvroJSON's case "bytes" String branch used []byte(v.String())
+// which converts to UTF-8, producing 2 bytes for the codepoint U+00FF
+// instead of the spec-required 1 byte 0xff. The binary path's
+// defaultStringToBytes (resolve.go) correctly used codepoint mapping;
+// the JSON encoder was the lone outlier.
+func TestRegression_EncodeJSONBytesDefaultCodepointMapping(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"r","fields":[{"name":"a","type":"bytes","default":"ÿ"}]}`)
+	out, err := s.EncodeJSON(map[string]any{})
+	if err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	const want = `{"a":"\u00ff"}`
+	if string(out) != want {
+		t.Fatalf("EncodeJSON got %s, want %s", out, want)
+	}
+}
+
+// TestRegression_EncodeJSONFixedDefaultCodepointMapping is the fixed
+// counterpart. Pre-fix the buggy UTF-8 conversion produced 2 bytes
+// for a fixed(size=1), and the size-mismatch check at the end of
+// the case "fixed" arm rejected it as "fixed size mismatch: got 2,
+// need 1" — the encoder hard-failed instead of producing 1 byte
+// codepoint-mapped output.
+func TestRegression_EncodeJSONFixedDefaultCodepointMapping(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"r","fields":[{"name":"a","type":{"type":"fixed","name":"f","size":1},"default":"ÿ"}]}`)
+	out, err := s.EncodeJSON(map[string]any{})
+	if err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	const want = `{"a":"\u00ff"}`
+	if string(out) != want {
+		t.Fatalf("EncodeJSON got %s, want %s", out, want)
+	}
+}
+
+// TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames locks
+// in that Resolve picks the correct full-name match when a reader
+// union contains two named types with the same unqualified name and
+// different namespaces (a configuration the spec explicitly permits:
+// "permitting multiple types with the same name and different
+// namespaces is necessary"). Pre-fix findMatchingBranch / namesMatch
+// returned true on unqualified-name match alone, so writer b.Foo
+// could pick reader a.Foo as the first match — typically erroring
+// with "field has no default and is missing from writer" or silently
+// yielding wrong output. Java/fastavro both match by full name in
+// this context.
+func TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames(t *testing.T) {
+	w := MustParse(`{"type":"record","name":"Foo","namespace":"b","fields":[{"name":"bf","type":"int"}]}`)
+	r := MustParse(`[
+		{"type":"record","name":"Foo","namespace":"a","fields":[{"name":"af","type":"int"}]},
+		{"type":"record","name":"Foo","namespace":"b","fields":[{"name":"bf","type":"int"}]}
+	]`)
+	bin, err := w.AppendEncode(nil, map[string]any{"bf": int32(42)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(w, r)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	var got any
+	if _, err := resolved.Decode(bin, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map, got %T(%v)", got, got)
+	}
+	if _, hasBf := m["bf"]; !hasBf {
+		t.Fatalf("decoded record lacks bf — wrong branch selected: got %v", m)
+	}
+}
+
+// TestRegression_UnsafeArrayDirectFloatBoundDivergence locks in
+// that the unsafe primitive-array fast path (udArrayDirect) bounds
+// block count using the wire-item minimum (4 bytes/float, 8 bytes/
+// double) just like the safe path's deserArray.minItemBytes. Pre-fix
+// it used the loose count > len(src) check (1 byte/item assumption),
+// so a hostile array<float> stream declaring count = len(src) drove
+// a reflect.MakeSlice of 4×len(src) bytes before the per-element
+// readUint32 loop hit short-buffer. Same shape as the deserMap DoS
+// fix — the unsafe sibling was missed.
+func TestRegression_UnsafeArrayDirectFloatBoundDivergence(t *testing.T) {
+	bin := []byte{
+		0x0c, // varlong zigzag(6) = 12
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 5 floats (20 bytes)
+		0x00, // terminator
+	}
+	type R struct {
+		F []float32 `avro:"f"`
+	}
+	s := MustParse(`{"type":"record","name":"r","fields":[{"name":"f","type":{"type":"array","items":"float"}}]}`)
+	var unsafeOut R
+	_, unsafeErr := s.Decode(bin, &unsafeOut)
+	var safeOut any
+	_, safeErr := s.Decode(bin, &safeOut)
+	if safeErr == nil {
+		t.Fatalf("safe path unexpectedly succeeded")
+	}
+	if unsafeErr == nil {
+		t.Fatalf("unsafe path unexpectedly succeeded")
+	}
+	if !strings.Contains(safeErr.Error(), "min 4 byte/item") {
+		t.Fatalf("safe path did not surface item-aware bound: %v", safeErr)
+	}
+	if !strings.Contains(unsafeErr.Error(), "min 4 byte/item") {
+		t.Fatalf("unsafe path bound diverges from safe path:\n  safe:   %s\n  unsafe: %s", safeErr.Error(), unsafeErr.Error())
+	}
+}
+
+// TestRegression_JSONEncodeNonStringKeyMap locks in that the JSON
+// encoder rejects a map whose Go key kind isn't reflect.String,
+// matching the binary path's serMapPreamble (ser.go) which errors
+// with SemanticError{AvroType: "map"}. Pre-fix the JSON path only
+// validated v.Kind() == reflect.Map without checking the key kind,
+// so a map[int]V silently emitted JSON object keys like
+// "<int Value>" — invalid Avro JSON that round-trips to a wrong
+// map. Avro spec: "Map keys are assumed to be strings."
+func TestRegression_JSONEncodeNonStringKeyMap(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"long"}`)
+	in := map[int]int64{1: 100}
+
+	if _, err := s.AppendEncode(nil, in); err == nil {
+		t.Fatal("binary path: expected error for map[int]int64, got nil")
+	}
+	out, errJSON := s.EncodeJSON(in)
+	if errJSON == nil {
+		t.Fatalf("JSON path: expected error for map[int]int64, got nil; output=%q", out)
+	}
+}
+
+// TestRegression_DecimalBytesJSONStringIsCodepointForm locks in that
+// JSON decimal-bytes/decimal-fixed string-form decode interprets the
+// JSON string as the spec's codepoint-mapped raw bytes (each rune
+// 0-255 → one byte of the unscaled two's-complement integer), NOT
+// as a numeric-value string. Java's JsonDecoder.readBytes follows
+// the spec form strictly. The bare-number form (0.33 unquoted) is
+// separately supported as a leniency for hand-edited JSON; that
+// path is unaffected.
+//
+// linkedin/goavro emits "0.33" (a numeric-value string) when its
+// EnableDecimalBinarySpecCompliantEncoding flag is set; that form
+// is NOT accepted here because there's no way to disambiguate from
+// a spec-form byte sequence that happens to look like ASCII digits.
+// Producers targeting twmb/avro should emit either the spec form
+// (codepoint-mapped) or the bare-number form, not the goavro
+// quoted-numeric form.
+func TestRegression_DecimalBytesJSONStringIsCodepointForm(t *testing.T) {
+	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
+	// Spec form: codepoint string of the unscaled-int bytes.
+	// For unscaled=33, the byte is 0x21 = '!'.
+	var got *big.Rat
+	if err := s.DecodeJSON([]byte(`"!"`), &got); err != nil {
+		t.Fatalf("DecodeJSON of spec form: %v", err)
+	}
+	want := new(big.Rat).SetFrac64(33, 100)
+	if got.Cmp(want) != 0 {
+		t.Fatalf("spec form: got %s, want %s", got.RatString(), want.RatString())
+	}
+
+	// Bare-number form (lenient): no quotes. Separately supported
+	// path inside decodeBytes' decimal arm.
+	var got2 *big.Rat
+	if err := s.DecodeJSON([]byte(`0.33`), &got2); err != nil {
+		t.Fatalf("DecodeJSON of bare number: %v", err)
+	}
+	if got2.Cmp(want) != 0 {
+		t.Fatalf("bare number: got %s, want %s", got2.RatString(), want.RatString())
+	}
+
+	// goavro quoted-numeric form: NOT accepted as numeric. The string
+	// "0.33" is interpreted via codepoint mapping as bytes
+	// [0x30, 0x2e, 0x33, 0x33] = unscaled 808334131 → value
+	// 808334131/100. We don't promise this round-trips with goavro's
+	// spec-compliant-encoding mode; users should configure goavro to
+	// emit the codepoint form for cross-tool interop.
+	var got3 *big.Rat
+	if err := s.DecodeJSON([]byte(`"0.33"`), &got3); err != nil {
+		t.Fatalf("DecodeJSON of quoted-numeric: %v", err)
+	}
+	wrong := new(big.Rat).SetFrac64(808334131, 100)
+	if got3.Cmp(wrong) != 0 {
+		t.Fatalf("quoted-numeric is intentionally codepoint-interpreted: got %s, want %s",
+			got3.RatString(), wrong.RatString())
+	}
+}
+
+// TestRegression_ArrayMapMultiLevelPointerElements locks in that the
+// per-primitive serArray/serMap specializations accept multi-level
+// pointer element types (**T, ***T), matching the unsafe fast path
+// which already chased arbitrarily-deep pointers via
+// `pp := *(*unsafe.Pointer)(p)`. Pre-fix the safe specializations did
+// a single Elem() unwrap and rejected anything deeper as
+// "cannot use *int32 with Avro type int".
+func TestRegression_ArrayMapMultiLevelPointerElements(t *testing.T) {
+	intArr := MustParse(`{"type":"array","items":"int"}`)
+	longArr := MustParse(`{"type":"array","items":"long"}`)
+	stringArr := MustParse(`{"type":"array","items":"string"}`)
+	floatArr := MustParse(`{"type":"array","items":"float"}`)
+	doubleArr := MustParse(`{"type":"array","items":"double"}`)
+	boolArr := MustParse(`{"type":"array","items":"boolean"}`)
+	intMap := MustParse(`{"type":"map","values":"int"}`)
+	stringMap := MustParse(`{"type":"map","values":"string"}`)
+
+	i32 := int32(7)
+	i32p := &i32
+	i32pp := &i32p
+	i64 := int64(8)
+	i64p := &i64
+	i64pp := &i64p
+	str := "hi"
+	strp := &str
+	strpp := &strp
+	f32 := float32(1.5)
+	f32p := &f32
+	f32pp := &f32p
+	f64 := float64(2.5)
+	f64p := &f64
+	f64pp := &f64p
+	bv := true
+	bvp := &bv
+	bvpp := &bvp
+
+	// **T: every primitive specialization accepts a [single-element]
+	// slice and the wire matches the canonical T-element encoding.
+	cases := []struct {
+		name string
+		s    *Schema
+		vpp  any
+		vd   any
+	}{
+		{"int/**T", intArr, []**int32{i32pp}, []int32{i32}},
+		{"long/**T", longArr, []**int64{i64pp}, []int64{i64}},
+		{"string/**T", stringArr, []**string{strpp}, []string{str}},
+		{"float/**T", floatArr, []**float32{f32pp}, []float32{f32}},
+		{"double/**T", doubleArr, []**float64{f64pp}, []float64{f64}},
+		{"bool/**T", boolArr, []**bool{bvpp}, []bool{bv}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotPP, err := c.s.AppendEncode(nil, c.vpp)
+			if err != nil {
+				t.Fatalf("**T encode: %v", err)
+			}
+			wantDirect, err := c.s.AppendEncode(nil, c.vd)
+			if err != nil {
+				t.Fatalf("direct encode: %v", err)
+			}
+			if string(gotPP) != string(wantDirect) {
+				t.Fatalf("wire mismatch: got %x, want %x", gotPP, wantDirect)
+			}
+		})
+	}
+
+	// Map: **T values must encode like direct.
+	gotMapPP, err := intMap.AppendEncode(nil, map[string]**int32{"a": i32pp})
+	if err != nil {
+		t.Fatalf("map **int32 encode: %v", err)
+	}
+	wantMapDirect, err := intMap.AppendEncode(nil, map[string]int32{"a": i32})
+	if err != nil {
+		t.Fatalf("map int32 encode: %v", err)
+	}
+	if string(gotMapPP) != string(wantMapDirect) {
+		t.Fatalf("map int wire mismatch: got %x, want %x", gotMapPP, wantMapDirect)
+	}
+	gotMapStrPP, err := stringMap.AppendEncode(nil, map[string]**string{"a": strpp})
+	if err != nil {
+		t.Fatalf("map **string encode: %v", err)
+	}
+	wantMapStrDirect, err := stringMap.AppendEncode(nil, map[string]string{"a": str})
+	if err != nil {
+		t.Fatalf("map string encode: %v", err)
+	}
+	if string(gotMapStrPP) != string(wantMapStrDirect) {
+		t.Fatalf("map string wire mismatch: got %x, want %x", gotMapStrPP, wantMapStrDirect)
+	}
+
+	// Sanity: nil at any pointer level is rejected with errIndirectNil,
+	// matching the existing single-level *T behavior.
+	if _, err := intArr.AppendEncode(nil, []**int32{nil}); err == nil {
+		t.Fatalf("expected error on nil outer pointer in []**int32")
+	}
+	var nilInner *int32
+	if _, err := intArr.AppendEncode(nil, []**int32{&nilInner}); err == nil {
+		t.Fatalf("expected error on nil inner pointer in []**int32")
+	}
+}
+
+// TestRegression_ArrayLongTimeMicrosAcceptsTime locks in that
+// array<long, time-micros> accepts []time.Time, matching the scalar
+// serTimeMicros. The array path falls through to per-element scalar
+// encoding when element type is time.Time, so this is parity with the
+// scalar fix.
+func TestRegression_ArrayLongTimeMicrosAcceptsTime(t *testing.T) {
+	s := MustParse(`{"type":"array","items":{"type":"long","logicalType":"time-micros"}}`)
+	tm := time.Date(2020, 6, 15, 14, 30, 45, 123_456_000, time.UTC)
+	if _, err := s.AppendEncode(nil, []time.Time{tm}); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+}
+
+// TestRegression_SerTimeMicrosAcceptsTime locks in that the time-micros
+// logical type accepts time.Time on encode, mirroring time-millis (and
+// the timestamp-* variants). Pre-fix only time.Duration was accepted;
+// time.Time fell through to serLong and was rejected as a non-numeric.
+// Binary and JSON paths both checked.
+func TestRegression_SerTimeMicrosAcceptsTime(t *testing.T) {
+	s := MustParse(`{"type":"long","logicalType":"time-micros"}`)
+	// 14:30:45.123456 — non-zero in every field.
+	tm := time.Date(2020, 6, 15, 14, 30, 45, 123_456_000, time.UTC)
+	d := time.Duration(tm.Hour())*time.Hour + time.Duration(tm.Minute())*time.Minute + time.Duration(tm.Second())*time.Second + time.Duration(tm.Nanosecond())
+	// Binary parity with time.Duration input.
+	gotBin, err := s.AppendEncode(nil, tm)
+	if err != nil {
+		t.Fatalf("AppendEncode time.Time: %v", err)
+	}
+	wantBin, err := s.AppendEncode(nil, d)
+	if err != nil {
+		t.Fatalf("AppendEncode time.Duration: %v", err)
+	}
+	if string(gotBin) != string(wantBin) {
+		t.Fatalf("binary wire: got %x, want %x", gotBin, wantBin)
+	}
+	// JSON parity.
+	gotJSON, err := s.EncodeJSON(tm)
+	if err != nil {
+		t.Fatalf("EncodeJSON time.Time: %v", err)
+	}
+	wantJSON, err := s.EncodeJSON(d)
+	if err != nil {
+		t.Fatalf("EncodeJSON time.Duration: %v", err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("json wire: got %s, want %s", gotJSON, wantJSON)
 	}
 }

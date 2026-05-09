@@ -1,12 +1,10 @@
 package avro
 
 import (
-	"encoding"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
-	"math/big"
 	"reflect"
 	"strconv"
 	"strings"
@@ -35,6 +33,17 @@ func (taggedUnions) opt() {}
 //
 // [Schema.DecodeJSON] and [Schema.Encode] always accept both tagged
 // and bare union input regardless of this option.
+//
+// Spec note: the Avro 1.12 JSON-encoding section defines non-null
+// union values as {"type_name": value}. The library's default
+// (without TaggedUnions) emits bare values, which Java's stock
+// JsonDecoder and fastavro's JSON decoder both REJECT — they throw
+// "Expected start-union" / equivalent on the first non-null union
+// field. Pass TaggedUnions when interop with Java, fastavro, or
+// avro-tools fromjson is required. The bare default is for
+// round-trips through goavro and for the natural Go map[string]any
+// shape; see Apache Avro Jira issue AVRO-2899 for the long-standing
+// upstream discussion.
 func TaggedUnions() Opt { return taggedUnions{} }
 
 type tagLogicalTypes struct{}
@@ -94,6 +103,15 @@ func parseOpts(opts []Opt) optConfig {
 //
 // EncodeJSON accepts the same Go types as [Schema.Encode]. Map key order in
 // the output is non-deterministic, as with [encoding/json.Marshal].
+//
+// Interop note: the default bare-union output is NOT readable by Java's
+// org.apache.avro.io.JsonDecoder, fastavro's JSON decoder, or
+// avro-tools fromjson — they all require the spec-compliant
+// {"type_name": value} envelope and reject bare values with
+// "Expected start-union" / equivalent. Pass [TaggedUnions] to produce
+// the wrapped form when interop with those tools is required. See
+// the [TaggedUnions] doc and Apache Avro Jira issue AVRO-2899 for the
+// long-standing upstream discussion of this divergence.
 func (s *Schema) EncodeJSON(v any, opts ...Opt) ([]byte, error) {
 	return s.AppendEncodeJSON(nil, v, opts...)
 }
@@ -126,8 +144,6 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 	ctx := &jsonDecoder{
 		scanner:        &jsonScanner{data: src},
 		slab:           sl,
-		customDecoders: s.customDecoders,
-		customSNs:      s.customSNs,
 		wrapUnions:     cfg.tagged,
 		qualifyLogical: cfg.tagLogical,
 	}
@@ -146,8 +162,23 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	}
 	// Handle nil / invalid values.
 	if !v.IsValid() {
-		if node.kind == "null" || node.kind == "union" {
+		if node.kind == "null" {
 			return append(buf, "null"...), nil
+		}
+		if node.kind == "union" {
+			for _, br := range node.branches {
+				if br.kind == "null" {
+					return append(buf, "null"...), nil
+				}
+			}
+			// Union without a null branch can't represent nil; reject
+			// rather than emit "null", matching the binary path
+			// (serUnion.ser → tryAll → "no matching branch") and
+			// Java's UnresolvedUnionException / fastavro's
+			// "do not match" rejection. The library's own DecodeJSON
+			// also rejects null against a no-null union (see
+			// TestRegression_UnionWithoutNullBranchAcceptsJsonNull).
+			return nil, fmt.Errorf("avro json: nil value for union without a null branch")
 		}
 		return nil, fmt.Errorf("avro json: nil value for non-nullable type %q", node.kind)
 	}
@@ -189,7 +220,11 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			t := v.Interface().(time.Time)
 			switch node.logical {
 			case "date":
-				return strconv.AppendInt(buf, int64(timeToDate(t)), 10), nil
+				d, err := timeToDate(t)
+				if err != nil {
+					return nil, err
+				}
+				return strconv.AppendInt(buf, int64(d), 10), nil
 			case "time-millis":
 				// Time-of-day ms (< 86.4M) never overflows int32.
 				ms := int32(t.Hour()*3600000 + t.Minute()*60000 + t.Second()*1000 + t.Nanosecond()/1_000_000)
@@ -209,7 +244,11 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		}
 		if node.logical == "date" {
 			if t, ok := tryParseDateString(v); ok {
-				return strconv.AppendInt(buf, int64(timeToDate(t)), 10), nil
+				d, err := timeToDate(t)
+				if err != nil {
+					return nil, err
+				}
+				return strconv.AppendInt(buf, int64(d), 10), nil
 			}
 		}
 		n, err := jsonCoerceToInt32(v)
@@ -219,40 +258,23 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return strconv.AppendInt(buf, int64(n), 10), nil
 
 	case "long":
-		if v.Type() == timeType {
-			t := v.Interface().(time.Time)
-			switch node.logical {
-			case "timestamp-millis", "local-timestamp-millis":
-				return strconv.AppendInt(buf, timeToTimestampMillis(t), 10), nil
-			case "timestamp-micros", "local-timestamp-micros":
-				return strconv.AppendInt(buf, timeToTimestampMicros(t), 10), nil
-			case "timestamp-nanos", "local-timestamp-nanos":
-				n, err := timeToTimestampNanos(t)
+		if conv := timeLogicalToInt64(node.logical); conv != nil {
+			if t, ok := extractTime(v); ok {
+				n, err := conv(t)
 				if err != nil {
 					return nil, err
 				}
 				return strconv.AppendInt(buf, n, 10), nil
 			}
 		}
-		if v.Type() == durationType {
-			d := v.Interface().(time.Duration)
-			switch node.logical {
-			case "time-micros":
-				return strconv.AppendInt(buf, durationToTimeMicros(d), 10), nil
+		if node.logical == "time-micros" {
+			if v.Type() == timeType {
+				t := v.Interface().(time.Time)
+				d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
+				return strconv.AppendInt(buf, d.Microseconds(), 10), nil
 			}
-		}
-		if t, ok := tryParseTimeString(v); ok {
-			switch node.logical {
-			case "timestamp-millis", "local-timestamp-millis":
-				return strconv.AppendInt(buf, timeToTimestampMillis(t), 10), nil
-			case "timestamp-micros", "local-timestamp-micros":
-				return strconv.AppendInt(buf, timeToTimestampMicros(t), 10), nil
-			case "timestamp-nanos", "local-timestamp-nanos":
-				n, err := timeToTimestampNanos(t)
-				if err != nil {
-					return nil, err
-				}
-				return strconv.AppendInt(buf, n, 10), nil
+			if v.Type() == durationType {
+				return strconv.AppendInt(buf, v.Interface().(time.Duration).Microseconds(), 10), nil
 			}
 		}
 		n, err := jsonCoerceToInt64(v)
@@ -276,79 +298,148 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return appendJSONFloat(buf, f, 64, cfg), nil
 
 	case "string":
-		// Reject json.Number so union dispatch routes it to numeric
-		// branches, matching Encode's serString behavior.
-		if v.Type() == jsonNumberType {
-			return nil, fmt.Errorf("avro json: cannot use json.Number with Avro type string")
+		// UUID logical type: [16]byte input canonicalizes to the RFC 4122
+		// hex-dash string, matching serUUID on the binary side.
+		if node.logical == "uuid" && isUUIDType(v.Type()) {
+			var u [16]byte
+			reflect.Copy(reflect.ValueOf(&u).Elem(), v)
+			return appendJSONString(buf, uuidToString(u)), nil
 		}
-		if v.Kind() == reflect.String {
-			return appendJSONString(buf, v.String()), nil
+		// Resolution order is shared with the binary encoder via
+		// avroStringValue: json.Number rejected, reflect.String,
+		// TextAppender, TextMarshaler, []byte slice. Both encoders
+		// must stay in lockstep on precedence.
+		s, err := avroStringValue(v)
+		if err != nil {
+			return nil, err
 		}
-		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-			return appendJSONString(buf, string(v.Bytes())), nil
-		}
-		if v.CanInterface() {
-			if a, ok := v.Interface().(encoding.TextAppender); ok {
-				text, err := a.AppendText(nil)
-				if err != nil {
-					return nil, err
-				}
-				return appendJSONString(buf, string(text)), nil
-			}
-			if m, ok := v.Interface().(encoding.TextMarshaler); ok {
-				text, err := m.MarshalText()
-				if err != nil {
-					return nil, err
-				}
-				return appendJSONString(buf, string(text)), nil
-			}
-		}
-		return nil, fmt.Errorf("avro json: expected string, got %s", v.Type())
+		return appendJSONString(buf, s), nil
 
 	case "bytes":
-		// Decimal logical type: coerce numeric types to JSON number.
-		// Pointers (*big.Rat) are already unwrapped by the deref loop above.
-		if node.logical == "decimal" {
-			if v.Type() == jsonNumberType {
-				return append(buf, v.String()...), nil
+		// Decimal logical type: emit the spec form — the underlying bytes
+		// (two's-complement big-endian unscaled integer) as an Avro JSON
+		// byte string with code points 0-255 mapped to byte values 0-255.
+		// Per Avro 1.12 spec ("Logical Types": "always serialized using
+		// its underlying Avro type") + the bytes/fixed JSON rule. Matches
+		// Java's JsonEncoder and fastavro's AvroJSONEncoder.write_bytes.
+		// The decoder accepts both this form and bare numbers, so users
+		// who hand-edit JSON can still feed 0.33 into DecodeJSON.
+		//
+		// Logical-arm fall-through (no decimalRatFor match) lands on
+		// the generic string/slice/array targets below. big-decimal
+		// (AVRO-4124) wraps the binary inner payload (length-prefixed
+		// unscaled + zigzag scale, via buildBigDecimalPayload) in the
+		// spec codepoint-string form; binary and JSON share the
+		// helper to stay in lockstep.
+		switch node.logical {
+		case "decimal":
+			r, ok, err := decimalRatFor(v)
+			if err != nil {
+				return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
 			}
-			if v.Type() == bigRatType {
-				tmp := v.Interface().(big.Rat)
-				return append(buf, tmp.FloatString(node.scale)...), nil
+			if ok {
+				unscaled, err := ratToUnscaled(r, node.scale)
+				if err != nil {
+					return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
+				}
+				if err := checkDecimalPrecision(unscaled, node.precision); err != nil {
+					return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
+				}
+				return appendAvroJSONBytes(buf, bigIntToBytes(unscaled)), nil
 			}
-			if r, ok := tryCoerceToRat(v); ok {
-				return append(buf, r.FloatString(node.scale)...), nil
+		case "big-decimal":
+			r, ok, err := decimalRatFor(v)
+			if err != nil {
+				return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
+			}
+			if ok {
+				inner, err := buildBigDecimalPayload(r)
+				if err != nil {
+					return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
+				}
+				return appendAvroJSONBytes(buf, inner), nil
 			}
 		}
 		if v.Kind() == reflect.String {
+			// Treat the Go string as raw UTF-8 bytes, matching serBytes
+			// (ser.go's string arm appends the string bytes verbatim).
+			// Pre-fix this arm parsed the string as codepoint-mapped
+			// bytes (0-255 per rune), which diverged from binary: e.g.
+			// "é" encoded as c3 a9 in binary but as e9 in JSON. Defaults
+			// don't reach this arm — convertDefaultBytes (schema.go)
+			// already turns JSON-parsed default strings into []byte, so
+			// only runtime user input lands here, where the Go convention
+			// is UTF-8. appendAvroJSONBytes then handles the
+			// codepoint↔byte mapping on the wire form.
 			return appendAvroJSONBytes(buf, []byte(v.String())), nil
 		}
 		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 			return appendAvroJSONBytes(buf, v.Bytes()), nil
 		}
+		if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
+			// reflect.Value.Bytes() panics on Array kinds, so materialize
+			// the bytes via Copy. Mirrors the "fixed" arm below and
+			// serBytes (ser.go:460) which accepts Array alongside Slice.
+			raw := make([]byte, v.Len())
+			reflect.Copy(reflect.ValueOf(raw), v)
+			return appendAvroJSONBytes(buf, raw), nil
+		}
 		return nil, fmt.Errorf("avro json: expected []byte or string, got %s", v.Type())
 
 	case "fixed":
-		// Decimal logical type: coerce numeric types to JSON number.
-		// Pointers (*big.Rat) are already unwrapped by the deref loop above.
-		if node.logical == "decimal" {
-			if v.Type() == jsonNumberType {
-				return append(buf, v.String()...), nil
+		// Decimal: spec form padded / sign-extended to the fixed
+		// schema size (mirrors serFixedDecimal.serRat). UUID: hex-
+		// dash string input parses to 16 bytes (matches
+		// serFixedUUIDReflect), checked before the generic raw
+		// extraction so a 36-char string isn't rejected as size != 16.
+		// Logical-arm fall-through lands on the generic string/slice/
+		// array targets below.
+		switch node.logical {
+		case "decimal":
+			r, ok, err := decimalRatFor(v)
+			if err != nil {
+				return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: err}
 			}
-			if v.Type() == bigRatType {
-				tmp := v.Interface().(big.Rat)
-				return append(buf, tmp.FloatString(node.scale)...), nil
+			if ok {
+				unscaled, err := ratToUnscaled(r, node.scale)
+				if err != nil {
+					return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: err}
+				}
+				if err := checkDecimalPrecision(unscaled, node.precision); err != nil {
+					return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: err}
+				}
+				b := bigIntToBytes(unscaled)
+				if len(b) > node.size {
+					return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), node.size)}
+				}
+				out := make([]byte, node.size)
+				if len(b) < node.size && len(b) > 0 && b[0]&0x80 != 0 {
+					for i := 0; i < node.size-len(b); i++ {
+						out[i] = 0xff
+					}
+				}
+				copy(out[node.size-len(b):], b)
+				return appendAvroJSONBytes(buf, out), nil
 			}
-			if r, ok := tryCoerceToRat(v); ok {
-				return append(buf, r.FloatString(node.scale)...), nil
+		case "duration":
+			if v.Type() == avroDurationType {
+				raw := v.Interface().(Duration).Bytes()
+				return appendAvroJSONBytes(buf, raw[:]), nil
 			}
-		}
-		if v.Type() == avroDurationType {
-			raw := v.Interface().(Duration).Bytes()
-			return appendAvroJSONBytes(buf, raw[:]), nil
+		case "uuid":
+			if v.Kind() == reflect.String {
+				u, err := parseUUID(v.String())
+				if err != nil {
+					return nil, err
+				}
+				return appendAvroJSONBytes(buf, u[:]), nil
+			}
 		}
 		var raw []byte
 		if v.Kind() == reflect.String {
+			// Go string → raw UTF-8 bytes, matching serSize on the
+			// binary side. See the bytes-string arm above for the full
+			// rationale on why codepoint mapping was wrong here.
 			raw = []byte(v.String())
 		} else if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
 			raw = make([]byte, v.Len())
@@ -405,8 +496,13 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return append(buf, ']'), nil
 
 	case "map":
-		if v.Kind() != reflect.Map {
-			return nil, fmt.Errorf("avro json: expected map, got %s", v.Type())
+		if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
+			// Avro spec: "Map keys are assumed to be strings."
+			// Without this guard, iter.Key().String() returns
+			// reflect's <int Value>-style placeholder for non-string
+			// keys, producing invalid Avro JSON. Mirrors
+			// serMapPreamble's check on the binary side.
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "map"}
 		}
 		buf = append(buf, '{')
 		first := true
@@ -459,7 +555,22 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 					if !f.hasDefault {
 						return nil, fmt.Errorf("avro json: record %q missing required field %q", node.name, f.name)
 					}
-					buf = append(buf, f.defaultJSON...)
+					// Route the default through appendAvroJSON (not a
+					// pre-marshalled splice) so encoder options —
+					// TaggedUnions, TagLogicalTypes, LinkedinFloats —
+					// apply to defaults the same way they apply to
+					// present values. A nil defaultVal is the null
+					// encoding (explicit "default": null or implicit
+					// ["null", T] union default).
+					if f.defaultVal == nil {
+						buf = append(buf, "null"...)
+						continue
+					}
+					var err error
+					buf, err = appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, customEncodes, depth+1)
+					if err != nil {
+						return nil, err
+					}
 					continue
 				}
 				var err error
@@ -476,12 +587,20 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			}
 			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
-			val := v.MapIndex(f.nameVal)
+			val := v.MapIndex(mapKeyAs(v.Type(), f.nameVal))
 			if !val.IsValid() {
 				if !f.hasDefault {
 					return nil, fmt.Errorf("avro json: record %q missing required field %q", node.name, f.name)
 				}
-				buf = append(buf, f.defaultJSON...)
+				if f.defaultVal == nil {
+					buf = append(buf, "null"...)
+					continue
+				}
+				var err error
+				buf, err = appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, customEncodes, depth+1)
+				if err != nil {
+					return nil, err
+				}
 				continue
 			}
 			var err error
@@ -502,6 +621,18 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
 			fv := v.FieldByIndex(mapping.indices[i])
+			// Honor omitzero: mirrors ser.go's slow-path check
+			// at the binary site so a value-typed zero-value
+			// null-union field renders as JSON `null` rather
+			// than the value's zero literal. Position-agnostic on
+			// the JSON side — only the binary path needs
+			// nullUnionBytes for the branch-index byte. avroType
+			// lives on serRecord.fields[i] (parallel-indexed to
+			// node.fields[i]).
+			if mapping.omitzero[i] && node.serRecord.fields[i].avroType == "nullunion" && valueIsZero(fv) {
+				buf = append(buf, "null"...)
+				continue
+			}
 			buf, err = appendAvroJSON(buf, fv, f.node, cfg, customEncodes, depth+1)
 			if err != nil {
 				return nil, err
@@ -517,11 +648,6 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
 	if depth >= maxDepth {
 		return nil, errTooDeep
-	}
-	if !v.IsValid() || (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil() {
-		// unreachable: appendAvroJSON's deref loop converts nil pointers/interfaces
-		// to invalid values before dispatching here, but kept as a safety net.
-		return append(buf, "null"...), nil
 	}
 
 	// Accept tagged union maps: {"typeName": value}. This matches the
@@ -543,19 +669,35 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 					goto tryAll
 				}
 				if cfg.tagged {
-					bn, ln := unionBranchNames(branch)
-					name := bn
-					if cfg.tagLogical {
-						name = ln
-					}
-					buf = append(buf, '{')
-					buf = appendJSONString(buf, name)
-					buf = append(buf, ':')
-					buf = append(buf, encoded...)
-					return append(buf, '}'), nil
+					return appendTaggedUnion(buf, branch, encoded, cfg.tagLogical), nil
 				}
 				return append(buf, encoded...), nil
 			}
+		}
+	}
+
+	// Type-name dispatch (Java/fastavro/hamba parity): if v's Go type
+	// has a canonical Avro primitive name and exactly one branch
+	// matches, prefer it over try-each. Mirrors serUnion.ser. Falls
+	// through to try-each on no-match or on encode failure (e.g. a
+	// numeric value that needs promotion via the encoder's lenient
+	// arms — try-each preserves those paths).
+	if name := unionTypeNameForValue(v); name != "" {
+		for _, branch := range node.branches {
+			if branch.kind != name {
+				continue
+			}
+			encoded, err := appendAvroJSON(nil, v, branch, cfg, customEncodes, depth+1)
+			if err == nil {
+				if cfg.tagged {
+					return appendTaggedUnion(buf, branch, encoded, cfg.tagLogical), nil
+				}
+				return append(buf, encoded...), nil
+			}
+			if errors.Is(err, errTooDeep) {
+				return nil, err
+			}
+			break // only one branch has this kind; don't waste cycles
 		}
 	}
 
@@ -567,16 +709,7 @@ tryAll:
 		encoded, err := appendAvroJSON(nil, v, branch, cfg, customEncodes, depth+1)
 		if err == nil {
 			if cfg.tagged {
-				bn, ln := unionBranchNames(branch)
-				name := bn
-				if cfg.tagLogical {
-					name = ln
-				}
-				buf = append(buf, '{')
-				buf = appendJSONString(buf, name)
-				buf = append(buf, ':')
-				buf = append(buf, encoded...)
-				buf = append(buf, '}')
+				buf = appendTaggedUnion(buf, branch, encoded, cfg.tagLogical)
 			} else {
 				buf = append(buf, encoded...)
 			}
@@ -616,28 +749,76 @@ func unionBranchNames(node *schemaNode) (standard, logical string) {
 	return standard, logical
 }
 
+// appendTaggedUnion appends the Avro JSON tagged-union wrapping
+// `{"<branch>":<encoded>}` for the given branch and pre-encoded body.
+func appendTaggedUnion(buf []byte, branch *schemaNode, encoded []byte, tagLogical bool) []byte {
+	bn, ln := unionBranchNames(branch)
+	name := bn
+	if tagLogical {
+		name = ln
+	}
+	buf = append(buf, '{')
+	buf = appendJSONString(buf, name)
+	buf = append(buf, ':')
+	buf = append(buf, encoded...)
+	return append(buf, '}')
+}
+
 // findUnionBranch finds a union branch by type name.
+//
+// We accept three tag conventions on input for cross-implementation
+// interop, in order:
+//
+//  1. Exact match against the spec/Java fullname (e.g. "long" or
+//     "com.example.User"). This is what we emit on output.
+//  2. goavro's "type.logicalType" form (e.g. "long.timestamp-millis"):
+//     match the base primitive before the dot.
+//  3. fastavro's unqualified short-name form for named types (e.g.
+//     "User" instead of "com.example.User"). Only applied when the
+//     input has no namespace AND exactly one branch matches by short
+//     name; ambiguous cases return no match rather than guess.
 func findUnionBranch(union *schemaNode, name string) *schemaNode {
 	for _, b := range union.branches {
 		if unionBranchName(b) == name {
 			return b
 		}
 	}
-	// Fallback: goavro uses "type.logicalType" (e.g. "long.time-millis")
-	// as union branch names. Try matching primitive branches by the base
-	// type before the dot. Only matches primitives to avoid confusion with
-	// named types that might coincidentally share a primitive type name.
-	if base, _, ok := strings.Cut(name, "."); ok {
+	// Fallback (goavro / TagLogicalTypes): "type.logicalType" → match a
+	// branch whose kind == base AND whose logicalType == suffix. Includes
+	// primitives and "fixed" (the only named type that can carry a
+	// logical type — duration/decimal/uuid are valid on fixed; enum
+	// can't have a logical type per spec). Matching on the (kind, logical)
+	// pair — not just kind — prevents silently misrouting a tagged
+	// branch when a union contains two same-kind branches that differ
+	// only by logical type (e.g. [long, {"type":"long","logicalType":
+	// "timestamp-millis"}]). Pre-tightening, this fallback returned the
+	// first kind-match, which lost the logical-type distinction.
+	if base, suffix, ok := strings.Cut(name, "."); ok {
 		for _, b := range union.branches {
 			switch b.kind {
-			case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
-				if b.kind == base {
+			case "null", "boolean", "int", "long", "float", "double", "string", "bytes", "fixed":
+				if b.kind == base && b.logical == suffix {
 					return b
 				}
 			}
 		}
+		return nil
 	}
-	return nil
+	// Fallback (fastavro): unqualified short name. The ambiguity guard
+	// prevents silent misrouting when two namespaces share a short name.
+	var match *schemaNode
+	for _, b := range union.branches {
+		switch b.kind {
+		case "record", "enum", "fixed":
+			if unqualified(b.name) == name {
+				if match != nil {
+					return nil // ambiguous
+				}
+				match = b
+			}
+		}
+	}
+	return match
 }
 
 // parseSpecialFloat parses NaN/Infinity string representations (Java
@@ -653,11 +834,6 @@ func parseSpecialFloat(s string) (float64, error) {
 		return math.Inf(-1), nil
 	}
 	return 0, fmt.Errorf("avro json: unknown float value %q", s)
-}
-
-func parseSpecialFloat32(s string) (float32, error) {
-	f, err := parseSpecialFloat(s)
-	return float32(f), err
 }
 
 // appendAvroJSONBytes encodes raw bytes as an Avro JSON string using
@@ -686,19 +862,11 @@ func appendAvroJSONBytes(buf []byte, b []byte) []byte {
 			if c >= 0x20 && c <= 0x7E {
 				buf = append(buf, c)
 			} else {
-				buf = append(buf, '\\', 'u', '0', '0')
-				buf = append(buf, hexDigit(c>>4), hexDigit(c&0xf))
+				buf = append(buf, '\\', 'u', '0', '0', jsonHex[c>>4], jsonHex[c&0xf])
 			}
 		}
 	}
 	return append(buf, '"')
-}
-
-func hexDigit(b byte) byte {
-	if b < 10 {
-		return '0' + b
-	}
-	return 'A' - 10 + b
 }
 
 const jsonHex = "0123456789abcdef"
@@ -838,7 +1006,7 @@ func jsonCoerceToFloat64(v reflect.Value, bitSize int) (float64, error) {
 	}
 	// Narrowing float64 → float32 must not silently clamp to ±Inf.
 	// Allow ±Inf and NaN pass-through (they have dedicated JSON encodings).
-	if bitSize == 32 && !math.IsInf(f, 0) && !math.IsNaN(f) && math.IsInf(float64(float32(f)), 0) {
+	if bitSize == 32 && finiteFloat32Overflows(f) {
 		return 0, fmt.Errorf("avro json: value %g overflows float32", f)
 	}
 	return f, nil

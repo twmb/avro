@@ -56,11 +56,25 @@ func checkCompat(r, w *schemaNode, path string, seen map[nodePair]bool) error {
 	}
 }
 
+// checkWriterUnion validates that a writer-union schema is compatible
+// with a reader schema. Every writer branch must be compatible with the
+// reader (whether the reader is a union or not). The first incompatible
+// branch yields an eager CompatibilityError.
+//
+// This is a deliberate divergence from Java's Resolver.WriterUnion and
+// fastavro's read_union, both of which defer per-branch failures to
+// decode time via ErrorAction sentinels — a writer who narrowed during
+// evolution but never emits the dropped branch can still be consumed
+// there. We choose fail-fast at resolve/CheckCompatibility time
+// instead, matching the rest of this package (resolveEnum,
+// resolveReaderUnion, resolveNode, validateDefault, etc., all eagerly
+// reject incompatibilities). Trade-off: a "compatible-on-actual-data
+// only" producer must update its schema before resolution will accept
+// the pair. The benefit is that callers see schema problems before any
+// data flows rather than at decode time.
 func checkWriterUnion(r, w *schemaNode, path string, seen map[nodePair]bool) error {
-	if r.kind == "union" {
-		// Both writer and reader are unions: every writer branch must
-		// match a reader branch by kind, then recurse for deep check.
-		for i, wb := range w.branches {
+	for i, wb := range w.branches {
+		if r.kind == "union" {
 			rb := findMatchingBranch(r, wb)
 			if rb == nil {
 				return &CompatibilityError{
@@ -73,13 +87,10 @@ func checkWriterUnion(r, w *schemaNode, path string, seen map[nodePair]bool) err
 			if err := checkCompat(rb, wb, path, seen); err != nil {
 				return err
 			}
+			continue
 		}
-	} else {
-		// Writer is union, reader is not: every branch must match reader.
-		for _, wb := range w.branches {
-			if err := checkCompat(r, wb, path, seen); err != nil {
-				return err
-			}
+		if err := checkCompat(r, wb, path, seen); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -242,28 +253,76 @@ func findWriterField(rf fieldNode, writerFields map[string]*fieldNode) *fieldNod
 	return nil
 }
 
-// findMatchingBranch finds the first reader union branch that matches the writer node.
+// findMatchingBranch finds the best reader union branch for the writer
+// node. Three tiers, matching Java/fastavro: full-name (or alias-full-
+// name) for named types beats unqualified-name match, which beats
+// promotion. The unqualified-name tier preserves the lenient match that
+// CheckCompatibility's simple writer-vs-reader case relies on (different
+// namespaces, same logical type). Exact-match must win over it because
+// the spec permits a union to contain multiple named types with the
+// same unqualified name and different namespaces.
+//
+// Single-pass best-tier scan: equivalent to three sequential walks but
+// shorter; ties resolve by declaration order.
 func findMatchingBranch(r *schemaNode, w *schemaNode) *schemaNode {
+	var bestTier matchTier
+	var best *schemaNode
 	for _, rb := range r.branches {
-		if kindsMatch(rb, w) {
-			return rb
+		if t := kindsMatchTier(rb, w); t > bestTier {
+			bestTier = t
+			best = rb
 		}
 	}
-	return nil
+	return best
 }
 
-// kindsMatch checks if two schema nodes could be compatible (same kind, or promotable, or name-matched).
-func kindsMatch(r, w *schemaNode) bool {
+type matchTier int
+
+const (
+	matchNone matchTier = iota
+	matchPromotion
+	matchUnqualifiedName
+	matchExact
+)
+
+// kindsMatchTier classifies how strongly r and w match for union-branch
+// selection. matchExact = same kind plus full-name (or alias-fullname)
+// for named types, OR same kind for primitives/array/map/union;
+// matchUnqualifiedName = same kind, named, sharing only the unqualified
+// portion (different namespaces); matchPromotion = different kinds with
+// a valid Avro promotion (int→long/float/double, etc.); matchNone
+// otherwise.
+func kindsMatchTier(r, w *schemaNode) matchTier {
 	if r.kind == w.kind {
 		switch r.kind {
 		case "record", "enum", "fixed":
-			return namesMatch(r, w)
+			if r.name == w.name {
+				return matchExact
+			}
+			for _, a := range r.aliases {
+				if a == w.name {
+					return matchExact
+				}
+			}
+			if unqualified(r.name) == unqualified(w.name) {
+				return matchUnqualifiedName
+			}
+			for _, a := range r.aliases {
+				if unqualified(a) == unqualified(w.name) {
+					return matchUnqualifiedName
+				}
+			}
+			return matchNone
 		default:
-			return true
+			return matchExact
 		}
 	}
-	return promotionDeser(w.kind, r.kind) != nil
+	if promotionDeser(w.kind, r.kind) != nil {
+		return matchPromotion
+	}
+	return matchNone
 }
+
 
 func pathOrRoot(path string) string {
 	if path == "" {
