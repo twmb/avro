@@ -793,11 +793,16 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return append(dst, b...), nil
 	case "array":
+		// null is not an array. Rejecting it here keeps the union try-
+		// each loop honest: a [Array,null] union with default null would
+		// otherwise match the Array branch (producing an empty-array
+		// wire form) instead of the null branch. Mirrors
+		// validateDefault's nil-reject for parse-time symmetry.
+		if val == nil {
+			return nil, fmt.Errorf("expected array for array default, got null")
+		}
 		arr, ok := val.([]any)
 		if !ok {
-			if val == nil {
-				return appendVarlong(dst, 0), nil
-			}
 			return nil, fmt.Errorf("expected array for array default, got %T", val)
 		}
 		if len(arr) == 0 {
@@ -813,11 +818,11 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return append(dst, 0), nil
 	case "map":
+		if val == nil {
+			return nil, fmt.Errorf("expected object for map default, got null")
+		}
 		m, ok := val.(map[string]any)
 		if !ok {
-			if val == nil {
-				return appendVarlong(dst, 0), nil
-			}
 			return nil, fmt.Errorf("expected object for map default, got %T", val)
 		}
 		if len(m) == 0 {
@@ -835,9 +840,12 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return append(dst, 0), nil
 	case "record":
-		m, _ := val.(map[string]any)
-		if m == nil {
-			m = make(map[string]any)
+		if val == nil {
+			return nil, fmt.Errorf("expected object for record default, got null")
+		}
+		m, ok := val.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("expected object for record default, got %T", val)
 		}
 		var err error
 		for _, f := range node.fields {

@@ -666,6 +666,181 @@ func TestSpecUnionDefaultMatchesAnyBranch(t *testing.T) {
 	}
 }
 
+// TestRegression_UnionNullDefaultRoutesToNullBranchNotCompound locks the
+// branch-routing for unions [Compound, null] with default null. Per spec
+// (lang/java/avro/src/main/java/org/apache/avro/Schema.java:1751-1798
+// isValidDefault: RECORD/ARRAY/MAP cases all reject non-matching JSON
+// type; NULL case accepts only JsonNode.isNull), null is not a valid
+// default for record/array/map — it can only match the null branch in
+// such unions. Pre-fix, twmb's validateDefault lenient-accepted nil val
+// for record/array/map (synthesizing an empty map / iterating zero
+// elements), so the union branch-walk matched the compound branch first
+// and encodeDefault emitted empty-Record / empty-array / empty-map wire
+// bytes where the null branch was intended — a binary↔JSON parity break
+// (JSON's auto-fill bypasses defaultBytes via the f.defaultVal == nil
+// early-out and emits "null" correctly).
+//
+// Cross-checked: fastavro's _validate_record requires isinstance(datum,
+// Mapping); hamba's isValidDefault returns false on type-assertion
+// failure. Only twmb accepted.
+func TestRegression_UnionNullDefaultRoutesToNullBranchNotCompound(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"record-null union",
+			`{"type":"record","name":"W","fields":[{
+				"name":"f",
+				"type":[{"type":"record","name":"R","fields":[{"name":"x","type":"int","default":0}]},"null"],
+				"default":null
+			}]}`,
+		},
+		{
+			"array-null union",
+			`{"type":"record","name":"W","fields":[{
+				"name":"f",
+				"type":[{"type":"array","items":"int"},"null"],
+				"default":null
+			}]}`,
+		},
+		{
+			"map-null union",
+			`{"type":"record","name":"W","fields":[{
+				"name":"f",
+				"type":[{"type":"map","values":"int"},"null"],
+				"default":null
+			}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			// Binary encode of map missing the field auto-fills the default.
+			// Expected: 0x02 (zigzag varint 1, null branch index).
+			bin, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			if !bytes.Equal(bin, []byte{0x02}) {
+				t.Errorf("binary encode: got %x, want 02 (null branch)", bin)
+			}
+			// JSON encode emits "null" (correct on both sides of the fix
+			// because JSON's path bypasses defaultBytes).
+			js, err := s.AppendEncodeJSON(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("json encode: %v", err)
+			}
+			if string(js) != `{"f":null}` {
+				t.Errorf("json encode: got %s, want {\"f\":null}", js)
+			}
+			// JSON decode of `{}` fills the missing field via the pre-encoded
+			// defaultBytes (applyFieldDefault → field.deser). Must be nil,
+			// not an empty-compound value.
+			var out map[string]any
+			if err := s.DecodeJSON([]byte(`{}`), &out); err != nil {
+				t.Fatalf("json decode: %v", err)
+			}
+			if v := out["f"]; v != nil {
+				t.Errorf("json decode fill: out[f] = %T(%v), want nil", v, v)
+			}
+		})
+	}
+}
+
+// TestRegression_NonUnionCompoundNullDefaultRejected locks parse-time
+// rejection of null as a default for a non-union record/array/map
+// field. Per spec (Specification/_index.md "field default values"
+// table at lines 85-97): record default is JSON object, array default
+// is JSON array, map default is JSON object — null is only a valid
+// default for the null type. Java/fastavro/hamba all reject.
+//
+// Pre-fix, twmb's validateDefault accepted nil val for these types by
+// synthesizing an empty container, masking the schema error.
+func TestRegression_NonUnionCompoundNullDefaultRejected(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"record null default",
+			`{"type":"record","name":"W","fields":[{
+				"name":"f",
+				"type":{"type":"record","name":"R","fields":[{"name":"x","type":"int","default":0}]},
+				"default":null
+			}]}`,
+		},
+		{
+			"array null default",
+			`{"type":"record","name":"W","fields":[{
+				"name":"f",
+				"type":{"type":"array","items":"int"},
+				"default":null
+			}]}`,
+		},
+		{
+			"map null default",
+			`{"type":"record","name":"W","fields":[{
+				"name":"f",
+				"type":{"type":"map","values":"int"},
+				"default":null
+			}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := avro.Parse(tc.schema); err == nil {
+				t.Fatalf("parse accepted null as %s default; expected rejection per spec", tc.name)
+			}
+		})
+	}
+}
+
+// Counter-test: empty `{}` / `[]` defaults are valid (JSON object /
+// array). The fix distinguishes nil from empty-but-non-nil — only
+// nil is rejected.
+func TestRegression_EmptyCompoundDefaultStillAccepted(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"empty object record default",
+			`{"type":"record","name":"W","fields":[{
+				"name":"f",
+				"type":{"type":"record","name":"R","fields":[{"name":"x","type":"int","default":0}]},
+				"default":{}
+			}]}`,
+		},
+		{
+			"empty array default",
+			`{"type":"record","name":"W","fields":[{
+				"name":"f",
+				"type":{"type":"array","items":"int"},
+				"default":[]
+			}]}`,
+		},
+		{
+			"empty map default",
+			`{"type":"record","name":"W","fields":[{
+				"name":"f",
+				"type":{"type":"map","values":"int"},
+				"default":{}
+			}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := avro.Parse(tc.schema); err != nil {
+				t.Fatalf("parse rejected valid %s: %v", tc.name, err)
+			}
+		})
+	}
+}
+
 func TestSpecNumericDefaultValidation(t *testing.T) {
 	t.Run("int default must be integer", func(t *testing.T) {
 		_, err := avro.Parse(`{

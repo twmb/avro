@@ -2646,12 +2646,22 @@ func validateDefault(val any, node *schemaNode) error {
 			return fmt.Errorf("fixed default length %d does not match size %d", len([]rune(s)), node.size)
 		}
 	case "record":
-		m, ok := val.(map[string]any)
-		if !ok && val != nil {
-			return fmt.Errorf("expected object for record default, got %T", val)
+		// null is not a record. Java's isValidDefault returns false for
+		// null on RECORD (Schema.java case RECORD: `if (!defaultValue
+		// .isObject()) return false;`); fastavro's _validate_record
+		// requires isinstance(datum, Mapping); hamba's isValidDefault
+		// returns false on type-assertion failure. Without this reject,
+		// a union ["Record","null"] with default null would have its
+		// validate-walk match the Record branch (synthesizing an empty
+		// map + relying on per-field defaults) instead of falling
+		// through to the null branch — encodeDefault would then emit
+		// Record(field-defaults) wire bytes where null was intended.
+		if val == nil {
+			return fmt.Errorf("expected object for record default, got null")
 		}
-		if m == nil {
-			m = make(map[string]any)
+		m, ok := val.(map[string]any)
+		if !ok {
+			return fmt.Errorf("expected object for record default, got %T", val)
 		}
 		for _, f := range node.fields {
 			fv, exists := m[f.name]
@@ -2668,8 +2678,11 @@ func validateDefault(val any, node *schemaNode) error {
 			}
 		}
 	case "array":
+		if val == nil {
+			return fmt.Errorf("expected array for array default, got null")
+		}
 		arr, ok := val.([]any)
-		if !ok && val != nil {
+		if !ok {
 			return fmt.Errorf("expected array for array default, got %T", val)
 		}
 		for i, elem := range arr {
@@ -2680,8 +2693,11 @@ func validateDefault(val any, node *schemaNode) error {
 			}
 		}
 	case "map":
+		if val == nil {
+			return fmt.Errorf("expected object for map default, got null")
+		}
 		m, ok := val.(map[string]any)
-		if !ok && val != nil {
+		if !ok {
 			return fmt.Errorf("expected object for map default, got %T", val)
 		}
 		for k, v := range m {

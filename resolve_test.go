@@ -2238,26 +2238,22 @@ func TestResolveDeserMapNilInit(t *testing.T) {
 }
 
 func TestEncodeDefaultArrayNil(t *testing.T) {
+	// Java, fastavro, and hamba all reject null as an array default
+	// (Schema.java ARRAY case: `if (!defaultValue.isArray()) return
+	// false;`). Accepting it lenient would make a union [Array,null]
+	// with default null match the Array branch (empty-array bytes)
+	// instead of falling through to the null branch.
 	node := &schemaNode{kind: "array", items: &schemaNode{kind: "int"}}
-	encoded, err := encodeDefault(nil, nil, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Nil array encodes as count=0.
-	if len(encoded) != 1 || encoded[0] != 0 {
-		t.Fatalf("expected [0], got %v", encoded)
+	if _, err := encodeDefault(nil, nil, node); err == nil {
+		t.Fatal("expected error for nil array default")
 	}
 }
 
 func TestEncodeDefaultMapNil(t *testing.T) {
+	// Same rationale as TestEncodeDefaultArrayNil: nil is not a map.
 	node := &schemaNode{kind: "map", values: &schemaNode{kind: "int"}}
-	encoded, err := encodeDefault(nil, nil, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Nil map encodes as count=0.
-	if len(encoded) != 1 || encoded[0] != 0 {
-		t.Fatalf("expected [0], got %v", encoded)
+	if _, err := encodeDefault(nil, nil, node); err == nil {
+		t.Fatal("expected error for nil map default")
 	}
 }
 
@@ -2280,6 +2276,12 @@ func TestEncodeDefaultMapValueError(t *testing.T) {
 }
 
 func TestEncodeDefaultRecordNilVal(t *testing.T) {
+	// nil is not a record. Java's isValidDefault rejects (RECORD case:
+	// `if (!defaultValue.isObject()) return false;`); fastavro requires
+	// isinstance(datum, Mapping); hamba returns false on type-assertion
+	// failure. The previous lenient path made unions like [Record,null]
+	// with default null incorrectly encode the Record branch instead of
+	// the null branch.
 	node := &schemaNode{
 		kind: "record",
 		name: "R",
@@ -2287,23 +2289,8 @@ func TestEncodeDefaultRecordNilVal(t *testing.T) {
 			{name: "a", node: &schemaNode{kind: "int"}, defaultVal: float64(0), hasDefault: true},
 		},
 	}
-	// nil val → uses field defaults.
-	encoded, err := encodeDefault(nil, nil, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Should encode field "a" with default 0.
-	s, err := Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var v int32
-	_, err = s.Decode(encoded, &v)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v != 0 {
-		t.Fatalf("expected 0, got %d", v)
+	if _, err := encodeDefault(nil, nil, node); err == nil {
+		t.Fatal("expected error for nil record default")
 	}
 }
 
