@@ -1577,10 +1577,16 @@ func TestDefaultValidationErrors(t *testing.T) {
 // TestFieldLevelLogicalType_RoundTrip exercises the Java/JDBC Avro idiom
 // where the `logicalType` annotation (and, for decimal, `precision`/
 // `scale`) sits as a sibling of `type` on the field object rather than
-// nested inside the type definition. Confluent's Java code generator,
-// kafka-connect-avro-converter, and most Debezium CDC sources (Oracle,
-// MySQL, PostgreSQL) emit schemas in this shape. The on-wire encoding
-// is identical to the nested form; only the JSON layout differs.
+// nested inside the type definition. Apache Avro JIRA AVRO-2015 and
+// AVRO-3014 document this as "a common error" users make; the Java
+// reference impl detects and warns (Schema.java:1874, AVRO-3014 fix
+// commit 72654bf73c, Feb 2021) but does not lift. The form is widely
+// emitted by hand-written .avsc files, older Java tooling, and tutorial
+// code; Confluent's production kafka-connect-avro-converter
+// (AvroData.java) does NOT emit this shape — it puts logicalType on the
+// type object, producing canonical nested form. The on-wire encoding is
+// identical between the two; only the JSON layout differs, so lifting
+// is a strict superset of the spec-blessed behaviour.
 //
 // Each case constructs a strongly-typed Go value, encodes through the
 // flat-form schema, and decodes back through the same schema. Before
@@ -2101,5 +2107,123 @@ func TestFieldLevelLogicalType_MultiNonNullUnion(t *testing.T) {
 	}
 	if node.branches[2].logical != "" {
 		t.Fatalf("branch 2 must not inherit the annotation; got %q", node.branches[2].logical)
+	}
+}
+
+// TestFieldLevelLogicalType_RealWorldFixtures exercises the lift against
+// schemas pulled verbatim from public sources. The Apache Avro project
+// has tracked this idiom across two JIRA tickets (AVRO-2015, AVRO-3014)
+// going back to 2017 — the Java reference now emits a warning when it
+// encounters the form (Schema.java:1874, commit 72654bf73c, Feb 2021),
+// but does not lift it. The shape is real in the wild because users
+// hand-write .avsc files and read the spec's "extra attributes permitted
+// as metadata" rule literally, expecting their annotation to flow through.
+//
+// Each fixture is a verbatim public schema with origin cited so future
+// readers can verify it is real and not invented. The test pins both:
+//
+//   - The schema parses and `logicalType` reaches the field's schemaNode
+//     (i.e. the lift fires); without the lift it would silently parse
+//     as a plain primitive and Encode against the logical Go type would
+//     error at use.
+//   - The canonical form strips `logicalType` per PCF [STRIP], so a
+//     flat-form schema and the equivalent nested-form schema canonicalize
+//     identically — fingerprint stability is preserved.
+func TestFieldLevelLogicalType_RealWorldFixtures(t *testing.T) {
+	cases := []struct {
+		name        string
+		origin      string
+		schema      string
+		wantLogical string
+	}{
+		{
+			// Verbatim from OneCricketeer/kafka-connect-sandbox. Note
+			// the namespace "io.confluent.example" — this is community
+			// Confluent-ecosystem tutorial code. (Confluent's actual
+			// production converter, AvroData.java, emits nested form;
+			// the flat form here is hand-authored.)
+			name:   "OneCricketeer kafka-connect-sandbox record_v3",
+			origin: "https://github.com/OneCricketeer/kafka-connect-sandbox/blob/master/replicator/scripts/record_v3.avsc",
+			schema: `{"type":"record","name":"Record","namespace":"io.confluent.example","fields":[
+				{"name":"time","type":"long","logicalType":"timestamp-millis"},
+				{"name":"desc","type":"string"},
+				{"name":"counter","type":"int","default":-1},
+				{"name":"remaining","type":["null","int"],"default":null}
+			]}`,
+			wantLogical: "timestamp-millis",
+		},
+		{
+			// The canonical Apache JIRA reproducer. Mirrors
+			// TestSchemaWarnings.warnWhenTheLogicalTypeIsOnTheField
+			// in the Java reference: a field of type "int" with a
+			// sibling "logicalType":"date". Java parses but warns and
+			// discards; we lift.
+			name:        "AVRO-3014 / AVRO-2015 Apache reproducer",
+			origin:      "https://issues.apache.org/jira/browse/AVRO-3014 — mirrored in apache/avro lang/java/avro/src/test/java/org/apache/avro/TestSchemaWarnings.java",
+			schema:      `{"type":"record","name":"A","fields":[{"name":"a1","type":"int","logicalType":"date"}]}`,
+			wantLogical: "date",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse failed for %s: %v", tc.origin, err)
+			}
+			if got := effectiveLogicalType(firstFieldNode(s)); got != tc.wantLogical {
+				t.Fatalf("origin %s: effectiveLogicalType after lift = %q, want %q",
+					tc.origin, got, tc.wantLogical)
+			}
+			if bytes.Contains(s.Canonical(), []byte("logicalType")) {
+				t.Fatalf("origin %s: canonical must strip logicalType per PCF [STRIP], got %s",
+					tc.origin, s.Canonical())
+			}
+		})
+	}
+}
+
+// TestFieldLevelLogicalType_OneCricketeerRoundTrip pins the full
+// Encode/Decode path against the OneCricketeer fixture from above. This
+// is the bug PR 38 fixes end-to-end: a Go time.Time round-tripping
+// through a flat-form schema. Before the lift, Encode errored with
+// "cannot use time.Time with Avro type long". After the lift it succeeds.
+func TestFieldLevelLogicalType_OneCricketeerRoundTrip(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"Record","namespace":"io.confluent.example","fields":[
+		{"name":"time","type":"long","logicalType":"timestamp-millis"},
+		{"name":"desc","type":"string"},
+		{"name":"counter","type":"int","default":-1},
+		{"name":"remaining","type":["null","int"],"default":null}
+	]}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	type record struct {
+		Time      time.Time `avro:"time"`
+		Desc      string    `avro:"desc"`
+		Counter   int32     `avro:"counter"`
+		Remaining *int32    `avro:"remaining"`
+	}
+	want := record{
+		Time:    time.UnixMilli(1700000000123).UTC(),
+		Desc:    "hello",
+		Counter: 7,
+	}
+	enc, err := s.Encode(&want)
+	if err != nil {
+		t.Fatalf("encode (would fail without the lift with %q): %v",
+			"cannot use time.Time with Avro type long", err)
+	}
+	var got record
+	if _, err := s.Decode(enc, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.Time.Equal(want.Time) {
+		t.Fatalf("time: got %v, want %v", got.Time, want.Time)
+	}
+	if got.Desc != want.Desc || got.Counter != want.Counter {
+		t.Fatalf("payload mismatch: got %+v want %+v", got, want)
+	}
+	if got.Remaining != nil {
+		t.Fatalf("remaining: got %v, want nil", *got.Remaining)
 	}
 }
