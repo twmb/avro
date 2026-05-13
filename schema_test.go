@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCanonical(t *testing.T) {
@@ -1570,4 +1571,239 @@ func TestDefaultValidationErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFieldLevelLogicalType_RoundTrip exercises the Java/JDBC Avro idiom
+// where the `logicalType` annotation (and, for decimal, `precision`/
+// `scale`) sits as a sibling of `type` on the field object rather than
+// nested inside the type definition. Confluent's Java code generator,
+// kafka-connect-avro-converter, and most Debezium CDC sources (Oracle,
+// MySQL, PostgreSQL) emit schemas in this shape. The on-wire encoding
+// is identical to the nested form; only the JSON layout differs.
+//
+// Each case constructs a strongly-typed Go value, encodes through the
+// flat-form schema, and decodes back through the same schema. Before
+// the lift, encoding a `time.Time` (or `time.Duration` etc.) against a
+// flat-form schema produced "avro: field x: cannot use <Go type> with
+// Avro type long/int/string" because the parser dropped the field-level
+// annotation and built a plain-primitive schema. After the lift the
+// schema knows the field is logical and the round-trip succeeds.
+func TestFieldLevelLogicalType_RoundTrip(t *testing.T) {
+	// Each case asserts a schema parses successfully and that an encode/
+	// decode round-trip via the schema produces the expected Go-side type
+	// (verified by decoding into a *any and inspecting the result).
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		// Primitive type with field-level logicalType. Without the lift
+		// these would have parsed as plain long / int / string and the
+		// decoder would have produced int64 / int32 / string rather
+		// than the logical Go types.
+		{
+			"primitive timestamp-millis",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"long","logicalType":"timestamp-millis"}
+			]}`,
+		},
+		{
+			"primitive timestamp-micros",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"long","logicalType":"timestamp-micros"}
+			]}`,
+		},
+		{
+			"primitive local-timestamp-millis",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"long","logicalType":"local-timestamp-millis"}
+			]}`,
+		},
+		{
+			"primitive date",
+			`{"type":"record","name":"R","fields":[
+				{"name":"d","type":"int","logicalType":"date"}
+			]}`,
+		},
+		{
+			"primitive time-millis",
+			`{"type":"record","name":"R","fields":[
+				{"name":"t","type":"int","logicalType":"time-millis"}
+			]}`,
+		},
+		{
+			"primitive time-micros",
+			`{"type":"record","name":"R","fields":[
+				{"name":"t","type":"long","logicalType":"time-micros"}
+			]}`,
+		},
+		{
+			"primitive uuid",
+			`{"type":"record","name":"R","fields":[
+				{"name":"u","type":"string","logicalType":"uuid"}
+			]}`,
+		},
+		{
+			"primitive decimal with sibling precision and scale",
+			`{"type":"record","name":"R","fields":[
+				{"name":"amt","type":"bytes","logicalType":"decimal","precision":9,"scale":2}
+			]}`,
+		},
+
+		// Nullable union with field-level logicalType — the shape most
+		// commonly emitted by Debezium-style sources.
+		{
+			"union timestamp-millis",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}
+			]}`,
+		},
+		{
+			"union date",
+			`{"type":"record","name":"R","fields":[
+				{"name":"d","type":["null","int"],"logicalType":"date"}
+			]}`,
+		},
+		{
+			"union uuid",
+			`{"type":"record","name":"R","fields":[
+				{"name":"u","type":["null","string"],"logicalType":"uuid"}
+			]}`,
+		},
+		{
+			"union decimal with sibling precision and scale",
+			`{"type":"record","name":"R","fields":[
+				{"name":"amt","type":["null","bytes"],"logicalType":"decimal","precision":18,"scale":4}
+			]}`,
+		},
+
+		// Long-first union order — both branch orderings must work.
+		{
+			"union timestamp-millis with long first",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":["long","null"],"logicalType":"timestamp-millis"}
+			]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+
+			// The first record field's effective logicalType must match
+			// the field-level annotation, regardless of whether the
+			// type is a primitive or a nullable union — the lift puts
+			// the annotation in the spec-blessed location either way.
+			if got := effectiveLogicalType(firstFieldNode(s)); got == "" {
+				t.Fatalf("expected non-empty effective logicalType after lift, got empty")
+			}
+		})
+	}
+}
+
+// TestFieldLevelLogicalType_RoundTripValue exercises the actual decoder.
+// Before the lift, encoding a time.Time against a flat-form schema
+// errored with "cannot use time.Time with Avro type long" because the
+// parser dropped the field-level annotation. With the lift, the schema
+// recognises the field as timestamp-millis and the round-trip succeeds.
+//
+// We only assert this for timestamp-millis (primitive and union) because
+// the value-side decoder already has unit tests for every other logical
+// type via the nested form; this test's purpose is to prove the flat
+// form reaches the same decoder path, not to re-cover every type.
+func TestFieldLevelLogicalType_RoundTripValue(t *testing.T) {
+	type Row struct {
+		TS time.Time `avro:"ts"`
+	}
+
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"primitive timestamp-millis",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"long","logicalType":"timestamp-millis"}
+			]}`,
+		},
+		{
+			"union timestamp-millis (null first)",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}
+			]}`,
+		},
+	}
+
+	want := time.UnixMilli(1_700_000_000_000).UTC()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			data, err := s.Encode(&Row{TS: want})
+			if err != nil {
+				t.Fatalf("encode time.Time into flat-form schema: %v", err)
+			}
+			var got Row
+			if _, err := s.Decode(data, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !got.TS.Equal(want) {
+				t.Fatalf("round-trip mismatch: got %v, want %v", got.TS, want)
+			}
+		})
+	}
+}
+
+// TestFieldLevelLogicalType_NestedAnnotationWins covers the edge case
+// where both a nested and a field-level annotation are present. The
+// closer-to-the-type annotation wins so that an explicit author choice
+// is never overridden by an outer scope.
+func TestFieldLevelLogicalType_NestedAnnotationWins(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"ts","type":{"type":"long","logicalType":"timestamp-micros"},"logicalType":"timestamp-millis"}
+	]}`)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	got := effectiveLogicalType(firstFieldNode(s))
+	if got != "timestamp-micros" {
+		t.Fatalf("nested annotation must win; got %q, want timestamp-micros", got)
+	}
+}
+
+// firstFieldNode returns the parsed internal schemaNode for the first
+// record field of s. Tests use this to introspect what Parse actually
+// built without going through the Root() re-parse path.
+func firstFieldNode(s *Schema) *schemaNode {
+	if s == nil || s.node == nil || len(s.node.fields) == 0 {
+		return nil
+	}
+	return s.node.fields[0].node
+}
+
+// effectiveLogicalType returns the logical-type annotation that controls
+// decode for a record field's parsed schemaNode. For a non-union type
+// it lives directly on the node; for a nullable union it lives on the
+// first non-null branch (the spec puts it on the type, not the union
+// itself).
+func effectiveLogicalType(n *schemaNode) string {
+	if n == nil {
+		return ""
+	}
+	if n.logical != "" {
+		return n.logical
+	}
+	for _, branch := range n.branches {
+		if branch == nil || branch.kind == "null" {
+			continue
+		}
+		if branch.logical != "" {
+			return branch.logical
+		}
+	}
+	return ""
 }

@@ -270,6 +270,21 @@ type afield struct {
 	Default json.RawMessage `json:"default,omitempty"`
 	Order   string          `json:"order,omitempty"`
 
+	// Field-level logical type annotations — the Java/JDBC Avro idiom
+	// where logicalType (and, for decimal, precision/scale) sit as
+	// siblings of `type` on the field object rather than nested inside
+	// the type definition. Confluent's Java code generator,
+	// kafka-connect-avro-converter, and most Debezium CDC sources
+	// (Oracle, MySQL, PostgreSQL) emit schemas in this shape.
+	//
+	// The on-wire encoding is identical to the spec-blessed nested form;
+	// only the JSON layout differs. We capture these here so that
+	// UnmarshalJSON can lift them into the type definition, after which
+	// the rest of the parser sees the canonical nested form.
+	Logical   string `json:"logicalType,omitempty"`
+	Scale     *int   `json:"scale,omitempty"`
+	Precision *int   `json:"precision,omitempty"`
+
 	// hasDefault is true if the field has a default value. This is set
 	// in canonical afields (which strip Default) so that validateDefault
 	// can check whether nested record fields have defaults.
@@ -309,10 +324,18 @@ func (f *afield) UnmarshalJSON(data []byte) error {
 	// into a nested type object so the rest of the parser sees the
 	// canonical form.
 	if f.Type == nil || f.Type.primitive == "" {
+		// No complex-type lift possible. Still need to handle the
+		// field-level logicalType case for unions and already-object
+		// type forms.
+		f.liftFieldLogicalIntoType()
 		return nil
 	}
 	tp := f.Type.primitive
 	if tp != "enum" && tp != "array" && tp != "map" && tp != "record" && tp != "error" && tp != "fixed" {
+		// Primitive type with possible field-level logicalType — the
+		// Java/JDBC Avro idiom. Lift the annotation into the type so
+		// the parser sees the canonical nested form.
+		f.liftFieldLogicalIntoType()
 		return nil
 	}
 	var raw map[string]json.RawMessage
@@ -360,7 +383,108 @@ func (f *afield) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	f.Type = &s
+	// The lift above already copied "logicalType"/"precision"/"scale" into
+	// typeObj, so the freshly-built schema's aobject captures them. Clear
+	// the field-level copies so canonical re-emit does not duplicate.
+	f.Logical, f.Scale, f.Precision = "", nil, nil
 	return nil
+}
+
+// liftFieldLogicalIntoType moves a field-level logicalType annotation (with
+// optional precision/scale for the decimal case) into the field's type
+// definition, so the rest of the parser sees the canonical nested form.
+// This is the Java/JDBC Avro idiom, e.g.
+//
+//	{"name":"ts","type":"long","logicalType":"timestamp-millis"}
+//	{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}
+//
+// emitted by Confluent's Java codegen, kafka-connect-avro-converter, and
+// Debezium CDC sources. The on-wire encoding is identical to
+//
+//	{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}
+//	{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}
+//
+// — only the JSON layout differs.
+//
+// Conflict resolution: an annotation already present inside the type
+// definition wins (closer-to-the-type wins). After lifting, the
+// field-level copies are cleared so canonical re-emit does not duplicate
+// them.
+func (f *afield) liftFieldLogicalIntoType() {
+	if f.Logical == "" || f.Type == nil {
+		return
+	}
+
+	switch {
+	case f.Type.primitive != "":
+		// {"type":"long", "logicalType":"x"} →
+		//   {"type":{"type":"long", "logicalType":"x"}}
+		f.Type = &aschema{object: f.newLogicalObject(f.Type.primitive)}
+
+	case len(f.Type.union) > 0:
+		// {"type":["null","long"], "logicalType":"x"} →
+		//   {"type":["null",{"type":"long","logicalType":"x"}]}
+		// Apply to the first non-null branch that doesn't already carry
+		// its own annotation. If every non-null branch already has a
+		// nested annotation, the field-level one is redundant and we
+		// drop it.
+		for i := range f.Type.union {
+			branch := &f.Type.union[i]
+			if branch.primitive == "null" {
+				continue
+			}
+			if branch.primitive != "" {
+				f.Type.union[i] = aschema{object: f.newLogicalObject(branch.primitive)}
+				break
+			}
+			if branch.object != nil && branch.object.Logical == "" {
+				branch.object.Logical = f.Logical
+				if branch.object.Scale == nil {
+					branch.object.Scale = clonePtrInt(f.Scale)
+				}
+				if branch.object.Precision == nil {
+					branch.object.Precision = clonePtrInt(f.Precision)
+				}
+				break
+			}
+		}
+
+	case f.Type.object != nil:
+		// {"type":{"type":"long"}, "logicalType":"x"} →
+		//   {"type":{"type":"long","logicalType":"x"}}.
+		// Closer-to-the-type annotation wins; only fill in fields the
+		// inner object didn't already declare.
+		if f.Type.object.Logical == "" {
+			f.Type.object.Logical = f.Logical
+		}
+		if f.Type.object.Scale == nil {
+			f.Type.object.Scale = clonePtrInt(f.Scale)
+		}
+		if f.Type.object.Precision == nil {
+			f.Type.object.Precision = clonePtrInt(f.Precision)
+		}
+	}
+
+	f.Logical, f.Scale, f.Precision = "", nil, nil
+}
+
+// newLogicalObject builds an aobject describing the field's primitive type
+// promoted with the field-level logicalType / precision / scale.
+func (f *afield) newLogicalObject(primitiveType string) *aobject {
+	return &aobject{
+		Type:      primitiveType,
+		Logical:   f.Logical,
+		Scale:     clonePtrInt(f.Scale),
+		Precision: clonePtrInt(f.Precision),
+	}
+}
+
+func clonePtrInt(p *int) *int {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }
 
 type aobject struct {
