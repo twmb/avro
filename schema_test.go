@@ -1704,47 +1704,100 @@ func TestFieldLevelLogicalType_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestFieldLevelLogicalType_RoundTripValue exercises the actual decoder.
-// Before the lift, encoding a time.Time against a flat-form schema
-// errored with "cannot use time.Time with Avro type long" because the
-// parser dropped the field-level annotation. With the lift, the schema
-// recognises the field as timestamp-millis and the round-trip succeeds.
-//
-// We only assert this for timestamp-millis (primitive and union) because
-// the value-side decoder already has unit tests for every other logical
-// type via the nested form; this test's purpose is to prove the flat
-// form reaches the same decoder path, not to re-cover every type.
+// TestFieldLevelLogicalType_RoundTripValue exercises the actual decoder
+// across every time-typed logical type whose base primitive becomes a
+// time.Time when decoded. Before the lift, encoding a time.Time against
+// a flat-form schema errored with "cannot use time.Time with Avro type
+// long" because the parser dropped the field-level annotation. With the
+// lift, the schema recognises the logical type and the round-trip
+// succeeds at the full declared precision.
 func TestFieldLevelLogicalType_RoundTripValue(t *testing.T) {
 	type Row struct {
 		TS time.Time `avro:"ts"`
 	}
 
+	// Picks a concrete instant for each unit. timestamp-millis truncates
+	// sub-millisecond precision; timestamp-micros preserves microseconds;
+	// timestamp-nanos preserves nanoseconds. Test inputs are chosen so
+	// that round-trip equality is non-trivial — a parser that quietly
+	// fell back to long would lose the time.Time wrapping and the
+	// Encode call would error.
+	const (
+		baseMillis = int64(1_700_000_000_000)
+		baseMicros = int64(1_700_000_000_123_456)
+		baseNanos  = int64(1_700_000_000_123_456_789)
+	)
+
 	cases := []struct {
-		name   string
-		schema string
+		name    string
+		schema  string
+		want    time.Time
 	}{
 		{
 			"primitive timestamp-millis",
 			`{"type":"record","name":"R","fields":[
 				{"name":"ts","type":"long","logicalType":"timestamp-millis"}
 			]}`,
+			time.UnixMilli(baseMillis).UTC(),
 		},
 		{
-			"union timestamp-millis (null first)",
+			"union timestamp-millis",
 			`{"type":"record","name":"R","fields":[
 				{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}
 			]}`,
+			time.UnixMilli(baseMillis).UTC(),
+		},
+		{
+			"primitive timestamp-micros",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"long","logicalType":"timestamp-micros"}
+			]}`,
+			time.UnixMicro(baseMicros).UTC(),
+		},
+		{
+			"union timestamp-micros",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":["null","long"],"logicalType":"timestamp-micros"}
+			]}`,
+			time.UnixMicro(baseMicros).UTC(),
+		},
+		{
+			"primitive local-timestamp-millis",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"long","logicalType":"local-timestamp-millis"}
+			]}`,
+			time.UnixMilli(baseMillis).UTC(),
+		},
+		{
+			"primitive local-timestamp-micros",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"long","logicalType":"local-timestamp-micros"}
+			]}`,
+			time.UnixMicro(baseMicros).UTC(),
+		},
+		{
+			"primitive timestamp-nanos",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"long","logicalType":"timestamp-nanos"}
+			]}`,
+			time.Unix(0, baseNanos).UTC(),
+		},
+		{
+			"primitive date",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"int","logicalType":"date"}
+			]}`,
+			time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC),
 		},
 	}
 
-	want := time.UnixMilli(1_700_000_000_000).UTC()
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s, err := Parse(tc.schema)
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
-			data, err := s.Encode(&Row{TS: want})
+			data, err := s.Encode(&Row{TS: tc.want})
 			if err != nil {
 				t.Fatalf("encode time.Time into flat-form schema: %v", err)
 			}
@@ -1752,8 +1805,8 @@ func TestFieldLevelLogicalType_RoundTripValue(t *testing.T) {
 			if _, err := s.Decode(data, &got); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
-			if !got.TS.Equal(want) {
-				t.Fatalf("round-trip mismatch: got %v, want %v", got.TS, want)
+			if !got.TS.Equal(tc.want) {
+				t.Fatalf("round-trip mismatch: got %v, want %v", got.TS, tc.want)
 			}
 		})
 	}
