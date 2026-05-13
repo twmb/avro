@@ -2383,3 +2383,123 @@ func TestFieldLevelLogicalType_StrictMismatchErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestFieldLevelLogicalType_LiftedUnknownLogicalPreserved pins the
+// composition of the flat-form lift with the unknownLogical
+// preservation path. A flat-form schema whose logicalType is one we
+// don't have a built-in handler for (e.g. Debezium's "io.debezium.time.
+// Timestamp") must:
+//
+//   - Parse successfully (validateLogical clears unrecognized logicals
+//     instead of erroring).
+//   - Preserve the original logicalType string in node.unknownLogical
+//     so that a later Parse registering a CustomType for the same
+//     logical can detect the silent-drop scenario via
+//     rejectCachedRefIfCustomTypeWouldMatch.
+//
+// Pre-lift this test couldn't exist because the flat-form annotation
+// was silently dropped at JSON-parse time, before validateLogical
+// ever saw it; unknownLogical would always be empty.
+func TestFieldLevelLogicalType_LiftedUnknownLogicalPreserved(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"ts","type":"long","logicalType":"io.debezium.time.Timestamp"}
+	]}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	node := firstFieldNode(s)
+	if node == nil {
+		t.Fatal("no first field node")
+	}
+	if node.kind != "long" {
+		t.Fatalf("kind: want long, got %q", node.kind)
+	}
+	// validateLogical clears unrecognized logicals from `logical`.
+	if node.logical != "" {
+		t.Fatalf("node.logical: want \"\" after validateLogical strips unknown, got %q", node.logical)
+	}
+	// ...but preserves them in unknownLogical for the cache check.
+	if node.unknownLogical != "io.debezium.time.Timestamp" {
+		t.Fatalf("node.unknownLogical: want %q, got %q", "io.debezium.time.Timestamp", node.unknownLogical)
+	}
+}
+
+// TestFieldLevelLogicalType_CacheRejectionAcrossFlatForm pins that
+// rejectCachedRefIfCustomTypeWouldMatch fires when a Parse references
+// a cached named type whose subtree contains a flat-form-lifted
+// unknownLogical, and the current Parse registers a CustomType that
+// would have matched that logical. This is the load-bearing
+// composition: the lift happens at JSON-parse time, so by the time
+// caching runs the lifted logical is indistinguishable from a
+// nested one — and the rejection check correctly consults
+// unknownLogical as a fallback.
+//
+// Without the lift, this scenario would silently succeed and the
+// user's CustomType would never fire on cached fields — the exact
+// "silent drop" the rejection check exists to prevent.
+func TestFieldLevelLogicalType_CacheRejectionAcrossFlatForm(t *testing.T) {
+	var cache SchemaCache
+	// Parse 1: cache a record with a flat-form unknown logical. No
+	// CustomType registered; the logical is stripped from `logical`
+	// but preserved in `unknownLogical` on the field's node.
+	_, err := cache.Parse(`{"type":"record","name":"DebeziumRow","fields":[
+		{"name":"ts","type":"long","logicalType":"money"}
+	]}`)
+	if err != nil {
+		t.Fatalf("parse 1 (cache seed): %v", err)
+	}
+	// Parse 2: reference the cached "DebeziumRow" by name AND register
+	// a CustomType for "money". The cached node was built without
+	// money-CT wiring, so silently reusing it would drop the CT on
+	// the cached fields. Expect the rejection error.
+	_, err = cache.Parse(`{"type":"record","name":"Outer","fields":[
+		{"name":"row","type":"DebeziumRow"}
+	]}`, moneyCT)
+	if err == nil {
+		t.Fatal("parse 2 (cached ref with CT): expected rejection error, got nil")
+	}
+	if !strings.Contains(err.Error(), "DebeziumRow") || !strings.Contains(err.Error(), "money") {
+		t.Fatalf("rejection error should mention both the cached type and the matching logical, got: %v", err)
+	}
+}
+
+// TestFieldLevelLogicalType_CustomTypeFiresOnLiftedLogical pins that
+// applyCustomTypes correctly wires a registered CustomType into the
+// lifted schemaNode. The lift completes during afield.UnmarshalJSON,
+// so by the time build() walks the resulting nested form to assign
+// ser/deser/customEncode functions, the node looks identical to one
+// that arrived in canonical nested form — and applyCustomTypes fires
+// for both. The round-trip below transparently produces a testMoney
+// instead of int64 when the CT is registered against the same flat-
+// form schema.
+func TestFieldLevelLogicalType_CustomTypeFiresOnLiftedLogical(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"Order","fields":[
+		{"name":"id","type":"long"},
+		{"name":"price","type":"long","logicalType":"money"}
+	]}`, moneyCT)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	type Order struct {
+		ID    int64     `avro:"id"`
+		Price testMoney `avro:"price"`
+	}
+	input := Order{ID: 7, Price: testMoney{Cents: 500, Currency: "USD"}}
+	data, err := s.Encode(&input)
+	if err != nil {
+		t.Fatalf("encode (lift composes with CustomType ser): %v", err)
+	}
+	var got Order
+	if _, err := s.Decode(data, &got); err != nil {
+		t.Fatalf("decode (lift composes with CustomType deser): %v", err)
+	}
+	if got.ID != 7 {
+		t.Fatalf("id: got %d", got.ID)
+	}
+	if got.Price.Cents != 500 {
+		t.Fatalf("price.Cents: CustomType decoder did not fire on lifted logical; got %d (raw int64?) want 500", got.Price.Cents)
+	}
+	if got.Price.Currency != "USD" {
+		t.Fatalf("price.Currency: CustomType decoder did not fire; got %q want USD", got.Price.Currency)
+	}
+}
