@@ -1895,6 +1895,20 @@ func TestFieldLevelLogicalType_DecimalRoundTrip(t *testing.T) {
 				{"name":"amt","type":["null","bytes"],"logicalType":"decimal","precision":9,"scale":2}
 			]}`,
 		},
+		{
+			// Hybrid: precision/scale are nested inside the type object,
+			// but logicalType sits as a field-level sibling. Exercises
+			// `case f.Type.object != nil` in liftFieldLogicalIntoType
+			// — the lift fills in only `Logical` since Precision/Scale
+			// are already set on the inner object. A user adding the
+			// logicalType "later" to an otherwise-canonical schema
+			// (or a tool that emits precision/scale nested but logical
+			// at field level) hits this arm.
+			"hybrid: precision/scale nested, logicalType at field level",
+			`{"type":"record","name":"R","fields":[
+				{"name":"amt","type":{"type":"bytes","precision":10,"scale":2},"logicalType":"decimal"}
+			]}`,
+		},
 	}
 
 	want := new(big.Rat).SetFrac64(31415, 100) // 314.15
@@ -2225,5 +2239,147 @@ func TestFieldLevelLogicalType_OneCricketeerRoundTrip(t *testing.T) {
 	}
 	if got.Remaining != nil {
 		t.Fatalf("remaining: got %v, want nil", *got.Remaining)
+	}
+}
+
+// TestFieldLevelLogicalType_UnionPreAnnotatedFirstBranch pins the lift's
+// "first non-null branch only" semantics. The earlier implementation
+// looped past the first non-null branch when that branch was already
+// an object with its own nested annotation — and if a later non-null
+// branch was either a primitive or an object with no annotation, the
+// field-level annotation would be silently grafted onto it.
+//
+// To make the fall-through observable, this schema uses different
+// primitive types for the two non-null branches (so we don't trip the
+// "duplicate union type" check before the lift difference manifests):
+//
+//	["null", {"type":"int","logicalType":"date"}, "string"]
+//
+// with a field-level `logicalType:"uuid"`. The user-visible difference:
+//
+//   - With the bug: the lift falls through past branch 1 (object with
+//     its own `date` annotation) and grafts `uuid` onto branch 2,
+//     producing `[null, int+date, string+uuid]`. Schema parses
+//     successfully but the user's "string" branch silently gained a
+//     uuid semantic they never asked for.
+//   - With the fix: the lift `break`s unconditionally after the first
+//     non-null branch. Since that branch already has its own logical,
+//     the field-level `uuid` is dropped (closer-to-the-type wins) and
+//     branch 2 remains a plain `string`.
+//
+// This is the load-bearing pin against regression of the fall-through
+// fix.
+func TestFieldLevelLogicalType_UnionPreAnnotatedFirstBranch(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"v","type":["null",{"type":"int","logicalType":"date"},"string"],"logicalType":"uuid"}
+	]}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	node := firstFieldNode(s)
+	if node == nil || node.kind != "union" {
+		t.Fatalf("expected union, got %+v", node)
+	}
+	if len(node.branches) != 3 {
+		t.Fatalf("expected 3 branches, got %d", len(node.branches))
+	}
+	if node.branches[0].kind != "null" {
+		t.Fatalf("branch 0: want null, got %q", node.branches[0].kind)
+	}
+	// First non-null branch keeps its own nested annotation; the
+	// field-level annotation is redundant and dropped.
+	if got := node.branches[1].logical; got != "date" {
+		t.Fatalf("branch 1: closer-to-type wins, want date, got %q", got)
+	}
+	// Second non-null branch must remain plain. Pre-fix this branch
+	// would have been silently lifted to {type:string,logicalType:uuid}.
+	if got := node.branches[2].logical; got != "" {
+		t.Fatalf("branch 2: must NOT inherit field-level annotation, got %q (lift fell through past pre-annotated branch 1)", got)
+	}
+}
+
+// TestFieldLevelLogicalType_StrictMismatchErrors pins the post-lift
+// behavior that a flat-form schema whose logicalType is structurally
+// incompatible with the primitive type now errors at Parse rather than
+// silently dropping the annotation. Pre-PR, `afield` had no `Logical`
+// field — the JSON key was ignored entirely, leaving a plain primitive
+// schema that the user's encoder hit later with a confusing type
+// mismatch. Post-PR the annotation is lifted into the type object,
+// runs through validateLogical, and the strict-mismatch arms produce a
+// clear, actionable error at Parse time.
+//
+// This is the load-bearing pin against any future revert: silently
+// tolerating malformed logicals here is what AVRO-2015 / AVRO-3014 are
+// about, and the cure (a parse-time error) is what the PR delivers
+// for these cases. Java's reference still silently ignores; twmb is
+// now stricter than Java on flat-form just as it has always been on
+// the spec-blessed nested form.
+//
+// Note: `decimal` is an intentional exception — `validateLogical`'s
+// decimal arm clears the annotation rather than erroring, so flat-form
+// `decimal` on a non-bytes/non-fixed type still parses (as a plain
+// primitive). That's a separate decision; not pinned here.
+func TestFieldLevelLogicalType_StrictMismatchErrors(t *testing.T) {
+	cases := []struct {
+		name        string
+		schema      string
+		wantErrSubs string // substring that must appear in the error
+	}{
+		{
+			"long with date logical (date requires int)",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"long","logicalType":"date"}
+			]}`,
+			`date`,
+		},
+		{
+			"int with uuid logical (uuid requires string or fixed(16))",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"int","logicalType":"uuid"}
+			]}`,
+			`uuid`,
+		},
+		{
+			"string with timestamp-millis logical (requires long)",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"string","logicalType":"timestamp-millis"}
+			]}`,
+			`timestamp-millis`,
+		},
+		{
+			"int with time-micros logical (requires long)",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"int","logicalType":"time-micros"}
+			]}`,
+			`time-micros`,
+		},
+		{
+			"bytes with date logical (requires int)",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"bytes","logicalType":"date"}
+			]}`,
+			`date`,
+		},
+		// Union variant: same strict-mismatch through the union-lift
+		// path. The lift wraps "long" in {type:long,logicalType:date}
+		// and validateLogical then rejects.
+		{
+			"union null+long with date logical (date requires int)",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":["null","long"],"logicalType":"date"}
+			]}`,
+			`date`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.schema)
+			if err == nil {
+				t.Fatalf("expected parse error for %s, got nil (schema lifted to invalid type+logical combination but did not error)", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSubs) {
+				t.Fatalf("error message does not mention %q: %v", tc.wantErrSubs, err)
+			}
+		})
 	}
 }

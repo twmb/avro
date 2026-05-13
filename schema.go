@@ -424,20 +424,23 @@ func (f *afield) liftFieldLogicalIntoType() {
 	case len(f.Type.union) > 0:
 		// {"type":["null","long"], "logicalType":"x"} →
 		//   {"type":["null",{"type":"long","logicalType":"x"}]}
-		// Apply to the first non-null branch that doesn't already carry
-		// its own annotation. If every non-null branch already has a
-		// nested annotation, the field-level one is redundant and we
-		// drop it.
+		// Apply to the FIRST non-null branch only. Closer-to-the-type
+		// wins: if that branch is already an object with its own
+		// annotation, the field-level annotation is redundant and we
+		// drop it — we do NOT fall through to a later non-null branch
+		// (that would silently mutate a different type than the spec-
+		// equivalent nested form would have addressed, and on the
+		// `[null, T+logical, T]` shape would even synthesize a
+		// duplicate union member).
 		for i := range f.Type.union {
 			branch := &f.Type.union[i]
 			if branch.primitive == "null" {
 				continue
 			}
-			if branch.primitive != "" {
+			switch {
+			case branch.primitive != "":
 				f.Type.union[i] = aschema{object: f.newLogicalObject(branch.primitive)}
-				break
-			}
-			if branch.object != nil && branch.object.Logical == "" {
+			case branch.object != nil && branch.object.Logical == "":
 				branch.object.Logical = f.Logical
 				if branch.object.Scale == nil {
 					branch.object.Scale = clonePtrInt(f.Scale)
@@ -445,8 +448,8 @@ func (f *afield) liftFieldLogicalIntoType() {
 				if branch.object.Precision == nil {
 					branch.object.Precision = clonePtrInt(f.Precision)
 				}
-				break
 			}
+			break // first non-null branch only
 		}
 
 	case f.Type.object != nil:
