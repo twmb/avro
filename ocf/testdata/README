@@ -8,3 +8,12 @@ deflate-invalid-data.avro, snappy-invalid-crc.avro, snappy-invalid-data.avro,
 snappy-short-crc.avro, zstd-invalid-data.avro:
   From the hamba/avro project (https://github.com/hamba/avro),
   ocf/testdata/. Licensed under the MIT License.
+
+bigdec.avro:
+  Java-generated big-decimal logical-type OCF (AVRO-4124). Contains
+  one record {field_name: 2.24}; wire bytes match avro-rs's
+  test_avro_3779_from_java_file (avro/tests/bigdec.avro). Used by
+  TestRegression_OCFBigDecimalJavaInterop to lock in cross-impl
+  binary compatibility with Java and avro-rs.
+  Licensed under the Apache License, Version 2.0 (sourced via
+  apache/avro-rs's vendored copy).

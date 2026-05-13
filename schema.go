@@ -54,22 +54,38 @@ type schemaNode struct {
 	branches    []*schemaNode // union branches
 	ser         serfn
 	deser       deserfn
+	decodeJSON  jsonDecodeFn // non-nil only when custom decoders are wired
 	serRecord   *serRecord
 	deserRecord *deserRecord
 
 	props    map[string]any // extra schema properties (for CustomType callbacks)
 	fieldIdx map[string]int // record field name → index; built at parse time
+
+	// unknownLogical preserves the schema's original logicalType value
+	// when it failed validateLogical (no built-in handler matched AND
+	// no registered CustomType matched at this Parse). The runtime
+	// ignores it — built-in handlers were already chosen based on the
+	// validated (possibly cleared) logical, and runtime dispatches use
+	// `logical`. unknownLogical is consulted ONLY by the cache-
+	// reference rejection check (rejectCachedRefIfCustomTypeWouldMatch)
+	// so a later Parse that registers a CT for this logical can
+	// detect the silent-drop scenario and error loudly.
+	unknownLogical string
 }
+
+// jsonDecodeFn is the per-node JSON dispatch shape used when custom
+// decoders are wired (mirrors deserfn for the binary path). nil node
+// means the runtime falls back to kind dispatch.
+type jsonDecodeFn func(*jsonDecoder, reflect.Value, *schemaNode) error
 
 // fieldNode represents a record field with full metadata.
 type fieldNode struct {
-	name        string
-	nameVal     reflect.Value // pre-computed for map lookups without allocation
-	aliases     []string
-	node        *schemaNode
-	defaultVal  any
-	defaultJSON []byte // pre-computed JSON encoding of defaultVal; nil if no default
-	hasDefault  bool
+	name       string
+	nameVal    reflect.Value // pre-computed for map lookups without allocation
+	aliases    []string
+	node       *schemaNode
+	defaultVal any
+	hasDefault bool
 }
 
 type parseOptLax struct{ fn func(string) error }
@@ -163,11 +179,32 @@ func parse(schema string, b *builder) (*Schema, error) {
 }
 
 // Canonical returns the Parsing Canonical Form of the schema, stripping
-// doc, aliases, defaults, and other non-essential attributes. The result is
-// deterministic and suitable for comparison and fingerprinting.
+// doc, aliases, defaults, and other non-essential attributes. The result
+// is deterministic and matches Java's reference output byte-for-byte,
+// so [Schema.Fingerprint] values are interoperable across implementations.
 func (s *Schema) Canonical() []byte {
-	b, _ := json.Marshal(s.c)
-	return b
+	// Use json.Encoder with HTML escaping disabled: PCF requires raw
+	// UTF-8 (the "STRINGS" rule), so <, >, & must NOT be escaped to
+	// \uXXXX. Java's PCF emitter does not escape them; json.Marshal
+	// does, which would silently diverge fingerprints.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(s.c)
+	out := buf.Bytes()
+	if n := len(out); n > 0 && out[n-1] == '\n' {
+		out = out[:n-1] // strip Encoder's trailing newline
+	}
+	// Go's json.Encoder unconditionally escapes U+2028 and U+2029 even
+	// with SetEscapeHTML(false) — those code points trigger browser-side
+	// JS parser pitfalls that Go's stdlib defends against. PCF requires
+	// raw UTF-8; replace the six-byte JSON escapes with their UTF-8
+	// encodings. Safe: a valid JSON string cannot contain an unescaped
+	// backslash, so the literal six-byte `\uXXXX` byte sequence only
+	// appears as an escape we want to undo.
+	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '2', '0', '2', '8'}, []byte{0xe2, 0x80, 0xa8})
+	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '2', '0', '2', '9'}, []byte{0xe2, 0x80, 0xa9})
+	return out
 }
 
 // Fingerprint hashes the schema's canonical form with h. Use [NewRabin] for
@@ -589,6 +626,11 @@ type fieldMeta struct {
 	inner         *fieldMeta // for nullunion fields: the inner branch's metadata
 	nullSecond    bool       // true for ["T","null"] unions (null is index 1)
 	hasCustomType bool       // true if a CustomType was applied; disables unsafe fast path
+	// minBytes is the minimum wire bytes required to encode one value
+	// of this type. Set on the items' fieldMeta when an array is built;
+	// used by the unsafe array deser to bound block counts. 0 means
+	// items can be zero-byte (array<null>, array<EmptyRecord>).
+	minBytes int
 }
 
 // metaFixup patches a fieldMeta's serRecord/deserRecord when the inner
@@ -618,6 +660,13 @@ type namedType struct {
 	sr    *serRecord   // non-nil for records only
 	dr    *deserRecord // non-nil for records only
 	node  *schemaNode
+	// hadCustomType is true when this named type was built under a
+	// Parse that registered at least one CustomType matching some
+	// node in its subtree. The cache-reference rejection check uses
+	// this to allow re-references when the cached entry was already
+	// CT-wired at its original Parse — the documented remediation
+	// path "re-parse Inner with the CT first" depends on this signal.
+	hadCustomType bool
 }
 
 type builder struct {
@@ -745,7 +794,23 @@ func (b *builder) finalize() error {
 		}
 		m.nd.fields[m.idx].node = nt.node
 		if m.hasDefault && nt.node != nil {
-			defaultBytes, err := encodeDefault(m.defaultVal, nt.node)
+			// Now that the type is resolved, run the validation +
+			// coercion + conversion that was deferred at parse time
+			// against the resolved schemaNode tree. coerceDefault
+			// turns nested float-from-string into float64;
+			// validateDefault enforces structural compatibility;
+			// convertDefaultBytes maps bytes/fixed strings to []byte
+			// for JSON-encoder parity.
+			m.defaultVal = coerceDefault(m.defaultVal, nt.node)
+			if err := validateDefault(m.defaultVal, nt.node); err != nil {
+				return fmt.Errorf("field %q: invalid default for type %q: %v", m.sr.fields[m.idx].name, m.name, err)
+			}
+			m.defaultVal = convertDefaultBytes(m.defaultVal, nt.node)
+			m.dr.fields[m.idx].defaultVal = m.defaultVal
+			m.dr.fields[m.idx].hasDefault = true
+			m.nd.fields[m.idx].defaultVal = m.defaultVal
+			m.nd.fields[m.idx].hasDefault = true
+			defaultBytes, err := encodeDefault(nil, m.defaultVal, nt.node)
 			if err != nil {
 				return fmt.Errorf("field %q: invalid default for type %q: %v", m.sr.fields[m.idx].name, m.name, err)
 			}
@@ -829,8 +894,6 @@ func buildCustomSN(node *schemaNode) *SchemaNode {
 	return sn
 }
 
-// applyCustomTypes wires matching CustomType registrations into the
-// schema node's ser/deser/customEncode functions.
 // hasMatchingCustomType checks if any registered custom type would match
 // a node with the given kind and logical type. Used to skip built-in
 // logical type handlers when a custom type replaces them.
@@ -907,7 +970,13 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 						result, err := enc.fn(v.Interface(), sn)
 						if err != nil {
 							if errors.Is(err, ErrSkipCustomType) {
-								break
+								// Skip this encoder, try the next
+								// chain entry — mirrors the
+								// value-GoType scan below and the
+								// decoder side (custom_type.go) so
+								// the ErrSkipCustomType contract
+								// holds regardless of GoType shape.
+								continue
 							}
 							return reflect.Value{}, err
 						}
@@ -969,6 +1038,12 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		b.customDecoderMap[node] = decoders
 		b.customSNMap[node] = sn
 		b.deser = wrapDeserWithCustomDecoders(node.deser, decoders, sn)
+		// JSON-side: wrap the node's per-decode dispatch with a
+		// closure that captures the decoder chain. The JSON runtime
+		// (decodeValue) checks node.decodeJSON first and falls back
+		// to decodeKind otherwise — no per-call map lookup, no
+		// recursion guard, no shared mutable state.
+		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(decoders, sn)
 	}
 
 	b.meta.hasCustomType = true
@@ -992,6 +1067,9 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 	// Check if this is a named type reference (record, enum, fixed).
 	name := s.primitive
 	if nt := b.named[name]; nt != nil {
+		if err := b.rejectCachedRefIfCustomTypeWouldMatch(name, nt); err != nil {
+			return err
+		}
 		b.ser = nt.ser
 		b.deser = nt.deser
 		if nt.sr != nil {
@@ -1006,6 +1084,9 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 		if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
 			qualified := parentName[:dot+1] + name
 			if nt := b.named[qualified]; nt != nil {
+				if err := b.rejectCachedRefIfCustomTypeWouldMatch(qualified, nt); err != nil {
+					return err
+				}
 				b.canon.primitive = qualified
 				b.ser = nt.ser
 				b.deser = nt.deser
@@ -1018,6 +1099,100 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 		}
 	}
 	return &unknownPrimitiveError{s.primitive}
+}
+
+// rejectCachedRefIfCustomTypeWouldMatch returns an error when the
+// current Parse registered a CustomType that would match a node
+// inside the cached named-type's subtree. The cached node's
+// ser/deser/per-field handlers were baked at the original Parse with
+// no knowledge of this Parse's customTypes; silently reusing them
+// would mean the user's CustomType is dropped on the cached fields.
+// Rather than fail at runtime (the user gets back unwrapped raw
+// bytes), we fail at Parse time and tell them what to do: re-parse
+// the inner type with the CustomType in place, or pass the CT when
+// the inner type is first parsed.
+//
+// Per the package's "Intentional asymmetries": CustomTypes are
+// scoped to the resulting Schema, which by definition includes its
+// referenced types. Cached references previously bypassed this scope.
+func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *namedType) error {
+	if len(b.customTypes) == 0 || nt == nil || nt.node == nil {
+		return nil
+	}
+	// If the cached entry was itself built under a CT-bearing Parse,
+	// trust that its wiring is sufficient — the user's documented
+	// remediation is to re-parse the inner type with the CT in scope,
+	// which lands here. We don't try to detect CT shape mismatches
+	// between the two parses; the cached wiring wins.
+	if nt.hadCustomType {
+		return nil
+	}
+	visited := make(map[*schemaNode]bool)
+	if matched := b.findCustomTypeMatchInSubtree(nt.node, visited); matched != "" {
+		return fmt.Errorf("avro: cached type %q contains %q which would match a CustomType on this Parse; re-parse %q with the CustomType first", refName, matched, refName)
+	}
+	return nil
+}
+
+// findCustomTypeMatchInSubtree walks node and its descendants,
+// returning a short location string for the first node whose
+// (kind, logical) would match any of b.customTypes. Returns "" if
+// no descendant matches. Recursive types are handled via the
+// visited set; node.fields, node.items, node.values, node.branches
+// cover every container shape (record, array, map, union). Named-
+// type recursion is rare in cached-reuse scenarios but the visited
+// set keeps it safe.
+func (b *builder) findCustomTypeMatchInSubtree(node *schemaNode, visited map[*schemaNode]bool) string {
+	if node == nil || visited[node] {
+		return ""
+	}
+	visited[node] = true
+	// Effective logical: prefer the live logical, fall back to the
+	// preserved-but-cleared unknownLogical. Built-in logicals are
+	// always preserved; only unknown-at-original-Parse logicals end
+	// up in unknownLogical. Either may match a CT registered now.
+	effLogical := node.logical
+	if effLogical == "" {
+		effLogical = node.unknownLogical
+	}
+	for _, ct := range b.customTypes {
+		// Wildcard CTs (both empty) opt into runtime ErrSkipCustomType
+		// dispatch — they don't reliably suppress built-ins at parse
+		// time, so they don't cause silent-drop on cached subtrees.
+		// Skip them in this check; only explicitly-typed CTs would
+		// silently fail to fire.
+		if ct.LogicalType == "" && ct.AvroType == "" {
+			continue
+		}
+		ltMatch := ct.LogicalType == "" || ct.LogicalType == effLogical
+		atMatch := ct.AvroType == "" || ct.AvroType == node.kind
+		if ltMatch && atMatch && (ct.LogicalType != "" || ct.AvroType != "") {
+			if node.name != "" {
+				return node.name
+			}
+			if effLogical != "" {
+				return node.kind + "." + effLogical
+			}
+			return node.kind
+		}
+	}
+	for _, f := range node.fields {
+		if m := b.findCustomTypeMatchInSubtree(f.node, visited); m != "" {
+			return m
+		}
+	}
+	if m := b.findCustomTypeMatchInSubtree(node.items, visited); m != "" {
+		return m
+	}
+	if m := b.findCustomTypeMatchInSubtree(node.values, visited); m != "" {
+		return m
+	}
+	for _, br := range node.branches {
+		if m := b.findCustomTypeMatchInSubtree(br, visited); m != "" {
+			return m
+		}
+	}
+	return ""
 }
 
 // Unions may not contain multiple schemas with the same type, except for
@@ -1039,10 +1214,15 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	for i, us := range s.union {
 		u := b.nest()
 		if err := u.build(parentName, &us); err != nil {
-			if pe := (*unknownPrimitiveError)(nil); !errors.As(err, &pe) {
+			pe := (*unknownPrimitiveError)(nil)
+			if !errors.As(err, &pe) {
 				return fmt.Errorf("invalid union: %w", err)
 			}
-			missing[i] = us.primitive
+			// pe.p is the unresolved name from either the bare-string
+			// form (where us.primitive is set) or the wrapped form
+			// {"type":"FwdName"} (where us.object.Type is set); the
+			// error normalizes both into pe.p.
+			missing[i] = pe.p
 		}
 		b.unnest(u)
 		branchMetas[i] = u.meta
@@ -1052,10 +1232,25 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		if err != nil {
 			return err
 		}
-		if sawTypes[typ] && name == "" {
-			return fmt.Errorf("duplicate union type %q", typ)
+		// Per Avro spec ("Unions"): "Names of named types must be
+		// defined exactly once across all the schemas of the union."
+		// Key by the resolved fullname when available so an inline
+		// definition + a name reference to the same named type
+		// collide; primitives still collide on kind. Forward refs key
+		// on the unresolved name (the common case where the user
+		// writes consistent names is caught; namespace-qualification
+		// mismatches that only resolve later may escape).
+		key := typ
+		switch {
+		case u.node != nil && u.node.name != "":
+			key = u.node.name
+		case missing[i] != "":
+			key = missing[i]
 		}
-		sawTypes[typ] = true
+		if sawTypes[key] {
+			return fmt.Errorf("duplicate union type %q", key)
+		}
+		sawTypes[key] = true
 
 		b.canon.union = append(b.canon.union, u.canon)
 		ser.fns = append(ser.fns, u.ser)
@@ -1082,6 +1277,54 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			ser.branchNames[ln] = i
 		}
 	}
+	// Fastavro-short-name fallback: for named branches (record/enum/
+	// fixed) whose canonical name carries a namespace, also accept the
+	// unqualified short name on tagged-union encode IFF it's unique
+	// across the union. Mirrors findUnionBranch's JSON-side fallback
+	// (json_codec.go:findUnionBranch) so binary and JSON encode accept
+	// the same tagged input shape. The ambiguity guard prevents silent
+	// misrouting when two namespaces share a short name.
+	if len(deser.branchNames) > 0 {
+		shortCount := make(map[string]int, len(deser.branchNames))
+		for _, bn := range deser.branchNames {
+			if short := unqualified(bn); short != bn {
+				shortCount[short]++
+			}
+		}
+		for i, bn := range deser.branchNames {
+			short := unqualified(bn)
+			if short == bn {
+				continue
+			}
+			if shortCount[short] != 1 {
+				continue
+			}
+			if _, exists := ser.branchNames[short]; exists {
+				continue
+			}
+			ser.branchNames[short] = i
+		}
+	}
+	// Populate branchKinds for type-name dispatch in serUnion.ser /
+	// appendAvroJSONUnion / encodeDefault's union case (see
+	// unionTypeNameForValue). Primitive kinds only — record/enum/fixed
+	// branches go through tagged-union dispatch, and the spec
+	// guarantees primitive kinds are unique within a union (so this
+	// map is unambiguous by construction).
+	for i, branch := range branchNodes {
+		if branch == nil {
+			continue
+		}
+		switch branch.kind {
+		case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
+			if ser.branchKinds == nil {
+				ser.branchKinds = make(map[string]int, len(branchNodes))
+			}
+			if _, exists := ser.branchKinds[branch.kind]; !exists {
+				ser.branchKinds[branch.kind] = i
+			}
+		}
+	}
 
 	if len(s.union) == 2 && s.union[0].primitive == "null" {
 		b.ser = serNullUnion(ser)
@@ -1089,7 +1332,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		if _, isMissing := missing[1]; isMissing {
 			inner := &fieldMeta{}
 			b.meta = fieldMeta{avroType: "nullunion", inner: inner}
-			b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: s.union[1].primitive})
+			b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: missing[1]})
 		} else {
 			inner := new(fieldMeta)
 			*inner = branchMetas[1]
@@ -1101,7 +1344,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		if _, isMissing := missing[0]; isMissing {
 			inner := &fieldMeta{}
 			b.meta = fieldMeta{avroType: "nullunion", nullSecond: true, inner: inner}
-			b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: s.union[0].primitive})
+			b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: missing[0]})
 		} else {
 			inner := new(fieldMeta)
 			*inner = branchMetas[0]
@@ -1157,7 +1400,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			if o.Scale != nil {
 				scale = *o.Scale
 			}
-			b.ser = (&serBytesDecimal{scale: scale}).ser
+			b.ser = (&serBytesDecimal{precision: *o.Precision, scale: scale}).ser
 			b.deser = (&deserBytesDecimal{scale: scale}).deser
 			b.canon = aschema{primitive: o.Type}
 			b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
@@ -1168,6 +1411,20 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				deser:     b.deser,
 				precision: *o.Precision,
 				scale:     scale,
+			}
+			b.node = nd
+			return nil
+		}
+		if o.Logical == "big-decimal" && !b.hasMatchingCustomType(o.Type, o.Logical) {
+			b.ser = (&serBigDecimal{}).ser
+			b.deser = (&deserBigDecimal{}).deser
+			b.canon = aschema{primitive: o.Type}
+			b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
+			nd := &schemaNode{
+				kind:    o.Type,
+				logical: o.Logical,
+				ser:     b.ser,
+				deser:   b.deser,
 			}
 			b.node = nd
 			return nil
@@ -1195,6 +1452,9 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			ser:     b.ser,
 			deser:   b.deser,
 		}
+		if o.Logical == "" && origLogical != "" {
+			nd.unknownLogical = origLogical
+		}
 		if o.Precision != nil {
 			nd.precision = *o.Precision
 		}
@@ -1203,6 +1463,68 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.node = nd
 		return nil
+	}
+
+	// Named-type reference wrapped in an object: {"type":"Node"} where
+	// "Node" is a record/enum/fixed and no type-defining fields are
+	// present. Java's parser accepts this form (see apache/avro
+	// TestUnionSelfReference). The bare-string form "Node" is the
+	// canonical reference shape; this branch handles the equivalent
+	// wrapped form for interop with producers that emit it. Forward
+	// references — names not yet declared — return unknownPrimitiveError
+	// so the field/union/array/map dispatch can queue a fixup, mirroring
+	// the bare-string forward-reference path in buildPrimitive.
+	// Any of Fields/Symbols/Items/Values/Size/Name being set means the
+	// caller is trying to *define* a new type — fall through and let the
+	// regular dispatch handle (or error on) that case.
+	if o.Name == "" &&
+		len(o.Fields) == 0 && len(o.Symbols) == 0 &&
+		o.Items == nil && o.Values == nil && o.Size == nil {
+		if nt := b.named[o.Type]; nt != nil {
+			if err := b.rejectCachedRefIfCustomTypeWouldMatch(o.Type, nt); err != nil {
+				return err
+			}
+			b.canon = aschema{primitive: o.Type}
+			b.ser = nt.ser
+			b.deser = nt.deser
+			if nt.sr != nil {
+				b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
+			}
+			b.node = nt.node
+			return nil
+		}
+		if !strings.Contains(o.Type, ".") && parentName != "" {
+			if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
+				qualified := parentName[:dot+1] + o.Type
+				if nt := b.named[qualified]; nt != nil {
+					if err := b.rejectCachedRefIfCustomTypeWouldMatch(qualified, nt); err != nil {
+						return err
+					}
+					b.canon = aschema{primitive: qualified}
+					b.ser = nt.ser
+					b.deser = nt.deser
+					if nt.sr != nil {
+						b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
+					}
+					b.node = nt.node
+					return nil
+				}
+			}
+		}
+		// Not a recognized base/complex type and not a declared named
+		// type — treat as a forward reference. The caller (record-field
+		// build, union dispatch, etc.) catches unknownPrimitiveError and
+		// queues a fixup keyed on the name in the error.
+		switch o.Type {
+		case "record", "error", "enum", "fixed", "array", "map":
+			// real complex-type-without-required-fields — fall through
+			// to the existing switch which will surface the right error.
+		default:
+			if _, isPrim := serPrimitive[o.Type]; !isPrim {
+				b.canon = aschema{primitive: o.Type}
+				return &unknownPrimitiveError{o.Type}
+			}
+		}
 	}
 
 	// Preserve original aliases and enum default before canonical stripping.
@@ -1309,7 +1631,8 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			serRecord:   sr,
 			deserRecord: dr,
 		}
-		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, sr: sr, dr: dr, node: nd}
+		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, sr: sr, dr: dr, node: nd,
+			hadCustomType: len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0}
 		b.node = nd
 
 		var names []string
@@ -1334,12 +1657,15 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			isFwdRef := false
 			fwdRefName := ""
 			if err := bf.build(o.Name, of.Type); err != nil {
-				// An unknownPrimitiveError for a primitive ref means
-				// the type hasn't been parsed yet — treat it as a
-				// forward reference to be resolved in finalize().
-				if pe := (*unknownPrimitiveError)(nil); errors.As(err, &pe) && of.Type != nil && of.Type.primitive != "" {
+				// An unknownPrimitiveError signals a not-yet-declared
+				// named type — treat as a forward reference to be
+				// resolved in finalize(). The error's `p` field carries
+				// the name from either the bare-string form (where
+				// of.Type.primitive is set) or the wrapped form
+				// {"type":"FwdName"} (where of.Type.object.Type is set).
+				if pe := (*unknownPrimitiveError)(nil); errors.As(err, &pe) {
 					isFwdRef = true
-					fwdRefName = of.Type.primitive
+					fwdRefName = pe.p
 				} else {
 					return fmt.Errorf("invalid record field: %v", err)
 				}
@@ -1367,6 +1693,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				name:     of.Name,
 				nameVal:  reflect.ValueOf(of.Name),
 				fn:       bf.deser,
+				fnIface:  ifaceFnForPrimitive(meta),
 				avroType: meta.avroType,
 				meta:     meta,
 			}
@@ -1385,37 +1712,39 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 					name: fwdRefName,
 				}
 				if len(of.Default) > 0 {
-					var dv any
-					// json.Unmarshal cannot fail: of.Default is a json.RawMessage
-					// preserved from the initial schema parse, so it is valid JSON.
-					json.Unmarshal(of.Default, &dv)
-					fix.defaultVal = dv
+					fix.defaultVal = unmarshalDefault(of.Default)
 					fix.hasDefault = true
 				}
 				b.fieldFixups = append(b.fieldFixups, fix)
 			}
 			if len(of.Default) > 0 {
-				var defaultVal any
-				// json.Unmarshal cannot fail: of.Default is a json.RawMessage
-				// preserved from the initial schema parse, so it is valid JSON.
-				json.Unmarshal(of.Default, &defaultVal)
-				defaultVal = coerceDefault(defaultVal, &bf.canon)
+				defaultVal := unmarshalDefault(of.Default)
+				defaultVal = coerceDefault(defaultVal, bf.node)
 				// Skip default validation for forward references since we
 				// don't know the type yet.
 				if !isFwdRef {
-					if err := validateDefault(defaultVal, &bf.canon); err != nil {
+					if err := validateDefault(defaultVal, bf.node); err != nil {
 						return fmt.Errorf("record field %q: invalid default: %v", of.Name, err)
 					}
+					// Convert bytes/fixed string defaults to []byte before
+					// storing, so the JSON encoder sees the wire form
+					// directly and its logical-type-aware arms can't
+					// misinterpret the string as decimal / UUID / etc.
+					// Mirrors encodeDefault's codepoint mapping; both
+					// paths agree on default-fill output. Walks the
+					// resolved schemaNode tree (not the aschema canon)
+					// so name-references — both forward and backward —
+					// follow into the real type.
+					defaultVal = convertDefaultBytes(defaultVal, bf.node)
 				}
 				drf.defaultVal = defaultVal
 				drf.hasDefault = true
 				fn.defaultVal = defaultVal
 				fn.hasDefault = true
-				fn.defaultJSON, _ = json.Marshal(defaultVal)
 				// Pre-encode the default to Avro binary for use
 				// when encoding maps with missing keys.
 				if !isFwdRef && bf.node != nil {
-					defaultBytes, err := encodeDefault(defaultVal, bf.node)
+					defaultBytes, err := encodeDefault(nil, defaultVal, bf.node)
 					if err != nil {
 						return fmt.Errorf("record field %q: encoding default: %v", of.Name, err)
 					}
@@ -1425,9 +1754,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			} else if bf.canon.isNullableUnion() {
 				// Per the Avro spec, a union whose first branch is "null"
 				// implicitly defaults to null when no explicit default is given.
+				// fn.defaultVal stays nil — the JSON encoder treats a nil
+				// default as the null encoding.
 				drf.hasDefault = true
 				fn.hasDefault = true
-				fn.defaultJSON = []byte("null")
 				sr.fields[fieldIdx].defaultBytes = []byte{0} // varint 0 = null branch
 				sr.fields[fieldIdx].hasDefault = true
 			}
@@ -1437,9 +1767,29 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		sr.names = names
 		dr.names = names
+		// JSON DecodeJSON uses fieldIdx to route record-field keys to their
+		// schema slot. Register every alias→idx mapping in addition to the
+		// canonical name so JSON producers that emit using an alias name
+		// route to the right field. The binary path's resolve.go does the
+		// equivalent alias-aware lookup via findReaderFieldIndex.
 		nd.fieldIdx = make(map[string]int, len(nd.fields))
 		for i, f := range nd.fields {
 			nd.fieldIdx[f.name] = i
+			for _, a := range f.aliases {
+				if _, exists := nd.fieldIdx[a]; exists {
+					return fmt.Errorf("record field alias %q collides with another field name or alias", a)
+				}
+				nd.fieldIdx[a] = i
+			}
+		}
+		// Update hadCustomType after all fields are built. The named
+		// entry was registered EARLY (before fields) to support self-
+		// referencing record schemas, so the flag couldn't be set at
+		// registration time — fields might apply CTs that won't show
+		// up in the maps until unnest. Re-stamp now.
+		if cached := b.named[o.Name]; cached != nil {
+			cached.hadCustomType = cached.hadCustomType ||
+				len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0
 		}
 
 	case "enum":
@@ -1463,7 +1813,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 			seenSymbols[e] = true
 		}
-		b.ser = (&serEnum{symbols: o.Symbols}).ser
+		b.ser = newSerEnum(o.Symbols).ser
 		b.deser = (&deserEnum{symbols: o.Symbols}).deser
 		b.meta = fieldMeta{avroType: "enum"}
 
@@ -1485,7 +1835,8 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			nd.enumDef = defStr
 			nd.hasEnumDef = true
 		}
-		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, node: nd}
+		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, node: nd,
+			hadCustomType: len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0}
 		b.node = nd
 
 	case "array":
@@ -1505,11 +1856,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.unnest(af)
 		o.Items = &af.canon
 		sa := &serArray{serItem: af.ser}
-		da := &deserArray{deserItem: af.deser}
-		// When items have a custom type, skip specialized array
-		// ser/deser fast paths — they bypass the item's wrapped
-		// ser/deser functions.
-		if af.meta.hasCustomType {
+		da := &deserArray{deserItem: af.deser, minItemBytes: schemaMinBytes(af.node)}
+		// Specialized array ser/deser fast paths bypass the inner
+		// schema's wrapped ser/deser functions. They are correct only
+		// when no per-element conversion is needed: no custom type,
+		// and no logical type (logical-typed inners route through
+		// serTimestampMillis / deserTimeMicros / serUUID / etc., which
+		// the primitive-only specialization can't see).
+		if af.meta.hasCustomType || af.meta.logical != "" {
 			b.ser = sa.ser
 		} else {
 			switch af.canon.primitive {
@@ -1517,26 +1871,32 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				b.ser = sa.serString
 				da.fastLoop = deserArrayStringLoop
 				da.fastElemKind = reflect.String
+				da.fastIfaceLoop = deserArrayStringIfaceLoop
 			case "boolean":
 				b.ser = sa.serBoolean
 				da.fastLoop = deserArrayBooleanLoop
 				da.fastElemKind = reflect.Bool
+				da.fastIfaceLoop = deserArrayBooleanIfaceLoop
 			case "int":
 				b.ser = sa.serInt
 				da.fastLoop = deserArrayIntLoop
 				da.fastElemKind = reflect.Int32
+				da.fastIfaceLoop = deserArrayIntIfaceLoop
 			case "long":
 				b.ser = sa.serLong
 				da.fastLoop = deserArrayLongLoop
 				da.fastElemKind = reflect.Int64
+				da.fastIfaceLoop = deserArrayLongIfaceLoop
 			case "float":
 				b.ser = sa.serFloat
 				da.fastLoop = deserArrayFloatLoop
 				da.fastElemKind = reflect.Float32
+				da.fastIfaceLoop = deserArrayFloatIfaceLoop
 			case "double":
 				b.ser = sa.serDouble
 				da.fastLoop = deserArrayDoubleLoop
 				da.fastElemKind = reflect.Float64
+				da.fastIfaceLoop = deserArrayDoubleIfaceLoop
 			default:
 				b.ser = sa.ser
 			}
@@ -1544,6 +1904,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.deser = da.deser
 		inner := new(fieldMeta)
 		*inner = af.meta
+		inner.minBytes = schemaMinBytes(af.node)
 		b.meta = fieldMeta{avroType: "array", inner: inner}
 		b.node = &schemaNode{
 			kind:  "array",
@@ -1569,8 +1930,16 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.unnest(mf)
 		o.Values = &mf.canon
 		sm := &serMap{serItem: mf.ser}
-		dm := &deserMap{deserItem: mf.deser}
-		if mf.meta.hasCustomType {
+		// minEntryBytes = 1 (empty-key length varint) + values' minimum
+		// wire bytes. Matches deserArray.minItemBytes in spirit; bounds
+		// block-count against remaining-buffer to prevent memory
+		// amplification on hostile input.
+		dm := &deserMap{deserItem: mf.deser, minEntryBytes: 1 + schemaMinBytes(mf.node)}
+		// Same gate as the array case above: skip specialization when
+		// values have a custom type or a logical type, so the inner
+		// per-element function (serTimestampMillis / deserTimeMicros
+		// / etc.) actually runs.
+		if mf.meta.hasCustomType || mf.meta.logical != "" {
 			b.ser = sm.ser
 		} else {
 			switch mf.canon.primitive {
@@ -1578,26 +1947,32 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				b.ser = sm.serString
 				dm.fastBlock = deserMapStringBlock
 				dm.fastElemKind = reflect.String
+				dm.fastIfaceBlock = deserMapStringIfaceBlock
 			case "boolean":
 				b.ser = sm.serBoolean
 				dm.fastBlock = deserMapBooleanBlock
 				dm.fastElemKind = reflect.Bool
+				dm.fastIfaceBlock = deserMapBooleanIfaceBlock
 			case "int":
 				b.ser = sm.serInt
 				dm.fastBlock = deserMapIntBlock
 				dm.fastElemKind = reflect.Int32
+				dm.fastIfaceBlock = deserMapIntIfaceBlock
 			case "long":
 				b.ser = sm.serLong
 				dm.fastBlock = deserMapLongBlock
 				dm.fastElemKind = reflect.Int64
+				dm.fastIfaceBlock = deserMapLongIfaceBlock
 			case "float":
 				b.ser = sm.serFloat
 				dm.fastBlock = deserMapFloatBlock
 				dm.fastElemKind = reflect.Float32
+				dm.fastIfaceBlock = deserMapFloatIfaceBlock
 			case "double":
 				b.ser = sm.serDouble
 				dm.fastBlock = deserMapDoubleBlock
 				dm.fastElemKind = reflect.Float64
+				dm.fastIfaceBlock = deserMapDoubleIfaceBlock
 			default:
 				b.ser = sm.ser
 			}
@@ -1640,7 +2015,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				if o.Scale != nil {
 					scale = *o.Scale
 				}
-				b.ser = (&serFixedDecimal{size: size, scale: scale}).ser
+				b.ser = (&serFixedDecimal{size: size, precision: *o.Precision, scale: scale}).ser
 				b.deser = (&deserFixedDecimal{size: size, scale: scale}).deser
 			case "uuid":
 				b.ser = serFixedUUIDReflect
@@ -1667,7 +2042,8 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 		}
 		b.node = nd
-		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, node: nd}
+		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, node: nd,
+			hadCustomType: len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0}
 	}
 	return nil
 }
@@ -1698,31 +2074,45 @@ func (o *aobject) validateLogical() error {
 		// No logical type: validate no scale / precision below.
 
 	case "decimal":
+		// Wrong underlying type is the one fall-back-on-mismatch case
+		// the spec implies: an unknown logical type pinned on the wrong
+		// primitive should not block schema parse. Precision/scale
+		// constraints, on the other hand, are explicit Avro 1.12 rules
+		// (LogicalTypes.Decimal.validate in Java rejects each); a
+		// schema that violates them is malformed. Java and fastavro
+		// reject; we do too, to avoid silent interop divergence.
 		if o.Type != "bytes" && o.Type != "fixed" {
-			// Wrong underlying type: fall back to underlying type.
 			o.Logical = ""
 			return nil
 		}
-		if o.Precision == nil || *o.Precision <= 0 {
-			// Invalid precision: fall back to underlying type.
-			o.Logical = ""
-			return nil
+		if o.Precision == nil {
+			return fmt.Errorf("decimal logical type requires precision")
+		}
+		if *o.Precision <= 0 {
+			return fmt.Errorf("decimal precision %d must be positive", *o.Precision)
 		}
 		scale := 0
 		if o.Scale != nil {
 			scale = *o.Scale
 		}
-		if scale < 0 || scale > *o.Precision {
-			// Invalid scale: fall back to underlying type.
-			o.Logical = ""
-			return nil
+		if scale < 0 {
+			return fmt.Errorf("decimal scale %d must not be negative", scale)
+		}
+		if scale > *o.Precision {
+			return fmt.Errorf("decimal scale %d exceeds precision %d", scale, *o.Precision)
+		}
+		// DoS bound: precision/scale drive 10^scale allocations in
+		// bytesToRat / ratToUnscaled at every decode/encode.
+		if *o.Precision > decimalScaleLimit {
+			return fmt.Errorf("decimal precision %d exceeds %d limit", *o.Precision, decimalScaleLimit)
+		}
+		if scale > decimalScaleLimit {
+			return fmt.Errorf("decimal scale %d exceeds %d limit", scale, decimalScaleLimit)
 		}
 		if o.Type == "fixed" && o.Size != nil {
 			maxDigits := maxDecimalDigits(int(*o.Size))
 			if *o.Precision > maxDigits {
-				// Precision exceeds fixed capacity: fall back.
-				o.Logical = ""
-				return nil
+				return fmt.Errorf("decimal precision %d exceeds fixed(%d) capacity %d", *o.Precision, *o.Size, maxDigits)
 			}
 		}
 		return nil
@@ -1794,12 +2184,18 @@ func maxDecimalDigits(size int) int {
 // or nil if the logical type doesn't have special serialization.
 func logicalSer(logical string) serfn {
 	switch logical {
-	case "timestamp-millis", "local-timestamp-millis":
+	case "timestamp-millis":
 		return serTimestampMillis
-	case "timestamp-micros", "local-timestamp-micros":
+	case "timestamp-micros":
 		return serTimestampMicros
-	case "timestamp-nanos", "local-timestamp-nanos":
+	case "timestamp-nanos":
 		return serTimestampNanos
+	case "local-timestamp-millis":
+		return serLocalTimestampMillis
+	case "local-timestamp-micros":
+		return serLocalTimestampMicros
+	case "local-timestamp-nanos":
+		return serLocalTimestampNanos
 	case "date":
 		return serDate
 	case "time-millis":
@@ -1836,19 +2232,125 @@ func logicalDeser(logical string) deserfn {
 	}
 }
 
+// unmarshalDefault parses a field's raw JSON default. Uses
+// json.Decoder.UseNumber() so that numeric literals are preserved as
+// json.Number rather than rounded through float64 — int64 / long
+// defaults > 2^53 would otherwise silently lose precision (e.g. 9007199254740993
+// → 9007199254740992).
+func unmarshalDefault(raw json.RawMessage) any {
+	var dv any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	// Cannot fail: raw is preserved from the initial parse and is valid JSON.
+	_ = dec.Decode(&dv)
+	return dv
+}
+
+// defaultAsInt32 / defaultAsInt64 / defaultAsFloat64 extract a numeric
+// default. After unmarshalDefault, a JSON number arrives as json.Number
+// (full precision); a few callers also pass float64 (e.g. round-tripped
+// through coerceDefault). Float-defaulted-from-string is accepted for
+// float / double (Java parser leniency).
+
+func defaultAsInt32(val any) (int32, error) {
+	switch v := val.(type) {
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			if i < math.MinInt32 || i > math.MaxInt32 {
+				return 0, fmt.Errorf("value %d overflows int32", i)
+			}
+			return int32(i), nil
+		}
+		f, err := v.Float64()
+		if err != nil {
+			return 0, fmt.Errorf("invalid number %s", v.String())
+		}
+		return floatFitsInt32(f)
+	case float64:
+		return floatFitsInt32(v)
+	}
+	return 0, fmt.Errorf("expected number, got %T", val)
+}
+
+func defaultAsInt64(val any) (int64, error) {
+	switch v := val.(type) {
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i, nil
+		}
+		f, err := v.Float64()
+		if err != nil {
+			return 0, fmt.Errorf("invalid number %s", v.String())
+		}
+		return floatFitsInt64(f)
+	case float64:
+		return floatFitsInt64(v)
+	}
+	return 0, fmt.Errorf("expected number, got %T", val)
+}
+
+func defaultAsFloat64(val any) (float64, error) {
+	switch v := val.(type) {
+	case json.Number:
+		f, err := v.Float64()
+		if err != nil {
+			return 0, fmt.Errorf("invalid number %s", v.String())
+		}
+		return f, nil
+	case float64:
+		return v, nil
+	case string:
+		// Java accepts "3.14" as a float/double default literal.
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid string default %q: %w", v, err)
+		}
+		return f, nil
+	}
+	return 0, fmt.Errorf("expected number, got %T", val)
+}
+
 // coerceDefault converts string default values to the expected type when
-// the schema type is float or double, matching Java's schema parser behavior.
-func coerceDefault(val any, s *aschema) any {
-	prim := s.primitive
-	if prim == "" && len(s.union) > 0 {
-		for _, branch := range s.union {
-			if branch.primitive == "float" || branch.primitive == "double" {
-				prim = branch.primitive
-				break
+// the field's type is literally float or double, matching Java's
+// Schema.parseField (Schema.java:1900-1902): the string→DoubleNode
+// coercion is gated on Type.FLOAT.equals(...) || Type.DOUBLE.equals(...).
+// Union-typed fields are NOT coerced at parse time — Java leaves the
+// TextNode in place and lets the default flow through to the union's
+// per-branch dispatch, where the first branch with isCompatible wins.
+// We mirror that: union defaults pass through unchanged so a textual
+// default into ["string","float"] picks the string branch (matches
+// Java, fastavro, hamba). The float branch's defaultAsFloat64 has its
+// own string-fallback for the `{"type":"float","default":"3.14"}`
+// non-union case, kept here.
+//
+// Walks *schemaNode so that nested float fields reached through a name-
+// reference are coerced too — the prior aschema-canon walker silently
+// dropped name-refs (canon=aschema{primitive:<Name>}), leaving nested
+// string defaults uncoerced and breaking JSON encode's
+// jsonCoerceToFloat64 which rejects string inputs at default-fill time.
+func coerceDefault(val any, node *schemaNode) any {
+	if node == nil {
+		return val
+	}
+	if node.kind == "union" {
+		// Mirror convertDefaultBytes's union-case branch matcher:
+		// the first branch validateDefault accepts is the one this
+		// default resolves to, and we recurse so the coerced value
+		// matches the picked branch's natural Go type. Without this,
+		// a `["float","null"]` default of `"1.5"` stays as a Go
+		// string and the JSON encoder's union try-each-branch loop
+		// hits jsonCoerceToFloat64 (which rejects strings); the
+		// binary encoder meanwhile coerces via defaultAsFloat64's
+		// string fallback and picks the float branch — a silent
+		// binary/JSON divergence on `["float","string"]` unions.
+		for _, branch := range node.branches {
+			if validateDefault(val, branch) == nil {
+				return coerceDefault(val, branch)
 			}
 		}
+		return val
 	}
-	if prim != "float" && prim != "double" {
+	if node.kind != "float" && node.kind != "double" {
 		return val
 	}
 	str, ok := val.(string)
@@ -1861,98 +2363,106 @@ func coerceDefault(val any, s *aschema) any {
 	return val // leave as-is; validateDefault will report the error
 }
 
-// validateDefault checks that a parsed JSON default value is compatible
-// with the given Avro schema type.
-func validateDefault(val any, s *aschema) error {
-	if s.primitive != "" {
-		return validateDefaultPrimitive(val, s.primitive)
+// convertDefaultBytes walks a parsed-then-validated default value and
+// converts string defaults to []byte for bytes/fixed schema nodes,
+// recursively descending into records/arrays/maps/unions. The Avro
+// JSON spec specifies that bytes/fixed defaults are codepoint-mapped
+// strings; binary encodeDefault already takes the codepoint route via
+// avroJSONBytesToBytes, while the JSON encoder's appendAvroJSON
+// logical-type-aware arms (decimal, big-decimal, uuid) would otherwise
+// misinterpret the string semantically. Storing the wire-form []byte
+// up front makes both encode paths agree without requiring per-arm
+// special cases.
+//
+// Walks *schemaNode (the resolved type tree) rather than the aschema
+// canon so that named-type references — forward and backward — are
+// followed naturally: a record field whose type is `aschema{primitive:
+// "MyDec"}` has a node that already points at MyDec's resolved
+// schemaNode. Called both from buildComplex's non-fwd-ref path and
+// from finalize's fwd-ref fixup.
+//
+// Called after validateDefault has succeeded for non-fwd-ref fields;
+// for fwd-ref fields validation is deferred and the conversion is
+// best-effort (avroJSONBytesToBytes silently returns on error and we
+// preserve the original value).
+func convertDefaultBytes(val any, node *schemaNode) any {
+	if node == nil {
+		return val
 	}
-	if len(s.union) > 0 {
-		// Per Avro 1.12+, the default may match any branch.
-		for _, branch := range s.union {
-			if validateDefault(val, &branch) == nil {
-				return nil
+	switch node.kind {
+	case "bytes", "fixed":
+		if str, ok := val.(string); ok {
+			if b, err := avroJSONBytesToBytes(str); err == nil {
+				return b
 			}
 		}
-		return fmt.Errorf("default does not match any union branch: %T(%v)", val, val)
-	}
-	if s.object != nil {
-		switch s.object.Type {
-		case "record", "error":
-			m, ok := val.(map[string]any)
-			if !ok && val != nil {
-				return fmt.Errorf("expected object for record default, got %T", val)
+		return val
+	case "record":
+		m, ok := val.(map[string]any)
+		if !ok {
+			return val
+		}
+		for _, f := range node.fields {
+			if fv, exists := m[f.name]; exists {
+				m[f.name] = convertDefaultBytes(fv, f.node)
 			}
-			if m == nil {
-				m = make(map[string]any)
-			}
-			for _, f := range s.object.Fields {
-				fv, exists := m[f.Name]
-				if !exists {
-					if !f.hasDefault {
-						return fmt.Errorf("record default missing field %q with no default", f.Name)
-					}
-					continue
-				}
-				fv = coerceDefault(fv, f.Type)
-				m[f.Name] = fv
-				if err := validateDefault(fv, f.Type); err != nil {
-					return fmt.Errorf("field %q: %w", f.Name, err)
-				}
-			}
-		case "enum":
-			sym, ok := val.(string)
-			if !ok {
-				return fmt.Errorf("expected string for enum default, got %T", val)
-			}
-			found := slices.Contains(s.object.Symbols, sym)
-			if !found && len(s.object.Symbols) > 0 {
-				return fmt.Errorf("enum default %q is not a member of symbols", sym)
-			}
-		case "array":
-			arr, ok := val.([]any)
-			if !ok && val != nil {
-				return fmt.Errorf("expected array for array default, got %T", val)
-			}
-			if arr != nil && s.object.Items != nil {
-				for i, elem := range arr {
-					if err := validateDefault(elem, s.object.Items); err != nil {
-						return fmt.Errorf("array element %d: %w", i, err)
-					}
-				}
-			}
-		case "map":
-			m, ok := val.(map[string]any)
-			if !ok && val != nil {
-				return fmt.Errorf("expected object for map default, got %T", val)
-			}
-			if m != nil && s.object.Values != nil {
-				for k, v := range m {
-					if err := validateDefault(v, s.object.Values); err != nil {
-						return fmt.Errorf("map key %q: %w", k, err)
-					}
-				}
-			}
-		case "fixed":
-			str, ok := val.(string)
-			if !ok {
-				return fmt.Errorf("expected string for fixed default, got %T", val)
-			}
-			for _, r := range str {
-				if r > 255 {
-					return fmt.Errorf("fixed default contains code point U+%04X, max allowed is U+00FF", r)
-				}
-			}
-			if s.object.Size != nil && len([]rune(str)) != int(*s.object.Size) {
-				return fmt.Errorf("fixed default length %d does not match size %d", len([]rune(str)), int(*s.object.Size))
+		}
+		return val
+	case "array":
+		arr, ok := val.([]any)
+		if !ok || node.items == nil {
+			return val
+		}
+		for i, item := range arr {
+			arr[i] = convertDefaultBytes(item, node.items)
+		}
+		return val
+	case "map":
+		m, ok := val.(map[string]any)
+		if !ok || node.values == nil {
+			return val
+		}
+		for k, v := range m {
+			m[k] = convertDefaultBytes(v, node.values)
+		}
+		return val
+	case "union":
+		// First-matching-branch determines the type interpretation.
+		// Reuse validateDefault as the matcher so we agree with the
+		// validate pass on which branch this default lands on — a
+		// structural-only check (e.g. "is val a string?") can pick a
+		// fixed:N branch on a string default whose rune-count
+		// doesn't fit, mutate it into a length-N []byte that no
+		// branch can encode, and surface as "union default does not
+		// match any branch" at encodeDefault time even though
+		// validateDefault accepted the schema. validateDefault is
+		// idempotent (coerceDefault on already-coerced floats is a
+		// no-op) so re-running it here is safe.
+		for _, branch := range node.branches {
+			if validateDefault(val, branch) == nil {
+				return convertDefaultBytes(val, branch)
 			}
 		}
 	}
-	return nil
+	return val
 }
 
-func validateDefaultPrimitive(val any, prim string) error {
-	switch prim {
+// validateDefault checks that a parsed JSON default value is compatible
+// with the given Avro schema. Walks *schemaNode (the resolved type
+// tree) so name-references — forward and backward — follow into the
+// real type rather than slipping through with no validation (the prior
+// aschema-canon walker hit validateDefaultPrimitive's "unknown
+// primitive" silent-accept for any name-ref). Mutates record/array/map
+// structures in place via coerceDefault, propagating float-from-string
+// coercions to nested fields reached through name-refs.
+//
+// Returns nil for a nil node — fwd-refs defer validation to finalize,
+// where the resolved node is wired up.
+func validateDefault(val any, node *schemaNode) error {
+	if node == nil {
+		return nil
+	}
+	switch node.kind {
 	case "null":
 		if val != nil {
 			return fmt.Errorf("expected null, got %T", val)
@@ -1962,32 +2472,16 @@ func validateDefaultPrimitive(val any, prim string) error {
 			return fmt.Errorf("expected boolean, got %T", val)
 		}
 	case "int":
-		f, ok := val.(float64)
-		if !ok {
-			return fmt.Errorf("expected number for int, got %T", val)
-		}
-		if _, err := floatFitsInt32(f); err != nil {
+		if _, err := defaultAsInt32(val); err != nil {
 			return fmt.Errorf("int default: %w", err)
 		}
 	case "long":
-		f, ok := val.(float64)
-		if !ok {
-			return fmt.Errorf("expected number for long, got %T", val)
-		}
-		if _, err := floatFitsInt64(f); err != nil {
+		if _, err := defaultAsInt64(val); err != nil {
 			return fmt.Errorf("long default: %w", err)
 		}
 	case "float", "double":
-		if _, ok := val.(float64); !ok {
-			// Java's schema parser accepts string defaults for float/double
-			// (e.g. "default":"3.14") and coerces them to numbers.
-			if s, ok := val.(string); ok {
-				if _, err := strconv.ParseFloat(s, 64); err != nil {
-					return fmt.Errorf("invalid string default %q for %s: %w", s, prim, err)
-				}
-			} else {
-				return fmt.Errorf("expected number for %s, got %T", prim, val)
-			}
+		if _, err := defaultAsFloat64(val); err != nil {
+			return fmt.Errorf("%s default: %w", node.kind, err)
 		}
 	case "string":
 		if _, ok := val.(string); !ok {
@@ -2003,6 +2497,86 @@ func validateDefaultPrimitive(val any, prim string) error {
 				return fmt.Errorf("bytes default contains code point U+%04X, max allowed is U+00FF", r)
 			}
 		}
+	case "enum":
+		sym, ok := val.(string)
+		if !ok {
+			return fmt.Errorf("expected string for enum default, got %T", val)
+		}
+		if len(node.symbols) > 0 && !slices.Contains(node.symbols, sym) {
+			return fmt.Errorf("enum default %q is not a member of symbols", sym)
+		}
+	case "fixed":
+		s, ok := val.(string)
+		if !ok {
+			return fmt.Errorf("expected string for fixed default, got %T", val)
+		}
+		for _, r := range s {
+			if r > 255 {
+				return fmt.Errorf("fixed default contains code point U+%04X, max allowed is U+00FF", r)
+			}
+		}
+		if len([]rune(s)) != node.size {
+			return fmt.Errorf("fixed default length %d does not match size %d", len([]rune(s)), node.size)
+		}
+	case "record":
+		m, ok := val.(map[string]any)
+		if !ok && val != nil {
+			return fmt.Errorf("expected object for record default, got %T", val)
+		}
+		if m == nil {
+			m = make(map[string]any)
+		}
+		for _, f := range node.fields {
+			fv, exists := m[f.name]
+			if !exists {
+				if !f.hasDefault {
+					return fmt.Errorf("record default missing field %q with no default", f.name)
+				}
+				continue
+			}
+			fv = coerceDefault(fv, f.node)
+			m[f.name] = fv
+			if err := validateDefault(fv, f.node); err != nil {
+				return fmt.Errorf("field %q: %w", f.name, err)
+			}
+		}
+	case "array":
+		arr, ok := val.([]any)
+		if !ok && val != nil {
+			return fmt.Errorf("expected array for array default, got %T", val)
+		}
+		for i, elem := range arr {
+			coerced := coerceDefault(elem, node.items)
+			arr[i] = coerced
+			if err := validateDefault(coerced, node.items); err != nil {
+				return fmt.Errorf("array element %d: %w", i, err)
+			}
+		}
+	case "map":
+		m, ok := val.(map[string]any)
+		if !ok && val != nil {
+			return fmt.Errorf("expected object for map default, got %T", val)
+		}
+		for k, v := range m {
+			coerced := coerceDefault(v, node.values)
+			m[k] = coerced
+			if err := validateDefault(coerced, node.values); err != nil {
+				return fmt.Errorf("map key %q: %w", k, err)
+			}
+		}
+	case "union":
+		// Avro 1.12+ relaxed the union-default rule: the default may
+		// match any branch (formerly required to match the first
+		// branch). See AVRO-3649 / PR apache/avro#2503. We walk
+		// branches in declaration order and accept the first that
+		// matches, matching Java 1.12+ and fastavro v1.7+.
+		for _, branch := range node.branches {
+			if validateDefault(val, branch) == nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("default does not match any union branch: %T(%v)", val, val)
 	}
 	return nil
 }
+

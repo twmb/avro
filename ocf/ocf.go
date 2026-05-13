@@ -68,6 +68,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"strings"
 
 	"github.com/klauspost/compress/snappy"
@@ -424,17 +425,25 @@ func (w *Writer) Flush() error {
 	return nil
 }
 
-// Close flushes any remaining items and closes the codec.
+// Close flushes any remaining items and closes the codec. The codec
+// is closed even if the writer is in a poisoned state — zstd and
+// similar codecs hold goroutines and buffers whose lifetime must be
+// bounded; mirrors Java DataFileWriter.close's try { flush } finally
+// { codec.close }.
 func (w *Writer) Close() error {
-	if w.err != nil {
+	var flushErr error
+	if w.err == nil && w.count > 0 {
+		flushErr = w.flush()
+	}
+	closeErr := w.codec.Close()
+	switch {
+	case w.err != nil:
 		return w.err
+	case flushErr != nil:
+		return flushErr
+	default:
+		return closeErr
 	}
-	if w.count > 0 {
-		if err := w.flush(); err != nil {
-			return err
-		}
-	}
-	return w.codec.Close()
 }
 
 func (w *Writer) flush() error {
@@ -507,6 +516,7 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 	}
 
 	if _, err := rws.Seek(0, io.SeekEnd); err != nil {
+		codec.Close()
 		return nil, fmt.Errorf("ocf: seeking to end of file: %w", err)
 	}
 
@@ -581,7 +591,7 @@ func readHeader(br *bufio.Reader, schemaOpts []avro.SchemaOpt) (schema *avro.Sch
 
 // NewReader creates a Reader that decodes an OCF from r. The header is read
 // immediately. Use [WithCodec] if the file uses a non-built-in codec.
-func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
+func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 	var customCodecs []Codec
 	var readerSchema *avro.Schema
 	var readerSchemaFn func(*Reader) (*avro.Schema, error)
@@ -623,6 +633,14 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	// resolveCodec succeeded; from here, any error path must release
+	// the codec's resources (zstd holds goroutines + buffers). Named
+	// return so deferred error handling sees the final err value.
+	defer func() {
+		if err != nil {
+			codec.Close()
+		}
+	}()
 
 	rd := &Reader{
 		r:             br,
@@ -636,7 +654,8 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 	// If a reader-schema callback was provided, invoke it now that the
 	// header has been parsed so it can inspect writer schema and metadata.
 	if readerSchemaFn != nil {
-		chosen, err := readerSchemaFn(rd)
+		var chosen *avro.Schema
+		chosen, err = readerSchemaFn(rd)
 		if err != nil {
 			return nil, fmt.Errorf("ocf: reader schema func: %w", err)
 		}
@@ -645,7 +664,8 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (*Reader, error) {
 
 	// Apply schema evolution if a reader schema was provided.
 	if readerSchema != nil {
-		resolved, err := avro.Resolve(schema, readerSchema)
+		var resolved *avro.Schema
+		resolved, err = avro.Resolve(schema, readerSchema)
 		if err != nil {
 			return nil, fmt.Errorf("ocf: resolving reader schema: %w", err)
 		}
@@ -707,6 +727,11 @@ func (rd *Reader) readBlock() error {
 	if size > rd.maxBlockBytes {
 		return fmt.Errorf("ocf: block size %d exceeds safety limit of %d", size, rd.maxBlockBytes)
 	}
+	// Guard against int truncation on 32-bit even when the user-configured
+	// limit allows large values (e.g. larger than MaxInt32).
+	if size > math.MaxInt {
+		return fmt.Errorf("ocf: block size %d exceeds platform max int", size)
+	}
 	compressed := make([]byte, int(size))
 	if _, err := io.ReadFull(rd.r, compressed); err != nil {
 		return fmt.Errorf("ocf: reading block data: %w", err)
@@ -718,6 +743,17 @@ func (rd *Reader) readBlock() error {
 	if sync != rd.sync {
 		return errors.New("ocf: sync marker mismatch")
 	}
+	// count == 0 still requires reading size + (zero-or-otherwise) data
+	// + 16-byte sync, per spec ("Each block consists of: count, size,
+	// objects, sync marker"). Java's DataFileStream.nextRawBlock and
+	// fastavro's _iter_avro_records both validate the sync on count=0
+	// blocks; bailing early on count alone meant a tail-truncated file
+	// with a corrupt sync (where count happens to read as 0) was
+	// silently accepted as clean EOF. After the sync is validated as a
+	// real block boundary, an empty block is end-of-stream.
+	if count == 0 {
+		return io.EOF
+	}
 	block, err := rd.codec.Decompress(compressed)
 	if err != nil {
 		return fmt.Errorf("ocf: decompressing block: %w", err)
@@ -728,6 +764,24 @@ func (rd *Reader) readBlock() error {
 }
 
 // ---------- codecs ----------
+
+// Memory bounds (security note).
+//
+// WithMaxBlockBytes bounds the *compressed* block size we read off
+// the wire. It does NOT bound the *decompressed* size. Each built-in
+// codec's Decompress allocates based on a length declared inside the
+// compressed payload, before the payload is fully validated:
+//
+//   - snappy: snappy.Decode pre-allocates from a varint header that
+//     can declare up to ~4 GiB inside a 5-byte frame.
+//   - deflate: flate.NewReader streams without a header bound;
+//     io.ReadAll grows until the stream ends.
+//   - zstd: the zstd decoder enforces its own internal cap, but the
+//     library default permits multi-GiB outputs.
+//
+// Java's SnappyCodec (ByteBuffer.allocate(Snappy.uncompressedLength
+// (...))) and fastavro's python-snappy decompress share the same
+// shape.
 
 type nullCodec struct{}
 
@@ -857,6 +911,9 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 		}
 		if count < 0 {
 			count = -count
+			if count < 0 {
+				return nil, errors.New("ocf: invalid metadata map block count")
+			}
 			// Skip block byte-size.
 			if _, err := binary.ReadVarint(r); err != nil {
 				return nil, err

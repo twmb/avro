@@ -769,7 +769,7 @@ func TestEncodeDefault(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			encoded, err := encodeDefault(tt.val, s.node)
+			encoded, err := encodeDefault(nil, tt.val, s.node)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1036,8 +1036,9 @@ func TestResolveRecordDefault(t *testing.T) {
 }
 
 func TestResolveWriterUnionReaderNonUnion(t *testing.T) {
-	// Writer is ["null","int"], reader is just "int".
-	// All writer branches must be compatible with reader.
+	// Writer is ["null","int"], reader is just "int". The null branch
+	// is incompatible with the int reader, so Resolve must fail eagerly
+	// (fail-fast posture; see checkWriterUnion's doc comment).
 	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"a","type":["null","int"]}
 	]}`)
@@ -1050,10 +1051,8 @@ func TestResolveWriterUnionReaderNonUnion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// This should fail: null branch is incompatible with int reader.
-	_, err = Resolve(writer, reader)
-	if err == nil {
-		t.Fatal("expected error for null branch incompatible with int reader")
+	if _, err := Resolve(writer, reader); err == nil {
+		t.Fatal("expected Resolve to fail eagerly: null branch is incompatible with int reader")
 	}
 }
 
@@ -1582,7 +1581,7 @@ func TestPromoteStringToBytesTyped(t *testing.T) {
 	// SetBytes slice path.
 	var b []byte
 	v := reflect.ValueOf(&b).Elem()
-	_, err := promoteStringToBytes(data, v, nil)
+	_, err := promoteStringToBytes(data, v, &slab{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1593,20 +1592,20 @@ func TestPromoteStringToBytesTyped(t *testing.T) {
 	// SemanticError (wrong type).
 	var i int
 	v = reflect.ValueOf(&i).Elem()
-	_, err = promoteStringToBytes(data, v, nil)
+	_, err = promoteStringToBytes(data, v, &slab{})
 	if err == nil {
 		t.Fatal("expected error for int target")
 	}
 
 	// readVarlong error.
-	_, err = promoteStringToBytes(nil, v, nil)
+	_, err = promoteStringToBytes(nil, v, &slab{})
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
 
 	// Short buffer after length.
 	short := appendVarlong(nil, 100) // length=100 but no data
-	_, err = promoteStringToBytes(short, v, nil)
+	_, err = promoteStringToBytes(short, v, &slab{})
 	if err == nil {
 		t.Fatal("expected error for short buffer")
 	}
@@ -1620,7 +1619,7 @@ func TestPromoteBytesToStringTyped(t *testing.T) {
 	// SetString path.
 	var s string
 	v := reflect.ValueOf(&s).Elem()
-	_, err := promoteBytesToString(data, v, nil)
+	_, err := promoteBytesToString(data, v, &slab{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1631,20 +1630,20 @@ func TestPromoteBytesToStringTyped(t *testing.T) {
 	// SemanticError (wrong type).
 	var i int
 	v = reflect.ValueOf(&i).Elem()
-	_, err = promoteBytesToString(data, v, nil)
+	_, err = promoteBytesToString(data, v, &slab{})
 	if err == nil {
 		t.Fatal("expected error for int target")
 	}
 
 	// readVarlong error.
-	_, err = promoteBytesToString(nil, v, nil)
+	_, err = promoteBytesToString(nil, v, &slab{})
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
 
 	// Short buffer after length.
 	short := appendVarlong(nil, 100)
-	_, err = promoteBytesToString(short, v, nil)
+	_, err = promoteBytesToString(short, v, &slab{})
 	if err == nil {
 		t.Fatal("expected error for short buffer")
 	}
@@ -2005,7 +2004,7 @@ func TestEncodeDefaultErrors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = encodeDefault(tt.val, s.node)
+			_, err = encodeDefault(nil, tt.val, s.node)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -2016,7 +2015,7 @@ func TestEncodeDefaultErrors(t *testing.T) {
 func TestEncodeDefaultUnsupportedType(t *testing.T) {
 	// Unknown node kind.
 	node := &schemaNode{kind: "unknown_kind"}
-	_, err := encodeDefault(nil, node)
+	_, err := encodeDefault(nil, nil, node)
 	if err == nil {
 		t.Fatal("expected error for unsupported type")
 	}
@@ -2024,7 +2023,7 @@ func TestEncodeDefaultUnsupportedType(t *testing.T) {
 
 func TestEncodeDefaultEmptyUnion(t *testing.T) {
 	node := &schemaNode{kind: "union", branches: nil}
-	_, err := encodeDefault(nil, node)
+	_, err := encodeDefault(nil, nil, node)
 	if err == nil {
 		t.Fatal("expected error for empty union")
 	}
@@ -2043,7 +2042,7 @@ func TestPromoteStringToBytesNegativeLength(t *testing.T) {
 	data := appendVarlong(nil, -1)
 	var b []byte
 	v := reflect.ValueOf(&b).Elem()
-	_, err := promoteStringToBytes(data, v, nil)
+	_, err := promoteStringToBytes(data, v, &slab{})
 	if err == nil {
 		t.Fatal("expected error for negative length")
 	}
@@ -2053,7 +2052,7 @@ func TestPromoteBytesToStringNegativeLength(t *testing.T) {
 	data := appendVarlong(nil, -1)
 	var s string
 	v := reflect.ValueOf(&s).Elem()
-	_, err := promoteBytesToString(data, v, nil)
+	_, err := promoteBytesToString(data, v, &slab{})
 	if err == nil {
 		t.Fatal("expected error for negative length")
 	}
@@ -2240,7 +2239,7 @@ func TestResolveDeserMapNilInit(t *testing.T) {
 
 func TestEncodeDefaultArrayNil(t *testing.T) {
 	node := &schemaNode{kind: "array", items: &schemaNode{kind: "int"}}
-	encoded, err := encodeDefault(nil, node)
+	encoded, err := encodeDefault(nil, nil, node)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2252,7 +2251,7 @@ func TestEncodeDefaultArrayNil(t *testing.T) {
 
 func TestEncodeDefaultMapNil(t *testing.T) {
 	node := &schemaNode{kind: "map", values: &schemaNode{kind: "int"}}
-	encoded, err := encodeDefault(nil, node)
+	encoded, err := encodeDefault(nil, nil, node)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2265,7 +2264,7 @@ func TestEncodeDefaultMapNil(t *testing.T) {
 func TestEncodeDefaultArrayItemError(t *testing.T) {
 	node := &schemaNode{kind: "array", items: &schemaNode{kind: "int"}}
 	// Array with wrong-type item.
-	_, err := encodeDefault([]any{"not_a_number"}, node)
+	_, err := encodeDefault(nil, []any{"not_a_number"}, node)
 	if err == nil {
 		t.Fatal("expected error for wrong item type in array")
 	}
@@ -2274,7 +2273,7 @@ func TestEncodeDefaultArrayItemError(t *testing.T) {
 func TestEncodeDefaultMapValueError(t *testing.T) {
 	node := &schemaNode{kind: "map", values: &schemaNode{kind: "int"}}
 	// Map with wrong-type value.
-	_, err := encodeDefault(map[string]any{"k": "not_a_number"}, node)
+	_, err := encodeDefault(nil, map[string]any{"k": "not_a_number"}, node)
 	if err == nil {
 		t.Fatal("expected error for wrong value type in map")
 	}
@@ -2289,7 +2288,7 @@ func TestEncodeDefaultRecordNilVal(t *testing.T) {
 		},
 	}
 	// nil val → uses field defaults.
-	encoded, err := encodeDefault(nil, node)
+	encoded, err := encodeDefault(nil, nil, node)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2316,7 +2315,7 @@ func TestEncodeDefaultRecordMissingFieldNoDefault(t *testing.T) {
 			{name: "a", node: &schemaNode{kind: "int"}, hasDefault: false},
 		},
 	}
-	_, err := encodeDefault(map[string]any{}, node)
+	_, err := encodeDefault(nil, map[string]any{}, node)
 	if err == nil {
 		t.Fatal("expected error for missing field with no default")
 	}
@@ -2331,7 +2330,7 @@ func TestEncodeDefaultRecordFieldSubError(t *testing.T) {
 		},
 	}
 	// Provide wrong type for field.
-	_, err := encodeDefault(map[string]any{"a": "not_a_number"}, node)
+	_, err := encodeDefault(nil, map[string]any{"a": "not_a_number"}, node)
 	if err == nil {
 		t.Fatal("expected error for wrong field type")
 	}
@@ -2347,7 +2346,7 @@ func TestEncodeDefaultRecordFieldDefault(t *testing.T) {
 		},
 	}
 	// Provide "b" but not "a" — "a" has a default.
-	encoded, err := encodeDefault(map[string]any{"b": "hello"}, node)
+	encoded, err := encodeDefault(nil, map[string]any{"b": "hello"}, node)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2601,14 +2600,16 @@ func TestResolveMapError(t *testing.T) {
 }
 
 func TestResolveWriterUnionError(t *testing.T) {
-	// Call resolveWriterUnion directly: a branch doesn't resolve.
+	// Call resolveWriterUnion directly: any incompatible branch causes
+	// Resolve to fail eagerly (fail-fast posture; see resolveWriterUnion
+	// doc comment).
 	r := &schemaNode{kind: "int"}
 	w := &schemaNode{kind: "union", branches: []*schemaNode{
 		{kind: "boolean"},
 	}}
 	_, err := resolveWriterUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
 	if err == nil {
-		t.Fatal("expected error for incompatible writer union branch")
+		t.Fatal("expected error when a writer branch is incompatible")
 	}
 }
 

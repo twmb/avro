@@ -2368,3 +2368,197 @@ func TestDurationBytesRoundTrip(t *testing.T) {
 		t.Errorf("round-trip: got %+v, want %+v", got, d)
 	}
 }
+
+// TestRegression_SerArrayFloatSilentInf locks in that the specialized
+// array<float> ser path rejects values that would silently clamp to ±Inf,
+// matching serFloat (top-level) and usFloat (unsafe). Pre-fix the
+// serArray.serFloat / serMap.serFloat specializations were the only
+// float-encode paths missing this guard, so encoding []float64{1e40}
+// into array<float> silently emitted +Inf bits on the wire.
+func TestRegression_SerArrayFloatSilentInf(t *testing.T) {
+	s := MustParse(`{"type":"array","items":"float"}`)
+	huge := 1e40
+	if !math.IsInf(float64(float32(huge)), 1) {
+		t.Fatalf("test assumption failed: float32(1e40) should be +Inf")
+	}
+	got, err := s.AppendEncode(nil, []float64{huge})
+	if err == nil {
+		t.Fatalf("expected float32 overflow error encoding []float64{1e40} into array<float>, got nil; encoded bytes = %x", got)
+	}
+}
+
+// TestRegression_SerMapFloatSilentInf is the map<float> parity test.
+func TestRegression_SerMapFloatSilentInf(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"float"}`)
+	got, err := s.AppendEncode(nil, map[string]float64{"k": 1e40})
+	if err == nil {
+		t.Fatalf("expected float32 overflow error encoding map[string]float64{k:1e40} into map<float>, got nil; encoded bytes = %x", got)
+	}
+}
+
+// TestRegression_SerArrayFloatAcceptsInt verifies that the specialized
+// array<float> path accepts integer elements (with the float32-precision
+// bound), matching the single-value serFloat path. Pre-fix it errored
+// with "cannot use int64 with Avro type float" for any int slice.
+func TestRegression_SerArrayFloatAcceptsInt(t *testing.T) {
+	s := MustParse(`{"type":"array","items":"float"}`)
+	if _, err := s.AppendEncode(nil, []int64{1, 2, 3}); err != nil {
+		t.Fatalf("expected []int64{1,2,3} to encode as array<float>, got %v", err)
+	}
+	// And rejects values exceeding float32's 24-bit precision.
+	if _, err := s.AppendEncode(nil, []int64{1 << 25}); err == nil {
+		t.Fatalf("expected []int64{1<<25} to error on float32 precision bound")
+	}
+}
+
+// TestRegression_SerArrayDoubleAcceptsInt verifies array<double> accepts
+// integer elements with the float64-precision bound.
+func TestRegression_SerArrayDoubleAcceptsInt(t *testing.T) {
+	s := MustParse(`{"type":"array","items":"double"}`)
+	if _, err := s.AppendEncode(nil, []int64{1, 2, 3}); err != nil {
+		t.Fatalf("expected []int64{1,2,3} to encode as array<double>, got %v", err)
+	}
+	if _, err := s.AppendEncode(nil, []int64{1 << 54}); err == nil {
+		t.Fatalf("expected []int64{1<<54} to error on float64 precision bound")
+	}
+}
+
+// TestSafeUnsafeFloat32OverflowParity locks in that the unsafe fast path
+// (struct field of type float64 → Avro float) rejects values that would
+// silently clamp to ±Inf, matching serFloat's behavior. Pre-fix the unsafe
+// path encoded math.Float32bits(±Inf) without error; the safe path errored.
+func TestSafeUnsafeFloat32OverflowParity(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"v","type":"float"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const huge = math.MaxFloat64
+
+	// Safe path via map[string]any.
+	if _, err := s.AppendEncode(nil, map[string]any{"v": huge}); err == nil {
+		t.Fatalf("safe path: expected overflow error for %g, got nil", huge)
+	}
+
+	// Unsafe fast path via struct.
+	type R struct {
+		V float64 `avro:"v"`
+	}
+	if _, err := s.AppendEncode(nil, &R{V: huge}); err == nil {
+		t.Fatalf("unsafe path: expected overflow error for %g (parity with safe path), got nil", huge)
+	}
+}
+
+// TestSafeUnsafeUint64LongOverflowParity locks in that the unsafe fast path
+// rejects uint64 values that exceed math.MaxInt64 when encoding to Avro
+// long, matching serLong. Pre-fix the unsafe path silently wrapped to a
+// negative int64.
+func TestSafeUnsafeUint64LongOverflowParity(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Safe path: map[string]any with uint64 value.
+	if _, err := s.AppendEncode(nil, map[string]any{"v": uint64(math.MaxUint64)}); err == nil {
+		t.Fatalf("safe path: expected overflow error for MaxUint64, got nil")
+	}
+
+	// Unsafe fast path: struct field uint64.
+	type R struct {
+		V uint64 `avro:"v"`
+	}
+	if _, err := s.AppendEncode(nil, &R{V: math.MaxUint64}); err == nil {
+		t.Fatalf("unsafe path: expected overflow error for MaxUint64 (parity with safe path), got nil")
+	}
+}
+
+// textBytesMarshaler is a []byte-kind type that ALSO implements
+// TextMarshaler / TextUnmarshaler. The two precedence orders disagree
+// on it: a []byte-first order encodes the raw bytes, a TextMarshaler-
+// first order encodes the text. Used by the array/map/JSON parity
+// regression tests below to lock in the correct precedence.
+type textBytesMarshaler []byte
+
+func (b textBytesMarshaler) MarshalText() ([]byte, error) {
+	return []byte("TEXT:" + string(b)), nil
+}
+
+func (b *textBytesMarshaler) UnmarshalText(text []byte) error {
+	*b = textBytesMarshaler("UNTEXT:" + string(text))
+	return nil
+}
+
+// TestRegression_SerArrayStringTextMarshaler locks in that the
+// specialized array<string> ser path resolves a []byte-kind value that
+// also implements TextMarshaler via its text representation, not its
+// raw bytes. Pre-fix, serArray.serString diverged from the scalar
+// serString and silently encoded the raw bytes; the appendAvroString
+// helper consolidated all three sites.
+func TestRegression_SerArrayStringTextMarshaler(t *testing.T) {
+	s := MustParse(`{"type":"array","items":"string"}`)
+	encoded, err := s.AppendEncode(nil, []textBytesMarshaler{textBytesMarshaler("hello")})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	out := MustParse(`{"type":"array","items":"string"}`)
+	var got []string
+	if _, err := out.Decode(encoded, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 || got[0] != "TEXT:hello" {
+		t.Fatalf("got %v, want [TEXT:hello]; the array path encoded raw bytes instead of MarshalText output", got)
+	}
+}
+
+// TestRegression_SerMapStringTextMarshaler is the map<string> parity
+// test for the same precedence rule.
+func TestRegression_SerMapStringTextMarshaler(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"string"}`)
+	encoded, err := s.AppendEncode(nil, map[string]textBytesMarshaler{"k": textBytesMarshaler("hello")})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	out := MustParse(`{"type":"map","values":"string"}`)
+	var got map[string]string
+	if _, err := out.Decode(encoded, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got["k"] != "TEXT:hello" {
+		t.Fatalf("got %q, want %q; the map path encoded raw bytes instead of MarshalText output", got["k"], "TEXT:hello")
+	}
+}
+
+// TestRegression_JSONEncodeStringTextMarshaler locks in that the JSON
+// encoder for "string" picks TextMarshaler over the []byte fallback for
+// types that implement both. Pre-fix, appendAvroJSON's "string" case
+// checked []byte before TextMarshaler, so net.IP-style values JSON-
+// encoded as their raw bytes (interpreted as UTF-8) instead of their
+// text form.
+func TestRegression_JSONEncodeStringTextMarshaler(t *testing.T) {
+	s := MustParse(`"string"`)
+	v := textBytesMarshaler("hello")
+	got, err := s.EncodeJSON(v)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	const want = `"TEXT:hello"`
+	if string(got) != want {
+		t.Fatalf("got %s, want %s; JSON encoder used []byte fallback instead of MarshalText", got, want)
+	}
+}
+
+// TestRegression_JSONDecodeStringTextUnmarshaler locks in that the JSON
+// decoder for "string" routes into TextUnmarshaler when the target
+// implements it, mirroring deserString. Pre-fix, decodeString skipped
+// TextUnmarshaler entirely and would either set the raw bytes (for
+// []byte targets) or error.
+func TestRegression_JSONDecodeStringTextUnmarshaler(t *testing.T) {
+	s := MustParse(`"string"`)
+	var v textBytesMarshaler
+	if err := s.DecodeJSON([]byte(`"hello"`), &v); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(v) != "UNTEXT:hello" {
+		t.Fatalf("got %q, want %q; JSON decoder skipped TextUnmarshaler", string(v), "UNTEXT:hello")
+	}
+}

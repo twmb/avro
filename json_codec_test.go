@@ -24,7 +24,7 @@ func TestEncodeJSON(t *testing.T) {
 		{"float", `"float"`, float32(1.5), `1.5`},
 		{"double", `"double"`, float64(3.14), `3.14`},
 		{"string", `"string"`, "hello", `"hello"`},
-		{"bytes", `"bytes"`, []byte{0x00, 0xFF, 0x41}, `"\u0000\u00FFA"`},
+		{"bytes", `"bytes"`, []byte{0x00, 0xFF, 0x41}, `"\u0000\u00ffA"`},
 		{"enum", `{"type":"enum","name":"Color","symbols":["RED","GREEN"]}`, "RED", `"RED"`},
 		{
 			"fixed",
@@ -2322,18 +2322,22 @@ func TestLogicalTypeRoundTrips(t *testing.T) {
 			json:   "1742378400000000000",
 		},
 		{
+			// Spec / Java / fastavro form: unscaled-int (33 → 0x21)
+			// emitted as a codepoint-mapped Avro JSON byte string.
 			name:   "decimal-bytes",
 			schema: `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
 			value:  json.Number("0.33"),
 			want:   new(big.Rat).SetFrac64(33, 100),
-			json:   "0.33",
+			json:   `"!"`,
 		},
 		{
+			// Fixed-size variant: 8 bytes, sign-extended for unscaled=33,
+			// so seven leading 0x00 codepoints + literal '!' for 0x21.
 			name:   "decimal-fixed",
 			schema: `{"type":"fixed","name":"dec","size":8,"logicalType":"decimal","precision":10,"scale":2}`,
 			value:  json.Number("0.33"),
 			want:   new(big.Rat).SetFrac64(33, 100),
-			json:   "0.33",
+			json:   `"\u0000\u0000\u0000\u0000\u0000\u0000\u0000!"`,
 		},
 		{
 			name:   "uuid",
@@ -2552,8 +2556,9 @@ func TestEncodeJSONLogical(t *testing.T) {
 		// time-millis: int path from time.Time (hour/min/sec derived)
 		{"time-millis from time.Time", `{"type":"int","logicalType":"time-millis"}`, tm},
 		{"time-millis from time.Duration", `{"type":"int","logicalType":"time-millis"}`, dur},
-		// time-micros: int64 path from time.Duration
+		// time-micros: int64 path from time.Duration / time.Time
 		{"time-micros from time.Duration", `{"type":"long","logicalType":"time-micros"}`, dur},
+		{"time-micros from time.Time", `{"type":"long","logicalType":"time-micros"}`, tm},
 		// timestamp variants from time.Time
 		{"timestamp-millis from time.Time", `{"type":"long","logicalType":"timestamp-millis"}`, tm},
 		{"timestamp-micros from time.Time", `{"type":"long","logicalType":"timestamp-micros"}`, tm},

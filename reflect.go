@@ -89,14 +89,10 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 //
 // Caller contract: v.Kind() must be reflect.Interface. Concrete-kind v
 // is rejected with a SemanticError rather than silently calling Set.
-// The previous NumMethod()==0 shortcut would have spuriously
-// short-circuited on any methodless concrete type (e.g. [16]byte,
-// time.Duration), so a future change that produced an rv of a
-// mismatched type would have panicked on Set. Concrete-target paths
-// must split the dispatch at the call site — see deserFixedUUIDReflect
-// (Interface vs isUUIDType arms), deserTimeMillis (Interface vs
-// durationType), and deserDuration (Interface vs avroDurationType) for
-// the pattern.
+// Concrete-target paths must split the dispatch at the call site — see
+// deserFixedUUIDReflect (Interface vs isUUIDType arms), deserTimeMillis
+// (Interface vs durationType), and deserDuration (Interface vs
+// avroDurationType) for the pattern.
 //
 // Use this on the cold paths (logical types, promoted decoders, resolved
 // records, etc.) where the per-call function-boundary cost doesn't matter.
@@ -128,6 +124,20 @@ func setIface(v, rv reflect.Value, avroType string) error {
 		return nil
 	}
 	return &SemanticError{GoType: v.Type(), AvroType: avroType}
+}
+
+// mapKeyAs returns key as a reflect.Value typed to match mapType.Key().
+// Fast-path identity when the types already match (the common
+// map[string]V case); slow-path Convert() for named-string-key maps
+// (e.g. `type UserID string; map[UserID]V`). Without this conversion,
+// reflect.MapIndex / SetMapIndex panics with "value of type string is
+// not assignable to type X". Used by every record-as-map encode and
+// every map-decode site that builds an Avro map with string keys.
+func mapKeyAs(mapType reflect.Type, key reflect.Value) reflect.Value {
+	if mapType.Key() == key.Type() {
+		return key
+	}
+	return key.Convert(mapType.Key())
 }
 
 // fieldByIndex is like reflect.Value.FieldByIndex but allocates nil embedded

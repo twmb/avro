@@ -828,7 +828,7 @@ func TestValidateLogical(t *testing.T) {
 		// decimal
 		{"decimal ok bytes", aobject{Type: "bytes", Logical: "decimal", Precision: &somePrec}, false},
 		{"decimal ok fixed", aobject{Type: "fixed", Logical: "decimal", Precision: &somePrec, Size: &intSize}, false},
-		{"decimal missing precision", aobject{Type: "bytes", Logical: "decimal"}, false},
+		{"decimal missing precision", aobject{Type: "bytes", Logical: "decimal"}, true},
 		{"decimal wrong type", aobject{Type: "int", Logical: "decimal", Precision: &somePrec}, false},
 
 		// uuid

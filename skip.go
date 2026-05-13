@@ -47,16 +47,9 @@ func skipDouble(src []byte, _ *slab) ([]byte, error) {
 }
 
 func skipBytes(src []byte, _ *slab) ([]byte, error) {
-	length, src, err := readVarlong(src)
+	n, src, err := readLength(src, "bytes")
 	if err != nil {
 		return nil, err
-	}
-	if length < 0 {
-		return nil, fmt.Errorf("invalid negative bytes length %d", length)
-	}
-	n := int(length)
-	if len(src) < n {
-		return nil, &ShortBufferError{Type: "bytes", Need: n, Have: len(src)}
 	}
 	return src[n:], nil
 }
@@ -110,6 +103,7 @@ func skipRecord(w *schemaNode) skipfn {
 
 func skipArray(w *schemaNode) skipfn {
 	itemSkip := buildSkip(w.items)
+	minItemBytes := schemaMinBytes(w.items)
 	return func(src []byte, sl *slab) ([]byte, error) {
 		if sl.depth >= maxDepth {
 			return nil, errTooDeep
@@ -117,6 +111,7 @@ func skipArray(w *schemaNode) skipfn {
 		sl.depth++
 		defer func() { sl.depth-- }()
 		var err error
+		var totalItems int64
 		for {
 			var count int64
 			count, src, err = readVarlong(src)
@@ -137,12 +132,16 @@ func skipArray(w *schemaNode) skipfn {
 				if err != nil {
 					return nil, err
 				}
-				if int(byteSize) > len(src) {
+				if byteSize < 0 || byteSize > int64(len(src)) {
 					return nil, &ShortBufferError{Type: "array block", Need: int(byteSize), Have: len(src)}
 				}
-				src = src[byteSize:]
+				src = src[int(byteSize):]
 				continue
 			}
+			if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
+				return nil, err
+			}
+			totalItems += count
 			for range int(count) {
 				if src, err = itemSkip(src, sl); err != nil {
 					return nil, err
@@ -180,10 +179,10 @@ func skipMap(w *schemaNode) skipfn {
 				if err != nil {
 					return nil, err
 				}
-				if int(byteSize) > len(src) {
+				if byteSize < 0 || byteSize > int64(len(src)) {
 					return nil, &ShortBufferError{Type: "map block", Need: int(byteSize), Have: len(src)}
 				}
-				src = src[byteSize:]
+				src = src[int(byteSize):]
 				continue
 			}
 			for range int(count) {

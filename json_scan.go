@@ -36,6 +36,17 @@ func (s *jsonScanner) peek() byte {
 	return s.data[s.pos]
 }
 
+// peekAt returns the byte `n` positions past the current
+// non-whitespace cursor, without consuming. Used to disambiguate
+// negative-number vs bare "-Infinity" at the start of a token.
+func (s *jsonScanner) peekAt(n int) byte {
+	s.skipWhitespace()
+	if s.pos+n >= len(s.data) {
+		return 0
+	}
+	return s.data[s.pos+n]
+}
+
 func (s *jsonScanner) expect(b byte) error {
 	s.skipWhitespace()
 	if s.pos >= len(s.data) {
@@ -55,6 +66,37 @@ func (s *jsonScanner) consumeNull() error {
 	}
 	s.pos += 4
 	return nil
+}
+
+// consumeBareSpecialFloat consumes a bare JSON token shaped like an
+// optional leading '-' followed by an alphabetic run. The token's
+// content is returned verbatim for parseSpecialFloat to validate, so
+// casing leniency (NaN/nan/NAN, Infinity/inf/Inf, etc.) is identical
+// between this bare path and the quoted-string path in decodeFloat/
+// decodeDouble — preventing a quoted-vs-bare casing-parity gap.
+func (s *jsonScanner) consumeBareSpecialFloat() (string, error) {
+	s.skipWhitespace()
+	if s.pos >= len(s.data) {
+		return "", fmt.Errorf("avro json: expected bare NaN/Infinity at offset %d", s.pos)
+	}
+	start := s.pos
+	if s.data[s.pos] == '-' {
+		s.pos++
+	}
+	tokenStart := s.pos
+	for s.pos < len(s.data) {
+		c := s.data[s.pos]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			s.pos++
+			continue
+		}
+		break
+	}
+	if s.pos == tokenStart {
+		s.pos = start
+		return "", fmt.Errorf("avro json: expected bare NaN/Infinity at offset %d", start)
+	}
+	return string(s.data[start:s.pos]), nil
 }
 
 func (s *jsonScanner) consumeBool() (bool, error) {
@@ -249,6 +291,21 @@ func parseJSONInt64(b []byte) (int64, error) {
 	if i >= len(b) {
 		return 0, fmt.Errorf("avro json: invalid number %q", b)
 	}
+	// Per-digit pre-multiply guard. The naive "n*10+d wrapped if it
+	// went down" check has a gap once n ≈ 2^64/9: n*10+d can wrap
+	// mod 2^64 to a value still ≥ prev (e.g. parsing
+	// "20496382304121724020" lands at 2049638230412172404 with no
+	// post-multiply wrap visible). Java's JsonParser.getLongValue
+	// throws InputCoercionException; goavro uses strconv.ParseInt;
+	// twmb/avro now does an equivalent pre-multiply bound.
+	//
+	// MaxInt64 = 9223372036854775807 → cutoff 922337203685477580, last digit 7.
+	// |MinInt64| = 9223372036854775808 → same cutoff, last digit 8.
+	const cutoff = uint64(math.MaxInt64) / 10
+	maxDigit := uint64(7)
+	if neg {
+		maxDigit = 8
+	}
 	var n uint64
 	for ; i < len(b); i++ {
 		c := b[i]
@@ -267,34 +324,49 @@ func parseJSONInt64(b []byte) (int64, error) {
 		if c < '0' || c > '9' {
 			return 0, fmt.Errorf("avro json: invalid number %q", b)
 		}
-		prev := n
-		n = n*10 + uint64(c-'0')
-		if n < prev {
-			return 0, fmt.Errorf("avro json: value %q overflows", b)
-		}
-	}
-	if neg {
-		if n > 1<<63 {
+		d := uint64(c - '0')
+		if n > cutoff || (n == cutoff && d > maxDigit) {
 			return 0, fmt.Errorf("avro json: value %q overflows int64", b)
 		}
-		return -int64(n), nil
+		n = n*10 + d
 	}
-	if n > math.MaxInt64 {
-		return 0, fmt.Errorf("avro json: value %q overflows int64", b)
+	if neg {
+		// -int64(1<<63) wraps to MinInt64 in two's complement, which
+		// is the correct value for the input "-9223372036854775808".
+		return -int64(n), nil
 	}
 	return int64(n), nil
 }
 
 // walkJSONEscapes iterates raw JSON string content (between quotes),
-// resolving escape sequences and calling emit for each code point.
-// This is the single implementation of JSON escape handling, shared
-// by resolveJSONEscapes (for strings) and scanAvroJSONBytes (for bytes).
+// decoding escape sequences and UTF-8 multi-byte sequences into runes,
+// then calling emit for each code point. Used by both resolveJSONEscapes
+// (Avro string) and scanAvroJSONBytes (Avro bytes/fixed).
+//
+// The UTF-8 decoding is required for spec parity with Java/fastavro.
+// Per the Avro 1.12 JSON spec, "each character represents one byte"
+// and "Unicode code points 0-255 are mapped to unsigned 8-bit byte
+// values 0-255". Both Java and fastavro decode the JSON string into
+// Unicode characters first (Jackson getText() / Python str), then map
+// code points to bytes. A byte-by-byte walker would (wrongly) emit
+// JSON literal "é" (UTF-8 bytes c3 a9) as two output bytes [0xC3, 0xA9]
+// rather than the spec-correct one byte [0xE9].
 func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
-	for i := 0; i < len(raw); i++ {
+	for i := 0; i < len(raw); {
 		if raw[i] != '\\' {
-			if err := emit(rune(raw[i])); err != nil {
+			// Decode multi-byte UTF-8 as a single rune so the round
+			// trip preserves the value. For invalid UTF-8 (e.g. lone
+			// 0x9e), DecodeRune returns RuneError with size 1 — emit
+			// the raw byte as its codepoint (Postel; the encoder
+			// canonicalizes on output).
+			r, size := utf8.DecodeRune(raw[i:])
+			if r == utf8.RuneError && size == 1 {
+				r = rune(raw[i])
+			}
+			if err := emit(r); err != nil {
 				return err
 			}
+			i += size
 			continue
 		}
 		i++
@@ -341,6 +413,7 @@ func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 		if err := emit(r); err != nil {
 			return err
 		}
+		i++
 	}
 	return nil
 }
@@ -349,7 +422,7 @@ func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 // producing a UTF-8 Go string.
 func resolveJSONEscapes(raw []byte) (string, error) {
 	var buf []byte
-	err := walkJSONStringEscapes(raw, func(r rune) error {
+	err := walkJSONEscapes(raw, func(r rune) error {
 		buf = utf8.AppendRune(buf, r)
 		return nil
 	})
@@ -359,78 +432,6 @@ func resolveJSONEscapes(raw []byte) (string, error) {
 	return string(buf), nil
 }
 
-// walkJSONStringEscapes is like walkJSONEscapes but decodes raw bytes
-// between escape sequences as UTF-8 runes (rather than emitting each
-// byte as its own rune). Used for strings — JSON requires valid UTF-8,
-// and treating multi-byte UTF-8 sequences as separate codepoints would
-// corrupt the value (the round-trip "耼\x00" → "耼" → "è¼\x00"
-// bug). The byte-by-byte walker is preserved for bytes/fixed decoding,
-// where each codepoint maps 1:1 to a byte.
-func walkJSONStringEscapes(raw []byte, emit func(r rune) error) error {
-	for i := 0; i < len(raw); {
-		if raw[i] != '\\' {
-			// Decode multi-byte UTF-8 as a single rune so the round
-			// trip preserves the value. For invalid UTF-8 (e.g. lone
-			// 0x9e), DecodeRune returns RuneError with size 1 — emit
-			// the raw byte as its codepoint to stay liberal on input
-			// (Postel). The encoder canonicalizes on output.
-			r, size := utf8.DecodeRune(raw[i:])
-			if r == utf8.RuneError && size == 1 {
-				r = rune(raw[i])
-			}
-			if err := emit(r); err != nil {
-				return err
-			}
-			i += size
-			continue
-		}
-		i++
-		if i >= len(raw) {
-			return fmt.Errorf("avro json: unterminated escape")
-		}
-		var r rune
-		switch raw[i] {
-		case '"', '\\', '/':
-			r = rune(raw[i])
-		case 'b':
-			r = '\b'
-		case 'f':
-			r = '\f'
-		case 'n':
-			r = '\n'
-		case 'r':
-			r = '\r'
-		case 't':
-			r = '\t'
-		case 'u':
-			if i+4 >= len(raw) {
-				return fmt.Errorf("avro json: short \\u escape")
-			}
-			var err error
-			r, err = parseHex4(raw[i+1 : i+5])
-			if err != nil {
-				return err
-			}
-			i += 4
-			if r >= 0xD800 && r <= 0xDBFF && i+2 < len(raw) && raw[i+1] == '\\' && raw[i+2] == 'u' {
-				if i+6 < len(raw) {
-					r2, err := parseHex4(raw[i+3 : i+7])
-					if err == nil && r2 >= 0xDC00 && r2 <= 0xDFFF {
-						r = 0x10000 + (r-0xD800)*0x400 + (r2 - 0xDC00)
-						i += 6
-					}
-				}
-			}
-		default:
-			r = rune(raw[i])
-		}
-		if err := emit(r); err != nil {
-			return err
-		}
-		i++
-	}
-	return nil
-}
 
 // scanAvroJSONBytes resolves a raw JSON string content into Avro bytes.
 // In Avro's convention, each code point maps to a single byte (≤ 255).

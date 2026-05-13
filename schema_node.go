@@ -382,14 +382,28 @@ var fieldReservedKeys = map[string]bool{
 // lookupCI looks up key k in m, matching case-insensitively. Mirrors
 // encoding/json's struct field matching so schemas with non-canonical
 // casing ("tYpe" instead of "type") round-trip through Root/Schema.
+// When multiple keys collide case-insensitively (e.g. both "tYpe" and
+// "TYpe"), the smallest by Unicode code-point wins so the result is
+// deterministic — bare `for k := range m` was non-deterministic per
+// Go's randomized map iteration, which made Root() return different
+// branches on different calls for the same parsed Schema.
 func lookupCI(m map[string]any, key string) (any, bool) {
 	if v, ok := m[key]; ok {
 		return v, true
 	}
-	for k, v := range m {
-		if strings.EqualFold(k, key) {
-			return v, true
+	var pickKey string
+	var found bool
+	for k := range m {
+		if !strings.EqualFold(k, key) {
+			continue
 		}
+		if !found || k < pickKey {
+			pickKey = k
+			found = true
+		}
+	}
+	if found {
+		return m[pickKey], true
 	}
 	return nil, false
 }

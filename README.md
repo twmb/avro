@@ -279,8 +279,8 @@ Logical types decode to their natural Go equivalents:
 | Logical Type | Avro Type | Encode | Decode |
 |---|---|---|---|
 | date | int | time.Time, RFC 3339 or YYYY-MM-DD string, or int | time.Time (UTC) |
-| time-millis | int | time.Duration or int | time.Duration |
-| time-micros | long | time.Duration or int | time.Duration |
+| time-millis | int | time.Duration, time.Time (lossy †), or int | time.Duration or time.Time (lossy †) |
+| time-micros | long | time.Duration, time.Time (lossy †), or int | time.Duration or time.Time (lossy †) |
 | timestamp-millis | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | timestamp-micros | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
 | timestamp-nanos | long | time.Time, RFC 3339 string, or int | time.Time (UTC) |
@@ -290,12 +290,31 @@ Logical types decode to their natural Go equivalents:
 | uuid (string) | string | [16]byte or string | string into any; [16]byte or string into typed target |
 | uuid (fixed(16)) | fixed(16) | [16]byte, []byte, or hex-dash string | [16]byte into any or [16]byte target; string into string target |
 | decimal | bytes or fixed | *big.Rat, float64, numeric string, json.Number, or underlying type | *big.Rat, float64/float32, numeric string, json.Number, or underlying type |
+| big-decimal | bytes | *big.Rat, float64, numeric string, json.Number | *big.Rat, float64/float32, numeric string, json.Number |
 | duration | fixed(12) | avro.Duration or underlying type | avro.Duration or underlying type |
 
 When encoding, timestamp and date fields accept RFC 3339 strings, and decimal
 fields accept float64 and numeric strings (e.g. "3.14"). Values that don't
 match the expected format fall through to the underlying type's encoder, which
 will return an error.
+
+† **time-millis / time-micros with `time.Time`** is a convenience escape hatch
+for users whose Go data already lives in `time.Time`. Avro's `time-millis` and
+`time-micros` logical types are time-of-day only — the wire bytes physically
+cannot represent a date or zone. On encode, only the wall-clock fields
+(hour/minute/second/nanosecond) are written; year/month/day/location are
+silently discarded. On decode into a `time.Time` target, the wire value is
+materialized at the Unix epoch (`1970-01-01 UTC`) plus the time-of-day. A
+round-trip through `time.Time` therefore preserves the time-of-day but
+resets the date and zone: `2024-01-15 12:34:56 PST` → wire → `1970-01-01
+12:34:56 UTC`. If round-trip date fidelity matters, use `timestamp-millis` /
+`timestamp-micros` (which preserve the full instant) or convert to and from
+`time.Duration` explicitly. `time.Duration` is always lossless for these
+types.
+
+big-decimal carries no schema-level precision or scale; scale is derived
+per value, and rationals with no finite decimal expansion (e.g.
+`big.NewRat(1, 3)`) return an error.
 
 Unknown logical types are silently ignored per the Avro spec, and the
 underlying type is used as-is.
@@ -555,6 +574,13 @@ Built-in codecs: **null** (default, no compression), **deflate**
 (`DeflateCodec`), **snappy** (`SnappyCodec`), and **zstandard** (`ZstdCodec`).
 Custom codecs can be provided via the `Codec` interface.
 
+**Memory bounds.** `WithMaxBlockBytes` (default 64 MiB) caps the *compressed*
+block size, not the *decompressed* size. A maliciously-crafted block can
+declare a large decompressed length that the codec (snappy/deflate/zstd)
+pre-allocates before validating the payload. This matches Java and fastavro
+behavior. For OCF read from untrusted sources, bound memory at the transport
+or process layer (request size cap, cgroup limit).
+
 ### Appending
 
 `NewAppendWriter` opens an existing OCF for appending — it reads the header to
@@ -655,3 +681,65 @@ Struct field access uses `unsafe` pointer arithmetic (similar to
 `encoding/json` v2) to avoid `reflect.Value` overhead on every encode/decode.
 All schemas, type mappings, and codec state are cached after first use so
 repeated operations pay no extra allocation cost.
+
+## Encode/decode behavior contract
+
+The encoder and decoder are mostly symmetric: any Go shape the encoder accepts
+as input is a Go shape the decoder accepts as a target, and an encode→decode
+round-trip through the same Go type yields the same value. The cases below are
+deliberate exceptions.
+
+### Lossy by design
+
+- **`time.Time` → `time-millis` / `time-micros`**: the encoder extracts the
+  wall-clock time-of-day fields (hours, minutes, seconds, sub-second nanos)
+  and discards the date + zone — the wire format can't carry them. Round-trip
+  preserves time-of-day only; the decoded `time.Time` sits at the Unix epoch
+  with the original time-of-day.
+- **`time.Time` → `date`**: the encoder takes the UTC date (year, month, day)
+  and discards the time-of-day + zone. Round-trip preserves the date only.
+
+### Spec / interop choices
+
+- **Writer-union schema resolution fails eagerly.** Every branch must resolve
+  at `Resolve` / `CheckCompatibility` time. Java's `Resolver.WriterUnion`
+  defers per-branch errors to decode; we choose internal consistency with the
+  rest of the package (`resolveEnum`, `resolveReaderUnion`, `resolveNode`,
+  `validateDefault` are all eager).
+- **`NaN` / `±Infinity` emit as JSON-quoted strings** (`"NaN"`, `"Infinity"`)
+  by default. Java's `JsonEncoder` emits bare RFC-invalid tokens; we emit
+  valid JSON. Bare tokens are accepted on decode for fastavro interop. Use
+  `LinkedinFloats` for the goavro `null` / `1e999` / `-1e999` convention.
+- **`DecodeJSON` fills schema-declared defaults for absent record fields.**
+  Java's `JsonDecoder` errors on missing fields; we follow the binary-side
+  defaulting behavior so a record can omit fields with defaults from JSON
+  input.
+- **`local-timestamp-*` encode wall-clock fields as if UTC** (matching Java's
+  `TimeConversions.LocalTimestampMillisConversion` and fastavro). Decoded
+  values are UTC `time.Time`.
+- **OCF Snappy CRC is verified on read.** fastavro silently discards; we
+  fail-fast on integrity errors.
+- **Big-decimal canonical scale.** The encoder normalizes to the canonical
+  `(unscaled, scale)` form. Java preserves trailing-zero scale information on
+  the `BigDecimal` carrier; our `big.Rat` carrier can't represent the
+  distinction, so the trailing-zero scale is not round-tripped.
+- **Decimal JSON decode accepts both the spec form** (codepoint-mapped string)
+  **and the bare-number form**. Java is strict (spec form only); we accept the
+  lenient form for goavro / LinkedIn interop. Encode emits only the spec form.
+- **JSON null-union fast paths accept non-canonical multi-byte varint
+  encodings** of indices 0/1 (e.g. `0x80 0x00` = 0). Java's
+  `BinaryDecoder.readIndex` accepts both canonical and non-canonical forms.
+
+### Decoder leniencies without a symmetric encoder shape
+
+- **`TaggedUnions` on `DecodeJSON` wraps non-null union values** as
+  `map[string]any{branchName: value}` when the decode target is `*any`.
+  `EncodeJSON` accepts both the wrapped and the bare form on input, so an
+  encode→decode round-trip into `*any` produces the wrapped form even when
+  the user-provided input was bare. Documented on the `TaggedUnions` option.
+- **Schema parser accepts `{"type":"Node"}` as an alternate spelling** of the
+  bare `"Node"` name reference (matches Java's `TestUnionSelfReference`). The
+  encoder emits only the bare form; the decoder accepts either.
+- **Top-level union into a typed-map target** (e.g. `*map[string]any` against
+  `["null","float"]`) is rejected by both binary and JSON paths — the target
+  type doesn't fit a union schema. Use `*any` instead.

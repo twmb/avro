@@ -181,6 +181,11 @@
 //   - Fingerprinting: [Schema.Canonical], [Schema.Fingerprint], [NewRabin]
 //   - Object Container Files: the [github.com/twmb/avro/ocf] sub-package
 //
+// The repository README's "Encode/decode behavior contract" section
+// documents the intentional asymmetries between the encoder and
+// decoder (lossy-by-design conversions, spec/interop choices, and
+// decoder-only leniencies).
+//
 // [encoding/json/v2.Unmarshal]: https://pkg.go.dev/encoding/json/v2#Unmarshal
 // [Avro specification]: https://avro.apache.org/docs/current/specification/
 package avro

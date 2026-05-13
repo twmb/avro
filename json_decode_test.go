@@ -1827,8 +1827,11 @@ func TestDecodeJSONErrorPaths(t *testing.T) {
 	if err := enumS.DecodeJSON([]byte(`"C"`), new(string)); err == nil {
 		t.Error("expected unknown symbol error")
 	}
-	if err := enumS.DecodeJSON([]byte(`"A"`), new(int)); err == nil {
-		t.Error("expected unsupported target error")
+	// int / uint targets are accepted (ordinal) per binary parity —
+	// see TestRegression_JSONEnumDecodeIntoIntTargetParity. Only
+	// genuinely unsupported targets (channel, slice, etc.) error.
+	if err := enumS.DecodeJSON([]byte(`"A"`), new([]int)); err == nil {
+		t.Error("expected unsupported target error for slice")
 	}
 	// decodeBytes decimal invalid number
 	bytesDecS := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
@@ -1850,11 +1853,14 @@ func TestDecodeJSONErrorPaths(t *testing.T) {
 	if err := doubleS.DecodeJSON([]byte(`"not a double"`), new(float64)); err == nil {
 		t.Error("expected invalid double error")
 	}
-	// int unsupported target
+	// int → float target is now supported (round-trip parity with
+	// documented encode-side whole-number divergence). See
+	// TestRegression_IntLongDecodeIntoFloatJSONNumber. Genuinely
+	// unsupported targets (slice, struct without method, etc.) still
+	// error.
 	intS := MustParse(`"int"`)
-	var f float32
-	if err := intS.DecodeJSON([]byte(`42`), &f); err == nil {
-		t.Error("expected unsupported target for int")
+	if err := intS.DecodeJSON([]byte(`42`), new([]int)); err == nil {
+		t.Error("expected unsupported target for int (slice)")
 	}
 	// fixed decimal with typed unsupported target
 	if err := fixedDecS.DecodeJSON([]byte("12.34"), new(int)); err == nil {
