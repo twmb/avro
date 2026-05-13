@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -1806,4 +1807,246 @@ func effectiveLogicalType(n *schemaNode) string {
 		}
 	}
 	return ""
+}
+
+// TestFieldLevelLogicalType_DecimalRoundTrip exercises the value-side
+// decoder against a flat-form decimal schema. Decimal is the most
+// load-bearing case for the lift because it also propagates field-level
+// `precision` and `scale` — not just `logicalType`. Before the lift the
+// parser dropped all three and Encode/Decode of a *big.Rat errored with
+// "cannot use *big.Rat with Avro type bytes".
+func TestFieldLevelLogicalType_DecimalRoundTrip(t *testing.T) {
+	type Row struct {
+		Amt *big.Rat `avro:"amt"`
+	}
+
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"primitive decimal",
+			`{"type":"record","name":"R","fields":[
+				{"name":"amt","type":"bytes","logicalType":"decimal","precision":9,"scale":2}
+			]}`,
+		},
+		{
+			"union decimal (null first)",
+			`{"type":"record","name":"R","fields":[
+				{"name":"amt","type":["null","bytes"],"logicalType":"decimal","precision":9,"scale":2}
+			]}`,
+		},
+	}
+
+	want := new(big.Rat).SetFrac64(31415, 100) // 314.15
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			data, err := s.Encode(&Row{Amt: want})
+			if err != nil {
+				t.Fatalf("encode *big.Rat into flat-form schema: %v", err)
+			}
+			var got Row
+			if _, err := s.Decode(data, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got.Amt == nil || got.Amt.Cmp(want) != 0 {
+				t.Fatalf("round-trip mismatch: got %v, want %v", got.Amt, want)
+			}
+		})
+	}
+}
+
+// TestFieldLevelLogicalType_CanonicalDoesNotDuplicate pins down the
+// "clear the field-level copies after lift" contract. The canonical form
+// must carry the annotation exactly once (in the nested location), never
+// at both the field level and inside the type — otherwise downstream
+// canonicalisation produces non-spec output and fingerprints would drift.
+func TestFieldLevelLogicalType_CanonicalDoesNotDuplicate(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"primitive timestamp-millis",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":"long","logicalType":"timestamp-millis"}
+			]}`,
+		},
+		{
+			"union timestamp-millis",
+			`{"type":"record","name":"R","fields":[
+				{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}
+			]}`,
+		},
+		{
+			"primitive decimal",
+			`{"type":"record","name":"R","fields":[
+				{"name":"amt","type":"bytes","logicalType":"decimal","precision":9,"scale":2}
+			]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			canon := string(s.Canonical())
+			if c := strings.Count(canon, `"logicalType"`); c > 1 {
+				t.Fatalf("canonical form must contain logicalType at most once, got %d:\n  %s", c, canon)
+			}
+			if c := strings.Count(canon, `"precision"`); c > 1 {
+				t.Fatalf("canonical form must contain precision at most once, got %d:\n  %s", c, canon)
+			}
+			if c := strings.Count(canon, `"scale"`); c > 1 {
+				t.Fatalf("canonical form must contain scale at most once, got %d:\n  %s", c, canon)
+			}
+		})
+	}
+}
+
+// TestFieldLevelLogicalType_FingerprintsMatch is the load-bearing
+// drop-in-compatibility invariant: flat-form and nested-form schemas
+// must produce byte-identical canonical output (and therefore identical
+// fingerprints) so that downstream tooling — schema registries, schema
+// caches, anything keyed on fingerprint — treats them as the same
+// schema.
+func TestFieldLevelLogicalType_FingerprintsMatch(t *testing.T) {
+	cases := []struct {
+		name        string
+		flat        string
+		nested      string
+	}{
+		{
+			"primitive timestamp-millis",
+			`{"type":"record","name":"R","fields":[{"name":"ts","type":"long","logicalType":"timestamp-millis"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}`,
+		},
+		{
+			"primitive timestamp-micros",
+			`{"type":"record","name":"R","fields":[{"name":"ts","type":"long","logicalType":"timestamp-micros"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"ts","type":{"type":"long","logicalType":"timestamp-micros"}}]}`,
+		},
+		{
+			"primitive date",
+			`{"type":"record","name":"R","fields":[{"name":"d","type":"int","logicalType":"date"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"d","type":{"type":"int","logicalType":"date"}}]}`,
+		},
+		{
+			"primitive uuid",
+			`{"type":"record","name":"R","fields":[{"name":"u","type":"string","logicalType":"uuid"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"u","type":{"type":"string","logicalType":"uuid"}}]}`,
+		},
+		{
+			"primitive decimal",
+			`{"type":"record","name":"R","fields":[{"name":"amt","type":"bytes","logicalType":"decimal","precision":9,"scale":2}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"amt","type":{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}}]}`,
+		},
+		{
+			"union timestamp-millis",
+			`{"type":"record","name":"R","fields":[{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}]}`,
+		},
+		{
+			"union decimal",
+			`{"type":"record","name":"R","fields":[{"name":"amt","type":["null","bytes"],"logicalType":"decimal","precision":18,"scale":4}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"amt","type":["null",{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}]}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			flat, err := Parse(tc.flat)
+			if err != nil {
+				t.Fatalf("flat parse: %v", err)
+			}
+			nested, err := Parse(tc.nested)
+			if err != nil {
+				t.Fatalf("nested parse: %v", err)
+			}
+			if !bytes.Equal(flat.Canonical(), nested.Canonical()) {
+				t.Fatalf("canonical mismatch:\n  flat:   %s\n  nested: %s",
+					flat.Canonical(), nested.Canonical())
+			}
+			flatFP := flat.Fingerprint(sha256.New())
+			nestedFP := nested.Fingerprint(sha256.New())
+			if !bytes.Equal(flatFP, nestedFP) {
+				t.Fatalf("fingerprint mismatch:\n  flat:   %x\n  nested: %x", flatFP, nestedFP)
+			}
+		})
+	}
+}
+
+// TestFieldLevelLogicalType_EncodeJSONMatchesNested verifies that the
+// JSON encoder produces the same output for the flat and nested forms.
+// EncodeJSON is a separate code path from binary Encode and exercises
+// the same parsed schema's logical-type wiring; if the lift produced an
+// inconsistent parsed schema, the two forms would emit different JSON
+// representations of the same value.
+func TestFieldLevelLogicalType_EncodeJSONMatchesNested(t *testing.T) {
+	type Row struct {
+		TS time.Time `avro:"ts"`
+	}
+	val := &Row{TS: time.UnixMilli(1_700_000_000_000).UTC()}
+
+	flat, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"ts","type":"long","logicalType":"timestamp-millis"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	flatJSON, err := flat.EncodeJSON(val)
+	if err != nil {
+		t.Fatalf("flat EncodeJSON: %v", err)
+	}
+	nestedJSON, err := nested.EncodeJSON(val)
+	if err != nil {
+		t.Fatalf("nested EncodeJSON: %v", err)
+	}
+	if !bytes.Equal(flatJSON, nestedJSON) {
+		t.Fatalf("EncodeJSON differs between flat and nested forms:\n  flat:   %s\n  nested: %s", flatJSON, nestedJSON)
+	}
+}
+
+// TestFieldLevelLogicalType_MultiNonNullUnion pins down the "first
+// non-null branch wins" semantics for unusual unions with more than one
+// non-null primitive. The annotation is applied only to the first
+// matching branch; subsequent branches are unchanged. Validation downstream
+// will catch base-type mismatches, but the lift itself remains predictable.
+func TestFieldLevelLogicalType_MultiNonNullUnion(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"v","type":["null","long","string"],"logicalType":"timestamp-millis"}
+	]}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	node := firstFieldNode(s)
+	if node == nil || node.kind != "union" {
+		t.Fatalf("expected union, got %+v", node)
+	}
+	// Branches: [null, long(timestamp-millis), string]
+	if len(node.branches) != 3 {
+		t.Fatalf("expected 3 branches, got %d", len(node.branches))
+	}
+	if node.branches[0].kind != "null" {
+		t.Fatalf("branch 0: want null, got %q", node.branches[0].kind)
+	}
+	if node.branches[1].logical != "timestamp-millis" {
+		t.Fatalf("branch 1 (first non-null): want timestamp-millis, got %q", node.branches[1].logical)
+	}
+	if node.branches[2].logical != "" {
+		t.Fatalf("branch 2 must not inherit the annotation; got %q", node.branches[2].logical)
+	}
 }
