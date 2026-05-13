@@ -1030,7 +1030,7 @@ func jsonCoerceToInt32(v reflect.Value) (int32, error) {
 		return int32(n), nil
 	}
 	if v.CanFloat() {
-		n, err := floatFitsInt32(v.Float())
+		n, err := floatFitsInt32From(v.Float(), v.Type().Bits())
 		if err != nil {
 			return 0, fmt.Errorf("avro json: %w", err)
 		}
@@ -1071,7 +1071,7 @@ func jsonCoerceToInt64(v reflect.Value) (int64, error) {
 		return int64(n), nil
 	}
 	if v.CanFloat() {
-		n, err := floatFitsInt64(v.Float())
+		n, err := floatFitsInt64From(v.Float(), v.Type().Bits())
 		if err != nil {
 			return 0, fmt.Errorf("avro json: %w", err)
 		}

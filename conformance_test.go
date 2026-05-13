@@ -5364,6 +5364,128 @@ func TestRegression_WholeFloatEncodesAsInt(t *testing.T) {
 	})
 }
 
+// TestRegression_FloatSourceMantissaBoundOnIntLongEncode locks the
+// encoder-side mantissa-precision bound on whole-number-float input
+// against int/long schemas. The decoder's float-target arms in
+// setIntValue / setLongValue cap val at 1<<24 (float32 target) or 1<<53
+// (float64 target) for round-trip lossless guarantee. Pre-fix the
+// encoder's CanFloat arm only validated whole+int32/int64-range, so
+// `Encode(float32(1<<25), "int|long")` produced wire bytes that the
+// matching `Decode(wire, *float32)` could not read back — an
+// asymmetric encode-only round-trip. All eight encode-side sites that
+// took Go-float input (serInt, serLong, serArray.serInt+serLong,
+// serMap.serInt+serLong, jsonCoerceToInt32, jsonCoerceToInt64) shared
+// the gap and now share the source-bit-aware floatFitsInt32From /
+// floatFitsInt64From helpers.
+//
+// json.Number values are unaffected: their precision is float64-
+// implicit (json.Number's Float64 fallback is for non-integer forms
+// like "1.5e3"), so the json.Number → Float64 path keeps the
+// unchecked floatFitsInt32 / floatFitsInt64 helpers — capping it at
+// 1<<24 would falsely reject "1e9" → int32 which IS exact.
+func TestRegression_FloatSourceMantissaBoundOnIntLongEncode(t *testing.T) {
+	intS := mustParse(t, `"int"`)
+	longS := mustParse(t, `"long"`)
+	arrIntS := mustParse(t, `{"type":"array","items":"int"}`)
+	arrLongS := mustParse(t, `{"type":"array","items":"long"}`)
+	mapIntS := mustParse(t, `{"type":"map","values":"int"}`)
+	mapLongS := mustParse(t, `{"type":"map","values":"long"}`)
+
+	// In-bound: same-type round-trip is lossless and accepted on both
+	// encode and decode arms.
+	t.Run("float32_at_bound_into_int_round_trips", func(t *testing.T) {
+		in := float32(1 << 24) // = 16777216, the largest float32-exact integer.
+		enc, err := intS.AppendEncode(nil, &in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out float32
+		if _, err := intS.Decode(enc, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != in {
+			t.Errorf("round-trip: got %v, want %v", out, in)
+		}
+	})
+	t.Run("float64_at_bound_into_long_round_trips", func(t *testing.T) {
+		in := float64(1 << 53)
+		enc, err := longS.AppendEncode(nil, &in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out float64
+		if _, err := longS.Decode(enc, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != in {
+			t.Errorf("round-trip: got %v, want %v", out, in)
+		}
+	})
+
+	// Out-of-bound rejection at encode for each affected site. The
+	// values picked are exact in their source type (powers of two) so
+	// the only reason to reject them is the precision-bound rule, not
+	// non-whole or out-of-int-range.
+	type encCase struct {
+		name string
+		s    *avro.Schema
+		v    any
+	}
+	rejected := []encCase{
+		{"serInt_float32_above_mantissa", intS, ptr(float32(1 << 25))},
+		{"serInt_float64_above_int32_via_floatFitsInt32", intS, ptr(float64(1 << 32))},
+		{"serLong_float32_above_mantissa", longS, ptr(float32(1 << 25))},
+		{"serLong_float64_above_mantissa", longS, ptr(float64(1 << 54))},
+		{"serArray.serInt_float32_above_mantissa", arrIntS, &[]float32{1 << 25}},
+		{"serArray.serLong_float32_above_mantissa", arrLongS, &[]float32{1 << 25}},
+		{"serArray.serLong_float64_above_mantissa", arrLongS, &[]float64{1 << 54}},
+		{"serMap.serInt_float32_above_mantissa", mapIntS, &map[string]float32{"k": 1 << 25}},
+		{"serMap.serLong_float32_above_mantissa", mapLongS, &map[string]float32{"k": 1 << 25}},
+		{"serMap.serLong_float64_above_mantissa", mapLongS, &map[string]float64{"k": 1 << 54}},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.s.AppendEncode(nil, tc.v); err == nil {
+				t.Fatalf("expected encode rejection, got no error")
+			}
+		})
+	}
+
+	// Same set of rejections via the JSON encoder, exercising
+	// jsonCoerceToInt32 / jsonCoerceToInt64.
+	jsonRejected := []encCase{
+		{"jsonCoerceToInt32_float32_above_mantissa", intS, ptr(float32(1 << 25))},
+		{"jsonCoerceToInt64_float32_above_mantissa", longS, ptr(float32(1 << 25))},
+		{"jsonCoerceToInt64_float64_above_mantissa", longS, ptr(float64(1 << 54))},
+	}
+	for _, tc := range jsonRejected {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.s.AppendEncodeJSON(nil, tc.v); err == nil {
+				t.Fatalf("expected JSON encode rejection, got no error")
+			}
+		})
+	}
+
+	// json.Number with the same magnitude is unaffected — the
+	// json.Number → Int64 path returns the value verbatim, which the
+	// "expected on both sides" decoder of *json.Number / *int64 / etc.
+	// will round-trip without engaging the float-target precLimit.
+	t.Run("jsonNumber_unaffected", func(t *testing.T) {
+		jn := json.Number("33554432") // = 1<<25
+		enc, err := longS.AppendEncode(nil, jn)
+		if err != nil {
+			t.Fatalf("encode json.Number into long: %v", err)
+		}
+		var out int64
+		if _, err := longS.Decode(enc, &out); err != nil {
+			t.Fatalf("decode long-wire into int64: %v", err)
+		}
+		if out != 1<<25 {
+			t.Errorf("round-trip: got %d, want %d", out, 1<<25)
+		}
+	})
+}
+
 // TestSpecBareTypeNameInObjectAccepted locks in that {"type":"Node"}
 // as a wrapped reference to a previously-declared named type is
 // accepted at parse and the wrapped/bare forms produce equivalent

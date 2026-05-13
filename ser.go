@@ -336,6 +336,46 @@ func floatFitsInt64(f float64) (int64, error) {
 	return int64(n), nil
 }
 
+// floatFitsInt32From is floatFitsInt32 with an additional source-float
+// mantissa-precision check. When the source is float32 (bits == 32),
+// values exceeding ±(1<<24) are rejected — those are values the matching
+// decoder's float32-target arm in setIntValue would reject, so accepting
+// them on encode breaks the same-type round-trip. bits == 64 needs no
+// additional bound: int32 fits within float64's 1<<53 mantissa exactly.
+// Source-bit-aware mantissa rule lives here (and floatFitsInt64From) so
+// every encode arm that takes Go float input — serInt, serArray.serInt,
+// serMap.serInt, jsonCoerceToInt32 — agrees with setIntValue's decode
+// arm on the symmetric round-trip boundary.
+func floatFitsInt32From(f float64, bits int) (int32, error) {
+	n, err := floatFitsInt32(f)
+	if err != nil {
+		return 0, err
+	}
+	if bits == 32 && (n < -(1<<24) || n > 1<<24) {
+		return 0, fmt.Errorf("value %v exceeds float32 exact-precision range", f)
+	}
+	return n, nil
+}
+
+// floatFitsInt64From is floatFitsInt64 with an additional source-float
+// mantissa-precision check. Mirrors setLongValue's float-target precLimit:
+// 1<<24 for a float32 source, 1<<53 for float64. Same DRY rationale as
+// floatFitsInt32From — one rule, every encode-side float→int/long path.
+func floatFitsInt64From(f float64, bits int) (int64, error) {
+	n, err := floatFitsInt64(f)
+	if err != nil {
+		return 0, err
+	}
+	var bound int64 = 1 << 53
+	if bits == 32 {
+		bound = 1 << 24
+	}
+	if n < -bound || n > bound {
+		return 0, fmt.Errorf("value %v exceeds float%d exact-precision range", f, bits)
+	}
+	return n, nil
+}
+
 // jsonNumberToFloat converts a json.Number to a float64 reflect.Value.
 func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool) {
 	if v.Type() != jsonNumberType {
@@ -394,7 +434,7 @@ func serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		}
 		return appendVarint(dst, int32(n)), nil
 	} else if v.CanFloat() {
-		n, err := floatFitsInt32(v.Float())
+		n, err := floatFitsInt32From(v.Float(), v.Type().Bits())
 		if err != nil {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: err}
 		}
@@ -425,7 +465,7 @@ func serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		}
 		return appendVarlong(dst, int64(n)), nil
 	} else if v.CanFloat() {
-		n, err := floatFitsInt64(v.Float())
+		n, err := floatFitsInt64From(v.Float(), v.Type().Bits())
 		if err != nil {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: err}
 		}
@@ -987,7 +1027,7 @@ func (s *serArray) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 			}
 			dst = appendVarint(dst, int32(n))
 		} else if elem.CanFloat() {
-			n, err := floatFitsInt32(elem.Float())
+			n, err := floatFitsInt32From(elem.Float(), elem.Type().Bits())
 			if err != nil {
 				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: err}
 			}
@@ -1028,7 +1068,7 @@ func (s *serArray) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 			}
 			dst = appendVarlong(dst, int64(n))
 		} else if elem.CanFloat() {
-			n, err := floatFitsInt64(elem.Float())
+			n, err := floatFitsInt64From(elem.Float(), elem.Type().Bits())
 			if err != nil {
 				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: err}
 			}
@@ -1201,7 +1241,7 @@ func (s *serMap) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 			}
 			dst = appendVarint(dst, int32(n))
 		} else if val.CanFloat() {
-			n, err := floatFitsInt32(val.Float())
+			n, err := floatFitsInt32From(val.Float(), val.Type().Bits())
 			if err != nil {
 				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: err}
 			}
@@ -1244,7 +1284,7 @@ func (s *serMap) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 			}
 			dst = appendVarlong(dst, int64(n))
 		} else if val.CanFloat() {
-			n, err := floatFitsInt64(val.Float())
+			n, err := floatFitsInt64From(val.Float(), val.Type().Bits())
 			if err != nil {
 				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: err}
 			}
