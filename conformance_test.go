@@ -8625,6 +8625,91 @@ func TestRegression_BigDecimalJSONOpaquePassThrough(t *testing.T) {
 	}
 }
 
+// TestRegression_BigDecimalJSONBareNumberParity locks JSON-decode
+// parity between decimal and big-decimal on the bare-number arm. The
+// decimal-bytes path already accepted bare numbers (TestRegression_
+// DecodeJSONDecimalBareNumberIntoFloatParity); big-decimal was missing
+// from both the per-arm gate in decodeBytes and the union token
+// dispatcher in jsonTokenMatchesBranch, so a hand-edited JSON producer
+// emitting `1.5` for a big-decimal-bytes schema got "expected string
+// at offset 0" (standalone) or "no union branch matched" (inside a
+// union) where the decimal sibling accepted the same input.
+//
+// Big-decimal has no schema-level scale (it's encoded inline on the
+// wire), so the bare-number arm derives the natural scale via
+// finiteScale(r) — used only for json.Number / string targets where
+// the formatted display needs a scale parameter. Other target shapes
+// (big.Rat / float / interface) are unaffected by the scale choice.
+//
+// Three-impl note: fastavro has no big-decimal implementation; Java's
+// JsonDecoder for big-decimal goes through the bytes layer with no
+// bare-number leniency — the argument for accepting bare numbers here
+// is sibling-shape parity with twmb's own decimal-bytes leniency, not
+// cross-impl alignment.
+func TestRegression_BigDecimalJSONBareNumberParity(t *testing.T) {
+	s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
+	t.Run("standalone bare-number into *big.Rat", func(t *testing.T) {
+		var got *big.Rat
+		if err := s.DecodeJSON([]byte("1.5"), &got); err != nil {
+			t.Fatalf("bare-number decode: %v", err)
+		}
+		want := new(big.Rat).SetFrac64(3, 2)
+		if got.Cmp(want) != 0 {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+	t.Run("standalone bare-number into *float64", func(t *testing.T) {
+		var got float64
+		if err := s.DecodeJSON([]byte("1.5"), &got); err != nil {
+			t.Fatalf("bare-number decode: %v", err)
+		}
+		if got != 1.5 {
+			t.Errorf("got %v, want 1.5", got)
+		}
+	})
+	t.Run("standalone bare-integer into *big.Rat", func(t *testing.T) {
+		var got *big.Rat
+		if err := s.DecodeJSON([]byte("42"), &got); err != nil {
+			t.Fatalf("bare-integer decode: %v", err)
+		}
+		if got.Cmp(big.NewRat(42, 1)) != 0 {
+			t.Errorf("got %v, want 42", got)
+		}
+	})
+	t.Run("standalone bare-number into *any", func(t *testing.T) {
+		var got any
+		if err := s.DecodeJSON([]byte("1.5"), &got); err != nil {
+			t.Fatalf("bare-number decode: %v", err)
+		}
+		r, ok := got.(*big.Rat)
+		if !ok {
+			t.Fatalf("expected *big.Rat, got %T", got)
+		}
+		if r.Cmp(new(big.Rat).SetFrac64(3, 2)) != 0 {
+			t.Errorf("got %v, want 3/2", r)
+		}
+	})
+
+	// Union dispatch: a bare-number must route to the big-decimal
+	// branch via jsonTokenMatchesBranch. Pre-fix the digit-token arm
+	// only matched `decimal`-logical bytes/fixed.
+	t.Run("union dispatch bare-number to big-decimal branch", func(t *testing.T) {
+		us := avro.MustParse(`["null",{"type":"bytes","logicalType":"big-decimal"}]`)
+		var got any
+		if err := us.DecodeJSON([]byte("1.5"), &got); err != nil {
+			t.Fatalf("union bare-number decode: %v", err)
+		}
+		r, ok := got.(*big.Rat)
+		if !ok {
+			t.Fatalf("expected *big.Rat, got %T (%v)", got, got)
+		}
+		if r.Cmp(new(big.Rat).SetFrac64(3, 2)) != 0 {
+			t.Errorf("got %v, want 3/2", r)
+		}
+	})
+
+}
+
 // TestRegression_DateEncodeWallClock locks the calendar-date
 // interpretation of timeToDate. Pre-fix it used UTC-instant
 // (floorDiv(t.Unix(), 86400)) so a time.Time whose wall-clock date

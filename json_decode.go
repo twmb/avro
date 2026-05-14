@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/big"
 	"reflect"
 	"strconv"
 	"time"
@@ -604,25 +603,13 @@ func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode, toAny bool
 }
 
 func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny bool) error {
-	// Decimal logical type: accept JSON numbers (e.g. 0.33) in addition
-	// to Avro JSON byte strings, for round-trip with EncodeJSON output.
-	if node.logical == "decimal" {
-		if c := ctx.scanner.peek(); c != '"' && c != 0 {
-			nb, err := ctx.scanner.consumeNumberBytes()
-			if err != nil {
-				return err
-			}
-			r, ok, err := boundedRatFromString(string(nb))
-			if err != nil {
-				return fmt.Errorf("avro json: decimal %q: %w", nb, err)
-			}
-			if !ok {
-				return fmt.Errorf("avro json: invalid decimal number %q", nb)
-			}
-			if toAny {
-				return setIface(v, reflect.ValueOf(r), "bytes")
-			}
-			return assignDecimalRat(v, r, node)
+	// Decimal / big-decimal logical types: accept JSON numbers (e.g. 0.33
+	// or 1.5) in addition to Avro JSON byte strings, for round-trip with
+	// EncodeJSON output and convenience for hand-edited JSON. Big-decimal
+	// is bytes-only per spec (rejected in decodeFixed).
+	if hasDecimalBareNumberArm(node) {
+		if handled, err := ctx.decodeBareDecimal(v, node, toAny); handled {
+			return err
 		}
 	}
 	start, end, _, err := ctx.scanner.consumeStringRaw()
@@ -645,23 +632,10 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny boo
 
 func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny bool) error {
 	// Decimal logical type: accept JSON numbers, same as decodeBytes.
-	if node.logical == "decimal" {
-		if c := ctx.scanner.peek(); c != '"' && c != 0 {
-			nb, err := ctx.scanner.consumeNumberBytes()
-			if err != nil {
-				return err
-			}
-			r, ok, err := boundedRatFromString(string(nb))
-			if err != nil {
-				return fmt.Errorf("avro json: decimal %q: %w", nb, err)
-			}
-			if !ok {
-				return fmt.Errorf("avro json: invalid decimal number %q", nb)
-			}
-			if toAny {
-				return setIface(v, reflect.ValueOf(r), "fixed")
-			}
-			return assignDecimalRat(v, r, node)
+	// Big-decimal is bytes-only per spec, so it never reaches here.
+	if hasDecimalBareNumberArm(node) {
+		if handled, err := ctx.decodeBareDecimal(v, node, toAny); handled {
+			return err
 		}
 	}
 	start, end, _, err := ctx.scanner.consumeStringRaw()
@@ -742,14 +716,58 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode) error {
 	return setBytesValue(v, b, node.kind)
 }
 
-// assignDecimalRat assigns a *big.Rat to a typed target for decimal fields
-// decoded from JSON numbers (the lenient bare-number form). Shares
-// setDecimalRat with the binary path and assignBytes' spec-form path.
-func assignDecimalRat(v reflect.Value, r *big.Rat, node *schemaNode) error {
-	if ok, err := setDecimalRat(v, r, node.scale); ok {
-		return err
+// hasDecimalBareNumberArm reports whether node is a logical-typed bytes/
+// fixed schema that accepts the bare-number JSON form on decode. Both
+// decimal and big-decimal qualify; the union-dispatch sibling
+// jsonTokenMatchesBranch uses the same rule.
+func hasDecimalBareNumberArm(node *schemaNode) bool {
+	return node.logical == "decimal" || node.logical == "big-decimal"
+}
+
+// decodeBareDecimal handles the bare-number JSON arm for decimal-like
+// logical types (decimal, big-decimal). Returns handled=true when the
+// next token was a bare number (and the value was assigned or an error
+// produced); handled=false when the next token is a quoted string and
+// the caller should fall through to the spec-form path. Shared by
+// decodeBytes (decimal + big-decimal) and decodeFixed (decimal only;
+// big-decimal is bytes-only per spec) so all three sites agree on
+// scale derivation and target-set dispatch.
+func (ctx *jsonDecoder) decodeBareDecimal(v reflect.Value, node *schemaNode, toAny bool) (handled bool, err error) {
+	c := ctx.scanner.peek()
+	if c == '"' || c == 0 {
+		return false, nil
 	}
-	return &SemanticError{GoType: v.Type(), AvroType: node.kind}
+	nb, perr := ctx.scanner.consumeNumberBytes()
+	if perr != nil {
+		return true, perr
+	}
+	r, ok, perr := boundedRatFromString(string(nb))
+	if perr != nil {
+		return true, fmt.Errorf("avro json: %s %q: %w", node.logical, nb, perr)
+	}
+	if !ok {
+		return true, fmt.Errorf("avro json: invalid %s number %q", node.logical, nb)
+	}
+	if toAny {
+		return true, setIface(v, reflect.ValueOf(r), node.kind)
+	}
+	// Decimal uses the schema-declared node.scale; big-decimal has no
+	// schema-level scale (it's encoded inline on the wire), so derive
+	// the natural scale from the rat. Scale is consulted only by
+	// setDecimalRat's json.Number / string target arms; for big.Rat,
+	// float, and interface targets the value is unchanged.
+	scale := node.scale
+	if node.logical == "big-decimal" {
+		s, ok := finiteScale(r)
+		if !ok {
+			return true, fmt.Errorf("avro json: big-decimal value %s has no finite decimal expansion", r.RatString())
+		}
+		scale = s
+	}
+	if applied, err := setDecimalRat(v, r, scale); applied {
+		return true, err
+	}
+	return true, &SemanticError{GoType: v.Type(), AvroType: node.kind}
 }
 
 func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny bool) error {
@@ -1266,11 +1284,13 @@ func jsonTokenMatchesBranch(p byte, branch *schemaNode) bool {
 			return true
 		case "bytes", "fixed":
 			// Lenient decode: a hand-edited or alternate-tool JSON
-			// producer may emit a decimal-typed bytes/fixed branch
-			// as a bare number. decodeBytes / decodeFixed already
-			// accept both forms; dispatch must offer the branch so
-			// the number-form reaches them.
-			return branch.logical == "decimal"
+			// producer may emit a decimal-like-typed bytes/fixed
+			// branch as a bare number. decodeBytes / decodeFixed
+			// accept both forms via decodeBareDecimal; dispatch must
+			// offer the branch so the number-form reaches them.
+			// Big-decimal is bytes-only per spec, hence not eligible
+			// on a fixed branch.
+			return hasDecimalBareNumberArm(branch)
 		}
 	}
 	return false
