@@ -48,21 +48,32 @@ type SchemaNode struct {
 	EnumDefault    string // default symbol for enum schema evolution
 	HasEnumDefault bool   // true if an enum default is defined
 
-	Precision int            // decimal precision
-	Scale     int            // decimal scale
-	Props     map[string]any // custom properties (any JSON value)
+	Precision int // decimal precision
+	Scale     int // decimal scale
+
+	// Props holds custom (non-reserved) schema properties. Integer JSON
+	// literals decode to int64 (json.Number when the magnitude exceeds
+	// int64); fractional and exponent-form literals decode to float64.
+	Props map[string]any
 }
 
 // SchemaField represents a field in an Avro record schema.
 type SchemaField struct {
-	Name       string         // field name
-	Type       SchemaNode     // field schema
-	Default    any            // default value (only meaningful when HasDefault is true)
-	HasDefault bool           // true if a default value is defined in the schema
-	Aliases    []string       // field aliases for schema evolution
-	Order      string         // sort order: "ascending" (default), "descending", or "ignore"
-	Doc        string         // documentation string
-	Props      map[string]any // custom properties (any JSON value)
+	Name string     // field name
+	Type SchemaNode // field schema
+
+	// Default is the field's default value, meaningful only when HasDefault
+	// is true. Numbers decode as in [SchemaNode.Props].
+	Default any
+
+	HasDefault bool     // true if a default value is defined in the schema
+	Aliases    []string // field aliases for schema evolution
+	Order      string   // sort order: "ascending" (default), "descending", or "ignore"
+	Doc        string   // documentation string
+
+	// Props holds custom (non-reserved) field properties. Numbers decode as
+	// in [SchemaNode.Props].
+	Props map[string]any
 }
 
 // Schema parses the SchemaNode into a [*Schema] that can be used for
