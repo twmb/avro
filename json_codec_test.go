@@ -352,6 +352,77 @@ func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
 	}
 }
 
+// TestRegression_TaggedUnionsBareNullForNullBranch locks in that
+// EncodeJSON emits bare `null` for the null branch under TaggedUnions,
+// matching the doc commitment ("wraps non-null union values"),
+// Java's JsonEncoder.writeIndex (lang/java/avro/src/main/java/org/
+// apache/avro/io/JsonEncoder.java: `if (symbol != Symbol.NULL &&
+// includeNamespace)`), and the Avro JSON spec's bare-null union form.
+//
+// Pre-fix appendAvroJSONUnion's four cfg.tagged sites (tagged-form,
+// nil-first, type-name, try-each) wrapped any branch — including
+// null — when cfg.tagged was set, producing {"null":null}. Meanwhile
+// the entry early-null at appendAvroJSON:165-172 (reached when the
+// entry peel converts a nil Pointer/Interface to invalid) emitted
+// bare "null" regardless of cfg.tagged. Two paths, same conceptual
+// input, different output. Bug surfaced when commit 310cfc4 removed
+// the `if branch.kind == "null" continue` try-each skip — the wrap
+// path was previously unreachable for the null branch.
+//
+// Fix: factor appendUnionBranch that centralizes
+// `wrap iff cfg.tagged && branch.kind != "null"`, used at all four
+// dispatcher sites — so a future dispatcher addition inherits the
+// null special-case automatically.
+func TestRegression_TaggedUnionsBareNullForNullBranch(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		value  any
+	}{
+		// Nil Pointer / Interface — reach the entry early-null path via
+		// the peel loop at appendAvroJSON:189-197; emitted bare pre-fix
+		// AND post-fix (this leg locks the early-null path's behavior).
+		{"nil ptr against [null,bytes]", `["null","bytes"]`, (*[]byte)(nil)},
+		{"nil ptr against [null,int]", `["null","int"]`, (*int)(nil)},
+		{"any holding nil ptr against [null,int]", `["null","int"]`, any((*int)(nil))},
+
+		// Nil Slice / Map / Chan / Func — reach appendAvroJSONUnion's
+		// nil-first dispatch (added in 310cfc4); pre-fix this site
+		// wrapped null in {"null":null} under TaggedUnions.
+		{"nil slice against [null,bytes]", `["null","bytes"]`, []byte(nil)},
+		{"nil slice against [null,int,bytes]", `["null","int","bytes"]`, []byte(nil)},
+		{"nil map against [null,{type:map,values:int}]", `["null",{"type":"map","values":"int"}]`, map[string]int(nil)},
+
+		// Try-each null branch reached from a non-nil shape that fails
+		// every other branch — pre-fix this site wrapped null too once
+		// 310cfc4 removed the null-skip in try-each.
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Parse(tc.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := s.EncodeJSON(tc.value, TaggedUnions())
+			if err != nil {
+				t.Fatalf("EncodeJSON: %v", err)
+			}
+			if string(got) != "null" {
+				t.Errorf("got %s, want null (TaggedUnions doc: \"wraps non-null union values\")", got)
+			}
+			// Round-trip: decoder must accept bare null regardless of
+			// TaggedUnions setting so the encoded output stays valid.
+			var back any
+			if err := s.DecodeJSON(got, &back, TaggedUnions()); err != nil {
+				t.Fatalf("DecodeJSON round-trip: %v", err)
+			}
+			if back != nil {
+				t.Errorf("DecodeJSON of %s with TaggedUnions: got %T %v, want nil", got, back, back)
+			}
+		})
+	}
+}
+
 func TestDecodeJSONInvalidUnion(t *testing.T) {
 	s, err := Parse(`["null","string"]`)
 	if err != nil {
