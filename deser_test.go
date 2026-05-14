@@ -12120,6 +12120,66 @@ func TestRegression_EncodeJSONNullParity(t *testing.T) {
 	})
 }
 
+// TestRegression_EncodeJSONNullParityPointerToNilPointer extends
+// TestRegression_EncodeJSONNullParity to the **T-with-nil-inner shape:
+// a non-nil outer pointer whose Elem() is a nil pointer (e.g. `&p`
+// where `var p *int = nil`), with or without an enclosing any{}
+// wrapper. The 2-branch [null,T] optimization works via isNilValue
+// (which peels both Pointer and Interface); the prior serNull only
+// peeled Interface so the outer Pointer's IsNil()==false reached the
+// kind switch and errNonNil was returned. JSON's appendAvroJSON
+// indirect loop already peeled both, so JSON encode succeeded —
+// binary↔JSON asymmetry. The fix extends serNull's peel loop to
+// include reflect.Pointer, mirroring isNilValue's behavior.
+func TestRegression_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
+	nilIntPtrPtr := func() any { var p *int; return &p }
+	nilMapPtrPtr := func() any { var p *map[string]any; return &p }
+
+	parity := func(t *testing.T, s *Schema, in any) {
+		t.Helper()
+		_, binErr := s.AppendEncode(nil, in)
+		_, jsonErr := s.AppendEncodeJSON(nil, in)
+		if (binErr == nil) != (jsonErr == nil) {
+			t.Errorf("parity violation: binary err=%v, JSON err=%v", binErr, jsonErr)
+		}
+		if binErr != nil {
+			t.Errorf("binary rejected **T with nil inner: %v", binErr)
+		}
+	}
+
+	t.Run("top-level null + &nilIntPtr", func(t *testing.T) {
+		parity(t, MustParse(`"null"`), nilIntPtrPtr())
+	})
+	t.Run("top-level null + any(&nilIntPtr)", func(t *testing.T) {
+		parity(t, MustParse(`"null"`), any(nilIntPtrPtr()))
+	})
+	t.Run("top-level null + &nilMapPtr", func(t *testing.T) {
+		parity(t, MustParse(`"null"`), nilMapPtrPtr())
+	})
+	t.Run("3-branch union + &nilIntPtr", func(t *testing.T) {
+		parity(t, MustParse(`["null","int","string"]`), nilIntPtrPtr())
+	})
+	t.Run("3-branch union + any(&nilIntPtr)", func(t *testing.T) {
+		parity(t, MustParse(`["null","int","string"]`), any(nilIntPtrPtr()))
+	})
+	t.Run("array<null> + any(&nilIntPtr) elements", func(t *testing.T) {
+		parity(t, MustParse(`{"type":"array","items":"null"}`),
+			[]any{any(nilIntPtrPtr())})
+	})
+	t.Run("map<null> + any(&nilIntPtr) values", func(t *testing.T) {
+		parity(t, MustParse(`{"type":"map","values":"null"}`),
+			map[string]any{"a": any(nilIntPtrPtr())})
+	})
+	t.Run("record field null + &nilIntPtr", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"null"}]}`)
+		parity(t, s, map[string]any{"x": nilIntPtrPtr()})
+	})
+	t.Run("record field 3-branch + any(&nilIntPtr)", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":["null","int","string"]}]}`)
+		parity(t, s, map[string]any{"x": any(nilIntPtrPtr())})
+	})
+}
+
 // TestRegression_TimestampNanosMinInt64 locks in that
 // timeToTimestampNanos accepts time.Time values constructed from
 // MinInt64 nanoseconds since epoch, matching avro-rs and fastavro.
