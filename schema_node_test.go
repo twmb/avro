@@ -48,7 +48,11 @@ func TestSchemaNodeRoundTrip(t *testing.T) {
 	if got.Fields[0].Name != "name" || got.Fields[0].Type.Type != "string" {
 		t.Errorf("field 0: got %+v", got.Fields[0])
 	}
-	if got.Fields[1].Name != "age" || got.Fields[1].Default != float64(18) {
+	// Root() now preserves integer precision: JSON integer literals come
+	// back as int64 instead of float64. See unmarshalAnyPreservePrecision
+	// in schema.go and TestRegression_SchemaExtraNumberPrecisionLoss for
+	// the >2^53 case that motivated the change.
+	if got.Fields[1].Name != "age" || got.Fields[1].Default != int64(18) {
 		t.Errorf("field 1: got %+v", got.Fields[1])
 	}
 	if got.Fields[2].Type.Type != "union" || len(got.Fields[2].Type.Branches) != 2 {
@@ -695,7 +699,9 @@ func TestSchemaNodeCustomPropsExtended(t *testing.T) {
 	if root.Props["custom.tag"] != "hello" {
 		t.Errorf("record props: %v", root.Props)
 	}
-	if root.Props["custom.num"] != float64(42) {
+	// Integer JSON literals preserve precision and come back as int64,
+	// not float64. See TestRegression_SchemaExtraNumberPrecisionLoss.
+	if root.Props["custom.num"] != int64(42) {
 		t.Errorf("record num prop: %v", root.Props["custom.num"])
 	}
 	if root.Fields[0].Props["custom.field"] != true {

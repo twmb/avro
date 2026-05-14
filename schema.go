@@ -285,8 +285,14 @@ func (s *aschema) UnmarshalJSON(data []byte) error {
 			if s.object.extra == nil {
 				s.object.extra = make(map[string]any)
 			}
-			var v any
-			json.Unmarshal(raw[k], &v)
+			v, err := unmarshalAnyPreservePrecision(raw[k])
+			if err != nil {
+				// raw[k] came from a successful map[string]json.RawMessage
+				// decode above, so this is unreachable for well-formed input
+				// — but preserve the pre-fix behavior of silently dropping
+				// the property rather than failing the whole schema parse.
+				continue
+			}
 			s.object.extra[k] = v
 		}
 		return nil
@@ -2371,6 +2377,82 @@ func unmarshalDefault(raw json.RawMessage) any {
 	// Cannot fail: raw is preserved from the initial parse and is valid JSON.
 	_ = dec.Decode(&dv)
 	return dv
+}
+
+// unmarshalAnyPreservePrecision parses raw JSON into a Go value with the
+// same shape as encoding/json's default any decode (map[string]any, []any,
+// string, bool, nil for the structural pieces) BUT preserves integer
+// precision: integer-valued JSON numbers materialize as int64 instead of
+// float64, lifting the silent 2^53 round-down that bare
+// json.Unmarshal(&v any) applies. Fractional / exponent-form numbers
+// stay float64 since their natural domain is float64-precision anyway.
+// Integers that overflow int64 are returned as json.Number so the
+// caller still has arbitrary-precision access via .String() / .Int().
+//
+// Used by Schema metadata surfaces — schema parsing for record-level
+// extras (forwarded to schemaNode.props → SchemaNode.Props for
+// CustomType callbacks) and Schema.Root()'s re-parse — where the
+// previous bare-Unmarshal silently rounded JSON ints > 2^53. The Avro
+// internal encode/decode path was already protected via unmarshalDefault
+// (which UseNumber-decodes and pushes json.Number through the
+// defaultAsInt32/Int64/Float64 dispatch); this helper extends the
+// guarantee to the user-facing metadata API. See
+// TestRegression_SchemaExtraNumberPrecisionLoss.
+func unmarshalAnyPreservePrecision(raw []byte) (any, error) {
+	var v any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	return normalizeJSONValue(v), nil
+}
+
+// normalizeJSONValue recursively walks a value parsed via UseNumber and
+// converts json.Number to int64 / float64 / json.Number per
+// normalizeJSONNumber. Maps and slices are walked in place; other types
+// pass through.
+func normalizeJSONValue(v any) any {
+	switch tv := v.(type) {
+	case json.Number:
+		return normalizeJSONNumber(tv)
+	case map[string]any:
+		for k, val := range tv {
+			tv[k] = normalizeJSONValue(val)
+		}
+		return tv
+	case []any:
+		for i, val := range tv {
+			tv[i] = normalizeJSONValue(val)
+		}
+		return tv
+	}
+	return v
+}
+
+// normalizeJSONNumber resolves a UseNumber-preserved json.Number to the
+// idiomatic Go type: int64 for integer-valued literals (no '.', 'e', 'E')
+// that fit in int64; json.Number for integers that overflow int64 (rare,
+// keeps arbitrary precision); float64 for fractional / exponent-form
+// literals. Whole-number JSON literals like "18" — which would round-trip
+// from a Go float64(18) through json.Marshal as `18` — become int64(18)
+// here; type pinning tests that previously asserted float64(N) for a
+// small integer must now assert int64(N). Lossless for any literal Avro
+// callers are likely to write.
+func normalizeJSONNumber(n json.Number) any {
+	s := string(n)
+	// Integer-form: no decimal point and no exponent marker.
+	if !strings.ContainsAny(s, ".eE") {
+		if i, err := n.Int64(); err == nil {
+			return i
+		}
+		// Overflows int64; preserve as json.Number for arbitrary precision.
+		return n
+	}
+	if f, err := n.Float64(); err == nil {
+		return f
+	}
+	return n
 }
 
 // defaultAsInt32 / defaultAsInt64 / defaultAsFloat64 extract a numeric

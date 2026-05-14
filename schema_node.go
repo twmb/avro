@@ -99,13 +99,16 @@ type deduper struct {
 
 // Root returns the SchemaNode representation of a parsed schema by
 // re-parsing the original schema JSON. This preserves all metadata
-// including doc strings, namespaces, and custom properties.
+// including doc strings, namespaces, custom properties, and numeric
+// defaults — JSON integer literals come back as int64 (or json.Number
+// for the rare ones that overflow int64), not float64; see
+// unmarshalAnyPreservePrecision for the precision-preservation rationale.
 //
 // Root re-parses the JSON on each call. Cache the result if you need
 // to access it repeatedly (e.g. in a per-message processing loop).
 func (s *Schema) Root() SchemaNode {
-	var raw any
-	if err := json.Unmarshal([]byte(s.full), &raw); err != nil {
+	raw, err := unmarshalAnyPreservePrecision([]byte(s.full))
+	if err != nil {
 		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
 	}
 	return nodeFromJSON(raw)
@@ -379,6 +382,25 @@ var fieldReservedKeys = map[string]bool{
 	"aliases": true, "order": true,
 }
 
+// jsonNumericInt accepts a value parsed via unmarshalAnyPreservePrecision
+// (int64 for integer literals) and falls through to float64 / json.Number
+// for compatibility with values originating from a bare encoding/json
+// Unmarshal — primarily SchemaNode trees constructed programmatically
+// and round-tripped through Schema().Root().
+func jsonNumericInt(v any) (int, bool) {
+	switch t := v.(type) {
+	case int64:
+		return int(t), true
+	case float64:
+		return int(t), true
+	case json.Number:
+		if i, err := t.Int64(); err == nil {
+			return int(i), true
+		}
+	}
+	return 0, false
+}
+
 // lookupCI looks up key k in m, matching case-insensitively. Mirrors
 // encoding/json's struct field matching so schemas with non-canonical
 // casing ("tYpe" instead of "type") round-trip through Root/Schema.
@@ -436,19 +458,22 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 			n.LogicalType = lt
 		}
 	}
+	// precision/scale/size are int per spec. After
+	// unmarshalAnyPreservePrecision, integer JSON literals come back as
+	// int64 (not float64); accept the integer form directly.
 	if v, ok := lookupCI(m, "precision"); ok {
-		if p, ok := v.(float64); ok {
-			n.Precision = int(p)
+		if p, ok := jsonNumericInt(v); ok {
+			n.Precision = p
 		}
 	}
 	if v, ok := lookupCI(m, "scale"); ok {
-		if s, ok := v.(float64); ok {
-			n.Scale = int(s)
+		if p, ok := jsonNumericInt(v); ok {
+			n.Scale = p
 		}
 	}
 	if v, ok := lookupCI(m, "size"); ok {
-		if s, ok := v.(float64); ok {
-			n.Size = int(s)
+		if p, ok := jsonNumericInt(v); ok {
+			n.Size = p
 		}
 	}
 

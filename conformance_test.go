@@ -12796,3 +12796,167 @@ func TestParity_RoundTripMatrix(t *testing.T) {
 		})
 	}
 }
+
+// TestRegression_SchemaMetadataNumericPrecisionPreserved locks that JSON
+// integer literals > 2^53 survive Schema parsing intact when surfaced
+// via the metadata API (Schema.Root().Props, Root().Fields[].Props,
+// Root().Fields[].Default, and CustomType callbacks' schema.Props).
+// Pre-fix two sites — schema_node.go:108 (Root re-parse) and
+// schema.go:289 (record extras during parse) — called json.Unmarshal
+// without UseNumber so JSON ints > 2^53 silently rounded to float64
+// (e.g. 9007199254740993 → 9007199254740992). Java preserves precision
+// via Jackson's LongNode (lang/java/avro/src/main/java/org/apache/avro/
+// Schema.java:1985 stores extras as JsonNode); fastavro preserves via
+// Python int (arbitrary precision). Internal encode/decode was already
+// safe via unmarshalDefault (UseNumber); only the user-facing metadata
+// surfaces were buggy.
+//
+// Fix: switch both sites to unmarshalAnyPreservePrecision — UseNumber
+// decode followed by normalizeJSONValue which converts integer-form
+// json.Number to int64 (or json.Number for >int64 magnitudes), and
+// fractional/exponent-form to float64. Existing pinning tests
+// (TestSchemaNodeRoundTrip, TestSchemaNodeCustomPropsExtended) were
+// updated from float64(N) to int64(N) for small integers, matching the
+// new spec-aligned behavior.
+func TestRegression_SchemaMetadataNumericPrecisionPreserved(t *testing.T) {
+	const wantVal = int64(9007199254740993) // 2^53 + 1
+	// Helper: type-assert v as the canonical int (int64 or json.Number
+	// Int64()) and compare to wantVal. The encoding/json default of
+	// float64 would round wantVal to 2^53 — silent precision loss.
+	asInt64 := func(t *testing.T, label string, v any) int64 {
+		t.Helper()
+		switch tv := v.(type) {
+		case int64:
+			return tv
+		case json.Number:
+			i, err := tv.Int64()
+			if err != nil {
+				t.Fatalf("%s: json.Number(%q) overflows int64", label, tv)
+			}
+			return i
+		case float64:
+			t.Fatalf("%s: got float64(%v) — precision-loss site not fixed (want int64 %d)", label, tv, wantVal)
+		default:
+			t.Fatalf("%s: unexpected type %T = %v", label, v, v)
+		}
+		return 0
+	}
+
+	t.Run("record-level extra > 2^53 via Schema.Root().Props", func(t *testing.T) {
+		s, err := avro.Parse(fmt.Sprintf(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"int"}],
+			"schemaId":%d
+		}`, wantVal))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := asInt64(t, "Root().Props[schemaId]", s.Root().Props["schemaId"])
+		if got != wantVal {
+			t.Errorf("got %d, want %d", got, wantVal)
+		}
+	})
+
+	t.Run("field-level Default > 2^53 via Schema.Root().Fields[].Default", func(t *testing.T) {
+		s, err := avro.Parse(fmt.Sprintf(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"long","default":%d}]
+		}`, wantVal))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := asInt64(t, "Fields[0].Default", s.Root().Fields[0].Default)
+		if got != wantVal {
+			t.Errorf("got %d, want %d", got, wantVal)
+		}
+	})
+
+	t.Run("field-level extra > 2^53 via Schema.Root().Fields[].Props", func(t *testing.T) {
+		s, err := avro.Parse(fmt.Sprintf(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"int","field.id":%d}]
+		}`, wantVal))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := asInt64(t, "Fields[0].Props[field.id]", s.Root().Fields[0].Props["field.id"])
+		if got != wantVal {
+			t.Errorf("got %d, want %d", got, wantVal)
+		}
+	})
+
+	t.Run("record-level extra > 2^53 via CustomType callback schema.Props", func(t *testing.T) {
+		// Place the prop on the inner type so it's surfaced via the
+		// custom-typed node's Props rather than the outer record's.
+		schemaStr := fmt.Sprintf(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":{
+				"type":"long","logicalType":"my-long","schemaId":%d
+			}}]
+		}`, wantVal)
+		var captured map[string]any
+		ct := avro.CustomType{
+			AvroType:    "long",
+			LogicalType: "my-long",
+			Decode: func(v any, schema *avro.SchemaNode) (any, error) {
+				captured = schema.Props
+				return v, nil
+			},
+		}
+		s, err := avro.Parse(schemaStr, avro.WithCustomType(ct))
+		if err != nil {
+			t.Fatal(err)
+		}
+		bin, err := s.AppendEncode(nil, map[string]any{"f": int64(42)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if _, err := s.Decode(bin, &out); err != nil {
+			t.Fatal(err)
+		}
+		got := asInt64(t, "CustomType schema.Props[schemaId]", captured["schemaId"])
+		if got != wantVal {
+			t.Errorf("got %d, want %d", got, wantVal)
+		}
+	})
+
+	t.Run("nested extra inside array > 2^53", func(t *testing.T) {
+		s, err := avro.Parse(fmt.Sprintf(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"int"}],
+			"versions":[%d, 1, 2]
+		}`, wantVal))
+		if err != nil {
+			t.Fatal(err)
+		}
+		arr, ok := s.Root().Props["versions"].([]any)
+		if !ok {
+			t.Fatalf("versions not []any: %T", s.Root().Props["versions"])
+		}
+		if len(arr) != 3 {
+			t.Fatalf("expected 3 elements, got %d", len(arr))
+		}
+		got := asInt64(t, "Props[versions][0]", arr[0])
+		if got != wantVal {
+			t.Errorf("got %d, want %d", got, wantVal)
+		}
+	})
+
+	t.Run("fractional extras still come back as float64", func(t *testing.T) {
+		// Fractional numbers must NOT become int64 — verifies the
+		// normalize-fractional arm.
+		s, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"int"}],
+			"threshold":3.14
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := s.Root().Props["threshold"]
+		if f, ok := v.(float64); !ok || f != 3.14 {
+			t.Errorf("got %T %v, want float64(3.14)", v, v)
+		}
+	})
+}
