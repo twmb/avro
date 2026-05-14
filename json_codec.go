@@ -692,6 +692,28 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 		}
 	}
 
+	// Nil-first dispatch: if v is nil-equivalent and the union has a
+	// null branch, pick null regardless of arity. Mirrors the binary
+	// 2-branch optimization serNullUnionAt (ser.go) and the
+	// corresponding serUnion.ser nil-first check; generalizes the
+	// "Go nil = absent → null branch" semantic uniformly across all
+	// union arities so 2-branch and N-branch behavior agree on what
+	// counts as null. Without this, nil []byte against ["null","bytes"]
+	// routes via unionTypeNameForValue → "bytes" → bytes branch
+	// (emitting empty bytes) while binary 2-branch picks null —
+	// producing a binary↔JSON parity gap for the 2-branch case and a
+	// binary 2-branch↔3-branch inconsistency for the N-branch case.
+	if isNilValue(v) {
+		for _, branch := range node.branches {
+			if branch.kind == "null" {
+				if cfg.tagged {
+					return appendTaggedUnion(buf, branch, []byte("null"), cfg.tagLogical), nil
+				}
+				return append(buf, "null"...), nil
+			}
+		}
+	}
+
 	// Type-name dispatch (Java/fastavro/hamba parity): if v's Go type
 	// has a canonical Avro primitive name and exactly one branch
 	// matches, prefer it over try-each. Mirrors serUnion.ser. Falls
@@ -718,10 +740,17 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 	}
 
 tryAll:
+	// Try every branch including null, mirroring serUnion.ser (ser.go:127).
+	// The case "null" arm of appendAvroJSON rejects non-nil values with
+	// errNonNil, so a non-nil v cleanly falls through to the next branch.
+	// A nil Map / nil Slice / nil Chan / nil Func (none of which the peel
+	// loop above converts to invalid, and none of which unionTypeNameForValue
+	// names except []byte → "bytes") lands on case "null" here and emits
+	// "null"; without trying the null branch, binary↔JSON parity breaks
+	// for those shapes the way the binary serUnion.ser try-each handles via
+	// serNull (ser.go:281). The 2-branch [null,T] fast path on the binary
+	// side uses serNullUnionAt → isNilValue, which covers the same shapes.
 	for _, branch := range node.branches {
-		if branch.kind == "null" {
-			continue
-		}
 		encoded, err := appendAvroJSON(nil, v, branch, cfg, customEncodes, depth+1)
 		if err == nil {
 			if cfg.tagged {

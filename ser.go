@@ -111,6 +111,19 @@ func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		}
 	}
 
+	// Nil-first dispatch: if v is nil-equivalent and the union has a
+	// null branch, pick null regardless of arity. Mirrors the 2-branch
+	// optimization serNullUnionAt and generalizes the "Go nil = absent
+	// → null branch" semantic uniformly across all union arities. Pre-
+	// fix, only the 2-branch optimization did this; the generic
+	// dispatcher used type-name dispatch first, so nil []byte against
+	// ["null","int","bytes"] routed to "bytes" (empty bytes) while the
+	// 2-branch sibling ["null","bytes"] routed to null. The two
+	// behaviors now agree.
+	if nullIdx, ok := s.branchKinds["null"]; ok && isNilValue(v) {
+		return appendVarint(dst, int32(nullIdx)), nil
+	}
+
 	base := dst
 	if name := unionTypeNameForValue(v); name != "" {
 		if idx, ok := s.branchKinds[name]; ok {
@@ -231,9 +244,16 @@ func serNullUnionAt(u *serUnion, valIdx int, nullByte, valByte byte) serfn {
 	}
 }
 
-// isNilValue reports whether v is nil, peeling through pointer and
-// interface layers. This handles the case where AppendEncode receives
-// &nilPtr (a **T with non-nil outer pointer) for a nullable union.
+// isNilValue reports whether v is nil-equivalent for the purposes of the
+// 2-branch [null,T] union optimization. It peels Pointer / Interface
+// layers (handling &nilPtr — a **T with non-nil outer pointer wrapping a
+// nil *T) and treats nil Map / Slice / Chan / Func as nil. The accept
+// set matches serNull (ser.go) and appendAvroJSON's case "null" arm
+// (json_codec.go) exactly so the four dispatch sites — binary 2-branch
+// optimization (serNullUnionAt), binary 3-branch try-each (serUnion.ser
+// → serNull), JSON 2-branch optimization (appendAvroJSONUnion's
+// 2-branch nil short-circuit), and JSON try-each (case "null") —
+// agree on what counts as nil.
 //
 // Capped at maxIndirectDepth so a self-referential interface
 // (var p any; p = &p) terminates instead of looping forever; treat
@@ -250,7 +270,7 @@ func isNilValue(v reflect.Value) bool {
 				return true
 			}
 			v = v.Elem()
-		case reflect.Map, reflect.Slice:
+		case reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
 			return v.IsNil()
 		default:
 			return false

@@ -12180,6 +12180,367 @@ func TestRegression_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 	})
 }
 
+// TestRegression_EncodeJSONNullParityBareNilContainer locks parity between
+// the binary union encoder (serUnion.ser, ser.go) and the JSON union
+// encoder (appendAvroJSONUnion, json_codec.go) for bare nil Map / nil
+// Slice / nil []byte inputs against a multi-branch union containing
+// "null". The bug: appendAvroJSONUnion's try-each loop unconditionally
+// skipped the null branch (`if branch.kind == "null" continue`), and
+// the upstream peel loop in appendAvroJSON only peels Pointer / Interface
+// — not Map / Slice / Chan / Func — so a bare nil Map / nil Slice never
+// landed on case "null". Binary serUnion.ser tries every branch
+// including null; serNull's post-2995c67 peel-loop + kind-switch accepts
+// nil Map / Slice / Chan / Func — so the binary path picked the null
+// branch while the JSON path returned "no union branch matched" (for
+// non-bytes nils) or silently picked the string/bytes branch and emitted
+// "" (for nil []byte). Fix: drop the null-skip in the try-each so the
+// loop mirrors serUnion.ser; the case "null" arm rejects non-nil with
+// errNonNil so non-nil inputs cleanly fall through to the next branch.
+//
+// This is distinct from TestRegression_EncodeJSONNullParity above, which
+// covers the TAGGED-union dispatch (`{"null": <typed-nil>}` flowing
+// through tryUnwrapTagged → case "null"). The bare-value form here goes
+// through unionTypeNameForValue (which returns "" for Map/Slice except
+// []byte) → try-each, which is exactly where the null-skip blocked the
+// dispatch. Pattern 14a partial-fix sibling: commit 2995c67 brought the
+// binary serNull's peel into matching shape with isNilValue, but the JSON
+// dispatcher's try-each was not updated; the bug hid because every
+// existing parity test passed the typed-nil through the tagged form, not
+// the bare form.
+func TestRegression_EncodeJSONNullParityBareNilContainer(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		value  any
+		// wantBin / wantJSON are the expected wire / JSON outputs.
+		wantBin  []byte
+		wantJSON string
+	}{
+		{
+			name:     "bare nil map against [null,int,string]",
+			schema:   `["null","int","string"]`,
+			value:    map[string]any(nil),
+			wantBin:  []byte{0},
+			wantJSON: "null",
+		},
+		{
+			name:     "bare nil slice against [null,int,string]",
+			schema:   `["null","int","string"]`,
+			value:    []int(nil),
+			wantBin:  []byte{0},
+			wantJSON: "null",
+		},
+		{
+			name:     "bare nil []byte against [null,int,string]",
+			schema:   `["null","int","string"]`,
+			value:    []byte(nil),
+			wantBin:  []byte{0},
+			wantJSON: "null",
+		},
+		{
+			name:     "any-wrapped nil map",
+			schema:   `["null","int","string"]`,
+			value:    any(map[string]any(nil)),
+			wantBin:  []byte{0},
+			wantJSON: "null",
+		},
+		{
+			name:     "any-wrapped nil slice",
+			schema:   `["null","int","string"]`,
+			value:    any([]int(nil)),
+			wantBin:  []byte{0},
+			wantJSON: "null",
+		},
+		{
+			name:     "any-wrapped nil []byte",
+			schema:   `["null","int","string"]`,
+			value:    any([]byte(nil)),
+			wantBin:  []byte{0},
+			wantJSON: "null",
+		},
+		{
+			name:     "2-branch [null,int] + bare nil map",
+			schema:   `["null","int"]`,
+			value:    map[string]any(nil),
+			wantBin:  []byte{0},
+			wantJSON: "null",
+		},
+		{
+			name:     "2-branch [null,int] + bare nil slice",
+			schema:   `["null","int"]`,
+			value:    []int(nil),
+			wantBin:  []byte{0},
+			wantJSON: "null",
+		},
+		{
+			name:     "2-branch [int,null] + bare nil map (null second)",
+			schema:   `["int","null"]`,
+			value:    map[string]any(nil),
+			wantBin:  []byte{2},
+			wantJSON: "null",
+		},
+		{
+			name:     "array<[null,int,string]> with nil-map items",
+			schema:   `{"type":"array","items":["null","int","string"]}`,
+			value:    []any{map[string]any(nil), map[string]any(nil)},
+			wantBin:  []byte{4, 0, 0, 0},
+			wantJSON: "[null,null]",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := MustParse(tc.schema)
+			bin, err := s.AppendEncode(nil, tc.value)
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			if !bytes.Equal(bin, tc.wantBin) {
+				t.Errorf("binary: got %v, want %v", bin, tc.wantBin)
+			}
+			jbin, err := s.AppendEncodeJSON(nil, tc.value)
+			if err != nil {
+				t.Fatalf("JSON encode (binary↔JSON parity gap): %v", err)
+			}
+			if string(jbin) != tc.wantJSON {
+				t.Errorf("JSON: got %q, want %q", jbin, tc.wantJSON)
+			}
+		})
+	}
+}
+
+// TestRegression_EncodeJSONNullBytesUnionParity locks the "Go nil =
+// absent → null branch" semantic uniformly across union arities and
+// encoders. Pre-fix the dispatch logic was inconsistent on three axes:
+//
+//  1. Binary 2-branch [null,T] used serNullUnionAt → isNilValue,
+//     which peels Pointer/Interface and treats nil Map/Slice as nil
+//     → picked null for nil []byte.
+//  2. Binary 3+ branch used serUnion.ser → unionTypeNameForValue,
+//     which names Slice<uint8> as "bytes" regardless of IsNil →
+//     picked the bytes branch (encoding empty bytes) for nil []byte.
+//  3. JSON appendAvroJSONUnion mirrored binary 3+-branch on both 2-
+//     and 3+-branch unions → picked bytes for nil []byte everywhere.
+//
+// Three distinct results for the same `[]byte(nil)` against three
+// near-identical schemas — a binary↔JSON parity gap (1 vs 3) and a
+// binary 2-branch↔3-branch internal inconsistency (1 vs 2). The fix:
+// add a nil-first short-circuit at the entry of BOTH serUnion.ser and
+// appendAvroJSONUnion that checks `isNilValue(v) && has null branch`
+// before any type-name dispatch, mirroring the 2-branch optimization.
+// All four dispatch sites — binary 2-branch (serNullUnionAt),
+// binary N-branch (serUnion.ser), JSON N-branch
+// (appendAvroJSONUnion), and JSON tagged-form (decodeUnionObject) —
+// now agree on the nil-equivalence semantic.
+//
+// Pattern 14a — partial fix sibling. The prior round's working-tree
+// fix removed `if branch.kind == "null" continue` from
+// appendAvroJSONUnion's try-each loop, but type-name dispatch fired
+// before try-each ever ran for nil Slice<uint8>. Special-casing
+// len==2 (the audit's first proposal) would have papered over the
+// JSON↔binary gap while preserving the binary 2-branch↔3-branch
+// inconsistency. The general "nil → null when null branch present"
+// rule resolves both.
+func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
+	tests := []struct {
+		name     string
+		schema   string
+		value    any
+		wantBin  []byte
+		wantJSON string
+	}{
+		{
+			name:     "2-branch [null,bytes] + []byte(nil)",
+			schema:   `["null","bytes"]`,
+			value:    []byte(nil),
+			wantBin:  []byte{0}, // null branch
+			wantJSON: "null",
+		},
+		{
+			name:     "2-branch [bytes,null] + []byte(nil) (null second)",
+			schema:   `["bytes","null"]`,
+			value:    []byte(nil),
+			wantBin:  []byte{2}, // null branch (idx 1)
+			wantJSON: "null",
+		},
+		{
+			name:     "2-branch [null,bytes] + any([]byte(nil))",
+			schema:   `["null","bytes"]`,
+			value:    any([]byte(nil)),
+			wantBin:  []byte{0},
+			wantJSON: "null",
+		},
+		{
+			name: "record with [null,bytes] field + []byte(nil)",
+			schema: `{
+				"type":"record",
+				"name":"R",
+				"fields":[
+					{"name":"data","type":["null","bytes"],"default":null}
+				]
+			}`,
+			value:    map[string]any{"data": []byte(nil)},
+			wantBin:  []byte{0},
+			wantJSON: `{"data":null}`,
+		},
+		{
+			name: "array<[null,bytes]> with nil-byte items",
+			schema: `{
+				"type":"array",
+				"items":["null","bytes"]
+			}`,
+			value: []any{[]byte(nil), []byte("hi"), []byte(nil)},
+			// block-count=3, null-byte, bytes-branch len=2 "hi", null-byte, block-end
+			wantBin:  []byte{6, 0, 2, 4, 'h', 'i', 0, 0},
+			wantJSON: `[null,"hi",null]`,
+		},
+		// Sanity: non-nil empty []byte{} stays in bytes branch on both sides.
+		{
+			name:     "2-branch [null,bytes] + []byte{} (non-nil empty)",
+			schema:   `["null","bytes"]`,
+			value:    []byte{},
+			wantBin:  []byte{2, 0},
+			wantJSON: `""`,
+		},
+		// 3-branch: nil-first dispatch wins on both sides. Pre-fix
+		// binary picked bytes (idx 2 → wire [4, 0]) and JSON picked
+		// bytes (`""`) — a binary 2-branch ↔ 3-branch inconsistency.
+		// Post-fix both pick null uniformly with the 2-branch case.
+		{
+			name:     "3-branch [null,int,bytes] + []byte(nil)",
+			schema:   `["null","int","bytes"]`,
+			value:    []byte(nil),
+			wantBin:  []byte{0}, // null branch
+			wantJSON: "null",
+		},
+		// 3-branch with null NOT first: still picks null because the
+		// nil-first rule is order-independent. Pre-fix this picked
+		// bytes via type-name dispatch.
+		{
+			name:     "3-branch [bytes,int,null] + []byte(nil)",
+			schema:   `["bytes","int","null"]`,
+			value:    []byte(nil),
+			wantBin:  []byte{4}, // null branch (idx 2 → zigzag 4)
+			wantJSON: "null",
+		},
+		// 3-branch without a null branch: type-name dispatch picks
+		// bytes (the only sensible choice). Pre-fix behavior preserved.
+		{
+			name:     "3-branch [int,bytes,string] (no null) + []byte(nil)",
+			schema:   `["int","bytes","string"]`,
+			value:    []byte(nil),
+			wantBin:  []byte{2, 0}, // bytes branch (idx 1), length 0
+			wantJSON: `""`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := MustParse(tc.schema)
+			bin, err := s.AppendEncode(nil, tc.value)
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			if !bytes.Equal(bin, tc.wantBin) {
+				t.Errorf("binary: got %v want %v", bin, tc.wantBin)
+			}
+			js, err := s.AppendEncodeJSON(nil, tc.value)
+			if err != nil {
+				t.Fatalf("JSON encode: %v", err)
+			}
+			if string(js) != tc.wantJSON {
+				t.Errorf("JSON: got %q want %q", js, tc.wantJSON)
+			}
+		})
+	}
+}
+
+// TestRegression_EncodeNullParity2BranchNilChanFunc locks parity
+// between the binary 2-branch [null,T] optimization (serNullUnion /
+// isNilValue at ser.go) and the binary 3-branch / JSON paths
+// (serUnion.ser / appendAvroJSONUnion → serNull / case "null") for
+// nil Chan and nil Func inputs.
+//
+// Background: serNull (ser.go) and appendAvroJSON's case "null"
+// arm (json_codec.go) both accept v.IsNil() for kinds
+// {Pointer, Interface, Map, Slice, Chan, Func}. isNilValue (ser.go)
+// — used uniquely by the 2-branch optimization serNullUnionAt — peels
+// Pointer/Interface but its terminal kind switch previously covered
+// only {Map, Slice}, missing Chan/Func. Result: 2-branch [null,T]
+// + nil Chan/Func fell to fns[valIdx] (e.g. serInt) which then
+// errored on the non-numeric Kind, while the 3-branch try-each and
+// the JSON try-each both reached the case "null" arm that DID accept
+// Chan/Func nil.
+//
+// Pattern 14a — partial fix for helper coverage. Commit 4efe6c6
+// added the Interface peel to serNull; commit 2995c67 extended it to
+// Pointer to match isNilValue's docstring. Neither broadened
+// isNilValue's terminal switch to match serNull's full kind set.
+// The fix extends isNilValue's terminal switch to include
+// reflect.Chan and reflect.Func; isNilValue's accept set now matches
+// serNull's exactly.
+func TestRegression_EncodeNullParity2BranchNilChanFunc(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		value   any
+		wantBin []byte
+	}{
+		{
+			name:    "2-branch [null,int] + nil chan",
+			schema:  `["null","int"]`,
+			value:   chan int(nil),
+			wantBin: []byte{0}, // null branch
+		},
+		{
+			name:    "2-branch [int,null] + nil chan",
+			schema:  `["int","null"]`,
+			value:   chan int(nil),
+			wantBin: []byte{2}, // null branch at idx 1
+		},
+		{
+			name:    "2-branch [null,int] + nil func",
+			schema:  `["null","int"]`,
+			value:   (func())(nil),
+			wantBin: []byte{0},
+		},
+		{
+			name:    "2-branch [null,string] + nil chan",
+			schema:  `["null","string"]`,
+			value:   chan int(nil),
+			wantBin: []byte{0},
+		},
+		// Sanity: 3-branch path already worked because serUnion.ser
+		// try-each reaches serNull which has the broader kind set.
+		{
+			name:    "3-branch [null,int,string] + nil chan (unchanged)",
+			schema:  `["null","int","string"]`,
+			value:   chan int(nil),
+			wantBin: []byte{0},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := MustParse(tc.schema)
+			bin, err := s.AppendEncode(nil, tc.value)
+			if err != nil {
+				t.Fatalf("binary: %v (want encode to %v)", err, tc.wantBin)
+			}
+			if !bytes.Equal(bin, tc.wantBin) {
+				t.Errorf("binary: got %v want %v", bin, tc.wantBin)
+			}
+			// JSON side: should also produce null. Both 2-branch and
+			// 3-branch JSON paths route to "null" via the patched
+			// appendAvroJSONUnion (case "null" / 2-branch short-circuit).
+			js, err := s.AppendEncodeJSON(nil, tc.value)
+			if err != nil {
+				t.Fatalf("json: %v", err)
+			}
+			if string(js) != "null" {
+				t.Errorf("json: got %q want %q", js, "null")
+			}
+		})
+	}
+}
+
 // TestRegression_TimestampNanosMinInt64 locks in that
 // timeToTimestampNanos accepts time.Time values constructed from
 // MinInt64 nanoseconds since epoch, matching avro-rs and fastavro.
