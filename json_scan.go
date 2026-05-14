@@ -3,7 +3,6 @@ package avro
 import (
 	"fmt"
 	"math"
-	"strconv"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -310,12 +309,14 @@ func parseJSONInt64(b []byte) (int64, error) {
 	for ; i < len(b); i++ {
 		c := b[i]
 		if c == '.' || c == 'e' || c == 'E' {
-			// Has fractional/exponent part — parse as float and truncate.
-			f, err := strconv.ParseFloat(string(b), 64)
-			if err != nil {
-				return 0, fmt.Errorf("avro json: invalid number %q", b)
-			}
-			n, err := floatFitsInt64(f)
+			// Has fractional/exponent part — parse with arbitrary precision
+			// so values near the int64 boundary aren't silently truncated
+			// or rejected via float64 rounding (e.g. "-9.2233720368547758e18"
+			// = -9223372036854775800 is a valid int64 that float64 would
+			// round to int64.Min; "9.2233720368547758e18" = 9223372036854775800
+			// would float64-round to int64.Max+1 and be rejected). See
+			// parseInt64Lenient for the full rationale.
+			n, err := parseInt64Lenient(string(b))
 			if err != nil {
 				return 0, fmt.Errorf("avro json: %w", err)
 			}

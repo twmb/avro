@@ -2464,17 +2464,7 @@ func normalizeJSONNumber(n json.Number) any {
 func defaultAsInt32(val any) (int32, error) {
 	switch v := val.(type) {
 	case json.Number:
-		if i, err := v.Int64(); err == nil {
-			if i < math.MinInt32 || i > math.MaxInt32 {
-				return 0, fmt.Errorf("value %d overflows int32", i)
-			}
-			return int32(i), nil
-		}
-		f, err := v.Float64()
-		if err != nil {
-			return 0, fmt.Errorf("invalid number %s", v.String())
-		}
-		return floatFitsInt32(f)
+		return parseInt32Lenient(string(v))
 	case float64:
 		return floatFitsInt32(v)
 	}
@@ -2484,14 +2474,7 @@ func defaultAsInt32(val any) (int32, error) {
 func defaultAsInt64(val any) (int64, error) {
 	switch v := val.(type) {
 	case json.Number:
-		if i, err := v.Int64(); err == nil {
-			return i, nil
-		}
-		f, err := v.Float64()
-		if err != nil {
-			return 0, fmt.Errorf("invalid number %s", v.String())
-		}
-		return floatFitsInt64(f)
+		return parseInt64Lenient(string(v))
 	case float64:
 		return floatFitsInt64(v)
 	}

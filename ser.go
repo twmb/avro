@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -431,28 +432,116 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool) {
 	return reflect.ValueOf(f), true
 }
 
+// parseInt64Lenient parses s as a decimal integer, accepting pure-integer
+// form (fast path via strconv.ParseInt), exponent form (e.g. "1e3"), and
+// fractional form whose fractional part is zero (e.g. "1.0", "1.5e1"=15).
+// Rejects:
+//   - syntactically invalid numbers
+//   - whole-number values outside int64 range
+//   - fractional values with non-zero fractional part
+//   - 10^|exp| magnitudes beyond decimalScaleLimit (DoS bound)
+//
+// Slow-path parsing uses [boundedRatFromString] to get exact arbitrary-
+// precision representation, then checks IsInt + IsInt64. This avoids the
+// silent precision loss the prior strconv.ParseFloat + [floatFitsInt64]
+// fallback exhibited at the int64 boundary, where float64's 2048-unit
+// precision at magnitude 2^63 either:
+//
+//   - silently truncated values in (int64.Min-1024, int64.Min) to
+//     int64.Min — e.g. "-9223372036854775809" or "-9.223372036854776832e18"
+//     both encoded as int64.Min wire bytes, off-by-N data corruption.
+//
+//   - silently rejected valid int64 values in exponent form whose float64
+//     rounding crossed the int64 boundary — e.g. "9.2233720368547758e18"
+//     (= 9223372036854775800, a valid int64) was rejected as overflow
+//     because float64 rounded it to +1<<63.
+//
+// Java's BigDecimal-based JsonNode.canConvertToLong() and fastavro's
+// Cython long64 overflow check both use arbitrary precision; the prior
+// float64 fallback was twmb's only precision hole at this boundary.
+//
+// Shared by every site that converts a string-form numeric to int64 for
+// Avro long encoding/decoding: [jsonNumberToInt64] (binary encode of
+// json.Number against int/long), [defaultAsInt64] (schema default
+// validate + encodeDefault), [jsonCoerceToInt64] (JSON encode of
+// json.Number / lenient string), and [parseJSONInt64]'s exponent /
+// fractional branch (JSON decode of long from exponent form). One
+// helper, one rule across all four sites.
+func parseInt64Lenient(s string) (int64, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err == nil {
+		return n, nil
+	}
+	// ParseInt failed. For pure-integer-form overflow (ErrRange, no .eE),
+	// reject directly — value is definitionally outside int64 range and
+	// the boundedRatFromString fallback would only confirm what ErrRange
+	// already proved. ErrSyntax (anything else: exponent/fractional/
+	// non-numeric) falls through to the arbitrary-precision path for a
+	// precise IsInt+IsInt64 check and an accurate error message.
+	if errors.Is(err, strconv.ErrRange) && !strings.ContainsAny(s, ".eE") {
+		return 0, fmt.Errorf("value %s overflows int64", s)
+	}
+	// Length cap on slow-path inputs bounds boundedRatFromString's O(n²)
+	// big.Rat.SetString cost on hostile inputs. Legit int64 in exponent
+	// form fits in ~30 chars; 64 is generous. boundedRatFromString itself
+	// caps at 1 MiB + decimalScaleLimit (decimal-logical-type DoS
+	// posture), looser than int64 needs.
+	if len(s) > maxInt64LenientLen {
+		return 0, fmt.Errorf("value %s exceeds int64-input length cap (%d)", s, maxInt64LenientLen)
+	}
+	r, ok, perr := boundedRatFromString(s)
+	if perr != nil {
+		return 0, perr
+	}
+	if !ok {
+		return 0, fmt.Errorf("invalid number %s", s)
+	}
+	if !r.IsInt() {
+		return 0, fmt.Errorf("value %s is not a whole number", s)
+	}
+	bi := r.Num()
+	if !bi.IsInt64() {
+		return 0, fmt.Errorf("value %s overflows int64", s)
+	}
+	return bi.Int64(), nil
+}
+
+// maxInt64LenientLen caps the input length parseInt64Lenient routes
+// through boundedRatFromString → big.Rat.SetString (O(n²)). The longest
+// legit int64 input in exponent form ("-9.223372036854775808e18" = 24
+// chars) plus generous padding fits in 64. Pure-integer-form overflow
+// is rejected before this check via the strconv.ParseInt + ContainsAny
+// short-circuit, so this cap only affects exponent/fractional inputs.
+const maxInt64LenientLen = 64
+
+// parseInt32Lenient is [parseInt64Lenient] with int32 range narrowing.
+// Shares the same arbitrary-precision parsing so fractional-part-lost-
+// to-float64-rounding inputs like "1.0000000000000001" are correctly
+// rejected as non-whole rather than silently truncating to 1 via float64.
+// Used by [defaultAsInt32] (schema int default validate) and
+// [jsonCoerceToInt32] (JSON encode of json.Number against int). The
+// pure-integer-form fast path goes through strconv.ParseInt → int64 →
+// int32 narrowing; only fractional/exponent form pays the big.Rat cost.
+func parseInt32Lenient(s string) (int32, error) {
+	n, err := parseInt64Lenient(s)
+	if err != nil {
+		return 0, err
+	}
+	if n < math.MinInt32 || n > math.MaxInt32 {
+		return 0, fmt.Errorf("value %s overflows int32", s)
+	}
+	return int32(n), nil
+}
+
 // jsonNumberToInt64 converts a json.Number reflect.Value to a validated int64,
-// checking that the value is a whole number within int64 range. It tries
-// Int64() first for full int64 precision, falling back to Float64() for
-// exponent notation (e.g. "1.5e3") and fractional detection. The returned
+// checking that the value is a whole number within int64 range. Routes
+// through [parseInt64Lenient] for precision-preserving parsing. The returned
 // error is bare; callers wrap it in their SemanticError.
 func jsonNumberToInt64(v reflect.Value) (int64, bool, error) {
 	if v.Type() != jsonNumberType {
 		return 0, false, nil
 	}
-	jn := v.Interface().(json.Number)
-	// Try exact integer parse first — handles the full int64 range
-	// without float64 precision loss.
-	if n, err := jn.Int64(); err == nil {
-		return n, true, nil
-	}
-	// Fall back to float64 for exponent notation (strconv rejects "1.5e3"
-	// as an integer) and fractional detection.
-	f, err := jn.Float64()
-	if err != nil {
-		return 0, true, fmt.Errorf("value %s is not a valid number", jn)
-	}
-	n, err := floatFitsInt64(f)
+	n, err := parseInt64Lenient(string(v.Interface().(json.Number)))
 	if err != nil {
 		return 0, true, err
 	}

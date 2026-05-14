@@ -1094,18 +1094,7 @@ func jsonCoerceToInt32(v reflect.Value) (int32, error) {
 		return n, nil
 	}
 	if v.Type() == jsonNumberType {
-		jn := v.Interface().(json.Number)
-		if n, err := jn.Int64(); err == nil {
-			if n < math.MinInt32 || n > math.MaxInt32 {
-				return 0, fmt.Errorf("avro json: value %s overflows int32", jn)
-			}
-			return int32(n), nil
-		}
-		f, err := jn.Float64()
-		if err != nil {
-			return 0, fmt.Errorf("avro json: invalid json.Number for int: %s", jn)
-		}
-		n, err := floatFitsInt32(f)
+		n, err := parseInt32Lenient(string(v.Interface().(json.Number)))
 		if err != nil {
 			return 0, fmt.Errorf("avro json: %w", err)
 		}
@@ -1135,15 +1124,7 @@ func jsonCoerceToInt64(v reflect.Value) (int64, error) {
 		return n, nil
 	}
 	if v.Type() == jsonNumberType {
-		jn := v.Interface().(json.Number)
-		if n, err := jn.Int64(); err == nil {
-			return n, nil
-		}
-		f, err := jn.Float64()
-		if err != nil {
-			return 0, fmt.Errorf("avro json: invalid json.Number for long: %s", jn)
-		}
-		n, err := floatFitsInt64(f)
+		n, err := parseInt64Lenient(string(v.Interface().(json.Number)))
 		if err != nil {
 			return 0, fmt.Errorf("avro json: %w", err)
 		}
