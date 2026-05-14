@@ -6024,6 +6024,134 @@ func TestRegression_DecodeJSONIntoAnyDefaultFillTypeConsistency(t *testing.T) {
 	})
 }
 
+// TestRegression_JSONDecodeFillsZeroByteDefault locks JSON DecodeJSON's
+// default-fill for record fields whose schema-encoded default is exactly
+// 0 wire bytes — null-typed fields, empty-record fields, and records
+// whose every field is null-typed. Pre-fix applyFieldDefault rejected
+// empty defaultBytes with "record has no pre-encoded default for field
+// N", conflating "no default registered" (caller already gated on
+// hasDefault) with "valid 0-byte default" (legitimate for these types).
+//
+// Binary resolved decode and JSON encode default-fill both handle these
+// correctly: binary appends 0 bytes for the missing-from-writer field;
+// EncodeJSON walks the parsed defaultVal directly, not defaultBytes.
+// The bug was a JSON-decode-only divergence from twmb's own binary path
+// AND from the project's stated fastavro parity for default-fill (per
+// fastavro/io/json_decoder.py:55-78 returning symbol.get_default() for
+// any default including None). Java is irrelevant here since
+// JsonDecoder rejects all missing fields outright.
+//
+// Subtests cover the three default-fill target paths
+// (decodeRecordAny / typed-map / struct) and the three zero-byte
+// shapes (top-level null field, empty inner record, all-null-fields
+// inner record).
+func TestRegression_JSONDecodeFillsZeroByteDefault(t *testing.T) {
+	t.Run("null_field_default_into_any", func(t *testing.T) {
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
+			{"name":"x","type":"null","default":null}
+		]}`)
+		var got any
+		if err := s.DecodeJSON([]byte(`{}`), &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("decoded is %T, want map[string]any", got)
+		}
+		if v, present := m["x"]; !present || v != nil {
+			t.Fatalf("x: got present=%v val=%v, want present=true val=nil", present, v)
+		}
+	})
+	t.Run("null_field_default_into_typed_map", func(t *testing.T) {
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
+			{"name":"x","type":"null","default":null},
+			{"name":"y","type":"int"}
+		]}`)
+		got := make(map[string]any)
+		if err := s.DecodeJSON([]byte(`{"y":42}`), &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if v, present := got["x"]; !present || v != nil {
+			t.Fatalf("x: got present=%v val=%v, want present=true val=nil", present, v)
+		}
+	})
+	t.Run("null_field_default_into_struct", func(t *testing.T) {
+		type R struct {
+			X any   `avro:"x"`
+			Y int32 `avro:"y"`
+		}
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
+			{"name":"x","type":"null","default":null},
+			{"name":"y","type":"int"}
+		]}`)
+		var got R
+		if err := s.DecodeJSON([]byte(`{"y":42}`), &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.X != nil || got.Y != 42 {
+			t.Fatalf("got %+v, want {X:nil Y:42}", got)
+		}
+	})
+	t.Run("empty_inner_record_default", func(t *testing.T) {
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
+			{"name":"r","type":{"type":"record","name":"Inner","fields":[]},"default":{}}
+		]}`)
+		var got map[string]any
+		if err := s.DecodeJSON([]byte(`{}`), &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		r, ok := got["r"].(map[string]any)
+		if !ok {
+			t.Fatalf("r: got %T, want map[string]any", got["r"])
+		}
+		if len(r) != 0 {
+			t.Fatalf("r: got %v, want empty map", r)
+		}
+	})
+	t.Run("all_null_fields_inner_record_default", func(t *testing.T) {
+		s := mustParse(t, `{"type":"record","name":"R","fields":[
+			{"name":"r","type":{"type":"record","name":"Inner","fields":[
+				{"name":"x","type":"null"}
+			]},"default":{"x":null}}
+		]}`)
+		var got map[string]any
+		if err := s.DecodeJSON([]byte(`{}`), &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		r, ok := got["r"].(map[string]any)
+		if !ok {
+			t.Fatalf("r: got %T, want map[string]any", got["r"])
+		}
+		if v, present := r["x"]; !present || v != nil {
+			t.Fatalf("r.x: got present=%v val=%v, want present=true val=nil", present, v)
+		}
+	})
+	t.Run("binary_resolved_decode_parity", func(t *testing.T) {
+		// Cross-check: the binary path handles all three shapes correctly,
+		// confirming the bug was JSON-decode-only.
+		writer := mustParse(t, `{"type":"record","name":"R","fields":[]}`)
+		reader := mustParse(t, `{"type":"record","name":"R","fields":[
+			{"name":"x","type":"null","default":null},
+			{"name":"r","type":{"type":"record","name":"Inner","fields":[]},"default":{}}
+		]}`)
+		res, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		var got map[string]any
+		if _, err := res.Decode(nil, &got); err != nil {
+			t.Fatalf("binary resolved Decode: %v", err)
+		}
+		if v, present := got["x"]; !present || v != nil {
+			t.Fatalf("binary x: got present=%v val=%v", present, v)
+		}
+		r, ok := got["r"].(map[string]any)
+		if !ok || len(r) != 0 {
+			t.Fatalf("binary r: got %v, want empty map", got["r"])
+		}
+	})
+}
+
 // TestRegression_DecimalScaleAllocBound locks in DoS resistance against
 // wire-controlled big-decimal scale and schema-controlled regular-
 // decimal precision/scale. Pre-fix every site computing 10^scale

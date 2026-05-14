@@ -1062,14 +1062,18 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 
 // applyFieldDefault decodes the field's pre-encoded binary default
 // into target via the field's binary deserfn.
+//
+// A zero-length defaultBytes is a *valid* default for any field whose
+// wire encoding is naturally 0 bytes — null-typed fields, empty-record
+// fields, and records whose every field is null-typed. The caller
+// (iterateRecordFields) gates on f.hasDefault before invoking us, so
+// presence of a default is already authoritative; the structural check
+// below only guards a malformed schema where serRecord is missing.
 func (ctx *jsonDecoder) applyFieldDefault(target reflect.Value, node *schemaNode, idx int) error {
 	if node.serRecord == nil || idx >= len(node.serRecord.fields) {
 		return fmt.Errorf("record has no pre-encoded default for field %d", idx)
 	}
 	enc := node.serRecord.fields[idx].defaultBytes
-	if len(enc) == 0 {
-		return fmt.Errorf("record has no pre-encoded default for field %d", idx)
-	}
 	// Copy the encoded bytes — deserfns may slab-substring into src
 	// and we don't want them to reach into the schema's shared default.
 	src := append([]byte(nil), enc...)
