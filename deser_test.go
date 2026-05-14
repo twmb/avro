@@ -11968,6 +11968,158 @@ func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
 	}
 }
 
+// TestRegression_EncodeJSONNullParity locks binary↔JSON encode parity
+// for the plain "null" Avro type across every site that reaches serNull
+// or appendAvroJSON's case "null" arm. Pre-fix #1 (JSON branch added the
+// errNonNil check): the JSON encoder's `case "null"` arm in
+// appendAvroJSON emitted the literal `null` regardless of v's content,
+// while binary serNull (ser.go:281) rejected non-nil with errNonNil —
+// silently dropping the user's input on the JSON path. Pre-fix #2
+// (serNull added the Interface peel): the generic serUnion / serArray /
+// serMap dispatch calls serNull with iter.Value() Kind=Interface
+// wrapping a typed-nil; binary returned errNonNil while JSON's indirect
+// loop unwrapped the interface and emitted "null" — the same input
+// produced opposite results. The 2-branch [null,T] optimization wasn't
+// affected (serNullUnionAt → isNilValue already peels interfaces) which
+// is why this hid through ~79 audits: every typical 2-branch null
+// shape worked.
+//
+// The matrix covers both directions of parity (reject and accept) at
+// the four sites that route through serNull's kind-switch:
+//
+//   1. Top-level "null" schema (Schema.Encode / Schema.EncodeJSON).
+//   2. Null-typed record field — value goes through f.fn = serNull.
+//   3. Tagged-union null branch in a 3+ branch union — inner from
+//      tryUnwrapTagged is wrapped in Interface kind, not the 2-branch
+//      fast path.
+//   4. array<null> items (serArray.serItem = serNull) and map<null>
+//      values (similar).
+//
+// Cross-impl note: Java/fastavro are silently lenient on both binary
+// and JSON (GenericDatumWriter.NULL writes the marker without checking
+// datum; same in fastavro's write_null). twmb's binary path is
+// deliberately strict here per TestSerNullNonNilableType (ser_test.go)
+// — bringing the JSON path into parity with our strict-binary choice
+// rather than weakening the binary side to match Java.
+func TestRegression_EncodeJSONNullParity(t *testing.T) {
+	// ---- Reject arm: non-nil non-nilable values must error on both paths ----
+
+	t.Run("plain null schema, non-nil int", func(t *testing.T) {
+		s := MustParse(`"null"`)
+		if _, err := s.AppendEncode(nil, 42); err == nil {
+			t.Fatal("binary: expected error encoding non-nil into null schema")
+		}
+		if out, err := s.AppendEncodeJSON(nil, 42); err == nil {
+			t.Errorf("JSON: expected error encoding non-nil into null schema, got %s", out)
+		}
+	})
+	t.Run("null-typed record field, non-nil value", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"null"}]}`)
+		in := map[string]any{"x": 42}
+		if _, err := s.AppendEncode(nil, in); err == nil {
+			t.Fatal("binary: expected error encoding non-nil into null field")
+		}
+		if out, err := s.AppendEncodeJSON(nil, in); err == nil {
+			t.Errorf("JSON: expected error encoding non-nil into null field, got %s", out)
+		}
+	})
+	t.Run("tagged-union null tag with non-nil value", func(t *testing.T) {
+		s := MustParse(`["null","int"]`)
+		in := map[string]any{"null": 42}
+		if _, err := s.AppendEncode(nil, in); err == nil {
+			t.Fatal("binary: expected error for {\"null\":42} against [null,int]")
+		}
+		if out, err := s.AppendEncodeJSON(nil, in); err == nil {
+			t.Errorf("JSON: expected error for {\"null\":42} against [null,int], got %s", out)
+		}
+	})
+	t.Run("typed-nil map into null schema accepted", func(t *testing.T) {
+		// Symmetric positive case: a typed-nil map IS a valid no-value
+		// representation (matches serNull's IsNil arm for Map kind).
+		s := MustParse(`"null"`)
+		var m map[string]any
+		out, err := s.AppendEncodeJSON(nil, m)
+		if err != nil {
+			t.Fatalf("typed-nil map into null schema: %v", err)
+		}
+		if string(out) != "null" {
+			t.Errorf("got %q, want \"null\"", out)
+		}
+	})
+
+	// ---- Accept arm: typed-nil wrapped in any() must be recognized as
+	// null at every dispatch site that calls serNull on iter.Value()
+	// (the wrapped-Interface form). The 2-branch [null,T] case at the
+	// top-level uses serNullUnionAt → isNilValue and was already
+	// indirect-aware; the cases below all route through the generic
+	// serNull whose pre-fix kind switch saw Kind=Interface IsNil=false
+	// (the interface holds type info even though the wrapped value is
+	// a nil pointer/map). Each subtest exercises one of the four sites
+	// and asserts binary == JSON outcome.
+
+	parity := func(t *testing.T, s *Schema, in any) {
+		t.Helper()
+		_, binErr := s.AppendEncode(nil, in)
+		_, jsonErr := s.AppendEncodeJSON(nil, in)
+		if (binErr == nil) != (jsonErr == nil) {
+			t.Errorf("parity violation: binary err=%v, JSON err=%v", binErr, jsonErr)
+		}
+		if binErr != nil {
+			t.Errorf("binary rejected typed-nil-via-interface: %v", binErr)
+		}
+	}
+
+	t.Run("3-branch union tagged null with typed-nil pointer", func(t *testing.T) {
+		s := MustParse(`["null","int","string"]`)
+		parity(t, s, map[string]any{"null": (*int)(nil)})
+	})
+	t.Run("3-branch union tagged null with typed-nil map", func(t *testing.T) {
+		s := MustParse(`["null","int","string"]`)
+		parity(t, s, map[string]any{"null": map[string]any(nil)})
+	})
+	t.Run("3-branch union tagged null with typed-nil slice", func(t *testing.T) {
+		s := MustParse(`["null","int","string"]`)
+		parity(t, s, map[string]any{"null": []byte(nil)})
+	})
+	t.Run("array<null> with typed-nil pointer items", func(t *testing.T) {
+		s := MustParse(`{"type":"array","items":"null"}`)
+		parity(t, s, []any{(*int)(nil), (*int)(nil)})
+	})
+	t.Run("array<null> with typed-nil map items", func(t *testing.T) {
+		s := MustParse(`{"type":"array","items":"null"}`)
+		parity(t, s, []any{map[string]any(nil), map[string]any(nil)})
+	})
+	t.Run("map<null> with typed-nil pointer values", func(t *testing.T) {
+		s := MustParse(`{"type":"map","values":"null"}`)
+		parity(t, s, map[string]any{"a": (*int)(nil), "b": (*int)(nil)})
+	})
+	t.Run("map<null> with typed-nil map values", func(t *testing.T) {
+		s := MustParse(`{"type":"map","values":"null"}`)
+		parity(t, s, map[string]any{"a": map[string]any(nil)})
+	})
+	t.Run("record field 3-branch union, tagged null typed-nil pointer", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"x","type":["null","int","string"]}
+		]}`)
+		parity(t, s, map[string]any{"x": map[string]any{"null": (*int)(nil)}})
+	})
+	t.Run("record field 3-branch union, tagged null typed-nil map", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"x","type":["null","int","string"]}
+		]}`)
+		parity(t, s, map[string]any{"x": map[string]any{"null": map[string]any(nil)}})
+	})
+	t.Run("null-typed record field, typed-nil pointer value", func(t *testing.T) {
+		// Sibling: the map-fast-path of serRecord.ser implicitly
+		// unwraps via Go's interface unboxing (m["x"] returns the
+		// underlying nil pointer), so the value reaches serNull as
+		// Kind=Pointer not Kind=Interface and was always accepted.
+		// Pin it so a future change to that path can't regress.
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"null"}]}`)
+		parity(t, s, map[string]any{"x": (*int)(nil)})
+	})
+}
+
 // TestRegression_TimestampNanosMinInt64 locks in that
 // timeToTimestampNanos accepts time.Time values constructed from
 // MinInt64 nanoseconds since epoch, matching avro-rs and fastavro.

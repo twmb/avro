@@ -207,6 +207,22 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 
 	switch node.kind {
 	case "null":
+		// Validate v is nil-equivalent, mirroring serNull on the binary
+		// side. Pre-fix this arm emitted "null" unconditionally, so a
+		// non-nil value into a "null" schema was silently dropped — both
+		// at top level (Schema.EncodeJSON(42, "null")), as a null-typed
+		// record field, and via tagged-union dispatch ({"null": 42}
+		// against ["null", T]). Binary serNull (ser.go) returns errNonNil
+		// for the same shapes; matching that here keeps EncodeJSON ↔
+		// AppendEncode parity and prevents silent input loss.
+		switch v.Kind() {
+		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+			if !v.IsNil() {
+				return nil, errNonNil
+			}
+		default:
+			return nil, errNonNil
+		}
 		return append(buf, "null"...), nil
 
 	case "boolean":

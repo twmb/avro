@@ -282,6 +282,27 @@ func serNull(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 	if !v.IsValid() {
 		return dst, nil
 	}
+	// Peel interface layers so a typed-nil value reaching us inside an
+	// any wrapper (iter.Value() on a map[string]any in
+	// serUnion.tryUnwrapTagged, serArray.serItem over []any, serMap
+	// over map[string]any) is recognized as nil. Without the peel,
+	// any((*int)(nil)) and any(map[string]any(nil)) etc. have
+	// Kind()==Interface with IsNil()==false (the interface itself is
+	// non-nil — it holds type info) and the kind switch below would
+	// return errNonNil even though the user clearly meant "null."
+	// Mirrors appendAvroJSON's indirect loop on the JSON side and
+	// isNilValue's loop on the 2-branch [null,T] optimization.
+	// Bounded by maxIndirectDepth so a self-referential interface
+	// (var p any; p = &p) terminates.
+	for range maxIndirectDepth {
+		if v.Kind() != reflect.Interface {
+			break
+		}
+		if v.IsNil() {
+			return dst, nil
+		}
+		v = v.Elem()
+	}
 	switch v.Kind() {
 	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
 		if v.IsNil() {

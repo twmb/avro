@@ -419,14 +419,24 @@ func TestDecodeBytesIntoWrongType(t *testing.T) {
 
 func TestEncodeJSONNullSchema(t *testing.T) {
 	s, _ := Parse(`"null"`)
-	// Non-nil value with null schema — should still write "null".
-	b, err := s.EncodeJSON("ignored")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(b) != "null" {
-		t.Errorf("got %s", b)
-	}
+	// Nil values produce "null" wire output.
+	t.Run("nil value", func(t *testing.T) {
+		b, err := s.EncodeJSON(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "null" {
+			t.Errorf("got %s", b)
+		}
+	})
+	// Non-nil values must error, matching binary serNull's errNonNil
+	// rejection. Pre-fix this arm emitted "null" silently and lost the
+	// caller's input — see TestRegression_EncodeJSONNullParity.
+	t.Run("non-nil value rejected", func(t *testing.T) {
+		if out, err := s.EncodeJSON("ignored"); err == nil {
+			t.Errorf("expected error encoding non-nil value into null schema, got %s", out)
+		}
+	})
 }
 
 func TestEncodeJSONDecimalFixedRoundTrip(t *testing.T) {
