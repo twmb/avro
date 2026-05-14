@@ -758,10 +758,42 @@ func (rd *Reader) readBlock() error {
 	if err != nil {
 		return fmt.Errorf("ocf: decompressing block: %w", err)
 	}
+	// Bound count against the decompressed block length plus a small
+	// slack for zero-byte-record schemas (EmptyRecord, records of all
+	// null-typed fields). Each Avro record encodes to at least 0 bytes;
+	// for non-zero-byte schemas count > len(block) is corruption, and
+	// for zero-byte schemas count can grow unboundedly relative to len
+	// (block) unless capped — without this check a 5-byte zigzag varint
+	// claiming count=10^9 against a zero-byte schema would force the
+	// user's `for rd.Decode(&v) == nil` loop to iterate that many times
+	// (each call advancing rd.block by 0 bytes), producing a ~10^9 CPU
+	// amplification on a tiny attacker input.
+	//
+	// Mirrors the maxZeroByteItems philosophy in deser.go:558 (Avro
+	// array<null> / array<EmptyRecord> block-count cap): legitimate use
+	// of zero-byte records with more than a few thousand per block is
+	// essentially always a schema-design problem; tighter producers can
+	// split into multiple blocks.
+	//
+	// Java's DataFileStream (DataFileStream.java:303) and fastavro's
+	// _iter_avro_records (_read_py.py:807) leave this uncapped. twmb's
+	// defense-in-depth strategy already applies the same shape to Avro
+	// arrays and maps; OCF blocks are the structural twin.
+	if count > int64(len(block))+maxOCFZeroByteSlack {
+		return fmt.Errorf("ocf: block claims %d records but decompressed block is %d bytes (zero-byte slack: %d)",
+			count, len(block), maxOCFZeroByteSlack)
+	}
 	rd.block = block
 	rd.remain = count
 	return nil
 }
+
+// maxOCFZeroByteSlack is the cap on count - len(block) for an OCF block.
+// Records that encode to >= 1 wire byte are bounded by len(block) directly;
+// records that encode to 0 bytes (EmptyRecord and records whose every field
+// is "null"-typed) consume this slack instead. Matches maxZeroByteItems in
+// deser.go for Avro array<null>/array<EmptyRecord> block-counts.
+const maxOCFZeroByteSlack = 4 << 10
 
 // ---------- codecs ----------
 

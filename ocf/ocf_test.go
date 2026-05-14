@@ -3454,6 +3454,194 @@ func TestRegression_OCFBlockEnvelopeInvariant(t *testing.T) {
 	}
 }
 
+// TestRegression_OCFBlockCountCap locks in the DoS-resistance cap on
+// the OCF block count, which was previously uncapped. For zero-byte
+// record schemas (EmptyRecord, records of all-null-typed fields) every
+// record encodes to 0 wire bytes; without the cap an attacker could
+// claim ~10^9 records in a 5-byte zigzag-varint count, forcing the
+// user's `for rd.Decode(&v) == nil` loop to iterate that many times
+// (each call advancing rd.block by 0 bytes) from a tiny attacker input
+// — ~10^9 CPU amplification.
+//
+// The cap (readBlock in ocf.go) bounds count by
+//
+//	len(decompressed block) + maxOCFZeroByteSlack
+//
+// where the slack matches deser.go:558's maxZeroByteItems philosophy
+// for Avro array<null>/array<EmptyRecord> block-counts. Legitimate
+// zero-byte schemas split into multiple blocks when the per-block
+// record count exceeds the slack.
+//
+// Java's DataFileStream (lang/java/avro/src/main/java/org/apache/avro/
+// file/DataFileStream.java:303) and fastavro's _iter_avro_records
+// (_read_py.py:807) leave this uncapped — this cap is twmb's
+// defense-in-depth extension matching its existing array/map caps.
+func TestRegression_OCFBlockCountCap(t *testing.T) {
+	zigzag := func(n int64) []byte {
+		u := uint64(n<<1) ^ uint64(n>>63)
+		var buf []byte
+		for u >= 0x80 {
+			buf = append(buf, byte(u)|0x80)
+			u >>= 7
+		}
+		return append(buf, byte(u))
+	}
+
+	// Build a header-only OCF for a schema and extract the sync marker.
+	headerAndSync := func(t *testing.T, schemaJSON string) ([]byte, []byte) {
+		t.Helper()
+		s, err := avro.Parse(schemaJSON)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		w, err := NewWriter(&buf, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		hdr := buf.Bytes()
+		return hdr, hdr[len(hdr)-16:]
+	}
+
+	t.Run("zero-byte schema, count > slack", func(t *testing.T) {
+		hdr, sync := headerAndSync(t, `{"type":"record","name":"E","fields":[]}`)
+		var mb []byte
+		mb = append(mb, hdr...)
+		mb = append(mb, zigzag(1_000_000_000)...) // count = 10^9
+		mb = append(mb, zigzag(0)...)             // size = 0 (empty block payload)
+		mb = append(mb, sync...)
+
+		rd, err := NewReader(bytes.NewReader(mb))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rd.Close()
+
+		var v map[string]any
+		err = rd.Decode(&v)
+		if err == nil || err == io.EOF {
+			t.Fatalf("expected error rejecting huge block count, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "zero-byte slack") {
+			t.Fatalf("expected error containing %q, got: %v", "zero-byte slack", err)
+		}
+	})
+
+	t.Run("zero-byte schema, count at slack boundary", func(t *testing.T) {
+		// count == maxOCFZeroByteSlack (4096) should be accepted; the
+		// reader iterates 4096 times without complaint. This pins that
+		// the cap is the documented slack, not a tighter bound.
+		const slack = 4 << 10
+		hdr, sync := headerAndSync(t, `{"type":"record","name":"E","fields":[]}`)
+		var mb []byte
+		mb = append(mb, hdr...)
+		mb = append(mb, zigzag(slack)...)
+		mb = append(mb, zigzag(0)...)
+		mb = append(mb, sync...)
+
+		rd, err := NewReader(bytes.NewReader(mb))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rd.Close()
+
+		iter := 0
+		for {
+			var v map[string]any
+			err := rd.Decode(&v)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("unexpected error at iter %d: %v", iter, err)
+			}
+			iter++
+			if iter > slack+10 {
+				t.Fatalf("reader iterated past slack boundary (%d > %d)", iter, slack)
+			}
+		}
+		if iter != slack {
+			t.Errorf("expected %d iterations (at slack), got %d", slack, iter)
+		}
+	})
+
+	t.Run("non-zero-byte schema, count exceeds block size", func(t *testing.T) {
+		// Schema with minItemBytes >= 1 per record. Attacker claims
+		// 10^9 records but block size is small (here, empty after the
+		// initial valid record block). The cap rejects since
+		// count > len(block) + slack with len(block) ~ 0.
+		hdr, sync := headerAndSync(t, `"long"`)
+		var mb []byte
+		mb = append(mb, hdr...)
+		mb = append(mb, zigzag(1_000_000_000)...)
+		mb = append(mb, zigzag(0)...)
+		mb = append(mb, sync...)
+
+		rd, err := NewReader(bytes.NewReader(mb))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rd.Close()
+
+		var v int64
+		err = rd.Decode(&v)
+		if err == nil || err == io.EOF {
+			t.Fatalf("expected error rejecting huge count for empty block, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "zero-byte slack") {
+			t.Fatalf("expected error containing %q, got: %v", "zero-byte slack", err)
+		}
+	})
+
+	t.Run("legitimate non-zero-byte schema unaffected", func(t *testing.T) {
+		// Write a legitimate OCF with 5000 long records — count well
+		// past the 4096 zero-byte slack, but len(block) >= count so
+		// the check accepts.
+		s, err := avro.Parse(`"long"`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		w, err := NewWriter(&buf, s, WithBlockCount(10_000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		const n = 5000
+		for i := range n {
+			if err := w.Encode(int64(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		rd, err := NewReader(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rd.Close()
+		iter := 0
+		for {
+			var v int64
+			err := rd.Decode(&v)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("unexpected error at iter %d: %v", iter, err)
+			}
+			iter++
+		}
+		if iter != n {
+			t.Errorf("expected %d records, got %d", n, iter)
+		}
+	})
+}
+
 func TestRegression_OCFBigDecimalJavaInterop(t *testing.T) {
 	data, err := os.ReadFile("testdata/bigdec.avro")
 	if err != nil {
