@@ -5819,6 +5819,267 @@ func TestRegression_JsonNumberOverflowToInfFloatEncodeParity(t *testing.T) {
 	})
 }
 
+// TestRegression_SchemaDefaultOverflowToInfParity is the schema-default-
+// parse-time sibling of TestRegression_JsonNumberOverflowToInfFloatEncodeParity.
+// The encode-side fix (commit ae99f46) accepted (±Inf, strconv.ErrRange)
+// at jsonNumberToFloat / jsonCoerceToFloat64 but left the same predicate
+// missing at three schema-default parse sites:
+//
+//   - defaultAsFloat64 json.Number arm (schema.go:2497)
+//   - defaultAsFloat64 string arm     (schema.go:2511)
+//   - coerceDefault                    (schema.go:2567)
+//
+// All three were subsequently fixed to mirror the encode side. Smoking-
+// gun probe pre-fix:
+//
+//	avro.Parse(`{"type":"record",...,"default":1e1000}`)  -> rejected
+//	s := avro.Parse(`"double"`)
+//	s.AppendEncode(nil, json.Number("1e1000"))            -> +Inf wire bits
+//	s.Decode(+Inf wire bytes, &f64)                       -> f64 = +Inf
+//
+// Java's Schema.parseField (Schema.java:1899-1902) converts textual
+// float/double defaults via Double.parseDouble, which returns +Inf for
+// "1e1000" without throwing; Jackson's DoubleNode(+Inf) passes the
+// isValidDefault.isNumber() gate (Schema.java:1764-1766). fastavro's
+// _default_matches_schema (fastavro/_schema_py.py:351-352) accepts via
+// _maybe_float(default) == float("1e1000") == inf, isinstance float.
+// Both upstream impls accept; the prior twmb behavior rejected.
+//
+// The matrix below pins the parse acceptance AND the round-trip wire
+// value (+Inf bits) for the parsed default across the four arms it can
+// reach: literal-numeric default vs string-form default × float vs
+// double schema, the negative-overflow sign mirror, the boundary
+// finite-but-just-below-MaxFloat64, the union-shape variant (a
+// "Known intentional divergence" twmb accepts where Java rejects, and
+// the overflow subcase must remain consistent with that), the nested-
+// record carrier, and the still-rejects-syntax-error confirmation.
+func TestRegression_SchemaDefaultOverflowToInfParity(t *testing.T) {
+	type acceptCase struct {
+		name         string
+		schema       string
+		expectNegInf bool
+		// Floats produce 4-byte wire defaults; doubles 8 bytes.
+		// binaryWireWantHex covers the materialized default wire bytes
+		// observable through encoding an empty record (which fires the
+		// schema default for the missing field). Hex is little-endian
+		// IEEE 754 bits.
+		binaryWireWantHex string
+	}
+	cases := []acceptCase{
+		{
+			name:              "float_literal_positive_overflow_1e1000",
+			schema:            `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":1e1000}]}`,
+			binaryWireWantHex: "0000807f", // float +Inf
+		},
+		{
+			name:              "float_literal_negative_overflow_-1e1000",
+			schema:            `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":-1e1000}]}`,
+			expectNegInf:      true,
+			binaryWireWantHex: "000080ff", // float -Inf
+		},
+		{
+			name:              "double_literal_positive_overflow_1e1000",
+			schema:            `{"type":"record","name":"R","fields":[{"name":"f","type":"double","default":1e1000}]}`,
+			binaryWireWantHex: "000000000000f07f", // double +Inf
+		},
+		{
+			name:              "double_literal_negative_overflow_-1.8e308",
+			schema:            `{"type":"record","name":"R","fields":[{"name":"f","type":"double","default":-1.8e308}]}`,
+			expectNegInf:      true,
+			binaryWireWantHex: "000000000000f0ff", // double -Inf
+		},
+		{
+			// "Known intentional divergence": string-form float defaults
+			// against a single-type field route through coerceDefault's
+			// string→float64 ParseFloat. The overflow subcase must accept
+			// for the divergence to be coherent — pre-fix it rejected,
+			// stranding string-form overflow callers between encode-side
+			// acceptance and parse-side rejection.
+			name:              "float_string_form_positive_overflow_1e1000",
+			schema:            `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"1e1000"}]}`,
+			binaryWireWantHex: "0000807f",
+		},
+		{
+			name:              "double_string_form_negative_overflow_-1e1000",
+			schema:            `{"type":"record","name":"R","fields":[{"name":"f","type":"double","default":"-1e1000"}]}`,
+			expectNegInf:      true,
+			binaryWireWantHex: "000000000000f0ff",
+		},
+		{
+			// Union-shape string-form default: twmb's "Known intentional
+			// divergence" accepts this where Java rejects. The overflow
+			// subcase must remain consistent with the non-overflow form
+			// (e.g. `["float","null"]` with `"3.14"`), which the
+			// non-overflow union test elsewhere already pins. Wire bytes
+			// include the leading union branch index varint (0 for the
+			// float branch at position 0) before the 4-byte float +Inf.
+			name:              "union_float_null_string_form_overflow_1e1000",
+			schema:            `{"type":"record","name":"R","fields":[{"name":"f","type":["float","null"],"default":"1e1000"}]}`,
+			binaryWireWantHex: "000000807f", // varint(0) || float +Inf
+		},
+		{
+			// Nested record carrier — exercises the same defaultAsFloat64
+			// path through the inner record's field-default validate.
+			name:              "nested_record_float_literal_overflow_1e1000",
+			schema:            `{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"type":"record","name":"Inner","fields":[{"name":"f","type":"float","default":1e1000}]}}]}`,
+			binaryWireWantHex: "0000807f", // emitted for inner.f's default
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("schema parse rejected an overflow-to-±Inf default: %v\n  schema: %s", err, tc.schema)
+			}
+			// Pre-encode the default into binary by encoding an empty
+			// map (so the schema's default for the absent field fires
+			// from sr.fields[i].defaultBytes). For the nested carrier,
+			// pass a single-key map whose value is an empty inner map.
+			var (
+				bin []byte
+				en  error
+			)
+			if strings.Contains(tc.name, "nested_record") {
+				bin, en = s.AppendEncode(nil, map[string]any{"inner": map[string]any{}})
+			} else {
+				bin, en = s.AppendEncode(nil, map[string]any{})
+			}
+			if en != nil {
+				t.Fatalf("encode empty record (default fires): %v", en)
+			}
+			gotHex := hex.EncodeToString(bin)
+			if gotHex != tc.binaryWireWantHex {
+				t.Errorf("default wire bytes: got %s, want %s", gotHex, tc.binaryWireWantHex)
+			}
+			// Round-trip the binary back into a map and confirm the
+			// materialized value is ±Inf.
+			var dec map[string]any
+			if _, err := s.Decode(bin, &dec); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			val := dec["f"]
+			if strings.Contains(tc.name, "nested_record") {
+				inner, ok := dec["inner"].(map[string]any)
+				if !ok {
+					t.Fatalf("nested carrier missing inner map: got %T", dec["inner"])
+				}
+				val = inner["f"]
+			}
+			var f64 float64
+			switch v := val.(type) {
+			case float32:
+				f64 = float64(v)
+			case float64:
+				f64 = v
+			default:
+				t.Fatalf("unexpected materialized type %T %v", val, val)
+			}
+			if !math.IsInf(f64, 0) {
+				t.Errorf("materialized default %v, expected ±Inf", f64)
+			}
+			if tc.expectNegInf != math.IsInf(f64, -1) {
+				t.Errorf("sign mismatch: got %v, expectNegInf=%v", f64, tc.expectNegInf)
+			}
+		})
+	}
+
+	// Boundary: just-below MaxFloat64 (ParseFloat returns finite, no
+	// ErrRange) must continue to materialize the exact finite value,
+	// not snap to Inf via the new acceptance arm. Same boundary as the
+	// encode-side test's just_below_MaxFloat64_stays_finite subcase.
+	t.Run("just_below_MaxFloat64_default_stays_finite", func(t *testing.T) {
+		schemaSrc := `{"type":"record","name":"R","fields":[{"name":"f","type":"double","default":1.7976931348623157e308}]}`
+		s, err := avro.Parse(schemaSrc)
+		if err != nil {
+			t.Fatalf("schema parse rejected near-MaxFloat64 default: %v", err)
+		}
+		bin, err := s.AppendEncode(nil, map[string]any{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var dec map[string]any
+		if _, err := s.Decode(bin, &dec); err != nil {
+			t.Fatal(err)
+		}
+		f, ok := dec["f"].(float64)
+		if !ok {
+			t.Fatalf("unexpected type %T", dec["f"])
+		}
+		if math.IsInf(f, 0) {
+			t.Errorf("MaxFloat64 default must stay finite; got %v", f)
+		}
+		if f != math.MaxFloat64 {
+			t.Errorf("MaxFloat64 default materialized as %v, want %v", f, math.MaxFloat64)
+		}
+	})
+
+	// Float-arm-specific boundary: finite float64 magnitudes that
+	// overflow when narrowed to float32 must still reject (the float
+	// arm's encodeDefault calls finiteFloat32Overflows). My fix only
+	// changes the ErrRange path; finite-but-narrows-to-Inf still
+	// rejects via the pre-existing narrowing guard.
+	t.Run("float_default_finite_but_overflows_float32_rejects", func(t *testing.T) {
+		// 1e100 is finite in float64 but overflows float32 to +Inf.
+		schemaSrc := `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":1e100}]}`
+		if _, err := avro.Parse(schemaSrc); err == nil {
+			t.Errorf("expected reject for float64-finite-but-float32-overflow default")
+		}
+	})
+
+	// Syntax errors at the json.Number arm still reject (gated by
+	// isJSONNumber upstream of ParseFloat).
+	t.Run("json_number_syntax_error_still_rejects", func(t *testing.T) {
+		schemaSrc := `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":1e}]}`
+		// JSON itself rejects the literal at unmarshalDefault; the
+		// schema parse therefore fails at a step before defaultAsFloat64
+		// is reached. This case confirms the reject path is upstream.
+		if _, err := avro.Parse(schemaSrc); err == nil {
+			t.Errorf("expected JSON syntax reject for 1e literal")
+		}
+	})
+
+	// Syntax errors at the string arm: a non-numeric string default
+	// against a float/double schema still rejects (ParseFloat returns
+	// ErrSyntax, not ErrRange — the IsInf check fails, fall to reject).
+	t.Run("string_arm_syntax_error_still_rejects", func(t *testing.T) {
+		schemaSrc := `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"hello"}]}`
+		if _, err := avro.Parse(schemaSrc); err == nil {
+			t.Errorf("expected ErrSyntax reject for non-numeric string default")
+		}
+	})
+
+	// String-form "Infinity"/"NaN" literal defaults (existing intentional
+	// divergence, see also TestRegression_SpecialFloatStringDefaults
+	// elsewhere): ParseFloat("Infinity") returns (Inf, nil) — no error
+	// — so the existing path always worked. My fix does NOT change this
+	// case; locked here as a sanity check that the named-float forms
+	// still flow through their non-error path.
+	t.Run("infinity_string_literal_default_unaffected", func(t *testing.T) {
+		schemaSrc := `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"Infinity"}]}`
+		s, err := avro.Parse(schemaSrc)
+		if err != nil {
+			t.Fatalf("schema parse rejected Infinity-literal default: %v", err)
+		}
+		bin, err := s.AppendEncode(nil, map[string]any{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hex.EncodeToString(bin) != "0000807f" {
+			t.Errorf("Infinity default wire bytes mismatch: %x", bin)
+		}
+	})
+
+	// Cross-implementation parity statement: the schema-parse acceptance
+	// here mirrors Java (Schema.java:1764-1766 isValidDefault returns
+	// defaultValue.isNumber() for FLOAT/DOUBLE; DoubleNode(+Inf) is a
+	// number) and fastavro (_schema_py.py:351-352 _default_matches_schema
+	// runs _maybe_float and float("1e1000") returns inf which IS a
+	// Python float). Without the fix, twmb diverged from both — the
+	// schema parsed elsewhere but rejected here, even though the parsed
+	// schema's own encoder accepted the same input after the prior
+	// encode-side fix at ae99f46.
+}
+
 // TestSpecBareTypeNameInObjectAccepted locks in that {"type":"Node"}
 // as a wrapped reference to a previously-declared named type is
 // accepted at parse and the wrapped/bare forms produce equivalent

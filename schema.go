@@ -2496,6 +2496,18 @@ func defaultAsFloat64(val any) (float64, error) {
 		}
 		f, err := strconv.ParseFloat(s, 64)
 		if err != nil {
+			// (±Inf, strconv.ErrRange): the +Inf result IS the correct
+			// IEEE 754 / Avro wire value for the overflowing literal.
+			// Java's Double.parseDouble("1e1000") returns POSITIVE_INFINITY
+			// without throwing; Jackson's DoubleNode(+Inf) passes
+			// isValidDefault's isNumber() check. fastavro's
+			// _default_matches_schema runs float(default)=inf which is
+			// a Python float. Mirrors the encode-side [jsonNumberToFloat]
+			// and the decode-side decodeFloat/decodeDouble. Syntax
+			// errors still reject.
+			if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
+				return f, nil
+			}
 			return 0, fmt.Errorf("invalid number %s", s)
 		}
 		return f, nil
@@ -2510,6 +2522,14 @@ func defaultAsFloat64(val any) (float64, error) {
 		// acceptance + least surprise for stringly-typed config inputs.
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
+			// Same ErrRange-with-Inf acceptance as the json.Number arm
+			// above: an overflowing string default like "1e1000" produces
+			// the correct ±Inf wire value. The string arm is Java-parity
+			// lenient (Double.parseDouble), so accepting overflow here
+			// matches Java's textual-default route at Schema.java:1900-1902.
+			if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
+				return f, nil
+			}
 			return 0, fmt.Errorf("invalid string default %q: %w", v, err)
 		}
 		return f, nil
@@ -2564,7 +2584,15 @@ func coerceDefault(val any, node *schemaNode) any {
 	if !ok {
 		return val
 	}
-	if f, err := strconv.ParseFloat(str, 64); err == nil {
+	f, err := strconv.ParseFloat(str, 64)
+	if err == nil {
+		return f
+	}
+	// (±Inf, strconv.ErrRange) overflow: the +Inf result is the correct
+	// IEEE 754 wire value, so promote string→float64 rather than leaving
+	// the string for validateDefault to re-reject. Same predicate as
+	// defaultAsFloat64's two ParseFloat arms.
+	if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
 		return f
 	}
 	return val // leave as-is; validateDefault will report the error
