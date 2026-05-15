@@ -8041,13 +8041,30 @@ func TestLogicalTypeUnsafeDeserShortBuffer(t *testing.T) {
 	})
 }
 
-// ---- Coverage: validateLogical error in buildComplex ----
+// ---- Coverage: validateLogical soft-drop in buildComplex ----
 
-func TestSchemaValidateLogicalError(t *testing.T) {
-	// date requires int, not string.
-	_, err := Parse(`{"type":"string","logicalType":"date"}`)
-	if err == nil {
-		t.Fatal("expected error for date on string type")
+func TestSchemaValidateLogicalSoftDrop(t *testing.T) {
+	// date-on-string soft-drops the logical and treats as bare string,
+	// matching Java's fromSchemaIgnoreInvalid (Schema.java:1979 ->
+	// LogicalTypes.java:120-194) and fastavro/hamba behavior. Spec text:
+	// "If a logical type is invalid, ... implementations should ignore
+	// the logical type and use the underlying Avro type."
+	s, err := Parse(`{"type":"string","logicalType":"date"}`)
+	if err != nil {
+		t.Fatalf("expected soft-drop accept for date-on-string, got: %v", err)
+	}
+	// Round-trip a plain string through the schema: the logical is
+	// dropped so encode/decode is bare string.
+	enc, err := s.AppendEncode(nil, "hello")
+	if err != nil {
+		t.Fatalf("encode bare string: %v", err)
+	}
+	var out string
+	if _, err := s.Decode(enc, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out != "hello" {
+		t.Fatalf("got %q want %q", out, "hello")
 	}
 }
 
@@ -8310,15 +8327,19 @@ func TestDurationInRecordUnsafeShortBuffer(t *testing.T) {
 }
 
 func TestDurationSchemaValidation(t *testing.T) {
-	// duration must be on fixed.
-	_, err := Parse(`{"type":"int","logicalType":"duration"}`)
-	if err == nil {
-		t.Fatal("expected error: duration on int")
+	// duration on non-fixed soft-drops the logical (matches Java
+	// fromSchemaIgnoreInvalid + hamba's parseFixedLogicalType returning
+	// nil for non-(duration && size==12) combos). The schema parses as
+	// bare int.
+	if _, err := Parse(`{"type":"int","logicalType":"duration"}`); err != nil {
+		t.Fatalf("expected soft-drop accept for duration on int, got: %v", err)
 	}
-	// duration fixed must be size 12.
-	_, err = Parse(`{"type":"fixed","name":"d","size":8,"logicalType":"duration"}`)
-	if err == nil {
-		t.Fatal("expected error: duration size != 12")
+	// duration on fixed with size != 12: same soft-drop (matches Java's
+	// Duration.validate throw caught by fromSchemaIgnoreInvalid + hamba
+	// dropping the logical via the (ltyp == Duration && size == 12)
+	// match miss).
+	if _, err := Parse(`{"type":"fixed","name":"d","size":8,"logicalType":"duration"}`); err != nil {
+		t.Fatalf("expected soft-drop accept for duration size != 12, got: %v", err)
 	}
 }
 
@@ -9050,10 +9071,14 @@ func TestBigDecimalLogicalType(t *testing.T) {
 	}
 }
 
-func TestBigDecimalOnFixedRejected(t *testing.T) {
-	_, err := Parse(`{"type":"fixed","name":"F","size":16,"logicalType":"big-decimal"}`)
-	if err == nil {
-		t.Fatal("expected error for big-decimal on fixed")
+func TestBigDecimalOnFixedSoftDrop(t *testing.T) {
+	// big-decimal requires bytes; on fixed (any size), the logical
+	// soft-drops. Matches Java's BigDecimal.validate at
+	// LogicalTypes.java:466-470 (throws for non-bytes; caught by
+	// fromSchemaIgnoreInvalid → silent drop). Schema parses as bare
+	// fixed(16); the user's wire bytes are treated opaquely.
+	if _, err := Parse(`{"type":"fixed","name":"F","size":16,"logicalType":"big-decimal"}`); err != nil {
+		t.Fatalf("expected soft-drop accept for big-decimal on fixed, got: %v", err)
 	}
 }
 

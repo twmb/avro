@@ -6080,6 +6080,339 @@ func TestRegression_SchemaDefaultOverflowToInfParity(t *testing.T) {
 	// encode-side fix at ae99f46.
 }
 
+// TestRegression_LogicalTypeSoftDropMatrix locks in the F1 fix:
+// every known logical type, on every wrong underlying type, soft-drops
+// the logical and parses successfully as bare underlying — matching
+// Java's fromSchemaIgnoreInvalid (Schema.java:1979 ->
+// LogicalTypes.java:120-194 try/catch wrapping each validate() throw),
+// fastavro's LOGICAL_*.get-returns-None-then-fallthrough
+// (_read_py.py:662, _write_py.py:205/313), hamba's
+// parsePrimitiveLogicalType / parseFixedLogicalType returning nil
+// (schema_parse.go:205-222, :514-524), AND the spec text:
+//
+//	"If a logical type is invalid, … implementations should ignore
+//	 the logical type and use the underlying Avro type."
+//	(apache/avro Specification/_index.md, Logical Types section)
+//
+// Pre-F1-fix twmb hard-rejected, diverging from three reference impls
+// + the spec on each of 7 known logical types (only `decimal` was
+// correctly soft-dropping). The pin was the bug — a Java/fastavro
+// producer schema with a legacy/typo `{"type":"string","logicalType":
+// "timestamp-millis"}` or `{"type":"long","logicalType":"uuid"}` was
+// unreadable by twmb consumers despite being valid per the spec.
+//
+// The matrix below pins the soft-drop behavior across every known
+// (logical, valid-underlying) -> (logical, wrong-underlying) pair, plus
+// the round-trip wire encoding (which must match the bare-underlying
+// schema's wire encoding, since the logical was dropped). The
+// Canonical() form is also pinned to match the bare-underlying schema's
+// PCF (logicals are stripped from canonical per the spec's PCF rules).
+//
+// Acceptance siblings: TestParity_AcceptedLeniencies has the
+// representative subset; this test is the exhaustive matrix.
+//
+// Counter-test sibling: TestParity_SchemaRejectionMatrix at
+// conformance_test.go:8430 retained NONE of these rows — every
+// wrong-underlying combo moved to acceptance.
+func TestRegression_LogicalTypeSoftDropMatrix(t *testing.T) {
+	// (logical, underlying) -> isValidPair
+	validPairs := map[string]map[string]bool{
+		"uuid":                   {"string": true, "fixed:16": true},
+		"date":                   {"int": true},
+		"time-millis":            {"int": true},
+		"time-micros":            {"long": true},
+		"timestamp-millis":       {"long": true},
+		"timestamp-micros":       {"long": true},
+		"timestamp-nanos":        {"long": true},
+		"local-timestamp-millis": {"long": true},
+		"local-timestamp-micros": {"long": true},
+		"local-timestamp-nanos":  {"long": true},
+		"big-decimal":            {"bytes": true},
+		"duration":               {"fixed:12": true},
+	}
+	// Wrong-underlying combinations to probe. fixed:N covers various sizes.
+	underlyings := []string{
+		"int", "long", "float", "double", "string", "bytes", "boolean",
+		"fixed:8", "fixed:12", "fixed:16", "fixed:20", "fixed:32",
+	}
+	mkSchema := func(underlying, logical string) string {
+		if strings.HasPrefix(underlying, "fixed:") {
+			size := underlying[len("fixed:"):]
+			return `{"type":"fixed","name":"F","size":` + size + `,"logicalType":"` + logical + `"}`
+		}
+		return `{"type":"` + underlying + `","logicalType":"` + logical + `"}`
+	}
+	mkBareSchema := func(underlying string) string {
+		if strings.HasPrefix(underlying, "fixed:") {
+			size := underlying[len("fixed:"):]
+			return `{"type":"fixed","name":"F","size":` + size + `}`
+		}
+		return `"` + underlying + `"`
+	}
+
+	for logical, valids := range validPairs {
+		for _, underlying := range underlyings {
+			isValid := valids[underlying]
+			name := logical + "_on_" + underlying
+			t.Run(name, func(t *testing.T) {
+				sch := mkSchema(underlying, logical)
+				s, err := avro.Parse(sch)
+				if err != nil {
+					t.Fatalf("expected soft-drop accept, got: %v\n  schema: %s", err, sch)
+				}
+				// PCF must match the bare-underlying schema's canonical
+				// form (logicals stripped per spec). Skip the comparison
+				// for valid pairs since the logical may legitimately
+				// survive at the schema-decode layer (decimal/uuid).
+				if !isValid {
+					bareSch := mkBareSchema(underlying)
+					bareS, err := avro.Parse(bareSch)
+					if err != nil {
+						t.Fatalf("bare schema parse: %v\n  schema: %s", err, bareSch)
+					}
+					if got, want := string(s.Canonical()), string(bareS.Canonical()); got != want {
+						t.Errorf("canonical PCF diverges:\n  soft-drop: %s\n  bare:      %s", got, want)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestRegression_SchemaNodeCycleDetection locks in the F2 fix:
+// programmatic SchemaNode construction with pointer cycles via
+// Items/Values no longer crashes the process with stack overflow.
+// Pre-fix the cycle guard at toJSONDedup line 134 only protected
+// the dedup-aware walk; the snapshot-via-toJSON forks at lines
+// 148/180 (named-type conflict-check + definition snapshot) called
+// the non-cycle-aware toJSON. A programmatic recursive named type
+// — e.g. `node := &SchemaNode{Type:"record",Name:"Node",...}; arr :=
+// SchemaNode{Type:"array",Items:node}; node.Fields = append(...,
+// SchemaField{Name:"children",Type:arr})` — crashed with
+// "runtime: goroutine stack exceeds 1000000000-byte limit / fatal
+// error: stack overflow / github.com/twmb/avro.(*SchemaNode).toJSON
+// schema_node.go:328 (recurses)".
+//
+// Post-fix:
+//   - Named-type ancestor cycles (the realistic programmatic
+//     recursive-schema shape) emit as a name reference, mirroring
+//     the Avro JSON canonical form ({"items":"Node"}).
+//   - Unnamed cycles (array of self, map of self) return a graceful
+//     "cyclic SchemaNode detected" error rather than crashing.
+//
+// Two fix sites cooperate:
+//   - schema_node.go's toJSON refactored into toJSONVisited(visited
+//     map) so the four recursive call sites (Items, Values, Branches,
+//     Fields[].Type) propagate the visited set.
+//   - schema_node.go's toJSONDedup cycle guard at line 134 special-
+//     cases named types via name-reference emission so an ancestor
+//     cycle through Items/Values to a named type produces a valid
+//     recursive Avro schema rather than failing at the dedup walk.
+//
+// Existing tests TestSchemaNodeCyclicItems/Values/Indirect/Cyclic3Node
+// only covered unnamed (array/map) cycles which DID hit the
+// toJSONDedup cycle guard pre-fix and reported the error; the
+// named-type cycle path was structurally invisible to those tests.
+func TestRegression_SchemaNodeCycleDetection(t *testing.T) {
+	t.Run("programmatic_recursive_node_via_array_items", func(t *testing.T) {
+		// The natural shape: a recursive Node with children:array<Node>.
+		// Pre-fix: stack overflow. Post-fix: valid recursive schema.
+		node := &avro.SchemaNode{
+			Type: "record",
+			Name: "Node",
+			Fields: []avro.SchemaField{
+				{Name: "v", Type: avro.SchemaNode{Type: "int"}},
+			},
+		}
+		arr := avro.SchemaNode{Type: "array", Items: node}
+		node.Fields = append(node.Fields, avro.SchemaField{Name: "children", Type: arr})
+		s, err := node.Schema()
+		if err != nil {
+			t.Fatalf("recursive node should produce a valid schema, got: %v", err)
+		}
+		// The emitted JSON must use a name reference for Node, matching
+		// the canonical Avro recursive-schema form.
+		want := `{"fields":[{"name":"v","type":"int"},{"name":"children","type":{"items":"Node","type":"array"}}],"name":"Node","type":"record"}`
+		if got := s.String(); got != want {
+			t.Errorf("recursive Node JSON mismatch:\n  got:  %s\n  want: %s", got, want)
+		}
+	})
+	t.Run("programmatic_recursive_node_via_map_values", func(t *testing.T) {
+		// Same shape but via map<Node> instead of array<Node>.
+		node := &avro.SchemaNode{
+			Type: "record",
+			Name: "Node",
+			Fields: []avro.SchemaField{
+				{Name: "v", Type: avro.SchemaNode{Type: "int"}},
+			},
+		}
+		m := avro.SchemaNode{Type: "map", Values: node}
+		node.Fields = append(node.Fields, avro.SchemaField{Name: "children", Type: m})
+		s, err := node.Schema()
+		if err != nil {
+			t.Fatalf("recursive node via map should produce a valid schema, got: %v", err)
+		}
+		want := `{"fields":[{"name":"v","type":"int"},{"name":"children","type":{"type":"map","values":"Node"}}],"name":"Node","type":"record"}`
+		if got := s.String(); got != want {
+			t.Errorf("recursive Node JSON mismatch:\n  got:  %s\n  want: %s", got, want)
+		}
+	})
+	t.Run("unnamed_array_self_cycle_errors_not_crashes", func(t *testing.T) {
+		arr := &avro.SchemaNode{Type: "array"}
+		arr.Items = arr
+		_, err := arr.Schema()
+		if err == nil {
+			t.Fatal("expected cyclic-SchemaNode error for unnamed array self-loop")
+		}
+		if !strings.Contains(err.Error(), "cyclic") {
+			t.Errorf("expected 'cyclic' in error, got: %v", err)
+		}
+	})
+	t.Run("unnamed_map_self_cycle_errors_not_crashes", func(t *testing.T) {
+		m := &avro.SchemaNode{Type: "map"}
+		m.Values = m
+		_, err := m.Schema()
+		if err == nil {
+			t.Fatal("expected cyclic-SchemaNode error for unnamed map self-loop")
+		}
+	})
+	t.Run("record_invalid_items_field_errors_not_crashes", func(t *testing.T) {
+		// Records shouldn't have Items; constructing one with a self-
+		// loop on Items hits the type-validation error rather than
+		// crashing. Pre-fix this crashed via toJSON's unguarded
+		// recursion before the type validation could fire.
+		r := &avro.SchemaNode{
+			Type: "record",
+			Name: "R",
+			Fields: []avro.SchemaField{
+				{Name: "f", Type: avro.SchemaNode{Type: "int"}},
+			},
+		}
+		r.Items = r
+		_, err := r.Schema()
+		if err == nil {
+			t.Fatal("expected error for record with Items")
+		}
+	})
+	t.Run("parsed_recursive_schema_round_trips_via_Root_Schema", func(t *testing.T) {
+		// Sibling check: the parse-then-Root-then-Schema round-trip
+		// for the canonical Avro recursive schema must still work.
+		// (Pre-fix this also worked because the parse path produces
+		// name-reference SchemaNodes rather than pointer cycles.)
+		src := `{"type":"record","name":"Node","fields":[{"name":"v","type":"int"},{"name":"children","type":{"type":"array","items":"Node"}}]}`
+		s1, err := avro.Parse(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := s1.Root()
+		s2, err := root.Schema()
+		if err != nil {
+			t.Fatalf("Root().Schema() round-trip: %v", err)
+		}
+		// Both schemas should produce the same canonical form.
+		if c1, c2 := string(s1.Canonical()), string(s2.Canonical()); c1 != c2 {
+			t.Errorf("round-trip canonical mismatch:\n  orig:    %s\n  rt:      %s", c1, c2)
+		}
+	})
+}
+
+// TestRegression_LogicalSoftDropRoundTrip pins the encode/decode
+// behavior for soft-dropped schemas: after F1 the schema is treated
+// as bare underlying for the entire wire-format path. A representative
+// cross-section across the 12 logical types' wrong-underlying combos
+// verifies encode/decode/canonical/fingerprint all agree on the bare-
+// underlying behavior.
+func TestRegression_LogicalSoftDropRoundTrip(t *testing.T) {
+	cases := []struct {
+		name     string
+		schema   string
+		bareEq   string // canonical form must match this bare schema's PCF
+		input    any
+		decTgt   any
+		wantWire string // wire bytes as hex (binary encoding)
+	}{
+		{
+			"timestamp-millis_on_string",
+			`{"type":"string","logicalType":"timestamp-millis"}`,
+			`"string"`,
+			"hello",
+			new(string),
+			"0a68656c6c6f",
+		},
+		{
+			"uuid_on_int",
+			`{"type":"int","logicalType":"uuid"}`,
+			`"int"`,
+			int32(42),
+			new(int32),
+			"54",
+		},
+		{
+			"date_on_long",
+			`{"type":"long","logicalType":"date"}`,
+			`"long"`,
+			int64(1234567890),
+			new(int64),
+			"a48bb09909", // varint(zigzag(1234567890)) = varint(2469135780)
+		},
+		{
+			"big-decimal_on_int",
+			`{"type":"int","logicalType":"big-decimal"}`,
+			`"int"`,
+			int32(100),
+			new(int32),
+			"c801",
+		},
+		{
+			"duration_on_fixed_size_10",
+			`{"type":"fixed","name":"F","size":10,"logicalType":"duration"}`,
+			`{"type":"fixed","name":"F","size":10}`,
+			[10]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+			new([10]byte),
+			"0102030405060708090a",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := avro.Parse(c.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			bareS, err := avro.Parse(c.bareEq)
+			if err != nil {
+				t.Fatalf("bare parse: %v", err)
+			}
+			// PCF must match.
+			if got, want := string(s.Canonical()), string(bareS.Canonical()); got != want {
+				t.Errorf("canonical:\n  soft-drop: %s\n  bare:      %s", got, want)
+			}
+			// Wire encoding must match the bare schema's encoding.
+			enc, err := s.AppendEncode(nil, c.input)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			bareEnc, err := bareS.AppendEncode(nil, c.input)
+			if err != nil {
+				t.Fatalf("bare encode: %v", err)
+			}
+			if !bytes.Equal(enc, bareEnc) {
+				t.Errorf("wire bytes:\n  soft-drop: %x\n  bare:      %x", enc, bareEnc)
+			}
+			if hex.EncodeToString(enc) != c.wantWire {
+				t.Errorf("wire mismatch: got %x want %s", enc, c.wantWire)
+			}
+			// Round-trip decode.
+			if _, err := s.Decode(enc, c.decTgt); err != nil {
+				t.Errorf("decode: %v", err)
+			}
+			gotV := reflect.ValueOf(c.decTgt).Elem().Interface()
+			if !reflect.DeepEqual(gotV, c.input) {
+				t.Errorf("round-trip: got %v want %v", gotV, c.input)
+			}
+		})
+	}
+}
+
 // TestSpecBareTypeNameInObjectAccepted locks in that {"type":"Node"}
 // as a wrapped reference to a previously-declared named type is
 // accepted at parse and the wrapped/bare forms produce equivalent
@@ -8434,54 +8767,11 @@ func TestParity_SchemaRejectionMatrix(t *testing.T) {
 		wantSubstr string
 	}{
 		// ── logical type / base type mismatches ─────────────────────
-		{"date on long", `{"type":"long","logicalType":"date"}`, "date"},
-		{"date on float", `{"type":"float","logicalType":"date"}`, "date"},
-		{"date on double", `{"type":"double","logicalType":"date"}`, "date"},
-		{"date on string", `{"type":"string","logicalType":"date"}`, "date"},
-		{"date on bytes", `{"type":"bytes","logicalType":"date"}`, "date"},
-		{"date on boolean", `{"type":"boolean","logicalType":"date"}`, "date"},
-		{"time-millis on long", `{"type":"long","logicalType":"time-millis"}`, "time-millis"},
-		{"time-millis on float", `{"type":"float","logicalType":"time-millis"}`, "time-millis"},
-		{"time-millis on double", `{"type":"double","logicalType":"time-millis"}`, "time-millis"},
-		{"time-millis on string", `{"type":"string","logicalType":"time-millis"}`, "time-millis"},
-		{"time-millis on bytes", `{"type":"bytes","logicalType":"time-millis"}`, "time-millis"},
-		{"time-millis on boolean", `{"type":"boolean","logicalType":"time-millis"}`, "time-millis"},
-		{"time-micros on int", `{"type":"int","logicalType":"time-micros"}`, "time-micros"},
-		{"time-micros on float", `{"type":"float","logicalType":"time-micros"}`, "time-micros"},
-		{"time-micros on double", `{"type":"double","logicalType":"time-micros"}`, "time-micros"},
-		{"time-micros on string", `{"type":"string","logicalType":"time-micros"}`, "time-micros"},
-		{"timestamp-millis on int", `{"type":"int","logicalType":"timestamp-millis"}`, "timestamp-millis"},
-		{"timestamp-millis on float", `{"type":"float","logicalType":"timestamp-millis"}`, "timestamp-millis"},
-		{"timestamp-millis on double", `{"type":"double","logicalType":"timestamp-millis"}`, "timestamp-millis"},
-		{"timestamp-millis on string", `{"type":"string","logicalType":"timestamp-millis"}`, "timestamp-millis"},
-		{"timestamp-micros on int", `{"type":"int","logicalType":"timestamp-micros"}`, "timestamp-micros"},
-		{"timestamp-micros on float", `{"type":"float","logicalType":"timestamp-micros"}`, "timestamp-micros"},
-		{"timestamp-nanos on int", `{"type":"int","logicalType":"timestamp-nanos"}`, "timestamp-nanos"},
-		{"timestamp-nanos on float", `{"type":"float","logicalType":"timestamp-nanos"}`, "timestamp-nanos"},
-		{"local-timestamp-millis on int", `{"type":"int","logicalType":"local-timestamp-millis"}`, "local-timestamp-millis"},
-		{"local-timestamp-micros on int", `{"type":"int","logicalType":"local-timestamp-micros"}`, "local-timestamp-micros"},
-		{"local-timestamp-nanos on int", `{"type":"int","logicalType":"local-timestamp-nanos"}`, "local-timestamp-nanos"},
-		// NOTE: `decimal on <wrong-base>` is INTENTIONAL LENIENCY — schema.go's
-		// validateLogical falls back to the primitive base per the spec's
-		// "if a logical type cannot be deserialized, ignore it" rule. NOT
-		// a rejection case here; locked as acceptance in TestParity_AcceptedLeniencies below.
-		{"big-decimal on int", `{"type":"int","logicalType":"big-decimal"}`, "big-decimal"},
-		{"big-decimal on long", `{"type":"long","logicalType":"big-decimal"}`, "big-decimal"},
-		{"big-decimal on string", `{"type":"string","logicalType":"big-decimal"}`, "big-decimal"},
-		{"big-decimal on fixed", `{"type":"fixed","name":"D","size":12,"logicalType":"big-decimal"}`, "big-decimal"},
-		{"uuid on int", `{"type":"int","logicalType":"uuid"}`, "uuid"},
-		{"uuid on long", `{"type":"long","logicalType":"uuid"}`, "uuid"},
-		{"uuid on float", `{"type":"float","logicalType":"uuid"}`, "uuid"},
-		{"uuid on bytes", `{"type":"bytes","logicalType":"uuid"}`, "uuid"},
-		{"uuid on boolean", `{"type":"boolean","logicalType":"uuid"}`, "uuid"},
-		{"duration on int", `{"type":"int","logicalType":"duration"}`, "duration"},
-		{"duration on long", `{"type":"long","logicalType":"duration"}`, "duration"},
-		{"duration on bytes", `{"type":"bytes","logicalType":"duration"}`, "duration"},
-		{"duration on string", `{"type":"string","logicalType":"duration"}`, "duration"},
-		{"duration on fixed size 10", `{"type":"fixed","name":"D","size":10,"logicalType":"duration"}`, ""},
-		{"duration on fixed size 13", `{"type":"fixed","name":"D","size":13,"logicalType":"duration"}`, ""},
-		{"uuid on fixed size 12", `{"type":"fixed","name":"U","size":12,"logicalType":"uuid"}`, ""},
-		{"uuid on fixed size 32", `{"type":"fixed","name":"U","size":32,"logicalType":"uuid"}`, ""},
+		// NOTE: every known logical type on the wrong underlying type is
+		// INTENTIONAL LENIENCY (soft-drop) per the spec's "ignore invalid
+		// logical type" rule and per Java/fastavro/hamba consensus.
+		// Locked as acceptance in TestParity_AcceptedLeniencies below.
+		// Pre-F1-fix twmb hard-rejected; the rejection was the bug.
 
 		// ── decimal precision/scale invariants ──────────────────────
 		{"decimal precision zero", `{"type":"bytes","logicalType":"decimal","precision":0,"scale":0}`, "precision"},
@@ -12603,12 +12893,129 @@ func TestParity_AcceptedLeniencies(t *testing.T) {
 		// schema.go's validateLogical strips `logicalType:"decimal"`
 		// when the underlying type isn't bytes/fixed, per the spec's
 		// "if a logical type cannot be deserialized, ignore it" rule.
-		// Java/avro-rs reject outright; we accept-and-degrade.
+		// Java's fromSchemaIgnoreInvalid catches BigDecimal.validate's
+		// throw, fastavro's LOGICAL_*.get returns None and falls
+		// through to bare base, hamba's parsePrimitiveLogicalType
+		// returns nil for (typ, decimal) where typ != bytes/fixed.
 		for _, base := range []string{"int", "long", "float", "double", "string", "boolean"} {
 			schema := `{"type":"` + base + `","logicalType":"decimal","precision":4,"scale":2}`
 			if _, err := avro.Parse(schema); err != nil {
 				t.Errorf("decimal on %s should be accepted-and-degraded, got: %v", base, err)
 			}
+		}
+	})
+	t.Run("all known logical types on wrong base soft-drop", func(t *testing.T) {
+		// F1 fix: pre-fix only the decimal arm soft-dropped; the other
+		// 7 logical-type arms hard-rejected, diverging from Java/
+		// fastavro/hamba/spec consensus. Post-fix every arm soft-drops
+		// consistently. Schema parses as bare underlying.
+		//
+		// References:
+		//   - Spec text (apache/avro Specification/_index.md): "If a
+		//     logical type is invalid, … implementations should ignore
+		//     the logical type and use the underlying Avro type."
+		//   - Java (Schema.java:1979): result.logicalType =
+		//     LogicalTypes.fromSchemaIgnoreInvalid(result) — catches
+		//     RuntimeException from every per-type validate() and
+		//     silently drops the logical.
+		//   - fastavro (_read_py.py:662): LOGICAL_READERS.get(
+		//     logical_type) returns None for unknown (rt-lt) combos and
+		//     falls through to bare underlying decode.
+		//   - hamba (schema_parse.go:205-222 + :514-524): the
+		//     (typ, ltyp) switch returns nil for any combo not
+		//     explicitly listed.
+		schemas := []string{
+			// timestamp-* on non-long
+			`{"type":"string","logicalType":"timestamp-millis"}`,
+			`{"type":"int","logicalType":"timestamp-micros"}`,
+			`{"type":"float","logicalType":"timestamp-nanos"}`,
+			`{"type":"double","logicalType":"timestamp-millis"}`,
+			`{"type":"bytes","logicalType":"timestamp-micros"}`,
+			`{"type":"boolean","logicalType":"timestamp-nanos"}`,
+			// local-timestamp-* on non-long
+			`{"type":"int","logicalType":"local-timestamp-millis"}`,
+			`{"type":"int","logicalType":"local-timestamp-micros"}`,
+			`{"type":"int","logicalType":"local-timestamp-nanos"}`,
+			`{"type":"string","logicalType":"local-timestamp-millis"}`,
+			// time-millis on non-int
+			`{"type":"long","logicalType":"time-millis"}`,
+			`{"type":"float","logicalType":"time-millis"}`,
+			`{"type":"string","logicalType":"time-millis"}`,
+			`{"type":"bytes","logicalType":"time-millis"}`,
+			`{"type":"boolean","logicalType":"time-millis"}`,
+			// time-micros on non-long
+			`{"type":"int","logicalType":"time-micros"}`,
+			`{"type":"float","logicalType":"time-micros"}`,
+			`{"type":"string","logicalType":"time-micros"}`,
+			// date on non-int
+			`{"type":"long","logicalType":"date"}`,
+			`{"type":"float","logicalType":"date"}`,
+			`{"type":"double","logicalType":"date"}`,
+			`{"type":"string","logicalType":"date"}`,
+			`{"type":"bytes","logicalType":"date"}`,
+			`{"type":"boolean","logicalType":"date"}`,
+			// uuid on non-string-non-fixed(16)
+			`{"type":"int","logicalType":"uuid"}`,
+			`{"type":"long","logicalType":"uuid"}`,
+			`{"type":"float","logicalType":"uuid"}`,
+			`{"type":"bytes","logicalType":"uuid"}`,
+			`{"type":"boolean","logicalType":"uuid"}`,
+			`{"type":"fixed","name":"U","size":12,"logicalType":"uuid"}`,
+			`{"type":"fixed","name":"U","size":32,"logicalType":"uuid"}`,
+			// big-decimal on non-bytes
+			`{"type":"int","logicalType":"big-decimal"}`,
+			`{"type":"long","logicalType":"big-decimal"}`,
+			`{"type":"string","logicalType":"big-decimal"}`,
+			`{"type":"fixed","name":"D","size":12,"logicalType":"big-decimal"}`,
+			// duration on non-fixed, or fixed with size != 12
+			`{"type":"int","logicalType":"duration"}`,
+			`{"type":"long","logicalType":"duration"}`,
+			`{"type":"bytes","logicalType":"duration"}`,
+			`{"type":"string","logicalType":"duration"}`,
+			`{"type":"fixed","name":"D","size":10,"logicalType":"duration"}`,
+			`{"type":"fixed","name":"D","size":13,"logicalType":"duration"}`,
+		}
+		for _, sch := range schemas {
+			if _, err := avro.Parse(sch); err != nil {
+				t.Errorf("expected soft-drop accept (Java/fastavro/hamba parity), got: %v\n  schema: %s", err, sch)
+			}
+		}
+	})
+	t.Run("logical-on-wrong-type round-trips as bare underlying", func(t *testing.T) {
+		// After soft-drop, the schema behaves as bare underlying for
+		// encode/decode. Verify a representative cross-section.
+		cases := []struct {
+			name  string
+			sch   string
+			input any
+			want  any
+		}{
+			{"string-timestamp-millis", `{"type":"string","logicalType":"timestamp-millis"}`, "hello", "hello"},
+			{"int-uuid", `{"type":"int","logicalType":"uuid"}`, int32(42), int32(42)},
+			{"long-date", `{"type":"long","logicalType":"date"}`, int64(1234567890), int64(1234567890)},
+			{"fixed12-duration", `{"type":"fixed","name":"F","size":10,"logicalType":"duration"}`, [10]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, [10]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}},
+			{"fixed12-uuid", `{"type":"fixed","name":"U","size":12,"logicalType":"uuid"}`, [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}},
+			{"int-big-decimal", `{"type":"int","logicalType":"big-decimal"}`, int32(100), int32(100)},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				s, err := avro.Parse(c.sch)
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+				enc, err := s.AppendEncode(nil, c.input)
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				out := reflect.New(reflect.TypeOf(c.want)).Interface()
+				if _, err := s.Decode(enc, out); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				got := reflect.ValueOf(out).Elem().Interface()
+				if !reflect.DeepEqual(got, c.want) {
+					t.Errorf("round-trip: got %v (%T), want %v (%T)", got, got, c.want, c.want)
+				}
+			})
 		}
 	})
 	t.Run("boolean decoder accepts any non-1 byte as false", func(t *testing.T) {

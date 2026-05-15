@@ -2250,14 +2250,34 @@ func (o *aobject) validateLogical() error {
 		}
 		return nil
 
+	// Wrong-underlying-type soft-drop for every known logical type
+	// mirrors the decimal arm above and matches the spec:
+	//   "If a logical type is invalid, …then implementations should
+	//    ignore the logical type and use the underlying Avro type."
+	//   (apache/avro Specification/_index.md, "Logical Types")
+	// Java's default Schema parser wraps each LogicalType.validate() in
+	// fromSchemaIgnoreInvalid (Schema.java:1979 → LogicalTypes.java:120-194):
+	// a thrown IllegalArgumentException for wrong underlying type is
+	// caught and the logical is silently dropped, leaving the schema as
+	// bare underlying. fastavro's LOGICAL_READERS/WRITERS.get(<rt-lt>)
+	// returns None for unknown rt-lt combos and falls through to bare
+	// underlying decode/encode (_read_py.py:662, _write_py.py:205/313).
+	// hamba's parsePrimitiveLogicalType (schema_parse.go:205-222) and
+	// parseFixedLogicalType (:514-524) return nil for any combo not in
+	// the (typ, ltyp) switch, dropping the logical silently. Three
+	// reference impls + spec text all agree on soft-drop; pre-fix twmb
+	// was the outlier hard-rejecting (interop break for Java/fastavro
+	// producers that emit schema-evolution / legacy combos).
 	case "uuid":
 		if o.Type != "string" && !(o.Type == "fixed" && o.Size != nil && int(*o.Size) == 16) {
-			return fmt.Errorf("invalid logicalType uuid type %q, must be string or fixed(16)", o.Type)
+			o.Logical = ""
+			return nil
 		}
 
 	case "date", "time-millis":
 		if o.Type != "int" {
-			return fmt.Errorf("invalid logicalType %s type %q, can only be int", o.Logical, o.Type)
+			o.Logical = ""
+			return nil
 		}
 
 	case "time-micros",
@@ -2268,23 +2288,26 @@ func (o *aobject) validateLogical() error {
 		"local-timestamp-micros",
 		"local-timestamp-nanos":
 		if o.Type != "long" {
-			return fmt.Errorf("invalid logicalType %s type %q, can only be long", o.Logical, o.Type)
+			o.Logical = ""
+			return nil
 		}
 
 	case "big-decimal":
 		if o.Type != "bytes" {
-			return fmt.Errorf("invalid logicalType big-decimal type %q, can only be bytes", o.Type)
+			o.Logical = ""
+			return nil
 		}
 
 	case "duration":
-		if o.Type != "fixed" {
-			return fmt.Errorf("invalid logicalType duration type %q, can only be fixed", o.Type)
-		}
-		if o.Size == nil {
-			return errors.New("invalid logicalType duration has no size")
-		}
-		if int(*o.Size) != 12 {
-			return fmt.Errorf("invalid logicalType duration size %v is not the expected 12", int(*o.Size))
+		// Duration on non-fixed, or fixed with size != 12, soft-drops.
+		// Java's Duration.validate at LogicalTypes.java:526-530 throws
+		// IllegalArgumentException for `type != FIXED || size != 12`;
+		// fromSchemaIgnoreInvalid catches and drops. hamba's
+		// parseFixedLogicalType at schema_parse.go:517 only matches
+		// `ltyp == Duration && size == 12` and drops everything else.
+		if o.Type != "fixed" || o.Size == nil || int(*o.Size) != 12 {
+			o.Logical = ""
+			return nil
 		}
 
 	default:

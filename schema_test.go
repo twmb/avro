@@ -820,67 +820,79 @@ func TestValidateLogical(t *testing.T) {
 	zeroPrec := 0
 	somePrec := 10
 
+	// wantErr=true → validateLogical returns a non-nil error.
+	// wantDropped=true → validateLogical returns nil but clears Logical
+	// to "" per the spec's "ignore invalid logical type" rule (matches
+	// Java's fromSchemaIgnoreInvalid, fastavro's LOGICAL_*.get fallthrough,
+	// hamba's parsePrimitiveLogicalType nil-return). Wrong-underlying-
+	// type combinations soft-drop; precision/scale invariants on the
+	// correct underlying still error (matches fastavro's strict decimal
+	// validation; Java's behavior differs but twmb aligns with fastavro
+	// for decimal precision/scale — see schema.go's decimal arm comment).
 	tests := []struct {
-		name    string
-		obj     aobject
-		wantErr bool
+		name        string
+		obj         aobject
+		wantErr     bool
+		wantDropped bool
 	}{
-		{"no logical", aobject{Type: "int"}, false},
+		{"no logical", aobject{Type: "int"}, false, false},
 
 		// decimal
-		{"decimal ok bytes", aobject{Type: "bytes", Logical: "decimal", Precision: &somePrec}, false},
-		{"decimal ok fixed", aobject{Type: "fixed", Logical: "decimal", Precision: &somePrec, Size: &intSize}, false},
-		{"decimal missing precision", aobject{Type: "bytes", Logical: "decimal"}, true},
-		{"decimal wrong type", aobject{Type: "int", Logical: "decimal", Precision: &somePrec}, false},
+		{"decimal ok bytes", aobject{Type: "bytes", Logical: "decimal", Precision: &somePrec}, false, false},
+		{"decimal ok fixed", aobject{Type: "fixed", Logical: "decimal", Precision: &somePrec, Size: &intSize}, false, false},
+		{"decimal missing precision", aobject{Type: "bytes", Logical: "decimal"}, true, false},
+		{"decimal wrong type", aobject{Type: "int", Logical: "decimal", Precision: &somePrec}, false, true},
 
-		// uuid
-		{"uuid ok", aobject{Type: "string", Logical: "uuid"}, false},
-		{"uuid wrong type", aobject{Type: "int", Logical: "uuid"}, true},
-		{"uuid with scale", aobject{Type: "string", Logical: "uuid", Scale: &zeroPrec}, true},
+		// uuid: wrong-type soft-drops (matches Java/fastavro/hamba).
+		{"uuid ok", aobject{Type: "string", Logical: "uuid"}, false, false},
+		{"uuid wrong type", aobject{Type: "int", Logical: "uuid"}, false, true},
+		{"uuid wrong fixed size", aobject{Type: "fixed", Logical: "uuid", Size: ptr(laxInt(12))}, false, true},
+		// scale/precision on uuid (correct underlying type): still errors
+		// per validateLogical's trailing scale/precision check.
+		{"uuid with scale", aobject{Type: "string", Logical: "uuid", Scale: &zeroPrec}, true, false},
 
-		// date
-		{"date ok", aobject{Type: "int", Logical: "date"}, false},
-		{"date wrong type", aobject{Type: "long", Logical: "date"}, true},
+		// date / time-millis / time-micros / timestamp-* /
+		// local-timestamp-* / big-decimal: wrong-underlying soft-drops.
+		{"date ok", aobject{Type: "int", Logical: "date"}, false, false},
+		{"date wrong type", aobject{Type: "long", Logical: "date"}, false, true},
+		{"time-millis ok", aobject{Type: "int", Logical: "time-millis"}, false, false},
+		{"time-millis wrong type", aobject{Type: "long", Logical: "time-millis"}, false, true},
+		{"time-micros ok", aobject{Type: "long", Logical: "time-micros"}, false, false},
+		{"time-micros wrong type", aobject{Type: "int", Logical: "time-micros"}, false, true},
+		{"timestamp-millis ok", aobject{Type: "long", Logical: "timestamp-millis"}, false, false},
+		{"timestamp-millis wrong type", aobject{Type: "int", Logical: "timestamp-millis"}, false, true},
+		{"timestamp-micros ok", aobject{Type: "long", Logical: "timestamp-micros"}, false, false},
+		{"timestamp-micros wrong type", aobject{Type: "int", Logical: "timestamp-micros"}, false, true},
+		{"local-timestamp-millis ok", aobject{Type: "long", Logical: "local-timestamp-millis"}, false, false},
+		{"local-timestamp-micros ok", aobject{Type: "long", Logical: "local-timestamp-micros"}, false, false},
 
-		// time-millis
-		{"time-millis ok", aobject{Type: "int", Logical: "time-millis"}, false},
-		{"time-millis wrong type", aobject{Type: "long", Logical: "time-millis"}, true},
+		// duration: wrong-type AND wrong-size soft-drop (matches Java's
+		// Duration.validate throw caught by fromSchemaIgnoreInvalid, plus
+		// hamba's (Duration && size == 12) match-or-drop pattern).
+		{"duration ok", aobject{Type: "fixed", Logical: "duration", Size: &intSize}, false, false},
+		{"duration wrong type", aobject{Type: "int", Logical: "duration"}, false, true},
+		{"duration no size", aobject{Type: "fixed", Logical: "duration"}, false, true},
+		{"duration wrong size", aobject{Type: "fixed", Logical: "duration", Size: ptr(laxInt(10))}, false, true},
 
-		// time-micros
-		{"time-micros ok", aobject{Type: "long", Logical: "time-micros"}, false},
-		{"time-micros wrong type", aobject{Type: "int", Logical: "time-micros"}, true},
+		// unknown logical types are ignored per spec.
+		{"unknown logical", aobject{Type: "int", Logical: "foobar"}, false, true},
 
-		// timestamp-millis
-		{"timestamp-millis ok", aobject{Type: "long", Logical: "timestamp-millis"}, false},
-		{"timestamp-millis wrong type", aobject{Type: "int", Logical: "timestamp-millis"}, true},
-
-		// timestamp-micros
-		{"timestamp-micros ok", aobject{Type: "long", Logical: "timestamp-micros"}, false},
-		{"timestamp-micros wrong type", aobject{Type: "int", Logical: "timestamp-micros"}, true},
-
-		// local-timestamp-millis
-		{"local-timestamp-millis ok", aobject{Type: "long", Logical: "local-timestamp-millis"}, false},
-
-		// local-timestamp-micros
-		{"local-timestamp-micros ok", aobject{Type: "long", Logical: "local-timestamp-micros"}, false},
-
-		// duration
-		{"duration ok", aobject{Type: "fixed", Logical: "duration", Size: &intSize}, false},
-		{"duration wrong type", aobject{Type: "int", Logical: "duration"}, true},
-		{"duration no size", aobject{Type: "fixed", Logical: "duration"}, true},
-		{"duration wrong size", aobject{Type: "fixed", Logical: "duration", Size: ptr(laxInt(10))}, true},
-
-		// unknown logical types are ignored per spec
-		{"unknown logical", aobject{Type: "int", Logical: "foobar"}, false},
-
-		// scale/precision on non-decimal
-		{"date with precision", aobject{Type: "int", Logical: "date", Precision: &somePrec}, true},
+		// scale/precision on non-decimal (correct underlying): still
+		// errors per the trailing scale/precision check.
+		{"date with precision", aobject{Type: "int", Logical: "date", Precision: &somePrec}, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			origLogical := tt.obj.Logical
 			err := tt.obj.validateLogical()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateLogical() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil {
+				dropped := origLogical != "" && tt.obj.Logical == ""
+				if dropped != tt.wantDropped {
+					t.Errorf("dropped = %v (Logical %q -> %q), wantDropped %v", dropped, origLogical, tt.obj.Logical, tt.wantDropped)
+				}
 			}
 		})
 	}
@@ -1192,11 +1204,12 @@ func TestBuildComplexUnknownLogicalIgnored(t *testing.T) {
 	}
 }
 
-func TestBuildComplexValidateLogicalError(t *testing.T) {
-	// Known logical type on wrong underlying type should error through buildComplex.
-	_, err := Parse(`{"type":"string","logicalType":"date"}`)
-	if err == nil {
-		t.Fatal("expected error for date on string type")
+func TestBuildComplexValidateLogicalSoftDrop(t *testing.T) {
+	// Known logical type on wrong underlying type soft-drops the
+	// logical and parses as bare underlying, matching Java/fastavro/
+	// hamba and the spec's "ignore invalid logical type" rule.
+	if _, err := Parse(`{"type":"string","logicalType":"date"}`); err != nil {
+		t.Fatalf("expected soft-drop accept for date-on-string, got: %v", err)
 	}
 }
 
@@ -2298,87 +2311,40 @@ func TestFieldLevelLogicalType_UnionPreAnnotatedFirstBranch(t *testing.T) {
 	}
 }
 
-// TestFieldLevelLogicalType_StrictMismatchErrors pins the post-lift
+// TestFieldLevelLogicalType_MismatchSoftDrops pins the post-lift
 // behavior that a flat-form schema whose logicalType is structurally
-// incompatible with the primitive type now errors at Parse rather than
-// silently dropping the annotation. Pre-PR, `afield` had no `Logical`
-// field — the JSON key was ignored entirely, leaving a plain primitive
-// schema that the user's encoder hit later with a confusing type
-// mismatch. Post-PR the annotation is lifted into the type object,
-// runs through validateLogical, and the strict-mismatch arms produce a
-// clear, actionable error at Parse time.
+// incompatible with the primitive type SOFT-DROPS the annotation,
+// matching Java's fromSchemaIgnoreInvalid (Schema.java:1979 ->
+// LogicalTypes.java:120-194), fastavro's LOGICAL_*.get-returns-None
+// fallthrough (_read_py.py:662), and hamba's parsePrimitiveLogicalType
+// returning nil for unrecognized (type, logical) pairs (schema_parse
+// .go:205-222), plus the spec's "ignore invalid logical type" rule.
 //
-// This is the load-bearing pin against any future revert: silently
-// tolerating malformed logicals here is what AVRO-2015 / AVRO-3014 are
-// about, and the cure (a parse-time error) is what the PR delivers
-// for these cases. Java's reference still silently ignores; twmb is
-// now stricter than Java on flat-form just as it has always been on
-// the spec-blessed nested form.
+// Pre-F1-fix this test errored at Parse with the strict-mismatch
+// rejection; the prior pin claimed the strict behavior was "the load-
+// bearing pin against any future revert" but it diverged from three
+// reference impls AND from the spec text. The pin itself was the bug.
+// A Java/fastavro producer that emitted any of these schemas (legacy
+// schema, developer mistake, schema-evolution corner case) could not
+// be parsed by a twmb consumer — interop break.
 //
-// Note: `decimal` is an intentional exception — `validateLogical`'s
-// decimal arm clears the annotation rather than erroring, so flat-form
-// `decimal` on a non-bytes/non-fixed type still parses (as a plain
-// primitive). That's a separate decision; not pinned here.
-func TestFieldLevelLogicalType_StrictMismatchErrors(t *testing.T) {
-	cases := []struct {
-		name        string
-		schema      string
-		wantErrSubs string // substring that must appear in the error
-	}{
-		{
-			"long with date logical (date requires int)",
-			`{"type":"record","name":"R","fields":[
-				{"name":"x","type":"long","logicalType":"date"}
-			]}`,
-			`date`,
-		},
-		{
-			"int with uuid logical (uuid requires string or fixed(16))",
-			`{"type":"record","name":"R","fields":[
-				{"name":"x","type":"int","logicalType":"uuid"}
-			]}`,
-			`uuid`,
-		},
-		{
-			"string with timestamp-millis logical (requires long)",
-			`{"type":"record","name":"R","fields":[
-				{"name":"x","type":"string","logicalType":"timestamp-millis"}
-			]}`,
-			`timestamp-millis`,
-		},
-		{
-			"int with time-micros logical (requires long)",
-			`{"type":"record","name":"R","fields":[
-				{"name":"x","type":"int","logicalType":"time-micros"}
-			]}`,
-			`time-micros`,
-		},
-		{
-			"bytes with date logical (requires int)",
-			`{"type":"record","name":"R","fields":[
-				{"name":"x","type":"bytes","logicalType":"date"}
-			]}`,
-			`date`,
-		},
-		// Union variant: same strict-mismatch through the union-lift
-		// path. The lift wraps "long" in {type:long,logicalType:date}
-		// and validateLogical then rejects.
-		{
-			"union null+long with date logical (date requires int)",
-			`{"type":"record","name":"R","fields":[
-				{"name":"x","type":["null","long"],"logicalType":"date"}
-			]}`,
-			`date`,
-		},
+// Users wanting strict pre-parse validation should add their own
+// validator pass; twmb's parse layer follows the documented spec
+// guidance ("should ignore") and reference-impl consensus.
+func TestFieldLevelLogicalType_MismatchSoftDrops(t *testing.T) {
+	cases := []string{
+		`{"type":"record","name":"R","fields":[{"name":"x","type":"long","logicalType":"date"}]}`,
+		`{"type":"record","name":"R","fields":[{"name":"x","type":"int","logicalType":"uuid"}]}`,
+		`{"type":"record","name":"R","fields":[{"name":"x","type":"string","logicalType":"timestamp-millis"}]}`,
+		`{"type":"record","name":"R","fields":[{"name":"x","type":"int","logicalType":"time-micros"}]}`,
+		`{"type":"record","name":"R","fields":[{"name":"x","type":"bytes","logicalType":"date"}]}`,
+		// Union variant: same soft-drop through the union-lift path.
+		`{"type":"record","name":"R","fields":[{"name":"x","type":["null","long"],"logicalType":"date"}]}`,
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := Parse(tc.schema)
-			if err == nil {
-				t.Fatalf("expected parse error for %s, got nil (schema lifted to invalid type+logical combination but did not error)", tc.name)
-			}
-			if !strings.Contains(err.Error(), tc.wantErrSubs) {
-				t.Fatalf("error message does not mention %q: %v", tc.wantErrSubs, err)
+	for _, sch := range cases {
+		t.Run(sch, func(t *testing.T) {
+			if _, err := Parse(sch); err != nil {
+				t.Fatalf("expected soft-drop accept, got: %v\n  schema: %s", err, sch)
 			}
 		})
 	}

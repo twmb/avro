@@ -131,7 +131,29 @@ func (s *Schema) Root() SchemaNode {
 func (n *SchemaNode) toJSONDedup(d *deduper) any {
 	// Cycle detection for *SchemaNode pointers (Items/Values). Fields
 	// and Branches are value slices and cannot form true cycles.
+	//
+	// Named-type ancestor cycles (a record that contains an array
+	// whose Items pointer is the record itself — the programmatic
+	// shape of an Avro recursive schema) emit as a name reference,
+	// which is the canonical Avro recursive-schema form. The JSON
+	// equivalent uses a name reference at the inner position
+	// ({"type":"array","items":"NodeName"}); the programmatic form
+	// reaches the same destination via the pointer. Pre-fix this
+	// errored because the cycle guard fired before the dedup
+	// mechanism's name-reference emission at line 152 could; both
+	// cycle-at-ancestor-named and conflict-detection-via-d.defined
+	// converge on "emit the name" so the cycle path emits it
+	// directly without needing d.defined to be populated yet (which
+	// won't happen for ancestors until the line-180 snapshot below).
+	// Unnamed cycles (array of itself, map of itself) remain errors —
+	// Avro has no name-reference syntax for unnamed types.
 	if _, cycle := d.visited[n]; cycle {
+		switch n.Type {
+		case "record", "error", "enum", "fixed":
+			if n.Name != "" {
+				return n.Name
+			}
+		}
 		if d.err == nil {
 			d.err = fmt.Errorf("avro: cyclic SchemaNode detected")
 		}
@@ -260,7 +282,42 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 }
 
 // toJSON converts a SchemaNode to a JSON-serializable representation.
+// Cycles in n's Items/Values pointers (programmatically constructed)
+// are detected and emitted as the cyclic node's name (for named types)
+// or nil (for unnamed). The visited map is per-call; toJSONDedup uses
+// its own dedup-aware cycle guard at line 134 for the outer walk and
+// calls into toJSON for snapshot/equality at lines 148/180.
 func (n *SchemaNode) toJSON() any {
+	return n.toJSONVisited(make(map[*SchemaNode]struct{}))
+}
+
+// toJSONVisited is the cycle-aware inner walker. Pre-fix, the four
+// recursive call sites (Items, Values, Branches[i], Fields[i].Type)
+// invoked toJSON unconditionally, so programmatic cycles via
+// Items/Values pointers caused stack overflow when toJSONDedup forked
+// here at lines 148/180 (snapshot + equality check for named-type
+// conflict detection). The dedup walker's own cycle guard at line 134
+// only protected the outer dedup-aware walk; the snapshot fork was
+// blind to cycles. See TestRegression_SchemaNodeToJSONCycleSafe.
+func (n *SchemaNode) toJSONVisited(visited map[*SchemaNode]struct{}) any {
+	if _, cycle := visited[n]; cycle {
+		// Cycle through Items/Values back to n. For named types, emit
+		// the name as a reference (the natural Avro recursive-schema
+		// shape). For unnamed types, return nil — the resulting JSON
+		// is partial but stable enough for the toJSONDedup snapshot/
+		// equality check to function: two equal cyclic subtrees
+		// produce the same partial JSON.
+		switch n.Type {
+		case "record", "error", "enum", "fixed":
+			if n.Name != "" {
+				return n.Name
+			}
+		}
+		return nil
+	}
+	visited[n] = struct{}{}
+	defer delete(visited, n)
+
 	// Named type reference: just the name string.
 	switch n.Type {
 	case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
@@ -270,7 +327,7 @@ func (n *SchemaNode) toJSON() any {
 	case "union":
 		branches := make([]any, len(n.Branches))
 		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSON()
+			branches[i] = n.Branches[i].toJSONVisited(visited)
 		}
 		return branches
 	}
@@ -325,10 +382,10 @@ func (n *SchemaNode) toJSON() any {
 		m["symbols"] = n.Symbols
 	}
 	if n.Items != nil {
-		m["items"] = n.Items.toJSON()
+		m["items"] = n.Items.toJSONVisited(visited)
 	}
 	if n.Values != nil {
-		m["values"] = n.Values.toJSON()
+		m["values"] = n.Values.toJSONVisited(visited)
 	}
 	// record.fields is a required attribute per the Avro spec (Complex
 	// Types > Records: "fields: a JSON array, listing fields (required)"),
@@ -338,7 +395,7 @@ func (n *SchemaNode) toJSON() any {
 		for i, f := range n.Fields {
 			fd := map[string]any{
 				"name": f.Name,
-				"type": f.Type.toJSON(),
+				"type": f.Type.toJSONVisited(visited),
 			}
 			if f.HasDefault || f.Default != nil {
 				fd["default"] = f.Default
