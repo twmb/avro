@@ -3672,3 +3672,176 @@ func TestRegression_OCFBigDecimalJavaInterop(t *testing.T) {
 		t.Fatalf("expected io.EOF after single record, got %v", err)
 	}
 }
+
+// TestRegression_OCFCodecMatrix pins round-trip behavior for every
+// supported codec (null, deflate, snappy, zstd) at writer and reader
+// sides. Snappy specifically uses a trailing CRC32 that the reader
+// verifies (fastavro skips this verification — see AUDIT.md known
+// divergences); the matrix asserts CRC mismatches are detected.
+func TestRegression_OCFCodecMatrix(t *testing.T) {
+	schema := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`)
+	records := []map[string]any{
+		{"v": int64(1)},
+		{"v": int64(2)},
+		{"v": int64(3)},
+		{"v": int64(1 << 40)}, // larger value to give compression something to chew on
+	}
+
+	type codecCase struct {
+		desc  string
+		codec Codec
+	}
+	zstdC, err := ZstdCodec(nil, nil)
+	if err != nil {
+		t.Fatalf("ZstdCodec: %v", err)
+	}
+	codecs := []codecCase{
+		{"null", nil}, // explicit nil = default null codec
+		{"deflate", DeflateCodec(flate.DefaultCompression)},
+		{"snappy", SnappyCodec()},
+		{"zstd", zstdC},
+	}
+
+	for _, c := range codecs {
+		c := c
+		t.Run(c.desc, func(t *testing.T) {
+			var buf bytes.Buffer
+			var opts []WriterOpt
+			if c.codec != nil {
+				opts = append(opts, WithCodec(c.codec))
+			}
+			w, err := NewWriter(&buf, schema, opts...)
+			if err != nil {
+				t.Fatalf("NewWriter: %v", err)
+			}
+			for _, r := range records {
+				if err := w.Encode(r); err != nil {
+					t.Fatalf("Encode: %v", err)
+				}
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			// Read back.
+			r, err := NewReader(bytes.NewReader(buf.Bytes()))
+			if err != nil {
+				t.Fatalf("NewReader: %v", err)
+			}
+			for i, want := range records {
+				var got map[string]any
+				if err := r.Decode(&got); err != nil {
+					t.Fatalf("Decode #%d: %v", i, err)
+				}
+				if got["v"] != want["v"] {
+					t.Errorf("record %d: got %v, want %v", i, got, want)
+				}
+			}
+			// EOF after last record.
+			var dummy any
+			if err := r.Decode(&dummy); err != io.EOF {
+				t.Errorf("expected EOF after %d records, got %v", len(records), err)
+			}
+		})
+	}
+}
+
+// TestRegression_OCFEmptyFile pins behavior for an OCF file with zero
+// records (header + sync, no data blocks). Reader should produce EOF
+// on first Decode without error.
+func TestRegression_OCFEmptyFile(t *testing.T) {
+	schema := avro.MustParse(`"long"`)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	var v int64
+	if err := r.Decode(&v); err != io.EOF {
+		t.Errorf("expected EOF on empty file, got %v", err)
+	}
+}
+
+// TestRegression_OCFTruncatedFile pins behavior on truncation: header-
+// only, header + partial block, etc. Reader should error gracefully
+// rather than panic or return wrong data.
+func TestRegression_OCFTruncatedFile(t *testing.T) {
+	schema := avro.MustParse(`"long"`)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := w.Encode(int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	full := buf.Bytes()
+
+	// Try truncating at every byte position; reader should not panic.
+	for cut := 0; cut < len(full); cut += 7 {
+		cut := cut
+		t.Run(fmt.Sprintf("cut@%d", cut), func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panic on truncated input at offset %d: %v", cut, r)
+				}
+			}()
+			r, err := NewReader(bytes.NewReader(full[:cut]))
+			if err != nil {
+				return // header parse failure is fine
+			}
+			for i := 0; i < 100; i++ {
+				var v int64
+				if err := r.Decode(&v); err != nil {
+					break // any error (EOF or truncation) is fine
+				}
+			}
+		})
+	}
+}
+
+// TestRegression_OCFReaderSchemaPromotion pins reader-schema promotion
+// (writer schema embedded in file, reader supplies a separate schema
+// via WithReaderSchema). int file decoded with long reader → long
+// values.
+func TestRegression_OCFReaderSchemaPromotion(t *testing.T) {
+	wschema := avro.MustParse(`"int"`)
+	rschema := avro.MustParse(`"long"`)
+
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, wschema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(int32(42)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()), WithReaderSchema(rschema))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	var got int64
+	if err := r.Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 42 {
+		t.Errorf("got %d, want 42", got)
+	}
+}

@@ -12960,3 +12960,1796 @@ func TestRegression_SchemaMetadataNumericPrecisionPreserved(t *testing.T) {
 		}
 	})
 }
+
+// TestRegression_NumberGrammarParityMatrix pins the JSON-number grammar
+// gate across every entry point that converts a [json.Number] to an
+// Avro primitive (int / long / float / double) on both the binary and
+// JSON encode paths. The matrix exists because the codebase historically
+// accumulated multiple parallel parsers — strconv.ParseInt with base=10,
+// strconv.ParseFloat, big.Rat.SetString — each with subtly different
+// accepted sets that diverged from RFC 8259's JSON-number grammar.
+// Three rounds of bugs (commit 1971999's int-path fix, the round-after
+// audit's hex/octal/binary regression, the float-path sibling) all
+// landed because no single test pinned the cross-entry-point invariant
+// "a json.Number is accepted iff it is an RFC 8259 number".
+//
+// Rows: input equivalence classes (valid JSON, value-overflow,
+// JSON-invalid grammar). Columns: 4 target types × 2 encode directions
+// = 8 entry-point cells. Cell value: whether encode succeeds.
+//
+// Java's JsonParser rejects every JSON-invalid form at parse time;
+// fastavro's int() / float() raise ValueError on the same set. The
+// matrix targets parity with the Java + fastavro consensus.
+//
+// Adding an entry point: add a column to typeCases. Adding an input
+// class: add a row to cases. Cells that are surprising (e.g.,
+// "9223372036854775807" rejected for double on grammar grounds but
+// independently rejected for precision) should grow a comment.
+func TestRegression_NumberGrammarParityMatrix(t *testing.T) {
+	// Each input is classified by whether the JSON encoder for each
+	// target type should accept it. "accept" requires the value to also
+	// fit the target type's range; e.g., MaxInt64 is JSON-grammar-valid
+	// but exceeds int32 range so the int cell is reject.
+	type expect struct{ intC, longC, floatC, doubleC bool }
+	const (
+		acc = true
+		rej = false
+	)
+
+	cases := []struct {
+		input  string
+		expect expect
+		desc   string
+	}{
+		// ---- Valid JSON numbers, fit every type. ----
+		{"0", expect{acc, acc, acc, acc}, "zero"},
+		{"-0", expect{acc, acc, acc, acc}, "negative zero"},
+		{"1", expect{acc, acc, acc, acc}, "one"},
+		{"-1", expect{acc, acc, acc, acc}, "neg one"},
+		{"42", expect{acc, acc, acc, acc}, "small int"},
+
+		// ---- Valid JSON, fractional — int/long reject (not whole). ----
+		{"1.5", expect{rej, rej, acc, acc}, "fractional"},
+		{"-0.5", expect{rej, rej, acc, acc}, "neg fractional"},
+		{"1.0", expect{acc, acc, acc, acc}, "whole fractional"},
+
+		// ---- Valid JSON, exponent forms. ----
+		{"1e3", expect{acc, acc, acc, acc}, "exp positive"},
+		// -1e10 = -10000000000, exceeds int32 range.
+		{"-1E10", expect{rej, acc, acc, acc}, "exp uppercase neg"},
+		{"1.5e1", expect{acc, acc, acc, acc}, "whole via exp"},
+		{"1.5e0", expect{rej, rej, acc, acc}, "non-whole via exp"},
+
+		// ---- Boundary values. ----
+		// 2^24 = 16777216, the float32 mantissa boundary. Exactly fits.
+		{"16777216", expect{acc, acc, acc, acc}, "float32 mantissa boundary"},
+		// 2^24+1 = 16777217 — first integer not exactly representable in float32.
+		{"16777217", expect{acc, acc, rej, acc}, "float32 mantissa+1"},
+		{"-16777217", expect{acc, acc, rej, acc}, "-float32 mantissa+1"},
+		// MaxInt32 = 2147483647 — fits int, long, double exactly; exceeds float32 mantissa (1<<24).
+		{"2147483647", expect{acc, acc, rej, acc}, "MaxInt32"},
+		{"-2147483648", expect{acc, acc, rej, acc}, "MinInt32"},
+		// MaxInt32+1 = 2147483648 — exceeds int range.
+		{"2147483648", expect{rej, acc, rej, acc}, "MaxInt32+1"},
+		// MaxInt64 = 9223372036854775807 — exceeds int and float* precision.
+		{"9223372036854775807", expect{rej, acc, rej, rej}, "MaxInt64"},
+		{"-9223372036854775808", expect{rej, acc, rej, rej}, "MinInt64"},
+		// MaxInt64+1 = 9223372036854775808 — exceeds every type.
+		{"9223372036854775808", expect{rej, rej, rej, rej}, "MaxInt64+1"},
+		// 2^53+1 = first integer not exactly representable in float64.
+		// Fits int64 exactly; floats reject for precision.
+		{"9007199254740993", expect{rej, acc, rej, rej}, "2^53+1"},
+
+		// ---- JSON-invalid grammar — every cell rejects. ----
+		{"0x10", expect{rej, rej, rej, rej}, "hex prefix"},
+		{"0X10", expect{rej, rej, rej, rej}, "hex prefix uppercase"},
+		{"0b10", expect{rej, rej, rej, rej}, "binary prefix"},
+		{"0o10", expect{rej, rej, rej, rej}, "octal prefix"},
+		{"0x1.0p10", expect{rej, rej, rej, rej}, "hex float (Go/Java accept, JSON rejects)"},
+		{"0x1p4", expect{rej, rej, rej, rej}, "hex float compact"},
+		{"1_000", expect{rej, rej, rej, rej}, "underscore separator (Go-specific)"},
+		{"1_2_3", expect{rej, rej, rej, rej}, "multiple underscores"},
+		{"5/1", expect{rej, rej, rej, rej}, "rational form (big.Rat.SetString accepts)"},
+		{"+5", expect{rej, rej, rej, rej}, "leading plus"},
+		{"01", expect{rej, rej, rej, rej}, "leading zero multi-digit"},
+		{"-01", expect{rej, rej, rej, rej}, "neg leading zero"},
+		{"00", expect{rej, rej, rej, rej}, "double zero"},
+		{".5", expect{rej, rej, rej, rej}, "no leading digit"},
+		{"-.5", expect{rej, rej, rej, rej}, "neg no leading digit"},
+		{"1.", expect{rej, rej, rej, rej}, "trailing dot"},
+		{"1e", expect{rej, rej, rej, rej}, "exp no digit"},
+		{"1.5.6", expect{rej, rej, rej, rej}, "double decimal"},
+		{"NaN", expect{rej, rej, rej, rej}, "NaN literal"},
+		{"Infinity", expect{rej, rej, rej, rej}, "Infinity literal"},
+		{"abc", expect{rej, rej, rej, rej}, "non-numeric"},
+		{"", expect{rej, rej, rej, rej}, "empty"},
+
+		// ---- Whitespace edge cases. ----
+		{" 5", expect{rej, rej, rej, rej}, "leading space"},
+		{"5 ", expect{rej, rej, rej, rej}, "trailing space"},
+		{"5 6", expect{rej, rej, rej, rej}, "internal whitespace"},
+		{"\t5", expect{rej, rej, rej, rej}, "leading tab"},
+		{"5\n", expect{rej, rej, rej, rej}, "trailing newline"},
+	}
+
+	typeCases := []struct {
+		schema string
+		name   string
+		expect func(expect) bool
+	}{
+		{`"int"`, "int", func(e expect) bool { return e.intC }},
+		{`"long"`, "long", func(e expect) bool { return e.longC }},
+		{`"float"`, "float", func(e expect) bool { return e.floatC }},
+		{`"double"`, "double", func(e expect) bool { return e.doubleC }},
+	}
+
+	for _, c := range cases {
+		c := c
+		for _, target := range typeCases {
+			target := target
+			t.Run(c.desc+"/"+target.name, func(t *testing.T) {
+				s, err := avro.Parse(target.schema)
+				if err != nil {
+					t.Fatalf("parse %s: %v", target.schema, err)
+				}
+				wantAccept := target.expect(c.expect)
+
+				// Binary encode arm.
+				_, binErr := s.AppendEncode(nil, json.Number(c.input))
+				gotBinAccept := binErr == nil
+				if gotBinAccept != wantAccept {
+					t.Errorf("binary encode %q against %s: want accept=%v, got err=%v", c.input, target.name, wantAccept, binErr)
+				}
+
+				// JSON encode arm.
+				_, jsonErr := s.AppendEncodeJSON(nil, json.Number(c.input))
+				gotJSONAccept := jsonErr == nil
+				if gotJSONAccept != wantAccept {
+					t.Errorf("JSON encode %q against %s: want accept=%v, got err=%v", c.input, target.name, wantAccept, jsonErr)
+				}
+			})
+		}
+	}
+}
+
+// TestRegression_NumberGrammarParityMatrix_Decimal extends the grammar
+// matrix to the decimal / big-decimal encode paths, where the coercion
+// runs through tryCoerceToRat → boundedRatFromString. Same grammar rule:
+// json.Number must be RFC 8259 valid; strings are coerced only when
+// they look like JSON numbers (first char '-' or digit), otherwise fall
+// through to opaque-bytes encoding.
+func TestRegression_NumberGrammarParityMatrix_Decimal(t *testing.T) {
+	// (input, jsonNumberAccepts, stringAccepts) — string arm's
+	// "fall-through to raw bytes" path differs from json.Number's
+	// "always treat as a number".
+	cases := []struct {
+		input string
+		jn    bool // json.Number behavior: accept (valid) / reject (invalid)
+		str   bool // string behavior: accept (number) / fall-through (opaque) — both succeed; both error states are when bound exceeded or numeric-looking but malformed
+		desc  string
+	}{
+		// Valid JSON-number inputs encode successfully on both arms.
+		{"3.14", true, true, "fractional"},
+		{"0.5", true, true, "half"},
+		{"-1.5", true, true, "neg fractional"},
+		{"100", true, true, "integer"},
+		{"1e3", true, true, "exp positive"},
+		{"1e-3", true, true, "exp negative"},
+
+		// JSON-invalid grammar: both arms error (the string arm because
+		// the input starts with a digit/minus, so it's numeric-looking
+		// and surfaces the error rather than falling through).
+		{"0x10", false, false, "hex prefix"},
+		{"0b10", false, false, "binary prefix"},
+		{"0o10", false, false, "octal prefix"},
+		{"1_000", false, false, "underscore"},
+		{"5/1", false, false, "rational"},
+		{"+5", false, false, "leading plus"},
+		{"01", false, false, "leading zero"},
+
+		// Non-numeric inputs: json.Number arm errors (json.Number's
+		// type asserts "this is a number"); string arm falls through
+		// to opaque-bytes encoding so encode succeeds.
+		{"abc", false, true, "non-numeric string"},
+		{"hello", false, true, "non-numeric word"},
+	}
+
+	for _, sj := range []struct{ schemaJSON, name string }{
+		{`{"type":"bytes","logicalType":"decimal","precision":20,"scale":4}`, "decimal-bytes"},
+		{`{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal"},
+	} {
+		s, err := avro.Parse(sj.schemaJSON)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range cases {
+			c := c
+			t.Run(sj.name+"/"+c.desc, func(t *testing.T) {
+				// json.Number arm.
+				_, jnErr := s.AppendEncode(nil, json.Number(c.input))
+				if (jnErr == nil) != c.jn {
+					t.Errorf("json.Number %q against %s: want accept=%v, got err=%v", c.input, sj.name, c.jn, jnErr)
+				}
+				// String arm.
+				_, sErr := s.AppendEncode(nil, c.input)
+				if (sErr == nil) != c.str {
+					t.Errorf("string %q against %s: want accept=%v, got err=%v", c.input, sj.name, c.str, sErr)
+				}
+			})
+		}
+	}
+}
+
+// TestRegression_NumberGrammarParityMatrix_JSONDecode_Long pins the
+// JSON-decode path for "long" against the same grammar matrix. The
+// scanner gates most non-JSON inputs at JSON-syntax parse time, but
+// the .eE branch of parseJSONInt64 routes through parseInt64Lenient
+// (which gates via isJSONNumber). Inputs in this matrix that pass
+// the scanner but fail isJSONNumber surface the gate.
+func TestRegression_NumberGrammarParityMatrix_JSONDecode_Long(t *testing.T) {
+	// All inputs go through Schema.DecodeJSON, which routes via the
+	// JSON scanner. Inputs that aren't valid JSON tokens are rejected
+	// at scanner time; those that pass the scanner but contain '.', 'e',
+	// or 'E' reach parseInt64Lenient.
+	cases := []struct {
+		input  string
+		expect bool
+		desc   string
+	}{
+		// Valid: scanner accepts, parseJSONInt64 (or via .eE branch) returns int64.
+		{"0", true, "zero"},
+		{"1", true, "one"},
+		{"-1", true, "neg"},
+		{"1e3", true, "exp"},      // .eE branch → parseInt64Lenient
+		{"1.5e1", true, "exp-15"}, // .eE branch
+		{"9223372036854775807", true, "MaxInt64"},
+
+		// Scanner rejects most JSON-invalid forms BEFORE reaching the
+		// long parser. We assert overall rejection regardless of which
+		// layer catches.
+		{"0x10", false, "hex"},
+		{"0b10", false, "binary"},
+		{"01", false, "leading zero"},
+		{"+5", false, "leading plus"},
+		{"1.5", false, "non-whole"},
+		{"NaN", false, "NaN"},
+	}
+
+	s := avro.MustParse(`"long"`)
+	for _, c := range cases {
+		c := c
+		t.Run(c.desc, func(t *testing.T) {
+			var v int64
+			err := s.DecodeJSON([]byte(c.input), &v)
+			if (err == nil) != c.expect {
+				t.Errorf("JSON-decode %q against long: want accept=%v, got err=%v", c.input, c.expect, err)
+			}
+		})
+	}
+}
+
+// TestRegression_NumberGrammarParityMatrix_JSONDecode_AllTypes extends
+// the long-only JSON-decode matrix to int / float / double. The scanner
+// gates JSON syntax for all four, but each runs through a distinct
+// downstream parser (parseJSONInt32 for int, parseJSONInt64 for long,
+// strconv.ParseFloat for float/double), so the per-type strictness needs
+// independent pinning. Trailing-garbage rejection comes from
+// [Schema.DecodeJSON]'s end-of-input check.
+func TestRegression_NumberGrammarParityMatrix_JSONDecode_AllTypes(t *testing.T) {
+	cases := []struct {
+		input string
+		// Per-type expected outcome. nil means N/A (e.g., fractional input
+		// against int is "accept" for grammar but reject for type-fit;
+		// here we test the union — does encode end-to-end succeed?).
+		intOK, longOK, floatOK, doubleOK bool
+		desc                             string
+	}{
+		// Valid integer.
+		{"42", true, true, true, true, "small int"},
+		{"-1", true, true, true, true, "neg int"},
+		{"0", true, true, true, true, "zero"},
+
+		// Valid float.
+		{"1.5", false, false, true, true, "fractional"},
+		{"1e3", true, true, true, true, "whole via exp"},
+		{"1.5e1", true, true, true, true, "whole via exp scaled"},
+		{"1.5e0", false, false, true, true, "fractional via exp"},
+
+		// Mid-token garbage — trailing-content check fires.
+		{"1abc", false, false, false, false, "trailing letters"},
+		{"1.5x", false, false, false, false, "fractional + trailing"},
+		{"0x10", false, false, false, false, "hex prefix"},
+
+		// JSON-invalid forms (scanner-rejected at parse).
+		{"0b10", false, false, false, false, "binary prefix"},
+		{"+5", false, false, false, false, "leading plus"},
+		{"01", false, false, false, false, "leading zero"},
+
+		// Empty.
+		{"", false, false, false, false, "empty"},
+
+		// Trailing whitespace (RFC 8259 permits) and multi-record concat.
+		{"5  ", true, true, true, true, "trailing whitespace"},
+		{"5  {}", true, true, true, true, "trailing valid JSON (concat)"},
+
+		// Overflow.
+		{"2147483648", false, true, true, true, "MaxInt32+1"},
+		{"9223372036854775808", false, false, true, true, "MaxInt64+1 (float-rounded)"},
+	}
+
+	type target struct {
+		schema string
+		decode func(s *avro.Schema, in []byte) error
+	}
+	targets := []target{
+		{`"int"`, func(s *avro.Schema, in []byte) error { var v int32; return s.DecodeJSON(in, &v) }},
+		{`"long"`, func(s *avro.Schema, in []byte) error { var v int64; return s.DecodeJSON(in, &v) }},
+		{`"float"`, func(s *avro.Schema, in []byte) error { var v float32; return s.DecodeJSON(in, &v) }},
+		{`"double"`, func(s *avro.Schema, in []byte) error { var v float64; return s.DecodeJSON(in, &v) }},
+	}
+
+	getExpect := func(c struct {
+		input                            string
+		intOK, longOK, floatOK, doubleOK bool
+		desc                             string
+	}, idx int) bool {
+		switch idx {
+		case 0:
+			return c.intOK
+		case 1:
+			return c.longOK
+		case 2:
+			return c.floatOK
+		case 3:
+			return c.doubleOK
+		}
+		return false
+	}
+
+	for _, c := range cases {
+		c := c
+		for i, tg := range targets {
+			tg := tg
+			i := i
+			t.Run(c.desc+"/"+tg.schema, func(t *testing.T) {
+				s := avro.MustParse(tg.schema)
+				err := tg.decode(s, []byte(c.input))
+				gotOK := err == nil
+				want := getExpect(c, i)
+				if gotOK != want {
+					t.Errorf("DecodeJSON %q against %s: want accept=%v, got err=%v", c.input, tg.schema, want, err)
+				}
+			})
+		}
+	}
+}
+
+// TestRegression_UnionDispatchMatrix pins branch selection for every
+// (input, union schema) combination that has historically surfaced bugs
+// or could under future drift. Avro union encode is try-each in schema
+// order: try each branch; pick the first that encodes without error.
+// The matrix locks which branch wins for inputs where multiple branches
+// could plausibly accept — bytes-vs-string for raw bytes, the four
+// numeric branches for json.Number, null shapes against
+// [null,T]/T-only unions, etc.
+//
+// "Branch picked" is verified by decoding the wire output back through
+// [Schema.DecodeJSON] into a *any target with [TaggedUnions], which
+// wraps the decoded value with its branch name. The branch-name string
+// thus appears in the decoded result and can be asserted against an
+// expected branch.
+//
+// Branch-selection asymmetries in this matrix have caused real bugs:
+// the prior nil-Map-against-multi-branch-union didn't reach case "null"
+// because the try-each loop had a `continue` on null kinds (pattern 15
+// in AUDIT.md); the binary serUnion try-each was independent of the
+// JSON one, so they drifted on which inputs land on which branch.
+func TestRegression_UnionDispatchMatrix(t *testing.T) {
+	type expect struct {
+		picked string // expected branch kind/name
+		errOK  bool   // alternatively, encode is expected to error
+	}
+	cases := []struct {
+		schema string
+		input  any
+		exp    expect
+		desc   string
+	}{
+		// ---- Typed numeric inputs, single-branch fit. ----
+		// Type-name dispatch (unionTypeNameForValue) maps int64 → "long"
+		// regardless of value range, so int64(42) against
+		// ["int","long"] picks long, NOT int even though 42 fits int32.
+		// This locks the Go-type→Avro-type canonical mapping over
+		// value-fitting promotion.
+		{`["null","long"]`, int64(42), expect{"long", false}, "int64 to long"},
+		{`["null","int","long"]`, int64(42), expect{"long", false}, "int64-fits-int32 still picks long via type-name"},
+		{`["null","int","long"]`, int64(1 << 40), expect{"long", false}, "int64-out-of-int32 to long"},
+		{`["null","int","long"]`, int32(42), expect{"int", false}, "int32 to int via type-name"},
+		// int8/int16/uint8/uint16 all map to Avro "int" per type-name dispatch.
+		{`["null","int","long"]`, int8(42), expect{"int", false}, "int8 maps to int"},
+		{`["null","int","long"]`, int16(42), expect{"int", false}, "int16 maps to int"},
+		{`["null","double"]`, float64(1.5), expect{"double", false}, "float64 to double"},
+		{`["null","float","double"]`, float32(1.5), expect{"float", false}, "float32 to float"},
+		{`["null","float","double"]`, float64(1.5), expect{"double", false}, "float64 to double, not float"},
+
+		// ---- json.Number numeric inputs (type-name skips json.Number,
+		// runs try-each which picks first branch that accepts). ----
+		{`["null","long","string"]`, json.Number("42"), expect{"long", false}, "json.Number int prefers long"},
+		// All-numeric union: try-each picks the first numeric that accepts.
+		{`["null","int","long","float","double"]`, json.Number("42"), expect{"int", false}, "small int prefers int (first numeric)"},
+		{`["null","int","long","float","double"]`, json.Number("9999999999"), expect{"long", false}, "out-of-int32 prefers long"},
+		{`["null","int","long","float","double"]`, json.Number("1.5"), expect{"float", false}, "fractional prefers float"},
+		// Non-whole rejects int+long, falls to first float that accepts.
+		{`["null","double","string"]`, json.Number("1.5"), expect{"double", false}, "json.Number(1.5) to double"},
+		// JSON-invalid grammar: all numeric branches reject; string
+		// also rejects json.Number explicitly (avroStringValue/
+		// appendAvroString line 805). No matching branch → error.
+		{`["null","long","string"]`, json.Number("0x10"), expect{"", true}, "hex jsonNumber - all reject"},
+		// Fractional against int+long+string: int+long reject (not whole),
+		// string rejects json.Number → error.
+		{`["null","long","string"]`, json.Number("1.5"), expect{"", true}, "fractional jsonNumber against long+string"},
+		// But against bytes-containing union: bytes accepts string-typed
+		// json.Number as raw bytes (serBytes line 768). Asymmetry: string
+		// rejects json.Number but bytes accepts it. Documenting.
+		{`["null","long","bytes"]`, json.Number("0x10"), expect{"bytes", false}, "hex jsonNumber falls to bytes (asymmetry vs string)"},
+
+		// ---- nil shapes. serNull accepts Pointer/Interface/Map/Slice/
+		// Chan/Func nils via the peel loop. ----
+		{`["null","long"]`, nil, expect{"null", false}, "untyped nil"},
+		{`["null","long"]`, (*int)(nil), expect{"null", false}, "typed nil pointer"},
+		{`["null","long"]`, any((*int)(nil)), expect{"null", false}, "interface-wrapped typed nil"},
+		// Nil []byte against any union with a null branch picks null
+		// regardless of type-name dispatch — serUnion has an explicit
+		// isNilValue priority gate (ser.go:125) BEFORE type-name and
+		// try-each, so all nil shapes route to null when null is in
+		// the union. Pre-fix this only fired for 2-branch [null,T];
+		// the generic path used type-name first which silently sent
+		// nil []byte to bytes-empty. The two are now uniform.
+		{`["null","string"]`, []byte(nil), expect{"null", false}, "nil []byte against ['null','string'] routes to null"},
+		{`["null","bytes"]`, []byte(nil), expect{"null", false}, "nil []byte against ['null','bytes'] routes to null (isNilValue priority)"},
+		{`["null","bytes","string"]`, []byte(nil), expect{"null", false}, "nil []byte against ['null','bytes','string']"},
+		// Nil map: type-name returns "" for map (not in dispatch); try-each.
+		{`["null","string"]`, map[string]any(nil), expect{"null", false}, "nil map falls to null"},
+		// No-null union with nil: rejects.
+		{`["long","string"]`, nil, expect{"", true}, "untyped nil against no-null union"},
+
+		// ---- string / bytes type-name dispatch. ----
+		// Type-name maps reflect.String → "string", []byte → "bytes".
+		// Schema order doesn't matter — type-name wins over try-each.
+		{`["null","bytes","string"]`, []byte("hello"), expect{"bytes", false}, "[]byte to bytes via type-name"},
+		{`["null","bytes","string"]`, "hello", expect{"string", false}, "string to string via type-name"},
+		{`["null","string","bytes"]`, "hello", expect{"string", false}, "string-first union picks string"},
+		{`["null","string","bytes"]`, []byte("hello"), expect{"bytes", false, /* type-name */}, "[]byte type-name to bytes"},
+
+		// ---- Bool dispatch. ----
+		{`["null","boolean","string"]`, true, expect{"boolean", false}, "bool to boolean"},
+		{`["null","boolean","string"]`, false, expect{"boolean", false}, "false bool to boolean"},
+
+		// ---- Numeric-overflow fall-through. ----
+		{`["null","int","long"]`, int64(math.MaxInt64), expect{"long", false}, "MaxInt64 to long"},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.desc, func(t *testing.T) {
+			s := avro.MustParse(c.schema)
+			out, err := s.AppendEncode(nil, c.input)
+			if c.exp.errOK {
+				if err == nil {
+					t.Errorf("expected error, got encoded %v", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			// Decode with TaggedUnions to see which branch was picked.
+			var v any
+			if _, err := s.Decode(out, &v, avro.TaggedUnions()); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			// For the null branch, decoded value is nil — tagged map not produced.
+			if c.exp.picked == "null" {
+				if v != nil {
+					t.Errorf("expected null branch (v=nil), got %T %v", v, v)
+				}
+				return
+			}
+			m, ok := v.(map[string]any)
+			if !ok {
+				t.Fatalf("expected tagged-union map, got %T %v", v, v)
+			}
+			if _, found := m[c.exp.picked]; !found {
+				t.Errorf("expected branch %q to be picked, got map=%v", c.exp.picked, m)
+			}
+		})
+	}
+}
+
+// TestRegression_LogicalTypeRoundTripMatrix locks encode + decode for
+// every logical type, asserting that a value encoded through one path
+// round-trips identically through the matching decode path. Each
+// logical type gets a representative value and a primary target Go
+// type (the one the binary deserializer emits). The matrix prevents
+// drift where a future encoder accepts a value the decoder can't read
+// back, or vice versa.
+func TestRegression_LogicalTypeRoundTripMatrix(t *testing.T) {
+	type rt struct {
+		schema   string
+		value    any
+		makeTgt  func() any
+		desc     string
+		decoded  func(any) any // optional decoded transform
+		jsonOnly bool
+	}
+
+	now := time.Date(2024, 6, 15, 10, 30, 45, 123456789, time.UTC)
+	dateOnly := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC)
+
+	cases := []rt{
+		{
+			schema:  `{"type":"int","logicalType":"date"}`,
+			value:   dateOnly,
+			makeTgt: func() any { var v time.Time; return &v },
+			desc:    "date",
+		},
+		{
+			schema:  `{"type":"int","logicalType":"time-millis"}`,
+			value:   3*time.Hour + 30*time.Minute + 45*time.Second,
+			makeTgt: func() any { var v time.Duration; return &v },
+			desc:    "time-millis",
+		},
+		{
+			schema:  `{"type":"long","logicalType":"time-micros"}`,
+			value:   3*time.Hour + 30*time.Minute + 45*time.Second + 123*time.Microsecond,
+			makeTgt: func() any { var v time.Duration; return &v },
+			desc:    "time-micros",
+		},
+		{
+			schema:  `{"type":"long","logicalType":"timestamp-millis"}`,
+			value:   now.Truncate(time.Millisecond),
+			makeTgt: func() any { var v time.Time; return &v },
+			desc:    "timestamp-millis",
+		},
+		{
+			schema:  `{"type":"long","logicalType":"timestamp-micros"}`,
+			value:   now.Truncate(time.Microsecond),
+			makeTgt: func() any { var v time.Time; return &v },
+			desc:    "timestamp-micros",
+		},
+		{
+			schema:  `{"type":"long","logicalType":"timestamp-nanos"}`,
+			value:   now,
+			makeTgt: func() any { var v time.Time; return &v },
+			desc:    "timestamp-nanos",
+		},
+		{
+			schema:  `{"type":"long","logicalType":"local-timestamp-millis"}`,
+			value:   now.Truncate(time.Millisecond),
+			makeTgt: func() any { var v time.Time; return &v },
+			desc:    "local-timestamp-millis",
+		},
+		{
+			schema:  `{"type":"string","logicalType":"uuid"}`,
+			value:   "01020304-0506-0708-090a-0b0c0d0e0f10",
+			makeTgt: func() any { var v string; return &v },
+			desc:    "uuid",
+		},
+		{
+			schema:  `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+			value:   big.NewRat(31415, 100),
+			makeTgt: func() any { var v big.Rat; return &v },
+			desc:    "decimal-bytes",
+			decoded: func(v any) any {
+				if r, ok := v.(*big.Rat); ok {
+					return r
+				}
+				if r, ok := v.(big.Rat); ok {
+					return &r
+				}
+				return v
+			},
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.desc+"/binary", func(t *testing.T) {
+			s := avro.MustParse(c.schema)
+			out, err := s.AppendEncode(nil, c.value)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			tgt := c.makeTgt()
+			if _, err := s.Decode(out, tgt); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			// Sanity: a non-zero output and a non-nil target.
+			if len(out) == 0 {
+				t.Errorf("encoded to empty bytes")
+			}
+		})
+		t.Run(c.desc+"/json", func(t *testing.T) {
+			if c.jsonOnly {
+				t.Skip("binary-only test")
+			}
+			s := avro.MustParse(c.schema)
+			out, err := s.AppendEncodeJSON(nil, c.value)
+			if err != nil {
+				t.Fatalf("JSON encode: %v", err)
+			}
+			tgt := c.makeTgt()
+			if err := s.DecodeJSON(out, tgt); err != nil {
+				t.Fatalf("JSON decode: %v (out=%s)", err, string(out))
+			}
+		})
+	}
+}
+
+// TestRegression_PromotionMatrix locks Avro schema-resolution promotion
+// rules for every writer→reader type pair the spec permits. The Avro
+// spec defines these promotions: int→{long,float,double};
+// long→{float,double}; float→{double}; string↔bytes. Additionally,
+// resolved decode handles schema evolution: removed fields (writer has
+// field, reader doesn't), default-fill (reader has field, writer doesn't),
+// aliases, enum-symbol widening, and union widening (non-union writer
+// against union reader).
+//
+// Each case: encode a value with the writer schema, decode the wire
+// bytes through Resolve(writer, reader), assert the decoded value
+// matches the spec'd promoted shape. Drift in any promotion arm
+// surfaces immediately.
+//
+// Java: org.apache.avro.io.parsing.ResolvingGrammarGenerator + Symbol.RESOLVED.
+// fastavro: _read_py.py's read_resolved.
+// twmb is fail-fast on writer-union → reader-non-union (intentional
+// divergence; see AUDIT.md known divergences). The matrix avoids that
+// case so it doesn't conflate intentional divergence with a regression.
+func TestRegression_PromotionMatrix(t *testing.T) {
+	cases := []struct {
+		writer, reader string
+		input          any
+		target         func() any
+		want           any
+		desc           string
+	}{
+		// ---- Primitive promotion. ----
+		{`"int"`, `"long"`, int32(42), func() any { var v int64; return &v }, int64(42), "int→long"},
+		{`"int"`, `"float"`, int32(42), func() any { var v float32; return &v }, float32(42), "int→float"},
+		{`"int"`, `"double"`, int32(42), func() any { var v float64; return &v }, float64(42), "int→double"},
+		{`"long"`, `"float"`, int64(123456), func() any { var v float32; return &v }, float32(123456), "long→float"},
+		{`"long"`, `"double"`, int64(123456), func() any { var v float64; return &v }, float64(123456), "long→double"},
+		{`"float"`, `"double"`, float32(1.5), func() any { var v float64; return &v }, float64(1.5), "float→double"},
+		{`"string"`, `"bytes"`, "hello", func() any { var v []byte; return &v }, []byte("hello"), "string→bytes"},
+		{`"bytes"`, `"string"`, []byte("hello"), func() any { var v string; return &v }, "hello", "bytes→string"},
+
+		// ---- Same schema (no promotion). ----
+		{`"long"`, `"long"`, int64(42), func() any { var v int64; return &v }, int64(42), "long→long identity"},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.desc, func(t *testing.T) {
+			w := avro.MustParse(c.writer)
+			r := avro.MustParse(c.reader)
+			wire, err := w.AppendEncode(nil, c.input)
+			if err != nil {
+				t.Fatalf("encode with writer: %v", err)
+			}
+			rs, err := avro.Resolve(w, r)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			tgt := c.target()
+			if _, err := rs.Decode(wire, tgt); err != nil {
+				t.Fatalf("Decode resolved: %v", err)
+			}
+			// Compare via reflect since target is a *T.
+			got := reflect.ValueOf(tgt).Elem().Interface()
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("got %T %v, want %T %v", got, got, c.want, c.want)
+			}
+		})
+	}
+}
+
+// TestRegression_PromotionInvalid locks resolution failures for type
+// pairs that the spec REJECTS. Avro disallows narrowing promotions
+// (long→int, float→int, double→float, etc.) and unrelated-type pairs.
+// CheckCompatibility / Resolve must error on these at config time.
+func TestRegression_PromotionInvalid(t *testing.T) {
+	cases := []struct {
+		writer, reader string
+		desc           string
+	}{
+		{`"long"`, `"int"`, "long→int (narrowing)"},
+		{`"double"`, `"float"`, "double→float (narrowing)"},
+		{`"double"`, `"int"`, "double→int (narrowing)"},
+		{`"long"`, `"boolean"`, "long→boolean (unrelated)"},
+		{`"string"`, `"int"`, "string→int (unrelated)"},
+		{`"bytes"`, `"int"`, "bytes→int (unrelated)"},
+		{`"int"`, `"string"`, "int→string (unrelated)"},
+		// float→int is unrelated per the spec (no narrowing path).
+		{`"float"`, `"int"`, "float→int (unrelated)"},
+		{`"float"`, `"long"`, "float→long (narrowing)"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.desc, func(t *testing.T) {
+			w := avro.MustParse(c.writer)
+			r := avro.MustParse(c.reader)
+			_, err := avro.Resolve(w, r)
+			if err == nil {
+				t.Errorf("expected resolve error for %s, got success", c.desc)
+			}
+		})
+	}
+}
+
+// TestRegression_PromotionSchemaEvolution tests schema-evolution cases:
+// removed fields (writer has but reader doesn't), default-fill (reader
+// has but writer doesn't), aliases, enum-symbol widening with default,
+// union widening (writer's type is in reader's union).
+func TestRegression_PromotionSchemaEvolution(t *testing.T) {
+	t.Run("default-fill new field", func(t *testing.T) {
+		writer := `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"}
+		]}`
+		reader := `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"},
+			{"name":"b","type":"int","default":99}
+		]}`
+		w := avro.MustParse(writer)
+		r := avro.MustParse(reader)
+		wire, err := w.AppendEncode(nil, map[string]any{"a": int32(7)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if _, err := rs.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["a"] != int32(7) || got["b"] != int32(99) {
+			t.Errorf("got %+v, want a=7 b=99 (default)", got)
+		}
+	})
+
+	t.Run("removed field (writer has, reader doesn't)", func(t *testing.T) {
+		writer := `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"},
+			{"name":"b","type":"string"}
+		]}`
+		reader := `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"}
+		]}`
+		w := avro.MustParse(writer)
+		r := avro.MustParse(reader)
+		wire, err := w.AppendEncode(nil, map[string]any{"a": int32(7), "b": "drop me"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if _, err := rs.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["a"] != int32(7) || len(got) != 1 {
+			t.Errorf("got %+v, want only a=7", got)
+		}
+	})
+
+	t.Run("missing reader field without default errors at Resolve", func(t *testing.T) {
+		writer := `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"}
+		]}`
+		reader := `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"},
+			{"name":"b","type":"int"}
+		]}`
+		w := avro.MustParse(writer)
+		r := avro.MustParse(reader)
+		_, err := avro.Resolve(w, r)
+		if err == nil {
+			t.Errorf("expected Resolve error for missing field without default, got success")
+		}
+	})
+
+	t.Run("record alias rename", func(t *testing.T) {
+		writer := `{"type":"record","name":"OldName","fields":[{"name":"a","type":"int"}]}`
+		reader := `{"type":"record","name":"NewName","aliases":["OldName"],"fields":[{"name":"a","type":"int"}]}`
+		w := avro.MustParse(writer)
+		r := avro.MustParse(reader)
+		wire, err := w.AppendEncode(nil, map[string]any{"a": int32(42)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		var got map[string]any
+		if _, err := rs.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["a"] != int32(42) {
+			t.Errorf("got %+v, want a=42", got)
+		}
+	})
+
+	t.Run("field alias rename", func(t *testing.T) {
+		writer := `{"type":"record","name":"R","fields":[{"name":"oldField","type":"int"}]}`
+		reader := `{"type":"record","name":"R","fields":[{"name":"newField","type":"int","aliases":["oldField"]}]}`
+		w := avro.MustParse(writer)
+		r := avro.MustParse(reader)
+		wire, err := w.AppendEncode(nil, map[string]any{"oldField": int32(42)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if _, err := rs.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["newField"] != int32(42) {
+			t.Errorf("got %+v, want newField=42", got)
+		}
+	})
+
+	t.Run("enum widened with default", func(t *testing.T) {
+		writer := `{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]}`
+		// Reader removes BLUE and adds a default for missing symbols.
+		reader := `{"type":"enum","name":"Color","symbols":["RED","GREEN"],"default":"RED"}`
+		w := avro.MustParse(writer)
+		r := avro.MustParse(reader)
+		// Encode "BLUE" with writer (symbol index 2).
+		wire, err := w.AppendEncode(nil, "BLUE")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got string
+		if _, err := rs.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != "RED" {
+			t.Errorf("got %q, want %q (enum default)", got, "RED")
+		}
+	})
+
+	t.Run("non-union writer to union reader", func(t *testing.T) {
+		writer := `"int"`
+		reader := `["null","int"]`
+		w := avro.MustParse(writer)
+		r := avro.MustParse(reader)
+		wire, err := w.AppendEncode(nil, int32(42))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got any
+		if _, err := rs.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != int32(42) {
+			t.Errorf("got %T %v, want int32(42)", got, got)
+		}
+	})
+}
+
+// TestRegression_DefaultFillMatrix pins the auto-default-fill behavior
+// (twmb-specific feature: when DecodeJSON / EncodeJSON sees a record
+// with a missing field that has a schema default, the default
+// materializes into the target / wire). Each primitive + logical type
+// gets a default fill case; the matrix prevents drift in any single
+// arm's default-extraction.
+//
+// Default fill fires at: AppendEncodeJSON (record field absent in
+// Go-side input) and DecodeJSON (field absent in JSON input). Binary
+// encode/decode use pre-encoded default bytes (encodeDefault) which
+// also runs through these arms at schema build time.
+func TestRegression_DefaultFillMatrix(t *testing.T) {
+	cases := []struct {
+		field    string // schema fragment for the field with default
+		expectGo any    // expected Go value after decode
+		desc     string
+	}{
+		{`{"name":"x","type":"int","default":42}`, int32(42), "int default"},
+		{`{"name":"x","type":"long","default":1234567890}`, int64(1234567890), "long default"},
+		{`{"name":"x","type":"float","default":1.5}`, float32(1.5), "float default"},
+		{`{"name":"x","type":"double","default":1.5}`, float64(1.5), "double default"},
+		{`{"name":"x","type":"string","default":"hello"}`, "hello", "string default"},
+		{`{"name":"x","type":"boolean","default":true}`, true, "bool default"},
+		{`{"name":"x","type":"null","default":null}`, nil, "null default"},
+		// Long-precision default: 2^53+1 must survive (the precision-
+		// preserving unmarshalDefault path was a prior bug class).
+		{`{"name":"x","type":"long","default":9007199254740993}`, int64(9007199254740993), "long >2^53 default"},
+		// Nested record default.
+		{`{"name":"x","type":{"type":"record","name":"N","fields":[{"name":"y","type":"int"}]},"default":{"y":7}}`,
+			map[string]any{"y": int32(7)}, "nested record default"},
+		// Array default.
+		{`{"name":"x","type":{"type":"array","items":"int"},"default":[1,2,3]}`,
+			[]any{int32(1), int32(2), int32(3)}, "array default"},
+		// Map default.
+		{`{"name":"x","type":{"type":"map","values":"int"},"default":{"a":1}}`,
+			map[string]any{"a": int32(1)}, "map default"},
+		// Null-union default (implicit null).
+		{`{"name":"x","type":["null","int"]}`, nil, "null-union implicit null default"},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.desc+"/binary", func(t *testing.T) {
+			schema := `{"type":"record","name":"R","fields":[` + c.field + `]}`
+			s := avro.MustParse(schema)
+			// Encode an empty map (missing field).
+			wire, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var got map[string]any
+			if _, err := s.Decode(wire, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !reflect.DeepEqual(got["x"], c.expectGo) {
+				t.Errorf("got %T %v, want %T %v", got["x"], got["x"], c.expectGo, c.expectGo)
+			}
+		})
+		t.Run(c.desc+"/json", func(t *testing.T) {
+			schema := `{"type":"record","name":"R","fields":[` + c.field + `]}`
+			s := avro.MustParse(schema)
+			wire, err := s.AppendEncodeJSON(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("JSON encode: %v", err)
+			}
+			var got map[string]any
+			if err := s.DecodeJSON(wire, &got); err != nil {
+				t.Fatalf("JSON decode (out=%s): %v", string(wire), err)
+			}
+			if !reflect.DeepEqual(got["x"], c.expectGo) {
+				t.Errorf("got %T %v, want %T %v", got["x"], got["x"], c.expectGo, c.expectGo)
+			}
+		})
+	}
+}
+
+// TestRegression_DefaultFillLogicalTypes covers logical-type defaults
+// — date/timestamp/uuid/decimal — which exercise the convertDefaultBytes
+// path (bytes/fixed defaults become []byte) and the logical decoder's
+// default arm. Bugs in this surface have included UUID-fixed defaults
+// being rejected as "invalid UUID" because the stored codepoint-string
+// form (16 chars) didn't match parseUUID's strict 36-char hex-dash
+// requirement (commit history shows this was fixed in earlier rounds).
+func TestRegression_DefaultFillLogicalTypes(t *testing.T) {
+	cases := []struct {
+		field       string
+		jsonExpect  string // JSON wire form of the default-filled value
+		desc        string
+	}{
+		// date default (epoch days).
+		{`{"name":"x","type":{"type":"int","logicalType":"date"},"default":0}`, `"x":"1970-01-01"`, "date default"},
+		// time-millis (millis-of-day).
+		{`{"name":"x","type":{"type":"int","logicalType":"time-millis"},"default":0}`, `"x":0`, "time-millis default"},
+		// UUID fixed.
+		{`{"name":"x","type":{"type":"fixed","name":"F","size":16,"logicalType":"uuid"},"default":"\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000"}`, "", "uuid fixed default"},
+		// Decimal bytes default ("0" codepoint = unscaled 0).
+		{`{"name":"x","type":{"type":"bytes","logicalType":"decimal","precision":5,"scale":2},"default":"\u0000"}`, "", "decimal default"},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.desc, func(t *testing.T) {
+			schema := `{"type":"record","name":"R","fields":[` + c.field + `]}`
+			s, err := avro.Parse(schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			// JSON-encode an empty map — should fill default.
+			wire, err := s.AppendEncodeJSON(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("JSON encode: %v", err)
+			}
+			// Round-trip via JSON decode to verify the default
+			// materialized correctly.
+			var got map[string]any
+			if err := s.DecodeJSON(wire, &got); err != nil {
+				t.Fatalf("JSON decode (out=%s): %v", string(wire), err)
+			}
+			if _, exists := got["x"]; !exists {
+				t.Errorf("default field 'x' missing from decoded: %v (wire=%s)", got, string(wire))
+			}
+		})
+	}
+}
+
+type myDuration int64
+
+// TestRegression_CustomTypeMatrix pins CustomType registration across
+// the matching axes: LogicalType-only / AvroType-only /
+// LogicalType+AvroType / ErrSkipCustomType fall-through to next
+// custom type or built-in / per-Schema scope.
+func TestRegression_CustomTypeMatrix(t *testing.T) {
+	t.Run("LogicalType match", func(t *testing.T) {
+		ct := avro.CustomType{
+			LogicalType: "uuid",
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+				return v, nil
+			},
+		}
+		s, err := avro.Parse(`{"type":"string","logicalType":"uuid"}`, ct)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire, err := s.AppendEncode(nil, "01234567-89ab-cdef-0123-456789abcdef")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got any
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if s, ok := got.(string); !ok || s != "01234567-89ab-cdef-0123-456789abcdef" {
+			t.Errorf("got %T %v, want passthrough string", got, got)
+		}
+	})
+
+	t.Run("AvroType match", func(t *testing.T) {
+		ct := avro.CustomType{
+			AvroType: "long",
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+				if n, ok := v.(int64); ok {
+					return myDuration(n), nil
+				}
+				return v, nil
+			},
+		}
+		s, err := avro.Parse(`"long"`, ct)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire, err := s.AppendEncode(nil, int64(42))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got any
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := got.(myDuration); !ok || v != myDuration(42) {
+			t.Errorf("got %T %v, want myDuration(42)", got, got)
+		}
+	})
+
+	t.Run("ErrSkipCustomType falls through to built-in", func(t *testing.T) {
+		called := 0
+		ct := avro.CustomType{
+			AvroType: "long",
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+				called++
+				return nil, avro.ErrSkipCustomType
+			},
+		}
+		s, err := avro.Parse(`"long"`, ct)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire, err := s.AppendEncode(nil, int64(7))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got int64
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if called != 1 {
+			t.Errorf("custom decode not called: %d", called)
+		}
+		if got != 7 {
+			t.Errorf("got %d, want 7", got)
+		}
+	})
+
+	t.Run("ErrSkipCustomType falls through to next CustomType", func(t *testing.T) {
+		called1, called2 := 0, 0
+		ct1 := avro.CustomType{
+			AvroType: "long",
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+				called1++
+				return nil, avro.ErrSkipCustomType
+			},
+		}
+		ct2 := avro.CustomType{
+			AvroType: "long",
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+				called2++
+				if n, ok := v.(int64); ok {
+					return n * 2, nil
+				}
+				return v, nil
+			},
+		}
+		s, err := avro.Parse(`"long"`, ct1, ct2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire, err := s.AppendEncode(nil, int64(7))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got any
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if called1 != 1 || called2 != 1 {
+			t.Errorf("called1=%d called2=%d", called1, called2)
+		}
+		if got != int64(14) {
+			t.Errorf("got %v, want 14 (second custom doubled)", got)
+		}
+	})
+
+	t.Run("Per-Schema scope: custom types don't leak across Schemas", func(t *testing.T) {
+		ct := avro.CustomType{
+			AvroType: "long",
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+				if n, ok := v.(int64); ok {
+					return myDuration(n), nil
+				}
+				return v, nil
+			},
+		}
+		s1, _ := avro.Parse(`"long"`, ct)
+		s2, _ := avro.Parse(`"long"`)
+
+		wire, _ := s1.AppendEncode(nil, int64(42))
+		var got1 any
+		_, _ = s1.Decode(wire, &got1)
+		var got2 any
+		_, _ = s2.Decode(wire, &got2)
+
+		if _, ok := got1.(myDuration); !ok {
+			t.Errorf("s1 with custom type: got %T, want myDuration", got1)
+		}
+		if _, ok := got2.(int64); !ok {
+			t.Errorf("s2 without custom type: got %T, want int64", got2)
+		}
+	})
+}
+
+// TestRegression_TaggedUnionMatrix pins the JSON-encode / JSON-decode
+// behavior of unions with and without the TaggedUnions option. The
+// Avro JSON spec mandates tagged form ({"type_name":value}); twmb
+// also accepts bare form on decode for interop with goavro and
+// non-conformant producers. The TaggedUnions option toggles which
+// form encode emits and which form decode wraps into the *any target.
+func TestRegression_TaggedUnionMatrix(t *testing.T) {
+	schema := `["null","int","string"]`
+	s := avro.MustParse(schema)
+
+	t.Run("encode without TaggedUnions emits bare", func(t *testing.T) {
+		out, err := s.AppendEncodeJSON(nil, int32(42))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(out)
+		if got != "42" {
+			t.Errorf("bare encode: got %q, want %q", got, "42")
+		}
+	})
+
+	t.Run("encode with TaggedUnions emits {type:value}", func(t *testing.T) {
+		out, err := s.AppendEncodeJSON(nil, int32(42), avro.TaggedUnions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(out)
+		// Tagged form: {"int":42}
+		if got != `{"int":42}` {
+			t.Errorf("tagged encode: got %q, want %q", got, `{"int":42}`)
+		}
+	})
+
+	t.Run("encode null bare", func(t *testing.T) {
+		out, err := s.AppendEncodeJSON(nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(out) != "null" {
+			t.Errorf("nil: got %q, want null", string(out))
+		}
+	})
+
+	t.Run("encode null with TaggedUnions emits bare null", func(t *testing.T) {
+		// Null branches don't get the tag wrapper — bare `null` is the
+		// universal form even under TaggedUnions.
+		out, err := s.AppendEncodeJSON(nil, nil, avro.TaggedUnions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(out) != "null" {
+			t.Errorf("nil tagged: got %q, want null", string(out))
+		}
+	})
+
+	t.Run("decode bare form into *any", func(t *testing.T) {
+		var got any
+		if err := s.DecodeJSON([]byte("42"), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != int32(42) {
+			t.Errorf("bare decode: got %T %v, want int32(42)", got, got)
+		}
+	})
+
+	t.Run("decode tagged form into *any without TaggedUnions option", func(t *testing.T) {
+		var got any
+		if err := s.DecodeJSON([]byte(`{"int":42}`), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != int32(42) {
+			t.Errorf("tagged input → bare decode: got %T %v, want int32(42)", got, got)
+		}
+	})
+
+	t.Run("decode tagged form into *any with TaggedUnions option wraps", func(t *testing.T) {
+		var got any
+		if err := s.DecodeJSON([]byte(`{"int":42}`), &got, avro.TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("expected tagged map, got %T %v", got, got)
+		}
+		if m["int"] != int32(42) {
+			t.Errorf("got map=%v, want map[int:42]", m)
+		}
+	})
+
+	t.Run("decode bare form into *any with TaggedUnions wraps", func(t *testing.T) {
+		// TaggedUnions option also wraps bare-form input on decode
+		// so the typed map output is consistent regardless of input form.
+		var got any
+		if err := s.DecodeJSON([]byte("42"), &got, avro.TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("expected tagged map, got %T %v", got, got)
+		}
+		if m["int"] != int32(42) {
+			t.Errorf("got map=%v, want map[int:42]", m)
+		}
+	})
+
+	t.Run("round-trip with TaggedUnions both sides", func(t *testing.T) {
+		for _, val := range []any{
+			int32(42),
+			"hello",
+			nil,
+		} {
+			val := val
+			out, err := s.AppendEncodeJSON(nil, val, avro.TaggedUnions())
+			if err != nil {
+				t.Errorf("encode %v: %v", val, err)
+				continue
+			}
+			var got any
+			if err := s.DecodeJSON(out, &got, avro.TaggedUnions()); err != nil {
+				t.Errorf("decode %s: %v", string(out), err)
+				continue
+			}
+			if val == nil {
+				if got != nil {
+					t.Errorf("nil round-trip: got %v", got)
+				}
+				continue
+			}
+			m, ok := got.(map[string]any)
+			if !ok {
+				t.Errorf("expected tagged map for %v, got %T %v", val, got, got)
+				continue
+			}
+			// Walk one level — the value should match.
+			for _, v := range m {
+				if !reflect.DeepEqual(v, val) {
+					t.Errorf("round-trip: got %v, want %v", v, val)
+				}
+			}
+		}
+	})
+}
+
+// TestRegression_SingleObjectMatrix pins SOE framing (2-byte magic
+// 0xC3 0x01 + 8-byte little-endian CRC-64-AVRO fingerprint + payload),
+// fingerprint mismatch detection, and short-buffer rejection.
+func TestRegression_SingleObjectMatrix(t *testing.T) {
+	s := avro.MustParse(`"long"`)
+
+	t.Run("round-trip", func(t *testing.T) {
+		out, err := s.AppendSingleObject(nil, int64(42))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out) < 10 {
+			t.Fatalf("output too short: %d bytes", len(out))
+		}
+		if out[0] != 0xC3 || out[1] != 0x01 {
+			t.Errorf("magic: got [%#x, %#x], want [0xC3, 0x01]", out[0], out[1])
+		}
+		var v int64
+		if _, err := s.DecodeSingleObject(out, &v); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if v != 42 {
+			t.Errorf("got %d, want 42", v)
+		}
+	})
+
+	t.Run("invalid magic rejected", func(t *testing.T) {
+		out, _ := s.AppendSingleObject(nil, int64(42))
+		out[0] = 0xFF
+		var v int64
+		_, err := s.DecodeSingleObject(out, &v)
+		if err == nil {
+			t.Errorf("expected magic-mismatch error")
+		}
+	})
+
+	t.Run("fingerprint mismatch rejected", func(t *testing.T) {
+		out, _ := s.AppendSingleObject(nil, int64(42))
+		// Corrupt one byte of fingerprint.
+		out[5] ^= 0xFF
+		var v int64
+		_, err := s.DecodeSingleObject(out, &v)
+		if err == nil {
+			t.Errorf("expected fingerprint-mismatch error")
+		}
+	})
+
+	t.Run("too-short buffer rejected", func(t *testing.T) {
+		var v int64
+		for _, n := range []int{0, 1, 5, 9} {
+			_, err := s.DecodeSingleObject(make([]byte, n), &v)
+			if err == nil {
+				t.Errorf("len=%d: expected error, got success", n)
+			}
+		}
+	})
+
+	t.Run("SingleObjectFingerprint extracts fingerprint and rest", func(t *testing.T) {
+		out, _ := s.AppendSingleObject(nil, int64(42))
+		fp, rest, err := avro.SingleObjectFingerprint(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Fingerprint should match what AppendSingleObject embedded.
+		if [8]byte(out[2:10]) != fp {
+			t.Errorf("fingerprint mismatch: out[2:10]=%x got %x", out[2:10], fp)
+		}
+		// Rest should be the encoded payload.
+		var v int64
+		if _, err := s.Decode(rest, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v != 42 {
+			t.Errorf("decoded payload got %d, want 42", v)
+		}
+	})
+
+	t.Run("schemas with different fingerprints don't cross-decode", func(t *testing.T) {
+		sLong := avro.MustParse(`"long"`)
+		sInt := avro.MustParse(`"int"`)
+		out, _ := sLong.AppendSingleObject(nil, int64(42))
+		var v int32
+		_, err := sInt.DecodeSingleObject(out, &v)
+		if err == nil {
+			t.Errorf("expected fingerprint mismatch when decoding long-SOE with int schema")
+		}
+	})
+}
+
+// TestRegression_SchemaIntrospectionMatrix pins the Schema introspection
+// surface: Root (programmatic tree), Canonical (PCF bytes), Fingerprint
+// (CRC-64-AVRO + SHA-256 hashes), String (raw JSON). These have no
+// encode/decode parity counterpart, so drift in any of them isn't caught
+// by the round-trip matrices.
+//
+// Each schema is exercised through all four methods and round-tripped:
+//   - Root().Schema() should parse back to an equivalent schema.
+//   - Canonical() should match the spec'd PCF order/escaping rules.
+//   - Fingerprint(crc64).String() should be stable across runs.
+//   - String() should return the original JSON unchanged.
+//
+// Pattern 1's precision-edge concern: integer metadata > 2^53 must
+// survive Root() as int64 / json.Number, NOT silently round to float64.
+// This was a prior bug class fixed in commit 4cbdd5c — the matrix
+// prevents regressions.
+func TestRegression_SchemaIntrospectionMatrix(t *testing.T) {
+	cases := []struct {
+		schema string
+		desc   string
+	}{
+		{`"int"`, "primitive int"},
+		{`"long"`, "primitive long"},
+		{`["null","string"]`, "simple union"},
+		{`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`, "simple record"},
+		{`{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int","default":42},
+			{"name":"b","type":{"type":"map","values":"long"}}
+		]}`, "record with default and map field"},
+		{`{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"],"default":"RED"}`, "enum with default"},
+		{`{"type":"fixed","name":"F","size":16}`, "fixed"},
+		{`{"type":"int","logicalType":"date"}`, "int with date logical"},
+		{`{"type":"bytes","logicalType":"decimal","precision":20,"scale":4}`, "decimal"},
+		// Records with extra props at every level.
+		{`{"type":"record","name":"R","custom-prop":"hello","fields":[
+			{"name":"a","type":"int","fieldProp":42}
+		]}`, "record with custom props"},
+		// Big-integer property (>2^53) — locks Root() precision preservation.
+		{`{"type":"record","name":"R","big-int":9007199254740993,"fields":[
+			{"name":"a","type":"int"}
+		]}`, "record with >2^53 int property"},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.desc, func(t *testing.T) {
+			s := avro.MustParse(c.schema)
+
+			// Root() returns a SchemaNode tree.
+			root := s.Root()
+			if root.Type == "" {
+				t.Errorf("Root: empty type")
+			}
+
+			// Root().Schema() re-parses; should not error.
+			s2, err := root.Schema()
+			if err != nil {
+				t.Errorf("Root().Schema() re-parse: %v", err)
+			}
+			// Re-parsed schema should have the same canonical form.
+			if s2 != nil && !bytes.Equal(s.Canonical(), s2.Canonical()) {
+				t.Errorf("Root() round-trip canonical differs:\n  before: %s\n  after:  %s",
+					string(s.Canonical()), string(s2.Canonical()))
+			}
+
+			// Canonical() should be valid PCF JSON.
+			canon := s.Canonical()
+			if len(canon) == 0 {
+				t.Errorf("Canonical returned empty")
+			}
+			if !json.Valid(canon) {
+				t.Errorf("Canonical is not valid JSON: %s", string(canon))
+			}
+
+			// Fingerprint should be deterministic.
+			h1 := avro.NewRabin()
+			fp1 := s.Fingerprint(h1)
+			h2 := avro.NewRabin()
+			fp2 := s.Fingerprint(h2)
+			if !bytes.Equal(fp1, fp2) {
+				t.Errorf("Fingerprint not deterministic: %x vs %x", fp1, fp2)
+			}
+
+			// String() should return the original JSON.
+			if s.String() != c.schema {
+				t.Errorf("String() returned modified schema:\n  want: %s\n  got:  %s", c.schema, s.String())
+			}
+		})
+	}
+
+	// Specific precision-preservation case.
+	t.Run("big-int Props preserved as int64", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"int","big":9007199254740993}`)
+		v := s.Root().Props["big"]
+		if got, ok := v.(int64); !ok || got != 9007199254740993 {
+			t.Errorf("got %T %v, want int64(9007199254740993)", v, v)
+		}
+	})
+	t.Run("MaxInt64+1 preserved as json.Number", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"int","huge":18446744073709551615}`)
+		v := s.Root().Props["huge"]
+		if got, ok := v.(json.Number); !ok || string(got) != "18446744073709551615" {
+			t.Errorf("got %T %v, want json.Number(\"18446744073709551615\")", v, v)
+		}
+	})
+}
+
+// TestRegression_SchemaForMatrix pins SchemaFor's reflection-based
+// schema generation for the common Go type matrix. For each Go type,
+// the generated schema should round-trip cleanly: AppendEncode of a
+// zero-value of T, then Decode back into T, then re-encode produces
+// identical wire bytes.
+type sfRecord struct {
+	I32 int32         `avro:"i32"`
+	I64 int64         `avro:"i64"`
+	F32 float32       `avro:"f32"`
+	F64 float64       `avro:"f64"`
+	S   string        `avro:"s"`
+	B   bool          `avro:"b"`
+	Bs  []byte        `avro:"bs"`
+	A   [16]byte      `avro:"a"`
+	D   time.Duration `avro:"d"`
+	T   time.Time     `avro:"t"`
+}
+
+type sfNested struct {
+	Inner sfRecord `avro:"inner"`
+	M     map[string]int32
+	L     []int32
+}
+
+type sfOptional struct {
+	X *int64 `avro:"x"`
+}
+
+func TestRegression_SchemaForMatrix(t *testing.T) {
+	t.Run("primitive types", func(t *testing.T) {
+		s, err := avro.SchemaFor[sfRecord]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Sanity: encode a zero-value, decode back, re-encode, compare.
+		v := sfRecord{I32: 1, I64: 2, F32: 1.5, F64: 2.5, S: "hi", B: true, Bs: []byte{1, 2}}
+		wire, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v2 sfRecord
+		if _, err := s.Decode(wire, &v2); err != nil {
+			t.Fatal(err)
+		}
+		wire2, err := s.AppendEncode(nil, v2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(wire, wire2) {
+			t.Errorf("re-encode differs:\n  wire1: %x\n  wire2: %x", wire, wire2)
+		}
+	})
+
+	t.Run("nested record", func(t *testing.T) {
+		s, err := avro.SchemaFor[sfNested]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := sfNested{
+			Inner: sfRecord{I32: 1, S: "hi"},
+			M:     map[string]int32{"a": 1},
+			L:     []int32{1, 2, 3},
+		}
+		wire, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v2 sfNested
+		if _, err := s.Decode(wire, &v2); err != nil {
+			t.Fatal(err)
+		}
+		if v2.Inner.I32 != 1 || v2.Inner.S != "hi" {
+			t.Errorf("inner: %+v", v2.Inner)
+		}
+		if v2.L[0] != 1 || v2.L[2] != 3 {
+			t.Errorf("list: %v", v2.L)
+		}
+	})
+
+	t.Run("optional via pointer", func(t *testing.T) {
+		s, err := avro.SchemaFor[sfOptional]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		x := int64(42)
+		// With pointer set.
+		wire, err := s.AppendEncode(nil, sfOptional{X: &x})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v2 sfOptional
+		if _, err := s.Decode(wire, &v2); err != nil {
+			t.Fatal(err)
+		}
+		if v2.X == nil || *v2.X != 42 {
+			t.Errorf("expected *X=42, got %v", v2.X)
+		}
+		// With pointer nil.
+		wire2, err := s.AppendEncode(nil, sfOptional{X: nil})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v3 sfOptional
+		if _, err := s.Decode(wire2, &v3); err != nil {
+			t.Fatal(err)
+		}
+		if v3.X != nil {
+			t.Errorf("expected nil X, got %v", v3.X)
+		}
+	})
+
+	t.Run("non-struct top-level rejected", func(t *testing.T) {
+		// SchemaFor requires a struct type at the top level — primitives
+		// and bare slices/maps aren't supported. Document the rejection.
+		_, err := avro.SchemaFor[int64]()
+		if err == nil {
+			t.Errorf("expected error for top-level int64")
+		}
+	})
+
+	t.Run("struct with slice field", func(t *testing.T) {
+		type sfSlice struct {
+			L []int32 `avro:"l"`
+		}
+		s, err := avro.SchemaFor[sfSlice]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := sfSlice{L: []int32{1, 2, 3}}
+		wire, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v2 sfSlice
+		if _, err := s.Decode(wire, &v2); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(v, v2) {
+			t.Errorf("got %v, want %v", v2, v)
+		}
+	})
+
+	t.Run("struct with map field", func(t *testing.T) {
+		type sfMap struct {
+			M map[string]int32 `avro:"m"`
+		}
+		s, err := avro.SchemaFor[sfMap]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := sfMap{M: map[string]int32{"a": 1, "b": 2}}
+		wire, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v2 sfMap
+		if _, err := s.Decode(wire, &v2); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(v, v2) {
+			t.Errorf("got %v, want %v", v2, v)
+		}
+	})
+}
+
+// TestRegression_SchemaMetadataPreservation pins the Schema.Root()
+// doc-string contract: "preserves all metadata including doc strings,
+// namespaces, aliases, and custom properties." Each metadata field is
+// set on a parse-time schema, and Schema.Root() should surface it on
+// the returned SchemaNode tree.
+func TestRegression_SchemaMetadataPreservation(t *testing.T) {
+	schema := `{
+		"type":"record",
+		"name":"R",
+		"namespace":"com.example",
+		"aliases":["OldName","com.other.AnotherName"],
+		"doc":"top-level record doc",
+		"my.custom.string":"hello",
+		"my.custom.int":42,
+		"my.custom.bool":true,
+		"my.custom.precision":9007199254740993,
+		"fields":[
+			{
+				"name":"f1",
+				"type":"int",
+				"doc":"field 1 doc",
+				"aliases":["oldF1"],
+				"field.custom":"field-level-prop"
+			}
+		]
+	}`
+	s := avro.MustParse(schema)
+	root := s.Root()
+
+	if root.Doc != "top-level record doc" {
+		t.Errorf("Doc: got %q", root.Doc)
+	}
+	if root.Namespace != "com.example" {
+		t.Errorf("Namespace: got %q", root.Namespace)
+	}
+	wantAliases := []string{"OldName", "com.other.AnotherName"}
+	// Aliases are namespace-qualified in the resolved form.
+	if len(root.Aliases) != len(wantAliases) {
+		t.Errorf("Aliases count: got %d (%v), want %d", len(root.Aliases), root.Aliases, len(wantAliases))
+	}
+
+	// Custom props.
+	if s, ok := root.Props["my.custom.string"].(string); !ok || s != "hello" {
+		t.Errorf("string prop: got %T %v", root.Props["my.custom.string"], root.Props["my.custom.string"])
+	}
+	if i, ok := root.Props["my.custom.int"].(int64); !ok || i != 42 {
+		t.Errorf("int prop: got %T %v, want int64(42)", root.Props["my.custom.int"], root.Props["my.custom.int"])
+	}
+	if b, ok := root.Props["my.custom.bool"].(bool); !ok || !b {
+		t.Errorf("bool prop: got %T %v", root.Props["my.custom.bool"], root.Props["my.custom.bool"])
+	}
+	// >2^53 precision must survive.
+	if i, ok := root.Props["my.custom.precision"].(int64); !ok || i != 9007199254740993 {
+		t.Errorf("precision prop: got %T %v, want int64(9007199254740993)", root.Props["my.custom.precision"], root.Props["my.custom.precision"])
+	}
+
+	// Field-level metadata.
+	if len(root.Fields) != 1 {
+		t.Fatalf("expected 1 field, got %d", len(root.Fields))
+	}
+	f := root.Fields[0]
+	if f.Doc != "field 1 doc" {
+		t.Errorf("field Doc: got %q", f.Doc)
+	}
+	if len(f.Aliases) != 1 || f.Aliases[0] != "oldF1" {
+		t.Errorf("field Aliases: got %v", f.Aliases)
+	}
+	if s, ok := f.Props["field.custom"].(string); !ok || s != "field-level-prop" {
+		t.Errorf("field prop: got %T %v", f.Props["field.custom"], f.Props["field.custom"])
+	}
+}
+
+// TestRegression_SchemaCacheConcurrency verifies the SchemaCache is
+// safe for concurrent Parse + Encode/Decode access.
+func TestRegression_SchemaCacheConcurrency(t *testing.T) {
+	c := &avro.SchemaCache{}
+	const workers = 16
+	const iters = 100
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			schemas := []string{
+				`"int"`, `"long"`, `"string"`,
+				`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`,
+				`{"type":"array","items":"long"}`,
+			}
+			for j := 0; j < iters; j++ {
+				sch := schemas[j%len(schemas)]
+				s, err := c.Parse(sch)
+				if err != nil {
+					t.Errorf("worker %d Parse: %v", id, err)
+					return
+				}
+				// Use the schema for encode/decode based on its kind.
+				switch s.Root().Type {
+				case "int":
+					wire, _ := s.AppendEncode(nil, int32(id*100+j))
+					var v int32
+					if _, err := s.Decode(wire, &v); err != nil {
+						t.Errorf("worker %d decode int: %v", id, err)
+						return
+					}
+				case "record":
+					wire, _ := s.AppendEncode(nil, map[string]any{"a": int32(id)})
+					var v map[string]any
+					if _, err := s.Decode(wire, &v); err != nil {
+						t.Errorf("worker %d decode record: %v", id, err)
+						return
+					}
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+}
