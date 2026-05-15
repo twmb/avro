@@ -432,7 +432,15 @@ func floatFitsInt64From(f float64, bits int) (int64, error) {
 //     definition).
 //   - (reflect.Value(f), true, nil) — float-form input parsed via
 //     strconv.ParseFloat. Precision loss for float-form is expected
-//     and matches the CanFloat() arm.
+//     and matches the CanFloat() arm. ParseFloat returning
+//     (±Inf, strconv.ErrRange) for a float-form input whose magnitude
+//     exceeds float64 range is treated as a successful encode of ±Inf:
+//     Java's BigDecimal.doubleValue() returns POSITIVE_INFINITY for the
+//     same input, fastavro's float() returns inf, and the decode side
+//     (json_decode.go decodeFloat/decodeDouble) already accepts ±Inf
+//     from overflow. Without this acceptance,
+//     s.Encode(json.Number("1e1000")) against "double" rejected while
+//     s.Encode(math.Inf(1)) — the equivalent typed value — succeeded.
 //   - (v, false, nil) — not a json.Number; caller falls through.
 //   - (v, true, err) — IS json.Number but JSON-grammar-invalid (hex
 //     float "0x1.0p10", underscore "1_000"). Java/fastavro reject.
@@ -464,6 +472,12 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 	}
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
+		// ErrRange + infinite result: ParseFloat's "error" returns the
+		// correct Avro wire value (±Inf bits) — accept rather than
+		// reject. Syntax errors (other than ErrRange) still surface.
+		if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
+			return reflect.ValueOf(f), true, nil
+		}
 		return v, true, fmt.Errorf("invalid JSON number %q: %w", s, err)
 	}
 	return reflect.ValueOf(f), true, nil

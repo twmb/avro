@@ -5661,6 +5661,164 @@ func TestRegression_FloatSourceMantissaBoundOnIntLongEncode(t *testing.T) {
 	})
 }
 
+// TestRegression_JsonNumberOverflowToInfFloatEncodeParity locks the
+// (jsonNumberToFloat, jsonCoerceToFloat64) acceptance of float-form
+// json.Number whose magnitude exceeds float64 range — strconv.ParseFloat
+// returns (±Inf, strconv.ErrRange) for those inputs, and ±Inf IS the
+// correct Avro wire encoding. Pre-fix, the encoder propagated the error
+// and rejected, creating a route divergence: s.Encode(math.Inf(1)) and
+// s.Encode(float64(9.999e308)) (Go's literal evaluates to +Inf) both
+// succeeded, but s.Encode(json.Number("9.999e308")) — the same value
+// expressed precision-preservingly through json.Number — rejected. The
+// decode side (json_decode.go decodeFloat/decodeDouble) was already
+// coded to "Accept ±Inf from overflow (e.g. 1e999, goavro convention)"
+// — encode just hadn't caught up. Java's BigDecimal.doubleValue() and
+// fastavro's float() both return ±Inf for the same input without error.
+//
+// Locked at both jsonNumberToFloat (binary encode, exercised via
+// AppendEncode) and jsonCoerceToFloat64 (JSON encode, exercised via
+// AppendEncodeJSON), at float32 (clean float64→float32 +Inf narrowing)
+// and float64. Boundary: just-below MaxFloat64 still encodes finite;
+// just-above encodes ±Inf; ErrRange-without-Inf (none from ParseFloat
+// in practice, but the guard is conservative) would still reject.
+func TestRegression_JsonNumberOverflowToInfFloatEncodeParity(t *testing.T) {
+	floatS := mustParse(t, `"float"`)
+	doubleS := mustParse(t, `"double"`)
+
+	type acceptCase struct {
+		name        string
+		s           *avro.Schema
+		v           json.Number
+		wantNegInf  bool
+		wireWantHex string // expected wire bytes (hex) for binary path
+	}
+	// Wire-format expectations:
+	//   - float +Inf  IEEE 754 = 0x7F800000 → little-endian "0000807f"
+	//   - float -Inf  IEEE 754 = 0xFF800000 → little-endian "000080ff"
+	//   - double +Inf IEEE 754 = 0x7FF0000000000000 → little-endian "000000000000f07f"
+	//   - double -Inf IEEE 754 = 0xFFF0000000000000 → little-endian "000000000000f0ff"
+	accepts := []acceptCase{
+		{"float_positive_overflow_1e1000", floatS, json.Number("1e1000"), false, "0000807f"},
+		{"float_negative_overflow_-1e1000", floatS, json.Number("-1e1000"), true, "000080ff"},
+		{"double_positive_overflow_1.8e308", doubleS, json.Number("1.8e308"), false, "000000000000f07f"},
+		{"double_negative_overflow_-1.8e308", doubleS, json.Number("-1.8e308"), true, "000000000000f0ff"},
+		{"double_positive_overflow_1e400", doubleS, json.Number("1e400"), false, "000000000000f07f"},
+	}
+	for _, tc := range accepts {
+		t.Run("binary/"+tc.name, func(t *testing.T) {
+			got, err := tc.s.AppendEncode(nil, tc.v)
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			if hex.EncodeToString(got) != tc.wireWantHex {
+				t.Errorf("wire bytes: got %x, want %s", got, tc.wireWantHex)
+			}
+			// Round-trip into float64/float32 confirms decoder produces ±Inf.
+			if tc.s == floatS {
+				var out float32
+				if _, err := tc.s.Decode(got, &out); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if !math.IsInf(float64(out), 0) {
+					t.Errorf("decoded %v, expected ±Inf", out)
+				}
+				if tc.wantNegInf != math.IsInf(float64(out), -1) {
+					t.Errorf("sign mismatch: got %v", out)
+				}
+			} else {
+				var out float64
+				if _, err := tc.s.Decode(got, &out); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if !math.IsInf(out, 0) {
+					t.Errorf("decoded %v, expected ±Inf", out)
+				}
+				if tc.wantNegInf != math.IsInf(out, -1) {
+					t.Errorf("sign mismatch: got %v", out)
+				}
+			}
+		})
+		t.Run("json/"+tc.name, func(t *testing.T) {
+			got, err := tc.s.AppendEncodeJSON(nil, tc.v)
+			if err != nil {
+				t.Fatalf("json encode: %v", err)
+			}
+			// JSON encode of ±Inf emits "Infinity"/"-Infinity" by default
+			// (twmb's quoted-string convention). Verify round-trip parses
+			// to ±Inf rather than asserting the exact string form, which
+			// is config-dependent.
+			if tc.s == floatS {
+				var out float32
+				if err := tc.s.DecodeJSON(got, &out); err != nil {
+					t.Fatalf("json decode: %v (encoded as %q)", err, got)
+				}
+				if !math.IsInf(float64(out), 0) {
+					t.Errorf("decoded %v, expected ±Inf", out)
+				}
+				if tc.wantNegInf != math.IsInf(float64(out), -1) {
+					t.Errorf("sign mismatch: got %v", out)
+				}
+			} else {
+				var out float64
+				if err := tc.s.DecodeJSON(got, &out); err != nil {
+					t.Fatalf("json decode: %v (encoded as %q)", err, got)
+				}
+				if !math.IsInf(out, 0) {
+					t.Errorf("decoded %v, expected ±Inf", out)
+				}
+				if tc.wantNegInf != math.IsInf(out, -1) {
+					t.Errorf("sign mismatch: got %v", out)
+				}
+			}
+		})
+	}
+
+	// Parity confirmation: the typed math.Inf(1) path was already
+	// accepted pre-fix; the json.Number path now produces identical
+	// wire output. The bug was the divergence between these two
+	// equivalent ways of expressing the same value.
+	t.Run("parity_with_typed_Inf", func(t *testing.T) {
+		fromTyped, err := doubleS.AppendEncode(nil, math.Inf(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fromJsonNumber, err := doubleS.AppendEncode(nil, json.Number("1e400"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(fromTyped, fromJsonNumber) {
+			t.Errorf("typed-Inf vs json.Number-overflow wire bytes differ: %x vs %x",
+				fromTyped, fromJsonNumber)
+		}
+	})
+
+	// Boundary: just below MaxFloat64 (ParseFloat returns finite) must
+	// continue to encode as the finite value, not silently snap to Inf.
+	t.Run("just_below_MaxFloat64_stays_finite", func(t *testing.T) {
+		got, err := doubleS.AppendEncode(nil, json.Number("1.7976931348623157e308"))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out float64
+		if _, err := doubleS.Decode(got, &out); err != nil {
+			t.Fatal(err)
+		}
+		if math.IsInf(out, 0) {
+			t.Errorf("MaxFloat64 must NOT round to Inf; got %v", out)
+		}
+	})
+
+	// Syntax errors (vs ErrRange) still reject. The ErrRange-Inf
+	// acceptance must be narrowly gated on the err kind AND the
+	// result being infinite.
+	t.Run("syntax_error_still_rejects", func(t *testing.T) {
+		// "1e" is JSON-grammar-invalid; isJSONNumber rejects upstream.
+		if _, err := doubleS.AppendEncode(nil, json.Number("1e")); err == nil {
+			t.Error("expected reject for invalid grammar")
+		}
+	})
+}
+
 // TestSpecBareTypeNameInObjectAccepted locks in that {"type":"Node"}
 // as a wrapped reference to a previously-declared named type is
 // accepted at parse and the wrapped/bare forms produce equivalent

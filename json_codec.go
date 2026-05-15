@@ -1121,7 +1121,16 @@ func jsonCoerceToFloat64(v reflect.Value, bitSize int) (float64, error) {
 		var err error
 		f, err = strconv.ParseFloat(s, 64)
 		if err != nil {
-			return 0, fmt.Errorf("avro json: invalid json.Number for float: %w", err)
+			// ParseFloat returns (±Inf, strconv.ErrRange) for inputs
+			// whose magnitude exceeds float64 range. Accept the Inf —
+			// it IS the correct Avro wire encoding for the overflow,
+			// matches the binary jsonNumberToFloat path, matches
+			// decodeFloat/decodeDouble's "Accept ±Inf from overflow"
+			// arm, and matches Java's BigDecimal.doubleValue() /
+			// fastavro's float(). Syntax errors still reject.
+			if !errors.Is(err, strconv.ErrRange) || !math.IsInf(f, 0) {
+				return 0, fmt.Errorf("avro json: invalid json.Number for float: %w", err)
+			}
 		}
 	default:
 		return 0, fmt.Errorf("avro json: expected numeric, got %s", v.Type())
