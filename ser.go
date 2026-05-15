@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 type serfn func([]byte, reflect.Value, int) ([]byte, error)
@@ -420,16 +421,52 @@ func floatFitsInt64From(f float64, bits int) (int64, error) {
 	return n, nil
 }
 
-// jsonNumberToFloat converts a json.Number to a float64 reflect.Value.
-func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool) {
+// jsonNumberToFloat converts a json.Number reflect.Value to a numeric
+// reflect.Value suitable for the float encode arms. Returns:
+//   - (reflect.Value(n), true, nil) — integer-form input (no '.', 'e', 'E')
+//     that parses as int64 returns an int64 Value so the caller's CanInt()
+//     arm applies its 1<<24 / 1<<53 precision-bound check (parity with
+//     s.Encode(int64(N))). Integer-form inputs that overflow int64 fall
+//     through to the float path, which surfaces via finiteFloat32Overflows
+//     or stores the exact int64-out-of-range float (precision is gone by
+//     definition).
+//   - (reflect.Value(f), true, nil) — float-form input parsed via
+//     strconv.ParseFloat. Precision loss for float-form is expected
+//     and matches the CanFloat() arm.
+//   - (v, false, nil) — not a json.Number; caller falls through.
+//   - (v, true, err) — IS json.Number but JSON-grammar-invalid (hex
+//     float "0x1.0p10", underscore "1_000"). Java/fastavro reject.
+func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 	if v.Type() != jsonNumberType {
-		return v, false
+		return v, false, nil
 	}
-	f, err := v.Interface().(json.Number).Float64()
+	s := string(v.Interface().(json.Number))
+	if !isJSONNumber(s) {
+		return v, true, fmt.Errorf("invalid JSON number %q", s)
+	}
+	// Integer-form: route through int64 so callers apply the same
+	// precision check they apply to typed-integer inputs. Without this
+	// branch, s.Encode(json.Number("9007199254740993")) against "double"
+	// silently rounds to 9007199254740992 via float64 mantissa
+	// truncation, while s.Encode(int64(9007199254740993)) rejects with
+	// "integer overflows float64 exact precision" — a path-divergence
+	// bug identical in shape to the JSON-grammar gap above.
+	if !strings.ContainsAny(s, ".eE") {
+		if n, perr := strconv.ParseInt(s, 10, 64); perr == nil {
+			return reflect.ValueOf(n), true, nil
+		}
+		// Integer-form that overflows int64: magnitude is beyond any
+		// float exact precision (>1<<53), so reject outright. Silently
+		// rounding via ParseFloat would diverge from the typed-int64
+		// path which rejects MaxInt64-magnitude integers against float
+		// targets via the 1<<24 / 1<<53 mantissa-precision check.
+		return v, true, fmt.Errorf("integer %s overflows float exact precision", s)
+	}
+	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return v, false
+		return v, true, fmt.Errorf("invalid JSON number %q: %w", s, err)
 	}
-	return reflect.ValueOf(f), true
+	return reflect.ValueOf(f), true, nil
 }
 
 // parseInt64Lenient parses s as a decimal integer, accepting pure-integer
@@ -468,6 +505,17 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool) {
 // fractional branch (JSON decode of long from exponent form). One
 // helper, one rule across all four sites.
 func parseInt64Lenient(s string) (int64, error) {
+	// JSON-spec grammar gate: strconv.ParseInt(s,10,64) accepts forms
+	// the JSON spec rejects — leading '+' ("+5" → 5), leading-zero
+	// multi-digit ("01" → 1). Validate first so the fast path agrees
+	// with the slow path on grammar (boundedRatFromString applies the
+	// same gate). Java's JsonParser rejects "+5"/"01" at JSON parse,
+	// fastavro's int() raises ValueError on Python int("+5") only
+	// in some versions but always on "01" → IntegerParseError; both
+	// match strict JSON.
+	if !isJSONNumber(s) {
+		return 0, fmt.Errorf("invalid JSON number %q", s)
+	}
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err == nil {
 		return n, nil
@@ -484,8 +532,8 @@ func parseInt64Lenient(s string) (int64, error) {
 	// Length cap on slow-path inputs bounds boundedRatFromString's O(n²)
 	// big.Rat.SetString cost on hostile inputs. Legit int64 in exponent
 	// form fits in ~30 chars; 64 is generous. boundedRatFromString itself
-	// caps at 1 MiB + decimalScaleLimit (decimal-logical-type DoS
-	// posture), looser than int64 needs.
+	// caps at maxRatInputLen (128 KiB, decimal-logical-type DoS posture
+	// matched to decimalScaleLimit), looser than int64 needs.
 	if len(s) > maxInt64LenientLen {
 		return 0, fmt.Errorf("value %s exceeds int64-input length cap (%d)", s, maxInt64LenientLen)
 	}
@@ -671,7 +719,10 @@ func appendAvroFloat32(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		return appendUint32(dst, math.Float32bits(float32(n))), nil
 	}
-	if fv, ok := jsonNumberToFloat(v); ok {
+	if fv, ok, err := jsonNumberToFloat(v); ok {
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: err}
+		}
 		return appendAvroFloat32(dst, fv)
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "float"}
@@ -698,7 +749,10 @@ func appendAvroFloat64(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		return appendUint64(dst, math.Float64bits(float64(n))), nil
 	}
-	if fv, ok := jsonNumberToFloat(v); ok {
+	if fv, ok, err := jsonNumberToFloat(v); ok {
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: err}
+		}
 		return appendAvroFloat64(dst, fv)
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
@@ -787,7 +841,10 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		return doSerString(dst, string(v.Bytes())), nil
+		// doSerString does `append(dst, s...)` and doesn't retain s, so
+		// alias v.Bytes() instead of copying.
+		b := v.Bytes()
+		return doSerString(dst, unsafe.String(unsafe.SliceData(b), len(b))), nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
 }

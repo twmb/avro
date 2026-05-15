@@ -2484,15 +2484,30 @@ func defaultAsInt64(val any) (int64, error) {
 func defaultAsFloat64(val any) (float64, error) {
 	switch v := val.(type) {
 	case json.Number:
-		f, err := v.Float64()
+		// JSON-spec grammar gate: a json.Number carries the typed
+		// promise "this was a JSON number". strconv.ParseFloat (called
+		// by json.Number.Float64) silently accepts hex floats and
+		// underscore-separated digits that the JSON spec rejects, so
+		// validate before parsing. Mirrors [jsonNumberToFloat] /
+		// [jsonCoerceToFloat64]'s json.Number arm.
+		s := v.String()
+		if !isJSONNumber(s) {
+			return 0, fmt.Errorf("invalid JSON number %q", s)
+		}
+		f, err := strconv.ParseFloat(s, 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid number %s", v.String())
+			return 0, fmt.Errorf("invalid number %s", s)
 		}
 		return f, nil
 	case float64:
 		return v, nil
 	case string:
-		// Java accepts "3.14" as a float/double default literal.
+		// Java accepts "3.14" as a float/double default literal. The
+		// string arm is documented Java-parity lenient (see "Known
+		// intentional divergences" in AUDIT.md); we don't tighten it
+		// to strict JSON grammar — Java's Double.parseDouble accepts
+		// hex floats too, and the project principle is lenient default
+		// acceptance + least surprise for stringly-typed config inputs.
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
 			return 0, fmt.Errorf("invalid string default %q: %w", v, err)

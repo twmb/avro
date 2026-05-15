@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"time"
+	"unsafe"
 )
 
 // decodeLogicalInt applies logical type conversion for int-backed logical types
@@ -449,7 +450,8 @@ func (ctx *jsonDecoder) decodeFloat(v reflect.Value) error {
 		if err != nil {
 			return err
 		}
-		f64, err := strconv.ParseFloat(string(nb), 32)
+		// strconv.ParseFloat is read-only; alias nb to avoid the copy.
+		f64, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(nb), len(nb)), 32)
 		if err != nil {
 			// Accept ±Inf from overflow (e.g. 1e999, goavro convention).
 			if math.IsInf(f64, 0) {
@@ -500,7 +502,8 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value) error {
 		if err != nil {
 			return err
 		}
-		f64, err := strconv.ParseFloat(string(nb), 64)
+		// strconv.ParseFloat is read-only; alias nb to avoid the copy.
+		f64, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(nb), len(nb)), 64)
 		if err != nil {
 			// Accept ±Inf from overflow (e.g. 1e999, goavro convention).
 			if !math.IsInf(f64, 0) {
@@ -741,7 +744,10 @@ func (ctx *jsonDecoder) decodeBareDecimal(v reflect.Value, node *schemaNode, toA
 	if perr != nil {
 		return true, perr
 	}
-	r, ok, perr := boundedRatFromString(string(nb))
+	// boundedRatFromString and its callees (json.Valid, strconv.ParseInt,
+	// big.Rat.SetString, fmt.Errorf) treat the string read-only and don't
+	// retain it past the call, so alias nb instead of copying.
+	r, ok, perr := boundedRatFromString(unsafe.String(unsafe.SliceData(nb), len(nb)))
 	if perr != nil {
 		return true, fmt.Errorf("avro json: %s %q: %w", node.logical, nb, perr)
 	}

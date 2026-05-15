@@ -592,47 +592,113 @@ func checkArrayBlockBounds(count int64, totalItems int64, srcLen int, minItemByt
 // at decode time, so the cap has to live here.
 const decimalScaleLimit = 1 << 16
 
-// boundedRatFromString parses s into a *big.Rat, rejecting decimal-form
-// inputs whose net 10^exponent magnitude exceeds decimalScaleLimit.
-// big.Rat.SetString materializes 10^|net-exp| eagerly during parsing —
-// a 9-byte "1e1000000" allocates ~3 MB without this guard. Mirrors the
-// wire-side bound in parseBigDecimalPayload so every external decimal
-// path (JSON decode bytes/fixed decimal, encode of json.Number and
-// string-typed values) shares the same magnitude cap.
+// maxRatInputLen caps the byte length boundedRatFromString routes
+// through big.Rat.SetString. SetString is O(n²) over input length, so
+// 1 MiB of digits burns ~2 sec CPU; 128 KiB rejects in ~25 ms worst
+// case. Legitimate decimal use is bounded by decimalScaleLimit
+// (mantissa+exponent ≤ 65536), so a cap matched to twice that magnitude
+// covers every schema-conforming input with headroom while still
+// bounding the new helper's parse cost. Java/avro-rs don't materialize
+// 10^N during parsing so don't need this cap; twmb does, so the cap
+// has to live at the boundary the parsing actually crosses.
+const maxRatInputLen = 1 << 17 // 128 KiB
+
+// isJSONNumber reports whether s is a JSON number per RFC 8259.
+// json.Valid validates the grammar; the boundary-whitespace and
+// first-char checks reject (a) whitespace-padded numbers (JSON's
+// "ws value ws" production accepts them as JSON-text but not as a
+// standalone number), and (b) other JSON values that are valid but
+// non-numeric (strings, booleans, null, arrays, objects).
+//
+// boundedRatFromString uses this gate because big.Rat.SetString's
+// accepted-input set is strictly broader than JSON: it accepts
+// hex ("0x10"), binary ("0b10"), octal ("0o10"), underscore-separated
+// ("1_000"), rational ("5/1"), and hex-float-with-binary-exponent
+// ("0x1p4") forms. None of these are valid JSON numbers, and all of
+// them silently produced an integer value when they leaked into the
+// integer / decimal / big-decimal encode paths via parseInt64Lenient,
+// jsonNumberToInt64, jsonCoerceToInt32/64, and tryCoerceToRat.
+func isJSONNumber(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	first := s[0]
+	if first == ' ' || first == '\t' || first == '\n' || first == '\r' {
+		return false
+	}
+	last := s[len(s)-1]
+	if last == ' ' || last == '\t' || last == '\n' || last == '\r' {
+		return false
+	}
+	if first != '-' && (first < '0' || first > '9') {
+		return false
+	}
+	// json.Valid is read-only; alias s's bytes to avoid the []byte(s) copy.
+	// Mirrors the parseUUID/parseUUIDBytes unsafe-slice pattern.
+	return json.Valid(unsafe.Slice(unsafe.StringData(s), len(s)))
+}
+
+// boundedRatFromString parses s into a *big.Rat, validating that s is
+// a JSON-spec number (via isJSONNumber) before reaching big.Rat.SetString
+// and rejecting decimal-form inputs whose net 10^exponent magnitude
+// exceeds decimalScaleLimit. SetString materializes 10^|net-exp| eagerly
+// during parsing — a 9-byte "1e1000000" allocates ~3 MB without the
+// magnitude guard, and 1 MiB of digits costs ~2 sec without the length
+// cap. Mirrors the wire-side bound in parseBigDecimalPayload so every
+// external decimal path (JSON decode bytes/fixed decimal, encode of
+// json.Number and string-typed values) shares the same caps.
 //
 // Three-valued return: (rat, true, nil) on success; (nil, false, nil)
-// when s is not parseable as a number (caller may fall back to raw
+// when s is not a number form at all (e.g. "abc", empty, or any input
+// that doesn't start with '-' or a digit — caller may fall back to raw
 // bytes for legitimate non-numeric inputs); (nil, false, err) when s
-// IS a number form but its magnitude exceeds decimalScaleLimit (caller
-// should propagate err — a hostile json.Number should not silently
-// re-encode as raw bytes). The rational form "p/q" is forwarded to
-// SetString unchanged: it has no 10^N materialization and is symmetric
-// with Java/avro-rs which store significand + scale separately.
+// IS number-shaped (leading '-' or digit) but rejected — JSON-invalid
+// grammar, length cap, or magnitude cap. Callers must propagate err
+// so hostile numeric-looking input cannot silently re-encode as raw
+// bytes via the fall-through path.
 func boundedRatFromString(s string) (*big.Rat, bool, error) {
-	if len(s) > 1<<20 {
-		return nil, false, fmt.Errorf("decimal value exceeds 1 MiB length cap")
+	if len(s) > maxRatInputLen {
+		return nil, false, fmt.Errorf("decimal value exceeds %d byte length cap", maxRatInputLen)
 	}
-	if !strings.ContainsRune(s, '/') {
-		netExp := int64(0)
-		body := s
-		if i := strings.IndexAny(body, "eE"); i >= 0 {
-			exp, err := strconv.ParseInt(body[i+1:], 10, 64)
-			if err != nil {
-				return nil, false, nil
+	if !isJSONNumber(s) {
+		// Numeric-looking but JSON-invalid (e.g. "0x10", "1_000",
+		// "5/1", "+5", ".5") surfaces as an error so the caller's
+		// typed-numeric path doesn't silently drop into the raw-bytes
+		// fallback. The "numeric-looking" predicate is broader than
+		// JSON-spec's number-start (which is just '-' or digit): it
+		// also includes '+' (Go/C-style sign that strconv accepts)
+		// and '.' (Python/JS-style leading dot that the user likely
+		// intended as a fractional). Genuinely non-numeric inputs
+		// (first char something like 'a', 'N', '{') stay in the
+		// (nil, false, nil) lane for the reflect.String → opaque
+		// raw-bytes fall-through.
+		if len(s) > 0 {
+			c := s[0]
+			if c == '-' || c == '+' || c == '.' || (c >= '0' && c <= '9') {
+				return nil, false, fmt.Errorf("invalid JSON number %q", s)
 			}
-			netExp = exp
-			body = body[:i]
 		}
-		if i := strings.IndexByte(body, '.'); i >= 0 {
-			fracLen := int64(len(body) - i - 1)
-			if netExp < math.MinInt64+fracLen {
-				return nil, false, fmt.Errorf("decimal exponent overflow")
-			}
-			netExp -= fracLen
+		return nil, false, nil
+	}
+	netExp := int64(0)
+	body := s
+	if i := strings.IndexAny(body, "eE"); i >= 0 {
+		exp, err := strconv.ParseInt(body[i+1:], 10, 64)
+		if err != nil {
+			return nil, false, nil
 		}
-		if netExp > decimalScaleLimit || netExp < -decimalScaleLimit {
-			return nil, false, fmt.Errorf("decimal value 10^%d magnitude exceeds %d limit", netExp, decimalScaleLimit)
+		netExp = exp
+		body = body[:i]
+	}
+	if i := strings.IndexByte(body, '.'); i >= 0 {
+		fracLen := int64(len(body) - i - 1)
+		if netExp < math.MinInt64+fracLen {
+			return nil, false, fmt.Errorf("decimal exponent overflow")
 		}
+		netExp -= fracLen
+	}
+	if netExp > decimalScaleLimit || netExp < -decimalScaleLimit {
+		return nil, false, fmt.Errorf("decimal value 10^%d magnitude exceeds %d limit", netExp, decimalScaleLimit)
 	}
 	r, ok := new(big.Rat).SetString(s)
 	if !ok {

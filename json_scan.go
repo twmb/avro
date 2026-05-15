@@ -316,7 +316,12 @@ func parseJSONInt64(b []byte) (int64, error) {
 			// round to int64.Min; "9.2233720368547758e18" = 9223372036854775800
 			// would float64-round to int64.Max+1 and be rejected). See
 			// parseInt64Lenient for the full rationale.
-			n, err := parseInt64Lenient(string(b))
+			//
+			// parseInt64Lenient (and its downstream boundedRatFromString /
+			// strconv.ParseInt / fmt.Errorf calls) treat s as read-only and
+			// don't retain it past the call, so alias b's bytes instead of
+			// copying.
+			n, err := parseInt64Lenient(unsafe.String(unsafe.SliceData(b), len(b)))
 			if err != nil {
 				return 0, fmt.Errorf("avro json: %w", err)
 			}

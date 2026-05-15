@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // Opt configures encoding and decoding behavior. See each option's
@@ -148,8 +149,42 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 		qualifyLogical: cfg.tagLogical,
 	}
 	err := ctx.decodeValue(rv.Elem(), s.node)
+	if err == nil {
+		// The scanner stops at the first non-token character; anything
+		// after the decoded value falls into one of three classes:
+		//   1. EOF / trailing whitespace — fine (RFC 8259 JSON-text).
+		//   2. Start of a valid next JSON value ({, [, ", digit, -,
+		//      t, f, n) — fine, allows multi-record concat streaming
+		//      that Java's JsonDecoder also supports
+		//      (TestSpecJSONMultiRecordConcatDecode locks this).
+		//   3. Anything else — mid-token garbage like the "x10" after
+		//      "0x10" (which the number scanner stops at silently,
+		//      returning just "0"). Reject so "0x10" against "long"
+		//      doesn't silently decode as 0, and "1abc" doesn't
+		//      decode as 1.
+		ctx.scanner.skipWhitespace()
+		if ctx.scanner.pos < len(ctx.scanner.data) {
+			next := ctx.scanner.data[ctx.scanner.pos]
+			if !isJSONValueStart(next) {
+				err = fmt.Errorf("avro json: unexpected trailing content at offset %d", ctx.scanner.pos)
+			}
+		}
+	}
 	sl.put()
 	return err
+}
+
+// isJSONValueStart reports whether b is a byte that can begin a JSON
+// value per RFC 8259: {, [, " (string), -, 0-9 (number), t (true),
+// f (false), n (null). Used by [Schema.DecodeJSON] to distinguish
+// "multi-record concat" trailing content (start of a new JSON value)
+// from mid-token garbage that the scanner stopped at.
+func isJSONValueStart(b byte) bool {
+	switch b {
+	case '{', '[', '"', '-', 't', 'f', 'n':
+		return true
+	}
+	return b >= '0' && b <= '9'
 }
 
 // appendAvroJSON is the single-pass Avro JSON encoder. It walks
@@ -387,7 +422,10 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			// only runtime user input lands here, where the Go convention
 			// is UTF-8. appendAvroJSONBytes then handles the
 			// codepoint↔byte mapping on the wire form.
-			return appendAvroJSONBytes(buf, []byte(v.String())), nil
+			// appendAvroJSONBytes iterates byte-by-byte without retaining;
+			// alias v's string data instead of allocating a copy.
+			s := v.String()
+			return appendAvroJSONBytes(buf, unsafe.Slice(unsafe.StringData(s), len(s))), nil
 		}
 		if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 			return appendAvroJSONBytes(buf, v.Bytes()), nil
@@ -456,7 +494,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			// Go string → raw UTF-8 bytes, matching serSize on the
 			// binary side. See the bytes-string arm above for the full
 			// rationale on why codepoint mapping was wrong here.
-			raw = []byte(v.String())
+			// Alias v's bytes; downstream consumers iterate read-only.
+			s := v.String()
+			raw = unsafe.Slice(unsafe.StringData(s), len(s))
 		} else if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
 			raw = make([]byte, v.Len())
 			reflect.Copy(reflect.ValueOf(raw), v)
@@ -1053,8 +1093,33 @@ func jsonCoerceToFloat64(v reflect.Value, bitSize int) (float64, error) {
 		}
 		f = float64(n)
 	case v.Type() == jsonNumberType:
+		// strconv.ParseFloat is lenient about hex floats ("0x1.0p10")
+		// and underscore-separated digits ("1_000") that the JSON spec
+		// rejects; gate via isJSONNumber to match the binary path's
+		// [jsonNumberToFloat] strictness and Java/fastavro behavior.
+		s := string(v.Interface().(json.Number))
+		if !isJSONNumber(s) {
+			return 0, fmt.Errorf("avro json: invalid JSON number %q", s)
+		}
+		// Integer-form gets the same precLimit check the v.CanInt()
+		// arm above applies, so typed-int and json.Number inputs of
+		// the same magnitude agree on accept/reject. Without this,
+		// json.Number("9007199254740993") against "double" silently
+		// rounds via ParseFloat while int64(9007199254740993) rejects.
+		if !strings.ContainsAny(s, ".eE") {
+			if n, perr := strconv.ParseInt(s, 10, 64); perr == nil {
+				if n < -precLimit || n > precLimit {
+					return 0, fmt.Errorf("avro json: integer %d overflows float%d exact precision", n, bitSize)
+				}
+				f = float64(n)
+				break
+			}
+			// Integer-form > int64: magnitude exceeds any float
+			// precision; reject outright rather than silently rounding.
+			return 0, fmt.Errorf("avro json: integer %s overflows float%d exact precision", s, bitSize)
+		}
 		var err error
-		f, err = v.Interface().(json.Number).Float64()
+		f, err = strconv.ParseFloat(s, 64)
 		if err != nil {
 			return 0, fmt.Errorf("avro json: invalid json.Number for float: %w", err)
 		}
