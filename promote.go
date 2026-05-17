@@ -212,17 +212,11 @@ func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byt
 	}
 	payload := src[:n]
 	v = indirectAlloc(v)
-	if r, displayScale, perr := parseBigDecimalPayload(payload); perr == nil {
-		if ok, err := setDecimalRat(v, r, displayScale); ok {
-			if err != nil {
-				return nil, err
-			}
-			return src[n:], nil
-		}
-	} else if v.Kind() != reflect.Slice && v.Kind() != reflect.String && v.Kind() != reflect.Array {
-		return nil, perr
+	done, err := applyBigDecimalPayload(v, payload)
+	if !done {
+		err = setBytesValue(v, payload, "big-decimal")
 	}
-	if err := setBytesValue(v, payload, "big-decimal"); err != nil {
+	if err != nil {
 		return nil, err
 	}
 	return src[n:], nil

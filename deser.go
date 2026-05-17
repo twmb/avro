@@ -1329,7 +1329,6 @@ var deserIfaceFnByKind = map[string]deserIfaceFn{
 // no logical type / custom decoder applies before using the result.
 func ifaceFnForKind(kind string) deserIfaceFn { return deserIfaceFnByKind[kind] }
 
-
 // deserFixedUUIDReflect decodes a fixed(16) UUID. Into any it returns
 // [16]byte; into [16]byte it copies the raw bytes; into string it
 // formats a hex-dash UUID string; into []byte it falls back to raw bytes.
@@ -1797,20 +1796,46 @@ func (s *deserBigDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte, 
 	payload := src[:n]
 	src = src[n:]
 	v = indirectAlloc(v)
-	// Try the structured-rat decode first; if the target can't take a
-	// *big.Rat (e.g. []byte/string for opaque pass-through, mirroring
-	// serBigDecimal's serBytes fall-through), fall back to raw bytes.
-	// For raw-byte targets the validity of the payload doesn't matter
-	// (user is intentionally bypassing the framing), so the parse
-	// error is only surfaced when a structured target is rejected.
-	if r, displayScale, perr := parseBigDecimalPayload(payload); perr == nil {
-		if ok, err := setDecimalRat(v, r, displayScale); ok {
-			return src, err
-		}
-	} else if v.Kind() != reflect.Slice && v.Kind() != reflect.String && v.Kind() != reflect.Array {
-		return nil, perr
+	done, err := applyBigDecimalPayload(v, payload)
+	if !done {
+		err = setBytesValue(v, payload, "big-decimal")
 	}
-	return src, setBytesValue(v, payload, "big-decimal")
+	if err != nil {
+		return nil, err
+	}
+	return src, nil
+}
+
+// applyBigDecimalPayload tries the structured big-decimal decode first
+// (parse payload via parseBigDecimalPayload then setDecimalRat). Three
+// outcomes:
+//
+//   - (true, nil): structured set succeeded.
+//   - (true, err): the result is final — either setDecimalRat failed
+//     OR the parse failed AND the target is structured-only (not
+//     []byte/string/[N]byte). Caller must surface err.
+//   - (false, nil): the caller should fall through to setBytesValue
+//     for opaque-bytes pass-through. Happens when parse succeeded but
+//     no structured target matched, OR when parse failed and the
+//     target is byte-like (user is intentionally bypassing the
+//     framing, so the parse error doesn't matter).
+//
+// Shared by binary deserBigDecimal, JSON assignBytes's big-decimal
+// arm, and promote.go's promoteStringToBytesBigDecimal so the three
+// sites agree on the structured-vs-opaque dispatch and the parse-fail
+// surface-vs-suppress rule.
+func applyBigDecimalPayload(v reflect.Value, payload []byte) (done bool, err error) {
+	r, displayScale, perr := parseBigDecimalPayload(payload)
+	if perr == nil {
+		if ok, serr := setDecimalRat(v, r, displayScale); ok {
+			return true, serr
+		}
+		return false, nil
+	}
+	if v.Kind() != reflect.Slice && v.Kind() != reflect.String && v.Kind() != reflect.Array {
+		return true, perr
+	}
+	return false, nil
 }
 
 // parseBigDecimalPayload parses the big-decimal inner payload bytes

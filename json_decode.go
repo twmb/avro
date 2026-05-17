@@ -583,31 +583,20 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny boo
 func assignBytes(v reflect.Value, b []byte, node *schemaNode) error {
 	switch node.logical {
 	case "decimal":
-		// Share setDecimalRat with the binary path so the JSON
-		// decoder accepts the same target types (*big.Rat, big.Rat,
-		// json.Number, *float32, *float64, *string) with the same
-		// float-overflow guards.
-		if ok, err := setDecimalRat(v, bytesToRat(b, node.scale), node.scale); ok {
+		// Share setDecimalValue with the binary path so JSON accepts
+		// the same target types (*big.Rat, big.Rat, json.Number,
+		// *float32, *float64, *string) with the same overflow guards.
+		if ok, err := setDecimalValue(v, b, node.scale); ok {
 			return err
 		}
 	case "big-decimal":
 		// b is the inner big-decimal payload (length-prefixed unscaled
 		// + zigzag scale); the outer codepoint-string decode has
-		// already stripped the JSON quoting. Mirrors the binary
-		// deserBigDecimal post-readLength path INCLUDING its opaque-
-		// bytes pass-through: when the payload can't be parsed AND
-		// the target is byte-like (slice / string / array), fall
-		// through to setBytesValue below so a raw payload that the
-		// encoder accepts via serBigDecimal's serBytes fall-through
-		// round-trips. Only surface the parse error when the target
-		// is a structured big.Rat / json.Number / float / etc., which
-		// can't take raw bytes meaningfully.
-		if r, displayScale, perr := parseBigDecimalPayload(b); perr == nil {
-			if ok, err := setDecimalRat(v, r, displayScale); ok {
-				return err
-			}
-		} else if v.Kind() != reflect.Slice && v.Kind() != reflect.String && v.Kind() != reflect.Array {
-			return perr
+		// already stripped the JSON quoting. applyBigDecimalPayload
+		// encapsulates the binary-side opaque-bytes fall-through; when
+		// it returns (false, _) we drop into setBytesValue below.
+		if done, err := applyBigDecimalPayload(v, b); done {
+			return err
 		}
 	case "duration":
 		if v.Type() == avroDurationType {
