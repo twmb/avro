@@ -2,6 +2,7 @@ package avro
 
 import (
 	"encoding"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -337,7 +338,7 @@ func serNull(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 
 func appendAvroBool(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.Kind() != reflect.Bool {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+		return nil, semErr(v, "boolean")
 	}
 	if v.Bool() {
 		return append(dst, 1), nil
@@ -345,13 +346,21 @@ func appendAvroBool(dst []byte, v reflect.Value) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
+// serPrim returns the standard ser primitive wrapper: indirect-then-
+// dispatch to appendFn. Used to wire the six primitive serializers
+// (serBoolean/Int/Long/Float/Double/String) to their appendAvro*
+// helpers. Keeps the indirect+nil-check shape in one place.
+func serPrim(appendFn func([]byte, reflect.Value) ([]byte, error)) serfn {
+	return func(dst []byte, v reflect.Value, _ int) ([]byte, error) {
+		v, err := indirect(v)
+		if err != nil {
+			return nil, err
+		}
+		return appendFn(dst, v)
 	}
-	return appendAvroBool(dst, v)
 }
+
+var serBoolean = serPrim(appendAvroBool)
 
 var jsonNumberType = reflect.TypeFor[json.Number]()
 var mapStringAnyType = reflect.TypeFor[map[string]any]()
@@ -431,27 +440,14 @@ func floatFitsInt64From(f float64, bits int) (int64, error) {
 
 // jsonNumberToFloat converts a json.Number reflect.Value to a numeric
 // reflect.Value suitable for the float encode arms. Returns:
-//   - (reflect.Value(n), true, nil) — integer-form input (no '.', 'e', 'E')
-//     that parses as int64 returns an int64 Value so the caller's CanInt()
-//     arm applies its 1<<24 / 1<<53 precision-bound check (parity with
-//     s.Encode(int64(N))). Integer-form inputs that overflow int64 fall
-//     through to the float path, which surfaces via finiteFloat32Overflows
-//     or stores the exact int64-out-of-range float (precision is gone by
-//     definition).
-//   - (reflect.Value(f), true, nil) — float-form input parsed via
-//     strconv.ParseFloat. Precision loss for float-form is expected
-//     and matches the CanFloat() arm. ParseFloat returning
-//     (±Inf, strconv.ErrRange) for a float-form input whose magnitude
-//     exceeds float64 range is treated as a successful encode of ±Inf:
-//     Java's BigDecimal.doubleValue() returns POSITIVE_INFINITY for the
-//     same input, fastavro's float() returns inf, and the decode side
-//     (json_decode.go decodeFloat/decodeDouble) already accepts ±Inf
-//     from overflow. Without this acceptance,
-//     s.Encode(json.Number("1e1000")) against "double" rejected while
-//     s.Encode(math.Inf(1)) — the equivalent typed value — succeeded.
+//   - (int64 Value, true, nil) — integer-form input parsed as int64;
+//     the caller's CanInt() arm then applies its mantissa-precision
+//     check (parity with the typed-int encode path).
+//   - (float64 Value, true, nil) — float-form input via parseFloatAcceptOverflow.
+//     ±Inf from overflow is accepted (Java/fastavro/decode-side parity).
 //   - (v, false, nil) — not a json.Number; caller falls through.
 //   - (v, true, err) — IS json.Number but JSON-grammar-invalid (hex
-//     float "0x1.0p10", underscore "1_000"). Java/fastavro reject.
+//     float, underscore, integer-form > int64). Java/fastavro reject.
 func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 	if v.Type() != jsonNumberType {
 		return v, false, nil
@@ -485,41 +481,20 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 	return reflect.ValueOf(f), true, nil
 }
 
-// parseInt64Lenient parses s as a decimal integer, accepting pure-integer
-// form (fast path via strconv.ParseInt), exponent form (e.g. "1e3"), and
-// fractional form whose fractional part is zero (e.g. "1.0", "1.5e1"=15).
-// Rejects:
-//   - syntactically invalid numbers
-//   - whole-number values outside int64 range
-//   - fractional values with non-zero fractional part
-//   - 10^|exp| magnitudes beyond decimalScaleLimit (DoS bound)
+// parseInt64Lenient parses s as a decimal integer, accepting pure-integer,
+// exponent ("1e3"), and zero-fractional-part ("1.0", "1.5e1"=15) forms.
+// Rejects invalid grammar, out-of-int64 values, non-zero fractional parts,
+// and exponents beyond decimalScaleLimit (DoS bound).
 //
-// Slow-path parsing uses [boundedRatFromString] to get exact arbitrary-
-// precision representation, then checks IsInt + IsInt64. This avoids the
-// silent precision loss the prior strconv.ParseFloat + [floatFitsInt64]
-// fallback exhibited at the int64 boundary, where float64's 2048-unit
-// precision at magnitude 2^63 either:
+// Slow path goes through [boundedRatFromString] (arbitrary precision via
+// big.Rat IsInt+IsInt64) instead of strconv.ParseFloat+[floatFitsInt64],
+// which silently corrupted values near the int64 boundary — float64 lacks
+// the precision to distinguish int64.Min from int64.Min-1024, and rounded
+// valid exponent-form int64s across the boundary. Java's BigDecimal and
+// fastavro's Cython long64 check use the same arbitrary-precision approach.
 //
-//   - silently truncated values in (int64.Min-1024, int64.Min) to
-//     int64.Min — e.g. "-9223372036854775809" or "-9.223372036854776832e18"
-//     both encoded as int64.Min wire bytes, off-by-N data corruption.
-//
-//   - silently rejected valid int64 values in exponent form whose float64
-//     rounding crossed the int64 boundary — e.g. "9.2233720368547758e18"
-//     (= 9223372036854775800, a valid int64) was rejected as overflow
-//     because float64 rounded it to +1<<63.
-//
-// Java's BigDecimal-based JsonNode.canConvertToLong() and fastavro's
-// Cython long64 overflow check both use arbitrary precision; the prior
-// float64 fallback was twmb's only precision hole at this boundary.
-//
-// Shared by every site that converts a string-form numeric to int64 for
-// Avro long encoding/decoding: [jsonNumberToInt64] (binary encode of
-// json.Number against int/long), [defaultAsInt64] (schema default
-// validate + encodeDefault), [jsonCoerceToInt64] (JSON encode of
-// json.Number / lenient string), and [parseJSONInt64]'s exponent /
-// fractional branch (JSON decode of long from exponent form). One
-// helper, one rule across all four sites.
+// Shared by [jsonNumberToInt64], [defaultAsInt64], [jsonCoerceToInt64],
+// and [parseJSONInt64]'s exponent/fractional branch.
 func parseInt64Lenient(s string) (int64, error) {
 	// JSON-spec grammar gate: strconv.ParseInt(s,10,64) accepts forms
 	// the JSON spec rejects — leading '+' ("+5" → 5), leading-zero
@@ -633,20 +608,20 @@ func appendAvroInt(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanFloat() {
 		n, err := floatFitsInt32From(v.Float(), v.Type().Bits())
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: err}
+			return nil, semErrW(v, "int", err)
 		}
 		return appendVarint(dst, n), nil
 	}
 	if n, ok, err := jsonNumberToInt64(v); ok {
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: err}
+			return nil, semErrW(v, "int", err)
 		}
 		if n < math.MinInt32 || n > math.MaxInt32 {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 		}
 		return appendVarint(dst, int32(n)), nil
 	}
-	return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
+	return nil, semErr(v, "int")
 }
 
 // appendAvroLong is appendAvroInt with the int64 bound + varlong emit.
@@ -664,50 +639,25 @@ func appendAvroLong(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanFloat() {
 		n, err := floatFitsInt64From(v.Float(), v.Type().Bits())
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: err}
+			return nil, semErrW(v, "long", err)
 		}
 		return appendVarlong(dst, n), nil
 	}
 	if n, ok, err := jsonNumberToInt64(v); ok {
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: err}
+			return nil, semErrW(v, "long", err)
 		}
 		return appendVarlong(dst, n), nil
 	}
-	return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+	return nil, semErr(v, "long")
 }
 
-func serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
-	return appendAvroInt(dst, v)
-}
-
-func serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
-	return appendAvroLong(dst, v)
-}
-
-func serFloat(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
-	return appendAvroFloat32(dst, v)
-}
-
-func serDouble(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
-	return appendAvroFloat64(dst, v)
-}
+var (
+	serInt    = serPrim(appendAvroInt)
+	serLong   = serPrim(appendAvroLong)
+	serFloat  = serPrim(appendAvroFloat32)
+	serDouble = serPrim(appendAvroFloat64)
+)
 
 // finiteFloat32Overflows reports whether f is a finite float64 whose
 // float32(f) narrowing is ±Inf. ±Inf and NaN inputs return false: those
@@ -742,24 +692,24 @@ func appendAvroFloat32(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanInt() {
 		f, err := intFitsFloat(v.Int(), 32)
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: err}
+			return nil, semErrW(v, "float", err)
 		}
 		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	}
 	if v.CanUint() {
 		f, err := uintFitsFloat(v.Uint(), 32)
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: err}
+			return nil, semErrW(v, "float", err)
 		}
 		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	}
 	if fv, ok, err := jsonNumberToFloat(v); ok {
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: err}
+			return nil, semErrW(v, "float", err)
 		}
 		return appendAvroFloat32(dst, fv)
 	}
-	return nil, &SemanticError{GoType: v.Type(), AvroType: "float"}
+	return nil, semErr(v, "float")
 }
 
 // appendAvroFloat64 is the parallel helper for Avro double. Same shape
@@ -772,24 +722,24 @@ func appendAvroFloat64(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanInt() {
 		f, err := intFitsFloat(v.Int(), 64)
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: err}
+			return nil, semErrW(v, "double", err)
 		}
 		return appendUint64(dst, math.Float64bits(f)), nil
 	}
 	if v.CanUint() {
 		f, err := uintFitsFloat(v.Uint(), 64)
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: err}
+			return nil, semErrW(v, "double", err)
 		}
 		return appendUint64(dst, math.Float64bits(f)), nil
 	}
 	if fv, ok, err := jsonNumberToFloat(v); ok {
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: err}
+			return nil, semErrW(v, "double", err)
 		}
 		return appendAvroFloat64(dst, fv)
 	}
-	return nil, &SemanticError{GoType: v.Type(), AvroType: "double"}
+	return nil, semErr(v, "double")
 }
 
 func serBytes(dst []byte, v reflect.Value, depth int) ([]byte, error) {
@@ -803,18 +753,12 @@ func serBytes(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return doSerString(dst, v.String()), nil
 	}
 	if (v.Kind() != reflect.Array && v.Kind() != reflect.Slice) || v.Type().Elem().Kind() != reflect.Uint8 {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes"}
+		return nil, semErr(v, "bytes")
 	}
 	return doSerBytes(dst, v, depth), nil
 }
 
-func serString(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
-	return appendAvroString(dst, v)
-}
+var serString = serPrim(appendAvroString)
 
 // appendAvroString appends v as an Avro string. The resolution order is
 // the canonical contract for any Avro-string-typed encode site:
@@ -837,7 +781,7 @@ func serString(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 // lockstep on precedence.
 func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.Type() == jsonNumberType {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
+		return nil, semErr(v, "string")
 	}
 	if v.Kind() == reflect.String {
 		return doSerString(dst, v.String()), nil
@@ -880,7 +824,7 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 		b := v.Bytes()
 		return doSerString(dst, unsafe.String(unsafe.SliceData(b), len(b))), nil
 	}
-	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
+	return nil, semErr(v, "string")
 }
 
 // avroStringValue resolves v to its canonical Avro-string textual form
@@ -892,7 +836,7 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 // appendAvroString does not apply here.
 func avroStringValue(v reflect.Value) (string, error) {
 	if v.Type() == jsonNumberType {
-		return "", &SemanticError{GoType: v.Type(), AvroType: "string"}
+		return "", semErr(v, "string")
 	}
 	if v.Kind() == reflect.String {
 		return v.String(), nil
@@ -917,7 +861,7 @@ func avroStringValue(v reflect.Value) (string, error) {
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		return string(v.Bytes()), nil
 	}
-	return "", &SemanticError{GoType: v.Type(), AvroType: "string"}
+	return "", semErr(v, "string")
 }
 
 ////////////////////
@@ -1122,7 +1066,7 @@ func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		return appendVarint(dst, int32(n)), nil
 
 	default:
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
+		return nil, semErr(v, "enum")
 	}
 }
 
@@ -1233,7 +1177,7 @@ func serArrayPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, 
 		return nil, v, 0, err
 	}
 	if v.Kind() != reflect.Array && v.Kind() != reflect.Slice {
-		return nil, v, 0, &SemanticError{GoType: v.Type(), AvroType: "array"}
+		return nil, v, 0, semErr(v, "array")
 	}
 	l := v.Len()
 	dst = appendVarlong(dst, int64(l))
@@ -1402,18 +1346,9 @@ type Duration struct {
 // matching the Avro duration wire format.
 func (d Duration) Bytes() [12]byte {
 	var b [12]byte
-	b[0] = byte(d.Months)
-	b[1] = byte(d.Months >> 8)
-	b[2] = byte(d.Months >> 16)
-	b[3] = byte(d.Months >> 24)
-	b[4] = byte(d.Days)
-	b[5] = byte(d.Days >> 8)
-	b[6] = byte(d.Days >> 16)
-	b[7] = byte(d.Days >> 24)
-	b[8] = byte(d.Milliseconds)
-	b[9] = byte(d.Milliseconds >> 8)
-	b[10] = byte(d.Milliseconds >> 16)
-	b[11] = byte(d.Milliseconds >> 24)
+	binary.LittleEndian.PutUint32(b[0:4], d.Months)
+	binary.LittleEndian.PutUint32(b[4:8], d.Days)
+	binary.LittleEndian.PutUint32(b[8:12], d.Milliseconds)
 	return b
 }
 
@@ -1427,9 +1362,9 @@ func DurationFromBytes(b []byte) Duration {
 		return Duration{}
 	}
 	return Duration{
-		Months:       uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24,
-		Days:         uint32(b[4]) | uint32(b[5])<<8 | uint32(b[6])<<16 | uint32(b[7])<<24,
-		Milliseconds: uint32(b[8]) | uint32(b[9])<<8 | uint32(b[10])<<16 | uint32(b[11])<<24,
+		Months:       binary.LittleEndian.Uint32(b[0:4]),
+		Days:         binary.LittleEndian.Uint32(b[4:8]),
+		Milliseconds: binary.LittleEndian.Uint32(b[8:12]),
 	}
 }
 
@@ -1526,7 +1461,7 @@ func serTimeAsLong(dst []byte, v reflect.Value, depth int, conv func(time.Time) 
 	if t, ok := extractTime(v); ok {
 		n, err := conv(t)
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: err}
+			return nil, semErrW(v, "long", err)
 		}
 		return appendVarlong(dst, n), nil
 	}
@@ -1576,7 +1511,7 @@ func serDate(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	if t, ok := tryParseDateString(v); ok {
 		d, err := timeToDate(t)
 		if err != nil {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "date", Err: err}
+			return nil, semErrW(v, "date", err)
 		}
 		return appendVarint(dst, d), nil
 	}
@@ -1637,6 +1572,30 @@ func serDuration(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return append(dst, b[:]...), nil
 	}
 	return (&serSize{12}).ser(dst, v, depth)
+}
+
+// coerceDecimalRat is decimalRatFor with the indirect + SemanticError-
+// wrap preamble factored out. Returns (peeled v, rat, ok, err):
+//   - err != nil: caller surfaces it (indirect-nil or a wrapped tryCoerceToRat
+//     failure that names avroType)
+//   - ok == true: caller calls its serRat helper with rat
+//   - ok == false, err == nil: caller falls through to its bytes/fixed
+//     opaque-bytes path
+//
+// Shared by serBytesDecimal/serFixedDecimal/serBigDecimal so the three
+// agree on the indirect / bigRat-fast-path / tryCoerceToRat / err-wrap
+// chain. Returning the peeled v lets serBigDecimal pass v.Type() into
+// its serRat for SemanticError context.
+func coerceDecimalRat(v reflect.Value, avroType string) (reflect.Value, *big.Rat, bool, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return v, nil, false, err
+	}
+	r, ok, err := decimalRatFor(v)
+	if err != nil {
+		return v, nil, false, &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
+	}
+	return v, r, ok, nil
 }
 
 // decimalRatFor extracts a *big.Rat from v for decimal-logical-type
@@ -1751,17 +1710,9 @@ func (s *serBytesDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
 }
 
 func (s *serBytesDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
-	v, err := indirect(v)
+	v, r, ok, err := coerceDecimalRat(v, "bytes")
 	if err != nil {
 		return nil, err
-	}
-	if v.Type() == bigRatType {
-		tmp := v.Interface().(big.Rat)
-		return s.serRat(dst, &tmp)
-	}
-	r, ok, err := tryCoerceToRat(v)
-	if err != nil {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
 	}
 	if ok {
 		return s.serRat(dst, r)
@@ -1795,17 +1746,9 @@ func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
 }
 
 func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
-	v, err := indirect(v)
+	v, r, ok, err := coerceDecimalRat(v, "fixed")
 	if err != nil {
 		return nil, err
-	}
-	if v.Type() == bigRatType {
-		tmp := v.Interface().(big.Rat)
-		return s.serRat(dst, &tmp)
-	}
-	r, ok, err := tryCoerceToRat(v)
-	if err != nil {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: err}
 	}
 	if ok {
 		return s.serRat(dst, r)
@@ -1816,13 +1759,9 @@ func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 type serBigDecimal struct{}
 
 func (s *serBigDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
-	v, err := indirect(v)
+	v, r, ok, err := coerceDecimalRat(v, "bytes")
 	if err != nil {
 		return nil, err
-	}
-	r, ok, err := decimalRatFor(v)
-	if err != nil {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
 	}
 	if ok {
 		return s.serRat(dst, r, v.Type())
@@ -1850,8 +1789,7 @@ func buildBigDecimalPayload(r *big.Rat) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("big.Rat %s has no finite decimal expansion; big-decimal cannot encode this value", r.RatString())
 	}
-	mult := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
-	num := new(big.Int).Mul(r.Num(), mult)
+	num := new(big.Int).Mul(r.Num(), pow10(scale))
 	unscaled, _ := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
 	// Remainder is provably 0 since finiteScale chose s to make
 	// 10^s / Denom an integer.
@@ -1916,6 +1854,27 @@ func finiteScale(r *big.Rat) (int, bool) {
 	return b, true
 }
 
+// pow10 returns 10^n as a *big.Int. n must be non-negative.
+// Shared chokepoint for every decimal encode/decode site that materializes
+// a power of ten — keeps the (single) DoS-bound update site bound to
+// decimalScaleLimit if a future tightening is needed.
+func pow10(n int) *big.Int {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
+}
+
+// scaledRat returns unscaled * 10^(-scale) as a fresh *big.Rat.
+// Positive scale divides (the standard Avro decimal interpretation;
+// schema scale=2 of unscaled=33 → 0.33); negative scale multiplies
+// (the Avro big-decimal form where the wire encodes a left-shifted
+// integer, e.g. scale=-3 of unscaled=42 → 42000).
+func scaledRat(unscaled *big.Int, scale int) *big.Rat {
+	if scale < 0 {
+		num := new(big.Int).Mul(unscaled, pow10(-scale))
+		return new(big.Rat).SetFrac(num, big.NewInt(1))
+	}
+	return new(big.Rat).SetFrac(unscaled, pow10(scale))
+}
+
 // ratToUnscaled returns the unscaled big.Int (rat * 10^scale / denom) when
 // the value is exactly representable at the requested scale, or an error
 // when the conversion would require rounding. Used by both
@@ -1929,8 +1888,7 @@ func finiteScale(r *big.Rat) (int, bool) {
 // big.NewRat(1, 3) at scale=2 has remainder 1 after multiplying by 100,
 // matching Java's "scale=infinite > schema scale=2" rejection.
 func ratToUnscaled(r *big.Rat, scale int) (*big.Int, error) {
-	s := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
-	num := new(big.Int).Mul(r.Num(), s)
+	num := new(big.Int).Mul(r.Num(), pow10(scale))
 	unscaled, rem := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
 	if rem.Sign() != 0 {
 		return nil, fmt.Errorf("decimal value %s cannot be represented at scale %d without rounding", r.RatString(), scale)
@@ -2006,9 +1964,7 @@ func serFixedUUIDReflect(dst []byte, v reflect.Value, depth int) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	if isUUIDType(v.Type()) {
-		var u [16]byte
-		reflect.Copy(reflect.ValueOf(&u).Elem(), v)
+	if u, ok := uuidBytes(v); ok {
 		return append(dst, u[:]...), nil
 	}
 	if v.Kind() == reflect.String {
@@ -2025,6 +1981,20 @@ func serFixedUUIDReflect(dst []byte, v reflect.Value, depth int) ([]byte, error)
 // or any type whose underlying type is [16]byte).
 func isUUIDType(t reflect.Type) bool {
 	return t.Kind() == reflect.Array && t.Len() == 16 && t.Elem().Kind() == reflect.Uint8
+}
+
+// uuidBytes copies v's [16]byte payload out into a stack-allocated array
+// when v is a UUID-typed array, returning (u, true). For non-UUID v it
+// returns (zero, false). Shared by the three encode sites that need to
+// materialize a [16]byte from a reflect.Value (serFixedUUIDReflect,
+// serUUID, the JSON "string"+uuid arm).
+func uuidBytes(v reflect.Value) ([16]byte, bool) {
+	if !isUUIDType(v.Type()) {
+		return [16]byte{}, false
+	}
+	var u [16]byte
+	reflect.Copy(reflect.ValueOf(&u).Elem(), v)
+	return u, true
 }
 
 // uuidToString formats a [16]byte as the RFC 4122 hex-dash string
@@ -2048,9 +2018,7 @@ func serUUID(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if isUUIDType(v.Type()) {
-		var u [16]byte
-		reflect.Copy(reflect.ValueOf(&u).Elem(), v)
+	if u, ok := uuidBytes(v); ok {
 		return doSerString(dst, uuidToString(u)), nil
 	}
 	return serString(dst, v, depth)

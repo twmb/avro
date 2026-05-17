@@ -53,6 +53,18 @@ func formatGoType(t reflect.Type) string {
 
 func (e *SemanticError) Unwrap() error { return e.Err }
 
+// semErr returns a SemanticError naming v's Go type and the given Avro
+// type. Shared by the trivial 2-field error sites (~60+ across ser.go /
+// deser.go / json_codec.go) that previously open-coded the literal.
+func semErr(v reflect.Value, avroType string) error {
+	return &SemanticError{GoType: v.Type(), AvroType: avroType}
+}
+
+// semErrW is semErr with a wrapped underlying error.
+func semErrW(v reflect.Value, avroType string, err error) error {
+	return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
+}
+
 // recordFieldError wraps an error from a record field serializer/deserializer,
 // building a dotted path for nested records. If the inner error is a
 // SemanticError, the field name is prepended to the path and the inner

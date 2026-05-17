@@ -89,18 +89,31 @@ type resolveCtx struct {
 // maybeWrapResolvedNode re-applies custom decoders from the reader
 // schema to a resolved node that uses the reader node directly.
 func maybeWrapResolvedNode(r *schemaNode, ctx *resolveCtx) *schemaNode {
-	decs := ctx.customDecoders[r]
-	if len(decs) == 0 {
+	if len(ctx.customDecoders[r]) == 0 {
 		return r
 	}
-	sn := ctx.customSNs[r]
-	return &schemaNode{
-		kind:       r.kind,
-		name:       r.name,
-		ser:        r.ser,
-		deser:      wrapDeserWithCustomDecoders(r.deser, decs, sn),
-		decodeJSON: wrapDecodeJSONWithCustomDecoders(decs, sn),
+	nd := &schemaNode{
+		kind:  r.kind,
+		name:  r.name,
+		ser:   r.ser,
+		deser: r.deser,
 	}
+	ctx.applyCustomToNode(nd, r)
+	return nd
+}
+
+// applyCustomToNode wraps nd.deser + nd.decodeJSON with the custom
+// decoders registered against r. No-op when no CT is registered.
+// Shared by the resolveArray/resolveMap/resolveEnum/promote sites in
+// doResolve so all four agree on the wrap pair.
+func (ctx *resolveCtx) applyCustomToNode(nd, r *schemaNode) {
+	decs := ctx.customDecoders[r]
+	if len(decs) == 0 {
+		return
+	}
+	sn := ctx.customSNs[r]
+	nd.deser = wrapDeserWithCustomDecoders(nd.deser, decs, sn)
+	nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
 }
 
 // resolveNode resolves a (reader, writer) schema pair, handling cycles
@@ -195,19 +208,13 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 		if pdLogical := promotionDeserForLogical(w.kind, r); pdLogical != nil {
 			deser = pdLogical
 		}
-		var decodeJSON jsonDecodeFn
-		// Re-apply custom decoders from the reader schema to the promoted node.
-		if decs := ctx.customDecoders[r]; len(decs) > 0 {
-			sn := ctx.customSNs[r]
-			deser = wrapDeserWithCustomDecoders(deser, decs, sn)
-			decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
+		nd := &schemaNode{
+			kind:  r.kind,
+			ser:   r.ser,
+			deser: deser,
 		}
-		return &schemaNode{
-			kind:       r.kind,
-			ser:        r.ser,
-			deser:      deser,
-			decodeJSON: decodeJSON,
-		}, nil
+		ctx.applyCustomToNode(nd, r)
+		return nd, nil
 	}
 
 	return nil, &CompatibilityError{
@@ -481,21 +488,16 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 		ri := mapping[idx]
 		return src, setEnumTarget(indirectAlloc(v), ri, readerSymbols[ri])
 	})
-	var decodeJSON jsonDecodeFn
-	if decs := ctx.customDecoders[r]; len(decs) > 0 {
-		sn := ctx.customSNs[r]
-		deser = wrapDeserWithCustomDecoders(deser, decs, sn)
-		decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
+	nd := &schemaNode{
+		kind:    "enum",
+		name:    r.name,
+		aliases: r.aliases,
+		symbols: r.symbols,
+		ser:     r.ser,
+		deser:   deser,
 	}
-	return &schemaNode{
-		kind:       "enum",
-		name:       r.name,
-		aliases:    r.aliases,
-		symbols:    r.symbols,
-		ser:        r.ser,
-		deser:      deser,
-		decodeJSON: decodeJSON,
-	}, nil
+	ctx.applyCustomToNode(nd, r)
+	return nd, nil
 }
 
 func resolveArray(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
@@ -517,11 +519,7 @@ func resolveArray(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, 
 		// resolveMap site below.
 		deser: (&deserArray{deserItem: resolved.deser, minItemBytes: schemaMinBytes(w.items)}).deser,
 	}
-	if decs := ctx.customDecoders[r]; len(decs) > 0 {
-		sn := ctx.customSNs[r]
-		nd.deser = wrapDeserWithCustomDecoders(nd.deser, decs, sn)
-		nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
-	}
+	ctx.applyCustomToNode(nd, r)
 	return nd, nil
 }
 
@@ -542,11 +540,7 @@ func resolveMap(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, er
 		// reader is still 1 byte minimum on the wire).
 		deser: (&deserMap{deserItem: resolved.deser, minEntryBytes: 1 + schemaMinBytes(w.values)}).deser,
 	}
-	if decs := ctx.customDecoders[r]; len(decs) > 0 {
-		sn := ctx.customSNs[r]
-		nd.deser = wrapDeserWithCustomDecoders(nd.deser, decs, sn)
-		nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
-	}
+	ctx.applyCustomToNode(nd, r)
 	return nd, nil
 }
 

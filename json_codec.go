@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -348,10 +349,10 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	case "string":
 		// UUID logical type: [16]byte input canonicalizes to the RFC 4122
 		// hex-dash string, matching serUUID on the binary side.
-		if node.logical == "uuid" && isUUIDType(v.Type()) {
-			var u [16]byte
-			reflect.Copy(reflect.ValueOf(&u).Elem(), v)
-			return appendJSONString(buf, uuidToString(u)), nil
+		if node.logical == "uuid" {
+			if u, ok := uuidBytes(v); ok {
+				return appendJSONString(buf, uuidToString(u)), nil
+			}
 		}
 		// Resolution order is shared with the binary encoder via
 		// avroStringValue: json.Number rejected, reflect.String,
@@ -383,7 +384,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		case "decimal":
 			r, ok, err := decimalRatFor(v)
 			if err != nil {
-				return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
+				return nil, semErrW(v, "bytes", err)
 			}
 			if ok {
 				b, err := decimalUnscaledBytes(r, node.scale, node.precision, "bytes", v.Type())
@@ -395,12 +396,12 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		case "big-decimal":
 			r, ok, err := decimalRatFor(v)
 			if err != nil {
-				return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
+				return nil, semErrW(v, "bytes", err)
 			}
 			if ok {
 				inner, err := buildBigDecimalPayload(r)
 				if err != nil {
-					return nil, &SemanticError{GoType: v.Type(), AvroType: "bytes", Err: err}
+					return nil, semErrW(v, "bytes", err)
 				}
 				return appendAvroJSONBytes(buf, inner), nil
 			}
@@ -446,7 +447,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		case "decimal":
 			r, ok, err := decimalRatFor(v)
 			if err != nil {
-				return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: err}
+				return nil, semErrW(v, "fixed", err)
 			}
 			if ok {
 				b, err := decimalUnscaledBytes(r, node.scale, node.precision, "fixed", v.Type())
@@ -503,10 +504,8 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	case "enum":
 		if v.Kind() == reflect.String {
 			needle := v.String()
-			for _, sym := range node.symbols {
-				if sym == needle {
-					return appendJSONString(buf, needle), nil
-				}
+			if slices.Contains(node.symbols, needle) {
+				return appendJSONString(buf, needle), nil
 			}
 			return nil, fmt.Errorf("avro json: unknown enum symbol %q", needle)
 		}
@@ -548,7 +547,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			// reflect's <int Value>-style placeholder for non-string
 			// keys, producing invalid Avro JSON. Mirrors
 			// serMapPreamble's check on the binary side.
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "map"}
+			return nil, semErr(v, "map")
 		}
 		buf = append(buf, '{')
 		first := true
@@ -579,12 +578,30 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	}
 }
 
+// appendJSONFieldDefault appends a missing record field's default value
+// to buf — JSON `null` for nil defaultVal, otherwise recursive
+// appendAvroJSON. Errors with "missing required field" when the field
+// has no default. Shared by the map[string]any fast path and the
+// generic-map arm in appendAvroJSONRecord so the missing-required /
+// nil-default-to-null / default-via-appendAvroJSON sequence agrees
+// across both. Defaults route through appendAvroJSON (not a pre-
+// marshalled splice) so encoder options apply equally to defaults.
+func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
+	if !f.hasDefault {
+		return nil, fmt.Errorf("avro json: record %q missing required field %q", recordName, f.name)
+	}
+	if f.defaultVal == nil {
+		return append(buf, "null"...), nil
+	}
+	return appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, customEncodes, depth+1)
+}
+
 // appendAvroJSONRecord handles record encoding for both structs and maps.
 func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
 	buf = append(buf, '{')
 	if v.Kind() == reflect.Map {
 		if v.Type().Key().Kind() != reflect.String {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "record"}
+			return nil, semErr(v, "record")
 		}
 		// map[string]any fast path: MapIndex allocates via reflect.copyVal
 		// for each interface{} element; direct lookup skips that.
@@ -597,30 +614,12 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 				buf = appendJSONString(buf, f.name)
 				buf = append(buf, ':')
 				val, exists := m[f.name]
-				if !exists {
-					if !f.hasDefault {
-						return nil, fmt.Errorf("avro json: record %q missing required field %q", node.name, f.name)
-					}
-					// Route the default through appendAvroJSON (not a
-					// pre-marshalled splice) so encoder options —
-					// TaggedUnions, TagLogicalTypes, LinkedinFloats —
-					// apply to defaults the same way they apply to
-					// present values. A nil defaultVal is the null
-					// encoding (explicit "default": null or implicit
-					// ["null", T] union default).
-					if f.defaultVal == nil {
-						buf = append(buf, "null"...)
-						continue
-					}
-					var err error
-					buf, err = appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, customEncodes, depth+1)
-					if err != nil {
-						return nil, err
-					}
-					continue
-				}
 				var err error
-				buf, err = appendAvroJSON(buf, reflect.ValueOf(val), f.node, cfg, customEncodes, depth+1)
+				if !exists {
+					buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, customEncodes, depth)
+				} else {
+					buf, err = appendAvroJSON(buf, reflect.ValueOf(val), f.node, cfg, customEncodes, depth+1)
+				}
 				if err != nil {
 					return nil, err
 				}
@@ -634,23 +633,12 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
 			val := v.MapIndex(mapKeyAs(v.Type(), f.nameVal))
-			if !val.IsValid() {
-				if !f.hasDefault {
-					return nil, fmt.Errorf("avro json: record %q missing required field %q", node.name, f.name)
-				}
-				if f.defaultVal == nil {
-					buf = append(buf, "null"...)
-					continue
-				}
-				var err error
-				buf, err = appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, customEncodes, depth+1)
-				if err != nil {
-					return nil, err
-				}
-				continue
-			}
 			var err error
-			buf, err = appendAvroJSON(buf, val, f.node, cfg, customEncodes, depth+1)
+			if !val.IsValid() {
+				buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, customEncodes, depth)
+			} else {
+				buf, err = appendAvroJSON(buf, val, f.node, cfg, customEncodes, depth+1)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -908,25 +896,13 @@ func findUnionBranch(union *schemaNode, name string) *schemaNode {
 	return match
 }
 
-// parseSpecialFloat parses the canonical Java/fastavro NaN/Infinity
-// string forms. Java's JsonDecoder accepts {"NaN", "Infinity", "INF",
-// "-Infinity", "-INF"} via exact-match (Schema.java:247-260's
-// isNaNString / isPositiveInfinityString / isNegativeInfinityString).
-// Python's json (fastavro's underlying parser) emits/accepts the
-// first three exactly. goavro doesn't accept any of these — it uses
-// `null`→NaN and `1e999`/-`1e999`→±Inf instead (handled separately).
-//
-// Pre-tightening, this accepted any casing via strings.EqualFold —
-// "nan", "NAN", "infinity", "iNf", etc. The lowercase first-letter
-// variants in particular created a dispatch ambiguity: a bare `n`
-// could start either `null` or the never-emitted `nan`, and the
-// union-arm dispatcher hard-coded `if p == 'n'` for null routing,
-// hijacking the lowercase form (F1 finding). Tightening to Java's
-// exact set eliminates the ambiguity at the source AND aligns with
-// the three reference impls (Java, fastavro, goavro) — all reject
-// lowercase. The "Inf" / "-Inf" mixed-case forms are accepted as
-// common Go-style alternates (Go's strconv.ParseFloat emits these
-// for IsInf-flagged float64s) but lowercase variants are not.
+// parseSpecialFloat parses NaN/Infinity string forms. Accepts the
+// Java/fastavro set {"NaN", "Infinity", "INF", "-Infinity", "-INF"}
+// plus Go-strconv-style "Inf"/"-Inf". Java/fastavro/goavro all reject
+// lowercase; the lowercase 'n' previously hijacked the JSON null
+// literal in the union dispatcher (F1 finding) so case-strict matters
+// here. The goavro null→NaN and ±1e999→±Inf conventions are handled
+// separately by the bare-token/number paths in decodeJSONFloat.
 func parseSpecialFloat(s string) (float64, error) {
 	switch s {
 	case "NaN":
@@ -939,6 +915,29 @@ func parseSpecialFloat(s string) (float64, error) {
 	return 0, fmt.Errorf("avro json: unknown float value %q", s)
 }
 
+// jsonEscapeShort returns the second byte of the 2-byte short JSON
+// escape for c (so '"' → '"', '\n' → 'n', etc.) or 0 if no short
+// escape applies. Shared by appendAvroJSONBytes and appendJSONString
+// so the two hot-path escape switches can't drift on the set of
+// short-form bytes the JSON spec defines.
+func jsonEscapeShort(c byte) byte {
+	switch c {
+	case '"', '\\':
+		return c
+	case '\b':
+		return 'b'
+	case '\t':
+		return 't'
+	case '\n':
+		return 'n'
+	case '\f':
+		return 'f'
+	case '\r':
+		return 'r'
+	}
+	return 0
+}
+
 // appendAvroJSONBytes encodes raw bytes as an Avro JSON string using
 // ISO-8859-1 encoding, matching the Java canonical implementation.
 // Printable ASCII bytes (0x20-0x7E, except " and \) are written as
@@ -946,27 +945,12 @@ func parseSpecialFloat(s string) (float64, error) {
 func appendAvroJSONBytes(buf []byte, b []byte) []byte {
 	buf = append(buf, '"')
 	for _, c := range b {
-		switch c {
-		case '"':
-			buf = append(buf, '\\', '"')
-		case '\\':
-			buf = append(buf, '\\', '\\')
-		case '\b':
-			buf = append(buf, '\\', 'b')
-		case '\t':
-			buf = append(buf, '\\', 't')
-		case '\n':
-			buf = append(buf, '\\', 'n')
-		case '\f':
-			buf = append(buf, '\\', 'f')
-		case '\r':
-			buf = append(buf, '\\', 'r')
-		default:
-			if c >= 0x20 && c <= 0x7E {
-				buf = append(buf, c)
-			} else {
-				buf = append(buf, '\\', 'u', '0', '0', jsonHex[c>>4], jsonHex[c&0xf])
-			}
+		if esc := jsonEscapeShort(c); esc != 0 {
+			buf = append(buf, '\\', esc)
+		} else if c >= 0x20 && c <= 0x7E {
+			buf = append(buf, c)
+		} else {
+			buf = append(buf, '\\', 'u', '0', '0', jsonHex[c>>4], jsonHex[c&0xf])
 		}
 	}
 	return append(buf, '"')
@@ -984,27 +968,12 @@ func appendJSONString(buf []byte, s string) []byte {
 		c := s[i]
 		if c < utf8.RuneSelf {
 			// ASCII fast path.
-			switch c {
-			case '"':
-				buf = append(buf, '\\', '"')
-			case '\\':
-				buf = append(buf, '\\', '\\')
-			case '\b':
-				buf = append(buf, '\\', 'b')
-			case '\t':
-				buf = append(buf, '\\', 't')
-			case '\n':
-				buf = append(buf, '\\', 'n')
-			case '\f':
-				buf = append(buf, '\\', 'f')
-			case '\r':
-				buf = append(buf, '\\', 'r')
-			default:
-				if c < 0x20 {
-					buf = append(buf, '\\', 'u', '0', '0', jsonHex[c>>4], jsonHex[c&0xf])
-				} else {
-					buf = append(buf, c)
-				}
+			if esc := jsonEscapeShort(c); esc != 0 {
+				buf = append(buf, '\\', esc)
+			} else if c < 0x20 {
+				buf = append(buf, '\\', 'u', '0', '0', jsonHex[c>>4], jsonHex[c&0xf])
+			} else {
+				buf = append(buf, c)
 			}
 			i++
 			continue

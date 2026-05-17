@@ -15,6 +15,36 @@ var (
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 )
 
+// reuseOrMakeStringAnyMap reuses v's existing map[string]any backing
+// when v is an interface wrapping one (the streaming-decode pattern
+// pinned by TestDecodeReuseAnyTargetStaleKeys); otherwise allocates a
+// fresh map sized to hint. Shared by deserRecord's interface arm and
+// decodeRecordAny so the two record-into-*any paths agree on reuse.
+//
+// Reuse retains keys not present in the schema (matches encoding/json
+// into a non-empty map). Callers that need a fresh decode should clear
+// or replace the map before each call.
+func reuseOrMakeStringAnyMap(v reflect.Value, hint int) map[string]any {
+	if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
+		return inner.Interface().(map[string]any)
+	}
+	return make(map[string]any, hint)
+}
+
+// tryTextUnmarshal calls (*v).UnmarshalText(b) when v is addressable
+// and its address implements [encoding.TextUnmarshaler]. Returns
+// (true, err) when invoked; (false, nil) when v can't accept the text.
+// Caller owns b — the helper does not copy. Shared by setStringValue
+// (binary deser of string), deserUUID (binary deser of UUID-as-string),
+// and decodeString (JSON deser of string) so all three sites agree on
+// the "addressable + implements" gate.
+func tryTextUnmarshal(v reflect.Value, b []byte) (bool, error) {
+	if !v.CanAddr() || !v.Addr().Type().Implements(textUnmarshalerType) {
+		return false, nil
+	}
+	return true, v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText(b)
+}
+
 var (
 	errIndirectNil  = errors.New("invalid nil in non-union, non-null")
 	errIndirectDeep = errors.New("avro: pointer/interface chain on input is cyclic or nests deeper than supported")

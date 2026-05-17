@@ -1,7 +1,6 @@
 package avro
 
 import (
-	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -333,7 +332,7 @@ func deserBoolean(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return src[1:], setIface(v, reflect.ValueOf(b), "boolean")
 	}
 	if v.Kind() != reflect.Bool {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+		return nil, semErr(v, "boolean")
 	}
 	v.SetBool(b)
 	return src[1:], nil
@@ -433,28 +432,16 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	k := v.Kind()
 	if k == reflect.Interface {
 		if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "record"}
+			return nil, semErr(v, "record")
 		}
-		// Reuse the existing map[string]any if v already wraps one.
-		// This is the streaming-decode pattern (OCF reader, batch
-		// consumer reusing &out across many records). We do this
-		// explicitly here rather than in indirectAlloc — unwrapping a
-		// non-nil interface there would break decoders that
-		// v.Set(...) on the result (decodeNull, decodeArray's typed
-		// branch, etc.) since the unwrapped Value isn't addressable.
-		// Here we only need SetMapIndex, which works on the
-		// non-addressable Map.
-		//
-		// Reuse retains keys not present in the schema (matches
-		// encoding/json into a non-empty map). Callers that need a
-		// fresh decode should clear or replace the map before each
-		// call. Pinned by TestDecodeReuseAnyTargetStaleKeys.
-		var m map[string]any
-		if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
-			m = inner.Interface().(map[string]any)
-		} else {
-			m = make(map[string]any, len(s.fields))
-		}
+		// Reuse the existing map[string]any if v already wraps one
+		// (streaming-decode pattern, OCF reader, batch consumer
+		// reusing &out). Done here rather than in indirectAlloc
+		// because the unwrapped non-addressable interface payload
+		// would break decoders that v.Set(...) on the result; here
+		// we only SetMapIndex, which works on the non-addressable
+		// Map. See [reuseOrMakeStringAnyMap].
+		m := reuseOrMakeStringAnyMap(v, len(s.fields))
 		var elem reflect.Value
 		var err error
 		for _, f := range s.fields {
@@ -543,7 +530,7 @@ func setEnumTarget(v reflect.Value, idx int, symbol string) error {
 		v.SetUint(uint64(idx))
 		return nil
 	}
-	return &SemanticError{GoType: v.Type(), AvroType: "enum"}
+	return semErr(v, "enum")
 }
 
 func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -797,7 +784,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	iface := v.Kind() == reflect.Interface
 	fixedArray := v.Kind() == reflect.Array
 	if !iface && !fixedArray && v.Kind() != reflect.Slice {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "array"}
+		return nil, semErr(v, "array")
 	}
 	// Fixed-size Go arrays: decode directly into array elements and
 	// verify the Avro data has exactly the right number of elements.
@@ -1148,10 +1135,7 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		// at the 2-byte minimum); without the cap the size hint would
 		// drive ~40x heap allocation per input byte for map[string]any.
 		if !mapVal.IsValid() {
-			hint := int(count)
-			if hint > maxMapPreAllocSize {
-				hint = maxMapPreAllocSize
-			}
+			hint := min(int(count), maxMapPreAllocSize)
 			mapVal = reflect.MakeMapWithSize(mapTyp, hint)
 			if !iface {
 				v.Set(mapVal)
@@ -1511,18 +1495,16 @@ func setStringValue(v reflect.Value, src []byte, n int, sl *slab) error {
 	}
 	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
 	// should use their text parsing, not raw byte assignment.
-	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
-		b := make([]byte, n)
-		copy(b, src[:n])
-		return v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText(b)
+	b := make([]byte, n)
+	copy(b, src[:n])
+	if ok, err := tryTextUnmarshal(v, b); ok {
+		return err
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		b := make([]byte, n)
-		copy(b, src[:n])
 		v.SetBytes(b)
 		return nil
 	}
-	return &SemanticError{GoType: v.Type(), AvroType: "string"}
+	return semErr(v, "string")
 }
 
 // setIntegerWire stores the wire integer into v, handling interface, int,
@@ -1859,19 +1841,8 @@ func parseBigDecimalPayload(payload []byte) (*big.Rat, int, error) {
 	if scale > decimalScaleLimit || scale < -decimalScaleLimit {
 		return nil, 0, fmt.Errorf("big-decimal scale %d exceeds %d limit", scale, decimalScaleLimit)
 	}
-	unscaled := bytesToBigInt(uBytes)
-	r := new(big.Rat).SetInt(unscaled)
-	if scale > 0 {
-		denom := new(big.Int).Exp(big.NewInt(10), big.NewInt(scale), nil)
-		r.Quo(r, new(big.Rat).SetInt(denom))
-	} else if scale < 0 {
-		mult := new(big.Int).Exp(big.NewInt(10), big.NewInt(-scale), nil)
-		r.Mul(r, new(big.Rat).SetInt(mult))
-	}
-	displayScale := int(scale)
-	if displayScale < 0 {
-		displayScale = 0
-	}
+	r := scaledRat(bytesToBigInt(uBytes), int(scale))
+	displayScale := max(int(scale), 0)
 	return r, displayScale, nil
 }
 
@@ -1909,7 +1880,6 @@ func RatFromBytes(b []byte, scale int) *big.Rat {
 }
 
 func bytesToRat(b []byte, scale int) *big.Rat {
-	unscaled := bytesToBigInt(b)
 	if scale > decimalScaleLimit || scale < -decimalScaleLimit {
 		// Public-API safety: bound the public RatFromBytes surface
 		// against attacker-controlled scale. Internal callers pass
@@ -1918,12 +1888,7 @@ func bytesToRat(b []byte, scale int) *big.Rat {
 		// RatFromBytes use with hostile input.
 		return new(big.Rat)
 	}
-	if scale < 0 {
-		mult := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-scale)), nil)
-		return new(big.Rat).SetFrac(new(big.Int).Mul(unscaled, mult), big.NewInt(1))
-	}
-	s := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
-	return new(big.Rat).SetFrac(unscaled, s)
+	return scaledRat(bytesToBigInt(b), scale)
 }
 
 // bytesToBigInt decodes big-endian two's complement bytes into a *big.Int.
@@ -1996,10 +1961,10 @@ func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		v.SetString(sl.string(src, n))
 		return src[n:], nil
 	}
-	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
-		b := make([]byte, n)
-		copy(b, src[:n])
-		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText(b); err != nil {
+	b := make([]byte, n)
+	copy(b, src[:n])
+	if ok, err := tryTextUnmarshal(v, b); ok {
+		if err != nil {
 			return nil, err
 		}
 		return src[n:], nil
@@ -2010,10 +1975,8 @@ func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	// side needs the symmetric Slice byte arm for round-trip parity.
 	// TextUnmarshaler is checked first per deserString's precedence.
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		b := make([]byte, n)
-		copy(b, src[:n])
 		v.SetBytes(b)
 		return src[n:], nil
 	}
-	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
+	return nil, semErr(v, "string")
 }

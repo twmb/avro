@@ -755,21 +755,15 @@ var (
 )
 
 func usDuration(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-	d := *(*Duration)(p)
-	dst = appendUint32(dst, d.Months)
-	dst = appendUint32(dst, d.Days)
-	dst = appendUint32(dst, d.Milliseconds)
-	return dst, nil
+	b := (*(*Duration)(p)).Bytes()
+	return append(dst, b[:]...), nil
 }
 
 func udDuration(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	if len(src) < 12 {
 		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
 	}
-	d := (*Duration)(p)
-	d.Months = uint32(src[0]) | uint32(src[1])<<8 | uint32(src[2])<<16 | uint32(src[3])<<24
-	d.Days = uint32(src[4]) | uint32(src[5])<<8 | uint32(src[6])<<16 | uint32(src[7])<<24
-	d.Milliseconds = uint32(src[8]) | uint32(src[9])<<8 | uint32(src[10])<<16 | uint32(src[11])<<24
+	*(*Duration)(p) = DurationFromBytes(src[:12])
 	return src[12:], nil
 }
 

@@ -279,7 +279,7 @@ func (s *aschema) UnmarshalJSON(data []byte) error {
 		// so keys like "tYpe" parse into Type and should not also land
 		// in extras.
 		for k := range raw {
-			if aobjectKnownKeyInsensitive(k) {
+			if schemaReservedKeyCI(k) {
 				continue
 			}
 			if s.object.extra == nil {
@@ -693,26 +693,6 @@ func (o aobject) MarshalJSON() ([]byte, error) {
 	}
 	buf.WriteByte('}')
 	return buf.Bytes(), nil
-}
-
-var aobjectKnownKeys = map[string]bool{
-	"type": true, "name": true, "namespace": true, "doc": true,
-	"fields": true, "symbols": true, "items": true, "values": true,
-	"size": true, "logicalType": true, "precision": true, "scale": true,
-	"aliases": true, "default": true, "order": true,
-}
-
-// aobjectKnownKeyInsensitive reports whether k is a known schema key,
-// matching case-insensitively to mirror encoding/json's struct field
-// matching. This keeps lenient decoders from double-parsing a field
-// (once as a struct field, again as an extra prop).
-func aobjectKnownKeyInsensitive(k string) bool {
-	for known := range aobjectKnownKeys {
-		if strings.EqualFold(k, known) {
-			return true
-		}
-	}
-	return false
 }
 
 // validName reports whether s matches [A-Za-z_][A-Za-z0-9_]*.
@@ -2595,39 +2575,24 @@ func defaultAsFloat(val any, bitSize int) (float64, error) {
 	return 0, fmt.Errorf("expected number, got %T", val)
 }
 
-// coerceDefault converts string default values to the expected type when
-// the field's type is literally float or double, matching Java's
-// Schema.parseField (Schema.java:1900-1902): the string→DoubleNode
-// coercion is gated on Type.FLOAT.equals(...) || Type.DOUBLE.equals(...).
-// Union-typed fields are NOT coerced at parse time — Java leaves the
-// TextNode in place and lets the default flow through to the union's
-// per-branch dispatch, where the first branch with isCompatible wins.
-// We mirror that: union defaults pass through unchanged so a textual
-// default into ["string","float"] picks the string branch (matches
-// Java, fastavro, hamba). The float branch's defaultAsFloat has its
-// own string-fallback for the `{"type":"float","default":"3.14"}`
-// non-union case, kept here.
-//
-// Walks *schemaNode so that nested float fields reached through a name-
-// reference are coerced too — the prior aschema-canon walker silently
-// dropped name-refs (canon=aschema{primitive:<Name>}), leaving nested
-// string defaults uncoerced and breaking JSON encode's
-// jsonCoerceToFloat64 which rejects string inputs at default-fill time.
+// coerceDefault converts string default values to the float/double
+// target type when the field type is literally float or double,
+// matching Java's Schema.parseField. Union defaults pass through
+// unchanged: Java/fastavro/hamba defer the textual→typed coercion to
+// the union's per-branch dispatch, where the first compatible branch
+// wins. Walks *schemaNode so name-referenced nested fields coerce too
+// (the resolved type tree, not the canon — name-refs lose type info on
+// the canon side).
 func coerceDefault(val any, node *schemaNode) any {
 	if node == nil {
 		return val
 	}
 	if node.kind == "union" {
-		// Mirror convertDefaultBytes's union-case branch matcher:
-		// the first branch validateDefault accepts is the one this
-		// default resolves to, and we recurse so the coerced value
-		// matches the picked branch's natural Go type. Without this,
-		// a `["float","null"]` default of `"1.5"` stays as a Go
-		// string and the JSON encoder's union try-each-branch loop
-		// hits jsonCoerceToFloat64 (which rejects strings); the
-		// binary encoder meanwhile coerces via defaultAsFloat's
-		// string fallback and picks the float branch — a silent
-		// binary/JSON divergence on `["float","string"]` unions.
+		// First branch validateDefault accepts wins; recurse so the
+		// coerced value matches that branch's natural Go type.
+		// Without recursion, ["float","null"] with default "1.5"
+		// stays a string and the JSON encoder rejects it while
+		// binary's defaultAsFloat coerces — binary/JSON divergence.
 		for _, branch := range node.branches {
 			if validateDefault(val, branch) == nil {
 				return coerceDefault(val, branch)

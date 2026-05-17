@@ -1,7 +1,6 @@
 package avro
 
 import (
-	"encoding"
 	"errors"
 	"fmt"
 	"math"
@@ -243,7 +242,7 @@ func (ctx *jsonDecoder) decodeBool(v reflect.Value, toAny bool) error {
 		v.SetBool(b)
 		return nil
 	}
-	return &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+	return semErr(v, "boolean")
 }
 
 func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool) error {
@@ -483,19 +482,16 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny bo
 	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
 	// should use their text parsing, not raw byte assignment. Mirrors
 	// deserString's order so binary and JSON decoders agree on which
-	// Go target types accept Avro string.
-	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
-		// s borrows the slab; allocate fresh storage for the callee.
-		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(s)); err != nil {
-			return err
-		}
-		return nil
+	// Go target types accept Avro string. []byte(s) allocates fresh
+	// storage so the callee may retain.
+	if ok, err := tryTextUnmarshal(v, []byte(s)); ok {
+		return err
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		v.SetBytes([]byte(s))
 		return nil
 	}
-	return &SemanticError{GoType: v.Type(), AvroType: "string"}
+	return semErr(v, "string")
 }
 
 func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode) error {
@@ -710,7 +706,7 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 	}
 	// Typed slice target.
 	if v.Kind() != reflect.Slice {
-		return &SemanticError{GoType: v.Type(), AvroType: "array"}
+		return semErr(v, "array")
 	}
 	v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 	if ctx.scanner.peek() != ']' {
@@ -765,7 +761,7 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 	}
 	// Typed map target.
 	if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
-		return &SemanticError{GoType: v.Type(), AvroType: "map"}
+		return semErr(v, "map")
 	}
 	if v.IsNil() {
 		v.Set(reflect.MakeMap(v.Type()))
@@ -813,7 +809,7 @@ func (ctx *jsonDecoder) decodeRecord(v reflect.Value, node *schemaNode, toAny bo
 	if v.Kind() == reflect.Struct {
 		return ctx.decodeRecordStruct(v, node)
 	}
-	return &SemanticError{GoType: v.Type(), AvroType: "record"}
+	return semErr(v, "record")
 }
 
 // iterateRecordFields drives the JSON object field loop for records:
@@ -882,19 +878,12 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 	// iterating each field, allocating a map, and decoding values
 	// only to throw them away on assignment.
 	if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
-		return &SemanticError{GoType: v.Type(), AvroType: "record"}
+		return semErr(v, "record")
 	}
 	// Reuse the existing map[string]any if v already wraps one — the
 	// streaming pattern (DecodeJSON repeatedly into the same *any).
-	// Mirrors the equivalent reuse in deserRecord for binary decode,
-	// including the same stale-key semantics: keys not present in the
-	// schema are retained (matches encoding/json into a non-empty map).
-	var m map[string]any
-	if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
-		m = inner.Interface().(map[string]any)
-	} else {
-		m = make(map[string]any, len(node.fields))
-	}
+	// See [reuseOrMakeStringAnyMap].
+	m := reuseOrMakeStringAnyMap(v, len(node.fields))
 	var val any
 	valV := reflect.ValueOf(&val).Elem()
 	err := ctx.iterateRecordFields(node,
