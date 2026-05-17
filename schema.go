@@ -902,13 +902,13 @@ func (b *builder) hasCustomTypeWired() bool {
 // fast paths. Indexed by the canonical primitive name; missing entries
 // fall back to the generic (function-pointer) per-element path.
 type primFastInfo struct {
-	elemKind             reflect.Kind
-	serArrayFn           func(*serArray) serfn
-	serMapFn             func(*serMap) serfn
-	deserArrayLoop       func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error)
-	deserArrayIfaceLoop  func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error)
-	deserMapBlock        func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
-	deserMapIfaceVal     deserIfaceFn
+	elemKind            reflect.Kind
+	serArrayFn          func(*serArray) serfn
+	serMapFn            func(*serMap) serfn
+	deserArrayLoop      func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error)
+	deserArrayIfaceLoop func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error)
+	deserMapBlock       func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
+	deserMapIfaceVal    deserIfaceFn
 }
 
 var primFast = map[string]primFastInfo{
@@ -2925,4 +2925,3 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 	}
 	return val, nil
 }
-

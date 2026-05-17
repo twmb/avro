@@ -296,7 +296,6 @@ func kindsMatchTier(r, w *schemaNode) matchTier {
 	return matchNone
 }
 
-
 func pathOrRoot(path string) string {
 	if path == "" {
 		return "(root)"

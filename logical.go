@@ -209,4 +209,3 @@ func timeOfDay(t time.Time) time.Duration {
 		time.Duration(t.Second())*time.Second +
 		time.Duration(t.Nanosecond())
 }
-

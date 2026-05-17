@@ -510,11 +510,11 @@ func TestSplitTag(t *testing.T) {
 
 	// Unclosed and mismatched delimiters should error.
 	for _, tag := range []string{
-		"name,alias=[a,b",       // unclosed [
-		"name,decimal(10,2",     // unclosed (
-		"name,alias=[a,b)",      // [ closed by )
-		"name,decimal(10,2]",    // ( closed by ]
-		"name,alias=[a)b]",      // ) inside [ context
+		"name,alias=[a,b",    // unclosed [
+		"name,decimal(10,2",  // unclosed (
+		"name,alias=[a,b)",   // [ closed by )
+		"name,decimal(10,2]", // ( closed by ]
+		"name,alias=[a)b]",   // ) inside [ context
 	} {
 		if _, err := splitTag(tag); err == nil {
 			t.Errorf("splitTag(%q) expected error for bad delimiters", tag)
@@ -1822,7 +1822,6 @@ func TestSchemaForErrors(t *testing.T) {
 			t.Fatal("expected error")
 		}
 	})
-
 
 	t.Run("embedded bad tag", func(t *testing.T) {
 		type R struct {

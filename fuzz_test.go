@@ -1057,6 +1057,7 @@ func FuzzResolve(f *testing.F) {
 //   - panics when decoding into a struct with non-empty-interface fields
 //   - panics on re-decode into a populated *any (the inner unwraps to
 //     unaddressable Value)
+//
 // The driver's `mode` byte selects the target shape; data bytes are the
 // wire input. All schemas come from fuzzSchemas. No panic is ever
 // expected — every target/data combo must surface as a returned error.
@@ -1458,9 +1459,9 @@ func FuzzTimeDateEdgeCases(f *testing.F) {
 	f.Add(uint8(0), int64(1<<62))           // overflow risk
 	f.Add(uint8(0), int64(-1<<62))
 	f.Add(uint8(2), int64(1))
-	f.Add(uint8(3), int64(0))   // epoch
-	f.Add(uint8(3), int64(-1))  // pre-epoch date
-	f.Add(uint8(4), int64(0))   // midnight
+	f.Add(uint8(3), int64(0))  // epoch
+	f.Add(uint8(3), int64(-1)) // pre-epoch date
+	f.Add(uint8(4), int64(0))  // midnight
 	f.Add(uint8(4), int64(86400000))
 	f.Add(uint8(5), int64(86400000000))
 
@@ -1594,7 +1595,9 @@ func FuzzDepthBounds(f *testing.F) {
 				src = append(src, 0, 0x02)
 			}
 			src = append(src, 0)
-			type rR struct{ Value int32 `avro:"value"` }
+			type rR struct {
+				Value int32 `avro:"value"`
+			}
 			var rv rR
 			resolved.Decode(src, &rv)
 		case 3:
@@ -2421,7 +2424,6 @@ func branchTagFor(n SchemaNode) string {
 		return n.Type
 	}
 }
-
 
 // FuzzDecodeUnionObjectDeep stresses the depth-tracked recursive
 // descent through decodeUnionObject / decodeUnionBare with cyclic

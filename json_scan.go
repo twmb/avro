@@ -438,7 +438,6 @@ func resolveJSONEscapes(raw []byte) (string, error) {
 	return string(buf), nil
 }
 
-
 // scanAvroJSONBytes resolves a raw JSON string content into Avro bytes.
 // In Avro's convention, each code point maps to a single byte (≤ 255).
 func scanAvroJSONBytes(raw []byte) ([]byte, error) {

@@ -2226,9 +2226,9 @@ func TestAppendJSONStringEscaping(t *testing.T) {
 		{"a\\b", `"a\\b"`},
 		{"a\nb", `"a\nb"`},
 		{"a\x00b", `"a\u0000b"`},
-		{"日本語", `"日本語"`},                               // multi-byte UTF-8 passed through
-		{"a\u2028b", `"a\u2028b"`},                     // U+2028 escaped
-		{"a\u2029b", `"a\u2029b"`},                     // U+2029 escaped
+		{"日本語", `"日本語"`},           // multi-byte UTF-8 passed through
+		{"a\u2028b", `"a\u2028b"`}, // U+2028 escaped
+		{"a\u2029b", `"a\u2029b"`}, // U+2029 escaped
 		// Invalid UTF-8 bytes are replaced with U+FFFD encoded as raw
 		// UTF-8 (efbfbd), not as the literal `\ufffd` escape. Using raw
 		// UTF-8 makes encode idempotent: a re-decode of an actual U+FFFD

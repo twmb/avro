@@ -11995,13 +11995,13 @@ func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
 // The matrix covers both directions of parity (reject and accept) at
 // the four sites that route through serNull's kind-switch:
 //
-//   1. Top-level "null" schema (Schema.Encode / Schema.EncodeJSON).
-//   2. Null-typed record field — value goes through f.fn = serNull.
-//   3. Tagged-union null branch in a 3+ branch union — inner from
-//      tryUnwrapTagged is wrapped in Interface kind, not the 2-branch
-//      fast path.
-//   4. array<null> items (serArray.serItem = serNull) and map<null>
-//      values (similar).
+//  1. Top-level "null" schema (Schema.Encode / Schema.EncodeJSON).
+//  2. Null-typed record field — value goes through f.fn = serNull.
+//  3. Tagged-union null branch in a 3+ branch union — inner from
+//     tryUnwrapTagged is wrapped in Interface kind, not the 2-branch
+//     fast path.
+//  4. array<null> items (serArray.serItem = serNull) and map<null>
+//     values (similar).
 //
 // Cross-impl note: Java/fastavro are silently lenient on both binary
 // and JSON (GenericDatumWriter.NULL writes the marker without checking
@@ -13222,7 +13222,7 @@ func TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames(t *testing.T) {
 // fix — the unsafe sibling was missed.
 func TestRegression_UnsafeArrayDirectFloatBoundDivergence(t *testing.T) {
 	bin := []byte{
-		0x0c, // varlong zigzag(6) = 12
+		0x0c,                                                       // varlong zigzag(6) = 12
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 5 floats (20 bytes)
 		0x00, // terminator
 	}

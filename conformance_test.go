@@ -6170,10 +6170,10 @@ func TestRegression_DefaultFloatIntegerOverflowPrecisionLoss(t *testing.T) {
 		// keeps the precision-strict int-form branch from intercepting
 		// these: ParseFloat handles them at its inherent float-precision
 		// without claiming exact-integer semantics.
-		{"double_string_hex_float", "double", `"0x1p10"`},  // 1024
-		{"float_string_exp_form", "float", `"1.5e5"`},      // 150000, fits float32
-		{"double_string_special_inf", "double", `"Inf"`},   // ParseFloat accepts "Inf"
-		{"double_string_special_nan", "double", `"NaN"`},   // ParseFloat accepts "NaN"
+		{"double_string_hex_float", "double", `"0x1p10"`}, // 1024
+		{"float_string_exp_form", "float", `"1.5e5"`},     // 150000, fits float32
+		{"double_string_special_inf", "double", `"Inf"`},  // ParseFloat accepts "Inf"
+		{"double_string_special_nan", "double", `"NaN"`},  // ParseFloat accepts "NaN"
 	}
 	for _, tc := range accepts {
 		t.Run(tc.name+"/accept", func(t *testing.T) {
@@ -11028,10 +11028,10 @@ func TestRegression_SchemaCacheCustomTypeRefRejected(t *testing.T) {
 // logical types; the existing matrix only covered primitive defaults.
 func TestRegression_LogicalTypedDefaults(t *testing.T) {
 	type cell struct {
-		name      string
-		schema    string
-		input     any // map missing the field-with-default
-		check     func(t *testing.T, decoded map[string]any)
+		name   string
+		schema string
+		input  any // map missing the field-with-default
+		check  func(t *testing.T, decoded map[string]any)
 	}
 	cells := []cell{
 		{
@@ -11260,10 +11260,10 @@ func TestRegression_SingleObjectRoundTrip(t *testing.T) {
 // fixed, enum, decimal-bytes, and time-logical.
 func TestRegression_DefaultValueMaterializationParity(t *testing.T) {
 	cases := []struct {
-		name      string
-		schema    string
-		input     any // missing the field with the default
-		assertEq  func(t *testing.T, binDecoded, jsonDecoded any)
+		name     string
+		schema   string
+		input    any // missing the field with the default
+		assertEq func(t *testing.T, binDecoded, jsonDecoded any)
 	}{
 		{
 			name:   "int default",
@@ -11474,12 +11474,12 @@ func TestRegression_TaggedUnionLogicalDisambiguation(t *testing.T) {
 func TestRegression_PromotionTargetSetMatchesNatural(t *testing.T) {
 	type cell struct {
 		name      string
-		writer    string                                              // writer schema (the wire's encoded type)
-		reader    string                                              // reader schema (the promotion target type)
-		encode    func() any                                          // value to encode against writer
-		makeDest  func() any                                          // pointer-to-struct with field "X" of the target type
-		checkDest func(t *testing.T, dest any)                        // optional post-decode value assertion
-		decodeErr string                                              // if non-empty, decode is expected to fail with this substring
+		writer    string                       // writer schema (the wire's encoded type)
+		reader    string                       // reader schema (the promotion target type)
+		encode    func() any                   // value to encode against writer
+		makeDest  func() any                   // pointer-to-struct with field "X" of the target type
+		checkDest func(t *testing.T, dest any) // optional post-decode value assertion
+		decodeErr string                       // if non-empty, decode is expected to fail with this substring
 	}
 	// Each cell encodes against writer, resolves writer→reader, then
 	// decodes into a record whose field X has the target Go type.
@@ -11491,69 +11491,181 @@ func TestRegression_PromotionTargetSetMatchesNatural(t *testing.T) {
 	cells := []cell{
 		// ── int → float ─────────────────────────────────────────────
 		{name: "int→float / float32", writer: "int", reader: "float", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X float32 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X float32 `avro:"x"`
+				}{}
+			}},
 		{name: "int→float / float64", writer: "int", reader: "float", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X float64 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X float64 `avro:"x"`
+				}{}
+			}},
 		{name: "int→float / int32 (whole-number lenient)", writer: "int", reader: "float", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X int32 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X int32 `avro:"x"`
+				}{}
+			}},
 		{name: "int→float / int64 lenient", writer: "int", reader: "float", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X int64 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X int64 `avro:"x"`
+				}{}
+			}},
 		{name: "int→float / uint32 lenient", writer: "int", reader: "float", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X uint32 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X uint32 `avro:"x"`
+				}{}
+			}},
 		{name: "int→float / json.Number", writer: "int", reader: "float", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X json.Number `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X json.Number `avro:"x"`
+				}{}
+			}},
 		// ── int → double ────────────────────────────────────────────
 		{name: "int→double / float64", writer: "int", reader: "double", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X float64 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X float64 `avro:"x"`
+				}{}
+			}},
 		{name: "int→double / int32 lenient", writer: "int", reader: "double", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X int32 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X int32 `avro:"x"`
+				}{}
+			}},
 		{name: "int→double / json.Number", writer: "int", reader: "double", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X json.Number `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X json.Number `avro:"x"`
+				}{}
+			}},
 		// ── long → float ────────────────────────────────────────────
 		{name: "long→float / float32", writer: "long", reader: "float", encode: func() any { return map[string]any{"x": int64(42)} },
-			makeDest: func() any { return &struct{ X float32 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X float32 `avro:"x"`
+				}{}
+			}},
 		{name: "long→float / int32 lenient", writer: "long", reader: "float", encode: func() any { return map[string]any{"x": int64(42)} },
-			makeDest: func() any { return &struct{ X int32 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X int32 `avro:"x"`
+				}{}
+			}},
 		{name: "long→float / json.Number", writer: "long", reader: "float", encode: func() any { return map[string]any{"x": int64(42)} },
-			makeDest: func() any { return &struct{ X json.Number `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X json.Number `avro:"x"`
+				}{}
+			}},
 		// ── long → double ───────────────────────────────────────────
 		{name: "long→double / float64", writer: "long", reader: "double", encode: func() any { return map[string]any{"x": int64(42)} },
-			makeDest: func() any { return &struct{ X float64 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X float64 `avro:"x"`
+				}{}
+			}},
 		{name: "long→double / int64 lenient", writer: "long", reader: "double", encode: func() any { return map[string]any{"x": int64(42)} },
-			makeDest: func() any { return &struct{ X int64 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X int64 `avro:"x"`
+				}{}
+			}},
 		{name: "long→double / uint64 lenient", writer: "long", reader: "double", encode: func() any { return map[string]any{"x": int64(42)} },
-			makeDest: func() any { return &struct{ X uint64 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X uint64 `avro:"x"`
+				}{}
+			}},
 		{name: "long→double / json.Number", writer: "long", reader: "double", encode: func() any { return map[string]any{"x": int64(42)} },
-			makeDest: func() any { return &struct{ X json.Number `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X json.Number `avro:"x"`
+				}{}
+			}},
 		// ── float → double ──────────────────────────────────────────
 		{name: "float→double / float64", writer: "float", reader: "double", encode: func() any { return map[string]any{"x": float32(42)} },
-			makeDest: func() any { return &struct{ X float64 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X float64 `avro:"x"`
+				}{}
+			}},
 		{name: "float→double / float32 (target == source width)", writer: "float", reader: "double", encode: func() any { return map[string]any{"x": float32(42)} },
-			makeDest: func() any { return &struct{ X float32 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X float32 `avro:"x"`
+				}{}
+			}},
 		{name: "float→double / int32 (whole-number lenient)", writer: "float", reader: "double", encode: func() any { return map[string]any{"x": float32(42)} },
-			makeDest: func() any { return &struct{ X int32 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X int32 `avro:"x"`
+				}{}
+			}},
 		{name: "float→double / int64 lenient", writer: "float", reader: "double", encode: func() any { return map[string]any{"x": float32(42)} },
-			makeDest: func() any { return &struct{ X int64 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X int64 `avro:"x"`
+				}{}
+			}},
 		{name: "float→double / json.Number", writer: "float", reader: "double", encode: func() any { return map[string]any{"x": float32(42)} },
-			makeDest: func() any { return &struct{ X json.Number `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X json.Number `avro:"x"`
+				}{}
+			}},
 		// ── string → bytes ──────────────────────────────────────────
 		{name: "string→bytes / []byte", writer: "string", reader: "bytes", encode: func() any { return map[string]any{"x": "hello"} },
-			makeDest: func() any { return &struct{ X []byte `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X []byte `avro:"x"`
+				}{}
+			}},
 		{name: "string→bytes / [N]byte array (length-matched)", writer: "string", reader: "bytes", encode: func() any { return map[string]any{"x": "hello"} },
-			makeDest: func() any { return &struct{ X [5]byte `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X [5]byte `avro:"x"`
+				}{}
+			}},
 		{name: "string→bytes / string", writer: "string", reader: "bytes", encode: func() any { return map[string]any{"x": "hello"} },
-			makeDest: func() any { return &struct{ X string `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X string `avro:"x"`
+				}{}
+			}},
 		// ── bytes → string ──────────────────────────────────────────
 		{name: "bytes→string / string", writer: "bytes", reader: "string", encode: func() any { return map[string]any{"x": []byte("hello")} },
-			makeDest: func() any { return &struct{ X string `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X string `avro:"x"`
+				}{}
+			}},
 		{name: "bytes→string / []byte", writer: "bytes", reader: "string", encode: func() any { return map[string]any{"x": []byte("hello")} },
-			makeDest: func() any { return &struct{ X []byte `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X []byte `avro:"x"`
+				}{}
+			}},
 		// ── int → long (no Go-target divergence between long types
 		//    and integer targets; small witness cell) ────────────────
 		{name: "int→long / int64", writer: "int", reader: "long", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X int64 `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X int64 `avro:"x"`
+				}{}
+			}},
 		{name: "int→long / json.Number", writer: "int", reader: "long", encode: func() any { return map[string]any{"x": int32(42)} },
-			makeDest: func() any { return &struct{ X json.Number `avro:"x"` }{} }},
+			makeDest: func() any {
+				return &struct {
+					X json.Number `avro:"x"`
+				}{}
+			}},
 	}
 	for _, c := range cells {
 		t.Run(c.name, func(t *testing.T) {
@@ -13406,8 +13518,8 @@ func TestParity_RoundTripMatrix(t *testing.T) {
 	tsMillis := time.Date(2024, 6, 15, 12, 34, 56, 123_000_000, time.UTC)
 	tsMicros := time.Date(2024, 6, 15, 12, 34, 56, 123_456_000, time.UTC)
 	dateOnly := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC)
-	timeOfDay := time.Duration(45_296_000) * time.Millisecond                  // 12:34:56
-	timeOfDayMicros := time.Duration(45_296_000_123) * time.Microsecond        // 12:34:56.000123
+	timeOfDay := time.Duration(45_296_000) * time.Millisecond           // 12:34:56
+	timeOfDayMicros := time.Duration(45_296_000_123) * time.Microsecond // 12:34:56.000123
 	dur := avro.Duration{Months: 1, Days: 2, Milliseconds: 3}
 
 	cells := []cell{
@@ -14399,7 +14511,7 @@ func TestRegression_UnionDispatchMatrix(t *testing.T) {
 		{`["null","bytes","string"]`, []byte("hello"), expect{"bytes", false}, "[]byte to bytes via type-name"},
 		{`["null","bytes","string"]`, "hello", expect{"string", false}, "string to string via type-name"},
 		{`["null","string","bytes"]`, "hello", expect{"string", false}, "string-first union picks string"},
-		{`["null","string","bytes"]`, []byte("hello"), expect{"bytes", false, /* type-name */}, "[]byte type-name to bytes"},
+		{`["null","string","bytes"]`, []byte("hello"), expect{"bytes", false /* type-name */}, "[]byte type-name to bytes"},
 
 		// ---- Bool dispatch. ----
 		{`["null","boolean","string"]`, true, expect{"boolean", false}, "bool to boolean"},
@@ -14917,9 +15029,9 @@ func TestRegression_DefaultFillMatrix(t *testing.T) {
 // requirement (commit history shows this was fixed in earlier rounds).
 func TestRegression_DefaultFillLogicalTypes(t *testing.T) {
 	cases := []struct {
-		field       string
-		jsonExpect  string // JSON wire form of the default-filled value
-		desc        string
+		field      string
+		jsonExpect string // JSON wire form of the default-filled value
+		desc       string
 	}{
 		// date default (epoch days).
 		{`{"name":"x","type":{"type":"int","logicalType":"date"},"default":0}`, `"x":"1970-01-01"`, "date default"},

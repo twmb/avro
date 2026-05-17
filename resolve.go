@@ -672,7 +672,6 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 	}, nil
 }
 
-
 func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 	switch node.kind {
 	case "null":

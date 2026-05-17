@@ -30,7 +30,6 @@ const maxDepth = 1000
 
 var errTooDeep = errors.New("avro: recursion limit exceeded (cyclic or pathologically deep input)")
 
-
 // AppendEncode appends the Avro binary encoding of v to dst. See
 // [Schema.Decode] for the Go-to-Avro type mapping. In addition to the types
 // listed there, encoding also accepts:

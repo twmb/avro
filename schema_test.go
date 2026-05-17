@@ -1748,9 +1748,9 @@ func TestFieldLevelLogicalType_RoundTripValue(t *testing.T) {
 	)
 
 	cases := []struct {
-		name    string
-		schema  string
-		want    time.Time
+		name   string
+		schema string
+		want   time.Time
 	}{
 		{
 			"primitive timestamp-millis",
@@ -2004,9 +2004,9 @@ func TestFieldLevelLogicalType_CanonicalDoesNotDuplicate(t *testing.T) {
 // schema.
 func TestFieldLevelLogicalType_FingerprintsMatch(t *testing.T) {
 	cases := []struct {
-		name        string
-		flat        string
-		nested      string
+		name   string
+		flat   string
+		nested string
 	}{
 		{
 			"primitive timestamp-millis",

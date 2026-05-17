@@ -293,7 +293,6 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 	return m
 }
 
-
 // nodeFromJSON converts a parsed JSON value into a SchemaNode.
 func nodeFromJSON(v any) SchemaNode {
 	switch s := v.(type) {
