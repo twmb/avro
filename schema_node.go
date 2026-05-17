@@ -3,7 +3,7 @@ package avro
 import (
 	"encoding/json"
 	"fmt"
-	"maps"
+	"math"
 	"strings"
 )
 
@@ -130,6 +130,88 @@ func (s *Schema) Root() SchemaNode {
 // definition; subsequent occurrences emit the name as a reference.
 func (n *SchemaNode) toJSONDedup(d *deduper) any {
 	return n.toJSONWalk(d.visited, d)
+}
+
+// jsonSerializableValue returns v with any ±Inf float embedded inside
+// (directly or under map[string]any / []any container layers) replaced
+// by a [json.Number] literal that re-parses to the same value via
+// [parseFloatAcceptOverflow] (schema.go) — the inverse of
+// normalizeJSONNumber's ErrRange-with-Inf accept. Required because
+// [encoding/json.Marshal] unconditionally rejects ±Inf and NaN, so a
+// SchemaNode obtained from [Schema.Root] for a schema whose Default /
+// Props normalized an exponent-form overflow to ±Inf cannot otherwise
+// round-trip through [SchemaNode.Schema].
+//
+// Container values (map[string]any, []any) are deep-copied only when a
+// descendant requires conversion, so the common no-Inf case is
+// allocation-free and the user's SchemaNode storage is never mutated.
+//
+// NaN is intentionally left untouched: no JSON literal re-parses to NaN,
+// so json.Marshal's UnsupportedValueError is the honest answer. Users
+// who put NaN in Default/Props must convert to the string-form "NaN"
+// themselves (defaultAsFloat accepts the string-form for float/double
+// fields).
+func jsonSerializableValue(v any) any {
+	if !needsInfFixup(v) {
+		return v
+	}
+	return convertInfToJSONNumber(v)
+}
+
+func needsInfFixup(v any) bool {
+	switch tv := v.(type) {
+	case float64:
+		return math.IsInf(tv, 0)
+	case float32:
+		return math.IsInf(float64(tv), 0)
+	case map[string]any:
+		for _, val := range tv {
+			if needsInfFixup(val) {
+				return true
+			}
+		}
+	case []any:
+		for _, val := range tv {
+			if needsInfFixup(val) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func convertInfToJSONNumber(v any) any {
+	switch tv := v.(type) {
+	case float64:
+		if math.IsInf(tv, 1) {
+			return json.Number("1e1000")
+		}
+		if math.IsInf(tv, -1) {
+			return json.Number("-1e1000")
+		}
+		return tv
+	case float32:
+		if math.IsInf(float64(tv), 1) {
+			return json.Number("1e1000")
+		}
+		if math.IsInf(float64(tv), -1) {
+			return json.Number("-1e1000")
+		}
+		return tv
+	case map[string]any:
+		out := make(map[string]any, len(tv))
+		for k, val := range tv {
+			out[k] = convertInfToJSONNumber(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(tv))
+		for i, val := range tv {
+			out[i] = convertInfToJSONNumber(val)
+		}
+		return out
+	}
+	return v
 }
 
 // toJSON converts a SchemaNode to a JSON-serializable representation.
@@ -273,7 +355,12 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 				"type": f.Type.toJSONWalk(visited, d),
 			}
 			if f.HasDefault || f.Default != nil {
-				fd["default"] = f.Default
+				// jsonSerializableValue converts ±Inf — which a Root()
+				// of "default":1e1000 normalizes to via normalizeJSONNumber
+				// → parseFloatAcceptOverflow — back to a json.Number
+				// literal so encoding/json.Marshal at SchemaNode.Schema()
+				// doesn't fail. Inverse of the metadata-API normalization.
+				fd["default"] = jsonSerializableValue(f.Default)
 			}
 			if len(f.Aliases) > 0 {
 				fd["aliases"] = f.Aliases
@@ -284,12 +371,16 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 			if f.Doc != "" {
 				fd["doc"] = f.Doc
 			}
-			maps.Copy(fd, f.Props)
+			for k, v := range f.Props {
+				fd[k] = jsonSerializableValue(v)
+			}
 			fields[i] = fd
 		}
 		m["fields"] = fields
 	}
-	maps.Copy(m, n.Props)
+	for k, v := range n.Props {
+		m[k] = jsonSerializableValue(v)
+	}
 	return m
 }
 

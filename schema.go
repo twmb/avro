@@ -2408,11 +2408,22 @@ func normalizeJSONValue(v any) any {
 // idiomatic Go type: int64 for integer-valued literals (no '.', 'e', 'E')
 // that fit in int64; json.Number for integers that overflow int64 (rare,
 // keeps arbitrary precision); float64 for fractional / exponent-form
-// literals. Whole-number JSON literals like "18" — which would round-trip
-// from a Go float64(18) through json.Marshal as `18` — become int64(18)
-// here; type pinning tests that previously asserted float64(N) for a
-// small integer must now assert int64(N). Lossless for any literal Avro
-// callers are likely to write.
+// literals, including ±Inf for values whose magnitude exceeds float64's
+// exponent range (e.g. "1e1000" → +Inf). Whole-number JSON literals like
+// "18" — which would round-trip from a Go float64(18) through json.Marshal
+// as `18` — become int64(18) here; type pinning tests that previously
+// asserted float64(N) for a small integer must now assert int64(N).
+//
+// The ±Inf-from-overflow path routes through [parseFloatAcceptOverflow]
+// so the metadata-API observability surface (Schema.Root().Props,
+// Fields[].Default, Fields[].Props, CustomType callbacks' *SchemaNode.Props)
+// agrees with the encode/decode/schema-parse-time arms on the
+// ErrRange-with-Inf predicate — pattern 1b parity across the 4th
+// code-path axis. Java's Jackson DoubleNode(Double.parseDouble("1e1000"))
+// produces +Inf at the metadata layer; fastavro's float("1e1000") → inf
+// via Python json. Pre-fix twmb returned json.Number("1e1000") here,
+// violating the docstring contract "fractional and exponent-form literals
+// decode to float64" on the overflow subcase.
 func normalizeJSONNumber(n json.Number) any {
 	s := string(n)
 	// Integer-form: no decimal point and no exponent marker.
@@ -2423,7 +2434,7 @@ func normalizeJSONNumber(n json.Number) any {
 		// Overflows int64; preserve as json.Number for arbitrary precision.
 		return n
 	}
-	if f, err := n.Float64(); err == nil {
+	if f, err := parseFloatAcceptOverflow(s); err == nil {
 		return f
 	}
 	return n

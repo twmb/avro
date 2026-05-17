@@ -14053,6 +14053,235 @@ func TestRegression_SchemaMetadataNumericPrecisionPreserved(t *testing.T) {
 	})
 }
 
+// TestRegression_SchemaMetadataExponentOverflowNormalizesToInf locks the
+// metadata-API observability surface (Schema.Root().Props,
+// Fields[].Default, Fields[].Props, CustomType callbacks'
+// *SchemaNode.Props) on the ±Inf-from-overflow case for exponent-form
+// JSON literals. Pre-fix, normalizeJSONNumber (schema.go) bailed when
+// (json.Number).Float64() returned (±Inf, strconv.ErrRange) and returned
+// the json.Number unchanged — violating the [SchemaField.Default] /
+// [SchemaNode.Props] docstring contract "fractional and exponent-form
+// literals decode to float64" on the overflow subcase, and diverging
+// from Java + fastavro which both surface ±Inf in their metadata APIs
+// (Java: Jackson DoubleNode(Double.parseDouble("1e1000")) → +Inf;
+// fastavro: float("1e1000") → inf via Python json).
+//
+// This is the metadata-observability axis of pattern 1b's three-axis
+// rule (formerly four axes: encode, decode, schema-parse-time validate,
+// metadata observability). The schema-parse-time arms (defaultAsFloat,
+// coerceDefault) and encode/decode arms route through
+// parseFloatAcceptOverflow (schema.go) to accept ±Inf; the fix wires
+// normalizeJSONNumber through the same helper so all four arms agree.
+//
+// The fix also wires SchemaNode.toJSONWalk (schema_node.go) through
+// jsonSerializableValue, which converts ±Inf back to a json.Number
+// literal so SchemaNode.Schema() round-trip continues to work
+// (encoding/json.Marshal rejects ±Inf unconditionally).
+//
+// Smoking-gun probe pre-fix:
+//
+//	s := avro.Parse(`{"type":"record",...,"default":1e1000}`)
+//	s.Root().Fields[0].Default                       → json.Number("1e1000")  ← BUG
+//	buf, _ := s.AppendEncode(nil, map[string]any{})  → +Inf wire bits
+//	s.Decode(buf, &out)                              → +Inf                   ← contract honored
+//
+// Sibling sweep: this same shape applies to Schema.Root().Props (record-
+// level extras), Fields[].Props (field-level extras), CustomType
+// callbacks' *SchemaNode.Props, and recursively nested values inside
+// any of those. All five surfaces share normalizeJSONNumber, so a
+// single-site fix covers all.
+func TestRegression_SchemaMetadataExponentOverflowNormalizesToInf(t *testing.T) {
+	t.Run("default 1e1000 normalizes to +Inf", func(t *testing.T) {
+		s, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"double","default":1e1000}]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := s.Root().Fields[0].Default
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, 1) {
+			t.Errorf("Default: got %T %v, want float64(+Inf) — pattern 1b violation (docstring says exponent-form decodes to float64)", got, got)
+		}
+	})
+	t.Run("default -1e1000 normalizes to -Inf", func(t *testing.T) {
+		s, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"double","default":-1e1000}]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := s.Root().Fields[0].Default
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, -1) {
+			t.Errorf("Default: got %T %v, want float64(-Inf)", got, got)
+		}
+	})
+	t.Run("record-level Props 1e1000 normalizes to +Inf", func(t *testing.T) {
+		s, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"int"}],
+			"limit":1e1000
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := s.Root().Props["limit"]
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, 1) {
+			t.Errorf("Props[limit]: got %T %v, want float64(+Inf)", got, got)
+		}
+	})
+	t.Run("field-level Props -1e1000 normalizes to -Inf", func(t *testing.T) {
+		s, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"int","fieldLimit":-1e1000}]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := s.Root().Fields[0].Props["fieldLimit"]
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, -1) {
+			t.Errorf("Fields[0].Props[fieldLimit]: got %T %v, want float64(-Inf)", got, got)
+		}
+	})
+	t.Run("CustomType callback schema.Props 1e1000 normalizes to +Inf", func(t *testing.T) {
+		var captured map[string]any
+		ct := avro.CustomType{
+			AvroType:    "long",
+			LogicalType: "my-long",
+			Decode: func(v any, schema *avro.SchemaNode) (any, error) {
+				captured = schema.Props
+				return v, nil
+			},
+		}
+		s, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":{
+				"type":"long","logicalType":"my-long","scaleHint":1e1000
+			}}]
+		}`, avro.WithCustomType(ct))
+		if err != nil {
+			t.Fatal(err)
+		}
+		bin, err := s.AppendEncode(nil, map[string]any{"f": int64(42)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if _, err := s.Decode(bin, &out); err != nil {
+			t.Fatal(err)
+		}
+		got := captured["scaleHint"]
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, 1) {
+			t.Errorf("CustomType schema.Props[scaleHint]: got %T %v, want float64(+Inf)", got, got)
+		}
+	})
+	t.Run("nested Props inside array also normalize", func(t *testing.T) {
+		s, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"int"}],
+			"limits":[1e1000, -1e1000, 1.5e10]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		arr, ok := s.Root().Props["limits"].([]any)
+		if !ok {
+			t.Fatalf("limits not []any: %T", s.Root().Props["limits"])
+		}
+		if f, ok := arr[0].(float64); !ok || !math.IsInf(f, 1) {
+			t.Errorf("arr[0]: got %T %v, want float64(+Inf)", arr[0], arr[0])
+		}
+		if f, ok := arr[1].(float64); !ok || !math.IsInf(f, -1) {
+			t.Errorf("arr[1]: got %T %v, want float64(-Inf)", arr[1], arr[1])
+		}
+		if f, ok := arr[2].(float64); !ok || f != 1.5e10 {
+			t.Errorf("arr[2]: got %T %v, want float64(1.5e10)", arr[2], arr[2])
+		}
+	})
+	t.Run("finite exponent-form still normalizes to float64", func(t *testing.T) {
+		// Boundary-1 case: 1e308 fits in float64 exact-precision range.
+		// Verifies the fix doesn't over-trigger on finite values.
+		s, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"int"}],
+			"x":1e308,"y":2.5e10
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f, ok := s.Root().Props["x"].(float64); !ok || f != 1e308 {
+			t.Errorf("Props[x]: got %T %v, want float64(1e308)", s.Root().Props["x"], s.Root().Props["x"])
+		}
+		if f, ok := s.Root().Props["y"].(float64); !ok || f != 2.5e10 {
+			t.Errorf("Props[y]: got %T %v, want float64(2.5e10)", s.Root().Props["y"], s.Root().Props["y"])
+		}
+	})
+	t.Run("SchemaNode.Schema() round-trips ±Inf via json.Number literal", func(t *testing.T) {
+		// jsonSerializableValue converts ±Inf back to a json.Number
+		// literal so encoding/json.Marshal — which rejects ±Inf
+		// unconditionally — doesn't fail at SchemaNode.Schema().
+		// The re-parsed schema's Default re-normalizes to +Inf via
+		// normalizeJSONNumber, completing the round trip.
+		s1, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"double","default":1e1000}]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root1 := s1.Root()
+		s2, err := root1.Schema()
+		if err != nil {
+			t.Fatalf("Schema() round-trip failed (jsonSerializableValue missing?): %v", err)
+		}
+		got := s2.Root().Fields[0].Default
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, 1) {
+			t.Errorf("round-tripped Default: got %T %v, want float64(+Inf)", got, got)
+		}
+		// And the wire bytes are still +Inf.
+		bin, err := s2.AppendEncode(nil, map[string]any{})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out map[string]any
+		if _, err := s2.Decode(bin, &out); err != nil {
+			t.Fatal(err)
+		}
+		if f, ok := out["f"].(float64); !ok || !math.IsInf(f, 1) {
+			t.Errorf("decoded round-trip: got %T %v, want float64(+Inf)", out["f"], out["f"])
+		}
+	})
+	t.Run("SchemaNode.Schema() round-trips programmatically-constructed +Inf Props", func(t *testing.T) {
+		// User puts +Inf in Props directly. Should round-trip via the
+		// jsonSerializableValue conversion to json.Number literal.
+		node := &avro.SchemaNode{
+			Type: "record",
+			Name: "R",
+			Fields: []avro.SchemaField{
+				{Name: "f", Type: avro.SchemaNode{Type: "int"}},
+			},
+			Props: map[string]any{
+				"limit": math.Inf(1),
+			},
+		}
+		s, err := node.Schema()
+		if err != nil {
+			t.Fatalf("Schema() rejected +Inf in Props: %v", err)
+		}
+		got := s.Root().Props["limit"]
+		if f, ok := got.(float64); !ok || !math.IsInf(f, 1) {
+			t.Errorf("round-tripped Props[limit]: got %T %v, want float64(+Inf)", got, got)
+		}
+	})
+}
+
 // TestRegression_NumberGrammarParityMatrix pins the JSON-number grammar
 // gate across every entry point that converts a [json.Number] to an
 // Avro primitive (int / long / float / double) on both the binary and
