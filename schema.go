@@ -2659,6 +2659,95 @@ func coerceDefault(val any, node *schemaNode) any {
 	return val
 }
 
+// walkDefault drives the (val, node) recursion shared by the
+// default-tree walkers. visit is called once per non-union node and
+// may mutate val; for union nodes walkDefault picks the first
+// validateDefault-accepting branch (skipping visit at the union
+// itself) and recurses into the matched branch. If no union branch
+// matches, walkDefault returns the canonical "default does not match
+// any union branch" error so callers that don't care (the mutator
+// walker convertDefaultBytes) can discard it while validateDefault
+// surfaces it.
+//
+// Container arms wrap nested errors with "field %q:", "array element
+// %d:", or "map key %q:" so the per-element error path is identical
+// across walkers.
+//
+// Caller contract: visit MUST be idempotent. The union arm calls
+// validateDefault to pick a branch and then re-invokes visit at every
+// node of the matched branch — a non-idempotent visit (e.g. one that
+// increments a counter) would double-fire at every union depth.
+//
+// Walks *schemaNode (the resolved type tree) so name-references —
+// forward and backward — follow into the real type. Returns
+// immediately for a nil node so fwd-ref-deferred validation is a
+// no-op.
+func walkDefault(val any, node *schemaNode, visit func(any, *schemaNode) (any, error)) (any, error) {
+	if node == nil {
+		return val, nil
+	}
+	if node.kind == "union" {
+		// Avro 1.12+ relaxed the union-default rule: the default may
+		// match any branch (formerly required to match the first).
+		// See AVRO-3649 / PR apache/avro#2503.
+		//
+		// Branch matcher is validateDefault: a structural-only check
+		// (e.g. "is val a string?") can pick a fixed:N branch on a
+		// string default whose rune-count doesn't fit, mutate it into
+		// a length-N []byte that no branch can encode, and surface as
+		// "union default does not match any branch" at encodeDefault
+		// time even though validateDefault accepted the schema.
+		// validateDefault is idempotent so re-running it here is safe.
+		for _, branch := range node.branches {
+			if validateDefault(val, branch) == nil {
+				return walkDefault(val, branch, visit)
+			}
+		}
+		return val, fmt.Errorf("default does not match any union branch: %T(%v)", val, val)
+	}
+	val, err := visit(val, node)
+	if err != nil {
+		return val, err
+	}
+	switch node.kind {
+	case "record":
+		if m, ok := val.(map[string]any); ok {
+			for _, f := range node.fields {
+				fv, exists := m[f.name]
+				if !exists {
+					continue
+				}
+				fv2, err := walkDefault(fv, f.node, visit)
+				if err != nil {
+					return val, fmt.Errorf("field %q: %w", f.name, err)
+				}
+				m[f.name] = fv2
+			}
+		}
+	case "array":
+		if arr, ok := val.([]any); ok && node.items != nil {
+			for i, item := range arr {
+				item2, err := walkDefault(item, node.items, visit)
+				if err != nil {
+					return val, fmt.Errorf("array element %d: %w", i, err)
+				}
+				arr[i] = item2
+			}
+		}
+	case "map":
+		if m, ok := val.(map[string]any); ok && node.values != nil {
+			for k, v := range m {
+				v2, err := walkDefault(v, node.values, visit)
+				if err != nil {
+					return val, fmt.Errorf("map key %q: %w", k, err)
+				}
+				m[k] = v2
+			}
+		}
+	}
+	return val, nil
+}
+
 // convertDefaultBytes walks a parsed-then-validated default value and
 // converts string defaults to []byte for bytes/fixed schema nodes,
 // recursively descending into records/arrays/maps/unions. The Avro
@@ -2670,90 +2759,26 @@ func coerceDefault(val any, node *schemaNode) any {
 // up front makes both encode paths agree without requiring per-arm
 // special cases.
 //
-// Walks *schemaNode (the resolved type tree) rather than the aschema
-// canon so that named-type references — forward and backward — are
-// followed naturally: a record field whose type is `aschema{primitive:
-// "MyDec"}` has a node that already points at MyDec's resolved
-// schemaNode. Called both from buildComplex's non-fwd-ref path and
-// from finalize's fwd-ref fixup.
-//
 // Called after validateDefault has succeeded for non-fwd-ref fields;
 // for fwd-ref fields validation is deferred and the conversion is
-// best-effort (avroJSONBytesToBytes silently returns on error and we
-// preserve the original value).
+// best-effort. The walkDefault union-no-match error is discarded —
+// validateDefault would have caught it for non-fwd-ref defaults, and
+// fwd-ref defaults shouldn't surface conversion-time errors.
 func convertDefaultBytes(val any, node *schemaNode) any {
-	if node == nil {
-		return val
-	}
-	switch node.kind {
-	case "bytes", "fixed":
+	out, _ := walkDefault(val, node, func(val any, node *schemaNode) (any, error) {
+		if node.kind != "bytes" && node.kind != "fixed" {
+			return val, nil
+		}
 		if str, ok := val.(string); ok {
 			if b, err := avroJSONBytesToBytes(str); err == nil {
-				return b
+				return b, nil
 			}
 		}
-		return val
-	case "record":
-		m, ok := val.(map[string]any)
-		if !ok {
-			return val
-		}
-		for _, f := range node.fields {
-			if fv, exists := m[f.name]; exists {
-				m[f.name] = convertDefaultBytes(fv, f.node)
-			}
-		}
-		return val
-	case "array":
-		arr, ok := val.([]any)
-		if !ok || node.items == nil {
-			return val
-		}
-		for i, item := range arr {
-			arr[i] = convertDefaultBytes(item, node.items)
-		}
-		return val
-	case "map":
-		m, ok := val.(map[string]any)
-		if !ok || node.values == nil {
-			return val
-		}
-		for k, v := range m {
-			m[k] = convertDefaultBytes(v, node.values)
-		}
-		return val
-	case "union":
-		// First-matching-branch determines the type interpretation.
-		// Reuse validateDefault as the matcher so we agree with the
-		// validate pass on which branch this default lands on — a
-		// structural-only check (e.g. "is val a string?") can pick a
-		// fixed:N branch on a string default whose rune-count
-		// doesn't fit, mutate it into a length-N []byte that no
-		// branch can encode, and surface as "union default does not
-		// match any branch" at encodeDefault time even though
-		// validateDefault accepted the schema. validateDefault is
-		// idempotent (coerceDefault on already-coerced floats is a
-		// no-op) so re-running it here is safe.
-		for _, branch := range node.branches {
-			if validateDefault(val, branch) == nil {
-				return convertDefaultBytes(val, branch)
-			}
-		}
-	}
-	return val
+		return val, nil
+	})
+	return out
 }
 
-// validateDefault checks that a parsed JSON default value is compatible
-// with the given Avro schema. Walks *schemaNode (the resolved type
-// tree) so name-references — forward and backward — follow into the
-// real type rather than slipping through with no validation (the prior
-// aschema-canon walker hit validateDefaultPrimitive's "unknown
-// primitive" silent-accept for any name-ref). Mutates record/array/map
-// structures in place via coerceDefault, propagating float-from-string
-// coercions to nested fields reached through name-refs.
-//
-// Returns nil for a nil node — fwd-refs defer validation to finalize,
-// where the resolved node is wired up.
 // validateAvroByteString reports an error when s contains a code point
 // > 0xFF — the Avro JSON-bytes / JSON-fixed default form maps each
 // codepoint to one byte, so values outside that range are not
@@ -2767,26 +2792,44 @@ func validateAvroByteString(s, fieldType string) error {
 	return nil
 }
 
+// validateDefault checks that a parsed JSON default value is
+// compatible with the given Avro schema. Drives walkDefault with a
+// validateLeaf visit that does the per-kind primitive validation and
+// the container-shape checks; the structural recursion + union
+// branch-matching + per-element error-path wrapping live in
+// walkDefault so the validate / convert / coerce walkers can't drift
+// on those invariants.
+//
+// Mutates record/array/map structures in place via coerceDefault
+// (called from the validateLeaf record/array/map arms), propagating
+// float-from-string coercions to nested fields reached through
+// name-refs. Returns nil for a nil node — fwd-refs defer validation
+// to finalize.
 func validateDefault(val any, node *schemaNode) error {
-	if node == nil {
-		return nil
-	}
+	_, err := walkDefault(val, node, validateLeaf)
+	return err
+}
+
+// validateLeaf is the per-node visit for validateDefault: primitive
+// kind validation, plus container-shape checks + per-field coercion
+// (walkDefault handles the actual recursion).
+func validateLeaf(val any, node *schemaNode) (any, error) {
 	switch node.kind {
 	case "null":
 		if val != nil {
-			return fmt.Errorf("expected null, got %T", val)
+			return val, fmt.Errorf("expected null, got %T", val)
 		}
 	case "boolean":
 		if _, ok := val.(bool); !ok {
-			return fmt.Errorf("expected boolean, got %T", val)
+			return val, fmt.Errorf("expected boolean, got %T", val)
 		}
 	case "int":
 		if _, err := defaultAsInt32(val); err != nil {
-			return fmt.Errorf("int default: %w", err)
+			return val, fmt.Errorf("int default: %w", err)
 		}
 	case "long":
 		if _, err := defaultAsInt64(val); err != nil {
-			return fmt.Errorf("long default: %w", err)
+			return val, fmt.Errorf("long default: %w", err)
 		}
 	case "float", "double":
 		bitSize := 64
@@ -2794,112 +2837,92 @@ func validateDefault(val any, node *schemaNode) error {
 			bitSize = 32
 		}
 		if _, err := defaultAsFloat(val, bitSize); err != nil {
-			return fmt.Errorf("%s default: %w", node.kind, err)
+			return val, fmt.Errorf("%s default: %w", node.kind, err)
 		}
 	case "string":
 		if _, ok := val.(string); !ok {
-			return fmt.Errorf("expected string, got %T", val)
+			return val, fmt.Errorf("expected string, got %T", val)
 		}
 	case "bytes":
 		s, ok := val.(string)
 		if !ok {
-			return fmt.Errorf("expected string for bytes, got %T", val)
+			return val, fmt.Errorf("expected string for bytes, got %T", val)
 		}
-		return validateAvroByteString(s, "bytes")
+		return val, validateAvroByteString(s, "bytes")
 	case "enum":
 		sym, ok := val.(string)
 		if !ok {
-			return fmt.Errorf("expected string for enum default, got %T", val)
+			return val, fmt.Errorf("expected string for enum default, got %T", val)
 		}
 		if len(node.symbols) > 0 && !slices.Contains(node.symbols, sym) {
-			return fmt.Errorf("enum default %q is not a member of symbols", sym)
+			return val, fmt.Errorf("enum default %q is not a member of symbols", sym)
 		}
 	case "fixed":
 		s, ok := val.(string)
 		if !ok {
-			return fmt.Errorf("expected string for fixed default, got %T", val)
+			return val, fmt.Errorf("expected string for fixed default, got %T", val)
 		}
 		if err := validateAvroByteString(s, "fixed"); err != nil {
-			return err
+			return val, err
 		}
 		if len([]rune(s)) != node.size {
-			return fmt.Errorf("fixed default length %d does not match size %d", len([]rune(s)), node.size)
+			return val, fmt.Errorf("fixed default length %d does not match size %d", len([]rune(s)), node.size)
 		}
 	case "record":
 		// null is not a record. Java's isValidDefault returns false for
-		// null on RECORD (Schema.java case RECORD: `if (!defaultValue
-		// .isObject()) return false;`); fastavro's _validate_record
-		// requires isinstance(datum, Mapping); hamba's isValidDefault
-		// returns false on type-assertion failure. Without this reject,
-		// a union ["Record","null"] with default null would have its
-		// validate-walk match the Record branch (synthesizing an empty
-		// map + relying on per-field defaults) instead of falling
-		// through to the null branch — encodeDefault would then emit
-		// Record(field-defaults) wire bytes where null was intended.
+		// null on RECORD; fastavro's _validate_record requires
+		// isinstance(datum, Mapping); hamba's isValidDefault returns
+		// false on type-assertion failure. Without this reject, a
+		// union ["Record","null"] with default null would have its
+		// validate-walk match the Record branch (synthesizing an
+		// empty map + relying on per-field defaults) instead of
+		// falling through to the null branch — encodeDefault would
+		// then emit Record(field-defaults) wire bytes where null was
+		// intended.
 		if val == nil {
-			return fmt.Errorf("expected object for record default, got null")
+			return val, fmt.Errorf("expected object for record default, got null")
 		}
 		m, ok := val.(map[string]any)
 		if !ok {
-			return fmt.Errorf("expected object for record default, got %T", val)
+			return val, fmt.Errorf("expected object for record default, got %T", val)
 		}
+		// Required-field presence check before coercion: a missing
+		// no-default field is an error regardless of per-field types.
 		for _, f := range node.fields {
-			fv, exists := m[f.name]
-			if !exists {
-				if !f.hasDefault {
-					return fmt.Errorf("record default missing field %q with no default", f.name)
-				}
-				continue
+			if _, exists := m[f.name]; !exists && !f.hasDefault {
+				return val, fmt.Errorf("record default missing field %q with no default", f.name)
 			}
-			fv = coerceDefault(fv, f.node)
-			m[f.name] = fv
-			if err := validateDefault(fv, f.node); err != nil {
-				return fmt.Errorf("field %q: %w", f.name, err)
+		}
+		// Coerce each present field in-place; walkDefault then recurses
+		// to validate the coerced value at each child node.
+		for _, f := range node.fields {
+			if fv, exists := m[f.name]; exists {
+				m[f.name] = coerceDefault(fv, f.node)
 			}
 		}
 	case "array":
 		if val == nil {
-			return fmt.Errorf("expected array for array default, got null")
+			return val, fmt.Errorf("expected array for array default, got null")
 		}
 		arr, ok := val.([]any)
 		if !ok {
-			return fmt.Errorf("expected array for array default, got %T", val)
+			return val, fmt.Errorf("expected array for array default, got %T", val)
 		}
-		for i, elem := range arr {
-			coerced := coerceDefault(elem, node.items)
-			arr[i] = coerced
-			if err := validateDefault(coerced, node.items); err != nil {
-				return fmt.Errorf("array element %d: %w", i, err)
-			}
+		for i, item := range arr {
+			arr[i] = coerceDefault(item, node.items)
 		}
 	case "map":
 		if val == nil {
-			return fmt.Errorf("expected object for map default, got null")
+			return val, fmt.Errorf("expected object for map default, got null")
 		}
 		m, ok := val.(map[string]any)
 		if !ok {
-			return fmt.Errorf("expected object for map default, got %T", val)
+			return val, fmt.Errorf("expected object for map default, got %T", val)
 		}
 		for k, v := range m {
-			coerced := coerceDefault(v, node.values)
-			m[k] = coerced
-			if err := validateDefault(coerced, node.values); err != nil {
-				return fmt.Errorf("map key %q: %w", k, err)
-			}
+			m[k] = coerceDefault(v, node.values)
 		}
-	case "union":
-		// Avro 1.12+ relaxed the union-default rule: the default may
-		// match any branch (formerly required to match the first
-		// branch). See AVRO-3649 / PR apache/avro#2503. We walk
-		// branches in declaration order and accept the first that
-		// matches, matching Java 1.12+ and fastavro v1.7+.
-		for _, branch := range node.branches {
-			if validateDefault(val, branch) == nil {
-				return nil
-			}
-		}
-		return fmt.Errorf("default does not match any union branch: %T(%v)", val, val)
 	}
-	return nil
+	return val, nil
 }
 
