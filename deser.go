@@ -42,6 +42,44 @@ func readLength(src []byte, typeName string) (int, []byte, error) {
 	return int(length), src, nil
 }
 
+// readBlockHeader reads an Avro array/map block header: a varlong
+// count, plus (when the count is negative) a varlong byte-size for
+// the block. Returns:
+//   - (count > 0, byteSize, src, false, nil): a block follows.
+//   - (0, 0, src, true, nil): terminator (count==0) — series ended.
+//   - (0, 0, nil, false, err): read error / malformed count / bad
+//     byteSize.
+//
+// byteSize is 0 unless the wire used negative-count framing; skip
+// paths use it to fast-skip the block, deser paths ignore it.
+// validateByteSize=true bounds byteSize against len(src) (needed for
+// skip paths since they trust the wire's byte-count).
+func readBlockHeader(src []byte, blockType string, validateByteSize bool) (absCount int64, byteSize int64, _ []byte, end bool, err error) {
+	count, src, err := readVarlong(src)
+	if err != nil {
+		return 0, 0, nil, false, err
+	}
+	if count == 0 {
+		return 0, 0, src, true, nil
+	}
+	if count < 0 {
+		count = -count
+		if count < 0 {
+			return 0, 0, nil, false, fmt.Errorf("invalid %s block count", blockType)
+		}
+		byteSize, src, err = readVarlong(src)
+		if err != nil {
+			return 0, 0, nil, false, err
+		}
+		if validateByteSize {
+			if byteSize < 0 || byteSize > int64(len(src)) {
+				return 0, 0, nil, false, &ShortBufferError{Type: blockType, Need: int(byteSize), Have: len(src)}
+			}
+		}
+	}
+	return count, byteSize, src, false, nil
+}
+
 var anyType = reflect.TypeFor[any]()
 var sliceAnyType = reflect.SliceOf(anyType)
 
@@ -807,12 +845,12 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	var err error
 	var totalItems int64
 	for {
-		var count int64
-		count, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
+		count, _, rest, end, headerErr := readBlockHeader(src, "array", false)
+		if headerErr != nil {
+			return nil, headerErr
 		}
-		if count == 0 {
+		src = rest
+		if end {
 			if iface {
 				if !sliceVal.IsValid() {
 					sliceVal = reflect.MakeSlice(sliceType, 0, 0)
@@ -820,16 +858,6 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 				return src, setIface(v, sliceVal, "array")
 			}
 			return src, nil
-		}
-		if count < 0 {
-			count = -count
-			if count < 0 {
-				return nil, errors.New("invalid array block count")
-			}
-			_, src, err = readVarlong(src) // skip block byte size
-			if err != nil {
-				return nil, err
-			}
 		}
 		if err := checkArrayBlockBounds(count, totalItems, len(src), s.minItemBytes); err != nil {
 			return nil, err
@@ -906,26 +934,16 @@ func (s *deserArray) deserFixedArray(src []byte, v reflect.Value, sl *slab) ([]b
 	idx := 0
 	var err error
 	for {
-		var count int64
-		count, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
+		count, _, rest, end, headerErr := readBlockHeader(src, "array", false)
+		if headerErr != nil {
+			return nil, headerErr
 		}
-		if count == 0 {
+		src = rest
+		if end {
 			if idx != arrLen {
 				return nil, &SemanticError{GoType: v.Type(), AvroType: "array", Err: fmt.Errorf("expected %d elements, got %d", arrLen, idx)}
 			}
 			return src, nil
-		}
-		if count < 0 {
-			count = -count
-			if count < 0 {
-				return nil, errors.New("invalid array block count")
-			}
-			_, src, err = readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
 		}
 		// Compare in int64-sized arithmetic before narrowing to int.
 		// idx+int(count) > arrLen wraps for huge count (e.g. count
@@ -1103,11 +1121,11 @@ type deserMap struct {
 	deserItem    deserfn
 	fastBlock    func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
 	fastElemKind reflect.Kind
-	// fastIfaceBlock decodes one block of entries directly into a
-	// map[string]any, bypassing reflect for primitive values. Selected
-	// at schema-build time based on the avro value type. nil for
-	// non-primitive value types; the generic reflect path handles those.
-	fastIfaceBlock func(src []byte, m map[string]any, count int, sl *slab) ([]byte, error)
+	// fastIfaceVal decodes one primitive value directly into a Go any,
+	// bypassing reflect; deserMapPrimitiveIfaceBlock drives the per-block
+	// loop. nil for non-primitive value types; the generic reflect path
+	// handles those.
+	fastIfaceVal deserIfaceFn
 	// minEntryBytes is 1 (key length varint, ≥1 byte for empty key)
 	// + schemaMinBytes(values). Used to bound block-count against
 	// remaining buffer length, preventing the same memory-amplification
@@ -1161,7 +1179,7 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	useFast := !iface && s.fastBlock != nil && elemTyp.Kind() == s.fastElemKind
 	// For interface targets with primitive avro values, use the
 	// iface-block fast path that operates directly on map[string]any.
-	useFastIface := iface && s.fastIfaceBlock != nil
+	useFastIface := iface && s.fastIfaceVal != nil
 	// Pre-allocate reusable key and elem containers to avoid
 	// per-entry reflect.ValueOf / reflect.New allocations.
 	// Construct keyVal with the user's actual map key type (e.g.
@@ -1175,12 +1193,12 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	}
 	var err error
 	for {
-		var count int64
-		count, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
+		count, _, rest, end, headerErr := readBlockHeader(src, "map", false)
+		if headerErr != nil {
+			return nil, headerErr
 		}
-		if count == 0 {
+		src = rest
+		if end {
 			// Empty map: allocate zero-sized backing if we never saw a block.
 			if !mapVal.IsValid() {
 				mapVal = reflect.MakeMap(mapTyp)
@@ -1192,16 +1210,6 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 				return src, setIface(v, mapVal, "map")
 			}
 			return src, nil
-		}
-		if count < 0 {
-			count = -count
-			if count < 0 {
-				return nil, errors.New("invalid map block count")
-			}
-			_, src, err = readVarlong(src) // skip block size
-			if err != nil {
-				return nil, err
-			}
 		}
 		if count > int64(len(src))/int64(s.minEntryBytes) {
 			return nil, fmt.Errorf("map block count %d exceeds remaining buffer length %d (min %d byte/entry)", count, len(src), s.minEntryBytes)
@@ -1234,7 +1242,7 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			// via the extracted Go map is visible through mapVal too,
 			// so the trailing setIface picks up all entries.
 			m := mapVal.Interface().(map[string]any)
-			src, err = s.fastIfaceBlock(src, m, int(count), sl)
+			src, err = deserMapPrimitiveIfaceBlock(src, m, int(count), sl, s.fastIfaceVal)
 			if err != nil {
 				return nil, err
 			}
@@ -1269,6 +1277,20 @@ func readMapKey(src []byte, keyVal reflect.Value, sl *slab) ([]byte, error) {
 	n := int(keyLen)
 	keyVal.SetString(sl.string(src, n))
 	return src[n:], nil
+}
+
+// readMapKeyString is readMapKey returning a Go string instead of
+// writing into a reflect.Value.
+func readMapKeyString(src []byte, sl *slab) (string, []byte, error) {
+	keyLen, src, err := readVarlong(src)
+	if err != nil {
+		return "", nil, err
+	}
+	if keyLen < 0 || keyLen > int64(len(src)) {
+		return "", nil, fmt.Errorf("invalid map key length %d", keyLen)
+	}
+	n := int(keyLen)
+	return sl.string(src, n), src[n:], nil
 }
 
 // The following block functions decode map entries for primitive value
@@ -1405,119 +1427,20 @@ func deserMapDoubleBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, coun
 // reading into the native Go map. Selected at schema build time based
 // on the avro value type.
 
-func deserMapStringIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
+// deserMapPrimitiveIfaceBlock decodes one map block into m using a
+// per-value decoder (the matching deser*Iface for each primitive).
+func deserMapPrimitiveIfaceBlock(src []byte, m map[string]any, count int, sl *slab, decodeVal deserIfaceFn) ([]byte, error) {
 	for range count {
-		keyLen, rest, err := readVarlong(src)
+		key, rest, err := readMapKeyString(src, sl)
 		if err != nil {
 			return nil, err
 		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		valLen, rest2, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if valLen < 0 || valLen > int64(len(rest2)) {
-			return nil, &ShortBufferError{Type: "string", Need: int(valLen), Have: len(rest2)}
-		}
-		vn := int(valLen)
-		m[key] = sl.string(rest2, vn)
-		src = rest2[vn:]
-	}
-	return src, nil
-}
-
-func deserMapBooleanIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-		if len(src) < 1 {
-			return nil, &ShortBufferError{Type: "boolean"}
-		}
-		m[key] = src[0] == 1
-		src = src[1:]
-	}
-	return src, nil
-}
-
-func deserMapIntIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		var val int32
-		val, src, err = readVarint(src)
+		val, rest, err := decodeVal(rest, sl)
 		if err != nil {
 			return nil, err
 		}
 		m[key] = val
-	}
-	return src, nil
-}
-
-func deserMapLongIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		var val int64
-		val, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		m[key] = val
-	}
-	return src, nil
-}
-
-func deserMapFloatIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		var u uint32
-		u, src, err = readUint32(src)
-		if err != nil {
-			return nil, err
-		}
-		m[key] = math.Float32frombits(u)
+		src = rest
 	}
 	return src, nil
 }
@@ -1605,28 +1528,6 @@ func ifaceFnForKind(kind string) deserIfaceFn {
 	return nil
 }
 
-func deserMapDoubleIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		var u uint64
-		u, src, err = readUint64(src)
-		if err != nil {
-			return nil, err
-		}
-		m[key] = math.Float64frombits(u)
-	}
-	return src, nil
-}
 
 // deserFixedUUIDReflect decodes a fixed(16) UUID. Into any it returns
 // [16]byte; into [16]byte it copies the raw bytes; into string it

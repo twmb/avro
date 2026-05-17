@@ -110,32 +110,20 @@ func skipArray(w *schemaNode) skipfn {
 		}
 		sl.depth++
 		defer func() { sl.depth-- }()
-		var err error
 		var totalItems int64
 		for {
-			var count int64
-			count, src, err = readVarlong(src)
+			count, byteSize, rest, end, err := readBlockHeader(src, "array block", true)
 			if err != nil {
 				return nil, err
 			}
-			if count == 0 {
+			src = rest
+			if end {
 				return src, nil
 			}
-			if count < 0 {
-				count = -count
-				if count < 0 {
-					return nil, fmt.Errorf("invalid array block count")
-				}
-				// Negative count means the block has a byte size we can skip.
-				var byteSize int64
-				byteSize, src, err = readVarlong(src)
-				if err != nil {
-					return nil, err
-				}
-				if byteSize < 0 || byteSize > int64(len(src)) {
-					return nil, &ShortBufferError{Type: "array block", Need: int(byteSize), Have: len(src)}
-				}
-				src = src[int(byteSize):]
+			if byteSize > 0 {
+				// Negative count framing: skip the whole block by
+				// byte-size instead of iterating per item.
+				src = src[byteSize:]
 				continue
 			}
 			if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
@@ -159,30 +147,17 @@ func skipMap(w *schemaNode) skipfn {
 		}
 		sl.depth++
 		defer func() { sl.depth-- }()
-		var err error
 		for {
-			var count int64
-			count, src, err = readVarlong(src)
+			count, byteSize, rest, end, err := readBlockHeader(src, "map block", true)
 			if err != nil {
 				return nil, err
 			}
-			if count == 0 {
+			src = rest
+			if end {
 				return src, nil
 			}
-			if count < 0 {
-				count = -count
-				if count < 0 {
-					return nil, fmt.Errorf("invalid map block count")
-				}
-				var byteSize int64
-				byteSize, src, err = readVarlong(src)
-				if err != nil {
-					return nil, err
-				}
-				if byteSize < 0 || byteSize > int64(len(src)) {
-					return nil, &ShortBufferError{Type: "map block", Need: int(byteSize), Have: len(src)}
-				}
-				src = src[int(byteSize):]
+			if byteSize > 0 {
+				src = src[byteSize:]
 				continue
 			}
 			for range int(count) {
