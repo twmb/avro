@@ -336,11 +336,7 @@ func serNull(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 	return dst, errNonNil
 }
 
-func serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
+func appendAvroBool(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.Kind() != reflect.Bool {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "boolean"}
 	}
@@ -348,6 +344,14 @@ func serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		return append(dst, 1), nil
 	}
 	return append(dst, 0), nil
+}
+
+func serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	return appendAvroBool(dst, v)
 }
 
 var jsonNumberType = reflect.TypeFor[json.Number]()
@@ -396,25 +400,30 @@ func floatFitsInt32From(f float64, bits int) (int32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if bits == 32 && (n < -(1<<24) || n > 1<<24) {
-		return 0, fmt.Errorf("value %v exceeds float32 exact-precision range", f)
+	// Only float32 sources can lose precision inside the int32 range
+	// (1<<24 mantissa bound); a float64 source has enough mantissa to
+	// represent every int32 exactly.
+	if bits == 32 {
+		lim := int32(floatMantissaLimit(32))
+		if n < -lim || n > lim {
+			return 0, fmt.Errorf("value %v exceeds float32 exact-precision range", f)
+		}
 	}
 	return n, nil
 }
 
 // floatFitsInt64From is floatFitsInt64 with an additional source-float
 // mantissa-precision check. Mirrors setLongValue's float-target precLimit:
-// 1<<24 for a float32 source, 1<<53 for float64. Same DRY rationale as
-// floatFitsInt32From — one rule, every encode-side float→int/long path.
+// 1<<24 for a float32 source, 1<<53 for float64. Shares the bound with
+// [floatMantissaLimit] / [intFitsFloat] / [appendAvroFloat32] /
+// [appendAvroFloat64] / [jsonCoerceToFloat64] — one constant, every
+// encode-side float-mantissa-precision site.
 func floatFitsInt64From(f float64, bits int) (int64, error) {
 	n, err := floatFitsInt64(f)
 	if err != nil {
 		return 0, err
 	}
-	var bound int64 = 1 << 53
-	if bits == 32 {
-		bound = 1 << 24
-	}
+	bound := floatMantissaLimit(bits)
 	if n < -bound || n > bound {
 		return 0, fmt.Errorf("value %v exceeds float%d exact-precision range", f, bits)
 	}
@@ -470,14 +479,8 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 		// targets via the 1<<24 / 1<<53 mantissa-precision check.
 		return v, true, fmt.Errorf("integer %s overflows float exact precision", s)
 	}
-	f, err := strconv.ParseFloat(s, 64)
+	f, err := parseFloatAcceptOverflow(s)
 	if err != nil {
-		// ErrRange + infinite result: ParseFloat's "error" returns the
-		// correct Avro wire value (±Inf bits) — accept rather than
-		// reject. Syntax errors (other than ErrRange) still surface.
-		if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
-			return reflect.ValueOf(f), true, nil
-		}
 		return v, true, fmt.Errorf("invalid JSON number %q: %w", s, err)
 	}
 	return reflect.ValueOf(f), true, nil
@@ -610,30 +613,32 @@ func jsonNumberToInt64(v reflect.Value) (int64, bool, error) {
 	return n, true, nil
 }
 
-func serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
+// appendAvroInt appends v as an Avro int (zigzag varint, narrowed to int32).
+// Accepts reflect.Int*/Uint*/Float*/json.Number with overflow + precision
+// checks per type. Direct-call helper — compiler inlines at every site.
+func appendAvroInt(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanInt() {
 		n := v.Int()
 		if n < math.MinInt32 || n > math.MaxInt32 {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 		}
 		return appendVarint(dst, int32(n)), nil
-	} else if v.CanUint() {
+	}
+	if v.CanUint() {
 		n := v.Uint()
 		if n > math.MaxInt32 {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 		}
 		return appendVarint(dst, int32(n)), nil
-	} else if v.CanFloat() {
+	}
+	if v.CanFloat() {
 		n, err := floatFitsInt32From(v.Float(), v.Type().Bits())
 		if err != nil {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: err}
 		}
 		return appendVarint(dst, n), nil
-	} else if n, ok, err := jsonNumberToInt64(v); ok {
+	}
+	if n, ok, err := jsonNumberToInt64(v); ok {
 		if err != nil {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "int", Err: err}
 		}
@@ -645,32 +650,48 @@ func serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "int"}
 }
 
-func serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	v, err := indirect(v)
-	if err != nil {
-		return nil, err
-	}
+// appendAvroLong is appendAvroInt with the int64 bound + varlong emit.
+func appendAvroLong(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanInt() {
-		return appendVarlong(dst, int64(v.Int())), nil
-	} else if v.CanUint() {
+		return appendVarlong(dst, v.Int()), nil
+	}
+	if v.CanUint() {
 		n := v.Uint()
 		if n > math.MaxInt64 {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
 		}
 		return appendVarlong(dst, int64(n)), nil
-	} else if v.CanFloat() {
+	}
+	if v.CanFloat() {
 		n, err := floatFitsInt64From(v.Float(), v.Type().Bits())
 		if err != nil {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: err}
 		}
 		return appendVarlong(dst, n), nil
-	} else if n, ok, err := jsonNumberToInt64(v); ok {
+	}
+	if n, ok, err := jsonNumberToInt64(v); ok {
 		if err != nil {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "long", Err: err}
 		}
 		return appendVarlong(dst, n), nil
 	}
 	return nil, &SemanticError{GoType: v.Type(), AvroType: "long"}
+}
+
+func serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	return appendAvroInt(dst, v)
+}
+
+func serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
+	v, err := indirect(v)
+	if err != nil {
+		return nil, err
+	}
+	return appendAvroLong(dst, v)
 }
 
 func serFloat(dst []byte, v reflect.Value, _ int) ([]byte, error) {
@@ -720,18 +741,18 @@ func appendAvroFloat32(dst []byte, v reflect.Value) ([]byte, error) {
 		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	}
 	if v.CanInt() {
-		n := v.Int()
-		if n < -1<<24 || n > 1<<24 {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: errors.New("integer overflows float32 exact precision")}
+		f, err := intFitsFloat(v.Int(), 32)
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: err}
 		}
-		return appendUint32(dst, math.Float32bits(float32(n))), nil
+		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	}
 	if v.CanUint() {
-		n := v.Uint()
-		if n > 1<<24 {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: errors.New("integer overflows float32 exact precision")}
+		f, err := uintFitsFloat(v.Uint(), 32)
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: err}
 		}
-		return appendUint32(dst, math.Float32bits(float32(n))), nil
+		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	}
 	if fv, ok, err := jsonNumberToFloat(v); ok {
 		if err != nil {
@@ -750,18 +771,18 @@ func appendAvroFloat64(dst []byte, v reflect.Value) ([]byte, error) {
 		return appendUint64(dst, math.Float64bits(v.Float())), nil
 	}
 	if v.CanInt() {
-		n := v.Int()
-		if n < -1<<53 || n > 1<<53 {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: errors.New("integer overflows float64 exact precision")}
+		f, err := intFitsFloat(v.Int(), 64)
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: err}
 		}
-		return appendUint64(dst, math.Float64bits(float64(n))), nil
+		return appendUint64(dst, math.Float64bits(f)), nil
 	}
 	if v.CanUint() {
-		n := v.Uint()
-		if n > 1<<53 {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: errors.New("integer overflows float64 exact precision")}
+		f, err := uintFitsFloat(v.Uint(), 64)
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "double", Err: err}
 		}
-		return appendUint64(dst, math.Float64bits(float64(n))), nil
+		return appendUint64(dst, math.Float64bits(f)), nil
 	}
 	if fv, ok, err := jsonNumberToFloat(v); ok {
 		if err != nil {
@@ -1193,13 +1214,8 @@ func (s *serArray) serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error
 				return nil, &SemanticError{AvroType: "boolean", Err: err}
 			}
 		}
-		if elem.Kind() != reflect.Bool {
-			return nil, &SemanticError{GoType: elem.Type(), AvroType: "boolean"}
-		}
-		if elem.Bool() {
-			dst = append(dst, 1)
-		} else {
-			dst = append(dst, 0)
+		if dst, err = appendAvroBool(dst, elem); err != nil {
+			return nil, err
 		}
 	}
 	return append(dst, 0), nil
@@ -1217,34 +1233,8 @@ func (s *serArray) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 				return nil, &SemanticError{AvroType: "int", Err: err}
 			}
 		}
-		if elem.CanInt() {
-			n := elem.Int()
-			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			dst = appendVarint(dst, int32(n))
-		} else if elem.CanUint() {
-			n := elem.Uint()
-			if n > math.MaxInt32 {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			dst = appendVarint(dst, int32(n))
-		} else if elem.CanFloat() {
-			n, err := floatFitsInt32From(elem.Float(), elem.Type().Bits())
-			if err != nil {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: err}
-			}
-			dst = appendVarint(dst, n)
-		} else if n, ok, err := jsonNumberToInt64(elem); ok {
-			if err != nil {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: err}
-			}
-			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			dst = appendVarint(dst, int32(n))
-		} else {
-			return nil, &SemanticError{GoType: elem.Type(), AvroType: "int"}
+		if dst, err = appendAvroInt(dst, elem); err != nil {
+			return nil, err
 		}
 	}
 	return append(dst, 0), nil
@@ -1262,27 +1252,8 @@ func (s *serArray) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 				return nil, &SemanticError{AvroType: "long", Err: err}
 			}
 		}
-		if elem.CanInt() {
-			dst = appendVarlong(dst, elem.Int())
-		} else if elem.CanUint() {
-			n := elem.Uint()
-			if n > math.MaxInt64 {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
-			}
-			dst = appendVarlong(dst, int64(n))
-		} else if elem.CanFloat() {
-			n, err := floatFitsInt64From(elem.Float(), elem.Type().Bits())
-			if err != nil {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: err}
-			}
-			dst = appendVarlong(dst, n)
-		} else if n, ok, err := jsonNumberToInt64(elem); ok {
-			if err != nil {
-				return nil, &SemanticError{GoType: elem.Type(), AvroType: "long", Err: err}
-			}
-			dst = appendVarlong(dst, n)
-		} else {
-			return nil, &SemanticError{GoType: elem.Type(), AvroType: "long"}
+		if dst, err = appendAvroLong(dst, elem); err != nil {
+			return nil, err
 		}
 	}
 	return append(dst, 0), nil
@@ -1405,13 +1376,8 @@ func (s *serMap) serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) 
 				return nil, &SemanticError{AvroType: "boolean", Err: err}
 			}
 		}
-		if val.Kind() != reflect.Bool {
-			return nil, &SemanticError{GoType: val.Type(), AvroType: "boolean"}
-		}
-		if val.Bool() {
-			dst = append(dst, 1)
-		} else {
-			dst = append(dst, 0)
+		if dst, err = appendAvroBool(dst, val); err != nil {
+			return nil, err
 		}
 	}
 	return append(dst, 0), nil
@@ -1431,34 +1397,8 @@ func (s *serMap) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 				return nil, &SemanticError{AvroType: "int", Err: err}
 			}
 		}
-		if val.CanInt() {
-			n := val.Int()
-			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			dst = appendVarint(dst, int32(n))
-		} else if val.CanUint() {
-			n := val.Uint()
-			if n > math.MaxInt32 {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			dst = appendVarint(dst, int32(n))
-		} else if val.CanFloat() {
-			n, err := floatFitsInt32From(val.Float(), val.Type().Bits())
-			if err != nil {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: err}
-			}
-			dst = appendVarint(dst, n)
-		} else if n, ok, err := jsonNumberToInt64(val); ok {
-			if err != nil {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: err}
-			}
-			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			dst = appendVarint(dst, int32(n))
-		} else {
-			return nil, &SemanticError{GoType: val.Type(), AvroType: "int"}
+		if dst, err = appendAvroInt(dst, val); err != nil {
+			return nil, err
 		}
 	}
 	return append(dst, 0), nil
@@ -1478,27 +1418,8 @@ func (s *serMap) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 				return nil, &SemanticError{AvroType: "long", Err: err}
 			}
 		}
-		if val.CanInt() {
-			dst = appendVarlong(dst, val.Int())
-		} else if val.CanUint() {
-			n := val.Uint()
-			if n > math.MaxInt64 {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
-			}
-			dst = appendVarlong(dst, int64(n))
-		} else if val.CanFloat() {
-			n, err := floatFitsInt64From(val.Float(), val.Type().Bits())
-			if err != nil {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: err}
-			}
-			dst = appendVarlong(dst, n)
-		} else if n, ok, err := jsonNumberToInt64(val); ok {
-			if err != nil {
-				return nil, &SemanticError{GoType: val.Type(), AvroType: "long", Err: err}
-			}
-			dst = appendVarlong(dst, n)
-		} else {
-			return nil, &SemanticError{GoType: val.Type(), AvroType: "long"}
+		if dst, err = appendAvroLong(dst, val); err != nil {
+			return nil, err
 		}
 	}
 	return append(dst, 0), nil
@@ -1810,9 +1731,7 @@ func serTimeMillis(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return appendVarint(dst, ms), nil
 	}
 	if v.Type() == timeType {
-		t := v.Interface().(time.Time)
-		d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
-		ms, err := durationToTimeMillis(d)
+		ms, err := durationToTimeMillis(timeOfDay(v.Interface().(time.Time)))
 		if err != nil {
 			return nil, &SemanticError{GoType: timeType, AvroType: "time-millis", Err: err}
 		}
@@ -1832,9 +1751,7 @@ func serTimeMicros(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return appendVarlong(dst, time.Duration(v.Int()).Microseconds()), nil
 	}
 	if v.Type() == timeType {
-		t := v.Interface().(time.Time)
-		d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
-		return appendVarlong(dst, d.Microseconds()), nil
+		return appendVarlong(dst, timeOfDay(v.Interface().(time.Time)).Microseconds()), nil
 	}
 	return serLong(dst, v, depth)
 }
