@@ -1,9 +1,9 @@
 package avro
 
 import (
-	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"reflect"
 	"sync"
 	"time"
@@ -684,9 +684,7 @@ func usTimeMillis(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 // time-of-day fields and encodes as time-millis, mirroring the
 // serTimeMillis(timeType) safe-path arm.
 func usTimeMillisTime(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-	t := *(*time.Time)(p)
-	d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
-	ms, err := durationToTimeMillis(d)
+	ms, err := durationToTimeMillis(timeOfDay(*(*time.Time)(p)))
 	if err != nil {
 		return nil, &SemanticError{GoType: timeType, AvroType: "time-millis", Err: err}
 	}
@@ -699,94 +697,70 @@ func usTimeMicros(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 
 // usTimeMicrosTime mirrors serTimeMicros(timeType).
 func usTimeMicrosTime(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-	t := *(*time.Time)(p)
-	d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
-	return appendVarlong(dst, d.Microseconds()), nil
+	return appendVarlong(dst, timeOfDay(*(*time.Time)(p)).Microseconds()), nil
 }
 
-func udTimestampMillis(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
+// udTimeFromVarint reads a varint and stores conv(val) into *T.
+func udTimeFromVarint[T any](conv func(int32) T) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		val, src, err := readVarint(src)
+		if err != nil {
+			return nil, err
+		}
+		*(*T)(p) = conv(val)
+		return src, nil
 	}
-	*(*time.Time)(p) = timestampMillisToTime(val)
-	return src, nil
 }
 
-func udTimestampMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
+// udTimeFromVarlong is udTimeFromVarint's varlong sibling.
+func udTimeFromVarlong[T any](conv func(int64) T) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		val, src, err := readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		*(*T)(p) = conv(val)
+		return src, nil
 	}
-	*(*time.Time)(p) = timestampMicrosToTime(val)
-	return src, nil
 }
 
-func udTimestampNanos(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
+// udTimeFromVarlongChecked is udTimeFromVarlong for fallible converters.
+func udTimeFromVarlongChecked[T any](conv func(int64) (T, error)) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		val, src, err := readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		out, err := conv(val)
+		if err != nil {
+			return nil, err
+		}
+		*(*T)(p) = out
+		return src, nil
 	}
-	*(*time.Time)(p) = timestampNanosToTime(val)
-	return src, nil
 }
 
-func udDate(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Time)(p) = dateToTime(val)
-	return src, nil
-}
-
-func udTimeMillis(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Duration)(p) = timeMillisToDuration(val)
-	return src, nil
-}
-
-// udTimeMillisTime is the time.Time variant of udTimeMillis, materializing
-// the time-of-day duration at epoch midnight (UTC). Mirrors
-// deserTimeMillis's timeType safe-path arm.
-func udTimeMillisTime(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Time)(p) = timeOfDayToTime(timeMillisToDuration(val))
-	return src, nil
-}
-
-func udTimeMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
-	}
-	d, err := timeMicrosToDuration(val)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Duration)(p) = d
-	return src, nil
-}
-
-// udTimeMicrosTime is the time.Time variant of udTimeMicros.
-func udTimeMicrosTime(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
-	}
-	d, err := timeMicrosToDuration(val)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Time)(p) = timeOfDayToTime(d)
-	return src, nil
-}
+// *Time variants materialize the time-of-day count as a time.Time at
+// epoch midnight (UTC) — used when a struct field is typed as time.Time
+// but the schema is time-millis/time-micros.
+var (
+	udTimestampMillis = udTimeFromVarlong(timestampMillisToTime)
+	udTimestampMicros = udTimeFromVarlong(timestampMicrosToTime)
+	udTimestampNanos  = udTimeFromVarlong(timestampNanosToTime)
+	udDate            = udTimeFromVarint(dateToTime)
+	udTimeMillis      = udTimeFromVarint(timeMillisToDuration)
+	udTimeMillisTime  = udTimeFromVarint(func(v int32) time.Time {
+		return timeOfDayToTime(timeMillisToDuration(v))
+	})
+	udTimeMicros     = udTimeFromVarlongChecked(timeMicrosToDuration)
+	udTimeMicrosTime = udTimeFromVarlongChecked(func(v int64) (time.Time, error) {
+		d, err := timeMicrosToDuration(v)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return timeOfDayToTime(d), nil
+	})
+)
 
 func usDuration(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	d := *(*Duration)(p)
@@ -866,61 +840,69 @@ func usBool(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
+// usVarintFrom is udVarintTo's serialize-side mirror: reads a typed
+// integer via unsafe pointer, range-checks, writes as Avro int.
+func usVarintFrom[T intLike](lo, hi int64) userfn {
+	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
+		n := int64(*(*T)(p))
+		if n < lo || n > hi {
+			return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
+		}
+		return appendVarint(dst, int32(n)), nil
+	}
+}
+
+// usVarlongFrom is usVarintFrom's varlong (Avro long) sibling.
+func usVarlongFrom[T intLike](lo, hi int64) userfn {
+	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
+		n := int64(*(*T)(p))
+		if n < lo || n > hi {
+			return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
+		}
+		return appendVarlong(dst, n), nil
+	}
+}
+
+// usVarlongFromUnsigned is usVarlongFrom for unsigned T. The upper
+// bound is checked in uint64 space since uint64 > MaxInt64 can't
+// round-trip through int64.
+func usVarlongFromUnsigned[T uint | uint8 | uint16 | uint32 | uint64]() userfn {
+	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
+		n := uint64(*(*T)(p))
+		if n > math.MaxInt64 {
+			return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
+		}
+		return appendVarlong(dst, int64(n)), nil
+	}
+}
+
 func usInt(k reflect.Kind) userfn {
 	switch k {
 	case reflect.Int:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*int)(p)
-			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			return appendVarint(dst, int32(n)), nil
-		}
+		// On 64-bit int can exceed int32; bound check applies.
+		return usVarintFrom[int](math.MinInt32, math.MaxInt32)
 	case reflect.Int8:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, int32(*(*int8)(p))), nil
-		}
+		return usVarintFrom[int8](math.MinInt64, math.MaxInt64)
 	case reflect.Int16:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, int32(*(*int16)(p))), nil
-		}
+		return usVarintFrom[int16](math.MinInt64, math.MaxInt64)
 	case reflect.Int32:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, *(*int32)(p)), nil
-		}
+		return usVarintFrom[int32](math.MinInt64, math.MaxInt64)
 	case reflect.Int64:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*int64)(p)
-			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			return appendVarint(dst, int32(n)), nil
-		}
+		return usVarintFrom[int64](math.MinInt32, math.MaxInt32)
 	case reflect.Uint:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*uint)(p)
-			if n > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			return appendVarint(dst, int32(n)), nil
-		}
+		// uint as int64 max — bound applies on 64-bit too (uint > MaxInt32 possible).
+		return usVarintFrom[uint](0, math.MaxInt32)
 	case reflect.Uint8:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint8)(p))), nil
-		}
+		return usVarintFrom[uint8](math.MinInt64, math.MaxInt64)
 	case reflect.Uint16:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint16)(p))), nil
-		}
+		return usVarintFrom[uint16](math.MinInt64, math.MaxInt64)
 	case reflect.Uint32:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*uint32)(p)
-			if n > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			return appendVarint(dst, int32(n)), nil
-		}
+		return usVarintFrom[uint32](0, math.MaxInt32)
 	case reflect.Uint64:
+		// uint64 > MaxInt64 can't be represented as int64 — but the
+		// usVarintFrom int64 cast already truncates negative-when-
+		// reinterpreted values. Match the prior behavior by using
+		// the unsigned-aware bound directly.
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 			n := *(*uint64)(p)
 			if n > math.MaxInt32 {
@@ -936,53 +918,25 @@ func usInt(k reflect.Kind) userfn {
 func usLong(k reflect.Kind) userfn {
 	switch k {
 	case reflect.Int:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*int)(p))), nil
-		}
+		return usVarlongFrom[int](math.MinInt64, math.MaxInt64)
 	case reflect.Int8:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*int8)(p))), nil
-		}
+		return usVarlongFrom[int8](math.MinInt64, math.MaxInt64)
 	case reflect.Int16:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*int16)(p))), nil
-		}
+		return usVarlongFrom[int16](math.MinInt64, math.MaxInt64)
 	case reflect.Int32:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*int32)(p))), nil
-		}
+		return usVarlongFrom[int32](math.MinInt64, math.MaxInt64)
 	case reflect.Int64:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, *(*int64)(p)), nil
-		}
+		return usVarlongFrom[int64](math.MinInt64, math.MaxInt64)
 	case reflect.Uint:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*uint)(p)
-			if uint64(n) > math.MaxInt64 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
-			}
-			return appendVarlong(dst, int64(n)), nil
-		}
+		return usVarlongFromUnsigned[uint]()
 	case reflect.Uint8:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*uint8)(p))), nil
-		}
+		return usVarlongFromUnsigned[uint8]()
 	case reflect.Uint16:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*uint16)(p))), nil
-		}
+		return usVarlongFromUnsigned[uint16]()
 	case reflect.Uint32:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*uint32)(p))), nil
-		}
+		return usVarlongFromUnsigned[uint32]()
 	case reflect.Uint64:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*uint64)(p)
-			if n > math.MaxInt64 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
-			}
-			return appendVarlong(dst, int64(n)), nil
-		}
+		return usVarlongFromUnsigned[uint64]()
 	default:
 		return nil
 	}
@@ -1049,120 +1003,70 @@ func udBool(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src[1:], nil
 }
 
+// intLike covers all signed and unsigned integer kinds.
+type intLike interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64
+}
+
+// udVarintTo reads a varint (int32 wire), range-checks against [lo, hi]
+// in int64 space, and stores the narrowed result into *T. lo=MinInt64 /
+// hi=MaxInt64 disables the range check.
+func udVarintTo[T intLike](lo, hi int64, avroType, targetName string) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		v, src, err := readVarint(src)
+		if err != nil {
+			return nil, err
+		}
+		if int64(v) < lo || int64(v) > hi {
+			return nil, &SemanticError{AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", v, targetName)}
+		}
+		*(*T)(p) = T(v)
+		return src, nil
+	}
+}
+
+// udVarlongTo is udVarintTo's varlong (int64 wire) sibling.
+func udVarlongTo[T intLike](lo, hi int64, avroType, targetName string) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		v, src, err := readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		if v < lo || v > hi {
+			return nil, &SemanticError{AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", v, targetName)}
+		}
+		*(*T)(p) = T(v)
+		return src, nil
+	}
+}
+
 func udInt(k reflect.Kind) udeserfn {
 	switch k {
 	case reflect.Int:
-		// int32 always fits in int (int is int32 or int64).
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			*(*int)(p) = int(v)
-			return src, nil
-		}
+		// int32 wire always fits in int (int is int32 or int64).
+		return udVarintTo[int](math.MinInt64, math.MaxInt64, "int", "int")
 	case reflect.Int8:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt8 || v > math.MaxInt8 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int8", v)}
-			}
-			*(*int8)(p) = int8(v)
-			return src, nil
-		}
+		return udVarintTo[int8](math.MinInt8, math.MaxInt8, "int", "int8")
 	case reflect.Int16:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt16 || v > math.MaxInt16 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int16", v)}
-			}
-			*(*int16)(p) = int16(v)
-			return src, nil
-		}
+		return udVarintTo[int16](math.MinInt16, math.MaxInt16, "int", "int16")
 	case reflect.Int32:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			*(*int32)(p) = v
-			return src, nil
-		}
+		return udVarintTo[int32](math.MinInt64, math.MaxInt64, "int", "int32")
 	case reflect.Int64:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			*(*int64)(p) = int64(v)
-			return src, nil
-		}
+		return udVarintTo[int64](math.MinInt64, math.MaxInt64, "int", "int64")
 	case reflect.Uint:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint", v)}
-			}
-			*(*uint)(p) = uint(v)
-			return src, nil
-		}
+		// Varint wire is int32; uint is always wide enough — only
+		// the lower-bound (v < 0) check matters. hi=MaxInt64 is
+		// effectively unbounded.
+		return udVarintTo[uint](0, math.MaxInt64, "int", "uint")
 	case reflect.Uint8:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint8 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint8", v)}
-			}
-			*(*uint8)(p) = uint8(v)
-			return src, nil
-		}
+		return udVarintTo[uint8](0, math.MaxUint8, "int", "uint8")
 	case reflect.Uint16:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint16 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint16", v)}
-			}
-			*(*uint16)(p) = uint16(v)
-			return src, nil
-		}
+		return udVarintTo[uint16](0, math.MaxUint16, "int", "uint16")
 	case reflect.Uint32:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint32", v)}
-			}
-			*(*uint32)(p) = uint32(v)
-			return src, nil
-		}
+		return udVarintTo[uint32](0, math.MaxInt64, "int", "uint32")
 	case reflect.Uint64:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint64", v)}
-			}
-			*(*uint64)(p) = uint64(v)
-			return src, nil
-		}
+		return udVarintTo[uint64](0, math.MaxInt64, "int", "uint64")
 	default:
 		return nil
 	}
@@ -1171,125 +1075,36 @@ func udInt(k reflect.Kind) udeserfn {
 func udLong(k reflect.Kind) udeserfn {
 	switch k {
 	case reflect.Int:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			// On 32-bit platforms int is int32; bound-check.
-			if v < math.MinInt || v > math.MaxInt {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int", v)}
-			}
-			*(*int)(p) = int(v)
-			return src, nil
-		}
+		// On 64-bit int holds any int64; on 32-bit int is int32 so
+		// the bound check is real. math.MinInt/MaxInt resolve per
+		// platform.
+		return udVarlongTo[int](math.MinInt, math.MaxInt, "long", "int")
 	case reflect.Int8:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt8 || v > math.MaxInt8 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int8", v)}
-			}
-			*(*int8)(p) = int8(v)
-			return src, nil
-		}
+		return udVarlongTo[int8](math.MinInt8, math.MaxInt8, "long", "int8")
 	case reflect.Int16:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt16 || v > math.MaxInt16 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int16", v)}
-			}
-			*(*int16)(p) = int16(v)
-			return src, nil
-		}
+		return udVarlongTo[int16](math.MinInt16, math.MaxInt16, "long", "int16")
 	case reflect.Int32:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt32 || v > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int32", v)}
-			}
-			*(*int32)(p) = int32(v)
-			return src, nil
-		}
+		return udVarlongTo[int32](math.MinInt32, math.MaxInt32, "long", "int32")
 	case reflect.Int64:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			*(*int64)(p) = v
-			return src, nil
-		}
+		return udVarlongTo[int64](math.MinInt64, math.MaxInt64, "long", "int64")
 	case reflect.Uint:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			// On 64-bit uint can hold any non-negative int64; on 32-bit
-			// uint = uint32, so additionally cap at MaxUint32 via MaxUint.
-			if v < 0 || uint64(v) > math.MaxUint {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint", v)}
-			}
-			*(*uint)(p) = uint(v)
-			return src, nil
+		// On 64-bit uint = uint64 holds any non-negative int64; on
+		// 32-bit uint = uint32, so cap at MaxUint32. bits.UintSize
+		// is a compile-time constant so the branch resolves to
+		// dead code on the non-matching platform.
+		hi := int64(math.MaxInt64)
+		if bits.UintSize == 32 {
+			hi = math.MaxUint32
 		}
+		return udVarlongTo[uint](0, hi, "long", "uint")
 	case reflect.Uint8:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint8 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint8", v)}
-			}
-			*(*uint8)(p) = uint8(v)
-			return src, nil
-		}
+		return udVarlongTo[uint8](0, math.MaxUint8, "long", "uint8")
 	case reflect.Uint16:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint16 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint16", v)}
-			}
-			*(*uint16)(p) = uint16(v)
-			return src, nil
-		}
+		return udVarlongTo[uint16](0, math.MaxUint16, "long", "uint16")
 	case reflect.Uint32:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint32 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint32", v)}
-			}
-			*(*uint32)(p) = uint32(v)
-			return src, nil
-		}
+		return udVarlongTo[uint32](0, math.MaxUint32, "long", "uint32")
 	case reflect.Uint64:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint64", v)}
-			}
-			*(*uint64)(p) = uint64(v)
-			return src, nil
-		}
+		return udVarlongTo[uint64](0, math.MaxInt64, "long", "uint64")
 	default:
 		return nil
 	}
@@ -1636,26 +1451,15 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minIt
 		defer func() { sl.depth-- }()
 		v := reflect.NewAt(sliceType, p).Elem()
 		v.SetLen(0)
-		var err error
 		var totalItems int64
 		for {
-			var count int64
-			count, src, err = readVarlong(src)
+			count, _, rest, end, err := readBlockHeader(src, "array", false)
 			if err != nil {
 				return nil, err
 			}
-			if count == 0 {
+			src = rest
+			if end {
 				return src, nil
-			}
-			if count < 0 {
-				count = -count
-				if count < 0 {
-					return nil, errors.New("invalid array block count")
-				}
-				_, src, err = readVarlong(src)
-				if err != nil {
-					return nil, err
-				}
 			}
 			if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
 				return nil, err
@@ -1731,26 +1535,15 @@ func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type, min
 		defer func() { sl.depth-- }()
 		v := reflect.NewAt(sliceType, p).Elem()
 		v.SetLen(0)
-		var err error
 		var totalItems int64
 		for {
-			var count int64
-			count, src, err = readVarlong(src)
+			count, _, rest, end, err := readBlockHeader(src, "array", false)
 			if err != nil {
 				return nil, err
 			}
-			if count == 0 {
+			src = rest
+			if end {
 				return src, nil
-			}
-			if count < 0 {
-				count = -count
-				if count < 0 {
-					return nil, errors.New("invalid array block count")
-				}
-				_, src, err = readVarlong(src)
-				if err != nil {
-					return nil, err
-				}
 			}
 			if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
 				return nil, err
