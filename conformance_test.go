@@ -6080,6 +6080,111 @@ func TestRegression_SchemaDefaultOverflowToInfParity(t *testing.T) {
 	// encode-side fix at ae99f46.
 }
 
+// TestRegression_DefaultFloatIntegerOverflowPrecisionLoss: a
+// schema-declared float/double default whose integer magnitude
+// exceeds the target's mantissa precision (1<<24 for float, 1<<53
+// for double) must reject at schema-parse time so it agrees with
+// the runtime json.Number encode arm. Pre-fix: parse accepted,
+// binary encode silently rounded, JSON encode rejected, and
+// Schema.Root().Fields[0].Default returned the preserved literal —
+// four observable surfaces, two values.
+func TestRegression_DefaultFloatIntegerOverflowPrecisionLoss(t *testing.T) {
+	type rejectCase struct {
+		name       string
+		typ        string
+		defaultLit string
+	}
+	rejects := []rejectCase{
+		// float target: 2^24 mantissa boundary.
+		{"float_2_24_plus_1_int_literal", "float", "16777217"},
+		{"float_2_24_plus_3_int_literal", "float", "16777219"},
+		{"float_neg_2_24_minus_1", "float", "-16777217"},
+		// double target: 2^53 mantissa boundary.
+		{"double_2_53_plus_1_int_literal", "double", "9007199254740993"},
+		{"double_2_53_plus_3_int_literal", "double", "9007199254740995"},
+		{"double_neg_2_53_minus_1", "double", "-9007199254740993"},
+		// Integer-form magnitude beyond int64 (≈10^20) — also rejected.
+		{"double_beyond_int64", "double", "99999999999999999999"},
+		// String-arm: same shape via defaultAsFloat string arm.
+		{"double_string_form_2_53_plus_1", "double", `"9007199254740993"`},
+		{"float_string_form_2_24_plus_1", "float", `"16777217"`},
+		// Beyond-int64 magnitude via the string arm: a self-audit during
+		// F2 fix authoring caught the string arm fall-through bug —
+		// ParseInt fails with ErrRange on "99999999999999999999", and
+		// the unchecked fall-through to ParseFloat silently rounded to
+		// 1e20. Now rejected with looksDecimalIntegerLiteral gating the
+		// "ParseInt-fails-means-integer-magnitude-beyond-int64" branch.
+		{"double_string_beyond_int64", "double", `"99999999999999999999"`},
+		{"double_string_neg_beyond_int64", "double", `"-99999999999999999999"`},
+		// Coerce-via-union: union-typed default goes through coerceDefault's
+		// union branch matcher, which now routes through the precision-
+		// aware defaultAsFloat.
+		{"union_double_null_overflow_string", "double", `"9007199254740993"`}, // single-type, but exercises the same path
+	}
+	for _, tc := range rejects {
+		t.Run(tc.name+"/reject", func(t *testing.T) {
+			schemaJSON := `{"type":"record","name":"R","fields":[{"name":"f","type":"` + tc.typ + `","default":` + tc.defaultLit + `}]}`
+			_, err := avro.Parse(schemaJSON)
+			if err == nil {
+				t.Fatalf("expected reject for %s default %s; parse accepted", tc.typ, tc.defaultLit)
+			}
+			// Error message must name the overflow direction so callers
+			// can diagnose; "overflows float%d exact precision" mirrors
+			// the encode-arm error text byte-for-byte (modulo "avro json:"
+			// JSON-side prefix).
+			if !strings.Contains(err.Error(), "overflows float") {
+				t.Errorf("expected 'overflows float%%d exact precision' in error, got: %v", err)
+			}
+		})
+	}
+
+	// Boundary-value acceptance: values AT the precision limit (not
+	// beyond) must still parse. 2^24 = 16777216 is the last exact
+	// integer in float32; 2^53 = 9007199254740992 is the last exact
+	// integer in float64.
+	type acceptCase struct {
+		name       string
+		typ        string
+		defaultLit string
+	}
+	accepts := []acceptCase{
+		{"float_2_24_boundary", "float", "16777216"},
+		{"float_neg_2_24_boundary", "float", "-16777216"},
+		{"double_2_53_boundary", "double", "9007199254740992"},
+		{"double_neg_2_53_boundary", "double", "-9007199254740992"},
+		// Small ints stay accepted (regression guard against
+		// over-aggressive tightening).
+		{"float_small", "float", "0"},
+		{"double_small", "double", "42"},
+		// Exponent-form / fractional-form unchanged (always lossy by
+		// nature, ParseFloat-handled).
+		{"double_fractional_exact", "double", "1.5"},
+		{"double_exponent", "double", "1e10"},
+		// Overflow-to-Inf (exponent-form) still accepted via the
+		// existing TestRegression_SchemaDefaultOverflowToInfParity
+		// path; locked here too for cross-test invariance.
+		{"double_exp_overflow_to_inf", "double", "1e1000"},
+		// String-form values that are explicitly NOT decimal-integer
+		// literals stay on the ParseFloat path (Java-parity lenient
+		// preserved). The looksDecimalIntegerLiteral gate is what
+		// keeps the precision-strict int-form branch from intercepting
+		// these: ParseFloat handles them at its inherent float-precision
+		// without claiming exact-integer semantics.
+		{"double_string_hex_float", "double", `"0x1p10"`},  // 1024
+		{"float_string_exp_form", "float", `"1.5e5"`},      // 150000, fits float32
+		{"double_string_special_inf", "double", `"Inf"`},   // ParseFloat accepts "Inf"
+		{"double_string_special_nan", "double", `"NaN"`},   // ParseFloat accepts "NaN"
+	}
+	for _, tc := range accepts {
+		t.Run(tc.name+"/accept", func(t *testing.T) {
+			schemaJSON := `{"type":"record","name":"R","fields":[{"name":"f","type":"` + tc.typ + `","default":` + tc.defaultLit + `}]}`
+			if _, err := avro.Parse(schemaJSON); err != nil {
+				t.Fatalf("expected accept for %s default %s; got: %v", tc.typ, tc.defaultLit, err)
+			}
+		})
+	}
+}
+
 // TestRegression_LogicalTypeSoftDropMatrix locks in the F1 fix:
 // every known logical type, on every wrong underlying type, soft-drops
 // the logical and parses successfully as bare underlying — matching

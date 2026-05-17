@@ -2080,32 +2080,32 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				b.ser = sm.serString
 				dm.fastBlock = deserMapStringBlock
 				dm.fastElemKind = reflect.String
-				dm.fastIfaceBlock = deserMapStringIfaceBlock
+				dm.fastIfaceVal = deserStringIface
 			case "boolean":
 				b.ser = sm.serBoolean
 				dm.fastBlock = deserMapBooleanBlock
 				dm.fastElemKind = reflect.Bool
-				dm.fastIfaceBlock = deserMapBooleanIfaceBlock
+				dm.fastIfaceVal = deserBooleanIface
 			case "int":
 				b.ser = sm.serInt
 				dm.fastBlock = deserMapIntBlock
 				dm.fastElemKind = reflect.Int32
-				dm.fastIfaceBlock = deserMapIntIfaceBlock
+				dm.fastIfaceVal = deserIntIface
 			case "long":
 				b.ser = sm.serLong
 				dm.fastBlock = deserMapLongBlock
 				dm.fastElemKind = reflect.Int64
-				dm.fastIfaceBlock = deserMapLongIfaceBlock
+				dm.fastIfaceVal = deserLongIface
 			case "float":
 				b.ser = sm.serFloat
 				dm.fastBlock = deserMapFloatBlock
 				dm.fastElemKind = reflect.Float32
-				dm.fastIfaceBlock = deserMapFloatIfaceBlock
+				dm.fastIfaceVal = deserFloatIface
 			case "double":
 				b.ser = sm.serDouble
 				dm.fastBlock = deserMapDoubleBlock
 				dm.fastElemKind = reflect.Float64
-				dm.fastIfaceBlock = deserMapDoubleIfaceBlock
+				dm.fastIfaceVal = deserDoubleIface
 			default:
 				b.ser = sm.ser
 			}
@@ -2478,11 +2478,21 @@ func normalizeJSONNumber(n json.Number) any {
 	return n
 }
 
-// defaultAsInt32 / defaultAsInt64 / defaultAsFloat64 extract a numeric
+// defaultAsInt32 / defaultAsInt64 / defaultAsFloat extract a numeric
 // default. After unmarshalDefault, a JSON number arrives as json.Number
 // (full precision); a few callers also pass float64 (e.g. round-tripped
 // through coerceDefault). Float-defaulted-from-string is accepted for
 // float / double (Java parser leniency).
+//
+// All three are precision-aware:
+//   - defaultAsInt32 / defaultAsInt64 reject overflow via
+//     parseInt{32,64}Lenient (which uses boundedRatFromString for
+//     arbitrary-precision parsing).
+//   - defaultAsFloat rejects integer-form magnitudes exceeding the
+//     target's mantissa precision (1<<24 for float, 1<<53 for double)
+//     so the schema's declared default is reachable at runtime via
+//     the equivalent json.Number / typed-int encode arms, which apply
+//     the same predicate.
 
 func defaultAsInt32(val any) (int32, error) {
 	switch v := val.(type) {
@@ -2504,55 +2514,106 @@ func defaultAsInt64(val any) (int64, error) {
 	return 0, fmt.Errorf("expected number, got %T", val)
 }
 
-func defaultAsFloat64(val any) (float64, error) {
+// floatMantissaLimit returns the largest integer magnitude exactly
+// representable in float32 (bitSize=32) or float64 (bitSize=64) —
+// the mantissa bound used for int↔float precision-loss checks.
+func floatMantissaLimit(bitSize int) int64 {
+	if bitSize == 32 {
+		return 1 << 24
+	}
+	return 1 << 53
+}
+
+func intFitsFloat(n int64, bitSize int) (float64, error) {
+	lim := floatMantissaLimit(bitSize)
+	if n < -lim || n > lim {
+		return 0, fmt.Errorf("integer %d overflows float%d exact precision", n, bitSize)
+	}
+	return float64(n), nil
+}
+
+func uintFitsFloat(n uint64, bitSize int) (float64, error) {
+	lim := uint64(floatMantissaLimit(bitSize))
+	if n > lim {
+		return 0, fmt.Errorf("integer %d overflows float%d exact precision", n, bitSize)
+	}
+	return float64(n), nil
+}
+
+// integerFormFitsFloat parses s as a decimal-integer literal and
+// verifies the value fits the target's mantissa precision.
+// (f, true, nil) on accept, (0, true, err) on integer-form overflow,
+// (0, false, nil) when s is not a decimal-integer literal — caller
+// then falls through to ParseFloat (preserves Java-parity lenient
+// hex-float / exponent-form acceptance).
+func integerFormFitsFloat(s string, bitSize int) (float64, bool, error) {
+	if len(s) == 0 {
+		return 0, false, nil
+	}
+	i := 0
+	if s[0] == '-' || s[0] == '+' {
+		i = 1
+	}
+	if i >= len(s) {
+		return 0, false, nil
+	}
+	for j := i; j < len(s); j++ {
+		c := s[j]
+		if c < '0' || c > '9' {
+			return 0, false, nil
+		}
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		f, err := intFitsFloat(n, bitSize)
+		return f, true, err
+	}
+	// ParseInt failed on a decimal-integer literal: ErrRange (magnitude
+	// beyond int64, and therefore beyond any float precision >1<<53).
+	// Reject directly — falling through to ParseFloat would silently
+	// round (e.g. "99999999999999999999" → 1e20).
+	return 0, true, fmt.Errorf("integer %s overflows float%d exact precision", s, bitSize)
+}
+
+// parseFloatAcceptOverflow is [strconv.ParseFloat] with one twist:
+// ErrRange-with-±Inf is treated as success (Java/fastavro return the
+// Inf; the wire format permits it). Other parse errors propagate.
+func parseFloatAcceptOverflow(s string) (float64, error) {
+	f, err := strconv.ParseFloat(s, 64)
+	if err == nil {
+		return f, nil
+	}
+	if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
+		return f, nil
+	}
+	return 0, err
+}
+
+// defaultAsFloat extracts a numeric default for a float (bitSize=32)
+// or double (bitSize=64) field. The string arm is Java-parity lenient
+// (accepts hex floats etc.); the json.Number arm is JSON-strict.
+func defaultAsFloat(val any, bitSize int) (float64, error) {
 	switch v := val.(type) {
 	case json.Number:
-		// JSON-spec grammar gate: a json.Number carries the typed
-		// promise "this was a JSON number". strconv.ParseFloat (called
-		// by json.Number.Float64) silently accepts hex floats and
-		// underscore-separated digits that the JSON spec rejects, so
-		// validate before parsing. Mirrors [jsonNumberToFloat] /
-		// [jsonCoerceToFloat64]'s json.Number arm.
 		s := v.String()
 		if !isJSONNumber(s) {
 			return 0, fmt.Errorf("invalid JSON number %q", s)
 		}
-		f, err := strconv.ParseFloat(s, 64)
+		if f, handled, err := integerFormFitsFloat(s, bitSize); handled {
+			return f, err
+		}
+		f, err := parseFloatAcceptOverflow(s)
 		if err != nil {
-			// (±Inf, strconv.ErrRange): the +Inf result IS the correct
-			// IEEE 754 / Avro wire value for the overflowing literal.
-			// Java's Double.parseDouble("1e1000") returns POSITIVE_INFINITY
-			// without throwing; Jackson's DoubleNode(+Inf) passes
-			// isValidDefault's isNumber() check. fastavro's
-			// _default_matches_schema runs float(default)=inf which is
-			// a Python float. Mirrors the encode-side [jsonNumberToFloat]
-			// and the decode-side decodeFloat/decodeDouble. Syntax
-			// errors still reject.
-			if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
-				return f, nil
-			}
 			return 0, fmt.Errorf("invalid number %s", s)
 		}
 		return f, nil
 	case float64:
 		return v, nil
 	case string:
-		// Java accepts "3.14" as a float/double default literal. The
-		// string arm is documented Java-parity lenient (see "Known
-		// intentional divergences" in AUDIT.md); we don't tighten it
-		// to strict JSON grammar — Java's Double.parseDouble accepts
-		// hex floats too, and the project principle is lenient default
-		// acceptance + least surprise for stringly-typed config inputs.
-		f, err := strconv.ParseFloat(v, 64)
+		if f, handled, err := integerFormFitsFloat(v, bitSize); handled {
+			return f, err
+		}
+		f, err := parseFloatAcceptOverflow(v)
 		if err != nil {
-			// Same ErrRange-with-Inf acceptance as the json.Number arm
-			// above: an overflowing string default like "1e1000" produces
-			// the correct ±Inf wire value. The string arm is Java-parity
-			// lenient (Double.parseDouble), so accepting overflow here
-			// matches Java's textual-default route at Schema.java:1900-1902.
-			if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
-				return f, nil
-			}
 			return 0, fmt.Errorf("invalid string default %q: %w", v, err)
 		}
 		return f, nil
@@ -2569,7 +2630,7 @@ func defaultAsFloat64(val any) (float64, error) {
 // per-branch dispatch, where the first branch with isCompatible wins.
 // We mirror that: union defaults pass through unchanged so a textual
 // default into ["string","float"] picks the string branch (matches
-// Java, fastavro, hamba). The float branch's defaultAsFloat64 has its
+// Java, fastavro, hamba). The float branch's defaultAsFloat has its
 // own string-fallback for the `{"type":"float","default":"3.14"}`
 // non-union case, kept here.
 //
@@ -2590,7 +2651,7 @@ func coerceDefault(val any, node *schemaNode) any {
 		// a `["float","null"]` default of `"1.5"` stays as a Go
 		// string and the JSON encoder's union try-each-branch loop
 		// hits jsonCoerceToFloat64 (which rejects strings); the
-		// binary encoder meanwhile coerces via defaultAsFloat64's
+		// binary encoder meanwhile coerces via defaultAsFloat's
 		// string fallback and picks the float branch — a silent
 		// binary/JSON divergence on `["float","string"]` unions.
 		for _, branch := range node.branches {
@@ -2603,22 +2664,25 @@ func coerceDefault(val any, node *schemaNode) any {
 	if node.kind != "float" && node.kind != "double" {
 		return val
 	}
-	str, ok := val.(string)
-	if !ok {
+	if _, ok := val.(string); !ok {
 		return val
 	}
-	f, err := strconv.ParseFloat(str, 64)
-	if err == nil {
+	bitSize := 32
+	if node.kind == "double" {
+		bitSize = 64
+	}
+	// Route through defaultAsFloat so the precision check fires uniformly
+	// with validateDefault's own check at schema.go's case "float", "double"
+	// arm. Without this, the string default's ParseFloat would silently
+	// round and then validateDefault (now seeing the float64 result) would
+	// accept — the precision-loss check at defaultAsFloat's string arm
+	// would never run. If defaultAsFloat rejects (precision overflow or
+	// syntax), leave the original string so validateDefault produces the
+	// canonical error message via the same arm on its own call.
+	if f, err := defaultAsFloat(val, bitSize); err == nil {
 		return f
 	}
-	// (±Inf, strconv.ErrRange) overflow: the +Inf result is the correct
-	// IEEE 754 wire value, so promote string→float64 rather than leaving
-	// the string for validateDefault to re-reject. Same predicate as
-	// defaultAsFloat64's two ParseFloat arms.
-	if errors.Is(err, strconv.ErrRange) && math.IsInf(f, 0) {
-		return f
-	}
-	return val // leave as-is; validateDefault will report the error
+	return val
 }
 
 // convertDefaultBytes walks a parsed-then-validated default value and
@@ -2738,7 +2802,11 @@ func validateDefault(val any, node *schemaNode) error {
 			return fmt.Errorf("long default: %w", err)
 		}
 	case "float", "double":
-		if _, err := defaultAsFloat64(val); err != nil {
+		bitSize := 64
+		if node.kind == "float" {
+			bitSize = 32
+		}
+		if _, err := defaultAsFloat(val, bitSize); err != nil {
 			return fmt.Errorf("%s default: %w", node.kind, err)
 		}
 	case "string":

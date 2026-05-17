@@ -721,7 +721,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return appendVarlong(dst, n), nil
 	case "float":
-		f, err := defaultAsFloat64(val)
+		f, err := defaultAsFloat(val, 32)
 		if err != nil {
 			return nil, fmt.Errorf("float default: %w", err)
 		}
@@ -731,7 +731,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	case "double":
-		f, err := defaultAsFloat64(val)
+		f, err := defaultAsFloat(val, 64)
 		if err != nil {
 			return nil, fmt.Errorf("double default: %w", err)
 		}
