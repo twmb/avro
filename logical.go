@@ -13,74 +13,48 @@ import (
 
 func timestampMillisToTime(val int64) time.Time { return time.UnixMilli(val).UTC() }
 
-// timeToTimestampMillis converts t to milliseconds since the Unix epoch,
-// returning an error when the result would overflow int64. Mirrors
-// Java's Instant.toEpochMilli (used by TimestampMillisConversion.toLong),
-// including the seconds<0 && nanos>0 adjustment branch that accepts
-// time.UnixMilli(MinInt64) — the symmetric form sec*1000+nsec/1e6 would
-// reject those inputs because Go normalizes them to sec=-maxSec-1
-// with nsec in [1, 1e9), which is below -maxSec.
-func timeToTimestampMillis(t time.Time) (int64, error) {
+// timeToTimestampScaled converts t to (sec*scale + nsec/subScale)
+// with int64 overflow protection. Pass subScale=1 for nanos (no
+// sub-second scaling). The seconds<0 && nanos>0 adjustment branch
+// is required for inputs Go normalizes via time.UnixMilli(MinInt64)
+// etc. (sec=-maxSec-1 with nsec in [1, 1e9) is below -maxSec under
+// the symmetric form).
+func timeToTimestampScaled(t time.Time, scale, subScale int64, unit string) (int64, error) {
 	sec := t.Unix()
 	nsec := int64(t.Nanosecond())
-	const scale = int64(1_000)
-	const subScale = int64(1_000_000) // ns per ms
-	const maxSec = math.MaxInt64 / scale
+	maxSec := math.MaxInt64 / scale
 	if sec < 0 && nsec > 0 {
-		// Adjustment branch: millis = (sec+1)*scale + (nsec/sub - scale).
+		// Adjustment branch: scaled = (sec+1)*scale + (nsec/sub - scale).
 		// Both terms are ≤ 0; only underflow is possible.
 		if sec+1 < -maxSec {
-			return 0, fmt.Errorf("time %v overflows int64 milliseconds since epoch", t)
+			return 0, fmt.Errorf("time %v overflows int64 %s since epoch", t, unit)
 		}
-		millis := (sec + 1) * scale
+		scaled := (sec + 1) * scale
 		adjustment := nsec/subScale - scale
-		if adjustment < math.MinInt64-millis {
-			return 0, fmt.Errorf("time %v overflows int64 milliseconds since epoch", t)
+		if adjustment < math.MinInt64-scaled {
+			return 0, fmt.Errorf("time %v overflows int64 %s since epoch", t, unit)
 		}
-		return millis + adjustment, nil
+		return scaled + adjustment, nil
 	}
 	if sec > maxSec || sec < -maxSec {
-		return 0, fmt.Errorf("time %v overflows int64 milliseconds since epoch", t)
+		return 0, fmt.Errorf("time %v overflows int64 %s since epoch", t, unit)
 	}
 	total := sec * scale
-	ms := nsec / subScale
-	if sec == maxSec && ms > math.MaxInt64-total {
-		return 0, fmt.Errorf("time %v overflows int64 milliseconds since epoch", t)
+	sub := nsec / subScale
+	if sec == maxSec && sub > math.MaxInt64-total {
+		return 0, fmt.Errorf("time %v overflows int64 %s since epoch", t, unit)
 	}
-	return total + ms, nil
+	return total + sub, nil
+}
+
+func timeToTimestampMillis(t time.Time) (int64, error) {
+	return timeToTimestampScaled(t, 1_000, 1_000_000, "milliseconds")
 }
 
 func timestampMicrosToTime(val int64) time.Time { return time.UnixMicro(val).UTC() }
 
-// timeToTimestampMicros mirrors timeToTimestampMillis, with the
-// micros bound and Java parity (TimestampMicrosConversion.toLong has
-// the explicit `seconds<0 && nanos>0` adjustment branch).
 func timeToTimestampMicros(t time.Time) (int64, error) {
-	sec := t.Unix()
-	nsec := int64(t.Nanosecond())
-	const scale = int64(1_000_000)
-	const subScale = int64(1_000) // ns per µs
-	const maxSec = math.MaxInt64 / scale
-	if sec < 0 && nsec > 0 {
-		if sec+1 < -maxSec {
-			return 0, fmt.Errorf("time %v overflows int64 microseconds since epoch", t)
-		}
-		micros := (sec + 1) * scale
-		adjustment := nsec/subScale - scale
-		if adjustment < math.MinInt64-micros {
-			return 0, fmt.Errorf("time %v overflows int64 microseconds since epoch", t)
-		}
-		return micros + adjustment, nil
-	}
-	if sec > maxSec || sec < -maxSec {
-		return 0, fmt.Errorf("time %v overflows int64 microseconds since epoch", t)
-	}
-	total := sec * scale
-	us := nsec / subScale
-	if sec == maxSec && us > math.MaxInt64-total {
-		return 0, fmt.Errorf("time %v overflows int64 microseconds since epoch", t)
-	}
-	return total + us, nil
+	return timeToTimestampScaled(t, 1_000_000, 1_000, "microseconds")
 }
 
 func timestampNanosToTime(val int64) time.Time { return time.Unix(val/1e9, val%1e9).UTC() }
@@ -113,50 +87,19 @@ func timeToLocalTimestampNanos(t time.Time) (int64, error) {
 	return timeToTimestampNanos(time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
 }
 
-// timeToTimestampNanos converts t to nanoseconds since the Unix epoch,
-// returning an error when the result would overflow int64.
+// timeToTimestampNanos shares timeToTimestampScaled with subScale=1
+// (no sub-second scaling — the unit IS nanoseconds, so nsec/1 == nsec).
 //
-// We deliberately diverge from Java's TimestampNanosConversion.toLong
-// here: Java's adjustment branch at TimeConversions.java:238 has an
-// off-by-1000 typo (uses `nanos - 1_000_000` where the analogous
-// millis/micros branches subtract `scale` — `nanos - 1_000_000_000`
-// for nanos), which would corrupt every negative-second instant by
-// ~999ms. Java's millis/micros conversions are correct so we mirror
-// them; nanos aligns with avro-rs and fastavro, both of which produce
-// the mathematically correct sec*1e9 + nsec via the same adjustment
-// formula we use here.
+// twmb deliberately diverges from Java's TimestampNanosConversion.toLong:
+// Java's adjustment branch at TimeConversions.java:238 has an off-by-1000
+// typo (subtracts `nanos - 1_000_000` where the analogous millis/micros
+// branches subtract `scale` — `nanos - 1_000_000_000` for nanos), which
+// would corrupt every negative-second instant by ~999ms. Java's
+// millis/micros conversions are correct; nanos aligns with avro-rs and
+// fastavro, both of which produce the mathematically correct sec*1e9 +
+// nsec via the same adjustment formula timeToTimestampScaled implements.
 func timeToTimestampNanos(t time.Time) (int64, error) {
-	sec := t.Unix()
-	nsec := int64(t.Nanosecond())
-	const scale = int64(1_000_000_000)
-	const maxSec = math.MaxInt64 / scale
-	if sec < 0 && nsec > 0 {
-		// Adjustment branch: nanos = (sec+1)*scale + (nsec - scale).
-		// Algebraically equivalent to sec*scale + nsec but avoids the
-		// (sec)*scale multiplication overflow when sec is very negative
-		// (e.g. time.Unix(0, MinInt64) normalizes to sec=-MaxInt64/scale-1
-		// with nsec ≈ 145_224_192).
-		if sec+1 < -maxSec {
-			return 0, fmt.Errorf("time %v overflows int64 nanoseconds since epoch", t)
-		}
-		nanos := (sec + 1) * scale
-		adjustment := nsec - scale
-		if adjustment < math.MinInt64-nanos {
-			return 0, fmt.Errorf("time %v overflows int64 nanoseconds since epoch", t)
-		}
-		return nanos + adjustment, nil
-	}
-	// MaxInt64 = 9_223_372_036 sec + 854_775_807 ns. Bound sec
-	// symmetrically so sec*1e9 stays well within int64; since nsec ≥ 0
-	// the addition can only push upward, so underflow is impossible.
-	if sec > maxSec || sec < -maxSec {
-		return 0, fmt.Errorf("time %v overflows int64 nanoseconds since epoch", t)
-	}
-	total := sec * scale
-	if sec == maxSec && nsec > math.MaxInt64-total {
-		return 0, fmt.Errorf("time %v overflows int64 nanoseconds since epoch", t)
-	}
-	return total + nsec, nil
+	return timeToTimestampScaled(t, 1_000_000_000, 1, "nanoseconds")
 }
 
 // timeLogicalToInt64 returns the time.Time→int64 conversion for any
@@ -249,14 +192,14 @@ func timeOfDayToTime(d time.Duration) time.Time {
 	return time.Unix(0, int64(d)).UTC()
 }
 
-
-// floorDiv returns the floor of a/b (rounds toward negative infinity),
-// unlike Go's built-in integer division which truncates toward zero.
-func floorDiv(a, b int64) int64 {
-	d := a / b
-	if (a^b) < 0 && d*b != a {
-		d--
-	}
-	return d
+// timeOfDay returns the time-of-day portion of t as a Duration since
+// midnight in t's wall-clock fields, ignoring date and zone offset.
+// Date is intentionally discarded — the Avro time-millis / time-micros
+// wire form can't represent it.
+func timeOfDay(t time.Time) time.Duration {
+	return time.Duration(t.Hour())*time.Hour +
+		time.Duration(t.Minute())*time.Minute +
+		time.Duration(t.Second())*time.Second +
+		time.Duration(t.Nanosecond())
 }
 

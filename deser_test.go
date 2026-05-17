@@ -8973,23 +8973,6 @@ func TestSerNullUnionInvalidValue(t *testing.T) {
 	}
 }
 
-// ---- Coverage: floorDiv positive exact division ----
-
-func TestFloorDivPositive(t *testing.T) {
-	// Positive exact division (no remainder, no adjustment needed).
-	if got := floorDiv(10, 5); got != 2 {
-		t.Fatalf("floorDiv(10,5) = %d, want 2", got)
-	}
-	// Negative with remainder (adjustment needed).
-	if got := floorDiv(-1, 86400); got != -1 {
-		t.Fatalf("floorDiv(-1,86400) = %d, want -1", got)
-	}
-	// Negative exact (no adjustment).
-	if got := floorDiv(-86400, 86400); got != -1 {
-		t.Fatalf("floorDiv(-86400,86400) = %d, want -1", got)
-	}
-}
-
 // ---- Coverage: MustParse panic ----
 
 func TestMustParsePanic(t *testing.T) {
