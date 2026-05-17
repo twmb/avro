@@ -18,9 +18,20 @@ type nodePair struct {
 	r, w *schemaNode
 }
 
+// compatErr builds a *CompatibilityError, factoring the construction
+// shape repeated at every site in this file.
+func compatErr(path, readerType, writerType, detail string) error {
+	return &CompatibilityError{
+		Path:       pathOrRoot(path),
+		ReaderType: readerType,
+		WriterType: writerType,
+		Detail:     detail,
+	}
+}
+
 func checkCompat(r, w *schemaNode, path string, seen map[nodePair]bool) error {
 	if r == nil || w == nil {
-		return &CompatibilityError{Path: pathOrRoot(path), ReaderType: nodeKind(r), WriterType: nodeKind(w), Detail: "nil schema"}
+		return compatErr(path, nodeKind(r), nodeKind(w), "nil schema")
 	}
 
 	pair := nodePair{r, w}
@@ -48,12 +59,7 @@ func checkCompat(r, w *schemaNode, path string, seen map[nodePair]bool) error {
 		return nil
 	}
 
-	return &CompatibilityError{
-		Path:       pathOrRoot(path),
-		ReaderType: r.kind,
-		WriterType: w.kind,
-		Detail:     "incompatible types",
-	}
+	return compatErr(path, r.kind, w.kind, "incompatible types")
 }
 
 // checkWriterUnion validates that a writer-union schema is compatible
@@ -77,12 +83,8 @@ func checkWriterUnion(r, w *schemaNode, path string, seen map[nodePair]bool) err
 		if r.kind == "union" {
 			rb := findMatchingBranch(r, wb)
 			if rb == nil {
-				return &CompatibilityError{
-					Path:       pathOrRoot(path),
-					ReaderType: r.kind,
-					WriterType: fmt.Sprintf("union[%d]:%s", i, wb.kind),
-					Detail:     "writer union branch has no matching reader branch",
-				}
+				return compatErr(path, r.kind, fmt.Sprintf("union[%d]:%s", i, wb.kind),
+					"writer union branch has no matching reader branch")
 			}
 			if err := checkCompat(rb, wb, path, seen); err != nil {
 				return err
@@ -99,12 +101,7 @@ func checkWriterUnion(r, w *schemaNode, path string, seen map[nodePair]bool) err
 func checkReaderUnion(r, w *schemaNode, path string, seen map[nodePair]bool) error {
 	rb := findMatchingBranch(r, w)
 	if rb == nil {
-		return &CompatibilityError{
-			Path:       pathOrRoot(path),
-			ReaderType: "union",
-			WriterType: w.kind,
-			Detail:     "writer type matches no reader union branch",
-		}
+		return compatErr(path, "union", w.kind, "writer type matches no reader union branch")
 	}
 	return checkCompat(rb, w, path, seen)
 }
@@ -113,22 +110,12 @@ func checkSameKind(r, w *schemaNode, path string, seen map[nodePair]bool) error 
 	switch r.kind {
 	case "record":
 		if !namesMatch(r, w) {
-			return &CompatibilityError{
-				Path:       pathOrRoot(path),
-				ReaderType: r.name,
-				WriterType: w.name,
-				Detail:     "record names do not match",
-			}
+			return compatErr(path, r.name, w.name, "record names do not match")
 		}
 		return checkRecordCompat(r, w, path, seen)
 	case "enum":
 		if !namesMatch(r, w) {
-			return &CompatibilityError{
-				Path:       pathOrRoot(path),
-				ReaderType: r.name,
-				WriterType: w.name,
-				Detail:     "enum names do not match",
-			}
+			return compatErr(path, r.name, w.name, "enum names do not match")
 		}
 		return checkEnumCompat(r, w, path)
 	case "array":
@@ -137,31 +124,22 @@ func checkSameKind(r, w *schemaNode, path string, seen map[nodePair]bool) error 
 		return checkCompat(r.values, w.values, path+".values", seen)
 	case "fixed":
 		if !namesMatch(r, w) {
-			return &CompatibilityError{
-				Path:       pathOrRoot(path),
-				ReaderType: r.name,
-				WriterType: w.name,
-				Detail:     "fixed names do not match",
-			}
+			return compatErr(path, r.name, w.name, "fixed names do not match")
 		}
 		if r.size != w.size {
-			return &CompatibilityError{
-				Path:       pathOrRoot(path),
-				ReaderType: fmt.Sprintf("fixed(%d)", r.size),
-				WriterType: fmt.Sprintf("fixed(%d)", w.size),
-				Detail:     "fixed sizes differ",
-			}
+			return compatErr(path,
+				fmt.Sprintf("fixed(%d)", r.size),
+				fmt.Sprintf("fixed(%d)", w.size),
+				"fixed sizes differ")
 		}
 	}
 	// Decimal logical types must match on precision and scale.
 	if r.logical == "decimal" && w.logical == "decimal" {
 		if r.precision != w.precision || r.scale != w.scale {
-			return &CompatibilityError{
-				Path:       pathOrRoot(path),
-				ReaderType: fmt.Sprintf("decimal(%d,%d)", r.precision, r.scale),
-				WriterType: fmt.Sprintf("decimal(%d,%d)", w.precision, w.scale),
-				Detail:     "decimal precision or scale differ",
-			}
+			return compatErr(path,
+				fmt.Sprintf("decimal(%d,%d)", r.precision, r.scale),
+				fmt.Sprintf("decimal(%d,%d)", w.precision, w.scale),
+				"decimal precision or scale differ")
 		}
 	}
 	return nil
@@ -182,7 +160,6 @@ func checkRecordCompat(r, w *schemaNode, path string, seen map[nodePair]bool) er
 				return &CompatibilityError{
 					Path:       fieldPath(path, rf.name),
 					ReaderType: rf.node.kind,
-					WriterType: "",
 					Detail:     "reader field has no default and is missing from writer",
 				}
 			}
@@ -202,12 +179,8 @@ func checkEnumCompat(r, w *schemaNode, path string) error {
 	}
 	for _, ws := range w.symbols {
 		if !readerSymbols[ws] && !r.hasEnumDef {
-			return &CompatibilityError{
-				Path:       pathOrRoot(path),
-				ReaderType: r.name,
-				WriterType: w.name,
-				Detail:     fmt.Sprintf("writer enum symbol %q not in reader and reader has no default", ws),
-			}
+			return compatErr(path, r.name, w.name,
+				fmt.Sprintf("writer enum symbol %q not in reader and reader has no default", ws))
 		}
 	}
 	return nil

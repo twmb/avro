@@ -890,6 +890,105 @@ func (b *builder) unnest(nest *builder) {
 	}
 }
 
+// hasCustomTypeWired reports whether the builder has accumulated any
+// custom encoders or decoders. Used to stamp namedType.hadCustomType so
+// later cached references can skip the rejectCachedRefIfCustomTypeWouldMatch
+// check when this Parse already wired its own CTs.
+func (b *builder) hasCustomTypeWired() bool {
+	return len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0
+}
+
+// primFastInfo holds per-primitive bindings for both the array and map
+// fast paths. Indexed by the canonical primitive name; missing entries
+// fall back to the generic (function-pointer) per-element path.
+type primFastInfo struct {
+	elemKind             reflect.Kind
+	serArrayFn           func(*serArray) serfn
+	serMapFn             func(*serMap) serfn
+	deserArrayLoop       func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error)
+	deserArrayIfaceLoop  func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error)
+	deserMapBlock        func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
+	deserMapIfaceVal     deserIfaceFn
+}
+
+var primFast = map[string]primFastInfo{
+	"string": {
+		reflect.String,
+		func(s *serArray) serfn { return s.serString }, func(s *serMap) serfn { return s.serString },
+		deserArrayStringLoop, deserArrayStringIfaceLoop, deserMapStringBlock, deserStringIface,
+	},
+	"boolean": {
+		reflect.Bool,
+		func(s *serArray) serfn { return s.serBoolean }, func(s *serMap) serfn { return s.serBoolean },
+		deserArrayBooleanLoop, deserArrayBooleanIfaceLoop, deserMapBooleanBlock, deserBooleanIface,
+	},
+	"int": {
+		reflect.Int32,
+		func(s *serArray) serfn { return s.serInt }, func(s *serMap) serfn { return s.serInt },
+		deserArrayIntLoop, deserArrayIntIfaceLoop, deserMapIntBlock, deserIntIface,
+	},
+	"long": {
+		reflect.Int64,
+		func(s *serArray) serfn { return s.serLong }, func(s *serMap) serfn { return s.serLong },
+		deserArrayLongLoop, deserArrayLongIfaceLoop, deserMapLongBlock, deserLongIface,
+	},
+	"float": {
+		reflect.Float32,
+		func(s *serArray) serfn { return s.serFloat }, func(s *serMap) serfn { return s.serFloat },
+		deserArrayFloatLoop, deserArrayFloatIfaceLoop, deserMapFloatBlock, deserFloatIface,
+	},
+	"double": {
+		reflect.Float64,
+		func(s *serArray) serfn { return s.serDouble }, func(s *serMap) serfn { return s.serDouble },
+		deserArrayDoubleLoop, deserArrayDoubleIfaceLoop, deserMapDoubleBlock, deserDoubleIface,
+	},
+}
+
+// registerNamed stores nt under name, populating hadCustomType from the
+// builder's current overlay maps. Shared by the record/enum/fixed
+// registrations in buildComplex so the flag is set consistently.
+func (b *builder) registerNamed(name string, nt *namedType) {
+	nt.hadCustomType = b.hasCustomTypeWired()
+	b.named[name] = nt
+}
+
+// tryAssignNamedRef resolves a named-type reference, possibly with
+// namespace qualification against parentName. Returns true on hit (with
+// b.ser / b.deser / b.meta / b.node populated and, when setCanon is
+// true, b.canon set to the resolved name). Shared by buildPrimitive's
+// bare-string named-ref path and buildComplex's wrapped-form
+// {"type":"Name"} path so the rejectCachedRefIfCustomTypeWouldMatch
+// gate and the namespace-qualified retry agree.
+func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (bool, error) {
+	assign := func(n string, nt *namedType) error {
+		if err := b.rejectCachedRefIfCustomTypeWouldMatch(n, nt); err != nil {
+			return err
+		}
+		if setCanon {
+			b.canon = aschema{primitive: n}
+		}
+		b.ser = nt.ser
+		b.deser = nt.deser
+		if nt.sr != nil {
+			b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
+		}
+		b.node = nt.node
+		return nil
+	}
+	if nt := b.named[name]; nt != nil {
+		return true, assign(name, nt)
+	}
+	if !strings.Contains(name, ".") && parentName != "" {
+		if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
+			qualified := parentName[:dot+1] + name
+			if nt := b.named[qualified]; nt != nil {
+				return true, assign(qualified, nt)
+			}
+		}
+	}
+	return false, nil
+}
+
 func (b *builder) finalize() error {
 	for _, m := range b.missing {
 		for idx, name := range m.missing {
@@ -1198,38 +1297,15 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 		return nil
 	}
 	// Check if this is a named type reference (record, enum, fixed).
-	name := s.primitive
-	if nt := b.named[name]; nt != nil {
-		if err := b.rejectCachedRefIfCustomTypeWouldMatch(name, nt); err != nil {
-			return err
-		}
-		b.ser = nt.ser
-		b.deser = nt.deser
-		if nt.sr != nil {
-			b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
-		}
-		b.node = nt.node
-		return nil
-	}
-	// Try namespace-qualified lookup: if name is unqualified and parent
-	// has a namespace, try parentNamespace + "." + name.
-	if !strings.Contains(name, ".") && parentName != "" {
-		if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
-			qualified := parentName[:dot+1] + name
-			if nt := b.named[qualified]; nt != nil {
-				if err := b.rejectCachedRefIfCustomTypeWouldMatch(qualified, nt); err != nil {
-					return err
-				}
-				b.canon.primitive = qualified
-				b.ser = nt.ser
-				b.deser = nt.deser
-				if nt.sr != nil {
-					b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
-				}
-				b.node = nt.node
-				return nil
-			}
-		}
+	// setCanon=false: the buildPrimitive path's canon was already set to
+	// s.primitive above; only the namespace-qualified retry needs to
+	// rewrite it, which tryAssignNamedRef handles internally when given
+	// setCanon=true. To preserve the prior shape (bare-name canon stays
+	// as written, only the qualified retry rewrites), we tell the helper
+	// to setCanon for both branches and let the bare path overwrite with
+	// the identical name.
+	if found, err := b.tryAssignNamedRef(s.primitive, parentName, true); err != nil || found {
+		return err
 	}
 	return &unknownPrimitiveError{s.primitive}
 }
@@ -1613,36 +1689,8 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	if o.Name == "" &&
 		len(o.Fields) == 0 && len(o.Symbols) == 0 &&
 		o.Items == nil && o.Values == nil && o.Size == nil {
-		if nt := b.named[o.Type]; nt != nil {
-			if err := b.rejectCachedRefIfCustomTypeWouldMatch(o.Type, nt); err != nil {
-				return err
-			}
-			b.canon = aschema{primitive: o.Type}
-			b.ser = nt.ser
-			b.deser = nt.deser
-			if nt.sr != nil {
-				b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
-			}
-			b.node = nt.node
-			return nil
-		}
-		if !strings.Contains(o.Type, ".") && parentName != "" {
-			if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
-				qualified := parentName[:dot+1] + o.Type
-				if nt := b.named[qualified]; nt != nil {
-					if err := b.rejectCachedRefIfCustomTypeWouldMatch(qualified, nt); err != nil {
-						return err
-					}
-					b.canon = aschema{primitive: qualified}
-					b.ser = nt.ser
-					b.deser = nt.deser
-					if nt.sr != nil {
-						b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
-					}
-					b.node = nt.node
-					return nil
-				}
-			}
+		if found, err := b.tryAssignNamedRef(o.Type, parentName, true); err != nil || found {
+			return err
 		}
 		// Not a recognized base/complex type and not a declared named
 		// type — treat as a forward reference. The caller (record-field
@@ -1764,8 +1812,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			serRecord:   sr,
 			deserRecord: dr,
 		}
-		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, sr: sr, dr: dr, node: nd,
-			hadCustomType: len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0}
+		b.registerNamed(o.Name, &namedType{ser: b.ser, deser: b.deser, sr: sr, dr: dr, node: nd})
 		b.node = nd
 
 		var names []string
@@ -1921,8 +1968,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// registration time — fields might apply CTs that won't show
 		// up in the maps until unnest. Re-stamp now.
 		if cached := b.named[o.Name]; cached != nil {
-			cached.hadCustomType = cached.hadCustomType ||
-				len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0
+			cached.hadCustomType = cached.hadCustomType || b.hasCustomTypeWired()
 		}
 
 	case "enum":
@@ -1968,8 +2014,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			nd.enumDef = defStr
 			nd.hasEnumDef = true
 		}
-		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, node: nd,
-			hadCustomType: len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0}
+		b.registerNamed(o.Name, &namedType{ser: b.ser, deser: b.deser, node: nd})
 		b.node = nd
 
 	case "array":
@@ -1998,41 +2043,13 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// the primitive-only specialization can't see).
 		if af.meta.hasCustomType || af.meta.logical != "" {
 			b.ser = sa.ser
+		} else if info, ok := primFast[af.canon.primitive]; ok {
+			b.ser = info.serArrayFn(sa)
+			da.fastLoop = info.deserArrayLoop
+			da.fastElemKind = info.elemKind
+			da.fastIfaceLoop = info.deserArrayIfaceLoop
 		} else {
-			switch af.canon.primitive {
-			case "string":
-				b.ser = sa.serString
-				da.fastLoop = deserArrayStringLoop
-				da.fastElemKind = reflect.String
-				da.fastIfaceLoop = deserArrayStringIfaceLoop
-			case "boolean":
-				b.ser = sa.serBoolean
-				da.fastLoop = deserArrayBooleanLoop
-				da.fastElemKind = reflect.Bool
-				da.fastIfaceLoop = deserArrayBooleanIfaceLoop
-			case "int":
-				b.ser = sa.serInt
-				da.fastLoop = deserArrayIntLoop
-				da.fastElemKind = reflect.Int32
-				da.fastIfaceLoop = deserArrayIntIfaceLoop
-			case "long":
-				b.ser = sa.serLong
-				da.fastLoop = deserArrayLongLoop
-				da.fastElemKind = reflect.Int64
-				da.fastIfaceLoop = deserArrayLongIfaceLoop
-			case "float":
-				b.ser = sa.serFloat
-				da.fastLoop = deserArrayFloatLoop
-				da.fastElemKind = reflect.Float32
-				da.fastIfaceLoop = deserArrayFloatIfaceLoop
-			case "double":
-				b.ser = sa.serDouble
-				da.fastLoop = deserArrayDoubleLoop
-				da.fastElemKind = reflect.Float64
-				da.fastIfaceLoop = deserArrayDoubleIfaceLoop
-			default:
-				b.ser = sa.ser
-			}
+			b.ser = sa.ser
 		}
 		b.deser = da.deser
 		inner := new(fieldMeta)
@@ -2074,41 +2091,13 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// / etc.) actually runs.
 		if mf.meta.hasCustomType || mf.meta.logical != "" {
 			b.ser = sm.ser
+		} else if info, ok := primFast[mf.canon.primitive]; ok {
+			b.ser = info.serMapFn(sm)
+			dm.fastBlock = info.deserMapBlock
+			dm.fastElemKind = info.elemKind
+			dm.fastIfaceVal = info.deserMapIfaceVal
 		} else {
-			switch mf.canon.primitive {
-			case "string":
-				b.ser = sm.serString
-				dm.fastBlock = deserMapStringBlock
-				dm.fastElemKind = reflect.String
-				dm.fastIfaceVal = deserStringIface
-			case "boolean":
-				b.ser = sm.serBoolean
-				dm.fastBlock = deserMapBooleanBlock
-				dm.fastElemKind = reflect.Bool
-				dm.fastIfaceVal = deserBooleanIface
-			case "int":
-				b.ser = sm.serInt
-				dm.fastBlock = deserMapIntBlock
-				dm.fastElemKind = reflect.Int32
-				dm.fastIfaceVal = deserIntIface
-			case "long":
-				b.ser = sm.serLong
-				dm.fastBlock = deserMapLongBlock
-				dm.fastElemKind = reflect.Int64
-				dm.fastIfaceVal = deserLongIface
-			case "float":
-				b.ser = sm.serFloat
-				dm.fastBlock = deserMapFloatBlock
-				dm.fastElemKind = reflect.Float32
-				dm.fastIfaceVal = deserFloatIface
-			case "double":
-				b.ser = sm.serDouble
-				dm.fastBlock = deserMapDoubleBlock
-				dm.fastElemKind = reflect.Float64
-				dm.fastIfaceVal = deserDoubleIface
-			default:
-				b.ser = sm.ser
-			}
+			b.ser = sm.ser
 		}
 		b.deser = dm.deser
 		b.meta = fieldMeta{avroType: "map"}
@@ -2175,8 +2164,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 		}
 		b.node = nd
-		b.named[o.Name] = &namedType{ser: b.ser, deser: b.deser, node: nd,
-			hadCustomType: len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0}
+		b.registerNamed(o.Name, &namedType{ser: b.ser, deser: b.deser, node: nd})
 	}
 	return nil
 }
@@ -2199,6 +2187,39 @@ func qualifyAliases(aliases []string, fullname string) []string {
 		}
 	}
 	return out
+}
+
+// logicalUnderlyingAccept maps known logical types to the predicate
+// that decides whether the carrier's Avro type is permitted. Mismatches
+// soft-drop the logical (returning the bare underlying type) per spec
+// and Java/fastavro/hamba parity — see the soft-drop comment in
+// validateLogical for the rationale.
+//
+// "decimal" is handled inline in validateLogical because its precision/
+// scale validation is too involved to fit a one-line predicate.
+var logicalUnderlyingAccept = map[string]func(o *aobject) bool{
+	"uuid": func(o *aobject) bool {
+		return o.Type == "string" || (o.Type == "fixed" && o.Size != nil && int(*o.Size) == 16)
+	},
+	"date":                   func(o *aobject) bool { return o.Type == "int" },
+	"time-millis":            func(o *aobject) bool { return o.Type == "int" },
+	"time-micros":            func(o *aobject) bool { return o.Type == "long" },
+	"timestamp-millis":       func(o *aobject) bool { return o.Type == "long" },
+	"timestamp-micros":       func(o *aobject) bool { return o.Type == "long" },
+	"timestamp-nanos":        func(o *aobject) bool { return o.Type == "long" },
+	"local-timestamp-millis": func(o *aobject) bool { return o.Type == "long" },
+	"local-timestamp-micros": func(o *aobject) bool { return o.Type == "long" },
+	"local-timestamp-nanos":  func(o *aobject) bool { return o.Type == "long" },
+	"big-decimal":            func(o *aobject) bool { return o.Type == "bytes" },
+	// Duration on non-fixed, or fixed with size != 12, soft-drops.
+	// Java's Duration.validate at LogicalTypes.java:526-530 throws
+	// IllegalArgumentException for `type != FIXED || size != 12`;
+	// fromSchemaIgnoreInvalid catches and drops. hamba's
+	// parseFixedLogicalType at schema_parse.go:517 only matches
+	// `ltyp == Duration && size == 12` and drops everything else.
+	"duration": func(o *aobject) bool {
+		return o.Type == "fixed" && o.Size != nil && int(*o.Size) == 12
+	},
 }
 
 func (o *aobject) validateLogical() error {
@@ -2268,53 +2289,18 @@ func (o *aobject) validateLogical() error {
 	// reference impls + spec text all agree on soft-drop; pre-fix twmb
 	// was the outlier hard-rejecting (interop break for Java/fastavro
 	// producers that emit schema-evolution / legacy combos).
-	case "uuid":
-		if o.Type != "string" && !(o.Type == "fixed" && o.Size != nil && int(*o.Size) == 16) {
-			o.Logical = ""
-			return nil
-		}
-
-	case "date", "time-millis":
-		if o.Type != "int" {
-			o.Logical = ""
-			return nil
-		}
-
-	case "time-micros",
-		"timestamp-millis",
-		"timestamp-micros",
-		"timestamp-nanos",
-		"local-timestamp-millis",
-		"local-timestamp-micros",
-		"local-timestamp-nanos":
-		if o.Type != "long" {
-			o.Logical = ""
-			return nil
-		}
-
-	case "big-decimal":
-		if o.Type != "bytes" {
-			o.Logical = ""
-			return nil
-		}
-
-	case "duration":
-		// Duration on non-fixed, or fixed with size != 12, soft-drops.
-		// Java's Duration.validate at LogicalTypes.java:526-530 throws
-		// IllegalArgumentException for `type != FIXED || size != 12`;
-		// fromSchemaIgnoreInvalid catches and drops. hamba's
-		// parseFixedLogicalType at schema_parse.go:517 only matches
-		// `ltyp == Duration && size == 12` and drops everything else.
-		if o.Type != "fixed" || o.Size == nil || int(*o.Size) != 12 {
-			o.Logical = ""
-			return nil
-		}
-
 	default:
-		// Per the Avro spec, unknown logical types are ignored and the
-		// underlying type is used as-is.
-		o.Logical = ""
-		return nil
+		if accept, known := logicalUnderlyingAccept[o.Logical]; known {
+			if !accept(o) {
+				o.Logical = ""
+				return nil
+			}
+		} else {
+			// Per the Avro spec, unknown logical types are ignored and the
+			// underlying type is used as-is.
+			o.Logical = ""
+			return nil
+		}
 	}
 
 	if o.Scale != nil || o.Precision != nil {
@@ -2336,57 +2322,42 @@ func maxDecimalDigits(size int) int {
 	return int(math.Floor(float64(bits) * math.Log10(2)))
 }
 
-// logicalSer returns a time-aware serializer for a given logical type,
-// or nil if the logical type doesn't have special serialization.
-func logicalSer(logical string) serfn {
-	switch logical {
-	case "timestamp-millis":
-		return serTimestampMillis
-	case "timestamp-micros":
-		return serTimestampMicros
-	case "timestamp-nanos":
-		return serTimestampNanos
-	case "local-timestamp-millis":
-		return serLocalTimestampMillis
-	case "local-timestamp-micros":
-		return serLocalTimestampMicros
-	case "local-timestamp-nanos":
-		return serLocalTimestampNanos
-	case "date":
-		return serDate
-	case "time-millis":
-		return serTimeMillis
-	case "time-micros":
-		return serTimeMicros
-	case "uuid":
-		return serUUID
-	default:
-		return nil
+// logicalSer / logicalDeser look up the time-aware encoder / decoder
+// for a logical type, or return nil if the logical has no specialized
+// codec. Both encode and decode tables in one place so a new logical
+// only needs to be wired in once.
+var (
+	logicalSers = map[string]serfn{
+		"timestamp-millis":       serTimestampMillis,
+		"timestamp-micros":       serTimestampMicros,
+		"timestamp-nanos":        serTimestampNanos,
+		"local-timestamp-millis": serLocalTimestampMillis,
+		"local-timestamp-micros": serLocalTimestampMicros,
+		"local-timestamp-nanos":  serLocalTimestampNanos,
+		"date":                   serDate,
+		"time-millis":            serTimeMillis,
+		"time-micros":            serTimeMicros,
+		"uuid":                   serUUID,
 	}
-}
+	// Decode collapses local-timestamp-* with timestamp-* because both
+	// resolve to the same UTC time.Time (the wire long is interpreted
+	// identically; see logical.go for the encode-side rationale).
+	logicalDesers = map[string]deserfn{
+		"timestamp-millis":       deserTimestampMillis,
+		"local-timestamp-millis": deserTimestampMillis,
+		"timestamp-micros":       deserTimestampMicros,
+		"local-timestamp-micros": deserTimestampMicros,
+		"timestamp-nanos":        deserTimestampNanos,
+		"local-timestamp-nanos":  deserTimestampNanos,
+		"date":                   deserDate,
+		"time-millis":            deserTimeMillis,
+		"time-micros":            deserTimeMicros,
+		"uuid":                   deserUUID,
+	}
+)
 
-// logicalDeser returns a time-aware deserializer for a given logical type,
-// or nil if the logical type doesn't have special deserialization.
-func logicalDeser(logical string) deserfn {
-	switch logical {
-	case "timestamp-millis", "local-timestamp-millis":
-		return deserTimestampMillis
-	case "timestamp-micros", "local-timestamp-micros":
-		return deserTimestampMicros
-	case "timestamp-nanos", "local-timestamp-nanos":
-		return deserTimestampNanos
-	case "date":
-		return deserDate
-	case "time-millis":
-		return deserTimeMillis
-	case "time-micros":
-		return deserTimeMicros
-	case "uuid":
-		return deserUUID
-	default:
-		return nil
-	}
-}
+func logicalSer(logical string) serfn     { return logicalSers[logical] }
+func logicalDeser(logical string) deserfn { return logicalDesers[logical] }
 
 // unmarshalDefault parses a field's raw JSON default. Uses
 // json.Decoder.UseNumber() so that numeric literals are preserved as
@@ -2494,24 +2465,27 @@ func normalizeJSONNumber(n json.Number) any {
 //     the equivalent json.Number / typed-int encode arms, which apply
 //     the same predicate.
 
-func defaultAsInt32(val any) (int32, error) {
+// numericDefault extracts a typed integer default. After
+// unmarshalDefault, a JSON number arrives as json.Number (full precision);
+// callers may also pass float64 (e.g. round-tripped through coerceDefault).
+// Shared body of defaultAsInt32 / defaultAsInt64.
+func numericDefault[T int32 | int64](val any, parse func(string) (T, error), fromFloat func(float64) (T, error)) (T, error) {
 	switch v := val.(type) {
 	case json.Number:
-		return parseInt32Lenient(string(v))
+		return parse(string(v))
 	case float64:
-		return floatFitsInt32(v)
+		return fromFloat(v)
 	}
-	return 0, fmt.Errorf("expected number, got %T", val)
+	var z T
+	return z, fmt.Errorf("expected number, got %T", val)
+}
+
+func defaultAsInt32(val any) (int32, error) {
+	return numericDefault(val, parseInt32Lenient, floatFitsInt32)
 }
 
 func defaultAsInt64(val any) (int64, error) {
-	switch v := val.(type) {
-	case json.Number:
-		return parseInt64Lenient(string(v))
-	case float64:
-		return floatFitsInt64(v)
-	}
-	return 0, fmt.Errorf("expected number, got %T", val)
+	return numericDefault(val, parseInt64Lenient, floatFitsInt64)
 }
 
 // floatMantissaLimit returns the largest integer magnitude exactly
@@ -2780,6 +2754,19 @@ func convertDefaultBytes(val any, node *schemaNode) any {
 //
 // Returns nil for a nil node — fwd-refs defer validation to finalize,
 // where the resolved node is wired up.
+// validateAvroByteString reports an error when s contains a code point
+// > 0xFF — the Avro JSON-bytes / JSON-fixed default form maps each
+// codepoint to one byte, so values outside that range are not
+// representable. fieldType is "bytes" or "fixed" for the message.
+func validateAvroByteString(s, fieldType string) error {
+	for _, r := range s {
+		if r > 255 {
+			return fmt.Errorf("%s default contains code point U+%04X, max allowed is U+00FF", fieldType, r)
+		}
+	}
+	return nil
+}
+
 func validateDefault(val any, node *schemaNode) error {
 	if node == nil {
 		return nil
@@ -2818,11 +2805,7 @@ func validateDefault(val any, node *schemaNode) error {
 		if !ok {
 			return fmt.Errorf("expected string for bytes, got %T", val)
 		}
-		for _, r := range s {
-			if r > 255 {
-				return fmt.Errorf("bytes default contains code point U+%04X, max allowed is U+00FF", r)
-			}
-		}
+		return validateAvroByteString(s, "bytes")
 	case "enum":
 		sym, ok := val.(string)
 		if !ok {
@@ -2836,10 +2819,8 @@ func validateDefault(val any, node *schemaNode) error {
 		if !ok {
 			return fmt.Errorf("expected string for fixed default, got %T", val)
 		}
-		for _, r := range s {
-			if r > 255 {
-				return fmt.Errorf("fixed default contains code point U+%04X, max allowed is U+00FF", r)
-			}
+		if err := validateAvroByteString(s, "fixed"); err != nil {
+			return err
 		}
 		if len([]rune(s)) != node.size {
 			return fmt.Errorf("fixed default length %d does not match size %d", len([]rune(s)), node.size)

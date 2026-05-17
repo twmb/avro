@@ -1162,6 +1162,69 @@ func unwrapElemPtr(v reflect.Value) (reflect.Value, error) {
 	return v, nil
 }
 
+// peelElem unwraps one Pointer/Interface layer from an array/map element,
+// tagging the unwrap error with avroType. Direct-call helper used by the
+// primitive serArray/serMap specializations.
+func peelElem(v reflect.Value, avroType string) (reflect.Value, error) {
+	if v.Kind() != reflect.Interface && v.Kind() != reflect.Pointer {
+		return v, nil
+	}
+	out, err := unwrapElemPtr(v)
+	if err != nil {
+		return v, &SemanticError{AvroType: avroType, Err: err}
+	}
+	return out, nil
+}
+
+// appendArrayPrimitive runs the shared (preamble + per-element peel +
+// appendFn + terminator) sequence for the primitive serArray
+// specializations. appendFn is a typed function-pointer parameter (NOT a
+// closure capture), so the compiler emits one indirect call per element
+// — same shape as the direct call before R2.
+func appendArrayPrimitive(
+	dst []byte, v reflect.Value, avroType string,
+	appendFn func([]byte, reflect.Value) ([]byte, error),
+) ([]byte, error) {
+	dst, v, l, err := serArrayPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	for i := range l {
+		elem, err := peelElem(v.Index(i), avroType)
+		if err != nil {
+			return nil, err
+		}
+		if dst, err = appendFn(dst, elem); err != nil {
+			return nil, err
+		}
+	}
+	return append(dst, 0), nil
+}
+
+// appendMapPrimitive is appendArrayPrimitive's map sibling. Same
+// per-element discipline plus the doSerString(key) emit on each entry.
+func appendMapPrimitive(
+	dst []byte, v reflect.Value, avroType string,
+	appendFn func([]byte, reflect.Value) ([]byte, error),
+) ([]byte, error) {
+	dst, v, l, err := serMapPreamble(dst, v)
+	if err != nil || l == 0 {
+		return dst, err
+	}
+	iter := v.MapRange()
+	for iter.Next() {
+		dst = doSerString(dst, iter.Key().String())
+		elem, err := peelElem(iter.Value(), avroType)
+		if err != nil {
+			return nil, err
+		}
+		if dst, err = appendFn(dst, elem); err != nil {
+			return nil, err
+		}
+	}
+	return append(dst, 0), nil
+}
+
 // serArrayPreamble handles the shared preamble for all serArray methods:
 // indirect, kind check, length encoding, and empty-return. Called once
 // per encode — no performance impact.
@@ -1182,119 +1245,34 @@ func serArrayPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, 
 // primitive values directly from v.Index(i), avoiding reflect.Value
 // escapes through serfn function pointers. Each is selected at schema
 // build time based on the array's item type.
+//
+// History note: the per-method body was previously inlined six times.
+// Two prior factoring attempts regressed perf — a closure-based factory
+// forced element escape (~25%); a generic-with-empty-struct GCShape
+// dispatch added a runtime-dictionary lookup (+34-62%). The current
+// shape (appendArrayPrimitive with a typed function-pointer parameter)
+// avoids both: appendFn is a direct symbol per site so the indirect
+// call shape matches the prior direct-call site. Verified via benchstat
+// on BenchmarkLargeArrayEncode + BenchmarkMapEncode against the inlined
+// six-copy baseline.
 
 func (s *serArray) serString(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serArrayPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	for i := range l {
-		elem := v.Index(i)
-		if elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
-			if elem, err = unwrapElemPtr(elem); err != nil {
-				return nil, &SemanticError{AvroType: "string", Err: err}
-			}
-		}
-		if dst, err = appendAvroString(dst, elem); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendArrayPrimitive(dst, v, "string", appendAvroString)
 }
-
 func (s *serArray) serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serArrayPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	for i := range l {
-		elem := v.Index(i)
-		if elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
-			if elem, err = unwrapElemPtr(elem); err != nil {
-				return nil, &SemanticError{AvroType: "boolean", Err: err}
-			}
-		}
-		if dst, err = appendAvroBool(dst, elem); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendArrayPrimitive(dst, v, "boolean", appendAvroBool)
 }
-
 func (s *serArray) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serArrayPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	for i := range l {
-		elem := v.Index(i)
-		if elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
-			if elem, err = unwrapElemPtr(elem); err != nil {
-				return nil, &SemanticError{AvroType: "int", Err: err}
-			}
-		}
-		if dst, err = appendAvroInt(dst, elem); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendArrayPrimitive(dst, v, "int", appendAvroInt)
 }
-
 func (s *serArray) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serArrayPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	for i := range l {
-		elem := v.Index(i)
-		if elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
-			if elem, err = unwrapElemPtr(elem); err != nil {
-				return nil, &SemanticError{AvroType: "long", Err: err}
-			}
-		}
-		if dst, err = appendAvroLong(dst, elem); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendArrayPrimitive(dst, v, "long", appendAvroLong)
 }
-
 func (s *serArray) serFloat(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serArrayPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	for i := range l {
-		elem := v.Index(i)
-		if elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
-			if elem, err = unwrapElemPtr(elem); err != nil {
-				return nil, &SemanticError{AvroType: "float", Err: err}
-			}
-		}
-		if dst, err = appendAvroFloat32(dst, elem); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendArrayPrimitive(dst, v, "float", appendAvroFloat32)
 }
-
 func (s *serArray) serDouble(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serArrayPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	for i := range l {
-		elem := v.Index(i)
-		if elem.Kind() == reflect.Interface || elem.Kind() == reflect.Pointer {
-			if elem, err = unwrapElemPtr(elem); err != nil {
-				return nil, &SemanticError{AvroType: "double", Err: err}
-			}
-		}
-		if dst, err = appendAvroFloat64(dst, elem); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendArrayPrimitive(dst, v, "double", appendAvroFloat64)
 }
 
 type serMap struct {
@@ -1339,132 +1317,26 @@ func serMapPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, er
 // The following serMap methods serialize map values by extracting
 // primitive values directly from iter.Value(), avoiding reflect.Value
 // escapes through serfn function pointers. Each is selected at schema
-// build time based on the map's value type.
+// build time based on the map's value type. See serArray.serString for
+// the factoring history.
 
 func (s *serMap) serString(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serMapPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	iter := v.MapRange()
-	for iter.Next() {
-		dst = doSerString(dst, iter.Key().String())
-		val := iter.Value()
-		if val.Kind() == reflect.Interface || val.Kind() == reflect.Pointer {
-			if val, err = unwrapElemPtr(val); err != nil {
-				return nil, &SemanticError{AvroType: "string", Err: err}
-			}
-		}
-		if dst, err = appendAvroString(dst, val); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendMapPrimitive(dst, v, "string", appendAvroString)
 }
-
 func (s *serMap) serBoolean(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serMapPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	iter := v.MapRange()
-	for iter.Next() {
-		dst = doSerString(dst, iter.Key().String())
-		val := iter.Value()
-		if val.Kind() == reflect.Interface || val.Kind() == reflect.Pointer {
-			if val, err = unwrapElemPtr(val); err != nil {
-				return nil, &SemanticError{AvroType: "boolean", Err: err}
-			}
-		}
-		if dst, err = appendAvroBool(dst, val); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendMapPrimitive(dst, v, "boolean", appendAvroBool)
 }
-
 func (s *serMap) serInt(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serMapPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	iter := v.MapRange()
-	for iter.Next() {
-		dst = doSerString(dst, iter.Key().String())
-		val := iter.Value()
-		if val.Kind() == reflect.Interface || val.Kind() == reflect.Pointer {
-			if val, err = unwrapElemPtr(val); err != nil {
-				return nil, &SemanticError{AvroType: "int", Err: err}
-			}
-		}
-		if dst, err = appendAvroInt(dst, val); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendMapPrimitive(dst, v, "int", appendAvroInt)
 }
-
 func (s *serMap) serLong(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serMapPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	iter := v.MapRange()
-	for iter.Next() {
-		dst = doSerString(dst, iter.Key().String())
-		val := iter.Value()
-		if val.Kind() == reflect.Interface || val.Kind() == reflect.Pointer {
-			if val, err = unwrapElemPtr(val); err != nil {
-				return nil, &SemanticError{AvroType: "long", Err: err}
-			}
-		}
-		if dst, err = appendAvroLong(dst, val); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendMapPrimitive(dst, v, "long", appendAvroLong)
 }
-
 func (s *serMap) serFloat(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serMapPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	iter := v.MapRange()
-	for iter.Next() {
-		dst = doSerString(dst, iter.Key().String())
-		val := iter.Value()
-		if val.Kind() == reflect.Interface || val.Kind() == reflect.Pointer {
-			if val, err = unwrapElemPtr(val); err != nil {
-				return nil, &SemanticError{AvroType: "float", Err: err}
-			}
-		}
-		if dst, err = appendAvroFloat32(dst, val); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendMapPrimitive(dst, v, "float", appendAvroFloat32)
 }
-
 func (s *serMap) serDouble(dst []byte, v reflect.Value, _ int) ([]byte, error) {
-	dst, v, l, err := serMapPreamble(dst, v)
-	if err != nil || l == 0 {
-		return dst, err
-	}
-	iter := v.MapRange()
-	for iter.Next() {
-		dst = doSerString(dst, iter.Key().String())
-		val := iter.Value()
-		if val.Kind() == reflect.Interface || val.Kind() == reflect.Pointer {
-			if val, err = unwrapElemPtr(val); err != nil {
-				return nil, &SemanticError{AvroType: "double", Err: err}
-			}
-		}
-		if dst, err = appendAvroFloat64(dst, val); err != nil {
-			return nil, err
-		}
-	}
-	return append(dst, 0), nil
+	return appendMapPrimitive(dst, v, "double", appendAvroFloat64)
 }
 
 type serSize struct {
@@ -1848,20 +1720,33 @@ func tryCoerceToRat(v reflect.Value) (*big.Rat, bool, error) {
 	return nil, false, nil
 }
 
+// decimalUnscaledBytes runs the shared (r → unscaled → validate precision →
+// big-endian two's-complement bytes) pipeline. avroType labels the
+// SemanticError ("bytes" or "fixed"); goType identifies the source type.
+// One pipeline for the four decimal-emit sites (binary serBytesDecimal /
+// serFixedDecimal, JSON appendAvroJSON's bytes+decimal and fixed+decimal
+// arms) so precision/scale handling can't drift across them.
+func decimalUnscaledBytes(r *big.Rat, scale, precision int, avroType string, goType reflect.Type) ([]byte, error) {
+	unscaled, err := ratToUnscaled(r, scale)
+	if err != nil {
+		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
+	}
+	if err := checkDecimalPrecision(unscaled, precision); err != nil {
+		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
+	}
+	return bigIntToBytes(unscaled), nil
+}
+
 type serBytesDecimal struct {
 	precision int
 	scale     int
 }
 
 func (s *serBytesDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
-	unscaled, err := ratToUnscaled(r, s.scale)
+	b, err := decimalUnscaledBytes(r, s.scale, s.precision, "bytes", bigRatType)
 	if err != nil {
-		return nil, &SemanticError{GoType: bigRatType, AvroType: "bytes", Err: err}
+		return nil, err
 	}
-	if err := checkDecimalPrecision(unscaled, s.precision); err != nil {
-		return nil, &SemanticError{GoType: bigRatType, AvroType: "bytes", Err: err}
-	}
-	b := bigIntToBytes(unscaled)
 	dst = appendVarlong(dst, int64(len(b)))
 	return append(dst, b...), nil
 }
@@ -1892,14 +1777,10 @@ type serFixedDecimal struct {
 }
 
 func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
-	unscaled, err := ratToUnscaled(r, s.scale)
+	b, err := decimalUnscaledBytes(r, s.scale, s.precision, "fixed", bigRatType)
 	if err != nil {
-		return nil, &SemanticError{GoType: bigRatType, AvroType: "fixed", Err: err}
+		return nil, err
 	}
-	if err := checkDecimalPrecision(unscaled, s.precision); err != nil {
-		return nil, &SemanticError{GoType: bigRatType, AvroType: "fixed", Err: err}
-	}
-	b := bigIntToBytes(unscaled)
 	if len(b) > s.size {
 		return nil, &SemanticError{GoType: bigRatType, AvroType: "fixed", Err: fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), s.size)}
 	}

@@ -479,26 +479,7 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 			return nil, fmt.Errorf("enum index %d out of range [0, %d)", idx, len(mapping))
 		}
 		ri := mapping[idx]
-		v = indirectAlloc(v)
-		switch {
-		case v.Kind() == reflect.Interface:
-			return src, setIface(v, reflect.ValueOf(readerSymbols[ri]), "enum")
-		case v.Kind() == reflect.String:
-			v.SetString(readerSymbols[ri])
-		case v.CanInt():
-			if v.OverflowInt(int64(ri)) {
-				return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", ri, v.Type())}
-			}
-			v.SetInt(int64(ri))
-		case v.CanUint():
-			if v.OverflowUint(uint64(ri)) {
-				return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", ri, v.Type())}
-			}
-			v.SetUint(uint64(ri))
-		default:
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
-		}
-		return src, nil
+		return src, setEnumTarget(indirectAlloc(v), ri, readerSymbols[ri])
 	})
 	var decodeJSON jsonDecodeFn
 	if decs := ctx.customDecoders[r]; len(decs) > 0 {
@@ -559,7 +540,7 @@ func resolveMap(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, er
 		// minEntryBytes: bound against the WRITER's wire format, not the
 		// reader's resolved schema (a long-on-wire promoted to a double
 		// reader is still 1 byte minimum on the wire).
-		deser:  (&deserMap{deserItem: resolved.deser, minEntryBytes: 1 + schemaMinBytes(w.values)}).deser,
+		deser: (&deserMap{deserItem: resolved.deser, minEntryBytes: 1 + schemaMinBytes(w.values)}).deser,
 	}
 	if decs := ctx.customDecoders[r]; len(decs) > 0 {
 		sn := ctx.customSNs[r]

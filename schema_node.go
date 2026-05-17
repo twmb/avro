@@ -129,196 +129,62 @@ func (s *Schema) Root() SchemaNode {
 // occurrence of a named type (record, enum, fixed) emits the full
 // definition; subsequent occurrences emit the name as a reference.
 func (n *SchemaNode) toJSONDedup(d *deduper) any {
-	// Cycle detection for *SchemaNode pointers (Items/Values). Fields
-	// and Branches are value slices and cannot form true cycles.
-	//
-	// Named-type ancestor cycles (a record that contains an array
-	// whose Items pointer is the record itself — the programmatic
-	// shape of an Avro recursive schema) emit as a name reference,
-	// which is the canonical Avro recursive-schema form. The JSON
-	// equivalent uses a name reference at the inner position
-	// ({"type":"array","items":"NodeName"}); the programmatic form
-	// reaches the same destination via the pointer. Pre-fix this
-	// errored because the cycle guard fired before the dedup
-	// mechanism's name-reference emission at line 152 could; both
-	// cycle-at-ancestor-named and conflict-detection-via-d.defined
-	// converge on "emit the name" so the cycle path emits it
-	// directly without needing d.defined to be populated yet (which
-	// won't happen for ancestors until the line-180 snapshot below).
-	// Unnamed cycles (array of itself, map of itself) remain errors —
-	// Avro has no name-reference syntax for unnamed types.
-	if _, cycle := d.visited[n]; cycle {
-		switch n.Type {
-		case "record", "error", "enum", "fixed":
-			if n.Name != "" {
-				return n.Name
-			}
-		}
-		if d.err == nil {
-			d.err = fmt.Errorf("avro: cyclic SchemaNode detected")
-		}
-		return nil
-	}
-	d.visited[n] = struct{}{}
-	defer delete(d.visited, n)
-
-	// For named types with a Name, check if already defined.
-	switch n.Type {
-	case "record", "error", "enum", "fixed":
-		if n.Name != "" {
-			if prev, exists := d.defined[n.Name]; exists {
-				cur, _ := json.Marshal(n.toJSON())
-				if string(cur) != prev && d.err == nil {
-					d.err = fmt.Errorf("avro: conflicting definitions for named type %q", n.Name)
-				}
-				return n.Name
-			}
-		}
-	}
-
-	switch n.Type {
-	case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
-		if n.LogicalType == "" && len(n.Props) == 0 {
-			return n.Type
-		}
-	case "union":
-		branches := make([]any, len(n.Branches))
-		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSONDedup(d)
-		}
-		return branches
-	}
-
-	if n.Name == "" && n.Type != "array" && n.Type != "map" &&
-		n.Type != "record" && n.Type != "error" && n.Type != "enum" && n.Type != "fixed" &&
-		n.Type != "union" && n.LogicalType == "" && len(n.Props) == 0 {
-		return n.Type
-	}
-
-	// Mark named types as defined, storing the canonical JSON for comparison.
-	switch n.Type {
-	case "record", "error", "enum", "fixed":
-		if n.Name != "" {
-			b, _ := json.Marshal(n.toJSON())
-			d.defined[n.Name] = string(b)
-		}
-	}
-
-	m := map[string]any{"type": n.Type}
-	if n.Name != "" {
-		m["name"] = n.Name
-	}
-	if n.Namespace != "" {
-		m["namespace"] = n.Namespace
-	}
-	if len(n.Aliases) > 0 {
-		m["aliases"] = n.Aliases
-	}
-	if n.Doc != "" {
-		m["doc"] = n.Doc
-	}
-	if n.HasEnumDefault {
-		m["default"] = n.EnumDefault
-	}
-	if n.LogicalType != "" {
-		m["logicalType"] = n.LogicalType
-	}
-	if n.Precision != 0 {
-		m["precision"] = n.Precision
-	}
-	if n.Scale != 0 {
-		m["scale"] = n.Scale
-	}
-	if n.Size != 0 {
-		m["size"] = n.Size
-	}
-	// enum.symbols is a required attribute per the Avro spec (Complex
-	// Types > Enums: "symbols: a JSON array, listing symbols, as JSON
-	// strings (required)"), always emit for enum types even when empty.
-	if n.Type == "enum" {
-		if n.Symbols == nil {
-			m["symbols"] = []string{}
-		} else {
-			m["symbols"] = n.Symbols
-		}
-	} else if len(n.Symbols) > 0 {
-		m["symbols"] = n.Symbols
-	}
-	if n.Items != nil {
-		m["items"] = n.Items.toJSONDedup(d)
-	}
-	if n.Values != nil {
-		m["values"] = n.Values.toJSONDedup(d)
-	}
-	// record.fields is a required attribute per the Avro spec (Complex
-	// Types > Records: "fields: a JSON array, listing fields (required)"),
-	// always emit for record/error types even when empty.
-	if n.Type == "record" || n.Type == "error" || len(n.Fields) > 0 {
-		fields := make([]map[string]any, len(n.Fields))
-		for i, f := range n.Fields {
-			fd := map[string]any{
-				"name": f.Name,
-				"type": f.Type.toJSONDedup(d),
-			}
-			if f.HasDefault || f.Default != nil {
-				fd["default"] = f.Default
-			}
-			if len(f.Aliases) > 0 {
-				fd["aliases"] = f.Aliases
-			}
-			if f.Order != "" {
-				fd["order"] = f.Order
-			}
-			if f.Doc != "" {
-				fd["doc"] = f.Doc
-			}
-			maps.Copy(fd, f.Props)
-			fields[i] = fd
-		}
-		m["fields"] = fields
-	}
-	maps.Copy(m, n.Props)
-	return m
+	return n.toJSONWalk(d.visited, d)
 }
 
 // toJSON converts a SchemaNode to a JSON-serializable representation.
 // Cycles in n's Items/Values pointers (programmatically constructed)
 // are detected and emitted as the cyclic node's name (for named types)
-// or nil (for unnamed). The visited map is per-call; toJSONDedup uses
-// its own dedup-aware cycle guard at line 134 for the outer walk and
-// calls into toJSON for snapshot/equality at lines 148/180.
+// or nil (for unnamed).
 func (n *SchemaNode) toJSON() any {
-	return n.toJSONVisited(make(map[*SchemaNode]struct{}))
+	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil)
 }
 
-// toJSONVisited is the cycle-aware inner walker. Pre-fix, the four
-// recursive call sites (Items, Values, Branches[i], Fields[i].Type)
-// invoked toJSON unconditionally, so programmatic cycles via
-// Items/Values pointers caused stack overflow when toJSONDedup forked
-// here at lines 148/180 (snapshot + equality check for named-type
-// conflict detection). The dedup walker's own cycle guard at line 134
-// only protected the outer dedup-aware walk; the snapshot fork was
-// blind to cycles. See TestRegression_SchemaNodeToJSONCycleSafe.
-func (n *SchemaNode) toJSONVisited(visited map[*SchemaNode]struct{}) any {
+// toJSONWalk is the cycle-aware walker shared by toJSON and toJSONDedup.
+// visited is threaded through every recursive call so cycles introduced
+// via Items / Values pointers terminate — see
+// TestRegression_SchemaNodeToJSONCycleSafe for the invariant. When d is
+// non-nil it tracks named-type definitions and reports conflicting
+// redefinitions; when nil it just emits the JSON tree.
+func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) any {
 	if _, cycle := visited[n]; cycle {
-		// Cycle through Items/Values back to n. For named types, emit
-		// the name as a reference (the natural Avro recursive-schema
-		// shape). For unnamed types, return nil — the resulting JSON
-		// is partial but stable enough for the toJSONDedup snapshot/
-		// equality check to function: two equal cyclic subtrees
-		// produce the same partial JSON.
+		// Cycle through Items/Values back to n. Named types emit the
+		// name as a reference (the canonical Avro recursive-schema
+		// shape). Unnamed cycles are an error in the dedup walker and
+		// return nil-stable JSON in the bare walker (snapshot/equality
+		// comparison stays meaningful: two equal cyclic subtrees
+		// produce the same partial JSON).
 		switch n.Type {
 		case "record", "error", "enum", "fixed":
 			if n.Name != "" {
 				return n.Name
 			}
+		}
+		if d != nil && d.err == nil {
+			d.err = fmt.Errorf("avro: cyclic SchemaNode detected")
 		}
 		return nil
 	}
 	visited[n] = struct{}{}
 	defer delete(visited, n)
 
-	// Named type reference: just the name string.
+	// Dedup: named types that have already been emitted become name refs;
+	// a redefinition with a different body is reported as a conflict.
+	if d != nil {
+		switch n.Type {
+		case "record", "error", "enum", "fixed":
+			if n.Name != "" {
+				if prev, exists := d.defined[n.Name]; exists {
+					cur, _ := json.Marshal(n.toJSON())
+					if string(cur) != prev && d.err == nil {
+						d.err = fmt.Errorf("avro: conflicting definitions for named type %q", n.Name)
+					}
+					return n.Name
+				}
+			}
+		}
+	}
+
 	switch n.Type {
 	case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
 		if n.LogicalType == "" && len(n.Props) == 0 {
@@ -327,21 +193,30 @@ func (n *SchemaNode) toJSONVisited(visited map[*SchemaNode]struct{}) any {
 	case "union":
 		branches := make([]any, len(n.Branches))
 		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSONVisited(visited)
+			branches[i] = n.Branches[i].toJSONWalk(visited, d)
 		}
 		return branches
 	}
 
-	// Check if this is a named type reference (no fields, no items, etc.)
 	if n.Name == "" && n.Type != "array" && n.Type != "map" &&
 		n.Type != "record" && n.Type != "error" && n.Type != "enum" && n.Type != "fixed" &&
 		n.Type != "union" && n.LogicalType == "" && len(n.Props) == 0 {
-		// Named type reference.
 		return n.Type
 	}
 
-	m := map[string]any{"type": n.Type}
+	// Dedup: remember this named type's canonical body for the next
+	// occurrence's conflict check.
+	if d != nil {
+		switch n.Type {
+		case "record", "error", "enum", "fixed":
+			if n.Name != "" {
+				b, _ := json.Marshal(n.toJSON())
+				d.defined[n.Name] = string(b)
+			}
+		}
+	}
 
+	m := map[string]any{"type": n.Type}
 	if n.Name != "" {
 		m["name"] = n.Name
 	}
@@ -382,10 +257,10 @@ func (n *SchemaNode) toJSONVisited(visited map[*SchemaNode]struct{}) any {
 		m["symbols"] = n.Symbols
 	}
 	if n.Items != nil {
-		m["items"] = n.Items.toJSONVisited(visited)
+		m["items"] = n.Items.toJSONWalk(visited, d)
 	}
 	if n.Values != nil {
-		m["values"] = n.Values.toJSONVisited(visited)
+		m["values"] = n.Values.toJSONWalk(visited, d)
 	}
 	// record.fields is a required attribute per the Avro spec (Complex
 	// Types > Records: "fields: a JSON array, listing fields (required)"),
@@ -395,7 +270,7 @@ func (n *SchemaNode) toJSONVisited(visited map[*SchemaNode]struct{}) any {
 		for i, f := range n.Fields {
 			fd := map[string]any{
 				"name": f.Name,
-				"type": f.Type.toJSONVisited(visited),
+				"type": f.Type.toJSONWalk(visited, d),
 			}
 			if f.HasDefault || f.Default != nil {
 				fd["default"] = f.Default
@@ -417,6 +292,7 @@ func (n *SchemaNode) toJSONVisited(visited map[*SchemaNode]struct{}) any {
 	maps.Copy(m, n.Props)
 	return m
 }
+
 
 // nodeFromJSON converts a parsed JSON value into a SchemaNode.
 func nodeFromJSON(v any) SchemaNode {
@@ -469,6 +345,41 @@ func jsonNumericInt(v any) (int, bool) {
 	return 0, false
 }
 
+// getCIString assigns *dst to m[key] when present and string-typed.
+// Mirrors the lookupCI + type-assert pattern repeated ~6 times in
+// nodeFromJSONObject and its inner field loop.
+func getCIString(m map[string]any, key string, dst *string) {
+	if v, ok := lookupCI(m, key); ok {
+		if s, ok := v.(string); ok {
+			*dst = s
+		}
+	}
+}
+
+// getCIInt assigns *dst to m[key] when present and parseable via
+// jsonNumericInt (precision/scale/size).
+func getCIInt(m map[string]any, key string, dst *int) {
+	if v, ok := lookupCI(m, key); ok {
+		if p, ok := jsonNumericInt(v); ok {
+			*dst = p
+		}
+	}
+}
+
+// getCIStringSlice assigns *dst to m[key] when it is a []any of strings
+// (aliases, symbols).
+func getCIStringSlice(m map[string]any, key string, dst *[]string) {
+	if v, ok := lookupCI(m, key); ok {
+		if vs, ok := v.([]any); ok {
+			out := make([]string, len(vs))
+			for i, x := range vs {
+				out[i], _ = x.(string)
+			}
+			*dst = out
+		}
+	}
+}
+
 // lookupCI looks up key k in m, matching case-insensitively. Mirrors
 // encoding/json's struct field matching so schemas with non-canonical
 // casing ("tYpe" instead of "type") round-trip through Root/Schema.
@@ -501,67 +412,20 @@ func lookupCI(m map[string]any, key string) (any, bool) {
 func nodeFromJSONObject(m map[string]any) SchemaNode {
 	n := SchemaNode{}
 
-	if v, ok := lookupCI(m, "type"); ok {
-		if t, ok := v.(string); ok {
-			n.Type = t
-		}
-	}
-	if v, ok := lookupCI(m, "name"); ok {
-		if name, ok := v.(string); ok {
-			n.Name = name
-		}
-	}
-	if v, ok := lookupCI(m, "namespace"); ok {
-		if ns, ok := v.(string); ok {
-			n.Namespace = ns
-		}
-	}
-	if v, ok := lookupCI(m, "doc"); ok {
-		if doc, ok := v.(string); ok {
-			n.Doc = doc
-		}
-	}
-	if v, ok := lookupCI(m, "logicalType"); ok {
-		if lt, ok := v.(string); ok {
-			n.LogicalType = lt
-		}
-	}
+	getCIString(m, "type", &n.Type)
+	getCIString(m, "name", &n.Name)
+	getCIString(m, "namespace", &n.Namespace)
+	getCIString(m, "doc", &n.Doc)
+	getCIString(m, "logicalType", &n.LogicalType)
 	// precision/scale/size are int per spec. After
 	// unmarshalAnyPreservePrecision, integer JSON literals come back as
-	// int64 (not float64); accept the integer form directly.
-	if v, ok := lookupCI(m, "precision"); ok {
-		if p, ok := jsonNumericInt(v); ok {
-			n.Precision = p
-		}
-	}
-	if v, ok := lookupCI(m, "scale"); ok {
-		if p, ok := jsonNumericInt(v); ok {
-			n.Scale = p
-		}
-	}
-	if v, ok := lookupCI(m, "size"); ok {
-		if p, ok := jsonNumericInt(v); ok {
-			n.Size = p
-		}
-	}
+	// int64 (not float64); jsonNumericInt accepts both.
+	getCIInt(m, "precision", &n.Precision)
+	getCIInt(m, "scale", &n.Scale)
+	getCIInt(m, "size", &n.Size)
+	getCIStringSlice(m, "aliases", &n.Aliases)
+	getCIStringSlice(m, "symbols", &n.Symbols)
 
-	if v, ok := lookupCI(m, "aliases"); ok {
-		if aliases, ok := v.([]any); ok {
-			n.Aliases = make([]string, len(aliases))
-			for i, a := range aliases {
-				n.Aliases[i], _ = a.(string)
-			}
-		}
-	}
-
-	if v, ok := lookupCI(m, "symbols"); ok {
-		if syms, ok := v.([]any); ok {
-			n.Symbols = make([]string, len(syms))
-			for i, s := range syms {
-				n.Symbols[i], _ = s.(string)
-			}
-		}
-	}
 	if v, ok := lookupCI(m, "default"); ok && n.Type == "enum" {
 		if d, ok := v.(string); ok {
 			n.EnumDefault = d
@@ -584,11 +448,7 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 			for i, f := range fields {
 				fm, _ := f.(map[string]any)
 				sf := SchemaField{}
-				if v, ok := lookupCI(fm, "name"); ok {
-					if name, ok := v.(string); ok {
-						sf.Name = name
-					}
-				}
+				getCIString(fm, "name", &sf.Name)
 				if t, ok := lookupCI(fm, "type"); ok {
 					sf.Type = nodeFromJSON(t)
 				}
@@ -596,24 +456,9 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 					sf.Default = d
 					sf.HasDefault = true
 				}
-				if v, ok := lookupCI(fm, "doc"); ok {
-					if doc, ok := v.(string); ok {
-						sf.Doc = doc
-					}
-				}
-				if v, ok := lookupCI(fm, "aliases"); ok {
-					if aliases, ok := v.([]any); ok {
-						sf.Aliases = make([]string, len(aliases))
-						for j, a := range aliases {
-							sf.Aliases[j], _ = a.(string)
-						}
-					}
-				}
-				if v, ok := lookupCI(fm, "order"); ok {
-					if order, ok := v.(string); ok {
-						sf.Order = order
-					}
-				}
+				getCIString(fm, "doc", &sf.Doc)
+				getCIStringSlice(fm, "aliases", &sf.Aliases)
+				getCIString(fm, "order", &sf.Order)
 				for k, v := range fm {
 					if fieldReservedKeyCI(k) {
 						continue
@@ -642,12 +487,14 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 	return n
 }
 
-// fieldReservedKeyCI is a case-insensitive wrapper over fieldReservedKeys.
-func fieldReservedKeyCI(k string) bool {
-	if fieldReservedKeys[k] {
+// reservedKeyCI is a case-insensitive wrapper for membership in a
+// reserved-key map. Shared by fieldReservedKeyCI / schemaReservedKeyCI
+// so the case-insensitive fall-through scan lives in one place.
+func reservedKeyCI(k string, reserved map[string]bool) bool {
+	if reserved[k] {
 		return true
 	}
-	for rk := range fieldReservedKeys {
+	for rk := range reserved {
 		if strings.EqualFold(k, rk) {
 			return true
 		}
@@ -655,15 +502,5 @@ func fieldReservedKeyCI(k string) bool {
 	return false
 }
 
-// schemaReservedKeyCI is a case-insensitive wrapper over schemaReservedKeys.
-func schemaReservedKeyCI(k string) bool {
-	if schemaReservedKeys[k] {
-		return true
-	}
-	for rk := range schemaReservedKeys {
-		if strings.EqualFold(k, rk) {
-			return true
-		}
-	}
-	return false
-}
+func fieldReservedKeyCI(k string) bool  { return reservedKeyCI(k, fieldReservedKeys) }
+func schemaReservedKeyCI(k string) bool { return reservedKeyCI(k, schemaReservedKeys) }

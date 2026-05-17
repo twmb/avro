@@ -174,7 +174,7 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 	case "string":
 		return ctx.decodeString(v, node, toAny)
 	case "enum":
-		return ctx.decodeEnum(v, node, toAny)
+		return ctx.decodeEnum(v, node)
 	case "bytes":
 		return ctx.decodeBytes(v, node, toAny)
 	case "fixed":
@@ -237,21 +237,13 @@ func (ctx *jsonDecoder) decodeBool(v reflect.Value, toAny bool) error {
 		return err
 	}
 	if toAny {
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(b))
-			return nil
-		}
-		rv := reflect.ValueOf(b)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: "boolean"}
-		}
-		v.Set(rv)
-	} else if v.Kind() == reflect.Bool {
-		v.SetBool(b)
-	} else {
-		return &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+		return setIface(v, reflect.ValueOf(b), "boolean")
 	}
-	return nil
+	if v.Kind() == reflect.Bool {
+		v.SetBool(b)
+		return nil
+	}
+	return &SemanticError{GoType: v.Type(), AvroType: "boolean"}
 }
 
 func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool) error {
@@ -264,17 +256,7 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 		return err
 	}
 	if toAny {
-		logical := decodeLogicalInt(val, node)
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(logical))
-			return nil
-		}
-		rv := reflect.ValueOf(logical)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: "int"}
-		}
-		v.Set(rv)
-		return nil
+		return setIface(v, reflect.ValueOf(decodeLogicalInt(val, node)), "int")
 	}
 	// All DecodeJSON entry points produce addressable values
 	// (Schema.DecodeJSON requires a pointer; recursive paths use
@@ -318,16 +300,7 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 		if err != nil {
 			return err
 		}
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(logical))
-			return nil
-		}
-		rv := reflect.ValueOf(logical)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: "long"}
-		}
-		v.Set(rv)
-		return nil
+		return setIface(v, reflect.ValueOf(logical), "long")
 	}
 	// All DecodeJSON entry points produce addressable values (see decodeInt).
 	if v.Type() == timeType {
@@ -501,16 +474,7 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny bo
 		return nil
 	}
 	if toAny {
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(s))
-			return nil
-		}
-		rv := reflect.ValueOf(s)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: "string"}
-		}
-		v.Set(rv)
-		return nil
+		return setIface(v, reflect.ValueOf(s), "string")
 	}
 	if v.Kind() == reflect.String {
 		v.SetString(s)
@@ -534,7 +498,7 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny bo
 	return &SemanticError{GoType: v.Type(), AvroType: "string"}
 }
 
-func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode, toAny bool) error {
+func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode) error {
 	s, err := ctx.consumeSlabString()
 	if err != nil {
 		return err
@@ -549,30 +513,10 @@ func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode, toAny bool
 	if idx < 0 {
 		return fmt.Errorf("avro json: unknown enum symbol %q", s)
 	}
-	switch {
-	case toAny:
-		return setIface(v, reflect.ValueOf(s), "enum")
-	case v.Kind() == reflect.String:
-		v.SetString(s)
-	case v.CanInt():
-		// Mirrors deserEnum's int target arm: set the symbol's
-		// ordinal so a struct with an int-typed enum field round-
-		// trips identically through binary and JSON. Java's
-		// JsonDecoder.readEnum and fastavro's read_enum both return
-		// the index — twmb's JSON path used to reject this shape.
-		if v.OverflowInt(int64(idx)) {
-			return &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
-		}
-		v.SetInt(int64(idx))
-	case v.CanUint():
-		if v.OverflowUint(uint64(idx)) {
-			return &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
-		}
-		v.SetUint(uint64(idx))
-	default:
-		return &SemanticError{GoType: v.Type(), AvroType: "enum"}
-	}
-	return nil
+	// Mirrors deserEnum's target dispatch: Interface→symbol; String→symbol;
+	// Int/Uint→ordinal (Java's JsonDecoder.readEnum and fastavro's read_enum
+	// both return the index, which twmb's JSON path used to reject).
+	return setEnumTarget(v, idx, s)
 }
 
 func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny bool) error {
@@ -1143,15 +1087,17 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 			if branch := findUnionBranch(node, key); branch != nil {
 				if err := ctx.scanner.expect(':'); err == nil {
 					if toAny {
+						// Decode into a tmp `any` first so v stays
+						// untouched until we know the close-brace
+						// arrived — otherwise a malformed tagged
+						// payload like `{"long": 42,` would write v
+						// and THEN backtrack to the bare-fallback,
+						// leaving v dirty on the final err return.
 						var val any
 						err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch)
 						if err == nil {
 							if ctx.scanner.peek() == '}' {
 								ctx.scanner.pos++
-								// wrapUnion returns nil for null branches;
-								// reflect.ValueOf(nil) is the invalid zero
-								// Value, so use assignAny which sets a typed
-								// nil for interface targets.
 								return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
 							}
 						} else if errors.Is(err, errTooDeep) {
@@ -1164,6 +1110,12 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 							taggedErr = err
 						}
 					} else {
+						// Typed path: decodeValue writes v directly.
+						// Backtracking after a partial write here is
+						// acceptable — the only case it triggers is a
+						// missing close brace on otherwise-valid JSON,
+						// and the next attempt will overwrite via the
+						// bare fallback if it matches.
 						err := ctx.decodeValue(v, branch)
 						if err == nil {
 							if ctx.scanner.peek() == '}' {
@@ -1194,6 +1146,27 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 	return nil
 }
 
+// decodeBranchInto decodes the next JSON value as the given union branch
+// and writes the result into v. Used by decodeUnionBare where the entire
+// branch interpretation either fully succeeds (return nil) or fully
+// fails (caller backtracks and tries the next branch). decodeUnionObject
+// uses an inline tmp `any` instead since it must hold the decoded value
+// pending a close-brace check before committing to v — see the comment
+// on its tagged-path arm.
+func (ctx *jsonDecoder) decodeBranchInto(v reflect.Value, branch *schemaNode, toAny bool) error {
+	if toAny {
+		var val any
+		if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err != nil {
+			return err
+		}
+		// wrapUnion returns nil for null branches; reflect.ValueOf(nil)
+		// is the invalid zero Value, so use assignAny which sets a typed
+		// nil for interface targets.
+		return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
+	}
+	return ctx.decodeValue(v, branch)
+}
+
 func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny bool, p byte) error {
 	// Match by JSON token type against branch kinds. The last branch's
 	// decode error (if any) is preserved so the final message names the
@@ -1210,24 +1183,14 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny
 			continue
 		}
 		savedPos := ctx.scanner.pos
-		var err error
-		if toAny {
-			var val any
-			err = ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch)
-			if err == nil {
-				return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
-			}
-		} else {
-			err = ctx.decodeValue(v, branch)
-			if err == nil {
-				return nil
-			}
-		}
-		if errors.Is(err, errTooDeep) {
+		if err := ctx.decodeBranchInto(v, branch, toAny); err == nil {
+			return nil
+		} else if errors.Is(err, errTooDeep) {
 			return err
+		} else {
+			lastErr = err
+			ctx.scanner.pos = savedPos
 		}
-		lastErr = err
-		ctx.scanner.pos = savedPos
 	}
 	if lastErr != nil {
 		return fmt.Errorf("avro json: no union branch matched at offset %d: %w", ctx.scanner.pos, lastErr)

@@ -27,73 +27,72 @@ var promotions = map[string]deserfn{
 	"bytes>string": promoteBytesToString,
 }
 
-func promoteIntToLong(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
+// promoteRead wraps a wire read + per-target setter into a deserfn. Each
+// promote* function below is a one-liner using this helper.
+func promoteRead[Wire any](
+	read func([]byte) (Wire, []byte, error),
+	apply func(reflect.Value, Wire) error,
+) deserfn {
+	return func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+		val, src, err := read(src)
+		if err != nil {
+			return nil, err
+		}
+		return src, apply(indirectAlloc(v), val)
 	}
-	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		return src, setIface(v, reflect.ValueOf(int64(val)), "long")
-	}
-	return src, setLongValue(v, int64(val))
 }
 
-func promoteIntToFloat(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
-	}
-	return src, setFloatValue(indirectAlloc(v), float64(val), "float", 32)
-}
+var (
+	// setLongValue handles the Interface arm internally, so no special-case
+	// needed here (the prior promoteIntToLong's separate Interface arm was
+	// redundant with setLongValue's first branch).
+	promoteIntToLong = promoteRead(readVarint,
+		func(v reflect.Value, n int32) error { return setLongValue(v, int64(n)) })
+	promoteIntToFloat = promoteRead(readVarint,
+		func(v reflect.Value, n int32) error { return setFloatValue(v, float64(n), "float", 32) })
+	promoteIntToDouble = promoteRead(readVarint,
+		func(v reflect.Value, n int32) error { return setFloatValue(v, float64(n), "double", 64) })
+	promoteLongToFloat = promoteRead(readVarlong,
+		func(v reflect.Value, n int64) error { return setFloatValue(v, float64(n), "float", 32) })
+	promoteLongToDouble = promoteRead(readVarlong,
+		func(v reflect.Value, n int64) error { return setFloatValue(v, float64(n), "double", 64) })
+	promoteFloatToDouble = promoteRead(readUint32,
+		func(v reflect.Value, u uint32) error {
+			return setFloatValue(v, float64(math.Float32frombits(u)), "double", 64)
+		})
+)
 
-func promoteIntToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
+// readBytesPrefix reads a varlong length prefix and validates it against
+// the remaining buffer. Shared by the four promote*-with-length-prefix
+// helpers (promoteStringToBytes, promoteStringToBytesDecimal,
+// promoteStringToBytesBigDecimal, promoteBytesToStringUUID,
+// promoteBytesToString) so the trio of error shapes (varlong, negative,
+// overrun) is in one place. destAvroType labels the SemanticError for a
+// negative length; wireTypeName labels the ShortBufferError for buffer
+// overrun. They differ across promotion directions: a string→bytes
+// promotion tags negative-length as "bytes" (destination) and short-
+// buffer as "string" (writer's wire type), and vice versa for bytes→
+// string.
+func readBytesPrefix(src []byte, destAvroType, wireTypeName string) (n int, rest []byte, err error) {
+	length, rest, err := readVarlong(src)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
-	return src, setFloatValue(indirectAlloc(v), float64(val), "double", 64)
-}
-
-func promoteLongToFloat(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
+	if length < 0 {
+		return 0, nil, &SemanticError{AvroType: destAvroType}
 	}
-	return src, setFloatValue(indirectAlloc(v), float64(val), "float", 32)
-}
-
-func promoteLongToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
+	if length > int64(len(rest)) {
+		return 0, nil, &ShortBufferError{Type: wireTypeName, Need: int(length), Have: len(rest)}
 	}
-	return src, setFloatValue(indirectAlloc(v), float64(val), "double", 64)
-}
-
-func promoteFloatToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	u, src, err := readUint32(src)
-	if err != nil {
-		return nil, err
-	}
-	return src, setFloatValue(indirectAlloc(v), float64(math.Float32frombits(u)), "double", 64)
+	return int(length), rest, nil
 }
 
 func promoteStringToBytes(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	length, src, err := readVarlong(src)
+	n, src, err := readBytesPrefix(src, "bytes", "string")
 	if err != nil {
 		return nil, err
 	}
-	if length < 0 {
-		return nil, &SemanticError{AvroType: "bytes"}
-	}
-	if length > int64(len(src)) {
-		return nil, &ShortBufferError{Type: "string", Need: int(length), Have: len(src)}
-	}
-	n := int(length)
-	b := make([]byte, n)
-	copy(b, src[:n])
-	if err := setBytesValue(indirectAlloc(v), b, "bytes"); err != nil {
+	if err := setBytesValue(indirectAlloc(v), src[:n], "bytes"); err != nil {
 		return nil, err
 	}
 	return src[n:], nil
@@ -172,23 +171,7 @@ func promoteIntToLongTimeMicros(src []byte, v reflect.Value, _ *slab) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	v = indirectAlloc(v)
-	if v.Type() == durationType || v.Type() == timeType || v.Kind() == reflect.Interface {
-		d, err := timeMicrosToDuration(int64(val))
-		if err != nil {
-			return nil, err
-		}
-		switch {
-		case v.Type() == durationType:
-			v.Set(reflect.ValueOf(d))
-		case v.Type() == timeType:
-			v.Set(reflect.ValueOf(timeOfDayToTime(d)))
-		default:
-			return src, setIface(v, reflect.ValueOf(d), "long")
-		}
-		return src, nil
-	}
-	return src, setLongValue(v, int64(val))
+	return src, setTimeMicrosTarget(indirectAlloc(v), int64(val))
 }
 
 // promoteStringToBytesDecimal reads the writer's varlong-length-
@@ -197,19 +180,11 @@ func promoteIntToLongTimeMicros(src []byte, v reflect.Value, _ *slab) ([]byte, e
 // length-read shape of promoteStringToBytes.
 func promoteStringToBytesDecimal(scale int) deserfn {
 	return func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-		length, src, err := readVarlong(src)
+		n, src, err := readBytesPrefix(src, "bytes", "string")
 		if err != nil {
 			return nil, err
 		}
-		if length < 0 {
-			return nil, &SemanticError{AvroType: "bytes"}
-		}
-		if length > int64(len(src)) {
-			return nil, &ShortBufferError{Type: "string", Need: int(length), Have: len(src)}
-		}
-		n := int(length)
-		b := make([]byte, n)
-		copy(b, src[:n])
+		b := src[:n]
 		v = indirectAlloc(v)
 		ok, err := setDecimalValue(v, b, scale)
 		if err != nil {
@@ -231,19 +206,11 @@ func promoteStringToBytesDecimal(scale int) deserfn {
 // (parse as structured big-decimal payload, fall back to raw bytes
 // for opaque-pass-through targets).
 func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	length, src, err := readVarlong(src)
+	n, src, err := readBytesPrefix(src, "bytes", "string")
 	if err != nil {
 		return nil, err
 	}
-	if length < 0 {
-		return nil, &SemanticError{AvroType: "bytes"}
-	}
-	if length > int64(len(src)) {
-		return nil, &ShortBufferError{Type: "string", Need: int(length), Have: len(src)}
-	}
-	n := int(length)
-	payload := make([]byte, n)
-	copy(payload, src[:n])
+	payload := src[:n]
 	v = indirectAlloc(v)
 	if r, displayScale, perr := parseBigDecimalPayload(payload); perr == nil {
 		if ok, err := setDecimalRat(v, r, displayScale); ok {
@@ -255,7 +222,7 @@ func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byt
 	} else if v.Kind() != reflect.Slice && v.Kind() != reflect.String && v.Kind() != reflect.Array {
 		return nil, perr
 	}
-	if _, err := assignBytesTarget(v, payload, "big-decimal"); err != nil {
+	if err := setBytesValue(v, payload, "big-decimal"); err != nil {
 		return nil, err
 	}
 	return src[n:], nil
@@ -268,17 +235,10 @@ func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byt
 // deserializer would handle the bytes if they'd been written as the
 // 36-char hex-dash form.
 func promoteBytesToStringUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	length, src, err := readVarlong(src)
+	n, src, err := readBytesPrefix(src, "string", "bytes")
 	if err != nil {
 		return nil, err
 	}
-	if length < 0 {
-		return nil, &SemanticError{AvroType: "string"}
-	}
-	if length > int64(len(src)) {
-		return nil, &ShortBufferError{Type: "bytes", Need: int(length), Have: len(src)}
-	}
-	n := int(length)
 	v = indirectAlloc(v)
 	// [16]byte target wants the parsed UUID bytes; everything else
 	// gets the canonical-string view (interface, string, []byte).
@@ -298,17 +258,10 @@ func promoteBytesToStringUUID(src []byte, v reflect.Value, sl *slab) ([]byte, er
 }
 
 func promoteBytesToString(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	length, src, err := readVarlong(src)
+	n, src, err := readBytesPrefix(src, "string", "bytes")
 	if err != nil {
 		return nil, err
 	}
-	if length < 0 {
-		return nil, &SemanticError{AvroType: "string"}
-	}
-	if length > int64(len(src)) {
-		return nil, &ShortBufferError{Type: "bytes", Need: int(length), Have: len(src)}
-	}
-	n := int(length)
 	if err := setStringValue(indirectAlloc(v), src, n, sl); err != nil {
 		return nil, err
 	}

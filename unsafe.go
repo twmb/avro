@@ -490,38 +490,26 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 
 // ---- Logical type unsafe serializers ----
 
+// usTimestampLogicals maps the six long-typed timestamp logicals to
+// their time.Time-target unsafe serializer. Non-time.Time targets fall
+// back to usLong(kind) at the dispatch site below.
+var usTimestampLogicals = map[string]userfn{
+	"timestamp-millis":       usTimestampMillis,
+	"timestamp-micros":       usTimestampMicros,
+	"timestamp-nanos":        usTimestampNanos,
+	"local-timestamp-millis": usLocalTimestampMillis,
+	"local-timestamp-micros": usLocalTimestampMicros,
+	"local-timestamp-nanos":  usLocalTimestampNanos,
+}
+
 func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn {
+	if fn, ok := usTimestampLogicals[logical]; ok {
+		if goType == timeType {
+			return fn
+		}
+		return usLong(goType.Kind())
+	}
 	switch logical {
-	case "timestamp-millis":
-		if goType == timeType {
-			return usTimestampMillis
-		}
-		return usLong(goType.Kind())
-	case "timestamp-micros":
-		if goType == timeType {
-			return usTimestampMicros
-		}
-		return usLong(goType.Kind())
-	case "timestamp-nanos":
-		if goType == timeType {
-			return usTimestampNanos
-		}
-		return usLong(goType.Kind())
-	case "local-timestamp-millis":
-		if goType == timeType {
-			return usLocalTimestampMillis
-		}
-		return usLong(goType.Kind())
-	case "local-timestamp-micros":
-		if goType == timeType {
-			return usLocalTimestampMicros
-		}
-		return usLong(goType.Kind())
-	case "local-timestamp-nanos":
-		if goType == timeType {
-			return usLocalTimestampNanos
-		}
-		return usLong(goType.Kind())
 	case "date":
 		if goType == timeType {
 			return usDate
@@ -565,23 +553,27 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 	return nil
 }
 
+// udTimestampLogicals maps the six long-typed timestamp logicals to
+// their time.Time-target unsafe deserializer (local-timestamp-* and
+// timestamp-* decode identically; the wire long is interpreted the same
+// way — see logical.go for the encode-side wall-clock vs instant note).
+var udTimestampLogicals = map[string]udeserfn{
+	"timestamp-millis":       udTimestampMillis,
+	"timestamp-micros":       udTimestampMicros,
+	"timestamp-nanos":        udTimestampNanos,
+	"local-timestamp-millis": udTimestampMillis,
+	"local-timestamp-micros": udTimestampMicros,
+	"local-timestamp-nanos":  udTimestampNanos,
+}
+
 func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udeserfn {
+	if fn, ok := udTimestampLogicals[logical]; ok {
+		if goType == timeType {
+			return fn
+		}
+		return udLong(goType.Kind())
+	}
 	switch logical {
-	case "timestamp-millis", "local-timestamp-millis":
-		if goType == timeType {
-			return udTimestampMillis
-		}
-		return udLong(goType.Kind())
-	case "timestamp-micros", "local-timestamp-micros":
-		if goType == timeType {
-			return udTimestampMicros
-		}
-		return udLong(goType.Kind())
-	case "timestamp-nanos", "local-timestamp-nanos":
-		if goType == timeType {
-			return udTimestampNanos
-		}
-		return udLong(goType.Kind())
 	case "date":
 		if goType == timeType {
 			return udDate
@@ -799,24 +791,34 @@ func udUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src[n:], nil
 }
 
+// readFixedUUID validates len(src) ≥ 16 and returns the next UUID bytes
+// plus the advanced source slice. Shared body of udFixedUUID (writes
+// [16]byte) and udFixedUUIDString (writes the canonical string form).
+func readFixedUUID(src []byte) ([16]byte, []byte, error) {
+	if len(src) < 16 {
+		return [16]byte{}, nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	}
+	return [16]byte(src[:16]), src[16:], nil
+}
+
 // udFixedUUID reads 16 raw bytes from a fixed(16) UUID and writes a [16]byte.
 // Used when the target is [16]byte or any (interface).
 func udFixedUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	if len(src) < 16 {
-		return nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	u, src, err := readFixedUUID(src)
+	if err == nil {
+		*(*[16]byte)(p) = u
 	}
-	*(*[16]byte)(p) = [16]byte(src[:16])
-	return src[16:], nil
+	return src, err
 }
 
 // udFixedUUIDString reads 16 raw bytes from a fixed(16) UUID and writes a
 // formatted UUID string (e.g. "550e8400-e29b-41d4-a716-446655440000").
 func udFixedUUIDString(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	if len(src) < 16 {
-		return nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	u, src, err := readFixedUUID(src)
+	if err == nil {
+		*(*string)(p) = uuidToString(u)
 	}
-	*(*string)(p) = uuidToString([16]byte(src[:16]))
-	return src[16:], nil
+	return src, err
 }
 
 // usFixedUUIDString serializes a UUID string to 16 raw fixed bytes.
@@ -1232,22 +1234,36 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte
 	}
 }
 
+// udNullUnionEnter is the shared preamble for udNullUnionPtr / udNullUnionRecord:
+// read the union index, nil-out *T on the null branch, allocate inner
+// storage on the value branch. Returns (pp, src, isNull, err). When
+// isNull is true the caller should return src directly (the pointer
+// field has already been zeroed). Otherwise pp points at freshly-
+// allocated inner storage that the caller's per-branch decoder fills.
+func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valIdx int, nullByte, valByte byte) (pp unsafe.Pointer, rest []byte, isNull bool, err error) {
+	isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !isVal {
+		*(*unsafe.Pointer)(p) = nil
+		return nil, src, true, nil
+	}
+	pp = *(*unsafe.Pointer)(p)
+	if pp == nil {
+		v := reflect.New(innerType)
+		pp = v.UnsafePointer()
+		*(*unsafe.Pointer)(p) = pp
+	}
+	return pp, src, false, nil
+}
+
 // udNullUnionPtr handles null-union deser for *T where T has a primitive unsafe deserializer.
 func udNullUnionPtr(inner udeserfn, innerType reflect.Type, valIdx int, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
-		if err != nil {
-			return nil, err
-		}
-		if !isVal {
-			*(*unsafe.Pointer)(p) = nil
-			return src, nil
-		}
-		pp := *(*unsafe.Pointer)(p)
-		if pp == nil {
-			v := reflect.New(innerType)
-			pp = v.UnsafePointer()
-			*(*unsafe.Pointer)(p) = pp
+		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
+		if err != nil || isNull {
+			return src, err
 		}
 		return inner(src, pp, sl)
 	}
@@ -1264,19 +1280,9 @@ func udNullUnionPtr(inner udeserfn, innerType reflect.Type, valIdx int, nullByte
 // tracking.
 func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
-		if err != nil {
-			return nil, err
-		}
-		if !isVal {
-			*(*unsafe.Pointer)(p) = nil
-			return src, nil
-		}
-		pp := *(*unsafe.Pointer)(p)
-		if pp == nil {
-			v := reflect.New(innerType)
-			pp = v.UnsafePointer()
-			*(*unsafe.Pointer)(p) = pp
+		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
+		if err != nil || isNull {
+			return src, err
 		}
 		if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
 			return deserRecordFastPtr(src, fast, pp, sl)
@@ -1286,6 +1292,15 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 }
 
 // ---- Array unsafe ser/deser ----
+//
+// R4 attempted a usSliceFrame[Elem] generic factor of the (depth-check +
+// length-prefix + early-exit + per-element body + terminator) sequence.
+// Benchstat against the inline-five-copies baseline showed +16% on
+// BenchmarkLargeArrayEncode (the []*Record hot path) — beyond the 5%
+// audit threshold. The extra closure call per slice (body func passed
+// to usSliceFrame) combined with the Go compiler choosing not to inline
+// the generic at the call site costs measurable per-array work. Reverted.
+// See DRY_AUDIT.md R4 for the proposal that was rejected on perf grounds.
 
 // usArrayRecord handles array ser for []T or []*T where items are records.
 func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
@@ -1372,16 +1387,16 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 		for _, pp := range s {
 			if pp == nil {
 				dst = append(dst, nullByte)
+				continue
+			}
+			dst = append(dst, valByte)
+			if useFast {
+				dst, err = serRecordFastPtr(dst, fast, pp, depth+1)
 			} else {
-				dst = append(dst, valByte)
-				if useFast {
-					dst, err = serRecordFastPtr(dst, fast, pp, depth+1)
-				} else {
-					dst, err = rec.ser(dst, reflect.NewAt(innerType, pp).Elem(), depth+1)
-				}
-				if err != nil {
-					return nil, err
-				}
+				dst, err = rec.ser(dst, reflect.NewAt(innerType, pp).Elem(), depth+1)
+			}
+			if err != nil {
+				return nil, err
 			}
 		}
 		return append(dst, 0), nil
@@ -1404,11 +1419,11 @@ func usArrayNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 		for _, pp := range s {
 			if pp == nil {
 				dst = append(dst, nullByte)
-			} else {
-				dst, err = inner(append(dst, valByte), pp, depth+1)
-				if err != nil {
-					return nil, err
-				}
+				continue
+			}
+			dst, err = inner(append(dst, valByte), pp, depth+1)
+			if err != nil {
+				return nil, err
 			}
 		}
 		return append(dst, 0), nil
@@ -1439,139 +1454,134 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 	}
 }
 
-// udArrayPtrRecord handles array deser for []*T where items are records.
-// Uses reflect for slice management, unsafe for per-element record deser.
-func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minItemBytes int) udeserfn {
-	innerSize := innerType.Size()
-	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		if sl.depth >= maxDepth {
-			return nil, errTooDeep
-		}
-		sl.depth++
-		defer func() { sl.depth-- }()
-		v := reflect.NewAt(sliceType, p).Elem()
-		v.SetLen(0)
-		var totalItems int64
-		for {
-			count, _, rest, end, err := readBlockHeader(src, "array", false)
-			if err != nil {
-				return nil, err
-			}
-			src = rest
-			if end {
-				return src, nil
-			}
-			if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
-				return nil, err
-			}
-			totalItems += count
-			n := int(count)
-			start := v.Len()
-			if start > math.MaxInt-n {
-				return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
-			}
-			newLen := start + n
-			if v.Cap() < newLen {
-				ns := reflect.MakeSlice(sliceType, newLen, newLen)
-				reflect.Copy(ns, v)
-				v.Set(ns)
-			} else {
-				v.SetLen(newLen)
-			}
-			s := *(*[]unsafe.Pointer)(p)
-			// Batch-allocate backing memory for nil pointer slots in
-			// one contiguous slice, then distribute pointers into the
-			// individual slots. This is much cheaper than allocating
-			// each element separately.
-			var need int
-			for i := range n {
-				if s[start+i] == nil {
-					need++
-				}
-			}
-			if need > 0 {
-				backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
-				backingBase := backing.Index(0).Addr().UnsafePointer()
-				j := 0
-				for i := range n {
-					if s[start+i] == nil {
-						s[start+i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
-						j++
-					}
-				}
-			}
-			// Deserialize each element.
-			fast := rec.fast.Load()
-			useFast := fast != nil && fast.typ == innerType && fast.allFast
-			for i := range n {
-				elemP := s[start+i]
-				if useFast {
-					src, err = deserRecordFastPtr(src, fast, elemP, sl)
-				} else {
-					src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)
-				}
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-}
-
-// udArrayDirect handles array deser for []T where items are primitives.
-// Uses reflect for slice management, unsafe for per-element deser.
+// udArrayBlocks drives the outer block loop for the unsafe array
+// deserializers. onBlock fills slots [start, start+n) of v's backing
+// array; src→advancedSrc is returned. Shared by udArrayPtrRecord and
+// udArrayDirect so the depth bookkeeping, length overflow guard,
+// MakeSlice/SetLen growth, and block-bounds check live in one place.
+//
 // minItemBytes is the schema-derived per-item wire-byte minimum (1 for
 // varint primitives, 4 for float, 8 for double, etc.) — bounds block
 // count to len(src)/minItemBytes, mirroring deserArray.deser. Without
 // it the loose count > len(src) check would let a hostile float-array
 // stream drive a 4× MakeSlice allocation per wire byte before the
 // per-element readUint32 loop fails on short buffer.
+//
+// Benchstat verified perf-neutral on BenchmarkLargeArrayDecode (sister
+// of LargeArrayEncode, exercising []*Record fast-path decode).
+func udArrayBlocks(
+	src []byte, p unsafe.Pointer, sl *slab,
+	sliceType reflect.Type, minItemBytes int,
+	onBlock func(src []byte, v reflect.Value, p unsafe.Pointer, start, n int, sl *slab) ([]byte, error),
+) ([]byte, error) {
+	if sl.depth >= maxDepth {
+		return nil, errTooDeep
+	}
+	sl.depth++
+	defer func() { sl.depth-- }()
+	v := reflect.NewAt(sliceType, p).Elem()
+	v.SetLen(0)
+	var totalItems int64
+	for {
+		count, _, rest, end, err := readBlockHeader(src, "array", false)
+		if err != nil {
+			return nil, err
+		}
+		src = rest
+		if end {
+			return src, nil
+		}
+		if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
+			return nil, err
+		}
+		totalItems += count
+		n := int(count)
+		start := v.Len()
+		if start > math.MaxInt-n {
+			return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
+		}
+		newLen := start + n
+		if v.Cap() < newLen {
+			ns := reflect.MakeSlice(sliceType, newLen, newLen)
+			reflect.Copy(ns, v)
+			v.Set(ns)
+		} else {
+			v.SetLen(newLen)
+		}
+		if src, err = onBlock(src, v, p, start, n, sl); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// udArrayPtrRecord handles array deser for []*T where items are records.
+// Uses reflect for slice management, unsafe for per-element record deser.
+func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minItemBytes int) udeserfn {
+	innerSize := innerType.Size()
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
+			func(src []byte, _ reflect.Value, p unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
+				s := *(*[]unsafe.Pointer)(p)
+				// Batch-allocate backing memory for nil pointer slots in
+				// one contiguous slice, then distribute pointers into the
+				// individual slots. This is much cheaper than allocating
+				// each element separately.
+				var need int
+				for i := range n {
+					if s[start+i] == nil {
+						need++
+					}
+				}
+				if need > 0 {
+					backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
+					backingBase := backing.Index(0).Addr().UnsafePointer()
+					j := 0
+					for i := range n {
+						if s[start+i] == nil {
+							s[start+i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
+							j++
+						}
+					}
+				}
+				// Deserialize each element.
+				fast := rec.fast.Load()
+				useFast := fast != nil && fast.typ == innerType && fast.allFast
+				var err error
+				for i := range n {
+					elemP := s[start+i]
+					if useFast {
+						src, err = deserRecordFastPtr(src, fast, elemP, sl)
+					} else {
+						src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)
+					}
+					if err != nil {
+						return nil, err
+					}
+				}
+				return src, nil
+			})
+	}
+}
+
+// udArrayDirect handles array deser for []T where items are primitives.
+// Uses reflect for slice management, unsafe for per-element deser.
 func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type, minItemBytes int) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		if sl.depth >= maxDepth {
-			return nil, errTooDeep
-		}
-		sl.depth++
-		defer func() { sl.depth-- }()
-		v := reflect.NewAt(sliceType, p).Elem()
-		v.SetLen(0)
-		var totalItems int64
-		for {
-			count, _, rest, end, err := readBlockHeader(src, "array", false)
-			if err != nil {
-				return nil, err
-			}
-			src = rest
-			if end {
-				return src, nil
-			}
-			if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
-				return nil, err
-			}
-			totalItems += count
-			n := int(count)
-			start := v.Len()
-			if start > math.MaxInt-n {
-				return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
-			}
-			newLen := start + n
-			if v.Cap() < newLen {
-				ns := reflect.MakeSlice(sliceType, newLen, newLen)
-				reflect.Copy(ns, v)
-				v.Set(ns)
-			} else {
-				v.SetLen(newLen)
-			}
-			// Access data pointer after potential reallocation. v.UnsafePointer
-			// returns the slice's underlying-array pointer for any element
-			// type — avoids the type-pun via *(*[]byte)(p).
-			data := v.UnsafePointer()
-			for i := start; i < newLen; i++ {
-				src, err = inner(src, unsafe.Add(data, uintptr(i)*elemSize), sl)
-				if err != nil {
-					return nil, err
+		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
+			func(src []byte, v reflect.Value, _ unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
+				// Access data pointer after the slice growth in
+				// udArrayBlocks. v.UnsafePointer returns the slice's
+				// underlying-array pointer for any element type — avoids
+				// the type-pun via *(*[]byte)(p).
+				data := v.UnsafePointer()
+				var err error
+				for i := start; i < start+n; i++ {
+					src, err = inner(src, unsafe.Add(data, uintptr(i)*elemSize), sl)
+					if err != nil {
+						return nil, err
+					}
 				}
-			}
-		}
+				return src, nil
+			})
 	}
 }

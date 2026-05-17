@@ -931,6 +931,13 @@ func encodeMap(dst []byte, entries []kv) []byte {
 	return append(dst, 0) // terminating zero-count block
 }
 
+// ocfMetadataSafetyLimit caps the per-entry length and per-block count
+// for the OCF metadata map. 1 MiB is generous (real metadata keys/
+// values are tens of bytes); the cap bounds hostile-input memory
+// amplification (a malicious header claiming 2^62 entries would
+// otherwise drive an unbounded make).
+const ocfMetadataSafetyLimit = 1 << 20
+
 func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 	m := make(map[string][]byte)
 	for {
@@ -951,7 +958,7 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 				return nil, err
 			}
 		}
-		if count > 1<<20 {
+		if count > ocfMetadataSafetyLimit {
 			return nil, fmt.Errorf("map block count %d exceeds safety limit", count)
 		}
 		for range int(count) {
@@ -959,7 +966,7 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			if keyLen < 0 || keyLen > 1<<20 {
+			if keyLen < 0 || keyLen > ocfMetadataSafetyLimit {
 				return nil, fmt.Errorf("map key length %d out of range", keyLen)
 			}
 			key := make([]byte, int(keyLen))
@@ -970,7 +977,7 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			if valLen < 0 || valLen > 1<<20 {
+			if valLen < 0 || valLen > ocfMetadataSafetyLimit {
 				return nil, fmt.Errorf("map value length %d out of range", valLen)
 			}
 			val := make([]byte, int(valLen))

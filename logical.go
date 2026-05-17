@@ -75,16 +75,23 @@ func timestampNanosToTime(val int64) time.Time { return time.Unix(val/1e9, val%1
 // fields as if UTC (see timeToLocalTimestamp* below) regardless of
 // the input's location.
 
+// timeToLocalUTC re-anchors t's wall-clock components at UTC, matching
+// Java's TimeConversions.LocalTimestamp*Conversion behavior. Shared
+// preamble of the three local-timestamp encoders.
+func timeToLocalUTC(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+}
+
 func timeToLocalTimestampMillis(t time.Time) (int64, error) {
-	return timeToTimestampMillis(time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
+	return timeToTimestampMillis(timeToLocalUTC(t))
 }
 
 func timeToLocalTimestampMicros(t time.Time) (int64, error) {
-	return timeToTimestampMicros(time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
+	return timeToTimestampMicros(timeToLocalUTC(t))
 }
 
 func timeToLocalTimestampNanos(t time.Time) (int64, error) {
-	return timeToTimestampNanos(time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC))
+	return timeToTimestampNanos(timeToLocalUTC(t))
 }
 
 // timeToTimestampNanos shares timeToTimestampScaled with subScale=1

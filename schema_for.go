@@ -628,20 +628,18 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	// source type), so e.g. `time.Time` tagged time-millis correctly
 	// emits {int, time-millis} and `time.Duration` tagged
 	// timestamp-millis correctly emits {long, timestamp-millis}.
+	inferTimeLike := func(defaultLogical string) any {
+		lt := logical
+		if lt == "" {
+			lt = defaultLogical
+		}
+		return map[string]any{"type": baseTypeForLogical(lt, "long"), "logicalType": lt}
+	}
 	switch t {
 	case timeType:
-		lt := logical
-		if lt == "" {
-			lt = "timestamp-millis"
-		}
-		return map[string]any{"type": baseTypeForLogical(lt, "long"), "logicalType": lt}, nil
-
+		return inferTimeLike("timestamp-millis"), nil
 	case durationType:
-		lt := logical
-		if lt == "" {
-			lt = "time-millis"
-		}
-		return map[string]any{"type": baseTypeForLogical(lt, "long"), "logicalType": lt}, nil
+		return inferTimeLike("time-millis"), nil
 
 	case bigRatPtrType, bigRatValueType:
 		if logical != "decimal" || decimal == [2]int{} {
@@ -673,6 +671,17 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}
 	}
 
+	// inferArray emits the array schema for a non-byte slice/array element
+	// type. Shared by the Slice and Array arms below so the items-recursion
+	// + wrapping shape stays in one place.
+	inferArray := func(elem reflect.Type) (any, error) {
+		items, err := inferType(elem, "", [2]int{}, namespace, seen, customTypes)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"type": "array", "items": items}, nil
+	}
+
 	switch t.Kind() {
 	case reflect.Bool:
 		return "boolean", nil
@@ -693,11 +702,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if t.Elem().Kind() == reflect.Uint8 {
 			return "bytes", nil
 		}
-		items, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"type": "array", "items": items}, nil
+		return inferArray(t.Elem())
 
 	case reflect.Array:
 		if t.Elem().Kind() == reflect.Uint8 {
@@ -727,11 +732,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 				"size": t.Len(),
 			}, nil
 		}
-		items, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"type": "array", "items": items}, nil
+		return inferArray(t.Elem())
 
 	case reflect.Map:
 		if t.Key().Kind() != reflect.String {
