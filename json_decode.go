@@ -390,127 +390,97 @@ func isJSONNullStart(s *jsonScanner, p byte) bool {
 	return p == 'n' && s.peekAt(1) == 'u'
 }
 
-// isBareSpecialFloatStart reports whether the next token is a bare
-// NaN / Infinity / -Infinity in any of the casings parseSpecialFloat
-// accepts (NaN / nan / NAN, Inf / inf / Infinity / infinity, etc.).
-// Mirrors the comment on consumeBareSpecialFloat — pre-fix the
-// dispatch gate only checked uppercase first letters, so lowercase
-// "nan", "inf", "-inf", "-infinity" rejected even though the quoted-
-// string arm accepts them case-insensitively via EqualFold. Now the
-// two arms have parity.
+// isBareSpecialFloatStart reports whether the next token could begin
+// a bare NaN / Infinity / -Infinity / Inf / INF token in the canonical
+// Java/fastavro casings (uppercase first letter; parseSpecialFloat
+// applies the exact-match gate after consumption). Lowercase first
+// letters ('n', 'i') are rejected — Java's JsonDecoder, fastavro's
+// Python json, and goavro all reject lowercase, and the lowercase 'n'
+// in particular collided with the JSON null literal in the union
+// dispatcher (F1 finding).
 func isBareSpecialFloatStart(s *jsonScanner, p byte) bool {
 	switch p {
-	case 'N', 'n', 'I', 'i':
+	case 'N', 'I':
 		return true
 	case '-':
-		p2 := s.peekAt(1)
-		return p2 == 'I' || p2 == 'i'
+		return s.peekAt(1) == 'I'
 	}
 	return false
 }
 
-func (ctx *jsonDecoder) decodeFloat(v reflect.Value) error {
-	var f float32
+// decodeJSONFloat decodes the next JSON token into a float64,
+// dispatching across the four producer conventions twmb accepts:
+//
+//   - quoted-string "NaN"/"Infinity"/"-Infinity"/"INF"/"-INF"/"Inf"/"-Inf"
+//     (Java JsonEncoder form, twmb's default emit form). parseSpecialFloat
+//     gates exact-match (Java/fastavro/goavro parity — see its docstring).
+//   - bare null → NaN (goavro convention). isJSONNullStart disambiguates
+//     from bare special-float tokens whose first byte is unambiguously
+//     uppercase post-tightening.
+//   - bare NaN/Infinity/-Infinity/INF/-INF/Inf/-Inf (fastavro / Python json.dumps
+//     with allow_nan=True). Routed through parseSpecialFloat for consistency
+//     with the quoted-string arm — same exact-match acceptance set.
+//   - numeric literal, with ±Inf accept on overflow (goavro's 1e999 / -1e999
+//     convention, and any over-range literal that strconv.ParseFloat
+//     produces as Inf with ErrRange).
+//
+// Shared by decodeFloat (bitSize=32) and decodeDouble (bitSize=64);
+// the per-target narrowing is applied via setFloatValue downstream.
+// typ is "float" or "double" for the syntax-error message.
+func (ctx *jsonDecoder) decodeJSONFloat(bitSize int, typ string) (float64, error) {
 	p := ctx.scanner.peek()
-	if p == '"' {
-		// NaN/Infinity as string (Java JsonEncoder quoted form,
-		// twmb's default emit form).
+	switch {
+	case p == '"':
 		s, err := ctx.scanner.consumeString()
 		if err != nil {
-			return err
+			return 0, err
 		}
-		f64, err := parseSpecialFloat(s)
-		if err != nil {
-			return err
-		}
-		f = float32(f64)
-	} else if isJSONNullStart(ctx.scanner, p) {
-		// null → NaN (goavro convention).
+		return parseSpecialFloat(s)
+	case isJSONNullStart(ctx.scanner, p):
 		if err := ctx.scanner.consumeNull(); err != nil {
-			return err
+			return 0, err
 		}
-		f = float32(math.NaN())
-	} else if isBareSpecialFloatStart(ctx.scanner, p) {
-		// Bare NaN / Infinity / -Infinity (fastavro / Python json.dumps
-		// with allow_nan=True). Routed through parseSpecialFloat for
-		// consistency with the quoted-string arm — casing parity is
-		// preserved so lowercase "nan", "inf", "-inf", etc. work the
-		// same as the quoted forms.
+		return math.NaN(), nil
+	case isBareSpecialFloatStart(ctx.scanner, p):
 		tok, err := ctx.scanner.consumeBareSpecialFloat()
 		if err != nil {
-			return err
+			return 0, err
 		}
-		f64, err := parseSpecialFloat(tok)
-		if err != nil {
-			return err
-		}
-		f = float32(f64)
-	} else {
+		return parseSpecialFloat(tok)
+	default:
 		nb, err := ctx.scanner.consumeNumberBytes()
 		if err != nil {
-			return err
+			return 0, err
 		}
 		// strconv.ParseFloat is read-only; alias nb to avoid the copy.
-		f64, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(nb), len(nb)), 32)
+		f, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(nb), len(nb)), bitSize)
 		if err != nil {
 			// Accept ±Inf from overflow (e.g. 1e999, goavro convention).
-			if math.IsInf(f64, 0) {
-				f = float32(f64)
-			} else {
-				return fmt.Errorf("avro json: invalid float: %w", err)
+			if math.IsInf(f, 0) {
+				return f, nil
 			}
-		} else {
-			f = float32(f64)
+			return 0, fmt.Errorf("avro json: invalid %s: %w", typ, err)
 		}
+		return f, nil
+	}
+}
+
+func (ctx *jsonDecoder) decodeFloat(v reflect.Value) error {
+	f, err := ctx.decodeJSONFloat(32, "float")
+	if err != nil {
+		return err
 	}
 	// setFloatValue's interface arm subsumes what the toAny branch
 	// would otherwise do — single point of truth for the float-target
-	// matrix shared with deserFloat.
-	return setFloatValue(v, float64(f), "float", 32)
+	// matrix shared with deserFloat. The float32 narrowing happens
+	// inside setFloatValue for typed float32 targets.
+	return setFloatValue(v, f, "float", 32)
 }
 
 func (ctx *jsonDecoder) decodeDouble(v reflect.Value) error {
-	var f float64
-	p := ctx.scanner.peek()
-	if p == '"' {
-		s, err := ctx.scanner.consumeString()
-		if err != nil {
-			return err
-		}
-		f64, err := parseSpecialFloat(s)
-		if err != nil {
-			return err
-		}
-		f = f64
-	} else if isJSONNullStart(ctx.scanner, p) {
-		if err := ctx.scanner.consumeNull(); err != nil {
-			return err
-		}
-		f = math.NaN()
-	} else if isBareSpecialFloatStart(ctx.scanner, p) {
-		tok, err := ctx.scanner.consumeBareSpecialFloat()
-		if err != nil {
-			return err
-		}
-		f64, err := parseSpecialFloat(tok)
-		if err != nil {
-			return err
-		}
-		f = f64
-	} else {
-		nb, err := ctx.scanner.consumeNumberBytes()
-		if err != nil {
-			return err
-		}
-		// strconv.ParseFloat is read-only; alias nb to avoid the copy.
-		f64, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(nb), len(nb)), 64)
-		if err != nil {
-			// Accept ±Inf from overflow (e.g. 1e999, goavro convention).
-			if !math.IsInf(f64, 0) {
-				return fmt.Errorf("avro json: invalid double: %w", err)
-			}
-		}
-		f = f64
+	f, err := ctx.decodeJSONFloat(64, "double")
+	if err != nil {
+		return err
 	}
 	return setFloatValue(v, f, "double", 64)
 }
@@ -1112,7 +1082,16 @@ func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 	// before indirectAlloc so *T pointer targets stay nil. Java's
 	// JsonDecoder.readIndex and fastavro's read_index both reject
 	// null when no "null" label is in the union; we match.
-	if p == 'n' {
+	//
+	// Use isJSONNullStart to disambiguate from bare special-float
+	// tokens. Currently parseSpecialFloat rejects lowercase 'n'-start
+	// (parity tightening with Java/fastavro/goavro), so a bare 'n'
+	// here is unambiguous as "null". The helper is still used
+	// defensively: if future leniency re-accepts lowercase nan, this
+	// dispatcher must NOT hijack it into the null arm. Sibling
+	// dispatchers decodeFloat (json_decode.go) and decodeDouble use
+	// the helper for the same reason.
+	if isJSONNullStart(ctx.scanner, p) {
 		hasNull := false
 		for _, br := range node.branches {
 			if br.kind == "null" {

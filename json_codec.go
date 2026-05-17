@@ -278,8 +278,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				return strconv.AppendInt(buf, int64(d), 10), nil
 			case "time-millis":
 				// Time-of-day ms (< 86.4M) never overflows int32.
-				ms := int32(t.Hour()*3600000 + t.Minute()*60000 + t.Second()*1000 + t.Nanosecond()/1_000_000)
-				return strconv.AppendInt(buf, int64(ms), 10), nil
+				return strconv.AppendInt(buf, timeOfDay(t).Milliseconds(), 10), nil
 			}
 		}
 		if v.Type() == durationType {
@@ -320,9 +319,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		}
 		if node.logical == "time-micros" {
 			if v.Type() == timeType {
-				t := v.Interface().(time.Time)
-				d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
-				return strconv.AppendInt(buf, d.Microseconds(), 10), nil
+				return strconv.AppendInt(buf, timeOfDay(v.Interface().(time.Time)).Microseconds(), 10), nil
 			}
 			if v.Type() == durationType {
 				return strconv.AppendInt(buf, v.Interface().(time.Duration).Microseconds(), 10), nil
@@ -918,16 +915,32 @@ func findUnionBranch(union *schemaNode, name string) *schemaNode {
 	return match
 }
 
-// parseSpecialFloat parses NaN/Infinity string representations (Java
-// convention and case-insensitive variants per AVRO-4217).
+// parseSpecialFloat parses the canonical Java/fastavro NaN/Infinity
+// string forms. Java's JsonDecoder accepts {"NaN", "Infinity", "INF",
+// "-Infinity", "-INF"} via exact-match (Schema.java:247-260's
+// isNaNString / isPositiveInfinityString / isNegativeInfinityString).
+// Python's json (fastavro's underlying parser) emits/accepts the
+// first three exactly. goavro doesn't accept any of these — it uses
+// `null`→NaN and `1e999`/-`1e999`→±Inf instead (handled separately).
+//
+// Pre-tightening, this accepted any casing via strings.EqualFold —
+// "nan", "NAN", "infinity", "iNf", etc. The lowercase first-letter
+// variants in particular created a dispatch ambiguity: a bare `n`
+// could start either `null` or the never-emitted `nan`, and the
+// union-arm dispatcher hard-coded `if p == 'n'` for null routing,
+// hijacking the lowercase form (F1 finding). Tightening to Java's
+// exact set eliminates the ambiguity at the source AND aligns with
+// the three reference impls (Java, fastavro, goavro) — all reject
+// lowercase. The "Inf" / "-Inf" mixed-case forms are accepted as
+// common Go-style alternates (Go's strconv.ParseFloat emits these
+// for IsInf-flagged float64s) but lowercase variants are not.
 func parseSpecialFloat(s string) (float64, error) {
-	if strings.EqualFold(s, "nan") {
+	switch s {
+	case "NaN":
 		return math.NaN(), nil
-	}
-	if strings.EqualFold(s, "infinity") || strings.EqualFold(s, "inf") {
+	case "Infinity", "INF", "Inf":
 		return math.Inf(1), nil
-	}
-	if strings.EqualFold(s, "-infinity") || strings.EqualFold(s, "-inf") {
+	case "-Infinity", "-INF", "-Inf":
 		return math.Inf(-1), nil
 	}
 	return 0, fmt.Errorf("avro json: unknown float value %q", s)
@@ -1070,28 +1083,28 @@ func appendJSONFloat(buf []byte, f float64, bits int, cfg *optConfig) []byte {
 // jsonCoerceToFloat64 converts a reflect.Value to float64, accepting
 // float, int, uint, and json.Number types. bitSize is the target float
 // size (32 or 64) — integer values exceeding the mantissa precision are
-// rejected to avoid silent precision loss on round-trip.
+// rejected via the shared [intFitsFloat] / [uintFitsFloat] helpers
+// (schema.go), used identically by the binary encode arms
+// [appendAvroFloat32] / [appendAvroFloat64] and the schema-parse-time
+// [integerFormFitsFloat]. One predicate across every site that
+// converts a typed integer to an Avro float / double.
 func jsonCoerceToFloat64(v reflect.Value, bitSize int) (float64, error) {
-	precLimit := int64(1) << 53
-	if bitSize == 32 {
-		precLimit = 1 << 24
-	}
 	var f float64
 	switch {
 	case v.CanFloat():
 		f = v.Float()
 	case v.CanInt():
-		n := v.Int()
-		if n < -precLimit || n > precLimit {
-			return 0, fmt.Errorf("avro json: integer %d overflows float%d exact precision", n, bitSize)
+		var err error
+		f, err = intFitsFloat(v.Int(), bitSize)
+		if err != nil {
+			return 0, fmt.Errorf("avro json: %w", err)
 		}
-		f = float64(n)
 	case v.CanUint():
-		n := v.Uint()
-		if n > uint64(precLimit) {
-			return 0, fmt.Errorf("avro json: integer %d overflows float%d exact precision", n, bitSize)
+		var err error
+		f, err = uintFitsFloat(v.Uint(), bitSize)
+		if err != nil {
+			return 0, fmt.Errorf("avro json: %w", err)
 		}
-		f = float64(n)
 	case v.Type() == jsonNumberType:
 		// strconv.ParseFloat is lenient about hex floats ("0x1.0p10")
 		// and underscore-separated digits ("1_000") that the JSON spec
@@ -1101,36 +1114,24 @@ func jsonCoerceToFloat64(v reflect.Value, bitSize int) (float64, error) {
 		if !isJSONNumber(s) {
 			return 0, fmt.Errorf("avro json: invalid JSON number %q", s)
 		}
-		// Integer-form gets the same precLimit check the v.CanInt()
-		// arm above applies, so typed-int and json.Number inputs of
-		// the same magnitude agree on accept/reject. Without this,
-		// json.Number("9007199254740993") against "double" silently
-		// rounds via ParseFloat while int64(9007199254740993) rejects.
-		if !strings.ContainsAny(s, ".eE") {
-			if n, perr := strconv.ParseInt(s, 10, 64); perr == nil {
-				if n < -precLimit || n > precLimit {
-					return 0, fmt.Errorf("avro json: integer %d overflows float%d exact precision", n, bitSize)
-				}
-				f = float64(n)
-				break
+		// Two-step parse: integerFormFitsFloat fast path applies the
+		// precLimit reject for decimal-integer literals
+		// (precision-strict), then parseFloatAcceptOverflow handles
+		// fractional / exponent forms with the ErrRange-with-Inf
+		// accept predicate. Same pipeline as defaultAsFloat's
+		// json.Number arm (schema.go) — schema-parse and encode
+		// agree on what a json.Number resolves to.
+		if f1, handled, err := integerFormFitsFloat(s, bitSize); handled {
+			if err != nil {
+				return 0, fmt.Errorf("avro json: %w", err)
 			}
-			// Integer-form > int64: magnitude exceeds any float
-			// precision; reject outright rather than silently rounding.
-			return 0, fmt.Errorf("avro json: integer %s overflows float%d exact precision", s, bitSize)
+			f = f1
+			break
 		}
 		var err error
-		f, err = strconv.ParseFloat(s, 64)
+		f, err = parseFloatAcceptOverflow(s)
 		if err != nil {
-			// ParseFloat returns (±Inf, strconv.ErrRange) for inputs
-			// whose magnitude exceeds float64 range. Accept the Inf —
-			// it IS the correct Avro wire encoding for the overflow,
-			// matches the binary jsonNumberToFloat path, matches
-			// decodeFloat/decodeDouble's "Accept ±Inf from overflow"
-			// arm, and matches Java's BigDecimal.doubleValue() /
-			// fastavro's float(). Syntax errors still reject.
-			if !errors.Is(err, strconv.ErrRange) || !math.IsInf(f, 0) {
-				return 0, fmt.Errorf("avro json: invalid json.Number for float: %w", err)
-			}
+			return 0, fmt.Errorf("avro json: invalid json.Number for float: %w", err)
 		}
 	default:
 		return 0, fmt.Errorf("avro json: expected numeric, got %s", v.Type())

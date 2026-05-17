@@ -1702,11 +1702,14 @@ func TestDecodeJSONNaNInfRoundTrip(t *testing.T) {
 		{"float INF string", `"float"`, `"INF"`},
 		{"float -INF string", `"float"`, `"-INF"`},
 		{"double NaN string", `"double"`, `"NaN"`},
-		{"double nan lowercase", `"double"`, `"nan"`},
 		{"double Inf string", `"double"`, `"Infinity"`},
 		{"double -Inf string", `"double"`, `"-Infinity"`},
 		{"float null → NaN", `"float"`, `null`},
 		{"double null → NaN", `"double"`, `null`},
+		// Lowercase quoted "nan" was previously accepted via
+		// parseSpecialFloat's strings.EqualFold leniency. Tightened
+		// to match Java/fastavro/goavro (all of which exact-match
+		// "NaN"); see TestRegression_JSONDecodeBareNaNInfinityCasingParity.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1720,7 +1723,7 @@ func TestDecodeJSONNaNInfRoundTrip(t *testing.T) {
 			}
 			switch v := got.(type) {
 			case float32:
-				if tt.input == `null` || tt.input == `"NaN"` || tt.input == `"nan"` {
+				if tt.input == `null` || tt.input == `"NaN"` {
 					if !math.IsNaN(float64(v)) {
 						t.Errorf("expected NaN, got %v", v)
 					}
@@ -1728,7 +1731,7 @@ func TestDecodeJSONNaNInfRoundTrip(t *testing.T) {
 					t.Errorf("expected Inf, got %v", v)
 				}
 			case float64:
-				if tt.input == `null` || tt.input == `"NaN"` || tt.input == `"nan"` {
+				if tt.input == `null` || tt.input == `"NaN"` {
 					if !math.IsNaN(v) {
 						t.Errorf("expected NaN, got %v", v)
 					}

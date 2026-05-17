@@ -9578,41 +9578,42 @@ func TestRegression_DateEncodeWallClock(t *testing.T) {
 	})
 }
 
-// TestRegression_JSONDecodeBareNaNInfinityCasingParity locks the
-// dispatch-gate fix that makes lowercase bare NaN/Infinity tokens
-// reach consumeBareSpecialFloat. Pre-fix decodeFloat / decodeDouble
-// only checked uppercase first letters (N / I / -I), so lowercase
-// "nan" routed to the null arm and "inf" / "-inf" routed to the
-// number arm, both with confusing errors. The comment on
-// consumeBareSpecialFloat claimed casing parity with the quoted-
-// string arm — now true. Locks all 12 casings × 2 schemas = 24
-// cells.
+// TestRegression_JSONDecodeBareNaNInfinityCasingParity: bare NaN /
+// Infinity / -Infinity tokens are exact-matched against the
+// Java/fastavro accept set ({"NaN", "Infinity", "INF", "-Infinity",
+// "-INF"}) plus the Go strconv-style "Inf" / "-Inf". Lowercase
+// first-letter variants ('n', 'i') reject — they collide with the
+// JSON null literal in the union dispatcher.
 func TestRegression_JSONDecodeBareNaNInfinityCasingParity(t *testing.T) {
-	cases := []struct {
+	accepts := []struct {
 		input string
 		check func(float64) bool
 	}{
-		{"nan", math.IsNaN},
+		// Canonical Java emissions / accepts (also fastavro's).
 		{"NaN", math.IsNaN},
-		{"NAN", math.IsNaN},
-		{"inf", func(f float64) bool { return math.IsInf(f, 1) }},
-		{"Inf", func(f float64) bool { return math.IsInf(f, 1) }},
-		{"INF", func(f float64) bool { return math.IsInf(f, 1) }},
-		{"infinity", func(f float64) bool { return math.IsInf(f, 1) }},
 		{"Infinity", func(f float64) bool { return math.IsInf(f, 1) }},
-		{"INFINITY", func(f float64) bool { return math.IsInf(f, 1) }},
-		{"-inf", func(f float64) bool { return math.IsInf(f, -1) }},
-		{"-Inf", func(f float64) bool { return math.IsInf(f, -1) }},
-		{"-infinity", func(f float64) bool { return math.IsInf(f, -1) }},
 		{"-Infinity", func(f float64) bool { return math.IsInf(f, -1) }},
+		// Java's alternate "INF" / "-INF" form (Schema.java:254/259).
+		{"INF", func(f float64) bool { return math.IsInf(f, 1) }},
+		{"-INF", func(f float64) bool { return math.IsInf(f, -1) }},
+		// Twmb extension: Go strconv.ParseFloat-style mixed-case "Inf".
+		{"Inf", func(f float64) bool { return math.IsInf(f, 1) }},
+		{"-Inf", func(f float64) bool { return math.IsInf(f, -1) }},
+	}
+	rejects := []string{
+		// Lowercase first letter — collides with JSON null/bool literal
+		// starts (n/t/f); rejected for dispatcher unambiguity.
+		"nan", "inf", "infinity", "-inf", "-infinity",
+		// Wrong-case body for the canonical NaN/Infinity forms.
+		"NAN", "INFINITY", "-INFINITY", "Nan", "nAn", "iNf",
 	}
 	for _, kind := range []struct {
 		schema string
 		bits   int
 	}{{`"float"`, 32}, {`"double"`, 64}} {
 		s := avro.MustParse(kind.schema)
-		for _, c := range cases {
-			t.Run(kind.schema+"/"+c.input, func(t *testing.T) {
+		for _, c := range accepts {
+			t.Run(kind.schema+"/accept/"+c.input, func(t *testing.T) {
 				if kind.bits == 32 {
 					var f float32
 					if err := s.DecodeJSON([]byte(c.input), &f); err != nil {
@@ -9632,6 +9633,21 @@ func TestRegression_JSONDecodeBareNaNInfinityCasingParity(t *testing.T) {
 				}
 			})
 		}
+		for _, in := range rejects {
+			t.Run(kind.schema+"/reject/"+in, func(t *testing.T) {
+				if kind.bits == 32 {
+					var f float32
+					if err := s.DecodeJSON([]byte(in), &f); err == nil {
+						t.Fatalf("DecodeJSON(%q): expected reject; got %v", in, f)
+					}
+				} else {
+					var f float64
+					if err := s.DecodeJSON([]byte(in), &f); err == nil {
+						t.Fatalf("DecodeJSON(%q): expected reject; got %v", in, f)
+					}
+				}
+			})
+		}
 	}
 	// Lock that null still routes to null-arm (NaN per goavro) and
 	// isn't misrouted to the bare-special path by the new dispatch.
@@ -9645,6 +9661,39 @@ func TestRegression_JSONDecodeBareNaNInfinityCasingParity(t *testing.T) {
 			t.Errorf("null should decode to NaN (goavro convention), got %v", f)
 		}
 	})
+}
+
+// TestRegression_LowercaseNanUnionWithNullF1: a bare `n`-starting
+// token in a union with a null branch must use isJSONNullStart to
+// disambiguate vs lowercase `nan`. Pre-fix `decodeUnion` open-coded
+// `if p == 'n'` and hijacked `nan` into the null arm; even though
+// parseSpecialFloat now rejects lowercase, the dispatch keeps the
+// defensive disambiguation.
+func TestRegression_LowercaseNanUnionWithNullF1(t *testing.T) {
+	// Bare `n` followed by non-`u` second byte must NOT be hijacked
+	// into the null arm. Currently rejected by parseSpecialFloat;
+	// the dispatcher path is exercised here to lock in the defense.
+	s := avro.MustParse(`["null","float"]`)
+	var v any
+	// Lowercase nan: parseSpecialFloat rejects (matches Java/fastavro
+	// /goavro). Confirm the error is about the float arm's parser,
+	// NOT about consumeNull failing — the latter would mean the
+	// dispatcher hijacked it into the null branch incorrectly.
+	err := s.DecodeJSON([]byte("nan"), &v)
+	if err == nil {
+		t.Fatal("expected reject for lowercase nan")
+	}
+	if strings.Contains(err.Error(), "expected null") {
+		t.Errorf("bare lowercase nan was hijacked into null arm: %v", err)
+	}
+	// Real null still works.
+	err = s.DecodeJSON([]byte("null"), &v)
+	if err != nil {
+		t.Fatalf("bare null: %v", err)
+	}
+	if v != nil {
+		t.Errorf("expected nil for null branch, got %#v", v)
+	}
 }
 
 // TestRegression_JSONDecodeBareNaNInfinityTokens locks the fastavro
