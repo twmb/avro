@@ -9,6 +9,7 @@ import (
 	"hash"
 	"maps"
 	"math"
+	"math/big"
 	"reflect"
 	"slices"
 	"strconv"
@@ -1107,9 +1108,38 @@ func buildCustomSN(node *schemaNode) *SchemaNode {
 }
 
 // hasMatchingCustomType checks if any registered custom type would match
-// a node with the given kind and logical type. Used to skip built-in
-// logical type handlers when a custom type replaces them.
+// a node with the given kind and logical type. Used to skip the built-in
+// logical-type *decoder* when a custom type replaces it (the deser-side
+// of the suppression contract — see [CustomType.Decode]'s docstring:
+// "If nil, the built-in logical type handler is bypassed and the base
+// Avro type decoder is used directly").
+//
+// The encode side has different semantics ([CustomType.Encode]: "If nil,
+// the built-in logical type encoder is used"), so encoder-suppression
+// uses [hasMatchingCustomTypeWithEncode] instead — only suppress the
+// built-in encoder when the user actually provided an Encode callback
+// to wrap it with.
 func (b *builder) hasMatchingCustomType(kind, logical string) bool {
+	return b.hasMatchingCustomTypeCond(kind, logical, false)
+}
+
+// hasMatchingCustomTypeWithEncode reports whether any matching CustomType
+// has a non-nil Encode callback. Used to gate suppression of the
+// built-in logical encoder: per [CustomType.Encode]'s docstring, an
+// Encode==nil CustomType leaves the built-in encoder in place (so a
+// user registering only Decode keeps the convenient time.Time /
+// *big.Rat / avro.Duration encoder), while an Encode!=nil CustomType
+// wraps the base (raw) encoder with the user's callback.
+func (b *builder) hasMatchingCustomTypeWithEncode(kind, logical string) bool {
+	return b.hasMatchingCustomTypeCond(kind, logical, true)
+}
+
+// hasMatchingCustomTypeCond is the shared body. When requireEncode is
+// true, the predicate additionally requires ct.Encode != nil — used by
+// the encoder-suppression gate. When false, the predicate matches any
+// registered CustomType — used by the decoder-suppression gate (where
+// Decode==nil still bypasses the built-in per the doc).
+func (b *builder) hasMatchingCustomTypeCond(kind, logical string, requireEncode bool) bool {
 	for _, ct := range b.customTypes {
 		// Wildcards (both empty) should not suppress built-in
 		// handlers — they use ErrSkipCustomType at runtime.
@@ -1120,6 +1150,9 @@ func (b *builder) hasMatchingCustomType(kind, logical string) bool {
 			continue
 		}
 		if ct.AvroType != "" && ct.AvroType != kind {
+			continue
+		}
+		if requireEncode && ct.Encode == nil {
 			continue
 		}
 		return true
@@ -1584,13 +1617,32 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	}
 
 	if ser, isPrimitive := serPrimitive[o.Type]; isPrimitive {
-		if o.Logical == "decimal" && !b.hasMatchingCustomType(o.Type, o.Logical) {
+		if o.Logical == "decimal" {
 			scale := 0
 			if o.Scale != nil {
 				scale = *o.Scale
 			}
-			b.ser = (&serBytesDecimal{precision: *o.Precision, scale: scale}).ser
-			b.deser = (&deserBytesDecimal{scale: scale}).deser
+			// Per-direction suppression mirrors the timestamp/uuid path
+			// below (line ~1660-1675): built-in encoder is preserved
+			// whenever the user didn't provide an Encode callback (per
+			// CustomType.Encode docstring "If nil, the built-in logical
+			// type encoder is used"); built-in decoder is suppressed
+			// whenever ANY matching CustomType exists (per
+			// CustomType.Decode docstring "If nil, the built-in logical
+			// type handler is bypassed and the base Avro type decoder
+			// is used directly"). Single-gate pre-fix suppressed both
+			// sides on any match, breaking encode of *big.Rat with a
+			// Decode-only CustomType.
+			if b.hasMatchingCustomTypeWithEncode(o.Type, o.Logical) {
+				b.ser = ser
+			} else {
+				b.ser = (&serBytesDecimal{precision: *o.Precision, scale: scale}).ser
+			}
+			if b.hasMatchingCustomType(o.Type, o.Logical) {
+				b.deser = deserPrimitive[o.Type]
+			} else {
+				b.deser = (&deserBytesDecimal{scale: scale}).deser
+			}
 			b.canon = aschema{primitive: o.Type}
 			b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
 			nd := &schemaNode{
@@ -1604,9 +1656,17 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			b.node = nd
 			return nil
 		}
-		if o.Logical == "big-decimal" && !b.hasMatchingCustomType(o.Type, o.Logical) {
-			b.ser = (&serBigDecimal{}).ser
-			b.deser = (&deserBigDecimal{}).deser
+		if o.Logical == "big-decimal" {
+			if b.hasMatchingCustomTypeWithEncode(o.Type, o.Logical) {
+				b.ser = ser
+			} else {
+				b.ser = (&serBigDecimal{}).ser
+			}
+			if b.hasMatchingCustomType(o.Type, o.Logical) {
+				b.deser = deserPrimitive[o.Type]
+			} else {
+				b.deser = (&deserBigDecimal{}).deser
+			}
 			b.canon = aschema{primitive: o.Type}
 			b.meta = fieldMeta{avroType: o.Type, logical: o.Logical}
 			nd := &schemaNode{
@@ -2102,30 +2162,59 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if size <= 0 {
 			return fmt.Errorf("invalid fixed size %v", size)
 		}
-		// Use raw fixed ser/deser when a custom type replaces the
-		// built-in logical type handler.
-		if b.hasMatchingCustomType("fixed", s.object.Logical) {
+		// Per-direction suppression: built-in encoder preserved when the
+		// user didn't provide Encode (CustomType.Encode docstring: "If
+		// nil, the built-in logical type encoder is used"); built-in
+		// decoder suppressed whenever ANY matching CustomType exists
+		// (CustomType.Decode docstring: "If nil, the built-in logical
+		// type handler is bypassed and the base Avro type decoder is
+		// used directly"). Single-gate pre-fix suppressed both sides
+		// on any match, so a Decode-only CustomType for fixed.decimal /
+		// fixed.duration / fixed.uuid would land on raw serSize which
+		// can't accept *big.Rat / avro.Duration as input.
+		hasEnc := b.hasMatchingCustomTypeWithEncode("fixed", s.object.Logical)
+		hasAny := b.hasMatchingCustomType("fixed", s.object.Logical)
+		switch s.object.Logical {
+		case "duration":
+			if hasEnc {
+				b.ser = (&serSize{size}).ser
+			} else {
+				b.ser = serDuration
+			}
+			if hasAny {
+				b.deser = (&deserFixed{size}).deser
+			} else {
+				b.deser = deserDuration
+			}
+		case "decimal":
+			scale := 0
+			if o.Scale != nil {
+				scale = *o.Scale
+			}
+			if hasEnc {
+				b.ser = (&serSize{size}).ser
+			} else {
+				b.ser = (&serFixedDecimal{size: size, precision: *o.Precision, scale: scale}).ser
+			}
+			if hasAny {
+				b.deser = (&deserFixed{size}).deser
+			} else {
+				b.deser = (&deserFixedDecimal{size: size, scale: scale}).deser
+			}
+		case "uuid":
+			if hasEnc {
+				b.ser = (&serSize{size}).ser
+			} else {
+				b.ser = serFixedUUIDReflect
+			}
+			if hasAny {
+				b.deser = (&deserFixed{size}).deser
+			} else {
+				b.deser = deserFixedUUIDReflect
+			}
+		default:
 			b.ser = (&serSize{size}).ser
 			b.deser = (&deserFixed{size}).deser
-		} else {
-			switch s.object.Logical {
-			case "duration":
-				b.ser = serDuration
-				b.deser = deserDuration
-			case "decimal":
-				scale := 0
-				if o.Scale != nil {
-					scale = *o.Scale
-				}
-				b.ser = (&serFixedDecimal{size: size, precision: *o.Precision, scale: scale}).ser
-				b.deser = (&deserFixedDecimal{size: size, scale: scale}).deser
-			case "uuid":
-				b.ser = serFixedUUIDReflect
-				b.deser = deserFixedUUIDReflect
-			default:
-				b.ser = (&serSize{size}).ser
-				b.deser = (&deserFixed{size}).deser
-			}
 		}
 		b.meta = fieldMeta{avroType: "fixed", logical: s.object.Logical}
 		nd := &schemaNode{
@@ -2461,31 +2550,63 @@ func normalizeJSONNumber(n json.Number) any {
 // callers may also pass float64 (e.g. round-tripped through coerceDefault).
 // Shared body of defaultAsInt32 / defaultAsInt64.
 //
-// Integer defaults must be in integer literal form (no decimal point, no
-// exponent marker). Matches Java's isIntegralNumber() gate at Schema.java
-// LONG/INT cases and fastavro's isinstance(default, int) check in
-// _schema_py.py. Whole-number values in fractional or exponent form
-// (e.g. "2.0", "4e1", "9.2233720368547758e18") were previously accepted
-// via parseInt{32,64}Lenient → boundedRatFromString — but the metadata-
-// API path (normalizeJSONNumber) exposes them as float64, producing a
-// four-axis divergence where encode/decode/parse-validate all agreed on
-// int64 wire encoding but Schema.Root().Fields[].Default surfaced
-// float64 with potential precision loss at the int64 boundary (exp-form
-// "9.2233720368547758e18" → wire int64(9223372036854775800) vs
-// metadata float64(9.223372036854776e+18) → int64(9223372036854775807),
-// a 7-unit value mismatch from the same JSON literal).
+// Whole-number values written in fractional or exponent form (e.g. "1.0",
+// "4e1") are accepted, matching twmb's existing "Whole-number floats
+// encode against int/long schemas" intentional divergence — the same
+// rationale (encoding/json.Unmarshal produces float64 for every JSON
+// number; rejecting forces explicit conversion) applies to JSON-encoded
+// schema defaults written by humans or codegen tools.
 //
-// Rejecting non-integer form at parse eliminates the divergence by
-// removing the lenient-acceptance class entirely; Java and fastavro both
-// reject these inputs, so cross-impl interop is preserved.
+// Precision guard: rejects only the subset where the metadata-API path
+// (normalizeJSONNumber, which surfaces fractional/exponent literals as
+// float64) would round to a different integer than the wire-fill path
+// (parseInt{32,64}Lenient via big.Rat, precision-exact). For "1.0" and
+// "4e1" the float64 representation equals the parsed int exactly — both
+// surfaces report the same value, no divergence, accept. For
+// "9.2233720368547758e18" the float64 form rounds up beyond the parsed
+// int (wire=9223372036854775800 vs metadata-as-float64≈9.223372036854776e+18
+// → int64(9223372036854775808)+, a >7-unit mismatch) — reject so the
+// schema can't carry a default whose metadata-vs-wire values disagree.
+//
+// Diverges from Java's isIntegralNumber() gate at Schema.java LONG/INT
+// cases and fastavro's isinstance(default, int) check, which both reject
+// "1.0" outright; twmb's existing runtime-arm acceptance of json.Number
+// fractional forms (TestEncodeJSONCoercion) is already a Java/fastavro
+// divergence, and tightening only at schema-parse without tightening
+// runtime would produce a within-twmb encode-vs-parse asymmetry. The
+// precision guard preserves the cross-impl interop concern (wire bytes
+// match Java/fastavro for accepted defaults) while keeping the ergonomic
+// acceptance Go users expect.
 func numericDefault[T int32 | int64](val any, parse func(string) (T, error), fromFloat func(float64) (T, error)) (T, error) {
 	switch v := val.(type) {
 	case json.Number:
-		if strings.ContainsAny(string(v), ".eE") {
+		s := string(v)
+		n, err := parse(s)
+		if err != nil {
 			var z T
-			return z, fmt.Errorf("integer default must be an integer literal, got non-integer form %q", string(v))
+			return z, err
 		}
-		return parse(string(v))
+		// Integer-literal form (no decimal point, no exponent marker)
+		// skips the metadata-API float64 path in normalizeJSONNumber —
+		// no precision-loss risk, accept directly.
+		if !strings.ContainsAny(s, ".eE") {
+			return n, nil
+		}
+		// Fractional/exponent form: the metadata-API path surfaces this
+		// as float64. Reject if the float64 representation rounds to a
+		// different integer than the parsed (precision-exact) value.
+		f, ferr := parseFloatAcceptOverflow(s)
+		if ferr != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			var z T
+			return z, fmt.Errorf("invalid number %s", s)
+		}
+		fRat := new(big.Rat).SetFloat64(f)
+		nRat := new(big.Rat).SetInt64(int64(n))
+		if fRat == nil || fRat.Cmp(nRat) != 0 {
+			var z T
+			return z, fmt.Errorf("default value %s in fractional/exponent form loses precision via float64 metadata normalization (wire=%d, metadata≈%g); use integer literal form", s, int64(n), f)
+		}
+		return n, nil
 	case float64:
 		return fromFloat(v)
 	}

@@ -245,8 +245,13 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 		rr.readerNameVals[i] = reflect.ValueOf(rf.name)
 	}
 
-	// Track which reader fields are matched.
+	// Track which reader fields are matched. Also tracks WHICH writer
+	// field name claimed each reader slot, so a second writer field
+	// resolving to the same reader index (via the alias-rename collision
+	// described below) produces a useful error rather than a silent
+	// last-writer-wins overwrite.
 	readerMatched := make([]bool, len(r.fields))
+	matchedByWriterName := make([]string, len(r.fields))
 
 	// For each writer field (in wire order), find matching reader field.
 	for _, wf := range w.fields {
@@ -259,7 +264,29 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 			})
 			continue
 		}
+		// Alias-rename collision: a previous writer field already
+		// resolved to this reader-field index (either by exact name
+		// match for one and alias match for the other, or both via
+		// aliases). Java applyAliases renames the writer field and
+		// then Schema.setFields rejects the resulting duplicate
+		// (Schema.java:978-981). fastavro deletes the reader-field
+		// from its lookup dict on first claim so the second falls
+		// through to skip_data (_read_py.py:553). twmb aligns with
+		// Java's fail-fast posture — matches the rest of the package
+		// (writer-union incompatibility, eager schema-resolution fail)
+		// and surfaces the configuration error at Resolve time rather
+		// than producing silent data loss on every decode.
+		if readerMatched[ri] {
+			return nil, &CompatibilityError{
+				Path:       pathOrRoot(path),
+				ReaderType: "record",
+				WriterType: "record",
+				Detail: fmt.Sprintf("writer fields %q and %q both resolve to reader field %q (via name + alias collision); rename the writer or drop the alias to disambiguate",
+					matchedByWriterName[ri], wf.name, r.fields[ri].name),
+			}
+		}
 		readerMatched[ri] = true
+		matchedByWriterName[ri] = wf.name
 		rf := &r.fields[ri]
 		resolved, err := resolveNode(rf.node, wf.node, fieldPath(path, rf.name), ctx)
 		if err != nil {

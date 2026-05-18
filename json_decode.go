@@ -424,6 +424,16 @@ func (ctx *jsonDecoder) decodeJSONFloat(bitSize int, typ string) (float64, error
 		if err != nil {
 			return 0, err
 		}
+		// Length cap mirrors parseFloatAcceptOverflow (schema.go) so all
+		// five strconv.ParseFloat-on-user-input sites agree (binary encode
+		// jsonNumberToFloat, JSON encode jsonCoerceToFloat64, schema-parse
+		// defaultAsFloat, metadata-API normalizeJSONNumber, and this
+		// decode-JSON arm). Inline rather than via parseFloatAcceptOverflow
+		// because that helper is bitSize=64 only; preserving the bitSize=32
+		// ParseFloat for the decodeFloat path avoids double-rounding shifts.
+		if len(nb) > maxParseFloatLen {
+			return 0, fmt.Errorf("avro json: %s literal exceeds %d byte length cap", typ, maxParseFloatLen)
+		}
 		// strconv.ParseFloat is read-only; alias nb to avoid the copy.
 		f, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(nb), len(nb)), bitSize)
 		if err != nil {
@@ -846,6 +856,15 @@ func (ctx *jsonDecoder) decodeRecord(v reflect.Value, node *schemaNode, toAny bo
 // (errors otherwise). fillDefault may be nil.
 func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx int, key string) error, fillDefault func(idx int) error) error {
 	seen := make([]bool, len(node.fields))
+	// Track WHICH JSON key claimed each reader slot, so a second key
+	// that resolves to the same field-index (the canonical name plus
+	// an alias both appearing in the same JSON object) produces an
+	// error rather than silently overwriting. The schema parse already
+	// rejects within-schema alias/name collisions at schema.go:1999, so
+	// fieldIdx only has multiple keys per index for the legitimate
+	// "renamed-with-alias" case — and a single JSON object emitting
+	// both forms is the producer-side ambiguity this guard catches.
+	seenKey := make([]string, len(node.fields))
 	if ctx.scanner.peek() != '}' {
 		for {
 			// Zero-copy: key is used only for fieldIdx lookup and
@@ -868,7 +887,12 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 					return err
 				}
 			} else {
+				if seen[idx] {
+					return fmt.Errorf("avro json: record %q field %q resolved from both %q and %q in the same JSON object",
+						node.name, node.fields[idx].name, seenKey[idx], key)
+				}
 				seen[idx] = true
+				seenKey[idx] = key
 				if err := handle(idx, key); err != nil {
 					return err
 				}

@@ -169,6 +169,47 @@ func checkRecordCompat(r, w *schemaNode, path string, seen map[nodePair]bool) er
 			return err
 		}
 	}
+
+	// Alias-rename collision: a writer with both an alias-named field
+	// AND the canonical-named reader field would resolve two writer
+	// fields to the same reader slot (silent overwrite at decode pre-
+	// resolve-fix). Mirror resolveRecord's duplicate-claim guard so
+	// CheckCompatibility and Resolve agree — without this, a user could
+	// see CheckCompatibility return nil only for Resolve to reject the
+	// same schema pair. Iterates writer fields and checks each maps to
+	// a unique reader index.
+	if err := checkRecordFieldClaimsUnique(r, w, path); err != nil {
+		return err
+	}
+	return nil
+}
+
+// checkRecordFieldClaimsUnique reports the alias-rename collision case
+// where two writer fields would both resolve to the same reader-field
+// index (via the canonical name on one and an alias on the other, or
+// both via aliases). Mirrors the guard at resolveRecord (resolve.go) so
+// CheckCompatibility surfaces the same misconfiguration Resolve does.
+func checkRecordFieldClaimsUnique(r, w *schemaNode, path string) error {
+	if len(r.fields) == 0 {
+		return nil
+	}
+	claimedBy := make([]string, len(r.fields))
+	for _, wf := range w.fields {
+		ri := findReaderFieldIndex(r, wf.name)
+		if ri < 0 {
+			continue
+		}
+		if claimedBy[ri] != "" {
+			return &CompatibilityError{
+				Path:       pathOrRoot(path),
+				ReaderType: "record",
+				WriterType: "record",
+				Detail: fmt.Sprintf("writer fields %q and %q both resolve to reader field %q (via name + alias collision); rename the writer or drop the alias to disambiguate",
+					claimedBy[ri], wf.name, r.fields[ri].name),
+			}
+		}
+		claimedBy[ri] = wf.name
+	}
 	return nil
 }
 
