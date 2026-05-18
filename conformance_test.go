@@ -3446,7 +3446,13 @@ func TestPromotionBoundaryValues(t *testing.T) {
 		}
 	})
 
-	t.Run("MaxInt64 to double", func(t *testing.T) {
+	t.Run("MaxInt64 to double rejects (mantissa)", func(t *testing.T) {
+		// Pre-F2-fix: promoteLongToDouble silently truncated MaxInt64
+		// to float64(MaxInt64) ≈ 9.223372036854776e+18, locking a bug
+		// pattern 13a — pinned acceptance on a wrong acceptance. The
+		// natural same-schema decoder (w.Decode(long wire, &float64))
+		// rejected via setIntegerWire's mantissa bound; the promoted
+		// path now agrees post-fix (intFitsFloat at 1<<53).
 		writer := mustParse(t, `"long"`)
 		reader := mustParse(t, `"double"`)
 		resolved, err := avro.Resolve(writer, reader)
@@ -3460,13 +3466,20 @@ func TestPromotionBoundaryValues(t *testing.T) {
 		}
 		var out float64
 		_, err = resolved.Decode(encoded, &out)
+		if err == nil {
+			t.Fatalf("expected reject (MaxInt64 exceeds float64 1<<53 mantissa); accepted with out=%v", out)
+		}
+		// Verify the within-mantissa case still works.
+		v2 := int64(1 << 53)
+		encoded, err = writer.Encode(&v2)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// MaxInt64 loses precision when converted to float64, but the
-		// conversion should match Go's behavior.
-		if out != float64(math.MaxInt64) {
-			t.Fatalf("got %v, want %v", out, float64(math.MaxInt64))
+		if _, err := resolved.Decode(encoded, &out); err != nil {
+			t.Fatalf("within-mantissa promotion should accept: %v", err)
+		}
+		if out != float64(1<<53) {
+			t.Fatalf("got %v, want %v", out, float64(int64(1<<53)))
 		}
 	})
 
@@ -6182,6 +6195,662 @@ func TestRegression_DefaultFloatIntegerOverflowPrecisionLoss(t *testing.T) {
 				t.Fatalf("expected accept for %s default %s; got: %v", tc.typ, tc.defaultLit, err)
 			}
 		})
+	}
+}
+
+// TestRegression_LongDefaultExpFormPrecisionParity locks the F4 fix:
+// json.Number values in fractional/exponent form whose float64
+// representation rounds to a different int64 than the parsed-exact
+// value (e.g. "9.223372036854775807e18" — big.Rat parses to int64.Max
+// but float64 rounds to int64.Max+1) are now rejected at BOTH the
+// encode-time arm AND the schema-parse-time arm, matching Java's
+// DoubleNode.canConvertToLong()=false behavior and fastavro's
+// isinstance(default,int)=false rejection.
+//
+// Pre-fix: schema-parse rejected (round-85 fix added the precision
+// check at numericDefault) but encode-side parseInt64Lenient via
+// big.Rat returned the exact int64 — a within-twmb encode↔parse
+// asymmetry. Post-fix: parseInt64WithFloatParity is the encode-side
+// wrapper that applies the same predicate; both arms now agree.
+//
+// Decode stays lenient per the "Encode strict / decode lenient on
+// float-mantissa precision" intentional divergence: a JSON wire
+// value at the boundary still decodes via the unchanged
+// parseInt64Lenient.
+func TestRegression_LongDefaultExpFormPrecisionParity(t *testing.T) {
+	const intMaxExp = "9.223372036854775807e18" // int64.Max in exponent form
+	s := avro.MustParse(`"long"`)
+
+	// All three encode arms reject the boundary case.
+	t.Run("binary_encode_rejects", func(t *testing.T) {
+		if _, err := s.AppendEncode(nil, json.Number(intMaxExp)); err == nil {
+			t.Fatalf("expected reject for %q against long; encode accepted", intMaxExp)
+		}
+	})
+	t.Run("json_encode_rejects", func(t *testing.T) {
+		if _, err := s.AppendEncodeJSON(nil, json.Number(intMaxExp)); err == nil {
+			t.Fatalf("expected reject for %q against long; JSON encode accepted", intMaxExp)
+		}
+	})
+	t.Run("schema_parse_rejects", func(t *testing.T) {
+		schemaJSON := `{"type":"record","name":"R","fields":[{"name":"f","type":"long","default":` + intMaxExp + `}]}`
+		if _, err := avro.Parse(schemaJSON); err == nil {
+			t.Fatalf("expected reject for long default %q; parse accepted", intMaxExp)
+		}
+	})
+
+	// Decode stays lenient (documented intentional divergence).
+	t.Run("json_decode_accepts", func(t *testing.T) {
+		var n int64
+		if err := s.DecodeJSON([]byte(intMaxExp), &n); err != nil {
+			t.Fatalf("expected decode to accept %q against long (lenient decode preserved); got: %v", intMaxExp, err)
+		}
+		if n != 9223372036854775807 {
+			t.Fatalf("expected int64.Max=%d; got %d", int64(9223372036854775807), n)
+		}
+	})
+
+	// Boundary safety: clean-round-trip values still accepted everywhere.
+	type acceptCase struct {
+		name string
+		v    string
+	}
+	cleanFloats := []acceptCase{
+		{"whole_float_42", "42.0"},
+		{"exponent_1e10", "1e10"},
+		{"negative_exponent", "-1e10"},
+		{"zero", "0"},
+		{"int_literal_at_2_53_plus_1", "9007199254740993"}, // integer form, no precision concern
+		{"negative_int_literal", "-9007199254740993"},
+	}
+	for _, tc := range cleanFloats {
+		t.Run("clean_"+tc.name+"/encode_accepts", func(t *testing.T) {
+			if _, err := s.AppendEncode(nil, json.Number(tc.v)); err != nil {
+				t.Fatalf("clean value %q rejected by binary encode: %v", tc.v, err)
+			}
+			if _, err := s.AppendEncodeJSON(nil, json.Number(tc.v)); err != nil {
+				t.Fatalf("clean value %q rejected by JSON encode: %v", tc.v, err)
+			}
+			schemaJSON := `{"type":"record","name":"R","fields":[{"name":"f","type":"long","default":` + tc.v + `}]}`
+			if _, err := avro.Parse(schemaJSON); err != nil {
+				t.Fatalf("clean value %q rejected by schema parse: %v", tc.v, err)
+			}
+		})
+	}
+}
+
+// TestRegression_IsNilValueDepth5Parity locks the F10 fix: isNilValue
+// (ser.go:275) had an off-by-one peel cap that excluded depth-5 nil-
+// equivalent inputs that the four-site invariant comment at ser.go:264-
+// 274 explicitly named. serNull's peel-then-inspect shape correctly
+// detected depth-5 nil Maps/Slices/Chans/Funcs; isNilValue's combined
+// peel-and-check inside one loop missed them because the loop ended
+// before the final value's kind could be inspected. Post-fix:
+// isNilValue mirrors serNull's structure.
+//
+// Observable consequence pre-fix: 2-branch [null,T] union encoded
+// *****map[string]any (5 non-nil pointers wrapping a nil map) failed
+// with "pointer/interface chain... nests deeper than supported" while
+// the same shape in a 3-branch union succeeded (try-each path called
+// serNull directly), and the same shape in JSON encode succeeded
+// (appendAvroJSON's entry peel doesn't error on depth-5).
+func TestRegression_IsNilValueDepth5Parity(t *testing.T) {
+	// Build *****map[string]any with non-nil outer 5 pointers and nil inner map.
+	type m = map[string]any
+	var nilMap m
+	p1 := &nilMap
+	p2 := &p1
+	p3 := &p2
+	p4 := &p3
+	p5 := &p4 // depth-5 pointer chain
+
+	s2 := avro.MustParse(`["null","int"]`)
+	out, err := s2.AppendEncode(nil, p5)
+	if err != nil {
+		t.Fatalf("2-branch [null,int] of depth-5 nil-equivalent: expected encode-as-null; got: %v", err)
+	}
+	// Wire form of null in a 2-branch [null,T] union is one byte (varint 0 for branch index).
+	if len(out) != 1 || out[0] != 0 {
+		t.Fatalf("expected single-byte null union wire; got %v", out)
+	}
+
+	// Symmetry check: 3-branch path still works (it always did, via serNull).
+	s3 := avro.MustParse(`["null","int","string"]`)
+	out3, err := s3.AppendEncode(nil, p5)
+	if err != nil {
+		t.Fatalf("3-branch [null,int,string] of depth-5 nil-equivalent: %v", err)
+	}
+	if len(out3) != 1 || out3[0] != 0 {
+		t.Fatalf("expected 3-branch null wire; got %v", out3)
+	}
+
+	// JSON encode parity — already worked pre-fix via appendAvroJSON's peel.
+	outJSON, err := s2.AppendEncodeJSON(nil, p5)
+	if err != nil {
+		t.Fatalf("JSON 2-branch encode of depth-5 nil: %v", err)
+	}
+	if string(outJSON) != "null" {
+		t.Fatalf("expected JSON \"null\"; got %s", string(outJSON))
+	}
+
+	// Within-mantissa depth-1 sanity (regression guard).
+	var nilMap2 m
+	out, err = s2.AppendEncode(nil, &nilMap2)
+	if err != nil {
+		t.Fatalf("depth-1 nil-equivalent: %v", err)
+	}
+	if len(out) != 1 || out[0] != 0 {
+		t.Fatalf("depth-1: expected null wire; got %v", out)
+	}
+}
+
+// TestRegression_SchemaNodePropsDocstringContract locks the F7 fix:
+// SchemaNode.Props docstring now explicitly states "literals exceeding
+// maxParseFloatLen (1024) chars fall back to json.Number." Pre-fix, the
+// docstring promised "fractional and exponent-form literals decode to
+// float64" without acknowledging the DoS-defense length cap, leading
+// auditors to file F7 as a docstring-contract violation. The behavior
+// is correct; this test asserts the documented contract at boundary
+// points so future docstring edits don't drift from the implementation.
+func TestRegression_SchemaNodePropsDocstringContract(t *testing.T) {
+	t.Run("small_fractional_is_float64", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"long","my.x":1.5}`)
+		v := s.Root().Props["my.x"]
+		if f, ok := v.(float64); !ok || f != 1.5 {
+			t.Fatalf("expected float64(1.5); got %T(%v)", v, v)
+		}
+	})
+	t.Run("exponent_overflow_is_inf_float64", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"long","my.x":1e1000}`)
+		v := s.Root().Props["my.x"]
+		f, ok := v.(float64)
+		if !ok {
+			t.Fatalf("expected float64; got %T(%v)", v, v)
+		}
+		if !math.IsInf(f, 1) {
+			t.Fatalf("expected +Inf; got %v", f)
+		}
+	})
+	t.Run("large_literal_falls_back_to_json_number", func(t *testing.T) {
+		// >1024 chars: docstring promises json.Number fallback.
+		large := "1." + strings.Repeat("1", 2048) + "e10"
+		s := avro.MustParse(`{"type":"long","my.x":` + large + `}`)
+		v := s.Root().Props["my.x"]
+		if _, ok := v.(json.Number); !ok {
+			t.Fatalf("expected json.Number (>1024 char fallback per docstring); got %T", v)
+		}
+	})
+	t.Run("integer_literal_int64", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"long","my.x":42}`)
+		v := s.Root().Props["my.x"]
+		if n, ok := v.(int64); !ok || n != 42 {
+			t.Fatalf("expected int64(42); got %T(%v)", v, v)
+		}
+	})
+	t.Run("int64_overflow_falls_back_to_json_number", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"long","my.x":99999999999999999999}`)
+		v := s.Root().Props["my.x"]
+		if _, ok := v.(json.Number); !ok {
+			t.Fatalf("expected json.Number (overflows int64); got %T", v)
+		}
+	})
+}
+
+// TestRegression_MetadataAPICoerceStringFloatDefault locks the F11 fix:
+// Schema.Root().Fields[].Default for string-form float defaults (e.g.
+// {"type":"float","default":"1.5"}) now surfaces float64(1.5) — matching
+// Java's Schema.parseField (Schema.java:1899-1902) which Jackson-coerces
+// text default to DoubleNode at parse time. Pre-fix returned the raw
+// string "1.5", contradicting the documented "materialize as
+// float64(1.5)" promise in the "String-form float defaults" intentional-
+// divergence entry and creating four-axis divergence (wire produces
+// float bits, metadata API exposed string).
+//
+// fastavro keeps Python strings for the same input — a documented
+// footgun; twmb sides with Java's typed-materialization here.
+func TestRegression_MetadataAPICoerceStringFloatDefault(t *testing.T) {
+	type expectCase struct {
+		name     string
+		schema   string
+		fieldIdx int
+		assert   func(t *testing.T, def any)
+	}
+
+	float64Eq := func(want float64) func(*testing.T, any) {
+		return func(t *testing.T, def any) {
+			f, ok := def.(float64)
+			if !ok {
+				t.Fatalf("expected float64, got %T(%v)", def, def)
+			}
+			if want != want { // NaN
+				if !(f != f) {
+					t.Fatalf("expected NaN, got %v", f)
+				}
+				return
+			}
+			if f != want {
+				t.Fatalf("expected float64(%v), got %v", want, f)
+			}
+		}
+	}
+
+	cases := []expectCase{
+		{
+			name:     "float_string_default",
+			schema:   `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"1.5"}]}`,
+			fieldIdx: 0,
+			assert:   float64Eq(1.5),
+		},
+		{
+			name:     "double_string_default",
+			schema:   `{"type":"record","name":"R","fields":[{"name":"f","type":"double","default":"2.718"}]}`,
+			fieldIdx: 0,
+			assert:   float64Eq(2.718),
+		},
+		{
+			name:     "float_string_NaN",
+			schema:   `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"NaN"}]}`,
+			fieldIdx: 0,
+			assert:   float64Eq(math.NaN()),
+		},
+		{
+			name:     "float_string_Infinity",
+			schema:   `{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"Infinity"}]}`,
+			fieldIdx: 0,
+			assert:   float64Eq(math.Inf(1)),
+		},
+		{
+			name:     "union_null_float_string_default",
+			schema:   `{"type":"record","name":"R","fields":[{"name":"f","type":["null","float"],"default":"1.5"}]}`,
+			fieldIdx: 0,
+			assert:   float64Eq(1.5),
+		},
+		{
+			name:     "nested_record_double_string_default",
+			schema:   `{"type":"record","name":"Outer","fields":[{"name":"o","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"double"}]},"default":{"x":"2.5"}}]}`,
+			fieldIdx: 0,
+			assert: func(t *testing.T, def any) {
+				m, ok := def.(map[string]any)
+				if !ok {
+					t.Fatalf("expected map[string]any, got %T(%v)", def, def)
+				}
+				inner, ok := m["x"]
+				if !ok {
+					t.Fatalf("inner field 'x' missing from default: %v", m)
+				}
+				float64Eq(2.5)(t, inner)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			root := s.Root()
+			if len(root.Fields) <= tc.fieldIdx {
+				t.Fatalf("schema has %d fields; expected idx %d", len(root.Fields), tc.fieldIdx)
+			}
+			tc.assert(t, root.Fields[tc.fieldIdx].Default)
+		})
+	}
+
+	// Regression guard: numeric defaults still surface correctly
+	// (don't break the existing successful cases).
+	t.Run("numeric_float_default_passes_through", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":1.5}]}`)
+		def := s.Root().Fields[0].Default
+		if f, ok := def.(float64); !ok || f != 1.5 {
+			t.Fatalf("expected float64(1.5); got %T(%v)", def, def)
+		}
+	})
+
+	// Union branch selection: the FIRST accepting branch wins, matching
+	// the wire-encode pipeline's coerceDefault and Java's
+	// Schema.parseField. For ["string","float"] with default "1.5",
+	// string branch accepts first → metadata API returns string (matches
+	// wire). For ["null","float"] with default "1.5", null rejects
+	// (non-nil) → float accepts → metadata API returns float64 (also
+	// matches wire). Caught during post-fix re-audit of F11 — my
+	// initial "first-transformation-wins" union arm diverged for the
+	// ["string","float"] case; "first-accept-wins" matches both wire
+	// and Java.
+	t.Run("union_string_first_then_float_picks_string", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":["string","float"],"default":"1.5"}]}`)
+		def := s.Root().Fields[0].Default
+		if str, ok := def.(string); !ok || str != "1.5" {
+			t.Fatalf("expected string \"1.5\" (string branch accepts first, matches wire); got %T(%v)", def, def)
+		}
+	})
+	t.Run("union_float_first_then_string_picks_float", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":["float","string"],"default":"1.5"}]}`)
+		def := s.Root().Fields[0].Default
+		if f, ok := def.(float64); !ok || f != 1.5 {
+			t.Fatalf("expected float64(1.5) (float branch accepts string-form first); got %T(%v)", def, def)
+		}
+	})
+}
+
+// TestRegression_SkipValueBareSpecialFloat locks the F9 fix: skipValue
+// now accepts bare NaN/Infinity/-Infinity (etc.) tokens in unknown record
+// fields, matching decodeJSONFloat's known-field dispatcher (which uses
+// isBareSpecialFloatStart + consumeBareSpecialFloat). Pre-fix, a record
+// produced by Java's JsonEncoder or fastavro's allow-NaN dumps with a
+// bare NaN/Infinity in a writer-only field crashed the entire decode
+// at skipValue's default → consumeNumberBytes arm (which only accepts
+// digit-led tokens). Invalid bare tokens (e.g. "Naive") still error
+// via parseSpecialFloat's exact-match gate — strictness matches Java's
+// JsonParser (which rejects "Naive" but accepts "NaN").
+func TestRegression_SkipValueBareSpecialFloat(t *testing.T) {
+	schema := `{"type":"record","name":"R","fields":[{"name":"known","type":"long"}]}`
+	s := avro.MustParse(schema)
+
+	accepts := []struct {
+		name, body string
+	}{
+		{"bare_NaN", `{"known":1,"unknown":NaN}`},
+		{"bare_Infinity", `{"known":1,"unknown":Infinity}`},
+		{"bare_neg_Infinity", `{"known":1,"unknown":-Infinity}`},
+		{"bare_INF", `{"known":1,"unknown":INF}`},
+		{"bare_Inf", `{"known":1,"unknown":Inf}`},
+		{"bare_neg_INF", `{"known":1,"unknown":-INF}`},
+		{"bare_neg_Inf", `{"known":1,"unknown":-Inf}`},
+	}
+	for _, tc := range accepts {
+		t.Run(tc.name, func(t *testing.T) {
+			var got map[string]any
+			if err := s.DecodeJSON([]byte(tc.body), &got); err != nil {
+				t.Fatalf("expected accept (bare special float in unknown field); got: %v", err)
+			}
+			if got["known"] != int64(1) {
+				t.Fatalf("expected known=1; got %v", got["known"])
+			}
+		})
+	}
+
+	rejects := []struct {
+		name, body string
+	}{
+		{"invalid_uppercase_N", `{"known":1,"unknown":Naive}`},
+		{"invalid_uppercase_I", `{"known":1,"unknown":Invalid}`},
+		{"lowercase_nan", `{"known":1,"unknown":nan}`},      // lowercase rejected (Java/fastavro parity)
+		{"lowercase_inf", `{"known":1,"unknown":inf}`},      // lowercase rejected
+		{"neg_invalid", `{"known":1,"unknown":-NotAFloat}`}, // negative + non-digit non-'I'
+	}
+	for _, tc := range rejects {
+		t.Run(tc.name, func(t *testing.T) {
+			var got map[string]any
+			if err := s.DecodeJSON([]byte(tc.body), &got); err == nil {
+				t.Fatalf("expected reject (invalid bare token); accepted as %v", got)
+			}
+		})
+	}
+}
+
+// TestRegression_ResolveWriterUnionTaggedUnionsNoWrap locks the F3 fix:
+// resolveWriterUnion (writer-union → reader-non-union) no longer
+// spuriously wraps decoded values as {"<writer_branch>": value} when
+// TaggedUnions is active. Pre-fix: deserUnion.maybeWrap fired
+// unconditionally based on the slab flag, ignoring that the reader is
+// non-union — so a writer ["int","long"] → reader "long" decode with
+// TaggedUnions produced {"int": 42} into a *any target despite the
+// reader having no union branches. Sibling resolveReaderUnion does
+// the wrap correctly because its reader IS a union; resolveWriterUnion
+// reused du.deser (carrying maybeWrap) but should have suppressed it.
+//
+// Post-fix: deserUnion gains a noWrap flag that resolveWriterUnion
+// sets, disabling the wrap. The natural union decode and
+// resolveUnionUnion (both with union readers) keep wrap enabled.
+func TestRegression_ResolveWriterUnionTaggedUnionsNoWrap(t *testing.T) {
+	w := avro.MustParse(`["int","long"]`)
+	r := avro.MustParse(`"long"`)
+	resolved, err := avro.Resolve(w, r)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	wire, err := w.AppendEncode(nil, int32(42))
+	if err != nil {
+		t.Fatalf("encode writer: %v", err)
+	}
+
+	t.Run("any_target_no_wrap", func(t *testing.T) {
+		var got any
+		if _, err := resolved.Decode(wire, &got, avro.TaggedUnions()); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		// Reader is non-union "long"; result should be a plain int64.
+		// Pre-fix produced map[string]any{"int": int64(42)} — wrap leaked.
+		if n, ok := got.(int64); !ok || n != 42 {
+			t.Fatalf("expected int64(42) (reader is non-union long); got %T(%v)", got, got)
+		}
+	})
+
+	// Sanity: writer-union → reader-union still wraps correctly under TaggedUnions.
+	// Reader has only "long" (no "int"), so writer's "int" branch matches via
+	// int→long promotion. Tag should be the reader's matched branch name.
+	t.Run("union_reader_still_wraps", func(t *testing.T) {
+		r2 := avro.MustParse(`["null","long"]`)
+		resolved2, err := avro.Resolve(w, r2)
+		if err != nil {
+			t.Fatalf("Resolve writer-union → reader-union: %v", err)
+		}
+		var got any
+		if _, err := resolved2.Decode(wire, &got, avro.TaggedUnions()); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		m, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("union → union should produce tagged map; got %T", got)
+		}
+		// Tag name comes from the READER branch (the one that matched).
+		// Writer's "int" promotes into reader's "long" branch.
+		if v, exists := m["long"]; !exists || v != int64(42) {
+			t.Fatalf("expected {\"long\":42}; got %v", m)
+		}
+	})
+}
+
+// TestRegression_DuplicateCanonicalKeyLastWins locks the F5 fix:
+// the round-85 alias-collision guard at iterateRecordFields fired too
+// broadly, rejecting any second key resolving to the same idx —
+// including the same canonical key appearing twice. encoding/json
+// (Go), Jackson (Java), and Python json.loads (fastavro) all
+// implement last-wins for duplicate keys. The fix tightens the check
+// to fire only when DIFFERENT JSON keys resolve to the same idx
+// (i.e. the actual alias-collision case).
+func TestRegression_DuplicateCanonicalKeyLastWins(t *testing.T) {
+	schemaJSON := `{"type":"record","name":"R","fields":[{"name":"f","type":"long"}]}`
+	s := avro.MustParse(schemaJSON)
+
+	t.Run("same_canonical_key_twice_last_wins", func(t *testing.T) {
+		var got map[string]any
+		if err := s.DecodeJSON([]byte(`{"f":11,"f":22}`), &got); err != nil {
+			t.Fatalf("expected last-wins (Java/fastavro/encoding-json parity); got error: %v", err)
+		}
+		if got["f"] != int64(22) {
+			t.Fatalf("expected last-wins f=22; got %v", got["f"])
+		}
+	})
+
+	// Triple-duplicate still last-wins.
+	t.Run("triple_canonical_key_last_wins", func(t *testing.T) {
+		var got map[string]any
+		if err := s.DecodeJSON([]byte(`{"f":11,"f":22,"f":33}`), &got); err != nil {
+			t.Fatalf("expected last-wins; got error: %v", err)
+		}
+		if got["f"] != int64(33) {
+			t.Fatalf("expected f=33; got %v", got["f"])
+		}
+	})
+
+	// Alias collision (the round-85 fix's actual target) still errors.
+	t.Run("alias_collision_still_rejects", func(t *testing.T) {
+		aliasSchema := `{"type":"record","name":"R","fields":[{"name":"new_name","type":"long","aliases":["old_name"]}]}`
+		sa := avro.MustParse(aliasSchema)
+		var got map[string]any
+		err := sa.DecodeJSON([]byte(`{"new_name":11,"old_name":22}`), &got)
+		if err == nil {
+			t.Fatalf("expected reject for canonical+alias both present; accepted")
+		}
+		if !strings.Contains(err.Error(), "resolved from both") {
+			t.Fatalf("expected 'resolved from both' error; got: %v", err)
+		}
+	})
+}
+
+// TestRegression_JSONEncodeAliasKeySymmetric locks the F6 fix:
+// appendAvroJSONRecord (encode side) now mirrors iterateRecordFields
+// (decode side) on alias-key resolution. Pre-fix: encode silently
+// dropped alias keys when the canonical key was absent OR when both
+// were present. Post-fix: encode uses the alias value as a fallback,
+// and rejects when canonical and alias are both present (matching
+// decode-side rejection in the F5 alias-collision sub-test above).
+func TestRegression_JSONEncodeAliasKeySymmetric(t *testing.T) {
+	schemaJSON := `{"type":"record","name":"R","fields":[{"name":"new_name","type":"long","aliases":["old_name"]}]}`
+	s := avro.MustParse(schemaJSON)
+
+	t.Run("alias_only_uses_alias_value", func(t *testing.T) {
+		out, err := s.AppendEncodeJSON(nil, map[string]any{"old_name": int64(22)})
+		if err != nil {
+			t.Fatalf("expected accept for alias-only input; got error: %v", err)
+		}
+		got := string(out)
+		// Symmetric with decode: alias key resolves to canonical field.
+		// Output uses the canonical name (schema field name).
+		if got != `{"new_name":22}` {
+			t.Fatalf("expected output to use canonical name with alias value; got: %s", got)
+		}
+	})
+
+	t.Run("canonical_plus_alias_rejects", func(t *testing.T) {
+		_, err := s.AppendEncodeJSON(nil, map[string]any{"new_name": int64(11), "old_name": int64(22)})
+		if err == nil {
+			t.Fatalf("expected reject for canonical+alias both present (symmetric with decode); accepted")
+		}
+		if !strings.Contains(err.Error(), "alias") && !strings.Contains(err.Error(), "both") {
+			t.Fatalf("expected error mentioning alias/both; got: %v", err)
+		}
+	})
+
+	t.Run("canonical_only_passes_through", func(t *testing.T) {
+		out, err := s.AppendEncodeJSON(nil, map[string]any{"new_name": int64(11)})
+		if err != nil {
+			t.Fatalf("canonical-only input should still work: %v", err)
+		}
+		if string(out) != `{"new_name":11}` {
+			t.Fatalf("expected {\"new_name\":11}; got: %s", string(out))
+		}
+	})
+}
+
+// TestRegression_PromotionMantissaParityWithNatural locks the F2 fix:
+// int→float, int→double, long→float, long→double promotions now apply
+// the same mantissa bound the natural same-type decoder enforces. Pre-
+// fix: setIntegerWire (deser.go:1541-1544) rejected when |int| exceeds
+// the target's mantissa precision, but the promote* arms went straight
+// to setFloatValue with a float64-converted value, silently truncating.
+// Within-twmb: same wire bytes, same Go target, encoder/natural/promoted
+// arms now agree on accept/reject.
+func TestRegression_PromotionMantissaParityWithNatural(t *testing.T) {
+	type promoteCase struct {
+		name        string
+		writer      string
+		reader      string
+		wireValue   any
+		fitMantissa bool // value within reader-bitSize mantissa
+	}
+	cases := []promoteCase{
+		// int→float: 1<<24 mantissa.
+		{"int>float_within_mantissa", `"int"`, `"float"`, int32(1 << 24), true},
+		{"int>float_exceeds_mantissa", `"int"`, `"float"`, int32(1<<24 + 1), false},
+		{"int>float_neg_exceeds_mantissa", `"int"`, `"float"`, int32(-(1<<24 + 1)), false},
+		// int→double: 1<<53 mantissa — int32 always fits.
+		{"int>double_max", `"int"`, `"double"`, int32(math.MaxInt32), true},
+		{"int>double_min", `"int"`, `"double"`, int32(math.MinInt32), true},
+		// long→float: 1<<24 mantissa.
+		{"long>float_within_mantissa", `"long"`, `"float"`, int64(1 << 24), true},
+		{"long>float_exceeds_mantissa", `"long"`, `"float"`, int64(1<<24 + 1), false},
+		// long→double: 1<<53 mantissa.
+		{"long>double_within_mantissa", `"long"`, `"double"`, int64(1 << 53), true},
+		{"long>double_exceeds_mantissa", `"long"`, `"double"`, int64(1<<53 + 1), false},
+		{"long>double_neg_exceeds_mantissa", `"long"`, `"double"`, int64(-(1<<53 + 1)), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := avro.MustParse(tc.writer)
+			r := avro.MustParse(tc.reader)
+			wire, err := w.AppendEncode(nil, tc.wireValue)
+			if err != nil {
+				t.Fatalf("encode writer wire: %v", err)
+			}
+			res, err := avro.Resolve(w, r)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+
+			// Promoted decode into reader's natural Go type.
+			if tc.reader == `"float"` {
+				var got float32
+				_, err = res.Decode(wire, &got)
+			} else {
+				var got float64
+				_, err = res.Decode(wire, &got)
+			}
+			if tc.fitMantissa {
+				if err != nil {
+					t.Fatalf("expected accept (value within mantissa): %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("expected reject (value exceeds mantissa); promoted decode silently accepted")
+				}
+				if !strings.Contains(err.Error(), "overflow") && !strings.Contains(err.Error(), "exact precision") {
+					t.Fatalf("expected mantissa-overflow error; got: %v", err)
+				}
+			}
+
+			// Same wire, same reader, but *any target: must match the
+			// Float-typed result (the natural decoder of the writer
+			// schema against *any returns int*; the promoted decoder
+			// against *any should return the reader's natural Go type
+			// — float32 for "float", float64 for "double"). The mantissa
+			// check still applies via setFloatValue's Interface arm.
+			var anyTarget any
+			_, errAny := res.Decode(wire, &anyTarget)
+			if tc.fitMantissa {
+				if errAny != nil {
+					t.Fatalf("expected *any decode accept: %v", errAny)
+				}
+			} else {
+				if errAny == nil {
+					t.Fatalf("expected *any decode reject (value exceeds mantissa); accepted as %v", anyTarget)
+				}
+			}
+		})
+	}
+}
+
+// TestRegression_JsonNumberToFloatErrorBounded locks the F8 fix:
+// jsonNumberToFloat's integer-form arm now routes through
+// boundedParseIntForFloat, capping input length at maxParseFloatLen
+// (1024) before strconv.ParseInt. A 1 MiB hostile pure-integer input
+// pre-fix produced a 1 MiB error message via fmt.Errorf("integer %s
+// overflows float exact precision", s) — same semantic verdict as the
+// parallel arms (jsonCoerceToFloat64, defaultAsFloat via
+// integerFormFitsFloat) which capped at 1024, but with a ~19,000x
+// error-payload-size asymmetry. The fix consolidates the cap into a
+// single helper shared by both ParseInt-on-integer-form sites.
+func TestRegression_JsonNumberToFloatErrorBounded(t *testing.T) {
+	hostile := strings.Repeat("9", 1<<20) // 1 MiB of digits
+	s := avro.MustParse(`"double"`)
+	_, err := s.AppendEncode(nil, json.Number(hostile))
+	if err == nil {
+		t.Fatalf("expected reject for 1 MiB hostile integer-form input")
+	}
+	if len(err.Error()) > 200 {
+		t.Fatalf("error message length %d exceeds 200-byte bound (cap should fire before interpolation)", len(err.Error()))
 	}
 }
 

@@ -2580,33 +2580,7 @@ func normalizeJSONNumber(n json.Number) any {
 func numericDefault[T int32 | int64](val any, parse func(string) (T, error), fromFloat func(float64) (T, error)) (T, error) {
 	switch v := val.(type) {
 	case json.Number:
-		s := string(v)
-		n, err := parse(s)
-		if err != nil {
-			var z T
-			return z, err
-		}
-		// Integer-literal form (no decimal point, no exponent marker)
-		// skips the metadata-API float64 path in normalizeJSONNumber —
-		// no precision-loss risk, accept directly.
-		if !strings.ContainsAny(s, ".eE") {
-			return n, nil
-		}
-		// Fractional/exponent form: the metadata-API path surfaces this
-		// as float64. Reject if the float64 representation rounds to a
-		// different integer than the parsed (precision-exact) value.
-		f, ferr := parseFloatAcceptOverflow(s)
-		if ferr != nil || math.IsNaN(f) || math.IsInf(f, 0) {
-			var z T
-			return z, fmt.Errorf("invalid number %s", s)
-		}
-		fRat := new(big.Rat).SetFloat64(f)
-		nRat := new(big.Rat).SetInt64(int64(n))
-		if fRat == nil || fRat.Cmp(nRat) != 0 {
-			var z T
-			return z, fmt.Errorf("default value %s in fractional/exponent form loses precision via float64 metadata normalization (wire=%d, metadata≈%g); use integer literal form", s, int64(n), f)
-		}
-		return n, nil
+		return parse(string(v))
 	case float64:
 		return fromFloat(v)
 	}
@@ -2614,12 +2588,56 @@ func numericDefault[T int32 | int64](val any, parse func(string) (T, error), fro
 	return z, fmt.Errorf("expected number, got %T", val)
 }
 
+// floatRoundsToSameInt64 reports whether the float64 representation of
+// the decimal literal s rounds to exactly the same integer value as n.
+// Used to detect within-twmb route divergence between the int64 wire
+// path (exact via big.Rat) and the float64 metadata-API path (rounds at
+// the 53-bit mantissa). Java's Schema.parseField (Long.canConvertToLong
+// → DoubleNode false at >=2^63) and fastavro's _default_matches_schema
+// (isinstance(default,int)=false for floats) both reject when this
+// predicate would fail; twmb applies it at the encode-time AND
+// schema-parse-time arms so they agree.
+//
+// Caller must have verified s is fractional/exponent form — pure
+// integer-literal inputs are exact by construction and skip this check.
+//
+// Returns false for parse errors, NaN, and ±Inf: none are valid int64
+// representations, so the caller's strict path can just reject.
+func floatRoundsToSameInt64(s string, n int64) bool {
+	f, err := parseFloatAcceptOverflow(s)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return false
+	}
+	fRat := new(big.Rat).SetFloat64(f)
+	if fRat == nil {
+		return false
+	}
+	return fRat.Cmp(new(big.Rat).SetInt64(n)) == 0
+}
+
+// boundedParseIntForFloat parses s as a decimal integer literal, capping
+// input length at maxParseFloatLen to bound the error-message payload on
+// hostile inputs (a 1 MiB pure-integer string would otherwise produce a
+// ~1 MiB error via fmt.Errorf interpolation). Shared by
+// [jsonNumberToFloat]'s integer-form arm and [integerFormFitsFloat] so
+// every encode-time integer→float conversion site agrees on the cap.
+func boundedParseIntForFloat(s string) (int64, error) {
+	if len(s) > maxParseFloatLen {
+		return 0, fmt.Errorf("integer literal exceeds %d byte length cap", maxParseFloatLen)
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("integer %s overflows float exact precision", s)
+	}
+	return n, nil
+}
+
 func defaultAsInt32(val any) (int32, error) {
 	return numericDefault(val, parseInt32Lenient, floatFitsInt32)
 }
 
 func defaultAsInt64(val any) (int64, error) {
-	return numericDefault(val, parseInt64Lenient, floatFitsInt64)
+	return numericDefault(val, parseInt64WithFloatParity, floatFitsInt64)
 }
 
 // floatMantissaLimit returns the largest integer magnitude exactly
@@ -2682,15 +2700,20 @@ func integerFormFitsFloat(s string, bitSize int) (float64, bool, error) {
 			return 0, false, nil
 		}
 	}
-	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-		f, err := intFitsFloat(n, bitSize)
-		return f, true, err
+	// boundedParseIntForFloat caps + parses + formats overflow errors;
+	// the early-cap-check above keeps a fast O(1) reject before the
+	// digit walk, so a hostile multi-MB input rejects without walking.
+	// On ParseInt-ErrRange (magnitude beyond int64, and therefore
+	// beyond any float exact precision >1<<53), boundedParseIntForFloat
+	// returns the formatted error directly — falling through to
+	// ParseFloat would silently round (e.g. "99999999999999999999" →
+	// 1e20).
+	n, err := boundedParseIntForFloat(s)
+	if err != nil {
+		return 0, true, err
 	}
-	// ParseInt failed on a decimal-integer literal: ErrRange (magnitude
-	// beyond int64, and therefore beyond any float precision >1<<53).
-	// Reject directly — falling through to ParseFloat would silently
-	// round (e.g. "99999999999999999999" → 1e20).
-	return 0, true, fmt.Errorf("integer %s overflows float%d exact precision", s, bitSize)
+	f, err := intFitsFloat(n, bitSize)
+	return f, true, err
 }
 
 // parseFloatAcceptOverflow is [strconv.ParseFloat] with one twist:
@@ -2773,6 +2796,25 @@ func defaultAsFloat(val any, bitSize int) (float64, error) {
 // wins. Walks *schemaNode so name-referenced nested fields coerce too
 // (the resolved type tree, not the canon — name-refs lose type info on
 // the canon side).
+// firstUnionBranchAcceptingDefault returns the first union branch whose
+// validateDefault accepts val, or nil if none match. Shared by
+// coerceDefault and walkDefault's union arms — both implement Avro's
+// "first matching branch wins" default-resolution rule (1.12 relaxed
+// from "first branch" to "any branch," with deterministic first-match
+// tie-break). Keeping the iteration in one place ensures coerceDefault
+// and walkDefault stay in lockstep if validateDefault's semantics
+// change. coerceMetadataDefault (schema_node.go) uses the analogous
+// branchAcceptsDefault predicate on the *SchemaNode public type — the
+// pattern is the same but the type split prevents direct reuse.
+func firstUnionBranchAcceptingDefault(val any, node *schemaNode) *schemaNode {
+	for _, branch := range node.branches {
+		if validateDefault(val, branch) == nil {
+			return branch
+		}
+	}
+	return nil
+}
+
 func coerceDefault(val any, node *schemaNode) any {
 	if node == nil {
 		return val
@@ -2783,10 +2825,8 @@ func coerceDefault(val any, node *schemaNode) any {
 		// Without recursion, ["float","null"] with default "1.5"
 		// stays a string and the JSON encoder rejects it while
 		// binary's defaultAsFloat coerces — binary/JSON divergence.
-		for _, branch := range node.branches {
-			if validateDefault(val, branch) == nil {
-				return coerceDefault(val, branch)
-			}
+		if branch := firstUnionBranchAcceptingDefault(val, node); branch != nil {
+			return coerceDefault(val, branch)
 		}
 		return val
 	}
@@ -2846,17 +2886,17 @@ func walkDefault(val any, node *schemaNode, visit func(any, *schemaNode) (any, e
 		// match any branch (formerly required to match the first).
 		// See AVRO-3649 / PR apache/avro#2503.
 		//
-		// Branch matcher is validateDefault: a structural-only check
-		// (e.g. "is val a string?") can pick a fixed:N branch on a
-		// string default whose rune-count doesn't fit, mutate it into
-		// a length-N []byte that no branch can encode, and surface as
-		// "union default does not match any branch" at encodeDefault
-		// time even though validateDefault accepted the schema.
-		// validateDefault is idempotent so re-running it here is safe.
-		for _, branch := range node.branches {
-			if validateDefault(val, branch) == nil {
-				return walkDefault(val, branch, visit)
-			}
+		// Branch matcher is validateDefault (via
+		// firstUnionBranchAcceptingDefault, shared with coerceDefault):
+		// a structural-only check (e.g. "is val a string?") can pick a
+		// fixed:N branch on a string default whose rune-count doesn't
+		// fit, mutate it into a length-N []byte that no branch can
+		// encode, and surface as "union default does not match any
+		// branch" at encodeDefault time even though validateDefault
+		// accepted the schema. validateDefault is idempotent so
+		// re-running it here is safe.
+		if branch := firstUnionBranchAcceptingDefault(val, node); branch != nil {
+			return walkDefault(val, branch, visit)
 		}
 		return val, fmt.Errorf("default does not match any union branch: %T(%v)", val, val)
 	}

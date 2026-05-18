@@ -304,7 +304,17 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	next:
 	}
 
-	// Deduplicate: tagged wins over untagged, shallower wins.
+	// Deduplicate. Matches reflect.go's typeFieldMapping (line 322-323)
+	// so SchemaFor's inferred schema and the runtime field-mapping
+	// agree on which Go field claims each Avro name. The precedence
+	// rules are documented at doc.go:147-149 ("the shallowest wins;
+	// among fields at the same depth, a tagged field wins over an
+	// untagged one"):
+	//   1. Tagged beats untagged.
+	//   2. Among same-tagged-status fields, shallower (shorter index
+	//      path) wins — this is the F1 fix; pre-fix kept first-seen
+	//      which was the deeper embedded field because nested-struct
+	//      fields are appended to raw BEFORE outer fields.
 	type entry struct {
 		idx int
 		schemaField
@@ -313,6 +323,14 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	for i, f := range raw {
 		if existing, ok := m[f.name]; ok {
 			if f.tagged && !existing.tagged {
+				m[f.name] = entry{i, f}
+				continue
+			}
+			if !f.tagged && existing.tagged {
+				continue
+			}
+			// Same tagged status: shallower wins.
+			if len(f.index) < len(existing.index) {
 				m[f.name] = entry{i, f}
 			}
 			continue

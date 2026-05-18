@@ -42,6 +42,24 @@ func promoteRead[Wire any](
 	}
 }
 
+// promoteIntFloatMantissa is the int→float conversion shared by the
+// four int/long→float/double promotion arms. It applies the same
+// mantissa bound the natural same-type decoder enforces at
+// setIntegerWire's CanFloat arm (deser.go:1541-1544), so a writer→
+// reader promotion at the boundary fails the same way Decode of an
+// equivalent same-schema wire into the same Go target would. Without
+// this check, e.g. Resolve("long","double").Decode(wire(1<<53+1), &f64)
+// silently truncated to 1<<53 while w.Decode(wire(1<<53+1), &f64)
+// rejected — within-twmb encode/natural-decode/promoted-decode contract
+// disagreement on identical wire bytes (F2 finding).
+func promoteIntFloatMantissa(v reflect.Value, n int64, avroType string, bitSize int) error {
+	f, err := intFitsFloat(n, bitSize)
+	if err != nil {
+		return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
+	}
+	return setFloatValue(v, f, avroType, bitSize)
+}
+
 var (
 	// setLongValue handles the Interface arm internally, so no special-case
 	// needed here (the prior promoteIntToLong's separate Interface arm was
@@ -49,13 +67,13 @@ var (
 	promoteIntToLong = promoteRead(readVarint,
 		func(v reflect.Value, n int32) error { return setLongValue(v, int64(n)) })
 	promoteIntToFloat = promoteRead(readVarint,
-		func(v reflect.Value, n int32) error { return setFloatValue(v, float64(n), "float", 32) })
+		func(v reflect.Value, n int32) error { return promoteIntFloatMantissa(v, int64(n), "float", 32) })
 	promoteIntToDouble = promoteRead(readVarint,
-		func(v reflect.Value, n int32) error { return setFloatValue(v, float64(n), "double", 64) })
+		func(v reflect.Value, n int32) error { return promoteIntFloatMantissa(v, int64(n), "double", 64) })
 	promoteLongToFloat = promoteRead(readVarlong,
-		func(v reflect.Value, n int64) error { return setFloatValue(v, float64(n), "float", 32) })
+		func(v reflect.Value, n int64) error { return promoteIntFloatMantissa(v, n, "float", 32) })
 	promoteLongToDouble = promoteRead(readVarlong,
-		func(v reflect.Value, n int64) error { return setFloatValue(v, float64(n), "double", 64) })
+		func(v reflect.Value, n int64) error { return promoteIntFloatMantissa(v, n, "double", 64) })
 	promoteFloatToDouble = promoteRead(readUint32,
 		func(v reflect.Value, u uint32) error {
 			return setFloatValue(v, float64(math.Float32frombits(u)), "double", 64)

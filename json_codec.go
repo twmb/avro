@@ -596,6 +596,45 @@ func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *opt
 	return appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, customEncodes, depth+1)
 }
 
+// chooseFieldKey selects which key (canonical or alias) the caller's
+// input map used to populate the given record field, mirroring the
+// decode-side alias resolution in [iterateRecordFields]:
+//   - canonical present, no alias: returns (canonical, true, nil)
+//   - only an alias present: returns (alias, true, nil)
+//   - canonical AND alias both present, or two aliases both present:
+//     returns ("", false, err) — same kind of ambiguity decode rejects
+//   - neither present: returns ("", false, nil) — caller emits default
+//
+// hasKey is the lookup probe: for the map[string]any fast path, it
+// returns `_, ok := m[k]`; for the generic Map path, it returns
+// `v.MapIndex(typedKey).IsValid()`. Keeping the probe abstract lets the
+// helper drive both paths and ensures encode-side alias-resolution
+// stays symmetric with decode (F6 fix).
+func chooseFieldKey(f *fieldNode, nodeName string, hasKey func(key string) bool) (foundKey string, exists bool, err error) {
+	canonOK := hasKey(f.name)
+	aliasFound := ""
+	for _, a := range f.aliases {
+		if hasKey(a) {
+			if aliasFound != "" {
+				return "", false, fmt.Errorf("avro json: record %q field %q resolved from both alias keys %q and %q in the input map",
+					nodeName, f.name, aliasFound, a)
+			}
+			aliasFound = a
+		}
+	}
+	if canonOK && aliasFound != "" {
+		return "", false, fmt.Errorf("avro json: record %q field %q resolved from both canonical key %q and alias key %q in the input map",
+			nodeName, f.name, f.name, aliasFound)
+	}
+	if canonOK {
+		return f.name, true, nil
+	}
+	if aliasFound != "" {
+		return aliasFound, true, nil
+	}
+	return "", false, nil
+}
+
 // appendAvroJSONRecord handles record encoding for both structs and maps.
 func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
 	buf = append(buf, '{')
@@ -613,12 +652,17 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 				}
 				buf = appendJSONString(buf, f.name)
 				buf = append(buf, ':')
-				val, exists := m[f.name]
-				var err error
+				foundKey, exists, err := chooseFieldKey(&f, node.name, func(k string) bool {
+					_, ok := m[k]
+					return ok
+				})
+				if err != nil {
+					return nil, err
+				}
 				if !exists {
 					buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, customEncodes, depth)
 				} else {
-					buf, err = appendAvroJSON(buf, reflect.ValueOf(val), f.node, cfg, customEncodes, depth+1)
+					buf, err = appendAvroJSON(buf, reflect.ValueOf(m[foundKey]), f.node, cfg, customEncodes, depth+1)
 				}
 				if err != nil {
 					return nil, err
@@ -632,12 +676,16 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			}
 			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
-			val := v.MapIndex(mapKeyAs(v.Type(), f.nameVal))
-			var err error
-			if !val.IsValid() {
+			foundKey, exists, err := chooseFieldKey(&f, node.name, func(k string) bool {
+				return v.MapIndex(mapKeyAs(v.Type(), reflect.ValueOf(k))).IsValid()
+			})
+			if err != nil {
+				return nil, err
+			}
+			if !exists {
 				buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, customEncodes, depth)
 			} else {
-				buf, err = appendAvroJSON(buf, val, f.node, cfg, customEncodes, depth+1)
+				buf, err = appendAvroJSON(buf, v.MapIndex(mapKeyAs(v.Type(), reflect.ValueOf(foundKey))), f.node, cfg, customEncodes, depth+1)
 			}
 			if err != nil {
 				return nil, err
@@ -1154,5 +1202,5 @@ func jsonCoerceToInt32(v reflect.Value) (int32, error) {
 }
 
 func jsonCoerceToInt64(v reflect.Value) (int64, error) {
-	return jsonCoerceInt(v, math.MaxInt64, floatFitsInt64From, parseInt64Lenient)
+	return jsonCoerceInt(v, math.MaxInt64, floatFitsInt64From, parseInt64WithFloatParity)
 }

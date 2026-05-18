@@ -276,18 +276,28 @@ func isNilValue(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
 	}
+	// Peel Pointer/Interface in one loop, then inspect the final kind
+	// in a separate switch — matches serNull's shape (ser.go:332-346)
+	// so a depth-5 chain bottoming at a nil Map/Slice/Chan/Func is
+	// correctly identified. Combining the peel and the Map/Slice/Chan/
+	// Func nil-check inside one loop (the pre-fix shape) lost the
+	// bottom-value check at exactly the depth-cap boundary: iter 5
+	// would peel the last Pointer to a Map but the loop terminated
+	// before the next iteration could inspect Map.IsNil. Pattern 14a
+	// — the peel broadening on serNull was not propagated to its
+	// sibling pre-filter helper.
 	for range maxIndirectDepth {
-		switch v.Kind() {
-		case reflect.Pointer, reflect.Interface:
-			if v.IsNil() {
-				return true
-			}
-			v = v.Elem()
-		case reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
-			return v.IsNil()
-		default:
-			return false
+		if v.Kind() != reflect.Pointer && v.Kind() != reflect.Interface {
+			break
 		}
+		if v.IsNil() {
+			return true
+		}
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		return v.IsNil()
 	}
 	return false
 }
@@ -474,16 +484,18 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 	// truncation, while s.Encode(int64(9007199254740993)) rejects with
 	// "integer overflows float64 exact precision" — a path-divergence
 	// bug identical in shape to the JSON-grammar gap above.
+	//
+	// boundedParseIntForFloat caps input at maxParseFloatLen (1024)
+	// before strconv.ParseInt so a 1 MiB hostile pure-integer input
+	// produces a bounded-length error instead of interpolating the
+	// full input — matches the parallel cap at integerFormFitsFloat
+	// (jsonCoerceToFloat64 / defaultAsFloat).
 	if !strings.ContainsAny(s, ".eE") {
-		if n, perr := strconv.ParseInt(s, 10, 64); perr == nil {
-			return reflect.ValueOf(n), true, nil
+		n, perr := boundedParseIntForFloat(s)
+		if perr != nil {
+			return v, true, perr
 		}
-		// Integer-form that overflows int64: magnitude is beyond any
-		// float exact precision (>1<<53), so reject outright. Silently
-		// rounding via ParseFloat would diverge from the typed-int64
-		// path which rejects MaxInt64-magnitude integers against float
-		// targets via the 1<<24 / 1<<53 mantissa-precision check.
-		return v, true, fmt.Errorf("integer %s overflows float exact precision", s)
+		return reflect.ValueOf(n), true, nil
 	}
 	f, err := parseFloatAcceptOverflow(s)
 	if err != nil {
@@ -564,6 +576,38 @@ func parseInt64Lenient(s string) (int64, error) {
 // short-circuit, so this cap only affects exponent/fractional inputs.
 const maxInt64LenientLen = 64
 
+// parseInt64WithFloatParity is [parseInt64Lenient] + a precision check
+// rejecting fractional/exponent-form inputs whose float64 representation
+// rounds to a different int64 than the parsed-exact value. Used at the
+// encode-time arms ([jsonNumberToInt64], [jsonCoerceToInt64]) and the
+// schema-parse-time arm ([defaultAsInt64] via [numericDefault]) so they
+// reject the same hostile boundary values Java/fastavro reject (e.g.
+// "9.223372036854775807e18" where big.Rat parses to int64.Max but
+// float64 rounds to int64.Max+1 = 2^63 — Java's
+// DoubleNode.canConvertToLong() returns false at this boundary;
+// fastavro's float input fails isinstance(default,int)).
+//
+// Pure integer-literal inputs skip the check — their wire and metadata-
+// API representations are identical by construction.
+//
+// Decode-side ([parseJSONInt64]) keeps [parseInt64Lenient] without the
+// parity check to preserve the documented "Encode strict / decode
+// lenient on float-mantissa precision" intentional divergence: a JSON
+// wire value at the int64 boundary still decodes losslessly.
+func parseInt64WithFloatParity(s string) (int64, error) {
+	n, err := parseInt64Lenient(s)
+	if err != nil {
+		return 0, err
+	}
+	if !strings.ContainsAny(s, ".eE") {
+		return n, nil
+	}
+	if !floatRoundsToSameInt64(s, n) {
+		return 0, fmt.Errorf("value %s in fractional/exponent form has float64 representation that diverges from its parsed-exact int64 value (%d); use integer literal form", s, n)
+	}
+	return n, nil
+}
+
 // parseInt32Lenient is [parseInt64Lenient] with int32 range narrowing.
 // Shares the same arbitrary-precision parsing so fractional-part-lost-
 // to-float64-rounding inputs like "1.0000000000000001" are correctly
@@ -591,7 +635,7 @@ func jsonNumberToInt64(v reflect.Value) (int64, bool, error) {
 	if v.Type() != jsonNumberType {
 		return 0, false, nil
 	}
-	n, err := parseInt64Lenient(string(v.Interface().(json.Number)))
+	n, err := parseInt64WithFloatParity(string(v.Interface().(json.Number)))
 	if err != nil {
 		return 0, true, err
 	}

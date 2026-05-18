@@ -205,6 +205,21 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 }
 
 // skipValue skips an entire JSON value (for unknown record fields).
+//
+// Accepts the same bare special-float tokens decodeJSONFloat accepts on
+// known float/double fields — NaN, Infinity, -Infinity, INF, -INF, Inf,
+// -Inf — so a record produced by Java JsonEncoder or fastavro (both
+// emit bare NaN/Infinity by convention) with such a token in a
+// writer-only field can be decoded against a reader that doesn't have
+// the field. parseSpecialFloat's exact-match gate is applied so invalid
+// bare tokens (e.g. "Naive", lowercase "nan") still error, matching
+// the strict-JSON posture decodeJSONFloat enforces.
+//
+// Case-sensitivity note: lowercase 'n' is unambiguously the JSON null
+// literal; lowercase 'i' isn't a valid token start (Java's JsonParser,
+// fastavro's Python json, and goavro all reject lowercase
+// nan/infinity/inf). Uppercase 'N' / 'I' / '-I' are the bare-special-
+// float starts.
 func (s *jsonScanner) skipValue() error {
 	s.skipWhitespace()
 	if s.pos >= len(s.data) {
@@ -222,6 +237,31 @@ func (s *jsonScanner) skipValue() error {
 		return err
 	case 'n':
 		return s.consumeNull()
+	case 'N', 'I':
+		t, err := s.consumeBareSpecialFloat()
+		if err != nil {
+			return err
+		}
+		_, err = parseSpecialFloat(t)
+		return err
+	case '-':
+		// Disambiguate -<digit> (negative number) vs -I... (bare
+		// -Infinity / -INF / -Inf). The bare-special-float arm
+		// always starts uppercase 'I' after the leading '-'; any
+		// other byte (digit, or invalid like '-N') routes to
+		// consumeNumberBytes which handles the negative-number
+		// case and emits a consistent "expected number" error for
+		// invalid shapes.
+		if s.peekAt(1) == 'I' {
+			t, err := s.consumeBareSpecialFloat()
+			if err != nil {
+				return err
+			}
+			_, err = parseSpecialFloat(t)
+			return err
+		}
+		_, err := s.consumeNumberBytes()
+		return err
 	case '[':
 		return s.skipCompound('[', ']')
 	case '{':

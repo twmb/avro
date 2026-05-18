@@ -599,7 +599,12 @@ func resolveWriterUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 		branchDesers[i] = resolved.deser
 		bnames[i], lnames[i] = unionBranchNames(wb)
 	}
-	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
+	// noWrap: reader is non-union, so the TaggedUnions wrap on
+	// du.deser would leak the WRITER's branch name onto a target that
+	// has no union to dispatch through. Sibling resolveReaderUnion
+	// handles its own wrap (with the READER's branch name) when the
+	// reader IS a union; resolveUnionUnion (both union) keeps wrap on.
+	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames, noWrap: true}
 	return &schemaNode{
 		kind:  r.kind,
 		name:  r.name,

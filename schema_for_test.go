@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math/big"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -2004,4 +2005,61 @@ func TestSchemaForCustomTypeNoAvroType(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for CustomType without AvroType or Schema")
 	}
+}
+
+// TestRegression_SchemaForShadowedEmbedShallowestWins locks the F1 fix:
+// doc.go:147-149 documents "the shallowest wins" for same-name fields,
+// and reflect.go's typeFieldMapping (line 322-323) implements it at
+// runtime. Pre-fix, schema_for.go's collectFields dedup (line 313-321)
+// only special-cased tagged-beats-untagged and kept first-seen for
+// same-tagged-status — which is the deeper embedded field because
+// collectFields appends nested-struct fields BEFORE outer fields.
+//
+// Observable consequence pre-fix: encode of a legal outer.X int64
+// value against the inferred schema failed with "overflows int32"
+// because the schema declared the embedded int32 type while the
+// runtime encoder used the outer int64 value.
+func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
+	t.Run("both_tagged_outer_wins", func(t *testing.T) {
+		type Inner struct {
+			X int32 `avro:"x"`
+		}
+		type Outer struct {
+			Inner
+			X int64 `avro:"x"`
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		js := s.String()
+		if !strings.Contains(js, `"type":"long"`) {
+			t.Fatalf("expected outer field's int64→long; got: %s", js)
+		}
+
+		// Runtime encode of int64-fitting value should succeed.
+		o := Outer{}
+		o.X = 1 << 33 // beyond int32 range, fits int64
+		if _, err := s.Encode(&o); err != nil {
+			t.Fatalf("expected encode accept (schema is long, value fits int64); got: %v", err)
+		}
+	})
+
+	t.Run("both_untagged_outer_wins", func(t *testing.T) {
+		type Inner struct {
+			X int32
+		}
+		type Outer struct {
+			Inner
+			X int64
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		js := s.String()
+		if !strings.Contains(js, `"type":"long"`) {
+			t.Fatalf("expected outer field's int64→long for untagged shadowed embed; got: %s", js)
+		}
+	})
 }

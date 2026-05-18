@@ -887,7 +887,14 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 					return err
 				}
 			} else {
-				if seen[idx] {
+				// Reject ONLY when two DIFFERENT JSON keys resolve to the
+				// same idx — the alias-collision case the round-85 fix
+				// targeted. Same canonical key appearing twice falls
+				// through to last-wins (handle is called again, decoding
+				// the second value and overwriting the first), matching
+				// Java's Jackson, fastavro's Python json.loads, and Go's
+				// encoding/json on duplicate keys.
+				if seen[idx] && seenKey[idx] != key {
 					return fmt.Errorf("avro json: record %q field %q resolved from both %q and %q in the same JSON object",
 						node.name, node.fields[idx].name, seenKey[idx], key)
 				}

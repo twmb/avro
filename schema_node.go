@@ -53,7 +53,19 @@ type SchemaNode struct {
 
 	// Props holds custom (non-reserved) schema properties. Integer JSON
 	// literals decode to int64 (json.Number when the magnitude exceeds
-	// int64); fractional and exponent-form literals decode to float64.
+	// int64); fractional and exponent-form literals decode to float64,
+	// with ±Inf for magnitudes overflowing the float64 exponent (e.g.
+	// "1e1000" → float64(+Inf), matching Java's Jackson DoubleNode and
+	// fastavro's Python float()).
+	//
+	// DoS-defense cap: numeric literals exceeding maxParseFloatLen
+	// (1024) chars fall back to json.Number rather than float64 to
+	// bound strconv.ParseFloat cost on hostile multi-MB inputs. Java
+	// and fastavro have no analogous cap; twmb's defense-in-depth
+	// posture (see "DoS-resistance defense-in-depth" intentional
+	// divergence) makes this trade explicitly: legitimate numbers fit
+	// comfortably under 1024 chars; truly large literals are preserved
+	// losslessly as json.Number for callers that need them.
 	Props map[string]any
 }
 
@@ -499,6 +511,158 @@ func lookupCI(m map[string]any, key string) (any, bool) {
 	return nil, false
 }
 
+// coerceMetadataDefault is the metadata-API parallel of [coerceDefault]
+// (schema.go). It transforms a parsed-JSON default value into the
+// canonical Go form the wire-encode pipeline materializes for that
+// field type — so SchemaField.Default surfaces a value type matching
+// the wire bytes rather than the raw JSON form
+// unmarshalAnyPreservePrecision returns.
+//
+// Currently coerces string defaults to float64 for float/double fields,
+// walking unions (Avro 1.12: union default may match any branch) and
+// nested record/array/map types. Java's Schema.parseField
+// (Schema.java:1899-1902) eagerly Jackson-coerces text defaults to
+// DoubleNode at parse so Field.defaultVal() returns numeric; fastavro
+// keeps raw Python strings (footgun). twmb sides with Java's typed-
+// materialization per the "String-form float defaults" intentional-
+// divergence entry's promise.
+//
+// Non-string defaults and non-float/double/union/container types pass
+// through unchanged.
+func coerceMetadataDefault(val any, t *SchemaNode) any {
+	if t == nil {
+		return val
+	}
+	if t.Type == "union" {
+		// Pick the FIRST branch that accepts val's Go type — matches
+		// the wire-encode pipeline's coerceDefault (which uses
+		// validateDefault for branch selection) and Java's Schema.
+		// parseField (which Jackson-coerces against the first
+		// accepting branch). Picking "first transformation" instead
+		// would diverge for ["string","float"] with default "1.5":
+		// wire picks string (first accept), but a transform-based
+		// helper would pick float because string→string is a no-op.
+		for i := range t.Branches {
+			if branchAcceptsDefault(&t.Branches[i], val) {
+				return coerceMetadataDefault(val, &t.Branches[i])
+			}
+		}
+		return val
+	}
+	if val == nil {
+		return val
+	}
+	if t.Type == "float" || t.Type == "double" {
+		if s, ok := val.(string); ok {
+			bitSize := 32
+			if t.Type == "double" {
+				bitSize = 64
+			}
+			if f, err := defaultAsFloat(s, bitSize); err == nil {
+				return f
+			}
+		}
+		return val
+	}
+	if t.Type == "record" {
+		if m, ok := val.(map[string]any); ok {
+			out := make(map[string]any, len(m))
+			for k, v := range m {
+				inner := v
+				for i := range t.Fields {
+					if t.Fields[i].Name == k {
+						inner = coerceMetadataDefault(v, &t.Fields[i].Type)
+						break
+					}
+				}
+				out[k] = inner
+			}
+			return out
+		}
+		return val
+	}
+	if t.Type == "array" && t.Items != nil {
+		if a, ok := val.([]any); ok {
+			out := make([]any, len(a))
+			for i, v := range a {
+				out[i] = coerceMetadataDefault(v, t.Items)
+			}
+			return out
+		}
+		return val
+	}
+	if t.Type == "map" && t.Values != nil {
+		if m, ok := val.(map[string]any); ok {
+			out := make(map[string]any, len(m))
+			for k, v := range m {
+				out[k] = coerceMetadataDefault(v, t.Values)
+			}
+			return out
+		}
+		return val
+	}
+	return val
+}
+
+// branchAcceptsDefault reports whether the Avro type t natively accepts
+// val as a default value, using the same Go-type → Avro-type
+// compatibility the wire-encode pipeline's validateDefault enforces.
+// Used by coerceMetadataDefault's union-branch selection: iterate
+// branches in order; the first accepting branch is the chosen one
+// (matches Java's Schema.parseField first-matching-branch behavior).
+//
+// The float/double branch lenient-accepts string (twmb's documented
+// "String-form float defaults" intentional divergence). bytes/fixed
+// branch accepts string (codepoint-mapped form per Avro JSON spec) or
+// []byte. int/long branch accepts integer + numeric-float Go types.
+func branchAcceptsDefault(t *SchemaNode, val any) bool {
+	switch t.Type {
+	case "null":
+		return val == nil
+	case "boolean":
+		_, ok := val.(bool)
+		return ok
+	case "int", "long":
+		switch val.(type) {
+		case int64, int32, json.Number, float64:
+			return true
+		}
+		return false
+	case "float", "double":
+		switch val.(type) {
+		case float64, json.Number, string:
+			return true
+		}
+		return false
+	case "string", "enum":
+		_, ok := val.(string)
+		return ok
+	case "bytes", "fixed":
+		switch val.(type) {
+		case string, []byte:
+			return true
+		}
+		return false
+	case "record":
+		_, ok := val.(map[string]any)
+		return ok
+	case "array":
+		_, ok := val.([]any)
+		return ok
+	case "map":
+		_, ok := val.(map[string]any)
+		return ok
+	case "union":
+		for i := range t.Branches {
+			if branchAcceptsDefault(&t.Branches[i], val) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 func nodeFromJSONObject(m map[string]any) SchemaNode {
 	n := SchemaNode{}
 
@@ -543,7 +707,14 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 					sf.Type = nodeFromJSON(t)
 				}
 				if d, ok := lookupCI(fm, "default"); ok {
-					sf.Default = d
+					// Coerce string defaults to typed float64 for
+					// float/double fields (and recurse through nested
+					// record/array/map/union types), matching Java's
+					// Schema.parseField text→DoubleNode coercion and
+					// the wire-encode pipeline's coerceDefault — so
+					// SchemaField.Default reflects the materialized
+					// wire form instead of the raw JSON string. F11.
+					sf.Default = coerceMetadataDefault(d, &sf.Type)
 					sf.HasDefault = true
 				}
 				getCIString(fm, "doc", &sf.Doc)

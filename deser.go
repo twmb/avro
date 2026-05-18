@@ -177,6 +177,13 @@ type deserUnion struct {
 	fns          []deserfn
 	branchNames  []string // standard names: "null", "string", "com.example.Foo"
 	logicalNames []string // with logical type: "long.timestamp-millis"; empty if same as branchNames
+	// noWrap disables maybeWrap. Set by resolveWriterUnion when the
+	// reader is non-union — wrapping there would leak the writer's
+	// branch name onto a target that has no union to dispatch through.
+	// Default (zero value, false) is the natural-union and
+	// resolveUnionUnion behavior: wrap when TaggedUnions is active
+	// and the target is *any (or compatible interface).
+	noWrap bool
 }
 
 func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -206,7 +213,7 @@ func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 // map). Non-interface targets and interfaces with methods are
 // skipped silently.
 func (s *deserUnion) maybeWrap(v reflect.Value, sl *slab, idx int32) {
-	if !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
+	if s.noWrap || !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
 		return
 	}
 	// Skip silently if the wrapping map[string]any can't be assigned
@@ -1534,15 +1541,15 @@ func setIntegerWire[T int32 | int64](v reflect.Value, val T, avroType string) er
 	if v.CanFloat() {
 		// Mirrors the documented whole-number-float-as-int encode
 		// leniency: AppendEncode(float64(42), "long") succeeds, so
-		// Decode("long" wire, *float64) must round-trip. Mantissa
-		// bounds protect the lossless guarantee — int32 always fits
-		// in float64 (1<<53), but float32 has the 1<<24 boundary
-		// enforced for both int and long sources.
-		lim := floatMantissaLimit(v.Type().Bits())
-		if v64 < -lim || v64 > lim {
-			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %d exceeds %s exact-precision range", val, v.Type())}
+		// Decode("long" wire, *float64) must round-trip. intFitsFloat
+		// is shared with promoteIntFloatMantissa (promote.go:F2 fix)
+		// so the natural-decoder and promoted-decoder arms apply the
+		// same mantissa bound to the same wire bytes.
+		f, err := intFitsFloat(v64, v.Type().Bits())
+		if err != nil {
+			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
 		}
-		v.SetFloat(float64(v64))
+		v.SetFloat(f)
 		return nil
 	}
 	if v.Type() == jsonNumberType {
