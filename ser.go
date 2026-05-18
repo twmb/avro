@@ -79,11 +79,22 @@ type serUnion struct {
 
 // tryUnwrapTagged checks if v is a single-key map whose key matches a
 // branch name. Returns the branch index and unwrapped value on match.
+//
+// Routes Pointer/Interface chains through [indirect] so &m / any(&m)
+// reach the tagged-map check, mirroring appendAvroJSON's entry peel
+// (json_codec.go). Without the peel, AppendEncode(&taggedMap, union)
+// silently fell through to try-each while AppendEncodeJSON(&taggedMap,
+// union) accepted via the JSON entry-peel, producing a binary↔JSON
+// parity gap at top level, inside arrays of unions, and inside record
+// fields. indirect's errIndirectNil / errIndirectDeep both surface as
+// "no match" so the caller's nil-first dispatch picks the null branch
+// (TestRegression_TaggedUnionEncodeIndirection pins both arms).
 func (s *serUnion) tryUnwrapTagged(v reflect.Value) (int, reflect.Value, bool) {
-	if v.Kind() == reflect.Interface && !v.IsNil() {
-		v = v.Elem()
+	v, err := indirect(v)
+	if err != nil {
+		return 0, v, false
 	}
-	if !v.IsValid() || v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String || v.Len() != 1 {
+	if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String || v.Len() != 1 {
 		return 0, v, false
 	}
 	iter := v.MapRange()

@@ -1003,6 +1003,154 @@ func TestSerTaggedUnionMapBranchFallback(t *testing.T) {
 	}
 }
 
+// TestRegression_TaggedUnionEncodeIndirection locks in that the binary
+// union encoder peels Pointer/Interface chains before recognizing a
+// tagged-union map, matching the JSON encoder's entry-peel
+// (appendAvroJSON at json_codec.go) and isNilValue's loop (ser.go).
+//
+// Pre-fix, serUnion.tryUnwrapTagged peeled exactly one Interface layer
+// and no Pointer layers, so &m and any(&m) wrapping a tagged-form map
+// silently failed binary encoding while AppendEncodeJSON accepted them.
+// Observable as a binary↔JSON parity gap at top-level, inside arrays of
+// unions, and inside record fields of union type.
+func TestRegression_TaggedUnionEncodeIndirection(t *testing.T) {
+	m := map[string]any{"int": int32(42)}
+	wantInt32 := int32(42)
+
+	t.Run("2-branch top-level", func(t *testing.T) {
+		s := MustParse(`["null","int"]`)
+		for _, tc := range []struct {
+			name string
+			in   any
+		}{
+			{"map (baseline)", m},
+			{"any(map) (baseline)", any(m)},
+			{"*map (was rejected)", &m},
+			{"any(*map) (was rejected)", any(&m)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				bin, err := s.AppendEncode(nil, tc.in)
+				if err != nil {
+					t.Fatalf("AppendEncode: %v", err)
+				}
+				jsonOut, err := s.AppendEncodeJSON(nil, tc.in)
+				if err != nil {
+					t.Fatalf("AppendEncodeJSON: %v", err)
+				}
+				// Binary↔binary round-trip: decode should produce the same int.
+				var out any
+				if _, err := s.Decode(bin, &out); err != nil {
+					t.Fatalf("Decode: %v", err)
+				}
+				if out != wantInt32 {
+					t.Fatalf("binary round-trip: got %v (%T), want %v", out, out, wantInt32)
+				}
+				// JSON parity: same byte output regardless of indirection.
+				if string(jsonOut) != "42" {
+					t.Fatalf("JSON: got %s, want 42", jsonOut)
+				}
+			})
+		}
+	})
+
+	t.Run("3-branch top-level", func(t *testing.T) {
+		s := MustParse(`["null","int","string"]`)
+		// 3-branch goes through the generic serUnion.ser path; 2-branch
+		// goes through serNullUnionAt. Both share tryUnwrapTagged so a
+		// single fix closes both, but lock both explicitly.
+		bin, err := s.AppendEncode(nil, &m)
+		if err != nil {
+			t.Fatalf("3-branch AppendEncode(&m): %v", err)
+		}
+		var out any
+		if _, err := s.Decode(bin, &out); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if out != wantInt32 {
+			t.Fatalf("got %v, want %v", out, wantInt32)
+		}
+	})
+
+	t.Run("array of unions", func(t *testing.T) {
+		s := MustParse(`{"type":"array","items":["null","int"]}`)
+		arr := []any{&m, m, any(&m)}
+		bin, err := s.AppendEncode(nil, arr)
+		if err != nil {
+			t.Fatalf("AppendEncode: %v", err)
+		}
+		var out any
+		if _, err := s.Decode(bin, &out); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		got, ok := out.([]any)
+		if !ok || len(got) != 3 {
+			t.Fatalf("got %v, want []any{42, 42, 42}", out)
+		}
+		for i, v := range got {
+			if v != wantInt32 {
+				t.Errorf("item %d: got %v (%T)", i, v, v)
+			}
+		}
+	})
+
+	t.Run("record field of union type", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"u","type":["null","int"]}]}`)
+		rec := map[string]any{"u": &m}
+		bin, err := s.AppendEncode(nil, rec)
+		if err != nil {
+			t.Fatalf("AppendEncode: %v", err)
+		}
+		var out any
+		if _, err := s.Decode(bin, &out); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		got, ok := out.(map[string]any)
+		if !ok || got["u"] != wantInt32 {
+			t.Fatalf("got %v, want map{u:42}", out)
+		}
+	})
+
+	t.Run("nil cases still picked up by nil-first dispatch", func(t *testing.T) {
+		// The peel-before-tagged-check must NOT route a nil pointer/
+		// interface into the tagged-map branch — it must fall through
+		// to the nil-first dispatch and pick the null branch. Pin this
+		// so the fix doesn't accidentally hijack nil into try-each.
+		s := MustParse(`["null","int"]`)
+		var nilMap *map[string]any
+		bin, err := s.AppendEncode(nil, nilMap)
+		if err != nil {
+			t.Fatalf("AppendEncode(nilMap): %v", err)
+		}
+		// varint(0) = byte 0x00 → null branch.
+		if len(bin) != 1 || bin[0] != 0x00 {
+			t.Fatalf("nil *map: got %x, want [00] (null branch)", bin)
+		}
+		var ifaceNil any
+		bin, err = s.AppendEncode(nil, ifaceNil)
+		if err != nil {
+			t.Fatalf("AppendEncode(any(nil)): %v", err)
+		}
+		if len(bin) != 1 || bin[0] != 0x00 {
+			t.Fatalf("any(nil): got %x, want [00]", bin)
+		}
+	})
+
+	t.Run("non-tagged map shapes still rejected", func(t *testing.T) {
+		// A pointer to a map whose key matches NO branch must still
+		// fail (not silently match the wrong branch).
+		s := MustParse(`["null","int"]`)
+		unknown := map[string]any{"notABranch": int32(42)}
+		if _, err := s.AppendEncode(nil, &unknown); err == nil {
+			t.Fatalf("expected rejection for unknown branch key, got nil")
+		}
+		// A pointer to a multi-key map (Len != 1) must still fail.
+		multi := map[string]any{"int": int32(1), "x": int32(2)}
+		if _, err := s.AppendEncode(nil, &multi); err == nil {
+			t.Fatalf("expected rejection for multi-key map, got nil")
+		}
+	})
+}
+
 // TestJsonNumberExponentInInt locks in consistent handling of exponent-
 // notation json.Number values across scalar, array, and map int/long
 // encoders. Prior to the fix, scalar serInt rejected "1.5e3" with a
