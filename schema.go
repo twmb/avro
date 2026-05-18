@@ -2460,9 +2460,31 @@ func normalizeJSONNumber(n json.Number) any {
 // unmarshalDefault, a JSON number arrives as json.Number (full precision);
 // callers may also pass float64 (e.g. round-tripped through coerceDefault).
 // Shared body of defaultAsInt32 / defaultAsInt64.
+//
+// Integer defaults must be in integer literal form (no decimal point, no
+// exponent marker). Matches Java's isIntegralNumber() gate at Schema.java
+// LONG/INT cases and fastavro's isinstance(default, int) check in
+// _schema_py.py. Whole-number values in fractional or exponent form
+// (e.g. "2.0", "4e1", "9.2233720368547758e18") were previously accepted
+// via parseInt{32,64}Lenient → boundedRatFromString — but the metadata-
+// API path (normalizeJSONNumber) exposes them as float64, producing a
+// four-axis divergence where encode/decode/parse-validate all agreed on
+// int64 wire encoding but Schema.Root().Fields[].Default surfaced
+// float64 with potential precision loss at the int64 boundary (exp-form
+// "9.2233720368547758e18" → wire int64(9223372036854775800) vs
+// metadata float64(9.223372036854776e+18) → int64(9223372036854775807),
+// a 7-unit value mismatch from the same JSON literal).
+//
+// Rejecting non-integer form at parse eliminates the divergence by
+// removing the lenient-acceptance class entirely; Java and fastavro both
+// reject these inputs, so cross-impl interop is preserved.
 func numericDefault[T int32 | int64](val any, parse func(string) (T, error), fromFloat func(float64) (T, error)) (T, error) {
 	switch v := val.(type) {
 	case json.Number:
+		if strings.ContainsAny(string(v), ".eE") {
+			var z T
+			return z, fmt.Errorf("integer default must be an integer literal, got non-integer form %q", string(v))
+		}
 		return parse(string(v))
 	case float64:
 		return fromFloat(v)
@@ -2511,9 +2533,20 @@ func uintFitsFloat(n uint64, bitSize int) (float64, error) {
 // (0, false, nil) when s is not a decimal-integer literal — caller
 // then falls through to ParseFloat (preserves Java-parity lenient
 // hex-float / exponent-form acceptance).
+//
+// Length cap: the legitimate int64 input fits in 20 chars (sign +
+// 19 digits); the digit-walk loop and strconv.ParseInt are O(n), so
+// a 1 MiB hostile all-digit input would walk + parse ~10-20ms per
+// call and the formatted error message would copy the 1 MiB string
+// into the alloc. Mirror parseFloatAcceptOverflow's maxParseFloatLen
+// cap (1024) — same input domain, same callers (defaultAsFloat,
+// jsonCoerceToFloat64).
 func integerFormFitsFloat(s string, bitSize int) (float64, bool, error) {
 	if len(s) == 0 {
 		return 0, false, nil
+	}
+	if len(s) > maxParseFloatLen {
+		return 0, true, fmt.Errorf("integer literal exceeds %d byte length cap", maxParseFloatLen)
 	}
 	i := 0
 	if s[0] == '-' || s[0] == '+' {
@@ -2542,7 +2575,24 @@ func integerFormFitsFloat(s string, bitSize int) (float64, bool, error) {
 // parseFloatAcceptOverflow is [strconv.ParseFloat] with one twist:
 // ErrRange-with-±Inf is treated as success (Java/fastavro return the
 // Inf; the wire format permits it). Other parse errors propagate.
+//
+// Length cap: strconv.ParseFloat is O(n) and processes ~30-50ms per MiB
+// of input. Schema parse for a record with one float/double field
+// calls this helper twice (validateDefault + encodeDefault), so a 1 MiB
+// hostile default literal can drive ~130ms per parse — past the
+// audit's 100ms DoS threshold. Legitimate float64 literals (including
+// hex-float and max-exponent forms) fit in well under 350 chars;
+// maxParseFloatLen=1024 is generous and rejects hostile input in O(1).
+// Mirrors the same length-cap pattern as boundedRatFromString
+// (deser.go:670, maxRatInputLen=128KiB) and parseInt64Lenient
+// (ser.go:559, maxInt64LenientLen=64). The helper is the single
+// source of truth for the four-axis ParseFloat callers
+// (jsonNumberToFloat, jsonCoerceToFloat64, defaultAsFloat,
+// normalizeJSONNumber), so capping here covers all axes.
 func parseFloatAcceptOverflow(s string) (float64, error) {
+	if len(s) > maxParseFloatLen {
+		return 0, fmt.Errorf("float literal exceeds %d byte length cap", maxParseFloatLen)
+	}
 	f, err := strconv.ParseFloat(s, 64)
 	if err == nil {
 		return f, nil
@@ -2552,6 +2602,14 @@ func parseFloatAcceptOverflow(s string) (float64, error) {
 	}
 	return 0, err
 }
+
+// maxParseFloatLen caps the input length parseFloatAcceptOverflow
+// forwards to [strconv.ParseFloat]. The longest legitimate float64
+// literal (max-exponent + mantissa in scientific form, hex-float
+// with 17-digit significand and 3-digit exponent) fits in ~320 chars;
+// 1024 leaves comfortable headroom and remains O(1)-rejectable on
+// hostile multi-MB inputs. See helper's docstring for full rationale.
+const maxParseFloatLen = 1024
 
 // defaultAsFloat extracts a numeric default for a float (bitSize=32)
 // or double (bitSize=64) field. The string arm is Java-parity lenient

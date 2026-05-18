@@ -16074,3 +16074,447 @@ func TestRegression_SchemaCacheConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestRegression_JSONDecodeFixedSizeArrayTarget pins the symmetry between
+// the JSON encoder, binary encoder, binary decoder, and JSON decoder for
+// fixed-size Go array targets ([N]T) against Avro array schemas.
+//
+// Pre-fix, json_decode.go's decodeArray rejected reflect.Array with
+// "cannot use [N]T with Avro type array" even though appendAvroJSON's
+// case "array" (json_codec.go) accepted both Slice and Array, and
+// deserArray (deser.go) detected fixedArray and dispatched to
+// deserFixedArray. The asymmetry broke JSON round-trip: AppendEncodeJSON
+// would succeed on [3]int32, but DecodeJSON on the produced JSON could
+// not write back into the same Go shape.
+//
+// Pattern 12 from BUG_AUDIT.md (encode accepts type X, decode rejects
+// type X). The fix mirrors deserArray.deserFixedArray: validate element
+// count, decode into v.Index(i) directly.
+func TestRegression_JSONDecodeFixedSizeArrayTarget(t *testing.T) {
+	t.Run("[3]int32 round-trip through JSON", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":"int"}`)
+		in := [3]int32{1, 2, 3}
+		jbuf, err := s.AppendEncodeJSON(nil, in)
+		if err != nil {
+			t.Fatalf("encode JSON: %v", err)
+		}
+		if string(jbuf) != "[1,2,3]" {
+			t.Errorf("JSON = %s, want [1,2,3]", jbuf)
+		}
+		var out [3]int32
+		if err := s.DecodeJSON(jbuf, &out); err != nil {
+			t.Fatalf("decode JSON into [3]int32: %v", err)
+		}
+		if out != in {
+			t.Errorf("got %v, want %v", out, in)
+		}
+	})
+
+	t.Run("[3]int32 binary↔JSON cross-path round-trip", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":"int"}`)
+		in := [3]int32{10, 20, 30}
+		bbuf, err := s.AppendEncode(nil, in)
+		if err != nil {
+			t.Fatalf("encode binary: %v", err)
+		}
+		var bout [3]int32
+		if _, err := s.Decode(bbuf, &bout); err != nil {
+			t.Fatalf("binary decode: %v", err)
+		}
+		if bout != in {
+			t.Errorf("binary round-trip: got %v, want %v", bout, in)
+		}
+		jbuf, err := s.AppendEncodeJSON(nil, in)
+		if err != nil {
+			t.Fatalf("encode JSON: %v", err)
+		}
+		var jout [3]int32
+		if err := s.DecodeJSON(jbuf, &jout); err != nil {
+			t.Fatalf("JSON decode: %v", err)
+		}
+		if jout != in {
+			t.Errorf("JSON round-trip: got %v, want %v", jout, in)
+		}
+	})
+
+	t.Run("[3]string element type", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":"string"}`)
+		in := [3]string{"a", "b", "c"}
+		jbuf, err := s.AppendEncodeJSON(nil, in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out [3]string
+		if err := s.DecodeJSON(jbuf, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != in {
+			t.Errorf("got %v, want %v", out, in)
+		}
+	})
+
+	t.Run("[2]record element type", func(t *testing.T) {
+		type rec struct {
+			X int32 `avro:"x"`
+		}
+		s := avro.MustParse(`{"type":"array","items":{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}}`)
+		in := [2]rec{{1}, {2}}
+		jbuf, err := s.AppendEncodeJSON(nil, in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out [2]rec
+		if err := s.DecodeJSON(jbuf, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != in {
+			t.Errorf("got %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("element count mismatch — JSON too long for [2]int", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":"int"}`)
+		var out [2]int32
+		if err := s.DecodeJSON([]byte("[1,2,3]"), &out); err == nil {
+			t.Fatalf("expected error for 3 elements into [2]int32")
+		}
+	})
+
+	t.Run("element count mismatch — JSON too short for [3]int", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":"int"}`)
+		var out [3]int32
+		if err := s.DecodeJSON([]byte("[1,2]"), &out); err == nil {
+			t.Fatalf("expected error for 2 elements into [3]int32")
+		}
+	})
+
+	t.Run("empty JSON array into [0]int", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":"int"}`)
+		var out [0]int32
+		if err := s.DecodeJSON([]byte("[]"), &out); err != nil {
+			t.Fatalf("empty array into [0]int32: %v", err)
+		}
+	})
+
+	t.Run("[N]T as struct field round-trip", func(t *testing.T) {
+		type rec struct {
+			Xs [3]int32 `avro:"xs"`
+		}
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"xs","type":{"type":"array","items":"int"}}]}`)
+		in := rec{Xs: [3]int32{7, 8, 9}}
+		jbuf, err := s.AppendEncodeJSON(nil, in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out rec
+		if err := s.DecodeJSON(jbuf, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != in {
+			t.Errorf("got %+v, want %+v", out, in)
+		}
+	})
+}
+
+// TestRegression_IntegerDefaultMustBeIntegerLiteral pins that int and
+// long schema defaults must be in pure integer literal form — no
+// fractional component, no exponent marker. Matches Java's
+// isIntegralNumber() gate (Schema.java LONG/INT cases) and fastavro's
+// isinstance(default, int) check.
+//
+// Pre-fix, twmb accepted exponent-form and fractional-whole-number
+// values (e.g. "9.2233720368547758e18" for a long default) via
+// parseInt{32,64}Lenient's boundedRatFromString slow path. The
+// metadata-API path (normalizeJSONNumber's exponent-form arm) routed
+// the same input through parseFloatAcceptOverflow → float64, producing
+// a four-axis divergence (pattern 1b from BUG_AUDIT.md): encode/decode/
+// parse-validate all agreed on int64 wire encoding, but
+// Schema.Root().Fields[].Default surfaced lossy float64 — for
+// magnitudes > 2^53, the metadata value differed from the wire-fill
+// value (e.g. exp-form 9.2233720368547758e18 → wire int64(9223372036854775800)
+// vs metadata float64 that rounds to int64(9223372036854775807), a
+// 7-unit mismatch from the same JSON literal).
+//
+// Rejecting non-integer form at parse-validate (defaultAsInt32/64)
+// eliminates the divergence by removing the lenient acceptance class.
+// Both upstream impls reject these inputs, so cross-impl interop is
+// preserved.
+func TestRegression_IntegerDefaultMustBeIntegerLiteral(t *testing.T) {
+	rejectCases := []struct {
+		name, schema string
+	}{
+		{
+			"long default exponent-form integer-valued (silently rounded via float64 in metadata pre-fix)",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"long","default":9.2233720368547758e18}]}`,
+		},
+		{
+			"long default exponent-form small",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"long","default":1e3}]}`,
+		},
+		{
+			"long default fractional-whole",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"long","default":2.0}]}`,
+		},
+		{
+			"int default exponent-form",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"int","default":1e3}]}`,
+		},
+		{
+			"int default fractional-whole",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"int","default":2.0}]}`,
+		},
+	}
+	for _, tc := range rejectCases {
+		t.Run("reject: "+tc.name, func(t *testing.T) {
+			_, err := avro.Parse(tc.schema)
+			if err == nil {
+				t.Fatalf("expected parse error for non-integer-form default")
+			}
+		})
+	}
+
+	// Boundary-1: integer literal form must still parse and metadata
+	// must surface int64 (not float64) — the fix doesn't over-trigger.
+	// The wire-fill default decodes as the schema-appropriate Go type
+	// (int32 for "int" schemas, int64 for "long" schemas) per the
+	// documented "metadata normalizes, not preserves Go types" rule —
+	// we compare the underlying integer value, not the exact Go type.
+	type acceptCase struct {
+		name, schema   string
+		wantDefault    any   // exact metadata Go type expected
+		wantWireFillN  int64 // numeric value the wire-fill default must equal
+	}
+	acceptCases := []acceptCase{
+		{
+			"long default int64 boundary preserved as int64 in metadata",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"long","default":9223372036854775800}]}`,
+			int64(9223372036854775800),
+			9223372036854775800,
+		},
+		{
+			"long default 2^53+1 preserves precision via int64",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"long","default":9007199254740993}]}`,
+			int64(9007199254740993),
+			9007199254740993,
+		},
+		{
+			"int default small positive",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"int","default":42}]}`,
+			int64(42),
+			42,
+		},
+		{
+			"int default negative",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"int","default":-1}]}`,
+			int64(-1),
+			-1,
+		},
+	}
+	asInt64 := func(t *testing.T, v any) int64 {
+		t.Helper()
+		switch n := v.(type) {
+		case int32:
+			return int64(n)
+		case int64:
+			return n
+		default:
+			t.Fatalf("wire-fill default has unexpected type %T(%v)", v, v)
+			return 0
+		}
+	}
+	for _, tc := range acceptCases {
+		t.Run("accept: "+tc.name, func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("integer-form default rejected: %v", err)
+			}
+			gotDefault := s.Root().Fields[0].Default
+			if gotDefault != tc.wantDefault {
+				t.Errorf("Root().Fields[0].Default: got %T(%v), want %T(%v) — metadata-API normalization broken",
+					gotDefault, gotDefault, tc.wantDefault, tc.wantDefault)
+			}
+			// And: the wire-fill default value must equal what metadata
+			// reports (modulo Go type — int32 wire vs int64 metadata is
+			// the documented normalization). This is the four-axis check:
+			// (a) wire/encode, (b) wire/decode, (c) parse-validate, (d)
+			// metadata — all axes agree on the same numeric value.
+			wire, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("encode empty record: %v", err)
+			}
+			var got map[string]any
+			if _, err := s.Decode(wire, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if asInt64(t, got["f"]) != tc.wantWireFillN {
+				t.Errorf("wire-fill default value: got %v, want %d — four-axis divergence",
+					got["f"], tc.wantWireFillN)
+			}
+		})
+	}
+}
+
+// TestRegression_ParseFloatLengthCapDoS pins the schema-parse-time
+// length cap on float-default literals. Pre-fix, parseFloatAcceptOverflow
+// (schema.go) wrapped strconv.ParseFloat without bounding input length;
+// ParseFloat is O(n) at ~30-50ms per MiB. The helper was called twice
+// per schema parse (validateDefault → defaultAsFloat → ParseFloat;
+// encodeDefault → defaultAsFloat → ParseFloat), so a 1 MiB hostile
+// default literal drove ~130-150ms per Parse — past the audit's 100ms
+// DoS threshold.
+//
+// Sibling helpers boundedRatFromString (deser.go, 128KiB cap) and
+// parseInt64Lenient (ser.go, 64-byte cap) had explicit length caps
+// for exactly this reason; parseFloatAcceptOverflow was missed when
+// the F2-round factored it into a single source of truth. This test
+// locks the 1024-byte cap at the helper, mirroring the same shape
+// applied to integerFormFitsFloat.
+//
+// Pattern 16 from BUG_AUDIT.md (precision fix that introduces own DoS).
+//
+// The test is split into two parts: (1) a behavioral check that the
+// cap fires with the expected error message — this runs under all
+// modes including -race; (2) a wall-clock timing check that verifies
+// the post-cap rejection is fast — this is skipped under -race
+// because race-instrumentation overhead masks the speedup (race
+// makes JSON parsing of 1 MiB hostile input slow regardless of the
+// downstream cap).
+func TestRegression_ParseFloatLengthCapDoS(t *testing.T) {
+	hostile := "1." + strings.Repeat("0", (1<<20)-2) // 1 MiB digit string
+	schemaJSON := fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":"double","default":%s}]}`, hostile)
+
+	// (1) Behavioral check: the cap MUST fire, returning a length-cap
+	// error rather than silently succeeding (pre-fix would have parsed
+	// and rounded to +Inf or finite via ParseFloat's slow path).
+	_, err := avro.Parse(schemaJSON)
+	if err == nil {
+		t.Fatalf("expected length-cap rejection on 1 MiB hostile double default; schema parsed successfully")
+	}
+	if !strings.Contains(err.Error(), "length cap") {
+		t.Errorf("expected length-cap error, got: %v", err)
+	}
+
+	// (2) Timing check: under -race the instrumentation overhead makes
+	// even legitimate JSON parsing of a 1 MiB literal slow, so the
+	// timing assertion is meaningful only without -race. We use a
+	// raceEnabled helper if present, otherwise fall back to a
+	// permissive threshold under any mode. The asymptotic improvement
+	// is what matters: without the cap, ParseFloat is O(n²)-ish and
+	// schema-parse averaged 153ms pre-fix; with the cap, the
+	// rejection short-circuits before reaching ParseFloat.
+	// The residual cost is dominated by JSON parsing of the 1 MiB
+	// literal, which is O(n) and unavoidable. The cap saves the
+	// ParseFloat O(n)-with-large-constant cost on top of JSON
+	// parsing — about 30-50ms per MiB on a modern machine. The
+	// threshold is generous because we're not aiming for asymptotic
+	// rejection here (the behavioral check above already pins that
+	// the cap fires); we're just guarding against future regressions
+	// that re-introduce the slow path on top of JSON parse cost.
+	threshold := 250 * time.Millisecond
+	if isRaceEnabled() {
+		threshold = 3 * time.Second // race adds 5-10x to everything; loose bound
+	}
+	_, _ = avro.Parse(schemaJSON) // warm-up
+	const runs = 3
+	var total time.Duration
+	for range runs {
+		start := time.Now()
+		_, _ = avro.Parse(schemaJSON)
+		total += time.Since(start)
+	}
+	avg := total / runs
+	if avg > threshold {
+		t.Errorf("1 MiB hostile double default schema-parse averaged %s — exceeds %s threshold; parseFloatAcceptOverflow length cap missing or wrong", avg, threshold)
+	}
+
+	// Sibling: the float-extras path (record-level Props) hits the
+	// same parser through normalizeJSONNumber. Same shape.
+	extrasJSON := fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}],"x":%s}`, hostile)
+	// Extras parse succeeds (record-level Props don't fail the parse
+	// even when one prop's value can't be normalized — the prop is
+	// retained as json.Number). The behavior we lock here is that the
+	// parse completes — i.e. doesn't hang on a 1 MiB hostile prop.
+	doneCh := make(chan struct{})
+	go func() {
+		_, _ = avro.Parse(extrasJSON)
+		close(doneCh)
+	}()
+	select {
+	case <-doneCh:
+	case <-time.After(threshold * 5): // 5x the per-parse threshold for the sibling probe
+		t.Errorf("hostile extras prop schema-parse hung past %s; normalizeJSONNumber length cap missing", threshold*5)
+	}
+
+	// Boundary-1: a legitimate-sized float default (well under 1024)
+	// must continue to parse cleanly.
+	okJSON := `{"type":"record","name":"R","fields":[{"name":"f","type":"double","default":1.234567890123456e308}]}`
+	if _, err := avro.Parse(okJSON); err != nil {
+		t.Errorf("legitimate float default rejected by length cap: %v", err)
+	}
+}
+
+// isRaceEnabled reports whether the race detector is compiled into
+// this binary. Used to relax wall-clock thresholds when race
+// instrumentation adds ~5-10x overhead.
+func isRaceEnabled() bool {
+	return raceEnabled
+}
+
+// TestRegression_OCFWriterPreservesLogicalTypeInHeader pins that the
+// OCF writer writes the full schema JSON (preserving logicalType,
+// precision, scale, doc, aliases, default) to the avro.schema header,
+// matching Java's DataFileWriter (Schema.toString → writeProps) and
+// fastavro (json.dumps(schema)).
+//
+// Pre-fix, ocf.go's writeHeader used Schema.Canonical() — the Parsing
+// Canonical Form — which the spec defines for fingerprinting only.
+// PCF strips logicalType, precision, scale, doc, aliases, default.
+// Three observable consequences:
+//  1. Downstream consumers relying on the self-describing OCF header
+//     to convey logical-type info got the raw underlying type.
+//  2. ocf.NewReader(..., WithSchemaOpts(CustomType{LogicalType:X}))
+//     silently never matched — the parsed header schema had no
+//     logical type to dispatch on.
+//  3. Schema.Root().Fields[i].Type.Precision on a decoded OCF returned
+//     zero even when the writer specified precision=10.
+//
+// Pattern 12 from BUG_AUDIT.md (encode and decode must agree on the
+// schema's observable contract — here, the metadata layer).
+func TestRegression_OCFWriterPreservesLogicalTypeInHeader(t *testing.T) {
+	// We can't import the ocf package from package avro_test (would
+	// create an import cycle through this test file's package), so
+	// instead we verify the underlying contract: Schema.String()
+	// returns the full JSON with logicalType intact, and the
+	// equivalent re-parse round-trip preserves the logical type.
+	// The OCF-layer test that demonstrates Reader+CustomType
+	// dispatch lives in ocf/ocf_test.go TestWithSchemaOptsCustomType.
+
+	src := `{"type":"record","name":"R","fields":[{"name":"d","type":{"type":"int","logicalType":"date"}}]}`
+	s, err := avro.Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := s.String()
+	if !strings.Contains(full, `"logicalType":"date"`) {
+		t.Errorf("Schema.String() does not preserve logicalType — pre-fix OCF header would have stripped it. Got: %s", full)
+	}
+
+	// Canonical strips logicalType (per PCF spec — intentional).
+	canon := string(s.Canonical())
+	if strings.Contains(canon, "logicalType") {
+		t.Errorf("Canonical() should strip logicalType per PCF [STRIP] rule, but found it. Got: %s", canon)
+	}
+
+	// Decimal with precision/scale: full preserves, canonical strips.
+	dec := `{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}}]}`
+	ds, err := avro.Parse(dec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ds.String(), `"precision":10`) {
+		t.Errorf("Schema.String() does not preserve precision: %s", ds.String())
+	}
+	if !strings.Contains(ds.String(), `"scale":2`) {
+		t.Errorf("Schema.String() does not preserve scale: %s", ds.String())
+	}
+}

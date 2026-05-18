@@ -704,6 +704,34 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 		}
 		return setIface(v, reflect.ValueOf(arr), "array")
 	}
+	// Typed array target ([N]T): decode each JSON element into v.Index(i),
+	// require exactly len(v) elements. Mirrors deserArray.deserFixedArray
+	// on the binary side (deser.go); the JSON encoder accepts the same
+	// target via appendAvroJSON case "array" (json_codec.go), so without
+	// this branch [N]T round-trips bin→JSON but not JSON→JSON.
+	if v.Kind() == reflect.Array {
+		arrLen := v.Len()
+		idx := 0
+		if ctx.scanner.peek() != ']' {
+			for {
+				if idx >= arrLen {
+					return &SemanticError{GoType: v.Type(), AvroType: "array", Err: fmt.Errorf("expected %d elements, got more", arrLen)}
+				}
+				if err := ctx.decodeValue(v.Index(idx), node.items); err != nil {
+					return err
+				}
+				idx++
+				if ctx.scanner.peek() != ',' {
+					break
+				}
+				ctx.scanner.pos++
+			}
+		}
+		if idx != arrLen {
+			return &SemanticError{GoType: v.Type(), AvroType: "array", Err: fmt.Errorf("expected %d elements, got %d", arrLen, idx)}
+		}
+		return ctx.scanner.expect(']')
+	}
 	// Typed slice target.
 	if v.Kind() != reflect.Slice {
 		return semErr(v, "array")

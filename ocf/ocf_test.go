@@ -3125,9 +3125,24 @@ func TestWriterSchema(t *testing.T) {
 	w.Close()
 }
 
+// TestWithSchemaOptsCustomType verifies that [WithSchemaOpts] passes
+// [avro.CustomType] through to the reader-schema parse so the registered
+// callback fires on the matching logical-typed field during Decode.
+//
+// Pre-fix the OCF writer wrote [avro.Schema.Canonical] (PCF) to the
+// header — PCF strips logicalType — so the reader's parsed-from-header
+// schema had no logical type to dispatch on, the CustomType handler
+// never fired, and the built-in date-on-int default kicked in
+// producing an int32 instead of a time.Time. The old assertion
+// `out["d"].(int32)` was tautological: it succeeded whether or not
+// the CustomType fired, because the default behavior absent the
+// logical type was also int32. Post-fix the OCF writer preserves
+// logicalType in the header (matching Java + fastavro), so the
+// CustomType handler actually fires; this test now tracks via a
+// captured bool that Decode was invoked, AND asserts the returned
+// type matches what the handler produced (a string "tag") rather
+// than the default int32 or built-in time.Time.
 func TestWithSchemaOptsCustomType(t *testing.T) {
-	// Register a custom type that converts date logicalType to a raw int32
-	// (suppresses the built-in time.Time conversion).
 	schema := avro.MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"d","type":{"type":"int","logicalType":"date"}}
 	]}`)
@@ -3137,18 +3152,22 @@ func TestWithSchemaOptsCustomType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Write one record.
 	if err := w.Encode(map[string]any{"d": int32(18262)}); err != nil {
 		t.Fatal(err)
 	}
 	w.Close()
 
-	// Read with WithSchemaOpts + CustomType that suppresses logical type.
+	called := false
 	ct := avro.CustomType{
 		LogicalType: "date",
 		AvroType:    "int",
 		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
-			return v, nil // raw int32
+			called = true
+			// Return a value whose Go type differs from the int32
+			// default-decode and the built-in time.Time logical-decode,
+			// so a successful test cannot be satisfied by either of
+			// those fallbacks.
+			return fmt.Sprintf("date-tag-%v", v), nil
 		},
 	}
 	r, err := NewReader(&buf, WithSchemaOpts(ct))
@@ -3159,8 +3178,15 @@ func TestWithSchemaOptsCustomType(t *testing.T) {
 	if err := r.Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := out["d"].(int32); !ok {
-		t.Fatalf("expected int32 (custom type suppressed logical), got %T", out["d"])
+	if !called {
+		t.Fatal("WithSchemaOpts CustomType.Decode was never called — OCF header likely strips logicalType")
+	}
+	got, ok := out["d"].(string)
+	if !ok {
+		t.Fatalf("expected string from custom Decode, got %T(%v)", out["d"], out["d"])
+	}
+	if want := "date-tag-18262"; got != want {
+		t.Fatalf("custom Decode result: got %q, want %q", got, want)
 	}
 }
 

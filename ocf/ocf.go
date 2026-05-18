@@ -178,9 +178,12 @@ func WithMetadata(m map[string][]byte) WriterOpt { return optMetadata{m} }
 func WithSyncMarker(sync [16]byte) WriterOpt { return optSyncMarker{sync} }
 
 // WithSchema overrides the schema JSON written to the file header. By default
-// [avro.Schema.Canonical] is used, which strips non-essential properties like
-// doc strings and aliases. Use this to preserve those properties or to write
-// a custom schema string.
+// [avro.Schema.String] is used (the original JSON passed to [avro.Parse]
+// with all properties preserved — logicalType, precision, scale, doc,
+// aliases, default — matching Java's DataFileWriter and fastavro). Use
+// this only to write a deliberately-different schema text (e.g. the
+// Parsing Canonical Form via [avro.Schema.Canonical] for strict-PCF
+// downstream consumers).
 func WithSchema(schema string) WriterOpt { return optSchema{schema} }
 
 // WithReaderSchema provides the reader schema to resolve the file's writer
@@ -355,7 +358,32 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) 
 }
 
 func (w *Writer) writeHeader() error {
-	schemaBytes := w.schema.Canonical()
+	// Per Avro 1.11.3 spec ("Object Container Files → Header"): the
+	// `avro.schema` metadata entry stores the schema of objects in the
+	// file as JSON data. The spec is unqualified — Java writes
+	// Schema.toString() (full JSON via writeProps, preserving
+	// logicalType/precision/scale/doc/aliases/default; DataFileWriter.java
+	// setMetaInternal) and fastavro writes json.dumps(schema) (full
+	// schema dict; _write_py.py metadata["avro.schema"]).
+	//
+	// Pre-fix this used Schema.Canonical() — the Parsing Canonical Form
+	// — which the spec defines for FINGERPRINTING (SchemaNormalization
+	// section). PCF [STRIP] strips logicalType, precision, scale, doc,
+	// aliases, default, etc. Three observable consequences:
+	//   1. Downstream consumers relying on the self-describing OCF
+	//      header to convey logical-type info got the raw underlying
+	//      type (e.g. "long" instead of "long+timestamp-millis").
+	//   2. ocf.NewReader(..., WithSchemaOpts(CustomType{LogicalType:X}))
+	//      silently never matched, because the parsed header schema
+	//      had no logicalType to dispatch on.
+	//   3. Schema.Root().Fields[i].Type.Precision on a decoded OCF
+	//      returned 0 even when the writer specified precision=10.
+	//
+	// Schema.String() returns Schema.full = the original JSON passed
+	// to Parse, preserving every attribute that Java/fastavro also
+	// preserve. WithSchema override (w.schemaJSON) is honored for
+	// callers who deliberately want a different header schema text.
+	schemaBytes := []byte(w.schema.String())
 	if w.schemaJSON != "" {
 		schemaBytes = []byte(w.schemaJSON)
 	}
