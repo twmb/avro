@@ -433,13 +433,24 @@ func (f *afield) UnmarshalJSON(data []byte) error {
 // liftFieldLogicalIntoType moves a field-level logicalType annotation (with
 // optional precision/scale for the decimal case) into the field's type
 // definition, so the rest of the parser sees the canonical nested form.
-// This is the Java/JDBC Avro idiom, e.g.
+// The form
 //
 //	{"name":"ts","type":"long","logicalType":"timestamp-millis"}
 //	{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}
 //
-// emitted by Confluent's Java codegen, kafka-connect-avro-converter, and
-// Debezium CDC sources. The on-wire encoding is identical to
+// is documented as a common user error in AVRO-2015 / AVRO-3014; Apache
+// Avro's official parser (Schema.java:1871-1877) detects and warns but
+// does not lift, leaving the union bare. fastavro / hamba / linkedin-
+// goavro preserve it as a field property only without applying it to
+// any branch. The form is widely emitted by hand-written .avsc files,
+// older Java tooling, and tutorial code (Confluent's production
+// kafka-connect-avro-converter does NOT emit it — it puts logicalType on
+// the type object, producing canonical nested form). Twmb performs the
+// lift so these in-the-wild schemas round-trip correctly. Wire format
+// is identical (raw long varint); only the parsed schema's Go-type
+// interpretation differs.
+//
+// The on-wire encoding is identical to
 //
 //	{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}
 //	{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}

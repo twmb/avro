@@ -1213,6 +1213,17 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny
 	// offset N" that hid the actual root cause.
 	var lastErr error
 	for _, branch := range node.branches {
+		// Skip null: decodeUnion's upstream isJSONNullStart filter
+		// pre-routes JSON null literals before this loop runs, so any
+		// peek byte reaching here is guaranteed NOT to start a null
+		// token. The skip avoids jsonTokenMatchesBranch's default arm
+		// from matching peek byte 'n' (a bare-special-float start like
+		// "nan") against the null branch — decodeJSONFloat will reject
+		// the lowercase form downstream, but routing through null
+		// first would emit a misleading error. If isJSONNullStart's
+		// accept set ever broadens (e.g. lowercase 'nan' handling
+		// changes), re-verify this skip can't drop a now-reachable
+		// null branch.
 		if branch.kind == "null" {
 			continue
 		}

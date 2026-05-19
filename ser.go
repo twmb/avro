@@ -1688,6 +1688,16 @@ func decimalRatFor(v reflect.Value) (*big.Rat, bool, error) {
 // approach via Double.toString; the user-visible value 0.33 becomes
 // the big.Rat 33/100, which rounds exactly at schema scale 2.
 //
+// Cross-impl: fastavro requires decimal.Decimal, hamba requires *big.Rat,
+// linkedin-goavro requires a textual string — twmb is the only Go impl
+// accepting native float input for the decimal logical type. The float
+// arm bypasses boundedRatFromString's isJSONNumber / magnitude gates:
+// FormatFloat's 'f'-format output is JSON-valid by construction (≤310
+// chars, no hex / underscore / rational forms), and float64's bounded
+// exponent (~±308) keeps the magnitude well under decimalScaleLimit
+// (65536) — so the gates would pass anyway and skipping them avoids the
+// per-call allocation of an intermediate parse.
+//
 // Returns (nil, false, err) when the input was clearly a number form
 // (json.Number, or a reflect.String that parses as a number) but its
 // magnitude exceeds decimalScaleLimit — see boundedRatFromString.
