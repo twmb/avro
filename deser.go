@@ -703,7 +703,16 @@ func boundedRatFromString(s string) (*big.Rat, bool, error) {
 	if i := strings.IndexAny(body, "eE"); i >= 0 {
 		exp, err := strconv.ParseInt(body[i+1:], 10, 64)
 		if err != nil {
-			return nil, false, nil
+			// isJSONNumber already established s IS a JSON-grammar-valid
+			// number with this exponent, so the only way ParseInt fails
+			// here is strconv.ErrRange — the exponent magnitude exceeds
+			// int64. Route through the (nil, false, err) "numeric but
+			// rejected" lane, not the (nil, false, nil) "non-numeric"
+			// lane: the latter is reserved for inputs that the caller
+			// may legitimately fall back to raw-bytes encoding, and a
+			// numeric-looking string with an out-of-range exponent
+			// must not silently re-encode as opaque bytes.
+			return nil, false, fmt.Errorf("decimal exponent %s overflows int64", body[i+1:])
 		}
 		netExp = exp
 		body = body[:i]

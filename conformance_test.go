@@ -15325,6 +15325,232 @@ func TestRegression_NumberGrammarParityMatrix_Decimal(t *testing.T) {
 	}
 }
 
+// TestRegression_Float32DecimalInputUsesSourcePrecision pins that
+// float32-typed inputs to decimal / big-decimal logical types format with
+// the source's natural float32 precision when materializing the big.Rat,
+// not with hardcoded float64 precision. Pre-fix, tryCoerceToRat called
+// strconv.FormatFloat(f, 'f', -1, 64) for every CanFloat input —
+// reflect.Value.Float() widens float32 → float64 losslessly but with up
+// to 53 mantissa bits of IEEE-754 binary noise; bitSize=64 exposed every
+// digit ("0.33000001311302185"), which big.Rat parsed as a fraction with
+// non-terminating-at-the-schema-scale denominator, and ratToUnscaled
+// rejected with "decimal value … cannot be represented at scale 2
+// without rounding". The same call with float64(0.33) succeeded because
+// Go's float64 shortest-decimal is "0.33" → 33/100 → fits scale 2.
+//
+// Java's reference for float-as-decimal is `new BigDecimal(Float.toString(f))`,
+// which uses Float.toString — float32's shortest-decimal — yielding 33/100
+// for 0.33f. twmb's float32 path now matches by formatting at v.Type().Bits()
+// so float32 inputs apply float32's shortest-decimal rule.
+func TestRegression_Float32DecimalInputUsesSourcePrecision(t *testing.T) {
+	// Main bug case: float32(0.33) against scale=2.
+	// Pre-fix: rejected (precision-leak through float64 widening).
+	// Post-fix: accepted (33/100 fits scale 2).
+	// Tested across binary + JSON encode and across bytes-decimal /
+	// fixed-decimal / big-decimal so all five emit sites that converge
+	// on tryCoerceToRat are pinned.
+	t.Run("0.33-accepts-at-scale-2", func(t *testing.T) {
+		schemas := []struct {
+			schemaJSON, name string
+		}{
+			{`{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`, "bytes-decimal"},
+			{`{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":5,"scale":2}`, "fixed-decimal"},
+			{`{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal"},
+		}
+		for _, sj := range schemas {
+			s := avro.MustParse(sj.schemaJSON)
+			if _, err := s.AppendEncode(nil, float32(0.33)); err != nil {
+				t.Errorf("binary float32(0.33) against %s: %v", sj.name, err)
+			}
+			if _, err := s.AppendEncodeJSON(nil, float32(0.33)); err != nil {
+				t.Errorf("JSON float32(0.33) against %s: %v", sj.name, err)
+			}
+		}
+	})
+
+	// Boundary-1: float64(0.33) at scale=2 ACCEPTS (already worked
+	// pre-fix; locked here so the fix doesn't accidentally regress
+	// the float64 path).
+	t.Run("float64-0.33-still-accepts", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`)
+		if _, err := s.AppendEncode(nil, float64(0.33)); err != nil {
+			t.Errorf("binary float64(0.33): %v", err)
+		}
+		if _, err := s.AppendEncodeJSON(nil, float64(0.33)); err != nil {
+			t.Errorf("JSON float64(0.33): %v", err)
+		}
+	})
+
+	// Boundary-1: terminating-binary values like 0.5 accept whether the
+	// source is float32 or float64. Locks the trivial cases.
+	t.Run("terminating-binary-0.5", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`)
+		if _, err := s.AppendEncode(nil, float32(0.5)); err != nil {
+			t.Errorf("float32(0.5): %v", err)
+		}
+		if _, err := s.AppendEncode(nil, float64(0.5)); err != nil {
+			t.Errorf("float64(0.5): %v", err)
+		}
+	})
+
+	// Reject-still-rejects boundary: a value whose float32 shortest-
+	// decimal representation legitimately can't be represented at
+	// scale=2 without rounding (1.0/7.0 → "0.14285715" → 14285715/100000000,
+	// non-zero remainder at scale 2). The fix changes only the precision-
+	// noise-widening case; truly non-terminating values must still
+	// reject so users see the rounding error instead of silent precision
+	// loss. Tested on bytes-decimal where the schema has a fixed scale;
+	// big-decimal derives the scale from the rat and would accept.
+	t.Run("non-terminating-at-scale-2-still-rejects", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+		if _, err := s.AppendEncode(nil, float32(1.0/7.0)); err == nil {
+			t.Errorf("float32(1/7) at scale 2: silently accepted (expected reject for non-terminating)")
+		}
+		if _, err := s.AppendEncode(nil, float64(1.0/7.0)); err == nil {
+			t.Errorf("float64(1/7) at scale 2: silently accepted")
+		}
+	})
+
+	// Round-trip sanity: float32(0.33) encodes and decodes back to the
+	// same float32 value.
+	t.Run("roundtrip-float32-0.33", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`)
+		want := float32(0.33)
+		buf, err := s.AppendEncode(nil, want)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got float32
+		if _, err := s.Decode(buf, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		// big.Rat (33/100) decodes to float64 0.33 → narrowed to
+		// float32 0.33, which equals our `want`.
+		if got != want {
+			t.Errorf("roundtrip: got %g, want %g", got, want)
+		}
+	})
+}
+
+// TestRegression_DecimalExponentOverflowRejectsAcrossArms pins that a
+// numeric string with an exponent magnitude exceeding int64 (e.g.
+// "1e99999999999999999999") routes through the same reject path as the
+// equivalent json.Number input, instead of silently falling through to
+// raw-bytes encoding. Pre-fix, boundedRatFromString returned the
+// (nil, false, nil) "not a number form at all" sentinel when ParseInt
+// failed on the exponent, even though isJSONNumber(s) had already
+// established the input IS a JSON-grammar-valid number. The string arm
+// of tryCoerceToRat treats (nil, false, nil) as "non-numeric → fall
+// through to opaque bytes" per its documented contract — so a
+// numeric-looking-but-exp-overflowing string silently encoded as raw
+// ASCII bytes, while the matching json.Number input rejected.
+//
+// The wire data corruption: input "1e99999999999999999999" (22 ASCII
+// chars) against fixed(22)+decimal encoded as 22 raw bytes [49 101 57
+// 57 …]; round-trip decode interpreted those bytes as a two's-complement
+// unscaled int (3.7e51) at scale 2 — a completely unrelated value from
+// the user's input.
+//
+// Java's BigDecimal(String) rejects "1e99999999999999999999" with
+// NumberFormatException ("Too many nonzero exponent digits") at
+// BigDecimal.java:558. twmb now matches by propagating the ParseInt
+// error through the (nil, false, err) "IS-numeric but rejected" lane,
+// which the string arm propagates to the user.
+func TestRegression_DecimalExponentOverflowRejectsAcrossArms(t *testing.T) {
+	// (input, mustReject) — all should reject; this matrix locks the
+	// shapes so a future regression that loosens any arm immediately
+	// surfaces.
+	overflowInputs := []string{
+		"1e99999999999999999999",   // positive exp overflow
+		"1e-99999999999999999999",  // negative exp overflow
+		"1.5e99999999999999999999", // fractional + exp overflow
+		"-1e99999999999999999999",  // sign + exp overflow
+	}
+	// Boundary-1 (must still accept): in-range exponents whose magnitudes
+	// fit a precision=5, scale=2 schema (so all three schemas accept):
+	//   1.5e1 = 15      → unscaled 1500, 4 digits ≤ precision 5
+	//   1e-2  = 0.01    → unscaled 1, 1 digit
+	//   3.14            → unscaled 314, 3 digits
+	//   -2.5            → unscaled -250, 3 digits
+	acceptInputs := []string{
+		"1.5e1",
+		"1e-2",
+		"3.14",
+		"-2.5",
+	}
+
+	schemas := []struct {
+		schemaJSON, name string
+	}{
+		{`{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`, "bytes-decimal"},
+		// Fixed size 22 ensures inputs of len 22 (the overflow examples)
+		// reach the silent-raw-bytes fall-through. Smaller fixed sizes
+		// would length-mismatch and error for an unrelated reason.
+		{`{"type":"fixed","name":"D","size":22,"logicalType":"decimal","precision":5,"scale":2}`, "fixed-decimal-22byte"},
+		{`{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal"},
+	}
+
+	for _, sj := range schemas {
+		s, err := avro.Parse(sj.schemaJSON)
+		if err != nil {
+			t.Fatalf("parse %s: %v", sj.name, err)
+		}
+		for _, in := range overflowInputs {
+			in := in
+			t.Run(sj.name+"/overflow/"+in, func(t *testing.T) {
+				// fixed-decimal-22byte's serSize-fallthrough is only
+				// reachable when the string's length exactly matches the
+				// fixed size; len("1e99…9")==22 IS the trigger. Other
+				// overflow inputs (24+ chars) length-mismatch the fixed
+				// schema and error out for a different reason — the
+				// silent-raw-bytes fall-through never fires. We still
+				// pin "must reject" for all overflow inputs across all
+				// three schemas: the difference is the error path, not
+				// the accept/reject outcome.
+
+				// Binary string arm — pre-fix silently encoded as raw bytes
+				// for bytes-decimal / big-decimal / fixed-decimal at the
+				// length-matched size.
+				if _, err := s.AppendEncode(nil, in); err == nil {
+					t.Errorf("binary string %q against %s: silently accepted (expected reject)", in, sj.name)
+				}
+				// Binary json.Number arm.
+				if _, err := s.AppendEncode(nil, json.Number(in)); err == nil {
+					t.Errorf("binary json.Number(%q) against %s: silently accepted", in, sj.name)
+				}
+				// JSON encode string arm.
+				if _, err := s.AppendEncodeJSON(nil, in); err == nil {
+					t.Errorf("JSON string %q against %s: silently accepted", in, sj.name)
+				}
+				// JSON encode json.Number arm.
+				if _, err := s.AppendEncodeJSON(nil, json.Number(in)); err == nil {
+					t.Errorf("JSON json.Number(%q) against %s: silently accepted", in, sj.name)
+				}
+			})
+		}
+		for _, in := range acceptInputs {
+			in := in
+			t.Run(sj.name+"/accept/"+in, func(t *testing.T) {
+				// Reject-via-precision schemas don't apply here — these
+				// inputs are chosen to fit precision=5 at scale=2.
+				// big-decimal has no precision limit; all four accept.
+				if _, err := s.AppendEncode(nil, in); err != nil {
+					t.Errorf("binary string %q against %s: rejected (%v); expected accept", in, sj.name, err)
+				}
+				if _, err := s.AppendEncode(nil, json.Number(in)); err != nil {
+					t.Errorf("binary json.Number(%q) against %s: rejected (%v); expected accept", in, sj.name, err)
+				}
+				if _, err := s.AppendEncodeJSON(nil, in); err != nil {
+					t.Errorf("JSON string %q against %s: rejected (%v); expected accept", in, sj.name, err)
+				}
+				if _, err := s.AppendEncodeJSON(nil, json.Number(in)); err != nil {
+					t.Errorf("JSON json.Number(%q) against %s: rejected (%v); expected accept", in, sj.name, err)
+				}
+			})
+		}
+	}
+}
+
 // TestRegression_NumberGrammarParityMatrix_JSONDecode_Long pins the
 // JSON-decode path for "long" against the same grammar matrix. The
 // scanner gates most non-JSON inputs at JSON-syntax parse time, but

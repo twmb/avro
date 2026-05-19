@@ -36,7 +36,7 @@ var errTooDeep = errors.New("avro: recursion limit exceeded (cyclic or pathologi
 // listed there, encoding also accepts:
 //   - [encoding/json.Number] for any numeric Avro type (int, long, float, double)
 //   - RFC 3339 strings for timestamp and date logical types
-//   - [*big.Rat], [big.Rat], float64, [encoding/json.Number], and numeric strings for decimal logical types
+//   - [*big.Rat], [big.Rat], float32, float64, [encoding/json.Number], and numeric strings for decimal logical types
 //   - [encoding.TextAppender], [encoding.TextMarshaler], and []byte for string types (and vice versa for [encoding.TextUnmarshaler])
 //   - string (hex-dash UUID format) for fixed(16) UUID logical types
 //   - Tagged union maps (map[string]any{"typeName": value}) for union types,
@@ -1702,7 +1702,16 @@ func tryCoerceToRat(v reflect.Value) (*big.Rat, bool, error) {
 		}
 		// Float magnitudes are bounded by float64's ~310-digit FormatFloat
 		// output; no decimalScaleLimit guard needed on this arm.
-		if r, ok := new(big.Rat).SetString(strconv.FormatFloat(f, 'f', -1, 64)); ok {
+		//
+		// bitSize=v.Type().Bits() so a float32 input uses float32's
+		// shortest-decimal rule. reflect.Value.Float() widens float32 →
+		// float64 losslessly but the IEEE-754 binary mantissa carries
+		// trailing noise visible at float64 precision (float32(0.33) →
+		// float64(0.33000001311302185)). Formatting at the source's
+		// natural precision avoids parsing that noise into a fraction
+		// with non-terminating-at-the-schema-scale denominator. Mirrors
+		// Java's `new BigDecimal(Float.toString(f))` convention.
+		if r, ok := new(big.Rat).SetString(strconv.FormatFloat(f, 'f', -1, v.Type().Bits())); ok {
 			return r, true, nil
 		}
 		return nil, false, nil
