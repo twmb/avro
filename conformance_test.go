@@ -8022,6 +8022,170 @@ func TestRegression_UUIDFixedDefaultJSONEncode(t *testing.T) {
 	}
 }
 
+// TestRegression_MetadataAPIBytesFixedDefaultRoundTrip pins that
+// Schema.Root().Fields[].Default for bytes/fixed-typed fields materializes
+// as []byte (matching the wire-encode pipeline's internal defaultVal form
+// produced by convertDefaultBytes in schema.go) rather than as the raw
+// JSON codepoint string from unmarshalAnyPreservePrecision. Without this,
+// the natural user pattern
+//
+//	defs := map[string]any{}
+//	for _, f := range s.Root().Fields {
+//		if f.HasDefault { defs[f.Name] = f.Default }
+//	}
+//	s.AppendEncode(nil, defs)
+//
+// succeeds for every bytes/fixed default EXCEPT fixed+uuid, where the
+// encoder's UUID arm (serFixedUUIDReflect / appendAvroJSON case
+// "fixed"/"uuid") hard-fails parseUUID on the 16-codepoint wire-form
+// string. The auto-fill default-fill path (s.AppendEncode(nil, empty-map))
+// works because f.defaultVal has been pre-converted to []byte by
+// convertDefaultBytes; only the metadata-API surface skipped the
+// conversion. coerceMetadataDefault now applies the same conversion so
+// every bytes/fixed default round-trips uniformly.
+//
+// Boundary invariants pinned:
+//   - non-UUID fixed default round-trips (control: was already working).
+//   - UUID-fixed default round-trips (post-fix).
+//   - bytes default round-trips (control).
+//   - decimal-bytes / decimal-fixed / duration / string+uuid defaults
+//     round-trip (controls — they worked pre-fix because their encoder
+//     arms accept the wire form directly).
+//   - Default's Go type is []byte for bytes/fixed (was string pre-fix,
+//     now []byte matching the wire-encode pipeline's defaultVal form).
+func TestRegression_MetadataAPIBytesFixedDefaultRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		schema string
+		// wantDefaultIsBytes asserts root.Fields[0].Default is []byte after
+		// the fix; pre-fix all six produced string and only the bytes /
+		// non-UUID-fixed / decimal / duration / string+uuid cases happened
+		// to round-trip through encode anyway.
+		wantBytes []byte
+	}{
+		{
+			name: "bytes default",
+			schema: "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+				"{\"name\":\"b\",\"type\":\"bytes\",\"default\":\"\\u0001\\u0002\\u0003\"}" +
+				"]}",
+			wantBytes: []byte{0x01, 0x02, 0x03},
+		},
+		{
+			name: "non-uuid fixed default",
+			schema: "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+				"{\"name\":\"f\",\"type\":{\"type\":\"fixed\",\"name\":\"F\",\"size\":4}," +
+				"\"default\":\"\\u0001\\u0002\\u0003\\u0004\"}" +
+				"]}",
+			wantBytes: []byte{0x01, 0x02, 0x03, 0x04},
+		},
+		{
+			name: "uuid fixed default (the broken case pre-fix)",
+			schema: "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+				"{\"name\":\"u\",\"type\":{\"type\":\"fixed\",\"name\":\"U\",\"size\":16,\"logicalType\":\"uuid\"}," +
+				"\"default\":\"\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u000e\\u000f\\u0010\"}" +
+				"]}",
+			wantBytes: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10},
+		},
+		{
+			name: "duration default (fixed 12)",
+			schema: "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+				"{\"name\":\"d\",\"type\":{\"type\":\"fixed\",\"name\":\"D\",\"size\":12,\"logicalType\":\"duration\"}," +
+				"\"default\":\"\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\"}" +
+				"]}",
+			wantBytes: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c},
+		},
+		{
+			name: "decimal bytes default",
+			schema: "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+				"{\"name\":\"d\",\"type\":{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":3,\"scale\":2}," +
+				"\"default\":\"\\u0021\"}" +
+				"]}",
+			wantBytes: []byte{0x21},
+		},
+		{
+			name: "decimal fixed default",
+			schema: "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" +
+				"{\"name\":\"d\",\"type\":{\"type\":\"fixed\",\"name\":\"D\",\"size\":4,\"logicalType\":\"decimal\",\"precision\":9,\"scale\":2}," +
+				"\"default\":\"\\u0000\\u0000\\u0000\\u002a\"}" +
+				"]}",
+			wantBytes: []byte{0x00, 0x00, 0x00, 0x2a},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+
+			root := s.Root()
+			gotDefault := root.Fields[0].Default
+			gotBytes, ok := gotDefault.([]byte)
+			if !ok {
+				t.Fatalf("Root().Fields[0].Default: got %T(%v), want []byte — coerceMetadataDefault must materialize bytes/fixed defaults as []byte so metadata-derived defaults round-trip through the encoder uniformly",
+					gotDefault, gotDefault)
+			}
+			if !bytes.Equal(gotBytes, tc.wantBytes) {
+				t.Errorf("Root().Fields[0].Default: got %x, want %x", gotBytes, tc.wantBytes)
+			}
+
+			// User pattern: build a record from metadata defaults, encode.
+			// Pre-fix this rejected for the UUID case with "invalid UUID";
+			// post-fix it succeeds for every bytes/fixed default uniformly.
+			defs := map[string]any{}
+			for _, f := range root.Fields {
+				if f.HasDefault {
+					defs[f.Name] = f.Default
+				}
+			}
+			if _, err := s.AppendEncode(nil, defs); err != nil {
+				t.Errorf("AppendEncode(metadata-defaults): %v — pre-fix only the UUID-fixed case failed, leaving 5/6 working asymmetrically",
+					err)
+			}
+			if _, err := s.AppendEncodeJSON(nil, defs); err != nil {
+				t.Errorf("AppendEncodeJSON(metadata-defaults): %v", err)
+			}
+
+			// And: the auto-fill path (empty map) must keep producing the
+			// same wire bytes as the metadata-derived encode — same fields,
+			// same defaults, same wire form regardless of which path runs.
+			autoWire, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("AppendEncode auto-fill: %v", err)
+			}
+			derivedWire, err := s.AppendEncode(nil, defs)
+			if err != nil {
+				t.Fatalf("AppendEncode metadata-derived: %v", err)
+			}
+			if !bytes.Equal(autoWire, derivedWire) {
+				t.Errorf("auto-fill wire %x != metadata-derived wire %x — the two paths must agree on the same record's default-fill wire bytes",
+					autoWire, derivedWire)
+			}
+
+			// SchemaNode round-trip: Root() → .Schema() → .Root().Default
+			// must reproduce the same []byte. Without the []byte fixup in
+			// jsonSerializableValue, encoding/json.Marshal base64-encodes
+			// the slice ("AQID" for {0x01,0x02,0x03}), the re-parse reads
+			// those literal ASCII bytes back as the new Default (e.g.
+			// [0x41,0x51,0x49,0x44]) — silent value corruption. For
+			// fixed types the size check also rejects because base64
+			// expands 16 bytes → 24 characters.
+			s2, err := root.Schema()
+			if err != nil {
+				t.Fatalf("Root().Schema(): %v — jsonSerializableValue must convert []byte back to the codepoint string form for bytes/fixed defaults", err)
+			}
+			roundTrip := s2.Root().Fields[0].Default
+			roundTripBytes, ok := roundTrip.([]byte)
+			if !ok {
+				t.Fatalf("round-trip Default: got %T(%v), want []byte", roundTrip, roundTrip)
+			}
+			if !bytes.Equal(roundTripBytes, tc.wantBytes) {
+				t.Errorf("round-trip Default: got %x, want %x — jsonSerializableValue's []byte → codepoint string emit broke the round-trip",
+					roundTripBytes, tc.wantBytes)
+			}
+		})
+	}
+}
+
 // TestRegression_Float32NarrowingPredicateParity locks the 8 sites that
 // share the predicate
 //

@@ -75,7 +75,15 @@ type SchemaField struct {
 	Type SchemaNode // field schema
 
 	// Default is the field's default value, meaningful only when HasDefault
-	// is true. Numbers decode as in [SchemaNode.Props].
+	// is true. Numbers decode as in [SchemaNode.Props]. Bytes and fixed
+	// defaults decode as []byte (the wire form): the JSON schema spec
+	// writes them as code-point-per-byte strings, and Default exposes the
+	// already-mapped raw bytes so the value can be re-encoded directly
+	// (s.AppendEncode(defaultsMap, ...) succeeds for any default,
+	// including fixed+uuid whose encoder arm rejects the codepoint-string
+	// form via strict parseUUID gating). Enum defaults stay as the symbol
+	// string; record/array/map defaults stay as their parsed map/slice
+	// shape with each leaf coerced by these same rules.
 	Default any
 
 	HasDefault bool     // true if a default value is defined in the schema
@@ -146,18 +154,35 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 	return n.toJSONWalk(d.visited, d)
 }
 
-// jsonSerializableValue returns v with any ±Inf float embedded inside
-// (directly or under map[string]any / []any container layers) replaced
-// by a [json.Number] literal that re-parses to the same value via
-// [parseFloatAcceptOverflow] (schema.go) — the inverse of
-// normalizeJSONNumber's ErrRange-with-Inf accept. Required because
-// [encoding/json.Marshal] unconditionally rejects ±Inf and NaN, so a
-// SchemaNode obtained from [Schema.Root] for a schema whose Default /
-// Props normalized an exponent-form overflow to ±Inf cannot otherwise
-// round-trip through [SchemaNode.Schema].
+// jsonSerializableValue returns v with two Avro-JSON-specific shape
+// fixups applied (directly or under map[string]any / []any container
+// layers):
+//
+//  1. ±Inf float → [json.Number]("±1e1000") literal that re-parses to
+//     the same value via [parseFloatAcceptOverflow] (schema.go). The
+//     inverse of normalizeJSONNumber's ErrRange-with-Inf accept.
+//     Required because [encoding/json.Marshal] unconditionally rejects
+//     ±Inf and NaN, so a SchemaNode obtained from [Schema.Root] for a
+//     schema whose Default / Props normalized an exponent-form overflow
+//     to ±Inf cannot otherwise round-trip through [SchemaNode.Schema].
+//
+//  2. []byte → codepoint-per-byte string (each byte 0x00-0xFF becomes
+//     a rune at the same code point). The inverse of
+//     [avroJSONBytesToBytes] / [coerceMetadataDefault]'s bytes/fixed
+//     arm: that arm materializes Default as []byte (the wire form);
+//     re-emitting requires putting it back in the Avro JSON
+//     codepoint-string form (the spec form for bytes/fixed defaults).
+//     Plain [encoding/json.Marshal] would base64-encode the slice
+//     ("AQID" for {0x01,0x02,0x03}) which the Avro parser would then
+//     re-read as raw bytes [0x41,0x51,0x49,0x44] — a silent value
+//     corruption breaking [SchemaNode.Schema] round-trips for any
+//     bytes/fixed default. Programmatically-constructed Props with
+//     []byte values also get the codepoint encoding (Avro's
+//     convention), not Go's base64 default; users who need base64 in
+//     Props should pre-encode to a string.
 //
 // Container values (map[string]any, []any) are deep-copied only when a
-// descendant requires conversion, so the common no-Inf case is
+// descendant requires conversion, so the common no-fixup case is
 // allocation-free and the user's SchemaNode storage is never mutated.
 //
 // NaN is intentionally left untouched: no JSON literal re-parses to NaN,
@@ -166,27 +191,29 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 // themselves (defaultAsFloat accepts the string-form for float/double
 // fields).
 func jsonSerializableValue(v any) any {
-	if !needsInfFixup(v) {
+	if !needsJSONFixup(v) {
 		return v
 	}
-	return convertInfToJSONNumber(v)
+	return applyJSONFixup(v)
 }
 
-func needsInfFixup(v any) bool {
+func needsJSONFixup(v any) bool {
 	switch tv := v.(type) {
 	case float64:
 		return math.IsInf(tv, 0)
 	case float32:
 		return math.IsInf(float64(tv), 0)
+	case []byte:
+		return true
 	case map[string]any:
 		for _, val := range tv {
-			if needsInfFixup(val) {
+			if needsJSONFixup(val) {
 				return true
 			}
 		}
 	case []any:
 		for _, val := range tv {
-			if needsInfFixup(val) {
+			if needsJSONFixup(val) {
 				return true
 			}
 		}
@@ -194,7 +221,7 @@ func needsInfFixup(v any) bool {
 	return false
 }
 
-func convertInfToJSONNumber(v any) any {
+func applyJSONFixup(v any) any {
 	switch tv := v.(type) {
 	case float64:
 		if math.IsInf(tv, 1) {
@@ -212,16 +239,18 @@ func convertInfToJSONNumber(v any) any {
 			return json.Number("-1e1000")
 		}
 		return tv
+	case []byte:
+		return bytesToAvroJSONString(tv)
 	case map[string]any:
 		out := make(map[string]any, len(tv))
 		for k, val := range tv {
-			out[k] = convertInfToJSONNumber(val)
+			out[k] = applyJSONFixup(val)
 		}
 		return out
 	case []any:
 		out := make([]any, len(tv))
 		for i, val := range tv {
-			out[i] = convertInfToJSONNumber(val)
+			out[i] = applyJSONFixup(val)
 		}
 		return out
 	}
@@ -520,17 +549,29 @@ func lookupCI(m map[string]any, key string) (any, bool) {
 // the wire bytes rather than the raw JSON form
 // unmarshalAnyPreservePrecision returns.
 //
-// Currently coerces string defaults to float64 for float/double fields,
-// walking unions (Avro 1.12: union default may match any branch) and
-// nested record/array/map types. Java's Schema.parseField
-// (Schema.java:1899-1902) eagerly Jackson-coerces text defaults to
-// DoubleNode at parse so Field.defaultVal() returns numeric; fastavro
-// keeps raw Python strings (footgun). twmb sides with Java's typed-
-// materialization per the "String-form float defaults" intentional-
-// divergence entry's promise.
+// Currently:
+//   - string defaults for float/double fields → float64 (Java's
+//     Schema.parseField text→DoubleNode coercion at Schema.java:1899-1902).
+//   - string defaults for bytes/fixed fields → []byte via Avro's
+//     codepoint-per-byte mapping (mirrors [convertDefaultBytes] in
+//     schema.go, which produces the same []byte for the wire-encode
+//     pipeline's internal defaultVal). Without this conversion, a
+//     metadata-API consumer doing
+//     `defs[f.Name] = f.Default; s.Encode(defs)` succeeds for every
+//     bytes/fixed default EXCEPT fixed+uuid (the encoder's UUID arm
+//     hard-fails parseUUID on the 16-codepoint wire-form string), and
+//     the round-trip contract breaks asymmetrically. Converting to
+//     []byte here brings every bytes/fixed default into a form the
+//     encoder accepts uniformly (raw bytes via serSize/serBytes /
+//     the JSON fixed/string-slice/array arm).
 //
-// Non-string defaults and non-float/double/union/container types pass
-// through unchanged.
+// Walks unions (Avro 1.12: union default may match any branch) and
+// nested record/array/map types. fastavro keeps raw Python strings
+// (footgun); twmb sides with Java's typed-materialization per the
+// "String-form float defaults" intentional-divergence entry's promise.
+//
+// Non-string defaults and non-float/double/bytes/fixed/union/container
+// types pass through unchanged.
 func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode) any {
 	if t == nil {
 		return val
@@ -575,6 +616,14 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 			}
 			if f, err := defaultAsFloat(s, bitSize); err == nil {
 				return f
+			}
+		}
+		return val
+	}
+	if t.Type == "bytes" || t.Type == "fixed" {
+		if s, ok := val.(string); ok {
+			if b, err := avroJSONBytesToBytes(s); err == nil {
+				return b
 			}
 		}
 		return val

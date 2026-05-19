@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"math/big"
@@ -2823,3 +2824,83 @@ func TestEncodeJSONStringBytesEnumCoverage(t *testing.T) {
 		t.Error("expected error")
 	}
 }
+
+// TestRegression_BytesToAvroJSONStringCodepointPerByte pins that
+// [bytesToAvroJSONString] emits each byte 0x00-0xFF as a separate
+// Unicode codepoint (not as a UTF-8-interpreted multi-byte sequence).
+// `string(b)` is NOT equivalent: it reinterprets the byte slice as a
+// UTF-8 string, which (a) collapses adjacent bytes that form a valid
+// UTF-8 sequence into a single codepoint (bytes c3 a9 → 1 codepoint
+// U+00E9 instead of 2 codepoints U+00C3 + U+00A9), and (b) maps
+// invalid UTF-8 bytes (0xFF, isolated 0x80-0xBF, etc.) to U+FFFD
+// which avroJSONBytesToBytes then rejects as out-of-range. The Avro
+// JSON spec mandates "code points 0-255 encoded as ASCII or escape
+// sequences" — one byte per codepoint.
+//
+// Round-trip invariant: [avroJSONBytesToBytes] of
+// [bytesToAvroJSONString] of b must equal b for every []byte. The
+// inverse pair is what makes [SchemaField.Default] = []byte for
+// bytes/fixed defaults round-trip through [SchemaNode.Schema]; the
+// naive string(b) path (or [encoding/json.Marshal]'s default base64)
+// breaks the round-trip for any default containing a byte ≥ 0x80.
+func TestRegression_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []byte
+	}{
+		{"ascii", []byte{0x41, 0x42}},
+		{"single high-bit byte", []byte{0xFF}},
+		{"two-byte UTF-8 looking pair", []byte{0xC3, 0xA9}}, // string([]byte) collapses to "é"
+		{"isolated invalid UTF-8", []byte{0x00, 0xE9}},      // string([]byte) maps E9 to U+FFFD
+		{"all 256 byte values", func() []byte {
+			b := make([]byte, 256)
+			for i := range b {
+				b[i] = byte(i)
+			}
+			return b
+		}()},
+		{"empty", []byte{}},
+		{"nil", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded := bytesToAvroJSONString(tc.in)
+			decoded, err := avroJSONBytesToBytes(encoded)
+			if err != nil {
+				t.Fatalf("avroJSONBytesToBytes(bytesToAvroJSONString(%x)): %v", tc.in, err)
+			}
+			if !bytes.Equal(decoded, tc.in) {
+				t.Errorf("round-trip mismatch: bytesToAvroJSONString(%x) → %q → avroJSONBytesToBytes → %x",
+					tc.in, encoded, decoded)
+			}
+			// One codepoint per input byte — the property string([]byte)
+			// violates whenever the slice contains bytes ≥ 0x80.
+			runeCount := 0
+			for range encoded {
+				runeCount++
+			}
+			if runeCount != len(tc.in) {
+				t.Errorf("rune count: got %d, want %d (each input byte must become one codepoint)",
+					runeCount, len(tc.in))
+			}
+		})
+	}
+
+	// Direct demonstration that string(b) does NOT satisfy the contract:
+	// bytes c3 a9 (which happen to spell U+00E9 in UTF-8) collapse to
+	// the single rune 'é' under string([]byte), then avroJSONBytesToBytes
+	// maps that one rune back to a single byte 0xE9 — losing the original
+	// 2-byte input. This locks "don't use string(b) as a shortcut" in
+	// case a future refactor is tempted to simplify the helper.
+	t.Run("string([]byte) breaks the round-trip on high-bit bytes", func(t *testing.T) {
+		in := []byte{0xC3, 0xA9}
+		naive := string(in)
+		naiveDecoded, _ := avroJSONBytesToBytes(naive)
+		if bytes.Equal(naiveDecoded, in) {
+			t.Errorf("string([]byte) unexpectedly preserved round-trip — this test was meant to prove it doesn't")
+		}
+		if len(naiveDecoded) != 1 || naiveDecoded[0] != 0xE9 {
+			t.Errorf("naive shortcut produced %x; documented behavior is E9 (the single codepoint U+00E9 = bytes c3 a9 interpreted as UTF-8)", naiveDecoded)
+		}
+	})
+}
+

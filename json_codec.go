@@ -1050,7 +1050,8 @@ func appendJSONString(buf []byte, s string) []byte {
 }
 
 // avroJSONBytesToBytes decodes an Avro JSON bytes string (\uXXXX per byte)
-// to raw bytes.
+// to raw bytes. Inverse pair with [bytesToAvroJSONString]: round-trip
+// `avroJSONBytesToBytes(bytesToAvroJSONString(b)) == b` for every []byte.
 func avroJSONBytesToBytes(s string) ([]byte, error) {
 	// The string from json.Unmarshal has already decoded \uXXXX escapes
 	// to Unicode code points. Each code point 0-255 maps to a byte.
@@ -1062,6 +1063,36 @@ func avroJSONBytesToBytes(s string) ([]byte, error) {
 		b = append(b, byte(r))
 	}
 	return b, nil
+}
+
+// bytesToAvroJSONString encodes raw bytes into the Avro JSON bytes
+// codepoint-string form: each byte 0x00-0xFF becomes a rune at the same
+// codepoint (a 1-byte UTF-8 sequence for 0x00-0x7F, a 2-byte sequence
+// for 0x80-0xFF). The Go string this returns serializes via
+// [encoding/json.Marshal] as either `\uXXXX` (for control chars) or the
+// literal UTF-8 bytes (for printable codepoints) — both forms re-parse
+// back to the original codepoint, which [avroJSONBytesToBytes] then
+// maps back to the original byte.
+//
+// Inverse pair with [avroJSONBytesToBytes]: round-trip
+// `avroJSONBytesToBytes(bytesToAvroJSONString(b)) == b` for every []byte.
+// Used by [jsonSerializableValue] (schema_node.go) to re-emit []byte
+// SchemaField.Default / SchemaNode.Props values in the Avro JSON spec's
+// codepoint form instead of [encoding/json.Marshal]'s default base64
+// encoding (which the Avro parser would silently re-read as the literal
+// ASCII bytes of the base64 alphabet).
+func bytesToAvroJSONString(b []byte) string {
+	// strings.Builder.WriteRune calls utf8.EncodeRune internally and
+	// uses unsafe to return the underlying buffer as a string without
+	// a final copy. Grow(len(b)) is the all-ASCII lower bound; bytes
+	// ≥ 0x80 take 2 UTF-8 bytes, so the worst-case output is 2*len(b)
+	// — append's geometric growth absorbs that with at most one realloc.
+	var sb strings.Builder
+	sb.Grow(len(b))
+	for _, v := range b {
+		sb.WriteRune(rune(v))
+	}
+	return sb.String()
 }
 
 // appendJSONFloat formats a float for JSON output, handling special values.
