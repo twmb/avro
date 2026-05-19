@@ -609,7 +609,7 @@ func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *opt
 // returns `_, ok := m[k]`; for the generic Map path, it returns
 // `v.MapIndex(typedKey).IsValid()`. Keeping the probe abstract lets the
 // helper drive both paths and ensures encode-side alias-resolution
-// stays symmetric with decode (F6 fix).
+// stays symmetric with decode.
 func chooseFieldKey(f *fieldNode, nodeName string, hasKey func(key string) bool) (foundKey string, exists bool, err error) {
 	canonOK := hasKey(f.name)
 	aliasFound := ""
@@ -947,9 +947,8 @@ func findUnionBranch(union *schemaNode, name string) *schemaNode {
 // parseSpecialFloat parses NaN/Infinity string forms. Accepts the
 // Java/fastavro set {"NaN", "Infinity", "INF", "-Infinity", "-INF"}
 // plus Go-strconv-style "Inf"/"-Inf". Java/fastavro/goavro all reject
-// lowercase; the lowercase 'n' previously hijacked the JSON null
-// literal in the union dispatcher (F1 finding) so case-strict matters
-// here. The goavro null→NaN and ±1e999→±Inf conventions are handled
+// lowercase; the lowercase 'n' would collide with the JSON null
+// literal in the union dispatcher, so case-strict matters here. The goavro null→NaN and ±1e999→±Inf conventions are handled
 // separately by the bare-token/number paths in decodeJSONFloat.
 func parseSpecialFloat(s string) (float64, error) {
 	switch s {

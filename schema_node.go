@@ -134,7 +134,9 @@ func (s *Schema) Root() SchemaNode {
 	if err != nil {
 		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
 	}
-	return nodeFromJSON(raw)
+	n := nodeFromJSON(raw)
+	fixupNameRefDefaults(&n)
+	return n
 }
 
 // toJSONDedup is like toJSON but deduplicates named types. The first
@@ -529,9 +531,18 @@ func lookupCI(m map[string]any, key string) (any, bool) {
 //
 // Non-string defaults and non-float/double/union/container types pass
 // through unchanged.
-func coerceMetadataDefault(val any, t *SchemaNode) any {
+func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode) any {
 	if t == nil {
 		return val
+	}
+	// Name-ref resolution: when the caller passes a non-nil name-table
+	// and t.Type is a bare name-reference (e.g. "Inner"), resolve to
+	// the actual named SchemaNode and recurse. table == nil means the
+	// caller is doing best-effort inline coercion only — used by the
+	// synchronous call during nodeFromJSON construction where the full
+	// tree (and therefore the name-table) isn't available yet.
+	if resolved := lookupNameRef(t, table); resolved != nil {
+		return coerceMetadataDefault(val, resolved, table)
 	}
 	if t.Type == "union" {
 		// Pick the FIRST branch that accepts val's Go type — matches
@@ -543,8 +554,12 @@ func coerceMetadataDefault(val any, t *SchemaNode) any {
 		// wire picks string (first accept), but a transform-based
 		// helper would pick float because string→string is a no-op.
 		for i := range t.Branches {
-			if branchAcceptsDefault(&t.Branches[i], val) {
-				return coerceMetadataDefault(val, &t.Branches[i])
+			branch := &t.Branches[i]
+			if resolved := lookupNameRef(branch, table); resolved != nil {
+				branch = resolved
+			}
+			if branchAcceptsDefault(branch, val, table) {
+				return coerceMetadataDefault(val, branch, table)
 			}
 		}
 		return val
@@ -571,7 +586,7 @@ func coerceMetadataDefault(val any, t *SchemaNode) any {
 				inner := v
 				for i := range t.Fields {
 					if t.Fields[i].Name == k {
-						inner = coerceMetadataDefault(v, &t.Fields[i].Type)
+						inner = coerceMetadataDefault(v, &t.Fields[i].Type, table)
 						break
 					}
 				}
@@ -585,7 +600,7 @@ func coerceMetadataDefault(val any, t *SchemaNode) any {
 		if a, ok := val.([]any); ok {
 			out := make([]any, len(a))
 			for i, v := range a {
-				out[i] = coerceMetadataDefault(v, t.Items)
+				out[i] = coerceMetadataDefault(v, t.Items, table)
 			}
 			return out
 		}
@@ -595,13 +610,96 @@ func coerceMetadataDefault(val any, t *SchemaNode) any {
 		if m, ok := val.(map[string]any); ok {
 			out := make(map[string]any, len(m))
 			for k, v := range m {
-				out[k] = coerceMetadataDefault(v, t.Values)
+				out[k] = coerceMetadataDefault(v, t.Values, table)
 			}
 			return out
 		}
 		return val
 	}
 	return val
+}
+
+// lookupNameRef returns the named target of t if t.Type is a bare
+// name-reference (not a structural or primitive kind) AND table has it,
+// else nil. A nil table always returns nil (synchronous-build callers
+// disable name-ref resolution because the tree isn't fully walked yet).
+func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode) *SchemaNode {
+	if t == nil || table == nil {
+		return nil
+	}
+	switch t.Type {
+	case "null", "boolean", "int", "long", "float", "double",
+		"bytes", "string", "record", "enum", "fixed", "array", "map", "union":
+		return nil
+	}
+	return table[t.Type]
+}
+
+// fixupNameRefDefaults walks the SchemaNode tree once to populate a
+// name-table of every reachable record/enum/fixed, then re-coerces
+// HasDefault fields with the table so name-referenced defaults (and
+// defaults whose union contains a name-ref branch) materialize the
+// way inline-typed siblings already do via the synchronous coerce.
+func fixupNameRefDefaults(root *SchemaNode) {
+	table := map[string]*SchemaNode{}
+	collectNamedTypes(root, "", table)
+	if len(table) == 0 {
+		return
+	}
+	coerceTreeDefaults(root, table)
+}
+
+func collectNamedTypes(n *SchemaNode, parentNS string, table map[string]*SchemaNode) {
+	if n == nil {
+		return
+	}
+	if n.Name != "" { // record / enum / fixed
+		ns := n.Namespace
+		if ns == "" {
+			ns = parentNS
+		}
+		full := n.Name
+		if ns != "" {
+			full = ns + "." + n.Name
+		}
+		table[full] = n
+		table[n.Name] = n // unqualified fallback, matches schema-build lookup
+		parentNS = ns
+	}
+	if n.Items != nil {
+		collectNamedTypes(n.Items, parentNS, table)
+	}
+	if n.Values != nil {
+		collectNamedTypes(n.Values, parentNS, table)
+	}
+	for i := range n.Fields {
+		collectNamedTypes(&n.Fields[i].Type, parentNS, table)
+	}
+	for i := range n.Branches {
+		collectNamedTypes(&n.Branches[i], parentNS, table)
+	}
+}
+
+func coerceTreeDefaults(n *SchemaNode, table map[string]*SchemaNode) {
+	if n == nil {
+		return
+	}
+	for i := range n.Fields {
+		f := &n.Fields[i]
+		if f.HasDefault {
+			f.Default = coerceMetadataDefault(f.Default, &f.Type, table)
+		}
+		coerceTreeDefaults(&f.Type, table)
+	}
+	if n.Items != nil {
+		coerceTreeDefaults(n.Items, table)
+	}
+	if n.Values != nil {
+		coerceTreeDefaults(n.Values, table)
+	}
+	for i := range n.Branches {
+		coerceTreeDefaults(&n.Branches[i], table)
+	}
 }
 
 // branchAcceptsDefault reports whether the Avro type t natively accepts
@@ -615,7 +713,11 @@ func coerceMetadataDefault(val any, t *SchemaNode) any {
 // "String-form float defaults" intentional divergence). bytes/fixed
 // branch accepts string (codepoint-mapped form per Avro JSON spec) or
 // []byte. int/long branch accepts integer + numeric-float Go types.
-func branchAcceptsDefault(t *SchemaNode, val any) bool {
+func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) bool {
+	// Resolve a bare name-reference if the caller supplied a name-table.
+	if resolved := lookupNameRef(t, table); resolved != nil {
+		return branchAcceptsDefault(resolved, val, table)
+	}
 	switch t.Type {
 	case "null":
 		return val == nil
@@ -654,7 +756,7 @@ func branchAcceptsDefault(t *SchemaNode, val any) bool {
 		return ok
 	case "union":
 		for i := range t.Branches {
-			if branchAcceptsDefault(&t.Branches[i], val) {
+			if branchAcceptsDefault(&t.Branches[i], val, table) {
 				return true
 			}
 		}
@@ -713,8 +815,13 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 					// Schema.parseField text→DoubleNode coercion and
 					// the wire-encode pipeline's coerceDefault — so
 					// SchemaField.Default reflects the materialized
-					// wire form instead of the raw JSON string. F11.
-					sf.Default = coerceMetadataDefault(d, &sf.Type)
+					// wire form instead of the raw JSON string.
+					// nil name-table: best-effort inline coercion only;
+					// fixupNameRefDefaults (called at the end of Root)
+					// re-coerces with a populated table to resolve
+					// name-references that aren't visible during this
+					// per-field construction.
+					sf.Default = coerceMetadataDefault(d, &sf.Type, nil)
 					sf.HasDefault = true
 				}
 				getCIString(fm, "doc", &sf.Doc)

@@ -12210,11 +12210,11 @@ func TestRegression_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 // through tryUnwrapTagged → case "null"). The bare-value form here goes
 // through unionTypeNameForValue (which returns "" for Map/Slice except
 // []byte) → try-each, which is exactly where the null-skip blocked the
-// dispatch. Pattern 14a partial-fix sibling: commit 2995c67 brought the
-// binary serNull's peel into matching shape with isNilValue, but the JSON
-// dispatcher's try-each was not updated; the bug hid because every
-// existing parity test passed the typed-nil through the tagged form, not
-// the bare form.
+// dispatch. Pattern 14a partial-fix sibling: bringing the binary
+// serNull's peel into matching shape with isNilValue without also
+// updating the JSON dispatcher's try-each hides the bug, because every
+// existing parity test passes the typed-nil through the tagged form,
+// not the bare form.
 func TestRegression_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -12340,14 +12340,13 @@ func TestRegression_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 // (appendAvroJSONUnion), and JSON tagged-form (decodeUnionObject) —
 // now agree on the nil-equivalence semantic.
 //
-// Pattern 14a — partial fix sibling. The prior round's working-tree
-// fix removed `if branch.kind == "null" continue` from
-// appendAvroJSONUnion's try-each loop, but type-name dispatch fired
-// before try-each ever ran for nil Slice<uint8>. Special-casing
-// len==2 (the audit's first proposal) would have papered over the
-// JSON↔binary gap while preserving the binary 2-branch↔3-branch
-// inconsistency. The general "nil → null when null branch present"
-// rule resolves both.
+// Pattern 14a — partial fix sibling. Removing
+// `if branch.kind == "null" continue` from appendAvroJSONUnion's
+// try-each loop alone does not suffice: type-name dispatch fires
+// before try-each runs for nil Slice<uint8>. Special-casing len==2
+// would paper over the JSON↔binary gap while preserving the binary
+// 2-branch↔3-branch inconsistency. The general "nil → null when null
+// branch present" rule resolves both.
 func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -12478,13 +12477,12 @@ func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
 // the JSON try-each both reached the case "null" arm that DID accept
 // Chan/Func nil.
 //
-// Pattern 14a — partial fix for helper coverage. Commit 4efe6c6
-// added the Interface peel to serNull; commit 2995c67 extended it to
-// Pointer to match isNilValue's docstring. Neither broadened
-// isNilValue's terminal switch to match serNull's full kind set.
-// The fix extends isNilValue's terminal switch to include
-// reflect.Chan and reflect.Func; isNilValue's accept set now matches
-// serNull's exactly.
+// Pattern 14a — partial fix for helper coverage. Adding the Interface
+// peel and then the Pointer peel to serNull (to match isNilValue's
+// docstring) without broadening isNilValue's terminal switch leaves
+// the helper's accept set narrower than serNull's. isNilValue's
+// terminal switch must include reflect.Chan and reflect.Func so its
+// accept set matches serNull's exactly.
 func TestRegression_EncodeNullParity2BranchNilChanFunc(t *testing.T) {
 	cases := []struct {
 		name    string

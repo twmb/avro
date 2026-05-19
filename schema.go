@@ -251,6 +251,15 @@ func (s aschema) MarshalJSON() ([]byte, error) {
 }
 
 func (s *aschema) UnmarshalJSON(data []byte) error {
+	// Reset state on every call. encoding/json invokes UnmarshalJSON
+	// once PER duplicate key at the same level (e.g. {"tYpe":"int",
+	// "tYpe":[]} ends up calling this twice on the same *aschema). The
+	// last-wins contract requires the later call to fully replace the
+	// earlier state, not merge into it — without this reset a string
+	// primitive then a union would leave both s.primitive AND s.union
+	// populated, and build()'s primitive-priority dispatch would diverge
+	// from Root()'s map-decode last-wins.
+	*s = aschema{}
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 {
 		return errors.New("invalid empty schema")
@@ -259,26 +268,23 @@ func (s *aschema) UnmarshalJSON(data []byte) error {
 	case '"':
 		return json.Unmarshal(data, &s.primitive)
 	case '{':
-		// Round-trip through map[string]RawMessage to normalize duplicate
-		// keys (JSON allows them, encoding/json is "last wins" for map
-		// decode but struct-decode ordering can diverge). After this,
-		// the struct decode and any subsequent map-based re-parse see
-		// identical keys.
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(data, &raw); err != nil {
-			return err
-		}
-		normalized, err := json.Marshal(raw)
-		if err != nil {
-			return err
-		}
-		if err := json.Unmarshal(normalized, &s.object); err != nil {
+		// Decode directly into the struct. encoding/json struct decode
+		// and map decode are both documented and implemented as
+		// last-wins for duplicate keys in modern Go, matching Java's
+		// Jackson and Python's json — no re-Marshal-for-dedup needed.
+		// Avoiding the re-Marshal is what makes Parse cost O(n) over
+		// the schema bytes instead of O(n²) over nested schema depth.
+		if err := json.Unmarshal(data, &s.object); err != nil {
 			return err
 		}
 		// Capture extra properties not in the struct tags.
 		// encoding/json matches struct field names case-insensitively,
 		// so keys like "tYpe" parse into Type and should not also land
 		// in extras.
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return err
+		}
 		for k := range raw {
 			if schemaReservedKeyCI(k) {
 				continue
@@ -346,18 +352,8 @@ var afieldComplexKeys = map[string]string{
 }
 
 func (f *afield) UnmarshalJSON(data []byte) error {
-	// Round-trip through map[string]RawMessage to normalize duplicate
-	// keys. See aschema.UnmarshalJSON for the rationale.
-	var dedupRaw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &dedupRaw); err != nil {
-		return err
-	}
-	normalized, err := json.Marshal(dedupRaw)
-	if err != nil {
-		return err
-	}
-	data = normalized
-	// Standard unmarshal into a type alias to avoid recursion.
+	// Direct struct decode — last-wins for duplicate keys. See
+	// aschema.UnmarshalJSON for the rationale.
 	type plain afield
 	if err := json.Unmarshal(data, (*plain)(f)); err != nil {
 		return err
@@ -766,6 +762,36 @@ type recordFieldFixup struct {
 	hasDefault bool // whether the field had a "default" in the schema
 }
 
+// containerFixup patches an array or map container whose element type
+// (items / values) was a forward reference. Used by both case "array"
+// and case "map" in buildComplex so the two contexts share one fixup
+// path; the only per-container variation is the min-bytes computation,
+// which a closure carries.
+type containerFixup struct {
+	serItem    *serfn       // address of serArray.serItem / serMap.serItem
+	deserItem  *deserfn     // address of deserArray.deserItem / deserMap.deserItem
+	setMinBytes func(int)   // setter for minItemBytes (array) or 1+min (map)
+	nodeChild  **schemaNode // address of arrayNode.items / mapNode.values
+	name       string       // referenced named-type name
+	ctxLabel   string       // "array" or "map" for error messages
+}
+
+// captureFwdRef is the shared boilerplate used by every site that might
+// encounter a forward reference inside a nested build (record field,
+// array items, map values). On success it returns (false, "", nil). On
+// an unknownPrimitiveError it returns (true, name, nil) so the caller
+// can queue a fixup. On any other error it wraps with ctxLabel and
+// returns (false, "", err).
+func captureFwdRef(err error, ctxLabel string) (isFwdRef bool, fwdName string, wrapped error) {
+	if err == nil {
+		return false, "", nil
+	}
+	if pe := (*unknownPrimitiveError)(nil); errors.As(err, &pe) {
+		return true, pe.p, nil
+	}
+	return false, "", fmt.Errorf("invalid %s: %v", ctxLabel, err)
+}
+
 // namedType holds the compiled artifacts for a named Avro type (record,
 // enum, fixed) so they can be looked up by name during schema building.
 type namedType struct {
@@ -787,11 +813,12 @@ type builder struct {
 	ser   serfn
 	deser deserfn
 
-	named       map[string]*namedType
-	missing     []unionMissing
-	dmissing    []unionMissingDeser
-	mfixups     []metaFixup
-	fieldFixups []recordFieldFixup
+	named           map[string]*namedType
+	missing         []unionMissing
+	dmissing        []unionMissingDeser
+	mfixups         []metaFixup
+	fieldFixups     []recordFieldFixup
+	containerFixups []containerFixup
 
 	meta             fieldMeta
 	canon            aschema
@@ -850,6 +877,7 @@ func (b *builder) unnest(nest *builder) {
 	b.dmissing = append(b.dmissing, nest.dmissing...)
 	b.mfixups = append(b.mfixups, nest.mfixups...)
 	b.fieldFixups = append(b.fieldFixups, nest.fieldFixups...)
+	b.containerFixups = append(b.containerFixups, nest.containerFixups...)
 	// Merge custom type overlay maps from nested builders.
 	if len(nest.customEncodes) > 0 {
 		if b.customEncodes == nil {
@@ -1030,6 +1058,16 @@ func (b *builder) finalize() error {
 			m.sr.fields[m.idx].defaultBytes = defaultBytes
 			m.sr.fields[m.idx].hasDefault = true
 		}
+	}
+	for _, m := range b.containerFixups {
+		nt := b.named[m.name]
+		if nt == nil {
+			return fmt.Errorf("%s references unknown named type %q", m.ctxLabel, m.name)
+		}
+		*m.serItem = nt.ser
+		*m.deserItem = nt.deser
+		m.setMinBytes(schemaMinBytes(nt.node))
+		*m.nodeChild = nt.node
 	}
 	return nil
 }
@@ -1435,16 +1473,19 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 
 	for i, us := range s.union {
 		u := b.nest()
-		if err := u.build(parentName, &us); err != nil {
-			pe := (*unknownPrimitiveError)(nil)
-			if !errors.As(err, &pe) {
-				return fmt.Errorf("invalid union: %w", err)
-			}
-			// pe.p is the unresolved name from either the bare-string
-			// form (where us.primitive is set) or the wrapped form
-			// {"type":"FwdName"} (where us.object.Type is set); the
-			// error normalizes both into pe.p.
-			missing[i] = pe.p
+		// captureFwdRef converts an unknownPrimitiveError into a
+		// (true, name) signal so we can queue a missing-branch fixup
+		// for finalize(); any other error is wrapped with the "union"
+		// context label. pe.p inside captureFwdRef carries the
+		// unresolved name from either the bare-string form (where
+		// us.primitive is set) or the wrapped form {"type":"FwdName"}
+		// (where us.object.Type is set).
+		isFwdRef, fwdName, err := captureFwdRef(u.build(parentName, &us), "union")
+		if err != nil {
+			return err
+		}
+		if isFwdRef {
+			missing[i] = fwdName
 		}
 		b.unnest(u)
 		branchMetas[i] = u.meta
@@ -1874,21 +1915,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				return fmt.Errorf("invalid field order %q for field %q", of.Order, of.Name)
 			}
 			bf := b.nest()
-			isFwdRef := false
-			fwdRefName := ""
-			if err := bf.build(o.Name, of.Type); err != nil {
-				// An unknownPrimitiveError signals a not-yet-declared
-				// named type — treat as a forward reference to be
-				// resolved in finalize(). The error's `p` field carries
-				// the name from either the bare-string form (where
-				// of.Type.primitive is set) or the wrapped form
-				// {"type":"FwdName"} (where of.Type.object.Type is set).
-				if pe := (*unknownPrimitiveError)(nil); errors.As(err, &pe) {
-					isFwdRef = true
-					fwdRefName = pe.p
-				} else {
-					return fmt.Errorf("invalid record field: %v", err)
-				}
+			// captureFwdRef converts unknownPrimitiveError from a nested
+			// build into an "isFwdRef" signal so the caller can queue a
+			// fixup in finalize(); other errors are wrapped with the
+			// "record field" context label. Shared with array/map sites
+			// so all three contexts handle fwd-refs uniformly.
+			isFwdRef, fwdRefName, err := captureFwdRef(bf.build(o.Name, of.Type), "record field")
+			if err != nil {
+				return err
 			}
 			b.unnest(bf)
 			if isFwdRef {
@@ -2068,20 +2102,25 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			return errors.New("array is missing items schema")
 		}
 		af := b.nest()
-		if err := af.build(parentName, o.Items); err != nil {
-			return fmt.Errorf("invalid array: %v", err)
+		isFwdRef, fwdRefName, err := captureFwdRef(af.build(parentName, o.Items), "array")
+		if err != nil {
+			return err
 		}
 		b.unnest(af)
+		if isFwdRef {
+			af.canon = aschema{primitive: fwdRefName}
+		}
 		o.Items = &af.canon
 		sa := &serArray{serItem: af.ser}
 		da := &deserArray{deserItem: af.deser, minItemBytes: schemaMinBytes(af.node)}
 		// Specialized array ser/deser fast paths bypass the inner
 		// schema's wrapped ser/deser functions. They are correct only
 		// when no per-element conversion is needed: no custom type,
-		// and no logical type (logical-typed inners route through
-		// serTimestampMillis / deserTimeMicros / serUUID / etc., which
-		// the primitive-only specialization can't see).
-		if af.meta.hasCustomType || af.meta.logical != "" {
+		// no logical type, AND no forward reference (the inner ser/
+		// deser aren't wired until finalize() resolves the fwd-ref,
+		// so the fast-path closure would capture nil fns at build
+		// time).
+		if isFwdRef || af.meta.hasCustomType || af.meta.logical != "" {
 			b.ser = sa.ser
 		} else if info, ok := primFast[af.canon.primitive]; ok {
 			b.ser = info.serArrayFn(sa)
@@ -2096,11 +2135,26 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		*inner = af.meta
 		inner.minBytes = schemaMinBytes(af.node)
 		b.meta = fieldMeta{avroType: "array", inner: inner}
-		b.node = &schemaNode{
+		arrayNode := &schemaNode{
 			kind:  "array",
 			items: af.node,
 			ser:   b.ser,
 			deser: b.deser,
+		}
+		b.node = arrayNode
+		if isFwdRef {
+			// fwd-ref's resolved node is wired in finalize().
+			// Capture pointers to all four wire-side slots that
+			// depend on the resolved type so the fixup can patch
+			// them once b.named[fwdRefName] becomes available.
+			b.containerFixups = append(b.containerFixups, containerFixup{
+				serItem:    &sa.serItem,
+				deserItem:  &da.deserItem,
+				setMinBytes: func(n int) { da.minItemBytes = n },
+				nodeChild:  &arrayNode.items,
+				name:       fwdRefName,
+				ctxLabel:   "array",
+			})
 		}
 
 	case "map":
@@ -2114,10 +2168,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			return errors.New("map is missing values schema")
 		}
 		mf := b.nest()
-		if err := mf.build(parentName, o.Values); err != nil {
-			return fmt.Errorf("invalid map: %v", err)
+		isFwdRef, fwdRefName, err := captureFwdRef(mf.build(parentName, o.Values), "map")
+		if err != nil {
+			return err
 		}
 		b.unnest(mf)
+		if isFwdRef {
+			mf.canon = aschema{primitive: fwdRefName}
+		}
 		o.Values = &mf.canon
 		sm := &serMap{serItem: mf.ser}
 		// minEntryBytes = 1 (empty-key length varint) + values' minimum
@@ -2126,10 +2184,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// amplification on hostile input.
 		dm := &deserMap{deserItem: mf.deser, minEntryBytes: 1 + schemaMinBytes(mf.node)}
 		// Same gate as the array case above: skip specialization when
-		// values have a custom type or a logical type, so the inner
-		// per-element function (serTimestampMillis / deserTimeMicros
-		// / etc.) actually runs.
-		if mf.meta.hasCustomType || mf.meta.logical != "" {
+		// values have a custom type, a logical type, OR a forward
+		// reference (the fast-path closure can't capture an unresolved
+		// inner ser/deser).
+		if isFwdRef || mf.meta.hasCustomType || mf.meta.logical != "" {
 			b.ser = sm.ser
 		} else if info, ok := primFast[mf.canon.primitive]; ok {
 			b.ser = info.serMapFn(sm)
@@ -2141,11 +2199,22 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.deser = dm.deser
 		b.meta = fieldMeta{avroType: "map"}
-		b.node = &schemaNode{
+		mapNode := &schemaNode{
 			kind:   "map",
 			values: mf.node,
 			ser:    b.ser,
 			deser:  b.deser,
+		}
+		b.node = mapNode
+		if isFwdRef {
+			b.containerFixups = append(b.containerFixups, containerFixup{
+				serItem:    &sm.serItem,
+				deserItem:  &dm.deserItem,
+				setMinBytes: func(n int) { dm.minEntryBytes = 1 + n },
+				nodeChild:  &mapNode.values,
+				name:       fwdRefName,
+				ctxLabel:   "map",
+			})
 		}
 
 	case "fixed":

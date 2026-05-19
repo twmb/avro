@@ -359,15 +359,13 @@ func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
 // apache/avro/io/JsonEncoder.java: `if (symbol != Symbol.NULL &&
 // includeNamespace)`), and the Avro JSON spec's bare-null union form.
 //
-// Pre-fix appendAvroJSONUnion's four cfg.tagged sites (tagged-form,
-// nil-first, type-name, try-each) wrapped any branch — including
-// null — when cfg.tagged was set, producing {"null":null}. Meanwhile
-// the entry early-null at appendAvroJSON:165-172 (reached when the
-// entry peel converts a nil Pointer/Interface to invalid) emitted
-// bare "null" regardless of cfg.tagged. Two paths, same conceptual
-// input, different output. Bug surfaced when commit 310cfc4 removed
-// the `if branch.kind == "null" continue` try-each skip — the wrap
-// path was previously unreachable for the null branch.
+// Without this guarantee, appendAvroJSONUnion's four cfg.tagged sites
+// (tagged-form, nil-first, type-name, try-each) would wrap any branch
+// — including null — when cfg.tagged is set, producing {"null":null}.
+// Meanwhile the entry early-null at appendAvroJSON:165-172 (reached
+// when the entry peel converts a nil Pointer/Interface to invalid)
+// emits bare "null" regardless of cfg.tagged. Two paths, same
+// conceptual input, different output.
 //
 // Fix: factor appendUnionBranch that centralizes
 // `wrap iff cfg.tagged && branch.kind != "null"`, used at all four

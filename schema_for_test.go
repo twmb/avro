@@ -2007,18 +2007,19 @@ func TestSchemaForCustomTypeNoAvroType(t *testing.T) {
 	}
 }
 
-// TestRegression_SchemaForShadowedEmbedShallowestWins locks the F1 fix:
-// doc.go:147-149 documents "the shallowest wins" for same-name fields,
-// and reflect.go's typeFieldMapping (line 322-323) implements it at
-// runtime. Pre-fix, schema_for.go's collectFields dedup (line 313-321)
-// only special-cased tagged-beats-untagged and kept first-seen for
-// same-tagged-status — which is the deeper embedded field because
+// TestRegression_SchemaForShadowedEmbedShallowestWins pins the
+// shadowed-embed precedence rule: doc.go:147-149 documents "the
+// shallowest wins" for same-name fields, and reflect.go's
+// typeFieldMapping (line 322-323) implements it at runtime. Without
+// this, schema_for.go's collectFields dedup (line 313-321) would only
+// special-case tagged-beats-untagged and keep first-seen for
+// same-tagged-status — the deeper embedded field, because
 // collectFields appends nested-struct fields BEFORE outer fields.
 //
-// Observable consequence pre-fix: encode of a legal outer.X int64
-// value against the inferred schema failed with "overflows int32"
-// because the schema declared the embedded int32 type while the
-// runtime encoder used the outer int64 value.
+// Observable consequence without the rule: encode of a legal outer.X
+// int64 value against the inferred schema fails with "overflows int32"
+// because the schema declares the embedded int32 type while the
+// runtime encoder uses the outer int64 value.
 func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
 	t.Run("both_tagged_outer_wins", func(t *testing.T) {
 		type Inner struct {

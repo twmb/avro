@@ -368,8 +368,8 @@ func isJSONNullStart(s *jsonScanner, p byte) bool {
 // applies the exact-match gate after consumption). Lowercase first
 // letters ('n', 'i') are rejected — Java's JsonDecoder, fastavro's
 // Python json, and goavro all reject lowercase, and the lowercase 'n'
-// in particular collided with the JSON null literal in the union
-// dispatcher (F1 finding).
+// in particular would collide with the JSON null literal in the union
+// dispatcher.
 func isBareSpecialFloatStart(s *jsonScanner, p byte) bool {
 	switch p {
 	case 'N', 'I':

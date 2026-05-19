@@ -312,9 +312,9 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	// untagged one"):
 	//   1. Tagged beats untagged.
 	//   2. Among same-tagged-status fields, shallower (shorter index
-	//      path) wins — this is the F1 fix; pre-fix kept first-seen
-	//      which was the deeper embedded field because nested-struct
-	//      fields are appended to raw BEFORE outer fields.
+	//      path) wins. Without this, dedup keeps first-seen — the
+	//      deeper embedded field — because nested-struct fields are
+	//      appended to raw BEFORE outer fields.
 	type entry struct {
 		idx int
 		schemaField

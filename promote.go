@@ -51,7 +51,7 @@ func promoteRead[Wire any](
 // this check, e.g. Resolve("long","double").Decode(wire(1<<53+1), &f64)
 // silently truncated to 1<<53 while w.Decode(wire(1<<53+1), &f64)
 // rejected — within-twmb encode/natural-decode/promoted-decode contract
-// disagreement on identical wire bytes (F2 finding).
+// disagreement on identical wire bytes.
 func promoteIntFloatMantissa(v reflect.Value, n int64, avroType string, bitSize int) error {
 	f, err := intFitsFloat(n, bitSize)
 	if err != nil {

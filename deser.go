@@ -1560,7 +1560,7 @@ func setIntegerWire[T int32 | int64](v reflect.Value, val T, avroType string) er
 		// Mirrors the documented whole-number-float-as-int encode
 		// leniency: AppendEncode(float64(42), "long") succeeds, so
 		// Decode("long" wire, *float64) must round-trip. intFitsFloat
-		// is shared with promoteIntFloatMantissa (promote.go:F2 fix)
+		// is shared with promoteIntFloatMantissa (promote.go)
 		// so the natural-decoder and promoted-decoder arms apply the
 		// same mantissa bound to the same wire bytes.
 		f, err := intFitsFloat(v64, v.Type().Bits())

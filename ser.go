@@ -519,6 +519,15 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 // Shared by [jsonNumberToInt64], [defaultAsInt64], [jsonCoerceToInt64],
 // and [parseJSONInt64]'s exponent/fractional branch.
 func parseInt64Lenient(s string) (int64, error) {
+	// Length cap at the entry. Bounds every downstream walk
+	// (isJSONNumber, strconv.ParseInt, boundedRatFromString) in O(1)
+	// before any per-byte work happens; also bounds the size of any
+	// error message that echoes the input. Legit int64 inputs (decimal
+	// max 20 chars; exponent form max ~24 chars) fit easily under the
+	// cap.
+	if len(s) > maxInt64LenientLen {
+		return 0, fmt.Errorf("integer literal exceeds %d-byte length cap", maxInt64LenientLen)
+	}
 	// JSON-spec grammar gate: strconv.ParseInt(s,10,64) accepts forms
 	// the JSON spec rejects — leading '+' ("+5" → 5), leading-zero
 	// multi-digit ("01" → 1). Validate first so the fast path agrees
@@ -541,15 +550,7 @@ func parseInt64Lenient(s string) (int64, error) {
 	// non-numeric) falls through to the arbitrary-precision path for a
 	// precise IsInt+IsInt64 check and an accurate error message.
 	if errors.Is(err, strconv.ErrRange) && !strings.ContainsAny(s, ".eE") {
-		return 0, fmt.Errorf("value %s overflows int64", s)
-	}
-	// Length cap on slow-path inputs bounds boundedRatFromString's O(n²)
-	// big.Rat.SetString cost on hostile inputs. Legit int64 in exponent
-	// form fits in ~30 chars; 64 is generous. boundedRatFromString itself
-	// caps at maxRatInputLen (128 KiB, decimal-logical-type DoS posture
-	// matched to decimalScaleLimit), looser than int64 needs.
-	if len(s) > maxInt64LenientLen {
-		return 0, fmt.Errorf("value %s exceeds int64-input length cap (%d)", s, maxInt64LenientLen)
+		return 0, fmt.Errorf("integer literal overflows int64: %q", s)
 	}
 	r, ok, perr := boundedRatFromString(s)
 	if perr != nil {
@@ -568,12 +569,14 @@ func parseInt64Lenient(s string) (int64, error) {
 	return bi.Int64(), nil
 }
 
-// maxInt64LenientLen caps the input length parseInt64Lenient routes
-// through boundedRatFromString → big.Rat.SetString (O(n²)). The longest
-// legit int64 input in exponent form ("-9.223372036854775808e18" = 24
-// chars) plus generous padding fits in 64. Pure-integer-form overflow
-// is rejected before this check via the strconv.ParseInt + ContainsAny
-// short-circuit, so this cap only affects exponent/fractional inputs.
+// maxInt64LenientLen caps the input length parseInt64Lenient accepts.
+// Fires at the entry of parseInt64Lenient so every downstream walk
+// (isJSONNumber, strconv.ParseInt for pure-integer overflow,
+// boundedRatFromString for slow-path exponent/fractional) bounds in O(1)
+// instead of O(n). Also bounds the size of error messages that echo
+// the input. The longest legit int64 input in exponent form
+// ("-9.223372036854775808e18" = 24 chars) plus generous padding fits
+// in 64.
 const maxInt64LenientLen = 64
 
 // parseInt64WithFloatParity is [parseInt64Lenient] + a precision check

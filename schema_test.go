@@ -2320,13 +2320,11 @@ func TestFieldLevelLogicalType_UnionPreAnnotatedFirstBranch(t *testing.T) {
 // returning nil for unrecognized (type, logical) pairs (schema_parse
 // .go:205-222), plus the spec's "ignore invalid logical type" rule.
 //
-// Pre-F1-fix this test errored at Parse with the strict-mismatch
-// rejection; the prior pin claimed the strict behavior was "the load-
-// bearing pin against any future revert" but it diverged from three
-// reference impls AND from the spec text. The pin itself was the bug.
-// A Java/fastavro producer that emitted any of these schemas (legacy
-// schema, developer mistake, schema-evolution corner case) could not
-// be parsed by a twmb consumer — interop break.
+// A strict-rejection behavior here would diverge from three reference
+// impls AND from the spec text. A Java/fastavro producer that emitted
+// any of these schemas (legacy schema, developer mistake, schema-
+// evolution corner case) could not be parsed by a twmb consumer —
+// interop break.
 //
 // Users wanting strict pre-parse validation should add their own
 // validator pass; twmb's parse layer follows the documented spec
