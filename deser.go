@@ -1403,6 +1403,14 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 // so target-set parity stays in lock-step (regression: promote*To{Float,Double}
 // previously rejected integer + json.Number targets that deserFloat/deserDouble
 // accepted).
+//
+// Non-finite floats (±Inf, NaN) are rejected for integer AND json.Number
+// targets: neither type can faithfully hold the value (no integer representation;
+// json.Number's encoding/json contract requires a valid JSON number literal,
+// which RFC 8259 doesn't define for ±Inf/NaN). Float/Interface targets pass
+// non-finite values through unchanged. Users who need ±Inf/NaN round-trip
+// should decode into a typed float (float32/float64) and pick their own JSON
+// convention (twmb's quoted-string default, LinkedinFloats' 1e999, custom).
 func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error {
 	if v.Kind() == reflect.Interface {
 		var rv reflect.Value
@@ -1444,6 +1452,16 @@ func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error 
 		return nil
 	}
 	if v.Type() == jsonNumberType {
+		// Non-finite floats (±Inf, NaN) have no valid JSON number
+		// representation per RFC 8259: encoding/json.Marshal rejects
+		// json.Number values whose underlying string isn't a valid
+		// JSON number literal. Mirror the integer arm above which
+		// rejects for the structurally identical reason ("target type
+		// cannot represent this value"). Users who need ±Inf/NaN
+		// should decode into a typed float target instead.
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("non-finite %g has no JSON number representation", f)}
+		}
 		v.Set(reflect.ValueOf(json.Number(strconv.FormatFloat(f, 'g', -1, bits))))
 		return nil
 	}

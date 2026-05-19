@@ -9516,6 +9516,145 @@ func TestRegression_IntLongDecodeIntoFloatJSONNumber(t *testing.T) {
 	})
 }
 
+// TestRegression_NonFiniteFloatRejectedForJSONNumberTarget pins the
+// rejection of ±Inf and NaN when decoding wire float/double into a
+// json.Number target. Pre-fix setFloatValue's json.Number arm
+// (deser.go:1447) called strconv.FormatFloat unconditionally, which
+// produces "+Inf"/"-Inf"/"NaN" for non-finite floats — none of which
+// are valid JSON number literals per RFC 8259. encoding/json.Marshal
+// rejects them at the user's first attempt to re-serialize the
+// decoded json.Number, producing a generic stdlib error far from the
+// real source.
+//
+// Post-fix: setFloatValue mirrors the integer arm's existing reject
+// at deser.go:1426 — the target type can't represent non-finite floats,
+// so the decoder fails fast with a twmb SemanticError tagged to the
+// Avro type. Users who need ±Inf/NaN round-trip should decode into
+// typed float (float32/float64) and pick their own JSON convention
+// (twmb's quoted-string default, LinkedinFloats' 1e999, custom).
+//
+// Sibling-safe: setIntegerWire (deser.go:1556) uses FormatInt which is
+// total over int64; setDecimalRat (deser.go:1733) uses big.Rat which
+// cannot represent ±Inf/NaN. Only this site was buggy.
+//
+// Covers binary deser (deserFloat/deserDouble), JSON decode
+// (decodeFloat/decodeDouble), and the promotion paths
+// (promoteFloatToDouble, promoteIntFloatMantissa) which all route
+// through setFloatValue.
+func TestRegression_NonFiniteFloatRejectedForJSONNumberTarget(t *testing.T) {
+	floatPlusInf := float32(math.Inf(1))
+	floatMinusInf := float32(math.Inf(-1))
+	floatNaN := float32(math.NaN())
+
+	rejectCases := []struct {
+		name   string
+		schema string
+		wire   any
+	}{
+		{"binary float +Inf", `"float"`, floatPlusInf},
+		{"binary float -Inf", `"float"`, floatMinusInf},
+		{"binary float NaN", `"float"`, floatNaN},
+		{"binary double +Inf", `"double"`, math.Inf(1)},
+		{"binary double -Inf", `"double"`, math.Inf(-1)},
+		{"binary double NaN", `"double"`, math.NaN()},
+	}
+	for _, tc := range rejectCases {
+		t.Run("binary/"+tc.name, func(t *testing.T) {
+			s := avro.MustParse(tc.schema)
+			enc, err := s.AppendEncode(nil, tc.wire)
+			if err != nil {
+				t.Fatalf("AppendEncode: %v", err)
+			}
+			var n json.Number
+			_, err = s.Decode(enc, &n)
+			if err == nil {
+				t.Fatalf("expected reject, decoded json.Number=%q (json.Marshal would fail later)", string(n))
+			}
+			if _, ok := err.(*avro.SemanticError); !ok {
+				t.Errorf("expected *avro.SemanticError, got %T: %v", err, err)
+			}
+		})
+	}
+
+	// JSON-decode path — same reject behavior.
+	jsonRejectCases := []struct {
+		name   string
+		schema string
+		jsonIn string
+	}{
+		{"double Infinity quoted-string", `"double"`, `"Infinity"`},
+		{"double -Infinity quoted-string", `"double"`, `"-Infinity"`},
+		{"double NaN quoted-string", `"double"`, `"NaN"`},
+		{"double bare Infinity", `"double"`, `Infinity`},
+		{"double 1e999 (overflow → +Inf via ParseFloat)", `"double"`, `1e999`},
+		{"double -1e999 (overflow → -Inf)", `"double"`, `-1e999`},
+	}
+	for _, tc := range jsonRejectCases {
+		t.Run("json/"+tc.name, func(t *testing.T) {
+			s := avro.MustParse(tc.schema)
+			var n json.Number
+			err := s.DecodeJSON([]byte(tc.jsonIn), &n)
+			if err == nil {
+				t.Fatalf("expected reject, decoded json.Number=%q (json.Marshal would fail later)", string(n))
+			}
+			if _, ok := err.(*avro.SemanticError); !ok {
+				t.Errorf("expected *avro.SemanticError, got %T: %v", err, err)
+			}
+		})
+	}
+
+	// Promotion path: float wire → double reader → json.Number target.
+	t.Run("promote float→double +Inf", func(t *testing.T) {
+		w := avro.MustParse(`"float"`)
+		r := avro.MustParse(`"double"`)
+		resolved, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		enc, _ := w.AppendEncode(nil, float32(math.Inf(1)))
+		var n json.Number
+		_, err = resolved.Decode(enc, &n)
+		if err == nil {
+			t.Fatalf("expected reject under promotion, decoded json.Number=%q", string(n))
+		}
+		if _, ok := err.(*avro.SemanticError); !ok {
+			t.Errorf("expected *avro.SemanticError under promotion, got %T: %v", err, err)
+		}
+	})
+
+	// Boundary: finite floats must still decode cleanly and produce a
+	// json.Number that re-marshals through encoding/json.
+	acceptCases := []struct {
+		name   string
+		schema string
+		wire   any
+	}{
+		{"binary float 3.14", `"float"`, float32(3.14)},
+		{"binary float 0", `"float"`, float32(0)},
+		{"binary float -1.5", `"float"`, float32(-1.5)},
+		{"binary double 3.14", `"double"`, 3.14},
+		{"binary double 0", `"double"`, 0.0},
+		{"binary double MaxFloat64", `"double"`, math.MaxFloat64},
+		{"binary double SmallestNonzero", `"double"`, math.SmallestNonzeroFloat64},
+	}
+	for _, tc := range acceptCases {
+		t.Run("accept/"+tc.name, func(t *testing.T) {
+			s := avro.MustParse(tc.schema)
+			enc, err := s.AppendEncode(nil, tc.wire)
+			if err != nil {
+				t.Fatalf("AppendEncode: %v", err)
+			}
+			var n json.Number
+			if _, err := s.Decode(enc, &n); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if _, jerr := json.Marshal(n); jerr != nil {
+				t.Errorf("json.Marshal(decoded json.Number=%q): %v", string(n), jerr)
+			}
+		})
+	}
+}
+
 // TestParity_SchemaRejectionMatrix systematically asserts that
 // Parse rejects every malformed schema shape the spec forbids or the
 // reference implementations reject. Sibling to
