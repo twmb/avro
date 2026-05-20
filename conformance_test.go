@@ -8186,6 +8186,251 @@ func TestRegression_MetadataAPIBytesFixedDefaultRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRegression_ErrorTypeMetadataDefaultCoercion pins that bytes/fixed
+// defaults nested inside an "error"-typed record (whether the record is
+// reached as a field's type, a union branch, or an array's items)
+// surface as []byte in SchemaField.Default, uniformly with the "record"
+// case. Avro treats error types as the record kind with an isError
+// flag — used in RPC protocols — and twmb's schema builder normalizes
+// node.kind to "record" for both at schema.go's case "record", "error":
+// arm. The wire-encode pipeline (coerceDefault / convertDefaultBytes /
+// walkDefault) dispatches on the normalized node.kind, so the wire form
+// of an error record's bytes/fixed default is identical to a regular
+// record's. But the metadata-API surface uses SchemaNode.Type which
+// preserves the JSON-as-written "error"; coerceMetadataDefault and
+// branchAcceptsDefault each have a `case "record"` arm that must
+// include "error" so the metadata-API result matches the wire form.
+//
+// Drift sentinel: SchemaField.Default's docstring states "Bytes and
+// fixed defaults decode as []byte (the wire form)". That contract must
+// hold uniformly across record/error nesting positions. The
+// user-impactful failure is the fixed+uuid default subcase: a string-
+// form Default value fails parseUUID at re-encode time (16-codepoint
+// string vs required 36-char hex-dash), so the natural pattern
+//
+//	defs := map[string]any{}
+//	for _, f := range s.Root().Fields {
+//	    if f.HasDefault { defs[f.Name] = f.Default }
+//	}
+//	s.AppendEncode(nil, defs)
+//
+// breaks asymmetrically: works for record-typed nesting, fails for
+// error-typed nesting.
+func TestRegression_ErrorTypeMetadataDefaultCoercion(t *testing.T) {
+	uuidBytes := []byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	rs := make([]rune, len(uuidBytes))
+	for i, b := range uuidBytes {
+		rs[i] = rune(b)
+	}
+	uuidJSON, _ := json.Marshal(string(rs))
+
+	cases := []struct {
+		name string
+		// schemaJSON's outer record's first field has a default whose
+		// shape varies (record-shaped map, union, array of records);
+		// the leaf path names how to walk it.
+		schemaJSON string
+		// leafPath describes how to walk into outer.Default to find the
+		// bytes/fixed leaf. "key" walks a map by name; "idx" walks a
+		// slice by index. The terminal step yields the leaf value.
+		leafPath []any
+		want     []byte
+	}{
+		// (a) Field's TYPE is an "error" record, OUTER default is a
+		//     record-shaped map with a bytes leaf. coerceMetadataDefault
+		//     is called with t.Type=="error", val=map; pre-fix the
+		//     `case "record"` arm didn't match, so val returned
+		//     unchanged — the inner "b" stayed as string.
+		{
+			name: "error_inner_record_with_bytes_default_outer",
+			schemaJSON: `{"type":"record","name":"R","fields":[
+				{"name":"inner","type":{"type":"error","name":"I","fields":[
+					{"name":"b","type":"bytes","default":"xyz"}
+				]},"default":{"b":"abc"}}
+			]}`,
+			leafPath: []any{"b"},
+			want:     []byte("abc"),
+		},
+		// (b) Union [error, null] with a record-shaped default. The
+		//     union dispatch calls branchAcceptsDefault for each
+		//     branch; pre-fix the `case "record"` arm didn't accept
+		//     "error", so no branch matched, val returned unchanged.
+		{
+			name: "union_error_null_record_default",
+			schemaJSON: `{"type":"record","name":"R","fields":[
+				{"name":"x","type":[{"type":"error","name":"E","fields":[
+					{"name":"b","type":"bytes","default":"xyz"}
+				]},"null"],"default":{"b":"abc"}}
+			]}`,
+			leafPath: []any{"b"},
+			want:     []byte("abc"),
+		},
+		// (c) Array of error type with record-shaped items. The array
+		//     arm recurses into items via coerceMetadataDefault(item,
+		//     t.Items, table); item's t.Type=="error" missed the
+		//     record arm pre-fix.
+		{
+			name: "array_of_error_with_bytes_default",
+			schemaJSON: `{"type":"record","name":"R","fields":[
+				{"name":"errs","type":{"type":"array","items":{
+					"type":"error","name":"E","fields":[
+						{"name":"b","type":"bytes","default":"xyz"}
+					]
+				}},"default":[{"b":"abc"}]}
+			]}`,
+			leafPath: []any{0, "b"},
+			want:     []byte("abc"),
+		},
+		// (d) The user-impactful case: error-typed inner record with a
+		//     fixed+uuid leaf. SchemaField.Default's docstring promises
+		//     []byte; the JSON encoder's "fixed"+"uuid" arm requires
+		//     []byte input (parseUUID rejects the 16-codepoint string
+		//     form). User pattern below fails with "invalid UUID"
+		//     pre-fix; the binary encoder's case "fixed" + UUID via
+		//     serFixedUUIDReflect's parseUUID arm rejects identically.
+		{
+			name: "error_inner_with_fixed_uuid_default_outer",
+			schemaJSON: fmt.Sprintf(`{"type":"record","name":"R","fields":[
+				{"name":"inner","type":{"type":"error","name":"I","fields":[
+					{"name":"u","type":{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}}
+				]},"default":{"u":%s}}
+			]}`, uuidJSON),
+			leafPath: []any{"u"},
+			want:     uuidBytes,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := avro.Parse(tc.schemaJSON)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			outer := s.Root().Fields[0]
+			if !outer.HasDefault {
+				t.Fatalf("outer field missing default")
+			}
+
+			// Walk to the leaf via leafPath.
+			cur := outer.Default
+			for _, step := range tc.leafPath {
+				switch sv := step.(type) {
+				case string:
+					m, ok := cur.(map[string]any)
+					if !ok {
+						t.Fatalf("walking %q: expected map, got %T", sv, cur)
+					}
+					cur = m[sv]
+				case int:
+					a, ok := cur.([]any)
+					if !ok {
+						t.Fatalf("walking [%d]: expected slice, got %T", sv, cur)
+					}
+					cur = a[sv]
+				}
+			}
+
+			leafBytes, ok := cur.([]byte)
+			if !ok {
+				t.Fatalf("leaf: got %T(%v), want []byte — coerceMetadataDefault must materialize bytes/fixed defaults as []byte even when the parent type is \"error\"; SchemaField.Default's docstring promises \"Bytes and fixed defaults decode as []byte (the wire form)\" and that contract must hold uniformly for record/error types since Avro treats them as the same record kind",
+					cur, cur)
+			}
+			if !bytes.Equal(leafBytes, tc.want) {
+				t.Errorf("leaf: got %x, want %x", leafBytes, tc.want)
+			}
+
+			// User pattern: re-encode using Default. Pre-fix this
+			// rejects for the fixed+uuid case with "invalid UUID"
+			// (parseUUID gets the 16-codepoint string instead of the
+			// []byte the encoder accepts). The fix makes the metadata-
+			// API Default re-encodable uniformly across record/error
+			// nesting.
+			defs := map[string]any{}
+			for _, f := range s.Root().Fields {
+				if f.HasDefault {
+					defs[f.Name] = f.Default
+				}
+			}
+			if _, err := s.AppendEncode(nil, defs); err != nil {
+				t.Errorf("AppendEncode using Default-derived map: %v — the metadata API's Default value must be re-encodable by AppendEncode without further coercion", err)
+			}
+			if _, err := s.AppendEncodeJSON(nil, defs); err != nil {
+				t.Errorf("AppendEncodeJSON using Default-derived map: %v — the metadata API's Default value must be re-encodable by AppendEncodeJSON without further coercion", err)
+			}
+
+			// The auto-fill wire form (empty map → internal defaultVal,
+			// which uses the wire pipeline's normalized "record"
+			// dispatch) must match the metadata-derived wire form.
+			// Pre-fix the metadata-derived path failed for fixed+uuid
+			// (parseUUID reject); for bytes the wire format matched by
+			// coincidence (serBytes accepts string fall-through) — the
+			// pin asserts equality across both paths so the wire-form
+			// agreement holds uniformly.
+			autoWire, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("AppendEncode auto-fill: %v", err)
+			}
+			derivedWire, err := s.AppendEncode(nil, defs)
+			if err != nil {
+				t.Fatalf("AppendEncode metadata-derived: %v", err)
+			}
+			if !bytes.Equal(autoWire, derivedWire) {
+				t.Errorf("auto-fill wire %x != metadata-derived wire %x — the two paths must agree on the same record's default-fill wire bytes regardless of record/error type alias",
+					autoWire, derivedWire)
+			}
+		})
+	}
+}
+
+// TestRegression_LookupNameRefAcceptsErrorKind pins that the
+// metadata-API's lookupNameRef helper (schema_node.go) treats "error"
+// as a structural kind alias of "record" — not as a bare
+// name-reference target. The Avro RPC convention names error-record
+// kinds with "error", and the schema builder normalizes node.kind to
+// "record" for both at parse time. The metadata-API's SchemaNode.Type
+// preserves the JSON-as-written "error", so lookupNameRef must list
+// "error" alongside "record" in its known-structural-kinds list —
+// otherwise a SchemaNode whose t.Type=="error" (the kind) gets
+// silently rerouted to a record literally named "error" elsewhere in
+// the schema, and coerceMetadataDefault then recurses into the WRONG
+// child schema. Drift sentinel: any default whose schema mixes a
+// named-record-called-"error" with a separate error-kind type would
+// surface coercion against the wrong child field schemas.
+func TestRegression_LookupNameRefAcceptsErrorKind(t *testing.T) {
+	// Two children:
+	//   - "a": refers to a record literally NAMED "error" with a bytes field.
+	//   - "b": an "error"-KIND record (Avro RPC convention) with a string field
+	//     and a default whose value is `{"x":"abc"}`.
+	// Pre-fix, lookupNameRef for b's t.Type=="error" fell through to
+	// table["error"] which resolved to a's record (bytes field), and
+	// coerceMetadataDefault misrouted b's default through that schema,
+	// coercing "abc" → []byte{97,98,99} instead of leaving the string
+	// unchanged.
+	schemaJSON := `{
+		"type":"record","name":"Outer","fields":[
+			{"name":"a","type":{"type":"record","name":"error","fields":[
+				{"name":"x","type":"bytes","default":"xyz"}
+			]}},
+			{"name":"b","type":{"type":"error","name":"MyError","fields":[
+				{"name":"x","type":"string","default":"strDef"}
+			]},"default":{"x":"abc"}}
+		]
+	}`
+	s, err := avro.Parse(schemaJSON)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	bDefault := s.Root().Fields[1].Default
+	m, ok := bDefault.(map[string]any)
+	if !ok {
+		t.Fatalf("b.Default: got %T(%v), want map[string]any", bDefault, bDefault)
+	}
+	v := m["x"]
+	if _, ok := v.(string); !ok {
+		t.Errorf("b.x: got %T(%v), want string — b's schema has x as \"string\"; lookupNameRef must not misroute through a named-record-called-\"error\" when the kind alias \"error\" appears as a SchemaNode.Type",
+			v, v)
+	}
+}
+
 // TestRegression_Float32NarrowingPredicateParity locks the 8 sites that
 // share the predicate
 //

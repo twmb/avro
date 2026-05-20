@@ -390,7 +390,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 	// record.fields is a required attribute per the Avro spec (Complex
 	// Types > Records: "fields: a JSON array, listing fields (required)"),
 	// always emit for record/error types even when empty.
-	if n.Type == "record" || n.Type == "error" || len(n.Fields) > 0 {
+	if isRecordKind(n.Type) || len(n.Fields) > 0 {
 		fields := make([]map[string]any, len(n.Fields))
 		for i, f := range n.Fields {
 			fd := map[string]any{
@@ -542,6 +542,19 @@ func lookupCI(m map[string]any, key string) (any, bool) {
 	return nil, false
 }
 
+// isRecordKind reports whether typ names the Avro record kind in
+// [SchemaNode.Type]. Both "record" and "error" are valid JSON literals
+// for the same on-wire kind (the Avro RPC convention names error-record
+// types with "error"); the schema builder normalizes both to
+// node.kind=="record" at schema.go's `case "record", "error":` arm.
+// SchemaNode.Type preserves the JSON-as-written name, so any
+// metadata-API dispatcher on SchemaNode.Type that branches on the
+// record kind must accept either alias — this helper centralizes the
+// predicate so the alias set can't drift across call sites.
+func isRecordKind(typ string) bool {
+	return typ == "record" || typ == "error"
+}
+
 // coerceMetadataDefault is the metadata-API parallel of [coerceDefault]
 // (schema.go). It transforms a parsed-JSON default value into the
 // canonical Go form the wire-encode pipeline materializes for that
@@ -628,7 +641,7 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 		}
 		return val
 	}
-	if t.Type == "record" {
+	if isRecordKind(t.Type) {
 		if m, ok := val.(map[string]any); ok {
 			out := make(map[string]any, len(m))
 			for k, v := range m {
@@ -676,9 +689,15 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode) *SchemaNode {
 	if t == nil || table == nil {
 		return nil
 	}
+	// Structural kinds (primitives, "record"/"error", "enum", "fixed",
+	// "array", "map", "union") are schema definitions, not name-ref
+	// targets. "error" is in this list per [isRecordKind] — without it,
+	// a SchemaNode with t.Type=="error" would fall through to
+	// table["error"] and wrongly resolve to any record literally named
+	// "error" in the schema.
 	switch t.Type {
 	case "null", "boolean", "int", "long", "float", "double",
-		"bytes", "string", "record", "enum", "fixed", "array", "map", "union":
+		"bytes", "string", "record", "error", "enum", "fixed", "array", "map", "union":
 		return nil
 	}
 	return table[t.Type]
@@ -794,7 +813,7 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) 
 			return true
 		}
 		return false
-	case "record":
+	case "record", "error":
 		_, ok := val.(map[string]any)
 		return ok
 	case "array":
