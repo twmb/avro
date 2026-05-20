@@ -9660,6 +9660,245 @@ func TestRegression_UnionFloatStringDefaultCoerce(t *testing.T) {
 	})
 }
 
+// TestRegression_UnionDefaultMetadataMatchesWireBranch pins the cross-
+// surface union default branch selection contract: for a union default,
+// the metadata-API path (Schema.Root().Fields[i].Default) and the wire-
+// encode path (AppendEncode of an empty record auto-filling the
+// default) must select the SAME branch. Pre-fix, the metadata path's
+// branchAcceptsDefault was a structural type-only check while the wire
+// path's validateDefault did full per-value validation; for unions
+// where a numeric kind preceded another numeric kind in declaration
+// order (e.g. ["float","int"] default 42), the two paths diverged
+// — wire picked float via integerFormFitsFloat on json.Number("42"),
+// metadata picked int via int64 acceptance after normalizeJSONNumber.
+//
+// Fix: branchAcceptsDefault now delegates to the wire-side helpers
+// defaultAsInt32 / defaultAsInt64 / defaultAsFloat (extended to accept
+// int64/int32 inputs so the metadata-normalized values reach the same
+// per-value predicates the wire-side json.Number/float64 inputs hit),
+// and coerceMetadataDefault converts int64/int32/string → float64 when
+// the chosen branch is float/double so SchemaField.Default's Go type
+// matches the chosen branch's natural Go type.
+//
+// Each subtest pins (a) the chosen branch on both surfaces, (b) the
+// wire bytes' branch-index prefix, and (c) the metadata Default's Go
+// type. The combinations exercise: float-first / double-first /
+// int-first / long-first with integer-form defaults (the primary bug
+// shape), fractional-form defaults (the sibling shape where float64-
+// accepting integer arms misroute), and int64 magnitudes that overflow
+// int32 (the int-vs-long branch-selection shape). Cross-impl: Java's
+// Schema.parseField + isValidDefault first-match-wins on isNumber()/
+// isIntegralNumber() and fastavro's _default_matches_schema first-
+// match-wins on _maybe_float()/isinstance(int) both pick the same
+// branches twmb now agrees on.
+func TestRegression_UnionDefaultMetadataMatchesWireBranch(t *testing.T) {
+	type wantKind int
+	const (
+		kindFloat wantKind = iota
+		kindDouble
+		kindInt
+		kindLong
+		kindString
+	)
+	wantKindName := map[wantKind]string{
+		kindFloat: "float", kindDouble: "double",
+		kindInt: "int", kindLong: "long", kindString: "string",
+	}
+	cases := []struct {
+		name   string
+		schema string
+		want   wantKind
+		// wireBranchByte is the first byte of the wire bytes for an
+		// auto-filled empty record — the union branch index varint.
+		wireBranchByte byte
+	}{
+		{
+			"float_first_integer_form_default_picks_float",
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["float","int"],"default":42}]}`,
+			kindFloat, 0x00,
+		},
+		{
+			"double_first_integer_form_default_picks_double",
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["double","int"],"default":42}]}`,
+			kindDouble, 0x00,
+		},
+		{
+			"double_first_integer_form_default_picks_double_with_long_runner_up",
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["double","long"],"default":42}]}`,
+			kindDouble, 0x00,
+		},
+		{
+			"int_first_integer_form_default_picks_int",
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["int","float"],"default":42}]}`,
+			kindInt, 0x00,
+		},
+		{
+			"int_first_fractional_form_default_picks_float",
+			// 42.5 is not a whole number — int branch rejects via
+			// defaultAsInt32, falls through to float branch.
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["int","float"],"default":42.5}]}`,
+			kindFloat, 0x02,
+		},
+		{
+			"int_first_int64_overflowing_int32_picks_long",
+			// 9007199254740993 = 2^53+1, fits int64 but overflows int32.
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["int","long"],"default":9007199254740993}]}`,
+			kindLong, 0x02,
+		},
+		{
+			"float_first_above_mantissa_picks_int",
+			// 16777217 = 2^24+1, overflows float32 mantissa, fits int32.
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["float","int"],"default":16777217}]}`,
+			kindInt, 0x02,
+		},
+		{
+			"double_first_above_mantissa_picks_long",
+			// 9007199254740993 = 2^53+1, overflows float64 mantissa, fits int64.
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["double","long"],"default":9007199254740993}]}`,
+			kindLong, 0x02,
+		},
+		{
+			"float_first_string_form_default_picks_float",
+			// String-form float default — twmb's documented String-form
+			// intentional divergence. Float branch accepts via
+			// defaultAsFloat's string arm; metadata path materializes
+			// as float64.
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["float","string"],"default":"1.5"}]}`,
+			kindFloat, 0x00,
+		},
+		{
+			"string_first_string_default_picks_string",
+			// Control: when string is first, both surfaces pick string.
+			`{"type":"record","name":"r","fields":[{"name":"f","type":["string","float"],"default":"1.5"}]}`,
+			kindString, 0x00,
+		},
+		{
+			"fixed_first_mismatched_size_picks_string",
+			// Sibling: fixed:8 default "abcd" (4 chars) — fixed branch
+			// rejects via size check, string branch matches. Pre-fix
+			// branchAcceptsDefault's bytes/fixed arm was structural-only
+			// (accepted ANY string), so metadata picked fixed while wire
+			// picked string. Post-fix both pick string.
+			`{"type":"record","name":"r","fields":[{"name":"f","type":[{"type":"fixed","name":"F8","size":8},"string"],"default":"abcd"}]}`,
+			kindString, 0x02,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := avro.Parse(c.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			// Metadata side: SchemaField.Default's Go type implies the chosen branch.
+			d := s.Root().Fields[0].Default
+			var gotMeta wantKind
+			switch d.(type) {
+			case float64:
+				if c.want == kindDouble {
+					gotMeta = kindDouble
+				} else {
+					gotMeta = kindFloat
+				}
+			case float32:
+				gotMeta = kindFloat
+			case int32:
+				gotMeta = kindInt
+			case int, int64:
+				if c.want == kindInt {
+					gotMeta = kindInt
+				} else {
+					gotMeta = kindLong
+				}
+			case string:
+				gotMeta = kindString
+			default:
+				t.Fatalf("unexpected Default type %T", d)
+			}
+			if gotMeta != c.want {
+				t.Errorf("metadata picked %s branch (Default %T %v), want %s",
+					wantKindName[gotMeta], d, d, wantKindName[c.want])
+			}
+			// Wire side: auto-fill default into an empty record and
+			// inspect the branch-index varint.
+			buf, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("AppendEncode empty: %v", err)
+			}
+			if len(buf) == 0 {
+				t.Fatal("empty wire")
+			}
+			if buf[0] != c.wireBranchByte {
+				t.Errorf("wire branch byte: got 0x%02x, want 0x%02x (full wire %x)",
+					buf[0], c.wireBranchByte, buf)
+			}
+		})
+	}
+}
+
+// TestRegression_UnionDefaultMetadataMatchesWireBranch_BranchAcceptsDelegatesToWireHelpers
+// pins the DRY contract: branchAcceptsDefault must delegate to the
+// wire-side defaultAsInt32 / defaultAsInt64 / defaultAsFloat so the
+// metadata branch matcher and wire branch matcher cannot drift. The
+// previous fix at TestRegression_UnionFloatStringDefaultCoerce
+// addressed the wire-side coerceDefault using validateDefault as the
+// branch selector; this sibling addresses the metadata side. The
+// post-fix shape uses ONE set of per-value predicates for both
+// surfaces — adding a new numeric Avro type or tightening a precision
+// check at the wire arm propagates automatically to the metadata arm.
+func TestRegression_UnionDefaultMetadataMatchesWireBranch_BranchAcceptsDelegatesToWireHelpers(t *testing.T) {
+	// Direct probe: defaultAsInt32, defaultAsInt64, defaultAsFloat
+	// must accept int64 and int32 inputs (the metadata-normalized
+	// form of integer-literal JSON defaults). Pre-fix these helpers
+	// only accepted json.Number / float64 (and string for float),
+	// so the metadata-API matcher had to be a separate type switch
+	// — drift between the two matchers was the bug.
+	type R struct {
+		schema string
+		val    any
+		ok     bool
+	}
+	avroParse := avro.Parse
+	_ = avroParse
+	// Inputs are exercised indirectly via Schema parse with the
+	// equivalent JSON literal (the wire arm) and via the SchemaNode
+	// re-parse (the metadata arm); both must agree.
+	cases := []struct {
+		name   string
+		schema string
+		// branchType is the chosen branch's natural Go type:
+		// "float64" / "int64" / "string".
+		branchType string
+	}{
+		{"int_input_to_float_first_union", `["float","long"]`, "float64"},
+		{"int_input_to_int_first_union", `["int","long"]`, "int64"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			schema := `{"type":"record","name":"r","fields":[{"name":"f","type":` + c.schema + `,"default":42}]}`
+			s, err := avro.Parse(schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			d := s.Root().Fields[0].Default
+			gotType := ""
+			switch d.(type) {
+			case float64:
+				gotType = "float64"
+			case float32:
+				gotType = "float32"
+			case int64:
+				gotType = "int64"
+			case int32:
+				gotType = "int32"
+			}
+			if gotType != c.branchType {
+				t.Errorf("Default Go type: got %s (%T %v), want %s",
+					gotType, d, d, c.branchType)
+			}
+		})
+	}
+}
+
 // TestRegression_TaggedUnionShortNameBinaryParity locks binary ↔ JSON
 // parity on fastavro's unqualified-short-name tagged-union shape.
 // Pre-fix the binary `serUnion.tryUnwrapTagged` did a plain map

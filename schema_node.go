@@ -84,6 +84,16 @@ type SchemaField struct {
 	// form via strict parseUUID gating). Enum defaults stay as the symbol
 	// string; record/array/map defaults stay as their parsed map/slice
 	// shape with each leaf coerced by these same rules.
+	//
+	// Union defaults: the chosen branch's natural Go type wins over the
+	// JSON-literal-form normalization rule. The metadata path uses the
+	// same first-matching-branch selector as the wire-encode path
+	// (defaultAsInt32 / defaultAsInt64 / defaultAsFloat applied to each
+	// branch in declaration order). For ["float","int"] default 42 (an
+	// integer literal that would otherwise normalize to int64), the
+	// float branch matches first and Default surfaces as float64(42) —
+	// type-switching on Default identifies the chosen branch the same
+	// way it identifies the underlying Avro type for a non-union field.
 	Default any
 
 	HasDefault bool     // true if a default value is defined in the schema
@@ -622,12 +632,23 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 		return val
 	}
 	if t.Type == "float" || t.Type == "double" {
-		if s, ok := val.(string); ok {
-			bitSize := 32
-			if t.Type == "double" {
-				bitSize = 64
-			}
-			if f, err := defaultAsFloat(s, bitSize); err == nil {
+		bitSize := 32
+		if t.Type == "double" {
+			bitSize = 64
+		}
+		// Convert string / int64 / int32 inputs to float64 so
+		// SchemaField.Default's Go type matches the chosen branch
+		// (users type-switching on float64 vs int64 to identify the
+		// branch get the right answer). float64 inputs pass through
+		// unchanged via the trailing return; json.Number passes through
+		// unchanged for the >int64-magnitude case that the metadata
+		// API contract preserves losslessly. defaultAsFloat applies
+		// the precision predicates (integerFormFitsFloat for string;
+		// intFitsFloat for int64/int32) so an out-of-mantissa value
+		// passes through unchanged rather than silently rounding.
+		switch val.(type) {
+		case string, int64, int32:
+			if f, err := defaultAsFloat(val, bitSize); err == nil {
 				return f
 			}
 		}
@@ -770,6 +791,35 @@ func coerceTreeDefaults(n *SchemaNode, table map[string]*SchemaNode) {
 	}
 }
 
+// defaultMatchesBytesOrFixedKind mirrors the wire-encode pipeline's
+// validateLeaf for "bytes" / "fixed" branches: codepoint range
+// (validateAvroByteString) and, for "fixed", the exact-rune-count
+// size match. The pre-fix structural matcher (`case string, []byte:
+// return true`) accepted ANY string regardless of codepoint range or
+// fixed-size constraint, so [fixed:8,"string"] with a 4-char default
+// would metadata-match the fixed branch while the wire path matched
+// the string branch via validateDefault's size check — pattern 14a
+// sibling of the convertDefaultBytes/validateDefault fix at
+// TestRegression_UnionBytesFixedDefaultMisroutedToWrongBranch.
+func defaultMatchesBytesOrFixedKind(t *SchemaNode, val any) bool {
+	switch v := val.(type) {
+	case string:
+		if err := validateAvroByteString(v, t.Type); err != nil {
+			return false
+		}
+		if t.Type == "fixed" && len([]rune(v)) != t.Size {
+			return false
+		}
+		return true
+	case []byte:
+		if t.Type == "fixed" && len(v) != t.Size {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
 // branchAcceptsDefault reports whether the Avro type t natively accepts
 // val as a default value, using the same Go-type → Avro-type
 // compatibility the wire-encode pipeline's validateDefault enforces.
@@ -777,10 +827,22 @@ func coerceTreeDefaults(n *SchemaNode, table map[string]*SchemaNode) {
 // branches in order; the first accepting branch is the chosen one
 // (matches Java's Schema.parseField first-matching-branch behavior).
 //
-// The float/double branch lenient-accepts string (twmb's documented
+// The numeric arms (int/long/float/double) delegate to the wire-encode
+// pipeline's defaultAsInt32 / defaultAsInt64 / defaultAsFloat so the
+// metadata branch selector and the wire branch selector apply the same
+// per-value predicates (mantissa, whole-number, int32-bounds, JSON-
+// grammar, big.Rat-precision, ParseFloat-ErrRange-with-Inf). A pure
+// type-only predicate would silently mis-route across branches when
+// the type matched but the value didn't — e.g. ["float","int"] default
+// 42 (integer-form json.Number → normalized to int64 by the metadata
+// path) would metadata-match the int branch via type-only acceptance
+// while the wire path matches the float branch via integerFormFitsFloat
+// on the same magnitude.
+//
+// The float/double arm lenient-accepts string (twmb's documented
 // "String-form float defaults" intentional divergence). bytes/fixed
 // branch accepts string (codepoint-mapped form per Avro JSON spec) or
-// []byte. int/long branch accepts integer + numeric-float Go types.
+// []byte.
 func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) bool {
 	// Resolve a bare name-reference if the caller supplied a name-table.
 	if resolved := lookupNameRef(t, table); resolved != nil {
@@ -792,27 +854,24 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) 
 	case "boolean":
 		_, ok := val.(bool)
 		return ok
-	case "int", "long":
-		switch val.(type) {
-		case int64, int32, json.Number, float64:
-			return true
-		}
-		return false
+	case "int":
+		_, err := defaultAsInt32(val)
+		return err == nil
+	case "long":
+		_, err := defaultAsInt64(val)
+		return err == nil
 	case "float", "double":
-		switch val.(type) {
-		case float64, json.Number, string:
-			return true
+		bitSize := 64
+		if t.Type == "float" {
+			bitSize = 32
 		}
-		return false
+		_, err := defaultAsFloat(val, bitSize)
+		return err == nil
 	case "string", "enum":
 		_, ok := val.(string)
 		return ok
 	case "bytes", "fixed":
-		switch val.(type) {
-		case string, []byte:
-			return true
-		}
-		return false
+		return defaultMatchesBytesOrFixedKind(t, val)
 	case "record", "error":
 		_, ok := val.(map[string]any)
 		return ok

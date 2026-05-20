@@ -2657,16 +2657,34 @@ func normalizeJSONNumber(n json.Number) any {
 // precision guard preserves the cross-impl interop concern (wire bytes
 // match Java/fastavro for accepted defaults) while keeping the ergonomic
 // acceptance Go users expect.
-func numericDefault[T int32 | int64](val any, parse func(string) (T, error), fromFloat func(float64) (T, error)) (T, error) {
+func numericDefault[T int32 | int64](val any, parse func(string) (T, error), fromFloat func(float64) (T, error), fromInt64 func(int64) (T, error)) (T, error) {
 	switch v := val.(type) {
 	case json.Number:
 		return parse(string(v))
 	case float64:
 		return fromFloat(v)
+	case int64:
+		return fromInt64(v)
+	case int32:
+		return fromInt64(int64(v))
 	}
 	var z T
 	return z, fmt.Errorf("expected number, got %T", val)
 }
+
+// int64FitsInt32 narrows n to int32 with bounds check. Shared by
+// numericDefault's int64/int32 arms (for defaultAsInt32 callers) and
+// keeps the bounds rule in one place.
+func int64FitsInt32(n int64) (int32, error) {
+	if n < math.MinInt32 || n > math.MaxInt32 {
+		return 0, fmt.Errorf("integer %d overflows int32", n)
+	}
+	return int32(n), nil
+}
+
+// int64Identity is numericDefault's fromInt64 for the int64 (long)
+// target — pass through unchanged.
+func int64Identity(n int64) (int64, error) { return n, nil }
 
 // floatRoundsToSameInt64 reports whether the float64 representation of
 // the decimal literal s rounds to exactly the same integer value as n.
@@ -2713,11 +2731,11 @@ func boundedParseIntForFloat(s string) (int64, error) {
 }
 
 func defaultAsInt32(val any) (int32, error) {
-	return numericDefault(val, parseInt32Lenient, floatFitsInt32)
+	return numericDefault(val, parseInt32Lenient, floatFitsInt32, int64FitsInt32)
 }
 
 func defaultAsInt64(val any) (int64, error) {
-	return numericDefault(val, parseInt64WithFloatParity, floatFitsInt64)
+	return numericDefault(val, parseInt64WithFloatParity, floatFitsInt64, int64Identity)
 }
 
 // floatMantissaLimit returns the largest integer magnitude exactly
@@ -2837,7 +2855,11 @@ const maxParseFloatLen = 1024
 
 // defaultAsFloat extracts a numeric default for a float (bitSize=32)
 // or double (bitSize=64) field. The string arm is Java-parity lenient
-// (accepts hex floats etc.); the json.Number arm is JSON-strict.
+// (accepts hex floats etc.); the json.Number arm is JSON-strict. The
+// int64/int32 arms apply intFitsFloat's mantissa-precision check —
+// metadata-API consumers (branchAcceptsDefault) pass normalized int64
+// values directly through this helper so the accept set agrees with
+// the wire path for the same JSON literal.
 func defaultAsFloat(val any, bitSize int) (float64, error) {
 	switch v := val.(type) {
 	case json.Number:
@@ -2864,6 +2886,10 @@ func defaultAsFloat(val any, bitSize int) (float64, error) {
 			return 0, fmt.Errorf("invalid string default %q: %w", v, err)
 		}
 		return f, nil
+	case int64:
+		return intFitsFloat(v, bitSize)
+	case int32:
+		return intFitsFloat(int64(v), bitSize)
 	}
 	return 0, fmt.Errorf("expected number, got %T", val)
 }
