@@ -477,6 +477,13 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		return udDouble(k)
 	case "string":
 		if k == reflect.String {
+			// json.Number-typed string fields fall through to the safe path
+			// so setStringValue's rejectJSONNumberStringTarget guard fires;
+			// the unsafe path's direct *(*string)(p)=... pointer store
+			// would silently violate json.Number's RFC 8259 invariant.
+			if goType == jsonNumberType {
+				return nil
+			}
 			return udStringDeser
 		}
 	case "bytes":
@@ -606,6 +613,9 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 				return udFixedUUID
 			}
 			if goType.Kind() == reflect.String {
+				if goType == jsonNumberType {
+					return nil // safe path enforces json.Number guard
+				}
 				return udFixedUUIDString
 			}
 			return nil // any, []byte etc. handled by reflect path
@@ -614,6 +624,9 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 			return udUUID
 		}
 		if goType.Kind() == reflect.String {
+			if goType == jsonNumberType {
+				return nil // safe path enforces json.Number guard
+			}
 			return udStringDeser
 		}
 	}

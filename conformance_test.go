@@ -19221,3 +19221,168 @@ func TestRegression_JSONNumberTargetRejectedForStringLikeWire(t *testing.T) {
 		}
 	})
 }
+
+// TestRegression_JSONNumberMapKeyRejected pins that map decode targets keyed
+// by json.Number are rejected at decode entry. Avro map keys (and record
+// field names when a record is decoded as map[K]V) are wire strings with
+// no JSON-number contract; writing them into json.Number keys silently
+// produces values that violate json.Number's RFC 8259 invariant and fail
+// at the user's first json.Marshal call far from the decode site. Same
+// policy as TestRegression_JSONNumberTargetRejectedForStringLikeWire,
+// applied at the key axis instead of the value axis.
+//
+// Covers five entry points: binary deserMap, binary deserRecord-to-map,
+// JSON decodeMap, JSON decodeRecordMap, and resolved record-to-map.
+func TestRegression_JSONNumberMapKeyRejected(t *testing.T) {
+	t.Run("binary_map", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"int"}`)
+		wire, err := s.Encode(map[string]int{"foo": 1})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[json.Number]int
+		if _, err := s.Decode(wire, &got); err == nil {
+			t.Errorf("binary map decode accepted map[json.Number]int target; got %v", got)
+		}
+	})
+	t.Run("json_map", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"int"}`)
+		var got map[json.Number]int
+		if err := s.DecodeJSON([]byte(`{"foo": 1}`), &got); err == nil {
+			t.Errorf("JSON map decode accepted map[json.Number]int target; got %v", got)
+		}
+	})
+	t.Run("binary_record_as_map", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"alpha","type":"int"}]}`)
+		wire, err := s.Encode(map[string]int{"alpha": 1})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[json.Number]int
+		if _, err := s.Decode(wire, &got); err == nil {
+			t.Errorf("binary record-to-map decode accepted map[json.Number]int target; got %v", got)
+		}
+	})
+	t.Run("json_record_as_map", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"alpha","type":"int"}]}`)
+		var got map[json.Number]int
+		if err := s.DecodeJSON([]byte(`{"alpha": 1}`), &got); err == nil {
+			t.Errorf("JSON record-to-map decode accepted map[json.Number]int target; got %v", got)
+		}
+	})
+	t.Run("resolve_record_as_map", func(t *testing.T) {
+		// Writer schema + reader schema with an added defaulted field so
+		// Resolve produces a resolvedRecord that exercises deserMap.
+		writer := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"alpha","type":"int"}]}`)
+		reader := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"alpha","type":"int"},{"name":"beta","type":"int","default":7}]}`)
+		resolved, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		wire, err := writer.Encode(map[string]int{"alpha": 1})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[json.Number]int
+		if _, err := resolved.Decode(wire, &got); err == nil {
+			t.Errorf("resolved record-to-map decode accepted map[json.Number]int target; got %v", got)
+		}
+	})
+	// Sibling baseline: map[string]V keeps working.
+	t.Run("map_string_baseline_accepted", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"int"}`)
+		wire, _ := s.Encode(map[string]int{"foo": 1})
+		var got map[string]int
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("map[string]int baseline rejected: %v", err)
+		}
+		if got["foo"] != 1 {
+			t.Errorf("map[string]int baseline got=%v, want {foo:1}", got)
+		}
+	})
+	// Sibling baseline: map keyed by a named string subtype keeps working
+	// — Kind()==reflect.String and Type()!=jsonNumberType, so the new
+	// reject doesn't fire.
+	t.Run("map_named_string_baseline_accepted", func(t *testing.T) {
+		type Key string
+		s := avro.MustParse(`{"type":"map","values":"int"}`)
+		wire, _ := s.Encode(map[string]int{"foo": 1})
+		var got map[Key]int
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("map[NamedString]int baseline rejected: %v", err)
+		}
+		if got["foo"] != 1 {
+			t.Errorf("map[NamedString]int baseline got=%v, want {foo:1}", got)
+		}
+	})
+}
+
+// TestRegression_JSONNumberUnsafeStructFieldRejected pins that a
+// json.Number-typed struct field for a string-like Avro type rejects
+// regardless of whether the unsafe fast-path or the safe reflect path
+// runs. The safe path's setStringValue applies rejectJSONNumberStringTarget
+// at deser.go; the unsafe path's udStringDeser / udFixedUUIDString do a
+// direct *(*string)(p) = ... pointer store that bypassed the guard
+// before the fix. compileFastDeser is selected automatically for
+// addressable struct decode targets (the common Decode(&dst) pattern), so
+// without the fix the bug fires on the typical user-facing surface.
+//
+// Covers three dispatch positions: basic string (unsafe.go:480), string +
+// uuid logical (unsafe.go:617), fixed + uuid logical (unsafe.go:609).
+func TestRegression_JSONNumberUnsafeStructFieldRejected(t *testing.T) {
+	t.Run("string_field", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"string"}]}`)
+		wire, err := s.Encode(map[string]any{"f": "hello-world"})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var dst struct {
+			F json.Number `avro:"f"`
+		}
+		if _, err := s.Decode(wire, &dst); err == nil {
+			t.Errorf("unsafe struct field json.Number for string accepted %q; expected reject per RFC 8259 contract", string(dst.F))
+		}
+	})
+	t.Run("string_uuid_logical_field", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"u","type":{"type":"string","logicalType":"uuid"}}]}`)
+		wire, err := s.Encode(map[string]any{"u": "550e8400-e29b-41d4-a716-446655440000"})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var dst struct {
+			U json.Number `avro:"u"`
+		}
+		if _, err := s.Decode(wire, &dst); err == nil {
+			t.Errorf("unsafe struct field json.Number for string+uuid accepted %q; expected reject", string(dst.U))
+		}
+	})
+	t.Run("fixed_uuid_logical_field", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"u","type":{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}}]}`)
+		wire, err := s.Encode(map[string]any{"u": "550e8400-e29b-41d4-a716-446655440000"})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var dst struct {
+			U json.Number `avro:"u"`
+		}
+		if _, err := s.Decode(wire, &dst); err == nil {
+			t.Errorf("unsafe struct field json.Number for fixed+uuid accepted %q; expected reject", string(dst.U))
+		}
+	})
+	// Sibling baseline: string-typed struct field on the same path
+	// keeps working — confirms the fix is scoped to json.Number, not
+	// blanket rejection of string-kind targets.
+	t.Run("plain_string_field_baseline_accepted", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"string"}]}`)
+		wire, _ := s.Encode(map[string]any{"f": "hello"})
+		var dst struct {
+			F string `avro:"f"`
+		}
+		if _, err := s.Decode(wire, &dst); err != nil {
+			t.Fatalf("plain string field baseline rejected: %v", err)
+		}
+		if dst.F != "hello" {
+			t.Errorf("got dst.F=%q, want \"hello\"", dst.F)
+		}
+	})
+}

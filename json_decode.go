@@ -279,12 +279,7 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 	// which accepts a date-string on encode (tryParseDateString).
 	// Parity with deserDate on the binary side.
 	if v.Kind() == reflect.String && node.logical == "date" {
-		s := dateToTime(val).Format(time.DateOnly)
-		if err := rejectJSONNumberStringTarget(v, s, "int"); err != nil {
-			return err
-		}
-		v.SetString(s)
-		return nil
+		return setStringTarget(v, dateToTime(val).Format(time.DateOnly), "int")
 	}
 	return setIntValue(v, val)
 }
@@ -352,12 +347,7 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 		default:
 			return setLongValue(v, val)
 		}
-		s := t.Format(time.RFC3339Nano)
-		if err := rejectJSONNumberStringTarget(v, s, "long"); err != nil {
-			return err
-		}
-		v.SetString(s)
-		return nil
+		return setStringTarget(v, t.Format(time.RFC3339Nano), "long")
 	}
 	return setLongValue(v, val)
 }
@@ -494,11 +484,7 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny bo
 		return setIface(v, reflect.ValueOf(s), "string")
 	}
 	if v.Kind() == reflect.String {
-		if err := rejectJSONNumberStringTarget(v, s, "string"); err != nil {
-			return err
-		}
-		v.SetString(s)
-		return nil
+		return setStringTarget(v, s, "string")
 	}
 	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
 	// should use their text parsing, not raw byte assignment. Mirrors
@@ -628,12 +614,7 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode) error {
 		if len(b) == 16 && v.Kind() == reflect.String {
 			var u [16]byte
 			copy(u[:], b)
-			s := uuidToString(u)
-			if err := rejectJSONNumberStringTarget(v, s, "fixed"); err != nil {
-				return err
-			}
-			v.SetString(s)
-			return nil
+			return setStringTarget(v, uuidToString(u), "fixed")
 		}
 	}
 	// Generic byte-target fall-through shared with the binary path.
@@ -816,6 +797,9 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 	if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
 		return semErr(v, "map")
 	}
+	if err := rejectJSONNumberMapKey(v.Type(), "map"); err != nil {
+		return err
+	}
 	if v.IsNil() {
 		v.Set(reflect.MakeMap(v.Type()))
 	}
@@ -989,6 +973,9 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 }
 
 func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error {
+	if err := rejectJSONNumberMapKey(v.Type(), "record"); err != nil {
+		return err
+	}
 	if v.IsNil() {
 		v.Set(reflect.MakeMapWithSize(v.Type(), len(node.fields)))
 	}

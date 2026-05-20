@@ -405,6 +405,9 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 }
 
 func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
+	if err := rejectJSONNumberMapKey(t, "record"); err != nil {
+		return nil, err
+	}
 	if v.IsNil() {
 		v.Set(reflect.MakeMapWithSize(t, len(rr.readerNames)))
 	}
