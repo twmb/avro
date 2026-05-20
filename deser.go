@@ -792,6 +792,28 @@ func schemaMinBytesSeen(n *schemaNode, seen map[*schemaNode]struct{}) int {
 	return 1
 }
 
+// fastPathSafeForElem reports whether a primitive fast loop with expected
+// kind fastElemKind is safe for slice/map elements of type elemType.
+// Returns false when:
+//   - Kind doesn't match (the existing primitive-fast-path screen), OR
+//   - elemType is json.Number (whose Kind() == reflect.String matches the
+//     string fast path's expected kind, but whose stdlib RFC 8259 contract
+//     requires per-element setStringTarget consultation via
+//     rejectJSONNumberStringTarget). The fast string loops
+//     (deserArrayStringLoop, deserMapStringBlock) capture
+//     reflect.Value.SetString as a method expression and invoke it via
+//     closure with no guard — Pattern 14c (BUG_AUDIT.md) helper-bypass-via-
+//     function-value-capture. Routing json.Number elements through the
+//     slow path activates the guard at the per-element setter.
+//
+// One predicate consulted by both deserArray.deser and deserMap.deser so
+// the fast-path-vs-guard rule lives in one place — drift impossible by
+// construction. Inlines at cost 67 (within Go's mid-stack inliner budget
+// of 80), so the gate has no call overhead at runtime.
+func fastPathSafeForElem(elemType reflect.Type, fastElemKind reflect.Kind) bool {
+	return elemType.Kind() == fastElemKind && elemType != jsonNumberType
+}
+
 func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if sl.depth >= maxDepth {
 		return nil, errTooDeep
@@ -825,7 +847,9 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	}
 	// For primitive item types with matching Go element types, use
 	// a specialized loop that avoids per-element function pointer calls.
-	useFast := !iface && s.fastLoop != nil && sliceType.Elem().Kind() == s.fastElemKind
+	// fastPathSafeForElem screens both the Kind match and the json.Number
+	// guard-bypass case — see its docstring.
+	useFast := !iface && s.fastLoop != nil && fastPathSafeForElem(sliceType.Elem(), s.fastElemKind)
 	// For interface targets with primitive avro items, use the iface
 	// fast loop that operates directly on []any.
 	useFastIface := iface && s.fastIfaceLoop != nil
@@ -1111,7 +1135,9 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	}
 	// For primitive value types with matching Go element types, use
 	// reusable reflect.Value containers to avoid per-entry allocations.
-	useFast := !iface && s.fastBlock != nil && elemTyp.Kind() == s.fastElemKind
+	// fastPathSafeForElem screens both the Kind match and the json.Number
+	// guard-bypass case — see its docstring.
+	useFast := !iface && s.fastBlock != nil && fastPathSafeForElem(elemTyp, s.fastElemKind)
 	// For interface targets with primitive avro values, use the
 	// iface-block fast path that operates directly on map[string]any.
 	useFastIface := iface && s.fastIfaceVal != nil

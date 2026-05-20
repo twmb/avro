@@ -19386,3 +19386,128 @@ func TestRegression_JSONNumberUnsafeStructFieldRejected(t *testing.T) {
 		}
 	})
 }
+
+// TestRegression_JSONNumberSliceMapElementRejected pins that decoding into
+// []json.Number or map[string]json.Number targets rejects when the Avro
+// schema's element/value type is a string-like wire kind. json.Number's
+// stdlib contract requires the underlying string to be a valid RFC 8259
+// number literal; arbitrary Avro string content (which legitimately can be
+// any UTF-8) violates that. Writing such content into a json.Number
+// element would produce values that fail encoding/json.Marshal at the
+// user's first downstream call — far from the decode site, with a
+// confusing stdlib error.
+//
+// rejectJSONNumberStringTarget enforces this for every wire string-like
+// setter (setStringValue, setBytesValue, setEnumTarget, decodeString's
+// reflect.String arm). The binary array/map block paths are siblings of
+// those setters; the same rule applies. Routing json.Number element
+// targets through the per-element path (instead of the fast block loop's
+// bare reflect.Value.SetString) makes the policy uniform.
+//
+// Covers both top-level slice/map targets and struct fields holding such
+// slices/maps: the unsafe path's json.Number guard is per-leaf-field and
+// doesn't peek into slice/map element types, so struct fields fall back to
+// the safe deserArray/deserMap path and inherit the same rule.
+func TestRegression_JSONNumberSliceMapElementRejected(t *testing.T) {
+	arraySchema := avro.MustParse(`{"type":"array","items":"string"}`)
+	mapSchema := avro.MustParse(`{"type":"map","values":"string"}`)
+
+	// Pre-encode wires using []string / map[string]string baselines.
+	arrayWire, err := arraySchema.Encode([]string{"hello", "ACME-PO-7791"})
+	if err != nil {
+		t.Fatalf("encode array: %v", err)
+	}
+	mapWire, err := mapSchema.Encode(map[string]string{"k": "world"})
+	if err != nil {
+		t.Fatalf("encode map: %v", err)
+	}
+
+	t.Run("top_level_slice", func(t *testing.T) {
+		var got []json.Number
+		if _, err := arraySchema.Decode(arrayWire, &got); err == nil {
+			t.Errorf("array<string> → []json.Number accepted %v; expected reject per RFC 8259 contract", got)
+		}
+	})
+	t.Run("top_level_map", func(t *testing.T) {
+		var got map[string]json.Number
+		if _, err := mapSchema.Decode(mapWire, &got); err == nil {
+			t.Errorf("map<string> → map[string]json.Number accepted %v; expected reject per RFC 8259 contract", got)
+		}
+	})
+	t.Run("struct_field_slice", func(t *testing.T) {
+		recordSchema := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"arr","type":{"type":"array","items":"string"}}]}`)
+		wire, err := recordSchema.Encode(map[string]any{"arr": []string{"hello"}})
+		if err != nil {
+			t.Fatalf("encode record-with-array: %v", err)
+		}
+		var got struct {
+			Arr []json.Number `avro:"arr"`
+		}
+		if _, err := recordSchema.Decode(wire, &got); err == nil {
+			t.Errorf("record-with-[]json.Number-field accepted %v; expected reject", got)
+		}
+	})
+	t.Run("struct_field_map", func(t *testing.T) {
+		recordSchema := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"map","values":"string"}}]}`)
+		wire, err := recordSchema.Encode(map[string]any{"m": map[string]string{"k": "hello"}})
+		if err != nil {
+			t.Fatalf("encode record-with-map: %v", err)
+		}
+		var got struct {
+			M map[string]json.Number `avro:"m"`
+		}
+		if _, err := recordSchema.Decode(wire, &got); err == nil {
+			t.Errorf("record-with-map[string]json.Number-field accepted %v; expected reject", got)
+		}
+	})
+
+	// Sibling baselines: these must continue to accept after the fix so
+	// the rule is scoped to json.Number, not blanket rejection of
+	// string-kind elements/values.
+	t.Run("plain_string_slice_baseline_accepted", func(t *testing.T) {
+		var got []string
+		if _, err := arraySchema.Decode(arrayWire, &got); err != nil {
+			t.Fatalf("[]string baseline rejected: %v", err)
+		}
+		if len(got) != 2 || got[0] != "hello" || got[1] != "ACME-PO-7791" {
+			t.Errorf("[]string got=%v, want [hello ACME-PO-7791]", got)
+		}
+	})
+	t.Run("named_string_subtype_slice_baseline_accepted", func(t *testing.T) {
+		// Named string subtype: Kind()==reflect.String but
+		// Type()!=jsonNumberType, so no contract violation and the fast
+		// path still applies.
+		type Tag string
+		var got []Tag
+		if _, err := arraySchema.Decode(arrayWire, &got); err != nil {
+			t.Fatalf("[]NamedString baseline rejected: %v", err)
+		}
+		if len(got) != 2 || got[0] != "hello" || got[1] != "ACME-PO-7791" {
+			t.Errorf("[]NamedString got=%v, want [hello ACME-PO-7791]", got)
+		}
+	})
+	t.Run("plain_string_map_baseline_accepted", func(t *testing.T) {
+		var got map[string]string
+		if _, err := mapSchema.Decode(mapWire, &got); err != nil {
+			t.Fatalf("map[string]string baseline rejected: %v", err)
+		}
+		if got["k"] != "world" {
+			t.Errorf("map[string]string got=%v, want {k:world}", got)
+		}
+	})
+	t.Run("logical_uuid_string_slice_still_rejected", func(t *testing.T) {
+		// Logical-typed string disables the fast path at schema build, so
+		// the per-element setStringTarget already catches json.Number.
+		// This sibling pins the slow-path arm so the fix doesn't change
+		// its behavior accidentally.
+		uuidArr := avro.MustParse(`{"type":"array","items":{"type":"string","logicalType":"uuid"}}`)
+		wire, err := uuidArr.Encode([]string{"550e8400-e29b-41d4-a716-446655440000"})
+		if err != nil {
+			t.Fatalf("encode uuid array: %v", err)
+		}
+		var got []json.Number
+		if _, err := uuidArr.Decode(wire, &got); err == nil {
+			t.Errorf("array<string+uuid> → []json.Number accepted; expected reject")
+		}
+	})
+}
