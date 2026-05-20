@@ -47,9 +47,20 @@ func TestCanonicalStripsLogicalType(t *testing.T) {
 			`"int"`,
 		},
 		{
-			"error preserves type",
+			// Java SchemaNormalization.build and fastavro's
+			// _to_parsing_canonical_form both emit "type":"record" for an
+			// error-typed record (Java stores both as Type.RECORD with an
+			// `isError` flag the canonical form ignores; fastavro
+			// explicitly `elif schema_type == "record" or schema_type ==
+			// "error":` writes "record"). Normalizing here is what makes
+			// twmb's Rabin / SHA-256 / MD5 fingerprints match Java's and
+			// fastavro's for error-typed schemas — Schema.Root().Type
+			// and Schema.String() still preserve the JSON-as-written
+			// "error" via the isRecordKind path; only the canonical
+			// surface normalizes.
+			"error normalizes to record",
 			`{"type":"error","name":"E","fields":[{"name":"x","type":"int"}]}`,
-			`{"name":"E","type":"error","fields":[{"name":"x","type":"int"}]}`,
+			`{"name":"E","type":"record","fields":[{"name":"x","type":"int"}]}`,
 		},
 	}
 	for _, tt := range tests {

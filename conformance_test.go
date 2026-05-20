@@ -18990,3 +18990,234 @@ func TestRegression_ArrayMapForwardReferenceAccepted(t *testing.T) {
 		}
 	})
 }
+
+// TestRegression_RecordFieldNameAliasUniqueness pins that the spec's
+// uniqueness constraint on field names AND aliases ("Aliases are
+// alternative names, and thus subject to the same uniqueness constraints
+// as names") is enforced symmetrically: a later field name colliding with
+// an earlier field's alias rejects, just like a later alias colliding
+// with an earlier name. Without symmetric enforcement the schema parses
+// but the resolver routes the writer's value to the literal-named reader
+// field, while Java's applyAliases routes it to the alias-named reader
+// field — a silent Java-divergent data mis-routing on any schema that
+// declares the aliased field first.
+func TestRegression_RecordFieldNameAliasUniqueness(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{
+			"alias_then_name_colliding",
+			`{"type":"record","name":"R","fields":[
+				{"name":"a","type":"int","default":0,"aliases":["x"]},
+				{"name":"x","type":"int","default":0}
+			]}`,
+		},
+		{
+			"name_then_alias_colliding",
+			`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"int","default":0},
+				{"name":"a","type":"int","default":0,"aliases":["x"]}
+			]}`,
+		},
+		{
+			"two_aliases_colliding",
+			`{"type":"record","name":"R","fields":[
+				{"name":"a","type":"int","default":0,"aliases":["shared"]},
+				{"name":"b","type":"int","default":0,"aliases":["shared"]}
+			]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := avro.Parse(tc.schema); err == nil {
+				t.Errorf("expected parse rejection for name/alias collision; schema accepted")
+			}
+		})
+	}
+	// Sibling boundary: unique names + unique aliases still parse, so the
+	// uniqueness predicate isn't over-rejecting.
+	t.Run("unique_names_and_aliases_still_parse", func(t *testing.T) {
+		schema := `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int","default":0,"aliases":["x","y"]},
+			{"name":"b","type":"int","default":0,"aliases":["z","w"]}
+		]}`
+		if _, err := avro.Parse(schema); err != nil {
+			t.Errorf("unique alias set rejected: %v", err)
+		}
+	})
+}
+
+// TestRegression_ErrorTypeCanonicalNormalizesToRecord pins that the
+// Parsing Canonical Form normalizes a record declared as
+// {"type":"error",...} to {"type":"record",...}, matching Java's
+// SchemaNormalization.build (Schema.Type.RECORD.getName() == "record"
+// for both record-typed and error-typed records) and fastavro's
+// _to_parsing_canonical_form ("elif schema_type == 'record' or
+// schema_type == 'error': fo.write(... \"type\":\"record\" ...)").
+// Without normalization, twmb's Rabin/SHA-256/MD5 fingerprint of an
+// error-typed schema diverges from Java's and fastavro's, breaking
+// Single Object Encoding interop and schema-registry fingerprint
+// indexing for any schema that uses error records.
+//
+// Schema.Root().Type, Schema.String(), and SchemaNode.Schema()
+// round-trip still preserve the JSON-as-written "error" (intentional
+// per the isRecordKind design at schema_node.go); only the canonical
+// surface is normalized.
+func TestRegression_ErrorTypeCanonicalNormalizesToRecord(t *testing.T) {
+	cases := []struct {
+		name string
+		err  string
+		rec  string
+	}{
+		{
+			"top_level",
+			`{"type":"error","name":"e","fields":[{"name":"f","type":"long"}]}`,
+			`{"type":"record","name":"e","fields":[{"name":"f","type":"long"}]}`,
+		},
+		{
+			"with_namespace",
+			`{"type":"error","name":"e","namespace":"x.y","fields":[{"name":"f","type":"long"}]}`,
+			`{"type":"record","name":"e","namespace":"x.y","fields":[{"name":"f","type":"long"}]}`,
+		},
+		{
+			"nested_in_record",
+			`{"type":"record","name":"Outer","fields":[{"name":"e","type":{"type":"error","name":"Inner","fields":[]}}]}`,
+			`{"type":"record","name":"Outer","fields":[{"name":"e","type":{"type":"record","name":"Inner","fields":[]}}]}`,
+		},
+		{
+			"nested_in_union",
+			`{"type":"record","name":"Outer","fields":[{"name":"e","type":["null",{"type":"error","name":"Inner","fields":[]}]}]}`,
+			`{"type":"record","name":"Outer","fields":[{"name":"e","type":["null",{"type":"record","name":"Inner","fields":[]}]}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			se, err := avro.Parse(tc.err)
+			if err != nil {
+				t.Fatalf("parse error variant: %v", err)
+			}
+			sr, err := avro.Parse(tc.rec)
+			if err != nil {
+				t.Fatalf("parse record variant: %v", err)
+			}
+			ce := se.Canonical()
+			cr := sr.Canonical()
+			if !bytes.Equal(ce, cr) {
+				t.Errorf("canonical mismatch for error vs record variant\n  err: %s\n  rec: %s", ce, cr)
+			}
+			// Fingerprint parity follows from canonical parity, but pin it
+			// independently so a future change to fingerprint construction
+			// can't silently break it.
+			h1 := avro.NewRabin()
+			h1.Write(se.Canonical())
+			h2 := avro.NewRabin()
+			h2.Write(sr.Canonical())
+			if h1.Sum64() != h2.Sum64() {
+				t.Errorf("Rabin fingerprint mismatch: error=%x record=%x", h1.Sum64(), h2.Sum64())
+			}
+		})
+	}
+	// Sibling: Schema.Root().Type preserves the JSON-as-written "error"
+	// per the documented intentional divergence — the normalization is
+	// canonical-surface only.
+	t.Run("root_type_still_preserves_error", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"error","name":"e","fields":[{"name":"f","type":"long"}]}`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if got := s.Root().Type; got != "error" {
+			t.Errorf("Root().Type=%q, want \"error\" (preserved-as-written contract)", got)
+		}
+	})
+}
+
+// TestRegression_JSONNumberTargetRejectedForStringLikeWire pins that
+// decoding a string/bytes/fixed/enum wire value into a json.Number
+// target rejects, mirroring setFloatValue's existing reject for
+// non-finite floats decoded into json.Number. json.Number's stdlib
+// contract requires the underlying string to be a valid RFC 8259
+// number literal; encoding/json.Marshal fails on json.Number values
+// violating that contract. Pre-fix the decoder silently wrote arbitrary
+// wire string content into the json.Number target, producing values
+// that fail json.Marshal far from the decode site.
+//
+// Covers all four dispatch sites: setStringValue (deserString +
+// promoteBytesToString), setBytesValue (deserBytes + deserFixed +
+// promoteStringToBytes + decimal opaque pass-through + JSON
+// assignBytes), setEnumTarget (deserEnum + resolveEnum + decodeEnum),
+// and decodeString's direct string arm.
+func TestRegression_JSONNumberTargetRejectedForStringLikeWire(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		goValue any
+	}{
+		{"string_plain", `"string"`, "hello"},
+		{"bytes_plain", `"bytes"`, []byte("hello")},
+		{"fixed_size5", `{"type":"fixed","name":"f","size":5}`, []byte("hello")},
+		{"enum", `{"type":"enum","name":"E","symbols":["A","B"]}`, "A"},
+		{"string_uuid_logical", `{"type":"string","logicalType":"uuid"}`, "550e8400-e29b-41d4-a716-446655440000"},
+		// Sibling logical-type cases: the int/long wire is numeric, but
+		// the decoder formats it as an RFC3339 / DateOnly / UUID-hex-dash
+		// string before assigning to reflect.String. json.Number target
+		// would receive that non-number-literal string. Reject by the
+		// same contract: users targeting json.Number for a time/date
+		// logical type should target int32/int64 instead and pick the
+		// numeric representation they want.
+		{"date_logical", `{"type":"int","logicalType":"date"}`, time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)},
+		{"timestamp_millis_logical", `{"type":"long","logicalType":"timestamp-millis"}`, time.Date(2024, 1, 15, 12, 30, 45, 0, time.UTC)},
+		{"timestamp_micros_logical", `{"type":"long","logicalType":"timestamp-micros"}`, time.Date(2024, 1, 15, 12, 30, 45, 0, time.UTC)},
+		{"fixed_uuid_logical", `{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`, [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"_binary", func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			wire, err := s.Encode(tc.goValue)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var got json.Number
+			if _, err := s.Decode(wire, &got); err == nil {
+				t.Errorf("binary decode accepted string-like wire into json.Number=%q; expected SemanticError per RFC 8259 contract", string(got))
+			}
+		})
+		t.Run(tc.name+"_json", func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			// Produce the JSON wire form via the encoder so the test
+			// doesn't have to hand-craft codepoint strings (16-byte
+			// uuid-fixed wire would otherwise need NUL bytes in source).
+			jsonWire, err := s.EncodeJSON(tc.goValue)
+			if err != nil {
+				t.Fatalf("encode JSON: %v", err)
+			}
+			var got json.Number
+			if err := s.DecodeJSON(jsonWire, &got); err == nil {
+				t.Errorf("JSON decode accepted string-like wire into json.Number=%q; expected SemanticError per RFC 8259 contract", string(got))
+			}
+		})
+	}
+	// Sibling boundary: json.Number target for actual numeric schemas
+	// still works — the reject is scoped to string-like wire shapes,
+	// not blanket json.Number rejection.
+	t.Run("json_number_target_for_long_still_accepted", func(t *testing.T) {
+		s := avro.MustParse(`"long"`)
+		wire, err := s.Encode(int64(42))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got json.Number
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("binary decode rejected json.Number target for long: %v", err)
+		}
+		if string(got) != "42" {
+			t.Errorf("got json.Number=%q, want \"42\"", string(got))
+		}
+	})
+}

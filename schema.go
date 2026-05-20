@@ -1811,9 +1811,29 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	// Canonical form: per the Avro spec's Parsing Canonical Form STRIP
 	// rule, keep only: type, name, fields, symbols, items, values, size.
 	// Strip all others (logicalType, precision, scale, doc, aliases, etc.).
+	//
+	// "error" normalizes to "record" so the canonical form (and therefore
+	// every Fingerprint hash) matches Java's SchemaNormalization.build
+	// (`Schema.Type.RECORD.getName()` returns "record" for both record-
+	// typed and error-typed records, since Java's parser stores both as
+	// `Type.RECORD` with an `isError` flag the canonical form ignores)
+	// and fastavro's `_to_parsing_canonical_form` (which explicitly
+	// `elif schema_type == "record" or schema_type == "error":` emits
+	// `"type":"record"`). Without this, Rabin / SHA-256 / MD5 fingerprints
+	// for error-typed schemas diverge silently from Java's and
+	// fastavro's, breaking Single Object Encoding interop and schema-
+	// registry fingerprint indexing.
+	//
+	// Schema.Root().Type, Schema.String(), and SchemaNode.Schema()
+	// round-trip continue to preserve the JSON-as-written "error" —
+	// only the canonical-surface fingerprint normalizes.
+	canonType := o.Type
+	if canonType == "error" {
+		canonType = "record"
+	}
 	canonObj := &aobject{
 		Name: o.Name,
-		Type: o.Type,
+		Type: canonType,
 
 		Fields:  o.Fields,
 		Symbols: o.Symbols,
@@ -2037,8 +2057,21 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// canonical name so JSON producers that emit using an alias name
 		// route to the right field. The binary path's resolve.go does the
 		// equivalent alias-aware lookup via findReaderFieldIndex.
+		// Per Avro spec ("Aliases are alternative names, and thus subject
+		// to the same uniqueness constraints as names"), a field name AND
+		// alias share one namespace within a record. Reject symmetrically:
+		// either a later name shadowing a prior alias, or a later alias
+		// shadowing a prior name/alias, breaks uniqueness. Pre-fix only
+		// the alias-side check fired, which let `[{name:"a",aliases:["x"]},
+		// {name:"x"}]` silently parse and then route differently from
+		// Java's applyAliases (writer's "x" mapped to literal-named "x"
+		// here, but Java rewrites writer's "x" → "a" first via the
+		// alias).
 		nd.fieldIdx = make(map[string]int, len(nd.fields))
 		for i, f := range nd.fields {
+			if _, exists := nd.fieldIdx[f.name]; exists {
+				return fmt.Errorf("record field name %q collides with another field name or alias", f.name)
+			}
 			nd.fieldIdx[f.name] = i
 			for _, a := range f.aliases {
 				if _, exists := nd.fieldIdx[a]; exists {

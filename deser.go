@@ -522,6 +522,9 @@ func setEnumTarget(v reflect.Value, idx int, symbol string) error {
 	case v.Kind() == reflect.Interface:
 		return setIface(v, reflect.ValueOf(symbol), "enum")
 	case v.Kind() == reflect.String:
+		if err := rejectJSONNumberStringTarget(v, symbol, "enum"); err != nil {
+			return err
+		}
 		v.SetString(symbol)
 		return nil
 	case v.CanInt():
@@ -1348,7 +1351,11 @@ func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		// isUUIDType, so direct Set is safe (no interface check).
 		v.Set(reflect.ValueOf(b))
 	case v.Kind() == reflect.String:
-		v.SetString(uuidToString(b))
+		s := uuidToString(b)
+		if err := rejectJSONNumberStringTarget(v, s, "fixed"); err != nil {
+			return nil, err
+		}
+		v.SetString(s)
 	case v.Type().Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8:
 		// Copy: SetBytes(src[:16]) would alias the caller's input buffer,
 		// so a later overwrite of src would silently corrupt the decoded
@@ -1388,7 +1395,11 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		// string of the right length and writes raw bytes; decoder
 		// reads raw bytes and materializes them as a string. Same
 		// shape as deserBytes's reflect.String arm.
-		v.SetString(string(src[:s.n]))
+		str := string(src[:s.n])
+		if err := rejectJSONNumberStringTarget(v, str, "fixed"); err != nil {
+			return nil, err
+		}
+		v.SetString(str)
 		return src[s.n:], nil
 	}
 	if t.Kind() != reflect.Array || t.Elem().Kind() != reflect.Uint8 {
@@ -1404,6 +1415,32 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 ///////////////////////////////
 // LOGICAL TYPE DESERIALIZERS //
 ///////////////////////////////
+
+// rejectJSONNumberStringTarget reports a SemanticError when v is a
+// json.Number target receiving string-like wire content (the string,
+// bytes, fixed, or enum-symbol cases). json.Number's encoding/json
+// contract requires the underlying string to be a valid RFC 8259 number
+// literal — arbitrary wire strings violate that and encoding/json.Marshal
+// rejects the resulting json.Number at the user's first attempt to
+// re-serialize it, far from the decode site.
+//
+// Mirrors setFloatValue's non-finite reject (which also has no valid JSON
+// number representation) and the encode-side rejection at appendAvroString
+// (json.Number is not an accepted input for "string"). Without this
+// guard the decoder silently produced invalid json.Number values whose
+// .String() didn't satisfy json.Number's stdlib invariant.
+//
+// One predicate consulted by every string-like-wire setter
+// (setStringValue, setBytesValue, setEnumTarget, decodeString's direct
+// string arm) so the json.Number contract guard can't drift across the
+// four dispatch sites.
+func rejectJSONNumberStringTarget(v reflect.Value, content, avroType string) error {
+	if v.Type() != jsonNumberType {
+		return nil
+	}
+	return &SemanticError{GoType: v.Type(), AvroType: avroType,
+		Err: fmt.Errorf("string-like value %q has no JSON number representation", content)}
+}
 
 // setFloatValue sets v to f, handling interface, float, integer (whole-number),
 // and json.Number targets. bits is 32 or 64, the source width — used for
@@ -1507,7 +1544,11 @@ func setBytesValue(v reflect.Value, b []byte, avroType string) error {
 		}
 		reflect.Copy(v, reflect.ValueOf(b))
 	case reflect.String:
-		v.SetString(string(b))
+		s := string(b)
+		if err := rejectJSONNumberStringTarget(v, s, avroType); err != nil {
+			return err
+		}
+		v.SetString(s)
 	default:
 		return &SemanticError{GoType: v.Type(), AvroType: avroType}
 	}
@@ -1524,7 +1565,11 @@ func setStringValue(v reflect.Value, src []byte, n int, sl *slab) error {
 		return setIface(v, reflect.ValueOf(sl.string(src, n)), "string")
 	}
 	if v.Kind() == reflect.String {
-		v.SetString(sl.string(src, n))
+		s := sl.string(src, n)
+		if err := rejectJSONNumberStringTarget(v, s, "string"); err != nil {
+			return err
+		}
+		v.SetString(s)
 		return nil
 	}
 	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
@@ -1619,7 +1664,11 @@ func setTimeAsLongTarget(v reflect.Value, val int64, conv func(int64) time.Time)
 		return nil
 	}
 	if v.Kind() == reflect.String {
-		v.SetString(conv(val).Format(time.RFC3339Nano))
+		s := conv(val).Format(time.RFC3339Nano)
+		if err := rejectJSONNumberStringTarget(v, s, "long"); err != nil {
+			return err
+		}
+		v.SetString(s)
 		return nil
 	}
 	return setLongValue(v, val)
@@ -1654,7 +1703,11 @@ func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	// (ser.go's date arm + JSON "int" date arm both accept a date
 	// string on encode); the decoder emits ISO 8601 date-only.
 	if v.Kind() == reflect.String {
-		v.SetString(dateToTime(val).Format(time.DateOnly))
+		s := dateToTime(val).Format(time.DateOnly)
+		if err := rejectJSONNumberStringTarget(v, s, "int"); err != nil {
+			return nil, err
+		}
+		v.SetString(s)
 		return src, nil
 	}
 	return src, setIntValue(v, val)
@@ -1992,7 +2045,11 @@ func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		return src[n:], setIface(v, reflect.ValueOf(sl.string(src, n)), "string")
 	}
 	if v.Kind() == reflect.String {
-		v.SetString(sl.string(src, n))
+		s := sl.string(src, n)
+		if err := rejectJSONNumberStringTarget(v, s, "string"); err != nil {
+			return nil, err
+		}
+		v.SetString(s)
 		return src[n:], nil
 	}
 	b := make([]byte, n)

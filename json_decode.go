@@ -279,7 +279,11 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 	// which accepts a date-string on encode (tryParseDateString).
 	// Parity with deserDate on the binary side.
 	if v.Kind() == reflect.String && node.logical == "date" {
-		v.SetString(dateToTime(val).Format(time.DateOnly))
+		s := dateToTime(val).Format(time.DateOnly)
+		if err := rejectJSONNumberStringTarget(v, s, "int"); err != nil {
+			return err
+		}
+		v.SetString(s)
 		return nil
 	}
 	return setIntValue(v, val)
@@ -348,7 +352,11 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 		default:
 			return setLongValue(v, val)
 		}
-		v.SetString(t.Format(time.RFC3339Nano))
+		s := t.Format(time.RFC3339Nano)
+		if err := rejectJSONNumberStringTarget(v, s, "long"); err != nil {
+			return err
+		}
+		v.SetString(s)
 		return nil
 	}
 	return setLongValue(v, val)
@@ -486,6 +494,9 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny bo
 		return setIface(v, reflect.ValueOf(s), "string")
 	}
 	if v.Kind() == reflect.String {
+		if err := rejectJSONNumberStringTarget(v, s, "string"); err != nil {
+			return err
+		}
 		v.SetString(s)
 		return nil
 	}
@@ -617,7 +628,11 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode) error {
 		if len(b) == 16 && v.Kind() == reflect.String {
 			var u [16]byte
 			copy(u[:], b)
-			v.SetString(uuidToString(u))
+			s := uuidToString(u)
+			if err := rejectJSONNumberStringTarget(v, s, "fixed"); err != nil {
+				return err
+			}
+			v.SetString(s)
 			return nil
 		}
 	}
