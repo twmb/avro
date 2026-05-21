@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 )
 
@@ -617,14 +618,8 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 		// would diverge for ["string","float"] with default "1.5":
 		// wire picks string (first accept), but a transform-based
 		// helper would pick float because string→string is a no-op.
-		for i := range t.Branches {
-			branch := &t.Branches[i]
-			if resolved := lookupNameRef(branch, table); resolved != nil {
-				branch = resolved
-			}
-			if branchAcceptsDefault(branch, val, table) {
-				return coerceMetadataDefault(val, branch, table)
-			}
+		if branch := firstMetadataBranchAcceptingDefault(t, val, table); branch != nil {
+			return coerceMetadataDefault(val, branch, table)
 		}
 		return val
 	}
@@ -843,6 +838,16 @@ func defaultMatchesBytesOrFixedKind(t *SchemaNode, val any) bool {
 // "String-form float defaults" intentional divergence). bytes/fixed
 // branch accepts string (codepoint-mapped form per Avro JSON spec) or
 // []byte.
+//
+// The structural arms (record/error, array, map) recurse into children
+// so per-element validity mirrors the wire-side walkDefault. The record
+// arm enforces required-field-no-default presence; the array/map arms
+// require every item/value to itself accept against items/values.
+// Without these per-element checks, a union like [{record needing X},
+// {record needing nothing}] with default {} metadata-matches the first
+// branch (type-only) while the wire path picks the second (Java parity);
+// users type-switching on Default see a Go type that contradicts the
+// wire-decoded auto-fill.
 func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) bool {
 	// Resolve a bare name-reference if the caller supplied a name-table.
 	if resolved := lookupNameRef(t, table); resolved != nil {
@@ -867,29 +872,105 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) 
 		}
 		_, err := defaultAsFloat(val, bitSize)
 		return err == nil
-	case "string", "enum":
+	case "string":
 		_, ok := val.(string)
 		return ok
+	case "enum":
+		sym, ok := val.(string)
+		if !ok {
+			return false
+		}
+		// Wire-side validateLeaf for enum rejects non-member symbols
+		// (schema.go's enum arm at the `slices.Contains(node.symbols,
+		// sym)` check). Pre-fix this arm was lumped with "string" and
+		// accepted any string regardless of symbol membership, so a
+		// union [enum:{A,B}, bytes] with default "Z" metadata-matched
+		// the enum branch (type-only) while the wire path rejected
+		// enum and picked bytes. The len(t.Symbols)>0 guard mirrors
+		// the wire side and tolerates a fwd-ref'd enum whose Symbols
+		// haven't been populated yet during synchronous construction.
+		if len(t.Symbols) > 0 && !slices.Contains(t.Symbols, sym) {
+			return false
+		}
+		return true
 	case "bytes", "fixed":
 		return defaultMatchesBytesOrFixedKind(t, val)
 	case "record", "error":
-		_, ok := val.(map[string]any)
-		return ok
-	case "array":
-		_, ok := val.([]any)
-		return ok
-	case "map":
-		_, ok := val.(map[string]any)
-		return ok
-	case "union":
-		for i := range t.Branches {
-			if branchAcceptsDefault(&t.Branches[i], val, table) {
-				return true
+		m, ok := val.(map[string]any)
+		if !ok {
+			return false
+		}
+		for i := range t.Fields {
+			f := &t.Fields[i]
+			fv, present := m[f.Name]
+			if !present {
+				if !f.HasDefault {
+					return false
+				}
+				continue
+			}
+			if !branchAcceptsDefault(&f.Type, fv, table) {
+				return false
 			}
 		}
-		return false
+		return true
+	case "array":
+		arr, ok := val.([]any)
+		if !ok {
+			return false
+		}
+		if t.Items == nil {
+			return true
+		}
+		for _, item := range arr {
+			if !branchAcceptsDefault(t.Items, item, table) {
+				return false
+			}
+		}
+		return true
+	case "map":
+		m, ok := val.(map[string]any)
+		if !ok {
+			return false
+		}
+		if t.Values == nil {
+			return true
+		}
+		for _, v := range m {
+			if !branchAcceptsDefault(t.Values, v, table) {
+				return false
+			}
+		}
+		return true
+	case "union":
+		return firstMetadataBranchAcceptingDefault(t, val, table) != nil
 	}
 	return false
+}
+
+// firstMetadataBranchAcceptingDefault returns the first branch of the
+// union t whose [branchAcceptsDefault] accepts val (with name-ref
+// resolution applied to each branch), or nil if no branch accepts.
+// Mirrors the wire-side [firstUnionBranchAcceptingDefault] (schema.go)
+// on the *SchemaNode public type — the two implement Avro's "first
+// matching branch wins" default-resolution rule (1.12 relaxed from
+// "first branch" to "any branch," with deterministic first-match
+// tie-break) on opposite sides of the dual-namespace boundary.
+//
+// Shared by [coerceMetadataDefault] (returns the resolved branch so
+// the coerce step recurses against it) and [branchAcceptsDefault]'s
+// union arm (returns nil/non-nil for the accept predicate).
+func firstMetadataBranchAcceptingDefault(t *SchemaNode, val any, table map[string]*SchemaNode) *SchemaNode {
+	for i := range t.Branches {
+		branch := &t.Branches[i]
+		if resolved := lookupNameRef(branch, table); resolved != nil {
+			branch = resolved
+		}
+		if branchAcceptsDefault(branch, val, table) {
+			return branch
+		}
+	}
+	return nil
 }
 
 func nodeFromJSONObject(m map[string]any) SchemaNode {

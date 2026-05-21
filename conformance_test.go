@@ -9899,6 +9899,341 @@ func TestRegression_UnionDefaultMetadataMatchesWireBranch_BranchAcceptsDelegates
 	}
 }
 
+// TestRegression_UnionDefaultMetadataMatchesWireBranch_StructuralArms locks
+// the cross-surface parity contract for the record / array / map branches
+// of a union default. The numeric and bytes/fixed arms of
+// branchAcceptsDefault delegate to the wire-side per-value predicates
+// (defaultAsInt32 / defaultAsInt64 / defaultAsFloat /
+// defaultMatchesBytesOrFixedKind) so the metadata branch picker and the
+// wire-side validateDefault stay in lockstep on those branches. The
+// structural arms must apply the same per-element checks the wire-side
+// walkDefault enforces:
+//
+//   - record/error: required-field-no-default presence + recurse into
+//     present fields' values. A pure `_, ok := val.(map[string]any)`
+//     type-only match would silently pick the first record branch on
+//     any object-shaped default, even when the wire-side per-field
+//     validation rejects that branch and falls through to a later one.
+//   - array: recurse into items. The Avro spec forbids two array
+//     branches in a union, so direct branch divergence here is
+//     unreachable, but the recursion still matters when a record /
+//     map branch's nested array field is validated by this helper.
+//   - map: recurse into values. [map<X>, record<...>] is allowed (map
+//     and record are distinct kinds in the same union), so a map<long>
+//     default {"k":"v"} type-only-matches the map branch while the
+//     wire path's per-value check rejects "v" against long and falls
+//     through to the record branch.
+//
+// Each subtest probes the divergence case (wire and metadata MUST agree
+// on the chosen branch) and one boundary case (the same shape with a
+// default that the FIRST branch's per-element check now accepts, so the
+// new predicate doesn't over-reject).
+//
+// Cross-impl: Java's Schema.isValidValue (Schema.java:1785-1797) walks
+// per-field for RECORD, per-element for ARRAY, per-value for MAP and
+// rejects any branch with a missing required field or an element that
+// doesn't validate; fastavro's _default_matches_schema is structurally
+// identical. Java has no separate metadata-API predicate; the same
+// isValidValue picks the branch the wire path encodes against — no
+// drift possible. twmb's dual-namespace structure (validateDefault on
+// *schemaNode vs branchAcceptsDefault on *SchemaNode) introduced the
+// drift; this test enforces the conceptual-pair contract on both sides.
+func TestRegression_UnionDefaultMetadataMatchesWireBranch_StructuralArms(t *testing.T) {
+	cases := []struct {
+		name string
+		// schema for the outer record with one union-typed field "u".
+		schema string
+		// First wire byte of an auto-filled empty record = the union
+		// branch index varint chosen by the wire path.
+		wireBranchByte byte
+		// Type assertion on Default["u"]'s "shared" field (or "k" for
+		// the map case). The Go type implies which union branch the
+		// metadata path picked.
+		probeKey string
+		// "int64" / "float64" / "string" / "[]byte" / "" (no probe — used
+		// for empty-record case).
+		wantMetaType string
+	}{
+		{
+			// Record arm: union [record needing field X, record with
+			// no required fields] default {}. Wire picks the second
+			// branch (FloatRequiredFields rejects on missing "needed");
+			// metadata must too.
+			name: "record_first_required_field_missing_picks_second_branch",
+			schema: `{"type":"record","name":"r","fields":[{
+				"name":"u",
+				"type":[
+					{"type":"record","name":"FloatReq","fields":[
+						{"name":"needed","type":"string"},
+						{"name":"shared","type":"float"}
+					]},
+					{"type":"record","name":"LongOnly","fields":[
+						{"name":"shared","type":"long"}
+					]}
+				],
+				"default":{"shared":42}
+			}]}`,
+			wireBranchByte: 0x02, // index 1 → LongOnly
+			probeKey:       "shared",
+			wantMetaType:   "int64", // long branch's natural Go type
+		},
+		{
+			// Record arm boundary: same union shape, but the default
+			// supplies the required field — first record-branch's
+			// validateLeaf now accepts. Wire picks branch 0; metadata
+			// must too. Verifies the new required-field check doesn't
+			// reject defaults that legitimately satisfy the first
+			// branch.
+			name: "record_first_required_field_supplied_picks_first_branch",
+			schema: `{"type":"record","name":"r","fields":[{
+				"name":"u",
+				"type":[
+					{"type":"record","name":"FloatReq","fields":[
+						{"name":"needed","type":"string"},
+						{"name":"shared","type":"float"}
+					]},
+					{"type":"record","name":"LongOnly","fields":[
+						{"name":"shared","type":"long"}
+					]}
+				],
+				"default":{"needed":"ok","shared":42}
+			}]}`,
+			wireBranchByte: 0x00, // index 0 → FloatReq
+			probeKey:       "shared",
+			wantMetaType:   "float64", // float branch's natural Go type
+		},
+		{
+			// Map arm: union [map<long>, record<bytes field>] default
+			// {"k":"v"}. Wire's map<long> validation walks values and
+			// rejects "v" (not a long); falls through to record. Pre-
+			// fix metadata's map arm was type-only so it picked map<long>
+			// and Default["k"] surfaced as string; the record's bytes
+			// arm would have converted to []byte. Post-fix metadata
+			// recurses into map values, rejects map<long>, picks record.
+			name: "map_values_dont_match_picks_record_branch",
+			schema: `{"type":"record","name":"r","fields":[{
+				"name":"u",
+				"type":[
+					{"type":"map","values":"long"},
+					{"type":"record","name":"R","fields":[{"name":"k","type":"bytes"}]}
+				],
+				"default":{"k":"v"}
+			}]}`,
+			wireBranchByte: 0x02, // index 1 → record
+			probeKey:       "k",
+			wantMetaType:   "[]byte", // bytes branch's natural Go type
+		},
+		{
+			// Map arm boundary: same union shape with a default whose
+			// values DO validate against the first branch (map<long>).
+			// Wire picks the map branch; metadata must too. Verifies
+			// the new per-value recursion still accepts valid map
+			// defaults.
+			name: "map_values_match_picks_map_branch",
+			schema: `{"type":"record","name":"r","fields":[{
+				"name":"u",
+				"type":[
+					{"type":"map","values":"long"},
+					{"type":"record","name":"R","fields":[{"name":"k","type":"bytes"}]}
+				],
+				"default":{"k":42}
+			}]}`,
+			wireBranchByte: 0x00, // index 0 → map
+			probeKey:       "k",
+			wantMetaType:   "int64", // long values stay int64
+		},
+		{
+			// Array arm via nested context: a record branch with an
+			// array<long> field whose default contains a non-long
+			// item. Wire's per-element validation rejects the record
+			// branch; metadata's array arm must also recurse into the
+			// array's items to reject the branch.
+			//
+			// Schema shape: union [record{arr: array<long>}, record{arr:
+			// array<string>}]. Both record branches have unique names
+			// (the Avro spec permits multiple records in one union).
+			// Default {"arr":["a","b"]}.
+			name: "record_with_array_field_items_dont_match_picks_string_branch",
+			schema: `{"type":"record","name":"r","fields":[{
+				"name":"u",
+				"type":[
+					{"type":"record","name":"LongArr","fields":[
+						{"name":"arr","type":{"type":"array","items":"long"}}
+					]},
+					{"type":"record","name":"StringArr","fields":[
+						{"name":"arr","type":{"type":"array","items":"string"}}
+					]}
+				],
+				"default":{"arr":["a","b"]}
+			}]}`,
+			wireBranchByte: 0x02, // index 1 → StringArr
+			probeKey:       "arr",
+			wantMetaType:   "[]any:string", // []any whose first element is string
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := avro.Parse(c.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			// Wire side: auto-fill default into an empty record and
+			// inspect the branch-index varint.
+			buf, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("AppendEncode empty: %v", err)
+			}
+			if len(buf) == 0 || buf[0] != c.wireBranchByte {
+				t.Errorf("wire branch byte: got 0x%02x, want 0x%02x (full wire %x)",
+					buf[0], c.wireBranchByte, buf)
+			}
+			// Metadata side: SchemaField.Default's nested Go type
+			// implies the chosen branch.
+			d := s.Root().Fields[0].Default
+			defMap, ok := d.(map[string]any)
+			if !ok {
+				t.Fatalf("Default not map[string]any: %T(%v)", d, d)
+			}
+			probed, present := defMap[c.probeKey]
+			if !present {
+				t.Fatalf("Default missing probe key %q (Default=%v)", c.probeKey, defMap)
+			}
+			var gotMetaType string
+			switch v := probed.(type) {
+			case float64:
+				gotMetaType = "float64"
+			case float32:
+				gotMetaType = "float32"
+			case int64:
+				gotMetaType = "int64"
+			case int32:
+				gotMetaType = "int32"
+			case string:
+				gotMetaType = "string"
+			case []byte:
+				gotMetaType = "[]byte"
+			case []any:
+				// Probe the first element's Go type for the array case.
+				if len(v) == 0 {
+					gotMetaType = "[]any:empty"
+				} else {
+					switch v[0].(type) {
+					case string:
+						gotMetaType = "[]any:string"
+					case int64:
+						gotMetaType = "[]any:int64"
+					case float64:
+						gotMetaType = "[]any:float64"
+					default:
+						gotMetaType = "[]any:other"
+					}
+				}
+			default:
+				gotMetaType = "other"
+			}
+			if gotMetaType != c.wantMetaType {
+				t.Errorf("metadata Default[u][%s]: got %s (%T %v), want %s",
+					c.probeKey, gotMetaType, probed, probed, c.wantMetaType)
+			}
+		})
+	}
+}
+
+// TestRegression_UnionDefaultMetadataMatchesWireBranch_EnumArm locks the
+// enum-arm parity contract between branchAcceptsDefault (metadata-side)
+// and validateLeaf (wire-side). The wire-side rejects an enum default
+// that is not a member of node.symbols (schema.go's `slices.Contains`
+// check); the metadata-side must reject the same string for the same
+// branch-selection decision. Pre-fix branchAcceptsDefault had the
+// "string" and "enum" cases lumped (`case "string", "enum":
+// _, ok := val.(string); return ok`) so an enum branch accepted any
+// string regardless of symbol membership.
+//
+// Schema: union [enum:{A,B}, bytes] with default "Z". Wire-side
+// validateLeaf rejects the enum branch ("Z" not in symbols), accepts
+// the bytes branch (codepoint range ok). Wire wins at index 1; auto-
+// fill encodes the bytes form. Metadata side must agree: the enum
+// branch's branchAcceptsDefault must reject "Z" so the bytes branch
+// is the first match. coerceMetadataDefault then converts the string
+// default to []byte via the bytes/fixed arm.
+//
+// Observable: Default["u"] surfaces as []byte (matching the wire-
+// picked bytes branch's natural Go type); pre-fix it surfaced as
+// string because the enum branch incorrectly accepted "Z" and the
+// coerce step preserved the unmatched string verbatim.
+//
+// Cross-impl: Java's Schema.isValidValue (Schema.java:1786) for an
+// ENUM defaultValue checks `getEnumSymbols().contains(...)`; fastavro
+// _default_matches_schema enum branch checks `default in schema['symbols']`.
+// Both reject non-member enum defaults and let the union pick a later
+// branch.
+func TestRegression_UnionDefaultMetadataMatchesWireBranch_EnumArm(t *testing.T) {
+	cases := []struct {
+		name           string
+		schema         string
+		wireBranchByte byte
+		wantMetaType   string // Go type of Default["u"]
+	}{
+		{
+			// Enum branch first, non-member default → wire picks bytes,
+			// metadata must agree → Default is []byte.
+			name: "enum_first_non_member_default_picks_bytes_branch",
+			schema: `{"type":"record","name":"r","fields":[{
+				"name":"u","type":[
+					{"type":"enum","name":"E","symbols":["A","B"]},
+					"bytes"
+				],"default":"Z"
+			}]}`,
+			wireBranchByte: 0x02, // index 1 → bytes
+			wantMetaType:   "[]byte",
+		},
+		{
+			// Boundary: enum first, member default → both surfaces
+			// pick enum. Verifies the new symbol-membership check
+			// doesn't reject valid enum defaults.
+			name: "enum_first_member_default_picks_enum_branch",
+			schema: `{"type":"record","name":"r","fields":[{
+				"name":"u","type":[
+					{"type":"enum","name":"E","symbols":["A","B"]},
+					"bytes"
+				],"default":"A"
+			}]}`,
+			wireBranchByte: 0x00, // index 0 → enum
+			wantMetaType:   "string",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := avro.Parse(c.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			buf, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("AppendEncode empty: %v", err)
+			}
+			if len(buf) == 0 || buf[0] != c.wireBranchByte {
+				t.Errorf("wire branch byte: got 0x%02x, want 0x%02x (full wire %x)",
+					buf[0], c.wireBranchByte, buf)
+			}
+			d := s.Root().Fields[0].Default
+			var gotType string
+			switch d.(type) {
+			case []byte:
+				gotType = "[]byte"
+			case string:
+				gotType = "string"
+			default:
+				gotType = "other"
+			}
+			if gotType != c.wantMetaType {
+				t.Errorf("metadata Default[u]: got %s (%T %v), want %s",
+					gotType, d, d, c.wantMetaType)
+			}
+		})
+	}
+}
+
 // TestRegression_TaggedUnionShortNameBinaryParity locks binary ↔ JSON
 // parity on fastavro's unqualified-short-name tagged-union shape.
 // Pre-fix the binary `serUnion.tryUnwrapTagged` did a plain map
