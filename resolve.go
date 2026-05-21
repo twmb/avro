@@ -53,6 +53,17 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 		customSNs:      reader.customSNs,
 	}
 	s.soe = reader.soe
+	// SOE wire bytes carry the writer's fingerprint per the Avro spec
+	// (the schema that produced the wire IS the writer). Storing
+	// writer.soe lets DecodeSingleObject match wire bearing either the
+	// writer's fingerprint (the primary case — writer-produced bytes
+	// resolved into reader-shaped Go) or the reader's fingerprint (the
+	// degenerate AppendSingleObject-on-resolved-then-decode case). Java's
+	// BinaryMessageDecoder dispatches the wire fingerprint into a
+	// resolved (writer→reader) codec via a fingerprint registry; twmb's
+	// single-schema model bakes the equivalent dispatch into the resolved
+	// Schema's own check.
+	s.writerSoe = writer.soe
 	return s, nil
 }
 

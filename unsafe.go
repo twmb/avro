@@ -356,6 +356,17 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		return usDouble(k)
 	case "string":
 		if k == reflect.String {
+			// json.Number-typed string fields fall through to the safe
+			// path so appendAvroString's json.Number reject fires; the
+			// unsafe path's direct *(*string)(p) read would silently
+			// write json.Number content as a string wire value, which
+			// the matching decoder's json.Number target reject (via
+			// tryCompileFieldDeser at the symmetric site) then can't
+			// round-trip. Same shape as the decoder gate at the
+			// "string" arm of tryCompileFieldDeser below.
+			if goType == jsonNumberType {
+				return nil
+			}
 			return usString
 		}
 	case "bytes":
@@ -546,6 +557,9 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 	case "uuid":
 		if avroType == "fixed" {
 			if goType.Kind() == reflect.String {
+				// fixed+uuid accepts reflect.String including json.Number
+				// (the safe-path serFixedUUIDReflect does too — see "raw
+				// bytes" leniency comment there).
 				return usFixedUUIDString
 			}
 			return nil // [16]byte, []byte handled by default fixed ser
@@ -554,6 +568,14 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 			return usUUID
 		}
 		if goType.Kind() == reflect.String {
+			// json.Number string+uuid: usString would emit the json.Number's
+			// underlying string as the wire UUID, with no UUID validation.
+			// The safe path's serUUID falls through to appendAvroString
+			// which rejects json.Number. Mirror the decoder gate at
+			// tryCompileLogicalDeser's "uuid"+string+reflect.String arm.
+			if goType == jsonNumberType {
+				return nil
+			}
 			return usString
 		}
 	}

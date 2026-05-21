@@ -1502,6 +1502,26 @@ func rejectJSONNumberMapKey(t reflect.Type, avroType string) error {
 		Err: errors.New("cannot use json.Number as map key: wire keys are strings with no JSON number representation")}
 }
 
+// formatToStringKindTarget formats content as a string into v if v is a
+// reflect.String-kind target that is NOT json.Number. The matching
+// invariant: json.Number's underlying string must be a valid JSON number
+// literal (RFC 8259); arbitrary formatted content (RFC3339Nano, DateOnly,
+// hex-dash UUID, etc.) violates that. json.Number targets fall through
+// (returns wrote=false) so the caller routes the underlying numeric wire
+// value through the integer/float arm whose json.Number write produces
+// an RFC-valid literal.
+//
+// Used by the time-logical String arms (setTimeAsLongTarget / deserDate
+// in deser.go and the JSON-side decodeInt+date / decodeLong+timestamp
+// arms in json_decode.go) where the wire is numeric but the conventional
+// String-target rendering is a formatted-time literal.
+func formatToStringKindTarget(v reflect.Value, content, avroType string) (wrote bool, err error) {
+	if v.Kind() != reflect.String || v.Type() == jsonNumberType {
+		return false, nil
+	}
+	return true, setStringTarget(v, content, avroType)
+}
+
 // setFloatValue sets v to f, handling interface, float, integer (whole-number),
 // and json.Number targets. bits is 32 or 64, the source width — used for
 // interface assignment, the float32-overflow check, and json.Number formatting.
@@ -1714,8 +1734,14 @@ func setTimeAsLongTarget(v reflect.Value, val int64, conv func(int64) time.Time)
 		v.Set(reflect.ValueOf(conv(val)))
 		return nil
 	}
-	if v.Kind() == reflect.String {
-		return setStringTarget(v, conv(val).Format(time.RFC3339Nano), "long")
+	// String target (mirrors serTimeAsLong's RFC3339-string accept on encode):
+	// emit the formatted timestamp. json.Number targets are excluded by
+	// formatToStringKindTarget so they fall through to setLongValue's
+	// json.Number arm (which writes the raw integer wire value as a valid
+	// JSON number literal) — same routing as setTimeMillisTarget /
+	// setTimeMicrosTarget, which have no String intercept.
+	if wrote, err := formatToStringKindTarget(v, conv(val).Format(time.RFC3339Nano), "long"); wrote {
+		return err
 	}
 	return setLongValue(v, val)
 }
@@ -1747,9 +1773,11 @@ func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	// String target mirrors serDate's tryParseDateString leniency
 	// (ser.go's date arm + JSON "int" date arm both accept a date
-	// string on encode); the decoder emits ISO 8601 date-only.
-	if v.Kind() == reflect.String {
-		if err := setStringTarget(v, dateToTime(val).Format(time.DateOnly), "int"); err != nil {
+	// string on encode); the decoder emits ISO 8601 date-only. json.Number
+	// targets are excluded so they get the raw days-since-epoch as a JSON
+	// number literal via setIntValue's json.Number arm.
+	if wrote, err := formatToStringKindTarget(v, dateToTime(val).Format(time.DateOnly), "int"); wrote {
+		if err != nil {
 			return nil, err
 		}
 		return src, nil

@@ -27,11 +27,20 @@ func validateSOEHeader(data []byte) error {
 
 // DecodeSingleObject decodes a Single Object Encoding message into v after
 // verifying the magic and fingerprint match this schema.
+//
+// For a schema returned by [Resolve], the writer's fingerprint is also
+// accepted — wire bytes carry the writer's fingerprint per the SOE spec,
+// and a resolved schema is the right place to decode them.
 func (s *Schema) DecodeSingleObject(data []byte, v any, opts ...Opt) ([]byte, error) {
 	if err := validateSOEHeader(data); err != nil {
 		return nil, err
 	}
-	if [10]byte(data[:10]) != s.soe {
+	header := [10]byte(data[:10])
+	// A valid SOE header has data[0] == 0xC3 (enforced by validateSOEHeader);
+	// the zero-value writerSoe has writerSoe[0] == 0x00, so a non-resolved
+	// schema's writerSoe can never match a valid header. The OR check works
+	// uniformly for both resolved and non-resolved schemas.
+	if header != s.soe && header != s.writerSoe {
 		return nil, errors.New("avro: single-object encoding fingerprint mismatch")
 	}
 	return s.Decode(data[10:], v, opts...)

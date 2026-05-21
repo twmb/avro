@@ -806,7 +806,11 @@ func serBytes(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return nil, err
 	}
 	// Accept string for json.Unmarshal pipelines where JSON strings
-	// may represent Avro bytes fields.
+	// may represent Avro bytes fields. json.Number's Kind is reflect.String
+	// so it lands here too — see TestRegression_UnionDispatchMatrix's
+	// `"hex jsonNumber falls to bytes"` pin, which documents the
+	// intentional encode-side acceptance even though the matching decoder
+	// rejects json.Number bytes targets.
 	if v.Kind() == reflect.String {
 		return doSerString(dst, v.String()), nil
 	}
@@ -1351,6 +1355,10 @@ func (s *serSize) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	}
 	t := v.Type()
 	// Accept [N]byte arrays, []byte slices, and strings of the correct length.
+	// json.Number (Kind=reflect.String) lands in the String arm — same
+	// "raw bytes" leniency as serBytes (see TestRegression_UnionDispatchMatrix
+	// "hex jsonNumber falls to bytes"), even though the matching decoder
+	// rejects json.Number target for fixed wire.
 	switch t.Kind() {
 	case reflect.Array:
 		if t.Elem().Kind() != reflect.Uint8 || t.Len() != s.n {
@@ -2045,6 +2053,12 @@ func serFixedUUIDReflect(dst []byte, v reflect.Value, depth int) ([]byte, error)
 		return append(dst, u[:]...), nil
 	}
 	if v.Kind() == reflect.String {
+		// json.Number with UUID-shaped underlying content lands here
+		// via Kind=reflect.String — accepted iff parseUUID succeeds,
+		// matching the "raw bytes" leniency documented for serBytes /
+		// serSize. The matching decoder rejects json.Number target for
+		// fixed+uuid wire (rejectJSONNumberStringTarget) but the
+		// encode-side asymmetry is documented as intentional.
 		u, err := parseUUID(v.String())
 		if err != nil {
 			return nil, err

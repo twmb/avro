@@ -277,9 +277,13 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 	}
 	// String target for date: mirrors json_codec.go's "int" date arm
 	// which accepts a date-string on encode (tryParseDateString).
-	// Parity with deserDate on the binary side.
-	if v.Kind() == reflect.String && node.logical == "date" {
-		return setStringTarget(v, dateToTime(val).Format(time.DateOnly), "int")
+	// Parity with deserDate on the binary side. json.Number is excluded
+	// by formatToStringKindTarget — falls through to setIntValue's
+	// json.Number arm for the raw integer wire value.
+	if node.logical == "date" {
+		if wrote, err := formatToStringKindTarget(v, dateToTime(val).Format(time.DateOnly), "int"); wrote {
+			return err
+		}
 	}
 	return setIntValue(v, val)
 }
@@ -334,20 +338,22 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 	// String target for the six long-typed time logicals: mirrors the
 	// JSON encoder's "long" arm (json_codec.go), which accepts an RFC
 	// 3339 string via extractTime. Parity with deserTimeAsLong on the
-	// binary side.
-	if v.Kind() == reflect.String {
-		var t time.Time
-		switch node.logical {
-		case "timestamp-millis", "local-timestamp-millis":
-			t = timestampMillisToTime(val)
-		case "timestamp-micros", "local-timestamp-micros":
-			t = timestampMicrosToTime(val)
-		case "timestamp-nanos", "local-timestamp-nanos":
-			t = timestampNanosToTime(val)
-		default:
-			return setLongValue(v, val)
-		}
-		return setStringTarget(v, t.Format(time.RFC3339Nano), "long")
+	// binary side. json.Number is excluded by formatToStringKindTarget;
+	// falls through to setLongValue's json.Number arm for the raw integer
+	// wire value (same routing as the time-micros / time-millis logicals).
+	var t time.Time
+	switch node.logical {
+	case "timestamp-millis", "local-timestamp-millis":
+		t = timestampMillisToTime(val)
+	case "timestamp-micros", "local-timestamp-micros":
+		t = timestampMicrosToTime(val)
+	case "timestamp-nanos", "local-timestamp-nanos":
+		t = timestampNanosToTime(val)
+	default:
+		return setLongValue(v, val)
+	}
+	if wrote, err := formatToStringKindTarget(v, t.Format(time.RFC3339Nano), "long"); wrote {
+		return err
 	}
 	return setLongValue(v, val)
 }

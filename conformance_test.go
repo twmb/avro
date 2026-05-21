@@ -16087,6 +16087,216 @@ func TestRegression_SchemaMetadataExponentOverflowNormalizesToInf(t *testing.T) 
 			t.Errorf("round-tripped Props[limit]: got %T %v, want float64(+Inf)", got, got)
 		}
 	})
+	t.Run("SchemaNode.Schema() round-trips NaN default via JSON string", func(t *testing.T) {
+		// Sibling to the ±Inf case above, with a different inverse shape:
+		// jsonSerializableValue converts float64(NaN) to JSON string "NaN"
+		// (the same form appendJSONFloat emits for runtime NaN field
+		// values). defaultAsFloat's string arm re-parses "NaN" via
+		// strconv.ParseFloat back to float64(NaN) — so the round-trip
+		// closes via the documented "String-form float defaults"
+		// lenient-accept path. ±Inf uses a JSON NUMBER literal; NaN uses
+		// a JSON STRING literal because no number literal re-parses to NaN.
+		s1, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"double","default":"NaN"}]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root1 := s1.Root()
+		// Confirm the metadata side normalized "NaN" string → float64(NaN).
+		if f, ok := root1.Fields[0].Default.(float64); !ok || !math.IsNaN(f) {
+			t.Fatalf("source Default: got %T %v, want float64(NaN)", root1.Fields[0].Default, root1.Fields[0].Default)
+		}
+		s2, err := root1.Schema()
+		if err != nil {
+			t.Fatalf("Schema() round-trip failed: %v", err)
+		}
+		got := s2.Root().Fields[0].Default
+		f, ok := got.(float64)
+		if !ok || !math.IsNaN(f) {
+			t.Errorf("round-tripped Default: got %T %v, want float64(NaN)", got, got)
+		}
+		// And the wire bytes are still NaN (encoded as the IEEE 754
+		// quiet-NaN bit pattern via math.Float64bits(NaN)).
+		bin, err := s2.AppendEncode(nil, map[string]any{})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out map[string]any
+		if _, err := s2.Decode(bin, &out); err != nil {
+			t.Fatal(err)
+		}
+		if f, ok := out["f"].(float64); !ok || !math.IsNaN(f) {
+			t.Errorf("decoded round-trip: got %T %v, want float64(NaN)", out["f"], out["f"])
+		}
+	})
+	t.Run("SchemaNode.Schema() round-trips NaN default in float (32-bit) field", func(t *testing.T) {
+		// The float32 arm of jsonSerializableValue's float fixup must
+		// mirror the float64 arm: NaN → "NaN" string. The metadata path
+		// stores float defaults as float64 (defaultAsFloat returns
+		// float64 even with bitSize=32), so this exercises the float64
+		// arm; the float32 case is reachable only via programmatic
+		// Default = float32(NaN), tested below.
+		s1, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":"float","default":"NaN"}]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root1 := s1.Root()
+		s2, err := root1.Schema()
+		if err != nil {
+			t.Fatalf("Schema() round-trip failed: %v", err)
+		}
+		got := s2.Root().Fields[0].Default
+		if f, ok := got.(float64); !ok || !math.IsNaN(f) {
+			t.Errorf("round-tripped Default: got %T %v, want float64(NaN)", got, got)
+		}
+	})
+	t.Run("SchemaNode.Schema() round-trips NaN inside union default", func(t *testing.T) {
+		s1, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":["double","null"],"default":"NaN"}]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root1 := s1.Root()
+		s2, err := root1.Schema()
+		if err != nil {
+			t.Fatalf("Schema() round-trip failed: %v", err)
+		}
+		if f, ok := s2.Root().Fields[0].Default.(float64); !ok || !math.IsNaN(f) {
+			t.Errorf("round-tripped Default: got %T %v, want float64(NaN)", s2.Root().Fields[0].Default, s2.Root().Fields[0].Default)
+		}
+	})
+	t.Run("SchemaNode.Schema() round-trips NaN inside array element default", func(t *testing.T) {
+		// Container values are walked recursively by needsJSONFixup /
+		// applyJSONFixup — a NaN nested inside a []any must be converted
+		// just like a top-level NaN.
+		s1, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":{"type":"array","items":"double"},"default":["NaN",1.5,"Infinity"]}]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root1 := s1.Root()
+		s2, err := root1.Schema()
+		if err != nil {
+			t.Fatalf("Schema() round-trip failed: %v", err)
+		}
+		arr, ok := s2.Root().Fields[0].Default.([]any)
+		if !ok || len(arr) != 3 {
+			t.Fatalf("round-tripped Default: want []any of length 3, got %T %v", s2.Root().Fields[0].Default, s2.Root().Fields[0].Default)
+		}
+		if f, ok := arr[0].(float64); !ok || !math.IsNaN(f) {
+			t.Errorf("arr[0]: got %T %v, want NaN", arr[0], arr[0])
+		}
+		if f, ok := arr[1].(float64); !ok || f != 1.5 {
+			t.Errorf("arr[1]: got %T %v, want 1.5", arr[1], arr[1])
+		}
+		if f, ok := arr[2].(float64); !ok || !math.IsInf(f, 1) {
+			t.Errorf("arr[2]: got %T %v, want +Inf", arr[2], arr[2])
+		}
+	})
+	t.Run("SchemaNode.Schema() round-trips NaN inside nested record default", func(t *testing.T) {
+		// Container values are walked recursively by needsJSONFixup /
+		// applyJSONFixup — NaN inside a map[string]any must be converted.
+		s1, err := avro.Parse(`{
+			"type":"record","name":"R",
+			"fields":[{"name":"f","type":{
+				"type":"record","name":"Inner",
+				"fields":[{"name":"x","type":"double","default":"NaN"}]
+			},"default":{"x":"NaN"}}]
+		}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root1 := s1.Root()
+		s2, err := root1.Schema()
+		if err != nil {
+			t.Fatalf("Schema() round-trip failed: %v", err)
+		}
+		m, ok := s2.Root().Fields[0].Default.(map[string]any)
+		if !ok {
+			t.Fatalf("round-tripped Default: want map[string]any, got %T %v", s2.Root().Fields[0].Default, s2.Root().Fields[0].Default)
+		}
+		if f, ok := m["x"].(float64); !ok || !math.IsNaN(f) {
+			t.Errorf("m[x]: got %T %v, want NaN", m["x"], m["x"])
+		}
+	})
+	t.Run("SchemaNode.Schema() round-trips programmatically-constructed NaN Props", func(t *testing.T) {
+		// User puts NaN in Props directly (record-level). Should round-trip
+		// via jsonSerializableValue's NaN → "NaN" string conversion.
+		node := &avro.SchemaNode{
+			Type: "record", Name: "R",
+			Fields: []avro.SchemaField{
+				{Name: "f", Type: avro.SchemaNode{Type: "int"}},
+			},
+			Props: map[string]any{"sentinel": math.NaN()},
+		}
+		s, err := node.Schema()
+		if err != nil {
+			t.Fatalf("Schema() rejected NaN in Props: %v", err)
+		}
+		got := s.Root().Props["sentinel"]
+		// Note: defaultAsFloat applies only to record-field DEFAULTS;
+		// Props go through unmarshalAnyPreservePrecision which preserves
+		// the string form. After the round-trip the Go type is string,
+		// not float64 — the round-trip preserves the underlying VALUE
+		// (a NaN-equivalent token) but not the Go type. This is
+		// acceptable per the documented "metadata normalizes, not
+		// preserves Go types" contract: Props are not lenient-coerced
+		// to float64 the way defaults are. Users who need float64 NaN
+		// observability in Props should place the value in a record-
+		// field default instead.
+		switch v := got.(type) {
+		case string:
+			if v != "NaN" {
+				t.Errorf("Props[sentinel]: got string %q, want %q", v, "NaN")
+			}
+		case float64:
+			if !math.IsNaN(v) {
+				t.Errorf("Props[sentinel]: got float64 %v, want NaN", v)
+			}
+		default:
+			t.Errorf("Props[sentinel]: got %T %v, want string(\"NaN\") or float64(NaN)", got, got)
+		}
+	})
+	t.Run("SchemaNode.Schema() round-trips programmatically-constructed NaN in field Props", func(t *testing.T) {
+		node := &avro.SchemaNode{
+			Type: "record", Name: "R",
+			Fields: []avro.SchemaField{
+				{
+					Name: "f", Type: avro.SchemaNode{Type: "int"},
+					Props: map[string]any{"sentinel": math.NaN()},
+				},
+			},
+		}
+		s, err := node.Schema()
+		if err != nil {
+			t.Fatalf("Schema() rejected NaN in field Props: %v", err)
+		}
+		got := s.Root().Fields[0].Props["sentinel"]
+		// Same caveat as the record-Props case: Props don't go through
+		// defaultAsFloat's string-form coerce, so the value comes back
+		// as the literal string "NaN".
+		switch v := got.(type) {
+		case string:
+			if v != "NaN" {
+				t.Errorf("Fields[0].Props[sentinel]: got string %q, want %q", v, "NaN")
+			}
+		case float64:
+			if !math.IsNaN(v) {
+				t.Errorf("Fields[0].Props[sentinel]: got float64 %v, want NaN", v)
+			}
+		default:
+			t.Errorf("Fields[0].Props[sentinel]: got %T %v, want string(\"NaN\") or float64(NaN)", got, got)
+		}
+	})
 }
 
 // TestRegression_NumberGrammarParityMatrix pins the JSON-number grammar
@@ -19492,18 +19702,16 @@ func TestRegression_JSONNumberTargetRejectedForStringLikeWire(t *testing.T) {
 		{"bytes_plain", `"bytes"`, []byte("hello")},
 		{"fixed_size5", `{"type":"fixed","name":"f","size":5}`, []byte("hello")},
 		{"enum", `{"type":"enum","name":"E","symbols":["A","B"]}`, "A"},
+		// UUID logicals: the wire content is a hex-dash UUID string with
+		// no JSON-number representation. json.Number target rejects per
+		// the RFC 8259 contract.
 		{"string_uuid_logical", `{"type":"string","logicalType":"uuid"}`, "550e8400-e29b-41d4-a716-446655440000"},
-		// Sibling logical-type cases: the int/long wire is numeric, but
-		// the decoder formats it as an RFC3339 / DateOnly / UUID-hex-dash
-		// string before assigning to reflect.String. json.Number target
-		// would receive that non-number-literal string. Reject by the
-		// same contract: users targeting json.Number for a time/date
-		// logical type should target int32/int64 instead and pick the
-		// numeric representation they want.
-		{"date_logical", `{"type":"int","logicalType":"date"}`, time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)},
-		{"timestamp_millis_logical", `{"type":"long","logicalType":"timestamp-millis"}`, time.Date(2024, 1, 15, 12, 30, 45, 0, time.UTC)},
-		{"timestamp_micros_logical", `{"type":"long","logicalType":"timestamp-micros"}`, time.Date(2024, 1, 15, 12, 30, 45, 0, time.UTC)},
 		{"fixed_uuid_logical", `{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`, [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}},
+		// date / timestamp-* / local-timestamp-* logicals are NOT in this
+		// rejection list — their wire is int/long-typed, so json.Number
+		// target receives the raw integer wire value as a valid JSON
+		// number literal via setIntegerWire. See
+		// TestRegression_JSONNumberTargetAcceptedForTimeLogicals.
 	}
 	for _, tc := range cases {
 		t.Run(tc.name+"_binary", func(t *testing.T) {
@@ -19555,6 +19763,188 @@ func TestRegression_JSONNumberTargetRejectedForStringLikeWire(t *testing.T) {
 			t.Errorf("got json.Number=%q, want \"42\"", string(got))
 		}
 	})
+}
+
+// TestRegression_JSONNumberTargetAcceptedForTimeLogicals pins that a
+// json.Number decode target receives the raw integer wire value (formatted
+// as an RFC 8259 valid integer literal) for all int/long-typed time
+// logicals: date, time-millis, time-micros, timestamp-{millis,micros,nanos},
+// local-timestamp-{millis,micros,nanos}. The natural integer wire value
+// IS a valid JSON number, so json.Number's invariant is preserved. The
+// alternative — formatting the wire as a date / RFC3339 string and writing
+// THAT to json.Number — would violate the invariant. Same uniform routing
+// the time-millis and time-micros setters already used; the timestamp /
+// local-timestamp / date setters had a String-arm intercept that hit
+// rejectJSONNumberStringTarget for json.Number targets, creating a
+// within-twmb encode/decode asymmetry (encode accepted json.Number via
+// serLong's json.Number arm; decode rejected). The integer-form routing
+// produces wire that the matching encoder's same json.Number arm accepts,
+// completing the round-trip.
+func TestRegression_JSONNumberTargetAcceptedForTimeLogicals(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		wire   string
+	}{
+		{"int_date", `{"type":"int","logicalType":"date"}`, "100"},
+		{"int_time_millis", `{"type":"int","logicalType":"time-millis"}`, "1234"},
+		{"long_time_micros", `{"type":"long","logicalType":"time-micros"}`, "1234567"},
+		{"long_timestamp_millis", `{"type":"long","logicalType":"timestamp-millis"}`, "1705320645000"},
+		{"long_timestamp_micros", `{"type":"long","logicalType":"timestamp-micros"}`, "1705320645000000"},
+		{"long_timestamp_nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, "1705320645000000000"},
+		{"long_local_timestamp_millis", `{"type":"long","logicalType":"local-timestamp-millis"}`, "1705320645000"},
+		{"long_local_timestamp_micros", `{"type":"long","logicalType":"local-timestamp-micros"}`, "1705320645000000"},
+		{"long_local_timestamp_nanos", `{"type":"long","logicalType":"local-timestamp-nanos"}`, "1705320645000000000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"_binary", func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			input := json.Number(tc.wire)
+			wire, err := s.Encode(input)
+			if err != nil {
+				t.Fatalf("encode json.Number(%q): %v", tc.wire, err)
+			}
+			var got json.Number
+			if _, err := s.Decode(wire, &got); err != nil {
+				t.Fatalf("decode into json.Number: %v", err)
+			}
+			if string(got) != tc.wire {
+				t.Errorf("got json.Number=%q, want %q", string(got), tc.wire)
+			}
+			// json.Marshal must round-trip — the strongest invariant check.
+			if _, err := json.Marshal(got); err != nil {
+				t.Errorf("json.Marshal(decoded json.Number) failed: %v — invariant violation", err)
+			}
+		})
+		t.Run(tc.name+"_json", func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			input := json.Number(tc.wire)
+			jsonWire, err := s.EncodeJSON(input)
+			if err != nil {
+				t.Fatalf("EncodeJSON json.Number(%q): %v", tc.wire, err)
+			}
+			var got json.Number
+			if err := s.DecodeJSON(jsonWire, &got); err != nil {
+				t.Fatalf("DecodeJSON into json.Number: %v", err)
+			}
+			if string(got) != tc.wire {
+				t.Errorf("got json.Number=%q, want %q", string(got), tc.wire)
+			}
+			if _, err := json.Marshal(got); err != nil {
+				t.Errorf("json.Marshal(decoded json.Number) failed: %v — invariant violation", err)
+			}
+		})
+	}
+
+	// Sibling boundary: reflect.String targets (not json.Number) still
+	// receive the formatted-time string — the String-arm intercept is
+	// preserved for non-json.Number string-kind targets.
+	t.Run("string_target_still_gets_formatted_time", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"long","logicalType":"timestamp-millis"}`)
+		wire, err := s.Encode(int64(1705320645000))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got string
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode into string: %v", err)
+		}
+		if got == "1705320645000" {
+			t.Errorf("string target got raw integer %q; expected formatted RFC3339Nano", got)
+		}
+		// The format check is shape-only — exact string depends on local-time
+		// dependencies in the converter; verify it parses back as time.
+		if _, err := time.Parse(time.RFC3339Nano, got); err != nil {
+			t.Errorf("string target got non-RFC3339Nano %q: %v", got, err)
+		}
+	})
+
+	// Promoted path: writer int → reader long+timestamp-millis. The
+	// promotion uses setTimeAsLongTarget (promote.go), same factor as
+	// the natural deser path, so the json.Number-acceptance fix benefits
+	// both arms uniformly.
+	t.Run("promoted_int_to_long_timestamp_millis", func(t *testing.T) {
+		writer := avro.MustParse(`"int"`)
+		reader := avro.MustParse(`{"type":"long","logicalType":"timestamp-millis"}`)
+		resolved, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		wire, err := writer.Encode(int32(1234))
+		if err != nil {
+			t.Fatalf("writer.Encode: %v", err)
+		}
+		var got json.Number
+		if _, err := resolved.Decode(wire, &got); err != nil {
+			t.Fatalf("resolved.Decode into json.Number: %v", err)
+		}
+		if string(got) != "1234" {
+			t.Errorf("got json.Number=%q, want \"1234\"", string(got))
+		}
+		if _, err := json.Marshal(got); err != nil {
+			t.Errorf("json.Marshal(decoded json.Number) failed: %v", err)
+		}
+	})
+}
+
+// TestRegression_JSONNumberStringSourceRejectedOnEncode pins that the
+// encode side rejects json.Number for the structured-string Avro types
+// (string, string+uuid). The "raw bytes" Avro types (bytes, fixed,
+// fixed+uuid) retain their documented encode-side leniency (see
+// TestRegression_UnionDispatchMatrix's "hex jsonNumber falls to bytes"
+// pin) — encode is intentionally asymmetric with decode for those types.
+//
+// Pre-fix, the unsafe struct-field fast path emitted the json.Number's
+// underlying string directly via usString (bypassing appendAvroString's
+// json.Number reject) for both plain string and string+uuid fields,
+// silently producing wire that the matching decoder rejected.
+func TestRegression_JSONNumberStringSourceRejectedOnEncode(t *testing.T) {
+	type structField struct {
+		N json.Number `avro:"n"`
+	}
+	cases := []struct {
+		name   string
+		schema string
+		input  any
+	}{
+		// Top-level safe path: covered by existing appendAvroString reject.
+		{"safe_string", `"string"`, json.Number("hello")},
+		// Unsafe struct-field path for plain string — usString previously
+		// bypassed appendAvroString's reject.
+		{"unsafe_struct_string", `{"type":"record","name":"R","fields":[{"name":"n","type":"string"}]}`, &structField{N: json.Number("hello")}},
+		// Top-level safe path for string+uuid: serUUID falls through to
+		// appendAvroString which rejects.
+		{"safe_string_uuid", `{"type":"string","logicalType":"uuid"}`, json.Number("550e8400-e29b-41d4-a716-446655440000")},
+		// Unsafe struct-field path for string+uuid logical — usString
+		// previously bypassed serUUID's fall-through reject.
+		{"unsafe_struct_string_uuid", `{"type":"record","name":"R","fields":[{"name":"n","type":{"type":"string","logicalType":"uuid"}}]}`, &structField{N: json.Number("550e8400-e29b-41d4-a716-446655440000")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"_binary", func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if _, err := s.Encode(tc.input); err == nil {
+				t.Errorf("binary encode accepted json.Number for %s; expected SemanticError per RFC 8259 contract", tc.name)
+			}
+		})
+		t.Run(tc.name+"_json", func(t *testing.T) {
+			s, err := avro.Parse(tc.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if _, err := s.EncodeJSON(tc.input); err == nil {
+				t.Errorf("JSON encode accepted json.Number for %s; expected SemanticError per RFC 8259 contract", tc.name)
+			}
+		})
+	}
 }
 
 // TestRegression_JSONNumberMapKeyRejected pins that map decode targets keyed

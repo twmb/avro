@@ -28,6 +28,15 @@ type Schema struct {
 	node *schemaNode // full metadata tree (aliases, defaults, etc.) for schema introspection and evolution
 	full string      // original schema JSON, returned by String()
 
+	// writerSoe is the writer schema's SOE header — populated only by
+	// Resolve(writer, reader) and consulted by DecodeSingleObject so a
+	// resolved schema can decode wire bytes bearing the writer's
+	// fingerprint (the wire fingerprint identifies the schema that
+	// produced the bytes, which is the writer when a resolution is
+	// involved). Zero value (writerSoe[0] == 0x00) means "not a resolved
+	// schema; accept only s.soe."
+	writerSoe [10]byte
+
 	// Per-schema custom type overlays. Keyed by *schemaNode so the
 	// shared node is not mutated — different schemas parsed with
 	// different custom types get different overlays.

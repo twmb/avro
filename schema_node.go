@@ -165,7 +165,7 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 	return n.toJSONWalk(d.visited, d)
 }
 
-// jsonSerializableValue returns v with two Avro-JSON-specific shape
+// jsonSerializableValue returns v with three Avro-JSON-specific shape
 // fixups applied (directly or under map[string]any / []any container
 // layers):
 //
@@ -177,7 +177,18 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 //     schema whose Default / Props normalized an exponent-form overflow
 //     to ±Inf cannot otherwise round-trip through [SchemaNode.Schema].
 //
-//  2. []byte → codepoint-per-byte string (each byte 0x00-0xFF becomes
+//  2. NaN float → JSON string "NaN". encoding/json.Marshal rejects NaN
+//     unconditionally, but the runtime JSON encoder (appendJSONFloat)
+//     already emits NaN field values as "NaN" by default, and
+//     defaultAsFloat's string arm re-parses "NaN" via strconv.ParseFloat
+//     back to float64(NaN) — so the round-trip is closed by the same
+//     string-form path used at the wire layer. Note this differs in
+//     shape from the ±Inf inverse: NaN uses a JSON string literal (the
+//     library's documented "String-form float defaults" lenient-accept
+//     path), while ±Inf uses a JSON number literal (the
+//     normalizeJSONNumber ErrRange-with-Inf path).
+//
+//  3. []byte → codepoint-per-byte string (each byte 0x00-0xFF becomes
 //     a rune at the same code point). The inverse of
 //     [avroJSONBytesToBytes] / [coerceMetadataDefault]'s bytes/fixed
 //     arm: that arm materializes Default as []byte (the wire form);
@@ -195,12 +206,6 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 // Container values (map[string]any, []any) are deep-copied only when a
 // descendant requires conversion, so the common no-fixup case is
 // allocation-free and the user's SchemaNode storage is never mutated.
-//
-// NaN is intentionally left untouched: no JSON literal re-parses to NaN,
-// so json.Marshal's UnsupportedValueError is the honest answer. Users
-// who put NaN in Default/Props must convert to the string-form "NaN"
-// themselves (defaultAsFloat accepts the string-form for float/double
-// fields).
 func jsonSerializableValue(v any) any {
 	if !needsJSONFixup(v) {
 		return v
@@ -211,9 +216,9 @@ func jsonSerializableValue(v any) any {
 func needsJSONFixup(v any) bool {
 	switch tv := v.(type) {
 	case float64:
-		return math.IsInf(tv, 0)
+		return math.IsInf(tv, 0) || math.IsNaN(tv)
 	case float32:
-		return math.IsInf(float64(tv), 0)
+		return math.IsInf(float64(tv), 0) || math.IsNaN(float64(tv))
 	case []byte:
 		return true
 	case map[string]any:
@@ -241,6 +246,9 @@ func applyJSONFixup(v any) any {
 		if math.IsInf(tv, -1) {
 			return json.Number("-1e1000")
 		}
+		if math.IsNaN(tv) {
+			return "NaN"
+		}
 		return tv
 	case float32:
 		if math.IsInf(float64(tv), 1) {
@@ -248,6 +256,9 @@ func applyJSONFixup(v any) any {
 		}
 		if math.IsInf(float64(tv), -1) {
 			return json.Number("-1e1000")
+		}
+		if math.IsNaN(float64(tv)) {
+			return "NaN"
 		}
 		return tv
 	case []byte:
