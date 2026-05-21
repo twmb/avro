@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -425,8 +424,31 @@ type deserRecordField struct {
 type deserRecord struct {
 	fields []deserRecordField
 	names  []string
-	cache  sync.Map                        // map[reflect.Type]*cachedMapping
-	fast   atomic.Pointer[fastRecordDeser] // lazily compiled unsafe fast path, atomic for concurrent decode
+	cache  sync.Map // map[reflect.Type]*cachedMapping
+	fast   sync.Map // map[reflect.Type]*fastRecordDeser — per-Go-type compiled unsafe path
+}
+
+// fastFor returns the compiled unsafe fast path for t, or nil if not
+// yet compiled. Sibling of [serRecord.fastFor]; see that comment.
+func (s *deserRecord) fastFor(t reflect.Type) *fastRecordDeser {
+	if v, ok := s.fast.Load(t); ok {
+		return v.(*fastRecordDeser)
+	}
+	return nil
+}
+
+// loadOrCompileFast returns the compiled fast path for t, compiling
+// and storing it on first call. Sibling of [serRecord.loadOrCompileFast].
+func (s *deserRecord) loadOrCompileFast(t reflect.Type) *fastRecordDeser {
+	if fast := s.fastFor(t); fast != nil {
+		return fast
+	}
+	fast := compileFastDeser(s.fields, s.names, &s.cache, t)
+	if fast == nil {
+		return nil
+	}
+	actual, _ := s.fast.LoadOrStore(t, fast)
+	return actual.(*fastRecordDeser)
 }
 
 func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -497,11 +519,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	}
 	// Struct: try precompiled unsafe fast path.
 	if v.CanAddr() {
-		if fast := s.fast.Load(); fast != nil && fast.typ == t {
-			return deserRecordFast(src, fast, v, sl)
-		}
-		if fast := compileFastDeser(s.fields, s.names, &s.cache, t); fast != nil {
-			s.fast.Store(fast)
+		if fast := s.loadOrCompileFast(t); fast != nil {
 			return deserRecordFast(src, fast, v, sl)
 		}
 	}
@@ -516,10 +534,10 @@ type deserEnum struct {
 }
 
 // setEnumTarget assigns the (idx, symbol) pair to v per the enum target
-// matrix: Interface→symbol-as-string; String→symbol; Int/Uint→ordinal.
-// Shared by deserEnum (binary), resolveEnum (binary with symbol remap),
-// and decodeEnum (JSON) so the four target arms agree on overflow checks
-// and SemanticError shapes.
+// matrix: Interface→symbol-as-string; String→symbol; Int/Uint→ordinal;
+// TextUnmarshaler→UnmarshalText(symbol). Shared by deserEnum (binary),
+// resolveEnum (binary with symbol remap), and decodeEnum (JSON) so the
+// target arms agree on overflow checks and SemanticError shapes.
 func setEnumTarget(v reflect.Value, idx int, symbol string) error {
 	switch {
 	case v.Kind() == reflect.Interface:
@@ -538,6 +556,9 @@ func setEnumTarget(v reflect.Value, idx int, symbol string) error {
 		}
 		v.SetUint(uint64(idx))
 		return nil
+	}
+	if ok, err := tryTextUnmarshal(v, []byte(symbol)); ok {
+		return err
 	}
 	return semErr(v, "enum")
 }
@@ -794,22 +815,14 @@ func schemaMinBytesSeen(n *schemaNode, seen map[*schemaNode]struct{}) int {
 
 // fastPathSafeForElem reports whether a primitive fast loop with expected
 // kind fastElemKind is safe for slice/map elements of type elemType.
-// Returns false when:
-//   - Kind doesn't match (the existing primitive-fast-path screen), OR
-//   - elemType is json.Number (whose Kind() == reflect.String matches the
-//     string fast path's expected kind, but whose stdlib RFC 8259 contract
-//     requires per-element setStringTarget consultation via
-//     rejectJSONNumberStringTarget). The fast string loops
-//     (deserArrayStringLoop, deserMapStringBlock) capture
-//     reflect.Value.SetString as a method expression and invoke it via
-//     closure with no guard — Pattern 14c (BUG_AUDIT.md) helper-bypass-via-
-//     function-value-capture. Routing json.Number elements through the
-//     slow path activates the guard at the per-element setter.
-//
-// One predicate consulted by both deserArray.deser and deserMap.deser so
-// the fast-path-vs-guard rule lives in one place — drift impossible by
-// construction. Inlines at cost 67 (within Go's mid-stack inliner budget
-// of 80), so the gate has no call overhead at runtime.
+// Returns false when the kind doesn't match, or when elemType is
+// json.Number — its Kind() == reflect.String matches the string fast
+// path's expected kind, but its RFC 8259 invariant requires per-element
+// rejectJSONNumberStringTarget consultation, which the fast string
+// loops (deserArrayStringLoop, deserMapStringBlock) bypass by capturing
+// reflect.Value.SetString as a method expression. Routing json.Number
+// elements through the slow path activates the guard at the per-element
+// setter.
 func fastPathSafeForElem(elemType reflect.Type, fastElemKind reflect.Kind) bool {
 	return elemType.Kind() == fastElemKind && elemType != jsonNumberType
 }
@@ -1390,6 +1403,15 @@ func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		copy(buf, src[:16])
 		v.SetBytes(buf)
 	default:
+		// TextUnmarshaler target: pass the canonical hex-dash form, so
+		// the same Go type can decode from either schema shape
+		// (fixed+uuid or string+uuid) symmetrically with serFixedUUIDReflect.
+		if ok, err := tryTextUnmarshal(v, []byte(uuidToString(b))); ok {
+			if err != nil {
+				return nil, err
+			}
+			return src[16:], nil
+		}
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: errors.New("uuid")}
 	}
 	return src[16:], nil

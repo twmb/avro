@@ -121,7 +121,7 @@ func (s *Schema) EncodeJSON(v any, opts ...Opt) ([]byte, error) {
 // AppendEncodeJSON is like [Schema.EncodeJSON] but appends to dst.
 func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error) {
 	cfg := parseOpts(opts)
-	return appendAvroJSON(dst, reflect.ValueOf(v), s.node, &cfg, s.customEncodes, 0)
+	return appendAvroJSON(dst, reflect.ValueOf(v), s.node, &cfg, s.custom, 0)
 }
 
 // DecodeJSON decodes Avro JSON from src into v. It unwraps union wrappers,
@@ -192,7 +192,7 @@ func isJSONValueStart(b byte) bool {
 // the Go value via reflect and the schema tree simultaneously, writing
 // JSON directly without an intermediate binary encoding step. Handles
 // structs, maps, all numeric coercions, time.Time, etc.
-func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
+func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
 	if depth >= maxDepth {
 		return nil, errTooDeep
 	}
@@ -227,15 +227,15 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			break
 		}
 		if v.IsNil() {
-			return appendAvroJSON(buf, reflect.Value{}, node, cfg, customEncodes, depth+1)
+			return appendAvroJSON(buf, reflect.Value{}, node, cfg, custom, depth+1)
 		}
 		v = v.Elem()
 	}
 
 	// Apply custom type encode conversion before the type switch.
-	if ce := customEncodes[node]; ce != nil {
+	if w := custom[node]; w != nil && w.encode != nil {
 		var err error
-		v, err = ce(v)
+		v, err = w.encode(v)
 		if err != nil {
 			return nil, err
 		}
@@ -479,6 +479,19 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				}
 				return appendAvroJSONBytes(buf, u[:]), nil
 			}
+			// TextMarshaler / AppendText: parity with the binary
+			// serFixedUUIDReflect and with the JSON string+uuid path
+			// (avroStringValue). MarshalText must produce a UUID
+			// hex-dash string.
+			if text, ok, err := textValue(v, "fixed"); err != nil {
+				return nil, err
+			} else if ok {
+				u, err := parseUUID(text)
+				if err != nil {
+					return nil, err
+				}
+				return appendAvroJSONBytes(buf, u[:]), nil
+			}
 		}
 		var raw []byte
 		if v.Kind() == reflect.String {
@@ -521,6 +534,16 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			}
 			return appendJSONString(buf, node.symbols[n]), nil
 		}
+		// TextMarshaler / AppendText: parity with serEnum on the binary
+		// side. The text must match a known symbol.
+		if text, ok, err := textValue(v, "enum"); err != nil {
+			return nil, err
+		} else if ok {
+			if slices.Contains(node.symbols, text) {
+				return appendJSONString(buf, text), nil
+			}
+			return nil, fmt.Errorf("avro json: unknown enum symbol %q", text)
+		}
 		return nil, fmt.Errorf("avro json: expected string or integer for enum, got %s", v.Type())
 
 	case "array":
@@ -533,7 +556,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				buf = append(buf, ',')
 			}
 			var err error
-			buf, err = appendAvroJSON(buf, v.Index(i), node.items, cfg, customEncodes, depth+1)
+			buf, err = appendAvroJSON(buf, v.Index(i), node.items, cfg, custom, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -560,7 +583,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			buf = appendJSONString(buf, iter.Key().String())
 			buf = append(buf, ':')
 			var err error
-			buf, err = appendAvroJSON(buf, iter.Value(), node.values, cfg, customEncodes, depth+1)
+			buf, err = appendAvroJSON(buf, iter.Value(), node.values, cfg, custom, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -568,10 +591,10 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return append(buf, '}'), nil
 
 	case "record":
-		return appendAvroJSONRecord(buf, v, node, cfg, customEncodes, depth+1)
+		return appendAvroJSONRecord(buf, v, node, cfg, custom, depth+1)
 
 	case "union":
-		return appendAvroJSONUnion(buf, v, node, cfg, customEncodes, depth+1)
+		return appendAvroJSONUnion(buf, v, node, cfg, custom, depth+1)
 
 	default:
 		return nil, fmt.Errorf("avro json: unsupported schema kind %q", node.kind)
@@ -586,64 +609,29 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 // nil-default-to-null / default-via-appendAvroJSON sequence agrees
 // across both. Defaults route through appendAvroJSON (not a pre-
 // marshalled splice) so encoder options apply equally to defaults.
-func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
+func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
 	if !f.hasDefault {
 		return nil, fmt.Errorf("avro json: record %q missing required field %q", recordName, f.name)
 	}
 	if f.defaultVal == nil {
 		return append(buf, "null"...), nil
 	}
-	return appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, customEncodes, depth+1)
-}
-
-// chooseFieldKey selects which key (canonical or alias) the caller's
-// input map used to populate the given record field, mirroring the
-// decode-side alias resolution in [iterateRecordFields]:
-//   - canonical present, no alias: returns (canonical, true, nil)
-//   - only an alias present: returns (alias, true, nil)
-//   - canonical AND alias both present, or two aliases both present:
-//     returns ("", false, err) — same kind of ambiguity decode rejects
-//   - neither present: returns ("", false, nil) — caller emits default
-//
-// hasKey is the lookup probe: for the map[string]any fast path, it
-// returns `_, ok := m[k]`; for the generic Map path, it returns
-// `v.MapIndex(typedKey).IsValid()`. Keeping the probe abstract lets the
-// helper drive both paths and ensures encode-side alias-resolution
-// stays symmetric with decode.
-func chooseFieldKey(f *fieldNode, nodeName string, hasKey func(key string) bool) (foundKey string, exists bool, err error) {
-	canonOK := hasKey(f.name)
-	aliasFound := ""
-	for _, a := range f.aliases {
-		if hasKey(a) {
-			if aliasFound != "" {
-				return "", false, fmt.Errorf("avro json: record %q field %q resolved from both alias keys %q and %q in the input map",
-					nodeName, f.name, aliasFound, a)
-			}
-			aliasFound = a
-		}
-	}
-	if canonOK && aliasFound != "" {
-		return "", false, fmt.Errorf("avro json: record %q field %q resolved from both canonical key %q and alias key %q in the input map",
-			nodeName, f.name, f.name, aliasFound)
-	}
-	if canonOK {
-		return f.name, true, nil
-	}
-	if aliasFound != "" {
-		return aliasFound, true, nil
-	}
-	return "", false, nil
+	return appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, custom, depth+1)
 }
 
 // appendAvroJSONRecord handles record encoding for both structs and maps.
-func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
+func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
 	buf = append(buf, '{')
 	if v.Kind() == reflect.Map {
 		if v.Type().Key().Kind() != reflect.String {
 			return nil, semErr(v, "record")
 		}
-		// map[string]any fast path: MapIndex allocates via reflect.copyVal
-		// for each interface{} element; direct lookup skips that.
+		// Input keys must match the schema's canonical field names —
+		// aliases are a reader-side / decode concept, not relevant on
+		// encode (we are the writer and our output uses our schema's
+		// canonical names). map[string]any fast path: MapIndex
+		// allocates via reflect.copyVal for each interface{} element;
+		// direct lookup skips that.
 		if v.Type() == mapStringAnyType {
 			m := v.Interface().(map[string]any)
 			for i, f := range node.fields {
@@ -652,17 +640,12 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 				}
 				buf = appendJSONString(buf, f.name)
 				buf = append(buf, ':')
-				foundKey, exists, err := chooseFieldKey(&f, node.name, func(k string) bool {
-					_, ok := m[k]
-					return ok
-				})
-				if err != nil {
-					return nil, err
-				}
+				value, exists := m[f.name]
+				var err error
 				if !exists {
-					buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, customEncodes, depth)
+					buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, custom, depth)
 				} else {
-					buf, err = appendAvroJSON(buf, reflect.ValueOf(m[foundKey]), f.node, cfg, customEncodes, depth+1)
+					buf, err = appendAvroJSON(buf, reflect.ValueOf(value), f.node, cfg, custom, depth+1)
 				}
 				if err != nil {
 					return nil, err
@@ -670,22 +653,19 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			}
 			return append(buf, '}'), nil
 		}
+		mapType := v.Type()
 		for i, f := range node.fields {
 			if i > 0 {
 				buf = append(buf, ',')
 			}
 			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
-			foundKey, exists, err := chooseFieldKey(&f, node.name, func(k string) bool {
-				return v.MapIndex(mapKeyAs(v.Type(), reflect.ValueOf(k))).IsValid()
-			})
-			if err != nil {
-				return nil, err
-			}
-			if !exists {
-				buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, customEncodes, depth)
+			value := v.MapIndex(mapKeyAs(mapType, f.nameVal))
+			var err error
+			if !value.IsValid() {
+				buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, custom, depth)
 			} else {
-				buf, err = appendAvroJSON(buf, v.MapIndex(mapKeyAs(v.Type(), reflect.ValueOf(foundKey))), f.node, cfg, customEncodes, depth+1)
+				buf, err = appendAvroJSON(buf, value, f.node, cfg, custom, depth+1)
 			}
 			if err != nil {
 				return nil, err
@@ -715,7 +695,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 				buf = append(buf, "null"...)
 				continue
 			}
-			buf, err = appendAvroJSON(buf, fv, f.node, cfg, customEncodes, depth+1)
+			buf, err = appendAvroJSON(buf, fv, f.node, cfg, custom, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -753,7 +733,7 @@ func appendUnionBranch(buf []byte, branch *schemaNode, encoded []byte, cfg *optC
 }
 
 // appendAvroJSONUnion handles union encoding.
-func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, customEncodes map[*schemaNode]func(reflect.Value) (reflect.Value, error), depth int) ([]byte, error) {
+func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
 	if depth >= maxDepth {
 		return nil, errTooDeep
 	}
@@ -767,7 +747,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 		if key.Kind() == reflect.String {
 			if branch := findUnionBranch(node, key.String()); branch != nil {
 				inner := iter.Value()
-				encoded, err := appendAvroJSON(nil, inner, branch, cfg, customEncodes, depth+1)
+				encoded, err := appendAvroJSON(nil, inner, branch, cfg, custom, depth+1)
 				if err != nil {
 					if errors.Is(err, errTooDeep) {
 						return nil, err
@@ -811,7 +791,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 			if branch.kind != name {
 				continue
 			}
-			encoded, err := appendAvroJSON(nil, v, branch, cfg, customEncodes, depth+1)
+			encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
 			if err == nil {
 				return appendUnionBranch(buf, branch, encoded, cfg), nil
 			}
@@ -823,7 +803,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 	}
 
 tryAll:
-	// Try every branch including null, mirroring serUnion.ser (ser.go:127).
+	// Try every branch including null, mirroring serUnion.ser.
 	// The case "null" arm of appendAvroJSON rejects non-nil values with
 	// errNonNil, so a non-nil v cleanly falls through to the next branch.
 	// A nil Map / nil Slice / nil Chan / nil Func (none of which the peel
@@ -831,10 +811,15 @@ tryAll:
 	// names except []byte → "bytes") lands on case "null" here and emits
 	// "null"; without trying the null branch, binary↔JSON parity breaks
 	// for those shapes the way the binary serUnion.ser try-each handles via
-	// serNull (ser.go:281). The 2-branch [null,T] fast path on the binary
-	// side uses serNullUnionAt → isNilValue, which covers the same shapes.
+	// serNull. The 2-branch [null,T] fast path on the binary side uses
+	// serNullUnionAt → isNilValue, which covers the same shapes.
+	//
+	// Keep the last concrete error so the final message names the closest
+	// reason a branch failed (mirrors decodeUnionBare's lastErr plumbing
+	// on the decode side and serUnion.ser on the binary encode side).
+	var lastErr error
 	for _, branch := range node.branches {
-		encoded, err := appendAvroJSON(nil, v, branch, cfg, customEncodes, depth+1)
+		encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
 		if err == nil {
 			return appendUnionBranch(buf, branch, encoded, cfg), nil
 		}
@@ -844,6 +829,10 @@ tryAll:
 		if errors.Is(err, errTooDeep) {
 			return nil, err
 		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("avro json: no union branch matched value of type %s: %w", v.Type(), lastErr)
 	}
 	return nil, fmt.Errorf("avro json: no union branch matched value of type %s", v.Type())
 }

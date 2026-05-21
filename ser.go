@@ -1,7 +1,6 @@
 package avro
 
 import (
-	"encoding"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -13,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -149,20 +147,29 @@ func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		}
 	}
 
-	var err error
+	// Try every branch; keep the last concrete error so callers see why
+	// the closest match failed instead of a generic "no matching branch".
+	var lastErr error
 	for i, fn := range s.fns {
 		attempt := appendVarint(base, int32(i))
-		if attempt, err = fn(attempt, v, depth+1); err == nil {
-			return attempt, nil
+		out, err := fn(attempt, v, depth+1)
+		if err == nil {
+			return out, nil
 		}
 		// Propagate too-deep immediately; trial loop would mask it.
 		if errors.Is(err, errTooDeep) {
 			return nil, err
 		}
+		lastErr = err
 	}
-	e := &SemanticError{AvroType: "union", Err: errors.New("no matching branch")}
+	e := &SemanticError{AvroType: "union"}
 	if v.IsValid() {
 		e.GoType = v.Type()
+	}
+	if lastErr != nil {
+		e.Err = fmt.Errorf("no matching branch: %w", lastErr)
+	} else {
+		e.Err = errors.New("no matching branch")
 	}
 	return nil, e
 }
@@ -277,15 +284,13 @@ func isNilValue(v reflect.Value) bool {
 		return true
 	}
 	// Peel Pointer/Interface in one loop, then inspect the final kind
-	// in a separate switch — matches serNull's shape (ser.go:332-346)
-	// so a depth-5 chain bottoming at a nil Map/Slice/Chan/Func is
-	// correctly identified. Combining the peel and the Map/Slice/Chan/
-	// Func nil-check inside one loop (the pre-fix shape) lost the
-	// bottom-value check at exactly the depth-cap boundary: iter 5
-	// would peel the last Pointer to a Map but the loop terminated
-	// before the next iteration could inspect Map.IsNil. Pattern 14a
-	// — the peel broadening on serNull was not propagated to its
-	// sibling pre-filter helper.
+	// in a separate switch — matches serNull's shape so a depth-cap
+	// chain bottoming at a nil Map/Slice/Chan/Func is correctly
+	// identified. Combining the peel and the Map/Slice/Chan/Func
+	// nil-check inside one loop loses the bottom-value check at
+	// exactly the depth-cap boundary: the loop would peel the last
+	// Pointer to a Map but terminate before the next iteration could
+	// inspect Map.IsNil.
 	for range maxIndirectDepth {
 		if v.Kind() != reflect.Pointer && v.Kind() != reflect.Interface {
 			break
@@ -848,37 +853,36 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.Kind() == reflect.String {
 		return doSerString(dst, v.String()), nil
 	}
-	if v.CanInterface() {
-		i := v.Interface()
-		if a, ok := i.(encoding.TextAppender); ok {
-			mark := len(dst)
-			dst = appendVarlong(dst, 0) // placeholder for length
-			hdrLen := len(dst) - mark
-			var err error
-			dst, err = a.AppendText(dst)
-			if err != nil {
-				return nil, err
-			}
-			textLen := len(dst) - mark - hdrLen
-			var buf [10]byte
-			hdr := appendVarlong(buf[:0], int64(textLen))
-			if len(hdr) == hdrLen {
-				copy(dst[mark:], hdr)
-			} else {
-				// Header grew; shift text to make room.
-				dst = append(dst, make([]byte, len(hdr)-hdrLen)...)
-				copy(dst[mark+len(hdr):], dst[mark+hdrLen:mark+hdrLen+textLen])
-				copy(dst[mark:], hdr)
-			}
-			return dst, nil
+	if a, m := textOutFor(v); a != nil {
+		// AppendText is preferred for the alloc-free inline write:
+		// reserve a single-byte length placeholder, let AppendText
+		// write directly into dst, then backfill the real header
+		// (shifting text iff the header grew past 1 byte).
+		mark := len(dst)
+		dst = appendVarlong(dst, 0)
+		hdrLen := len(dst) - mark
+		var err error
+		dst, err = a.AppendText(dst)
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "string", Err: err}
 		}
-		if m, ok := i.(encoding.TextMarshaler); ok {
-			text, err := m.MarshalText()
-			if err != nil {
-				return nil, err
-			}
-			return doSerString(dst, string(text)), nil
+		textLen := len(dst) - mark - hdrLen
+		var buf [10]byte
+		hdr := appendVarlong(buf[:0], int64(textLen))
+		if len(hdr) == hdrLen {
+			copy(dst[mark:], hdr)
+		} else {
+			dst = append(dst, make([]byte, len(hdr)-hdrLen)...)
+			copy(dst[mark+len(hdr):], dst[mark+hdrLen:mark+hdrLen+textLen])
+			copy(dst[mark:], hdr)
 		}
+		return dst, nil
+	} else if m != nil {
+		text, err := m.MarshalText()
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "string", Err: err}
+		}
+		return doSerString(dst, string(text)), nil
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		// doSerString does `append(dst, s...)` and doesn't retain s, so
@@ -888,6 +892,7 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 	}
 	return nil, semErr(v, "string")
 }
+
 
 // avroStringValue resolves v to its canonical Avro-string textual form
 // as a Go string. It is the JSON-encoder's counterpart to appendAvroString
@@ -903,22 +908,10 @@ func avroStringValue(v reflect.Value) (string, error) {
 	if v.Kind() == reflect.String {
 		return v.String(), nil
 	}
-	if v.CanInterface() {
-		i := v.Interface()
-		if a, ok := i.(encoding.TextAppender); ok {
-			text, err := a.AppendText(nil)
-			if err != nil {
-				return "", err
-			}
-			return string(text), nil
-		}
-		if m, ok := i.(encoding.TextMarshaler); ok {
-			text, err := m.MarshalText()
-			if err != nil {
-				return "", err
-			}
-			return string(text), nil
-		}
+	if text, ok, err := textValue(v, "string"); err != nil {
+		return "", err
+	} else if ok {
+		return text, nil
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		return string(v.Bytes()), nil
@@ -967,8 +960,37 @@ type serRecordField struct {
 type serRecord struct {
 	fields []serRecordField
 	names  []string
-	cache  sync.Map                      // map[reflect.Type]*cachedMapping
-	fast   atomic.Pointer[fastRecordSer] // lazily compiled unsafe fast path, atomic for concurrent encode
+	cache  sync.Map // map[reflect.Type]*cachedMapping
+	fast   sync.Map // map[reflect.Type]*fastRecordSer — per-Go-type compiled unsafe path
+}
+
+// fastFor returns the compiled unsafe fast path for t, or nil if not
+// yet compiled. Read-only; used by nested-record sites that don't
+// trigger compilation themselves (the outer record's slow-path entry
+// is responsible for that).
+func (s *serRecord) fastFor(t reflect.Type) *fastRecordSer {
+	if v, ok := s.fast.Load(t); ok {
+		return v.(*fastRecordSer)
+	}
+	return nil
+}
+
+// loadOrCompileFast returns the compiled fast path for t, compiling
+// and storing it on first call. Returns nil when compilation fails
+// (e.g. typeFieldMapping rejects t); callers fall back to the reflect
+// path. Multiple goroutines compiling the same type concurrently each
+// build their own *fastRecordSer; LoadOrStore picks one winner so all
+// callers end up with the same pointer.
+func (s *serRecord) loadOrCompileFast(t reflect.Type) *fastRecordSer {
+	if fast := s.fastFor(t); fast != nil {
+		return fast
+	}
+	fast := compileFastSer(s.fields, s.names, &s.cache, t)
+	if fast == nil {
+		return nil
+	}
+	actual, _ := s.fast.LoadOrStore(t, fast)
+	return actual.(*fastRecordSer)
 }
 
 func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
@@ -987,7 +1009,10 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 	if k == reflect.Map {
 		// map[string]any fast path: reflect.Value.MapIndex copies the value
 		// through reflect.copyVal which allocates per field for interface{}
-		// element maps. Direct map access skips that.
+		// element maps. Direct map access skips that. Input keys must
+		// match the schema's canonical field names — aliases are a
+		// reader-side / decode concept, not relevant on encode (we are
+		// the writer and our output uses our schema's canonical names).
 		if t == mapStringAnyType {
 			m := v.Interface().(map[string]any)
 			for _, f := range s.fields {
@@ -1036,11 +1061,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 	// Struct: try precompiled unsafe fast path. Requires addressable
 	// value so we can take a pointer for unsafe field access.
 	if v.CanAddr() {
-		if fast := s.fast.Load(); fast != nil && fast.typ == t {
-			return serRecordFast(dst, fast, v, depth+1)
-		}
-		if fast := compileFastSer(s.fields, s.names, &s.cache, t); fast != nil {
-			s.fast.Store(fast)
+		if fast := s.loadOrCompileFast(t); fast != nil {
 			return serRecordFast(dst, fast, v, depth+1)
 		}
 	}
@@ -1126,11 +1147,21 @@ func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("index %d out of range [0, %d)", n, len(s.symbols))}
 		}
 		return appendVarint(dst, int32(n)), nil
-
-	default:
-		return nil, semErr(v, "enum")
 	}
+	// Enum symbols are strings; a type whose Go form isn't reflect.String
+	// but provides a text-out method (TextAppender / TextMarshaler) can
+	// still encode by materializing its text and looking up the symbol.
+	if needle, ok, err := textValue(v, "enum"); err != nil {
+		return nil, err
+	} else if ok {
+		if i, idxOk := s.indexOfSymbol(needle); idxOk {
+			return appendVarint(dst, int32(i)), nil
+		}
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", needle)}
+	}
+	return nil, semErr(v, "enum")
 }
+
 
 type serArray struct {
 	serItem serfn
@@ -1185,7 +1216,7 @@ func peelElem(v reflect.Value, avroType string) (reflect.Value, error) {
 // appendFn + terminator) sequence for the primitive serArray
 // specializations. appendFn is a typed function-pointer parameter (NOT a
 // closure capture), so the compiler emits one indirect call per element
-// — same shape as the direct call before R2.
+// — matching the inlined direct-call shape.
 func appendArrayPrimitive(
 	dst []byte, v reflect.Value, avroType string,
 	appendFn func([]byte, reflect.Value) ([]byte, error),
@@ -2060,6 +2091,17 @@ func serFixedUUIDReflect(dst []byte, v reflect.Value, depth int) ([]byte, error)
 		// fixed+uuid wire (rejectJSONNumberStringTarget) but the
 		// encode-side asymmetry is documented as intentional.
 		u, err := parseUUID(v.String())
+		if err != nil {
+			return nil, err
+		}
+		return append(dst, u[:]...), nil
+	}
+	// TextMarshaler / AppendText: parity with serUUID (string+uuid) so
+	// the same Go type can be encoded against either schema shape.
+	if text, ok, err := textValue(v, "fixed"); err != nil {
+		return nil, err
+	} else if ok {
+		u, err := parseUUID(text)
 		if err != nil {
 			return nil, err
 		}

@@ -315,7 +315,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		}
 		rec := f.meta.serRecord
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			if fast := rec.fast.Load(); fast != nil && fast.typ == goType && fast.allFast {
+			if fast := rec.fastFor(goType); fast != nil && fast.allFast {
 				return serRecordFastPtr(dst, fast, p, depth+1)
 			}
 			return rec.ser(dst, reflect.NewAt(goType, p).Elem(), depth+1)
@@ -456,7 +456,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		}
 		rec := f.meta.deserRecord
 		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			if fast := rec.fast.Load(); fast != nil && fast.typ == goType && fast.allFast {
+			if fast := rec.fastFor(goType); fast != nil && fast.allFast {
 				return deserRecordFastPtr(src, fast, p, sl)
 			}
 			return rec.deser(src, reflect.NewAt(goType, p).Elem(), sl)
@@ -1256,7 +1256,7 @@ func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte
 			return append(dst, nullByte), nil
 		}
 		dst = append(dst, valByte)
-		if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
+		if fast := rec.fastFor(innerType); fast != nil && fast.allFast {
 			return serRecordFastPtr(dst, fast, pp, depth+1)
 		}
 		return rec.ser(dst, reflect.NewAt(innerType, pp).Elem(), depth+1)
@@ -1313,7 +1313,7 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 		if err != nil || isNull {
 			return src, err
 		}
-		if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
+		if fast := rec.fastFor(innerType); fast != nil && fast.allFast {
 			return deserRecordFastPtr(src, fast, pp, sl)
 		}
 		return rec.deser(src, reflect.NewAt(innerType, pp).Elem(), sl)
@@ -1322,14 +1322,13 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 
 // ---- Array unsafe ser/deser ----
 //
-// R4 attempted a usSliceFrame[Elem] generic factor of the (depth-check +
-// length-prefix + early-exit + per-element body + terminator) sequence.
-// Benchstat against the inline-five-copies baseline showed +16% on
-// BenchmarkLargeArrayEncode (the []*Record hot path) — beyond the 5%
-// audit threshold. The extra closure call per slice (body func passed
-// to usSliceFrame) combined with the Go compiler choosing not to inline
-// the generic at the call site costs measurable per-array work. Reverted.
-// See DRY_AUDIT.md R4 for the proposal that was rejected on perf grounds.
+// The five per-element loops (depth-check + length-prefix + early-exit
+// + per-element body + terminator) are intentionally inlined rather
+// than factored into a generic helper. A usSliceFrame[Elem] factoring
+// regressed BenchmarkLargeArrayEncode (the []*Record hot path) by ~16%:
+// the extra closure call per slice combined with the Go compiler
+// declining to inline the generic at each call site costs measurable
+// per-array work.
 
 // usArrayRecord handles array ser for []T or []*T where items are records.
 func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
@@ -1348,8 +1347,8 @@ func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 			return dst, nil
 		}
 		data := unsafe.Pointer(unsafe.SliceData(bs))
-		fast := rec.fast.Load()
-		useFast := fast != nil && fast.typ == elemGoType && fast.allFast
+		fast := rec.fastFor(elemGoType)
+		useFast := fast != nil && fast.allFast
 		var err error
 		for i := range n {
 			elemP := unsafe.Add(data, uintptr(i)*elemSize)
@@ -1378,8 +1377,8 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 		if n == 0 {
 			return dst, nil
 		}
-		fast := rec.fast.Load()
-		useFast := fast != nil && fast.typ == innerType && fast.allFast
+		fast := rec.fastFor(innerType)
+		useFast := fast != nil && fast.allFast
 		var err error
 		for _, pp := range s {
 			if pp == nil {
@@ -1410,8 +1409,8 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 		if n == 0 {
 			return dst, nil
 		}
-		fast := rec.fast.Load()
-		useFast := fast != nil && fast.typ == innerType && fast.allFast
+		fast := rec.fastFor(innerType)
+		useFast := fast != nil && fast.allFast
 		var err error
 		for _, pp := range s {
 			if pp == nil {
@@ -1573,8 +1572,8 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minIt
 					}
 				}
 				// Deserialize each element.
-				fast := rec.fast.Load()
-				useFast := fast != nil && fast.typ == innerType && fast.allFast
+				fast := rec.fastFor(innerType)
+				useFast := fast != nil && fast.allFast
 				var err error
 				for i := range n {
 					elemP := s[start+i]

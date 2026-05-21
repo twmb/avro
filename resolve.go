@@ -34,23 +34,20 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 		return nil, err
 	}
 	ctx := &resolveCtx{
-		seen:           make(map[nodePair]*schemaNode),
-		customDecoders: reader.customDecoders,
-		customSNs:      reader.customSNs,
+		seen:   make(map[nodePair]*schemaNode),
+		custom: reader.custom,
 	}
 	resolved, err := resolveNode(reader.node, writer.node, "", ctx)
 	if err != nil {
 		return nil, err
 	}
 	s := &Schema{
-		ser:            reader.ser,
-		deser:          resolved.deser,
-		c:              reader.c,
-		node:           reader.node,
-		full:           reader.full,
-		customEncodes:  reader.customEncodes,
-		customDecoders: reader.customDecoders,
-		customSNs:      reader.customSNs,
+		ser:    reader.ser,
+		deser:  resolved.deser,
+		c:      reader.c,
+		node:   reader.node,
+		full:   reader.full,
+		custom: reader.custom,
 	}
 	s.soe = reader.soe
 	// SOE wire bytes carry the writer's fingerprint per the Avro spec
@@ -92,15 +89,23 @@ type defaultOp struct {
 
 // resolveCtx carries per-resolution state through the recursive resolve calls.
 type resolveCtx struct {
-	seen           map[nodePair]*schemaNode
-	customDecoders map[*schemaNode][]func(any, *SchemaNode) (any, error)
-	customSNs      map[*schemaNode]*SchemaNode
+	seen   map[nodePair]*schemaNode
+	custom map[*schemaNode]*customWiring
+}
+
+// customDecodersFor returns the decoder chain registered against r, or
+// nil if none. Sibling of [resolveCtx.customSNFor].
+func (ctx *resolveCtx) customDecodersFor(r *schemaNode) []func(any, *SchemaNode) (any, error) {
+	if w := ctx.custom[r]; w != nil {
+		return w.decoders
+	}
+	return nil
 }
 
 // maybeWrapResolvedNode re-applies custom decoders from the reader
 // schema to a resolved node that uses the reader node directly.
 func maybeWrapResolvedNode(r *schemaNode, ctx *resolveCtx) *schemaNode {
-	if len(ctx.customDecoders[r]) == 0 {
+	if len(ctx.customDecodersFor(r)) == 0 {
 		return r
 	}
 	nd := &schemaNode{
@@ -118,13 +123,12 @@ func maybeWrapResolvedNode(r *schemaNode, ctx *resolveCtx) *schemaNode {
 // Shared by the resolveArray/resolveMap/resolveEnum/promote sites in
 // doResolve so all four agree on the wrap pair.
 func (ctx *resolveCtx) applyCustomToNode(nd, r *schemaNode) {
-	decs := ctx.customDecoders[r]
-	if len(decs) == 0 {
+	w := ctx.custom[r]
+	if w == nil || len(w.decoders) == 0 {
 		return
 	}
-	sn := ctx.customSNs[r]
-	nd.deser = wrapDeserWithCustomDecoders(nd.deser, decs, sn)
-	nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
+	nd.deser = wrapDeserWithCustomDecoders(nd.deser, w.decoders, w.sn)
+	nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(w.decoders, w.sn)
 }
 
 // resolveNode resolves a (reader, writer) schema pair, handling cycles
@@ -319,8 +323,8 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 			return nil, fmt.Errorf("field %s: %w", fieldPath(path, rf.name), err)
 		}
 		deser := rf.node.deser
-		if decs := ctx.customDecoders[rf.node]; len(decs) > 0 {
-			deser = wrapDeserWithCustomDecoders(deser, decs, ctx.customSNs[rf.node])
+		if w := ctx.custom[rf.node]; w != nil && len(w.decoders) > 0 {
+			deser = wrapDeserWithCustomDecoders(deser, w.decoders, w.sn)
 		}
 		rr.defaults = append(rr.defaults, defaultOp{
 			readerIdx:      i,

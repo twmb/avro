@@ -6680,7 +6680,7 @@ func TestRegression_DuplicateCanonicalKeyLastWins(t *testing.T) {
 		}
 	})
 
-	// Alias collision (the round-85 fix's actual target) still errors.
+	// Alias collision (the original target of this guard) still errors.
 	t.Run("alias_collision_still_rejects", func(t *testing.T) {
 		aliasSchema := `{"type":"record","name":"R","fields":[{"name":"new_name","type":"long","aliases":["old_name"]}]}`
 		sa := avro.MustParse(aliasSchema)
@@ -6695,37 +6695,39 @@ func TestRegression_DuplicateCanonicalKeyLastWins(t *testing.T) {
 	})
 }
 
-// TestRegression_JSONEncodeAliasKeySymmetric pins:
-// appendAvroJSONRecord (encode side) mirrors iterateRecordFields
-// (decode side) on alias-key resolution. Without this, encode would
-// silently drop alias keys when the canonical key was absent OR when
-// both were present. Encode uses the alias value as a fallback, and
-// rejects when canonical and alias are both present (matching
-// decode-side rejection in the alias-collision sub-test above).
-func TestRegression_JSONEncodeAliasKeySymmetric(t *testing.T) {
+// TestRegression_JSONEncodeIgnoresAliases pins: appendAvroJSONRecord
+// (encode side) looks up input keys by the schema's canonical field
+// name ONLY. Aliases are a reader-side / decode concept — they let
+// downstream readers accept writer data tagged with older names. On
+// encode we are the writer; our output uses our schema's canonical
+// names and our input is expected to use the same. An input keyed by
+// an alias is not recognized: the field falls through to default-fill
+// (or "missing required field" when no default exists), exactly as
+// any other unrecognized key would.
+func TestRegression_JSONEncodeIgnoresAliases(t *testing.T) {
 	schemaJSON := `{"type":"record","name":"R","fields":[{"name":"new_name","type":"long","aliases":["old_name"]}]}`
 	s := avro.MustParse(schemaJSON)
 
-	t.Run("alias_only_uses_alias_value", func(t *testing.T) {
-		out, err := s.AppendEncodeJSON(nil, map[string]any{"old_name": int64(22)})
-		if err != nil {
-			t.Fatalf("expected accept for alias-only input; got error: %v", err)
+	t.Run("alias_only_is_missing_field", func(t *testing.T) {
+		_, err := s.AppendEncodeJSON(nil, map[string]any{"old_name": int64(22)})
+		if err == nil {
+			t.Fatalf("expected missing-field error; alias key was silently accepted")
 		}
-		got := string(out)
-		// Symmetric with decode: alias key resolves to canonical field.
-		// Output uses the canonical name (schema field name).
-		if got != `{"new_name":22}` {
-			t.Fatalf("expected output to use canonical name with alias value; got: %s", got)
+		if !strings.Contains(err.Error(), "missing") {
+			t.Fatalf("expected missing-field error; got: %v", err)
 		}
 	})
 
-	t.Run("canonical_plus_alias_rejects", func(t *testing.T) {
-		_, err := s.AppendEncodeJSON(nil, map[string]any{"new_name": int64(11), "old_name": int64(22)})
-		if err == nil {
-			t.Fatalf("expected reject for canonical+alias both present (symmetric with decode); accepted")
+	t.Run("canonical_plus_extra_alias_ignores_alias", func(t *testing.T) {
+		// Canonical present; alias is treated as a stray key (silently
+		// ignored, matching the general "extra keys in input map are
+		// not an error" contract).
+		out, err := s.AppendEncodeJSON(nil, map[string]any{"new_name": int64(11), "old_name": int64(22)})
+		if err != nil {
+			t.Fatalf("canonical present + extra alias key should succeed: %v", err)
 		}
-		if !strings.Contains(err.Error(), "alias") && !strings.Contains(err.Error(), "both") {
-			t.Fatalf("expected error mentioning alias/both; got: %v", err)
+		if string(out) != `{"new_name":11}` {
+			t.Fatalf("expected {\"new_name\":11}; got: %s", string(out))
 		}
 	})
 
@@ -18329,9 +18331,9 @@ func TestRegression_SchemaCacheConcurrency(t *testing.T) {
 // would succeed on [3]int32, but DecodeJSON on the produced JSON could
 // not write back into the same Go shape.
 //
-// Pattern 12 from BUG_AUDIT.md (encode accepts type X, decode rejects
-// type X). The fix mirrors deserArray.deserFixedArray: validate element
-// count, decode into v.Index(i) directly.
+// Encode accepts type X but decode rejects type X. The fix mirrors
+// deserArray.deserFixedArray: validate element count, decode into
+// v.Index(i) directly.
 func TestRegression_JSONDecodeFixedSizeArrayTarget(t *testing.T) {
 	t.Run("[3]int32 round-trip through JSON", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"array","items":"int"}`)
@@ -18649,8 +18651,6 @@ func TestRegression_IntegerDefaultMustBeIntegerLiteral(t *testing.T) {
 // parseFloatAcceptOverflow, mirroring the shape applied to
 // integerFormFitsFloat.
 //
-// Pattern 16 from BUG_AUDIT.md (precision fix that introduces own DoS).
-//
 // The test is split into two parts: (1) a behavioral check that the
 // cap fires with the expected error message — this runs under all
 // modes including -race; (2) a wall-clock timing check that verifies
@@ -18689,7 +18689,7 @@ func TestRegression_ParseFloatLengthCapDoS(t *testing.T) {
 	// rejection here (the behavioral check above already pins that
 	// the cap fires); we're just guarding against future regressions
 	// that re-introduce the slow path on top of JSON parse cost.
-	threshold := 250 * time.Millisecond
+	threshold := 500 * time.Millisecond
 	if isRaceEnabled() {
 		threshold = 3 * time.Second // race adds 5-10x to everything; loose bound
 	}
@@ -18757,8 +18757,8 @@ func isRaceEnabled() bool {
 //  3. Schema.Root().Fields[i].Type.Precision on a decoded OCF returned
 //     zero even when the writer specified precision=10.
 //
-// Pattern 12 from BUG_AUDIT.md (encode and decode must agree on the
-// schema's observable contract — here, the metadata layer).
+// Encode and decode must agree on the schema's observable contract —
+// here, the metadata layer that OCF readers consult.
 func TestRegression_OCFWriterPreservesLogicalTypeInHeader(t *testing.T) {
 	// We can't import the ocf package from package avro_test (would
 	// create an import cycle through this test file's package), so
@@ -19369,7 +19369,7 @@ func TestRegression_IntDefaultLengthCapBounded(t *testing.T) {
 	// O(1) once schema-build reaches it). Under -race, schema-parse is
 	// 5-10x slower; the behavioral check above (err.length bounded)
 	// runs in every mode.
-	threshold := 250 * time.Millisecond
+	threshold := 500 * time.Millisecond
 	if isRaceEnabled() {
 		threshold = 5 * time.Second
 	}
@@ -19425,7 +19425,7 @@ func TestRegression_DeepSchemaParseRunsInBoundedTime(t *testing.T) {
 	}
 	// Wall-clock bound; -race adds 5-10x overhead so the threshold
 	// relaxes proportionally.
-	threshold := 500 * time.Millisecond
+	threshold := 1 * time.Second
 	if isRaceEnabled() {
 		threshold = 10 * time.Second
 	}

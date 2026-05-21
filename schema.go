@@ -37,12 +37,29 @@ type Schema struct {
 	// schema; accept only s.soe."
 	writerSoe [10]byte
 
-	// Per-schema custom type overlays. Keyed by *schemaNode so the
+	// Per-schema custom type overlay. Keyed by *schemaNode so the
 	// shared node is not mutated — different schemas parsed with
 	// different custom types get different overlays.
-	customEncodes  map[*schemaNode]func(v reflect.Value) (reflect.Value, error)
-	customDecoders map[*schemaNode][]func(any, *SchemaNode) (any, error)
-	customSNs      map[*schemaNode]*SchemaNode
+	custom map[*schemaNode]*customWiring
+}
+
+// customWiring bundles the per-node custom-type artifacts. Allocated
+// once per node that matches at least one registered CustomType; the
+// three slots are independently populated based on which callbacks
+// the user provided.
+type customWiring struct {
+	// encode wraps the user's CustomType.Encode chain. Runs before
+	// the built-in serializer. nil if no encoders matched, or if
+	// every matching CustomType had Encode == nil.
+	encode func(reflect.Value) (reflect.Value, error)
+	// decoders is the CustomType.Decode callback chain. Run after the
+	// built-in deserializer produces the raw Avro-native value. nil
+	// if no decoders matched.
+	decoders []func(any, *SchemaNode) (any, error)
+	// sn is the public *SchemaNode passed to the encode and decoder
+	// callbacks. Built once at parse time and reused across calls.
+	// Always populated when the wiring is non-nil.
+	sn *SchemaNode
 }
 
 // schemaNode preserves full schema metadata that canonical form strips:
@@ -90,8 +107,14 @@ type jsonDecodeFn func(*jsonDecoder, reflect.Value, *schemaNode) error
 
 // fieldNode represents a record field with full metadata.
 type fieldNode struct {
-	name       string
-	nameVal    reflect.Value // pre-computed for map lookups without allocation
+	name    string
+	nameVal reflect.Value // pre-computed for map lookups without allocation
+	// aliases: schema-evolution alternate field names. Consumers are
+	// all decode/resolve side — JSON decode (via node.fieldIdx, which
+	// is built from this slice at parse time), CheckCompatibility's
+	// findWriterField (compat.go), and Resolve's findReaderFieldIndex
+	// (resolve.go). Not consulted on encode — aliases are a reader-
+	// side concept per the Avro 1.12 spec.
 	aliases    []string
 	node       *schemaNode
 	defaultVal any
@@ -171,14 +194,12 @@ func parse(schema string, b *builder) (*Schema, error) {
 		return nil, err
 	}
 	s := &Schema{
-		ser:            b.ser,
-		deser:          b.deser,
-		c:              b.canon,
-		node:           b.node,
-		full:           schema,
-		customEncodes:  b.customEncodes,
-		customDecoders: b.customDecoderMap,
-		customSNs:      b.customSNMap,
+		ser:    b.ser,
+		deser:  b.deser,
+		c:      b.canon,
+		node:   b.node,
+		full:   schema,
+		custom: b.custom,
 	}
 	s.soe[0] = 0xC3
 	s.soe[1] = 0x01
@@ -840,16 +861,14 @@ type builder struct {
 	fieldFixups     []recordFieldFixup
 	containerFixups []containerFixup
 
-	meta             fieldMeta
-	canon            aschema
-	node             *schemaNode
-	checkName        func(string) error // nil means strict (default)
-	customTypes      []CustomType
-	customEncodes    map[*schemaNode]func(v reflect.Value) (reflect.Value, error)
-	customDecoderMap map[*schemaNode][]func(any, *SchemaNode) (any, error)
-	customSNMap      map[*schemaNode]*SchemaNode
-	cachedNames      map[string]bool // names inherited from SchemaCache, not from this parse
-	depth            int             // current build recursion depth, bounded by maxDepth
+	meta        fieldMeta
+	canon       aschema
+	node        *schemaNode
+	checkName   func(string) error // nil means strict (default)
+	customTypes []CustomType
+	custom      map[*schemaNode]*customWiring
+	cachedNames map[string]bool // names inherited from SchemaCache, not from this parse
+	depth       int             // current build recursion depth, bounded by maxDepth
 }
 
 // validNameErr validates a simple name using the builder's configured validator.
@@ -881,14 +900,12 @@ func (b *builder) validFullnameErr(s string) error {
 
 func (b *builder) nest() *builder {
 	return &builder{
-		named:            b.named,
-		checkName:        b.checkName,
-		customTypes:      b.customTypes,
-		customEncodes:    b.customEncodes,
-		customDecoderMap: b.customDecoderMap,
-		customSNMap:      b.customSNMap,
-		cachedNames:      b.cachedNames,
-		depth:            b.depth,
+		named:       b.named,
+		checkName:   b.checkName,
+		customTypes: b.customTypes,
+		custom:      b.custom,
+		cachedNames: b.cachedNames,
+		depth:       b.depth,
 	}
 }
 
@@ -898,24 +915,11 @@ func (b *builder) unnest(nest *builder) {
 	b.mfixups = append(b.mfixups, nest.mfixups...)
 	b.fieldFixups = append(b.fieldFixups, nest.fieldFixups...)
 	b.containerFixups = append(b.containerFixups, nest.containerFixups...)
-	// Merge custom type overlay maps from nested builders.
-	if len(nest.customEncodes) > 0 {
-		if b.customEncodes == nil {
-			b.customEncodes = make(map[*schemaNode]func(reflect.Value) (reflect.Value, error), len(nest.customEncodes))
+	if len(nest.custom) > 0 {
+		if b.custom == nil {
+			b.custom = make(map[*schemaNode]*customWiring, len(nest.custom))
 		}
-		maps.Copy(b.customEncodes, nest.customEncodes)
-	}
-	if len(nest.customDecoderMap) > 0 {
-		if b.customDecoderMap == nil {
-			b.customDecoderMap = make(map[*schemaNode][]func(any, *SchemaNode) (any, error), len(nest.customDecoderMap))
-		}
-		maps.Copy(b.customDecoderMap, nest.customDecoderMap)
-	}
-	if len(nest.customSNMap) > 0 {
-		if b.customSNMap == nil {
-			b.customSNMap = make(map[*schemaNode]*SchemaNode, len(nest.customSNMap))
-		}
-		maps.Copy(b.customSNMap, nest.customSNMap)
+		maps.Copy(b.custom, nest.custom)
 	}
 }
 
@@ -924,7 +928,16 @@ func (b *builder) unnest(nest *builder) {
 // later cached references can skip the rejectCachedRefIfCustomTypeWouldMatch
 // check when this Parse already wired its own CTs.
 func (b *builder) hasCustomTypeWired() bool {
-	return len(b.customDecoderMap) > 0 || len(b.customEncodes) > 0
+	return len(b.custom) > 0
+}
+
+// putCustomWiring stores the wiring under node, allocating b.custom on
+// demand. Used by applyCustomTypes after building the per-node closures.
+func (b *builder) putCustomWiring(node *schemaNode, w *customWiring) {
+	if b.custom == nil {
+		b.custom = make(map[*schemaNode]*customWiring)
+	}
+	b.custom[node] = w
 }
 
 // primFastInfo holds per-primitive bindings for both the array and map
@@ -1055,28 +1068,16 @@ func (b *builder) finalize() error {
 		}
 		m.nd.fields[m.idx].node = nt.node
 		if m.hasDefault && nt.node != nil {
-			// Now that the type is resolved, run the validation +
-			// coercion + conversion that was deferred at parse time
-			// against the resolved schemaNode tree. coerceDefault
-			// turns nested float-from-string into float64;
-			// validateDefault enforces structural compatibility;
-			// convertDefaultBytes maps bytes/fixed strings to []byte
-			// for JSON-encoder parity.
-			m.defaultVal = coerceDefault(m.defaultVal, nt.node)
-			if err := validateDefault(m.defaultVal, nt.node); err != nil {
-				return fmt.Errorf("field %q: invalid default for type %q: %v", m.sr.fields[m.idx].name, m.name, err)
+			// Now that the forward-ref is resolved, run the same
+			// coerce + validate + convert + encode pipeline the
+			// non-fwd-ref path runs inline at build time.
+			defaultVal := coerceDefault(m.defaultVal, nt.node)
+			if err := applyResolvedDefault(
+				defaultVal, nt.node, m.sr.fields[m.idx].name,
+				&m.dr.fields[m.idx], &m.nd.fields[m.idx], &m.sr.fields[m.idx],
+			); err != nil {
+				return fmt.Errorf("type %q: %w", m.name, err)
 			}
-			m.defaultVal = convertDefaultBytes(m.defaultVal, nt.node)
-			m.dr.fields[m.idx].defaultVal = m.defaultVal
-			m.dr.fields[m.idx].hasDefault = true
-			m.nd.fields[m.idx].defaultVal = m.defaultVal
-			m.nd.fields[m.idx].hasDefault = true
-			defaultBytes, err := encodeDefault(nil, m.defaultVal, nt.node)
-			if err != nil {
-				return fmt.Errorf("field %q: invalid default for type %q: %v", m.sr.fields[m.idx].name, m.name, err)
-			}
-			m.sr.fields[m.idx].defaultBytes = defaultBytes
-			m.sr.fields[m.idx].hasDefault = true
 		}
 	}
 	for _, m := range b.containerFixups {
@@ -1250,8 +1251,9 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		return nil
 	}
 
-	// Build the cached SchemaNode for callbacks.
+	// Build the cached SchemaNode for callbacks and the wiring entry.
 	sn := buildCustomSN(node)
+	wiring := &customWiring{sn: sn}
 
 	if len(encoders) > 0 {
 		customEncode := func(v reflect.Value) (reflect.Value, error) {
@@ -1310,12 +1312,9 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 			return v, nil // no encoder matched, pass through
 		}
 
-		// Store the customEncode in the builder's overlay map (not on
-		// the shared node) so it doesn't leak via the cache.
-		if b.customEncodes == nil {
-			b.customEncodes = make(map[*schemaNode]func(reflect.Value) (reflect.Value, error))
-		}
-		b.customEncodes[node] = customEncode
+		// Store the customEncode in the builder's overlay (not on the
+		// shared node) so it doesn't leak via the cache.
+		wiring.encode = customEncode
 
 		// Wrap the binary serializer. We update b.ser (which becomes the
 		// Schema's ser) but NOT node.ser, so named types in the cache
@@ -1332,14 +1331,7 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 	}
 
 	if len(decoders) > 0 {
-		if b.customDecoderMap == nil {
-			b.customDecoderMap = make(map[*schemaNode][]func(any, *SchemaNode) (any, error))
-		}
-		if b.customSNMap == nil {
-			b.customSNMap = make(map[*schemaNode]*SchemaNode)
-		}
-		b.customDecoderMap[node] = decoders
-		b.customSNMap[node] = sn
+		wiring.decoders = decoders
 		b.deser = wrapDeserWithCustomDecoders(node.deser, decoders, sn)
 		// JSON-side: wrap the node's per-decode dispatch with a
 		// closure that captures the decoder chain. The JSON runtime
@@ -1349,6 +1341,7 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(decoders, sn)
 	}
 
+	b.putCustomWiring(node, wiring)
 	b.meta.hasCustomType = true
 	return nil
 }
@@ -2012,38 +2005,22 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				b.fieldFixups = append(b.fieldFixups, fix)
 			}
 			if len(of.Default) > 0 {
-				defaultVal := unmarshalDefault(of.Default)
-				defaultVal = coerceDefault(defaultVal, bf.node)
-				// Skip default validation for forward references since we
-				// don't know the type yet.
-				if !isFwdRef {
-					if err := validateDefault(defaultVal, bf.node); err != nil {
-						return fmt.Errorf("record field %q: invalid default: %v", of.Name, err)
+				if isFwdRef {
+					// Forward-ref: signal hasDefault so the dispatch
+					// knows a default exists. finalize() runs the full
+					// pipeline against the resolved schemaNode and
+					// overwrites defaultVal there.
+					drf.hasDefault = true
+					fn.hasDefault = true
+				} else {
+					defaultVal := unmarshalDefault(of.Default)
+					defaultVal = coerceDefault(defaultVal, bf.node)
+					if err := applyResolvedDefault(
+						defaultVal, bf.node, of.Name,
+						&drf, &fn, &sr.fields[fieldIdx],
+					); err != nil {
+						return err
 					}
-					// Convert bytes/fixed string defaults to []byte before
-					// storing, so the JSON encoder sees the wire form
-					// directly and its logical-type-aware arms can't
-					// misinterpret the string as decimal / UUID / etc.
-					// Mirrors encodeDefault's codepoint mapping; both
-					// paths agree on default-fill output. Walks the
-					// resolved schemaNode tree (not the aschema canon)
-					// so name-references — both forward and backward —
-					// follow into the real type.
-					defaultVal = convertDefaultBytes(defaultVal, bf.node)
-				}
-				drf.defaultVal = defaultVal
-				drf.hasDefault = true
-				fn.defaultVal = defaultVal
-				fn.hasDefault = true
-				// Pre-encode the default to Avro binary for use
-				// when encoding maps with missing keys.
-				if !isFwdRef && bf.node != nil {
-					defaultBytes, err := encodeDefault(nil, defaultVal, bf.node)
-					if err != nil {
-						return fmt.Errorf("record field %q: encoding default: %v", of.Name, err)
-					}
-					sr.fields[fieldIdx].defaultBytes = defaultBytes
-					sr.fields[fieldIdx].hasDefault = true
 				}
 			} else if bf.canon.isNullableUnion() {
 				// Per the Avro spec, a union whose first branch is "null"
@@ -2562,6 +2539,44 @@ func unmarshalDefault(raw json.RawMessage) any {
 	// Cannot fail: raw is preserved from the initial parse and is valid JSON.
 	_ = dec.Decode(&dv)
 	return dv
+}
+
+// applyResolvedDefault runs the validate + convertDefaultBytes +
+// encodeDefault pipeline for a coerced default value against its
+// resolved schemaNode and writes the result into the three
+// field-slot triple (deserRecordField, fieldNode, serRecordField).
+// fieldName is used for error context.
+//
+// Shared by the build-time non-fwd-ref path and the finalize-time
+// fwd-ref fixup path so the pipeline lives in one place. Both call
+// sites coerce against their respective schemaNode (build-time
+// against bf.node, finalize-time against the now-resolved nt.node)
+// before delegating here.
+//
+// convertDefaultBytes maps bytes/fixed string defaults to []byte so
+// the JSON encoder sees the wire form directly and its
+// logical-type-aware arms can't misinterpret the string as
+// decimal / UUID / etc. Walks the resolved schemaNode tree (not the
+// aschema canon) so name-references — forward and backward —
+// follow into the real type.
+func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
+	drf *deserRecordField, fn *fieldNode, srf *serRecordField,
+) error {
+	if err := validateDefault(defaultVal, node); err != nil {
+		return fmt.Errorf("record field %q: invalid default: %v", fieldName, err)
+	}
+	defaultVal = convertDefaultBytes(defaultVal, node)
+	drf.defaultVal = defaultVal
+	drf.hasDefault = true
+	fn.defaultVal = defaultVal
+	fn.hasDefault = true
+	defaultBytes, err := encodeDefault(nil, defaultVal, node)
+	if err != nil {
+		return fmt.Errorf("record field %q: encoding default: %v", fieldName, err)
+	}
+	srf.defaultBytes = defaultBytes
+	srf.hasDefault = true
+	return nil
 }
 
 // unmarshalAnyPreservePrecision parses raw JSON into a Go value with the

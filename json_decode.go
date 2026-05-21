@@ -622,6 +622,15 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode) error {
 			copy(u[:], b)
 			return setStringTarget(v, uuidToString(u), "fixed")
 		}
+		// TextUnmarshaler: pass the canonical hex-dash form, matching
+		// deserFixedUUIDReflect on the binary side.
+		if len(b) == 16 {
+			var u [16]byte
+			copy(u[:], b)
+			if ok, err := tryTextUnmarshal(v, []byte(uuidToString(u))); ok {
+				return err
+			}
+		}
 	}
 	// Generic byte-target fall-through shared with the binary path.
 	// setBytesValue handles slice/array/string (and would handle the
@@ -893,12 +902,12 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 				}
 			} else {
 				// Reject ONLY when two DIFFERENT JSON keys resolve to the
-				// same idx — the alias-collision case the round-85 fix
-				// targeted. Same canonical key appearing twice falls
-				// through to last-wins (handle is called again, decoding
-				// the second value and overwriting the first), matching
-				// Java's Jackson, fastavro's Python json.loads, and Go's
-				// encoding/json on duplicate keys.
+				// same idx (the alias-collision case). The same canonical
+				// key appearing twice falls through to last-wins (handle
+				// is called again, decoding the second value and
+				// overwriting the first), matching Java's Jackson,
+				// fastavro's Python json.loads, and Go's encoding/json on
+				// duplicate keys.
 				if seen[idx] && seenKey[idx] != key {
 					return fmt.Errorf("avro json: record %q field %q resolved from both %q and %q in the same JSON object",
 						node.name, node.fields[idx].name, seenKey[idx], key)

@@ -34,15 +34,83 @@ func reuseOrMakeStringAnyMap(v reflect.Value, hint int) map[string]any {
 // tryTextUnmarshal calls (*v).UnmarshalText(b) when v is addressable
 // and its address implements [encoding.TextUnmarshaler]. Returns
 // (true, err) when invoked; (false, nil) when v can't accept the text.
-// Caller owns b — the helper does not copy. Shared by setStringValue
-// (binary deser of string), deserUUID (binary deser of UUID-as-string),
-// and decodeString (JSON deser of string) so all three sites agree on
-// the "addressable + implements" gate.
+// Caller owns b — the helper does not copy. Used at every text-shaped
+// decode site (Avro string, string+uuid, fixed+uuid, enum symbol;
+// binary and JSON).
+//
+// TextUnmarshaler stands on its own — the decoder does not require
+// the type to also implement TextMarshaler. The one-way Go idiom
+// (parse-only types: config values, enum keys, lookup tables) is
+// supported. A user can pair MarshalText on type A with
+// UnmarshalText on type B without either type implementing both.
 func tryTextUnmarshal(v reflect.Value, b []byte) (bool, error) {
 	if !v.CanAddr() || !v.Addr().Type().Implements(textUnmarshalerType) {
 		return false, nil
 	}
 	return true, v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText(b)
+}
+
+// textOutFor returns the strongest text-out method on v: TextAppender
+// is preferred (alloc-free), TextMarshaler is the fallback. Checks
+// both v.Interface() (value method set) and v.Addr().Interface()
+// (pointer method set on addressable values) so pointer-receiver
+// MarshalText/AppendText on an addressable struct field is reachable
+// — mirroring tryTextUnmarshal's TextUnmarshaler discovery via v.Addr().
+//
+// TextMarshaler / TextAppender stand on their own — the encoder does
+// not require the type to also implement TextUnmarshaler.
+func textOutFor(v reflect.Value) (encoding.TextAppender, encoding.TextMarshaler) {
+	var appender encoding.TextAppender
+	var marshaler encoding.TextMarshaler
+	if v.CanInterface() {
+		i := v.Interface()
+		if a, ok := i.(encoding.TextAppender); ok {
+			appender = a
+		}
+		if m, ok := i.(encoding.TextMarshaler); ok {
+			marshaler = m
+		}
+	}
+	if (appender == nil || marshaler == nil) && v.CanAddr() {
+		i := v.Addr().Interface()
+		if appender == nil {
+			if a, ok := i.(encoding.TextAppender); ok {
+				appender = a
+			}
+		}
+		if marshaler == nil {
+			if m, ok := i.(encoding.TextMarshaler); ok {
+				marshaler = m
+			}
+		}
+	}
+	return appender, marshaler
+}
+
+// textValue materializes v's TextAppender or TextMarshaler output as
+// a Go string. Returns (text, true, nil) on success; ("", false, nil)
+// when v has no text-out method (caller falls through); ("", false,
+// SemanticError) when the text-out method itself errored. avroType
+// labels the SemanticError. Used at every text-shaped encode site
+// (string+uuid, fixed+uuid, enum symbol; binary and JSON) so all
+// callers share the wrap shape and the AppendText vs MarshalText
+// preference.
+func textValue(v reflect.Value, avroType string) (string, bool, error) {
+	a, m := textOutFor(v)
+	if a == nil && m == nil {
+		return "", false, nil
+	}
+	var text []byte
+	var err error
+	if a != nil {
+		text, err = a.AppendText(nil)
+	} else {
+		text, err = m.MarshalText()
+	}
+	if err != nil {
+		return "", false, &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
+	}
+	return string(text), true, nil
 }
 
 var (
