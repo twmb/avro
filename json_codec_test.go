@@ -368,7 +368,7 @@ func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
 // emits bare "null" regardless of cfg.tagged. Two paths, same
 // conceptual input, different output.
 //
-// Fix: factor appendUnionBranch that centralizes
+// Structural fix: appendUnionBranch centralizes
 // `wrap iff cfg.tagged && branch.kind != "null"`, used at all four
 // dispatcher sites — so a future dispatcher addition inherits the
 // null special-case automatically.
@@ -379,22 +379,22 @@ func TestRegression_TaggedUnionsBareNullForNullBranch(t *testing.T) {
 		value  any
 	}{
 		// Nil Pointer / Interface — reach the entry early-null path via
-		// the peel loop at appendAvroJSON:189-197; emitted bare pre-fix
-		// AND post-fix (this leg locks the early-null path's behavior).
+		// the peel loop at appendAvroJSON:189-197; this leg pins the
+		// early-null path's bare-null emission.
 		{"nil ptr against [null,bytes]", `["null","bytes"]`, (*[]byte)(nil)},
 		{"nil ptr against [null,int]", `["null","int"]`, (*int)(nil)},
 		{"any holding nil ptr against [null,int]", `["null","int"]`, any((*int)(nil))},
 
 		// Nil Slice / Map / Chan / Func — reach appendAvroJSONUnion's
-		// nil-first dispatch (added in 310cfc4); pre-fix this site
-		// wrapped null in {"null":null} under TaggedUnions.
+		// nil-first dispatch. Without bare-null emission this site
+		// wraps null in {"null":null} under TaggedUnions.
 		{"nil slice against [null,bytes]", `["null","bytes"]`, []byte(nil)},
 		{"nil slice against [null,int,bytes]", `["null","int","bytes"]`, []byte(nil)},
 		{"nil map against [null,{type:map,values:int}]", `["null",{"type":"map","values":"int"}]`, map[string]int(nil)},
 
 		// Try-each null branch reached from a non-nil shape that fails
-		// every other branch — pre-fix this site wrapped null too once
-		// 310cfc4 removed the null-skip in try-each.
+		// every other branch — must emit bare null even though the
+		// non-null branches would have been wrapped.
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1705,10 +1705,9 @@ func TestDecodeJSONNaNInfRoundTrip(t *testing.T) {
 		{"double -Inf string", `"double"`, `"-Infinity"`},
 		{"float null → NaN", `"float"`, `null`},
 		{"double null → NaN", `"double"`, `null`},
-		// Lowercase quoted "nan" was previously accepted via
-		// parseSpecialFloat's strings.EqualFold leniency. Tightened
-		// to match Java/fastavro/goavro (all of which exact-match
-		// "NaN"); see TestRegression_JSONDecodeBareNaNInfinityCasingParity.
+		// Lowercase quoted "nan" is rejected to match Java/fastavro/
+		// goavro (all of which exact-match "NaN"); see
+		// TestRegression_JSONDecodeBareNaNInfinityCasingParity.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2596,8 +2595,10 @@ func TestEncodeJSONCoercion(t *testing.T) {
 		{"int to float", floatSchema, int(42), false},
 		{"uint to float", floatSchema, uint(42), false},
 		{"json.Number to float", floatSchema, json.Number("3.14"), false},
-		{"int overflow float precision", floatSchema, int64(1 << 30), true},
-		{"uint overflow float precision", floatSchema, uint64(1 << 30), true},
+		// Lossy-destination policy: int/uint beyond float mantissa silently
+		// IEEE-rounds, matching Java/fastavro.
+		{"int overflow float lossy round", floatSchema, int64(1 << 30), false},
+		{"uint overflow float lossy round", floatSchema, uint64(1 << 30), false},
 		{"int to double", doubleSchema, int(42), false},
 		{"invalid json.Number float", floatSchema, json.Number("nope"), true},
 		{"string to float", floatSchema, "hello", true},

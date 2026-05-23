@@ -54,8 +54,8 @@ func formatGoType(t reflect.Type) string {
 func (e *SemanticError) Unwrap() error { return e.Err }
 
 // semErr returns a SemanticError naming v's Go type and the given Avro
-// type. Shared by the trivial 2-field error sites (~60+ across ser.go /
-// deser.go / json_codec.go) that previously open-coded the literal.
+// type. Single helper for the ~60+ trivial 2-field error sites across
+// ser.go / deser.go / json_codec.go.
 func semErr(v reflect.Value, avroType string) error {
 	return &SemanticError{GoType: v.Type(), AvroType: avroType}
 }

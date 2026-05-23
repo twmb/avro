@@ -430,8 +430,7 @@ func TestEncodeJSONNullSchema(t *testing.T) {
 		}
 	})
 	// Non-nil values must error, matching binary serNull's errNonNil
-	// rejection. Pre-fix this arm emitted "null" silently and lost the
-	// caller's input — see TestRegression_EncodeJSONNullParity.
+	// rejection — see TestRegression_EncodeJSONNullParity.
 	t.Run("non-nil value rejected", func(t *testing.T) {
 		if out, err := s.EncodeJSON("ignored"); err == nil {
 			t.Errorf("expected error encoding non-nil value into null schema, got %s", out)

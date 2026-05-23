@@ -43,19 +43,35 @@ func promoteRead[Wire any](
 }
 
 // promoteIntFloatMantissa is the int→float conversion shared by the
-// four int/long→float/double promotion arms. It applies the same
-// mantissa bound the natural same-type decoder enforces at
-// setIntegerWire's CanFloat arm (deser.go:1541-1544), so a writer→
-// reader promotion at the boundary fails the same way Decode of an
-// equivalent same-schema wire into the same Go target would. Without
-// this check, e.g. Resolve("long","double").Decode(wire(1<<53+1), &f64)
-// silently truncated to 1<<53 while w.Decode(wire(1<<53+1), &f64)
-// rejected — within-twmb encode/natural-decode/promoted-decode contract
-// disagreement on identical wire bytes.
+// four int/long→float/double promotion arms. The READER schema is the
+// user's evolved-to type — by writing a reader schema of float/double
+// the user explicitly opted into IEEE-precision semantics, so wire
+// magnitudes the reader can't represent exactly silently IEEE-round.
+// Matches Java's ResolvingDecoder.readDouble's `(double) in.readLong()`
+// (`lang/java/avro/src/main/java/org/apache/avro/io/ResolvingDecoder.
+// java:192`), fastavro's `maybe_promote` returning `float(data)`
+// (`fastavro/_read_py.py:619-621`), and hamba's createDoubleConverter
+// `float64(r.ReadLong())` (`hamba/avro/converter.go:28`).
+//
+// Asymmetric with the natural same-schema decode case: `s.Decode(wire,
+// &f float64)` against `s = MustParse("long")` still rejects via
+// setLongValue's CanFloat arm because there the READER schema IS long
+// (exact) — the user did NOT evolve the schema, only chose a Go type
+// the wire doesn't fit. The principle: lossiness on decode is
+// acceptable when the READER SCHEMA (the user's contract) is lossy;
+// when the reader schema is exact and only the Go type is lossy, the
+// wire preserved a value the user shouldn't silently lose.
+//
+// Float32 narrowing for the bitSize=32 arm happens at setFloatValue's
+// `v.SetFloat(f)` when the Go target is *float32; the float64 cast
+// here preserves the long's full value before the assignment narrows
+// it to the reader-schema's float32 precision.
 func promoteIntFloatMantissa(v reflect.Value, n int64, avroType string, bitSize int) error {
-	f, err := intFitsFloat(n, bitSize)
-	if err != nil {
-		return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
+	var f float64
+	if bitSize == 32 {
+		f = float64(float32(n))
+	} else {
+		f = float64(n)
 	}
 	return setFloatValue(v, f, avroType, bitSize)
 }

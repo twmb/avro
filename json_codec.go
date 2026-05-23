@@ -244,13 +244,13 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	switch node.kind {
 	case "null":
 		// Validate v is nil-equivalent, mirroring serNull on the binary
-		// side. Pre-fix this arm emitted "null" unconditionally, so a
-		// non-nil value into a "null" schema was silently dropped — both
-		// at top level (Schema.EncodeJSON(42, "null")), as a null-typed
-		// record field, and via tagged-union dispatch ({"null": 42}
-		// against ["null", T]). Binary serNull (ser.go) returns errNonNil
-		// for the same shapes; matching that here keeps EncodeJSON ↔
-		// AppendEncode parity and prevents silent input loss.
+		// side. A non-nil value into a "null" schema is rejected with
+		// errNonNil — both at top level (Schema.EncodeJSON(42, "null")),
+		// as a null-typed record field, and via tagged-union dispatch
+		// ({"null": 42} against ["null", T]). Binary serNull (ser.go)
+		// returns errNonNil for the same shapes; matching that here
+		// keeps EncodeJSON ↔ AppendEncode parity and prevents silent
+		// input loss.
 		switch v.Kind() {
 		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
 			if !v.IsNil() {
@@ -333,14 +333,14 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return strconv.AppendInt(buf, n, 10), nil
 
 	case "float":
-		f, err := jsonCoerceToFloat64(v, 32)
+		f, err := jsonCoerceToFloat64(v)
 		if err != nil {
 			return nil, err
 		}
 		return appendJSONFloat(buf, f, 32, cfg), nil
 
 	case "double":
-		f, err := jsonCoerceToFloat64(v, 64)
+		f, err := jsonCoerceToFloat64(v)
 		if err != nil {
 			return nil, err
 		}
@@ -409,14 +409,12 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		if v.Kind() == reflect.String {
 			// Treat the Go string as raw UTF-8 bytes, matching serBytes
 			// (ser.go's string arm appends the string bytes verbatim).
-			// Pre-fix this arm parsed the string as codepoint-mapped
-			// bytes (0-255 per rune), which diverged from binary: e.g.
-			// "é" encoded as c3 a9 in binary but as e9 in JSON. Defaults
-			// don't reach this arm — convertDefaultBytes (schema.go)
-			// already turns JSON-parsed default strings into []byte, so
-			// only runtime user input lands here, where the Go convention
-			// is UTF-8. appendAvroJSONBytes then handles the
-			// codepoint↔byte mapping on the wire form.
+			// Binary↔JSON parity: "é" encodes as c3 a9 on both paths.
+			// Defaults don't reach this arm — convertDefaultBytes
+			// (schema.go) already turns JSON-parsed default strings into
+			// []byte, so only runtime user input lands here, where the
+			// Go convention is UTF-8. appendAvroJSONBytes then handles
+			// the codepoint↔byte mapping on the wire form.
 			// appendAvroJSONBytes iterates byte-by-byte without retaining;
 			// alias v's string data instead of allocating a copy.
 			s := v.String()
@@ -1087,7 +1085,15 @@ func bytesToAvroJSONString(b []byte) string {
 // appendJSONFloat formats a float for JSON output, handling special values.
 // With LinkedinFloats, NaN encodes as null and ±Infinity as ±1e999 (goavro
 // convention). Otherwise NaN/Infinity encode as JSON strings (Java convention).
+//
+// When bits==32 and f is a finite float64 that overflows float32's range,
+// the value narrows to ±Inf and emits as "Infinity"/"-Infinity" per the
+// lossy-destination policy (matches Java's writeFloat(Number.floatValue())
+// silent narrowing).
 func appendJSONFloat(buf []byte, f float64, bits int, cfg *optConfig) []byte {
+	if bits == 32 {
+		f = float64(float32(f))
+	}
 	if math.IsNaN(f) {
 		if cfg.linkedin {
 			return append(buf, "null"...)
@@ -1110,67 +1116,30 @@ func appendJSONFloat(buf []byte, f float64, bits int, cfg *optConfig) []byte {
 }
 
 // jsonCoerceToFloat64 converts a reflect.Value to float64, accepting
-// float, int, uint, and json.Number types. bitSize is the target float
-// size (32 or 64) — integer values exceeding the mantissa precision are
-// rejected via the shared [intFitsFloat] / [uintFitsFloat] helpers
-// (schema.go), used identically by the binary encode arms
-// [appendAvroFloat32] / [appendAvroFloat64] and the schema-parse-time
-// [integerFormFitsFloat]. One predicate across every site that
-// converts a typed integer to an Avro float / double.
-func jsonCoerceToFloat64(v reflect.Value, bitSize int) (float64, error) {
-	var f float64
+// float, int, uint, and json.Number types. Encoding into a float/double
+// schema is lossy by destination: integer inputs exceeding the mantissa
+// precision silently IEEE-round, and float32-target overflows silently
+// narrow to ±Inf at the caller's float64 → float32 cast. Matches Java's
+// GenericDatumWriter.writeFloat / writeDouble and fastavro's encoder.
+func jsonCoerceToFloat64(v reflect.Value) (float64, error) {
 	switch {
 	case v.CanFloat():
-		f = v.Float()
+		return v.Float(), nil
 	case v.CanInt():
-		var err error
-		f, err = intFitsFloat(v.Int(), bitSize)
-		if err != nil {
-			return 0, fmt.Errorf("avro json: %w", err)
-		}
+		return float64(v.Int()), nil
 	case v.CanUint():
-		var err error
-		f, err = uintFitsFloat(v.Uint(), bitSize)
+		return float64(v.Uint()), nil
+	case v.Type() == jsonNumberType:
+		// Route through the shared json.Number → float64 helper —
+		// same predicate used by binary encode (jsonNumberToFloat) and
+		// schema-parse default validation (defaultAsFloat).
+		f, err := parseJSONNumberAsFloat(string(v.Interface().(json.Number)))
 		if err != nil {
 			return 0, fmt.Errorf("avro json: %w", err)
 		}
-	case v.Type() == jsonNumberType:
-		// strconv.ParseFloat is lenient about hex floats ("0x1.0p10")
-		// and underscore-separated digits ("1_000") that the JSON spec
-		// rejects; gate via isJSONNumber to match the binary path's
-		// [jsonNumberToFloat] strictness and Java/fastavro behavior.
-		s := string(v.Interface().(json.Number))
-		if !isJSONNumber(s) {
-			return 0, fmt.Errorf("avro json: invalid JSON number %q", s)
-		}
-		// Two-step parse: integerFormFitsFloat fast path applies the
-		// precLimit reject for decimal-integer literals
-		// (precision-strict), then parseFloatAcceptOverflow handles
-		// fractional / exponent forms with the ErrRange-with-Inf
-		// accept predicate. Same pipeline as defaultAsFloat's
-		// json.Number arm (schema.go) — schema-parse and encode
-		// agree on what a json.Number resolves to.
-		if f1, handled, err := integerFormFitsFloat(s, bitSize); handled {
-			if err != nil {
-				return 0, fmt.Errorf("avro json: %w", err)
-			}
-			f = f1
-			break
-		}
-		var err error
-		f, err = parseFloatAcceptOverflow(s)
-		if err != nil {
-			return 0, fmt.Errorf("avro json: invalid json.Number for float: %w", err)
-		}
-	default:
-		return 0, fmt.Errorf("avro json: expected numeric, got %s", v.Type())
+		return f, nil
 	}
-	// Narrowing float64 → float32 must not silently clamp to ±Inf.
-	// Allow ±Inf and NaN pass-through (they have dedicated JSON encodings).
-	if bitSize == 32 && finiteFloat32Overflows(f) {
-		return 0, fmt.Errorf("avro json: value %g overflows float32", f)
-	}
-	return f, nil
+	return 0, fmt.Errorf("avro json: expected numeric, got %s", v.Type())
 }
 
 // jsonCoerceInt converts a reflect.Value to an integer T, with overflow
@@ -1221,5 +1190,5 @@ func jsonCoerceToInt32(v reflect.Value) (int32, error) {
 }
 
 func jsonCoerceToInt64(v reflect.Value) (int64, error) {
-	return jsonCoerceInt(v, math.MaxInt64, floatFitsInt64From, parseInt64WithFloatParity)
+	return jsonCoerceInt(v, math.MaxInt64, floatFitsInt64From, parseInt64Lenient)
 }

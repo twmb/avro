@@ -426,10 +426,10 @@ func TestMapRecordEncodeIgnoresAliases(t *testing.T) {
 
 // TestPointerReceiverTextMarshalerSymmetry verifies that the encoder
 // reaches a pointer-receiver MarshalText via v.Addr(), matching the
-// decoder's TextUnmarshaler lookup via v.Addr(). Pre-fix the encoder
-// only checked v.Interface() (the value-method-set assertion), so a
-// pointer-receiver MarshalText on an addressable struct field was
-// silently missed.
+// decoder's TextUnmarshaler lookup via v.Addr(). Without the Addr()
+// hop, only value-method-set MarshalText would resolve, silently
+// missing a pointer-receiver MarshalText on an addressable struct
+// field.
 func TestPointerReceiverTextMarshalerSymmetry(t *testing.T) {
 	t.Run("via pointer", func(t *testing.T) {
 		s := MustParse(`"string"`)

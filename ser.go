@@ -448,10 +448,12 @@ func floatFitsInt32From(f float64, bits int) (int32, error) {
 
 // floatFitsInt64From is floatFitsInt64 with an additional source-float
 // mantissa-precision check. Mirrors setLongValue's float-target precLimit:
-// 1<<24 for a float32 source, 1<<53 for float64. Shares the bound with
-// [floatMantissaLimit] / [intFitsFloat] / [appendAvroFloat32] /
-// [appendAvroFloat64] / [jsonCoerceToFloat64] — one constant, every
-// encode-side float-mantissa-precision site.
+// 1<<24 for a float32 source, 1<<53 for float64. The bound lives at
+// [floatMantissaLimit] and is also consulted by the decode-side
+// [intFitsFloat] (long-wire → smaller Go float-target precision check).
+// Encode-side int → float coercion is lossy by destination per Java /
+// fastavro parity and does NOT consult this bound; see
+// [appendAvroFloat32] / [appendAvroFloat64].
 func floatFitsInt64From(f float64, bits int) (int64, error) {
 	n, err := floatFitsInt64(f)
 	if err != nil {
@@ -464,49 +466,79 @@ func floatFitsInt64From(f float64, bits int) (int64, error) {
 	return n, nil
 }
 
-// jsonNumberToFloat converts a json.Number reflect.Value to a numeric
+// jsonNumberToFloat converts a json.Number reflect.Value to a float64
 // reflect.Value suitable for the float encode arms. Returns:
-//   - (int64 Value, true, nil) — integer-form input parsed as int64;
-//     the caller's CanInt() arm then applies its mantissa-precision
-//     check (parity with the typed-int encode path).
-//   - (float64 Value, true, nil) — float-form input via parseFloatAcceptOverflow.
-//     ±Inf from overflow is accepted (Java/fastavro/decode-side parity).
+//   - (float64 Value, true, nil) — accepted via parseJSONNumberAsFloat
+//     (±Inf from overflow is accepted, matching Java/fastavro/decode).
 //   - (v, false, nil) — not a json.Number; caller falls through.
 //   - (v, true, err) — IS json.Number but JSON-grammar-invalid (hex
-//     float, underscore, integer-form > int64). Java/fastavro reject.
+//     float, underscore, exceeds length cap). Java/fastavro reject.
 func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 	if v.Type() != jsonNumberType {
 		return v, false, nil
 	}
-	s := string(v.Interface().(json.Number))
-	if !isJSONNumber(s) {
-		return v, true, fmt.Errorf("invalid JSON number %q", s)
+	f, err := parseJSONNumberAsFloat(string(v.Interface().(json.Number)))
+	if err != nil {
+		return v, true, err
 	}
-	// Integer-form: route through int64 so callers apply the same
-	// precision check they apply to typed-integer inputs. Without this
-	// branch, s.Encode(json.Number("9007199254740993")) against "double"
-	// silently rounds to 9007199254740992 via float64 mantissa
-	// truncation, while s.Encode(int64(9007199254740993)) rejects with
-	// "integer overflows float64 exact precision" — a path-divergence
-	// bug identical in shape to the JSON-grammar gap above.
-	//
-	// boundedParseIntForFloat caps input at maxParseFloatLen (1024)
-	// before strconv.ParseInt so a 1 MiB hostile pure-integer input
-	// produces a bounded-length error instead of interpolating the
-	// full input — matches the parallel cap at integerFormFitsFloat
-	// (jsonCoerceToFloat64 / defaultAsFloat).
-	if !strings.ContainsAny(s, ".eE") {
-		n, perr := boundedParseIntForFloat(s)
-		if perr != nil {
-			return v, true, perr
-		}
-		return reflect.ValueOf(n), true, nil
+	return reflect.ValueOf(f), true, nil
+}
+
+// parseJSONNumberAsFloat is the shared "json.Number → float64" pipeline:
+// gate via [isJSONNumber] (JSON-grammar strict — rejects hex floats,
+// underscores, the forms strconv.ParseFloat would accept but JSON does
+// not), then parse via [parseFloatAcceptOverflow] (±Inf from ErrRange
+// counts as success per the wire-format lossy-destination policy).
+//
+// Single source of truth for the three sites that need it: binary encode
+// (ser.go's [jsonNumberToFloat]), JSON encode (json_codec.go's
+// [jsonCoerceToFloat64] json.Number arm), and schema-parse default
+// validation (schema.go's [defaultAsFloat] json.Number arm). A future
+// tightening of float-literal validation lands once, here.
+//
+// User-controllable input is routed through [truncForError] before
+// interpolation so a 1 MiB hostile input doesn't produce a 1 MiB error
+// string.
+//
+// Note: the JSON decode-time arm [decodeJSONFloat] intentionally inlines
+// strconv.ParseFloat with bitSize=32 instead of calling this helper —
+// preserving the float32 decode semantics avoids a double-rounding shift.
+func parseJSONNumberAsFloat(s string) (float64, error) {
+	if !isJSONNumber(s) {
+		return 0, fmt.Errorf("invalid JSON number %q", truncForError(s))
 	}
 	f, err := parseFloatAcceptOverflow(s)
 	if err != nil {
-		return v, true, fmt.Errorf("invalid JSON number %q: %w", s, err)
+		return 0, fmt.Errorf("invalid JSON number %q: %w", truncForError(s), err)
 	}
-	return reflect.ValueOf(f), true, nil
+	return f, nil
+}
+
+// truncForError caps a user-controllable string at 80 chars for inclusion
+// in error messages, preventing 1 MiB hostile inputs from producing 1 MiB
+// error strings. Mirrors the maxParseFloatLen DoS posture at the message
+// layer.
+func truncForError(s string) string {
+	const max = 80
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
+// truncBytesForError caps a user-controllable byte slice at 32 chars
+// before string conversion for error interpolation. 32 chars fits a
+// MaxInt64 representation (20 chars) with diagnostic headroom while
+// keeping the error message bounded on hostile multi-MB JSON input.
+// Shared by parseJSONInt32 / parseJSONInt64 (json_scan.go) where the
+// input `b` comes from the JSON scanner's number-bytes accumulator —
+// which has no upstream length cap of its own.
+func truncBytesForError(b []byte) string {
+	const max = 32
+	if len(b) <= max {
+		return string(b)
+	}
+	return string(b[:max]) + "..."
 }
 
 // parseInt64Lenient parses s as a decimal integer, accepting pure-integer,
@@ -584,37 +616,6 @@ func parseInt64Lenient(s string) (int64, error) {
 // in 64.
 const maxInt64LenientLen = 64
 
-// parseInt64WithFloatParity is [parseInt64Lenient] + a precision check
-// rejecting fractional/exponent-form inputs whose float64 representation
-// rounds to a different int64 than the parsed-exact value. Used at the
-// encode-time arms ([jsonNumberToInt64], [jsonCoerceToInt64]) and the
-// schema-parse-time arm ([defaultAsInt64] via [numericDefault]) so they
-// reject the same hostile boundary values Java/fastavro reject (e.g.
-// "9.223372036854775807e18" where big.Rat parses to int64.Max but
-// float64 rounds to int64.Max+1 = 2^63 — Java's
-// DoubleNode.canConvertToLong() returns false at this boundary;
-// fastavro's float input fails isinstance(default,int)).
-//
-// Pure integer-literal inputs skip the check — their wire and metadata-
-// API representations are identical by construction.
-//
-// Decode-side ([parseJSONInt64]) keeps [parseInt64Lenient] without the
-// parity check to preserve the documented "Encode strict / decode
-// lenient on float-mantissa precision" intentional divergence: a JSON
-// wire value at the int64 boundary still decodes losslessly.
-func parseInt64WithFloatParity(s string) (int64, error) {
-	n, err := parseInt64Lenient(s)
-	if err != nil {
-		return 0, err
-	}
-	if !strings.ContainsAny(s, ".eE") {
-		return n, nil
-	}
-	if !floatRoundsToSameInt64(s, n) {
-		return 0, fmt.Errorf("value %s in fractional/exponent form has float64 representation that diverges from its parsed-exact int64 value (%d); use integer literal form", s, n)
-	}
-	return n, nil
-}
 
 // parseInt32Lenient is [parseInt64Lenient] with int32 range narrowing.
 // Shares the same arbitrary-precision parsing so fractional-part-lost-
@@ -643,7 +644,7 @@ func jsonNumberToInt64(v reflect.Value) (int64, bool, error) {
 	if v.Type() != jsonNumberType {
 		return 0, false, nil
 	}
-	n, err := parseInt64WithFloatParity(string(v.Interface().(json.Number)))
+	n, err := parseInt64Lenient(string(v.Interface().(json.Number)))
 	if err != nil {
 		return 0, true, err
 	}
@@ -725,46 +726,35 @@ var (
 // finiteFloat32Overflows reports whether f is a finite float64 whose
 // float32(f) narrowing is ±Inf. ±Inf and NaN inputs return false: those
 // have valid float32 forms and shouldn't be rejected by callers that
-// otherwise accept finite-only. Used by every site that narrows a
-// float64 (wire value or Go input) to float32 — see deserDouble,
-// decodeDouble, encodeDefault, jsonCoerceToFloat64, appendAvroFloat32,
-// usFloat(Float64), udDouble(Float32). One predicate, one drift class.
+// otherwise accept finite-only. Encode-side narrowing accepts ±Inf
+// silently per the lossy-destination policy; this helper is used only
+// on the decode side to surface precision loss when the user picked a
+// smaller Go target (deserDouble setFloatValue with Float32 target,
+// udDouble Float32 target).
 func finiteFloat32Overflows(f float64) bool {
 	return !math.IsInf(f, 0) && !math.IsNaN(f) && math.IsInf(float64(float32(f)), 0)
 }
 
-// appendAvroFloat32 appends v's Avro-float (4-byte) encoding to dst,
-// rejecting:
-//   - finite float64 inputs that would silently narrow to ±Inf
-//   - integer inputs whose magnitude exceeds float32's 24-bit mantissa
+// appendAvroFloat32 appends v's Avro-float (4-byte) encoding to dst.
+// Encoding into a float schema is lossy by destination: int/uint inputs
+// exceeding float32's 24-bit mantissa silently IEEE-round, and finite
+// float64 inputs that overflow float32's range silently narrow to ±Inf.
+// Matches Java's GenericDatumWriter (Number.floatValue()) and fastavro
+// (struct.pack("<f", v)). Users wanting precise round-trip for large
+// integers should use "long", not "float".
 //
 // Used by serFloat (top-level), serArray.serFloat / serMap.serFloat
 // (specialized container paths), and any other site that encodes a
-// reflect-typed value as Avro float. Centralizing the rules ensures
-// every encode path agrees on what's accepted vs rejected.
+// reflect-typed value as Avro float.
 func appendAvroFloat32(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanFloat() {
-		f := v.Float()
-		// Narrowing float64 → float32 must not silently clamp to ±Inf.
-		// Allow ±Inf and NaN pass-through.
-		if v.Kind() == reflect.Float64 && finiteFloat32Overflows(f) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "float", Err: fmt.Errorf("value %g overflows float32", f)}
-		}
-		return appendUint32(dst, math.Float32bits(float32(f))), nil
+		return appendUint32(dst, math.Float32bits(float32(v.Float()))), nil
 	}
 	if v.CanInt() {
-		f, err := intFitsFloat(v.Int(), 32)
-		if err != nil {
-			return nil, semErrW(v, "float", err)
-		}
-		return appendUint32(dst, math.Float32bits(float32(f))), nil
+		return appendUint32(dst, math.Float32bits(float32(v.Int()))), nil
 	}
 	if v.CanUint() {
-		f, err := uintFitsFloat(v.Uint(), 32)
-		if err != nil {
-			return nil, semErrW(v, "float", err)
-		}
-		return appendUint32(dst, math.Float32bits(float32(f))), nil
+		return appendUint32(dst, math.Float32bits(float32(v.Uint()))), nil
 	}
 	if fv, ok, err := jsonNumberToFloat(v); ok {
 		if err != nil {
@@ -775,26 +765,18 @@ func appendAvroFloat32(dst []byte, v reflect.Value) ([]byte, error) {
 	return nil, semErr(v, "float")
 }
 
-// appendAvroFloat64 is the parallel helper for Avro double. Same shape
-// as appendAvroFloat32, with the float64 mantissa bound (1<<53) instead
-// of float32's (1<<24) and no narrowing-to-Inf risk for float inputs.
+// appendAvroFloat64 is the parallel helper for Avro double. Same lossy-
+// destination policy: int/uint inputs exceeding float64's 53-bit mantissa
+// silently IEEE-round.
 func appendAvroFloat64(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.CanFloat() {
 		return appendUint64(dst, math.Float64bits(v.Float())), nil
 	}
 	if v.CanInt() {
-		f, err := intFitsFloat(v.Int(), 64)
-		if err != nil {
-			return nil, semErrW(v, "double", err)
-		}
-		return appendUint64(dst, math.Float64bits(f)), nil
+		return appendUint64(dst, math.Float64bits(float64(v.Int()))), nil
 	}
 	if v.CanUint() {
-		f, err := uintFitsFloat(v.Uint(), 64)
-		if err != nil {
-			return nil, semErrW(v, "double", err)
-		}
-		return appendUint64(dst, math.Float64bits(f)), nil
+		return appendUint64(dst, math.Float64bits(float64(v.Uint()))), nil
 	}
 	if fv, ok, err := jsonNumberToFloat(v); ok {
 		if err != nil {
@@ -1282,15 +1264,14 @@ func serArrayPreamble(dst []byte, v reflect.Value) ([]byte, reflect.Value, int, 
 // escapes through serfn function pointers. Each is selected at schema
 // build time based on the array's item type.
 //
-// History note: the per-method body was previously inlined six times.
-// Two prior factoring attempts regressed perf — a closure-based factory
-// forced element escape (~25%); a generic-with-empty-struct GCShape
-// dispatch added a runtime-dictionary lookup (+34-62%). The current
-// shape (appendArrayPrimitive with a typed function-pointer parameter)
-// avoids both: appendFn is a direct symbol per site so the indirect
-// call shape matches the prior direct-call site. Verified via benchstat
-// on BenchmarkLargeArrayEncode + BenchmarkMapEncode against the inlined
-// six-copy baseline.
+// Factoring constraint: appendArrayPrimitive must take the appendFn
+// as a typed function-pointer parameter, with each per-method site
+// passing a direct symbol (appendAvroInt, appendAvroLong, …). Two
+// alternative factorings regress benchstat on BenchmarkLargeArrayEncode
+// + BenchmarkMapEncode: a closure-based factory forces element escape
+// (~25%); a generic-with-empty-struct GCShape dispatch adds a runtime
+// dictionary lookup (+34-62%). The direct-symbol indirect call matches
+// the inlined per-method call shape.
 
 func (s *serArray) serString(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 	return appendArrayPrimitive(dst, v, "string", appendAvroString)

@@ -328,7 +328,7 @@ func parseJSONInt64(b []byte) (int64, error) {
 		i = 1
 	}
 	if i >= len(b) {
-		return 0, fmt.Errorf("avro json: invalid number %q", b)
+		return 0, fmt.Errorf("avro json: invalid number %q", truncBytesForError(b))
 	}
 	// Per-digit pre-multiply guard. The naive "n*10+d wrapped if it
 	// went down" check has a gap once n ≈ 2^64/9: n*10+d can wrap
@@ -368,11 +368,11 @@ func parseJSONInt64(b []byte) (int64, error) {
 			return n, nil
 		}
 		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("avro json: invalid number %q", b)
+			return 0, fmt.Errorf("avro json: invalid number %q", truncBytesForError(b))
 		}
 		d := uint64(c - '0')
 		if n > cutoff || (n == cutoff && d > maxDigit) {
-			return 0, fmt.Errorf("avro json: value %q overflows int64", b)
+			return 0, fmt.Errorf("avro json: value %q overflows int64", truncBytesForError(b))
 		}
 		n = n*10 + d
 	}

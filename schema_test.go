@@ -1894,10 +1894,10 @@ func effectiveLogicalType(n *schemaNode) string {
 
 // TestFieldLevelLogicalType_DecimalRoundTrip exercises the value-side
 // decoder against a flat-form decimal schema. Decimal is the most
-// load-bearing case for the lift because it also propagates field-level
-// `precision` and `scale` — not just `logicalType`. Before the lift the
-// parser dropped all three and Encode/Decode of a *big.Rat errored with
-// "cannot use *big.Rat with Avro type bytes".
+// involved case for the lift because it also propagates field-level
+// `precision` and `scale` — not just `logicalType`. Without the lift,
+// the parser would drop all three and Encode/Decode of a *big.Rat
+// would error with "cannot use *big.Rat with Avro type bytes".
 func TestFieldLevelLogicalType_DecimalRoundTrip(t *testing.T) {
 	type Row struct {
 		Amt *big.Rat `avro:"amt"`
@@ -2007,12 +2007,12 @@ func TestFieldLevelLogicalType_CanonicalDoesNotDuplicate(t *testing.T) {
 	}
 }
 
-// TestFieldLevelLogicalType_FingerprintsMatch is the load-bearing
-// drop-in-compatibility invariant: flat-form and nested-form schemas
-// must produce byte-identical canonical output (and therefore identical
-// fingerprints) so that downstream tooling — schema registries, schema
-// caches, anything keyed on fingerprint — treats them as the same
-// schema.
+// TestFieldLevelLogicalType_FingerprintsMatch pins the drop-in-
+// compatibility invariant: flat-form and nested-form schemas must
+// produce byte-identical canonical output (and therefore identical
+// fingerprints) so that downstream tooling — schema registries,
+// schema caches, anything keyed on fingerprint — treats them as the
+// same schema.
 func TestFieldLevelLogicalType_FingerprintsMatch(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -2267,11 +2267,13 @@ func TestFieldLevelLogicalType_OneCricketeerRoundTrip(t *testing.T) {
 }
 
 // TestFieldLevelLogicalType_UnionPreAnnotatedFirstBranch pins the lift's
-// "first non-null branch only" semantics. The earlier implementation
-// looped past the first non-null branch when that branch was already
-// an object with its own nested annotation — and if a later non-null
-// branch was either a primitive or an object with no annotation, the
-// field-level annotation would be silently grafted onto it.
+// "first non-null branch only" semantics: the lift breaks unconditionally
+// after the first non-null branch. If the first non-null branch already
+// has its own nested annotation, the field-level annotation is dropped
+// (closer-to-the-type wins) and any later branches remain unaffected.
+// Without the unconditional break, the lift would fall through past
+// the annotated branch and graft the field-level annotation onto a
+// later un-annotated branch.
 //
 // To make the fall-through observable, this schema uses different
 // primitive types for the two non-null branches (so we don't trip the
@@ -2279,20 +2281,10 @@ func TestFieldLevelLogicalType_OneCricketeerRoundTrip(t *testing.T) {
 //
 //	["null", {"type":"int","logicalType":"date"}, "string"]
 //
-// with a field-level `logicalType:"uuid"`. The user-visible difference:
-//
-//   - With the bug: the lift falls through past branch 1 (object with
-//     its own `date` annotation) and grafts `uuid` onto branch 2,
-//     producing `[null, int+date, string+uuid]`. Schema parses
-//     successfully but the user's "string" branch silently gained a
-//     uuid semantic they never asked for.
-//   - With the fix: the lift `break`s unconditionally after the first
-//     non-null branch. Since that branch already has its own logical,
-//     the field-level `uuid` is dropped (closer-to-the-type wins) and
-//     branch 2 remains a plain `string`.
-//
-// This is the load-bearing pin against regression of the fall-through
-// fix.
+// with a field-level `logicalType:"uuid"`. Expected result:
+// `[null, int+date, string]` — the field-level `uuid` is dropped
+// because branch 1 already has its own `date` annotation, and branch
+// 2 remains plain `string`.
 func TestFieldLevelLogicalType_UnionPreAnnotatedFirstBranch(t *testing.T) {
 	s, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"v","type":["null",{"type":"int","logicalType":"date"},"string"],"logicalType":"uuid"}
@@ -2315,8 +2307,9 @@ func TestFieldLevelLogicalType_UnionPreAnnotatedFirstBranch(t *testing.T) {
 	if got := node.branches[1].logical; got != "date" {
 		t.Fatalf("branch 1: closer-to-type wins, want date, got %q", got)
 	}
-	// Second non-null branch must remain plain. Pre-fix this branch
-	// would have been silently lifted to {type:string,logicalType:uuid}.
+	// Second non-null branch must remain plain — the lift must not
+	// silently graft the field-level annotation onto a later branch
+	// after the first non-null branch already absorbed (or dropped) it.
 	if got := node.branches[2].logical; got != "" {
 		t.Fatalf("branch 2: must NOT inherit field-level annotation, got %q (lift fell through past pre-annotated branch 1)", got)
 	}
@@ -2403,11 +2396,11 @@ func TestFieldLevelLogicalType_LiftedUnknownLogicalPreserved(t *testing.T) {
 // rejectCachedRefIfCustomTypeWouldMatch fires when a Parse references
 // a cached named type whose subtree contains a flat-form-lifted
 // unknownLogical, and the current Parse registers a CustomType that
-// would have matched that logical. This is the load-bearing
-// composition: the lift happens at JSON-parse time, so by the time
-// caching runs the lifted logical is indistinguishable from a
-// nested one — and the rejection check correctly consults
-// unknownLogical as a fallback.
+// would have matched that logical. This composition matters because
+// the lift happens at JSON-parse time, so by the time caching runs
+// the lifted logical is indistinguishable from a nested one — and
+// the rejection check correctly consults unknownLogical as a
+// fallback.
 //
 // Without the lift, this scenario would silently succeed and the
 // user's CustomType would never fire on cached fields — the exact

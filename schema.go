@@ -9,7 +9,6 @@ import (
 	"hash"
 	"maps"
 	"math"
-	"math/big"
 	"reflect"
 	"slices"
 	"strconv"
@@ -325,9 +324,9 @@ func (s *aschema) UnmarshalJSON(data []byte) error {
 			v, err := unmarshalAnyPreservePrecision(raw[k])
 			if err != nil {
 				// raw[k] came from a successful map[string]json.RawMessage
-				// decode above, so this is unreachable for well-formed input
-				// — but preserve the pre-fix behavior of silently dropping
-				// the property rather than failing the whole schema parse.
+				// decode above, so this is unreachable for well-formed input.
+				// Silently drop the property rather than fail the whole
+				// schema parse — extra props are advisory metadata.
 				continue
 			}
 			s.object.extra[k] = v
@@ -1387,7 +1386,7 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 //
 // Per the package's "Intentional asymmetries": CustomTypes are
 // scoped to the resulting Schema, which by definition includes its
-// referenced types. Cached references previously bypassed this scope.
+// referenced types.
 func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *namedType) error {
 	if len(b.customTypes) == 0 || nt == nil || nt.node == nil {
 		return nil
@@ -1684,9 +1683,9 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			// whenever ANY matching CustomType exists (per
 			// CustomType.Decode docstring "If nil, the built-in logical
 			// type handler is bypassed and the base Avro type decoder
-			// is used directly"). Single-gate pre-fix suppressed both
-			// sides on any match, breaking encode of *big.Rat with a
-			// Decode-only CustomType.
+			// is used directly"). A single-gate suppression on any match
+			// would break encode of *big.Rat with a Decode-only
+			// CustomType.
 			if b.hasMatchingCustomTypeWithEncode(o.Type, o.Logical) {
 				b.ser = ser
 			} else {
@@ -2047,10 +2046,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// to the same uniqueness constraints as names"), a field name AND
 		// alias share one namespace within a record. Reject symmetrically:
 		// either a later name shadowing a prior alias, or a later alias
-		// shadowing a prior name/alias, breaks uniqueness. Pre-fix only
-		// the alias-side check fired, which let `[{name:"a",aliases:["x"]},
+		// shadowing a prior name/alias, breaks uniqueness. A check on only
+		// the alias side would let `[{name:"a",aliases:["x"]},
 		// {name:"x"}]` silently parse and then route differently from
-		// Java's applyAliases (writer's "x" mapped to literal-named "x"
+		// Java's applyAliases (writer's "x" maps to literal-named "x"
 		// here, but Java rewrites writer's "x" → "a" first via the
 		// alias).
 		nd.fieldIdx = make(map[string]int, len(nd.fields))
@@ -2267,10 +2266,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// decoder suppressed whenever ANY matching CustomType exists
 		// (CustomType.Decode docstring: "If nil, the built-in logical
 		// type handler is bypassed and the base Avro type decoder is
-		// used directly"). Single-gate pre-fix suppressed both sides
-		// on any match, so a Decode-only CustomType for fixed.decimal /
-		// fixed.duration / fixed.uuid would land on raw serSize which
-		// can't accept *big.Rat / avro.Duration as input.
+		// used directly"). A single-gate suppression on any match would
+		// route a Decode-only CustomType for fixed.decimal /
+		// fixed.duration / fixed.uuid onto raw serSize which can't
+		// accept *big.Rat / avro.Duration as input.
 		hasEnc := b.hasMatchingCustomTypeWithEncode("fixed", s.object.Logical)
 		hasAny := b.hasMatchingCustomType("fixed", s.object.Logical)
 		switch s.object.Logical {
@@ -2454,9 +2453,9 @@ func (o *aobject) validateLogical() error {
 	// hamba's parsePrimitiveLogicalType (schema_parse.go:205-222) and
 	// parseFixedLogicalType (:514-524) return nil for any combo not in
 	// the (typ, ltyp) switch, dropping the logical silently. Three
-	// reference impls + spec text all agree on soft-drop; pre-fix twmb
-	// was the outlier hard-rejecting (interop break for Java/fastavro
-	// producers that emit schema-evolution / legacy combos).
+	// reference impls + spec text all agree on soft-drop; hard-rejecting
+	// would be an interop break against Java/fastavro producers that
+	// emit schema-evolution / legacy combos.
 	default:
 		if accept, known := logicalUnderlyingAccept[o.Logical]; known {
 			if !accept(o) {
@@ -2631,34 +2630,63 @@ func normalizeJSONValue(v any) any {
 }
 
 // normalizeJSONNumber resolves a UseNumber-preserved json.Number to the
-// idiomatic Go type: int64 for integer-valued literals (no '.', 'e', 'E')
-// that fit in int64; json.Number for integers that overflow int64 (rare,
-// keeps arbitrary precision); float64 for fractional / exponent-form
-// literals, including ±Inf for values whose magnitude exceeds float64's
-// exponent range (e.g. "1e1000" → +Inf). Whole-number JSON literals like
-// "18" — which would round-trip from a Go float64(18) through json.Marshal
-// as `18` — become int64(18) here; type pinning tests that previously
-// asserted float64(N) for a small integer must now assert int64(N).
+// idiomatic Go type by VALUE, not by literal syntax:
+//
+//   - Exact integer fitting int64 → int64. Applies to `42`, `1.5e1`
+//     (= 15), `9.5e17` — the literal's syntactic shape (`.`/`e`)
+//     doesn't matter.
+//   - Exact integer exceeding int64, written in pure-digit syntax
+//     → json.Number (preserves arbitrary precision).
+//   - Non-integer, OR exact integer exceeding int64 in fractional/
+//     exp-form syntax → float64 (parseFloatAcceptOverflow handles
+//     ±Inf for magnitudes overflowing float64's exponent range,
+//     e.g. "1e1000" → +Inf).
 //
 // The ±Inf-from-overflow path routes through [parseFloatAcceptOverflow]
 // so the metadata-API observability surface (Schema.Root().Props,
 // Fields[].Default, Fields[].Props, CustomType callbacks' *SchemaNode.Props)
 // agrees with the encode/decode/schema-parse-time arms on the
-// ErrRange-with-Inf predicate — pattern 1b parity across the 4th
-// code-path axis. Java's Jackson DoubleNode(Double.parseDouble("1e1000"))
-// produces +Inf at the metadata layer; fastavro's float("1e1000") → inf
-// via Python json. Pre-fix twmb returned json.Number("1e1000") here,
-// violating the docstring contract "fractional and exponent-form literals
-// decode to float64" on the overflow subcase.
+// ErrRange-with-Inf predicate. Java's Jackson
+// DoubleNode(Double.parseDouble("1e1000")) produces +Inf at the
+// metadata layer; fastavro's float("1e1000") → inf via Python json.
+//
+// Value-based dispatch (vs syntax-based) is what eliminates a
+// metadata-vs-wire divergence at the int64 boundary: under syntax-
+// based dispatch, "9.2233720368547758e18" against a long field had
+// wire = int64(9223372036854775800) but metadata = float64(rounded
+// to 2^63); the two surfaces disagreed about the default value.
+// Value-based dispatch normalizes both to int64(9223372036854775800).
 func normalizeJSONNumber(n json.Number) any {
 	s := string(n)
-	// Integer-form: no decimal point and no exponent marker.
+	// Integer-syntax fast path: no decimal point, no exponent — strconv
+	// alone is enough, no need to spin up a big.Rat.
 	if !strings.ContainsAny(s, ".eE") {
 		if i, err := n.Int64(); err == nil {
 			return i
 		}
 		// Overflows int64; preserve as json.Number for arbitrary precision.
 		return n
+	}
+	// Fractional or exponent syntax. Value-based dispatch: parse with
+	// arbitrary precision and check if the value is an exact integer.
+	// Without this, a literal like "1.5e1" (= 15) or "9.5e17"
+	// (= 950000000000000000) surfaces as float64 — silently rounding for
+	// values exceeding float64's 53-bit mantissa and diverging from the
+	// wire-encode pipeline's exact-integer parse for integer-defaultable
+	// schemas. Going through boundedRatFromString lets metadata and wire
+	// agree on the same int64 value regardless of how the user wrote the
+	// literal.
+	if r, ok, err := boundedRatFromString(s); err == nil && ok && r.IsInt() {
+		if bi := r.Num(); bi.IsInt64() {
+			return bi.Int64()
+		}
+		// Exact integer beyond int64 range. Two sub-cases:
+		//   - Magnitude fits float64's exponent → surface as float64,
+		//     matching what an encode against a float/double schema
+		//     emits on the wire (lossy by destination).
+		//   - Magnitude overflows float64 → parseFloatAcceptOverflow
+		//     returns ±Inf, matching the wire encoder's silent
+		//     overflow-to-Inf path.
 	}
 	if f, err := parseFloatAcceptOverflow(s); err == nil {
 		return f
@@ -2743,61 +2771,20 @@ func int64FitsInt32(n int64) (int32, error) {
 // target — pass through unchanged.
 func int64Identity(n int64) (int64, error) { return n, nil }
 
-// floatRoundsToSameInt64 reports whether the float64 representation of
-// the decimal literal s rounds to exactly the same integer value as n.
-// Used to detect within-twmb route divergence between the int64 wire
-// path (exact via big.Rat) and the float64 metadata-API path (rounds at
-// the 53-bit mantissa). Java's Schema.parseField (Long.canConvertToLong
-// → DoubleNode false at >=2^63) and fastavro's _default_matches_schema
-// (isinstance(default,int)=false for floats) both reject when this
-// predicate would fail; twmb applies it at the encode-time AND
-// schema-parse-time arms so they agree.
-//
-// Caller must have verified s is fractional/exponent form — pure
-// integer-literal inputs are exact by construction and skip this check.
-//
-// Returns false for parse errors, NaN, and ±Inf: none are valid int64
-// representations, so the caller's strict path can just reject.
-func floatRoundsToSameInt64(s string, n int64) bool {
-	f, err := parseFloatAcceptOverflow(s)
-	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
-		return false
-	}
-	fRat := new(big.Rat).SetFloat64(f)
-	if fRat == nil {
-		return false
-	}
-	return fRat.Cmp(new(big.Rat).SetInt64(n)) == 0
-}
-
-// boundedParseIntForFloat parses s as a decimal integer literal, capping
-// input length at maxParseFloatLen to bound the error-message payload on
-// hostile inputs (a 1 MiB pure-integer string would otherwise produce a
-// ~1 MiB error via fmt.Errorf interpolation). Shared by
-// [jsonNumberToFloat]'s integer-form arm and [integerFormFitsFloat] so
-// every encode-time integer→float conversion site agrees on the cap.
-func boundedParseIntForFloat(s string) (int64, error) {
-	if len(s) > maxParseFloatLen {
-		return 0, fmt.Errorf("integer literal exceeds %d byte length cap", maxParseFloatLen)
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("integer %s overflows float exact precision", s)
-	}
-	return n, nil
-}
-
 func defaultAsInt32(val any) (int32, error) {
 	return numericDefault(val, parseInt32Lenient, floatFitsInt32, int64FitsInt32)
 }
 
 func defaultAsInt64(val any) (int64, error) {
-	return numericDefault(val, parseInt64WithFloatParity, floatFitsInt64, int64Identity)
+	return numericDefault(val, parseInt64Lenient, floatFitsInt64, int64Identity)
 }
 
 // floatMantissaLimit returns the largest integer magnitude exactly
 // representable in float32 (bitSize=32) or float64 (bitSize=64) —
-// the mantissa bound used for int↔float precision-loss checks.
+// the mantissa bound used for float→int whole-number precision-loss
+// checks at [floatFitsInt32From] and [floatFitsInt64From]. The reverse
+// direction (int→float) is lossy by destination per Java/fastavro parity;
+// see [appendAvroFloat32] / [appendAvroFloat64].
 func floatMantissaLimit(bitSize int) int64 {
 	if bitSize == 32 {
 		return 1 << 24
@@ -2805,70 +2792,19 @@ func floatMantissaLimit(bitSize int) int64 {
 	return 1 << 53
 }
 
+// intFitsFloat reports whether an int64 value of magnitude n can be
+// represented exactly in the target float (float32 or float64). Used
+// by decode-time arms that write a long-wire value into a Go float
+// target: the user explicitly chose a smaller-precision Go type, so we
+// surface the precision loss rather than silently rounding. Encode-time
+// arms use the lossy-destination policy and silently round; see
+// [appendAvroFloat32] / [appendAvroFloat64].
 func intFitsFloat(n int64, bitSize int) (float64, error) {
 	lim := floatMantissaLimit(bitSize)
 	if n < -lim || n > lim {
 		return 0, fmt.Errorf("integer %d overflows float%d exact precision", n, bitSize)
 	}
 	return float64(n), nil
-}
-
-func uintFitsFloat(n uint64, bitSize int) (float64, error) {
-	lim := uint64(floatMantissaLimit(bitSize))
-	if n > lim {
-		return 0, fmt.Errorf("integer %d overflows float%d exact precision", n, bitSize)
-	}
-	return float64(n), nil
-}
-
-// integerFormFitsFloat parses s as a decimal-integer literal and
-// verifies the value fits the target's mantissa precision.
-// (f, true, nil) on accept, (0, true, err) on integer-form overflow,
-// (0, false, nil) when s is not a decimal-integer literal — caller
-// then falls through to ParseFloat (preserves Java-parity lenient
-// hex-float / exponent-form acceptance).
-//
-// Length cap: the legitimate int64 input fits in 20 chars (sign +
-// 19 digits); the digit-walk loop and strconv.ParseInt are O(n), so
-// a 1 MiB hostile all-digit input would walk + parse ~10-20ms per
-// call and the formatted error message would copy the 1 MiB string
-// into the alloc. Mirror parseFloatAcceptOverflow's maxParseFloatLen
-// cap (1024) — same input domain, same callers (defaultAsFloat,
-// jsonCoerceToFloat64).
-func integerFormFitsFloat(s string, bitSize int) (float64, bool, error) {
-	if len(s) == 0 {
-		return 0, false, nil
-	}
-	if len(s) > maxParseFloatLen {
-		return 0, true, fmt.Errorf("integer literal exceeds %d byte length cap", maxParseFloatLen)
-	}
-	i := 0
-	if s[0] == '-' || s[0] == '+' {
-		i = 1
-	}
-	if i >= len(s) {
-		return 0, false, nil
-	}
-	for j := i; j < len(s); j++ {
-		c := s[j]
-		if c < '0' || c > '9' {
-			return 0, false, nil
-		}
-	}
-	// boundedParseIntForFloat caps + parses + formats overflow errors;
-	// the early-cap-check above keeps a fast O(1) reject before the
-	// digit walk, so a hostile multi-MB input rejects without walking.
-	// On ParseInt-ErrRange (magnitude beyond int64, and therefore
-	// beyond any float exact precision >1<<53), boundedParseIntForFloat
-	// returns the formatted error directly — falling through to
-	// ParseFloat would silently round (e.g. "99999999999999999999" →
-	// 1e20).
-	n, err := boundedParseIntForFloat(s)
-	if err != nil {
-		return 0, true, err
-	}
-	f, err := intFitsFloat(n, bitSize)
-	return f, true, err
 }
 
 // parseFloatAcceptOverflow is [strconv.ParseFloat] with one twist:
@@ -2910,43 +2846,33 @@ func parseFloatAcceptOverflow(s string) (float64, error) {
 // hostile multi-MB inputs. See helper's docstring for full rationale.
 const maxParseFloatLen = 1024
 
-// defaultAsFloat extracts a numeric default for a float (bitSize=32)
-// or double (bitSize=64) field. The string arm is Java-parity lenient
-// (accepts hex floats etc.); the json.Number arm is JSON-strict. The
-// int64/int32 arms apply intFitsFloat's mantissa-precision check —
-// metadata-API consumers (branchAcceptsDefault) pass normalized int64
-// values directly through this helper so the accept set agrees with
-// the wire path for the same JSON literal.
-func defaultAsFloat(val any, bitSize int) (float64, error) {
+// defaultAsFloat extracts a numeric default for a float or double field.
+// The string arm is Java-parity lenient (accepts hex floats etc.); the
+// json.Number arm is JSON-strict. Encoding into a float/double field is
+// lossy by destination — int64/int32 inputs exceeding the mantissa
+// precision silently IEEE-round (matches Java's Schema.parseField
+// text→DoubleNode coercion and fastavro's float()). The float32 narrowing
+// to ±Inf happens at the caller's float64 → float32 cast.
+//
+// User-controllable strings are passed through [truncForError] before
+// interpolation so a 1 MiB hostile default literal doesn't produce a 1 MiB
+// error message.
+func defaultAsFloat(val any) (float64, error) {
 	switch v := val.(type) {
 	case json.Number:
-		s := v.String()
-		if !isJSONNumber(s) {
-			return 0, fmt.Errorf("invalid JSON number %q", s)
-		}
-		if f, handled, err := integerFormFitsFloat(s, bitSize); handled {
-			return f, err
-		}
-		f, err := parseFloatAcceptOverflow(s)
-		if err != nil {
-			return 0, fmt.Errorf("invalid number %s", s)
-		}
-		return f, nil
+		return parseJSONNumberAsFloat(v.String())
 	case float64:
 		return v, nil
 	case string:
-		if f, handled, err := integerFormFitsFloat(v, bitSize); handled {
-			return f, err
-		}
 		f, err := parseFloatAcceptOverflow(v)
 		if err != nil {
-			return 0, fmt.Errorf("invalid string default %q: %w", v, err)
+			return 0, fmt.Errorf("invalid string default %q: %w", truncForError(v), err)
 		}
 		return f, nil
 	case int64:
-		return intFitsFloat(v, bitSize)
+		return float64(v), nil
 	case int32:
-		return intFitsFloat(int64(v), bitSize)
+		return float64(v), nil
 	}
 	return 0, fmt.Errorf("expected number, got %T", val)
 }
@@ -2999,19 +2925,11 @@ func coerceDefault(val any, node *schemaNode) any {
 	if _, ok := val.(string); !ok {
 		return val
 	}
-	bitSize := 32
-	if node.kind == "double" {
-		bitSize = 64
-	}
-	// Route through defaultAsFloat so the precision check fires uniformly
-	// with validateDefault's own check at schema.go's case "float", "double"
-	// arm. Without this, the string default's ParseFloat would silently
-	// round and then validateDefault (now seeing the float64 result) would
-	// accept — the precision-loss check at defaultAsFloat's string arm
-	// would never run. If defaultAsFloat rejects (precision overflow or
-	// syntax), leave the original string so validateDefault produces the
-	// canonical error message via the same arm on its own call.
-	if f, err := defaultAsFloat(val, bitSize); err == nil {
+	// Route through defaultAsFloat so the string→float64 coercion
+	// applies uniformly with validateDefault's own arm. If parsing
+	// fails (syntax error), leave the original string so validateDefault
+	// produces the canonical error message.
+	if f, err := defaultAsFloat(val); err == nil {
 		return f
 	}
 	return val
@@ -3190,11 +3108,7 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 			return val, fmt.Errorf("long default: %w", err)
 		}
 	case "float", "double":
-		bitSize := 64
-		if node.kind == "float" {
-			bitSize = 32
-		}
-		if _, err := defaultAsFloat(val, bitSize); err != nil {
+		if _, err := defaultAsFloat(val); err != nil {
 			return val, fmt.Errorf("%s default: %w", node.kind, err)
 		}
 	case "string":

@@ -3,6 +3,7 @@ package avro
 import (
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -199,10 +200,22 @@ func TestFloatOverflowAllPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("serFloat: float64 overflow into avro float", func(t *testing.T) {
+	t.Run("serFloat: float64 overflow silently narrows to ±Inf", func(t *testing.T) {
+		// Lossy-destination policy: matches Java's
+		// GenericDatumWriter.writeFloat(Number.floatValue()) and fastavro's
+		// struct.pack("<f", v) — finite float64 → float32 silently narrows
+		// to ±Inf when out of range.
 		s := MustParse(`"float"`)
-		if _, err := s.Encode(overflow); err == nil {
-			t.Fatalf("expected overflow error on encode")
+		data, err := s.Encode(overflow)
+		if err != nil {
+			t.Fatalf("encode rejected overflow: %v", err)
+		}
+		var out float32
+		if _, err := s.Decode(data, &out); err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if !math.IsInf(float64(out), +1) {
+			t.Fatalf("expected +Inf wire value, got %v", out)
 		}
 	})
 
@@ -224,13 +237,16 @@ func TestFloatOverflowAllPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("EncodeJSON float: float64 overflow into avro float", func(t *testing.T) {
-		// Match binary serFloat: reject finite float64 values that clamp
-		// to ±Inf when narrowed to float32, rather than silently emitting
-		// the invalid JSON literal "+Inf".
+	t.Run("EncodeJSON float: float64 overflow silently narrows", func(t *testing.T) {
+		// Lossy-destination policy: float64 → float32 narrowing produces
+		// ±Inf, emitted via the dedicated "Infinity" JSON literal.
 		s := MustParse(`"float"`)
-		if _, err := s.EncodeJSON(overflow); err == nil {
-			t.Fatal("expected overflow error on EncodeJSON")
+		out, err := s.EncodeJSON(overflow)
+		if err != nil {
+			t.Fatalf("encode rejected overflow: %v", err)
+		}
+		if !strings.Contains(string(out), "Infinity") {
+			t.Fatalf("expected Infinity literal in output, got %s", out)
 		}
 	})
 
@@ -243,10 +259,16 @@ func TestFloatOverflowAllPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("EncodeJSON float: json.Number overflow", func(t *testing.T) {
+	t.Run("EncodeJSON float: json.Number overflow silently narrows", func(t *testing.T) {
+		// Lossy-destination policy: parseFloatAcceptOverflow returns +Inf
+		// for overflowing exponent-form input; encoded as "Infinity" literal.
 		s := MustParse(`"float"`)
-		if _, err := s.EncodeJSON(json.Number("1e100")); err == nil {
-			t.Fatal("expected overflow error for json.Number(1e100)")
+		out, err := s.EncodeJSON(json.Number("1e100"))
+		if err != nil {
+			t.Fatalf("encode rejected overflow: %v", err)
+		}
+		if !strings.Contains(string(out), "Infinity") {
+			t.Fatalf("expected Infinity literal in output, got %s", out)
 		}
 	})
 }

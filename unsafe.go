@@ -981,12 +981,9 @@ func usFloat(k reflect.Kind) userfn {
 		}
 	case reflect.Float64:
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			f := *(*float64)(p)
-			// Match serFloat: reject silent narrowing to ±Inf for finite inputs.
-			if finiteFloat32Overflows(f) {
-				return nil, &SemanticError{AvroType: "float", Err: fmt.Errorf("value %g overflows float32", f)}
-			}
-			return appendUint32(dst, math.Float32bits(float32(f))), nil
+			// Lossy-destination: finite float64 → float32 silently narrows
+			// to ±Inf when out of range (matches appendAvroFloat32 / Java).
+			return appendUint32(dst, math.Float32bits(float32(*(*float64)(p)))), nil
 		}
 	default:
 		return nil

@@ -729,6 +729,41 @@ deliberate exceptions.
 - **JSON null-union fast paths accept non-canonical multi-byte varint
   encodings** of indices 0/1 (e.g. `0x80 0x00` = 0). Java's
   `BinaryDecoder.readIndex` accepts both canonical and non-canonical forms.
+- **Union dispatch is type-based, not value-based.** When encoding a Go
+  value into a union, the encoder routes by the value's static Go type:
+  `int`, `int64`, `uint`, `uint32`, `uint64` all map to the `"long"`
+  branch, never `"int"`, even when the runtime value would fit `int32`.
+  A union `["int","long"]` with value `int(42)` emits `"long"`. To force
+  the `"int"` branch for a small value, pass `int32(value)` explicitly
+  or use a tagged-map wrapper `map[string]any{"int": value}`. The
+  type-based rule keeps wire size deterministic per Go type — the
+  alternative (value-aware) would mean the same Go field encodes
+  differently across calls depending on the runtime magnitude.
+- **Precision: the reader schema decides.**
+  - Reader schema is lossy (`float`/`double`): encode and decode both
+    silently IEEE-round. `s.AppendEncode(int64(9007199254740993), "double")`
+    succeeds and emits the float64 rounding of the input. Matches
+    Java/fastavro.
+  - Reader schema is exact (`int`/`long`/`bytes`/`string`): decoding
+    into a lossy Go target is allowed only if the wire value fits
+    exactly. `s.Decode(longWire, &f float64)` against a `"long"`
+    schema errors when the wire value exceeds float64's mantissa.
+
+  Users wanting exact large-integer round-trip should keep `"long"`.
+  Users evolving to `"double"` should expect silent IEEE rounding.
+- **`json.Number` in fractional/exponent form is accepted against
+  integer schemas when the value is exact.**
+  `s.AppendEncode(json.Number("9.5e17"), "long")` succeeds (the
+  literal represents an exact int64); twmb parses with arbitrary
+  precision and the JSON encoder emits the integer-decimal form.
+
+  Interop caveat: a schema with an exponent-form integer default like
+  `{"type":"long","default":9.5e17}` parses in twmb but is rejected
+  by Java's `Schema.parseField` (Jackson treats `.`/`e` literals as
+  non-integral). Twmb preserves the schema text verbatim, so a
+  twmb-published schema with this shape will not load in a Java
+  consumer. Prefer integer-literal defaults (`"default":950000000000000000`)
+  if Java reads your schemas.
 
 ### Decoder leniencies without a symmetric encoder shape
 

@@ -1489,10 +1489,10 @@ func rejectJSONNumberStringTarget(v reflect.Value, content, avroType string) err
 }
 
 // setStringTarget is the combined "guard + SetString" applied at every
-// string-like-wire setter. Calling rejectJSONNumberStringTarget + SetString
-// is a 4-line dance that previously lived at each of the 12 setter sites;
-// factoring it here means a future setter can't accidentally call SetString
-// without the guard. v.Kind() must be reflect.String.
+// string-like-wire setter. Single entry point for the
+// rejectJSONNumberStringTarget + SetString pair across all 12 setter
+// sites — a future setter can't accidentally call SetString without
+// the guard. v.Kind() must be reflect.String.
 func setStringTarget(v reflect.Value, s, avroType string) error {
 	if err := rejectJSONNumberStringTarget(v, s, avroType); err != nil {
 		return err
@@ -1548,9 +1548,9 @@ func formatToStringKindTarget(v reflect.Value, content, avroType string) (wrote 
 // and json.Number targets. bits is 32 or 64, the source width — used for
 // interface assignment, the float32-overflow check, and json.Number formatting.
 // Shared between natural float/double deser and float-promotion deserializers
-// so target-set parity stays in lock-step (regression: promote*To{Float,Double}
-// previously rejected integer + json.Number targets that deserFloat/deserDouble
-// accepted).
+// so target-set parity stays in lock-step across deserFloat / deserDouble /
+// promote*To{Float,Double}: every float-emitting deserializer accepts the
+// same integer and json.Number target shapes.
 //
 // Non-finite floats (±Inf, NaN) are rejected for integer AND json.Number
 // targets: neither type can faithfully hold the value (no integer representation;
@@ -1704,12 +1704,14 @@ func setIntegerWire[T int32 | int64](v reflect.Value, val T, avroType string) er
 		return nil
 	}
 	if v.CanFloat() {
-		// Mirrors the documented whole-number-float-as-int encode
-		// leniency: AppendEncode(float64(42), "long") succeeds, so
-		// Decode("long" wire, *float64) must round-trip. intFitsFloat
-		// is shared with promoteIntFloatMantissa (promote.go)
-		// so the natural-decoder and promoted-decoder arms apply the
-		// same mantissa bound to the same wire bytes.
+		// Natural-decoder rule (reader schema is exact, Go target is
+		// lossy): rejects when the wire value can't be represented
+		// exactly in the Go float target. This is asymmetric with the
+		// resolved-promotion path (promoteIntFloatMantissa in
+		// promote.go), which silently IEEE-rounds because there the
+		// reader schema itself is float/double — the user opted into
+		// IEEE-precision semantics at the schema layer. See
+		// BUG_AUDIT.md §"Precision: the READER schema decides".
 		f, err := intFitsFloat(v64, v.Type().Bits())
 		if err != nil {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}

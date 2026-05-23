@@ -215,9 +215,9 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 		// If the reader has a logical type, the bare promotion deser
 		// drops it — Java's Resolver.Action carries logicalType +
 		// conversion orthogonally to Promote and applies the conversion
-		// after the widening (Resolver.java:154-165). Pre-fix, a
+		// after the widening (Resolver.java:154-165). Without this wrap,
 		// writer "int" → reader {"long","logicalType":"timestamp-millis"}
-		// produced int64 instead of time.Time at every position
+		// would produce int64 instead of time.Time at every position
 		// (top-level, record field, array item, map value, reader-union
 		// branch). Wrap the promotion deser to re-apply the conversion.
 		if pdLogical := promotionDeserForLogical(w.kind, r); pdLogical != nil {
@@ -745,17 +745,15 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return appendVarlong(dst, n), nil
 	case "float":
-		f, err := defaultAsFloat(val, 32)
+		f, err := defaultAsFloat(val)
 		if err != nil {
 			return nil, fmt.Errorf("float default: %w", err)
 		}
-		// Match serFloat: reject silent narrowing to ±Inf.
-		if finiteFloat32Overflows(f) {
-			return nil, fmt.Errorf("float default %g overflows float32", f)
-		}
+		// Lossy-destination policy: float64 → float32 narrowing to ±Inf
+		// is accepted at encode (matches appendAvroFloat32 / Java).
 		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	case "double":
-		f, err := defaultAsFloat(val, 64)
+		f, err := defaultAsFloat(val)
 		if err != nil {
 			return nil, fmt.Errorf("double default: %w", err)
 		}

@@ -1676,9 +1676,9 @@ func FuzzDepthBounds(f *testing.F) {
 // long+time-micros, string→bytes+decimal, string→bytes+big-decimal,
 // and bytes→string+uuid promotion-plus-logical paths under fuzz
 // inputs — the regression tests pin specific values; this fuzz
-// surfaces variants. Pre-fix any of these decodes silently produced
-// the raw wire type (int64 / []byte / string) instead of the logical-
-// typed result (time.Time / *big.Rat / [16]byte).
+// surfaces variants. Without the wrap, the decode produces the raw
+// wire type (int64 / []byte / string) instead of the logical-typed
+// result (time.Time / *big.Rat / [16]byte).
 var fuzzPromoteLogicalPairs = []struct {
 	writer    string
 	reader    string
@@ -1699,8 +1699,8 @@ var fuzzPromoteLogicalPairs = []struct {
 // fuzzPromoteLogicalNesting wraps a primitive (writer, reader) pair in
 // each container the resolver dispatches through: top-level, record
 // field, array items, map values, and reader-side union branch. The
-// pre-fix bug surfaced uniformly across these nestings, so the fuzz
-// needs to cover every one.
+// logical-conversion wrap must apply uniformly across every nesting,
+// so the fuzz covers each container axis.
 func fuzzPromoteLogicalNesting(writer, reader string, nesting uint8) (string, string) {
 	switch nesting % 5 {
 	case 0:
@@ -1918,15 +1918,14 @@ func FuzzBareSpecialFloat(f *testing.F) {
 }
 
 // FuzzBytesFixedUTF8RoundTrip exercises the JSON encoder bytes/fixed
-// arms that take Go strings as input — pre-fix Encode("é") with an
-// avro "bytes" schema serialized the UTF-8 representation as raw
-// bytes for the binary path (c3 a9) but the JSON path emitted the
-// pre-mapping codepoint string ("é"), producing JSON c3a9 byte
-// strings that re-decoded to two-codepoint garbage. The fix routes
-// the JSON bytes/fixed arms through avroStringValue so the wire form
-// is codepoint-per-byte and round-trips. The fuzz seeds cover
-// multibyte runes (2/3/4-byte UTF-8) inside arrays, maps, unions,
-// records, and verifies the binary↔JSON parity claim: encoding the
+// arms that take Go strings as input. The JSON bytes/fixed arms route
+// through avroStringValue so the wire form is codepoint-per-byte and
+// round-trips; without this routing, Encode("é") against avro "bytes"
+// would serialize the UTF-8 bytes c3 a9 on binary but emit the
+// pre-mapping codepoint string "é" on JSON, producing JSON byte
+// strings that re-decode to two-codepoint garbage. The fuzz seeds
+// cover multibyte runes (2/3/4-byte UTF-8) inside arrays, maps,
+// unions, records, and verifies binary↔JSON parity: encoding the
 // same input through both paths and decoding back must produce the
 // same Go value.
 func FuzzBytesFixedUTF8RoundTrip(f *testing.F) {
@@ -2232,14 +2231,14 @@ func FuzzFindUnionBranch(f *testing.F) {
 }
 
 // FuzzUnionBranchErrorWrapping locks the decodeUnionObject / decode-
-// UnionBare error wrapping introduced this session. The fuzz only
-// asserts no panics — the error-message check belongs to a regression
-// test, not to fuzz. Pre-fix, a target-type mismatch inside a matched
-// tagged-union branch produced the generic "no union branch matched
-// at offset N" message hiding the real cause. The new wrapping
-// preserves the underlying error via errors.Is/Unwrap. Fuzz here
-// exercises every (union shape, tagged/bare input, target shape)
-// combination to surface any panic path the change introduced.
+// UnionBare error wrapping. The fuzz only asserts no panics — the
+// error-message check belongs to a regression test, not to fuzz.
+// A target-type mismatch inside a matched tagged-union branch must
+// preserve the underlying error via errors.Is/Unwrap rather than
+// surface the generic "no union branch matched at offset N" message
+// that hides the real cause. Fuzz here exercises every (union shape,
+// tagged/bare input, target shape) combination to surface any panic
+// path.
 func FuzzUnionBranchErrorWrapping(f *testing.F) {
 	unions := []*Schema{
 		MustParse(`["null","int"]`),
@@ -2303,9 +2302,9 @@ func FuzzUnionBranchErrorWrapping(f *testing.F) {
 }
 
 // FuzzResolveUnionUnionTags exercises resolveUnionUnion's reader-side
-// branch-name path under TaggedUnions. Pre-fix Resolve(["null","int"]
-// → ["null","long"]) decoded into *any with TaggedUnions emitted
-// {"int":42} (writer-side branch name) instead of {"long":42} (reader-
+// branch-name path under TaggedUnions. Resolve(["null","int"] →
+// ["null","long"]) decoded into *any with TaggedUnions must emit
+// {"long":42} (reader-side branch name) — not {"int":42} (writer-
 // side). The fuzz drives Resolve across writer×reader union pairs,
 // encodes a value against the writer, resolves+decodes with
 // TaggedUnions, and verifies the tagged map's key names a reader-side
@@ -2428,11 +2427,11 @@ func branchTagFor(n SchemaNode) string {
 // FuzzDecodeUnionObjectDeep stresses the depth-tracked recursive
 // descent through decodeUnionObject / decodeUnionBare with cyclic
 // JSON inputs. The errTooDeep propagation must not be masked by the
-// "try tagged then bare" fallback — pre-fix, the tagged-side errToo-
-// Deep was caught and the bare-side retry burned more depth. Now
-// errors.Is(err, errTooDeep) short-circuits before the bare retry.
-// Fuzz over deeply nested {"tag":{"tag":{...}}} sequences and assert
-// the library terminates (no panic, no stack overflow).
+// "try tagged then bare" fallback — errors.Is(err, errTooDeep)
+// short-circuits before the bare retry, otherwise the tagged-side
+// errTooDeep would be caught and the bare-side retry would burn
+// more depth. Fuzz over deeply nested {"tag":{"tag":{...}}} sequences
+// and assert the library terminates (no panic, no stack overflow).
 func FuzzDecodeUnionObjectDeep(f *testing.F) {
 	recursiveSchema := MustParse(`{"type":"record","name":"Node","fields":[
 		{"name":"value","type":"int"},

@@ -48,11 +48,11 @@ func TestSchemaNodeRoundTrip(t *testing.T) {
 	if got.Fields[0].Name != "name" || got.Fields[0].Type.Type != "string" {
 		t.Errorf("field 0: got %+v", got.Fields[0])
 	}
-	// Root() now preserves integer precision: JSON integer literals come
-	// back as int64 instead of float64. See unmarshalAnyPreservePrecision
-	// in schema.go and TestRegression_SchemaExtraNumberPrecisionLoss for
-	// the >2^53 case that motivated the change.
-	if got.Fields[1].Name != "age" || got.Fields[1].Default != int64(18) {
+	// Root() narrows defaults to the schema's wire width: int → int32,
+	// long → int64, float → float32, double → float64. See
+	// coerceMetadataDefault in schema_node.go and SchemaField.Default
+	// docstring for the type table.
+	if got.Fields[1].Name != "age" || got.Fields[1].Default != int32(18) {
 		t.Errorf("field 1: got %+v", got.Fields[1])
 	}
 	if got.Fields[2].Type.Type != "union" || len(got.Fields[2].Type.Branches) != 2 {

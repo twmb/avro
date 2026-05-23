@@ -712,7 +712,8 @@ func TestSerNullNonNilableType(t *testing.T) {
 
 func TestSerNullGenericUnionNonNilable(t *testing.T) {
 	// 3-branch union takes the generic serUnion.ser path, which tries
-	// serNull first. This would panic on non-nilable types before the fix.
+	// serNull first. Pins that serNull tolerates non-nilable types
+	// (e.g. int32) without panicking, falling through to the int branch.
 	s, err := Parse(`["null","int","string"]`)
 	if err != nil {
 		t.Fatal(err)
@@ -1007,12 +1008,10 @@ func TestSerTaggedUnionMapBranchFallback(t *testing.T) {
 // union encoder peels Pointer/Interface chains before recognizing a
 // tagged-union map, matching the JSON encoder's entry-peel
 // (appendAvroJSON at json_codec.go) and isNilValue's loop (ser.go).
-//
-// Pre-fix, serUnion.tryUnwrapTagged peeled exactly one Interface layer
-// and no Pointer layers, so &m and any(&m) wrapping a tagged-form map
-// silently failed binary encoding while AppendEncodeJSON accepted them.
-// Observable as a binary↔JSON parity gap at top-level, inside arrays of
-// unions, and inside record fields of union type.
+// serUnion.tryUnwrapTagged must peel every Pointer and Interface layer
+// — &m and any(&m) wrapping a tagged-form map must encode identically
+// to m and any(m). Pins binary↔JSON parity at top-level, inside
+// arrays of unions, and inside record fields of union type.
 func TestRegression_TaggedUnionEncodeIndirection(t *testing.T) {
 	m := map[string]any{"int": int32(42)}
 	wantInt32 := int32(42)
@@ -1113,8 +1112,8 @@ func TestRegression_TaggedUnionEncodeIndirection(t *testing.T) {
 	t.Run("nil cases still picked up by nil-first dispatch", func(t *testing.T) {
 		// The peel-before-tagged-check must NOT route a nil pointer/
 		// interface into the tagged-map branch — it must fall through
-		// to the nil-first dispatch and pick the null branch. Pin this
-		// so the fix doesn't accidentally hijack nil into try-each.
+		// to the nil-first dispatch and pick the null branch. Pins
+		// that the peel never hijacks nil into try-each.
 		s := MustParse(`["null","int"]`)
 		var nilMap *map[string]any
 		bin, err := s.AppendEncode(nil, nilMap)
@@ -1153,8 +1152,10 @@ func TestRegression_TaggedUnionEncodeIndirection(t *testing.T) {
 
 // TestJsonNumberExponentInInt locks in consistent handling of exponent-
 // notation json.Number values across scalar, array, and map int/long
-// encoders. Prior to the fix, scalar serInt rejected "1.5e3" with a
-// misleading "overflows int64" error while serArray.serInt accepted it.
+// encoders. All three paths must accept "1.5e3" identically; any
+// asymmetry between scalar serInt and serArray.serInt would produce
+// the "overflows int64" message on one path while another path
+// silently rounds.
 func TestJsonNumberExponentInInt(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -2243,7 +2244,12 @@ func TestSerIntCoercionToFloat(t *testing.T) {
 	}
 }
 
-func TestSerIntCoercionToFloatPrecisionOverflow(t *testing.T) {
+// TestSerIntCoercionToFloatPrecision verifies the lossy-destination
+// policy for int → float encode: values within the target's mantissa
+// preserve precision exactly, values beyond silently IEEE-round. Matches
+// Java's Number.floatValue()/doubleValue() and fastavro's float()
+// coercion — see [appendAvroFloat32] / [appendAvroFloat64].
+func TestSerIntCoercionToFloatPrecision(t *testing.T) {
 	sf, err := Parse(`"float"`)
 	if err != nil {
 		t.Fatal(err)
@@ -2254,7 +2260,6 @@ func TestSerIntCoercionToFloatPrecisionOverflow(t *testing.T) {
 	}
 
 	// float32: exact range is [-2^24, 2^24].
-	// Values at the boundary should work.
 	atFloat32Limit := int64(1 << 24)
 	if _, err := sf.AppendEncode(nil, atFloat32Limit); err != nil {
 		t.Fatalf("float32 at limit: %v", err)
@@ -2262,16 +2267,15 @@ func TestSerIntCoercionToFloatPrecisionOverflow(t *testing.T) {
 	if _, err := sf.AppendEncode(nil, -atFloat32Limit); err != nil {
 		t.Fatalf("float32 at negative limit: %v", err)
 	}
-	// One past the boundary should fail.
-	if _, err := sf.AppendEncode(nil, atFloat32Limit+1); err == nil {
-		t.Fatal("expected error for int64 overflowing float32 precision")
+	// One past the boundary silently IEEE-rounds.
+	if _, err := sf.AppendEncode(nil, atFloat32Limit+1); err != nil {
+		t.Fatalf("expected lossy round for int64 beyond float32 precision, got: %v", err)
 	}
-	if _, err := sf.AppendEncode(nil, -atFloat32Limit-1); err == nil {
-		t.Fatal("expected error for negative int64 overflowing float32 precision")
+	if _, err := sf.AppendEncode(nil, -atFloat32Limit-1); err != nil {
+		t.Fatalf("expected lossy round for negative int64 beyond float32 precision, got: %v", err)
 	}
-	// Large uint should fail.
-	if _, err := sf.AppendEncode(nil, uint64(1<<24+1)); err == nil {
-		t.Fatal("expected error for uint64 overflowing float32 precision")
+	if _, err := sf.AppendEncode(nil, uint64(1<<24+1)); err != nil {
+		t.Fatalf("expected lossy round for uint64 beyond float32 precision, got: %v", err)
 	}
 
 	// float64: exact range is [-2^53, 2^53].
@@ -2282,11 +2286,11 @@ func TestSerIntCoercionToFloatPrecisionOverflow(t *testing.T) {
 	if _, err := sd.AppendEncode(nil, -atFloat64Limit); err != nil {
 		t.Fatalf("float64 at negative limit: %v", err)
 	}
-	if _, err := sd.AppendEncode(nil, atFloat64Limit+1); err == nil {
-		t.Fatal("expected error for int64 overflowing float64 precision")
+	if _, err := sd.AppendEncode(nil, atFloat64Limit+1); err != nil {
+		t.Fatalf("expected lossy round for int64 beyond float64 precision, got: %v", err)
 	}
-	if _, err := sd.AppendEncode(nil, uint64(1<<53+1)); err == nil {
-		t.Fatal("expected error for uint64 overflowing float64 precision")
+	if _, err := sd.AppendEncode(nil, uint64(1<<53+1)); err != nil {
+		t.Fatalf("expected lossy round for uint64 beyond float64 precision, got: %v", err)
 	}
 }
 
@@ -2517,64 +2521,66 @@ func TestDurationBytesRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRegression_SerArrayFloatSilentInf locks in that the specialized
-// array<float> ser path rejects values that would silently clamp to ±Inf,
-// matching serFloat (top-level) and usFloat (unsafe). Pre-fix the
-// serArray.serFloat / serMap.serFloat specializations were the only
-// float-encode paths missing this guard, so encoding []float64{1e40}
-// into array<float> silently emitted +Inf bits on the wire.
+// TestRegression_SerArrayFloatSilentInf pins the lossy-destination
+// policy: array<float> with []float64{1e40} silently narrows to +Inf
+// on the wire (matches Java/fastavro). Parity check across serFloat
+// (top-level), serArray.serFloat (specialized array), serMap.serFloat
+// (specialized map), and usFloat (unsafe) — every float-encode path
+// must apply the same policy uniformly.
 func TestRegression_SerArrayFloatSilentInf(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"float"}`)
 	huge := 1e40
 	if !math.IsInf(float64(float32(huge)), 1) {
 		t.Fatalf("test assumption failed: float32(1e40) should be +Inf")
 	}
-	got, err := s.AppendEncode(nil, []float64{huge})
-	if err == nil {
-		t.Fatalf("expected float32 overflow error encoding []float64{1e40} into array<float>, got nil; encoded bytes = %x", got)
+	if _, err := s.AppendEncode(nil, []float64{huge}); err != nil {
+		t.Fatalf("expected lossy narrow to +Inf, got error: %v", err)
 	}
 }
 
-// TestRegression_SerMapFloatSilentInf is the map<float> parity test.
+// TestRegression_SerMapFloatSilentInf is the map<float> parity test for
+// the lossy-destination policy.
 func TestRegression_SerMapFloatSilentInf(t *testing.T) {
 	s := MustParse(`{"type":"map","values":"float"}`)
-	got, err := s.AppendEncode(nil, map[string]float64{"k": 1e40})
-	if err == nil {
-		t.Fatalf("expected float32 overflow error encoding map[string]float64{k:1e40} into map<float>, got nil; encoded bytes = %x", got)
+	if _, err := s.AppendEncode(nil, map[string]float64{"k": 1e40}); err != nil {
+		t.Fatalf("expected lossy narrow to +Inf, got error: %v", err)
 	}
 }
 
 // TestRegression_SerArrayFloatAcceptsInt verifies that the specialized
-// array<float> path accepts integer elements (with the float32-precision
-// bound), matching the single-value serFloat path. Pre-fix it errored
-// with "cannot use int64 with Avro type float" for any int slice.
+// array<float> path accepts integer elements (silently IEEE-rounding
+// beyond float32's 24-bit mantissa), matching the single-value serFloat
+// path. Pins int → float lossy-destination acceptance for the
+// specialized array path.
 func TestRegression_SerArrayFloatAcceptsInt(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"float"}`)
 	if _, err := s.AppendEncode(nil, []int64{1, 2, 3}); err != nil {
 		t.Fatalf("expected []int64{1,2,3} to encode as array<float>, got %v", err)
 	}
-	// And rejects values exceeding float32's 24-bit precision.
-	if _, err := s.AppendEncode(nil, []int64{1 << 25}); err == nil {
-		t.Fatalf("expected []int64{1<<25} to error on float32 precision bound")
+	// Lossy-destination: values exceeding float32's 24-bit mantissa
+	// silently IEEE-round (matches Java/fastavro).
+	if _, err := s.AppendEncode(nil, []int64{1 << 25}); err != nil {
+		t.Fatalf("expected []int64{1<<25} to silently round, got %v", err)
 	}
 }
 
 // TestRegression_SerArrayDoubleAcceptsInt verifies array<double> accepts
-// integer elements with the float64-precision bound.
+// integer elements (silently IEEE-rounding beyond float64's 53-bit
+// mantissa per the lossy-destination policy).
 func TestRegression_SerArrayDoubleAcceptsInt(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"double"}`)
 	if _, err := s.AppendEncode(nil, []int64{1, 2, 3}); err != nil {
 		t.Fatalf("expected []int64{1,2,3} to encode as array<double>, got %v", err)
 	}
-	if _, err := s.AppendEncode(nil, []int64{1 << 54}); err == nil {
-		t.Fatalf("expected []int64{1<<54} to error on float64 precision bound")
+	if _, err := s.AppendEncode(nil, []int64{1 << 54}); err != nil {
+		t.Fatalf("expected []int64{1<<54} to silently round, got %v", err)
 	}
 }
 
-// TestSafeUnsafeFloat32OverflowParity locks in that the unsafe fast path
-// (struct field of type float64 → Avro float) rejects values that would
-// silently clamp to ±Inf, matching serFloat's behavior. Pre-fix the unsafe
-// path encoded math.Float32bits(±Inf) without error; the safe path errored.
+// TestSafeUnsafeFloat32OverflowParity locks in that the safe and unsafe
+// encode paths agree on the lossy-destination policy: float64 → float32
+// narrowing produces ±Inf on the wire without error, matching Java's
+// (float)doubleValue() silent narrowing.
 func TestSafeUnsafeFloat32OverflowParity(t *testing.T) {
 	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"v","type":"float"}]}`)
 	if err != nil {
@@ -2583,23 +2589,23 @@ func TestSafeUnsafeFloat32OverflowParity(t *testing.T) {
 	const huge = math.MaxFloat64
 
 	// Safe path via map[string]any.
-	if _, err := s.AppendEncode(nil, map[string]any{"v": huge}); err == nil {
-		t.Fatalf("safe path: expected overflow error for %g, got nil", huge)
+	if _, err := s.AppendEncode(nil, map[string]any{"v": huge}); err != nil {
+		t.Fatalf("safe path: expected lossy narrow to +Inf, got error: %v", err)
 	}
 
 	// Unsafe fast path via struct.
 	type R struct {
 		V float64 `avro:"v"`
 	}
-	if _, err := s.AppendEncode(nil, &R{V: huge}); err == nil {
-		t.Fatalf("unsafe path: expected overflow error for %g (parity with safe path), got nil", huge)
+	if _, err := s.AppendEncode(nil, &R{V: huge}); err != nil {
+		t.Fatalf("unsafe path: expected lossy narrow to +Inf, got error: %v", err)
 	}
 }
 
 // TestSafeUnsafeUint64LongOverflowParity locks in that the unsafe fast path
 // rejects uint64 values that exceed math.MaxInt64 when encoding to Avro
-// long, matching serLong. Pre-fix the unsafe path silently wrapped to a
-// negative int64.
+// long, matching serLong. Without the parity, the unsafe path would
+// silently wrap to a negative int64 while the safe path rejected.
 func TestSafeUnsafeUint64LongOverflowParity(t *testing.T) {
 	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`)
 	if err != nil {
@@ -2639,9 +2645,9 @@ func (b *textBytesMarshaler) UnmarshalText(text []byte) error {
 // TestRegression_SerArrayStringTextMarshaler locks in that the
 // specialized array<string> ser path resolves a []byte-kind value that
 // also implements TextMarshaler via its text representation, not its
-// raw bytes. Pre-fix, serArray.serString diverged from the scalar
-// serString and silently encoded the raw bytes; the appendAvroString
-// helper consolidated all three sites.
+// raw bytes — matching scalar serString. The shared appendAvroString
+// helper enforces the precedence across all three sites (scalar,
+// array, map).
 func TestRegression_SerArrayStringTextMarshaler(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"string"}`)
 	encoded, err := s.AppendEncode(nil, []textBytesMarshaler{textBytesMarshaler("hello")})
@@ -2678,10 +2684,8 @@ func TestRegression_SerMapStringTextMarshaler(t *testing.T) {
 
 // TestRegression_JSONEncodeStringTextMarshaler locks in that the JSON
 // encoder for "string" picks TextMarshaler over the []byte fallback for
-// types that implement both. Pre-fix, appendAvroJSON's "string" case
-// checked []byte before TextMarshaler, so net.IP-style values JSON-
-// encoded as their raw bytes (interpreted as UTF-8) instead of their
-// text form.
+// types that implement both. net.IP-style values must JSON-encode as
+// their text form, not their raw bytes (interpreted as UTF-8).
 func TestRegression_JSONEncodeStringTextMarshaler(t *testing.T) {
 	s := MustParse(`"string"`)
 	v := textBytesMarshaler("hello")
@@ -2697,9 +2701,8 @@ func TestRegression_JSONEncodeStringTextMarshaler(t *testing.T) {
 
 // TestRegression_JSONDecodeStringTextUnmarshaler locks in that the JSON
 // decoder for "string" routes into TextUnmarshaler when the target
-// implements it, mirroring deserString. Pre-fix, decodeString skipped
-// TextUnmarshaler entirely and would either set the raw bytes (for
-// []byte targets) or error.
+// implements it, mirroring deserString. Without this routing, the
+// target would receive raw bytes ([]byte-kind targets) or an error.
 func TestRegression_JSONDecodeStringTextUnmarshaler(t *testing.T) {
 	s := MustParse(`"string"`)
 	var v textBytesMarshaler

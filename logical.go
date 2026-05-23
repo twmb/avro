@@ -143,13 +143,6 @@ func dateToTime(val int32) time.Time { return time.Unix(int64(val)*86400, 0).UTC
 // at UTC for the day count is the same shape used by
 // timeToLocalTimestamp* for the long-typed wall-clock logicals.
 //
-// Pre-fix this used floorDiv(t.Unix(), 86400) which is the UTC
-// instant's day. For a time.Time whose wall-clock date is D in a
-// non-UTC zone, the encoded day was D-1 or D+1 — wire value differed
-// from Java for the same calendar date, and a TZ-offset string like
-// "2020-01-01T00:00:00+05:00" encoded to a different day than the
-// bare "2020-01-01" form.
-//
 // Returns an error when the day count exceeds int32 range —
 // possible for time.Time values whose year falls outside roughly
 // ±5.8 million. Without the bounds check, int32(...) silent

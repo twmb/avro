@@ -7194,11 +7194,11 @@ func TestOmitzeroStringValue(t *testing.T) {
 
 // TestRegression_OmitzeroNullSecondUnion locks in that omitzero on a
 // null-SECOND union (["T","null"]) emits the correct null-branch index
-// (0x02 = zigzag 1), not 0x00. Pre-fix both the slow path
-// (serRecord.ser at ser.go:704) and the fast-path slow-fn fallback
-// (serRecordFast at unsafe.go:152) unconditionally emitted 0x00,
-// corrupting the wire for null-second unions — twmb couldn't even
-// decode its own output.
+// (0x02 = zigzag 1), not 0x00. Both the slow path (serRecord.ser at
+// ser.go:704) and the fast-path slow-fn fallback (serRecordFast at
+// unsafe.go:152) must look up the null branch's actual index;
+// unconditionally emitting 0x00 would corrupt the wire for null-
+// second unions — twmb couldn't even decode its own output.
 //
 // Slow-path case: bare struct value (non-addressable in some call
 // paths or hitting the reflect fallback). Triggers the ser.go shortcut.
@@ -8231,14 +8231,12 @@ func TestTimestampNanosDecodeUint(t *testing.T) {
 	}
 }
 
-// TestTimestampNanosDecodeIntoString previously asserted that decoding
-// timestamp-nanos into a *string ERRORED — that lock-in covered the
-// encoder/decoder asymmetry (encoder accepted RFC 3339 strings, decoder
-// rejected string targets). The asymmetry is now fixed: deserTimeAsLong
-// has a String arm that emits the RFC 3339 Nano form, so the round-trip
-// succeeds. See TestRegression_TimeLogicalStringRoundTrip for the full
-// matrix across all seven string-accepting time logicals; this test
-// keeps the original schema/input shape as a single-cell sanity check.
+// TestTimestampNanosDecodeIntoString pins decoder symmetry with the
+// encoder for timestamp-nanos into a *string. deserTimeAsLong has a
+// String arm that emits the RFC 3339 Nano form so the round-trip
+// succeeds. See TestRegression_TimeLogicalStringRoundTrip for the
+// full matrix across all seven string-accepting time logicals; this
+// test keeps a single-cell schema/input shape as a sanity check.
 func TestTimestampNanosDecodeIntoString(t *testing.T) {
 	schema := `{"type":"long","logicalType":"timestamp-nanos"}`
 	now := time.Now()
@@ -9817,13 +9815,14 @@ func TestFixedSliceRoundTrip(t *testing.T) {
 	}
 }
 
-// TestDecodeReuseAnyTarget covers the indirectAlloc fix. Before the fix,
-// decoding twice into the same *any panicked with "SetInt using
-// unaddressable value": the first decode populated *any with a concrete
-// (e.g. int32) value, and the second decode's indirectAlloc unwrapped the
-// non-nil interface to that unaddressable inner value, so SetInt panicked.
-// indirectAlloc now keeps the interface as the destination unless its
-// inner is a non-nil pointer (where the pointee IS addressable).
+// TestDecodeReuseAnyTarget covers indirectAlloc's interface-target
+// handling. indirectAlloc keeps the interface as the destination
+// unless its inner is a non-nil pointer (where the pointee IS
+// addressable). Without that guard, decoding twice into the same
+// *any panics with "SetInt using unaddressable value": the first
+// decode populates *any with a concrete (e.g. int32) value, and the
+// second decode unwraps the non-nil interface to that unaddressable
+// inner value, so SetInt panics.
 func TestDecodeReuseAnyTarget(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -10089,8 +10088,8 @@ func TestSetIntValueInterface(t *testing.T) {
 //
 // All tests below lock in safe/unsafe behavioral parity for primitive
 // numeric and float types decoded through the struct-field unsafe fast
-// path. Pre-fix the unsafe path silently truncated/wrapped values that
-// the safe path explicitly rejected.
+// path. Without parity, the unsafe path silently truncates/wraps
+// values that the safe path explicitly rejects.
 
 // Finding 1: udLong narrow signed truncation.
 func TestRegression_UdLongInt8Truncates(t *testing.T) {
@@ -10437,9 +10436,10 @@ func TestRegression_WriterUnionBranchMismatchFailsFast(t *testing.T) {
 // null-union fast path accepts non-canonical multi-byte varint
 // encodings of the branch index. Spec ("Binary encoding > Unions")
 // says the index is a generic int (varint); Java's BinaryDecoder.readIndex
-// calls readInt() which is a full multi-byte loop. Pre-fix our
-// fast paths peeked src[0] only and rejected anything other than 0x00 /
-// 0x02, breaking interop with producers that emit non-canonical varints.
+// calls readInt() which is a full multi-byte loop. A fast path that
+// peeks src[0] only and rejects anything other than 0x00 / 0x02
+// would break interop with producers that emit non-canonical
+// varints.
 func TestRegression_NullUnionNonCanonicalVarint(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":["null","int"]}]}`)
 	type rec struct {
@@ -10457,8 +10457,9 @@ func TestRegression_NullUnionNonCanonicalVarint(t *testing.T) {
 
 // TestRegression_LongDefaultPrecisionLoss verifies that long-typed
 // schema defaults > 2^53 round-trip exact (no float64 truncation).
-// Pre-fix, json.Unmarshal into any decoded all numeric defaults as
-// float64, silently rounding 9007199254740993 → 9007199254740992.
+// json.Unmarshal-into-any would decode numeric defaults as float64,
+// silently rounding 9007199254740993 → 9007199254740992;
+// unmarshalDefault uses UseNumber to preserve the integer.
 func TestRegression_LongDefaultPrecisionLoss(t *testing.T) {
 	const want = int64(9007199254740993)
 	src := `{"type":"record","name":"R","fields":[{"name":"x","type":"long","default":9007199254740993}]}`
@@ -10483,8 +10484,8 @@ func TestRegression_LongDefaultPrecisionLoss(t *testing.T) {
 // logical types (precision <= 0, scale > precision, missing precision,
 // precision exceeding fixed capacity) are rejected at parse time, matching
 // Java's LogicalTypes.Decimal.validate and fastavro's parse_schema.
-// Pre-fix the library silently stripped the logical type and treated the
-// schema as plain bytes/fixed — interop hazard.
+// Silently stripping the logical type and treating the schema as plain
+// bytes/fixed would be an interop hazard.
 func TestRegression_InvalidDecimalRejected(t *testing.T) {
 	cases := []struct {
 		name, schema string
@@ -10504,11 +10505,12 @@ func TestRegression_InvalidDecimalRejected(t *testing.T) {
 }
 
 // TestRegression_DecimalNaNInfNoPanic verifies that encoding non-finite
-// floats (NaN, ±Inf) into decimal-typed schemas does not panic. Pre-fix
-// tryCoerceToRat returned (nil, true) because (*big.Rat).SetFloat64
-// returns nil for non-finite values, and downstream serRat / FloatString
-// dereferenced the nil pointer. Java/fastavro/goavro all reject these
-// inputs with a typed error rather than crash.
+// floats (NaN, ±Inf) into decimal-typed schemas does not panic.
+// tryCoerceToRat must guard against (*big.Rat).SetFloat64 returning
+// nil for non-finite values; without the guard, downstream
+// serRat / FloatString dereferences the nil pointer. Java/fastavro/
+// goavro all reject these inputs with a typed error rather than
+// crash.
 func TestRegression_DecimalNaNInfNoPanic(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -10571,10 +10573,9 @@ func TestRegression_CanonicalU2028Escaping(t *testing.T) {
 // that union resolution does a two-pass scan: exact-kind branches win
 // over promotion branches even when the promotion branch comes first
 // in declaration order. Matches Java's bestBranch
-// (ResolvingGrammarGenerator.java) and fastavro. Pre-fix the library
-// did a single pass and silently picked the first promotion match,
-// producing float64 for an int writer when the reader was
-// ["double","int"].
+// (ResolvingGrammarGenerator.java) and fastavro. A single-pass scan
+// would silently pick the first promotion match, producing float64
+// for an int writer when the reader is ["double","int"].
 func TestRegression_UnionResolutionPrefersExactKindOverPromotion(t *testing.T) {
 	t.Run("writer non-union, reader union with promotion before exact", func(t *testing.T) {
 		writer := MustParse(`"int"`)
@@ -10619,10 +10620,11 @@ func TestRegression_UnionResolutionPrefersExactKindOverPromotion(t *testing.T) {
 // TestRegression_DecodeJSON_FixedLengthMismatch locks in JSON-decoder
 // length validation for fixed types. Per Avro 1.12 JSON spec, a fixed
 // value is encoded as a JSON string whose code points are the bytes
-// of the value; length must equal schema's size. Java's JsonDecoder.readFixed
-// throws when the lengths differ; fastavro raises ValueError. Pre-fix,
-// the library silently truncated, zero-padded, or returned the wrong
-// length depending on the target type.
+// of the value; length must equal schema's size. Java's
+// JsonDecoder.readFixed throws when the lengths differ; fastavro
+// raises ValueError. Without the length check, the decoder would
+// silently truncate, zero-pad, or return the wrong length depending
+// on the target type.
 func TestRegression_DecodeJSON_FixedLengthMismatch(t *testing.T) {
 	schema := `{"type":"fixed","name":"F","size":4}`
 	s := MustParse(schema)
@@ -10712,8 +10714,8 @@ func TestRegression_DecodeArrayOfNullCumulativeAcrossBlocks(t *testing.T) {
 
 // TestRegression_DecodeArrayOfEmptyRecord verifies that arrays whose
 // items take 0 wire bytes (empty record) decode correctly up to the cap.
-// Pre-fix, the nullItem bool only handled primitive null, not records-
-// that-encode-to-zero-bytes.
+// The zero-byte-item detector must include records-that-encode-to-
+// zero-bytes, not just primitive null.
 func TestRegression_DecodeArrayOfEmptyRecord(t *testing.T) {
 	sch := MustParse(`{"type":"array","items":{"type":"record","name":"E","fields":[]}}`)
 	var data []byte
@@ -10746,10 +10748,11 @@ func TestRegression_DecodeArrayOfRecordWithAllNullFields(t *testing.T) {
 }
 
 // TestRegression_TimeMicrosAnyVsDurationParity locks in that *any and
-// *time.Duration paths agree on overflow handling. Pre-fix the
-// *time.Duration arm errored on val > MaxInt64/Microsecond; the *any
-// arm silently wrapped via time.Duration(val) * time.Microsecond,
-// delivering a wrong typed value to user code.
+// *time.Duration paths agree on overflow handling. Both arms must
+// error on val > MaxInt64/Microsecond; without parity, the *any arm
+// silently wraps via time.Duration(val) * time.Microsecond,
+// delivering a wrong typed value to user code while the
+// *time.Duration arm errors.
 func TestRegression_TimeMicrosAnyVsDurationParity(t *testing.T) {
 	sch := MustParse(`{"type":"long","logicalType":"time-micros"}`)
 	encSch := MustParse(`"long"`)
@@ -10776,8 +10779,8 @@ func TestRegression_TimeMicrosAnyVsDurationParity(t *testing.T) {
 // unsigned 8-bit byte values 0-255". Java decodes JSON strings into
 // Java Strings (UTF-8 → UTF-16) then maps each char to a byte via
 // ISO-8859-1; fastavro does the same via str.encode("iso-8859-1").
-// Pre-fix the library walked raw input bytes one-by-one, so JSON
-// literal "é" (UTF-8 c3 a9) decoded to two output bytes [0xC3, 0xA9]
+// twmb must apply codepoint mapping; walking raw input bytes one-by-
+// one would decode JSON literal "é" (UTF-8 c3 a9) to [0xC3, 0xA9]
 // instead of the spec-correct [0xE9].
 func TestRegression_JSONBytesUnicodeCharCodepointSemantics(t *testing.T) {
 	sch := MustParse(`"bytes"`)
@@ -10803,8 +10806,8 @@ func TestRegression_JSONBytesUnicodeCharCodepointSemantics(t *testing.T) {
 // TestRegression_DecimalPrecisionEnforcedOnEncode locks in that the
 // encoder rejects decimal values whose unscaled magnitude exceeds the
 // schema's declared precision. Java (Conversions.DecimalConversion),
-// fastavro, and hamba/avro all enforce this on encode; pre-fix the
-// library silently encoded oversized values without error.
+// fastavro, and hamba/avro all enforce this on encode; silently
+// encoding oversized values would diverge from every reference impl.
 func TestRegression_DecimalPrecisionEnforcedOnEncode(t *testing.T) {
 	t.Run("bytes", func(t *testing.T) {
 		schema := MustParse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`)
@@ -10828,8 +10831,8 @@ func TestRegression_DecimalPrecisionEnforcedOnEncode(t *testing.T) {
 // Per Avro 1.12 + Java reference (TimeConversions.LocalTimestampMillisConversion
 // uses LocalDateTime.toInstant(ZoneOffset.UTC)) and fastavro's
 // data.replace(tzinfo=datetime.timezone.utc), local-timestamp encodes
-// the wall-clock fields as-if-UTC. Pre-fix the encoder used t.UnixMilli()
-// which encoded the absolute UTC moment, breaking interop for non-UTC
+// the wall-clock fields as-if-UTC. Using t.UnixMilli() would encode
+// the absolute UTC moment instead, breaking interop for non-UTC
 // inputs.
 func TestRegression_LocalTimestampMillisNonUTCWallClock(t *testing.T) {
 	schema := MustParse(`{"type":"long","logicalType":"local-timestamp-millis"}`)
@@ -10878,9 +10881,8 @@ func TestRegression_UdArrayNullUnionPtrInt8Truncates(t *testing.T) {
 // deserTimestamp{Millis,Micros,Nanos} and deserDate handle the same
 // five target shapes (any, time.Time, typed-interface-implemented-by-
 // time.Time, typed-interface-not-implemented, plain integer) in lockstep.
-// Pre-fix each had its own inline interface guard; consolidating into
-// deserTimeAsLong + setIface gave them shared behavior and prevents
-// drift across future setIface changes.
+// All four sites route through deserTimeAsLong + setIface so the
+// interface guard is shared and can't drift across changes.
 func TestRegression_TimestampDeserParity(t *testing.T) {
 	type stringerIface interface{ String() string } // time.Time implements
 	type unsupported interface{ Mock() }            // time.Time does not
@@ -10955,12 +10957,11 @@ func TestRegression_TimestampDeserParity(t *testing.T) {
 // TestRegression_DecimalBytesJSONEncodeSpecForm locks in that EncodeJSON
 // for a decimal-on-bytes logical type emits the spec / Java / fastavro
 // codepoint-mapped string form (e.g. "!" for unscaled=33 / scale=2),
-// not the bare-number form (0.33) the library used pre-fix. The
-// pre-fix output was incompatible with Java's JsonDecoder.readBytes
-// (which throws on VALUE_NUMBER_FLOAT) and fastavro's
-// AvroJSONDecoder.read_bytes (which calls .encode("iso-8859-1") on the
-// JSON string). See checkWriterUnion / decodeBytes doc comments for
-// the spec citation.
+// not the bare-number form (0.33). The bare-number form is
+// incompatible with Java's JsonDecoder.readBytes (which throws on
+// VALUE_NUMBER_FLOAT) and fastavro's AvroJSONDecoder.read_bytes
+// (which calls .encode("iso-8859-1") on the JSON string). See
+// checkWriterUnion / decodeBytes doc comments for the spec citation.
 func TestRegression_DecimalBytesJSONEncodeSpecForm(t *testing.T) {
 	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
 	out, err := s.EncodeJSON(new(big.Rat).SetFrac64(33, 100))
@@ -10974,10 +10975,10 @@ func TestRegression_DecimalBytesJSONEncodeSpecForm(t *testing.T) {
 
 // TestRegression_DecimalBytesUnionJSONRoundTrip locks in that
 // EncodeJSON / DecodeJSON round-trip a decimal-bytes value when it is
-// a non-null branch of a union. Pre-fix two bugs combined: EncodeJSON
-// emitted 0.33 (non-spec) and the union dispatch table refused to
-// route digit tokens to bytes/fixed branches, so DecodeJSON could not
-// consume EncodeJSON's own output.
+// a non-null branch of a union. Two failure modes: EncodeJSON
+// emitting 0.33 (non-spec) and the union dispatch table refusing to
+// route digit tokens to bytes/fixed branches; either alone breaks
+// EncodeJSON ↔ DecodeJSON round-trip.
 func TestRegression_DecimalBytesUnionJSONRoundTrip(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"v","type":["null",{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}]}
@@ -10994,10 +10995,10 @@ func TestRegression_DecimalBytesUnionJSONRoundTrip(t *testing.T) {
 }
 
 // TestRegression_DecimalBytesUnionJSONLenientNumberDecode locks in
-// that DecodeJSON still accepts the bare-number form (0.33) inside a
-// union branch even after the encode-side switched to the spec form.
-// Hand-edited JSON or alternate-tool input (e.g. the pre-fix output of
-// this library) must keep working as a decode input.
+// that DecodeJSON accepts the bare-number form (0.33) inside a
+// union branch even when the encode-side emits the spec form. Hand-
+// edited JSON or alternate-tool input must keep working as a decode
+// input.
 func TestRegression_DecimalBytesUnionJSONLenientNumberDecode(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"v","type":["null",{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}]}
@@ -11021,11 +11022,11 @@ func TestRegression_DecimalBytesUnionJSONLenientNumberDecode(t *testing.T) {
 
 // TestRegression_TimeMicrosJSONOverflowParity locks in that the JSON
 // decoder rejects out-of-range time-micros values when decoding to
-// *time.Duration, matching the binary path's overflow guard. Pre-fix
-// the binary path errored but the JSON path silently wrapped via
-// timeMicrosToDuration's val * time.Microsecond multiplication. The
-// guard now lives inside timeMicrosToDuration so all callers (binary
-// safe, binary unsafe, JSON any, JSON typed) reject uniformly.
+// *time.Duration, matching the binary path's overflow guard. The
+// guard lives inside timeMicrosToDuration so all callers (binary
+// safe, binary unsafe, JSON any, JSON typed) reject uniformly;
+// without it, the JSON path silently wraps via val * time.Microsecond
+// while the binary path errors.
 func TestRegression_TimeMicrosJSONOverflowParity(t *testing.T) {
 	schema := MustParse(`{"type":"long","logicalType":"time-micros"}`)
 	bigVal := int64(math.MaxInt64/1000) + 1
@@ -11040,8 +11041,8 @@ func TestRegression_TimeMicrosJSONOverflowParity(t *testing.T) {
 
 // TestRegression_TimeMicrosJSONOverflowAnyPath is the *any companion:
 // the same overflow must also fail when DecodeJSON targets a *any
-// (which routes through decodeLogicalLong). Pre-fix that path
-// produced time.Duration(-2562047h47m16s) silently.
+// (which routes through decodeLogicalLong). Without the shared
+// guard, the *any path silently produces time.Duration(-2562047h47m16s).
 func TestRegression_TimeMicrosJSONOverflowAnyPath(t *testing.T) {
 	schema := MustParse(`{"type":"long","logicalType":"time-micros"}`)
 	bigVal := int64(math.MaxInt64/1000) + 1
@@ -11057,10 +11058,10 @@ func TestRegression_TimeMicrosJSONOverflowAnyPath(t *testing.T) {
 // TestRegression_UnionWithoutNullBranchAcceptsJsonNull locks in that
 // DecodeJSON rejects a null token when the union schema has no null
 // branch. Java's JsonDecoder.readIndex and fastavro's read_index both
-// reject (synthesize "null" label, look it up in the branch list, fail
-// if absent). Pre-fix decodeUnion short-circuited on the 'n' peek byte
-// regardless of branch list, silently consuming null and either
-// zeroing the target or leaving it untouched.
+// reject (synthesize "null" label, look it up in the branch list,
+// fail if absent). decodeUnion must check the branch list before
+// short-circuiting on the 'n' peek byte; otherwise it silently
+// consumes null and either zeroes the target or leaves it untouched.
 func TestRegression_UnionWithoutNullBranchAcceptsJsonNull(t *testing.T) {
 	schema := MustParse(`["int","string"]`)
 	var v any
@@ -11075,12 +11076,10 @@ type rTagLong struct {
 
 // TestRegression_SchemaForLongDefaultPrecisionLoss locks in that
 // SchemaFor preserves long defaults > 2^53 when reading the default=
-// struct tag. Pre-fix the JSON-unmarshal of the default went through
-// float64, turning 9223372036854775807 (MaxInt64) into the next
-// representable float64 9.223372036854776e+18, which downstream Parse
-// then rejected via floatFitsInt64. Mirrors unmarshalDefault on the
-// Parse path; the two sites must stay in lockstep on number-precision
-// handling.
+// struct tag. The default-value pipeline through SchemaFor uses
+// arbitrary-precision parsing so values like MaxInt64 round-trip
+// exactly. Mirrors unmarshalDefault on the Parse path; the two sites
+// must stay in lockstep on number-precision handling.
 func TestRegression_SchemaForLongDefaultPrecisionLoss(t *testing.T) {
 	reader, err := SchemaFor[rTagLong]()
 	if err != nil {
@@ -11109,9 +11108,8 @@ func TestRegression_SchemaForLongDefaultPrecisionLoss(t *testing.T) {
 // TestRegression_UUIDStringJSONEncodeFromArrayParity locks in that
 // JSON encode of a string-backed UUID accepts a [16]byte input and
 // canonicalizes it to the RFC 4122 hex-dash form, matching the
-// binary serUUID. Pre-fix the JSON path's "string" case rejected
-// [16]byte with "cannot use [16]uint8 with Avro type string"
-// because avroStringValue had no UUID pre-pass.
+// binary serUUID. avroStringValue runs a UUID pre-pass on [16]byte
+// inputs before the generic string-target dispatch.
 func TestRegression_UUIDStringJSONEncodeFromArrayParity(t *testing.T) {
 	schema := MustParse(`{"type":"string","logicalType":"uuid"}`)
 	u := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
@@ -11146,9 +11144,10 @@ func TestRegression_UUIDStringJSONDecodeIntoArrayParity(t *testing.T) {
 
 // TestRegression_UUIDFixedJSONEncodeFromString locks in that JSON
 // encode of a fixed(16) UUID accepts a hex-dash string input and
-// parses it to 16 bytes, matching serFixedUUIDReflect. Pre-fix the
-// JSON "fixed" case rejected the 36-char string with
-// "fixed size mismatch: got 36 bytes, need 16".
+// parses it to 16 bytes, matching serFixedUUIDReflect. The
+// JSON "fixed" case routes through the UUID pre-pass when the
+// schema carries `logicalType:"uuid"`, so the 36-char hex-dash
+// string is parsed before the generic fixed-size check applies.
 func TestRegression_UUIDFixedJSONEncodeFromString(t *testing.T) {
 	schema := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
 	const s = "550e8400-e29b-41d4-a716-446655440000"
@@ -11174,8 +11173,8 @@ func TestRegression_UUIDFixedJSONEncodeFromString(t *testing.T) {
 
 // TestRegression_UUIDFixedJSONDecodeIntoString locks in that JSON
 // decode of a fixed(16) UUID into a string target produces the RFC
-// 4122 hex-dash form, matching deserFixedUUIDReflect. Pre-fix
-// assignBytes returned the raw 16 bytes as a string.
+// 4122 hex-dash form (canonical UUID text), matching
+// deserFixedUUIDReflect's binary-path output.
 func TestRegression_UUIDFixedJSONDecodeIntoString(t *testing.T) {
 	schema := MustParse(`{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`)
 	u := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
@@ -11219,10 +11218,10 @@ func TestRegression_UUIDFixedJSONDecodeIntoAny(t *testing.T) {
 // TestRegression_ArrayLongTimeMicrosBypassesLogicalSer locks in that
 // the specialized array<long> ser path does NOT silently skip the
 // time-micros logical conversion when the user provides
-// []time.Duration. Pre-fix the specialization was selected purely on
-// af.canon.primitive == "long", ignoring the inner's logical type, so
-// the encoder appendVarlong'd raw nanoseconds (1500*time.Microsecond
-// = 1500000 ns) instead of the spec-required microseconds (1500).
+// []time.Duration. The specialization selector must inspect the
+// inner's logical type, not just af.canon.primitive — otherwise the
+// encoder appendVarlong's raw nanoseconds (1500*time.Microsecond =
+// 1500000 ns) instead of the spec-required microseconds (1500).
 func TestRegression_ArrayLongTimeMicrosBypassesLogicalSer(t *testing.T) {
 	s := MustParse(`{"type":"array","items":{"type":"long","logicalType":"time-micros"}}`)
 	in := []time.Duration{1500 * time.Microsecond}
@@ -11283,9 +11282,9 @@ func TestRegression_ArrayIntTimeMillisBypassesLogicalSer(t *testing.T) {
 
 // TestRegression_ArrayLongTimestampMillisAcceptsTime locks in that
 // array<long, timestamp-millis> accepts []time.Time, matching the
-// scalar serTimestampMillis. Pre-fix the specialized serArray.serLong
-// was selected and rejected time.Time as "cannot use time.Time with
-// Avro type long".
+// scalar serTimestampMillis. The specialized serArray.serLong must
+// inspect the inner's logical type so the time-millis arm fires for
+// time.Time inputs rather than the bare-long rejection.
 func TestRegression_ArrayLongTimestampMillisAcceptsTime(t *testing.T) {
 	s := MustParse(`{"type":"array","items":{"type":"long","logicalType":"timestamp-millis"}}`)
 	in := []time.Time{time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}
@@ -11296,9 +11295,10 @@ func TestRegression_ArrayLongTimestampMillisAcceptsTime(t *testing.T) {
 
 // TestRegression_ArrayStringUUIDAccepts16Byte locks in that
 // array<string, uuid> accepts [][16]byte, matching the scalar serUUID
-// (which canonicalizes [16]byte to hex-dash). Pre-fix the specialized
-// serArray.serString was selected and rejected [16]byte as "cannot
-// use [16]uint8 with Avro type string".
+// (which canonicalizes [16]byte to hex-dash). The specialized
+// serArray.serString consults the inner's logical type so the UUID
+// pre-pass applies before the generic string-target dispatch rejects
+// [16]byte.
 func TestRegression_ArrayStringUUIDAccepts16Byte(t *testing.T) {
 	s := MustParse(`{"type":"array","items":{"type":"string","logicalType":"uuid"}}`)
 	u := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
@@ -11309,10 +11309,9 @@ func TestRegression_ArrayStringUUIDAccepts16Byte(t *testing.T) {
 
 // TestRegression_RecordArrayTimeMillisAddrVsByValParity locks in that
 // the same record + same data produces the same wire bytes regardless
-// of input addressability. Pre-fix the addressable path took the
-// unsafe fast path (correct via usTimeMillis); the by-value path took
-// the safe specialized serArray.serInt (silently encoded raw
-// nanoseconds — 1000x off).
+// of input addressability — the unsafe fast path (addressable) and
+// the safe specialized serArray.serInt (by-value) must agree on the
+// time-millis conversion, not silently encode raw nanoseconds.
 func TestRegression_RecordArrayTimeMillisAddrVsByValParity(t *testing.T) {
 	type R struct {
 		Vs []time.Duration `avro:"vs"`
@@ -11331,10 +11330,9 @@ func TestRegression_RecordArrayTimeMillisAddrVsByValParity(t *testing.T) {
 
 // TestRegression_RecordArrayIntPtrAddrVsByValParity locks in that
 // addressable and by-value record encoding produce the same result for
-// a []*int32 array field. Pre-fix the unsafe fast path handled the
-// pointer indirection (pp := *(*unsafe.Pointer)(p)); the safe
-// specialized serArray.serInt only unwrapped reflect.Interface, not
-// reflect.Pointer, and rejected *int32 elements.
+// a []*int32 array field. The safe specialized serArray.serInt must
+// unwrap both reflect.Interface AND reflect.Pointer (matching the
+// unsafe fast path's pp := *(*unsafe.Pointer)(p) indirection).
 func TestRegression_RecordArrayIntPtrAddrVsByValParity(t *testing.T) {
 	type R struct {
 		Vs []*int32 `avro:"vs"`
@@ -11356,10 +11354,10 @@ func TestRegression_RecordArrayIntPtrAddrVsByValParity(t *testing.T) {
 // EncodeJSON for local-timestamp-millis encodes wall-clock fields
 // as-if-UTC, matching the binary path (serLocalTimestampMillis), Java
 // (TimeConversions.LocalTimestampMillisConversion: toInstant(ZoneOffset.UTC))
-// and fastavro (data.replace(tzinfo=datetime.timezone.utc)). Pre-fix
-// the JSON path used timeToTimestampMillis (= UnixMilli, the absolute
-// moment), so the same time.Time produced different binary vs JSON
-// wire values for non-UTC inputs.
+// and fastavro (data.replace(tzinfo=datetime.timezone.utc)). Using
+// the absolute-moment conversion (timeToTimestampMillis = UnixMilli)
+// would produce different binary vs JSON wire values for non-UTC
+// inputs.
 func TestRegression_LocalTimestampMillisJSONEncodeNonUTC(t *testing.T) {
 	schema := MustParse(`{"type":"long","logicalType":"local-timestamp-millis"}`)
 	nyc := time.FixedZone("NYC", -5*3600)
@@ -11424,12 +11422,11 @@ func TestRegression_LocalTimestampMillisJSONEncodeFromString(t *testing.T) {
 }
 
 // TestRegression_DefaultJSONIgnoresTaggedUnions locks in that
-// missing-field record defaults respect encoder options. Pre-fix the
-// missing-field path spliced a pre-marshalled f.defaultJSON (just
-// json.Marshal of the parsed default), bypassing the appendAvroJSON
-// dispatch — so under TaggedUnions a "hello" union default emitted
-// "hello" instead of {"string":"hello"}, the form Java/fastavro
-// JsonDecoder require.
+// missing-field record defaults respect encoder options. Missing-field
+// defaults route through the full appendAvroJSON dispatch — so under
+// TaggedUnions a "hello" union default emits {"string":"hello"} (the
+// form Java/fastavro JsonDecoder require) rather than the bare
+// pre-marshalled value.
 func TestRegression_DefaultJSONIgnoresTaggedUnions(t *testing.T) {
 	s := MustParse(`{
 		"type": "record", "name": "R",
@@ -11460,8 +11457,9 @@ func TestRegression_DefaultJSONIgnoresTaggedUnions(t *testing.T) {
 
 // TestRegression_NestedDefaultJSONIgnoresTaggedUnions locks in the
 // recursive variant: a record default whose inner field is a non-null
-// union must wrap the inner value under TaggedUnions. Pre-fix the
-// splice emitted the bare default verbatim regardless of nesting.
+// union must wrap the inner value under TaggedUnions. The encoder
+// recursively re-dispatches into appendAvroJSON for nested defaults
+// rather than splicing them verbatim.
 func TestRegression_NestedDefaultJSONIgnoresTaggedUnions(t *testing.T) {
 	s := MustParse(`{
 		"type": "record", "name": "Outer",
@@ -11493,9 +11491,8 @@ func TestRegression_NestedDefaultJSONIgnoresTaggedUnions(t *testing.T) {
 // silently wrapping. Java's Instant.toEpochMilli and
 // TimestampMicrosConversion.toLong (Math.multiplyExact / Math.addExact)
 // throw ArithmeticException on the same input; Go's UnixMilli /
-// UnixMicro are documented as "undefined" for out-of-range times. The
-// timeToTimestampNanos path already had this guard; the millis/micros
-// variants were missed.
+// UnixMicro are documented as "undefined" for out-of-range times.
+// timeToTimestampNanos has an analogous guard.
 //
 // Year 300_000 overflows micros (MaxInt64µs ≈ year 294246); year
 // 300_000_000 overflows millis (MaxInt64ms ≈ year 292M).
@@ -11564,12 +11561,11 @@ func TestRegression_TimestampMillisMicrosUnsafeOverflow(t *testing.T) {
 
 // TestRegression_DecodeJSONLongOverflowGap locks in that JSON-encoded
 // long values exceeding int64 are rejected, not silently wrapped.
-// parseJSONInt64 used a "n*10+d wrapped if it went down" check that
-// has a gap once n is near 2^64/9: n*10+d wraps mod 2^64 to a value
-// still ≥ prev, evading detection. The post-loop n > MaxInt64 guard
-// then accepts the wrapped value because it's below MaxInt64 even
-// though the input wasn't. Pre-fix all ten 20-digit inputs of the
-// form 2049638230412172402d (d ∈ 0..9) silently mis-parsed.
+// parseJSONInt64 uses a per-digit pre-multiply bound that's safe near
+// 2^64/9 (the boundary where the naive "n*10+d wrapped if it went
+// down" post-multiply check has a gap — n*10+d can wrap mod 2^64 to
+// a value still ≥ prev, evading detection). The 20-digit family
+// 2049638230412172402d (d ∈ 0..9) probes that boundary.
 //
 // Java: JsonParser.getLongValue throws InputCoercionException.
 // goavro: strconv.ParseInt rejects.
@@ -11638,11 +11634,11 @@ func TestRegression_DecodeJSONLongOverflowGap(t *testing.T) {
 // TestRegression_DeserFixedArrayBlockCountOverflow locks in that
 // decoding into a fixed-size Go array [N]T errors instead of panicking
 // when the wire's block count would overflow the int64 idx+count
-// arithmetic. Pre-fix the bound check `idx+int(count) > arrLen`
-// wrapped for count near MaxInt64, bypassing the guard and panicking
-// on v.Index(idx) when idx exceeded arrLen. The new check uses
-// `count > int64(arrLen-idx)` which compares two non-negative int64
-// values without wrap risk.
+// arithmetic. The bound check uses `count > int64(arrLen-idx)` —
+// comparing two non-negative int64 values without wrap risk — rather
+// than the `idx+int(count) > arrLen` form which wraps for count near
+// MaxInt64 and would otherwise let an attacker-controlled count panic
+// v.Index(idx) when idx exceeds arrLen.
 func TestRegression_DeserFixedArrayBlockCountOverflow(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"null"}`)
 	enc := func(n int64) []byte {
@@ -11669,12 +11665,11 @@ func TestRegression_DeserFixedArrayBlockCountOverflow(t *testing.T) {
 
 // TestRegression_SkipArrayBlockCountOverflow locks in that schema
 // resolution dropping an array<null> field doesn't hang on a hostile
-// wire. Pre-fix the totalItems += count accumulator wrapped to
-// MinInt64+999 when block 1 count = 4000 + block 2 count =
-// MaxInt64-3000, bypassing the maxZeroByteItems cap. The inner loop
-// then ran ~MaxInt64 iterations of skipNull (a no-op), hanging the
-// process. The new pre-add check `count > maxZeroByteItems-totalItems`
-// catches this without wrapping.
+// wire. The pre-add check `count > maxZeroByteItems-totalItems`
+// catches accumulator wraparound: a totalItems += count form would
+// wrap to MinInt64+999 for block 1 count=4000 + block 2 count=
+// MaxInt64-3000, bypass the maxZeroByteItems cap, and run ~MaxInt64
+// iterations of skipNull (a no-op), hanging the process.
 func TestRegression_SkipArrayBlockCountOverflow(t *testing.T) {
 	writer := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"drop","type":{"type":"array","items":"null"}},
@@ -11822,14 +11817,14 @@ func TestRegression_UdArrayDirectBlockCountOverflow(t *testing.T) {
 
 // TestRegression_TimestampMillisMinInt64 locks in that
 // timeToTimestampMillis accepts time.Time values constructed from
-// MinInt64 milliseconds since epoch. Pre-fix the symmetric guard
-// `sec > maxSec || sec < -maxSec` rejected sec = -maxSec - 1
-// (= -9223372036854776), which is the seconds component of
-// time.UnixMilli(MinInt64) after Go's normalization (since the
-// remainder is negative, normalization decrements sec by 1 and adds
-// 1e9 to nsec). Java's Instant.toEpochMilli has an adjustment branch
-// for sec < 0 && nsec > 0 — `(sec+1)*1000 + (nsec/1e6 - 1000)` —
-// that accepts the full int64 range; we now mirror it.
+// MinInt64 milliseconds since epoch. Go's time normalization makes
+// the seconds component of time.UnixMilli(MinInt64) = -maxSec - 1
+// (since the remainder is negative, normalization decrements sec by
+// 1 and adds 1e9 to nsec). We mirror Java's Instant.toEpochMilli
+// adjustment branch for sec < 0 && nsec > 0 —
+// `(sec+1)*1000 + (nsec/1e6 - 1000)` — which accepts the full int64
+// range. A naive symmetric guard `sec > maxSec || sec < -maxSec`
+// would reject sec = -maxSec - 1.
 func TestRegression_TimestampMillisMinInt64(t *testing.T) {
 	in := time.UnixMilli(math.MinInt64).UTC()
 	type R struct {
@@ -11856,8 +11851,8 @@ func TestRegression_TimestampMicrosMinInt64(t *testing.T) {
 }
 
 // TestRegression_TimestampMillisMinInt64UnsafePath — the unsafe
-// struct-fast-path (usTimestampMillis) calls the same helper, so the
-// fix propagates automatically. This test pins that.
+// struct-fast-path (usTimestampMillis) calls the same helper so the
+// MinInt64 acceptance propagates automatically. This test pins that.
 func TestRegression_TimestampMillisMinInt64UnsafePath(t *testing.T) {
 	type R struct {
 		T time.Time `avro:"t"`
@@ -11874,8 +11869,8 @@ func TestRegression_TimestampMillisMinInt64UnsafePath(t *testing.T) {
 
 // TestRegression_LocalTimestampMillisMinInt64 — local-timestamp
 // variants delegate to the timestamp-* helpers, inheriting the same
-// fix. Java's LocalTimestampMillisConversion.toLong (line 274-277)
-// also delegates to TimestampMillisConversion.toLong.
+// MinInt64 acceptance. Java's LocalTimestampMillisConversion.toLong
+// (line 274-277) similarly delegates to TimestampMillisConversion.toLong.
 func TestRegression_LocalTimestampMillisMinInt64(t *testing.T) {
 	in := time.UnixMilli(math.MinInt64).UTC()
 	type R struct {
@@ -11933,14 +11928,13 @@ func TestRegression_DecodeJSONCustomDecoderConcurrentRace(t *testing.T) {
 
 // TestRegression_EncodeJSONNilPtrIntoNonNullableUnion locks in that
 // EncodeJSON of a nil *T into a union that doesn't contain "null"
-// errors instead of silently emitting "null". The early return in
-// appendAvroJSON treated every union as nullable; the binary path
-// (serUnion.ser → branch tryAll) correctly errors with "no matching
-// branch", and Java/fastavro reject the same input
-// (UnresolvedUnionException / "do not match"). The library's own
-// DecodeJSON also rejects null against a no-null union (see
-// TestRegression_UnionWithoutNullBranchAcceptsJsonNull) — so the bug
-// produced output the same library couldn't read back.
+// errors instead of silently emitting "null". The binary path
+// (serUnion.ser → branch tryAll) errors with "no matching branch",
+// Java/fastavro reject the same input (UnresolvedUnionException /
+// "do not match"), and the library's own DecodeJSON rejects null
+// against a no-null union (see
+// TestRegression_UnionWithoutNullBranchAcceptsJsonNull). Encoding
+// "null" here would produce output the library can't read back.
 func TestRegression_EncodeJSONNilPtrIntoNonNullableUnion(t *testing.T) {
 	s := MustParse(`["int","string"]`)
 	var p *int
@@ -11951,7 +11945,7 @@ func TestRegression_EncodeJSONNilPtrIntoNonNullableUnion(t *testing.T) {
 }
 
 // TestRegression_EncodeJSONNilInterfaceIntoNonNullableUnion is the
-// nil-any sibling — same bug, same fix.
+// nil-any sibling of the nil-pointer reject above.
 func TestRegression_EncodeJSONNilInterfaceIntoNonNullableUnion(t *testing.T) {
 	s := MustParse(`["int","string"]`)
 	var x any
@@ -11978,22 +11972,21 @@ func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
 
 // TestRegression_EncodeJSONNullParity locks binary↔JSON encode parity
 // for the plain "null" Avro type across every site that reaches serNull
-// or appendAvroJSON's case "null" arm. Pre-fix #1 (JSON branch added the
-// errNonNil check): the JSON encoder's `case "null"` arm in
-// appendAvroJSON emitted the literal `null` regardless of v's content,
-// while binary serNull (ser.go:281) rejected non-nil with errNonNil —
-// silently dropping the user's input on the JSON path. Pre-fix #2
-// (serNull added the Interface peel): the generic serUnion / serArray /
-// serMap dispatch calls serNull with iter.Value() Kind=Interface
-// wrapping a typed-nil; binary returned errNonNil while JSON's indirect
-// loop unwrapped the interface and emitted "null" — the same input
-// produced opposite results. The 2-branch [null,T] optimization wasn't
-// affected (serNullUnionAt → isNilValue already peels interfaces) which
-// is why this hid through ~79 audits: every typical 2-branch null
-// shape worked.
+// or appendAvroJSON's case "null" arm. Both paths must:
 //
-// The matrix covers both directions of parity (reject and accept) at
-// the four sites that route through serNull's kind-switch:
+//   (1) reject non-nil non-nilable values with errNonNil (the JSON
+//       arm cannot just emit literal `null` regardless of v's content).
+//   (2) accept typed-nil values arriving via an Interface wrapper —
+//       generic serUnion / serArray / serMap dispatch calls serNull
+//       with iter.Value() Kind=Interface wrapping a typed-nil, and
+//       both sides must peel the interface before the kind switch.
+//
+// The 2-branch [null,T] optimization is unaffected (serNullUnionAt →
+// isNilValue peels interfaces); the parity concern is the 3+ branch
+// union dispatch and the array<null>/map<null>/null-typed-field cases.
+//
+// The matrix covers both directions (reject and accept) at the four
+// sites that route through serNull's kind-switch:
 //
 //  1. Top-level "null" schema (Schema.Encode / Schema.EncodeJSON).
 //  2. Null-typed record field — value goes through f.fn = serNull.
@@ -12058,12 +12051,12 @@ func TestRegression_EncodeJSONNullParity(t *testing.T) {
 	// ---- Accept arm: typed-nil wrapped in any() must be recognized as
 	// null at every dispatch site that calls serNull on iter.Value()
 	// (the wrapped-Interface form). The 2-branch [null,T] case at the
-	// top-level uses serNullUnionAt → isNilValue and was already
-	// indirect-aware; the cases below all route through the generic
-	// serNull whose pre-fix kind switch saw Kind=Interface IsNil=false
-	// (the interface holds type info even though the wrapped value is
-	// a nil pointer/map). Each subtest exercises one of the four sites
-	// and asserts binary == JSON outcome.
+	// top-level uses serNullUnionAt → isNilValue and is indirect-aware
+	// by construction; the cases below all route through the generic
+	// serNull which must peel the Interface wrapper before its kind
+	// switch (a bare Kind=Interface IsNil=false check would miss
+	// typed-nil maps/pointers wrapped via any()). Each subtest exercises
+	// one of the four sites and asserts binary == JSON outcome.
 
 	parity := func(t *testing.T, s *Schema, in any) {
 		t.Helper()
@@ -12317,34 +12310,26 @@ func TestRegression_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 
 // TestRegression_EncodeJSONNullBytesUnionParity locks the "Go nil =
 // absent → null branch" semantic uniformly across union arities and
-// encoders. Pre-fix the dispatch logic was inconsistent on three axes:
+// encoders. All four dispatch sites must agree on nil-equivalence:
+// binary 2-branch (serNullUnionAt → isNilValue), binary N-branch
+// (serUnion.ser), JSON N-branch (appendAvroJSONUnion), and JSON
+// tagged-form (decodeUnionObject).
 //
-//  1. Binary 2-branch [null,T] used serNullUnionAt → isNilValue,
-//     which peels Pointer/Interface and treats nil Map/Slice as nil
-//     → picked null for nil []byte.
-//  2. Binary 3+ branch used serUnion.ser → unionTypeNameForValue,
-//     which names Slice<uint8> as "bytes" regardless of IsNil →
-//     picked the bytes branch (encoding empty bytes) for nil []byte.
-//  3. JSON appendAvroJSONUnion mirrored binary 3+-branch on both 2-
-//     and 3+-branch unions → picked bytes for nil []byte everywhere.
+// The general rule "nil → null when null branch present" applies via
+// a nil-first short-circuit at the entry of both serUnion.ser and
+// appendAvroJSONUnion. Without this, three near-identical schemas
+// could produce three distinct results for `[]byte(nil)`:
 //
-// Three distinct results for the same `[]byte(nil)` against three
-// near-identical schemas — a binary↔JSON parity gap (1 vs 3) and a
-// binary 2-branch↔3-branch internal inconsistency (1 vs 2). The fix:
-// add a nil-first short-circuit at the entry of BOTH serUnion.ser and
-// appendAvroJSONUnion that checks `isNilValue(v) && has null branch`
-// before any type-name dispatch, mirroring the 2-branch optimization.
-// All four dispatch sites — binary 2-branch (serNullUnionAt),
-// binary N-branch (serUnion.ser), JSON N-branch
-// (appendAvroJSONUnion), and JSON tagged-form (decodeUnionObject) —
-// now agree on the nil-equivalence semantic.
+//   - 2-branch [null,bytes]: isNilValue → null. ✓
+//   - N-branch via type-name dispatch: unionTypeNameForValue names
+//     Slice<uint8> as "bytes" regardless of IsNil → bytes branch.
+//   - JSON without nil-first: same as above. JSON↔binary gap and
+//     2-branch↔N-branch internal inconsistency.
 //
-// Removing `if branch.kind == "null" continue` from appendAvroJSONUnion's
-// try-each loop alone does not suffice: type-name dispatch fires before
-// try-each runs for nil Slice<uint8>. Special-casing len==2 would paper
-// over the JSON↔binary gap while preserving the binary 2-branch↔3-branch
-// inconsistency. The general "nil → null when null branch present" rule
-// resolves both.
+// Removing `if branch.kind == "null" continue` from the try-each loop
+// alone does not suffice: type-name dispatch fires before try-each
+// runs for nil Slice<uint8>. The nil-first short-circuit is the
+// general fix.
 func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -12406,10 +12391,11 @@ func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
 			wantBin:  []byte{2, 0},
 			wantJSON: `""`,
 		},
-		// 3-branch: nil-first dispatch wins on both sides. Pre-fix
-		// binary picked bytes (idx 2 → wire [4, 0]) and JSON picked
-		// bytes (`""`) — a binary 2-branch ↔ 3-branch inconsistency.
-		// Post-fix both pick null uniformly with the 2-branch case.
+		// 3-branch: nil-first dispatch wins on both sides — picks
+		// null uniformly with the 2-branch case. Without the nil-first
+		// short-circuit, binary would pick bytes (idx 2 → wire [4, 0])
+		// and JSON would pick bytes (`""`), a binary 2-branch ↔
+		// 3-branch inconsistency.
 		{
 			name:     "3-branch [null,int,bytes] + []byte(nil)",
 			schema:   `["null","int","bytes"]`,
@@ -12418,8 +12404,8 @@ func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
 			wantJSON: "null",
 		},
 		// 3-branch with null NOT first: still picks null because the
-		// nil-first rule is order-independent. Pre-fix this picked
-		// bytes via type-name dispatch.
+		// nil-first rule is order-independent (type-name dispatch
+		// would otherwise pick bytes regardless of position).
 		{
 			name:     "3-branch [bytes,int,null] + []byte(nil)",
 			schema:   `["bytes","int","null"]`,
@@ -12428,7 +12414,7 @@ func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
 			wantJSON: "null",
 		},
 		// 3-branch without a null branch: type-name dispatch picks
-		// bytes (the only sensible choice). Pre-fix behavior preserved.
+		// bytes (the only sensible choice).
 		{
 			name:     "3-branch [int,bytes,string] (no null) + []byte(nil)",
 			schema:   `["int","bytes","string"]`,
@@ -12636,9 +12622,10 @@ func TestRegression_DecodeJSONBytesOverflowTypedTarget(t *testing.T) {
 
 // TestRegression_SerRecordMapNamedStringKey locks in that binary
 // encoding a record from map[NamedKey]any (where NamedKey has
-// underlying type string) doesn't panic. Pre-fix v.MapIndex(f.nameVal)
-// panicked because f.nameVal was a plain string but the map's key
-// type was the named subtype.
+// underlying type string) doesn't panic. v.MapIndex must use a key
+// value of the map's exact key type — a bare string panics when the
+// map's key type is a named subtype, even though Go's type system
+// allows the conversion at the source level.
 func TestRegression_SerRecordMapNamedStringKey(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`)
 	m := map[myKey]any{myKey("x"): int32(7)}
@@ -12758,11 +12745,12 @@ func TestRegression_ResolveDeserRecordMapNamedKey(t *testing.T) {
 
 // TestRegression_DecodeJSONDecimalIntoFloatParity locks in that JSON
 // decode of a decimal-bytes value into *float64 matches the binary
-// path's setDecimalValue float coercion. Pre-fix assignBytes only
-// matched *big.Rat / json.Number for the decimal arm and fell through
-// to the generic byte/string handlers (which don't apply decimal
-// logic), so the JSON path rejected float targets that the binary
-// path supports.
+// path's setDecimalValue float coercion. assignBytes recognises
+// *big.Rat / json.Number / *float64 / *float32 / *string for the
+// decimal arm so the JSON path supports the same float targets the
+// binary path does — without this, the float targets would fall
+// through to the generic byte/string handlers, which don't apply
+// decimal logic.
 func TestRegression_DecodeJSONDecimalIntoFloatParity(t *testing.T) {
 	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
 	r := new(big.Rat).SetFrac64(33, 100)
@@ -12822,9 +12810,10 @@ func TestRegression_DecodeJSONFixedDecimalIntoFloatParity(t *testing.T) {
 
 // TestRegression_DecodeJSONDecimalIntoStringParity locks in that JSON
 // decode into *string produces the formatted decimal "0.33" via
-// rat.FloatString(scale), matching the binary path. Pre-fix it
-// returned the raw codepoint bytes interpreted as UTF-8 ("!" for
-// unscaled=33), silently wrong rather than an error.
+// rat.FloatString(scale), matching the binary path. Returning the
+// raw codepoint bytes interpreted as UTF-8 (e.g. "!" for unscaled=33)
+// would be silently wrong — the user picked *string for a textual
+// representation of the decimal value, not the raw codepoint mapping.
 func TestRegression_DecodeJSONDecimalIntoStringParity(t *testing.T) {
 	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
 	r := new(big.Rat).SetFrac64(33, 100)
@@ -12853,7 +12842,8 @@ func TestRegression_DecodeJSONDecimalIntoStringParity(t *testing.T) {
 
 // TestRegression_DecodeJSONDecimalRecordFloatField — the typical user
 // shape: a record with a float-typed field backed by a decimal
-// logical type. Pre-fix the parity gap propagated into struct decode.
+// logical type. The struct-decode path delegates to the same decimal
+// arm, so binary↔JSON parity for the leaf flows up to records.
 func TestRegression_DecodeJSONDecimalRecordFloatField(t *testing.T) {
 	type R struct {
 		V float64 `avro:"v"`
@@ -12919,11 +12909,9 @@ func TestRegression_DecodeJSONDecimalFloat64Overflow(t *testing.T) {
 // TestRegression_UnionDefaultStringMatchesStringBranchNotFloat locks
 // in that a textual union default matches the string branch first when
 // the union contains both string and float (in that order), matching
-// Java/fastavro/hamba. Pre-fix coerceDefault converted a string default
-// to float64 whenever the union contained a float/double branch,
-// regardless of branch order — so encodeDefault then wrote the float
-// branch's index + IEEE bytes for ["string","float"] + "3.14",
-// producing wire output none of the reference impls would.
+// Java/fastavro/hamba. coerceDefault must consult branch order — a
+// string default against ["string","float"] picks branch 0 (string),
+// not the float branch via string-to-float coercion.
 //
 // Spec ("Schema Records / Default Values", Avro 1.12): "Default values
 // for union fields correspond to the first schema that matches in the
@@ -12956,19 +12944,21 @@ func TestRegression_UnionDefaultStringMatchesStringBranchNotFloat(t *testing.T) 
 
 // TestRegression_MapDecodeBucketAmplificationDoS pins that an Avro
 // map<V> decode does not pre-allocate bucket storage proportional to
-// an attacker-declared count. Pre-fix the block-count bound was
-// `count > len(src)` (no per-entry minimum), and the size hint was
-// passed straight into reflect.MakeMapWithSize, so a 4 MB input
-// declaring 2 M entries with empty keys collapsed to one decoded
-// entry while heap-allocating ~160 MB of bucket overhead (≈ 40×
-// amplification for map[string]any).
+// an attacker-declared count.
 //
-// Fixes: (a) bound now uses minMapEntryBytes (1-byte empty-key
-// varint plus schemaMinBytes(values)) like the array path's
-// minItemBytes; (b) MakeMapWithSize hint capped at maxMapPreAllocSize
-// so worst-case allocation is bounded regardless of bound-check
-// loophole. fastavro avoids the issue by not pre-sizing; Java has a
-// smaller version (~4×) and we now amplify less than Java.
+// Two layered defenses are required:
+// (a) Block-count bound uses minMapEntryBytes (1-byte empty-key
+//     varint plus schemaMinBytes(values)) like the array path's
+//     minItemBytes. A bare `count > len(src)` admits zero-byte-entry
+//     inflation.
+// (b) MakeMapWithSize hint capped at maxMapPreAllocSize so worst-case
+//     allocation is bounded regardless of any bound-check loophole.
+//
+// Without these, a 4 MB input declaring 2 M entries with empty keys
+// would collapse to one decoded entry while heap-allocating ~160 MB
+// of bucket overhead (≈ 40× amplification for map[string]any).
+// fastavro avoids the issue by not pre-sizing; Java has a smaller
+// version (~4×) and we amplify less than Java.
 func TestRegression_MapDecodeBucketAmplificationDoS(t *testing.T) {
 	s := MustParse(`{"type":"map","values":"long"}`)
 
@@ -13010,13 +13000,14 @@ func TestRegression_MapDecodeBucketAmplificationDoS(t *testing.T) {
 // TestRegression_ResolveArrayPromotion_MinItemBytesBoundTooStrict
 // locks in that resolveArray bounds the writer's wire block-count
 // against the WRITER's per-item minimum, not the reader's resolved
-// item size. Pre-fix it used schemaMinBytes(resolved) (the reader's
-// resolved item node); for array<int> writer → array<double> reader,
-// the reader's min is 8 bytes so a valid 18-byte array<int> stream
-// of 16 small ints (1 byte each on wire) was rejected with
-// "array block count 16 exceeds remaining buffer length 17 (min 8
-// byte/item)". The sibling resolveMap has had this right since the
-// map DoS round; the array path was the missed twin.
+// item size. The wire was produced by the WRITER, so its minimum
+// item size is what the count bound must use. Using
+// schemaMinBytes(resolved) (the reader's resolved item node) would
+// reject e.g. array<int> writer → array<double> reader on a valid
+// 18-byte stream of 16 small ints (1 byte each on wire) because the
+// reader's min is 8 bytes — the bound math would say
+// "count 16 exceeds remaining buffer length 17 (min 8 byte/item)".
+// resolveMap uses the same writer-min rule.
 //
 // Java/fastavro/avro-rs all decode promoted arrays without this
 // bound (no per-block count×item-size check at all). Spec lists
@@ -13114,14 +13105,14 @@ func TestRegression_ResolveArrayRecordEvolution_DefaultedField_TooStrict(t *test
 // TestRegression_JSONDurationIgnoresNonDurationFixedSize locks in
 // that the JSON encoder's case "fixed" arm only invokes the
 // avro.Duration → 12-byte-encoded path when node.logical ==
-// "duration". Pre-fix the avro.Duration branch fired for any fixed
-// node, regardless of node.logical or node.size, so a 12-byte
-// duration encoding was written into a fixed schema declaring a
-// different size — invalid Avro JSON (the same library's decoder
-// rejects it as "fixed value has 12 bytes, schema declares 8") and
-// rejected by Java/fastavro consumers. The binary path's schema
-// build only assigns serDuration when node.logical == "duration"
-// (schema.go:1665), so this was a JSON-only gap.
+// "duration". Without the logical-type gate, the avro.Duration
+// branch would fire for any fixed node regardless of node.logical
+// or node.size, producing a 12-byte duration encoding in a fixed
+// schema declaring a different size — invalid Avro JSON (the same
+// library's decoder rejects it as "fixed value has 12 bytes, schema
+// declares 8") and rejected by Java/fastavro consumers. The binary
+// path's schema build only assigns serDuration when node.logical ==
+// "duration" (schema.go:1665), so the gate must mirror that.
 func TestRegression_JSONDurationIgnoresNonDurationFixedSize(t *testing.T) {
 	s := MustParse(`{"type":"fixed","name":"F","size":8}`)
 	d := Duration{Months: 1, Days: 2, Milliseconds: 3}
@@ -13132,12 +13123,11 @@ func TestRegression_JSONDurationIgnoresNonDurationFixedSize(t *testing.T) {
 
 // TestRegression_EncodeJSONBytesDefaultCodepointMapping locks in
 // that JSON encode of a missing bytes-typed field with a string
-// default emits the spec codepoint-mapped byte string. Pre-fix
-// appendAvroJSON's case "bytes" String branch used []byte(v.String())
-// which converts to UTF-8, producing 2 bytes for the codepoint U+00FF
-// instead of the spec-required 1 byte 0xff. The binary path's
-// defaultStringToBytes (resolve.go) correctly used codepoint mapping;
-// the JSON encoder was the lone outlier.
+// default emits the spec codepoint-mapped byte string. appendAvroJSON's
+// case "bytes" String branch uses codepoint mapping (1 byte per
+// codepoint up to U+00FF), matching the binary path's
+// defaultStringToBytes. A naive []byte(v.String()) UTF-8 conversion
+// would produce 2 bytes for U+00FF — wrong per spec.
 func TestRegression_EncodeJSONBytesDefaultCodepointMapping(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"r","fields":[{"name":"a","type":"bytes","default":"ÿ"}]}`)
 	out, err := s.EncodeJSON(map[string]any{})
@@ -13151,11 +13141,9 @@ func TestRegression_EncodeJSONBytesDefaultCodepointMapping(t *testing.T) {
 }
 
 // TestRegression_EncodeJSONFixedDefaultCodepointMapping is the fixed
-// counterpart. Pre-fix the buggy UTF-8 conversion produced 2 bytes
-// for a fixed(size=1), and the size-mismatch check at the end of
-// the case "fixed" arm rejected it as "fixed size mismatch: got 2,
-// need 1" — the encoder hard-failed instead of producing 1 byte
-// codepoint-mapped output.
+// counterpart. Same codepoint-mapping rule applies — for a fixed(size=1)
+// field with a U+00FF default, the encoded byte is 0xff (1 byte). A
+// UTF-8 conversion would produce 2 bytes and fail the fixed size check.
 func TestRegression_EncodeJSONFixedDefaultCodepointMapping(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"r","fields":[{"name":"a","type":{"type":"fixed","name":"f","size":1},"default":"ÿ"}]}`)
 	out, err := s.EncodeJSON(map[string]any{})
@@ -13173,12 +13161,12 @@ func TestRegression_EncodeJSONFixedDefaultCodepointMapping(t *testing.T) {
 // union contains two named types with the same unqualified name and
 // different namespaces (a configuration the spec explicitly permits:
 // "permitting multiple types with the same name and different
-// namespaces is necessary"). Pre-fix findMatchingBranch / namesMatch
-// returned true on unqualified-name match alone, so writer b.Foo
-// could pick reader a.Foo as the first match — typically erroring
-// with "field has no default and is missing from writer" or silently
-// yielding wrong output. Java/fastavro both match by full name in
-// this context.
+// namespaces is necessary"). findMatchingBranch / namesMatch must
+// match by FULL name when namespaces differ — unqualified-name
+// match alone would let writer b.Foo pick reader a.Foo (the first
+// occurrence), typically erroring with "field has no default and is
+// missing from writer" or silently yielding wrong output.
+// Java/fastavro both match by full name in this context.
 func TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames(t *testing.T) {
 	w := MustParse(`{"type":"record","name":"Foo","namespace":"b","fields":[{"name":"bf","type":"int"}]}`)
 	r := MustParse(`[
@@ -13209,12 +13197,12 @@ func TestRegression_ResolveReaderUnionAmbiguousUnqualifiedNames(t *testing.T) {
 // TestRegression_UnsafeArrayDirectFloatBoundDivergence locks in
 // that the unsafe primitive-array fast path (udArrayDirect) bounds
 // block count using the wire-item minimum (4 bytes/float, 8 bytes/
-// double) just like the safe path's deserArray.minItemBytes. Pre-fix
-// it used the loose count > len(src) check (1 byte/item assumption),
-// so a hostile array<float> stream declaring count = len(src) drove
-// a reflect.MakeSlice of 4×len(src) bytes before the per-element
-// readUint32 loop hit short-buffer. Same shape as the deserMap DoS
-// fix — the unsafe sibling was missed.
+// double) just like the safe path's deserArray.minItemBytes. A loose
+// count > len(src) check (1 byte/item assumption) would let a
+// hostile array<float> stream declaring count = len(src) drive a
+// reflect.MakeSlice of 4×len(src) bytes before the per-element
+// readUint32 loop hit short-buffer. The unsafe path mirrors the
+// deserMap DoS fix.
 func TestRegression_UnsafeArrayDirectFloatBoundDivergence(t *testing.T) {
 	bin := []byte{
 		0x0c,                                                       // varlong zigzag(6) = 12
@@ -13246,11 +13234,11 @@ func TestRegression_UnsafeArrayDirectFloatBoundDivergence(t *testing.T) {
 // TestRegression_JSONEncodeNonStringKeyMap locks in that the JSON
 // encoder rejects a map whose Go key kind isn't reflect.String,
 // matching the binary path's serMapPreamble (ser.go) which errors
-// with SemanticError{AvroType: "map"}. Pre-fix the JSON path only
-// validated v.Kind() == reflect.Map without checking the key kind,
-// so a map[int]V silently emitted JSON object keys like
-// "<int Value>" — invalid Avro JSON that round-trips to a wrong
-// map. Avro spec: "Map keys are assumed to be strings."
+// with SemanticError{AvroType: "map"}. The JSON path checks both
+// v.Kind() == reflect.Map AND the key kind — without the key check,
+// a map[int]V would silently emit JSON object keys like
+// "<int Value>" (invalid Avro JSON that round-trips to a wrong
+// map). Avro spec: "Map keys are assumed to be strings."
 func TestRegression_JSONEncodeNonStringKeyMap(t *testing.T) {
 	s := MustParse(`{"type":"map","values":"long"}`)
 	in := map[int]int64{1: 100}
@@ -13323,10 +13311,11 @@ func TestRegression_DecimalBytesJSONStringIsCodepointForm(t *testing.T) {
 // TestRegression_ArrayMapMultiLevelPointerElements locks in that the
 // per-primitive serArray/serMap specializations accept multi-level
 // pointer element types (**T, ***T), matching the unsafe fast path
-// which already chased arbitrarily-deep pointers via
-// `pp := *(*unsafe.Pointer)(p)`. Pre-fix the safe specializations did
-// a single Elem() unwrap and rejected anything deeper as
-// "cannot use *int32 with Avro type int".
+// which chases arbitrarily-deep pointers via
+// `pp := *(*unsafe.Pointer)(p)`. The safe specializations must
+// recurse through Elem() until reaching the concrete primitive type
+// — a single-level unwrap would reject **T as "cannot use *int32
+// with Avro type int".
 func TestRegression_ArrayMapMultiLevelPointerElements(t *testing.T) {
 	intArr := MustParse(`{"type":"array","items":"int"}`)
 	longArr := MustParse(`{"type":"array","items":"long"}`)
@@ -13437,9 +13426,9 @@ func TestRegression_ArrayLongTimeMicrosAcceptsTime(t *testing.T) {
 
 // TestRegression_SerTimeMicrosAcceptsTime locks in that the time-micros
 // logical type accepts time.Time on encode, mirroring time-millis (and
-// the timestamp-* variants). Pre-fix only time.Duration was accepted;
-// time.Time fell through to serLong and was rejected as a non-numeric.
-// Binary and JSON paths both checked.
+// the timestamp-* variants). The time-of-day component is extracted
+// via timeOfDay so a time.Time input produces the same wire as the
+// equivalent time.Duration. Binary and JSON paths both checked.
 func TestRegression_SerTimeMicrosAcceptsTime(t *testing.T) {
 	s := MustParse(`{"type":"long","logicalType":"time-micros"}`)
 	// 14:30:45.123456 — non-zero in every field.
