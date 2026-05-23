@@ -607,12 +607,44 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 // nil-default-to-null / default-via-appendAvroJSON sequence agrees
 // across both. Defaults route through appendAvroJSON (not a pre-
 // marshalled splice) so encoder options apply equally to defaults.
+//
+// Union defaults dispatch with a declaration-order try-each that mirrors
+// the binary side's encodeDefault (resolve.go). The runtime
+// appendAvroJSONUnion dispatcher uses unionTypeNameForValue (a kind-match
+// fast path) — correct for user-supplied values (the Go type names the
+// user's intended branch) but wrong for stored defaults: parse time
+// already chose a branch via the declaration-order accept rule, and the
+// JSON tagged-form wrap must name that same branch for parity with the
+// binary defaultBytes. Without this, [enum, string] default "A" emits
+// {"v":{"string":"A"}} under TaggedUnions while validate chose enum and
+// the binary defaultBytes encode against the enum branch.
+//
+// firstUnionBranchAcceptingDefault isn't reusable here because
+// convertDefaultBytes has already rewritten string→[]byte for bytes/fixed
+// branches, and validateDefault's bytes/fixed arm only accepts string.
+// Declaration-order try-each on appendAvroJSON itself has the right
+// post-convert acceptance set (the bytes/fixed appendAvroJSON arms accept
+// []byte) and matches encodeDefault's new try-each loop on the binary
+// side branch-by-branch.
 func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
 	if !f.hasDefault {
 		return nil, fmt.Errorf("avro json: record %q missing required field %q", recordName, f.name)
 	}
 	if f.defaultVal == nil {
 		return append(buf, "null"...), nil
+	}
+	if f.node != nil && f.node.kind == "union" {
+		v := reflect.ValueOf(f.defaultVal)
+		for _, branch := range f.node.branches {
+			encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
+			if err == nil {
+				return appendUnionBranch(buf, branch, encoded, cfg), nil
+			}
+			if errors.Is(err, errTooDeep) {
+				return nil, err
+			}
+		}
+		return nil, fmt.Errorf("avro json: union default for field %q does not match any branch", f.name)
 	}
 	return appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, custom, depth+1)
 }

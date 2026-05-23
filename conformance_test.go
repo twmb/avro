@@ -10295,6 +10295,164 @@ func TestRegression_UnionDefaultMetadataMatchesWireBranch_EnumArm(t *testing.T) 
 	}
 }
 
+// TestRegression_UnionDefaultEncodeMatchesValidateBranch pins that the
+// wire branch encoded for an auto-filled union default matches the branch
+// firstUnionBranchAcceptingDefault picked at parse time. validateDefault,
+// coerceDefault, convertDefaultBytes, walkDefault, and (metadata-side)
+// branchAcceptsDefault all iterate in declaration order and pick the
+// first ACCEPTING branch. The wire side (encodeDefault's union arm and
+// the JSON appendAvroJSONUnion dispatcher reached via appendJSONFieldDefault)
+// must agree on that branch — otherwise the wire bytes correspond to a
+// different branch than the metadata/parse-time picker chose.
+//
+// The runtime dispatcher's type-name fast path (unionTypeNameForValue
+// → branch.kind match) is correct for user-supplied values (the Go type
+// names the user's intended branch). For stored defaults it's wrong:
+// when the Go value's natural primitive kind matches a LATER branch
+// while an EARLIER branch with a different kind also accepts the value,
+// the fast path skips the earlier branch.
+//
+// Sibling shapes covered:
+//   - [enum, string] valid symbol — string matches branch 1, enum
+//     accepts at branch 0 via symbol membership.
+//   - [fixed:N, bytes] size-matching string — after convertDefaultBytes
+//     val is []byte, "bytes" matches branch 1, fixed accepts at branch 0
+//     via size match.
+//   - [fixed:M, fixed:N, bytes] (M ≠ N) size-N string — same shape with
+//     a skipped-non-matching first fixed.
+//   - [enum, bytes, string] valid symbol — skips both intermediate
+//     accepting branches.
+//
+// Java: JacksonUtils.toObject(jsonNode, schema) at JacksonUtils.java:
+// 117-118 always interprets a union default against schema.getTypes().
+// get(0); for [enum:{A,B}, string] default "A", the enum arm at line 157
+// returns jsonNode.asText() so the default is stored against branch 0.
+// UnionSchema.isValidDefault (Schema.java:1278) uses anyMatch (Avro 1.12
+// relaxation), but the toObject coercion still uses branch 0. The wire
+// bytes Java would emit for an auto-fill default use branch 0.
+//
+// Companion: TestRegression_UnionDefaultMetadataMatchesWireBranch_EnumArm
+// pins the [enum, bytes] case where unionTypeNameForValue returns ""
+// (bytes is the post-convertDefaultBytes type for the enum-symbol-as-
+// codepoints conversion, but the val at encode time is still a string)
+// — i.e. where the type-name fast path doesn't trigger. This test
+// covers the cases where it DOES trigger.
+func TestRegression_UnionDefaultEncodeMatchesValidateBranch(t *testing.T) {
+	cases := []struct {
+		name           string
+		schema         string
+		wireBranchByte byte
+		wireTag        string // tag visible under TaggedUnions on the binary side
+	}{
+		{
+			name: "enum_string_valid_symbol_picks_enum_branch",
+			schema: `{"type":"record","name":"R","fields":[
+				{"name":"v","type":[
+					{"type":"enum","name":"com.example.E","symbols":["A","B"]},
+					"string"
+				],"default":"A"}
+			]}`,
+			wireBranchByte: 0x00,
+			wireTag:        "com.example.E",
+		},
+		{
+			name: "fixed_bytes_size_matching_string_picks_fixed_branch",
+			schema: `{"type":"record","name":"R","fields":[
+				{"name":"v","type":[
+					{"type":"fixed","name":"f","size":8},
+					"bytes"
+				],"default":"01234567"}
+			]}`,
+			wireBranchByte: 0x00,
+			wireTag:        "f",
+		},
+		{
+			name: "two_fixeds_then_bytes_picks_size_matching_fixed",
+			schema: `{"type":"record","name":"R","fields":[
+				{"name":"v","type":[
+					{"type":"fixed","name":"f4","size":4},
+					{"type":"fixed","name":"f8","size":8},
+					"bytes"
+				],"default":"01234567"}
+			]}`,
+			wireBranchByte: 0x02,
+			wireTag:        "f8",
+		},
+		{
+			name: "enum_bytes_string_valid_symbol_picks_enum_branch",
+			schema: `{"type":"record","name":"R","fields":[
+				{"name":"v","type":[
+					{"type":"enum","name":"com.example.E","symbols":["A","B"]},
+					"bytes",
+					"string"
+				],"default":"A"}
+			]}`,
+			wireBranchByte: 0x00,
+			wireTag:        "com.example.E",
+		},
+		{
+			// String-form default for [float, double]: coerceDefault parses
+			// "1.5" → float64(1.5). With the runtime type-name fast path,
+			// unionTypeNameForValue(float64)=="double" matched branch 1,
+			// overriding validateDefault's branch 0 (float) choice. Post-
+			// fix: declaration-order picks float, matching the metadata
+			// API's float32(1.5) Default type.
+			name: "float_double_string_default_picks_float_branch",
+			schema: `{"type":"record","name":"R","fields":[
+				{"name":"v","type":["float","double"],"default":"1.5"}
+			]}`,
+			wireBranchByte: 0x00,
+			wireTag:        "float",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := avro.Parse(c.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+
+			// Binary auto-fill: wire branch index must match validate's choice.
+			buf, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Fatalf("AppendEncode: %v", err)
+			}
+			if len(buf) == 0 || buf[0] != c.wireBranchByte {
+				t.Errorf("binary wire branch byte: got 0x%02x, want 0x%02x (full %x)",
+					buf[0], c.wireBranchByte, buf)
+			}
+
+			// TaggedUnions decode confirms the wire branch's name.
+			var got map[string]any
+			if _, err := s.Decode(buf, &got, avro.TaggedUnions()); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			gotTag := ""
+			if m, ok := got["v"].(map[string]any); ok {
+				for k := range m {
+					gotTag = k
+					break
+				}
+			}
+			if gotTag != c.wireTag {
+				t.Errorf("binary tagged decode tag: got %q, want %q (decoded %+v)",
+					gotTag, c.wireTag, got)
+			}
+
+			// JSON tagged auto-fill must wrap in the same branch.
+			jsonOut, err := s.AppendEncodeJSON(nil, map[string]any{}, avro.TaggedUnions())
+			if err != nil {
+				t.Fatalf("AppendEncodeJSON: %v", err)
+			}
+			wantWrap := `"` + c.wireTag + `":`
+			if !strings.Contains(string(jsonOut), wantWrap) {
+				t.Errorf("JSON tagged output %s does not contain %q (expected branch wrap)",
+					jsonOut, wantWrap)
+			}
+		})
+	}
+}
+
 // TestRegression_TaggedUnionShortNameBinaryParity locks binary ↔ JSON
 // parity on fastavro's unqualified-short-name tagged-union shape.
 // The binary `serUnion.tryUnwrapTagged` must apply the same short-

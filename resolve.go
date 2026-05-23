@@ -885,33 +885,29 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return dst, nil
 	case "union":
-		// Avro 1.12+: union defaults may match any branch (not just the
-		// first). We walk branches in declaration order and use the first
-		// that accepts the value, encoding its index as the wire prefix.
-		// Matches Java 1.12.0+ and fastavro; goavro still requires the
-		// first-branch default. See Apache Avro AVRO-3649 / PR #2503.
+		// Avro 1.12+ relaxed the union-default rule (AVRO-3649): the default
+		// may match any branch, not just the first. Walk in declaration
+		// order and pick the first that accepts; encode its index as the
+		// wire prefix.
 		//
-		// Type-name dispatch first (Java/fastavro/hamba parity, matching
-		// serUnion.ser and appendAvroJSONUnion). Try-each fallback
-		// preserves the documented whole-number-float / string-numeric
-		// coercion paths that defaultAsFloat64 / defaultAsInt32 etc.
-		// implement.
+		// No type-name fast path here. The runtime serUnion.ser and
+		// appendAvroJSONUnion dispatchers use unionTypeNameForValue to
+		// pick a kind-matching branch — correct for user-supplied values
+		// (the Go type names the user's intended branch). For stored
+		// defaults the chosen branch was decided at parse time by
+		// firstUnionBranchAcceptingDefault (used by validateDefault,
+		// coerceDefault, convertDefaultBytes, walkDefault, and the
+		// metadata-side branchAcceptsDefault), which iterates in
+		// declaration order without a kind filter. The wire branch index
+		// MUST agree with that picker; otherwise an [enum, string] default
+		// "A" picks enum at validate-time (the symbol matches) but the
+		// type-name shortcut picks the later string branch on the wire,
+		// producing wire bytes that name a different branch than the
+		// metadata API reports.
 		if len(node.branches) == 0 {
 			return nil, fmt.Errorf("empty union")
 		}
 		base := len(dst)
-		if name := unionTypeNameForValue(reflect.ValueOf(val)); name != "" {
-			for i, branch := range node.branches {
-				if branch.kind != name {
-					continue
-				}
-				attempt := appendVarlong(dst[:base], int64(i))
-				if encoded, err := encodeDefault(attempt, val, branch); err == nil {
-					return encoded, nil
-				}
-				break // primitive kinds are unique per union (Avro spec)
-			}
-		}
 		for i, branch := range node.branches {
 			attempt := appendVarlong(dst[:base], int64(i))
 			if encoded, err := encodeDefault(attempt, val, branch); err == nil {
