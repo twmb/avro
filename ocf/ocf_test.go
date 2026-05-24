@@ -3729,7 +3729,6 @@ func TestRegression_OCFCodecMatrix(t *testing.T) {
 	}
 
 	for _, c := range codecs {
-		c := c
 		t.Run(c.desc, func(t *testing.T) {
 			var buf bytes.Buffer
 			var opts []WriterOpt
@@ -3806,7 +3805,7 @@ func TestRegression_OCFTruncatedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if err := w.Encode(int64(i)); err != nil {
 			t.Fatal(err)
 		}
@@ -3829,7 +3828,7 @@ func TestRegression_OCFTruncatedFile(t *testing.T) {
 			if err != nil {
 				return // header parse failure is fine
 			}
-			for i := 0; i < 100; i++ {
+			for range 100 {
 				var v int64
 				if err := r.Decode(&v); err != nil {
 					break // any error (EOF or truncation) is fine

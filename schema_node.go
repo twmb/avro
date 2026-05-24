@@ -52,28 +52,19 @@ type SchemaNode struct {
 	Precision int // decimal precision
 	Scale     int // decimal scale
 
-	// Props holds custom (non-reserved) schema properties. Numeric
-	// literals decode by VALUE, not by syntax — the literal's shape
-	// (`.`/`e` vs pure digits) does not affect the resulting Go type:
+	// Props holds custom (non-reserved) schema attributes — anything
+	// in the schema JSON that is not a standard Avro field (e.g.
+	// namespace-prefixed metadata like "com.example.tag").
 	//
-	//   - Mathematical value is an exact integer fitting int64
-	//     → returned as int64. `42`, `1e3`, `9.5e17` all decode to int64.
-	//   - Mathematical value is an exact integer exceeding int64,
-	//     written in integer-only syntax (no `.`/`e`)
-	//     → returned as json.Number to preserve precision.
-	//   - Mathematical value is non-integer, or an exact integer
-	//     exceeding int64 written in fractional/exponent syntax
-	//     → returned as float64 (with ±Inf for magnitudes overflowing
-	//     the float64 exponent, e.g. `1e1000` → float64(+Inf)).
+	// Values use the natural Go types from JSON: string, bool, nil,
+	// []any, map[string]any, plus int64 for whole numbers, float64
+	// for fractional, and json.Number for whole numbers too large for
+	// int64. Whole-valued exponents collapse to int64 (1e3 reads as
+	// int64(1000)), and exponents that overflow float64 give ±Inf.
 	//
-	// DoS-defense cap: numeric literals exceeding maxParseFloatLen
-	// (1024) chars fall back to json.Number rather than float64 to
-	// bound strconv.ParseFloat cost on hostile multi-MB inputs. Java
-	// and fastavro have no analogous cap; twmb's defense-in-depth
-	// posture (see "DoS-resistance defense-in-depth" intentional
-	// divergence) makes this trade explicitly: legitimate numbers fit
-	// comfortably under 1024 chars; truly large literals are preserved
-	// losslessly as json.Number for callers that need them.
+	// math.NaN() stored in Props re-reads as string "NaN" after
+	// round-tripping through Schema() and Root(), because JSON has
+	// no NaN literal. ±Inf round-trips correctly as float64(±Inf).
 	Props map[string]any
 }
 
@@ -82,51 +73,26 @@ type SchemaField struct {
 	Name string     // field name
 	Type SchemaNode // field schema
 
-	// Default is the field's default value, meaningful only when HasDefault
-	// is true. Numbers decode SCHEMA-WIDTH-FAITHFULLY so Default.Go-type
-	// matches the wire's natural Go type AND the user's natural Go field
-	// type:
+	// Default is the field's default value, present when HasDefault is
+	// true. The Go type matches the schema:
 	//
-	//   ┌────────┬─────────────────────────────┐
-	//   │ Schema │ Default Go type             │
-	//   ├────────┼─────────────────────────────┤
-	//   │ int    │ int32                       │
-	//   │ long   │ int64                       │
-	//   │ float  │ float32                     │
-	//   │ double │ float64                     │
-	//   └────────┴─────────────────────────────┘
+	//   - int schemas give int32, long schemas give int64. Out-of-range
+	//     defaults are rejected at parse.
+	//   - float schemas give float32, double schemas give float64.
+	//     Overflows narrow to ±Inf; NaN and ±Inf round-trip correctly.
+	//   - string and enum schemas give string.
+	//   - bytes and fixed schemas give []byte, already decoded from
+	//     the JSON spec's codepoint-per-byte form so you can pass
+	//     Default straight back to AppendEncode without conversion.
+	//   - record, array, and map schemas give map[string]any or []any
+	//     respectively, with each leaf following these same rules.
 	//
-	// Out-of-range integer defaults (e.g. {"default":2147483648,"type":"int"})
-	// are rejected at schema parse, so int32/int64 Defaults always carry
-	// the exact wire value. float32 narrowing surfaces overflow as ±Inf
-	// (`{"default":1e100,"type":"float"}` → float32(+Inf)), matching the
-	// wire bytes. Matches Java's JacksonUtils.toObject(jsonNode, schema)
-	// which narrows DoubleNode → Float for FLOAT schemas. Unlike Props
-	// (which uses value-based dispatch and may surface json.Number for
-	// >int64 integer literals), Default for numeric fields is NEVER
-	// json.Number — schema-parse-time validation guarantees the value
-	// fits the target.
+	// Union defaults pick the first branch that accepts the value; the
+	// Go type tells you which branch was chosen. For ["float","int"]
+	// with default 42 you get float32(42) because float matches first.
 	//
-	//   - bytes / fixed fields: Default is []byte (the wire form). The
-	//     JSON schema spec writes these as code-point-per-byte strings;
-	//     Default exposes the already-mapped raw bytes so the value can
-	//     be re-encoded directly (s.AppendEncode(defaultsMap, ...) succeeds
-	//     for any default, including fixed+uuid whose encoder arm rejects
-	//     the codepoint-string form via strict parseUUID gating).
-	//
-	//   - enum fields: Default is the symbol string.
-	//
-	//   - record / array / map fields: Default is the parsed map/slice
-	//     shape with each leaf coerced by these same rules.
-	//
-	// Union defaults: the chosen branch's natural Go type wins (per the
-	// table above). The metadata path uses the same first-matching-branch
-	// selector as the wire-encode path (defaultAsInt32 / defaultAsInt64 /
-	// defaultAsFloat applied to each branch in declaration order). For
-	// ["float","int"] default 42, the float branch matches first and
-	// Default surfaces as float32(42) — type-switching on Default
-	// identifies the chosen branch the same way it identifies the
-	// underlying Avro type for a non-union field.
+	// Unlike Props, Default for numeric fields is never json.Number:
+	// schema parse rejects defaults that do not fit the declared type.
 	Default any
 
 	HasDefault bool     // true if a default value is defined in the schema
@@ -171,12 +137,10 @@ type deduper struct {
 	err     error                    // first conflict or cycle encountered
 }
 
-// Root returns the SchemaNode representation of a parsed schema by
-// re-parsing the original schema JSON. This preserves all metadata
-// including doc strings, namespaces, custom properties, and numeric
-// defaults — JSON integer literals come back as int64 (or json.Number
-// for the rare ones that overflow int64), not float64; see
-// unmarshalAnyPreservePrecision for the precision-preservation rationale.
+// Root returns a SchemaNode tree describing the parsed schema. All
+// metadata is preserved (doc strings, namespaces, custom properties,
+// numeric defaults). See [SchemaNode.Props] and [SchemaField.Default]
+// for how values decode.
 //
 // Root re-parses the JSON on each call. Cache the result if you need
 // to access it repeatedly (e.g. in a per-message processing loop).
@@ -209,16 +173,17 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 //     schema whose Default / Props normalized an exponent-form overflow
 //     to ±Inf cannot otherwise round-trip through [SchemaNode.Schema].
 //
-//  2. NaN float → JSON string "NaN". encoding/json.Marshal rejects NaN
-//     unconditionally, but the runtime JSON encoder (appendJSONFloat)
-//     already emits NaN field values as "NaN" by default, and
-//     defaultAsFloat's string arm re-parses "NaN" via strconv.ParseFloat
-//     back to float64(NaN) — so the round-trip is closed by the same
-//     string-form path used at the wire layer. Note this differs in
-//     shape from the ±Inf inverse: NaN uses a JSON string literal (the
-//     library's documented "String-form float defaults" lenient-accept
-//     path), while ±Inf uses a JSON number literal (the
-//     normalizeJSONNumber ErrRange-with-Inf path).
+//  2. NaN float → JSON string "NaN". RFC 8259 has no NaN literal, so
+//     no JSON number can encode NaN (compare item 1's ±Inf overflow
+//     trick — no analogue exists for NaN). Re-parse recovers
+//     float64(NaN) only for SchemaField.Default of a float / double
+//     field (via coerceMetadataDefault → defaultAsFloat's string
+//     arm; the schema type drives the coercion). For SchemaNode.Props
+//     and SchemaField.Props the string survives unchanged —
+//     auto-coercing literal "NaN" in normalizeJSONValue would silently
+//     reinterpret user-intentional string Props (Parse can never
+//     produce NaN in Props; a hand-written {"x":"NaN"} is the user
+//     storing a string). User-facing note lives on SchemaNode.Props.
 //
 //  3. []byte → codepoint-per-byte string (each byte 0x00-0xFF becomes
 //     a rune at the same code point). The inverse of
@@ -260,11 +225,7 @@ func needsJSONFixup(v any) bool {
 			}
 		}
 	case []any:
-		for _, val := range tv {
-			if needsJSONFixup(val) {
-				return true
-			}
-		}
+		return slices.ContainsFunc(tv, needsJSONFixup)
 	}
 	return false
 }

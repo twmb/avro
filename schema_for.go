@@ -398,10 +398,8 @@ func parseBracketedValues(s string) ([]string, error) {
 		// Simple comma split is safe: Avro names are [A-Za-z_][A-Za-z0-9_]*
 		// and cannot contain commas or brackets.
 		vals := strings.Split(inner, ",")
-		for _, v := range vals {
-			if v == "" {
-				return nil, fmt.Errorf("empty element in %q", s)
-			}
+		if slices.Contains(vals, "") {
+			return nil, fmt.Errorf("empty element in %q", s)
 		}
 		return vals, nil
 	}

@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1118,7 +1119,7 @@ func FuzzDecodeVariedTargets(f *testing.F) {
 	// Seed every (schema, target_kind) pair with a valid binary encoding
 	// plus an empty buffer.
 	for i := range fuzzSchemas {
-		for mode := uint8(0); mode < 12; mode++ {
+		for mode := range uint8(12) {
 			f.Add(uint8(i), mode, []byte{})
 			f.Add(uint8(i), mode, []byte{0})
 			f.Add(uint8(i), mode, []byte{2, 'x'})
@@ -1180,7 +1181,7 @@ func FuzzDecodeJSONVariedTargets(f *testing.F) {
 	}
 
 	for i := range fuzzSchemas {
-		for mode := uint8(0); mode < 9; mode++ {
+		for mode := range uint8(9) {
 			for _, src := range []string{
 				`null`, `42`, `"x"`, `true`, `[]`, `{}`,
 				`{"int":1}`, `{"null":null}`, `{"x":1}`,
@@ -1288,7 +1289,7 @@ func FuzzEncodeHostile(f *testing.F) {
 	}
 
 	for i := range fuzzSchemas {
-		for mode := uint8(0); mode < 16; mode++ {
+		for mode := range uint8(16) {
 			f.Add(uint8(i), mode)
 		}
 	}
@@ -1400,7 +1401,7 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 		// aren't safe for concurrent use from non-test goroutines.
 		panicCh := make(chan any, workers)
 		done := make(chan struct{}, workers)
-		for i := 0; i < workers; i++ {
+		for range workers {
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -1408,7 +1409,7 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 					}
 					done <- struct{}{}
 				}()
-				for j := 0; j < 20; j++ {
+				for j := range 20 {
 					rec := Record{A: a + int32(j), B: b}
 					data, err := s.AppendEncode(nil, &rec)
 					if err != nil {
@@ -1421,7 +1422,7 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 				}
 			}()
 		}
-		for i := 0; i < workers; i++ {
+		for range workers {
 			<-done
 		}
 		close(panicCh)
@@ -1724,7 +1725,7 @@ func FuzzPromoteLogical(f *testing.F) {
 	// Seeds: one canonical per pair × nesting combo, plus a couple of
 	// adversarial wire payloads (varint overflow, length > buffer).
 	for idx := uint8(0); idx < uint8(len(fuzzPromoteLogicalPairs)); idx++ {
-		for n := uint8(0); n < 5; n++ {
+		for n := range uint8(5) {
 			pair := fuzzPromoteLogicalPairs[idx]
 			w, _ := fuzzPromoteLogicalNesting(pair.writer, pair.reader, n)
 			ws, err := Parse(w)
@@ -2112,7 +2113,7 @@ func FuzzSetValueTargets(f *testing.F) {
 
 	// Seed every (schema, target) combo with valid + empty wire.
 	for sIdx := range schemas {
-		for m := uint8(0); m < 14; m++ {
+		for m := range uint8(14) {
 			f.Add(uint8(sIdx), m, []byte{})
 			f.Add(uint8(sIdx), m, []byte{0})
 			// A 4-byte fixed seed (legal for fixedS, harmless for the
@@ -2284,7 +2285,7 @@ func FuzzUnionBranchErrorWrapping(f *testing.F) {
 
 	for uIdx := range unions {
 		for iIdx := range inputs {
-			for m := uint8(0); m < 6; m++ {
+			for m := range uint8(6) {
 				f.Add(uint8(uIdx), uint8(iIdx), m)
 			}
 		}
@@ -2374,13 +2375,7 @@ func FuzzResolveUnionUnionTags(f *testing.F) {
 		for k := range m {
 			key = k
 		}
-		ok = false
-		for _, branchTxt := range readerBranchTags(readerJSON) {
-			if key == branchTxt {
-				ok = true
-				break
-			}
-		}
+		ok = slices.Contains(readerBranchTags(readerJSON), key)
 		if !ok {
 			t.Fatalf("TaggedUnions key %q not found in reader schema %s", key, readerJSON)
 		}

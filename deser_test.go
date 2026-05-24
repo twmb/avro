@@ -11974,12 +11974,12 @@ func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
 // for the plain "null" Avro type across every site that reaches serNull
 // or appendAvroJSON's case "null" arm. Both paths must:
 //
-//   (1) reject non-nil non-nilable values with errNonNil (the JSON
-//       arm cannot just emit literal `null` regardless of v's content).
-//   (2) accept typed-nil values arriving via an Interface wrapper —
-//       generic serUnion / serArray / serMap dispatch calls serNull
-//       with iter.Value() Kind=Interface wrapping a typed-nil, and
-//       both sides must peel the interface before the kind switch.
+//	(1) reject non-nil non-nilable values with errNonNil (the JSON
+//	    arm cannot just emit literal `null` regardless of v's content).
+//	(2) accept typed-nil values arriving via an Interface wrapper —
+//	    generic serUnion / serArray / serMap dispatch calls serNull
+//	    with iter.Value() Kind=Interface wrapping a typed-nil, and
+//	    both sides must peel the interface before the kind switch.
 //
 // The 2-branch [null,T] optimization is unaffected (serNullUnionAt →
 // isNilValue peels interfaces); the parity concern is the 3+ branch
@@ -12948,11 +12948,14 @@ func TestRegression_UnionDefaultStringMatchesStringBranchNotFloat(t *testing.T) 
 //
 // Two layered defenses are required:
 // (a) Block-count bound uses minMapEntryBytes (1-byte empty-key
-//     varint plus schemaMinBytes(values)) like the array path's
-//     minItemBytes. A bare `count > len(src)` admits zero-byte-entry
-//     inflation.
+//
+//	varint plus schemaMinBytes(values)) like the array path's
+//	minItemBytes. A bare `count > len(src)` admits zero-byte-entry
+//	inflation.
+//
 // (b) MakeMapWithSize hint capped at maxMapPreAllocSize so worst-case
-//     allocation is bounded regardless of any bound-check loophole.
+//
+//	allocation is bounded regardless of any bound-check loophole.
 //
 // Without these, a 4 MB input declaring 2 M entries with empty keys
 // would collapse to one decoded entry while heap-allocating ~160 MB
@@ -12970,7 +12973,7 @@ func TestRegression_MapDecodeBucketAmplificationDoS(t *testing.T) {
 		zigzag >>= 7
 	}
 	blob = append(blob, byte(zigzag))
-	for i := 0; i < int(declaredCount); i++ {
+	for range int(declaredCount) {
 		blob = append(blob, 0, 0) // 1-byte empty key + 1-byte value 0
 	}
 	blob = append(blob, 0)

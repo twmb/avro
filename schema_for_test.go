@@ -714,7 +714,7 @@ func TestSchemaForTypeAliasEnum(t *testing.T) {
 		State Status `avro:"state,type-alias=OldStatus"`
 	}
 	reader, err := SchemaFor[Outer](CustomType{
-		GoType: reflect.TypeOf(Status("")),
+		GoType: reflect.TypeFor[Status](),
 		Schema: &enumNode,
 	})
 	if err != nil {

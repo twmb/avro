@@ -2,6 +2,7 @@ package avro
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -313,10 +314,8 @@ func kindsMatchTier(r, w *schemaNode) matchTier {
 			if r.name == w.name {
 				return matchExact
 			}
-			for _, a := range r.aliases {
-				if a == w.name {
-					return matchExact
-				}
+			if slices.Contains(r.aliases, w.name) {
+				return matchExact
 			}
 			if unqualified(r.name) == unqualified(w.name) {
 				return matchUnqualifiedName

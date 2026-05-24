@@ -57,7 +57,7 @@ func TestOverflowAuditAllPaths(t *testing.T) {
 	t.Run("enum ordinal overflow", func(t *testing.T) {
 		// Build an enum with 200 symbols, target int8.
 		symbols := `["`
-		for i := 0; i < 200; i++ {
+		for i := range 200 {
 			if i > 0 {
 				symbols += `","`
 			}

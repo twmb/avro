@@ -308,7 +308,7 @@ func FuzzOCFBlockEnvelope(f *testing.F) {
 		// only asserts no panic / no hang. A bounded loop guards
 		// against any reader bug that could yield infinite zero-
 		// length blocks.
-		for i := 0; i < 10000; i++ {
+		for range 10000 {
 			var v any
 			if err := r.Decode(&v); err != nil {
 				break

@@ -123,7 +123,7 @@ func benchDecodeMapStringValue(b *testing.B, n int) {
 		b.Fatal(err)
 	}
 	in := make(map[string]string, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		in[fmt.Sprintf("key-%05d", i)] = fmt.Sprintf("value-%05d", i)
 	}
 	enc, err := s.AppendEncode(nil, &in)
@@ -214,7 +214,7 @@ func BenchmarkDecodeMapInto_Any_Medium(b *testing.B) {
 		b.Fatal(err)
 	}
 	in := make(map[string]string, 64)
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		in[fmt.Sprintf("key-%05d", i)] = fmt.Sprintf("value-%05d", i)
 	}
 	enc, err := s.AppendEncode(nil, &in)
@@ -238,7 +238,7 @@ func BenchmarkDecodeArrayStringInto_Any_Medium(b *testing.B) {
 		b.Fatal(err)
 	}
 	in := make([]string, 64)
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		in[i] = fmt.Sprintf("value-%05d", i)
 	}
 	enc, err := s.AppendEncode(nil, &in)
@@ -262,7 +262,7 @@ func BenchmarkDecodeArrayIntInto_Any_Medium(b *testing.B) {
 		b.Fatal(err)
 	}
 	in := make([]int32, 64)
-	for i := 0; i < 64; i++ {
+	for i := range 64 {
 		in[i] = int32(i * 1000)
 	}
 	enc, err := s.AppendEncode(nil, &in)

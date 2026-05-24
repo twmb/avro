@@ -6405,6 +6405,150 @@ func TestRegression_SchemaNodePropsDocstringContract(t *testing.T) {
 	})
 }
 
+// TestRegression_SchemaNodePropsNonFiniteFloatRoundTrip pins the
+// asymmetric round-trip behavior for non-finite float64 values stored
+// in SchemaNode.Props. RFC 8259 has no NaN literal: ±Inf can be
+// emitted as the JSON number 1e1000 / -1e1000 (the IEEE overflow
+// re-parse closes the round-trip), but NaN must emit as a JSON string
+// "NaN" and the string survives untouched on re-parse. Auto-coercing
+// the literal "NaN" at the Props normalize stage would silently
+// reinterpret a user-intentional string Props value (a hand-written
+// schema {"x":"NaN"} legitimately stores a string; the "parsed
+// intentional string preserved" sub-test pins that direction).
+//
+// SchemaField.Default closes for NaN via the schema-typed coercion
+// stage (TestRegression_SchemaFieldDefaultNonFiniteFloatRoundTrip);
+// Props has no analogous stage by design.
+//
+// Cross-impl: Java/Jackson exhibits the same Props asymmetry (quoted
+// "NaN" → JacksonUtils.toObject returns Java String for re-parsed
+// Props). fastavro avoids it only by emitting non-RFC bare NaN.
+// avro-rs/hamba reject or drop the value entirely.
+func TestRegression_SchemaNodePropsNonFiniteFloatRoundTrip(t *testing.T) {
+	t.Run("pos_inf_round_trips", func(t *testing.T) {
+		n := avro.SchemaNode{Type: "int", Props: map[string]any{"x": math.Inf(1)}}
+		s, err := n.Schema()
+		if err != nil {
+			t.Fatalf("Schema(): %v", err)
+		}
+		got := s.Root().Props["x"]
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, 1) {
+			t.Fatalf("expected float64(+Inf); got %T(%v)", got, got)
+		}
+	})
+
+	t.Run("neg_inf_round_trips", func(t *testing.T) {
+		n := avro.SchemaNode{Type: "int", Props: map[string]any{"x": math.Inf(-1)}}
+		s, err := n.Schema()
+		if err != nil {
+			t.Fatalf("Schema(): %v", err)
+		}
+		got := s.Root().Props["x"]
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, -1) {
+			t.Fatalf("expected float64(-Inf); got %T(%v)", got, got)
+		}
+	})
+
+	t.Run("nan_re_reads_as_string", func(t *testing.T) {
+		n := avro.SchemaNode{Type: "int", Props: map[string]any{"x": math.NaN()}}
+		s, err := n.Schema()
+		if err != nil {
+			t.Fatalf("Schema(): %v", err)
+		}
+		got := s.Root().Props["x"]
+		if v, ok := got.(string); !ok || v != "NaN" {
+			t.Fatalf("expected string(\"NaN\"); got %T(%v)", got, got)
+		}
+	})
+
+	t.Run("parsed_intentional_nan_string_preserved", func(t *testing.T) {
+		// User wrote {"x":"NaN"} meaning a string. Locks that
+		// normalizeJSONValue does NOT silently reinterpret it as
+		// float NaN — the auto-coerce alternative would change
+		// semantics based on the literal content of a string.
+		s := avro.MustParse(`{"type":"int","x":"NaN"}`)
+		got := s.Root().Props["x"]
+		if v, ok := got.(string); !ok || v != "NaN" {
+			t.Fatalf("expected string(\"NaN\") preserved; got %T(%v)", got, got)
+		}
+	})
+}
+
+// TestRegression_SchemaFieldDefaultNonFiniteFloatRoundTrip pins the
+// other half of the non-finite float asymmetry: for SchemaField.Default
+// of a float / double schema, NaN AND ±Inf both round-trip back to
+// their typed Go form. NaN closure relies on coerceMetadataDefault →
+// defaultAsFloat's string arm re-parsing "NaN" via strconv.ParseFloat;
+// ±Inf closure rides the same path for the float-narrowing case.
+//
+// Companion pin to TestRegression_SchemaNodePropsNonFiniteFloatRoundTrip:
+// the Props arm does NOT close for NaN by design; Default does because
+// the schema's declared type drives string→float coercion.
+func TestRegression_SchemaFieldDefaultNonFiniteFloatRoundTrip(t *testing.T) {
+	mkSchema := func(t *testing.T, fieldType string, def any) *avro.Schema {
+		t.Helper()
+		n := avro.SchemaNode{
+			Type: "record", Name: "R",
+			Fields: []avro.SchemaField{{
+				Name: "f", Type: avro.SchemaNode{Type: fieldType},
+				HasDefault: true, Default: def,
+			}},
+		}
+		s, err := n.Schema()
+		if err != nil {
+			t.Fatalf("Schema(): %v", err)
+		}
+		return s
+	}
+
+	t.Run("double_nan", func(t *testing.T) {
+		s := mkSchema(t, "double", math.NaN())
+		got := s.Root().Fields[0].Default
+		f, ok := got.(float64)
+		if !ok || !math.IsNaN(f) {
+			t.Fatalf("expected float64(NaN); got %T(%v)", got, got)
+		}
+	})
+
+	t.Run("double_pos_inf", func(t *testing.T) {
+		s := mkSchema(t, "double", math.Inf(1))
+		got := s.Root().Fields[0].Default
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, 1) {
+			t.Fatalf("expected float64(+Inf); got %T(%v)", got, got)
+		}
+	})
+
+	t.Run("double_neg_inf", func(t *testing.T) {
+		s := mkSchema(t, "double", math.Inf(-1))
+		got := s.Root().Fields[0].Default
+		f, ok := got.(float64)
+		if !ok || !math.IsInf(f, -1) {
+			t.Fatalf("expected float64(-Inf); got %T(%v)", got, got)
+		}
+	})
+
+	t.Run("float_nan", func(t *testing.T) {
+		s := mkSchema(t, "float", math.NaN())
+		got := s.Root().Fields[0].Default
+		f, ok := got.(float32)
+		if !ok || !math.IsNaN(float64(f)) {
+			t.Fatalf("expected float32(NaN); got %T(%v)", got, got)
+		}
+	})
+
+	t.Run("float_pos_inf", func(t *testing.T) {
+		s := mkSchema(t, "float", math.Inf(1))
+		got := s.Root().Fields[0].Default
+		f, ok := got.(float32)
+		if !ok || !math.IsInf(float64(f), 1) {
+			t.Fatalf("expected float32(+Inf); got %T(%v)", got, got)
+		}
+	})
+}
+
 // TestRegression_MetadataAPICoerceStringFloatDefault pins:
 // Schema.Root().Fields[].Default for string-form float defaults (e.g.
 // {"type":"float","default":"1.5"}) surfaces the schema-width-faithful
@@ -9459,7 +9603,7 @@ func TestRegression_JSONEnumDecodeIntoIntTargetParity(t *testing.T) {
 		// symbol enum should reject ordinals that don't fit.
 		var syms strings.Builder
 		syms.WriteString(`{"type":"enum","name":"E","symbols":[`)
-		for i := 0; i < 200; i++ {
+		for i := range 200 {
 			if i > 0 {
 				syms.WriteString(",")
 			}
@@ -11184,7 +11328,6 @@ func TestParity_RuntimeRejectionMatrix(t *testing.T) {
 			{"date from bool", `{"type":"int","logicalType":"date"}`, true},
 		}
 		for _, c := range cells {
-			c := c
 			t.Run(c.name, func(t *testing.T) {
 				s := avro.MustParse(c.schema)
 				if _, err := s.AppendEncode(nil, c.input); err == nil {
@@ -11210,7 +11353,6 @@ func TestParity_RuntimeRejectionMatrix(t *testing.T) {
 			{"enum unknown symbol", `{"type":"enum","name":"E","symbols":["A","B"]}`, "Z"},
 		}
 		for _, c := range cells {
-			c := c
 			t.Run(c.name, func(t *testing.T) {
 				s := avro.MustParse(c.schema)
 				if _, err := s.AppendEncodeJSON(nil, c.input); err == nil {
@@ -11255,7 +11397,6 @@ func TestParity_RuntimeRejectionMatrix(t *testing.T) {
 			{"map negative key length", `{"type":"map","values":"int"}`, []byte{0x02, 0x01, 0x00}},
 		}
 		for _, c := range cells {
-			c := c
 			t.Run(c.name, func(t *testing.T) {
 				s := avro.MustParse(c.schema)
 				var out any
@@ -11299,7 +11440,6 @@ func TestParity_RuntimeRejectionMatrix(t *testing.T) {
 			{"date from non-int", `{"type":"int","logicalType":"date"}`, `"abc"`},
 		}
 		for _, c := range cells {
-			c := c
 			t.Run(c.name, func(t *testing.T) {
 				s := avro.MustParse(c.schema)
 				var out any
@@ -12903,14 +13043,14 @@ func TestRegression_LookupCIDeterminism(t *testing.T) {
 		t.Fatalf("Parse: %v", err)
 	}
 	root1 := s.Root()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		root := s.Root()
 		if !reflect.DeepEqual(root, root1) {
 			t.Fatalf("Root() flapping on iter %d:\n  expected: %+v\n  got:      %+v", i, root1, root)
 		}
 	}
 	canon1 := string(s.Canonical())
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if got := string(s.Canonical()); got != canon1 {
 			t.Fatalf("Canonical() flapping on iter %d:\n  expected: %s\n  got:      %s", i, canon1, got)
 		}
@@ -13153,7 +13293,7 @@ func TestRegression_ResolveDoesNotMutateInputs(t *testing.T) {
 	// readers — exercises any shared-state mutation on w or the
 	// readers under race detector.
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		wg.Add(1)
 		go func(useTs bool) {
 			defer wg.Done()
@@ -14272,11 +14412,9 @@ func TestParity_ConcurrentSchema(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < goroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < iters; j++ {
+	for range goroutines {
+		wg.Go(func() {
+			for range iters {
 				// Concurrent encode.
 				if _, err := s.AppendEncode(nil, in); err != nil {
 					t.Errorf("concurrent encode: %v", err)
@@ -14293,7 +14431,7 @@ func TestParity_ConcurrentSchema(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -16670,9 +16808,7 @@ func TestRegression_NumberGrammarParityMatrix(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		for _, target := range typeCases {
-			target := target
 			t.Run(c.desc+"/"+target.name, func(t *testing.T) {
 				s, err := avro.Parse(target.schema)
 				if err != nil {
@@ -16749,7 +16885,6 @@ func TestRegression_NumberGrammarParityMatrix_Decimal(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, c := range cases {
-			c := c
 			t.Run(sj.name+"/"+c.desc, func(t *testing.T) {
 				// json.Number arm.
 				_, jnErr := s.AppendEncode(nil, json.Number(c.input))
@@ -16936,7 +17071,6 @@ func TestRegression_DecimalExponentOverflowRejectsAcrossArms(t *testing.T) {
 			t.Fatalf("parse %s: %v", sj.name, err)
 		}
 		for _, in := range overflowInputs {
-			in := in
 			t.Run(sj.name+"/overflow/"+in, func(t *testing.T) {
 				// fixed-decimal-22byte's serSize-fallthrough is only
 				// reachable when the string's length exactly matches the
@@ -16970,7 +17104,6 @@ func TestRegression_DecimalExponentOverflowRejectsAcrossArms(t *testing.T) {
 			})
 		}
 		for _, in := range acceptInputs {
-			in := in
 			t.Run(sj.name+"/accept/"+in, func(t *testing.T) {
 				// Reject-via-precision schemas don't apply here — these
 				// inputs are chosen to fit precision=5 at scale=2.
@@ -17029,7 +17162,6 @@ func TestRegression_NumberGrammarParityMatrix_JSONDecode_Long(t *testing.T) {
 
 	s := avro.MustParse(`"long"`)
 	for _, c := range cases {
-		c := c
 		t.Run(c.desc, func(t *testing.T) {
 			var v int64
 			err := s.DecodeJSON([]byte(c.input), &v)
@@ -17119,10 +17251,7 @@ func TestRegression_NumberGrammarParityMatrix_JSONDecode_AllTypes(t *testing.T) 
 	}
 
 	for _, c := range cases {
-		c := c
 		for i, tg := range targets {
-			tg := tg
-			i := i
 			t.Run(c.desc+"/"+tg.schema, func(t *testing.T) {
 				s := avro.MustParse(tg.schema)
 				err := tg.decode(s, []byte(c.input))
@@ -17243,7 +17372,6 @@ func TestRegression_UnionDispatchMatrix(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.desc, func(t *testing.T) {
 			s := avro.MustParse(c.schema)
 			out, err := s.AppendEncode(nil, c.input)
@@ -17366,7 +17494,6 @@ func TestRegression_LogicalTypeRoundTripMatrix(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.desc+"/binary", func(t *testing.T) {
 			s := avro.MustParse(c.schema)
 			out, err := s.AppendEncode(nil, c.value)
@@ -17441,7 +17568,6 @@ func TestRegression_PromotionMatrix(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.desc, func(t *testing.T) {
 			w := avro.MustParse(c.writer)
 			r := avro.MustParse(c.reader)
@@ -17487,7 +17613,6 @@ func TestRegression_PromotionInvalid(t *testing.T) {
 		{`"float"`, `"long"`, "float→long (narrowing)"},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.desc, func(t *testing.T) {
 			w := avro.MustParse(c.writer)
 			r := avro.MustParse(c.reader)
@@ -17706,7 +17831,6 @@ func TestRegression_DefaultFillMatrix(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.desc+"/binary", func(t *testing.T) {
 			schema := `{"type":"record","name":"R","fields":[` + c.field + `]}`
 			s := avro.MustParse(schema)
@@ -17765,7 +17889,6 @@ func TestRegression_DefaultFillLogicalTypes(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.desc, func(t *testing.T) {
 			schema := `{"type":"record","name":"R","fields":[` + c.field + `]}`
 			s, err := avro.Parse(schema)
@@ -18055,7 +18178,6 @@ func TestRegression_TaggedUnionMatrix(t *testing.T) {
 			"hello",
 			nil,
 		} {
-			val := val
 			out, err := s.AppendEncodeJSON(nil, val, avro.TaggedUnions())
 			if err != nil {
 				t.Errorf("encode %v: %v", val, err)
@@ -18219,7 +18341,6 @@ func TestRegression_SchemaIntrospectionMatrix(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		c := c
 		t.Run(c.desc, func(t *testing.T) {
 			s := avro.MustParse(c.schema)
 
@@ -18527,7 +18648,7 @@ func TestRegression_SchemaCacheConcurrency(t *testing.T) {
 	const iters = 100
 
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
+	for i := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -18536,7 +18657,7 @@ func TestRegression_SchemaCacheConcurrency(t *testing.T) {
 				`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`,
 				`{"type":"array","items":"long"}`,
 			}
-			for j := 0; j < iters; j++ {
+			for j := range iters {
 				sch := schemas[j%len(schemas)]
 				s, err := c.Parse(sch)
 				if err != nil {
@@ -18721,11 +18842,12 @@ func TestRegression_JSONDecodeFixedSizeArrayTarget(t *testing.T) {
 // metadata path doesn't use float64 for exact-integer values.
 //
 // Concretely:
-//   "9.2233720368547758e18" → big.Rat 9223372036854775800 (fits int64).
-//   Metadata Default = int64(9223372036854775800); wire = same. Accept.
-//   "9.223372036854775808e18" → big.Rat 9223372036854775808 (= 2^63,
-//   doesn't fit int64). Metadata = float64(2^63); wire-fill via
-//   defaultAsInt64 rejects. Schema parse rejects.
+//
+//	"9.2233720368547758e18" → big.Rat 9223372036854775800 (fits int64).
+//	Metadata Default = int64(9223372036854775800); wire = same. Accept.
+//	"9.223372036854775808e18" → big.Rat 9223372036854775808 (= 2^63,
+//	doesn't fit int64). Metadata = float64(2^63); wire-fill via
+//	defaultAsInt64 rejects. Schema parse rejects.
 func TestRegression_IntegerDefaultExactValueAccepted(t *testing.T) {
 	// Reject cases: the exact value doesn't fit the target type.
 	rejectCases := []struct {
@@ -19742,11 +19864,11 @@ func TestRegression_DeepSchemaParseRunsInBoundedTime(t *testing.T) {
 	}
 	build := func(depth int) string {
 		var b strings.Builder
-		for i := 0; i < depth; i++ {
+		for i := range depth {
 			b.WriteString(fmt.Sprintf(`{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i))
 		}
 		b.WriteString(`"int"`)
-		for i := 0; i < depth; i++ {
+		for range depth {
 			b.WriteString(`}]}`)
 		}
 		return b.String()
