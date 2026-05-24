@@ -317,7 +317,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 				if prev, exists := d.defined[n.Name]; exists {
 					cur, _ := json.Marshal(n.toJSON())
 					if string(cur) != prev && d.err == nil {
-						d.err = fmt.Errorf("avro: conflicting definitions for named type %q", n.Name)
+						d.err = fmt.Errorf("avro: conflicting definitions for named type %q", truncForError(n.Name))
 					}
 					return n.Name
 				}

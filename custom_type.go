@@ -80,6 +80,12 @@ type CustomType struct {
 	// If nil, the built-in logical type encoder is used, which accepts
 	// both enriched types ([time.Time], [time.Duration]) and raw
 	// values (int64, int32, etc.).
+	//
+	// The schema argument is built once at Parse and shared across all
+	// concurrent invocations. Treat it as read-only; in particular, do
+	// not mutate schema.Props or schema.Symbols — those slices/maps
+	// alias the parser's internal state and concurrent writes from
+	// multiple goroutines decoding the same [*Schema] will race.
 	Encode func(v any, schema *SchemaNode) (any, error)
 
 	// Decode converts a raw Avro-native value to a custom Go value,
@@ -93,6 +99,9 @@ type CustomType struct {
 	// base Avro type decoder is used directly, producing raw
 	// Avro-native values (int32, int64, etc.) rather than enriched
 	// types ([time.Time], [time.Duration], etc.).
+	//
+	// The schema argument is shared across concurrent callback invocations;
+	// see [CustomType.Encode] for the read-only contract.
 	Decode func(v any, schema *SchemaNode) (any, error)
 
 	// Set by NewCustomType; if true and AvroType is "", Parse returns

@@ -20941,3 +20941,258 @@ func TestRegression_ErrorMessageBoundedForHostileInput(t *testing.T) {
 		mustHaveBoundedErr(t, "DecodeJSON 1MiB decimal bare number", err)
 	})
 }
+
+// TestRegression_SchemaParseErrorBoundedForHostileInput pins that every
+// schema-parse error message that interpolates a user-controllable name,
+// symbol, or default literal caps the interpolated portion via
+// truncForError. Without this cap, a hostile Schema Registry pull (the
+// documented use case at doc.go and README.md) producing a schema with
+// a 1+ MiB field name / enum symbol / type reference would emit a 1+ MiB
+// error message — a 1:1 DoS amplification through logs, RPC error
+// trailers (gRPC default trailer cap is 4 KiB; ~250 KiB exceeds typical
+// caps), Prometheus metric labels, and tracing systems.
+//
+// Sibling-coverage: each schema-parse-time interpolation site reachable
+// from avro.Parse is exercised. The previously-pinned
+// TestRegression_ErrorMessageBoundedForHostileInput covers encode-time
+// and decode-time sites; this test covers the schema-parse-time and
+// resolution-time sites that take the same input shape via a different
+// code path.
+//
+// Boundary symmetry: each subtest also confirms a SHORT input (10 chars)
+// still produces an informative error message — the truncation only
+// kicks in for hostile-length input, so legitimate diagnostic content
+// survives unchanged.
+func TestRegression_SchemaParseErrorBoundedForHostileInput(t *testing.T) {
+	const maxErrLen = 4096
+	const huge1MiB = 1 << 20
+
+	mustHaveBoundedErr := func(t *testing.T, label string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: expected error, got nil", label)
+		}
+		if got := len(err.Error()); got > maxErrLen {
+			t.Errorf("%s: error length %d exceeds %d-byte cap (hostile-input amplification)", label, got, maxErrLen)
+		}
+	}
+	mustHaveInformativeErr := func(t *testing.T, label string, err error, mustContain string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: expected error, got nil", label)
+		}
+		if !strings.Contains(err.Error(), mustContain) {
+			t.Errorf("%s: short-input error %q lost diagnostic content (expected to contain %q)", label, err.Error(), mustContain)
+		}
+	}
+
+	t.Run("unknown primitive name", func(t *testing.T) {
+		huge := strings.Repeat("Z", huge1MiB)
+		_, err := avro.Parse(fmt.Sprintf(`"%s"`, huge))
+		mustHaveBoundedErr(t, "Parse hostile primitive name", err)
+
+		_, err = avro.Parse(`"notatype"`)
+		mustHaveInformativeErr(t, "Parse short bad primitive", err, "notatype")
+	})
+
+	t.Run("invalid field name", func(t *testing.T) {
+		huge := strings.Repeat("A", huge1MiB)
+		// "a-..." contains a dash → validName rejects.
+		src := fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"a-%s","type":"int"}]}`, huge)
+		_, err := avro.Parse(src)
+		mustHaveBoundedErr(t, "Parse hostile field name", err)
+
+		_, err = avro.Parse(`{"type":"record","name":"R","fields":[{"name":"a-b","type":"int"}]}`)
+		mustHaveInformativeErr(t, "Parse short bad field name", err, "a-b")
+	})
+
+	t.Run("invalid enum symbol", func(t *testing.T) {
+		huge := strings.Repeat("A", huge1MiB)
+		// "9..." starts with a digit → validName rejects.
+		src := fmt.Sprintf(`{"type":"enum","name":"E","symbols":["9%s"]}`, huge)
+		_, err := avro.Parse(src)
+		mustHaveBoundedErr(t, "Parse hostile enum symbol", err)
+
+		_, err = avro.Parse(`{"type":"enum","name":"E","symbols":["9bad"]}`)
+		mustHaveInformativeErr(t, "Parse short bad enum symbol", err, "9bad")
+	})
+
+	t.Run("unknown named type reference", func(t *testing.T) {
+		huge := strings.Repeat("A", huge1MiB)
+		// Reference an undefined named type; build() reports "unknown type %q".
+		src := fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"a","type":"%s"}]}`, huge)
+		_, err := avro.Parse(src)
+		mustHaveBoundedErr(t, "Parse hostile named-type reference", err)
+
+		_, err = avro.Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"Unknown"}]}`)
+		mustHaveInformativeErr(t, "Parse short unknown named type", err, "Unknown")
+	})
+
+	t.Run("duplicate named type", func(t *testing.T) {
+		// Two records sharing the same long fullname → "duplicate named type %q".
+		// Use ~512 KiB so total schema stays under 1 MiB but the name itself
+		// is large enough to exceed any reasonable error budget if echoed.
+		huge := strings.Repeat("A", huge1MiB/2)
+		src := fmt.Sprintf(
+			`[{"type":"record","name":"%s","fields":[]},{"type":"record","name":"%s","fields":[]}]`,
+			huge, huge,
+		)
+		_, err := avro.Parse(src)
+		mustHaveBoundedErr(t, "Parse hostile duplicate named type", err)
+
+		_, err = avro.Parse(`[{"type":"record","name":"Dup","fields":[]},{"type":"record","name":"Dup","fields":[]}]`)
+		mustHaveInformativeErr(t, "Parse short duplicate named type", err, "Dup")
+	})
+
+	t.Run("duplicate record field name", func(t *testing.T) {
+		huge := strings.Repeat("A", huge1MiB)
+		src := fmt.Sprintf(
+			`{"type":"record","name":"R","fields":[{"name":"%s","type":"int"},{"name":"%s","type":"int"}]}`,
+			huge, huge,
+		)
+		_, err := avro.Parse(src)
+		mustHaveBoundedErr(t, "Parse hostile duplicate field", err)
+
+		_, err = avro.Parse(`{"type":"record","name":"R","fields":[{"name":"dup","type":"int"},{"name":"dup","type":"int"}]}`)
+		mustHaveInformativeErr(t, "Parse short duplicate field", err, "dup")
+	})
+
+	t.Run("duplicate union type", func(t *testing.T) {
+		// A union with two "int" branches has "int" as the duplicate key.
+		// To exercise the unbounded code path, use a duplicate named type
+		// reference; the dispatch key would otherwise be a short builtin name.
+		// First, register the type via a record field with a 1 MiB name, then
+		// reference it twice in a union.
+		huge := strings.Repeat("A", huge1MiB)
+		src := fmt.Sprintf(
+			`{"type":"record","name":"R","fields":[{"name":"u","type":["int",{"type":"enum","name":"%s","symbols":["X"]},"%s"]}]}`,
+			huge, huge,
+		)
+		_, err := avro.Parse(src)
+		mustHaveBoundedErr(t, "Parse hostile duplicate union type", err)
+
+		_, err = avro.Parse(`{"type":"record","name":"R","fields":[{"name":"u","type":["int","int"]}]}`)
+		mustHaveInformativeErr(t, "Parse short duplicate union type", err, "int")
+	})
+
+	t.Run("invalid field order", func(t *testing.T) {
+		huge := strings.Repeat("A", huge1MiB)
+		// validName accepts the order token's character set, but Parse
+		// rejects unless it's one of the three documented orders.
+		src := fmt.Sprintf(
+			`{"type":"record","name":"R","fields":[{"name":"a","type":"int","order":"%s"}]}`,
+			huge,
+		)
+		_, err := avro.Parse(src)
+		mustHaveBoundedErr(t, "Parse hostile field order", err)
+
+		_, err = avro.Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int","order":"bogus"}]}`)
+		mustHaveInformativeErr(t, "Parse short bad field order", err, "bogus")
+	})
+
+	t.Run("invalid record name", func(t *testing.T) {
+		huge := strings.Repeat("A", huge1MiB)
+		// Leading dash invalidates the name.
+		src := fmt.Sprintf(`{"type":"record","name":"-%s","fields":[]}`, huge)
+		_, err := avro.Parse(src)
+		mustHaveBoundedErr(t, "Parse hostile record name", err)
+
+		_, err = avro.Parse(`{"type":"record","name":"-bad","fields":[]}`)
+		mustHaveInformativeErr(t, "Parse short bad record name", err, "-bad")
+	})
+
+	t.Run("unknown complex type", func(t *testing.T) {
+		huge := strings.Repeat("A", huge1MiB)
+		// A complex-shaped object (here, "items" forces complex-type
+		// dispatch) with a non-recognized "type" triggers the
+		// "unknown complex type %q" path.
+		src := fmt.Sprintf(`{"type":"%s","items":"int"}`, huge)
+		_, err := avro.Parse(src)
+		mustHaveBoundedErr(t, "Parse hostile complex type", err)
+
+		_, err = avro.Parse(`{"type":"weird","items":"int"}`)
+		mustHaveInformativeErr(t, "Parse short bad complex type", err, "weird")
+	})
+}
+
+// TestRegression_SchemaForRejectsDuplicateFieldName pins that SchemaFor
+// returns an error when two Go struct fields at the same depth produce
+// the same Avro field name. Without this rejection, the dedup loop in
+// collectFields would silently keep one field and drop the other,
+// causing silent data loss at encode time — the user passes a value
+// for the dropped field, the encoder has no schema position for it,
+// and the value is silently discarded.
+//
+// Embedded-struct shadowing (different nesting depths) still works:
+// an outer tagged field correctly overrides an inner untagged field of
+// the same name. Only same-depth siblings error.
+//
+// Cross-impl: Java's Schema.RecordSchema.setFields rejects with
+// "Duplicate field X in record Y" (Schema.java); hamba rejects similarly.
+func TestRegression_SchemaForRejectsDuplicateFieldName(t *testing.T) {
+	// Two siblings collide on Avro name "X" — error.
+	type Collision struct {
+		A int    `avro:"X"`
+		X string // also produces Avro name "X"
+	}
+	_, err := avro.SchemaFor[Collision]()
+	if err == nil {
+		t.Fatal("expected duplicate-field error, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate field") {
+		t.Errorf("error %q does not mention duplicate field", err.Error())
+	}
+
+	// Embedded shadowing — outer tagged field overrides inner untagged.
+	// This is legitimate use; should NOT error.
+	type Inner struct {
+		X int
+	}
+	type Outer struct {
+		Inner
+		Y int `avro:"X"`
+	}
+	s, err := avro.SchemaFor[Outer]()
+	if err != nil {
+		t.Fatalf("legitimate embed-shadow rejected: %v", err)
+	}
+	got := s.String()
+	if !strings.Contains(got, `"name":"X"`) {
+		t.Errorf("embed-shadow schema missing X field: %s", got)
+	}
+}
+
+// TestRegression_SchemaForRejectsDashTagWithOptions pins that an `avro`
+// struct tag starting with "-" but not equal to "-" (e.g. "-,inline",
+// "-opt", "-foo") is rejected. Without this rejection, the exact-match
+// skip check (`if tag == "-"`) would let the tag through to
+// parseSchemaTag, where the option list is processed against an
+// implied empty name — the field gets silently dropped without an
+// error, producing an empty record. The encoding/json convention
+// treats "-" as exact-match skip and "-,opt" as a field literally
+// named "-"; either is fine but silent drop is neither.
+func TestRegression_SchemaForRejectsDashTagWithOptions(t *testing.T) {
+	type WithDashInline struct {
+		X int `avro:"-,inline"`
+	}
+	_, err := avro.SchemaFor[WithDashInline]()
+	if err == nil {
+		t.Fatal("expected error for avro:\"-,inline\", got nil")
+	}
+	if !strings.Contains(err.Error(), `"-"`) && !strings.Contains(err.Error(), "skip") {
+		t.Errorf("error %q does not mention the skip directive", err.Error())
+	}
+
+	// Exact "-" still skips correctly — sibling positive case.
+	type WithDashOnly struct {
+		Y int `avro:"-"`
+		Z int
+	}
+	s, err := avro.SchemaFor[WithDashOnly]()
+	if err != nil {
+		t.Fatalf("exact avro:\"-\" should skip cleanly, got: %v", err)
+	}
+	if !strings.Contains(s.String(), `"name":"Z"`) || strings.Contains(s.String(), `"name":"Y"`) {
+		t.Errorf("avro:\"-\" did not skip Y, schema=%s", s.String())
+	}
+}

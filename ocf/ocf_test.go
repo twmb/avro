@@ -3870,3 +3870,56 @@ func TestRegression_OCFReaderSchemaPromotion(t *testing.T) {
 		t.Errorf("got %d, want 42", got)
 	}
 }
+
+// TestRegression_OCFUnknownCodecErrorBounded pins that an unknown
+// avro.codec metadata value from a hostile OCF file produces a bounded
+// error message. The per-entry metadata cap is ocfMetadataSafetyLimit
+// (1 MiB), so without truncation in the unknown-codec error path a
+// hostile producer could emit a 1 MiB codec name and the parse error
+// would echo all of it — 1:1 DoS amplification through logs and RPC
+// error trailers.
+//
+// Boundary symmetry: a short bad codec name still produces an
+// informative error message.
+func TestRegression_OCFUnknownCodecErrorBounded(t *testing.T) {
+	const maxErrLen = 4096
+
+	mkOCF := func(codecName string) []byte {
+		var buf bytes.Buffer
+		buf.Write([]byte{'O', 'b', 'j', 0x01})
+		schemaJSON := `"long"`
+		mb := make([]byte, 0)
+		mb = binary.AppendVarint(mb, 2)
+		mb = binary.AppendVarint(mb, int64(len("avro.schema")))
+		mb = append(mb, "avro.schema"...)
+		mb = binary.AppendVarint(mb, int64(len(schemaJSON)))
+		mb = append(mb, schemaJSON...)
+		mb = binary.AppendVarint(mb, int64(len("avro.codec")))
+		mb = append(mb, "avro.codec"...)
+		mb = binary.AppendVarint(mb, int64(len(codecName)))
+		mb = append(mb, codecName...)
+		mb = binary.AppendVarint(mb, 0)
+		buf.Write(mb)
+		buf.Write(make([]byte, 16)) // sync marker
+		return buf.Bytes()
+	}
+
+	// Hostile 1 MiB codec name.
+	hostile := strings.Repeat("X", 1<<20)
+	_, err := NewReader(bytes.NewReader(mkOCF(hostile)))
+	if err == nil {
+		t.Fatal("expected error for hostile codec name")
+	}
+	if got := len(err.Error()); got > maxErrLen {
+		t.Errorf("hostile codec name: error length %d exceeds %d-byte cap", got, maxErrLen)
+	}
+
+	// Short bad name — informative content preserved.
+	_, err = NewReader(bytes.NewReader(mkOCF("bogus")))
+	if err == nil {
+		t.Fatal("expected error for bogus codec name")
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Errorf("short codec name error %q lost diagnostic content", err.Error())
+	}
+}

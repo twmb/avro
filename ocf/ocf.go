@@ -935,7 +935,22 @@ func resolveCodec(name string, custom []Codec) (Codec, error) {
 	case "zstandard":
 		return ZstdCodec(nil, nil)
 	}
-	return nil, fmt.Errorf("ocf: unknown codec %q", name)
+	return nil, fmt.Errorf("ocf: unknown codec %q", truncForError(name))
+}
+
+// truncForError caps a wire-derived string at 80 chars for inclusion in
+// error messages. The OCF metadata-map value cap is 1 MiB per entry
+// (ocfMetadataSafetyLimit), so without this an unknown-codec name from
+// a hostile producer would echo up to 1 MiB into the parse error and
+// 1:1-amplify through logging / RPC error trailers. Mirrors the
+// truncForError helper in the root avro package (which is unexported
+// and not reachable from this subpackage).
+func truncForError(s string) string {
+	const max = 80
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 // ---------- Avro map encoding helpers ----------

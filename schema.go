@@ -876,7 +876,7 @@ func (b *builder) validNameErr(s string) error {
 		return b.checkName(s)
 	}
 	if !validName(s) {
-		return fmt.Errorf("invalid name %q", s)
+		return fmt.Errorf("invalid name %q", truncForError(s))
 	}
 	return nil
 }
@@ -887,7 +887,7 @@ func (b *builder) validFullnameErr(s string) error {
 		if b.checkName != nil {
 			return b.checkName(s)
 		}
-		return fmt.Errorf("invalid name %q", s)
+		return fmt.Errorf("invalid name %q", truncForError(s))
 	}
 	for part := range strings.SplitSeq(s, ".") {
 		if err := b.validNameErr(part); err != nil {
@@ -1035,7 +1035,7 @@ func (b *builder) finalize() error {
 		for idx, name := range m.missing {
 			nt := b.named[name]
 			if nt == nil {
-				return fmt.Errorf("unknown type %q", name)
+				return fmt.Errorf("unknown type %q", truncForError(name))
 			}
 			m.ser.fns[idx] = nt.ser
 		}
@@ -1053,7 +1053,7 @@ func (b *builder) finalize() error {
 	for _, m := range b.fieldFixups {
 		nt := b.named[m.name]
 		if nt == nil {
-			return fmt.Errorf("unknown type %q", m.name)
+			return fmt.Errorf("unknown type %q", truncForError(m.name))
 		}
 		m.sr.fields[m.idx].fn = nt.ser
 		m.dr.fields[m.idx].fn = nt.deser
@@ -1075,14 +1075,14 @@ func (b *builder) finalize() error {
 				defaultVal, nt.node, m.sr.fields[m.idx].name,
 				&m.dr.fields[m.idx], &m.nd.fields[m.idx], &m.sr.fields[m.idx],
 			); err != nil {
-				return fmt.Errorf("type %q: %w", m.name, err)
+				return fmt.Errorf("type %q: %w", truncForError(m.name), err)
 			}
 		}
 	}
 	for _, m := range b.containerFixups {
 		nt := b.named[m.name]
 		if nt == nil {
-			return fmt.Errorf("%s references unknown named type %q", m.ctxLabel, m.name)
+			return fmt.Errorf("%s references unknown named type %q", m.ctxLabel, truncForError(m.name))
 		}
 		*m.serItem = nt.ser
 		*m.deserItem = nt.deser
@@ -1109,7 +1109,9 @@ func (s *aschema) unionTypeName() (string, string, error) {
 
 type unknownPrimitiveError struct{ p string }
 
-func (e *unknownPrimitiveError) Error() string { return fmt.Sprintf("unknown primitive %q", e.p) }
+func (e *unknownPrimitiveError) Error() string {
+	return fmt.Sprintf("unknown primitive %q", truncForError(e.p))
+}
 
 func (b *builder) build(parentName string, s *aschema) error {
 	if s == nil || s.primitive == "" && s.object == nil && len(s.union) == 0 {
@@ -1401,7 +1403,7 @@ func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *name
 	}
 	visited := make(map[*schemaNode]bool)
 	if matched := b.findCustomTypeMatchInSubtree(nt.node, visited); matched != "" {
-		return fmt.Errorf("avro: cached type %q contains %q which would match a CustomType on this Parse; re-parse %q with the CustomType first", refName, matched, refName)
+		return fmt.Errorf("avro: cached type %q contains %q which would match a CustomType on this Parse; re-parse %q with the CustomType first", truncForError(refName), truncForError(matched), truncForError(refName))
 	}
 	return nil
 }
@@ -1523,7 +1525,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			key = missing[i]
 		}
 		if sawTypes[key] {
-			return fmt.Errorf("duplicate union type %q", key)
+			return fmt.Errorf("duplicate union type %q", truncForError(key))
 		}
 		sawTypes[key] = true
 
@@ -1849,11 +1851,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	switch o.Type {
 	case "record", "error", "enum", "fixed":
 		if err := b.validFullnameErr(o.Name); err != nil {
-			return fmt.Errorf("invalid %s name %q: %w", o.Type, o.Name, err)
+			return fmt.Errorf("invalid %s name %q: %w", truncForError(o.Type), truncForError(o.Name), err)
 		}
 		for _, a := range origAliases {
 			if err := b.validFullnameErr(a); err != nil {
-				return fmt.Errorf("invalid %s alias %q: %w", o.Type, a, err)
+				return fmt.Errorf("invalid %s alias %q: %w", truncForError(o.Type), truncForError(a), err)
 			}
 		}
 		ns := ""
@@ -1881,7 +1883,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		canonObj.Namespace = nil
 		if _, exists := b.named[o.Name]; exists {
 			if !b.cachedNames[o.Name] {
-				return fmt.Errorf("duplicate named type %q", o.Name)
+				return fmt.Errorf("duplicate named type %q", truncForError(o.Name))
 			}
 			// Name exists from cache — allow re-registration
 			// (custom types need to re-parse to get fresh wiring).
@@ -1894,7 +1896,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 
 	switch o.Type {
 	default:
-		return fmt.Errorf("unknown complex type %q", o.Type)
+		return fmt.Errorf("unknown complex type %q", truncForError(o.Type))
 
 	case "record", "error":
 		if len(o.Symbols) > 0 ||
@@ -1932,19 +1934,19 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
 			if err := b.validNameErr(of.Name); err != nil {
-				return fmt.Errorf("invalid field name %q: %w", of.Name, err)
+				return fmt.Errorf("invalid field name %q: %w", truncForError(of.Name), err)
 			}
 			for _, a := range origFieldAliases[i] {
 				if err := b.validNameErr(a); err != nil {
-					return fmt.Errorf("invalid field alias %q for field %q: %w", a, of.Name, err)
+					return fmt.Errorf("invalid field alias %q for field %q: %w", truncForError(a), truncForError(of.Name), err)
 				}
 			}
 			if seenFields[of.Name] {
-				return fmt.Errorf("duplicate record field name %q", of.Name)
+				return fmt.Errorf("duplicate record field name %q", truncForError(of.Name))
 			}
 			seenFields[of.Name] = true
 			if of.Order != "" && of.Order != "ascending" && of.Order != "descending" && of.Order != "ignore" {
-				return fmt.Errorf("invalid field order %q for field %q", of.Order, of.Name)
+				return fmt.Errorf("invalid field order %q for field %q", truncForError(of.Order), truncForError(of.Name))
 			}
 			bf := b.nest()
 			// captureFwdRef converts unknownPrimitiveError from a nested
@@ -2055,12 +2057,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		nd.fieldIdx = make(map[string]int, len(nd.fields))
 		for i, f := range nd.fields {
 			if _, exists := nd.fieldIdx[f.name]; exists {
-				return fmt.Errorf("record field name %q collides with another field name or alias", f.name)
+				return fmt.Errorf("record field name %q collides with another field name or alias", truncForError(f.name))
 			}
 			nd.fieldIdx[f.name] = i
 			for _, a := range f.aliases {
 				if _, exists := nd.fieldIdx[a]; exists {
-					return fmt.Errorf("record field alias %q collides with another field name or alias", a)
+					return fmt.Errorf("record field alias %q collides with another field name or alias", truncForError(a))
 				}
 				nd.fieldIdx[a] = i
 			}
@@ -2088,10 +2090,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		seenSymbols := make(map[string]bool, len(o.Symbols))
 		for _, e := range o.Symbols {
 			if err := b.validNameErr(e); err != nil {
-				return fmt.Errorf("invalid enum symbol %q: %w", e, err)
+				return fmt.Errorf("invalid enum symbol %q: %w", truncForError(e), err)
 			}
 			if seenSymbols[e] {
-				return fmt.Errorf("duplicate enum symbol %q", e)
+				return fmt.Errorf("duplicate enum symbol %q", truncForError(e))
 			}
 			seenSymbols[e] = true
 		}
@@ -2471,7 +2473,7 @@ func (o *aobject) validateLogical() error {
 	}
 
 	if o.Scale != nil || o.Precision != nil {
-		return fmt.Errorf("type %q logicalType %q: invalid scale or precision specified", o.Type, o.Logical)
+		return fmt.Errorf("type %q logicalType %q: invalid scale or precision specified", truncForError(o.Type), truncForError(o.Logical))
 	}
 
 	return nil
@@ -2562,7 +2564,7 @@ func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
 	drf *deserRecordField, fn *fieldNode, srf *serRecordField,
 ) error {
 	if err := validateDefault(defaultVal, node); err != nil {
-		return fmt.Errorf("record field %q: invalid default: %v", fieldName, err)
+		return fmt.Errorf("record field %q: invalid default: %v", truncForError(fieldName), err)
 	}
 	defaultVal = convertDefaultBytes(defaultVal, node)
 	drf.defaultVal = defaultVal
@@ -2571,7 +2573,7 @@ func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
 	fn.hasDefault = true
 	defaultBytes, err := encodeDefault(nil, defaultVal, node)
 	if err != nil {
-		return fmt.Errorf("record field %q: encoding default: %v", fieldName, err)
+		return fmt.Errorf("record field %q: encoding default: %v", truncForError(fieldName), err)
 	}
 	srf.defaultBytes = defaultBytes
 	srf.hasDefault = true
@@ -2995,7 +2997,7 @@ func walkDefault(val any, node *schemaNode, visit func(any, *schemaNode) (any, e
 				}
 				fv2, err := walkDefault(fv, f.node, visit)
 				if err != nil {
-					return val, fmt.Errorf("field %q: %w", f.name, err)
+					return val, fmt.Errorf("field %q: %w", truncForError(f.name), err)
 				}
 				m[f.name] = fv2
 			}
@@ -3162,7 +3164,7 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 		// no-default field is an error regardless of per-field types.
 		for _, f := range node.fields {
 			if _, exists := m[f.name]; !exists && !f.hasDefault {
-				return val, fmt.Errorf("record default missing field %q with no default", f.name)
+				return val, fmt.Errorf("record default missing field %q with no default", truncForError(f.name))
 			}
 		}
 		// Coerce each present field in-place; walkDefault then recurses

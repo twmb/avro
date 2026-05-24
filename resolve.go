@@ -297,7 +297,7 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 				ReaderType: "record",
 				WriterType: "record",
 				Detail: fmt.Sprintf("writer fields %q and %q both resolve to reader field %q (via name + alias collision); rename the writer or drop the alias to disambiguate",
-					matchedByWriterName[ri], wf.name, r.fields[ri].name),
+					truncForError(matchedByWriterName[ri]), truncForError(wf.name), truncForError(r.fields[ri].name)),
 			}
 		}
 		readerMatched[ri] = true
@@ -320,7 +320,7 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 		}
 		encoded, err := encodeDefault(nil, rf.defaultVal, rf.node)
 		if err != nil {
-			return nil, fmt.Errorf("field %s: %w", fieldPath(path, rf.name), err)
+			return nil, fmt.Errorf("field %s: %w", truncForError(fieldPath(path, rf.name)), err)
 		}
 		deser := rf.node.deser
 		if w := ctx.custom[rf.node]; w != nil && len(w.decoders) > 0 {
@@ -511,7 +511,7 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 			}
 			defIdx, ok := readerIdx[r.enumDef]
 			if !ok {
-				return nil, fmt.Errorf("enum default %q not found in reader symbols", r.enumDef)
+				return nil, fmt.Errorf("enum default %q not found in reader symbols", truncForError(r.enumDef))
 			}
 			mapping[i] = defIdx
 		}
@@ -794,7 +794,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 				return appendVarint(dst, int32(i)), nil
 			}
 		}
-		return nil, fmt.Errorf("unknown enum symbol %q in default", s)
+		return nil, fmt.Errorf("unknown enum symbol %q in default", truncForError(s))
 	case "fixed":
 		var b []byte
 		switch v := val.(type) {
@@ -874,7 +874,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 			fval, exists := m[f.name]
 			if !exists {
 				if !f.hasDefault {
-					return nil, fmt.Errorf("record default missing field %q with no default", f.name)
+					return nil, fmt.Errorf("record default missing field %q with no default", truncForError(f.name))
 				}
 				fval = f.defaultVal
 			}

@@ -271,6 +271,16 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 		if tag == "-" {
 			continue
 		}
+		// Reject "-,opt" / "-foo" — the "-" skip directive is exact-match
+		// only. Anything else starting with "-" is a typo (user meant to
+		// skip but added options, or means to name a field literally "-"
+		// which Avro's naming rules reject anyway). Erroring here matches
+		// the user's likely intent and avoids the silent-empty-record
+		// outcome that "tag = '-,opt'" produced before this check.
+		if strings.HasPrefix(tag, "-") {
+			return nil, fmt.Errorf("avro: field %s has tag %q: the skip directive %q is exact-match only; remove the suffix or rename the field",
+				sf.Name, truncForError(tag), "-")
+		}
 		parts, err := splitTag(tag)
 		if err != nil {
 			return nil, err
@@ -310,11 +320,18 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	// rules are documented at doc.go:147-149 ("the shallowest wins;
 	// among fields at the same depth, a tagged field wins over an
 	// untagged one"):
-	//   1. Tagged beats untagged.
+	//   1. Tagged beats untagged across depths (shadowing).
 	//   2. Among same-tagged-status fields, shallower (shorter index
 	//      path) wins. Without this, dedup keeps first-seen — the
 	//      deeper embedded field — because nested-struct fields are
 	//      appended to raw BEFORE outer fields.
+	//
+	// Same-depth collisions error: when two fields at the SAME nesting
+	// depth produce the same Avro name there is no legitimate
+	// shadowing — the user wrote two sibling fields that disagree on
+	// who owns the name, so silently picking one would cause data loss
+	// at encode time. Java's RecordSchema.setFields rejects with
+	// "Duplicate field" (Schema.java:981); hamba rejects similarly.
 	type entry struct {
 		idx int
 		schemaField
@@ -322,6 +339,10 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	m := make(map[string]entry, len(raw))
 	for i, f := range raw {
 		if existing, ok := m[f.name]; ok {
+			if len(f.index) == len(existing.index) {
+				return nil, fmt.Errorf("avro: duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
+					truncForError(f.name), t.String(), truncForError(t.FieldByIndex(existing.index).Name), truncForError(t.FieldByIndex(f.index).Name))
+			}
 			if f.tagged && !existing.tagged {
 				m[f.name] = entry{i, f}
 				continue
