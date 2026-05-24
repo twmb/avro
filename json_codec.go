@@ -518,7 +518,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if slices.Contains(node.symbols, needle) {
 				return appendJSONString(buf, needle), nil
 			}
-			return nil, fmt.Errorf("avro json: unknown enum symbol %q", needle)
+			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(needle))
 		}
 		if v.CanInt() || v.CanUint() {
 			var n int
@@ -540,7 +540,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if slices.Contains(node.symbols, text) {
 				return appendJSONString(buf, text), nil
 			}
-			return nil, fmt.Errorf("avro json: unknown enum symbol %q", text)
+			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(text))
 		}
 		return nil, fmt.Errorf("avro json: expected string or integer for enum, got %s", v.Type())
 
@@ -978,7 +978,7 @@ func parseSpecialFloat(s string) (float64, error) {
 	case "-Infinity", "-INF", "-Inf":
 		return math.Inf(-1), nil
 	}
-	return 0, fmt.Errorf("avro json: unknown float value %q", s)
+	return 0, fmt.Errorf("avro json: unknown float value %q", truncForError(s))
 }
 
 // jsonEscapeShort returns the second byte of the 2-byte short JSON

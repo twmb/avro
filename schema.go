@@ -2112,7 +2112,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			var defStr string
 			json.Unmarshal(origEnumDefault, &defStr)
 			if !seenSymbols[defStr] {
-				return fmt.Errorf("enum default %q is not a member of symbols", defStr)
+				return fmt.Errorf("enum default %q is not a member of symbols", truncForError(defStr))
 			}
 			nd.enumDef = defStr
 			nd.hasEnumDef = true
@@ -2979,7 +2979,7 @@ func walkDefault(val any, node *schemaNode, visit func(any, *schemaNode) (any, e
 		if branch := firstUnionBranchAcceptingDefault(val, node); branch != nil {
 			return walkDefault(val, branch, visit)
 		}
-		return val, fmt.Errorf("default does not match any union branch: %T(%v)", val, val)
+		return val, fmt.Errorf("default does not match any union branch: %T(%s)", val, truncValueForError(val))
 	}
 	val, err := visit(val, node)
 	if err != nil {
@@ -3015,7 +3015,7 @@ func walkDefault(val any, node *schemaNode, visit func(any, *schemaNode) (any, e
 			for k, v := range m {
 				v2, err := walkDefault(v, node.values, visit)
 				if err != nil {
-					return val, fmt.Errorf("map key %q: %w", k, err)
+					return val, fmt.Errorf("map key %q: %w", truncForError(k), err)
 				}
 				m[k] = v2
 			}
@@ -3127,7 +3127,7 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 			return val, fmt.Errorf("expected string for enum default, got %T", val)
 		}
 		if len(node.symbols) > 0 && !slices.Contains(node.symbols, sym) {
-			return val, fmt.Errorf("enum default %q is not a member of symbols", sym)
+			return val, fmt.Errorf("enum default %q is not a member of symbols", truncForError(sym))
 		}
 	case "fixed":
 		s, ok := val.(string)

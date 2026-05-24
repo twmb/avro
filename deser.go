@@ -716,7 +716,7 @@ func boundedRatFromString(s string) (*big.Rat, bool, error) {
 		if len(s) > 0 {
 			c := s[0]
 			if c == '-' || c == '+' || c == '.' || (c >= '0' && c <= '9') {
-				return nil, false, fmt.Errorf("invalid JSON number %q", s)
+				return nil, false, fmt.Errorf("invalid JSON number %q", truncForError(s))
 			}
 		}
 		return nil, false, nil
@@ -735,7 +735,7 @@ func boundedRatFromString(s string) (*big.Rat, bool, error) {
 			// may legitimately fall back to raw-bytes encoding, and a
 			// numeric-looking string with an out-of-range exponent
 			// must not silently re-encode as opaque bytes.
-			return nil, false, fmt.Errorf("decimal exponent %s overflows int64", body[i+1:])
+			return nil, false, fmt.Errorf("decimal exponent %s overflows int64", truncForError(body[i+1:]))
 		}
 		netExp = exp
 		body = body[:i]
@@ -1485,7 +1485,7 @@ func rejectJSONNumberStringTarget(v reflect.Value, content, avroType string) err
 		return nil
 	}
 	return &SemanticError{GoType: v.Type(), AvroType: avroType,
-		Err: fmt.Errorf("string-like value %q has no JSON number representation", content)}
+		Err: fmt.Errorf("string-like value %q has no JSON number representation", truncForError(content))}
 }
 
 // setStringTarget is the combined "guard + SetString" applied at every
@@ -1914,7 +1914,7 @@ func setDecimalRat(v reflect.Value, r *big.Rat, scale int) (bool, error) {
 		// big.Rat.Float64 returns ±Inf when the rational is too large
 		// for float64; reject rather than silently writing Inf.
 		if math.IsInf(f, 0) {
-			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("decimal value %s overflows %s", r.RatString(), v.Kind())}
+			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("decimal value %s overflows %s", truncForError(r.RatString()), v.Kind())}
 		}
 		if v.Kind() == reflect.Float32 && finiteFloat32Overflows(f) {
 			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("value %g overflows float32", f)}
@@ -2103,22 +2103,22 @@ func parseUUID(s string) ([16]byte, error) {
 func parseUUIDBytes(s []byte) ([16]byte, error) {
 	var u [16]byte
 	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
-		return u, fmt.Errorf("invalid UUID %q", s)
+		return u, fmt.Errorf("invalid UUID %q", truncBytesForError(s))
 	}
 	if _, err := hex.Decode(u[0:4], s[0:8]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	if _, err := hex.Decode(u[4:6], s[9:13]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	if _, err := hex.Decode(u[6:8], s[14:18]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	if _, err := hex.Decode(u[8:10], s[19:23]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	if _, err := hex.Decode(u[10:16], s[24:36]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	return u, nil
 }

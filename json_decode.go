@@ -520,7 +520,7 @@ func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode) error {
 		}
 	}
 	if idx < 0 {
-		return fmt.Errorf("avro json: unknown enum symbol %q", s)
+		return fmt.Errorf("avro json: unknown enum symbol %q", truncForError(s))
 	}
 	// Mirrors deserEnum's target dispatch: Interface→symbol; String→symbol;
 	// Int/Uint→ordinal (Java's JsonDecoder.readEnum and fastavro's read_enum
@@ -669,10 +669,10 @@ func (ctx *jsonDecoder) decodeBareDecimal(v reflect.Value, node *schemaNode, toA
 	// retain it past the call, so alias nb instead of copying.
 	r, ok, perr := boundedRatFromString(unsafe.String(unsafe.SliceData(nb), len(nb)))
 	if perr != nil {
-		return true, fmt.Errorf("avro json: %s %q: %w", node.logical, nb, perr)
+		return true, fmt.Errorf("avro json: %s %q: %w", node.logical, truncBytesForError(nb), perr)
 	}
 	if !ok {
-		return true, fmt.Errorf("avro json: invalid %s number %q", node.logical, nb)
+		return true, fmt.Errorf("avro json: invalid %s number %q", node.logical, truncBytesForError(nb))
 	}
 	if toAny {
 		return true, setIface(v, reflect.ValueOf(r), node.kind)
@@ -686,7 +686,7 @@ func (ctx *jsonDecoder) decodeBareDecimal(v reflect.Value, node *schemaNode, toA
 	if node.logical == "big-decimal" {
 		s, ok := finiteScale(r)
 		if !ok {
-			return true, fmt.Errorf("avro json: big-decimal value %s has no finite decimal expansion", r.RatString())
+			return true, fmt.Errorf("avro json: big-decimal value %s has no finite decimal expansion", truncForError(r.RatString()))
 		}
 		scale = s
 	}

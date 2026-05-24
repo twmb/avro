@@ -914,7 +914,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 				return encoded, nil
 			}
 		}
-		return nil, fmt.Errorf("union default does not match any branch: %T(%v)", val, val)
+		return nil, fmt.Errorf("union default does not match any branch: %T(%s)", val, truncValueForError(val))
 	default:
 		return nil, fmt.Errorf("unsupported default encoding for type %q", node.kind)
 	}

@@ -526,19 +526,44 @@ func truncForError(s string) string {
 	return s[:max] + "..."
 }
 
-// truncBytesForError caps a user-controllable byte slice at 32 chars
-// before string conversion for error interpolation. 32 chars fits a
-// MaxInt64 representation (20 chars) with diagnostic headroom while
-// keeping the error message bounded on hostile multi-MB JSON input.
-// Shared by parseJSONInt32 / parseJSONInt64 (json_scan.go) where the
-// input `b` comes from the JSON scanner's number-bytes accumulator —
-// which has no upstream length cap of its own.
+// truncBytesForError caps a user-controllable byte slice at 40 chars
+// before string conversion for error interpolation. 40 chars fits a
+// MaxInt64 representation (20 chars) and a canonical hex-dash UUID
+// (36 chars) with headroom, while keeping the error message bounded
+// on hostile multi-MB inputs. Lower than [truncForError]'s 80-char
+// cap because every caller of truncBytesForError today (parseJSONInt32 /
+// parseJSONInt64 in json_scan.go, parseUUIDBytes in deser.go) operates
+// on a fixed-format value whose useful diagnostic prefix fits in
+// 40 chars; truncForError's 80-char cap is sized for arbitrary
+// string defaults / decimal literals where the useful prefix is wider.
 func truncBytesForError(b []byte) string {
-	const max = 32
+	const max = 40
 	if len(b) <= max {
 		return string(b)
 	}
 	return string(b[:max]) + "..."
+}
+
+// truncValueForError returns a "%v"-style string representation of v
+// bounded by [truncForError]. Use when interpolating a user-controllable
+// arbitrary-typed default value into an error message (the `%T(%v)` shape
+// at walkDefault's union arm and encodeDefault's union arm). For string /
+// []byte / json.Number inputs — the common ways user-controllable bytes
+// reach a default — the input is truncated WITHOUT first allocating the
+// unbounded "%v" representation. Other types format via fmt.Sprintf and
+// then truncate; container types (map / slice) are still bounded by
+// schema-parse-time JSON validation upstream so the intermediate
+// allocation is bounded by the on-the-wire JSON size.
+func truncValueForError(v any) string {
+	switch tv := v.(type) {
+	case string:
+		return truncForError(tv)
+	case []byte:
+		return truncBytesForError(tv)
+	case json.Number:
+		return truncForError(string(tv))
+	}
+	return truncForError(fmt.Sprintf("%v", v))
 }
 
 // parseInt64Lenient parses s as a decimal integer, accepting pure-integer,
@@ -1116,7 +1141,7 @@ func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		if i, ok := s.indexOfSymbol(needle); ok {
 			return appendVarint(dst, int32(i)), nil
 		}
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", needle)}
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", truncForError(needle))}
 
 	case v.CanInt() || v.CanUint():
 		var n int
@@ -1139,7 +1164,7 @@ func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		if i, idxOk := s.indexOfSymbol(needle); idxOk {
 			return appendVarint(dst, int32(i)), nil
 		}
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", needle)}
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", truncForError(needle))}
 	}
 	return nil, semErr(v, "enum")
 }
@@ -1750,20 +1775,20 @@ func tryCoerceToRat(v reflect.Value) (*big.Rat, bool, error) {
 		s := v.Interface().(json.Number).String()
 		r, ok, err := boundedRatFromString(s)
 		if err != nil {
-			return nil, false, fmt.Errorf("json.Number %q: %w", s, err)
+			return nil, false, fmt.Errorf("json.Number %q: %w", truncForError(s), err)
 		}
 		if ok {
 			return r, true, nil
 		}
 		// json.Number's type guarantees the input was meant as a number;
 		// a parse failure (e.g. malformed exponent) is fatal too.
-		return nil, false, fmt.Errorf("invalid decimal number %q", s)
+		return nil, false, fmt.Errorf("invalid decimal number %q", truncForError(s))
 	}
 	if v.Kind() == reflect.String {
 		s := v.String()
 		r, ok, err := boundedRatFromString(s)
 		if err != nil {
-			return nil, false, fmt.Errorf("decimal string %q: %w", s, err)
+			return nil, false, fmt.Errorf("decimal string %q: %w", truncForError(s), err)
 		}
 		if ok {
 			return r, true, nil
@@ -1884,7 +1909,7 @@ func (s *serBigDecimal) serRat(dst []byte, r *big.Rat, srcType reflect.Type) ([]
 func buildBigDecimalPayload(r *big.Rat) ([]byte, error) {
 	scale, ok := finiteScale(r)
 	if !ok {
-		return nil, fmt.Errorf("big.Rat %s has no finite decimal expansion; big-decimal cannot encode this value", r.RatString())
+		return nil, fmt.Errorf("big.Rat %s has no finite decimal expansion; big-decimal cannot encode this value", truncForError(r.RatString()))
 	}
 	num := new(big.Int).Mul(r.Num(), pow10(scale))
 	unscaled, _ := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
@@ -1988,7 +2013,7 @@ func ratToUnscaled(r *big.Rat, scale int) (*big.Int, error) {
 	num := new(big.Int).Mul(r.Num(), pow10(scale))
 	unscaled, rem := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
 	if rem.Sign() != 0 {
-		return nil, fmt.Errorf("decimal value %s cannot be represented at scale %d without rounding", r.RatString(), scale)
+		return nil, fmt.Errorf("decimal value %s cannot be represented at scale %d without rounding", truncForError(r.RatString()), scale)
 	}
 	return unscaled, nil
 }
