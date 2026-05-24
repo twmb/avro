@@ -575,11 +575,11 @@ Built-in codecs: **null** (default, no compression), **deflate**
 Custom codecs can be provided via the `Codec` interface.
 
 **Memory bounds.** `WithMaxBlockBytes` (default 64 MiB) caps the *compressed*
-block size, not the *decompressed* size. A maliciously-crafted block can
-declare a large decompressed length that the codec (snappy/deflate/zstd)
-pre-allocates before validating the payload. This matches Java and fastavro
-behavior. For OCF read from untrusted sources, bound memory at the transport
-or process layer (request size cap, cgroup limit).
+block size, not the *decompressed* size — snappy, deflate, and zstd all
+allocate the declared decompressed length before validating the payload, so
+a malicious block can drive a larger allocation than the cap allows. For
+OCF read from untrusted sources, bound memory at the transport or process
+layer (request size cap, cgroup limit).
 
 ### Appending
 
@@ -701,80 +701,74 @@ deliberate exceptions.
 
 ### Spec / interop choices
 
-- **Writer-union schema resolution fails eagerly.** Every branch must resolve
-  at `Resolve` / `CheckCompatibility` time. Java's `Resolver.WriterUnion`
-  defers per-branch errors to decode; we choose internal consistency with the
-  rest of the package (`resolveEnum`, `resolveReaderUnion`, `resolveNode`,
-  `validateDefault` are all eager).
-- **`NaN` / `±Infinity` emit as JSON-quoted strings** (`"NaN"`, `"Infinity"`)
-  by default. Java's `JsonEncoder` emits bare RFC-invalid tokens; we emit
-  valid JSON. Bare tokens are accepted on decode for fastavro interop. Use
+- **Writer-union schema resolution fails eagerly.** Every branch must
+  resolve at `Resolve` / `CheckCompatibility` time. Java defers per-branch
+  errors to decode; resolving against twmb-published schemas surfaces
+  incompatibilities at config-load time instead.
+- **`NaN` / `±Infinity` emit as JSON-quoted strings** (`"NaN"`,
+  `"Infinity"`, `"-Infinity"`) by default — valid RFC 8259. Java emits
+  bare tokens (RFC-invalid). Bare tokens are accepted on decode. Pass
   `LinkedinFloats` for the goavro `null` / `1e999` / `-1e999` convention.
 - **`DecodeJSON` fills schema-declared defaults for absent record fields.**
-  Java's `JsonDecoder` errors on missing fields; we follow the binary-side
-  defaulting behavior so a record can omit fields with defaults from JSON
-  input.
-- **`local-timestamp-*` encode wall-clock fields as if UTC** (matching Java's
-  `TimeConversions.LocalTimestampMillisConversion` and fastavro). Decoded
-  values are UTC `time.Time`.
-- **OCF Snappy CRC is verified on read.** fastavro silently discards; we
-  fail-fast on integrity errors.
-- **Big-decimal canonical scale.** The encoder normalizes to the canonical
-  `(unscaled, scale)` form. Java preserves trailing-zero scale information on
-  the `BigDecimal` carrier; our `big.Rat` carrier can't represent the
-  distinction, so the trailing-zero scale is not round-tripped.
-- **Decimal JSON decode accepts both the spec form** (codepoint-mapped string)
-  **and the bare-number form**. Java is strict (spec form only); we accept the
-  lenient form for goavro / LinkedIn interop. Encode emits only the spec form.
-- **JSON null-union fast paths accept non-canonical multi-byte varint
-  encodings** of indices 0/1 (e.g. `0x80 0x00` = 0). Java's
-  `BinaryDecoder.readIndex` accepts both canonical and non-canonical forms.
-- **Union dispatch is type-based, not value-based.** When encoding a Go
-  value into a union, the encoder routes by the value's static Go type:
-  `int`, `int64`, `uint`, `uint32`, `uint64` all map to the `"long"`
-  branch, never `"int"`, even when the runtime value would fit `int32`.
-  A union `["int","long"]` with value `int(42)` emits `"long"`. To force
-  the `"int"` branch for a small value, pass `int32(value)` explicitly
-  or use a tagged-map wrapper `map[string]any{"int": value}`. The
-  type-based rule keeps wire size deterministic per Go type — the
-  alternative (value-aware) would mean the same Go field encodes
-  differently across calls depending on the runtime magnitude.
+  Java rejects missing fields; twmb mirrors the binary-side defaulting
+  behavior so JSON input can omit fields with defaults.
+- **`local-timestamp-*` encodes wall-clock fields as if UTC**, matching
+  Java and fastavro. Decoded values are UTC `time.Time`.
+- **OCF Snappy CRC is verified on read.** fastavro silently discards; twmb
+  fails fast on integrity errors.
+- **Big-decimal canonical scale.** The encoder emits canonical
+  `(unscaled, scale)`. Java preserves trailing-zero scale via its
+  `BigDecimal` carrier; `big.Rat` can't represent the distinction, so
+  trailing-zero scale does not round-trip.
+- **Decimal JSON decode accepts both the spec form** (codepoint-mapped
+  string) **and the bare-number form**. Java accepts only the spec form;
+  the bare-number form is accepted for goavro and LinkedIn interop.
+  Encode emits only the spec form.
+- **Non-canonical multi-byte varint indices are accepted for null-union
+  branches** (e.g. `0x80 0x00` for index 0), matching Java.
+- **Union dispatch is type-based, not value-based.** The encoder routes
+  by the value's static Go type, not its runtime magnitude: `int`,
+  `int64`, `uint`, `uint32`, `uint64` all select the `"long"` branch of
+  a union, never `"int"`, even when the value fits `int32`. So
+  `["int","long"]` with value `int(42)` emits `"long"`. To force `"int"`,
+  pass `int32(value)` or use the tagged-map wrapper
+  `map[string]any{"int": value}`. The type-based rule keeps wire size
+  deterministic per Go type — value-aware dispatch would mean the same
+  Go field encodes differently across calls depending on runtime value.
 - **Precision: the reader schema decides.**
-  - Reader schema is lossy (`float`/`double`): encode and decode both
-    silently IEEE-round. `s.AppendEncode(int64(9007199254740993), "double")`
-    succeeds and emits the float64 rounding of the input. Matches
-    Java/fastavro.
-  - Reader schema is exact (`int`/`long`/`bytes`/`string`): decoding
-    into a lossy Go target is allowed only if the wire value fits
-    exactly. `s.Decode(longWire, &f float64)` against a `"long"`
-    schema errors when the wire value exceeds float64's mantissa.
+  - Lossy reader schema (`float` / `double`): encode and decode both
+    silently IEEE-round. `s.AppendEncode(int64(9007199254740993),
+    "double")` succeeds and emits the float64 rounding. Matches Java
+    and fastavro.
+  - Exact reader schema (`int` / `long` / `bytes` / `string`): decoding
+    into a lossy Go target is allowed only when the wire value fits
+    exactly. `s.Decode(longWire, &f float64)` against a `"long"` schema
+    errors when the wire value exceeds float64's mantissa.
 
-  Users wanting exact large-integer round-trip should keep `"long"`.
-  Users evolving to `"double"` should expect silent IEEE rounding.
-- **`json.Number` in fractional/exponent form is accepted against
+  For exact large-integer round-trip, keep the schema as `"long"`.
+  Evolving to `"double"` opts into silent IEEE rounding.
+- **`json.Number` in fractional or exponent form is accepted against
   integer schemas when the value is exact.**
-  `s.AppendEncode(json.Number("9.5e17"), "long")` succeeds (the
-  literal represents an exact int64); twmb parses with arbitrary
-  precision and the JSON encoder emits the integer-decimal form.
+  `s.AppendEncode(json.Number("9.5e17"), "long")` succeeds — the literal
+  is an exact int64. The JSON encoder emits the integer-decimal form.
 
   Interop caveat: a schema with an exponent-form integer default like
-  `{"type":"long","default":9.5e17}` parses in twmb but is rejected
-  by Java's `Schema.parseField` (Jackson treats `.`/`e` literals as
-  non-integral). Twmb preserves the schema text verbatim, so a
-  twmb-published schema with this shape will not load in a Java
-  consumer. Prefer integer-literal defaults (`"default":950000000000000000`)
-  if Java reads your schemas.
+  `{"type":"long","default":9.5e17}` parses in twmb but is rejected by
+  Java, which treats `.` / `e` literals as non-integral. The schema
+  text is preserved verbatim, so a twmb-published schema with this
+  shape will not load in a Java consumer. Use integer-literal defaults
+  (`"default":950000000000000000`) for Java compatibility.
 
 ### Decoder leniencies without a symmetric encoder shape
 
 - **`TaggedUnions` on `DecodeJSON` wraps non-null union values** as
   `map[string]any{branchName: value}` when the decode target is `*any`.
-  `EncodeJSON` accepts both the wrapped and the bare form on input, so an
-  encode→decode round-trip into `*any` produces the wrapped form even when
-  the user-provided input was bare. Documented on the `TaggedUnions` option.
-- **Schema parser accepts `{"type":"Node"}` as an alternate spelling** of the
-  bare `"Node"` name reference (matches Java's `TestUnionSelfReference`). The
-  encoder emits only the bare form; the decoder accepts either.
-- **Top-level union into a typed-map target** (e.g. `*map[string]any` against
-  `["null","float"]`) is rejected by both binary and JSON paths — the target
-  type doesn't fit a union schema. Use `*any` instead.
+  `EncodeJSON` accepts both wrapped and bare input, so an encode→decode
+  round-trip into `*any` produces the wrapped form even when the input
+  was bare. See the `TaggedUnions` option for details.
+- **The schema parser accepts `{"type":"Node"}` as an alternate spelling**
+  of the bare `"Node"` name reference, matching Java. The encoder emits
+  only the bare form; the decoder accepts either.
+- **Top-level union into a typed-map target** (e.g. `*map[string]any`
+  against `["null","float"]`) is rejected by both binary and JSON paths —
+  the target type can't represent a union. Use `*any` instead.
