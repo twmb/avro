@@ -184,7 +184,7 @@ func applySchemaOpts(b *builder, opts []SchemaOpt) {
 func parse(schema string, b *builder) (*Schema, error) {
 	var orig aschema
 	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
-		return nil, fmt.Errorf("invalid schema: %w", err)
+		return nil, fmt.Errorf("invalid schema: %w", boundJSONErrorEcho(err))
 	}
 	if err := b.build("", &orig); err != nil {
 		return nil, err
@@ -570,6 +570,34 @@ func clonePtrInt(p *int) *int {
 	return &v
 }
 
+// boundJSONErrorEcho truncates user-controllable input echoed verbatim by
+// stdlib json / strconv error types so a hostile MiB-sized literal can't
+// produce a MiB-sized error string from [Parse]. Reaches
+// *json.UnmarshalTypeError (returned by stdlib's reflect-based int
+// decoder for the schema's *int Scale / Precision fields) and
+// *strconv.NumError (defense-in-depth; [laxInt.UnmarshalJSON]'s own
+// length cap is the primary guard for that path because [fmt.Errorf]'s
+// %w wrap caches the formatted message at construction).
+//
+// Walks the chain via [errors.As] and mutates in place; the mutation must
+// happen before the caller wraps the error with [fmt.Errorf]("%w", err),
+// which caches its formatted message and locks in the pre-truncation
+// content of any descendant.
+func boundJSONErrorEcho(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ute *json.UnmarshalTypeError
+	if errors.As(err, &ute) && len(ute.Value) > 80 {
+		ute.Value = truncForError(ute.Value)
+	}
+	var ne *strconv.NumError
+	if errors.As(err, &ne) && len(ne.Num) > 80 {
+		ne.Num = truncForError(ne.Num)
+	}
+	return err
+}
+
 type aobject struct {
 	Name string `json:"name,omitempty"`
 	Type string `json:"type"`
@@ -602,7 +630,22 @@ type aobject struct {
 // that "size" may appear as a quoted integer.
 type laxInt int
 
+// maxLaxIntDataLen caps the raw JSON bytes accepted by [laxInt.UnmarshalJSON].
+// Legit int64 representations fit in 20 chars (-9223372036854775808); the
+// quoted-string form (per the Avro [INTEGERS] rule) adds 2 chars; +2 chars
+// of headroom covers the Go-style +sign that strconv.Atoi accepts. Hostile
+// MiB-sized literals are rejected at entry so neither strconv.Atoi nor
+// stdlib json.Unmarshal-into-int produces a multi-MB error string (both
+// embed the failing input verbatim in *strconv.NumError.Num /
+// *json.UnmarshalTypeError.Value). The string-arm's [fmt.Errorf] wrap
+// caches the formatted message in *fmt.wrapError, defeating downstream
+// truncation of the inner error — the only reliable defense is at entry.
+const maxLaxIntDataLen = 24
+
 func (l *laxInt) UnmarshalJSON(data []byte) error {
+	if len(data) > maxLaxIntDataLen {
+		return fmt.Errorf("integer value exceeds %d byte length cap", maxLaxIntDataLen)
+	}
 	data = bytes.TrimSpace(data)
 	if len(data) > 0 && data[0] == '"' {
 		var s string

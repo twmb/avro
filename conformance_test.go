@@ -21260,6 +21260,49 @@ func TestRegression_SchemaParseErrorBoundedForHostileInput(t *testing.T) {
 		_, err = avro.Parse(`{"type":"weird","items":"int"}`)
 		mustHaveInformativeErr(t, "Parse short bad complex type", err, "weird")
 	})
+
+	t.Run("integer-typed schema fields (size/scale/precision)", func(t *testing.T) {
+		// Avro schema fields that decode into Go int / laxInt — fixed.size,
+		// decimal precision, decimal scale — route through stdlib parsers
+		// whose error formats embed the failing input verbatim:
+		// *strconv.NumError.Num (laxInt's string-arm strconv.Atoi) and
+		// *json.UnmarshalTypeError.Value (stdlib reflect-based int decoder).
+		// Without bounding at the parse-time entry, a hostile MiB-sized
+		// literal in any of these fields produces a MiB-sized error
+		// message — 1:1 amplification reachable from any schema source
+		// (registry, network, config).
+		hugeNum := strings.Repeat("9", huge1MiB)
+		hugeStr := strings.Repeat("Z", huge1MiB)
+
+		cases := []struct{ name, schema string }{
+			{"fixed_size_number", fmt.Sprintf(`{"type":"fixed","name":"F","size":%s}`, hugeNum)},
+			{"fixed_size_decimal_form", fmt.Sprintf(`{"type":"fixed","name":"F","size":1.%s}`, hugeNum)},
+			{"fixed_size_negative", fmt.Sprintf(`{"type":"fixed","name":"F","size":-%s}`, hugeNum)},
+			{"fixed_size_quoted_string", fmt.Sprintf(`{"type":"fixed","name":"F","size":"%s"}`, hugeStr)},
+			{"decimal_scale_at_type_level", fmt.Sprintf(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":%s}`, hugeNum)},
+			{"decimal_precision_at_type_level", fmt.Sprintf(`{"type":"bytes","logicalType":"decimal","precision":%s,"scale":0}`, hugeNum)},
+			{"decimal_scale_at_field_level", fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":"bytes","logicalType":"decimal","precision":10,"scale":%s}]}`, hugeNum)},
+			{"decimal_precision_at_field_level", fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":"bytes","logicalType":"decimal","precision":%s,"scale":0}]}`, hugeNum)},
+		}
+		for _, c := range cases {
+			_, err := avro.Parse(c.schema)
+			mustHaveBoundedErr(t, "Parse hostile "+c.name, err)
+		}
+
+		// Boundary symmetry: legitimate values still parse, and short
+		// invalid inputs still produce informative diagnostic content.
+		if _, err := avro.Parse(`{"type":"fixed","name":"F","size":16}`); err != nil {
+			t.Errorf("legit number-form size rejected: %v", err)
+		}
+		if _, err := avro.Parse(`{"type":"fixed","name":"F","size":"16"}`); err != nil {
+			t.Errorf("legit quoted-string-form size rejected: %v", err)
+		}
+		if _, err := avro.Parse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`); err != nil {
+			t.Errorf("legit decimal precision/scale rejected: %v", err)
+		}
+		_, err := avro.Parse(`{"type":"fixed","name":"F","size":"notanum"}`)
+		mustHaveInformativeErr(t, "Parse short bad size string", err, "notanum")
+	})
 }
 
 // TestRegression_SchemaForRejectsDuplicateFieldName pins that SchemaFor
