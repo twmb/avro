@@ -598,9 +598,15 @@ func isRecordKind(typ string) bool {
 //     the JSON fixed/string-slice/array arm).
 //
 // Walks unions (Avro 1.12: union default may match any branch) and
-// nested record/array/map types. fastavro keeps raw Python strings
-// (footgun); twmb sides with Java's typed-materialization per the
-// "String-form float defaults" intentional-divergence entry's promise.
+// nested record/array/map types. For single-field float/double fields
+// with a string-form numeric default, this coerces the string to
+// float32/float64 — Java parity with parseField's text→DoubleNode
+// coercion at Schema.java:1899-1902, scoped to outer FLOAT/DOUBLE
+// field types only. For union branches the coercion does NOT fire
+// (matching Java's isValidDefault for the union arm, avro-rs's
+// resolve_internal, and goavro's strict type assertions): union+
+// numeric-string defaults are rejected at schema parse, so they never
+// reach this function.
 //
 // Non-numeric / non-string defaults and non-handled types pass through
 // unchanged.
@@ -683,13 +689,26 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 		// rounded). Users get Default.(float32) for float fields and
 		// Default.(float64) for double fields, matching their Go field
 		// types directly.
+		//
+		// String inputs are handled inline via parseFloatAcceptOverflow
+		// rather than through [defaultAsFloat], which is now strict
+		// (no string arm) so it can be reused at union-branch
+		// matching and encode-time arms without accepting strings
+		// where the spec says it shouldn't. This single-field arm
+		// mirrors [coerceDefault]'s parseField-style text→float
+		// coercion (schema.go) for outer FLOAT/DOUBLE schemas.
 		var f float64
 		switch val := val.(type) {
 		case float64:
 			f = val
 		case float32:
 			f = float64(val)
-		case string, int64, int32, json.Number:
+		case string:
+			var err error
+			if f, err = parseFloatAcceptOverflow(val); err != nil {
+				return val
+			}
+		case int64, int32, json.Number:
 			var err error
 			if f, err = defaultAsFloat(val); err != nil {
 				return val
@@ -884,10 +903,11 @@ func defaultMatchesBytesOrFixedKind(t *SchemaNode, val any) bool {
 // ["float","int"] default 42 picks the float branch (first match) on
 // both surfaces.
 //
-// The float/double arm lenient-accepts string (twmb's documented
-// "String-form float defaults" intentional divergence). bytes/fixed
-// branch accepts string (codepoint-mapped form per Avro JSON spec) or
-// []byte.
+// The float/double arm rejects string defaults at union-branch matching
+// (Java parity: parseField text→DoubleNode coercion at
+// Schema.java:1899-1902 fires only for OUTER FLOAT/DOUBLE field types,
+// not union branches). bytes/fixed branch accepts string (codepoint-
+// mapped form per Avro JSON spec) or []byte.
 //
 // The structural arms (record/error, array, map) recurse into children
 // so per-element validity mirrors the wire-side walkDefault. The record

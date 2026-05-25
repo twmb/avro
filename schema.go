@@ -2849,28 +2849,30 @@ func parseFloatAcceptOverflow(s string) (float64, error) {
 const maxParseFloatLen = 1024
 
 // defaultAsFloat extracts a numeric default for a float or double field.
-// The string arm is Java-parity lenient (accepts hex floats etc.); the
-// json.Number arm is JSON-strict. Encoding into a float/double field is
-// lossy by destination — int64/int32 inputs exceeding the mantissa
-// precision silently IEEE-round (matches Java's Schema.parseField
-// text→DoubleNode coercion and fastavro's float()). The float32 narrowing
-// to ±Inf happens at the caller's float64 → float32 cast.
+// Accepts json.Number / float64 / int64 / int32 — i.e., the Go types
+// produced by UseNumber-parsed JSON literals plus any post-coerce
+// numerics. Does NOT accept Go string: the spec 1.12 §"Record" default-
+// values table requires the JSON type of a float/double default to be
+// `number`, never a JSON string. The narrow Java-deployed exception —
+// Schema.java:1899-1902's parseField text→DoubleNode coercion for outer
+// FLOAT/DOUBLE field types — is handled UPSTREAM in [coerceDefault] so
+// the string never reaches this validator. Union branches and any
+// downstream caller (encodeDefault, validateLeaf, the metadata-side
+// branchAcceptsDefault path) see only post-coerce typed values; a
+// string here is invalid by construction and rejected via the default
+// `expected number, got %T` error.
 //
-// User-controllable strings are passed through [truncForError] before
-// interpolation so a 1 MiB hostile default literal doesn't produce a 1 MiB
-// error message.
+// Encoding into a float/double field is lossy by destination — int64/
+// int32 inputs exceeding the mantissa precision silently IEEE-round
+// (matches Java's Schema.parseField text→DoubleNode coercion and
+// fastavro's float()). The float32 narrowing to ±Inf happens at the
+// caller's float64 → float32 cast.
 func defaultAsFloat(val any) (float64, error) {
 	switch v := val.(type) {
 	case json.Number:
 		return parseJSONNumberAsFloat(v.String())
 	case float64:
 		return v, nil
-	case string:
-		f, err := parseFloatAcceptOverflow(v)
-		if err != nil {
-			return 0, fmt.Errorf("invalid string default %q: %w", truncForError(v), err)
-		}
-		return f, nil
 	case int64:
 		return float64(v), nil
 	case int32:
@@ -2879,14 +2881,6 @@ func defaultAsFloat(val any) (float64, error) {
 	return 0, fmt.Errorf("expected number, got %T", val)
 }
 
-// coerceDefault converts string default values to the float/double
-// target type when the field type is literally float or double,
-// matching Java's Schema.parseField. Union defaults pass through
-// unchanged: Java/fastavro/hamba defer the textual→typed coercion to
-// the union's per-branch dispatch, where the first compatible branch
-// wins. Walks *schemaNode so name-referenced nested fields coerce too
-// (the resolved type tree, not the canon — name-refs lose type info on
-// the canon side).
 // firstUnionBranchAcceptingDefault returns the first union branch whose
 // validateDefault accepts val, or nil if none match. Shared by
 // coerceDefault and walkDefault's union arms — both implement Avro's
@@ -2897,6 +2891,15 @@ func defaultAsFloat(val any) (float64, error) {
 // change. coerceMetadataDefault (schema_node.go) uses the analogous
 // branchAcceptsDefault predicate on the *SchemaNode public type — the
 // pattern is the same but the type split prevents direct reuse.
+//
+// String defaults are matched ONLY by branches whose Avro type's
+// permitted JSON type is `string` per spec 1.12 §"Record" default-
+// values table (string, bytes, enum, fixed). Numeric branches
+// (int, long, float, double) reject string defaults at this layer
+// — [defaultAsFloat] no longer has a string-acceptance arm; Java's
+// parseField text→DoubleNode coercion fires only for the OUTER
+// FLOAT/DOUBLE field type (handled in [coerceDefault] below) and
+// never for union branches.
 func firstUnionBranchAcceptingDefault(val any, node *schemaNode) *schemaNode {
 	for _, branch := range node.branches {
 		if validateDefault(val, branch) == nil {
@@ -2906,16 +2909,35 @@ func firstUnionBranchAcceptingDefault(val any, node *schemaNode) *schemaNode {
 	return nil
 }
 
+// coerceDefault converts string default values to float64 when the
+// field type is literally float or double. Matches Java's parseField
+// at Schema.java:1899-1902, which special-cases TextNode → DoubleNode
+// coercion ONLY when the outer fieldSchema.getType() is FLOAT or
+// DOUBLE directly — never for union branches, never for int/long
+// fields. Spec 1.12 §"Record" default-values table marks JSON string
+// as invalid for float/double defaults; the Java-deployed coercion is
+// an interop carveout preserved here for legacy Java-generated
+// schemas. avro-rs and goavro do not implement this coercion.
+//
+// Union defaults pass through unchanged: walkDefault picks the first
+// branch whose validateDefault accepts, and validateDefault no longer
+// has a string-to-float arm at the leaf level, so union+numeric-string
+// defaults are rejected at parse (matching Java/avro-rs/goavro).
+//
+// Walks *schemaNode so name-referenced nested fields coerce too (the
+// resolved type tree, not the canon — name-refs lose type info on the
+// canon side).
 func coerceDefault(val any, node *schemaNode) any {
 	if node == nil {
 		return val
 	}
 	if node.kind == "union" {
-		// First branch validateDefault accepts wins; recurse so the
-		// coerced value matches that branch's natural Go type.
-		// Without recursion, ["float","null"] with default "1.5"
-		// stays a string and the JSON encoder rejects it while
-		// binary's defaultAsFloat coerces — binary/JSON divergence.
+		// First validateDefault-accepting branch wins; recurse so the
+		// coerced value matches that branch's natural Go type. For
+		// string defaults, no numeric branch accepts (defaultAsFloat
+		// no longer has a string arm), so this picks a string-
+		// accepting branch (string/bytes/enum/fixed) or returns nil
+		// — schema parse then fails via validateDefault.
 		if branch := firstUnionBranchAcceptingDefault(val, node); branch != nil {
 			return coerceDefault(val, branch)
 		}
@@ -2924,14 +2946,20 @@ func coerceDefault(val any, node *schemaNode) any {
 	if node.kind != "float" && node.kind != "double" {
 		return val
 	}
-	if _, ok := val.(string); !ok {
+	s, ok := val.(string)
+	if !ok {
 		return val
 	}
-	// Route through defaultAsFloat so the string→float64 coercion
-	// applies uniformly with validateDefault's own arm. If parsing
-	// fails (syntax error), leave the original string so validateDefault
-	// produces the canonical error message.
-	if f, err := defaultAsFloat(val); err == nil {
+	// Java parity (Schema.java:1899-1902): coerce text → float64 for
+	// the outer single-field float/double case. Direct call to
+	// parseFloatAcceptOverflow (not defaultAsFloat) because
+	// defaultAsFloat is the strict validator used by union branches
+	// and downstream encode-time arms; the lenient coerce is
+	// specifically the parseField-special-case behavior, scoped to
+	// this single call site. If parsing fails (syntax error), leave
+	// the original string so validateDefault produces the canonical
+	// error message.
+	if f, err := parseFloatAcceptOverflow(s); err == nil {
 		return f
 	}
 	return val

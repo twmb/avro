@@ -5925,18 +5925,6 @@ func TestRegression_SchemaDefaultOverflowToInfParity(t *testing.T) {
 			binaryWireWantHex: "000000000000f0ff",
 		},
 		{
-			// Union-shape string-form default: twmb's "Known intentional
-			// divergence" accepts this where Java rejects. The overflow
-			// subcase must remain consistent with the non-overflow form
-			// (e.g. `["float","null"]` with `"3.14"`), which the
-			// non-overflow union test elsewhere already pins. Wire bytes
-			// include the leading union branch index varint (0 for the
-			// float branch at position 0) before the 4-byte float +Inf.
-			name:              "union_float_null_string_form_overflow_1e1000",
-			schema:            `{"type":"record","name":"R","fields":[{"name":"f","type":["float","null"],"default":"1e1000"}]}`,
-			binaryWireWantHex: "000000807f", // varint(0) || float +Inf
-		},
-		{
 			// Nested record carrier — exercises the same defaultAsFloat64
 			// path through the inner record's field-default validate.
 			name:              "nested_record_float_literal_overflow_1e1000",
@@ -6630,12 +6618,6 @@ func TestRegression_MetadataAPICoerceStringFloatDefault(t *testing.T) {
 			assert:   float32Eq(float32(math.Inf(1))),
 		},
 		{
-			name:     "union_null_float_string_default",
-			schema:   `{"type":"record","name":"R","fields":[{"name":"f","type":["null","float"],"default":"1.5"}]}`,
-			fieldIdx: 0,
-			assert:   float32Eq(1.5),
-		},
-		{
 			name:     "nested_record_double_string_default",
 			schema:   `{"type":"record","name":"Outer","fields":[{"name":"o","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"double"}]},"default":{"x":"2.5"}}]}`,
 			fieldIdx: 0,
@@ -6677,27 +6659,30 @@ func TestRegression_MetadataAPICoerceStringFloatDefault(t *testing.T) {
 		}
 	})
 
-	// Union branch selection: the FIRST accepting branch wins, matching
-	// the wire-encode pipeline's coerceDefault and Java's
-	// Schema.parseField. For ["string","float"] with default "1.5",
-	// string branch accepts first → metadata API returns string (matches
-	// wire). For ["null","float"] with default "1.5", null rejects
-	// (non-nil) → float accepts → metadata API returns float32 (also
-	// matches wire). A "first-transformation-wins" union arm would
-	// diverge for the ["string","float"] case; "first-accept-wins"
-	// matches both wire and Java.
+	// Union branch selection: the first JSON-type-matching branch wins.
+	// String-default JSON-type matches: string/bytes/enum/fixed branches
+	// only — never numeric branches (per spec 1.12 §"Record" default-
+	// values table). Java's parseField text→DoubleNode coercion at
+	// Schema.java:1899-1902 fires only for outer FLOAT/DOUBLE field
+	// types, NOT for union branches; avro-rs and goavro reject
+	// union+numeric-string defaults identically. See
+	// TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches
+	// for the full cross-impl rationale.
 	t.Run("union_string_first_then_float_picks_string", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":["string","float"],"default":"1.5"}]}`)
 		def := s.Root().Fields[0].Default
 		if str, ok := def.(string); !ok || str != "1.5" {
-			t.Fatalf("expected string \"1.5\" (string branch accepts first, matches wire); got %T(%v)", def, def)
+			t.Fatalf("expected string \"1.5\" (string branch accepts the string default); got %T(%v)", def, def)
 		}
 	})
-	t.Run("union_float_first_then_string_picks_float", func(t *testing.T) {
+	t.Run("union_float_first_then_string_picks_string", func(t *testing.T) {
+		// Float branch's permitted JSON type is `number`; the default
+		// is a JSON string. Float branch is skipped; string branch
+		// (next in declaration order) accepts.
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":["float","string"],"default":"1.5"}]}`)
 		def := s.Root().Fields[0].Default
-		if f, ok := def.(float32); !ok || f != 1.5 {
-			t.Fatalf("expected float32(1.5) (float branch accepts string-form first); got %T(%v)", def, def)
+		if str, ok := def.(string); !ok || str != "1.5" {
+			t.Fatalf("expected string \"1.5\" (float branch rejects JSON string default → string branch wins); got %T(%v)", def, def)
 		}
 	})
 }
@@ -9742,77 +9727,21 @@ func TestRegression_UnsafeOverflowErrorsPreserveAvroType(t *testing.T) {
 	})
 }
 
-// TestRegression_UnionFloatStringDefaultCoerce locks the union case
-// of coerceDefault. coerceDefault must handle kind "union" by walking
-// branches via validateDefault's first-matching-branch rule (mirroring
-// convertDefaultBytes); without the union arm, a raw string default
-// flows through unchanged and the downstream JSON encoder's union
-// try-each-branch loop errors on the float branch (jsonCoerceToFloat64
-// rejects strings) before picking the string branch in
-// ["float","string"], diverging from the binary encoder which picks
-// float via defaultAsFloat64's string fallback. validateDefault
-// accepts both float and string branches for "3.14" leniently, so
-// the union resolution must agree across consumers.
-func TestRegression_UnionFloatStringDefaultCoerce(t *testing.T) {
-	t.Run("top-level [float,null] default-fill via JSON", func(t *testing.T) {
-		s := avro.MustParse(`{"type":"record","name":"R","fields":[
-			{"name":"f","type":["float","null"],"default":"1.5"}
-		]}`)
-		jb, err := s.AppendEncodeJSON(nil, map[string]any{})
-		if err != nil {
-			t.Fatalf("JSON encode default-fill: %v", err)
-		}
-		if !strings.Contains(string(jb), "1.5") {
-			t.Fatalf("JSON output missing 1.5: %s", jb)
-		}
-	})
-	t.Run("nested record with [float,null] default", func(t *testing.T) {
-		s := avro.MustParse(`{"type":"record","name":"R","fields":[
-			{"name":"inner","type":{"type":"record","name":"Inner","fields":[
-				{"name":"f","type":["float","null"],"default":"2.5"}
-			]},"default":{}}
-		]}`)
-		jb, err := s.AppendEncodeJSON(nil, map[string]any{})
-		if err != nil {
-			t.Fatalf("JSON encode: %v", err)
-		}
-		if !strings.Contains(string(jb), "2.5") {
-			t.Fatalf("JSON output missing 2.5: %s", jb)
-		}
-	})
-	t.Run("array of [float,null] default", func(t *testing.T) {
-		s := avro.MustParse(`{"type":"record","name":"R","fields":[
-			{"name":"a","type":{"type":"array","items":["float","null"]},"default":["1.5"]}
-		]}`)
-		jb, err := s.AppendEncodeJSON(nil, map[string]any{})
-		if err != nil {
-			t.Fatalf("JSON encode: %v", err)
-		}
-		if !strings.Contains(string(jb), "1.5") {
-			t.Fatalf("JSON output missing 1.5: %s", jb)
-		}
-	})
-	t.Run("map of [float,null] default", func(t *testing.T) {
-		s := avro.MustParse(`{"type":"record","name":"R","fields":[
-			{"name":"m","type":{"type":"map","values":["float","null"]},"default":{"k":"1.5"}}
-		]}`)
-		jb, err := s.AppendEncodeJSON(nil, map[string]any{})
-		if err != nil {
-			t.Fatalf("JSON encode: %v", err)
-		}
-		if !strings.Contains(string(jb), "1.5") {
-			t.Fatalf("JSON output missing 1.5: %s", jb)
-		}
-	})
-	t.Run("[double,null] (not just float)", func(t *testing.T) {
-		s := avro.MustParse(`{"type":"record","name":"R","fields":[
-			{"name":"d","type":["double","null"],"default":"5"}
-		]}`)
-		if _, err := s.AppendEncodeJSON(nil, map[string]any{}); err != nil {
-			t.Fatalf("JSON encode: %v", err)
-		}
-	})
-	t.Run("[float,string] binary/JSON pick same branch", func(t *testing.T) {
+// TestRegression_UnionStringDefaultBinaryJSONParity locks the binary/
+// JSON parity for union defaults that are JSON strings. Per spec 1.12
+// §"Record" default-values table, a JSON string default matches only
+// branches whose Avro type's permitted JSON type is `string` —
+// string, bytes, enum, fixed. Numeric branches (int/long/float/double)
+// are skipped because their permitted JSON type is `integer` or
+// `number`. The first-matching-branch rule (line 80) then picks the
+// earliest-declared string-accepting branch on BOTH the binary and
+// JSON encoders.
+//
+// For unions whose only branches are numeric (or numeric + null), no
+// branch's JSON type matches a string default → schema parse fails.
+// See TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches.
+func TestRegression_UnionStringDefaultBinaryJSONParity(t *testing.T) {
+	t.Run("[float,string] picks string on both encoders", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[
 			{"name":"f","type":["float","string"],"default":"3.14"}
 		]}`)
@@ -9831,18 +9760,21 @@ func TestRegression_UnionFloatStringDefaultCoerce(t *testing.T) {
 		if err := s.DecodeJSON(jb, &jsonDec); err != nil {
 			t.Fatalf("JSON decode: %v", err)
 		}
-		_, binIsFloat := binDec["f"].(float32)
-		_, jsonIsFloat := jsonDec["f"].(float32)
-		if binIsFloat != jsonIsFloat {
-			t.Errorf("parity divergence: binary=%T JSON=%T (binary=%x, JSON=%s)",
-				binDec["f"], jsonDec["f"], bin, jb)
+		// Both encoders pick the string branch (float branch's JSON
+		// type is `number`, doesn't match the string default).
+		if _, ok := binDec["f"].(string); !ok {
+			t.Errorf("binary picked non-string branch: %T(%v) (wire %x)", binDec["f"], binDec["f"], bin)
+		}
+		if _, ok := jsonDec["f"].(string); !ok {
+			t.Errorf("JSON picked non-string branch: %T(%v) (wire %s)", jsonDec["f"], jsonDec["f"], jb)
 		}
 	})
-	t.Run("[string,float] (declaration order: string wins, unchanged)", func(t *testing.T) {
-		// Regression-guard: when the string branch comes FIRST,
-		// validateDefault matches string, coerceDefault is a no-op for
-		// string targets, both encoders pick the string branch. This
-		// preserves the prior documented behavior.
+	t.Run("[string,float] picks string on both encoders", func(t *testing.T) {
+		// Regression-guard: when the string branch comes FIRST, the
+		// same JSON-type-match rule picks it. Identical to the
+		// [float,string] case after the rule applies; declaration
+		// order doesn't matter when only one branch's JSON type
+		// matches.
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[
 			{"name":"f","type":["string","float"],"default":"3.14"}
 		]}`)
@@ -9962,13 +9894,16 @@ func TestRegression_UnionDefaultMetadataMatchesWireBranch(t *testing.T) {
 			kindDouble, 0x00,
 		},
 		{
-			"float_first_string_form_default_picks_float",
-			// String-form float default — twmb's documented String-form
-			// intentional divergence. Float branch accepts via
-			// defaultAsFloat's string arm; metadata path materializes
-			// as float64.
+			"float_first_string_default_picks_string",
+			// String-form default in a union: the float branch's
+			// permitted JSON type is `number`; the default is JSON
+			// `string`; float branch skipped. String branch wins per
+			// first-matching-branch rule (spec 1.12 §"Record" default-
+			// values table + §"Unions" line 163). Matches Java's
+			// isValidDefault (Schema.java:1751-1797), avro-rs's
+			// resolve_internal, and goavro's type-assertion validator.
 			`{"type":"record","name":"r","fields":[{"name":"f","type":["float","string"],"default":"1.5"}]}`,
-			kindFloat, 0x00,
+			kindString, 0x02,
 		},
 		{
 			"string_first_string_default_picks_string",
@@ -10533,20 +10468,6 @@ func TestRegression_UnionDefaultEncodeMatchesValidateBranch(t *testing.T) {
 			]}`,
 			wireBranchByte: 0x00,
 			wireTag:        "com.example.E",
-		},
-		{
-			// String-form default for [float, double]: coerceDefault parses
-			// "1.5" → float64(1.5). With the runtime type-name fast path,
-			// unionTypeNameForValue(float64)=="double" matched branch 1,
-			// overriding validateDefault's branch 0 (float) choice. Post-
-			// fix: declaration-order picks float, matching the metadata
-			// API's float32(1.5) Default type.
-			name: "float_double_string_default_picks_float_branch",
-			schema: `{"type":"record","name":"R","fields":[
-				{"name":"v","type":["float","double"],"default":"1.5"}
-			]}`,
-			wireBranchByte: 0x00,
-			wireTag:        "float",
 		},
 	}
 	for _, c := range cases {
@@ -15488,17 +15409,20 @@ func TestParity_AcceptedLeniencies(t *testing.T) {
 			t.Errorf("fractional float should error on int encode")
 		}
 	})
-	t.Run("string-form float defaults coerce to float64", func(t *testing.T) {
-		// Java accepts {"type":"float","default":"1.5"} but not the
-		// union form; fastavro accepts both but materializes as
-		// string. twmb accepts both and materializes as float64.
-		for _, schema := range []string{
-			`{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"1.5"}]}`,
-			`{"type":"record","name":"R","fields":[{"name":"f","type":["float","null"],"default":"1.5"}]}`,
-		} {
-			if _, err := avro.Parse(schema); err != nil {
-				t.Errorf("string-form float default should parse: %v\n  %s", err, schema)
-			}
+	t.Run("string-form float defaults coerce to float64 (single-field only)", func(t *testing.T) {
+		// Java's parseField text→DoubleNode coercion at Schema.java:1899-1902
+		// fires only when the OUTER fieldSchema.getType() is FLOAT or
+		// DOUBLE directly, NOT for union branches. twmb mirrors this
+		// exactly: single-field accepts, union rejects (matching Java's
+		// isValidDefault for the union arm, avro-rs's resolve_*, and
+		// goavro's record-default validator). See
+		// TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches
+		// for the full cross-impl matrix.
+		if _, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"1.5"}]}`); err != nil {
+			t.Errorf("single-field string-form float default should parse: %v", err)
+		}
+		if _, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":["float","null"],"default":"1.5"}]}`); err == nil {
+			t.Errorf("union+numeric-string default should REJECT (Java parity); accepted")
 		}
 	})
 	t.Run("implicit null default for [null, T] unions", func(t *testing.T) {
@@ -15539,6 +15463,218 @@ func TestParity_AcceptedLeniencies(t *testing.T) {
 		var got any
 		if err := s.DecodeJSON([]byte(`"\q"`), &got); err != nil {
 			t.Errorf("unknown escape should be accepted lenient: %v", err)
+		}
+	})
+}
+
+// TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches
+// locks the Avro 1.12 spec rule that a union field's default JSON type
+// must match one branch's permitted JSON type per the §"Record" default-
+// values table. The table maps:
+//
+//	int,long      → integer
+//	float,double  → number
+//	string,enum   → string
+//	bytes,fixed   → string (codepoint-mapped)
+//
+// A JSON string default therefore matches ONLY string / bytes / enum /
+// fixed branches — never int / long / float / double. The spec §"Unions"
+// line 163 makes this explicit: "the type of the default value must
+// match with one element of the union."
+//
+// Cross-impl consensus:
+//   - Java's Schema.parseField text→DoubleNode coercion at
+//     Schema.java:1899-1902 fires only when the OUTER fieldSchema.getType()
+//     is FLOAT or DOUBLE directly; for a UNION outer type, the TextNode
+//     reaches isValidDefault (Schema.java:1751-1797) and the numeric arms
+//     check JsonNode.isNumber() / isIntegralNumber(), which return false
+//     for TextNode regardless of its string contents. Union+numeric-string
+//     defaults are rejected.
+//   - avro-rs's resolve_float / resolve_double (types.rs:960-986) accept
+//     Value::String only for the IEEE 754 special tokens (NaN, INF,
+//     Infinity, -INF, -Infinity) via parse_special_float; regular numeric
+//     strings like "1.5" or "42" reject. The union branch matcher iterates
+//     branches via iter().any(resolve_internal) — both branches reject
+//     for union+numeric-string defaults.
+//   - linkedin/goavro's record-field default validator (record.go:79-101)
+//     type-asserts the default to Go float64 for float/double schemas and
+//     Go string for string/bytes schemas; a JSON string default ends up
+//     as Go string, fails the float64 assertion, and the schema is
+//     rejected.
+//
+// Single-field float/double with a string-numeric default REMAINS
+// accepted (matches Java's parseField text→DoubleNode coercion at
+// Schema.java:1899-1902 — the one deployed-Java behavior the broader
+// ecosystem doesn't share but twmb preserves for interop with
+// Java-generated schemas).
+//
+// First-accept-wins union dispatch (per spec line 80: "Default values
+// for union fields correspond to the first schema that matches in the
+// union") still applies. For ["float","string"] default "1.5", the
+// float branch's JSON-type requirement is number — string doesn't
+// match — so the float branch is skipped; the string branch's JSON-type
+// requirement is string — match — string branch wins.
+func TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches(t *testing.T) {
+	t.Run("single-field float + string-numeric default accepts (Java parity)", func(t *testing.T) {
+		// Schema.java:1899-1902 coerces TextNode → DoubleNode for outer
+		// FLOAT/DOUBLE field types. Deployed Java behavior; preserved
+		// for interop with Java-generated schemas.
+		cases := []struct {
+			schema string
+			want   any
+		}{
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"1.5"}]}`, float32(1.5)},
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":"double","default":"2.718"}]}`, float64(2.718)},
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"NaN"}]}`, float32(math.NaN())},
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":"float","default":"Infinity"}]}`, float32(math.Inf(1))},
+		}
+		for _, c := range cases {
+			s, err := avro.Parse(c.schema)
+			if err != nil {
+				t.Errorf("single-field should accept: %v\n  %s", err, c.schema)
+				continue
+			}
+			got := s.Root().Fields[0].Default
+			switch want := c.want.(type) {
+			case float32:
+				gotF, ok := got.(float32)
+				if !ok {
+					t.Errorf("got %T(%v), want float32\n  %s", got, got, c.schema)
+				} else if want != want { // NaN
+					if !(gotF != gotF) {
+						t.Errorf("got %v, want NaN\n  %s", gotF, c.schema)
+					}
+				} else if gotF != want {
+					t.Errorf("got %v, want %v\n  %s", gotF, want, c.schema)
+				}
+			case float64:
+				gotF, ok := got.(float64)
+				if !ok || gotF != want {
+					t.Errorf("got %T(%v), want float64(%v)\n  %s", got, got, want, c.schema)
+				}
+			}
+		}
+	})
+
+	t.Run("union + all-numeric branches + string default rejects (spec + Java + avro-rs + goavro)", func(t *testing.T) {
+		// Every JSON string default in a union containing only numeric
+		// branches MUST reject per spec table. Java rejects via
+		// isValidDefault (TextNode fails isNumber/isIntegralNumber);
+		// avro-rs rejects via resolve_float/resolve_int (non-special
+		// strings); goavro rejects via type assertion against float64.
+		cases := []string{
+			// nullable-numeric (the documented twmb-unique acceptance — now revoked)
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["float","null"],"default":"1.5"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["null","float"],"default":"1.5"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["double","null"],"default":"5"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["null","double"],"default":"2.718"}]}`,
+			// numeric-only unions
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["float","double"],"default":"1.5"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["int","float"],"default":"42"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["long","double"],"default":"42"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["int","long"],"default":"42"}]}`,
+			// special-float tokens in numeric-only unions also reject (Java parity;
+			// avro-rs accepts these but Java is the deployed reference)
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["float","null"],"default":"NaN"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["float","null"],"default":"1e1000"}]}`,
+		}
+		for _, schema := range cases {
+			if _, err := avro.Parse(schema); err == nil {
+				t.Errorf("expected reject; parsed OK:\n  %s", schema)
+			}
+		}
+	})
+
+	t.Run("union + string-accepting branch + string default picks that branch (first-match per spec line 80)", func(t *testing.T) {
+		// The first union branch whose permitted JSON type matches the
+		// default's JSON type wins. String-accepting branches: string,
+		// bytes, enum, fixed (per the spec default-values table).
+		cases := []struct {
+			schema     string
+			wantBranch byte // wire byte for the chosen branch's varint index
+			wantTag    string
+		}{
+			// string branch wins regardless of position
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":["string","float"],"default":"1.5"}]}`, 0x00, "string"},
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":["float","string"],"default":"1.5"}]}`, 0x02, "string"},
+			// bytes branch wins (string→bytes via codepoint mapping)
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":["bytes","float"],"default":"hi"}]}`, 0x00, "bytes"},
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":["float","bytes"],"default":"hi"}]}`, 0x02, "bytes"},
+			// enum branch wins (symbol must be in symbols list)
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":[{"type":"enum","name":"E","symbols":["A","B"]},"float"],"default":"A"}]}`, 0x00, "E"},
+			// fixed branch wins (codepoint-mapped string of matching length)
+			{`{"type":"record","name":"R","fields":[{"name":"f","type":[{"type":"fixed","name":"F2","size":2},"float"],"default":"hi"}]}`, 0x00, "F2"},
+		}
+		for _, c := range cases {
+			s, err := avro.Parse(c.schema)
+			if err != nil {
+				t.Errorf("expected accept; parse failed: %v\n  %s", err, c.schema)
+				continue
+			}
+			out, err := s.AppendEncode(nil, map[string]any{})
+			if err != nil {
+				t.Errorf("AppendEncode: %v\n  %s", err, c.schema)
+				continue
+			}
+			if len(out) == 0 || out[0] != c.wantBranch {
+				t.Errorf("wire branch byte: got 0x%02x, want 0x%02x (full %x)\n  %s",
+					out[0], c.wantBranch, out, c.schema)
+			}
+			var got map[string]any
+			if _, err := s.Decode(out, &got, avro.TaggedUnions()); err != nil {
+				t.Errorf("Decode: %v", err)
+				continue
+			}
+			if m, ok := got["f"].(map[string]any); ok {
+				for k := range m {
+					if k != c.wantTag {
+						t.Errorf("tagged tag: got %q, want %q\n  %s", k, c.wantTag, c.schema)
+					}
+					break
+				}
+			}
+		}
+	})
+
+	t.Run("single-field int/long + string default rejects (unchanged — matches spec + every impl)", func(t *testing.T) {
+		// numericDefault has no string-acceptance arm; defaultAsInt32 /
+		// defaultAsInt64 reject Go string inputs. Matches Java's
+		// isValidDefault (INT/LONG arms require isIntegralNumber, false
+		// for TextNode), avro-rs's resolve_int (other arm rejects
+		// Value::String), and goavro's type-assertion-to-float64.
+		cases := []string{
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"int","default":"42"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"long","default":"42"}]}`,
+		}
+		for _, schema := range cases {
+			if _, err := avro.Parse(schema); err == nil {
+				t.Errorf("expected reject; parsed OK:\n  %s", schema)
+			}
+		}
+	})
+
+	t.Run("nested record + array + map carriers reject union+numeric-string default", func(t *testing.T) {
+		// The rejection propagates through container defaults: an array
+		// of ["float","null"] with default ["1.5"] fails because the
+		// inner-element default is invalid; same for nested record /
+		// map / union-within-array carriers.
+		cases := []string{
+			`{"type":"record","name":"R","fields":[
+				{"name":"inner","type":{"type":"record","name":"Inner","fields":[
+					{"name":"f","type":["float","null"],"default":"2.5"}
+				]},"default":{}}
+			]}`,
+			`{"type":"record","name":"R","fields":[
+				{"name":"a","type":{"type":"array","items":["float","null"]},"default":["1.5"]}
+			]}`,
+			`{"type":"record","name":"R","fields":[
+				{"name":"m","type":{"type":"map","values":["float","null"]},"default":{"k":"1.5"}}
+			]}`,
+		}
+		for _, schema := range cases {
+			if _, err := avro.Parse(schema); err == nil {
+				t.Errorf("expected reject; parsed OK:\n  %s", schema)
+			}
 		}
 	})
 }
@@ -16470,11 +16606,13 @@ func TestRegression_SchemaMetadataExponentOverflowNormalizesToInf(t *testing.T) 
 		// Sibling to the ±Inf case above, with a different inverse shape:
 		// jsonSerializableValue converts float64(NaN) to JSON string "NaN"
 		// (the same form appendJSONFloat emits for runtime NaN field
-		// values). defaultAsFloat's string arm re-parses "NaN" via
-		// strconv.ParseFloat back to float64(NaN) — so the round-trip
-		// closes via the documented "String-form float defaults"
-		// lenient-accept path. ±Inf uses a JSON NUMBER literal; NaN uses
-		// a JSON STRING literal because no number literal re-parses to NaN.
+		// values). coerceDefault's single-field float/double arm re-parses
+		// "NaN" via parseFloatAcceptOverflow back to float64(NaN) — Java
+		// parity with parseField's text→DoubleNode coercion at
+		// Schema.java:1899-1902, scoped to outer FLOAT/DOUBLE field types
+		// only (NOT union branches). ±Inf uses a JSON NUMBER literal;
+		// NaN uses a JSON STRING literal because no number literal re-
+		// parses to NaN.
 		s1, err := avro.Parse(`{
 			"type":"record","name":"R",
 			"fields":[{"name":"f","type":"double","default":"NaN"}]
@@ -16532,10 +16670,19 @@ func TestRegression_SchemaMetadataExponentOverflowNormalizesToInf(t *testing.T) 
 			t.Errorf("round-tripped Default: got %T %v, want float32(NaN)", got, got)
 		}
 	})
-	t.Run("SchemaNode.Schema() round-trips NaN inside union default", func(t *testing.T) {
+	t.Run("SchemaNode.Schema() round-trips NaN inside numeric-form union default", func(t *testing.T) {
+		// String-form defaults are NOT accepted in unions (Java parity:
+		// parseField text→DoubleNode coercion at Schema.java:1899-1902
+		// fires only for outer FLOAT/DOUBLE field types, not union
+		// branches). Numeric-form NaN literals can't be expressed in
+		// JSON either (RFC 8259 has no NaN), but the SchemaNode round-
+		// trip path materializes NaN via the single-field's float-
+		// coercion arm during the inner-tree walk. This subtest
+		// exercises the round-trip on a single-field double NaN
+		// default and confirms the float64(NaN) survives.
 		s1, err := avro.Parse(`{
 			"type":"record","name":"R",
-			"fields":[{"name":"f","type":["double","null"],"default":"NaN"}]
+			"fields":[{"name":"f","type":"double","default":"NaN"}]
 		}`)
 		if err != nil {
 			t.Fatal(err)

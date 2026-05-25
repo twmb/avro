@@ -368,7 +368,16 @@ func TestParseFixedStringSizeRoundTrip(t *testing.T) {
 }
 
 func TestParseFloatDefaultFromString(t *testing.T) {
-	// Java's schema parser coerces string defaults for float/double fields.
+	// Java's parseField at Schema.java:1899-1902 coerces TextNode →
+	// DoubleNode when the OUTER fieldSchema.getType() is FLOAT or
+	// DOUBLE directly. Spec 1.12 §"Record" default-values table marks
+	// JSON string as invalid for float/double defaults; the
+	// coercion is a deployed-Java interop carveout. avro-rs and
+	// goavro do not implement it. For UNION outer types the
+	// coercion does NOT fire — the TextNode reaches isValidDefault
+	// (Schema.java:1751-1797) and rejects because no numeric
+	// branch's isNumber()/isIntegralNumber() returns true for a
+	// TextNode. See TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches.
 	tests := []struct {
 		name   string
 		schema string
@@ -398,12 +407,6 @@ func TestParseFloatDefaultFromString(t *testing.T) {
 			]}`,
 		},
 		{
-			"nullable float string default",
-			`{"type":"record","name":"R","fields":[
-				{"name":"f","type":["float","null"],"default":"1.5"}
-			]}`,
-		},
-		{
 			"nested record with float string default",
 			`{"type":"record","name":"R","fields":[
 				{"name":"inner","type":{"type":"record","name":"I","fields":[
@@ -430,6 +433,18 @@ func TestParseFloatDefaultFromString(t *testing.T) {
 	]}`)
 	if err == nil {
 		t.Fatal("expected error for invalid string float default")
+	}
+
+	// Union outer types reject string defaults for numeric branches —
+	// Java parity (parseField's text→DoubleNode coercion does not
+	// fire for UNION outer types). See
+	// TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches
+	// for the full matrix.
+	_, err = Parse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":["float","null"],"default":"1.5"}
+	]}`)
+	if err == nil {
+		t.Fatal("expected error for union+string-numeric default")
 	}
 }
 
