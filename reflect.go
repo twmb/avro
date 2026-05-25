@@ -21,9 +21,8 @@ var (
 // fresh map sized to hint. Shared by deserRecord's interface arm and
 // decodeRecordAny so the two record-into-*any paths agree on reuse.
 //
-// Reuse retains keys not present in the schema (matches encoding/json
-// into a non-empty map). Callers that need a fresh decode should clear
-// or replace the map before each call.
+// Reuse retains keys not present in the schema; callers that need a
+// fresh decode should clear or replace the map before each call.
 func reuseOrMakeStringAnyMap(v reflect.Value, hint int) map[string]any {
 	if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
 		return inner.Interface().(map[string]any)
@@ -436,4 +435,14 @@ func valueIsZero(v reflect.Value) bool {
 		}
 	}
 	return v.IsZero()
+}
+
+// setZero sets v to the Go zero value of its type. Used wherever a null
+// (or a custom-type-returned nil) must clear the target, replacing any
+// prior value — concrete primitives included. Pre-populated non-pointer
+// fields would otherwise silently retain stale data across reused
+// decodes, contradicting the public-API promise that null clears the
+// target.
+func setZero(v reflect.Value) {
+	v.Set(reflect.Zero(v.Type()))
 }

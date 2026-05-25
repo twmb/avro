@@ -32,7 +32,7 @@
 // # JSON encoding
 //
 // [Schema.EncodeJSON] is schema-aware and handles bytes, unions, and
-// NaN/Infinity floats correctly — use it instead of [encoding/json.Marshal]
+// NaN/Infinity floats correctly — use it instead of a generic JSON encoder
 // when serializing decoded Avro data to JSON. Options control the output
 // format: [TaggedUnions] for Avro JSON union wrappers ({"type": value}),
 // [TagLogicalTypes] for qualified branch names, and [LinkedinFloats] for
@@ -40,12 +40,12 @@
 //
 // # Encoding from JSON input
 //
-// Data from [encoding/json.Unmarshal] (map[string]any with float64 numbers
-// and string timestamps) can be encoded directly. Missing map keys are
-// filled from schema defaults, [encoding/json.Number] is accepted for all
-// numeric types, and timestamp fields accept RFC 3339 strings. String
-// fields accept [encoding.TextAppender] and [encoding.TextMarshaler]
-// implementations (with [encoding.TextUnmarshaler] on decode).
+// Generically-decoded JSON data (map[string]any with float64 numbers and
+// string timestamps) can be encoded directly. Missing map keys are filled
+// from schema defaults, [encoding/json.Number] is accepted for all numeric
+// types, and timestamp fields accept RFC 3339 strings. String fields accept
+// [encoding.TextAppender] and [encoding.TextMarshaler] implementations
+// (with [encoding.TextUnmarshaler] on decode).
 //
 // # Schema evolution
 //
@@ -106,10 +106,18 @@
 // building a resolved schema, use [CheckCompatibility].
 //
 // A null union branch decodes to the target's Go zero value, always replacing
-// any prior value — matching [encoding/json/v2.Unmarshal]. Use *T to
-// distinguish null from zero. Numeric values that don't fit the Go target's
-// range return an error; values within range but without exact representation
-// are rounded silently, matching json/v2's "rounded or clamped" rule.
+// any prior value. Use *T to distinguish null from zero.
+//
+// The reader schema is the user's contract for precision. When the reader
+// schema is lossy — float or double — encode and decode both silently
+// IEEE-round to the destination's representable range, and an out-of-range
+// finite input becomes ±Inf on the wire. When the reader schema is exact —
+// int, long, bytes, string — decode requires the Go target to represent the
+// wire value without loss; values outside the target's range or values the
+// target can't represent exactly (for example, a long above 2^53 decoded into
+// a float64) return an error. Users who need exact round-trip of large
+// integers should choose a long reader schema with an int64 target rather
+// than relying on a float to round.
 //
 // # Struct tags
 //
@@ -186,6 +194,5 @@
 // decoder (lossy-by-design conversions, spec/interop choices, and
 // decoder-only leniencies).
 //
-// [encoding/json/v2.Unmarshal]: https://pkg.go.dev/encoding/json/v2#Unmarshal
 // [Avro specification]: https://avro.apache.org/docs/current/specification/
 package avro

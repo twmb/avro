@@ -11055,6 +11055,67 @@ func TestRegression_TimeMicrosJSONOverflowAnyPath(t *testing.T) {
 	}
 }
 
+// TestDurationSubResolutionTruncatesTowardZero locks in that
+// time.Duration values whose nanosecond component is not a whole
+// multiple of the schema's resolution unit are silently truncated
+// toward zero at encode — matching Go's time.Duration.Milliseconds()
+// and .Microseconds() integer-conversion semantics. The wire format
+// physically can't represent sub-resolution precision, so encode
+// either truncates, rounds, or rejects; this implementation truncates
+// (consistent with the standard library's int conversion methods).
+// Locked in README §Logical Types and the serTimeMillis doc-string.
+//
+// A whole-millisecond / whole-microsecond Duration round-trips exactly.
+func TestDurationSubResolutionTruncatesTowardZero(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		in     time.Duration
+		want   time.Duration
+	}{
+		{
+			name:   "time-millis exact ms",
+			schema: `{"type":"int","logicalType":"time-millis"}`,
+			in:     2 * time.Millisecond,
+			want:   2 * time.Millisecond,
+		},
+		{
+			name:   "time-millis sub-ms truncates",
+			schema: `{"type":"int","logicalType":"time-millis"}`,
+			in:     time.Duration(1_500_500), // 1.5005ms
+			want:   1 * time.Millisecond,
+		},
+		{
+			name:   "time-micros exact us",
+			schema: `{"type":"long","logicalType":"time-micros"}`,
+			in:     3 * time.Microsecond,
+			want:   3 * time.Microsecond,
+		},
+		{
+			name:   "time-micros sub-us truncates",
+			schema: `{"type":"long","logicalType":"time-micros"}`,
+			in:     time.Duration(1_500_999), // 1.500999ms → 1500us
+			want:   1500 * time.Microsecond,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := MustParse(tc.schema)
+			buf, err := s.AppendEncode(nil, tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out time.Duration
+			if _, err := s.Decode(buf, &out); err != nil {
+				t.Fatal(err)
+			}
+			if out != tc.want {
+				t.Fatalf("in=%v: got out=%v, want %v", tc.in, out, tc.want)
+			}
+		})
+	}
+}
+
 // TestRegression_UnionWithoutNullBranchAcceptsJsonNull locks in that
 // DecodeJSON rejects a null token when the union schema has no null
 // branch. Java's JsonDecoder.readIndex and fastavro's read_index both

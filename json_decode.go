@@ -82,10 +82,7 @@ func decodeLogicalFixed(b []byte, node *schemaNode) any {
 // for the empty-interface (any) target — the hot decode-into-*any path.
 func assignAny(v reflect.Value, val any, avroType string) error {
 	if val == nil {
-		switch v.Kind() {
-		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
-			v.Set(reflect.Zero(v.Type()))
-		}
+		setZero(v)
 		return nil
 	}
 	rv := reflect.ValueOf(val)
@@ -215,18 +212,11 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 	}
 }
 
-func (ctx *jsonDecoder) decodeNull(v reflect.Value, toAny bool) error {
+func (ctx *jsonDecoder) decodeNull(v reflect.Value, _ bool) error {
 	if err := ctx.scanner.consumeNull(); err != nil {
 		return err
 	}
-	if toAny {
-		v.Set(reflect.Zero(v.Type()))
-	} else {
-		switch v.Kind() {
-		case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Interface:
-			v.Set(reflect.Zero(v.Type()))
-		}
-	}
+	setZero(v)
 	return nil
 }
 
@@ -812,21 +802,22 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 	if v.Kind() != reflect.Map || v.Type().Key().Kind() != reflect.String {
 		return semErr(v, "map")
 	}
-	if err := rejectJSONNumberMapKey(v.Type(), "map"); err != nil {
-		return err
-	}
 	if v.IsNil() {
 		v.Set(reflect.MakeMap(v.Type()))
 	}
+	keyType := v.Type().Key()
 	valType := v.Type().Elem()
 	if ctx.scanner.peek() != '}' {
 		elem := reflect.New(valType).Elem()
 		// Reusable key Value typed to match the user's map key type
 		// (handles `type UserID string; map[UserID]V` without panic).
-		keyVal := reflect.New(v.Type().Key()).Elem()
+		keyVal := reflect.New(keyType).Elem()
 		for {
 			key, err := ctx.consumeSlabString()
 			if err != nil {
+				return err
+			}
+			if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
 				return err
 			}
 			if err := ctx.scanner.expect(':'); err != nil {
@@ -988,17 +979,18 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 }
 
 func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error {
-	if err := rejectJSONNumberMapKey(v.Type(), "record"); err != nil {
-		return err
-	}
 	if v.IsNil() {
 		v.Set(reflect.MakeMapWithSize(v.Type(), len(node.fields)))
 	}
 	elem := reflect.New(v.Type().Elem()).Elem()
 	mapType := v.Type()
+	keyType := mapType.Key()
 	return ctx.iterateRecordFields(node,
 		func(idx int, key string) error {
 			f := &node.fields[idx]
+			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
+				return err
+			}
 			if err := ctx.decodeValue(elem, f.node); err != nil {
 				return fmt.Errorf("field %q: %w", key, err)
 			}
@@ -1008,6 +1000,9 @@ func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error
 		},
 		func(idx int) error {
 			f := &node.fields[idx]
+			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
+				return err
+			}
 			if err := ctx.applyFieldDefault(elem, node, idx); err != nil {
 				return fmt.Errorf("field %q default: %w", f.name, err)
 			}
@@ -1103,10 +1098,7 @@ func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 		if err := ctx.scanner.consumeNull(); err != nil {
 			return err
 		}
-		switch v.Kind() {
-		case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Interface:
-			v.Set(reflect.Zero(v.Type()))
-		}
+		setZero(v)
 		return nil
 	}
 

@@ -168,10 +168,11 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 //  1. ±Inf float → [json.Number]("±1e1000") literal that re-parses to
 //     the same value via [parseFloatAcceptOverflow] (schema.go). The
 //     inverse of normalizeJSONNumber's ErrRange-with-Inf accept.
-//     Required because [encoding/json.Marshal] unconditionally rejects
-//     ±Inf and NaN, so a SchemaNode obtained from [Schema.Root] for a
-//     schema whose Default / Props normalized an exponent-form overflow
-//     to ±Inf cannot otherwise round-trip through [SchemaNode.Schema].
+//     Required because Go's standard JSON encoder unconditionally
+//     rejects ±Inf and NaN, so a SchemaNode obtained from [Schema.Root]
+//     for a schema whose Default / Props normalized an exponent-form
+//     overflow to ±Inf cannot otherwise round-trip through
+//     [SchemaNode.Schema].
 //
 //  2. NaN float → JSON string "NaN". RFC 8259 has no NaN literal, so
 //     no JSON number can encode NaN (compare item 1's ±Inf overflow
@@ -191,14 +192,14 @@ func (n *SchemaNode) toJSONDedup(d *deduper) any {
 //     arm: that arm materializes Default as []byte (the wire form);
 //     re-emitting requires putting it back in the Avro JSON
 //     codepoint-string form (the spec form for bytes/fixed defaults).
-//     Plain [encoding/json.Marshal] would base64-encode the slice
+//     A plain []byte marshal would base64-encode the slice
 //     ("AQID" for {0x01,0x02,0x03}) which the Avro parser would then
 //     re-read as raw bytes [0x41,0x51,0x49,0x44] — a silent value
 //     corruption breaking [SchemaNode.Schema] round-trips for any
 //     bytes/fixed default. Programmatically-constructed Props with
 //     []byte values also get the codepoint encoding (Avro's
-//     convention), not Go's base64 default; users who need base64 in
-//     Props should pre-encode to a string.
+//     convention), not base64; users who need base64 in Props should
+//     pre-encode to a string.
 //
 // Container values (map[string]any, []any) are deep-copied only when a
 // descendant requires conversion, so the common no-fixup case is

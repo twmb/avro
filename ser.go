@@ -1050,7 +1050,11 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 			}
 			return dst, nil
 		}
+		keyType := t.Key()
 		for _, f := range s.fields {
+			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
+				return nil, err
+			}
 			value := v.MapIndex(mapKeyAs(t, f.nameVal))
 			if !value.IsValid() {
 				if !f.hasDefault {
@@ -1254,9 +1258,14 @@ func appendMapPrimitive(
 	if err != nil || l == 0 {
 		return dst, err
 	}
+	keyType := v.Type().Key()
 	iter := v.MapRange()
 	for iter.Next() {
-		dst = doSerString(dst, iter.Key().String())
+		key := iter.Key().String()
+		if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
+			return nil, err
+		}
+		dst = doSerString(dst, key)
 		elem, err := peelElem(iter.Value(), avroType)
 		if err != nil {
 			return nil, err
@@ -1329,9 +1338,14 @@ func (s *serMap) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	if err != nil || l == 0 {
 		return dst, err
 	}
+	keyType := v.Type().Key()
 	iter := v.MapRange()
 	for iter.Next() {
-		dst = doSerString(dst, iter.Key().String())
+		key := iter.Key().String()
+		if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
+			return nil, err
+		}
+		dst = doSerString(dst, key)
 		if dst, err = s.serItem(dst, iter.Value(), depth+1); err != nil {
 			return nil, err
 		}
@@ -1625,8 +1639,12 @@ func serDate(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 // Accepts time.Duration (canonical) and time.Time as a convenience
 // escape hatch; the time.Time arm silently discards the date and zone
 // since the wire format physically can't represent them. Documented
-// in README §Logical Types. time.Duration is always lossless;
-// time.Time round-trips preserve time-of-day only.
+// in README §Logical Types. time.Duration round-trips exactly only when
+// its nanosecond component is a whole multiple of one millisecond;
+// sub-millisecond nanoseconds are silently truncated toward zero (integer
+// division by 1ms, dropping the remainder) since the wire format physically
+// can't represent them. time.Time round-trips preserve time-of-day only
+// (date and zone are dropped).
 func serTimeMillis(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
@@ -1817,6 +1835,26 @@ func decimalUnscaledBytes(r *big.Rat, scale, precision int, avroType string, goT
 	return bigIntToBytes(unscaled), nil
 }
 
+// appendDecimalFixed pads/sign-extends b into exactly size bytes and
+// appends the result to dst. Returns a SemanticError when b exceeds
+// size (decimal value too wide for the fixed schema). Shared by
+// serFixedDecimal.serRat (binary) and the JSON fixed+decimal arm so
+// both agree on the high-bit-pad rule and the oversize-reject shape.
+func appendDecimalFixed(dst, b []byte, size int, goType reflect.Type) ([]byte, error) {
+	if len(b) > size {
+		return nil, &SemanticError{GoType: goType, AvroType: "fixed",
+			Err: fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), size)}
+	}
+	pad := byte(0)
+	if len(b) > 0 && b[0]&0x80 != 0 {
+		pad = 0xff
+	}
+	for i := len(b); i < size; i++ {
+		dst = append(dst, pad)
+	}
+	return append(dst, b...), nil
+}
+
 type serBytesDecimal struct {
 	precision int
 	scale     int
@@ -1853,18 +1891,7 @@ func (s *serFixedDecimal) serRat(dst []byte, r *big.Rat) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > s.size {
-		return nil, &SemanticError{GoType: bigRatType, AvroType: "fixed", Err: fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), s.size)}
-	}
-	// Pad to fixed size with sign extension.
-	pad := byte(0)
-	if len(b) > 0 && b[0]&0x80 != 0 {
-		pad = 0xff
-	}
-	for i := len(b); i < s.size; i++ {
-		dst = append(dst, pad)
-	}
-	return append(dst, b...), nil
+	return appendDecimalFixed(dst, b, s.size, bigRatType)
 }
 
 func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {

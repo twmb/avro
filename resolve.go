@@ -420,14 +420,12 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 }
 
 func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, sl *slab) ([]byte, error) {
-	if err := rejectJSONNumberMapKey(t, "record"); err != nil {
-		return nil, err
-	}
 	if v.IsNil() {
 		v.Set(reflect.MakeMapWithSize(t, len(rr.readerNames)))
 	}
 	var err error
 	elem := reflect.New(t.Elem()).Elem()
+	keyType := t.Key()
 
 	for _, op := range rr.wireOps {
 		if op.readerIdx < 0 {
@@ -436,16 +434,24 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 			}
 			continue
 		}
+		name := rr.readerNames[op.readerIdx]
+		if err := validateJSONNumberMapKey(name, keyType, "record"); err != nil {
+			return nil, err
+		}
 		if src, err = op.read(src, elem, sl); err != nil {
-			return nil, recordFieldError(nil, rr.readerNames[op.readerIdx], err)
+			return nil, recordFieldError(nil, name, err)
 		}
 		v.SetMapIndex(mapKeyAs(t, rr.readerNameVals[op.readerIdx]), elem)
 		elem.SetZero()
 	}
 
 	for _, d := range rr.defaults {
+		name := rr.readerNames[d.readerIdx]
+		if err := validateJSONNumberMapKey(name, keyType, "record"); err != nil {
+			return nil, err
+		}
 		if _, err = d.deser(d.encodedDefault, elem, sl); err != nil {
-			return nil, recordFieldError(nil, rr.readerNames[d.readerIdx], err)
+			return nil, recordFieldError(nil, name, err)
 		}
 		v.SetMapIndex(mapKeyAs(t, rr.readerNameVals[d.readerIdx]), elem)
 		elem.SetZero()
@@ -716,6 +722,21 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 	}, nil
 }
 
+// extractDefaultBytes converts the encodeDefault "bytes"/"fixed" arm's
+// raw default value into the wire-form []byte. A literal []byte passes
+// through; a string is codepoint-mapped via avroJSONBytesToBytes (the
+// fwd-ref fixup path that bypasses convertDefaultBytes); other types
+// yield a typed error. typeLabel is "bytes" or "fixed".
+func extractDefaultBytes(val any, typeLabel string) ([]byte, error) {
+	switch v := val.(type) {
+	case []byte:
+		return v, nil
+	case string:
+		return avroJSONBytesToBytes(v)
+	}
+	return nil, fmt.Errorf("expected []byte or string for %s default, got %T", typeLabel, val)
+}
+
 func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 	switch node.kind {
 	case "null":
@@ -766,21 +787,9 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		dst = appendVarlong(dst, int64(len(s)))
 		return append(dst, s...), nil
 	case "bytes":
-		var b []byte
-		switch v := val.(type) {
-		case []byte:
-			b = v
-		case string:
-			// Fwd-ref fixup path stores the unconverted JSON string;
-			// convert here via codepoint mapping for consistency with
-			// the normal (post-convertDefaultBytes) []byte path.
-			var err error
-			b, err = avroJSONBytesToBytes(v)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("expected []byte or string for bytes default, got %T", val)
+		b, err := extractDefaultBytes(val, "bytes")
+		if err != nil {
+			return nil, err
 		}
 		dst = appendVarlong(dst, int64(len(b)))
 		return append(dst, b...), nil
@@ -796,19 +805,9 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("unknown enum symbol %q in default", truncForError(s))
 	case "fixed":
-		var b []byte
-		switch v := val.(type) {
-		case []byte:
-			b = v
-		case string:
-			// Fwd-ref fixup path; see "bytes" case for rationale.
-			var err error
-			b, err = avroJSONBytesToBytes(v)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("expected []byte or string for fixed default, got %T", val)
+		b, err := extractDefaultBytes(val, "fixed")
+		if err != nil {
+			return nil, err
 		}
 		if len(b) != node.size {
 			return nil, fmt.Errorf("fixed default length %d != size %d", len(b), node.size)

@@ -144,7 +144,7 @@ func (sl *slab) put() {
 //   - duration: [Duration]
 //
 // To produce JSON from decoded *any data, use [Schema.EncodeJSON] rather
-// than [encoding/json.Marshal]. EncodeJSON is schema-aware and converts
+// than a generic JSON encoder. EncodeJSON is schema-aware and converts
 // these types back to their Avro representations (e.g. time.Time to
 // epoch integers, []byte to \uXXXX strings).
 //
@@ -499,16 +499,17 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	if k != reflect.Struct && (k != reflect.Map || t.Key().Kind() != reflect.String) {
 		return nil, &SemanticError{GoType: t, AvroType: "record"}
 	}
-	if err := rejectJSONNumberMapKey(t, "record"); err != nil {
-		return nil, err
-	}
 	var err error
 	if k == reflect.Map {
+		keyType := t.Key()
 		if v.IsNil() {
 			v.Set(reflect.MakeMapWithSize(t, len(s.fields)))
 		}
 		elem := reflect.New(t.Elem()).Elem()
 		for _, f := range s.fields {
+			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
+				return nil, err
+			}
 			if src, err = f.fn(src, elem, sl); err != nil {
 				return nil, recordFieldError(nil, f.name, err)
 			}
@@ -1137,9 +1138,6 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		if t.Kind() != reflect.Map || t.Key().Kind() != reflect.String {
 			return nil, &SemanticError{GoType: t, AvroType: "map"}
 		}
-		if err := rejectJSONNumberMapKey(t, "map"); err != nil {
-			return nil, err
-		}
 		mapTyp = t
 		elemTyp = t.Elem()
 		if !v.IsNil() {
@@ -1149,8 +1147,12 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	// For primitive value types with matching Go element types, use
 	// reusable reflect.Value containers to avoid per-entry allocations.
 	// fastPathSafeForElem screens both the Kind match and the json.Number
-	// guard-bypass case — see its docstring.
-	useFast := !iface && s.fastBlock != nil && fastPathSafeForElem(elemTyp, s.fastElemKind)
+	// guard-bypass case — see its docstring. A json.Number map key also
+	// requires per-key validation (isJSONNumber check on each wire key),
+	// which the fastBlock loops can't perform without per-element setter
+	// indirection; route those to the slow path so the in-loop call to
+	// validateJSONNumberMapKey fires.
+	useFast := !iface && s.fastBlock != nil && fastPathSafeForElem(elemTyp, s.fastElemKind) && mapTyp.Key() != jsonNumberType
 	// For interface targets with primitive avro values, use the
 	// iface-block fast path that operates directly on map[string]any.
 	useFastIface := iface && s.fastIfaceVal != nil
@@ -1219,9 +1221,13 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			}
 			continue
 		}
+		keyType := mapTyp.Key()
 		for range int(count) {
 			src, err = readMapKey(src, keyVal, sl)
 			if err != nil {
+				return nil, err
+			}
+			if err := validateJSONNumberMapKey(keyVal.String(), keyType, "map"); err != nil {
 				return nil, err
 			}
 			src, err = s.deserItem(src, elemVal, sl)
@@ -1463,23 +1469,12 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 ///////////////////////////////
 
 // rejectJSONNumberStringTarget reports a SemanticError when v is a
-// json.Number target receiving string-like wire content (the string,
-// bytes, fixed, or enum-symbol cases). json.Number's encoding/json
-// contract requires the underlying string to be a valid RFC 8259 number
-// literal — arbitrary wire strings violate that and encoding/json.Marshal
-// rejects the resulting json.Number at the user's first attempt to
-// re-serialize it, far from the decode site.
-//
-// Mirrors setFloatValue's non-finite reject (which also has no valid JSON
-// number representation) and the encode-side rejection at appendAvroString
-// (json.Number is not an accepted input for "string"). Without this
-// guard the decoder silently produced invalid json.Number values whose
-// .String() didn't satisfy json.Number's stdlib invariant.
-//
-// One predicate consulted by every string-like-wire setter
-// (setStringValue, setBytesValue, setEnumTarget, decodeString's direct
-// string arm) so the json.Number contract guard can't drift across the
-// four dispatch sites.
+// json.Number target receiving string-like wire content (string, bytes,
+// fixed, or enum-symbol). json.Number's encoding/json contract requires
+// the underlying string to be a valid RFC 8259 number literal; arbitrary
+// wire strings violate that and json.Marshal rejects later, far from the
+// decode site. Mirrors appendAvroString's encode-side reject. Consulted
+// by setStringValue / setBytesValue / setEnumTarget / decodeString.
 func rejectJSONNumberStringTarget(v reflect.Value, content, avroType string) error {
 	if v.Type() != jsonNumberType {
 		return nil
@@ -1501,42 +1496,38 @@ func setStringTarget(v reflect.Value, s, avroType string) error {
 	return nil
 }
 
-// rejectJSONNumberMapKey is rejectJSONNumberStringTarget's key-axis
-// variant. Avro map keys (and record field names when a record is
-// decoded as map[K]V) are wire strings with no JSON-number contract; a
-// map keyed by json.Number would silently receive arbitrary string
-// content that violates json.Number's RFC 8259 invariant the same way
-// the value-setter sites would. Rejected at decode entry rather than
-// per-key: the policy is type-level (string-wire source can never
-// satisfy json.Number's invariant), and Avro field names structurally
-// never produce valid JSON-number literals anyway, so per-key checks
-// would always trip on the first key for record-to-map decode.
+// validateJSONNumberMapKey is rejectJSONNumberStringTarget's key-axis
+// variant. When keyType is json.Number, key must be a valid JSON number
+// literal (per the same RFC 8259 contract enforced on string-target
+// values); arbitrary string content silently violates the invariant.
+// No-op for any other key type.
 //
-// One predicate consulted by every map-decode entry point (binary
-// deserMap / deserRecord-to-map, JSON decodeMap / decodeRecordMap,
-// resolved resolvedRecord.deserMap) so the policy can't drift across
-// the five dispatch sites.
-func rejectJSONNumberMapKey(t reflect.Type, avroType string) error {
-	if t.Kind() != reflect.Map || t.Key() != jsonNumberType {
+// Called per-key during both decode and encode so the round-trip is
+// content-symmetric: every map[json.Number]V key that encodes also
+// decodes back into the same target. Avro field names (used when a
+// record is encoded from or decoded into map[K]V) follow the Avro
+// naming rule [A-Za-z_][A-Za-z0-9_]*, so for the record-as-map case
+// the first field name always fails validation — effectively the same
+// outcome as a blanket reject for that shape, but the error names the
+// specific key.
+func validateJSONNumberMapKey(key string, keyType reflect.Type, avroType string) error {
+	if keyType != jsonNumberType {
 		return nil
 	}
-	return &SemanticError{GoType: t, AvroType: avroType,
-		Err: errors.New("cannot use json.Number as map key: wire keys are strings with no JSON number representation")}
+	if !isJSONNumber(key) {
+		return &SemanticError{GoType: keyType, AvroType: avroType,
+			Err: fmt.Errorf("map key %q is not a valid JSON number literal", truncForError(key))}
+	}
+	return nil
 }
 
 // formatToStringKindTarget formats content as a string into v if v is a
-// reflect.String-kind target that is NOT json.Number. The matching
-// invariant: json.Number's underlying string must be a valid JSON number
-// literal (RFC 8259); arbitrary formatted content (RFC3339Nano, DateOnly,
-// hex-dash UUID, etc.) violates that. json.Number targets fall through
-// (returns wrote=false) so the caller routes the underlying numeric wire
-// value through the integer/float arm whose json.Number write produces
-// an RFC-valid literal.
-//
-// Used by the time-logical String arms (setTimeAsLongTarget / deserDate
-// in deser.go and the JSON-side decodeInt+date / decodeLong+timestamp
-// arms in json_decode.go) where the wire is numeric but the conventional
-// String-target rendering is a formatted-time literal.
+// reflect.String-kind target that is NOT json.Number (arbitrary
+// formatted content like RFC3339Nano violates json.Number's RFC 8259
+// invariant). json.Number targets fall through (wrote=false) so the
+// caller routes the underlying numeric wire value through its integer/
+// float arm. Used by the time-logical String arms (setTimeAsLongTarget /
+// deserDate / JSON decodeInt+date / decodeLong+timestamp).
 func formatToStringKindTarget(v reflect.Value, content, avroType string) (wrote bool, err error) {
 	if v.Kind() != reflect.String || v.Type() == jsonNumberType {
 		return false, nil
@@ -2137,31 +2128,12 @@ func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		reflect.Copy(v, reflect.ValueOf(u))
 		return src[n:], nil
 	}
-	if v.Kind() == reflect.Interface {
-		return src[n:], setIface(v, reflect.ValueOf(sl.string(src, n)), "string")
+	// Non-UUID targets share setStringValue's Interface / String /
+	// TextUnmarshaler / []byte chain. UUID-on-string is wire-equivalent
+	// to plain string; serUUID falls through to serString on the encode
+	// side. Symmetric.
+	if err := setStringValue(v, src, n, sl); err != nil {
+		return nil, err
 	}
-	if v.Kind() == reflect.String {
-		if err := setStringTarget(v, sl.string(src, n), "string"); err != nil {
-			return nil, err
-		}
-		return src[n:], nil
-	}
-	b := make([]byte, n)
-	copy(b, src[:n])
-	if ok, err := tryTextUnmarshal(v, b); ok {
-		if err != nil {
-			return nil, err
-		}
-		return src[n:], nil
-	}
-	// []byte target: mirror deserString's Slice byte arm. UUID-on-
-	// string is wire-equivalent to plain string, and serUUID falls
-	// through to serString (which accepts []byte source); the decode
-	// side needs the symmetric Slice byte arm for round-trip parity.
-	// TextUnmarshaler is checked first per deserString's precedence.
-	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		v.SetBytes(b)
-		return src[n:], nil
-	}
-	return nil, semErr(v, "string")
+	return src[n:], nil
 }

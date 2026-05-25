@@ -227,6 +227,33 @@ func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, 
 	return src, nil
 }
 
+// serRecordVia dispatches one record encode via the all-fast unsafe
+// path when available, falling back to the reflect-based path.
+// Callers pass pre-resolved fast (from rec.fastFor) so per-element
+// loops compute the lookup once outside the loop.
+//
+// Do NOT inline this into per-element array loops: the helper exceeds
+// the Go inline budget (cost ~290 vs 80) because reflect.NewAt+Elem
+// counts as interface method calls, and the t/rec parameters escape
+// to heap. The four array sites in this file (usArrayRecord,
+// usArrayPtrRecord, usArrayNullUnionRecord, udArrayPtrRecord) keep
+// the if/else open-coded with useFast hoisted outside the loop.
+func serRecordVia(dst []byte, fast *fastRecordSer, rec *serRecord, t reflect.Type, p unsafe.Pointer, depth int) ([]byte, error) {
+	if fast != nil && fast.allFast {
+		return serRecordFastPtr(dst, fast, p, depth)
+	}
+	return rec.ser(dst, reflect.NewAt(t, p).Elem(), depth)
+}
+
+// deserRecordVia is serRecordVia's decode-side mirror. The same
+// inline-budget caveat applies: do not use in per-element loops.
+func deserRecordVia(src []byte, fast *fastRecordDeser, rec *deserRecord, t reflect.Type, p unsafe.Pointer, sl *slab) ([]byte, error) {
+	if fast != nil && fast.allFast {
+		return deserRecordFastPtr(src, fast, p, sl)
+	}
+	return rec.deser(src, reflect.NewAt(t, p).Elem(), sl)
+}
+
 // tryCompileFieldSer returns a userfn for fields that can be fully handled
 // via unsafe pointer access. Returns nil for complex types that must use
 // the reflect-based slow path.
@@ -315,10 +342,7 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		}
 		rec := f.meta.serRecord
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			if fast := rec.fastFor(goType); fast != nil && fast.allFast {
-				return serRecordFastPtr(dst, fast, p, depth+1)
-			}
-			return rec.ser(dst, reflect.NewAt(goType, p).Elem(), depth+1)
+			return serRecordVia(dst, rec.fastFor(goType), rec, goType, p, depth+1)
 		}
 	}
 
@@ -456,10 +480,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		}
 		rec := f.meta.deserRecord
 		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			if fast := rec.fastFor(goType); fast != nil && fast.allFast {
-				return deserRecordFastPtr(src, fast, p, sl)
-			}
-			return rec.deser(src, reflect.NewAt(goType, p).Elem(), sl)
+			return deserRecordVia(src, rec.fastFor(goType), rec, goType, p, sl)
 		}
 	}
 
@@ -1233,30 +1254,39 @@ func nullUnionBytes(nullSecond bool) (nullByte, valByte byte) {
 	return 0, 2
 }
 
+// usNullUnionEnter is the encode-side mirror of udNullUnionEnter:
+// emits null-branch byte when *(*unsafe.Pointer)(p) is nil, value-
+// branch byte otherwise. Returns (pp, dst-after-tag, isNull). When
+// isNull is true the caller returns dst directly; otherwise pp is
+// the inner *T address the per-branch ser fn fills.
+func usNullUnionEnter(dst []byte, p unsafe.Pointer, nullByte, valByte byte) (pp unsafe.Pointer, _ []byte, isNull bool) {
+	pp = *(*unsafe.Pointer)(p)
+	if pp == nil {
+		return nil, append(dst, nullByte), true
+	}
+	return pp, append(dst, valByte), false
+}
+
 // usNullUnionPtr handles null-union ser for *T where T has a primitive unsafe serializer.
 // nullByte/valByte are the varint-encoded index bytes for null and value branches.
 func usNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-		pp := *(*unsafe.Pointer)(p)
-		if pp == nil {
-			return append(dst, nullByte), nil
+		pp, dst, isNull := usNullUnionEnter(dst, p, nullByte, valByte)
+		if isNull {
+			return dst, nil
 		}
-		return inner(append(dst, valByte), pp, depth+1)
+		return inner(dst, pp, depth+1)
 	}
 }
 
 // usNullUnionRecord handles null-union ser for *T where T is a record.
 func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-		pp := *(*unsafe.Pointer)(p)
-		if pp == nil {
-			return append(dst, nullByte), nil
+		pp, dst, isNull := usNullUnionEnter(dst, p, nullByte, valByte)
+		if isNull {
+			return dst, nil
 		}
-		dst = append(dst, valByte)
-		if fast := rec.fastFor(innerType); fast != nil && fast.allFast {
-			return serRecordFastPtr(dst, fast, pp, depth+1)
-		}
-		return rec.ser(dst, reflect.NewAt(innerType, pp).Elem(), depth+1)
+		return serRecordVia(dst, rec.fastFor(innerType), rec, innerType, pp, depth+1)
 	}
 }
 
@@ -1310,10 +1340,7 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 		if err != nil || isNull {
 			return src, err
 		}
-		if fast := rec.fastFor(innerType); fast != nil && fast.allFast {
-			return deserRecordFastPtr(src, fast, pp, sl)
-		}
-		return rec.deser(src, reflect.NewAt(innerType, pp).Elem(), sl)
+		return deserRecordVia(src, rec.fastFor(innerType), rec, innerType, pp, sl)
 	}
 }
 

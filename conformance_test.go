@@ -20555,13 +20555,18 @@ func TestRegression_JSONNumberStringSourceRejectedOnEncode(t *testing.T) {
 }
 
 // TestRegression_JSONNumberMapKeyRejected pins that map decode targets keyed
-// by json.Number are rejected at decode entry. Avro map keys (and record
-// field names when a record is decoded as map[K]V) are wire strings with
-// no JSON-number contract; writing them into json.Number keys silently
-// produces values that violate json.Number's RFC 8259 invariant and fail
-// at the user's first json.Marshal call far from the decode site. Same
-// policy as TestRegression_JSONNumberTargetRejectedForStringLikeWire,
-// applied at the key axis instead of the value axis.
+// by json.Number reject any key that is not a valid JSON number literal.
+// The rejection is per-key (the failing key appears in the error message)
+// rather than blanket-by-type: a map<int> wire with all-numeric keys is
+// acceptable for map[json.Number]int targets and round-trips cleanly. This
+// preserves json.Number's RFC 8259 contract (its underlying string must be
+// a valid JSON number literal) while still allowing UseNumber-pipeline
+// users to decode generic maps into json.Number-keyed targets.
+//
+// Record-as-map decode keyed by json.Number always rejects on the first
+// field name, because Avro field names follow [A-Za-z_][A-Za-z0-9_]* which
+// can never satisfy the JSON-number grammar. Same observable outcome as a
+// blanket reject, but the error names the specific key.
 //
 // Covers five entry points: binary deserMap, binary deserRecord-to-map,
 // JSON decodeMap, JSON decodeRecordMap, and resolved record-to-map.
@@ -20645,6 +20650,294 @@ func TestRegression_JSONNumberMapKeyRejected(t *testing.T) {
 		}
 		if got["foo"] != 1 {
 			t.Errorf("map[NamedString]int baseline got=%v, want {foo:1}", got)
+		}
+	})
+}
+
+// TestLogicalNumericTargetJSONNumberWritesRawWire pins that decoding a
+// logical-on-numeric schema (date/int, time-millis/int, time-micros/long,
+// timestamp-millis/long, timestamp-micros/long, timestamp-nanos/long,
+// local-timestamp-millis/long, local-timestamp-micros/long,
+// local-timestamp-nanos/long) into a *json.Number target writes the RAW
+// numeric wire value as a JSON-number-valid string — NOT the
+// logical-formatted RFC3339/DateOnly string. This preserves json.Number's
+// RFC 8259 contract (its underlying string must be a valid JSON number
+// literal) while still letting users decode logical-numeric schemas into
+// json.Number targets for use in JSON-Marshal pipelines.
+//
+// Encode-side accepts json.Number for the same logical-numeric schemas
+// (parse the string as a number, validate fits, write wire). Encode +
+// decode through json.Number therefore round-trips identically.
+//
+// Covers safe binary (deser.go: deserDate, deserTimeMillis, deserTimeMicros,
+// deserTimeAsLong), unsafe binary (unsafe.go: udTimeFromVarint,
+// udTimeFromVarlong), JSON (json_decode.go: decodeInt date arm,
+// decodeLong timestamp arm), and resolved (resolve.go via
+// setTimeAsLongTarget / setIntegerWire's json.Number arm).
+func TestLogicalNumericTargetJSONNumberWritesRawWire(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		wire   json.Number
+	}{
+		{"date", `{"type":"int","logicalType":"date"}`, json.Number("19723")},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, json.Number("86399999")},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, json.Number("86399999999")},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, json.Number("1700000000000")},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, json.Number("1700000000000000")},
+		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, json.Number("1700000000000000000")},
+		{"local-timestamp-millis", `{"type":"long","logicalType":"local-timestamp-millis"}`, json.Number("1700000000000")},
+		{"local-timestamp-micros", `{"type":"long","logicalType":"local-timestamp-micros"}`, json.Number("1700000000000000")},
+		{"local-timestamp-nanos", `{"type":"long","logicalType":"local-timestamp-nanos"}`, json.Number("1700000000000000000")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/binary", func(t *testing.T) {
+			s := avro.MustParse(tc.schema)
+			wire, err := s.AppendEncode(nil, tc.wire)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var got json.Number
+			if _, err := s.Decode(wire, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got != tc.wire {
+				t.Fatalf("round-trip mismatch: in=%q out=%q", tc.wire, got)
+			}
+		})
+		t.Run(tc.name+"/json", func(t *testing.T) {
+			s := avro.MustParse(tc.schema)
+			wire, err := s.AppendEncodeJSON(nil, tc.wire)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var got json.Number
+			if err := s.DecodeJSON(wire, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got != tc.wire {
+				t.Fatalf("round-trip mismatch: in=%q out=%q", tc.wire, got)
+			}
+		})
+		t.Run(tc.name+"/unsafe_struct_field", func(t *testing.T) {
+			recordSchema := `{"type":"record","name":"R","fields":[{"name":"v","type":` + tc.schema + `}]}`
+			s := avro.MustParse(recordSchema)
+			type Row struct {
+				V json.Number `avro:"v"`
+			}
+			wire, err := s.AppendEncode(nil, Row{V: tc.wire})
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var got Row
+			if _, err := s.Decode(wire, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got.V != tc.wire {
+				t.Fatalf("round-trip mismatch: in=%q out=%q", tc.wire, got.V)
+			}
+		})
+	}
+}
+
+// TestJSONNumberMapKeyContentValidated pins that map[json.Number]V is
+// accepted as a decode target AND encode source when every key is a valid
+// JSON number literal, and rejected per-key (with a specific key in the
+// error message) when any key violates the JSON-number grammar. This
+// preserves json.Number's RFC 8259 contract (the underlying string must
+// be a valid JSON number literal) at the key axis without requiring users
+// to fall back to map[string]json.Number when they want numeric-keyed
+// maps from UseNumber-decoded pipelines.
+//
+// Record-as-map decode against map[json.Number]V always fails on the
+// first field name, because Avro field names follow [A-Za-z_][A-Za-z0-9_]*
+// which can never satisfy the JSON-number grammar. This is the same
+// observable outcome as a blanket type-level reject for that case, but
+// the error now identifies the specific key that failed validation.
+func TestJSONNumberMapKeyContentValidated(t *testing.T) {
+	// Decode side ----
+	t.Run("binary_map_numeric_keys_accepted", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"int"}`)
+		wire, err := s.Encode(map[string]int{"1": 100, "2": 200})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[json.Number]int
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode rejected numeric keys: %v", err)
+		}
+		if got[json.Number("1")] != 100 || got[json.Number("2")] != 200 {
+			t.Fatalf("round-trip mismatch: %v", got)
+		}
+	})
+	t.Run("binary_map_non_numeric_key_rejected", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"int"}`)
+		wire, err := s.Encode(map[string]int{"not-a-number": 1})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[json.Number]int
+		_, err = s.Decode(wire, &got)
+		if err == nil {
+			t.Fatalf("expected reject for non-numeric key; got %v", got)
+		}
+		if !strings.Contains(err.Error(), "not-a-number") {
+			t.Errorf("error should name the offending key, got: %v", err)
+		}
+	})
+	t.Run("json_map_numeric_keys_accepted", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"int"}`)
+		var got map[json.Number]int
+		if err := s.DecodeJSON([]byte(`{"1":100,"2":200}`), &got); err != nil {
+			t.Fatalf("decode rejected numeric keys: %v", err)
+		}
+		if got[json.Number("1")] != 100 || got[json.Number("2")] != 200 {
+			t.Fatalf("round-trip mismatch: %v", got)
+		}
+	})
+	t.Run("json_map_non_numeric_key_rejected", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"int"}`)
+		var got map[json.Number]int
+		err := s.DecodeJSON([]byte(`{"not-a-number":1}`), &got)
+		if err == nil {
+			t.Fatalf("expected reject for non-numeric key; got %v", got)
+		}
+	})
+	t.Run("binary_record_as_map_field_name_rejected", func(t *testing.T) {
+		// Avro field names can never satisfy the JSON-number grammar.
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"alpha","type":"int"}]}`)
+		wire, err := s.Encode(map[string]int{"alpha": 1})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[json.Number]int
+		if _, err := s.Decode(wire, &got); err == nil {
+			t.Fatalf("expected reject for record-as-map (field name 'alpha' is not a JSON number); got %v", got)
+		}
+	})
+	t.Run("json_record_as_map_field_name_rejected", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"alpha","type":"int"}]}`)
+		var got map[json.Number]int
+		if err := s.DecodeJSON([]byte(`{"alpha":1}`), &got); err == nil {
+			t.Fatalf("expected reject; got %v", got)
+		}
+	})
+
+	// Encode side ----
+	t.Run("binary_encode_map_numeric_keys_accepted", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"long"}`)
+		in := map[json.Number]int64{
+			json.Number("1"): 100,
+			json.Number("2"): 200,
+		}
+		if _, err := s.AppendEncode(nil, in); err != nil {
+			t.Fatalf("encode rejected numeric json.Number keys: %v", err)
+		}
+	})
+	t.Run("binary_encode_map_non_numeric_key_rejected", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"long"}`)
+		in := map[json.Number]int64{
+			json.Number("not-a-number"): 1,
+		}
+		_, err := s.AppendEncode(nil, in)
+		if err == nil {
+			t.Fatalf("expected encode reject for non-numeric json.Number key")
+		}
+		if !strings.Contains(err.Error(), "not-a-number") {
+			t.Errorf("error should name the offending key, got: %v", err)
+		}
+	})
+	t.Run("json_encode_map_non_numeric_key_rejected", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"long"}`)
+		in := map[json.Number]int64{
+			json.Number("not-a-number"): 1,
+		}
+		_, err := s.AppendEncodeJSON(nil, in)
+		if err == nil {
+			t.Fatalf("expected JSON encode reject for non-numeric json.Number key")
+		}
+	})
+	t.Run("binary_encode_record_as_map_field_name_rejected", func(t *testing.T) {
+		// User has map[json.Number]V but the schema is a record whose
+		// field names ('alpha') don't satisfy the JSON-number grammar.
+		// The lookup-by-field-name path will reject when it discovers
+		// the user has supplied 'alpha' as a json.Number, since 'alpha'
+		// is not a valid JSON number literal.
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"alpha","type":"int"}]}`)
+		in := map[json.Number]int{
+			json.Number("alpha"): 1,
+		}
+		_, err := s.AppendEncode(nil, in)
+		if err == nil {
+			t.Fatalf("expected reject for json.Number map key matching Avro field name 'alpha'")
+		}
+	})
+
+	// Baseline: map[string]V keeps working.
+	t.Run("map_string_baseline_accepted", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"int"}`)
+		in := map[string]int{"alpha": 1, "1": 100}
+		wire, _ := s.Encode(in)
+		var got map[string]int
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("map[string]int baseline rejected: %v", err)
+		}
+		if got["alpha"] != 1 || got["1"] != 100 {
+			t.Fatalf("baseline got=%v", got)
+		}
+	})
+
+	// Resolved generic-map path: the resolution helper at resolve.go
+	// constructs a new deserMap whose .deser method calls the per-key
+	// validator in the slow path. Locks the sixth decode dispatch site
+	// (in addition to the five enumerated above).
+	t.Run("resolved_generic_map_numeric_keys_accepted", func(t *testing.T) {
+		writer := avro.MustParse(`{"type":"map","values":"long"}`)
+		reader := avro.MustParse(`{"type":"map","values":"long"}`)
+		resolved, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire, _ := writer.Encode(map[string]int64{"1": 100, "42": 4200})
+		var got map[json.Number]int64
+		if _, err := resolved.Decode(wire, &got); err != nil {
+			t.Fatalf("resolved generic-map rejected numeric keys: %v", err)
+		}
+		if got[json.Number("1")] != 100 || got[json.Number("42")] != 4200 {
+			t.Fatalf("round-trip mismatch: %v", got)
+		}
+	})
+	t.Run("resolved_generic_map_non_numeric_key_rejected", func(t *testing.T) {
+		writer := avro.MustParse(`{"type":"map","values":"long"}`)
+		reader := avro.MustParse(`{"type":"map","values":"long"}`)
+		resolved, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire, _ := writer.Encode(map[string]int64{"not-a-number": 1})
+		var got map[json.Number]int64
+		if _, err := resolved.Decode(wire, &got); err == nil {
+			t.Fatalf("expected reject for non-numeric key; got %v", got)
+		}
+	})
+
+	// Per-key validation cost is O(n) byte-scan via isJSONNumber; no
+	// arbitrary-precision helper. A 1 MiB hostile json.Number key must
+	// reject in well under 100ms — the conventional DoS bound for fail-
+	// fast rejections of attacker-controlled input.
+	t.Run("hostile_key_rejected_fast", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":"long"}`)
+		in := map[json.Number]int64{
+			json.Number(strings.Repeat("x", 1<<20)): 1,
+		}
+		t0 := time.Now()
+		_, err := s.AppendEncode(nil, in)
+		d := time.Since(t0)
+		if err == nil {
+			t.Fatalf("expected reject")
+		}
+		if d > 100*time.Millisecond {
+			t.Fatalf("hostile 1MiB key rejected slowly: %v", d)
 		}
 	})
 }

@@ -212,11 +212,7 @@ func inferAvroType(t reflect.Type) string {
 // (rather than letting reflect.Value.Set panic).
 func setCustomResult(v reflect.Value, result any, avroType string) error {
 	if result == nil {
-		// Nil result — set zero value for nullable types.
-		switch v.Kind() {
-		case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
-			v.Set(reflect.Zero(v.Type()))
-		}
+		setZero(v)
 		return nil
 	}
 	rv := reflect.ValueOf(result)

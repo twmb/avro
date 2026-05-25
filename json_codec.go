@@ -100,11 +100,14 @@ func parseOpts(opts []Opt) optConfig {
 //
 // NaN and Infinity float values are encoded as JSON strings "NaN",
 // "Infinity", and "-Infinity" by default (Java Avro convention), or as
-// null/±1e999 with [LinkedinFloats]. Standard [encoding/json.Marshal]
-// cannot represent these values; use EncodeJSON instead.
+// null/±1e999 with [LinkedinFloats]. A generic JSON encoder rejects
+// non-finite floats outright; EncodeJSON encodes them via the strings
+// above so the result is valid JSON and round-trippable through any
+// strict parser.
 //
-// EncodeJSON accepts the same Go types as [Schema.Encode]. Map key order in
-// the output is non-deterministic, as with [encoding/json.Marshal].
+// EncodeJSON accepts the same Go types as [Schema.Encode]. Map key order
+// in the output is non-deterministic — Go's map iteration order is
+// randomized and the encoder does not sort keys.
 //
 // Interop note: the default bare-union output is NOT readable by Java's
 // org.apache.avro.io.JsonDecoder, fastavro's JSON decoder, or
@@ -452,17 +455,11 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				if err != nil {
 					return nil, err
 				}
-				if len(b) > node.size {
-					return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), node.size)}
+				padded, err := appendDecimalFixed(nil, b, node.size, v.Type())
+				if err != nil {
+					return nil, err
 				}
-				out := make([]byte, node.size)
-				if len(b) < node.size && len(b) > 0 && b[0]&0x80 != 0 {
-					for i := 0; i < node.size-len(b); i++ {
-						out[i] = 0xff
-					}
-				}
-				copy(out[node.size-len(b):], b)
-				return appendAvroJSONBytes(buf, out), nil
+				return appendAvroJSONBytes(buf, padded), nil
 			}
 		case "duration":
 			if v.Type() == avroDurationType {
@@ -572,13 +569,18 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		}
 		buf = append(buf, '{')
 		first := true
+		keyType := v.Type().Key()
 		iter := v.MapRange()
 		for iter.Next() {
+			key := iter.Key().String()
+			if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
+				return nil, err
+			}
 			if !first {
 				buf = append(buf, ',')
 			}
 			first = false
-			buf = appendJSONString(buf, iter.Key().String())
+			buf = appendJSONString(buf, key)
 			buf = append(buf, ':')
 			var err error
 			buf, err = appendAvroJSON(buf, iter.Value(), node.values, cfg, custom, depth+1)
@@ -684,7 +686,11 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			return append(buf, '}'), nil
 		}
 		mapType := v.Type()
+		keyType := mapType.Key()
 		for i, f := range node.fields {
+			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
+				return nil, err
+			}
 			if i > 0 {
 				buf = append(buf, ',')
 			}
@@ -1025,9 +1031,9 @@ func appendAvroJSONBytes(buf []byte, b []byte) []byte {
 const jsonHex = "0123456789abcdef"
 
 // appendJSONString appends a JSON-encoded string to buf, escaping as needed.
-// This avoids the allocation that json.Marshal(s) would require. It escapes
+// Avoids the allocation a generic string-marshal call would require. Escapes
 // control characters, U+2028/U+2029 (for JavaScript safety), and replaces
-// invalid UTF-8 with U+FFFD, matching encoding/json behavior.
+// invalid UTF-8 with U+FFFD.
 func appendJSONString(buf []byte, s string) []byte {
 	buf = append(buf, '"')
 	for i := 0; i < len(s); {
@@ -1087,19 +1093,18 @@ func avroJSONBytesToBytes(s string) ([]byte, error) {
 // bytesToAvroJSONString encodes raw bytes into the Avro JSON bytes
 // codepoint-string form: each byte 0x00-0xFF becomes a rune at the same
 // codepoint (a 1-byte UTF-8 sequence for 0x00-0x7F, a 2-byte sequence
-// for 0x80-0xFF). The Go string this returns serializes via
-// [encoding/json.Marshal] as either `\uXXXX` (for control chars) or the
-// literal UTF-8 bytes (for printable codepoints) — both forms re-parse
-// back to the original codepoint, which [avroJSONBytesToBytes] then
-// maps back to the original byte.
+// for 0x80-0xFF). The Go string this returns serializes as either
+// `\uXXXX` (for control chars) or the literal UTF-8 bytes (for printable
+// codepoints) — both forms re-parse back to the original codepoint,
+// which [avroJSONBytesToBytes] then maps back to the original byte.
 //
 // Inverse pair with [avroJSONBytesToBytes]: round-trip
 // `avroJSONBytesToBytes(bytesToAvroJSONString(b)) == b` for every []byte.
 // Used by [jsonSerializableValue] (schema_node.go) to re-emit []byte
 // SchemaField.Default / SchemaNode.Props values in the Avro JSON spec's
-// codepoint form instead of [encoding/json.Marshal]'s default base64
-// encoding (which the Avro parser would silently re-read as the literal
-// ASCII bytes of the base64 alphabet).
+// codepoint form rather than the default base64 a generic []byte
+// marshal would produce (which the Avro parser would silently re-read
+// as the literal ASCII bytes of the base64 alphabet).
 func bytesToAvroJSONString(b []byte) string {
 	// strings.Builder.WriteRune calls utf8.EncodeRune internally and
 	// uses unsafe to return the underlying buffer as a string without

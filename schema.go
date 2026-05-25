@@ -1646,31 +1646,16 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		}
 	}
 
-	if len(s.union) == 2 && s.union[0].primitive == "null" {
+	switch {
+	case len(s.union) == 2 && s.union[0].primitive == "null":
 		b.ser = serNullUnion(ser)
 		b.deser = deserNullUnion(deser)
-		if _, isMissing := missing[1]; isMissing {
-			inner := &fieldMeta{}
-			b.meta = fieldMeta{avroType: "nullunion", inner: inner}
-			b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: missing[1]})
-		} else {
-			inner := new(fieldMeta)
-			*inner = branchMetas[1]
-			b.meta = fieldMeta{avroType: "nullunion", inner: inner}
-		}
-	} else if len(s.union) == 2 && s.union[1].primitive == "null" {
+		b.meta = b.buildNullUnionMeta(missing, branchMetas, 1, false)
+	case len(s.union) == 2 && s.union[1].primitive == "null":
 		b.ser = serNullSecondUnion(ser)
 		b.deser = deserNullSecondUnion(deser)
-		if _, isMissing := missing[0]; isMissing {
-			inner := &fieldMeta{}
-			b.meta = fieldMeta{avroType: "nullunion", nullSecond: true, inner: inner}
-			b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: missing[0]})
-		} else {
-			inner := new(fieldMeta)
-			*inner = branchMetas[0]
-			b.meta = fieldMeta{avroType: "nullunion", nullSecond: true, inner: inner}
-		}
-	} else {
+		b.meta = b.buildNullUnionMeta(missing, branchMetas, 0, true)
+	default:
 		b.ser = ser.ser
 		b.deser = deser.deser
 		b.meta = fieldMeta{avroType: "union"}
@@ -1692,6 +1677,23 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		deser:    b.deser,
 	}
 	return nil
+}
+
+// buildNullUnionMeta returns the fieldMeta for the 2-branch null-union
+// fast path. nonNullIdx is the index of the non-null branch (1 for
+// ["null", T]; 0 for ["T", "null"]). When that branch is a forward
+// reference, the inner meta is queued for finalize-time fixup;
+// otherwise the inner meta is copied from branchMetas. nullSecond
+// distinguishes the two orderings.
+func (b *builder) buildNullUnionMeta(missing map[int]string, branchMetas []fieldMeta, nonNullIdx int, nullSecond bool) fieldMeta {
+	if name, isMissing := missing[nonNullIdx]; isMissing {
+		inner := &fieldMeta{}
+		b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: name})
+		return fieldMeta{avroType: "nullunion", nullSecond: nullSecond, inner: inner}
+	}
+	inner := new(fieldMeta)
+	*inner = branchMetas[nonNullIdx]
+	return fieldMeta{avroType: "nullunion", nullSecond: nullSecond, inner: inner}
 }
 
 func (b *builder) buildComplex(parentName string, s *aschema) error {
@@ -3214,16 +3216,12 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 			return val, fmt.Errorf("fixed default length %d does not match size %d", len([]rune(s)), node.size)
 		}
 	case "record":
-		// null is not a record. Java's isValidDefault returns false for
-		// null on RECORD; fastavro's _validate_record requires
-		// isinstance(datum, Mapping); hamba's isValidDefault returns
-		// false on type-assertion failure. Without this reject, a
-		// union ["Record","null"] with default null would have its
-		// validate-walk match the Record branch (synthesizing an
-		// empty map + relying on per-field defaults) instead of
-		// falling through to the null branch — encodeDefault would
-		// then emit Record(field-defaults) wire bytes where null was
-		// intended.
+		// null is not a record (Java/fastavro/hamba all reject). Without
+		// this, ["Record","null"] with default null would match the
+		// Record branch (synthesizing an empty map + relying on per-
+		// field defaults) instead of falling through to null —
+		// encodeDefault would emit Record(field-defaults) wire bytes
+		// where null was intended.
 		if val == nil {
 			return val, fmt.Errorf("expected object for record default, got null")
 		}

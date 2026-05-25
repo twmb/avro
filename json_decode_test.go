@@ -806,6 +806,96 @@ func TestDecodeJSONNullTypedTargets(t *testing.T) {
 	})
 }
 
+// TestDecodeJSONNullIntoNonPointerZeroes is the JSON sibling of
+// TestDeserNullIntoNonPointerZeroes. doc.go states that a null union
+// branch decodes to the target's Go zero value, always replacing any
+// prior value. The binary path honors this unconditionally; the JSON
+// path historically only zeroed nilable kinds (pointer/map/slice/
+// interface), leaving non-nilable concrete targets (int, string, bool,
+// struct fields) at whatever prior value they held. That was a silent
+// value-bleed footgun across reused decode targets, contradicting the
+// public-API promise.
+//
+// Covers all three null-handling dispatch sites in json_decode.go:
+//   - decodeNull (top-level "null" schema and non-union null fields)
+//   - decodeUnion null branch (3+ branch unions and bare null in ["null", T])
+//   - assignAny nil value (toAny path)
+func TestDecodeJSONNullIntoNonPointerZeroes(t *testing.T) {
+	t.Run("top-level null", func(t *testing.T) {
+		s, _ := Parse(`"null"`)
+		out := 42
+		if err := s.DecodeJSON([]byte(`null`), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out != 0 {
+			t.Fatalf("top-level null into int target did not zero: got %d", out)
+		}
+	})
+
+	t.Run("null in union, non-pointer struct fields", func(t *testing.T) {
+		s, err := Parse(`{"type":"record","name":"R","fields":[
+			{"name":"a","type":["null","int"],"default":null},
+			{"name":"b","type":["int","null"]},
+			{"name":"c","type":["null","int","string"]},
+			{"name":"d","type":["null","string"],"default":null}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf, err := s.AppendEncodeJSON(nil, map[string]any{"a": nil, "b": nil, "c": nil, "d": nil})
+		if err != nil {
+			t.Fatal(err)
+		}
+		type Row struct {
+			A int32  `avro:"a"`
+			B int32  `avro:"b"`
+			C int32  `avro:"c"`
+			D string `avro:"d"`
+		}
+		got := Row{A: 99, B: 88, C: 77, D: "prior"}
+		if err := s.DecodeJSON(buf, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := Row{}
+		if got != want {
+			t.Fatalf("null decoded into pre-populated struct: got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("null in 2-branch union, bare int target", func(t *testing.T) {
+		s, _ := Parse(`["null","int"]`)
+		out := int32(99)
+		if err := s.DecodeJSON([]byte(`null`), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out != 0 {
+			t.Fatalf("2-branch null union did not zero int target: got %d", out)
+		}
+	})
+
+	t.Run("null in 3-branch union, bare bool target", func(t *testing.T) {
+		s, _ := Parse(`["null","boolean","string"]`)
+		out := true
+		if err := s.DecodeJSON([]byte(`null`), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out {
+			t.Fatalf("3-branch null union did not zero bool target")
+		}
+	})
+
+	t.Run("null in union, bare string target", func(t *testing.T) {
+		s, _ := Parse(`["null","string"]`)
+		out := "prior"
+		if err := s.DecodeJSON([]byte(`null`), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out != "" {
+			t.Fatalf("null did not zero string target: got %q", out)
+		}
+	})
+}
+
 // TestDecodeJSONTaggedUnionTypedTarget exercises tagged union decode to struct.
 func TestDecodeJSONTaggedUnionTypedTarget(t *testing.T) {
 	s, _ := Parse(`{"type":"record","name":"R","fields":[
