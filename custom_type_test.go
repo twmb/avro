@@ -829,3 +829,179 @@ func TestCustomTypeDecodeIntIntoAny(t *testing.T) {
 		t.Errorf("got %v", v)
 	}
 }
+
+// TestRegression_DecodeJSONFillsDefaultThroughCustomDecoder locks in that
+// DecodeJSON applies a registered CustomType.Decode to a record field's
+// default value when the field is absent from the JSON input — matching
+// the binary side, where the field's pre-encoded defaultBytes roundtrip
+// through the same wrapped deserRecord.fields[i].fn as a present field's
+// wire bytes.
+//
+// Without this, applyFieldDefault dispatched through the unwrapped
+// node.fields[idx].node.deser (built before applyCustomTypes installed
+// the chain), bypassing CustomType.Decode and surfacing the raw
+// Avro-native value (int64 for a long-backed money type) directly into
+// a target Go type that expects the user's custom domain type — failing
+// with "cannot use X with Avro type Y" on any DecodeJSON of an empty or
+// partially-omitted record into a typed struct/typed-map whose field
+// type is the user's custom type.
+//
+// Sub-tests cover the three iterateRecordFields entry points:
+//   - into_struct: *struct → decodeRecordStruct → applyFieldDefault.
+//   - into_any: *any → decodeRecordAny.
+//   - into_map_string_any: *map[string]any → decodeRecordMap (any-typed elem).
+//
+// Each sub-test pairs JSON-decode with the binary-roundtrip equivalent
+// and asserts both produce the same user-domain Go value so the parity
+// guarantee survives schema/codec changes.
+func TestRegression_DecodeJSONFillsDefaultThroughCustomDecoder(t *testing.T) {
+	s := parseMoney(t, `{"type":"record","name":"R","fields":[
+		{"name":"price","type":{"type":"long","logicalType":"money"},"default":42}
+	]}`)
+
+	t.Run("into_struct", func(t *testing.T) {
+		type R struct {
+			Price testMoney `avro:"price"`
+		}
+		// Binary parity (default is encoded into wire then decoded through
+		// the wrapped deser): produces the user's domain type.
+		wire, err := s.AppendEncode(nil, map[string]any{})
+		if err != nil {
+			t.Fatalf("AppendEncode: %v", err)
+		}
+		var rBin R
+		if _, err := s.Decode(wire, &rBin); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if rBin.Price.Cents != 42 || rBin.Price.Currency != "USD" {
+			t.Fatalf("binary: Price=%+v, want {Cents:42, Currency:USD}", rBin.Price)
+		}
+
+		// JSON decode of empty object must materialize the same value.
+		var rJSON R
+		if err := s.DecodeJSON([]byte(`{}`), &rJSON); err != nil {
+			t.Fatalf("DecodeJSON({}): %v", err)
+		}
+		if rJSON.Price != rBin.Price {
+			t.Fatalf("JSON Price=%+v, want %+v (binary parity)", rJSON.Price, rBin.Price)
+		}
+	})
+
+	t.Run("into_any", func(t *testing.T) {
+		var v any
+		if err := s.DecodeJSON([]byte(`{}`), &v); err != nil {
+			t.Fatalf("DecodeJSON({}): %v", err)
+		}
+		got, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("decoded into %T, want map[string]any", v)
+		}
+		price, ok := got["price"].(testMoney)
+		if !ok {
+			t.Fatalf("price: got %T %#v, want testMoney", got["price"], got["price"])
+		}
+		if price.Cents != 42 || price.Currency != "USD" {
+			t.Fatalf("price=%+v, want {Cents:42, Currency:USD}", price)
+		}
+	})
+
+	t.Run("into_map_string_any", func(t *testing.T) {
+		var got map[string]any
+		if err := s.DecodeJSON([]byte(`{}`), &got); err != nil {
+			t.Fatalf("DecodeJSON({}): %v", err)
+		}
+		price, ok := got["price"].(testMoney)
+		if !ok {
+			t.Fatalf("price: got %T %#v, want testMoney", got["price"], got["price"])
+		}
+		if price.Cents != 42 {
+			t.Fatalf("price.Cents=%d, want 42", price.Cents)
+		}
+	})
+
+	t.Run("partial_fill_present_and_default", func(t *testing.T) {
+		// One field present, one filled from default — both must produce
+		// the user's domain type through the custom decoder.
+		s := parseMoney(t, `{"type":"record","name":"R","fields":[
+			{"name":"price","type":{"type":"long","logicalType":"money"},"default":42},
+			{"name":"shipping","type":{"type":"long","logicalType":"money"},"default":7}
+		]}`)
+		type R struct {
+			Price    testMoney `avro:"price"`
+			Shipping testMoney `avro:"shipping"`
+		}
+		var r R
+		if err := s.DecodeJSON([]byte(`{"price":100}`), &r); err != nil {
+			t.Fatalf("DecodeJSON: %v", err)
+		}
+		if r.Price.Cents != 100 || r.Shipping.Cents != 7 {
+			t.Fatalf("got %+v, want Price.Cents=100 (present) Shipping.Cents=7 (default)", r)
+		}
+	})
+}
+
+// TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill locks in
+// that AppendEncodeJSON does NOT invoke a registered CustomType.Encode
+// for default-filled record fields — matching binary's encodeDefault
+// which is a self-contained switch with no custom-wiring hook.
+//
+// Rationale: CustomType.Encode converts user-Go-type → Avro-native; the
+// parsed default value is already in Avro-native form (json.Number /
+// []byte / string per the schema's type) and never had a Go-domain-type
+// representation, so the directional contract has nothing to apply.
+// Pre-fix, appendJSONFieldDefault routed defaults through appendAvroJSON
+// with a non-nil custom map, firing the user's Encode once per
+// default-filled custom-typed field on JSON-encode of an empty map and
+// passing a json.Number the encoder's GoType filter doesn't recognize.
+// Binary-encode of the same empty map fired the encoder zero times.
+//
+// The asymmetry is silently benign for GoType-typed encoders that
+// fallthrough via ErrSkipCustomType on a type-assertion miss, but
+// surfaces as a behavioral surprise for GoType=nil encoders used for
+// logging / validation / property-based dispatch.
+func TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill(t *testing.T) {
+	// GoType=nil so the encoder fires on every value reaching the long+
+	// money node — instrumentation pattern that surfaces the asymmetry.
+	calls := 0
+	ct := CustomType{
+		LogicalType: "money",
+		AvroType:    "long",
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			calls++
+			return v, nil
+		},
+	}
+	s, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":{"type":"long","logicalType":"money"},"default":42}
+	]}`, ct)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	calls = 0
+	if _, err := s.AppendEncode(nil, map[string]any{}); err != nil {
+		t.Fatalf("AppendEncode: %v", err)
+	}
+	binaryCalls := calls
+	if binaryCalls != 0 {
+		t.Fatalf("binary AppendEncode fired the user encoder %d times on default-fill; defaults bypass encodeDefault", binaryCalls)
+	}
+
+	calls = 0
+	if _, err := s.AppendEncodeJSON(nil, map[string]any{}); err != nil {
+		t.Fatalf("AppendEncodeJSON: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("AppendEncodeJSON fired the user encoder %d times on default-fill; must match binary (0)", calls)
+	}
+
+	// User-supplied values still fire the encoder on both paths. Lock
+	// that the bypass only applies to defaults.
+	calls = 0
+	if _, err := s.AppendEncodeJSON(nil, map[string]any{"f": int64(99)}); err != nil {
+		t.Fatalf("AppendEncodeJSON with present field: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("AppendEncodeJSON with present field fired the user encoder %d times, want 1", calls)
+	}
+}

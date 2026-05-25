@@ -610,6 +610,15 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 // across both. Defaults route through appendAvroJSON (not a pre-
 // marshalled splice) so encoder options apply equally to defaults.
 //
+// The recursive appendAvroJSON entries pass nil for the custom map so
+// CustomType.Encode is bypassed for default values, matching binary's
+// encodeDefault. Encoders convert user-Go-type → Avro-native; defaults
+// are stored in parsed Avro-native form (json.Number / []byte / string)
+// and have no Go-domain-type representation, so the directional
+// contract has nothing to apply. The custom encoder fires for
+// user-supplied values (encode arm of appendAvroJSONRecord) but not
+// for the library-inserted defaults handled here.
+//
 // Union defaults dispatch with a declaration-order try-each that mirrors
 // the binary side's encodeDefault (resolve.go). The runtime
 // appendAvroJSONUnion dispatcher uses unionTypeNameForValue (a kind-match
@@ -628,17 +637,25 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 // post-convert acceptance set (the bytes/fixed appendAvroJSON arms accept
 // []byte) and matches encodeDefault's new try-each loop on the binary
 // side branch-by-branch.
-func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *optConfig, custom map[*schemaNode]*customWiring, depth int) ([]byte, error) {
+func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *optConfig, depth int) ([]byte, error) {
 	if !f.hasDefault {
 		return nil, fmt.Errorf("avro json: record %q missing required field %q", recordName, f.name)
 	}
 	if f.defaultVal == nil {
 		return append(buf, "null"...), nil
 	}
+	// Defaults bypass the CustomType.Encode wrap by passing nil for
+	// the custom map at the recursive appendAvroJSON entries. Encoders
+	// convert user-Go-type → Avro-native; the parsed default value is
+	// already in Avro-native form (json.Number / []byte / string per
+	// the schema's type), so the directional contract has nothing to
+	// apply. Binary's encodeDefault (resolve.go) takes no custom
+	// parameter and never reaches the wiring hook for the same reason;
+	// matching it here keeps Encode/EncodeJSON parity for default-fill.
 	if f.node != nil && f.node.kind == "union" {
 		v := reflect.ValueOf(f.defaultVal)
 		for _, branch := range f.node.branches {
-			encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
+			encoded, err := appendAvroJSON(nil, v, branch, cfg, nil, depth+1)
 			if err == nil {
 				return appendUnionBranch(buf, branch, encoded, cfg), nil
 			}
@@ -648,7 +665,7 @@ func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *opt
 		}
 		return nil, fmt.Errorf("avro json: union default for field %q does not match any branch", f.name)
 	}
-	return appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, custom, depth+1)
+	return appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, nil, depth+1)
 }
 
 // appendAvroJSONRecord handles record encoding for both structs and maps.
@@ -675,7 +692,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 				value, exists := m[f.name]
 				var err error
 				if !exists {
-					buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, custom, depth)
+					buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, depth)
 				} else {
 					buf, err = appendAvroJSON(buf, reflect.ValueOf(value), f.node, cfg, custom, depth+1)
 				}
@@ -699,7 +716,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			value := v.MapIndex(mapKeyAs(mapType, f.nameVal))
 			var err error
 			if !value.IsValid() {
-				buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, custom, depth)
+				buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, depth)
 			} else {
 				buf, err = appendAvroJSON(buf, value, f.node, cfg, custom, depth+1)
 			}

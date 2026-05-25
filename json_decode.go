@@ -1048,14 +1048,25 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 }
 
 // applyFieldDefault decodes the field's pre-encoded binary default
-// into target via the field's binary deserfn.
+// into target via the record's wrapped binary deserfn — the same fn
+// that decodes a present field's wire bytes. Routing through the
+// wrapped deser is what makes a registered CustomType.Decode fire for
+// default-filled fields, matching the binary side where pre-encoded
+// f.defaultBytes roundtrip through dr.fields[i].fn naturally. The raw
+// per-node node.fields[idx].node.deser is the unwrapped primitive
+// (built before applyCustomTypes had a chance to install the custom
+// chain), so calling it directly bypasses the wrap and surfaces the
+// raw Avro-native value (int64, []byte, ...) into a target Go type
+// that expects the user's custom domain type.
 //
 // A zero-length defaultBytes is a *valid* default for any field whose
 // wire encoding is naturally 0 bytes — null-typed fields, empty-record
 // fields, and records whose every field is null-typed. The caller
 // (iterateRecordFields) gates on f.hasDefault before invoking us, so
 // presence of a default is already authoritative; the structural check
-// below only guards a malformed schema where serRecord is missing.
+// below only guards a malformed schema where serRecord/deserRecord is
+// missing (both are built in lockstep at buildRecord time, so checking
+// serRecord transitively covers deserRecord).
 func (ctx *jsonDecoder) applyFieldDefault(target reflect.Value, node *schemaNode, idx int) error {
 	if node.serRecord == nil || idx >= len(node.serRecord.fields) {
 		return fmt.Errorf("record has no pre-encoded default for field %d", idx)
@@ -1064,7 +1075,7 @@ func (ctx *jsonDecoder) applyFieldDefault(target reflect.Value, node *schemaNode
 	// Copy the encoded bytes — deserfns may slab-substring into src
 	// and we don't want them to reach into the schema's shared default.
 	src := append([]byte(nil), enc...)
-	_, err := node.fields[idx].node.deser(src, target, ctx.slab)
+	_, err := node.deserRecord.fields[idx].fn(src, target, ctx.slab)
 	return err
 }
 
