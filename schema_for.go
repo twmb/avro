@@ -67,7 +67,8 @@ func WithName(name string) SchemaOpt { return withName(name) }
 //   - time.Time → long with timestamp-millis (override with tag)
 //   - time.Duration → int with time-millis (override with tag)
 //   - *big.Rat → requires explicit decimal(p,s) tag
-//   - [16]byte with uuid tag → string with uuid logical type
+//   - [16]byte with uuid tag → fixed(16) with uuid logical type
+//   - string (or text marshaler type) with uuid tag → string with uuid logical type
 func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	var o schemaOpts
 	var customTypes []CustomType
@@ -246,12 +247,31 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 				}
 				if parts[0] != "" {
 					// Explicit name on embedded struct: treat as named field.
+					// inline is incompatible with an explicit name — the name
+					// says "make this a field"; inline says "flatten, no field."
+					for _, p := range parts[1:] {
+						if p == "inline" {
+							return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with an explicit field name (inline flattens the embed; there is no field at this position to name)",
+								sf.Name, truncForError(tag))
+						}
+					}
 					f, err := parseSchemaTag(sf, parts, idx)
 					if err != nil {
 						return nil, err
 					}
 					raw = append(raw, f)
 					continue
+				}
+				// Anonymous embed with empty name flattens. The embed has
+				// no Avro field of its own at this position, so options
+				// that apply to a field (default=, alias=, type-alias=,
+				// omitzero, logical-type tags) have no target. Reject
+				// rather than silently drop.
+				for _, p := range parts[1:] {
+					if p != "inline" {
+						return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with option %q (the anonymous embed flattens; there is no field at this position for the option to apply to)",
+							sf.Name, truncForError(tag), truncForError(p))
+					}
 				}
 				nested, err := collectFields(ft, idx, visited)
 				if err != nil {
@@ -287,21 +307,43 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 		}
 
 		// Check for inline.
+		hasInline := false
 		for _, p := range parts[1:] {
 			if p == "inline" {
-				ft := sf.Type
-				if ft.Kind() == reflect.Pointer {
-					ft = ft.Elem()
-				}
-				if ft.Kind() == reflect.Struct {
-					nested, err := collectFields(ft, idx, visited)
-					if err != nil {
-						return nil, err
-					}
-					raw = append(raw, nested...)
-				}
-				goto next
+				hasInline = true
+				break
 			}
+		}
+		if hasInline {
+			// inline flattens the embedded struct into the parent — the
+			// embed has no field of its own at this position. Other tag
+			// options apply to a field (name, default=, alias=,
+			// type-alias=, omitzero, logical-type tags) and have no
+			// target with inline. Reject rather than silently drop so
+			// typos surface here instead of producing a schema that
+			// quietly ignores the user's tag.
+			if parts[0] != "" {
+				return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with an explicit field name (inline flattens the embed; there is no field at this position to name)",
+					sf.Name, truncForError(tag))
+			}
+			for _, p := range parts[1:] {
+				if p != "inline" {
+					return nil, fmt.Errorf("avro: field %s has tag %q: inline is incompatible with option %q (inline flattens the embed; there is no field at this position for the option to apply to)",
+						sf.Name, truncForError(tag), truncForError(p))
+				}
+			}
+			ft := sf.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				nested, err := collectFields(ft, idx, visited)
+				if err != nil {
+					return nil, err
+				}
+				raw = append(raw, nested...)
+			}
+			goto next
 		}
 
 		{
@@ -665,22 +707,36 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	// source type), so e.g. `time.Time` tagged time-millis correctly
 	// emits {int, time-millis} and `time.Duration` tagged
 	// timestamp-millis correctly emits {long, timestamp-millis}.
-	inferTimeLike := func(defaultLogical string) any {
+	// Reject non-time logicals (uuid, decimal) on time types — they
+	// would emit an invalid {long, uuid} or {long, decimal} schema
+	// which Parse soft-drops, silently losing the user's tag.
+	inferTimeLike := func(defaultLogical string) (any, error) {
 		lt := logical
 		if lt == "" {
 			lt = defaultLogical
 		}
-		return map[string]any{"type": baseTypeForLogical(lt, "long"), "logicalType": lt}
+		switch lt {
+		case "date", "time-millis", "time-micros",
+			"timestamp-millis", "timestamp-micros", "timestamp-nanos",
+			"local-timestamp-millis", "local-timestamp-micros", "local-timestamp-nanos":
+			// time-related logical, OK.
+		default:
+			return nil, fmt.Errorf("avro: %s does not support logical type %q; use a time or date logical type", t, lt)
+		}
+		return map[string]any{"type": baseTypeForLogical(lt, "long"), "logicalType": lt}, nil
 	}
 	switch t {
 	case timeType:
-		return inferTimeLike("timestamp-millis"), nil
+		return inferTimeLike("timestamp-millis")
 	case durationType:
-		return inferTimeLike("time-millis"), nil
+		return inferTimeLike("time-millis")
 
 	case bigRatPtrType, bigRatValueType:
-		if logical != "decimal" || decimal == [2]int{} {
+		if logical == "" || (logical == "decimal" && decimal == [2]int{}) {
 			return nil, fmt.Errorf("*big.Rat requires explicit decimal(precision,scale) tag")
+		}
+		if logical != "decimal" {
+			return nil, fmt.Errorf("avro: *big.Rat / big.Rat does not support logical type %q; use decimal(precision,scale)", logical)
 		}
 		return map[string]any{
 			"type":        "bytes",
@@ -690,9 +746,69 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}, nil
 	}
 
-	// UUID: string by default, but [16]byte gets fixed(16).
-	if logical == "uuid" && t.Kind() != reflect.Array {
-		return map[string]any{"type": "string", "logicalType": "uuid"}, nil
+	// decimal logical type requires *big.Rat or big.Rat (handled above).
+	// Any other Go type carrying ",decimal(p,s)" produces a schema that
+	// wouldn't reflect the user's intent — the encoder for decimal-on-bytes
+	// expects *big.Rat input, not raw bytes / int / string — so reject at
+	// SchemaFor time rather than silently dropping the tag.
+	if logical == "decimal" {
+		return nil, fmt.Errorf("avro: decimal logical type requires *big.Rat or big.Rat; got %s", t)
+	}
+
+	// UUID: spec wire form is either string or fixed(16). Accept Go
+	// string kind and text-marshaler types as string; [16]byte goes
+	// through the Array case below for fixed(16). Reject other Go
+	// types — they would produce a schema that lies about the field's
+	// Go type and cause Encode to fail at runtime far from here.
+	if logical == "uuid" {
+		isArr16 := t.Kind() == reflect.Array && t.Elem().Kind() == reflect.Uint8 && t.Len() == 16
+		if !isArr16 {
+			ok := t.Kind() == reflect.String
+			if !ok {
+				for _, iface := range []reflect.Type{textAppenderType, textMarshalerType, textUnmarshalerType} {
+					if t.Implements(iface) || reflect.PointerTo(t).Implements(iface) {
+						ok = true
+						break
+					}
+				}
+			}
+			if !ok {
+				return nil, fmt.Errorf("avro: uuid logical type requires Go string, [16]byte, or a text marshaler type; got %s", t)
+			}
+			return map[string]any{"type": "string", "logicalType": "uuid"}, nil
+		}
+	}
+
+	// Integer-wire logical types (date / time-millis on int wire;
+	// time-micros / timestamp-* / local-timestamp-* on long wire)
+	// attached to a plain Go integer field. The user opted into the
+	// logical with the tag; honor it by emitting the wire+logical
+	// schema. The Go field must have a natural Avro wire type that
+	// matches the logical's required wire — otherwise the encoder
+	// would silently widen or narrow, hiding the user's intent and
+	// producing a schema whose annotation may be soft-dropped at
+	// Parse if the wire doesn't match.
+	if logical != "" {
+		wire := baseTypeForLogical(logical, "")
+		if wire != "" {
+			compat := false
+			switch wire {
+			case "int":
+				switch t.Kind() {
+				case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Uint8, reflect.Uint16:
+					compat = true
+				}
+			case "long":
+				switch t.Kind() {
+				case reflect.Int, reflect.Int64, reflect.Uint32, reflect.Uint64, reflect.Uint:
+					compat = true
+				}
+			}
+			if !compat {
+				return nil, fmt.Errorf("avro: logical type %q requires a Go integer field whose natural Avro wire type is %q; got %s", logical, wire, t)
+			}
+			return map[string]any{"type": wire, "logicalType": logical}, nil
+		}
 	}
 
 	// Types implementing text interfaces are inferred as string,

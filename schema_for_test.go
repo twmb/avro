@@ -1494,6 +1494,560 @@ func TestSchemaForUUID(t *testing.T) {
 	})
 }
 
+// TestSchemaForInlineRejectsOtherOptions locks the rule that the inline
+// directive removes the field at this position (the embedded struct's
+// fields are flattened into the parent). With no field at the inline
+// position, options that apply to a field (default=, alias=, type-alias=,
+// omitzero, logical-type tags) have no target — silently dropping them
+// would hide user typos and produce a schema that doesn't reflect the
+// user's tag. Reject any non-"inline" option (and any explicit name) on
+// an inline tag at SchemaFor time.
+func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"inline + default=", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,default=foo"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + alias=", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,alias=old"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + type-alias=", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,type-alias=old"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + omitzero", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,omitzero"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + date", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,date"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + uuid", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,uuid"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + timestamp-millis", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,timestamp-millis"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + decimal(10,2)", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,decimal(10,2)"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"explicit name + inline", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:"Name,inline"`
+			}
+			return SchemaFor[Outer]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+
+	// Positive control: plain inline (no other options) still works.
+	t.Run("plain inline still accepted", func(t *testing.T) {
+		type Embed struct {
+			A int32 `avro:"a"`
+		}
+		type Outer struct {
+			Embed `avro:",inline"`
+			B     string `avro:"b"`
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := s.String()
+		// Flattened: should have both a and b at the top level.
+		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"b"`) {
+			t.Errorf("expected flattened a + b fields; got %s", got)
+		}
+	})
+}
+
+// TestSchemaForTimeTypesRejectNonTimeLogicals locks the rule that
+// time.Time and time.Duration accept only time/date logical-type
+// tags (date, time-millis, time-micros, timestamp-*, local-timestamp-*).
+// Non-time logicals (uuid, decimal) on time types previously produced
+// a schema declaring a wire/logical combination that isn't valid Avro
+// (e.g. {type:long, logicalType:uuid}) and would be soft-dropped at
+// Parse, losing the user's tag. Reject at SchemaFor time.
+func TestSchemaForTimeTypesRejectNonTimeLogicals(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"time.Time + uuid", func() (*Schema, error) {
+			type R struct {
+				T time.Time `avro:"t,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time.Time + decimal", func() (*Schema, error) {
+			type R struct {
+				T time.Time `avro:"t,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time.Duration + uuid", func() (*Schema, error) {
+			type R struct {
+				T time.Duration `avro:"t,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time.Duration + decimal", func() (*Schema, error) {
+			type R struct {
+				T time.Duration `avro:"t,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+
+	// Positive control: time-related logicals still work.
+	t.Run("time.Time + date still accepted", func(t *testing.T) {
+		type R struct {
+			T time.Time `avro:"t,date"`
+		}
+		_, err := SchemaFor[R]()
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+	t.Run("time.Duration + timestamp-millis still accepted", func(t *testing.T) {
+		type R struct {
+			T time.Duration `avro:"t,timestamp-millis"`
+		}
+		_, err := SchemaFor[R]()
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
+// TestSchemaForDecimalRejectsNonBigRat locks the rule that the decimal
+// logical type requires either *big.Rat or big.Rat. Other Go types (int,
+// string, []byte, etc.) carrying the ",decimal(p,s)" tag are rejected at
+// SchemaFor time. Prior behavior silently dropped the decimal tag,
+// producing a schema that didn't reflect the user's intent.
+func TestSchemaForDecimalRejectsNonBigRat(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"int32", func() (*Schema, error) {
+			type R struct {
+				X int32 `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"int64", func() (*Schema, error) {
+			type R struct {
+				X int64 `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"float64", func() (*Schema, error) {
+			type R struct {
+				X float64 `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"string", func() (*Schema, error) {
+			type R struct {
+				X string `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"[]byte", func() (*Schema, error) {
+			type R struct {
+				X []byte `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"[16]byte", func() (*Schema, error) {
+			type R struct {
+				X [16]byte `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"bool", func() (*Schema, error) {
+			type R struct {
+				X bool `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for decimal on %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+}
+
+// TestSchemaForLogicalOnNumericKind locks the rule that integer-wire
+// logical types (date, time-millis, time-micros, timestamp-*,
+// local-timestamp-*) attached to a plain Go integer field produce a
+// schema carrying the logicalType annotation when the Go field's
+// natural Avro wire type matches the logical's required wire type.
+// Mismatched Go kinds (e.g., date on int64 — date requires int wire
+// but int64 naturally maps to long) are rejected at SchemaFor time
+// rather than silently dropping the user's logical-type tag.
+//
+// Acceptance and rejection both round-trip end-to-end for the
+// accepted shape: encode + decode against the inferred schema.
+func TestSchemaForLogicalOnNumericKind(t *testing.T) {
+	intWireAccepted := []struct {
+		name    string
+		logical string
+		schemaFn func() (*Schema, error)
+	}{
+		{"date on int32", "date", func() (*Schema, error) {
+			type R struct {
+				D int32 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on int8", "date", func() (*Schema, error) {
+			type R struct {
+				D int8 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time-millis on int16", "time-millis", func() (*Schema, error) {
+			type R struct {
+				T int16 `avro:"t,time-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time-millis on uint16", "time-millis", func() (*Schema, error) {
+			type R struct {
+				T uint16 `avro:"t,time-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range intWireAccepted {
+		t.Run(tc.name+" accepted (int wire)", func(t *testing.T) {
+			s, err := tc.schemaFn()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := s.String()
+			if !strings.Contains(got, `"logicalType":"`+tc.logical+`"`) {
+				t.Errorf("schema missing logicalType:%s; got %s", tc.logical, got)
+			}
+			if !strings.Contains(got, `"type":"int"`) {
+				t.Errorf("schema missing int wire type; got %s", got)
+			}
+		})
+	}
+
+	longWireAccepted := []struct {
+		name    string
+		logical string
+		schemaFn func() (*Schema, error)
+	}{
+		{"timestamp-millis on int64", "timestamp-millis", func() (*Schema, error) {
+			type R struct {
+				T int64 `avro:"t,timestamp-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-micros on int", "timestamp-micros", func() (*Schema, error) {
+			type R struct {
+				T int `avro:"t,timestamp-micros"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-nanos on uint64", "timestamp-nanos", func() (*Schema, error) {
+			type R struct {
+				T uint64 `avro:"t,timestamp-nanos"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time-micros on uint32", "time-micros", func() (*Schema, error) {
+			type R struct {
+				T uint32 `avro:"t,time-micros"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"local-timestamp-millis on int64", "local-timestamp-millis", func() (*Schema, error) {
+			type R struct {
+				T int64 `avro:"t,local-timestamp-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range longWireAccepted {
+		t.Run(tc.name+" accepted (long wire)", func(t *testing.T) {
+			s, err := tc.schemaFn()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := s.String()
+			if !strings.Contains(got, `"logicalType":"`+tc.logical+`"`) {
+				t.Errorf("schema missing logicalType:%s; got %s", tc.logical, got)
+			}
+			if !strings.Contains(got, `"type":"long"`) {
+				t.Errorf("schema missing long wire type; got %s", got)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"date on int64 (long-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				D int64 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on int (long-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				D int `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on uint32 (long-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				D uint32 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-millis on int32 (int-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				T int32 `avro:"t,timestamp-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-micros on int16 (int-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				T int16 `avro:"t,timestamp-micros"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on string", func() (*Schema, error) {
+			type R struct {
+				D string `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on float32", func() (*Schema, error) {
+			type R struct {
+				D float32 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on bool", func() (*Schema, error) {
+			type R struct {
+				D bool `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-millis on float64", func() (*Schema, error) {
+			type R struct {
+				T float64 `avro:"t,timestamp-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name+" rejected", func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+
+	t.Run("date on int32 round-trip", func(t *testing.T) {
+		type R struct {
+			D int32 `avro:"d,date"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		enc, err := s.Encode(&R{D: 19723})
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(enc, &got); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if got.D != 19723 {
+			t.Errorf("got %d, want 19723", got.D)
+		}
+	})
+
+	t.Run("timestamp-millis on int64 round-trip", func(t *testing.T) {
+		type R struct {
+			T int64 `avro:"t,timestamp-millis"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		enc, err := s.Encode(&R{T: 1700000000000})
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(enc, &got); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if got.T != 1700000000000 {
+			t.Errorf("got %d, want 1700000000000", got.T)
+		}
+	})
+}
+
+// TestSchemaForUUIDRejectsUnsupportedKind locks the rule that the uuid
+// logical type requires either Go string, [16]byte, or a type that
+// implements TextMarshaler / TextUnmarshaler / TextAppender. Other Go
+// kinds would produce a schema that declares string (or fixed of a
+// non-16 size) while the Go field is something else — a schema that
+// lies about the field type and causes Encode to fail at runtime far
+// from the SchemaFor call.
+func TestSchemaForUUIDRejectsUnsupportedKind(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"int32", func() (*Schema, error) {
+			type R struct {
+				U int32 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"int64", func() (*Schema, error) {
+			type R struct {
+				U int64 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"uint32", func() (*Schema, error) {
+			type R struct {
+				U uint32 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"float64", func() (*Schema, error) {
+			type R struct {
+				U float64 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"bool", func() (*Schema, error) {
+			type R struct {
+				U bool `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"[]byte (slice)", func() (*Schema, error) {
+			type R struct {
+				U []byte `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"[32]byte (wrong size)", func() (*Schema, error) {
+			type R struct {
+				U [32]byte `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"plain struct (no text marshaler)", func() (*Schema, error) {
+			type Inner struct{ X int32 }
+			type R struct {
+				U Inner `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"map", func() (*Schema, error) {
+			type R struct {
+				U map[string]int32 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for uuid logical on %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+}
+
 func TestSchemaForIgnored(t *testing.T) {
 	type Record struct {
 		Name    string `avro:"name"`

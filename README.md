@@ -103,16 +103,20 @@ Encoding also accepts `json.Number` for any numeric type (supporting
 vice versa).
 
 A null union branch decodes to the target's Go zero value, always replacing
-any prior value — matching [`encoding/json/v2.Unmarshal`][jsonv2-null]. Use
-`*T` to distinguish null from zero.
+any prior value. Use `*T` to distinguish null from zero.
 
-Numeric values that don't fit the Go target's range (e.g. Avro `long` `2^33`
-into Go `int32`, or Avro `double` overflowing `float32` to `±Inf`) return an
-error rather than silently wrapping or clamping. Values within range but
-without exact representation are rounded silently, matching
-[`encoding/json/v2`][jsonv2-null]'s "rounded or clamped" rule.
-
-[jsonv2-null]: https://pkg.go.dev/encoding/json/v2#Unmarshal
+The reader schema is the user's contract for precision. When the reader
+schema is lossy (`float`, `double`), encode and decode both silently
+IEEE-round to the destination's representable range, and an out-of-range
+finite input becomes ±Inf on the wire. When the reader schema is exact
+(`int`, `long`, `bytes`, `string`), decode requires the Go target to
+represent the wire value without loss; values outside the target's range
+or values the target can't represent exactly — for example, an Avro `long`
+value above `2^53` decoded into Go `float64`, or `long` `2^33` decoded
+into Go `int32` — return an error rather than silently wrapping or
+rounding. Users who need exact round-trip of large integers should pair
+a `long` reader schema with an `int64` target rather than relying on a
+float to round.
 
 ## Struct Tags
 
@@ -144,7 +148,9 @@ Supported options:
   they were declared directly on the parent. The field must be a struct or
   pointer to struct. This works like anonymous (embedded) struct fields, but
   for named fields. When using inline, the name portion of the tag must be
-  empty.
+  empty and no other tag options are allowed — the flattened embed has no
+  field of its own for `default=`, `alias=`, logical-type tags, etc. to
+  apply to. Put those options on the embed's child fields directly.
 
 - **omitzero**: when encoding, if the field is the zero value for its type (or
   implements an `IsZero() bool` method that returns true), the Avro default
@@ -211,9 +217,9 @@ Additional tag options for schema inference:
 | `alias=` | `avro:",alias=old"` | Field alias for schema evolution (repeatable, or `alias=[a,b]`) |
 | `type-alias=` | `avro:",type-alias=old"` | Alias for the field's named type — record, enum, or fixed (repeatable, or `type-alias=[a,b]`) |
 | `timestamp-micros` | `avro:",timestamp-micros"` | Override logical type |
-| `decimal(p,s)` | `avro:",decimal(10,2)"` | Decimal logical type (required for `*big.Rat`) |
-| `uuid` | `avro:",uuid"` | UUID logical type |
-| `date` | `avro:",date"` | Date logical type |
+| `decimal(p,s)` | `avro:",decimal(10,2)"` | Decimal logical type (requires `*big.Rat` or `big.Rat`) |
+| `uuid` | `avro:",uuid"` | UUID logical type (requires Go string, `[16]byte`, or a text marshaler type) |
+| `date` | `avro:",date"` | Date logical type (requires `time.Time`, `time.Duration`, or an int8/16/32/uint8/uint16) |
 
 `alias` and `type-alias` serve different purposes in schema evolution. `alias`
 adds an alias to the **field** — it lets a writer field with a different name
@@ -309,8 +315,11 @@ round-trip through `time.Time` therefore preserves the time-of-day but
 resets the date and zone: `2024-01-15 12:34:56 PST` → wire → `1970-01-01
 12:34:56 UTC`. If round-trip date fidelity matters, use `timestamp-millis` /
 `timestamp-micros` (which preserve the full instant) or convert to and from
-`time.Duration` explicitly. `time.Duration` is always lossless for these
-types.
+`time.Duration` explicitly. `time.Duration` round-trips exactly when its
+nanosecond component is a whole multiple of the schema's resolution unit
+(millisecond for `time-millis`, microsecond for `time-micros`); sub-resolution
+nanoseconds are silently truncated toward zero on encode (integer division
+by the resolution unit, dropping the remainder).
 
 big-decimal carries no schema-level precision or scale; scale is derived
 per value, and rationals with no finite decimal expansion (e.g.
