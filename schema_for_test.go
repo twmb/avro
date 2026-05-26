@@ -1619,6 +1619,118 @@ func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
 	})
 }
 
+// InlineScalarAlias is a named non-struct type used by
+// TestSchemaForInlineRejectsNonStructFieldType to exercise the
+// anonymous-embed-of-named-scalar shape. Must live at package scope
+// because Go field names for anonymous embeds come from the type name
+// and the embed has to be exported (start with an uppercase letter)
+// to reach the regular field-handling code path.
+type InlineScalarAlias string
+
+// TestSchemaForInlineRejectsNonStructFieldType locks the rule that the
+// inline directive requires a struct (or pointer-to-struct) field type.
+// Inline flattens an embedded struct's fields into the parent — on a
+// non-struct field there is no struct to flatten, so the user's tag has
+// no defensible meaning and the prior silent-drop produced a schema in
+// which the field simply disappeared. The rejection rationale mirrors
+// the sibling "inline is incompatible with X" errors: inline has nothing
+// to apply itself to. Covers Go scalar, slice, map, pointer-to-scalar,
+// and anonymous embed of a named non-struct exported type.
+func TestSchemaForInlineRejectsNonStructFieldType(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"string field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo string `avro:",inline"`
+				Bar int32  `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"int32 field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo int32 `avro:",inline"`
+				Bar int32 `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"slice field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo []int32 `avro:",inline"`
+				Bar int32   `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"map field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo map[string]int32 `avro:",inline"`
+				Bar int32            `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"*string field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo *string `avro:",inline"`
+				Bar int32   `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"anon embed named-scalar + ,inline", func() (*Schema, error) {
+			type R struct {
+				InlineScalarAlias `avro:",inline"`
+				Bar               int32 `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+
+	// Positive controls: ,inline on a struct and on a pointer-to-struct
+	// still flattens the embed's fields into the parent.
+	t.Run("struct field + ,inline still flattens", func(t *testing.T) {
+		type Embed struct {
+			A int32 `avro:"a"`
+		}
+		type R struct {
+			Foo Embed `avro:",inline"`
+			Bar int32 `avro:"bar"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := s.String()
+		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"bar"`) {
+			t.Errorf("expected flattened a + bar fields; got %s", got)
+		}
+	})
+	t.Run("*struct field + ,inline still flattens", func(t *testing.T) {
+		type Embed struct {
+			A int32 `avro:"a"`
+		}
+		type R struct {
+			Foo *Embed `avro:",inline"`
+			Bar int32  `avro:"bar"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := s.String()
+		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"bar"`) {
+			t.Errorf("expected flattened a + bar fields; got %s", got)
+		}
+	})
+}
+
 // TestSchemaForTimeTypesRejectNonTimeLogicals locks the rule that
 // time.Time and time.Duration accept only time/date logical-type
 // tags (date, time-millis, time-micros, timestamp-*, local-timestamp-*).

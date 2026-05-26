@@ -336,13 +336,15 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 			if ft.Kind() == reflect.Pointer {
 				ft = ft.Elem()
 			}
-			if ft.Kind() == reflect.Struct {
-				nested, err := collectFields(ft, idx, visited)
-				if err != nil {
-					return nil, err
-				}
-				raw = append(raw, nested...)
+			if ft.Kind() != reflect.Struct {
+				return nil, fmt.Errorf("avro: field %s has tag %q: inline requires a struct or pointer-to-struct field type; got %s (inline flattens the embed; there is no struct here to flatten)",
+					sf.Name, truncForError(tag), ft)
 			}
+			nested, err := collectFields(ft, idx, visited)
+			if err != nil {
+				return nil, err
+			}
+			raw = append(raw, nested...)
 			goto next
 		}
 
