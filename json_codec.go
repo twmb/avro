@@ -545,14 +545,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(needle))
 		}
 		if v.CanInt() || v.CanUint() {
-			var n int
-			if v.CanInt() {
-				n = int(v.Int())
-			} else {
-				n = int(v.Uint())
-			}
-			if n < 0 || n >= len(node.symbols) {
-				return nil, fmt.Errorf("avro json: enum index %d out of range [0, %d)", n, len(node.symbols))
+			n, err := enumOrdinalIndex(v, len(node.symbols))
+			if err != nil {
+				return nil, fmt.Errorf("avro json: enum %w", err)
 			}
 			return appendJSONString(buf, node.symbols[n]), nil
 		}

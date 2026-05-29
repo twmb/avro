@@ -683,7 +683,6 @@ func parseInt64Lenient(s string) (int64, error) {
 // in 64.
 const maxInt64LenientLen = 64
 
-
 // parseInt32Lenient is [parseInt64Lenient] with int32 range narrowing.
 // Shares the same arbitrary-precision parsing so fractional-part-lost-
 // to-float64-rounding inputs like "1.0000000000000001" are correctly
@@ -994,7 +993,6 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 	return nil, semErr(v, "string")
 }
 
-
 // avroStringValue resolves v to its canonical Avro-string textual form
 // as a Go string. It is the JSON-encoder's counterpart to appendAvroString
 // and must keep the same precedence (json.Number rejected; then
@@ -1233,6 +1231,32 @@ func (s *serEnum) indexOfSymbol(needle string) (int, bool) {
 	return 0, false
 }
 
+// enumOrdinalIndex validates an integer-kind enum carrier as an ordinal in
+// [0, nSymbols) and returns it as an int. The range check is done in the
+// carrier's OWN width (int64 / uint64) BEFORE narrowing to int — narrowing
+// first (int(v.Uint()) / int(v.Int())) truncates a value ≥ 2^32 to its low
+// bits on a 32-bit build, so an out-of-range ordinal like uint64(1<<32+5)
+// would wrap to 5 and pass `n < len(symbols)`, silently encoding the wrong
+// symbol (and diverging from the same program's 64-bit behavior). Comparing
+// wide first rejects it on every platform. Shared by serEnum.ser (binary) and
+// appendAvroJSON's enum case (JSON) so the bound and the truncation guard
+// can't drift between the two encoders; each caller wraps the returned error
+// in its own SemanticError / "avro json:" shape and does its own emit.
+func enumOrdinalIndex(v reflect.Value, nSymbols int) (int, error) {
+	if v.CanInt() {
+		n := v.Int()
+		if n < 0 || n >= int64(nSymbols) {
+			return 0, fmt.Errorf("index %d out of range [0, %d)", n, nSymbols)
+		}
+		return int(n), nil
+	}
+	n := v.Uint()
+	if n >= uint64(nSymbols) {
+		return 0, fmt.Errorf("index %d out of range [0, %d)", n, nSymbols)
+	}
+	return int(n), nil
+}
+
 func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
@@ -1270,14 +1294,9 @@ func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", truncForError(needle))}
 	}
 	if v.CanInt() || v.CanUint() {
-		var n int
-		if v.CanInt() {
-			n = int(v.Int())
-		} else {
-			n = int(v.Uint())
-		}
-		if n < 0 || n >= len(s.symbols) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("index %d out of range [0, %d)", n, len(s.symbols))}
+		n, err := enumOrdinalIndex(v, len(s.symbols))
+		if err != nil {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: err}
 		}
 		return appendVarint(dst, int32(n)), nil
 	}
