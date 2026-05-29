@@ -511,8 +511,13 @@ func parseSchemaTag(sf reflect.StructField, parts []string, index []int) (schema
 		case strings.HasPrefix(opt, "decimal(") && strings.HasSuffix(opt, ")"):
 			inner := opt[len("decimal(") : len(opt)-1]
 			var p, s int
-			if _, err := fmt.Sscanf(inner, "%d,%d", &p, &s); err != nil {
-				return f, fmt.Errorf("invalid decimal tag %q: %w", opt, err)
+			// The trailing %s captures any content after the two integers so
+			// decimal(9,2,3) / decimal(9,2x) / decimal(9,2e1) are rejected
+			// rather than silently truncated to decimal(9,2): "%d,%d" alone
+			// stops as soon as two integers match and ignores the rest.
+			var extra string
+			if n, _ := fmt.Sscanf(inner, "%d,%d%s", &p, &s, &extra); n < 2 || extra != "" {
+				return f, fmt.Errorf("invalid decimal tag %q: want decimal(precision,scale)", opt)
 			}
 			f.decimal = [2]int{p, s}
 			f.logical = "decimal"

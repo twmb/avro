@@ -2436,6 +2436,48 @@ func TestSchemaForErrors(t *testing.T) {
 		}
 	})
 
+	// A decimal(...) tag must contain exactly two integers and nothing
+	// else. Trailing content after the scale (a third argument, junk
+	// characters, an exponent) was silently discarded, producing a
+	// decimal(precision,scale) schema that does not reflect what the user
+	// wrote — inconsistent with decimal()/decimal(9)/decimal(9,)/decimal(bad),
+	// which all error. Each of these must be rejected, not truncated.
+	t.Run("decimal tag rejects trailing content", func(t *testing.T) {
+		t.Run("three args", func(t *testing.T) {
+			type R struct {
+				Price *big.Rat `avro:"price,decimal(9,2,3)"`
+			}
+			if _, err := SchemaFor[R](); err == nil {
+				t.Fatal("expected error for decimal(9,2,3)")
+			}
+		})
+		t.Run("trailing junk", func(t *testing.T) {
+			type R struct {
+				Price *big.Rat `avro:"price,decimal(9,2x)"`
+			}
+			if _, err := SchemaFor[R](); err == nil {
+				t.Fatal("expected error for decimal(9,2x)")
+			}
+		})
+		t.Run("exponent scale", func(t *testing.T) {
+			type R struct {
+				Price *big.Rat `avro:"price,decimal(9,2e1)"`
+			}
+			if _, err := SchemaFor[R](); err == nil {
+				t.Fatal("expected error for decimal(9,2e1)")
+			}
+		})
+		// Boundary: the well-formed two-integer form must still parse.
+		t.Run("well formed still accepted", func(t *testing.T) {
+			type R struct {
+				Price *big.Rat `avro:"price,decimal(9,2)"`
+			}
+			if _, err := SchemaFor[R](); err != nil {
+				t.Fatalf("decimal(9,2) should parse: %v", err)
+			}
+		})
+	})
+
 	t.Run("unknown tag option", func(t *testing.T) {
 		type R struct {
 			X int32 `avro:"x,bogus"`
