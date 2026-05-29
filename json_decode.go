@@ -682,7 +682,7 @@ func (ctx *jsonDecoder) decodeBareDecimal(v reflect.Value, node *schemaNode, toA
 	if node.logical == "big-decimal" {
 		s, ok := finiteScale(r)
 		if !ok {
-			return true, fmt.Errorf("avro json: big-decimal value %s has no finite decimal expansion", truncForError(r.RatString()))
+			return true, fmt.Errorf("avro json: big-decimal value %s has no finite decimal expansion", truncRatForError(r))
 		}
 		scale = s
 	}

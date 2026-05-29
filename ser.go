@@ -554,6 +554,20 @@ func truncForError(s string) string {
 	return s[:max] + "..."
 }
 
+// truncRatForError renders r for an error message without materializing a
+// huge decimal string. big.Rat.RatString on a megabit-scale rational builds
+// a multi-megabyte string (superlinear base conversion) before truncForError
+// could trim it — a CPU/alloc amplification on hostile or pathological
+// big-decimal input. When either component is too large to format cheaply,
+// report bit sizes instead of the value. 512 bits ≈ 154 decimal digits each,
+// comfortably above anything truncForError keeps but cheap to stringify.
+func truncRatForError(r *big.Rat) string {
+	if r.Num().BitLen() <= 512 && r.Denom().BitLen() <= 512 {
+		return truncForError(r.RatString())
+	}
+	return fmt.Sprintf("(num %d bits / denom %d bits)", r.Num().BitLen(), r.Denom().BitLen())
+}
+
 // truncBytesForError caps a user-controllable byte slice at 40 chars
 // before string conversion for error interpolation. 40 chars fits a
 // MaxInt64 representation (20 chars) and a canonical hex-dash UUID
@@ -2244,7 +2258,7 @@ func (s *serBigDecimal) serRat(dst []byte, r *big.Rat, srcType reflect.Type) ([]
 func buildBigDecimalPayload(r *big.Rat) ([]byte, error) {
 	scale, ok := finiteScale(r)
 	if !ok {
-		return nil, fmt.Errorf("big.Rat %s has no finite decimal expansion; big-decimal cannot encode this value", truncForError(r.RatString()))
+		return nil, fmt.Errorf("big.Rat %s has no finite decimal expansion; big-decimal cannot encode this value", truncRatForError(r))
 	}
 	num := new(big.Int).Mul(r.Num(), pow10(scale))
 	unscaled, _ := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
@@ -2258,21 +2272,32 @@ func buildBigDecimalPayload(r *big.Rat) ([]byte, error) {
 	return inner, nil
 }
 
+// log2of5 is log2(5), used to estimate a denominator's factor-of-5 count
+// from its bit length without an O(scale) division loop.
+const log2of5 = 2.321928094887362
+
 // finiteScale returns the smallest s >= 0 such that r * 10^s is an
 // integer, or (0, false) if r has no finite decimal expansion (or
 // would require a scale beyond decimalScaleLimit — same outcome
 // from the caller's perspective).
-// For denominator d = 2^a * 5^b returns max(a, b).
+// For a reduced denominator d = 2^a * 5^b returns max(a, b).
 //
-// The 2-power factor is extracted via TrailingZeroBits() (one
-// optimized call) instead of a per-bit loop. The 5-power factor's
-// max possible value is bounded upfront via BitLen()/log2(5) so an
-// attacker-constructed denominator like 10^65536 (which would take
-// ~65536 iterations of QuoRem on a 152K-digit big.Int and burn ~1.4
-// CPU seconds per 6-byte wire input) short-circuits to (0, false)
-// in O(1) bit-length math. Without that bound the inner loop is
-// O(n²) in scale and gives an attacker ~10^8× CPU amplification on
-// the binary serBigDecimal and JSON big-decimal encode paths.
+// The factor-of-2 count a is one TrailingZeroBits() call. The odd part of
+// the denominator must be a pure power of 5 for the decimal to terminate;
+// rather than divide it by 5 one factor at a time (which is O(scale^2) on
+// the shrinking big.Int — ~1.4 CPU seconds for a 6-byte wire value at the
+// cap, an attacker amplification on the decode->re-encode path), estimate b
+// from the bit length (5^b has floor(b·log2 5)+1 bits), then verify with a
+// single 5^b == d comparison and a ≤1-step climb that absorbs the float
+// rounding. 5^b is strictly increasing, so at most one b can equal d; a miss
+// means d has a prime factor other than 5 and the value is non-terminating.
+// The whole derivation is O(M(scale)) — one big.Int exponentiation plus a
+// couple of multiplies, matching the regular-decimal encode path's cost.
+// (Java/fastavro/avro-rs pay even less because their decimal types store the
+// scale and never factorize; big.Rat is a reduced fraction with no scale, so
+// the value-derived scale must be computed here — O(M) is the floor for that
+// input, and is the same order as the unscaled-value computation that
+// follows in buildBigDecimalPayload regardless.)
 func finiteScale(r *big.Rat) (int, bool) {
 	d := new(big.Int).Set(r.Denom())
 	a := int(d.TrailingZeroBits())
@@ -2282,28 +2307,35 @@ func finiteScale(r *big.Rat) (int, bool) {
 	if a > 0 {
 		d.Rsh(d, uint(a))
 	}
-	// Upper bound on b: 5^b ≤ d means b ≤ d.BitLen() / log2(5).
-	// log2(5) ≈ 2.3219; conservatively use 2 (slightly overestimates
-	// b but stays correct since we only reject when b > limit). If
-	// the bound already exceeds the cap, short-circuit.
-	if d.BitLen()/2 > decimalScaleLimit {
-		return 0, false
-	}
 	b := 0
-	five := big.NewInt(5)
-	rem := new(big.Int)
-	q := new(big.Int)
 	one := big.NewInt(1)
-	for d.Cmp(one) != 0 {
-		if b >= decimalScaleLimit {
+	if d.Cmp(one) != 0 {
+		// Reject a denominator too large to be a permitted power of 5
+		// before materializing 5^b. Compare in float64 BEFORE the int()
+		// conversion so a multi-gigabit denominator can't overflow int on a
+		// 32-bit build. 5^b == d implies b < BitLen(d)/log2 5; the +1 margin
+		// leaves the exact b == cap case for the final check below.
+		bEstF := float64(d.BitLen()-1) / log2of5
+		if bEstF > float64(decimalScaleLimit)+1 {
 			return 0, false
 		}
-		q.QuoRem(d, five, rem)
-		if rem.Sign() != 0 {
-			return 0, false
+		five := big.NewInt(5)
+		b = int(bEstF)
+		pow := new(big.Int).Exp(five, big.NewInt(int64(b)), nil)
+		for pow.Cmp(d) < 0 { // estimate low: climb (≤ ~2 steps)
+			pow.Mul(pow, five)
+			b++
 		}
-		d.Set(q)
-		b++
+		for pow.Cmp(d) > 0 && b > 0 { // estimate high: descend
+			pow.Quo(pow, five)
+			b--
+		}
+		if pow.Cmp(d) != 0 {
+			return 0, false // d is not a pure power of 5 → non-terminating
+		}
+	}
+	if b > decimalScaleLimit {
+		return 0, false
 	}
 	if a > b {
 		return a, true
@@ -2348,7 +2380,7 @@ func ratToUnscaled(r *big.Rat, scale int) (*big.Int, error) {
 	num := new(big.Int).Mul(r.Num(), pow10(scale))
 	unscaled, rem := new(big.Int).QuoRem(num, r.Denom(), new(big.Int))
 	if rem.Sign() != 0 {
-		return nil, fmt.Errorf("decimal value %s cannot be represented at scale %d without rounding", truncForError(r.RatString()), scale)
+		return nil, fmt.Errorf("decimal value %s cannot be represented at scale %d without rounding", truncRatForError(r), scale)
 	}
 	return unscaled, nil
 }

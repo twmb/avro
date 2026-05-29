@@ -2049,7 +2049,7 @@ func setDecimalRat(v reflect.Value, r *big.Rat, scale int) (bool, error) {
 		// big.Rat.Float64 returns ±Inf when the rational is too large
 		// for float64; reject rather than silently writing Inf.
 		if math.IsInf(f, 0) {
-			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("decimal value %s overflows %s", truncForError(r.RatString()), v.Kind())}
+			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("decimal value %s overflows %s", truncRatForError(r), v.Kind())}
 		}
 		if v.Kind() == reflect.Float32 && finiteFloat32Overflows(f) {
 			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("value %g overflows float32", f)}

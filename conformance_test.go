@@ -11413,14 +11413,15 @@ func TestRegression_CustomTypeSkipPointerChainContinues(t *testing.T) {
 	}
 }
 
-// TestRegression_FiniteScaleCPUBound locks the upfront bit-length
-// short-circuit in finiteScale. Without the BitLen check, encoding
-// a big-decimal value 1/10^65536 (6 wire bytes) iterates the 5-power
-// factorization 65536 times on a ~152K-digit big.Int, taking ~1.4
-// CPU seconds. A pipeline that decodes big-decimal from one source
-// and re-encodes for another (replication, schema translation, OCF
-// rewrite) would hand an attacker ~10^8× CPU amplification per wire
-// byte.
+// TestRegression_FiniteScaleCPUBound locks the O(M(scale)) scale
+// derivation in finiteScale. A divide-by-5-per-factor loop would
+// iterate 65536 times on a ~152K-digit big.Int when encoding the
+// big-decimal value 1/10^65536 (6 wire bytes), taking ~1.4 CPU
+// seconds — a pipeline that decodes big-decimal from one source and
+// re-encodes for another (replication, schema translation, OCF
+// rewrite) would hand an attacker that amplification per wire byte.
+// The value is at the documented cap (scale 65536), so it must both
+// ACCEPT and finish fast.
 func TestRegression_FiniteScaleCPUBound(t *testing.T) {
 	denom := new(big.Int).Exp(big.NewInt(10), big.NewInt(65536), nil)
 	r := new(big.Rat).SetFrac(big.NewInt(1), denom)
@@ -11434,7 +11435,102 @@ func TestRegression_FiniteScaleCPUBound(t *testing.T) {
 	if elapsed > 200*time.Millisecond {
 		t.Fatalf("Encoding 1/10^65536 took %v (>200ms cap); amplification regression", elapsed)
 	}
-	_ = err // err is acceptable (out-of-scale rejection)
+	// scale 65536 is exactly the documented cap, so a terminating decimal
+	// at that scale must ACCEPT (not be wrongly rejected) and finish fast.
+	if err != nil {
+		t.Fatalf("1/10^65536 (scale 65536, == cap) should encode: %v", err)
+	}
+}
+
+// A big.Rat with a terminating decimal expansion must encode for every
+// scale up to decimalScaleLimit — the scale derivation rejects only
+// genuinely non-terminating rationals (denominator with a prime factor
+// other than 2 or 5) and scales past the cap, never a valid terminating
+// decimal whose scale merely happens to be large. Probes the high band a
+// bit-length-estimate could wrongly reject, and asserts decode->re-encode
+// parity: a wire scale the decoder accepts is a scale the encoder accepts.
+func TestRegression_BigDecimalFiniteScaleNoFalseReject(t *testing.T) {
+	s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
+
+	for _, scale := range []int64{1, 2, 8, 1000, 50000, 56448, 60000, 65535, 65536} {
+		r := new(big.Rat).SetFrac(big.NewInt(1), new(big.Int).Exp(big.NewInt(5), big.NewInt(scale), nil))
+		buf, err := s.AppendEncode(nil, r)
+		if err != nil {
+			t.Errorf("scale %d (1/5^%d) is a terminating decimal but encode rejected it: %v", scale, scale, err)
+			continue
+		}
+		var out big.Rat
+		if _, derr := s.Decode(buf, &out); derr != nil {
+			t.Errorf("scale %d decode-back failed: %v", scale, derr)
+		} else if out.Cmp(r) != 0 {
+			t.Errorf("scale %d round-trip mismatch", scale)
+		}
+	}
+
+	// Just past the cap must reject.
+	over := new(big.Rat).SetFrac(big.NewInt(1), new(big.Int).Exp(big.NewInt(5), big.NewInt(65537), nil))
+	if _, err := s.AppendEncode(nil, over); err == nil {
+		t.Error("scale 65537 exceeds decimalScaleLimit but encode accepted it")
+	}
+
+	// Non-terminating rationals (denominator has a prime factor other than
+	// 2 or 5) must still reject.
+	for _, r := range []*big.Rat{big.NewRat(1, 3), big.NewRat(1, 6), big.NewRat(1, 7), big.NewRat(2, 15)} {
+		if _, err := s.AppendEncode(nil, r); err == nil {
+			t.Errorf("non-terminating %s should reject", r.RatString())
+		}
+	}
+
+	// Decode->re-encode parity for a 6-byte wire value at scale 60000
+	// (unscaled=1, scale=60000 == 10^-60000): the decoder accepts it, so
+	// the encoder must too.
+	wire := []byte{0x0A, 0x02, 0x01, 0xC0, 0xA9, 0x07}
+	var dec big.Rat
+	if _, err := s.Decode(wire, &dec); err != nil {
+		t.Fatalf("decode of scale-60000 big-decimal failed: %v", err)
+	}
+	if _, err := s.AppendEncode(nil, &dec); err != nil {
+		t.Fatalf("re-encode of decoded scale-60000 value rejected (decode/encode asymmetry): %v", err)
+	}
+}
+
+// A *big.Rat whose denominator is a multi-megabit power that exceeds the
+// scale cap must reject with a BOUNDED-size error message. big.Rat.RatString
+// would materialize the full multi-hundred-KB decimal string before
+// truncation, amplifying CPU/alloc per call. Covers every error site that
+// renders a *big.Rat value (big-decimal encode, regular-decimal
+// scale-mismatch encode, big-decimal JSON decode) — all share truncRatForError.
+func TestRegression_BigDecimalRatErrorMessageBounded(t *testing.T) {
+	// 5^200000: scale 200000 >> cap, ~140K-digit denominator.
+	denom := new(big.Int).Exp(big.NewInt(5), big.NewInt(200000), nil)
+	huge := new(big.Rat).SetFrac(big.NewInt(1), denom)
+
+	check := func(name string, fn func() error) {
+		start := time.Now()
+		err := fn()
+		el := time.Since(start)
+		if err == nil {
+			t.Errorf("%s: expected reject", name)
+			return
+		}
+		if n := len(err.Error()); n > 1024 {
+			t.Errorf("%s: error message is %d bytes — unbounded user-value echo", name, n)
+		}
+		if el > 100*time.Millisecond {
+			t.Errorf("%s: reject took %v (>100ms) — error-message amplification", name, el)
+		}
+	}
+
+	bigDec := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
+	check("big-decimal encode", func() error { _, e := bigDec.AppendEncode(nil, huge); return e })
+	check("big-decimal JSON decode", func() error {
+		// 1e-200000 is a terminating decimal whose scale exceeds the cap.
+		var out big.Rat
+		return bigDec.DecodeJSON([]byte("1e-200000"), &out)
+	})
+
+	regDec := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
+	check("regular-decimal encode", func() error { _, e := regDec.AppendEncode(nil, huge); return e })
 }
 
 // TestRegression_DeserUUIDAcceptsByteSliceTarget locks the
@@ -14920,9 +15016,10 @@ func TestParity_CheckCompatibilityMatrix(t *testing.T) {
 // the seconds-class regression that motivated the matrix.
 func TestParity_CPUCostSentinels(t *testing.T) {
 	t.Run("big-decimal encode of 1/10^cap", func(t *testing.T) {
-		// finiteScale short-circuits via BitLen bound. Without the
-		// bound, the 5-power factorization iterates 65536 times on a
-		// ~152K-digit big.Int, taking ~1.4 CPU seconds.
+		// finiteScale derives the scale in O(M(scale)) (one 5^b
+		// exponentiation + compare), so a value at the cap encodes in a
+		// few ms. A divide-by-5-per-factor loop would take ~1.4 CPU
+		// seconds here — the amplification this cell guards against.
 		denom := new(big.Int).Exp(big.NewInt(10), big.NewInt(65536), nil)
 		r := new(big.Rat).SetFrac(big.NewInt(1), denom)
 		s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
@@ -14934,8 +15031,7 @@ func TestParity_CPUCostSentinels(t *testing.T) {
 	})
 	t.Run("big-decimal encode of 1/2^cap", func(t *testing.T) {
 		// 2-power-only denominator — exercises the TrailingZeroBits
-		// arm. Without the bit-length short-circuit, this iterates
-		// 65536 single-bit shifts.
+		// arm (scale derived in O(1) from the trailing-zero count).
 		denom := new(big.Int).Lsh(big.NewInt(1), 65536)
 		r := new(big.Rat).SetFrac(big.NewInt(1), denom)
 		s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
