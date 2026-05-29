@@ -479,16 +479,18 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny bo
 	if toAny {
 		return setIface(v, reflect.ValueOf(s), "string")
 	}
+	// TextUnmarshaler before the reflect.String fast path: a string-kind
+	// type implementing TextUnmarshaler uses its text parsing, mirroring
+	// the encoder (avroStringValue tries text before reflect.String) and
+	// setStringValue on the binary side. Also covers named []byte subtypes
+	// like net.IP. The implements-check gates the []byte(s) allocation so
+	// the common plain-string path stays alloc-free.
+	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
+		_, err := tryTextUnmarshal(v, []byte(s))
+		return err
+	}
 	if v.Kind() == reflect.String {
 		return setStringTarget(v, s, "string")
-	}
-	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
-	// should use their text parsing, not raw byte assignment. Mirrors
-	// deserString's order so binary and JSON decoders agree on which
-	// Go target types accept Avro string. []byte(s) allocates fresh
-	// storage so the callee may retain.
-	if ok, err := tryTextUnmarshal(v, []byte(s)); ok {
-		return err
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		v.SetBytes([]byte(s))
@@ -603,22 +605,26 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode) error {
 			return nil
 		}
 	case "uuid":
-		// UUID into a string target: format as RFC 4122 hex-dash,
-		// matching deserFixedUUIDReflect on the binary side. Plain
-		// []byte / [16]byte targets fall through to the generic
-		// byte-copy paths below.
-		if len(b) == 16 && v.Kind() == reflect.String {
-			var u [16]byte
-			copy(u[:], b)
-			return setStringTarget(v, uuidToString(u), "fixed")
-		}
-		// TextUnmarshaler: pass the canonical hex-dash form, matching
-		// deserFixedUUIDReflect on the binary side.
 		if len(b) == 16 {
 			var u [16]byte
 			copy(u[:], b)
-			if ok, err := tryTextUnmarshal(v, []byte(uuidToString(u))); ok {
+			// [16]byte trusts the raw bytes (isUUIDType-first, matching
+			// deserFixedUUIDReflect): no UnmarshalText round trip. Without
+			// this, a [16]byte type that also implements TextUnmarshaler
+			// (e.g. google/uuid.UUID) diverged from the binary path.
+			if isUUIDType(v.Type()) {
+				reflect.Copy(v, reflect.ValueOf(u))
+				return nil
+			}
+			// TextUnmarshaler before the reflect.String arm (parity with the
+			// binary side): the canonical hex-dash form is fed to UnmarshalText.
+			if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
+				_, err := tryTextUnmarshal(v, []byte(uuidToString(u)))
 				return err
+			}
+			// String target: format as RFC 4122 hex-dash.
+			if v.Kind() == reflect.String {
+				return setStringTarget(v, uuidToString(u), "fixed")
 			}
 		}
 	}
@@ -747,6 +753,14 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 	if v.Kind() != reflect.Slice {
 		return semErr(v, "array")
 	}
+	// Native concrete fast path: plain primitive item + unnamed []V. Drops the
+	// per-element reflect.Append + reflect parse. Logical items / named slice /
+	// named elem fall through.
+	if node.items.logical == "" {
+		if handled, err := decodeJSONNativeSliceDispatch(ctx, v, node.items); handled {
+			return err
+		}
+	}
 	v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 	if ctx.scanner.peek() != ']' {
 		elem := reflect.New(v.Type().Elem()).Elem()
@@ -807,6 +821,16 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 	}
 	keyType := v.Type().Key()
 	valType := v.Type().Elem()
+	// Native concrete fast path: plain primitive value + exactly-string key.
+	// Drops the per-entry reflect SetMapIndex (m[k]=v instead). The reflect
+	// parse into a reused elem stays; logical / named / non-interfaceable
+	// fall through. (Array JSON decode has no equivalent — it already parses
+	// in place via Index(i), so there's no SetMapIndex to remove.)
+	if node.values.logical == "" && keyType == stringType && v.CanInterface() {
+		if handled, err := decodeJSONNativeMap(ctx, v, node.values); handled {
+			return err
+		}
+	}
 	if ctx.scanner.peek() != '}' {
 		elem := reflect.New(valType).Elem()
 		// Reusable key Value typed to match the user's map key type
@@ -836,6 +860,156 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 		}
 	}
 	return ctx.scanner.expect('}')
+}
+
+// JSON parse-to-native leaves: scan + parse one JSON token straight into the
+// Go value, no reflect.Value. decodeInt/decodeFloat/decodeBool/decodeString
+// are each one of these leaves plus a setXValue, so the native map/slice loops
+// below reuse the exact same token parsing — the leaf is the shared point.
+func jsonReadString(c *jsonDecoder) (string, error) { return c.consumeSlabString() }
+func jsonReadBool(c *jsonDecoder) (bool, error)     { return c.scanner.consumeBool() }
+func jsonReadInt32(c *jsonDecoder) (int32, error) {
+	nb, err := c.scanner.consumeNumberBytes()
+	if err != nil {
+		return 0, err
+	}
+	return parseJSONInt32(nb)
+}
+func jsonReadInt64(c *jsonDecoder) (int64, error) {
+	nb, err := c.scanner.consumeNumberBytes()
+	if err != nil {
+		return 0, err
+	}
+	return parseJSONInt64(nb)
+}
+// jsonReadInt is only reached when int is 64-bit (its callers gate on
+// strconv.IntSize == 64), so int(n) is a lossless identity there. On 32-bit
+// the long→int native arms fall back to the overflow-checked reflect path.
+func jsonReadInt(c *jsonDecoder) (int, error) { n, err := jsonReadInt64(c); return int(n), err }
+func jsonReadFloat32(c *jsonDecoder) (float32, error) {
+	f, err := c.decodeJSONFloat(32, "float")
+	return float32(f), err
+}
+func jsonReadFloat64(c *jsonDecoder) (float64, error) { return c.decodeJSONFloat(64, "double") }
+
+// decodeJSONNativeStringMap stores each parsed value straight into m — no
+// reflect SetMapIndex, no reflect parse (readOne yields a native V).
+func decodeJSONNativeStringMap[V any](ctx *jsonDecoder, m map[string]V, readOne func(*jsonDecoder) (V, error)) error {
+	if ctx.scanner.peek() != '}' {
+		for {
+			key, err := ctx.consumeSlabString()
+			if err != nil {
+				return err
+			}
+			if err := ctx.scanner.expect(':'); err != nil {
+				return err
+			}
+			val, err := readOne(ctx)
+			if err != nil {
+				return err
+			}
+			m[key] = val
+			if ctx.scanner.peek() != ',' {
+				break
+			}
+			ctx.scanner.pos++
+		}
+	}
+	return ctx.scanner.expect('}')
+}
+
+// decodeJSONNativeSlice builds a native []V via append and sets it once,
+// dropping the generic path's per-element reflect.Append AND reflect parse.
+func decodeJSONNativeSlice[V any](ctx *jsonDecoder, v reflect.Value, readOne func(*jsonDecoder) (V, error)) error {
+	var s []V
+	if ctx.scanner.peek() != ']' {
+		for {
+			val, err := readOne(ctx)
+			if err != nil {
+				return err
+			}
+			s = append(s, val)
+			if ctx.scanner.peek() != ',' {
+				break
+			}
+			ctx.scanner.pos++
+		}
+	}
+	if s == nil {
+		s = []V{}
+	}
+	v.Set(reflect.ValueOf(s))
+	return ctx.scanner.expect(']')
+}
+
+// decodeJSONNativeMap routes an unnamed map[string]V of a plain primitive to
+// the native loop. handled=false (scanner untouched — the assertion fails
+// before any read) for named map/value types, which fall back to reflect.
+func decodeJSONNativeMap(ctx *jsonDecoder, v reflect.Value, valNode *schemaNode) (bool, error) {
+	switch et := v.Type().Elem(); {
+	case valNode.kind == "string" && et == stringType:
+		if m, ok := v.Interface().(map[string]string); ok {
+			return true, decodeJSONNativeStringMap(ctx, m, jsonReadString)
+		}
+	case valNode.kind == "int" && et == int32Type:
+		if m, ok := v.Interface().(map[string]int32); ok {
+			return true, decodeJSONNativeStringMap(ctx, m, jsonReadInt32)
+		}
+	case valNode.kind == "long" && et == int64Type:
+		if m, ok := v.Interface().(map[string]int64); ok {
+			return true, decodeJSONNativeStringMap(ctx, m, jsonReadInt64)
+		}
+	// long → int: int(int64) narrows on 32-bit platforms (int is 32-bit
+	// there), silently truncating an out-of-int32 wire value where the reflect
+	// path errors. Gate on a 64-bit int (compile-time constant) so 32-bit
+	// falls back to the overflow-checked reflect path. (The int32/int64 arms
+	// are safe — parseJSONInt32/parseJSONInt64 range-check.)
+	case valNode.kind == "long" && et == intType && strconv.IntSize == 64:
+		if m, ok := v.Interface().(map[string]int); ok {
+			return true, decodeJSONNativeStringMap(ctx, m, jsonReadInt)
+		}
+	case valNode.kind == "float" && et == float32Type:
+		if m, ok := v.Interface().(map[string]float32); ok {
+			return true, decodeJSONNativeStringMap(ctx, m, jsonReadFloat32)
+		}
+	case valNode.kind == "double" && et == float64Type:
+		if m, ok := v.Interface().(map[string]float64); ok {
+			return true, decodeJSONNativeStringMap(ctx, m, jsonReadFloat64)
+		}
+	case valNode.kind == "boolean" && et == boolType:
+		if m, ok := v.Interface().(map[string]bool); ok {
+			return true, decodeJSONNativeStringMap(ctx, m, jsonReadBool)
+		}
+	}
+	return false, nil
+}
+
+// decodeJSONNativeSliceDispatch routes an unnamed []V of a plain primitive to
+// the native loop. A named slice type (Name() != "") can't take v.Set([]V),
+// and a named element type misses the exact-type case; both fall back.
+func decodeJSONNativeSliceDispatch(ctx *jsonDecoder, v reflect.Value, itemNode *schemaNode) (bool, error) {
+	if v.Type().Name() != "" {
+		return false, nil
+	}
+	switch et := v.Type().Elem(); {
+	case itemNode.kind == "string" && et == stringType:
+		return true, decodeJSONNativeSlice(ctx, v, jsonReadString)
+	case itemNode.kind == "int" && et == int32Type:
+		return true, decodeJSONNativeSlice(ctx, v, jsonReadInt32)
+	case itemNode.kind == "long" && et == int64Type:
+		return true, decodeJSONNativeSlice(ctx, v, jsonReadInt64)
+	case itemNode.kind == "long" && et == intType && strconv.IntSize == 64:
+		// See decodeJSONNativeMap: 32-bit int narrows; gate to 64-bit so
+		// 32-bit uses the overflow-checked reflect path.
+		return true, decodeJSONNativeSlice(ctx, v, jsonReadInt)
+	case itemNode.kind == "float" && et == float32Type:
+		return true, decodeJSONNativeSlice(ctx, v, jsonReadFloat32)
+	case itemNode.kind == "double" && et == float64Type:
+		return true, decodeJSONNativeSlice(ctx, v, jsonReadFloat64)
+	case itemNode.kind == "boolean" && et == boolType:
+		return true, decodeJSONNativeSlice(ctx, v, jsonReadBool)
+	}
+	return false, nil
 }
 
 func (ctx *jsonDecoder) decodeRecord(v reflect.Value, node *schemaNode, toAny bool) error {

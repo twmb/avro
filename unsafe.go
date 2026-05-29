@@ -380,15 +380,12 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		return usDouble(k)
 	case "string":
 		if k == reflect.String {
-			// json.Number-typed string fields fall through to the safe
-			// path so appendAvroString's json.Number reject fires; the
-			// unsafe path's direct *(*string)(p) read would silently
-			// write json.Number content as a string wire value, which
-			// the matching decoder's json.Number target reject (via
-			// tryCompileFieldDeser at the symmetric site) then can't
-			// round-trip. Same shape as the decoder gate at the
-			// "string" arm of tryCompileFieldDeser below.
-			if goType == jsonNumberType {
+			// json.Number and text-method string-kind types take the safe
+			// path: the unsafe *(*string)(p) read would write the raw
+			// underlying string, bypassing appendAvroString's json.Number
+			// reject and text-out arm — diverging a struct field from the
+			// scalar encode of the same value. See stringFastPathEligibleEncode.
+			if !stringFastPathEligibleEncode(goType) {
 				return nil
 			}
 			return usString
@@ -509,11 +506,12 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		return udDouble(k)
 	case "string":
 		if k == reflect.String {
-			// json.Number-typed string fields fall through to the safe path
-			// so setStringValue's rejectJSONNumberStringTarget guard fires;
-			// the unsafe path's direct *(*string)(p)=... pointer store
-			// would silently violate json.Number's RFC 8259 invariant.
-			if goType == jsonNumberType {
+			// json.Number and TextUnmarshaler string-kind types take the
+			// safe path: the unsafe *(*string)(p)=... store would bypass
+			// setStringValue's json.Number RFC 8259 guard and UnmarshalText
+			// arm — diverging a struct field from the scalar decode of the
+			// same target. See stringFastPathEligibleDecode.
+			if !stringFastPathEligibleDecode(goType) {
 				return nil
 			}
 			return udStringDeser
@@ -578,9 +576,13 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 	case "uuid":
 		if avroType == "fixed" {
 			if goType.Kind() == reflect.String {
-				// fixed+uuid accepts reflect.String including json.Number
-				// (the safe-path serFixedUUIDReflect does too — see "raw
-				// bytes" leniency comment there).
+				// text-method (and json.Number) string-kind types take the
+				// safe path so serFixedUUIDReflect's text-before-string-kind
+				// order applies; json.Number reaches the same parseUUID
+				// outcome on either path. See stringFastPathEligibleEncode.
+				if !stringFastPathEligibleEncode(goType) {
+					return nil
+				}
 				return usFixedUUIDString
 			}
 			return nil // [16]byte, []byte handled by default fixed ser
@@ -589,12 +591,11 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 			return usUUID
 		}
 		if goType.Kind() == reflect.String {
-			// json.Number string+uuid: usString would emit the json.Number's
-			// underlying string as the wire UUID, with no UUID validation.
-			// The safe path's serUUID falls through to appendAvroString
-			// which rejects json.Number. Mirror the decoder gate at
-			// tryCompileLogicalDeser's "uuid"+string+reflect.String arm.
-			if goType == jsonNumberType {
+			// json.Number/text string+uuid: usString would emit the raw
+			// underlying string as the wire UUID with no validation / no
+			// text-out; the safe path's serUUID → appendAvroString applies
+			// both. See stringFastPathEligibleEncode.
+			if !stringFastPathEligibleEncode(goType) {
 				return nil
 			}
 			return usString
@@ -656,8 +657,11 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 				return udFixedUUID
 			}
 			if goType.Kind() == reflect.String {
-				if goType == jsonNumberType {
-					return nil // safe path enforces json.Number guard
+				// Safe path enforces the json.Number guard and the
+				// TextUnmarshaler arm (deserFixedUUIDReflect tries
+				// UnmarshalText before the string-kind setStringTarget).
+				if !stringFastPathEligibleDecode(goType) {
+					return nil
 				}
 				return udFixedUUIDString
 			}
@@ -667,8 +671,10 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 			return udUUID
 		}
 		if goType.Kind() == reflect.String {
-			if goType == jsonNumberType {
-				return nil // safe path enforces json.Number guard
+			// Safe path enforces the json.Number guard and the
+			// TextUnmarshaler arm.
+			if !stringFastPathEligibleDecode(goType) {
+				return nil
 			}
 			return udStringDeser
 		}

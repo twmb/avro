@@ -467,21 +467,28 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				return appendAvroJSONBytes(buf, raw[:]), nil
 			}
 		case "uuid":
-			if v.Kind() == reflect.String {
-				u, err := parseUUID(v.String())
+			// [16]byte trusts its bytes (uuidBytes-first, matching binary
+			// serFixedUUIDReflect): the raw 16 bytes are the wire form, with
+			// no MarshalText→parseUUID round trip. Without this, a [16]byte
+			// type that also implements TextMarshaler (e.g. google/uuid.UUID)
+			// diverged from the binary path.
+			if u, ok := uuidBytes(v); ok {
+				return appendAvroJSONBytes(buf, u[:]), nil
+			}
+			// TextMarshaler / AppendText before the reflect.String arm
+			// (parity with serFixedUUIDReflect). MarshalText must produce a
+			// UUID hex-dash string, which parseUUID validates into 16 bytes.
+			if text, ok, err := textValue(v, "fixed"); err != nil {
+				return nil, err
+			} else if ok {
+				u, err := parseUUID(text)
 				if err != nil {
 					return nil, err
 				}
 				return appendAvroJSONBytes(buf, u[:]), nil
 			}
-			// TextMarshaler / AppendText: parity with the binary
-			// serFixedUUIDReflect and with the JSON string+uuid path
-			// (avroStringValue). MarshalText must produce a UUID
-			// hex-dash string.
-			if text, ok, err := textValue(v, "fixed"); err != nil {
-				return nil, err
-			} else if ok {
-				u, err := parseUUID(text)
+			if v.Kind() == reflect.String {
+				u, err := parseUUID(v.String())
 				if err != nil {
 					return nil, err
 				}
@@ -510,6 +517,26 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return appendAvroJSONBytes(buf, raw), nil
 
 	case "enum":
+		// Builtin string fast path (parity with serEnum): unnamed string is
+		// text-less, so it IS the symbol — skip the textValue probe. Named
+		// string types fall through to textValue, so uniformity holds.
+		if v.Type() == stringType {
+			needle := v.String()
+			if slices.Contains(node.symbols, needle) {
+				return appendJSONString(buf, needle), nil
+			}
+			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(needle))
+		}
+		// Text-out first (uniformity / name-based matching), then named string
+		// without a text method, then the int-ordinal arm.
+		if text, ok, err := textValue(v, "enum"); err != nil {
+			return nil, err
+		} else if ok {
+			if slices.Contains(node.symbols, text) {
+				return appendJSONString(buf, text), nil
+			}
+			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(text))
+		}
 		if v.Kind() == reflect.String {
 			needle := v.String()
 			if slices.Contains(node.symbols, needle) {
@@ -529,21 +556,18 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			}
 			return appendJSONString(buf, node.symbols[n]), nil
 		}
-		// TextMarshaler / AppendText: parity with serEnum on the binary
-		// side. The text must match a known symbol.
-		if text, ok, err := textValue(v, "enum"); err != nil {
-			return nil, err
-		} else if ok {
-			if slices.Contains(node.symbols, text) {
-				return appendJSONString(buf, text), nil
-			}
-			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(text))
-		}
 		return nil, fmt.Errorf("avro json: expected string or integer for enum, got %s", v.Type())
 
 	case "array":
 		if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
 			return nil, fmt.Errorf("avro json: expected slice/array, got %s", v.Type())
+		}
+		// Native concrete fast path: plain primitive item + unnamed []V slice.
+		// Logical items, [N]T arrays, named slice/elem types fall through.
+		if node.items.logical == "" && v.Kind() == reflect.Slice && v.CanInterface() {
+			if out, ok := appendAvroJSONNativeArray(buf, v, node.items.kind, cfg); ok {
+				return out, nil
+			}
 		}
 		buf = append(buf, '[')
 		for i := range v.Len() {
@@ -567,12 +591,27 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			// serMapPreamble's check on the binary side.
 			return nil, semErr(v, "map")
 		}
+		// Native concrete fast path: a plain (non-logical) primitive value and
+		// an exactly-string key mean the whole map is a known unnamed type, so
+		// assert it and emit natively (no reflect.MapRange). Logical-typed
+		// values (date/time/uuid serialize specially), named map/value types,
+		// and non-interfaceable maps fall through to the reflect path.
+		if node.values.logical == "" && v.Type().Key() == stringType && v.CanInterface() {
+			if out, ok := appendAvroJSONNativeMap(buf, v, node.values.kind, cfg); ok {
+				return out, nil
+			}
+		}
 		buf = append(buf, '{')
 		first := true
 		keyType := v.Type().Key()
+		// Reused addressable Values avoid the per-entry alloc of
+		// iter.Key()/iter.Value() — see appendMapPrimitive (ser.go).
+		keyV := reflect.New(keyType).Elem()
+		valV := reflect.New(v.Type().Elem()).Elem()
 		iter := v.MapRange()
 		for iter.Next() {
-			key := iter.Key().String()
+			keyV.SetIterKey(iter)
+			key := keyV.String()
 			if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
 				return nil, err
 			}
@@ -582,8 +621,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			first = false
 			buf = appendJSONString(buf, key)
 			buf = append(buf, ':')
+			valV.SetIterValue(iter)
 			var err error
-			buf, err = appendAvroJSON(buf, iter.Value(), node.values, cfg, custom, depth+1)
+			buf, err = appendAvroJSON(buf, valV, node.values, cfg, custom, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -599,6 +639,115 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	default:
 		return nil, fmt.Errorf("avro json: unsupported schema kind %q", node.kind)
 	}
+}
+
+// appendJSONNativeStringMap ranges a concrete map[string]V natively (no
+// reflect.MapRange / per-entry Value), emitting each value via emit. The
+// native range dominates the win, so the emit func-param's indirection is
+// negligible on this (cooler than binary) path — and it keeps one loop shape
+// for all value types.
+func appendJSONNativeStringMap[V any](buf []byte, m map[string]V, emit func([]byte, V) []byte) []byte {
+	buf = append(buf, '{')
+	first := true
+	for k, val := range m {
+		if !first {
+			buf = append(buf, ',')
+		}
+		first = false
+		buf = appendJSONString(buf, k)
+		buf = append(buf, ':')
+		buf = emit(buf, val)
+	}
+	return append(buf, '}')
+}
+
+// appendAvroJSONNativeMap emits a plain-primitive-valued map[string]V the same
+// way appendAvroJSON would, but natively. ok is false (buf untouched) when v's
+// dynamic type isn't the unnamed map[string]V for kind — the caller falls back
+// to the reflect path. Only reached when node.values.logical == "" (logical
+// values serialize specially) and the key is exactly string.
+func appendAvroJSONNativeMap(buf []byte, v reflect.Value, kind string, cfg *optConfig) ([]byte, bool) {
+	switch et := v.Type().Elem(); {
+	case kind == "string" && et == stringType:
+		if m, ok := v.Interface().(map[string]string); ok {
+			return appendJSONNativeStringMap(buf, m, appendJSONString), true
+		}
+	case kind == "int" && et == int32Type:
+		if m, ok := v.Interface().(map[string]int32); ok {
+			return appendJSONNativeStringMap(buf, m, func(b []byte, x int32) []byte { return strconv.AppendInt(b, int64(x), 10) }), true
+		}
+	case kind == "long" && et == int64Type:
+		if m, ok := v.Interface().(map[string]int64); ok {
+			return appendJSONNativeStringMap(buf, m, func(b []byte, x int64) []byte { return strconv.AppendInt(b, x, 10) }), true
+		}
+	case kind == "long" && et == intType:
+		if m, ok := v.Interface().(map[string]int); ok {
+			return appendJSONNativeStringMap(buf, m, func(b []byte, x int) []byte { return strconv.AppendInt(b, int64(x), 10) }), true
+		}
+	case kind == "float" && et == float32Type:
+		if m, ok := v.Interface().(map[string]float32); ok {
+			return appendJSONNativeStringMap(buf, m, func(b []byte, x float32) []byte { return appendJSONFloat(b, float64(x), 32, cfg) }), true
+		}
+	case kind == "double" && et == float64Type:
+		if m, ok := v.Interface().(map[string]float64); ok {
+			return appendJSONNativeStringMap(buf, m, func(b []byte, x float64) []byte { return appendJSONFloat(b, x, 64, cfg) }), true
+		}
+	case kind == "boolean" && et == boolType:
+		if m, ok := v.Interface().(map[string]bool); ok {
+			return appendJSONNativeStringMap(buf, m, strconv.AppendBool), true
+		}
+	}
+	return buf, false
+}
+
+// appendJSONNativeSlice ranges a concrete []V natively (no per-element
+// reflect.Value / appendAvroJSON dispatch), emitting each value via emit.
+func appendJSONNativeSlice[V any](buf []byte, s []V, emit func([]byte, V) []byte) []byte {
+	buf = append(buf, '[')
+	for i, val := range s {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = emit(buf, val)
+	}
+	return append(buf, ']')
+}
+
+// appendAvroJSONNativeArray is appendAvroJSONNativeMap's slice sibling. ok is
+// false (buf untouched) when v's dynamic type isn't the unnamed []V for kind.
+// Only reached when node.items.logical == "" and v is a slice (not [N]T).
+func appendAvroJSONNativeArray(buf []byte, v reflect.Value, kind string, cfg *optConfig) ([]byte, bool) {
+	switch et := v.Type().Elem(); {
+	case kind == "string" && et == stringType:
+		if s, ok := v.Interface().([]string); ok {
+			return appendJSONNativeSlice(buf, s, appendJSONString), true
+		}
+	case kind == "int" && et == int32Type:
+		if s, ok := v.Interface().([]int32); ok {
+			return appendJSONNativeSlice(buf, s, func(b []byte, x int32) []byte { return strconv.AppendInt(b, int64(x), 10) }), true
+		}
+	case kind == "long" && et == int64Type:
+		if s, ok := v.Interface().([]int64); ok {
+			return appendJSONNativeSlice(buf, s, func(b []byte, x int64) []byte { return strconv.AppendInt(b, x, 10) }), true
+		}
+	case kind == "long" && et == intType:
+		if s, ok := v.Interface().([]int); ok {
+			return appendJSONNativeSlice(buf, s, func(b []byte, x int) []byte { return strconv.AppendInt(b, int64(x), 10) }), true
+		}
+	case kind == "float" && et == float32Type:
+		if s, ok := v.Interface().([]float32); ok {
+			return appendJSONNativeSlice(buf, s, func(b []byte, x float32) []byte { return appendJSONFloat(b, float64(x), 32, cfg) }), true
+		}
+	case kind == "double" && et == float64Type:
+		if s, ok := v.Interface().([]float64); ok {
+			return appendJSONNativeSlice(buf, s, func(b []byte, x float64) []byte { return appendJSONFloat(b, x, 64, cfg) }), true
+		}
+	case kind == "boolean" && et == boolType:
+		if s, ok := v.Interface().([]bool); ok {
+			return appendJSONNativeSlice(buf, s, strconv.AppendBool), true
+		}
+	}
+	return buf, false
 }
 
 // appendJSONFieldDefault appends a missing record field's default value

@@ -391,6 +391,34 @@ var serBoolean = serPrim(appendAvroBool)
 var jsonNumberType = reflect.TypeFor[json.Number]()
 var mapStringAnyType = reflect.TypeFor[map[string]any]()
 
+// These builtin (unnamed) numeric/bool types are the exact natural Go
+// representations for their Avro primitive — e.g. int32 for "int", int64
+// for "long". When an array's element type is exactly one of these, the
+// encode is a direct read+emit with NO coercion, bounds, or overflow logic
+// (the value provably fits the wire type), so the per-element dispatch in
+// appendAvroInt / appendAvroFloat / appendAvroBool can be hoisted out of
+// the loop. Named or other-width types (e.g. `type Celsius int32`, int8,
+// uint32) are NOT matched here — they take the general per-element path,
+// which applies the correct coercion/bounds for them.
+var (
+	boolType    = reflect.TypeFor[bool]()
+	int32Type   = reflect.TypeFor[int32]()
+	int64Type   = reflect.TypeFor[int64]()
+	intType     = reflect.TypeFor[int]()
+	float32Type = reflect.TypeFor[float32]()
+	float64Type = reflect.TypeFor[float64]()
+)
+
+// stringType is the builtin (unnamed) string type. It is the
+// overwhelming-common Go type at string/enum encode sites, and being
+// unnamed it can carry no methods — so it definitively cannot implement a
+// text-out interface. A `v.Type() == stringType` pointer comparison is the
+// zero-reflection fast path that lets the common case skip the text-method
+// probe (textOutFor) entirely, now that text-out is tried before the
+// reflect.String / enum-ordinal arms. Named string types fall through to
+// the text-aware path.
+var stringType = reflect.TypeFor[string]()
+
 // floatFitsInt32 returns f truncated to int32 and a nil error iff f is a
 // whole number within [MinInt32, MaxInt32]. Callers wrap the returned
 // error with their SemanticError/context.
@@ -771,8 +799,46 @@ func finiteFloat32Overflows(f float64) bool {
 // Used by serFloat (top-level), serArray.serFloat / serMap.serFloat
 // (specialized container paths), and any other site that encodes a
 // reflect-typed value as Avro float.
+// float32WireBits returns f's exact 32-bit pattern, matching Java's
+// Float.floatToRawIntBits and the unsafe path (usFloat). reflect.Value.Float()
+// would widen to float64 and narrow back, quieting signaling-NaN payloads;
+// this avoids that detour so float32 encodes identically on every path. v
+// must be Kind Float32.
+func float32WireBits(v reflect.Value) uint32 {
+	// Fast path: float32→float64→float32 (reflect.Value.Float() then narrow)
+	// is bit-exact for every non-NaN value and for ±Inf, so its bits equal
+	// the raw bits — and it's several times cheaper than reading raw. Only a
+	// NaN survives the round-trip differently (signaling NaNs get quieted),
+	// so only a NaN needs the raw read to preserve its payload (match Java
+	// floatToRawIntBits). This keeps normal float32 encoding regression-free
+	// while still preserving sNaN.
+	f := float32(v.Float())
+	if f == f { // not NaN
+		return math.Float32bits(f)
+	}
+	if v.CanAddr() {
+		return *(*uint32)(unsafe.Pointer(v.UnsafeAddr()))
+	}
+	if v.Type() == float32Type {
+		// Non-addressable builtin float32 (e.g. Encode(f32)): Interface()
+		// preserves the bits and is alloc-free here (the box is unpacked
+		// immediately, so it stays on the stack).
+		return math.Float32bits(v.Interface().(float32))
+	}
+	// Named float32, non-addressable (rare): bit-copy into an addressable
+	// temp via Set (a typedmemmove, not a numeric conversion), then read raw.
+	tmp := reflect.New(v.Type()).Elem()
+	tmp.Set(v)
+	return *(*uint32)(unsafe.Pointer(tmp.UnsafeAddr()))
+}
+
 func appendAvroFloat32(dst []byte, v reflect.Value) ([]byte, error) {
+	if v.Kind() == reflect.Float32 {
+		// Same-width: emit exact bits (preserve sNaN), matching Java + unsafe.
+		return appendUint32(dst, float32WireBits(v)), nil
+	}
 	if v.CanFloat() {
+		// float64 source → genuine narrowing to float32 (lossy by design).
 		return appendUint32(dst, math.Float32bits(float32(v.Float()))), nil
 	}
 	if v.CanInt() {
@@ -839,14 +905,19 @@ var serString = serPrim(appendAvroString)
 //
 //  1. json.Number is rejected (Kind==String but numeric semantics; let
 //     union dispatch route it to a numeric branch).
-//  2. reflect.String → write the underlying string.
-//  3. encoding.TextAppender (preferred over TextMarshaler when both
+//  2. encoding.TextAppender (preferred over TextMarshaler when both
 //     are implemented; appends directly into dst, saving one alloc).
-//  4. encoding.TextMarshaler → MarshalText then write.
-//  5. []byte slice → write bytes (named subtypes like net.IP that
-//     also implement TextMarshaler are handled at step 3/4 above —
-//     the text representation is preferred over the raw bytes).
+//  3. encoding.TextMarshaler → MarshalText then write.
+//  4. reflect.String → write the underlying string.
+//  5. []byte slice → write bytes.
 //  6. Anything else → SemanticError.
+//
+// Text interfaces are tried BEFORE the reflect.String fast path so a
+// string-kind type that implements TextMarshaler uses its marshaled
+// form, matching encoding/json (which prefers TextMarshaler over the
+// default string encoding). json.Number is the one string-kind type
+// excluded — it is rejected up front so union dispatch routes it to a
+// numeric branch.
 //
 // Used by serString (top-level), serArray.serString (array items),
 // and serMap.serString (map values). The JSON encoder uses
@@ -854,10 +925,16 @@ var serString = serPrim(appendAvroString)
 // the string for JSON-escaping; both helpers must remain in
 // lockstep on precedence.
 func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
-	if v.Type() == jsonNumberType {
+	// One Type() read serves both discriminators (vs the old Type()+Kind()):
+	// json.Number is rejected, and the builtin (unnamed) string — the common
+	// case, which can carry no text-out method — is fast-pathed past the
+	// textOutFor probe. Named string types fall through to the text-aware
+	// arms below.
+	t := v.Type()
+	if t == jsonNumberType {
 		return nil, semErr(v, "string")
 	}
-	if v.Kind() == reflect.String {
+	if t == stringType {
 		return doSerString(dst, v.String()), nil
 	}
 	if a, m := textOutFor(v); a != nil {
@@ -891,6 +968,9 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 		}
 		return doSerString(dst, string(text)), nil
 	}
+	if v.Kind() == reflect.String {
+		return doSerString(dst, v.String()), nil
+	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		// doSerString does `append(dst, s...)` and doesn't retain s, so
 		// alias v.Bytes() instead of copying.
@@ -903,22 +983,27 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 
 // avroStringValue resolves v to its canonical Avro-string textual form
 // as a Go string. It is the JSON-encoder's counterpart to appendAvroString
-// and must keep the same precedence (json.Number rejected; reflect.String;
-// encoding.TextAppender; encoding.TextMarshaler; []byte slice). The JSON
-// encoder always materializes the string to apply JSON quoting/escapes,
-// so the alloc-free TextAppender-into-buffer optimization in
-// appendAvroString does not apply here.
+// and must keep the same precedence (json.Number rejected; then
+// encoding.TextAppender / encoding.TextMarshaler; then reflect.String;
+// then []byte slice). The JSON encoder always materializes the string to
+// apply JSON quoting/escapes, so the alloc-free TextAppender-into-buffer
+// optimization in appendAvroString does not apply here.
 func avroStringValue(v reflect.Value) (string, error) {
-	if v.Type() == jsonNumberType {
+	// One Type() read for both discriminators (see appendAvroString).
+	t := v.Type()
+	if t == jsonNumberType {
 		return "", semErr(v, "string")
 	}
-	if v.Kind() == reflect.String {
+	if t == stringType {
 		return v.String(), nil
 	}
 	if text, ok, err := textValue(v, "string"); err != nil {
 		return "", err
 	} else if ok {
 		return text, nil
+	}
+	if v.Kind() == reflect.String {
+		return v.String(), nil
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		return string(v.Bytes()), nil
@@ -1139,15 +1224,38 @@ func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case v.Kind() == reflect.String:
+	// Builtin string fast path: unnamed string can carry no text-out method,
+	// so it IS the symbol — skip the textValue probe. (This is only a
+	// shortcut for the provably-text-less builtin; named string types fall
+	// through to textValue below, so uniformity holds — a named string with
+	// MarshalText still uses it.)
+	if v.Type() == stringType {
 		needle := v.String()
 		if i, ok := s.indexOfSymbol(needle); ok {
 			return appendVarint(dst, int32(i)), nil
 		}
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", truncForError(needle))}
-
-	case v.CanInt() || v.CanUint():
+	}
+	// Text-out methods first (uniformity): a carrier's MarshalText / AppendText,
+	// if any, names its symbol — robust to a Go int whose value doesn't match
+	// the Avro symbol order (Java's getEnumOrdinal(datum.toString())). Named
+	// string types without a text method, and plain ints, fall through.
+	if needle, ok, err := textValue(v, "enum"); err != nil {
+		return nil, err
+	} else if ok {
+		if i, idxOk := s.indexOfSymbol(needle); idxOk {
+			return appendVarint(dst, int32(i)), nil
+		}
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", truncForError(needle))}
+	}
+	if v.Kind() == reflect.String {
+		needle := v.String()
+		if i, ok := s.indexOfSymbol(needle); ok {
+			return appendVarint(dst, int32(i)), nil
+		}
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", truncForError(needle))}
+	}
+	if v.CanInt() || v.CanUint() {
 		var n int
 		if v.CanInt() {
 			n = int(v.Int())
@@ -1159,20 +1267,8 @@ func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		}
 		return appendVarint(dst, int32(n)), nil
 	}
-	// Enum symbols are strings; a type whose Go form isn't reflect.String
-	// but provides a text-out method (TextAppender / TextMarshaler) can
-	// still encode by materializing its text and looking up the symbol.
-	if needle, ok, err := textValue(v, "enum"); err != nil {
-		return nil, err
-	} else if ok {
-		if i, idxOk := s.indexOfSymbol(needle); idxOk {
-			return appendVarint(dst, int32(i)), nil
-		}
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", truncForError(needle))}
-	}
 	return nil, semErr(v, "enum")
 }
-
 
 type serArray struct {
 	serItem serfn
@@ -1236,6 +1332,115 @@ func appendArrayPrimitive(
 	if err != nil || l == 0 {
 		return dst, err
 	}
+	// Hoist the per-element type dispatch out of the loop when the element
+	// type is the exact natural Go type for this Avro primitive. The element
+	// type is uniform across the slice, so this resolves once per encode
+	// instead of once per element, and each fast loop is a direct read+emit
+	// with no coercion/bounds/overflow logic (the exact type provably fits
+	// the wire type — see the type-var block's rationale). Named / other-width
+	// / pointer / text / json.Number element types fall to the general
+	// per-element appendFn loop below, which applies the correct coercion.
+	// Native concrete fast path per case: assert the unnamed []V and range it
+	// directly (no per-element v.Index(i) reflect). The hoist loop below each
+	// assertion handles [N]T fixed arrays (where the []V assertion fails) and
+	// non-interfaceable slices; a named element type misses the exact-type
+	// case entirely and uses the general appendFn loop. float32 emits raw bits
+	// (math.Float32bits(x) equals float32WireBits for every value: non-NaN
+	// round-trips exactly, NaN is read raw — so it matches the reflect path).
+	switch et := v.Type().Elem(); {
+	case avroType == "string" && et == stringType:
+		if v.CanInterface() {
+			if s, ok := v.Interface().([]string); ok {
+				for _, x := range s {
+					dst = doSerString(dst, x)
+				}
+				return append(dst, 0), nil
+			}
+		}
+		for i := range l {
+			dst = doSerString(dst, v.Index(i).String())
+		}
+		return append(dst, 0), nil
+	case avroType == "boolean" && et == boolType:
+		if v.CanInterface() {
+			if s, ok := v.Interface().([]bool); ok {
+				for _, x := range s {
+					if x {
+						dst = append(dst, 1)
+					} else {
+						dst = append(dst, 0)
+					}
+				}
+				return append(dst, 0), nil
+			}
+		}
+		for i := range l {
+			if v.Index(i).Bool() {
+				dst = append(dst, 1)
+			} else {
+				dst = append(dst, 0)
+			}
+		}
+		return append(dst, 0), nil
+	case avroType == "int" && et == int32Type:
+		if v.CanInterface() {
+			if s, ok := v.Interface().([]int32); ok {
+				for _, x := range s {
+					dst = appendVarint(dst, x)
+				}
+				return append(dst, 0), nil
+			}
+		}
+		for i := range l {
+			dst = appendVarint(dst, int32(v.Index(i).Int()))
+		}
+		return append(dst, 0), nil
+	case avroType == "long" && (et == int64Type || et == intType):
+		if v.CanInterface() {
+			if s, ok := v.Interface().([]int64); ok {
+				for _, x := range s {
+					dst = appendVarlong(dst, x)
+				}
+				return append(dst, 0), nil
+			}
+			if s, ok := v.Interface().([]int); ok {
+				for _, x := range s {
+					dst = appendVarlong(dst, int64(x))
+				}
+				return append(dst, 0), nil
+			}
+		}
+		for i := range l {
+			dst = appendVarlong(dst, v.Index(i).Int())
+		}
+		return append(dst, 0), nil
+	case avroType == "float" && et == float32Type:
+		if v.CanInterface() {
+			if s, ok := v.Interface().([]float32); ok {
+				for _, x := range s {
+					dst = appendUint32(dst, math.Float32bits(x))
+				}
+				return append(dst, 0), nil
+			}
+		}
+		for i := range l {
+			dst = appendUint32(dst, float32WireBits(v.Index(i)))
+		}
+		return append(dst, 0), nil
+	case avroType == "double" && et == float64Type:
+		if v.CanInterface() {
+			if s, ok := v.Interface().([]float64); ok {
+				for _, x := range s {
+					dst = appendUint64(dst, math.Float64bits(x))
+				}
+				return append(dst, 0), nil
+			}
+		}
+		for i := range l {
+			dst = appendUint64(dst, math.Float64bits(v.Index(i).Float()))
+		}
+		return append(dst, 0), nil
+	}
 	for i := range l {
 		elem, err := peelElem(v.Index(i), avroType)
 		if err != nil {
@@ -1248,8 +1453,20 @@ func appendArrayPrimitive(
 	return append(dst, 0), nil
 }
 
-// appendMapPrimitive is appendArrayPrimitive's map sibling. Same
-// per-element discipline plus the doSerString(key) emit on each entry.
+// appendMapPrimitive encodes a map whose values are an Avro primitive.
+//
+// Fast path: when the key is exactly string and the value is the exact
+// natural Go type for the Avro primitive, the whole map is a known concrete
+// type (e.g. map[string]int32), so we type-assert and range it natively —
+// no reflect.MapRange, no per-entry Value allocation, no reflect accessor
+// calls. This is gated on CanInterface: a map read from an unexported struct
+// field is not interfaceable and takes the reflect path.
+//
+// Reflect fallback: non-string keys (named string, json.Number), named /
+// other-width / pointer / text value types, and non-interfaceable maps.
+// SetIterKey/SetIterValue reuse two addressable Values so iteration costs 2
+// heap allocs per encode rather than the 2 per entry that
+// iter.Key()/iter.Value() would.
 func appendMapPrimitive(
 	dst []byte, v reflect.Value, avroType string,
 	appendFn func([]byte, reflect.Value) ([]byte, error),
@@ -1259,14 +1476,98 @@ func appendMapPrimitive(
 		return dst, err
 	}
 	keyType := v.Type().Key()
+	// Native concrete fast path: an exactly-string key plus an exact-natural
+	// value type means the whole map has a known unnamed type, so assert it
+	// and range natively — no reflect.MapRange, no per-entry Value. The
+	// comma-ok assertion also rejects named map types (type M map[string]T,
+	// whose Key/Elem match but whose dynamic type does not), which then take
+	// the reflect path. A string key never needs json.Number validation.
+	if keyType == stringType && v.CanInterface() {
+		switch et := v.Type().Elem(); {
+		case avroType == "string" && et == stringType:
+			if m, ok := v.Interface().(map[string]string); ok {
+				for k, val := range m {
+					dst = doSerString(dst, k)
+					dst = doSerString(dst, val)
+				}
+				return append(dst, 0), nil
+			}
+		case avroType == "int" && et == int32Type:
+			if m, ok := v.Interface().(map[string]int32); ok {
+				for k, val := range m {
+					dst = doSerString(dst, k)
+					dst = appendVarint(dst, val)
+				}
+				return append(dst, 0), nil
+			}
+		case avroType == "long" && et == int64Type:
+			if m, ok := v.Interface().(map[string]int64); ok {
+				for k, val := range m {
+					dst = doSerString(dst, k)
+					dst = appendVarlong(dst, val)
+				}
+				return append(dst, 0), nil
+			}
+		case avroType == "long" && et == intType:
+			if m, ok := v.Interface().(map[string]int); ok {
+				for k, val := range m {
+					dst = doSerString(dst, k)
+					dst = appendVarlong(dst, int64(val))
+				}
+				return append(dst, 0), nil
+			}
+		case avroType == "float" && et == float32Type:
+			if m, ok := v.Interface().(map[string]float32); ok {
+				for k, val := range m {
+					dst = doSerString(dst, k)
+					// Native float32: emit exact bits (preserve sNaN), matching
+					// Java floatToRawIntBits, the unsafe path, and (now) the
+					// reflect path via float32WireBits.
+					dst = appendUint32(dst, math.Float32bits(val))
+				}
+				return append(dst, 0), nil
+			}
+		case avroType == "double" && et == float64Type:
+			if m, ok := v.Interface().(map[string]float64); ok {
+				for k, val := range m {
+					dst = doSerString(dst, k)
+					dst = appendUint64(dst, math.Float64bits(val))
+				}
+				return append(dst, 0), nil
+			}
+		case avroType == "boolean" && et == boolType:
+			if m, ok := v.Interface().(map[string]bool); ok {
+				for k, val := range m {
+					dst = doSerString(dst, k)
+					if val {
+						dst = append(dst, 1)
+					} else {
+						dst = append(dst, 0)
+					}
+				}
+				return append(dst, 0), nil
+			}
+		}
+	}
+	// Reflect fallback: non-string keys, named / other-width / pointer / text
+	// value types, named map types, and non-interfaceable maps. SetIterKey/
+	// SetIterValue reuse two addressable Values so iteration costs 2 heap
+	// allocs per encode, not 2 per entry (iter.Key()/iter.Value()).
+	keyNeedsJSONNumberCheck := keyType == jsonNumberType
+	keyV := reflect.New(keyType).Elem()
+	valV := reflect.New(v.Type().Elem()).Elem()
 	iter := v.MapRange()
 	for iter.Next() {
-		key := iter.Key().String()
-		if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
-			return nil, err
+		keyV.SetIterKey(iter)
+		key := keyV.String()
+		if keyNeedsJSONNumberCheck {
+			if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
+				return nil, err
+			}
 		}
 		dst = doSerString(dst, key)
-		elem, err := peelElem(iter.Value(), avroType)
+		valV.SetIterValue(iter)
+		elem, err := peelElem(valV, avroType)
 		if err != nil {
 			return nil, err
 		}
@@ -1339,14 +1640,21 @@ func (s *serMap) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return dst, err
 	}
 	keyType := v.Type().Key()
+	// Reused addressable Values: see appendMapPrimitive. valV is addressable
+	// (iter.Value() is not), so a struct-valued map now reaches serRecord's
+	// unsafe fast path — byte-identical to the reflect path, just faster.
+	keyV := reflect.New(keyType).Elem()
+	valV := reflect.New(v.Type().Elem()).Elem()
 	iter := v.MapRange()
 	for iter.Next() {
-		key := iter.Key().String()
+		keyV.SetIterKey(iter)
+		key := keyV.String()
 		if err := validateJSONNumberMapKey(key, keyType, "map"); err != nil {
 			return nil, err
 		}
 		dst = doSerString(dst, key)
-		if dst, err = s.serItem(dst, iter.Value(), depth+1); err != nil {
+		valV.SetIterValue(iter)
+		if dst, err = s.serItem(dst, valV, depth+1); err != nil {
 			return nil, err
 		}
 	}
@@ -2113,7 +2421,25 @@ func serFixedUUIDReflect(dst []byte, v reflect.Value, depth int) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
+	// [16]byte trusts its bytes: the raw 16 bytes ARE the UUID wire form,
+	// so they are written directly without a MarshalText→parseUUID round
+	// trip (which would be redundant for a canonical type and could
+	// spuriously fail parseUUID on an otherwise-valid [16]byte). This is
+	// the uuidBytes-first rule the JSON encoder mirrors.
 	if u, ok := uuidBytes(v); ok {
+		return append(dst, u[:]...), nil
+	}
+	// TextMarshaler / AppendText before the reflect.String arm (parity with
+	// the string encoders): a struct or string-kind type implementing a
+	// text method derives its UUID text that way. The text must be a
+	// parseable UUID; parseUUID validates and yields the 16 wire bytes.
+	if text, ok, err := textValue(v, "fixed"); err != nil {
+		return nil, err
+	} else if ok {
+		u, err := parseUUID(text)
+		if err != nil {
+			return nil, err
+		}
 		return append(dst, u[:]...), nil
 	}
 	if v.Kind() == reflect.String {
@@ -2124,17 +2450,6 @@ func serFixedUUIDReflect(dst []byte, v reflect.Value, depth int) ([]byte, error)
 		// fixed+uuid wire (rejectJSONNumberStringTarget) but the
 		// encode-side asymmetry is documented as intentional.
 		u, err := parseUUID(v.String())
-		if err != nil {
-			return nil, err
-		}
-		return append(dst, u[:]...), nil
-	}
-	// TextMarshaler / AppendText: parity with serUUID (string+uuid) so
-	// the same Go type can be encoded against either schema shape.
-	if text, ok, err := textValue(v, "fixed"); err != nil {
-		return nil, err
-	} else if ok {
-		u, err := parseUUID(text)
 		if err != nil {
 			return nil, err
 		}

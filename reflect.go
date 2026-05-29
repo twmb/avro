@@ -58,7 +58,18 @@ func tryTextUnmarshal(v reflect.Value, b []byte) (bool, error) {
 //
 // TextMarshaler / TextAppender stand on their own — the encoder does
 // not require the type to also implement TextUnmarshaler.
+//
+// Fast-out: text-out methods are tried BEFORE the reflect.String / enum
+// int-ordinal arms at every encode site, so this runs on every plain
+// string / enum encode. The alloc-free type check short-circuits before
+// the v.Interface() boxing for types that can't implement a text-out
+// method — keeping the common plain-string/enum path allocation-free.
+// If implementsTextMarshaler is false, neither method set has the method,
+// so the body below would return (nil, nil) anyway.
 func textOutFor(v reflect.Value) (encoding.TextAppender, encoding.TextMarshaler) {
+	if !implementsTextMarshaler(v.Type()) {
+		return nil, nil
+	}
 	var appender encoding.TextAppender
 	var marshaler encoding.TextMarshaler
 	if v.CanInterface() {
@@ -110,6 +121,63 @@ func textValue(v reflect.Value, avroType string) (string, bool, error) {
 		return "", false, &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
 	}
 	return string(text), true, nil
+}
+
+// implementsTextMarshaler reports whether t's value or pointer method set
+// implements TextMarshaler or TextAppender. The unsafe/fast string-encode
+// paths (usString, usFixedUUIDString) read the underlying string directly
+// and bypass appendAvroString's text-out arm; keeping text-method types
+// off those paths is what makes a string-kind type with a text method
+// encode its marshaled form in a struct field exactly as it does as a
+// scalar. Evaluated once per type at fast-path compile time, never per
+// value.
+func implementsTextMarshaler(t reflect.Type) bool {
+	// Method-set fast-out: the pointer method set is a superset of the value
+	// method set, so an empty pointer method set means the type has no
+	// methods at all and can implement no interface. A NumMethod field read
+	// is far cheaper than four Implements method-set scans — this gates the
+	// per-element encode path, where plain string / enum types (zero methods)
+	// are the overwhelming-common case.
+	pt := reflect.PointerTo(t)
+	if pt.NumMethod() == 0 {
+		return false
+	}
+	return t.Implements(textMarshalerType) || t.Implements(textAppenderType) ||
+		pt.Implements(textMarshalerType) || pt.Implements(textAppenderType)
+}
+
+// implementsTextUnmarshaler reports whether *t implements TextUnmarshaler.
+// The unsafe/fast string-decode paths (udStringDeser, udFixedUUIDString)
+// and the array/map fast loops write the wire string directly and bypass
+// setStringValue's UnmarshalText arm; keeping such types off those paths
+// makes a string-kind type with UnmarshalText decode through it in a
+// struct field / container exactly as it does as a scalar.
+func implementsTextUnmarshaler(t reflect.Type) bool {
+	return reflect.PointerTo(t).Implements(textUnmarshalerType)
+}
+
+// stringFastPathEligibleEncode reports whether a reflect.String-kind Go type
+// may use an unsafe/fast string-encode path (usString, usFixedUUIDString,
+// the container loops). It must take the slow reflect path when it is
+// json.Number (appendAvroString's RFC 8259 reject) or implements a text-out
+// method (appendAvroString's text-out arm) — both of which the fast paths
+// bypass. Callers have already established Kind()==String.
+//
+// This is the SINGLE source of truth for "which string-kind types are
+// fast-path-ineligible on encode." Every encode fast-path gate consults it,
+// so a future slow-path-only string concern is added in one place rather
+// than re-swept across every gate (the pattern-14c trap).
+func stringFastPathEligibleEncode(t reflect.Type) bool {
+	return t != jsonNumberType && !implementsTextMarshaler(t)
+}
+
+// stringFastPathEligibleDecode is the decode-side counterpart: a
+// reflect.String-kind target is fast-path-ineligible when it is json.Number
+// (setStringValue's RFC 8259 guard) or implements TextUnmarshaler
+// (setStringValue's UnmarshalText arm). Single source of truth for the
+// decode gates (udStringDeser, udFixedUUIDString, fastPathSafeForElem).
+func stringFastPathEligibleDecode(t reflect.Type) bool {
+	return t != jsonNumberType && !implementsTextUnmarshaler(t)
 }
 
 var (

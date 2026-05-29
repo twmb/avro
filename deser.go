@@ -360,12 +360,29 @@ func deserLong(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	return src, setLongValue(indirectAlloc(v), val)
 }
 
+// setFloat32WireValue stores a 32-bit "float" wire value into v. For a
+// float32 target it writes the exact bit pattern, preserving signaling-NaN
+// payloads to match Java (Float.intBitsToFloat) and the unsafe path (udFloat);
+// reflect's SetFloat would round-trip through float64 and quiet them. float64
+// (widen) and integer (coerce) targets go through setFloatValue, and an
+// interface target boxes the raw float32 directly.
+func setFloat32WireValue(v reflect.Value, u uint32) error {
+	if v.Kind() == reflect.Float32 && v.CanAddr() {
+		*(*uint32)(unsafe.Pointer(v.UnsafeAddr())) = u
+		return nil
+	}
+	if v.Kind() == reflect.Interface {
+		return setIface(v, reflect.ValueOf(math.Float32frombits(u)), "float")
+	}
+	return setFloatValue(v, float64(math.Float32frombits(u)), "float", 32)
+}
+
 func deserFloat(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	u, src, err := readUint32(src)
 	if err != nil {
 		return nil, err
 	}
-	return src, setFloatValue(indirectAlloc(v), float64(math.Float32frombits(u)), "float", 32)
+	return src, setFloat32WireValue(indirectAlloc(v), u)
 }
 
 func deserDouble(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -540,9 +557,19 @@ type deserEnum struct {
 // resolveEnum (binary with symbol remap), and decodeEnum (JSON) so the
 // target arms agree on overflow checks and SemanticError shapes.
 func setEnumTarget(v reflect.Value, idx int, symbol string) error {
-	switch {
-	case v.Kind() == reflect.Interface:
+	if v.Kind() == reflect.Interface {
 		return setIface(v, reflect.ValueOf(symbol), "enum")
+	}
+	// TextUnmarshaler before the String/int arms: an enum target receiving
+	// a symbol name uses its text parsing, mirroring serEnum (which matches
+	// by symbol name first). A plain int target with no UnmarshalText falls
+	// through to the ordinal arm below. The implements-check gates the
+	// []byte(symbol) allocation off the common string/int paths.
+	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
+		_, err := tryTextUnmarshal(v, []byte(symbol))
+		return err
+	}
+	switch {
 	case v.Kind() == reflect.String:
 		return setStringTarget(v, symbol, "enum")
 	case v.CanInt():
@@ -557,9 +584,6 @@ func setEnumTarget(v reflect.Value, idx int, symbol string) error {
 		}
 		v.SetUint(uint64(idx))
 		return nil
-	}
-	if ok, err := tryTextUnmarshal(v, []byte(symbol)); ok {
-		return err
 	}
 	return semErr(v, "enum")
 }
@@ -578,6 +602,10 @@ func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 type deserArray struct {
 	deserItem    deserfn
 	fastLoop     func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error)
+	// nativeLoop decodes one block straight into the concrete Go slice
+	// (s[i]=v) when its dynamic type is exactly []V; returns handled=false
+	// for named slice/elem types, which fall back to fastLoop.
+	nativeLoop   func(sliceVal reflect.Value, src []byte, start, count int, sl *slab) (bool, []byte, error)
 	fastElemKind reflect.Kind
 	// fastIfaceLoop decodes one block of items directly into a []any,
 	// bypassing reflect for primitive items. Selected at schema-build
@@ -816,16 +844,21 @@ func schemaMinBytesSeen(n *schemaNode, seen map[*schemaNode]struct{}) int {
 
 // fastPathSafeForElem reports whether a primitive fast loop with expected
 // kind fastElemKind is safe for slice/map elements of type elemType.
-// Returns false when the kind doesn't match, or when elemType is
-// json.Number — its Kind() == reflect.String matches the string fast
-// path's expected kind, but its RFC 8259 invariant requires per-element
-// rejectJSONNumberStringTarget consultation, which the fast string
-// loops (deserArrayStringLoop, deserMapStringBlock) bypass by capturing
-// reflect.Value.SetString as a method expression. Routing json.Number
-// elements through the slow path activates the guard at the per-element
-// setter.
+// Returns false when the kind doesn't match. The string fast loops
+// (deserArrayStringLoop, deserMapStringBlock) capture reflect.Value.SetString
+// as a method expression, bypassing the per-element setStringValue logic, so
+// the eligibility decision is shared with the unsafe struct gates via
+// stringFastPathEligibleDecode (json.Number's RFC 8259 guard + any
+// TextUnmarshaler implementor's UnmarshalText arm). Evaluated once per decode
+// call (not per element).
 func fastPathSafeForElem(elemType reflect.Type, fastElemKind reflect.Kind) bool {
-	return elemType.Kind() == fastElemKind && elemType != jsonNumberType
+	if elemType.Kind() != fastElemKind {
+		return false
+	}
+	if fastElemKind == reflect.String {
+		return stringFastPathEligibleDecode(elemType)
+	}
+	return true
 }
 
 func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -864,6 +897,10 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	// fastPathSafeForElem screens both the Kind match and the json.Number
 	// guard-bypass case — see its docstring.
 	useFast := !iface && s.fastLoop != nil && fastPathSafeForElem(sliceType.Elem(), s.fastElemKind)
+	// Native concrete path: write straight into []V. The unnamed-slice
+	// assertion in nativeLoop returns handled=false for named slice/elem
+	// types, which fall back to fastLoop.
+	useFastNative := useFast && s.nativeLoop != nil
 	// For interface targets with primitive avro items, use the iface
 	// fast loop that operates directly on []any.
 	useFastIface := iface && s.fastIfaceLoop != nil
@@ -920,6 +957,17 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			sliceVal = sliceVal.Slice(0, newLen)
 		default:
 			sliceVal.SetLen(newLen)
+		}
+		if useFastNative {
+			handled, rest, nerr := s.nativeLoop(sliceVal, src, start, n, sl)
+			if nerr != nil {
+				return nil, nerr
+			}
+			if handled {
+				src = rest
+				continue
+			}
+			useFastNative = false // named slice/elem type: fall back to fastLoop henceforth
 		}
 		if useFast {
 			src, err = s.fastLoop(src, sliceVal, start, n, sl)
@@ -1076,7 +1124,7 @@ var (
 	deserArrayBooleanLoop = deserArrayLoop(readOneBool, reflect.Value.SetBool)
 	deserArrayIntLoop     = deserArrayLoop(readOneInt, func(v reflect.Value, x int32) { v.SetInt(int64(x)) })
 	deserArrayLongLoop    = deserArrayLoop(readOneLong, reflect.Value.SetInt)
-	deserArrayFloatLoop   = deserArrayLoop(readOneFloat, func(v reflect.Value, x float32) { v.SetFloat(float64(x)) })
+	deserArrayFloatLoop   = deserArrayLoop(readOneFloat, func(v reflect.Value, x float32) { *(*uint32)(unsafe.Pointer(v.UnsafeAddr())) = math.Float32bits(x) })
 	deserArrayDoubleLoop  = deserArrayLoop(readOneDouble, reflect.Value.SetFloat)
 
 	deserArrayStringIfaceLoop  = deserArrayIfaceLoop(readOneString)
@@ -1090,6 +1138,10 @@ var (
 type deserMap struct {
 	deserItem    deserfn
 	fastBlock    func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
+	// nativeBlock decodes one block straight into the concrete Go map
+	// (m[k]=v) when its dynamic type is exactly map[string]V; returns
+	// handled=false for named map types, which fall back to fastBlock.
+	nativeBlock  func(mapVal reflect.Value, src []byte, count int, sl *slab) (bool, []byte, error)
 	fastElemKind reflect.Kind
 	// fastIfaceVal decodes one primitive value directly into a Go any,
 	// bypassing reflect; deserMapPrimitiveIfaceBlock drives the per-block
@@ -1153,6 +1205,10 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	// indirection; route those to the slow path so the in-loop call to
 	// validateJSONNumberMapKey fires.
 	useFast := !iface && s.fastBlock != nil && fastPathSafeForElem(elemTyp, s.fastElemKind) && mapTyp.Key() != jsonNumberType
+	// Native concrete path: exact string key (so the unnamed map[string]V
+	// assertion can succeed) on top of the useFast eligibility. A named map
+	// or named key type returns handled=false and falls back to fastBlock.
+	useFastNative := useFast && s.nativeBlock != nil && mapTyp.Key() == stringType
 	// For interface targets with primitive avro values, use the
 	// iface-block fast path that operates directly on map[string]any.
 	useFastIface := iface && s.fastIfaceVal != nil
@@ -1202,6 +1258,17 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			if !iface {
 				v.Set(mapVal)
 			}
+		}
+		if useFastNative {
+			handled, rest, nerr := s.nativeBlock(mapVal, src, int(count), sl)
+			if nerr != nil {
+				return nil, nerr
+			}
+			if handled {
+				src = rest
+				continue
+			}
+			useFastNative = false // named map type: fall back to fastBlock henceforth
 		}
 		if useFast {
 			src, err = s.fastBlock(src, mapVal, keyVal, elemVal, int(count), sl)
@@ -1300,8 +1367,76 @@ var (
 	deserMapBooleanBlock = deserMapBlock(readOneBool, reflect.Value.SetBool)
 	deserMapIntBlock     = deserMapBlock(readOneInt, func(v reflect.Value, x int32) { v.SetInt(int64(x)) })
 	deserMapLongBlock    = deserMapBlock(readOneLong, reflect.Value.SetInt)
-	deserMapFloatBlock   = deserMapBlock(readOneFloat, func(v reflect.Value, x float32) { v.SetFloat(float64(x)) })
+	deserMapFloatBlock   = deserMapBlock(readOneFloat, func(v reflect.Value, x float32) { *(*uint32)(unsafe.Pointer(v.UnsafeAddr())) = math.Float32bits(x) })
 	deserMapDoubleBlock  = deserMapBlock(readOneDouble, reflect.Value.SetFloat)
+)
+
+// Native concrete decode: write directly into the Go map/slice (m[k]=v /
+// s[i]=v), bypassing reflect SetMapIndex / Index(i).Set* and the reusable elem
+// Value. Selected at decode time when the container's dynamic type is the
+// unnamed map[string]V / []V; a named type returns handled=false (src
+// untouched) and the caller falls back to the reflect block/loop. Reuses the
+// readOneX leaves, so coercion is identical — including float32 raw-bit
+// preservation (readOneFloat returns the exact bits; m[k]=v / s[i]=v copies
+// them, no SetFloat round-trip).
+
+func nativeMapBlockFor[V any](readOne func([]byte, *slab) (V, []byte, error)) func(reflect.Value, []byte, int, *slab) (bool, []byte, error) {
+	return func(mapVal reflect.Value, src []byte, count int, sl *slab) (bool, []byte, error) {
+		m, ok := mapVal.Interface().(map[string]V)
+		if !ok {
+			return false, src, nil
+		}
+		var err error
+		for range count {
+			var k string
+			k, src, err = readMapKeyString(src, sl)
+			if err != nil {
+				return true, nil, err
+			}
+			var val V
+			val, src, err = readOne(src, sl)
+			if err != nil {
+				return true, nil, err
+			}
+			m[k] = val
+		}
+		return true, src, nil
+	}
+}
+
+func nativeArrayLoopFor[V any](readOne func([]byte, *slab) (V, []byte, error)) func(reflect.Value, []byte, int, int, *slab) (bool, []byte, error) {
+	return func(sliceVal reflect.Value, src []byte, start, count int, sl *slab) (bool, []byte, error) {
+		s, ok := sliceVal.Interface().([]V)
+		if !ok {
+			return false, src, nil
+		}
+		var err error
+		for i := start; i < start+count; i++ {
+			var val V
+			val, src, err = readOne(src, sl)
+			if err != nil {
+				return true, nil, err
+			}
+			s[i] = val
+		}
+		return true, src, nil
+	}
+}
+
+var (
+	deserNativeMapStringBlock  = nativeMapBlockFor(readOneString)
+	deserNativeMapBooleanBlock = nativeMapBlockFor(readOneBool)
+	deserNativeMapIntBlock     = nativeMapBlockFor(readOneInt)
+	deserNativeMapLongBlock    = nativeMapBlockFor(readOneLong)
+	deserNativeMapFloatBlock   = nativeMapBlockFor(readOneFloat)
+	deserNativeMapDoubleBlock  = nativeMapBlockFor(readOneDouble)
+
+	deserNativeArrayStringLoop  = nativeArrayLoopFor(readOneString)
+	deserNativeArrayBooleanLoop = nativeArrayLoopFor(readOneBool)
+	deserNativeArrayIntLoop     = nativeArrayLoopFor(readOneInt)
+	deserNativeArrayLongLoop    = nativeArrayLoopFor(readOneLong)
+	deserNativeArrayFloatLoop   = nativeArrayLoopFor(readOneFloat)
+	deserNativeArrayDoubleLoop  = nativeArrayLoopFor(readOneDouble)
 )
 
 // The following iface-block functions decode map entries directly into a
@@ -1394,9 +1529,18 @@ func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			return nil, err
 		}
 	case isUUIDType(v.Type()):
-		// Concrete [16]byte target: rv.Type() == v.Type() by
-		// isUUIDType, so direct Set is safe (no interface check).
+		// [16]byte trusts the raw bytes: rv.Type() == v.Type() by
+		// isUUIDType, so direct Set is safe (no interface check), and no
+		// UnmarshalText round trip is attempted — the bytes ARE the UUID.
 		v.Set(reflect.ValueOf(b))
+	case v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType):
+		// TextUnmarshaler before the String / []byte arms (parity with the
+		// string decoders and serFixedUUIDReflect's text-before-string-kind
+		// order): pass the canonical hex-dash form so the same Go type can
+		// decode from either schema shape (fixed+uuid or string+uuid).
+		if _, err := tryTextUnmarshal(v, []byte(uuidToString(b))); err != nil {
+			return nil, err
+		}
 	case v.Kind() == reflect.String:
 		if err := setStringTarget(v, uuidToString(b), "fixed"); err != nil {
 			return nil, err
@@ -1409,15 +1553,6 @@ func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		copy(buf, src[:16])
 		v.SetBytes(buf)
 	default:
-		// TextUnmarshaler target: pass the canonical hex-dash form, so
-		// the same Go type can decode from either schema shape
-		// (fixed+uuid or string+uuid) symmetrically with serFixedUUIDReflect.
-		if ok, err := tryTextUnmarshal(v, []byte(uuidToString(b))); ok {
-			if err != nil {
-				return nil, err
-			}
-			return src[16:], nil
-		}
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: errors.New("uuid")}
 	}
 	return src[16:], nil
@@ -1653,17 +1788,26 @@ func setStringValue(v reflect.Value, src []byte, n int, sl *slab) error {
 	if v.Kind() == reflect.Interface {
 		return setIface(v, reflect.ValueOf(sl.string(src, n)), "string")
 	}
+	// TextUnmarshaler before the reflect.String fast path: a string-kind
+	// type implementing TextUnmarshaler uses its text parsing, mirroring the
+	// encoder (textValue is tried before reflect.String in appendAvroString)
+	// and encoding/json. Also covers named []byte subtypes like net.IP that
+	// prefer text parsing over raw byte assignment. The implements-check
+	// gates the []byte allocation so the common plain-string path stays
+	// alloc-free via the slab. json.Number has no UnmarshalText, so it falls
+	// through to setStringTarget below, whose guard rejects it.
+	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
+		b := make([]byte, n)
+		copy(b, src[:n])
+		_, err := tryTextUnmarshal(v, b)
+		return err
+	}
 	if v.Kind() == reflect.String {
 		return setStringTarget(v, sl.string(src, n), "string")
 	}
-	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
-	// should use their text parsing, not raw byte assignment.
-	b := make([]byte, n)
-	copy(b, src[:n])
-	if ok, err := tryTextUnmarshal(v, b); ok {
-		return err
-	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
+		b := make([]byte, n)
+		copy(b, src[:n])
 		v.SetBytes(b)
 		return nil
 	}

@@ -993,6 +993,8 @@ type primFastInfo struct {
 	deserArrayIfaceLoop func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error)
 	deserMapBlock       func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
 	deserMapIfaceVal    deserIfaceFn
+	deserArrayNative    func(sliceVal reflect.Value, src []byte, start, count int, sl *slab) (bool, []byte, error)
+	deserMapNative      func(mapVal reflect.Value, src []byte, count int, sl *slab) (bool, []byte, error)
 }
 
 var primFast = map[string]primFastInfo{
@@ -1000,31 +1002,37 @@ var primFast = map[string]primFastInfo{
 		reflect.String,
 		func(s *serArray) serfn { return s.serString }, func(s *serMap) serfn { return s.serString },
 		deserArrayStringLoop, deserArrayStringIfaceLoop, deserMapStringBlock, deserStringIface,
+		deserNativeArrayStringLoop, deserNativeMapStringBlock,
 	},
 	"boolean": {
 		reflect.Bool,
 		func(s *serArray) serfn { return s.serBoolean }, func(s *serMap) serfn { return s.serBoolean },
 		deserArrayBooleanLoop, deserArrayBooleanIfaceLoop, deserMapBooleanBlock, deserBooleanIface,
+		deserNativeArrayBooleanLoop, deserNativeMapBooleanBlock,
 	},
 	"int": {
 		reflect.Int32,
 		func(s *serArray) serfn { return s.serInt }, func(s *serMap) serfn { return s.serInt },
 		deserArrayIntLoop, deserArrayIntIfaceLoop, deserMapIntBlock, deserIntIface,
+		deserNativeArrayIntLoop, deserNativeMapIntBlock,
 	},
 	"long": {
 		reflect.Int64,
 		func(s *serArray) serfn { return s.serLong }, func(s *serMap) serfn { return s.serLong },
 		deserArrayLongLoop, deserArrayLongIfaceLoop, deserMapLongBlock, deserLongIface,
+		deserNativeArrayLongLoop, deserNativeMapLongBlock,
 	},
 	"float": {
 		reflect.Float32,
 		func(s *serArray) serfn { return s.serFloat }, func(s *serMap) serfn { return s.serFloat },
 		deserArrayFloatLoop, deserArrayFloatIfaceLoop, deserMapFloatBlock, deserFloatIface,
+		deserNativeArrayFloatLoop, deserNativeMapFloatBlock,
 	},
 	"double": {
 		reflect.Float64,
 		func(s *serArray) serfn { return s.serDouble }, func(s *serMap) serfn { return s.serDouble },
 		deserArrayDoubleLoop, deserArrayDoubleIfaceLoop, deserMapDoubleBlock, deserDoubleIface,
+		deserNativeArrayDoubleLoop, deserNativeMapDoubleBlock,
 	},
 }
 
@@ -2203,6 +2211,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			da.fastLoop = info.deserArrayLoop
 			da.fastElemKind = info.elemKind
 			da.fastIfaceLoop = info.deserArrayIfaceLoop
+			da.nativeLoop = info.deserArrayNative
 		} else {
 			b.ser = sa.ser
 		}
@@ -2270,6 +2279,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			dm.fastBlock = info.deserMapBlock
 			dm.fastElemKind = info.elemKind
 			dm.fastIfaceVal = info.deserMapIfaceVal
+			dm.nativeBlock = info.deserMapNative
 		} else {
 			b.ser = sm.ser
 		}
