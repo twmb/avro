@@ -117,8 +117,7 @@ func dedupNamedTypes(v any, defined map[string]string) any {
 	case map[string]any:
 		// Is this a named type definition?
 		if name, _ := v["name"].(string); name != "" {
-			switch v["type"] {
-			case "record", "error", "enum", "fixed":
+			if typ, _ := v["type"].(string); isNamedKind(typ) {
 				if prev, exists := defined[name]; exists {
 					cur, _ := json.Marshal(v)
 					if string(cur) == prev {
@@ -622,8 +621,9 @@ type typeAliasResult struct {
 func addTypeAliases(schema any, aliases []string) typeAliasResult {
 	switch s := schema.(type) {
 	case map[string]any:
-		switch s["type"] {
-		case "record", "error", "enum", "fixed":
+		typ, _ := s["type"].(string)
+		switch {
+		case isNamedKind(typ):
 			// The existing aliases come from inferRecord/inferType which
 			// builds the schema as map[string]any with []string values.
 			// This assertion is safe for freshly-inferred schemas.
@@ -631,11 +631,11 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 			s["aliases"] = append(existing, aliases...)
 			name, _ := s["name"].(string)
 			return typeAliasResult{applied: true, refName: name}
-		case "array":
+		case typ == "array":
 			if items, ok := s["items"]; ok {
 				return addTypeAliases(items, aliases)
 			}
-		case "map":
+		case typ == "map":
 			if values, ok := s["values"]; ok {
 				return addTypeAliases(values, aliases)
 			}

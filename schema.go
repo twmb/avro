@@ -851,12 +851,31 @@ type recordFieldFixup struct {
 // path; the only per-container variation is the min-bytes computation,
 // which a closure carries.
 type containerFixup struct {
-	serItem    *serfn       // address of serArray.serItem / serMap.serItem
-	deserItem  *deserfn     // address of deserArray.deserItem / deserMap.deserItem
-	setMinBytes func(int)   // setter for minItemBytes (array) or 1+min (map)
-	nodeChild  **schemaNode // address of arrayNode.items / mapNode.values
-	name       string       // referenced named-type name
-	ctxLabel   string       // "array" or "map" for error messages
+	serItem     *serfn       // address of serArray.serItem / serMap.serItem
+	deserItem   *deserfn     // address of deserArray.deserItem / deserMap.deserItem
+	setMinBytes func(int)    // setter for minItemBytes (array) or 1+min (map)
+	nodeChild   **schemaNode // address of arrayNode.items / mapNode.values
+	name        string       // referenced named-type name
+	ctxLabel    string       // "array" or "map" for error messages
+}
+
+// defaultFixup defers a record field's default-value resolution + encoding
+// to finalize, for a field whose OUTER type resolved at build time but whose
+// type tree contains a forward-referenced descendant (e.g. array<fwd-ref>
+// items, map<fwd-ref> values, or an inline record with a fwd-ref field).
+// encodeDefault recurses into items/values/fields and dereferences each
+// child's kind, so running it at build time against a not-yet-wired child
+// node panics; deferring runs it after every container/field fixup has wired
+// the descendants. The fwd-ref-OUTER case (the whole field type is a bare
+// forward-ref name) is handled by recordFieldFixup instead, which also
+// carries the default and resolves the node by name in finalize.
+type defaultFixup struct {
+	sr         *serRecord
+	dr         *deserRecord
+	nd         *schemaNode
+	idx        int
+	node       *schemaNode // the field's already-built outer node (children wired by other fixups)
+	defaultVal any         // parsed-but-not-yet-coerced JSON default
 }
 
 // captureFwdRef is the shared boilerplate used by every site that might
@@ -902,6 +921,7 @@ type builder struct {
 	mfixups         []metaFixup
 	fieldFixups     []recordFieldFixup
 	containerFixups []containerFixup
+	defaultFixups   []defaultFixup
 
 	meta        fieldMeta
 	canon       aschema
@@ -957,6 +977,7 @@ func (b *builder) unnest(nest *builder) {
 	b.mfixups = append(b.mfixups, nest.mfixups...)
 	b.fieldFixups = append(b.fieldFixups, nest.fieldFixups...)
 	b.containerFixups = append(b.containerFixups, nest.containerFixups...)
+	b.defaultFixups = append(b.defaultFixups, nest.defaultFixups...)
 	if len(nest.custom) > 0 {
 		if b.custom == nil {
 			b.custom = make(map[*schemaNode]*customWiring, len(nest.custom))
@@ -1101,6 +1122,10 @@ func (b *builder) finalize() error {
 		m.meta.serRecord = nt.sr
 		m.meta.deserRecord = nt.dr
 	}
+	// Phase 1: wire every forward-referenced record-field node. Default
+	// ENCODING is deferred to phase 2 below so it runs only after every
+	// field AND container child node is wired — encodeDefault recurses into
+	// a field's child nodes, and a not-yet-wired child would nil-panic.
 	for _, m := range b.fieldFixups {
 		nt := b.named[m.name]
 		if nt == nil {
@@ -1117,19 +1142,8 @@ func (b *builder) finalize() error {
 			m.dr.fields[m.idx].meta.deserRecord = nt.dr
 		}
 		m.nd.fields[m.idx].node = nt.node
-		if m.hasDefault && nt.node != nil {
-			// Now that the forward-ref is resolved, run the same
-			// coerce + validate + convert + encode pipeline the
-			// non-fwd-ref path runs inline at build time.
-			defaultVal := coerceDefault(m.defaultVal, nt.node)
-			if err := applyResolvedDefault(
-				defaultVal, nt.node, m.sr.fields[m.idx].name,
-				&m.dr.fields[m.idx], &m.nd.fields[m.idx], &m.sr.fields[m.idx],
-			); err != nil {
-				return fmt.Errorf("type %q: %w", truncForError(m.name), err)
-			}
-		}
 	}
+	// Phase 1b: wire every forward-referenced array/map container child.
 	for _, m := range b.containerFixups {
 		nt := b.named[m.name]
 		if nt == nil {
@@ -1139,6 +1153,59 @@ func (b *builder) finalize() error {
 		*m.deserItem = nt.deser
 		m.setMinBytes(schemaMinBytes(nt.node))
 		*m.nodeChild = nt.node
+	}
+	// Phase 2 — deferred field defaults, in two passes. encodeDefault fills
+	// an absent nested record field from its resolved f.defaultVal, so every
+	// field's default VALUE must be recorded (phase 2a) before any default's
+	// binary bytes are encoded (phase 2b); otherwise a field default that
+	// nests into a sibling-defaulted record reads a nil f.defaultVal and
+	// mis-encodes. Both deferral kinds participate: fwd-ref-OUTER fields
+	// (recordFieldFixup, node resolved by name) and container/nested fields
+	// whose outer type resolved but whose descendant was a fwd-ref
+	// (defaultFixup, node already known).
+	type pendingDefault struct {
+		node      *schemaNode
+		name      string
+		converted any
+		srf       *serRecordField
+	}
+	var pending []pendingDefault
+	// Phase 2a: resolve + record every deferred default's value.
+	for _, m := range b.fieldFixups {
+		if !m.hasDefault {
+			continue
+		}
+		node := b.named[m.name].node
+		if node == nil {
+			continue
+		}
+		name := m.sr.fields[m.idx].name
+		converted, err := resolveFieldDefaultValue(
+			coerceDefault(m.defaultVal, node), node, name,
+			&m.dr.fields[m.idx], &m.nd.fields[m.idx],
+		)
+		if err != nil {
+			return fmt.Errorf("type %q: %w", truncForError(m.name), err)
+		}
+		pending = append(pending, pendingDefault{node, name, converted, &m.sr.fields[m.idx]})
+	}
+	for _, m := range b.defaultFixups {
+		name := m.sr.fields[m.idx].name
+		converted, err := resolveFieldDefaultValue(
+			coerceDefault(m.defaultVal, m.node), m.node, name,
+			&m.dr.fields[m.idx], &m.nd.fields[m.idx],
+		)
+		if err != nil {
+			return err
+		}
+		pending = append(pending, pendingDefault{m.node, name, converted, &m.sr.fields[m.idx]})
+	}
+	// Phase 2b: encode binary default bytes now that every default value
+	// (inline-built and deferred) is recorded on its field node.
+	for _, p := range pending {
+		if err := encodeFieldDefaultBytes(p.converted, p.node, p.name, p.srf); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1150,12 +1217,10 @@ func (s *aschema) unionTypeName() (string, string, error) {
 	if len(s.union) > 0 {
 		return "union", "", errors.New("unions cannot immediately contain other unions")
 	}
-	switch s.object.Type {
-	case "record", "error", "fixed", "enum":
+	if isNamedKind(s.object.Type) {
 		return s.object.Type, s.object.Name, nil
-	default:
-		return s.object.Type, "", nil
 	}
+	return s.object.Type, "", nil
 }
 
 type unknownPrimitiveError struct{ p string }
@@ -1901,8 +1966,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	}
 	b.canon = aschema{object: canonObj}
 
-	switch o.Type {
-	case "record", "error", "enum", "fixed":
+	if isNamedKind(o.Type) {
 		if err := b.validFullnameErr(o.Name); err != nil {
 			return fmt.Errorf("invalid %s name %q: %w", truncForError(o.Type), truncForError(o.Name), err)
 		}
@@ -1941,7 +2005,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			// Name exists from cache — allow re-registration
 			// (custom types need to re-parse to get fresh wiring).
 		}
-	default:
+	} else {
 		if o.Name != "" || o.Namespace != nil {
 			return errors.New("only record, enum, and fixed can have a name")
 		}
@@ -2066,6 +2130,25 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 					// overwrites defaultVal there.
 					drf.hasDefault = true
 					fn.hasDefault = true
+				} else if nodeAwaitsForwardRef(bf.node) {
+					// The field's outer type resolved at build time, but its
+					// type tree has a forward-referenced descendant (array/map
+					// items/values, or an inline record field) not yet wired.
+					// encodeDefault would dereference the nil child and panic,
+					// so defer the resolve+encode to finalize, after the
+					// container/field fixups wire the descendants. Signal
+					// hasDefault so dispatch knows a default exists; the
+					// deferred pass fills defaultVal/defaultBytes.
+					drf.hasDefault = true
+					fn.hasDefault = true
+					b.defaultFixups = append(b.defaultFixups, defaultFixup{
+						sr:         sr,
+						dr:         dr,
+						nd:         nd,
+						idx:        fieldIdx,
+						node:       bf.node,
+						defaultVal: unmarshalDefault(of.Default),
+					})
 				} else {
 					defaultVal := unmarshalDefault(of.Default)
 					defaultVal = coerceDefault(defaultVal, bf.node)
@@ -2243,12 +2326,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			// depend on the resolved type so the fixup can patch
 			// them once b.named[fwdRefName] becomes available.
 			b.containerFixups = append(b.containerFixups, containerFixup{
-				serItem:    &sa.serItem,
-				deserItem:  &da.deserItem,
+				serItem:     &sa.serItem,
+				deserItem:   &da.deserItem,
 				setMinBytes: func(n int) { da.minItemBytes = n },
-				nodeChild:  &arrayNode.items,
-				name:       fwdRefName,
-				ctxLabel:   "array",
+				nodeChild:   &arrayNode.items,
+				name:        fwdRefName,
+				ctxLabel:    "array",
 			})
 		}
 
@@ -2309,12 +2392,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.node = mapNode
 		if isFwdRef {
 			b.containerFixups = append(b.containerFixups, containerFixup{
-				serItem:    &sm.serItem,
-				deserItem:  &dm.deserItem,
+				serItem:     &sm.serItem,
+				deserItem:   &dm.deserItem,
 				setMinBytes: func(n int) { dm.minEntryBytes = 1 + n },
-				nodeChild:  &mapNode.values,
-				name:       fwdRefName,
-				ctxLabel:   "map",
+				nodeChild:   &mapNode.values,
+				name:        fwdRefName,
+				ctxLabel:    "map",
 			})
 		}
 
@@ -2612,35 +2695,83 @@ func unmarshalDefault(raw json.RawMessage) any {
 	return dv
 }
 
-// applyResolvedDefault runs the validate + convertDefaultBytes +
-// encodeDefault pipeline for a coerced default value against its
-// resolved schemaNode and writes the result into the three
-// field-slot triple (deserRecordField, fieldNode, serRecordField).
-// fieldName is used for error context.
+// nodeAwaitsForwardRef reports whether node has any not-yet-resolved
+// forward-referenced child that encodeDefault would traverse. encodeDefault
+// recurses into items / values / fields / branches and dereferences each
+// child's kind, so a nil child there is a runtime nil-pointer panic, not an
+// error. When this returns true at build time, the caller must defer the
+// whole resolve+encode-default pipeline to finalize (after the container /
+// field fixups have wired the descendants) rather than run it inline.
 //
-// Shared by the build-time non-fwd-ref path and the finalize-time
-// fwd-ref fixup path so the pipeline lives in one place. Both call
-// sites coerce against their respective schemaNode (build-time
-// against bf.node, finalize-time against the now-resolved nt.node)
-// before delegating here.
+// Cycle-safe via a seen set: a back-edge to an already-built node (recursive
+// schema) is a wired pointer, not nil, so it is not a pending forward ref.
+func nodeAwaitsForwardRef(node *schemaNode) bool {
+	return nodeAwaitsForwardRefSeen(node, map[*schemaNode]struct{}{})
+}
+
+func nodeAwaitsForwardRefSeen(node *schemaNode, seen map[*schemaNode]struct{}) bool {
+	if node == nil {
+		return true
+	}
+	if _, ok := seen[node]; ok {
+		return false
+	}
+	seen[node] = struct{}{}
+	switch node.kind {
+	case "array":
+		return nodeAwaitsForwardRefSeen(node.items, seen)
+	case "map":
+		return nodeAwaitsForwardRefSeen(node.values, seen)
+	case "record", "error":
+		for i := range node.fields {
+			if nodeAwaitsForwardRefSeen(node.fields[i].node, seen) {
+				return true
+			}
+		}
+	case "union":
+		for _, b := range node.branches {
+			if nodeAwaitsForwardRefSeen(b, seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// resolveFieldDefaultValue runs the validate + convertDefaultBytes half of
+// the default pipeline against a coerced default value and its resolved
+// schemaNode, recording the (converted) default on the deser/field metadata.
+// It deliberately does NOT encode the binary defaultBytes — that is
+// [encodeFieldDefaultBytes], which must run only after every field's default
+// VALUE is recorded, because encodeDefault fills absent nested record fields
+// from their f.defaultVal. Returns the converted value for the caller to hand
+// to encodeFieldDefaultBytes.
 //
-// convertDefaultBytes maps bytes/fixed string defaults to []byte so
-// the JSON encoder sees the wire form directly and its
-// logical-type-aware arms can't misinterpret the string as
-// decimal / UUID / etc. Walks the resolved schemaNode tree (not the
-// aschema canon) so name-references — forward and backward —
-// follow into the real type.
-func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
-	drf *deserRecordField, fn *fieldNode, srf *serRecordField,
-) error {
+// convertDefaultBytes maps bytes/fixed string defaults to []byte so the JSON
+// encoder sees the wire form directly and its logical-type-aware arms can't
+// misinterpret the string as decimal / UUID / etc. Walks the resolved
+// schemaNode tree (not the aschema canon) so name-references — forward and
+// backward — follow into the real type.
+func resolveFieldDefaultValue(defaultVal any, node *schemaNode, fieldName string,
+	drf *deserRecordField, fn *fieldNode,
+) (any, error) {
 	if err := validateDefault(defaultVal, node); err != nil {
-		return fmt.Errorf("record field %q: invalid default: %v", truncForError(fieldName), err)
+		return nil, fmt.Errorf("record field %q: invalid default: %v", truncForError(fieldName), err)
 	}
 	defaultVal = convertDefaultBytes(defaultVal, node)
 	drf.defaultVal = defaultVal
 	drf.hasDefault = true
 	fn.defaultVal = defaultVal
 	fn.hasDefault = true
+	return defaultVal, nil
+}
+
+// encodeFieldDefaultBytes encodes the (already-resolved) default value into
+// the field's pre-encoded binary defaultBytes. Split from
+// resolveFieldDefaultValue so deferred defaults can resolve every field's
+// VALUE first (encodeDefault reads sibling/nested f.defaultVal for absent
+// fields).
+func encodeFieldDefaultBytes(defaultVal any, node *schemaNode, fieldName string, srf *serRecordField) error {
 	defaultBytes, err := encodeDefault(nil, defaultVal, node)
 	if err != nil {
 		return fmt.Errorf("record field %q: encoding default: %v", truncForError(fieldName), err)
@@ -2648,6 +2779,27 @@ func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
 	srf.defaultBytes = defaultBytes
 	srf.hasDefault = true
 	return nil
+}
+
+// applyResolvedDefault runs the full validate + convertDefaultBytes +
+// encodeDefault pipeline for a coerced default value against its resolved
+// schemaNode, writing the result into the three field-slot triple
+// (deserRecordField, fieldNode, serRecordField). fieldName is used for error
+// context.
+//
+// Used by the build-time path for fields whose type tree is fully resolved
+// (no pending forward reference — [nodeAwaitsForwardRef] is false). Fields
+// with an unresolved forward-referenced descendant defer to finalize via the
+// split resolveFieldDefaultValue / encodeFieldDefaultBytes pair so encodeDefault
+// never dereferences a not-yet-wired child node.
+func applyResolvedDefault(defaultVal any, node *schemaNode, fieldName string,
+	drf *deserRecordField, fn *fieldNode, srf *serRecordField,
+) error {
+	converted, err := resolveFieldDefaultValue(defaultVal, node, fieldName, drf, fn)
+	if err != nil {
+		return err
+	}
+	return encodeFieldDefaultBytes(converted, node, fieldName, srf)
 }
 
 // unmarshalAnyPreservePrecision parses raw JSON into a Go value with the

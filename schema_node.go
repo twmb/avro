@@ -295,11 +295,8 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 		// return nil-stable JSON in the bare walker (snapshot/equality
 		// comparison stays meaningful: two equal cyclic subtrees
 		// produce the same partial JSON).
-		switch n.Type {
-		case "record", "error", "enum", "fixed":
-			if n.Name != "" {
-				return n.Name
-			}
+		if isNamedKind(n.Type) && n.Name != "" {
+			return n.Name
 		}
 		if d != nil && d.err == nil {
 			d.err = fmt.Errorf("avro: cyclic SchemaNode detected")
@@ -311,18 +308,13 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 
 	// Dedup: named types that have already been emitted become name refs;
 	// a redefinition with a different body is reported as a conflict.
-	if d != nil {
-		switch n.Type {
-		case "record", "error", "enum", "fixed":
-			if n.Name != "" {
-				if prev, exists := d.defined[n.Name]; exists {
-					cur, _ := json.Marshal(n.toJSON())
-					if string(cur) != prev && d.err == nil {
-						d.err = fmt.Errorf("avro: conflicting definitions for named type %q", truncForError(n.Name))
-					}
-					return n.Name
-				}
+	if d != nil && isNamedKind(n.Type) && n.Name != "" {
+		if prev, exists := d.defined[n.Name]; exists {
+			cur, _ := json.Marshal(n.toJSON())
+			if string(cur) != prev && d.err == nil {
+				d.err = fmt.Errorf("avro: conflicting definitions for named type %q", truncForError(n.Name))
 			}
+			return n.Name
 		}
 	}
 
@@ -340,7 +332,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 	}
 
 	if n.Name == "" && n.Type != "array" && n.Type != "map" &&
-		n.Type != "record" && n.Type != "error" && n.Type != "enum" && n.Type != "fixed" &&
+		!isNamedKind(n.Type) &&
 		n.Type != "union" && n.LogicalType == "" && len(n.Props) == 0 {
 		return n.Type
 	}
@@ -348,12 +340,9 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 	// Dedup: remember this named type's canonical body for the next
 	// occurrence's conflict check.
 	if d != nil {
-		switch n.Type {
-		case "record", "error", "enum", "fixed":
-			if n.Name != "" {
-				b, _ := json.Marshal(n.toJSON())
-				d.defined[n.Name] = string(b)
-			}
+		if isNamedKind(n.Type) && n.Name != "" {
+			b, _ := json.Marshal(n.toJSON())
+			d.defined[n.Name] = string(b)
 		}
 	}
 
@@ -571,6 +560,16 @@ func isRecordKind(typ string) bool {
 	return typ == "record" || typ == "error"
 }
 
+// isNamedKind reports whether typ is one of the four Avro named-type kinds
+// (record / error / enum / fixed) — the set that carries a Name and can be
+// referenced, deduped, and aliased. "error" is the record alias and must
+// always travel with "record" here. Centralizes the four-element set so the
+// many dedup / name-validation / alias call sites can't drift (the named-type
+// analogue of [isRecordKind]).
+func isNamedKind(typ string) bool {
+	return typ == "record" || typ == "error" || typ == "enum" || typ == "fixed"
+}
+
 // coerceMetadataDefault is the metadata-API parallel of [coerceDefault]
 // (schema.go). It transforms a parsed-JSON default value into the
 // canonical Go form the wire-encode pipeline materializes for that
@@ -625,6 +624,18 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 		return coerceMetadataDefault(val, resolved, table)
 	}
 	if t.Type == "union" {
+		// Best-effort first pass (table == nil): name-referenced branches
+		// can't be resolved yet, so a greedy earlier branch (e.g. a bytes
+		// branch accepting a string) would destructively coerce the value
+		// (string to []byte) and lock out the correct name-ref branch (e.g.
+		// an enum) that the table-populated pass would have picked — the
+		// enum arm only accepts a string, never a []byte, so the value can
+		// never be reclaimed. Defer ALL union branch selection to
+		// coerceTreeDefaults, which runs with the name table populated
+		// (Schema.Root); leave the raw value untouched here.
+		if table == nil {
+			return val
+		}
 		// Pick the FIRST branch that accepts val's Go type — matches
 		// the wire-encode pipeline's coerceDefault (which uses
 		// validateDefault for branch selection) and Java's Schema.
