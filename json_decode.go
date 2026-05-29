@@ -22,18 +22,32 @@ func decodeLogicalInt(val int32, node *schemaNode) any {
 	return val
 }
 
+// timestampToTimeConv returns the wire-int64 → time.Time converter for the
+// six long-typed timestamp logical names (local-* shares its non-local
+// converter), or (nil, false) for any other logical. Single source for the
+// name→converter mapping that decodeLogicalLong and decodeLong's three target
+// arms (any / time.Time / string) all share, so adding or changing a timestamp
+// logical can't silently update only some of them.
+func timestampToTimeConv(logical string) (func(int64) time.Time, bool) {
+	switch logical {
+	case "timestamp-millis", "local-timestamp-millis":
+		return timestampMillisToTime, true
+	case "timestamp-micros", "local-timestamp-micros":
+		return timestampMicrosToTime, true
+	case "timestamp-nanos", "local-timestamp-nanos":
+		return timestampNanosToTime, true
+	}
+	return nil, false
+}
+
 // decodeLogicalLong applies logical type conversion for long-backed logical types
 // when decoding to *any targets. Returns an error only for time-micros when
 // val * time.Microsecond would wrap; the timestamp conversions are total.
 func decodeLogicalLong(val int64, node *schemaNode) (any, error) {
-	switch node.logical {
-	case "timestamp-millis", "local-timestamp-millis":
-		return timestampMillisToTime(val), nil
-	case "timestamp-micros", "local-timestamp-micros":
-		return timestampMicrosToTime(val), nil
-	case "timestamp-nanos", "local-timestamp-nanos":
-		return timestampNanosToTime(val), nil
-	case "time-micros":
+	if conv, ok := timestampToTimeConv(node.logical); ok {
+		return conv(val), nil
+	}
+	if node.logical == "time-micros" {
 		return timeMicrosToDuration(val)
 	}
 	return val, nil
@@ -297,17 +311,11 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 	// All DecodeJSON entry points produce addressable values (see decodeInt).
 	if v.Type() == timeType {
 		p := (*time.Time)(v.Addr().UnsafePointer())
-		switch node.logical {
-		case "timestamp-millis", "local-timestamp-millis":
-			*p = timestampMillisToTime(val)
+		if conv, ok := timestampToTimeConv(node.logical); ok {
+			*p = conv(val)
 			return nil
-		case "timestamp-micros", "local-timestamp-micros":
-			*p = timestampMicrosToTime(val)
-			return nil
-		case "timestamp-nanos", "local-timestamp-nanos":
-			*p = timestampNanosToTime(val)
-			return nil
-		case "time-micros":
+		}
+		if node.logical == "time-micros" {
 			// Mirrors serTimeMicros's timeType arm.
 			d, err := timeMicrosToDuration(val)
 			if err != nil {
@@ -331,18 +339,11 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 	// binary side. json.Number is excluded by formatToStringKindTarget;
 	// falls through to setLongValue's json.Number arm for the raw integer
 	// wire value (same routing as the time-micros / time-millis logicals).
-	var t time.Time
-	switch node.logical {
-	case "timestamp-millis", "local-timestamp-millis":
-		t = timestampMillisToTime(val)
-	case "timestamp-micros", "local-timestamp-micros":
-		t = timestampMicrosToTime(val)
-	case "timestamp-nanos", "local-timestamp-nanos":
-		t = timestampNanosToTime(val)
-	default:
+	conv, ok := timestampToTimeConv(node.logical)
+	if !ok {
 		return setLongValue(v, val)
 	}
-	if wrote, err := formatToStringKindTarget(v, t.Format(time.RFC3339Nano), "long"); wrote {
+	if wrote, err := formatToStringKindTarget(v, conv(val).Format(time.RFC3339Nano), "long"); wrote {
 		return err
 	}
 	return setLongValue(v, val)
@@ -882,6 +883,7 @@ func jsonReadInt64(c *jsonDecoder) (int64, error) {
 	}
 	return parseJSONInt64(nb)
 }
+
 // jsonReadInt is only reached when int is 64-bit (its callers gate on
 // strconv.IntSize == 64), so int(n) is a lossless identity there. On 32-bit
 // the long→int native arms fall back to the overflow-checked reflect path.

@@ -15,12 +15,24 @@ func skipNull(src []byte, _ *slab) ([]byte, error) {
 	return src, nil
 }
 
+// needLen reports a ShortBufferError when src is too short to read n bytes.
+// Single constructor of the fixed-size {Type + Need + Have} short-buffer
+// shape so every fixed-length read/skip agrees on it (skip paths via
+// skipBytesN; decode paths — deserFixed, deserDuration, deserFixedDecimal,
+// deserFixedUUIDReflect, udDuration, readFixedUUID — call it directly).
+func needLen(src []byte, n int, typ string) error {
+	if len(src) < n {
+		return &ShortBufferError{Type: typ, Need: n, Have: len(src)}
+	}
+	return nil
+}
+
 // skipBytesN advances past n bytes (boolean/float/double/fixed). One
 // helper for every fixed-size skip so they agree on the ShortBufferError
 // shape (Type + Need + Have, rather than the prior boolean-only Type form).
 func skipBytesN(src []byte, n int, typ string) ([]byte, error) {
-	if len(src) < n {
-		return nil, &ShortBufferError{Type: typ, Need: n, Have: len(src)}
+	if err := needLen(src, n, typ); err != nil {
+		return nil, err
 	}
 	return src[n:], nil
 }

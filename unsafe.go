@@ -822,8 +822,8 @@ func usDuration(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 }
 
 func udDuration(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	if len(src) < 12 {
-		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
+	if err := needLen(src, 12, "duration"); err != nil {
+		return nil, err
 	}
 	*(*Duration)(p) = DurationFromBytes(src[:12])
 	return src[12:], nil
@@ -851,8 +851,8 @@ func udUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 // plus the advanced source slice. Shared body of udFixedUUID (writes
 // [16]byte) and udFixedUUIDString (writes the canonical string form).
 func readFixedUUID(src []byte) ([16]byte, []byte, error) {
-	if len(src) < 16 {
-		return [16]byte{}, nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	if err := needLen(src, 16, "uuid"); err != nil {
+		return [16]byte{}, nil, err
 	}
 	return [16]byte(src[:16]), src[16:], nil
 }

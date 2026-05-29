@@ -600,8 +600,8 @@ func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 }
 
 type deserArray struct {
-	deserItem    deserfn
-	fastLoop     func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error)
+	deserItem deserfn
+	fastLoop  func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error)
 	// nativeLoop decodes one block straight into the concrete Go slice
 	// (s[i]=v) when its dynamic type is exactly []V; returns handled=false
 	// for named slice/elem types, which fall back to fastLoop.
@@ -1136,8 +1136,8 @@ var (
 )
 
 type deserMap struct {
-	deserItem    deserfn
-	fastBlock    func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
+	deserItem deserfn
+	fastBlock func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
 	// nativeBlock decodes one block straight into the concrete Go map
 	// (m[k]=v) when its dynamic type is exactly map[string]V; returns
 	// handled=false for named map types, which fall back to fastBlock.
@@ -1518,8 +1518,8 @@ func ifaceFnForKind(kind string) deserIfaceFn { return deserIfaceFnByKind[kind] 
 // [16]byte; into [16]byte it copies the raw bytes; into string it
 // formats a hex-dash UUID string; into []byte it falls back to raw bytes.
 func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	if len(src) < 16 {
-		return nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	if err := needLen(src, 16, "uuid"); err != nil {
+		return nil, err
 	}
 	b := [16]byte(src[:16])
 	v = indirectAlloc(v)
@@ -1563,8 +1563,8 @@ type deserFixed struct {
 }
 
 func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	if len(src) < s.n {
-		return nil, &ShortBufferError{Type: "fixed", Need: s.n, Have: len(src)}
+	if err := needLen(src, s.n, "fixed"); err != nil {
+		return nil, err
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
@@ -2003,8 +2003,8 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 }
 
 func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	if len(src) < 12 {
-		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
+	if err := needLen(src, 12, "duration"); err != nil {
+		return nil, err
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
@@ -2170,8 +2170,8 @@ type deserFixedDecimal struct {
 }
 
 func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	if len(src) < s.size {
-		return nil, &ShortBufferError{Type: "decimal", Need: s.size, Have: len(src)}
+	if err := needLen(src, s.size, "decimal"); err != nil {
+		return nil, err
 	}
 	b := src[:s.size]
 	src = src[s.size:]
