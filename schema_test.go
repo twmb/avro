@@ -77,6 +77,88 @@ func TestCanonicalStripsLogicalType(t *testing.T) {
 	}
 }
 
+// The PCF [PRIMITIVES] rule ("convert {"type":"X"} to X") and [STRIP] rule
+// (keep only type/name/fields/symbols/items/values/size) apply recursively
+// inside array items and map values, exactly as they do at the top level,
+// in record fields, and in union branches. Java's SchemaNormalization.build
+// recurses into getElementType()/getValueType(); fastavro's
+// _to_parsing_canonical_form does the same. A schema whose items/values is
+// written in wrapped or attribute-bearing form must canonicalize identically
+// to the same schema written in bare form, so the fingerprint (and thus
+// Single Object Encoding framing) matches every other implementation.
+func TestCanonicalNormalizesArrayItemsAndMapValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		want   string
+	}{
+		{
+			"array wrapped primitive items",
+			`{"type":"array","items":{"type":"int"}}`,
+			`{"type":"array","items":"int"}`,
+		},
+		{
+			"map wrapped primitive values",
+			`{"type":"map","values":{"type":"int"}}`,
+			`{"type":"map","values":"int"}`,
+		},
+		{
+			"array items strips logicalType",
+			`{"type":"array","items":{"type":"long","logicalType":"timestamp-millis"}}`,
+			`{"type":"array","items":"long"}`,
+		},
+		{
+			"map values strips logicalType",
+			`{"type":"map","values":{"type":"long","logicalType":"timestamp-millis"}}`,
+			`{"type":"map","values":"long"}`,
+		},
+		{
+			"nested array of map of wrapped primitive",
+			`{"type":"array","items":{"type":"map","values":{"type":"string"}}}`,
+			`{"type":"array","items":{"type":"map","values":"string"}}`,
+		},
+		{
+			// Boundary: bare items already equals its canonical child, so
+			// this case is unaffected by the bug and must keep working.
+			"array bare primitive items unchanged",
+			`{"type":"array","items":"int"}`,
+			`{"type":"array","items":"int"}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(s.Canonical()); got != tt.want {
+				t.Errorf("got  %s\nwant %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// Official Apache Avro schema-tests.txt vector 031:
+//   input { "items":{"type":"null"}, "type":"array"} canonicalizes to
+//   {"type":"array","items":"null"} with CRC-64-AVRO fingerprint
+//   -589620603366471059 (Java signed-int64). The fingerprint can only match
+//   when array items are canonicalized per [PRIMITIVES].
+func TestFingerprintArrayItemsMatchesSpecVector(t *testing.T) {
+	s, err := Parse(`{ "items":{"type":"null"}, "type":"array"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(s.Canonical()); got != `{"type":"array","items":"null"}` {
+		t.Fatalf("canonical: got %s", got)
+	}
+	h := NewRabin()
+	s.Fingerprint(h)
+	var javaFP int64 = -589620603366471059 // spec vector 031, signed int64
+	if got := h.Sum64(); got != uint64(javaFP) {
+		t.Errorf("Sum64 = %d, want %d (spec vector 031)", got, uint64(javaFP))
+	}
+}
+
 func TestFingerprint(t *testing.T) {
 	s, err := Parse(`"int"`)
 	if err != nil {

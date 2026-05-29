@@ -2195,6 +2195,16 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			af.canon = aschema{primitive: fwdRefName}
 		}
 		o.Items = &af.canon
+		// canonObj captured o.Items by value before this recursion ran, so
+		// it still points at the as-parsed (possibly {"type":"X"}-wrapped or
+		// attribute-bearing) items schema. Repoint it at the canonicalized
+		// child so the Parsing Canonical Form's [PRIMITIVES] and [STRIP]
+		// rules apply inside array items, matching Java's
+		// SchemaNormalization.build (which recurses into getElementType) and
+		// every other top-level/field/branch site that already uses the
+		// child's canon. Record fields stay correct via the o.Fields slice
+		// alias; only the Items/Values pointer fields need the explicit sync.
+		canonObj.Items = &af.canon
 		sa := &serArray{serItem: af.ser}
 		da := &deserArray{deserItem: af.deser, minItemBytes: schemaMinBytes(af.node)}
 		// Specialized array ser/deser fast paths bypass the inner
@@ -2262,6 +2272,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			mf.canon = aschema{primitive: fwdRefName}
 		}
 		o.Values = &mf.canon
+		// See the array case above: canonObj.Values still points at the
+		// as-parsed values schema, so repoint it at the canonicalized child
+		// or the canonical form (and fingerprint) diverges for any
+		// map-of-wrapped-or-attribute-bearing-value schema.
+		canonObj.Values = &mf.canon
 		sm := &serMap{serItem: mf.ser}
 		// minEntryBytes = 1 (empty-key length varint) + values' minimum
 		// wire bytes. Matches deserArray.minItemBytes in spirit; bounds
