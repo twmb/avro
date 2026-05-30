@@ -1708,21 +1708,40 @@ func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error 
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("non-finite %g into integer target", f)}
 		}
-		if f != float64(int64(f)) {
+		if f != math.Trunc(f) {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("non-whole %g into integer target", f)}
 		}
-		n := int64(f)
+		// Bound in float space BEFORE the int64/uint64 conversion. Go's
+		// float->integer conversion is implementation-defined on overflow
+		// (spec: "the result value is implementation-dependent"), so a
+		// round-trip check via float64(int64(f)) is platform-dependent: on
+		// saturating-conversion platforms (arm64) it silently accepts the
+		// out-of-range whole float 2^63 and stores int64(2^63-1). Mirror the
+		// encode-side floatFitsInt64, which checks the representable bound in
+		// float space and rejects out-of-range whole floats on every platform.
 		if v.CanInt() {
+			if f < -(1<<63) || f >= (1<<63) {
+				return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %g overflows %s", f, v.Type())}
+			}
+			n := int64(f)
 			if v.OverflowInt(n) {
 				return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", n, v.Type())}
 			}
 			v.SetInt(n)
 			return nil
 		}
-		if n < 0 || v.OverflowUint(uint64(n)) {
+		// Unsigned target: uint64(f) is well-defined for f in [0, 2^64) on
+		// every platform. The full uint64 range is supported — the prior
+		// int64 intermediate could not represent [2^63, 2^64), the upper half
+		// of uint64, and silently corrupted or rejected those values.
+		if f < 0 || f >= (1<<64) {
+			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %g overflows %s", f, v.Type())}
+		}
+		n := uint64(f)
+		if v.OverflowUint(n) {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", n, v.Type())}
 		}
-		v.SetUint(uint64(n))
+		v.SetUint(n)
 		return nil
 	}
 	if v.Type() == jsonNumberType {

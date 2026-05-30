@@ -13523,3 +13523,167 @@ func TestRegression_SerTimeMicrosAcceptsTime(t *testing.T) {
 		t.Fatalf("json wire: got %s, want %s", gotJSON, wantJSON)
 	}
 }
+
+// TestRegression_FloatDecodeIntegerOverflowBoundary pins that decoding a
+// float/double wire value into an integer Go target performs its out-of-range
+// check in float space (like the encode-side floatFitsInt64), not via the
+// platform-dependent int64(f) round trip. Go's float->int conversion is
+// implementation-defined on overflow (spec: "the result value is
+// implementation-dependent"), so a `f != float64(int64(f))` check gives
+// different answers per platform for |f| >= 2^63. On saturating-conversion
+// platforms (arm64) it silently accepts the double 2^63 (= MaxInt64+1) and
+// stores int64(2^63-1) -- an off-by-one corruption of a value that is out of
+// int64 range and must be rejected, exactly as the encode side rejects
+// float64(2^63) against a long schema.
+func TestRegression_FloatDecodeIntegerOverflowBoundary(t *testing.T) {
+	doubleWire := func(f float64) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, math.Float64bits(f))
+		return b
+	}
+	floatWire := func(f float32) []byte {
+		b := make([]byte, 4)
+		binary.LittleEndian.PutUint32(b, math.Float32bits(f))
+		return b
+	}
+	twoTo63 := float64(uint64(1) << 63) // 2^63 = MaxInt64+1, exact in float32 and float64
+
+	dbl := MustParse(`"double"`)
+	flt := MustParse(`"float"`)
+
+	t.Run("binary double 2^63 into int64 rejects", func(t *testing.T) {
+		var n int64
+		if _, err := dbl.Decode(doubleWire(twoTo63), &n); err == nil {
+			t.Fatalf("want reject (out of int64 range), got n=%d", n)
+		}
+	})
+	t.Run("binary float 2^63 into int64 rejects", func(t *testing.T) {
+		var n int64
+		if _, err := flt.Decode(floatWire(float32(twoTo63)), &n); err == nil {
+			t.Fatalf("want reject (out of int64 range), got n=%d", n)
+		}
+	})
+	t.Run("json double 2^63 into int64 rejects", func(t *testing.T) {
+		var n int64
+		if err := dbl.DecodeJSON([]byte("9223372036854775808"), &n); err == nil {
+			t.Fatalf("want reject (out of int64 range), got n=%d", n)
+		}
+	})
+	t.Run("binary double 2^63 into uint64 yields 2^63", func(t *testing.T) {
+		// 2^63 is a valid uint64; the encode side accepts uint64(2^63)->double,
+		// so decode must round-trip it (never the silent off-by-one 2^63-1).
+		var u uint64
+		if _, err := dbl.Decode(doubleWire(twoTo63), &u); err != nil {
+			t.Fatalf("want accept, got err=%v", err)
+		}
+		if u != uint64(1)<<63 {
+			t.Fatalf("got %d, want %d", u, uint64(1)<<63)
+		}
+	})
+	t.Run("encode-decode symmetry at 2^63", func(t *testing.T) {
+		// The encode side already rejects float64(2^63) against an exact int
+		// schema (floatFitsInt64, float-space bound) and accepts it against a
+		// lossy double schema. Decode must mirror that boundary: reject into
+		// int64, accept into double. Locking both directions documents the
+		// encode<->decode parity at the exact MaxInt64+1 boundary.
+		long := MustParse(`"long"`)
+		if _, err := long.Encode(twoTo63); err == nil {
+			t.Fatalf("encode float64(2^63) into long: want reject")
+		}
+		if _, err := dbl.Encode(twoTo63); err != nil {
+			t.Fatalf("encode float64(2^63) into double: want accept, got %v", err)
+		}
+	})
+}
+
+// TestRegression_FloatDecodeIntegerTargetMatrix exercises the float/double ->
+// integer-target decode arm (setFloatValue) across every integer width and at
+// each type's overflow boundary, including the int64/uint64 boundary the
+// platform-dependent conversion hid. Boundary-minus-one values must still
+// decode; boundary-plus-one must reject; non-whole and non-finite values must
+// reject for every integer target. The full uint64 range [0, 2^64) is decodable
+// (the int64 intermediate previously could not represent [2^63, 2^64)).
+func TestRegression_FloatDecodeIntegerTargetMatrix(t *testing.T) {
+	doubleWire := func(f float64) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint64(b, math.Float64bits(f))
+		return b
+	}
+	dbl := MustParse(`"double"`)
+
+	checkS := func(name string, target any, f float64, wantOK bool, want int64) {
+		t.Run(name, func(t *testing.T) {
+			_, err := dbl.Decode(doubleWire(f), target)
+			ev := reflect.ValueOf(target).Elem()
+			if !wantOK {
+				if err == nil {
+					t.Fatalf("f=%g into %s: want reject, got %v", f, ev.Type(), ev)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("f=%g into %s: want accept, got err=%v", f, ev.Type(), err)
+			}
+			if ev.Int() != want {
+				t.Fatalf("f=%g into %s: got %d, want %d", f, ev.Type(), ev.Int(), want)
+			}
+		})
+	}
+	checkU := func(name string, target any, f float64, wantOK bool, want uint64) {
+		t.Run(name, func(t *testing.T) {
+			_, err := dbl.Decode(doubleWire(f), target)
+			ev := reflect.ValueOf(target).Elem()
+			if !wantOK {
+				if err == nil {
+					t.Fatalf("f=%g into %s: want reject, got %v", f, ev.Type(), ev)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("f=%g into %s: want accept, got err=%v", f, ev.Type(), err)
+			}
+			if ev.Uint() != want {
+				t.Fatalf("f=%g into %s: got %d, want %d", f, ev.Type(), ev.Uint(), want)
+			}
+		})
+	}
+
+	// Signed widths: boundary, boundary+1 (reject), -boundary, -boundary-1 (reject).
+	checkS("int8 max", new(int8), 127, true, 127)
+	checkS("int8 max+1", new(int8), 128, false, 0)
+	checkS("int8 min", new(int8), -128, true, -128)
+	checkS("int8 min-1", new(int8), -129, false, 0)
+	checkS("int16 max", new(int16), 32767, true, 32767)
+	checkS("int16 max+1", new(int16), 32768, false, 0)
+	checkS("int16 min-1", new(int16), -32769, false, 0)
+	checkS("int32 max", new(int32), 2147483647, true, 2147483647)
+	checkS("int32 max+1", new(int32), 2147483648, false, 0)
+	checkS("int32 min-1", new(int32), -2147483649, false, 0)
+	checkS("int64 2^53", new(int64), 1<<53, true, 1<<53)
+	checkS("int64 2^62", new(int64), 1<<62, true, 1<<62)
+	checkS("int64 MinInt64", new(int64), float64(math.MinInt64), true, math.MinInt64)
+	checkS("int64 MaxInt64+1 (2^63)", new(int64), float64(uint64(1)<<63), false, 0)
+	checkS("int (platform) 2^63 rejects", new(int), float64(uint64(1)<<63), false, 0)
+
+	// Unsigned widths.
+	checkU("uint8 max", new(uint8), 255, true, 255)
+	checkU("uint8 max+1", new(uint8), 256, false, 0)
+	checkU("uint8 neg", new(uint8), -1, false, 0)
+	checkU("uint8 non-whole", new(uint8), 2.5, false, 0)
+	checkU("uint16 max", new(uint16), 65535, true, 65535)
+	checkU("uint16 max+1", new(uint16), 65536, false, 0)
+	checkU("uint32 max", new(uint32), 4294967295, true, 4294967295)
+	checkU("uint32 max+1", new(uint32), 4294967296, false, 0)
+	checkU("uint64 2^63", new(uint64), float64(uint64(1)<<63), true, uint64(1)<<63)
+	checkU("uint64 2^63+2^53", new(uint64), float64(uint64(1)<<63+uint64(1)<<53), true, uint64(1)<<63+uint64(1)<<53)
+	checkU("uint64 2^64 overflow", new(uint64), float64(uint64(1)<<63)*2, false, 0)
+	checkU("uint64 neg", new(uint64), -1, false, 0)
+
+	// Non-whole / non-finite into integer targets reject regardless of width.
+	checkS("int64 non-whole", new(int64), 1.5, false, 0)
+	checkS("int64 NaN", new(int64), math.NaN(), false, 0)
+	checkS("int64 +Inf", new(int64), math.Inf(1), false, 0)
+	checkS("int64 -Inf", new(int64), math.Inf(-1), false, 0)
+	checkU("uint64 NaN", new(uint64), math.NaN(), false, 0)
+	checkU("uint64 +Inf", new(uint64), math.Inf(1), false, 0)
+}
