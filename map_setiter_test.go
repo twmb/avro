@@ -309,6 +309,40 @@ func TestRegression_Float32SignalingNaNPreserved(t *testing.T) {
 	if got := math.Float32bits(anyV.(float32)); got != bits {
 		t.Fatalf("interface decode quieted: got %08x want %08x", got, bits)
 	}
+
+	// Named float32 (fpFloat32): a non-addressable scalar encode hits
+	// float32WireBits's typedmemmove-into-temp branch — distinct from the
+	// builtin-float32 Interface() branch and the unsafe-addressable branch
+	// exercised above, and the only float32 path the rest of this test (and
+	// TestRegression_MapValueSwitchMatchesGeneral, which uses an addressable
+	// map elem) does not reach with a payload. Scalar decode and the
+	// []fpFloat32 reflect loop must preserve the raw bits too.
+	fltS := MustParse(`"float"`)
+	nb, err := fltS.Encode(fpFloat32(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(nb, wire) {
+		t.Fatalf("named float32 scalar encode quieted sNaN: got % x want % x", nb, wire)
+	}
+	var nf fpFloat32
+	if _, err := fltS.Decode(wire, &nf); err != nil {
+		t.Fatal(err)
+	}
+	if got := math.Float32bits(float32(nf)); got != bits {
+		t.Fatalf("named float32 scalar decode quieted: got %08x want %08x", got, bits)
+	}
+	nab, _ := arrS.Encode([]fpFloat32{fpFloat32(f)})
+	if !bytes.Contains(nab, wire) {
+		t.Fatalf("named []fpFloat32 encode quieted sNaN: % x", nab)
+	}
+	var na []fpFloat32
+	if _, err := arrS.Decode(nab, &na); err != nil {
+		t.Fatal(err)
+	}
+	if got := math.Float32bits(float32(na[0])); got != bits {
+		t.Fatalf("named []fpFloat32 decode quieted: got %08x want %08x", got, bits)
+	}
 }
 
 // JSON array encode native must be byte-identical to the reflect path.
