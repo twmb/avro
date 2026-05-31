@@ -440,6 +440,17 @@ func splitTag(tag string) ([]string, error) {
 			if len(stack) == 0 {
 				parts = append(parts, tag[start:i])
 				start = i + 1
+				// default= consumes the rest of the tag verbatim — its
+				// value may be an arbitrary string containing unbalanced
+				// brackets/parens (e.g. `default=note (a`) or commas. Stop
+				// splitting and bracket-checking at this boundary so the
+				// value is preserved rather than rejected as an "unclosed
+				// (". parseSchemaTag's default= arm already documents that
+				// it takes the rest of the tag as the last option.
+				if strings.HasPrefix(tag[start:], "default=") {
+					parts = append(parts, tag[start:])
+					return parts, nil
+				}
 			}
 		}
 	}
@@ -591,6 +602,17 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string, c
 			v = raw
 		}
 		fieldDef["default"] = v
+		// A narrow Go integer kind maps to a WIDER Avro type (int8/16 and
+		// uint8/16 → int; uint32 / uint → long), so a default that is a
+		// valid Avro int/long but exceeds the Go field's range builds a
+		// schema whose own default cannot be materialized back into the
+		// field at decode-fill time. Reject it here for consistency with
+		// the other Go-type/tag compatibility checks (uuid-on-wrong-kind,
+		// etc.) rather than deferring to a decode-time error far from the
+		// SchemaFor call.
+		if err := checkIntDefaultFitsGoKind(v, f.goType); err != nil {
+			return nil, fmt.Errorf("default for field %q: %w", f.name, err)
+		}
 	} else if union, ok := schema.([]any); ok && len(union) > 0 && union[0] == "null" {
 		// Null-first unions (from *T or CustomType) default to null so
 		// the field is backward-compatible (readers can read data written
@@ -598,6 +620,46 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string, c
 		fieldDef["default"] = nil
 	}
 	return fieldDef, nil
+}
+
+// checkIntDefaultFitsGoKind verifies a numeric default fits the Go field's
+// integer kind. It runs only when the Go field (after peeling pointers) is
+// an integer kind; non-integer defaults and non-integer fields return nil
+// and leave type compatibility to Parse's Avro-type validation.
+//
+// The default's integer value is extracted via defaultAsInt64 — the SAME
+// lenient parser the wire default-fill path uses — so exponent / whole-
+// number-float literals (e.g. "4e3") are caught here exactly as the wire
+// path would catch them at decode time, instead of only the plain-integer
+// forms. A value defaultAsInt64 can't read as an integer (a string,
+// fractional, or > int64 default) is left to Parse, which validates it
+// against the Avro type.
+func checkIntDefaultFitsGoKind(v any, t reflect.Type) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		n, err := defaultAsInt64(v)
+		if err != nil {
+			return nil
+		}
+		if reflect.New(t).Elem().OverflowInt(n) {
+			return fmt.Errorf("value %d overflows %s", n, t)
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		n, err := defaultAsInt64(v)
+		if err != nil {
+			return nil
+		}
+		if n < 0 {
+			return fmt.Errorf("value %d cannot be stored in unsigned %s", n, t)
+		}
+		if reflect.New(t).Elem().OverflowUint(uint64(n)) {
+			return fmt.Errorf("value %d overflows %s", n, t)
+		}
+	}
+	return nil
 }
 
 var avroPrimitives = map[string]bool{
@@ -866,31 +928,48 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 
 	case reflect.Array:
 		if t.Elem().Kind() == reflect.Uint8 {
+			// The Avro name a []byte array gets depends on the uuid tag:
+			// "uuid" (with the logical type) when ,uuid-tagged, otherwise
+			// t.Name() / "fixed_N". So the SAME Go type can legitimately
+			// appear under two different Avro names — e.g. used once
+			// ,uuid-tagged and once plain — which are distinct Avro types
+			// (they differ by logicalType). seen[t] records the name an
+			// earlier occurrence emitted; emit a name reference ONLY when
+			// this occurrence's name matches it. A different-named form of
+			// the same type emits its own full definition. The prior code
+			// returned a reference for ANY repeat occurrence of t without
+			// checking the name, so a uuid-then-plain (or plain-then-uuid)
+			// pair emitted a reference under the WRONG name — a dangling
+			// reference Parse rejects with "unknown type". The name-match
+			// guard keeps the same-form dedup (needed so a later field can
+			// reference an earlier definition that type-alias= mutated)
+			// while letting the two forms each define their own fixed.
+			var name string
+			var def map[string]any
 			if logical == "uuid" && t.Len() == 16 {
-				if _, ok := seen[t]; ok {
-					return "uuid", nil
-				}
-				seen[t] = "uuid"
-				return map[string]any{
+				name = "uuid"
+				def = map[string]any{
 					"type":        "fixed",
 					"name":        "uuid",
 					"size":        16,
 					"logicalType": "uuid",
-				}, nil
+				}
+			} else {
+				name = t.Name()
+				if name == "" {
+					name = fmt.Sprintf("fixed_%d", t.Len())
+				}
+				def = map[string]any{
+					"type": "fixed",
+					"name": name,
+					"size": t.Len(),
+				}
 			}
-			name := t.Name()
-			if name == "" {
-				name = fmt.Sprintf("fixed_%d", t.Len())
-			} else if _, ok := seen[t]; ok {
-				// Named fixed type already defined — emit reference.
+			if prev, ok := seen[t]; ok && prev == name {
 				return name, nil
 			}
 			seen[t] = name
-			return map[string]any{
-				"type": "fixed",
-				"name": name,
-				"size": t.Len(),
-			}, nil
+			return def, nil
 		}
 		return inferArray(t.Elem())
 

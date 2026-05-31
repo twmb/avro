@@ -2772,3 +2772,239 @@ func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
 		}
 	})
 }
+
+// A single Go [N]byte type can be referenced both ,uuid-tagged (Avro
+// fixed(16) + uuid logical, named "uuid") and plain (Avro fixed named after
+// the Go type). Those are distinct Avro types, so SchemaFor must emit a
+// definition for each form rather than a name reference under the other
+// form's name (which would dangle and fail Parse). Both field orders are
+// exercised because the definition/reference bookkeeping is order-sensitive.
+func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
+	type ID [16]byte
+
+	t.Run("uuid then plain round-trips", func(t *testing.T) {
+		type R struct {
+			A ID `avro:"a,uuid"`
+			B ID `avro:"b"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		// Two distinct fixed(16) definitions, not one definition + a
+		// dangling reference.
+		if c := strings.Count(s.String(), `"size":16`); c != 2 {
+			t.Fatalf("want 2 fixed(16) definitions, got %d in %s", c, s.String())
+		}
+		in := R{A: ID{1, 2, 3}, B: ID{4, 5, 6}}
+		data, err := s.Encode(&in)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if got != in {
+			t.Fatalf("round trip: got %+v want %+v", got, in)
+		}
+	})
+
+	t.Run("plain then uuid", func(t *testing.T) {
+		type R struct {
+			B ID `avro:"b"`
+			A ID `avro:"a,uuid"`
+		}
+		if _, err := SchemaFor[R](); err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+	})
+
+	// Boundary: the same type used the SAME way twice still collapses to
+	// one definition plus a name reference (no duplicate-name error).
+	t.Run("both uuid dedups to one definition", func(t *testing.T) {
+		type R struct {
+			A ID `avro:"a,uuid"`
+			B ID `avro:"b,uuid"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if c := strings.Count(s.String(), `"size":16`); c != 1 {
+			t.Fatalf("want 1 fixed(16) definition (rest references), got %d in %s", c, s.String())
+		}
+	})
+}
+
+// default= takes the remainder of the tag verbatim, so a string default
+// whose value contains unbalanced parens/brackets — or commas, or JSON
+// object braces — must be preserved rather than rejected by the tag
+// bracket-balance scan (which exists only for the alias=[...] / decimal(...)
+// option forms).
+func TestRegression_SchemaForDefaultWithBrackets(t *testing.T) {
+	t.Run("unbalanced open paren", func(t *testing.T) {
+		type R struct {
+			X string `avro:"x,default=note (a"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if !strings.Contains(s.String(), "note (a") {
+			t.Fatalf("default not preserved: %s", s.String())
+		}
+	})
+
+	t.Run("unbalanced close bracket", func(t *testing.T) {
+		type R struct {
+			X string `avro:"x,default=a]b"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if !strings.Contains(s.String(), "a]b") {
+			t.Fatalf("default not preserved: %s", s.String())
+		}
+	})
+
+	t.Run("commas in value", func(t *testing.T) {
+		type R struct {
+			X string `avro:"x,default=a,b,c"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if !strings.Contains(s.String(), "a,b,c") {
+			t.Fatalf("default not preserved: %s", s.String())
+		}
+	})
+
+	// Regression guard: a JSON-object default (internal commas + braces)
+	// still survives — default= rejoins everything after it.
+	t.Run("json object default", func(t *testing.T) {
+		type R struct {
+			M map[string]int32 `avro:"m,default={\"a\":1,\"b\":2}"`
+		}
+		if _, err := SchemaFor[R](); err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+	})
+
+	// Boundary: a malformed bracketed NON-default option still errors — the
+	// scan is only suppressed once a segment begins with default=.
+	t.Run("non-default unbalanced bracket still errors", func(t *testing.T) {
+		type R struct {
+			X string `avro:"x,alias=[a,b"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error for unbalanced bracket in alias= option")
+		}
+	})
+}
+
+// A narrow Go integer kind maps to a wider Avro type (int8/16, uint8/16 ->
+// int; uint32, uint -> long), so a default that fits the Avro type but not
+// the Go field would build a schema whose own default overflows the field
+// at decode-fill time. SchemaFor rejects it at build time, consistent with
+// its other Go-type/tag compatibility checks. The default is parsed with
+// the same lenient parser the wire path uses, so exponent / whole-number-
+// float forms are caught too.
+func TestRegression_SchemaForNarrowIntDefaultBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fn     func() (*Schema, error)
+		reject bool
+	}{
+		{"int8 in range", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=5"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"int8 at max", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=127"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"int8 over max", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=128"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"int8 at min", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=-128"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"int8 under min", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=-129"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"int8 far over (valid Avro int)", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=99999"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"int8 exponent form over", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=1e3"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"uint8 at max", func() (*Schema, error) {
+			type R struct {
+				X uint8 `avro:"x,default=255"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"uint8 over max", func() (*Schema, error) {
+			type R struct {
+				X uint8 `avro:"x,default=256"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"uint8 negative", func() (*Schema, error) {
+			type R struct {
+				X uint8 `avro:"x,default=-1"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"uint32 over max (valid Avro long)", func() (*Schema, error) {
+			type R struct {
+				X uint32 `avro:"x,default=4294967296"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"int32 full range ok (no narrowing)", func() (*Schema, error) {
+			type R struct {
+				X int32 `avro:"x,default=2147483647"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"pointer narrow int over", func() (*Schema, error) {
+			type R struct {
+				X *int8 `avro:"x,default=200"`
+			}
+			return SchemaFor[R]()
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if tc.reject && err == nil {
+				t.Fatal("expected SchemaFor to reject out-of-range default")
+			}
+			if !tc.reject && err != nil {
+				t.Fatalf("expected SchemaFor to accept in-range default, got: %v", err)
+			}
+		})
+	}
+}
