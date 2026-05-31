@@ -1432,6 +1432,99 @@ func TestEncodeJSONLinkedinFloats(t *testing.T) {
 	}
 }
 
+// LinkedinFloats encodes NaN as a bare JSON null. Inside a bare (untagged)
+// union a bare null is claimed by the union's null branch — or rejected
+// when the union has none — before the float branch's null→NaN rule runs,
+// so a union-member NaN does not round-trip. This is the inherent
+// ambiguity of the null-for-NaN convention when null is also a structural
+// union value; TaggedUnions disambiguates it. ±Inf encodes as the number
+// token ±1e999 and round-trips in a bare union regardless. This pins the
+// contract documented on LinkedinFloats.
+func TestRegression_LinkedinFloatsNaNUnionAmbiguity(t *testing.T) {
+	nan := float32(math.Float32frombits(0x7fc00000))
+
+	// Bare union WITH a null branch: NaN encodes as null and decodes to the
+	// null branch (nil), not back to NaN.
+	t.Run("bare union with null branch loses NaN to null branch", func(t *testing.T) {
+		s := MustParse(`["null","float"]`)
+		js, err := s.AppendEncodeJSON(nil, nan, LinkedinFloats())
+		if err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		if string(js) != `null` {
+			t.Fatalf("EncodeJSON NaN: got %s, want null", js)
+		}
+		var out any
+		if err := s.DecodeJSON(js, &out, LinkedinFloats()); err != nil {
+			t.Fatalf("DecodeJSON: %v", err)
+		}
+		if out != nil {
+			t.Fatalf("bare-union NaN: got %#v, want nil (null branch)", out)
+		}
+	})
+
+	// Bare union WITHOUT a null branch: NaN still encodes as null, which
+	// the decoder rejects — there is no null branch to receive it.
+	t.Run("bare union without null branch rejects null on decode", func(t *testing.T) {
+		s := MustParse(`["float","string"]`)
+		js, err := s.AppendEncodeJSON(nil, nan, LinkedinFloats())
+		if err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		if string(js) != `null` {
+			t.Fatalf("EncodeJSON NaN: got %s, want null", js)
+		}
+		var out any
+		if err := s.DecodeJSON(js, &out, LinkedinFloats()); err == nil {
+			t.Fatal("DecodeJSON of null into null-less union: want error, got nil")
+		}
+	})
+
+	// TaggedUnions disambiguates: {"float":null} routes the null to the
+	// float branch, which reapplies the null→NaN rule, so NaN round-trips.
+	t.Run("tagged union round-trips NaN", func(t *testing.T) {
+		s := MustParse(`["null","float"]`)
+		js, err := s.AppendEncodeJSON(nil, nan, LinkedinFloats(), TaggedUnions())
+		if err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		if string(js) != `{"float":null}` {
+			t.Fatalf("EncodeJSON NaN tagged: got %s, want {\"float\":null}", js)
+		}
+		var out any
+		if err := s.DecodeJSON(js, &out, LinkedinFloats(), TaggedUnions()); err != nil {
+			t.Fatalf("DecodeJSON: %v", err)
+		}
+		m, ok := out.(map[string]any)
+		if !ok {
+			t.Fatalf("tagged decode: got %T, want map[string]any", out)
+		}
+		if f, ok := m["float"].(float32); !ok || !math.IsNaN(float64(f)) {
+			t.Fatalf("tagged decode: got %#v, want float branch NaN", m)
+		}
+	})
+
+	// ±Inf are number tokens (±1e999), not null, so they round-trip in a
+	// bare union under LinkedinFloats.
+	t.Run("bare union round-trips +Inf", func(t *testing.T) {
+		s := MustParse(`["null","float"]`)
+		js, err := s.AppendEncodeJSON(nil, float32(math.Inf(1)), LinkedinFloats())
+		if err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		if string(js) != `1e999` {
+			t.Fatalf("EncodeJSON +Inf: got %s, want 1e999", js)
+		}
+		var out any
+		if err := s.DecodeJSON(js, &out, LinkedinFloats()); err != nil {
+			t.Fatalf("DecodeJSON: %v", err)
+		}
+		if f, ok := out.(float32); !ok || !math.IsInf(float64(f), 1) {
+			t.Fatalf("bare-union +Inf: got %#v, want float32(+Inf)", out)
+		}
+	})
+}
+
 func TestEncodeJSONTaggedUnions(t *testing.T) {
 	s, err := Parse(`["null","string","int"]`)
 	if err != nil {

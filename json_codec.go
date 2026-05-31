@@ -68,8 +68,18 @@ func (linkedinFloats) opt() {}
 // in [Schema.EncodeJSON], matching the linkedin/goavro convention.
 // Without this option, NaN is encoded as the JSON string "NaN" and
 // ±Infinity as "Infinity"/"-Infinity", following the Java Avro
-// convention. [Schema.DecodeJSON] always accepts
-// both conventions regardless of this option.
+// convention.
+//
+// [Schema.DecodeJSON] accepts both conventions for a float/double decoded
+// directly or as a tagged union branch ({"float":null} → NaN). The one
+// exception is a NaN that is a member of a bare (untagged) union: NaN
+// encodes as a bare null, and on decode a bare null is claimed by the
+// union's null branch — or rejected when the union has none — before the
+// float branch is considered, so the NaN does not round-trip. This is an
+// inherent ambiguity of the null-for-NaN convention when null is also a
+// structural union value; use [TaggedUnions] for a round-trip-safe NaN
+// union member. ±Infinity (±1e999) is a number token and round-trips in a
+// bare union regardless.
 func LinkedinFloats() Opt { return linkedinFloats{} }
 
 type optConfig struct {
