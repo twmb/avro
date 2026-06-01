@@ -9,6 +9,7 @@ on:
     branches: [main]
     paths-ignore:
       - "**.md"
+  workflow_dispatch: {}
 
 jobs:
   test:
@@ -30,3 +31,21 @@ jobs:
             done
           done
           wait
+
+  # Differential testing against fastavro (an independent reference impl).
+  # The fastavro oracle subprocess cross-checks twmb's encode/decode as Avro
+  # bytes; without it TestDifferentialFastavro skips, so the `test` job above
+  # stays meaningful on its own. See CORRECTNESS_PLAN.md §Tier 1.
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install fastavro
+      - name: fastavro differential
+        run: go test -count=1 -run 'TestDifferentialFastavro|TestApacheSchemaTestsVectors' -v .
