@@ -717,7 +717,7 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 			f = float64(val)
 		case string:
 			var err error
-			if f, err = parseFloatAcceptOverflow(val); err != nil {
+			if f, err = parseFloatAcceptOverflow(val, 64); err != nil {
 				return val
 			}
 		case int64, int32, json.Number:

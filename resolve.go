@@ -702,10 +702,9 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 		}
 		branchDesers[i] = resolved.deser
 		// Tag name comes from the READER branch — what the consumer's
-		// schema declares — not the writer's. Sibling resolveReaderUnion
-		// already uses rb here; the prior wb here diverged silently so
-		// a promoted int→long branch decoded with TaggedUnions emitted
-		// {"int": ...} against a reader that knew the field as "long".
+		// schema declares — not the writer's. Otherwise a promoted
+		// int→long branch decoded with TaggedUnions would emit
+		// {"int": ...} against a reader that knows the field as "long".
 		bnames[i], lnames[i] = unionBranchNames(rb)
 	}
 	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}

@@ -122,6 +122,7 @@ func (s *jsonScanner) consumeStringRaw() (start, end int, hasEscapes bool, err e
 	}
 	s.pos++ // skip opening quote
 	start = s.pos
+	sawHighByte := false
 	for s.pos < len(s.data) {
 		b := s.data[s.pos]
 		if b == '\\' {
@@ -135,28 +136,25 @@ func (s *jsonScanner) consumeStringRaw() (start, end int, hasEscapes bool, err e
 		if b == '"' {
 			end = s.pos
 			s.pos++ // skip closing quote
-			// Postel: don't validate UTF-8 here. Some producers emit
-			// raw bytes 0x80-0xff (technically invalid JSON but seen
-			// in real pipelines). The encoder canonicalizes invalid
-			// bytes on output (replacement char), so a round-trip
-			// from non-canonical input lands on canonical output.
+			// RFC 8259: JSON text is UTF-8. Reject literal invalid byte
+			// sequences. Gated by sawHighByte so pure-ASCII content (the
+			// common case) skips the scan; \uXXXX escapes are ASCII here
+			// and resolve to valid runes during walkJSONEscapes.
+			if sawHighByte && !utf8.Valid(s.data[start:end]) {
+				return 0, 0, false, fmt.Errorf("avro json: invalid UTF-8 in string at offset %d", start)
+			}
 			return start, end, hasEscapes, nil
+		}
+		// RFC 8259 §7: control characters U+0000–U+001F must be escaped.
+		if b < 0x20 {
+			return 0, 0, false, fmt.Errorf("avro json: unescaped control character %#x in string at offset %d", b, s.pos)
+		}
+		if b >= 0x80 {
+			sawHighByte = true
 		}
 		s.pos++
 	}
 	return 0, 0, false, fmt.Errorf("avro json: unterminated string at offset %d", start-1)
-}
-
-// consumeString consumes a JSON string and returns the resolved Go string.
-func (s *jsonScanner) consumeString() (string, error) {
-	start, end, hasEscapes, err := s.consumeStringRaw()
-	if err != nil {
-		return "", err
-	}
-	if !hasEscapes {
-		return string(s.data[start:end]), nil
-	}
-	return resolveJSONEscapes(s.data[start:end])
 }
 
 // consumeStringZeroCopy consumes a JSON string and returns a zero-copy
@@ -400,15 +398,10 @@ func parseJSONInt64(b []byte) (int64, error) {
 func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 	for i := 0; i < len(raw); {
 		if raw[i] != '\\' {
-			// Decode multi-byte UTF-8 as a single rune so the round
-			// trip preserves the value. For invalid UTF-8 (e.g. lone
-			// 0x9e), DecodeRune returns RuneError with size 1 — emit
-			// the raw byte as its codepoint (Postel; the encoder
-			// canonicalizes on output).
+			// Decode multi-byte UTF-8 as a single rune so the round trip
+			// preserves the value. consumeStringRaw already rejected
+			// invalid UTF-8, so DecodeRune always advances a full rune.
 			r, size := utf8.DecodeRune(raw[i:])
-			if r == utf8.RuneError && size == 1 {
-				r = rune(raw[i])
-			}
 			if err := emit(r); err != nil {
 				return err
 			}
@@ -454,7 +447,13 @@ func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 				}
 			}
 		default:
-			r = rune(raw[i])
+			// Unrecognized escape sequence. JSON defines exactly eight
+			// (" \ / b f n r t) plus \uXXXX; anything else is malformed.
+			// Reject rather than silently dropping the backslash (which
+			// corrupts content — "C:\dir" would become "C:dir"). Matches
+			// Java's JsonDecoder (Jackson, "Unrecognized character
+			// escape") and fastavro (Python json, "Invalid \escape").
+			return fmt.Errorf("avro json: invalid escape sequence \\%c", raw[i])
 		}
 		if err := emit(r); err != nil {
 			return err

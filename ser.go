@@ -505,7 +505,7 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 	if v.Type() != jsonNumberType {
 		return v, false, nil
 	}
-	f, err := parseJSONNumberAsFloat(string(v.Interface().(json.Number)))
+	f, err := parseJSONNumberAsFloat(string(v.Interface().(json.Number)), 64)
 	if err != nil {
 		return v, true, err
 	}
@@ -518,24 +518,28 @@ func jsonNumberToFloat(v reflect.Value) (reflect.Value, bool, error) {
 // not), then parse via [parseFloatAcceptOverflow] (±Inf from ErrRange
 // counts as success per the wire-format lossy-destination policy).
 //
-// Single source of truth for the three sites that need it: binary encode
-// (ser.go's [jsonNumberToFloat]), JSON encode (json_codec.go's
-// [jsonCoerceToFloat64] json.Number arm), and schema-parse default
-// validation (schema.go's [defaultAsFloat] json.Number arm). A future
-// tightening of float-literal validation lands once, here.
+// Single source of truth for every site that turns a JSON-number string
+// into a float64: binary encode (ser.go's [jsonNumberToFloat]), JSON
+// encode (json_codec.go's [jsonCoerceToFloat64] json.Number arm),
+// schema-parse default validation (schema.go's [defaultAsFloat]
+// json.Number arm), and the JSON decode arm ([decodeJSONFloat]). A
+// future tightening of float-literal validation lands once, here.
+//
+// bitSize is 64 for every caller except decodeJSONFloat against a
+// "float" schema, which passes 32 to parse at float32 precision directly
+// (avoiding a float64→float32 double-rounding shift). The isJSONNumber
+// gate is bitSize-independent — it is the grammar check the int/long
+// arms and goavro's numberLength both apply before ParseFloat, so a
+// trailing-dot literal like "5." is rejected uniformly.
 //
 // User-controllable input is routed through [truncForError] before
 // interpolation so a 1 MiB hostile input doesn't produce a 1 MiB error
 // string.
-//
-// Note: the JSON decode-time arm [decodeJSONFloat] intentionally inlines
-// strconv.ParseFloat with bitSize=32 instead of calling this helper —
-// preserving the float32 decode semantics avoids a double-rounding shift.
-func parseJSONNumberAsFloat(s string) (float64, error) {
+func parseJSONNumberAsFloat(s string, bitSize int) (float64, error) {
 	if !isJSONNumber(s) {
 		return 0, fmt.Errorf("invalid JSON number %q", truncForError(s))
 	}
-	f, err := parseFloatAcceptOverflow(s)
+	f, err := parseFloatAcceptOverflow(s, bitSize)
 	if err != nil {
 		return 0, fmt.Errorf("invalid JSON number %q: %w", truncForError(s), err)
 	}
@@ -938,7 +942,7 @@ var serString = serPrim(appendAvroString)
 // the string for JSON-escaping; both helpers must remain in
 // lockstep on precedence.
 func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
-	// One Type() read serves both discriminators (vs the old Type()+Kind()):
+	// One Type() read serves both discriminators:
 	// json.Number is rejected, and the builtin (unnamed) string — the common
 	// case, which can carry no text-out method — is fast-pathed past the
 	// textOutFor probe. Named string types fall through to the text-aware

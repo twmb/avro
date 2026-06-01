@@ -398,7 +398,10 @@ func (ctx *jsonDecoder) decodeJSONFloat(bitSize int, typ string) (float64, error
 	p := ctx.scanner.peek()
 	switch {
 	case p == '"':
-		s, err := ctx.scanner.consumeString()
+		// Zero-copy: parseSpecialFloat reads the token (NaN / Infinity /
+		// ...) and returns a float without retaining the string, so the
+		// transient scanner-backed string is safe here.
+		s, err := ctx.scanner.consumeStringZeroCopy()
 		if err != nil {
 			return 0, err
 		}
@@ -419,24 +422,17 @@ func (ctx *jsonDecoder) decodeJSONFloat(bitSize int, typ string) (float64, error
 		if err != nil {
 			return 0, err
 		}
-		// Length cap mirrors parseFloatAcceptOverflow (schema.go) so all
-		// five strconv.ParseFloat-on-user-input sites agree (binary encode
-		// jsonNumberToFloat, JSON encode jsonCoerceToFloat64, schema-parse
-		// defaultAsFloat, metadata-API normalizeJSONNumber, and this
-		// decode-JSON arm). Inline rather than via parseFloatAcceptOverflow
-		// because that helper is bitSize=64 only; preserving the bitSize=32
-		// ParseFloat for the decodeFloat path avoids double-rounding shifts.
-		if len(nb) > maxParseFloatLen {
-			return 0, fmt.Errorf("avro json: %s literal exceeds %d byte length cap", typ, maxParseFloatLen)
-		}
-		// strconv.ParseFloat is read-only; alias nb to avoid the copy.
-		f, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(nb), len(nb)), bitSize)
+		// Same shared gate + parse the int/long arms and the encode side
+		// use: parseJSONNumberAsFloat applies the isJSONNumber grammar gate
+		// (rejecting non-JSON forms like the trailing-dot "5." / "5.e3"
+		// that strconv.ParseFloat would otherwise accept), caps the length
+		// for DoS, and accepts ±Inf from overflow (1e999). bitSize is
+		// threaded so a "float" schema parses at float32 precision (single
+		// rounding). nb aliases the scanner buffer; the helper is read-only
+		// and its error path copies via truncForError.
+		f, err := parseJSONNumberAsFloat(unsafe.String(unsafe.SliceData(nb), len(nb)), bitSize)
 		if err != nil {
-			// Accept ±Inf from overflow (e.g. 1e999, goavro convention).
-			if math.IsInf(f, 0) {
-				return f, nil
-			}
-			return 0, fmt.Errorf("avro json: invalid %s: %w", typ, err)
+			return 0, fmt.Errorf("avro json: %s: %w", typ, err)
 		}
 		return f, nil
 	}
@@ -517,7 +513,7 @@ func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode) error {
 	}
 	// Mirrors deserEnum's target dispatch: Interface→symbol; String→symbol;
 	// Int/Uint→ordinal (Java's JsonDecoder.readEnum and fastavro's read_enum
-	// both return the index, which twmb's JSON path used to reject).
+	// both return the index).
 	return setEnumTarget(v, idx, s)
 }
 

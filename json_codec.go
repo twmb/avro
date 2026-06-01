@@ -164,41 +164,16 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 	}
 	err := ctx.decodeValue(rv.Elem(), s.node)
 	if err == nil {
-		// The scanner stops at the first non-token character; anything
-		// after the decoded value falls into one of three classes:
-		//   1. EOF / trailing whitespace — fine (RFC 8259 JSON-text).
-		//   2. Start of a valid next JSON value ({, [, ", digit, -,
-		//      t, f, n) — fine, allows multi-record concat streaming
-		//      that Java's JsonDecoder also supports
-		//      (TestSpecJSONMultiRecordConcatDecode locks this).
-		//   3. Anything else — mid-token garbage like the "x10" after
-		//      "0x10" (which the number scanner stops at silently,
-		//      returning just "0"). Reject so "0x10" against "long"
-		//      doesn't silently decode as 0, and "1abc" doesn't
-		//      decode as 1.
+		// One DecodeJSON call decodes exactly one value and returns no
+		// offset, so any trailing non-whitespace content is rejected
+		// (matching encoding/json.Unmarshal and fastavro).
 		ctx.scanner.skipWhitespace()
 		if ctx.scanner.pos < len(ctx.scanner.data) {
-			next := ctx.scanner.data[ctx.scanner.pos]
-			if !isJSONValueStart(next) {
-				err = fmt.Errorf("avro json: unexpected trailing content at offset %d", ctx.scanner.pos)
-			}
+			err = fmt.Errorf("avro json: unexpected trailing content at offset %d", ctx.scanner.pos)
 		}
 	}
 	sl.put()
 	return err
-}
-
-// isJSONValueStart reports whether b is a byte that can begin a JSON
-// value per RFC 8259: {, [, " (string), -, 0-9 (number), t (true),
-// f (false), n (null). Used by [Schema.DecodeJSON] to distinguish
-// "multi-record concat" trailing content (start of a new JSON value)
-// from mid-token garbage that the scanner stopped at.
-func isJSONValueStart(b byte) bool {
-	switch b {
-	case '{', '[', '"', '-', 't', 'f', 'n':
-		return true
-	}
-	return b >= '0' && b <= '9'
 }
 
 // appendAvroJSON is the single-pass Avro JSON encoder. It walks
@@ -1341,7 +1316,7 @@ func jsonCoerceToFloat64(v reflect.Value) (float64, error) {
 		// Route through the shared json.Number → float64 helper —
 		// same predicate used by binary encode (jsonNumberToFloat) and
 		// schema-parse default validation (defaultAsFloat).
-		f, err := parseJSONNumberAsFloat(string(v.Interface().(json.Number)))
+		f, err := parseJSONNumberAsFloat(string(v.Interface().(json.Number)), 64)
 		if err != nil {
 			return 0, fmt.Errorf("avro json: %w", err)
 		}

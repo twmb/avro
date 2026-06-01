@@ -1079,7 +1079,7 @@ func deserArrayIfaceLoop[T any](readOne func(src []byte, sl *slab) (T, []byte, e
 
 // Per-primitive readOne functions feed both the typed-slice and iface
 // loops. Boolean trusts the caller's len(src) ≥ count bounds check via
-// the block-count guard, matching the prior copy's inline comment.
+// the block-count guard.
 func readOneString(src []byte, sl *slab) (string, []byte, error) {
 	n, src, err := readLength(src, "string")
 	if err != nil {
@@ -1731,9 +1731,7 @@ func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error 
 			return nil
 		}
 		// Unsigned target: uint64(f) is well-defined for f in [0, 2^64) on
-		// every platform. The full uint64 range is supported — the prior
-		// int64 intermediate could not represent [2^63, 2^64), the upper half
-		// of uint64, and silently corrupted or rejected those values.
+		// every platform; the full uint64 range is supported.
 		if f < 0 || f >= (1<<64) {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %g overflows %s", f, v.Type())}
 		}

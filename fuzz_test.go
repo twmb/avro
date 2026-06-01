@@ -660,12 +660,11 @@ func FuzzDecodeJSONRoundTrip(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, idx uint8, input string) {
 		s := fuzzSchemas[int(idx)%len(fuzzSchemas)]
-		// Postel: input may be non-canonical (lenient decode is OK).
-		// Re-encoding produces canonical output. Test canonical
-		// idempotence: encode → decode → encode must be stable.
-		// Asserting bit-exact equality with the original bytes is
-		// wrong under Postel — non-canonical input legitimately
-		// canonicalizes on the first encode.
+		// Decode tolerates non-canonical-but-valid input (any boolean
+		// byte, bare unions, whole-number floats, etc.); invalid input
+		// is skipped via the return below. Re-encoding produces canonical
+		// output, so test canonical idempotence (encode → decode → encode
+		// is stable) rather than bit-exact equality with the original.
 		var v1 any
 		if err := s.DecodeJSON([]byte(input), &v1); err != nil {
 			return

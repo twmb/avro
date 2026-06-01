@@ -60,7 +60,8 @@ func WithName(name string) SchemaOpt { return withName(name) }
 //   - string → string
 //   - []byte → bytes
 //   - [N]byte → fixed (size N, name from Go type name or "fixed_N")
-//   - *T → ["null", T] union with default null
+//   - *T → ["null", T] union with default null (a pointer chain of any
+//     depth — **T, ***T — collapses to the same single nullable union)
 //   - []T → array
 //   - map[string]T → map
 //   - struct → record (recursive)
@@ -160,6 +161,22 @@ func MustSchemaFor[T any](opts ...SchemaOpt) *Schema {
 	return s
 }
 
+// avroFullName returns the Avro fullname for a named type: the namespace
+// and name joined by a dot, or the bare name when there is no namespace.
+// This is the single identity a named type is registered under (seen[t])
+// and referenced by, so every site that needs a named type's identity —
+// the record definition, a later name reference, and the type-alias dedup
+// in inferField — derives it the same way and cannot drift. (The drift it
+// prevents: registering under the bare name while referencing by fullname,
+// so a same-type/identical-alias pair is wrongly seen as a fresh
+// definition once a namespace is configured.)
+func avroFullName(namespace, name string) string {
+	if namespace == "" {
+		return name
+	}
+	return namespace + "." + name
+}
+
 // inferRecord builds a schema map for a struct type. The seen map tracks
 // types that have been visited so repeat references (both recursive and
 // shared) emit a named reference instead of a duplicate definition.
@@ -168,10 +185,7 @@ func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]s
 		return fullName, nil
 	}
 
-	fullName := name
-	if namespace != "" {
-		fullName = namespace + "." + name
-	}
+	fullName := avroFullName(namespace, name)
 	// Register the name before processing fields so that recursive
 	// references resolve to a name reference rather than re-entering here.
 	seen[t] = fullName
@@ -691,8 +705,17 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 			// This assertion is safe for freshly-inferred schemas.
 			existing, _ := s["aliases"].([]string)
 			s["aliases"] = append(existing, aliases...)
+			// refName must be the type's fullname (namespace + name) — the
+			// same identity inferRecord registers in seen[t] and a later
+			// field's name reference resolves to. The definition carries
+			// name and namespace as separate keys; join them so the dedup
+			// in inferField keys both the defining and referencing fields
+			// by one identity. (A namespace-less type's fullname is its
+			// bare name, so fixed types and no-namespace records are
+			// unchanged.)
 			name, _ := s["name"].(string)
-			return typeAliasResult{applied: true, refName: name}
+			ns, _ := s["namespace"].(string)
+			return typeAliasResult{applied: true, refName: avroFullName(ns, name)}
 		case typ == "array":
 			if items, ok := s["items"]; ok {
 				return addTypeAliases(items, aliases)
@@ -762,11 +785,22 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}
 	}
 
-	// Pointer → nullable union.
+	// Pointer → nullable union. A pointer means "nullable", and the codecs
+	// treat a pointer chain as a single nullable level (indirect /
+	// indirectAlloc). Recurse one level — so an intermediate pointer type
+	// can still match a registered CustomType — then collapse: if the
+	// inner already inferred to a null-first union (a deeper pointer like
+	// **T, or a CustomType whose schema is ["null", …]), return it
+	// unwrapped rather than nesting. Avro forbids a union immediately
+	// inside a union, so wrapping each level would emit an unparseable
+	// ["null", ["null", T]].
 	if t.Kind() == reflect.Pointer {
 		inner, err := inferType(t.Elem(), logical, decimal, namespace, seen, customTypes)
 		if err != nil {
 			return nil, err
+		}
+		if u, ok := inner.([]any); ok && len(u) > 0 && u[0] == "null" {
+			return u, nil
 		}
 		return []any{"null", inner}, nil
 	}
@@ -936,13 +970,9 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 			// (they differ by logicalType). seen[t] records the name an
 			// earlier occurrence emitted; emit a name reference ONLY when
 			// this occurrence's name matches it. A different-named form of
-			// the same type emits its own full definition. The prior code
-			// returned a reference for ANY repeat occurrence of t without
-			// checking the name, so a uuid-then-plain (or plain-then-uuid)
-			// pair emitted a reference under the WRONG name — a dangling
-			// reference Parse rejects with "unknown type". The name-match
-			// guard keeps the same-form dedup (needed so a later field can
-			// reference an earlier definition that type-alias= mutated)
+			// the same type emits its own full definition. The name-match
+			// guard keeps the same-form dedup (so a later field can
+			// reference an earlier definition that a type-alias= mutated)
 			// while letting the two forms each define their own fixed.
 			var name string
 			var def map[string]any

@@ -1481,8 +1481,8 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 	// setCanon=false: the buildPrimitive path's canon was already set to
 	// s.primitive above; only the namespace-qualified retry needs to
 	// rewrite it, which tryAssignNamedRef handles internally when given
-	// setCanon=true. To preserve the prior shape (bare-name canon stays
-	// as written, only the qualified retry rewrites), we tell the helper
+	// setCanon=true. To keep the bare-name canon as written (only the
+	// qualified retry rewrites it), we tell the helper
 	// to setCanon for both branches and let the bare path overwrite with
 	// the identical name.
 	if found, err := b.tryAssignNamedRef(s.primitive, parentName, true); err != nil || found {
@@ -2912,7 +2912,7 @@ func normalizeJSONNumber(n json.Number) any {
 		//     returns ±Inf, matching the wire encoder's silent
 		//     overflow-to-Inf path.
 	}
-	if f, err := parseFloatAcceptOverflow(s); err == nil {
+	if f, err := parseFloatAcceptOverflow(s, 64); err == nil {
 		return f
 	}
 	return n
@@ -3045,14 +3045,19 @@ func intFitsFloat(n int64, bitSize int) (float64, error) {
 // Mirrors the same length-cap pattern as boundedRatFromString
 // (deser.go:670, maxRatInputLen=128KiB) and parseInt64Lenient
 // (ser.go:559, maxInt64LenientLen=64). The helper is the single
-// source of truth for the four-axis ParseFloat callers
-// (jsonNumberToFloat, jsonCoerceToFloat64, defaultAsFloat,
-// normalizeJSONNumber), so capping here covers all axes.
-func parseFloatAcceptOverflow(s string) (float64, error) {
+// source of truth for every ParseFloat-on-user-input caller across all
+// axes: binary encode (jsonNumberToFloat), JSON encode
+// (jsonCoerceToFloat64), schema-parse (defaultAsFloat), metadata-API
+// (normalizeJSONNumber), and JSON decode (decodeJSONFloat) — the last
+// reaching it via parseJSONNumberAsFloat. bitSize is 64 for every axis
+// except the JSON decode of a "float" schema, which passes 32 to parse
+// at float32 precision directly (single rounding, no float64→float32
+// double-rounding shift).
+func parseFloatAcceptOverflow(s string, bitSize int) (float64, error) {
 	if len(s) > maxParseFloatLen {
 		return 0, fmt.Errorf("float literal exceeds %d byte length cap", maxParseFloatLen)
 	}
-	f, err := strconv.ParseFloat(s, 64)
+	f, err := strconv.ParseFloat(s, bitSize)
 	if err == nil {
 		return f, nil
 	}
@@ -3092,7 +3097,7 @@ const maxParseFloatLen = 1024
 func defaultAsFloat(val any) (float64, error) {
 	switch v := val.(type) {
 	case json.Number:
-		return parseJSONNumberAsFloat(v.String())
+		return parseJSONNumberAsFloat(v.String(), 64)
 	case float64:
 		return v, nil
 	case int64:
@@ -3118,7 +3123,7 @@ func defaultAsFloat(val any) (float64, error) {
 // permitted JSON type is `string` per spec 1.12 §"Record" default-
 // values table (string, bytes, enum, fixed). Numeric branches
 // (int, long, float, double) reject string defaults at this layer
-// — [defaultAsFloat] no longer has a string-acceptance arm; Java's
+// — [defaultAsFloat] has no string-acceptance arm; Java's
 // parseField text→DoubleNode coercion fires only for the OUTER
 // FLOAT/DOUBLE field type (handled in [coerceDefault] below) and
 // never for union branches.
@@ -3142,8 +3147,8 @@ func firstUnionBranchAcceptingDefault(val any, node *schemaNode) *schemaNode {
 // schemas. avro-rs and goavro do not implement this coercion.
 //
 // Union defaults pass through unchanged: walkDefault picks the first
-// branch whose validateDefault accepts, and validateDefault no longer
-// has a string-to-float arm at the leaf level, so union+numeric-string
+// branch whose validateDefault accepts, and validateDefault has no
+// string-to-float arm at the leaf level, so union+numeric-string
 // defaults are rejected at parse (matching Java/avro-rs/goavro).
 //
 // Walks *schemaNode so name-referenced nested fields coerce too (the
@@ -3157,7 +3162,7 @@ func coerceDefault(val any, node *schemaNode) any {
 		// First validateDefault-accepting branch wins; recurse so the
 		// coerced value matches that branch's natural Go type. For
 		// string defaults, no numeric branch accepts (defaultAsFloat
-		// no longer has a string arm), so this picks a string-
+		// has no string arm), so this picks a string-
 		// accepting branch (string/bytes/enum/fixed) or returns nil
 		// — schema parse then fails via validateDefault.
 		if branch := firstUnionBranchAcceptingDefault(val, node); branch != nil {
@@ -3181,7 +3186,7 @@ func coerceDefault(val any, node *schemaNode) any {
 	// this single call site. If parsing fails (syntax error), leave
 	// the original string so validateDefault produces the canonical
 	// error message.
-	if f, err := parseFloatAcceptOverflow(s); err == nil {
+	if f, err := parseFloatAcceptOverflow(s, 64); err == nil {
 		return f
 	}
 	return val
@@ -3215,9 +3220,8 @@ func walkDefault(val any, node *schemaNode, visit func(any, *schemaNode) (any, e
 		return val, nil
 	}
 	if node.kind == "union" {
-		// Avro 1.12+ relaxed the union-default rule: the default may
-		// match any branch (formerly required to match the first).
-		// See AVRO-3649 / PR apache/avro#2503.
+		// Per Avro 1.12 the default may match any branch, not only the
+		// first. See AVRO-3649 / PR apache/avro#2503.
 		//
 		// Branch matcher is validateDefault (via
 		// firstUnionBranchAcceptingDefault, shared with coerceDefault):

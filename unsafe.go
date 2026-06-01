@@ -959,8 +959,7 @@ func usInt(k reflect.Kind) userfn {
 	case reflect.Uint64:
 		// uint64 > MaxInt64 can't be represented as int64 — but the
 		// usVarintFrom int64 cast already truncates negative-when-
-		// reinterpreted values. Match the prior behavior by using
-		// the unsigned-aware bound directly.
+		// reinterpreted values. Use the unsigned-aware bound directly.
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 			n := *(*uint64)(p)
 			if n > math.MaxInt32 {

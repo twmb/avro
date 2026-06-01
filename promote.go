@@ -78,8 +78,7 @@ func promoteIntFloatMantissa(v reflect.Value, n int64, avroType string, bitSize 
 
 var (
 	// setLongValue handles the Interface arm internally, so no special-case
-	// needed here (the prior promoteIntToLong's separate Interface arm was
-	// redundant with setLongValue's first branch).
+	// needed here.
 	promoteIntToLong = promoteRead(readVarint,
 		func(v reflect.Value, n int32) error { return setLongValue(v, int64(n)) })
 	promoteIntToFloat = promoteRead(readVarint,

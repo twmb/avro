@@ -114,6 +114,70 @@ func TestSchemaForNullable(t *testing.T) {
 	})
 }
 
+func TestSchemaForMultiLevelPointer(t *testing.T) {
+	// The codecs collapse a whole pointer chain (**T, ***T, ...) to a
+	// single nullable union via indirect/indirectAlloc, so SchemaFor must
+	// emit one ["null", T] for any pointer depth — not a union nested
+	// inside a union, which Avro forbids ("unions cannot immediately
+	// contain other unions") and which would make the schema unusable.
+	t.Run("double pointer to int", func(t *testing.T) {
+		type Rec struct {
+			V **int32 `avro:"v"`
+		}
+		s, err := SchemaFor[Rec]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The emitted schema must itself parse.
+		if _, err := Parse(s.String()); err != nil {
+			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
+		}
+		n := int32(7)
+		p := &n
+		in := Rec{V: &p}
+		data, err := s.Encode(&in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got Rec
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.V == nil || *got.V == nil || **got.V != 7 {
+			t.Fatalf("round-trip mismatch: got %v, want **int32(7)", got.V)
+		}
+	})
+
+	t.Run("double pointer to struct", func(t *testing.T) {
+		type Inner struct {
+			Value int32 `avro:"value"`
+		}
+		type Rec struct {
+			V **Inner `avro:"v"`
+		}
+		s, err := SchemaFor[Rec]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(s.String()); err != nil {
+			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
+		}
+	})
+
+	t.Run("triple pointer", func(t *testing.T) {
+		type Rec struct {
+			V ***int32 `avro:"v"`
+		}
+		s, err := SchemaFor[Rec]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(s.String()); err != nil {
+			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
+		}
+	})
+}
+
 func TestSchemaForNullableDefaultNull(t *testing.T) {
 	type V2 struct {
 		Name  string  `avro:"name"`
@@ -990,6 +1054,46 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 		aliases, _ := hashField["aliases"].([]any)
 		if len(aliases) != 1 || aliases[0] != "old_hash" {
 			t.Fatalf("fixed aliases: got %v, want [old_hash]", aliases)
+		}
+	})
+
+	t.Run("namespaced identical aliases accepted", func(t *testing.T) {
+		// A configured namespace must not change whether two fields of the
+		// same named type with identical type-aliases are accepted: the
+		// defining field and the referencing field identify the type by the
+		// same identity (its fullname), so the dedup that recognizes
+		// "identical aliases, accept" must key on that same identity in both
+		// positions. (The defining field registers the type and the
+		// referencing field resolves to a name reference — both are the
+		// type's fullname com.example.Inner.)
+		type Outer struct {
+			A Inner `avro:"a,type-alias=old_inner"`
+			B Inner `avro:"b,type-alias=old_inner"`
+		}
+		s, err := SchemaFor[Outer](WithNamespace("com.example"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The alias must be present on the (namespaced) Inner definition.
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
+			t.Fatal(err)
+		}
+		aField := raw["fields"].([]any)[0].(map[string]any)["type"].(map[string]any)
+		aliases, _ := aField["aliases"].([]any)
+		if len(aliases) != 1 || aliases[0] != "old_inner" {
+			t.Fatalf("namespaced Inner aliases: got %v, want [old_inner]", aliases)
+		}
+	})
+
+	t.Run("namespaced conflicting aliases rejected", func(t *testing.T) {
+		// The conflict detection must still fire under a namespace.
+		type Outer struct {
+			A Inner `avro:"a,type-alias=old_inner"`
+			B Inner `avro:"b,type-alias=different_inner"`
+		}
+		if _, err := SchemaFor[Outer](WithNamespace("com.example")); err == nil {
+			t.Fatal("expected error for conflicting type-alias under namespace")
 		}
 	})
 }
@@ -1874,8 +1978,8 @@ func TestSchemaForDecimalRejectsNonBigRat(t *testing.T) {
 // accepted shape: encode + decode against the inferred schema.
 func TestSchemaForLogicalOnNumericKind(t *testing.T) {
 	intWireAccepted := []struct {
-		name    string
-		logical string
+		name     string
+		logical  string
 		schemaFn func() (*Schema, error)
 	}{
 		{"date on int32", "date", func() (*Schema, error) {
@@ -1920,8 +2024,8 @@ func TestSchemaForLogicalOnNumericKind(t *testing.T) {
 	}
 
 	longWireAccepted := []struct {
-		name    string
-		logical string
+		name     string
+		logical  string
 		schemaFn func() (*Schema, error)
 	}{
 		{"timestamp-millis on int64", "timestamp-millis", func() (*Schema, error) {

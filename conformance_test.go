@@ -5470,25 +5470,27 @@ func TestSpecDateAndTimestampKnownWireValues(t *testing.T) {
 	})
 }
 
-// TestSpecJSONMultiRecordConcatDecode locks in that DecodeJSON consumes
-// only the first complete JSON value from src — concatenated records
-// decode independently. Java's JsonDecoder has the same streaming
-// behavior (TestJsonDecoder reads multiple records from a single
-// buffer). twmb's AppendEncodeJSON does NOT add inter-record separators
-// (caller's responsibility, like encoding/json.Marshal); separator
-// behavior is intentionally out of scope here.
-func TestSpecJSONMultiRecordConcatDecode(t *testing.T) {
+// TestSpecJSONTrailingContentRejected locks in that DecodeJSON decodes
+// exactly one value and rejects trailing non-whitespace content. Unlike
+// Java's streaming JsonDecoder or encoding/json.Decoder, DecodeJSON
+// returns no offset, so concatenated records cannot be streamed — a
+// buffer holding two records is a malformed single value (matching
+// encoding/json.Unmarshal and fastavro's one-value-per-decode model).
+func TestSpecJSONTrailingContentRejected(t *testing.T) {
 	s := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"l","type":"long"},
 		{"name":"a","type":{"type":"array","items":"int"}}
 	]}`)
-	data := []byte(`{"a":[1,2],"l":100}{"l":200,"a":[3,4]}`)
-	var got1 map[string]any
-	if err := s.DecodeJSON(data, &got1); err != nil {
-		t.Fatalf("first decode: %v", err)
+	if err := s.DecodeJSON([]byte(`{"a":[1,2],"l":100}{"l":200,"a":[3,4]}`), new(map[string]any)); err == nil {
+		t.Fatal("concatenated records accepted; want reject (trailing content)")
 	}
-	if got1["l"] != int64(100) {
-		t.Fatalf("first record l: got %v want 100", got1["l"])
+	// A single record, with trailing whitespace, still decodes.
+	var got map[string]any
+	if err := s.DecodeJSON([]byte(`{"a":[1,2],"l":100}`+"\n"), &got); err != nil {
+		t.Fatalf("single record rejected: %v", err)
+	}
+	if got["l"] != int64(100) {
+		t.Fatalf("l: got %v want 100", got["l"])
 	}
 }
 
@@ -15548,19 +15550,11 @@ func TestParity_AcceptedLeniencies(t *testing.T) {
 			t.Errorf("forward wrapped-form ref should parse: %v", err)
 		}
 	})
-	t.Run("JSON scanner accepts unknown \\X escapes", func(t *testing.T) {
-		// twmb's JSON scanner accepts \q as `q` (passes the char
-		// through). encoding/json rejects unknown escapes. Locked as
-		// lenient; the practical cost is accepting a few hand-edited
-		// schemas/JSON inputs that strict parsers reject. If
-		// strictness is wanted, the fix is in json_scan.go's string
-		// parser — well-localized.
-		s := avro.MustParse(`"string"`)
-		var got any
-		if err := s.DecodeJSON([]byte(`"\q"`), &got); err != nil {
-			t.Errorf("unknown escape should be accepted lenient: %v", err)
-		}
-	})
+	// Note: unknown \X escape sequences, unescaped control characters, and
+	// invalid UTF-8 are NOT leniencies — all are rejected, matching Java
+	// (Jackson), fastavro (Python json), and the standard-JSON spec. See
+	// TestDecodeJSONInvalidEscapeRejected, TestDecodeJSONRawControlCharRejected,
+	// and TestDecodeJSONInvalidUTF8Rejected.
 }
 
 // TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches
@@ -17455,9 +17449,10 @@ func TestRegression_NumberGrammarParityMatrix_JSONDecode_AllTypes(t *testing.T) 
 		// Empty.
 		{"", false, false, false, false, "empty"},
 
-		// Trailing whitespace (RFC 8259 permits) and multi-record concat.
+		// Trailing whitespace (RFC 8259 permits) is accepted; any trailing
+		// non-whitespace content is rejected (matches encoding/json.Unmarshal).
 		{"5  ", true, true, true, true, "trailing whitespace"},
-		{"5  {}", true, true, true, true, "trailing valid JSON (concat)"},
+		{"5  {}", false, false, false, false, "trailing content rejected"},
 
 		// Overflow.
 		{"2147483648", false, true, true, true, "MaxInt32+1"},

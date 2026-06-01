@@ -29,7 +29,7 @@ func needLen(src []byte, n int, typ string) error {
 
 // skipBytesN advances past n bytes (boolean/float/double/fixed). One
 // helper for every fixed-size skip so they agree on the ShortBufferError
-// shape (Type + Need + Have, rather than the prior boolean-only Type form).
+// shape (Type + Need + Have).
 func skipBytesN(src []byte, n int, typ string) ([]byte, error) {
 	if err := needLen(src, n, typ); err != nil {
 		return nil, err
