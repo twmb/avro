@@ -1,3 +1,6 @@
+// Vectors in testdata/avro-schema-tests.txt are vendored from Apache Avro
+// (apache/avro), Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0
+
 package avro_test
 
 import (
