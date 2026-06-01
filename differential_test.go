@@ -30,14 +30,22 @@ import (
 // runs set AVRO_FASTAVRO_PYTHON to a python with fastavro. See
 // CORRECTNESS_PLAN.md §T1b/§T1c and testdata/oracle/README.md.
 //
-// NOT yet covered (follow-ups, tracked in the plan): bytes/fixed/decimal/uuid
-// (need base64 value transport), logical types, and ambiguous multi-numeric
-// unions (encode branch-selection can legitimately differ by impl).
+// Binary- and logical-typed values (bytes, fixed, decimal, uuid, timestamp)
+// are covered by TestDifferentialFastavroBinaryLogical in
+// differential_logical_test.go, which carries them to the oracle via the
+// Kind-tagged transport. Still NOT covered: ambiguous multi-numeric unions
+// (encode branch-selection can legitimately differ by impl).
 
 type oracleJob struct {
 	Op     string          `json:"op"`
 	Schema json.RawMessage `json:"schema"`
 	Value  json.RawMessage `json:"value,omitempty"`
+	// Kind tags how the oracle must reconstruct Value into a native Python
+	// type before fastavro encodes it: "" passes the JSON value through, while
+	// "bytes"/"fixed" base64-decode it, "decimal" builds a decimal.Decimal,
+	// and "timestamp-millis"/"timestamp-micros" build a UTC datetime. Lets the
+	// differential carry binary- and logical-typed values JSON cannot.
+	Kind string `json:"kind,omitempty"`
 	// No omitempty: a zero-byte encoding (e.g. the "null" type) has an empty
 	// hex string that must still be sent, or the oracle sees no "hex" key.
 	Hex string `json:"hex"`
