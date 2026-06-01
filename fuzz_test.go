@@ -2466,6 +2466,28 @@ func FuzzDecodeUnionObjectDeep(f *testing.F) {
 // each carrier with adversarial numeric strings ("1e1000", "NaN",
 // "0.0000000000000000000000000001", "9".Repeat(40)) and asserts no
 // panic on encode or decode.
+// safeForBigNum reports whether s is small enough to hand to the stdlib
+// big.Rat.SetString / big.ParseFloat parsers without risking a multi-minute
+// or multi-gigabyte materialization. Those parsers eagerly build the full
+// mantissa and 10^exponent, so a 20-million-digit mantissa costs big.Rat
+// ~8 minutes and a short "1e2000000000" allocates gigabytes. twmb's own
+// numeric entry points are bounded (maxRatInputLen / decimalScaleLimit);
+// this mirrors that bound for the fuzzer's DIRECT stdlib construction so the
+// harness cannot DoS itself. (twmb's json.Number path above is exercised
+// unbounded since it is internally capped.)
+func safeForBigNum(s string) bool {
+	if len(s) > 1024 {
+		return false
+	}
+	if i := strings.IndexAny(s, "eE"); i >= 0 {
+		exp := strings.TrimLeft(s[i+1:], "+-")
+		if len(exp) > 4 { // |exponent| could exceed 9999 → huge 10^exp
+			return false
+		}
+	}
+	return true
+}
+
 func FuzzNumberCarriers(f *testing.F) {
 	floatS := MustParse(`"float"`)
 	doubleS := MustParse(`"double"`)
@@ -2493,16 +2515,26 @@ func FuzzNumberCarriers(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, schemaIdx uint8, numStr string) {
 		s := schemas[int(schemaIdx)%len(schemas)]
-		// As json.Number.
+		// As json.Number: twmb's own numeric entry points are length- and
+		// magnitude-bounded (maxRatInputLen / maxParseFloatLen /
+		// decimalScaleLimit), so any input is safe to hand to twmb here.
 		s.AppendEncode(nil, json.Number(numStr))
 		s.AppendEncodeJSON(nil, json.Number(numStr))
-		// As *big.Rat (round-trip if parseable).
+		// As *big.Rat / *big.Float the fuzzer builds the value DIRECTLY via
+		// stdlib parsers, which — unlike twmb — eagerly materialize the full
+		// mantissa and 10^exp: a 20-million-digit mantissa takes big.Rat
+		// ~8 minutes, and "1e2000000000" allocates gigabytes, OOM-ing the
+		// worker. Bound the input the way twmb itself does so the fuzzer
+		// exercises twmb's big.Rat/big.Float handling without DoSing its own
+		// harness (a 13-byte input could otherwise hang the whole run).
+		if !safeForBigNum(numStr) {
+			return
+		}
 		r := new(big.Rat)
 		if _, ok := r.SetString(numStr); ok {
 			s.AppendEncode(nil, r)
 			s.AppendEncodeJSON(nil, r)
 		}
-		// As *big.Float.
 		bf, _, err := big.ParseFloat(numStr, 10, 100, big.ToNearestEven)
 		if err == nil {
 			s.AppendEncode(nil, bf)
