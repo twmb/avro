@@ -18,6 +18,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -27,14 +28,22 @@ jobs:
 
       - run: go test -race ./...
 
+      # Run fuzzers SEQUENTIALLY, not in parallel. Backgrounding every Fuzz
+      # target at once launched ~40 `go test -fuzz` processes, each spawning
+      # its own worker pool, which oversubscribed the 2-core runner badly
+      # enough that the step was killed (SIGTERM/143) before finishing. Each
+      # target gets a hard -timeout so a genuinely stuck single execution
+      # (which -fuzztime, a between-execs wall-clock budget, cannot interrupt)
+      # fails fast and names the offending fuzzer instead of hanging the step.
       - name: Fuzz
         run: |
           for pkg in . ./ocf; do
             for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep '^Fuzz'); do
-              go test -run='^$' -fuzz="^${fn}$" -fuzztime=10s "$pkg" &
+              echo "::group::fuzz $pkg $fn"
+              go test -run='^$' -fuzz="^${fn}$" -fuzztime=10s -timeout=90s "$pkg"
+              echo "::endgroup::"
             done
           done
-          wait
 
   # Differential testing against fastavro (an independent reference impl).
   # The fastavro oracle subprocess cross-checks twmb's encode/decode as Avro
