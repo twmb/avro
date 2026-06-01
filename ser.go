@@ -895,18 +895,35 @@ func appendAvroFloat64(dst []byte, v reflect.Value) ([]byte, error) {
 	return nil, semErr(v, "double")
 }
 
+// rejectJSONNumberRawTarget reports a SemanticError when v is a json.Number
+// being encoded against a "raw bytes" Avro type (bytes / fixed). json.Number
+// is a numeric carrier — its stdlib contract is an RFC 8259 number literal —
+// so it is valid only for numeric Avro types, the same rule appendAvroString
+// applies for the string type and rejectJSONNumberStringTarget applies on
+// decode. Plain strings stay accepted at these sites for json.Unmarshal
+// pipelines that carry Avro bytes/fixed as strings; only json.Number is turned
+// away. Callers invoke this inside a v.Kind()==reflect.String branch.
+func rejectJSONNumberRawTarget(v reflect.Value, avroType string) error {
+	if v.Type() == jsonNumberType {
+		return semErr(v, avroType)
+	}
+	return nil
+}
+
 func serBytes(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	v, err := indirect(v)
 	if err != nil {
 		return nil, err
 	}
-	// Accept string for json.Unmarshal pipelines where JSON strings
-	// may represent Avro bytes fields. json.Number's Kind is reflect.String
-	// so it lands here too — see TestRegression_UnionDispatchMatrix's
-	// `"hex jsonNumber falls to bytes"` pin, which documents the
-	// intentional encode-side acceptance even though the matching decoder
-	// rejects json.Number bytes targets.
+	// Accept plain strings for json.Unmarshal pipelines where JSON strings
+	// may represent Avro bytes fields, but reject json.Number: it is a numeric
+	// carrier (valid only for numeric Avro types), so a bytes target is a type
+	// mismatch — symmetric with the decoder, which rejects a json.Number bytes
+	// target. See rejectJSONNumberRawTarget.
 	if v.Kind() == reflect.String {
+		if err := rejectJSONNumberRawTarget(v, "bytes"); err != nil {
+			return nil, err
+		}
 		return doSerString(dst, v.String()), nil
 	}
 	if (v.Kind() != reflect.Array && v.Kind() != reflect.Slice) || v.Type().Elem().Kind() != reflect.Uint8 {
@@ -1750,11 +1767,10 @@ func (s *serSize) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		return nil, err
 	}
 	t := v.Type()
-	// Accept [N]byte arrays, []byte slices, and strings of the correct length.
-	// json.Number (Kind=reflect.String) lands in the String arm — same
-	// "raw bytes" leniency as serBytes (see TestRegression_UnionDispatchMatrix
-	// "hex jsonNumber falls to bytes"), even though the matching decoder
-	// rejects json.Number target for fixed wire.
+	// Accept [N]byte arrays, []byte slices, and plain strings of the correct
+	// length (json.Unmarshal pipelines). json.Number (Kind=reflect.String) is
+	// rejected: it is a numeric carrier, valid only for numeric Avro types,
+	// symmetric with the decoder which rejects a json.Number fixed target.
 	switch t.Kind() {
 	case reflect.Array:
 		if t.Elem().Kind() != reflect.Uint8 || t.Len() != s.n {
@@ -1766,6 +1782,9 @@ func (s *serSize) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 		}
 		return append(dst, v.Bytes()...), nil
 	case reflect.String:
+		if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
+			return nil, err
+		}
 		str := v.String()
 		if len(str) != s.n {
 			return nil, &SemanticError{GoType: t, AvroType: "fixed"}
@@ -2498,12 +2517,14 @@ func serFixedUUIDReflect(dst []byte, v reflect.Value, depth int) ([]byte, error)
 		return append(dst, u[:]...), nil
 	}
 	if v.Kind() == reflect.String {
-		// json.Number with UUID-shaped underlying content lands here
-		// via Kind=reflect.String — accepted iff parseUUID succeeds,
-		// matching the "raw bytes" leniency documented for serBytes /
-		// serSize. The matching decoder rejects json.Number target for
-		// fixed+uuid wire (rejectJSONNumberStringTarget) but the
-		// encode-side asymmetry is documented as intentional.
+		// A plain string with UUID-shaped content is accepted (parsed to the
+		// 16 wire bytes). json.Number is rejected up front: it is a numeric
+		// carrier, valid only for numeric Avro types, symmetric with the
+		// decoder which rejects a json.Number fixed target. (It would also
+		// fail parseUUID, but the explicit reject gives a clear error.)
+		if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
+			return nil, err
+		}
 		u, err := parseUUID(v.String())
 		if err != nil {
 			return nil, err

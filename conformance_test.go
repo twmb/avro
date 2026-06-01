@@ -17567,10 +17567,12 @@ func TestRegression_UnionDispatchMatrix(t *testing.T) {
 		// Fractional against int+long+string: int+long reject (not whole),
 		// string rejects json.Number → error.
 		{`["null","long","string"]`, json.Number("1.5"), expect{"", true}, "fractional jsonNumber against long+string"},
-		// But against bytes-containing union: bytes accepts string-typed
-		// json.Number as raw bytes (serBytes line 768). Asymmetry: string
-		// rejects json.Number but bytes accepts it. Documenting.
-		{`["null","long","bytes"]`, json.Number("0x10"), expect{"bytes", false}, "hex jsonNumber falls to bytes (asymmetry vs string)"},
+		// Against a bytes-containing union: json.Number is numeric-only, so
+		// the long branch rejects "0x10" (not a valid number) and the bytes
+		// branch also rejects json.Number — no branch accepts it. A VALID
+		// number still routes to the numeric branch, not bytes.
+		{`["null","long","bytes"]`, json.Number("0x10"), expect{"", true}, "hex jsonNumber: numeric-only, all branches reject"},
+		{`["null","long","bytes"]`, json.Number("42"), expect{"long", false}, "valid jsonNumber prefers long, not bytes"},
 
 		// ---- nil shapes. serNull accepts Pointer/Interface/Map/Slice/
 		// Chan/Func nils via the peel loop. ----
@@ -20590,18 +20592,20 @@ func TestRegression_JSONNumberTargetAcceptedForTimeLogicals(t *testing.T) {
 	})
 }
 
-// TestRegression_JSONNumberStringSourceRejectedOnEncode pins that the
-// encode side rejects json.Number for the structured-string Avro types
-// (string, string+uuid). The "raw bytes" Avro types (bytes, fixed,
-// fixed+uuid) retain their documented encode-side leniency (see
-// TestRegression_UnionDispatchMatrix's "hex jsonNumber falls to bytes"
-// pin) — encode is intentionally asymmetric with decode for those types.
+// TestRegression_JSONNumberStringSourceRejectedOnEncode pins that the encode
+// side rejects json.Number for EVERY non-numeric Avro type — string,
+// string+uuid, bytes, fixed, and fixed+uuid. json.Number is a numeric carrier
+// (its stdlib contract is an RFC 8259 number literal), valid only for numeric
+// Avro types; encoding one into a text or binary field is a type mismatch,
+// symmetric with the decoder which rejects a json.Number target for the same
+// wire (see TestRegression_JSONNumberTargetRejectedForStringLikeWire). Plain Go
+// strings remain accepted for bytes/fixed (json.Unmarshal pipelines); only
+// json.Number is turned away.
 //
-// The unsafe struct-field fast path must route through
-// appendAvroString's json.Number reject for both plain string and
-// string+uuid fields; usString that emits the json.Number's
-// underlying string directly would produce wire that the matching
-// decoder rejects.
+// The unsafe struct-field fast path routes json.Number to the reflect path
+// (stringFastPathEligibleEncode excludes it), so the reflect-side rejects in
+// appendAvroString / serBytes / serSize / serFixedUUIDReflect cover the
+// struct-field case too.
 func TestRegression_JSONNumberStringSourceRejectedOnEncode(t *testing.T) {
 	type structField struct {
 		N json.Number `avro:"n"`
@@ -20622,6 +20626,13 @@ func TestRegression_JSONNumberStringSourceRejectedOnEncode(t *testing.T) {
 		// Unsafe struct-field path for string+uuid logical — usString
 		// routes through serUUID's fall-through reject.
 		{"unsafe_struct_string_uuid", `{"type":"record","name":"R","fields":[{"name":"n","type":{"type":"string","logicalType":"uuid"}}]}`, &structField{N: json.Number("550e8400-e29b-41d4-a716-446655440000")}},
+		// "raw bytes" types reject json.Number on encode too (numeric-only):
+		// symmetric with the decoder, plain strings still accepted.
+		{"bytes", `"bytes"`, json.Number("123")},
+		{"fixed", `{"type":"fixed","name":"f","size":3}`, json.Number("123")},
+		{"fixed_uuid", `{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`, json.Number("123")},
+		// Unsafe struct-field path for bytes — routes to reflect serBytes.
+		{"unsafe_struct_bytes", `{"type":"record","name":"R","fields":[{"name":"n","type":"bytes"}]}`, &structField{N: json.Number("123")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name+"_binary", func(t *testing.T) {

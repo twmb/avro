@@ -395,6 +395,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			}
 		}
 		if v.Kind() == reflect.String {
+			if err := rejectJSONNumberRawTarget(v, "bytes"); err != nil {
+				return nil, err
+			}
 			// Treat the Go string as raw UTF-8 bytes, matching serBytes
 			// (ser.go's string arm appends the string bytes verbatim).
 			// Binary↔JSON parity: "é" encodes as c3 a9 on both paths.
@@ -473,6 +476,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				return appendAvroJSONBytes(buf, u[:]), nil
 			}
 			if v.Kind() == reflect.String {
+				if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
+					return nil, err
+				}
 				u, err := parseUUID(v.String())
 				if err != nil {
 					return nil, err
@@ -482,6 +488,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		}
 		var raw []byte
 		if v.Kind() == reflect.String {
+			if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
+				return nil, err
+			}
 			// Go string → raw UTF-8 bytes, matching serSize on the
 			// binary side. See the bytes-string arm above for the full
 			// rationale on why codepoint mapping was wrong here.
