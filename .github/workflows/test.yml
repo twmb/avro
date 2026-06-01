@@ -2,7 +2,6 @@ name: Test
 
 on:
   push:
-    branches: [main]
     paths-ignore:
       - "**.md"
   pull_request:
@@ -10,6 +9,11 @@ on:
     paths-ignore:
       - "**.md"
   workflow_dispatch: {}
+
+# Cancel an in-progress run when a newer commit lands on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
