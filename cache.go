@@ -3,6 +3,8 @@ package avro
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"io"
 	"maps"
 	"strings"
 	"sync"
@@ -19,7 +21,10 @@ import (
 // Parsing the same schema string multiple times is allowed and returns the
 // previously parsed result. This handles diamond dependencies in schema
 // reference graphs (e.g. A→B→D, A→C→D) without requiring callers to
-// track which schemas have already been parsed. Deduplication normalizes
+// track which schemas have already been parsed. Calls that pass options
+// changing what the string compiles to — custom types or [WithLaxNames] —
+// skip this deduplication and re-parse, since the schema string alone no
+// longer identifies the result. Deduplication normalizes
 // the JSON (whitespace and key order) but not the Avro canonical form:
 // schemas that differ only in formatting are deduplicated, but differences
 // in non-canonical fields like doc or aliases are not and will return a
@@ -53,8 +58,19 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err == nil {
-		if normalized, err := json.Marshal(v); err == nil {
-			schema = string(normalized)
+		// json.Decoder.Decode stops after the first JSON value, silently
+		// ignoring trailing bytes. Parse (json.Unmarshal) rejects trailing
+		// non-whitespace, so only normalize when the input is a single
+		// value: a second Decode returning io.EOF means the value was the
+		// whole input (trailing whitespace is consumed). Anything else
+		// (a syntax error on garbage, or a second value) means trailing
+		// content — leave schema unchanged so parse() rejects it exactly
+		// as bare Parse would, instead of silently truncating-and-accepting.
+		var tail json.RawMessage
+		if err2 := dec.Decode(&tail); errors.Is(err2, io.EOF) {
+			if normalized, err := json.Marshal(v); err == nil {
+				schema = string(normalized)
+			}
 		}
 	}
 	// Clone the cache's map so a failed parse doesn't corrupt the cache.
@@ -64,11 +80,20 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	}
 	applySchemaOpts(b, opts)
 	hasCustomTypes := len(b.customTypes) > 0
+	// WithLaxNames sets a non-default name validator (b.checkName), which
+	// changes what the same schema string compiles to (a name strict Parse
+	// rejects becomes accepted). The dedup key is the schema string only,
+	// so lax parses must skip dedup the way custom types do — otherwise a
+	// lax-then-strict call sequence returns the cached lax schema to the
+	// strict caller (silently accepting an invalid name), and a
+	// strict-then-lax sequence returns the strict schema ignoring the opt.
+	hasLaxNames := b.checkName != nil
+	skipDedup := hasCustomTypes || hasLaxNames
 
-	// Skip dedup when custom types are registered: custom types produce
-	// different compiled schemas for the same schema string.
+	// Skip dedup when custom types or lax names are in play: both produce
+	// a compiled schema that the bare schema string alone doesn't identify.
 	h := sha256.Sum256([]byte(schema))
-	if !hasCustomTypes {
+	if !skipDedup {
 		if s, ok := c.dedup[h]; ok {
 			return s, nil
 		}
@@ -97,7 +122,7 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	c.named = b.named
 	if hasCustomTypes {
 		c.customParsed[h] = true
-	} else {
+	} else if !skipDedup {
 		c.dedup[h] = s
 	}
 	return s, nil

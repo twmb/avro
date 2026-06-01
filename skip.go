@@ -159,8 +159,26 @@ func skipArray(w *schemaNode) skipfn {
 
 func skipMap(w *schemaNode) skipfn {
 	valueSkip := buildSkip(w.values)
+	// minEntryBytes = 1 (key length varint, ≥1 byte for an empty key) +
+	// the value's minimum wire bytes — identical to deserMap.minEntryBytes.
+	minEntryBytes := 1 + schemaMinBytes(w.values)
 	return func(src []byte, sl *slab) ([]byte, error) {
-		return skipBlocks(src, sl, "map block", nil,
+		return skipBlocks(src, sl, "map block",
+			// Bound the block count against the remaining buffer, matching
+			// deserMap (deser.go) and skipArray's checkArrayBlockBounds.
+			// Without it, skipBlocks' `for range int(count)` loop truncates
+			// a count above 2^31 on a 32-bit build, mis-framing the skip of
+			// subsequent bytes; on 64-bit the loop is buffer-bounded already,
+			// but this keeps deserMap, skipArray, and skipMap on one rule.
+			// minEntryBytes ≥ 1, so this is always the buffer-relative bound
+			// and never false-rejects a legitimate block (each entry occupies
+			// at least minEntryBytes wire bytes).
+			func(count, _ int64, srcLen int) error {
+				if count > int64(srcLen)/int64(minEntryBytes) {
+					return fmt.Errorf("map block count %d exceeds remaining buffer length %d (min %d byte/entry)", count, srcLen, minEntryBytes)
+				}
+				return nil
+			},
 			func(src []byte, sl *slab) ([]byte, error) {
 				// Skip key (string), then value.
 				if src, err := skipString(src, sl); err != nil {

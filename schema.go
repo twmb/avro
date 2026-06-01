@@ -212,6 +212,146 @@ func parse(schema string, b *builder) (*Schema, error) {
 // doc, aliases, defaults, and other non-essential attributes. The result
 // is deterministic and matches Java's reference output byte-for-byte,
 // so [Schema.Fingerprint] values are interoperable across implementations.
+// canonicalFirstOccurrence rewrites the parse-time canon tree so each
+// named type's full definition is emitted at its FIRST occurrence in the
+// field-walk order, with bare (full)name references afterward — the rule
+// Apache Avro's SchemaNormalization (the Parsing Canonical Form reference,
+// SchemaNormalization.java's env-keyed build) applies. The parse-time
+// canon tree instead places the full body at the textual DEFINITION site
+// and a bare name at every reference. The two agree for the common
+// define-before-reference shape (the definition IS the first occurrence),
+// so output is byte-identical there; they diverge only when a reference
+// precedes its definition (a forward reference, which twmb accepts): there
+// the un-transformed tree emitted the full body at the SECOND occurrence,
+// producing a PCF — and thus a schema fingerprint — that differed from
+// Java for single-object-encoding / schema-registry interop.
+//
+// References are also normalized to the resolved fullname (bare forward
+// references store the as-written short name), matching PCF's fullname
+// rule and keeping the emission consistent across orderings.
+func canonicalFirstOccurrence(s aschema) aschema {
+	defs := map[string]*aobject{}
+	shortCount := map[string]int{}
+	shortToFull := map[string]string{}
+	collectCanonDefs(s, defs, shortCount, shortToFull)
+	if len(defs) == 0 {
+		return s // no named types: nothing can be relocated
+	}
+	return rewriteCanonFirstOcc(s, defs, shortCount, shortToFull, map[string]struct{}{})
+}
+
+// collectCanonDefs records every named-type definition (the aobject whose
+// body is present) in the canon tree, keyed by fullname, plus an
+// unqualified-name index for resolving bare forward references into a
+// namespaced scope.
+func collectCanonDefs(s aschema, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string) {
+	switch {
+	case s.object != nil:
+		o := s.object
+		if isNamedKind(o.Type) && o.Name != "" {
+			if _, dup := defs[o.Name]; !dup {
+				defs[o.Name] = o
+				short := unqualified(o.Name)
+				shortCount[short]++
+				shortToFull[short] = o.Name
+			}
+		}
+		for i := range o.Fields {
+			if o.Fields[i].Type != nil {
+				collectCanonDefs(*o.Fields[i].Type, defs, shortCount, shortToFull)
+			}
+		}
+		if o.Items != nil {
+			collectCanonDefs(*o.Items, defs, shortCount, shortToFull)
+		}
+		if o.Values != nil {
+			collectCanonDefs(*o.Values, defs, shortCount, shortToFull)
+		}
+	case len(s.union) != 0:
+		for i := range s.union {
+			collectCanonDefs(s.union[i], defs, shortCount, shortToFull)
+		}
+	}
+}
+
+// lookupCanonDef resolves a reference name to its definition aobject, or
+// nil when ref is a real Avro primitive (never a named ref) or names a
+// type defined outside this schema (a SchemaCache cross-reference — left
+// as a bare name, the pre-existing behavior). A bare reference into a
+// namespaced scope resolves by unique unqualified name.
+func lookupCanonDef(ref string, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string) *aobject {
+	if _, isPrim := serPrimitive[ref]; isPrim {
+		return nil
+	}
+	if o, ok := defs[ref]; ok {
+		return o
+	}
+	if !strings.Contains(ref, ".") && shortCount[ref] == 1 {
+		return defs[shortToFull[ref]]
+	}
+	return nil
+}
+
+func rewriteCanonFirstOcc(s aschema, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string, seen map[string]struct{}) aschema {
+	switch {
+	case s.primitive != "":
+		def := lookupCanonDef(s.primitive, defs, shortCount, shortToFull)
+		if def == nil {
+			return s // real primitive, or a cross-schema reference: emit as-is
+		}
+		if _, ok := seen[def.Name]; ok {
+			return aschema{primitive: def.Name} // already emitted: bare fullname
+		}
+		seen[def.Name] = struct{}{}
+		return aschema{object: rewriteCanonObj(def, defs, shortCount, shortToFull, seen)}
+	case s.object != nil:
+		o := s.object
+		if isNamedKind(o.Type) && o.Name != "" {
+			if _, ok := seen[o.Name]; ok {
+				return aschema{primitive: o.Name} // already emitted at an earlier occurrence
+			}
+			seen[o.Name] = struct{}{}
+		}
+		return aschema{object: rewriteCanonObj(o, defs, shortCount, shortToFull, seen)}
+	case len(s.union) != 0:
+		out := make([]aschema, len(s.union))
+		for i := range s.union {
+			out[i] = rewriteCanonFirstOcc(s.union[i], defs, shortCount, shortToFull, seen)
+		}
+		return aschema{union: out}
+	}
+	return s
+}
+
+// rewriteCanonObj shallow-copies o (preserving every scalar/canonical
+// attribute) and rebuilds only its recursive schema children
+// (Fields[].Type / Items / Values) through rewriteCanonFirstOcc, so
+// per-object PCF emission is unchanged and only the full-vs-reference
+// placement of nested named types moves to first occurrence.
+func rewriteCanonObj(o *aobject, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string, seen map[string]struct{}) *aobject {
+	no := *o
+	if len(o.Fields) > 0 {
+		no.Fields = make([]afield, len(o.Fields))
+		for i, f := range o.Fields {
+			nf := f
+			if f.Type != nil {
+				t := rewriteCanonFirstOcc(*f.Type, defs, shortCount, shortToFull, seen)
+				nf.Type = &t
+			}
+			no.Fields[i] = nf
+		}
+	}
+	if o.Items != nil {
+		t := rewriteCanonFirstOcc(*o.Items, defs, shortCount, shortToFull, seen)
+		no.Items = &t
+	}
+	if o.Values != nil {
+		t := rewriteCanonFirstOcc(*o.Values, defs, shortCount, shortToFull, seen)
+		no.Values = &t
+	}
+	return &no
+}
+
 func (s *Schema) Canonical() []byte {
 	// Use json.Encoder with HTML escaping disabled: PCF requires raw
 	// UTF-8 (the "STRINGS" rule), so <, >, & must NOT be escaped to
@@ -220,7 +360,7 @@ func (s *Schema) Canonical() []byte {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
-	_ = enc.Encode(s.c)
+	_ = enc.Encode(canonicalFirstOccurrence(s.c))
 	out := buf.Bytes()
 	if n := len(out); n > 0 && out[n-1] == '\n' {
 		out = out[:n-1] // strip Encoder's trailing newline
@@ -800,13 +940,15 @@ func validName(s string) bool {
 // unionMissing / unionMissingDeser patch union branch function tables
 // when a branch type was a forward reference.
 type unionMissing struct {
-	ser     *serUnion
-	missing map[int]string // branch index → type name
+	ser        *serUnion
+	missing    map[int]string // branch index → type name
+	parentName string         // enclosing scope, for the finalize namespace-qualified retry
 }
 
 type unionMissingDeser struct {
-	deser   *deserUnion
-	missing map[int]string
+	deser      *deserUnion
+	missing    map[int]string
+	parentName string
 }
 
 // fieldMeta carries Avro-level type info for a record field, used by the
@@ -829,8 +971,9 @@ type fieldMeta struct {
 // metaFixup patches a fieldMeta's serRecord/deserRecord when the inner
 // type of a null-union was a forward reference.
 type metaFixup struct {
-	meta *fieldMeta
-	name string
+	meta       *fieldMeta
+	name       string
+	parentName string
 }
 
 // recordFieldFixup patches a record field's ser/deser function, avroType,
@@ -841,8 +984,9 @@ type recordFieldFixup struct {
 	nd         *schemaNode
 	idx        int
 	name       string
-	defaultVal any  // parsed JSON default; valid only when hasDefault is true
-	hasDefault bool // whether the field had a "default" in the schema
+	parentName string // enclosing record fullname, for the namespace-qualified retry
+	defaultVal any    // parsed JSON default; valid only when hasDefault is true
+	hasDefault bool   // whether the field had a "default" in the schema
 }
 
 // containerFixup patches an array or map container whose element type
@@ -856,6 +1000,7 @@ type containerFixup struct {
 	setMinBytes func(int)    // setter for minItemBytes (array) or 1+min (map)
 	nodeChild   **schemaNode // address of arrayNode.items / mapNode.values
 	name        string       // referenced named-type name
+	parentName  string       // enclosing scope, for the namespace-qualified retry
 	ctxLabel    string       // "array" or "map" for error messages
 }
 
@@ -1072,40 +1217,58 @@ func (b *builder) registerNamed(name string, nt *namedType) {
 // bare-string named-ref path and buildComplex's wrapped-form
 // {"type":"Name"} path so the rejectCachedRefIfCustomTypeWouldMatch
 // gate and the namespace-qualified retry agree.
-func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (bool, error) {
-	assign := func(n string, nt *namedType) error {
-		if err := b.rejectCachedRefIfCustomTypeWouldMatch(n, nt); err != nil {
-			return err
-		}
-		if setCanon {
-			b.canon = aschema{primitive: n}
-		}
-		b.ser = nt.ser
-		b.deser = nt.deser
-		if nt.sr != nil {
-			b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
-		}
-		b.node = nt.node
-		return nil
-	}
+// resolveNamedRef looks up a named-type reference by name, applying the
+// namespace-qualified retry: a bare name (no dot) is retried under
+// parentName's namespace prefix (e.g. "Inner" referenced inside
+// "com.x.Outer" resolves to "com.x.Inner"). Returns the resolved fullname
+// and the namedType, or ("", nil) when unresolved.
+//
+// Shared by tryAssignNamedRef (build-time, backward references) and
+// finalize (forward-reference fixups) so the qualification rule lives in
+// ONE place. finalize previously did a bare b.named[name] lookup with no
+// qualified retry, so a forward reference into a namespaced scope failed
+// ("unknown type") even though the byte-identical backward-ordered schema
+// resolved through tryAssignNamedRef's retry — an order-dependent parse
+// rejection of a valid schema.
+func (b *builder) resolveNamedRef(name, parentName string) (string, *namedType) {
 	if nt := b.named[name]; nt != nil {
-		return true, assign(name, nt)
+		return name, nt
 	}
 	if !strings.Contains(name, ".") && parentName != "" {
 		if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
 			qualified := parentName[:dot+1] + name
 			if nt := b.named[qualified]; nt != nil {
-				return true, assign(qualified, nt)
+				return qualified, nt
 			}
 		}
 	}
-	return false, nil
+	return "", nil
+}
+
+func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (bool, error) {
+	resolved, nt := b.resolveNamedRef(name, parentName)
+	if nt == nil {
+		return false, nil
+	}
+	if err := b.rejectCachedRefIfCustomTypeWouldMatch(resolved, nt); err != nil {
+		return true, err
+	}
+	if setCanon {
+		b.canon = aschema{primitive: resolved}
+	}
+	b.ser = nt.ser
+	b.deser = nt.deser
+	if nt.sr != nil {
+		b.meta = fieldMeta{avroType: "record", serRecord: nt.sr, deserRecord: nt.dr}
+	}
+	b.node = nt.node
+	return true, nil
 }
 
 func (b *builder) finalize() error {
 	for _, m := range b.missing {
 		for idx, name := range m.missing {
-			nt := b.named[name]
+			_, nt := b.resolveNamedRef(name, m.parentName)
 			if nt == nil {
 				return fmt.Errorf("unknown type %q", truncForError(name))
 			}
@@ -1114,11 +1277,18 @@ func (b *builder) finalize() error {
 	}
 	for _, m := range b.dmissing {
 		for idx, name := range m.missing {
-			m.deser.fns[idx] = b.named[name].deser
+			_, nt := b.resolveNamedRef(name, m.parentName)
+			if nt == nil {
+				return fmt.Errorf("unknown type %q", truncForError(name))
+			}
+			m.deser.fns[idx] = nt.deser
 		}
 	}
 	for _, m := range b.mfixups {
-		nt := b.named[m.name]
+		_, nt := b.resolveNamedRef(m.name, m.parentName)
+		if nt == nil {
+			return fmt.Errorf("unknown type %q", truncForError(m.name))
+		}
 		m.meta.serRecord = nt.sr
 		m.meta.deserRecord = nt.dr
 	}
@@ -1127,7 +1297,7 @@ func (b *builder) finalize() error {
 	// field AND container child node is wired — encodeDefault recurses into
 	// a field's child nodes, and a not-yet-wired child would nil-panic.
 	for _, m := range b.fieldFixups {
-		nt := b.named[m.name]
+		_, nt := b.resolveNamedRef(m.name, m.parentName)
 		if nt == nil {
 			return fmt.Errorf("unknown type %q", truncForError(m.name))
 		}
@@ -1145,7 +1315,7 @@ func (b *builder) finalize() error {
 	}
 	// Phase 1b: wire every forward-referenced array/map container child.
 	for _, m := range b.containerFixups {
-		nt := b.named[m.name]
+		_, nt := b.resolveNamedRef(m.name, m.parentName)
 		if nt == nil {
 			return fmt.Errorf("%s references unknown named type %q", m.ctxLabel, truncForError(m.name))
 		}
@@ -1175,7 +1345,11 @@ func (b *builder) finalize() error {
 		if !m.hasDefault {
 			continue
 		}
-		node := b.named[m.name].node
+		_, nt := b.resolveNamedRef(m.name, m.parentName)
+		if nt == nil {
+			continue
+		}
+		node := nt.node
 		if node == nil {
 			continue
 		}
@@ -1723,11 +1897,11 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	case len(s.union) == 2 && s.union[0].primitive == "null":
 		b.ser = serNullUnion(ser)
 		b.deser = deserNullUnion(deser)
-		b.meta = b.buildNullUnionMeta(missing, branchMetas, 1, false)
+		b.meta = b.buildNullUnionMeta(parentName, missing, branchMetas, 1, false)
 	case len(s.union) == 2 && s.union[1].primitive == "null":
 		b.ser = serNullSecondUnion(ser)
 		b.deser = deserNullSecondUnion(deser)
-		b.meta = b.buildNullUnionMeta(missing, branchMetas, 0, true)
+		b.meta = b.buildNullUnionMeta(parentName, missing, branchMetas, 0, true)
 	default:
 		b.ser = ser.ser
 		b.deser = deser.deser
@@ -1735,12 +1909,14 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	}
 	if len(missing) > 0 {
 		b.missing = append(b.missing, unionMissing{
-			ser,
-			missing,
+			ser:        ser,
+			missing:    missing,
+			parentName: parentName,
 		})
 		b.dmissing = append(b.dmissing, unionMissingDeser{
-			deser,
-			missing,
+			deser:      deser,
+			missing:    missing,
+			parentName: parentName,
 		})
 	}
 	b.node = &schemaNode{
@@ -1758,10 +1934,10 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 // reference, the inner meta is queued for finalize-time fixup;
 // otherwise the inner meta is copied from branchMetas. nullSecond
 // distinguishes the two orderings.
-func (b *builder) buildNullUnionMeta(missing map[int]string, branchMetas []fieldMeta, nonNullIdx int, nullSecond bool) fieldMeta {
+func (b *builder) buildNullUnionMeta(parentName string, missing map[int]string, branchMetas []fieldMeta, nonNullIdx int, nullSecond bool) fieldMeta {
 	if name, isMissing := missing[nonNullIdx]; isMissing {
 		inner := &fieldMeta{}
-		b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: name})
+		b.mfixups = append(b.mfixups, metaFixup{meta: inner, name: name, parentName: parentName})
 		return fieldMeta{avroType: "nullunion", nullSecond: nullSecond, inner: inner}
 	}
 	inner := new(fieldMeta)
@@ -1790,7 +1966,19 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 	}
 
 	if ser, isPrimitive := serPrimitive[o.Type]; isPrimitive {
-		if o.Logical == "decimal" {
+		// "bytes" is the only primitive underlying that validateLogical
+		// permits for decimal/big-decimal ("fixed" is built on the
+		// named-type path below, never here). The o.Type=="bytes" gate
+		// matters because the CustomType-resurrection above can restore a
+		// dropped "decimal"/"big-decimal" logical onto ANY primitive
+		// (validateLogical soft-drops decimal on a wrong underlying type
+		// BEFORE its precision-required check, so o.Precision stays nil):
+		// without the gate a `{"type":"int","logicalType":"decimal"}` +
+		// decimal CustomType would enter this branch and dereference nil
+		// o.Precision. A resurrected logical on a non-bytes primitive
+		// instead falls through to the plain-primitive path, where the
+		// base ser/deser carry the value and the CustomType wraps them.
+		if o.Logical == "decimal" && o.Type == "bytes" {
 			scale := 0
 			if o.Scale != nil {
 				scale = *o.Scale
@@ -1829,7 +2017,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			b.node = nd
 			return nil
 		}
-		if o.Logical == "big-decimal" {
+		if o.Logical == "big-decimal" && o.Type == "bytes" {
 			if b.hasMatchingCustomTypeWithEncode(o.Type, o.Logical) {
 				b.ser = ser
 			} else {
@@ -2110,11 +2298,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 			if isFwdRef {
 				fix := recordFieldFixup{
-					sr:   sr,
-					dr:   dr,
-					nd:   nd,
-					idx:  fieldIdx,
-					name: fwdRefName,
+					sr:         sr,
+					dr:         dr,
+					nd:         nd,
+					idx:        fieldIdx,
+					name:       fwdRefName,
+					parentName: o.Name, // fields build under the record's fullname
 				}
 				if len(of.Default) > 0 {
 					fix.defaultVal = unmarshalDefault(of.Default)
@@ -2331,6 +2520,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				setMinBytes: func(n int) { da.minItemBytes = n },
 				nodeChild:   &arrayNode.items,
 				name:        fwdRefName,
+				parentName:  parentName,
 				ctxLabel:    "array",
 			})
 		}
@@ -2397,6 +2587,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				setMinBytes: func(n int) { dm.minEntryBytes = 1 + n },
 				nodeChild:   &mapNode.values,
 				name:        fwdRefName,
+				parentName:  parentName,
 				ctxLabel:    "map",
 			})
 		}

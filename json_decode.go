@@ -220,9 +220,19 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 				}
 				return err
 			}
-			return assignAny(indirectAlloc(v), out, node.kind)
+			// setCustomResult (not assignAny) so a custom decoder result
+			// that isn't assignable to a CONCRETE target returns a
+			// SemanticError instead of panicking in reflect.Set —
+			// matching the binary path (wrapDeserWithCustomDecoders).
+			// assignAny only checks assignability for interface targets;
+			// for a domain-typed struct field it Sets unconditionally.
+			return setCustomResult(indirectAlloc(v), out, node.kind)
 		}
-		return assignAny(indirectAlloc(v), tmp, node.kind)
+		// All decoders skipped: the raw Avro-native value (int64, []byte,
+		// …) lands in the target. setCustomResult guards the
+		// concrete-target assignability the same way the binary
+		// all-skip fall-through does.
+		return setCustomResult(indirectAlloc(v), tmp, node.kind)
 	}
 }
 
