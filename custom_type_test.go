@@ -761,6 +761,102 @@ func TestCustomTypeMapFastPathDisabled(t *testing.T) {
 	}
 }
 
+// An AvroType-only CustomType (no logicalType) must fire on the JSON
+// array/map element paths exactly as it does on binary. The binary
+// fast-path gate disables specialization when the element carries a custom
+// type (meta.hasCustomType); the JSON fast-path gate previously checked only
+// logical=="" and emitted/parsed the raw element, silently skipping the
+// custom codec — a binary↔JSON wire divergence. (The existing
+// TestCustomType{Array,Map}FastPathDisabled use a logicalType-bearing custom
+// type, so logical!="" also tripped the JSON gate and masked this gap.)
+func TestCustomTypeJSONArrayAvroTypeOnly(t *testing.T) {
+	ct := CustomType{
+		AvroType: "long",
+		Encode:   func(v any, _ *SchemaNode) (any, error) { return v.(int64) + 1000, nil },
+		Decode:   func(v any, _ *SchemaNode) (any, error) { return v.(int64) - 1000, nil },
+	}
+	s, err := Parse(`{"type":"array","items":"long"}`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := []int64{5, 6}
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("binary encode: %v", err)
+	}
+	js, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("json encode: %v", err)
+	}
+	// Read the raw wire values each encoder wrote, via a no-custom schema.
+	plain := MustParse(`{"type":"array","items":"long"}`)
+	var rawBin, rawJSON []int64
+	if _, err := plain.Decode(bin, &rawBin); err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.DecodeJSON(js, &rawJSON); err != nil {
+		t.Fatal(err)
+	}
+	want := []int64{1005, 1006} // custom Encode added 1000
+	if !reflect.DeepEqual(rawBin, want) {
+		t.Fatalf("binary raw wire = %v, want %v", rawBin, want)
+	}
+	if !reflect.DeepEqual(rawJSON, want) {
+		t.Fatalf("json raw wire = %v, want %v (custom Encode skipped on JSON array fast path)", rawJSON, want)
+	}
+	// JSON decode must apply the custom Decode (subtract 1000).
+	var out []int64
+	if err := s.DecodeJSON(js, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("json decode = %v, want %v (custom Decode skipped on JSON array fast path)", out, in)
+	}
+}
+
+func TestCustomTypeJSONMapAvroTypeOnly(t *testing.T) {
+	ct := CustomType{
+		AvroType: "long",
+		Encode:   func(v any, _ *SchemaNode) (any, error) { return v.(int64) + 1000, nil },
+		Decode:   func(v any, _ *SchemaNode) (any, error) { return v.(int64) - 1000, nil },
+	}
+	s, err := Parse(`{"type":"map","values":"long"}`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := map[string]int64{"a": 5}
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("binary encode: %v", err)
+	}
+	js, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("json encode: %v", err)
+	}
+	plain := MustParse(`{"type":"map","values":"long"}`)
+	var rawBin, rawJSON map[string]int64
+	if _, err := plain.Decode(bin, &rawBin); err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.DecodeJSON(js, &rawJSON); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int64{"a": 1005}
+	if !reflect.DeepEqual(rawBin, want) {
+		t.Fatalf("binary raw wire = %v, want %v", rawBin, want)
+	}
+	if !reflect.DeepEqual(rawJSON, want) {
+		t.Fatalf("json raw wire = %v, want %v (custom Encode skipped on JSON map fast path)", rawJSON, want)
+	}
+	var out map[string]int64
+	if err := s.DecodeJSON(js, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("json decode = %v, want %v (custom Decode skipped on JSON map fast path)", out, in)
+	}
+}
+
 func TestCustomTypeFixedLogicalType(t *testing.T) {
 	// Exercises hasMatchingCustomType("fixed", logical) path.
 	type PackedID [8]byte

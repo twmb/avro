@@ -553,7 +553,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		}
 		// Native concrete fast path: plain primitive item + unnamed []V slice.
 		// Logical items, [N]T arrays, named slice/elem types fall through.
-		if node.items.logical == "" && v.Kind() == reflect.Slice && v.CanInterface() {
+		if node.items.logical == "" && custom[node.items] == nil && v.Kind() == reflect.Slice && v.CanInterface() {
 			if out, ok := appendAvroJSONNativeArray(buf, v, node.items.kind, cfg); ok {
 				return out, nil
 			}
@@ -585,7 +585,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		// assert it and emit natively (no reflect.MapRange). Logical-typed
 		// values (date/time/uuid serialize specially), named map/value types,
 		// and non-interfaceable maps fall through to the reflect path.
-		if node.values.logical == "" && v.Type().Key() == stringType && v.CanInterface() {
+		if node.values.logical == "" && custom[node.values] == nil && v.Type().Key() == stringType && v.CanInterface() {
 			if out, ok := appendAvroJSONNativeMap(buf, v, node.values.kind, cfg); ok {
 				return out, nil
 			}
@@ -653,8 +653,9 @@ func appendJSONNativeStringMap[V any](buf []byte, m map[string]V, emit func([]by
 // appendAvroJSONNativeMap emits a plain-primitive-valued map[string]V the same
 // way appendAvroJSON would, but natively. ok is false (buf untouched) when v's
 // dynamic type isn't the unnamed map[string]V for kind — the caller falls back
-// to the reflect path. Only reached when node.values.logical == "" (logical
-// values serialize specially) and the key is exactly string.
+// to the reflect path. Only reached when node.values has no logical type
+// (logical values serialize specially) and no custom codec (custom values
+// route through the per-element path), and the key is exactly string.
 func appendAvroJSONNativeMap(buf []byte, v reflect.Value, kind string, cfg *optConfig) ([]byte, bool) {
 	switch et := v.Type().Elem(); {
 	case kind == "string" && et == stringType:
@@ -704,7 +705,8 @@ func appendJSONNativeSlice[V any](buf []byte, s []V, emit func([]byte, V) []byte
 
 // appendAvroJSONNativeArray is appendAvroJSONNativeMap's slice sibling. ok is
 // false (buf untouched) when v's dynamic type isn't the unnamed []V for kind.
-// Only reached when node.items.logical == "" and v is a slice (not [N]T).
+// Only reached when node.items has no logical type and no custom codec, and
+// v is a slice (not [N]T).
 func appendAvroJSONNativeArray(buf []byte, v reflect.Value, kind string, cfg *optConfig) ([]byte, bool) {
 	switch et := v.Type().Elem(); {
 	case kind == "string" && et == stringType:

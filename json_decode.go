@@ -763,7 +763,7 @@ func (ctx *jsonDecoder) decodeArray(v reflect.Value, node *schemaNode, toAny boo
 	// Native concrete fast path: plain primitive item + unnamed []V. Drops the
 	// per-element reflect.Append + reflect parse. Logical items / named slice /
 	// named elem fall through.
-	if node.items.logical == "" {
+	if node.items.logical == "" && node.items.decodeJSON == nil {
 		if handled, err := decodeJSONNativeSliceDispatch(ctx, v, node.items); handled {
 			return err
 		}
@@ -833,7 +833,7 @@ func (ctx *jsonDecoder) decodeMap(v reflect.Value, node *schemaNode, toAny bool)
 	// parse into a reused elem stays; logical / named / non-interfaceable
 	// fall through. (Array JSON decode has no equivalent — it already parses
 	// in place via Index(i), so there's no SetMapIndex to remove.)
-	if node.values.logical == "" && keyType == stringType && v.CanInterface() {
+	if node.values.logical == "" && node.values.decodeJSON == nil && keyType == stringType && v.CanInterface() {
 		if handled, err := decodeJSONNativeMap(ctx, v, node.values); handled {
 			return err
 		}
