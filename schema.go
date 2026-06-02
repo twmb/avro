@@ -941,6 +941,7 @@ func validName(s string) bool {
 // when a branch type was a forward reference.
 type unionMissing struct {
 	ser        *serUnion
+	branches   []*schemaNode  // union node's branch slice; fwd-ref branch nodes are patched in finalize
 	missing    map[int]string // branch index → type name
 	parentName string         // enclosing scope, for the finalize namespace-qualified retry
 }
@@ -1273,6 +1274,15 @@ func (b *builder) finalize() error {
 				return fmt.Errorf("unknown type %q", truncForError(name))
 			}
 			m.ser.fns[idx] = nt.ser
+			// The builder left branches[idx] nil for this forward-ref
+			// branch (the named type wasn't built yet). The binary path
+			// dispatches through the ser/deser fn tables (patched here and
+			// in the b.dmissing loop below), but the JSON encode/decode,
+			// schema-resolution, and union-default-validation paths walk
+			// node.branches directly and would dereference the nil node.
+			if m.branches != nil {
+				m.branches[idx] = nt.node
+			}
 		}
 	}
 	for _, m := range b.dmissing {
@@ -1910,6 +1920,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	if len(missing) > 0 {
 		b.missing = append(b.missing, unionMissing{
 			ser:        ser,
+			branches:   branchNodes,
 			missing:    missing,
 			parentName: parentName,
 		})

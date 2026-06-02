@@ -204,3 +204,105 @@ func TestRegression_NameRefEnumUnionDefaultMetadata(t *testing.T) {
 
 func isStr(v any) bool   { _, ok := v.(string); return ok }
 func isBytes(v any) bool { _, ok := v.([]byte); return ok }
+
+// A union branch may be a forward reference to a named type declared later
+// in the same schema (a shape twmb deliberately accepts and round-trips on
+// the binary path). The builder leaves node.branches[i] nil for such a
+// branch and patches only the ser/deser function tables in finalize; every
+// path that walks node.branches directly — JSON encode, JSON decode, schema
+// resolution, and union-default validation — must still see the resolved
+// branch node, not the nil placeholder. These pin that finalize writes the
+// resolved node back into the union's branch slice so none of those paths
+// dereferences nil.
+func TestRegression_ForwardRefUnionBranchAllPaths(t *testing.T) {
+	type later struct {
+		V int32 `avro:"v"`
+	}
+	type rec struct {
+		Opt *later `avro:"opt"`
+		L   later  `avro:"l"`
+	}
+	// "opt" references "Later" before it is defined in field "l".
+	const sc = `{"type":"record","name":"R","fields":[
+	  {"name":"opt","type":["null","Later"]},
+	  {"name":"l","type":{"type":"record","name":"Later","fields":[{"name":"v","type":"int"}]}}]}`
+	s, err := avro.Parse(sc)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	in := rec{Opt: &later{V: 9}, L: later{V: 1}}
+
+	// Binary already worked; guard against regression.
+	bin, err := s.AppendEncode(nil, in)
+	if err != nil {
+		t.Fatalf("binary encode: %v", err)
+	}
+	var binOut rec
+	if _, err := s.Decode(bin, &binOut); err != nil {
+		t.Fatalf("binary decode: %v", err)
+	}
+	if !reflect.DeepEqual(in, binOut) {
+		t.Fatalf("binary round-trip: got %+v want %+v", binOut, in)
+	}
+
+	// JSON encode + decode must not nil-panic and must round-trip.
+	js, err := s.AppendEncodeJSON(nil, in)
+	if err != nil {
+		t.Fatalf("json encode: %v", err)
+	}
+	var jsOut rec
+	if err := s.DecodeJSON(js, &jsOut); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if !reflect.DeepEqual(in, jsOut) {
+		t.Fatalf("json round-trip: got %+v want %+v", jsOut, in)
+	}
+
+	// Schema resolution / compatibility must not nil-panic on the writer's
+	// forward-ref union branch.
+	if _, err := avro.Resolve(s, s); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := avro.CheckCompatibility(s, s); err != nil {
+		t.Fatalf("CheckCompatibility: %v", err)
+	}
+
+	// Null branch (the other arm) must still round-trip through JSON too.
+	inNull := rec{Opt: nil, L: later{V: 2}}
+	js2, err := s.AppendEncodeJSON(nil, inNull)
+	if err != nil {
+		t.Fatalf("json encode (null arm): %v", err)
+	}
+	var jsOut2 rec
+	if err := s.DecodeJSON(js2, &jsOut2); err != nil {
+		t.Fatalf("json decode (null arm): %v", err)
+	}
+	if !reflect.DeepEqual(inNull, jsOut2) {
+		t.Fatalf("json round-trip (null arm): got %+v want %+v", jsOut2, inNull)
+	}
+}
+
+// A union field whose first branch is a forward reference can carry a
+// default that matches that branch. The default validator walks
+// node.branches; a nil forward-ref branch made it report "no branch
+// matched" and reject a schema that is byte-equivalent to a backward-ordered
+// one that parses. Pins that field order does not change acceptance.
+func TestRegression_ForwardRefUnionDefaultParses(t *testing.T) {
+	const forward = `{"type":"record","name":"R","fields":[
+	  {"name":"u","type":["E","string"],"default":"A"},
+	  {"name":"e","type":{"type":"enum","name":"E","symbols":["A","B"]}}]}`
+	const backward = `{"type":"record","name":"R","fields":[
+	  {"name":"e","type":{"type":"enum","name":"E","symbols":["A","B"]}},
+	  {"name":"u","type":["E","string"],"default":"A"}]}`
+	if _, err := avro.Parse(backward); err != nil {
+		t.Fatalf("backward-ordered control should parse: %v", err)
+	}
+	sf, err := avro.Parse(forward)
+	if err != nil {
+		t.Fatalf("forward-ref union default should parse (byte-equivalent to backward): %v", err)
+	}
+	// The default "A" resolves to the enum branch; it surfaces in metadata.
+	if got := sf.Root().Fields[0].Default; !isStr(got) || got.(string) != "A" {
+		t.Fatalf("union default = %#v, want \"A\"", got)
+	}
+}
