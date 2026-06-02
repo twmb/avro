@@ -3923,3 +3923,166 @@ func TestRegression_OCFUnknownCodecErrorBounded(t *testing.T) {
 		t.Errorf("short codec name error %q lost diagnostic content", err.Error())
 	}
 }
+
+// closeCountCodec is a null-passthrough codec that counts Close calls. A custom
+// codec that frees pooled buffers or decrements a refcount in Close must be
+// closed exactly once even when Writer.Close/Reader.Close are called
+// repeatedly.
+type closeCountCodec struct{ closes *int }
+
+func (closeCountCodec) Name() string                          { return "null" }
+func (closeCountCodec) Compress(src []byte) ([]byte, error)   { return append([]byte(nil), src...), nil }
+func (closeCountCodec) Decompress(src []byte) ([]byte, error) { return append([]byte(nil), src...), nil }
+func (c closeCountCodec) Close() error                        { *c.closes++; return nil }
+
+// assertOneInt reads buf as an OCF and asserts it contains exactly one int
+// datum equal to want — the second Decode must be a clean io.EOF. This catches
+// a file silently extended past its logical EOF.
+func assertOneInt(t *testing.T, buf *bytes.Buffer, want int32) {
+	t.Helper()
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	var got int32
+	if err := r.Decode(&got); err != nil {
+		t.Fatalf("decoding first datum: %v", err)
+	}
+	if got != want {
+		t.Fatalf("first datum = %d, want %d", got, want)
+	}
+	if err := r.Decode(&got); err != io.EOF {
+		t.Fatalf("second Decode = %v (value %d), want io.EOF — file extended past logical EOF", err, got)
+	}
+}
+
+// After Close, the Writer must reject every mutator rather than silently
+// extending the file. A closed codec cannot be relied on to catch the misuse
+// (klauspost's zstd encoder silently re-initializes after Close), so the Writer
+// tracks its own closed state. Mirrors Java DataFileWriter.assertOpen.
+func TestRegression_WriterRejectsMutatorsAfterClose(t *testing.T) {
+	s, err := avro.Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func() (*Writer, *bytes.Buffer) {
+		var buf bytes.Buffer
+		w, err := NewWriter(&buf, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := int32(1)
+		if err := w.Encode(&v); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return w, &buf
+	}
+
+	t.Run("Encode", func(t *testing.T) {
+		w, buf := build()
+		v := int32(2)
+		if err := w.Encode(&v); err == nil {
+			t.Error("Encode after Close returned nil; want error")
+		}
+		assertOneInt(t, buf, 1)
+	})
+	t.Run("Write", func(t *testing.T) {
+		w, buf := build()
+		if _, err := w.Write([]byte{0x04}); err == nil {
+			t.Error("Write after Close returned nil; want error")
+		}
+		assertOneInt(t, buf, 1)
+	})
+	t.Run("Flush", func(t *testing.T) {
+		w, buf := build()
+		if err := w.Flush(); err == nil {
+			t.Error("Flush after Close returned nil; want error")
+		}
+		assertOneInt(t, buf, 1)
+	})
+	t.Run("Reset", func(t *testing.T) {
+		w, _ := build()
+		var buf2 bytes.Buffer
+		if err := w.Reset(&buf2); err == nil {
+			t.Error("Reset after Close returned nil; want error")
+		}
+	})
+}
+
+// Writer.Close is idempotent toward the codec: repeated Close calls close the
+// underlying codec exactly once.
+func TestRegression_WriterCloseClosesCodecOnce(t *testing.T) {
+	s, err := avro.Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closes := 0
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s, WithCodec(closeCountCodec{&closes}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := int32(7)
+	if err := w.Encode(&v); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close #%d: %v", i+1, err)
+		}
+	}
+	if closes != 1 {
+		t.Errorf("codec.Close called %d times across 3 Writer.Close calls; want 1", closes)
+	}
+}
+
+// Reader.Close is idempotent toward the codec, and Decode after Close errors
+// rather than returning data or a clean io.EOF.
+func TestRegression_ReaderRejectsUseAfterCloseAndClosesCodecOnce(t *testing.T) {
+	s, err := avro.Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two records in one block, so the second is buffered after the first
+	// Decode — a use-after-Close that returns buffered data would leak it.
+	for _, v := range []int32{7, 9} {
+		if err := w.Encode(&v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	closes := 0
+	r, err := NewReader(bytes.NewReader(buf.Bytes()), WithCodec(closeCountCodec{&closes}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got int32
+	if err := r.Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if err := r.Close(); err != nil {
+			t.Fatalf("Close #%d: %v", i+1, err)
+		}
+	}
+	if closes != 1 {
+		t.Errorf("codec.Close called %d times across 2 Reader.Close calls; want 1", closes)
+	}
+	// The second record is still buffered; Decode after Close must error
+	// rather than leak it.
+	if err := r.Decode(&got); err == nil {
+		t.Errorf("Decode after Close returned nil (value %d); want error", got)
+	}
+}

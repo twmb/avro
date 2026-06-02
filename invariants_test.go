@@ -77,16 +77,43 @@ func paritySchemas() []paritySchema {
 	}
 }
 
-// allowedAsymmetry holds schema/type pairs where a type encodes but its own
-// wire will not decode back into that same type BY DOCUMENTED, PINNED POLICY.
-// Keyed "schema/type". Each entry must cite the pin(s) that document the
-// intentional asymmetry; anything NOT listed here fails the invariant.
+// allowedAsymmetry holds axis/schema/type triples where a type encodes but its
+// own wire will not decode back into that same type BY DOCUMENTED, PINNED
+// POLICY. Keyed "axis/schema/type". Each entry must cite the pin(s) that
+// document the intentional asymmetry; anything NOT listed here fails the
+// invariant.
 //
 // Currently empty: json.Number is numeric-only (rejected for string, bytes,
 // fixed, and enum on BOTH encode and decode — see
 // TestRegression_JSONNumberStringSourceRejectedOnEncode), so no stringy
-// encode/decode round-trip asymmetry remains.
+// encode/decode round-trip asymmetry remains on either wire format.
 var allowedAsymmetry = map[string]string{}
+
+// parityAxis is one wire format's encode/decode pair. The target-type parity
+// rule must hold INDEPENDENTLY on each: a value encoded as binary must decode
+// back from binary into the same Go type, and likewise for JSON. The custom-
+// type logical-suppression bugs that recurred this audit were precisely a JSON
+// path diverging from the binary path, so the JSON axis is not redundant.
+type parityAxis struct {
+	name   string
+	encode func(s *avro.Schema, v any) ([]byte, error)
+	decode func(s *avro.Schema, wire []byte, ptr any) error
+}
+
+func parityAxes() []parityAxis {
+	return []parityAxis{
+		{
+			"binary",
+			func(s *avro.Schema, v any) ([]byte, error) { return s.Encode(v) },
+			func(s *avro.Schema, wire []byte, ptr any) error { _, err := s.Decode(wire, ptr); return err },
+		},
+		{
+			"json",
+			func(s *avro.Schema, v any) ([]byte, error) { return s.EncodeJSON(v) },
+			func(s *avro.Schema, wire []byte, ptr any) error { return s.DecodeJSON(wire, ptr) },
+		},
+	}
+}
 
 func TestInvariant_EncodeDecodeTargetParity(t *testing.T) {
 	cands := goTypeCands()
@@ -96,24 +123,26 @@ func TestInvariant_EncodeDecodeTargetParity(t *testing.T) {
 		allowHits []string
 	)
 
-	for _, sc := range paritySchemas() {
-		s, err := avro.Parse(sc.json)
-		if err != nil {
-			t.Fatalf("%s: Parse: %v", sc.name, err)
-		}
-		for _, c := range cands {
-			wireT, encErr := s.Encode(c.sample)
-			if encErr != nil {
-				continue // type not encode-accepted for this schema; not a round-trip concern
+	for _, axis := range parityAxes() {
+		for _, sc := range paritySchemas() {
+			s, err := avro.Parse(sc.json)
+			if err != nil {
+				t.Fatalf("%s: Parse: %v", sc.name, err)
 			}
-			checked++
-			if _, decErr := s.Decode(wireT, c.newPtr()); decErr != nil {
-				key := sc.name + "/" + c.name
-				msg := fmt.Sprintf("%s: Encode(%s) OK -> Decode(its own wire)->*%s rejects: %v", sc.name, c.name, c.name, decErr)
-				if reason, ok := allowedAsymmetry[key]; ok {
-					allowHits = append(allowHits, msg+"  [allowed: "+reason+"]")
-				} else {
-					breaks = append(breaks, msg)
+			for _, c := range cands {
+				wireT, encErr := axis.encode(s, c.sample)
+				if encErr != nil {
+					continue // type not encode-accepted for this schema; not a round-trip concern
+				}
+				checked++
+				if decErr := axis.decode(s, wireT, c.newPtr()); decErr != nil {
+					key := axis.name + "/" + sc.name + "/" + c.name
+					msg := fmt.Sprintf("[%s] %s: Encode(%s) OK -> Decode(its own wire)->*%s rejects: %v", axis.name, sc.name, c.name, c.name, decErr)
+					if reason, ok := allowedAsymmetry[key]; ok {
+						allowHits = append(allowHits, msg+"  [allowed: "+reason+"]")
+					} else {
+						breaks = append(breaks, msg)
+					}
 				}
 			}
 		}
@@ -128,6 +157,6 @@ func TestInvariant_EncodeDecodeTargetParity(t *testing.T) {
 		t.Errorf("round-trip break: %s", m)
 	}
 	if len(breaks) == 0 {
-		t.Logf("round-trip parity holds: %d (schema, Go type) pairs encode AND decode back into the same type", checked)
+		t.Logf("round-trip parity holds across binary+json: %d (axis, schema, Go type) triples encode AND decode back into the same type", checked)
 	}
 }

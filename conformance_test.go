@@ -20061,18 +20061,15 @@ func TestRegression_IntDefaultLengthCapBounded(t *testing.T) {
 	if got := len(err.Error()); got > 200 {
 		t.Errorf("error length %d unbounded — should be capped before echoing input", got)
 	}
-	// Wall-clock check is meaningful only without race instrumentation;
-	// the bound is generous to absorb json.Unmarshal tokenization
-	// overhead on the 4 MiB schema bytes (parseInt64Lenient rejects in
-	// O(1) once schema-build reaches it). Under -race, schema-parse is
-	// 5-10x slower; the behavioral check above (err.length bounded)
-	// runs in every mode.
-	threshold := 500 * time.Millisecond
-	if isRaceEnabled() {
-		threshold = 5 * time.Second
-	}
-	if elapsed > threshold {
-		t.Errorf("4 MiB default parse took %s — exceeds %s bound", elapsed, threshold)
+	// The wall-clock guard runs only WITHOUT race instrumentation. Under
+	// -race the 5-10x slowdown plus uncontrolled host load (parallel tests,
+	// other processes) make any fixed budget non-deterministic — a relaxed
+	// -race threshold is a band-aid that still flakes under contention. The
+	// behavioral guard (bounded error above) and the race detector itself run
+	// in every mode; the O(1)-reject perf guard lives in the non-race suite,
+	// where the tight 500ms budget is deterministic and meaningful.
+	if !isRaceEnabled() && elapsed > 500*time.Millisecond {
+		t.Errorf("4 MiB default parse took %s — exceeds 500ms bound", elapsed)
 	}
 
 	t.Run("legitimate-length int64 still accepted (boundary-1)", func(t *testing.T) {
@@ -20121,14 +20118,13 @@ func TestRegression_DeepSchemaParseRunsInBoundedTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("depth-%d schema parse failed: %v", depth, err)
 	}
-	// Wall-clock bound; -race adds 5-10x overhead so the threshold
-	// relaxes proportionally.
-	threshold := 1 * time.Second
-	if isRaceEnabled() {
-		threshold = 10 * time.Second
-	}
-	if elapsed > threshold {
-		t.Errorf("depth-%d parse took %s — exceeds %s threshold (re-Marshal regression?)", depth, elapsed, threshold)
+	// The wall-clock guard runs only WITHOUT -race: instrumentation overhead
+	// plus host load make a wall-clock budget non-deterministic under -race,
+	// while the perf-regression signal (a re-Marshal O(n^2) blowup) is fully
+	// visible in the non-race run's tight 1s budget (a quadratic blowup would
+	// be seconds even there). The race detector still runs in -race mode.
+	if !isRaceEnabled() && elapsed > 1*time.Second {
+		t.Errorf("depth-%d parse took %s — exceeds 1s threshold (re-Marshal regression?)", depth, elapsed)
 	}
 }
 

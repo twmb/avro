@@ -59,6 +59,25 @@ type customWiring struct {
 	// callbacks. Built once at parse time and reused across calls.
 	// Always populated when the wiring is non-nil.
 	sn *SchemaNode
+	// suppressLogical mirrors the binary decoder-suppression decision
+	// (hasMatchingCustomType) so the JSON decode wrapper feeds the custom
+	// decoder the same raw-vs-enriched value the binary path does. False
+	// for wildcard CustomTypes (empty LogicalType AND AvroType), which the
+	// binary gate excludes — they must receive the enriched logical value.
+	// Carried here so resolved nodes (resolve.go) reuse the parse-time
+	// decision without re-running the gate.
+	suppressLogical bool
+	// encodeSuppresses mirrors the binary ENCODER-suppression decision
+	// (hasMatchingCustomTypeWithEncode). The JSON encode arms (decimal /
+	// big-decimal on bytes; all logicals on fixed) must skip the built-in
+	// logical coercion arm iff the binary build replaced the logical
+	// serializer with the base (raw-bytes) serializer — which is iff a
+	// non-wildcard matching CustomType has an Encode. Gating the JSON arms
+	// on the runtime proxy `custom[node].encode != nil` instead would
+	// wrongly skip the arm for a WILDCARD-with-Encode (the binary keeps the
+	// logical ser for wildcards), rejecting *big.Rat on JSON while binary
+	// accepts it. Use this exact predicate, not the proxy.
+	encodeSuppresses bool
 }
 
 // schemaNode preserves full schema metadata that canonical form strips:
@@ -237,7 +256,7 @@ func canonicalFirstOccurrence(s aschema) aschema {
 	if len(defs) == 0 {
 		return s // no named types: nothing can be relocated
 	}
-	return rewriteCanonFirstOcc(s, defs, shortCount, shortToFull, map[string]struct{}{})
+	return rewriteCanonFirstOcc(s, "", defs, shortCount, shortToFull, map[string]struct{}{})
 }
 
 // collectCanonDefs records every named-type definition (the aobject whose
@@ -277,25 +296,37 @@ func collectCanonDefs(s aschema, defs map[string]*aobject, shortCount map[string
 // lookupCanonDef resolves a reference name to its definition aobject, or
 // nil when ref is a real Avro primitive (never a named ref) or names a
 // type defined outside this schema (a SchemaCache cross-reference — left
-// as a bare name, the pre-existing behavior). A bare reference into a
-// namespaced scope resolves by unique unqualified name.
-func lookupCanonDef(ref string, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string) *aobject {
+// as a bare name, the pre-existing behavior). A bare reference resolves
+// lexically in the enclosing namespace ns (mirroring parse-time
+// resolveNamedRef), so a short name shared across namespaces still resolves
+// to its in-scope fullname rather than being emitted verbatim.
+func lookupCanonDef(ref, ns string, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string) *aobject {
 	if _, isPrim := serPrimitive[ref]; isPrim {
 		return nil
 	}
 	if o, ok := defs[ref]; ok {
 		return o
 	}
-	if !strings.Contains(ref, ".") && shortCount[ref] == 1 {
-		return defs[shortToFull[ref]]
+	if !strings.Contains(ref, ".") {
+		// A bare reference resolves in its enclosing namespace. This is the
+		// only correct resolution; the globally-unique fallback below covers
+		// references with no enclosing namespace (ns == "").
+		if ns != "" {
+			if o, ok := defs[ns+"."+ref]; ok {
+				return o
+			}
+		}
+		if shortCount[ref] == 1 {
+			return defs[shortToFull[ref]]
+		}
 	}
 	return nil
 }
 
-func rewriteCanonFirstOcc(s aschema, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string, seen map[string]struct{}) aschema {
+func rewriteCanonFirstOcc(s aschema, ns string, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string, seen map[string]struct{}) aschema {
 	switch {
 	case s.primitive != "":
-		def := lookupCanonDef(s.primitive, defs, shortCount, shortToFull)
+		def := lookupCanonDef(s.primitive, ns, defs, shortCount, shortToFull)
 		if def == nil {
 			return s // real primitive, or a cross-schema reference: emit as-is
 		}
@@ -303,7 +334,7 @@ func rewriteCanonFirstOcc(s aschema, defs map[string]*aobject, shortCount map[st
 			return aschema{primitive: def.Name} // already emitted: bare fullname
 		}
 		seen[def.Name] = struct{}{}
-		return aschema{object: rewriteCanonObj(def, defs, shortCount, shortToFull, seen)}
+		return aschema{object: rewriteCanonObj(def, ns, defs, shortCount, shortToFull, seen)}
 	case s.object != nil:
 		o := s.object
 		if isNamedKind(o.Type) && o.Name != "" {
@@ -312,11 +343,11 @@ func rewriteCanonFirstOcc(s aschema, defs map[string]*aobject, shortCount map[st
 			}
 			seen[o.Name] = struct{}{}
 		}
-		return aschema{object: rewriteCanonObj(o, defs, shortCount, shortToFull, seen)}
+		return aschema{object: rewriteCanonObj(o, ns, defs, shortCount, shortToFull, seen)}
 	case len(s.union) != 0:
 		out := make([]aschema, len(s.union))
 		for i := range s.union {
-			out[i] = rewriteCanonFirstOcc(s.union[i], defs, shortCount, shortToFull, seen)
+			out[i] = rewriteCanonFirstOcc(s.union[i], ns, defs, shortCount, shortToFull, seen)
 		}
 		return aschema{union: out}
 	}
@@ -328,25 +359,32 @@ func rewriteCanonFirstOcc(s aschema, defs map[string]*aobject, shortCount map[st
 // (Fields[].Type / Items / Values) through rewriteCanonFirstOcc, so
 // per-object PCF emission is unchanged and only the full-vs-reference
 // placement of nested named types moves to first occurrence.
-func rewriteCanonObj(o *aobject, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string, seen map[string]struct{}) *aobject {
+func rewriteCanonObj(o *aobject, ns string, defs map[string]*aobject, shortCount map[string]int, shortToFull map[string]string, seen map[string]struct{}) *aobject {
+	// A named type (record/enum/fixed) establishes the namespace its children
+	// resolve bare references in; array/map carry no name, so their children
+	// inherit the enclosing namespace.
+	childNS := ns
+	if isNamedKind(o.Type) && o.Name != "" {
+		childNS = namespaceOf(o.Name)
+	}
 	no := *o
 	if len(o.Fields) > 0 {
 		no.Fields = make([]afield, len(o.Fields))
 		for i, f := range o.Fields {
 			nf := f
 			if f.Type != nil {
-				t := rewriteCanonFirstOcc(*f.Type, defs, shortCount, shortToFull, seen)
+				t := rewriteCanonFirstOcc(*f.Type, childNS, defs, shortCount, shortToFull, seen)
 				nf.Type = &t
 			}
 			no.Fields[i] = nf
 		}
 	}
 	if o.Items != nil {
-		t := rewriteCanonFirstOcc(*o.Items, defs, shortCount, shortToFull, seen)
+		t := rewriteCanonFirstOcc(*o.Items, childNS, defs, shortCount, shortToFull, seen)
 		no.Items = &t
 	}
 	if o.Values != nil {
-		t := rewriteCanonFirstOcc(*o.Values, defs, shortCount, shortToFull, seen)
+		t := rewriteCanonFirstOcc(*o.Values, childNS, defs, shortCount, shortToFull, seen)
 		no.Values = &t
 	}
 	return &no
@@ -374,6 +412,24 @@ func (s *Schema) Canonical() []byte {
 	// appears as an escape we want to undo.
 	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '2', '0', '2', '8'}, []byte{0xe2, 0x80, 0xa8})
 	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '2', '0', '2', '9'}, []byte{0xe2, 0x80, 0xa9})
+	// The nested aobject/aschema MarshalJSON methods call plain
+	// json.Marshal, which HTML-escapes the three ASCII characters less-than,
+	// greater-than, and ampersand to their six-byte JSON unicode escapes
+	// (lowercase hex) — and it does so regardless of the outer encoder's
+	// SetEscapeHTML(false) above, because a Marshaler's output is passed
+	// through verbatim (only U+2028/U+2029 get re-processed). PCF's STRINGS
+	// rule requires raw UTF-8 for these too; Java's SchemaNormalization
+	// (lang/java/.../SchemaNormalization.java) appends names / symbols /
+	// fullnames with no escaping, so leaving them escaped diverges the
+	// Rabin/SHA/MD5 fingerprint and the SOE header. Undo the escapes — safe
+	// for the same reason as the U+2028/U+2029 replacement above:
+	// json.Marshal emits exactly these lowercase six-byte forms, and a
+	// literal backslash inside a string is itself escaped to a double
+	// backslash, so a single-backslash escape only appears as one we want
+	// to undo.
+	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '0', '0', '3', 'c'}, []byte{'<'})
+	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '0', '0', '3', 'e'}, []byte{'>'})
+	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '0', '0', '2', '6'}, []byte{'&'})
 	return out
 }
 
@@ -1631,6 +1687,21 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		}
 	}
 
+	// suppressLogical mirrors the binary decoder-suppression gate
+	// (hasMatchingCustomType, the same predicate the primitive/decimal/fixed
+	// builds use to decide between the raw and logical deserializer). The
+	// JSON wrapper must suppress the logical transform iff the binary path
+	// does, or the custom decoder sees raw on one path and enriched on the
+	// other. Wildcard CustomTypes (empty LogicalType AND AvroType) are
+	// excluded by the gate, so they keep the enriched value on BOTH paths.
+	suppressLogical := b.hasMatchingCustomType(node.kind, node.logical)
+	wiring.suppressLogical = suppressLogical
+	// encodeSuppresses mirrors the binary ENCODER-suppression gate exactly
+	// (hasMatchingCustomTypeWithEncode — excludes wildcards), so the JSON
+	// encode arms suppress the built-in logical coercion iff the binary build
+	// did. See customWiring.encodeSuppresses.
+	wiring.encodeSuppresses = b.hasMatchingCustomTypeWithEncode(node.kind, node.logical)
+
 	if len(decoders) > 0 {
 		wiring.decoders = decoders
 		b.deser = wrapDeserWithCustomDecoders(node.deser, decoders, sn)
@@ -1639,7 +1710,19 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		// (decodeValue) checks node.decodeJSON first and falls back
 		// to decodeKind otherwise — no per-call map lookup, no
 		// recursion guard, no shared mutable state.
-		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(decoders, sn)
+		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(decoders, sn, suppressLogical)
+	} else if suppressLogical && jsonDecodeAppliesLogical(node) {
+		// Encode-only custom (Decode==nil) on a logical node that the binary
+		// path suppresses (non-wildcard): with no Decode callback the user
+		// receives the RAW Avro-native value (CustomType.Decode docstring:
+		// "If nil, the built-in logical type handler is bypassed ... the
+		// base Avro type decoder is used directly, producing raw values").
+		// decodeKind applies the logical transform unless suppressed, so
+		// install the raw-decode wrapper with an empty decoder chain to
+		// produce the same raw value through DecodeJSON. A wildcard
+		// (suppressLogical false) skips this — decodeKind keeps the logical
+		// transform, matching the binary wildcard path.
+		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(nil, sn, suppressLogical)
 	}
 
 	b.putCustomWiring(node, wiring)

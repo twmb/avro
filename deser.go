@@ -923,6 +923,16 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 				}
 				return src, setIface(v, sliceVal, "array")
 			}
+			// An empty Avro array decodes to a non-nil empty slice, matching
+			// the JSON array decoder and the binary map decoder (which uses
+			// MakeMap) — so a decoded empty array is distinguishable from an
+			// absent value and round-trips identically across wire formats.
+			// Only the empty case reaches here with v still nil; a populated
+			// or reused target already has a backing array. The IsNil check is
+			// once per array decode (not per element).
+			if v.IsNil() {
+				v.Set(reflect.MakeSlice(sliceType, 0, 0))
+			}
 			return src, nil
 		}
 		if err := checkArrayBlockBounds(count, totalItems, len(src), s.minItemBytes); err != nil {

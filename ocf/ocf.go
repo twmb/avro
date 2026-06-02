@@ -296,7 +296,13 @@ type Writer struct {
 	err        error
 	userMeta   []kv
 	hasSync    bool
+	closed     bool
 }
+
+// errClosed is returned by Writer/Reader methods invoked after Close. A closed
+// OCF object is permanently unusable; mutating it would corrupt the file or
+// reuse a released codec.
+var errClosed = errors.New("ocf: operation on a closed OCF")
 
 const defaultBlockBytes = 64 << 10 // 64 KiB
 
@@ -409,6 +415,9 @@ func (w *Writer) writeHeader() error {
 // After any error the Writer is poisoned: all subsequent calls return the
 // same error.
 func (w *Writer) Encode(v any) error {
+	if w.closed {
+		return errClosed
+	}
 	if w.err != nil {
 		return w.err
 	}
@@ -429,6 +438,9 @@ func (w *Writer) Encode(v any) error {
 // block. The caller must ensure p is exactly one datum encoded with the
 // writer's schema. Auto-flushing rules are the same as [Encode].
 func (w *Writer) Write(p []byte) (int, error) {
+	if w.closed {
+		return 0, errClosed
+	}
 	if w.err != nil {
 		return 0, w.err
 	}
@@ -444,6 +456,9 @@ func (w *Writer) Write(p []byte) (int, error) {
 
 // Flush writes any buffered items as a block. The Writer remains usable.
 func (w *Writer) Flush() error {
+	if w.closed {
+		return errClosed
+	}
 	if w.err != nil {
 		return w.err
 	}
@@ -458,7 +473,15 @@ func (w *Writer) Flush() error {
 // similar codecs hold goroutines and buffers whose lifetime must be
 // bounded; mirrors Java DataFileWriter.close's try { flush } finally
 // { codec.close }.
+//
+// Close is idempotent: subsequent calls return nil without re-closing the
+// codec. After Close, Encode, Write, Flush, and Reset all return an error
+// rather than silently extending the file.
 func (w *Writer) Close() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
 	var flushErr error
 	if w.err == nil && w.count > 0 {
 		flushErr = w.flush()
@@ -497,7 +520,12 @@ func (w *Writer) flush() error {
 // Reset flushes buffered items to the current destination, then starts a
 // new OCF on dst reusing the original schema, codec, and options. If the
 // Writer is in an error state the flush is skipped and the error is cleared.
+// Reset returns an error if the Writer has been closed — its codec is no
+// longer usable.
 func (w *Writer) Reset(dst io.Writer) error {
+	if w.closed {
+		return errClosed
+	}
 	if w.err == nil && w.count > 0 {
 		if err := w.flush(); err != nil {
 			return err
@@ -583,6 +611,7 @@ type Reader struct {
 	block         []byte
 	remain        int64
 	maxBlockBytes int64
+	closed        bool
 }
 
 // readHeader reads and validates the OCF header, returning the parsed
@@ -705,6 +734,9 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 
 // Decode reads the next datum into v, returning [io.EOF] at end of file.
 func (rd *Reader) Decode(v any) error {
+	if rd.closed {
+		return errClosed
+	}
 	if rd.remain == 0 {
 		if err := rd.readBlock(); err != nil {
 			return err
@@ -729,8 +761,14 @@ func (rd *Reader) Schema() *avro.Schema { return rd.schema }
 // "avro.*" and user-defined keys. The returned map must not be modified.
 func (rd *Reader) Metadata() map[string][]byte { return rd.meta }
 
-// Close closes the codec, releasing any resources it holds.
+// Close closes the codec, releasing any resources it holds. Close is
+// idempotent: subsequent calls return nil without re-closing the codec. After
+// Close, Decode returns an error.
 func (rd *Reader) Close() error {
+	if rd.closed {
+		return nil
+	}
+	rd.closed = true
 	return rd.codec.Close()
 }
 

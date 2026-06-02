@@ -254,6 +254,15 @@ func unqualified(name string) string {
 	return name
 }
 
+// namespaceOf returns the namespace portion of a fullname (everything before
+// the final dot), or "" when the name has no namespace.
+func namespaceOf(name string) string {
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		return name[:i]
+	}
+	return ""
+}
+
 // findWriterField finds the writer field matching a reader field by name or
 // reader field aliases.
 func findWriterField(rf fieldNode, writerFields map[string]*fieldNode) *fieldNode {

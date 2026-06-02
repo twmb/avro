@@ -18,20 +18,25 @@ import (
 // removal (skip), renaming (aliases), reordering, and type promotion.
 // Encoding with it uses the reader's format.
 //
-// If the schemas have identical canonical forms, reader is returned as-is.
-// Otherwise [CheckCompatibility] is called first and any incompatibility is
-// returned as a [*CompatibilityError]. See the package-level documentation
-// for a full example.
+// [CheckCompatibility] is called first and any incompatibility is returned as a
+// [*CompatibilityError]; if it passes and the schemas have identical canonical
+// forms, reader is returned as-is. The compatibility check must precede the
+// canonical-form fast path because the parsing canonical form strips logical-
+// type attributes (logicalType, precision, scale): two schemas can have equal
+// canonical forms yet be logically incompatible — most importantly a decimal
+// precision/scale mismatch — which would otherwise pass the fast path and
+// silently rescale the decoded value. See the package-level documentation for
+// a full example.
 //
 // Note: the argument order is (writer, reader), matching source-then-destination
 // convention and Java's GenericDatumReader. This differs from the Avro spec
 // text and hamba/avro, which put reader first.
 func Resolve(writer, reader *Schema) (*Schema, error) {
-	if bytes.Equal(reader.Canonical(), writer.Canonical()) {
-		return reader, nil
-	}
 	if err := CheckCompatibility(writer, reader); err != nil {
 		return nil, err
+	}
+	if bytes.Equal(reader.Canonical(), writer.Canonical()) {
+		return reader, nil
 	}
 	ctx := &resolveCtx{
 		seen:   make(map[nodePair]*schemaNode),
@@ -128,7 +133,7 @@ func (ctx *resolveCtx) applyCustomToNode(nd, r *schemaNode) {
 		return
 	}
 	nd.deser = wrapDeserWithCustomDecoders(nd.deser, w.decoders, w.sn)
-	nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(w.decoders, w.sn)
+	nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(w.decoders, w.sn, w.suppressLogical)
 }
 
 // resolveNode resolves a (reader, writer) schema pair, handling cycles

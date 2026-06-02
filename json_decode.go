@@ -70,6 +70,59 @@ func decodeLogicalBytes(b []byte, node *schemaNode) (any, error) {
 	return b, nil
 }
 
+// jsonDecodeAppliesLogical reports whether decodeKind would transform the raw
+// Avro-native value into an enriched Go type for this node's logical type —
+// the JSON parallel of the binary logical deserializer.
+//
+// It DERIVES the answer from the very decodeLogical{Int,Long,Bytes,Fixed}
+// functions decodeKind uses, by probing each with a placeholder value and
+// checking whether the result is still the raw Avro-native type. There is no
+// second list to keep in sync: a logical added to / removed from a
+// decodeLogical* switch is reflected here automatically, so the JSON
+// suppression gate can never drift from what decode actually does — correct by
+// construction ("applies a transform" ≡ "the decode function returns a non-raw
+// type"), including for a future logical.
+//
+// This is consulted ONLY by applyCustomTypes at PARSE time (the
+// wildcard/Decode-suppression gate). The placeholder boxing it does is a
+// parse-time-only cost (a handful of allocs per custom-typed logical node, one
+// time per schema) and never touches the encode/decode hot path — decodeKind
+// and the decodeLogical* functions are unchanged.
+// TestRegression_JSONDecodeAppliesLogicalMatchesDecode pins the result for
+// every logical against the human-known expected set.
+func jsonDecodeAppliesLogical(node *schemaNode) bool {
+	if node.logical == "" {
+		return false
+	}
+	switch node.kind {
+	case "int":
+		_, raw := decodeLogicalInt(0, node).(int32)
+		return !raw
+	case "long":
+		v, err := decodeLogicalLong(0, node)
+		if err != nil { // only a transforming arm (time-micros) can error
+			return true
+		}
+		_, raw := v.(int64)
+		return !raw
+	case "bytes":
+		v, err := decodeLogicalBytes(nil, node)
+		if err != nil { // only a transforming arm (big-decimal) can error on empty input
+			return true
+		}
+		_, raw := v.([]byte)
+		return !raw
+	case "fixed":
+		// Probe at the schema's declared size: decodeLogicalFixed's uuid /
+		// duration arms only convert at len 16 / 12 respectively.
+		_, raw := decodeLogicalFixed(make([]byte, node.size), node).([]byte)
+		return !raw
+	}
+	// string: decodeString applies no logical transform (uuid-on-string is
+	// identity), so no suppression is needed.
+	return false
+}
+
 // decodeLogicalFixed applies logical type conversion for fixed-backed logical types
 // when decoding to *any targets.
 func decodeLogicalFixed(b []byte, node *schemaNode) any {
@@ -126,6 +179,14 @@ type jsonDecoder struct {
 	slab           *slab
 	wrapUnions     bool
 	qualifyLogical bool
+	// suppressLogical, when set, makes the next decodeKind hand the RAW
+	// Avro-native value (int32/int64/[]byte) to its leaf decoder instead
+	// of the logical-transformed Go value (time.Time/time.Duration/
+	// *big.Rat). Set by wrapDecodeJSONWithCustomDecoders so a custom
+	// decoder chain receives the raw value, mirroring the binary path's
+	// logical-deser suppression. decodeKind captures and clears it on
+	// entry so it scopes to exactly one node.
+	suppressLogical bool
 }
 
 // decodeValue is the core recursive decoder. It reads the next JSON
@@ -159,6 +220,13 @@ func (ctx *jsonDecoder) decodeValue(v reflect.Value, node *schemaNode) error {
 // custom-decoder closure to produce the inner *any value before
 // applying the decoder chain.
 func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
+	// Capture and clear suppressLogical so it applies to exactly this
+	// node's leaf decode and never leaks into children decoded during
+	// recursion (e.g. a custom type whose AvroType is "record" — its
+	// fields must still get their own logical conversions).
+	raw := ctx.suppressLogical
+	ctx.suppressLogical = false
+
 	// Unions handle pointer/nil targets specially (before indirectAlloc),
 	// so dispatch early.
 	if node.kind == "union" {
@@ -174,9 +242,9 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 	case "boolean":
 		return ctx.decodeBool(v, toAny)
 	case "int":
-		return ctx.decodeInt(v, node, toAny)
+		return ctx.decodeInt(v, node, toAny, raw)
 	case "long":
-		return ctx.decodeLong(v, node, toAny)
+		return ctx.decodeLong(v, node, toAny, raw)
 	case "float":
 		return ctx.decodeFloat(v)
 	case "double":
@@ -186,9 +254,9 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 	case "enum":
 		return ctx.decodeEnum(v, node)
 	case "bytes":
-		return ctx.decodeBytes(v, node, toAny)
+		return ctx.decodeBytes(v, node, toAny, raw)
 	case "fixed":
-		return ctx.decodeFixed(v, node, toAny)
+		return ctx.decodeFixed(v, node, toAny, raw)
 	case "array":
 		return ctx.decodeArray(v, node, toAny)
 	case "map":
@@ -205,10 +273,21 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 // of wrapDeserWithCustomDecoders (custom_type.go). The inner value is
 // produced via decodeKind so we don't re-enter the wrapper for the
 // same node.
-func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, error), sn *SchemaNode) jsonDecodeFn {
+func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, error), sn *SchemaNode, suppressLogical bool) jsonDecodeFn {
 	return func(ctx *jsonDecoder, v reflect.Value, node *schemaNode) error {
 		var tmp any
 		tmpV := reflect.ValueOf(&tmp).Elem()
+		// Decode the RAW Avro-native value (int32/int64/[]byte) for the
+		// custom decoder chain when the binary path also suppresses the
+		// logical deserializer for this node — i.e. exactly when
+		// hasMatchingCustomType is true (suppressLogical). A wildcard
+		// CustomType (empty LogicalType AND AvroType) is excluded from that
+		// gate, so the binary path leaves the logical deserializer in place
+		// and feeds the callback the ENRICHED value; suppressLogical is
+		// false there so we keep the logical transform too, preserving
+		// binary↔JSON parity. decodeKind captures and clears the flag, so
+		// it applies only to this node's leaf decode.
+		ctx.suppressLogical = suppressLogical
 		if err := ctx.decodeKind(tmpV, node); err != nil {
 			return err
 		}
@@ -259,7 +338,7 @@ func (ctx *jsonDecoder) decodeBool(v reflect.Value, toAny bool) error {
 	return semErr(v, "boolean")
 }
 
-func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool) error {
+func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny, raw bool) error {
 	nb, err := ctx.scanner.consumeNumberBytes()
 	if err != nil {
 		return err
@@ -269,6 +348,9 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 		return err
 	}
 	if toAny {
+		if raw {
+			return setIface(v, reflect.ValueOf(val), "int")
+		}
 		return setIface(v, reflect.ValueOf(decodeLogicalInt(val, node)), "int")
 	}
 	// All DecodeJSON entry points produce addressable values
@@ -302,7 +384,7 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny bool)
 	return setIntValue(v, val)
 }
 
-func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool) error {
+func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny, raw bool) error {
 	nb, err := ctx.scanner.consumeNumberBytes()
 	if err != nil {
 		return err
@@ -312,6 +394,9 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny bool
 		return err
 	}
 	if toAny {
+		if raw {
+			return setIface(v, reflect.ValueOf(val), "long")
+		}
 		logical, err := decodeLogicalLong(val, node)
 		if err != nil {
 			return err
@@ -527,12 +612,15 @@ func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode) error {
 	return setEnumTarget(v, idx, s)
 }
 
-func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny bool) error {
+func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny, raw bool) error {
 	// Decimal / big-decimal logical types: accept JSON numbers (e.g. 0.33
 	// or 1.5) in addition to Avro JSON byte strings, for round-trip with
 	// EncodeJSON output and convenience for hand-edited JSON. Big-decimal
-	// is bytes-only per spec (rejected in decodeFixed).
-	if hasDecimalBareNumberArm(node) {
+	// is bytes-only per spec (rejected in decodeFixed). Skipped in raw
+	// (custom-decoder) mode: the callback receives the raw Avro-native
+	// []byte, and a bare JSON number has no raw-bytes form — matching the
+	// binary path, which has no bare-number form at all.
+	if !raw && hasDecimalBareNumberArm(node) {
 		if handled, err := ctx.decodeBareDecimal(v, node, toAny); handled {
 			return err
 		}
@@ -546,6 +634,9 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny boo
 		return err
 	}
 	if toAny {
+		if raw {
+			return setIface(v, reflect.ValueOf(b), "bytes")
+		}
 		val, err := decodeLogicalBytes(b, node)
 		if err != nil {
 			return err
@@ -555,10 +646,11 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny boo
 	return assignBytes(v, b, node)
 }
 
-func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny bool) error {
+func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny, raw bool) error {
 	// Decimal logical type: accept JSON numbers, same as decodeBytes.
 	// Big-decimal is bytes-only per spec, so it never reaches here.
-	if hasDecimalBareNumberArm(node) {
+	// Skipped in raw (custom-decoder) mode — see decodeBytes.
+	if !raw && hasDecimalBareNumberArm(node) {
 		if handled, err := ctx.decodeBareDecimal(v, node, toAny); handled {
 			return err
 		}
@@ -579,6 +671,9 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny boo
 		return fmt.Errorf("avro json: fixed value has %d bytes, schema declares %d", len(b), node.size)
 	}
 	if toAny {
+		if raw {
+			return setIface(v, reflect.ValueOf(b), "fixed")
+		}
 		return setIface(v, reflect.ValueOf(decodeLogicalFixed(b, node)), "fixed")
 	}
 	return assignBytes(v, b, node)

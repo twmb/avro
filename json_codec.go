@@ -206,6 +206,35 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		}
 		return nil, fmt.Errorf("avro json: nil value for non-nullable type %q", node.kind)
 	}
+	// Union dispatch BEFORE dereferencing and the custom hook: the branch
+	// encoders must receive the un-peeled value so a branch's custom encoder
+	// with a pointer/interface GoType matches at the pointer level. Mirrors
+	// binary serUnion (ser.go), which passes the un-peeled value to the
+	// branch serializers — their customEncode peels and GoType-checks at each
+	// level — and the decode side (decodeKind), which dispatches union before
+	// indirectAlloc. A custom type never matches a union container node
+	// (applyCustomTypes skips unions), so the custom hook below is not
+	// bypassed for unions; unionTypeNameForValue / isNilValue inside
+	// appendAvroJSONUnion peel internally for the branch-selection decision.
+	if node.kind == "union" {
+		return appendAvroJSONUnion(buf, v, node, cfg, custom, depth+1)
+	}
+	// Apply custom type encode conversion BEFORE dereferencing, so a
+	// custom type with a pointer GoType (e.g. *url.URL) matches before
+	// the pointer is stripped. customEncode (schema.go) peels and checks
+	// GoType at each level itself, returning either the encoded result or
+	// a pass-through value dereferenced as far as it peeled; the loop
+	// below then handles nil → null and any remaining indirection on a
+	// pass-through value. Mirrors the binary path, which wraps the
+	// serializer with the same customEncode closure on the un-peeled
+	// value (schema.go).
+	if w := custom[node]; w != nil && w.encode != nil {
+		var err error
+		v, err = w.encode(v)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// Dereference pointers and interfaces. Capped at maxIndirectDepth
 	// so a self-referential interface (var p any; p = &p) terminates;
 	// the deeply-wrapped value falls through to the type switch which
@@ -218,15 +247,6 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			return appendAvroJSON(buf, reflect.Value{}, node, cfg, custom, depth+1)
 		}
 		v = v.Elem()
-	}
-
-	// Apply custom type encode conversion before the type switch.
-	if w := custom[node]; w != nil && w.encode != nil {
-		var err error
-		v, err = w.encode(v)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	switch node.kind {
@@ -368,30 +388,46 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		// unscaled + zigzag scale, via buildBigDecimalPayload) in the
 		// spec codepoint-string form; binary and JSON share the
 		// helper to stay in lockstep.
+		// Skip the decimal/big-decimal coercion arm exactly when the binary
+		// build replaced serBytesDecimal/serBigDecimal with the base-bytes
+		// serializer — i.e. when a NON-WILDCARD matching CustomType has an
+		// Encode (encodeSuppresses = hasMatchingCustomTypeWithEncode). Then a
+		// value matching the custom GoType is written as its raw []byte and a
+		// non-matching pass-through (e.g. *big.Rat) is rejected by the
+		// base-bytes targets below. Gate on the threaded predicate, NOT the
+		// runtime proxy custom[node].encode != nil: a wildcard CustomType
+		// (empty LogicalType AND AvroType) has an Encode wrapper but is
+		// excluded from the binary gate, so it keeps the decimal arm (accepts
+		// *big.Rat) on BOTH paths.
+		noCustomEnc := custom[node] == nil || !custom[node].encodeSuppresses
 		switch node.logical {
 		case "decimal":
-			r, ok, err := decimalRatFor(v)
-			if err != nil {
-				return nil, semErrW(v, "bytes", err)
-			}
-			if ok {
-				b, err := decimalUnscaledBytes(r, node.scale, node.precision, "bytes", v.Type())
-				if err != nil {
-					return nil, err
-				}
-				return appendAvroJSONBytes(buf, b), nil
-			}
-		case "big-decimal":
-			r, ok, err := decimalRatFor(v)
-			if err != nil {
-				return nil, semErrW(v, "bytes", err)
-			}
-			if ok {
-				inner, err := buildBigDecimalPayload(r)
+			if noCustomEnc {
+				r, ok, err := decimalRatFor(v)
 				if err != nil {
 					return nil, semErrW(v, "bytes", err)
 				}
-				return appendAvroJSONBytes(buf, inner), nil
+				if ok {
+					b, err := decimalUnscaledBytes(r, node.scale, node.precision, "bytes", v.Type())
+					if err != nil {
+						return nil, err
+					}
+					return appendAvroJSONBytes(buf, b), nil
+				}
+			}
+		case "big-decimal":
+			if noCustomEnc {
+				r, ok, err := decimalRatFor(v)
+				if err != nil {
+					return nil, semErrW(v, "bytes", err)
+				}
+				if ok {
+					inner, err := buildBigDecimalPayload(r)
+					if err != nil {
+						return nil, semErrW(v, "bytes", err)
+					}
+					return appendAvroJSONBytes(buf, inner), nil
+				}
 			}
 		}
 		if v.Kind() == reflect.String {
@@ -432,58 +468,72 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		// extraction so a 36-char string isn't rejected as size != 16.
 		// Logical-arm fall-through lands on the generic string/slice/
 		// array targets below.
-		switch node.logical {
-		case "decimal":
-			r, ok, err := decimalRatFor(v)
-			if err != nil {
-				return nil, semErrW(v, "fixed", err)
-			}
-			if ok {
-				b, err := decimalUnscaledBytes(r, node.scale, node.precision, "fixed", v.Type())
+		// Skip ALL logical coercion arms exactly when the binary fixed build
+		// replaced serFixedDecimal / serDuration / serFixedUUIDReflect with the
+		// base serSize — i.e. when a NON-WILDCARD matching CustomType has an
+		// Encode (encodeSuppresses = hasMatchingCustomTypeWithEncode). Then a
+		// value matching the custom GoType is written as its raw bytes and a
+		// non-matching pass-through falls through to the size-checked base
+		// targets below. Gate on the threaded predicate, NOT the runtime proxy
+		// custom[node].encode != nil — a wildcard CustomType has an Encode
+		// wrapper but is excluded from the binary gate, so it keeps the logical
+		// arm on BOTH paths. (Non-fixed logicals — uuid-on-string, timestamp,
+		// etc. — keep their logical serializer wrapped by the custom encoder on
+		// the binary side, so only the fixed arms are gated here.)
+		if custom[node] == nil || !custom[node].encodeSuppresses {
+			switch node.logical {
+			case "decimal":
+				r, ok, err := decimalRatFor(v)
 				if err != nil {
-					return nil, err
+					return nil, semErrW(v, "fixed", err)
 				}
-				padded, err := appendDecimalFixed(nil, b, node.size, v.Type())
-				if err != nil {
-					return nil, err
+				if ok {
+					b, err := decimalUnscaledBytes(r, node.scale, node.precision, "fixed", v.Type())
+					if err != nil {
+						return nil, err
+					}
+					padded, err := appendDecimalFixed(nil, b, node.size, v.Type())
+					if err != nil {
+						return nil, err
+					}
+					return appendAvroJSONBytes(buf, padded), nil
 				}
-				return appendAvroJSONBytes(buf, padded), nil
-			}
-		case "duration":
-			if v.Type() == avroDurationType {
-				raw := v.Interface().(Duration).Bytes()
-				return appendAvroJSONBytes(buf, raw[:]), nil
-			}
-		case "uuid":
-			// [16]byte trusts its bytes (uuidBytes-first, matching binary
-			// serFixedUUIDReflect): the raw 16 bytes are the wire form, with
-			// no MarshalText→parseUUID round trip. Without this, a [16]byte
-			// type that also implements TextMarshaler (e.g. google/uuid.UUID)
-			// diverged from the binary path.
-			if u, ok := uuidBytes(v); ok {
-				return appendAvroJSONBytes(buf, u[:]), nil
-			}
-			// TextMarshaler / AppendText before the reflect.String arm
-			// (parity with serFixedUUIDReflect). MarshalText must produce a
-			// UUID hex-dash string, which parseUUID validates into 16 bytes.
-			if text, ok, err := textValue(v, "fixed"); err != nil {
-				return nil, err
-			} else if ok {
-				u, err := parseUUID(text)
-				if err != nil {
-					return nil, err
+			case "duration":
+				if v.Type() == avroDurationType {
+					raw := v.Interface().(Duration).Bytes()
+					return appendAvroJSONBytes(buf, raw[:]), nil
 				}
-				return appendAvroJSONBytes(buf, u[:]), nil
-			}
-			if v.Kind() == reflect.String {
-				if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
-					return nil, err
+			case "uuid":
+				// [16]byte trusts its bytes (uuidBytes-first, matching binary
+				// serFixedUUIDReflect): the raw 16 bytes are the wire form, with
+				// no MarshalText→parseUUID round trip. Without this, a [16]byte
+				// type that also implements TextMarshaler (e.g. google/uuid.UUID)
+				// diverged from the binary path.
+				if u, ok := uuidBytes(v); ok {
+					return appendAvroJSONBytes(buf, u[:]), nil
 				}
-				u, err := parseUUID(v.String())
-				if err != nil {
+				// TextMarshaler / AppendText before the reflect.String arm
+				// (parity with serFixedUUIDReflect). MarshalText must produce a
+				// UUID hex-dash string, which parseUUID validates into 16 bytes.
+				if text, ok, err := textValue(v, "fixed"); err != nil {
 					return nil, err
+				} else if ok {
+					u, err := parseUUID(text)
+					if err != nil {
+						return nil, err
+					}
+					return appendAvroJSONBytes(buf, u[:]), nil
 				}
-				return appendAvroJSONBytes(buf, u[:]), nil
+				if v.Kind() == reflect.String {
+					if err := rejectJSONNumberRawTarget(v, "fixed"); err != nil {
+						return nil, err
+					}
+					u, err := parseUUID(v.String())
+					if err != nil {
+						return nil, err
+					}
+					return appendAvroJSONBytes(buf, u[:]), nil
+				}
 			}
 		}
 		var raw []byte
@@ -622,8 +672,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	case "record":
 		return appendAvroJSONRecord(buf, v, node, cfg, custom, depth+1)
 
-	case "union":
-		return appendAvroJSONUnion(buf, v, node, cfg, custom, depth+1)
+	// "union" is dispatched before the peel loop above (un-peeled value).
 
 	default:
 		return nil, fmt.Errorf("avro json: unsupported schema kind %q", node.kind)
@@ -795,13 +844,25 @@ func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *opt
 	if f.node != nil && f.node.kind == "union" {
 		v := reflect.ValueOf(f.defaultVal)
 		for _, branch := range f.node.branches {
-			encoded, err := appendAvroJSON(nil, v, branch, cfg, nil, depth+1)
-			if err == nil {
-				return appendUnionBranch(buf, branch, encoded, cfg), nil
+			// Select the branch exactly as binary encodeDefault does, so the
+			// JSON wire names the same branch as Encode / Decode-fill / the
+			// metadata API. appendAvroJSON-success alone is too lenient as the
+			// branch test: its bytes/fixed arm encodes a default string as raw
+			// UTF-8 and would pick bytes/fixed for a codepoint>255 default
+			// where binary correctly falls through to a later branch (a
+			// bytes/fixed JSON default maps each codepoint 0-255 to one byte,
+			// so codepoint>255 is not representable). encodeDefault applies
+			// that codepoint rule and accepts both the converted ([]byte) and
+			// raw (string) default forms, so it is the single source of truth
+			// for which branch a stored default belongs to.
+			if _, err := encodeDefault(nil, f.defaultVal, branch); err != nil {
+				continue
 			}
-			if errors.Is(err, errTooDeep) {
+			encoded, err := appendAvroJSON(nil, v, branch, cfg, nil, depth+1)
+			if err != nil {
 				return nil, err
 			}
+			return appendUnionBranch(buf, branch, encoded, cfg), nil
 		}
 		return nil, fmt.Errorf("avro json: union default for field %q does not match any branch", f.name)
 	}
@@ -911,13 +972,12 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 // writeFieldName; }`. The Avro JSON spec defines a union null value as
 // bare `null`; TaggedUnions's own doc commits to "wraps non-null union
 // values," so the null branch must stay bare even under cfg.tagged.
-// Without this guard, EncodeJSON((*int)(nil), ...) (which the entry
-// peel at appendAvroJSON converts to invalid → early-null at lines
-// 168-172 → bare "null") and EncodeJSON([]byte(nil), ...) (which
-// reaches appendAvroJSONUnion as a still-valid nil Slice and is routed
-// to the null branch by isNilValue) produced different outputs under
-// TaggedUnions: bare `null` vs `{"null":null}` for the same conceptual
-// input.
+// Without this guard, a nil value routed to the null branch — e.g.
+// EncodeJSON((*int)(nil), ...) or EncodeJSON([]byte(nil), ...), both
+// identified by isNilValue in appendAvroJSONUnion (union is dispatched
+// before the appendAvroJSON peel loop, so the un-peeled nil reaches the
+// union dispatcher) — would emit `{"null":null}` under TaggedUnions
+// instead of the spec-required bare `null`.
 func appendUnionBranch(buf []byte, branch *schemaNode, encoded []byte, cfg *optConfig) []byte {
 	if cfg.tagged && branch.kind != "null" {
 		return appendTaggedUnion(buf, branch, encoded, cfg.tagLogical)
@@ -931,10 +991,27 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 		return nil, errTooDeep
 	}
 
+	// Peel pointer/interface layers for the tagged-map detection below,
+	// mirroring binary serUnion.tryUnwrapTagged. v itself stays un-peeled
+	// so the try-each loop hands the original value to branch encoders (a
+	// branch's custom encoder with a pointer GoType matches at the pointer
+	// level); isNilValue and unionTypeNameForValue peel internally on their
+	// own, so only the tagged-map check needs a peeled view here.
+	tv := v
+	for range maxIndirectDepth {
+		if tv.Kind() != reflect.Pointer && tv.Kind() != reflect.Interface {
+			break
+		}
+		if tv.IsNil() {
+			break
+		}
+		tv = tv.Elem()
+	}
+
 	// Accept tagged union maps: {"typeName": value}. This matches the
 	// Avro JSON convention and the behavior of Encode (binary).
-	if v.Kind() == reflect.Map && v.Len() == 1 {
-		iter := v.MapRange()
+	if tv.Kind() == reflect.Map && tv.Len() == 1 {
+		iter := tv.MapRange()
 		iter.Next()
 		key := iter.Key()
 		if key.Kind() == reflect.String {
@@ -996,22 +1073,33 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 	}
 
 tryAll:
-	// Try every branch including null, mirroring serUnion.ser.
-	// The case "null" arm of appendAvroJSON rejects non-nil values with
-	// errNonNil, so a non-nil v cleanly falls through to the next branch.
-	// A nil Map / nil Slice / nil Chan / nil Func (none of which the peel
-	// loop above converts to invalid, and none of which unionTypeNameForValue
-	// names except []byte → "bytes") lands on case "null" here and emits
-	// "null"; without trying the null branch, binary↔JSON parity breaks
-	// for those shapes the way the binary serUnion.ser try-each handles via
-	// serNull. The 2-branch [null,T] fast path on the binary side uses
-	// serNullUnionAt → isNilValue, which covers the same shapes.
+	// Try each branch, mirroring serUnion.ser. The case "null" arm of
+	// appendAvroJSON rejects non-nil values with errNonNil, so a non-nil v
+	// cleanly falls through to the next branch. Nil-equivalent values were
+	// already routed to the null branch by the nil-first dispatch above, so v
+	// here is non-nil and the null branch can never succeed for a value.
+	//
+	// Arity-dependent null handling, mirroring the binary side EXACTLY so a
+	// wildcard custom encode hook (installed on every branch, including null)
+	// fires the same number of times on both paths:
+	//   - 2-branch [null,T] / [T,null]: binary dispatches via the
+	//     serNullUnionAt fast path (ser.go), which for a non-nil value goes
+	//     straight to the non-null branch and NEVER trials null. Skip null here
+	//     too — otherwise the wildcard hook on the null node fires spuriously,
+	//     making a side-effecting wildcard Encode (the logging /
+	//     property-dispatch pattern) run an extra time on EncodeJSON vs Encode.
+	//   - N>=3: binary uses serUnion.ser's try-each (ser.go), which DOES trial
+	//     (and fires the hook on) the null branch before it rejects the non-nil
+	//     value, so JSON must trial null too for parity.
 	//
 	// Keep the last concrete error so the final message names the closest
 	// reason a branch failed (mirrors decodeUnionBare's lastErr plumbing
 	// on the decode side and serUnion.ser on the binary encode side).
 	var lastErr error
 	for _, branch := range node.branches {
+		if len(node.branches) == 2 && branch.kind == "null" {
+			continue
+		}
 		encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
 		if err == nil {
 			return appendUnionBranch(buf, branch, encoded, cfg), nil

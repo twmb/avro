@@ -2726,13 +2726,49 @@ func TestDecodeLongUint(t *testing.T) {
 	}
 }
 
+// numericKindTestType returns a reflect.Type whose Kind is k, for the unsafe
+// per-kind ser/deser constructors (usInt/usLong/udInt/udLong/udDouble) which
+// take the field's reflect.Type so SemanticError.GoType matches the reflect
+// path. Test-only helper.
+func numericKindTestType(k reflect.Kind) reflect.Type {
+	switch k {
+	case reflect.Bool:
+		return reflect.TypeOf(false)
+	case reflect.Int:
+		return reflect.TypeOf(int(0))
+	case reflect.Int8:
+		return reflect.TypeOf(int8(0))
+	case reflect.Int16:
+		return reflect.TypeOf(int16(0))
+	case reflect.Int32:
+		return reflect.TypeOf(int32(0))
+	case reflect.Int64:
+		return reflect.TypeOf(int64(0))
+	case reflect.Uint:
+		return reflect.TypeOf(uint(0))
+	case reflect.Uint8:
+		return reflect.TypeOf(uint8(0))
+	case reflect.Uint16:
+		return reflect.TypeOf(uint16(0))
+	case reflect.Uint32:
+		return reflect.TypeOf(uint32(0))
+	case reflect.Uint64:
+		return reflect.TypeOf(uint64(0))
+	case reflect.Float32:
+		return reflect.TypeOf(float32(0))
+	case reflect.Float64:
+		return reflect.TypeOf(float64(0))
+	}
+	return nil
+}
+
 // TestUnsafeSerializeDefaults covers usInt/usLong/usFloat/usDouble returning
 // nil for unsupported Go kinds (the default: branches).
 func TestUnsafeSerializeDefaults(t *testing.T) {
-	if usInt(reflect.Bool) != nil {
+	if usInt(numericKindTestType(reflect.Bool)) != nil {
 		t.Fatal("usInt(Bool) should be nil")
 	}
-	if usLong(reflect.Bool) != nil {
+	if usLong(numericKindTestType(reflect.Bool)) != nil {
 		t.Fatal("usLong(Bool) should be nil")
 	}
 	if usFloat(reflect.Bool) != nil {
@@ -2746,16 +2782,16 @@ func TestUnsafeSerializeDefaults(t *testing.T) {
 // TestUnsafeDeserializeDefaults covers udInt/udLong/udFloat/udDouble returning
 // nil for unsupported Go kinds (the default: branches).
 func TestUnsafeDeserializeDefaults(t *testing.T) {
-	if udInt(reflect.Bool) != nil {
+	if udInt(numericKindTestType(reflect.Bool)) != nil {
 		t.Fatal("udInt(Bool) should be nil")
 	}
-	if udLong(reflect.Bool) != nil {
+	if udLong(numericKindTestType(reflect.Bool)) != nil {
 		t.Fatal("udLong(Bool) should be nil")
 	}
 	if udFloat(reflect.Bool) != nil {
 		t.Fatal("udFloat(Bool) should be nil")
 	}
-	if udDouble(reflect.Bool) != nil {
+	if udDouble(numericKindTestType(reflect.Bool)) != nil {
 		t.Fatal("udDouble(Bool) should be nil")
 	}
 }
@@ -2768,7 +2804,7 @@ func TestUnsafeDeserializeIntErrors(t *testing.T) {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
 	}
 	for _, k := range kinds {
-		fn := udInt(k)
+		fn := udInt(numericKindTestType(k))
 		if fn == nil {
 			t.Fatalf("udInt(%v) returned nil", k)
 		}
@@ -2788,7 +2824,7 @@ func TestUnsafeDeserializeLongErrors(t *testing.T) {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
 	}
 	for _, k := range kinds {
-		fn := udLong(k)
+		fn := udLong(numericKindTestType(k))
 		if fn == nil {
 			t.Fatalf("udLong(%v) returned nil", k)
 		}
@@ -2815,7 +2851,7 @@ func TestUnsafeDeserializeFloatErrors(t *testing.T) {
 		}
 	}
 	for _, k := range []reflect.Kind{reflect.Float32, reflect.Float64} {
-		fn := udDouble(k)
+		fn := udDouble(numericKindTestType(k))
 		if fn == nil {
 			t.Fatalf("udDouble(%v) returned nil", k)
 		}
