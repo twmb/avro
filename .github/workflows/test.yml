@@ -35,12 +35,23 @@ jobs:
       # target gets a hard -timeout so a genuinely stuck single execution
       # (which -fuzztime, a between-execs wall-clock budget, cannot interrupt)
       # fails fast and names the offending fuzzer instead of hanging the step.
+      #
+      # -parallel=1 runs ONE fuzz worker process (default is GOMAXPROCS = 2 on
+      # ubuntu-latest). With 2 workers the worker pool saturates both cores, so
+      # at the -fuzztime boundary the coordinator process can be starved long
+      # enough to miss its worker-shutdown RPC deadline and fail the step with
+      # "context deadline exceeded" — intermittently, with a healthy exec rate
+      # and no crasher input (reproduction: none locally even at 3x the
+      # fuzztime under GOMAXPROCS=2; the signature is runner contention at
+      # shutdown, not a slow input). One worker leaves a core for the
+      # coordinator so shutdown is reliable; 10s × one worker is still ample
+      # for these regression-smoke fuzzers.
       - name: Fuzz
         run: |
           for pkg in . ./ocf; do
             for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep '^Fuzz'); do
               echo "::group::fuzz $pkg $fn"
-              go test -run='^$' -fuzz="^${fn}$" -fuzztime=10s -timeout=90s "$pkg"
+              go test -run='^$' -fuzz="^${fn}$" -fuzztime=10s -timeout=90s -parallel=1 "$pkg"
               echo "::endgroup::"
             done
           done
