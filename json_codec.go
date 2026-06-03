@@ -46,6 +46,22 @@ func (taggedUnions) opt() {}
 // round-trips through goavro and for the natural Go map[string]any
 // shape; see Apache Avro Jira issue AVRO-2899 for the long-standing
 // upstream discussion.
+//
+// Branch identity: a bare (untagged) union value does not name its
+// branch, so [Schema.DecodeJSON] cannot recover which branch the
+// writer used when several branches share a JSON token class (a bare
+// 7 matches int, long, float, and double; a bare "x" matches string,
+// bytes, fixed, and enum). The decoder commits to the FIRST
+// declaration-order branch of the matching class — for every decode
+// target shape — which can differ from the branch the writer chose,
+// and silently bypasses a [CustomType] registered on a later branch
+// of the same class (its Decode never runs; a concrete typed target
+// is filled by plain coercion from the first branch's value instead).
+// Binary [Schema.Decode] is unaffected: the binary wire carries the
+// branch index. When branch identity or branch-bound CustomTypes
+// matter, encode AND decode with TaggedUnions — the {"type_name":
+// value} envelope names the branch, so decode dispatches to the
+// writer's branch exactly like binary.
 func TaggedUnions() Opt { return taggedUnions{} }
 
 type tagLogicalTypes struct{}
@@ -155,6 +171,12 @@ func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error
 // DecodeJSON accepts all input formats (tagged and bare unions, Java and
 // goavro NaN/Infinity conventions). Pass [TaggedUnions] to wrap decoded
 // union values when the target is *any.
+//
+// A bare union value whose JSON token class matches several branches
+// (e.g. a bare number against ["long","int"]) decodes via the first
+// matching branch in declaration order — the bare form does not name the
+// writer's branch, so it cannot be recovered; see the [TaggedUnions] doc
+// for the branch-identity and CustomType consequences.
 //
 // On a schema returned by [Resolve], src is WRITER-shaped JSON (the JSON a
 // producer using the writer schema would emit) and full writer→reader

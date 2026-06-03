@@ -1988,3 +1988,106 @@ func TestRegression_InvalidUTF8StringBinaryVerbatimJSONCoercion(t *testing.T) {
 		t.Errorf("binary map round-trip lost the verbatim key: %v", mBack)
 	}
 }
+
+type untaggedPinBig int64
+
+// A bare (untagged) JSON union value cannot name its branch, so DecodeJSON
+// commits to the FIRST declaration-order branch of the matching JSON token
+// class. DOCUMENTED INTENTIONAL (TaggedUnions and DecodeJSON docs;
+// BUG_AUDIT.md §Known intentional divergences): the untagged wire for
+// int32(7)-via-int and int64(7)-via-long is the identical byte `7`, so the
+// writer's branch is information-theoretically unrecoverable — do not "fix"
+// with branch-guessing heuristics. This pin spells out the consequences so a
+// future round surfaces the policy instead of re-flagging the asymmetry:
+// (1) untagged decode-into-any picks the first number-class branch (int64)
+// where binary recovers the writer's branch from the wire index (int32);
+// (2) a TRANSFORMING CustomType on a non-first same-class branch is skipped
+// even for a CONCRETE typed target (plain coercion fills it instead);
+// (3) TaggedUnions recovers the branch on both counts.
+func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
+	t.Run("decode-into-any-first-class-branch", func(t *testing.T) {
+		sc := avro.MustParse(`["long","int"]`)
+		bw, err := sc.Encode(int32(7)) // writer chose the "int" branch (index 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jw, err := sc.EncodeJSON(int32(7)) // bare wire: `7` — no branch on the wire
+		if err != nil {
+			t.Fatal(err)
+		}
+		var bo, jo any
+		if _, err := sc.Decode(bw, &bo); err != nil {
+			t.Fatal(err)
+		}
+		if err := sc.DecodeJSON(jw, &jo); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := bo.(int32); !ok {
+			t.Errorf("binary decode-into-any = %T, want int32 (wire index recovers the writer's branch)", bo)
+		}
+		if _, ok := jo.(int64); !ok {
+			t.Errorf("untagged JSON decode-into-any = %T, want int64 (documented first-class-branch commit)", jo)
+		}
+
+		// TaggedUnions names the branch: decode recovers it (in the documented
+		// {branch: value} envelope form for an any target).
+		tw, err := sc.EncodeJSON(int32(7), avro.TaggedUnions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var to any
+		if err := sc.DecodeJSON(tw, &to, avro.TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		env, ok := to.(map[string]any)
+		if !ok || len(env) != 1 {
+			t.Fatalf("tagged decode-into-any = %T %v, want one-key envelope", to, to)
+		}
+		if v, ok := env["int"]; !ok {
+			t.Errorf("tagged envelope key = %v, want \"int\" (writer's branch recovered)", env)
+		} else if _, ok := v.(int32); !ok {
+			t.Errorf("tagged envelope value = %T, want int32", v)
+		}
+	})
+
+	t.Run("custom-on-non-first-branch-skipped", func(t *testing.T) {
+		ct := avro.NewCustomType[untaggedPinBig, int64]("upb",
+			func(m untaggedPinBig, _ *avro.SchemaNode) (int64, error) { return int64(m), nil },
+			func(v int64, _ *avro.SchemaNode) (untaggedPinBig, error) { return untaggedPinBig(v * 10), nil })
+		sc := avro.MustParse(`["int",{"type":"long","logicalType":"upb"}]`, ct)
+		bw, err := sc.Encode(untaggedPinBig(7)) // long+custom branch on the wire
+		if err != nil {
+			t.Fatal(err)
+		}
+		jw, err := sc.EncodeJSON(untaggedPinBig(7)) // bare `7`
+		if err != nil {
+			t.Fatal(err)
+		}
+		var bc, jc untaggedPinBig
+		if _, err := sc.Decode(bw, &bc); err != nil {
+			t.Fatal(err)
+		}
+		if err := sc.DecodeJSON(jw, &jc); err != nil {
+			t.Fatal(err)
+		}
+		if bc != 70 {
+			t.Errorf("binary concrete-target decode = %v, want 70 (custom Decode fired on the long branch)", bc)
+		}
+		if jc != 7 {
+			t.Errorf("untagged JSON concrete-target decode = %v, want 7 (documented: first int branch + coercion, custom skipped)", jc)
+		}
+
+		// TaggedUnions recovers the custom branch for the concrete target.
+		tw, err := sc.EncodeJSON(untaggedPinBig(7), avro.TaggedUnions())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var tc untaggedPinBig
+		if err := sc.DecodeJSON(tw, &tc, avro.TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if tc != 70 {
+			t.Errorf("tagged JSON concrete-target decode = %v, want 70 (branch named on the wire, custom fires)", tc)
+		}
+	})
+}
