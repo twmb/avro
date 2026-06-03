@@ -1394,6 +1394,15 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 	f.Add(int32(-1), "ababab", uint8(2))
 
 	f.Fuzz(func(t *testing.T, a int32, b string, n uint8) {
+		// The concurrency surface is shared-schema state across goroutines,
+		// not payload size: cap the fuzz-grown string so a corpus-mutated
+		// multi-megabyte b doesn't turn one execution into seconds of
+		// memcpy across workers×iterations (observed as the fuzzer's exec
+		// counter freezing for whole intervals, risking the -fuzztime
+		// shutdown deadline).
+		if len(b) > 1024 {
+			b = b[:1024]
+		}
 		workers := 1 + int(n%8)
 		// Collect panics from worker goroutines via channel rather than
 		// calling t.Errorf directly: testing.T methods other than Log
@@ -1534,18 +1543,51 @@ func FuzzDepthBounds(f *testing.F) {
 		Value int32 `avro:"value"`
 		Next  *node `avro:"next"`
 	}
+	// Input-independent schemas/resolutions are built ONCE here: re-parsing
+	// and re-resolving them per execution added constant fixture cost to
+	// every iteration without exercising anything the first iteration
+	// didn't — the per-exec-cost class that starves fuzz workers into
+	// missing the coordinator's -fuzztime shutdown deadline.
+	resolvedSame, err := Resolve(rs, rs)
+	if err != nil {
+		f.Fatal(err)
+	}
+	rdrSchema, err := Parse(`{"type":"record","name":"Node","fields":[{"name":"value","type":"int"}]}`)
+	if err != nil {
+		f.Fatal(err)
+	}
+	resolvedDrop, err := Resolve(rs, rdrSchema)
+	if err != nil {
+		f.Fatal(err)
+	}
+	arrSchema, err := Parse(`{"type":"array","items":"int"}`)
+	if err != nil {
+		f.Fatal(err)
+	}
+	intS, err := Parse(`"int"`)
+	if err != nil {
+		f.Fatal(err)
+	}
+	nullableS, err := Parse(`["null","int"]`)
+	if err != nil {
+		f.Fatal(err)
+	}
 
 	f.Fuzz(func(t *testing.T, nesting, arrayCount, schemaDepth uint16, mode uint8) {
-		// Hard caps to keep individual fuzz iterations bounded. The
-		// schemaDepth cap is tight because encoding/json's recursive
-		// parser is O(N²) on nested-array JSON — well past maxDepth
-		// we just burn time in the stdlib without exercising more
-		// of our code.
-		if nesting > 20000 {
-			nesting = 20000
+		// Hard caps to keep individual fuzz iterations bounded. The depth
+		// guard trips at maxDepth, so nesting past maxDepth+margin buys no
+		// new coverage — it only linearly burns time building and walking
+		// input (at a 20000 cap a single execution averaged tens of
+		// milliseconds, sliding the exec rate low enough that a worker
+		// could miss the -fuzztime shutdown deadline). The schemaDepth cap
+		// is tight because encoding/json's recursive parser is O(N²) on
+		// nested-array JSON — well past maxDepth we just burn time in the
+		// stdlib without exercising more of our code.
+		if nesting > maxDepth+200 {
+			nesting = maxDepth + 200
 		}
-		if arrayCount > 5000 {
-			arrayCount = 5000
+		if arrayCount > 2000 {
+			arrayCount = 2000
 		}
 		if schemaDepth > maxDepth+10 {
 			schemaDepth = maxDepth + 10
@@ -1574,22 +1616,10 @@ func FuzzDepthBounds(f *testing.F) {
 				src = append(src, 0, 0x02)
 			}
 			src = append(src, 0)
-			resolved, err := Resolve(rs, rs)
-			if err != nil {
-				return
-			}
 			var n node
-			resolved.Decode(src, &n)
+			resolvedSame.Decode(src, &n)
 		case 2:
 			// Deeply nested binary skipped via resolve (reader drops "next").
-			rdrSchema, err := Parse(`{"type":"record","name":"Node","fields":[{"name":"value","type":"int"}]}`)
-			if err != nil {
-				return
-			}
-			resolved, err := Resolve(rs, rdrSchema)
-			if err != nil {
-				return
-			}
 			var src []byte
 			for range int(nesting) {
 				src = append(src, 0, 0x02)
@@ -1599,7 +1629,7 @@ func FuzzDepthBounds(f *testing.F) {
 				Value int32 `avro:"value"`
 			}
 			var rv rR
-			resolved.Decode(src, &rv)
+			resolvedDrop.Decode(src, &rv)
 		case 3:
 			// Deeply nested JSON into recursive struct.
 			var src []byte
@@ -1642,22 +1672,10 @@ func FuzzDepthBounds(f *testing.F) {
 				src = append(src, 0)    // single item: int(0)
 			}
 			src = append(src, 0) // terminator
-			arrSchema, err := Parse(`{"type":"array","items":"int"}`)
-			if err != nil {
-				return
-			}
 			var out []int32
 			arrSchema.Decode(src, &out)
 		case 7:
 			// Self-referential `any` against various schemas.
-			intS, err := Parse(`"int"`)
-			if err != nil {
-				return
-			}
-			nullableS, err := Parse(`["null","int"]`)
-			if err != nil {
-				return
-			}
 			var p any
 			p = &p
 			intS.AppendEncode(nil, p)
