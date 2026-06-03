@@ -115,6 +115,14 @@ func parseOpts(opts []Opt) optConfig {
 // above so the result is valid JSON and round-trippable through any
 // strict parser.
 //
+// String content that is not valid UTF-8 is written with each invalid
+// byte replaced by U+FFFD (the Unicode replacement character). A JSON
+// string cannot carry arbitrary non-UTF-8 bytes, so the JSON wire is
+// lossy for such content, while [Schema.Encode] preserves the raw bytes
+// verbatim on the binary wire; the Java implementation behaves
+// identically on both wire formats. This applies to string values and
+// map keys at any nesting depth.
+//
 // EncodeJSON accepts the same Go types as [Schema.Encode]. Map key order
 // in the output is non-deterministic — Go's map iteration order is
 // randomized and the encoder does not sort keys.

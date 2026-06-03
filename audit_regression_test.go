@@ -1920,3 +1920,71 @@ func TestRegression_CustomSuppressionScalarTargetParity(t *testing.T) {
 		})
 	}
 }
+
+// An Avro string containing invalid UTF-8 is preserved VERBATIM on the binary
+// wire and coerced — each invalid byte replaced by U+FFFD — on the JSON wire.
+// This is a DOCUMENTED INTENTIONAL divergence (BUG_AUDIT.md §Known intentional
+// divergences, Schema.EncodeJSON doc): an RFC 8259 JSON string cannot carry a
+// raw non-UTF-8 byte, so byte-faithful parity is impossible, and the Java
+// reference implementation produces byte-identical output on BOTH wires
+// (verified live by TestDifferentialJavaInvalidUTF8 in CI). Do not "fix"
+// either side toward the other: making binary lossy corrupts the faithful
+// wire; making EncodeJSON reject diverges from Java's lenient coercion.
+func TestRegression_InvalidUTF8StringBinaryVerbatimJSONCoercion(t *testing.T) {
+	s := avro.MustParse(`"string"`)
+	in := "A\xffB"
+
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("binary Encode must accept invalid UTF-8 (verbatim wire): %v", err)
+	}
+	// varint length 3, then the raw bytes 'A' 0xff 'B' — byte-faithful.
+	if want := "\x06A\xffB"; string(bin) != want {
+		t.Errorf("binary wire = % x, want % x (verbatim bytes)", bin, want)
+	}
+	var binBack string
+	if _, err := s.Decode(bin, &binBack); err != nil {
+		t.Fatalf("binary Decode: %v", err)
+	}
+	if binBack != in {
+		t.Errorf("binary round-trip = %q, want verbatim %q", binBack, in)
+	}
+
+	jsn, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("EncodeJSON must accept invalid UTF-8 (U+FFFD coercion, Java parity): %v", err)
+	}
+	// `"A<efbfbd>B"` — the invalid byte coerced to the replacement char,
+	// byte-identical to Java's JsonEncoder output for the same datum.
+	if want := "\"A�B\""; string(jsn) != want {
+		t.Errorf("JSON wire = % x, want % x (U+FFFD coercion)", jsn, want)
+	}
+	var jsonBack string
+	if err := s.DecodeJSON(jsn, &jsonBack); err != nil {
+		t.Fatalf("DecodeJSON: %v", err)
+	}
+	if jsonBack != "A�B" {
+		t.Errorf("JSON round-trip = %q, want coerced %q", jsonBack, "A�B")
+	}
+
+	// Map keys take the same JSON path (appendJSONString) — pin one level deep.
+	ms := avro.MustParse(`{"type":"map","values":"int"}`)
+	mj, err := ms.EncodeJSON(map[string]int32{"\xffA": 1})
+	if err != nil {
+		t.Fatalf("EncodeJSON map with invalid-UTF-8 key: %v", err)
+	}
+	if want := "{\"�A\":1}"; string(mj) != want {
+		t.Errorf("map-key JSON = % x, want % x", mj, want)
+	}
+	mb, err := ms.Encode(map[string]int32{"\xffA": 1})
+	if err != nil {
+		t.Fatalf("binary Encode map with invalid-UTF-8 key: %v", err)
+	}
+	var mBack map[string]int32
+	if _, err := ms.Decode(mb, &mBack); err != nil {
+		t.Fatalf("binary Decode map: %v", err)
+	}
+	if _, ok := mBack["\xffA"]; !ok {
+		t.Errorf("binary map round-trip lost the verbatim key: %v", mBack)
+	}
+}
