@@ -438,20 +438,20 @@ func TestRegression_ResolveSelfCompatAllShapes(t *testing.T) {
 		`{"type":"int","logicalType":"date"}`,
 		`{"type":"long","logicalType":"timestamp-micros"}`,
 		`{"type":"fixed","name":"Dur","size":12,"logicalType":"duration"}`,
-		`{"type":"enum","name":"E","symbols":["A","B","C"]}`,                 // no default
-		`{"type":"enum","name":"E","symbols":["A","B","C"],"default":"A"}`,   // with default
+		`{"type":"enum","name":"E","symbols":["A","B","C"]}`,               // no default
+		`{"type":"enum","name":"E","symbols":["A","B","C"],"default":"A"}`, // with default
 		`{"type":"fixed","name":"F","size":16}`,
 		`{"type":"array","items":"int"}`,
 		`{"type":"map","values":"long"}`,
 		`["null","int"]`, `["int","null"]`, `["null","string","long","bytes"]`,
-		`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`,                                  // required field
-		`{"type":"record","name":"R","fields":[{"name":"a","type":"int","default":7}]}`,                      // defaulted field
-		`{"type":"record","name":"R","fields":[{"name":"a","type":"int","aliases":["b"]}]}`,                  // field alias
-		`{"type":"record","name":"R","fields":[{"name":"u","type":["null",{"type":"record","name":"S","fields":[{"name":"x","type":"int"}]}]}]}`, // record in union
-		`{"type":"array","items":{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}}`,         // array of records
-		`{"type":"map","values":["null","string"]}`,                                                         // map of unions
-		`{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]}]}`,                  // recursive
-		`{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[{"name":"a","type":["null","A"]}]}}]}`, // mutually recursive
+		`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`,                                                                                               // required field
+		`{"type":"record","name":"R","fields":[{"name":"a","type":"int","default":7}]}`,                                                                                   // defaulted field
+		`{"type":"record","name":"R","fields":[{"name":"a","type":"int","aliases":["b"]}]}`,                                                                               // field alias
+		`{"type":"record","name":"R","fields":[{"name":"u","type":["null",{"type":"record","name":"S","fields":[{"name":"x","type":"int"}]}]}]}`,                          // record in union
+		`{"type":"array","items":{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}}`,                                                                      // array of records
+		`{"type":"map","values":["null","string"]}`,                                                                                                                       // map of unions
+		`{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]}]}`,                                                                               // recursive
+		`{"type":"record","name":"A","fields":[{"name":"b","type":{"type":"record","name":"B","fields":[{"name":"a","type":["null","A"]}]}}]}`,                            // mutually recursive
 		`{"type":"record","name":"R","fields":[{"name":"f1","type":"Inner"},{"name":"f2","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}}]}`, // forward ref
 	}
 	for _, sc := range schemas {
@@ -1237,6 +1237,685 @@ func TestRegression_WildcardEncodeCallbackCountUnionParity(t *testing.T) {
 			b, j := count(c.schema, c.v)
 			if b != j {
 				t.Errorf("wildcard Encode fired binary=%d json=%d times (must agree)", b, j)
+			}
+		})
+	}
+}
+
+// customLogicalCase is one logical type plus a value the built-in logical
+// ENCODER accepts and the raw Avro-native Go type the SUPPRESSED decoder
+// produces. Shared by the no-callback-suppression and promotion-suppression
+// regression tests so both cover every logical type uniformly.
+type customLogicalCase struct {
+	name     string
+	schema   string
+	logical  string
+	avroType string
+	encVal   any
+	rawType  string // %T of the raw Avro-native value a suppressed decode yields
+}
+
+func customLogicalCases() []customLogicalCase {
+	return []customLogicalCase{
+		{"date", `{"type":"int","logicalType":"date"}`, "date", "int", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), "int32"},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, "time-millis", "int", 3 * time.Hour, "int32"},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, "time-micros", "long", 3 * time.Hour, "int64"},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", "long", time.UnixMilli(1700000000000).UTC(), "int64"},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, "timestamp-micros", "long", time.UnixMilli(1700000000000).UTC(), "int64"},
+		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, "timestamp-nanos", "long", time.Unix(1700000000, 5).UTC(), "int64"},
+		{"local-timestamp-millis", `{"type":"long","logicalType":"local-timestamp-millis"}`, "local-timestamp-millis", "long", time.UnixMilli(1700000000000).UTC(), "int64"},
+		{"local-timestamp-micros", `{"type":"long","logicalType":"local-timestamp-micros"}`, "local-timestamp-micros", "long", time.UnixMilli(1700000000000).UTC(), "int64"},
+		{"local-timestamp-nanos", `{"type":"long","logicalType":"local-timestamp-nanos"}`, "local-timestamp-nanos", "long", time.Unix(1700000000, 5).UTC(), "int64"},
+		{"decimal-bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, "decimal", "bytes", big.NewRat(33, 100), "[]uint8"},
+		{"decimal-fixed", `{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`, "decimal", "fixed", big.NewRat(33, 100), "[]uint8"},
+		{"big-decimal", `{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal", "bytes", big.NewRat(33, 100), "[]uint8"},
+		{"uuid-string", `{"type":"string","logicalType":"uuid"}`, "uuid", "string", "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "string"},
+		{"uuid-fixed", `{"type":"fixed","name":"UF","size":16,"logicalType":"uuid"}`, "uuid", "fixed", "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "[]uint8"},
+		{"duration", `{"type":"fixed","name":"DUR","size":12,"logicalType":"duration"}`, "duration", "fixed", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, "[]uint8"},
+	}
+}
+
+// A CustomType that MATCHES a logical node but provides NEITHER an Encode NOR a
+// Decode callback still suppresses the built-in logical DECODER on the binary
+// path (hasMatchingCustomType counts callback-less matchers; only wildcards are
+// excluded). Per CustomType.Decode ("If nil, the built-in logical type handler
+// is bypassed ... producing raw Avro-native values"), Decode yields the raw
+// Avro-native type — and DecodeJSON must yield the SAME raw type. The wiring for
+// a callback-less matcher used to return early before installing the JSON
+// suppress-wrapper, so DecodeJSON kept the logical transform (time.Time /
+// *big.Rat) while Decode produced the raw value: a binary<->JSON divergence on
+// the same schema. Driven across every logical type and both matcher forms
+// (LogicalType-only and AvroType-only).
+func TestRegression_CustomNoCallbackSuppressionBinaryJSONParity(t *testing.T) {
+	matchers := []struct {
+		name string
+		make func(c customLogicalCase) avro.CustomType
+	}{
+		{"logical-only", func(c customLogicalCase) avro.CustomType { return avro.CustomType{LogicalType: c.logical} }},
+		{"avrotype-only", func(c customLogicalCase) avro.CustomType { return avro.CustomType{AvroType: c.avroType} }},
+	}
+	for _, c := range customLogicalCases() {
+		for _, m := range matchers {
+			t.Run(c.name+"/"+m.name, func(t *testing.T) {
+				plain := avro.MustParse(c.schema)
+				bin, err := plain.Encode(c.encVal)
+				if err != nil {
+					t.Fatalf("Encode: %v", err)
+				}
+				jsn, err := plain.EncodeJSON(c.encVal)
+				if err != nil {
+					t.Fatalf("EncodeJSON: %v", err)
+				}
+				cs := avro.MustParse(c.schema, m.make(c))
+				var bv, jv any
+				if _, err := cs.Decode(bin, &bv); err != nil {
+					t.Fatalf("Decode: %v", err)
+				}
+				if err := cs.DecodeJSON(jsn, &jv); err != nil {
+					t.Fatalf("DecodeJSON: %v", err)
+				}
+				if got := fmt.Sprintf("%T", bv); got != c.rawType {
+					t.Errorf("binary callback-less Decode produced %s, want raw %s", got, c.rawType)
+				}
+				if got := fmt.Sprintf("%T", jv); got != c.rawType {
+					t.Errorf("JSON callback-less DecodeJSON produced %s, want raw %s (binary<->JSON parity)", got, c.rawType)
+				}
+				if !reflect.DeepEqual(bv, jv) {
+					t.Errorf("callback-less decode divergence: binary=%#v json=%#v", bv, jv)
+				}
+			})
+		}
+	}
+}
+
+// A matching CustomType suppresses the reader's built-in logical decoder; that
+// suppression must hold whether a value is decoded directly OR reached via a
+// writer->reader promotion (int->long). The promotion deser used to re-apply
+// the reader's logical conversion UNCONDITIONALLY, so for the same reader+custom
+// a direct long wire fed the custom decoder (or the user) the raw Avro-native
+// type while a promoted int wire fed the enriched logical type — a binary
+// internal inconsistency. Driven across every long-backed logical and all four
+// callback configurations; the decode-only/both configs record (via the marker
+// the Decode returns) which raw type they were handed, so a TYPE-only check
+// can't mask a value divergence.
+func TestRegression_CustomPromotionHonorsLogicalSuppression(t *testing.T) {
+	dummyGo := reflect.TypeOf(struct{ N int64 }{})
+	mark := func(v any, _ *avro.SchemaNode) (any, error) { return "raw:" + fmt.Sprintf("%T", v), nil }
+	enc := func(v any, _ *avro.SchemaNode) (any, error) { return v, nil }
+	configs := []struct {
+		name string
+		make func(c customLogicalCase) avro.CustomType
+	}{
+		{"no-callbacks", func(c customLogicalCase) avro.CustomType { return avro.CustomType{LogicalType: c.logical} }},
+		{"encode-only", func(c customLogicalCase) avro.CustomType {
+			return avro.CustomType{LogicalType: c.logical, AvroType: c.avroType, GoType: dummyGo, Encode: enc}
+		}},
+		{"decode-only", func(c customLogicalCase) avro.CustomType {
+			return avro.CustomType{LogicalType: c.logical, AvroType: c.avroType, Decode: mark}
+		}},
+		{"both", func(c customLogicalCase) avro.CustomType {
+			return avro.CustomType{LogicalType: c.logical, AvroType: c.avroType, GoType: dummyGo, Encode: enc, Decode: mark}
+		}},
+	}
+	for _, c := range customLogicalCases() {
+		if c.avroType != "long" {
+			continue // int->long promotion applies only to long-backed logicals
+		}
+		for _, cfg := range configs {
+			t.Run(c.name+"/"+cfg.name, func(t *testing.T) {
+				ct := cfg.make(c)
+				r := avro.MustParse(c.schema, ct)
+
+				longWire, err := avro.MustParse(c.schema).Encode(c.encVal)
+				if err != nil {
+					t.Fatalf("encode long wire: %v", err)
+				}
+				var direct any
+				if _, err := r.Decode(longWire, &direct); err != nil {
+					t.Fatalf("direct Decode: %v", err)
+				}
+
+				w := avro.MustParse(`"int"`)
+				resolved, err := avro.Resolve(w, r)
+				if err != nil {
+					t.Fatalf("Resolve: %v", err)
+				}
+				intWire, _ := w.Encode(int32(1700000000))
+				var promoted any
+				if _, err := resolved.Decode(intWire, &promoted); err != nil {
+					t.Fatalf("promoted Decode: %v", err)
+				}
+
+				// decode-only/both: the marker value records the raw type fed to
+				// Decode and must match. no-callbacks/encode-only: the result Go
+				// type itself (raw int64 vs enriched time.X) must match.
+				dv, pv := fmt.Sprintf("%T=%v", direct, direct), fmt.Sprintf("%T=%v", promoted, promoted)
+				dMark, _ := direct.(string)
+				pMark, _ := promoted.(string)
+				if dMark != "" || pMark != "" {
+					if dMark != pMark {
+						t.Errorf("custom Decode fed different raw types: direct=%q promoted=%q", dMark, pMark)
+					}
+					return
+				}
+				if fmt.Sprintf("%T", direct) != fmt.Sprintf("%T", promoted) {
+					t.Errorf("promotion ignored custom suppression: direct=%s promoted=%s", dv, pv)
+				}
+			})
+		}
+	}
+}
+
+// On a schema returned by Resolve, DecodeJSON consumes WRITER-shaped JSON and
+// applies full writer->reader resolution, matching Java's ResolvingDecoder over
+// a JsonDecoder constructed with the writer schema (the JSON is parsed against
+// the writer, then resolved). Java maps a writer enum symbol absent from the
+// reader to the reader's enum default; promotes int->long etc.; drops writer-
+// only fields; fills reader defaults; and honors aliases. The binary resolved
+// decode (Schema.Decode, which has always resolved) is the oracle: for every
+// shape, resolved.DecodeJSON(writerJSON) must equal resolved.Decode(writerBinary).
+// Previously DecodeJSON on a resolved schema decoded against the bare reader
+// node, so a writer-only enum symbol errored ("unknown enum symbol") where
+// binary produced the reader default.
+func TestRegression_ResolvedDecodeJSONMatchesBinary(t *testing.T) {
+	cases := []struct {
+		name           string
+		writer, reader string
+		readerOpts     []avro.SchemaOpt
+		writerVal      any
+	}{
+		{
+			"enum-writer-symbol-to-reader-default",
+			`{"type":"enum","name":"E","symbols":["A","B","C"]}`,
+			`{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`,
+			nil, "C", // only in writer; resolution -> reader default "A"
+		},
+		{
+			"promotion-int-to-long",
+			`"int"`, `"long"`, nil, int32(5),
+		},
+		{
+			"promotion-int-to-timestamp-logical",
+			`"int"`, `{"type":"long","logicalType":"timestamp-millis"}`, nil, int32(1700000000),
+		},
+		{
+			"promotion-with-nocallback-custom-suppression",
+			`"int"`, `{"type":"long","logicalType":"timestamp-millis"}`,
+			[]avro.SchemaOpt{avro.CustomType{LogicalType: "timestamp-millis"}}, int32(1700000000),
+		},
+		{
+			"record-add-default-drop-writer-field-promote",
+			`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"x","type":"int"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"c","type":"int","default":99}]}`,
+			nil, map[string]any{"a": int32(1), "x": int32(2)},
+		},
+		{
+			"record-field-rename-via-alias",
+			`{"type":"record","name":"R","fields":[{"name":"old","type":"int"}]}`,
+			`{"type":"record","name":"R","fields":[{"name":"new","type":"int","aliases":["old"]}]}`,
+			nil, map[string]any{"old": int32(7)},
+		},
+		{
+			"union-writer-branch-promote",
+			`["null","int"]`, `["null","long"]`, nil, int32(9),
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := avro.MustParse(c.writer)
+			r := avro.MustParse(c.reader, c.readerOpts...)
+			resolved, err := avro.Resolve(w, r)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			binWire, err := w.Encode(c.writerVal)
+			if err != nil {
+				t.Fatalf("writer Encode: %v", err)
+			}
+			jsonWire, err := w.EncodeJSON(c.writerVal)
+			if err != nil {
+				t.Fatalf("writer EncodeJSON: %v", err)
+			}
+			var binOut, jsonOut any
+			if _, err := resolved.Decode(binWire, &binOut); err != nil {
+				t.Fatalf("resolved.Decode (binary oracle): %v", err)
+			}
+			if err := resolved.DecodeJSON(jsonWire, &jsonOut); err != nil {
+				t.Fatalf("resolved.DecodeJSON: %v", err)
+			}
+			if !reflect.DeepEqual(binOut, jsonOut) {
+				t.Errorf("resolved JSON decode != binary decode:\n  binary=%#v\n  json  =%#v", binOut, jsonOut)
+			}
+		})
+	}
+
+	// Spell out the headline Java behavior explicitly.
+	t.Run("enum-default-value-explicit", func(t *testing.T) {
+		w := avro.MustParse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+		r := avro.MustParse(`{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`)
+		resolved, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		var got any
+		if err := resolved.DecodeJSON([]byte(`"C"`), &got); err != nil {
+			t.Fatalf("DecodeJSON: %v", err)
+		}
+		if got != "A" {
+			t.Errorf("writer-only enum symbol via JSON resolution: got %v, want reader default A", got)
+		}
+	})
+}
+
+// A self-/mutually-recursive (or forward-referenced) named type whose subtree
+// contains a logical that a registered CustomType matches must Parse — the
+// CustomType is in scope for the current Parse and applies to the type's single
+// definition. The cached-named-ref guard (rejectCachedRefIfCustomTypeWouldMatch)
+// is for types inherited from a SchemaCache across Parses; it must NOT fire on a
+// name defined in the current Parse. A self-reference resolves mid-build (before
+// the record's fields finish wiring their CTs), so the guard's hadCustomType
+// flag is still false at that point — gating the guard on cachedNames (the
+// cross-parse name set) is what keeps it from rejecting valid recursive schemas.
+// Once parsed, binary and JSON must agree (suppression holds through recursion).
+func TestRegression_RecursiveCustomTypeParsesAndParity(t *testing.T) {
+	ct := avro.CustomType{LogicalType: "timestamp-millis"}
+	schemas := []struct{ name, schema string }{
+		{"self-nested", `{"type":"record","name":"Node","fields":[
+			{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
+			{"name":"next","type":["null","Node"]}]}`},
+		{"self-wrapped", `{"type":"record","name":"Node","fields":[
+			{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
+			{"name":"next","type":["null",{"type":"Node"}]}]}`},
+		{"mutual", `{"type":"record","name":"A","fields":[
+			{"name":"b","type":["null",{"type":"record","name":"B","fields":[
+				{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},
+				{"name":"a","type":["null","A"]}]}]}]}`},
+		{"shared-multiref", `{"type":"record","name":"R","fields":[
+			{"name":"x","type":{"type":"record","name":"Pair","fields":[
+				{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}},
+			{"name":"y","type":"Pair"}]}`},
+	}
+	for _, sc := range schemas {
+		t.Run(sc.name, func(t *testing.T) {
+			s, err := avro.Parse(sc.schema, ct)
+			if err != nil {
+				t.Fatalf("Parse(recursive + CustomType) failed: %v", err)
+			}
+			// Decode a minimal leaf both ways; suppression -> raw int64 on both.
+			plain := avro.MustParse(sc.schema)
+			// Build a minimal value: just the ts (and nil recursion / required subrecords).
+			var val any
+			switch sc.name {
+			case "self-nested", "self-wrapped":
+				val = map[string]any{"ts": time.UnixMilli(1700000000000).UTC(), "next": nil}
+			case "mutual":
+				val = map[string]any{"b": nil}
+			case "shared-multiref":
+				val = map[string]any{
+					"x": map[string]any{"ts": time.UnixMilli(1700000000000).UTC()},
+					"y": map[string]any{"ts": time.UnixMilli(1700000001000).UTC()},
+				}
+			}
+			bin, err := plain.Encode(val)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			jsn, err := plain.EncodeJSON(val)
+			if err != nil {
+				t.Fatalf("encodeJSON: %v", err)
+			}
+			var bv, jv any
+			if _, err := s.Decode(bin, &bv); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if err := s.DecodeJSON(jsn, &jv); err != nil {
+				t.Fatalf("DecodeJSON: %v", err)
+			}
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("recursive custom binary<->JSON divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
+			}
+		})
+	}
+}
+
+// A FORWARD-referenced named type (one used before its definition appears in the
+// schema) carrying a CustomType must encode AND decode identically to an
+// in-order reference — and to the JSON path. The finalize fixups that wire a
+// forward reference's ser/deser used the UNWRAPPED namedType functions and did
+// not re-apply the custom wrap, so the forward-referenced field encoded/decoded
+// RAW on binary while JSON applied the custom (silent binary↔JSON divergence:
+// for an enum with a reorder Encode, the field wrote a different ordinal on each
+// format). A named reference is position-independent in Avro (Java resolves
+// every reference to the same Schema object), so its encoding cannot depend on
+// whether the type was defined before or after. The fix routes both the
+// in-order and the three forward-ref fixup sites (union branch / record field /
+// array item) through one shared wrap (customWrappedSer / customWrappedDeser).
+func TestRegression_ForwardRefCustomTypeBinaryJSONParity(t *testing.T) {
+	// E used in field "a" (forward ref) BEFORE its definition in field "b".
+	enumPos := []struct{ name, schema string }{
+		{"union-branch", `{"type":"record","name":"R","fields":[
+			{"name":"a","type":["null","E"]},
+			{"name":"b","type":{"type":"enum","name":"E","symbols":["RED","GREEN","BLUE"]}}]}`},
+		{"array-item", `{"type":"record","name":"R","fields":[
+			{"name":"a","type":{"type":"array","items":"E"}},
+			{"name":"b","type":{"type":"enum","name":"E","symbols":["RED","GREEN","BLUE"]}}]}`},
+	}
+	for _, p := range enumPos {
+		t.Run(p.name+"/encode", func(t *testing.T) {
+			// Encode-side: a reorder Encode makes raw-ordinal vs custom-ordinal
+			// observable. GoType drives the custom on the Color value.
+			ct := avro.CustomType{AvroType: "enum", GoType: reflect.TypeOf(testColor(0)),
+				Encode: func(v any, sn *avro.SchemaNode) (any, error) {
+					return sn.Symbols[len(sn.Symbols)-1-int(v.(testColor))], nil
+				}}
+			s := avro.MustParse(p.schema, ct)
+			var aVal any = testColor(0)
+			if p.name == "array-item" {
+				aVal = []testColor{0}
+			}
+			val := map[string]any{"a": aVal, "b": testColor(0)}
+			bin, eb := s.Encode(val)
+			jsn, ej := s.EncodeJSON(val)
+			if eb != nil || ej != nil {
+				t.Fatalf("encode: bin=%v json=%v", eb, ej)
+			}
+			var bv, jv any
+			if _, err := s.Decode(bin, &bv); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if err := s.DecodeJSON(jsn, &jv); err != nil {
+				t.Fatalf("DecodeJSON: %v", err)
+			}
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("forward-ref custom encode divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
+			}
+		})
+		t.Run(p.name+"/decode", func(t *testing.T) {
+			ct := avro.CustomType{AvroType: "enum",
+				Decode: func(v any, _ *avro.SchemaNode) (any, error) { return "DEC:" + fmt.Sprintf("%v", v), nil }}
+			plain := avro.MustParse(p.schema)
+			var aVal any = "RED"
+			if p.name == "array-item" {
+				aVal = []any{"RED"}
+			}
+			val := map[string]any{"a": aVal, "b": "GREEN"}
+			bin, _ := plain.Encode(val)
+			jsn, _ := plain.EncodeJSON(val)
+			s := avro.MustParse(p.schema, ct)
+			var bv, jv any
+			if _, err := s.Decode(bin, &bv); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if err := s.DecodeJSON(jsn, &jv); err != nil {
+				t.Fatalf("DecodeJSON: %v", err)
+			}
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("forward-ref custom decode divergence:\n  binary=%#v\n  json  =%#v", bv, jv)
+			}
+		})
+	}
+}
+
+type testColor int32
+
+// A no-Decode CustomType that suppresses a logical produces the RAW Avro-native
+// value (CustomType.Decode "If nil ... the base Avro type decoder is used"). For
+// a fixed-size byte-ARRAY target ([N]byte) this must agree between Decode and
+// DecodeJSON: binary's raw deserFixed copies the bytes into [N]byte, so JSON
+// must too (it previously boxed into any and setCustomResult rejected the
+// []byte→[N]byte assignment). And for uuid-on-string into [16]byte, binary's
+// raw deserString has no array arm and ERRORS, so JSON must error too (it
+// previously applied the uuid arm and succeeded). Both are fixed by routing the
+// no-Decode suppression through the same raw decode arms the binary deser uses.
+func TestRegression_CustomSuppressionByteArrayTargetParity(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		logical string
+		wantErr bool // true: both wire formats must ERROR ([N]byte can't hold a raw string)
+	}{
+		{"fixed-uuid-16", `{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`, "uuid", false},
+		{"fixed-duration-12", `{"type":"fixed","name":"D","size":12,"logicalType":"duration"}`, "duration", false},
+		{"fixed-decimal-8", `{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`, "decimal", false},
+		{"string-uuid-16", `{"type":"string","logicalType":"uuid"}`, "uuid", true},
+	}
+	u := "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			plain := avro.MustParse(c.schema)
+			var encVal any = u
+			if c.name == "fixed-duration-12" {
+				encVal = avro.Duration{Months: 1, Days: 2, Milliseconds: 3}
+			} else if c.name == "fixed-decimal-8" {
+				encVal = big.NewRat(33, 100)
+			}
+			bin, _ := plain.Encode(encVal)
+			jsn, _ := plain.EncodeJSON(encVal)
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+
+			szArr := func() reflect.Value {
+				switch c.name {
+				case "fixed-duration-12":
+					return reflect.New(reflect.ArrayOf(12, reflect.TypeOf(byte(0))))
+				case "fixed-decimal-8":
+					return reflect.New(reflect.ArrayOf(8, reflect.TypeOf(byte(0))))
+				default:
+					return reflect.New(reflect.ArrayOf(16, reflect.TypeOf(byte(0))))
+				}
+			}
+			bp, jp := szArr(), szArr()
+			_, eb := cs.Decode(bin, bp.Interface())
+			ej := cs.DecodeJSON(jsn, jp.Interface())
+			if (eb == nil) != (ej == nil) {
+				t.Fatalf("[N]byte target parity: binary err=%v ; json err=%v", eb, ej)
+			}
+			if c.wantErr && eb == nil {
+				t.Errorf("expected both to error ([N]byte can't hold a raw string), got success")
+			}
+			if !c.wantErr {
+				if eb != nil {
+					t.Fatalf("expected success, got binary err=%v", eb)
+				}
+				if !reflect.DeepEqual(bp.Elem().Interface(), jp.Elem().Interface()) {
+					t.Errorf("[N]byte value divergence: binary=%v json=%v", bp.Elem(), jp.Elem())
+				}
+			}
+		})
+	}
+}
+
+// SchemaCache: a cached named type and the Parse referencing it must AGREE on
+// whether a matching CustomType is registered — the custom's effect is baked
+// onto the SHARED cached node (binary suppression on node.ser/deser, JSON
+// node.decodeJSON), so a mismatch silently changes what the referencing Schema
+// decodes/encodes on BOTH wire formats. Both directions are rejected with a
+// clear error; a consistent registration resolves. A current-Parse self-/
+// forward reference is exempt (its CustomTypes are in scope for its single
+// definition).
+func TestRegression_SchemaCacheCustomBoundaryGuard(t *testing.T) {
+	tsCustom := avro.CustomType{LogicalType: "timestamp-millis"}
+	rSchema := `{"type":"record","name":"R","fields":[{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}`
+	outer := `{"type":"record","name":"Outer","fields":[{"name":"r","type":"R"}]}`
+
+	t.Run("reverse-custom-cached-nocustom-ref-rejects", func(t *testing.T) {
+		var cache avro.SchemaCache
+		if _, err := cache.Parse(rSchema, tsCustom); err != nil {
+			t.Fatalf("cache R with custom: %v", err)
+		}
+		_, err := cache.Parse(outer) // no custom -> must reject (would inherit suppression)
+		if err == nil {
+			t.Fatal("expected error referencing custom-built cached type without the CustomType")
+		}
+		if !strings.Contains(err.Error(), "R") || !strings.Contains(err.Error(), "CustomType") {
+			t.Errorf("error should name the cached type and CustomType: %v", err)
+		}
+	})
+	t.Run("forward-clean-cached-custom-ref-rejects", func(t *testing.T) {
+		var cache avro.SchemaCache
+		if _, err := cache.Parse(rSchema); err != nil { // no custom
+			t.Fatalf("cache R clean: %v", err)
+		}
+		_, err := cache.Parse(outer, tsCustom) // custom -> must reject (would drop the custom)
+		if err == nil {
+			t.Fatal("expected error: custom would match a clean cached type's subtree")
+		}
+	})
+	t.Run("consistent-custom-both-resolves", func(t *testing.T) {
+		var cache avro.SchemaCache
+		if _, err := cache.Parse(rSchema, tsCustom); err != nil {
+			t.Fatalf("cache R with custom: %v", err)
+		}
+		if _, err := cache.Parse(outer, tsCustom); err != nil { // same custom -> OK
+			t.Errorf("consistent custom reference should resolve, got: %v", err)
+		}
+	})
+	t.Run("clean-both-resolves", func(t *testing.T) {
+		var cache avro.SchemaCache
+		if _, err := cache.Parse(rSchema); err != nil {
+			t.Fatalf("cache R clean: %v", err)
+		}
+		if _, err := cache.Parse(outer); err != nil { // both clean -> OK
+			t.Errorf("clean reference should resolve, got: %v", err)
+		}
+	})
+}
+
+// A CustomType whose Decode returns a POINTER, decoded into a POINTER target,
+// must succeed identically on binary and JSON. setCustomResult itself walks
+// pointer indirections to find the assignable level, so the JSON decoder-chain
+// must hand it the SAME un-indirected target the binary path does. The JSON path
+// pre-dereferenced the target with indirectAlloc before calling setCustomResult,
+// so a *wrap Decode result into a **wrap target had its outer pointer peeled away
+// and the *wrap result no longer matched ("cannot use wrap with Avro type
+// string") while binary accepted it — a binary<->JSON divergence. The fix drops
+// the extra indirectAlloc so the JSON decoder-chain mirrors binary's
+// setCustomResult(v, ...). Exercised through the multi-decoder wrap branch
+// (wrapDecodeJSONWithCustomDecoders), where the indirectAlloc lived.
+func TestRegression_CustomDecodePointerResultPointerTargetParity(t *testing.T) {
+	type wrap struct{ V string }
+	ct := avro.CustomType{
+		LogicalType: "wrapped", AvroType: "string", GoType: reflect.TypeOf((*wrap)(nil)),
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v.(*wrap).V, nil },
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) { return &wrap{V: v.(string)}, nil },
+	}
+	s := avro.MustParse(`{"type":"string","logicalType":"wrapped"}`, ct)
+	bin, err := s.Encode(&wrap{V: "hi"})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	jsn, err := s.EncodeJSON(&wrap{V: "hi"})
+	if err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+
+	var tb, tj *wrap
+	_, eb := s.Decode(bin, &tb)
+	ej := s.DecodeJSON(jsn, &tj)
+	if (eb == nil) != (ej == nil) {
+		t.Fatalf("pointer-result/pointer-target parity broken: binary err=%v ; json err=%v", eb, ej)
+	}
+	if eb != nil {
+		t.Fatalf("both should succeed (setCustomResult walks pointers), got binary err=%v json err=%v", eb, ej)
+	}
+	if tb == nil || tj == nil || *tb != *tj {
+		t.Errorf("pointer-result divergence: binary=%v json=%v", tb, tj)
+	}
+	if tj.V != "hi" {
+		t.Errorf("json pointer Decode result lost its value: %+v", tj)
+	}
+}
+
+// A no-Decode CustomType that suppresses a logical must yield the RAW
+// Avro-native value on BOTH wire formats for a SCALAR typed target, exactly like
+// binary's raw deser* (which build no logical deser under suppression). Each
+// per-kind JSON decoder honored the suppression flag in its decode-into-any
+// branch but applied the logical transform UNCONDITIONALLY for a TYPED target:
+//   - assignBytes (bytes/fixed): decimal/big-decimal/duration arms — a suppressed
+//     decimal into *string read the logical "123.45" on JSON while binary handed
+//     back the raw 2-byte payload "09"; into *big.Rat JSON coerced while binary
+//     rejected (no slice/array/string target).
+//   - decodeInt/decodeLong (int/long): date/time/timestamp arms — a suppressed
+//     date into time.Time succeeded on JSON (enriched) while binary rejected the
+//     raw int32, and time-millis into time.Duration SILENTLY produced a different
+//     value (binary's raw ns vs the JSON logical conversion) — no error, corrupt
+//     data, the worst kind of divergence.
+//
+// The fix threads the suppression flag into assignBytes/decodeInt/decodeLong so
+// each returns the raw value (setBytesValue/setIntValue/setLongValue) before its
+// logical switch. The [N]byte-array sibling is
+// TestRegression_CustomSuppressionByteArrayTargetParity; this pins the scalar
+// (string / time.Time / time.Duration) targets and the now-invalid enriched
+// targets (*big.Rat / avro.Duration / time.Time), whose logical arm no longer
+// fires. Driven across bytes, fixed, int and long logicals uniformly.
+func TestRegression_CustomSuppressionScalarTargetParity(t *testing.T) {
+	strT := reflect.TypeOf("")
+	ratT := reflect.TypeOf((*big.Rat)(nil))
+	durT := reflect.TypeOf(avro.Duration{})
+	timeT := reflect.TypeOf(time.Time{})
+	godurT := reflect.TypeOf(time.Duration(0))
+	cases := []struct {
+		name    string
+		schema  string
+		logical string
+		encVal  any
+		target  reflect.Type // reflect.New(target) is the decode target
+		wantRaw any          // when non-nil, both must succeed and DeepEqual this raw value
+		wantErr bool         // both must reject (enriched target invalid once the arm is suppressed)
+	}{
+		// The headline case: 123.45 at scale 2 is unscaled 12345 = 0x3039, whose
+		// two raw bytes are '0','9'. The suppressed string target must read "09",
+		// NOT the logical-formatted "123.45".
+		{"decimal-bytes/string", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, "decimal", big.NewRat(12345, 100), strT, "09", false},
+		{"decimal-bytes/bigRat", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, "decimal", big.NewRat(12345, 100), ratT, nil, true},
+		{"decimal-fixed/string", `{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`, "decimal", big.NewRat(12345, 100), strT, nil, false},
+		{"big-decimal/string", `{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal", big.NewRat(12345, 100), strT, nil, false},
+		{"big-decimal/bigRat", `{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal", big.NewRat(12345, 100), ratT, nil, true},
+		{"duration-fixed/string", `{"type":"fixed","name":"DUR","size":12,"logicalType":"duration"}`, "duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, strT, nil, false},
+		{"duration-fixed/duration", `{"type":"fixed","name":"DUR2","size":12,"logicalType":"duration"}`, "duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, durT, nil, true},
+		// int/long logicals: the suppressed raw int must NOT be transformed.
+		{"date/time", `{"type":"int","logicalType":"date"}`, "date", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), timeT, nil, true},
+		{"date/string", `{"type":"int","logicalType":"date"}`, "date", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), strT, nil, true},
+		// 3h as time-millis is 10_800_000 on the wire; raw into a time.Duration
+		// (ns) is 10.8ms, NOT the logical 3h — the silent value-divergence case.
+		{"time-millis/duration", `{"type":"int","logicalType":"time-millis"}`, "time-millis", 3 * time.Hour, godurT, time.Duration(10800000), false},
+		{"timestamp-millis/time", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", time.UnixMilli(1700000000000).UTC(), timeT, nil, true},
+		{"timestamp-millis/string", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", time.UnixMilli(1700000000000).UTC(), strT, nil, true},
+		// 3h as time-micros is 10_800_000_000; raw into time.Duration is 10.8s.
+		{"time-micros/duration", `{"type":"long","logicalType":"time-micros"}`, "time-micros", 3 * time.Hour, godurT, time.Duration(10800000000), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			plain := avro.MustParse(c.schema)
+			bin, err := plain.Encode(c.encVal)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			jsn, err := plain.EncodeJSON(c.encVal)
+			if err != nil {
+				t.Fatalf("EncodeJSON: %v", err)
+			}
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+			bp, jp := reflect.New(c.target), reflect.New(c.target)
+			_, eb := cs.Decode(bin, bp.Interface())
+			ej := cs.DecodeJSON(jsn, jp.Interface())
+			if (eb == nil) != (ej == nil) {
+				t.Fatalf("binary<->JSON parity broken: binary err=%v ; json err=%v", eb, ej)
+			}
+			if c.wantErr {
+				if eb == nil {
+					t.Errorf("expected both to reject the enriched target under suppression, got success (binary=%v)", bp.Elem())
+				}
+				return
+			}
+			if eb != nil {
+				t.Fatalf("expected success, got binary err=%v json err=%v", eb, ej)
+			}
+			bv, jv := bp.Elem().Interface(), jp.Elem().Interface()
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("suppressed scalar-target divergence: binary=%#v json=%#v", bv, jv)
+			}
+			if c.wantRaw != nil && !reflect.DeepEqual(bv, c.wantRaw) {
+				t.Errorf("expected RAW value %#v (logical arm suppressed), got %#v — JSON applied the logical transform", c.wantRaw, bv)
 			}
 		})
 	}

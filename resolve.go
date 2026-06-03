@@ -54,6 +54,7 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 		full:   reader.full,
 		custom: reader.custom,
 	}
+	s.resolveWriter = writer
 	s.soe = reader.soe
 	// SOE wire bytes carry the writer's fingerprint per the Avro spec
 	// (the schema that produced the wire IS the writer). Storing
@@ -225,8 +226,18 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 		// would produce int64 instead of time.Time at every position
 		// (top-level, record field, array item, map value, reader-union
 		// branch). Wrap the promotion deser to re-apply the conversion.
+		// A matching CustomType that suppresses the reader's built-in logical
+		// decoder (the binary build fed the user the raw Avro-native value via
+		// hasMatchingCustomType) must keep suppressing through promotion: the
+		// bare promotion deser feeds the custom decoder (or, with no Decode
+		// callback, the user) the raw value, exactly as a direct, non-promoted
+		// decode does. Without this gate the custom decoder receives the
+		// enriched logical type (time.Time / *big.Rat) on a promoted wire but
+		// the raw type on a direct wire for the same reader+custom.
 		if pdLogical := promotionDeserForLogical(w.kind, r); pdLogical != nil {
-			deser = pdLogical
+			if cw := ctx.custom[r]; cw == nil || !cw.suppressLogical {
+				deser = pdLogical
+			}
 		}
 		nd := &schemaNode{
 			kind:  r.kind,

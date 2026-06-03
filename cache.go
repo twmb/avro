@@ -99,17 +99,24 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 		}
 	}
 
-	// Allow re-registration of inherited names when re-parsing a schema
-	// that was previously parsed with custom types (which skipped dedup),
-	// or when parsing with custom types now. This preserves the
-	// "duplicate named type" error for genuinely conflicting definitions.
-	needsCachedNames := hasCustomTypes || c.customParsed[h]
-	if needsCachedNames && len(cloned) > 0 {
+	// cachedNames marks every name INHERITED from the cache (cross-parse), so
+	// rejectCachedRefIfCustomTypeWouldMatch can tell an inherited reference from
+	// a name defined in THIS parse (a self-/forward reference), and the
+	// duplicate-name check can do the same. Populated for EVERY parse with
+	// inherited names — the cross-parse custom-boundary guard must fire even for
+	// a plain (no-CustomType) parse that references a custom-built cached type.
+	if len(cloned) > 0 {
 		b.cachedNames = make(map[string]bool, len(cloned))
 		for name := range cloned {
 			b.cachedNames[name] = true
 		}
 	}
+	// allowReRegister lets a parse re-DEFINE an inherited name (vs the
+	// "duplicate named type" error). Only parses that skipped dedup and
+	// re-parse to get fresh CustomType wiring need this — custom parses, or a
+	// re-parse of a schema previously parsed with custom types. A plain parse
+	// re-defining an inherited name still errors, preserving conflict detection.
+	b.allowReRegister = hasCustomTypes || c.customParsed[h]
 
 	s, err := parse(schema, b)
 	if err != nil {

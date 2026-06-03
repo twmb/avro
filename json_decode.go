@@ -117,9 +117,16 @@ func jsonDecodeAppliesLogical(node *schemaNode) bool {
 		// duration arms only convert at len 16 / 12 respectively.
 		_, raw := decodeLogicalFixed(make([]byte, node.size), node).([]byte)
 		return !raw
+	case "string":
+		// uuid-on-string has a TYPED-target transform — decodeString parses the
+		// hex-dash string into a [16]byte / UUID-typed target — that the *any
+		// probe above can't see (into *any / string it IS identity). Report it
+		// as transforming so a no-Decode CustomType on uuid-string installs the
+		// suppression wrapper, and the raw decode (decodeString with raw=true)
+		// then errors on a [16]byte target exactly as the binary deserString
+		// does. Other string logicals have no typed-target transform.
+		return node.logical == "uuid"
 	}
-	// string: decodeString applies no logical transform (uuid-on-string is
-	// identity), so no suppression is needed.
 	return false
 }
 
@@ -250,7 +257,7 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 	case "double":
 		return ctx.decodeDouble(v)
 	case "string":
-		return ctx.decodeString(v, node, toAny)
+		return ctx.decodeString(v, node, toAny, raw)
 	case "enum":
 		return ctx.decodeEnum(v, node)
 	case "bytes":
@@ -288,6 +295,17 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 		// binary↔JSON parity. decodeKind captures and clears the flag, so
 		// it applies only to this node's leaf decode.
 		ctx.suppressLogical = suppressLogical
+		if len(decoders) == 0 {
+			// Pure suppression (no Decode callback): produce EXACTLY what the
+			// binary raw deser produces by decoding straight into the target
+			// through the same raw decode arms (assignBytes/setBytesValue for
+			// fixed → [N]byte, setStringValue for string, …) — DRY parity with
+			// the binary raw deser. The previous box-into-any + setCustomResult
+			// path could not land a []byte into a [N]byte array the way binary's
+			// deserFixed reflect.Copy does (and over-applied the uuid arm for a
+			// string target). decodeKind captures and clears suppressLogical.
+			return ctx.decodeKind(v, node)
+		}
 		if err := ctx.decodeKind(tmpV, node); err != nil {
 			return err
 		}
@@ -305,13 +323,18 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 			// matching the binary path (wrapDeserWithCustomDecoders).
 			// assignAny only checks assignability for interface targets;
 			// for a domain-typed struct field it Sets unconditionally.
-			return setCustomResult(indirectAlloc(v), out, node.kind)
+			// Pass the UN-indirected v (matching the binary path,
+			// wrapDeserWithCustomDecoders): setCustomResult walks/allocates
+			// pointer levels itself, so a custom Decode returning a POINTER
+			// (*T) lands in a *T target. An extra indirectAlloc here would
+			// pre-dereference the target and reject a pointer result.
+			return setCustomResult(v, out, node.kind)
 		}
 		// All decoders skipped: the raw Avro-native value (int64, []byte,
 		// …) lands in the target. setCustomResult guards the
 		// concrete-target assignability the same way the binary
-		// all-skip fall-through does.
-		return setCustomResult(indirectAlloc(v), tmp, node.kind)
+		// all-skip fall-through does (un-indirected v, per above).
+		return setCustomResult(v, tmp, node.kind)
 	}
 }
 
@@ -352,6 +375,17 @@ func (ctx *jsonDecoder) decodeInt(v reflect.Value, node *schemaNode, toAny, raw 
 			return setIface(v, reflect.ValueOf(val), "int")
 		}
 		return setIface(v, reflect.ValueOf(decodeLogicalInt(val, node)), "int")
+	}
+	if raw {
+		// Suppressed by a matching no-Decode CustomType: assign the raw int32,
+		// skipping the date/time-millis typed-target arms below — mirrors
+		// binary's raw deserInt, which builds no logical deser under
+		// suppression (so a time.Time / time.Duration / string target is
+		// rejected or filled raw exactly as on the binary path). Without this,
+		// a suppressed date decoded into time.Time succeeded on JSON (enriched)
+		// while binary rejected it, and time-millis into time.Duration silently
+		// produced a different value (raw ns vs the logical conversion).
+		return setIntValue(v, val)
 	}
 	// All DecodeJSON entry points produce addressable values
 	// (Schema.DecodeJSON requires a pointer; recursive paths use
@@ -402,6 +436,13 @@ func (ctx *jsonDecoder) decodeLong(v reflect.Value, node *schemaNode, toAny, raw
 			return err
 		}
 		return setIface(v, reflect.ValueOf(logical), "long")
+	}
+	if raw {
+		// Suppressed by a matching no-Decode CustomType: assign the raw int64,
+		// skipping the timestamp/time-micros typed-target arms below — mirrors
+		// binary's raw deserLong (see decodeInt for the full rationale and the
+		// silent time.Duration value-divergence this prevents).
+		return setLongValue(v, val)
 	}
 	// All DecodeJSON entry points produce addressable values (see decodeInt).
 	if v.Type() == timeType {
@@ -553,14 +594,17 @@ func (ctx *jsonDecoder) decodeDouble(v reflect.Value) error {
 	return setFloatValue(v, f, "double", 64)
 }
 
-func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny bool) error {
+func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny, raw bool) error {
 	s, err := ctx.consumeSlabString()
 	if err != nil {
 		return err
 	}
-	// UUID logical type: [16]byte target parses the hex-dash string
-	// into raw bytes, matching deserUUID on the binary side.
-	if node.logical == "uuid" && !toAny && isUUIDType(v.Type()) {
+	// UUID logical type: [16]byte target parses the hex-dash string into raw
+	// bytes, matching deserUUID on the binary side. Skipped when raw (a custom
+	// type suppresses the logical with no Decode callback): the binary path then
+	// uses deserString, which has no [16]byte arm and errors — so producing the
+	// raw string here keeps DecodeJSON in parity with Decode.
+	if node.logical == "uuid" && !toAny && !raw && isUUIDType(v.Type()) {
 		u, err := parseUUID(s)
 		if err != nil {
 			return err
@@ -643,7 +687,7 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny, ra
 		}
 		return setIface(v, reflect.ValueOf(val), "bytes")
 	}
-	return assignBytes(v, b, node)
+	return assignBytes(v, b, node, raw)
 }
 
 func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny, raw bool) error {
@@ -676,14 +720,24 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny, ra
 		}
 		return setIface(v, reflect.ValueOf(decodeLogicalFixed(b, node)), "fixed")
 	}
-	return assignBytes(v, b, node)
+	return assignBytes(v, b, node, raw)
 }
 
 // assignBytes assigns decoded bytes to a typed target, handling decimal,
 // duration, and uuid logical types. Logical-arm fall-through (the arm
 // fires but doesn't return) lands on the generic byte/string/array
 // targets below.
-func assignBytes(v reflect.Value, b []byte, node *schemaNode) error {
+//
+// raw=true means a matching no-Decode CustomType suppressed the logical
+// codec: skip every logical arm and assign the raw bytes, mirroring the
+// binary path's raw deserBytes/deserFixed (which build no logical deser
+// when suppressLogical fires). Without this, a suppressed bytes/fixed node
+// with a decimal/uuid/duration logicalType still transformed on the JSON
+// side (e.g. "decimal" → *big.Rat) while binary handed back raw bytes.
+func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool) error {
+	if raw {
+		return setBytesValue(v, b, node.kind)
+	}
 	switch node.logical {
 	case "decimal":
 		// Share setDecimalValue with the binary path so JSON accepts

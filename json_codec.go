@@ -139,9 +139,7 @@ func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error
 
 // DecodeJSON decodes Avro JSON from src into v. It unwraps union wrappers,
 // converts bytes/fixed strings, and coerces numeric types to match the
-// schema. When v is *any, the result is returned directly. For typed
-// targets (structs, etc.), the value is round-tripped through binary
-// encode/decode.
+// schema. When v is *any, the result is returned directly.
 //
 // DecodeJSON also accepts the non-standard union branch naming used by
 // linkedin/goavro (e.g. "long.timestamp-millis" instead of "long").
@@ -149,10 +147,21 @@ func (s *Schema) AppendEncodeJSON(dst []byte, v any, opts ...Opt) ([]byte, error
 // DecodeJSON accepts all input formats (tagged and bare unions, Java and
 // goavro NaN/Infinity conventions). Pass [TaggedUnions] to wrap decoded
 // union values when the target is *any.
+//
+// On a schema returned by [Resolve], src is WRITER-shaped JSON (the JSON a
+// producer using the writer schema would emit) and full writer→reader
+// resolution is applied — promotion, enum-symbol remapping to the reader
+// default, field add/drop, and aliases — matching Java's ResolvingDecoder over
+// a JsonDecoder constructed with the writer schema. (For binary, [Schema.Decode]
+// resolves directly; JSON resolution composes the writer's JSON decode with the
+// resolving binary decode, so it is not on a hot path.)
 func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return errors.New("avro: DecodeJSON requires a non-nil pointer")
+	}
+	if s.resolveWriter != nil {
+		return s.decodeJSONResolved(src, rv, opts...)
 	}
 	cfg := parseOpts(opts)
 	sl := slabPool.Get().(*slab)
@@ -173,6 +182,33 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 		}
 	}
 	sl.put()
+	return err
+}
+
+// decodeJSONResolved applies writer→reader schema resolution to WRITER-shaped
+// JSON on a schema returned by [Resolve]. It composes already-validated paths:
+// decode the writer-shaped JSON with the writer schema into a faithful
+// intermediate, re-encode that to writer binary, then run the resolving binary
+// decode (s.deser via [Schema.Decode]). This mirrors Java, whose ResolvingDecoder
+// wraps a JsonDecoder constructed with the writer schema — the JSON is parsed
+// against the writer, then resolved. Resolution is not throughput-critical, so
+// reusing the binary resolver (rather than threading resolution through the JSON
+// decoder) keeps the surface small and correct by construction.
+func (s *Schema) decodeJSONResolved(src []byte, rv reflect.Value, opts ...Opt) error {
+	w := s.resolveWriter
+	// The intermediate is decoded with NEUTRAL options and re-encoded
+	// immediately, so it must hold the writer's natural decoded form (bare
+	// unions, raw/unwrapped values) for Encode to reproduce the writer wire.
+	// The caller's opts apply only to the final reader-shaped decode below.
+	var inter any
+	if err := w.DecodeJSON(src, &inter); err != nil {
+		return err
+	}
+	wb, err := w.Encode(inter)
+	if err != nil {
+		return fmt.Errorf("avro: re-encoding resolved JSON intermediate: %w", err)
+	}
+	_, err = s.Decode(wb, rv.Interface(), opts...)
 	return err
 }
 

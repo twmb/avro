@@ -16,24 +16,30 @@ func TestRegression_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
 		want          bool
 	}{
 		// Transforming logicals (decode → enriched Go type).
-		{"int", "date", 0, true},                     // → time.Time
-		{"int", "time-millis", 0, true},              // → time.Duration
-		{"long", "time-micros", 0, true},             // → time.Duration
-		{"long", "timestamp-millis", 0, true},        // → time.Time
-		{"long", "timestamp-micros", 0, true},        // → time.Time
-		{"long", "timestamp-nanos", 0, true},         // → time.Time
-		{"long", "local-timestamp-millis", 0, true},  // → time.Time
-		{"long", "local-timestamp-micros", 0, true},  // → time.Time
-		{"long", "local-timestamp-nanos", 0, true},   // → time.Time
-		{"bytes", "decimal", 0, true},                // → *big.Rat
-		{"fixed", "decimal", 8, true},                // → *big.Rat
-		{"bytes", "big-decimal", 0, true},            // → *big.Rat
-		{"fixed", "uuid", 16, true},                  // → [16]byte
-		{"fixed", "duration", 12, true},              // → avro.Duration
+		{"int", "date", 0, true},                    // → time.Time
+		{"int", "time-millis", 0, true},             // → time.Duration
+		{"long", "time-micros", 0, true},            // → time.Duration
+		{"long", "timestamp-millis", 0, true},       // → time.Time
+		{"long", "timestamp-micros", 0, true},       // → time.Time
+		{"long", "timestamp-nanos", 0, true},        // → time.Time
+		{"long", "local-timestamp-millis", 0, true}, // → time.Time
+		{"long", "local-timestamp-micros", 0, true}, // → time.Time
+		{"long", "local-timestamp-nanos", 0, true},  // → time.Time
+		{"bytes", "decimal", 0, true},               // → *big.Rat
+		{"fixed", "decimal", 8, true},               // → *big.Rat
+		{"bytes", "big-decimal", 0, true},           // → *big.Rat
+		{"fixed", "uuid", 16, true},                 // → [16]byte
+		{"fixed", "duration", 12, true},             // → avro.Duration
 
-		// Non-transforming: uuid-on-string is identity (no decodeLogicalString);
-		// no logical; and an unknown future logical (decodeLogical* returns raw).
-		{"string", "uuid", 0, false},
+		// uuid-on-string transforms for a TYPED target — decodeString parses the
+		// hex-dash string into a [16]byte / UUID-typed target (into *any/string
+		// it is identity, but the gate must report the transform so a no-Decode
+		// CustomType installs the suppression wrapper and the raw decode matches
+		// binary's deserString, which has no [16]byte arm).
+		{"string", "uuid", 0, true},
+
+		// Non-transforming: no logical; and an unknown future logical
+		// (decodeLogical* returns raw).
 		{"int", "", 0, false},
 		{"long", "", 0, false},
 		{"bytes", "", 0, false},

@@ -36,6 +36,17 @@ type Schema struct {
 	// schema; accept only s.soe."
 	writerSoe [10]byte
 
+	// resolveWriter is the writer schema, populated only by
+	// Resolve(writer, reader) when the writer and reader differ (an identity
+	// resolution returns the reader schema directly, leaving this nil). It
+	// lets DecodeJSON apply writer→reader resolution to WRITER-shaped JSON,
+	// matching Java's ResolvingDecoder-over-JsonDecoder (the JsonDecoder is
+	// constructed with the writer schema). Binary Decode resolves via s.deser;
+	// JSON resolution composes the writer's JSON decode + binary re-encode with
+	// that same resolving s.deser. nil ⇒ not resolved; DecodeJSON decodes
+	// directly against s.node.
+	resolveWriter *Schema
+
 	// Per-schema custom type overlay. Keyed by *schemaNode so the
 	// shared node is not mutated — different schemas parsed with
 	// different custom types get different overlays.
@@ -1132,7 +1143,12 @@ type builder struct {
 	customTypes []CustomType
 	custom      map[*schemaNode]*customWiring
 	cachedNames map[string]bool // names inherited from SchemaCache, not from this parse
-	depth       int             // current build recursion depth, bounded by maxDepth
+	// allowReRegister permits re-DEFINING an inherited (cachedNames) type
+	// instead of erroring "duplicate named type". Set by SchemaCache.Parse only
+	// for parses that skip dedup and re-parse to get fresh CustomType wiring
+	// (custom parses, and re-parses of a previously-custom-parsed schema).
+	allowReRegister bool
+	depth           int // current build recursion depth, bounded by maxDepth
 }
 
 // validNameErr validates a simple name using the builder's configured validator.
@@ -1168,8 +1184,9 @@ func (b *builder) nest() *builder {
 		checkName:   b.checkName,
 		customTypes: b.customTypes,
 		custom:      b.custom,
-		cachedNames: b.cachedNames,
-		depth:       b.depth,
+		cachedNames:     b.cachedNames,
+		allowReRegister: b.allowReRegister,
+		depth:           b.depth,
 	}
 }
 
@@ -1203,6 +1220,53 @@ func (b *builder) putCustomWiring(node *schemaNode, w *customWiring) {
 		b.custom = make(map[*schemaNode]*customWiring)
 	}
 	b.custom[node] = w
+}
+
+// makeCustomSer wraps base with the custom-Encode function ce: apply ce to the
+// value, then encode the converted value via base. SINGLE definition of the
+// binary custom-Encode wrap, shared by applyCustomTypes (in-order references)
+// and customWrappedSer (forward-ref finalize fixups) so the two paths cannot
+// drift — a forward reference to a custom-encoded named type must emit the same
+// wire as an in-order one.
+func makeCustomSer(ce func(reflect.Value) (reflect.Value, error), base serfn) serfn {
+	return func(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+		v, err := ce(v)
+		if err != nil {
+			return nil, err
+		}
+		return base(dst, v, depth+1)
+	}
+}
+
+// customWrappedSer returns base wrapped with node's custom-Encode chain when
+// one is registered (the same wrap applyCustomTypes installs for an in-order
+// reference), else base unchanged. The forward-ref fixups in finalize call this
+// so a forward reference to a custom-encoded named type applies the CustomType
+// on the binary path — previously they used the unwrapped namedType.ser while
+// the JSON encoder applied the custom (a silent binary↔JSON divergence: the
+// forward-referenced field encoded raw on binary but converted on JSON).
+func (b *builder) customWrappedSer(node *schemaNode, base serfn) serfn {
+	if w := b.custom[node]; w != nil && w.encode != nil {
+		return makeCustomSer(w.encode, base)
+	}
+	return base
+}
+
+// customWrappedDeser is the decode dual of customWrappedSer: it returns base
+// wrapped with node's custom-Decode chain when one is registered (the same wrap
+// applyCustomTypes installs for an in-order reference), else base unchanged.
+// The forward-ref fixups in finalize call this so a forward reference to a
+// custom-decoded named type applies the CustomType on the binary path —
+// otherwise the forward-referenced field decodes raw on binary while the JSON
+// decoder applies the custom via the patched node.decodeJSON (the decode twin
+// of the encode divergence). Logical-suppression with no Decode callback needs
+// no wrap here: the suppressed (raw) deser is already baked onto the shared
+// leaf node, so a forward reference inherits it on both wire formats.
+func (b *builder) customWrappedDeser(node *schemaNode, base deserfn) deserfn {
+	if w := b.custom[node]; w != nil && len(w.decoders) > 0 {
+		return wrapDeserWithCustomDecoders(base, w.decoders, w.sn)
+	}
+	return base
 }
 
 // primFastInfo holds per-primitive bindings for both the array and map
@@ -1329,7 +1393,7 @@ func (b *builder) finalize() error {
 			if nt == nil {
 				return fmt.Errorf("unknown type %q", truncForError(name))
 			}
-			m.ser.fns[idx] = nt.ser
+			m.ser.fns[idx] = b.customWrappedSer(nt.node, nt.ser)
 			// The builder left branches[idx] nil for this forward-ref
 			// branch (the named type wasn't built yet). The binary path
 			// dispatches through the ser/deser fn tables (patched here and
@@ -1347,7 +1411,7 @@ func (b *builder) finalize() error {
 			if nt == nil {
 				return fmt.Errorf("unknown type %q", truncForError(name))
 			}
-			m.deser.fns[idx] = nt.deser
+			m.deser.fns[idx] = b.customWrappedDeser(nt.node, nt.deser)
 		}
 	}
 	for _, m := range b.mfixups {
@@ -1367,8 +1431,8 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("unknown type %q", truncForError(m.name))
 		}
-		m.sr.fields[m.idx].fn = nt.ser
-		m.dr.fields[m.idx].fn = nt.deser
+		m.sr.fields[m.idx].fn = b.customWrappedSer(nt.node, nt.ser)
+		m.dr.fields[m.idx].fn = b.customWrappedDeser(nt.node, nt.deser)
 		if nt.sr != nil {
 			m.sr.fields[m.idx].avroType = "record"
 			m.sr.fields[m.idx].meta.avroType = "record"
@@ -1385,8 +1449,8 @@ func (b *builder) finalize() error {
 		if nt == nil {
 			return fmt.Errorf("%s references unknown named type %q", m.ctxLabel, truncForError(m.name))
 		}
-		*m.serItem = nt.ser
-		*m.deserItem = nt.deser
+		*m.serItem = b.customWrappedSer(nt.node, nt.ser)
+		*m.deserItem = b.customWrappedDeser(nt.node, nt.deser)
 		m.setMinBytes(schemaMinBytes(nt.node))
 		*m.nodeChild = nt.node
 	}
@@ -1604,7 +1668,28 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		}
 	}
 
-	if len(encoders) == 0 && len(decoders) == 0 {
+	// suppressLogical mirrors the binary decoder-suppression gate
+	// (hasMatchingCustomType, the same predicate the primitive/decimal/fixed
+	// builds use to decide between the raw and logical deserializer). The
+	// binary build replaces the built-in logical deserializer with the raw one
+	// whenever ANY non-wildcard CustomType matches — INCLUDING a matcher with
+	// no Encode/Decode callbacks (per CustomType.Decode: "If nil, the built-in
+	// logical type handler is bypassed ... producing raw Avro-native values").
+	// Wildcards (empty LogicalType AND AvroType) are excluded by the gate.
+	suppressLogical := b.hasMatchingCustomType(node.kind, node.logical)
+	// jsonAppliesLogical narrows that to nodes whose JSON decoder actually
+	// transforms the raw value (a logical decodeKind would apply): only those
+	// need a JSON-side suppress-wrapper to mirror the binary raw decode.
+	jsonAppliesLogical := suppressLogical && jsonDecodeAppliesLogical(node)
+
+	// Nothing to wire when there are no callbacks AND the JSON path has no
+	// suppression to mirror. A no-callback matcher on a LOGICAL node falls
+	// THROUGH this guard (jsonAppliesLogical is true) so its JSON decode is
+	// suppressed to raw, matching the binary path — without this, DecodeJSON
+	// returns the enriched logical type (time.Time / *big.Rat) while Decode
+	// returns the raw Avro-native value. A wildcard, or a no-callback matcher
+	// on a non-logical node, has nothing to mirror and returns here.
+	if len(encoders) == 0 && len(decoders) == 0 && !jsonAppliesLogical {
 		return nil
 	}
 
@@ -1675,26 +1760,13 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 
 		// Wrap the binary serializer. We update b.ser (which becomes the
 		// Schema's ser) but NOT node.ser, so named types in the cache
-		// keep their unwrapped ser/deser.
-		innerSer := node.ser
-		ce := customEncode
-		b.ser = func(dst []byte, v reflect.Value, depth int) ([]byte, error) {
-			v, err := ce(v)
-			if err != nil {
-				return nil, err
-			}
-			return innerSer(dst, v, depth+1)
-		}
+		// keep their unwrapped ser/deser. The wrap closure is built by
+		// makeCustomSer, shared with the forward-ref finalize fixups
+		// (customWrappedSer) so an in-order reference and a forward reference
+		// to the same custom-encoded named type apply the SAME wrap.
+		b.ser = makeCustomSer(customEncode, node.ser)
 	}
 
-	// suppressLogical mirrors the binary decoder-suppression gate
-	// (hasMatchingCustomType, the same predicate the primitive/decimal/fixed
-	// builds use to decide between the raw and logical deserializer). The
-	// JSON wrapper must suppress the logical transform iff the binary path
-	// does, or the custom decoder sees raw on one path and enriched on the
-	// other. Wildcard CustomTypes (empty LogicalType AND AvroType) are
-	// excluded by the gate, so they keep the enriched value on BOTH paths.
-	suppressLogical := b.hasMatchingCustomType(node.kind, node.logical)
 	wiring.suppressLogical = suppressLogical
 	// encodeSuppresses mirrors the binary ENCODER-suppression gate exactly
 	// (hasMatchingCustomTypeWithEncode — excludes wildcards), so the JSON
@@ -1711,17 +1783,17 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		// to decodeKind otherwise — no per-call map lookup, no
 		// recursion guard, no shared mutable state.
 		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(decoders, sn, suppressLogical)
-	} else if suppressLogical && jsonDecodeAppliesLogical(node) {
-		// Encode-only custom (Decode==nil) on a logical node that the binary
-		// path suppresses (non-wildcard): with no Decode callback the user
+	} else if jsonAppliesLogical {
+		// No Decode callback (Encode-only, OR no callbacks at all) on a logical
+		// node that the binary path suppresses (non-wildcard): the user
 		// receives the RAW Avro-native value (CustomType.Decode docstring:
 		// "If nil, the built-in logical type handler is bypassed ... the
 		// base Avro type decoder is used directly, producing raw values").
 		// decodeKind applies the logical transform unless suppressed, so
 		// install the raw-decode wrapper with an empty decoder chain to
 		// produce the same raw value through DecodeJSON. A wildcard
-		// (suppressLogical false) skips this — decodeKind keeps the logical
-		// transform, matching the binary wildcard path.
+		// (suppressLogical false ⇒ jsonAppliesLogical false) skips this —
+		// decodeKind keeps the logical transform, matching the binary wildcard.
 		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(nil, sn, suppressLogical)
 	}
 
@@ -1773,20 +1845,49 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 // scoped to the resulting Schema, which by definition includes its
 // referenced types.
 func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *namedType) error {
-	if len(b.customTypes) == 0 || nt == nil || nt.node == nil {
+	if nt == nil || nt.node == nil {
 		return nil
 	}
-	// If the cached entry was itself built under a CT-bearing Parse,
-	// trust that its wiring is sufficient — the user's documented
-	// remediation is to re-parse the inner type with the CT in scope,
-	// which lands here. We don't try to detect CT shape mismatches
-	// between the two parses; the cached wiring wins.
-	if nt.hadCustomType {
+	// This guard is ONLY about types inherited from the SchemaCache across
+	// Parses. A name DEFINED in the current Parse (including a self-/forward
+	// reference resolved mid-build, before its subtree's CTs are wired onto the
+	// shared node) has this Parse's CustomTypes in scope and applies them to its
+	// single definition, so it is never a stale cross-parse cache. cachedNames
+	// holds exactly the cross-parse names; without this gate a self-referential
+	// record (e.g. a linked-list Node) whose subtree contains a CT-matched
+	// logical wrongly fails to Parse, because the self-reference resolves before
+	// registerNamed's hadCustomType re-stamp (which only runs after the record's
+	// fields are fully built).
+	if !b.cachedNames[refName] {
 		return nil
 	}
-	visited := make(map[*schemaNode]bool)
-	if matched := b.findCustomTypeMatchInSubtree(nt.node, visited); matched != "" {
-		return fmt.Errorf("avro: cached type %q contains %q which would match a CustomType on this Parse; re-parse %q with the CustomType first", truncForError(refName), truncForError(matched), truncForError(refName))
+	// A cached named type and the Parse referencing it MUST AGREE on whether a
+	// matching CustomType is registered. The CustomType's effect is baked onto
+	// the SHARED cached node — the binary logical-codec suppression bakes the
+	// raw ser/deser onto node.ser/node.deser (build sites), and the JSON wrapper
+	// sets node.decodeJSON — and a named-type reference resolves through those
+	// node fields, with no per-Schema overlay. So a mismatch silently changes
+	// what the referencing Schema decodes/encodes, on BOTH wire formats. Both
+	// directions are rejected with the same "make them consistent" remediation.
+	currentMatches := ""
+	if len(b.customTypes) > 0 {
+		currentMatches = b.findCustomTypeMatchInSubtree(nt.node, make(map[*schemaNode]bool))
+	}
+	switch {
+	case currentMatches != "" && !nt.hadCustomType:
+		// Forward: this Parse registers a CustomType matching the cached
+		// subtree, but the cached node was built WITHOUT it — reusing it would
+		// silently DROP this Parse's custom (the user gets raw/unwrapped values
+		// on the cached fields). Re-parse the inner type with the CustomType.
+		return fmt.Errorf("avro: cached type %q contains %q which would match a CustomType on this Parse; re-parse %q with the CustomType first", truncForError(refName), truncForError(currentMatches), truncForError(refName))
+	case nt.hadCustomType && currentMatches == "":
+		// Reverse: the cached node was built WITH a CustomType (its raw ser/deser
+		// and JSON decodeJSON bake that conversion onto the shared node), but
+		// this Parse registers no matching CustomType — reusing it would
+		// silently APPLY the original conversion to a Schema that never opted in
+		// (suppressed/raw values on BOTH wire formats). Register the same
+		// CustomType in this Parse, or parse the inner type without one.
+		return fmt.Errorf("avro: cached type %q was parsed with a CustomType affecting its subtree, but this Parse registers no matching CustomType; reusing it would apply that conversion here — register the CustomType in this Parse, or parse %q without one", truncForError(refName), truncForError(refName))
 	}
 	return nil
 }
@@ -2281,11 +2382,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		canonObj.Name = o.Name // use fully-qualified name
 		canonObj.Namespace = nil
 		if _, exists := b.named[o.Name]; exists {
-			if !b.cachedNames[o.Name] {
+			if !(b.cachedNames[o.Name] && b.allowReRegister) {
 				return fmt.Errorf("duplicate named type %q", truncForError(o.Name))
 			}
-			// Name exists from cache — allow re-registration
-			// (custom types need to re-parse to get fresh wiring).
+			// Inherited name re-registered by a custom (re-)parse — allowed so
+			// it gets fresh CustomType wiring.
 		}
 	} else {
 		if o.Name != "" || o.Namespace != nil {
