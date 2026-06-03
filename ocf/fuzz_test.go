@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/twmb/avro"
 )
 
@@ -335,11 +336,27 @@ func FuzzOCFWriterReaderCodecCycle(f *testing.F) {
 	}
 	// nil entry → default codec (null). Public codec constructors don't
 	// include a NullCodec wrapper; the default already exercises it.
+	//
+	// The zstd codec uses minimum-footprint options: the fuzz constructs and
+	// closes a codec PER EXECUTION (that lifecycle is the fuzzed surface), and
+	// default-option zstd costs ~573µs + 1.64MB of garbage per cycle (vs
+	// ~126µs + 0.30MB with these options; deflate is ~478µs + 1.26MB with no
+	// shrink knob). At fuzz rates across parallel workers that allocation
+	// churn keeps the GC saturated on small CI runners — exec rates slide and
+	// a starved worker can miss the coordinator's shutdown deadline at the
+	// -fuzztime boundary, failing the run with "context deadline exceeded"
+	// and no crasher input. The options only shrink buffers/effort; the
+	// construct→compress→decompress→Close surface is unchanged.
 	codecs := []func() WriterOpt{
 		nil,
 		func() WriterOpt { return WithCodec(DeflateCodec(1)) },
 		func() WriterOpt { return WithCodec(SnappyCodec()) },
-		func() WriterOpt { return WithCodec(MustZstdCodec(nil, nil)) },
+		func() WriterOpt {
+			return WithCodec(MustZstdCodec(
+				[]zstd.EOption{zstd.WithWindowSize(zstd.MinWindowSize), zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithLowerEncoderMem(true)},
+				[]zstd.DOption{zstd.WithDecoderLowmem(true)},
+			))
+		},
 	}
 
 	f.Add(uint8(0), uint8(0), uint16(0))
