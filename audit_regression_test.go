@@ -2091,3 +2091,72 @@ func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
 		}
 	})
 }
+
+// Schema parse must stay bounded in time regardless of how deeply an attacker
+// nests a schema. aschema.UnmarshalJSON's object case scans each node's full
+// JSON subtree to capture extra properties, so a chain of N nested schema
+// nodes costs O(N^2) over the input, and the build-time maxDepth guard only
+// fires AFTER that quadratic unmarshal runs — so a ~250 KB deeply-nested
+// schema took ~22s to parse-then-reject (and a ~1 MB one, minutes). A linear
+// pre-scan (checkSchemaNestingDepth) now rejects input nested past
+// maxSchemaJSONDepth before the unmarshal, making parse cost independent of
+// nesting depth. The limit (4*maxDepth brackets) clears the provable ceiling
+// of a build-acceptable schema (<= 3 brackets per schema level => <= 3*maxDepth
+// for <= maxDepth levels) by a full maxDepth, so a genuinely valid deep schema
+// is never falsely rejected. The timing assertion runs only without -race
+// (instrumentation makes a wall-clock budget non-deterministic); the
+// reject-fast and no-false-rejection invariants are checked in both modes.
+func TestRegression_DeepSchemaNestingRejectedInBoundedTime(t *testing.T) {
+	arrayNest := func(d int) string {
+		return strings.Repeat(`{"type":"array","items":`, d) + `"int"` + strings.Repeat(`}`, d)
+	}
+
+	// A schema nested far past the limit must be REJECTED, and (without -race)
+	// quickly — pre-fix this 1.25 MB input ran the O(n^2) unmarshal for many
+	// seconds; the pre-scan rejects it in O(input).
+	huge := arrayNest(50000)
+	start := time.Now()
+	_, err := avro.Parse(huge)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a 50000-deep schema must be rejected, not parsed")
+	}
+	if !strings.Contains(err.Error(), "deep") {
+		t.Errorf("expected a nesting-depth error, got: %v", err)
+	}
+	if !isRaceEnabled() && elapsed > 2*time.Second {
+		t.Errorf("deep-schema reject took %s — exceeds 2s budget (quadratic unmarshal not short-circuited?)", elapsed)
+	}
+
+	// Just past the limit is rejected; comfortably within it still parses.
+	// maxSchemaJSONDepth is 4*maxDepth (4000) brackets.
+	if _, err := avro.Parse(arrayNest(4001)); err == nil {
+		t.Error("schema at 4001 array brackets (past the 4000 limit) must be rejected")
+	}
+	if _, err := avro.Parse(arrayNest(900)); err != nil {
+		// 900 nested arrays = 900 brackets, well under the limit AND under
+		// maxDepth, so it is a valid schema.
+		t.Errorf("a 900-deep array schema is valid and must parse: %v", err)
+	}
+
+	// No FALSE rejection of a build-acceptable schema at its densest: a
+	// maxDepth-1 chain of nested records reaches ~3*(maxDepth-1) brackets
+	// (well under 4*maxDepth), so it must still parse.
+	var b strings.Builder
+	const recDepth = 999 // maxDepth-1: the deepest the builder accepts
+	for i := range recDepth {
+		fmt.Fprintf(&b, `{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i)
+	}
+	b.WriteString(`"int"`)
+	for range recDepth {
+		b.WriteString(`}]}`)
+	}
+	if _, err := avro.Parse(b.String()); err != nil {
+		t.Errorf("a %d-deep record schema is build-acceptable and must not be falsely rejected by the pre-scan: %v", recDepth, err)
+	}
+
+	// Ordinary schemas are unaffected.
+	if _, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":["null","string"]}]}`); err != nil {
+		t.Errorf("ordinary schema regressed: %v", err)
+	}
+}

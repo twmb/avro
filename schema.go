@@ -212,6 +212,17 @@ func applySchemaOpts(b *builder, opts []SchemaOpt) {
 }
 
 func parse(schema string, b *builder) (*Schema, error) {
+	// Bound nesting depth with a single linear scan BEFORE unmarshaling.
+	// aschema.UnmarshalJSON's object case scans each node's full JSON
+	// subtree (to capture extra properties), so a chain of N nested schema
+	// nodes costs O(N^2) over the input — a ~150 KB deeply-nested schema
+	// takes seconds, and the build-time maxDepth guard only fires AFTER that
+	// quadratic unmarshal completes. This pre-scan rejects pathologically
+	// deep input in O(input) time so the quadratic can never run on it,
+	// making parse cost independent of how deeply an attacker nests.
+	if err := checkSchemaNestingDepth(schema); err != nil {
+		return nil, err
+	}
 	var orig aschema
 	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
 		return nil, fmt.Errorf("invalid schema: %w", boundJSONErrorEcho(err))
@@ -236,6 +247,55 @@ func parse(schema string, b *builder) (*Schema, error) {
 	h.Write(s.Canonical())
 	binary.LittleEndian.PutUint64(s.soe[2:], h.Sum64())
 	return s, nil
+}
+
+// maxSchemaJSONDepth bounds the raw JSON bracket nesting of a schema string.
+// It is a coarse DoS backstop, NOT the semantic depth limit: the build's
+// maxDepth caps SCHEMA-node nesting, and one schema level can carry up to
+// three JSON brackets (a record's object + its "fields" array + a field
+// object), so a build-acceptable schema (<= maxDepth nodes) reaches a JSON
+// bracket depth of at most 3*maxDepth. The 4*maxDepth limit clears that
+// provable ceiling by a full maxDepth, so the pre-scan never rejects a schema
+// the builder would accept; it only short-circuits input so deep the builder
+// would reject it anyway, before the O(n^2) unmarshal pays for it. Tight
+// sub-second bounds for legitimately deep schemas need the single-pass
+// O(n) unmarshal rewrite, not this backstop.
+const maxSchemaJSONDepth = maxDepth * 4
+
+// checkSchemaNestingDepth reports an error if schema's JSON nests deeper than
+// maxSchemaJSONDepth. It is a single linear pass that counts '{'/'[' nesting,
+// skipping brackets inside JSON strings (honoring backslash escapes), so it
+// runs in O(len(schema)) and constant space — cheap enough to gate every parse.
+func checkSchemaNestingDepth(schema string) error {
+	depth := 0
+	inStr := false
+	esc := false
+	for i := 0; i < len(schema); i++ {
+		c := schema[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{', '[':
+			depth++
+			if depth > maxSchemaJSONDepth {
+				return fmt.Errorf("avro: schema JSON nests deeper than the supported limit (%d brackets)", maxSchemaJSONDepth)
+			}
+		case '}', ']':
+			depth--
+		}
+	}
+	return nil
 }
 
 // Canonical returns the Parsing Canonical Form of the schema, stripping
@@ -1180,10 +1240,10 @@ func (b *builder) validFullnameErr(s string) error {
 
 func (b *builder) nest() *builder {
 	return &builder{
-		named:       b.named,
-		checkName:   b.checkName,
-		customTypes: b.customTypes,
-		custom:      b.custom,
+		named:           b.named,
+		checkName:       b.checkName,
+		customTypes:     b.customTypes,
+		custom:          b.custom,
 		cachedNames:     b.cachedNames,
 		allowReRegister: b.allowReRegister,
 		depth:           b.depth,
