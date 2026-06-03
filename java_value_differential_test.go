@@ -213,7 +213,13 @@ func TestDifferentialJavaValueMatrix(t *testing.T) {
 		{"long-min", `"long"`, int64(math.MinInt64), cmpBytes, false},
 		{"string-empty", `"string"`, "", cmpBytes, false},
 		{"string-ascii", `"string"`, "hello", cmpBytes, false},
-		{"string-unicode", `"string"`, "héllo 世界 🦆", cmpBytes, false},
+		// BMP multi-byte is byte-exact: Jackson, like Go, writes BMP
+		// non-ASCII as raw UTF-8.
+		{"string-unicode-bmp", `"string"`, "héllo 世界", cmpBytes, false},
+		// Supplementary-plane (astral) characters: Jackson escapes them as a
+		// UTF-16 surrogate pair (U+1F986 -> 🦆); twmb writes raw
+		// UTF-8 (f0 9f a6 86). Same string value, both valid JSON texts.
+		{"string-unicode-astral", `"string"`, "héllo 世界 🦆", cmpValue, false},
 		{"bytes-empty", `"bytes"`, []byte{}, cmpBytes, false},
 		{"bytes-ascii", `"bytes"`, []byte("hi"), cmpBytes, false},
 
