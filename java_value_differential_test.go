@@ -20,24 +20,25 @@ import (
 	"github.com/twmb/avro"
 )
 
-// TestDifferentialJavaInvalidUTF8 answers, against the Apache Avro Java
-// reference, the open design question behind the JSON encode of invalid-UTF-8
-// string content (audit U2): twmb writes such bytes VERBATIM on the binary wire
-// but coerces each invalid byte to U+FFFD on the JSON wire (appendJSONString,
-// json_codec.go). A raw 0xff cannot appear in an RFC 8259 JSON string, so JSON
-// cannot be byte-faithful; the question is whether twmb's lossy-on-JSON /
-// verbatim-on-binary split MATCHES Java (which would justify documenting it
-// rather than changing behavior).
+// TestDifferentialJavaInvalidUTF8 cross-checks, against the Apache Avro Java
+// reference, the JSON encode of invalid-UTF-8 string content: twmb writes such
+// bytes VERBATIM on the binary wire but coerces each invalid byte to U+FFFD on
+// the JSON wire (appendJSONString, json_codec.go). A raw 0xff cannot appear in
+// an RFC 8259 JSON string, so JSON cannot be byte-faithful; this split is
+// DOCUMENTED POLICY (Schema.EncodeJSON doc; BUG_AUDIT.md §Known intentional
+// divergences; pinned locally by
+// TestRegression_InvalidUTF8StringBinaryVerbatimJSONCoercion) precisely
+// BECAUSE it matches Java byte-for-byte — verified live by this test.
 //
 // Method: twmb binary-encodes the value (verbatim), hands the bytes to Java via
 // the SchemaOracle "RT" command — Java binary-decodes to a datum, then
 // re-encodes to BOTH JSON (JsonEncoder) and binary (BinaryEncoder). We then
 // compare Java's JSON to twmb's EncodeJSON, and Java's binary re-encode to
-// twmb's binary, surfacing exactly what Java does on each wire.
+// twmb's binary.
 //
-// Outcomes are LOGGED for maintainer triage (this is a "what does Java do"
-// probe, not a fixed contract); the only hard assertion is that Java accepts
-// the round-trip at all (a harness failure, not a behavior finding).
+// The per-case parity is ASSERTED: if a future avro-tools upgrade changes
+// Java's behavior, or a twmb encode change breaks the match, CI fails loudly
+// and the documented rationale must be revisited rather than silently rotting.
 func TestDifferentialJavaInvalidUTF8(t *testing.T) {
 	jar := os.Getenv("AVRO_TOOLS_JAR")
 	if jar == "" {
@@ -147,6 +148,16 @@ func TestDifferentialJavaInvalidUTF8(t *testing.T) {
 
 			// A concise verdict line per case for the CI log scanner.
 			t.Logf("VERDICT[%s]: jsonMatchesJava=%v javaBinaryVerbatim=%v", c.name, jsonMatch, binMatch)
+
+			// Asserted, not just logged: the documented U+FFFD-on-JSON /
+			// verbatim-on-binary policy rests on matching Java, so drift on
+			// either wire must fail CI.
+			if !jsonMatch {
+				t.Errorf("twmb JSON diverged from Java: twmb=%q java=%q", twJSON, javaJSON)
+			}
+			if !binMatch {
+				t.Errorf("Java binary re-encode not verbatim vs twmb: twmb=% x java=% x", twBin, javaBin)
+			}
 		})
 	}
 }
