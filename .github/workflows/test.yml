@@ -91,10 +91,12 @@ jobs:
         env:
           AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
         run: go test -tags=cisuite -count=1 -run TestDifferentialJavaFingerprint -v .
-      # Value-level differential: reports what Java does with invalid-UTF-8
-      # string content on the binary vs JSON wire (audit U2). Logs verdict
-      # lines (jsonMatchesJava / javaBinaryVerbatim) for maintainer triage.
-      - name: Java value differential (invalid-UTF-8 binary vs JSON)
+      # Value-level differentials against live Java via SchemaOracle's RT
+      # round-trip: the matrix sweeps (schema × value) across primitives,
+      # logicals, containers, records, and unions, asserting both wires;
+      # the invalid-UTF-8 test asserts the documented U+FFFD-on-JSON /
+      # verbatim-on-binary policy stays Java-identical.
+      - name: Java value differentials (matrix + invalid-UTF-8)
         env:
           AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
-        run: go test -tags=cisuite -count=1 -run TestDifferentialJavaInvalidUTF8 -v .
+        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaValueMatrix|TestDifferentialJavaInvalidUTF8' -v .
