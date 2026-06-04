@@ -41,17 +41,31 @@ jobs:
       # at the -fuzztime boundary the coordinator process can be starved long
       # enough to miss its worker-shutdown RPC deadline and fail the step with
       # "context deadline exceeded" — intermittently, with a healthy exec rate
-      # and no crasher input (reproduction: none locally even at 3x the
-      # fuzztime under GOMAXPROCS=2; the signature is runner contention at
-      # shutdown, not a slow input). One worker leaves a core for the
-      # coordinator so shutdown is reliable; 10s × one worker is still ample
-      # for these regression-smoke fuzzers.
+      # and no crasher input. One worker leaves a core for the coordinator, but
+      # under heavy first-run discovery (an empty corpus on a fresh runner) the
+      # coordinator's minimization/bookkeeping can still race the boundary.
+      #
+      # PRINCIPLED single retry: a fuzzer that finds a real crasher writes the
+      # input to testdata/fuzz/<Fuzz>/ AND fails; the retry replays that seed
+      # first and fails AGAIN — deterministically. The shutdown-race flake
+      # leaves no crasher, so the retry passes. The retry therefore separates
+      # an infra flake (passes on retry) from a real finding (reproduces),
+      # rather than masking one. It was verified infra-only: three different
+      # fuzzers hit "context deadline exceeded" on CI while each passed every
+      # local CI-exact run (no crasher, healthy rate). A persistent failure
+      # across BOTH attempts is real and must be investigated, never retried
+      # further.
       - name: Fuzz
         run: |
+          run_fuzz() {
+            go test -run='^$' -fuzz="^$2\$" -fuzztime=10s -timeout=90s -parallel=1 "$1" && return 0
+            echo "::warning::fuzz $1 $2 failed once; retrying (Go-fuzzing shutdown race is intermittent on constrained runners — a real crasher reproduces on the retry's seed replay)"
+            go test -run='^$' -fuzz="^$2\$" -fuzztime=10s -timeout=90s -parallel=1 "$1"
+          }
           for pkg in . ./ocf; do
             for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep '^Fuzz'); do
               echo "::group::fuzz $pkg $fn"
-              go test -run='^$' -fuzz="^${fn}$" -fuzztime=10s -timeout=90s -parallel=1 "$pkg"
+              run_fuzz "$pkg" "$fn"
               echo "::endgroup::"
             done
           done
