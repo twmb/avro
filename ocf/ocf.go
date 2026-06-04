@@ -927,21 +927,31 @@ const maxOCFZeroByteSlack = 4 << 10
 
 // Memory bounds (security note).
 //
-// WithMaxBlockBytes bounds the *compressed* block size we read off
-// the wire. It does NOT bound the *decompressed* size. Each built-in
-// codec's Decompress allocates based on a length declared inside the
-// compressed payload, before the payload is fully validated:
+// Two independent limits guard a block: WithMaxBlockBytes bounds the
+// *compressed* size read off the wire (default 64 MiB), and
+// WithMaxDecompressedBlockBytes bounds the *decompressed* size (default
+// 64 MiB). The decompressed limit is the one that stops amplification:
+// each built-in codec's Decompress would otherwise
+// allocate a size declared inside the compressed payload, before the
+// payload is validated —
 //
 //   - snappy: snappy.Decode pre-allocates from a varint header that
-//     can declare up to ~4 GiB inside a 5-byte frame.
-//   - deflate: flate.NewReader streams without a header bound;
-//     io.ReadAll grows until the stream ends.
-//   - zstd: the zstd decoder enforces its own internal cap, but the
-//     library default permits multi-GiB outputs.
+//     can declare up to ~4 GiB inside a 5-byte frame; bounded here by a
+//     snappy.DecodedLen pre-check before Decode allocates.
+//   - deflate: flate.NewReader streams without a header bound (io.ReadAll
+//     would grow until the stream ends); bounded here by an
+//     io.LimitReader(maxOut+1).
+//   - zstd: the library default permits multi-GiB output; bounded here by
+//     zstd.WithDecoderMaxMemory on the reader's decoder.
 //
-// Java's SnappyCodec (ByteBuffer.allocate(Snappy.uncompressedLength
-// (...))) and fastavro's python-snappy decompress share the same
-// shape.
+// readBlock also re-checks len(decompressed) against the limit as a
+// backstop for custom codecs (whose Decompress the reader can't bound
+// internally), and that bound transitively caps the per-block decode loop
+// since a block's record count cannot exceed its decompressed length plus
+// the zero-byte slack. Java's SnappyCodec (ByteBuffer.allocate(Snappy.
+// uncompressedLength(...))) and fastavro's python-snappy decompress leave
+// the decompressed side unbounded — the cap is twmb defense-in-depth, in
+// the same family as WithMaxBlockBytes and maxZeroByteItems.
 
 type nullCodec struct{}
 
