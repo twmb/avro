@@ -2590,7 +2590,7 @@ func TestWithSchema(t *testing.T) {
 func TestResolveCodecCustomOverridesBuiltin(t *testing.T) {
 	// A custom codec with a built-in name should override the built-in.
 	custom := &testCodec{name: "zstandard"}
-	codec, err := resolveCodec("zstandard", []Codec{custom})
+	codec, err := resolveCodec("zstandard", []Codec{custom}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3930,10 +3930,12 @@ func TestRegression_OCFUnknownCodecErrorBounded(t *testing.T) {
 // repeatedly.
 type closeCountCodec struct{ closes *int }
 
-func (closeCountCodec) Name() string                          { return "null" }
-func (closeCountCodec) Compress(src []byte) ([]byte, error)   { return append([]byte(nil), src...), nil }
-func (closeCountCodec) Decompress(src []byte) ([]byte, error) { return append([]byte(nil), src...), nil }
-func (c closeCountCodec) Close() error                        { *c.closes++; return nil }
+func (closeCountCodec) Name() string                        { return "null" }
+func (closeCountCodec) Compress(src []byte) ([]byte, error) { return append([]byte(nil), src...), nil }
+func (closeCountCodec) Decompress(src []byte) ([]byte, error) {
+	return append([]byte(nil), src...), nil
+}
+func (c closeCountCodec) Close() error { *c.closes++; return nil }
 
 // assertOneInt reads buf as an OCF and asserts it contains exactly one int
 // datum equal to want — the second Decode must be a clean io.EOF. This catches

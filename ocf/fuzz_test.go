@@ -59,7 +59,23 @@ func FuzzOCFReader(f *testing.F) {
 	f.Add([]byte{'O', 'b', 'j', 1})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		r, err := NewReader(bytes.NewReader(data))
+		// Keep each execution fast and bounded so the reader LOGIC (header,
+		// block envelope, codec, count handling) is what gets explored — not
+		// throughput on a large input. Two bounds, both about fuzzer hygiene,
+		// not the reader's contract:
+		//   - cap the input size: a multi-MB OCF decodes proportionally many
+		//     records (correct, not a bug), but the coordinator's minimization
+		//     of such an interesting input re-runs it dozens of times, freezing
+		//     the fuzzer for tens of seconds and tripping the -fuzztime
+		//     shutdown deadline (the large-input-minimization class).
+		//   - a tight WithMaxDecompressedBlockBytes: bounds per-exec decode
+		//     work AND exercises the decompression-amplification rejection
+		//     (an inflate past this cap is rejected; pinned at the API level
+		//     by TestRegression_OCFDecompressionAmplificationBounded).
+		if len(data) > 256<<10 {
+			return
+		}
+		r, err := NewReader(bytes.NewReader(data), WithMaxDecompressedBlockBytes(1<<20))
 		if err != nil {
 			return
 		}
