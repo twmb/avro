@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"os/exec"
 	"strconv"
@@ -27,7 +28,7 @@ import (
 // re-encodes them) and fpCanon (the bare-schema command — Java's
 // parsingFingerprint64 + Parsing Canonical Form).
 func startMatrixJavaOracle(t *testing.T) (
-	rt func(t *testing.T, schema string, binary []byte) (ok bool, binOut []byte, errMsg string),
+	rt func(t *testing.T, schema string, binary []byte) (ok bool, jsonOut, binOut []byte, errMsg string),
 	fpCanon func(t *testing.T, schema string) (ok bool, fp int64, canon, errMsg string),
 ) {
 	t.Helper()
@@ -74,7 +75,7 @@ func startMatrixJavaOracle(t *testing.T) (
 		return buf.String()
 	}
 
-	rt = func(t *testing.T, schema string, binary []byte) (bool, []byte, string) {
+	rt = func(t *testing.T, schema string, binary []byte) (bool, []byte, []byte, string) {
 		t.Helper()
 		req := "RT\t" + compact(t, schema) + "\t" + base64.StdEncoding.EncodeToString(binary) + "\n"
 		if _, err := io.WriteString(in, req); err != nil {
@@ -90,16 +91,20 @@ func startMatrixJavaOracle(t *testing.T) (
 			if len(parts) > 1 {
 				msg = parts[1]
 			}
-			return false, nil, msg
+			return false, nil, nil, msg
 		}
 		if len(parts) != 3 {
 			t.Fatalf("malformed RT response: %q", line)
+		}
+		jsonOut, err := base64.StdEncoding.DecodeString(parts[1])
+		if err != nil {
+			t.Fatalf("decode RT json: %v", err)
 		}
 		binOut, err := base64.StdEncoding.DecodeString(parts[2])
 		if err != nil {
 			t.Fatalf("decode RT binary: %v", err)
 		}
-		return true, binOut, ""
+		return true, jsonOut, binOut, ""
 	}
 
 	fpCanon = func(t *testing.T, schema string) (bool, int64, string, string) {
@@ -138,7 +143,7 @@ func startMatrixJavaOracle(t *testing.T) (
 // javaMatrixCheck runs the two Java-oracle checks for one composed cell:
 // Java's binary re-encode of twmb's wire must be byte-identical, and Java's
 // canonical form + Rabin fingerprint must match twmb's.
-func javaMatrixCheck(t *testing.T, rt func(*testing.T, string, []byte) (bool, []byte, string),
+func javaMatrixCheck(t *testing.T, rt func(*testing.T, string, []byte) (bool, []byte, []byte, string),
 	fpCanon func(*testing.T, string) (bool, int64, string, string),
 	schemaJSON string, vin any,
 ) {
@@ -151,7 +156,7 @@ func javaMatrixCheck(t *testing.T, rt func(*testing.T, string, []byte) (bool, []
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	ok, binOut, errMsg := rt(t, schemaJSON, w1)
+	ok, _, binOut, errMsg := rt(t, schemaJSON, w1)
 	if !ok {
 		t.Fatalf("Java could not round-trip twmb's bytes: %s\nschema: %s\nwire: %x", errMsg, schemaJSON, w1)
 	}
@@ -224,6 +229,116 @@ func TestDifferentialJavaAcceptance(t *testing.T) {
 			if ok {
 				t.Errorf("Java accepted mutant %s that twmb rejects:\n%s", m.label, m.schema)
 			}
+		}
+	}
+}
+
+// jsonSemanticEqual compares two JSON documents by VALUE: objects by key,
+// arrays by index, numbers by exact rational value (Jackson spells float
+// zero "0.0" where twmb writes "0"; both are the same number), strings by
+// codepoints (Jackson writes high bytes raw, twmb escapes \u00XX; both
+// decode identically).
+func jsonSemanticEqual(a, b []byte) bool {
+	var av, bv any
+	da := json.NewDecoder(bytes.NewReader(a))
+	da.UseNumber()
+	db := json.NewDecoder(bytes.NewReader(b))
+	db.UseNumber()
+	if da.Decode(&av) != nil || db.Decode(&bv) != nil {
+		return false
+	}
+	var eq func(x, y any) bool
+	eq = func(x, y any) bool {
+		switch xv := x.(type) {
+		case json.Number:
+			yv, ok := y.(json.Number)
+			if !ok {
+				return false
+			}
+			xr, ok1 := new(big.Rat).SetString(xv.String())
+			yr, ok2 := new(big.Rat).SetString(yv.String())
+			return ok1 && ok2 && xr.Cmp(yr) == 0
+		case map[string]any:
+			yv, ok := y.(map[string]any)
+			if !ok || len(xv) != len(yv) {
+				return false
+			}
+			for k, v := range xv {
+				if !eq(v, yv[k]) {
+					return false
+				}
+			}
+			return true
+		case []any:
+			yv, ok := y.([]any)
+			if !ok || len(xv) != len(yv) {
+				return false
+			}
+			for i := range xv {
+				if !eq(xv[i], yv[i]) {
+					return false
+				}
+			}
+			return true
+		default:
+			return x == y
+		}
+	}
+	return eq(av, bv)
+}
+
+// TestDifferentialJavaJSONForm compares twmb's Avro-JSON encoding against
+// Java's JsonEncoder per cell, semantically. Scoped to non-logical
+// fragments: Java's GENERIC datum path writes logical types in underlying
+// form (raw longs) while twmb writes the enriched form (RFC 3339 strings) —
+// a documented representation difference, not a parity target. twmb runs
+// with TaggedUnions because Java's JsonEncoder always writes the
+// {branch: value} union envelope.
+func TestDifferentialJavaJSONForm(t *testing.T) {
+	rt, _ := startMatrixJavaOracle(t)
+	eligible := map[string]bool{
+		"null": true, "boolean": true, "int": true, "long": true,
+		"float": true, "double": true, "string": true, "bytes": true,
+		"enum3": true, "enum1": true, "fixed0": true, "fixed1": true,
+		"fixed16": true, "rec2": true, "rec0": true, "arr-int": true,
+		"map-str": true,
+	}
+	for _, fr := range matFrags() {
+		if !eligible[fr.label] {
+			continue
+		}
+		for _, cx := range matCtxs() {
+			if cx.skip != nil && cx.skip(fr.kind) {
+				continue
+			}
+			t.Run(fr.label+"/"+cx.label, func(t *testing.T) {
+				u := &uniq{}
+				schemaJSON := cx.schema(fr.schema(u), fr.kind, u)
+				s, err := avro.Parse(schemaJSON)
+				if err != nil {
+					t.Fatalf("Parse: %v", err)
+				}
+				vin := cx.wrap(fr.values[0])
+				w1, err := s.AppendEncode(nil, vin, avro.TaggedUnions())
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				var a1 any
+				if _, err := s.Decode(w1, &a1, avro.TaggedUnions()); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				j1, err := s.AppendEncodeJSON(nil, a1, avro.TaggedUnions())
+				if err != nil {
+					t.Fatalf("encodeJSON: %v", err)
+				}
+				ok, javaJSON, _, errMsg := rt(t, schemaJSON, w1)
+				if !ok {
+					t.Fatalf("Java rt: %s", errMsg)
+				}
+				if !jsonSemanticEqual(j1, javaJSON) {
+					t.Fatalf("JSON form diverges from Java:\n twmb=%s\n java=%s\nschema: %s", j1, javaJSON, schemaJSON)
+				}
+			})
 		}
 	}
 }

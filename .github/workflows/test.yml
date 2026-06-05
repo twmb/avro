@@ -135,4 +135,4 @@ jobs:
       - name: Java matrix differential
         env:
           AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
-        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaMatrix|TestDifferentialJavaAcceptance' .
+        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaMatrix|TestDifferentialJavaAcceptance|TestDifferentialJavaJSONForm' .
