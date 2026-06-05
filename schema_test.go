@@ -233,35 +233,30 @@ func TestRabinReset(t *testing.T) {
 	}
 }
 
+// canonicalBytes (schema_canonical.go) is the single-pass writer of the
+// PCF form; these cases pin its key order and required-empty-array rules
+// for the aschema/aobject shapes (the former aschema/aobject MarshalJSON
+// methods it replaced).
 func TestMarshalJSON(t *testing.T) {
 	t.Run("primitive", func(t *testing.T) {
-		s := aschema{primitive: "int"}
-		b, err := json.Marshal(s)
-		if err != nil {
-			t.Fatal(err)
-		}
+		b := appendCanonSchema(nil, &aschema{primitive: "int"})
 		if string(b) != `"int"` {
 			t.Errorf("got %s, want \"int\"", b)
 		}
 	})
 
 	t.Run("object", func(t *testing.T) {
-		s := aschema{object: &aobject{Name: "r", Type: "record"}}
-		b, err := json.Marshal(s)
-		if err != nil {
-			t.Fatal(err)
-		}
+		b := appendCanonSchema(nil, &aschema{object: &aobject{Name: "r", Type: "record"}})
 		if !strings.Contains(string(b), `"name":"r"`) {
 			t.Errorf("got %s, want object with name r", b)
 		}
 	})
 
-	// Exercise aobject.MarshalJSON's non-PCF attribute branches. These
-	// paths are stripped from canonical form (Canonical() zeroes
-	// namespace, aliases, default, logicalType, precision, scale before
-	// calling MarshalJSON), so they only run when aobject is serialized
-	// directly. We keep them so the MarshalJSON is a proper full-schema
-	// marshal rather than a canonical-only marshal, and cover them here.
+	// Non-PCF attribute branches: stripped from canonical form (the canon
+	// tree zeroes namespace, aliases, default, logicalType, precision,
+	// scale), so they only run when an unstripped aobject is written; the
+	// writer emits them faithfully and in declaration order after the PCF
+	// keys.
 	t.Run("object full attrs", func(t *testing.T) {
 		ns := "com.example"
 		prec := 9
@@ -276,96 +271,51 @@ func TestMarshalJSON(t *testing.T) {
 			Precision: &prec,
 			Scale:     &scale,
 		}
-		b, err := json.Marshal(o)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got := string(b)
-		// PCF-ordered keys first (name, type, fields), then non-PCF
-		// attributes in declaration order.
+		got := string(appendCanonObject(nil, &o))
 		want := `{"name":"r","type":"record","fields":[],"namespace":"com.example","aliases":["old"],"default":null,"logicalType":"decimal","precision":9,"scale":2}`
 		if got != want {
 			t.Errorf("\n got %s\nwant %s", got, want)
 		}
 	})
 
-	// Defensive branches: a non-record type with populated Fields, or a
-	// non-enum type with populated Symbols, is nonsense per the Avro
-	// spec, but MarshalJSON still emits them for debuggability.
+	// Defensive: a non-record type with Fields, or a non-enum type with
+	// Symbols, is nonsense per the spec but is still emitted.
 	t.Run("object defensive fields on non-record", func(t *testing.T) {
-		o := aobject{
-			Type:   "int",
-			Fields: []afield{{Name: "x", Type: &aschema{primitive: "int"}}},
-		}
-		b, err := json.Marshal(o)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(string(b), `"fields":[`) {
+		o := aobject{Type: "int", Fields: []afield{{Name: "x", Type: &aschema{primitive: "int"}}}}
+		if b := appendCanonObject(nil, &o); !strings.Contains(string(b), `"fields":[`) {
 			t.Errorf("got %s, want fields to be emitted", b)
 		}
 	})
 	t.Run("object defensive symbols on non-enum", func(t *testing.T) {
-		o := aobject{
-			Type:    "int",
-			Symbols: []string{"A", "B"},
-		}
-		b, err := json.Marshal(o)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(string(b), `"symbols":["A","B"]`) {
+		o := aobject{Type: "int", Symbols: []string{"A", "B"}}
+		if b := appendCanonObject(nil, &o); !strings.Contains(string(b), `"symbols":["A","B"]`) {
 			t.Errorf("got %s, want symbols to be emitted", b)
 		}
 	})
 
-	// Enum with nil Symbols slice: MarshalJSON emits "symbols":[] to
-	// satisfy the spec's required attribute.
+	// Enum with nil Symbols slice still emits "symbols":[] (required).
 	t.Run("object nil enum symbols", func(t *testing.T) {
-		o := aobject{
-			Name: "E",
-			Type: "enum",
-		}
-		b, err := json.Marshal(o)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(b) != `{"name":"E","type":"enum","symbols":[]}` {
+		o := aobject{Name: "E", Type: "enum"}
+		if b := appendCanonObject(nil, &o); string(b) != `{"name":"E","type":"enum","symbols":[]}` {
 			t.Errorf("got %s", b)
 		}
 	})
 
 	t.Run("union", func(t *testing.T) {
 		s := aschema{union: []aschema{{primitive: "null"}, {primitive: "int"}}}
-		b, err := json.Marshal(s)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(b) != `["null","int"]` {
+		if b := appendCanonSchema(nil, &s); string(b) != `["null","int"]` {
 			t.Errorf("got %s", b)
-		}
-	})
-
-	t.Run("empty", func(t *testing.T) {
-		s := aschema{}
-		_, err := json.Marshal(s)
-		if err == nil {
-			t.Fatal("expected error for empty schema")
 		}
 	})
 }
 
 func TestUnmarshalJSONInvalid(t *testing.T) {
-	var s aschema
 	// Invalid first byte (number).
-	err := s.UnmarshalJSON([]byte(`123`))
-	if err == nil {
+	if _, err := parseSchemaTree(`123`); err == nil {
 		t.Fatal("expected error")
 	}
-
 	// Empty data.
-	err = s.UnmarshalJSON([]byte(``))
-	if err == nil {
+	if _, err := parseSchemaTree(``); err == nil {
 		t.Fatal("expected error for empty data")
 	}
 }
@@ -1541,10 +1491,11 @@ func TestSchemaValidationErrors(t *testing.T) {
 		name   string
 		schema string
 	}{
-		{"invalid type alias", `{"type":"record","name":"R","aliases":["bad-alias"],"fields":[{"name":"x","type":"int"}]}`},
+		// (type/field aliases accept any string per Avro §Aliases — see
+		// TestRegression_AliasAcceptsAnyString — so they are NOT in this
+		// expected-error table; names and symbols stay strictly validated.)
 		{"empty field name", `{"type":"record","name":"R","fields":[{"name":"","type":"int"}]}`},
 		{"invalid field name", `{"type":"record","name":"R","fields":[{"name":"bad-field!","type":"int"}]}`},
-		{"invalid field alias", `{"type":"record","name":"R","fields":[{"name":"x","type":"int","aliases":["bad-alias!"]}]}`},
 		{"empty enum symbols", `{"type":"enum","name":"E","symbols":[]}`},
 		{"invalid enum symbol", `{"type":"enum","name":"E","symbols":["bad-sym!"]}`},
 		{"enum default not in symbols", `{"type":"enum","name":"E","symbols":["A","B"],"default":"C"}`},
@@ -2567,4 +2518,283 @@ func TestFieldLevelLogicalType_CustomTypeFiresOnLiftedLogical(t *testing.T) {
 	if got.Price.Currency != "USD" {
 		t.Fatalf("price.Currency: CustomType decoder did not fire; got %q want USD", got.Price.Currency)
 	}
+}
+
+// A leading-dot type alias (".OldName") is Java's explicit null-namespace
+// form: Schema.java's Name(".OldName", null) splits at the last dot into
+// the empty (null) space and the name "OldName", so the alias matches a
+// writer type whose fullname is the bare "OldName" — NOT one qualified
+// into the reader's namespace. The spec's Aliases section accepts any
+// string as an alias; the dotted-empty-space form is the only way to
+// alias a null-namespace name from inside a namespaced type.
+func TestRegression_LeadingDotAliasNullNamespace(t *testing.T) {
+	reader, err := Parse(`{"type":"record","name":"R","namespace":"new","aliases":[".OldR"],"fields":[
+		{"name":"v","type":"int"}]}`)
+	if err != nil {
+		t.Fatalf("Parse reader with leading-dot alias: %v", err)
+	}
+	writer := MustParse(`{"type":"record","name":"OldR","fields":[{"name":"v","type":"int"}]}`)
+
+	if err := CheckCompatibility(writer, reader); err != nil {
+		t.Fatalf("CheckCompatibility via .OldR alias: %v", err)
+	}
+	res, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("Resolve via .OldR alias: %v", err)
+	}
+	type rec struct {
+		V int32 `avro:"v"`
+	}
+	wire, err := writer.AppendEncode(nil, rec{V: 7})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got rec
+	if _, err := res.Decode(wire, &got); err != nil {
+		t.Fatalf("resolved decode: %v", err)
+	}
+	if got.V != 7 {
+		t.Fatalf("v: got %d", got.V)
+	}
+
+	// Metadata axis: the alias survives Root() as-written and the
+	// re-emitted schema re-parses (the leading-dot form is valid input).
+	node := reader.Root()
+	if len(node.Aliases) != 1 || node.Aliases[0] != ".OldR" {
+		t.Fatalf("Root aliases: %v", node.Aliases)
+	}
+	if _, err := node.Schema(); err != nil {
+		t.Fatalf("Root().Schema() with leading-dot alias: %v", err)
+	}
+
+	// Aliases now accept any string (Avro §Aliases; see
+	// TestRegression_AliasAcceptsAnyString). The leading-dot null-namespace
+	// escape still strips exactly one leading dot via qualifyAliases, so
+	// these dotted forms parse (previously they were name-validated and
+	// rejected) — the escape is a qualification rule, not a grammar gate.
+	for _, a := range []string{".a.b", ".a..b", "."} {
+		if _, err := Parse(`{"type":"record","name":"R","aliases":["` + a + `"],"fields":[{"name":"v","type":"int"}]}`); err != nil {
+			t.Errorf("alias %q rejected; any string is a valid alias: %v", a, err)
+		}
+	}
+}
+
+// A bare (dot-free) name reference inside a namespaced scope binds to the
+// enclosing-namespace type FIRST, falling back to the null-namespace type
+// only when no in-scope type exists. Java's Names.get constructs
+// Name(ref, enclosingSpace) and looks that up before the null-space
+// fallback (Schema.java); fastavro qualifies a bare ref to the enclosing
+// namespace unconditionally (_schema_py.py schema_name). Binding the
+// null-namespace type first silently changes the wire contract of every
+// field using the reference.
+func TestRegression_BareNameRefBindsInScopeBeforeNullNamespace(t *testing.T) {
+	type inScope struct {
+		Only int32 `avro:"only"`
+	}
+	type nullNS struct {
+		Na int32  `avro:"na"`
+		Nb string `avro:"nb"`
+	}
+	type outer struct {
+		A inScope `avro:"a"`
+		B nullNS  `avro:"b"`
+		R inScope `avro:"r"`
+	}
+	cases := []struct{ name, schema string }{
+		{"backward ref", `{"type":"record","name":"Outer","namespace":"com.x","fields":[
+			{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"only","type":"int"}]}},
+			{"name":"b","type":{"type":"record","name":"Inner","namespace":"","fields":[{"name":"na","type":"int"},{"name":"nb","type":"string"}]}},
+			{"name":"r","type":"Inner"}]}`},
+		{"forward ref", `{"type":"record","name":"Outer","namespace":"com.x","fields":[
+			{"name":"r","type":"Inner"},
+			{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"only","type":"int"}]}},
+			{"name":"b","type":{"type":"record","name":"Inner","namespace":"","fields":[{"name":"na","type":"int"},{"name":"nb","type":"string"}]}}]}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := Parse(c.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			in := outer{A: inScope{1}, B: nullNS{2, "x"}, R: inScope{3}}
+			wire, err := s.AppendEncode(nil, in)
+			if err != nil {
+				t.Fatalf("encode with in-scope shape for r: %v", err)
+			}
+			var got outer
+			if _, err := s.Decode(wire, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got != in {
+				t.Fatalf("round-trip: got %+v want %+v", got, in)
+			}
+			// Canonical resolves the bare ref to the in-scope fullname:
+			// field r binds com.x.Inner, as a fullname reference or as the
+			// first-occurrence full body. (This canonical does NOT re-parse —
+			// the PCF [FULLNAMES] transform writes the null-namespace type's
+			// fullname as bare "Inner", which inside the com.x scope re-reads
+			// as inheriting; Java's SchemaNormalization emits the identical
+			// ambiguity. PCF is a fingerprint surface, not a round-trip
+			// surface.)
+			canon := string(s.Canonical())
+			if !strings.Contains(canon, `"name":"r","type":"com.x.Inner"`) &&
+				!strings.Contains(canon, `"name":"r","type":{"name":"com.x.Inner"`) {
+				t.Errorf("canonical r field not bound to com.x.Inner:\n%s", canon)
+			}
+		})
+	}
+}
+
+// The metadata API binds bare name-references with the same in-scope-first
+// precedence as the wire builder: when an in-scope type and a null-namespace
+// type share a short name, a field whose type is the bare reference must
+// materialize its Default against the type the WIRE bound — otherwise
+// SchemaField.Default's Go type contradicts the wire contract (string enum
+// symbol vs codepoint-decoded []byte here).
+func TestRegression_MetadataDefaultBindsInScopeNameRef(t *testing.T) {
+	const schema = `{"type":"record","name":"Outer","namespace":"com.x","fields":[
+		{"name":"a","type":{"type":"enum","name":"Inner","symbols":["A","B"]}},
+		{"name":"b","type":{"type":"fixed","name":"Inner","namespace":"","size":1}},
+		{"name":"r","type":"Inner","default":"A"}]}`
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	d := s.Root().Fields[2].Default
+	// In-scope binding resolves r to the enum com.x.Inner: the default is
+	// the symbol string "A", not the fixed branch's 1-codepoint []byte.
+	got, ok := d.(string)
+	if !ok || got != "A" {
+		t.Fatalf("metadata Default bound to the wrong type: got %T(%v), want string A", d, d)
+	}
+}
+
+// The metadata name-table must register exactly what the wire builder
+// registers: namespaced types under their fullname only, null-namespace
+// types under their bare name. Registering every type under its short
+// name makes the bare-key binding last-walked-wins — a bare ref at
+// null-namespace scope would then materialize its Default against
+// whichever colliding type the tree walk saw last, contradicting the
+// wire (which deterministically binds the null-namespace type) and
+// making the metadata surface reference-order-dependent.
+func TestRegression_MetadataDefaultShortNameCollisionWalkOrder(t *testing.T) {
+	cases := []struct{ name, schema string }{
+		{"namespaced walked last", `{"type":"record","name":"Top","fields":[
+			{"name":"a","type":{"type":"enum","name":"Inner","symbols":["A","B"]}},
+			{"name":"n","type":{"type":"fixed","name":"Inner","namespace":"ns","size":1}},
+			{"name":"r","type":"Inner","default":"A"}]}`},
+		{"namespaced walked first", `{"type":"record","name":"Top","fields":[
+			{"name":"n","type":{"type":"fixed","name":"Inner","namespace":"ns","size":1}},
+			{"name":"a","type":{"type":"enum","name":"Inner","symbols":["A","B"]}},
+			{"name":"r","type":"Inner","default":"A"}]}`},
+		{"union branch ref", `{"type":"record","name":"Top","fields":[
+			{"name":"a","type":{"type":"enum","name":"Inner","symbols":["A","B"]}},
+			{"name":"n","type":{"type":"fixed","name":"Inner","namespace":"ns","size":1}},
+			{"name":"r","type":["Inner","null"],"default":"A"}]}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := Parse(c.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			var d any
+			for _, f := range s.Root().Fields {
+				if f.Name == "r" {
+					d = f.Default
+				}
+			}
+			// The wire binds the bare ref at null-namespace scope to the
+			// null-namespace enum: the default is the symbol string "A".
+			got, ok := d.(string)
+			if !ok || got != "A" {
+				t.Fatalf("metadata Default bound to the wrong type: got %T(%v), want string A", d, d)
+			}
+		})
+	}
+}
+
+// A record/enum/fixed may NOT be named after an Avro primitive in the null
+// namespace (spec §Names: "Primitive type names ... may not be defined in
+// any namespace"); Java rejects it ("Schemas may not be named after
+// primitives"). A NAMESPACED type whose short name equals a primitive
+// (e.g. a.int) is fine — its fullname is not a primitive name.
+func TestRegression_NamedTypeNotPrimitiveName(t *testing.T) {
+	for _, prim := range []string{"int", "long", "string", "bytes", "boolean", "float", "double", "null"} {
+		for _, kind := range []string{"enum", "fixed", "record"} {
+			var schema string
+			switch kind {
+			case "enum":
+				schema = `{"type":"enum","name":"` + prim + `","symbols":["A"]}`
+			case "fixed":
+				schema = `{"type":"fixed","name":"` + prim + `","size":4}`
+			case "record":
+				schema = `{"type":"record","name":"` + prim + `","fields":[]}`
+			}
+			if _, err := Parse(schema); err == nil {
+				t.Errorf("%s named %q (null namespace) accepted; spec/Java reject", kind, prim)
+			}
+		}
+	}
+	// Namespaced same short name is allowed (fullname a.int is not a primitive).
+	if _, err := Parse(`{"type":"enum","name":"int","namespace":"a","symbols":["A"]}`); err != nil {
+		t.Errorf("namespaced a.int enum should be accepted: %v", err)
+	}
+}
+
+// Avro §Aliases: "any string is accepted as an alias" — so a reader can
+// alias its valid name to a writer's illegal/legacy name during evolution.
+// Java and fastavro do no alias-name validation; twmb formerly rejected
+// aliases that weren't valid Avro names, breaking interop with their
+// schemas. Names themselves stay strictly validated; only aliases relax.
+func TestRegression_AliasAcceptsAnyString(t *testing.T) {
+	t.Run("field aliases any string", func(t *testing.T) {
+		for _, alias := range []string{"1stField", "com.example.legacy_x", "weird name!", "has.dots", ""} {
+			schema := `{"type":"record","name":"R","fields":[{"name":"x","type":"long","aliases":["` + alias + `"]}]}`
+			if _, err := Parse(schema); err != nil {
+				t.Errorf("field alias %q rejected: %v", alias, err)
+			}
+		}
+	})
+	t.Run("type aliases any string", func(t *testing.T) {
+		for _, alias := range []string{"1stRecord", "weird!", "a b c"} {
+			schema := `{"type":"record","name":"R","aliases":["` + alias + `"],"fields":[{"name":"x","type":"long"}]}`
+			if _, err := Parse(schema); err != nil {
+				t.Errorf("type alias %q rejected: %v", alias, err)
+			}
+		}
+	})
+	// Type NAMES must still be validated strictly (only aliases relax).
+	if _, err := Parse(`{"type":"record","name":"1stRecord","fields":[]}`); err == nil {
+		t.Error("invalid type NAME should still be rejected")
+	}
+	// Resolution still matches a reader alias to the writer's field name.
+	t.Run("alias resolution still renames", func(t *testing.T) {
+		writer := MustParse(`{"type":"record","name":"R","fields":[{"name":"old","type":"long"}]}`)
+		reader := MustParse(`{"type":"record","name":"R","fields":[{"name":"new","type":"long","aliases":["old"]}]}`)
+		b, err := writer.Encode(map[string]any{"old": int64(7)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := Resolve(writer, reader)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		var got map[string]any
+		if _, err := resolved.Decode(b, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got["new"] != int64(7) {
+			t.Errorf("alias rename failed: got %v", got)
+		}
+	})
+	// Aliases are stripped from the canonical form, so weird ones don't
+	// affect fingerprints.
+	t.Run("canonical strips aliases", func(t *testing.T) {
+		withA := MustParse(`{"type":"record","name":"R","aliases":["1stRecord"],"fields":[{"name":"x","type":"long","aliases":["weird!"]}]}`)
+		without := MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"long"}]}`)
+		if string(withA.Canonical()) != string(without.Canonical()) {
+			t.Errorf("aliases leaked into canonical:\n %s\n %s", withA.Canonical(), without.Canonical())
+		}
+	})
 }

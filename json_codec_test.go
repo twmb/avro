@@ -3,10 +3,12 @@ package avro
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math"
 	"math/big"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -2998,3 +3000,48 @@ func TestRegression_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 	})
 }
 
+
+// The errTooDeep recursion bound must be UNIFORM across binary encode,
+// JSON encode, binary decode, and JSON decode — one increment per schema
+// nesting level. Record/union JSON encode formerly incremented twice per
+// level (a same-level dispatch hop also bumped depth), halving the budget
+// so a value DecodeJSON accepted (and binary Encode accepted) failed
+// EncodeJSON with errTooDeep at half the depth — a round-trip break.
+func TestRegression_JSONEncodeDepthMatchesDecode(t *testing.T) {
+	var b strings.Builder
+	const n = 900 // well under maxDepth (1000), well over the former /2 break
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, `{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i)
+	}
+	b.WriteString(`"int"`)
+	b.WriteString(strings.Repeat(`}]}`, n))
+	s := MustParse(b.String())
+
+	js := []byte(strings.Repeat(`{"f":`, n) + `0` + strings.Repeat(`}`, n))
+	var v any
+	if err := s.DecodeJSON(js, &v); err != nil {
+		t.Fatalf("DecodeJSON at depth %d: %v", n, err)
+	}
+	if _, err := s.Encode(v); err != nil {
+		t.Fatalf("binary Encode at depth %d: %v", n, err)
+	}
+	if _, err := s.EncodeJSON(v); err != nil {
+		t.Fatalf("EncodeJSON at depth %d must match Decode/binary, got: %v", n, err)
+	}
+
+	// The bound still protects against a cyclic Go value (must error, not
+	// loop forever).
+	type Node struct {
+		Next *Node `avro:"next"`
+		V    int32 `avro:"v"`
+	}
+	cyc := MustParse(`{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]},{"name":"v","type":"int"}]}`)
+	n0 := &Node{V: 1}
+	n0.Next = n0 // cycle
+	if _, err := cyc.EncodeJSON(n0); err == nil {
+		t.Error("EncodeJSON of a cyclic value must error (errTooDeep), not loop")
+	}
+	if _, err := cyc.Encode(n0); err == nil {
+		t.Error("binary Encode of a cyclic value must error, not loop")
+	}
+}

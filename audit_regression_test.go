@@ -2160,3 +2160,97 @@ func TestRegression_DeepSchemaNestingRejectedInBoundedTime(t *testing.T) {
 		t.Errorf("ordinary schema regressed: %v", err)
 	}
 }
+
+// A CustomType on a RECURSIVE node must not skew the recursion-depth bound:
+// the custom wrapper annotates an existing schema node, it is not a new
+// nesting level, so it must charge 0 depth — matching the decode wrapper and
+// the JSON path. The binary-encode wrapper formerly re-entered the base
+// serializer at depth+1, charging an extra unit per recursive level, so
+// binary encode tripped errTooDeep ~1.5x shallower than decode/JSON — a
+// value Decode (or any peer producer) could emit that Encode could never
+// reproduce.
+func TestRegression_CustomTypeRecursiveDepthUniform(t *testing.T) {
+	ct := avro.CustomType{
+		AvroType: "record",
+		Encode:   func(v any, _ *avro.SchemaNode) (any, error) { return v, avro.ErrSkipCustomType },
+		Decode:   func(v any, _ *avro.SchemaNode) (any, error) { return v, avro.ErrSkipCustomType },
+	}
+	const schema = `{"type":"record","name":"LL","fields":[{"name":"next","type":["null","LL"]},{"name":"v","type":"int"}]}`
+	s, err := avro.Parse(schema, ct)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	plain := avro.MustParse(schema) // no custom: the reference depth bound
+
+	mk := func(depth int) map[string]any {
+		v := map[string]any{"v": int32(0), "next": nil}
+		for i := 0; i < depth; i++ {
+			v = map[string]any{"v": int32(0), "next": v}
+		}
+		return v
+	}
+
+	// A depth the plain (no-custom) schema encodes must ALSO encode with the
+	// custom applied — the custom must not lower the bound.
+	plainMax := 0
+	for d := 0; d <= 600; d++ {
+		if _, e := plain.Encode(mk(d)); e != nil {
+			break
+		}
+		plainMax = d
+	}
+	probe := plainMax - 50 // comfortably inside the plain bound, well above the old custom-bugged ~332
+	if probe < 350 {
+		t.Fatalf("plain bound unexpectedly low (%d); test assumptions stale", plainMax)
+	}
+	b, err := s.Encode(mk(probe))
+	if err != nil {
+		t.Fatalf("custom-on-record Encode at depth %d must succeed (plain bound %d), got: %v", probe, plainMax, err)
+	}
+	var got any
+	if _, err := s.Decode(b, &got); err != nil {
+		t.Fatalf("custom-on-record Decode at depth %d: %v", probe, err)
+	}
+
+	// Cap still protects: a cyclic value must error on encode (not loop).
+	type Node struct {
+		Next *Node `avro:"next"`
+		V    int32 `avro:"v"`
+	}
+	n := &Node{}
+	n.Next = n
+	if _, err := s.Encode(n); err == nil {
+		t.Error("cyclic value must error (errTooDeep), not loop")
+	}
+}
+
+// timestamp-nanos must encode the SPEC-correct "nanoseconds from epoch" for a
+// NEGATIVE-second instant. Java's TimestampNanosConversion.toLong has an
+// off-by-1000 typo (subtracts nanos-1e6 instead of nanos-1e9) that corrupts
+// pre-1970 sub-second instants; twmb is deliberately spec-correct. The other
+// nanos tests use POSITIVE timestamps, which round-trip identically on the
+// buggy and correct formulas — so this is the pin that actually goes red if
+// someone "fixes" twmb toward Java's bug. (See logical.go timeToTimestampNanos.)
+func TestRegression_TimestampNanosNegativeSecondSpecValue(t *testing.T) {
+	s := avro.MustParse(`{"type":"long","logicalType":"timestamp-nanos"}`)
+	tm := time.Unix(-1, 500_000_000).UTC() // 0.5s before epoch → -5e8 ns
+	b, err := s.Encode(tm)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got int64
+	if _, err := s.Decode(b, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	const specValue = int64(-500_000_000) // Java's off-by-1000 yields a different value
+	if got != specValue {
+		t.Errorf("timestamp-nanos(0.5s-before-epoch) = %d, want spec-correct %d (regression toward Java's off-by-1000?)", got, specValue)
+	}
+	var back time.Time
+	if _, err := s.Decode(b, &back); err != nil {
+		t.Fatalf("decode time: %v", err)
+	}
+	if !back.UTC().Equal(tm) {
+		t.Errorf("round-trip = %v, want %v", back.UTC(), tm)
+	}
+}

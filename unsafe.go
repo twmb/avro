@@ -153,7 +153,7 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 		if f.ser != nil {
 			dst, err = f.ser(dst, unsafe.Add(base, f.offset), depth+1)
 		} else {
-			fv := v.FieldByIndex(f.slowIdx)
+			fv := fieldByIndexZero(v, f.slowIdx)
 			if f.omitzero && valueIsZero(fv) {
 				// f.nullByte is populated at compile (compileFastSer)
 				// from fieldMeta.nullSecond — 0x00 for ["null",T],
@@ -170,12 +170,19 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 	return dst, nil
 }
 
+// deserRecordFast is the unsafe fast body for ONE record node. Its only
+// caller is deserRecord.deser, which has already bumped sl.depth (and run
+// the maxDepth guard) for this exact record node. It therefore does NOT
+// bump again: a record is one schema node and must cost exactly one depth
+// unit regardless of whether it is decoded via the reflect body, the fast
+// body, or the reflect-body-then-fast-body chain. Double-bumping here
+// would halve the bound for struct-fast records vs the reflect/map path
+// and break depth uniformity (deserRecordFastPtr, the OTHER fast entry,
+// is reached on child edges that bypass deserRecord.deser, so it keeps
+// its own bump — it is the sole record-node entry on those paths).
 func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *slab) ([]byte, error) {
-	if sl.depth >= maxDepth {
-		return nil, errTooDeep
-	}
-	sl.depth++
-	defer func() { sl.depth-- }()
+	// No sl.depth++/guard here: deserRecord.deser (the only caller) already
+	// bumped and guarded for this exact record node. See the doc comment.
 	base := v.Addr().UnsafePointer()
 	var err error
 	for i := range fast.fields {
@@ -183,7 +190,11 @@ func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *sla
 		if f.deser != nil {
 			src, err = f.deser(src, unsafe.Add(base, f.offset), sl)
 		} else {
-			src, err = f.slowFn(src, fieldByIndex(v, f.slowIdx), sl)
+			fv, ferr := fieldByIndex(v, f.slowIdx)
+			if ferr != nil {
+				return nil, recordFieldError(fast.typ, f.name, ferr)
+			}
+			src, err = f.slowFn(src, fv, sl)
 		}
 		if err != nil {
 			return nil, recordFieldError(fast.typ, f.name, err)
@@ -283,6 +294,15 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			return nil
 		}
 		innerGoType := goType.Elem()
+		// Multi-pointer (**T) nullunion: the value &(*T)(nil) — a non-nil
+		// outer pointer wrapping a nil inner — is nil-equivalent per
+		// isNilValue (it peels every level), so the reflect path encodes
+		// the null branch. The unsafe enter peels only the outer pointer
+		// and would commit to the value branch, then fault on the nil
+		// inner. Decline to the reflect path, which is correct here.
+		if innerGoType.Kind() == reflect.Pointer {
+			return nil
+		}
 		if inner.serRecord != nil {
 			return usNullUnionRecord(inner.serRecord, innerGoType, nullByte, valByte)
 		}
@@ -306,6 +326,13 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		switch inner.avroType {
 		case "nullunion":
 			if elemGoType.Kind() != reflect.Pointer {
+				return nil
+			}
+			// Multi-pointer element ([]**T): &(*T)(nil) is nil-equivalent
+			// (isNilValue peels every level → null branch on reflect);
+			// the unsafe array enter peels only the outer pointer. Decline
+			// to the reflect path. (See the field nullunion case.)
+			if elemGoType.Elem().Kind() == reflect.Pointer {
 				return nil
 			}
 			nullByte, valByte := nullUnionBytes(inner.nullSecond)
@@ -341,8 +368,15 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			return nil
 		}
 		rec := f.meta.serRecord
+		// depth (not depth+1): the field-pass call in serRecordFast/Ptr
+		// already incremented for the parent-record→child-record edge.
+		// The field IS the child record node, so its node depth equals the
+		// field-pass depth; serRecordVia treats its depth arg as the
+		// record's node depth. Adding +1 here would charge the single edge
+		// twice (the reflect path and every decode path charge it once),
+		// breaking depth uniformity for a directly-nested struct record.
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return serRecordVia(dst, rec.fastFor(goType), rec, goType, p, depth+1)
+			return serRecordVia(dst, rec.fastFor(goType), rec, goType, p, depth)
 		}
 	}
 
@@ -1278,6 +1312,13 @@ func usNullUnionEnter(dst []byte, p unsafe.Pointer, nullByte, valByte byte) (pp 
 // nullByte/valByte are the varint-encoded index bytes for null and value branches.
 func usNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
+		// Guard at the union node, mirroring the decode-side udNullUnionPtr
+		// and the reflect serNullUnionAt: the union is a schema node and
+		// must both charge its edge (depth+1 into the branch below) AND
+		// guard. See the depth-uniformity invariant in deserNullUnionAt.
+		if depth >= maxDepth {
+			return nil, errTooDeep
+		}
 		pp, dst, isNull := usNullUnionEnter(dst, p, nullByte, valByte)
 		if isNull {
 			return dst, nil
@@ -1289,6 +1330,15 @@ func usNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 // usNullUnionRecord handles null-union ser for *T where T is a record.
 func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
+		// Guard at the union node, mirroring the decode-side
+		// udNullUnionRecord and the reflect serNullUnionAt. The union node
+		// is charged here (guard) and its edge to the inner record is
+		// charged by the depth+1 below; the record node self-charges on
+		// entry, so a ["null", Record] link costs two depth units on every
+		// path. See the depth-uniformity invariant in deserNullUnionAt.
+		if depth >= maxDepth {
+			return nil, errTooDeep
+		}
 		pp, dst, isNull := usNullUnionEnter(dst, p, nullByte, valByte)
 		if isNull {
 			return dst, nil
@@ -1322,32 +1372,61 @@ func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valI
 }
 
 // udNullUnionPtr handles null-union deser for *T where T has a primitive unsafe deserializer.
+//
+// The union is a schema node and bumps sl.depth once, exactly like the
+// reflect deserNullUnionAt, the general deserUnion.deser, and the encode
+// side (usNullUnionPtr passes its branch at depth+1). See the depth-
+// uniformity invariant in deserNullUnionAt. The decrement is inline (not
+// deferred) for the same hot-path reason as udNullUnionRecord below.
 func udNullUnionPtr(inner udeserfn, innerType reflect.Type, valIdx int, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
 		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
 		if err != nil || isNull {
+			sl.depth--
 			return src, err
 		}
-		return inner(src, pp, sl)
+		src, err = inner(src, pp, sl)
+		sl.depth--
+		return src, err
 	}
 }
 
 // udNullUnionRecord handles null-union deser for *T where T is a record.
 //
-// Depth bookkeeping note: this function does NOT bump sl.depth itself.
-// It relies on the inner record-entry — deserRecordFastPtr (fast path)
-// or rec.deser (slow path) — to bump on the way in and decrement on
-// the way out. Both currently do. If a future change adds a third
-// record-entry path that's invoked here, that path MUST also bump
-// sl.depth, or recursive ["null", T] schemas will silently lose depth
-// tracking.
+// The union node bumps sl.depth once here (matching deserNullUnionAt,
+// deserUnion.deser, and the encode side usNullUnionRecord). The inner
+// record node bumps separately on its own entry (deserRecordFastPtr or
+// rec.deser via deserRecordVia), so a ["null", Record] link costs two
+// depth units — one for the union edge, one for the record edge — on
+// every encode/decode/JSON path. See the depth-uniformity invariant in
+// deserNullUnionAt.
+//
+// The decrement is inline (not deferred) on this and udNullUnionPtr: this
+// is the recursive-decode hot path (a linked-list "next" field decodes
+// through here once per link), and benchstat showed the open-coded defer
+// adds ~10% per link on BenchmarkDeserializeRecursive. Every post-bump
+// return point decrements first (the err/isNull early return and the
+// after-inner-branch return), so sl.depth is restored on success and on
+// error alike — identical net effect to a defer. The over-bound abort
+// returns before the bump, so there is nothing to undo there.
 func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
 		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
 		if err != nil || isNull {
+			sl.depth--
 			return src, err
 		}
-		return deserRecordVia(src, rec.fastFor(innerType), rec, innerType, pp, sl)
+		src, err = deserRecordVia(src, rec.fastFor(innerType), rec, innerType, pp, sl)
+		sl.depth--
+		return src, err
 	}
 }
 
@@ -1429,6 +1508,16 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 }
 
 // usArrayNullUnionRecord handles array ser for []*T where items are ["null", Record].
+//
+// The element type ["null", Record] is a union schema NODE between the
+// array and the record. It must cost one depth unit, exactly like the
+// decode path (udArrayDirect → udNullUnionRecord → record) and every JSON
+// path. The array node is entered at depth; each element's union node is
+// entered at depth+1 and the inner record at depth+2. The per-element
+// union guard (depth+1 >= maxDepth) is loop-invariant, so it is hoisted
+// before the loop — matching decode's udNullUnionRecord, which guards
+// before reading the index (so a null-branch element at the boundary
+// trips too); only the empty array (no element unions entered) escapes.
 func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		if depth >= maxDepth {
@@ -1440,6 +1529,10 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 		if n == 0 {
 			return dst, nil
 		}
+		// Per-element union node entered at depth+1; charge it.
+		if depth+1 >= maxDepth {
+			return nil, errTooDeep
+		}
 		fast := rec.fastFor(innerType)
 		useFast := fast != nil && fast.allFast
 		var err error
@@ -1450,9 +1543,9 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 			}
 			dst = append(dst, valByte)
 			if useFast {
-				dst, err = serRecordFastPtr(dst, fast, pp, depth+1)
+				dst, err = serRecordFastPtr(dst, fast, pp, depth+2)
 			} else {
-				dst, err = rec.ser(dst, reflect.NewAt(innerType, pp).Elem(), depth+1)
+				dst, err = rec.ser(dst, reflect.NewAt(innerType, pp).Elem(), depth+2)
 			}
 			if err != nil {
 				return nil, err
@@ -1463,6 +1556,13 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 }
 
 // usArrayNullUnionPtr handles array ser for []*T where items are ["null", primitive].
+//
+// Like usArrayNullUnionRecord, the ["null", primitive] element type is a
+// union schema node between the array and the primitive; it costs one
+// depth unit. The array node is entered at depth, each element's union
+// node at depth+1, the inner primitive at depth+2. The loop-invariant
+// union guard is hoisted before the loop (mirrors decode's udNullUnionPtr,
+// which guards before reading the index); the empty array escapes.
 func usArrayNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		if depth >= maxDepth {
@@ -1474,13 +1574,17 @@ func usArrayNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 		if n == 0 {
 			return dst, nil
 		}
+		// Per-element union node entered at depth+1; charge it.
+		if depth+1 >= maxDepth {
+			return nil, errTooDeep
+		}
 		var err error
 		for _, pp := range s {
 			if pp == nil {
 				dst = append(dst, nullByte)
 				continue
 			}
-			dst, err = inner(append(dst, valByte), pp, depth+1)
+			dst, err = inner(append(dst, valByte), pp, depth+2)
 			if err != nil {
 				return nil, err
 			}

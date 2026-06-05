@@ -4,6 +4,7 @@
 package avro_test
 
 import (
+	"encoding/json"
 	"os"
 	"strconv"
 	"strings"
@@ -142,4 +143,28 @@ func TestApacheSchemaTestsVectors(t *testing.T) {
 		}
 	}
 	t.Logf("Apache oracle: %d canonical forms, %d fingerprints verified, %d documented divergences", canonChecked, fpChecked, diverged)
+}
+
+// Canonical() escapes control characters using the same short forms
+// encoding/json uses — including backspace (0x08) as \\b and formfeed
+// (0x0c) as \\f, not \\u0008 / \\u000c — so the canonical bytes (and
+// fingerprint) match the prior json.Marshal-based emitter for the lax
+// names that can carry them.
+func TestRegression_CanonicalBackspaceFormfeedShortForm(t *testing.T) {
+	// reachable only via a fully-permissive lax-name checker.
+	lax := avro.WithLaxNames(func(string) error { return nil })
+	s, err := avro.Parse("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"a\\b\\fz\"]}", lax)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c := string(s.Canonical())
+	if !strings.Contains(c, `\b`) || !strings.Contains(c, `\f`) {
+		t.Errorf("canonical should use \\b and \\f short forms: %s", c)
+	}
+	if strings.Contains(c, `\u0008`) || strings.Contains(c, `\u000c`) {
+		t.Errorf("canonical should NOT use \\u0008/\\u000c long forms: %s", c)
+	}
+	if !json.Valid(s.Canonical()) {
+		t.Errorf("canonical invalid JSON: %s", c)
+	}
 }

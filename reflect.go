@@ -307,17 +307,55 @@ func mapKeyAs(mapType reflect.Type, key reflect.Value) reflect.Value {
 
 // fieldByIndex is like reflect.Value.FieldByIndex but allocates nil embedded
 // pointer structs along the path, which is needed during deserialization.
-func fieldByIndex(v reflect.Value, index []int) reflect.Value {
+func fieldByIndex(v reflect.Value, index []int) (reflect.Value, error) {
 	for _, i := range index {
 		if v.Kind() == reflect.Pointer {
 			if v.IsNil() {
+				// A nil embedded pointer reached through an UNEXPORTED
+				// embedded field name is unsettable — Go reflection
+				// cannot allocate it. Error cleanly rather than panic in
+				// Set (matching encoding/json, which likewise cannot
+				// write through an unexported embedded pointer).
+				if !v.CanSet() {
+					return reflect.Value{}, fmt.Errorf("avro: cannot decode into a field promoted through a nil unexported embedded pointer")
+				}
 				v.Set(reflect.New(v.Type().Elem()))
 			}
 			v = v.Elem()
 		}
 		v = v.Field(i)
 	}
+	return v, nil
+}
+
+// fieldByIndexZero is the read-only (encode) counterpart of fieldByIndex:
+// it walks index from v, returning the ZERO value of the target field
+// when the path crosses a nil embedded pointer instead of panicking. A
+// nil embedded *struct thus encodes its promoted fields as zero —
+// symmetric with fieldByIndex allocating them on decode.
+func fieldByIndexZero(v reflect.Value, index []int) reflect.Value {
+	for n, i := range index {
+		if v.Kind() == reflect.Pointer {
+			if v.IsNil() {
+				return reflect.Zero(fieldTypeByIndex(v.Type(), index[n:]))
+			}
+			v = v.Elem()
+		}
+		v = v.Field(i)
+	}
 	return v
+}
+
+// fieldTypeByIndex resolves the type reached by walking index from t,
+// dereferencing pointer types along the way.
+func fieldTypeByIndex(t reflect.Type, index []int) reflect.Type {
+	for _, i := range index {
+		if t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		t = t.Field(i).Type
+	}
+	return t
 }
 
 // cachedMapping holds the results of typeFieldMapping, cached per Go type.
@@ -497,6 +535,13 @@ func parseTagOptions(opts []string) (inline, omitzero bool) {
 // valueIsZero reports whether v is the zero value for its type, or implements
 // an IsZero() bool method that returns true.
 func valueIsZero(v reflect.Value) bool {
+	// A nil pointer or interface IS the zero value — short-circuit before
+	// the IsZero() interface assertion, because a promoted value-receiver
+	// IsZero (e.g. (time.Time).IsZero on a nil *time.Time) dereferences
+	// the nil pointer and panics.
+	if k := v.Kind(); (k == reflect.Pointer || k == reflect.Interface) && v.IsNil() {
+		return true
+	}
 	if v.CanInterface() {
 		if z, ok := v.Interface().(interface{ IsZero() bool }); ok {
 			return z.IsZero()

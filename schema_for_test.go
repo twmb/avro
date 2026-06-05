@@ -3112,3 +3112,33 @@ func TestRegression_SchemaForNarrowIntDefaultBounds(t *testing.T) {
 		})
 	}
 }
+
+// A default= tag whose value is a valid JSON prefix followed by trailing
+// content must be preserved VERBATIM (the documented intent for non-JSON
+// defaults), not silently truncated to the JSON prefix. json.Decoder.Decode
+// stops at the end of the first value and ignores the rest, so "42 oops"
+// formerly became the number 42 with "oops" silently dropped.
+func TestRegression_SchemaForDefaultTrailingContentVerbatim(t *testing.T) {
+	type R struct {
+		X string `avro:"x,default=42 oops"`
+	}
+	s, err := SchemaFor[R]()
+	if err != nil {
+		t.Fatalf("SchemaFor: %v", err)
+	}
+	if !strings.Contains(s.String(), "oops") {
+		t.Errorf("trailing content silently truncated; want verbatim \"42 oops\": %s", s.String())
+	}
+
+	// A clean JSON default (no trailing content) still parses as JSON.
+	type Q struct {
+		N int64 `avro:"n,default=42"`
+	}
+	sq, err := SchemaFor[Q]()
+	if err != nil {
+		t.Fatalf("SchemaFor Q: %v", err)
+	}
+	if !strings.Contains(sq.String(), `"default":42`) {
+		t.Errorf("clean JSON default should stay numeric 42: %s", sq.String())
+	}
+}

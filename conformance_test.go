@@ -14006,17 +14006,22 @@ func TestParity_EncoderOptionMatrix(t *testing.T) {
 			decodeBack: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
 		},
 		// ── TagLogicalTypes + fixed-with-logical round-trip ─────────
-		// These three cells lock the findUnionBranch "fixed" fallback.
-		// Encoder emits {"fixed.uuid":...}; decoder must accept it via
-		// the logical-tag fallback including "fixed" in its kind list.
-		// A substring check alone would pass; only decodeBack catches
-		// the encoder/decoder asymmetry.
+		// A NAMED fixed carrying a logical type is tagged under its NAME
+		// (here "U" / "D"), NOT "fixed.<logicalType>": both goavro (the
+		// envelope key is the branch codec's typeName.fullName) and Java
+		// (JsonEncoder uses the branch's getFullName()) emit the fixed's
+		// name. The "fixed.<logicalType>" qualifier applies only to
+		// primitive-backed logicals (e.g. long.timestamp-millis above).
+		// The decoder still ACCEPTS the legacy {"fixed.uuid":...} form via
+		// findUnionBranch's "fixed" logical-tag fallback (pinned in a
+		// dedicated case below); these cells pin the EMITTED name and the
+		// round-trip. decodeBack catches any encoder/decoder asymmetry.
 		{
 			name:       "TagLogicalTypes + TaggedUnions: fixed-uuid round-trip",
 			schema:     `["null",{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}]`,
 			input:      "550e8400-e29b-41d4-a716-446655440000",
 			opts:       []avro.Opt{avro.TaggedUnions(), avro.TagLogicalTypes()},
-			wantSubstr: `"fixed.uuid"`,
+			wantSubstr: `"U"`,
 			decodeBack: "550e8400-e29b-41d4-a716-446655440000",
 		},
 		{
@@ -14024,7 +14029,7 @@ func TestParity_EncoderOptionMatrix(t *testing.T) {
 			schema:     `["null",{"type":"fixed","name":"D","size":12,"logicalType":"duration"}]`,
 			input:      avro.Duration{Months: 1, Days: 2, Milliseconds: 3},
 			opts:       []avro.Opt{avro.TaggedUnions(), avro.TagLogicalTypes()},
-			wantSubstr: `"fixed.duration"`,
+			wantSubstr: `"D"`,
 			decodeBack: avro.Duration{Months: 1, Days: 2, Milliseconds: 3},
 		},
 		// ── LinkedinFloats ──────────────────────────────────────────
@@ -21775,5 +21780,30 @@ func TestRegression_SchemaForRejectsDashTagWithOptions(t *testing.T) {
 	}
 	if !strings.Contains(s.String(), `"name":"Z"`) || strings.Contains(s.String(), `"name":"Y"`) {
 		t.Errorf("avro:\"-\" did not skip Y, schema=%s", s.String())
+	}
+}
+
+// json.Number is a numeric carrier (RFC 8259); it is rejected for STRINGY
+// schemas (string/bytes/fixed/enum) on the ENCODE side, regardless of content
+// — symmetric with the decode-side reject (TestRegression_JSONNumberUnsafeStructFieldRejected).
+// The decode side was pinned; this pins the encode side the BUG_AUDIT
+// "rejected on BOTH encode and decode" entry promises.
+func TestRegression_JSONNumberStringySchemasRejectEncode(t *testing.T) {
+	for _, sc := range []struct{ name, schema string }{
+		{"string", `"string"`},
+		{"bytes", `"bytes"`},
+		{"enum", `{"type":"enum","name":"E","symbols":["A","B"]}`},
+		{"fixed", `{"type":"fixed","name":"F","size":3}`},
+	} {
+		s := avro.MustParse(sc.schema)
+		for _, content := range []string{"1.5", "42", "0"} { // valid-number content must STILL reject
+			if _, err := s.Encode(json.Number(content)); err == nil {
+				t.Errorf("%s: Encode(json.Number(%q)) accepted; want reject (numeric carrier into stringy schema)", sc.name, content)
+			}
+		}
+	}
+	// Control: numeric schemas DO accept json.Number (so the reject is type-targeted, not blanket).
+	if _, err := avro.MustParse(`"long"`).Encode(json.Number("42")); err != nil {
+		t.Errorf("long schema must accept json.Number(42): %v", err)
 	}
 }

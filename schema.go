@@ -18,6 +18,11 @@ import (
 // Schema is a compiled Avro schema. Create one with [Parse] or [MustParse],
 // then use [Schema.Encode] / [Schema.Decode] to convert between Go values and
 // Avro binary. A Schema is safe for concurrent use.
+//
+// A nil *Schema is invalid; every method panics on it. Obtain a *Schema only
+// from [Parse], [MustParse], [Resolve], [SchemaFor], or [SchemaNode.Schema] —
+// each returns a non-nil *Schema or an error, so a nil *Schema is a
+// programming error and is surfaced as a panic rather than a returned error.
 type Schema struct {
 	ser   serfn
 	deser deserfn
@@ -212,26 +217,24 @@ func applySchemaOpts(b *builder, opts []SchemaOpt) {
 }
 
 func parse(schema string, b *builder) (*Schema, error) {
-	// Bound nesting depth with a single linear scan BEFORE unmarshaling.
-	// aschema.UnmarshalJSON's object case scans each node's full JSON
-	// subtree (to capture extra properties), so a chain of N nested schema
-	// nodes costs O(N^2) over the input — a ~150 KB deeply-nested schema
-	// takes seconds, and the build-time maxDepth guard only fires AFTER that
-	// quadratic unmarshal completes. This pre-scan rejects pathologically
-	// deep input in O(input) time so the quadratic can never run on it,
-	// making parse cost independent of how deeply an attacker nests.
+	// Bound nesting depth with a single linear scan BEFORE building. The
+	// build's maxDepth guard fires per schema node, but the JSON bracket
+	// nesting can run deeper than the node depth (and json.Decode has its
+	// own ~10000 limit); this O(input) pre-scan rejects pathologically
+	// deep input up front. (Parse itself is O(n) via parseSchemaTree — a
+	// single generic decode, no per-node subtree re-scan.)
 	if err := checkSchemaNestingDepth(schema); err != nil {
 		return nil, err
 	}
-	var orig aschema
-	if err := json.Unmarshal([]byte(schema), &orig); err != nil {
-		return nil, fmt.Errorf("invalid schema: %w", boundJSONErrorEcho(err))
-	}
-	if err := b.build("", &orig); err != nil {
+	orig, err := parseSchemaTree(schema)
+	if err != nil {
 		return nil, err
+	}
+	if err := b.build("", orig); err != nil {
+		return nil, boundErrorLen(err)
 	}
 	if err := b.finalize(); err != nil {
-		return nil, err
+		return nil, boundErrorLen(err)
 	}
 	s := &Schema{
 		ser:    b.ser,
@@ -256,10 +259,11 @@ func parse(schema string, b *builder) (*Schema, error) {
 // object), so a build-acceptable schema (<= maxDepth nodes) reaches a JSON
 // bracket depth of at most 3*maxDepth. The 4*maxDepth limit clears that
 // provable ceiling by a full maxDepth, so the pre-scan never rejects a schema
-// the builder would accept; it only short-circuits input so deep the builder
-// would reject it anyway, before the O(n^2) unmarshal pays for it. Tight
-// sub-second bounds for legitimately deep schemas need the single-pass
-// O(n) unmarshal rewrite, not this backstop.
+// the builder would accept; it short-circuits input deeper than the builder
+// accepts (and deeper than json's own ~10000 nesting cap) in one O(input)
+// pass. Parse itself is O(n) — see parseSchemaTree and canonicalBytes — so
+// this is a cheap early-reject, no longer the load-bearing DoS defense it was
+// when the unmarshal and canonical marshal were quadratic.
 const maxSchemaJSONDepth = maxDepth * 4
 
 // checkSchemaNestingDepth reports an error if schema's JSON nests deeper than
@@ -375,21 +379,16 @@ func lookupCanonDef(ref, ns string, defs map[string]*aobject, shortCount map[str
 	if _, isPrim := serPrimitive[ref]; isPrim {
 		return nil
 	}
-	if o, ok := defs[ref]; ok {
-		return o
+	var keys [2]string
+	for _, k := range scopedRefKeys(&keys, ref, ns) {
+		if o, ok := defs[k]; ok {
+			return o
+		}
 	}
-	if !strings.Contains(ref, ".") {
-		// A bare reference resolves in its enclosing namespace. This is the
-		// only correct resolution; the globally-unique fallback below covers
-		// references with no enclosing namespace (ns == "").
-		if ns != "" {
-			if o, ok := defs[ns+"."+ref]; ok {
-				return o
-			}
-		}
-		if shortCount[ref] == 1 {
-			return defs[shortToFull[ref]]
-		}
+	// Globally-unique short-name fallback for bare references with no
+	// other resolution.
+	if !strings.Contains(ref, ".") && shortCount[ref] == 1 {
+		return defs[shortToFull[ref]]
 	}
 	return nil
 }
@@ -462,46 +461,13 @@ func rewriteCanonObj(o *aobject, ns string, defs map[string]*aobject, shortCount
 }
 
 func (s *Schema) Canonical() []byte {
-	// Use json.Encoder with HTML escaping disabled: PCF requires raw
-	// UTF-8 (the "STRINGS" rule), so <, >, & must NOT be escaped to
-	// \uXXXX. Java's PCF emitter does not escape them; json.Marshal
-	// does, which would silently diverge fingerprints.
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(canonicalFirstOccurrence(s.c))
-	out := buf.Bytes()
-	if n := len(out); n > 0 && out[n-1] == '\n' {
-		out = out[:n-1] // strip Encoder's trailing newline
-	}
-	// Go's json.Encoder unconditionally escapes U+2028 and U+2029 even
-	// with SetEscapeHTML(false) — those code points trigger browser-side
-	// JS parser pitfalls that Go's stdlib defends against. PCF requires
-	// raw UTF-8; replace the six-byte JSON escapes with their UTF-8
-	// encodings. Safe: a valid JSON string cannot contain an unescaped
-	// backslash, so the literal six-byte `\uXXXX` byte sequence only
-	// appears as an escape we want to undo.
-	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '2', '0', '2', '8'}, []byte{0xe2, 0x80, 0xa8})
-	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '2', '0', '2', '9'}, []byte{0xe2, 0x80, 0xa9})
-	// The nested aobject/aschema MarshalJSON methods call plain
-	// json.Marshal, which HTML-escapes the three ASCII characters less-than,
-	// greater-than, and ampersand to their six-byte JSON unicode escapes
-	// (lowercase hex) — and it does so regardless of the outer encoder's
-	// SetEscapeHTML(false) above, because a Marshaler's output is passed
-	// through verbatim (only U+2028/U+2029 get re-processed). PCF's STRINGS
-	// rule requires raw UTF-8 for these too; Java's SchemaNormalization
-	// (lang/java/.../SchemaNormalization.java) appends names / symbols /
-	// fullnames with no escaping, so leaving them escaped diverges the
-	// Rabin/SHA/MD5 fingerprint and the SOE header. Undo the escapes — safe
-	// for the same reason as the U+2028/U+2029 replacement above:
-	// json.Marshal emits exactly these lowercase six-byte forms, and a
-	// literal backslash inside a string is itself escaped to a double
-	// backslash, so a single-backslash escape only appears as one we want
-	// to undo.
-	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '0', '0', '3', 'c'}, []byte{'<'})
-	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '0', '0', '3', 'e'}, []byte{'>'})
-	out = bytes.ReplaceAll(out, []byte{'\\', 'u', '0', '0', '2', '6'}, []byte{'&'})
-	return out
+	// Single-pass writer emitting raw UTF-8 strings per the PCF [STRINGS]
+	// rule (see canonicalBytes). O(n) over the schema, vs the former
+	// nested-MarshalJSON path that re-copied each subtree at every level
+	// (O(n^2)); and it never produces the HTML / U+2028 / U+2029 escapes
+	// the former path had to un-escape with bytes.ReplaceAll — which
+	// corrupted any name containing a literal backslash.
+	return canonicalBytes(canonicalFirstOccurrence(s.c))
 }
 
 // Fingerprint hashes the schema's canonical form with h. Use [NewRabin] for
@@ -533,78 +499,11 @@ func (s *aschema) isNullableUnion() bool {
 	return len(s.union) >= 2 && s.union[0].primitive == "null"
 }
 
-func (s aschema) MarshalJSON() ([]byte, error) {
-	switch {
-	case len(s.primitive) != 0:
-		return json.Marshal(s.primitive)
-	case s.object != nil:
-		return json.Marshal(s.object)
-	case len(s.union) != 0:
-		return json.Marshal(s.union)
-	default:
-		return nil, errors.New("invalid empty schema")
-	}
-}
-
-func (s *aschema) UnmarshalJSON(data []byte) error {
-	// Reset state on every call. encoding/json invokes UnmarshalJSON
-	// once PER duplicate key at the same level (e.g. {"tYpe":"int",
-	// "tYpe":[]} ends up calling this twice on the same *aschema). The
-	// last-wins contract requires the later call to fully replace the
-	// earlier state, not merge into it — without this reset a string
-	// primitive then a union would leave both s.primitive AND s.union
-	// populated, and build()'s primitive-priority dispatch would diverge
-	// from Root()'s map-decode last-wins.
-	*s = aschema{}
-	data = bytes.TrimSpace(data)
-	if len(data) == 0 {
-		return errors.New("invalid empty schema")
-	}
-	switch data[0] {
-	case '"':
-		return json.Unmarshal(data, &s.primitive)
-	case '{':
-		// Decode directly into the struct. encoding/json struct decode
-		// and map decode are both documented and implemented as
-		// last-wins for duplicate keys in modern Go, matching Java's
-		// Jackson and Python's json — no re-Marshal-for-dedup needed.
-		// Avoiding the re-Marshal is what makes Parse cost O(n) over
-		// the schema bytes instead of O(n²) over nested schema depth.
-		if err := json.Unmarshal(data, &s.object); err != nil {
-			return err
-		}
-		// Capture extra properties not in the struct tags.
-		// encoding/json matches struct field names case-insensitively,
-		// so keys like "tYpe" parse into Type and should not also land
-		// in extras.
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(data, &raw); err != nil {
-			return err
-		}
-		for k := range raw {
-			if schemaReservedKeyCI(k) {
-				continue
-			}
-			if s.object.extra == nil {
-				s.object.extra = make(map[string]any)
-			}
-			v, err := unmarshalAnyPreservePrecision(raw[k])
-			if err != nil {
-				// raw[k] came from a successful map[string]json.RawMessage
-				// decode above, so this is unreachable for well-formed input.
-				// Silently drop the property rather than fail the whole
-				// schema parse — extra props are advisory metadata.
-				continue
-			}
-			s.object.extra[k] = v
-		}
-		return nil
-	case '[':
-		return json.Unmarshal(data, &s.union)
-	default:
-		return errors.New("invalid schema")
-	}
-}
+// aschema, aobject, and afield are populated by parseSchemaTree
+// (schema_parse.go) from a single generic decode — they are deliberately
+// NOT json.Marshaler / json.Unmarshaler, so the stdlib decoder does not
+// re-scan each nested node's subtree (which made Parse O(depth*size)).
+// The canonical form is written by canonicalBytes (schema_canonical.go).
 
 type afield struct {
 	Name string   `json:"name"`
@@ -645,85 +544,6 @@ var afieldComplexKeys = map[string]string{
 	"values":  "map",
 	"fields":  "record",
 	"size":    "fixed",
-}
-
-func (f *afield) UnmarshalJSON(data []byte) error {
-	// Direct struct decode — last-wins for duplicate keys. See
-	// aschema.UnmarshalJSON for the rationale.
-	type plain afield
-	if err := json.Unmarshal(data, (*plain)(f)); err != nil {
-		return err
-	}
-	// Detect the "flat" field format: "type" is a string naming a complex
-	// type (e.g. "enum") and complex-type attributes (e.g. "symbols") live
-	// alongside the field's own keys. When detected, lift those attributes
-	// into a nested type object so the rest of the parser sees the
-	// canonical form.
-	if f.Type == nil || f.Type.primitive == "" {
-		// No complex-type lift possible. Still need to handle the
-		// field-level logicalType case for unions and already-object
-		// type forms.
-		f.liftFieldLogicalIntoType()
-		return nil
-	}
-	tp := f.Type.primitive
-	if tp != "enum" && tp != "array" && tp != "map" && tp != "record" && tp != "error" && tp != "fixed" {
-		// Primitive type with possible field-level logicalType — the
-		// Java/JDBC Avro idiom. Lift the annotation into the type so
-		// the parser sees the canonical nested form.
-		f.liftFieldLogicalIntoType()
-		return nil
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	needsLift := false
-	for key, forType := range afieldComplexKeys {
-		if _, ok := raw[key]; ok && (forType == tp || (key == "fields" && tp == "error")) {
-			needsLift = true
-			break
-		}
-	}
-	if !needsLift {
-		return nil
-	}
-	// Build a JSON object for the type schema from the field's own keys,
-	// excluding field-only keys ("default", "order", "aliases").
-	// For non-named types (array, map), also exclude "name" and
-	// "namespace" since those belong to the field, not the type.
-	named := tp == "record" || tp == "error" || tp == "enum" || tp == "fixed"
-	typeObj := make(map[string]json.RawMessage, len(raw))
-	for k, v := range raw {
-		switch k {
-		case "default", "order":
-			// Field-only keys, do not propagate.
-		case "aliases":
-			// In the flat format, aliases belong to the field, not
-			// the type. Named types that need aliases can use the
-			// nested format.
-		case "name", "namespace":
-			if named {
-				typeObj[k] = v
-			}
-		default:
-			typeObj[k] = v
-		}
-	}
-	typeJSON, err := json.Marshal(typeObj)
-	if err != nil {
-		return err
-	}
-	var s aschema
-	if err := json.Unmarshal(typeJSON, &s); err != nil {
-		return err
-	}
-	f.Type = &s
-	// The lift above already copied "logicalType"/"precision"/"scale" into
-	// typeObj, so the freshly-built schema's aobject captures them. Clear
-	// the field-level copies so canonical re-emit does not duplicate.
-	f.Logical, f.Scale, f.Precision = "", nil, nil
-	return nil
 }
 
 // liftFieldLogicalIntoType moves a field-level logicalType annotation (with
@@ -837,6 +657,32 @@ func clonePtrInt(p *int) *int {
 	return &v
 }
 
+// maxParseErrorLen bounds the assembled length of a schema-parse error
+// message. The build/finalize walkers wrap per nesting level (e.g.
+// "invalid array: %v" at each of up to maxDepth levels), so a deeply
+// nested schema can otherwise produce a multi-KB message from a small
+// input — the same log/RPC/metric amplification the per-value trunc
+// helpers prevent, but accumulated over the wrap chain rather than in one
+// value. truncForError caps individual interpolated values; this caps the
+// whole chain.
+const maxParseErrorLen = 1024
+
+// boundErrorLen returns err unchanged if its message fits maxParseErrorLen,
+// otherwise a flattened error keeping the head (outer context) and the
+// tail (the innermost cause — e.g. "recursion limit exceeded", which the
+// wrap chain puts last) with the repeated middle elided.
+func boundErrorLen(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if len(msg) <= maxParseErrorLen {
+		return err
+	}
+	half := maxParseErrorLen / 2
+	return errors.New(msg[:half] + " …[truncated]… " + msg[len(msg)-half:])
+}
+
 // boundJSONErrorEcho truncates user-controllable input echoed verbatim by
 // stdlib json / strconv error types so a hostile MiB-sized literal can't
 // produce a MiB-sized error string from [Parse]. Reaches
@@ -934,114 +780,6 @@ func (l *laxInt) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (l laxInt) MarshalJSON() ([]byte, error) {
-	return json.Marshal(int(l))
-}
-
-// MarshalJSON serializes an aobject honoring two Avro spec requirements
-// that encoding/json's struct-tag path cannot satisfy on its own:
-//
-//  1. record/error must emit "fields" even when empty (Complex Types >
-//     Records: "fields: a JSON array, listing fields (required)") and
-//     enum must emit "symbols" even when empty (Complex Types > Enums:
-//     "symbols: a JSON array, listing symbols, as JSON strings
-//     (required)"). The struct-tag omitempty would drop them.
-//
-//  2. Parsing Canonical Form's [ORDER] rule requires "name, type,
-//     fields, symbols, items, values, size" to appear in that order.
-//     encoding/json emits struct fields in declaration order, which
-//     happens to match for the first two but places other attributes
-//     (namespace, aliases, etc.) in between, violating PCF order when
-//     those non-canonical attributes are present.
-//
-// We emit the PCF-ordered keys first, then the non-PCF attributes
-// afterward. Non-PCF attributes are stripped from canonical form
-// before MarshalJSON is called, so their ordering is irrelevant to
-// canonical form — it only matters that PCF keys are correctly
-// ordered and complete.
-func (o aobject) MarshalJSON() ([]byte, error) {
-	type kv struct {
-		k string
-		v any
-	}
-	parts := make([]kv, 0, 8)
-
-	// PCF [ORDER]: name, type, fields, symbols, items, values, size.
-	if o.Name != "" {
-		parts = append(parts, kv{"name", o.Name})
-	}
-	parts = append(parts, kv{"type", o.Type})
-	switch o.Type {
-	case "record", "error":
-		fields := o.Fields
-		if fields == nil {
-			fields = []afield{}
-		}
-		parts = append(parts, kv{"fields", fields})
-	default:
-		if len(o.Fields) > 0 {
-			parts = append(parts, kv{"fields", o.Fields})
-		}
-	}
-	if o.Type == "enum" {
-		symbols := o.Symbols
-		if symbols == nil {
-			symbols = []string{}
-		}
-		parts = append(parts, kv{"symbols", symbols})
-	} else if len(o.Symbols) > 0 {
-		parts = append(parts, kv{"symbols", o.Symbols})
-	}
-	if o.Items != nil {
-		parts = append(parts, kv{"items", o.Items})
-	}
-	if o.Values != nil {
-		parts = append(parts, kv{"values", o.Values})
-	}
-	if o.Size != nil {
-		parts = append(parts, kv{"size", o.Size})
-	}
-
-	// Non-PCF attributes (stripped in canonical form).
-	if o.Namespace != nil {
-		parts = append(parts, kv{"namespace", *o.Namespace})
-	}
-	if len(o.Aliases) > 0 {
-		parts = append(parts, kv{"aliases", o.Aliases})
-	}
-	if len(o.Default) > 0 {
-		parts = append(parts, kv{"default", o.Default})
-	}
-	if o.Logical != "" {
-		parts = append(parts, kv{"logicalType", o.Logical})
-	}
-	if o.Precision != nil {
-		parts = append(parts, kv{"precision", *o.Precision})
-	}
-	if o.Scale != nil {
-		parts = append(parts, kv{"scale", *o.Scale})
-	}
-
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	for i, p := range parts {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		// Key: a string literal we control, never fails.
-		kJSON, _ := json.Marshal(p.k)
-		buf.Write(kJSON)
-		buf.WriteByte(':')
-		vJSON, err := json.Marshal(p.v)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(vJSON)
-	}
-	buf.WriteByte('}')
-	return buf.Bytes(), nil
-}
-
 // validName reports whether s matches [A-Za-z_][A-Za-z0-9_]*.
 func validName(s string) bool {
 	if s == "" {
@@ -1064,19 +802,16 @@ func validName(s string) bool {
 // whose type hasn't been parsed yet). We record what needs patching and
 // resolve everything in finalize() once all types are built.
 
-// unionMissing / unionMissingDeser patch union branch function tables
-// when a branch type was a forward reference.
+// unionMissing patches a union's ser AND deser branch function tables
+// (plus its branch nodes and name tables) when any branch type was a
+// forward reference. One fixup record per union keeps the paired
+// structures updated together by construction.
 type unionMissing struct {
 	ser        *serUnion
+	deser      *deserUnion
 	branches   []*schemaNode  // union node's branch slice; fwd-ref branch nodes are patched in finalize
 	missing    map[int]string // branch index → type name
 	parentName string         // enclosing scope, for the finalize namespace-qualified retry
-}
-
-type unionMissingDeser struct {
-	deser      *deserUnion
-	missing    map[int]string
-	parentName string
 }
 
 // fieldMeta carries Avro-level type info for a record field, used by the
@@ -1175,12 +910,14 @@ type namedType struct {
 	sr    *serRecord   // non-nil for records only
 	dr    *deserRecord // non-nil for records only
 	node  *schemaNode
-	// hadCustomType is true when this named type was built under a
-	// Parse that registered at least one CustomType matching some
-	// node in its subtree. The cache-reference rejection check uses
-	// this to allow re-references when the cached entry was already
-	// CT-wired at its original Parse — the documented remediation
-	// path "re-parse Inner with the CT first" depends on this signal.
+	// hadCustomType is true when this named type was DEFINED by a parse
+	// that wired at least one CustomType anywhere (deliberately coarse —
+	// every definition of a custom-wired parse counts; stamped at
+	// finalize, see registerNamed). The cache-reference boundary guard
+	// compares it against the referencing parse's registrations to
+	// allow consistent reuse and reject mismatches — the documented
+	// remediation path "re-parse Inner with the CT first" depends on
+	// this signal.
 	hadCustomType bool
 }
 
@@ -1189,8 +926,8 @@ type builder struct {
 	deser deserfn
 
 	named           map[string]*namedType
+	definedNamed    []*namedType // named types DEFINED by this parse (vs inherited); stamped custom-affected at finalize
 	missing         []unionMissing
-	dmissing        []unionMissingDeser
 	mfixups         []metaFixup
 	fieldFixups     []recordFieldFixup
 	containerFixups []containerFixup
@@ -1252,7 +989,7 @@ func (b *builder) nest() *builder {
 
 func (b *builder) unnest(nest *builder) {
 	b.missing = append(b.missing, nest.missing...)
-	b.dmissing = append(b.dmissing, nest.dmissing...)
+	b.definedNamed = append(b.definedNamed, nest.definedNamed...)
 	b.mfixups = append(b.mfixups, nest.mfixups...)
 	b.fieldFixups = append(b.fieldFixups, nest.fieldFixups...)
 	b.containerFixups = append(b.containerFixups, nest.containerFixups...)
@@ -1294,7 +1031,13 @@ func makeCustomSer(ce func(reflect.Value) (reflect.Value, error), base serfn) se
 		if err != nil {
 			return nil, err
 		}
-		return base(dst, v, depth+1)
+		// Pass depth unchanged: the custom wrapper annotates an existing
+		// schema node, it is not a new nesting level. base does the node's
+		// own depth accounting, and the decode wrapper + JSON path both
+		// charge 0 here — re-entering at depth+1 would make a custom on a
+		// recursive node trip errTooDeep a level shallower per recursion
+		// than decode, breaking round-trips.
+		return base(dst, v, depth)
 	}
 }
 
@@ -1383,12 +1126,16 @@ var primFast = map[string]primFastInfo{
 	},
 }
 
-// registerNamed stores nt under name, populating hadCustomType from the
-// builder's current overlay maps. Shared by the record/enum/fixed
-// registrations in buildComplex so the flag is set consistently.
+// registerNamed stores nt under name and records it as a definition of
+// this parse. The custom-affected flag (hadCustomType) is stamped for
+// ALL of this parse's definitions at finalize, after applyCustomTypes
+// has wired every node: registration happens early so self-references
+// resolve mid-build, and a stamp taken here would predate the wiring it
+// reports — permanently for a type whose OWN node matches the
+// CustomType (fixed, enum), since no later per-arm re-stamp sees it.
 func (b *builder) registerNamed(name string, nt *namedType) {
-	nt.hadCustomType = b.hasCustomTypeWired()
 	b.named[name] = nt
+	b.definedNamed = append(b.definedNamed, nt)
 }
 
 // tryAssignNamedRef resolves a named-type reference, possibly with
@@ -1398,11 +1145,35 @@ func (b *builder) registerNamed(name string, nt *namedType) {
 // bare-string named-ref path and buildComplex's wrapped-form
 // {"type":"Name"} path so the rejectCachedRefIfCustomTypeWouldMatch
 // gate and the namespace-qualified retry agree.
-// resolveNamedRef looks up a named-type reference by name, applying the
-// namespace-qualified retry: a bare name (no dot) is retried under
-// parentName's namespace prefix (e.g. "Inner" referenced inside
-// "com.x.Outer" resolves to "com.x.Inner"). Returns the resolved fullname
-// and the namedType, or ("", nil) when unresolved.
+// scopedRefKeys writes the lookup keys for a name reference into dst in
+// binding-precedence order and returns the filled prefix: a dotted
+// reference is an exact fullname lookup; a bare reference tries the
+// enclosing-namespace-qualified key first, then the bare key (the
+// null-namespace type, when one exists). This IS the name-binding rule —
+// Java's Names.get order (Schema.java: new Name(o, space) looked up
+// before the null-space retry) and fastavro's schema_name qualification.
+// Checking the bare key first would bind a null-namespace type in
+// preference to the in-scope one whenever the two share a short name,
+// silently changing the wire contract of every field using the
+// reference. Every resolver — wire build/finalize (resolveNamedRef),
+// canonical (lookupCanonDef), metadata (lookupNameRef) — derives its key
+// order here so the precedence cannot drift between them.
+func scopedRefKeys(dst *[2]string, ref, ns string) []string {
+	if strings.Contains(ref, ".") {
+		dst[0] = ref
+		return dst[:1]
+	}
+	if ns != "" {
+		dst[0], dst[1] = ns+"."+ref, ref
+		return dst[:2]
+	}
+	dst[0] = ref
+	return dst[:1]
+}
+
+// resolveNamedRef looks up a named-type reference by name, in
+// scopedRefKeys precedence order against parentName's namespace. Returns
+// the resolved fullname and the namedType, or ("", nil) when unresolved.
 //
 // Shared by tryAssignNamedRef (build-time, backward references) and
 // finalize (forward-reference fixups) so the qualification rule lives in
@@ -1412,15 +1183,10 @@ func (b *builder) registerNamed(name string, nt *namedType) {
 // resolved through tryAssignNamedRef's retry — an order-dependent parse
 // rejection of a valid schema.
 func (b *builder) resolveNamedRef(name, parentName string) (string, *namedType) {
-	if nt := b.named[name]; nt != nil {
-		return name, nt
-	}
-	if !strings.Contains(name, ".") && parentName != "" {
-		if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
-			qualified := parentName[:dot+1] + name
-			if nt := b.named[qualified]; nt != nil {
-				return qualified, nt
-			}
+	var keys [2]string
+	for _, k := range scopedRefKeys(&keys, name, namespaceOf(parentName)) {
+		if nt := b.named[k]; nt != nil {
+			return k, nt
 		}
 	}
 	return "", nil
@@ -1454,24 +1220,25 @@ func (b *builder) finalize() error {
 				return fmt.Errorf("unknown type %q", truncForError(name))
 			}
 			m.ser.fns[idx] = b.customWrappedSer(nt.node, nt.ser)
+			m.deser.fns[idx] = b.customWrappedDeser(nt.node, nt.deser)
 			// The builder left branches[idx] nil for this forward-ref
 			// branch (the named type wasn't built yet). The binary path
-			// dispatches through the ser/deser fn tables (patched here and
-			// in the b.dmissing loop below), but the JSON encode/decode,
-			// schema-resolution, and union-default-validation paths walk
-			// node.branches directly and would dereference the nil node.
+			// dispatches through the ser/deser fn tables (patched above),
+			// but the JSON encode/decode, schema-resolution, and
+			// union-default-validation paths walk node.branches directly
+			// and would dereference the nil node.
 			if m.branches != nil {
 				m.branches[idx] = nt.node
 			}
 		}
-	}
-	for _, m := range b.dmissing {
-		for idx, name := range m.missing {
-			_, nt := b.resolveNamedRef(name, m.parentName)
-			if nt == nil {
-				return fmt.Errorf("unknown type %q", truncForError(name))
+		// With every branch node wired, re-derive the union's
+		// name-dependent artifacts (duplicate-branch check, TaggedUnions
+		// branch-name tables) from the RESOLVED names — buildUnion ran
+		// them with the unresolved as-written names for fwd-ref branches.
+		if m.branches != nil && m.deser != nil {
+			if err := finalizeUnionNames(m.ser, m.deser, m.branches); err != nil {
+				return err
 			}
-			m.deser.fns[idx] = b.customWrappedDeser(nt.node, nt.deser)
 		}
 	}
 	for _, m := range b.mfixups {
@@ -1569,6 +1336,21 @@ func (b *builder) finalize() error {
 	for _, p := range pending {
 		if err := encodeFieldDefaultBytes(p.converted, p.node, p.name, p.srf); err != nil {
 			return err
+		}
+	}
+	// Stamp every named type DEFINED by this parse as custom-affected
+	// when any CustomType wired. Custom effects are baked onto the
+	// shared nodes, and the SchemaCache boundary guard
+	// (rejectCachedRefIfCustomTypeWouldMatch) compares this flag against
+	// the NEXT parse's registrations. Deliberately coarse — every name
+	// defined by a custom-wired parse counts as custom-affected,
+	// documented on the guard — and taken here, after applyCustomTypes
+	// has seen every node, because registration happens early to support
+	// self-references. Inherited (cache) entries are not in definedNamed
+	// and keep the flag from their defining parse.
+	if b.hasCustomTypeWired() {
+		for _, nt := range b.definedNamed {
+			nt.hadCustomType = true
 		}
 	}
 	return nil
@@ -2056,22 +1838,26 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		// Per Avro spec ("Unions"): "Names of named types must be
 		// defined exactly once across all the schemas of the union."
 		// Key by the resolved fullname when available so an inline
-		// definition + a name reference to the same named type
-		// collide; primitives still collide on kind. Forward refs key
-		// on the unresolved name (the common case where the user
-		// writes consistent names is caught; namespace-qualification
-		// mismatches that only resolve later may escape).
-		key := typ
-		switch {
-		case u.node != nil && u.node.name != "":
-			key = u.node.name
-		case missing[i] != "":
-			key = missing[i]
+		// definition + a name reference to the same named type collide;
+		// primitives still collide on kind. Forward-referenced branches
+		// are NOT keyed here: their as-written name is not yet bound
+		// (resolveNamedRef may qualify it in-scope or fall back to the
+		// null namespace), so keying it would both miss real duplicates
+		// ("Inner" vs the inline "n.Inner" it resolves to) and false-
+		// reject valid unions (a fwd "Inner" destined for "n.Inner"
+		// colliding with a null-namespace "Inner" branch). Every
+		// fwd-ref-bearing union is re-checked over the RESOLVED names in
+		// finalize via finalizeUnionNames.
+		if missing[i] == "" {
+			key := typ
+			if u.node != nil && u.node.name != "" {
+				key = u.node.name
+			}
+			if sawTypes[key] {
+				return fmt.Errorf("duplicate union type %q", truncForError(key))
+			}
+			sawTypes[key] = true
 		}
-		if sawTypes[key] {
-			return fmt.Errorf("duplicate union type %q", truncForError(key))
-		}
-		sawTypes[key] = true
 
 		b.canon.union = append(b.canon.union, u.canon)
 		ser.fns = append(ser.fns, u.ser)
@@ -2098,34 +1884,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 			ser.branchNames[ln] = i
 		}
 	}
-	// Fastavro-short-name fallback: for named branches (record/enum/
-	// fixed) whose canonical name carries a namespace, also accept the
-	// unqualified short name on tagged-union encode IFF it's unique
-	// across the union. Mirrors findUnionBranch's JSON-side fallback
-	// (json_codec.go:findUnionBranch) so binary and JSON encode accept
-	// the same tagged input shape. The ambiguity guard prevents silent
-	// misrouting when two namespaces share a short name.
-	if len(deser.branchNames) > 0 {
-		shortCount := make(map[string]int, len(deser.branchNames))
-		for _, bn := range deser.branchNames {
-			if short := unqualified(bn); short != bn {
-				shortCount[short]++
-			}
-		}
-		for i, bn := range deser.branchNames {
-			short := unqualified(bn)
-			if short == bn {
-				continue
-			}
-			if shortCount[short] != 1 {
-				continue
-			}
-			if _, exists := ser.branchNames[short]; exists {
-				continue
-			}
-			ser.branchNames[short] = i
-		}
-	}
+	addUnionShortNameFallbacks(ser, deser.branchNames)
 	// Populate branchKinds for type-name dispatch in serUnion.ser /
 	// appendAvroJSONUnion / encodeDefault's union case (see
 	// unionTypeNameForValue). Primitive kinds only — record/enum/fixed
@@ -2164,12 +1923,8 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	if len(missing) > 0 {
 		b.missing = append(b.missing, unionMissing{
 			ser:        ser,
-			branches:   branchNodes,
-			missing:    missing,
-			parentName: parentName,
-		})
-		b.dmissing = append(b.dmissing, unionMissingDeser{
 			deser:      deser,
+			branches:   branchNodes,
 			missing:    missing,
 			parentName: parentName,
 		})
@@ -2180,6 +1935,84 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		ser:      b.ser,
 		deser:    b.deser,
 	}
+	return nil
+}
+
+// addUnionShortNameFallbacks applies the fastavro-short-name fallback:
+// for named branches (record/enum/fixed) whose canonical name carries a
+// namespace, also accept the unqualified short name on tagged-union
+// encode IFF it's unique across the union. Mirrors findUnionBranch's
+// JSON-side fallback (json_codec.go:findUnionBranch) so binary and JSON
+// encode accept the same tagged input shape. The ambiguity guard
+// prevents silent misrouting when two namespaces share a short name.
+// Called from buildUnion (in-order branches) and finalizeUnionNames
+// (after forward-ref branches resolve) so the rule lives in one place.
+func addUnionShortNameFallbacks(ser *serUnion, branchNames []string) {
+	if len(branchNames) == 0 {
+		return
+	}
+	shortCount := make(map[string]int, len(branchNames))
+	for _, bn := range branchNames {
+		if short := unqualified(bn); short != bn {
+			shortCount[short]++
+		}
+	}
+	for i, bn := range branchNames {
+		short := unqualified(bn)
+		if short == bn {
+			continue
+		}
+		if shortCount[short] != 1 {
+			continue
+		}
+		if _, exists := ser.branchNames[short]; exists {
+			continue
+		}
+		ser.branchNames[short] = i
+	}
+}
+
+// finalizeUnionNames re-derives a union's name-dependent artifacts after
+// every forward-referenced branch node has been wired. A named reference
+// is position-independent in Avro, so nothing observable may depend on
+// whether a branch was defined before or after the reference — but
+// buildUnion runs before forward refs resolve, so for fwd-ref branches it
+// captured the UNRESOLVED as-written name in (a) the duplicate-branch
+// check key and (b) the TaggedUnions branch-name tables. This re-runs
+// both over the resolved nodes:
+//
+//   - Duplicate detection (spec, "Unions": a union may not contain the
+//     same named type twice): keyed by the resolved fullname for named
+//     branches and the kind for unnamed ones — so a short-name forward
+//     reference plus an inline definition of the same type collide here
+//     even though their parse-time keys ("Inner" vs "n.Inner") did not.
+//   - branchNames/logicalNames rebuild: the tagged-union envelope name
+//     and the tagged-map encode acceptance use the resolved full name,
+//     matching the JSON side's node-based unionBranchNames and making
+//     the tables identical to what an in-order reference produces.
+func finalizeUnionNames(ser *serUnion, deser *deserUnion, branches []*schemaNode) error {
+	saw := make(map[string]bool, len(branches))
+	deser.branchNames = deser.branchNames[:0]
+	deser.logicalNames = deser.logicalNames[:0]
+	ser.branchNames = make(map[string]int, len(branches))
+	for i, n := range branches {
+		key := n.kind
+		if n.name != "" {
+			key = n.name
+		}
+		if saw[key] {
+			return fmt.Errorf("duplicate union type %q", truncForError(key))
+		}
+		saw[key] = true
+		bn, ln := unionBranchNames(n)
+		deser.branchNames = append(deser.branchNames, bn)
+		deser.logicalNames = append(deser.logicalNames, ln)
+		ser.branchNames[bn] = i
+		if ln != bn {
+			ser.branchNames[ln] = i
+		}
+	}
+	addUnionShortNameFallbacks(ser, deser.branchNames)
 	return nil
 }
 
@@ -2413,11 +2246,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if err := b.validFullnameErr(o.Name); err != nil {
 			return fmt.Errorf("invalid %s name %q: %w", truncForError(o.Type), truncForError(o.Name), err)
 		}
-		for _, a := range origAliases {
-			if err := b.validFullnameErr(a); err != nil {
-				return fmt.Errorf("invalid %s alias %q: %w", truncForError(o.Type), truncForError(a), err)
-			}
-		}
+		// Aliases are NOT name-validated: the Avro spec (§Aliases) states
+		// "any string is accepted as an alias", precisely so evolution can
+		// alias a reader's valid name to a writer's illegal/legacy name.
+		// Java and fastavro do no alias-name validation either. qualifyAliases
+		// (below) still applies namespace qualification and the leading-dot
+		// null-namespace escape; resolution matches aliases as plain strings.
 		ns := ""
 		hasNS := false
 		if o.Namespace != nil {
@@ -2437,6 +2271,16 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			if dot := strings.LastIndexByte(parentName, '.'); dot >= 0 {
 				o.Name = parentName[:dot+1] + o.Name // no namespace: prefix our name with parent namespace if there is one
 			}
+		}
+		// Per the Avro spec (Names): a primitive type name has no
+		// namespace and may not name a record/enum/fixed. o.Name is now
+		// the resolved fullname; serPrimitive's keys are exactly the 8
+		// bare primitive names, so this matches only a null-namespace
+		// bare primitive name (a namespaced "a.int" has fullname "a.int",
+		// not a key). Matches Java's NamedSchema "may not be named after
+		// primitives".
+		if _, isPrim := serPrimitive[o.Name]; isPrim {
+			return fmt.Errorf("%s may not be named after the primitive type %q", truncForError(o.Type), truncForError(o.Name))
 		}
 		o.Namespace = nil      // canonical form omits namespace
 		canonObj.Name = o.Name // use fully-qualified name
@@ -2496,11 +2340,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			if err := b.validNameErr(of.Name); err != nil {
 				return fmt.Errorf("invalid field name %q: %w", truncForError(of.Name), err)
 			}
-			for _, a := range origFieldAliases[i] {
-				if err := b.validNameErr(a); err != nil {
-					return fmt.Errorf("invalid field alias %q for field %q: %w", truncForError(a), truncForError(of.Name), err)
-				}
-			}
+			// Field aliases are NOT name-validated — per the Avro spec any
+			// string is accepted as an alias (so a reader can alias a writer's
+			// illegal/legacy field name); matched as-is against writer field
+			// names during resolution. Matches Java/fastavro.
 			if seenFields[of.Name] {
 				return fmt.Errorf("duplicate record field name %q", truncForError(of.Name))
 			}
@@ -2647,15 +2490,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				nd.fieldIdx[a] = i
 			}
 		}
-		// Update hadCustomType after all fields are built. The named
-		// entry was registered EARLY (before fields) to support self-
-		// referencing record schemas, so the flag couldn't be set at
-		// registration time — fields might apply CTs that won't show
-		// up in the maps until unnest. Re-stamp now.
-		if cached := b.named[o.Name]; cached != nil {
-			cached.hadCustomType = cached.hadCustomType || b.hasCustomTypeWired()
-		}
-
 	case "enum":
 		if len(o.Fields) > 0 ||
 			o.Items != nil ||
@@ -2948,9 +2782,16 @@ func qualifyAliases(aliases []string, fullname string) []string {
 	}
 	out := make([]string, len(aliases))
 	for i, a := range aliases {
-		if strings.ContainsRune(a, '.') {
+		switch {
+		case strings.HasPrefix(a, "."):
+			// Java's explicit null-namespace escape: ".Name" aliases the
+			// null-namespace fullname "Name" (Schema.java's Name constructor
+			// treats the leading dot as a null-namespace marker) — never
+			// qualified into the type's own namespace.
+			out[i] = a[1:]
+		case strings.ContainsRune(a, '.'):
 			out[i] = a // already fully qualified
-		} else {
+		default:
 			out[i] = ns + a
 		}
 	}

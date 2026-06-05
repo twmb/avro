@@ -102,9 +102,13 @@ func timeToLocalTimestampNanos(t time.Time) (int64, error) {
 // typo (subtracts `nanos - 1_000_000` where the analogous millis/micros
 // branches subtract `scale` — `nanos - 1_000_000_000` for nanos), which
 // would corrupt every negative-second instant by ~999ms. Java's
-// millis/micros conversions are correct; nanos aligns with avro-rs and
-// fastavro, both of which produce the mathematically correct sec*1e9 +
-// nsec via the same adjustment formula timeToTimestampScaled implements.
+// Java's millis/micros conversions are correct; twmb implements the
+// spec-correct "nanoseconds from epoch" (sec*1e9 + nsec) via
+// timeToTimestampScaled — the same formula as Java's correct millis/micros
+// branches. (This is not corroborated by the other Go-adjacent impls:
+// fastavro has no timestamp-nanos support at all, and avro-rs stores the
+// raw int64 without an Instant conversion — twmb follows the spec and the
+// mathematically correct value, not Java's typo.)
 func timeToTimestampNanos(t time.Time) (int64, error) {
 	return timeToTimestampScaled(t, 1_000_000_000, 1, "nanoseconds")
 }

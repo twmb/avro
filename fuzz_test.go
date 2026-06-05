@@ -681,8 +681,13 @@ func FuzzDecodeJSONRoundTrip(f *testing.F) {
 		if err != nil {
 			t.Fatalf("re-encode of canonical value failed: %v", err)
 		}
-		if !bytes.Equal(encoded1, encoded2) {
-			t.Fatalf("encode is not idempotent on canonical input:\n  encoded1: %s\n  encoded2: %s\n  input:    %s", encoded1, encoded2, input)
+		// Value-level fixpoint, NOT byte-level: Avro map encoding (binary and
+		// JSON) iterates Go map keys in randomized, spec-legal order, so a
+		// multi-key map re-encodes to a different byte ordering even though
+		// the value is identical. fuzzEqual is order-robust (maps) and
+		// NaN-robust, still catching real round-trip drift.
+		if !fuzzEqual(v1, v2) {
+			t.Fatalf("decode∘encode is not a value fixpoint:\n  v1: %#v\n  v2: %#v\n  input: %s\n  encoded1: %s\n  encoded2: %s", v1, v2, input, encoded1, encoded2)
 		}
 	})
 }
@@ -733,8 +738,14 @@ func FuzzEncodeTaggedUnion(f *testing.F) {
 		if err != nil {
 			t.Fatalf("re-encode of canonical value failed: %v", err)
 		}
-		if !bytes.Equal(encoded1, encoded2) {
-			t.Fatalf("encode is not idempotent on canonical input:\n  encoded1: %x\n  encoded2: %x", encoded1, encoded2)
+		// Value-level fixpoint, NOT byte-level: Avro map encoding iterates Go
+		// map keys in randomized, spec-legal order, so a multi-key map
+		// re-encodes to a different byte ordering even though the value is
+		// identical. fuzzEqual is order-robust (maps) and NaN-robust (a
+		// decoded float NaN round-trips to an identical NaN that
+		// reflect.DeepEqual would wrongly call unequal).
+		if !fuzzEqual(tagged1, tagged2) {
+			t.Fatalf("decode∘encode is not a value fixpoint:\n  tagged1: %#v\n  tagged2: %#v\n  encoded1: %x\n  encoded2: %x", tagged1, tagged2, encoded1, encoded2)
 		}
 	})
 }

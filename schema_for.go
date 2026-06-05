@@ -614,6 +614,13 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string, c
 		dec.UseNumber()
 		if err := dec.Decode(&v); err != nil {
 			v = raw
+		} else if dec.More() {
+			// Decode stops at the end of the first JSON value and ignores
+			// the rest, so a valid JSON prefix followed by trailing content
+			// (e.g. "42 oops") would silently truncate to the prefix. Treat
+			// the whole tag as a verbatim string instead — matching the
+			// non-JSON fallback above and decimal()'s trailing-junk guard.
+			v = raw
 		}
 		fieldDef["default"] = v
 		// A narrow Go integer kind maps to a WIDER Avro type (int8/16 and

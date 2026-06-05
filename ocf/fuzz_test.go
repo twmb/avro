@@ -414,8 +414,9 @@ func FuzzOCFWriterReaderCodecCycle(f *testing.F) {
 				break
 			}
 		}
-		// Close is the new path: codec.Close must run even after a
-		// failed Encode poisons w.err. The fuzz cannot directly
+		// Close is the new path: codec.Close must run even when the
+		// writer is in a poisoned w.err state (I/O or compression
+		// errors; value errors recover). The fuzz cannot directly
 		// inject a poison, but it can drive enough variation that
 		// codec resource leaks would surface in -race + leak
 		// detector setups.

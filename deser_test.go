@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -4732,10 +4733,16 @@ func TestTimeOverflow(t *testing.T) {
 func TestUsIntOverflow(t *testing.T) {
 	schema := `{"type":"record","name":"W","fields":[{"name":"v","type":"int"}]}`
 	t.Run("int_overflow", func(t *testing.T) {
+		if strconv.IntSize == 32 {
+			t.Skip("a 32-bit int cannot hold a value that overflows int32")
+		}
 		type W struct {
 			V int `avro:"v"`
 		}
-		encodeErr(t, schema, &W{V: math.MaxInt32 + 1})
+		// Runtime conversion so the file compiles on 32-bit platforms,
+		// where the constant form would not.
+		over := int64(math.MaxInt32) + 1
+		encodeErr(t, schema, &W{V: int(over)})
 	})
 	t.Run("int64_overflow", func(t *testing.T) {
 		type W struct {

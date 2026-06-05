@@ -666,10 +666,16 @@ func TestEncodeError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error encoding bad type")
 	}
-	// Sticky: subsequent encode should also fail.
+	// A value error discards only the failed datum; the Writer remains
+	// usable (see TestRegression_OCFWriterValueErrorRecovers for the
+	// full accepted-datums-survive contract). Only I/O and compression
+	// errors poison the Writer (TestCompressError).
 	n := int32(1)
-	if err := w.Encode(&n); err == nil {
-		t.Fatal("expected sticky error")
+	if err := w.Encode(&n); err != nil {
+		t.Fatalf("encode after value error: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }
 
@@ -4086,5 +4092,59 @@ func TestRegression_ReaderRejectsUseAfterCloseAndClosesCodecOnce(t *testing.T) {
 	// rather than leak it.
 	if err := r.Decode(&got); err == nil {
 		t.Errorf("Decode after Close returned nil (value %d); want error", got)
+	}
+}
+
+// A VALUE error from Encode (the datum doesn't fit the schema) must not
+// poison the Writer: the failed datum's partial bytes are discarded by
+// restoring the buffer snapshot, previously-accepted datums survive, and
+// the Writer remains usable — mirroring Java DataFileWriter.append, which
+// truncates its buffer to the pre-append position and rethrows. Only
+// IO/compression/flush errors (where the sink state is unknowable) poison.
+func TestRegression_OCFWriterValueErrorRecovers(t *testing.T) {
+	s := avro.MustParse(`"int"`)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s)
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	for i := range 5 {
+		if err := w.Encode(int32(i)); err != nil {
+			t.Fatalf("encode %d: %v", i, err)
+		}
+	}
+	// 3.5 is not a whole number: a pure value error.
+	if err := w.Encode(3.5); err == nil {
+		t.Fatal("bad-value Encode returned nil; want error")
+	}
+	for i := 5; i < 7; i++ {
+		if err := w.Encode(int32(i)); err != nil {
+			t.Fatalf("encode %d after value error: %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	var got []int32
+	for {
+		var v int32
+		if err := r.Decode(&v); err != nil {
+			break
+		}
+		got = append(got, v)
+	}
+	want := []int32{0, 1, 2, 3, 4, 5, 6}
+	if len(got) != len(want) {
+		t.Fatalf("file datums: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("file datums: got %v, want %v", got, want)
+		}
 	}
 }

@@ -245,6 +245,18 @@ func serNullSecondUnion(u *serUnion) serfn { return serNullUnionAt(u, 0, 2, 0) }
 // null and value branches respectively.
 func serNullUnionAt(u *serUnion, valIdx int, nullByte, valByte byte) serfn {
 	return func(dst []byte, v reflect.Value, depth int) ([]byte, error) {
+		// The union is a schema node: guard at it exactly like the general
+		// serUnion.ser and the decode-side deserNullUnionAt (which both
+		// guards AND bumps at the union node). The value branch is entered
+		// at depth+1 below, charging the union→branch edge; this guard
+		// charges the union node itself. Without it the union edge is
+		// counted (via depth+1) but the node is unguarded, so a
+		// record{f:["null", container<Self>]} chain trips errTooDeep one
+		// level deeper on encode than on every decode/JSON path. See the
+		// depth-uniformity invariant in deserNullUnionAt.
+		if depth >= maxDepth {
+			return nil, errTooDeep
+		}
 		if isNilValue(v) {
 			return append(dst, nullByte), nil
 		}
@@ -1189,9 +1201,17 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 	}
 	// Struct: try precompiled unsafe fast path. Requires addressable
 	// value so we can take a pointer for unsafe field access.
+	//
+	// Dispatch at the SAME depth: serRecordFast is the fast body for this
+	// one record node, not a nested level. serRecordFast passes its fields
+	// at depth+1 exactly as the reflect path below does, so the record→
+	// field edge costs one depth unit on both paths. Passing depth+1 here
+	// would double-count the record node (once for the dispatch hop, once
+	// for the field pass), halving the effective bound for struct-fast
+	// records vs the reflect/map path and breaking depth uniformity.
 	if v.CanAddr() {
 		if fast := s.loadOrCompileFast(t); fast != nil {
-			return serRecordFast(dst, fast, v, depth+1)
+			return serRecordFast(dst, fast, v, depth)
 		}
 	}
 	// Slow path: reflect-based field access.
@@ -1200,7 +1220,7 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 		return nil, err
 	}
 	for i, f := range s.fields {
-		fv := v.FieldByIndex(mapping.indices[i])
+		fv := fieldByIndexZero(v, mapping.indices[i])
 		// omitzero + nullunion: if the Go field is zero, encode as
 		// the null branch. The wire byte depends on null position:
 		// ["null",T] → 0x00 (index 0); ["T","null"] → 0x02

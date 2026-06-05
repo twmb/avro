@@ -827,3 +827,144 @@ func TestSchemaCacheConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// A consistent CustomType registration resolves across the cache
+// boundary for EVERY named-type shape: the guard's allow arm compares
+// the cached type's custom-affected flag against this Parse's
+// registrations, and that flag must be stamped AFTER custom wiring runs.
+// Named types whose OWN node matches the CustomType (fixed/enum — their
+// registration precedes applyCustomTypes) previously kept a stale false
+// flag, so the forward arm rejected a registration the documented
+// contract accepts ("a consistent registration resolves").
+func TestRegression_SchemaCacheConsistentCustomSelfMatch(t *testing.T) {
+	dec := func(v any, sn *SchemaNode) (any, error) { return v, nil }
+	cases := []struct {
+		name, def, ref string
+		ct             CustomType
+	}{
+		{
+			"fixed self-match decimal",
+			`{"type":"fixed","name":"X","size":4,"logicalType":"decimal","precision":9,"scale":2}`,
+			`{"type":"record","name":"Y","fields":[{"name":"x","type":"X"}]}`,
+			CustomType{LogicalType: "decimal", Decode: dec},
+		},
+		{
+			"enum self-match AvroType",
+			`{"type":"enum","name":"X","symbols":["A","B"]}`,
+			`{"type":"record","name":"Y","fields":[{"name":"x","type":"X"}]}`,
+			CustomType{AvroType: "enum", Decode: dec},
+		},
+		{
+			"record subtree match",
+			`{"type":"record","name":"X","fields":[{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}}]}`,
+			`{"type":"record","name":"Y","fields":[{"name":"x","type":"X"}]}`,
+			CustomType{LogicalType: "timestamp-millis", Decode: dec},
+		},
+		{
+			"namespaced record subtree match",
+			`{"type":"record","name":"X","namespace":"com.x","fields":[{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}}]}`,
+			`{"type":"record","name":"Y","namespace":"com.x","fields":[{"name":"x","type":"X"}]}`,
+			CustomType{LogicalType: "timestamp-millis", Decode: dec},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var cache SchemaCache
+			if _, err := cache.Parse(c.def, WithCustomType(c.ct)); err != nil {
+				t.Fatalf("defining parse: %v", err)
+			}
+			if _, err := cache.Parse(c.ref, WithCustomType(c.ct)); err != nil {
+				t.Fatalf("consistent referencing parse: %v", err)
+			}
+		})
+	}
+}
+
+// Re-parsing the same valid schema string under WithLaxNames must return
+// success (the SchemaCache contract: "Parsing the same schema string
+// multiple times is allowed"). WithLaxNames skips string-dedup (the
+// compiled result isn't identified by the string alone), so the re-parse
+// re-enters the builder and re-registers the inherited name — which needs
+// allowReRegister, granted to the custom-types skip path but not the lax
+// one. Without it, the second parse errors "duplicate named type".
+func TestRegression_SchemaCacheLaxNamesReParse(t *testing.T) {
+	const schema = `{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`
+	cases := []struct {
+		name        string
+		first, second []SchemaOpt
+	}{
+		{"lax then lax", []SchemaOpt{WithLaxNames(nil)}, []SchemaOpt{WithLaxNames(nil)}},
+		{"strict then lax", nil, []SchemaOpt{WithLaxNames(nil)}},
+		{"lax then strict", []SchemaOpt{WithLaxNames(nil)}, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var cache SchemaCache
+			if _, err := cache.Parse(schema, c.first...); err != nil {
+				t.Fatalf("first parse: %v", err)
+			}
+			s, err := cache.Parse(schema, c.second...)
+			if err != nil {
+				t.Fatalf("re-parse same schema: %v", err)
+			}
+			// The re-parsed schema must still work.
+			if _, err := s.AppendEncode(nil, struct {
+				V int64 `avro:"v"`
+			}{V: 7}); err != nil {
+				t.Fatalf("encode after re-parse: %v", err)
+			}
+		})
+	}
+
+	// A genuine conflicting redefinition must still error.
+	var cache SchemaCache
+	if _, err := cache.Parse(schema, WithLaxNames(nil)); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	conflict := `{"type":"record","name":"R","fields":[{"name":"w","type":"string"}]}`
+	if _, err := cache.Parse(conflict, WithLaxNames(nil)); err == nil {
+		t.Fatal("conflicting redefinition of R accepted; want duplicate error")
+	}
+}
+
+// A custom-mode Parse of a NEW string that redefines an inherited name
+// with a DIFFERENT body must error (duplicate named type), exactly as
+// strict and lax do — re-registration is for re-parsing the SAME schema,
+// never for silently overwriting a cached type with a conflicting one.
+// allowReRegister formerly OR'd in hasCustomTypes, granting re-register
+// to any custom parse including a conflicting redefinition.
+func TestRegression_SchemaCacheCustomConflictRejected(t *testing.T) {
+	const base = `{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`
+	ct := CustomType{LogicalType: "nope", AvroType: "long"} // matches nothing in R
+
+	for _, c := range []struct {
+		name, conflict string
+	}{
+		{"field change", `{"type":"record","name":"R","fields":[{"name":"w","type":"string"}]}`},
+		{"kind change", `{"type":"enum","name":"R","symbols":["A"]}`},
+		{"fixed size change vs record", `{"type":"fixed","name":"R","size":4}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var cache SchemaCache
+			if _, err := cache.Parse(base, WithCustomType(ct)); err != nil {
+				t.Fatalf("base parse: %v", err)
+			}
+			if _, err := cache.Parse(c.conflict, WithCustomType(ct)); err == nil {
+				t.Errorf("conflicting redefinition under custom mode accepted; want duplicate-name error")
+			}
+		})
+	}
+
+	// The legitimate paths must still work: re-parsing the SAME custom
+	// schema, and a consistent custom cross-reference.
+	var cache SchemaCache
+	if _, err := cache.Parse(base, WithCustomType(ct)); err != nil {
+		t.Fatalf("base: %v", err)
+	}
+	if _, err := cache.Parse(base, WithCustomType(ct)); err != nil {
+		t.Errorf("re-parse of same custom schema must succeed: %v", err)
+	}
+	if _, err := cache.Parse(`{"type":"record","name":"Outer","fields":[{"name":"r","type":"R"}]}`, WithCustomType(ct)); err != nil {
+		t.Errorf("consistent custom cross-reference must succeed: %v", err)
+	}
+}

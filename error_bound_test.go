@@ -1,8 +1,10 @@
 package avro_test
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/twmb/avro"
 )
@@ -71,4 +73,74 @@ func TestErrorMessageBounded(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A deeply nested schema that the builder rejects (past the recursion
+// limit) must not produce an unbounded error message: each nesting level
+// wraps the inner error, so without a cap a 1500-deep array yields a
+// ~15 KB message from a ~37 KB input — the same amplification the
+// per-value trunc helpers prevent, accumulated over the wrap chain.
+func TestRegression_DeepSchemaErrorBounded(t *testing.T) {
+	for _, depth := range []int{1100, 1500, 3000} {
+		schema := strings.Repeat(`{"type":"array","items":`, depth) + `"int"` + strings.Repeat(`}`, depth)
+		_, err := avro.Parse(schema)
+		if err == nil {
+			t.Fatalf("depth %d: expected rejection", depth)
+		}
+		if len(err.Error()) > 4096 {
+			t.Errorf("depth %d: error %d bytes exceeds 4096 bound", depth, len(err.Error()))
+		}
+	}
+}
+
+// Parse is O(n) in schema size, not O(depth*size): a valid deeply-nested
+// schema (under the build's maxDepth) must parse in time linear in its
+// bytes. The former json.Unmarshaler front-end re-scanned each node's
+// full subtree (O(n^2)); a 999-deep array took ~0.4s, and Parse also fed
+// Canonical() whose nested MarshalJSON re-copied each subtree (a second
+// O(n^2)). Both are now single-pass.
+func TestRegression_DeepValidSchemaParsesLinear(t *testing.T) {
+	deep := strings.Repeat(`{"type":"array","items":`, 900) + `"int"` + strings.Repeat(`}`, 900)
+	t0 := time.Now()
+	s, err := avro.Parse(deep)
+	if err != nil {
+		t.Fatalf("parse valid deep schema: %v", err)
+	}
+	if d := time.Since(t0); d > 200*time.Millisecond {
+		t.Errorf("valid 900-deep schema parsed in %v; want <200ms (O(n^2) regression?)", d)
+	}
+	// Canonical()/Fingerprint must also be linear (it is on the hot Parse
+	// path for the SOE fingerprint).
+	t1 := time.Now()
+	_ = s.Canonical()
+	if d := time.Since(t1); d > 200*time.Millisecond {
+		t.Errorf("Canonical() of 900-deep schema took %v; want <200ms", d)
+	}
+}
+
+// Canonical() must emit valid JSON (and a sound fingerprint) for a name
+// containing a literal backslash, reachable via WithLaxNames. The former
+// path HTML-escaped then bytes.ReplaceAll-un-escaped, which collapsed the
+// \uXXXX target inside a \\uXXXX escape, producing invalid JSON.
+func TestRegression_CanonicalBackslashNameValid(t *testing.T) {
+	for _, name := range []string{`a&b`, `x<y`, `p q`, `back\\slash`} {
+		schema := `{"type":"record","name":"` + jsonEscapeForTest(name) + `","fields":[]}`
+		s, err := avro.Parse(schema, avro.WithLaxNames(nil))
+		if err != nil {
+			t.Fatalf("parse %q: %v", name, err)
+		}
+		c := s.Canonical()
+		if !json.Valid(c) {
+			t.Errorf("Canonical() for name %q is invalid JSON: %s", name, c)
+		}
+		// The PCF must round-trip-parse (registries re-parse canonical form).
+		if _, err := avro.Parse(string(c), avro.WithLaxNames(nil)); err != nil {
+			t.Errorf("Parse(Canonical()) for name %q: %v\ncanonical: %s", name, err, c)
+		}
+	}
+}
+
+func jsonEscapeForTest(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b[1 : len(b)-1]) // strip surrounding quotes
 }

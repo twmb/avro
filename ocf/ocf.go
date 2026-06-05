@@ -437,7 +437,13 @@ func (w *Writer) writeHeader() error {
 // Encode serializes v and appends it to the current block. The block is
 // flushed automatically when it hits the count or byte limit.
 //
-// After any error the Writer is poisoned: all subsequent calls return the
+// A value error (v does not fit the schema) discards the failed datum
+// and leaves the Writer usable: the datum was only ever appended to the
+// in-memory block buffer, never the file, so previously accepted datums
+// are intact and continue to flush.
+//
+// After an I/O or compression error — where the sink's state is not
+// knowable — the Writer is poisoned: all subsequent calls return the
 // same error.
 func (w *Writer) Encode(v any) error {
 	if w.closed {
@@ -446,12 +452,16 @@ func (w *Writer) Encode(v any) error {
 	if w.err != nil {
 		return w.err
 	}
-	var err error
-	w.buf, err = w.schema.AppendEncode(w.buf, v)
+	// AppendEncode is append-only into w.buf: on error the first
+	// len(w.buf) bytes are still exactly the previously accepted datums,
+	// and the failed datum's partial bytes sit past them in the backing
+	// array (hidden by the unchanged length, overwritten by the next
+	// append). Not assigning the returned slice IS the recovery.
+	buf, err := w.schema.AppendEncode(w.buf, v)
 	if err != nil {
-		w.err = err
 		return err
 	}
+	w.buf = buf
 	w.count++
 	if w.shouldFlush() {
 		return w.flush()

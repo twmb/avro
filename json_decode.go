@@ -1356,7 +1356,10 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 	return ctx.iterateRecordFields(node,
 		func(idx int, key string) error {
 			f := &node.fields[idx]
-			fv := fieldByIndex(v, mapping.indices[idx])
+			fv, err := fieldByIndex(v, mapping.indices[idx])
+			if err != nil {
+				return fmt.Errorf("field %q: %w", key, err)
+			}
 			if err := ctx.decodeValue(fv, f.node); err != nil {
 				return fmt.Errorf("field %q: %w", key, err)
 			}
@@ -1369,7 +1372,10 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 				// Mirrors decodeRecord's tolerance of struct-field omission.
 				return nil
 			}
-			fv := fieldByIndex(v, mapping.indices[idx])
+			fv, err := fieldByIndex(v, mapping.indices[idx])
+			if err != nil {
+				return fmt.Errorf("field %q default: %w", f.name, err)
+			}
 			if err := ctx.applyFieldDefault(fv, node, idx); err != nil {
 				return fmt.Errorf("field %q default: %w", f.name, err)
 			}
@@ -1601,9 +1607,15 @@ func (ctx *jsonDecoder) wrapUnion(val any, branch *schemaNode) any {
 	if !ctx.wrapUnions || val == nil {
 		return val
 	}
-	name := unionBranchName(branch)
-	if ctx.qualifyLogical && branch.logical != "" {
-		name = branch.kind + "." + branch.logical
+	// Reuse unionBranchNames so the tagged-map key produced on decode is
+	// byte-identical to what the encode side emits — in particular, a
+	// named fixed carrying a logical type wraps under its NAME, not
+	// "fixed.<logicalType>" (see unionBranchNames for the goavro/Java
+	// references this mirrors).
+	standard, logical := unionBranchNames(branch)
+	name := standard
+	if ctx.qualifyLogical {
+		name = logical
 	}
 	return map[string]any{name: val}
 }

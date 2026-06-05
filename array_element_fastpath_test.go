@@ -37,8 +37,11 @@ func TestRegression_ArrayElementFastPathMatchesGeneral(t *testing.T) {
 			[]int64{0, 1, -1, math.MaxInt64, math.MinInt64},
 			[]fpInt64{0, 1, -1, math.MaxInt64, math.MinInt64}},
 		{"long_int", `{"type":"array","items":"long"}`,
-			[]int{0, 1, -1, math.MaxInt64, math.MinInt64},
-			[]fpInt{0, 1, -1, math.MaxInt64, math.MinInt64}},
+			// Platform int extremes: identical to MaxInt64/MinInt64 on
+			// 64-bit, and the representable extremes (so the file still
+			// compiles) on 32-bit platforms.
+			[]int{0, 1, -1, math.MaxInt, math.MinInt},
+			[]fpInt{0, 1, -1, math.MaxInt, math.MinInt}},
 		{"float", `{"type":"array","items":"float"}`,
 			[]float32{0, 1, -1, math.MaxFloat32, float32(math.Inf(1)), float32(math.NaN())},
 			[]fpFloat32{0, 1, -1, math.MaxFloat32, fpFloat32(math.Inf(1)), fpFloat32(math.NaN())}},

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -34,10 +35,22 @@ type SchemaNode struct {
 	Type        string // Avro type or named type reference
 	LogicalType string // e.g. date, timestamp-millis, decimal, uuid; empty if none
 
-	Name      string   // name for record, enum, fixed
-	Namespace string   // namespace for named types
-	Aliases   []string // alternate names for named types (record, enum, fixed)
-	Doc       string   // documentation string
+	Name string // name for record, enum, fixed
+
+	// Namespace is the named type's RESOLVED namespace. [Schema.Root]
+	// populates it for every named type: a child that inherits its
+	// enclosing namespace surfaces that namespace here, and "" always
+	// means the null namespace, never "inherit from the parent". When
+	// constructing a SchemaNode by hand, set Namespace explicitly or
+	// leave "" for the null namespace — [SchemaNode.Schema] emits a
+	// "namespace":"" escape when a null-namespace type sits inside a
+	// namespaced scope, so the distinction survives the round trip.
+	// A dotted Name carries its own namespace and takes precedence
+	// over this field.
+	Namespace string
+
+	Aliases []string // alternate names for named types (record, enum, fixed)
+	Doc     string   // documentation string
 
 	Fields   []SchemaField // record fields
 	Items    *SchemaNode   // array element schema
@@ -109,8 +122,10 @@ type SchemaField struct {
 // encoding and decoding. Returns an error if the node is invalid.
 //
 // Named types (record, enum, fixed) that appear multiple times in the
-// tree are automatically deduplicated: the first occurrence emits the
-// full definition and subsequent occurrences emit a name reference.
+// tree are automatically deduplicated, matched by FULLNAME: the first
+// occurrence emits the full definition and subsequent occurrences emit
+// the fullname as a reference. Two types sharing a short name across
+// namespaces are distinct and both emit full definitions.
 func (n *SchemaNode) Schema() (*Schema, error) {
 	d := &deduper{
 		defined: make(map[string]string),
@@ -149,7 +164,7 @@ func (s *Schema) Root() SchemaNode {
 	if err != nil {
 		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
 	}
-	n := nodeFromJSON(raw)
+	n := nodeFromJSON(raw, "")
 	fixupNameRefDefaults(&n)
 	return n
 }
@@ -158,7 +173,7 @@ func (s *Schema) Root() SchemaNode {
 // occurrence of a named type (record, enum, fixed) emits the full
 // definition; subsequent occurrences emit the name as a reference.
 func (n *SchemaNode) toJSONDedup(d *deduper) any {
-	return n.toJSONWalk(d.visited, d)
+	return n.toJSONWalk(d.visited, d, "")
 }
 
 // jsonSerializableValue returns v with three Avro-JSON-specific shape
@@ -278,7 +293,7 @@ func applyJSONFixup(v any) any {
 // are detected and emitted as the cyclic node's name (for named types)
 // or nil (for unnamed).
 func (n *SchemaNode) toJSON() any {
-	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil)
+	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "")
 }
 
 // toJSONWalk is the cycle-aware walker shared by toJSON and toJSONDedup.
@@ -286,17 +301,22 @@ func (n *SchemaNode) toJSON() any {
 // via Items / Values pointers terminate — see
 // TestRegression_SchemaNodeToJSONCycleSafe for the invariant. When d is
 // non-nil it tracks named-type definitions and reports conflicting
-// redefinitions; when nil it just emits the JSON tree.
-func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) any {
+// redefinitions; when nil it just emits the JSON tree. enclosingNS is
+// the namespace scope at this node's position: named types emit their
+// namespace relative to it (omitted when inherited; "namespace":"" when
+// a null-namespace type sits inside a namespaced scope — Java's
+// Name.writeName escape), and name references emit the fullname so they
+// re-bind position-independently.
+func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string) any {
 	if _, cycle := visited[n]; cycle {
 		// Cycle through Items/Values back to n. Named types emit the
-		// name as a reference (the canonical Avro recursive-schema
+		// fullname as a reference (the canonical Avro recursive-schema
 		// shape). Unnamed cycles are an error in the dedup walker and
 		// return nil-stable JSON in the bare walker (snapshot/equality
 		// comparison stays meaningful: two equal cyclic subtrees
 		// produce the same partial JSON).
 		if isNamedKind(n.Type) && n.Name != "" {
-			return n.Name
+			return nodeFullname(n)
 		}
 		if d != nil && d.err == nil {
 			d.err = fmt.Errorf("avro: cyclic SchemaNode detected")
@@ -308,15 +328,28 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 
 	// Dedup: named types that have already been emitted become name refs;
 	// a redefinition with a different body is reported as a conflict.
+	// Keyed by the FULLNAME — equality of names is defined on the
+	// fullname (spec, "Names"), so two distinct types sharing a short
+	// name across namespaces are not redefinitions of each other. The
+	// reference is the fullname too: a dotted reference re-binds exactly
+	// anywhere, and a null-namespace type's bare fullname re-binds via
+	// the parser's null-namespace fallback. (A bare reference from
+	// inside a namespaced scope that ALSO collides with an in-scope
+	// short name re-binds in-scope — the same inherent reference
+	// ambiguity Java's getQualified/Names.get pair has; references have
+	// no "namespace":"" escape syntax.)
 	if d != nil && isNamedKind(n.Type) && n.Name != "" {
-		if prev, exists := d.defined[n.Name]; exists {
+		if prev, exists := d.defined[nodeFullname(n)]; exists {
 			cur, _ := json.Marshal(n.toJSON())
 			if string(cur) != prev && d.err == nil {
-				d.err = fmt.Errorf("avro: conflicting definitions for named type %q", truncForError(n.Name))
+				d.err = fmt.Errorf("avro: conflicting definitions for named type %q", truncForError(nodeFullname(n)))
 			}
-			return n.Name
+			return nodeFullname(n)
 		}
 	}
+
+	// The namespace scope inside this node: a named type opens its own.
+	childNS := nsForChildren(n, enclosingNS)
 
 	switch n.Type {
 	case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
@@ -326,7 +359,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 	case "union":
 		branches := make([]any, len(n.Branches))
 		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSONWalk(visited, d)
+			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS)
 		}
 		return branches
 	}
@@ -342,7 +375,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 	if d != nil {
 		if isNamedKind(n.Type) && n.Name != "" {
 			b, _ := json.Marshal(n.toJSON())
-			d.defined[n.Name] = string(b)
+			d.defined[nodeFullname(n)] = string(b)
 		}
 	}
 
@@ -350,7 +383,24 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 	if n.Name != "" {
 		m["name"] = n.Name
 	}
-	if n.Namespace != "" {
+	if isNamedKind(n.Type) && n.Name != "" && !strings.Contains(n.Name, ".") {
+		// Emit the namespace relative to the enclosing scope, mirroring
+		// Java's Name.writeName: omit when equal (re-parse inherits it),
+		// "namespace":"" to escape inheritance for a null-namespace type
+		// inside a namespaced scope, the value otherwise. A dotted Name
+		// carries its own namespace, so no attribute is emitted for it
+		// (the spec ignores the attribute when the name is dotted).
+		switch eff := n.Namespace; {
+		case eff == enclosingNS:
+			// inherited (or both null): omit
+		case eff == "":
+			m["namespace"] = ""
+		default:
+			m["namespace"] = eff
+		}
+	} else if n.Namespace != "" && !isNamedKind(n.Type) {
+		// Unnamed node with a namespace attribute set by hand: preserve
+		// as-written (the parser ignores it; fidelity only).
 		m["namespace"] = n.Namespace
 	}
 	if len(n.Aliases) > 0 {
@@ -387,10 +437,10 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 		m["symbols"] = n.Symbols
 	}
 	if n.Items != nil {
-		m["items"] = n.Items.toJSONWalk(visited, d)
+		m["items"] = n.Items.toJSONWalk(visited, d, childNS)
 	}
 	if n.Values != nil {
-		m["values"] = n.Values.toJSONWalk(visited, d)
+		m["values"] = n.Values.toJSONWalk(visited, d, childNS)
 	}
 	// record.fields is a required attribute per the Avro spec (Complex
 	// Types > Records: "fields: a JSON array, listing fields (required)"),
@@ -400,7 +450,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 		for i, f := range n.Fields {
 			fd := map[string]any{
 				"name": f.Name,
-				"type": f.Type.toJSONWalk(visited, d),
+				"type": f.Type.toJSONWalk(visited, d, childNS),
 			}
 			if f.HasDefault || f.Default != nil {
 				// jsonSerializableValue converts ±Inf — which a Root()
@@ -432,19 +482,21 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper) an
 	return m
 }
 
-// nodeFromJSON converts a parsed JSON value into a SchemaNode.
-func nodeFromJSON(v any) SchemaNode {
+// nodeFromJSON converts a parsed JSON value into a SchemaNode. parentNS
+// is the enclosing namespace scope; named types without an explicit
+// "namespace" attribute resolve into it (see [SchemaNode].Namespace).
+func nodeFromJSON(v any, parentNS string) SchemaNode {
 	switch s := v.(type) {
 	case string:
 		return SchemaNode{Type: s}
 	case []any:
 		branches := make([]SchemaNode, len(s))
 		for i, b := range s {
-			branches[i] = nodeFromJSON(b)
+			branches[i] = nodeFromJSON(b, parentNS)
 		}
 		return SchemaNode{Type: "union", Branches: branches}
 	case map[string]any:
-		return nodeFromJSONObject(s)
+		return nodeFromJSONObject(s, parentNS)
 	default:
 		return SchemaNode{}
 	}
@@ -478,6 +530,16 @@ func jsonNumericInt(v any) (int, bool) {
 	case json.Number:
 		if i, err := t.Int64(); err == nil {
 			return int(i), true
+		}
+	case string:
+		// The Avro [INTEGERS] rule allows a quoted-string size (e.g.
+		// "size":"16"), accepted at parse via laxInt; the metadata tree
+		// must read it too, or Root().Size returns 0 and Root().Schema()
+		// round-trips to "missing size".
+		if len(t) <= maxLaxIntDataLen {
+			if i, err := strconv.Atoi(t); err == nil {
+				return i, true
+			}
 		}
 	}
 	return 0, false
@@ -518,14 +580,17 @@ func getCIStringSlice(m map[string]any, key string, dst *[]string) {
 	}
 }
 
-// lookupCI looks up key k in m, matching case-insensitively. Mirrors
-// encoding/json's struct field matching so schemas with non-canonical
-// casing ("tYpe" instead of "type") round-trip through Root/Schema.
-// When multiple keys collide case-insensitively (e.g. both "tYpe" and
-// "TYpe"), the smallest by Unicode code-point wins so the result is
-// deterministic — bare `for k := range m` was non-deterministic per
-// Go's randomized map iteration, which made Root() return different
-// branches on different calls for the same parsed Schema.
+// lookupCI looks up key k in m, matching case-insensitively, so schemas
+// with non-canonical casing ("tYpe" instead of "type") round-trip through
+// Root/Schema. An EXACT-case match wins first (the common path). When no
+// exact match exists but multiple keys collide case-insensitively (e.g.
+// both "tYpe" and "TYpe", with no plain "type"), the smallest by Unicode
+// code-point wins — a deterministic tie-break for that malformed input
+// (Avro keys are case-sensitive per spec, so two case-variants of one key
+// are already non-conformant). This differs from a struct-decode's
+// document-order resolution on that degenerate case, but is deterministic
+// where a bare `for k := range m` was not — Go's randomized map iteration
+// otherwise made Root() return different branches on different calls.
 func lookupCI(m map[string]any, key string) (any, bool) {
 	if v, ok := m[key]; ok {
 		return v, true
@@ -610,18 +675,19 @@ func isNamedKind(typ string) bool {
 //
 // Non-numeric / non-string defaults and non-handled types pass through
 // unchanged.
-func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode) any {
+func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode, ns string) any {
 	if t == nil {
 		return val
 	}
 	// Name-ref resolution: when the caller passes a non-nil name-table
 	// and t.Type is a bare name-reference (e.g. "Inner"), resolve to
-	// the actual named SchemaNode and recurse. table == nil means the
-	// caller is doing best-effort inline coercion only — used by the
-	// synchronous call during nodeFromJSON construction where the full
-	// tree (and therefore the name-table) isn't available yet.
-	if resolved := lookupNameRef(t, table); resolved != nil {
-		return coerceMetadataDefault(val, resolved, table)
+	// the actual named SchemaNode and recurse — inside the TARGET's own
+	// namespace scope. table == nil means the caller is doing
+	// best-effort inline coercion only — used by the synchronous call
+	// during nodeFromJSON construction where the full tree (and
+	// therefore the name-table) isn't available yet.
+	if resolved := lookupNameRef(t, table, ns); resolved != nil {
+		return coerceMetadataDefault(val, resolved, table, nodeEffNS(resolved))
 	}
 	if t.Type == "union" {
 		// Best-effort first pass (table == nil): name-referenced branches
@@ -644,8 +710,8 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 		// would diverge for ["string","float"] with default "1.5":
 		// wire picks string (first accept), but a transform-based
 		// helper would pick float because string→string is a no-op.
-		if branch := firstMetadataBranchAcceptingDefault(t, val, table); branch != nil {
-			return coerceMetadataDefault(val, branch, table)
+		if branch := firstMetadataBranchAcceptingDefault(t, val, table, ns); branch != nil {
+			return coerceMetadataDefault(val, branch, table, nsForChildren(branch, ns))
 		}
 		return val
 	}
@@ -743,12 +809,13 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 	}
 	if isRecordKind(t.Type) {
 		if m, ok := val.(map[string]any); ok {
+			childNS := nsForChildren(t, ns)
 			out := make(map[string]any, len(m))
 			for k, v := range m {
 				inner := v
 				for i := range t.Fields {
 					if t.Fields[i].Name == k {
-						inner = coerceMetadataDefault(v, &t.Fields[i].Type, table)
+						inner = coerceMetadataDefault(v, &t.Fields[i].Type, table, childNS)
 						break
 					}
 				}
@@ -762,7 +829,7 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 		if a, ok := val.([]any); ok {
 			out := make([]any, len(a))
 			for i, v := range a {
-				out[i] = coerceMetadataDefault(v, t.Items, table)
+				out[i] = coerceMetadataDefault(v, t.Items, table, ns)
 			}
 			return out
 		}
@@ -772,7 +839,7 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 		if m, ok := val.(map[string]any); ok {
 			out := make(map[string]any, len(m))
 			for k, v := range m {
-				out[k] = coerceMetadataDefault(v, t.Values, table)
+				out[k] = coerceMetadataDefault(v, t.Values, table, ns)
 			}
 			return out
 		}
@@ -781,11 +848,46 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode)
 	return val
 }
 
-// lookupNameRef returns the named target of t if t.Type is a bare
-// name-reference (not a structural or primitive kind) AND table has it,
-// else nil. A nil table always returns nil (synchronous-build callers
-// disable name-ref resolution because the tree isn't fully walked yet).
-func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode) *SchemaNode {
+// nodeEffNS returns n's effective namespace: a dotted Name carries its
+// own namespace (taking precedence per the spec); otherwise Namespace,
+// which is already resolved ("" means the null namespace).
+func nodeEffNS(n *SchemaNode) string {
+	if i := strings.LastIndexByte(n.Name, '.'); i >= 0 {
+		return n.Name[:i]
+	}
+	return n.Namespace
+}
+
+// nodeFullname returns n's fullname: the dotted Name verbatim, or the
+// resolved namespace joined with the name.
+func nodeFullname(n *SchemaNode) string {
+	if strings.Contains(n.Name, ".") {
+		return n.Name
+	}
+	if n.Namespace != "" {
+		return n.Namespace + "." + n.Name
+	}
+	return n.Name
+}
+
+// nsForChildren returns the namespace scope in effect inside n: a named
+// type opens its own scope; unnamed nodes pass the enclosing scope
+// through.
+func nsForChildren(n *SchemaNode, enclosing string) string {
+	if n != nil && n.Name != "" {
+		return nodeEffNS(n)
+	}
+	return enclosing
+}
+
+// lookupNameRef returns the named target of t if t.Type is a name
+// reference (not a structural or primitive kind) AND table has it, else
+// nil. A nil table always returns nil (synchronous-build callers disable
+// name-ref resolution because the tree isn't fully walked yet). ns is
+// the enclosing namespace scope at the reference site; the key order
+// comes from scopedRefKeys (schema.go) so the metadata binding cannot
+// drift from the wire's.
+func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *SchemaNode {
 	if t == nil || table == nil {
 		return nil
 	}
@@ -800,7 +902,13 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode) *SchemaNode {
 		"bytes", "string", "record", "error", "enum", "fixed", "array", "map", "union":
 		return nil
 	}
-	return table[t.Type]
+	var keys [2]string
+	for _, k := range scopedRefKeys(&keys, t.Type, ns) {
+		if r, ok := table[k]; ok {
+			return r
+		}
+	}
+	return nil
 }
 
 // fixupNameRefDefaults walks the SchemaNode tree once to populate a
@@ -810,63 +918,63 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode) *SchemaNode {
 // way inline-typed siblings already do via the synchronous coerce.
 func fixupNameRefDefaults(root *SchemaNode) {
 	table := map[string]*SchemaNode{}
-	collectNamedTypes(root, "", table)
+	collectNamedTypes(root, table)
 	if len(table) == 0 {
 		return
 	}
-	coerceTreeDefaults(root, table)
+	coerceTreeDefaults(root, table, "")
 }
 
-func collectNamedTypes(n *SchemaNode, parentNS string, table map[string]*SchemaNode) {
+func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {
 	if n == nil {
 		return
 	}
 	if n.Name != "" { // record / enum / fixed
-		ns := n.Namespace
-		if ns == "" {
-			ns = parentNS
-		}
-		full := n.Name
-		if ns != "" {
-			full = ns + "." + n.Name
-		}
-		table[full] = n
-		table[n.Name] = n // unqualified fallback, matches schema-build lookup
-		parentNS = ns
+		// Namespace is resolved at construction (see [SchemaNode]), so
+		// the fullname is direct — no inheritance walk needed here.
+		// Register exactly what the wire builder registers: every type
+		// under its fullname ONLY. A null-namespace type's fullname IS
+		// its bare name, so it owns the bare key; also registering
+		// namespaced types under their short name would make the bare
+		// key last-walked-wins, binding a bare reference at
+		// null-namespace scope to a different type than the wire bound
+		// whenever short names collide.
+		table[nodeFullname(n)] = n
 	}
 	if n.Items != nil {
-		collectNamedTypes(n.Items, parentNS, table)
+		collectNamedTypes(n.Items, table)
 	}
 	if n.Values != nil {
-		collectNamedTypes(n.Values, parentNS, table)
+		collectNamedTypes(n.Values, table)
 	}
 	for i := range n.Fields {
-		collectNamedTypes(&n.Fields[i].Type, parentNS, table)
+		collectNamedTypes(&n.Fields[i].Type, table)
 	}
 	for i := range n.Branches {
-		collectNamedTypes(&n.Branches[i], parentNS, table)
+		collectNamedTypes(&n.Branches[i], table)
 	}
 }
 
-func coerceTreeDefaults(n *SchemaNode, table map[string]*SchemaNode) {
+func coerceTreeDefaults(n *SchemaNode, table map[string]*SchemaNode, ns string) {
 	if n == nil {
 		return
 	}
+	childNS := nsForChildren(n, ns)
 	for i := range n.Fields {
 		f := &n.Fields[i]
 		if f.HasDefault {
-			f.Default = coerceMetadataDefault(f.Default, &f.Type, table)
+			f.Default = coerceMetadataDefault(f.Default, &f.Type, table, childNS)
 		}
-		coerceTreeDefaults(&f.Type, table)
+		coerceTreeDefaults(&f.Type, table, childNS)
 	}
 	if n.Items != nil {
-		coerceTreeDefaults(n.Items, table)
+		coerceTreeDefaults(n.Items, table, childNS)
 	}
 	if n.Values != nil {
-		coerceTreeDefaults(n.Values, table)
+		coerceTreeDefaults(n.Values, table, childNS)
 	}
 	for i := range n.Branches {
-		coerceTreeDefaults(&n.Branches[i], table)
+		coerceTreeDefaults(&n.Branches[i], table, childNS)
 	}
 }
 
@@ -930,10 +1038,10 @@ func defaultMatchesBytesOrFixedKind(t *SchemaNode, val any) bool {
 // branch (type-only) while the wire path picks the second (Java parity);
 // users type-switching on Default see a Go type that contradicts the
 // wire-decoded auto-fill.
-func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) bool {
+func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, ns string) bool {
 	// Resolve a bare name-reference if the caller supplied a name-table.
-	if resolved := lookupNameRef(t, table); resolved != nil {
-		return branchAcceptsDefault(resolved, val, table)
+	if resolved := lookupNameRef(t, table, ns); resolved != nil {
+		return branchAcceptsDefault(resolved, val, table, nodeEffNS(resolved))
 	}
 	switch t.Type {
 	case "null":
@@ -978,6 +1086,7 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) 
 		if !ok {
 			return false
 		}
+		childNS := nsForChildren(t, ns)
 		for i := range t.Fields {
 			f := &t.Fields[i]
 			fv, present := m[f.Name]
@@ -987,7 +1096,7 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) 
 				}
 				continue
 			}
-			if !branchAcceptsDefault(&f.Type, fv, table) {
+			if !branchAcceptsDefault(&f.Type, fv, table, childNS) {
 				return false
 			}
 		}
@@ -1001,7 +1110,7 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) 
 			return true
 		}
 		for _, item := range arr {
-			if !branchAcceptsDefault(t.Items, item, table) {
+			if !branchAcceptsDefault(t.Items, item, table, ns) {
 				return false
 			}
 		}
@@ -1015,13 +1124,13 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) 
 			return true
 		}
 		for _, v := range m {
-			if !branchAcceptsDefault(t.Values, v, table) {
+			if !branchAcceptsDefault(t.Values, v, table, ns) {
 				return false
 			}
 		}
 		return true
 	case "union":
-		return firstMetadataBranchAcceptingDefault(t, val, table) != nil
+		return firstMetadataBranchAcceptingDefault(t, val, table, ns) != nil
 	}
 	return false
 }
@@ -1038,25 +1147,48 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode) 
 // Shared by [coerceMetadataDefault] (returns the resolved branch so
 // the coerce step recurses against it) and [branchAcceptsDefault]'s
 // union arm (returns nil/non-nil for the accept predicate).
-func firstMetadataBranchAcceptingDefault(t *SchemaNode, val any, table map[string]*SchemaNode) *SchemaNode {
+func firstMetadataBranchAcceptingDefault(t *SchemaNode, val any, table map[string]*SchemaNode, ns string) *SchemaNode {
 	for i := range t.Branches {
 		branch := &t.Branches[i]
-		if resolved := lookupNameRef(branch, table); resolved != nil {
+		if resolved := lookupNameRef(branch, table, ns); resolved != nil {
 			branch = resolved
 		}
-		if branchAcceptsDefault(branch, val, table) {
+		if branchAcceptsDefault(branch, val, table, nsForChildren(branch, ns)) {
 			return branch
 		}
 	}
 	return nil
 }
 
-func nodeFromJSONObject(m map[string]any) SchemaNode {
+func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 	n := SchemaNode{}
 
 	getCIString(m, "type", &n.Type)
 	getCIString(m, "name", &n.Name)
-	getCIString(m, "namespace", &n.Namespace)
+	// Namespace resolves at build: an explicit attribute wins (including
+	// the explicit-empty "namespace":"" null-namespace form — a DIFFERENT
+	// type than one inheriting the enclosing namespace, per the spec's
+	// fullname rules); an undotted named type without the attribute
+	// inherits the enclosing scope. A dotted name carries its own
+	// namespace; any attribute alongside it is preserved as-written for
+	// fidelity but ignored, exactly as the parser ignores it.
+	explicitNS, hasExplicitNS := "", false
+	if v, ok := lookupCI(m, "namespace"); ok {
+		if s, ok := v.(string); ok {
+			explicitNS, hasExplicitNS = s, true
+		}
+	}
+	switch {
+	case n.Name != "" && !strings.Contains(n.Name, "."):
+		if hasExplicitNS {
+			n.Namespace = explicitNS
+		} else {
+			n.Namespace = parentNS
+		}
+	case hasExplicitNS:
+		n.Namespace = explicitNS
+	}
+	childNS := nsForChildren(&n, parentNS)
 	getCIString(m, "doc", &n.Doc)
 	getCIString(m, "logicalType", &n.LogicalType)
 	// precision/scale/size are int per spec. After
@@ -1076,11 +1208,11 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 	}
 
 	if items, ok := lookupCI(m, "items"); ok {
-		node := nodeFromJSON(items)
+		node := nodeFromJSON(items, childNS)
 		n.Items = &node
 	}
 	if values, ok := lookupCI(m, "values"); ok {
-		node := nodeFromJSON(values)
+		node := nodeFromJSON(values, childNS)
 		n.Values = &node
 	}
 
@@ -1092,7 +1224,7 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 				sf := SchemaField{}
 				getCIString(fm, "name", &sf.Name)
 				if t, ok := lookupCI(fm, "type"); ok {
-					sf.Type = nodeFromJSON(t)
+					sf.Type = nodeFromJSON(t, childNS)
 				}
 				if d, ok := lookupCI(fm, "default"); ok {
 					// Coerce string defaults to typed float64 for
@@ -1107,7 +1239,7 @@ func nodeFromJSONObject(m map[string]any) SchemaNode {
 					// re-coerces with a populated table to resolve
 					// name-references that aren't visible during this
 					// per-field construction.
-					sf.Default = coerceMetadataDefault(d, &sf.Type, nil)
+					sf.Default = coerceMetadataDefault(d, &sf.Type, nil, "")
 					sf.HasDefault = true
 				}
 				getCIString(fm, "doc", &sf.Doc)

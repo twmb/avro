@@ -195,6 +195,14 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 	}
 	cfg := parseOpts(opts)
 	sl := slabPool.Get().(*slab)
+	// A record field filled from its schema default routes through the
+	// binary deser fn (applyFieldDefault), which reads the slab's
+	// taggedUnions / tagLogicalTypes flags — so set them here exactly as
+	// Schema.Decode does. Without this, a present union field wraps in its
+	// {branch: value} envelope but a default-filled one emits the bare
+	// value, a JSON-vs-binary and intra-call inconsistency on the option.
+	sl.taggedUnions = cfg.tagged
+	sl.tagLogicalTypes = cfg.tagLogical
 	ctx := &jsonDecoder{
 		scanner:        &jsonScanner{data: src},
 		slab:           sl,
@@ -283,7 +291,15 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	// bypassed for unions; unionTypeNameForValue / isNilValue inside
 	// appendAvroJSONUnion peel internally for the branch-selection decision.
 	if node.kind == "union" {
-		return appendAvroJSONUnion(buf, v, node, cfg, custom, depth+1)
+		// Pass depth unchanged: appendAvroJSONUnion is a same-level
+		// dispatch hop (a function split, not a schema-nesting level),
+		// and it recurses into branches at depth+1. Incrementing here
+		// too would make a union cost 2 depth units per level — halving
+		// the effective bound vs binary encode / decode / parse, which
+		// all count 1 per level (see ser.go's serUnion). That asymmetry
+		// breaks JSON round-trips for values decode accepts but encode
+		// then rejects.
+		return appendAvroJSONUnion(buf, v, node, cfg, custom, depth)
 	}
 	// Apply custom type encode conversion BEFORE dereferencing, so a
 	// custom type with a pointer GoType (e.g. *url.URL) matches before
@@ -736,7 +752,8 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		return append(buf, '}'), nil
 
 	case "record":
-		return appendAvroJSONRecord(buf, v, node, cfg, custom, depth+1)
+		// depth unchanged: same-level dispatch hop (see the union case).
+		return appendAvroJSONRecord(buf, v, node, cfg, custom, depth)
 
 	// "union" is dispatched before the peel loop above (un-peeled value).
 
@@ -1002,7 +1019,7 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			}
 			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
-			fv := v.FieldByIndex(mapping.indices[i])
+			fv := fieldByIndexZero(v, mapping.indices[i])
 			// Honor omitzero: mirrors ser.go's slow-path check
 			// at the binary site so a value-typed zero-value
 			// null-union field renders as JSON `null` rather
@@ -1195,12 +1212,26 @@ func unionBranchName(node *schemaNode) string {
 }
 
 // unionBranchNames returns the standard and logical branch names for a
-// union branch node. The logical name includes the logical type qualifier
-// (e.g. "long.timestamp-millis") when present, otherwise it equals the
-// standard name.
+// union branch node. The logical name carries the "<kind>.<logicalType>"
+// qualifier (e.g. "long.timestamp-millis") ONLY for a primitive-backed
+// logical type — a branch whose standard name is its kind. A NAMED type
+// that carries a logical type (the only case being a fixed with uuid /
+// decimal / duration) keeps its declared name as both the standard and
+// logical name; the qualifier is never appended and the name is never
+// dropped. This matches both reference implementations that produce
+// tagged-union JSON envelopes: linkedin/goavro keys the envelope by the
+// branch codec's typeName.fullName (a named fixed's codec keeps the
+// fixed's name — makeDecimalFixedCodec only swaps the conversion
+// functions, and goavro does not recognize uuid/duration so it strips the
+// logicalType to a plain named fixed), and Apache Avro's JsonEncoder uses
+// the branch schema's getFullName() (ValidatingGrammarGenerator labels a
+// union alternative with b.getFullName()). Both therefore emit the fixed's
+// name, not "fixed.<logicalType>".
 func unionBranchNames(node *schemaNode) (standard, logical string) {
 	standard = unionBranchName(node)
-	if node.logical != "" {
+	// standard != node.kind exactly when the branch is a named type
+	// (record/enum/fixed), whose name supersedes any logical qualifier.
+	if node.logical != "" && standard == node.kind {
 		logical = node.kind + "." + node.logical
 	} else {
 		logical = standard

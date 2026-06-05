@@ -58,14 +58,21 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 	s.soe = reader.soe
 	// SOE wire bytes carry the writer's fingerprint per the Avro spec
 	// (the schema that produced the wire IS the writer). Storing
-	// writer.soe lets DecodeSingleObject match wire bearing either the
-	// writer's fingerprint (the primary case — writer-produced bytes
-	// resolved into reader-shaped Go) or the reader's fingerprint (the
-	// degenerate AppendSingleObject-on-resolved-then-decode case). Java's
-	// BinaryMessageDecoder dispatches the wire fingerprint into a
-	// resolved (writer→reader) codec via a fingerprint registry; twmb's
-	// single-schema model bakes the equivalent dispatch into the resolved
-	// Schema's own check.
+	// writer.soe lets DecodeSingleObject accept writer-produced bytes
+	// and resolve them into reader-shaped Go. Java's BinaryMessageDecoder
+	// dispatches the wire fingerprint into a resolved (writer→reader)
+	// codec via a fingerprint registry; twmb's single-schema model bakes
+	// the equivalent dispatch into the resolved Schema's own check.
+	//
+	// The resolved Schema also accepts the reader's fingerprint, but the
+	// payload after it must still be WRITER-shaped: a resolved Schema
+	// decodes via the resolving s.deser, which consumes writer bytes.
+	// Feeding back reader.AppendSingleObject output (reader-shaped) is
+	// therefore NOT a supported round-trip — it errors on dropped writer
+	// fields or silently default-fills added ones, the same way feeding
+	// reader-shaped JSON to a resolved DecodeJSON does (see the resolved
+	// DecodeJSON divergence note). Use the reader schema directly for
+	// reader-shaped data.
 	s.writerSoe = writer.soe
 	return s, nil
 }
@@ -489,14 +496,20 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 			}
 			continue
 		}
-		fv := fieldByIndex(v, mapping.indices[op.readerIdx])
+		fv, ferr := fieldByIndex(v, mapping.indices[op.readerIdx])
+		if ferr != nil {
+			return nil, recordFieldError(t, rr.readerNames[op.readerIdx], ferr)
+		}
 		if src, err = op.read(src, fv, sl); err != nil {
 			return nil, recordFieldError(t, rr.readerNames[op.readerIdx], err)
 		}
 	}
 
 	for _, d := range rr.defaults {
-		fv := fieldByIndex(v, mapping.indices[d.readerIdx])
+		fv, ferr := fieldByIndex(v, mapping.indices[d.readerIdx])
+		if ferr != nil {
+			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], ferr)
+		}
 		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), fv, sl); err != nil {
 			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], err)
 		}

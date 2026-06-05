@@ -284,6 +284,18 @@ func readNullUnionIndex(src []byte, valIdx int, nullByte, valByte byte) (bool, [
 // wire-format bytes for the null and value branches.
 func deserNullUnionAt(u *deserUnion, valIdx int, nullByte, valByte byte) deserfn {
 	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+		// The union is a schema node and costs one depth unit, exactly
+		// like the general deserUnion.deser and like the encode side
+		// (serNullUnionAt passes its branch at depth+1). Without this
+		// bump a ["null", Self] linked list would decode ~2x deeper than
+		// it (or another impl) can encode/JSON-decode — a round-trip
+		// break. The bump scopes to this union node only; the inner
+		// branch's own node self-bumps when entered.
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
+		defer func() { sl.depth-- }()
 		isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
 		if err != nil {
 			return nil, err

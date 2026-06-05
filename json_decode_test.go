@@ -2251,3 +2251,52 @@ func TestDecodeJSONMapTimeValues(t *testing.T) {
 		}
 	})
 }
+
+// DecodeJSON must honor TaggedUnions / TagLogicalTypes for a union field
+// that is FILLED FROM ITS DEFAULT (absent in the input) exactly as it does
+// for a present union field — and exactly as Schema.Decode (binary),
+// resolved DecodeJSON, and EncodeJSON already do. The default-fill path
+// routes through the binary deser fn, which reads the slab's taggedUnions
+// flag; DecodeJSON populated only the jsonDecoder's wrapUnions field and
+// left the slab flag at the pool default, so the envelope was dropped on
+// default-filled fields only.
+func TestRegression_DecodeJSONTaggedUnionDefaultFill(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":["null","string"],"default":"hello"},
+		{"name":"g","type":"int"}]}`)
+
+	t.Run("present field wraps", func(t *testing.T) {
+		var out map[string]any
+		if err := s.DecodeJSON([]byte(`{"f":{"string":"world"},"g":1}`), &out, TaggedUnions()); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got, ok := out["f"].(map[string]any); !ok || got["string"] != "world" {
+			t.Fatalf("present union field: got %#v, want {\"string\":\"world\"}", out["f"])
+		}
+	})
+	t.Run("default-filled field wraps", func(t *testing.T) {
+		var out map[string]any
+		if err := s.DecodeJSON([]byte(`{"g":1}`), &out, TaggedUnions()); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got, ok := out["f"].(map[string]any)
+		if !ok || got["string"] != "hello" {
+			t.Fatalf("default-filled union field: got %#v (%T), want {\"string\":\"hello\"}", out["f"], out["f"])
+		}
+	})
+
+	// TagLogicalTypes: a default-filled logical union field tags with the
+	// qualified name, not the bare logical string.
+	sl := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"t","type":["null",{"type":"long","logicalType":"timestamp-millis"}],"default":null},
+		{"name":"g","type":"int"}]}`)
+	t.Run("logical present field tags", func(t *testing.T) {
+		var out map[string]any
+		if err := sl.DecodeJSON([]byte(`{"t":{"long.timestamp-millis":0},"g":1}`), &out, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if _, ok := out["t"].(map[string]any)["long.timestamp-millis"]; !ok {
+			t.Fatalf("present logical union: got %#v", out["t"])
+		}
+	})
+}

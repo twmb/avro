@@ -806,3 +806,27 @@ func TestSchemaNodeUnmarshalablePropsErrors(t *testing.T) {
 		t.Fatal("expected error for unmarshalable Props value")
 	}
 }
+
+// A fixed with a quoted-string size ("16", the spec [INTEGERS] form) must
+// surface Size in the metadata tree and round-trip through Root().Schema().
+// jsonNumericInt previously handled only numeric forms, so Root().Size was
+// 0 and Root().Schema() failed "fixed is missing size" (a Pattern-13b
+// metadata bug: Parse accepted the quoted size but no test read it back).
+func TestRegression_RootQuotedFixedSize(t *testing.T) {
+	for _, schema := range []string{
+		`{"type":"fixed","name":"F","size":"16"}`,
+		`{"type":"fixed","name":"F","size":"016"}`,
+		`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"fixed","name":"G","size":"4"}}]}`,
+	} {
+		s := MustParse(schema)
+		node := s.Root()
+		rt, err := node.Schema()
+		if err != nil {
+			t.Errorf("%s: Root().Schema(): %v", schema, err)
+			continue
+		}
+		if string(s.Canonical()) != string(rt.Canonical()) {
+			t.Errorf("%s: canonical changed across Root().Schema():\n %s\n %s", schema, s.Canonical(), rt.Canonical())
+		}
+	}
+}

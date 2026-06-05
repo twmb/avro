@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/json"
 	"errors"
@@ -2711,5 +2712,157 @@ func TestRegression_JSONDecodeStringTextUnmarshaler(t *testing.T) {
 	}
 	if string(v) != "UNTEXT:hello" {
 		t.Fatalf("got %q, want %q; JSON decoder skipped TextUnmarshaler", string(v), "UNTEXT:hello")
+	}
+}
+
+// A nil pointer field with ,omitzero whose element type implements
+// IsZero() (e.g. *time.Time) must encode as the null branch, not panic.
+// valueIsZero must not call the promoted IsZero() on a nil pointer (the
+// value-receiver method dereferences nil). Covers the slow, unsafe, and
+// JSON encode paths, which all route zero-checks through valueIsZero.
+func TestRegression_OmitzeroNilPointerIsZero(t *testing.T) {
+	type R struct {
+		T *time.Time `avro:"t,omitzero"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"t","type":["null",{"type":"long","logicalType":"timestamp-millis"}],"default":null}]}`)
+	v := R{T: nil}
+
+	// unsafe (addressable) + slow (non-addressable) + JSON encode paths.
+	wireAddr, err := s.AppendEncode(nil, &v)
+	if err != nil {
+		t.Fatalf("encode &v (unsafe path): %v", err)
+	}
+	wireVal, err := s.AppendEncode(nil, v)
+	if err != nil {
+		t.Fatalf("encode v (reflect path): %v", err)
+	}
+	if !bytes.Equal(wireAddr, wireVal) {
+		t.Errorf("unsafe vs reflect wire differ: % x vs % x", wireAddr, wireVal)
+	}
+	if _, err := s.EncodeJSON(&v); err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	// The null branch is index 0 → single 0x00 byte.
+	if len(wireAddr) != 1 || wireAddr[0] != 0x00 {
+		t.Errorf("nil omitzero field: got wire % x, want 00 (null branch)", wireAddr)
+	}
+	// A non-nil pointer to a zero time still takes the null branch (the
+	// pre-existing correct behavior).
+	var zero time.Time
+	w2, err := s.AppendEncode(nil, R{T: &zero})
+	if err != nil {
+		t.Fatalf("encode non-nil zero time: %v", err)
+	}
+	if len(w2) != 1 || w2[0] != 0x00 {
+		t.Errorf("non-nil zero time omitzero: got % x, want 00", w2)
+	}
+}
+
+type EmbeddedInner struct {
+	A int32 `avro:"a"`
+}
+
+type withNilEmbedPtr struct {
+	*EmbeddedInner
+	C int32 `avro:"c"`
+}
+
+type unexportedInner struct {
+	A int32 `avro:"a"`
+}
+
+type withUnexportedEmbedPtr struct {
+	*unexportedInner
+	C int32 `avro:"c"`
+}
+
+// A nil anonymous embedded *struct must not panic on encode: its promoted
+// fields encode as zero (symmetric with decode allocating the embedded
+// pointer). Decode into a struct whose embedded pointer is named via an
+// UNEXPORTED type must error cleanly, not panic (Go reflection cannot
+// allocate/set through an unexported embedded pointer).
+func TestRegression_EmbeddedPointerStructNoPanic(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"c","type":"int"}]}`)
+
+	t.Run("nil embedded encode zero-fills", func(t *testing.T) {
+		v := withNilEmbedPtr{C: 3}
+		// unsafe (addressable), reflect (value), and JSON encode paths.
+		wAddr, err := s.AppendEncode(nil, &v)
+		if err != nil {
+			t.Fatalf("encode &v: %v", err)
+		}
+		wVal, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatalf("encode v: %v", err)
+		}
+		if !bytes.Equal(wAddr, wVal) {
+			t.Errorf("unsafe vs reflect: % x vs % x", wAddr, wVal)
+		}
+		if _, err := s.EncodeJSON(&v); err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		// a=0 (zero-filled), c=3 → zig-zag 0x00, 0x06.
+		var got withNilEmbedPtr
+		if _, err := s.Decode(wAddr, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.EmbeddedInner == nil || got.A != 0 || got.C != 3 {
+			t.Errorf("round-trip: got %+v (A via embed=%v)", got, got.EmbeddedInner)
+		}
+	})
+
+	t.Run("unexported embedded decode errors cleanly", func(t *testing.T) {
+		wire, err := s.AppendEncode(nil, &withNilEmbedPtr{EmbeddedInner: &EmbeddedInner{A: 7}, C: 3})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got withUnexportedEmbedPtr
+		_, err = s.Decode(wire, &got) // must error, not panic
+		if err == nil {
+			t.Fatal("expected clean error decoding into unexported embedded pointer; got nil")
+		}
+	})
+}
+
+// A multi-pointer field (**T / **Record) mapped to ["null", T] holding
+// &(*T)(nil) — a non-nil outer pointer wrapping a nil inner — is
+// nil-equivalent per isNilValue, so it must encode as the null branch.
+// The unsafe struct fast-path enter peeled only the outer pointer and
+// committed to the value branch (then faulted on the nil inner), diverging
+// from the reflect path (which emits null) and from JSON. Such fields now
+// decline to the reflect path.
+func TestRegression_UnsafeMultiPtrNullUnionNil(t *testing.T) {
+	type Inner struct {
+		X int32 `avro:"x"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"p","type":["null","int"]},
+		{"name":"r","type":["null",{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}]}]}`)
+	type R struct {
+		P **int32 `avro:"p"`
+		Rr **Inner `avro:"r"`
+	}
+	nilInt := (*int32)(nil)
+	nilRec := (*Inner)(nil)
+	v := R{P: &nilInt, Rr: &nilRec} // &(*T)(nil) for both
+
+	wAddr, err := s.AppendEncode(nil, &v) // unsafe (addressable)
+	if err != nil {
+		t.Fatalf("encode &v (unsafe): %v", err)
+	}
+	wVal, err := s.AppendEncode(nil, v) // reflect (non-addressable)
+	if err != nil {
+		t.Fatalf("encode v (reflect): %v", err)
+	}
+	if !bytes.Equal(wAddr, wVal) {
+		t.Errorf("unsafe vs reflect diverge: % x vs % x", wAddr, wVal)
+	}
+	// Both null → two 0x00 bytes.
+	if len(wAddr) != 2 || wAddr[0] != 0x00 || wAddr[1] != 0x00 {
+		t.Errorf("got wire % x, want 00 00 (both null branches)", wAddr)
+	}
+	if _, err := s.EncodeJSON(&v); err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
 	}
 }
