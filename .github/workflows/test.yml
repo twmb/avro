@@ -20,9 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
 
@@ -77,16 +77,16 @@ jobs:
   differential:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
       - run: pip install fastavro
       - name: fastavro differential
-        run: go test -count=1 -run 'TestDifferentialFastavro|TestDifferentialMatrix|TestApacheSchemaTestsVectors' -v .
+        run: go test -count=1 -run 'TestDifferentialFastavro|TestDifferentialMatrix|TestDifferentialAcceptance|TestApacheSchemaTestsVectors' -v .
 
   # CI-only Java differential (heavy: JVM + avro-tools fat jar). Cross-checks
   # twmb's Parsing Canonical Form + Rabin fingerprint against the reference
@@ -98,11 +98,11 @@ jobs:
     env:
       AVRO_TOOLS_VERSION: "1.12.0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -135,4 +135,4 @@ jobs:
       - name: Java matrix differential
         env:
           AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
-        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaMatrix' .
+        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaMatrix|TestDifferentialJavaAcceptance' .
