@@ -72,6 +72,11 @@ def handle(job):
         buf = io.BytesIO(bytes.fromhex(job["hex"]))
         fastavro.schemaless_reader(buf, schema)
         return {"ok": True}
+    if op == "parse":
+        # Schema-acceptance probe: _parse already ran above; reaching here
+        # means fastavro accepted the schema. (A rejection surfaces as the
+        # handler's exception -> {"ok": false}.)
+        return {"ok": True}
     if op == "rt":
         # Round-trip THROUGH fastavro: decode twmb's bytes, re-encode the
         # decoded value, return fastavro's bytes. Byte equality means both

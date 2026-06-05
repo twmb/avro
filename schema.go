@@ -2322,6 +2322,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			o.Size != nil {
 			return errors.New("invalid record has schema for other types")
 		}
+		// The fields attribute is required (Java: "Record has no fields"),
+		// while an EMPTY array is the legal empty record. Same
+		// missing-vs-empty discrimination as enum symbols: the parser
+		// materializes "fields":[] as a non-nil empty slice and leaves
+		// the attribute's absence as nil.
+		if o.Fields == nil {
+			return errors.New("record is missing fields")
+		}
 
 		// Create record ser/deser and register early so
 		// self-referencing fields (e.g. array items, map values)

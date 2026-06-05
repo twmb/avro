@@ -208,13 +208,15 @@ func TestSchemaNodeEmptyRecordNested(t *testing.T) {
 
 // TestSchemaNodeCanonicalIdempotent verifies that Canonical() is a
 // fixed point: parsing the canonical form and re-canonicalizing must
-// produce byte-identical output. This is especially important for
-// empty records where the parser accepts the lenient form but the
-// emitter must produce the strict form.
+// produce byte-identical output.
+//
+// A record MISSING the fields attribute is not in this table: fields is
+// required (Java: "Record has no fields") and Parse rejects its absence —
+// the empty record is spelled "fields":[]. The rejection is pinned by the
+// record-missing-fields mutants in TestMatrix_AcceptanceMutantsRejectLocally.
 func TestSchemaNodeCanonicalIdempotent(t *testing.T) {
 	inputs := []string{
 		`{"type":"record","name":"Empty","fields":[]}`,
-		`{"type":"record","name":"Empty"}`, // lenient, missing fields
 		`{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"type":"record","name":"I","fields":[]}}]}`,
 		`{"type":"array","items":{"type":"record","name":"E","fields":[]}}`,
 		`{"type":"map","values":{"type":"record","name":"E","fields":[]}}`,

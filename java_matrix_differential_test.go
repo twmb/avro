@@ -205,3 +205,25 @@ func TestDifferentialJavaMatrixRecursion(t *testing.T) {
 		}
 	}
 }
+
+// TestDifferentialJavaAcceptance: schema-ACCEPTANCE parity with the Java
+// reference over every composed cell and every structurally-broken mutant.
+// Java enforces the full mutator set (missing fields/symbols/size/name,
+// duplicates, nested unions, negative sizes, empty field names), so unlike
+// the fastavro twin nothing is scoped out. The bare-schema oracle command
+// doubles as the parse probe: OK means Java parsed it, ERR means rejected.
+func TestDifferentialJavaAcceptance(t *testing.T) {
+	_, fpCanon := startMatrixJavaOracle(t)
+	for _, cell := range acceptanceCells() {
+		ok, _, _, errMsg := fpCanon(t, cell)
+		if !ok {
+			t.Fatalf("Java rejected a schema twmb accepts: %s\n%s", errMsg, cell)
+		}
+		for _, m := range schemaMutants(cell) {
+			ok, _, _, _ := fpCanon(t, m.schema)
+			if ok {
+				t.Errorf("Java accepted mutant %s that twmb rejects:\n%s", m.label, m.schema)
+			}
+		}
+	}
+}
