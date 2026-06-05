@@ -1548,12 +1548,20 @@ func TestFingerprintNamespaceExpansion(t *testing.T) {
 // Schema Parsing
 // -----------------------------------------------------------------------
 
-func TestHambaEmptyEnumSymbolsRejected(t *testing.T) {
-	// hamba/avro #295 area: enum with no symbols should be rejected.
-	// The Avro spec requires at least one symbol.
-	_, err := avro.Parse(`{"type":"enum","name":"E","symbols":[]}`)
-	if err == nil {
-		t.Fatal("expected error for enum with empty symbols list")
+func TestHambaEmptyEnumSymbolsAccepted(t *testing.T) {
+	// hamba/avro #295 area: hamba rejects an enum with an empty symbols
+	// list; Java (EnumSchema's constructor validates per-symbol only),
+	// fastavro, and avro-rs all accept it, and the spec requires only
+	// "a JSON array, listing symbols" with no minimum count. twmb sides
+	// with the references: the schema parses, and every encode/decode of
+	// the enum errors (no valid ordinal exists). Full coverage in
+	// TestRegression_EmptyEnumParses.
+	s, err := avro.Parse(`{"type":"enum","name":"E","symbols":[]}`)
+	if err != nil {
+		t.Fatalf("empty enum symbols should parse (Java/fastavro/avro-rs parity): %v", err)
+	}
+	if _, err := s.AppendEncode(nil, "A"); err == nil {
+		t.Fatal("encoding against an empty enum must error")
 	}
 }
 
@@ -10970,15 +10978,19 @@ func TestParity_SchemaRejectionMatrix(t *testing.T) {
 		{"decimal fixed-precision exceeds fixed size capacity", `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":20,"scale":2}`, ""},
 
 		// ── fixed size invariants ───────────────────────────────────
+		// NOTE: size 0 is ACCEPTED (spec: "an integer"; Java/fastavro/
+		// avro-rs all parse it) — pinned in TestRegression_FixedSizeZero*.
 		{"fixed without size", `{"type":"fixed","name":"F"}`, "size"},
-		{"fixed size zero", `{"type":"fixed","name":"F","size":0}`, "size"},
 		{"fixed size negative", `{"type":"fixed","name":"F","size":-1}`, "size"},
 		{"fixed without name", `{"type":"fixed","size":4}`, "name"},
 
 		// ── enum invariants ─────────────────────────────────────────
+		// NOTE: an EMPTY symbols array is ACCEPTED (Java/fastavro/avro-rs
+		// parse it; no value can encode/decode) — pinned in
+		// TestRegression_EmptyEnumParses. A MISSING symbols attribute
+		// still rejects (required attribute, Java "Enum has no symbols").
 		{"enum without name", `{"type":"enum","symbols":["A"]}`, "name"},
-		{"enum without symbols", `{"type":"enum","name":"E"}`, ""},
-		{"enum empty symbols", `{"type":"enum","name":"E","symbols":[]}`, ""},
+		{"enum without symbols", `{"type":"enum","name":"E"}`, "symbols"},
 		{"enum duplicate symbols", `{"type":"enum","name":"E","symbols":["A","B","A"]}`, "duplicate"},
 		{"enum default not in symbols", `{"type":"enum","name":"E","symbols":["A","B"],"default":"Z"}`, ""},
 		{"enum symbol starts with digit", `{"type":"enum","name":"E","symbols":["1A","B"]}`, ""},
@@ -11018,7 +11030,9 @@ func TestParity_SchemaRejectionMatrix(t *testing.T) {
 		// rejection case today; pending decision.
 
 		// ── union rules ─────────────────────────────────────────────
-		{"empty union", `[]`, ""},
+		// NOTE: the EMPTY union `[]` is ACCEPTED (Java's UnionSchema
+		// constructor, fastavro, and avro-rs all parse it; no value can
+		// encode/decode) — pinned in TestRegression_EmptyUnionParses.
 		{"union with two ints", `["int","int"]`, "duplicate"},
 		{"union with two longs", `["long","long"]`, "duplicate"},
 		{"union with two strings", `["string","string"]`, "duplicate"},

@@ -72,6 +72,24 @@ def handle(job):
         buf = io.BytesIO(bytes.fromhex(job["hex"]))
         fastavro.schemaless_reader(buf, schema)
         return {"ok": True}
+    if op == "rt":
+        # Round-trip THROUGH fastavro: decode twmb's bytes, re-encode the
+        # decoded value, return fastavro's bytes. Byte equality means both
+        # implementations agree these bytes are THE encoding of the value —
+        # no cross-language value comparison needed, and it catches
+        # symmetric encode+decode bugs a single-impl round trip cannot.
+        buf = io.BytesIO(bytes.fromhex(job["hex"]))
+        value = fastavro.schemaless_reader(buf, schema)
+        out = io.BytesIO()
+        fastavro.schemaless_writer(out, schema, value)
+        return {"ok": True, "hex": out.getvalue().hex()}
+    if op == "canonical":
+        # Parsing Canonical Form per fastavro (Java-validated rules); the
+        # caller compares against twmb's Canonical() for fingerprint parity
+        # on arbitrary composed schemas, not just the vendored vectors.
+        from fastavro.schema import to_parsing_canonical_form
+
+        return {"ok": True, "canonical": to_parsing_canonical_form(json.loads(json.dumps(job["schema"])))}
     return {"ok": False, "err": "unknown op %r" % op}
 
 

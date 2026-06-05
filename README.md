@@ -4,10 +4,14 @@
 
 Encode and decode [Avro](https://avro.apache.org/docs/current/specification/) binary data.
 
-Parse an Avro JSON schema, then encode and decode Go values directly — no
-code generation required. Supports all primitive and complex types, logical
-types, schema evolution, Object Container Files, Single Object Encoding, and
-fingerprinting.
+This project aims to be the "best" Avro encoder/decoder in the Go ecosystem by:
+* Keeping the API tight but comprehensive
+* Combining features that exist in only one of linkedin/goavro or hamba/avro
+* Being safe above all, while being fast with `unsafe` specialization functions internally
+* Running round after round of AI audits to shake out _any_ bug / DoS / huge alloc that exists
+* Being documented thoroughly for both human and AI users
+
+For the "why" of this project, see the [Why](#why) section.
 
 ## Index
 
@@ -20,11 +24,15 @@ fingerprinting.
 - [Schema Evolution](#schema-evolution)
 - [Schema Cache](#schema-cache)
 - [Custom Types](#custom-types)
+- [Type name constants](#type-name-constants)
 - [Object Container Files](#object-container-files)
 - [JSON Encoding](#json-encoding)
 - [Single Object Encoding](#single-object-encoding)
 - [Fingerprinting](#fingerprinting)
+- [Errors](#errors)
 - [Performance](#performance)
+- [Encode/decode behavior contract](#encodedecode-behavior-contract)
+- [Why](#why)
 
 ## Quick Start
 
@@ -53,13 +61,11 @@ type User struct {
 }
 
 func main() {
-	// Encode
 	data, err := schema.Encode(&User{Name: "Alice", Age: 30})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Decode
 	var u User
 	_, err = schema.Decode(data, &u)
 	if err != nil {
@@ -69,54 +75,41 @@ func main() {
 }
 ```
 
-`Parse` accepts options: pass `WithLaxNames()` to allow non-standard characters
-in type and field names (useful for interop with schemas from other languages).
-
 ## Type Mapping
 
-The table below shows which Go types can be used with each Avro type.
+All types can decode into `any`.
 
 | Avro Type | Encode | Decode |
 |-----------|--------|--------|
-| null      | `any` (nil) | `any` |
-| boolean   | `bool` | `bool`, `any` |
-| int, long | `int`, `int8`–`int64`, `uint`–`uint64`, `float64`, `json.Number` | `int`, `int8`–`int64`, `uint`–`uint64`, `any` |
-| float     | `float32`, `float64`, `json.Number` | `float32`, `float64`, `any` |
-| double    | `float64`, `float32`, `json.Number` | `float64`, `float32`, `any` |
-| string    | `string`, `[]byte`, `encoding.TextAppender`, `encoding.TextMarshaler` | `string`, `[]byte`, `encoding.TextUnmarshaler`, `any` |
-| bytes     | `[]byte`, `string` | `[]byte`, `string`, `any` |
-| enum      | `string`, any integer type (ordinal) | `string`, any integer type (ordinal), `any` |
-| fixed     | `[N]byte`, `[]byte` | `[N]byte`, `[]byte`, `any` |
-| array     | slice | slice, `any` |
-| map       | `map[string]T` | `map[string]T`, `any` |
-| union     | `any`, `*T`, or the matched branch type | `any`, `*T`, or the matched branch type |
-| record    | struct, `map[string]any` | struct, `map[string]any`, `any` |
+| null      | anything nillable | zeroes the target |
+| boolean   | `bool` | `bool` |
+| int, long, float, double | `numeric` † | `numeric` † |
+| string    | `string []byte TextAppender TextMarshaler` | `string []byte TextUnmarshaler` |
+| bytes     | `bytes-like` | `bytes-like` ‡ |
+| enum      | `string integer TextAppender TextMarshaler` | `string integer TextUnmarshaler` |
+| fixed     | `bytes-like` ‡ | `bytes-like` ‡ |
+| array     | slice or `[N]array` | slice or `[N]array` ‡ |
+| map       | `map[string]T` | `map[string]T` |
+| union     | `*T`, tagged-union map, or the matched branch | `*T` or the matched branch |
+| record    | struct or `map[string]any` | struct or `map[string]any` |
 
-When decoding into `any`, values use their natural Go types: `nil`, `bool`,
-`int32`, `int64`, `float32`, `float64`, `string`, `[]byte`, `[]any`,
-`map[string]any`. Logical types use `time.Time` (UTC) for timestamps and
-dates, `time.Duration` for time-of-day types, `*big.Rat` for decimals,
-and `avro.Duration` for the duration logical type.
+Shorthands used above:
+`numeric` = `int int8–int64 uint uint8–uint64 float32 float64 json.Number`.
+`integer` = `int int8–int64 uint uint8–uint64`.
+`bytes-like` = `[]byte [N]byte string`.
+`TextAppender` / `TextMarshaler` / `TextUnmarshaler` are the standard `encoding` interfaces.
 
-Encoding also accepts `json.Number` for any numeric type (supporting
-`json.Decoder.UseNumber()` pipelines) and `[]byte` for string fields (and
-vice versa).
+† Numeric types accept any `numeric` Go type, but coercion has precision rules —
+  whole-number/range checks into integers, silent IEEE rounding into floats. See
+  [Encode/decode behavior contract](#encodedecode-behavior-contract).
+‡ Length must match: decoding bytes into `[N]byte`, or encoding/decoding any value
+  as fixed, requires the byte length to equal N; `[N]array` requires exactly N elements.
 
-A null union branch decodes to the target's Go zero value, always replacing
-any prior value. Use `*T` to distinguish null from zero.
-
-The reader schema is the user's contract for precision. When the reader
-schema is lossy (`float`, `double`), encode and decode both silently
-IEEE-round to the destination's representable range, and an out-of-range
-finite input becomes ±Inf on the wire. When the reader schema is exact
-(`int`, `long`, `bytes`, `string`), decode requires the Go target to
-represent the wire value without loss; values outside the target's range
-or values the target can't represent exactly — for example, an Avro `long`
-value above `2^53` decoded into Go `float64`, or `long` `2^33` decoded
-into Go `int32` — return an error rather than silently wrapping or
-rounding. Users who need exact round-trip of large integers should pair
-a `long` reader schema with an `int64` target rather than relying on a
-float to round.
+Decoding into `any` yields the natural Go type — `int32`/`int64` for int/long,
+`float32`/`float64` for float/double, `[]any` for arrays, `map[string]any` for maps
+and records; logical types use the Go types in [Logical Types](#logical-types). A
+null (e.g. a union's null branch) decodes to the target's zero value, replacing any
+prior contents — use `*T` to tell null from zero.
 
 ## Struct Tags
 
@@ -610,6 +603,9 @@ jsonBytes, err = schema.EncodeJSON(&user, avro.TaggedUnions())
 // {"name":"Alice","email":{"string":"a@b.com"}}
 ```
 
+The tagged form is the Avro JSON spec's representation and what Java and other Avro
+tools require; the bare default is plainer JSON for non-Avro consumers.
+
 `DecodeJSON` accepts both formats (tagged and bare unions) and all NaN/Infinity
 conventions:
 
@@ -698,86 +694,41 @@ as input is a Go shape the decoder accepts as a target, and an encode→decode
 round-trip through the same Go type yields the same value. The cases below are
 deliberate exceptions.
 
-### Lossy by design
+### Round-trips that lose data
 
-- **`time.Time` → `time-millis` / `time-micros`**: the encoder extracts the
-  wall-clock time-of-day fields (hours, minutes, seconds, sub-second nanos)
-  and discards the date + zone — the wire format can't carry them. Round-trip
-  preserves time-of-day only; the decoded `time.Time` sits at the Unix epoch
-  with the original time-of-day.
-- **`time.Time` → `date`**: the encoder takes the UTC date (year, month, day)
-  and discards the time-of-day + zone. Round-trip preserves the date only.
+- **`time.Time` → `time-millis` / `time-micros`** keeps only the time-of-day;
+  date and zone are dropped. The decoded `time.Time` sits at the Unix epoch with
+  the original time-of-day. Use `timestamp-*` to keep the full instant.
+- **`time.Time` → `date`** keeps only the UTC date; time-of-day and zone are dropped.
+- **`big-decimal` trailing-zero scale** isn't preserved — scale is derived per
+  value, and `big.Rat` can't carry the distinction.
 
-### Spec / interop choices
+### Numbers
 
-- **Writer-union schema resolution fails eagerly.** Every branch must
-  resolve at `Resolve` / `CheckCompatibility` time. Java defers per-branch
-  errors to decode; resolving against twmb-published schemas surfaces
-  incompatibilities at config-load time instead.
-- **`NaN` / `±Infinity` emit as JSON-quoted strings** (`"NaN"`,
-  `"Infinity"`, `"-Infinity"`) by default — valid RFC 8259. Java emits
-  bare tokens (RFC-invalid). Bare tokens are accepted on decode. Pass
-  `LinkedinFloats` for the goavro `null` / `1e999` / `-1e999` convention.
-- **`DecodeJSON` fills schema-declared defaults for absent record fields.**
-  Java rejects missing fields; twmb mirrors the binary-side defaulting
-  behavior so JSON input can omit fields with defaults.
-- **`local-timestamp-*` encodes wall-clock fields as if UTC**, matching
-  Java and fastavro. Decoded values are UTC `time.Time`.
-- **OCF Snappy CRC is verified on read.** fastavro silently discards; twmb
-  fails fast on integrity errors.
-- **Big-decimal canonical scale.** The encoder emits canonical
-  `(unscaled, scale)`. Java preserves trailing-zero scale via its
-  `BigDecimal` carrier; `big.Rat` can't represent the distinction, so
-  trailing-zero scale does not round-trip.
-- **Decimal JSON decode accepts both the spec form** (codepoint-mapped
-  string) **and the bare-number form**. Java accepts only the spec form;
-  the bare-number form is accepted for goavro and LinkedIn interop.
-  Encode emits only the spec form.
-- **Non-canonical multi-byte varint indices are accepted for null-union
-  branches** (e.g. `0x80 0x00` for index 0), matching Java.
-- **Union dispatch is type-based, not value-based.** The encoder routes
-  by the value's static Go type, not its runtime magnitude: `int`,
-  `int64`, `uint`, `uint32`, `uint64` all select the `"long"` branch of
-  a union, never `"int"`, even when the value fits `int32`. So
-  `["int","long"]` with value `int(42)` emits `"long"`. To force `"int"`,
-  pass `int32(value)` or use the tagged-map wrapper
-  `map[string]any{"int": value}`. The type-based rule keeps wire size
-  deterministic per Go type — value-aware dispatch would mean the same
-  Go field encodes differently across calls depending on runtime value.
-- **Precision: the reader schema decides.**
-  - Lossy reader schema (`float` / `double`): encode and decode both
-    silently IEEE-round. `s.AppendEncode(int64(9007199254740993),
-    "double")` succeeds and emits the float64 rounding. Matches Java
-    and fastavro.
-  - Exact reader schema (`int` / `long` / `bytes` / `string`): decoding
-    into a lossy Go target is allowed only when the wire value fits
-    exactly. `s.Decode(longWire, &f float64)` against a `"long"` schema
-    errors when the wire value exceeds float64's mantissa.
+- **Precision follows the reader schema.** A `float`/`double` schema rounds
+  silently into a Go float (overflowing to ±Inf on encode), but decoding one into
+  a Go *integer* still requires a whole number in range. An `int`/`long` schema
+  never loses precision silently — decoding into a Go type that can't hold the
+  value exactly errors. For exact large-integer round-trips keep the schema `long`
+  with an `int64` target; evolving to `double` opts into rounding.
+- **Union branch is chosen by the Go type, not the value.** A Go `int` always
+  selects a union's `long` branch, never `int`, even when the value would fit —
+  dispatch keys off the static type, keeping wire size deterministic. Force the
+  `int` branch with an `int32` value or `map[string]any{"int": v}`.
+- **Encoding a `json.Number` into an `int`/`long` works even in fractional or
+  exponent form, as long as the value is whole** — `json.Number("9.5e17")`
+  succeeds (it's exactly 950000000000000000). Caveat: the same literal as a schema
+  *default* (`"default":9.5e17`) won't load in Java; use the plain integer form if
+  you publish schemas to Java consumers.
 
-  For exact large-integer round-trip, keep the schema as `"long"`.
-  Evolving to `"double"` opts into silent IEEE rounding.
-- **`json.Number` in fractional or exponent form is accepted against
-  integer schemas when the value is exact.**
-  `s.AppendEncode(json.Number("9.5e17"), "long")` succeeds — the literal
-  is an exact int64. The JSON encoder emits the integer-decimal form.
+## Why
 
-  Interop caveat: a schema with an exponent-form integer default like
-  `{"type":"long","default":9.5e17}` parses in twmb but is rejected by
-  Java, which treats `.` / `e` literals as non-integral. The schema
-  text is preserved verbatim, so a twmb-published schema with this
-  shape will not load in a Java consumer. Use integer-literal defaults
-  (`"default":950000000000000000`) for Java compatibility.
+I had efficient encode-side code lying around for two years. I'd written it one
+way, started rewriting it another, got most of the way through, and decided it
+wasn't worth the effort — hamba/avro was around by then and really good, so I
+stopped.
 
-### Decoder leniencies without a symmetric encoder shape
-
-- **`TaggedUnions` on `DecodeJSON` wraps non-null union values** as
-  `map[string]any{branchName: value}` when the decode target is `*any`.
-  `EncodeJSON` accepts both wrapped and bare input, so an encode→decode
-  round-trip into `*any` produces the wrapped form even when the input
-  was bare. See the `TaggedUnions` option for details.
-- **The schema parser accepts `{"type":"Node"}` as an alternate spelling**
-  of the bare `"Node"` name reference, matching Java. The encoder emits
-  only the bare form; the decoder accepts either.
-- **Top-level union into a typed-map target** (e.g. `*map[string]any`
-  against `["null","float"]`) is rejected by both binary and JSON paths —
-  the target type can't represent a union. Use `*any` instead.
+When I started using LLMs in January 2026, I figured I'd touch up all the old
+projects I had lying around. Did it for this one — and coincidentally, hamba/avro
+got archived right around then. I wanted one library that did it all: hamba/avro
+missed things linkedin/goavro had, and vice versa. Here we are.

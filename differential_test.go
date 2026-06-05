@@ -52,10 +52,11 @@ type oracleJob struct {
 }
 
 type oracleResp struct {
-	OK    bool   `json:"ok"`
-	Hex   string `json:"hex"`
-	Err   string `json:"err"`
-	Fatal string `json:"fatal"`
+	OK        bool   `json:"ok"`
+	Hex       string `json:"hex"`
+	Canonical string `json:"canonical"`
+	Err       string `json:"err"`
+	Fatal     string `json:"fatal"`
 }
 
 type oracle struct {

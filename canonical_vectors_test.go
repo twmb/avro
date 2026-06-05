@@ -71,14 +71,7 @@ func parseApacheSchemaTests(raw string) []schemaTestVec {
 // is verified to STILL diverge (Parse must still fail / differ); a stale entry
 // — twmb starting to agree with the oracle — fails the test so it gets removed
 // and the case re-enabled. Keep this list short and every entry justified.
-var schemaTestKnownDivergences = map[string]string{
-	// An empty union has no branches: it can encode no value and a decode
-	// reads a branch index that is always out of range. Apache Avro parses
-	// it (canonical "[]"); twmb rejects it at parse time, consistent with its
-	// documented eager-fail stance. Surfaced by this oracle; left as a
-	// maintainer policy decision (see CORRECTNESS_PLAN.md counterexamples).
-	"[  ]": "twmb rejects the empty union (encodes/decodes nothing); Apache parses to canonical []",
-}
+var schemaTestKnownDivergences = map[string]string{}
 
 // TestApacheSchemaTestsVectors runs the ENTIRE official Apache Avro
 // schema-tests.txt cross-implementation oracle (vendored at

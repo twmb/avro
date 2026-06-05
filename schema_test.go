@@ -341,6 +341,13 @@ func TestParseFixedStringSizeINTEGERS(t *testing.T) {
 			"string size with leading zeros",
 			`{"type":"fixed","name":"F","size":"016"}`,
 		},
+		{
+			// Size 0 is legal (spec: "an integer"; Java rejects only
+			// negatives) — in quoted form it flows through the same
+			// laxInt path as any other quoted size.
+			"string size zero",
+			`{"type":"fixed","name":"F","size":"0"}`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -362,7 +369,6 @@ func TestParseFixedStringSizeINTEGERS(t *testing.T) {
 		{"non-numeric string", `{"type":"fixed","name":"F","size":"abc"}`},
 		{"empty string", `{"type":"fixed","name":"F","size":""}`},
 		{"negative string", `{"type":"fixed","name":"F","size":"-1"}`},
-		{"zero string", `{"type":"fixed","name":"F","size":"0"}`},
 	}
 	for _, tt := range errTests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -690,12 +696,10 @@ func TestParseFlatFieldFormatErrors(t *testing.T) {
 				{"name":"E","type":"enum"}
 			]}`,
 		},
-		{
-			"flat enum empty symbols",
-			`{"type":"record","name":"R","fields":[
-				{"name":"E","type":"enum","symbols":[]}
-			]}`,
-		},
+		// NOTE: flat-form `{"name":"E","type":"enum","symbols":[]}` is no
+		// longer an error: an empty symbols ARRAY is a legal enum (the
+		// flat-form lift composes with TestRegression_EmptyEnumParses'
+		// acceptance). A flat enum MISSING symbols stays an error above.
 		{
 			"flat array no items",
 			`{"type":"record","name":"R","fields":[
@@ -1496,7 +1500,8 @@ func TestSchemaValidationErrors(t *testing.T) {
 		// expected-error table; names and symbols stay strictly validated.)
 		{"empty field name", `{"type":"record","name":"R","fields":[{"name":"","type":"int"}]}`},
 		{"invalid field name", `{"type":"record","name":"R","fields":[{"name":"bad-field!","type":"int"}]}`},
-		{"empty enum symbols", `{"type":"enum","name":"E","symbols":[]}`},
+		// (an EMPTY symbols array is legal — TestRegression_EmptyEnumParses;
+		// a missing symbols attribute still errors, covered elsewhere.)
 		{"invalid enum symbol", `{"type":"enum","name":"E","symbols":["bad-sym!"]}`},
 		{"enum default not in symbols", `{"type":"enum","name":"E","symbols":["A","B"],"default":"C"}`},
 	}

@@ -126,7 +126,13 @@ type SchemaField struct {
 // occurrence emits the full definition and subsequent occurrences emit
 // the fullname as a reference. Two types sharing a short name across
 // namespaces are distinct and both emit full definitions.
-func (n *SchemaNode) Schema() (*Schema, error) {
+//
+// opts are passed through to the internal [Parse]: a schema originally
+// parsed with [SchemaOpt]s that change what Parse accepts or wires —
+// [WithLaxNames] for non-standard names, [CustomType] registrations —
+// needs the same opts here, or the rebuilt schema fails to parse (lax
+// names) or silently lacks the custom wiring.
+func (n *SchemaNode) Schema(opts ...SchemaOpt) (*Schema, error) {
 	d := &deduper{
 		defined: make(map[string]string),
 		visited: make(map[*SchemaNode]struct{}),
@@ -139,7 +145,7 @@ func (n *SchemaNode) Schema() (*Schema, error) {
 	if err != nil {
 		return nil, fmt.Errorf("avro: marshaling schema node: %w", err)
 	}
-	return Parse(string(b))
+	return Parse(string(b), opts...)
 }
 
 // deduper tracks named type definitions during toJSONDedup and records
@@ -421,7 +427,12 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	if n.Scale != 0 {
 		m["scale"] = n.Scale
 	}
-	if n.Size != 0 {
+	// fixed.size is a required attribute and 0 is a legal size, so for
+	// fixed types it is always emitted — omitting a zero value would make
+	// the re-emitted schema unparseable ("fixed is missing size").
+	if n.Type == "fixed" {
+		m["size"] = n.Size
+	} else if n.Size != 0 {
 		m["size"] = n.Size
 	}
 	// enum.symbols is a required attribute per the Avro spec (Complex
@@ -1072,13 +1083,13 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, 
 		// string arm accepts any string regardless of symbol membership,
 		// so a union [enum:{A,B}, bytes] with default "Z" would
 		// metadata-match enum (type-only) while wire rejects enum and
-		// picks bytes. The len(t.Symbols)>0 guard mirrors the wire side
-		// and tolerates a fwd-ref'd enum whose Symbols haven't been
-		// populated yet during synchronous construction.
-		if len(t.Symbols) > 0 && !slices.Contains(t.Symbols, sym) {
-			return false
-		}
-		return true
+		// picks bytes. Membership is unconditional, mirroring the wire
+		// side: an empty enum accepts no default, so the union walk must
+		// fall through to a later branch exactly as the wire side does
+		// (a name-referenced enum branch reaches here only after
+		// lookupNameRef resolution, with its symbols final; the
+		// table-nil construction pass defers union selection entirely).
+		return slices.Contains(t.Symbols, sym)
 	case "bytes", "fixed":
 		return defaultMatchesBytesOrFixedKind(t, val)
 	case "record", "error":

@@ -332,7 +332,20 @@ var errClosed = errors.New("ocf: operation on a closed OCF")
 const defaultBlockBytes = 64 << 10 // 64 KiB
 
 func (w *Writer) shouldFlush() bool {
-	return (w.maxCount > 0 && w.count >= w.maxCount) || len(w.buf) >= w.maxBytes
+	// The third clause keeps every written block within the Reader's
+	// zero-byte bounds: readBlock rejects count > len(block)+
+	// maxOCFZeroByteSlack, and Decode caps a CONSECUTIVE zero-byte run at
+	// the same slack (both strict >). Datums that encode to ≥1 byte keep
+	// count ≤ len(buf), so this clause fires only when zero-byte datums
+	// (top-level "null", all-null records, size-0 fixed) accumulate —
+	// without it they never grow the buffer, the byte-driven flush never
+	// triggers, and the whole file lands in one block the Reader rejects.
+	// Flushing at equality is exact: each datum raises count by 1 and the
+	// buffer by ≥0, so the boundary cannot be jumped, and a block sealed
+	// at count == len+slack passes both reader checks.
+	return (w.maxCount > 0 && w.count >= w.maxCount) ||
+		len(w.buf) >= w.maxBytes ||
+		w.count >= len(w.buf)+maxOCFZeroByteSlack
 }
 
 // Schema returns the schema used by this Writer.
@@ -435,7 +448,10 @@ func (w *Writer) writeHeader() error {
 }
 
 // Encode serializes v and appends it to the current block. The block is
-// flushed automatically when it hits the count or byte limit.
+// flushed automatically when it hits the count or byte limit, or when a
+// run of zero-byte datums reaches the Reader's per-block bound (so files
+// of zero-byte datums — "null", all-null records, size-0 fixed — are
+// always readable back).
 //
 // A value error (v does not fit the schema) discards the failed datum
 // and leaves the Writer usable: the datum was only ever appended to the

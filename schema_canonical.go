@@ -48,7 +48,9 @@ func appendCanonSchema(dst []byte, s *aschema) []byte {
 		return appendCanonString(dst, s.primitive)
 	case s.object != nil:
 		return appendCanonObject(dst, s.object)
-	case len(s.union) > 0:
+	case s.union != nil:
+		// Non-nil discriminates union-ness so a zero-branch union emits
+		// `[]` rather than falling into the default arm.
 		dst = append(dst, '[')
 		for i := range s.union {
 			if i > 0 {

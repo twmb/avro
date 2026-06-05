@@ -414,7 +414,7 @@ func rewriteCanonFirstOcc(s aschema, ns string, defs map[string]*aobject, shortC
 			seen[o.Name] = struct{}{}
 		}
 		return aschema{object: rewriteCanonObj(o, ns, defs, shortCount, shortToFull, seen)}
-	case len(s.union) != 0:
+	case s.union != nil:
 		out := make([]aschema, len(s.union))
 		for i := range s.union {
 			out[i] = rewriteCanonFirstOcc(s.union[i], ns, defs, shortCount, shortToFull, seen)
@@ -1360,7 +1360,10 @@ func (s *aschema) unionTypeName() (string, string, error) {
 	if s.primitive != "" {
 		return s.primitive, "", nil
 	}
-	if len(s.union) > 0 {
+	// Non-nil (even when empty) means the JSON was an array: a nested
+	// union, which a union may not immediately contain (Java: "Nested
+	// union" fires for any union-typed member, zero branches included).
+	if s.union != nil {
 		return "union", "", errors.New("unions cannot immediately contain other unions")
 	}
 	if isNamedKind(s.object.Type) {
@@ -1376,7 +1379,11 @@ func (e *unknownPrimitiveError) Error() string {
 }
 
 func (b *builder) build(parentName string, s *aschema) error {
-	if s == nil || s.primitive == "" && s.object == nil && len(s.union) == 0 {
+	// Discriminate union-ness by non-nil, not length: `[]` parses to a
+	// non-nil zero-branch union (legal — Java's UnionSchema constructor,
+	// fastavro, and avro-rs all accept it; no value can ever encode or
+	// decode against it, but the schema itself is well-formed).
+	if s == nil || s.primitive == "" && s.object == nil && s.union == nil {
 		return errors.New("schema is not a primitive, complex, nor union")
 	}
 	if b.depth >= maxDepth {
@@ -1389,7 +1396,7 @@ func (b *builder) build(parentName string, s *aschema) error {
 	switch {
 	case s.primitive != "":
 		err = b.buildPrimitive(parentName, s)
-	case len(s.union) != 0:
+	case s.union != nil:
 		err = b.buildUnion(parentName, s)
 	default:
 		err = b.buildComplex(parentName, s)
@@ -1810,6 +1817,12 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		branchMetas = make([]fieldMeta, len(s.union))
 		branchNodes = make([]*schemaNode, len(s.union))
 	)
+	// A zero-branch union appends nothing below; the canon tree still
+	// needs a non-nil union so the canonical writer emits `[]` (union-ness
+	// is discriminated by non-nil throughout the canon walk).
+	if len(s.union) == 0 {
+		b.canon.union = []aschema{}
+	}
 
 	for i, us := range s.union {
 		u := b.nest()
@@ -2498,8 +2511,15 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			return errors.New("invalid enum has schema for other types")
 		}
 
-		if len(o.Symbols) == 0 {
-			return errors.New("enum must have at least one symbol")
+		// The symbols attribute is required (Java: "Enum has no symbols"),
+		// but an EMPTY array is legal: the spec asks only for "a JSON
+		// array, listing symbols", and Java (EnumSchema's constructor),
+		// fastavro, and avro-rs all accept zero symbols. Such an enum has
+		// no valid values — every encode/decode of it errors — but the
+		// schema parses, which matters for passthrough of foreign schemas
+		// carrying a degenerate enum in a position the data never uses.
+		if o.Symbols == nil {
+			return errors.New("enum is missing symbols")
 		}
 		seenSymbols := make(map[string]bool, len(o.Symbols))
 		for _, e := range o.Symbols {
@@ -2692,7 +2712,11 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			return errors.New("fixed is missing size")
 		}
 		size := int(*o.Size)
-		if size <= 0 {
+		// Size 0 is legal: the spec requires only "an integer", and Java
+		// (SystemLimitException.checkMaxBytesLength rejects negatives only),
+		// fastavro, and avro-rs all accept it — every value of a size-0
+		// fixed is the empty byte string. Only negatives are malformed.
+		if size < 0 {
 			return fmt.Errorf("invalid fixed size %v", size)
 		}
 		// Per-direction suppression: built-in encoder preserved when the
@@ -3669,7 +3693,14 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 		if !ok {
 			return val, fmt.Errorf("expected string for enum default, got %T", val)
 		}
-		if len(node.symbols) > 0 && !slices.Contains(node.symbols, sym) {
+		// Unconditional membership: a non-nil enum node always carries its
+		// final symbols (definitions build them in one shot; forward refs
+		// are nil until finalize and defaults resolve post-wiring). An
+		// empty enum therefore rejects every default — Java parity
+		// (EnumSchema's constructor and isValidDefault both test
+		// containment), and union-default branch selection must skip an
+		// empty-enum branch so a later branch can accept (Java's anyMatch).
+		if !slices.Contains(node.symbols, sym) {
 			return val, fmt.Errorf("enum default %q is not a member of symbols", truncForError(sym))
 		}
 	case "fixed":

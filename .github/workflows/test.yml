@@ -86,7 +86,7 @@ jobs:
           python-version: "3.x"
       - run: pip install fastavro
       - name: fastavro differential
-        run: go test -count=1 -run 'TestDifferentialFastavro|TestApacheSchemaTestsVectors' -v .
+        run: go test -count=1 -run 'TestDifferentialFastavro|TestDifferentialMatrix|TestApacheSchemaTestsVectors' -v .
 
   # CI-only Java differential (heavy: JVM + avro-tools fat jar). Cross-checks
   # twmb's Parsing Canonical Form + Rabin fingerprint against the reference
@@ -125,3 +125,14 @@ jobs:
         env:
           AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
         run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaValueMatrix|TestDifferentialJavaInvalidUTF8' -v .
+      # The combinatorial matrix through the Java oracle: every composed
+      # (fragment × context) cell and every recursive shape — twmb's wire
+      # bytes must survive a Java decode→re-encode byte-identically, and
+      # Java's canonical form + Rabin fingerprint must match twmb's for
+      # every composed schema. Java is the one external oracle that accepts
+      # forward references, so the fwd-ref recursion shapes (which the
+      # fastavro differential must skip) are validated here.
+      - name: Java matrix differential
+        env:
+          AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
+        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaMatrix' .

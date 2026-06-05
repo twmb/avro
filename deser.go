@@ -1793,7 +1793,14 @@ func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error 
 func setBytesValue(v reflect.Value, b []byte, avroType string) error {
 	switch v.Kind() {
 	case reflect.Interface:
-		owned := append([]byte(nil), b...)
+		// make+copy (not append onto a nil base): empty wire bytes must
+		// surface as a NON-nil empty []byte. A nil result is
+		// nil-equivalent on re-encode, so the nil-first union dispatch
+		// would flip a decoded {"bytes": ""} onto the null branch —
+		// silent value corruption through decode→re-encode. Mirrors the
+		// Slice arm below, deserFixed, and udBytesDeser.
+		owned := make([]byte, len(b))
+		copy(owned, b)
 		return setIface(v, reflect.ValueOf(owned), avroType)
 	case reflect.Slice:
 		if v.Type().Elem().Kind() != reflect.Uint8 {
