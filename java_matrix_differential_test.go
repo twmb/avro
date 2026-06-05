@@ -296,11 +296,17 @@ func jsonSemanticEqual(a, b []byte) bool {
 // {branch: value} union envelope.
 func TestDifferentialJavaJSONForm(t *testing.T) {
 	rt, _ := startMatrixJavaOracle(t)
+	// rec0 (the zero-field record) is excluded: avro-tools 1.12.0's
+	// JsonEncoder emits ZERO BYTES for an empty record — and for any
+	// document containing one — observed empirically via the RT oracle
+	// (the generator appears to never complete/flush the empty object).
+	// twmb's "{}" is the only valid JSON for an empty record and matches
+	// fastavro; Java's empty output is not a parity target.
 	eligible := map[string]bool{
 		"null": true, "boolean": true, "int": true, "long": true,
 		"float": true, "double": true, "string": true, "bytes": true,
 		"enum3": true, "enum1": true, "fixed0": true, "fixed1": true,
-		"fixed16": true, "rec2": true, "rec0": true, "arr-int": true,
+		"fixed16": true, "rec2": true, "arr-int": true,
 		"map-str": true,
 	}
 	for _, fr := range matFrags() {
