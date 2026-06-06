@@ -235,3 +235,66 @@ func TestMatrix_ForeignFramingThroughSkip(t *testing.T) {
 		}
 	}
 }
+
+// Multi-block array wires into FIXED-SIZE Go array targets: the remaining-
+// capacity bound in deserFixedArray (count > arrLen-idx) is only
+// distinguishable from a broken one once idx > 0 — i.e. on the SECOND
+// block — because at idx=0 the subtraction is inert. A second block that
+// over-claims must error ("got more"), never walk past the array end; an
+// exact multi-block fill must succeed; an under-fill must report the
+// shortfall. Single-block over-counts cannot pin this bound.
+func TestMatrix_MultiBlockIntoFixedArray(t *testing.T) {
+	s := avro.MustParse(`{"type":"array","items":"int"}`)
+	item := func(v int64) []byte { return putZigzag(nil, v) }
+	wire := func(blocks ...[]byte) []byte {
+		var w []byte
+		for _, b := range blocks {
+			w = append(w, b...)
+		}
+		return append(w, 0x00)
+	}
+	block := func(items ...[]byte) []byte {
+		b := putZigzag(nil, int64(len(items)))
+		for _, it := range items {
+			b = append(b, it...)
+		}
+		return b
+	}
+
+	t.Run("exact-fill-across-blocks", func(t *testing.T) {
+		var out [2]int32
+		w := wire(block(item(7)), block(item(8)))
+		if _, err := s.Decode(w, &out); err != nil {
+			t.Fatalf("two 1-item blocks into [2]int32: %v", err)
+		}
+		if out != [2]int32{7, 8} {
+			t.Fatalf("got %v", out)
+		}
+	})
+	t.Run("second-block-overclaims", func(t *testing.T) {
+		var out [2]int32
+		w := wire(block(item(7)), block(item(8), item(9)))
+		if _, err := s.Decode(w, &out); err == nil {
+			t.Fatal("3 items across blocks into [2]int32 must error, not panic")
+		}
+	})
+	t.Run("underfill-reports-shortfall", func(t *testing.T) {
+		var out [2]int32
+		w := wire(block(item(7)))
+		if _, err := s.Decode(w, &out); err == nil {
+			t.Fatal("1 item into [2]int32 must error")
+		}
+	})
+	t.Run("json-parity", func(t *testing.T) {
+		var out [2]int32
+		if err := s.DecodeJSON([]byte(`[7,8]`), &out); err != nil {
+			t.Fatalf("JSON exact fill: %v", err)
+		}
+		if err := s.DecodeJSON([]byte(`[7,8,9]`), &out); err == nil {
+			t.Fatal("JSON 3 items into [2]int32 must error")
+		}
+		if err := s.DecodeJSON([]byte(`[7]`), &out); err == nil {
+			t.Fatal("JSON 1 item into [2]int32 must error")
+		}
+	})
+}
