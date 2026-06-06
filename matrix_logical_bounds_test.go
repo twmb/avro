@@ -2,8 +2,10 @@ package avro_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"math"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,4 +178,52 @@ func TestMatrix_DurationAndDecimalEdges(t *testing.T) {
 			}
 		}
 	})
+}
+
+// The decimalScaleLimit magnitude gate in boundedRatFromString must sit at
+// EXACTLY ±65536 for string-form decimals whose exponent interacts with a
+// fractional part: for "1.5e<E>" the net magnitude is E-1 (one fractional
+// digit), so E=65537 is the last value the gate passes and E=65538 the
+// first it rejects (mirrored on the negative side). The two sides are
+// distinguished by WHICH error fires — the gate's "magnitude exceeds"
+// versus the schema's downstream precision/scale rejection — so a shifted
+// boundary (mis-derived fractional length) flips an assertion even though
+// every input here errors. Pins the gate position itself, which no
+// round-trip or oracle axis can see (the cap is twmb defense-in-depth).
+func TestMatrix_DecimalStringMagnitudeBoundary(t *testing.T) {
+	s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":6,"scale":2}`)
+	cases := []struct {
+		in           string
+		magnitudeErr bool // true: the ±65536 gate fires; false: it must NOT
+	}{
+		{"1.5e65538", true},   // netExp 65537: one past the limit
+		{"1.5e65537", false},  // netExp 65536: at the limit — gate passes
+		{"1.5e-65536", true},  // netExp -65537: one past, negative side
+		{"1.5e-65535", false}, // netExp -65536: at the limit, negative side
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			// Encode-side caller (string/json.Number → decimal coercion).
+			_, err := s.AppendEncode(nil, json.Number(c.in))
+			if err == nil {
+				t.Fatalf("encode %s: expected an error (precision 6 cannot hold it)", c.in)
+			}
+			if got := strings.Contains(err.Error(), "magnitude exceeds"); got != c.magnitudeErr {
+				t.Fatalf("encode %s: magnitude-gate fired=%v want %v (err: %v)", c.in, got, c.magnitudeErr, err)
+			}
+			// JSON-decode caller (bare-number decimal form). Decode has no
+			// precision check on this leniency path, so the discriminator
+			// is sharper: at-limit values SUCCEED outright, past-limit
+			// values fail with the gate's error.
+			var sink any
+			derr := s.DecodeJSON([]byte(c.in), &sink)
+			if c.magnitudeErr {
+				if derr == nil || !strings.Contains(derr.Error(), "magnitude exceeds") {
+					t.Fatalf("decodeJSON %s: want magnitude-gate error, got %v", c.in, derr)
+				}
+			} else if derr != nil {
+				t.Fatalf("decodeJSON %s: at-limit value must decode, got %v", c.in, derr)
+			}
+		})
+	}
 }
