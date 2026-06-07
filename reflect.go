@@ -394,7 +394,16 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 		if visited[t] {
 			return // prevent infinite recursion on embedded struct cycles
 		}
+		// PER-PATH marking: a cycle revisits a type while it is still ON the
+		// current path, so the on-path check above terminates it; but the
+		// SAME type reachable through two SIBLING embed paths is not a cycle
+		// and must be collected at each occurrence so the shallower one
+		// reaches the shallowest-wins dedup below. Marking-forever pruned the
+		// sibling occurrence, silently selecting the deeper field and
+		// violating doc.go's promotion contract. Same idiom as toJSONWalk
+		// (schema_node.go).
 		visited[t] = true
+		defer delete(visited, t)
 		for i := 0; i < t.NumField(); i++ {
 			sf := t.Field(i)
 			idx := make([]int, len(index)+1)

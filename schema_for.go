@@ -235,7 +235,15 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	if visited[t] {
 		return nil, nil
 	}
+	// PER-PATH marking, in lockstep with typeFieldMapping's collect
+	// (reflect.go): the on-path check terminates embed CYCLES, but a type
+	// reachable through two SIBLING embed paths must be collected at each
+	// occurrence — so the shallower one reaches the shallowest-wins dedup,
+	// and a type genuinely inlined twice surfaces as the duplicate-field
+	// collision it is (rather than being silently pruned). The two walkers
+	// must agree, so this marking discipline is kept identical.
 	visited[t] = true
+	defer delete(visited, t)
 
 	var raw []schemaField
 	for i := 0; i < t.NumField(); i++ {
