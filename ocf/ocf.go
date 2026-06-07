@@ -437,6 +437,20 @@ func (w *Writer) writeHeader() error {
 	}
 	meta = append(meta, w.userMeta...)
 
+	// Producer-side compliance with decodeMap's per-entry caps: refuse to
+	// write metadata the reader would reject (and which NewAppendWriter, which
+	// re-reads the header, would also reject) — emitting it would be a self-
+	// incompatible file. avro.schema gets the larger schema ceiling; every
+	// other key (and all values) the generic 1 MiB cap.
+	for _, e := range meta {
+		if int64(len(e.key)) > ocfMetadataSafetyLimit {
+			return fmt.Errorf("ocf: metadata key %q length %d exceeds the %d-byte limit", e.key, len(e.key), ocfMetadataSafetyLimit)
+		}
+		if lim := metadataValueLimit(e.key); int64(len(e.val)) > lim {
+			return fmt.Errorf("ocf: metadata %q value length %d exceeds the %d-byte limit", e.key, len(e.val), lim)
+		}
+	}
+
 	var hdr []byte
 	hdr = append(hdr, magic[:]...)
 	hdr = encodeMap(hdr, meta)
@@ -1175,6 +1189,26 @@ func encodeMap(dst []byte, entries []kv) []byte {
 // otherwise drive an unbounded make).
 const ocfMetadataSafetyLimit = 1 << 20
 
+// ocfSchemaSafetyLimit is the larger dedicated bound for the self-describing
+// avro.schema metadata VALUE. A wide record's JSON legitimately exceeds 1 MiB
+// (Java/fastavro read such files), so capping it at ocfMetadataSafetyLimit
+// makes the writer's own large-schema files unreadable. The schema's parse
+// cost is independently bounded by the schema parser's own guards, so a
+// generous-but-finite ceiling (still bounding the make([]byte, valLen) alloc)
+// is the right shape. The OCF writer enforces the same bound (producer-side
+// compliance), so a twmb-written file is always twmb-readable.
+const ocfSchemaSafetyLimit = 1 << 26 // 64 MiB
+
+// metadataValueLimit returns the per-key value-length bound: the larger
+// schema ceiling for the self-describing avro.schema key, the generic cap
+// otherwise.
+func metadataValueLimit(key string) int64 {
+	if key == "avro.schema" {
+		return ocfSchemaSafetyLimit
+	}
+	return ocfMetadataSafetyLimit
+}
+
 func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 	m := make(map[string][]byte)
 	for {
@@ -1214,7 +1248,7 @@ func decodeMap(r *bufio.Reader) (map[string][]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			if valLen < 0 || valLen > ocfMetadataSafetyLimit {
+			if valLen < 0 || valLen > metadataValueLimit(string(key)) {
 				return nil, fmt.Errorf("map value length %d out of range", valLen)
 			}
 			val := make([]byte, int(valLen))

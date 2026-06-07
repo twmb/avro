@@ -1356,10 +1356,26 @@ func (s *serArray) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	if err != nil || l == 0 {
 		return dst, err
 	}
+	bodyStart := len(dst)
 	for i := range l {
 		if dst, err = s.serItem(dst, v.Index(i), depth+1); err != nil {
 			return nil, err
 		}
+	}
+	// Producer-side compliance with the decoder's zero-byte-item cap
+	// (checkArrayBlockBounds / maxZeroByteItems): if every item encoded to
+	// zero bytes (array<null>, array<EmptyRecord>, array<size-0-fixed>), the
+	// decoder rejects a cumulative count above maxZeroByteItems, so emitting
+	// a larger array here would be a wire we cannot read back. Reject at
+	// encode with a clear error instead of producing a self-incompatible
+	// wire — the same discipline as the OCF zero-byte writer bound
+	// (shouldFlush). Non-zero-byte items grow the buffer, so this fires only
+	// for genuinely zero-byte element types; the primitive fast path
+	// (appendArrayPrimitive) handles only >=1-byte element types and cannot
+	// reach this case.
+	if len(dst) == bodyStart && l > maxZeroByteItems {
+		return nil, &SemanticError{AvroType: "array", Err: fmt.Errorf(
+			"array of %d zero-byte items exceeds the decoder's %d-element limit", l, maxZeroByteItems)}
 	}
 	return append(dst, 0), nil
 }
