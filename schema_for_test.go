@@ -3142,3 +3142,73 @@ func TestRegression_SchemaForDefaultTrailingContentVerbatim(t *testing.T) {
 		t.Errorf("clean JSON default should stay numeric 42: %s", sq.String())
 	}
 }
+
+// TestSchemaForRejectsJSONNumber locks the rule that json.Number cannot be a
+// SchemaFor field type. json.Number's Kind() is reflect.String and it
+// implements no text interface, so the Kind switch's String arm would emit
+// an Avro "string" schema — but the package's documented json.Number policy
+// is numeric-only: string/bytes/fixed/enum reject json.Number on both encode
+// and decode. SchemaFor is the package's one builder; emitting the single
+// Avro type its own codec is guaranteed to reject for that Go type is a
+// build-accepts / encode-rejects deferred failure, exactly the shape the
+// uuid/decimal/time SchemaFor strictness eliminated. So SchemaFor rejects
+// json.Number up front, naming the alternatives.
+func TestSchemaForRejectsJSONNumber(t *testing.T) {
+	type Event struct {
+		Seq json.Number `avro:"seq"`
+	}
+	if _, err := SchemaFor[Event](); err == nil {
+		t.Fatal("SchemaFor[json.Number field] must reject at build time, not defer to Encode")
+	}
+
+	// Siblings: every shape that carries json.Number through inferType's
+	// recursion must reject for the same root reason.
+	type SliceR struct {
+		V []json.Number `avro:"v"`
+	}
+	type MapValR struct {
+		V map[string]json.Number `avro:"v"`
+	}
+	type PtrR struct {
+		V *json.Number `avro:"v"`
+	}
+	for name, build := range map[string]func() (*Schema, error){
+		"slice":     func() (*Schema, error) { return SchemaFor[SliceR]() },
+		"map-value": func() (*Schema, error) { return SchemaFor[MapValR]() },
+		"pointer":   func() (*Schema, error) { return SchemaFor[PtrR]() },
+		"top-level": func() (*Schema, error) { return SchemaFor[json.Number]() },
+	} {
+		if _, err := build(); err == nil {
+			t.Errorf("%s: SchemaFor with a json.Number must reject at build time", name)
+		}
+	}
+
+	// map[json.Number]V as a KEY is the documented exception: Avro map keys
+	// are strings whose json.Number form round-trips, so the key path must
+	// stay accepted. The fix must not touch it.
+	type KeyR struct {
+		V map[json.Number]int32 `avro:"v"`
+	}
+	ks, err := SchemaFor[KeyR]()
+	if err != nil {
+		t.Fatalf("map[json.Number]V key must remain accepted (documented exception): %v", err)
+	}
+	if _, err := ks.Encode(&KeyR{V: map[json.Number]int32{"7": 1}}); err != nil {
+		t.Errorf("map[json.Number]int32 must round-trip on encode: %v", err)
+	}
+
+	// A NAMED alias (type N json.Number) is a distinct reflect.Type that the
+	// codec treats as a plain string, so it must stay a plain "string"
+	// schema and round-trip — the reject is exact-type only.
+	type NamedNum json.Number
+	type NamedR struct {
+		V NamedNum `avro:"v"`
+	}
+	ns, err := SchemaFor[NamedR]()
+	if err != nil {
+		t.Fatalf("named json.Number alias must stay a plain string schema: %v", err)
+	}
+	if _, err := ns.Encode(&NamedR{V: "hello"}); err != nil {
+		t.Errorf("named-alias string field must round-trip: %v", err)
+	}
+}

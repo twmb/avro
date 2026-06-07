@@ -841,6 +841,19 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	case durationType:
 		return inferTimeLike("time-millis")
 
+	case jsonNumberType:
+		// json.Number's Kind() is reflect.String, so the Kind switch below
+		// would emit an Avro "string" — but the package's json.Number policy
+		// is numeric-only: string/bytes/fixed/enum reject it on both encode
+		// and decode (doc.go "Encoding from JSON input"). Emitting the one
+		// Avro type the codec is guaranteed to reject for this Go type is a
+		// build-accepts/encode-rejects deferred failure; reject up front,
+		// matching the uuid/decimal/time strictness. (A registered CustomType
+		// for json.Number still works — the loop above runs first; a NAMED
+		// alias `type N json.Number` is a distinct reflect.Type that the
+		// codec treats as a plain string and is unaffected.)
+		return nil, fmt.Errorf("avro: json.Number has no single Avro type for SchemaFor; use a concrete Go numeric type (int32/int64/float64), string, or a CustomType")
+
 	case bigRatPtrType, bigRatValueType:
 		if logical == "" || (logical == "decimal" && decimal == [2]int{}) {
 			return nil, fmt.Errorf("*big.Rat requires explicit decimal(precision,scale) tag")
