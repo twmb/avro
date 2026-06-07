@@ -3212,3 +3212,160 @@ func TestSchemaForRejectsJSONNumber(t *testing.T) {
 		t.Errorf("named-alias string field must round-trip: %v", err)
 	}
 }
+
+// schemaForFieldType mirrors SchemaFor's internal pipeline for a struct
+// type built at runtime via reflect.StructOf, so the parity sweep below can
+// enumerate field types the compile-time-generic SchemaFor[T] cannot reach
+// at runtime. It is faithful to SchemaFor's body (inferRecord →
+// dedupNamedTypes → Marshal → Parse) except it supplies an explicit record
+// name (a StructOf struct is anonymous).
+func schemaForFieldType(ft reflect.Type) (*Schema, error) {
+	st := reflect.StructOf([]reflect.StructField{
+		{Name: "F", Type: ft, Tag: `avro:"f"`},
+	})
+	seen := make(map[reflect.Type]string)
+	s, err := inferRecord(st, "R", "", seen, nil)
+	if err != nil {
+		return nil, err
+	}
+	s = dedupNamedTypes(s, make(map[string]string))
+	b, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	return Parse(string(b))
+}
+
+// sampleValue builds a NON-EMPTY value of t so the encode-parity sweep
+// actually materializes leaf types buried in pointers/slices/maps (a nil
+// pointer or empty slice never encodes its element type, which would hide a
+// build-accepts/encode-rejects bug on that element — e.g. *json.Number).
+func sampleValue(t reflect.Type) reflect.Value {
+	switch t.Kind() {
+	case reflect.Pointer:
+		p := reflect.New(t.Elem())
+		p.Elem().Set(sampleValue(t.Elem()))
+		return p
+	case reflect.Slice:
+		sl := reflect.MakeSlice(t, 1, 1)
+		sl.Index(0).Set(sampleValue(t.Elem()))
+		return sl
+	case reflect.Array:
+		a := reflect.New(t).Elem()
+		for i := 0; i < t.Len(); i++ {
+			a.Index(i).Set(sampleValue(t.Elem()))
+		}
+		return a
+	case reflect.Map:
+		m := reflect.MakeMap(t)
+		m.SetMapIndex(sampleValue(t.Key()), sampleValue(t.Elem()))
+		return m
+	case reflect.Struct:
+		v := reflect.New(t).Elem()
+		for i := 0; i < t.NumField(); i++ {
+			if t.Field(i).IsExported() {
+				v.Field(i).Set(sampleValue(t.Field(i).Type))
+			}
+		}
+		return v
+	case reflect.String:
+		// "1" is a valid json.Number AND a valid string/map-key, so it works
+		// for every String-kind type the sweep carries.
+		return reflect.ValueOf("1").Convert(t)
+	default:
+		return reflect.New(t).Elem() // zero is representative for scalars/time
+	}
+}
+
+// TestSchemaForEncodeParity is the generative net for the build-accepts /
+// encode-rejects bug class (the shape of the json.Number SchemaFor bug):
+// SchemaFor is the package's one Go-type → schema builder, and it has no
+// wire-format counterpart, so the encode/decode-parity and oracle lenses
+// never reach it. The invariant that DOES reach it: if SchemaFor ACCEPTS a
+// field type, Encode of a value of that type MUST also accept — otherwise
+// the schema builds but every Encode fails far from the SchemaFor call.
+//
+// The sweep crosses every codec-special-cased / Kind-misleading Go type
+// (the high-risk surface — stdlib types whose reflect.Kind does not match
+// the Avro type the codec wants) plus named aliases, pointers, slices,
+// maps, and nesting. For each accepted type it encodes the zero value and
+// confirms the wire is readable; a reject is always safe (build-time
+// strictness cannot defer a failure to Encode). New field types are one
+// table line and inherit the invariant automatically.
+func TestSchemaForEncodeParity(t *testing.T) {
+	type namedString string
+	type namedInt int64
+	type namedNumber json.Number // distinct reflect.Type → plain string
+	type inner struct {
+		A int32 `avro:"a"`
+	}
+
+	types := []reflect.Type{
+		// primitives across every Kind the inference switch handles
+		reflect.TypeFor[bool](), reflect.TypeFor[int](), reflect.TypeFor[int8](),
+		reflect.TypeFor[int16](), reflect.TypeFor[int32](), reflect.TypeFor[int64](),
+		reflect.TypeFor[uint8](), reflect.TypeFor[uint16](), reflect.TypeFor[uint32](),
+		reflect.TypeFor[uint64](), reflect.TypeFor[uint](),
+		reflect.TypeFor[float32](), reflect.TypeFor[float64](), reflect.TypeFor[string](),
+		// byte containers
+		reflect.TypeFor[[]byte](), reflect.TypeFor[[4]byte](), reflect.TypeFor[[16]byte](),
+		// codec-special-cased stdlib types (Kind misleads)
+		reflect.TypeFor[json.Number](),   // Kind String, codec rejects → SchemaFor must reject
+		reflect.TypeFor[time.Time](),     // Kind Struct → logical long
+		reflect.TypeFor[time.Duration](), // Kind Int64 → logical
+		reflect.TypeFor[big.Rat](),       // requires decimal tag → reject untagged
+		reflect.TypeFor[*big.Rat](),      // requires decimal tag → reject untagged
+		// named aliases — distinct reflect.Type, must follow Kind honestly
+		reflect.TypeFor[namedString](), reflect.TypeFor[namedInt](), reflect.TypeFor[namedNumber](),
+		// pointers (nullable)
+		reflect.TypeFor[*int](), reflect.TypeFor[*string](), reflect.TypeFor[*time.Time](),
+		reflect.TypeFor[*json.Number](), // carries json.Number → reject
+		// slices / maps / nesting
+		reflect.TypeFor[[]int](), reflect.TypeFor[[]string](), reflect.TypeFor[[]time.Time](),
+		reflect.TypeFor[[]json.Number](),          // carries json.Number → reject
+		reflect.TypeFor[map[string]int](),         // value int
+		reflect.TypeFor[map[string]json.Number](), // value json.Number → reject
+		reflect.TypeFor[map[json.Number]int32](),  // KEY json.Number → documented exception, accept
+		reflect.TypeFor[inner](),                  // nested struct
+		reflect.TypeFor[[]inner](), reflect.TypeFor[map[string]inner](),
+	}
+
+	for _, ft := range types {
+		t.Run(ft.String(), func(t *testing.T) {
+			s, err := schemaForFieldType(ft)
+			if err != nil {
+				// Reject is always safe: a build-time error cannot become a
+				// deferred Encode failure. (The targeted reject-set is
+				// locked separately in TestSchemaForRejectsJSONNumber.)
+				return
+			}
+			// SchemaFor ACCEPTED → the parity invariant: a value of this
+			// type must Encode. The zero value is a representative input;
+			// for json.Number the zero value (json.Number("")) is exactly
+			// what the codec rejects, so the bug shape is caught here.
+			st := reflect.StructOf([]reflect.StructField{
+				{Name: "F", Type: ft, Tag: `avro:"f"`},
+			})
+			// A NON-EMPTY sample: pointers allocated, slices/maps with one
+			// element — so a json.Number buried in a *T / []T / map[K]T
+			// actually reaches the encoder. The zero value would leave those
+			// nil/empty and never exercise the leaf type (the exact gap a
+			// first version of this test had, revealed by neutering the fix:
+			// only top-level json.Number was caught).
+			sv := reflect.New(st).Elem()
+			sv.Field(0).Set(sampleValue(ft))
+			wire, encErr := s.Encode(sv.Interface())
+			if encErr != nil {
+				t.Fatalf("SchemaFor ACCEPTED field type %s but Encode of a value REJECTS it (build-accepts/encode-rejects deferred failure):\n schema: %s\n err: %v",
+					ft, s, encErr)
+			}
+			// The wire SchemaFor's own schema produced must be decodable by
+			// that same schema (no panic, consumes fully) — a sanity that
+			// the emitted schema is internally consistent end to end.
+			var sink any
+			if _, decErr := s.Decode(wire, &sink); decErr != nil {
+				t.Fatalf("SchemaFor schema for %s encoded but cannot decode its own wire: %v", ft, decErr)
+			}
+		})
+	}
+}
