@@ -1,6 +1,7 @@
 package avro_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -44,6 +45,13 @@ var jnNumericSchemas = []struct {
 	{"time-millis", `{"type":"int","logicalType":"time-millis"}`},
 	{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`},
 	{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`},
+	// decimal/big-decimal are the EXEMPT bytes-backed case: json.Number
+	// carries the RatString (RFC-8259-valid by construction), so they are
+	// numeric-accept, not stringy-reject. scale 0 / precision 18 lets the
+	// integer content battery round-trip exactly.
+	{"decimal", `{"type":"bytes","logicalType":"decimal","precision":18,"scale":0}`},
+	{"decimal-fixed", `{"type":"fixed","name":"JNDF","size":9,"logicalType":"decimal","precision":18,"scale":0}`},
+	{"big-decimal", `{"type":"bytes","logicalType":"big-decimal"}`},
 }
 
 var jnStringySchemas = []struct {
@@ -87,6 +95,33 @@ var jnPositions = []struct {
 		func(t reflect.Type) reflect.Value {
 			return reflect.New(reflect.MapOf(reflect.TypeFor[string](), t))
 		}},
+	// struct-field exercises the ADDRESSABLE unsafe struct-field fast path
+	// (unsafe.go gates on stringFastPathEligible{Encode,Decode}) — a code
+	// path the map/slice/typed-map targets above never reach.
+	{"struct-field",
+		func(leaf string) string {
+			return fmt.Sprintf(`{"type":"record","name":"JNSR","fields":[{"name":"f","type":%s}]}`, leaf)
+		},
+		func(leaf any) any {
+			st := reflect.StructOf([]reflect.StructField{
+				{Name: "F", Type: reflect.TypeOf(leaf), Tag: `avro:"f"`},
+			})
+			p := reflect.New(st) // POINTER → addressable → unsafe encode path
+			p.Elem().Field(0).Set(reflect.ValueOf(leaf))
+			return p.Interface()
+		},
+		func(t reflect.Type) reflect.Value {
+			st := reflect.StructOf([]reflect.StructField{
+				{Name: "F", Type: t, Tag: `avro:"f"`},
+			})
+			return reflect.New(st) // addressable struct → unsafe path
+		}},
+	// nullable-union exercises union branch dispatch: a numeric branch must
+	// accept json.Number; a stringy-only union must reject it.
+	{"nullable-union",
+		func(leaf string) string { return fmt.Sprintf(`["null",%s]`, leaf) },
+		func(leaf any) any { return leaf },
+		func(t reflect.Type) reflect.Value { return reflect.New(reflect.PointerTo(t)) }},
 }
 
 func TestMatrix_JSONNumberPolicy(t *testing.T) {
@@ -116,6 +151,65 @@ func TestMatrix_JSONNumberPolicy(t *testing.T) {
 				jtgt := pos.target(jnType)
 				if err := s.DecodeJSON(jwire, jtgt.Interface()); err != nil {
 					t.Fatalf("JSON decode into json.Number target rejected for numeric schema: %v", err)
+				}
+
+				// Resolved-decode path (identity resolution): a json.Number
+				// target must decode the same through resolve.go's resolved
+				// deser, not just the natural deser.
+				res, rerr := avro.Resolve(avro.MustParse(pos.schema(sc.schema)), avro.MustParse(pos.schema(sc.schema)))
+				if rerr != nil {
+					t.Fatalf("identity Resolve: %v", rerr)
+				}
+				if _, err := res.Decode(wire, pos.target(jnType).Interface()); err != nil {
+					t.Fatalf("resolved decode into json.Number target rejected for numeric schema: %v", err)
+				}
+
+				// Non-numeric / malformed json.Number content must REJECT on
+				// encode (the type's RFC-8259 invariant: its underlying
+				// string must be a valid number). This exercises the
+				// content-validating arms — e.g. the decimal encode arm's
+				// boundedRatFromString — which an integer-only battery never
+				// reaches (a numerically-valid value coerces identically with
+				// or without the validation).
+				for _, bad := range []string{"notanumber", "", "1.2.3"} {
+					if _, err := s.AppendEncode(nil, pos.encodeVal(json.Number(bad))); err == nil {
+						t.Errorf("binary encode of malformed json.Number(%q) ACCEPTED for numeric schema (must reject)", bad)
+					}
+					if _, err := s.AppendEncodeJSON(nil, pos.encodeVal(json.Number(bad))); err == nil {
+						t.Errorf("JSON encode of malformed json.Number(%q) ACCEPTED for numeric schema (must reject)", bad)
+					}
+				}
+
+				// Content variety with a WIRE-STABLE round-trip: encode
+				// json.Number(content) -> decode into a json.Number target ->
+				// re-encode -> must reproduce the ORIGINAL wire. This is
+				// calibration-free (no hardcoded expected string — date/
+				// timestamp/decimal each transform the content differently)
+				// and catches CONTENT corruption a success-only check misses:
+				// neutering the json.Number numeric-setter / decimal arms lets
+				// decode still succeed but produce a wrong value, which then
+				// re-encodes to different bytes.
+				for _, content := range []string{"0", "-1", "127", "2147483647"} {
+					cin := pos.encodeVal(json.Number(content))
+					cw, cerr := s.AppendEncode(nil, cin)
+					if cerr != nil {
+						t.Errorf("encode json.Number(%q) rejected for numeric schema: %v", content, cerr)
+						continue
+					}
+					ctgt := pos.target(jnType)
+					if _, err := s.Decode(cw, ctgt.Interface()); err != nil {
+						t.Errorf("decode json.Number(%q) wire into json.Number target failed: %v", content, err)
+						continue
+					}
+					// Re-encode the decoded json.Number tree; must match cw.
+					reW, reErr := s.AppendEncode(nil, ctgt.Elem().Interface())
+					if reErr != nil {
+						t.Errorf("re-encode of decoded json.Number(%q) failed: %v", content, reErr)
+						continue
+					}
+					if !bytes.Equal(reW, cw) {
+						t.Errorf("json.Number(%q) NOT wire-stable through json.Number target:\n in=%x\n out=%x", content, cw, reW)
+					}
 				}
 			})
 		}
