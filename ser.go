@@ -1348,6 +1348,27 @@ type serArray struct {
 	serItem serfn
 }
 
+// arrayZeroByteEncodeCompliance enforces producer-side compliance with the
+// decoder's maxZeroByteItems cap, shared by EVERY array encoder — the reflect
+// serArray.ser and the unsafe usArrayRecord/usArrayPtrRecord/usArrayDirect.
+// If the encoded body is empty, every item wrote zero bytes
+// (array<null>/array<EmptyRecord>/array<size-0-fixed>), and the decoder
+// (checkArrayBlockBounds) rejects a cumulative count above maxZeroByteItems —
+// so a larger array would be a wire we cannot read back. Reject at encode
+// instead of emitting a self-incompatible wire (the OCF shouldFlush
+// discipline). Non-zero-byte items grow the buffer, so this fires only for
+// genuinely zero-byte element types; the >=1-byte primitive fast paths never
+// reach it. Every array encoder MUST route through this one helper so the
+// reflect and unsafe paths cannot drift (the unsafe twins were missed the
+// first time this cap was added).
+func arrayZeroByteEncodeCompliance(emptyBody bool, n int) error {
+	if emptyBody && n > maxZeroByteItems {
+		return &SemanticError{AvroType: "array", Err: fmt.Errorf(
+			"array of %d zero-byte items exceeds the decoder's %d-element limit", n, maxZeroByteItems)}
+	}
+	return nil
+}
+
 func (s *serArray) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	if depth >= maxDepth {
 		return nil, errTooDeep
@@ -1362,20 +1383,8 @@ func (s *serArray) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 			return nil, err
 		}
 	}
-	// Producer-side compliance with the decoder's zero-byte-item cap
-	// (checkArrayBlockBounds / maxZeroByteItems): if every item encoded to
-	// zero bytes (array<null>, array<EmptyRecord>, array<size-0-fixed>), the
-	// decoder rejects a cumulative count above maxZeroByteItems, so emitting
-	// a larger array here would be a wire we cannot read back. Reject at
-	// encode with a clear error instead of producing a self-incompatible
-	// wire — the same discipline as the OCF zero-byte writer bound
-	// (shouldFlush). Non-zero-byte items grow the buffer, so this fires only
-	// for genuinely zero-byte element types; the primitive fast path
-	// (appendArrayPrimitive) handles only >=1-byte element types and cannot
-	// reach this case.
-	if len(dst) == bodyStart && l > maxZeroByteItems {
-		return nil, &SemanticError{AvroType: "array", Err: fmt.Errorf(
-			"array of %d zero-byte items exceeds the decoder's %d-element limit", l, maxZeroByteItems)}
+	if err := arrayZeroByteEncodeCompliance(len(dst) == bodyStart, l); err != nil {
+		return nil, err
 	}
 	return append(dst, 0), nil
 }

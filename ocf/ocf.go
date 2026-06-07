@@ -437,11 +437,16 @@ func (w *Writer) writeHeader() error {
 	}
 	meta = append(meta, w.userMeta...)
 
-	// Producer-side compliance with decodeMap's per-entry caps: refuse to
-	// write metadata the reader would reject (and which NewAppendWriter, which
-	// re-reads the header, would also reject) — emitting it would be a self-
-	// incompatible file. avro.schema gets the larger schema ceiling; every
-	// other key (and all values) the generic 1 MiB cap.
+	// Producer-side compliance with decodeMap's caps: refuse to write metadata
+	// the reader would reject (and which NewAppendWriter, which re-reads the
+	// header, would also reject) — emitting it would be a self-incompatible
+	// file. decodeMap caps three things, so the writer mirrors all three: the
+	// per-block ENTRY COUNT, each KEY length, and each VALUE length
+	// (avro.schema gets the larger schema ceiling; every other key + all
+	// values the generic 1 MiB cap).
+	if int64(len(meta)) > ocfMetadataSafetyLimit {
+		return fmt.Errorf("ocf: %d metadata entries exceed the %d-entry limit", len(meta), ocfMetadataSafetyLimit)
+	}
 	for _, e := range meta {
 		if int64(len(e.key)) > ocfMetadataSafetyLimit {
 			return fmt.Errorf("ocf: metadata key %q length %d exceeds the %d-byte limit", e.key, len(e.key), ocfMetadataSafetyLimit)

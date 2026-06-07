@@ -1456,6 +1456,7 @@ func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 		if n == 0 {
 			return dst, nil
 		}
+		bodyStart := len(dst)
 		data := unsafe.Pointer(unsafe.SliceData(bs))
 		fast := rec.fastFor(elemGoType)
 		useFast := fast != nil && fast.allFast
@@ -1470,6 +1471,9 @@ func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 			if err != nil {
 				return nil, err
 			}
+		}
+		if err := arrayZeroByteEncodeCompliance(len(dst) == bodyStart, n); err != nil {
+			return nil, err
 		}
 		return append(dst, 0), nil
 	}
@@ -1487,6 +1491,7 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 		if n == 0 {
 			return dst, nil
 		}
+		bodyStart := len(dst)
 		fast := rec.fastFor(innerType)
 		useFast := fast != nil && fast.allFast
 		var err error
@@ -1502,6 +1507,9 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 			if err != nil {
 				return nil, err
 			}
+		}
+		if err := arrayZeroByteEncodeCompliance(len(dst) == bodyStart, n); err != nil {
+			return nil, err
 		}
 		return append(dst, 0), nil
 	}
@@ -1605,6 +1613,7 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 		if n == 0 {
 			return dst, nil
 		}
+		bodyStart := len(dst)
 		data := unsafe.Pointer(unsafe.SliceData(bs))
 		var err error
 		for i := range n {
@@ -1612,6 +1621,9 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 			if err != nil {
 				return nil, err
 			}
+		}
+		if err := arrayZeroByteEncodeCompliance(len(dst) == bodyStart, n); err != nil {
+			return nil, err
 		}
 		return append(dst, 0), nil
 	}

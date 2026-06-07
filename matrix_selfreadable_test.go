@@ -75,7 +75,7 @@ func TestMatrix_SelfReadableAtScale(t *testing.T) {
 			schema: `{"type":"map","values":"null"}`,
 			value: func() any {
 				m := make(map[string]any, n)
-				for i := 0; i < n; i++ {
+				for i := range n {
 					m[fmt.Sprintf("k%d", i)] = nil
 				}
 				return m
@@ -108,7 +108,7 @@ func TestMatrix_SelfReadableAtScale(t *testing.T) {
 	// Deeply nested arrays around errTooDeep (1000).
 	for _, depth := range []int{998, 1000, 1002} {
 		schema := "\"long\""
-		for i := 0; i < depth; i++ {
+		for range depth {
 			schema = fmt.Sprintf(`{"type":"array","items":%s}`, schema)
 		}
 		d := depth
@@ -117,7 +117,7 @@ func TestMatrix_SelfReadableAtScale(t *testing.T) {
 			schema: schema,
 			value: func() any {
 				var v any = int64(1)
-				for i := 0; i < d; i++ {
+				for range d {
 					v = []any{v}
 				}
 				return v
@@ -151,5 +151,63 @@ func TestMatrix_SelfReadableAtScale(t *testing.T) {
 				func(b []byte, v any) ([]byte, error) { return s.AppendEncodeJSON(b, v) },
 				func(b []byte, tgt any) error { return s.DecodeJSON(b, tgt) }, "json")
 		})
+	}
+
+	// UNSAFE struct-field path. The generators above pass top-level []any /
+	// map[string]any values, which route through the REFLECT encoders. A
+	// zero-byte array that is an addressable struct field instead routes
+	// through the UNSAFE encoders (usArrayRecord / usArrayPtrRecord /
+	// usArrayDirect) — a structurally distinct code path that the first
+	// producer-compliance fix missed, and which this net was blind to until
+	// it drove typed struct fields. Each wrapper holds the same zero-byte
+	// array element type as a TYPED slice field, swept across the cap.
+	for _, uc := range unsafeArrayCases() {
+		for _, n := range []int{4096, 4097, 10000} {
+			t.Run(fmt.Sprintf("unsafe-field/%s×%d", uc.label, n), func(t *testing.T) {
+				s := avro.MustParse(uc.schema)
+				ptr := uc.value(n) // &struct{ A []ElemT }{...}, addressable → unsafe path
+				check(t, fmt.Sprintf("unsafe-field/%s×%d", uc.label, n), ptr,
+					func(b []byte, v any) ([]byte, error) { return s.AppendEncode(b, v) },
+					func(b []byte, tgt any) error { _, e := s.Decode(b, tgt); return e }, "binary")
+			})
+		}
+	}
+}
+
+// srEmptyRec maps to an empty record; the typed slices below force the unsafe
+// array encoders (a []any would stay on the reflect path).
+type srEmptyRec struct{}
+
+func unsafeArrayCases() []struct {
+	label  string
+	schema string
+	value  func(n int) any
+} {
+	const recField = `{"type":"record","name":"H","fields":[{"name":"a","type":{"type":"array","items":{"type":"record","name":"E","fields":[]}}}]}`
+	const fixedField = `{"type":"record","name":"H","fields":[{"name":"a","type":{"type":"array","items":{"type":"fixed","name":"Z","size":0}}}]}`
+	return []struct {
+		label  string
+		schema string
+		value  func(n int) any
+	}{
+		{"slice-empty-record", recField, func(n int) any {
+			return &struct {
+				A []srEmptyRec `avro:"a"`
+			}{A: make([]srEmptyRec, n)}
+		}},
+		{"slice-ptr-empty-record", recField, func(n int) any {
+			a := make([]*srEmptyRec, n)
+			for i := range a {
+				a[i] = &srEmptyRec{}
+			}
+			return &struct {
+				A []*srEmptyRec `avro:"a"`
+			}{A: a}
+		}},
+		{"slice-size0-fixed", fixedField, func(n int) any {
+			return &struct {
+				A [][0]byte `avro:"a"`
+			}{A: make([][0]byte, n)}
+		}},
 	}
 }
