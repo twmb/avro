@@ -2866,3 +2866,61 @@ func TestRegression_UnsafeMultiPtrNullUnionNil(t *testing.T) {
 		t.Fatalf("EncodeJSON: %v", err)
 	}
 }
+
+// TestRegression_TextAppenderHeaderGrowth pins appendAvroString's
+// AppendText inline-write slow path: it reserves a 1-byte length
+// placeholder, lets AppendText write directly into dst, then — when the
+// real text length needs MORE varint header bytes than the 1-byte
+// placeholder — grows dst by exactly (len(realHdr) - placeholderLen) and
+// shifts the text right. Every other AppendText test uses short values
+// (<64 bytes) that stay on the 1-byte-header fast path and never enter the
+// grow branch, so the grow arithmetic (ser.go: make([]byte, len(hdr)-
+// hdrLen)) had no wire-level coverage — an over- or under-grow there
+// leaves trailing garbage or truncates, corrupting the wire for the NEXT
+// field. This drives text lengths across both varint-width boundaries
+// (>=64 → 2-byte header, >=8192 → 3-byte header) and asserts an exact
+// round-trip both standalone and as the first field of a record (so a
+// length error shows up as a misread of the following field).
+func TestRegression_TextAppenderHeaderGrowth(t *testing.T) {
+	s := MustParse(`"string"`)
+	rec := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"s","type":"string"},{"name":"n","type":"int"}]}`)
+
+	for _, n := range []int{0, 1, 63, 64, 65, 127, 128, 8191, 8192, 8193, 70000} {
+		val := strings.Repeat("x", n)
+
+		// Standalone: encode the TextAppender, decode as a plain string,
+		// and confirm exact value + zero trailing bytes.
+		enc, err := s.AppendEncode(nil, testTextAppender{val: val})
+		if err != nil {
+			t.Fatalf("n=%d: encode: %v", n, err)
+		}
+		// The wire must be exactly varint(n) + n text bytes, nothing more.
+		plain, _ := s.AppendEncode(nil, val)
+		if !bytes.Equal(enc, plain) {
+			t.Fatalf("n=%d: AppendText wire differs from plain string wire:\n ta=%x\n  s=%x", n, enc, plain)
+		}
+		var out string
+		rest, err := s.Decode(enc, &out)
+		if err != nil || out != val || len(rest) != 0 {
+			t.Fatalf("n=%d: decode: err=%v len(out)=%d trailing=%d", n, err, len(out), len(rest))
+		}
+
+		// As the first field of a record: a header-length error here
+		// would desynchronize the following int field.
+		renc, err := rec.AppendEncode(nil, map[string]any{"s": testTextAppender{val: val}, "n": int32(0x2A)})
+		if err != nil {
+			t.Fatalf("n=%d: record encode: %v", n, err)
+		}
+		var rout struct {
+			S string `avro:"s"`
+			N int32  `avro:"n"`
+		}
+		if _, err := rec.Decode(renc, &rout); err != nil {
+			t.Fatalf("n=%d: record decode: %v", n, err)
+		}
+		if rout.S != val || rout.N != 0x2A {
+			t.Fatalf("n=%d: record round-trip corrupted: len(S)=%d N=%#x (want len %d, 0x2a)", n, len(rout.S), rout.N, n)
+		}
+	}
+}
