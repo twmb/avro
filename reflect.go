@@ -492,6 +492,19 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 	m := make(map[string]entry, len(fields))
 	for _, f := range fields {
 		if existing, ok := m[f.name]; ok {
+			// Equal depth is an ambiguous collision (Go makes the selector a
+			// compile error; encoding/json silently drops the field). REJECT
+			// rather than silently first-win — a silent wrong-field pick is
+			// the failure mode this codebase keeps hitting. Mirrors
+			// SchemaFor's collectFields exactly so the two field-mapping
+			// walkers agree, and since typeFieldMapping is shared by encode
+			// AND decode the reject has encode/decode parity by construction.
+			if len(f.index) == len(existing.index) {
+				return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf(
+					"duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
+					truncForError(f.name), t.String(),
+					truncForError(t.FieldByIndex(existing.index).Name), truncForError(t.FieldByIndex(f.index).Name))}
+			}
 			// Tagged always beats untagged.
 			if f.tagged && !existing.tagged {
 				m[f.name] = entry{f.index, f.tagged, f.omitzero}
@@ -500,7 +513,7 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 			if !f.tagged && existing.tagged {
 				continue
 			}
-			// Same tagged status: shallower (shorter index) wins.
+			// Same tagged status, different depth: shallower (shorter index) wins.
 			if len(f.index) < len(existing.index) {
 				m[f.name] = entry{f.index, f.tagged, f.omitzero}
 			}

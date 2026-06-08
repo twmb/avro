@@ -163,7 +163,10 @@ type Parent struct {
 
 When multiple fields at different depths resolve to the same Avro field name,
 the shallowest field wins. Among fields at the same depth, a tagged field wins
-over an untagged one.
+over an untagged one. Two fields that resolve to the same name at the same depth
+with the same tagged status are an ambiguous collision: encode, decode, and
+`SchemaFor` all return an error rather than silently selecting one (Go itself
+makes such a field reference a compile error).
 
 ## Schema Inference
 

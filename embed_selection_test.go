@@ -221,13 +221,18 @@ func fieldList(t reflect.Type) string {
 	return s + " }"
 }
 
-// TestRegression_EmbedEqualDepthAmbiguity documents the case the Go-promotion
-// oracle CANNOT adjudicate: a type reachable at EQUAL depth through two embeds.
-// Go makes v.X a compile error (ambiguous selector); reflect.FieldByName
-// returns the zero Value; encoding/json drops the field. doc.go's
-// "shallowest wins" is silent on equal-depth ties, so twmb's first-wins is a
-// deliberate policy, pinned so a change to it is conscious.
-func TestRegression_EmbedEqualDepthAmbiguity(t *testing.T) {
+// TestRegression_EmbedEqualDepthAmbiguityRejected pins that an equal-depth
+// name collision through two embeds is REJECTED by ALL THREE of SchemaFor,
+// encode, and decode — the two field-mapping walkers (collectFields for
+// SchemaFor, typeFieldMapping for runtime encode/decode) must agree. Go makes
+// v.X a compile error (ambiguous selector) and encoding/json silently drops
+// the field; twmb chooses to reject rather than silently first-win, because a
+// silent wrong-field pick is exactly the failure mode this codebase keeps
+// hitting. Because typeFieldMapping is shared by encode and decode, the reject
+// has encode/decode parity by construction. (Previously SchemaFor rejected
+// while runtime first-won — an internal divergence the twin-path catalog
+// surfaced.)
+func TestRegression_EmbedEqualDepthAmbiguityRejected(t *testing.T) {
 	type C struct {
 		X int32 `avro:"X"`
 	}
@@ -240,19 +245,29 @@ func TestRegression_EmbedEqualDepthAmbiguity(t *testing.T) {
 	if _, ok := reflect.TypeFor[R]().FieldByName("X"); ok {
 		t.Fatal("precondition: expected Go to treat R.X as ambiguous")
 	}
+
+	// SchemaFor rejects (the established behavior).
+	if _, err := SchemaFor[R](); err == nil {
+		t.Fatal("SchemaFor[R] must reject the equal-depth collision")
+	}
+
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"X","type":"int"}]}`)
+
+	// Encode must reject (no silent first-win).
 	var r R
 	r.A.C.X = 1
 	r.B.C.X = 2
-	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"X","type":"int"}]}`)
-	data, err := s.AppendEncode(nil, &r)
+	if _, err := s.AppendEncode(nil, &r); err == nil {
+		t.Fatal("encode must reject the equal-depth collision, not silently first-win")
+	}
+
+	// Decode must reject too — parity, since both share typeFieldMapping.
+	wire, err := MustParse(`{"type":"record","name":"R","fields":[{"name":"X","type":"int"}]}`).AppendEncode(nil, map[string]any{"X": int32(9)})
 	if err != nil {
-		t.Fatalf("equal-depth encode unexpectedly errored: %v", err)
+		t.Fatalf("setup encode via map: %v", err)
 	}
-	var out map[string]any
-	if _, err := s.Decode(data, &out); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if out["X"] != int32(1) {
-		t.Fatalf("equal-depth first-wins policy changed: X=%v, want 1 (A.C.X). If intentional, update this pin.", out["X"])
+	var into R
+	if _, err := s.Decode(wire, &into); err == nil {
+		t.Fatal("decode must reject the equal-depth collision (encode/decode parity)")
 	}
 }
