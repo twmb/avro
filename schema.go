@@ -1007,7 +1007,22 @@ func (b *builder) unnest(nest *builder) {
 // later cached references can skip the rejectCachedRefIfCustomTypeWouldMatch
 // check when this Parse already wired its own CTs.
 func (b *builder) hasCustomTypeWired() bool {
-	return len(b.custom) > 0
+	// Only a NON-wildcard CustomType bakes state onto the shared cached node
+	// (suppressLogical = true, set whenever a non-wildcard CT matches). A
+	// wildcard CT (empty LogicalType AND AvroType) suppresses nothing — its
+	// conversion lives entirely in the per-parse overlay — so a wildcard-only
+	// parse does NOT make its defined types "custom-affected" for the
+	// cache-boundary guard. Counting wildcards here (the old len(b.custom)>0)
+	// disagreed with findCustomTypeMatchInSubtree's wildcard SKIP, so a
+	// wildcard registered consistently across cache parses was spuriously
+	// rejected at a cache reference. Mirror that skip: count only wirings that
+	// actually suppress a built-in on the node.
+	for _, w := range b.custom {
+		if w.suppressLogical {
+			return true
+		}
+	}
+	return false
 }
 
 // putCustomWiring stores the wiring under node, allocating b.custom on
