@@ -66,7 +66,11 @@ func WithName(name string) SchemaOpt { return withName(name) }
 //   - map[string]T → map
 //   - struct → record (recursive)
 //   - time.Time → long with timestamp-millis (override with tag)
-//   - time.Duration → int with time-millis (override with tag)
+//   - time.Duration → int with time-millis (override with tag; a Duration is a
+//     span of time, so it is only meaningful with the time-millis/time-micros
+//     logicals — overriding it onto date or a timestamp-* logical maps a
+//     duration onto a point in time, and a large Duration overflows the
+//     narrower wire type)
 //   - *big.Rat → requires explicit decimal(p,s) tag
 //   - [16]byte with uuid tag → fixed(16) with uuid logical type
 //   - string (or text marshaler type) with uuid tag → string with uuid logical type
