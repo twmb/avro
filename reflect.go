@@ -490,32 +490,36 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 		omitzero bool
 	}
 	m := make(map[string]entry, len(fields))
+	ambiguous := make(map[string][2]string) // name -> the two colliding Go field names
 	for _, f := range fields {
 		if existing, ok := m[f.name]; ok {
-			// Equal depth is an ambiguous collision (Go makes the selector a
-			// compile error; encoding/json silently drops the field). REJECT
-			// rather than silently first-win — a silent wrong-field pick is
-			// the failure mode this codebase keeps hitting. Mirrors
-			// SchemaFor's collectFields exactly so the two field-mapping
-			// walkers agree, and since typeFieldMapping is shared by encode
-			// AND decode the reject has encode/decode parity by construction.
-			if len(f.index) == len(existing.index) {
-				return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf(
-					"duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
-					truncForError(f.name), t.String(),
-					truncForError(t.FieldByIndex(existing.index).Name), truncForError(t.FieldByIndex(f.index).Name))}
-			}
-			// Tagged always beats untagged.
+			// Tagged beats untagged (a tiebreaker, so not ambiguous).
 			if f.tagged && !existing.tagged {
 				m[f.name] = entry{f.index, f.tagged, f.omitzero}
+				delete(ambiguous, f.name)
 				continue
 			}
 			if !f.tagged && existing.tagged {
 				continue
 			}
-			// Same tagged status, different depth: shallower (shorter index) wins.
+			// Same tagged status: shallower (shorter index) wins (a tiebreaker).
 			if len(f.index) < len(existing.index) {
 				m[f.name] = entry{f.index, f.tagged, f.omitzero}
+				delete(ambiguous, f.name)
+				continue
+			}
+			if len(f.index) == len(existing.index) {
+				// Equal depth, same tagged status, no tiebreaker: AMBIGUOUS.
+				// Go makes the selector a compile error; encoding/json silently
+				// drops the field. We DEFER the error to lookup rather than
+				// rejecting here, so a coincidental collision on a field the
+				// schema never references (e.g. two embedded library structs
+				// that happen to share a name) does not break the whole struct
+				// — but a schema field that DOES resolve here errors loudly
+				// (not a silent first-win or drop). SchemaFor's collectFields
+				// rejects eagerly because it must emit every field; the runtime
+				// is schema-driven, so it only errors on names actually used.
+				ambiguous[f.name] = [2]string{t.FieldByIndex(existing.index).Name, t.FieldByIndex(f.index).Name}
 			}
 			continue
 		}
@@ -525,6 +529,11 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 	ats := make([][]int, 0, len(fieldNames))
 	ozs := make([]bool, 0, len(fieldNames))
 	for _, name := range fieldNames {
+		if names, amb := ambiguous[name]; amb {
+			return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf(
+				"duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
+				truncForError(name), t.String(), truncForError(names[0]), truncForError(names[1]))}
+		}
 		e, exists := m[name]
 		if !exists {
 			return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf("missing field %s", name)}

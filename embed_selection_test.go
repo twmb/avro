@@ -221,53 +221,63 @@ func fieldList(t reflect.Type) string {
 	return s + " }"
 }
 
-// TestRegression_EmbedEqualDepthAmbiguityRejected pins that an equal-depth
-// name collision through two embeds is REJECTED by ALL THREE of SchemaFor,
-// encode, and decode — the two field-mapping walkers (collectFields for
-// SchemaFor, typeFieldMapping for runtime encode/decode) must agree. Go makes
-// v.X a compile error (ambiguous selector) and encoding/json silently drops
-// the field; twmb chooses to reject rather than silently first-win, because a
-// silent wrong-field pick is exactly the failure mode this codebase keeps
-// hitting. Because typeFieldMapping is shared by encode and decode, the reject
-// has encode/decode parity by construction. (Previously SchemaFor rejected
-// while runtime first-won — an internal divergence the twin-path catalog
-// surfaced.)
-func TestRegression_EmbedEqualDepthAmbiguityRejected(t *testing.T) {
+// TestRegression_EmbedEqualDepthAmbiguity pins twmb's LAZY handling of an
+// equal-depth name collision through two embeds. The collision is genuinely
+// ambiguous (Go makes the selector a compile error; encoding/json silently
+// drops the field). twmb's contract:
+//   - SchemaFor REJECTS (eager — it must emit every field, and cannot emit two
+//     with the same name).
+//   - Runtime encode/decode (shared typeFieldMapping) reject ONLY when the
+//     schema actually resolves a field to the ambiguous name. A coincidental
+//     collision on a name the schema never references — e.g. two embedded
+//     library structs that happen to share a field name — does NOT break the
+//     struct; the other fields work. When the schema DOES use the ambiguous
+//     name, the error is loud and has encode/decode parity (vs json's silent
+//     drop, or the old silent first-win). The runtime is schema-driven, so it
+//     errors lazily; SchemaFor sees all fields, so it errors eagerly — a
+//     justified scoping difference, not a contradiction.
+func TestRegression_EmbedEqualDepthAmbiguity(t *testing.T) {
 	type C struct {
-		X int32 `avro:"X"`
+		Dup int32 `avro:"dup"`
 	}
 	type A struct{ C }
 	type B struct{ C }
+	// R collides on "dup" at equal depth, and also has a clean "keep" field.
 	type R struct {
 		A
 		B
-	}
-	if _, ok := reflect.TypeFor[R]().FieldByName("X"); ok {
-		t.Fatal("precondition: expected Go to treat R.X as ambiguous")
+		Keep int32 `avro:"keep"`
 	}
 
-	// SchemaFor rejects (the established behavior).
+	// SchemaFor rejects eagerly (cannot represent two "dup" fields).
 	if _, err := SchemaFor[R](); err == nil {
 		t.Fatal("SchemaFor[R] must reject the equal-depth collision")
 	}
 
-	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"X","type":"int"}]}`)
-
-	// Encode must reject (no silent first-win).
+	// Schema that NEVER references the ambiguous "dup": encode + decode work.
+	clean := MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
 	var r R
-	r.A.C.X = 1
-	r.B.C.X = 2
-	if _, err := s.AppendEncode(nil, &r); err == nil {
-		t.Fatal("encode must reject the equal-depth collision, not silently first-win")
-	}
-
-	// Decode must reject too — parity, since both share typeFieldMapping.
-	wire, err := MustParse(`{"type":"record","name":"R","fields":[{"name":"X","type":"int"}]}`).AppendEncode(nil, map[string]any{"X": int32(9)})
+	r.Keep = 7
+	wire, err := clean.AppendEncode(nil, &r)
 	if err != nil {
-		t.Fatalf("setup encode via map: %v", err)
+		t.Fatalf("unreferenced collision must NOT break the struct: encode errored: %v", err)
 	}
 	var into R
-	if _, err := s.Decode(wire, &into); err == nil {
-		t.Fatal("decode must reject the equal-depth collision (encode/decode parity)")
+	if _, err := clean.Decode(wire, &into); err != nil {
+		t.Fatalf("unreferenced collision must NOT break decode: %v", err)
+	}
+	if into.Keep != 7 {
+		t.Fatalf("keep round-trip: got %d want 7", into.Keep)
+	}
+
+	// Schema that DOES reference the ambiguous "dup": encode AND decode reject.
+	ambig := MustParse(`{"type":"record","name":"R","fields":[{"name":"dup","type":"int"}]}`)
+	if _, err := ambig.AppendEncode(nil, &r); err == nil {
+		t.Fatal("encode must reject when the schema resolves a field to the ambiguous name")
+	}
+	dwire, _ := MustParse(`{"type":"record","name":"R","fields":[{"name":"dup","type":"int"}]}`).AppendEncode(nil, map[string]any{"dup": int32(9)})
+	var into2 R
+	if _, err := ambig.Decode(dwire, &into2); err == nil {
+		t.Fatal("decode must reject the ambiguous name too (encode/decode parity)")
 	}
 }
