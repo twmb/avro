@@ -54,6 +54,26 @@
 // Null, deflate, snappy, and zstandard are built in. Custom codecs can be
 // provided via [WithCodec].
 //
+// # Block size limits
+//
+// The reader caps both the compressed block it reads off the wire
+// ([WithMaxBlockBytes]) and the size that block decompresses to
+// ([WithMaxDecompressedBlockBytes]), each defaulting to 64 MiB, to bound
+// memory and decode time on untrusted input. The writer has no such cap
+// (matching Java's DataFileWriter and fastavro): it writes whatever blocks it
+// is given.
+//
+// A single Avro datum cannot be split across blocks, so a value larger than
+// the reader default — e.g. an 80 MiB blob — is written as one block that a
+// default reader then refuses, with an error naming the option to raise. The
+// caps are a reader-side defense, so they live on the reader; to read a file
+// whose blocks exceed the default, raise the matching cap there:
+//
+//	r, err := ocf.NewReader(f, ocf.WithMaxDecompressedBlockBytes(128<<20))
+//
+// Configure the cap to match the largest block your writer produces (which,
+// for single large values, is governed by the datum size, not [WithBlockBytes]).
+//
 // [Object Container Files]: https://avro.apache.org/docs/current/specification/#object-container-files
 // [Avro specification]: https://avro.apache.org/docs/current/specification/#object-container-files
 package ocf
@@ -890,7 +910,7 @@ func (rd *Reader) readBlock() error {
 		return fmt.Errorf("ocf: invalid negative block size %d", size)
 	}
 	if size > rd.maxBlockBytes {
-		return fmt.Errorf("ocf: block size %d exceeds safety limit of %d", size, rd.maxBlockBytes)
+		return fmt.Errorf("ocf: block size %d exceeds safety limit of %d (raise WithMaxBlockBytes)", size, rd.maxBlockBytes)
 	}
 	// Guard against int truncation on 32-bit even when the user-configured
 	// limit allows large values (e.g. larger than MaxInt32).
