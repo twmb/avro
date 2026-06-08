@@ -66,11 +66,16 @@ func appendCanonSchema(dst []byte, s *aschema) []byte {
 	}
 }
 
-// appendCanonObject mirrors aobject.MarshalJSON's PCF key order and the
-// required-empty-array rules (record/error always emit "fields"; enum
-// always emits "symbols"), plus the non-PCF attributes that are present
-// only when the canon tree was not stripped (so the writer is a faithful
-// replacement, not only valid for the stripped tree).
+// appendCanonObject writes an aobject in PCF key order with the
+// required-empty-array rules (record/error always emit "fields"; enum always
+// emits "symbols"). It also emits the non-PCF attributes (namespace, aliases,
+// default, order, logicalType, precision, scale) when present, so it doubles
+// as a general-purpose object writer usable on an UNSTRIPPED tree — exercised
+// directly in that mode by schema_test.go. The Canonical() entry point feeds
+// an already-stripped tree (canonicalFirstOccurrence), so on that path only
+// name/type/the required arrays appear and the attribute branches are not
+// reached. (The aobject.MarshalJSON method this once mirrored has been
+// deleted; this is now the single object writer.)
 func appendCanonObject(dst []byte, o *aobject) []byte {
 	dst = append(dst, '{')
 	first := true
@@ -165,9 +170,12 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 	return append(dst, '}')
 }
 
-// appendCanonField mirrors afield.MarshalJSON: the canon tree strips
-// every field attribute except name and type, so only those two appear in
-// canonical output; the others are emitted faithfully if present.
+// appendCanonField writes an afield: name and type always, then the field
+// attributes (aliases, default, order, logicalType, precision, scale) when
+// present. The Canonical() path feeds a stripped tree, so only name/type
+// appear there; the attribute branches exist for the general-purpose writer
+// mode (symmetric with appendCanonObject). (The afield.MarshalJSON method this
+// once mirrored has been deleted.)
 func appendCanonField(dst []byte, f *afield) []byte {
 	dst = append(dst, '{')
 	dst = appendCanonString(dst, "name")

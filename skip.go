@@ -174,10 +174,7 @@ func skipMap(w *schemaNode) skipfn {
 			// and never false-rejects a legitimate block (each entry occupies
 			// at least minEntryBytes wire bytes).
 			func(count, _ int64, srcLen int) error {
-				if count > int64(srcLen)/int64(minEntryBytes) {
-					return fmt.Errorf("map block count %d exceeds remaining buffer length %d (min %d byte/entry)", count, srcLen, minEntryBytes)
-				}
-				return nil
+				return checkMapBlockBounds(count, srcLen, minEntryBytes)
 			},
 			func(src []byte, sl *slab) ([]byte, error) {
 				// Skip key (string), then value.

@@ -662,6 +662,19 @@ func checkArrayBlockBounds(count int64, totalItems int64, srcLen int, minItemByt
 	return nil
 }
 
+// checkMapBlockBounds bounds a map block's declared entry count against the
+// remaining buffer. A map entry's key is at least 1 byte (minEntryBytes >= 1),
+// so — unlike arrays — there is no zero-byte-item case; the bound is always
+// buffer-relative and never false-rejects a valid block. Shared by deserMap and
+// skipMap so the two block-bound checks cannot drift (the array path already
+// factored its bound into checkArrayBlockBounds).
+func checkMapBlockBounds(count int64, srcLen int, minEntryBytes int) error {
+	if count > int64(srcLen)/int64(minEntryBytes) {
+		return fmt.Errorf("map block count %d exceeds remaining buffer length %d (min %d byte/entry)", count, srcLen, minEntryBytes)
+	}
+	return nil
+}
+
 // decimalScaleLimit caps decimal/big-decimal scale and precision to
 // prevent attacker-controlled 10^scale allocations during Exp.
 // Applied at schema parse (regular decimal precision/scale), wire
@@ -1265,8 +1278,8 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			}
 			return src, nil
 		}
-		if count > int64(len(src))/int64(s.minEntryBytes) {
-			return nil, fmt.Errorf("map block count %d exceeds remaining buffer length %d (min %d byte/entry)", count, len(src), s.minEntryBytes)
+		if err := checkMapBlockBounds(count, len(src), s.minEntryBytes); err != nil {
+			return nil, err
 		}
 		// Lazy-allocate on first block using its count as a size hint,
 		// capped to bound bucket-overhead amplification on hostile

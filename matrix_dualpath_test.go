@@ -58,6 +58,13 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 		{"date", `{"type":"int","logicalType":"date"}`, time.Date(2020, 6, 1, 0, 0, 0, 0, time.UTC)},
 		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, time.UnixMilli(1234567).UTC()},
 		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, time.UnixMicro(1234567).UTC()},
+		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, time.Unix(0, 1234567890123).UTC()},
+		// local-timestamp-* and timestamp-nanos exercise usTimestampNanos /
+		// usLocalTimestamp{Millis,Micros,Nanos} — unsafe twins the parity
+		// battery previously omitted (twin-path catalog GAP).
+		{"local-timestamp-millis", `{"type":"long","logicalType":"local-timestamp-millis"}`, time.Date(2020, 1, 2, 3, 4, 5, 6000000, time.UTC)},
+		{"local-timestamp-micros", `{"type":"long","logicalType":"local-timestamp-micros"}`, time.Date(2020, 1, 2, 3, 4, 5, 6000, time.UTC)},
+		{"local-timestamp-nanos", `{"type":"long","logicalType":"local-timestamp-nanos"}`, time.Date(2020, 1, 2, 3, 4, 5, 6, time.UTC)},
 		{"time-millis/duration", `{"type":"int","logicalType":"time-millis"}`, 3*time.Hour + 14*time.Minute},
 		{"time-micros/duration", `{"type":"long","logicalType":"time-micros"}`, 3*time.Hour + 14*time.Minute + 159*time.Microsecond},
 		{"time-millis/time", `{"type":"int","logicalType":"time-millis"}`, time.Date(2020, 1, 1, 3, 14, 15, 0, time.UTC)},
@@ -65,6 +72,9 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 		{"duration-fixed", `{"type":"fixed","name":"Dur","size":12,"logicalType":"duration"}`, avro.Duration{Months: 1, Days: 2, Milliseconds: 3}},
 
 		{"decimal", `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`, rat(1234, 100)},
+		// uuid on a STRING carrier (usUUID/usFixedUUIDString string arm) —
+		// another unsafe twin omitted from the battery.
+		{"uuid-string", `{"type":"string","logicalType":"uuid"}`, "12345678-1234-1234-1234-123456789abc"},
 
 		// Composites as struct fields (the unsafe array/map/union encoders).
 		{"slice-int", `{"type":"array","items":"int"}`, []int32{1, 2, 3}},
