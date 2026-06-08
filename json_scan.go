@@ -232,7 +232,13 @@ func (s *jsonScanner) skipValue() error {
 // errors rather than overflowing the stack (the old skipCompound was
 // iterative; this validator is recursive).
 func (s *jsonScanner) skipValueDepth(depth int) error {
-	if depth > maxDepth {
+	// Use the value path's >= maxDepth (trips at the maxDepth-th level), not
+	// >, so the two recursion guards agree on the bound. depth restarts at 0
+	// per skipped value rather than threading the enclosing decode depth: a
+	// skipped value is a self-contained sub-parse that discards its data, so a
+	// fresh maxDepth budget is fine (the worst case, a deep value with a deep
+	// skipped tail, is still ~2*maxDepth frames — bounded for stack/DoS).
+	if depth >= maxDepth {
 		return errTooDeep
 	}
 	s.skipWhitespace()
