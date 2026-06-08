@@ -219,18 +219,30 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 // nan/infinity/inf). Uppercase 'N' / 'I' / '-I' are the bare-special-
 // float starts.
 func (s *jsonScanner) skipValue() error {
+	return s.skipValueDepth(0)
+}
+
+// skipValueDepth skips one JSON value while VALIDATING its full grammar, not
+// merely delimiting it. Unknown record fields route here. The former
+// delimit-only skip was a SECOND, lax JSON parser that accepted malformed
+// input the value path (and Java/fastavro/encoding/json) reject: the number
+// arm took 1.2.3/1e/5., the string arm skipped escapes blindly so "\q" passed,
+// and skipCompound counted only bracket depth so [}] / {"a" 1} / [1,2,]
+// "balanced". depth bounds recursion so a pathologically deep skipped value
+// errors rather than overflowing the stack (the old skipCompound was
+// iterative; this validator is recursive).
+func (s *jsonScanner) skipValueDepth(depth int) error {
+	if depth > maxDepth {
+		return errTooDeep
+	}
 	s.skipWhitespace()
 	if s.pos >= len(s.data) {
 		return fmt.Errorf("avro json: unexpected EOF")
 	}
 	switch s.data[s.pos] {
 	case '"':
-		_, _, _, err := s.consumeStringRaw()
-		return err
-	case 't':
-		_, err := s.consumeBool()
-		return err
-	case 'f':
+		return s.skipStringStrict()
+	case 't', 'f':
 		_, err := s.consumeBool()
 		return err
 	case 'n':
@@ -244,12 +256,8 @@ func (s *jsonScanner) skipValue() error {
 		return err
 	case '-':
 		// Disambiguate -<digit> (negative number) vs -I... (bare
-		// -Infinity / -INF / -Inf). The bare-special-float arm
-		// always starts uppercase 'I' after the leading '-'; any
-		// other byte (digit, or invalid like '-N') routes to
-		// consumeNumberBytes which handles the negative-number
-		// case and emits a consistent "expected number" error for
-		// invalid shapes.
+		// -Infinity / -INF / -Inf): the bare-special-float arm always
+		// starts uppercase 'I' after the leading '-'.
 		if s.peekAt(1) == 'I' {
 			t, err := s.consumeBareSpecialFloat()
 			if err != nil {
@@ -258,44 +266,152 @@ func (s *jsonScanner) skipValue() error {
 			_, err = parseSpecialFloat(t)
 			return err
 		}
-		_, err := s.consumeNumberBytes()
-		return err
+		return s.skipNumberStrict()
 	case '[':
-		return s.skipCompound('[', ']')
+		return s.skipArrayStrict(depth)
 	case '{':
-		return s.skipCompound('{', '}')
+		return s.skipObjectStrict(depth)
 	default:
-		_, err := s.consumeNumberBytes()
-		return err
+		return s.skipNumberStrict()
 	}
 }
 
-func (s *jsonScanner) skipCompound(open, close byte) error {
-	s.pos++ // consume open
-	depth := 1
-	for s.pos < len(s.data) && depth > 0 {
+// skipStringStrict consumes a JSON string and VALIDATES its escapes;
+// consumeStringRaw checks control bytes and UTF-8 but delimits escapes blindly,
+// so "\q"/"\x41" would otherwise pass.
+func (s *jsonScanner) skipStringStrict() error {
+	start, end, hasEscapes, err := s.consumeStringRaw()
+	if err != nil {
+		return err
+	}
+	if hasEscapes {
+		return walkJSONEscapes(s.data[start:end], func(rune) error { return nil })
+	}
+	return nil
+}
+
+// skipNumberStrict consumes a JSON number and validates the RFC 8259 grammar;
+// consumeNumberBytes delimits a [0-9.eE+-] run, so 1.2.3/1e/5. would pass.
+func (s *jsonScanner) skipNumberStrict() error {
+	nb, err := s.consumeNumberBytes()
+	if err != nil {
+		return err
+	}
+	return validateJSONNumberGrammar(nb)
+}
+
+func (s *jsonScanner) skipArrayStrict(depth int) error {
+	s.pos++ // '['
+	s.skipWhitespace()
+	if s.pos < len(s.data) && s.data[s.pos] == ']' {
+		s.pos++
+		return nil
+	}
+	for {
+		if err := s.skipValueDepth(depth + 1); err != nil {
+			return err
+		}
+		s.skipWhitespace()
+		if s.pos >= len(s.data) {
+			return fmt.Errorf("avro json: unterminated array")
+		}
 		switch s.data[s.pos] {
-		case open:
-			depth++
-		case close:
-			depth--
-		case '"':
+		case ',':
 			s.pos++
-			for s.pos < len(s.data) {
-				if s.data[s.pos] == '\\' {
-					s.pos += 2
-					continue
-				}
-				if s.data[s.pos] == '"' {
-					break
-				}
-				s.pos++
-			}
+		case ']':
+			s.pos++
+			return nil
+		default:
+			return fmt.Errorf("avro json: expected ',' or ']' in array at offset %d", s.pos)
+		}
+	}
+}
+
+func (s *jsonScanner) skipObjectStrict(depth int) error {
+	s.pos++ // '{'
+	s.skipWhitespace()
+	if s.pos < len(s.data) && s.data[s.pos] == '}' {
+		s.pos++
+		return nil
+	}
+	for {
+		s.skipWhitespace()
+		if s.pos >= len(s.data) || s.data[s.pos] != '"' {
+			return fmt.Errorf("avro json: expected object key string at offset %d", s.pos)
+		}
+		if err := s.skipStringStrict(); err != nil {
+			return err
+		}
+		s.skipWhitespace()
+		if s.pos >= len(s.data) || s.data[s.pos] != ':' {
+			return fmt.Errorf("avro json: expected ':' after object key at offset %d", s.pos)
 		}
 		s.pos++
+		if err := s.skipValueDepth(depth + 1); err != nil {
+			return err
+		}
+		s.skipWhitespace()
+		if s.pos >= len(s.data) {
+			return fmt.Errorf("avro json: unterminated object")
+		}
+		switch s.data[s.pos] {
+		case ',':
+			s.pos++
+		case '}':
+			s.pos++
+			return nil
+		default:
+			return fmt.Errorf("avro json: expected ',' or '}' in object at offset %d", s.pos)
+		}
 	}
-	if depth != 0 {
-		return fmt.Errorf("avro json: unterminated %c at offset %d", open, s.pos)
+}
+
+// validateJSONNumberGrammar checks b against the RFC 8259 number grammar:
+// -? ( 0 | [1-9][0-9]* ) ( '.' [0-9]+ )? ( [eE] [+-]? [0-9]+ )?.
+// consumeNumberBytes already rejected leading zeros and a non-digit start; this
+// rejects the multi-dot / bare-exponent / trailing-dot shapes its delimiter
+// loop accepts.
+func validateJSONNumberGrammar(b []byte) error {
+	bad := func() error { return fmt.Errorf("avro json: invalid JSON number %q", b) }
+	i := 0
+	if i < len(b) && b[i] == '-' {
+		i++
+	}
+	if i >= len(b) {
+		return bad()
+	}
+	if b[i] == '0' {
+		i++
+	} else if b[i] >= '1' && b[i] <= '9' {
+		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+			i++
+		}
+	} else {
+		return bad()
+	}
+	if i < len(b) && b[i] == '.' {
+		i++
+		if i >= len(b) || b[i] < '0' || b[i] > '9' {
+			return bad()
+		}
+		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+			i++
+		}
+	}
+	if i < len(b) && (b[i] == 'e' || b[i] == 'E') {
+		i++
+		if i < len(b) && (b[i] == '+' || b[i] == '-') {
+			i++
+		}
+		if i >= len(b) || b[i] < '0' || b[i] > '9' {
+			return bad()
+		}
+		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
+			i++
+		}
+	}
+	if i != len(b) {
+		return bad()
 	}
 	return nil
 }
