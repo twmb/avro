@@ -290,14 +290,20 @@ func (s *jsonScanner) skipStringStrict() error {
 	return nil
 }
 
-// skipNumberStrict consumes a JSON number and validates the RFC 8259 grammar;
-// consumeNumberBytes delimits a [0-9.eE+-] run, so 1.2.3/1e/5. would pass.
+// skipNumberStrict consumes a JSON number and validates the RFC 8259 grammar
+// through the SAME isJSONNumber gate the value path uses (parseJSONNumberAsFloat,
+// json.Number) — so the skip path and value path cannot disagree on what a
+// valid JSON number is. consumeNumberBytes only delimits a [0-9.eE+-] run, so
+// without this gate 1.2.3/1e/5. would pass.
 func (s *jsonScanner) skipNumberStrict() error {
 	nb, err := s.consumeNumberBytes()
 	if err != nil {
 		return err
 	}
-	return validateJSONNumberGrammar(nb)
+	if !isJSONNumber(unsafe.String(unsafe.SliceData(nb), len(nb))) {
+		return fmt.Errorf("avro json: invalid JSON number %q", truncForError(string(nb)))
+	}
+	return nil
 }
 
 func (s *jsonScanner) skipArrayStrict(depth int) error {
@@ -364,56 +370,6 @@ func (s *jsonScanner) skipObjectStrict(depth int) error {
 			return fmt.Errorf("avro json: expected ',' or '}' in object at offset %d", s.pos)
 		}
 	}
-}
-
-// validateJSONNumberGrammar checks b against the RFC 8259 number grammar:
-// -? ( 0 | [1-9][0-9]* ) ( '.' [0-9]+ )? ( [eE] [+-]? [0-9]+ )?.
-// consumeNumberBytes already rejected leading zeros and a non-digit start; this
-// rejects the multi-dot / bare-exponent / trailing-dot shapes its delimiter
-// loop accepts.
-func validateJSONNumberGrammar(b []byte) error {
-	bad := func() error { return fmt.Errorf("avro json: invalid JSON number %q", b) }
-	i := 0
-	if i < len(b) && b[i] == '-' {
-		i++
-	}
-	if i >= len(b) {
-		return bad()
-	}
-	if b[i] == '0' {
-		i++
-	} else if b[i] >= '1' && b[i] <= '9' {
-		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-			i++
-		}
-	} else {
-		return bad()
-	}
-	if i < len(b) && b[i] == '.' {
-		i++
-		if i >= len(b) || b[i] < '0' || b[i] > '9' {
-			return bad()
-		}
-		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-			i++
-		}
-	}
-	if i < len(b) && (b[i] == 'e' || b[i] == 'E') {
-		i++
-		if i < len(b) && (b[i] == '+' || b[i] == '-') {
-			i++
-		}
-		if i >= len(b) || b[i] < '0' || b[i] > '9' {
-			return bad()
-		}
-		for i < len(b) && b[i] >= '0' && b[i] <= '9' {
-			i++
-		}
-	}
-	if i != len(b) {
-		return bad()
-	}
-	return nil
 }
 
 // parseJSONInt32 parses raw JSON number bytes directly as int32.
