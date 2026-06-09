@@ -1,6 +1,7 @@
 package avro_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/twmb/avro"
@@ -158,5 +159,88 @@ func TestRegression_SchemaCacheSelfContainedEdgeCases(t *testing.T) {
 				t.Errorf("Root().Schema() FAILS: %v", err)
 			}
 		})
+	}
+}
+
+// TestRegression_SchemaCacheRebuildPreservesMetadata pins that making a
+// cache-referenced schema self-contained preserves every original attribute —
+// node doc, field doc/order/props, at both the outer and the inlined inner
+// level — exactly as the logically-identical inline schema does. (The first
+// self-containment fix rebuilt from the attribute-poor node tree and dropped
+// these; the JSON-inline approach preserves them.)
+func TestRegression_SchemaCacheRebuildPreservesMetadata(t *testing.T) {
+	innerDef := `{"type":"record","name":"ns.Inner","doc":"inner doc","fields":[` +
+		`{"name":"x","type":"int","doc":"x field doc","order":"descending","ns.fprop":"xfp"}]}`
+	outer := func(ref string) string {
+		return `{"type":"record","name":"Outer","doc":"outer doc","fields":[` +
+			`{"name":"i","type":` + ref + `,"doc":"i field doc","order":"ignore","ns.iprop":"ifp"}]}`
+	}
+	var c avro.SchemaCache
+	if _, err := c.Parse(innerDef); err != nil {
+		t.Fatalf("register Inner: %v", err)
+	}
+	viaCache, err := c.Parse(outer(`"ns.Inner"`))
+	if err != nil {
+		t.Fatalf("parse Outer via cache: %v", err)
+	}
+	inline := avro.MustParse(outer(innerDef))
+
+	rc, ri := viaCache.Root(), inline.Root()
+	if rc.Doc != ri.Doc {
+		t.Errorf("Outer.Doc: cache=%q inline=%q", rc.Doc, ri.Doc)
+	}
+	if rc.Fields[0].Doc != ri.Fields[0].Doc {
+		t.Errorf("Outer.i.Doc: cache=%q inline=%q", rc.Fields[0].Doc, ri.Fields[0].Doc)
+	}
+	if rc.Fields[0].Order != ri.Fields[0].Order {
+		t.Errorf("Outer.i.Order: cache=%q inline=%q", rc.Fields[0].Order, ri.Fields[0].Order)
+	}
+	if fmt.Sprint(rc.Fields[0].Props) != fmt.Sprint(ri.Fields[0].Props) {
+		t.Errorf("Outer.i.Props: cache=%v inline=%v", rc.Fields[0].Props, ri.Fields[0].Props)
+	}
+	// The inlined inner type's own metadata must survive too.
+	ci, ii := rc.Fields[0].Type, ri.Fields[0].Type
+	if ci.Doc != ii.Doc {
+		t.Errorf("Inner.Doc: cache=%q inline=%q", ci.Doc, ii.Doc)
+	}
+	if ci.Fields[0].Doc != ii.Fields[0].Doc {
+		t.Errorf("Inner.x.Doc: cache=%q inline=%q", ci.Fields[0].Doc, ii.Fields[0].Doc)
+	}
+	if ci.Fields[0].Order != ii.Fields[0].Order {
+		t.Errorf("Inner.x.Order: cache=%q inline=%q", ci.Fields[0].Order, ii.Fields[0].Order)
+	}
+	if fmt.Sprint(ci.Fields[0].Props) != fmt.Sprint(ii.Fields[0].Props) {
+		t.Errorf("Inner.x.Props: cache=%v inline=%v", ci.Fields[0].Props, ii.Fields[0].Props)
+	}
+}
+
+// TestRegression_SchemaCacheTransitiveRefs pins transitive cross-parse
+// references: C → B → A, each defined in its own Parse. C's self-contained form
+// must inline B (which itself inlines A), matching the fully-inline schema.
+func TestRegression_SchemaCacheTransitiveRefs(t *testing.T) {
+	var c avro.SchemaCache
+	aDef := `{"type":"record","name":"A","fields":[{"name":"x","type":"int"}]}`
+	bDef := `{"type":"record","name":"B","fields":[{"name":"a","type":"A"}]}`
+	if _, err := c.Parse(aDef); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	if _, err := c.Parse(bDef); err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	viaCache, err := c.Parse(`{"type":"record","name":"C","fields":[{"name":"b","type":"B"}]}`)
+	if err != nil {
+		t.Fatalf("C: %v", err)
+	}
+	inline := avro.MustParse(`{"type":"record","name":"C","fields":[{"name":"b","type":` +
+		`{"type":"record","name":"B","fields":[{"name":"a","type":` +
+		`{"type":"record","name":"A","fields":[{"name":"x","type":"int"}]}}]}}]}`)
+	if string(viaCache.Canonical()) != string(inline.Canonical()) {
+		t.Errorf("transitive Canonical diverges:\n cache : %s\n inline: %s", viaCache.Canonical(), inline.Canonical())
+	}
+	if string(viaCache.Fingerprint(avro.NewRabin())) != string(inline.Fingerprint(avro.NewRabin())) {
+		t.Errorf("transitive Fingerprint diverges")
+	}
+	if _, err := avro.Parse(string(viaCache.Canonical())); err != nil {
+		t.Errorf("Parse(transitive cache.Canonical()) FAILS: %v", err)
 	}
 }
