@@ -1020,17 +1020,25 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			buf = appendJSONString(buf, f.name)
 			buf = append(buf, ':')
 			fv := fieldByIndexZero(v, mapping.indices[i])
-			// Honor omitzero: mirrors ser.go's slow-path check
-			// at the binary site so a value-typed zero-value
-			// null-union field renders as JSON `null` rather
-			// than the value's zero literal. Position-agnostic on
-			// the JSON side — only the binary path needs
-			// nullUnionBytes for the branch-index byte. avroType
-			// lives on serRecord.fields[i] (parallel-indexed to
-			// node.fields[i]).
-			if mapping.omitzero[i] && node.serRecord.fields[i].avroType == "nullunion" && valueIsZero(fv) {
-				buf = append(buf, "null"...)
-				continue
+			// Honor omitzero via the shared omitzeroAction (the same
+			// decision as ser.go's binary site): a zero/IsZero value
+			// emits the field's default, else JSON `null` for a
+			// nullable field, else nothing (fall through to encode the
+			// zero). avroType/hasDefault live on serRecord.fields[i]
+			// (parallel-indexed to node.fields[i]).
+			if mapping.omitzero[i] && valueIsZero(fv) {
+				switch node.serRecord.fields[i].omitzeroAction() {
+				case ozDefault:
+					buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, depth)
+					if err != nil {
+						return nil, err
+					}
+					continue
+				case ozNull:
+					buf = append(buf, "null"...)
+					continue
+				}
+				// ozNoop: fall through to the normal field encoder.
 			}
 			buf, err = appendAvroJSON(buf, fv, f.node, cfg, custom, depth+1)
 			if err != nil {

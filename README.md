@@ -145,10 +145,12 @@ Supported options:
   field of its own for `default=`, `alias=`, logical-type tags, etc. to
   apply to. Put those options on the embed's child fields directly.
 
-- **omitzero**: when encoding, if the field is the zero value for its type (or
-  implements an `IsZero() bool` method that returns true), the Avro default
-  value from the schema is used instead. This is useful for optional fields in
-  `["null", T]` unions or fields with explicit defaults.
+- **omitzero**: when encoding, a zero value (or a field whose `IsZero() bool`
+  method returns true) is encoded as if its key were omitted from a
+  `map[string]any` — the field's schema default is used. A nullable field with
+  no default encodes `null`; a non-nullable field with no default keeps its zero
+  value (there is nothing to fill with). Useful for optional fields in
+  `["null", T]` / `["T", "null"]` unions or fields with explicit defaults.
 
 Embedded (anonymous) struct fields are automatically inlined — their fields are
 promoted into the parent as if declared directly. To prevent inlining an

@@ -1094,6 +1094,36 @@ type serRecordField struct {
 	hasDefault   bool
 }
 
+// ozAction is what an omitzero-tagged field does when its Go value is zero (or
+// IsZero() reports true). It is the SINGLE source of truth for the omitzero
+// contract, shared by the binary, JSON, and unsafe encode paths so they cannot
+// drift apart (the doc-vs-impl divergence that this consolidates). See doc.go's
+// "# Struct tags".
+type ozAction uint8
+
+const (
+	ozNoop    ozAction = iota // no-op: encode the zero value normally
+	ozDefault                 // emit the field's schema default (== map default-fill)
+	ozNull                    // emit the null branch (a nullable field with no default)
+)
+
+// omitzeroAction reports what omitzero does for a zero value of this field:
+// fill the schema default if it has one, else null if the field is a nullable
+// union, else nothing. This mirrors map[string]any default-fill, except a
+// nullable field with no default yields null here rather than the "missing
+// key" error map-fill raises (a zero value of a nullable field maps naturally
+// to its null branch).
+func (f *serRecordField) omitzeroAction() ozAction {
+	switch {
+	case f.hasDefault:
+		return ozDefault
+	case f.avroType == "nullunion":
+		return ozNull
+	default:
+		return ozNoop
+	}
+}
+
 type serRecord struct {
 	fields []serRecordField
 	names  []string
@@ -1221,15 +1251,23 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 	}
 	for i, f := range s.fields {
 		fv := fieldByIndexZero(v, mapping.indices[i])
-		// omitzero + nullunion: if the Go field is zero, encode as
-		// the null branch. The wire byte depends on null position:
-		// ["null",T] → 0x00 (index 0); ["T","null"] → 0x02
-		// (zigzag-encoded index 1). nullByte comes from
-		// fieldMeta.nullSecond via nullUnionBytes.
-		if mapping.omitzero[i] && f.avroType == "nullunion" && valueIsZero(fv) {
-			nullByte, _ := nullUnionBytes(f.meta != nil && f.meta.nullSecond)
-			dst = append(dst, nullByte)
-			continue
+		// omitzero: a zero/IsZero value encodes as if the field were
+		// absent — the schema default, else null for a nullable field,
+		// else the zero itself (no-op). The decision is shared via
+		// omitzeroAction so binary/JSON/unsafe agree. The null byte's
+		// position depends on the union: ["null",T] → 0x00 (index 0),
+		// ["T","null"] → 0x02 (zigzag index 1), from nullUnionBytes.
+		if mapping.omitzero[i] && valueIsZero(fv) {
+			switch f.omitzeroAction() {
+			case ozDefault:
+				dst = append(dst, f.defaultBytes...)
+				continue
+			case ozNull:
+				nullByte, _ := nullUnionBytes(f.meta != nil && f.meta.nullSecond)
+				dst = append(dst, nullByte)
+				continue
+			}
+			// ozNoop: fall through to the normal field encoder.
 		}
 		if dst, err = f.fn(dst, fv, depth+1); err != nil {
 			return nil, recordFieldError(t, f.name, err)

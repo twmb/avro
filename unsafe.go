@@ -33,8 +33,11 @@ type fastFieldSer struct {
 	ser      userfn // non-nil for unsafe-optimized fields (primitives)
 	slowFn   serfn  // non-nil for reflect-based fields (complex types)
 	slowIdx  []int  // field index path for FieldByIndex (used with slowFn)
-	omitzero bool   // if true and field is nullunion, check IsZero before ser
-	nullByte byte   // when omitzero fires, this is the null-branch index byte
+	omitzero bool   // true when omitzero acts on this field (fills a default or null)
+	// when omitzero fires on a zero value, the bytes to emit: the field's
+	// default (ozDefault) or the null-branch index byte (ozNull). Precomputed
+	// at compile from omitzeroAction so the fast path matches the reflect path.
+	omitzeroBytes []byte
 }
 
 type fastRecordDeser struct {
@@ -61,10 +64,12 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 	for i := range fields {
 		f := &fields[i]
 		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
-		// omitzero + nullunion fields need a runtime zero check before
-		// encoding, which the unsafe fast path can't do — fall back to
-		// the reflect-based slow path for these fields.
-		oz := mapping.omitzero[i] && f.avroType == "nullunion"
+		// An omitzero field that actually acts (fills a default or a null
+		// branch — see omitzeroAction) needs a runtime zero check the
+		// unsafe fast path can't do, so fall back to the reflect slow path.
+		// A no-op omitzero (non-nullable, no default) just encodes the
+		// value, so it stays on the fast path.
+		oz := mapping.omitzero[i] && f.omitzeroAction() != ozNoop
 		var fn userfn
 		if ok && !oz {
 			fn = tryCompileFieldSer(f, goType)
@@ -84,7 +89,13 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 				omitzero: oz,
 			}
 			if oz {
-				ffs.nullByte, _ = nullUnionBytes(f.meta != nil && f.meta.nullSecond)
+				switch f.omitzeroAction() {
+				case ozDefault:
+					ffs.omitzeroBytes = f.defaultBytes
+				case ozNull:
+					nb, _ := nullUnionBytes(f.meta != nil && f.meta.nullSecond)
+					ffs.omitzeroBytes = []byte{nb}
+				}
 			}
 			fast.fields[i] = ffs
 		}
@@ -155,10 +166,11 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 		} else {
 			fv := fieldByIndexZero(v, f.slowIdx)
 			if f.omitzero && valueIsZero(fv) {
-				// f.nullByte is populated at compile (compileFastSer)
-				// from fieldMeta.nullSecond — 0x00 for ["null",T],
-				// 0x02 for ["T","null"].
-				dst = append(dst, f.nullByte)
+				// f.omitzeroBytes is populated at compile (compileFastSer)
+				// from omitzeroAction — the field's default, or the
+				// null-branch byte (0x00 for ["null",T], 0x02 for
+				// ["T","null"]).
+				dst = append(dst, f.omitzeroBytes...)
 				continue
 			}
 			dst, err = f.slowFn(dst, fv, depth+1)
