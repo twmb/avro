@@ -302,6 +302,67 @@ func (n *SchemaNode) toJSON() any {
 	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "")
 }
 
+// schemaNodeToPublic converts the internal resolved *schemaNode tree into the
+// public SchemaNode tree, so a fully self-contained schema can be emitted from
+// it via [SchemaNode.Schema] (which runs toJSONDedup). This is the bridge used
+// to make a SchemaCache-referenced schema self-contained: the resolved tree
+// already inlines every cache-inherited definition (that is why Encode/Decode
+// work), so re-emitting it via the dedup walker produces a cache-independent
+// schema whose Canonical/Fingerprint/Root/String are correct.
+//
+// Recursion is emitted as a name reference via the per-path inProgress set;
+// repeated sibling occurrences of a named type get full definitions that
+// toJSONDedup then collapses to first-occurrence. The internal name is the
+// fully-qualified name, placed in Name (dotted, so nodeFullname returns it).
+func schemaNodeToPublic(n *schemaNode, inProgress map[*schemaNode]bool) SchemaNode {
+	if n == nil {
+		return SchemaNode{}
+	}
+	named := isNamedKind(n.kind) && n.name != ""
+	if named && inProgress[n] {
+		return SchemaNode{Type: n.name} // recursive back-reference
+	}
+	if named {
+		inProgress[n] = true
+		defer delete(inProgress, n)
+	}
+	pub := SchemaNode{
+		Type:           n.kind,
+		Name:           n.name,
+		Aliases:        n.aliases,
+		LogicalType:    n.logical,
+		Symbols:        n.symbols,
+		EnumDefault:    n.enumDef,
+		HasEnumDefault: n.hasEnumDef,
+		Size:           n.size,
+		Precision:      n.precision,
+		Scale:          n.scale,
+		Props:          n.props,
+	}
+	if n.items != nil {
+		it := schemaNodeToPublic(n.items, inProgress)
+		pub.Items = &it
+	}
+	if n.values != nil {
+		v := schemaNodeToPublic(n.values, inProgress)
+		pub.Values = &v
+	}
+	for _, b := range n.branches {
+		pub.Branches = append(pub.Branches, schemaNodeToPublic(b, inProgress))
+	}
+	for i := range n.fields {
+		f := &n.fields[i]
+		pub.Fields = append(pub.Fields, SchemaField{
+			Name:       f.name,
+			Aliases:    f.aliases,
+			Type:       schemaNodeToPublic(f.node, inProgress),
+			Default:    f.defaultVal,
+			HasDefault: f.hasDefault,
+		})
+	}
+	return pub
+}
+
 // toJSONWalk is the cycle-aware walker shared by toJSON and toJSONDedup.
 // visited is threaded through every recursive call so cycles introduced
 // via Items / Values pointers terminate — see

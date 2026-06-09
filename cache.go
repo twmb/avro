@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"strings"
@@ -130,6 +131,33 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	s, err := parse(schema, b)
 	if err != nil {
 		return nil, err
+	}
+
+	// A parse that REFERENCES a type defined in a PRIOR cache Parse resolves
+	// the reference in the node tree (so Encode/Decode work) but leaves a
+	// dangling bare reference in the JSON-derived forms (s.c / s.full): the
+	// inherited definition lives only in the resolved node. That makes
+	// Canonical()/Fingerprint()/Root()/String() non-self-contained, violating
+	// the documented "independent of the cache" contract and breaking
+	// cross-impl fingerprint / single-object-encoding interop. Detect it by
+	// re-parsing s.full cache-lessly; on failure (a dangling inherited ref),
+	// rebuild the metadata forms from the resolved node tree — which IS
+	// self-contained — via SchemaNode.Schema (the dedup walker that emits each
+	// named type's full definition at first occurrence). ser/deser/node (the
+	// cache-wired encode/decode path) are kept untouched; only the metadata
+	// forms become self-contained. A self-contained parse re-parses fine and
+	// is left as-is, preserving its original String() form.
+	if len(cloned) > 0 && s.node != nil {
+		if _, perr := Parse(s.full, opts...); perr != nil {
+			sn := schemaNodeToPublic(s.node, map[*schemaNode]bool{})
+			selfContained, rerr := sn.Schema(opts...)
+			if rerr != nil {
+				return nil, fmt.Errorf("avro: making cache-referenced schema self-contained: %w", rerr)
+			}
+			s.c = selfContained.c
+			s.full = selfContained.full
+			s.soe = selfContained.soe
+		}
 	}
 
 	// Named types are safe to cache unconditionally: applyCustomTypes
