@@ -178,7 +178,10 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	if tree, terr := unmarshalAnyPreservePrecision([]byte(selfContained)); terr == nil {
 		collectTreeDefs(tree, "", func(fn string, def any) {
 			if _, ok := c.defs[fn]; !ok {
-				c.defs[fn] = def
+				// Store with the namespace made explicit so the definition
+				// resolves to the same fullname wherever it is later spliced,
+				// regardless of the enclosing namespace at the reference site.
+				c.defs[fn] = defWithExplicitNamespace(def, fn)
 			}
 		})
 	}
@@ -340,6 +343,26 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, local, inlined map
 		return v
 	}
 	return node
+}
+
+// defWithExplicitNamespace deep-copies a named-type definition and makes its
+// namespace explicit from the resolved fullname: "name" is set to the
+// unqualified short name and "namespace" to the resolved namespace — "" for the
+// null namespace, which forces null even inside a namespaced splice site (the
+// documented "namespace":"" escape). Without this, a definition that relied on
+// an inherited namespace (no explicit "namespace", short "name") would
+// re-inherit the enclosing namespace of whatever schema it is later spliced
+// into and resolve to the WRONG fullname (e.g. a.b.Inner becoming c.d.Inner).
+// Only the top level is rewritten: nested named types resolve relative to this
+// now-explicit namespace (inherited children) or keep their own explicit
+// namespace, so both inheritance and explicit-override survive the splice.
+func defWithExplicitNamespace(def any, fullname string) any {
+	cp := deepCopyTree(def)
+	if obj, ok := cp.(map[string]any); ok {
+		obj["name"] = unqualified(fullname)
+		obj["namespace"] = namespaceOf(fullname)
+	}
+	return cp
 }
 
 // deepCopyTree deep-copies a generic JSON tree.

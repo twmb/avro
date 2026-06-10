@@ -218,6 +218,26 @@ func TestMatrix_SchemaCacheCrossRef(t *testing.T) {
 			if _, err := avro.Resolve(inline, viaCache); err != nil {
 				t.Fatalf("Resolve(inline→cache): %v", err)
 			}
+			// Rebuild parity: the cache-referenced schema's metadata forms must
+			// be self-contained and identical to the inline schema's — the
+			// canonical form (hence the Rabin fingerprint, the cross-language /
+			// single-object-encoding identity) byte-for-byte, the canonical must
+			// re-parse, and Root().Schema() must rebuild. The cache stores only
+			// the resolved node, so without inlining the inherited definition
+			// these forms keep a dangling bare reference.
+			if !bytes.Equal(viaCache.Canonical(), inline.Canonical()) {
+				t.Fatalf("canonical differs:\n c=%s\n i=%s", viaCache.Canonical(), inline.Canonical())
+			}
+			if !bytes.Equal(viaCache.Fingerprint(avro.NewRabin()), inline.Fingerprint(avro.NewRabin())) {
+				t.Fatalf("fingerprint differs (cache-ref not self-contained)")
+			}
+			if _, err := avro.Parse(string(viaCache.Canonical())); err != nil {
+				t.Fatalf("cache-ref canonical not self-contained: %v", err)
+			}
+			root := viaCache.Root()
+			if _, err := root.Schema(); err != nil {
+				t.Fatalf("Root().Schema() rebuild failed: %v", err)
+			}
 		})
 	}
 }

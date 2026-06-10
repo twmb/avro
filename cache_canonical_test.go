@@ -244,3 +244,88 @@ func TestRegression_SchemaCacheTransitiveRefs(t *testing.T) {
 		t.Errorf("Parse(transitive cache.Canonical()) FAILS: %v", err)
 	}
 }
+
+// TestRegression_SchemaCacheCrossNamespaceSplice pins that splicing an inherited
+// definition into a referencing schema preserves the definition's resolved
+// namespace, regardless of the enclosing namespace at the reference site. A
+// definition that inherited its namespace (or sat in the null namespace) is
+// stored with no explicit "namespace"; splicing it verbatim into a different
+// scope would re-inherit that scope's namespace and resolve to the wrong
+// fullname (e.g. com.a.Inner becoming com.b.Inner) — a self-contained-but-WRONG
+// form whose canonical/fingerprint silently diverge from the wire schema and
+// from every other Avro implementation. Stored definitions therefore carry an
+// explicit namespace. Each case must match the logically-identical inline
+// schema on wire (control), canonical, and fingerprint, and re-parse cleanly.
+func TestRegression_SchemaCacheCrossNamespaceSplice(t *testing.T) {
+	cases := []struct {
+		name   string
+		defs   []string
+		ref    string
+		inline string
+		value  any
+	}{
+		{
+			name:   "inherited-ns-referenced-from-other-ns",
+			defs:   []string{`{"type":"record","name":"P","namespace":"com.a","fields":[{"name":"inner","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}}]}`},
+			ref:    `{"type":"record","name":"Q","namespace":"com.b","fields":[{"name":"y","type":"com.a.Inner"}]}`,
+			inline: `{"type":"record","name":"Q","namespace":"com.b","fields":[{"name":"y","type":{"type":"record","name":"Inner","namespace":"com.a","fields":[{"name":"x","type":"int"}]}}]}`,
+			value:  map[string]any{"y": map[string]any{"x": int32(1)}},
+		},
+		{
+			name:   "null-ns-referenced-from-namespaced",
+			defs:   []string{`{"type":"record","name":"X","fields":[{"name":"v","type":"int"}]}`},
+			ref:    `{"type":"record","name":"Q","namespace":"com.b","fields":[{"name":"x","type":"X"}]}`,
+			inline: `{"type":"record","name":"Q","namespace":"com.b","fields":[{"name":"x","type":{"type":"record","name":"X","namespace":"","fields":[{"name":"v","type":"int"}]}}]}`,
+			value:  map[string]any{"x": map[string]any{"v": int32(2)}},
+		},
+		{
+			name:   "deep-inherited-chain-into-other-ns",
+			defs:   []string{`{"type":"record","name":"Root","namespace":"x.y","fields":[{"name":"m","type":{"type":"record","name":"Mid","fields":[{"name":"l","type":{"type":"record","name":"Leaf","fields":[{"name":"z","type":"int"}]}}]}}]}`},
+			ref:    `{"type":"record","name":"Q","namespace":"other","fields":[{"name":"mid","type":"x.y.Mid"}]}`,
+			inline: `{"type":"record","name":"Q","namespace":"other","fields":[{"name":"mid","type":{"type":"record","name":"Mid","namespace":"x.y","fields":[{"name":"l","type":{"type":"record","name":"Leaf","namespace":"x.y","fields":[{"name":"z","type":"int"}]}}]}}]}`,
+			value:  map[string]any{"mid": map[string]any{"l": map[string]any{"z": int32(4)}}},
+		},
+		{
+			name:   "recursive-inherited-ns-into-other-ns",
+			defs:   []string{`{"type":"record","name":"Holder","namespace":"r.s","fields":[{"name":"node","type":{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]},{"name":"v","type":"int"}]}}]}`},
+			ref:    `{"type":"record","name":"W","namespace":"diff","fields":[{"name":"head","type":"r.s.Node"}]}`,
+			inline: `{"type":"record","name":"W","namespace":"diff","fields":[{"name":"head","type":{"type":"record","name":"Node","namespace":"r.s","fields":[{"name":"next","type":["null","Node"]},{"name":"v","type":"int"}]}}]}`,
+			value:  map[string]any{"head": map[string]any{"next": nil, "v": int32(8)}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c avro.SchemaCache
+			for _, d := range tc.defs {
+				if _, err := c.Parse(d); err != nil {
+					t.Fatalf("register %q: %v", d, err)
+				}
+			}
+			viaCache, err := c.Parse(tc.ref)
+			if err != nil {
+				t.Fatalf("parse ref via cache: %v", err)
+			}
+			inline := avro.MustParse(tc.inline)
+
+			// Control: identical wire confirms the node tree resolved the same
+			// fullnames — so canonical/fingerprint MUST match too.
+			wc, errc := viaCache.Encode(tc.value)
+			wi, erri := inline.Encode(tc.value)
+			if errc != nil || erri != nil {
+				t.Fatalf("encode err: cache=%v inline=%v", errc, erri)
+			}
+			if fmt.Sprintf("%x", wc) != fmt.Sprintf("%x", wi) {
+				t.Fatalf("control wire mismatch:\n cache=%x\n inline=%x", wc, wi)
+			}
+			if string(viaCache.Canonical()) != string(inline.Canonical()) {
+				t.Errorf("Canonical diverges:\n cache : %s\n inline: %s", viaCache.Canonical(), inline.Canonical())
+			}
+			if string(viaCache.Fingerprint(avro.NewRabin())) != string(inline.Fingerprint(avro.NewRabin())) {
+				t.Errorf("Fingerprint diverges (namespace lost on splice)")
+			}
+			if _, err := avro.Parse(string(viaCache.Canonical())); err != nil {
+				t.Errorf("Parse(cache.Canonical()) FAILS: %v\n  %s", err, viaCache.Canonical())
+			}
+		})
+	}
+}
