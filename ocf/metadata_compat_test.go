@@ -112,3 +112,36 @@ func TestRegression_OCFLargeUserMetadataProducerCompliance(t *testing.T) {
 		t.Fatalf("over-cap write rejected, but not with a metadata reason: %v", werr)
 	}
 }
+
+// TestRegression_OCFMetadataKeyErrorBounded pins that the writer's metadata-key
+// rejection errors stay bounded in length: the caller-supplied key is wrapped
+// with truncForError, the same helper the read-side codec-name error uses. The
+// key comes from WithMetadata (commonly populated from untrusted upstream data
+// like tenant ids or labels), so echoing it verbatim is a 1:1 log/RPC/metric
+// amplification — an ~8 MiB key produced an ~8 MiB error string. The rejection
+// itself is correct and fast; only the message size was unbounded.
+func TestRegression_OCFMetadataKeyErrorBounded(t *testing.T) {
+	s := avro.MustParse(`"long"`)
+	const cap = 4096 // generous ceiling; truncForError caps at 80
+
+	t.Run("reserved-prefix-key", func(t *testing.T) {
+		huge := "avro." + strings.Repeat("k", 8<<20)
+		_, err := NewWriter(&bytes.Buffer{}, s, WithMetadata(map[string][]byte{huge: []byte("v")}))
+		if err == nil {
+			t.Fatal("expected reserved-key rejection")
+		}
+		if len(err.Error()) > cap {
+			t.Errorf("reserved-key error is %d bytes (unbounded echo); want <= %d", len(err.Error()), cap)
+		}
+	})
+	t.Run("overlong-key", func(t *testing.T) {
+		huge := strings.Repeat("k", 2<<20)
+		_, err := NewWriter(&bytes.Buffer{}, s, WithMetadata(map[string][]byte{huge: []byte("v")}))
+		if err == nil {
+			t.Fatal("expected overlong-key rejection")
+		}
+		if len(err.Error()) > cap {
+			t.Errorf("overlong-key error is %d bytes (unbounded echo); want <= %d", len(err.Error()), cap)
+		}
+	})
+}

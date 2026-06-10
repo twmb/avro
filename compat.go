@@ -30,6 +30,16 @@ func compatErr(path, readerType, writerType, detail string) error {
 	}
 }
 
+// CompatibilityError.Detail strings for the writer-union incompatibility rule.
+// The rule is enforced from two entry points — the pre-check here
+// (CheckCompatibility) and the resolver (resolve.go, Resolve) — so the
+// user-visible detail must stay identical between them; sharing the literal
+// makes that structural rather than a comment-enforced lockstep.
+const (
+	detailWriterTypeNoReaderBranch   = "writer type matches no reader union branch"
+	detailWriterBranchNoReaderBranch = "writer union branch has no matching reader branch"
+)
+
 func checkCompat(r, w *schemaNode, path string, seen map[nodePair]bool) error {
 	if r == nil || w == nil {
 		return compatErr(path, nodeKind(r), nodeKind(w), "nil schema")
@@ -85,7 +95,7 @@ func checkWriterUnion(r, w *schemaNode, path string, seen map[nodePair]bool) err
 			rb := findMatchingBranch(r, wb)
 			if rb == nil {
 				return compatErr(path, r.kind, fmt.Sprintf("union[%d]:%s", i, wb.kind),
-					"writer union branch has no matching reader branch")
+					detailWriterBranchNoReaderBranch)
 			}
 			if err := checkCompat(rb, wb, path, seen); err != nil {
 				return err
@@ -102,7 +112,7 @@ func checkWriterUnion(r, w *schemaNode, path string, seen map[nodePair]bool) err
 func checkReaderUnion(r, w *schemaNode, path string, seen map[nodePair]bool) error {
 	rb := findMatchingBranch(r, w)
 	if rb == nil {
-		return compatErr(path, "union", w.kind, "writer type matches no reader union branch")
+		return compatErr(path, "union", w.kind, detailWriterTypeNoReaderBranch)
 	}
 	return checkCompat(rb, w, path, seen)
 }
@@ -206,7 +216,7 @@ func checkRecordFieldClaimsUnique(r, w *schemaNode, path string) error {
 				ReaderType: "record",
 				WriterType: "record",
 				Detail: fmt.Sprintf("writer fields %q and %q both resolve to reader field %q (via name + alias collision); rename the writer or drop the alias to disambiguate",
-					claimedBy[ri], wf.name, r.fields[ri].name),
+					truncForError(claimedBy[ri]), truncForError(wf.name), truncForError(r.fields[ri].name)),
 			}
 		}
 		claimedBy[ri] = wf.name
@@ -222,7 +232,7 @@ func checkEnumCompat(r, w *schemaNode, path string) error {
 	for _, ws := range w.symbols {
 		if !readerSymbols[ws] && !r.hasEnumDef {
 			return compatErr(path, r.name, w.name,
-				fmt.Sprintf("writer enum symbol %q not in reader and reader has no default", ws))
+				fmt.Sprintf("writer enum symbol %q not in reader and reader has no default", truncForError(ws)))
 		}
 	}
 	return nil

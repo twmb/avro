@@ -119,5 +119,14 @@ type CompatibilityError struct {
 }
 
 func (e *CompatibilityError) Error() string {
-	return fmt.Sprintf("avro: incompatible at %s: reader %s vs writer %s: %s", e.Path, e.ReaderType, e.WriterType, e.Detail)
+	// Bound the rendered message: Path, ReaderType, and WriterType carry
+	// user-controlled type/field names, which have no length cap at parse, so a
+	// hostile schema with a megabyte-long name would otherwise produce a
+	// megabyte error string (1:1 log/RPC/metric amplification). truncForError is
+	// a no-op under its cap, so normal-length names render unchanged, and the
+	// public fields keep their full values for callers that inspect them. Detail
+	// is a composed sentence whose own embedded names are truncated at
+	// construction.
+	return fmt.Sprintf("avro: incompatible at %s: reader %s vs writer %s: %s",
+		truncForError(e.Path), truncForError(e.ReaderType), truncForError(e.WriterType), e.Detail)
 }

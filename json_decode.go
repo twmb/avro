@@ -1285,7 +1285,7 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 		func(idx int, key string) error {
 			f := &node.fields[idx]
 			if err := ctx.decodeValue(valV, f.node); err != nil {
-				return fmt.Errorf("field %q: %w", key, err)
+				return recordFieldError(v.Type(), f.name, err)
 			}
 			m[f.name] = val
 			val = nil
@@ -1323,7 +1323,7 @@ func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error
 				return err
 			}
 			if err := ctx.decodeValue(elem, f.node); err != nil {
-				return fmt.Errorf("field %q: %w", key, err)
+				return recordFieldError(v.Type(), f.name, err)
 			}
 			v.SetMapIndex(mapKeyAs(mapType, f.nameVal), elem)
 			elem.SetZero()
@@ -1358,10 +1358,10 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 			f := &node.fields[idx]
 			fv, err := fieldByIndex(v, mapping.indices[idx])
 			if err != nil {
-				return fmt.Errorf("field %q: %w", key, err)
+				return recordFieldError(v.Type(), f.name, err)
 			}
 			if err := ctx.decodeValue(fv, f.node); err != nil {
-				return fmt.Errorf("field %q: %w", key, err)
+				return recordFieldError(v.Type(), f.name, err)
 			}
 			return nil
 		},

@@ -2254,3 +2254,209 @@ func TestRegression_TimestampNanosNegativeSecondSpecValue(t *testing.T) {
 		t.Errorf("round-trip = %v, want %v", back.UTC(), tm)
 	}
 }
+
+// TestRegression_DecimalFixedSizeCapacityNoOverflow pins that the
+// fixed-backed decimal precision-vs-capacity check (maxDecimalDigits in
+// schema.go) does not overflow the platform int when computing 8*size-1.
+// A fixed size is an int that can exceed 2^60 on a 64-bit build (twmb
+// accepts sizes Java's int32 size field cannot represent); the prior
+// 8*size-1 wrapped negative there, so the computed digit capacity came back
+// negative and a precision-1 decimal was falsely rejected while the same
+// fixed without the decimal logical type parsed. The boundary is computed
+// in a way that never wraps, so a huge-size fixed+decimal parses exactly
+// like the same fixed alone, and ordinary sizes still reject a precision
+// that genuinely exceeds the byte capacity.
+func TestRegression_DecimalFixedSizeCapacityNoOverflow(t *testing.T) {
+	const huge = uint64(1) << 61 // 8*size == 2^64 wraps the platform int to 0
+
+	// A plain fixed of this size parses.
+	if _, err := avro.Parse(fmt.Sprintf(`{"type":"fixed","name":"f","size":%d}`, huge)); err != nil {
+		t.Fatalf("plain fixed at size 2^61 rejected: %v", err)
+	}
+	// The same size with a decimal logical type and a tiny precision must ALSO
+	// parse — capacity at this size is astronomically larger than precision 1.
+	if _, err := avro.Parse(fmt.Sprintf(`{"type":"fixed","name":"f","size":%d,"logicalType":"decimal","precision":1,"scale":0}`, huge)); err != nil {
+		t.Errorf("decimal precision 1 falsely rejected at huge fixed size (capacity overflow?): %v", err)
+	}
+
+	// Ordinary sizes still enforce the real capacity. A size-4 fixed holds
+	// floor((8*4-1)*log10(2)) = 9 decimal digits.
+	if _, err := avro.Parse(`{"type":"fixed","name":"f","size":4,"logicalType":"decimal","precision":9,"scale":0}`); err != nil {
+		t.Errorf("precision 9 at size-4 fixed (capacity 9) rejected: %v", err)
+	}
+	if _, err := avro.Parse(`{"type":"fixed","name":"f","size":4,"logicalType":"decimal","precision":10,"scale":0}`); err == nil {
+		t.Error("precision 10 at size-4 fixed (capacity 9) accepted; want rejection")
+	}
+}
+
+// TestRegression_JSONErrorsAreSemanticWithFieldPath pins doc.go's "# Errors"
+// contract for the JSON wire: a type mismatch on EncodeJSON / DecodeJSON is an
+// *avro.SemanticError carrying the same dotted record-field path the binary
+// encoder/decoder produce. The JSON encode arms previously returned bare
+// fmt.Errorf values (not errors.As-able) and the JSON decode path wrapped the
+// field name into the message text only (SemanticError.Field stayed empty), so
+// a caller's errors.As + .Field handling worked for Encode/Decode but silently
+// broke for EncodeJSON/DecodeJSON on the same value and schema.
+func TestRegression_JSONErrorsAreSemanticWithFieldPath(t *testing.T) {
+	s := avro.MustParse(`{"type":"record","name":"O","fields":[
+		{"name":"a","type":{"type":"record","name":"I","fields":[
+			{"name":"b","type":"int"}]}}]}`)
+
+	type inner struct {
+		B string `avro:"b"` // string is not an int
+	}
+	type outer struct {
+		A inner `avro:"a"`
+	}
+
+	assertFieldPath := func(t *testing.T, label string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: expected error, got nil", label)
+		}
+		var se *avro.SemanticError
+		if !errors.As(err, &se) {
+			t.Fatalf("%s: error is not *SemanticError: %v", label, err)
+		}
+		if se.Field != "a.b" {
+			t.Errorf("%s: SemanticError.Field = %q, want %q (err: %v)", label, se.Field, "a.b", err)
+		}
+	}
+
+	if _, err := s.Encode(&outer{A: inner{B: "x"}}); true {
+		assertFieldPath(t, "binary encode", err)
+	}
+	if _, err := s.EncodeJSON(&outer{A: inner{B: "x"}}); true {
+		assertFieldPath(t, "json encode", err)
+	}
+	wire, err := s.Encode(map[string]any{"a": map[string]any{"b": int32(1)}})
+	if err != nil {
+		t.Fatalf("seed encode: %v", err)
+	}
+	var out1 outer
+	if _, err := s.Decode(wire, &out1); true {
+		assertFieldPath(t, "binary decode", err)
+	}
+	var out2 outer
+	if err := s.DecodeJSON([]byte(`{"a":{"b":1}}`), &out2); true {
+		assertFieldPath(t, "json decode", err)
+	}
+
+	// Top-level (non-record) JSON type mismatch must also be errors.As-able,
+	// matching binary — the numeric coerce helpers tag their failures.
+	for _, tc := range []struct {
+		schema string
+		encode any
+	}{
+		{`"int"`, "not an int"},
+		{`"long"`, "not a long"},
+		{`"double"`, "not a double"},
+		{`"boolean"`, 5},
+	} {
+		js := avro.MustParse(tc.schema)
+		_, err := js.EncodeJSON(tc.encode)
+		var se *avro.SemanticError
+		if err == nil || !errors.As(err, &se) {
+			t.Errorf("EncodeJSON(%v) against %s: want *SemanticError, got %v", tc.encode, tc.schema, err)
+		}
+	}
+}
+
+// TestMatrix_JSONEncodeErrorSemanticParity is the standing net for the JSON
+// error-surface class: for every Avro fragment, a wrong-Go-typed value wrapped
+// as a record field "f" must be rejected by BOTH the binary and JSON encoders
+// with an *avro.SemanticError carrying the field path "f". The JSON encoder
+// previously returned bare fmt.Errorf values for several of these (not
+// errors.As-able, no field path), silently diverging from the binary encoder
+// and from doc.go's "# Errors" contract. This axis catches a regression in any
+// fragment's JSON type-mismatch arm, not just the one a report exercised.
+func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
+	frags := []struct {
+		name, schema string
+		wrong        any // a value of the WRONG Go type for this fragment
+	}{
+		{"int", `"int"`, "x"},
+		{"long", `"long"`, "x"},
+		{"float", `"float"`, "x"},
+		{"double", `"double"`, "x"},
+		{"boolean", `"boolean"`, "x"},
+		{"string", `"string"`, 5},
+		{"bytes", `"bytes"`, 5},
+		{"enum", `{"type":"enum","name":"E","symbols":["A"]}`, 5.5},
+		{"fixed", `{"type":"fixed","name":"Fx","size":2}`, 5},
+		{"array", `{"type":"array","items":"int"}`, 5},
+		{"map", `{"type":"map","values":"int"}`, 5},
+		{"record", `{"type":"record","name":"Sub","fields":[{"name":"n","type":"int"}]}`, 5},
+	}
+	for _, f := range frags {
+		t.Run(f.name, func(t *testing.T) {
+			s := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":%s}]}`, f.schema))
+			val := map[string]any{"f": f.wrong}
+			encoders := []struct {
+				name string
+				fn   func(any) ([]byte, error)
+			}{
+				{"binary", func(v any) ([]byte, error) { return s.AppendEncode(nil, v) }},
+				{"json", func(v any) ([]byte, error) { return s.AppendEncodeJSON(nil, v) }},
+			}
+			for _, enc := range encoders {
+				_, err := enc.fn(val)
+				var se *avro.SemanticError
+				if err == nil || !errors.As(err, &se) {
+					t.Errorf("%s encode of wrong-typed %q field: want *SemanticError, got %v", enc.name, f.name, err)
+					continue
+				}
+				if !strings.Contains(se.Field, "f") {
+					t.Errorf("%s encode of %q: SemanticError.Field = %q, want it to contain \"f\"", enc.name, f.name, se.Field)
+				}
+			}
+		})
+	}
+}
+
+// TestRegression_CompatibilityErrorRenderingBounded pins that
+// CompatibilityError.Error() bounds the user-controlled type/field names it
+// renders (Path, ReaderType, WriterType). Type and field names have no length
+// cap at parse, so a hostile schema with a megabyte-long name would otherwise
+// drive a megabyte error string through logging / RPC / metric pipelines (1:1
+// amplification, the same class the OCF and wire-decode error sites guard). The
+// public CompatibilityError fields keep their FULL values — only the rendered
+// message is bounded — so callers that inspect the struct are unaffected.
+func TestRegression_CompatibilityErrorRenderingBounded(t *testing.T) {
+	huge := strings.Repeat("N", 1<<20)
+	writer := avro.MustParse(fmt.Sprintf(`{"type":"record","name":"%s","fields":[{"name":"f","type":"int"}]}`, huge))
+	reader := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}]}`)
+
+	err := avro.CheckCompatibility(writer, reader)
+	if err == nil {
+		t.Fatal("expected a record-name-mismatch incompatibility")
+	}
+	if n := len(err.Error()); n > 4096 {
+		t.Errorf("CompatibilityError.Error() is %d bytes (unbounded name echo); want bounded", n)
+	}
+	// The structured field is preserved in full (rendering-only truncation).
+	var ce *avro.CompatibilityError
+	if !errors.As(err, &ce) {
+		t.Fatalf("not a *CompatibilityError: %v", err)
+	}
+	if ce.WriterType != huge {
+		t.Errorf("CompatibilityError.WriterType was truncated in the struct (len %d); the field must keep its full value", len(ce.WriterType))
+	}
+
+	// Detail is NOT rendering-truncated (it is a composed sentence), so a
+	// user-controlled value embedded in Detail must be bounded at construction.
+	// Resolve of an enum whose writer carries a huge symbol absent from the
+	// reader (no reader default) is rejected by Resolve's compatibility
+	// pre-check, whose enum-symbol Detail embeds that symbol — it must be
+	// bounded. (The resolution-time twin resolveEnum builds the same Detail and
+	// is likewise bounded, for internal consistency with the enum-default echo
+	// beside it; the pre-check guards it from this input, so this exercises the
+	// pre-check path.)
+	wEnum := avro.MustParse(fmt.Sprintf(`{"type":"enum","name":"E","symbols":[%q,"B"]}`, huge))
+	rEnum := avro.MustParse(`{"type":"enum","name":"E","symbols":["B"]}`)
+	if _, rerr := avro.Resolve(wEnum, rEnum); rerr == nil {
+		t.Fatal("expected an enum-symbol incompatibility from Resolve")
+	} else if n := len(rerr.Error()); n > 4096 {
+		t.Errorf("Resolve enum-symbol error is %d bytes (unbounded Detail echo); want bounded", n)
+	}
+}

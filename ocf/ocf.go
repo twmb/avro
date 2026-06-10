@@ -391,7 +391,7 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) 
 		case optMetadata:
 			for k, v := range o.m {
 				if strings.HasPrefix(k, "avro.") {
-					return nil, fmt.Errorf("ocf: metadata key %q is reserved (avro.* namespace)", k)
+					return nil, fmt.Errorf("ocf: metadata key %q is reserved (avro.* namespace)", truncForError(k))
 				}
 				wr.userMeta = append(wr.userMeta, kv{k, v})
 			}
@@ -469,10 +469,10 @@ func (w *Writer) writeHeader() error {
 	}
 	for _, e := range meta {
 		if int64(len(e.key)) > ocfMetadataSafetyLimit {
-			return fmt.Errorf("ocf: metadata key %q length %d exceeds the %d-byte limit", e.key, len(e.key), ocfMetadataSafetyLimit)
+			return fmt.Errorf("ocf: metadata key %q length %d exceeds the %d-byte limit", truncForError(e.key), len(e.key), ocfMetadataSafetyLimit)
 		}
 		if lim := metadataValueLimit(e.key); int64(len(e.val)) > lim {
-			return fmt.Errorf("ocf: metadata %q value length %d exceeds the %d-byte limit", e.key, len(e.val), lim)
+			return fmt.Errorf("ocf: metadata %q value length %d exceeds the %d-byte limit", truncForError(e.key), len(e.val), lim)
 		}
 	}
 

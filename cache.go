@@ -34,6 +34,13 @@ import (
 // independent of the cache — it can be used for [Schema.Encode] and
 // [Schema.Decode] without the cache.
 //
+// [WithLaxNames] is sticky across the cache: if a type is defined with
+// WithLaxNames, pass WithLaxNames to every later Parse that references it.
+// A schema that contains a lax (non-standard) name is not parseable without
+// WithLaxNames whether or not a cache produced it, so the referencing Parse's
+// [Schema.String] and [Schema.Canonical] output likewise requires WithLaxNames
+// to re-parse. [Schema.Encode] and [Schema.Decode] are unaffected either way.
+//
 // The zero value is ready to use. A SchemaCache is safe for concurrent use.
 type SchemaCache struct {
 	mu           sync.Mutex
@@ -157,11 +164,28 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	if len(cloned) > 0 {
 		if _, perr := Parse(s.full, opts...); perr != nil {
 			if tree, terr := unmarshalAnyPreservePrecision([]byte(s.full)); terr == nil {
-				local := make(map[string]bool)
-				collectTreeDefs(tree, "", func(fn string, _ any) { local[fn] = true })
-				tree = inlineTreeDefs(tree, "", c.defs, local, make(map[string]bool))
+				tree = inlineTreeDefs(tree, "", c.defs, make(map[string]bool), make(map[string]bool))
 				if marshaled, merr := json.Marshal(tree); merr == nil {
-					if s2, rerr := Parse(string(marshaled), opts...); rerr == nil {
+					s2, rerr := Parse(string(marshaled), opts...)
+					if rerr != nil {
+						// The spliced form is self-contained but may carry a
+						// name an inherited type was defined with under
+						// WithLaxNames, which a strict re-parse rejects. Lax
+						// names are sticky: a schema containing one is not
+						// strict-parseable, cache or not (see the SchemaCache
+						// doc). Retry permissively so the metadata forms still
+						// describe the full self-contained schema instead of
+						// falling back to a dangling reference; the result still
+						// needs WithLaxNames to re-parse. WithLaxNames(nil) only
+						// accepts the already-final names — it does not transform
+						// them — so the canonical/fingerprint bytes match a
+						// standalone lax parse of the same schema.
+						laxOpts := make([]SchemaOpt, len(opts)+1)
+						copy(laxOpts, opts)
+						laxOpts[len(opts)] = WithLaxNames(nil)
+						s2, rerr = Parse(string(marshaled), laxOpts...)
+					}
+					if rerr == nil {
 						selfContained = s2.full
 						s.c = s2.c
 						s.full = s2.full
@@ -248,15 +272,6 @@ func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
 	return short
 }
 
-// resolveRef resolves a (possibly short) reference against an enclosing
-// namespace into a fullname.
-func resolveRef(ref, enclosingNS string) string {
-	if strings.Contains(ref, ".") || enclosingNS == "" {
-		return ref
-	}
-	return enclosingNS + "." + ref
-}
-
 // collectTreeDefs calls visit for every named-type definition in the tree, with
 // its resolved fullname and sub-tree, tracking namespace scope.
 func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) {
@@ -269,7 +284,7 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 		typ, _ := v["type"].(string)
 		name, _ := v["name"].(string)
 		childNS := ns
-		if name != "" && (typ == "record" || typ == "error" || typ == "enum" || typ == "fixed") {
+		if name != "" && isNamedKind(typ) {
 			childNS = nodeNamespace(v, ns)
 			visit(nodeFullnameTree(v, ns), v)
 		}
@@ -293,52 +308,79 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 }
 
 // inlineTreeDefs replaces the FIRST occurrence of each reference to a cache-
-// inherited named type (in defs, not defined locally, not already inlined)
-// with its definition, recursing into the inlined copy so transitive
-// references resolve too. Subsequent occurrences stay bare. The def is deep-
-// copied before any mutation so the cache is not corrupted.
-func inlineTreeDefs(node any, ns string, defs map[string]any, local, inlined map[string]bool) any {
+// inherited named type (in defs, not defined locally before the reference, not
+// already inlined) with its definition, recursing into the inlined copy so
+// transitive references resolve too. Subsequent occurrences stay bare. The def
+// is deep-copied before any mutation so the cache is not corrupted.
+//
+// Reference binding mirrors the parser EXACTLY (eager, in-scope-first, and
+// POSITIONAL): a bare reference resolves in scopedRefKeys precedence
+// (enclosing-namespace-qualified first, then the null-namespace bare name),
+// and at each candidate a LOCAL definition already registered AT THIS POINT IN
+// THE WALK wins over a cache-inherited one. seen accumulates local fullnames in
+// DFS pre-order as the parser registers them (a named type's name is in scope
+// from the start of its own definition onward, for self-reference), so:
+//   - a ref AFTER a local def of the same name keeps the ref bare (the parser
+//     bound it to the local type, which is present inline); and
+//   - a ref BEFORE the local def binds to the cached type (the local name was
+//     not yet in scope at the reference), so the cached def is spliced —
+//     matching the eager wire binding.
+// Consulting a position-independent local set instead would wrongly keep a
+// before-the-def reference bare and diverge String()/Canonical()/Fingerprint()/
+// Root() from the wire codec the parser built.
+func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[string]bool) any {
 	switch v := node.(type) {
 	case string:
 		if !avroNamedRef(v) {
 			return v
 		}
-		key := resolveRef(v, ns)
-		def, ok := defs[key]
-		if !ok {
-			if def, ok = defs[v]; ok {
-				key = v
+		var keys [2]string
+		for _, key := range scopedRefKeys(&keys, v, ns) {
+			if seen[key] {
+				return v // bound to a local def already in scope; keep it bare
+			}
+			if def, ok := defs[key]; ok {
+				if inlined[key] {
+					return v
+				}
+				inlined[key] = true
+				return inlineTreeDefs(deepCopyTree(def), ns, defs, seen, inlined)
 			}
 		}
-		if !ok || local[key] || inlined[key] {
-			return v
-		}
-		inlined[key] = true
-		return inlineTreeDefs(deepCopyTree(def), ns, defs, local, inlined)
+		return v
 	case []any:
 		for i := range v {
-			v[i] = inlineTreeDefs(v[i], ns, defs, local, inlined)
+			v[i] = inlineTreeDefs(v[i], ns, defs, seen, inlined)
 		}
 		return v
 	case map[string]any:
 		childNS := nodeNamespace(v, ns)
+		// Register this node's own name BEFORE walking its children, mirroring
+		// the parser's early self-registration (a type is in scope for its own
+		// descendants). A later sibling/descendant reference then sees it; an
+		// earlier one already resolved against the cache above.
+		if typ, _ := v["type"].(string); isNamedKind(typ) {
+			if name, _ := v["name"].(string); name != "" {
+				seen[nodeFullnameTree(v, ns)] = true
+			}
+		}
 		if t, ok := v["type"]; ok {
-			v["type"] = inlineTreeDefs(t, ns, defs, local, inlined)
+			v["type"] = inlineTreeDefs(t, ns, defs, seen, inlined)
 		}
 		if fs, ok := v["fields"].([]any); ok {
 			for _, f := range fs {
 				if fo, ok := f.(map[string]any); ok {
 					if t, ok := fo["type"]; ok {
-						fo["type"] = inlineTreeDefs(t, childNS, defs, local, inlined)
+						fo["type"] = inlineTreeDefs(t, childNS, defs, seen, inlined)
 					}
 				}
 			}
 		}
 		if it, ok := v["items"]; ok {
-			v["items"] = inlineTreeDefs(it, childNS, defs, local, inlined)
+			v["items"] = inlineTreeDefs(it, childNS, defs, seen, inlined)
 		}
 		if vv, ok := v["values"]; ok {
-			v["values"] = inlineTreeDefs(vv, childNS, defs, local, inlined)
+			v["values"] = inlineTreeDefs(vv, childNS, defs, seen, inlined)
 		}
 		return v
 	}

@@ -75,6 +75,21 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 		// uuid on a STRING carrier (usUUID/usFixedUUIDString string arm) —
 		// another unsafe twin omitted from the battery.
 		{"uuid-string", `{"type":"string","logicalType":"uuid"}`, "12345678-1234-1234-1234-123456789abc"},
+		// Cross-carriers: a fixed+uuid schema with a Go STRING field exercises
+		// usFixedUUIDString, and a string+uuid schema with a [16]byte field
+		// exercises usUUID's byte arm — the two carrier/schema crossings the
+		// uuid-fixed ([16]byte) and uuid-string (string) rows above don't reach.
+		{"uuid-fixed/string-carrier", `{"type":"fixed","name":"FUS","size":16,"logicalType":"uuid"}`, "12345678-1234-5234-9234-123456789abc"},
+		{"uuid-string/bytes-carrier", `{"type":"string","logicalType":"uuid"}`, [16]byte{0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x52, 0x34, 0x92, 0x34, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc}},
+		// Non-time.Time / non-Duration carriers fall through to the raw usLong /
+		// usInt arms; pin that the unsafe fallback matches the reflect fallback
+		// for every long- and int-backed logical (a Duration / plain integer
+		// carrier writes the raw wire value, no logical conversion).
+		{"timestamp-millis/duration", `{"type":"long","logicalType":"timestamp-millis"}`, 90 * time.Minute},
+		{"timestamp-nanos/duration", `{"type":"long","logicalType":"timestamp-nanos"}`, 90 * time.Minute},
+		{"date/int32-carrier", `{"type":"int","logicalType":"date"}`, int32(19723)},
+		{"time-millis/int32-carrier", `{"type":"int","logicalType":"time-millis"}`, int32(12345)},
+		{"time-micros/int64-carrier", `{"type":"long","logicalType":"time-micros"}`, int64(12345678)},
 
 		// Composites as struct fields (the unsafe array/map/union encoders).
 		{"slice-int", `{"type":"array","items":"int"}`, []int32{1, 2, 3}},

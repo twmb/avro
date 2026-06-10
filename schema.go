@@ -2973,6 +2973,18 @@ func maxDecimalDigits(size int) int {
 	if size <= 0 {
 		return 0
 	}
+	// Cap size before the bit multiply. A fixed size is an int that can
+	// exceed 2^60 on a 64-bit build (twmb accepts sizes Java's int32 can't),
+	// where 8*size-1 wraps the platform int negative and the capacity comes
+	// back negative — falsely rejecting a valid precision. Any size past
+	// decimalScaleLimit yields a capacity far above that limit, and precision
+	// itself is capped at decimalScaleLimit upstream, so the exact digit count
+	// is irrelevant there: returning the ceiling both avoids the wrap and
+	// keeps the comparison correct (precision <= decimalScaleLimit can never
+	// exceed it).
+	if size > decimalScaleLimit {
+		return decimalScaleLimit
+	}
 	bits := 8*size - 1 // sign bit excluded
 	// log10(2^bits - 1) ≈ bits * log10(2)
 	return int(math.Floor(float64(bits) * math.Log10(2)))
@@ -3679,6 +3691,36 @@ func validateDefault(val any, node *schemaNode) error {
 // validateLeaf is the per-node visit for validateDefault: primitive
 // kind validation, plus container-shape checks + per-field coercion
 // (walkDefault handles the actual recursion).
+// defaultObjectShape asserts val is a non-null JSON object for an Avro record
+// or map default, returning the canonical "expected object for <kind> default"
+// error. Shared by the parse-time validator (validateLeaf) and the wire encoder
+// (encodeDefault, resolve.go) — two cross-path sites for one shape rule — so
+// the user-visible error cannot drift between them. Only the shape assertion is
+// shared; each caller keeps its own post-assertion work (validateLeaf coerces
+// fields in place, encodeDefault emits wire bytes).
+func defaultObjectShape(val any, kind string) (map[string]any, error) {
+	if val == nil {
+		return nil, fmt.Errorf("expected object for %s default, got null", kind)
+	}
+	m, ok := val.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("expected object for %s default, got %T", kind, val)
+	}
+	return m, nil
+}
+
+// defaultArrayShape is defaultObjectShape's array counterpart.
+func defaultArrayShape(val any) ([]any, error) {
+	if val == nil {
+		return nil, fmt.Errorf("expected array for array default, got null")
+	}
+	arr, ok := val.([]any)
+	if !ok {
+		return nil, fmt.Errorf("expected array for array default, got %T", val)
+	}
+	return arr, nil
+}
+
 func validateLeaf(val any, node *schemaNode) (any, error) {
 	switch node.kind {
 	case "null":
@@ -3744,12 +3786,9 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 		// field defaults) instead of falling through to null —
 		// encodeDefault would emit Record(field-defaults) wire bytes
 		// where null was intended.
-		if val == nil {
-			return val, fmt.Errorf("expected object for record default, got null")
-		}
-		m, ok := val.(map[string]any)
-		if !ok {
-			return val, fmt.Errorf("expected object for record default, got %T", val)
+		m, err := defaultObjectShape(val, "record")
+		if err != nil {
+			return val, err
 		}
 		// Required-field presence check before coercion: a missing
 		// no-default field is an error regardless of per-field types.
@@ -3766,23 +3805,17 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 			}
 		}
 	case "array":
-		if val == nil {
-			return val, fmt.Errorf("expected array for array default, got null")
-		}
-		arr, ok := val.([]any)
-		if !ok {
-			return val, fmt.Errorf("expected array for array default, got %T", val)
+		arr, err := defaultArrayShape(val)
+		if err != nil {
+			return val, err
 		}
 		for i, item := range arr {
 			arr[i] = coerceDefault(item, node.items)
 		}
 	case "map":
-		if val == nil {
-			return val, fmt.Errorf("expected object for map default, got null")
-		}
-		m, ok := val.(map[string]any)
-		if !ok {
-			return val, fmt.Errorf("expected object for map default, got %T", val)
+		m, err := defaultObjectShape(val, "map")
+		if err != nil {
+			return val, err
 		}
 		for k, v := range m {
 			m[k] = coerceDefault(v, node.values)

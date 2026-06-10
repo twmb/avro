@@ -541,7 +541,7 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 					Path:       r.name,
 					ReaderType: r.name,
 					WriterType: w.name,
-					Detail:     fmt.Sprintf("writer symbol %q not in reader and no default", ws),
+					Detail:     fmt.Sprintf("writer symbol %q not in reader and no default", truncForError(ws)),
 				}
 			}
 			defIdx, ok := readerIdx[r.enumDef]
@@ -678,7 +678,7 @@ func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 			Path:       pathOrRoot(path),
 			ReaderType: "union",
 			WriterType: w.kind,
-			Detail:     "writer type matches no reader union branch",
+			Detail:     detailWriterTypeNoReaderBranch,
 		}
 	}
 	resolved, err := resolveNode(rb, w, path, ctx)
@@ -722,7 +722,7 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 				Path:       pathOrRoot(path),
 				ReaderType: "union",
 				WriterType: fmt.Sprintf("union[%d]:%s", i, wb.kind),
-				Detail:     "writer union branch has no matching reader branch",
+				Detail:     detailWriterBranchNoReaderBranch,
 			}
 		}
 		resolved, err := resolveNode(rb, wb, path, ctx)
@@ -847,18 +847,14 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		// otherwise match the Array branch (producing an empty-array
 		// wire form) instead of the null branch. Mirrors
 		// validateDefault's nil-reject for parse-time symmetry.
-		if val == nil {
-			return nil, fmt.Errorf("expected array for array default, got null")
-		}
-		arr, ok := val.([]any)
-		if !ok {
-			return nil, fmt.Errorf("expected array for array default, got %T", val)
+		arr, err := defaultArrayShape(val)
+		if err != nil {
+			return nil, err
 		}
 		if len(arr) == 0 {
 			return appendVarlong(dst, 0), nil
 		}
 		dst = appendVarlong(dst, int64(len(arr)))
-		var err error
 		for _, item := range arr {
 			dst, err = encodeDefault(dst, item, node.items)
 			if err != nil {
@@ -867,18 +863,14 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return append(dst, 0), nil
 	case "map":
-		if val == nil {
-			return nil, fmt.Errorf("expected object for map default, got null")
-		}
-		m, ok := val.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("expected object for map default, got %T", val)
+		m, err := defaultObjectShape(val, "map")
+		if err != nil {
+			return nil, err
 		}
 		if len(m) == 0 {
 			return appendVarlong(dst, 0), nil
 		}
 		dst = appendVarlong(dst, int64(len(m)))
-		var err error
 		for k, v := range m {
 			dst = appendVarlong(dst, int64(len(k)))
 			dst = append(dst, k...)
@@ -889,14 +881,10 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return append(dst, 0), nil
 	case "record":
-		if val == nil {
-			return nil, fmt.Errorf("expected object for record default, got null")
+		m, err := defaultObjectShape(val, "record")
+		if err != nil {
+			return nil, err
 		}
-		m, ok := val.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("expected object for record default, got %T", val)
-		}
-		var err error
 		for _, f := range node.fields {
 			fval, exists := m[f.name]
 			if !exists {

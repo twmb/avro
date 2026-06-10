@@ -968,3 +968,136 @@ func TestRegression_SchemaCacheCustomConflictRejected(t *testing.T) {
 		t.Errorf("consistent custom cross-reference must succeed: %v", err)
 	}
 }
+
+// TestRegression_SchemaCacheLocalShadowNotSplicedFromCache pins that the
+// self-containment splice resolves a bare name reference exactly as the parser
+// bound it: eager, in-scope-first, and POSITIONAL. A parse under namespace
+// "myns" that locally defines T (inheriting -> myns.T) AND bare-references "T"
+// binds the reference per its position relative to the local definition:
+//   - a reference AFTER the local def binds to the local myns.T (string here);
+//   - a reference BEFORE the local def binds to the cached null-namespace T
+//     (int here) — the local name was not yet in scope (eager binding).
+// The splice must reproduce whichever binding the wire codec used so the
+// schema's own String()/Canonical() describe the SAME schema. The bug: the
+// splice consulted a position-independent local set and a bare fallback key, so
+// it always swapped in the cached T regardless of position/shadowing — making
+// the metadata forms diverge from the wire (silent decode corruption for any
+// consumer that re-parses the schema text). A dangling reference elsewhere
+// (here "U", only in the cache) is what forces the splice to run at all.
+//
+// The asserted invariant is binding-agnostic: decoding the wire with
+// Parse(s.String()) must produce exactly what decoding with s produces.
+func TestRegression_SchemaCacheLocalShadowNotSplicedFromCache(t *testing.T) {
+	cases := []struct {
+		order string
+		b     any // shape valid for b's actual (positional) binding
+	}{
+		{"ref-after-localdef", map[string]any{"y": "bb"}},      // b -> local string myns.T
+		{"ref-before-localdef", map[string]any{"x": int32(2)}}, // b -> cached int T (eager)
+	}
+	for _, tc := range cases {
+		t.Run(tc.order, func(t *testing.T) {
+			var c SchemaCache
+			if _, err := c.Parse(`{"type":"record","name":"T","fields":[{"name":"x","type":"int"}]}`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Parse(`{"type":"record","name":"U","fields":[{"name":"u","type":"int"}]}`); err != nil {
+				t.Fatal(err)
+			}
+			localDef := `{"name":"a","type":{"type":"record","name":"T","fields":[{"name":"y","type":"string"}]}}`
+			bareRef := `{"name":"b","type":"T"}`
+			danglingU := `{"name":"c","type":"U"}`
+			var fields string
+			if tc.order == "ref-after-localdef" {
+				fields = localDef + "," + bareRef + "," + danglingU
+			} else {
+				fields = bareRef + "," + localDef + "," + danglingU
+			}
+			s, err := c.Parse(`{"type":"record","name":"myns.R","fields":[` + fields + `]}`)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			val := map[string]any{
+				"a": map[string]any{"y": "aa"},
+				"b": tc.b,
+				"c": map[string]any{"u": int32(7)},
+			}
+			wire, err := s.Encode(val)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			s2, err := Parse(s.String())
+			if err != nil {
+				t.Fatalf("Parse(String()): %v", err)
+			}
+			var viaSelf, viaString map[string]any
+			if _, err := s.Decode(wire, &viaSelf); err != nil {
+				t.Fatalf("decode via s: %v", err)
+			}
+			if _, err := s2.Decode(wire, &viaString); err != nil {
+				t.Fatalf("decode via Parse(String()): %v", err)
+			}
+			selfJSON, _ := json.Marshal(viaSelf)
+			stringJSON, _ := json.Marshal(viaString)
+			if string(selfJSON) != string(stringJSON) {
+				t.Errorf("String() describes a different schema than the wire codec:\n via s     : %s\n via String: %s", selfJSON, stringJSON)
+			}
+		})
+	}
+}
+
+// TestRegression_SchemaCacheLaxNameStickyNotDangling pins that a type defined
+// with WithLaxNames and referenced by a later strict Parse yields a SELF-
+// CONTAINED metadata form (String/Canonical contain the spliced definition,
+// not a dangling reference), re-parseable WITH WithLaxNames. Lax names are
+// sticky: a schema containing one is not parseable without WithLaxNames whether
+// or not a cache produced it. The strict re-parse used to inline the body then
+// reject the lax NAME, silently falling back to a dangling reference no parser
+// could resolve; the splice now retries permissively so the metadata forms
+// describe the full schema. Encode/Decode are unaffected throughout.
+func TestRegression_SchemaCacheLaxNameStickyNotDangling(t *testing.T) {
+	var c SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"bad-name","fields":[{"name":"x","type":"int"}]}`, WithLaxNames(nil)); err != nil {
+		t.Fatal(err)
+	}
+	s, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"bad-name"}]}`)
+	if err != nil {
+		t.Fatalf("strict parse referencing a lax-defined cached type: %v", err)
+	}
+
+	// Encode/Decode work regardless.
+	wire, err := s.Encode(map[string]any{"f": map[string]any{"x": int32(3)}})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var back map[string]any
+	if _, err := s.Decode(wire, &back); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// String()/Canonical() are self-contained: the bad-name body is present,
+	// and they re-parse with WithLaxNames (a lax name needs it, cache or not).
+	if !json.Valid([]byte(s.String())) || !containsField(s.String(), "x") {
+		t.Errorf("String() not self-contained (bad-name body missing): %s", s.String())
+	}
+	if _, err := Parse(s.String(), WithLaxNames(nil)); err != nil {
+		t.Errorf("Parse(String(), WithLaxNames) failed — not self-contained: %v", err)
+	}
+	if _, err := Parse(string(s.Canonical()), WithLaxNames(nil)); err != nil {
+		t.Errorf("Parse(Canonical(), WithLaxNames) failed: %v", err)
+	}
+}
+
+func containsField(s, field string) bool {
+	return json.Valid([]byte(s)) && len(s) > 0 && stringContains(s, `"`+field+`"`)
+}
+
+func stringContains(haystack, needle string) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}
