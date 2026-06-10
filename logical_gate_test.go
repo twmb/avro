@@ -47,6 +47,18 @@ func TestRegression_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
 		{"fixed", "", 16, false},
 		{"long", "some-future-logical", 0, false},
 		{"bytes", "some-future-logical", 0, false},
+
+		// Hostile fixed size: the probe must NOT allocate proportional to size.
+		// jsonDecodeAppliesLogical caps its probe buffer at maxFixedLogicalLen+1,
+		// so a size > maxFixedLogicalLen is neither the uuid(16) nor duration(12)
+		// length and yields the same answer the small non-match case does, while
+		// decimal still transforms at any length. fixed size is schema-controlled
+		// and only validated non-negative, so without the cap make([]byte, size)
+		// here is a parse-time DoS; at 1<<62 a regressed cap panics immediately
+		// with "makeslice: len out of range" (it exceeds the runtime max alloc).
+		{"fixed", "uuid", 1 << 62, false},
+		{"fixed", "duration", 1 << 62, false},
+		{"fixed", "decimal", 1 << 62, true},
 	}
 	for _, c := range cases {
 		node := &schemaNode{kind: c.kind, logical: c.logical, size: c.size}

@@ -113,9 +113,21 @@ func jsonDecodeAppliesLogical(node *schemaNode) bool {
 		_, raw := v.([]byte)
 		return !raw
 	case "fixed":
-		// Probe at the schema's declared size: decodeLogicalFixed's uuid /
-		// duration arms only convert at len 16 / 12 respectively.
-		_, raw := decodeLogicalFixed(make([]byte, node.size), node).([]byte)
+		// decodeLogicalFixed's uuid / duration arms convert only at len 16 / 12;
+		// decimal converts at any len; an unknown logical never converts. So the
+		// probe's answer depends only on whether node.size is exactly 12 or 16 —
+		// no fixed logical inspects a length above 16. Cap the probe buffer just
+		// above that bound: node.size is schema-controlled and only validated as
+		// non-negative (a fixed size has no upper bound, matching fastavro), so a
+		// hostile {"type":"fixed","size":<huge>,"logicalType":...} with a matching
+		// CustomType would otherwise drive a multi-GB / panic-inducing make() here
+		// at parse time. A capped length >16 is neither 12 nor 16, so it yields
+		// the same answer the true oversized length would.
+		probeLen := node.size
+		if probeLen > maxFixedLogicalLen {
+			probeLen = maxFixedLogicalLen + 1
+		}
+		_, raw := decodeLogicalFixed(make([]byte, probeLen), node).([]byte)
 		return !raw
 	case "string":
 		// uuid-on-string has a TYPED-target transform — decodeString parses the
@@ -129,6 +141,13 @@ func jsonDecodeAppliesLogical(node *schemaNode) bool {
 	}
 	return false
 }
+
+// maxFixedLogicalLen is the largest fixed byte-length that any decodeLogicalFixed
+// arm inspects (uuid at 16; duration at 12; decimal converts at any length). It
+// bounds the jsonDecodeAppliesLogical parse-time probe buffer so a hostile fixed
+// size can't drive a huge allocation. If a future fixed-backed logical converts
+// at a longer length, raise this to match its len check.
+const maxFixedLogicalLen = 16
 
 // decodeLogicalFixed applies logical type conversion for fixed-backed logical types
 // when decoding to *any targets.

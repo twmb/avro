@@ -2735,10 +2735,16 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			return errors.New("fixed is missing size")
 		}
 		size := int(*o.Size)
-		// Size 0 is legal: the spec requires only "an integer", and Java
-		// (SystemLimitException.checkMaxBytesLength rejects negatives only),
+		// Size 0 is legal: the spec requires only "an integer", and Java,
 		// fastavro, and avro-rs all accept it — every value of a size-0
-		// fixed is the empty byte string. Only negatives are malformed.
+		// fixed is the empty byte string. We reject only negatives. The upper
+		// bound is intentionally unbounded at parse, matching fastavro and
+		// avro-rs (which defer the size to value/wire time): a size beyond the
+		// actual datum simply fails at encode/decode where it is value- and
+		// buffer-bounded. (Java is stricter — FixedSchema's ctor caps size at
+		// Integer.MAX_VALUE-8 via SystemLimitException.checkMaxBytesLength — but
+		// we follow the lenient majority. No parse-time path may allocate
+		// proportional to this size; see maxFixedLogicalLen in json_decode.go.)
 		if size < 0 {
 			return fmt.Errorf("invalid fixed size %v", size)
 		}

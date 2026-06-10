@@ -2460,3 +2460,52 @@ func TestRegression_CompatibilityErrorRenderingBounded(t *testing.T) {
 		t.Errorf("Resolve enum-symbol error is %d bytes (unbounded Detail echo); want bounded", n)
 	}
 }
+
+// Parsing a fixed schema whose size is large must not allocate (or panic
+// trying to allocate) proportional to that size. A fixed size is
+// schema-controlled and only validated non-negative (no upper bound, matching
+// fastavro/avro-rs). When a CustomType matches a fixed logical node, parse
+// consults jsonDecodeAppliesLogical, whose fixed arm previously did
+// make([]byte, node.size) — turning a tiny untrusted schema into a multi-GB /
+// panic-inducing parse-time allocation. The probe is now bounded to
+// maxFixedLogicalLen+1 bytes. This pins the end-to-end parse path; the
+// probe-level answer is pinned by TestRegression_JSONDecodeAppliesLogicalMatchesDecode.
+func TestRegression_FixedLogicalProbeSizeBounded(t *testing.T) {
+	ct := avro.CustomType{AvroType: "fixed", LogicalType: "duration"}
+	const schema = `{"type":"fixed","size":9223372036854775807,"logicalType":"duration","name":"f"}`
+
+	done := make(chan struct{})
+	var panicVal any
+	t0 := time.Now()
+	go func() {
+		defer func() { panicVal = recover(); close(done) }()
+		_, _ = avro.Parse(schema, avro.WithCustomType(ct))
+	}()
+	<-done
+	elapsed := time.Since(t0)
+	if panicVal != nil {
+		t.Fatalf("Parse panicked on a large fixed size (parse-time make([]byte, size) DoS): %v", panicVal)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("Parse of a large-fixed-size schema took %v (>100ms): allocation proportional to size", elapsed)
+	}
+
+	// Answer-preservation at the in-range sizes: a no-callback CustomType on a
+	// uuid fixed (size 16) suppresses the logical, so DecodeJSON into any yields
+	// the RAW 16 bytes (matching binary's deserFixed), not an enriched [16]byte.
+	// If the probe cap broke the size-16/12 cases, suppression would not install
+	// and JSON would leak the enriched type.
+	suppressed := avro.MustParse(`{"type":"fixed","size":16,"logicalType":"uuid","name":"u"}`, avro.WithCustomType(avro.CustomType{AvroType: "fixed", LogicalType: "uuid"}))
+	in := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	jb, err := suppressed.AppendEncodeJSON(nil, in)
+	if err != nil {
+		t.Fatalf("encodeJSON: %v", err)
+	}
+	var got any
+	if err := suppressed.DecodeJSON(jb, &got); err != nil {
+		t.Fatalf("decodeJSON: %v", err)
+	}
+	if _, ok := got.([]byte); !ok {
+		t.Fatalf("uuid suppression broken by probe cap: DecodeJSON into any returned %T, want []byte (raw)", got)
+	}
+}
