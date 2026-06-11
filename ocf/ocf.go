@@ -168,6 +168,7 @@ func (optMaxDecompressedBytes) readerOpt() {}
 type optSchemaOpts []avro.SchemaOpt
 
 func (optSchemaOpts) readerOpt() {}
+func (optSchemaOpts) writerOpt() {}
 
 // WithCodec sets the compression codec. The default is null (no compression).
 // WithCodec can be used as both a [WriterOpt] and a [ReaderOpt]. The four
@@ -270,10 +271,13 @@ const defaultMaxDecompressedBytes = 64 << 20
 // [WithBlockBytes]) that decompress beyond the default.
 func WithMaxDecompressedBlockBytes(n int64) ReaderOpt { return optMaxDecompressedBytes{n} }
 
-// WithSchemaOpts passes [avro.SchemaOpt] values (such as [avro.CustomType])
-// to the [avro.Parse] call that parses the file header's embedded schema.
-// This allows registering custom type conversions for the reader's schema.
-func WithSchemaOpts(opts ...avro.SchemaOpt) ReaderOpt { return optSchemaOpts(opts) }
+// WithSchemaOpts passes [avro.SchemaOpt] values (such as [avro.CustomType]
+// or [avro.WithLaxNames]) to the [avro.Parse] call that parses the file
+// header's embedded schema. [NewReader] uses it to register custom type
+// conversions (and to accept lax-named header schemas); [NewAppendWriter]
+// needs it whenever the header schema requires an option to parse at all.
+// [NewWriter] ignores it: its schema is already parsed by the caller.
+func WithSchemaOpts(opts ...avro.SchemaOpt) Opt { return optSchemaOpts(opts) }
 
 // DeflateCodec returns a [Codec] using raw DEFLATE compression at the given
 // level (e.g. [flate.DefaultCompression]).
@@ -638,10 +642,19 @@ func (w *Writer) Reset(dst io.Writer) error {
 //
 // [WithBlockCount] and [WithBlockBytes] are honored. [WithCodec] can
 // provide a codec implementation for non-built-in codecs (matched by name
-// against the header). Other options are ignored.
+// against the header). [WithSchemaOpts] passes schema options to the
+// header-schema parse — required when the header schema needs an option
+// to parse at all (e.g. [avro.WithLaxNames] for a file written with a
+// lax-named schema). Other options are ignored.
 func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error) {
+	var schemaOpts []avro.SchemaOpt
+	for _, o := range opts {
+		if o, ok := o.(optSchemaOpts); ok {
+			schemaOpts = append(schemaOpts, o...)
+		}
+	}
 	br := bufio.NewReader(rws)
-	schema, meta, sync, err := readHeader(br, nil)
+	schema, meta, sync, err := readHeader(br, schemaOpts)
 	if err != nil {
 		return nil, err
 	}

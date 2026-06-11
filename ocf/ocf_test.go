@@ -3196,6 +3196,77 @@ func TestWithSchemaOptsCustomType(t *testing.T) {
 	}
 }
 
+// TestRegression_AppendWriterSchemaOpts verifies that [WithSchemaOpts]
+// reaches the header-schema parse in [NewAppendWriter]. The append writer
+// recovers its schema by re-parsing the file header, so a SchemaOpt the
+// schema needs in order to PARSE (most importantly [avro.WithLaxNames])
+// must be threadable. Without it, a file this package writes (NewWriter
+// accepts any parsed schema) and reads (NewReader takes WithSchemaOpts)
+// can never be reopened for append — the open fails on header-schema name
+// validation with no way around it short of rewriting the file.
+func TestRegression_AppendWriterSchemaOpts(t *testing.T) {
+	schema, err := avro.Parse(`{"type":"record","name":"my-rec","fields":[
+		{"name":"f","type":"int"}]}`, avro.WithLaxNames(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &seekBuf{}
+	w, err := NewWriter(f, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(map[string]any{"f": int32(1)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without the option the header parse must still reject the lax name:
+	// the option is the explicit opt-in, exactly as it is for NewReader.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewAppendWriter(f); err == nil {
+		t.Fatal("NewAppendWriter without WithSchemaOpts accepted a lax-named header schema")
+	}
+
+	// With the same option NewReader takes, append must work.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	aw, err := NewAppendWriter(f, WithSchemaOpts(avro.WithLaxNames(nil)))
+	if err != nil {
+		t.Fatalf("NewAppendWriter with WithSchemaOpts: %v", err)
+	}
+	if err := aw.Encode(map[string]any{"f": int32(2)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := aw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both the original and the appended record read back.
+	r, err := NewReader(bytes.NewReader(f.data), WithSchemaOpts(avro.WithLaxNames(nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	for i, want := range []int32{1, 2} {
+		var out map[string]any
+		if err := r.Decode(&out); err != nil {
+			t.Fatalf("decode record %d: %v", i, err)
+		}
+		if got := out["f"].(int32); got != want {
+			t.Fatalf("record %d: got %d, want %d", i, got, want)
+		}
+	}
+	var out map[string]any
+	if err := r.Decode(&out); err != io.EOF {
+		t.Fatalf("expected EOF after 2 records, got %v", err)
+	}
+}
+
 // TestRegression_BlockCountZeroTerminatesStream verifies that an OCF
 // block with count==0 is treated as end-of-stream — AFTER reading and
 // validating the block's size and sync marker per spec. Java's
