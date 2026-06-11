@@ -2,6 +2,7 @@ package avro_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -143,4 +144,36 @@ func TestRegression_CanonicalBackslashNameValid(t *testing.T) {
 func jsonEscapeForTest(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b[1 : len(b)-1]) // strip surrounding quotes
+}
+
+// SchemaNode.Schema() (the Root().Schema() metadata round-trip) must be O(n)
+// in schema size, not O(depth*subtree). toJSONWalk snapshotted every named
+// type's full marshaled body for conflict detection; on a nested record chain
+// each enclosing record re-marshaled everything below it (O(n^2)) even though
+// the snapshot map is only ever read on a duplicate fullname. Parse() and
+// Canonical() of the same schema are already linear (microseconds); this pins
+// the metadata emitter to match. A 900-deep, ~318KB record chain that parses
+// in ~12ms regressed to >1.3s through Root().Schema().
+func TestRegression_RootSchemaEmitterLinearOnDeepNesting(t *testing.T) {
+	const depth = 900
+	var sb strings.Builder
+	for i := 0; i < depth; i++ {
+		fmt.Fprintf(&sb, `{"type":"record","name":"R%d","fields":[{"name":"f","type":`, i)
+	}
+	sb.WriteString(`{"type":"record","name":"Leaf","doc":"` + strings.Repeat("x", 256*1024) + `","fields":[{"name":"v","type":"int"}]}`)
+	for i := 0; i < depth; i++ {
+		sb.WriteString(`}]}`)
+	}
+	s, err := avro.Parse(sb.String())
+	if err != nil {
+		t.Fatalf("parse deep record chain: %v", err)
+	}
+	root := s.Root()
+	t0 := time.Now()
+	if _, err := root.Schema(); err != nil {
+		t.Fatalf("Root().Schema(): %v", err)
+	}
+	if d := time.Since(t0); d > 500*time.Millisecond {
+		t.Errorf("Root().Schema() of a %d-deep record chain took %v; want <500ms (O(depth*subtree) regression in toJSONWalk)", depth, d)
+	}
 }

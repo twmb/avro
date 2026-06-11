@@ -90,6 +90,138 @@ func TestRegression_SchemaCacheSOEInterop(t *testing.T) {
 	}
 }
 
+// The cross-parse self-containment splice harvests inherited definitions by
+// walking the prior schema's JSON tree. It must mirror the parser EXACTLY,
+// which (a) reads object keys case-insensitively (lookupCI) and (b) accepts
+// the flat ("linkedin/goavro") field form, where a record field carries a
+// named type's defining key (symbols/fields/size) alongside its own keys and
+// the parser lifts it into a registered named type. A walker that only
+// descended into a field's "type" value (and read keys case-sensitively)
+// never collected those definitions, so a later cross-parse reference stayed
+// a dangling bare ref: Canonical()/String() failed to re-parse and the
+// fingerprint diverged from the logically-identical schema (SOE/registry
+// interop break).
+func TestRegression_SchemaCacheSelfContainedFlatFormDef(t *testing.T) {
+	var c avro.SchemaCache
+	// Prior parse defines enum E in the FLAT field form.
+	if _, err := c.Parse(`{"type":"record","name":"H","fields":[{"name":"E","type":"enum","symbols":["A","B"]}]}`); err != nil {
+		t.Fatalf("register flat-form E: %v", err)
+	}
+	viaCache, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"x","type":"E"}]}`)
+	if err != nil {
+		t.Fatalf("reference E via cache: %v", err)
+	}
+	inline := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":{"type":"enum","name":"E","symbols":["A","B"]}}]}`)
+
+	assertSelfContained(t, viaCache, inline, map[string]any{"x": "B"})
+}
+
+// Sibling of the flat-form case: a prior definition written with a
+// case-variant object key (e.g. "tYpe", accepted by the parser's lookupCI)
+// must also be collected so the cross-parse reference self-contains.
+func TestRegression_SchemaCacheSelfContainedCaseVariantKey(t *testing.T) {
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"tYpe":"record","name":"Inner","fields":[{"name":"a","type":"int"}]}}]}`); err != nil {
+		t.Fatalf("register case-variant Inner: %v", err)
+	}
+	viaCache, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"x","type":"Inner"}]}`)
+	if err != nil {
+		t.Fatalf("reference Inner via cache: %v", err)
+	}
+	inline := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":{"type":"record","name":"Inner","fields":[{"name":"a","type":"int"}]}}]}`)
+
+	assertSelfContained(t, viaCache, inline, map[string]any{"x": map[string]any{"a": int32(7)}})
+}
+
+// The splice walker (inlineTreeDefs) is the parallel of collectTreeDefs and
+// must mirror the parser the same way, or a TRANSITIVE inherited reference
+// reached through a case-variant structural key or a flat-form definition
+// dangles: the self-containment re-parse then fails and the whole splice is
+// abandoned, leaving even the top-level reference bare. These cases require
+// inlineTreeDefs to read keys case-insensitively (writing back to the present
+// key) and to recurse into a flat-form field's own structural subtree.
+func TestRegression_SchemaCacheSelfContainedTransitiveRefs(t *testing.T) {
+	check := func(name string, defs []string, ref string) {
+		t.Run(name, func(t *testing.T) {
+			var c avro.SchemaCache
+			for i, d := range defs {
+				if _, err := c.Parse(d); err != nil {
+					t.Fatalf("parse def %d: %v", i, err)
+				}
+			}
+			s, err := c.Parse(ref)
+			if err != nil {
+				t.Fatalf("parse referencing schema: %v", err)
+			}
+			if _, err := avro.Parse(string(s.Canonical())); err != nil {
+				t.Errorf("Parse(Canonical()) FAILS — not self-contained: %v\n canonical=%s", err, s.Canonical())
+			}
+			if _, err := avro.Parse(s.String()); err != nil {
+				t.Errorf("Parse(String()) FAILS — not self-contained: %v", err)
+			}
+		})
+	}
+
+	// A's definition reached transitively through B, where B's def uses a
+	// case-variant structural key ("fIelds").
+	check("case_variant_key_transitive",
+		[]string{
+			`{"type":"record","name":"A","fields":[{"name":"a","type":"int"}]}`,
+			`{"type":"record","name":"B","fIelds":[{"name":"x","type":"A"}]}`,
+		},
+		`{"type":"record","name":"R","fields":[{"name":"y","type":"B"}]}`)
+
+	// B defined in flat field form, transitively referencing A.
+	check("flat_form_transitive",
+		[]string{
+			`{"type":"record","name":"A","fields":[{"name":"a","type":"int"}]}`,
+			`{"type":"record","name":"H","fields":[{"name":"B","type":"record","fields":[{"name":"x","type":"A"}]}]}`,
+		},
+		`{"type":"record","name":"R","fields":[{"name":"y","type":"B"}]}`)
+
+	// Case-variant structural key at the top-level schema being spliced.
+	check("case_variant_top_level",
+		[]string{
+			`{"type":"record","name":"A","fields":[{"name":"a","type":"int"}]}`,
+		},
+		`{"type":"record","name":"R","fIelds":[{"name":"y","type":"A"}]}`)
+}
+
+// assertSelfContained checks that a cache-built schema is byte-for-byte the
+// same logical schema as its inline-defined twin: identical wire for a value,
+// identical canonical form and fingerprint, and re-parseable Canonical()/
+// String()/Root().Schema().
+func assertSelfContained(t *testing.T, viaCache, inline *avro.Schema, val map[string]any) {
+	t.Helper()
+	wc, err := viaCache.Encode(val)
+	if err != nil {
+		t.Fatalf("cache encode: %v", err)
+	}
+	wi, err := inline.Encode(val)
+	if err != nil {
+		t.Fatalf("inline encode: %v", err)
+	}
+	if string(wc) != string(wi) {
+		t.Fatalf("control: wire differs (not the same logical schema)")
+	}
+	if string(viaCache.Canonical()) != string(inline.Canonical()) {
+		t.Errorf("Canonical() diverges:\n cache : %s\n inline: %s", viaCache.Canonical(), inline.Canonical())
+	}
+	if _, err := avro.Parse(string(viaCache.Canonical())); err != nil {
+		t.Errorf("Parse(cache.Canonical()) FAILS — not self-contained: %v", err)
+	}
+	if _, err := avro.Parse(viaCache.String()); err != nil {
+		t.Errorf("Parse(cache.String()) FAILS — not self-contained: %v", err)
+	}
+	if string(viaCache.Fingerprint(avro.NewRabin())) != string(inline.Fingerprint(avro.NewRabin())) {
+		t.Errorf("Fingerprint() diverges for the same logical schema (SOE/registry interop break)")
+	}
+	root := viaCache.Root()
+	if _, err := root.Schema(); err != nil {
+		t.Errorf("Root().Schema() FAILS to rebuild a cache-built schema: %v", err)
+	}
+}
+
 // TestRegression_SchemaCacheSelfContainedEdgeCases exercises the converter's
 // delicate paths: a recursive cache type (cycle handling), a cache type with a
 // field default (default round-trip), and enum/fixed cache refs (the bug is

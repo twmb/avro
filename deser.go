@@ -1025,9 +1025,28 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		elemType := sliceVal.Type().Elem()
 		if elemType.Kind() == reflect.Pointer {
 			innerType := elemType.Elem()
-			backing := reflect.MakeSlice(reflect.SliceOf(innerType), n, n)
+			// Batch-allocate backing for nil slots only; reuse any non-nil
+			// retained pointer so an element aliased from a prior decode is
+			// updated in place, matching the unsafe struct-field path
+			// (udArrayPtrRecord) and the documented pointer-reuse contract.
+			// On a freshly grown slice the new slots are nil, so they all get
+			// fresh backing.
+			var need int
 			for i := range n {
-				sliceVal.Index(start + i).Set(backing.Index(i).Addr())
+				if sliceVal.Index(start + i).IsNil() {
+					need++
+				}
+			}
+			if need > 0 {
+				backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
+				j := 0
+				for i := range n {
+					slot := sliceVal.Index(start + i)
+					if slot.IsNil() {
+						slot.Set(backing.Index(j).Addr())
+						j++
+					}
+				}
 			}
 		}
 		for i := start; i < newLen; i++ {

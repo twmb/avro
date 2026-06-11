@@ -21730,10 +21730,13 @@ func TestRegression_SchemaParseErrorBoundedForHostileInput(t *testing.T) {
 // Cross-impl: Java's Schema.RecordSchema.setFields rejects with
 // "Duplicate field X in record Y" (Schema.java); hamba rejects similarly.
 func TestRegression_SchemaForRejectsDuplicateFieldName(t *testing.T) {
-	// Two siblings collide on Avro name "X" — error.
+	// Two same-depth siblings with the SAME tagged status collide on Avro
+	// name "X" — genuinely ambiguous (no tiebreaker), so error. (A same-depth
+	// tagged-vs-untagged collision is NOT ambiguous — the tagged field wins;
+	// that case is pinned by TestRegression_SchemaForSameDepthTaggedBeatsUntagged.)
 	type Collision struct {
 		A int    `avro:"X"`
-		X string // also produces Avro name "X"
+		B string `avro:"X"` // both tagged to "X" — same status, no winner
 	}
 	_, err := avro.SchemaFor[Collision]()
 	if err == nil {

@@ -176,3 +176,123 @@ func TestMatrix_TypedContainerReuse(t *testing.T) {
 		}
 	})
 }
+
+type reuseArrayElemP struct {
+	A int64 `avro:"a"`
+}
+
+type reuseArrayElemFast struct {
+	F []*reuseArrayElemP `avro:"f"`
+}
+
+// The embedded-pointer twin routes every field through the reflect slow path
+// (computeFieldOffset declines fields reached through an embedded pointer),
+// so a value of this type decodes via the reflect array path while a plain
+// reuseArrayElemFast decodes via the unsafe struct fast path.
+type reuseArrayElemReflect struct {
+	*reuseArrayElemFast
+}
+
+// TestRegression_ArrayPointerElementReuseAcrossDecodePaths pins that decoding a
+// []*P struct field into a reused target reuses the retained non-nil element
+// pointers identically on the unsafe struct fast path and the reflect path —
+// the documented pointer-reuse contract (matrix header: "pointers are
+// reused"). The unsafe path batch-allocated backing only for nil slots and
+// wrote through retained pointers; the reflect path unconditionally installed
+// fresh backing, so an aliased element from a prior decode was updated in
+// place on one arm and orphaned on the other.
+func TestRegression_ArrayPointerElementReuseAcrossDecodePaths(t *testing.T) {
+	const schema = `{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":{"type":"record","name":"P","fields":[{"name":"a","type":"long"}]}}}]}`
+	s := avro.MustParse(schema)
+	w1, err := s.Encode(map[string]any{"f": []any{map[string]any{"a": int64(1)}}})
+	if err != nil {
+		t.Fatalf("encode w1: %v", err)
+	}
+	w2, err := s.Encode(map[string]any{"f": []any{map[string]any{"a": int64(2)}}})
+	if err != nil {
+		t.Fatalf("encode w2: %v", err)
+	}
+
+	// Unsafe struct fast path: a directly addressable struct target.
+	var fast reuseArrayElemFast
+	if _, err := s.Decode(w1, &fast); err != nil {
+		t.Fatalf("fast decode w1: %v", err)
+	}
+	fastKeep := fast.F[0]
+	if _, err := s.Decode(w2, &fast); err != nil {
+		t.Fatalf("fast decode w2: %v", err)
+	}
+
+	// Reflect path: same logical target through the embedded-pointer twin.
+	refl := reuseArrayElemReflect{reuseArrayElemFast: &reuseArrayElemFast{}}
+	if _, err := s.Decode(w1, &refl); err != nil {
+		t.Fatalf("reflect decode w1: %v", err)
+	}
+	reflKeep := refl.F[0]
+	if _, err := s.Decode(w2, &refl); err != nil {
+		t.Fatalf("reflect decode w2: %v", err)
+	}
+
+	if fastKeep.A != reflKeep.A {
+		t.Fatalf("arm divergence: retained pointer reads %d (unsafe fast path) vs %d (reflect path)", fastKeep.A, reflKeep.A)
+	}
+	// Both paths reuse the slot, so the retained alias observes the second
+	// decode's value.
+	if fastKeep.A != 2 {
+		t.Fatalf("retained pointer should observe the reused decode (want 2); got %d", fastKeep.A)
+	}
+}
+
+type reuseNullUnionFast struct {
+	F []*int64 `avro:"f"`
+}
+
+type reuseNullUnionReflect struct {
+	*reuseNullUnionFast
+}
+
+// Sibling of the record-element case: null-union array elements ([]*int64 over
+// array<["null","long"]>) flow through the same pointer-element branch, so the
+// unsafe path (udNullUnionEnter) and reflect path must reuse retained element
+// pointers identically.
+func TestRegression_ArrayNullUnionPointerElementReuseAcrossDecodePaths(t *testing.T) {
+	const schema = `{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":["null","long"]}}]}`
+	s := avro.MustParse(schema)
+	one, two := int64(1), int64(2)
+	w1, err := s.Encode(map[string]any{"f": []any{&one}})
+	if err != nil {
+		t.Fatalf("encode w1: %v", err)
+	}
+	w2, err := s.Encode(map[string]any{"f": []any{&two}})
+	if err != nil {
+		t.Fatalf("encode w2: %v", err)
+	}
+
+	var fast reuseNullUnionFast
+	if _, err := s.Decode(w1, &fast); err != nil {
+		t.Fatalf("fast decode w1: %v", err)
+	}
+	fastKeep := fast.F[0]
+	if _, err := s.Decode(w2, &fast); err != nil {
+		t.Fatalf("fast decode w2: %v", err)
+	}
+
+	refl := reuseNullUnionReflect{reuseNullUnionFast: &reuseNullUnionFast{}}
+	if _, err := s.Decode(w1, &refl); err != nil {
+		t.Fatalf("reflect decode w1: %v", err)
+	}
+	reflKeep := refl.F[0]
+	if _, err := s.Decode(w2, &refl); err != nil {
+		t.Fatalf("reflect decode w2: %v", err)
+	}
+
+	if fastKeep == nil || reflKeep == nil {
+		t.Fatalf("retained element pointers must be non-nil (value branch): fast=%v reflect=%v", fastKeep, reflKeep)
+	}
+	if *fastKeep != *reflKeep {
+		t.Fatalf("arm divergence: retained pointer reads %d (unsafe) vs %d (reflect)", *fastKeep, *reflKeep)
+	}
+	if *fastKeep != 2 {
+		t.Fatalf("retained pointer should observe the reused decode (want 2); got %d", *fastKeep)
+	}
+}

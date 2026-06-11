@@ -134,7 +134,7 @@ type SchemaField struct {
 // names) or silently lacks the custom wiring.
 func (n *SchemaNode) Schema(opts ...SchemaOpt) (*Schema, error) {
 	d := &deduper{
-		defined: make(map[string]string),
+		defined: make(map[string]*SchemaNode),
 		visited: make(map[*SchemaNode]struct{}),
 	}
 	tree := n.toJSONDedup(d)
@@ -153,7 +153,7 @@ func (n *SchemaNode) Schema(opts ...SchemaOpt) (*Schema, error) {
 // *SchemaNode Items/Values pointers (which are the only way a SchemaNode
 // tree can have true cycles — Fields and Branches are value slices).
 type deduper struct {
-	defined map[string]string        // name → marshaled JSON of first definition
+	defined map[string]*SchemaNode   // fullname → first definition's node
 	visited map[*SchemaNode]struct{} // seen *SchemaNode pointers (cycle detection)
 	err     error                    // first conflict or cycle encountered
 }
@@ -346,9 +346,20 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// no "namespace":"" escape syntax.)
 	if d != nil && isNamedKind(n.Type) && n.Name != "" {
 		if prev, exists := d.defined[nodeFullname(n)]; exists {
-			cur, _ := json.Marshal(n.toJSON())
-			if string(cur) != prev && d.err == nil {
-				d.err = fmt.Errorf("avro: conflicting definitions for named type %q", truncForError(nodeFullname(n)))
+			// A repeated fullname becomes a bare name reference. Marshal-
+			// compare the bodies only when the two are DISTINCT nodes (a
+			// possible conflicting redefinition); a named type referenced
+			// multiple times resolves to the same *SchemaNode and is
+			// definitionally equal, so it needs no marshal. Deferring the
+			// comparison to an actual collision keeps the common all-
+			// distinct-names case O(n) instead of marshaling every named
+			// type's full subtree eagerly (O(depth*subtree) on nesting).
+			if prev != n && d.err == nil {
+				cur, _ := json.Marshal(n.toJSON())
+				prevB, _ := json.Marshal(prev.toJSON())
+				if string(cur) != string(prevB) {
+					d.err = fmt.Errorf("avro: conflicting definitions for named type %q", truncForError(nodeFullname(n)))
+				}
 			}
 			return nodeFullname(n)
 		}
@@ -376,12 +387,13 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		return n.Type
 	}
 
-	// Dedup: remember this named type's canonical body for the next
-	// occurrence's conflict check.
+	// Dedup: remember this named type's node for the next occurrence's
+	// conflict check. Store the node, not its marshaled body — marshaling
+	// every named type eagerly is O(depth*subtree) on nested schemas, and
+	// the body is only needed if a duplicate fullname actually appears.
 	if d != nil {
 		if isNamedKind(n.Type) && n.Name != "" {
-			b, _ := json.Marshal(n.toJSON())
-			d.defined[nodeFullname(n)] = string(b)
+			d.defined[nodeFullname(n)] = n
 		}
 	}
 

@@ -2877,6 +2877,57 @@ func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
 	})
 }
 
+// TestRegression_SchemaForSameDepthTaggedBeatsUntagged pins that SchemaFor
+// resolves a same-depth tagged-vs-untagged Avro-name collision via the tag
+// tiebreaker, matching the documented contract (doc.go: "among fields at the
+// same depth, a tagged field wins over an untagged one") and the runtime
+// field mapping (reflect.go's typeFieldMapping). Only a same-depth collision
+// with the SAME tagged status is the ambiguous case that errors; a
+// tagged/untagged pair at the same depth has a clear winner. Without the
+// tiebreaker ordering, collectFields raised "duplicate field name" before
+// the tag tiebreaker could fire, so SchemaFor rejected a type that
+// Encode/Decode handle.
+func TestRegression_SchemaForSameDepthTaggedBeatsUntagged(t *testing.T) {
+	type Collide struct {
+		Renamed int32 `avro:"Shared"` // tagged → Avro name "Shared"
+		Shared  int32 // untagged → Go field name is also "Shared"; the tagged field wins
+	}
+	s, err := SchemaFor[Collide]()
+	if err != nil {
+		t.Fatalf("SchemaFor rejected a same-depth tagged/untagged collision the runtime resolves: %v", err)
+	}
+	// The winning field is the tagged int32 (named "Shared").
+	if c := strings.Count(s.String(), `"name":"Shared"`); c != 1 {
+		t.Fatalf("want exactly one field named %q; got %d in %s", "Shared", c, s.String())
+	}
+
+	// The runtime must select the same (tagged) field — encode a value that
+	// only fits if "shared" maps to the int32-typed Renamed field, then
+	// confirm it round-trips into Renamed.
+	in := Collide{Renamed: 7, Shared: 99}
+	b, err := s.Encode(&in)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var got Collide
+	if _, err := s.Decode(b, &got); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got.Renamed != 7 {
+		t.Fatalf("tagged field should own the Avro name: got Renamed=%d want 7", got.Renamed)
+	}
+
+	// Boundary: a same-depth collision with the SAME tagged status stays an
+	// ambiguous error (this is the case the tiebreaker does NOT resolve).
+	type Ambiguous struct {
+		A int32 `avro:"dup"`
+		B int32 `avro:"dup"`
+	}
+	if _, err := SchemaFor[Ambiguous](); err == nil {
+		t.Fatalf("same-depth same-tagged-status collision must remain an ambiguous error")
+	}
+}
+
 // A single Go [N]byte type can be referenced both ,uuid-tagged (Avro
 // fixed(16) + uuid logical, named "uuid") and plain (Avro fixed named after
 // the Go type). Those are distinct Avro types, so SchemaFor must emit a

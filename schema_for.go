@@ -383,24 +383,22 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	next:
 	}
 
-	// Deduplicate. Matches reflect.go's typeFieldMapping (line 322-323)
-	// so SchemaFor's inferred schema and the runtime field-mapping
-	// agree on which Go field claims each Avro name. The precedence
-	// rules are documented at doc.go:147-149 ("the shallowest wins;
-	// among fields at the same depth, a tagged field wins over an
-	// untagged one"):
-	//   1. Tagged beats untagged across depths (shadowing).
-	//   2. Among same-tagged-status fields, shallower (shorter index
-	//      path) wins. Without this, dedup keeps first-seen — the
-	//      deeper embedded field — because nested-struct fields are
-	//      appended to raw BEFORE outer fields.
-	//
-	// Same-depth collisions error: when two fields at the SAME nesting
-	// depth produce the same Avro name there is no legitimate
-	// shadowing — the user wrote two sibling fields that disagree on
-	// who owns the name, so silently picking one would cause data loss
-	// at encode time. Java's RecordSchema.setFields rejects with
-	// "Duplicate field" (Schema.java:981); hamba rejects similarly.
+	// Deduplicate. Must agree with reflect.go's typeFieldMapping so
+	// SchemaFor's inferred schema and the runtime field mapping pick the
+	// same Go field for each Avro name. The precedence rules (documented on
+	// the encode/decode field-mapping contract: "the shallowest wins; among
+	// fields at the same depth, a tagged field wins over an untagged one"):
+	//   1. A tagged field beats an untagged one at ANY depth — a
+	//      tiebreaker, so NOT an ambiguous collision. This runs first.
+	//   2. Among same-tagged-status fields, the shallower (shorter index
+	//      path) wins. Without this, dedup keeps first-seen — the deeper
+	//      embedded field — because nested-struct fields are appended to
+	//      raw BEFORE outer fields.
+	//   3. Only a same-depth collision with the SAME tagged status is
+	//      genuinely ambiguous: two sibling fields disagree on who owns the
+	//      name, so silently picking one would cause data loss at encode
+	//      time. Java's RecordSchema.setFields rejects a true duplicate with
+	//      "Duplicate field" (Schema.java:981); hamba rejects similarly.
 	type entry struct {
 		idx int
 		schemaField
@@ -408,10 +406,8 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	m := make(map[string]entry, len(raw))
 	for i, f := range raw {
 		if existing, ok := m[f.name]; ok {
-			if len(f.index) == len(existing.index) {
-				return nil, fmt.Errorf("avro: duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
-					truncForError(f.name), t.String(), truncForError(t.FieldByIndex(existing.index).Name), truncForError(t.FieldByIndex(f.index).Name))
-			}
+			// Tag tiebreaker first: tagged beats untagged regardless of
+			// depth, so a tagged/untagged pair is resolved, never ambiguous.
 			if f.tagged && !existing.tagged {
 				m[f.name] = entry{i, f}
 				continue
@@ -419,7 +415,12 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 			if !f.tagged && existing.tagged {
 				continue
 			}
-			// Same tagged status: shallower wins.
+			// Same tagged status: a same-depth collision is the ambiguous
+			// case; otherwise the shallower field wins.
+			if len(f.index) == len(existing.index) {
+				return nil, fmt.Errorf("avro: duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
+					truncForError(f.name), t.String(), truncForError(t.FieldByIndex(existing.index).Name), truncForError(t.FieldByIndex(f.index).Name))
+			}
 			if len(f.index) < len(existing.index) {
 				m[f.name] = entry{i, f}
 			}

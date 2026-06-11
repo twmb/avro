@@ -249,19 +249,27 @@ func avroNamedRef(typ string) bool {
 
 // nodeNamespace returns the namespace in scope inside a named-type object: the
 // prefix of a dotted name, else its "namespace" attribute, else inherited.
+// Keys are read case-insensitively, mirroring the parser's lookupCI.
 func nodeNamespace(obj map[string]any, enclosingNS string) string {
-	if name, ok := obj["name"].(string); ok && strings.Contains(name, ".") {
-		return name[:strings.LastIndex(name, ".")]
+	if v, ok := lookupCI(obj, "name"); ok {
+		if name, ok := v.(string); ok && strings.Contains(name, ".") {
+			return name[:strings.LastIndex(name, ".")]
+		}
 	}
-	if ns, ok := obj["namespace"].(string); ok {
-		return ns
+	if v, ok := lookupCI(obj, "namespace"); ok {
+		if ns, ok := v.(string); ok {
+			return ns
+		}
 	}
 	return enclosingNS
 }
 
 // nodeFullnameTree resolves a named-type object's fullname.
 func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
-	name, _ := obj["name"].(string)
+	name := ""
+	if v, ok := lookupCI(obj, "name"); ok {
+		name, _ = v.(string)
+	}
 	short := name
 	if i := strings.LastIndex(name, "."); i >= 0 {
 		short = name[i+1:]
@@ -273,7 +281,10 @@ func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
 }
 
 // collectTreeDefs calls visit for every named-type definition in the tree, with
-// its resolved fullname and sub-tree, tracking namespace scope.
+// its resolved fullname and sub-tree, tracking namespace scope. It mirrors the
+// parser EXACTLY: object keys are read case-insensitively (lookupCI), and a
+// flat-form ("linkedin/goavro") field whose own keys define a named type is
+// itself a definition (the parser lifts it via liftFlatFieldType).
 func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) {
 	switch v := node.(type) {
 	case []any:
@@ -281,30 +292,100 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 			collectTreeDefs(b, ns, visit)
 		}
 	case map[string]any:
-		typ, _ := v["type"].(string)
-		name, _ := v["name"].(string)
+		typVal, hasType := lookupCI(v, "type")
+		typ, _ := typVal.(string)
+		name := ""
+		if nm, ok := lookupCI(v, "name"); ok {
+			name, _ = nm.(string)
+		}
 		childNS := ns
 		if name != "" && isNamedKind(typ) {
 			childNS = nodeNamespace(v, ns)
 			visit(nodeFullnameTree(v, ns), v)
 		}
-		if t, ok := v["type"]; ok {
-			collectTreeDefs(t, ns, visit)
+		if hasType {
+			collectTreeDefs(typVal, ns, visit)
 		}
-		if fs, ok := v["fields"].([]any); ok {
-			for _, f := range fs {
-				if fo, ok := f.(map[string]any); ok {
-					collectTreeDefs(fo["type"], childNS, visit)
+		if fs, ok := lookupCI(v, "fields"); ok {
+			if fsa, ok := fs.([]any); ok {
+				for _, f := range fsa {
+					fo, ok := f.(map[string]any)
+					if !ok {
+						continue
+					}
+					if lifted, ok := flatFieldNamedDef(fo); ok {
+						collectTreeDefs(lifted, childNS, visit)
+						continue
+					}
+					if t, ok := lookupCI(fo, "type"); ok {
+						collectTreeDefs(t, childNS, visit)
+					}
 				}
 			}
 		}
-		if it, ok := v["items"]; ok {
+		if it, ok := lookupCI(v, "items"); ok {
 			collectTreeDefs(it, childNS, visit)
 		}
-		if vv, ok := v["values"]; ok {
+		if vv, ok := lookupCI(v, "values"); ok {
 			collectTreeDefs(vv, childNS, visit)
 		}
 	}
+}
+
+// flatFieldNamedDef reports whether fo is a flat-form ("linkedin/goavro")
+// field that itself defines a NAMED type — its "type" names a named kind
+// (record/error/enum/fixed) and that kind's defining key (fields/symbols/
+// size) sits inline — and if so returns the lifted type object with field-
+// only keys dropped, mirroring the parser's liftFlatFieldType. Only named
+// kinds are referenceable across parses; flat array/map fields define no name.
+func flatFieldNamedDef(fo map[string]any) (map[string]any, bool) {
+	tv, ok := lookupCI(fo, "type")
+	if !ok {
+		return nil, false
+	}
+	ts, ok := tv.(string)
+	if !ok || !isNamedKind(ts) {
+		return nil, false
+	}
+	var defKey string
+	switch ts {
+	case "record", "error":
+		defKey = "fields"
+	case "enum":
+		defKey = "symbols"
+	case "fixed":
+		defKey = "size"
+	}
+	if _, ok := lookupCI(fo, defKey); !ok {
+		return nil, false
+	}
+	lifted := make(map[string]any, len(fo))
+	for k, val := range fo {
+		switch {
+		case strings.EqualFold(k, "default"), strings.EqualFold(k, "order"), strings.EqualFold(k, "aliases"):
+			// Field-only keys, not part of the type definition.
+		default:
+			lifted[k] = val
+		}
+	}
+	return lifted, true
+}
+
+// ciKey returns the key actually present in m matching key case-insensitively
+// (exact match preferred, else the lexicographically smallest case-insensitive
+// match — same selection as lookupCI). A mutating walker uses it to write back
+// to the present key instead of introducing a duplicate canonical-cased key.
+func ciKey(m map[string]any, key string) (string, bool) {
+	if _, ok := m[key]; ok {
+		return key, true
+	}
+	pick, found := "", false
+	for k := range m {
+		if strings.EqualFold(k, key) && (!found || k < pick) {
+			pick, found = k, true
+		}
+	}
+	return pick, found
 }
 
 // inlineTreeDefs replaces the FIRST occurrence of each reference to a cache-
@@ -358,33 +439,66 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		// Register this node's own name BEFORE walking its children, mirroring
 		// the parser's early self-registration (a type is in scope for its own
 		// descendants). A later sibling/descendant reference then sees it; an
-		// earlier one already resolved against the cache above.
-		if typ, _ := v["type"].(string); isNamedKind(typ) {
-			if name, _ := v["name"].(string); name != "" {
-				seen[nodeFullnameTree(v, ns)] = true
-			}
-		}
-		if t, ok := v["type"]; ok {
-			v["type"] = inlineTreeDefs(t, ns, defs, seen, inlined)
-		}
-		if fs, ok := v["fields"].([]any); ok {
-			for _, f := range fs {
-				if fo, ok := f.(map[string]any); ok {
-					if t, ok := fo["type"]; ok {
-						fo["type"] = inlineTreeDefs(t, childNS, defs, seen, inlined)
+		// earlier one already resolved against the cache above. Keys are read
+		// case-insensitively, mirroring collectTreeDefs and the parser.
+		if typVal, ok := lookupCI(v, "type"); ok {
+			if typ, _ := typVal.(string); isNamedKind(typ) {
+				if nameVal, ok := lookupCI(v, "name"); ok {
+					if name, _ := nameVal.(string); name != "" {
+						seen[nodeFullnameTree(v, ns)] = true
 					}
 				}
 			}
 		}
-		if it, ok := v["items"]; ok {
-			v["items"] = inlineTreeDefs(it, childNS, defs, seen, inlined)
+		// A node's own "type" value sits at the enclosing namespace; its
+		// fields/items/values sit inside the node's own namespace scope.
+		if tk, ok := ciKey(v, "type"); ok {
+			v[tk] = inlineTreeDefs(v[tk], ns, defs, seen, inlined)
 		}
-		if vv, ok := v["values"]; ok {
-			v["values"] = inlineTreeDefs(vv, childNS, defs, seen, inlined)
-		}
+		inlineNodeContainers(v, childNS, defs, seen, inlined)
 		return v
 	}
 	return node
+}
+
+// inlineNodeContainers splices inherited refs in a node's record-fields,
+// array-items, and map-values positions (all inside the node's own namespace
+// scope). A flat-form ("linkedin/goavro") field defines its named type via the
+// field's own structural keys, so its inline subtree is recursed directly
+// rather than through a "type" value. Keys are read case-insensitively and
+// written back to the present key, mirroring the parser and collectTreeDefs.
+func inlineNodeContainers(v map[string]any, ns string, defs map[string]any, seen, inlined map[string]bool) {
+	if fk, ok := ciKey(v, "fields"); ok {
+		if fs, ok := v[fk].([]any); ok {
+			for _, f := range fs {
+				fo, ok := f.(map[string]any)
+				if !ok {
+					continue
+				}
+				if _, isFlat := flatFieldNamedDef(fo); isFlat {
+					// The flat field is itself a named type opening its own
+					// namespace; recurse its structural keys for transitive
+					// refs (its "type" is a bare kind string, not a reference).
+					if nameVal, ok := lookupCI(fo, "name"); ok {
+						if name, _ := nameVal.(string); name != "" {
+							seen[nodeFullnameTree(fo, ns)] = true
+						}
+					}
+					inlineNodeContainers(fo, nodeNamespace(fo, ns), defs, seen, inlined)
+					continue
+				}
+				if ftk, ok := ciKey(fo, "type"); ok {
+					fo[ftk] = inlineTreeDefs(fo[ftk], ns, defs, seen, inlined)
+				}
+			}
+		}
+	}
+	if ik, ok := ciKey(v, "items"); ok {
+		v[ik] = inlineTreeDefs(v[ik], ns, defs, seen, inlined)
+	}
+	if vk, ok := ciKey(v, "values"); ok {
+		v[vk] = inlineTreeDefs(v[vk], ns, defs, seen, inlined)
+	}
 }
 
 // defWithExplicitNamespace deep-copies a named-type definition and makes its
