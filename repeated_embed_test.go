@@ -5,8 +5,8 @@ import (
 )
 
 // TestRegression_RepeatedEmbedShallowestWins pins doc.go's documented field
-// precedence ("When multiple fields at different depths resolve to the same
-// name, the shallowest wins") for the case where the SAME embedded type is
+// precedence ("among fields with the same tagged status, the shallowest
+// wins") for the case where the SAME embedded type is
 // reachable through two different embed paths at different depths. The
 // field-mapper's cycle-breaking visited map was marked-forever, so the
 // depth-first walk collected only the FIRST (deeper) occurrence of the

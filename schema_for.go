@@ -386,8 +386,9 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	// Deduplicate. Must agree with reflect.go's typeFieldMapping so
 	// SchemaFor's inferred schema and the runtime field mapping pick the
 	// same Go field for each Avro name. The precedence rules (documented on
-	// the encode/decode field-mapping contract: "the shallowest wins; among
-	// fields at the same depth, a tagged field wins over an untagged one"):
+	// the encode/decode field-mapping contract: "a tagged field wins over an
+	// untagged one at any depth; among fields with the same tagged status,
+	// the shallowest wins"):
 	//   1. A tagged field beats an untagged one at ANY depth — a
 	//      tiebreaker, so NOT an ambiguous collision. This runs first.
 	//   2. Among same-tagged-status fields, the shallower (shorter index

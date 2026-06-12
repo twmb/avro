@@ -1838,6 +1838,29 @@ func TestTypeFieldMappingTaggedBeatsUntagged(t *testing.T) {
 	}
 }
 
+func TestTypeFieldMappingSameDepthTaggedBeatsUntagged(t *testing.T) {
+	// Two same-depth fields resolving to one name with DIFFERENT tagged
+	// status are a tag tiebreak, not an ambiguous collision: the tagged
+	// field wins. Ambiguity is reserved for same-depth fields with the
+	// SAME tagged status (the lazy-error pins in embed_selection_test.go).
+	type EmbA struct {
+		Val string `avro:"Name"` // tagged, depth 2
+	}
+	type EmbB struct {
+		Name string // untagged, depth 2, Go field name "Name"
+	}
+	type R struct {
+		EmbA
+		EmbB
+	}
+	schema := `{"type":"record","name":"r","fields":[{"name":"Name","type":"string"}]}`
+	input := R{EmbA: EmbA{Val: "tagged"}, EmbB: EmbB{Name: "untagged"}}
+	got := roundTrip(t, schema, input)
+	if got.EmbA.Val != "tagged" {
+		t.Errorf("expected the tagged field to win the same-depth tiebreak, got %+v", got)
+	}
+}
+
 func TestTypeFieldMappingDuplicateFirstWins(t *testing.T) {
 	// Two untagged fields at different depths with same name: shallower wins.
 	type Deep struct {

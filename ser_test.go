@@ -2917,6 +2917,25 @@ func TestRegression_EmbeddedPointerStructNoPanic(t *testing.T) {
 			t.Fatal("expected clean error decoding into unexported embedded pointer; got nil")
 		}
 	})
+
+	t.Run("unexported embedded decode works when pre-allocated", func(t *testing.T) {
+		// The refusal above is specific to a NIL unexported embedded
+		// pointer (reflection cannot allocate it — writing the pointer
+		// field itself is what's off-limits). Writing a promoted EXPORTED
+		// field through a non-nil unexported embed is permitted, so a
+		// caller who allocates the embed before decoding must succeed.
+		wire, err := s.AppendEncode(nil, &withNilEmbedPtr{EmbeddedInner: &EmbeddedInner{A: 7}, C: 3})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		got := withUnexportedEmbedPtr{unexportedInner: &unexportedInner{}}
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode into pre-allocated unexported embed: %v", err)
+		}
+		if got.A != 7 || got.C != 3 {
+			t.Errorf("promoted field not filled through pre-allocated embed: got %+v", got)
+		}
+	})
 }
 
 // A multi-pointer field (**T / **Record) mapped to ["null", T] holding

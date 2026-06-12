@@ -158,9 +158,9 @@
 // instead errors on the missing key.
 //
 // Embedded (anonymous) struct fields are automatically inlined. To prevent
-// inlining, give the field an explicit name tag. When multiple fields at
-// different depths resolve to the same name, the shallowest wins; among
-// fields at the same depth, a tagged field wins over an untagged one. Two
+// inlining, give the field an explicit name tag. When multiple fields
+// resolve to the same name, a tagged field wins over an untagged one at any
+// depth; among fields with the same tagged status, the shallowest wins. Two
 // fields that resolve to the same name at the same depth with the same tagged
 // status are an ambiguous collision (Go itself makes such a field reference a
 // compile error). twmb errors rather than silently selecting one: [SchemaFor]
