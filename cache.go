@@ -407,9 +407,18 @@ func ciKey(m map[string]any, key string) (string, bool) {
 //   - a ref BEFORE the local def binds to the cached type (the local name was
 //     not yet in scope at the reference), so the cached def is spliced —
 //     matching the eager wire binding.
+//
 // Consulting a position-independent local set instead would wrongly keep a
 // before-the-def reference bare and diverge String()/Canonical()/Fingerprint()/
 // Root() from the wire codec the parser built.
+//
+// The walk also dedupes DEFINITIONS: spliced defs are stored self-contained,
+// so two inherited refs whose definitions share a transitive type (or a
+// nested type referenced before its container) would otherwise both carry a
+// definition of the shared name — a duplicate the rebuild Parse rejects. A
+// definition of a name already in seen is rewritten to a reference to the
+// first definition (dupDefRef; flat-form fields via rewriteFlatFieldToRef),
+// mirroring the parser's single resolved type per name.
 func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[string]bool) any {
 	switch v := node.(type) {
 	case string:
@@ -442,11 +451,27 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		// descendants). A later sibling/descendant reference then sees it; an
 		// earlier one already resolved against the cache above. Keys are read
 		// case-insensitively, mirroring collectTreeDefs and the parser.
+		//
+		// If the name is ALREADY defined at this point in the walk, this node
+		// is a SECOND definition arriving inside another spliced subtree: two
+		// inherited refs whose self-contained definitions share a transitive
+		// type (the diamond A→{B,C}→D), or a nested type referenced before
+		// the container whose definition carries it. The parser's node tree
+		// shares ONE resolved type per name, so the self-contained JSON must
+		// keep the first definition and reference it thereafter — the same
+		// first-define-then-reference rule Java's Schema toString applies via
+		// NamedSchema.writeNameRef. Without the rewrite the rebuilt JSON
+		// defines the name twice, the rebuild Parse rejects it, and the
+		// metadata forms silently fall back to the dangling original.
 		if typVal, ok := lookupCI(v, "type"); ok {
 			if typ, _ := typVal.(string); isNamedKind(typ) {
 				if nameVal, ok := lookupCI(v, "name"); ok {
 					if name, _ := nameVal.(string); name != "" {
-						seen[nodeFullnameTree(v, ns)] = true
+						fullname := nodeFullnameTree(v, ns)
+						if ref, ok := dupDefRef(fullname, ns, seen); ok {
+							return ref
+						}
+						seen[fullname] = true
 					}
 				}
 			}
@@ -480,9 +505,18 @@ func inlineNodeContainers(v map[string]any, ns string, defs map[string]any, seen
 					// The flat field is itself a named type opening its own
 					// namespace; recurse its structural keys for transitive
 					// refs (its "type" is a bare kind string, not a reference).
+					// A flat definition of an already-defined name is the same
+					// duplicate-definition case as inlineTreeDefs's map arm,
+					// but a field object cannot be replaced by a bare string —
+					// rewrite it to the equivalent normal-form reference field.
 					if nameVal, ok := lookupCI(fo, "name"); ok {
 						if name, _ := nameVal.(string); name != "" {
-							seen[nodeFullnameTree(fo, ns)] = true
+							fullname := nodeFullnameTree(fo, ns)
+							if ref, ok := dupDefRef(fullname, ns, seen); ok {
+								rewriteFlatFieldToRef(fo, ref)
+								continue
+							}
+							seen[fullname] = true
 						}
 					}
 					inlineNodeContainers(fo, nodeNamespace(fo, ns), defs, seen, inlined)
@@ -500,6 +534,59 @@ func inlineNodeContainers(v map[string]any, ns string, defs map[string]any, seen
 	if vk, ok := ciKey(v, "values"); ok {
 		v[vk] = inlineTreeDefs(v[vk], ns, defs, seen, inlined)
 	}
+}
+
+// dupDefRef decides how a SECOND definition of fullname, encountered at a
+// position whose enclosing namespace is ns, is replaced by a reference to
+// the first definition. Returns the reference spelling and true when one is
+// expressible; ("", false) keeps the duplicate definition in place (the
+// rebuild Parse then fails and the metadata forms fall back to the dangling
+// original — degraded, but never describing a different schema than the wire
+// codec).
+//
+// A dotted fullname is an exact lookup on re-parse (scopedRefKeys), so it is
+// always a safe spelling. A null-namespace name has only its bare short name
+// as a spelling, which the parser binds enclosing-namespace-first — safe
+// unless a same-short-name type qualified by the enclosing namespace is
+// already defined at this point in the walk. Binding is eager and positional,
+// so only an EARLIER definition can capture the reference; one appearing
+// later cannot. Avro has no absolute-reference syntax that could express the
+// shadowed case (Java's toString shares the limitation), so it stays a
+// definition.
+func dupDefRef(fullname, ns string, seen map[string]bool) (string, bool) {
+	if !seen[fullname] {
+		return "", false
+	}
+	if strings.Contains(fullname, ".") {
+		return fullname, true
+	}
+	if ns == "" || !seen[ns+"."+fullname] {
+		return fullname, true
+	}
+	return "", false
+}
+
+// rewriteFlatFieldToRef converts a flat-form field that re-defines an
+// already-defined named type into the equivalent normal-form field whose
+// "type" is a name reference. The field keeps exactly the keys the parser
+// treats as field-only when lifting a flat definition (liftFlatFieldType:
+// name, default, order, aliases); every other key — the structural keys,
+// namespace, doc, logicalType, custom props — belongs to the TYPE and is
+// carried by its first definition.
+func rewriteFlatFieldToRef(fo map[string]any, ref string) {
+	for k := range fo {
+		switch {
+		case strings.EqualFold(k, "name"),
+			strings.EqualFold(k, "default"),
+			strings.EqualFold(k, "order"),
+			strings.EqualFold(k, "aliases"),
+			strings.EqualFold(k, "type"):
+		default:
+			delete(fo, k)
+		}
+	}
+	tk, _ := ciKey(fo, "type")
+	fo[tk] = ref
 }
 
 // defWithExplicitNamespace deep-copies a named-type definition and makes its
