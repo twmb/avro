@@ -3,6 +3,7 @@ package avro_test
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/twmb/avro"
 )
@@ -140,6 +141,213 @@ func TestRegression_ForwardRefFieldDefaultEncodes(t *testing.T) {
 			t.Errorf("forward-ref default %#v != backward-ref default %#v", a, b)
 		}
 	})
+}
+
+// A field default whose type subtree references a record still under
+// construction — a self- or mutual-recursive reference — must encode its
+// binary defaultBytes against the COMPLETE record node, not the partial node
+// that exists while the enclosing record's field loop is still running.
+// Encoding inline at build time sees only the fields declared before the
+// current one and silently drops the rest, producing truncated wire that the
+// same schema cannot decode. The default-encode must defer to finalize (where
+// every in-construction record is whole), exactly as a not-yet-wired
+// forward-ref child already does. EncodeJSON re-encodes the default at runtime
+// against the complete node and was already correct, so it is the parity oracle.
+func TestRegression_SelfRefContainerDefaultEncodes(t *testing.T) {
+	// roundTrip encodes a record that omits the defaulted field (triggering
+	// binary default-fill from the precomputed bytes) and asserts the bytes
+	// decode back via the same schema. Returns the decoded value.
+	roundTrip := func(t *testing.T, s *avro.Schema, present map[string]any) map[string]any {
+		t.Helper()
+		buf, err := s.AppendEncode(nil, present)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		out := map[string]any{}
+		rest, err := s.Decode(buf, &out)
+		if err != nil {
+			t.Fatalf("decode of Encode's own default-filled output failed: %v (wire=%x)", err, buf)
+		}
+		if len(rest) != 0 {
+			t.Fatalf("decode left %d trailing bytes (wire=%x)", len(rest), buf)
+		}
+		return out
+	}
+
+	t.Run("self_array", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"tag","type":"int"},
+			{"name":"kids","type":{"type":"array","items":"R"},"default":[{"tag":9,"kids":[]}]}]}`)
+		// The exact wire of the default-filled record: tag=1 (0x02), then
+		// kids = [ R{tag:9,kids:[]} ] = count 1 (0x02), item tag=9 (0x12),
+		// item kids empty (0x00), array terminator (0x00). The pre-fix bug
+		// dropped the inner kids and outer terminator, emitting 0x02021200.
+		buf, err := s.AppendEncode(nil, map[string]any{"tag": int32(1)})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if got, want := buf, []byte{0x02, 0x02, 0x12, 0x00, 0x00}; !reflect.DeepEqual(got, want) {
+			t.Errorf("default-filled wire = %x, want %x", got, want)
+		}
+		out := roundTrip(t, s, map[string]any{"tag": int32(1)})
+		kids, _ := out["kids"].([]any)
+		if len(kids) != 1 {
+			t.Fatalf("default kids = %#v, want one element", out["kids"])
+		}
+		if k0, _ := kids[0].(map[string]any); k0 == nil || k0["tag"].(int32) != 9 {
+			t.Errorf("default kid = %#v, want {tag:9,kids:[]}", kids[0])
+		}
+		// Binary Encode must match what EncodeJSON (runtime re-encode, already
+		// correct) produces for the same default-fill.
+		jb, err := s.EncodeJSON(map[string]any{"tag": int32(1)})
+		if err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		if want := `{"tag":1,"kids":[{"tag":9,"kids":[]}]}`; string(jb) != want {
+			t.Errorf("EncodeJSON = %s, want %s", jb, want)
+		}
+	})
+
+	t.Run("self_map", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"tag","type":"int"},
+			{"name":"m","type":{"type":"map","values":"R"},"default":{"k":{"tag":9,"m":{}}}}]}`)
+		out := roundTrip(t, s, map[string]any{"tag": int32(1)})
+		m, _ := out["m"].(map[string]any)
+		v, _ := m["k"].(map[string]any)
+		if v == nil || v["tag"].(int32) != 9 {
+			t.Errorf("default m[k] = %#v, want {tag:9,m:{}}", m["k"])
+		}
+	})
+
+	// Two-level nesting: the inner kids [{tag:8,kids:[]}] must survive. The
+	// pre-fix bug encoded the item against the partial record (tag only), so
+	// the 1- and 2-level defaults produced IDENTICAL truncated bytes; this
+	// subtest fails on the buggy code for a reason the 1-level case can't show.
+	t.Run("self_array_two_levels", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"tag","type":"int"},
+			{"name":"kids","type":{"type":"array","items":"R"},"default":[{"tag":9,"kids":[{"tag":8,"kids":[]}]}]}]}`)
+		out := roundTrip(t, s, map[string]any{"tag": int32(1)})
+		kids, _ := out["kids"].([]any)
+		if len(kids) != 1 {
+			t.Fatalf("level-1 kids = %#v, want one element", out["kids"])
+		}
+		k0, _ := kids[0].(map[string]any)
+		if k0 == nil || k0["tag"].(int32) != 9 {
+			t.Fatalf("level-1 kid = %#v, want tag 9", kids[0])
+		}
+		inner, _ := k0["kids"].([]any)
+		if len(inner) != 1 {
+			t.Fatalf("level-2 kids = %#v, want one element (pre-fix bug dropped it)", k0["kids"])
+		}
+		if k1, _ := inner[0].(map[string]any); k1 == nil || k1["tag"].(int32) != 8 {
+			t.Errorf("level-2 kid = %#v, want tag 8", inner[0])
+		}
+	})
+
+	// The recursive field is FIRST, so the record has NO prior fields when the
+	// default is processed — the partial node is entirely empty.
+	t.Run("self_array_recursive_field_first", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"kids","type":{"type":"array","items":"R"},"default":[{"kids":[]}]}]}`)
+		out := roundTrip(t, s, map[string]any{})
+		if kids, _ := out["kids"].([]any); len(kids) != 1 {
+			t.Errorf("default kids = %#v, want one element", out["kids"])
+		}
+	})
+
+	// Mutual recursion: Inner is built while Outer is still under construction,
+	// and Inner.outers' default references Outer. This exercises the shared
+	// in-construction set across the nested builder (Inner is built by a nested
+	// builder; Outer lives in the parent's set).
+	t.Run("mutual_recursion", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"Outer","fields":[
+			{"name":"tag","type":"int"},
+			{"name":"inner","type":{"type":"record","name":"Inner","fields":[
+				{"name":"outers","type":{"type":"array","items":"Outer"},"default":[{"tag":7,"inner":{"outers":[]}}]}]}}]}`)
+		out := roundTrip(t, s, map[string]any{"tag": int32(1), "inner": map[string]any{}})
+		inner, _ := out["inner"].(map[string]any)
+		outers, _ := inner["outers"].([]any)
+		if len(outers) != 1 {
+			t.Fatalf("inner.outers default = %#v, want one element", inner["outers"])
+		}
+		if o0, _ := outers[0].(map[string]any); o0 == nil || o0["tag"].(int32) != 7 {
+			t.Errorf("inner.outers[0] = %#v, want {tag:7,...}", outers[0])
+		}
+	})
+
+	// Controls — shapes the deferral must NOT break:
+	t.Run("self_array_empty_default", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"tag","type":"int"},
+			{"name":"kids","type":{"type":"array","items":"R"},"default":[]}]}`)
+		out := roundTrip(t, s, map[string]any{"tag": int32(1)})
+		if kids, _ := out["kids"].([]any); len(kids) != 0 {
+			t.Errorf("empty default kids = %#v, want empty", out["kids"])
+		}
+	})
+
+	t.Run("self_nullunion_default_null", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"tag","type":"int"},
+			{"name":"kids","type":["null",{"type":"array","items":"R"}],"default":null}]}`)
+		out := roundTrip(t, s, map[string]any{"tag": int32(1)})
+		if out["kids"] != nil {
+			t.Errorf("null default kids = %#v, want nil", out["kids"])
+		}
+	})
+
+	// Non-recursive array-of-record default (a backward reference to a complete
+	// type) must still round-trip — it was correct before and after the fix.
+	t.Run("non_recursive_still_works", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"tag","type":"int"},
+			{"name":"kids","type":{"type":"array","items":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}},"default":[{"x":5}]}]}`)
+		out := roundTrip(t, s, map[string]any{"tag": int32(1)})
+		kids, _ := out["kids"].([]any)
+		if len(kids) != 1 {
+			t.Fatalf("default kids = %#v, want one element", out["kids"])
+		}
+		if k0, _ := kids[0].(map[string]any); k0 == nil || k0["x"].(int32) != 5 {
+			t.Errorf("default kid = %#v, want {x:5}", kids[0])
+		}
+	})
+}
+
+// A default with no finite encoding — a required field whose default recurses
+// into its own type — must be rejected at Parse, not stack-overflow and not
+// silently produce truncated bytes. encodeDefault fills absent nested fields
+// from their own defaults (unlike validateDefault, which skips absent fields
+// and terminates vacuously), so without a recursion bound such a default
+// recurses until the goroutine stack overflows and the process dies. The
+// maxDepth ceiling turns it into an errTooDeep parse error instead. Each case
+// is a schema whose default can never be finitely materialized.
+func TestRegression_InfiniteRecursiveDefaultRejected(t *testing.T) {
+	cases := []struct{ name, schema string }{
+		{"self_record", `{"type":"record","name":"R","fields":[
+			{"name":"self","type":"R","default":{}}]}`},
+		{"self_array", `{"type":"record","name":"R","fields":[
+			{"name":"kids","type":{"type":"array","items":"R"},"default":[{}]}]}`},
+		{"self_map", `{"type":"record","name":"R","fields":[
+			{"name":"m","type":{"type":"map","values":"R"},"default":{"k":{}}}]}`},
+		{"mutual", `{"type":"record","name":"A","fields":[
+			{"name":"b","type":{"type":"record","name":"B","fields":[
+				{"name":"a","type":"A","default":{}}]},"default":{}}]}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// Must complete (the bound stops the recursion) and must reject.
+			start := time.Now()
+			_, err := avro.Parse(c.schema)
+			if d := time.Since(start); d > time.Second {
+				t.Fatalf("Parse took %v (recursion not bounded)", d)
+			}
+			if err == nil {
+				t.Fatalf("Parse accepted a default with no finite encoding; want rejection")
+			}
+		})
+	}
 }
 
 // SchemaField.Default's documented contract: "Union defaults pick the first

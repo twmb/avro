@@ -93,7 +93,8 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	// Clone the cache's map so a failed parse doesn't corrupt the cache.
 	cloned := maps.Clone(c.named)
 	b := &builder{
-		named: cloned,
+		named:    cloned,
+		building: make(map[*schemaNode]struct{}),
 	}
 	applySchemaOpts(b, opts)
 	hasCustomTypes := len(b.customTypes) > 0

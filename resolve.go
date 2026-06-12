@@ -766,6 +766,23 @@ func extractDefaultBytes(val any, typeLabel string) ([]byte, error) {
 }
 
 func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
+	return encodeDefaultDepth(dst, val, node, 0)
+}
+
+// encodeDefaultDepth bounds the recursion encodeDefault performs while filling
+// absent nested record fields from their own defaults. Unlike validateDefault
+// (which skips absent fields and so terminates vacuously), encodeDefault fills
+// them — so a default that has no finite encoding because a required field
+// recurses into its own type (e.g. record R{ R self = {} }, or
+// R{ array<R> kids = [{}] }) would recurse forever and overflow the stack.
+// The same maxDepth ceiling the wire codec enforces turns that into an
+// errTooDeep parse error. A legitimately finite default nests far below the
+// bound (each level resolves a concrete value), so this never false-rejects a
+// real default.
+func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	switch node.kind {
 	case "null":
 		if val != nil {
@@ -856,7 +873,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		dst = appendVarlong(dst, int64(len(arr)))
 		for _, item := range arr {
-			dst, err = encodeDefault(dst, item, node.items)
+			dst, err = encodeDefaultDepth(dst, item, node.items, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -874,7 +891,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		for k, v := range m {
 			dst = appendVarlong(dst, int64(len(k)))
 			dst = append(dst, k...)
-			dst, err = encodeDefault(dst, v, node.values)
+			dst, err = encodeDefaultDepth(dst, v, node.values, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -893,7 +910,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 				}
 				fval = f.defaultVal
 			}
-			dst, err = encodeDefault(dst, fval, f.node)
+			dst, err = encodeDefaultDepth(dst, fval, f.node, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -925,7 +942,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		base := len(dst)
 		for i, branch := range node.branches {
 			attempt := appendVarlong(dst[:base], int64(i))
-			if encoded, err := encodeDefault(attempt, val, branch); err == nil {
+			if encoded, err := encodeDefaultDepth(attempt, val, branch, depth+1); err == nil {
 				return encoded, nil
 			}
 		}

@@ -186,7 +186,8 @@ func MustParse(schema string, opts ...SchemaOpt) *Schema {
 // [SchemaCache].
 func Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	b := &builder{
-		named: make(map[string]*namedType),
+		named:    make(map[string]*namedType),
+		building: make(map[*schemaNode]struct{}),
 	}
 	applySchemaOpts(b, opts)
 	return parse(schema, b)
@@ -926,7 +927,8 @@ type builder struct {
 	deser deserfn
 
 	named           map[string]*namedType
-	definedNamed    []*namedType // named types DEFINED by this parse (vs inherited); stamped custom-affected at finalize
+	building        map[*schemaNode]struct{} // record/error nodes whose field loop is in progress (shared across nest, like named)
+	definedNamed    []*namedType             // named types DEFINED by this parse (vs inherited); stamped custom-affected at finalize
 	missing         []unionMissing
 	mfixups         []metaFixup
 	fieldFixups     []recordFieldFixup
@@ -978,6 +980,7 @@ func (b *builder) validFullnameErr(s string) error {
 func (b *builder) nest() *builder {
 	return &builder{
 		named:           b.named,
+		building:        b.building,
 		checkName:       b.checkName,
 		customTypes:     b.customTypes,
 		custom:          b.custom,
@@ -2370,6 +2373,25 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.registerNamed(o.Name, &namedType{ser: b.ser, deser: b.deser, sr: sr, dr: dr, node: nd})
 		b.node = nd
 
+		// Mark this record as under construction. A field default whose type
+		// subtree references this record (a self- or mutual-recursive
+		// reference) must defer its binary default-encode to finalize rather
+		// than encode inline now: encodeDefault recurses into the referenced
+		// record's fields, and nd.fields holds only the fields declared
+		// before the current one until the loop below completes — encoding
+		// inline against it emits truncated, non-decodable default bytes.
+		// nodeAwaitsForwardRef consults this set so an in-construction record
+		// is treated like a not-yet-wired forward-ref child. Cleared when the
+		// build returns and nd is whole. Lazily created (the public entry
+		// points seed it, but an internally-constructed builder may not) and
+		// shared through nest, so a nested record built while this one is open
+		// sees the same in-construction set.
+		if b.building == nil {
+			b.building = make(map[*schemaNode]struct{})
+		}
+		b.building[nd] = struct{}{}
+		defer delete(b.building, nd)
+
 		var names []string
 		seenFields := make(map[string]bool, len(o.Fields))
 		for i, of := range o.Fields {
@@ -2453,15 +2475,20 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 					// overwrites defaultVal there.
 					drf.hasDefault = true
 					fn.hasDefault = true
-				} else if nodeAwaitsForwardRef(bf.node) {
+				} else if b.nodeAwaitsForwardRef(bf.node) {
 					// The field's outer type resolved at build time, but its
-					// type tree has a forward-referenced descendant (array/map
-					// items/values, or an inline record field) not yet wired.
-					// encodeDefault would dereference the nil child and panic,
-					// so defer the resolve+encode to finalize, after the
-					// container/field fixups wire the descendants. Signal
-					// hasDefault so dispatch knows a default exists; the
-					// deferred pass fills defaultVal/defaultBytes.
+					// type tree has a descendant encodeDefault would traverse
+					// that is not yet whole: a forward-referenced array/map
+					// items/values or inline record field not yet wired (a nil
+					// child encodeDefault would nil-panic on), OR a self-/
+					// mutual-recursive reference back into a record still under
+					// construction (a non-nil but partial node whose later
+					// fields encodeDefault would silently drop). Either way,
+					// defer the resolve+encode to finalize, after the
+					// container/field fixups wire the descendants and every
+					// in-construction record is whole. Signal hasDefault so
+					// dispatch knows a default exists; the deferred pass fills
+					// defaultVal/defaultBytes.
 					drf.hasDefault = true
 					fn.hasDefault = true
 					b.defaultFixups = append(b.defaultFixups, defaultFixup{
@@ -3047,21 +3074,33 @@ func unmarshalDefault(raw json.RawMessage) any {
 	return dv
 }
 
-// nodeAwaitsForwardRef reports whether node has any not-yet-resolved
-// forward-referenced child that encodeDefault would traverse. encodeDefault
-// recurses into items / values / fields / branches and dereferences each
-// child's kind, so a nil child there is a runtime nil-pointer panic, not an
-// error. When this returns true at build time, the caller must defer the
-// whole resolve+encode-default pipeline to finalize (after the container /
-// field fixups have wired the descendants) rather than run it inline.
+// nodeAwaitsForwardRef reports whether node has any child encodeDefault would
+// traverse that is not yet whole. encodeDefault recurses into items / values /
+// fields / branches and dereferences each child's kind, so two child shapes
+// must defer the default pipeline to finalize:
 //
-// Cycle-safe via a seen set: a back-edge to an already-built node (recursive
-// schema) is a wired pointer, not nil, so it is not a pending forward ref.
-func nodeAwaitsForwardRef(node *schemaNode) bool {
-	return nodeAwaitsForwardRefSeen(node, map[*schemaNode]struct{}{})
+//   - a nil child — a not-yet-wired forward reference to a named type declared
+//     later in the schema; dereferencing it is a runtime nil-pointer panic.
+//   - a non-nil but partial record/error node still under construction (in
+//     b.building) — a self- or mutual-recursive reference back into a record
+//     whose field loop has not finished. Its fields slice holds only the
+//     fields declared before the current one, so encoding inline against it
+//     silently drops the rest and emits truncated, non-decodable default
+//     bytes. Deferring re-runs the encode at finalize once the node is whole.
+//
+// When this returns true at build time, the caller must defer the whole
+// resolve+encode-default pipeline to finalize (after the container / field
+// fixups have wired the descendants and every in-construction record has
+// completed) rather than run it inline.
+//
+// Cycle-safe via a seen set: a back-edge to an already-built node (a recursive
+// schema whose referenced record finished building) is a wired pointer not in
+// b.building, so it is correctly not treated as pending.
+func (b *builder) nodeAwaitsForwardRef(node *schemaNode) bool {
+	return nodeAwaitsForwardRefSeen(node, b.building, map[*schemaNode]struct{}{})
 }
 
-func nodeAwaitsForwardRefSeen(node *schemaNode, seen map[*schemaNode]struct{}) bool {
+func nodeAwaitsForwardRefSeen(node *schemaNode, building, seen map[*schemaNode]struct{}) bool {
 	if node == nil {
 		return true
 	}
@@ -3071,18 +3110,21 @@ func nodeAwaitsForwardRefSeen(node *schemaNode, seen map[*schemaNode]struct{}) b
 	seen[node] = struct{}{}
 	switch node.kind {
 	case "array":
-		return nodeAwaitsForwardRefSeen(node.items, seen)
+		return nodeAwaitsForwardRefSeen(node.items, building, seen)
 	case "map":
-		return nodeAwaitsForwardRefSeen(node.values, seen)
+		return nodeAwaitsForwardRefSeen(node.values, building, seen)
 	case "record", "error":
+		if _, ok := building[node]; ok {
+			return true
+		}
 		for i := range node.fields {
-			if nodeAwaitsForwardRefSeen(node.fields[i].node, seen) {
+			if nodeAwaitsForwardRefSeen(node.fields[i].node, building, seen) {
 				return true
 			}
 		}
 	case "union":
 		for _, b := range node.branches {
-			if nodeAwaitsForwardRefSeen(b, seen) {
+			if nodeAwaitsForwardRefSeen(b, building, seen) {
 				return true
 			}
 		}
