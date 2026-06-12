@@ -1101,3 +1101,41 @@ func TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill(t *testing.T) 
 		t.Fatalf("AppendEncodeJSON with present field fired the user encoder %d times, want 1", calls)
 	}
 }
+
+// A custom-decoded value whose decode TARGET is a recursive pointer type
+// (cyclic type graph: ctRecursivePtr's element is itself) must terminate with
+// an error, not loop forever allocating a pointer level per iteration.
+// setCustomResult's pointer walk is bounded by maxIndirectDepth — the same
+// ceiling the non-custom indirect/indirectAlloc decode path uses, which
+// already errors for this target (so registering a CustomType must not turn a
+// clean error into an unbounded loop). Watchdog so a regression fails by
+// timeout rather than hanging the suite.
+type ctRecursivePtr *ctRecursivePtr
+
+func TestRegression_CustomDecodeBoundsRecursivePointerTarget(t *testing.T) {
+	s, err := Parse(`"long"`, CustomType{
+		AvroType: "long",
+		Decode:   func(v any, _ *SchemaNode) (any, error) { return v, nil },
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	wire, err := s.Encode(int64(5))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		var p ctRecursivePtr
+		_, derr := s.Decode(wire, &p)
+		done <- derr
+	}()
+	select {
+	case derr := <-done:
+		if derr == nil {
+			t.Fatal("decode into recursive pointer target must error, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("decode into recursive pointer target did not terminate (setCustomResult pointer walk unbounded)")
+	}
+}

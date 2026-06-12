@@ -3420,3 +3420,116 @@ func TestSchemaForEncodeParity(t *testing.T) {
 		})
 	}
 }
+
+// Recursive non-struct Go types have a cyclic type graph (sfRecursiveSlice's
+// element is itself, etc.). inferType's pointer/slice/map arms recurse on the
+// element type, so without a depth bound SchemaFor recurses until the
+// goroutine stack overflows and the whole process dies. The bound makes it
+// return a clean error instead. A recursive STRUCT is unaffected — inferRecord
+// registers the type name before recursing, so a self-reference becomes a name
+// reference (pinned by TestSchemaForRecursiveStructStillBuilds below).
+//
+// Non-vacuity: reverting the inferType depth bound makes each of these
+// stack-overflow at SchemaFor time, which kills the test binary rather than
+// failing one case — so these pins assert the post-fix clean error directly.
+type sfRecursiveSlice []sfRecursiveSlice
+type sfRecursivePtr *sfRecursivePtr
+type sfRecursiveMap map[string]sfRecursiveMap
+
+func TestRegression_SchemaForRecursiveNonStructTypeErrors(t *testing.T) {
+	wantErr := func(t *testing.T, _ *Schema, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("expected a recursion error, got nil")
+		}
+		if !strings.Contains(err.Error(), "recursive") && !strings.Contains(err.Error(), "nests too deeply") {
+			t.Fatalf("error should name the recursion/depth cause, got: %v", err)
+		}
+	}
+	t.Run("slice", func(t *testing.T) {
+		type R struct {
+			F sfRecursiveSlice `avro:"f"`
+		}
+		s, err := SchemaFor[R]()
+		wantErr(t, s, err)
+	})
+	t.Run("pointer", func(t *testing.T) {
+		type R struct {
+			F sfRecursivePtr `avro:"f"`
+		}
+		s, err := SchemaFor[R]()
+		wantErr(t, s, err)
+	})
+	t.Run("map", func(t *testing.T) {
+		type R struct {
+			F sfRecursiveMap `avro:"f"`
+		}
+		s, err := SchemaFor[R]()
+		wantErr(t, s, err)
+	})
+}
+
+// The depth bound must not false-reject ordinary nested non-struct containers
+// (a handful of pointer/slice/map levels, far under the cap). This is the
+// "still accepted" side of the boundary.
+func TestSchemaForNestedNonStructContainersStillBuild(t *testing.T) {
+	type R struct {
+		A [][]int32                    `avro:"a"`
+		B map[string][]*int64          `avro:"b"`
+		C map[string]map[string]string `avro:"c"`
+	}
+	if _, err := SchemaFor[R](); err != nil {
+		t.Fatalf("ordinary nested containers must build, got: %v", err)
+	}
+}
+
+// Control: a self-referential STRUCT (linked list) still builds and
+// round-trips — the depth bound must not break legitimate recursive structs,
+// which terminate via inferRecord's seen[t] name registration.
+func TestSchemaForRecursiveStructStillBuilds(t *testing.T) {
+	type LinkedNode struct {
+		Val  int32       `avro:"val"`
+		Next *LinkedNode `avro:"next"`
+	}
+	s, err := SchemaFor[LinkedNode]()
+	if err != nil {
+		t.Fatalf("recursive struct must build: %v", err)
+	}
+	in := &LinkedNode{Val: 1, Next: &LinkedNode{Val: 2}}
+	b, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got LinkedNode
+	if _, err := s.Decode(b, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Val != 1 || got.Next == nil || got.Next.Val != 2 {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+}
+
+// checkIntDefaultFitsGoKind peels pointer levels off a field's Go type to
+// range-check an integer default. When a CustomType matches the field,
+// inferType returns before its own (bounded) recursion, so a recursive
+// pointer field carrying a default reaches this peel — which must terminate
+// (bounded by maxIndirectDepth), not loop forever. Watchdog so a regression
+// fails by timeout rather than hanging the suite.
+func TestRegression_SchemaForRecursivePtrDefaultTerminates(t *testing.T) {
+	type R struct {
+		F sfRecursivePtr `avro:"f,default=5"`
+	}
+	done := make(chan struct{}, 1)
+	go func() {
+		_, _ = SchemaFor[R](CustomType{
+			GoType:   reflect.TypeFor[sfRecursivePtr](),
+			AvroType: "long",
+		})
+		done <- struct{}{}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SchemaFor did not terminate (checkIntDefaultFitsGoKind pointer peel unbounded)")
+	}
+}

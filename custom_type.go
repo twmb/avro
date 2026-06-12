@@ -218,11 +218,18 @@ func setCustomResult(v reflect.Value, result any, avroType string) error {
 	rv := reflect.ValueOf(result)
 	// Walk through pointers, allocating as needed. Stop early if
 	// the result is directly assignable (e.g. pointer-valued custom
-	// decoder returning *T into a *T target).
-	for v.Kind() == reflect.Pointer {
+	// decoder returning *T into a *T target). Bounded by maxIndirectDepth:
+	// a cyclic target type (`type P *P`, whose Elem is itself) would
+	// otherwise loop forever, allocating a level each iteration. This is the
+	// same ceiling indirect/indirectAlloc apply on the non-custom decode
+	// path, which returns a SemanticError for the same target.
+	for i := 0; v.Kind() == reflect.Pointer; i++ {
 		if rv.Type().AssignableTo(v.Type()) {
 			v.Set(rv)
 			return nil
+		}
+		if i >= maxIndirectDepth {
+			return &SemanticError{GoType: v.Type(), AvroType: avroType}
 		}
 		if v.IsNil() {
 			v.Set(reflect.New(v.Type().Elem()))

@@ -588,7 +588,7 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string, c
 		"name": f.name,
 	}
 
-	schema, err := inferType(f.goType, f.logical, f.decimal, namespace, seen, customTypes)
+	schema, err := inferType(f.goType, f.logical, f.decimal, namespace, seen, customTypes, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -669,7 +669,13 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string, c
 // fractional, or > int64 default) is left to Parse, which validates it
 // against the Avro type.
 func checkIntDefaultFitsGoKind(v any, t reflect.Type) error {
-	for t.Kind() == reflect.Pointer {
+	// Bound the peel so a cyclic pointer type (`type P *P`, whose Elem is
+	// itself) terminates instead of looping forever. This is reached only
+	// when a CustomType matched the field — so inferType returned before its
+	// own (now-bounded) recursion — and a default is present. Past the cap the
+	// type is still a pointer, so the switch below treats it as non-integer
+	// and defers to Parse. Mirrors indirect/indirectAlloc's maxIndirectDepth.
+	for i := 0; i < maxIndirectDepth && t.Kind() == reflect.Pointer; i++ {
 		t = t.Elem()
 	}
 	switch t.Kind() {
@@ -787,7 +793,21 @@ func baseTypeForLogical(logical, fallback string) string {
 	return fallback
 }
 
-func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]string, customTypes []CustomType) (any, error) {
+func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]string, customTypes []CustomType, depth int) (any, error) {
+	// A recursive non-struct Go type — `type S []S`, `type P *P`,
+	// `type M map[string]M`, or a long-enough pointer/slice/map chain — has
+	// a cyclic type graph, and the pointer/slice/map arms below recurse on
+	// the element type. Struct cycles terminate via seen[t] (a struct
+	// registers its name before recursing into its fields), but a non-struct
+	// type registers no name, so the recursion would run until the goroutine
+	// stack overflows and the process dies. Bound it at maxDepth — the same
+	// ceiling the wire pipeline enforces — so such a type returns a clean
+	// error. depth resets to 0 at each record-field boundary (inferField),
+	// so a chain of distinct nested structs stays bounded by seen, not depth,
+	// and only an unbroken non-struct chain accrues depth here.
+	if depth >= maxDepth {
+		return nil, fmt.Errorf("avro: type %s nests too deeply or is recursive (exceeds depth %d); a recursive non-struct type such as `type T []T`, `*T`, or `map[string]T` has no Avro schema representation", t, maxDepth)
+	}
 	// Check custom types before anything else (including pointer unwrapping).
 	for _, ct := range customTypes {
 		if ct.GoType != nil && ct.GoType == t {
@@ -815,7 +835,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	// inside a union, so wrapping each level would emit an unparseable
 	// ["null", ["null", T]].
 	if t.Kind() == reflect.Pointer {
-		inner, err := inferType(t.Elem(), logical, decimal, namespace, seen, customTypes)
+		inner, err := inferType(t.Elem(), logical, decimal, namespace, seen, customTypes, depth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -964,7 +984,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	// type. Shared by the Slice and Array arms below so the items-recursion
 	// + wrapping shape stays in one place.
 	inferArray := func(elem reflect.Type) (any, error) {
-		items, err := inferType(elem, "", [2]int{}, namespace, seen, customTypes)
+		items, err := inferType(elem, "", [2]int{}, namespace, seen, customTypes, depth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -1040,7 +1060,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if t.Key().Kind() != reflect.String {
 			return nil, fmt.Errorf("map key must be string, got %s", t.Key())
 		}
-		values, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes)
+		values, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes, depth+1)
 		if err != nil {
 			return nil, err
 		}
