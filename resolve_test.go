@@ -4,6 +4,7 @@ import (
 	"math"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestResolveIdenticalSchemas(t *testing.T) {
@@ -1165,6 +1166,220 @@ func TestResolveReaderUnionTaggedUnions(t *testing.T) {
 	if wrapper["string"] != "hello" {
 		t.Fatalf("tagged: expected {\"string\":\"hello\"}, got %v", wrapper)
 	}
+}
+
+// TestResolveReaderUnionTaggedWrapTargetParity verifies that decoding
+// through a resolved reader-union (writer non-union, reader union) treats
+// every decode-target shape exactly like the natural union path. The
+// TaggedUnions {branch: value} envelope applies only to targets that
+// map[string]any is assignable to; for every other target (concrete
+// types, non-empty interfaces) the wrap is skipped silently — the
+// contract documented on deserUnion.maybeWrap — never turned into an
+// error. The natural decode of the reader-shaped wire is the oracle for
+// each cell; resolved binary and resolved JSON (which funnels through the
+// same resolving deser) must agree with it.
+func TestResolveReaderUnionTaggedWrapTargetParity(t *testing.T) {
+	writer, err := Parse(`{"type":"long","logicalType":"timestamp-millis"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`["null",{"type":"long","logicalType":"timestamp-millis"}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.UnixMilli(5).UTC()
+	writerWire, err := writer.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerWire, err := reader.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type nanoer interface{ UnixNano() int64 } // satisfied by time.Time
+
+	t.Run("any_untagged", func(t *testing.T) {
+		var nat, res any
+		if _, err := reader.Decode(readerWire, &nat); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+	})
+
+	t.Run("any_tagged", func(t *testing.T) {
+		var nat, res any
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+		m, ok := res.(map[string]any)
+		if !ok || !m["long"].(time.Time).Equal(want) {
+			t.Fatalf("expected {\"long\": %v} envelope, got %#v", want, res)
+		}
+	})
+
+	t.Run("any_tagged_logical", func(t *testing.T) {
+		var nat, res any
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+		m, ok := res.(map[string]any)
+		if !ok || !m["long.timestamp-millis"].(time.Time).Equal(want) {
+			t.Fatalf("expected {\"long.timestamp-millis\": %v} envelope, got %#v", want, res)
+		}
+	})
+
+	t.Run("typed_interface_tagged", func(t *testing.T) {
+		var nat, res nanoer
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like the natural path: %v", err)
+		}
+		if !nat.(time.Time).Equal(want) || !res.(time.Time).Equal(want) {
+			t.Fatalf("natural %#v / resolved %#v, want bare %v", nat, res, want)
+		}
+	})
+
+	t.Run("typed_interface_tagged_logical", func(t *testing.T) {
+		var res nanoer
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like the natural path: %v", err)
+		}
+		if !res.(time.Time).Equal(want) {
+			t.Fatalf("resolved %#v, want bare %v", res, want)
+		}
+	})
+
+	t.Run("pointer_target_tagged", func(t *testing.T) {
+		var nat, res *time.Time
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if nat == nil || res == nil || !nat.Equal(want) || !res.Equal(want) {
+			t.Fatalf("natural %v / resolved %v, want %v", nat, res, want)
+		}
+	})
+
+	t.Run("json_typed_interface_tagged", func(t *testing.T) {
+		var res nanoer
+		if err := resolved.DecodeJSON([]byte(`5`), &res, TaggedUnions()); err != nil {
+			t.Fatalf("resolved DecodeJSON into non-empty interface must skip the tagged wrap silently: %v", err)
+		}
+		if !res.(time.Time).Equal(want) {
+			t.Fatalf("resolved JSON %#v, want bare %v", res, want)
+		}
+	})
+}
+
+// TestResolvedRecordIntoAnyMapReuseParity verifies the resolved record
+// decoder honors the documented map-reuse contract for *any targets: when
+// the target interface already wraps a map[string]any, schema fields are
+// written into the existing map and unrelated keys are retained (see
+// reuseOrMakeStringAnyMap and TestDecodeReuseAnyTargetStaleKeys, which pin
+// the natural decoder's behavior). The natural decode is the oracle;
+// resolved binary and resolved JSON decodes must match it.
+func TestResolvedRecordIntoAnyMapReuseParity(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"long","default":7}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerWire, err := writer.Encode(map[string]any{"a": int64(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerWire, err := reader.Encode(map[string]any{"a": int64(1), "b": int64(7)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"stale": int64(99), "a": int64(1), "b": int64(7)}
+
+	t.Run("binary_preseeded", func(t *testing.T) {
+		// "a" pre-seeded with a different value proves schema keys are
+		// overwritten while unrelated keys survive.
+		var nat any = map[string]any{"stale": int64(99), "a": int64(42)}
+		if _, err := reader.Decode(readerWire, &nat); err != nil {
+			t.Fatal(err)
+		}
+		var res any = map[string]any{"stale": int64(99), "a": int64(42)}
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+		if !reflect.DeepEqual(res, want) {
+			t.Fatalf("resolved %#v, want %#v", res, want)
+		}
+	})
+
+	t.Run("binary_fresh", func(t *testing.T) {
+		var res any
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(res, map[string]any{"a": int64(1), "b": int64(7)}) {
+			t.Fatalf("fresh decode got %#v", res)
+		}
+	})
+
+	t.Run("typed_map_preseeded", func(t *testing.T) {
+		nat := map[string]int64{"stale": 99}
+		if _, err := reader.Decode(readerWire, &nat); err != nil {
+			t.Fatal(err)
+		}
+		res := map[string]int64{"stale": 99}
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		exp := map[string]int64{"stale": 99, "a": 1, "b": 7}
+		if !reflect.DeepEqual(nat, exp) || !reflect.DeepEqual(res, exp) {
+			t.Fatalf("natural %v / resolved %v, want %v", nat, res, exp)
+		}
+	})
+
+	t.Run("json_preseeded", func(t *testing.T) {
+		var res any = map[string]any{"stale": int64(99)}
+		if err := resolved.DecodeJSON([]byte(`{"a":1}`), &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(res, want) {
+			t.Fatalf("resolved JSON %#v, want %#v", res, want)
+		}
+	})
 }
 
 // --- Direct skip function error path tests ---

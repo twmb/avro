@@ -1511,7 +1511,7 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 						if err == nil {
 							if ctx.scanner.peek() == '}' {
 								ctx.scanner.pos++
-								return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
+								return assignAny(v, ctx.wrapUnion(v, val, branch), branch.kind)
 							}
 						} else if errors.Is(err, errTooDeep) {
 							// Don't fall through to bare-union retry; the
@@ -1575,7 +1575,7 @@ func (ctx *jsonDecoder) decodeBranchInto(v reflect.Value, branch *schemaNode, to
 		// wrapUnion returns nil for null branches; reflect.ValueOf(nil)
 		// is the invalid zero Value, so use assignAny which sets a typed
 		// nil for interface targets.
-		return assignAny(v, ctx.wrapUnion(val, branch), branch.kind)
+		return assignAny(v, ctx.wrapUnion(v, val, branch), branch.kind)
 	}
 	return ctx.decodeValue(v, branch)
 }
@@ -1622,8 +1622,16 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny
 	return fmt.Errorf("avro json: no union branch matched at offset %d", ctx.scanner.pos)
 }
 
-func (ctx *jsonDecoder) wrapUnion(val any, branch *schemaNode) any {
+func (ctx *jsonDecoder) wrapUnion(v reflect.Value, val any, branch *schemaNode) any {
 	if !ctx.wrapUnions || val == nil {
+		return val
+	}
+	// Mirror the binary wrap (deserUnion.maybeWrap): the {branch: value}
+	// envelope applies only to interface targets that map[string]any is
+	// assignable to. Any other interface target (non-empty interfaces)
+	// receives the bare branch value — the wrap is skipped silently,
+	// never turned into an assignment error.
+	if v.Kind() == reflect.Interface && !mapStringAnyType.AssignableTo(v.Type()) {
 		return val
 	}
 	// Reuse unionBranchNames so the tagged-map key produced on decode is

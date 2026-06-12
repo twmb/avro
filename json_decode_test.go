@@ -2300,3 +2300,76 @@ func TestRegression_DecodeJSONTaggedUnionDefaultFill(t *testing.T) {
 		}
 	})
 }
+
+// TestDecodeJSONTaggedUnionTypedInterfaceTarget verifies that DecodeJSON
+// under TaggedUnions handles a non-empty interface target exactly like
+// binary Decode: the {branch: value} envelope applies only to targets
+// that map[string]any is assignable to, and is skipped silently for
+// every other interface target (deserUnion.maybeWrap's contract) — the
+// decoded branch value lands bare. Without the skip, a union value that
+// satisfies the caller's interface decodes through binary but errors
+// through JSON on the same option.
+func TestDecodeJSONTaggedUnionTypedInterfaceTarget(t *testing.T) {
+	type nanoer interface{ UnixNano() int64 } // satisfied by time.Time
+
+	s, err := Parse(`["null",{"type":"long","logicalType":"timestamp-millis"}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.UnixMilli(5).UTC()
+
+	// Binary reference: index 1 + long 5; the wrap is skipped silently.
+	wire, err := s.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bin nanoer
+	if _, err := s.Decode(wire, &bin, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	if !bin.(time.Time).Equal(want) {
+		t.Fatalf("binary decode got %#v, want %v", bin, want)
+	}
+
+	t.Run("tagged_input", func(t *testing.T) {
+		var got nanoer
+		if err := s.DecodeJSON([]byte(`{"long":5}`), &got, TaggedUnions()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like binary Decode: %v", err)
+		}
+		if !got.(time.Time).Equal(want) {
+			t.Fatalf("got %#v, want bare %v", got, want)
+		}
+	})
+
+	t.Run("bare_input", func(t *testing.T) {
+		// The documented bare-union leniency composes with the same skip.
+		var got nanoer
+		if err := s.DecodeJSON([]byte(`5`), &got, TaggedUnions()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like binary Decode: %v", err)
+		}
+		if !got.(time.Time).Equal(want) {
+			t.Fatalf("got %#v, want bare %v", got, want)
+		}
+	})
+
+	t.Run("any_still_wrapped", func(t *testing.T) {
+		var got any
+		if err := s.DecodeJSON([]byte(`{"long":5}`), &got, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		m, ok := got.(map[string]any)
+		if !ok || !m["long"].(time.Time).Equal(want) {
+			t.Fatalf("expected {\"long\": %v} envelope for *any, got %#v", want, got)
+		}
+	})
+
+	t.Run("untagged_off", func(t *testing.T) {
+		var got nanoer
+		if err := s.DecodeJSON([]byte(`5`), &got); err != nil {
+			t.Fatal(err)
+		}
+		if !got.(time.Time).Equal(want) {
+			t.Fatalf("got %#v, want bare %v", got, want)
+		}
+	})
+}

@@ -420,7 +420,11 @@ func (rr *resolvedRecord) buildDeser() deserfn {
 }
 
 func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	m := make(map[string]any, len(rr.readerNames))
+	// Mirror the natural record decoder (deserRecord.deser): when the
+	// interface target already wraps a map[string]any, decode into the
+	// existing map so keys outside the schema are retained — the
+	// documented streaming-decode reuse contract.
+	m := reuseOrMakeStringAnyMap(v, len(rr.readerNames))
 	var err error
 	elem := reflect.New(anyType).Elem()
 
@@ -697,19 +701,20 @@ func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 	}
 	// The wire format has no union index (writer wrote a non-union
 	// value), so we can't use deserUnion.deser which reads a varint
-	// index. Wrap the resolved deser to apply TaggedUnions when active.
+	// index. Wrap the resolved deser with deserUnion.maybeWrap on a
+	// single-branch name table — the same code the natural union path
+	// runs — so the two paths share one TaggedUnions contract: targets
+	// that map[string]any is not assignable to (concrete types,
+	// non-empty interfaces) skip the wrap silently rather than erroring.
 	bn, ln := unionBranchNames(rb)
+	wrap := &deserUnion{branchNames: []string{bn}, logicalNames: []string{ln}}
 	inner := resolved.deser
 	deser := func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		src, err := inner(src, v, sl)
-		if err != nil || !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
-			return src, err
+		if err == nil {
+			wrap.maybeWrap(v, sl, 0)
 		}
-		name := bn
-		if sl.tagLogicalTypes {
-			name = ln
-		}
-		return src, setIface(v, reflect.ValueOf(map[string]any{name: v.Elem().Interface()}), "union")
+		return src, err
 	}
 	return &schemaNode{
 		kind:     "union",
