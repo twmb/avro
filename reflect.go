@@ -13,6 +13,7 @@ var (
 	textAppenderType    = reflect.TypeFor[encoding.TextAppender]()
 	textMarshalerType   = reflect.TypeFor[encoding.TextMarshaler]()
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
+	isZeroerType        = reflect.TypeFor[interface{ IsZero() bool }]()
 )
 
 // reuseOrMakeStringAnyMap reuses v's existing map[string]any backing
@@ -603,6 +604,23 @@ func valueIsZero(v reflect.Value) bool {
 	if v.CanInterface() {
 		if z, ok := v.Interface().(interface{ IsZero() bool }); ok {
 			return z.IsZero()
+		}
+		// Pointer-receiver IsZero: the method is in *T's method set, not T's,
+		// so the value-method-set assertion above misses it. Reach it through
+		// the address — mirroring textOutFor's pointer-method-set discovery on
+		// addressable values. Box a non-addressable value (e.g. a field of a
+		// struct passed by value) into an addressable temp so Encode(v) and
+		// Encode(&v) agree; a value-receiver IsZero is already reachable on both
+		// via the value method set, and this keeps the pointer-receiver case
+		// symmetric. The nil short-circuit above already handled nil pointers,
+		// so v here is a non-nil value whose *T IsZero is safe to invoke.
+		if reflect.PointerTo(v.Type()).Implements(isZeroerType) {
+			if !v.CanAddr() {
+				box := reflect.New(v.Type())
+				box.Elem().Set(v)
+				v = box.Elem()
+			}
+			return v.Addr().Interface().(interface{ IsZero() bool }).IsZero()
 		}
 	}
 	return v.IsZero()

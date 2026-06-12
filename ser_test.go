@@ -2759,6 +2759,100 @@ func TestRegression_OmitzeroNilPointerIsZero(t *testing.T) {
 	}
 }
 
+// ozPtrCounter has a POINTER-receiver IsZero that treats the sentinel 7 as
+// "zero" — a value that DISAGREES with the structural zero (0). Honoring it is
+// therefore observable in both directions: 7 (structurally non-zero) must be
+// omitted, and 0 (structurally zero) must NOT be omitted.
+type ozPtrCounter int64
+
+func (c *ozPtrCounter) IsZero() bool { return *c == 7 }
+
+// ozValCounter is the value-receiver twin, pinning that the pre-existing
+// value-receiver path still works after the pointer-receiver path was added.
+type ozValCounter int64
+
+func (c ozValCounter) IsZero() bool { return c == 7 }
+
+// omitzero must honor an IsZero() method regardless of whether its receiver is
+// a value or a pointer (doc.go: "fields whose IsZero() method returns true").
+// A value-typed field whose type has a POINTER-receiver IsZero is addressable
+// when encoding &struct, so (&field).IsZero() is callable; valueIsZero reached
+// only the value method set, silently encoding the value instead of the
+// default/null. The sentinel (7) disagrees with structural zero (0) so both
+// directions are pinned: IsZero()==true omits a structurally-non-zero value,
+// IsZero()==false keeps a structurally-zero value. Covers the reflect, unsafe,
+// and JSON encode paths (all route through valueIsZero).
+func TestRegression_OmitzeroPointerReceiverIsZero(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":["null","long"],"default":null}]}`)
+	null := []byte{0x00}    // union index 0 (null branch) — omitzero acted
+	longZero := []byte{2, 0} // union index 1 (long), value 0 — not omitted
+	longThree := []byte{2, 6} // union index 1 (long), value 3 (zigzag 6)
+
+	// encodeAll returns the reflect (value) and unsafe (&value, addressable)
+	// wire, asserting they agree, plus the JSON. The addressable path is the
+	// one where a pointer-receiver IsZero is legitimately reachable.
+	encodeAll := func(t *testing.T, v any, pv any) []byte {
+		t.Helper()
+		wireVal, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatalf("reflect encode: %v", err)
+		}
+		wireAddr, err := s.AppendEncode(nil, pv)
+		if err != nil {
+			t.Fatalf("unsafe encode: %v", err)
+		}
+		if !bytes.Equal(wireVal, wireAddr) {
+			t.Errorf("reflect vs unsafe wire differ: % x vs % x", wireVal, wireAddr)
+		}
+		if _, err := s.EncodeJSON(pv); err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		return wireAddr
+	}
+
+	t.Run("ptr-receiver IsZero true omits non-structural-zero", func(t *testing.T) {
+		type R struct {
+			F ozPtrCounter `avro:"f,omitzero"`
+		}
+		v := R{F: 7} // IsZero()==true, structurally non-zero
+		if got := encodeAll(t, v, &v); !bytes.Equal(got, null) {
+			t.Errorf("got % x, want % x (omitzero must honor pointer-receiver IsZero)", got, null)
+		}
+	})
+	t.Run("ptr-receiver IsZero false keeps structural-zero", func(t *testing.T) {
+		type R struct {
+			F ozPtrCounter `avro:"f,omitzero"`
+		}
+		v := R{F: 0} // IsZero()==false, structurally zero
+		if got := encodeAll(t, v, &v); !bytes.Equal(got, longZero) {
+			t.Errorf("got % x, want % x (IsZero()==false must override structural zero)", got, longZero)
+		}
+	})
+	t.Run("ptr-receiver IsZero false keeps nonzero", func(t *testing.T) {
+		type R struct {
+			F ozPtrCounter `avro:"f,omitzero"`
+		}
+		v := R{F: 3}
+		if got := encodeAll(t, v, &v); !bytes.Equal(got, longThree) {
+			t.Errorf("got % x, want % x", got, longThree)
+		}
+	})
+	t.Run("value-receiver IsZero still honored both ways", func(t *testing.T) {
+		type R struct {
+			F ozValCounter `avro:"f,omitzero"`
+		}
+		v7 := R{F: 7}
+		if got := encodeAll(t, v7, &v7); !bytes.Equal(got, null) {
+			t.Errorf("value-receiver IsZero()==true: got % x, want % x", got, null)
+		}
+		v0 := R{F: 0}
+		if got := encodeAll(t, v0, &v0); !bytes.Equal(got, longZero) {
+			t.Errorf("value-receiver IsZero()==false: got % x, want % x", got, longZero)
+		}
+	})
+}
+
 type EmbeddedInner struct {
 	A int32 `avro:"a"`
 }
