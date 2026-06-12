@@ -177,3 +177,81 @@ func TestRegression_RootSchemaEmitterLinearOnDeepNesting(t *testing.T) {
 		t.Errorf("Root().Schema() of a %d-deep record chain took %v; want <500ms (O(depth*subtree) regression in toJSONWalk)", depth, d)
 	}
 }
+
+// A schema field name has no length cap at parse (validName is pure grammar;
+// WithLaxNames permits any non-empty string), so a registry/remote schema can
+// carry a multi-megabyte name. Runtime per-datum errors that echo it amplify
+// 1:N — one oversized error string on every Encode/Decode call, flooding logs,
+// RPC error channels, and metric labels. The binary type-mismatch path routes
+// the name through SemanticError.Field, which Error() render-truncates; these
+// four paths (JSON missing-field on encode and decode, JSON alias collision,
+// and the binary struct-mapping missing-field whose name rides in .Err rather
+// than the truncated .Field) must apply the same bound at construction. The
+// control below proves the asymmetry: the SemanticError.Field path is already
+// bounded, so a failure here is a missed sibling of that bound, not a property
+// of field names being safe to echo.
+func TestRegression_FieldNameErrorEchoBounded(t *testing.T) {
+	const hostileLen = 1 << 20 // 1 MiB
+	const cap = 4096
+
+	hugeNameSchema := func(t *testing.T) *avro.Schema {
+		t.Helper()
+		huge := strings.Repeat("A", hostileLen)
+		s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"` + huge + `","type":"int"}]}`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return s
+	}
+	assertBounded := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if n := len(err.Error()); n > cap {
+			t.Errorf("error message is %d bytes for a %d-byte hostile name (cap %d): echo unbounded\nfirst 160: %.160s",
+				n, hostileLen, cap, err.Error())
+		}
+	}
+
+	t.Run("json encode missing required field", func(t *testing.T) {
+		s := hugeNameSchema(t)
+		_, err := s.EncodeJSON(map[string]any{})
+		assertBounded(t, err)
+	})
+	t.Run("json decode missing required field", func(t *testing.T) {
+		s := hugeNameSchema(t)
+		var out map[string]any
+		assertBounded(t, s.DecodeJSON([]byte(`{}`), &out))
+	})
+	t.Run("binary encode struct mapping missing field", func(t *testing.T) {
+		s := hugeNameSchema(t)
+		type empty struct{}
+		_, err := s.Encode(empty{})
+		assertBounded(t, err)
+	})
+	t.Run("json decode alias collision echoes two wire keys", func(t *testing.T) {
+		huge := strings.Repeat("B", hostileLen)
+		s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","aliases":["` + huge + `"],"type":"int"}]}`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		var out map[string]any
+		assertBounded(t, s.DecodeJSON([]byte(`{"f":1,"`+huge+`":2}`), &out))
+	})
+
+	// Control: the binary type-mismatch path routes the field name through
+	// SemanticError.Field (render-truncated in errors.go). It is already
+	// bounded — present so a future change that breaks the render truncation
+	// is caught here, and to document that the four cases above are an
+	// asymmetry with this path, not field names being inherently echo-safe.
+	t.Run("control: binary type mismatch already bounded", func(t *testing.T) {
+		huge := strings.Repeat("A", hostileLen)
+		s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"` + huge + `","type":"int"}]}`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		_, err = s.Encode(map[string]any{huge: "not-an-int"})
+		assertBounded(t, err)
+	})
+}

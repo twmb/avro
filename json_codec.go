@@ -911,7 +911,7 @@ func appendAvroJSONNativeArray(buf []byte, v reflect.Value, kind string, cfg *op
 // side branch-by-branch.
 func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *optConfig, depth int) ([]byte, error) {
 	if !f.hasDefault {
-		return nil, fmt.Errorf("avro json: record %q missing required field %q", recordName, f.name)
+		return nil, fmt.Errorf("avro json: record %q missing required field %q", truncForError(recordName), truncForError(f.name))
 	}
 	if f.defaultVal == nil {
 		return append(buf, "null"...), nil
@@ -947,7 +947,7 @@ func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *opt
 			}
 			return appendUnionBranch(buf, branch, encoded, cfg), nil
 		}
-		return nil, fmt.Errorf("avro json: union default for field %q does not match any branch", f.name)
+		return nil, fmt.Errorf("avro json: union default for field %q does not match any branch", truncForError(f.name))
 	}
 	return appendAvroJSON(buf, reflect.ValueOf(f.defaultVal), f.node, cfg, nil, depth+1)
 }

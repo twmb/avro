@@ -536,7 +536,12 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 		}
 		e, exists := m[name]
 		if !exists {
-			return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf("missing field %s", name)}
+			// truncForError: name is a schema field name with no length cap
+			// (validName grammar / WithLaxNames). It rides in .Err, not the
+			// render-truncated .Field, so SemanticError.Error() echoes it raw
+			// — bound it at construction like the sibling duplicate-name error
+			// above and the composed-sentence echoes in json_codec/json_decode.
+			return nil, &SemanticError{GoType: t, AvroType: "record", Err: fmt.Errorf("missing field %s", truncForError(name))}
 		}
 		ats = append(ats, e.index)
 		ozs = append(ozs, e.omitzero)

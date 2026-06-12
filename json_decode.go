@@ -1251,7 +1251,7 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 				// duplicate keys.
 				if seen[idx] && seenKey[idx] != key {
 					return fmt.Errorf("avro json: record %q field %q resolved from both %q and %q in the same JSON object",
-						node.name, node.fields[idx].name, seenKey[idx], key)
+						truncForError(node.name), truncForError(node.fields[idx].name), truncForError(seenKey[idx]), truncForError(key))
 				}
 				seen[idx] = true
 				seenKey[idx] = key
@@ -1273,7 +1273,7 @@ func (ctx *jsonDecoder) iterateRecordFields(node *schemaNode, handle func(idx in
 			continue
 		}
 		if !f.hasDefault {
-			return fmt.Errorf("avro json: record %q missing required field %q", node.name, f.name)
+			return fmt.Errorf("avro json: record %q missing required field %q", truncForError(node.name), truncForError(f.name))
 		}
 		if fillDefault != nil {
 			if err := fillDefault(i); err != nil {
@@ -1315,7 +1315,7 @@ func (ctx *jsonDecoder) decodeRecordAny(v reflect.Value, node *schemaNode) error
 			var defVal any
 			defValV := reflect.ValueOf(&defVal).Elem()
 			if err := ctx.applyFieldDefault(defValV, node, idx); err != nil {
-				return fmt.Errorf("field %q default: %w", f.name, err)
+				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
 			}
 			m[f.name] = defVal
 			return nil
@@ -1354,7 +1354,7 @@ func (ctx *jsonDecoder) decodeRecordMap(v reflect.Value, node *schemaNode) error
 				return err
 			}
 			if err := ctx.applyFieldDefault(elem, node, idx); err != nil {
-				return fmt.Errorf("field %q default: %w", f.name, err)
+				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
 			}
 			v.SetMapIndex(mapKeyAs(mapType, f.nameVal), elem)
 			elem.SetZero()
@@ -1393,10 +1393,10 @@ func (ctx *jsonDecoder) decodeRecordStruct(v reflect.Value, node *schemaNode) er
 			}
 			fv, err := fieldByIndex(v, mapping.indices[idx])
 			if err != nil {
-				return fmt.Errorf("field %q default: %w", f.name, err)
+				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
 			}
 			if err := ctx.applyFieldDefault(fv, node, idx); err != nil {
-				return fmt.Errorf("field %q default: %w", f.name, err)
+				return fmt.Errorf("field %q default: %w", truncForError(f.name), err)
 			}
 			return nil
 		},
