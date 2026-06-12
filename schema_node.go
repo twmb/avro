@@ -182,7 +182,7 @@ func (s *Schema) Root() SchemaNode {
 // occurrence of a named type (record, enum, fixed) emits the full
 // definition; subsequent occurrences emit the name as a reference.
 func (n *SchemaNode) toJSONDedup(d *deduper) any {
-	return n.toJSONWalk(d.visited, d, "")
+	return n.toJSONWalk(d.visited, d, "", 0)
 }
 
 // jsonSerializableValue returns v with three Avro-JSON-specific shape
@@ -319,7 +319,7 @@ func applyJSONFixup(v any) any {
 // are detected and emitted as the cyclic node's name (for named types)
 // or nil (for unnamed).
 func (n *SchemaNode) toJSON() any {
-	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "")
+	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0)
 }
 
 // toJSONWalk is the cycle-aware walker shared by toJSON and toJSONDedup.
@@ -333,7 +333,26 @@ func (n *SchemaNode) toJSON() any {
 // a null-namespace type sits inside a namespaced scope — Java's
 // Name.writeName escape), and name references emit the fullname so they
 // re-bind position-independently.
-func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string) any {
+//
+// depth is the structural nesting level (items/values/branches/fields
+// descents). The visited map only terminates true *pointer cycles; a
+// distinct-node-per-level acyclic chain (a hand-built array<array<…>> a
+// million deep) has no repeated pointer, so without this bound the walk
+// would recurse until the goroutine stack overflows and the process
+// dies uncatchably — before Schema's eventual Parse (which bounds JSON
+// bracket nesting at maxSchemaJSONDepth) ever runs. Cap the walk at the
+// same maxSchemaJSONDepth ceiling: any tree shallow enough to encode or
+// decode sits far below it (the wire codec's own maxDepth is 4× smaller),
+// so a usable tree is never rejected, and a deeper one stops with a clean
+// error (dedup path) or a truncated subtree Parse then rejects (bare
+// path) instead of crashing.
+func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string, depth int) any {
+	if depth > maxSchemaJSONDepth {
+		if d != nil && d.err == nil {
+			d.err = fmt.Errorf("avro: SchemaNode tree nests deeper than the supported limit (%d)", maxSchemaJSONDepth)
+		}
+		return nil
+	}
 	if _, cycle := visited[n]; cycle {
 		// Cycle through Items/Values back to n. Named types emit the
 		// fullname as a reference (the canonical Avro recursive-schema
@@ -396,7 +415,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	case "union":
 		branches := make([]any, len(n.Branches))
 		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS)
+			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1)
 		}
 		return branches
 	}
@@ -480,10 +499,10 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		m["symbols"] = n.Symbols
 	}
 	if n.Items != nil {
-		m["items"] = n.Items.toJSONWalk(visited, d, childNS)
+		m["items"] = n.Items.toJSONWalk(visited, d, childNS, depth+1)
 	}
 	if n.Values != nil {
-		m["values"] = n.Values.toJSONWalk(visited, d, childNS)
+		m["values"] = n.Values.toJSONWalk(visited, d, childNS, depth+1)
 	}
 	// record.fields is a required attribute per the Avro spec (Complex
 	// Types > Records: "fields: a JSON array, listing fields (required)"),
@@ -493,7 +512,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		for i, f := range n.Fields {
 			fd := map[string]any{
 				"name": f.Name,
-				"type": f.Type.toJSONWalk(visited, d, childNS),
+				"type": f.Type.toJSONWalk(visited, d, childNS, depth+1),
 			}
 			if f.HasDefault || f.Default != nil {
 				// jsonSerializableValue converts ±Inf — which a Root()

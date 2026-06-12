@@ -798,6 +798,46 @@ func TestSchemaNodeCyclic3Node(t *testing.T) {
 	}
 }
 
+// A deep ACYCLIC SchemaNode chain (distinct node per level, so the
+// cycle-detection visited map never fires) must bound its own walk: the
+// toJSONWalk recursion has no pointer cycle to terminate it, so without a
+// depth bound a hand-built array<array<…>> deep enough overflows the
+// goroutine stack and kills the process uncatchably — before Schema's
+// eventual Parse can reject it. The walk caps at maxSchemaJSONDepth, so a
+// too-deep tree stops with this bounded error rather than crashing. This
+// pins that the SchemaNode walk bounds depth ITSELF (message names the
+// node tree) rather than relying on Parse's downstream JSON-bracket cap.
+func TestRegression_SchemaNodeSchemaDeepAcyclicBounded(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panicked: %v", r)
+		}
+	}()
+	const depth = maxSchemaJSONDepth + 50
+	cur := &SchemaNode{Type: "long"}
+	for range depth {
+		cur = &SchemaNode{Type: "array", Items: cur}
+	}
+	_, err := cur.Schema()
+	if err == nil {
+		t.Fatal("expected a bounded error for an over-deep SchemaNode chain, got nil")
+	}
+	if !strings.Contains(err.Error(), "SchemaNode tree nests deeper") {
+		t.Fatalf("expected the node-walk depth bound to fire, got %v", err)
+	}
+
+	// Boundary-1: a tree well below the cap (and below the wire codec's own
+	// maxDepth, so genuinely usable) must still build — the bound must not
+	// false-reject a legitimately deep hand-built tree.
+	ok := &SchemaNode{Type: "long"}
+	for range 500 {
+		ok = &SchemaNode{Type: "array", Items: ok}
+	}
+	if _, err := ok.Schema(); err != nil {
+		t.Fatalf("a 500-deep array tree should build, got %v", err)
+	}
+}
+
 func TestSchemaNodeUnmarshalablePropsErrors(t *testing.T) {
 	// json.Marshal rejects channels, funcs, complex numbers.
 	node := SchemaNode{
