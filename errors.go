@@ -26,7 +26,15 @@ func (e *SemanticError) Error() string {
 	var s string
 	switch {
 	case e.Field != "" && gt != "":
-		s = fmt.Sprintf("avro: field %s: cannot use %s with Avro type %s", e.Field, gt, e.AvroType)
+		// Field is the dotted record-field path, built from parsed schema
+		// field names — registry/remote-controlled and unbounded in length
+		// (validName is pure grammar; WithLaxNames permits any non-empty
+		// string). Render-truncate it so a hostile multi-megabyte field name
+		// can't amplify into an equally large error string on every
+		// type-mismatched datum (1:1 log / RPC / metric-label blowup). The
+		// public e.Field keeps its full value for callers that inspect it —
+		// matching the sibling CompatibilityError.Error() single-value policy.
+		s = fmt.Sprintf("avro: field %s: cannot use %s with Avro type %s", truncForError(e.Field), gt, e.AvroType)
 	case gt != "" && e.AvroType != "":
 		s = fmt.Sprintf("avro: cannot use %s with Avro type %s", gt, e.AvroType)
 	case gt != "":

@@ -393,6 +393,30 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 	}
 
 	if k == reflect.Pointer {
+		// Bound the pointer-chain peel before recursing on the element type.
+		// A cyclic non-struct pointer type (type P *P, whose reflect graph has
+		// P.Elem() == P) would recurse here forever AT COMPILE TIME and
+		// overflow the goroutine stack — a fatal, unrecoverable crash. A
+		// non-cyclic chain too deep for the reflect encoder also matters: the
+		// reflect path (serIndirect → indirect) peels at most maxIndirectDepth
+		// levels and confirms a non-pointer only on a FOLLOWING iteration, so
+		// it accepts at most maxIndirectDepth-1 pointer levels and errors at
+		// or beyond maxIndirectDepth. An unbounded fast path would instead
+		// accept those deeper chains, diverging from the reflect encoder it
+		// must mirror byte-for-byte. Counting the consecutive pointer levels
+		// and declining at maxIndirectDepth terminates the cycle and keeps the
+		// fast path's accept set identical to the reflect encoder's: the
+		// declined chain routes to the reflect slow path, which errors
+		// uniformly (errIndirectDeep / errIndirectNil). Mirrors
+		// tryCompileFieldDeser (declines all pointers) and the multi-pointer
+		// nullunion/array arms.
+		levels := 1
+		for e := goType.Elem(); e.Kind() == reflect.Pointer; e = e.Elem() {
+			levels++
+			if levels >= maxIndirectDepth {
+				return nil
+			}
+		}
 		inner := tryCompileFieldSer(f, goType.Elem())
 		if inner == nil {
 			return nil

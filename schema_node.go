@@ -92,7 +92,10 @@ type SchemaField struct {
 	//   - int schemas give int32, long schemas give int64. Out-of-range
 	//     defaults are rejected at parse.
 	//   - float schemas give float32, double schemas give float64.
-	//     Overflows narrow to ±Inf; NaN and ±Inf round-trip correctly.
+	//     Overflows narrow to ±Inf; NaN, ±Inf, and a float-syntax negative
+	//     zero ("-0.0") round-trip correctly. An integer-syntax "-0" is the
+	//     sign-less integer 0 and surfaces as +0.0 (matching Java/fastavro),
+	//     even though the wire encoder writes -0.0 for that literal.
 	//   - string and enum schemas give string.
 	//   - bytes and fixed schemas give []byte, already decoded from
 	//     the JSON spec's codepoint-per-byte form so you can pass
@@ -232,12 +235,18 @@ func jsonSerializableValue(v any) any {
 	return applyJSONFixup(v)
 }
 
+// isNegativeZero reports whether f is IEEE-754 negative zero (−0.0). Distinct
+// from +0.0 only by the sign bit; both compare == 0.
+func isNegativeZero(f float64) bool {
+	return f == 0 && math.Signbit(f)
+}
+
 func needsJSONFixup(v any) bool {
 	switch tv := v.(type) {
 	case float64:
-		return math.IsInf(tv, 0) || math.IsNaN(tv)
+		return math.IsInf(tv, 0) || math.IsNaN(tv) || isNegativeZero(tv)
 	case float32:
-		return math.IsInf(float64(tv), 0) || math.IsNaN(float64(tv))
+		return math.IsInf(float64(tv), 0) || math.IsNaN(float64(tv)) || isNegativeZero(float64(tv))
 	case []byte:
 		return true
 	case map[string]any:
@@ -264,6 +273,14 @@ func applyJSONFixup(v any) any {
 		if math.IsNaN(tv) {
 			return "NaN"
 		}
+		if isNegativeZero(tv) {
+			// encoding/json.Marshal renders -0.0 as integer-syntax "-0",
+			// which re-parses to a sign-less integer 0 (+0.0 on the wire) —
+			// silently flipping the rebuilt schema's default away from the
+			// original -0.0. Emit float syntax so Root().Schema() round-trips
+			// the sign (matching the wire and Java/fastavro).
+			return json.Number("-0.0")
+		}
 		return tv
 	case float32:
 		if math.IsInf(float64(tv), 1) {
@@ -274,6 +291,9 @@ func applyJSONFixup(v any) any {
 		}
 		if math.IsNaN(float64(tv)) {
 			return "NaN"
+		}
+		if isNegativeZero(float64(tv)) {
+			return json.Number("-0.0")
 		}
 		return tv
 	case []byte:

@@ -425,7 +425,7 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 					// If the embedded struct has an explicit avro
 					// tag, treat it as a named field rather than
 					// inlining its fields.
-					parts := strings.Split(tag, ",")
+					parts := splitFieldTag(tag)
 					name := parts[0]
 					if name != "" {
 						_, oz := parseTagOptions(parts[1:])
@@ -451,7 +451,7 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 			if tag == "-" {
 				continue
 			}
-			parts := strings.Split(tag, ",")
+			parts := splitFieldTag(tag)
 			name := parts[0]
 			tagged := name != ""
 			inline, oz := parseTagOptions(parts[1:])
@@ -549,8 +549,30 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 	return result, nil
 }
 
+// splitFieldTag tokenizes an avro struct tag for the runtime field mapper
+// using the SAME grammar SchemaFor uses ([splitTag]): top-level commas
+// separate options, a default= value takes the rest of the tag verbatim, and
+// bracketed alias=[...] / decimal(...) values are not split on their internal
+// commas. Without this, a naive strings.Split would mis-read a comma inside a
+// default= value or an alias list — e.g. `default=a,omitzero` or
+// `alias=[x,inline,y]` — as a separate option, so the runtime would spuriously
+// fire omitzero/inline that SchemaFor (correctly) never sees, corrupting the
+// zero value's wire form or making SchemaFor's own schema unencodable for its
+// source type. A malformed tag (unbalanced brackets, which splitTag rejects)
+// falls back to the naive split so the runtime never newly errors on a tag a
+// hand-written-schema user already relies on.
+func splitFieldTag(tag string) []string {
+	parts, err := splitTag(tag)
+	if err != nil {
+		return strings.Split(tag, ",")
+	}
+	return parts
+}
+
 // parseTagOptions parses tag options after the field name. It returns whether
-// "inline" and "omitzero" were found.
+// "inline" and "omitzero" were found. Inputs come from [splitFieldTag], so an
+// option carrying a value (default=…, alias=…) arrives as a single part that
+// can never equal a bare keyword.
 func parseTagOptions(opts []string) (inline, omitzero bool) {
 	for _, o := range opts {
 		switch o {

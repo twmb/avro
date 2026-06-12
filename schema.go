@@ -2277,6 +2277,24 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if err := b.validFullnameErr(o.Name); err != nil {
 			return fmt.Errorf("invalid %s name %q: %w", truncForError(o.Type), truncForError(o.Name), err)
 		}
+		// The namespace attribute is itself a dot-separated sequence of names
+		// (Avro spec §Names) and must satisfy the same grammar. The check
+		// above only saw the (possibly bare) name attribute, so without this
+		// a namespace spelled via the attribute
+		// ({"name":"R","namespace":"bad ns"}) would skip validation entirely
+		// while the identical fullname spelled inline ({"name":"bad ns.R"})
+		// is rejected — and since the parsing canonical form inlines the
+		// namespace into the fullname, the accepted schema's Canonical()
+		// would otherwise fail to re-parse in the same mode. Validating here
+		// also routes namespace components through a WithLaxNames validator,
+		// honoring its documented "called for each name component" contract.
+		// A dotted name ignores the attribute (the spec, handled below), and
+		// the empty string is the explicit null-namespace escape — both exempt.
+		if o.Namespace != nil && *o.Namespace != "" && !strings.Contains(o.Name, ".") {
+			if err := b.validFullnameErr(*o.Namespace); err != nil {
+				return fmt.Errorf("invalid %s namespace %q: %w", truncForError(o.Type), truncForError(*o.Namespace), err)
+			}
+		}
 		// Aliases are NOT name-validated: the Avro spec (§Aliases) states
 		// "any string is accepted as an alias", precisely so evolution can
 		// alias a reader's valid name to a writer's illegal/legacy name.
@@ -3295,8 +3313,18 @@ func normalizeJSONNumber(n json.Number) any {
 	// agree on the same int64 value regardless of how the user wrote the
 	// literal.
 	if r, ok, err := boundedRatFromString(s); err == nil && ok && r.IsInt() {
-		if bi := r.Num(); bi.IsInt64() {
-			return bi.Int64()
+		// Negative zero in float syntax ("-0.0", "-0e5") is the one exact
+		// integer whose IEEE sign the int64 collapse would erase (a big.Rat
+		// has no signed zero). The wire encoder parses it via ParseFloat and
+		// preserves the sign, and Java's Jackson surfaces a DoubleNode(-0.0);
+		// keep the sign by falling through to parseFloatAcceptOverflow below
+		// (→ -0.0) so the metadata Default matches the wire and re-parses
+		// sign-stable. Integer syntax ("-0") stays integer 0 (no sign) above.
+		negZero := r.Sign() == 0 && s != "" && s[0] == '-'
+		if !negZero {
+			if bi := r.Num(); bi.IsInt64() {
+				return bi.Int64()
+			}
 		}
 		// Exact integer beyond int64 range. Two sub-cases:
 		//   - Magnitude fits float64's exponent → surface as float64,

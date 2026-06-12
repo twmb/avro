@@ -366,6 +366,16 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 		serRecord:   r.serRecord,
 		deserRecord: r.deserRecord,
 	}
+	// Re-apply a record-level CustomType (AvroType:"record") to the resolved
+	// node, exactly as resolveEnum / resolveArray / resolveMap / fixed /
+	// promotion do via applyCustomToNode. The direct (non-resolved) build
+	// wires record nodes in applyCustomTypes, so a CustomType.Decode for a
+	// record node fires on a plain Decode; without this, any real evolution
+	// (which bypasses the canonical-equality fast path) silently returns the
+	// raw map[string]any instead of the callback's converted value — a
+	// direct-vs-resolved divergence. The resolved DecodeJSON funnels through
+	// this same deser, so both resolved wire formats gain the custom together.
+	ctx.applyCustomToNode(nd, r)
 	return nd, nil
 }
 
