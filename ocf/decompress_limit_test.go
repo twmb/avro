@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"math"
 	"strings"
 	"testing"
 
@@ -144,4 +145,56 @@ func TestRegression_OCFDecompressionAmplificationBounded(t *testing.T) {
 		}
 		r.Close()
 	})
+}
+
+// A user expressing "no practical decompressed-size limit" as math.MaxInt64
+// (rather than the documented 0) must still read a valid deflate-compressed
+// OCF. deflateCodec.Decompress reads io.LimitReader(r, maxOut+1) to detect
+// over-limit without materializing the bomb; at maxOut==MaxInt64 the +1
+// overflows to MinInt64, LimitReader returns 0 bytes, the block decodes as
+// empty, and a valid file fails to read. The bound must not invert at its own
+// extreme value. The default-limit and limit==0 (unlimited) paths are the
+// boundary-1 controls that must keep working.
+func TestRegression_OCFDeflateDecompressLimitMaxInt(t *testing.T) {
+	s := avro.MustParse(`"string"`)
+	payload := strings.Repeat("hello world ", 2000) // ~24 KiB, compresses well
+	mk := func() []byte {
+		var buf bytes.Buffer
+		w, err := NewWriter(&buf, s, WithCodec(DeflateCodec(1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Encode(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	// Reader auto-selects the built-in deflate codec from the header; the
+	// codec's maxOut is set from WithMaxDecompressedBlockBytes.
+	for _, tc := range []struct {
+		name  string
+		limit int64
+	}{
+		{"max-int64", math.MaxInt64}, // the overflow boundary
+		{"unlimited-zero", 0},        // documented "unlimited" control
+		{"generous", 64 << 20},       // ordinary large control
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := NewReader(bytes.NewReader(mk()), WithMaxDecompressedBlockBytes(tc.limit))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			var got string
+			if err := r.Decode(&got); err != nil {
+				t.Fatalf("limit=%d: Decode of a valid deflate file failed: %v", tc.limit, err)
+			}
+			if got != payload {
+				t.Fatalf("limit=%d: round-trip mismatch: got %d bytes, want %d", tc.limit, len(got), len(payload))
+			}
+		})
+	}
 }

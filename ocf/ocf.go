@@ -1070,8 +1070,15 @@ func (c deflateCodec) Decompress(src []byte) ([]byte, error) {
 		return io.ReadAll(r)
 	}
 	// Read at most maxOut+1 bytes: if the stream yields more, it exceeds the
-	// limit and we reject without materializing the whole bomb.
-	out, err := io.ReadAll(io.LimitReader(r, c.maxOut+1))
+	// limit and we reject without materializing the whole bomb. Guard the +1
+	// against int64 overflow — maxOut == MaxInt64 ("effectively unlimited")
+	// would wrap to MinInt64, making io.LimitReader read zero bytes and
+	// silently truncate a valid block to empty.
+	limit := c.maxOut
+	if limit < math.MaxInt64 {
+		limit++
+	}
+	out, err := io.ReadAll(io.LimitReader(r, limit))
 	if err != nil {
 		return nil, err
 	}
