@@ -994,14 +994,24 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 
 	// Types implementing text interfaces are inferred as string,
 	// matching the encoder (TextAppender/TextMarshaler) and decoder
-	// (TextUnmarshaler) behavior.
-	for _, iface := range []reflect.Type{
-		textAppenderType,
-		textMarshalerType,
-		textUnmarshalerType,
-	} {
-		if t.Implements(iface) || reflect.PointerTo(t).Implements(iface) {
-			return "string", nil
+	// (TextUnmarshaler) behavior. EXCEPTION: a ,uuid-tagged [16]byte is a
+	// fixed(16) uuid handled by the Array case below — the codec trusts its
+	// raw bytes and never consults the text method for a uuid-on-fixed value
+	// (see [Schema.Decode]'s uuid-on-fixed contract). Letting a text method
+	// downgrade it to a plain "string" here would silently drop the fixed(16)
+	// shape and the uuid logical type, diverging from an identical text-less
+	// [16]byte field and from what the codec actually does.
+	uuidArr16 := logical == "uuid" && t.Kind() == reflect.Array &&
+		t.Elem().Kind() == reflect.Uint8 && t.Len() == 16
+	if !uuidArr16 {
+		for _, iface := range []reflect.Type{
+			textAppenderType,
+			textMarshalerType,
+			textUnmarshalerType,
+		} {
+			if t.Implements(iface) || reflect.PointerTo(t).Implements(iface) {
+				return "string", nil
+			}
 		}
 	}
 

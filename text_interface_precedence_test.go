@@ -307,3 +307,41 @@ func TestRegression_EnumTextMarshalerNameMatchOverOrdinal(t *testing.T) {
 		t.Fatalf("json decode = %d, want ordRed=0", jsonBack)
 	}
 }
+
+// SchemaFor must infer fixed(16) uuid for a ,uuid-tagged [16]byte EVEN WHEN
+// the type implements a text interface. The codec trusts the raw bytes of a
+// uuid-on-fixed [16]byte and never consults its text method (see
+// TestRegression_FixedUUIDByteArrayTrustsRawBytes), so inferring a plain Avro
+// "string" silently drops both the fixed(16) shape and the uuid logical type,
+// and produces a different wire format / fingerprint than an identical
+// text-less [16]byte field. The text-interface arm in inferType must not
+// intercept a uuid [16]byte headed for the fixed(16) Array case.
+func TestRegression_SchemaForUUIDByteArrayWithTextMethod(t *testing.T) {
+	// Bug case: nonCanonicalArrUUID is a [16]byte with MarshalText +
+	// UnmarshalText (mirrors github.com/google/uuid.UUID).
+	type recTexty struct {
+		ID nonCanonicalArrUUID `avro:"id,uuid"`
+	}
+	s, err := SchemaFor[recTexty]()
+	if err != nil {
+		t.Fatalf("SchemaFor[recTexty]: %v", err)
+	}
+	if ft := s.Root().Fields[0].Type; ft.Type != "fixed" || ft.Size != 16 || ft.LogicalType != "uuid" {
+		t.Fatalf("uuid [16]byte with a text method: want fixed(16) uuid, got Type=%q Size=%d LogicalType=%q",
+			ft.Type, ft.Size, ft.LogicalType)
+	}
+
+	// Boundary-1 control (must still hold): a plain [16]byte with no text
+	// method already infers fixed(16) uuid.
+	type recPlain struct {
+		ID [16]byte `avro:"id,uuid"`
+	}
+	sp, err := SchemaFor[recPlain]()
+	if err != nil {
+		t.Fatalf("SchemaFor[recPlain]: %v", err)
+	}
+	if fp := sp.Root().Fields[0].Type; fp.Type != "fixed" || fp.Size != 16 || fp.LogicalType != "uuid" {
+		t.Fatalf("plain uuid [16]byte: want fixed(16) uuid, got Type=%q Size=%d LogicalType=%q",
+			fp.Type, fp.Size, fp.LogicalType)
+	}
+}
