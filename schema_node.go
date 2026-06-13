@@ -183,7 +183,8 @@ func (s *Schema) Root() SchemaNode {
 // occurrence of a named type (record, enum, fixed) emits the full
 // definition; subsequent occurrences emit the name as a reference.
 func (n *SchemaNode) toJSONDedup(d *deduper) any {
-	return n.toJSONWalk(d.visited, d, "", 0)
+	nodes := maxSchemaJSONNodes
+	return n.toJSONWalk(d.visited, d, "", 0, &nodes)
 }
 
 // jsonSerializableValue returns v with three Avro-JSON-specific shape
@@ -315,54 +316,88 @@ func applyJSONFixup(v any) any {
 	return v
 }
 
-// valueNestsTooDeep reports whether v — a Props value or a
-// SchemaField.Default, an arbitrary user-supplied JSON tree — nests its
-// container layers deeper than remaining. It is the value-channel analogue of
-// toJSONWalk's structural depth bound: a Props/Default value is handed to
-// jsonSerializableValue (needsJSONFixup/applyJSONFixup) and then to
-// json.Marshal at [SchemaNode.Schema], none of which bounds recursion, so a
-// hand-built value nested far enough overflows the goroutine stack uncatchably
-// before Schema's eventual Parse (whose maxSchemaJSONDepth pre-scan would have
-// rejected the JSON) can run.
+// maxSchemaJSONNodes bounds the TOTAL number of nodes one SchemaNode→JSON walk
+// emits — every structural node in toJSONWalk PLUS every node inside every Props
+// value and SchemaField.Default — shared across a single [SchemaNode.Schema] /
+// [SchemaNode.toJSON] call. It is the expansion-axis companion to
+// maxSchemaJSONDepth's depth axis. The depth bound caps the longest container
+// PATH; it cannot see a shared-reference DAG: the same *SchemaNode reached via a
+// node's Items AND Values pointer, or the same sub-value reached via two map
+// keys ({"a":x,"b":x} repeated per level), is tiny in memory yet fans out into
+// an exponential TREE when serialized, because neither toJSONWalk nor
+// json.Marshal memoizes shared references — both re-expand every shared subtree.
+// A ~40-node DAG demands 2^40 emitted nodes and hangs/OOMs the process before
+// Schema's eventual Parse (whose maxSchemaJSONDepth pre-scan would reject the
+// JSON) ever runs. Counting emitted nodes against one budget bounds the fan-out
+// AND json.Marshal's subsequent cost (it processes the same expanded tree). The
+// cap sits far above any real schema's node count — a tree this large is itself
+// pathological — so a usable tree is never rejected; an over-budget walk stops
+// with a clean error (dedup path) or a truncated subtree (bare path) instead of
+// crashing, exactly like the depth bound.
+const maxSchemaJSONNodes = 1 << 20
+
+// valueWalkLimit result codes.
+const (
+	valueWalkOK      = iota // safe to hand to jsonSerializableValue / json.Marshal
+	valueWalkTooDeep        // nests past the depth budget (stack-overflow risk)
+	valueWalkTooWide        // expands to too many nodes (fan-out / json.Marshal cost)
+)
+
+// valueWalkLimit walks v — a Props value or a SchemaField.Default, an arbitrary
+// user-supplied JSON tree — the way json.Marshal will, returning a non-OK code
+// when the value is unsafe to serialize at [SchemaNode.Schema]. It enforces two
+// orthogonal limits, because a value is handed to jsonSerializableValue
+// (needsJSONFixup/applyJSONFixup) and then to json.Marshal, neither of which
+// bounds anything:
+//
+//   - DEPTH (depthLeft): the longest container PATH. A value nested far enough
+//     overflows the goroutine stack uncatchably (recover cannot catch a stack
+//     overflow) in the fixup walk or in json.Marshal, before Schema's eventual
+//     Parse can reject it. depthLeft mirrors toJSONWalk's structural depth
+//     bound, charging the structural nesting already accrued so the total
+//     marshaled nesting stays within one ceiling.
+//
+//   - EXPANSION (*nodes, the budget shared with the structural toJSONWalk): the
+//     TOTAL nodes json.Marshal will emit. A value that shares a sub-value across
+//     sibling paths is shallow yet fans out into a 2^depth tree when serialized
+//     (see maxSchemaJSONNodes). The depth bound is blind to it; only counting
+//     emitted nodes catches it. *nodes is decremented on EVERY node, so the walk
+//     itself terminates at the budget — it can neither overflow its own stack
+//     nor hang on a shared-reference DAG or a cyclic Go type (type P *P).
 //
 // The walk mirrors what json.Marshal recurses into — maps, slices, arrays,
 // structs, and pointer/interface indirection — not just the map[string]any /
-// []any shapes [Schema.Root] produces. A hand-built node (or a SchemaFor
-// CustomType.Schema) can store ANY Go value the map[string]any field accepts;
-// a typed container ([]map[string]any, a struct, a []*T chain) marshals just as
-// deeply but was invisible to a map[string]any/[]any-only type switch, so it
-// reached json.Marshal unbounded. remaining is decremented on EVERY descent
-// (indirection included), so the check terminates after at most `remaining`
-// recursive calls — it can neither overflow its own stack nor hang on a cyclic
-// Go type (type P *P), and []byte/[N]byte (a base64/number scalar to
-// json.Marshal, never a nested array) short-circuit.
-func valueNestsTooDeep(v any, remaining int) bool {
-	return valueNestsTooDeepValue(reflect.ValueOf(v), remaining)
-}
-
-func valueNestsTooDeepValue(rv reflect.Value, remaining int) bool {
-	if remaining < 0 {
-		return true
+// []any shapes [Schema.Root] produces (a hand-built node or a SchemaFor
+// CustomType.Schema can store ANY Go value the map[string]any field accepts).
+// []byte/[N]byte short-circuit (a base64/number scalar to json.Marshal, never a
+// nested array).
+func valueWalkLimit(rv reflect.Value, depthLeft int, nodes *int) int {
+	if depthLeft < 0 {
+		return valueWalkTooDeep
 	}
+	if *nodes <= 0 {
+		return valueWalkTooWide
+	}
+	*nodes--
 	switch rv.Kind() {
 	case reflect.Interface, reflect.Pointer:
 		if rv.IsNil() {
-			return false
+			return valueWalkOK
 		}
-		return valueNestsTooDeepValue(rv.Elem(), remaining-1)
+		return valueWalkLimit(rv.Elem(), depthLeft-1, nodes)
 	case reflect.Map:
 		for iter := rv.MapRange(); iter.Next(); {
-			if valueNestsTooDeepValue(iter.Value(), remaining-1) {
-				return true
+			if r := valueWalkLimit(iter.Value(), depthLeft-1, nodes); r != valueWalkOK {
+				return r
 			}
 		}
 	case reflect.Slice, reflect.Array:
 		if rv.Type().Elem().Kind() == reflect.Uint8 {
-			return false // []byte/[N]byte → base64/number scalar, not a nested array
+			return valueWalkOK // []byte/[N]byte → base64/number scalar, not a nested array
 		}
 		for i := 0; i < rv.Len(); i++ {
-			if valueNestsTooDeepValue(rv.Index(i), remaining-1) {
-				return true
+			if r := valueWalkLimit(rv.Index(i), depthLeft-1, nodes); r != valueWalkOK {
+				return r
 			}
 		}
 	case reflect.Struct:
@@ -371,27 +406,34 @@ func valueNestsTooDeepValue(rv reflect.Value, remaining int) bool {
 			if !t.Field(i).IsExported() {
 				continue // json.Marshal skips unexported fields
 			}
-			if valueNestsTooDeepValue(rv.Field(i), remaining-1) {
-				return true
+			if r := valueWalkLimit(rv.Field(i), depthLeft-1, nodes); r != valueWalkOK {
+				return r
 			}
 		}
 	}
-	return false
+	return valueWalkOK
 }
 
 // boundedSerializableValue applies jsonSerializableValue to a Props value or
-// SchemaField.Default, but first bounds its nesting depth so neither the
-// fixup walk nor the downstream json.Marshal overflows the stack. depth is the
-// structural nesting already accrued by toJSONWalk, so the value may add at
-// most maxSchemaJSONDepth-depth further levels — keeping the total marshaled
-// nesting within the same ceiling the structural walk enforces. A value that
-// exceeds it records the error on the dedup path (so [SchemaNode.Schema]
-// returns it) and truncates to nil on the bare path (so the marshal cannot
-// crash), mirroring toJSONWalk's own over-depth handling.
-func boundedSerializableValue(d *deduper, depth int, v any) any {
-	if valueNestsTooDeep(v, maxSchemaJSONDepth-depth) {
+// SchemaField.Default after bounding both its nesting depth AND its serialized
+// node count against the shared per-walk budget *nodes (see valueWalkLimit), so
+// neither the fixup walk nor the downstream json.Marshal overflows the stack or
+// fans a shared-reference DAG out into an exponential tree. depth is the
+// structural nesting already accrued by toJSONWalk, so the value may add at most
+// maxSchemaJSONDepth-depth further levels. A value that exceeds either bound
+// records the error on the dedup path (so [SchemaNode.Schema] returns it) and
+// truncates to nil on the bare path (so the marshal cannot crash), mirroring
+// toJSONWalk's own over-limit handling.
+func boundedSerializableValue(d *deduper, depth int, nodes *int, v any) any {
+	switch valueWalkLimit(reflect.ValueOf(v), maxSchemaJSONDepth-depth, nodes) {
+	case valueWalkTooDeep:
 		if d != nil && d.err == nil {
 			d.err = fmt.Errorf("avro: SchemaNode default/property value nests deeper than the supported limit (%d)", maxSchemaJSONDepth)
+		}
+		return nil
+	case valueWalkTooWide:
+		if d != nil && d.err == nil {
+			d.err = fmt.Errorf("avro: SchemaNode default/property value expands to more than the supported %d nodes", maxSchemaJSONNodes)
 		}
 		return nil
 	}
@@ -403,7 +445,8 @@ func boundedSerializableValue(d *deduper, depth int, v any) any {
 // are detected and emitted as the cyclic node's name (for named types)
 // or nil (for unnamed).
 func (n *SchemaNode) toJSON() any {
-	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0)
+	nodes := maxSchemaJSONNodes
+	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0, &nodes)
 }
 
 // toJSONWalk is the cycle-aware walker shared by toJSON and toJSONDedup.
@@ -430,13 +473,27 @@ func (n *SchemaNode) toJSON() any {
 // so a usable tree is never rejected, and a deeper one stops with a clean
 // error (dedup path) or a truncated subtree Parse then rejects (bare
 // path) instead of crashing.
-func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string, depth int) any {
+func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string, depth int, nodes *int) any {
 	if depth > maxSchemaJSONDepth {
 		if d != nil && d.err == nil {
 			d.err = fmt.Errorf("avro: SchemaNode tree nests deeper than the supported limit (%d)", maxSchemaJSONDepth)
 		}
 		return nil
 	}
+	// Charge this node against the shared expansion budget. The depth bound
+	// above caps the longest PATH; this caps the total number of emitted nodes,
+	// so a shared-reference DAG (the same *SchemaNode reached via Items AND
+	// Values, tiny in memory) cannot fan out into an exponential tree that hangs
+	// the walk / json.Marshal before Parse runs (see maxSchemaJSONNodes). Once
+	// exhausted, every further node returns early without descending, so the
+	// fan-out is pruned at the frontier rather than fully expanded.
+	if *nodes <= 0 {
+		if d != nil && d.err == nil {
+			d.err = fmt.Errorf("avro: SchemaNode tree expands to more than the supported %d nodes", maxSchemaJSONNodes)
+		}
+		return nil
+	}
+	*nodes--
 	if _, cycle := visited[n]; cycle {
 		// Cycle through Items/Values back to n. Named types emit the
 		// fullname as a reference (the canonical Avro recursive-schema
@@ -499,7 +556,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	case "union":
 		branches := make([]any, len(n.Branches))
 		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1)
+			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1, nodes)
 		}
 		return branches
 	}
@@ -583,10 +640,10 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		m["symbols"] = n.Symbols
 	}
 	if n.Items != nil {
-		m["items"] = n.Items.toJSONWalk(visited, d, childNS, depth+1)
+		m["items"] = n.Items.toJSONWalk(visited, d, childNS, depth+1, nodes)
 	}
 	if n.Values != nil {
-		m["values"] = n.Values.toJSONWalk(visited, d, childNS, depth+1)
+		m["values"] = n.Values.toJSONWalk(visited, d, childNS, depth+1, nodes)
 	}
 	// record.fields is a required attribute per the Avro spec (Complex
 	// Types > Records: "fields: a JSON array, listing fields (required)"),
@@ -596,7 +653,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		for i, f := range n.Fields {
 			fd := map[string]any{
 				"name": f.Name,
-				"type": f.Type.toJSONWalk(visited, d, childNS, depth+1),
+				"type": f.Type.toJSONWalk(visited, d, childNS, depth+1, nodes),
 			}
 			if f.HasDefault || f.Default != nil {
 				// jsonSerializableValue converts ±Inf — which a Root()
@@ -604,7 +661,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 				// → parseFloatAcceptOverflow — back to a json.Number
 				// literal so encoding/json.Marshal at SchemaNode.Schema()
 				// doesn't fail. Inverse of the metadata-API normalization.
-				fd["default"] = boundedSerializableValue(d, depth, f.Default)
+				fd["default"] = boundedSerializableValue(d, depth, nodes, f.Default)
 			}
 			if len(f.Aliases) > 0 {
 				fd["aliases"] = f.Aliases
@@ -616,14 +673,14 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 				fd["doc"] = f.Doc
 			}
 			for k, v := range f.Props {
-				fd[k] = boundedSerializableValue(d, depth, v)
+				fd[k] = boundedSerializableValue(d, depth, nodes, v)
 			}
 			fields[i] = fd
 		}
 		m["fields"] = fields
 	}
 	for k, v := range n.Props {
-		m[k] = boundedSerializableValue(d, depth, v)
+		m[k] = boundedSerializableValue(d, depth, nodes, v)
 	}
 	return m
 }

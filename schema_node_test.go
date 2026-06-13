@@ -1,9 +1,11 @@
 package avro
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSchemaNodeRoundTrip(t *testing.T) {
@@ -977,6 +979,287 @@ func TestRegression_SchemaNodeSchemaDeepValueBounded(t *testing.T) {
 		p = &p // p points to itself: p.Elem() == p, an unbounded pointer chain
 		node := &SchemaNode{Type: "int", Props: map[string]any{"x": p}}
 		_, _ = node.Schema() // must return (the bound stops the walk), not hang
+	})
+}
+
+// The SchemaNode→JSON walk (toJSONWalk + the value channel) must bound DEPTH on
+// EVERY channel a hand-built node can carry nesting through, or a refactor that
+// drops one channel's depth charge ships an uncatchable stack overflow with a
+// green battery. The structural recursions are four distinct sites
+// (Items/Values/Branches/Fields), the value channel is three distinct
+// boundedSerializableValue call sites (node Props, field Props, field Default),
+// and the value walk must recurse into every container kind json.Marshal does
+// (map, slice, array, struct, pointer/interface) — this pins each cell so its
+// bound cannot be silently removed.
+func TestRegression_SchemaNodeWalkDepthAllChannels(t *testing.T) {
+	const deep = maxSchemaJSONDepth + 50
+
+	// Each structural recursion must charge depth. A too-deep chain through any
+	// one of them stops with the structural depth error, never a crash.
+	structural := map[string]func() *SchemaNode{
+		"items": func() *SchemaNode {
+			cur := &SchemaNode{Type: "long"}
+			for range deep {
+				cur = &SchemaNode{Type: "array", Items: cur}
+			}
+			return cur
+		},
+		"values": func() *SchemaNode {
+			cur := &SchemaNode{Type: "long"}
+			for range deep {
+				cur = &SchemaNode{Type: "map", Values: cur}
+			}
+			return cur
+		},
+		"branches": func() *SchemaNode {
+			cur := SchemaNode{Type: "long"}
+			for range deep {
+				cur = SchemaNode{Type: "union", Branches: []SchemaNode{cur}}
+			}
+			return &cur
+		},
+		"fields": func() *SchemaNode {
+			cur := SchemaNode{Type: "long"}
+			for i := range deep {
+				// Distinct names per level: same-named records would dedup to a
+				// reference and collapse the chain instead of nesting it.
+				cur = SchemaNode{Type: "record", Name: fmt.Sprintf("R%d", i), Fields: []SchemaField{{Name: "f", Type: cur}}}
+			}
+			return &cur
+		},
+	}
+	for name, build := range structural {
+		t.Run("structural/"+name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked: %v", r)
+				}
+			}()
+			_, err := build().Schema()
+			if err == nil || !strings.Contains(err.Error(), "tree nests deeper") {
+				t.Fatalf("want the structural depth bound to fire, got %v", err)
+			}
+		})
+	}
+
+	deepMap := func() any {
+		var v any = "leaf"
+		for range deep {
+			v = map[string]any{"k": v}
+		}
+		return v
+	}
+	// Each of the three value sites routes its value through
+	// boundedSerializableValue; all three must bound a too-deep value. node Props
+	// and field Default were already pinned; field Props (the third call site)
+	// was not — a dropped bound there crashes only on a field-level property.
+	valueSites := map[string]func(any) *SchemaNode{
+		"node-props": func(v any) *SchemaNode {
+			return &SchemaNode{Type: "int", Props: map[string]any{"x": v}}
+		},
+		"field-props": func(v any) *SchemaNode {
+			return &SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+				{Name: "f", Type: SchemaNode{Type: "int"}, Props: map[string]any{"x": v}},
+			}}
+		},
+		"field-default": func(v any) *SchemaNode {
+			return &SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+				{Name: "f", HasDefault: true, Default: v, Type: SchemaNode{Type: "int"}},
+			}}
+		},
+	}
+	for name, build := range valueSites {
+		t.Run("value-site/"+name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked: %v", r)
+				}
+			}()
+			_, err := build(deepMap()).Schema()
+			if err == nil || !strings.Contains(err.Error(), "value nests deeper") {
+				t.Fatalf("want the value depth bound to fire, got %v", err)
+			}
+		})
+	}
+
+	// The value walk mirrors json.Marshal's recursion into EVERY container kind,
+	// not just the map[string]any/[]any shapes Root() emits — a hand-built node
+	// can store any Go value the map[string]any field accepts. Each kind deep
+	// enough must hit the value depth bound; removing its arm from valueWalkLimit
+	// would let json.Marshal stack-overflow on that shape instead.
+	type box struct{ X any }
+	kinds := map[string]func() any{
+		"typed-slice": func() any {
+			var v any = "leaf"
+			for range deep {
+				v = []map[string]any{{"k": v}}
+			}
+			return v
+		},
+		"array": func() any {
+			var v any = "leaf"
+			for range deep {
+				v = [1]any{v}
+			}
+			return v
+		},
+		"struct": func() any {
+			var v any = "leaf"
+			for range deep {
+				v = box{X: v}
+			}
+			return v
+		},
+		"pointer": func() any {
+			var v any = "leaf"
+			for range deep {
+				x := v
+				v = &x
+			}
+			return v
+		},
+	}
+	for name, build := range kinds {
+		t.Run("value-kind/"+name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked: %v", r)
+				}
+			}()
+			node := &SchemaNode{Type: "int", Props: map[string]any{"x": build()}}
+			_, err := node.Schema()
+			if err == nil || !strings.Contains(err.Error(), "value nests deeper") {
+				t.Fatalf("want the value depth bound to fire for %s, got %v", name, err)
+			}
+		})
+	}
+}
+
+// Depth is not the only unbounded axis: a shared-reference DAG nests SHALLOW yet
+// fans out into a 2^depth tree when serialized, because neither toJSONWalk nor
+// json.Marshal memoizes shared references. The depth bound (which caps the
+// longest PATH) is blind to it — depth 60 here is ~120 allocated nodes but 2^60
+// emitted nodes, which would hang/OOM the process before Schema's eventual Parse
+// runs. The node-count budget bounds the total emitted nodes across the whole
+// walk (structural plus every value), shared so the combined json.Marshal cost
+// stays bounded. This pins the expansion axis on every channel — the cell the
+// three prior depth bounds all missed.
+func TestRegression_SchemaNodeSharedDAGExpansionBounded(t *testing.T) {
+	const fanout = 60 // 2^60 emitted nodes if unbounded; ~120 nodes in memory
+
+	// Run the build in a goroutine so a REGRESSION (a removed budget → an
+	// unbounded fan-out) fails this test via the timeout instead of hanging the
+	// whole suite. Post-fix the budget rejects in well under a second.
+	noHangReject := func(t *testing.T, build func() (*Schema, error), wantMsg string) {
+		t.Helper()
+		ch := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					ch <- fmt.Errorf("panicked: %v", r)
+				}
+			}()
+			_, err := build()
+			ch <- err
+		}()
+		select {
+		case err := <-ch:
+			if err == nil || !strings.Contains(err.Error(), wantMsg) {
+				t.Fatalf("want %q, got %v", wantMsg, err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("did not reject within 30s — the node budget is not bounding the fan-out")
+		}
+	}
+
+	// Structural fan-out: each level's Items AND Values point at the SAME child,
+	// so toJSONWalk re-walks it twice per level (the visited map is path-scoped,
+	// so off-path sharing is not a cycle).
+	t.Run("structural", func(t *testing.T) {
+		noHangReject(t, func() (*Schema, error) {
+			cur := &SchemaNode{Type: "long"}
+			for range fanout {
+				cur = &SchemaNode{Type: "array", Items: cur, Values: cur}
+			}
+			return cur.Schema()
+		}, "tree expands to more")
+	})
+
+	// Value fan-out at each of the three value sites: a map whose two keys share
+	// the same child value, compounded per level.
+	valDAG := func() any {
+		var v any = "leaf"
+		for range fanout {
+			inner := v
+			v = map[string]any{"a": inner, "b": inner}
+		}
+		return v
+	}
+	valueSites := map[string]func(any) *SchemaNode{
+		"node-props": func(v any) *SchemaNode {
+			return &SchemaNode{Type: "int", Props: map[string]any{"x": v}}
+		},
+		"field-props": func(v any) *SchemaNode {
+			return &SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+				{Name: "f", Type: SchemaNode{Type: "int"}, Props: map[string]any{"x": v}},
+			}}
+		},
+		"field-default": func(v any) *SchemaNode {
+			return &SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+				{Name: "f", HasDefault: true, Default: v, Type: SchemaNode{Type: "int"}},
+			}}
+		},
+	}
+	for name, build := range valueSites {
+		t.Run("value-site/"+name, func(t *testing.T) {
+			noHangReject(t, func() (*Schema, error) { return build(valDAG()).Schema() }, "value expands to more")
+		})
+	}
+
+	// The bare path (SchemaFor's hand-built CustomType.Schema, walked via toJSON
+	// with d==nil) truncates over-budget subtrees rather than erroring, so the
+	// invariant is simply that it TERMINATES instead of fanning out forever.
+	t.Run("schemafor-bare-path", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked: %v", r)
+			}
+		}()
+		type recForCustom struct{ F int32 }
+		ct := CustomType{
+			GoType: reflect.TypeOf(int32(0)),
+			Schema: &SchemaNode{Type: "int", Props: map[string]any{"x": valDAG()}},
+		}
+		done := make(chan struct{})
+		go func() {
+			_, _ = SchemaFor[recForCustom](WithCustomType(ct))
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("SchemaFor on a shared-DAG CustomType.Schema did not terminate")
+		}
+	})
+
+	// Boundary: the bound rejects compounding FAN-OUT, not all sharing. A benign
+	// shallow double-reference (json.Marshal expands it to two copies, cheaply)
+	// must still build — and a structural reuse of a named sub-node must dedup to
+	// a reference, not be rejected as fan-out.
+	t.Run("benign-sharing-builds", func(t *testing.T) {
+		shared := map[string]any{"k": "v"}
+		node := &SchemaNode{Type: "int", Props: map[string]any{"a": shared, "b": shared}}
+		if _, err := node.Schema(); err != nil {
+			t.Fatalf("a benign shallow double-reference should build, got %v", err)
+		}
+		inner := &SchemaNode{Type: "record", Name: "Inner", Fields: []SchemaField{{Name: "n", Type: SchemaNode{Type: "long"}}}}
+		reuse := &SchemaNode{Type: "record", Name: "Outer", Fields: []SchemaField{
+			{Name: "a", Type: SchemaNode{Type: "array", Items: inner}},
+			{Name: "b", Type: SchemaNode{Type: "array", Items: inner}},
+		}}
+		if _, err := reuse.Schema(); err != nil {
+			t.Fatalf("reusing a named sub-node (deduped to a ref) should build, got %v", err)
+		}
 	})
 }
 
