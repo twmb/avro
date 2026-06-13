@@ -288,13 +288,16 @@ func findWriterField(rf fieldNode, writerFields map[string]*fieldNode) *fieldNod
 }
 
 // findMatchingBranch finds the best reader union branch for the writer
-// node. Three tiers, matching Java/fastavro: full-name (or alias-full-
-// name) for named types beats unqualified-name match, which beats
-// promotion. The unqualified-name tier preserves the lenient match that
-// CheckCompatibility's simple writer-vs-reader case relies on (different
-// namespaces, same logical type). Exact-match must win over it because
-// the spec permits a union to contain multiple named types with the
-// same unqualified name and different namespaces.
+// node. Three tiers: full-name (or alias-full-name) for named types beats
+// unqualified-name match, which beats promotion. The unqualified-name tier
+// applies to record, enum, AND fixed — matching fastavro's match_types.
+// (Java's firstMatchingBranch does this structural short-name match only for
+// records; enum and fixed require an exact full-name match inside a union.
+// twmb deliberately follows fastavro's more uniform rule here.) The tier also
+// preserves the lenient match that CheckCompatibility's simple writer-vs-
+// reader case relies on (different namespaces, same logical type). Exact-
+// match must win over it because the spec permits a union to contain multiple
+// named types with the same unqualified name and different namespaces.
 //
 // Single-pass best-tier scan: equivalent to three sequential walks but
 // shorter; ties resolve by declaration order.
