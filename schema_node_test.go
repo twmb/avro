@@ -912,17 +912,71 @@ func TestRegression_SchemaNodeSchemaDeepValueBounded(t *testing.T) {
 	// terminate instead of crashing the process; the bare path truncates the
 	// over-deep value rather than erroring (mirroring the structural walk's
 	// documented bare-path behavior), so the assertion is simply that it
-	// returns without a stack-overflow death.
+	// returns without a stack-overflow death. The CustomType.Schema is embedded
+	// (and its value walk runs) ONLY when a struct FIELD matches the custom
+	// GoType — SchemaFor over a non-struct errors before any walk — so this uses
+	// a struct field, and a typed-container value to cover the broadened bound.
 	t.Run("SchemaFor custom-schema deep value terminates", func(t *testing.T) {
 		var v any = "leaf"
 		for range maxSchemaJSONDepth + 50 {
-			v = map[string]any{"k": v}
+			v = []map[string]any{{"k": v}}
 		}
+		type recForCustom struct{ F int32 }
 		ct := CustomType{
 			GoType: reflect.TypeOf(int32(0)),
 			Schema: &SchemaNode{Type: "int", Props: map[string]any{"deep": v}},
 		}
-		_, _ = SchemaFor[int32](WithCustomType(ct))
+		_, _ = SchemaFor[recForCustom](WithCustomType(ct))
+	})
+
+	// json.Marshal recurses into EVERY container kind, not just the
+	// map[string]any / []any shapes Root() produces. A hand-built node can store
+	// any value the map[string]any field accepts; a TYPED container nests just
+	// as deeply yet was invisible to a map[string]any/[]any-only depth check, so
+	// it reached json.Marshal unbounded and overflowed the goroutine stack. The
+	// bound must cover the typed shapes too.
+	t.Run("typed-container props value rejected", func(t *testing.T) {
+		var v any = "leaf"
+		for range maxSchemaJSONDepth + 50 {
+			v = []map[string]any{{"k": v}} // []map[string]any: NOT []any, NOT map[string]any
+		}
+		node := &SchemaNode{Type: "int", Props: map[string]any{"x": v}}
+		_, err := node.Schema()
+		if err == nil {
+			t.Fatal("expected a bounded error for an over-deep typed-container Props value, got nil")
+		}
+		if !strings.Contains(err.Error(), "value nests deeper") {
+			t.Fatalf("expected the value-channel depth bound to fire (not a post-marshal Parse error), got %v", err)
+		}
+	})
+
+	// Boundary-1: a typed container nested well below the cap must still build —
+	// the broadened walk must not false-reject legitimate typed values.
+	t.Run("usable typed-container builds", func(t *testing.T) {
+		var v any = "leaf"
+		for range 200 {
+			v = []map[string]any{{"k": v}}
+		}
+		node := &SchemaNode{Type: "int", Props: map[string]any{"x": v}}
+		s, err := node.Schema()
+		if err != nil {
+			t.Fatalf("a 200-deep typed-container Props value should build, got %v", err)
+		}
+		if got := s.Root().Props["x"]; got == nil {
+			t.Fatal("the usable-depth typed-container Props value was dropped")
+		}
+	})
+
+	// A cyclic Go type (type P *P) has an infinite reflect-value chain. The walk
+	// decrements its budget on every indirection, so it must TERMINATE with the
+	// bound rather than recursing forever (the trap a reflect indirection walk
+	// without a bound would fall into) — Schema returns, no hang, no crash.
+	t.Run("cyclic pointer value terminates", func(t *testing.T) {
+		type selfPtr *selfPtr
+		var p selfPtr
+		p = &p // p points to itself: p.Elem() == p, an unbounded pointer chain
+		node := &SchemaNode{Type: "int", Props: map[string]any{"x": p}}
+		_, _ = node.Schema() // must return (the bound stops the walk), not hang
 	})
 }
 

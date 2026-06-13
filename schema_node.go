@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -316,30 +317,61 @@ func applyJSONFixup(v any) any {
 
 // valueNestsTooDeep reports whether v — a Props value or a
 // SchemaField.Default, an arbitrary user-supplied JSON tree — nests its
-// map/slice container layers deeper than remaining. It is the value-channel
-// analogue of toJSONWalk's structural depth bound: a Props/Default value is
-// handed to jsonSerializableValue (needsJSONFixup/applyJSONFixup) and then to
+// container layers deeper than remaining. It is the value-channel analogue of
+// toJSONWalk's structural depth bound: a Props/Default value is handed to
+// jsonSerializableValue (needsJSONFixup/applyJSONFixup) and then to
 // json.Marshal at [SchemaNode.Schema], none of which bounds recursion, so a
-// hand-built value nested far enough overflows the goroutine stack
-// uncatchably before Schema's eventual Parse (whose maxSchemaJSONDepth
-// pre-scan would have rejected the JSON) can run. The check short-circuits as
-// soon as it descends one level past remaining, so it never recurses deeper
-// than the bound it enforces — a hostile value cannot overflow the check
-// itself.
+// hand-built value nested far enough overflows the goroutine stack uncatchably
+// before Schema's eventual Parse (whose maxSchemaJSONDepth pre-scan would have
+// rejected the JSON) can run.
+//
+// The walk mirrors what json.Marshal recurses into — maps, slices, arrays,
+// structs, and pointer/interface indirection — not just the map[string]any /
+// []any shapes [Schema.Root] produces. A hand-built node (or a SchemaFor
+// CustomType.Schema) can store ANY Go value the map[string]any field accepts;
+// a typed container ([]map[string]any, a struct, a []*T chain) marshals just as
+// deeply but was invisible to a map[string]any/[]any-only type switch, so it
+// reached json.Marshal unbounded. remaining is decremented on EVERY descent
+// (indirection included), so the check terminates after at most `remaining`
+// recursive calls — it can neither overflow its own stack nor hang on a cyclic
+// Go type (type P *P), and []byte/[N]byte (a base64/number scalar to
+// json.Marshal, never a nested array) short-circuit.
 func valueNestsTooDeep(v any, remaining int) bool {
+	return valueNestsTooDeepValue(reflect.ValueOf(v), remaining)
+}
+
+func valueNestsTooDeepValue(rv reflect.Value, remaining int) bool {
 	if remaining < 0 {
 		return true
 	}
-	switch tv := v.(type) {
-	case map[string]any:
-		for _, e := range tv {
-			if valueNestsTooDeep(e, remaining-1) {
+	switch rv.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		if rv.IsNil() {
+			return false
+		}
+		return valueNestsTooDeepValue(rv.Elem(), remaining-1)
+	case reflect.Map:
+		for iter := rv.MapRange(); iter.Next(); {
+			if valueNestsTooDeepValue(iter.Value(), remaining-1) {
 				return true
 			}
 		}
-	case []any:
-		for _, e := range tv {
-			if valueNestsTooDeep(e, remaining-1) {
+	case reflect.Slice, reflect.Array:
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return false // []byte/[N]byte → base64/number scalar, not a nested array
+		}
+		for i := 0; i < rv.Len(); i++ {
+			if valueNestsTooDeepValue(rv.Index(i), remaining-1) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		t := rv.Type()
+		for i := 0; i < rv.NumField(); i++ {
+			if !t.Field(i).IsExported() {
+				continue // json.Marshal skips unexported fields
+			}
+			if valueNestsTooDeepValue(rv.Field(i), remaining-1) {
 				return true
 			}
 		}
