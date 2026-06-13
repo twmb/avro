@@ -446,7 +446,23 @@ func boundedSerializableValue(d *deduper, depth int, nodes *int, v any) any {
 // or nil (for unnamed).
 func (n *SchemaNode) toJSON() any {
 	nodes := maxSchemaJSONNodes
-	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0, &nodes)
+	return n.toJSONShared(&nodes)
+}
+
+// toJSONShared snapshots n's full JSON body (no dedup) for the conflict
+// comparison in toJSONWalk, charging the SHARED per-walk node budget rather
+// than a fresh one. A named type that re-occurs as a DISTINCT pointer with an
+// identical body triggers a 2x re-marshal of its whole subtree; with k such
+// copies of a w-node body that is O(k*w) work, and because the dedup walk only
+// charges 1 node per re-occurrence (it emits a bare reference, not the body),
+// the outer budget alone leaves k*w unbounded even though the emitted schema is
+// tiny (one definition + k-1 references). Sharing the budget caps the total
+// comparison work at maxSchemaJSONNodes. Once the budget is exhausted the walk
+// returns truncated output; the caller checks *nodes and reports over-budget
+// rather than a spurious body conflict (asymmetric truncation of n vs prev
+// could otherwise make identical bodies compare unequal).
+func (n *SchemaNode) toJSONShared(nodes *int) any {
+	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0, nodes)
 }
 
 // toJSONWalk is the cycle-aware walker shared by toJSON and toJSONDedup.
@@ -534,10 +550,21 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			// comparison to an actual collision keeps the common all-
 			// distinct-names case O(n) instead of marshaling every named
 			// type's full subtree eagerly (O(depth*subtree) on nesting).
+			// The comparison marshals share the walk's node budget
+			// (toJSONShared, not toJSON) so many identical-bodied distinct-
+			// pointer duplicates cannot amplify into O(k*subtree) work outside
+			// the bound — see toJSONShared.
 			if prev != n && d.err == nil {
-				cur, _ := json.Marshal(n.toJSON())
-				prevB, _ := json.Marshal(prev.toJSON())
-				if string(cur) != string(prevB) {
+				cur, _ := json.Marshal(n.toJSONShared(nodes))
+				prevB, _ := json.Marshal(prev.toJSONShared(nodes))
+				switch {
+				case *nodes <= 0:
+					// The comparison exhausted the shared budget: the
+					// duplicated subtree is large enough to blow the bound, so
+					// the truncated bodies can't be compared reliably. Report
+					// over-budget, matching toJSONWalk's other over-limit exits.
+					d.err = fmt.Errorf("avro: SchemaNode tree expands to more than the supported %d nodes", maxSchemaJSONNodes)
+				case string(cur) != string(prevB):
 					d.err = fmt.Errorf("avro: conflicting definitions for named type %q", truncForError(nodeFullname(n)))
 				}
 			}

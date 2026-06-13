@@ -1263,6 +1263,93 @@ func TestRegression_SchemaNodeSharedDAGExpansionBounded(t *testing.T) {
 	})
 }
 
+// TestRegression_SchemaNodeDuplicateNamedDefinitionBounded pins that
+// SchemaNode.Schema()'s dedup conflict check bounds its cost by the SHARED
+// per-walk node budget. When a named type re-occurs as a DISTINCT pointer with
+// an identical body, the body is marshal-compared against the first definition
+// to detect a conflicting redefinition; that comparison must charge the same
+// maxSchemaJSONNodes budget the rest of the walk uses (toJSONShared), so k
+// identical-bodied copies of a w-node definition cost O(maxSchemaJSONNodes),
+// not O(k*w) -- even though the emitted schema is tiny (one definition plus
+// k-1 name references). If the comparison re-marshals each copy on a fresh
+// budget, k*w can reach the budget SQUARED while k+w stays within it, an
+// amplification reachable from a hand-built node via the public Schema() API.
+func TestRegression_SchemaNodeDuplicateNamedDefinitionBounded(t *testing.T) {
+	// "Dup": a record with w long fields. The outer record references it via k
+	// distinct-pointer copies (value copies => &Fields[i].Type are distinct,
+	// bodies byte-identical). Valid Avro: a record may have many fields of one
+	// named type, so the dedup yields one Dup definition + k-1 references.
+	buildDup := func(w int) SchemaNode {
+		fields := make([]SchemaField, w)
+		for i := range fields {
+			fields[i] = SchemaField{Name: fmt.Sprintf("g%d", i), Type: SchemaNode{Type: "long"}}
+		}
+		return SchemaNode{Type: "record", Name: "Dup", Fields: fields}
+	}
+	buildOuter := func(dup SchemaNode, k int) *SchemaNode {
+		fields := make([]SchemaField, k)
+		for i := range fields {
+			fields[i] = SchemaField{Name: fmt.Sprintf("f%d", i), Type: dup}
+		}
+		return &SchemaNode{Type: "record", Name: "Outer", Fields: fields}
+	}
+
+	t.Run("many-large-duplicates-bounded", func(t *testing.T) {
+		// w*k = 2.25M; an unbounded conflict marshal would re-emit ~2*w*k nodes
+		// (far past maxSchemaJSONNodes) while the output is one Dup def + refs.
+		// The shared budget caps total work and rejects over-budget. Run in a
+		// goroutine so a regression (fresh-budget re-marshal restored) surfaces
+		// as the timeout instead of hanging the suite; the bounded reject
+		// finishes well under it.
+		node := buildOuter(buildDup(1500), 1500)
+		ch := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					ch <- fmt.Errorf("panicked: %v", r)
+				}
+			}()
+			_, err := node.Schema()
+			ch <- err
+		}()
+		select {
+		case err := <-ch:
+			if err == nil || !strings.Contains(err.Error(), "expands to more") {
+				t.Fatalf("want an over-budget rejection (the conflict marshal must share the node budget), got %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("did not complete within 30s — the conflict-comparison marshal is not bounded by the shared node budget")
+		}
+	})
+
+	t.Run("legit-duplication-builds", func(t *testing.T) {
+		// A handful of distinct-pointer copies of a small named type build fine
+		// and dedup to one definition + references — the boundary the bound
+		// must NOT false-reject. (If dedup failed, Parse would reject the
+		// repeated "Dup" name, so a successful build proves the dedup ran.)
+		s, err := buildOuter(buildDup(3), 5).Schema()
+		if err != nil {
+			t.Fatalf("legitimate small duplication should build, got %v", err)
+		}
+		if _, err := Parse(s.String()); err != nil {
+			t.Fatalf("deduped schema must re-parse, got %v", err)
+		}
+	})
+
+	t.Run("conflicting-bodies-errors", func(t *testing.T) {
+		// Distinct-pointer, same fullname, DIFFERENT bodies => a genuine
+		// redefinition conflict the bound must still surface.
+		a := SchemaNode{Type: "record", Name: "C", Fields: []SchemaField{{Name: "x", Type: SchemaNode{Type: "long"}}}}
+		b := SchemaNode{Type: "record", Name: "C", Fields: []SchemaField{{Name: "y", Type: SchemaNode{Type: "string"}}}}
+		node := &SchemaNode{Type: "record", Name: "Outer", Fields: []SchemaField{
+			{Name: "a", Type: a}, {Name: "b", Type: b},
+		}}
+		if _, err := node.Schema(); err == nil || !strings.Contains(err.Error(), "conflicting definitions") {
+			t.Fatalf("want a conflicting-definitions error, got %v", err)
+		}
+	})
+}
+
 func TestSchemaNodeUnmarshalablePropsErrors(t *testing.T) {
 	// json.Marshal rejects channels, funcs, complex numbers.
 	node := SchemaNode{
