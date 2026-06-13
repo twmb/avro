@@ -1102,6 +1102,96 @@ func TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill(t *testing.T) 
 	}
 }
 
+// The decode-side companion to the encoder default-fill bypass: when a reader
+// field is ABSENT from the writer and filled from its default through schema
+// resolution, the field's custom Decode must fire EXACTLY ONCE on the SAME raw
+// (logical-suppressed) Avro-native value a natural decode would feed it — on
+// both the resolved binary and resolved JSON paths. This pins resolveRecord's
+// default-fill deser construction (resolve.go): the reader field node's deser
+// is the raw, logical-suppressed deser, and the custom decoder chain is wrapped
+// onto it once. A double-wrap (custom fires twice) or feeding the callback the
+// enriched logical value (instead of the raw int64) are the two regressions
+// this guards. The ×10 transform makes "the callback fired" distinguishable
+// from a plain raw coercion that happens to coincide in value.
+func TestRegression_ResolvedDefaultFillFiresCustomDecodeOnceRaw(t *testing.T) {
+	var decodeCalls int
+	var lastIn any
+	ct := CustomType{
+		LogicalType: "money",
+		AvroType:    "long",
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			decodeCalls++
+			lastIn = v
+			return v.(int64) * 10, nil
+		},
+	}
+	reader := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":{"type":"long","logicalType":"money"},"default":42}
+	]}`, ct)
+	writer := MustParse(`{"type":"record","name":"R","fields":[]}`)
+	res, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	// Reference: a NATURAL decode of an explicit f=42 fires the custom once on
+	// the raw int64(42) (the money logical is suppressed because a CustomType
+	// matched) and yields the ×10 transform.
+	wireExplicit, err := reader.AppendEncode(nil, map[string]any{"f": int64(42)})
+	if err != nil {
+		t.Fatalf("encode explicit: %v", err)
+	}
+	decodeCalls, lastIn = 0, nil
+	var natOut map[string]any
+	if _, err := reader.Decode(wireExplicit, &natOut); err != nil {
+		t.Fatalf("natural decode: %v", err)
+	}
+	if decodeCalls != 1 {
+		t.Fatalf("natural decode fired custom %d times, want 1", decodeCalls)
+	}
+	if _, ok := lastIn.(int64); !ok {
+		t.Fatalf("natural custom got %T, want raw int64 (logical suppressed)", lastIn)
+	}
+	if natOut["f"] != int64(420) {
+		t.Fatalf("natural out[f]=%v, want int64(420) (×10 of raw 42)", natOut["f"])
+	}
+
+	// Default-fill through Resolve must match the natural reference on both
+	// resolved wire formats: writer omits f, reader fills default 42.
+	wBin, err := writer.AppendEncode(nil, map[string]any{})
+	if err != nil {
+		t.Fatalf("encode empty bin: %v", err)
+	}
+	wJSON, err := writer.AppendEncodeJSON(nil, map[string]any{})
+	if err != nil {
+		t.Fatalf("encode empty json: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		decode func() (map[string]any, error)
+	}{
+		{"binary", func() (map[string]any, error) { var m map[string]any; _, e := res.Decode(wBin, &m); return m, e }},
+		{"json", func() (map[string]any, error) { m := map[string]any{}; e := res.DecodeJSON(wJSON, &m); return m, e }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decodeCalls, lastIn = 0, nil
+			out, err := tc.decode()
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if decodeCalls != 1 {
+				t.Fatalf("default-fill fired custom Decode %d times, want exactly 1 (double-wrap or skip)", decodeCalls)
+			}
+			if _, ok := lastIn.(int64); !ok {
+				t.Fatalf("default-fill custom got %T, want raw int64 matching natural decode (logical suppressed)", lastIn)
+			}
+			if out["f"] != int64(420) {
+				t.Fatalf("default-fill out[f]=%T(%v), want int64(420) — the ×10 transform of raw default 42, identical to natural decode", out["f"], out["f"])
+			}
+		})
+	}
+}
+
 // A custom-decoded value whose decode TARGET is a recursive pointer type
 // (cyclic type graph: ctRecursivePtr's element is itself) must terminate with
 // an error, not loop forever allocating a pointer level per iteration.
