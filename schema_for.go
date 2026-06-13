@@ -395,39 +395,63 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 	//      path) wins. Without this, dedup keeps first-seen — the deeper
 	//      embedded field — because nested-struct fields are appended to
 	//      raw BEFORE outer fields.
-	//   3. Only a same-depth collision with the SAME tagged status is
-	//      genuinely ambiguous: two sibling fields disagree on who owns the
-	//      name, so silently picking one would cause data loss at encode
-	//      time. Java's RecordSchema.setFields rejects a true duplicate with
-	//      "Duplicate field" (Schema.java:981); hamba rejects similarly.
+	//   3. Only a same-depth collision with the SAME tagged status AT THE
+	//      WINNING DEPTH is genuinely ambiguous: two sibling fields disagree
+	//      on who owns the name, so silently picking one would cause data
+	//      loss at encode time. Java's RecordSchema.setFields rejects a true
+	//      duplicate with "Duplicate field" (Schema.java:981); hamba rejects
+	//      similarly. The ambiguity decision is DEFERRED, not eager: a
+	//      shallower field declared LATER (the common "embeds first, own
+	//      fields after" layout) resolves a same-depth deep collision, so it
+	//      must be allowed to clear the ambiguity — exactly as typeFieldMapping
+	//      and Go's own field promotion do. Erroring the instant two deep
+	//      fields collide would reject a struct whose name a shallower field
+	//      unambiguously owns.
 	type entry struct {
 		idx int
 		schemaField
 	}
 	m := make(map[string]entry, len(raw))
+	ambiguous := make(map[string][2]string) // name -> the two colliding Go field names
 	for i, f := range raw {
 		if existing, ok := m[f.name]; ok {
 			// Tag tiebreaker first: tagged beats untagged regardless of
 			// depth, so a tagged/untagged pair is resolved, never ambiguous.
 			if f.tagged && !existing.tagged {
 				m[f.name] = entry{i, f}
+				delete(ambiguous, f.name)
 				continue
 			}
 			if !f.tagged && existing.tagged {
 				continue
 			}
-			// Same tagged status: a same-depth collision is the ambiguous
-			// case; otherwise the shallower field wins.
-			if len(f.index) == len(existing.index) {
-				return nil, fmt.Errorf("avro: duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
-					truncForError(f.name), t.String(), truncForError(t.FieldByIndex(existing.index).Name), truncForError(t.FieldByIndex(f.index).Name))
-			}
+			// Same tagged status: the shallower field wins and clears any
+			// ambiguity a deeper collision recorded; only a collision that
+			// survives at the winning (shallowest) depth is genuinely
+			// ambiguous, and that is decided after the full walk below.
 			if len(f.index) < len(existing.index) {
 				m[f.name] = entry{i, f}
+				delete(ambiguous, f.name)
+				continue
+			}
+			if len(f.index) == len(existing.index) {
+				ambiguous[f.name] = [2]string{t.FieldByIndex(existing.index).Name, t.FieldByIndex(f.index).Name}
 			}
 			continue
 		}
 		m[f.name] = entry{i, f}
+	}
+
+	// A name still marked ambiguous after the full walk has two fields at its
+	// winning depth with the same tagged status and no shallower resolver.
+	// SchemaFor must emit every field, so it rejects here (the schema-driven
+	// runtime mapper instead defers the error to a lookup of the specific
+	// name). Report deterministically by raw encounter order.
+	for _, f := range raw {
+		if names, amb := ambiguous[f.name]; amb {
+			return nil, fmt.Errorf("avro: duplicate field name %q in type %s (fields %q and %q both map to the same Avro name)",
+				truncForError(f.name), t.String(), truncForError(names[0]), truncForError(names[1]))
+		}
 	}
 
 	// Preserve encounter order.

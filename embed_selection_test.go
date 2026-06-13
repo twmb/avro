@@ -281,3 +281,90 @@ func TestRegression_EmbedEqualDepthAmbiguity(t *testing.T) {
 		t.Fatal("decode must reject the ambiguous name too (encode/decode parity)")
 	}
 }
+
+// A name that a higher-priority field unambiguously OWNS is not an ambiguous
+// collision, even when lower-priority fields collide among themselves at a
+// deeper-or-equal level. SchemaFor must accept such a struct and infer the
+// single winning field, matching the runtime field mapper (typeFieldMapping)
+// and Go's own field promotion — both of which resolve the name. The
+// resolution is DEFERRED: the resolving field may be declared AFTER the
+// colliding pair (the common "embeds first, own fields after" layout), so
+// erroring the instant two deep fields collide wrongly rejects a struct whose
+// name a shallower or tagged field owns. The encode/decode round-trip is the
+// parity oracle: SchemaFor's inferred mapping must match what the codec uses.
+func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
+	t.Run("shallower field declared last resolves a deep collision", func(t *testing.T) {
+		type EmbA struct{ Name string } // depth 2, untagged
+		type EmbB struct{ Name string } // depth 2, untagged
+		type Outer struct {
+			EmbA
+			EmbB
+			Name string // depth 1, declared last: Go resolves Outer.Name here
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("SchemaFor must accept a struct whose name a shallower field owns: %v", err)
+		}
+		root := s.Root()
+		if len(root.Fields) != 1 || root.Fields[0].Name != "Name" {
+			t.Fatalf("expected a single inferred field %q, got %s", "Name", s.String())
+		}
+		// Parity: the codec maps "Name" to the direct (shallowest) field.
+		wire, err := s.AppendEncode(nil, Outer{Name: "direct"})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got Outer
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.Name != "direct" {
+			t.Fatalf("\"Name\" mapped to a shadowed field, not the direct one: %+v", got)
+		}
+	})
+
+	t.Run("tagged field declared last resolves a same-depth untagged collision", func(t *testing.T) {
+		type EmbA struct{ Name string }                     // depth 2, untagged
+		type EmbB struct{ Name string }                     // depth 2, untagged
+		type EmbTagged struct{ Other string `avro:"Name"` } // depth 2, tagged "Name"
+		type Outer struct {
+			EmbA
+			EmbB
+			EmbTagged // tag tiebreak wins over the untagged pair at the same depth
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("SchemaFor must accept a struct whose name a tagged field owns: %v", err)
+		}
+		if len(s.Root().Fields) != 1 {
+			t.Fatalf("expected a single inferred field, got %s", s.String())
+		}
+		// Parity: the codec maps "Name" to the tagged field.
+		wire, err := s.AppendEncode(nil, Outer{EmbTagged: EmbTagged{Other: "tagged"}})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got Outer
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.EmbTagged.Other != "tagged" {
+			t.Fatalf("\"Name\" mapped to an untagged field, not the tagged one: %+v", got)
+		}
+	})
+
+	// Boundary the other direction: a same-depth same-tagged collision with NO
+	// higher-priority resolver is genuinely ambiguous and must STILL reject —
+	// the fix defers the decision, it does not disable it.
+	t.Run("unresolved same-depth collision still rejects", func(t *testing.T) {
+		type EmbA struct{ Dup int32 }
+		type EmbB struct{ Dup int32 }
+		type Outer struct {
+			EmbA
+			EmbB
+		}
+		if _, err := SchemaFor[Outer](); err == nil {
+			t.Fatal("a genuinely ambiguous same-depth collision must still reject")
+		}
+	})
+}
