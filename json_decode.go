@@ -58,6 +58,11 @@ func decodeLogicalLong(val int64, node *schemaNode) (any, error) {
 // payloads.
 func decodeLogicalBytes(b []byte, node *schemaNode) (any, error) {
 	if node.logical == "decimal" {
+		// Bound the unscaled length before bytesToRat materializes/converts —
+		// the into-any path bypasses setDecimalValue (see maxDecimalUnscaledBytes).
+		if err := checkDecimalUnscaledLen(b); err != nil {
+			return nil, err
+		}
 		return bytesToRat(b, node.scale), nil
 	}
 	if node.logical == "big-decimal" {
@@ -734,6 +739,15 @@ func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny, ra
 	// produces exactly that length. Reject mismatches symmetrically.
 	if len(b) != node.size {
 		return fmt.Errorf("avro json: fixed value has %d bytes, schema declares %d", len(b), node.size)
+	}
+	if !raw && node.logical == "decimal" {
+		// The fixed-decimal into-any path goes through decodeLogicalFixed (no
+		// error return), bypassing setDecimalValue's bound — cap the unscaled
+		// length here so a huge fixed-decimal can't drive the base conversion
+		// (see maxDecimalUnscaledBytes).
+		if err := checkDecimalUnscaledLen(b); err != nil {
+			return err
+		}
 	}
 	if toAny {
 		if raw {

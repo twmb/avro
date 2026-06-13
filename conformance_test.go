@@ -21824,3 +21824,103 @@ func TestRegression_JSONNumberStringySchemasRejectEncode(t *testing.T) {
 		t.Errorf("long schema must accept json.Number(42): %v", err)
 	}
 }
+
+// A decimal whose SCALE is legal but whose UNSCALED value is large drives
+// big.Int materialization + big.Rat.FloatString (json.Number/string targets)
+// or big.Rat.SetFrac GCD (high-scale targets) — O(M(n)*log n) on a
+// multi-megabit integer (~2.7s for a 1 MiB unscaled value). decimalScaleLimit
+// bounds the scale, not the unscaled length, and the desers never see
+// precision; precision is parse-capped at decimalScaleLimit so a legitimate
+// unscaled value needs <= ~27 KiB, well under the 32 KiB maxDecimalUnscaledBytes
+// cap. The cap must apply on EVERY decode entry point (bytes/fixed/big-decimal,
+// binary and JSON, every target type) — Java/fastavro/avro-rs store
+// significand+scale and never base-convert, so this is twmb-specific defense.
+func TestRegression_DecimalUnscaledLengthDoS(t *testing.T) {
+	const cap = 32 << 10 // must match maxDecimalUnscaledBytes (deser.go)
+
+	avroBytesField := func(b []byte) []byte { return append(zigzagEncode64(int64(len(b))), b...) }
+	bigDecWire := func(uBytes []byte) []byte { // length-prefixed unscaled || zigzag scale(0), all wrapped as a bytes field
+		inner := append(avroBytesField(uBytes), zigzagEncode64(0)...)
+		return avroBytesField(inner)
+	}
+
+	bytesDec := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":65536,"scale":0}`)
+	bigDec := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
+	fixedDec := avro.MustParse(fmt.Sprintf(`{"type":"fixed","name":"F","size":%d,"logicalType":"decimal","precision":65536,"scale":0}`, cap+1))
+
+	// 0x55 has its sign bit clear -> a large POSITIVE magnitude (not -1).
+	hostileUnscaled := bytes.Repeat([]byte{0x55}, 1<<20) // ~1 MiB
+
+	// Hostile inputs must reject FAST (<100ms) at every entry point/target.
+	hostile := []struct {
+		name string
+		s    *avro.Schema
+		wire []byte
+	}{
+		{"binary-bytes-decimal", bytesDec, avroBytesField(hostileUnscaled)},
+		{"binary-big-decimal", bigDec, bigDecWire(hostileUnscaled)},
+		{"binary-fixed-decimal", fixedDec, bytes.Repeat([]byte{0x55}, cap+1)},
+	}
+	for _, tc := range hostile {
+		for _, tgt := range []string{"jsonNumber", "bigRat", "any"} {
+			t.Run(tc.name+"/"+tgt, func(t *testing.T) {
+				var dst any
+				switch tgt {
+				case "jsonNumber":
+					var x json.Number
+					dst = &x
+				case "bigRat":
+					var x big.Rat
+					dst = &x
+				default:
+					var x any
+					dst = &x
+				}
+				start := time.Now()
+				_, err := tc.s.Decode(tc.wire, dst)
+				if d := time.Since(start); d > 100*time.Millisecond {
+					t.Fatalf("decode took %s (>100ms): unbounded decimal unscaled-length DoS", d)
+				}
+				if err == nil {
+					t.Fatalf("over-length decimal: want rejection, got nil error")
+				}
+			})
+		}
+	}
+
+	// JSON codepoint-string form (the spec form) must also reject fast. 0x55
+	// is ASCII 'U', so the codepoint string needs no escaping.
+	t.Run("json-codepoint-bytes-decimal", func(t *testing.T) {
+		jsonWire := []byte(`"` + strings.Repeat("U", 1<<20) + `"`)
+		var x json.Number
+		start := time.Now()
+		err := bytesDec.DecodeJSON(jsonWire, &x)
+		if d := time.Since(start); d > 100*time.Millisecond {
+			t.Fatalf("DecodeJSON took %s (>100ms): unbounded decimal unscaled-length DoS", d)
+		}
+		if err == nil {
+			t.Fatalf("over-length decimal via JSON codepoint form: want rejection, got nil")
+		}
+	})
+
+	// Boundary-1: a value AT the cap still decodes AND stays fast (the cost
+	// must not merely move from the rejected extreme into the accepted path).
+	t.Run("accept-at-cap", func(t *testing.T) {
+		var x json.Number
+		start := time.Now()
+		if _, err := bytesDec.Decode(avroBytesField(bytes.Repeat([]byte{0x55}, cap)), &x); err != nil {
+			t.Fatalf("at-cap decimal must decode: %v", err)
+		}
+		if d := time.Since(start); d > 100*time.Millisecond {
+			t.Fatalf("at-cap decimal decode took %s (>100ms): cap too loose", d)
+		}
+	})
+
+	// Non-vacuity: a small decimal still decodes correctly.
+	t.Run("small", func(t *testing.T) {
+		var x json.Number
+		if _, err := bytesDec.Decode(avroBytesField([]byte{0x2a}), &x); err != nil || x != "42" {
+			t.Fatalf("small decimal: x=%q err=%v", x, err)
+		}
+	})
+}

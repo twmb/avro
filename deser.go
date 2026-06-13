@@ -698,6 +698,33 @@ const decimalScaleLimit = 1 << 16
 // has to live at the boundary the parsing actually crosses.
 const maxRatInputLen = 1 << 17 // 128 KiB
 
+// maxDecimalUnscaledBytes caps the byte length of a decimal / big-decimal
+// UNSCALED value accepted on decode — the orthogonal axis to decimalScaleLimit
+// (which caps the SCALE). A schema's precision is parse-capped at
+// decimalScaleLimit (schema.go), so a minimally-encoded unscaled value within
+// the declared precision needs at most ceil(decimalScaleLimit*log2(10)/8) ~=
+// 27 KiB; 32 KiB clears that with margin, so no parse-valid decimal is ever
+// rejected. Beyond it, materializing the big.Int and base-converting it via
+// big.Rat.FloatString (json.Number / string targets) or GCD-reducing
+// big.Rat.SetFrac (high-scale targets) is O(M(n)*log n) on a multi-megabit
+// integer — a 1 MiB unscaled value spends ~1 s — so reject before the
+// conversion. Java/fastavro/avro-rs store significand+scale and never
+// base-convert, so they have no such cost; this is twmb-specific DoS defense,
+// like decimalScaleLimit. (The bare-number JSON form is bounded separately by
+// maxRatInputLen via boundedRatFromString.)
+const maxDecimalUnscaledBytes = 32 << 10
+
+// checkDecimalUnscaledLen rejects an over-long decimal unscaled value before
+// the big.Int materialization / base conversion it would otherwise drive (see
+// maxDecimalUnscaledBytes). Shared by the bytes-, fixed-, and big-decimal
+// decode paths on both wire formats so the bound cannot drift between them.
+func checkDecimalUnscaledLen(b []byte) error {
+	if len(b) > maxDecimalUnscaledBytes {
+		return fmt.Errorf("decimal unscaled value of %d bytes exceeds %d byte limit", len(b), maxDecimalUnscaledBytes)
+	}
+	return nil
+}
+
 // isJSONNumber reports whether s is a JSON number per RFC 8259.
 // json.Valid validates the grammar; the boundary-whitespace and
 // first-char checks reject (a) whitespace-padded numbers (JSON's
@@ -2100,6 +2127,14 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 // false if v's Go type is not supported by the decimal decoder (caller
 // may fall back to the underlying bytes/fixed handler).
 func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
+	// Bound the unscaled length before bytesToRat materializes a big.Int and
+	// setDecimalRat base-converts it (see maxDecimalUnscaledBytes). Returning
+	// (true, err) makes the binary deserBytesDecimal / deserFixedDecimal and
+	// JSON assignBytes callers surface the error instead of falling through to
+	// the opaque-bytes path.
+	if err := checkDecimalUnscaledLen(b); err != nil {
+		return true, err
+	}
 	return setDecimalRat(v, bytesToRat(b, scale), scale)
 }
 
@@ -2227,6 +2262,9 @@ func parseBigDecimalPayload(payload []byte) (*big.Rat, int, error) {
 	}
 	uBytes := p[:uLen]
 	p = p[uLen:]
+	if err := checkDecimalUnscaledLen(uBytes); err != nil {
+		return nil, 0, err
+	}
 	scale, p, err := readVarlong(p)
 	if err != nil {
 		return nil, 0, fmt.Errorf("big-decimal scale: %w", err)
@@ -2269,8 +2307,9 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 //
 // Negative scale is interpreted as `unscaled * 10^|scale|` (matching
 // Java/avro-rs big-decimal semantics). |scale| is bounded by
-// decimalScaleLimit; scales beyond produce a zero *big.Rat rather
-// than allocating unbounded.
+// decimalScaleLimit and the unscaled byte length by maxDecimalUnscaledBytes;
+// inputs beyond either bound produce a zero *big.Rat rather than allocating /
+// base-converting unbounded.
 func RatFromBytes(b []byte, scale int) *big.Rat {
 	return bytesToRat(b, scale)
 }
@@ -2282,6 +2321,14 @@ func bytesToRat(b []byte, scale int) *big.Rat {
 		// schema-validated non-negative scale already bounded by
 		// validateLogical, so this guard only fires for direct
 		// RatFromBytes use with hostile input.
+		return new(big.Rat)
+	}
+	if len(b) > maxDecimalUnscaledBytes {
+		// Public-API safety: the decode paths reject an over-long unscaled
+		// value (via checkDecimalUnscaledLen) before reaching here, so this
+		// fires only for direct RatFromBytes use with hostile input — return a
+		// zero rat rather than driving an unbounded base conversion, mirroring
+		// the scale guard above.
 		return new(big.Rat)
 	}
 	return scaledRat(bytesToBigInt(b), scale)
