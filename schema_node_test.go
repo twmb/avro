@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -1383,4 +1384,336 @@ func TestRegression_RootQuotedFixedSize(t *testing.T) {
 			t.Errorf("%s: canonical changed across Root().Schema():\n %s\n %s", schema, s.Canonical(), rt.Canonical())
 		}
 	}
+}
+
+// TestRegression_SchemaNodeWalkBudgetBattery is THE consolidated DoS battery for
+// the SchemaNode→JSON metadata walk reached via the public SchemaNode.Schema()
+// (dedup path, d != nil, errors) and the bare toJSON() SchemaFor reaches via a
+// hand-built CustomType.Schema (d == nil, truncates). The walk has THREE
+// independently-unbounded axes, and a hand-built node drives cost through every
+// recursion point, fan-out point, AND per-node payload on each:
+//
+//   - DEPTH (maxSchemaJSONDepth): the longest container PATH. Unbounded → the
+//     fixup walk or json.Marshal overflows the goroutine stack uncatchably.
+//   - NODES (maxSchemaJSONNodes): the COUNT of emitted JSON nodes (objects,
+//     array elements, every enum symbol and alias). Unbounded → a shared-
+//     reference DAG, tiny in memory, fans out into a 2^depth tree.
+//   - BYTES (maxSchemaJSONBytes): the SIZE of every emitted scalar payload
+//     (type/name/namespace/doc/.../symbols/aliases strings, Props keys, string/
+//     []byte values). Unbounded → a huge or widely-shared string/slice — stored
+//     by reference, invisible to the node count, re-expanded by json.Marshal —
+//     blows the output past memory while the node count stays tiny.
+//
+// Five prior rounds each dribbled ONE bound here (structural depth 46d4dde,
+// value depth 7f13cf9, typed-value depth 01b0b32, node fan-out 885e132, dedup
+// conflict-marshal e76cd84) — a process failure. This battery drives the whole
+// surface at once: a later schema_node-walk DoS find is expected to EXTEND it
+// (proving the enumeration here was incomplete), not to be bounded from scratch
+// in a fresh one-off test. Every cell isolates ONE hostile payload to ONE charge
+// site (everything else tiny) and asserts the bound-specific message — which no
+// other code emits (see grep in schema_node.go) — so a cell cannot pass on an
+// unrelated Parse error and a removed charge turns exactly its cell red. Boundary
+// cells pin that a usable schema is never false-rejected.
+func TestRegression_SchemaNodeWalkBudgetBattery(t *testing.T) {
+	wantBytes := fmt.Sprintf("supported %d bytes", maxSchemaJSONBytes)
+	wantNodes := fmt.Sprintf("supported %d nodes", maxSchemaJSONNodes)
+
+	// huge is one byte past the output-size budget: any single emission of it
+	// trips the byte bound alone. Allocated ONCE and shared by reference across
+	// cells, so the battery's footprint is one budget-sized string, not one per
+	// cell. hugeBytes is its []byte sibling for the bytes/fixed value channel.
+	huge := strings.Repeat("x", maxSchemaJSONBytes+1)
+	hugeBytes := make([]byte, maxSchemaJSONBytes+1)
+
+	// reject runs build() in a goroutine so a REGRESSION (a removed bound →
+	// unbounded output/hang) surfaces as the timeout rather than wedging the
+	// suite; the bounded reject returns in well under it. want is the bound-
+	// specific fragment, so the cell fails unless THAT bound fired.
+	reject := func(t *testing.T, want string, build func() (*Schema, error)) {
+		t.Helper()
+		ch := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					ch <- fmt.Errorf("panicked: %v", r)
+				}
+			}()
+			_, err := build()
+			ch <- err
+		}()
+		select {
+		case err := <-ch:
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("want a bounded error containing %q, got %v", want, err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("did not reject within 30s — the %q bound is not firing", want)
+		}
+	}
+
+	// Axis BYTES — per-node scalar payload. Each cell carries `huge` (or its
+	// []byte form) at exactly one emission/charge site; nothing else is large,
+	// so only that site's byte charge can fire.
+	t.Run("bytes/scalar-payload", func(t *testing.T) {
+		intField := []SchemaField{{Name: "f", Type: SchemaNode{Type: "int"}}}
+		cells := map[string]func() (*Schema, error){
+			// toJSONWalk top charge (Type / Name / Namespace), charged before the
+			// fullname is hashed into the dedup map or emitted as a reference.
+			"node-type": func() (*Schema, error) { return (&SchemaNode{Type: huge}).Schema() },
+			"node-name": func() (*Schema, error) { return (&SchemaNode{Type: "record", Name: huge, Fields: intField}).Schema() },
+			"node-namespace": func() (*Schema, error) {
+				return (&SchemaNode{Type: "record", Name: "R", Namespace: huge, Fields: intField}).Schema()
+			},
+			// node-level scalar strings.
+			"node-doc":         func() (*Schema, error) { return (&SchemaNode{Type: "fixed", Name: "F", Size: 1, Doc: huge}).Schema() },
+			"node-logicalType": func() (*Schema, error) { return (&SchemaNode{Type: "int", LogicalType: huge}).Schema() },
+			"enum-default": func() (*Schema, error) {
+				return (&SchemaNode{Type: "enum", Name: "E", Symbols: []string{"A"}, HasEnumDefault: true, EnumDefault: huge}).Schema()
+			},
+			// field-level scalar strings.
+			"field-name": func() (*Schema, error) {
+				return (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{{Name: huge, Type: SchemaNode{Type: "int"}}}}).Schema()
+			},
+			"field-order": func() (*Schema, error) {
+				return (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{{Name: "f", Order: huge, Type: SchemaNode{Type: "int"}}}}).Schema()
+			},
+			"field-doc": func() (*Schema, error) {
+				return (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{{Name: "f", Doc: huge, Type: SchemaNode{Type: "int"}}}}).Schema()
+			},
+			// Props object keys (the VALUE channel charges values; the KEY string
+			// is charged separately as an emitted object key).
+			"node-props-key": func() (*Schema, error) { return (&SchemaNode{Type: "int", Props: map[string]any{huge: "v"}}).Schema() },
+			"field-props-key": func() (*Schema, error) {
+				return (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{{Name: "f", Type: SchemaNode{Type: "int"}, Props: map[string]any{huge: "v"}}}}).Schema()
+			},
+			// Value leaves walked by valueWalkLimit (Props / Default channel).
+			"value-string": func() (*Schema, error) { return (&SchemaNode{Type: "int", Props: map[string]any{"x": huge}}).Schema() },
+			"value-jsonNumber": func() (*Schema, error) {
+				return (&SchemaNode{Type: "int", Props: map[string]any{"x": json.Number(huge)}}).Schema()
+			},
+			"value-bytes": func() (*Schema, error) {
+				return (&SchemaNode{Type: "int", Props: map[string]any{"x": hugeBytes}}).Schema()
+			},
+			"value-map-key": func() (*Schema, error) {
+				return (&SchemaNode{Type: "int", Props: map[string]any{"x": map[string]any{huge: "v"}}}).Schema()
+			},
+			"value-struct-field-name": func() (*Schema, error) {
+				// json.Marshal emits a struct field name as an object key; a
+				// pathological StructOf type carries a huge one. Fan a 1 MiB
+				// field name across enough instances to clear the budget.
+				ft := reflect.StructOf([]reflect.StructField{{Name: "F" + strings.Repeat("a", 1<<20), Type: reflect.TypeOf(0)}})
+				n := maxSchemaJSONBytes/(1<<20) + 8
+				return (&SchemaNode{Type: "int", Props: map[string]any{"x": reflect.MakeSlice(reflect.SliceOf(ft), n, n).Interface()}}).Schema()
+			},
+		}
+		for name, build := range cells {
+			t.Run(name, func(t *testing.T) { reject(t, wantBytes, build) })
+		}
+	})
+
+	// Axis NODES — string SLICES emit one array node per element, so their
+	// element COUNT (not just the structural node) is charged. A slice one past
+	// the node budget trips it on its own.
+	t.Run("nodes/slice-payload", func(t *testing.T) {
+		bigSlice := make([]string, maxSchemaJSONNodes+1) // empty strings: nodes axis, not bytes
+		cells := map[string]func() (*Schema, error){
+			"symbols": func() (*Schema, error) { return (&SchemaNode{Type: "enum", Name: "E", Symbols: bigSlice}).Schema() },
+			"node-aliases": func() (*Schema, error) {
+				return (&SchemaNode{Type: "fixed", Name: "F", Size: 1, Aliases: bigSlice}).Schema()
+			},
+			"field-aliases": func() (*Schema, error) {
+				return (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{{Name: "f", Type: SchemaNode{Type: "int"}, Aliases: bigSlice}}}).Schema()
+			},
+		}
+		for name, build := range cells {
+			t.Run(name, func(t *testing.T) { reject(t, wantNodes, build) })
+		}
+	})
+
+	// The shared-reference DAG — the exact shape that is O(K+L) in memory but
+	// K*L in json.Marshal's output. The 885e132 node bound closed it for
+	// STRUCTURE; these close it for leaf PAYLOAD (and confirm the dedup-
+	// reference and dedup-map-hashing paths are bounded too).
+	t.Run("shared-dag-amplification", func(t *testing.T) {
+		shared := strings.Repeat("x", 1<<20) // 1 MiB, shared by reference
+		refs := maxSchemaJSONBytes/len(shared) + 8
+
+		// One shared 1 MiB doc fanned across many distinct named branches.
+		t.Run("doc-across-branches", func(t *testing.T) {
+			reject(t, wantBytes, func() (*Schema, error) {
+				branches := make([]SchemaNode, refs)
+				for i := range branches {
+					branches[i] = SchemaNode{Type: "fixed", Name: fmt.Sprintf("F%d", i), Size: 1, Doc: shared}
+				}
+				return (&SchemaNode{Type: "union", Branches: branches}).Schema()
+			})
+		})
+
+		// A 1 MiB-named record referenced via many distinct-pointer copies → one
+		// definition + refs-1 bare references, each re-emitting (and re-hashing)
+		// the 1 MiB fullname. Bounded by the top charge, which runs before the
+		// dedup map touches the name.
+		t.Run("name-via-dedup-references", func(t *testing.T) {
+			reject(t, wantBytes, func() (*Schema, error) {
+				dup := SchemaNode{Type: "record", Name: shared, Fields: []SchemaField{{Name: "g", Type: SchemaNode{Type: "long"}}}}
+				fields := make([]SchemaField, refs)
+				for i := range fields {
+					fields[i] = SchemaField{Name: fmt.Sprintf("f%d", i), Type: dup}
+				}
+				return (&SchemaNode{Type: "record", Name: "Outer", Fields: fields}).Schema()
+			})
+		})
+
+		// One shared symbols slice fanned across distinct-named enums → the node
+		// budget (slice elements) prunes the fan-out.
+		t.Run("symbols-slice-across-enums", func(t *testing.T) {
+			reject(t, wantNodes, func() (*Schema, error) {
+				sym := make([]string, maxSchemaJSONNodes/4)
+				branches := make([]SchemaNode, 6) // 6 * (budget/4) > budget
+				for i := range branches {
+					branches[i] = SchemaNode{Type: "enum", Name: fmt.Sprintf("E%d", i), Symbols: sym}
+				}
+				return (&SchemaNode{Type: "union", Branches: branches}).Schema()
+			})
+		})
+	})
+
+	// Axis DEPTH — structural and value channels (the 46d4dde / 7f13cf9 cells,
+	// driven here too so this battery covers the whole surface).
+	t.Run("depth", func(t *testing.T) {
+		const deep = maxSchemaJSONDepth + 50
+		t.Run("structural", func(t *testing.T) {
+			reject(t, "SchemaNode tree nests deeper", func() (*Schema, error) {
+				cur := &SchemaNode{Type: "long"}
+				for range deep {
+					cur = &SchemaNode{Type: "array", Items: cur}
+				}
+				return cur.Schema()
+			})
+		})
+		t.Run("value", func(t *testing.T) {
+			reject(t, "value nests deeper", func() (*Schema, error) {
+				var v any = "leaf"
+				for range deep {
+					v = map[string]any{"k": v}
+				}
+				return (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}).Schema()
+			})
+		})
+	})
+
+	// Axis NODES — structural and value shared-DAG fan-out (the 885e132 cells).
+	t.Run("fanout", func(t *testing.T) {
+		t.Run("structural", func(t *testing.T) {
+			reject(t, wantNodes, func() (*Schema, error) {
+				cur := &SchemaNode{Type: "long"}
+				for range 60 {
+					cur = &SchemaNode{Type: "array", Items: cur, Values: cur}
+				}
+				return cur.Schema()
+			})
+		})
+		t.Run("value", func(t *testing.T) {
+			reject(t, "value expands", func() (*Schema, error) {
+				var v any = "leaf"
+				for range 60 {
+					inner := v
+					v = map[string]any{"a": inner, "b": inner}
+				}
+				return (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}).Schema()
+			})
+		})
+	})
+
+	// The dedup conflict-comparison marshal (the e76cd84 axis): many large-bodied
+	// distinct-pointer duplicates of one named type must be bounded by the SHARED
+	// budget, not re-marshalled on a fresh one.
+	t.Run("dedup-conflict-marshal", func(t *testing.T) {
+		reject(t, "expands to more", func() (*Schema, error) {
+			fields := make([]SchemaField, 1500)
+			for i := range fields {
+				fields[i] = SchemaField{Name: fmt.Sprintf("g%d", i), Type: SchemaNode{Type: "long"}}
+			}
+			dup := SchemaNode{Type: "record", Name: "Dup", Fields: fields}
+			outer := make([]SchemaField, 1500)
+			for i := range outer {
+				outer[i] = SchemaField{Name: fmt.Sprintf("f%d", i), Type: dup}
+			}
+			return (&SchemaNode{Type: "record", Name: "Outer", Fields: outer}).Schema()
+		})
+	})
+
+	// The bare path (SchemaFor's hand-built CustomType.Schema, toJSON with
+	// d == nil) truncates over-budget output rather than erroring, so the
+	// invariant is that it TERMINATES — no uncatchable stack overflow, no
+	// unbounded fan-out, no multi-GB marshal — on every axis.
+	t.Run("bare-path-terminates", func(t *testing.T) {
+		type recForCustom struct{ F int32 }
+		run := func(t *testing.T, sn *SchemaNode) {
+			t.Helper()
+			done := make(chan struct{})
+			go func() {
+				defer func() {
+					_ = recover()
+					close(done)
+				}()
+				_, _ = SchemaFor[recForCustom](WithCustomType(CustomType{GoType: reflect.TypeOf(int32(0)), Schema: sn}))
+			}()
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Fatal("bare-path walk did not terminate")
+			}
+		}
+		t.Run("payload-bytes-doc", func(t *testing.T) { run(t, &SchemaNode{Type: "fixed", Name: "F", Size: 1, Doc: huge}) })
+		t.Run("payload-bytes-value", func(t *testing.T) { run(t, &SchemaNode{Type: "int", Props: map[string]any{"x": huge}}) })
+		t.Run("slice-symbols", func(t *testing.T) {
+			run(t, &SchemaNode{Type: "enum", Name: "E", Symbols: make([]string, maxSchemaJSONNodes+1)})
+		})
+		t.Run("shared-dag-value", func(t *testing.T) {
+			var v any = "leaf"
+			for range 60 {
+				inner := v
+				v = map[string]any{"a": inner, "b": inner}
+			}
+			run(t, &SchemaNode{Type: "int", Props: map[string]any{"x": v}})
+		})
+	})
+
+	// Boundary — a usable schema well under each bound must still build and
+	// round-trip. The bounds reject the pathological, never the merely large.
+	t.Run("boundary-usable-builds", func(t *testing.T) {
+		t.Run("large-doc", func(t *testing.T) {
+			doc := strings.Repeat("d", 1<<20) // 1 MiB, far under the 64 MiB byte budget
+			s, err := (&SchemaNode{Type: "record", Name: "R", Doc: doc, Fields: []SchemaField{{Name: "f", Type: SchemaNode{Type: "int"}}}}).Schema()
+			if err != nil {
+				t.Fatalf("a 1 MiB doc should build, got %v", err)
+			}
+			if s.Root().Doc != doc {
+				t.Fatal("the usable-size doc was dropped or truncated")
+			}
+		})
+		t.Run("many-symbols", func(t *testing.T) {
+			syms := make([]string, 10_000) // 10k symbols, far under the 1 MiB node budget
+			for i := range syms {
+				syms[i] = fmt.Sprintf("S%d", i)
+			}
+			if _, err := (&SchemaNode{Type: "enum", Name: "E", Symbols: syms}).Schema(); err != nil {
+				t.Fatalf("a 10k-symbol enum should build, got %v", err)
+			}
+		})
+		t.Run("benign-shared-payload", func(t *testing.T) {
+			// A handful of copies of a moderate string: json.Marshal expands it to
+			// a few copies, cheaply. The bound rejects compounding amplification,
+			// not all sharing.
+			shared := strings.Repeat("x", 1<<10)
+			branches := make([]SchemaNode, 8)
+			for i := range branches {
+				branches[i] = SchemaNode{Type: "fixed", Name: fmt.Sprintf("F%d", i), Size: 1, Doc: shared}
+			}
+			if _, err := (&SchemaNode{Type: "union", Branches: branches}).Schema(); err != nil {
+				t.Fatalf("a benign shared 1 KiB doc across 8 branches should build, got %v", err)
+			}
+		})
+	})
 }

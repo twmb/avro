@@ -183,8 +183,8 @@ func (s *Schema) Root() SchemaNode {
 // occurrence of a named type (record, enum, fixed) emits the full
 // definition; subsequent occurrences emit the name as a reference.
 func (n *SchemaNode) toJSONDedup(d *deduper) any {
-	nodes := maxSchemaJSONNodes
-	return n.toJSONWalk(d.visited, d, "", 0, &nodes)
+	b := newWalkBudget()
+	return n.toJSONWalk(d.visited, d, "", 0, &b)
 }
 
 // jsonSerializableValue returns v with three Avro-JSON-specific shape
@@ -336,11 +336,147 @@ func applyJSONFixup(v any) any {
 // crashing, exactly like the depth bound.
 const maxSchemaJSONNodes = 1 << 20
 
+// maxSchemaJSONBytes bounds the TOTAL bytes of scalar payload one
+// SchemaNode→JSON walk emits — every type / name / namespace / doc /
+// logicalType / enum-default string, every enum symbol and alias, every Props
+// key and string / []byte Props-or-Default value — shared across a single walk
+// exactly like maxSchemaJSONNodes. It is the output-SIZE companion to the
+// node-COUNT budget, and the cell the five depth/node rounds all missed.
+//
+// The node budget caps how many nodes the intermediate any-tree holds; it
+// cannot see a leaf's SIZE, because the tree stores every string and []string
+// BY REFERENCE (assigning n.Doc or n.Symbols is O(1) and charges exactly one
+// node) while json.Marshal re-expands each one. So a single multi-megabyte
+// Doc / Symbols, or a modest one shared across many distinct nodes (K nodes
+// each emitting one L-byte shared string is O(K+L) in memory but K*L in the
+// marshaled output, because Go strings/slices share backing storage and
+// json.Marshal memoizes nothing), blows the output up past memory while the
+// node count stays tiny — neither the depth nor the node budget catches it.
+// Charging emitted bytes against one shared budget bounds json.Marshal's output
+// (and the dedup conflict-comparison marshals) the same way the node budget
+// bounds the fan-out. The cap sits far above any real schema's serialized size
+// — a schema this large is itself pathological — so a usable tree is never
+// rejected; an over-budget walk stops with a clean error (dedup path) or a
+// truncated payload (bare path) instead of hanging, exactly like the depth and
+// node bounds.
+const maxSchemaJSONBytes = 1 << 26
+
+// walkBudget is the shared per-walk resource budget threaded through toJSONWalk
+// and valueWalkLimit. Both axes are decremented across the WHOLE walk
+// (structural nodes plus every Props/Default value plus the dedup
+// conflict-comparison marshals), so no single channel can blow either:
+//
+//   - nodes: the COUNT of emitted JSON nodes (objects plus array elements,
+//     including every enum symbol and alias). Bounds the intermediate any-tree
+//     and the walk's own fan-out — a shared-reference DAG re-expands per path
+//     (see maxSchemaJSONNodes).
+//   - bytes: the SIZE in bytes of every emitted scalar payload. Bounds
+//     json.Marshal's output — leaves are stored by reference (O(1), invisible
+//     to the node count) and re-expanded by json.Marshal (see
+//     maxSchemaJSONBytes).
+type walkBudget struct {
+	nodes int
+	bytes int
+}
+
+// newWalkBudget returns a fresh full budget for one SchemaNode→JSON walk.
+func newWalkBudget() walkBudget {
+	return walkBudget{nodes: maxSchemaJSONNodes, bytes: maxSchemaJSONBytes}
+}
+
+// takeNode charges one emitted node, reporting false when the node budget is
+// already exhausted (this path never drives it below zero).
+func (b *walkBudget) takeNode() bool {
+	if b.nodes <= 0 {
+		return false
+	}
+	b.nodes--
+	return true
+}
+
+// takeNodes charges n emitted nodes (a slice's elements). When n exceeds the
+// remainder the budget is driven to zero and false is reported, so the caller
+// truncates rather than handing json.Marshal a giant array.
+func (b *walkBudget) takeNodes(n int) bool {
+	if n > b.nodes {
+		b.nodes = 0
+		return false
+	}
+	b.nodes -= n
+	return true
+}
+
+// takeBytes charges n emitted payload bytes. When n exceeds the remainder the
+// budget is driven negative (so toJSONWalk's top-of-call check and
+// valueWalkLimit both observe exhaustion) and false is reported, so the
+// over-large payload is never handed to json.Marshal.
+func (b *walkBudget) takeBytes(n int) bool {
+	if n > b.bytes {
+		b.bytes = -1
+		return false
+	}
+	b.bytes -= n
+	return true
+}
+
+// emitString charges a structural scalar string's bytes, returning it for
+// emission, or "" (recording the over-budget error) when the byte budget is
+// exhausted — so json.Marshal never copies a payload past the bound.
+func (b *walkBudget) emitString(d *deduper, s string) string {
+	if b.takeBytes(len(s)) {
+		return s
+	}
+	d.fail(errSchemaTreeBytes())
+	return ""
+}
+
+// emitStrings charges a structural []string payload — its element COUNT against
+// the node budget (each element becomes an emitted array node) and its content
+// bytes against the byte budget — returning it for emission, or an empty slice
+// (recording the over-budget error) when either is exhausted. The truncation is
+// deterministic (always empty) so the dedup conflict comparison stays
+// meaningful; an exhausted budget is reported by the post-comparison check, not
+// as a spurious body conflict (asymmetric truncation could otherwise make
+// identical bodies compare unequal — the same hazard toJSONShared addresses).
+func (b *walkBudget) emitStrings(d *deduper, ss []string) []string {
+	if !b.takeNodes(len(ss)) {
+		d.fail(errSchemaTreeNodes())
+		return []string{}
+	}
+	total := 0
+	for _, s := range ss {
+		total += len(s)
+	}
+	if !b.takeBytes(total) {
+		d.fail(errSchemaTreeBytes())
+		return []string{}
+	}
+	return ss
+}
+
+// fail records err as the deduper's first error. It is a no-op on the bare
+// (d == nil) walk, which truncates over-budget output silently, and never
+// overwrites an earlier error.
+func (d *deduper) fail(err error) {
+	if d != nil && d.err == nil {
+		d.err = err
+	}
+}
+
+func errSchemaTreeNodes() error {
+	return fmt.Errorf("avro: SchemaNode tree expands to more than the supported %d nodes", maxSchemaJSONNodes)
+}
+
+func errSchemaTreeBytes() error {
+	return fmt.Errorf("avro: SchemaNode tree expands to more than the supported %d bytes", maxSchemaJSONBytes)
+}
+
 // valueWalkLimit result codes.
 const (
-	valueWalkOK      = iota // safe to hand to jsonSerializableValue / json.Marshal
-	valueWalkTooDeep        // nests past the depth budget (stack-overflow risk)
-	valueWalkTooWide        // expands to too many nodes (fan-out / json.Marshal cost)
+	valueWalkOK       = iota // safe to hand to jsonSerializableValue / json.Marshal
+	valueWalkTooDeep         // nests past the depth budget (stack-overflow risk)
+	valueWalkTooWide         // expands to too many nodes (fan-out / json.Marshal cost)
+	valueWalkTooLarge        // expands to too many payload bytes (json.Marshal output size)
 )
 
 // valueWalkLimit walks v — a Props value or a SchemaField.Default, an arbitrary
@@ -357,46 +493,64 @@ const (
 //     bound, charging the structural nesting already accrued so the total
 //     marshaled nesting stays within one ceiling.
 //
-//   - EXPANSION (*nodes, the budget shared with the structural toJSONWalk): the
-//     TOTAL nodes json.Marshal will emit. A value that shares a sub-value across
-//     sibling paths is shallow yet fans out into a 2^depth tree when serialized
-//     (see maxSchemaJSONNodes). The depth bound is blind to it; only counting
-//     emitted nodes catches it. *nodes is decremented on EVERY node, so the walk
-//     itself terminates at the budget — it can neither overflow its own stack
-//     nor hang on a shared-reference DAG or a cyclic Go type (type P *P).
+//   - EXPANSION (b.nodes, the node budget shared with the structural
+//     toJSONWalk): the TOTAL nodes json.Marshal will emit. A value that shares a
+//     sub-value across sibling paths is shallow yet fans out into a 2^depth tree
+//     when serialized (see maxSchemaJSONNodes). The depth bound is blind to it;
+//     only counting emitted nodes catches it. b.nodes is decremented on EVERY
+//     node, so the walk itself terminates at the budget — it can neither overflow
+//     its own stack nor hang on a shared-reference DAG or a cyclic Go type
+//     (type P *P).
+//
+//   - PAYLOAD SIZE (b.bytes, the byte budget shared with the structural walk):
+//     the TOTAL bytes of every emitted scalar — string and json.Number content,
+//     []byte (codepoint-string) content, map keys, struct field names. A value
+//     whose leaves are huge or share one big string across many nodes is small
+//     in memory yet expands past memory in json.Marshal's output, invisible to
+//     the node count (see maxSchemaJSONBytes).
 //
 // The walk mirrors what json.Marshal recurses into — maps, slices, arrays,
 // structs, and pointer/interface indirection — not just the map[string]any /
 // []any shapes [Schema.Root] produces (a hand-built node or a SchemaFor
 // CustomType.Schema can store ANY Go value the map[string]any field accepts).
-// []byte/[N]byte short-circuit (a base64/number scalar to json.Marshal, never a
-// nested array).
-func valueWalkLimit(rv reflect.Value, depthLeft int, nodes *int) int {
+// []byte/[N]byte are a codepoint/base64 scalar (charged by length, not walked as
+// a nested array).
+func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 	if depthLeft < 0 {
 		return valueWalkTooDeep
 	}
-	if *nodes <= 0 {
+	if b.bytes < 0 {
+		return valueWalkTooLarge
+	}
+	if !b.takeNode() {
 		return valueWalkTooWide
 	}
-	*nodes--
 	switch rv.Kind() {
 	case reflect.Interface, reflect.Pointer:
 		if rv.IsNil() {
 			return valueWalkOK
 		}
-		return valueWalkLimit(rv.Elem(), depthLeft-1, nodes)
+		return valueWalkLimit(rv.Elem(), depthLeft-1, b)
 	case reflect.Map:
 		for iter := rv.MapRange(); iter.Next(); {
-			if r := valueWalkLimit(iter.Value(), depthLeft-1, nodes); r != valueWalkOK {
+			// json.Marshal emits each map key as an object key string.
+			if k := iter.Key(); k.Kind() == reflect.String && !b.takeBytes(k.Len()) {
+				return valueWalkTooLarge
+			}
+			if r := valueWalkLimit(iter.Value(), depthLeft-1, b); r != valueWalkOK {
 				return r
 			}
 		}
 	case reflect.Slice, reflect.Array:
 		if rv.Type().Elem().Kind() == reflect.Uint8 {
-			return valueWalkOK // []byte/[N]byte → base64/number scalar, not a nested array
+			// []byte/[N]byte → codepoint/base64 scalar; charge its bytes, not a walk.
+			if !b.takeBytes(rv.Len()) {
+				return valueWalkTooLarge
+			}
+			return valueWalkOK
 		}
 		for i := 0; i < rv.Len(); i++ {
-			if r := valueWalkLimit(rv.Index(i), depthLeft-1, nodes); r != valueWalkOK {
+			if r := valueWalkLimit(rv.Index(i), depthLeft-1, b); r != valueWalkOK {
 				return r
 			}
 		}
@@ -406,9 +560,19 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, nodes *int) int {
 			if !t.Field(i).IsExported() {
 				continue // json.Marshal skips unexported fields
 			}
-			if r := valueWalkLimit(rv.Field(i), depthLeft-1, nodes); r != valueWalkOK {
+			// json.Marshal emits the field name (or json tag) as an object key.
+			if !b.takeBytes(len(t.Field(i).Name)) {
+				return valueWalkTooLarge
+			}
+			if r := valueWalkLimit(rv.Field(i), depthLeft-1, b); r != valueWalkOK {
 				return r
 			}
+		}
+	case reflect.String:
+		// string AND json.Number (type Number string) — charge the content
+		// bytes json.Marshal will copy.
+		if !b.takeBytes(rv.Len()) {
+			return valueWalkTooLarge
 		}
 	}
 	return valueWalkOK
@@ -424,17 +588,16 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, nodes *int) int {
 // records the error on the dedup path (so [SchemaNode.Schema] returns it) and
 // truncates to nil on the bare path (so the marshal cannot crash), mirroring
 // toJSONWalk's own over-limit handling.
-func boundedSerializableValue(d *deduper, depth int, nodes *int, v any) any {
-	switch valueWalkLimit(reflect.ValueOf(v), maxSchemaJSONDepth-depth, nodes) {
+func boundedSerializableValue(d *deduper, depth int, b *walkBudget, v any) any {
+	switch valueWalkLimit(reflect.ValueOf(v), maxSchemaJSONDepth-depth, b) {
 	case valueWalkTooDeep:
-		if d != nil && d.err == nil {
-			d.err = fmt.Errorf("avro: SchemaNode default/property value nests deeper than the supported limit (%d)", maxSchemaJSONDepth)
-		}
+		d.fail(fmt.Errorf("avro: SchemaNode default/property value nests deeper than the supported limit (%d)", maxSchemaJSONDepth))
 		return nil
 	case valueWalkTooWide:
-		if d != nil && d.err == nil {
-			d.err = fmt.Errorf("avro: SchemaNode default/property value expands to more than the supported %d nodes", maxSchemaJSONNodes)
-		}
+		d.fail(fmt.Errorf("avro: SchemaNode default/property value expands to more than the supported %d nodes", maxSchemaJSONNodes))
+		return nil
+	case valueWalkTooLarge:
+		d.fail(fmt.Errorf("avro: SchemaNode default/property value expands to more than the supported %d bytes", maxSchemaJSONBytes))
 		return nil
 	}
 	return jsonSerializableValue(v)
@@ -445,24 +608,24 @@ func boundedSerializableValue(d *deduper, depth int, nodes *int, v any) any {
 // are detected and emitted as the cyclic node's name (for named types)
 // or nil (for unnamed).
 func (n *SchemaNode) toJSON() any {
-	nodes := maxSchemaJSONNodes
-	return n.toJSONShared(&nodes)
+	b := newWalkBudget()
+	return n.toJSONShared(&b)
 }
 
 // toJSONShared snapshots n's full JSON body (no dedup) for the conflict
-// comparison in toJSONWalk, charging the SHARED per-walk node budget rather
-// than a fresh one. A named type that re-occurs as a DISTINCT pointer with an
-// identical body triggers a 2x re-marshal of its whole subtree; with k such
-// copies of a w-node body that is O(k*w) work, and because the dedup walk only
-// charges 1 node per re-occurrence (it emits a bare reference, not the body),
-// the outer budget alone leaves k*w unbounded even though the emitted schema is
-// tiny (one definition + k-1 references). Sharing the budget caps the total
-// comparison work at maxSchemaJSONNodes. Once the budget is exhausted the walk
-// returns truncated output; the caller checks *nodes and reports over-budget
-// rather than a spurious body conflict (asymmetric truncation of n vs prev
-// could otherwise make identical bodies compare unequal).
-func (n *SchemaNode) toJSONShared(nodes *int) any {
-	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0, nodes)
+// comparison in toJSONWalk, charging the SHARED per-walk budget rather than a
+// fresh one. A named type that re-occurs as a DISTINCT pointer with an identical
+// body triggers a 2x re-marshal of its whole subtree; with k such copies of a
+// w-node body that is O(k*w) work, and because the dedup walk only charges 1
+// node per re-occurrence (it emits a bare reference, not the body), the outer
+// budget alone leaves k*w unbounded even though the emitted schema is tiny (one
+// definition + k-1 references). Sharing the budget caps the total comparison
+// work at maxSchemaJSONNodes / maxSchemaJSONBytes. Once either axis is exhausted
+// the walk returns truncated output; the caller checks the budget and reports
+// over-budget rather than a spurious body conflict (asymmetric truncation of n
+// vs prev could otherwise make identical bodies compare unequal).
+func (n *SchemaNode) toJSONShared(b *walkBudget) any {
+	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0, b)
 }
 
 // toJSONWalk is the cycle-aware walker shared by toJSON and toJSONDedup.
@@ -489,27 +652,38 @@ func (n *SchemaNode) toJSONShared(nodes *int) any {
 // so a usable tree is never rejected, and a deeper one stops with a clean
 // error (dedup path) or a truncated subtree Parse then rejects (bare
 // path) instead of crashing.
-func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string, depth int, nodes *int) any {
+func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string, depth int, b *walkBudget) any {
 	if depth > maxSchemaJSONDepth {
-		if d != nil && d.err == nil {
-			d.err = fmt.Errorf("avro: SchemaNode tree nests deeper than the supported limit (%d)", maxSchemaJSONDepth)
-		}
+		d.fail(fmt.Errorf("avro: SchemaNode tree nests deeper than the supported limit (%d)", maxSchemaJSONDepth))
 		return nil
 	}
-	// Charge this node against the shared expansion budget. The depth bound
-	// above caps the longest PATH; this caps the total number of emitted nodes,
-	// so a shared-reference DAG (the same *SchemaNode reached via Items AND
-	// Values, tiny in memory) cannot fan out into an exponential tree that hangs
-	// the walk / json.Marshal before Parse runs (see maxSchemaJSONNodes). Once
-	// exhausted, every further node returns early without descending, so the
-	// fan-out is pruned at the frontier rather than fully expanded.
-	if *nodes <= 0 {
-		if d != nil && d.err == nil {
-			d.err = fmt.Errorf("avro: SchemaNode tree expands to more than the supported %d nodes", maxSchemaJSONNodes)
-		}
+	// Charge this node against the shared budget. The depth bound above caps the
+	// longest PATH; b.nodes caps the total number of emitted nodes, so a
+	// shared-reference DAG (the same *SchemaNode reached via Items AND Values,
+	// tiny in memory) cannot fan out into an exponential tree that hangs the walk
+	// / json.Marshal before Parse runs (see maxSchemaJSONNodes); b.bytes caps the
+	// total emitted scalar payload, so a huge or widely-shared string/slice
+	// cannot blow json.Marshal's output up while the node count stays tiny (see
+	// maxSchemaJSONBytes). Once either is exhausted, every further node returns
+	// early without descending, so the fan-out is pruned at the frontier.
+	if b.bytes < 0 {
+		d.fail(errSchemaTreeBytes())
 		return nil
 	}
-	*nodes--
+	if !b.takeNode() {
+		d.fail(errSchemaTreeNodes())
+		return nil
+	}
+	// Charge type / name / namespace BEFORE they are hashed into the dedup map,
+	// scanned by strings.Contains, or emitted as a name reference, so a huge
+	// shared Name/Namespace cannot amplify via the dedup map's per-occurrence
+	// hashing or the reference emission. (The type switches below are
+	// length-short-circuited — O(1) even for a huge Type — so charging once here
+	// covers every later emission of these three without double-counting.)
+	if !b.takeBytes(len(n.Type) + len(n.Name) + len(n.Namespace)) {
+		d.fail(errSchemaTreeBytes())
+		return nil
+	}
 	if _, cycle := visited[n]; cycle {
 		// Cycle through Items/Values back to n. Named types emit the
 		// fullname as a reference (the canonical Avro recursive-schema
@@ -555,15 +729,20 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			// pointer duplicates cannot amplify into O(k*subtree) work outside
 			// the bound — see toJSONShared.
 			if prev != n && d.err == nil {
-				cur, _ := json.Marshal(n.toJSONShared(nodes))
-				prevB, _ := json.Marshal(prev.toJSONShared(nodes))
+				cur, _ := json.Marshal(n.toJSONShared(b))
+				prevB, _ := json.Marshal(prev.toJSONShared(b))
 				switch {
-				case *nodes <= 0:
-					// The comparison exhausted the shared budget: the
+				case b.nodes <= 0:
+					// The comparison exhausted the shared node budget: the
 					// duplicated subtree is large enough to blow the bound, so
 					// the truncated bodies can't be compared reliably. Report
 					// over-budget, matching toJSONWalk's other over-limit exits.
-					d.err = fmt.Errorf("avro: SchemaNode tree expands to more than the supported %d nodes", maxSchemaJSONNodes)
+					d.err = errSchemaTreeNodes()
+				case b.bytes < 0:
+					// Same, on the payload-size axis: a truncated body comparison
+					// is meaningless, so report over-budget rather than risk a
+					// spurious conflict from asymmetric string truncation.
+					d.err = errSchemaTreeBytes()
 				case string(cur) != string(prevB):
 					d.err = fmt.Errorf("avro: conflicting definitions for named type %q", truncForError(nodeFullname(n)))
 				}
@@ -583,7 +762,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	case "union":
 		branches := make([]any, len(n.Branches))
 		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1, nodes)
+			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1, b)
 		}
 		return branches
 	}
@@ -629,16 +808,16 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		m["namespace"] = n.Namespace
 	}
 	if len(n.Aliases) > 0 {
-		m["aliases"] = n.Aliases
+		m["aliases"] = b.emitStrings(d, n.Aliases)
 	}
 	if n.Doc != "" {
-		m["doc"] = n.Doc
+		m["doc"] = b.emitString(d, n.Doc)
 	}
 	if n.HasEnumDefault {
-		m["default"] = n.EnumDefault
+		m["default"] = b.emitString(d, n.EnumDefault)
 	}
 	if n.LogicalType != "" {
-		m["logicalType"] = n.LogicalType
+		m["logicalType"] = b.emitString(d, n.LogicalType)
 	}
 	if n.Precision != 0 {
 		m["precision"] = n.Precision
@@ -661,16 +840,16 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		if n.Symbols == nil {
 			m["symbols"] = []string{}
 		} else {
-			m["symbols"] = n.Symbols
+			m["symbols"] = b.emitStrings(d, n.Symbols)
 		}
 	} else if len(n.Symbols) > 0 {
-		m["symbols"] = n.Symbols
+		m["symbols"] = b.emitStrings(d, n.Symbols)
 	}
 	if n.Items != nil {
-		m["items"] = n.Items.toJSONWalk(visited, d, childNS, depth+1, nodes)
+		m["items"] = n.Items.toJSONWalk(visited, d, childNS, depth+1, b)
 	}
 	if n.Values != nil {
-		m["values"] = n.Values.toJSONWalk(visited, d, childNS, depth+1, nodes)
+		m["values"] = n.Values.toJSONWalk(visited, d, childNS, depth+1, b)
 	}
 	// record.fields is a required attribute per the Avro spec (Complex
 	// Types > Records: "fields: a JSON array, listing fields (required)"),
@@ -679,8 +858,8 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		fields := make([]map[string]any, len(n.Fields))
 		for i, f := range n.Fields {
 			fd := map[string]any{
-				"name": f.Name,
-				"type": f.Type.toJSONWalk(visited, d, childNS, depth+1, nodes),
+				"name": b.emitString(d, f.Name),
+				"type": f.Type.toJSONWalk(visited, d, childNS, depth+1, b),
 			}
 			if f.HasDefault || f.Default != nil {
 				// jsonSerializableValue converts ±Inf — which a Root()
@@ -688,26 +867,36 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 				// → parseFloatAcceptOverflow — back to a json.Number
 				// literal so encoding/json.Marshal at SchemaNode.Schema()
 				// doesn't fail. Inverse of the metadata-API normalization.
-				fd["default"] = boundedSerializableValue(d, depth, nodes, f.Default)
+				fd["default"] = boundedSerializableValue(d, depth, b, f.Default)
 			}
 			if len(f.Aliases) > 0 {
-				fd["aliases"] = f.Aliases
+				fd["aliases"] = b.emitStrings(d, f.Aliases)
 			}
 			if f.Order != "" {
-				fd["order"] = f.Order
+				fd["order"] = b.emitString(d, f.Order)
 			}
 			if f.Doc != "" {
-				fd["doc"] = f.Doc
+				fd["doc"] = b.emitString(d, f.Doc)
 			}
 			for k, v := range f.Props {
-				fd[k] = boundedSerializableValue(d, depth, nodes, v)
+				// The Props KEY is emitted as a JSON object key; charge it, then
+				// the value through the depth+node+byte-bounded value walk.
+				if !b.takeBytes(len(k)) {
+					d.fail(errSchemaTreeBytes())
+					continue
+				}
+				fd[k] = boundedSerializableValue(d, depth, b, v)
 			}
 			fields[i] = fd
 		}
 		m["fields"] = fields
 	}
 	for k, v := range n.Props {
-		m[k] = boundedSerializableValue(d, depth, nodes, v)
+		if !b.takeBytes(len(k)) {
+			d.fail(errSchemaTreeBytes())
+			continue
+		}
+		m[k] = boundedSerializableValue(d, depth, b, v)
 	}
 	return m
 }
