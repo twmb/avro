@@ -711,7 +711,9 @@ func (ctx *jsonDecoder) decodeBytes(v reflect.Value, node *schemaNode, toAny, ra
 
 func (ctx *jsonDecoder) decodeFixed(v reflect.Value, node *schemaNode, toAny, raw bool) error {
 	// Decimal logical type: accept JSON numbers, same as decodeBytes.
-	// Big-decimal is bytes-only per spec, so it never reaches here.
+	// Big-decimal is bytes-only per spec; hasDecimalBareNumberArm enforces
+	// that (returns false for big-decimal on a fixed node, even one a
+	// CustomType resurrected), so the bare-number arm never fires here for it.
 	// Skipped in raw (custom-decoder) mode — see decodeBytes.
 	if !raw && hasDecimalBareNumberArm(node) {
 		if handled, err := ctx.decodeBareDecimal(v, node, toAny); handled {
@@ -757,6 +759,19 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool) error {
 	if raw {
 		return setBytesValue(v, b, node.kind)
 	}
+	// Each logical arm fires only on the Avro kind that logical is spec-valid
+	// on, so the typed-target transform set matches what decodeLogicalBytes /
+	// decodeLogicalFixed (the *any path) and jsonDecodeAppliesLogical's probe
+	// report for the same (kind, logical). decimal is valid on bytes AND fixed;
+	// big-decimal is bytes-only; duration and uuid are fixed-only (uuid-on-string
+	// is handled by decodeString, never here). A logical on the WRONG kind only
+	// arises when a CustomType resurrects a soft-dropped non-standard placement
+	// (e.g. {"type":"bytes","logicalType":"uuid"}); that match also SUPPRESSES the
+	// codec, so the contract is the raw Avro-native value — which is exactly what
+	// the kind-gated fall-through to setBytesValue produces, matching the binary
+	// path's suppressed deserBytes/deserFixed. Without the kind gate the JSON
+	// typed path transformed (uuid→hex-dash, duration→avro.Duration,
+	// big-decimal→*big.Rat) while binary returned raw bytes.
 	switch node.logical {
 	case "decimal":
 		// Share setDecimalValue with the binary path so JSON accepts
@@ -771,16 +786,18 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool) error {
 		// already stripped the JSON quoting. applyBigDecimalPayload
 		// encapsulates the binary-side opaque-bytes fall-through; when
 		// it returns (false, _) we drop into setBytesValue below.
-		if done, err := applyBigDecimalPayload(v, b); done {
-			return err
+		if node.kind == "bytes" {
+			if done, err := applyBigDecimalPayload(v, b); done {
+				return err
+			}
 		}
 	case "duration":
-		if v.Type() == avroDurationType {
+		if node.kind == "fixed" && v.Type() == avroDurationType {
 			v.Set(reflect.ValueOf(DurationFromBytes(b)))
 			return nil
 		}
 	case "uuid":
-		if len(b) == 16 {
+		if node.kind == "fixed" && len(b) == 16 {
 			var u [16]byte
 			copy(u[:], b)
 			// [16]byte trusts the raw bytes (isUUIDType-first, matching
@@ -811,11 +828,26 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool) error {
 }
 
 // hasDecimalBareNumberArm reports whether node is a logical-typed bytes/
-// fixed schema that accepts the bare-number JSON form on decode. Both
-// decimal and big-decimal qualify; the union-dispatch sibling
-// jsonTokenMatchesBranch uses the same rule.
+// fixed schema that accepts the bare-number JSON form on decode (the
+// lenient convenience that lets a hand-edited producer write 0.33 instead
+// of the spec codepoint-string form). decimal qualifies on bytes AND fixed;
+// big-decimal is bytes-only per spec, so it qualifies ONLY on bytes — on a
+// fixed node the big-decimal logical is non-standard (resurrected solely by
+// a CustomType, which suppresses the codec so the contract is the raw
+// value), and transforming a bare number there would diverge from the
+// suppressed binary path. Kind-gating big-decimal here keeps the predicate
+// in lockstep with assignBytes's kind gate and makes the call-site comments
+// ("big-decimal ... never reaches here" / "not eligible on a fixed branch")
+// true by construction. The union-dispatch sibling jsonTokenMatchesBranch
+// uses the same rule.
 func hasDecimalBareNumberArm(node *schemaNode) bool {
-	return node.logical == "decimal" || node.logical == "big-decimal"
+	switch node.logical {
+	case "decimal":
+		return true
+	case "big-decimal":
+		return node.kind == "bytes"
+	}
+	return false
 }
 
 // decodeBareDecimal handles the bare-number JSON arm for decimal-like

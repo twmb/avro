@@ -48,6 +48,18 @@ func TestRegression_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
 		{"long", "some-future-logical", 0, false},
 		{"bytes", "some-future-logical", 0, false},
 
+		// Logical types on a kind they are NOT spec-valid for — reachable only
+		// when a CustomType resurrects a soft-dropped non-standard placement.
+		// uuid/duration are fixed-only, big-decimal is bytes-only; on the wrong
+		// kind neither the *any decodeLogical{Bytes,Fixed} NOR the typed-target
+		// assignBytes transforms (assignBytes is kind-gated), so the decode is
+		// raw on both wire formats and the probe must report false — otherwise a
+		// no-Decode CustomType would over-install the suppression wrapper for a
+		// transform that no longer exists.
+		{"bytes", "uuid", 0, false},
+		{"bytes", "duration", 0, false},
+		{"fixed", "big-decimal", 8, false},
+
 		// Hostile fixed size: the probe must NOT allocate proportional to size.
 		// jsonDecodeAppliesLogical caps its probe buffer at maxFixedLogicalLen+1,
 		// so a size > maxFixedLogicalLen is neither the uuid(16) nor duration(12)

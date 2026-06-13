@@ -1872,6 +1872,19 @@ func TestRegression_CustomSuppressionScalarTargetParity(t *testing.T) {
 		{"big-decimal/bigRat", `{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal", big.NewRat(12345, 100), ratT, nil, true},
 		{"duration-fixed/string", `{"type":"fixed","name":"DUR","size":12,"logicalType":"duration"}`, "duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, strT, nil, false},
 		{"duration-fixed/duration", `{"type":"fixed","name":"DUR2","size":12,"logicalType":"duration"}`, "duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, durT, nil, true},
+		// Non-standard logical PLACEMENTS resurrected by a CustomType: the
+		// logical sits on an Avro kind it is not spec-valid for (uuid/duration
+		// are fixed-only, big-decimal is bytes-only). validateLogical soft-drops
+		// it; the CustomType restores it AND suppresses the codec, so the
+		// contract is the raw Avro-native bytes on BOTH wire formats. The JSON
+		// typed-decode path (assignBytes) must NOT apply the transform for the
+		// wrong kind — pre-gate it did (uuid→hex-dash string, duration→Duration,
+		// big-decimal→*big.Rat) while binary returned raw, a binary↔JSON split.
+		// encVal is raw bytes of the right length (the plain schema dropped the
+		// logical, so it encodes bare bytes/fixed).
+		{"uuid-on-bytes/string", `{"type":"bytes","logicalType":"uuid"}`, "uuid", []byte("0123456789abcdef"), strT, "0123456789abcdef", false},
+		{"duration-on-bytes/duration", `{"type":"bytes","logicalType":"duration"}`, "duration", []byte("aaaabbbbcccc"), durT, nil, true},
+		{"big-decimal-on-fixed/bigRat", `{"type":"fixed","name":"FBD","size":4,"logicalType":"big-decimal"}`, "big-decimal", []byte{0x04, 0x30, 0x39, 0x04}, ratT, nil, true},
 		// int/long logicals: the suppressed raw int must NOT be transformed.
 		{"date/time", `{"type":"int","logicalType":"date"}`, "date", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), timeT, nil, true},
 		{"date/string", `{"type":"int","logicalType":"date"}`, "date", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), strT, nil, true},
@@ -1919,6 +1932,49 @@ func TestRegression_CustomSuppressionScalarTargetParity(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The bare-number JSON decode convenience (a hand-edited producer writing
+// 123.45 instead of the spec codepoint-string form) is a decimal-family arm
+// reached through hasDecimalBareNumberArm by BOTH decodeBytes and decodeFixed.
+// big-decimal is bytes-only per spec; on a fixed node it exists only because a
+// CustomType resurrected it (which suppresses the codec → raw contract), so the
+// bare-number arm must NOT transform there — it has no raw interpretation and
+// the suppressed binary path has no bare-number form at all. decimal (valid on
+// both bytes and fixed) keeps its bare-number arm on both kinds.
+func TestRegression_DecimalBareNumberArmHonorsKindValidity(t *testing.T) {
+	// big-decimal on FIXED (non-standard, resurrected): bare number must reject,
+	// not transform to *big.Rat.
+	t.Run("big-decimal on fixed rejects bare number", func(t *testing.T) {
+		cs := avro.MustParse(`{"type":"fixed","name":"FBD","size":4,"logicalType":"big-decimal"}`,
+			avro.CustomType{LogicalType: "big-decimal"})
+		var r big.Rat
+		if err := cs.DecodeJSON([]byte("123.45"), &r); err == nil {
+			t.Errorf("suppressed fixed+big-decimal transformed a bare number to %v; big-decimal is bytes-only, the arm must not fire on fixed", r.RatString())
+		}
+	})
+	// big-decimal on BYTES (spec-valid): the bare-number convenience still works.
+	t.Run("big-decimal on bytes accepts bare number", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
+		var r big.Rat
+		if err := s.DecodeJSON([]byte("123.45"), &r); err != nil {
+			t.Fatalf("bytes+big-decimal bare number should decode: %v", err)
+		}
+		if r.RatString() != "2469/20" {
+			t.Errorf("bytes+big-decimal bare number = %v, want 2469/20", r.RatString())
+		}
+	})
+	// decimal on FIXED (spec-valid): bare-number convenience must remain.
+	t.Run("decimal on fixed accepts bare number", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`)
+		var r big.Rat
+		if err := s.DecodeJSON([]byte("1.50"), &r); err != nil {
+			t.Fatalf("fixed+decimal bare number should decode: %v", err)
+		}
+		if r.RatString() != "3/2" {
+			t.Errorf("fixed+decimal bare number = %v, want 3/2", r.RatString())
+		}
+	})
 }
 
 // An Avro string containing invalid UTF-8 is preserved VERBATIM on the binary
