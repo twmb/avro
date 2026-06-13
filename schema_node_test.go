@@ -838,6 +838,94 @@ func TestRegression_SchemaNodeSchemaDeepAcyclicBounded(t *testing.T) {
 	}
 }
 
+// The value channel — a Props value or a SchemaField.Default — is a SEPARATE
+// recursion from the structural node walk: each value is handed to
+// jsonSerializableValue (needsJSONFixup/applyJSONFixup) and then to
+// json.Marshal at Schema(), none of which bounds depth. So a value nested
+// deeply enough overflows the goroutine stack uncatchably (recover cannot
+// catch a stack overflow) even when the node tree itself is one level deep —
+// the structural depth bound never sees it. The walk bounds the value at the
+// same maxSchemaJSONDepth ceiling, so an over-deep value stops with a bounded
+// error rather than crashing.
+func TestRegression_SchemaNodeSchemaDeepValueBounded(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panicked: %v", r)
+		}
+	}()
+	deepValue := func() any {
+		var v any = "leaf"
+		for range maxSchemaJSONDepth + 50 {
+			v = map[string]any{"k": v}
+		}
+		return v
+	}
+
+	t.Run("props value", func(t *testing.T) {
+		node := &SchemaNode{Type: "int", Props: map[string]any{"x": deepValue()}}
+		_, err := node.Schema()
+		if err == nil {
+			t.Fatal("expected a bounded error for an over-deep Props value, got nil")
+		}
+		if !strings.Contains(err.Error(), "value nests deeper") {
+			t.Fatalf("expected the value-channel depth bound to fire, got %v", err)
+		}
+	})
+
+	t.Run("field default value", func(t *testing.T) {
+		node := &SchemaNode{
+			Type: "record",
+			Name: "R",
+			Fields: []SchemaField{
+				{Name: "f", HasDefault: true, Default: deepValue(), Type: SchemaNode{Type: "int"}},
+			},
+		}
+		_, err := node.Schema()
+		if err == nil {
+			t.Fatal("expected a bounded error for an over-deep Default value, got nil")
+		}
+		if !strings.Contains(err.Error(), "value nests deeper") {
+			t.Fatalf("expected the value-channel depth bound to fire, got %v", err)
+		}
+	})
+
+	// Boundary-1: a value nested well below the cap must still build AND
+	// survive the round-trip — the bound must not false-reject or silently
+	// drop a legitimately structured property.
+	t.Run("usable depth builds and round-trips", func(t *testing.T) {
+		var v any = "leaf"
+		for range 500 {
+			v = map[string]any{"k": v}
+		}
+		node := &SchemaNode{Type: "int", Props: map[string]any{"x": v}}
+		s, err := node.Schema()
+		if err != nil {
+			t.Fatalf("a 500-deep Props value should build, got %v", err)
+		}
+		if got := s.Root().Props["x"]; got == nil {
+			t.Fatal("the usable-depth Props value was dropped")
+		}
+	})
+
+	// Sibling channel: SchemaFor embeds a hand-built CustomType.Schema via the
+	// same value walk (the bare, d==nil path). A deep value there must also
+	// terminate instead of crashing the process; the bare path truncates the
+	// over-deep value rather than erroring (mirroring the structural walk's
+	// documented bare-path behavior), so the assertion is simply that it
+	// returns without a stack-overflow death.
+	t.Run("SchemaFor custom-schema deep value terminates", func(t *testing.T) {
+		var v any = "leaf"
+		for range maxSchemaJSONDepth + 50 {
+			v = map[string]any{"k": v}
+		}
+		ct := CustomType{
+			GoType: reflect.TypeOf(int32(0)),
+			Schema: &SchemaNode{Type: "int", Props: map[string]any{"deep": v}},
+		}
+		_, _ = SchemaFor[int32](WithCustomType(ct))
+	})
+}
+
 func TestSchemaNodeUnmarshalablePropsErrors(t *testing.T) {
 	// json.Marshal rejects channels, funcs, complex numbers.
 	node := SchemaNode{

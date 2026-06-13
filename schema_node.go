@@ -314,6 +314,58 @@ func applyJSONFixup(v any) any {
 	return v
 }
 
+// valueNestsTooDeep reports whether v — a Props value or a
+// SchemaField.Default, an arbitrary user-supplied JSON tree — nests its
+// map/slice container layers deeper than remaining. It is the value-channel
+// analogue of toJSONWalk's structural depth bound: a Props/Default value is
+// handed to jsonSerializableValue (needsJSONFixup/applyJSONFixup) and then to
+// json.Marshal at [SchemaNode.Schema], none of which bounds recursion, so a
+// hand-built value nested far enough overflows the goroutine stack
+// uncatchably before Schema's eventual Parse (whose maxSchemaJSONDepth
+// pre-scan would have rejected the JSON) can run. The check short-circuits as
+// soon as it descends one level past remaining, so it never recurses deeper
+// than the bound it enforces — a hostile value cannot overflow the check
+// itself.
+func valueNestsTooDeep(v any, remaining int) bool {
+	if remaining < 0 {
+		return true
+	}
+	switch tv := v.(type) {
+	case map[string]any:
+		for _, e := range tv {
+			if valueNestsTooDeep(e, remaining-1) {
+				return true
+			}
+		}
+	case []any:
+		for _, e := range tv {
+			if valueNestsTooDeep(e, remaining-1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// boundedSerializableValue applies jsonSerializableValue to a Props value or
+// SchemaField.Default, but first bounds its nesting depth so neither the
+// fixup walk nor the downstream json.Marshal overflows the stack. depth is the
+// structural nesting already accrued by toJSONWalk, so the value may add at
+// most maxSchemaJSONDepth-depth further levels — keeping the total marshaled
+// nesting within the same ceiling the structural walk enforces. A value that
+// exceeds it records the error on the dedup path (so [SchemaNode.Schema]
+// returns it) and truncates to nil on the bare path (so the marshal cannot
+// crash), mirroring toJSONWalk's own over-depth handling.
+func boundedSerializableValue(d *deduper, depth int, v any) any {
+	if valueNestsTooDeep(v, maxSchemaJSONDepth-depth) {
+		if d != nil && d.err == nil {
+			d.err = fmt.Errorf("avro: SchemaNode default/property value nests deeper than the supported limit (%d)", maxSchemaJSONDepth)
+		}
+		return nil
+	}
+	return jsonSerializableValue(v)
+}
+
 // toJSON converts a SchemaNode to a JSON-serializable representation.
 // Cycles in n's Items/Values pointers (programmatically constructed)
 // are detected and emitted as the cyclic node's name (for named types)
@@ -520,7 +572,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 				// → parseFloatAcceptOverflow — back to a json.Number
 				// literal so encoding/json.Marshal at SchemaNode.Schema()
 				// doesn't fail. Inverse of the metadata-API normalization.
-				fd["default"] = jsonSerializableValue(f.Default)
+				fd["default"] = boundedSerializableValue(d, depth, f.Default)
 			}
 			if len(f.Aliases) > 0 {
 				fd["aliases"] = f.Aliases
@@ -532,14 +584,14 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 				fd["doc"] = f.Doc
 			}
 			for k, v := range f.Props {
-				fd[k] = jsonSerializableValue(v)
+				fd[k] = boundedSerializableValue(d, depth, v)
 			}
 			fields[i] = fd
 		}
 		m["fields"] = fields
 	}
 	for k, v := range n.Props {
-		m[k] = jsonSerializableValue(v)
+		m[k] = boundedSerializableValue(d, depth, v)
 	}
 	return m
 }
