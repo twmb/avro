@@ -260,6 +260,15 @@ func WithMaxBlockBytes(n int64) ReaderOpt { return optMaxBlockBytes{n} }
 // producers writing larger blocks raise it with WithMaxDecompressedBlockBytes.
 const defaultMaxDecompressedBytes = 64 << 20
 
+// ocfEagerBlockAllocLimit is the largest declared compressed block size that
+// readBlock allocates in one shot (make + ReadFull, the fast common path).
+// It equals the default WithMaxBlockBytes, so a reader at the default cap
+// never leaves the eager path. A block larger than this is only reachable
+// when the caller raises WithMaxBlockBytes; those are read incrementally so an
+// attacker-declared-but-absent size cannot force an allocation up to the
+// raised cap. See readBlock.
+const ocfEagerBlockAllocLimit = 64 << 20
+
 // WithMaxDecompressedBlockBytes sets the maximum DECOMPRESSED size in bytes of
 // a single block that the reader will accept. The default is 64 MiB.
 // [WithMaxBlockBytes] bounds the compressed size read off the wire; this
@@ -930,9 +939,29 @@ func (rd *Reader) readBlock() error {
 	if size > math.MaxInt {
 		return fmt.Errorf("ocf: block size %d exceeds platform max int", size)
 	}
-	compressed := make([]byte, int(size))
-	if _, err := io.ReadFull(rd.r, compressed); err != nil {
-		return fmt.Errorf("ocf: reading block data: %w", err)
+	// size is the attacker-declared block length, bounded only by the
+	// user-configurable WithMaxBlockBytes. Eagerly allocating it would let a
+	// tiny hostile file (a huge declared size with few bytes behind it) force
+	// an allocation up to that cap: at a raised cap a multi-GiB transient
+	// spike, and near the cap's MaxInt64 ceiling an unrecoverable
+	// out-of-memory the caller cannot recover() from. Only allocate the full
+	// size up front when it is within a bounded window (the common path, where
+	// it never exceeds the default cap); beyond that, read incrementally so
+	// the buffer grows only to the bytes actually present and a declared-but-
+	// absent size fails after consuming what is there — the same bounded-
+	// allocation discipline the decompressed side already applies.
+	var compressed []byte
+	if size <= ocfEagerBlockAllocLimit {
+		compressed = make([]byte, int(size))
+		if _, err := io.ReadFull(rd.r, compressed); err != nil {
+			return fmt.Errorf("ocf: reading block data: %w", err)
+		}
+	} else {
+		var buf bytes.Buffer
+		if n, err := io.CopyN(&buf, rd.r, size); err != nil {
+			return fmt.Errorf("ocf: reading block data (%d of %d bytes): %w", n, size, err)
+		}
+		compressed = buf.Bytes()
 	}
 	var sync [16]byte
 	if _, err := io.ReadFull(rd.r, sync[:]); err != nil {

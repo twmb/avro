@@ -182,6 +182,31 @@ func TestDoSBattery_OCF_C2_BlockCountSize(t *testing.T) {
 		var v int64
 		return r.Decode(&v)
 	})
+
+	// Same hostile block, but with the reader's cap RAISED above the declared
+	// size — as a caller setting a very large / "unlimited" WithMaxBlockBytes
+	// would. The size > maxBlockBytes guard no longer fires, so readBlock must
+	// still reject gracefully instead of eagerly make([]byte, declaredSize):
+	// near the MaxInt64 ceiling that allocation is an unrecoverable fatal OOM,
+	// and even at realistic raised caps a tiny file forces a multi-GiB spike.
+	// Bound: readBlock reads incrementally beyond ocfEagerBlockAllocLimit, so a
+	// declared-but-absent size fails after consuming the bytes actually present.
+	// Extreme: TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate.
+	hdrRaised, syncRaised := ocfHeaderSync(t, `"long"`)
+	var raisedHuge []byte
+	raisedHuge = append(raisedHuge, hdrRaised...)
+	raisedHuge = append(raisedHuge, binary.AppendVarint(nil, 1)...)     // count = 1
+	raisedHuge = append(raisedHuge, binary.AppendVarint(nil, 1<<48)...) // declared 256 TiB, no payload
+	raisedHuge = append(raisedHuge, syncRaised...)
+	wantReject(t, "NewReader+Decode/huge-declared-size-raised-cap", func() error {
+		r, err := NewReader(bytes.NewReader(raisedHuge), WithMaxBlockBytes(1<<50))
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		var v int64
+		return r.Decode(&v)
+	})
 }
 
 //////////////////////////////////////////////////////////////////////////////
