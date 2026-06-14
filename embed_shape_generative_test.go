@@ -61,14 +61,16 @@ import (
 // each promoting an "N" field at a controlled depth through a controlled type,
 // so subsets of them embedded as siblings synthesize every structural family.
 
-type GA struct{ N int32 }                // untagged N, depth 1 when embedded
-type GB struct{ N int32 }                // DISTINCT type, also untagged N
-type GTag struct{ M int32 `avro:"N"` }   // TAGGED N (Go field "M")
-type GMid struct{ GA }                    // N one level deeper
-type GDeep struct{ GMid }                 // N two levels deeper
-type GBase struct{ N int32 }              // diamond base
-type GL struct{ GBase }                   // diamond arm L
-type GR struct{ GBase }                   // diamond arm R
+type GA struct{ N int32 } // untagged N, depth 1 when embedded
+type GB struct{ N int32 } // DISTINCT type, also untagged N
+type GTag struct {
+	M int32 `avro:"N"`
+}                            // TAGGED N (Go field "M")
+type GMid struct{ GA }       // N one level deeper
+type GDeep struct{ GMid }    // N two levels deeper
+type GBase struct{ N int32 } // diamond base
+type GL struct{ GBase }      // diamond arm L
+type GR struct{ GBase }      // diamond arm R
 
 func structuralCarriers() []reflect.Type {
 	return []reflect.Type{
@@ -280,9 +282,10 @@ func oracleResolve(t reflect.Type) oracleResult {
 // ---- generated structural shapes -------------------------------------------
 
 type genShape struct {
-	label  string
-	t      reflect.Type
-	hasTag bool // any avro tag anywhere -> FieldByName oracle applies only when false
+	label     string
+	t         reflect.Type
+	hasTag    bool // any avro tag anywhere -> FieldByName oracle applies only when false
+	hasInline bool // ,inline-flattened fields have no Go-promotion analog -> skip FieldByName
 }
 
 // genStructuralShapes crosses: every ordered subset (size 1..3) of the carrier
@@ -327,52 +330,64 @@ func genStructuralShapes() []genShape {
 
 	var shapes []genShape
 	for _, arr := range embedArrangements {
-		for _, ptr := range []bool{false, true} {
-			embeds := make([]reflect.StructField, len(arr))
-			for i, c := range arr {
-				ct := c
-				if ptr && i == 0 {
-					ct = reflect.PointerTo(c)
+		// inl renders the carriers as ,inline-flattened NAMED fields instead of
+		// anonymous embeds — the other flattening mechanism. The collision tree
+		// is identical (both walk into the carrier at the same index), but inline
+		// has no Go-promotion analog, so FieldByName cannot oracle it; oracleResolve
+		// (validated against FieldByName on the anonymous-embed shapes) + the
+		// two-walker agreement carry it.
+		for _, inl := range []bool{false, true} {
+			for _, ptr := range []bool{false, true} {
+				embeds := make([]reflect.StructField, len(arr))
+				for i, c := range arr {
+					ct := c
+					if ptr && i == 0 {
+						ct = reflect.PointerTo(c)
+					}
+					if inl {
+						embeds[i] = reflect.StructField{Name: fmt.Sprintf("Inl%d", i), Type: ct, Tag: `avro:",inline"`}
+					} else {
+						embeds[i] = anonEmbed(ct)
+					}
 				}
-				embeds[i] = anonEmbed(ct)
-			}
-			for _, d := range directOpts {
-				positions := []string{"after"}
-				if d.field != nil {
-					positions = []string{"before", "after"}
-				}
-				for _, pos := range positions {
-					for _, keep := range []bool{false, true} {
-						var fields []reflect.StructField
-						addDirect := func() {
-							if d.field != nil {
-								fields = append(fields, *d.field)
+				for _, d := range directOpts {
+					positions := []string{"after"}
+					if d.field != nil {
+						positions = []string{"before", "after"}
+					}
+					for _, pos := range positions {
+						for _, keep := range []bool{false, true} {
+							var fields []reflect.StructField
+							addDirect := func() {
+								if d.field != nil {
+									fields = append(fields, *d.field)
+								}
+								if keep {
+									fields = append(fields, keepField)
+								}
 							}
-							if keep {
-								fields = append(fields, keepField)
+							if pos == "before" {
+								addDirect()
+								fields = append(fields, embeds...)
+							} else {
+								fields = append(fields, embeds...)
+								addDirect()
 							}
-						}
-						if pos == "before" {
-							addDirect()
-							fields = append(fields, embeds...)
-						} else {
-							fields = append(fields, embeds...)
-							addDirect()
-						}
-						st := reflect.StructOf(fields)
-						hasTag := d.tag
-						for _, c := range arr {
-							if c == reflect.TypeFor[GTag]() {
-								hasTag = true
+							st := reflect.StructOf(fields)
+							hasTag := d.tag || inl // ,inline is itself a tag
+							for _, c := range arr {
+								if c == reflect.TypeFor[GTag]() {
+									hasTag = true
+								}
 							}
+							names := make([]string, 0, len(arr))
+							for _, c := range arr {
+								names = append(names, c.Name()[:1])
+							}
+							label := fmt.Sprintf("carriers=%v inline=%v ptr=%v %s/%s keep=%v",
+								names, inl, ptr, d.label, pos, keep)
+							shapes = append(shapes, genShape{label: label, t: st, hasTag: hasTag, hasInline: inl})
 						}
-						names := make([]string, 0, len(arr))
-						for _, c := range arr {
-							names = append(names, c.Name()[:1])
-						}
-						label := fmt.Sprintf("embeds=%v ptr=%v %s/%s keep=%v",
-							names, ptr, d.label, pos, keep)
-						shapes = append(shapes, genShape{label: label, t: st, hasTag: hasTag})
 					}
 				}
 			}
@@ -383,12 +398,15 @@ func genStructuralShapes() []genShape {
 
 // ---- value plumbing for the round-trip ------------------------------------
 
-// setLeafInt sets the int32 at index (pointers along the path must already be
-// allocated, e.g. via allocPointers).
+// setLeafInt sets the int32 at index, allocating any nil pointer along the path
+// (e.g. a ,inline *struct field, which allocPointers — anonymous-only — skips).
 func setLeafInt(structVal reflect.Value, index []int, v int32) {
 	fv := structVal
 	for _, i := range index {
 		for fv.Kind() == reflect.Pointer {
+			if fv.IsNil() {
+				fv.Set(reflect.New(fv.Type().Elem()))
+			}
 			fv = fv.Elem()
 		}
 		fv = fv.Field(i)
@@ -436,8 +454,16 @@ func TestGenerative_EmbedShapeWalkerAgreement(t *testing.T) {
 		anyAmbig := len(or.ambiguous) > 0
 
 		// (A) Validate the oracle against Go's own promotion for every name
-		//     with no tagged candidate (pure Go-promotion question).
+		//     with no tagged candidate (pure Go-promotion question). Skipped for
+		//     ,inline shapes: inline flattening has no Go-promotion analog (Go
+		//     does not promote through a non-anonymous field), so FieldByName
+		//     would not find the flattened name — oracleResolve (validated here
+		//     on the anonymous-embed shapes) and the two-walker agreement carry
+		//     the inline shapes instead.
 		for _, n := range or.names {
+			if sh.hasInline {
+				break
+			}
 			tagged := false
 			for _, c := range or.cands[n] {
 				if c.tagged {
@@ -708,25 +734,27 @@ func TestGenerative_SchemaForReplicaParity(t *testing.T) {
 // ---- neutering record (non-vacuity proof) ----------------------------------
 //
 // This net is proven to FAIL when each Family-5 fix is reverted in the
-// production walkers. Measured over the 8000 generated structural shapes with a
+// production walkers. Measured over the 16000 generated structural shapes with a
 // temporary count-don't-fatal harness (the live test fatals at the first red
 // cell). With both fixes intact all four counts below are 0.
 //
 //	NEUTER-1  Remove `defer delete(visited, t)` from BOTH walkers
 //	          (reflect.go + schema_for.go) — revert 6ce8257, restoring the
 //	          marked-forever visited map:
-//	            collectFields wrong-winner ......... 100 shapes
-//	            collectFields accepted-ambiguous ... 152 shapes
-//	            typeFieldMapping mirrors both (100 / 152)
+//	            collectFields wrong-winner ......... 200 shapes (100 of them inline)
+//	            collectFields accepted-ambiguous ... 304 shapes
+//	            typeFieldMapping mirrors both (200 / 304)
 //	          A type reached through two embed paths has its SHALLOW occurrence
-//	          pruned, so the deeper field wins (caught by the FieldByName/oracle
-//	          cross-check); a diamond's second arm is pruned, so the collision is
-//	          silently first-won instead of flagged ambiguous.
+//	          pruned, so the deeper field wins (caught by the FieldByName oracle
+//	          on the embed shapes and by oracleResolve on the inline shapes, where
+//	          FieldByName does not apply — hence the 100 inline reds); a diamond's
+//	          second arm is pruned, so the collision is silently first-won instead
+//	          of flagged ambiguous.
 //
 //	NEUTER-2  Drop the equal-depth `ambiguous[...]` mark in BOTH walkers
 //	          (revert 692b039 + a1c4b25), restoring silent first-win:
-//	            collectFields accepted-ambiguous ... 456 shapes
-//	            typeFieldMapping accepted-ambiguous  456 names
+//	            collectFields accepted-ambiguous ... 912 shapes
+//	            typeFieldMapping accepted-ambiguous  912 names
 //	          Every ambiguous shape the net asserts must reject is silently
-//	          first-won instead. 456 == the net's own ambiguity-rejection count,
+//	          first-won instead. 912 == the net's own ambiguity-rejection count,
 //	          i.e. EVERY ambiguous cell goes red.
