@@ -869,3 +869,139 @@ func boxRawTree(pos customPos, rawTree any) any {
 	}
 	return boxedInner
 }
+
+// ===========================================================================
+// Layer 4 — metadata-API agreement with the wire (assertion (c) completion).
+//
+// gMetadata pins Canonical/Fingerprint determinism. This layer pins the two
+// remaining metadata surfaces the user named: Fields[].Default and Root().Props.
+//
+// Fields[].Default: the contract is that the metadata default value, used AS a
+// field value, encodes to the SAME wire as resolution/auto fill — i.e. the
+// observed default agrees with the wire. Crossed with the resolution default-
+// fill (writer lacks the field) and Resolve⇔CheckCompatibility agreement.
+// ===========================================================================
+
+func TestMatrix_GenerativeDefaultFill(t *testing.T) {
+	kinds := []struct {
+		label      string
+		fieldType  string
+		defaultLit string
+	}{
+		{"boolean", `"boolean"`, `true`},
+		{"int", `"int"`, `7`},
+		{"long", `"long"`, `9007199254740993`},
+		{"float", `"float"`, `1.5`},
+		{"double", `"double"`, `-2.25`},
+		{"string", `"string"`, `"d"`},
+		{"bytes", `"bytes"`, `"\u00ff"`},
+		{"bytes-empty", `"bytes"`, `""`},
+		{"enum", `{"type":"enum","name":"GDE","symbols":["A","B"]}`, `"B"`},
+		{"fixed1", `{"type":"fixed","name":"GDF","size":1}`, `"\u00ab"`},
+		{"fixed0", `{"type":"fixed","name":"GDF0","size":0}`, `""`},
+		{"date", `{"type":"int","logicalType":"date"}`, `19723`},
+		{"timestamp", `{"type":"long","logicalType":"timestamp-millis"}`, `1717243496789`},
+		{"nullunion", `["null","int"]`, `null`},
+		{"union-int-first", `["int","string"]`, `42`},
+		{"array", `{"type":"array","items":"int"}`, `[1,2]`},
+		{"map", `{"type":"map","values":"string"}`, `{"k":"v"}`},
+		{"record", `{"type":"record","name":"GDR","fields":[{"name":"i","type":"int"}]}`, `{"i":3}`},
+		{"empty-record", `{"type":"record","name":"GDER","fields":[]}`, `{}`},
+	}
+	for _, k := range kinds {
+		t.Run(k.label, func(t *testing.T) {
+			rSchema := fmt.Sprintf(`{"type":"record","name":"R","fields":[
+				{"name":"pre","type":"string"},
+				{"name":"f","type":%s,"default":%s}]}`, k.fieldType, k.defaultLit)
+			wSchema := `{"type":"record","name":"R","fields":[{"name":"pre","type":"string"}]}`
+			r := avro.MustParse(rSchema)
+			w := avro.MustParse(wSchema)
+			res, err := resolveBoth(t, w, r)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+
+			// Metadata observation: locate field "f" and its typed Default.
+			root := r.Root()
+			var fld *avro.SchemaField
+			for i := range root.Fields {
+				if root.Fields[i].Name == "f" {
+					fld = &root.Fields[i]
+				}
+			}
+			if fld == nil || !fld.HasDefault {
+				t.Fatalf("metadata: field f missing or has no default; HasDefault must be true")
+			}
+
+			// (c) The metadata Default, used as the field value, must encode to
+			// the SAME wire as the reader's own auto-fill of the missing field.
+			autoWire, err := r.AppendEncode(nil, map[string]any{"pre": "p"})
+			if err != nil {
+				t.Fatalf("reader auto-fill encode: %v", err)
+			}
+			explicitWire, err := r.AppendEncode(nil, map[string]any{"pre": "p", "f": fld.Default})
+			if err != nil {
+				t.Fatalf("encode with metadata Default as the value: %v\ndefault=%#v", err, fld.Default)
+			}
+			if !bytes.Equal(autoWire, explicitWire) {
+				t.Fatalf("metadata Fields[].Default disagrees with the wire:\n auto    =%x\n explicit=%x\n default =%#v", autoWire, explicitWire, fld.Default)
+			}
+
+			// Resolution default-fill lands on the same auto-fill wire, and the
+			// reader's JSON fill agrees too (the three fill paths converge).
+			wWire, err := w.AppendEncode(nil, map[string]any{"pre": "p"})
+			if err != nil {
+				t.Fatalf("writer encode: %v", err)
+			}
+			var got map[string]any
+			if _, err := res.Decode(wWire, &got); err != nil {
+				t.Fatalf("resolved default fill: %v", err)
+			}
+			gotWire, err := r.AppendEncode(nil, got)
+			if err != nil || !bytes.Equal(gotWire, autoWire) {
+				t.Fatalf("resolution fill wire differs from auto-fill: err=%v\n got =%x\n auto=%x", err, gotWire, autoWire)
+			}
+			var jfill map[string]any
+			if err := r.DecodeJSON([]byte(`{"pre":"p"}`), &jfill); err != nil {
+				t.Fatalf("reader JSON fill: %v", err)
+			}
+			if !matEqual(got, jfill) {
+				t.Fatalf("resolution fill diverges from JSON fill:\n res =%#v\n json=%#v", got, jfill)
+			}
+		})
+	}
+}
+
+// TestMatrix_GenerativeProps pins Root().Props / Fields[].Props: they observe
+// the parsed custom attributes, survive the metadata rebuild, and are stripped
+// by Parsing Canonical Form (so they never perturb the fingerprint).
+func TestMatrix_GenerativeProps(t *testing.T) {
+	schema := `{"type":"record","name":"R","myrec":"v1","fields":[
+		{"name":"f","type":"int","myfield":42},
+		{"name":"g","type":{"type":"array","items":"long"},"tags":["a","b"]}]}`
+	s := avro.MustParse(schema)
+	root := s.Root()
+	if root.Props["myrec"] != "v1" {
+		t.Fatalf("Root().Props[myrec]=%#v want \"v1\"", root.Props["myrec"])
+	}
+	if len(root.Fields) != 2 || root.Fields[0].Props["myfield"] == nil {
+		t.Fatalf("Fields[0].Props[myfield] missing: %#v", root.Fields[0].Props)
+	}
+	// PCF strips props: the fingerprint of the propful schema equals that of the
+	// prop-stripped one.
+	bare := avro.MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":"int"},
+		{"name":"g","type":{"type":"array","items":"long"}}]}`)
+	if !bytes.Equal(s.Fingerprint(avro.NewRabin()), bare.Fingerprint(avro.NewRabin())) {
+		t.Fatalf("props perturb the canonical fingerprint:\n propful=%s\n bare   =%s", s.Canonical(), bare.Canonical())
+	}
+	// The rebuild preserves the props (observation survives a round-trip).
+	rebuilt, err := root.Schema()
+	if err != nil {
+		t.Fatalf("Root().Schema(): %v", err)
+	}
+	rr := rebuilt.Root()
+	if rr.Props["myrec"] != "v1" || rr.Fields[0].Props["myfield"] == nil {
+		t.Fatalf("rebuild dropped props: root=%#v field=%#v", rr.Props, rr.Fields[0].Props)
+	}
+}
