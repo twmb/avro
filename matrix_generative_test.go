@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -362,6 +363,245 @@ func TestMatrix_Generative(t *testing.T) {
 						}
 					})
 				}
+			})
+		}
+	}
+}
+
+// ===========================================================================
+// Layer 2 — the typed/unsafe path and container specializations.
+//
+// Assertion (a) demands all four codec paths agree byte-identically. The
+// binary-unsafe path (addressable struct fields, unsafe.go) and the per-element
+// container fast paths ([]T, map[string]T) are reached only with strongly-typed
+// Go targets. This layer drives every typed scalar through five positions —
+// bare top, struct field (the unsafe fast path), []T and map[string]T (the
+// container specializations), and *T (the pointer path) — at the boundary
+// values the legacy typed table omits. The float32 signaling-NaN cell is the
+// sharp one: the float32 encoder has a documented fast/slow split keyed on
+// "float32→float64→float32 is bit-exact for all NON-NaN values", so a signaling
+// NaN takes the slow path, and every typed position must still emit the exact
+// payload — caught by the independent oracle, not calibration.
+// ===========================================================================
+
+// gtyped is one typed scalar: the field/element schema, the Go type for the
+// unsafe/typed targets, and boundary-tagged values in typed + generic form.
+type gtyped struct {
+	label  string
+	schema string
+	goType reflect.Type
+	values []gtval
+}
+
+type gtval struct {
+	boundary  string
+	typed     any    // assignable to goType
+	generic   any    // generic-path equivalent (map[string]any/[]any/scalar)
+	oracle    []byte // bare top-context wire bytes (nil => no independent oracle)
+	jsonLossy bool   // NaN payload: binary bit-exact, JSON value-equal only
+}
+
+func gtypedTypes() []gtyped {
+	rat := big.NewRat(123, 4)
+	ts := time.Date(2024, 6, 1, 12, 34, 56, 789000000, time.UTC)
+	uuid16 := [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
+	return []gtyped{
+		{"boolean", `"boolean"`, reflect.TypeOf(true), []gtval{
+			{boundary: "true", typed: true, generic: true, oracle: []byte{0x01}},
+			{boundary: "false", typed: false, generic: false, oracle: []byte{0x00}},
+		}},
+		{"int", `"int"`, reflect.TypeOf(int32(0)), []gtval{
+			{boundary: "neg", typed: int32(-5), generic: int32(-5), oracle: appendZig(nil, -5)},
+			{boundary: "maxint", typed: int32(math.MaxInt32), generic: int32(math.MaxInt32), oracle: appendZig(nil, math.MaxInt32)},
+			{boundary: "minint", typed: int32(math.MinInt32), generic: int32(math.MinInt32), oracle: appendZig(nil, math.MinInt32)},
+		}},
+		{"int-as-int16", `"int"`, reflect.TypeOf(int16(0)), []gtval{
+			{boundary: "normal", typed: int16(300), generic: int32(300), oracle: appendZig(nil, 300)},
+			{boundary: "minint16", typed: int16(math.MinInt16), generic: int32(math.MinInt16), oracle: appendZig(nil, math.MinInt16)},
+		}},
+		{"long", `"long"`, reflect.TypeOf(int64(0)), []gtval{
+			{boundary: "2^53+1", typed: int64(1<<53 + 1), generic: int64(1<<53 + 1), oracle: appendZig(nil, 1<<53+1)},
+			{boundary: "maxint", typed: int64(math.MaxInt64), generic: int64(math.MaxInt64), oracle: appendZig(nil, math.MaxInt64)},
+			{boundary: "minint", typed: int64(math.MinInt64), generic: int64(math.MinInt64), oracle: appendZig(nil, math.MinInt64)},
+		}},
+		{"long-as-uint32", `"long"`, reflect.TypeOf(uint32(0)), []gtval{
+			{boundary: "big", typed: uint32(4000000000), generic: int64(4000000000), oracle: appendZig(nil, 4000000000)},
+		}},
+		{"float", `"float"`, reflect.TypeOf(float32(0)), []gtval{
+			{boundary: "normal", typed: float32(2.5), generic: float32(2.5), oracle: leF32(2.5)},
+			{boundary: "nzero", typed: float32(math.Copysign(0, -1)), generic: float32(math.Copysign(0, -1)), oracle: leF32(float32(math.Copysign(0, -1)))},
+			{boundary: "inf", typed: float32(math.Inf(1)), generic: float32(math.Inf(1)), oracle: leF32(float32(math.Inf(1)))},
+			{boundary: "qnan", typed: float32(math.NaN()), generic: float32(math.NaN()), oracle: leF32(float32(math.NaN()))},
+			{boundary: "snan", typed: sNaN32, generic: sNaN32, oracle: leF32(sNaN32), jsonLossy: true},
+			{boundary: "max", typed: float32(math.MaxFloat32), generic: float32(math.MaxFloat32), oracle: leF32(math.MaxFloat32)},
+		}},
+		{"double", `"double"`, reflect.TypeOf(float64(0)), []gtval{
+			{boundary: "normal", typed: 6.25, generic: 6.25, oracle: leF64(6.25)},
+			{boundary: "nzero", typed: math.Copysign(0, -1), generic: math.Copysign(0, -1), oracle: leF64(math.Copysign(0, -1))},
+			{boundary: "inf", typed: math.Inf(-1), generic: math.Inf(-1), oracle: leF64(math.Inf(-1))},
+			{boundary: "snan", typed: sNaN64, generic: sNaN64, oracle: leF64(sNaN64), jsonLossy: true},
+			{boundary: "max", typed: math.MaxFloat64, generic: math.MaxFloat64, oracle: leF64(math.MaxFloat64)},
+		}},
+		{"string", `"string"`, reflect.TypeOf(""), []gtval{
+			{boundary: "normal", typed: "typ", generic: "typ", oracle: avroLen([]byte("typ"))},
+			{boundary: "empty", typed: "", generic: "", oracle: avroLen(nil)},
+		}},
+		{"bytes", `"bytes"`, reflect.TypeOf([]byte(nil)), []gtval{
+			{boundary: "normal", typed: []byte{9, 8}, generic: []byte{9, 8}, oracle: avroLen([]byte{9, 8})},
+			{boundary: "empty", typed: []byte{}, generic: []byte{}, oracle: avroLen(nil)},
+		}},
+		{"enum", `{"type":"enum","name":"GTYE","symbols":["A","B"]}`, reflect.TypeOf(""), []gtval{
+			{boundary: "B", typed: "B", generic: "B", oracle: appendZig(nil, 1)},
+		}},
+		{"fixed2", `{"type":"fixed","name":"GTYF","size":2}`, reflect.TypeOf([2]byte{}), []gtval{
+			{boundary: "normal", typed: [2]byte{1, 2}, generic: []byte{1, 2}, oracle: []byte{1, 2}},
+		}},
+		{"uuid-fixed16", `{"type":"fixed","name":"GTYU","size":16,"logicalType":"uuid"}`, reflect.TypeOf([16]byte{}), []gtval{
+			{boundary: "normal", typed: uuid16, generic: "6ba7b810-9dad-11d1-80b4-00c04fd430c8", oracle: uuid16[:]},
+		}},
+		{"date", `{"type":"int","logicalType":"date"}`, reflect.TypeOf(time.Time{}), []gtval{
+			{boundary: "normal", typed: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), generic: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)},
+		}},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, reflect.TypeOf(time.Duration(0)), []gtval{
+			{boundary: "normal", typed: 3 * time.Hour, generic: 3 * time.Hour},
+		}},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, reflect.TypeOf(time.Time{}), []gtval{
+			{boundary: "normal", typed: ts, generic: ts},
+		}},
+		{"decimal", `{"type":"bytes","logicalType":"decimal","precision":6,"scale":2}`, reflect.TypeOf(&big.Rat{}), []gtval{
+			{boundary: "normal", typed: rat, generic: rat},
+		}},
+		{"duration", `{"type":"fixed","name":"GTYD","size":12,"logicalType":"duration"}`, reflect.TypeOf(avro.Duration{}), []gtval{
+			{boundary: "normal", typed: avro.Duration{Months: 3, Days: 1, Milliseconds: 9}, generic: avro.Duration{Months: 3, Days: 1, Milliseconds: 9}},
+		}},
+	}
+}
+
+// gEncEq encodes v against s on the binary path and asserts equality to want,
+// returning the wire for further checks.
+func gEncEq(t *testing.T, s *avro.Schema, v any, want []byte, what string) []byte {
+	t.Helper()
+	w, err := s.AppendEncode(nil, v)
+	if err != nil {
+		t.Fatalf("%s: encode: %v", what, err)
+	}
+	if want != nil && !bytes.Equal(w, want) {
+		t.Fatalf("%s: wire mismatch:\n got=%x\nwant=%x", what, w, want)
+	}
+	return w
+}
+
+// gTypedCell drives one typed scalar value through the bare, struct (unsafe),
+// []T, map[string]T, and *T positions, asserting byte-identity across the safe,
+// unsafe, generic, and container paths plus the independent oracle, and the
+// JSON twin parity. The jsonLossy (NaN payload) split drops only the JSON→wire
+// re-encode step, never the binary bit-exactness.
+func gTypedCell(t *testing.T, gd gtyped, tv gtval) {
+	t.Helper()
+
+	// ---- P1: bare top scalar (the typed scalar encoder; float32 slow path). ----
+	sTop := avro.MustParse(gd.schema)
+	wTop := gEncEq(t, sTop, tv.typed, tv.oracle, "bare-typed")
+	wGen := gEncEq(t, sTop, tv.generic, tv.oracle, "bare-generic")
+	if !bytes.Equal(wTop, wGen) {
+		t.Fatalf("bare typed vs generic differ:\n t=%x\n g=%x", wTop, wGen)
+	}
+	// Decode into a fresh typed target, re-encode byte-stable.
+	backTop := reflect.New(gd.goType)
+	if _, err := sTop.Decode(wTop, backTop.Interface()); err != nil {
+		t.Fatalf("bare typed decode: %v", err)
+	}
+	gEncEq(t, sTop, backTop.Elem().Interface(), wTop, "bare typed re-encode")
+
+	// ---- P2: struct field (addressable => unsafe fast path; non-addr => reflect). ----
+	st := reflect.StructOf([]reflect.StructField{{Name: "F", Type: gd.goType, Tag: `avro:"f"`}})
+	recSchema := fmt.Sprintf(`{"type":"record","name":"GS","fields":[{"name":"f","type":%s}]}`, gd.schema)
+	sRec := avro.MustParse(recSchema)
+	pStruct := reflect.New(st)
+	pStruct.Elem().Field(0).Set(reflect.ValueOf(tv.typed))
+	wAddr := gEncEq(t, sRec, pStruct.Interface(), nil, "struct addressable (unsafe)")     // *struct => addressable
+	wNon := gEncEq(t, sRec, pStruct.Elem().Interface(), nil, "struct non-addressable")    // struct value => reflect
+	wRecGen := gEncEq(t, sRec, map[string]any{"f": tv.generic}, nil, "struct generic")
+	if !bytes.Equal(wAddr, wNon) || !bytes.Equal(wAddr, wRecGen) {
+		t.Fatalf("struct safe/unsafe/generic diverge:\n addr=%x\n non =%x\n gen =%x", wAddr, wNon, wRecGen)
+	}
+	backStruct := reflect.New(st)
+	if _, err := sRec.Decode(wAddr, backStruct.Interface()); err != nil {
+		t.Fatalf("struct typed decode: %v", err)
+	}
+	gEncEq(t, sRec, backStruct.Interface(), wAddr, "struct decode→re-encode")
+
+	// ---- P3: []T container specialization. ----
+	arrSchema := avro.MustParse(fmt.Sprintf(`{"type":"array","items":%s}`, gd.schema))
+	slice := reflect.MakeSlice(reflect.SliceOf(gd.goType), 0, 2)
+	slice = reflect.Append(slice, reflect.ValueOf(tv.typed), reflect.ValueOf(tv.typed))
+	wSlice := gEncEq(t, arrSchema, slice.Interface(), nil, "[]T")
+	wSliceGen := gEncEq(t, arrSchema, []any{tv.generic, tv.generic}, nil, "[]any")
+	if !bytes.Equal(wSlice, wSliceGen) {
+		t.Fatalf("[]T vs []any diverge:\n t=%x\n g=%x", wSlice, wSliceGen)
+	}
+	backSlice := reflect.New(reflect.SliceOf(gd.goType))
+	if _, err := arrSchema.Decode(wSlice, backSlice.Interface()); err != nil {
+		t.Fatalf("[]T decode: %v", err)
+	}
+	gEncEq(t, arrSchema, backSlice.Interface(), wSlice, "[]T decode→re-encode")
+
+	// ---- P4: map[string]T container specialization. ----
+	mapSchema := avro.MustParse(fmt.Sprintf(`{"type":"map","values":%s}`, gd.schema))
+	mt := reflect.MapOf(reflect.TypeOf(""), gd.goType)
+	m := reflect.MakeMap(mt)
+	m.SetMapIndex(reflect.ValueOf("k"), reflect.ValueOf(tv.typed))
+	wMap := gEncEq(t, mapSchema, m.Interface(), nil, "map[string]T")
+	wMapGen := gEncEq(t, mapSchema, map[string]any{"k": tv.generic}, nil, "map[string]any")
+	if !bytes.Equal(wMap, wMapGen) {
+		t.Fatalf("map[string]T vs map[string]any diverge:\n t=%x\n g=%x", wMap, wMapGen)
+	}
+	backMap := reflect.New(mt)
+	if _, err := mapSchema.Decode(wMap, backMap.Interface()); err != nil {
+		t.Fatalf("map[string]T decode: %v", err)
+	}
+	gEncEq(t, mapSchema, backMap.Interface(), wMap, "map[string]T decode→re-encode")
+
+	// ---- P5: *T via a ["null",T] union (pointer typed path). ----
+	if gd.label != "bytes" { // a nil []byte is the null branch already; *[]byte is redundant
+		ptrUnionSchema := avro.MustParse(fmt.Sprintf(`["null",%s]`, gd.schema))
+		p := reflect.New(gd.goType)
+		p.Elem().Set(reflect.ValueOf(tv.typed))
+		wPtr := gEncEq(t, ptrUnionSchema, p.Interface(), nil, "*T")
+		wPtrGen := gEncEq(t, ptrUnionSchema, tv.generic, nil, "*T generic")
+		if !bytes.Equal(wPtr, wPtrGen) {
+			t.Fatalf("*T vs generic diverge:\n t=%x\n g=%x", wPtr, wPtrGen)
+		}
+	}
+
+	// ---- JSON twins: typed-JSON == generic-JSON byte-identical (true even for
+	// NaN — both emit "NaN"); for non-lossy also assert JSON→binary lands on the
+	// original wire. ----
+	jTyped, err := sRec.AppendEncodeJSON(nil, pStruct.Interface())
+	if err != nil {
+		t.Fatalf("struct typed encodeJSON: %v", err)
+	}
+	jGen, err := sRec.AppendEncodeJSON(nil, map[string]any{"f": tv.generic})
+	if err != nil || !bytes.Equal(jTyped, jGen) {
+		t.Fatalf("typed vs generic JSON differ: err=%v\n t=%s\n g=%s", err, jTyped, jGen)
+	}
+	jBack := reflect.New(st)
+	if err := sRec.DecodeJSON(jTyped, jBack.Interface()); err != nil {
+		t.Fatalf("struct typed decodeJSON: %v", err)
+	}
+	if !tv.jsonLossy {
+		wj, err := sRec.AppendEncode(nil, jBack.Interface())
+		if err != nil || !bytes.Equal(wj, wAddr) {
+			t.Fatalf("typed JSON round-trip wire differs: err=%v\n w=%x\n j=%x", err, wAddr, wj)
+		}
+	}
+}
+
+func TestMatrix_GenerativeTyped(t *testing.T) {
+	for _, gd := range gtypedTypes() {
+		for _, tv := range gd.values {
+			t.Run(gd.label+"/"+tv.boundary, func(t *testing.T) {
+				gTypedCell(t, gd, tv)
 			})
 		}
 	}
