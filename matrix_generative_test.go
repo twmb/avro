@@ -2,10 +2,12 @@ package avro_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -76,6 +78,8 @@ type gtype struct {
 }
 
 // ---- independent wire-oracle builders (no code-under-test) -----------------
+
+func jsonNum(s string) json.Number { return json.Number(s) }
 
 func leF32(f float32) []byte {
 	b := math.Float32bits(f)
@@ -1149,5 +1153,71 @@ func TestMatrix_GenerativePromotionBoundary(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// ===========================================================================
+// Layer 7 — the json.Number overflow boundary input (the "1e1000" axis value).
+//
+// gtypes covers the ±Inf VALUE; this covers the textual overflow INPUT that
+// must narrow TO ±Inf. json.Number is a valid encode input and a bare JSON
+// number is a valid decode input, so "1e1000" exercises a distinct narrow-to-Inf
+// path on the float/double arms and an exact-or-reject path on the int/long
+// arms. Oracle: the Go-parsed value's bits (float) or exact zigzag (integer),
+// computed independently of the codec.
+// ===========================================================================
+
+func TestMatrix_GenerativeJSONNumberBoundary(t *testing.T) {
+	parseF64 := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
+	floatCases := []struct {
+		schema string
+		oracle func(s string) []byte
+	}{
+		{`"double"`, func(s string) []byte { return leF64(parseF64(s)) }},
+		{`"float"`, func(s string) []byte { return leF32(float32(parseF64(s))) }},
+	}
+	floatInputs := []string{"1e1000", "-1e1000", "1.5", "0", "9007199254740993"}
+	for _, fc := range floatCases {
+		s := avro.MustParse(fc.schema)
+		for _, in := range floatInputs {
+			t.Run(fc.schema+"/"+in, func(t *testing.T) {
+				// Binary encode of json.Number narrows to the IEEE bits.
+				w, err := s.AppendEncode(nil, jsonNum(in))
+				if err != nil {
+					t.Fatalf("encode json.Number(%s): %v", in, err)
+				}
+				if want := fc.oracle(in); !bytes.Equal(w, want) {
+					t.Fatalf("json.Number(%s) binary diverges from Go-parsed oracle:\n got=%x\nwant=%x", in, w, want)
+				}
+				// Bare-number JSON decode into *any narrows the same way and the
+				// decoded value re-encodes onto the same wire.
+				var dec any
+				if err := s.DecodeJSON([]byte(in), &dec); err != nil {
+					t.Fatalf("decodeJSON bare number %s: %v", in, err)
+				}
+				w2, err := s.AppendEncode(nil, dec)
+				if err != nil || !bytes.Equal(w2, w) {
+					t.Fatalf("bare-number JSON decode re-encode differs: err=%v\n got=%x\n want=%x", err, w2, w)
+				}
+			})
+		}
+	}
+
+	// Integer arms: 2^53+1 is exact; 1e1000 (a non-integer overflow) must REJECT
+	// with a bounded error, not silently truncate.
+	t.Run("long/2^53+1-exact", func(t *testing.T) {
+		s := avro.MustParse(`"long"`)
+		w, err := s.AppendEncode(nil, jsonNum("9007199254740993"))
+		if err != nil || !bytes.Equal(w, appendZig(nil, 1<<53+1)) {
+			t.Fatalf("long json.Number 2^53+1 not exact: err=%v w=%x", err, w)
+		}
+	})
+	for _, sc := range []string{`"int"`, `"long"`} {
+		t.Run(sc+"/1e1000-rejects", func(t *testing.T) {
+			s := avro.MustParse(sc)
+			if _, err := s.AppendEncode(nil, jsonNum("1e1000")); err == nil {
+				t.Fatalf("%s accepted overflow json.Number 1e1000 (must reject)", sc)
+			}
+		})
 	}
 }
