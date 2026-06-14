@@ -806,7 +806,13 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool) error {
 			}
 		}
 	case "duration":
-		if node.kind == "fixed" && v.Type() == avroDurationType {
+		// len(b)==12 mirrors decodeLogicalFixed's duration arm (the *any path)
+		// and the uuid arm below (len==16): DurationFromBytes reads a fixed 12
+		// bytes, so it is only correct for a size-12 fixed. A CustomType-
+		// resurrected wrong-size duration (decodeFixed enforces len(b)==node.size)
+		// falls through to the raw setBytesValue, matching the suppressed binary
+		// deserFixed{size} and the plain (soft-dropped) fixed.
+		if node.kind == "fixed" && len(b) == 12 && v.Type() == avroDurationType {
 			v.Set(reflect.ValueOf(DurationFromBytes(b)))
 			return nil
 		}

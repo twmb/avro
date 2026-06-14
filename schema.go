@@ -2169,19 +2169,26 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// The kind check matters because the CustomType resurrection near the
 		// top of buildComplex can restore a soft-dropped logical onto a kind it
 		// is not valid for (uuid on bytes, timestamp-millis on string).
-		// logicalSer is keyed only on the logical name, so without the gate the
-		// binary encoder would apply serUUID/serTimestamp* on the wrong kind
-		// while the suppressed decoder, the per-kind JSON encoder, and the JSON
-		// decoder all stay raw — diverging binary from JSON and, for the string
+		// logicalSer/logicalDeser are keyed only on the logical name, so without
+		// the gate the binary codec would apply serUUID/serTimestamp* (and the
+		// matching deser) on the wrong kind while the per-kind JSON encoder and
+		// JSON decoder stay raw — diverging binary from JSON and, for the string
 		// case, producing a wire this schema's own decoder cannot read.
-		// logicalUnderlyingAccept is the same predicate validateLogical uses to
-		// soft-drop a wrong-kind logical.
-		if logSer := logicalSer(o.Logical); logSer != nil {
-			if accept := logicalUnderlyingAccept[o.Logical]; accept != nil && accept(o) {
-				b.ser = logSer
-			}
+		// logicalUnderlyingAcceptsObject is the same predicate validateLogical
+		// uses to soft-drop a wrong-kind logical; encode and decode gate on it
+		// identically so a resurrected wrong-kind logical stays raw on both.
+		//
+		// The deser ALSO suppresses on a matching CustomType (hasMatchingCustomType)
+		// so a custom decoder sees the raw Avro-native value. The validity gate is
+		// independent: a CustomType whose AvroType names a different kind resurrects
+		// the logical (resurrection keys on LogicalType only) yet does NOT match for
+		// suppression — without the validity gate the bare !hasMatchingCustomType
+		// branch would then apply the wrong-kind logical deser on binary while the
+		// kind-gated JSON path (assignBytes / decodeLogical*) stays raw.
+		if logSer := logicalSer(o.Logical); logSer != nil && logicalUnderlyingAcceptsObject(o) {
+			b.ser = logSer
 		}
-		if !b.hasMatchingCustomType(o.Type, o.Logical) {
+		if !b.hasMatchingCustomType(o.Type, o.Logical) && logicalUnderlyingAcceptsObject(o) {
 			if logDeser := logicalDeser(o.Logical); logDeser != nil {
 				b.deser = logDeser
 			}
@@ -2834,7 +2841,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			} else {
 				b.ser = serDuration
 			}
-			if hasAny {
+			// deserDuration always reads 12 bytes, so it is only correct for a
+			// size-12 fixed. Mirror the ser gate: a wrong-size duration (which
+			// validateLogical soft-drops and a CustomType can resurrect) keeps
+			// the raw deserFixed{size}, matching the plain fixed and the kind/
+			// size-checked JSON decode. hasAny suppresses for a matching custom;
+			// !logicalUnderlyingAccept covers a resurrection whose custom AvroType
+			// names a different kind (so it does NOT match for suppression).
+			if hasAny || !logicalUnderlyingAccept["duration"](o) {
 				b.deser = (&deserFixed{size}).deser
 			} else {
 				b.deser = deserDuration
@@ -2867,7 +2881,10 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			} else {
 				b.ser = serFixedUUIDReflect
 			}
-			if hasAny {
+			// deserFixedUUIDReflect always reads 16 bytes; mirror the ser gate so a
+			// wrong-size resurrected uuid keeps the raw deserFixed{size} (see the
+			// duration case for the hasAny / !logicalUnderlyingAccept split).
+			if hasAny || !logicalUnderlyingAccept["uuid"](o) {
 				b.deser = (&deserFixed{size}).deser
 			} else {
 				b.deser = deserFixedUUIDReflect
@@ -2956,6 +2973,20 @@ var logicalUnderlyingAccept = map[string]func(o *aobject) bool{
 	"duration": func(o *aobject) bool {
 		return o.Type == "fixed" && o.Size != nil && int(*o.Size) == 12
 	},
+}
+
+// logicalUnderlyingAcceptsObject reports whether o.Logical is spec-valid on
+// o's Avro underlying (type + size) — the single predicate the primitive
+// build's logical ser/deser selection gates on, identical for both directions.
+// Returns false for "decimal"/"big-decimal" (their underlying validity is
+// handled inline by validateLogical / the dedicated bytes-decimal build, not
+// this table) and for any logical with no specialized name-keyed codec, which
+// is correct: logicalSer/logicalDeser are nil there, so the gate's result is
+// moot. A CustomType-resurrected wrong-kind logical returns false here, so the
+// raw base ser/deser are kept — matching validateLogical's soft-drop.
+func logicalUnderlyingAcceptsObject(o *aobject) bool {
+	accept := logicalUnderlyingAccept[o.Logical]
+	return accept != nil && accept(o)
 }
 
 func (o *aobject) validateLogical() error {
