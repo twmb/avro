@@ -149,23 +149,39 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	}
 
 	// A parse that REFERENCES a type defined in a PRIOR cache Parse resolves
-	// the reference in the node tree (so Encode/Decode work) but leaves a
-	// dangling bare reference in the JSON-derived forms (s.c / s.full): the
-	// inherited definition lives only in the resolved node. That makes
+	// the reference in the node tree (so Encode/Decode work) but leaves a bare
+	// reference in the JSON-derived forms (s.c / s.full): the inherited
+	// definition lives only in the resolved node. That makes
 	// Canonical()/Fingerprint()/Root()/String() non-self-contained, violating
 	// the documented "independent of the cache" contract and breaking
-	// cross-impl fingerprint / single-object-encoding interop. Detect it by
-	// re-parsing s.full cache-lessly; on failure (a dangling inherited ref),
-	// splice the inherited definitions into the ORIGINAL JSON (preserving every
-	// attribute — doc, order, field props — that the node tree never stored)
-	// and rebuild the metadata forms from the now self-contained JSON, parsed
-	// cache-LESSLY so the inlined definition is not also seen as inherited.
-	// ser/deser/node (the cache-wired encode/decode path) are untouched.
+	// cross-impl fingerprint / single-object-encoding interop. Splice the
+	// inherited definitions into the ORIGINAL JSON (preserving every attribute —
+	// doc, order, field props — that the node tree never stored) and rebuild the
+	// metadata forms from the now self-contained JSON, parsed cache-LESSLY so the
+	// inlined definition is not also seen as inherited. ser/deser/node (the
+	// cache-wired encode/decode path) are untouched.
+	//
+	// The rebuild fires whenever inlineTreeDefs actually splices an inherited
+	// definition (len(inlined) > 0). The earlier trigger was "s.full does not
+	// re-parse cache-lessly" (a dangling inherited reference), but that misses a
+	// reference that re-parses to the WRONG type: a bare reference to an
+	// inherited type that, cache-lessly, FORWARD-binds to a same-named type
+	// defined LATER in this same schema. Eager binding sent the wire reference to
+	// the inherited type at its position (the later local definition cannot
+	// retroactively rebind it — see NOT_BUGS.md #24), so the node tree is right;
+	// but s.full re-parses fine with the reference bound to the local type, and
+	// its metadata then silently describes a DIFFERENT schema than the wire codec
+	// — the very resolver disagreement #24's "every resolver registers under the
+	// wire builder's keys" forbids. Splicing the inherited definition in (which
+	// inlineTreeDefs does by the same eager/positional rule) makes the metadata
+	// faithful to the node tree. A schema that references no inherited type
+	// splices nothing, so its original String() is preserved untouched.
 	selfContained := s.full
 	if len(cloned) > 0 {
-		if _, perr := Parse(s.full, opts...); perr != nil {
-			if tree, terr := unmarshalAnyPreservePrecision([]byte(s.full)); terr == nil {
-				tree = inlineTreeDefs(tree, "", c.defs, make(map[string]bool), make(map[string]bool))
+		if tree, terr := unmarshalAnyPreservePrecision([]byte(s.full)); terr == nil {
+			inlined := make(map[string]bool)
+			tree = inlineTreeDefs(tree, "", c.defs, make(map[string]bool), inlined)
+			if len(inlined) > 0 {
 				if marshaled, merr := json.Marshal(tree); merr == nil {
 					s2, rerr := Parse(string(marshaled), opts...)
 					if rerr != nil {
