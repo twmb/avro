@@ -9,8 +9,9 @@ package avro
 //
 // Rows (entry points): Parse / MustParse / SchemaCache.Parse / SchemaFor /
 // Decode / DecodeJSON / DecodeSingleObject (safe + unsafe targets) / Encode /
-// EncodeJSON / AppendSingleObject / Root / Canonical / String /
-// SchemaNode.Schema / Resolve / CheckCompatibility.
+// EncodeJSON / AppendSingleObject / Root / Canonical / String / Fingerprint /
+// SchemaNode.Schema / Resolve / CheckCompatibility / RatFromBytes /
+// DurationFromBytes / SingleObjectFingerprint.
 //
 // Columns (hostile-input classes):
 //   C1 deep nesting          — schema JSON brackets, wire value, Go encode
@@ -300,6 +301,14 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 	soeDeep := append(soeHdr[:10:10], wire...) // 2-byte magic + 8-byte fingerprint, then deep body
 	wantRejectIs(t, "DecodeSingleObject/recursive-wire", errTooDeep, func() error {
 		var n any
+		_, err := s.DecodeSingleObject(soeDeep, &n)
+		return err
+	})
+	// The unsafe (struct fast-path) DecodeSingleObject target shares the body
+	// codec, so it inherits the same depth bound — the header claims "safe +
+	// unsafe targets"; this drives the unsafe arm too.
+	wantRejectIs(t, "DecodeSingleObject/recursive-wire(unsafe)", errTooDeep, func() error {
+		var n cyclicStructNode
 		_, err := s.DecodeSingleObject(soeDeep, &n)
 		return err
 	})
@@ -629,6 +638,82 @@ func TestDoSBattery_C7_CyclicGoType(t *testing.T) {
 			F P `avro:"f"`
 		}]()
 		_ = err
+		return nil
+	})
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// C8 — DIRECT byte-slice / hash PUBLIC entry points the row list above omitted.
+//////////////////////////////////////////////////////////////////////////////
+
+// TestDoSBattery_C8_DirectByteAPIs covers the public entry points that take a
+// caller-supplied byte slice (or hostile schema) directly, bypassing Decode's
+// length-prefix bounds: RatFromBytes, DurationFromBytes, SingleObjectFingerprint,
+// and Fingerprint. Each must bound its cost on a megabyte / over-limit input
+// and never panic on a short one. These were missing from the battery's row
+// list even though two of them (the number-CPU and the metadata-hash surfaces)
+// are exactly the amplification shapes C3/C6 guard elsewhere.
+func TestDoSBattery_C8_DirectByteAPIs(t *testing.T) {
+	hostile1MiB := bytes.Repeat([]byte{0x55}, 1<<20)
+
+	// RatFromBytes (C3 number-CPU, DIRECT surface): a megabyte unscaled value or
+	// an attacker scale would drive an unbounded big.Int base conversion / 10^scale
+	// without the public-API guards (maxDecimalUnscaledBytes / decimalScaleLimit),
+	// which return a zero *big.Rat instead. Extreme: TestCoverage_RatFromBytesHostileScale.
+	wantTerminate(t, "RatFromBytes/megabyte-unscaled", func() error {
+		got := RatFromBytes(hostile1MiB, 2)
+		if got.Sign() != 0 {
+			return errors.New("over-length unscaled not bounded to zero rat")
+		}
+		return nil
+	})
+	wantTerminate(t, "RatFromBytes/hostile-scale", func() error {
+		got := RatFromBytes([]byte{0x01}, decimalScaleLimit+1)
+		if got.Sign() != 0 {
+			return errors.New("over-limit scale not bounded to zero rat")
+		}
+		return nil
+	})
+	wantTerminate(t, "RatFromBytes/hostile-negative-scale", func() error {
+		_ = RatFromBytes([]byte{0x01}, -(decimalScaleLimit + 1))
+		return nil
+	})
+
+	// DurationFromBytes (C2 length): reads exactly 12 bytes, so a megabyte input
+	// is read 12-bounded and a short input returns the zero Duration, never panics.
+	wantTerminate(t, "DurationFromBytes/megabyte", func() error {
+		_ = DurationFromBytes(hostile1MiB)
+		return nil
+	})
+	wantTerminate(t, "DurationFromBytes/short", func() error {
+		_ = DurationFromBytes([]byte{1, 2, 3})
+		return nil
+	})
+
+	// SingleObjectFingerprint (C2 length): validates the 10-byte header then reads
+	// it; a megabyte input is header-bounded and a short input errors, never panics.
+	wantTerminate(t, "SingleObjectFingerprint/megabyte", func() error {
+		_, _, err := SingleObjectFingerprint(hostile1MiB)
+		return err
+	})
+	wantTerminate(t, "SingleObjectFingerprint/short", func() error {
+		_, _, err := SingleObjectFingerprint([]byte{0xC3, 0x01})
+		return err
+	})
+
+	// Fingerprint (C6 metadata-hash): hashes Canonical(), so it inherits the
+	// maxSchemaJSONBytes budget — a megabyte Props number (stripped by PCF) and a
+	// recursive (cyclic) schema must both fingerprint fast without re-expansion.
+	wantTerminate(t, "Fingerprint/metadata-megabyte-number", func() error {
+		s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}],"x":` + strings.Repeat("9", 1<<20) + `}`)
+		if err != nil {
+			return err
+		}
+		_ = s.Fingerprint(NewRabin())
+		return nil
+	})
+	wantTerminate(t, "Fingerprint/recursive-schema", func() error {
+		_ = MustParse(recursiveNodeSchema).Fingerprint(NewRabin())
 		return nil
 	})
 }
