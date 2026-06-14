@@ -944,19 +944,22 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	if logical == "uuid" {
 		isArr16 := t.Kind() == reflect.Array && t.Elem().Kind() == reflect.Uint8 && t.Len() == 16
 		if !isArr16 {
-			ok := t.Kind() == reflect.String
-			if !ok {
-				for _, iface := range []reflect.Type{textAppenderType, textMarshalerType, textUnmarshalerType} {
-					if t.Implements(iface) || reflect.PointerTo(t).Implements(iface) {
-						ok = true
-						break
-					}
-				}
-			}
-			if !ok {
+			enc, dec := implementsTextMarshaler(t), implementsTextUnmarshaler(t)
+			stringKind := t.Kind() == reflect.String
+			byteSlice := t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8
+			switch {
+			case stringKind, byteSlice && (enc || dec), enc && dec:
+				// Round-trips as a uuid string: a string kind; a []byte slice
+				// carrying a text method; or any type implementing BOTH text
+				// directions. (The same round-trip rule as the plain string arm.)
+				return map[string]any{"type": "string", "logicalType": "uuid"}, nil
+			case enc:
+				return nil, fmt.Errorf("avro: uuid logical type on %s: it implements TextMarshaler/AppendText but not TextUnmarshaler, so a uuid string schema could encode it but not decode into it — implement both text directions or use Go string / [16]byte", t)
+			case dec:
+				return nil, fmt.Errorf("avro: uuid logical type on %s: it implements TextUnmarshaler but not TextMarshaler/AppendText, so a uuid string schema could decode into it but not encode it — implement both text directions or use Go string / [16]byte", t)
+			default:
 				return nil, fmt.Errorf("avro: uuid logical type requires Go string, [16]byte, or a text marshaler type; got %s", t)
 			}
-			return map[string]any{"type": "string", "logicalType": "uuid"}, nil
 		}
 	}
 
@@ -992,25 +995,38 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}
 	}
 
-	// Types implementing text interfaces are inferred as string,
-	// matching the encoder (TextAppender/TextMarshaler) and decoder
-	// (TextUnmarshaler) behavior. EXCEPTION: a ,uuid-tagged [16]byte is a
-	// fixed(16) uuid handled by the Array case below — the codec trusts its
-	// raw bytes and never consults the text method for a uuid-on-fixed value
-	// (see [Schema.Decode]'s uuid-on-fixed contract). Letting a text method
-	// downgrade it to a plain "string" here would silently drop the fixed(16)
-	// shape and the uuid logical type, diverging from an identical text-less
-	// [16]byte field and from what the codec actually does.
+	// A type implementing text interfaces is inferred as string — but only when
+	// a string schema ROUND-TRIPS for it. The codec encodes a string from
+	// TextMarshaler/AppendText (or a string / []byte kind) and decodes one via
+	// TextUnmarshaler (or a string / []byte kind). A string-kind or []byte-slice
+	// type round-trips regardless of which text methods it has (the kind itself
+	// covers the missing direction); any OTHER type round-trips only if it
+	// implements BOTH an encode-side method AND TextUnmarshaler. A non-string
+	// type implementing exactly one direction would yield a one-directional
+	// "string" schema whose unsupported direction fails at Encode/Decode far
+	// from here, and SchemaFor cannot reliably guess which direction the caller
+	// wants — so it refuses, the same strict-reject posture as the logical-type
+	// tags above (never emit a schema that lies about the Go type).
+	//
+	// EXCEPTION: a ,uuid-tagged [16]byte is a fixed(16) uuid handled by the
+	// Array case below — the codec trusts its raw bytes and never consults a
+	// text method for a uuid-on-fixed value (see [Schema.Decode]'s uuid-on-fixed
+	// contract); downgrading it to "string" would silently drop the fixed(16)
+	// shape and the uuid logical type.
 	uuidArr16 := logical == "uuid" && t.Kind() == reflect.Array &&
 		t.Elem().Kind() == reflect.Uint8 && t.Len() == 16
 	if !uuidArr16 {
-		for _, iface := range []reflect.Type{
-			textAppenderType,
-			textMarshalerType,
-			textUnmarshalerType,
-		} {
-			if t.Implements(iface) || reflect.PointerTo(t).Implements(iface) {
+		enc, dec := implementsTextMarshaler(t), implementsTextUnmarshaler(t)
+		if enc || dec {
+			kindFallback := t.Kind() == reflect.String ||
+				(t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8)
+			switch {
+			case kindFallback || (enc && dec):
 				return "string", nil
+			case enc:
+				return nil, fmt.Errorf("avro: type %s implements TextMarshaler/AppendText but not TextUnmarshaler: a string schema could encode it but not decode into it — implement TextUnmarshaler too, use a string/[]byte-based Go type, or define the schema explicitly", t)
+			default:
+				return nil, fmt.Errorf("avro: type %s implements TextUnmarshaler but not TextMarshaler/AppendText: a string schema could decode into it but not encode it — implement an encode-side text method (TextMarshaler/AppendText) too, use a string/[]byte-based Go type, or define the schema explicitly", t)
 			}
 		}
 	}
