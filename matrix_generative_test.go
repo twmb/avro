@@ -1005,3 +1005,106 @@ func TestMatrix_GenerativeProps(t *testing.T) {
 		t.Fatalf("rebuild dropped props: root=%#v field=%#v", rr.Props, rr.Fields[0].Props)
 	}
 }
+
+// ===========================================================================
+// Layer 6 — promotion decode-flavor × boundary values.
+//
+// The resolved/promoted decode-flavor with NORMAL values is covered by
+// matrix_evolution (PromotionPairsByContext) and matrix_typed (PromotionIn
+// EveryContext). This layer adds the boundary axis those omit, where promotion
+// is width-changing and so value-lossy by design:
+//
+//   - int→float of MaxInt32 rounds (float32 cannot hold 2^31-1);
+//   - long→double of 2^53+1 rounds (double cannot hold it);
+//   - float→double of a signaling NaN quiets the payload (a width conversion,
+//     exactly the float32→float64 case the codebase reasons about).
+//
+// The invariant is calibration-anchored, not bit-preserving: the resolved read
+// of the writer wire, re-encoded against the reader, must equal the reader's own
+// encoding of the GO-level promotion of the same value — i.e. the codec promotes
+// exactly as a plain Go conversion would, with no extra corruption.
+// ===========================================================================
+
+func goPromote(wk, rk string, v any) any {
+	switch wk + "->" + rk {
+	case "int->long":
+		return int64(v.(int32))
+	case "int->float":
+		return float32(v.(int32))
+	case "int->double":
+		return float64(v.(int32))
+	case "long->float":
+		return float32(v.(int64))
+	case "long->double":
+		return float64(v.(int64))
+	case "float->double":
+		return float64(v.(float32))
+	case "string->bytes":
+		return []byte(v.(string))
+	case "bytes->string":
+		return string(v.([]byte))
+	}
+	panic("no promotion " + wk + "->" + rk)
+}
+
+func TestMatrix_GenerativePromotionBoundary(t *testing.T) {
+	pairs := []struct {
+		wk, rk string
+		vals   []any // writer-typed boundary values
+	}{
+		{"int", "long", []any{int32(math.MaxInt32), int32(math.MinInt32), int32(0)}},
+		{"int", "float", []any{int32(math.MaxInt32), int32(math.MinInt32), int32(1 << 24), int32(1<<24 + 1)}},
+		{"int", "double", []any{int32(math.MaxInt32), int32(math.MinInt32)}},
+		{"long", "float", []any{int64(math.MaxInt64), int64(math.MinInt64)}},
+		{"long", "double", []any{int64(1<<53 + 1), int64(math.MaxInt64), int64(math.MinInt64)}},
+		{"float", "double", []any{float32(1.5), float32(math.Inf(1)), float32(math.Inf(-1)), float32(math.NaN()), sNaN32, float32(math.MaxFloat32), float32(math.Copysign(0, -1))}},
+		{"string", "bytes", []any{"", "x", strings.Repeat("s", 70000)}},
+		{"bytes", "string", []any{[]byte{}, []byte("y"), bytes.Repeat([]byte{0x41}, 70000)}},
+	}
+	// Representative contexts: top plus the per-element/per-field dispatches.
+	ctxs := []struct {
+		label  string
+		schema func(kind string) string
+		wrap   func(v any) any
+	}{
+		{"top", func(k string) string { return fmt.Sprintf("%q", k) }, func(v any) any { return v }},
+		{"array", func(k string) string { return fmt.Sprintf(`{"type":"array","items":%q}`, k) }, func(v any) any { return []any{v, v} }},
+		{"field", func(k string) string {
+			return fmt.Sprintf(`{"type":"record","name":"PR","fields":[{"name":"f","type":%q}]}`, k)
+		}, func(v any) any { return map[string]any{"f": v} }},
+	}
+	for _, p := range pairs {
+		for _, cx := range ctxs {
+			t.Run(fmt.Sprintf("%s->%s/%s", p.wk, p.rk, cx.label), func(t *testing.T) {
+				w := avro.MustParse(cx.schema(p.wk))
+				r := avro.MustParse(cx.schema(p.rk))
+				res, err := resolveBoth(t, w, r)
+				if err != nil {
+					t.Fatalf("Resolve: %v", err)
+				}
+				for _, v := range p.vals {
+					wire, err := w.AppendEncode(nil, cx.wrap(v))
+					if err != nil {
+						t.Fatalf("writer encode %v: %v", v, err)
+					}
+					var got any
+					if _, err := res.Decode(wire, &got); err != nil {
+						t.Fatalf("resolved decode %v: %v", v, err)
+					}
+					// Oracle: the reader's own encoding of the Go-level promotion.
+					wantWire, err := r.AppendEncode(nil, cx.wrap(goPromote(p.wk, p.rk, v)))
+					if err != nil {
+						t.Fatalf("reader encode promoted %v: %v", v, err)
+					}
+					gotWire, err := r.AppendEncode(nil, got)
+					if err != nil {
+						t.Fatalf("re-encode promoted %v: %v", v, err)
+					}
+					if !bytes.Equal(gotWire, wantWire) {
+						t.Fatalf("promotion %s->%s of %v (%s): wire diverges from Go-level promotion:\n got =%x\n want=%x\n value=%#v", p.wk, p.rk, v, cx.label, gotWire, wantWire, got)
+					}
+				}
+			})
+		}
+	}
+}
