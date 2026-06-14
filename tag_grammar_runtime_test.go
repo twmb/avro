@@ -1,6 +1,7 @@
 package avro_test
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/twmb/avro"
@@ -74,6 +75,67 @@ func TestRegression_RuntimeTagAliasListWithKeyword(t *testing.T) {
 	}
 	if _, err := s.AppendEncodeJSON(nil, in); err != nil {
 		t.Fatalf("json: SchemaFor-built schema cannot encode its own source type: %v", err)
+	}
+}
+
+// A MALFORMED tag (unbalanced bracket) whose comma-separated tail happens to
+// contain "inline"/"omitzero" must not fire that option. splitTag's grammar
+// cannot tokenize an unbalanced bracket, so the runtime mapper falls back to a
+// lenient form that maps the field by name with NO options — a hand-written-
+// schema user's malformed tag stays usable (no new error) but a bracket typo
+// never silently flips a field between nested-record and inline-flattened (or
+// toggles omitzero). The only difference from the well-formed alias=[x,inline]
+// case above is the missing ']'; the wire shape must be identical.
+type tagMalformedInlineSub struct {
+	X int32 `avro:"x"`
+	Y int32 `avro:"y"`
+}
+
+func TestRegression_RuntimeMalformedTagFiresNoOption(t *testing.T) {
+	// Field "f" is a nested record in the hand-written schema; the runtime must
+	// map it as such, never flatten its subfields by spuriously firing inline.
+	nested := `{"type":"record","name":"Outer","fields":[
+		{"name":"f","type":{"type":"record","name":"Inner","fields":[
+			{"name":"x","type":"int"},{"name":"y","type":"int"}]}}]}`
+	s, err := avro.Parse(nested)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	type clean struct {
+		F tagMalformedInlineSub `avro:"f"`
+	}
+	type closedBracket struct { // well-formed control: inline is an alias element
+		F tagMalformedInlineSub `avro:"f,alias=[a,inline]"`
+	}
+	type unclosedInline struct { // malformed: missing ']', "inline" trails
+		F tagMalformedInlineSub `avro:"f,alias=[a,inline"`
+	}
+	type unclosedOmitzero struct { // malformed: missing ']', "omitzero" trails
+		F tagMalformedInlineSub `avro:"f,alias=[a,omitzero"`
+	}
+
+	want, err := s.Encode(clean{F: tagMalformedInlineSub{X: 1, Y: 2}})
+	if err != nil {
+		t.Fatalf("encode clean control: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		wire func() ([]byte, error)
+	}{
+		{"closed_bracket_control", func() ([]byte, error) { return s.Encode(closedBracket{F: tagMalformedInlineSub{X: 1, Y: 2}}) }},
+		{"unclosed_inline", func() ([]byte, error) { return s.Encode(unclosedInline{F: tagMalformedInlineSub{X: 1, Y: 2}}) }},
+		{"unclosed_omitzero", func() ([]byte, error) { return s.Encode(unclosedOmitzero{F: tagMalformedInlineSub{X: 1, Y: 2}}) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.wire()
+			if err != nil {
+				t.Fatalf("encode: a malformed/aliased tag corrupted the field mapping (option spuriously fired): %v", err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("wire %x != clean %x: a tag option fired that must not have", got, want)
+			}
+		})
 	}
 }
 

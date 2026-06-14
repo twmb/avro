@@ -570,7 +570,18 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 func splitFieldTag(tag string) []string {
 	parts, err := splitTag(tag)
 	if err != nil {
-		return strings.Split(tag, ",")
+		// The tag is malformed (unbalanced brackets/parens), so splitTag's
+		// grammar cannot tokenize it. A naive strings.Split here would surface
+		// interior tokens as options — firing inline/omitzero out of an
+		// alias=[…] / decimal(…) value or any other comma-bearing fragment —
+		// the exact spurious firing splitTag was adopted to prevent, observable
+		// as a bracket typo silently flipping a field between nested-record and
+		// inline-flattened. Stay lenient (a hand-written-schema user's malformed
+		// tag must not newly error) but fire NO options: map the field under its
+		// name (the tag text up to the first comma; an Avro field name contains
+		// no comma) and drop the unparseable option fragments.
+		name, _, _ := strings.Cut(tag, ",")
+		return []string{name}
 	}
 	return parts
 }
