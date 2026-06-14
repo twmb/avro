@@ -150,10 +150,13 @@ func gtypes() []gtype {
 			{boundary: "ascii", generic: "a", oracle: avroLen([]byte("a"))},
 			{boundary: "unicode", generic: "héllo 日本 🎉", oracle: avroLen([]byte("héllo 日本 🎉"))},
 			{boundary: "nul", generic: "\x00nul", oracle: avroLen([]byte("\x00nul"))},
+			{boundary: "controls", generic: "with\nnewline\ttab", oracle: avroLen([]byte("with\nnewline\ttab"))},
+			{boundary: "spaces", generic: "  ", oracle: avroLen([]byte("  "))},
 			{boundary: "large", generic: strings.Repeat("x", 70000), oracle: avroLen([]byte(strings.Repeat("x", 70000)))},
 		}},
 		{"bytes", "bytes", func(*uniq) string { return `"bytes"` }, []gval{
 			{boundary: "empty", generic: []byte{}, oracle: avroLen(nil)},
+			{boundary: "zerobyte", generic: []byte{0x00}, oracle: avroLen([]byte{0x00})},
 			{boundary: "highbytes", generic: []byte{0xFF, 0x00, 0x7F}, oracle: avroLen([]byte{0xFF, 0x00, 0x7F})},
 			{boundary: "large", generic: bytes.Repeat([]byte{0xAB}, 70000), oracle: avroLen(bytes.Repeat([]byte{0xAB}, 70000))},
 		}},
@@ -213,6 +216,46 @@ func gtypes() []gtype {
 		{"big-decimal", "big-decimal", func(*uniq) string { return `{"type":"bytes","logicalType":"big-decimal"}` }, []gval{
 			{boundary: "normal", generic: big.NewRat(314159, 100000)},
 			{boundary: "neg", generic: big.NewRat(-7, 8)},
+		}},
+		// Every remaining logical (axis-completeness: "every logical").
+		{"time-millis", "time-millis", func(*uniq) string { return `{"type":"int","logicalType":"time-millis"}` }, []gval{
+			{boundary: "zero", generic: time.Duration(0), oracle: appendZig(nil, 0)},
+			{boundary: "max", generic: 23*time.Hour + 59*time.Minute + 59*time.Second + 999*time.Millisecond},
+		}},
+		{"time-micros", "time-micros", func(*uniq) string { return `{"type":"long","logicalType":"time-micros"}` }, []gval{
+			{boundary: "zero", generic: time.Duration(0), oracle: appendZig(nil, 0)},
+			{boundary: "max", generic: 23*time.Hour + 59*time.Minute + 59*time.Second + 999999*time.Microsecond},
+		}},
+		{"timestamp-nanos", "timestamp-nanos", func(*uniq) string { return `{"type":"long","logicalType":"timestamp-nanos"}` }, []gval{
+			{boundary: "normal", generic: time.Unix(0, 1717243496789012345).UTC()},
+			{boundary: "maxnanos", generic: time.Unix(0, math.MaxInt64).UTC()},
+			{boundary: "minnanos", generic: time.Unix(0, math.MinInt64).UTC()},
+		}},
+		{"local-ts-millis", "local-timestamp-millis", func(*uniq) string { return `{"type":"long","logicalType":"local-timestamp-millis"}` }, []gval{
+			{boundary: "normal", generic: time.UnixMilli(1717243496789).UTC()},
+		}},
+		{"local-ts-micros", "local-timestamp-micros", func(*uniq) string { return `{"type":"long","logicalType":"local-timestamp-micros"}` }, []gval{
+			{boundary: "normal", generic: time.UnixMicro(1717243496789012).UTC()},
+		}},
+		{"local-ts-nanos", "local-timestamp-nanos", func(*uniq) string { return `{"type":"long","logicalType":"local-timestamp-nanos"}` }, []gval{
+			{boundary: "normal", generic: time.Unix(0, 1717243496789012345).UTC()},
+		}},
+		{"uuid-fixed", "uuid", func(u *uniq) string {
+			return fmt.Sprintf(`{"type":"fixed","name":%q,"size":16,"logicalType":"uuid"}`, u.name("GUF"))
+		}, []gval{
+			{boundary: "normal", generic: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		}},
+		// Cardinality boundaries of enum/fixed the legacy gtypes set omits.
+		{"enum1", "enum", func(u *uniq) string {
+			return fmt.Sprintf(`{"type":"enum","name":%q,"symbols":["Only"]}`, u.name("GE1"))
+		}, []gval{
+			{boundary: "only", generic: "Only", oracle: appendZig(nil, 0)},
+		}},
+		{"fixed1", "fixed", func(u *uniq) string {
+			return fmt.Sprintf(`{"type":"fixed","name":%q,"size":1}`, u.name("GF1"))
+		}, []gval{
+			{boundary: "zero", generic: []byte{0x00}, oracle: []byte{0x00}},
+			{boundary: "high", generic: []byte{0xFF}, oracle: []byte{0xFF}},
 		}},
 		// ---- containers ----
 		{"rec2", "record", func(u *uniq) string {

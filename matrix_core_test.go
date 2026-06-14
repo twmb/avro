@@ -480,27 +480,14 @@ func runCore(t *testing.T, schemaJSON string, vin any, opts ...avro.Opt) {
 	}
 }
 
-func TestMatrix_FragmentsByContext(t *testing.T) {
-	frags := matFrags()
-	ctxs := matCtxs()
-	for _, fr := range frags {
-		for _, cx := range ctxs {
-			if cx.skip != nil && cx.skip(fr.kind) {
-				continue
-			}
-			t.Run(fr.label+"/"+cx.label, func(t *testing.T) {
-				for vi, v := range fr.values {
-					u := &uniq{}
-					schema := cx.schema(fr.schema(u), fr.kind, u)
-					vin := cx.wrap(v)
-					t.Run(fmt.Sprintf("v%d", vi), func(t *testing.T) {
-						runCore(t, schema, vin)
-					})
-				}
-			})
-		}
-	}
-}
+// TestMatrix_FragmentsByContext (fragment × context × value through runCore) was
+// RECONCILED INTO the axis-complete generator: TestMatrix_Generative in
+// matrix_generative_test.go runs the identical runCore battery over a gtypes
+// table that is a strict superset of matFrags (every primitive, every logical,
+// container) crossed with these same matCtxs, and additionally drives the
+// boundary-value axis, an independent wire oracle, and the metadata-API
+// agreement that this loop omitted. matFrags/matCtxs/runCore stay here as the
+// shared generative tables the broader matrix suite (and the generator) consume.
 
 // Two-level composition: a representative outer set around every (fragment ×
 // inner context) pair, exploding the nesting combinations.
