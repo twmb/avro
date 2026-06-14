@@ -606,3 +606,117 @@ func TestMatrix_GenerativeTyped(t *testing.T) {
 		}
 	}
 }
+
+// ===========================================================================
+// Layer 3a — resurrection regime × CONTEXT axis.
+//
+// A logical placed on an underlying it is not spec-valid for is soft-dropped to
+// the bare underlying (validateLogical) UNLESS a CustomType with the matching
+// LogicalType resurrects it. The contract: a resurrected wrong-kind/wrong-size
+// logical must fall through to the RAW kind/size-checked codec on EVERY axis.
+// custom_resurrection_parity_test.go proves this at TOP level across encode/
+// decode × binary/JSON × natural/resolved × targets × three matching shapes.
+//
+// This layer adds the axis that file omits: COMPOSITION CONTEXT. A wrong-kind
+// logical as an array element, map value, union branch, record field, or nested
+// field reaches the per-element / per-branch fast paths — a different dispatch
+// than the top-level codec — where a re-applied logical ser/deser would surface
+// as a wire-byte or value divergence from the plain (soft-dropped) schema.
+//
+// Oracle: the PLAIN schema (same JSON, no CustomType). For every resurrecting
+// shape the custom schema must be encode/decode-identical to plain in every
+// context, and its wire must read back through its own natural and identity-
+// resolved readers. Reuses resurrectionCells() and the encResult/decBin/decJSON
+// helpers; *any decode targets catch a wrongly-enriched value (it appears as a
+// logical Go type in the tree where plain yields the raw underlying).
+// ===========================================================================
+
+func TestRegression_CustomResurrectedLogicalInContext(t *testing.T) {
+	ctxs := []struct {
+		label  string
+		schema func(inner string) string
+		wrap   func(v any) any
+	}{
+		{"field", func(in string) string {
+			return fmt.Sprintf(`{"type":"record","name":"RC","fields":[{"name":"a","type":"long"},{"name":"f","type":%s}]}`, in)
+		}, func(v any) any { return map[string]any{"a": int64(3), "f": v} }},
+		{"array", func(in string) string {
+			return fmt.Sprintf(`{"type":"array","items":%s}`, in)
+		}, func(v any) any { return []any{v, v} }},
+		{"map", func(in string) string {
+			return fmt.Sprintf(`{"type":"map","values":%s}`, in)
+		}, func(v any) any { return map[string]any{"k": v} }},
+		{"union", func(in string) string {
+			return fmt.Sprintf(`["null",%s]`, in)
+		}, func(v any) any { return v }},
+		{"nested", func(in string) string {
+			return fmt.Sprintf(`{"type":"record","name":"RO","fields":[{"name":"o","type":{"type":"record","name":"RI","fields":[{"name":"f","type":%s}]}}]}`, in)
+		}, func(v any) any { return map[string]any{"o": map[string]any{"f": v}} }},
+	}
+	anyTgt := func() any { return new(any) }
+	for _, c := range resurrectionCells() {
+		for _, cx := range ctxs {
+			schema := cx.schema(c.schema)
+			// Skip a context that cannot hold this cell's underlying (e.g. a
+			// composed schema that fails to parse); none expected, but guard.
+			if _, err := avro.Parse(schema); err != nil {
+				continue
+			}
+			for _, sh := range []struct {
+				name string
+				opt  avro.SchemaOpt
+			}{
+				{"wildcard", avro.CustomType{LogicalType: c.logical}},
+				{"avrotype-match", avro.CustomType{LogicalType: c.logical, AvroType: c.kind}},
+				{"avrotype-mismatch", avro.CustomType{LogicalType: c.logical, AvroType: "boolean"}},
+			} {
+				t.Run(c.name+"/"+cx.label+"/"+sh.name, func(t *testing.T) {
+					plain := avro.MustParse(schema)
+					cs, err := avro.Parse(schema, sh.opt)
+					if err != nil {
+						t.Fatalf("parse custom: %v\nschema: %s", err, schema)
+					}
+					plainR := mustIdentityResolve(t, plain)
+					csR := mustIdentityResolve(t, cs)
+					for _, in := range c.inputs {
+						v := cx.wrap(in)
+						pbin, peb := plain.Encode(v)
+						cbin, ceb := cs.Encode(v)
+						if got, want := encResult(cbin, ceb), encResult(pbin, peb); got != want {
+							t.Errorf("binary encode %T in %s: custom=%s plain=%s — logical ser applied to wrong kind/size", in, cx.label, got, want)
+						}
+						pjsn, pej := plain.EncodeJSON(v)
+						cjsn, cej := cs.EncodeJSON(v)
+						if got, want := encResult(cjsn, cej), encResult(pjsn, pej); got != want {
+							t.Errorf("JSON encode %T in %s: custom=%q plain=%q — logical ser applied to wrong kind/size", in, cx.label, got, want)
+						}
+						if peb == nil && ceb == nil {
+							if got, want := decBin(cs, cbin, anyTgt), decBin(plain, pbin, anyTgt); got != want {
+								t.Errorf("binary decode natural %T in %s: custom=%s plain=%s — logical deser applied to wrong kind/size", in, cx.label, got, want)
+							}
+							if got, want := decBin(csR, cbin, anyTgt), decBin(plainR, pbin, anyTgt); got != want {
+								t.Errorf("binary decode RESOLVED %T in %s: custom=%s plain=%s", in, cx.label, got, want)
+							}
+							var sink any
+							if _, err := cs.Decode(cbin, &sink); err != nil {
+								t.Errorf("custom binary wire (%T in %s) not self-readable: %v", in, cx.label, err)
+							}
+						}
+						if pej == nil && cej == nil {
+							if got, want := decJSON(cs, cjsn, anyTgt), decJSON(plain, pjsn, anyTgt); got != want {
+								t.Errorf("JSON decode natural %T in %s: custom=%s plain=%s — logical deser applied to wrong kind/size", in, cx.label, got, want)
+							}
+							if got, want := decJSON(csR, cjsn, anyTgt), decJSON(plainR, pjsn, anyTgt); got != want {
+								t.Errorf("JSON decode RESOLVED %T in %s: custom=%s plain=%s", in, cx.label, got, want)
+							}
+							var sink any
+							if err := cs.DecodeJSON(cjsn, &sink); err != nil {
+								t.Errorf("custom JSON wire (%T in %s) not self-readable: %v", in, cx.label, err)
+							}
+						}
+					}
+				})
+			}
+		}
+	}
+}
