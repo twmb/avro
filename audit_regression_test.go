@@ -1934,6 +1934,117 @@ func TestRegression_CustomSuppressionScalarTargetParity(t *testing.T) {
 	}
 }
 
+// Encode-side complement of TestRegression_CustomSuppressionScalarTargetParity.
+// A CustomType registered for a built-in logical name (uuid, or a
+// date/time/timestamp logical) resurrects that logical when validateLogical has
+// soft-dropped it for sitting on a kind it is not spec-valid for (uuid is
+// string/fixed-only; the date/time/timestamp logicals are int/long-only). The
+// resurrection suppresses the codec, so the contract is the RAW Avro-native
+// value on every path: the binary decoder is suppressed to raw, the per-kind
+// JSON encoder writes raw, and the JSON decoder reads raw. The binary ENCODER
+// must match — it must not apply the logical serializer onto a kind the logical
+// is invalid for. logicalSer is keyed only on the logical name, so without a
+// kind gate the binary encoder writes the logical form (serUUID emits a UUID
+// string into a bytes value; serTimestampMillis emits a bare varint long into a
+// string value), which (a) disagrees with the raw value JSON encodes and (b)
+// for a logical whose wire shape differs from the base kind's produces a wire
+// this schema's own decoder cannot read.
+func TestRegression_CustomSuppressionWrongKindLogicalEncodeParity(t *testing.T) {
+	uuid16 := [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
+	tm := time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)
+	// Every entry in the logical-serializer table, placed on a kind it is not
+	// spec-valid for. uuid (string/fixed) on bytes; the int/long time logicals
+	// on string. The encode value is a Go type the BASE (suppressed) serializer
+	// accepts: a [16]byte for bytes, a time.Time (TextMarshaler) for string.
+	cases := []struct {
+		name, schema, logical string
+		encVal                any
+	}{
+		{"uuid-on-bytes", `{"type":"bytes","logicalType":"uuid"}`, "uuid", uuid16},
+		{"date-on-string", `{"type":"string","logicalType":"date"}`, "date", tm},
+		{"time-millis-on-string", `{"type":"string","logicalType":"time-millis"}`, "time-millis", tm},
+		{"time-micros-on-string", `{"type":"string","logicalType":"time-micros"}`, "time-micros", tm},
+		{"timestamp-millis-on-string", `{"type":"string","logicalType":"timestamp-millis"}`, "timestamp-millis", tm},
+		{"timestamp-micros-on-string", `{"type":"string","logicalType":"timestamp-micros"}`, "timestamp-micros", tm},
+		{"timestamp-nanos-on-string", `{"type":"string","logicalType":"timestamp-nanos"}`, "timestamp-nanos", tm},
+		{"local-timestamp-millis-on-string", `{"type":"string","logicalType":"local-timestamp-millis"}`, "local-timestamp-millis", tm},
+		{"local-timestamp-micros-on-string", `{"type":"string","logicalType":"local-timestamp-micros"}`, "local-timestamp-micros", tm},
+		{"local-timestamp-nanos-on-string", `{"type":"string","logicalType":"local-timestamp-nanos"}`, "local-timestamp-nanos", tm},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+			bin, eb := cs.Encode(c.encVal)
+			if eb != nil {
+				t.Fatalf("binary Encode: %v", eb)
+			}
+			jsn, ej := cs.EncodeJSON(c.encVal)
+			if ej != nil {
+				t.Fatalf("EncodeJSON: %v", ej)
+			}
+			// The binary wire must be readable by this schema's own decoder: a
+			// suppressed wrong-kind logical encodes the base kind, so a bytes/
+			// string wire is length-prefixed, never a bare varint.
+			var bv, jv any
+			if _, err := cs.Decode(bin, &bv); err != nil {
+				t.Fatalf("binary Encode produced a wire its own Decode rejects: %v", err)
+			}
+			if err := cs.DecodeJSON(jsn, &jv); err != nil {
+				t.Fatalf("DecodeJSON: %v", err)
+			}
+			// Both formats must encode the same raw Avro-native value.
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("binary vs JSON encode diverge under wrong-kind suppression: binary=%#v json=%#v", bv, jv)
+			}
+		})
+	}
+}
+
+// The kind gate that suppresses a wrong-kind logical's binary serializer must
+// NOT regress spec-valid placements, where the logical serializer is a genuine
+// superset of the base serializer (it alone accepts time.Time / a UUID string).
+// Encoding a time.Time against long+timestamp-millis (or a UUID string against
+// string+uuid) succeeds only when the logical serializer stays applied — the
+// base long/string serializer rejects a time.Time outright.
+func TestRegression_CustomSuppressionSpecValidLogicalStillApplied(t *testing.T) {
+	tm := time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)
+	cases := []struct {
+		name, schema, logical string
+		encVal                any
+	}{
+		{"uuid-on-string", `{"type":"string","logicalType":"uuid"}`, "uuid", "6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{"date-on-int", `{"type":"int","logicalType":"date"}`, "date", tm},
+		{"time-millis-on-int", `{"type":"int","logicalType":"time-millis"}`, "time-millis", 3 * time.Hour},
+		{"timestamp-millis-on-long", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", tm},
+		{"timestamp-micros-on-long", `{"type":"long","logicalType":"timestamp-micros"}`, "timestamp-micros", tm},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+			bin, eb := cs.Encode(c.encVal)
+			if eb != nil {
+				t.Fatalf("spec-valid logical encode regressed (logical serializer suppressed): %v", eb)
+			}
+			jsn, ej := cs.EncodeJSON(c.encVal)
+			if ej != nil {
+				t.Fatalf("spec-valid logical EncodeJSON: %v", ej)
+			}
+			// The encode must succeed AND round-trip through this schema's own
+			// (suppressed-to-raw) decoders identically on both wires.
+			var bv, jv any
+			if _, err := cs.Decode(bin, &bv); err != nil {
+				t.Fatalf("binary Decode: %v", err)
+			}
+			if err := cs.DecodeJSON(jsn, &jv); err != nil {
+				t.Fatalf("DecodeJSON: %v", err)
+			}
+			if !reflect.DeepEqual(bv, jv) {
+				t.Errorf("spec-valid logical binary vs JSON diverge: binary=%#v json=%#v", bv, jv)
+			}
+		})
+	}
+}
+
 // The bare-number JSON decode convenience (a hand-edited producer writing
 // 123.45 instead of the spec codepoint-string form) is a decimal-family arm
 // reached through hasDecimalBareNumberArm by BOTH decodeBytes and decodeFixed.

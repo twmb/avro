@@ -2160,13 +2160,26 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.ser = ser
 		b.deser = deserPrimitive[o.Type]
-		// Always use the logical type serializer if available — it's a
-		// strict superset of the base serializer (accepts time.Time etc.
-		// in addition to raw values). Only the deserializer is suppressed
-		// when a custom type matches, so that Decode produces raw
+		// Use the logical serializer when the logical is spec-valid for this
+		// underlying kind — there it is a strict superset of the base serializer
+		// (accepts time.Time etc. in addition to raw values). The deserializer
+		// is suppressed below when a custom type matches, so Decode produces raw
 		// Avro-native values for the custom decoder.
+		//
+		// The kind check matters because the CustomType resurrection near the
+		// top of buildComplex can restore a soft-dropped logical onto a kind it
+		// is not valid for (uuid on bytes, timestamp-millis on string).
+		// logicalSer is keyed only on the logical name, so without the gate the
+		// binary encoder would apply serUUID/serTimestamp* on the wrong kind
+		// while the suppressed decoder, the per-kind JSON encoder, and the JSON
+		// decoder all stay raw — diverging binary from JSON and, for the string
+		// case, producing a wire this schema's own decoder cannot read.
+		// logicalUnderlyingAccept is the same predicate validateLogical uses to
+		// soft-drop a wrong-kind logical.
 		if logSer := logicalSer(o.Logical); logSer != nil {
-			b.ser = logSer
+			if accept := logicalUnderlyingAccept[o.Logical]; accept != nil && accept(o) {
+				b.ser = logSer
+			}
 		}
 		if !b.hasMatchingCustomType(o.Type, o.Logical) {
 			if logDeser := logicalDeser(o.Logical); logDeser != nil {
