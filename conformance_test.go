@@ -21838,6 +21838,19 @@ func TestRegression_JSONNumberStringySchemasRejectEncode(t *testing.T) {
 func TestRegression_DecimalUnscaledLengthDoS(t *testing.T) {
 	const cap = 32 << 10 // must match maxDecimalUnscaledBytes (deser.go)
 
+	// The cap must make hostile decodes reject FAST. The JSON codepoint path's
+	// residual cost is the unavoidable O(n) scan of the 1 MiB string (the cap
+	// fires only after the scan materializes the unscaled bytes) — race
+	// instrumentation inflates that scan past a 100ms bound while the capped
+	// base conversion never runs. Use a generous threshold under -race, matching
+	// the sibling DoS timing tests (TestRegression_ParseFloatLengthCapDoS); a
+	// real unbounded base conversion (~2.7s for a 1 MiB unscaled value, far more
+	// under -race) still trips it, so the test stays meaningful in both modes.
+	timingThreshold := 100 * time.Millisecond
+	if isRaceEnabled() {
+		timingThreshold = 3 * time.Second
+	}
+
 	avroBytesField := func(b []byte) []byte { return append(zigzagEncode64(int64(len(b))), b...) }
 	bigDecWire := func(uBytes []byte) []byte { // length-prefixed unscaled || zigzag scale(0), all wrapped as a bytes field
 		inner := append(avroBytesField(uBytes), zigzagEncode64(0)...)
@@ -21878,8 +21891,8 @@ func TestRegression_DecimalUnscaledLengthDoS(t *testing.T) {
 				}
 				start := time.Now()
 				_, err := tc.s.Decode(tc.wire, dst)
-				if d := time.Since(start); d > 100*time.Millisecond {
-					t.Fatalf("decode took %s (>100ms): unbounded decimal unscaled-length DoS", d)
+				if d := time.Since(start); d > timingThreshold {
+					t.Fatalf("decode took %s (>%s): unbounded decimal unscaled-length DoS", d, timingThreshold)
 				}
 				if err == nil {
 					t.Fatalf("over-length decimal: want rejection, got nil error")
@@ -21895,8 +21908,8 @@ func TestRegression_DecimalUnscaledLengthDoS(t *testing.T) {
 		var x json.Number
 		start := time.Now()
 		err := bytesDec.DecodeJSON(jsonWire, &x)
-		if d := time.Since(start); d > 100*time.Millisecond {
-			t.Fatalf("DecodeJSON took %s (>100ms): unbounded decimal unscaled-length DoS", d)
+		if d := time.Since(start); d > timingThreshold {
+			t.Fatalf("DecodeJSON took %s (>%s): unbounded decimal unscaled-length DoS", d, timingThreshold)
 		}
 		if err == nil {
 			t.Fatalf("over-length decimal via JSON codepoint form: want rejection, got nil")
@@ -21911,8 +21924,8 @@ func TestRegression_DecimalUnscaledLengthDoS(t *testing.T) {
 		if _, err := bytesDec.Decode(avroBytesField(bytes.Repeat([]byte{0x55}, cap)), &x); err != nil {
 			t.Fatalf("at-cap decimal must decode: %v", err)
 		}
-		if d := time.Since(start); d > 100*time.Millisecond {
-			t.Fatalf("at-cap decimal decode took %s (>100ms): cap too loose", d)
+		if d := time.Since(start); d > timingThreshold {
+			t.Fatalf("at-cap decimal decode took %s (>%s): cap too loose", d, timingThreshold)
 		}
 	})
 
