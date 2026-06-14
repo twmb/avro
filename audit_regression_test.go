@@ -1,6 +1,7 @@
 package avro_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -2017,6 +2018,12 @@ func TestRegression_CustomSuppressionSpecValidLogicalStillApplied(t *testing.T) 
 		{"time-millis-on-int", `{"type":"int","logicalType":"time-millis"}`, "time-millis", 3 * time.Hour},
 		{"timestamp-millis-on-long", `{"type":"long","logicalType":"timestamp-millis"}`, "timestamp-millis", tm},
 		{"timestamp-micros-on-long", `{"type":"long","logicalType":"timestamp-micros"}`, "timestamp-micros", tm},
+		// The spec-valid fixed sizes (uuid=16, duration=12) are the boundary-1
+		// controls for the wrong-size fixed gate below: the logical serializer
+		// must stay applied here (it alone accepts a UUID string / avro.Duration;
+		// the base serSize rejects them), only the wrong-size placements drop it.
+		{"uuid-on-fixed16", `{"type":"fixed","name":"F16","size":16,"logicalType":"uuid"}`, "uuid", "6ba7b810-9dad-11d1-80b4-00c04fd430c8"},
+		{"duration-on-fixed12", `{"type":"fixed","name":"D12","size":12,"logicalType":"duration"}`, "duration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -2040,6 +2047,88 @@ func TestRegression_CustomSuppressionSpecValidLogicalStillApplied(t *testing.T) 
 			}
 			if !reflect.DeepEqual(bv, jv) {
 				t.Errorf("spec-valid logical binary vs JSON diverge: binary=%#v json=%#v", bv, jv)
+			}
+		})
+	}
+}
+
+// Wrong-SIZE complement of TestRegression_CustomSuppressionWrongKindLogicalEncodeParity
+// (which covers wrong KIND on primitive underlyings). uuid is fixed-valid only
+// at size 16 and duration only at size 12 (logicalUnderlyingAccept, the same
+// predicate validateLogical soft-drops a wrong-size fixed logical with). A
+// no-Encode CustomType resurrects the soft-dropped logical, so the contract is
+// the RAW Avro-native value on every path. serFixedUUIDReflect always emits 16
+// bytes and serDuration always 12, regardless of the declared size; the JSON
+// fixed arms do the same. Without the size gate the binary and JSON encoders
+// write the 16/12-byte logical form into a differently-sized fixed, producing a
+// wire this schema's own decoders (which read `size` bytes) reject — and
+// diverging from the plain (no-custom) fixed, which soft-drops to raw and
+// round-trips. The fix keeps the base serSize{size} / size-checked raw JSON
+// path for a wrong-size resurrected logical, so registering the passive custom
+// does not change the wire at all.
+func TestRegression_CustomSuppressionWrongSizeFixedLogicalEncodeParity(t *testing.T) {
+	uuid16 := [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
+	dur := avro.Duration{Months: 1, Days: 2, Milliseconds: 3}
+	cases := []struct {
+		name, schema, logical string
+		size                  int
+		// logical is the Go value the SIZE-BLIND logical serializer accepts
+		// (a 16-byte UUID array / an avro.Duration) — the exact input that, at
+		// the wrong size, drove the pre-fix self-incompatible wire. Post-fix the
+		// custom schema must treat it identically to the plain fixed (both
+		// reject it: it is not `size` raw bytes). raw[size] is the legitimate
+		// raw fixed value both must accept identically.
+		logical2 any
+	}{
+		{"uuid-on-fixed20", `{"type":"fixed","name":"F","size":20,"logicalType":"uuid"}`, "uuid", 20, uuid16},
+		{"duration-on-fixed16", `{"type":"fixed","name":"D","size":16,"logicalType":"duration"}`, "duration", 16, dur},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw := make([]byte, c.size)
+			for i := range raw {
+				raw[i] = byte(i + 1)
+			}
+			cs := avro.MustParse(c.schema, avro.CustomType{LogicalType: c.logical})
+			plain := avro.MustParse(c.schema) // no custom: logical soft-drops to plain fixed
+
+			// Invariant: a passive (no-Encode) custom registered for the logical
+			// name must make the wrong-size fixed behave EXACTLY like the plain
+			// fixed of that size — same accept/reject, same bytes, self-readable —
+			// for every input. The raw[size] input pins the legitimate round trip;
+			// the logical-shaped input (16-byte UUID / Duration) pins that the
+			// size-blind logical serializer is NOT applied (pre-fix it wrote a
+			// 16/12-byte wire the schema's own decoder rejected, on both wires).
+			for _, in := range []any{any(raw), c.logical2} {
+				cbin, ceb := cs.Encode(in)
+				pbin, peb := plain.Encode(in)
+				if (ceb == nil) != (peb == nil) {
+					t.Errorf("input %T: custom binary err=%v but plain binary err=%v — passive custom changed acceptance (wrong-size logical applied)", in, ceb, peb)
+				}
+				if ceb == nil && peb == nil {
+					if !bytes.Equal(cbin, pbin) {
+						t.Errorf("input %T: custom binary wire != plain wire — wrong-size logical serializer applied", in)
+					}
+					var bv any
+					if _, err := cs.Decode(cbin, &bv); err != nil {
+						t.Errorf("input %T: custom binary wire (len=%d) not readable by its own decoder: %v", in, len(cbin), err)
+					}
+				}
+
+				cjsn, cej := cs.EncodeJSON(in)
+				pjsn, pej := plain.EncodeJSON(in)
+				if (cej == nil) != (pej == nil) {
+					t.Errorf("input %T: custom JSON err=%v but plain JSON err=%v — passive custom changed acceptance (wrong-size logical applied)", in, cej, pej)
+				}
+				if cej == nil && pej == nil {
+					if !bytes.Equal(cjsn, pjsn) {
+						t.Errorf("input %T: custom JSON %q != plain JSON %q — wrong-size logical serializer applied", in, cjsn, pjsn)
+					}
+					var jv any
+					if err := cs.DecodeJSON(cjsn, &jv); err != nil {
+						t.Errorf("input %T: custom JSON not readable by its own decoder: %v", in, err)
+					}
+				}
 			}
 		})
 	}

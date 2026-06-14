@@ -2820,7 +2820,16 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		hasAny := b.hasMatchingCustomType("fixed", s.object.Logical)
 		switch s.object.Logical {
 		case "duration":
-			if hasEnc {
+			// serDuration always emits 12 bytes, so it is only correct for a
+			// size-12 fixed. validateLogical soft-drops a duration on a wrong
+			// size, but the CustomType resurrection near the top of buildComplex
+			// can restore it; without the size gate serDuration would write 12
+			// bytes into a size != 12 fixed — a wire this schema's own
+			// deserFixed{size} reader (and the JSON arm) cannot read.
+			// logicalUnderlyingAccept is the same size predicate validateLogical
+			// uses to soft-drop, so a resurrected wrong-size logical keeps the
+			// raw serSize, matching the suppressed decoder.
+			if hasEnc || !logicalUnderlyingAccept["duration"](o) {
 				b.ser = (&serSize{size}).ser
 			} else {
 				b.ser = serDuration
@@ -2846,7 +2855,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				b.deser = (&deserFixedDecimal{size: size, scale: scale}).deser
 			}
 		case "uuid":
-			if hasEnc {
+			// serFixedUUIDReflect always emits 16 bytes, so it is only correct for
+			// a size-16 fixed. validateLogical soft-drops a uuid on a wrong size,
+			// but the CustomType resurrection can restore it; without the size
+			// gate serFixedUUIDReflect would write 16 bytes into a size != 16
+			// fixed — a wire this schema's own deserFixed{size} reader (and the
+			// JSON arm) cannot read. logicalUnderlyingAccept is the same size
+			// predicate validateLogical uses to soft-drop.
+			if hasEnc || !logicalUnderlyingAccept["uuid"](o) {
 				b.ser = (&serSize{size}).ser
 			} else {
 				b.ser = serFixedUUIDReflect

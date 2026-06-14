@@ -581,11 +581,23 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 					return appendAvroJSONBytes(buf, padded), nil
 				}
 			case "duration":
-				if v.Type() == avroDurationType {
+				// Duration.Bytes() always emits 12 bytes, so it is only correct
+				// for the spec-required size-12 fixed. A CustomType-resurrected
+				// wrong-size duration (mirroring the binary fixed build) falls
+				// through to the size-checked raw path below, so JSON encode stays
+				// raw and self-readable.
+				if node.size == 12 && v.Type() == avroDurationType {
 					raw := v.Interface().(Duration).Bytes()
 					return appendAvroJSONBytes(buf, raw[:]), nil
 				}
 			case "uuid":
+				// Only emit the 16-byte UUID form for the spec-required size-16
+				// fixed; a CustomType-resurrected wrong-size uuid (mirroring the
+				// binary fixed build) breaks to the size-checked raw path below,
+				// so JSON encode stays raw and self-readable.
+				if node.size != 16 {
+					break
+				}
 				// [16]byte trusts its bytes (uuidBytes-first, matching binary
 				// serFixedUUIDReflect): the raw 16 bytes are the wire form, with
 				// no MarshalText→parseUUID round trip. Without this, a [16]byte
