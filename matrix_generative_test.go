@@ -720,3 +720,152 @@ func TestRegression_CustomResurrectedLogicalInContext(t *testing.T) {
 		}
 	}
 }
+
+// ===========================================================================
+// Layer 3b — the CustomType callback-config axis on VALID logicals.
+//
+// The five configs are {absent, passive, encode-only, decode-only, both}.
+// absent (built-in both ways) is covered by the gtypes round-trip; passive
+// (suppress), both (box), and count are covered by matrix_custom_test.go. This
+// layer adds the two it omits — encode-only and decode-only — which exercise
+// the ASYMMETRIC suppression gates (hasMatchingCustomTypeWithEncode keys on
+// Encode!=nil for the encoder; hasMatchingCustomType keys on any non-wildcard
+// match for the decoder).
+//
+// Oracles, anchored so the fixed/decimal JSON-suppression nuance can't false-
+// fail: the PLAIN schema's wire (built-in) and the PASSIVE schema's raw decode
+// (calibration). A cbox callback proves the custom side actually fired.
+// ===========================================================================
+
+func TestMatrix_GenerativeCustomConfigs(t *testing.T) {
+	notEnriched := func(t *testing.T, v any, what string) {
+		t.Helper()
+		switch v.(type) {
+		case time.Time, time.Duration, *big.Rat, avro.Duration:
+			t.Fatalf("%s: raw value is enriched %T (logical deser fired where it must not)", what, v)
+		}
+	}
+	for _, fr := range customFrags() {
+		for _, pos := range customPositions() {
+			posSchema := pos.schema(fr.schema)
+			if pos.label == "multibranch" {
+				posSchema = fmt.Sprintf(`["null","boolean",%s,%s]`, fr.schema, customPad(fr))
+				if _, err := avro.Parse(posSchema); err != nil {
+					continue
+				}
+			}
+			plain := avro.MustParse(posSchema)
+			vin := pos.wrap(fr.enriched)
+			plainWire, err := plain.AppendEncode(nil, vin)
+			if err != nil {
+				t.Fatalf("%s/%s plain encode: %v", fr.label, pos.label, err)
+			}
+			plainJSON, err := plain.AppendEncodeJSON(nil, vin)
+			if err != nil {
+				t.Fatalf("%s/%s plain encodeJSON: %v", fr.label, pos.label, err)
+			}
+			// Calibrate the raw underlying tree via a passive (suppress) decode.
+			passive := avro.MustParse(posSchema, avro.CustomType{LogicalType: fr.logical})
+			var rawTree any
+			if _, err := passive.Decode(plainWire, &rawTree); err != nil {
+				t.Fatalf("%s/%s raw calibration: %v", fr.label, pos.label, err)
+			}
+
+			// ---- decode-only: built-in encode (byte-identical to plain),
+			// custom Decode boxes the RAW underlying. ----
+			t.Run(fr.label+"/"+pos.label+"/decode-only", func(t *testing.T) {
+				ct := avro.CustomType{
+					LogicalType: fr.logical,
+					Decode:      func(v any, _ *avro.SchemaNode) (any, error) { return cbox{Raw: v}, nil },
+				}
+				s := avro.MustParse(posSchema, ct)
+				// Encode is built-in => byte-identical wire and JSON to plain.
+				if w, err := s.AppendEncode(nil, vin); err != nil || !bytes.Equal(w, plainWire) {
+					t.Fatalf("decode-only encode not built-in: err=%v\n got=%x\nwant=%x", err, w, plainWire)
+				}
+				if j, err := s.AppendEncodeJSON(nil, vin); err != nil || !bytes.Equal(j, plainJSON) {
+					t.Fatalf("decode-only encodeJSON not built-in: err=%v\n got=%s\nwant=%s", err, j, plainJSON)
+				}
+				// Decode boxes the raw underlying on both wire formats, equally.
+				var aBin any
+				if _, err := s.Decode(plainWire, &aBin); err != nil {
+					t.Fatalf("decode-only binary decode: %v", err)
+				}
+				boxBin, ok := pos.unwrap(aBin).(cbox)
+				if !ok {
+					t.Fatalf("decode-only did not box (binary): %T", pos.unwrap(aBin))
+				}
+				notEnriched(t, boxBin.Raw, "decode-only binary")
+				var aJSON any
+				if err := s.DecodeJSON(plainJSON, &aJSON); err != nil {
+					t.Fatalf("decode-only JSON decode: %v", err)
+				}
+				boxJSON, ok := pos.unwrap(aJSON).(cbox)
+				if !ok {
+					t.Fatalf("decode-only did not box (JSON): %T", pos.unwrap(aJSON))
+				}
+				if !matEqual(boxBin.Raw, boxJSON.Raw) {
+					t.Fatalf("decode-only binary/JSON raw diverge:\n bin=%#v\njson=%#v", boxBin.Raw, boxJSON.Raw)
+				}
+			})
+
+			// ---- encode-only: custom Encode unboxes to raw (built-in encode
+			// suppressed), Decode is raw (suppressed). ----
+			t.Run(fr.label+"/"+pos.label+"/encode-only", func(t *testing.T) {
+				ct := avro.CustomType{
+					LogicalType: fr.logical,
+					Encode: func(v any, _ *avro.SchemaNode) (any, error) {
+						if b, ok := v.(cbox); ok {
+							return b.Raw, nil
+						}
+						return nil, avro.ErrSkipCustomType
+					},
+				}
+				s := avro.MustParse(posSchema, ct)
+				// Decode is suppressed => raw, identical to the passive schema.
+				var aBin any
+				if _, err := s.Decode(plainWire, &aBin); err != nil {
+					t.Fatalf("encode-only binary decode: %v", err)
+				}
+				notEnriched(t, pos.unwrap(aBin), "encode-only binary decode")
+				if !matEqual(aBin, rawTree) {
+					t.Fatalf("encode-only decode not raw:\n got=%#v\nraw=%#v", aBin, rawTree)
+				}
+				// Encode the boxed raw tree: unbox => base encode => plain wire.
+				boxed := boxRawTree(pos, rawTree)
+				if w, err := s.AppendEncode(nil, boxed); err != nil || !bytes.Equal(w, plainWire) {
+					t.Fatalf("encode-only boxed encode not raw-equivalent: err=%v\n got=%x\nwant=%x", err, w, plainWire)
+				}
+				// JSON encode of the boxed raw tree round-trips back to raw.
+				jb, err := s.AppendEncodeJSON(nil, boxed)
+				if err != nil {
+					t.Fatalf("encode-only boxed encodeJSON: %v", err)
+				}
+				var jBack any
+				if err := s.DecodeJSON(jb, &jBack); err != nil {
+					t.Fatalf("encode-only JSON round-trip decode: %v\n j=%s", err, jb)
+				}
+				if !matEqual(jBack, rawTree) {
+					t.Fatalf("encode-only JSON round-trip not raw:\n got=%#v\nraw=%#v", jBack, rawTree)
+				}
+			})
+		}
+	}
+}
+
+// boxRawTree wraps the inner (unwrapped) raw value of a position's raw tree in a
+// cbox, leaving the surrounding structure intact — the encode-only callback
+// unboxes exactly that inner value.
+func boxRawTree(pos customPos, rawTree any) any {
+	inner := pos.unwrap(rawTree)
+	boxedInner := cbox{Raw: inner}
+	switch pos.label {
+	case "top", "nullunion", "multibranch":
+		return boxedInner
+	case "field":
+		return map[string]any{"a": int64(4), "f": boxedInner}
+	case "array":
+		return []any{boxedInner, boxedInner}
+	}
+	return boxedInner
+}
