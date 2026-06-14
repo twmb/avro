@@ -107,15 +107,15 @@ func TestRegression_DeepValidSchemaParsesLinear(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse valid deep schema: %v", err)
 	}
-	if d := time.Since(t0); d > 200*time.Millisecond {
-		t.Errorf("valid 900-deep schema parsed in %v; want <200ms (O(n^2) regression?)", d)
+	if d, bound := time.Since(t0), raceRelaxed(200*time.Millisecond); d > bound {
+		t.Errorf("valid 900-deep schema parsed in %v; want <%v (O(n^2) regression?)", d, bound)
 	}
 	// Canonical()/Fingerprint must also be linear (it is on the hot Parse
 	// path for the SOE fingerprint).
 	t1 := time.Now()
 	_ = s.Canonical()
-	if d := time.Since(t1); d > 200*time.Millisecond {
-		t.Errorf("Canonical() of 900-deep schema took %v; want <200ms", d)
+	if d, bound := time.Since(t1), raceRelaxed(200*time.Millisecond); d > bound {
+		t.Errorf("Canonical() of 900-deep schema took %v; want <%v", d, bound)
 	}
 }
 
@@ -173,8 +173,8 @@ func TestRegression_RootSchemaEmitterLinearOnDeepNesting(t *testing.T) {
 	if _, err := root.Schema(); err != nil {
 		t.Fatalf("Root().Schema(): %v", err)
 	}
-	if d := time.Since(t0); d > 500*time.Millisecond {
-		t.Errorf("Root().Schema() of a %d-deep record chain took %v; want <500ms (O(depth*subtree) regression in toJSONWalk)", depth, d)
+	if d, bound := time.Since(t0), raceRelaxed(500*time.Millisecond); d > bound {
+		t.Errorf("Root().Schema() of a %d-deep record chain took %v; want <%v (O(depth*subtree) regression in toJSONWalk)", depth, d, bound)
 	}
 }
 

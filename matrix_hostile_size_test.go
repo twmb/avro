@@ -44,7 +44,11 @@ func TestMatrix_HostileSizeRejects(t *testing.T) {
 		{"string-into-nullunion", `["null","int"]`, bigStr},
 		{"string-into-uuid-fixed", `{"type":"fixed","name":"HU","size":16,"logicalType":"uuid"}`, bigStr},
 	}
-	const maxDur = 250 * time.Millisecond // generous CI headroom; locally ~µs
+	// The reject is locally ~µs; 250ms is generous CI headroom. Under -race,
+	// instrumentation inflates the bounded reject past 250ms, so relax to a
+	// ~3s ceiling there — a superlinear blowup before the type check is
+	// multi-second and still trips it (see raceRelaxed).
+	maxDur := raceRelaxed(250 * time.Millisecond)
 	const maxErrLen = 2 << 10
 
 	for _, c := range cases {
@@ -100,8 +104,8 @@ func TestMatrix_HostileSizeDecodeMessages(t *testing.T) {
 	if derr == nil {
 		t.Fatal("string wire into int target unexpectedly accepted")
 	}
-	if d > 250*time.Millisecond {
-		t.Errorf("decode reject took %v", d)
+	if bound := raceRelaxed(250 * time.Millisecond); d > bound {
+		t.Errorf("decode reject took %v (>%v)", d, bound)
 	}
 	if n := len(derr.Error()); n > 2<<10 {
 		t.Errorf("decode reject error echoes wire content: %d bytes", n)

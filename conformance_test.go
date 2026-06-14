@@ -11447,9 +11447,10 @@ func TestRegression_FiniteScaleCPUBound(t *testing.T) {
 	elapsed := time.Since(start)
 	// Either we reject (out-of-bound scale) or accept very fast.
 	// The BitLen check must short-circuit before the 5-power loop;
-	// otherwise this takes ~1.4 CPU seconds.
-	if elapsed > 200*time.Millisecond {
-		t.Fatalf("Encoding 1/10^65536 took %v (>200ms cap); amplification regression", elapsed)
+	// otherwise this takes ~1.4 CPU seconds (which trips even the
+	// race-relaxed bound).
+	if bound := raceRelaxed(200 * time.Millisecond); elapsed > bound {
+		t.Fatalf("Encoding 1/10^65536 took %v (>%v cap); amplification regression", elapsed, bound)
 	}
 	// scale 65536 is exactly the documented cap, so a terminating decimal
 	// at that scale must ACCEPT (not be wrongly rejected) and finish fast.
@@ -11532,8 +11533,8 @@ func TestRegression_BigDecimalRatErrorMessageBounded(t *testing.T) {
 		if n := len(err.Error()); n > 1024 {
 			t.Errorf("%s: error message is %d bytes — unbounded user-value echo", name, n)
 		}
-		if el > 100*time.Millisecond {
-			t.Errorf("%s: reject took %v (>100ms) — error-message amplification", name, el)
+		if bound := raceRelaxed(100 * time.Millisecond); el > bound {
+			t.Errorf("%s: reject took %v (>%v) — error-message amplification", name, el, bound)
 		}
 	}
 
@@ -15036,6 +15037,11 @@ func TestParity_CheckCompatibilityMatrix(t *testing.T) {
 // any legitimate boundary-input cost we've measured and well below
 // the seconds-class regression that motivated the matrix.
 func TestParity_CPUCostSentinels(t *testing.T) {
+	// 200ms is conservative for "accept fast or reject fast"; relax to a
+	// generous ceiling under -race, where instrumentation inflates the
+	// bounded boundary-input work past a tight bound. The seconds-class
+	// regression this matrix guards against still trips the relaxed bound.
+	bound := raceRelaxed(200 * time.Millisecond)
 	t.Run("big-decimal encode of 1/10^cap", func(t *testing.T) {
 		// finiteScale derives the scale in O(M(scale)) (one 5^b
 		// exponentiation + compare), so a value at the cap encodes in a
@@ -15046,8 +15052,8 @@ func TestParity_CPUCostSentinels(t *testing.T) {
 		s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
 		start := time.Now()
 		_, _ = s.AppendEncode(nil, r)
-		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
-			t.Fatalf("encoding 1/10^65536 took %v (>200ms cap)", elapsed)
+		if elapsed := time.Since(start); elapsed > bound {
+			t.Fatalf("encoding 1/10^65536 took %v (>%v cap)", elapsed, bound)
 		}
 	})
 	t.Run("big-decimal encode of 1/2^cap", func(t *testing.T) {
@@ -15058,8 +15064,8 @@ func TestParity_CPUCostSentinels(t *testing.T) {
 		s := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
 		start := time.Now()
 		_, _ = s.AppendEncode(nil, r)
-		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
-			t.Fatalf("encoding 1/2^65536 took %v (>200ms cap)", elapsed)
+		if elapsed := time.Since(start); elapsed > bound {
+			t.Fatalf("encoding 1/2^65536 took %v (>%v cap)", elapsed, bound)
 		}
 	})
 	t.Run("decimal encode at precision cap", func(t *testing.T) {
@@ -15069,7 +15075,7 @@ func TestParity_CPUCostSentinels(t *testing.T) {
 		r := new(big.Rat).SetInt(bigNum)
 		start := time.Now()
 		_, _ = s.AppendEncode(nil, r)
-		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		if elapsed := time.Since(start); elapsed > bound {
 			t.Fatalf("decimal encode at precision cap took %v", elapsed)
 		}
 	})
@@ -15094,7 +15100,7 @@ func TestParity_CPUCostSentinels(t *testing.T) {
 		var out any
 		start := time.Now()
 		_, _ = s.Decode(wire, &out)
-		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		if elapsed := time.Since(start); elapsed > bound {
 			t.Fatalf("big-decimal decode at scale cap took %v", elapsed)
 		}
 	})
@@ -15108,7 +15114,7 @@ func TestParity_CPUCostSentinels(t *testing.T) {
 		var out any
 		start := time.Now()
 		_, _ = s.Decode(wire, &out)
-		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		if elapsed := time.Since(start); elapsed > bound {
 			t.Fatalf("array<null> at cap took %v", elapsed)
 		}
 	})
@@ -15120,7 +15126,7 @@ func TestParity_CPUCostSentinels(t *testing.T) {
 		var out any
 		start := time.Now()
 		_ = s.DecodeJSON([]byte(`1e65536`), &out)
-		if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		if elapsed := time.Since(start); elapsed > bound {
 			t.Fatalf("decimal JSON decode of 1e65536 took %v", elapsed)
 		}
 	})
@@ -19454,6 +19460,21 @@ func isRaceEnabled() bool {
 	return raceEnabled
 }
 
+// raceRelaxed returns a wall-clock DoS-timing ceiling: the tight normal bound,
+// or a generous ~3s ceiling under -race where instrumentation inflates
+// otherwise-fast bounded work (a µs/ms reject, a linear parse) past a tight
+// bound. The tight bound stays in effect normally so a regression is caught
+// sensitively; a real unbounded/superlinear blowup is multi-second and trips
+// even the generous ceiling, so detection is preserved under -race too. This is
+// the shared form of the inline branch on TestRegression_ParseFloatLengthCapDoS.
+// It never TIGHTENS (a normal bound already >= 3s is returned unchanged).
+func raceRelaxed(normal time.Duration) time.Duration {
+	if isRaceEnabled() && normal < 3*time.Second {
+		return 3 * time.Second
+	}
+	return normal
+}
+
 // TestRegression_OCFWriterPreservesLogicalTypeInHeader pins that the
 // OCF writer writes the full schema JSON (preserving logicalType,
 // precision, scale, doc, aliases, default) to the avro.schema header,
@@ -21053,8 +21074,8 @@ func TestJSONNumberMapKeyContentValidated(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected reject")
 		}
-		if d > 100*time.Millisecond {
-			t.Fatalf("hostile 1MiB key rejected slowly: %v", d)
+		if bound := raceRelaxed(100 * time.Millisecond); d > bound {
+			t.Fatalf("hostile 1MiB key rejected slowly: %v (>%v)", d, bound)
 		}
 	})
 }

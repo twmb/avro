@@ -340,8 +340,8 @@ func TestRegression_InfiniteRecursiveDefaultRejected(t *testing.T) {
 			// Must complete (the bound stops the recursion) and must reject.
 			start := time.Now()
 			_, err := avro.Parse(c.schema)
-			if d := time.Since(start); d > time.Second {
-				t.Fatalf("Parse took %v (recursion not bounded)", d)
+			if d, bound := time.Since(start), raceRelaxed(time.Second); d > bound {
+				t.Fatalf("Parse took %v (>%v; recursion not bounded)", d, bound)
 			}
 			if err == nil {
 				t.Fatalf("Parse accepted a default with no finite encoding; want rejection")

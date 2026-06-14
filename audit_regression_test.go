@@ -2742,8 +2742,8 @@ func TestRegression_FixedLogicalProbeSizeBounded(t *testing.T) {
 	if panicVal != nil {
 		t.Fatalf("Parse panicked on a large fixed size (parse-time make([]byte, size) DoS): %v", panicVal)
 	}
-	if elapsed > 100*time.Millisecond {
-		t.Fatalf("Parse of a large-fixed-size schema took %v (>100ms): allocation proportional to size", elapsed)
+	if bound := raceRelaxed(100 * time.Millisecond); elapsed > bound {
+		t.Fatalf("Parse of a large-fixed-size schema took %v (>%v): allocation proportional to size", elapsed, bound)
 	}
 
 	// Answer-preservation at the in-range sizes: a no-callback CustomType on a
