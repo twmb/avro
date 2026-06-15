@@ -1,6 +1,7 @@
 package avro_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/twmb/avro"
@@ -385,6 +386,57 @@ func TestRegression_SchemaCacheWrappedFormCrossParseRefSelfContains(t *testing.T
 		}
 		if _, err := avro.Parse(y.String()); err != nil {
 			t.Errorf("control: Parse(bare Y2.String()) must succeed: %v", err)
+		}
+	})
+
+	// A type referencing the same cached type TWICE via the wrapped form. The
+	// FIRST occurrence inlines X's definition; a LATER wrapped occurrence resolves
+	// to an already-inlined type and so does not splice. Its wrapper must collapse
+	// to the bare "X" the inline twin carries — otherwise {"type":"X"} survives in
+	// String() where the canonical bare reference belongs (Canonical/PCF already
+	// emits bare, so only String saw it). Single-reference cases above can never
+	// reach this later-occurrence path.
+	t.Run("repeated_ref_collapses_in_string", func(t *testing.T) {
+		c := &avro.SchemaCache{}
+		if _, err := c.Parse(xDef); err != nil {
+			t.Fatalf("parse X: %v", err)
+		}
+		y, err := c.Parse(`{"type":"record","name":"Y3","fields":[{"name":"f1","type":{"type":"X"}},{"name":"f2","type":{"type":"X"}}]}`)
+		if err != nil {
+			t.Fatalf("parse wrapped Y3: %v", err)
+		}
+		twin := avro.MustParse(`{"type":"record","name":"Y3","fields":[{"name":"f1","type":` + xDef + `},{"name":"f2","type":"X"}]}`)
+
+		// The surviving-wrapper signature is the VALUE {"type":"X"} (a wrapped
+		// name reference). f1 inlines X's full record definition (whose "type" is
+		// "record" and whose only "X" is "name":"X"), and f2's bare reference is
+		// the string "X" — so {"type":"X"} appears nowhere unless a wrapper
+		// survived the rebuild.
+		if strings.Contains(y.String(), `{"type":"X"}`) {
+			t.Errorf("String() kept a wrapped {\"type\":\"X\"} reference; the later occurrence must collapse to bare \"X\":\n  %s", y.String())
+		}
+		if !strings.Contains(y.String(), `"name":"X"`) {
+			t.Errorf("String() lost X's inlined definition entirely:\n  %s", y.String())
+		}
+		// Wire (logical-identity anchor) and Canonical/fingerprint must match the
+		// inline twin — they always did; String is the surface the wrapper broke.
+		val := map[string]any{"f1": map[string]any{"n": int32(1)}, "f2": map[string]any{"n": int32(2)}}
+		yw, err := y.Encode(val)
+		if err != nil {
+			t.Fatalf("Y3.Encode: %v", err)
+		}
+		tw, err := twin.Encode(val)
+		if err != nil {
+			t.Fatalf("twin.Encode: %v", err)
+		}
+		if string(yw) != string(tw) {
+			t.Errorf("wrapped repeated-ref wire != inline-twin wire")
+		}
+		if string(y.Canonical()) != string(twin.Canonical()) {
+			t.Errorf("Canonical diverges:\n got:  %s\n want: %s", y.Canonical(), twin.Canonical())
+		}
+		if _, err := avro.Parse(y.String()); err != nil {
+			t.Errorf("Parse(Y3.String()) must succeed: %v\n  %s", err, y.String())
 		}
 	})
 }

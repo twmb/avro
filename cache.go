@@ -462,23 +462,27 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		return v
 	case map[string]any:
 		// A pure wrapped-form name reference {"type":"X"} (the object's sole key
-		// is "type", whose value names a type) must be spliced as a WHOLE —
-		// replaced by the referenced definition exactly like the bare-string form
-		// "X". The general path below instead recurses INTO the "type" value,
-		// producing the invalid {"type":{X-def}} (a "type" value must be a
-		// string): the rebuild Parse then rejects it and the metadata silently
+		// is "type", whose value names a type) is equivalent to the bare-string
+		// form "X" and must collapse to whatever that form resolves to. The
+		// general path below instead recurses INTO the "type" value, producing the
+		// invalid {"type":{X-def}} (a "type" value must be a string) when X
+		// splices: the rebuild Parse then rejects it and the metadata silently
 		// falls back to a dangling cross-parse reference. {"type":"X"} is a
-		// documented-accepted name-ref spelling (including forward refs), so it
-		// must self-contain like the bare form. A ref that does not splice
-		// (local/forward/unknown, or an already-inlined later occurrence) stays a
-		// string and falls through unchanged, leaving the wrapped object intact.
+		// documented-accepted name-ref spelling (including forward refs).
+		//
+		// Collapse the wrapper UNCONDITIONALLY — whether X splices to its
+		// inherited definition or stays a bare reference (a local/forward/unknown
+		// name, or an already-inlined later occurrence). The wrapper carries no
+		// information the bare form lacks, so it must not survive into the
+		// rebuilt metadata: a later wrapped reference to a type whose first
+		// occurrence was inlined would otherwise keep {"type":"X"} where the
+		// canonical bare "X" belongs, diverging String() from the identical
+		// bare-spelled / inline twin (Canonical/PCF already emits bare fullnames,
+		// matching Java's NamedSchema.writeNameRef; only String saw the wrapper).
 		if len(v) == 1 {
 			if typVal, ok := lookupCI(v, "type"); ok {
 				if ref, ok := typVal.(string); ok && avroNamedRef(ref) {
-					spliced := inlineTreeDefs(ref, ns, defs, seen, inlined)
-					if _, stayedBare := spliced.(string); !stayedBare {
-						return spliced
-					}
+					return inlineTreeDefs(ref, ns, defs, seen, inlined)
 				}
 			}
 		}

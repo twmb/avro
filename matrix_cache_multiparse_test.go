@@ -26,18 +26,32 @@ import (
 // TestMatrix_CacheSelfContainedNamespaces crosses a SINGLE cross-parse
 // reference against namespace/position/kind. This net is the missing
 // CROSS-PRODUCT over the reference-graph TOPOLOGY — single, transitive chains,
-// diamonds, wide overlap, diamond-with-a-chain-arm, and a nested type
-// referenced before its container — each crossed with the namespace regime
+// diamonds, wide overlap, diamond-with-a-chain-arm, a nested type referenced
+// before its container, and a single type referencing the same leaf TWICE
+// (repeat2 / repeat_chain) — each crossed with the namespace regime
 // (null / single-namespace / split-namespace), the position the shared leaf
-// sits in (record field / array items / map values / union branch), and the
-// leaf kind (record / enum / fixed). Crossing topology with the other axes is
-// where a fifth gap in the dribble would hide; a point test per topology cannot
+// sits in (record field / array items / map values / union branch), the
+// leaf kind (record / enum / fixed), AND the cross-parse reference SPELLING
+// (bare "X" vs wrapped {"type":"X"}). Crossing topology with the other axes is
+// where a gap in the dribble would hide; a point test per topology cannot
 // reach it.
+//
+// The SPELLING axis is the one a later fix (collapse a non-splicing wrapped
+// reference to bare) exposed: a cross-parse reference is accepted both bare and
+// wrapped (NOT_BUGS #23), so the self-contained metadata must be identical for
+// either. The bug shape it catches has two layers — (1) a wrapped cross-parse
+// reference that splices must be replaced as a WHOLE (else it self-contains as
+// the invalid {"type":{X-def}} and the rebuild silently falls back to a dangling
+// reference); (2) a LATER wrapped occurrence of a type whose first occurrence was
+// inlined must COLLAPSE to bare "X", else {"type":"X"} survives in String() where
+// the canonical bare form belongs. Layer 2 is invisible to every single-reference
+// topology and is exactly what repeat2 / repeat_chain / local_forwardref add.
 //
 // For every shape the cache-built schema is compared to a logically-identical
 // inline twin emitted by an INDEPENDENT first-occurrence oracle (mpEmitTwin —
 // DFS pre-order, full at first occurrence, bare fullname after, exactly Java's
-// NamedSchema.writeNameRef rule). The wire bytes for a sample value are the
+// NamedSchema.writeNameRef rule). The twin is spelling-INDEPENDENT, so it anchors
+// both spellings to one canonical form. The wire bytes for a sample value are the
 // oracle-independent anchor: equal wire proves the two schemas ARE the same
 // logical schema (the node tree resolved identically), so ANY divergence in
 // Fingerprint / Canonical / Root / String is then provably a metadata-form bug,
@@ -173,17 +187,34 @@ func mpEmitTwin(g *mpGraph) string {
 	return string(b)
 }
 
+// mpRefSpell renders a cross-parse name reference in the chosen SPELLING — the
+// axis the topology cross had missed. Avro accepts a name reference written
+// two ways (NOT_BUGS #23): the bare fullname string "X", and the wrapped form
+// {"type":"X"} whose sole key is "type". Both resolve to the same node, so the
+// wire is identical; the splice that self-contains a cache schema must reach the
+// same metadata for either spelling. The bug surface is the wrapped form: a
+// wrapped cross-parse reference once hit the splice's general map path (recursing
+// INTO the "type" value → invalid {"type":{X-def}}), so String()/Canonical()
+// silently fell back to a dangling reference while the bare form self-contained.
+func mpRefSpell(spelling, ref string) any {
+	if spelling == "wrapped" {
+		return map[string]any{"type": ref}
+	}
+	return ref
+}
+
 // mpEmitStandalone emits one type's standalone schema string for a cache Parse.
-// References to other (already-registered) types are bare fullnames; a child
-// marked nested-in-this-type is emitted inline (it is registered by THIS parse).
-func mpEmitStandalone(full string, g *mpGraph) string {
+// References to other (already-registered) types are rendered in the given
+// spelling (bare fullname or wrapped {"type":...}); a child marked
+// nested-in-this-type is emitted inline (it is registered by THIS parse).
+func mpEmitStandalone(full string, g *mpGraph, spelling string) string {
 	n := g.nodes[full]
 	tree := mpNamedObj(n, func(e mpEdge) any {
 		if g.nested[e.to] == full {
-			child := mpNamedObj(g.nodes[e.to], func(ce mpEdge) any { return mpPosWrap(ce.pos, ce.to) })
+			child := mpNamedObj(g.nodes[e.to], func(ce mpEdge) any { return mpPosWrap(ce.pos, mpRefSpell(spelling, ce.to)) })
 			return mpPosWrap(e.pos, child)
 		}
-		return mpPosWrap(e.pos, e.to)
+		return mpPosWrap(e.pos, mpRefSpell(spelling, e.to))
 	})
 	b, err := json.Marshal(tree)
 	if err != nil {
@@ -307,6 +338,28 @@ func mpBuildTopo(name, regime, leafKind, pos string) (g *mpGraph, parseOrder []s
 			rec(Outer, e(Inner, "inner", "field")), leaf(Inner))
 		g.nested[Inner] = Outer
 		return g, []string{Outer}, true
+
+	case "repeat2":
+		// R references the SAME cached leaf D twice: d0 at a plain field (the
+		// first occurrence, which the splice inlines as a full definition) and
+		// d1 at `pos` (a LATER occurrence the splice must leave as a bare
+		// reference). Under the wrapped spelling d1 is {"type":"D"} and reaches
+		// the splice's no-splice fall-through (already-inlined) — exactly the
+		// path the single-reference topologies never exercise. The wrapper must
+		// collapse to bare "D" there, else String() diverges from the bare-
+		// spelled / inline twin (whose later occurrence is bare "D").
+		return mk(R, rec(R, e(D, "d0", "field"), e(D, "d1", pos)), leaf(D)), []string{D}, true
+
+	case "repeat_chain":
+		// The same repeated reference one level down: a cross-parse carrier B
+		// references D twice (b0 field, b1 at `pos`), and R references B. B's
+		// stored self-contained definition therefore already carries a later
+		// reference to D; the wrapper on that stored reference must be collapsed
+		// when B itself is self-contained AND it must survive re-splicing into R
+		// as a bare reference, not a re-wrapped one.
+		B := mpFull(carrierNS, "B")
+		return mk(R, rec(R, e(B, "b", "field")), rec(B, e(D, "b0", "field"), e(D, "b1", pos)), leaf(D)),
+			[]string{D, B}, true
 	}
 	return nil, nil, false
 }
@@ -489,42 +542,54 @@ func mpEmitInheritedWrapper(leafFull, kind string) string {
 }
 
 func TestMatrix_SchemaCacheMultiParseSelfContained(t *testing.T) {
-	topos := []string{"single", "chain2", "chain3", "diamond", "wide3", "diamond_chain", "nested_before"}
+	topos := []string{"single", "chain2", "chain3", "diamond", "wide3", "diamond_chain", "nested_before", "repeat2", "repeat_chain"}
 	regimes := []string{"null", "ns", "mixed"}
 	positions := []string{"field", "array", "map", "union"}
 	kinds := []string{"record", "enum", "fixed"}
+	// The spelling axis the net had missed. A cross-parse reference is written
+	// either as the bare fullname "X" or the wrapped {"type":"X"} (both accepted,
+	// NOT_BUGS #23); the self-contained metadata must be identical for either,
+	// since the wire is. The twin is spelling-INDEPENDENT (always the canonical
+	// first-occurrence inline form), so it anchors both spellings: bare is the
+	// control that already self-contained, wrapped is the form whose splice was
+	// the bug. The repeat2 / repeat_chain topologies make the wrapped column
+	// non-vacuous — a LATER wrapped occurrence of an inlined type must collapse
+	// to bare in String(), not survive as {"type":"X"}.
+	spellings := []string{"bare", "wrapped"}
 
 	var cells int
 
-	// --- core net: topology × namespace regime × position × leaf kind ---
-	for _, topo := range topos {
-		for _, regime := range regimes {
-			for _, pos := range positions {
-				for _, kind := range kinds {
-					g, parseOrder, ok := mpBuildTopo(topo, regime, kind, pos)
-					if !ok {
-						continue
-					}
-					name := fmt.Sprintf("%s/%s/%s/%s", topo, regime, pos, kind)
-					t.Run(name, func(t *testing.T) {
-						cells++
-						deps := make([]string, len(parseOrder))
-						for i, fn := range parseOrder {
-							deps[i] = mpEmitStandalone(fn, g)
+	// --- core net: spelling × topology × namespace regime × position × leaf kind ---
+	for _, spelling := range spellings {
+		for _, topo := range topos {
+			for _, regime := range regimes {
+				for _, pos := range positions {
+					for _, kind := range kinds {
+						g, parseOrder, ok := mpBuildTopo(topo, regime, kind, pos)
+						if !ok {
+							continue
 						}
-						rootSchema := mpEmitStandalone(g.root, g)
-						viaCache := mpRunCache(t, deps, rootSchema)
+						name := fmt.Sprintf("%s/%s/%s/%s/%s", spelling, topo, regime, pos, kind)
+						t.Run(name, func(t *testing.T) {
+							cells++
+							deps := make([]string, len(parseOrder))
+							for i, fn := range parseOrder {
+								deps[i] = mpEmitStandalone(fn, g, spelling)
+							}
+							rootSchema := mpEmitStandalone(g.root, g, spelling)
+							viaCache := mpRunCache(t, deps, rootSchema)
 
-						twinSchema := mpEmitTwin(g)
-						inline, err := avro.Parse(twinSchema)
-						if err != nil {
-							t.Fatalf("inline twin parse %q: %v", twinSchema, err)
-						}
-						// Core net never nests a null-ns type in a namespaced scope
-						// (a regime is all-null or all-namespaced), so the canonical
-						// always re-parses.
-						mpAssertSelfContained(t, viaCache, inline, mpSampleValue(g.root, g), rootSchema, twinSchema, true)
-					})
+							twinSchema := mpEmitTwin(g)
+							inline, err := avro.Parse(twinSchema)
+							if err != nil {
+								t.Fatalf("inline twin parse %q: %v", twinSchema, err)
+							}
+							// Core net never nests a null-ns type in a namespaced scope
+							// (a regime is all-null or all-namespaced), so the canonical
+							// always re-parses.
+							mpAssertSelfContained(t, viaCache, inline, mpSampleValue(g.root, g), rootSchema, twinSchema, true)
+						})
+					}
 				}
 			}
 		}
@@ -549,26 +614,33 @@ func TestMatrix_SchemaCacheMultiParseSelfContained(t *testing.T) {
 	}
 	var cases []fwd
 
-	for _, k := range kinds {
-		P, L, R := "x.P", "x.L", "x.R"
-		depP := mpJSON(mpFwdObj(P, k, 1))
-		// Reference to the cached type BEFORE a local def of a distinct type:
-		// the ref splices, the local def stays.
-		cases = append(cases, fwd{
-			name:  "distinct_ref_before_def/" + k,
-			deps:  []string{depP},
-			root:  mpJSON(mpRecObj(R, mpField("f1", P), mpField("f2", mpFwdObj(L, k, 1)))),
-			twin:  mpJSON(mpRecObj(R, mpField("f1", mpFwdObj(P, k, 1)), mpField("f2", mpFwdObj(L, k, 1)))),
-			value: map[string]any{"f1": mpFwdVal(k, 1), "f2": mpFwdVal(k, 1)},
-		})
-		// Local def of a distinct type BEFORE the cached reference.
-		cases = append(cases, fwd{
-			name:  "distinct_def_before_ref/" + k,
-			deps:  []string{depP},
-			root:  mpJSON(mpRecObj(R, mpField("f1", mpFwdObj(L, k, 1)), mpField("f2", P))),
-			twin:  mpJSON(mpRecObj(R, mpField("f1", mpFwdObj(L, k, 1)), mpField("f2", mpFwdObj(P, k, 1)))),
-			value: map[string]any{"f1": mpFwdVal(k, 1), "f2": mpFwdVal(k, 1)},
-		})
+	// The cached cross-parse reference is crossed with the spelling axis: it
+	// splices in place (the local def is a distinct type or not yet in scope),
+	// so the rebuild normalizes either spelling and the four forms match the
+	// full-def twin. Wrapped here is the splice surface reached at the
+	// positional / shadow corner the single-spelling family never crossed.
+	for _, spelling := range spellings {
+		for _, k := range kinds {
+			P, L, R := "x.P", "x.L", "x.R"
+			depP := mpJSON(mpFwdObj(P, k, 1))
+			// Reference to the cached type BEFORE a local def of a distinct type:
+			// the ref splices, the local def stays.
+			cases = append(cases, fwd{
+				name:  "distinct_ref_before_def/" + spelling + "/" + k,
+				deps:  []string{depP},
+				root:  mpJSON(mpRecObj(R, mpField("f1", mpRefSpell(spelling, P)), mpField("f2", mpFwdObj(L, k, 1)))),
+				twin:  mpJSON(mpRecObj(R, mpField("f1", mpFwdObj(P, k, 1)), mpField("f2", mpFwdObj(L, k, 1)))),
+				value: map[string]any{"f1": mpFwdVal(k, 1), "f2": mpFwdVal(k, 1)},
+			})
+			// Local def of a distinct type BEFORE the cached reference.
+			cases = append(cases, fwd{
+				name:  "distinct_def_before_ref/" + spelling + "/" + k,
+				deps:  []string{depP},
+				root:  mpJSON(mpRecObj(R, mpField("f1", mpFwdObj(L, k, 1)), mpField("f2", mpRefSpell(spelling, P)))),
+				twin:  mpJSON(mpRecObj(R, mpField("f1", mpFwdObj(L, k, 1)), mpField("f2", mpFwdObj(P, k, 1)))),
+				value: map[string]any{"f1": mpFwdVal(k, 1), "f2": mpFwdVal(k, 1)},
+			})
+		}
 	}
 
 	// Shadow corner, expressible direction: a bare ref to a cached NULL-namespace
@@ -590,20 +662,25 @@ func TestMatrix_SchemaCacheMultiParseSelfContained(t *testing.T) {
 				return v
 			}
 		}
-		// Cross the shadowed reference over every position: inlineTreeDefs walks
-		// fields, array items, map values, and union branches through distinct
-		// arms, so the forward-shadow splice must fire in each.
-		for _, pos := range []string{"field", "union", "array", "map"} {
-			cases = append(cases, fwd{
-				name:  "shadow_nullref_before_nsdef/" + pos,
-				deps:  []string{depT},
-				root:  mpJSON(mpRecObj(R, mpField("f1", mpPosWrap(pos, T)), mpField("f2", mpFwdObj(xT, "record", 2)))),
-				twin:  mpJSON(mpRecObj(R, mpField("f1", mpPosWrap(pos, mpFwdObj(T, "record", 1))), mpField("f2", mpFwdObj(xT, "record", 2)))),
-				value: map[string]any{"f1": posVal(pos, mpFwdVal("record", 1)), "f2": mpFwdVal("record", 2)},
-				// f1's spliced null-ns T nests in the namespaced x.R: its PCF form
-				// is the documented lossy-but-fingerprint-faithful kind (NOT_BUGS #25).
-				canonNoReparse: true,
-			})
+		// Cross the shadowed reference over every position AND spelling:
+		// inlineTreeDefs walks fields, array items, map values, and union branches
+		// through distinct arms, so the forward-shadow splice must fire in each;
+		// the wrapped spelling must reach the splice as a whole at the shadow
+		// corner too (the bare ref binds the cached null-ns T because the local
+		// x.T is not yet in scope).
+		for _, spelling := range spellings {
+			for _, pos := range []string{"field", "union", "array", "map"} {
+				cases = append(cases, fwd{
+					name:  "shadow_nullref_before_nsdef/" + spelling + "/" + pos,
+					deps:  []string{depT},
+					root:  mpJSON(mpRecObj(R, mpField("f1", mpPosWrap(pos, mpRefSpell(spelling, T))), mpField("f2", mpFwdObj(xT, "record", 2)))),
+					twin:  mpJSON(mpRecObj(R, mpField("f1", mpPosWrap(pos, mpFwdObj(T, "record", 1))), mpField("f2", mpFwdObj(xT, "record", 2)))),
+					value: map[string]any{"f1": posVal(pos, mpFwdVal("record", 1)), "f2": mpFwdVal("record", 2)},
+					// f1's spliced null-ns T nests in the namespaced x.R: its PCF form
+					// is the documented lossy-but-fingerprint-faithful kind (NOT_BUGS #25).
+					canonNoReparse: true,
+				})
+			}
 		}
 		// Reverse: the local x.T is defined FIRST, so the later bare "T" binds the
 		// LOCAL x.T (in scope), and the cached null-ns T is never referenced — no
@@ -615,6 +692,36 @@ func TestMatrix_SchemaCacheMultiParseSelfContained(t *testing.T) {
 			twin:  mpJSON(mpRecObj(R, mpField("f1", mpFwdObj(xT, "record", 2)), mpField("f2", T))),
 			value: map[string]any{"f1": mpFwdVal("record", 2), "f2": mpFwdVal("record", 2)},
 		})
+	}
+
+	// Pure within-parse forward reference crossed with spelling: a parse that
+	// references a cached type C (cross-parse, so the self-containment rebuild
+	// runs) AND references a LOCAL type Q before Q's own definition. The forward
+	// reference must NOT splice (Q is local, not inherited) — it stays a bare
+	// reference to the later definition. The wrapped spelling exercises the
+	// splice's no-splice fall-through directly: {"type":"Q"} must collapse to the
+	// bare "Q" the canonical / inline twin carries, not survive the rebuild as a
+	// wrapped object. The twin is written in the SAME reference-before-definition
+	// order (the cache preserves source order; it does not reorder to def-first),
+	// so the four forms compare field-for-field.
+	for _, spelling := range spellings {
+		for _, k := range kinds {
+			C, Q, R := "x.C", "x.Q", "x.R"
+			depC := mpJSON(mpFwdObj(C, k, 1))
+			cases = append(cases, fwd{
+				name: "local_forwardref/" + spelling + "/" + k,
+				deps: []string{depC},
+				root: mpJSON(mpRecObj(R,
+					mpField("f0", mpRefSpell(spelling, C)), // cross-parse ref → splices, triggers rebuild
+					mpField("f1", mpRefSpell(spelling, Q)), // forward ref to local Q (defined at f2)
+					mpField("f2", mpFwdObj(Q, k, 1)))),     // Q defined here
+				twin: mpJSON(mpRecObj(R,
+					mpField("f0", mpFwdObj(C, k, 1)),
+					mpField("f1", Q), // canonical bare reference
+					mpField("f2", mpFwdObj(Q, k, 1)))),
+				value: map[string]any{"f0": mpFwdVal(k, 1), "f1": mpFwdVal(k, 1), "f2": mpFwdVal(k, 1)},
+			})
+		}
 	}
 
 	// Shadow corner, INEXPRESSIBLE: a null-namespace D is carried (self-contained)
@@ -688,36 +795,58 @@ func TestMatrix_SchemaCacheMultiParseSelfContained(t *testing.T) {
 	// resolved fullname (b.D) when spliced into the "a" scope, not re-inherit "a"
 	// (de3dca3). Crossed with topology so the inherited def is reached directly,
 	// through a chain, and through both diamond arms — coverage the single-
-	// reference TestMatrix_CacheSelfContainedNamespaces does not have. ---
-	for _, topo := range []string{"single", "chain2", "diamond"} {
-		for _, kind := range kinds {
-			for _, pos := range []string{"field", "union"} {
-				g, parseOrder, ok := mpBuildTopo(topo, "mixed", kind, pos)
-				if !ok {
-					continue
+	// reference TestMatrix_CacheSelfContainedNamespaces does not have. Crossed
+	// with spelling so a WRAPPED reference to an inherited-namespace cached leaf
+	// splices the explicit-fullname def too. ---
+	for _, spelling := range spellings {
+		for _, topo := range []string{"single", "chain2", "diamond"} {
+			for _, kind := range kinds {
+				for _, pos := range []string{"field", "union"} {
+					g, parseOrder, ok := mpBuildTopo(topo, "mixed", kind, pos)
+					if !ok {
+						continue
+					}
+					name := fmt.Sprintf("inherited_ns/%s/%s/%s/%s", spelling, topo, pos, kind)
+					t.Run(name, func(t *testing.T) {
+						cells++
+						deps := make([]string, len(parseOrder))
+						for i, fn := range parseOrder {
+							deps[i] = mpEmitStandalone(fn, g, spelling)
+						}
+						// Register the leaf (parseOrder[0]) via an inherited-namespace
+						// wrapper rather than a standalone explicit-namespace def.
+						deps[0] = mpEmitInheritedWrapper(parseOrder[0], kind)
+						rootSchema := mpEmitStandalone(g.root, g, spelling)
+						viaCache := mpRunCache(t, deps, rootSchema)
+						twinSchema := mpEmitTwin(g)
+						inline, err := avro.Parse(twinSchema)
+						if err != nil {
+							t.Fatalf("inline twin parse %q: %v", twinSchema, err)
+						}
+						mpAssertSelfContained(t, viaCache, inline, mpSampleValue(g.root, g), rootSchema, twinSchema, true)
+					})
 				}
-				name := fmt.Sprintf("inherited_ns/%s/%s/%s", topo, pos, kind)
-				t.Run(name, func(t *testing.T) {
-					cells++
-					deps := make([]string, len(parseOrder))
-					for i, fn := range parseOrder {
-						deps[i] = mpEmitStandalone(fn, g)
-					}
-					// Register the leaf (parseOrder[0]) via an inherited-namespace
-					// wrapper rather than a standalone explicit-namespace def.
-					deps[0] = mpEmitInheritedWrapper(parseOrder[0], kind)
-					rootSchema := mpEmitStandalone(g.root, g)
-					viaCache := mpRunCache(t, deps, rootSchema)
-					twinSchema := mpEmitTwin(g)
-					inline, err := avro.Parse(twinSchema)
-					if err != nil {
-						t.Fatalf("inline twin parse %q: %v", twinSchema, err)
-					}
-					mpAssertSelfContained(t, viaCache, inline, mpSampleValue(g.root, g), rootSchema, twinSchema, true)
-				})
 			}
 		}
 	}
 
 	t.Logf("multi-parse self-containment net: %d cells", cells)
 }
+
+// Non-vacuity (neuter cache.go's inlineTreeDefs, observe the failures):
+//
+//   - Collapse the wrapper only when the wrapped reference SPLICES (restore the
+//     `if _, stayedBare := spliced.(string); !stayedBare { return spliced }`
+//     guard so a non-splicing wrapped reference falls through unchanged): the 76
+//     repeat2 / repeat_chain / local_forwardref wrapped cells fail with "String
+//     diverges" — the later/forward wrapped {"type":"X"} survives where the twin
+//     carries bare "X". Canonical/Fingerprint/Root still match (PCF emits bare),
+//     so String is the only surface — exactly the layer the single-reference
+//     topologies cannot reach.
+//
+//   - Remove the whole wrapped-reference detection (so a wrapped reference hits
+//     the general map path): all 356 wrapped cells across every topology fail
+//     with Canonical/Fingerprint/Root/String diverging AND "not self-contained"
+//     — the splice produced the invalid {"type":{X-def}} and the metadata fell
+//     back to a dangling reference. The bare cells stay green throughout, proving
+//     the spelling axis (not some shared regression) is what catches the bug.
