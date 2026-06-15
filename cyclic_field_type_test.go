@@ -189,13 +189,12 @@ func TestRegression_PointerChainEncodeDecodeDepthParity(t *testing.T) {
 		t.Fatalf("JSON round-trip mismatch at depth %d", maxDepthLevels)
 	}
 
-	// One level deeper (6) must be rejected on the BINARY wire symmetrically:
-	// encode (indirect) and decode (indirectAlloc) both refuse a chain past the
-	// cap (the cyclic-interface DoS guard is preserved). JSON encode refuses it
-	// too. (JSON decode of a UNION target indirects at two stages — unionTarget
-	// then decodeValue — so it tolerates a deeper pointer target than binary; a
-	// pre-existing, bounded JSON leniency orthogonal to this encode↔decode
-	// parity fix, not asserted here.)
+	// One level deeper (6) must be rejected SYMMETRICALLY across both wires AND
+	// both directions: encode (indirect) and decode (indirectAlloc) refuse a
+	// chain past the cap (the cyclic-interface DoS guard is preserved). JSON
+	// matches binary on decode too — a union pointer target is indirected
+	// exactly once (unionTarget returns a concrete target un-peeled so the
+	// branch decode's single indirectAlloc caps it), not twice.
 	q6 := &p5 // 6 pointers
 	if _, err := s.Encode(q6); err == nil {
 		t.Fatalf("binary Encode of a %d-deep pointer must be rejected", maxDepthLevels+1)
@@ -206,6 +205,33 @@ func TestRegression_PointerChainEncodeDecodeDepthParity(t *testing.T) {
 	}
 	if _, err := s.EncodeJSON(q6); err == nil {
 		t.Fatalf("JSON Encode of a %d-deep pointer must be rejected", maxDepthLevels+1)
+	}
+	var j6 ******int64
+	if err := s.DecodeJSON(js, &j6); err == nil {
+		t.Fatalf("JSON Decode into a %d-deep pointer must be rejected (parity with binary)", maxDepthLevels+1)
+	}
+}
+
+// Binary and JSON decode must accept the SAME set of pointer-target depths.
+// JSON decode of a UNION target formerly indirected at two stages (unionTarget
+// then the branch's decodeKind), so it peeled up to 2*maxIndirectDepth levels
+// and accepted targets binary rejected. Sweep every depth and assert the two
+// wires agree.
+func TestRegression_UnionPointerTargetDepthBinaryJSONParity(t *testing.T) {
+	s := avro.MustParse(`["null","int"]`)
+	bin, _ := s.Encode(int64(7))
+	js, _ := s.EncodeJSON(int64(7))
+	intType := reflect.TypeOf(int64(0))
+	for depth := 1; depth <= 9; depth++ {
+		pt := intType
+		for i := 0; i < depth; i++ {
+			pt = reflect.PointerTo(pt)
+		}
+		_, binErr := s.Decode(bin, reflect.New(pt).Interface())
+		jsonErr := s.DecodeJSON(js, reflect.New(pt).Interface())
+		if (binErr != nil) != (jsonErr != nil) {
+			t.Errorf("depth=%d: binary and JSON decode disagree on accept/reject (binErr=%v, jsonErr=%v)", depth, binErr, jsonErr)
+		}
 	}
 }
 

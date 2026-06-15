@@ -1656,7 +1656,22 @@ func unionTarget(rawV reflect.Value, branch *schemaNode) (reflect.Value, bool) {
 		return rawV, rawV.Kind() == reflect.Interface
 	}
 	iv := indirectAlloc(rawV)
-	return iv, iv.Kind() == reflect.Interface
+	if iv.Kind() == reflect.Interface {
+		// Interface target: the toAny path assigns the decoded value into this
+		// peeled interface directly (assignAny), never re-decoding into it, so
+		// there is no second indirection — return the peeled interface.
+		return iv, true
+	}
+	// Concrete target: return the UN-peeled rawV. The branch decode runs its own
+	// single indirectAlloc (decodeKind), which peels rawV from the top, capping
+	// at maxIndirectDepth — matching binary's single peel in the leaf decoder.
+	// Returning the already-peeled iv would make that second indirectAlloc peel
+	// a FURTHER maxIndirectDepth levels, so a union concrete-pointer target
+	// accepted up to 2*maxIndirectDepth levels where binary (and a non-union
+	// target) rejects past maxIndirectDepth — a binary↔JSON decode divergence.
+	// (indirectAlloc above already allocated the in-cap chain, so the re-peel
+	// reuses it; its only purpose here is to settle toAny.)
+	return rawV, false
 }
 
 func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byte) error {
