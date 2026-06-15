@@ -461,6 +461,27 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		}
 		return v
 	case map[string]any:
+		// A pure wrapped-form name reference {"type":"X"} (the object's sole key
+		// is "type", whose value names a type) must be spliced as a WHOLE —
+		// replaced by the referenced definition exactly like the bare-string form
+		// "X". The general path below instead recurses INTO the "type" value,
+		// producing the invalid {"type":{X-def}} (a "type" value must be a
+		// string): the rebuild Parse then rejects it and the metadata silently
+		// falls back to a dangling cross-parse reference. {"type":"X"} is a
+		// documented-accepted name-ref spelling (including forward refs), so it
+		// must self-contain like the bare form. A ref that does not splice
+		// (local/forward/unknown, or an already-inlined later occurrence) stays a
+		// string and falls through unchanged, leaving the wrapped object intact.
+		if len(v) == 1 {
+			if typVal, ok := lookupCI(v, "type"); ok {
+				if ref, ok := typVal.(string); ok && avroNamedRef(ref) {
+					spliced := inlineTreeDefs(ref, ns, defs, seen, inlined)
+					if _, stayedBare := spliced.(string); !stayedBare {
+						return spliced
+					}
+				}
+			}
+		}
 		childNS := nodeNamespace(v, ns)
 		// Register this node's own name BEFORE walking its children, mirroring
 		// the parser's early self-registration (a type is in scope for its own

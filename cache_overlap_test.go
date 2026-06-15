@@ -285,3 +285,106 @@ func TestRegression_SchemaCacheShortNameShadowNoMisbind(t *testing.T) {
 		}
 	}
 }
+
+// TestRegression_SchemaCacheWrappedFormCrossParseRefSelfContains pins that a
+// cross-parse reference spelled in the WRAPPED form {"type":"X"} self-contains
+// in the metadata exactly like the bare-string form "X". {"type":"X"} is a
+// documented-accepted name-reference spelling (including forward refs). The
+// splice replaces the whole wrapped object with the referenced definition; the
+// earlier bug recursed INTO the "type" value, producing the invalid
+// {"type":{X-def}}, so the rebuild Parse failed and String()/Canonical() fell
+// back to a dangling reference (wire codec worked, but Parse(s.String()) and
+// the fingerprint surface did not). The oracle is the inline-defined twin:
+// identical wire, identical canonical form + fingerprint, re-parseable
+// String()/Canonical(). Crosses every nesting position the splice walks.
+func TestRegression_SchemaCacheWrappedFormCrossParseRefSelfContains(t *testing.T) {
+	const xDef = `{"type":"record","name":"X","fields":[{"name":"n","type":"int"}]}`
+	cases := []struct {
+		name    string
+		wrapped string // Y referencing X via {"type":"X"}, cache-built after X
+		inline  string // logically-identical twin with X defined inline
+		val     map[string]any
+	}{
+		{
+			name:    "field",
+			wrapped: `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"X"}}]}`,
+			inline:  `{"type":"record","name":"Y","fields":[{"name":"f","type":` + xDef + `}]}`,
+			val:     map[string]any{"f": map[string]any{"n": int32(5)}},
+		},
+		{
+			name:    "union_branch",
+			wrapped: `{"type":"record","name":"Y","fields":[{"name":"f","type":["null",{"type":"X"}]}]}`,
+			inline:  `{"type":"record","name":"Y","fields":[{"name":"f","type":["null",` + xDef + `]}]}`,
+			val:     map[string]any{"f": map[string]any{"n": int32(6)}},
+		},
+		{
+			name:    "array_items",
+			wrapped: `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"array","items":{"type":"X"}}}]}`,
+			inline:  `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"array","items":` + xDef + `}}]}`,
+			val:     map[string]any{"f": []any{map[string]any{"n": int32(7)}}},
+		},
+		{
+			name:    "map_values",
+			wrapped: `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"map","values":{"type":"X"}}}]}`,
+			inline:  `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"map","values":` + xDef + `}}]}`,
+			val:     map[string]any{"f": map[string]any{"k": map[string]any{"n": int32(8)}}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &avro.SchemaCache{}
+			if _, err := c.Parse(xDef); err != nil {
+				t.Fatalf("parse X into cache: %v", err)
+			}
+			y, err := c.Parse(tc.wrapped)
+			if err != nil {
+				t.Fatalf("parse wrapped Y: %v", err)
+			}
+			twin := avro.MustParse(tc.inline)
+
+			// Wire codec already worked pre-fix; assert it still matches the twin.
+			wire, err := y.Encode(tc.val)
+			if err != nil {
+				t.Fatalf("Y.Encode: %v", err)
+			}
+			twinWire, err := twin.Encode(tc.val)
+			if err != nil {
+				t.Fatalf("twin.Encode: %v", err)
+			}
+			if string(wire) != string(twinWire) {
+				t.Errorf("wrapped-form wire != inline-twin wire")
+			}
+
+			// Self-containment: String()/Canonical() must re-parse and match the
+			// twin's canonical form + fingerprint (the surfaces the bug broke).
+			if _, err := avro.Parse(y.String()); err != nil {
+				t.Errorf("Parse(Y.String()) failed (dangling metadata): %v\n  %s", err, y.String())
+			}
+			if _, err := avro.Parse(string(y.Canonical())); err != nil {
+				t.Errorf("Parse(Y.Canonical()) failed (dangling metadata): %v\n  %s", err, y.Canonical())
+			}
+			// Canonical-form equality is the fingerprint surface (the Rabin/SHA
+			// fingerprint is a hash of these bytes), so matching the inline twin
+			// here pins the SOE / schema-registry interop the bug broke.
+			if string(y.Canonical()) != string(twin.Canonical()) {
+				t.Errorf("wrapped-form Canonical != inline-twin Canonical:\n got:  %s\n want: %s", y.Canonical(), twin.Canonical())
+			}
+		})
+	}
+
+	// Boundary-1 control: the bare-string form already self-contains; it must
+	// stay correct (the fix must not regress it).
+	t.Run("bare_form_control", func(t *testing.T) {
+		c := &avro.SchemaCache{}
+		if _, err := c.Parse(xDef); err != nil {
+			t.Fatalf("parse X: %v", err)
+		}
+		y, err := c.Parse(`{"type":"record","name":"Y2","fields":[{"name":"f","type":"X"}]}`)
+		if err != nil {
+			t.Fatalf("parse bare Y2: %v", err)
+		}
+		if _, err := avro.Parse(y.String()); err != nil {
+			t.Errorf("control: Parse(bare Y2.String()) must succeed: %v", err)
+		}
+	})
+}
