@@ -179,6 +179,11 @@ func (optSchemaOpts) writerOpt() {}
 // The codec's Close method is called by [Writer.Close] and [Reader.Close].
 // Codecs that should not be closed (e.g. shared across multiple writers)
 // should return nil from Close.
+//
+// For reader-side decompression bounding of a supplied codec, see
+// [WithMaxDecompressedBlockBytes]: it bounds a supplied built-in deflate or
+// snappy codec up front, but a supplied zstd or third-party codec is bounded
+// only by its own configuration plus a post-decompression backstop.
 func WithCodec(c Codec) Opt { return optCodec{c} }
 
 // WithBlockCount sets the maximum number of items per block. The default is
@@ -278,6 +283,17 @@ const ocfEagerBlockAllocLimit = 64 << 20
 // is bounded by its decompressed length, this also bounds the per-block
 // decode loop. Pass a larger value if you legitimately write blocks (via
 // [WithBlockBytes]) that decompress beyond the default.
+//
+// Enforcement scope: this limit is applied UP FRONT (the over-cap allocation is
+// prevented, not merely caught afterward) for codecs the reader resolves by
+// name from the file header — the common case — and for a built-in deflate or
+// snappy codec supplied as an instance via [WithCodec], since those constructors
+// expose no decompression bound of their own. A zstd codec or a third-party
+// codec supplied via [WithCodec] is bounded by its OWN configuration instead —
+// for zstd, set [zstd.WithDecoderMaxMemory] in [ZstdCodec]'s decoder options
+// when reading untrusted data — and this limit applies to such a codec only as
+// a backstop AFTER decompression, which rejects an over-cap block but does not
+// prevent its allocation.
 func WithMaxDecompressedBlockBytes(n int64) ReaderOpt { return optMaxDecompressedBytes{n} }
 
 // WithSchemaOpts passes [avro.SchemaOpt] values (such as [avro.CustomType]
@@ -305,6 +321,13 @@ func SnappyCodec() Codec { return snappyCodec{} }
 //
 // A single ZstdCodec is safe to share across multiple readers and writers
 // via [NopCloser].
+//
+// To READ untrusted data with a supplied ZstdCodec, bound decode memory via
+// [zstd.WithDecoderMaxMemory] in dopts: unlike a name-resolved zstd codec or a
+// supplied built-in deflate/snappy codec, a supplied zstd codec is NOT bounded
+// up front by [WithMaxDecompressedBlockBytes] (the reader cannot resize an
+// already-constructed decoder), so without it a tiny block can inflate to the
+// zstd default of 64 GiB before the post-decompression backstop rejects it.
 func ZstdCodec(eopts []zstd.EOption, dopts []zstd.DOption) (Codec, error) {
 	eopts = append([]zstd.EOption{zstd.WithEncoderConcurrency(1)}, eopts...)
 	dopts = append([]zstd.DOption{zstd.WithDecoderConcurrency(1)}, dopts...)
