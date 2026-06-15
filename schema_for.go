@@ -613,7 +613,7 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]string, c
 		"name": f.name,
 	}
 
-	schema, err := inferType(f.goType, f.logical, f.decimal, namespace, seen, customTypes, 0)
+	schema, err := inferType(f.goType, f.logical, f.decimal, namespace, seen, customTypes, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -818,7 +818,16 @@ func baseTypeForLogical(logical, fallback string) string {
 	return fallback
 }
 
-func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]string, customTypes []CustomType, depth int) (any, error) {
+// ptrChain is the number of CONSECUTIVE pointer levels already unwrapped to
+// reach t, reset to 0 at every record-field / array-item / map-value boundary
+// (the codec calls indirect/indirectAlloc fresh on each such leaf value). The
+// pointer arm caps it: the codec's indirect/indirectAlloc (reflect.go) unwrap
+// at most maxIndirectDepth pointer levels, so SchemaFor must refuse a deeper
+// chain at BUILD time rather than emit a ["null",T] the codec then rejects with
+// errIndirectDeep — a build-accepts/encode-rejects asymmetry. This also
+// terminates a cyclic non-struct pointer type (type P *P) at the cap instead
+// of recursing to the maxDepth ceiling.
+func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]string, customTypes []CustomType, depth, ptrChain int) (any, error) {
 	// A recursive non-struct Go type — `type S []S`, `type P *P`,
 	// `type M map[string]M`, or a long-enough pointer/slice/map chain — has
 	// a cyclic type graph, and the pointer/slice/map arms below recurse on
@@ -860,7 +869,16 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	// inside a union, so wrapping each level would emit an unparseable
 	// ["null", ["null", T]].
 	if t.Kind() == reflect.Pointer {
-		inner, err := inferType(t.Elem(), logical, decimal, namespace, seen, customTypes, depth+1)
+		// The codec unwraps at most maxIndirectDepth consecutive pointer levels
+		// (indirect/indirectAlloc both accept a chain bottoming at a non-pointer
+		// base within that cap). A deeper chain would build a valid ["null",T]
+		// here but fail Encode of a non-nil value with errIndirectDeep, so refuse
+		// it at build time. Mirrors checkIntDefaultFitsGoKind's maxIndirectDepth
+		// pointer-peel bound.
+		if ptrChain >= maxIndirectDepth {
+			return nil, fmt.Errorf("avro: %s: pointer chain nests deeper than the codec supports (it unwraps at most %d consecutive pointer levels); flatten the indirection, register a CustomType, or define the schema explicitly", t, maxIndirectDepth)
+		}
+		inner, err := inferType(t.Elem(), logical, decimal, namespace, seen, customTypes, depth+1, ptrChain+1)
 		if err != nil {
 			return nil, err
 		}
@@ -1035,7 +1053,9 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	// type. Shared by the Slice and Array arms below so the items-recursion
 	// + wrapping shape stays in one place.
 	inferArray := func(elem reflect.Type) (any, error) {
-		items, err := inferType(elem, "", [2]int{}, namespace, seen, customTypes, depth+1)
+		// Array/slice element: the codec encodes each element with a fresh
+		// indirect call, so the pointer chain resets (ptrChain=0).
+		items, err := inferType(elem, "", [2]int{}, namespace, seen, customTypes, depth+1, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -1111,7 +1131,9 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if t.Key().Kind() != reflect.String {
 			return nil, fmt.Errorf("map key must be string, got %s", t.Key())
 		}
-		values, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes, depth+1)
+		// Map value: encoded with a fresh indirect call per entry, so the
+		// pointer chain resets (ptrChain=0).
+		values, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes, depth+1, 0)
 		if err != nil {
 			return nil, err
 		}

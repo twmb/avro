@@ -117,9 +117,13 @@ func TestSchemaForNullable(t *testing.T) {
 func TestSchemaForMultiLevelPointer(t *testing.T) {
 	// The codecs collapse a whole pointer chain (**T, ***T, ...) to a
 	// single nullable union via indirect/indirectAlloc, so SchemaFor must
-	// emit one ["null", T] for any pointer depth — not a union nested
-	// inside a union, which Avro forbids ("unions cannot immediately
-	// contain other unions") and which would make the schema unusable.
+	// emit one ["null", T] — not a union nested inside a union, which Avro
+	// forbids ("unions cannot immediately contain other unions") and which
+	// would make the schema unusable. The chain is capped at the codec's
+	// own unwrap limit (maxIndirectDepth consecutive pointer levels); a
+	// deeper chain is refused at build (see
+	// TestRegression_SchemaForDeepPointerChainRefusedAtBuild) rather than
+	// emitting a ["null",T] the encoder would reject with errIndirectDeep.
 	t.Run("double pointer to int", func(t *testing.T) {
 		type Rec struct {
 			V **int32 `avro:"v"`
@@ -176,6 +180,71 @@ func TestSchemaForMultiLevelPointer(t *testing.T) {
 			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
 		}
 	})
+}
+
+// A pointer chain deeper than the codec unwraps (maxIndirectDepth consecutive
+// levels) must be refused at BUILD, not emitted as a ["null",T] the encoder
+// then rejects. The codec's indirect/indirectAlloc accept a chain bottoming at
+// a non-pointer base within maxIndirectDepth levels, so a SchemaFor schema for
+// a deeper chain would build but fail Encode of a non-nil value — a
+// build-accepts/encode-rejects asymmetry. Boundary: a chain at the cap
+// (maxIndirectDepth levels) builds AND round-trips a non-nil value; one level
+// deeper is refused at build naming the pointer-chain cause.
+func TestRegression_SchemaForDeepPointerChainRefusedAtBuild(t *testing.T) {
+	// At-cap chain (maxIndirectDepth == 5 pointer levels) builds and round-trips
+	// a NON-NIL value — the exact depth a deeper chain breaks and the depth the
+	// encode↔decode off-by-one used to reject on encode while decode accepted.
+	type AtCap struct {
+		F *****int32 `avro:"f"`
+	}
+	s, err := SchemaFor[AtCap]()
+	if err != nil {
+		t.Fatalf("a %d-level pointer chain (at the cap) must build: %v", maxIndirectDepth, err)
+	}
+	if _, err := Parse(s.String()); err != nil {
+		t.Fatalf("at-cap schema must re-parse: %v\n%s", err, s.String())
+	}
+	n := int32(42)
+	p1 := &n
+	p2 := &p1
+	p3 := &p2
+	p4 := &p3
+	p5 := &p4
+	wire, err := s.Encode(&AtCap{F: p5}) // non-nil all the way down
+	if err != nil {
+		t.Fatalf("at-cap chain must Encode a non-nil value: %v", err)
+	}
+	var got AtCap
+	if _, err := s.Decode(wire, &got); err != nil {
+		t.Fatalf("at-cap chain must Decode: %v", err)
+	}
+	if got.F == nil || *****got.F != 42 {
+		t.Fatalf("at-cap round-trip mismatch: %v", got.F)
+	}
+
+	// One level past the cap (maxIndirectDepth+1 == 6 pointer levels) is refused
+	// at BUILD, naming the pointer-chain cause — not deferred to an Encode
+	// failure.
+	type PastCap struct {
+		F ******int32 `avro:"f"`
+	}
+	_, err = SchemaFor[PastCap]()
+	if err == nil {
+		t.Fatalf("a %d-level pointer chain (past the cap) must be refused at build", maxIndirectDepth+1)
+	}
+	if !strings.Contains(err.Error(), "pointer chain nests deeper") {
+		t.Fatalf("build error should name the pointer-chain cause, got: %v", err)
+	}
+
+	// The cap resets at container boundaries: a slice/map whose element is an
+	// at-cap pointer chain still builds (each element is unwrapped fresh).
+	type Resets struct {
+		A []*****int32          `avro:"a"`
+		B map[string]*****int32 `avro:"b"`
+	}
+	if _, err := SchemaFor[Resets](); err != nil {
+		t.Fatalf("per-element pointer chains under the cap must build (chain resets at container boundary): %v", err)
+	}
 }
 
 func TestSchemaForNullableDefaultNull(t *testing.T) {
@@ -3442,7 +3511,14 @@ func TestRegression_SchemaForRecursiveNonStructTypeErrors(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected a recursion error, got nil")
 		}
-		if !strings.Contains(err.Error(), "recursive") && !strings.Contains(err.Error(), "nests too deeply") {
+		// slice/map recurse to the maxDepth ceiling ("nests too deeply or is
+		// recursive"); a cyclic pointer type (type P *P) is an unbounded
+		// consecutive-pointer chain, caught earlier at the codec's unwrap cap
+		// ("pointer chain nests deeper than the codec supports"). Either names
+		// the recursion/depth cause.
+		if !strings.Contains(err.Error(), "recursive") &&
+			!strings.Contains(err.Error(), "nests too deeply") &&
+			!strings.Contains(err.Error(), "nests deeper") {
 			t.Fatalf("error should name the recursion/depth cause, got: %v", err)
 		}
 	}
