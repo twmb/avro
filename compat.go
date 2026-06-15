@@ -333,6 +333,21 @@ func kindsMatchTier(r, w *schemaNode) matchTier {
 	if r.kind == w.kind {
 		switch r.kind {
 		case "record", "enum", "fixed":
+			// Spec: a reader branch matches a writer fixed only when "both
+			// schemas are fixed whose sizes and (unqualified) names match", and
+			// selection takes "the first schema in the reader's union that
+			// matches". So SIZE is part of the match predicate, not a post-
+			// selection check: a wrong-size same-name fixed branch must NOT match
+			// (matchNone) so findMatchingBranch keeps scanning and a later size-
+			// matching branch wins, rather than masking it. fastavro folds the
+			// size check into selection the same way; matching on name alone here
+			// and rejecting on size afterward (via checkSameKind) errored on a
+			// fully decodable value (see NOT_BUGS "Union-branch ... fixed-SIZE").
+			// The direct (non-union) fixed path still validates size in
+			// checkSameKind / doResolve; that is unaffected.
+			if r.kind == "fixed" && r.size != w.size {
+				return matchNone
+			}
 			if r.name == w.name {
 				return matchExact
 			}
