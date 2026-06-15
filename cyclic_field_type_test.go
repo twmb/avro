@@ -143,3 +143,73 @@ func TestRegression_SliceElementPointerChainBounded(t *testing.T) {
 		}
 	})
 }
+
+// Encode and decode must agree on the maximum pointer-chain depth they accept.
+// The encode-side indirect formerly accepted only maxIndirectDepth-1 levels
+// (it confirmed a non-pointer base on a FOLLOWING loop iteration the cap had
+// already spent), while the decode-side indirectAlloc accepted maxIndirectDepth
+// — so a value exactly maxIndirectDepth pointers deep DECODED but failed to
+// ENCODE, a round-trip break for a hand-written schema independent of SchemaFor.
+// Both now accept a chain bottoming at a non-pointer base within
+// maxIndirectDepth levels and reject one deeper, symmetrically, on binary AND
+// JSON.
+func TestRegression_PointerChainEncodeDecodeDepthParity(t *testing.T) {
+	s := avro.MustParse(`["null","int"]`)
+
+	// At maxIndirectDepth (5) levels: a non-nil chain must round-trip on both
+	// wires. Build *****int = &&&&&(7).
+	n := int64(7)
+	p1 := &n
+	p2 := &p1
+	p3 := &p2
+	p4 := &p3
+	p5 := &p4 // 5 pointers, non-nil all the way down
+
+	bin, err := s.Encode(p5)
+	if err != nil {
+		t.Fatalf("binary Encode of a %d-deep non-nil pointer must succeed (encode↔decode parity): %v", maxDepthLevels, err)
+	}
+	var bg *****int64
+	if _, err := s.Decode(bin, &bg); err != nil {
+		t.Fatalf("binary Decode into a %d-deep pointer must succeed: %v", maxDepthLevels, err)
+	}
+	if bg == nil || *****bg != 7 {
+		t.Fatalf("binary round-trip mismatch at depth %d", maxDepthLevels)
+	}
+
+	js, err := s.EncodeJSON(p5)
+	if err != nil {
+		t.Fatalf("JSON Encode of a %d-deep non-nil pointer must succeed: %v", maxDepthLevels, err)
+	}
+	var jg *****int64
+	if err := s.DecodeJSON(js, &jg); err != nil {
+		t.Fatalf("JSON Decode into a %d-deep pointer must succeed: %v", maxDepthLevels, err)
+	}
+	if jg == nil || *****jg != 7 {
+		t.Fatalf("JSON round-trip mismatch at depth %d", maxDepthLevels)
+	}
+
+	// One level deeper (6) must be rejected on the BINARY wire symmetrically:
+	// encode (indirect) and decode (indirectAlloc) both refuse a chain past the
+	// cap (the cyclic-interface DoS guard is preserved). JSON encode refuses it
+	// too. (JSON decode of a UNION target indirects at two stages — unionTarget
+	// then decodeValue — so it tolerates a deeper pointer target than binary; a
+	// pre-existing, bounded JSON leniency orthogonal to this encode↔decode
+	// parity fix, not asserted here.)
+	q6 := &p5 // 6 pointers
+	if _, err := s.Encode(q6); err == nil {
+		t.Fatalf("binary Encode of a %d-deep pointer must be rejected", maxDepthLevels+1)
+	}
+	var b6 ******int64
+	if _, err := s.Decode(bin, &b6); err == nil {
+		t.Fatalf("binary Decode into a %d-deep pointer must be rejected", maxDepthLevels+1)
+	}
+	if _, err := s.EncodeJSON(q6); err == nil {
+		t.Fatalf("JSON Encode of a %d-deep pointer must be rejected", maxDepthLevels+1)
+	}
+}
+
+// maxDepthLevels mirrors the package-internal maxIndirectDepth (5) for the
+// external test above; if the internal cap changes, the depth-parity test's
+// literal pointer types (*****T at the cap, ******T past it) must change with it.
+const maxDepthLevels = 5

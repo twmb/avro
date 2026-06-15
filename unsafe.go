@@ -399,21 +399,21 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		// overflow the goroutine stack — a fatal, unrecoverable crash. A
 		// non-cyclic chain too deep for the reflect encoder also matters: the
 		// reflect path (serIndirect → indirect) peels at most maxIndirectDepth
-		// levels and confirms a non-pointer only on a FOLLOWING iteration, so
-		// it accepts at most maxIndirectDepth-1 pointer levels and errors at
-		// or beyond maxIndirectDepth. An unbounded fast path would instead
-		// accept those deeper chains, diverging from the reflect encoder it
-		// must mirror byte-for-byte. Counting the consecutive pointer levels
-		// and declining at maxIndirectDepth terminates the cycle and keeps the
-		// fast path's accept set identical to the reflect encoder's: the
-		// declined chain routes to the reflect slow path, which errors
+		// levels and accepts a chain bottoming at a non-pointer base within
+		// that cap — maxIndirectDepth pointer levels — erroring only beyond it.
+		// An unbounded fast path would instead accept arbitrarily deep chains,
+		// diverging from the reflect encoder it must mirror byte-for-byte.
+		// Counting the consecutive pointer levels and declining BEYOND
+		// maxIndirectDepth terminates the cycle and keeps the fast path's accept
+		// set identical to the reflect encoder's: a chain within the cap
+		// compiles, a deeper one routes to the reflect slow path, which errors
 		// uniformly (errIndirectDeep / errIndirectNil). Mirrors
 		// tryCompileFieldDeser (declines all pointers) and the multi-pointer
 		// nullunion/array arms.
 		levels := 1
 		for e := goType.Elem(); e.Kind() == reflect.Pointer; e = e.Elem() {
 			levels++
-			if levels >= maxIndirectDepth {
+			if levels > maxIndirectDepth {
 				return nil
 			}
 		}

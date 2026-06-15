@@ -251,7 +251,23 @@ func indirect(v reflect.Value) (reflect.Value, error) {
 			return v, nil
 		}
 	}
-	return v, errIndirectDeep
+	// After maxIndirectDepth unwraps, the value may already be a non-pointer
+	// base reached at exactly the cap — accept it, matching indirectAlloc,
+	// isNilValue, and serNull (which peel in the loop body and inspect the
+	// base afterward, so they accept a chain of maxIndirectDepth levels).
+	// Inspecting only inside the loop's default arm would reject such a base
+	// because confirming it costs one further iteration the loop has already
+	// spent — an encode/decode off-by-one where a maxIndirectDepth-deep
+	// pointer value decodes but fails to encode. Only a STILL-indirect value,
+	// including a cyclic interface (var p any; p = &p), is genuinely too deep.
+	switch v.Kind() {
+	case reflect.Invalid:
+		return v, errIndirectNil
+	case reflect.Pointer, reflect.Interface:
+		return v, errIndirectDeep
+	default:
+		return v, nil
+	}
 }
 
 func indirectAlloc(v reflect.Value) reflect.Value {
