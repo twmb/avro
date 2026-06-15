@@ -1183,12 +1183,39 @@ func (c *zstdCodec) Close() error {
 
 // resolveCodec returns the codec named in the file header. maxDecompressed
 // (0 = unlimited) bounds the decompressed size of a block for the built-in
-// codecs that inflate untrusted input; a custom codec matched by name is
-// returned as-is (its allocation is the implementor's responsibility — the
-// reader still applies the post-decompress length backstop).
+// codecs that inflate untrusted input; a genuine third-party custom codec
+// matched by name is returned as-is (its allocation is the implementor's
+// responsibility — the reader still applies the post-decompress length
+// backstop).
 func resolveCodec(name string, custom []Codec, maxDecompressed int64) (Codec, error) {
 	for _, c := range custom {
 		if c.Name() == name {
+			// A user who supplies a built-in codec INSTANCE via WithCodec
+			// (ocf.DeflateCodec(…) / ocf.SnappyCodec()) gets one whose
+			// decompression bound defaults to 0 (unbounded). Unlike a genuine
+			// third-party custom codec — whose internals the reader cannot see,
+			// so it can only backstop the size after Decompress returns — these
+			// the reader DOES know how to bound: inject maxDecompressed so they
+			// prevent an over-cap allocation up front, exactly like the
+			// name-resolved built-in below. Without this, a reader configured
+			// with a built-in codec instance decompresses the whole block before
+			// the backstop rejects it (deflate via an unbounded io.ReadAll, so a
+			// tiny deflate bomb OOMs the process). maxDecompressed==0 (the
+			// trusted append path) leaves them unbounded, as intended.
+			if maxDecompressed > 0 {
+				switch cc := c.(type) {
+				case deflateCodec:
+					if cc.maxOut <= 0 {
+						cc.maxOut = maxDecompressed
+						return cc, nil
+					}
+				case snappyCodec:
+					if cc.maxOut <= 0 {
+						cc.maxOut = maxDecompressed
+						return cc, nil
+					}
+				}
+			}
 			return c, nil
 		}
 	}
