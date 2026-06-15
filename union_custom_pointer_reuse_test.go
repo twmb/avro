@@ -135,6 +135,63 @@ func TestRegression_UnionCustomDecodePointerReusedTargetParity(t *testing.T) {
 	}
 }
 
+// A CustomType.Decode returning a pointer must decode into a concrete *T field
+// target through a union branch on EVERY union shape and BOTH wires. The binary
+// general union deser (deserUnion.deser) passes the un-indirected target to the
+// branch fn, so setCustomResult lands the *T result; but the 2-branch null-union
+// fast path (deserNullUnionAt) pre-dereferenced a concrete pointer before the
+// branch fn, so a *T target FAILED in a ["null", customLong] union while
+// SUCCEEDING in a 3+-branch union — an arbitrary 2-branch-vs-general
+// inconsistency that rejected a target the general path decodes. The JSON
+// unionTarget likewise derefed concrete pointers. These pin that a *T custom
+// target decodes uniformly across union arity and wire format.
+func TestRegression_UnionCustomDecodePointerFieldTarget(t *testing.T) {
+	type EventPtr struct {
+		When *ucpEvent `avro:"when"`
+	}
+	want := time.UnixMilli(1700000000000).UTC()
+
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{"2-branch-null-union", `{"type":"record","name":"R","fields":[{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}]}`},
+		// A 3+-branch union routes through the general deserUnion.deser path.
+		{"3-branch-union", `{"type":"record","name":"R","fields":[{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"},"string"]}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := avro.Parse(tc.schema, avro.WithCustomType(ucpCustom()))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			in := EventPtr{When: &ucpEvent{T: want}}
+			b, err := s.AppendEncode(nil, in)
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			var gotB EventPtr
+			if _, err := s.Decode(b, &gotB); err != nil {
+				t.Fatalf("binary decode into *T field: %v", err)
+			}
+			if gotB.When == nil || !gotB.When.T.Equal(want) {
+				t.Fatalf("binary *T field: got %v", gotB.When)
+			}
+			j, err := s.AppendEncodeJSON(nil, in)
+			if err != nil {
+				t.Fatalf("json encode: %v", err)
+			}
+			var gotJ EventPtr
+			if err := s.DecodeJSON(j, &gotJ); err != nil {
+				t.Fatalf("json decode into *T field: %v", err)
+			}
+			if gotJ.When == nil || !gotJ.When.T.Equal(want) {
+				t.Fatalf("json *T field: got %v", gotJ.When)
+			}
+		})
+	}
+}
+
 // Boundary-1 control: NON-custom union decode into a reused interface that holds
 // a manually pre-populated *T must keep doing in-place reuse (the result's
 // dynamic type stays *T) identically on binary and JSON — the per-branch fix

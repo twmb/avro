@@ -304,12 +304,16 @@ func deserNullUnionAt(u *deserUnion, valIdx int, nullByte, valByte byte) deserfn
 			v.Set(reflect.Zero(v.Type()))
 			return src, nil
 		}
-		if v.Kind() == reflect.Pointer {
-			if v.IsNil() {
-				v.Set(reflect.New(v.Type().Elem()))
-			}
-			return u.fns[valIdx](src, v.Elem(), sl)
-		}
+		// Pass the UN-indirected target to the branch fn and let it indirect
+		// itself, exactly as the general deserUnion.deser does: a non-custom leaf
+		// (deserLong/deserRecord/...) calls indirectAlloc (reusing a *T in place,
+		// or allocating a nil one), and a custom wrapper's setCustomResult lands a
+		// pointer Decode result into a *T target. Pre-dereferencing a concrete
+		// pointer here (the former fast-path) handed the custom wrapper the pointee,
+		// so a CustomType.Decode returning a pointer FAILED into a *T field in this
+		// 2-branch null-union while SUCCEEDING in a 3+-branch union (deserUnion.deser)
+		// — an arbitrary 2-branch-vs-general inconsistency. maybeWrap is a no-op for
+		// non-interface targets, so the *T path is unaffected by it.
 		out, err := u.fns[valIdx](src, v, sl)
 		if err == nil {
 			u.maybeWrap(v, sl, int32(valIdx))

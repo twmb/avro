@@ -1640,19 +1640,20 @@ func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, branch *schemaNode)
 }
 
 // unionTarget selects the decode target and toAny flag for a matched union
-// branch, mirroring the binary deserUnion / deserNullUnionAt per-branch
-// indirection. A custom-decode branch whose target is an INTERFACE decodes
-// against the raw interface (the toAny path's assignAny then sets the —
-// possibly pointer — custom result into it): the binary union passes an
-// interface target to the branch fn UN-dereferenced, so pre-dereferencing a
-// reused *T held in an interface would reject a Decode that returns a pointer
-// (binary↔JSON divergence on the target-reuse contract). Every other case
-// indirects exactly as before — a non-custom branch reuses a *T held in an
-// interface IN PLACE (or boxes a value), and a custom branch into a concrete
-// pointer derefs to the pointee as deserNullUnionAt's v.Elem() does.
+// branch, mirroring the binary deserUnion.deser per-branch indirection: the
+// binary union passes the branch fn the un-dereferenced target. A non-custom
+// branch indirects (reusing a *T held in an interface IN PLACE, or boxing a
+// value); a custom branch keeps the raw target so its wrapper's setCustomResult
+// can land a pointer result into a reused interface or a concrete *T field.
 func unionTarget(rawV reflect.Value, branch *schemaNode) (reflect.Value, bool) {
-	if branch.decodeJSON != nil && rawV.Kind() == reflect.Interface {
-		return rawV, true
+	if branch.decodeJSON != nil {
+		// Custom-decode branch: decode against the UN-indirected target (any
+		// kind) so the wrapper's setCustomResult lands a pointer result into a
+		// reused *T held in an interface OR a concrete *T field — exactly as the
+		// binary deserUnion.deser passes the un-dereferenced target. Pre-
+		// dereferencing here rejected a Decode that returns a pointer. toAny
+		// routes the interface case through the wrap path.
+		return rawV, rawV.Kind() == reflect.Interface
 	}
 	iv := indirectAlloc(rawV)
 	return iv, iv.Kind() == reflect.Interface
