@@ -3360,31 +3360,73 @@ func schemaForFieldType(ft reflect.Type) (*Schema, error) {
 // actually materializes leaf types buried in pointers/slices/maps (a nil
 // pointer or empty slice never encodes its element type, which would hide a
 // build-accepts/encode-rejects bug on that element — e.g. *json.Number).
-func sampleValue(t reflect.Type) reflect.Value {
+func sampleValue(t reflect.Type) reflect.Value { return sampleValuePath(t, nil) }
+
+// sampleValuePath is sampleValue with a cycle guard so a recursive Go type
+// (a linked-list `Next *Node`, a `type S []S`, a `map[string]M`) terminates
+// instead of recursing forever: a type already on the construction path
+// yields the zero value at that point (a nil pointer / empty slice / empty
+// map / zero-filled array or struct), all of which are valid round-trip
+// values. For a NON-recursive type no type ever reaches itself, so the guard
+// never fires and the produced value is identical to the original
+// sampleValue — the existing TestSchemaForEncodeParity sweep is unchanged.
+// The cycle safety lets the round-trip-consistency net carry recursive-struct
+// leaves through the same shared sampler.
+func sampleValuePath(t reflect.Type, onPath map[reflect.Type]bool) reflect.Value {
+	if t == timeType {
+		// A representative IN-RANGE, whole-second, UTC time. The zero time.Time
+		// is year 1, which overflows int64-nanoseconds-since-epoch (~1678..2262
+		// AD): a timestamp-nanos schema — valid for in-range times, which
+		// SchemaFor rightly builds for the explicit tag — would then reject the
+		// zero value at Encode, masking a correct schema as a build-accepts/
+		// encode-rejects. A whole-second 2020 time is representable by every
+		// time/date logical (millis/micros/nanos, date, time-of-day) without
+		// overflow or sub-unit truncation. No monotonic reading, UTC location,
+		// so it round-trips identically.
+		return reflect.ValueOf(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC))
+	}
 	switch t.Kind() {
 	case reflect.Pointer:
+		if onPath[t.Elem()] {
+			return reflect.Zero(t) // nil pointer breaks a *Node→Node→*Node cycle
+		}
 		p := reflect.New(t.Elem())
-		p.Elem().Set(sampleValue(t.Elem()))
+		p.Elem().Set(sampleValuePath(t.Elem(), withSamplePath(onPath, t.Elem())))
 		return p
 	case reflect.Slice:
+		if onPath[t.Elem()] {
+			return reflect.MakeSlice(t, 0, 0) // empty slice breaks a []S→S cycle
+		}
 		sl := reflect.MakeSlice(t, 1, 1)
-		sl.Index(0).Set(sampleValue(t.Elem()))
+		sl.Index(0).Set(sampleValuePath(t.Elem(), withSamplePath(onPath, t.Elem())))
 		return sl
 	case reflect.Array:
 		a := reflect.New(t).Elem()
+		if onPath[t.Elem()] {
+			return a // zero-filled array breaks an [N]A→A cycle
+		}
+		next := withSamplePath(onPath, t.Elem())
 		for i := 0; i < t.Len(); i++ {
-			a.Index(i).Set(sampleValue(t.Elem()))
+			a.Index(i).Set(sampleValuePath(t.Elem(), next))
 		}
 		return a
 	case reflect.Map:
 		m := reflect.MakeMap(t)
-		m.SetMapIndex(sampleValue(t.Key()), sampleValue(t.Elem()))
+		if onPath[t.Elem()] || onPath[t.Key()] {
+			return m // empty map breaks a map[K]M→M cycle
+		}
+		m.SetMapIndex(sampleValuePath(t.Key(), withSamplePath(onPath, t.Key())),
+			sampleValuePath(t.Elem(), withSamplePath(onPath, t.Elem())))
 		return m
 	case reflect.Struct:
 		v := reflect.New(t).Elem()
+		if onPath[t] {
+			return v // zero struct breaks a by-value struct cycle
+		}
+		next := withSamplePath(onPath, t)
 		for i := 0; i < t.NumField(); i++ {
 			if t.Field(i).IsExported() {
-				v.Field(i).Set(sampleValue(t.Field(i).Type))
+				v.Field(i).Set(sampleValuePath(t.Field(i).Type, next))
 			}
 		}
 		return v
@@ -3395,6 +3437,18 @@ func sampleValue(t reflect.Type) reflect.Value {
 	default:
 		return reflect.New(t).Elem() // zero is representative for scalars/time
 	}
+}
+
+// withSamplePath returns a copy of onPath with t added (copy-on-descend so
+// sibling fields do not see each other's path — only a type reaching ITSELF
+// is cut).
+func withSamplePath(onPath map[reflect.Type]bool, t reflect.Type) map[reflect.Type]bool {
+	next := make(map[reflect.Type]bool, len(onPath)+1)
+	for k := range onPath {
+		next[k] = true
+	}
+	next[t] = true
+	return next
 }
 
 // TestSchemaForEncodeParity is the generative net for the build-accepts /
