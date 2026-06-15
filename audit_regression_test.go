@@ -1508,6 +1508,153 @@ func TestRegression_ResolvedDecodeJSONMatchesBinary(t *testing.T) {
 	})
 }
 
+// A resolved schema's DecodeJSON must match its binary Decode (the oracle) even
+// when the WRITER carries a CustomType whose Decode the writer's own Encode
+// cannot reproduce — a Decode-only "read-side mapping" custom being the common
+// case. decodeJSONResolved performs a pure wire-shape transform (writer-JSON ->
+// writer-binary) before the resolving decode, and that transform must run
+// against a CUSTOM-FREE view of the writer: decoding writer-JSON through the
+// writer's own custom Decode produces a Go-domain value the re-encode then
+// cannot invert, so DecodeJSON failed where binary Decode (which reads raw
+// writer bytes and applies the READER's custom) succeeded. The reader's custom
+// Decode still fires in the final resolving decode, so both wires land the same
+// domain value.
+//
+// Non-vacuity: the invertible-custom cells exercise the identical path and
+// round-tripped before the fix (their Encode reproduces the writer wire); the
+// decode-only cells are the ones that failed. Asserting both proves the fix
+// repairs the broken cells without regressing the working ones. (Neuter check:
+// reverting decodeJSONResolved to s.resolveWriter fails every decode-only cell.)
+func TestRegression_ResolvedDecodeJSONWriterCustomDecodeRawRoundTrip(t *testing.T) {
+	type domainTS struct{ ms int64 }
+	type domainDec struct{ raw string }
+
+	tsType := reflect.TypeFor[domainTS]()
+	decType := reflect.TypeFor[domainDec]()
+
+	// Decode-only customs (read-side domain mapping, no Encode) — the cells that
+	// failed pre-fix. The writer encodes the Avro-native/enriched value through
+	// the built-in encoder (a Decode-only custom does not suppress encode), so
+	// the bug is isolated to the resolved-JSON decode round-trip.
+	logicals := []struct {
+		name         string
+		fieldType    string
+		ct           avro.CustomType
+		writerXVal   any
+		assertDomain func(t *testing.T, x any)
+	}{
+		{
+			"timestamp-millis",
+			`{"type":"long","logicalType":"timestamp-millis"}`,
+			avro.CustomType{
+				LogicalType: "timestamp-millis", AvroType: "long", GoType: tsType,
+				Decode: func(v any, _ *avro.SchemaNode) (any, error) { return domainTS{ms: v.(int64)}, nil },
+			},
+			time.UnixMilli(1700000000000).UTC(),
+			func(t *testing.T, x any) {
+				if _, ok := x.(domainTS); !ok {
+					t.Fatalf("reader custom Decode did not fire (vacuous pass): x=%#v", x)
+				}
+			},
+		},
+		{
+			"decimal-bytes",
+			`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`,
+			avro.CustomType{
+				LogicalType: "decimal", AvroType: "bytes", GoType: decType,
+				Decode: func(v any, _ *avro.SchemaNode) (any, error) { return domainDec{raw: string(v.([]byte))}, nil },
+			},
+			big.NewRat(12345, 100), // 123.45
+			func(t *testing.T, x any) {
+				if _, ok := x.(domainDec); !ok {
+					t.Fatalf("reader custom Decode did not fire (vacuous pass): x=%#v", x)
+				}
+			},
+		},
+	}
+	evolutions := []struct {
+		name         string
+		writerFields func(x string) string
+		readerFields func(x string) string
+		val          func(xv any) map[string]any
+	}{
+		{
+			"reorder",
+			func(x string) string { return `{"name":"x","type":` + x + `},{"name":"y","type":"int"}` },
+			func(x string) string { return `{"name":"y","type":"int"},{"name":"x","type":` + x + `}` },
+			func(xv any) map[string]any { return map[string]any{"x": xv, "y": int32(7)} },
+		},
+		{
+			"drop-writer-field",
+			func(x string) string { return `{"name":"x","type":` + x + `},{"name":"drop","type":"int"}` },
+			func(x string) string { return `{"name":"x","type":` + x + `}` },
+			func(xv any) map[string]any { return map[string]any{"x": xv, "drop": int32(3)} },
+		},
+		{
+			"add-reader-default",
+			func(x string) string { return `{"name":"x","type":` + x + `}` },
+			func(x string) string { return `{"name":"x","type":` + x + `},{"name":"added","type":"int","default":42}` },
+			func(xv any) map[string]any { return map[string]any{"x": xv} },
+		},
+	}
+
+	roundTrip := func(t *testing.T, writer, reader *avro.Schema, val map[string]any) (binOut, jsonOut map[string]any) {
+		binWire, err := writer.Encode(val)
+		if err != nil {
+			t.Fatalf("writer Encode: %v", err)
+		}
+		jsonWire, err := writer.EncodeJSON(val)
+		if err != nil {
+			t.Fatalf("writer EncodeJSON: %v", err)
+		}
+		resolved, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		if _, err := resolved.Decode(binWire, &binOut); err != nil {
+			t.Fatalf("resolved.Decode (binary oracle): %v", err)
+		}
+		if err := resolved.DecodeJSON(jsonWire, &jsonOut); err != nil {
+			t.Fatalf("resolved.DecodeJSON failed where binary Decode succeeded: %v\n  binary oracle: %#v", err, binOut)
+		}
+		if !reflect.DeepEqual(binOut, jsonOut) {
+			t.Errorf("resolved JSON decode != binary decode:\n  binary=%#v\n  json  =%#v", binOut, jsonOut)
+		}
+		return binOut, jsonOut
+	}
+
+	for _, lg := range logicals {
+		for _, ev := range evolutions {
+			t.Run(lg.name+"/decode-only/"+ev.name, func(t *testing.T) {
+				writer := avro.MustParse(`{"type":"record","name":"R","fields":[`+ev.writerFields(lg.fieldType)+`]}`, avro.WithCustomType(lg.ct))
+				reader := avro.MustParse(`{"type":"record","name":"R","fields":[`+ev.readerFields(lg.fieldType)+`]}`, avro.WithCustomType(lg.ct))
+				binOut, _ := roundTrip(t, writer, reader, ev.val(lg.writerXVal))
+				lg.assertDomain(t, binOut["x"])
+			})
+		}
+	}
+
+	// Non-regression control: an INVERTIBLE custom (Decode + Encode) through the
+	// identical resolved-JSON path round-tripped before the fix and must still —
+	// the fix routes the round-trip through a custom-free writer view regardless
+	// of the custom's invertibility. The writer encodes the DOMAIN value here, so
+	// the custom Encode fires.
+	t.Run("invertible-control/timestamp-millis/reorder", func(t *testing.T) {
+		ct := avro.CustomType{
+			LogicalType: "timestamp-millis", AvroType: "long", GoType: tsType,
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) { return domainTS{ms: v.(int64)}, nil },
+			Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v.(domainTS).ms, nil },
+		}
+		ft := `{"type":"long","logicalType":"timestamp-millis"}`
+		writer := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":`+ft+`},{"name":"y","type":"int"}]}`, avro.WithCustomType(ct))
+		reader := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"y","type":"int"},{"name":"x","type":`+ft+`}]}`, avro.WithCustomType(ct))
+		binOut, _ := roundTrip(t, writer, reader, map[string]any{"x": domainTS{ms: 1700000000000}, "y": int32(7)})
+		if _, ok := binOut["x"].(domainTS); !ok {
+			t.Fatalf("invertible custom Decode did not fire (vacuous pass): x=%#v", binOut["x"])
+		}
+	})
+}
+
 // A self-/mutually-recursive (or forward-referenced) named type whose subtree
 // contains a logical that a registered CustomType matches must Parse — the
 // CustomType is in scope for the current Parse and applies to the type's single

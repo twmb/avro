@@ -233,11 +233,14 @@ func (s *Schema) DecodeJSON(src []byte, v any, opts ...Opt) error {
 // reusing the binary resolver (rather than threading resolution through the JSON
 // decoder) keeps the surface small and correct by construction.
 func (s *Schema) decodeJSONResolved(src []byte, rv reflect.Value, opts ...Opt) error {
-	w := s.resolveWriter
-	// The intermediate is decoded with NEUTRAL options and re-encoded
-	// immediately, so it must hold the writer's natural decoded form (bare
-	// unions, raw/unwrapped values) for Encode to reproduce the writer wire.
-	// The caller's opts apply only to the final reader-shaped decode below.
+	w := s.resolveWriterRaw
+	// Use the custom-free view of the writer: this round-trip is a pure
+	// wire-shape transform (writer-JSON -> writer-binary), so the intermediate
+	// must hold RAW Avro-native values. Decoding through the writer's own
+	// CustomType decoders would produce Go-domain values that the re-encode then
+	// cannot invert (a Decode-only custom has no Encode), failing where binary
+	// Decode succeeds. The reader's custom types apply only in the final
+	// resolving s.Decode below; the caller's opts likewise apply only there.
 	var inter any
 	if err := w.DecodeJSON(src, &inter); err != nil {
 		return err

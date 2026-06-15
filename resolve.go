@@ -55,6 +55,22 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 		custom: reader.custom,
 	}
 	s.resolveWriter = writer
+	// decodeJSONResolved transforms writer-shaped JSON into RAW writer binary
+	// before the resolving decode; a writer carrying its own CustomType decoders
+	// would run them during that transform and then fail to re-encode the
+	// resulting Go-domain value (a Decode-only custom has no Encode to invert it).
+	// Re-parse the writer custom-free for that round-trip; the reader's custom
+	// types still apply in the final s.Decode. Lenient names so a lax-named writer
+	// (which already parsed once) re-parses — names do not affect wire bytes. With
+	// no custom on the writer there is nothing to suppress, so reuse it directly.
+	s.resolveWriterRaw = writer
+	if len(writer.custom) > 0 {
+		raw, err := Parse(writer.full, WithLaxNames(nil))
+		if err != nil {
+			return nil, fmt.Errorf("avro: building custom-free writer view for resolved JSON decode: %w", err)
+		}
+		s.resolveWriterRaw = raw
+	}
 	s.soe = reader.soe
 	// SOE wire bytes carry the writer's fingerprint per the Avro spec
 	// (the schema that produced the wire IS the writer). Storing

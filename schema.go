@@ -52,6 +52,20 @@ type Schema struct {
 	// directly against s.node.
 	resolveWriter *Schema
 
+	// resolveWriterRaw is a custom-free view of the writer, used solely by
+	// decodeJSONResolved for the JSON wire-shape round-trip (writer-JSON ->
+	// writer-binary). That intermediate must hold RAW Avro-native values: if the
+	// writer carries its own CustomType decoders, decoding writer-JSON through
+	// resolveWriter would run them (producing Go-domain values) and the re-encode
+	// would then need the writer's custom ENCODER to invert them -- which fails
+	// for a Decode-only custom, or any custom whose Encode cannot reproduce the
+	// decoded type. Binary Decode never re-encodes through the writer (it reads
+	// raw writer bytes and applies the READER's custom), so it is unaffected;
+	// this custom-free view makes the JSON path match it. Equal to resolveWriter
+	// when the writer has no custom types (nothing to suppress); set alongside
+	// resolveWriter by Resolve.
+	resolveWriterRaw *Schema
+
 	// Per-schema custom type overlay. Keyed by *schemaNode so the
 	// shared node is not mutated — different schemas parsed with
 	// different custom types get different overlays.
