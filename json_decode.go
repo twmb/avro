@@ -1521,19 +1521,26 @@ func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 		return nil
 	}
 
-	v = indirectAlloc(v)
-	toAny := v.Kind() == reflect.Interface
+	// Branch indirection is PER-BRANCH (see decodeBranchInto / decodeUnionObject),
+	// mirroring the binary deserUnion.deser path: a custom-decode branch decodes
+	// against the un-indirected target so a Decode returning a pointer lands in an
+	// interface/pointer via setCustomResult (as binary's wrapDeserWithCustomDecoders
+	// does), while a non-custom branch indirects in decodeKind (in-place reuse of a
+	// *T held in an interface; value boxing for a nil/value interface).
+	// Pre-indirecting the union target here would dereference a reused *T held in
+	// an interface and reject a custom pointer result — a binary↔JSON divergence
+	// on the target-reuse contract.
 
 	// JSON object → could be tagged union {"type": value} or bare record/map.
 	if p == '{' {
-		return ctx.decodeUnionObject(v, node, toAny)
+		return ctx.decodeUnionObject(v, node)
 	}
 
 	// Bare non-object value — match by JSON token type.
-	return ctx.decodeUnionBare(v, node, toAny, p)
+	return ctx.decodeUnionBare(v, node, p)
 }
 
-func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toAny bool) error {
+func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) error {
 	// Save position for backtracking.
 	savedPos := ctx.scanner.pos
 	// Preserve the deepest concrete decode error from a matched branch
@@ -1551,37 +1558,36 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 		if err == nil {
 			if branch := findUnionBranch(node, key); branch != nil {
 				if err := ctx.scanner.expect(':'); err == nil {
+					target, toAny := unionTarget(v, branch)
 					if toAny {
-						// Decode into a tmp `any` first so v stays
-						// untouched until we know the close-brace
-						// arrived — otherwise a malformed tagged
-						// payload like `{"long": 42,` would write v
-						// and THEN backtrack to the bare-fallback,
-						// leaving v dirty on the final err return.
+						// Decode into a tmp `any` first so the target stays
+						// untouched until the close-brace arrives — a malformed
+						// tagged payload like `{"long": 42,` would otherwise write
+						// it and THEN backtrack to the bare-fallback, leaving it
+						// dirty on the final err. For a custom branch into an
+						// interface, unionTarget returns the raw interface so
+						// assignAny sets the (possibly pointer) custom result into
+						// it rather than a pre-dereferenced pointee.
 						var val any
 						err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch)
 						if err == nil {
 							if ctx.scanner.peek() == '}' {
 								ctx.scanner.pos++
-								return assignAny(v, ctx.wrapUnion(v, val, branch), branch.kind)
+								return assignAny(target, ctx.wrapUnion(target, val, branch), branch.kind)
 							}
 						} else if errors.Is(err, errTooDeep) {
-							// Don't fall through to bare-union retry; the
-							// recursion limit applies regardless of how the
-							// branch is matched, so masking it as "no
-							// branch matched" would be wrong.
+							// Don't fall through to bare-union retry; the recursion
+							// limit applies regardless of how the branch is matched.
 							return err
 						} else {
 							taggedErr = err
 						}
 					} else {
-						// Typed path: decodeValue writes v directly.
-						// Backtracking after a partial write here is
-						// acceptable — the only case it triggers is a
-						// missing close brace on otherwise-valid JSON,
-						// and the next attempt will overwrite via the
-						// bare fallback if it matches.
-						err := ctx.decodeValue(v, branch)
+						// Typed path: decodeValue writes target directly.
+						// Backtracking after a partial write is acceptable — the
+						// only trigger is a missing close brace on otherwise-valid
+						// JSON, and the bare fallback overwrites if it matches.
+						err := ctx.decodeValue(target, branch)
 						if err == nil {
 							if ctx.scanner.peek() == '}' {
 								ctx.scanner.pos++
@@ -1602,7 +1608,7 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 	// tagged-side concrete error so it can be surfaced if bare also
 	// fails to match.
 	ctx.scanner.pos = savedPos
-	if err := ctx.decodeUnionBare(v, node, toAny, '{'); err != nil {
+	if err := ctx.decodeUnionBare(v, node, '{'); err != nil {
 		if taggedErr != nil {
 			return fmt.Errorf("%w (tagged-form: %v)", err, taggedErr)
 		}
@@ -1618,7 +1624,8 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode, toA
 // uses an inline tmp `any` instead since it must hold the decoded value
 // pending a close-brace check before committing to v — see the comment
 // on its tagged-path arm.
-func (ctx *jsonDecoder) decodeBranchInto(v reflect.Value, branch *schemaNode, toAny bool) error {
+func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, branch *schemaNode) error {
+	v, toAny := unionTarget(rawV, branch)
 	if toAny {
 		var val any
 		if err := ctx.decodeValue(reflect.ValueOf(&val).Elem(), branch); err != nil {
@@ -1632,7 +1639,26 @@ func (ctx *jsonDecoder) decodeBranchInto(v reflect.Value, branch *schemaNode, to
 	return ctx.decodeValue(v, branch)
 }
 
-func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny bool, p byte) error {
+// unionTarget selects the decode target and toAny flag for a matched union
+// branch, mirroring the binary deserUnion / deserNullUnionAt per-branch
+// indirection. A custom-decode branch whose target is an INTERFACE decodes
+// against the raw interface (the toAny path's assignAny then sets the —
+// possibly pointer — custom result into it): the binary union passes an
+// interface target to the branch fn UN-dereferenced, so pre-dereferencing a
+// reused *T held in an interface would reject a Decode that returns a pointer
+// (binary↔JSON divergence on the target-reuse contract). Every other case
+// indirects exactly as before — a non-custom branch reuses a *T held in an
+// interface IN PLACE (or boxes a value), and a custom branch into a concrete
+// pointer derefs to the pointee as deserNullUnionAt's v.Elem() does.
+func unionTarget(rawV reflect.Value, branch *schemaNode) (reflect.Value, bool) {
+	if branch.decodeJSON != nil && rawV.Kind() == reflect.Interface {
+		return rawV, true
+	}
+	iv := indirectAlloc(rawV)
+	return iv, iv.Kind() == reflect.Interface
+}
+
+func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byte) error {
 	// Match by JSON token type against branch kinds. The last branch's
 	// decode error (if any) is preserved so the final message names the
 	// concrete reason — typically a target-type mismatch like the binary
@@ -1659,7 +1685,7 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, toAny
 			continue
 		}
 		savedPos := ctx.scanner.pos
-		if err := ctx.decodeBranchInto(v, branch, toAny); err == nil {
+		if err := ctx.decodeBranchInto(v, branch); err == nil {
 			return nil
 		} else if errors.Is(err, errTooDeep) {
 			return err
