@@ -1428,18 +1428,27 @@ func (s *serArray) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 }
 
 // unwrapElemPtr unwraps a pointer/interface element for the
-// serArray/serMap primitive specializations. One level is unwrapped
-// inline; ≥2 levels dispatch to indirect(). Callers inline the Kind
-// gate at each site so direct elements pay nothing.
+// serArray/serMap primitive specializations. A single-level element ([]*T /
+// map[string]*T) is unwrapped inline; ≥2 levels dispatch to indirect().
+// Callers inline the Kind gate at each site so direct elements pay nothing.
+//
+// The dispatch hands indirect the ORIGINAL element, not the once-peeled value:
+// indirect's maxIndirectDepth budget must count EVERY level so a container
+// element accepts exactly the cap the leaf encoder (serPrim → indirect) and
+// every other context accept — no more. Peeling one level first and then
+// giving indirect a fresh full budget would accept a chain one level deeper
+// (1+maxIndirectDepth) than the wire's own reader can decode and than the JSON
+// encoder accepts: an encode-produces-unreadable-wire / binary↔JSON-encode
+// divergence. (Same single-peel discipline the union target keeps so it
+// indirects once, not twice.)
 func unwrapElemPtr(v reflect.Value) (reflect.Value, error) {
 	if v.IsNil() {
 		return v, errIndirectNil
 	}
-	v = v.Elem()
-	if v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
-		return indirect(v)
+	if e := v.Elem(); e.Kind() != reflect.Interface && e.Kind() != reflect.Pointer {
+		return e, nil
 	}
-	return v, nil
+	return indirect(v)
 }
 
 // peelElem unwraps one Pointer/Interface layer from an array/map element,

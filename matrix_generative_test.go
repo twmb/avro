@@ -1221,3 +1221,293 @@ func TestMatrix_GenerativeJSONNumberBoundary(t *testing.T) {
 		})
 	}
 }
+
+// ===========================================================================
+// Pointer-indirection depth × container context.
+//
+// The codec peels a pointer/interface chain on BOTH the encode input and the
+// decode target, capped at maxIndirectDepth levels: a chain bottoming at a
+// non-pointer base WITHIN the cap is accepted, one level deeper is rejected.
+// That single cap must hold at EVERY context a value can sit in and across
+// EVERY path — binary encode, JSON encode, and natural + identity-resolved
+// decode of both wires — or a wire one path emits is a wire another path (or
+// the same path's own reader) refuses: a binary↔JSON / encode↔decode
+// round-trip break. The bug shape is a context-local peel that drifts from the
+// cap by re-indirecting an already-peeled value: a union target indirected at
+// two stages (unionTarget then the branch decode), or a container element
+// unwrapped one level inline then handed to a full-budget indirect — each
+// accepting up to one-or-two-times maxIndirectDepth where every leaf accepts
+// exactly the cap. Such a drift is invisible to round-trip-from-typed-input
+// (the input never nests past the cap) and to value/wire sweeps (depth carries
+// no wire bytes); only crossing the depth axis with the context axis the peel
+// is supposed to be identical across exposes it.
+//
+// Crosses pointer depth {0, 1, at-cap, past-cap} × context {top, record field,
+// 2-branch null union, 3+-branch union, array, map} × base primitive ×
+// {binary, JSON} encode × {binary, JSON} wire × {natural, identity-resolved}
+// decode, asserting (a) all six paths agree on accept/reject at each depth
+// AGAINST THE EXPLICIT CAP (so a "reject everything" regression is caught too,
+// not merely mutual agreement), (b) an accepted value round-trips to the
+// identical base on every path, and (c) pointer wrapping is wire-invariant — a
+// deep input encodes to the same bytes as the bare base.
+// ===========================================================================
+
+// ptrIndirectCap mirrors the package-internal maxIndirectDepth (reflect.go):
+// the deepest pointer/interface chain the codec peels. A chain bottoming at a
+// non-pointer base within this many levels round-trips on every path; one level
+// deeper is rejected on every path. If the internal cap changes, the past-cap
+// entry in the depth list below changes with it.
+const ptrIndirectCap = 5
+
+// ptrTypeOf wraps base in depth pointer levels (depth 0 => base unchanged).
+func ptrTypeOf(base reflect.Type, depth int) reflect.Type {
+	for range depth {
+		base = reflect.PointerTo(base)
+	}
+	return base
+}
+
+// ptrChain wraps sample in depth non-nil pointer levels (depth 0 => sample).
+func ptrChain(sample reflect.Value, depth int) reflect.Value {
+	for range depth {
+		p := reflect.New(sample.Type())
+		p.Elem().Set(sample)
+		sample = p
+	}
+	return sample
+}
+
+// derefAll fully dereferences a pointer/interface chain to its base value.
+func derefAll(v reflect.Value) reflect.Value {
+	for v.IsValid() && (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) {
+		if v.IsNil() {
+			return v
+		}
+		v = v.Elem()
+	}
+	return v
+}
+
+// ptrValEq compares a peeled base against the expected sample by type+value.
+func ptrValEq(got, want reflect.Value) bool {
+	return got.IsValid() && got.Type() == want.Type() && got.Interface() == want.Interface()
+}
+
+// ptrBase is one primitive base type for the pointer-indirection axis.
+type ptrBase struct {
+	avro   string        // the Avro schema text for this primitive
+	sample reflect.Value // a representative non-zero value of the Go base type
+	pad    string        // a union padding branch, token-class-distinct from avro
+}
+
+func ptrBases() []ptrBase {
+	// pad is token-class-distinct from the base so a 3+-branch union dispatches
+	// the sample to its OWN branch, never the pad (digit-class bases pad with a
+	// string; string/boolean bases pad with a long).
+	return []ptrBase{
+		{`"int"`, reflect.ValueOf(int32(7)), `"string"`},
+		{`"long"`, reflect.ValueOf(int64(7)), `"string"`},
+		{`"float"`, reflect.ValueOf(float32(1.5)), `"string"`},
+		{`"double"`, reflect.ValueOf(float64(1.5)), `"string"`},
+		{`"string"`, reflect.ValueOf("v"), `"long"`},
+		{`"boolean"`, reflect.ValueOf(true), `"long"`},
+	}
+}
+
+// ptrCtx composes a base primitive into a context that holds it in one or more
+// pointer-depth-D slots, building the encode input, a fresh decode target, and
+// a round-trip checker for that context.
+type ptrCtx struct {
+	label  string
+	schema func(b ptrBase) string
+	input  func(b ptrBase, depth int) reflect.Value // context-shaped encode input
+	target func(b ptrBase, depth int) reflect.Value // a *context-shaped fresh decode target
+	check  func(t *testing.T, b ptrBase, target reflect.Value)
+}
+
+// ptrFieldStruct is a one-field record struct whose field is a depth-deep
+// pointer chain over the base, avro-tagged to the schema field "f".
+func ptrFieldStruct(b ptrBase, depth int) reflect.Type {
+	return reflect.StructOf([]reflect.StructField{
+		{Name: "F", Type: ptrTypeOf(b.sample.Type(), depth), Tag: `avro:"f"`},
+	})
+}
+
+func ptrCtxs() []ptrCtx {
+	stringType := reflect.TypeOf("")
+	// top / 2-branch null union / 3+-branch union all carry the chain as the
+	// value itself; only the schema (and thus the decode dispatch) differs.
+	chainTop := func(b ptrBase, depth int) reflect.Value { return ptrChain(b.sample, depth) }
+	newChain := func(b ptrBase, depth int) reflect.Value { return reflect.New(ptrTypeOf(b.sample.Type(), depth)) }
+	checkTop := func(t *testing.T, b ptrBase, target reflect.Value) {
+		t.Helper()
+		if got := derefAll(target.Elem()); !ptrValEq(got, b.sample) {
+			t.Fatalf("round-trip mismatch: got %v, want %v", safeIface(got), b.sample)
+		}
+	}
+	return []ptrCtx{
+		{
+			label:  "top",
+			schema: func(b ptrBase) string { return b.avro },
+			input:  chainTop, target: newChain, check: checkTop,
+		},
+		{
+			label:  "union-null2",
+			schema: func(b ptrBase) string { return fmt.Sprintf(`["null",%s]`, b.avro) },
+			input:  chainTop, target: newChain, check: checkTop,
+		},
+		{
+			label:  "union-multi",
+			schema: func(b ptrBase) string { return fmt.Sprintf(`["null",%s,%s]`, b.avro, b.pad) },
+			input:  chainTop, target: newChain, check: checkTop,
+		},
+		{
+			label: "field",
+			schema: func(b ptrBase) string {
+				return fmt.Sprintf(`{"type":"record","name":"PtrRec","fields":[{"name":"f","type":%s}]}`, b.avro)
+			},
+			input: func(b ptrBase, depth int) reflect.Value {
+				v := reflect.New(ptrFieldStruct(b, depth)).Elem()
+				v.Field(0).Set(ptrChain(b.sample, depth))
+				return v
+			},
+			target: func(b ptrBase, depth int) reflect.Value { return reflect.New(ptrFieldStruct(b, depth)) },
+			check: func(t *testing.T, b ptrBase, target reflect.Value) {
+				t.Helper()
+				if got := derefAll(target.Elem().Field(0)); !ptrValEq(got, b.sample) {
+					t.Fatalf("field round-trip mismatch: got %v, want %v", safeIface(got), b.sample)
+				}
+			},
+		},
+		{
+			label:  "array",
+			schema: func(b ptrBase) string { return fmt.Sprintf(`{"type":"array","items":%s}`, b.avro) },
+			input: func(b ptrBase, depth int) reflect.Value {
+				st := reflect.SliceOf(ptrTypeOf(b.sample.Type(), depth))
+				sl := reflect.MakeSlice(st, 2, 2)
+				sl.Index(0).Set(ptrChain(b.sample, depth))
+				sl.Index(1).Set(ptrChain(b.sample, depth))
+				return sl
+			},
+			target: func(b ptrBase, depth int) reflect.Value {
+				return reflect.New(reflect.SliceOf(ptrTypeOf(b.sample.Type(), depth)))
+			},
+			check: func(t *testing.T, b ptrBase, target reflect.Value) {
+				t.Helper()
+				sl := target.Elem()
+				if sl.Len() != 2 {
+					t.Fatalf("array round-trip length: got %d, want 2", sl.Len())
+				}
+				for i := range sl.Len() {
+					if got := derefAll(sl.Index(i)); !ptrValEq(got, b.sample) {
+						t.Fatalf("array[%d] round-trip mismatch: got %v, want %v", i, safeIface(got), b.sample)
+					}
+				}
+			},
+		},
+		{
+			label:  "map",
+			schema: func(b ptrBase) string { return fmt.Sprintf(`{"type":"map","values":%s}`, b.avro) },
+			input: func(b ptrBase, depth int) reflect.Value {
+				mt := reflect.MapOf(stringType, ptrTypeOf(b.sample.Type(), depth))
+				m := reflect.MakeMap(mt)
+				m.SetMapIndex(reflect.ValueOf("k"), ptrChain(b.sample, depth))
+				return m
+			},
+			target: func(b ptrBase, depth int) reflect.Value {
+				return reflect.New(reflect.MapOf(stringType, ptrTypeOf(b.sample.Type(), depth)))
+			},
+			check: func(t *testing.T, b ptrBase, target reflect.Value) {
+				t.Helper()
+				got := derefAll(target.Elem().MapIndex(reflect.ValueOf("k")))
+				if !ptrValEq(got, b.sample) {
+					t.Fatalf("map[k] round-trip mismatch: got %v, want %v", safeIface(got), b.sample)
+				}
+			},
+		},
+	}
+}
+
+// safeIface renders a possibly-invalid/nil reflect.Value for an error message
+// without panicking on the .Interface() of an unexported/invalid Value.
+func safeIface(v reflect.Value) any {
+	if !v.IsValid() {
+		return "<invalid>"
+	}
+	if !v.CanInterface() {
+		return v.String()
+	}
+	return v.Interface()
+}
+
+func TestMatrix_GenerativePointerIndirection(t *testing.T) {
+	depths := []int{0, 1, ptrIndirectCap, ptrIndirectCap + 1} // {0, 1, at-cap, past-cap}
+	for _, b := range ptrBases() {
+		for _, pc := range ptrCtxs() {
+			t.Run(strings.Trim(b.avro, `"`)+"/"+pc.label, func(t *testing.T) {
+				s := avro.MustParse(pc.schema(b))
+				res, err := avro.Resolve(s, s)
+				if err != nil {
+					t.Fatalf("identity Resolve: %v\nschema: %s", err, pc.schema(b))
+				}
+				// Canonical wires from the bare (depth-0) base in this context;
+				// depth 0 is always within the cap, so both encodes must succeed.
+				cbin, err := s.AppendEncode(nil, pc.input(b, 0).Interface())
+				if err != nil {
+					t.Fatalf("canonical binary encode: %v", err)
+				}
+				cjson, err := s.AppendEncodeJSON(nil, pc.input(b, 0).Interface())
+				if err != nil {
+					t.Fatalf("canonical JSON encode: %v", err)
+				}
+				for _, depth := range depths {
+					t.Run(fmt.Sprintf("depth=%d", depth), func(t *testing.T) {
+						accept := depth <= ptrIndirectCap
+
+						// --- encode parity: binary and JSON agree with the cap ---
+						binW, binErr := s.AppendEncode(nil, pc.input(b, depth).Interface())
+						jsonW, jsonErr := s.AppendEncodeJSON(nil, pc.input(b, depth).Interface())
+						if (binErr == nil) != accept {
+							t.Fatalf("binary encode accept=%v, want %v (err=%v)", binErr == nil, accept, binErr)
+						}
+						if (jsonErr == nil) != accept {
+							t.Fatalf("JSON encode accept=%v, want %v (err=%v)", jsonErr == nil, accept, jsonErr)
+						}
+						// An accepted deep input encodes to the SAME bytes as the
+						// bare base: pointer wrapping is transparent on the wire.
+						if accept {
+							if !bytes.Equal(binW, cbin) {
+								t.Fatalf("deep binary wire differs from bare base:\n got=%x\nwant=%x", binW, cbin)
+							}
+							if !bytes.Equal(jsonW, cjson) {
+								t.Fatalf("deep JSON wire differs from bare base:\n got=%s\nwant=%s", jsonW, cjson)
+							}
+						}
+
+						// --- decode parity: every {wire}×{natural,resolved} path
+						// agrees with the cap, and an accepted value round-trips ---
+						decPaths := []struct {
+							name string
+							dec  func(target any) error
+						}{
+							{"binary/natural", func(target any) error { _, e := s.Decode(cbin, target); return e }},
+							{"binary/resolved", func(target any) error { _, e := res.Decode(cbin, target); return e }},
+							{"json/natural", func(target any) error { return s.DecodeJSON(cjson, target) }},
+							{"json/resolved", func(target any) error { return res.DecodeJSON(cjson, target) }},
+						}
+						for _, dp := range decPaths {
+							target := pc.target(b, depth)
+							err := dp.dec(target.Interface())
+							if (err == nil) != accept {
+								t.Fatalf("%s decode accept=%v, want %v (err=%v)", dp.name, err == nil, accept, err)
+							}
+							if accept {
+								pc.check(t, b, target)
+							}
+						}
+					})
+				}
+			})
+		}
+	}
+}
