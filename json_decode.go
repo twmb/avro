@@ -633,7 +633,7 @@ func (ctx *jsonDecoder) decodeString(v reflect.Value, node *schemaNode, toAny, r
 		if err != nil {
 			return err
 		}
-		reflect.Copy(v, reflect.ValueOf(u))
+		copyBytesToArray(v, u[:])
 		return nil
 	}
 	if toAny {
@@ -825,7 +825,7 @@ func assignBytes(v reflect.Value, b []byte, node *schemaNode, raw bool) error {
 			// this, a [16]byte type that also implements TextUnmarshaler
 			// (e.g. google/uuid.UUID) diverged from the binary path.
 			if isUUIDType(v.Type()) {
-				reflect.Copy(v, reflect.ValueOf(u))
+				copyBytesToArray(v, u[:])
 				return nil
 			}
 			// TextUnmarshaler before the reflect.String arm (parity with the

@@ -1610,10 +1610,11 @@ func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			return nil, err
 		}
 	case isUUIDType(v.Type()):
-		// [16]byte trusts the raw bytes: rv.Type() == v.Type() by
-		// isUUIDType, so direct Set is safe (no interface check), and no
-		// UnmarshalText round trip is attempted — the bytes ARE the UUID.
-		v.Set(reflect.ValueOf(b))
+		// [16]byte-shaped target trusts the raw bytes: no interface check and
+		// no UnmarshalText round trip — the bytes ARE the UUID. copyBytesToArray
+		// (not Set(reflect.ValueOf(b))) so a named byte element ([16]B, type B
+		// byte) — Kind Uint8 but not assignable from [16]byte — does not panic.
+		copyBytesToArray(v, b[:])
 	case v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType):
 		// TextUnmarshaler before the String / []byte arms (parity with the
 		// string decoders and serFixedUUIDReflect's text-before-string-kind
@@ -1657,7 +1658,11 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
 		b := make([]byte, s.n)
 		copy(b, src[:s.n])
-		v.Set(reflect.ValueOf(b))
+		// SetBytes (not Set(reflect.ValueOf(b))): a named byte-slice or
+		// named-byte-element slice (type B byte; []B) has element Kind Uint8 but
+		// is not assignable from []byte, so Set panics; SetBytes writes through
+		// the Kind. Mirrors setBytesValue's Slice arm.
+		v.SetBytes(b)
 		return src[s.n:], nil
 	}
 	if t.Kind() == reflect.String {
@@ -1676,7 +1681,7 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	if t.Len() != s.n {
 		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
-	reflect.Copy(v, reflect.ValueOf(src[:s.n]))
+	copyBytesToArray(v, src[:s.n])
 	return src[s.n:], nil
 }
 
@@ -1875,7 +1880,7 @@ func setBytesValue(v reflect.Value, b []byte, avroType string) error {
 		if v.Len() != len(b) {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("cannot decode %d bytes into array of length %d", len(b), v.Len())}
 		}
-		reflect.Copy(v, reflect.ValueOf(b))
+		copyBytesToArray(v, b)
 	case reflect.String:
 		return setStringTarget(v, string(b), avroType)
 	default:
@@ -2394,7 +2399,7 @@ func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		reflect.Copy(v, reflect.ValueOf(u))
+		copyBytesToArray(v, u[:])
 		return src[n:], nil
 	}
 	// Non-UUID targets share setStringValue's Interface / String /

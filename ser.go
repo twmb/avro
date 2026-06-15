@@ -2633,7 +2633,17 @@ func uuidBytes(v reflect.Value) ([16]byte, bool) {
 		return [16]byte{}, false
 	}
 	var u [16]byte
-	reflect.Copy(reflect.ValueOf(&u).Elem(), v)
+	// Exact-uint8 element: reflect.Copy's memmove (zero-alloc). A named byte
+	// element ([16]B, type B byte) is Kind Uint8 but not exactly uint8, so
+	// reflect.Copy panics; read it out element-wise instead (the same shape as
+	// byteArrayToSlice / copyBytesToArray, kept inline here to stay zero-alloc).
+	if v.Type().Elem() == byteType {
+		reflect.Copy(reflect.ValueOf(&u).Elem(), v)
+	} else {
+		for i := range u {
+			u[i] = byte(v.Index(i).Uint())
+		}
+	}
 	return u, true
 }
 

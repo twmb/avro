@@ -14,7 +14,49 @@ var (
 	textMarshalerType   = reflect.TypeFor[encoding.TextMarshaler]()
 	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
 	isZeroerType        = reflect.TypeFor[interface{ IsZero() bool }]()
+	byteType            = reflect.TypeFor[byte]()
 )
+
+// copyBytesToArray writes b into the byte-array v one element at a time when v's
+// element type is a NAMED byte type (Kind Uint8 but not exactly uint8), and uses
+// reflect.Copy's memmove for the common exact-uint8 element. The caller has
+// established that v is an Array whose element Kind is Uint8 and that
+// v.Len() == len(b).
+//
+// reflect.Copy and reflect.Value.Set(reflect.ValueOf([]byte)) both require the
+// element type to be EXACTLY uint8 and panic on a named byte element
+// (type B byte; [N]B) — a panic that surfaces from the public Decode /
+// DecodeJSON on a value the byte ENCODER accepts (serSize / doSerBytes /
+// appendAvroJSONBytes iterate via Uint, so they encode [N]B fine). The
+// element-wise SetUint writes through the Kind, restoring round-trip parity for
+// the named-element case while leaving the exact-uint8 fast path untouched.
+func copyBytesToArray(v reflect.Value, b []byte) {
+	if v.Type().Elem() == byteType {
+		reflect.Copy(v, reflect.ValueOf(b))
+		return
+	}
+	for i := range b {
+		v.Index(i).SetUint(uint64(b[i]))
+	}
+}
+
+// byteArrayToSlice reads the byte-array v into a fresh []byte. It is the
+// encode-side counterpart of [copyBytesToArray]: the exact-uint8 element uses
+// reflect.Copy's memmove, a named byte element ([N]B, type B byte) falls back to
+// element-wise reads, where reflect.Copy would panic on the exact-type
+// mismatch. The caller has established that v is an Array whose element Kind is
+// Uint8.
+func byteArrayToSlice(v reflect.Value) []byte {
+	b := make([]byte, v.Len())
+	if v.Type().Elem() == byteType {
+		reflect.Copy(reflect.ValueOf(b), v)
+		return b
+	}
+	for i := range b {
+		b[i] = byte(v.Index(i).Uint())
+	}
+	return b
+}
 
 // reuseOrMakeStringAnyMap reuses v's existing map[string]any backing
 // when v is an interface wrapping one (the streaming-decode pattern

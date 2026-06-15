@@ -275,7 +275,7 @@ func promoteBytesToStringUUID(src []byte, v reflect.Value, sl *slab) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		reflect.Copy(v, reflect.ValueOf(u))
+		copyBytesToArray(v, u[:])
 		return src[n:], nil
 	}
 	if err := setStringValue(v, src, n, sl); err != nil {

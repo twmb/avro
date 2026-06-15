@@ -533,12 +533,11 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			return appendAvroJSONBytes(buf, v.Bytes()), nil
 		}
 		if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
-			// reflect.Value.Bytes() panics on Array kinds, so materialize
-			// the bytes via Copy. Mirrors the "fixed" arm below and
+			// reflect.Value.Bytes() panics on Array kinds, so materialize the
+			// bytes via byteArrayToSlice (element-agnostic so a named byte
+			// element [N]B does not panic). Mirrors the "fixed" arm below and
 			// serBytes (ser.go:460) which accepts Array alongside Slice.
-			raw := make([]byte, v.Len())
-			reflect.Copy(reflect.ValueOf(raw), v)
-			return appendAvroJSONBytes(buf, raw), nil
+			return appendAvroJSONBytes(buf, byteArrayToSlice(v)), nil
 		}
 		return nil, semErr(v, "bytes")
 
@@ -642,8 +641,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			s := v.String()
 			raw = unsafe.Slice(unsafe.StringData(s), len(s))
 		} else if v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8 {
-			raw = make([]byte, v.Len())
-			reflect.Copy(reflect.ValueOf(raw), v)
+			raw = byteArrayToSlice(v)
 		} else if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 			raw = v.Bytes()
 		} else {
