@@ -70,21 +70,21 @@ func benchVarlongOver(b *testing.B, samples []int64, fn func(dst []byte, x int64
 // Representative magnitude buckets, one per varlong byte length.
 var varlongSamples = []int64{
 	0, 1, 63, 64, // 1-2 bytes
-	1 << 10,                            // 3 bytes
-	1 << 17,                            // 4 bytes
-	1 << 24,                            // 5 bytes
-	1 << 31,                            // 6 bytes
-	1 << 38,                            // 7 bytes
-	1 << 45,                            // 8 bytes
-	1 << 52,                            // 9 bytes
-	1 << 60,                            // 10 bytes
-	-1, -64, -1 << 31, -(1 << 62),      // negatives across magnitudes
+	1 << 10,                       // 3 bytes
+	1 << 17,                       // 4 bytes
+	1 << 24,                       // 5 bytes
+	1 << 31,                       // 6 bytes
+	1 << 38,                       // 7 bytes
+	1 << 45,                       // 8 bytes
+	1 << 52,                       // 9 bytes
+	1 << 60,                       // 10 bytes
+	-1, -64, -1 << 31, -(1 << 62), // negatives across magnitudes
 }
 
-func BenchmarkVarlong_Loop(b *testing.B)     { benchVarlongOver(b, varlongSamples, appendVarlongLoop) }
-func BenchmarkVarlong_Switch(b *testing.B)   { benchVarlongOver(b, varlongSamples, appendVarlongSwitch) }
-func BenchmarkVarlong_StdLib(b *testing.B)   { benchVarlongOver(b, varlongSamples, binary.AppendVarint) }
-func BenchmarkVarlong_Current(b *testing.B)  { benchVarlongOver(b, varlongSamples, appendVarlong) }
+func BenchmarkVarlong_Loop(b *testing.B)    { benchVarlongOver(b, varlongSamples, appendVarlongLoop) }
+func BenchmarkVarlong_Switch(b *testing.B)  { benchVarlongOver(b, varlongSamples, appendVarlongSwitch) }
+func BenchmarkVarlong_StdLib(b *testing.B)  { benchVarlongOver(b, varlongSamples, binary.AppendVarint) }
+func BenchmarkVarlong_Current(b *testing.B) { benchVarlongOver(b, varlongSamples, appendVarlong) }
 
 // Per-length micro-benchmarks let us see whether the switch's advantage
 // is mostly on small values (where the loop's branch predicts poorly)
@@ -92,16 +92,16 @@ func BenchmarkVarlong_Current(b *testing.B)  { benchVarlongOver(b, varlongSample
 // given length to make the loop perfectly predictable for both impls.
 
 var varlongPerLength = []int64{
-	0,        // 1 byte
-	1 << 7,   // 2 bytes
-	1 << 14,  // 3 bytes
-	1 << 21,  // 4 bytes
-	1 << 28,  // 5 bytes
-	1 << 35,  // 6 bytes
-	1 << 42,  // 7 bytes
-	1 << 49,  // 8 bytes
-	1 << 56,  // 9 bytes
-	1 << 62,  // 10 bytes (max with sign bit)
+	0,       // 1 byte
+	1 << 7,  // 2 bytes
+	1 << 14, // 3 bytes
+	1 << 21, // 4 bytes
+	1 << 28, // 5 bytes
+	1 << 35, // 6 bytes
+	1 << 42, // 7 bytes
+	1 << 49, // 8 bytes
+	1 << 56, // 9 bytes
+	1 << 62, // 10 bytes (max with sign bit)
 }
 
 func benchPerLen(b *testing.B, fn func(dst []byte, x int64) []byte) {

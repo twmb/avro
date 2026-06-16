@@ -1593,7 +1593,9 @@ func TestRegression_ResolvedDecodeJSONWriterCustomDecodeRawRoundTrip(t *testing.
 		{
 			"add-reader-default",
 			func(x string) string { return `{"name":"x","type":` + x + `}` },
-			func(x string) string { return `{"name":"x","type":` + x + `},{"name":"added","type":"int","default":42}` },
+			func(x string) string {
+				return `{"name":"x","type":` + x + `},{"name":"added","type":"int","default":42}`
+			},
 			func(xv any) map[string]any { return map[string]any{"x": xv} },
 		},
 	}

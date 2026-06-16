@@ -145,7 +145,7 @@ type rtRecord struct {
 	B string `avro:"b"`
 }
 type rtLinked struct {
-	Val  int32    `avro:"val"`
+	Val  int32     `avro:"val"`
 	Next *rtLinked `avro:"next"`
 }
 
@@ -618,9 +618,9 @@ type rtTopJSONNum struct{ rtEmbJSONNum }
 // with TestGenerative_EmbedShapeWalkerAgreement (which owns field selection)
 // rather than re-declaring int32 carriers. An exported carrier is required only
 // for the pointer-embed control, where decode must allocate the embed.
-type rtTopPlain struct{ GA }       // struct{ N int32 }
-type rtTopPlainPtr struct{ *GA }   // exported pointer embed -> decode allocates it
-type rtTopDiamond struct {         // "N" via GL.GBase.N and GR.GBase.N at equal depth -> ambiguous
+type rtTopPlain struct{ GA }     // struct{ N int32 }
+type rtTopPlainPtr struct{ *GA } // exported pointer embed -> decode allocates it
+type rtTopDiamond struct {       // "N" via GL.GBase.N and GR.GBase.N at equal depth -> ambiguous
 	GL
 	GR
 }
@@ -630,7 +630,7 @@ func TestGenerative_SchemaForEmbedLeafComposition(t *testing.T) {
 	cases := []struct {
 		name      string
 		build     func() (*Schema, error)
-		value     any  // non-nil when the schema is expected to build
+		value     any // non-nil when the schema is expected to build
 		wantBuild bool
 		faithful  bool // assert decode==value (off for decimal: *big.Rat repr)
 	}{

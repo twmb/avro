@@ -2785,8 +2785,8 @@ func (c ozValCounter) IsZero() bool { return c == 7 }
 func TestRegression_OmitzeroPointerReceiverIsZero(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"f","type":["null","long"],"default":null}]}`)
-	null := []byte{0x00}    // union index 0 (null branch) — omitzero acted
-	longZero := []byte{2, 0} // union index 1 (long), value 0 — not omitted
+	null := []byte{0x00}      // union index 0 (null branch) — omitzero acted
+	longZero := []byte{2, 0}  // union index 1 (long), value 0 — not omitted
 	longThree := []byte{2, 6} // union index 1 (long), value 3 (zigzag 6)
 
 	// encodeAll returns the reflect (value) and unsafe (&value, addressable)
@@ -2953,7 +2953,7 @@ func TestRegression_UnsafeMultiPtrNullUnionNil(t *testing.T) {
 		{"name":"p","type":["null","int"]},
 		{"name":"r","type":["null",{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}]}]}`)
 	type R struct {
-		P **int32 `avro:"p"`
+		P  **int32 `avro:"p"`
 		Rr **Inner `avro:"r"`
 	}
 	nilInt := (*int32)(nil)

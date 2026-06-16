@@ -170,8 +170,8 @@ func TestDoSBattery_OCF_C2_BlockCountSize(t *testing.T) {
 	hdr, sync := ocfHeaderSync(t, `"long"`)
 	var hugeSize []byte
 	hugeSize = append(hugeSize, hdr...)
-	hugeSize = append(hugeSize, binary.AppendVarint(nil, 1)...)      // count = 1
-	hugeSize = append(hugeSize, binary.AppendVarint(nil, 1<<40)...)  // declared block size = 1 TiB
+	hugeSize = append(hugeSize, binary.AppendVarint(nil, 1)...)     // count = 1
+	hugeSize = append(hugeSize, binary.AppendVarint(nil, 1<<40)...) // declared block size = 1 TiB
 	hugeSize = append(hugeSize, sync...)
 	wantReject(t, "NewReader+Decode/huge-declared-block-size", func() error {
 		r, err := NewReader(bytes.NewReader(hugeSize))

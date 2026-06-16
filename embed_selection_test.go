@@ -324,9 +324,11 @@ func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
 	})
 
 	t.Run("tagged field declared last resolves a same-depth untagged collision", func(t *testing.T) {
-		type EmbA struct{ Name string }                     // depth 2, untagged
-		type EmbB struct{ Name string }                     // depth 2, untagged
-		type EmbTagged struct{ Other string `avro:"Name"` } // depth 2, tagged "Name"
+		type EmbA struct{ Name string } // depth 2, untagged
+		type EmbB struct{ Name string } // depth 2, untagged
+		type EmbTagged struct {
+			Other string `avro:"Name"`
+		} // depth 2, tagged "Name"
 		type Outer struct {
 			EmbA
 			EmbB

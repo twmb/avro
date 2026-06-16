@@ -14,7 +14,7 @@ import (
 //	  → decode → []byte(nil) → re-encode → 00 (null branch)   ← corruption
 //
 // Java decodes empty bytes to an empty (non-null) ByteBuffer and fastavro
-// to b'', both re-encoding onto the bytes branch; twmb's JSON decoder,
+// to b”, both re-encoding onto the bytes branch; twmb's JSON decoder,
 // deserFixed, and the unsafe udBytesDeser all already produce non-nil
 // empties via make+copy. setBytesValue's interface arm was the one
 // sibling manufacturing nil (append onto a nil base).

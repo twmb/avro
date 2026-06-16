@@ -890,7 +890,7 @@ func TestRegression_SchemaCacheConsistentCustomSelfMatch(t *testing.T) {
 func TestRegression_SchemaCacheLaxNamesReParse(t *testing.T) {
 	const schema = `{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`
 	cases := []struct {
-		name        string
+		name          string
 		first, second []SchemaOpt
 	}{
 		{"lax then lax", []SchemaOpt{WithLaxNames(nil)}, []SchemaOpt{WithLaxNames(nil)}},
@@ -977,6 +977,7 @@ func TestRegression_SchemaCacheCustomConflictRejected(t *testing.T) {
 //   - a reference AFTER the local def binds to the local myns.T (string here);
 //   - a reference BEFORE the local def binds to the cached null-namespace T
 //     (int here) — the local name was not yet in scope (eager binding).
+//
 // The splice must reproduce whichever binding the wire codec used so the
 // schema's own String()/Canonical() describe the SAME schema. The bug: the
 // splice consulted a position-independent local set and a bare fallback key, so

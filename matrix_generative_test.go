@@ -566,8 +566,8 @@ func gTypedCell(t *testing.T, gd gtyped, tv gtval) {
 	sRec := avro.MustParse(recSchema)
 	pStruct := reflect.New(st)
 	pStruct.Elem().Field(0).Set(reflect.ValueOf(tv.typed))
-	wAddr := gEncEq(t, sRec, pStruct.Interface(), nil, "struct addressable (unsafe)")     // *struct => addressable
-	wNon := gEncEq(t, sRec, pStruct.Elem().Interface(), nil, "struct non-addressable")    // struct value => reflect
+	wAddr := gEncEq(t, sRec, pStruct.Interface(), nil, "struct addressable (unsafe)")  // *struct => addressable
+	wNon := gEncEq(t, sRec, pStruct.Elem().Interface(), nil, "struct non-addressable") // struct value => reflect
 	wRecGen := gEncEq(t, sRec, map[string]any{"f": tv.generic}, nil, "struct generic")
 	if !bytes.Equal(wAddr, wNon) || !bytes.Equal(wAddr, wRecGen) {
 		t.Fatalf("struct safe/unsafe/generic diverge:\n addr=%x\n non =%x\n gen =%x", wAddr, wNon, wRecGen)

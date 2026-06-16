@@ -3000,7 +3000,6 @@ func TestRegression_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 	})
 }
 
-
 // The errTooDeep recursion bound must be UNIFORM across binary encode,
 // JSON encode, binary decode, and JSON decode — one increment per schema
 // nesting level. Record/union JSON encode formerly incremented twice per

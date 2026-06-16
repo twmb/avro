@@ -90,7 +90,7 @@ func TestMatrix_HostileSizeRejects(t *testing.T) {
 // promptness are interesting).
 func TestMatrix_HostileSizeDecodeMessages(t *testing.T) {
 	s := avro.MustParse(`"string"`)
-	big := strings.Repeat("y", 1 << 20)
+	big := strings.Repeat("y", 1<<20)
 	wire, err := s.AppendEncode(nil, big)
 	if err != nil {
 		t.Fatalf("encode: %v", err)

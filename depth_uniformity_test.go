@@ -126,8 +126,8 @@ func llJSON(d int) []byte {
 //////////////////////////////////////////////////////////////////////
 
 type treeV struct {
-	V    int32    `avro:"v"`
-	Kids []treeV  `avro:"kids"`
+	V    int32   `avro:"v"`
+	Kids []treeV `avro:"kids"`
 }
 
 const treeSchema = `{"type":"record","name":"T","fields":[` +

@@ -192,11 +192,11 @@ func TestRegression_NamedFixedLogicalTaggedUnionName(t *testing.T) {
 	tsVal := time.Unix(0, 0).UTC()
 
 	cases := []struct {
-		name        string
-		schema      string
-		input       any
-		tagLogical  bool
-		wantKey     string // exact tagged key under the given options
+		name       string
+		schema     string
+		input      any
+		tagLogical bool
+		wantKey    string // exact tagged key under the given options
 	}{
 		// Named fixed + logical: name wins regardless of TagLogicalTypes.
 		{"fixed-uuid TaggedUnions", `["null",{"type":"fixed","name":"F","size":16,"logicalType":"uuid"}]`, uuidVal, false, "F"},

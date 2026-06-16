@@ -572,7 +572,7 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 		{"name":"f","type":"int","default":7}
 	]}`)
 	wantTerminate(t, "Root+Schema/round-trip", func() error {
-		root := s.Root()  // addressable: Schema() has a pointer receiver
+		root := s.Root() // addressable: Schema() has a pointer receiver
 		_, _ = root.Schema()
 		return nil
 	})

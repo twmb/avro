@@ -21,8 +21,8 @@ import (
 // for the TextUnmarshaler-only case.
 func TestDecodeReencodeSymmetry(t *testing.T) {
 	type tc struct {
-		name    string
-		schema  string
+		name   string
+		schema string
 		// build a fresh encoded payload for the test
 		encoded func() []byte
 		// list of decode target types to probe

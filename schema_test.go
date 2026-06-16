@@ -139,10 +139,11 @@ func TestCanonicalNormalizesArrayItemsAndMapValues(t *testing.T) {
 }
 
 // Official Apache Avro schema-tests.txt vector 031:
-//   input { "items":{"type":"null"}, "type":"array"} canonicalizes to
-//   {"type":"array","items":"null"} with CRC-64-AVRO fingerprint
-//   -589620603366471059 (Java signed-int64). The fingerprint can only match
-//   when array items are canonicalized per [PRIMITIVES].
+//
+//	input { "items":{"type":"null"}, "type":"array"} canonicalizes to
+//	{"type":"array","items":"null"} with CRC-64-AVRO fingerprint
+//	-589620603366471059 (Java signed-int64). The fingerprint can only match
+//	when array items are canonicalized per [PRIMITIVES].
 func TestFingerprintArrayItemsMatchesSpecVector(t *testing.T) {
 	s, err := Parse(`{ "items":{"type":"null"}, "type":"array"}`)
 	if err != nil {
