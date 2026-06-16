@@ -239,3 +239,223 @@ func TestRegression_UnionPointerTargetDepthBinaryJSONParity(t *testing.T) {
 // external test above; if the internal cap changes, the depth-parity test's
 // literal pointer types (*****T at the cap, ******T past it) must change with it.
 const maxDepthLevels = 5
+
+// An array<record> element's pointer chain must be capped at the same
+// maxIndirectDepth every other context enforces. The unsafe struct-field array
+// fast path peels one pointer level inline (usArrayRecord → usArrayPtrRecord on
+// encode, the case "record" arm → udArrayPtrRecord on decode) and then hands
+// the element to the record (de)serializer's own indirect/indirectAlloc budget.
+// Without declining a multi-level-pointer element it accepted a chain
+// 1+maxIndirectDepth deep — one past the cap the top-level reflect path, the
+// JSON encoder, and the nullunion array arms all enforce — so a []******Record
+// struct field encoded a binary wire that the struct's own JSON encoder, a
+// top-level encode of the same slice, and a top-level decode into the same type
+// all reject. Every context must agree on the accept/reject boundary; an
+// accepted chain must round-trip. The fast path stays single-pointer
+// ([]*Record); deeper-but-in-cap chains route to the reflect path.
+func TestRegression_ArrayRecordElementPointerChainDepthParity(t *testing.T) {
+	const recJSON = `{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}`
+	sArr := avro.MustParse(`{"type":"array","items":` + recJSON + `}`)
+	sOuter := avro.MustParse(`{"type":"record","name":"Outer","fields":[{"name":"arr","type":{"type":"array","items":` + recJSON + `}}]}`)
+
+	innerStruct := reflect.StructOf([]reflect.StructField{
+		{Name: "X", Type: reflect.TypeOf(int32(0)), Tag: `avro:"x"`},
+	})
+	// chain returns the slice element type at the given pointer depth and a
+	// non-nil value of that type bottoming at Inner{X:7}.
+	chain := func(depth int) (reflect.Type, reflect.Value) {
+		elemType := innerStruct
+		for range depth {
+			elemType = reflect.PointerTo(elemType)
+		}
+		v := reflect.New(innerStruct).Elem()
+		v.Field(0).SetInt(7)
+		for range depth {
+			p := reflect.New(v.Type())
+			p.Elem().Set(v)
+			v = p
+		}
+		return elemType, v
+	}
+
+	for depth := 0; depth <= maxDepthLevels+1; depth++ {
+		elemType, elemVal := chain(depth)
+		sliceType := reflect.SliceOf(elemType)
+
+		// Oracle: the same []*…*Inner value at top level goes through the reflect
+		// serArray path, which peels with a single indirect budget (caps at the
+		// cap). Its accept/reject is the boundary every other context must match.
+		topSlice := reflect.MakeSlice(sliceType, 1, 1)
+		topSlice.Index(0).Set(elemVal)
+		_, topErr := sArr.AppendEncode(nil, topSlice.Interface())
+
+		// Struct field exercises the unsafe usArrayRecord fast path (the value is
+		// addressable through reflect.New, so the unsafe compile is selected).
+		outerType := reflect.StructOf([]reflect.StructField{
+			{Name: "Arr", Type: sliceType, Tag: `avro:"arr"`},
+		})
+		outer := reflect.New(outerType)
+		sl := reflect.MakeSlice(sliceType, 1, 1)
+		sl.Index(0).Set(elemVal)
+		outer.Elem().Field(0).Set(sl)
+
+		binWire, binErr := sOuter.AppendEncode(nil, outer.Interface())
+		_, jsonErr := sOuter.AppendEncodeJSON(nil, outer.Interface())
+
+		if (binErr == nil) != (topErr == nil) {
+			t.Errorf("depth %d: struct-field unsafe encode and top-level reflect encode disagree (structErr=%v topErr=%v)", depth, binErr, topErr)
+		}
+		if (binErr == nil) != (jsonErr == nil) {
+			t.Errorf("depth %d: binary and JSON struct-field encode disagree (binErr=%v jsonErr=%v)", depth, binErr, jsonErr)
+		}
+
+		if depth <= maxDepthLevels {
+			// Within the cap: must encode and round-trip back to the value.
+			if binErr != nil {
+				t.Errorf("depth %d (<= cap %d) must encode: %v", depth, maxDepthLevels, binErr)
+				continue
+			}
+			got := reflect.New(outerType)
+			if _, err := sOuter.Decode(binWire, got.Interface()); err != nil {
+				t.Errorf("depth %d (<= cap) must decode: %v", depth, err)
+				continue
+			}
+			gv := got.Elem().Field(0).Index(0)
+			for gv.Kind() == reflect.Pointer {
+				if gv.IsNil() {
+					t.Errorf("depth %d round-trip produced a nil element", depth)
+					break
+				}
+				gv = gv.Elem()
+			}
+			if gv.Kind() == reflect.Struct && gv.Field(0).Int() != 7 {
+				t.Errorf("depth %d round-trip value mismatch: got %v", depth, gv.Field(0).Int())
+			}
+		} else if binErr == nil {
+			// depth == cap+1: every encode context must reject.
+			t.Errorf("depth %d (> cap %d) struct-field binary encode must reject; wire=%x", depth, maxDepthLevels, binWire)
+		}
+	}
+
+	// Decode-side neuter-proof: a valid wire (one record element) decoded into a
+	// struct whose array element is one level past the cap must reject — the fast
+	// udArrayPtrRecord must not peel 1+maxIndirectDepth levels.
+	depth0Slice := reflect.SliceOf(innerStruct)
+	d0 := reflect.New(reflect.StructOf([]reflect.StructField{
+		{Name: "Arr", Type: depth0Slice, Tag: `avro:"arr"`},
+	}))
+	one := reflect.New(innerStruct).Elem()
+	one.Field(0).SetInt(7)
+	s0 := reflect.MakeSlice(depth0Slice, 1, 1)
+	s0.Index(0).Set(one)
+	d0.Elem().Field(0).Set(s0)
+	validWire, err := sOuter.AppendEncode(nil, d0.Interface())
+	if err != nil {
+		t.Fatalf("setup: encode of []Inner must succeed: %v", err)
+	}
+	deepElem := innerStruct
+	for range maxDepthLevels + 1 {
+		deepElem = reflect.PointerTo(deepElem)
+	}
+	deepOuter := reflect.New(reflect.StructOf([]reflect.StructField{
+		{Name: "Arr", Type: reflect.SliceOf(deepElem), Tag: `avro:"arr"`},
+	}))
+	if _, err := sOuter.Decode(validWire, deepOuter.Interface()); err == nil {
+		t.Errorf("decode into an array field whose element is %d pointers deep must reject (cap %d)", maxDepthLevels+1, maxDepthLevels)
+	}
+}
+
+// A ["null", record] nullunion record FIELD's pointer chain must be capped at
+// maxIndirectDepth on decode, matching encode and every other context. The
+// unsafe udNullUnionRecord consumes the nullunion's outer pointer (goType.Elem)
+// and then indirectAllocs the remainder, so without declining a multi-level
+// pointer target it accepted a chain 1+maxIndirectDepth deep — one past the cap
+// the encode side (which already declines **…T to reflect), the reflect deser,
+// and the JSON paths all enforce. A valid wire decoded into a ******record
+// nullunion field then succeeded where encode of the same type rejected: an
+// encode/decode boundary asymmetry. Decode must reject at the same depth encode
+// does; the fast path stays single-pointer (*record), deeper-but-in-cap chains
+// route to the reflect deser.
+func TestRegression_NullUnionRecordFieldPointerChainDepthParity(t *testing.T) {
+	const recJSON = `{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}`
+	s := avro.MustParse(`{"type":"record","name":"Outer","fields":[{"name":"f","type":["null",` + recJSON + `]}]}`)
+
+	innerStruct := reflect.StructOf([]reflect.StructField{
+		{Name: "X", Type: reflect.TypeOf(int32(0)), Tag: `avro:"x"`},
+	})
+	ptrType := func(depth int) reflect.Type {
+		ft := innerStruct
+		for range depth {
+			ft = reflect.PointerTo(ft)
+		}
+		return ft
+	}
+	nonNilVal := func(depth int) reflect.Value {
+		v := reflect.New(innerStruct).Elem()
+		v.Field(0).SetInt(7)
+		for range depth {
+			p := reflect.New(v.Type())
+			p.Elem().Set(v)
+			v = p
+		}
+		return v
+	}
+	outerOf := func(fieldType reflect.Type) reflect.Type {
+		return reflect.StructOf([]reflect.StructField{{Name: "F", Type: fieldType, Tag: `avro:"f"`}})
+	}
+
+	// A valid wire: a depth-1 (*record) non-nil value encodes the value branch.
+	d1Type := outerOf(ptrType(1))
+	d1 := reflect.New(d1Type)
+	d1.Elem().Field(0).Set(nonNilVal(1))
+	validWire, err := s.AppendEncode(nil, d1.Interface())
+	if err != nil {
+		t.Fatalf("setup: encode of a *record nullunion value must succeed: %v", err)
+	}
+
+	for depth := 1; depth <= maxDepthLevels+1; depth++ {
+		outerType := outerOf(ptrType(depth))
+		outer := reflect.New(outerType)
+		outer.Elem().Field(0).Set(nonNilVal(depth))
+
+		binWire, binErr := s.AppendEncode(nil, outer.Interface())
+		_, jsonErr := s.AppendEncodeJSON(nil, outer.Interface())
+		// Decode the valid depth-1 wire into this depth's target type — the
+		// decode-side boundary, independent of whether encode produced a wire.
+		_, decErr := s.Decode(validWire, reflect.New(outerType).Interface())
+
+		if (binErr == nil) != (jsonErr == nil) {
+			t.Errorf("depth %d: binary vs JSON encode disagree (bin=%v json=%v)", depth, binErr, jsonErr)
+		}
+		if (binErr == nil) != (decErr == nil) {
+			t.Errorf("depth %d: encode and decode disagree on the cap boundary (encErr=%v decErr=%v)", depth, binErr, decErr)
+		}
+
+		if depth <= maxDepthLevels {
+			if binErr != nil {
+				t.Errorf("depth %d (<= cap %d) must encode: %v", depth, maxDepthLevels, binErr)
+				continue
+			}
+			got := reflect.New(outerType)
+			if _, err := s.Decode(binWire, got.Interface()); err != nil {
+				t.Errorf("depth %d (<= cap) must decode: %v", depth, err)
+				continue
+			}
+			gv := got.Elem().Field(0)
+			for gv.Kind() == reflect.Pointer {
+				if gv.IsNil() {
+					t.Errorf("depth %d round-trip produced a nil value", depth)
+					break
+				}
+				gv = gv.Elem()
+			}
+			if gv.Kind() == reflect.Struct && gv.Field(0).Int() != 7 {
+				t.Errorf("depth %d round-trip value mismatch: got %v", depth, gv.Field(0).Int())
+			}
+		} else if decErr == nil {
+			// depth == cap+1: decode into the too-deep target must reject (the
+			// decode-side neuter-proof), matching encode.
+			t.Errorf("depth %d (> cap %d) decode into a too-deep nullunion field must reject", depth, maxDepthLevels)
+		}
+	}
+}

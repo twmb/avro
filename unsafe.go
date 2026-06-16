@@ -500,6 +500,20 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 			return nil
 		}
 		innerGoType := goType.Elem()
+		// A multi-level-pointer target (**…T) declines to the reflect path,
+		// mirroring the encode field-nullunion decline. udNullUnionRecord/
+		// udNullUnionPtr consume the outer pointer (the nullunion optional) via
+		// goType.Elem() and then indirectAlloc the remainder — peeling one level
+		// past the cap, so a **…T target would accept 1+maxIndirectDepth levels
+		// where the reflect deser (deserNullUnionAt hands the un-indirected
+		// target to the branch fn, whose single indirectAlloc caps the whole
+		// chain at maxIndirectDepth), the encode side, and every other context
+		// reject. (A primitive inner already declines below when
+		// tryCompileFieldDeser refuses the *…T innerGoType; the record inner has
+		// its own branch, so the guard must precede it.)
+		if innerGoType.Kind() == reflect.Pointer {
+			return nil
+		}
 		if inner.deserRecord != nil {
 			return udNullUnionRecord(inner.deserRecord, innerGoType, valIdx, nullByte, valByte)
 		}
@@ -525,7 +539,16 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		elemGoType := goType.Elem()
 		switch inner.avroType {
 		case "record":
-			if inner.deserRecord != nil && elemGoType.Kind() == reflect.Pointer {
+			// A multi-level-pointer element ([]**…record) declines to the safe
+			// path: it falls to default → tryCompileFieldDeser rejects the
+			// **record element (the record arm needs a struct, the generic
+			// pointer arm declines all pointers), so the field's reflect deser
+			// handles it with a single indirectAlloc budget. The fast
+			// udArrayPtrRecord peels one pointer level inline and rec.deser peels
+			// a FURTHER maxIndirectDepth, accepting 1+maxIndirectDepth — one past
+			// the cap every other path enforces. Mirrors the encode usArrayRecord
+			// decline; the fast path stays single-pointer only ([]*record).
+			if inner.deserRecord != nil && elemGoType.Kind() == reflect.Pointer && elemGoType.Elem().Kind() != reflect.Pointer {
 				return udArrayPtrRecord(inner.deserRecord, elemGoType.Elem(), goType, inner.minBytes)
 			}
 		default:
@@ -1479,6 +1502,18 @@ func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nul
 // usArrayRecord handles array ser for []T or []*T where items are records.
 func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 	if elemGoType.Kind() == reflect.Pointer {
+		// A multi-level-pointer element ([]**…record) declines to the reflect
+		// path. usArrayPtrRecord peels one pointer level inline (the
+		// []unsafe.Pointer element read) and then hands the remainder to
+		// rec.ser, whose indirect peels a FURTHER maxIndirectDepth levels — so
+		// the element would accept a chain 1+maxIndirectDepth deep, one past the
+		// cap the leaf encoder, the JSON encoder, top-level reflect, and the
+		// nullunion array arms all enforce. The reflect serArray hands the
+		// element to rec.ser with a single indirect budget, capping at
+		// maxIndirectDepth. (Mirrors the []**…record nullunion array decline.)
+		if elemGoType.Elem().Kind() == reflect.Pointer {
+			return nil
+		}
 		return usArrayPtrRecord(rec, elemGoType.Elem())
 	}
 	elemSize := elemGoType.Size()
