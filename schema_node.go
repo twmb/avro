@@ -167,6 +167,14 @@ type deduper struct {
 // numeric defaults). See [SchemaNode.Props] and [SchemaField.Default]
 // for how values decode.
 //
+// Reserved Avro attribute names (such as "type", "name", "namespace",
+// "doc", "aliases") are matched case-insensitively, so a custom property
+// whose key differs from a reserved name only by ASCII letter case (for
+// example "Aliases") is interpreted as that reserved attribute and is not
+// reported in [SchemaNode.Props]. Parsing applies the same case-insensitive
+// matching, so the metadata reported here stays consistent with the parsed
+// schema and the encoded wire.
+//
 // Root re-parses the JSON on each call. Cache the result if you need
 // to access it repeatedly (e.g. in a per-message processing loop).
 func (s *Schema) Root() SchemaNode {
