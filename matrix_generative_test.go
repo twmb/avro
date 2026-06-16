@@ -1511,3 +1511,261 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 		}
 	}
 }
+
+// ===========================================================================
+// Pointer-indirection depth × FIELD-OF-CONTAINER context — the unsafe struct-
+// field CONTAINER fast paths.
+//
+// TestMatrix_GenerativePointerIndirection crosses depth × context, but its
+// contexts all carry the chain at TOP LEVEL or as a SCALAR struct field, so they
+// reach only the reflect serArray/serMap and the unsafe SCALAR field-pointer fast
+// path — never the unsafe struct-field CONTAINER fast paths
+// (tryCompileFieldSer/tryCompileFieldDeser's usArrayRecord→usArrayPtrRecord /
+// udArrayPtrRecord, usNullUnionRecord / udNullUnionRecord, and
+// usArrayNullUnionRecord / usArrayNullUnionPtr). Those arms fire ONLY for an
+// array / null-union / array-of-null-union element INSIDE an ADDRESSABLE struct
+// field. Each hand-peels exactly one pointer level inline (the element or the
+// null-union optional) and delegates the remainder to a full-budget indirect
+// (rec.ser / rec.deser); the recurring family bug is a MISSING multi-level-
+// pointer decline at one such arm, so it accepts 1+maxIndirectDepth levels where
+// the reflect element handler, the encode side, and every other context cap at
+// maxIndirectDepth — emitting a wire the same struct encoded as a non-addressable
+// VALUE (reflect), a top-level encode, and the wire's own reader all refuse.
+//
+// This net adds a RECORD base (so []*…*record / *…*record reach the record arms)
+// and FIELD-OF-CONTAINER contexts that encode BOTH the addressable *struct (=>
+// the unsafe container fast path) and the same struct as a non-addressable value
+// (=> reflect), asserting both agree with each other, with the generic any-tree
+// encode, and with the explicit cap at every depth {0,1,2,at-cap,past-cap}. A
+// double-peeling arm accepts the past-cap depth on the *struct path while the
+// reflect-value path rejects it: the divergence the scalar-field matrix above is
+// structurally blind to.
+// ===========================================================================
+
+// ptrIndRec is the record base for the field-of-container pointer net: a minimal
+// fully-unsafe-compileable struct, so a []*…*ptrIndRec / *…*ptrIndRec struct
+// field reaches the unsafe record container arms (usArrayPtrRecord,
+// usNullUnionRecord, usArrayNullUnionRecord, and their decode twins) until the
+// element/optional pointer depth forces a decline back to reflect.
+type ptrIndRec struct {
+	X int32 `avro:"x"`
+}
+
+const ptrIndRecSchema = `{"type":"record","name":"PIRec","fields":[{"name":"x","type":"int"}]}`
+
+// ptrCBase is one base type for the field-of-container pointer-depth net: its
+// Avro text, Go base type, a representative typed sample, and the generic
+// (any-tree) form. The generic form carries NO Go pointer wrapping, so it always
+// encodes (depth-0-equivalent) and is the canonical wire every accepted typed
+// depth must match and every decode reads.
+type ptrCBase struct {
+	label   string
+	avro    string
+	goType  reflect.Type
+	sample  reflect.Value
+	generic any
+}
+
+func ptrCBases() []ptrCBase {
+	// A primitive base exercises the usArrayDirect / usNullUnionPtr /
+	// usArrayNullUnionPtr arms (+ the scalar field-pointer fast path on the
+	// element); a record base exercises the usArrayPtrRecord / usNullUnionRecord
+	// / usArrayNullUnionRecord arms the family bug recurred in. string is a
+	// second, differently-shaped primitive.
+	return []ptrCBase{
+		{"int", `"int"`, reflect.TypeOf(int32(0)), reflect.ValueOf(int32(7)), int32(7)},
+		{"string", `"string"`, reflect.TypeOf(""), reflect.ValueOf("v"), "v"},
+		{"record", ptrIndRecSchema, reflect.TypeOf(ptrIndRec{}), reflect.ValueOf(ptrIndRec{X: 7}), map[string]any{"x": int32(7)}},
+	}
+}
+
+// ptrFieldCtx composes a base into an addressable struct field holding a
+// container whose element / value / optional sits at pointer depth D. minDepth is
+// the shallowest valid depth (0 for array/map; 1 for the null-union arms, whose
+// optional IS the first pointer level).
+type ptrFieldCtx struct {
+	label        string
+	minDepth     int
+	fieldSchema  func(baseAvro string) string
+	fieldType    func(baseGo reflect.Type, depth int) reflect.Type
+	setField     func(field reflect.Value, baseSample reflect.Value, depth int)
+	genericField func(baseGeneric any) any
+	checkField   func(t *testing.T, field reflect.Value, baseSample reflect.Value)
+}
+
+func ptrFieldCtxs() []ptrFieldCtx {
+	stringType := reflect.TypeOf("")
+	// field-array and field-array-nullunion share the []*…*base field shape and
+	// the two-element-slice input/check; only the schema and minDepth differ (the
+	// null-union element's pointer IS the optional, so depth 0 is value-only).
+	sliceType := func(baseGo reflect.Type, depth int) reflect.Type {
+		return reflect.SliceOf(ptrTypeOf(baseGo, depth))
+	}
+	setSlice := func(field reflect.Value, baseSample reflect.Value, depth int) {
+		sl := reflect.MakeSlice(field.Type(), 2, 2)
+		sl.Index(0).Set(ptrChain(baseSample, depth))
+		sl.Index(1).Set(ptrChain(baseSample, depth))
+		field.Set(sl)
+	}
+	genSlice := func(baseGeneric any) any { return []any{baseGeneric, baseGeneric} }
+	checkSlice := func(t *testing.T, field reflect.Value, baseSample reflect.Value) {
+		t.Helper()
+		if field.Len() != 2 {
+			t.Fatalf("array field round-trip length: got %d, want 2", field.Len())
+		}
+		for i := range field.Len() {
+			if got := derefAll(field.Index(i)); !ptrValEq(got, baseSample) {
+				t.Fatalf("array field[%d] round-trip mismatch: got %v, want %v", i, safeIface(got), safeIface(baseSample))
+			}
+		}
+	}
+	return []ptrFieldCtx{
+		{
+			label:        "field-array",
+			minDepth:     0,
+			fieldSchema:  func(b string) string { return fmt.Sprintf(`{"type":"array","items":%s}`, b) },
+			fieldType:    sliceType,
+			setField:     setSlice,
+			genericField: genSlice,
+			checkField:   checkSlice,
+		},
+		{
+			label:        "field-array-nullunion",
+			minDepth:     1,
+			fieldSchema:  func(b string) string { return fmt.Sprintf(`{"type":"array","items":["null",%s]}`, b) },
+			fieldType:    sliceType,
+			setField:     setSlice,
+			genericField: genSlice,
+			checkField:   checkSlice,
+		},
+		{
+			label:        "field-nullunion",
+			minDepth:     1,
+			fieldSchema:  func(b string) string { return fmt.Sprintf(`["null",%s]`, b) },
+			fieldType:    func(baseGo reflect.Type, depth int) reflect.Type { return ptrTypeOf(baseGo, depth) },
+			setField:     func(field reflect.Value, baseSample reflect.Value, depth int) { field.Set(ptrChain(baseSample, depth)) },
+			genericField: func(baseGeneric any) any { return baseGeneric },
+			checkField: func(t *testing.T, field reflect.Value, baseSample reflect.Value) {
+				t.Helper()
+				if got := derefAll(field); !ptrValEq(got, baseSample) {
+					t.Fatalf("null-union field round-trip mismatch: got %v, want %v", safeIface(got), safeIface(baseSample))
+				}
+			},
+		},
+		{
+			label:       "field-map",
+			minDepth:    0,
+			fieldSchema: func(b string) string { return fmt.Sprintf(`{"type":"map","values":%s}`, b) },
+			fieldType: func(baseGo reflect.Type, depth int) reflect.Type {
+				return reflect.MapOf(stringType, ptrTypeOf(baseGo, depth))
+			},
+			setField: func(field reflect.Value, baseSample reflect.Value, depth int) {
+				m := reflect.MakeMap(field.Type())
+				m.SetMapIndex(reflect.ValueOf("k"), ptrChain(baseSample, depth))
+				field.Set(m)
+			},
+			genericField: func(baseGeneric any) any { return map[string]any{"k": baseGeneric} },
+			checkField: func(t *testing.T, field reflect.Value, baseSample reflect.Value) {
+				t.Helper()
+				if got := derefAll(field.MapIndex(reflect.ValueOf("k"))); !ptrValEq(got, baseSample) {
+					t.Fatalf("map field[k] round-trip mismatch: got %v, want %v", safeIface(got), safeIface(baseSample))
+				}
+			},
+		},
+	}
+}
+
+func TestMatrix_GenerativePointerIndirectionUnsafeContainers(t *testing.T) {
+	depths := []int{0, 1, 2, ptrIndirectCap, ptrIndirectCap + 1} // {0,1,2,at-cap,past-cap}
+	for _, b := range ptrCBases() {
+		for _, cx := range ptrFieldCtxs() {
+			t.Run(b.label+"/"+cx.label, func(t *testing.T) {
+				recSchema := fmt.Sprintf(`{"type":"record","name":"PtrCOuter","fields":[{"name":"f","type":%s}]}`, cx.fieldSchema(b.avro))
+				s := avro.MustParse(recSchema)
+				res, err := avro.Resolve(s, s)
+				if err != nil {
+					t.Fatalf("identity Resolve: %v\nschema: %s", err, recSchema)
+				}
+				// Canonical wires from the generic any-tree input: it carries no Go
+				// pointer wrapping, so it always encodes (depth-0-equivalent) and is
+				// both the wire every accepted typed depth must match and the wire
+				// every decode reads — valid even at the reject depths (whose typed
+				// encode fails, so they cannot supply their own wire).
+				genVal := map[string]any{"f": cx.genericField(b.generic)}
+				cbin, err := s.AppendEncode(nil, genVal)
+				if err != nil {
+					t.Fatalf("canonical binary encode: %v\nschema: %s", err, recSchema)
+				}
+				cjson, err := s.AppendEncodeJSON(nil, genVal)
+				if err != nil {
+					t.Fatalf("canonical JSON encode: %v\nschema: %s", err, recSchema)
+				}
+				for _, depth := range depths {
+					if depth < cx.minDepth {
+						continue
+					}
+					t.Run(fmt.Sprintf("depth=%d", depth), func(t *testing.T) {
+						accept := depth <= ptrIndirectCap
+						st := reflect.StructOf([]reflect.StructField{
+							{Name: "F", Type: cx.fieldType(b.goType, depth), Tag: `avro:"f"`},
+						})
+						ps := reflect.New(st)
+						cx.setField(ps.Elem().Field(0), b.sample, depth)
+
+						// Encode parity: the addressable *struct (=> unsafe struct-field
+						// container fast path) and the same struct as a non-addressable
+						// VALUE (=> reflect) must agree with each other, with the generic
+						// wire, and with the explicit cap. A double-peeling arm accepts
+						// the past-cap depth on the *struct path alone.
+						for _, fm := range []struct {
+							name string
+							in   any
+						}{
+							{"unsafe(*struct)", ps.Interface()},
+							{"reflect(struct-value)", ps.Elem().Interface()},
+						} {
+							binW, binErr := s.AppendEncode(nil, fm.in)
+							jsonW, jsonErr := s.AppendEncodeJSON(nil, fm.in)
+							if (binErr == nil) != accept {
+								t.Fatalf("%s binary encode accept=%v, want %v (err=%v)", fm.name, binErr == nil, accept, binErr)
+							}
+							if (jsonErr == nil) != accept {
+								t.Fatalf("%s JSON encode accept=%v, want %v (err=%v)", fm.name, jsonErr == nil, accept, jsonErr)
+							}
+							if accept {
+								if !bytes.Equal(binW, cbin) {
+									t.Fatalf("%s binary wire != generic canonical (pointer wrapping not transparent):\n got=%x\nwant=%x", fm.name, binW, cbin)
+								}
+								if !bytes.Equal(jsonW, cjson) {
+									t.Fatalf("%s JSON wire != generic canonical:\n got=%s\nwant=%s", fm.name, jsonW, cjson)
+								}
+							}
+						}
+
+						// Decode parity: each {wire}×{natural,resolved} path agrees with
+						// the cap, decoding into a fresh depth-D typed *struct (=> the
+						// unsafe container deser arm); an accepted value round-trips.
+						for _, dp := range []struct {
+							name string
+							dec  func(target any) error
+						}{
+							{"binary/natural", func(target any) error { _, e := s.Decode(cbin, target); return e }},
+							{"binary/resolved", func(target any) error { _, e := res.Decode(cbin, target); return e }},
+							{"json/natural", func(target any) error { return s.DecodeJSON(cjson, target) }},
+							{"json/resolved", func(target any) error { return res.DecodeJSON(cjson, target) }},
+						} {
+							target := reflect.New(st)
+							err := dp.dec(target.Interface())
+							if (err == nil) != accept {
+								t.Fatalf("%s decode accept=%v, want %v (err=%v)", dp.name, err == nil, accept, err)
+							}
+							if accept {
+								cx.checkField(t, target.Elem().Field(0), b.sample)
+							}
+						}
+					})
+				}
+			})
+		}
+	}
+}
