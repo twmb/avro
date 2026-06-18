@@ -15,15 +15,17 @@ import (
 // PREVENTING the over-cap allocation, not by decompressing the whole block and
 // rejecting after. The reader passes its cap to the codec's DecompressBounded
 // (the BoundedDecompressor capability) at decode time, so the bound reaches a
-// supplied instance exactly like the name-resolved built-in. Without this,
-// deflate decompresses via an unbounded io.ReadAll: a tiny deflate bomb
-// materializes in full (OOM on a real bomb) before any rejection.
+// supplied instance — AND a NopCloser-wrapped instance, which forwards the
+// capability — exactly like the name-resolved built-in. Without this, deflate
+// decompresses via an unbounded io.ReadAll: a tiny deflate bomb materializes in
+// full (OOM on a real bomb) before any rejection.
 //
 // The pin is the ALLOCATION: a block declaring far more decompressed bytes than
 // the cap must be rejected having allocated only on the order of the cap, not
 // the full decompressed size. Reaching the assertion without materializing the
 // whole datum is the property; an over-cap allocation would show as a TotalAlloc
-// delta near the decompressed size.
+// delta near the decompressed size. The NopCloser rows pin that wrapping a
+// built-in for sharing does not silently drop its bounding.
 func TestRegression_OCFUserBuiltinCodecBoundsDecompression(t *testing.T) {
 	const datumSize = 8 << 20 // 8 MiB decompressed (highly compressible -> tiny compressed)
 	const cap = 256 << 10     // 256 KiB decompressed cap
@@ -67,6 +69,10 @@ func TestRegression_OCFUserBuiltinCodecBoundsDecompression(t *testing.T) {
 	}{
 		{"deflate", ocf.DeflateCodec(9), ocf.DeflateCodec(9)},
 		{"snappy", ocf.SnappyCodec(), ocf.SnappyCodec()},
+		// NopCloser-wrapped built-ins (the realistic shared-codec form): the
+		// wrapper forwards BoundedDecompressor, so the bound still applies.
+		{"deflate_nopcloser", ocf.DeflateCodec(9), ocf.NopCloser(ocf.DeflateCodec(9))},
+		{"snappy_nopcloser", ocf.SnappyCodec(), ocf.NopCloser(ocf.SnappyCodec())},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			file := mkFile(tc.write)

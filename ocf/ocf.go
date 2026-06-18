@@ -124,6 +124,11 @@ type Codec interface {
 // BoundedDecompressor decompresses unbounded; for untrusted data, supply a
 // codec that bounds itself (all built-in codecs do).
 //
+// A wrapper type that embeds [Codec] (e.g. a [NopCloser] result) does NOT
+// inherit this capability — embedding an interface promotes only that
+// interface's methods — so such a wrapper must forward DecompressBounded
+// explicitly or it silently disables bounding for the codec it wraps.
+//
 // max <= 0 means no limit. max is constant across all calls for a given
 // [Reader], so a codec that caches a configured decoder (e.g. a zstd decoder
 // built with a memory limit) may honor only the first call's max.
@@ -136,11 +141,28 @@ type BoundedDecompressor interface {
 // so that individual [Writer.Close] or [Reader.Close] calls do not release
 // shared resources. The caller is responsible for closing the underlying
 // codec when it is no longer needed.
+//
+// If c implements [BoundedDecompressor], so does the returned Codec (the
+// reader's decompression bound is forwarded to c), so wrapping a built-in codec
+// for sharing does not silently drop its bounding.
 func NopCloser(c Codec) Codec { return nopCloser{c} }
 
 type nopCloser struct{ Codec }
 
 func (nopCloser) Close() error { return nil }
+
+// DecompressBounded forwards the reader's per-block cap to the wrapped codec
+// when it implements [BoundedDecompressor]; otherwise it falls back to the
+// unbounded [Codec.Decompress] (honest: an unbounded wrapped codec stays
+// unbounded). nopCloser always exposes this method so that wrapping a bounding
+// codec (every built-in) preserves the bound — embedding the [Codec] interface
+// alone would not, since it promotes only the interface's own methods.
+func (n nopCloser) DecompressBounded(src []byte, max int64) ([]byte, error) {
+	if b, ok := n.Codec.(BoundedDecompressor); ok {
+		return b.DecompressBounded(src, max)
+	}
+	return n.Codec.Decompress(src)
+}
 
 // WriterOpt is an option for [NewWriter].
 type WriterOpt interface{ writerOpt() }
@@ -200,9 +222,9 @@ func (optSchemaOpts) writerOpt() {}
 //
 // For reader-side decompression bounding of a supplied codec, see
 // [WithMaxDecompressedBlockBytes]: it reaches any supplied codec implementing
-// [BoundedDecompressor] (every built-in does). A custom codec that does not
-// implement BoundedDecompressor decompresses unbounded — supply one that bounds
-// itself for untrusted data.
+// [BoundedDecompressor] (every built-in does, including one wrapped by
+// [NopCloser]). A custom codec that does not implement BoundedDecompressor
+// decompresses unbounded — supply one that bounds itself for untrusted data.
 func WithCodec(c Codec) Opt { return optCodec{c} }
 
 // WithBlockCount sets the maximum number of items per block. The default is
@@ -308,7 +330,7 @@ const ocfEagerBlockAllocLimit = 64 << 20
 // [BoundedDecompressor.DecompressBounded] at decode time. It therefore reaches
 // every codec implementing that capability uniformly — a codec resolved by name
 // from the file header (the common case), AND a codec supplied as an instance
-// via [WithCodec]. All four built-in
+// via [WithCodec], including one wrapped by [NopCloser]. All four built-in
 // codecs (null, deflate, snappy, zstandard) implement it. A custom codec that
 // does NOT implement [BoundedDecompressor] decompresses unbounded — this limit
 // does not apply to it (no post-decompression backstop; that is false comfort

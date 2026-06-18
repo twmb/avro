@@ -201,7 +201,8 @@ func TestRegression_OCFDeflateDecompressLimitMaxInt(t *testing.T) {
 	}
 }
 
-// A zstd codec supplied as an INSTANCE via WithCodec is bounded by the reader's
+// A zstd codec supplied as an INSTANCE via WithCodec (and one wrapped in
+// NopCloser, the realistic shared-codec form) is bounded by the reader's
 // WithMaxDecompressedBlockBytes, the same as a name-resolved zstd codec: the
 // decoder is built lazily with zstd.WithDecoderMaxMemory from the cap. A frame
 // inflating past the cap is rejected; the same frame under a raised cap decodes.
@@ -219,6 +220,7 @@ func TestRegression_OCFSuppliedZstdInstanceBounded(t *testing.T) {
 		codec func() Codec
 	}{
 		{"instance", func() Codec { c, _ := ZstdCodec(nil, nil); return c }},
+		{"nopcloser", func() Codec { c, _ := ZstdCodec(nil, nil); return NopCloser(c) }},
 	} {
 		t.Run(sc.name+"/rejected-at-limit", func(t *testing.T) {
 			r, err := NewReader(bytes.NewReader(data), WithCodec(sc.codec()), WithMaxDecompressedBlockBytes(limit))
