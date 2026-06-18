@@ -677,6 +677,12 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(text))
 		}
 		if v.Kind() == reflect.String {
+			// See serEnum.ser: json.Number (Kind reflect.String) is a numeric
+			// carrier, and a stringy enum target is a type mismatch — rejected
+			// on both wire formats, symmetric with the decoder.
+			if err := rejectJSONNumberRawTarget(v, "enum"); err != nil {
+				return nil, err
+			}
 			needle := v.String()
 			if slices.Contains(node.symbols, needle) {
 				return appendJSONString(buf, needle), nil

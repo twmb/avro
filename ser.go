@@ -908,13 +908,14 @@ func appendAvroFloat64(dst []byte, v reflect.Value) ([]byte, error) {
 }
 
 // rejectJSONNumberRawTarget reports a SemanticError when v is a json.Number
-// being encoded against a "raw bytes" Avro type (bytes / fixed). json.Number
-// is a numeric carrier — its stdlib contract is an RFC 8259 number literal —
-// so it is valid only for numeric Avro types, the same rule appendAvroString
-// applies for the string type and rejectJSONNumberStringTarget applies on
-// decode. Plain strings stay accepted at these sites for json.Unmarshal
-// pipelines that carry Avro bytes/fixed as strings; only json.Number is turned
-// away. Callers invoke this inside a v.Kind()==reflect.String branch.
+// being encoded against a non-numeric Avro type (bytes, fixed, or enum).
+// json.Number is a numeric carrier — its stdlib contract is an RFC 8259 number
+// literal — so it is valid only for numeric Avro types, the same rule
+// appendAvroString applies for the string type and rejectJSONNumberStringTarget
+// applies on decode. Plain strings stay accepted at these sites for
+// json.Unmarshal pipelines that carry Avro bytes/fixed/enum content as strings;
+// only json.Number is turned away. Callers invoke this inside a
+// v.Kind()==reflect.String branch.
 func rejectJSONNumberRawTarget(v reflect.Value, avroType string) error {
 	if v.Type() == jsonNumberType {
 		return semErr(v, avroType)
@@ -1366,6 +1367,17 @@ func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", truncForError(needle))}
 	}
 	if v.Kind() == reflect.String {
+		// json.Number's Kind() is reflect.String, but it is a numeric carrier
+		// (its stdlib contract is an RFC 8259 number literal), so a stringy
+		// enum target is a type mismatch — rejected here exactly as the
+		// string/bytes/fixed encoders reject it and the decode side
+		// (setEnumTarget → setStringTarget → rejectJSONNumberStringTarget)
+		// rejects it. Without this, the json.Number's content would be looked
+		// up as a symbol name and silently encode an ordinal the decoder can
+		// never read back.
+		if err := rejectJSONNumberRawTarget(v, "enum"); err != nil {
+			return nil, err
+		}
 		needle := v.String()
 		if i, ok := s.indexOfSymbol(needle); ok {
 			return appendVarint(dst, int32(i)), nil

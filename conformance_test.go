@@ -20669,6 +20669,16 @@ func TestRegression_JSONNumberStringSourceRejectedOnEncode(t *testing.T) {
 		{"fixed_uuid", `{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}`, json.Number("123")},
 		// Unsafe struct-field path for bytes — routes to reflect serBytes.
 		{"unsafe_struct_bytes", `{"type":"record","name":"R","fields":[{"name":"n","type":"bytes"}]}`, &structField{N: json.Number("123")}},
+		// enum rejects json.Number on encode too (numeric-only). json.Number's
+		// Kind() is reflect.String, so without the reject its content would be
+		// looked up as a symbol name and silently encode an ordinal. A
+		// VALID-symbol-name json.Number ("A") must reject just like a
+		// non-symbol one — symmetric with the decoder, which rejects a
+		// json.Number enum target via rejectJSONNumberStringTarget.
+		{"enum", `{"type":"enum","name":"E","symbols":["A","B","C"]}`, json.Number("A")},
+		// enum has no unsafe encode fast path, so a struct field routes to
+		// reflect serEnum.ser — same reject.
+		{"unsafe_struct_enum", `{"type":"record","name":"R","fields":[{"name":"n","type":{"type":"enum","name":"E","symbols":["A","B","C"]}}]}`, &structField{N: json.Number("A")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name+"_binary", func(t *testing.T) {
@@ -20689,6 +20699,52 @@ func TestRegression_JSONNumberStringSourceRejectedOnEncode(t *testing.T) {
 				t.Errorf("JSON encode accepted json.Number for %s; expected SemanticError per RFC 8259 contract", tc.name)
 			}
 		})
+	}
+}
+
+// TestRegression_EnumJSONNumberRejectStillEncodesString pins that the enum
+// json.Number encode reject does not over-reject — a valid string symbol still
+// encodes and round-trips on both wires, and an int ordinal target is
+// unaffected — and that the union dispatch path rejects too. json.Number's
+// unionTypeNameForValue is "" (it can flow into numeric branches), so serUnion
+// / appendAvroJSONUnion fall to try-each, which delegates to the enum branch's
+// per-value serfn; the per-branch reject is what stops a json.Number from
+// silently landing in an enum branch when the union has no branch that can
+// legitimately accept it.
+func TestRegression_EnumJSONNumberRejectStillEncodesString(t *testing.T) {
+	enum := avro.MustParse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	for _, enc := range []struct {
+		name   string
+		encode func(any) ([]byte, error)
+		decode func([]byte, any) error
+	}{
+		{"binary", func(v any) ([]byte, error) { return enum.Encode(v) }, func(b []byte, v any) error { _, err := enum.Decode(b, v); return err }},
+		{"json", func(v any) ([]byte, error) { return enum.EncodeJSON(v) }, func(b []byte, v any) error { return enum.DecodeJSON(b, v) }},
+	} {
+		// Boundary-1: a plain string symbol still encodes and round-trips.
+		wire, err := enc.encode("B")
+		if err != nil {
+			t.Fatalf("%s: encode string symbol: %v", enc.name, err)
+		}
+		var got string
+		if err := enc.decode(wire, &got); err != nil || got != "B" {
+			t.Fatalf("%s: string symbol round-trip: got %q err %v", enc.name, got, err)
+		}
+		// An int ordinal target is unaffected by the json.Number reject.
+		var ord int
+		if err := enc.decode(wire, &ord); err != nil || ord != 1 {
+			t.Fatalf("%s: int ordinal target: got %d err %v", enc.name, ord, err)
+		}
+	}
+
+	// Union with an enum branch and no branch that can accept a json.Number:
+	// encode must reject, not silently route the json.Number into the enum.
+	union := avro.MustParse(`["boolean",{"type":"enum","name":"E","symbols":["A","B","C"]}]`)
+	if _, err := union.Encode(json.Number("A")); err == nil {
+		t.Error("binary union encode accepted json.Number into the enum branch via try-each")
+	}
+	if _, err := union.EncodeJSON(json.Number("A")); err == nil {
+		t.Error("JSON union encode accepted json.Number into the enum branch via try-each")
 	}
 }
 
