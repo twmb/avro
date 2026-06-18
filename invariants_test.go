@@ -74,6 +74,9 @@ func paritySchemas() []paritySchema {
 		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`},
 		{"decimal", `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`},
 		{"uuid", `{"type":"string","logicalType":"uuid"}`},
+		{"enum", `{"type":"enum","name":"E","symbols":["A","B","C"]}`},
+		{"null-union-long", `["null","long"]`},
+		{"union-string-long", `["string","long"]`},
 	}
 }
 
