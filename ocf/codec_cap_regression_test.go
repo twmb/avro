@@ -10,16 +10,14 @@ import (
 	"github.com/twmb/avro/ocf"
 )
 
-// A reader configured with a BUILT-IN codec instance via WithCodec
-// (ocf.DeflateCodec(…) / ocf.SnappyCodec()) must enforce
-// WithMaxDecompressedBlockBytes the same way the name-resolved built-in does:
-// by PREVENTING the over-cap allocation, not by decompressing the whole block
-// and rejecting after. The public codec constructors default their
-// decompression bound to 0 (unbounded); resolveCodec injects maxDecompressed
-// for these built-in types so a user-supplied instance is bounded exactly like
-// the name-resolved one. Without that injection, deflate decompresses via an
-// unbounded io.ReadAll — a tiny deflate bomb materializes in full (OOM on a
-// real bomb) before the post-decompress backstop can reject it.
+// A reader configured with a codec instance via WithCodec must enforce
+// WithMaxDecompressedBlockBytes the same way a name-resolved codec does: by
+// PREVENTING the over-cap allocation, not by decompressing the whole block and
+// rejecting after. The reader passes its cap to the codec's DecompressBounded
+// (the BoundedDecompressor capability) at decode time, so the bound reaches a
+// supplied instance exactly like the name-resolved built-in. Without this,
+// deflate decompresses via an unbounded io.ReadAll: a tiny deflate bomb
+// materializes in full (OOM on a real bomb) before any rejection.
 //
 // The pin is the ALLOCATION: a block declaring far more decompressed bytes than
 // the cap must be rejected having allocated only on the order of the cap, not

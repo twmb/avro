@@ -90,6 +90,7 @@ import (
 	"io"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
@@ -111,6 +112,23 @@ type Codec interface {
 	// Close releases any resources held by the codec. Codecs that hold no
 	// resources may return nil.
 	Close() error
+}
+
+// BoundedDecompressor is an optional capability a [Codec] may implement. If a
+// Codec implements it, the [Reader] calls DecompressBounded with its per-block
+// decompression cap (from [WithMaxDecompressedBlockBytes]) instead of
+// [Codec.Decompress], so the codec can refuse-early or stream-limit BEFORE
+// allocating the whole block. That is the only effective defense against a
+// decompression bomb — a post-decompression size check is false comfort, since
+// the over-cap allocation has already happened. A Codec that does NOT implement
+// BoundedDecompressor decompresses unbounded; for untrusted data, supply a
+// codec that bounds itself (all built-in codecs do).
+//
+// max <= 0 means no limit. max is constant across all calls for a given
+// [Reader], so a codec that caches a configured decoder (e.g. a zstd decoder
+// built with a memory limit) may honor only the first call's max.
+type BoundedDecompressor interface {
+	DecompressBounded(src []byte, max int64) ([]byte, error)
 }
 
 // NopCloser returns a Codec that wraps c but has a no-op Close method. This
@@ -181,9 +199,10 @@ func (optSchemaOpts) writerOpt() {}
 // should return nil from Close.
 //
 // For reader-side decompression bounding of a supplied codec, see
-// [WithMaxDecompressedBlockBytes]: it bounds a supplied built-in deflate or
-// snappy codec up front, but a supplied zstd or third-party codec is bounded
-// only by its own configuration plus a post-decompression backstop.
+// [WithMaxDecompressedBlockBytes]: it reaches any supplied codec implementing
+// [BoundedDecompressor] (every built-in does). A custom codec that does not
+// implement BoundedDecompressor decompresses unbounded — supply one that bounds
+// itself for untrusted data.
 func WithCodec(c Codec) Opt { return optCodec{c} }
 
 // WithBlockCount sets the maximum number of items per block. The default is
@@ -285,15 +304,16 @@ const ocfEagerBlockAllocLimit = 64 << 20
 // [WithBlockBytes]) that decompress beyond the default.
 //
 // Enforcement scope: this limit is applied UP FRONT (the over-cap allocation is
-// prevented, not merely caught afterward) for codecs the reader resolves by
-// name from the file header — the common case — and for a built-in deflate or
-// snappy codec supplied as an instance via [WithCodec], since those constructors
-// expose no decompression bound of their own. A zstd codec or a third-party
-// codec supplied via [WithCodec] is bounded by its OWN configuration instead —
-// for zstd, set [zstd.WithDecoderMaxMemory] in [ZstdCodec]'s decoder options
-// when reading untrusted data — and this limit applies to such a codec only as
-// a backstop AFTER decompression, which rejects an over-cap block but does not
-// prevent its allocation.
+// prevented, not merely caught afterward) by passing it to the codec's
+// [BoundedDecompressor.DecompressBounded] at decode time. It therefore reaches
+// every codec implementing that capability uniformly — a codec resolved by name
+// from the file header (the common case), AND a codec supplied as an instance
+// via [WithCodec]. All four built-in
+// codecs (null, deflate, snappy, zstandard) implement it. A custom codec that
+// does NOT implement [BoundedDecompressor] decompresses unbounded — this limit
+// does not apply to it (no post-decompression backstop; that is false comfort
+// once the allocation has happened), so supply a self-bounding codec for
+// untrusted data.
 func WithMaxDecompressedBlockBytes(n int64) ReaderOpt { return optMaxDecompressedBytes{n} }
 
 // WithSchemaOpts passes [avro.SchemaOpt] values (such as [avro.CustomType]
@@ -322,25 +342,24 @@ func SnappyCodec() Codec { return snappyCodec{} }
 // A single ZstdCodec is safe to share across multiple readers and writers
 // via [NopCloser].
 //
-// To READ untrusted data with a supplied ZstdCodec, bound decode memory via
-// [zstd.WithDecoderMaxMemory] in dopts: unlike a name-resolved zstd codec or a
-// supplied built-in deflate/snappy codec, a supplied zstd codec is NOT bounded
-// up front by [WithMaxDecompressedBlockBytes] (the reader cannot resize an
-// already-constructed decoder), so without it a tiny block can inflate to the
-// zstd default of 64 GiB before the post-decompression backstop rejects it.
+// ZstdCodec implements [BoundedDecompressor], so a reader applies its
+// [WithMaxDecompressedBlockBytes] cap to a supplied ZstdCodec the same as a
+// name-resolved one: the decoder is built lazily on first read with
+// [zstd.WithDecoderMaxMemory] set from the cap. The decoder is then cached, so
+// a ZstdCodec shared across readers with different caps honors the first
+// reader's cap (set [zstd.WithDecoderMaxMemory] in dopts to pin a specific
+// bound regardless of reader). The cap floors at 1 MiB to stay within the
+// decoder's accepted range.
 func ZstdCodec(eopts []zstd.EOption, dopts []zstd.DOption) (Codec, error) {
 	eopts = append([]zstd.EOption{zstd.WithEncoderConcurrency(1)}, eopts...)
-	dopts = append([]zstd.DOption{zstd.WithDecoderConcurrency(1)}, dopts...)
 	enc, err := zstd.NewWriter(nil, eopts...)
 	if err != nil {
 		return nil, fmt.Errorf("ocf: creating zstd encoder: %w", err)
 	}
-	dec, err := zstd.NewReader(nil, dopts...)
-	if err != nil {
-		enc.Close()
-		return nil, fmt.Errorf("ocf: creating zstd decoder: %w", err)
-	}
-	return &zstdCodec{enc: enc, dec: dec}, nil
+	// The decoder is built lazily by DecompressBounded so the reader's
+	// per-block cap can be folded in as WithDecoderMaxMemory; store the
+	// caller's decoder options until then.
+	return &zstdCodec{enc: enc, dopts: dopts}, nil
 }
 
 // MustZstdCodec is like [ZstdCodec] but panics on error. This is useful for
@@ -701,10 +720,9 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 			customCodecs = append(customCodecs, o.c)
 		}
 	}
-	// 0 = unlimited: the append-writer compresses new data and never
-	// decompresses untrusted blocks, so the read-side decompression cap
-	// does not apply here.
-	codec, err := resolveCodec(codecName, customCodecs, 0)
+	// The append-writer compresses new data and never decompresses untrusted
+	// blocks, so the read-side decompression cap does not apply here.
+	codec, err := resolveCodec(codecName, customCodecs)
 	if err != nil {
 		return nil, err
 	}
@@ -832,7 +850,7 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 	if c, ok := meta["avro.codec"]; ok {
 		codecName = string(c)
 	}
-	codec, err := resolveCodec(codecName, customCodecs, maxDecompressed)
+	codec, err := resolveCodec(codecName, customCodecs)
 	if err != nil {
 		return nil, err
 	}
@@ -1004,16 +1022,21 @@ func (rd *Reader) readBlock() error {
 	if count == 0 {
 		return io.EOF
 	}
-	block, err := rd.codec.Decompress(compressed)
+	// Prefer the codec's bounded path: it refuses an over-cap block BEFORE
+	// allocating it (the only effective defense — a post-decompression size
+	// check is false comfort once the allocation has happened). Every built-in
+	// implements BoundedDecompressor. A custom codec that does not is honestly
+	// unbounded; for untrusted data supply a codec that bounds itself. For a
+	// BoundedDecompressor, len(block) <= maxDecompressed, which also caps the
+	// per-block decode loop below (count is bounded relative to len(block)).
+	var block []byte
+	if b, ok := rd.codec.(BoundedDecompressor); ok {
+		block, err = b.DecompressBounded(compressed, rd.maxDecompressed)
+	} else {
+		block, err = rd.codec.Decompress(compressed)
+	}
 	if err != nil {
 		return fmt.Errorf("ocf: decompressing block: %w", err)
-	}
-	// Backstop the decompressed size after the fact. The built-in codecs cap
-	// their own allocation; this also covers custom codecs (whose Decompress
-	// the reader can't bound internally) and, because the count check below
-	// is relative to len(block), bounds the per-block decode loop.
-	if rd.maxDecompressed > 0 && int64(len(block)) > rd.maxDecompressed {
-		return fmt.Errorf("ocf: decompressed block %d bytes exceeds limit of %d (raise WithMaxDecompressedBlockBytes)", len(block), rd.maxDecompressed)
 	}
 	// Bound count against the decompressed block length plus a small
 	// slack for zero-byte-record schemas (EmptyRecord, records of all
@@ -1059,45 +1082,49 @@ const maxOCFZeroByteSlack = 4 << 10
 //
 // Two independent limits guard a block: WithMaxBlockBytes bounds the
 // *compressed* size read off the wire (default 64 MiB), and
-// WithMaxDecompressedBlockBytes bounds the *decompressed* size (default
-// 64 MiB). The decompressed limit is the one that stops amplification:
-// each built-in codec's Decompress would otherwise
-// allocate a size declared inside the compressed payload, before the
-// payload is validated —
+// Each built-in codec implements [BoundedDecompressor]: the reader passes its
+// WithMaxDecompressedBlockBytes cap to DecompressBounded, which refuses an
+// over-cap block BEFORE allocating it (a decompression bomb otherwise inflates
+// a tiny compressed block to a huge allocation). Decompress is the unbounded
+// (max == 0) form, kept for the Codec interface and the trusted writer path:
 //
-//   - snappy: snappy.Decode pre-allocates from a varint header that
-//     can declare up to ~4 GiB inside a 5-byte frame; bounded here by a
+//   - snappy: snappy.Decode pre-allocates from a varint header that can declare
+//     up to ~4 GiB inside a 5-byte frame; DecompressBounded rejects via a
 //     snappy.DecodedLen pre-check before Decode allocates.
-//   - deflate: flate.NewReader streams without a header bound (io.ReadAll
-//     would grow until the stream ends); bounded here by an
-//     io.LimitReader(maxOut+1).
-//   - zstd: the library default permits multi-GiB output; bounded here by
-//     zstd.WithDecoderMaxMemory on the reader's decoder.
+//   - deflate: flate.NewReader streams without a header bound (io.ReadAll would
+//     grow until the stream ends); DecompressBounded reads via an
+//     io.LimitReader(max+1) and rejects past the cap.
+//   - zstd: the library default permits multi-GiB output; DecompressBounded
+//     builds the decoder with zstd.WithDecoderMaxMemory(max), which bounds the
+//     decode window an output limiter cannot.
+//   - null: the "decompressed" size IS the input size; DecompressBounded
+//     rejects an over-cap raw block, which also caps the per-block decode loop
+//     (a block's record count cannot exceed its decompressed length plus the
+//     zero-byte slack).
 //
-// readBlock also re-checks len(decompressed) against the limit as a
-// backstop for custom codecs (whose Decompress the reader can't bound
-// internally), and that bound transitively caps the per-block decode loop
-// since a block's record count cannot exceed its decompressed length plus
-// the zero-byte slack. Java's SnappyCodec (ByteBuffer.allocate(Snappy.
-// uncompressedLength(...))) and fastavro's python-snappy decompress leave
-// the decompressed side unbounded — the cap is twmb defense-in-depth, in
-// the same family as WithMaxBlockBytes and maxZeroByteItems.
+// Java's SnappyCodec (ByteBuffer.allocate(Snappy.uncompressedLength(...))) and
+// fastavro's python-snappy decompress leave the decompressed side unbounded —
+// the cap is twmb defense-in-depth, in the same family as WithMaxBlockBytes and
+// maxZeroByteItems.
 
 type nullCodec struct{}
 
-func (nullCodec) Name() string                          { return "null" }
-func (nullCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
-func (nullCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
-func (nullCodec) Close() error                          { return nil }
+func (nullCodec) Name() string                        { return "null" }
+func (nullCodec) Compress(src []byte) ([]byte, error) { return src, nil }
+
+func (c nullCodec) Decompress(src []byte) ([]byte, error) { return c.DecompressBounded(src, 0) }
+
+func (nullCodec) DecompressBounded(src []byte, max int64) ([]byte, error) {
+	if max > 0 && int64(len(src)) > max {
+		return nil, fmt.Errorf("ocf: decompressed block %d bytes exceeds limit of %d bytes (raise WithMaxDecompressedBlockBytes)", len(src), max)
+	}
+	return src, nil
+}
+
+func (nullCodec) Close() error { return nil }
 
 type deflateCodec struct {
 	level int
-	// maxOut bounds the decompressed output (0 = unlimited). The reader
-	// sets it from WithMaxDecompressedBlockBytes; direct DeflateCodec
-	// callers leave it unlimited. flate.NewReader streams without a header
-	// length, so io.ReadAll grows unbounded without this — a deflate
-	// "zip bomb" decompresses to arbitrary size.
-	maxOut int64
 }
 
 func (deflateCodec) Name() string { return "deflate" }
@@ -1116,17 +1143,24 @@ func (c deflateCodec) Compress(src []byte) ([]byte, error) {
 }
 
 func (c deflateCodec) Decompress(src []byte) ([]byte, error) {
+	return c.DecompressBounded(src, 0)
+}
+
+func (deflateCodec) DecompressBounded(src []byte, max int64) ([]byte, error) {
 	r := flate.NewReader(bytes.NewReader(src))
 	defer r.Close()
-	if c.maxOut <= 0 {
+	if max <= 0 {
+		// flate.NewReader streams without a header length, so io.ReadAll grows
+		// unbounded — a deflate "zip bomb" decompresses to arbitrary size. Only
+		// the trusted writer path (and an explicit "no limit") reaches here.
 		return io.ReadAll(r)
 	}
-	// Read at most maxOut+1 bytes: if the stream yields more, it exceeds the
-	// limit and we reject without materializing the whole bomb. Guard the +1
-	// against int64 overflow — maxOut == MaxInt64 ("effectively unlimited")
-	// would wrap to MinInt64, making io.LimitReader read zero bytes and
-	// silently truncate a valid block to empty.
-	limit := c.maxOut
+	// Read at most max+1 bytes: if the stream yields more, it exceeds the limit
+	// and we reject without materializing the whole bomb. Guard the +1 against
+	// int64 overflow — max == MaxInt64 ("effectively unlimited") would wrap to
+	// MinInt64, making io.LimitReader read zero bytes and silently truncate a
+	// valid block to empty.
+	limit := max
 	if limit < math.MaxInt64 {
 		limit++
 	}
@@ -1134,19 +1168,13 @@ func (c deflateCodec) Decompress(src []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(out)) > c.maxOut {
-		return nil, fmt.Errorf("ocf: decompressed block exceeds limit of %d bytes (raise WithMaxDecompressedBlockBytes)", c.maxOut)
+	if int64(len(out)) > max {
+		return nil, fmt.Errorf("ocf: decompressed block exceeds limit of %d bytes (raise WithMaxDecompressedBlockBytes)", max)
 	}
 	return out, nil
 }
 
-type snappyCodec struct {
-	// maxOut bounds the decompressed output (0 = unlimited). snappy.Decode
-	// pre-allocates from a length declared in the frame header (up to ~4 GiB
-	// in a few bytes), so the cap is checked via DecodedLen BEFORE Decode
-	// allocates.
-	maxOut int64
-}
+type snappyCodec struct{}
 
 func (snappyCodec) Name() string { return "snappy" }
 func (snappyCodec) Close() error { return nil }
@@ -1158,19 +1186,23 @@ func (snappyCodec) Compress(src []byte) ([]byte, error) {
 }
 
 func (c snappyCodec) Decompress(src []byte) ([]byte, error) {
+	return c.DecompressBounded(src, 0)
+}
+
+func (snappyCodec) DecompressBounded(src []byte, max int64) ([]byte, error) {
 	if len(src) < 4 {
 		return nil, errors.New("ocf: snappy data too short for CRC checksum")
 	}
 	body := src[:len(src)-4]
-	if c.maxOut > 0 {
+	if max > 0 {
 		// snappy.Decode allocates the declared length up front; reject an
 		// over-limit declaration before that allocation happens.
 		n, err := snappy.DecodedLen(body)
 		if err != nil {
 			return nil, err
 		}
-		if int64(n) > c.maxOut {
-			return nil, fmt.Errorf("ocf: decompressed block (%d bytes) exceeds limit of %d bytes (raise WithMaxDecompressedBlockBytes)", n, c.maxOut)
+		if int64(n) > max {
+			return nil, fmt.Errorf("ocf: decompressed block (%d bytes) exceeds limit of %d bytes (raise WithMaxDecompressedBlockBytes)", n, max)
 		}
 	}
 	decoded, err := snappy.Decode(nil, body)
@@ -1184,8 +1216,12 @@ func (c snappyCodec) Decompress(src []byte) ([]byte, error) {
 }
 
 type zstdCodec struct {
-	enc *zstd.Encoder
-	dec *zstd.Decoder
+	enc   *zstd.Encoder
+	dopts []zstd.DOption
+
+	decOnce sync.Once
+	dec     *zstd.Decoder
+	decErr  error
 }
 
 func (*zstdCodec) Name() string { return "zstandard" }
@@ -1195,50 +1231,52 @@ func (c *zstdCodec) Compress(src []byte) ([]byte, error) {
 }
 
 func (c *zstdCodec) Decompress(src []byte) ([]byte, error) {
+	return c.DecompressBounded(src, 0)
+}
+
+// DecompressBounded lazily builds the decoder on first use, applying max as
+// zstd.WithDecoderMaxMemory so DecodeAll refuses a frame whose declared window
+// would inflate past the cap — the window bound an output limiter cannot
+// provide. The decoder is cached and reused (preserving zstd's decoder reuse),
+// so per the [BoundedDecompressor] contract only the first call's max is
+// honored (max is constant across a Reader's blocks).
+func (c *zstdCodec) DecompressBounded(src []byte, max int64) ([]byte, error) {
+	c.decOnce.Do(func() {
+		dopts := append([]zstd.DOption{zstd.WithDecoderConcurrency(1)}, c.dopts...)
+		if max > 0 {
+			m := uint64(max)
+			if m < 1<<20 { // a floor keeps very small caps within the decoder's accepted range
+				m = 1 << 20
+			}
+			dopts = append(dopts, zstd.WithDecoderMaxMemory(m))
+		}
+		c.dec, c.decErr = zstd.NewReader(nil, dopts...)
+	})
+	if c.decErr != nil {
+		return nil, fmt.Errorf("ocf: creating zstd decoder: %w", c.decErr)
+	}
 	return c.dec.DecodeAll(src, nil)
 }
 
 func (c *zstdCodec) Close() error {
 	c.enc.Close()
-	c.dec.Close()
+	if c.dec != nil {
+		c.dec.Close()
+	}
 	return nil
 }
 
-// resolveCodec returns the codec named in the file header. maxDecompressed
-// (0 = unlimited) bounds the decompressed size of a block for the built-in
-// codecs that inflate untrusted input; a genuine third-party custom codec
-// matched by name is returned as-is (its allocation is the implementor's
-// responsibility — the reader still applies the post-decompress length
-// backstop).
-func resolveCodec(name string, custom []Codec, maxDecompressed int64) (Codec, error) {
+// resolveCodec returns the codec named in the file header. A custom codec
+// matched by name is returned as-is. The per-block decompression bound
+// (WithMaxDecompressedBlockBytes) is NOT injected here: the reader passes it to
+// the codec at decode time via [BoundedDecompressor.DecompressBounded], which
+// every built-in implements — so the bound governs name-resolved and
+// WithCodec-supplied codecs uniformly, including a codec instance constructed
+// before NewReader. A custom codec that does not implement BoundedDecompressor
+// decompresses unbounded.
+func resolveCodec(name string, custom []Codec) (Codec, error) {
 	for _, c := range custom {
 		if c.Name() == name {
-			// A user who supplies a built-in codec INSTANCE via WithCodec
-			// (ocf.DeflateCodec(…) / ocf.SnappyCodec()) gets one whose
-			// decompression bound defaults to 0 (unbounded). Unlike a genuine
-			// third-party custom codec — whose internals the reader cannot see,
-			// so it can only backstop the size after Decompress returns — these
-			// the reader DOES know how to bound: inject maxDecompressed so they
-			// prevent an over-cap allocation up front, exactly like the
-			// name-resolved built-in below. Without this, a reader configured
-			// with a built-in codec instance decompresses the whole block before
-			// the backstop rejects it (deflate via an unbounded io.ReadAll, so a
-			// tiny deflate bomb OOMs the process). maxDecompressed==0 (the
-			// trusted append path) leaves them unbounded, as intended.
-			if maxDecompressed > 0 {
-				switch cc := c.(type) {
-				case deflateCodec:
-					if cc.maxOut <= 0 {
-						cc.maxOut = maxDecompressed
-						return cc, nil
-					}
-				case snappyCodec:
-					if cc.maxOut <= 0 {
-						cc.maxOut = maxDecompressed
-						return cc, nil
-					}
-				}
-			}
 			return c, nil
 		}
 	}
@@ -1246,28 +1284,13 @@ func resolveCodec(name string, custom []Codec, maxDecompressed int64) (Codec, er
 	case "null":
 		return nullCodec{}, nil
 	case "deflate":
-		return deflateCodec{level: flate.DefaultCompression, maxOut: maxDecompressed}, nil
+		return deflateCodec{level: flate.DefaultCompression}, nil
 	case "snappy":
-		return snappyCodec{maxOut: maxDecompressed}, nil
+		return snappyCodec{}, nil
 	case "zstandard":
-		return ZstdCodec(nil, zstdReaderDopts(maxDecompressed))
+		return ZstdCodec(nil, nil)
 	}
 	return nil, fmt.Errorf("ocf: unknown codec %q", truncForError(name))
-}
-
-// zstdReaderDopts caps the zstd decoder's output memory so DecodeAll rejects a
-// block that would inflate beyond maxDecompressed, instead of allocating up to
-// the library default (64 GiB). A floor keeps the value within the decoder's
-// accepted range for very small caps.
-func zstdReaderDopts(maxDecompressed int64) []zstd.DOption {
-	if maxDecompressed <= 0 {
-		return nil
-	}
-	m := uint64(maxDecompressed)
-	if m < 1<<20 {
-		m = 1 << 20
-	}
-	return []zstd.DOption{zstd.WithDecoderMaxMemory(m)}
 }
 
 // truncForError caps a wire-derived string at 80 chars for inclusion in

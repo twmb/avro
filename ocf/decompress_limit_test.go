@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -108,10 +109,11 @@ func TestRegression_OCFDecompressionAmplificationBounded(t *testing.T) {
 		})
 	}
 
-	// null codec: the post-decompress backstop bounds the count loop. A 2 MiB
-	// raw block (no compression) over a 1 MiB limit is rejected before the
-	// decode loop runs.
-	t.Run("null-count-loop-backstop", func(t *testing.T) {
+	// null codec: DecompressBounded rejects an over-cap raw block (the
+	// "decompressed" size IS the input size), which also bounds the count loop.
+	// A 2 MiB raw block (no compression) over a 1 MiB limit is rejected before
+	// the decode loop runs.
+	t.Run("null-count-loop-bounded", func(t *testing.T) {
 		raw := make([]byte, 2<<20)
 		data := ocfWith(`"null"`, "null", 1, raw)
 		r, err := NewReader(bytes.NewReader(data), WithMaxDecompressedBlockBytes(limit))
@@ -149,8 +151,8 @@ func TestRegression_OCFDecompressionAmplificationBounded(t *testing.T) {
 
 // A user expressing "no practical decompressed-size limit" as math.MaxInt64
 // (rather than the documented 0) must still read a valid deflate-compressed
-// OCF. deflateCodec.Decompress reads io.LimitReader(r, maxOut+1) to detect
-// over-limit without materializing the bomb; at maxOut==MaxInt64 the +1
+// OCF. deflateCodec.DecompressBounded reads io.LimitReader(r, max+1) to detect
+// over-limit without materializing the bomb; at max==MaxInt64 the +1
 // overflows to MinInt64, LimitReader returns 0 bytes, the block decodes as
 // empty, and a valid file fails to read. The bound must not invert at its own
 // extreme value. The default-limit and limit==0 (unlimited) paths are the
@@ -172,8 +174,8 @@ func TestRegression_OCFDeflateDecompressLimitMaxInt(t *testing.T) {
 		}
 		return buf.Bytes()
 	}
-	// Reader auto-selects the built-in deflate codec from the header; the
-	// codec's maxOut is set from WithMaxDecompressedBlockBytes.
+	// Reader auto-selects the built-in deflate codec from the header; the cap is
+	// passed to its DecompressBounded from WithMaxDecompressedBlockBytes.
 	for _, tc := range []struct {
 		name  string
 		limit int64
@@ -197,4 +199,103 @@ func TestRegression_OCFDeflateDecompressLimitMaxInt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A zstd codec supplied as an INSTANCE via WithCodec is bounded by the reader's
+// WithMaxDecompressedBlockBytes, the same as a name-resolved zstd codec: the
+// decoder is built lazily with zstd.WithDecoderMaxMemory from the cap. A frame
+// inflating past the cap is rejected; the same frame under a raised cap decodes.
+func TestRegression_OCFSuppliedZstdInstanceBounded(t *testing.T) {
+	const limit = 1 << 20
+	const bombLen = 4 << 20
+	zeros := make([]byte, bombLen)
+	zenc, _ := zstd.NewWriter(nil)
+	zst := zenc.EncodeAll(zeros, nil)
+	zenc.Close()
+	data := ocfWith(`"null"`, "zstandard", 1, zst)
+
+	for _, sc := range []struct {
+		name  string
+		codec func() Codec
+	}{
+		{"instance", func() Codec { c, _ := ZstdCodec(nil, nil); return c }},
+	} {
+		t.Run(sc.name+"/rejected-at-limit", func(t *testing.T) {
+			r, err := NewReader(bytes.NewReader(data), WithCodec(sc.codec()), WithMaxDecompressedBlockBytes(limit))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			var v any
+			if err := r.Decode(&v); err == nil || !strings.Contains(err.Error(), "exceeds") {
+				t.Errorf("supplied zstd %s: 4 MiB frame under a 1 MiB cap: want over-limit rejection, got %v", sc.name, err)
+			}
+		})
+		t.Run(sc.name+"/accepted-when-raised", func(t *testing.T) {
+			r, err := NewReader(bytes.NewReader(data), WithCodec(sc.codec()), WithMaxDecompressedBlockBytes(8<<20))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			var v any
+			if err := r.Decode(&v); err != nil && strings.Contains(err.Error(), "exceeds") {
+				t.Errorf("supplied zstd %s under a raised cap was still rejected as over-limit: %v", sc.name, err)
+			}
+		})
+	}
+}
+
+// rawCodec is a no-op "compression" codec: the stored block IS the raw bytes.
+type rawCodec struct{ name string }
+
+func (c rawCodec) Name() string                        { return c.name }
+func (rawCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
+func (rawCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
+func (rawCodec) Close() error                          { return nil }
+
+// boundedRawCodec adds the BoundedDecompressor capability to rawCodec.
+type boundedRawCodec struct{ rawCodec }
+
+func (boundedRawCodec) DecompressBounded(src []byte, max int64) ([]byte, error) {
+	if max > 0 && int64(len(src)) > max {
+		return nil, fmt.Errorf("rawcodec: %d bytes exceeds limit of %d", len(src), max)
+	}
+	return src, nil
+}
+
+// A custom codec implementing BoundedDecompressor is bounded by the reader's
+// WithMaxDecompressedBlockBytes; a custom codec that does NOT implement it is
+// honestly unbounded — the reader adds no post-decompression backstop (false
+// comfort once the block is allocated). This pins the capability contract that
+// replaced the type-asserted "is this a built-in instance" recognition.
+func TestRegression_OCFCustomCodecBoundedDecompressorContract(t *testing.T) {
+	const limit = 1 << 20
+	raw := make([]byte, 4<<20) // 4 MiB "compressed" block == 4 MiB decompressed
+
+	t.Run("implements-bounded/rejected", func(t *testing.T) {
+		data := ocfWith(`"null"`, "bnd", 1, raw)
+		r, err := NewReader(bytes.NewReader(data), WithCodec(boundedRawCodec{rawCodec{"bnd"}}), WithMaxDecompressedBlockBytes(limit))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		var v any
+		if err := r.Decode(&v); err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Errorf("bounded custom codec: 4 MiB block over a 1 MiB cap: want rejection, got %v", err)
+		}
+	})
+	t.Run("plain/unbounded", func(t *testing.T) {
+		data := ocfWith(`"null"`, "unb", 1, raw)
+		r, err := NewReader(bytes.NewReader(data), WithCodec(rawCodec{"unb"}), WithMaxDecompressedBlockBytes(limit))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		// No BoundedDecompressor => the cap does not apply. The decode fails on
+		// the null schema's trailing bytes, NOT with an over-limit rejection.
+		var v any
+		if err := r.Decode(&v); err != nil && strings.Contains(err.Error(), "exceeds") {
+			t.Errorf("plain custom codec must be unbounded (no over-limit reject), got %v", err)
+		}
+	})
 }

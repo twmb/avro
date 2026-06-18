@@ -2596,7 +2596,7 @@ func TestWithSchema(t *testing.T) {
 func TestResolveCodecCustomOverridesBuiltin(t *testing.T) {
 	// A custom codec with a built-in name should override the built-in.
 	custom := &testCodec{name: "zstandard"}
-	codec, err := resolveCodec("zstandard", []Codec{custom}, 0)
+	codec, err := resolveCodec("zstandard", []Codec{custom})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2691,11 +2691,18 @@ func TestZstdCodecBadEncoderOption(t *testing.T) {
 }
 
 func TestZstdCodecBadDecoderOption(t *testing.T) {
-	_, err := ZstdCodec(nil, []zstd.DOption{zstd.WithDecoderConcurrency(-1)})
-	if err == nil {
-		t.Fatal("expected error for invalid zstd decoder option")
+	// The decoder is built lazily on first decompress (so the reader's per-block
+	// cap can be folded in), so an invalid decoder option surfaces there rather
+	// than at construction — and a write-only codec with a bad decoder option
+	// never builds the decoder, so it stays usable.
+	c, err := ZstdCodec(nil, []zstd.DOption{zstd.WithDecoderConcurrency(-1)})
+	if err != nil {
+		t.Fatalf("ZstdCodec should defer decoder construction, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "zstd") {
+	defer c.Close()
+	if _, err := c.Decompress([]byte("whatever")); err == nil {
+		t.Fatal("expected error for invalid zstd decoder option on first decompress")
+	} else if !strings.Contains(err.Error(), "zstd") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
