@@ -90,6 +90,10 @@ type slab struct {
 	tagLogicalTypes bool
 }
 
+// slabSize is the string-interning slab batch: short decoded strings are
+// sub-allocated from one shared buffer to amortize allocation. Perf-only —
+// not a correctness or safety bound; a larger value batches more, a smaller
+// one less.
 const slabSize = 1024
 
 func (s *slab) string(src []byte, n int) string {

@@ -301,3 +301,88 @@ func TestRegression_OCFCustomCodecBoundedDecompressorContract(t *testing.T) {
 		}
 	})
 }
+
+// A sub-1-MiB WithMaxDecompressedBlockBytes must bound a zstd block exactly, not
+// silently round up to 1 MiB. The reader builds the zstd decoder with
+// zstd.WithDecoderMaxMemory set from the cap, clamped up only to
+// zstd.MinWindowSize (1 KiB), so a 512 KiB block is rejected under a 256 KiB cap
+// yet accepted under a 1 MiB cap. Were the minimum mistakenly 1 MiB, the 256 KiB
+// cap would be raised to 1 MiB and the 512 KiB block would slip through — the
+// regression this pins.
+func TestRegression_OCFZstdSubMiBCapHonored(t *testing.T) {
+	s := avro.MustParse(`"bytes"`)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s, WithCodec(MustZstdCodec(nil, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(make([]byte, 512<<10)); err != nil { // one ~512 KiB zstd block
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file := buf.Bytes()
+
+	read := func(capBytes int64) error {
+		r, err := NewReader(bytes.NewReader(file),
+			WithCodec(MustZstdCodec(nil, nil)),
+			WithMaxDecompressedBlockBytes(capBytes))
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		var v []byte
+		return r.Decode(&v)
+	}
+
+	// 512 KiB block under a 256 KiB cap: the cap is below the block, so it must
+	// be rejected as over-limit, not accepted by a silent floor-up to 1 MiB.
+	if err := read(256 << 10); err == nil {
+		t.Fatalf("512 KiB zstd block accepted under a 256 KiB cap: the cap was floored up instead of honored")
+	} else if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("256 KiB cap: want an over-limit rejection, got %v", err)
+	}
+	// Same block under a 1 MiB cap: above the block, so it decodes.
+	if err := read(1 << 20); err != nil && strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("512 KiB block rejected under a 1 MiB cap: %v", err)
+	}
+}
+
+// A cap below zstd.MinWindowSize (1 KiB) must be raised UP to MinWindowSize, not
+// passed through: the decoder rejects any WithDecoderMaxMemory below a frame's
+// window, and every frame's window is at least MinWindowSize, so a sub-1-KiB cap
+// left as-is would spuriously reject even a tiny valid block. The MinWindowSize
+// minimum keeps a small datum decodable; removing it (or lowering it below
+// MinWindowSize) makes this block reject — the property this pins.
+func TestRegression_OCFZstdTinyCapFloorsAtMinWindow(t *testing.T) {
+	s := avro.MustParse(`"bytes"`)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s, WithCodec(MustZstdCodec(nil, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode(make([]byte, 100)); err != nil { // tiny block, well under MinWindowSize
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 512-byte cap is below MinWindowSize; it is raised up to 1 KiB so the tiny
+	// frame still decodes rather than tripping the decoder's window minimum.
+	r, err := NewReader(bytes.NewReader(buf.Bytes()),
+		WithCodec(MustZstdCodec(nil, nil)),
+		WithMaxDecompressedBlockBytes(512))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	var v []byte
+	if err := r.Decode(&v); err != nil {
+		t.Fatalf("tiny zstd block spuriously rejected under a sub-MinWindowSize cap (floor missing or below MinWindowSize): %v", err)
+	}
+	if len(v) != 100 {
+		t.Fatalf("decoded %d bytes, want 100", len(v))
+	}
+}

@@ -370,8 +370,10 @@ func SnappyCodec() Codec { return snappyCodec{} }
 // [zstd.WithDecoderMaxMemory] set from the cap. The decoder is then cached, so
 // a ZstdCodec shared across readers with different caps honors the first
 // reader's cap (set [zstd.WithDecoderMaxMemory] in dopts to pin a specific
-// bound regardless of reader). The cap floors at 1 MiB to stay within the
-// decoder's accepted range.
+// bound regardless of reader). A cap below [zstd.MinWindowSize] (1 KiB) is
+// raised up to it — the smallest window the decoder accepts; a smaller limit
+// would reject every frame, since each frame's window is at least
+// MinWindowSize. At or above that bound a sub-MiB cap is honored exactly.
 func ZstdCodec(eopts []zstd.EOption, dopts []zstd.DOption) (Codec, error) {
 	eopts = append([]zstd.EOption{zstd.WithEncoderConcurrency(1)}, eopts...)
 	enc, err := zstd.NewWriter(nil, eopts...)
@@ -1267,8 +1269,14 @@ func (c *zstdCodec) DecompressBounded(src []byte, max int64) ([]byte, error) {
 		dopts := append([]zstd.DOption{zstd.WithDecoderConcurrency(1)}, c.dopts...)
 		if max > 0 {
 			m := uint64(max)
-			if m < 1<<20 { // a floor keeps very small caps within the decoder's accepted range
-				m = 1 << 20
+			// Raise a sub-1-KiB cap up to zstd.MinWindowSize: the decoder gives
+			// every frame a window of at least MinWindowSize and clamps its
+			// max-window down to WithDecoderMaxMemory, so a cap below
+			// MinWindowSize would reject even a tiny valid frame. At or above
+			// that bound the cap is exact — a sub-MiB
+			// WithMaxDecompressedBlockBytes bounds zstd to the byte.
+			if m < zstd.MinWindowSize {
+				m = zstd.MinWindowSize
 			}
 			dopts = append(dopts, zstd.WithDecoderMaxMemory(m))
 		}
