@@ -281,11 +281,17 @@ func serNullUnionAt(u *serUnion, valIdx int, nullByte, valByte byte) serfn {
 // layers (handling &nilPtr — a **T with non-nil outer pointer wrapping a
 // nil *T) and treats nil Map / Slice / Chan / Func as nil. The accept
 // set matches serNull (ser.go) and appendAvroJSON's case "null" arm
-// (json_codec.go) exactly so the four dispatch sites — binary 2-branch
+// (json_codec.go) exactly so the five dispatch sites — binary 2-branch
 // optimization (serNullUnionAt), binary 3-branch try-each (serUnion.ser
 // → serNull), JSON 2-branch optimization (appendAvroJSONUnion's
-// 2-branch nil short-circuit), and JSON try-each (case "null") —
-// agree on what counts as nil.
+// 2-branch nil short-circuit), JSON try-each (case "null"), and the
+// unsafe struct fast path (usNullUnionEnter / usArrayNullUnionPtr) —
+// agree on what counts as nil. The unsafe site cannot call isNilValue
+// (it operates on an unsafe.Pointer, not a reflect.Value): it tests only
+// the outer pointer, which equals isNilValue exactly when the inner kind
+// is not itself nilable, so its tryCompileFieldSer gate declines every
+// isNilableKind inner to the reflect path — keeping it in lockstep
+// without re-implementing the peel.
 //
 // Capped at maxIndirectDepth so a self-referential interface
 // (var p any; p = &p) terminates instead of looping forever; treat
@@ -312,9 +318,29 @@ func isNilValue(v reflect.Value) bool {
 		}
 		v = v.Elem()
 	}
-	switch v.Kind() {
-	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+	// The bottom kind set is shared with the unsafe fast-path gate via
+	// isNilableKind, so the two can't drift on which kinds count as nil.
+	if isNilableKind(v.Kind()) {
 		return v.IsNil()
+	}
+	return false
+}
+
+// isNilableKind reports whether k is one of the kinds isNilValue treats as
+// nil-equivalent at the bottom of its pointer/interface peel. It is the
+// gatekeeper for the unsafe null-union fast paths: usNullUnionEnter /
+// usArrayNullUnionPtr decide null-vs-value by testing ONLY the outer pointer
+// (*(*unsafe.Pointer)(p) == nil), which equals isNilValue exactly when the
+// pointed-to inner is NOT itself nilable. When the inner kind IS nilable — a
+// non-nil *T pointing at a nil slice/map/interface/pointer — isNilValue peels
+// further and reports null where the bare outer-pointer test reports value, so
+// the null-union field and array-element gates decline such inners to the
+// reflect path (which consults isNilValue). Mirrors isNilValue's bottom switch
+// so the two cannot drift.
+func isNilableKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		return true
 	}
 	return false
 }

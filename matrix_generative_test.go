@@ -1769,3 +1769,233 @@ func TestMatrix_GenerativePointerIndirectionUnsafeContainers(t *testing.T) {
 		}
 	}
 }
+
+// ===========================================================================
+// Null-union nil-equivalence parity net (field-of-container).
+//
+// The 2-branch ["null",T] / [T,"null"] optimization picks the null branch
+// exactly when isNilValue reports the value nil — which peels pointer/interface
+// layers then nil-checks the bottom kind, so a non-nil pointer to a nil
+// slice/map/interface/pointer is null. Three encode paths must agree on the
+// branch for the SAME value: the unsafe struct fast path (reached only when the
+// struct is addressable, Encode(&v)), the reflect path (Encode(v)), and JSON
+// (EncodeJSON). This net crosses nil-equivalent base kind × container context ×
+// union position and asserts all three pick the same branch. The unsafe fast
+// path makes its nil decision on the outer pointer alone, so it must DECLINE
+// every isNilableKind inner to the reflect path; this net is what proves it.
+// ===========================================================================
+
+// nilEqThreeWayParity asserts that addr (addressable -> unsafe fast path) and
+// val (by value -> reflect path) encode to byte-identical binary, that the two
+// JSON encodings agree, and that the binary and JSON wires decode to the same
+// value (cross-format branch agreement). target1/target2 are fresh decode
+// destinations of the value's concrete type.
+func nilEqThreeWayParity(t *testing.T, schemaJSON string, addr, val, target1, target2 any) {
+	t.Helper()
+	s := avro.MustParse(schemaJSON)
+
+	wAddr, err := s.AppendEncode(nil, addr)
+	if err != nil {
+		t.Fatalf("Encode(&v) [unsafe]: %v", err)
+	}
+	wVal, err := s.AppendEncode(nil, val)
+	if err != nil {
+		t.Fatalf("Encode(v) [reflect]: %v", err)
+	}
+	if !bytes.Equal(wAddr, wVal) {
+		t.Errorf("binary addressable-vs-value branch divergence: Encode(&v)=% x  Encode(v)=% x", wAddr, wVal)
+	}
+
+	jAddr, err := s.AppendEncodeJSON(nil, addr)
+	if err != nil {
+		t.Fatalf("EncodeJSON(&v): %v", err)
+	}
+	jVal, err := s.AppendEncodeJSON(nil, val)
+	if err != nil {
+		t.Fatalf("EncodeJSON(v): %v", err)
+	}
+	if !bytes.Equal(jAddr, jVal) {
+		t.Errorf("JSON addressable-vs-value branch divergence: %s vs %s", jAddr, jVal)
+	}
+
+	if _, err := s.Decode(wAddr, target1); err != nil {
+		t.Fatalf("Decode(binary wire % x): %v", wAddr, err)
+	}
+	if err := s.DecodeJSON(jAddr, target2); err != nil {
+		t.Fatalf("DecodeJSON(%s): %v", jAddr, err)
+	}
+	if !reflect.DeepEqual(target1, target2) {
+		t.Errorf("binary<->JSON branch divergence: binary=%#v  json=%#v  (binWire=% x jsonWire=%s)", target1, target2, wAddr, jAddr)
+	}
+}
+
+func TestMatrix_NullUnionNilEquivalenceParity(t *testing.T) {
+	recField := func(inner string) string {
+		return `{"type":"record","name":"R","fields":[{"name":"f","type":` + inner + `}]}`
+	}
+	recArr := func(items string) string {
+		return `{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":` + items + `}}]}`
+	}
+	recMapVal := func(values string) string {
+		return `{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"map","values":` + values + `}}]}`
+	}
+	nf := func(x string) string { return `["null",` + x + `]` }
+	ns := func(x string) string { return `[` + x + `,"null"]` }
+
+	cases := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		// ----- FIELD context: *Inner, slice base, both positions -----
+		{"field/slice/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				F *[]string `avro:"f"`
+			}
+			var x []string
+			nilEqThreeWayParity(t, recField(nf(`{"type":"array","items":"string"}`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		{"field/slice/null-second/nil", func(t *testing.T) {
+			type rec struct {
+				F *[]string `avro:"f"`
+			}
+			var x []string
+			nilEqThreeWayParity(t, recField(ns(`{"type":"array","items":"string"}`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		{"field/slice/null-first/nonnil-control", func(t *testing.T) {
+			type rec struct {
+				F *[]string `avro:"f"`
+			}
+			x := []string{"a", "b"}
+			nilEqThreeWayParity(t, recField(nf(`{"type":"array","items":"string"}`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		// ----- FIELD context: bytes base (also a Slice inner) -----
+		{"field/bytes/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				F *[]byte `avro:"f"`
+			}
+			var x []byte
+			nilEqThreeWayParity(t, recField(nf(`"bytes"`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		{"field/bytes/null-first/nonnil-control", func(t *testing.T) {
+			type rec struct {
+				F *[]byte `avro:"f"`
+			}
+			x := []byte{1, 2, 3}
+			nilEqThreeWayParity(t, recField(nf(`"bytes"`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		// ----- FIELD context: map base -----
+		{"field/map/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				F *map[string]string `avro:"f"`
+			}
+			var x map[string]string
+			nilEqThreeWayParity(t, recField(nf(`{"type":"map","values":"string"}`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		{"field/map/null-first/nonnil-control", func(t *testing.T) {
+			type rec struct {
+				F *map[string]string `avro:"f"`
+			}
+			x := map[string]string{"k": "v"}
+			nilEqThreeWayParity(t, recField(nf(`{"type":"map","values":"string"}`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		// ----- FIELD context: **T (pointer inner), both positions -----
+		{"field/ptrptr/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				F **int `avro:"f"`
+			}
+			var x *int
+			nilEqThreeWayParity(t, recField(nf(`"int"`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		{"field/ptrptr/null-second/nil", func(t *testing.T) {
+			type rec struct {
+				F **int `avro:"f"`
+			}
+			var x *int
+			nilEqThreeWayParity(t, recField(ns(`"int"`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		{"field/ptrptr/null-first/nonnil-control", func(t *testing.T) {
+			type rec struct {
+				F **int `avro:"f"`
+			}
+			n := 7
+			x := &n
+			nilEqThreeWayParity(t, recField(nf(`"int"`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		// ----- FIELD context: deep chain ***int -----
+		{"field/deep-ptr/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				F ***int `avro:"f"`
+			}
+			var x **int
+			nilEqThreeWayParity(t, recField(nf(`"int"`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		// ----- FIELD context: interface inner (*any) -----
+		{"field/iface/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				F *any `avro:"f"`
+			}
+			var x any
+			nilEqThreeWayParity(t, recField(nf(`"int"`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
+		}},
+		// ----- ARRAY-ELEMENT context: []*Inner -----
+		{"array-elem/slice/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				A []*[]string `avro:"a"`
+			}
+			var x []string
+			nilEqThreeWayParity(t, recArr(nf(`{"type":"array","items":"string"}`)), &rec{A: []*[]string{&x}}, rec{A: []*[]string{&x}}, &rec{}, &rec{})
+		}},
+		{"array-elem/slice/null-second/nil", func(t *testing.T) {
+			type rec struct {
+				A []*[]string `avro:"a"`
+			}
+			var x []string
+			nilEqThreeWayParity(t, recArr(ns(`{"type":"array","items":"string"}`)), &rec{A: []*[]string{&x}}, rec{A: []*[]string{&x}}, &rec{}, &rec{})
+		}},
+		{"array-elem/bytes/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				A []*[]byte `avro:"a"`
+			}
+			var x []byte
+			nilEqThreeWayParity(t, recArr(nf(`"bytes"`)), &rec{A: []*[]byte{&x}}, rec{A: []*[]byte{&x}}, &rec{}, &rec{})
+		}},
+		{"array-elem/ptrptr/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				A []**int `avro:"a"`
+			}
+			var x *int
+			nilEqThreeWayParity(t, recArr(nf(`"int"`)), &rec{A: []**int{&x}}, rec{A: []**int{&x}}, &rec{}, &rec{})
+		}},
+		{"array-elem/slice/null-first/nonnil-control", func(t *testing.T) {
+			type rec struct {
+				A []*[]string `avro:"a"`
+			}
+			x := []string{"z"}
+			nilEqThreeWayParity(t, recArr(nf(`{"type":"array","items":"string"}`)), &rec{A: []*[]string{&x}}, rec{A: []*[]string{&x}}, &rec{}, &rec{})
+		}},
+		// ----- MAP-VALUE context: map[string]*Inner (declines to reflect both) -----
+		{"map-value/slice/null-first/nil", func(t *testing.T) {
+			type rec struct {
+				M map[string]*[]string `avro:"m"`
+			}
+			var x []string
+			nilEqThreeWayParity(t, recMapVal(nf(`{"type":"array","items":"string"}`)), &rec{M: map[string]*[]string{"k": &x}}, rec{M: map[string]*[]string{"k": &x}}, &rec{}, &rec{})
+		}},
+		// ----- NESTED context: nullunion field inside a nested record -----
+		{"nested-record-field/slice/null-first/nil", func(t *testing.T) {
+			type inner struct {
+				F *[]string `avro:"f"`
+			}
+			type outer struct {
+				M inner `avro:"m"`
+			}
+			var x []string
+			sch := `{"type":"record","name":"O","fields":[{"name":"m","type":{"type":"record","name":"M","fields":[{"name":"f","type":["null",{"type":"array","items":"string"}]}]}}]}`
+			nilEqThreeWayParity(t, sch, &outer{M: inner{F: &x}}, outer{M: inner{F: &x}}, &outer{}, &outer{})
+		}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, c.run)
+	}
+}

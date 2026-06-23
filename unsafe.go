@@ -306,13 +306,18 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			return nil
 		}
 		innerGoType := goType.Elem()
-		// Multi-pointer (**T) nullunion: the value &(*T)(nil) — a non-nil
-		// outer pointer wrapping a nil inner — is nil-equivalent per
-		// isNilValue (it peels every level), so the reflect path encodes
-		// the null branch. The unsafe enter peels only the outer pointer
-		// and would commit to the value branch, then fault on the nil
-		// inner. Decline to the reflect path, which is correct here.
-		if innerGoType.Kind() == reflect.Pointer {
+		// The inner is nil-able beyond the outer pointer: a non-nil *T
+		// wrapping a nil pointer (**T), a nil slice (*[]E), a nil map
+		// (*map[K]V), or a nil interface (*iface) is nil-equivalent per
+		// isNilValue, which peels the outer pointer then nil-checks the
+		// bottom kind — so the reflect path encodes the null branch. The
+		// unsafe enter (usNullUnionEnter) tests ONLY the outer pointer and
+		// would commit to the value branch (then either emit an empty
+		// slice/map or fault on the nil inner). Decline the whole nilable
+		// inner set to the reflect path, which consults isNilValue; this
+		// gate is the fifth dispatch site isNilValue's contract names, kept
+		// in lockstep via the shared isNilableKind predicate.
+		if isNilableKind(innerGoType.Kind()) {
 			return nil
 		}
 		if inner.serRecord != nil {
@@ -340,11 +345,14 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			if elemGoType.Kind() != reflect.Pointer {
 				return nil
 			}
-			// Multi-pointer element ([]**T): &(*T)(nil) is nil-equivalent
-			// (isNilValue peels every level → null branch on reflect);
-			// the unsafe array enter peels only the outer pointer. Decline
-			// to the reflect path. (See the field nullunion case.)
-			if elemGoType.Elem().Kind() == reflect.Pointer {
+			// Element inner nil-able beyond the outer pointer ([]**T,
+			// []*[]E, []*map[K]V, []*iface): &(nilInner) is nil-equivalent
+			// per isNilValue (peels the outer pointer then nil-checks the
+			// bottom kind → null branch on reflect/JSON); the unsafe array
+			// enter tests only the outer pointer and would emit the value
+			// branch. Decline the whole nilable inner set to the reflect
+			// path. (See the field nullunion case; shared isNilableKind.)
+			if isNilableKind(elemGoType.Elem().Kind()) {
 				return nil
 			}
 			nullByte, valByte := nullUnionBytes(inner.nullSecond)
