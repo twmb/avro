@@ -531,6 +531,217 @@ func TestSchemaForDuration(t *testing.T) {
 	}
 }
 
+// avro.Duration is the dedicated Go type for the Avro "duration" logical type
+// (a fixed(12) carrying little-endian months/days/milliseconds — distinct from
+// the time.Duration→time-millis mapping in [TestSchemaForDuration] above).
+// SchemaFor recognizes it BY TYPE, with no tag, and must emit the duration
+// fixed wherever the type appears — bare field, *avro.Duration (nullable
+// union), slice/array element, map value, and nested-record field — never
+// decompose its exported uint32 fields into a {Months,Days,Milliseconds}
+// record. The metadata-tree assertions below are the neuter target: reverting
+// inferType's avroDurationType case turns every leaf back into that record and
+// reddens this test (the round-trips would still pass as a record, so the
+// shape assertion is what locks the behavior).
+func TestSchemaForAvroDuration(t *testing.T) {
+	dur := Duration{Months: 5, Days: 10, Milliseconds: 1234}
+
+	assertDurationFixed := func(t *testing.T, n SchemaNode) {
+		t.Helper()
+		if n.Type != "fixed" {
+			t.Fatalf("duration leaf Type = %q, want \"fixed\" (a record decomposition means the avroDurationType case did not fire)", n.Type)
+		}
+		if n.LogicalType != "duration" {
+			t.Errorf("duration leaf LogicalType = %q, want \"duration\"", n.LogicalType)
+		}
+		if n.Size != 12 {
+			t.Errorf("duration leaf Size = %d, want 12", n.Size)
+		}
+		if n.Name != "duration" {
+			t.Errorf("duration leaf Name = %q, want \"duration\"", n.Name)
+		}
+		if len(n.Fields) != 0 {
+			t.Errorf("duration leaf has %d record fields; it must not decompose into Months/Days/Milliseconds", len(n.Fields))
+		}
+	}
+
+	t.Run("bare", func(t *testing.T) {
+		type R struct {
+			D Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertDurationFixed(t, s.Root().Fields[0].Type)
+		// A single-field record's wire IS the field's encoding (no framing),
+		// so it must be exactly the 12-byte duration fixed — a decomposed
+		// record would emit three zig-zag varint longs (4 bytes here), so the
+		// length alone separates the two even before the byte compare.
+		w, err := s.Encode(R{D: dur})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		b := dur.Bytes()
+		if string(w) != string(b[:]) {
+			t.Fatalf("wire = %x, want the 12-byte duration fixed %x", w, b)
+		}
+		var got R
+		if _, err := s.Decode(w, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.D != dur {
+			t.Errorf("round-trip: got %v, want %v", got.D, dur)
+		}
+	})
+
+	t.Run("pointer-nullable", func(t *testing.T) {
+		type R struct {
+			D *Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ft := s.Root().Fields[0].Type
+		if ft.Type != "union" || len(ft.Branches) != 2 || ft.Branches[0].Type != "null" {
+			t.Fatalf("pointer field type = %+v, want [\"null\", duration]", ft)
+		}
+		assertDurationFixed(t, ft.Branches[1])
+		for _, v := range []*Duration{&dur, nil} {
+			w, err := s.Encode(R{D: v})
+			if err != nil {
+				t.Fatalf("encode %v: %v", v, err)
+			}
+			var got R
+			if _, err := s.Decode(w, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if (v == nil) != (got.D == nil) || (v != nil && *got.D != *v) {
+				t.Errorf("round-trip ptr: got %v want %v", got.D, v)
+			}
+		}
+	})
+
+	t.Run("slice", func(t *testing.T) {
+		type R struct {
+			D []Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ft := s.Root().Fields[0].Type
+		if ft.Type != "array" || ft.Items == nil {
+			t.Fatalf("slice field type = %+v, want array of duration", ft)
+		}
+		assertDurationFixed(t, *ft.Items)
+		rt := R{D: []Duration{dur, {}}}
+		w, err := s.Encode(rt)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(w, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(got.D) != 2 || got.D[0] != dur || got.D[1] != (Duration{}) {
+			t.Errorf("round-trip slice: got %v", got.D)
+		}
+	})
+
+	t.Run("array", func(t *testing.T) {
+		type R struct {
+			D [2]Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ft := s.Root().Fields[0].Type
+		if ft.Type != "array" || ft.Items == nil {
+			t.Fatalf("array field type = %+v, want array of duration", ft)
+		}
+		assertDurationFixed(t, *ft.Items)
+		w, err := s.Encode(R{D: [2]Duration{dur, {}}})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(w, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.D[0] != dur || got.D[1] != (Duration{}) {
+			t.Errorf("round-trip array: got %v", got.D)
+		}
+	})
+
+	t.Run("map", func(t *testing.T) {
+		type R struct {
+			D map[string]Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ft := s.Root().Fields[0].Type
+		if ft.Type != "map" || ft.Values == nil {
+			t.Fatalf("map field type = %+v, want map of duration", ft)
+		}
+		assertDurationFixed(t, *ft.Values)
+		w, err := s.Encode(R{D: map[string]Duration{"k": dur}})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(w, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.D["k"] != dur {
+			t.Errorf("round-trip map: got %v", got.D)
+		}
+	})
+
+	t.Run("nested-record-field", func(t *testing.T) {
+		type Inner struct {
+			D Duration `avro:"d"`
+		}
+		type R struct {
+			In Inner `avro:"in"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner := s.Root().Fields[0].Type
+		if inner.Type != "record" {
+			t.Fatalf("inner field type = %q, want record", inner.Type)
+		}
+		assertDurationFixed(t, inner.Fields[0].Type)
+	})
+}
+
+// A non-empty logical tag attached to an avro.Duration field is always a
+// mismatch — there is no "duration" tag option (recognition is purely by type),
+// so any tag the user wrote is one of uuid / decimal / a time logical, none of
+// which apply to the duration fixed. SchemaFor rejects it rather than silently
+// emitting the duration schema and dropping the tag, matching the strict-reject
+// posture of the time.Time/time.Duration/uuid/decimal arms.
+func TestSchemaForAvroDurationRejectsLogicalTag(t *testing.T) {
+	for _, tag := range []string{"uuid", "timestamp-millis", "date", "decimal(9,2)"} {
+		t.Run(tag, func(t *testing.T) {
+			st := reflect.StructOf([]reflect.StructField{{
+				Name: "D",
+				Type: avroDurationType,
+				Tag:  reflect.StructTag(`avro:"d,` + tag + `"`),
+			}})
+			seen := make(map[reflect.Type]seenForm)
+			if _, err := inferRecord(st, "R", "", seen, nil); err == nil {
+				t.Fatalf("avro.Duration with %q tag should be rejected", tag)
+			}
+		})
+	}
+}
+
 func TestSchemaForDecimal(t *testing.T) {
 	type Product struct {
 		Name  string  `avro:"name"`
@@ -3156,6 +3367,35 @@ func TestRegression_SchemaForNamedTypeNameCollision(t *testing.T) {
 	}
 }
 
+// The avro.Duration realization of the collision class the comment above
+// anticipates: avro.Duration infers a fixed named "duration" WITH
+// logicalType:"duration", and a plain `type duration [12]byte` field infers a
+// DIFFERENT fixed (size 12, no logicalType) also named "duration". Two
+// definitions claiming one Avro name is rejected by the same general
+// dedupNamedTypes check — not by any duration-specific code. The "two different"
+// assertion proves SchemaFor's dedup fired and not Parse's weaker
+// duplicate-name fallback: both messages contain "duration", so a bare
+// err != nil + name check would pass even with dedupNamedTypes' conflict arm
+// reverted (the exact hollow-pin failure mode a prior round shipped). Neuter-
+// confirm by reverting that arm: this pin must redden.
+func TestRegression_SchemaForAvroDurationCollision(t *testing.T) {
+	type duration [12]byte // plain fixed named "duration", NO logicalType
+	type R struct {
+		A Duration `avro:"a"` // avro.Duration -> fixed "duration" + logicalType:"duration"
+		B duration `avro:"b"` // plain [12]byte -> fixed "duration", no logicalType (conflict)
+	}
+	_, err := SchemaFor[R]()
+	if err == nil {
+		t.Fatal("want error: avro.Duration and a plain [12]byte both produce a fixed named \"duration\"")
+	}
+	if !strings.Contains(err.Error(), "duration") {
+		t.Fatalf("error should name the colliding type: %v", err)
+	}
+	if !strings.Contains(err.Error(), "two different") {
+		t.Fatalf("conflict should be caught by SchemaFor's dedup, not the Parse fallback: %v", err)
+	}
+}
+
 // default= takes the remainder of the tag verbatim, so a string default
 // whose value contains unbalanced parens/brackets — or commas, or JSON
 // object braces — must be preserved rather than rejected by the tag
@@ -3483,6 +3723,13 @@ func sampleValuePath(t reflect.Type, onPath map[reflect.Type]bool) reflect.Value
 		// so it round-trips identically.
 		return reflect.ValueOf(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC))
 	}
+	if t == avroDurationType {
+		// A representative NON-ZERO duration so the parity net exercises the
+		// 12-byte fixed payload rather than an all-zero wire. (Without this the
+		// Struct case below would zero each uint32 field — a valid round-trip
+		// but one that never moves a non-zero byte through the duration codec.)
+		return reflect.ValueOf(Duration{Months: 3, Days: 4, Milliseconds: 5})
+	}
 	switch t.Kind() {
 	case reflect.Pointer:
 		if onPath[t.Elem()] {
@@ -3585,8 +3832,12 @@ func TestSchemaForEncodeParity(t *testing.T) {
 		reflect.TypeFor[json.Number](),   // Kind String, codec rejects → SchemaFor must reject
 		reflect.TypeFor[time.Time](),     // Kind Struct → logical long
 		reflect.TypeFor[time.Duration](), // Kind Int64 → logical
-		reflect.TypeFor[big.Rat](),       // requires decimal tag → reject untagged
-		reflect.TypeFor[*big.Rat](),      // requires decimal tag → reject untagged
+		reflect.TypeFor[Duration](),      // Kind Struct → duration fixed(12), NOT a record
+		reflect.TypeFor[*Duration](),     // nullable duration fixed
+		reflect.TypeFor[[]Duration](),    // array of duration fixed
+		reflect.TypeFor[map[string]Duration](), // map of duration fixed
+		reflect.TypeFor[big.Rat](),             // requires decimal tag → reject untagged
+		reflect.TypeFor[*big.Rat](),            // requires decimal tag → reject untagged
 		// named aliases — distinct reflect.Type, must follow Kind honestly
 		reflect.TypeFor[namedString](), reflect.TypeFor[namedInt](), reflect.TypeFor[namedNumber](),
 		// pointers (nullable)

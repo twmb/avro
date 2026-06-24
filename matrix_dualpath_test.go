@@ -70,6 +70,15 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 		{"time-millis/time", `{"type":"int","logicalType":"time-millis"}`, time.Date(2020, 1, 1, 3, 14, 15, 0, time.UTC)},
 		{"time-micros/time", `{"type":"long","logicalType":"time-micros"}`, time.Date(2020, 1, 1, 3, 14, 15, 926000, time.UTC)},
 		{"duration-fixed", `{"type":"fixed","name":"Dur","size":12,"logicalType":"duration"}`, avro.Duration{Months: 1, Days: 2, Milliseconds: 3}},
+		// avro.Duration through the unsafe CONTAINER / POINTER field paths: the
+		// bare duration-fixed row above only reaches the scalar-field unsafe arm
+		// (usDuration). A nullable *avro.Duration field, a []avro.Duration field,
+		// and a map[string]avro.Duration field reach the null-union / usArray /
+		// usMap element handling for the duration leaf, held byte-identical to
+		// their reflect twins.
+		{"duration-ptr/nullable", `["null",{"type":"fixed","name":"DurP","size":12,"logicalType":"duration"}]`, func() *avro.Duration { d := avro.Duration{Months: 4, Days: 5, Milliseconds: 6}; return &d }()},
+		{"duration-slice", `{"type":"array","items":{"type":"fixed","name":"DurA","size":12,"logicalType":"duration"}}`, []avro.Duration{{Months: 1}, {Days: 2}}},
+		{"duration-map", `{"type":"map","values":{"type":"fixed","name":"DurM","size":12,"logicalType":"duration"}}`, map[string]avro.Duration{"k": {Milliseconds: 9}}},
 
 		{"decimal", `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`, rat(1234, 100)},
 		// uuid on a STRING carrier (usUUID/usFixedUUIDString string arm) —

@@ -188,6 +188,11 @@ func rtLeaves() []rtLeaf {
 		leaf(reflect.TypeFor[json.Number](), false),
 		leaf(reflect.TypeFor[time.Time](), false),
 		leaf(reflect.TypeFor[time.Duration](), false),
+		// avro.Duration is a struct whose Kind would mislead to a record, but
+		// inferType maps it to the duration fixed(12). It round-trips bit-exactly
+		// (three uint32s), so faithful: true. Any logical TAG on it is rejected
+		// (the duration logical takes no tag) — a clean reject the oracle allows.
+		leaf(reflect.TypeFor[Duration](), true),
 		leaf(reflect.TypeFor[big.Rat](), false),
 		leaf(reflect.TypeFor[*big.Rat](), false),
 		// text-interface combos over three base kinds (the text axis).

@@ -54,6 +54,7 @@ func goTypeCands() []goTypeCand {
 		{"jsonNumber", json.Number("1"), func() any { return new(json.Number) }},
 		{"time.Time", time.Unix(1, 0).UTC(), func() any { return new(time.Time) }},
 		{"bigRat", big.NewRat(1, 1), func() any { return new(*big.Rat) }},
+		{"avroDuration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, func() any { return new(avro.Duration) }},
 	}
 }
 
@@ -74,6 +75,7 @@ func paritySchemas() []paritySchema {
 		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`},
 		{"decimal", `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`},
 		{"uuid", `{"type":"string","logicalType":"uuid"}`},
+		{"duration", `{"type":"fixed","name":"duration","size":12,"logicalType":"duration"}`},
 		{"enum", `{"type":"enum","name":"E","symbols":["A","B","C"]}`},
 		{"null-union-long", `["null","long"]`},
 		{"union-string-long", `["string","long"]`},

@@ -71,6 +71,9 @@ func WithName(name string) SchemaOpt { return withName(name) }
 //     logicals — overriding it onto date or a timestamp-* logical maps a
 //     duration onto a point in time, and a large Duration overflows the
 //     narrower wire type)
+//   - avro.Duration → fixed(12) with the duration logical type (the dedicated
+//     Go type for the Avro duration logical — little-endian months/days/
+//     milliseconds; recognized by type, takes no tag, and does not accept one)
 //   - *big.Rat → requires explicit decimal(p,s) tag
 //   - [16]byte with uuid tag → fixed(16) with uuid logical type
 //   - string (or text marshaler type) with uuid tag → string with uuid logical type
@@ -950,6 +953,31 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		return inferTimeLike("timestamp-millis")
 	case durationType:
 		return inferTimeLike("time-millis")
+
+	case avroDurationType:
+		// avro.Duration is the dedicated Go type for the Avro duration logical:
+		// a fixed(12) whose bytes are little-endian months/days/milliseconds.
+		// Recognition is BY TYPE (avro.Duration is a struct, so this case must
+		// fire before the struct→record path below, which would otherwise
+		// decompose its exported uint32 fields into a record) — there is no
+		// "duration" tag option and none is needed: unlike *big.Rat→decimal,
+		// the duration logical carries no parameters, so the bare type
+		// suffices. A non-empty logical here is therefore always a tag the
+		// user mis-attached (uuid / decimal / a time logical); reject it
+		// rather than silently emitting the duration schema and dropping the
+		// tag, matching the strict-reject posture of the time/uuid/decimal
+		// arms. The fixed name "duration" is safe even when a plain
+		// `type duration [12]byte` is also present: dedupNamedTypes rejects any
+		// Avro name claimed by two different definitions.
+		if logical != "" {
+			return nil, fmt.Errorf("avro: avro.Duration maps to the duration logical type (a fixed(12)); it does not support logical type %q — remove the tag", logical)
+		}
+		return map[string]any{
+			"type":        "fixed",
+			"name":        "duration",
+			"size":        12,
+			"logicalType": "duration",
+		}, nil
 
 	case jsonNumberType:
 		// json.Number's Kind() is reflect.String, so the Kind switch below
