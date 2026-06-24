@@ -111,6 +111,20 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 		{"slice-null-union", `{"type":"array","items":["null","int"]}`, []*int32{nil, func() *int32 { x := int32(5); return &x }()}},
 	}
 
+	// Most rows round-trip value-faithfully, so the decoded field must equal the
+	// input. The two TIME-OF-DAY logicals are the exception: time-millis and
+	// time-micros encode only the clock time (ms/µs since midnight), and the
+	// decoder reconstructs that time-of-day at the 1970-01-01 UTC epoch
+	// reference — so a time.Time input keeps its time-of-day but NOT its date.
+	// Compare those rows against the epoch-dated expected value rather than the
+	// 2020-dated input (the input stays realistic; the date drop is documented
+	// here, not hidden by picking a 1970 input). Other rows fall through to
+	// r.value.
+	expectedDecode := map[string]any{
+		"time-millis/time": time.Date(1970, 1, 1, 3, 14, 15, 0, time.UTC),
+		"time-micros/time": time.Date(1970, 1, 1, 3, 14, 15, 926000, time.UTC),
+	}
+
 	for _, r := range rows {
 		t.Run(r.label, func(t *testing.T) {
 			fieldS := avro.MustParse(r.schema)
@@ -140,7 +154,14 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 				t.Fatalf("REFLECT↔UNSAFE WIRE DIVERGENCE for %s:\n reflect=%x\n unsafe =%x", r.label, topWire, recWire)
 			}
 
-			// Both wires must decode back through their own path.
+			// Both wires must decode back through their own path. The reflect/
+			// interface decode (into *any) is left a no-error SMOKE check: decode-
+			// into-any yields the package's canonical Go types (int32 for int,
+			// []any for arrays, map[string]any for records/maps), which do not
+			// match the concrete input types of the composite rows (inner,
+			// []inner, map[string]int32), so a value comparison here would be
+			// brittle. The value guarantee is enforced on the unsafe side below,
+			// where the field is type-aligned with the input.
 			var topBack any
 			if _, err := fieldS.Decode(topWire, &topBack); err != nil {
 				t.Fatalf("reflect decode of own wire: %v", err)
@@ -148,6 +169,22 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 			recBack := reflect.New(st)
 			if _, err := recS.Decode(recWire, recBack.Interface()); err != nil {
 				t.Fatalf("unsafe decode of own wire: %v", err)
+			}
+
+			// Decode-no-error is not enough: a value-wrong-but-non-erroring
+			// unsafe field decoder (e.g. a zeroed udDuration) would pass the
+			// check above while corrupting the value. Assert the decoded field
+			// round-trips to the expected value (the input, except for the
+			// time-of-day rows above). matEqual handles time.Time (monotonic/loc
+			// via Equal), *big.Rat (Cmp), and []byte, and DeepEqual-falls-through
+			// for the slice/map/pointer rows; the field is type-aligned with
+			// r.value (st was built from reflect.TypeOf).
+			want := r.value
+			if w, ok := expectedDecode[r.label]; ok {
+				want = w
+			}
+			if got := recBack.Elem().Field(0).Interface(); !matEqual(got, want) {
+				t.Fatalf("unsafe decode value mismatch for %s: got %#v, want %#v", r.label, got, want)
 			}
 		})
 	}
