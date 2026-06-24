@@ -132,7 +132,10 @@ func schemaForType(t reflect.Type, opts ...SchemaOpt) (*Schema, error) {
 	if err != nil {
 		return nil, err
 	}
-	s = dedupNamedTypes(s, make(map[string]string))
+	s, err = dedupNamedTypes(s, make(map[string]string))
+	if err != nil {
+		return nil, err
+	}
 	b, err := json.Marshal(s)
 	if err != nil {
 		return nil, fmt.Errorf("avro: marshaling inferred schema: %w", err)

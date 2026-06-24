@@ -3119,6 +3119,27 @@ func TestRegression_SchemaForUUIDNamedTypeMemoCollision(t *testing.T) {
 	})
 }
 
+// The "one Avro name -> one definition" invariant is enforced GENERALLY by
+// dedupNamedTypes, not just for uuid: two DIFFERENT Go types that map to the
+// same fixed/record/enum name with different content are rejected. Here an
+// anonymous [8]byte (auto-named "fixed_8") collides with a type literally named
+// fixed_8 of a different size. This is the same check that will guard
+// avro.Duration ("duration") against a plain [12]byte named "duration".
+func TestRegression_SchemaForNamedTypeNameCollision(t *testing.T) {
+	type fixed_8 [4]byte // the auto-name of an anonymous [8]byte is "fixed_8"
+	type R struct {
+		A [8]byte `avro:"a"` // -> fixed named "fixed_8", size 8
+		B fixed_8 `avro:"b"` // -> fixed named "fixed_8", size 4  (conflict)
+	}
+	_, err := SchemaFor[R]()
+	if err == nil {
+		t.Fatal("want error: two different fixeds both named \"fixed_8\"")
+	}
+	if !strings.Contains(err.Error(), "fixed_8") {
+		t.Fatalf("error should name the colliding type: %v", err)
+	}
+}
+
 // default= takes the remainder of the tag verbatim, so a string default
 // whose value contains unbalanced parens/brackets — or commas, or JSON
 // object braces — must be preserved rather than rejected by the tag
@@ -3406,7 +3427,10 @@ func schemaForFieldType(ft reflect.Type) (*Schema, error) {
 	if err != nil {
 		return nil, err
 	}
-	s = dedupNamedTypes(s, make(map[string]string))
+	s, err = dedupNamedTypes(s, make(map[string]string))
+	if err != nil {
+		return nil, err
+	}
 	b, err := json.Marshal(s)
 	if err != nil {
 		return nil, err

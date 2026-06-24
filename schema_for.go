@@ -103,7 +103,10 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	if err != nil {
 		return nil, err
 	}
-	s = dedupNamedTypes(s, make(map[string]string))
+	s, err = dedupNamedTypes(s, make(map[string]string))
+	if err != nil {
+		return nil, err
+	}
 	b, err := json.Marshal(s)
 	if err != nil {
 		return nil, fmt.Errorf("avro: marshaling inferred schema: %w", err)
@@ -111,49 +114,70 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	return Parse(string(b), opts...)
 }
 
-// dedupNamedTypes walks a JSON-like schema tree (maps, slices, strings)
-// and replaces duplicate named type definitions with name references.
-// Returns the (possibly rewritten) value. This handles the case where
-// SchemaFor emits the same named type (e.g. a fixed UUID) for multiple
-// struct fields. Conflicting redefinitions are left intact so Parse
-// reports a clear "duplicate named type" error.
-func dedupNamedTypes(v any, defined map[string]string) any {
+// dedupNamedTypes walks a JSON-like schema tree (maps, slices, strings) and
+// replaces a repeated, IDENTICAL named-type definition (record/enum/fixed) with
+// a name reference. It also enforces the named-type invariant: each Avro name
+// must map to exactly ONE definition. When two DIFFERENT definitions claim the
+// same name — two different Go types, or two forms of one type (a [16]byte
+// named "uuid" used both ,uuid and plain; or, once supported, an avro.Duration
+// alongside a plain [12]byte named "duration") — it returns an error rather
+// than emitting an unrepresentable schema. This is the single, general
+// collision check; the fixed/record/enum arms above need not detect it.
+func dedupNamedTypes(v any, defined map[string]string) (any, error) {
 	switch v := v.(type) {
 	case map[string]any:
 		// Is this a named type definition?
 		if name, _ := v["name"].(string); name != "" {
 			if typ, _ := v["type"].(string); isNamedKind(typ) {
+				cur, _ := json.Marshal(v)
 				if prev, exists := defined[name]; exists {
-					cur, _ := json.Marshal(v)
 					if string(cur) == prev {
-						return name // identical — emit reference
+						return name, nil // identical — emit reference
 					}
-					return v // different — let Parse error
+					return nil, fmt.Errorf("avro: SchemaFor: the Avro name %q is produced by two different "+
+						"definitions (two Go types, or a logical and a plain form of one type, mapping to one "+
+						"fixed/record/enum name); each Avro named type must be unique — rename a Go type so the "+
+						"names are distinct", name)
 				}
-				b, _ := json.Marshal(v)
-				defined[name] = string(b)
+				defined[name] = string(cur)
 			}
 		}
 		// Recurse into children that can hold schemas.
 		if fields, ok := v["fields"].([]map[string]any); ok {
 			for i, f := range fields {
-				fields[i]["type"] = dedupNamedTypes(f["type"], defined)
+				nt, err := dedupNamedTypes(f["type"], defined)
+				if err != nil {
+					return nil, err
+				}
+				fields[i]["type"] = nt
 			}
 		}
 		if items, ok := v["items"]; ok {
-			v["items"] = dedupNamedTypes(items, defined)
+			nt, err := dedupNamedTypes(items, defined)
+			if err != nil {
+				return nil, err
+			}
+			v["items"] = nt
 		}
 		if values, ok := v["values"]; ok {
-			v["values"] = dedupNamedTypes(values, defined)
+			nt, err := dedupNamedTypes(values, defined)
+			if err != nil {
+				return nil, err
+			}
+			v["values"] = nt
 		}
-		return v
+		return v, nil
 	case []any: // union branches
 		for i, elem := range v {
-			v[i] = dedupNamedTypes(elem, defined)
+			nt, err := dedupNamedTypes(elem, defined)
+			if err != nil {
+				return nil, err
+			}
+			v[i] = nt
 		}
-		return v
+		return v, nil
 	}
-	return v
+	return v, nil
 }
 
 // MustSchemaFor is like [SchemaFor] but panics on error.
@@ -1130,19 +1154,14 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 					"size": t.Len(),
 				}
 			}
-			if prev, ok := seen[t]; ok && prev.name == name {
-				if prev.uuidForm == isUUIDForm {
-					return name, nil // same form: reference the earlier definition
-				}
-				// Same Avro name, different form: the Go type name equals the
-				// uuid logical name, so its ,uuid form and its plain form both
-				// want a fixed named "uuid" — two distinct Avro types under one
-				// name, which Avro can't represent. Reject rather than silently
-				// merge (which would drop the ,uuid logical, or add it to a
-				// plain field).
-				return nil, fmt.Errorf("avro: SchemaFor: %s is used as both a uuid-logical fixed and a plain fixed, "+
-					"but both map to an Avro fixed named %q because the Go type name equals the uuid logical name; "+
-					"rename the Go type for one use so the two forms get distinct Avro names", t, name)
+			// Reference an earlier definition only for the SAME type in the SAME
+			// form (same Avro name AND same logical-vs-plain form). When the form
+			// differs but the name coincides (a [16]byte named exactly "uuid"
+			// used both ,uuid and plain), emit this form's own definition; the
+			// name collision is then caught uniformly by dedupNamedTypes, which
+			// rejects any Avro name claimed by two different definitions.
+			if prev, ok := seen[t]; ok && prev.name == name && prev.uuidForm == isUUIDForm {
+				return name, nil
 			}
 			seen[t] = seenForm{name: name, uuidForm: isUUIDForm}
 			return def, nil
