@@ -3061,6 +3061,64 @@ func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
 	})
 }
 
+// A [16]byte Go type whose name is exactly the uuid logical name ("uuid")
+// yields the SAME Avro fixed name ("uuid") for both its ,uuid-logical form and
+// its plain form, so using it both ways would emit two distinct Avro types
+// under one name — which Avro can't represent. SchemaFor rejects it rather than
+// silently merging (dropping the ,uuid logical, or adding it to a plain field).
+// Sibling of TestRegression_SchemaForMixedUUIDAndPlainSameType, which uses a
+// distinct name (ID) where the two forms coexist; the distinct-name pin
+// structurally cannot reach this name coincidence.
+func TestRegression_SchemaForUUIDNamedTypeMemoCollision(t *testing.T) {
+	type uuid [16]byte // Name() == "uuid", colliding with the hard-coded logical name
+
+	t.Run("uuid then plain rejected", func(t *testing.T) {
+		type R struct {
+			A uuid `avro:"a,uuid"`
+			B uuid `avro:"b"`
+		}
+		_, err := SchemaFor[R]()
+		if err == nil {
+			t.Fatal("want error: type uuid used as both a uuid-logical and a plain fixed")
+		}
+		if !strings.Contains(err.Error(), "uuid") {
+			t.Fatalf("error should name the conflict: %v", err)
+		}
+	})
+
+	t.Run("plain then uuid rejected", func(t *testing.T) {
+		type R struct {
+			A uuid `avro:"a"`
+			B uuid `avro:"b,uuid"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("want error (plain first)")
+		}
+	})
+
+	// No regression: a uuid-named type used CONSISTENTLY (all plain, or all
+	// ,uuid) has no name conflict and must still succeed.
+	t.Run("plain only ok", func(t *testing.T) {
+		type R struct {
+			A uuid `avro:"a"`
+			B uuid `avro:"b"`
+		}
+		if _, err := SchemaFor[R](); err != nil {
+			t.Fatalf("plain-only uuid-named type should succeed: %v", err)
+		}
+	})
+
+	t.Run("uuid only ok", func(t *testing.T) {
+		type R struct {
+			A uuid `avro:"a,uuid"`
+			B uuid `avro:"b,uuid"`
+		}
+		if _, err := SchemaFor[R](); err != nil {
+			t.Fatalf("uuid-only should succeed: %v", err)
+		}
+	})
+}
+
 // default= takes the remainder of the tag verbatim, so a string default
 // whose value contains unbalanced parens/brackets — or commas, or JSON
 // object braces — must be preserved rather than rejected by the tag
@@ -3343,7 +3401,7 @@ func schemaForFieldType(ft reflect.Type) (*Schema, error) {
 	st := reflect.StructOf([]reflect.StructField{
 		{Name: "F", Type: ft, Tag: `avro:"f"`},
 	})
-	seen := make(map[reflect.Type]string)
+	seen := make(map[reflect.Type]seenForm)
 	s, err := inferRecord(st, "R", "", seen, nil)
 	if err != nil {
 		return nil, err

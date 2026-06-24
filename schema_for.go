@@ -98,7 +98,7 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	if name == "" {
 		name = t.Name()
 	}
-	seen := make(map[reflect.Type]string)
+	seen := make(map[reflect.Type]seenForm)
 	s, err := inferRecord(t, name, o.namespace, seen, customTypes)
 	if err != nil {
 		return nil, err
@@ -181,18 +181,28 @@ func avroFullName(namespace, name string) string {
 	return namespace + "." + name
 }
 
+// seenForm records, per visited type, the Avro name a type was registered
+// under and — for a [16]byte fixed — which form emitted it. The form bit lets
+// a [16]byte type whose name equals the uuid logical name ("uuid") be caught
+// as a name collision when used as both a ,uuid logical and a plain fixed,
+// rather than silently merged.
+type seenForm struct {
+	name     string
+	uuidForm bool // registered as the uuid-logical fixed form
+}
+
 // inferRecord builds a schema map for a struct type. The seen map tracks
 // types that have been visited so repeat references (both recursive and
 // shared) emit a named reference instead of a duplicate definition.
-func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]string, customTypes []CustomType) (any, error) {
-	if fullName, ok := seen[t]; ok {
-		return fullName, nil
+func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType) (any, error) {
+	if sf, ok := seen[t]; ok {
+		return sf.name, nil
 	}
 
 	fullName := avroFullName(namespace, name)
 	// Register the name before processing fields so that recursive
 	// references resolve to a name reference rather than re-entering here.
-	seen[t] = fullName
+	seen[t] = seenForm{name: fullName}
 
 	fields, err := collectFields(t, nil, make(map[reflect.Type]bool))
 	if err != nil {
@@ -608,7 +618,7 @@ var (
 type appliedTypeAliases map[string][]string
 
 // inferField builds the Avro field definition for a single struct field.
-func inferField(f schemaField, namespace string, seen map[reflect.Type]string, customTypes []CustomType, applied appliedTypeAliases) (map[string]any, error) {
+func inferField(f schemaField, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType, applied appliedTypeAliases) (map[string]any, error) {
 	fieldDef := map[string]any{
 		"name": f.name,
 	}
@@ -827,7 +837,7 @@ func baseTypeForLogical(logical, fallback string) string {
 // errIndirectDeep — a build-accepts/encode-rejects asymmetry. This also
 // terminates a cyclic non-struct pointer type (type P *P) at the cap instead
 // of recursing to the maxDepth ceiling.
-func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]string, customTypes []CustomType, depth, ptrChain int) (any, error) {
+func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType, depth, ptrChain int) (any, error) {
 	// A recursive non-struct Go type — `type S []S`, `type P *P`,
 	// `type M map[string]M`, or a long-enough pointer/slice/map chain — has
 	// a cyclic type graph, and the pointer/slice/map arms below recurse on
@@ -1098,9 +1108,10 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 			// guard keeps the same-form dedup (so a later field can
 			// reference an earlier definition that a type-alias= mutated)
 			// while letting the two forms each define their own fixed.
+			isUUIDForm := logical == "uuid" && t.Len() == 16
 			var name string
 			var def map[string]any
-			if logical == "uuid" && t.Len() == 16 {
+			if isUUIDForm {
 				name = "uuid"
 				def = map[string]any{
 					"type":        "fixed",
@@ -1119,10 +1130,21 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 					"size": t.Len(),
 				}
 			}
-			if prev, ok := seen[t]; ok && prev == name {
-				return name, nil
+			if prev, ok := seen[t]; ok && prev.name == name {
+				if prev.uuidForm == isUUIDForm {
+					return name, nil // same form: reference the earlier definition
+				}
+				// Same Avro name, different form: the Go type name equals the
+				// uuid logical name, so its ,uuid form and its plain form both
+				// want a fixed named "uuid" — two distinct Avro types under one
+				// name, which Avro can't represent. Reject rather than silently
+				// merge (which would drop the ,uuid logical, or add it to a
+				// plain field).
+				return nil, fmt.Errorf("avro: SchemaFor: %s is used as both a uuid-logical fixed and a plain fixed, "+
+					"but both map to an Avro fixed named %q because the Go type name equals the uuid logical name; "+
+					"rename the Go type for one use so the two forms get distinct Avro names", t, name)
 			}
-			seen[t] = name
+			seen[t] = seenForm{name: name, uuidForm: isUUIDForm}
 			return def, nil
 		}
 		return inferArray(t.Elem())
