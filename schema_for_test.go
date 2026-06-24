@@ -3084,6 +3084,12 @@ func TestRegression_SchemaForUUIDNamedTypeMemoCollision(t *testing.T) {
 		if !strings.Contains(err.Error(), "uuid") {
 			t.Fatalf("error should name the conflict: %v", err)
 		}
+		// Lock that SchemaFor's dedup produced this, not Parse's fallback
+		// duplicate-name error — both name the type, so without this the pin
+		// passes even with dedupNamedTypes' conflict error reverted.
+		if !strings.Contains(err.Error(), "two different") {
+			t.Fatalf("conflict should be caught by SchemaFor's dedup, not the Parse fallback: %v", err)
+		}
 	})
 
 	t.Run("plain then uuid rejected", func(t *testing.T) {
@@ -3091,8 +3097,12 @@ func TestRegression_SchemaForUUIDNamedTypeMemoCollision(t *testing.T) {
 			A uuid `avro:"a"`
 			B uuid `avro:"b,uuid"`
 		}
-		if _, err := SchemaFor[R](); err == nil {
+		_, err := SchemaFor[R]()
+		if err == nil {
 			t.Fatal("want error (plain first)")
+		}
+		if !strings.Contains(err.Error(), "two different") {
+			t.Fatalf("conflict should be caught by SchemaFor's dedup, not the Parse fallback: %v", err)
 		}
 	})
 
@@ -3137,6 +3147,12 @@ func TestRegression_SchemaForNamedTypeNameCollision(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "fixed_8") {
 		t.Fatalf("error should name the colliding type: %v", err)
+	}
+	// Lock that this is SchemaFor's dedup error (actionable: "rename a Go type"),
+	// not Parse's cryptic "duplicate named type" fallback — both contain the
+	// name, so without this the pin passes even if dedupNamedTypes is reverted.
+	if !strings.Contains(err.Error(), "two different") {
+		t.Fatalf("conflict should be caught by SchemaFor's dedup, not the Parse fallback: %v", err)
 	}
 }
 
