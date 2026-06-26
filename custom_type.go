@@ -95,6 +95,14 @@ type CustomType struct {
 	// Return [ErrSkipCustomType] to fall through. Any other non-nil
 	// error is fatal.
 	//
+	// When all matching decoders skip at a node, the wire is re-decoded
+	// into the target faithfully (identical to a no-custom decode); a
+	// wildcard custom (empty LogicalType and AvroType) that matches leaf
+	// nodes but skips containers therefore makes decoding into a
+	// deeply-nested TYPED target (struct/slice/map) cost O(depth^2) — for
+	// untrusted deeply-nested data decode into an interface / map[string]any
+	// (single-pass) or register against a specific LogicalType/AvroType.
+	//
 	// If nil, the built-in logical type handler is bypassed and the
 	// base Avro type decoder is used directly, producing raw
 	// Avro-native values (int32, int64, etc.) rather than enriched
