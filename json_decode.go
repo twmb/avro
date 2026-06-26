@@ -1518,6 +1518,18 @@ func (ctx *jsonDecoder) applyFieldDefault(target reflect.Value, node *schemaNode
 	return err
 }
 
+// unionBranchRecurses reports whether a union branch kind decodes a nested
+// value that can recurse back into the union (record/array/map). The bare and
+// tagged JSON union decoders commit to the first such branch instead of
+// re-decoding the subtree as a later container branch: backtracking across
+// recursive container branches is 2^depth (a hostile-input DoS), and the Avro
+// JSON spec's tagged {"branch":value} form — which Java/fastavro/goavro require
+// — never branch-guesses. Scalar branches cannot recurse, so they keep their
+// bounded backtrack.
+func unionBranchRecurses(kind string) bool {
+	return kind == "record" || kind == "array" || kind == "map"
+}
+
 func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 	p := ctx.scanner.peek()
 
@@ -1610,6 +1622,17 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 							// Don't fall through to bare-union retry; the recursion
 							// limit applies regardless of how the branch is matched.
 							return err
+						} else if unionBranchRecurses(branch.kind) {
+							// Commit to the tagged interpretation for a CONTAINER
+							// branch: do NOT fall back to the bare retry below. The
+							// bare retry re-decodes the whole subtree, and when a
+							// record field name collides with a branch name the tagged
+							// decode and the bare retry BOTH recurse → 2^depth (the
+							// same DoS the decodeUnionBare commit-to-first prevents).
+							// {"branch":value} is the spec's tagged form; a key
+							// matching a container branch name commits to it. Scalar
+							// branches can't recurse, so they keep the bare fallback.
+							return err
 						} else {
 							taggedErr = err
 						}
@@ -1625,6 +1648,11 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 								return nil
 							}
 						} else if errors.Is(err, errTooDeep) {
+							return err
+						} else if unionBranchRecurses(branch.kind) {
+							// Commit to the tagged container interpretation; see the
+							// toAny arm above (the bare retry would double the
+							// recursion → 2^depth on a field/branch name collision).
 							return err
 						} else {
 							taggedErr = err
@@ -1738,6 +1766,25 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byt
 			return err
 		} else {
 			lastErr = err
+			// Commit to the FIRST token-class-matching CONTAINER branch
+			// (record/array/map): do not backtrack to a later container branch
+			// on failure. Backtracking re-decodes the whole subtree per branch,
+			// which is 2^depth for a recursive union-of-records/arrays/maps — a
+			// hostile-input DoS (a ~120-byte bare nested object rejects in
+			// seconds). The Avro JSON spec encodes a non-null union as the tagged
+			// {"branch-name":value} form, and Java/fastavro/goavro read the branch
+			// from that tag with no branch-guessing; the tagged path
+			// (decodeUnionObject) already commits deterministically, so the bare
+			// leniency commits to first too. A caller needing a later container
+			// branch uses the tagged form. Container tokens ('{','[') match only
+			// container branches (jsonTokenMatchesBranch), so this never skips a
+			// scalar branch. Scalar branches cannot recurse into the union, so
+			// their bounded backtrack stays — preserving the numeric-width
+			// fall-through (e.g. ["int","long"] accepting an int-overflowing value
+			// via the long branch) at O(1) per node.
+			if unionBranchRecurses(branch.kind) {
+				break
+			}
 			ctx.scanner.pos = savedPos
 		}
 	}

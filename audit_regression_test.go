@@ -2953,3 +2953,93 @@ func TestRegression_FixedLogicalProbeSizeBounded(t *testing.T) {
 		t.Fatalf("uuid suppression broken by probe cap: DecodeJSON into any returned %T, want []byte (raw)", got)
 	}
 }
+
+// A bare (untagged) JSON union value commits to the FIRST token-class-matching
+// CONTAINER branch (record/array/map); it does NOT backtrack to re-decode the
+// whole subtree as each later container branch. Backtracking across container
+// branches is 2^depth for a recursive union-of-records — a ~120-byte bare
+// nested object that mismatches at the bottom would otherwise reject in seconds
+// (and a slightly deeper one in minutes/hours). The Avro JSON spec encodes a
+// non-null union as the tagged {"branch-name":value} form, and Java, fastavro,
+// and goavro all read the branch from that tag without branch-guessing; the
+// tagged decode path stays deterministic and a caller needing a later container
+// branch uses the tagged form. Scalar (number/string/bool token) branches keep
+// their bounded backtrack — they cannot recurse into the union, so they add no
+// blowup, and it preserves the numeric-width fall-through (e.g. ["int","long"]
+// accepting a value that overflows int via the long branch).
+func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		// keyed builds the nested object using the given field key; the
+		// innermost value (a bare number) matches no branch, forcing failure at
+		// the bottom — the worst case for container backtracking.
+		key string
+	}{
+		{
+			// Bare path: the field name ("v") is NOT a branch name, so every
+			// level routes through decodeUnionBare, which must commit to the
+			// first matching container branch instead of trying A then B.
+			name: "bare-path-distinct-field-name",
+			schema: `["null",
+				{"type":"record","name":"A","fields":[{"name":"v","type":["null","A","B"]}]},
+				{"type":"record","name":"B","fields":[{"name":"v","type":["null","A","B"]}]}]`,
+			key: "v",
+		},
+		{
+			// Tagged-fallback path: the field name ("A") COLLIDES with a branch
+			// name, so decodeUnionObject's tagged decode matches a container
+			// branch at every level. It must commit to the tagged interpretation
+			// rather than also trying the bare fallback (the two together double
+			// the recursion → 2^depth).
+			name:   "tagged-fallback-field-name-collides-with-branch",
+			schema: `["null",{"type":"record","name":"A","fields":[{"name":"A","type":["null","A"]}]}]`,
+			key:    "A",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := avro.MustParse(c.schema)
+			build := func(depth int) []byte {
+				var b strings.Builder
+				for range depth {
+					b.WriteString(`{"`)
+					b.WriteString(c.key)
+					b.WriteString(`":`)
+				}
+				b.WriteString(`1`)
+				for range depth {
+					b.WriteString(`}`)
+				}
+				return []byte(b.String())
+			}
+
+			// Depth 20 pre-fix backtracks ~2^20 full subtree re-decodes (seconds);
+			// post-fix it commits to the first container branch and rejects in
+			// microseconds. The 500ms bound sits well under the pre-fix cost and
+			// far over the post-fix cost.
+			var out any
+			t0 := time.Now()
+			if err := s.DecodeJSON(build(20), &out); err == nil {
+				t.Fatal("expected a decode error (innermost value matches no branch)")
+			}
+			if d := time.Since(t0); d > 500*time.Millisecond {
+				t.Fatalf("depth-20 union mismatch took %v; want <500ms (exponential-backtrack regression)", d)
+			}
+
+			// Scaling guard: a far deeper input must still reject in bounded
+			// (linear) time. Pre-fix this is 2^200 (unreachable) — the depth-20
+			// Fatalf above stops a pre-fix run before reaching here. Depth 200
+			// stays within maxDepth, so the rejection is the bottom mismatch,
+			// exercising the commit-to-first path itself.
+			t1 := time.Now()
+			if err := s.DecodeJSON(build(200), &out); err == nil {
+				t.Fatal("expected a decode error at depth 200")
+			}
+			if d := time.Since(t1); d > 500*time.Millisecond {
+				t.Fatalf("depth-200 union mismatch took %v; want <500ms (super-linear regression)", d)
+			}
+		})
+	}
+}

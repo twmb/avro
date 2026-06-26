@@ -1948,13 +1948,16 @@ func TestBareUnionMultiRecordRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Tagged round-trip should work.
+	// The tagged form recovers any branch deterministically — the Avro JSON spec
+	// form for a non-null union, and the only JSON form that round-trips a
+	// multi-record union (Java/fastavro/goavro require it).
 	var v1 any
 	if err := s.DecodeJSON([]byte(`{"Bar":{"y":"hello"}}`), &v1); err != nil {
 		t.Fatalf("tagged DecodeJSON: %v", err)
 	}
 
-	// Bare round-trip: encode Bar to binary, decode, EncodeJSON bare, DecodeJSON back.
+	// Binary carries an explicit branch index, so a Bar value round-trips on the
+	// binary wire regardless of declaration order.
 	bar := map[string]any{"y": "hello"}
 	bin, err := s.Encode(bar)
 	if err != nil {
@@ -1964,17 +1967,36 @@ func TestBareUnionMultiRecordRoundTrip(t *testing.T) {
 	if _, err := s.Decode(bin, &native); err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	jb, err := s.EncodeJSON(native)
+	// Tagged JSON round-trips the recovered branch.
+	jb, err := s.EncodeJSON(native, TaggedUnions())
 	if err != nil {
-		t.Fatalf("EncodeJSON bare: %v", err)
+		t.Fatalf("EncodeJSON tagged: %v", err)
 	}
-	t.Logf("bare JSON: %s", jb)
 	var rt any
 	if err := s.DecodeJSON(jb, &rt); err != nil {
-		t.Fatalf("DecodeJSON bare: %v", err)
+		t.Fatalf("DecodeJSON tagged: %v", err)
 	}
 
-	// Direct Encode of bare map should also work via branch matching.
+	// BARE JSON of a multi-record union commits to the FIRST declaration-order
+	// branch whose structure the object matches; it does NOT backtrack to a later
+	// record branch. That backtracking is the branch-guessing the Avro JSON spec
+	// + Java/fastavro/goavro avoid (they require the tagged form), and it is
+	// 2^depth for recursive unions (see
+	// TestRegression_BareUnionJSONNoExponentialBacktrack). So a bare object
+	// matching only the SECOND branch (Bar's {"y":...}) fails against the first
+	// branch (Foo needs "x"); the tagged form recovers Bar.
+	var barBare any
+	if err := s.DecodeJSON([]byte(`{"y":"hello"}`), &barBare); err == nil {
+		t.Fatal(`bare {"y":"hello"} must commit to the first record branch Foo and fail (missing "x"); tagged form required for Bar`)
+	}
+	// A bare object matching the FIRST branch (Foo) decodes fine.
+	var foo any
+	if err := s.DecodeJSON([]byte(`{"x":5}`), &foo); err != nil {
+		t.Fatalf("bare first-branch decode: %v", err)
+	}
+
+	// Direct Encode of a bare map still matches branches by STRUCTURE on the
+	// binary encode side (unaffected by the JSON-decode commit-to-first).
 	if _, err := s.Encode(map[string]any{"y": "hello"}); err != nil {
 		t.Fatalf("direct Encode of Bar map: %v", err)
 	}
