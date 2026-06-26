@@ -1523,6 +1523,23 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, 
 				}
 				continue
 			}
+			// Coerce the child the same way the wire selector does before the
+			// accept-check: validateLeaf's record/array/map arms (schema.go)
+			// rewrite each child via coerceDefault, so a string in a nested
+			// float/double field becomes a float and the wire selects the
+			// container branch. coerceMetadataDefault is the *SchemaNode twin of
+			// coerceDefault and applies the identical float/double string→float
+			// coercion (it also width-narrows int/long/bytes, which the per-kind
+			// predicates below already accept and which never changes acceptance);
+			// without it this selector would reject a nested string-numeric field
+			// the wire accepts and pick a later branch. coerceMetadataDefault
+			// returns fresh containers, so a rejected sibling branch's value is
+			// never mutated. NOT applied to the scalar float/double arm above, so
+			// a DIRECT scalar union branch (["double","string"] default "5") still
+			// rejects the numeric branch (NOT_BUGS #10). The coerced value is also
+			// what coerceMetadataDefault surfaces in Default, so selection and
+			// surfacing agree on the branch.
+			fv = coerceMetadataDefault(fv, &f.Type, table, childNS)
 			if !branchAcceptsDefault(&f.Type, fv, table, childNS) {
 				return false
 			}
@@ -1537,6 +1554,9 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, 
 			return true
 		}
 		for _, item := range arr {
+			// Coerce each element to mirror the wire selector — see the
+			// record arm above.
+			item = coerceMetadataDefault(item, t.Items, table, ns)
 			if !branchAcceptsDefault(t.Items, item, table, ns) {
 				return false
 			}
@@ -1551,6 +1571,9 @@ func branchAcceptsDefault(t *SchemaNode, val any, table map[string]*SchemaNode, 
 			return true
 		}
 		for _, v := range m {
+			// Coerce each value to mirror the wire selector — see the
+			// record arm above.
+			v = coerceMetadataDefault(v, t.Values, table, ns)
 			if !branchAcceptsDefault(t.Values, v, table, ns) {
 				return false
 			}

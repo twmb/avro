@@ -10384,6 +10384,210 @@ func TestRegression_UnionDefaultMetadataMatchesWireBranch_EnumArm(t *testing.T) 
 	}
 }
 
+// TestRegression_UnionContainerNestedFloatDefaultSelectionMatchesWire pins that
+// the metadata union-branch selector (branchAcceptsDefault, schema_node.go)
+// coerces a CONTAINER branch's nested float/double STRING child the same way the
+// wire selector (validateLeaf via coerceDefault, schema.go) does, so both pick
+// the SAME branch for a string-numeric default.
+//
+// The wire selector rewrites each nested child via coerceDefault before the
+// accept-check, so a string "5" in a nested double field becomes float64(5) and
+// the float/double-container branch is selected. The metadata selector formerly
+// left "5" a string, rejected that branch (defaultAsFloat has no string arm), and
+// picked a later string branch — so Root().Default reported a DIFFERENT union
+// branch (and Go type) than the wire auto-fill decoded, on both binary and JSON.
+//
+// The coercion is a real predicate, not a blanket accept: a non-coercible string
+// ("abc") still rejects the numeric child on both surfaces. And it lives ONLY in
+// the container arms, never the scalar float/double arm, so a DIRECT scalar union
+// branch (["double","string"] default "5") still rejects the numeric branch and
+// picks string on both surfaces. Companion to the
+// TestRegression_UnionDefaultMetadataMatchesWireBranch_* family (which covers the
+// non-coercing int/long/enum/bytes/structural arms); this covers the float/double
+// string-coercion arm those left.
+func TestRegression_UnionContainerNestedFloatDefaultSelectionMatchesWire(t *testing.T) {
+	// autofillProbe parses schema, auto-fills an EMPTY outer record on BOTH wire
+	// formats and reads the metadata Default, returning the value at probe() for
+	// each surface (binary, json, metadata).
+	autofillProbe := func(t *testing.T, schema string, probe func(any) any) (bin, js, meta any) {
+		t.Helper()
+		s, err := avro.Parse(schema)
+		if err != nil {
+			t.Fatalf("parse: %v\n  %s", err, schema)
+		}
+		wire, err := s.Encode(map[string]any{})
+		if err != nil {
+			t.Fatalf("binary encode: %v", err)
+		}
+		var gb map[string]any
+		if _, err := s.Decode(wire, &gb); err != nil {
+			t.Fatalf("binary decode: %v", err)
+		}
+		jw, err := s.AppendEncodeJSON(nil, map[string]any{})
+		if err != nil {
+			t.Fatalf("json encode: %v", err)
+		}
+		var gj map[string]any
+		if err := s.DecodeJSON(jw, &gj); err != nil {
+			t.Fatalf("json decode: %v", err)
+		}
+		return probe(gb["u"]), probe(gj["u"]), probe(s.Root().Fields[0].Default)
+	}
+	recProbe := func(v any) any { m, _ := v.(map[string]any); return m["x"] }
+	arrProbe := func(v any) any {
+		a, _ := v.([]any)
+		if len(a) > 0 {
+			return a[0]
+		}
+		return nil
+	}
+	mapProbe := func(v any) any { m, _ := v.(map[string]any); return m["k"] }
+
+	// POSITIVE parity matrix: container × {float,double}. All three surfaces
+	// select the numeric container branch and surface the wire-faithful Go type
+	// (float32 for "float", float64 for "double").
+	positives := []struct {
+		name   string
+		schema string
+		probe  func(any) any
+		want   any
+	}{
+		{"record_double", `{"type":"record","name":"O","fields":[{"name":"u","type":[
+			{"type":"record","name":"A","fields":[{"name":"x","type":"double"}]},
+			{"type":"record","name":"B","fields":[{"name":"x","type":"string"}]}],"default":{"x":"5"}}]}`, recProbe, float64(5)},
+		{"record_float", `{"type":"record","name":"O","fields":[{"name":"u","type":[
+			{"type":"record","name":"A","fields":[{"name":"x","type":"float"}]},
+			{"type":"record","name":"B","fields":[{"name":"x","type":"string"}]}],"default":{"x":"5"}}]}`, recProbe, float32(5)},
+		{"array_double", `{"type":"record","name":"O","fields":[{"name":"u","type":[
+			{"type":"array","items":"double"},"string"],"default":["5"]}]}`, arrProbe, float64(5)},
+		{"array_float", `{"type":"record","name":"O","fields":[{"name":"u","type":[
+			{"type":"array","items":"float"},"string"],"default":["5"]}]}`, arrProbe, float32(5)},
+		{"map_double", `{"type":"record","name":"O","fields":[{"name":"u","type":[
+			{"type":"map","values":"double"},"string"],"default":{"k":"5"}}]}`, mapProbe, float64(5)},
+		{"map_float", `{"type":"record","name":"O","fields":[{"name":"u","type":[
+			{"type":"map","values":"float"},"string"],"default":{"k":"5"}}]}`, mapProbe, float32(5)},
+	}
+	for _, c := range positives {
+		t.Run("positive/"+c.name, func(t *testing.T) {
+			bin, js, meta := autofillProbe(t, c.schema, c.probe)
+			if !reflect.DeepEqual(bin, c.want) {
+				t.Errorf("binary auto-fill = %T(%v), want %T(%v)", bin, bin, c.want, c.want)
+			}
+			// The crux: metadata must equal the wire (type AND value).
+			if !reflect.DeepEqual(meta, bin) {
+				t.Errorf("metadata Default = %T(%v) but binary wire = %T(%v) — divergent branch selection", meta, meta, bin, bin)
+			}
+			if !reflect.DeepEqual(js, bin) {
+				t.Errorf("json auto-fill = %T(%v) but binary wire = %T(%v)", js, js, bin, bin)
+			}
+		})
+	}
+
+	// NEGATIVE (predicate proof): a non-coercible string must NOT sneak into the
+	// numeric branch. record: BOTH the binary wire and the metadata fall through
+	// to the string-record branch (x = string), so SELECTION still agrees. Only
+	// binary + metadata are probed here: the selected string-record is the SECOND
+	// container branch, and the JSON auto-fill emits it as a BARE union, which the
+	// decoder commits to the FIRST container branch (record A / double) per the
+	// documented bare-union rule (NOT_BUGS #5/#36) — a round-trip limitation of
+	// bare unions, orthogonal to branch SELECTION (the positive cases, whose
+	// selected branch IS the first container, exercise the JSON path).
+	t.Run("negative/record_noncoercible_picks_string_branch", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"record","name":"O","fields":[{"name":"u","type":[
+			{"type":"record","name":"A","fields":[{"name":"x","type":"double"}]},
+			{"type":"record","name":"B","fields":[{"name":"x","type":"string"}]}],"default":{"x":"abc"}}]}`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		wire, _ := s.Encode(map[string]any{})
+		var gb map[string]any
+		if _, err := s.Decode(wire, &gb); err != nil {
+			t.Fatalf("binary decode: %v", err)
+		}
+		bin := recProbe(gb["u"])
+		meta := recProbe(s.Root().Fields[0].Default)
+		if bin != any("abc") {
+			t.Errorf("binary: x = %T(%v), want string(abc) (string branch B)", bin, bin)
+		}
+		if meta != any("abc") {
+			t.Errorf("metadata: x = %T(%v), want string(abc) (string branch B)", meta, meta)
+		}
+	})
+	// array/map: a union can't hold two same-kind containers, so the ["abc"] /
+	// {"k":"abc"} default can ONLY match the numeric-container branch; with "abc"
+	// non-coercible the numeric child rejects and NO branch matches, so the schema
+	// is rejected at PARSE — proving the coercion didn't blanket-accept the string
+	// (wire and metadata agree: parse rejection precedes Root()).
+	for _, c := range []struct{ name, schema string }{
+		{"array", `{"type":"record","name":"O","fields":[{"name":"u","type":[{"type":"array","items":"double"},"string"],"default":["abc"]}]}`},
+		{"map", `{"type":"record","name":"O","fields":[{"name":"u","type":[{"type":"map","values":"double"},"string"],"default":{"k":"abc"}}]}`},
+	} {
+		t.Run("negative/"+c.name+"_noncoercible_rejects_at_parse", func(t *testing.T) {
+			if _, err := avro.Parse(c.schema); err == nil {
+				t.Errorf("expected parse reject for non-coercible numeric-container default; parsed OK:\n  %s", c.schema)
+			}
+		})
+	}
+
+	// DEEPER nesting: union -> record{ r: record{ x: double } } default
+	// {"r":{"x":"5"}}. The coercion must mirror the wire at EVERY container level.
+	t.Run("deeper_nesting_union_record_record", func(t *testing.T) {
+		schema := `{"type":"record","name":"O","fields":[{"name":"u","type":[
+			{"type":"record","name":"A","fields":[{"name":"r","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"double"}]}}]},
+			{"type":"record","name":"B","fields":[{"name":"r","type":"string"}]}],"default":{"r":{"x":"5"}}}]}`
+		probe := func(v any) any {
+			a, _ := v.(map[string]any)
+			inner, _ := a["r"].(map[string]any)
+			return inner["x"]
+		}
+		bin, js, meta := autofillProbe(t, schema, probe)
+		if !reflect.DeepEqual(bin, float64(5)) {
+			t.Errorf("binary deep r.x = %T(%v), want float64(5)", bin, bin)
+		}
+		if !reflect.DeepEqual(meta, bin) || !reflect.DeepEqual(js, bin) {
+			t.Errorf("deep nesting divergence: binary=%T(%v) json=%T(%v) meta=%T(%v)", bin, bin, js, js, meta, meta)
+		}
+	})
+
+	// CONTROL 1 (must stay green independent of the fix): a DIRECT scalar union
+	// float/double branch still rejects a string default and picks string on both
+	// surfaces (NOT_BUGS #10) — the coercion must NOT leak into the scalar arm.
+	t.Run("control_scalar_union_string_picks_string_branch", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"record","name":"O","fields":[{"name":"u","type":["double","string"],"default":"5"}]}`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		wire, _ := s.Encode(map[string]any{})
+		var gb map[string]any
+		s.Decode(wire, &gb)
+		if _, ok := gb["u"].(string); !ok {
+			t.Errorf("scalar union wire u = %T(%v), want string", gb["u"], gb["u"])
+		}
+		if _, ok := s.Root().Fields[0].Default.(string); !ok {
+			d := s.Root().Fields[0].Default
+			t.Errorf("scalar union meta Default = %T(%v), want string", d, d)
+		}
+	})
+
+	// CONTROL 2 (must stay green independent of the fix): a NON-union nested
+	// record double-string default already agreed (both surfaces coerce) — stays
+	// float64 on both.
+	t.Run("control_nonunion_nested_double_agrees", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"record","name":"O","fields":[{"name":"r","type":{"type":"record","name":"R","fields":[{"name":"x","type":"double"}]},"default":{"x":"5"}}]}`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		wire, _ := s.Encode(map[string]any{})
+		var gb map[string]any
+		s.Decode(wire, &gb)
+		bx := gb["r"].(map[string]any)["x"]
+		mx := s.Root().Fields[0].Default.(map[string]any)["x"]
+		if !reflect.DeepEqual(bx, float64(5)) || !reflect.DeepEqual(mx, float64(5)) {
+			t.Errorf("non-union: wire x=%T(%v) meta x=%T(%v), want float64(5) both", bx, bx, mx, mx)
+		}
+	})
+}
+
 // TestRegression_UnionDefaultEncodeMatchesValidateBranch pins that the
 // wire branch encoded for an auto-filled union default matches the branch
 // firstUnionBranchAcceptingDefault picked at parse time. validateDefault,

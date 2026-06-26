@@ -3600,6 +3600,16 @@ func defaultAsFloat(val any) (float64, error) {
 		return float64(v), nil
 	case int32:
 		return float64(v), nil
+	case float32:
+		// A float32 reaches this predicate only on the METADATA side: the
+		// union-branch selector branchAcceptsDefault coerces a container's
+		// nested float/double child through coerceMetadataDefault before the
+		// accept-check, and coerceMetadataDefault narrows a "float" schema to
+		// float32 (schema_node.go). float32→float64 widening is exact, so the
+		// value is a valid float default. The wire path never reaches here with
+		// a float32 (coerceDefault yields float64 and the parsed default tree
+		// has no float32), so this arm does not change wire or parse behavior.
+		return float64(v), nil
 	}
 	return 0, fmt.Errorf("expected number, got %T", val)
 }
@@ -3644,19 +3654,38 @@ func firstUnionBranchAcceptingDefault(val any, node *schemaNode) *schemaNode {
 }
 
 // coerceDefault converts string default values to float64 when the
-// field type is literally float or double. Matches Java's parseField
+// field type is literally float or double. Modeled on Java's parseField
 // at Schema.java:1899-1902, which special-cases TextNode → DoubleNode
-// coercion ONLY when the outer fieldSchema.getType() is FLOAT or
-// DOUBLE directly — never for union branches, never for int/long
-// fields. Spec 1.12 §"Record" default-values table marks JSON string
-// as invalid for float/double defaults; the Java-deployed coercion is
-// an interop carveout preserved here for legacy Java-generated
-// schemas. avro-rs and goavro do not implement this coercion.
+// coercion for a FLOAT or DOUBLE field type. Spec 1.12 §"Record"
+// default-values table marks JSON string as invalid for float/double
+// defaults; the Java-deployed coercion is an interop carveout preserved
+// here for legacy Java-generated schemas. avro-rs and goavro do not
+// implement this coercion.
 //
-// Union defaults pass through unchanged: walkDefault picks the first
-// branch whose validateDefault accepts, and validateDefault has no
-// string-to-float arm at the leaf level, so union+numeric-string
-// defaults are rejected at parse (matching Java/avro-rs/goavro).
+// A DIRECT scalar float/double UNION branch does NOT coerce: this function
+// only transforms a node whose kind is literally float/double, and a union
+// node recurses into its first validateDefault-accepting branch, where the
+// scalar float/double leaf has no string arm — so a numeric-only union with
+// a string default rejects at parse (["double"] default "5" rejects), and
+// ["double","string"] default "5" picks the string branch. Matches
+// Java/avro-rs/goavro (see NOT_BUGS #10).
+//
+// A float/double field NESTED inside a record/array/map DOES coerce, even
+// when that container is a union branch: validateLeaf's record/array/map
+// arms (schema.go) call coerceDefault on each child, so a string "5" in a
+// nested double field becomes float64(5) before the accept-check and the
+// container branch is selected. This is a deliberate leniency BEYOND Java
+// (Java's parseField coercion is outer-field-only, so Java rejects a nested
+// string-numeric default and selects a string-accepting branch instead) —
+// twmb leans permissive (cross-impl rule 2). The metadata-side branch
+// selector (branchAcceptsDefault, schema_node.go) applies the SAME coercion
+// via coerceMetadataDefault, so the union branch reported by Root().Default
+// matches the wire auto-fill on both binary and JSON: there is NO
+// metadata↔wire divergence. Do NOT re-file "twmb coerces nested
+// string-double defaults where Java doesn't" or propose removing the nested
+// coercion — it is intentional and both surfaces agree; revisit only on a
+// real interop breakage with evidence. Pinned by
+// TestRegression_UnionContainerNestedFloatDefaultSelectionMatchesWire.
 //
 // Walks *schemaNode so name-referenced nested fields coerce too (the
 // resolved type tree, not the canon — name-refs lose type info on the
