@@ -2,6 +2,7 @@ package avro
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 )
 
@@ -143,7 +144,10 @@ func (ct CustomType) matches(node *schemaNode) bool {
 //
 // G is the custom Go type (e.g. Money). A is the Avro-native Go type:
 // int32 for int, int64 for long, float32 for float, float64 for double,
-// string for string, []byte for bytes, bool for boolean.
+// string for string, []byte for bytes, bool for boolean. A may also be a
+// named type whose underlying kind is one of these (e.g. type Cents int64);
+// the Avro type is inferred from A's kind and the decoded value is converted
+// to A.
 //
 // GoType and AvroType are inferred from the type parameters. If A is
 // not a supported Avro-native type, [Parse] or [SchemaFor] returns an
@@ -173,8 +177,23 @@ func NewCustomType[G, A any](
 	}
 	var decFn func(any, *SchemaNode) (any, error)
 	if decode != nil {
+		aType := reflect.TypeFor[A]()
 		decFn = func(v any, sn *SchemaNode) (any, error) {
-			return decode(v.(A), sn)
+			a, ok := v.(A)
+			if !ok {
+				// The base deserializer produces the CANONICAL Go value for A's
+				// Avro kind (int32 for int, []byte for bytes, ...). When A is a
+				// NAMED type over that kind (type UnixMillis int64), the value's
+				// dynamic type is the base kind, not A, so a bare v.(A) panics.
+				// inferAvroType keys on A's reflect.Kind, so the canonical value
+				// is always convertible to A; convert rather than assert.
+				rv := reflect.ValueOf(v)
+				if !rv.IsValid() || !rv.Type().ConvertibleTo(aType) {
+					return nil, fmt.Errorf("avro: custom decode: cannot convert %T to %s", v, aType)
+				}
+				a = rv.Convert(aType).Interface().(A)
+			}
+			return decode(a, sn)
 		}
 	}
 

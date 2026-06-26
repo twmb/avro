@@ -3625,7 +3625,18 @@ func defaultAsFloat(val any) (float64, error) {
 // never for union branches.
 func firstUnionBranchAcceptingDefault(val any, node *schemaNode) *schemaNode {
 	for _, branch := range node.branches {
-		if validateDefault(val, branch) == nil {
+		// validateDefault coerces in place: validateLeaf's record/array/map
+		// arms rewrite fields via coerceDefault (e.g. a string "5" -> float64
+		// against a double field, the documented outer-float carveout). Validate
+		// a COPY so a FAILED branch's partial coercion cannot leak into the next
+		// branch's check — otherwise acceptance is order-dependent (a later
+		// string-typed branch sees a float64 a prior failed branch left behind),
+		// violating Avro 1.12's order-independent "default matches any branch"
+		// (Java isValidDefault is anyMatch over an immutable node). The caller
+		// re-coerces the original val against the returned branch, so the
+		// selected branch and its coerced value are unchanged for any default
+		// that already parsed.
+		if validateDefault(deepCopyTree(val), branch) == nil {
 			return branch
 		}
 	}
