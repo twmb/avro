@@ -306,30 +306,60 @@ func (ctx *jsonDecoder) decodeKind(v reflect.Value, node *schemaNode) error {
 // same node.
 func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, error), sn *SchemaNode, suppressLogical bool) jsonDecodeFn {
 	return func(ctx *jsonDecoder, v reflect.Value, node *schemaNode) error {
-		var tmp any
-		tmpV := reflect.ValueOf(&tmp).Elem()
-		// Decode the RAW Avro-native value (int32/int64/[]byte) for the
-		// custom decoder chain when the binary path also suppresses the
-		// logical deserializer for this node — i.e. exactly when
-		// hasMatchingCustomType is true (suppressLogical). A wildcard
-		// CustomType (empty LogicalType AND AvroType) is excluded from that
-		// gate, so the binary path leaves the logical deserializer in place
-		// and feeds the callback the ENRICHED value; suppressLogical is
-		// false there so we keep the logical transform too, preserving
-		// binary↔JSON parity. decodeKind captures and clears the flag, so
-		// it applies only to this node's leaf decode.
-		ctx.suppressLogical = suppressLogical
-		if len(decoders) == 0 {
-			// Pure suppression (no Decode callback): produce EXACTLY what the
-			// binary raw deser produces by decoding straight into the target
-			// through the same raw decode arms (assignBytes/setBytesValue for
-			// fixed → [N]byte, setStringValue for string, …) — DRY parity with
-			// the binary raw deser. The previous box-into-any + setCustomResult
-			// path could not land a []byte into a [N]byte array the way binary's
-			// deserFixed reflect.Copy does (and over-applied the uuid arm for a
-			// string target). decodeKind captures and clears suppressLogical.
+		// A no-match ancestor set this: decode the subtree raw through the kind
+		// switch. This node's own suppression still applies to its leaf decode.
+		if ctx.slab.bypassCustom {
+			ctx.suppressLogical = suppressLogical
 			return ctx.decodeKind(v, node)
 		}
+		// suppressLogical decodes the RAW Avro-native value (int32/int64/[]byte)
+		// for this node exactly when the binary path also suppresses the logical
+		// deserializer (hasMatchingCustomType). A wildcard CustomType is excluded,
+		// so the logical transform is kept and binary↔JSON parity holds. decodeKind
+		// captures and clears the flag, so it applies only to this node's leaf.
+		if len(decoders) == 0 {
+			// Pure suppression (no Decode callback): decode straight into the
+			// target through the raw arms — DRY parity with the binary raw deser
+			// (a box-into-any could not land a []byte into a [N]byte array the way
+			// decodeKind's deserFixed reflect.Copy does).
+			ctx.suppressLogical = suppressLogical
+			return ctx.decodeKind(v, node)
+		}
+		// Fresh interface target: decodeKind's interface output IS the canonical
+		// value a no-custom decode yields, so decode straight into v and read it
+		// back for the chain — keeping a parent probe (whose elements are all
+		// fresh `any`) to a single pass, mirroring the binary wrapper. A NON-nil
+		// interface is excluded (it would reuse the held value in place) and takes
+		// the probe + re-decode path below.
+		if v.Kind() == reflect.Interface && v.IsNil() {
+			ctx.suppressLogical = suppressLogical
+			if err := ctx.decodeKind(v, node); err != nil {
+				return err
+			}
+			chainVal := v.Interface()
+			for _, dec := range decoders {
+				out, err := dec(chainVal, sn)
+				if err != nil {
+					if errors.Is(err, ErrSkipCustomType) {
+						continue
+					}
+					return err
+				}
+				ctx.slab.customMatches++
+				return setCustomResult(v, out, node.kind)
+			}
+			return nil // all-skip: v already holds the no-custom value
+		}
+		// Typed target: probe into a throwaway any for the chain; on the all-skip
+		// fall-through rewind the scanner and RE-DECODE faithfully into v — the
+		// same decode a no-custom schema performs (a reused map keeps its keys, a
+		// logical node lands in a base typed target, an overlapping union recovers
+		// its exact wire branch), none of which placing the any value reproduces.
+		var tmp any
+		tmpV := reflect.ValueOf(&tmp).Elem()
+		savedPos := ctx.scanner.pos
+		savedMatches := ctx.slab.customMatches
+		ctx.suppressLogical = suppressLogical
 		if err := ctx.decodeKind(tmpV, node); err != nil {
 			return err
 		}
@@ -341,24 +371,25 @@ func wrapDecodeJSONWithCustomDecoders(decoders []func(any, *SchemaNode) (any, er
 				}
 				return err
 			}
-			// setCustomResult (not assignAny) so a custom decoder result
-			// that isn't assignable to a CONCRETE target returns a
-			// SemanticError instead of panicking in reflect.Set —
-			// matching the binary path (wrapDeserWithCustomDecoders).
-			// assignAny only checks assignability for interface targets;
-			// for a domain-typed struct field it Sets unconditionally.
-			// Pass the UN-indirected v (matching the binary path,
-			// wrapDeserWithCustomDecoders): setCustomResult walks/allocates
-			// pointer levels itself, so a custom Decode returning a POINTER
-			// (*T) lands in a *T target. An extra indirectAlloc here would
-			// pre-dereference the target and reject a pointer result.
+			// setCustomResult (not assignAny): a result not assignable to a
+			// concrete target returns a SemanticError instead of panicking, and
+			// the un-indirected v lets a *T result land in a *T target — matching
+			// the binary path (wrapDeserWithCustomDecoders).
+			ctx.slab.customMatches++
 			return setCustomResult(v, out, node.kind)
 		}
-		// All decoders skipped: the raw Avro-native value (int64, []byte,
-		// …) lands in the target. setCustomResult guards the
-		// concrete-target assignability the same way the binary
-		// all-skip fall-through does (un-indirected v, per above).
-		return setCustomResult(v, tmp, node.kind)
+		// Every decoder skipped: rewind and re-decode into the typed target. No
+		// nested custom matched ⇒ bypass for a single pass; otherwise re-decode
+		// with customs active to reproduce the nested match (bounded by maxDepth).
+		ctx.scanner.pos = savedPos
+		ctx.suppressLogical = suppressLogical
+		if ctx.slab.customMatches == savedMatches {
+			ctx.slab.bypassCustom = true
+			err := ctx.decodeKind(v, node)
+			ctx.slab.bypassCustom = false
+			return err
+		}
+		return ctx.decodeKind(v, node)
 	}
 }
 

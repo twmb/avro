@@ -76,51 +76,90 @@ func TestRegression_DecimalCustomTypeWrongUnderlyingNoPanic(t *testing.T) {
 
 type auditMoney int64
 
-// A custom decoder result (or the ErrSkipCustomType all-skip fall-through,
-// which yields the raw Avro-native value) assigned into a CONCRETE
-// domain-typed target must return a SemanticError, not panic in
-// reflect.Set — and DecodeJSON must agree with binary Decode. The JSON
-// path previously assigned via a helper that only checked assignability
-// for interface targets.
+// A custom decoder that returns ErrSkipCustomType (no decoder matched) falls
+// through to built-in decode: the canonical Avro-native value is placed into the
+// target exactly as a no-custom decode would (CustomType.Decode docstring —
+// "the base Avro type decoder is used directly"). Two halves:
+//
+//   - A target the value FITS — long → a named integer (auditMoney) — now
+//     SUCCEEDS and equals the no-custom decode, identically on binary and JSON.
+//     (Previously the all-skip path boxed the canonical int64 into `any` and
+//     rejected it via AssignableTo, so even this compatible named-integer target
+//     errored — a divergence from no-custom decode. The all-skip fall-through now
+//     RE-DECODES the wire into the target through the base deserializer, so it is
+//     faithful to a no-custom decode by construction.)
+//   - A target the value genuinely does NOT fit — long → a string field — still
+//     errors GRACEFULLY (a SemanticError, never a panic in reflect.Set), and
+//     binary and JSON agree, matching the no-custom decode's own rejection.
 func TestRegression_DecodeJSONCustomDecoderConcreteTargetErrors(t *testing.T) {
 	ct := avro.CustomType{
 		LogicalType: "money",
 		AvroType:    "long",
 		Decode:      func(v any, _ *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType },
 	}
-	s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"p","type":{"type":"long","logicalType":"money"}}]}`, avro.WithCustomType(ct))
+	schema := `{"type":"record","name":"R","fields":[{"name":"p","type":{"type":"long","logicalType":"money"}}]}`
+	plain := avro.MustParse(schema)
+	s, err := avro.Parse(schema, avro.WithCustomType(ct))
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Compatible target (long → named integer): skip-custom == no-custom, both wires.
 	type R struct {
 		P auditMoney `avro:"p"`
 	}
-	wire, err := s.Encode(R{P: 5})
+	wire, err := plain.Encode(R{P: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
-	jsonBytes, err := s.EncodeJSON(R{P: 5})
+	jsonBytes, err := plain.EncodeJSON(R{P: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	var noCustom R
+	if _, err := plain.Decode(wire, &noCustom); err != nil {
+		t.Fatalf("no-custom decode (oracle): %v", err)
+	}
 	var rbin R
-	_, binErr := s.Decode(wire, &rbin)
-	if binErr == nil {
-		t.Fatal("binary Decode should reject int64 into a non-assignable concrete target")
+	if _, err := s.Decode(wire, &rbin); err != nil {
+		t.Errorf("binary skip-custom into named integer should succeed (== no-custom): %v", err)
+	}
+	var rjson R
+	if err := s.DecodeJSON(jsonBytes, &rjson); err != nil {
+		t.Errorf("JSON skip-custom into named integer should succeed (== no-custom): %v", err)
+	}
+	if rbin != noCustom || rjson != noCustom {
+		t.Errorf("skip-custom value diverges from no-custom: bin=%+v json=%+v want=%+v", rbin, rjson, noCustom)
 	}
 
-	var rjson R
+	// Incompatible target (long → string field): both wires error gracefully, no panic.
+	type Bad struct {
+		P string `avro:"p"`
+	}
+	binErr := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("binary Decode panicked on incompatible target: %v", r)
+			}
+		}()
+		var b Bad
+		_, err = s.Decode(wire, &b)
+		return
+	}()
+	if binErr == nil {
+		t.Fatal("binary Decode should reject a long into a string field")
+	}
 	jsonErr := func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
-				t.Fatalf("DecodeJSON panicked where binary Decode returned %v: %v", binErr, r)
+				t.Fatalf("DecodeJSON panicked on incompatible target where binary returned %v: %v", binErr, r)
 			}
 		}()
-		return s.DecodeJSON(jsonBytes, &rjson)
+		var b Bad
+		return s.DecodeJSON(jsonBytes, &b)
 	}()
 	if jsonErr == nil {
-		t.Fatal("DecodeJSON should reject like binary Decode, not silently succeed")
+		t.Fatal("DecodeJSON should reject a long into a string field, like binary Decode")
 	}
 }
 

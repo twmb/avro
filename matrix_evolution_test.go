@@ -398,27 +398,28 @@ func TestMatrix_AliasEvolution(t *testing.T) {
 		wSchema string
 		rSchema string
 		value   any
+		want    any // reader-shaped decoded value (field-alias RENAMES the field)
 	}{
 		{"type-alias",
 			`{"type":"record","name":"Old","fields":[{"name":"a","type":"int"}]}`,
 			`{"type":"record","name":"New","aliases":["Old"],"fields":[{"name":"a","type":"int"}]}`,
-			map[string]any{"a": int32(1)}},
+			map[string]any{"a": int32(1)}, map[string]any{"a": int32(1)}},
 		{"type-alias-namespaced",
 			`{"type":"record","name":"Old","namespace":"n1","fields":[{"name":"a","type":"int"}]}`,
 			`{"type":"record","name":"New","namespace":"n2","aliases":["n1.Old"],"fields":[{"name":"a","type":"int"}]}`,
-			map[string]any{"a": int32(2)}},
+			map[string]any{"a": int32(2)}, map[string]any{"a": int32(2)}},
 		{"field-alias",
 			`{"type":"record","name":"R","fields":[{"name":"old","type":"string"}]}`,
 			`{"type":"record","name":"R","fields":[{"name":"new","type":"string","aliases":["old"]}]}`,
-			map[string]any{"old": "v"}},
+			map[string]any{"old": "v"}, map[string]any{"new": "v"}},
 		{"enum-alias",
 			`{"type":"enum","name":"OldE","symbols":["A"]}`,
 			`{"type":"enum","name":"NewE","aliases":["OldE"],"symbols":["A"]}`,
-			"A"},
+			"A", "A"},
 		{"fixed-alias",
 			`{"type":"fixed","name":"OldF","size":2}`,
 			`{"type":"fixed","name":"NewF","aliases":["OldF"],"size":2}`,
-			[]byte{7, 8}},
+			[]byte{7, 8}, []byte{7, 8}},
 	}
 	for _, c := range cases {
 		t.Run(c.label, func(t *testing.T) {
@@ -436,6 +437,12 @@ func TestMatrix_AliasEvolution(t *testing.T) {
 			if _, err := res.Decode(wire, &got); err != nil {
 				t.Fatalf("aliased decode: %v", err)
 			}
+			// Not just no-error: the aliased value must land under the READER's
+			// (renamed) shape. A resolution that decodes the wrong value without
+			// erroring slips a no-error-only check.
+			if !matEqual(got, c.want) {
+				t.Fatalf("aliased value: got %#v want %#v", got, c.want)
+			}
 		})
 		// The same alias pair nested in an array still resolves.
 		t.Run(c.label+"/in-array", func(t *testing.T) {
@@ -452,6 +459,9 @@ func TestMatrix_AliasEvolution(t *testing.T) {
 			var got any
 			if _, err := res.Decode(wire, &got); err != nil {
 				t.Fatalf("aliased decode: %v", err)
+			}
+			if !matEqual(got, []any{c.want}) {
+				t.Fatalf("aliased array value: got %#v want %#v", got, []any{c.want})
 			}
 		})
 	}

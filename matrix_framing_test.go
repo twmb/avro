@@ -175,15 +175,25 @@ func TestMatrix_ForeignContainerFraming(t *testing.T) {
 			}
 
 			// Typed-slice targets see the same variants (the per-primitive
-			// container fast loops have their own block-walking code).
+			// container fast loops have their own block-walking code, distinct
+			// from the any-decode loop above). Assert the decoded ELEMENT VALUES
+			// against the canonical any-decode (want), not just len — a fast
+			// loop that mis-assembles values across split/negative-count/overlong
+			// framings while still landing 3 slots must red here.
+			wantArr := want.([]any)
 			if fr.label == "int" {
 				for name, wire := range frameVariants(items) {
 					var typed []int32
 					if _, err := arrSchema.Decode(wire, &typed); err != nil {
 						t.Fatalf("typed array %s decode: %v", name, err)
 					}
-					if len(typed) != 3 {
-						t.Fatalf("typed array %s: got %v", name, typed)
+					if len(typed) != len(wantArr) {
+						t.Fatalf("typed array %s: got len %d want %d (%v)", name, len(typed), len(wantArr), typed)
+					}
+					for i, e := range typed {
+						if !matEqual(e, wantArr[i]) {
+							t.Fatalf("typed array %s elem %d: got %v want %v", name, i, e, wantArr[i])
+						}
 					}
 				}
 			}
@@ -193,8 +203,13 @@ func TestMatrix_ForeignContainerFraming(t *testing.T) {
 					if _, err := arrSchema.Decode(wire, &typed); err != nil {
 						t.Fatalf("typed string array %s decode: %v", name, err)
 					}
-					if len(typed) != 3 {
-						t.Fatalf("typed string array %s: got %v", name, typed)
+					if len(typed) != len(wantArr) {
+						t.Fatalf("typed string array %s: got len %d want %d (%v)", name, len(typed), len(wantArr), typed)
+					}
+					for i, e := range typed {
+						if !matEqual(e, wantArr[i]) {
+							t.Fatalf("typed string array %s elem %d: got %v want %v", name, i, e, wantArr[i])
+						}
 					}
 				}
 			}

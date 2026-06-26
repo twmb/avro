@@ -88,6 +88,19 @@ type slab struct {
 	depth           int // recursion depth; bumped at recursive dispatch sites
 	taggedUnions    bool
 	tagLogicalTypes bool
+	// customMatches counts CustomType decoders that MATCHED (returned a result
+	// rather than ErrSkipCustomType) during a decode. A custom-decoder wrapper
+	// saves it before probing and compares after: an unchanged count means no
+	// custom matched anywhere in the probed subtree, so the all-skip re-decode
+	// can bypass the chain for a single O(subtree) pass. See
+	// wrapDeserWithCustomDecoders.
+	customMatches int
+	// bypassCustom, when set, makes a custom-decoder wrapper skip its probe and
+	// chain and decode straight through its base deserializer. Set by a no-match
+	// all-skip re-decode so nested wrappers don't re-probe (keeping the re-decode
+	// O(subtree)); skipping the chain is faithful precisely because no custom
+	// matched in the subtree.
+	bypassCustom bool
 }
 
 // slabSize is the string-interning slab batch: short decoded strings are
@@ -114,6 +127,8 @@ func (sl *slab) put() {
 	sl.depth = 0
 	sl.taggedUnions = false
 	sl.tagLogicalTypes = false
+	sl.customMatches = 0
+	sl.bypassCustom = false
 	slabPool.Put(sl)
 }
 

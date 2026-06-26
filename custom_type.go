@@ -244,14 +244,69 @@ func setCustomResult(v reflect.Value, result any, avroType string) error {
 }
 
 // wrapDeserWithCustomDecoders wraps a deserfn with custom decode functions.
-// Used both at parse time and during schema resolution to re-apply
-// custom decoders to promoted/resolved nodes.
+// Used both at parse time and during schema resolution to re-apply custom
+// decoders to promoted/resolved nodes.
+//
+// When every registered decoder returns ErrSkipCustomType (the documented
+// property-dispatch fall-through) the wire is RE-DECODED into the real target
+// through the base deserializer (inner) — byte-for-byte the decode a no-custom
+// schema performs. Re-decoding rather than placing a probe-decoded any is what
+// makes the fall-through faithful: a reused map keeps its existing keys, a
+// logical node lands in a base typed target, an overlapping union recovers its
+// exact wire branch — none of which placing an any value reproduces.
+//
+// Cost. A naive re-decode re-runs nested wrappers, which re-probe → O(depth^2).
+// The probe counts customMatches over the subtree (saved before, compared
+// after); if none matched, bypassCustom is set for the re-decode so nested
+// wrappers skip straight to inner — one O(subtree) pass. If some nested custom
+// matched, the re-decode runs with customs active so the match is reproduced
+// (O(depth^2), bounded by maxDepth, only this case).
+//
+// An interface (any) target needs no separate probe + re-decode: inner already
+// produces the canonical value a no-custom decode yields, so it is decoded
+// straight into v, which doubles as the chain input. This keeps a parent's
+// probe — whose element targets are all `any` — to a single pass.
 func wrapDeserWithCustomDecoders(inner deserfn, decoders []func(any, *SchemaNode) (any, error), sn *SchemaNode) deserfn {
 	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+		// A no-match ancestor set this so the whole subtree decodes through inner
+		// once: no custom matched anywhere in it, so skipping the chain is
+		// identical to running it all-skip.
+		if sl.bypassCustom {
+			return inner(src, v, sl)
+		}
+		// Fresh interface target: inner's interface output IS the canonical value
+		// a no-custom decode yields (tagged per the caller's option), so decode
+		// straight into v and read it back for the chain — keeping a parent's
+		// probe (whose element targets are all fresh `any`) to a single pass. A
+		// NON-nil interface is excluded: inner would reuse the held value in place
+		// (e.g. decode into a reused *T the custom is about to replace), so it
+		// takes the probe + re-decode path below, just like a typed target.
+		if v.Kind() == reflect.Interface && v.IsNil() {
+			rest, err := inner(src, v, sl)
+			if err != nil {
+				return rest, err
+			}
+			chainVal := v.Interface()
+			for _, dec := range decoders {
+				result, err := dec(chainVal, sn)
+				if err != nil {
+					if errors.Is(err, ErrSkipCustomType) {
+						continue
+					}
+					return nil, err
+				}
+				sl.customMatches++
+				return rest, setCustomResult(v, result, sn.Type)
+			}
+			return rest, nil // all-skip: v already holds the no-custom value
+		}
+		// Typed target: probe into a throwaway any for the chain, then re-decode
+		// faithfully into v on the all-skip fall-through.
 		var tmp any
-		src, err := inner(src, reflect.ValueOf(&tmp).Elem(), sl)
+		savedMatches := sl.customMatches
+		rest, err := inner(src, reflect.ValueOf(&tmp).Elem(), sl)
 		if err != nil {
-			return src, err
+			return rest, err
 		}
 		for _, dec := range decoders {
 			result, err := dec(tmp, sn)
@@ -261,15 +316,19 @@ func wrapDeserWithCustomDecoders(inner deserfn, decoders []func(any, *SchemaNode
 				}
 				return nil, err
 			}
-			if err := setCustomResult(v, result, sn.Type); err != nil {
-				return nil, err
-			}
-			return src, nil
+			sl.customMatches++
+			return rest, setCustomResult(v, result, sn.Type)
 		}
-		// No decoder matched — set the raw Avro-native value.
-		if err := setCustomResult(v, tmp, sn.Type); err != nil {
-			return nil, err
+		// Every decoder skipped: re-decode the original wire into the typed
+		// target. No nested custom matched ⇒ bypass for a single pass; otherwise
+		// re-decode with customs active to reproduce the nested match.
+		if sl.customMatches == savedMatches {
+			sl.bypassCustom = true
+			_, err = inner(src, v, sl)
+			sl.bypassCustom = false
+			return rest, err
 		}
-		return src, nil
+		_, err = inner(src, v, sl)
+		return rest, err
 	}
 }
