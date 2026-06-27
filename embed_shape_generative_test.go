@@ -128,7 +128,7 @@ func schemaForType(t reflect.Type, opts ...SchemaOpt) (*Schema, error) {
 		name = "GenRec"
 	}
 	seen := make(map[reflect.Type]seenForm)
-	s, err := inferRecord(t, name, o.namespace, seen, customTypes)
+	s, err := inferRecord(t, name, o.namespace, seen, customTypes, make(appliedTypeAliases))
 	if err != nil {
 		return nil, err
 	}

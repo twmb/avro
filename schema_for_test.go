@@ -735,7 +735,7 @@ func TestSchemaForAvroDurationRejectsLogicalTag(t *testing.T) {
 				Tag:  reflect.StructTag(`avro:"d,` + tag + `"`),
 			}})
 			seen := make(map[reflect.Type]seenForm)
-			if _, err := inferRecord(st, "R", "", seen, nil); err == nil {
+			if _, err := inferRecord(st, "R", "", seen, nil, make(appliedTypeAliases)); err == nil {
 				t.Fatalf("avro.Duration with %q tag should be rejected", tag)
 			}
 		})
@@ -1374,6 +1374,179 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 		}
 		if _, err := SchemaFor[Outer](WithNamespace("com.example")); err == nil {
 			t.Fatal("expected error for conflicting type-alias under namespace")
+		}
+	})
+}
+
+// TestSchemaForTypeAliasCrossRecord pins type-alias dedup scope ACROSS record
+// boundaries. The dedup state (which type-aliases have been applied to each
+// named type) is keyed on a type's fullname and must span the whole inference,
+// exactly like the named-type registry (seen): a named type is defined once and
+// may be referenced from any record. TestSchemaForTypeAliasNamedRef covers only
+// the same-record case (defining and referencing field in one struct); this
+// covers a named type defined in one record and referenced — with the SAME
+// alias — from a DIFFERENT (nested) record reached through every inferType
+// recursion arm. Per-record dedup state spuriously rejected these: the nested
+// record never saw the earlier application, so a reference fell into the
+// "defined without type-alias" branch with a factually false message.
+func TestSchemaForTypeAliasCrossRecord(t *testing.T) {
+	type Inner struct {
+		Value int32 `avro:"value"`
+	}
+
+	// Identical alias across a record boundary is accepted, and the alias lands
+	// on the type DEFINITION exactly once while the cross-record occurrence is a
+	// bare name reference (not a second definition carrying the alias).
+	t.Run("nested struct identical alias accepted and aliased once", func(t *testing.T) {
+		type Nested struct {
+			Ref Inner `avro:"ref,type-alias=old_inner"`
+		}
+		type Outer struct {
+			Def    Inner  `avro:"def,type-alias=old_inner"` // defines Inner + alias (processed first)
+			Nested Nested `avro:"nested"`                    // its Ref references Inner from another record
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("cross-record identical alias rejected: %v", err)
+		}
+		js := s.String()
+		// The alias attaches to the single Inner definition; references are bare,
+		// so the alias text appears exactly once.
+		if n := strings.Count(js, "old_inner"); n != 1 {
+			t.Fatalf("alias should appear once (on the definition), got %d occurrences: %s", n, js)
+		}
+		// Structural proof: the defining field's type is the Inner object with the
+		// alias; the nested field's Ref is the bare string "Inner".
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(js), &raw); err != nil {
+			t.Fatal(err)
+		}
+		fields := raw["fields"].([]any)
+		defType := fields[0].(map[string]any)["type"].(map[string]any)
+		if defType["name"] != "Inner" {
+			t.Fatalf("def field type name: got %v, want Inner", defType["name"])
+		}
+		aliases, _ := defType["aliases"].([]any)
+		if len(aliases) != 1 || aliases[0] != "old_inner" {
+			t.Fatalf("Inner definition aliases: got %v, want [old_inner]", aliases)
+		}
+		nestedType := fields[1].(map[string]any)["type"].(map[string]any)
+		refType := nestedType["fields"].([]any)[0].(map[string]any)["type"]
+		if refType != "Inner" {
+			t.Fatalf("nested Ref should be the bare name reference %q, got %T %v", "Inner", refType, refType)
+		}
+	})
+
+	// Threading coverage: the alias'd type is defined at the top level and
+	// referenced from a record reached via each inferType recursion arm. A
+	// recursion call that fails to thread the dedup state would give the reached
+	// record a fresh (empty) state and spuriously reject the identical alias, so
+	// each of these reds independently if its arm is not threaded.
+	t.Run("cross-record via array element", func(t *testing.T) {
+		type Elem struct {
+			Ref Inner `avro:"ref,type-alias=old_inner"`
+		}
+		type Outer struct {
+			Def  Inner  `avro:"def,type-alias=old_inner"`
+			List []Elem `avro:"list"` // Elem record reached via array items
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("cross-record-via-array identical alias rejected: %v", err)
+		}
+		if n := strings.Count(s.String(), "old_inner"); n != 1 {
+			t.Fatalf("alias occurrences: got %d, want 1: %s", n, s.String())
+		}
+	})
+
+	t.Run("cross-record via map value", func(t *testing.T) {
+		type Val struct {
+			Ref Inner `avro:"ref,type-alias=old_inner"`
+		}
+		type Outer struct {
+			Def Inner          `avro:"def,type-alias=old_inner"`
+			M   map[string]Val `avro:"m"` // Val record reached via map values
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("cross-record-via-map identical alias rejected: %v", err)
+		}
+		if n := strings.Count(s.String(), "old_inner"); n != 1 {
+			t.Fatalf("alias occurrences: got %d, want 1: %s", n, s.String())
+		}
+	})
+
+	t.Run("cross-record via pointer", func(t *testing.T) {
+		type Target struct {
+			Ref Inner `avro:"ref,type-alias=old_inner"`
+		}
+		type Outer struct {
+			Def Inner   `avro:"def,type-alias=old_inner"`
+			P   *Target `avro:"p"` // Target record reached via pointer elem
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("cross-record-via-pointer identical alias rejected: %v", err)
+		}
+		if n := strings.Count(s.String(), "old_inner"); n != 1 {
+			t.Fatalf("alias occurrences: got %d, want 1: %s", n, s.String())
+		}
+	})
+
+	// A genuine cross-record conflict (same type, different aliases in two
+	// records) must be reported truthfully as a conflict — NOT as the false
+	// "defined without type-alias" message that per-record state produced (it
+	// never saw the earlier application, so it mistook a conflict for a
+	// no-earlier-alias case).
+	t.Run("cross-record conflict reported as conflict", func(t *testing.T) {
+		type Nested struct {
+			Ref Inner `avro:"ref,type-alias=different_inner"`
+		}
+		type Outer struct {
+			Def    Inner  `avro:"def,type-alias=old_inner"`
+			Nested Nested `avro:"nested"`
+		}
+		_, err := SchemaFor[Outer]()
+		if err == nil {
+			t.Fatal("expected error for conflicting cross-record type-alias")
+		}
+		if !strings.Contains(err.Error(), "conflicts") {
+			t.Errorf("conflict should be reported as a conflict, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "without type-alias") {
+			t.Errorf("conflict must not be reported as the false 'without type-alias' message: %v", err)
+		}
+	})
+
+	// When the type is genuinely defined WITHOUT an alias and then referenced
+	// WITH one from another record, the truthful "without type-alias" error
+	// still fires (the dedup state correctly has no application recorded for it).
+	t.Run("cross-record define-without then reference-with errors truthfully", func(t *testing.T) {
+		type Nested struct {
+			Ref Inner `avro:"ref,type-alias=late_inner"`
+		}
+		type Outer struct {
+			Def    Inner  `avro:"def"` // defines Inner with NO alias
+			Nested Nested `avro:"nested"`
+		}
+		_, err := SchemaFor[Outer]()
+		if err == nil {
+			t.Fatal("expected error for type-alias on a type already defined without one")
+		}
+		if !strings.Contains(err.Error(), "without type-alias") {
+			t.Errorf("expected truthful 'without type-alias' error, got: %v", err)
+		}
+	})
+
+	// Same-record identical control: the established contract (also pinned by
+	// TestSchemaForTypeAliasNamedRef) must continue to accept.
+	t.Run("same-record identical control still accepts", func(t *testing.T) {
+		type Outer struct {
+			A Inner `avro:"a,type-alias=old_inner"`
+			B Inner `avro:"b,type-alias=old_inner"`
+		}
+		if _, err := SchemaFor[Outer](); err != nil {
+			t.Fatalf("same-record identical alias control rejected: %v", err)
 		}
 	})
 }
@@ -3679,7 +3852,7 @@ func schemaForFieldType(ft reflect.Type) (*Schema, error) {
 		{Name: "F", Type: ft, Tag: `avro:"f"`},
 	})
 	seen := make(map[reflect.Type]seenForm)
-	s, err := inferRecord(st, "R", "", seen, nil)
+	s, err := inferRecord(st, "R", "", seen, nil, make(appliedTypeAliases))
 	if err != nil {
 		return nil, err
 	}

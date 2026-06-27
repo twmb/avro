@@ -102,7 +102,18 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 		name = t.Name()
 	}
 	seen := make(map[reflect.Type]seenForm)
-	s, err := inferRecord(t, name, o.namespace, seen, customTypes)
+	// applied is threaded globally alongside seen. type-alias dedup keys on a
+	// named type's fullname, and seen guarantees exactly one definition per type
+	// across the whole inference, so the applied state must span the whole call
+	// too. A per-record map made cross-record identical aliases on a shared named
+	// type spuriously reject: the type is defined (alias recorded) in one record
+	// but referenced from another record whose fresh map is empty, so the
+	// reference fell into the "defined without type-alias" branch. applied is only
+	// SET at a definition (addTypeAliases applied==true) and only READ at a
+	// reference, so global scope never false-accepts — same-name distinct-type
+	// collisions are still caught independently by dedupNamedTypes.
+	applied := make(appliedTypeAliases)
+	s, err := inferRecord(t, name, o.namespace, seen, customTypes, applied)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +232,7 @@ type seenForm struct {
 // inferRecord builds a schema map for a struct type. The seen map tracks
 // types that have been visited so repeat references (both recursive and
 // shared) emit a named reference instead of a duplicate definition.
-func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType) (any, error) {
+func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType, applied appliedTypeAliases) (any, error) {
 	if sf, ok := seen[t]; ok {
 		return sf.name, nil
 	}
@@ -237,7 +248,6 @@ func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]s
 	}
 
 	avroFields := make([]map[string]any, 0, len(fields))
-	applied := make(appliedTypeAliases)
 	for _, f := range fields {
 		af, err := inferField(f, namespace, seen, customTypes, applied)
 		if err != nil {
@@ -650,7 +660,7 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]seenForm,
 		"name": f.name,
 	}
 
-	schema, err := inferType(f.goType, f.logical, f.decimal, namespace, seen, customTypes, 0, 0)
+	schema, err := inferType(f.goType, f.logical, f.decimal, namespace, seen, customTypes, applied, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -864,7 +874,7 @@ func baseTypeForLogical(logical, fallback string) string {
 // errIndirectDeep — a build-accepts/encode-rejects asymmetry. This also
 // terminates a cyclic non-struct pointer type (type P *P) at the cap instead
 // of recursing to the maxDepth ceiling.
-func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType, depth, ptrChain int) (any, error) {
+func inferType(t reflect.Type, logical string, decimal [2]int, namespace string, seen map[reflect.Type]seenForm, customTypes []CustomType, applied appliedTypeAliases, depth, ptrChain int) (any, error) {
 	// A recursive non-struct Go type — `type S []S`, `type P *P`,
 	// `type M map[string]M`, or a long-enough pointer/slice/map chain — has
 	// a cyclic type graph, and the pointer/slice/map arms below recurse on
@@ -915,7 +925,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if ptrChain >= maxIndirectDepth {
 			return nil, fmt.Errorf("avro: %s: pointer chain nests deeper than the codec supports (it unwraps at most %d consecutive pointer levels); flatten the indirection, register a CustomType, or define the schema explicitly", t, maxIndirectDepth)
 		}
-		inner, err := inferType(t.Elem(), logical, decimal, namespace, seen, customTypes, depth+1, ptrChain+1)
+		inner, err := inferType(t.Elem(), logical, decimal, namespace, seen, customTypes, applied, depth+1, ptrChain+1)
 		if err != nil {
 			return nil, err
 		}
@@ -1117,7 +1127,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	inferArray := func(elem reflect.Type) (any, error) {
 		// Array/slice element: the codec encodes each element with a fresh
 		// indirect call, so the pointer chain resets (ptrChain=0).
-		items, err := inferType(elem, "", [2]int{}, namespace, seen, customTypes, depth+1, 0)
+		items, err := inferType(elem, "", [2]int{}, namespace, seen, customTypes, applied, depth+1, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -1202,7 +1212,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}
 		// Map value: encoded with a fresh indirect call per entry, so the
 		// pointer chain resets (ptrChain=0).
-		values, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes, depth+1, 0)
+		values, err := inferType(t.Elem(), "", [2]int{}, namespace, seen, customTypes, applied, depth+1, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -1213,7 +1223,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if name == "" {
 			return nil, fmt.Errorf("anonymous struct types are not supported; use a named type")
 		}
-		return inferRecord(t, name, namespace, seen, customTypes)
+		return inferRecord(t, name, namespace, seen, customTypes, applied)
 
 	default:
 		return nil, fmt.Errorf("unsupported Go type %s", t)
