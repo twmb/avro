@@ -93,8 +93,9 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	// Clone the cache's map so a failed parse doesn't corrupt the cache.
 	cloned := maps.Clone(c.named)
 	b := &builder{
-		named:    cloned,
-		building: make(map[*schemaNode]struct{}),
+		named:      cloned,
+		building:   make(map[*schemaNode]struct{}),
+		definedSet: make(map[*namedType]bool),
 	}
 	applySchemaOpts(b, opts)
 	hasCustomTypes := len(b.customTypes) > 0
@@ -117,12 +118,17 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 		}
 	}
 
-	// cachedNames marks every name INHERITED from the cache (cross-parse), so
-	// rejectCachedRefIfCustomTypeWouldMatch can tell an inherited reference from
-	// a name defined in THIS parse (a self-/forward reference), and the
-	// duplicate-name check can do the same. Populated for EVERY parse with
-	// inherited names — the cross-parse custom-boundary guard must fire even for
-	// a plain (no-CustomType) parse that references a custom-built cached type.
+	// cachedNames marks every name INHERITED from the cache (cross-parse).
+	// cachedNames alone CANNOT tell an inherited REFERENCE from a name THIS
+	// parse RE-DEFINES (a re-registered name is in both): so
+	// rejectCachedRefIfCustomTypeWouldMatch keys its "defined this parse" skip on
+	// definedSet membership of the resolved *namedType, and uses cachedNames only
+	// to recognize a genuine cross-parse reference (in cachedNames, but its nt is
+	// the cloned cached node, absent from definedSet). The duplicate-name check
+	// pairs cachedNames with allowReRegister (string-keyed) to permit a
+	// same-string re-parse. Populated for EVERY parse with inherited names — the
+	// cross-parse custom-boundary guard must fire even for a plain (no-CustomType)
+	// parse that references a custom-built cached type.
 	if len(cloned) > 0 {
 		b.cachedNames = make(map[string]bool, len(cloned))
 		for name := range cloned {

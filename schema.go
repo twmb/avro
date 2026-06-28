@@ -200,8 +200,9 @@ func MustParse(schema string, opts ...SchemaOpt) *Schema {
 // [SchemaCache].
 func Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	b := &builder{
-		named:    make(map[string]*namedType),
-		building: make(map[*schemaNode]struct{}),
+		named:      make(map[string]*namedType),
+		building:   make(map[*schemaNode]struct{}),
+		definedSet: make(map[*namedType]bool),
 	}
 	applySchemaOpts(b, opts)
 	return parse(schema, b)
@@ -940,9 +941,18 @@ type builder struct {
 	ser   serfn
 	deser deserfn
 
-	named           map[string]*namedType
-	building        map[*schemaNode]struct{} // record/error nodes whose field loop is in progress (shared across nest, like named)
-	definedNamed    []*namedType             // named types DEFINED by this parse (vs inherited); stamped custom-affected at finalize
+	named        map[string]*namedType
+	building     map[*schemaNode]struct{} // record/error nodes whose field loop is in progress (shared across nest, like named)
+	definedNamed []*namedType             // named types DEFINED by this parse (vs inherited); stamped custom-affected at finalize
+	// definedSet is the membership form of this-parse definitions. Unlike
+	// definedNamed (a per-builder accumulator merged up only at unnest), it is
+	// SHARED BY REFERENCE across nest() — like named/building/cachedNames — so a
+	// guard running in a NESTED builder (e.g. while building a ["null","Self"]
+	// field) can test whether a resolved reference points at a name THIS parse
+	// defined, before unnest would have propagated definedNamed upward. A
+	// re-registered cached name's fresh *namedType lands here; cachedNames cannot
+	// make that distinction (it marks such a name as both inherited and redefined).
+	definedSet      map[*namedType]bool
 	missing         []unionMissing
 	mfixups         []metaFixup
 	fieldFixups     []recordFieldFixup
@@ -999,6 +1009,7 @@ func (b *builder) nest() *builder {
 		customTypes:     b.customTypes,
 		custom:          b.custom,
 		cachedNames:     b.cachedNames,
+		definedSet:      b.definedSet,
 		allowReRegister: b.allowReRegister,
 		depth:           b.depth,
 	}
@@ -1168,6 +1179,14 @@ var primFast = map[string]primFastInfo{
 func (b *builder) registerNamed(name string, nt *namedType) {
 	b.named[name] = nt
 	b.definedNamed = append(b.definedNamed, nt)
+	// Mirror the append into the reference-shared membership set so the
+	// cached-ref guard can recognize a this-parse definition from inside a
+	// nested builder. Nil only for white-box test builders that construct a
+	// builder literal without the top-level init; those degrade to the
+	// cachedNames-only behavior (the guard's other early return).
+	if b.definedSet != nil {
+		b.definedSet[nt] = true
+	}
 }
 
 // tryAssignNamedRef resolves a named-type reference, possibly with
@@ -1733,12 +1752,26 @@ func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *name
 	// Parses. A name DEFINED in the current Parse (including a self-/forward
 	// reference resolved mid-build, before its subtree's CTs are wired onto the
 	// shared node) has this Parse's CustomTypes in scope and applies them to its
-	// single definition, so it is never a stale cross-parse cache. cachedNames
-	// holds exactly the cross-parse names; without this gate a self-referential
-	// record (e.g. a linked-list Node) whose subtree contains a CT-matched
-	// logical wrongly fails to Parse, because the self-reference resolves before
-	// registerNamed's hadCustomType re-stamp (which only runs after the record's
-	// fields are fully built).
+	// single definition, so it is never a stale cross-parse cache.
+	//
+	// definedSet membership is the authoritative "defined this parse" test: it
+	// holds the *namedType of every definition THIS parse registered, INCLUDING
+	// a cached name re-registered under allowReRegister (whose self-reference
+	// resolves to that fresh node). cachedNames alone CANNOT make this
+	// distinction — a re-registered name is in cachedNames (it was inherited)
+	// AND defines a fresh node here — so keying the skip on cachedNames
+	// false-rejects a re-parse of a cached self-referential schema once a
+	// matching CustomType is added (the resolved nt is the fresh node, not the
+	// stale cached one). It is also shared by reference across nest(), so it is
+	// already populated when the guard runs in the nested builder that builds a
+	// self-referential field (definedNamed would not be — it merges up only at
+	// unnest). The cachedNames return below then handles only a name never
+	// inherited at all; a genuine cross-parse REFERENCE (nt is the cloned cached
+	// node, absent from definedSet, and refName IS in cachedNames) falls through
+	// both returns to the match check, exactly as intended.
+	if b.definedSet[nt] {
+		return nil
+	}
 	if !b.cachedNames[refName] {
 		return nil
 	}

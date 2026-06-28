@@ -1969,6 +1969,196 @@ func TestRegression_SchemaCacheCustomBoundaryGuard(t *testing.T) {
 	})
 }
 
+// A self-referential schema cached WITHOUT a CustomType and then re-parsed
+// (the SAME string) WITH a matching CustomType must Parse AND apply the
+// custom. The re-parse RE-DEFINES the name (allowReRegister), so its
+// self-reference resolves to THIS parse's fresh node — which has the
+// CustomType in scope and will be wired at finalize — not to the stale cached
+// node. rejectCachedRefIfCustomTypeWouldMatch must therefore NOT fire.
+//
+// The guard keys "defined this parse" on definedSet membership of the
+// resolved *namedType, which is SHARED BY REFERENCE across the nested
+// builders (so it is already populated when the self-reference resolves
+// inside a nested builder — definedNamed would not be, since it merges up
+// only at unnest). cachedNames cannot be used for this test: a re-registered
+// name is in cachedNames (inherited) AND defines a fresh node here, so keying
+// on cachedNames false-rejected with "re-parse Node with the CustomType
+// first" — exactly what the caller is doing — and the rejection was field-
+// ORDER dependent (it fired only when the custom-matched field preceded the
+// self-reference, i.e. once the partially-built node already showed the
+// match). The genuine cross-parse hazard (a DIFFERENT schema REFERENCING a
+// clean cached type, whose resolved node is the stale clone, absent from
+// definedSet) must still reject — re-asserted below and in
+// TestRegression_SchemaCacheCustomBoundaryGuard.
+func TestRegression_SchemaCacheSelfRefReParseWithCustom(t *testing.T) {
+	const ms = int64(1700000000000)
+	// A value-TRANSFORMING decoder: under suppression it receives the raw
+	// int64 millis and returns a distinctive marker, so "custom applied" is
+	// observable as a string in the decoded map. A no-op decoder would be
+	// indistinguishable from the built-in time.Time decode (convention: a
+	// callback-firing claim needs a value-transforming callback).
+	customMS := func() avro.CustomType {
+		return avro.CustomType{
+			LogicalType: "timestamp-millis",
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+				return fmt.Sprintf("MS=%v", v), nil
+			},
+		}
+	}
+	wantMarker := fmt.Sprintf("MS=%v", ms)
+
+	at := func(t *testing.T, m any, path ...string) any {
+		t.Helper()
+		cur := m
+		for _, k := range path {
+			mm, ok := cur.(map[string]any)
+			if !ok {
+				t.Fatalf("navigating %v: %T is not a map", path, cur)
+			}
+			cur = mm[k]
+		}
+		return cur
+	}
+
+	cases := []struct {
+		name   string
+		schema string
+		value  any
+		tPath  []string
+	}{
+		{
+			// custom-matched field BEFORE the self-reference: the
+			// partially-built node already shows the match, so the pre-fix
+			// guard fired here.
+			"flat-t-before-selfref",
+			`{"type":"record","name":"Node","fields":[
+				{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}},
+				{"name":"next","type":["null","Node"]}]}`,
+			map[string]any{"t": time.UnixMilli(ms).UTC(), "next": nil},
+			[]string{"t"},
+		},
+		{
+			// self-reference BEFORE the custom-matched field: accepted even
+			// pre-fix (the node's fields slice was empty at resolve time) —
+			// pins ORDER-INDEPENDENCE of the accept.
+			"flat-selfref-before-t",
+			`{"type":"record","name":"Node","fields":[
+				{"name":"next","type":["null","Node"]},
+				{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}}]}`,
+			map[string]any{"t": time.UnixMilli(ms).UTC(), "next": nil},
+			[]string{"t"},
+		},
+		{
+			// Node nested two record levels deep: the self-reference resolves
+			// inside a NESTED builder, so only the reference-shared definedSet
+			// (not the unnest-merged definedNamed) makes the this-parse
+			// definition visible there — this is the case the sharing fix is for.
+			"depth-nested-selfref",
+			`{"type":"record","name":"L1","fields":[
+				{"name":"a","type":{"type":"record","name":"L2","fields":[
+					{"name":"b","type":{"type":"record","name":"Node","fields":[
+						{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}},
+						{"name":"next","type":["null","Node"]}]}}]}}]}`,
+			map[string]any{"a": map[string]any{"b": map[string]any{"t": time.UnixMilli(ms).UTC(), "next": nil}}},
+			[]string{"a", "b", "t"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// Control: bare Parse with the custom succeeds — the cache must not
+			// change the accept/reject outcome of an identical (schema, opts).
+			bare, err := avro.Parse(c.schema, avro.WithCustomType(customMS()))
+			if err != nil {
+				t.Fatalf("CONTROL: bare Parse(schema, custom) should succeed: %v", err)
+			}
+
+			var cache avro.SchemaCache
+			if _, err := cache.Parse(c.schema); err != nil { // parse 1: no custom
+				t.Fatalf("cache parse 1 (no custom): %v", err)
+			}
+			s, err := cache.Parse(c.schema, avro.WithCustomType(customMS())) // parse 2: same string, matching custom
+			if err != nil {
+				t.Fatalf("cache parse 2 falsely rejected a valid self-ref re-parse: %v", err)
+			}
+
+			// Wire produced by the plain (no-custom) schema — a raw long for the
+			// timestamp-millis leaf.
+			plain := avro.MustParse(c.schema)
+			wire, err := plain.Encode(c.value)
+			if err != nil {
+				t.Fatalf("plain encode: %v", err)
+			}
+
+			// The cache-reparsed schema must DECODE with the custom applied
+			// (marker string), proving the custom is wired — not merely that
+			// Parse returned nil — and identically to the bare-parsed schema.
+			var gotCache, gotBare any
+			if _, err := s.Decode(wire, &gotCache); err != nil {
+				t.Fatalf("cache schema decode: %v", err)
+			}
+			if _, err := bare.Decode(wire, &gotBare); err != nil {
+				t.Fatalf("bare schema decode: %v", err)
+			}
+			if leaf := at(t, gotCache, c.tPath...); leaf != wantMarker {
+				t.Errorf("custom NOT applied through cache re-parse: t leaf = %#v, want %q", leaf, wantMarker)
+			}
+			if cv, bv := at(t, gotCache, c.tPath...), at(t, gotBare, c.tPath...); cv != bv {
+				t.Errorf("cache re-parse not equivalent to bare: cache=%#v bare=%#v", cv, bv)
+			}
+		})
+	}
+
+	// Reverse direction: cached WITH a custom, then re-parsed WITHOUT one,
+	// matches a bare no-custom Parse (accepts; custom NOT applied — the leaf
+	// decodes to the built-in time.Time, not the marker).
+	t.Run("reverse-custom-then-clean-matches-bare", func(t *testing.T) {
+		schema := cases[0].schema
+		var cache avro.SchemaCache
+		if _, err := cache.Parse(schema, avro.WithCustomType(customMS())); err != nil {
+			t.Fatalf("cache parse 1 (custom): %v", err)
+		}
+		s, err := cache.Parse(schema) // re-parse, no custom
+		if err != nil {
+			t.Fatalf("cache parse 2 (no custom) should succeed: %v", err)
+		}
+		plain := avro.MustParse(schema)
+		wire, err := plain.Encode(map[string]any{"t": time.UnixMilli(ms).UTC(), "next": nil})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got any
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		// No custom -> built-in timestamp-millis -> time.Time, NOT the marker.
+		if leaf := at(t, got, "t"); leaf == wantMarker {
+			t.Errorf("custom wrongly applied on a no-custom re-parse: leaf = %#v", leaf)
+		} else if _, ok := leaf.(time.Time); !ok {
+			t.Errorf("no-custom leaf should be time.Time, got %T (%#v)", leaf, leaf)
+		}
+	})
+
+	// SAFETY BOUNDARY (must keep rejecting): a genuine cross-parse REFERENCE —
+	// a DIFFERENT schema that references the clean cached Node by name, with a
+	// matching custom — is the real stale-node hazard (the resolved node is the
+	// cached clone, absent from definedSet), so the guard must still fire. The
+	// fix must not weaken this; pinned here and in
+	// TestRegression_SchemaCacheCustomBoundaryGuard.
+	t.Run("safety-boundary-cross-parse-reference-still-rejects", func(t *testing.T) {
+		var cache avro.SchemaCache
+		nodeDef := `{"type":"record","name":"Node","fields":[
+			{"name":"t","type":{"type":"long","logicalType":"timestamp-millis"}}]}`
+		if _, err := cache.Parse(nodeDef); err != nil { // cache Node clean
+			t.Fatalf("cache Node clean: %v", err)
+		}
+		outer := `{"type":"record","name":"Outer","fields":[{"name":"n","type":"Node"}]}`
+		if _, err := cache.Parse(outer, avro.WithCustomType(customMS())); err == nil {
+			t.Fatal("expected rejection: a cross-parse REFERENCE to a clean cached type with a matching custom must still reject (stale-node hazard)")
+		}
+	})
+}
+
 // A CustomType whose Decode returns a POINTER, decoded into a POINTER target,
 // must succeed identically on binary and JSON. setCustomResult itself walks
 // pointer indirections to find the assignable level, so the JSON decoder-chain
