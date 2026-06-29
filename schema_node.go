@@ -1150,14 +1150,22 @@ func coerceMetadataDefault(val any, t *SchemaNode, table map[string]*SchemaNode,
 		// int32 so SchemaField.Default's Go type matches the wire
 		// width AND the user's natural Go field type (`Foo int32
 		// `avro:"default=42"`` → Default.(int32) works directly).
-		// Schema parse rejects out-of-int32 defaults via defaultAsInt32,
-		// so the narrowing is always lossless here.
+		//
+		// Every numeric form routes through the range-checked defaultAsInt32. A
+		// TOP-LEVEL out-of-int32 int default is rejected at parse, but during
+		// union-branch SELECTION a wider sibling branch (e.g. double) makes the
+		// schema parse-valid, so this can run on a value parse never rejected. A
+		// blind int64→int32 cast would WRAP such a value (3000000000 →
+		// -1294967296), and branchAcceptsDefault would then accept the in-range
+		// wrapped value for the int branch the wire (validateLeaf → defaultAsInt32)
+		// rejects — selecting a different branch than the wire auto-fill and
+		// corrupting both Root().Default and the Root().Schema() rebuild. Leaving
+		// an out-of-range int64 unchanged lets defaultAsInt32 reject it so
+		// selection picks the wider sibling, matching the wire.
 		switch val := val.(type) {
 		case int32:
 			return val
-		case int64:
-			return int32(val)
-		case json.Number, string, float64:
+		case int64, json.Number, string, float64:
 			if n, err := defaultAsInt32(val); err == nil {
 				return n
 			}

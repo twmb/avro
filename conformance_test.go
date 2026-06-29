@@ -10588,6 +10588,184 @@ func TestRegression_UnionContainerNestedFloatDefaultSelectionMatchesWire(t *test
 	})
 }
 
+// TestRegression_UnionContainerNestedIntDefaultOverflowMatchesWire pins that the
+// metadata union-branch selector (branchAcceptsDefault → coerceMetadataDefault,
+// schema_node.go) does NOT silently WRAP an out-of-int32 int64 default while
+// coercing a CONTAINER branch's nested int child. A blind int64→int32 cast turned
+// 3000000000 into -1294967296, which then passed defaultAsInt32, so the metadata
+// selector accepted the int branch the wire selector (validateLeaf → defaultAsInt32)
+// correctly rejects — Root().Default reported a different branch and a corrupted
+// value than the binary auto-fill, and Root().Schema() re-emitted the wrapped
+// default and auto-filled a DIFFERENT wire branch.
+//
+// The default {"x":3000000000} exceeds int32, so the int branch cannot hold it; the
+// schema is parse-valid only because a wider sibling branch (double) accepts it. The
+// value-admitting sibling is what makes the overflow reachable — a same-class int-only
+// union would reject at parse and hide the divergence behind a parse error.
+//
+// Three surfaces are asserted: the binary auto-fill value, Root().Default, AND the
+// Root().Schema() rebuild re-encoding BYTE-IDENTICALLY (the rebuild is the severe
+// surface — a corrupted default silently changes the schema's wire). Crossed over the
+// three container shapes whose arms call coerceMetadataDefault: a nested int as a
+// record field, an array element, and a map value.
+//
+// Controls (consistency, NOT bugs — pinned so a future round does not "fix" the
+// sibling arms): a float-overflow default (1e300) is lossy-rounded to float32(+Inf)
+// IDENTICALLY on wire and metadata (lossy-by-destination; a correct rounding, not a
+// wrap to reject), and a long-out-of-int64 default (99999999999999999999) is rejected
+// by both selectors so both pick the double branch. The long arm only widens
+// (int32→int64) and the float arm lossy-rounds (float64→float32→±Inf), so neither
+// needs the int arm's range guard.
+//
+// Companion to TestRegression_UnionContainerNestedFloatDefaultSelectionMatchesWire
+// (string→float coercion) and TestRegression_UnionDefaultMetadataMatchesWireBranch_*
+// (which use an in-range default 42 and so never reach the int-overflow boundary).
+func TestRegression_UnionContainerNestedIntDefaultOverflowMatchesWire(t *testing.T) {
+	recA := `{"type":"record","name":"A","fields":[{"name":"x","type":%s}]}`
+	recB := `{"type":"record","name":"B","fields":[{"name":"x","type":%s}]}`
+	twoRec := func(ta, tb string) string {
+		return "[" + fmt.Sprintf(recA, ta) + "," + fmt.Sprintf(recB, tb) + "]"
+	}
+	leaf := func(v any) any { m, _ := v.(map[string]any); return m["x"] }
+	arrLeaf := func(v any) any {
+		m, _ := v.(map[string]any)
+		a, _ := m["x"].([]any)
+		if len(a) > 0 {
+			return a[0]
+		}
+		return nil
+	}
+	mapLeaf := func(v any) any {
+		m, _ := v.(map[string]any)
+		mm, _ := m["x"].(map[string]any)
+		return mm["k"]
+	}
+
+	// extract pulls the leaf value the union default carries; want is what BOTH the
+	// wire auto-fill and Root().Default must surface (the wider branch's Go type).
+	cases := []struct {
+		name    string
+		field   string
+		def     string
+		want    any
+		extract func(any) any
+	}{
+		{"int_overflow_record_field", twoRec(`"int"`, `"double"`), `{"x":3000000000}`, float64(3e9), leaf},
+		{"int_overflow_array_element",
+			twoRec(`{"type":"array","items":"int"}`, `{"type":"array","items":"double"}`),
+			`{"x":[3000000000]}`, float64(3e9), arrLeaf},
+		{"int_overflow_map_value",
+			twoRec(`{"type":"map","values":"int"}`, `{"type":"map","values":"double"}`),
+			`{"x":{"k":3000000000}}`, float64(3e9), mapLeaf},
+		{"long_overflow_control", twoRec(`"long"`, `"double"`), `{"x":99999999999999999999}`, float64(1e20), leaf},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			schema := `{"type":"record","name":"Outer","fields":[{"name":"f","type":` + c.field + `,"default":` + c.def + `}]}`
+			s, err := avro.Parse(schema)
+			if err != nil {
+				t.Fatalf("parse: %v\n  %s", err, schema)
+			}
+
+			// (a) Binary auto-fill is the contract: the default must land on the wider
+			// sibling branch and surface the value intact.
+			wire, err := s.Encode(map[string]any{})
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			var gb map[string]any
+			if _, err := s.Decode(wire, &gb); err != nil {
+				t.Fatalf("binary decode: %v", err)
+			}
+			if got := c.extract(gb["f"]); !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("wire auto-fill leaf = %T(%v), want %T(%v) (wrong branch on the wire)", got, got, c.want, c.want)
+			}
+			// JSON decode auto-fill (a missing field materializes the stored
+			// default via applyFieldDefault) must pick the same branch and value.
+			// Probed via a DIRECT DecodeJSON of an empty object, NOT an
+			// encode→decode round-trip — the latter would re-decode the bare
+			// untagged union value and hit the documented first-match loss
+			// (NOT_BUGS #5) on these overlapping record branches.
+			var gj map[string]any
+			if err := s.DecodeJSON([]byte(`{}`), &gj); err != nil {
+				t.Fatalf("json decode auto-fill: %v", err)
+			}
+			if got := c.extract(gj["f"]); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("JSON auto-fill leaf = %T(%v), want %T(%v)", got, got, c.want, c.want)
+			}
+
+			// (b) Root().Default must report the SAME branch+value the wire chose — for
+			// the int cases specifically NOT a wrapped int32.
+			if got := c.extract(s.Root().Fields[0].Default); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("Root().Default leaf = %T(%v), want %T(%v) (metadata selected a different branch/value than the wire — int64→int32 wrap)", got, got, c.want, c.want)
+			}
+
+			// (c) Root().Schema() rebuild must re-encode the auto-fill BYTE-IDENTICALLY:
+			// a wrapped default bakes a different value AND a different branch into the
+			// rebuilt schema's wire.
+			rn := s.Root()
+			rebuilt, err := rn.Schema()
+			if err != nil {
+				t.Fatalf("Root().Schema(): %v", err)
+			}
+			rwire, err := rebuilt.Encode(map[string]any{})
+			if err != nil {
+				t.Fatalf("rebuilt encode: %v", err)
+			}
+			if !bytes.Equal(rwire, wire) {
+				t.Errorf("Root().Schema() rebuild auto-fill = %x, want %x (original) — the rebuilt default selects a different wire branch/value", rwire, wire)
+			}
+		})
+	}
+
+	// Float-overflow CONTROL: lossy-by-destination, consistent on every surface.
+	// Pinned separately because the leaf is +Inf (not a plain equality) and to
+	// document the float arm must NOT be "fixed" to reject like the int arm.
+	t.Run("float_overflow_control", func(t *testing.T) {
+		schema := `{"type":"record","name":"Outer","fields":[{"name":"f","type":` +
+			twoRec(`"float"`, `"double"`) + `,"default":{"x":1e300}}]}`
+		s, err := avro.Parse(schema)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		isPosInf := func(v any) bool {
+			switch f := v.(type) {
+			case float32:
+				return math.IsInf(float64(f), 1)
+			case float64:
+				return math.IsInf(f, 1)
+			}
+			return false
+		}
+		wire, err := s.Encode(map[string]any{})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var gb map[string]any
+		if _, err := s.Decode(wire, &gb); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got := leaf(gb["f"]); !isPosInf(got) {
+			t.Fatalf("float control wire leaf = %T(%v), want +Inf (float branch, lossy-rounded)", got, got)
+		}
+		if got := leaf(s.Root().Fields[0].Default); !isPosInf(got) {
+			t.Errorf("float control Root().Default leaf = %T(%v), want +Inf (must match wire — lossy-by-destination, not a wrap)", got, got)
+		}
+		rn := s.Root()
+		rebuilt, err := rn.Schema()
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+		rwire, err := rebuilt.Encode(map[string]any{})
+		if err != nil {
+			t.Fatalf("rebuilt encode: %v", err)
+		}
+		if !bytes.Equal(rwire, wire) {
+			t.Errorf("float control rebuild = %x, want %x", rwire, wire)
+		}
+	})
+}
+
 // TestRegression_UnionDefaultEncodeMatchesValidateBranch pins that the
 // wire branch encoded for an auto-filled union default matches the branch
 // firstUnionBranchAcceptingDefault picked at parse time. validateDefault,
