@@ -1053,8 +1053,112 @@ func TestMatrix_GenerativeDefaultFill(t *testing.T) {
 // TestRegression_UnionContainerNestedFloatDefaultSelectionMatchesWire, the
 // single-shape pins this matrix generalizes).
 func TestMatrix_GenerativeUnionContainerDefaultFill(t *testing.T) {
-	// leaf branch | value-admitting sibling | default literal (in-range + boundary).
-	cells := []struct{ name, leaf, sib, defLit string }{
+	for _, c := range udfCells() {
+		for _, cont := range udfContainers() {
+			t.Run(c.name+"/"+cont.name, func(t *testing.T) {
+				branchA := fmt.Sprintf(`{"type":"record","name":"A","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.leaf))
+				branchB := fmt.Sprintf(`{"type":"record","name":"B","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.sib))
+				schema := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"f","type":[%s,%s],"default":%s}]}`,
+					branchA, branchB, cont.def(c.defLit))
+				udInvariant(t, schema, `{}`, map[string]any{}, udfIsLogical(c.leaf),
+					func(s *avro.Schema, a1 map[string]any) [][2]any {
+						return [][2]any{{s.Root().Fields[0].Default, a1["f"]}}
+					})
+			})
+		}
+	}
+}
+
+// TestMatrix_GenerativeUnionContainerDefaultFillRecursive runs the same union-
+// default invariant when the leaf-bearing branch is a SELF-REFERENTIAL record
+// (N{x:<leaf>, next:["null","N"]}), so the default-fill and the metadata coercion
+// run through a type that references itself — the second-occurrence / self-ref
+// path flat schemas and the matFrags×matCtxs core matrix never reach. Two default
+// depths: a shallow one ("next":null — the self-reference declared but not
+// traversed) and a one-level-deep one ("next":{...,"next":null} — the recursion
+// actually walked, so the coercion fires at BOTH levels). The leaf-bearing branch
+// N pairs with a value-admitting self-referential sibling S whose x is the wider
+// type, so a boundary default the leaf rejects is held by S and the cell is
+// reachable (the value-admitting-sibling rule).
+func TestMatrix_GenerativeUnionContainerDefaultFillRecursive(t *testing.T) {
+	// addNext appends a "next" field value to a {"x":...} default object.
+	addNext := func(obj, next string) string { return strings.TrimSuffix(obj, "}") + `,"next":` + next + "}" }
+	for _, c := range udfCells() {
+		for _, cont := range udfContainers() {
+			for _, depth := range []string{"shallow", "deep"} {
+				t.Run(c.name+"/"+cont.name+"/"+depth, func(t *testing.T) {
+					branchN := fmt.Sprintf(`{"type":"record","name":"N","fields":[{"name":"x","type":%s},{"name":"next","type":["null","N"]}]}`, cont.wrap(c.leaf))
+					branchS := fmt.Sprintf(`{"type":"record","name":"S","fields":[{"name":"x","type":%s},{"name":"next","type":["null","S"]}]}`, cont.wrap(c.sib))
+					inner := cont.def(c.defLit) // {"x":<container form>}
+					def := addNext(inner, "null")
+					if depth == "deep" {
+						def = addNext(inner, addNext(inner, "null"))
+					}
+					schema := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"f","type":[%s,%s],"default":%s}]}`,
+						branchN, branchS, def)
+					udInvariant(t, schema, `{}`, map[string]any{}, udfIsLogical(c.leaf),
+						func(s *avro.Schema, a1 map[string]any) [][2]any {
+							return [][2]any{{s.Root().Fields[0].Default, a1["f"]}}
+						})
+				})
+			}
+		}
+	}
+}
+
+// TestMatrix_GenerativeUnionContainerDefaultFillDiamond runs the same invariant
+// when the union-default-bearing record DiaT is referenced from TWO positions
+// (Outer{a:DiaT, b:DiaT}): DiaT is DEFINED at field a and a bare NAME REFERENCE at
+// field b. This exercises the second-occurrence reference path — where the cache
+// self-ref and type-alias cross-record bugs lived — for the default-fill class.
+// The wire must fill BOTH a.f and b.f from DiaT's default (the reference resolves
+// to the definition's default); Root() carries the default on the DEFINITION
+// (Fields[0]; a bare reference correctly surfaces as a name node with no inline
+// fields, so it is not separately asserted); and Root().Schema() must re-emit DiaT
+// as ONE definition + a reference (not duplicated or renamed), byte-identically.
+func TestMatrix_GenerativeUnionContainerDefaultFillDiamond(t *testing.T) {
+	for _, c := range udfCells() {
+		for _, cont := range udfContainers() {
+			t.Run(c.name+"/"+cont.name, func(t *testing.T) {
+				recA := fmt.Sprintf(`{"type":"record","name":"DiaA","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.leaf))
+				recB := fmt.Sprintf(`{"type":"record","name":"DiaB","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.sib))
+				tdef := fmt.Sprintf(`{"type":"record","name":"DiaT","fields":[{"name":"f","type":[%s,%s],"default":%s}]}`,
+					recA, recB, cont.def(c.defLit))
+				schema := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"a","type":%s},{"name":"b","type":"DiaT"}]}`, tdef)
+				fill := map[string]any{"a": map[string]any{}, "b": map[string]any{}}
+				_, a1, rebuilt := udInvariant(t, schema, `{"a":{},"b":{}}`, fill, udfIsLogical(c.leaf),
+					func(s *avro.Schema, a1 map[string]any) [][2]any {
+						// The DEFINITION (Fields[0]=a → DiaT → f) carries the default.
+						defT := s.Root().Fields[0].Type.Fields[0].Default
+						return [][2]any{{defT, a1["a"].(map[string]any)["f"]}}
+					})
+				// Reference path (every leaf, incl. logical): b.f must auto-fill from
+				// the SAME default the definition's a.f did.
+				aw := a1["a"].(map[string]any)["f"]
+				if bw := a1["b"].(map[string]any)["f"]; !matEqual(bw, aw) {
+					t.Errorf("reference branch b.f auto-fill diverges from definition a.f:\n  a.f = %#v\n  b.f = %#v", aw, bw)
+				}
+				// Structural: the rebuild defines DiaT exactly once (one definition + a
+				// reference, not duplicated/renamed) and re-parses.
+				if n := strings.Count(rebuilt.String(), `"name":"DiaT"`); n != 1 {
+					t.Errorf("rebuild defines DiaT %d times, want 1 (one definition + a reference):\n  %s", n, rebuilt.String())
+				}
+				if _, err := avro.Parse(rebuilt.String()); err != nil {
+					t.Errorf("rebuilt schema does not re-parse (duplicate/renamed type?): %v", err)
+				}
+			})
+		}
+	}
+}
+
+// udfCell is a leaf branch paired with a value-admitting wider/other sibling and a
+// default literal spanning the in-range and boundary/overflow value classes. The
+// three shape tests above share this table so flat, recursive, and diamond cross
+// the identical (leaf × value-class × container) axes.
+type udfCell struct{ name, leaf, sib, defLit string }
+
+func udfCells() []udfCell {
+	return []udfCell{
 		// int: in-range, both int32 boundaries, and the two overflow forms of the
 		// int64→int32 wrap — MaxInt32+1 wraps to a negative, 2^32 to a deceptively
 		// valid 0 — both of which the leaf branch must REJECT (sibling long holds it).
@@ -1088,90 +1192,104 @@ func TestMatrix_GenerativeUnionContainerDefaultFill(t *testing.T) {
 		{"timestamp_millis_in_range", `{"type":"long","logicalType":"timestamp-millis"}`, `"double"`, `1717243496789`},
 		{"timestamp_millis_beyond_int64", `{"type":"long","logicalType":"timestamp-millis"}`, `"double"`, `99999999999999999999`},
 	}
-	// Each container holds the leaf as a record field's value so the union stays
-	// legal (a union cannot hold two arrays or two maps directly).
-	containers := []struct {
-		name string
-		wrap func(leaf string) string  // the branch field "x"'s type
-		def  func(lit string) string   // the default literal in field-"x" container form
-	}{
+}
+
+func udfIsLogical(leaf string) bool { return strings.Contains(leaf, "logicalType") }
+
+// udfContainer holds the leaf as a record field "x"'s value (so a union of two
+// such records stays legal — a union cannot hold two arrays or two maps directly)
+// at one of three container depths.
+type udfContainer struct {
+	name string
+	wrap func(leaf string) string // the branch field "x"'s type
+	def  func(lit string) string  // the default literal in field-"x" container form
+}
+
+func udfContainers() []udfContainer {
+	return []udfContainer{
 		{"record_field", func(l string) string { return l }, func(lit string) string { return `{"x":` + lit + `}` }},
 		{"array_element", func(l string) string { return `{"type":"array","items":` + l + `}` }, func(lit string) string { return `{"x":[` + lit + `]}` }},
 		{"map_value", func(l string) string { return `{"type":"map","values":` + l + `}` }, func(lit string) string { return `{"x":{"k":` + lit + `}}` }},
 	}
-	for _, c := range cells {
-		for _, cont := range containers {
-			t.Run(c.name+"/"+cont.name, func(t *testing.T) {
-				branchA := fmt.Sprintf(`{"type":"record","name":"A","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.leaf))
-				branchB := fmt.Sprintf(`{"type":"record","name":"B","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.sib))
-				schema := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"f","type":[%s,%s],"default":%s}]}`,
-					branchA, branchB, cont.def(c.defLit))
-				s, err := avro.Parse(schema)
-				if err != nil {
-					t.Fatalf("parse: %v\n  %s", err, schema)
-				}
+}
 
-				// Binary auto-fill of an empty outer record is the oracle.
-				w1, err := s.Encode(map[string]any{})
-				if err != nil {
-					t.Fatalf("binary auto-fill encode: %v", err)
-				}
-				var a1 map[string]any
-				if _, err := s.Decode(w1, &a1); err != nil {
-					t.Fatalf("binary decode: %v", err)
-				}
-				j1, err := s.AppendEncodeJSON(nil, map[string]any{})
-				if err != nil {
-					t.Fatalf("json auto-fill encode: %v", err)
-				}
+// udInvariant runs the wire-as-oracle union-default invariant for one composed
+// default-fill schema, shared by the flat/recursive/diamond shape tests above. The
+// binary auto-fill decode of fillVal (an empty outer, whose missing nested defaults
+// materialize) is canonical; fillJSON is its JSON form for the direct DecodeJSON
+// fill. metaPairs returns, per metadata surface under test, the (Root-derived
+// Default, wire-decoded value) pair that must match type-exactly for a NON-logical
+// leaf (a logical leaf surfaces the raw Avro-native value per NOT_BUGS #30, so it
+// is covered by the rebuild + JSON-decode checks instead). Returns the parsed
+// schema, the canonical decode, and the metadata rebuild so a caller can add
+// shape-specific checks (the diamond's reference path + one-definition structure).
+func udInvariant(t *testing.T, schema, fillJSON string, fillVal map[string]any, logical bool,
+	metaPairs func(s *avro.Schema, a1 map[string]any) [][2]any) (*avro.Schema, map[string]any, *avro.Schema) {
+	t.Helper()
+	s, err := avro.Parse(schema)
+	if err != nil {
+		t.Fatalf("parse: %v\n  %s", err, schema)
+	}
+	w1, err := s.Encode(fillVal)
+	if err != nil {
+		t.Fatalf("binary auto-fill encode: %v", err)
+	}
+	var a1 map[string]any
+	if _, err := s.Decode(w1, &a1); err != nil {
+		t.Fatalf("binary decode: %v", err)
+	}
+	j1, err := s.AppendEncodeJSON(nil, fillVal)
+	if err != nil {
+		t.Fatalf("json auto-fill encode: %v", err)
+	}
 
-				// Non-logical: Root().Default equals the binary auto-fill decode,
-				// type-exactly. (A logical leaf surfaces the raw Avro-native value per
-				// NOT_BUGS #30, covered by the rebuild + JSON-decode checks below.)
-				if !strings.Contains(c.leaf, "logicalType") {
-					if meta := s.Root().Fields[0].Default; !matEqual(a1["f"], meta) {
-						t.Errorf("Root().Default disagrees with the binary auto-fill (wrong branch/value):\n  wire = %#v\n  meta = %#v", a1["f"], meta)
-					}
-				}
-
-				// Direct JSON decode auto-fill agrees with the binary auto-fill. A
-				// DIRECT DecodeJSON of an empty object materializes the stored default
-				// via applyFieldDefault — NOT a JSON encode→decode round-trip, which on
-				// these overlapping record branches would hit the documented bare
-				// untagged-union first-match loss (NOT_BUGS #5).
-				var dj map[string]any
-				if err := s.DecodeJSON([]byte(`{}`), &dj); err != nil {
-					t.Fatalf("json decode auto-fill: %v", err)
-				}
-				if !matEqual(dj["f"], a1["f"]) {
-					t.Errorf("JSON decode auto-fill disagrees with binary:\n  bin  = %#v\n  json = %#v", a1["f"], dj["f"])
-				}
-
-				// Root().Schema() rebuild re-encodes the auto-fill BYTE-IDENTICALLY on
-				// both wire formats — a wrapped/wrong-branch default silently changes
-				// the schema's wire through the documented metadata round-trip.
-				rn := s.Root()
-				rebuilt, err := rn.Schema()
-				if err != nil {
-					t.Fatalf("Root().Schema(): %v", err)
-				}
-				rw, err := rebuilt.Encode(map[string]any{})
-				if err != nil {
-					t.Fatalf("rebuilt binary auto-fill: %v", err)
-				}
-				if !bytes.Equal(rw, w1) {
-					t.Errorf("Root().Schema() binary rebuild auto-fill = %x, want %x (original — rebuilt default selects a different branch/value)", rw, w1)
-				}
-				rj, err := rebuilt.AppendEncodeJSON(nil, map[string]any{})
-				if err != nil {
-					t.Fatalf("rebuilt json auto-fill: %v", err)
-				}
-				if !bytes.Equal(rj, j1) {
-					t.Errorf("Root().Schema() JSON rebuild auto-fill = %s, want %s (original)", rj, j1)
-				}
-			})
+	// Non-logical: Root().Default equals the binary auto-fill decode, type-exactly
+	// (the direct metadata pin the int64→int32 wrap violated).
+	if !logical {
+		for _, pr := range metaPairs(s, a1) {
+			if meta, wire := pr[0], pr[1]; !matEqual(wire, meta) {
+				t.Errorf("Root().Default disagrees with the binary auto-fill (wrong branch/value):\n  wire = %#v\n  meta = %#v", wire, meta)
+			}
 		}
 	}
+
+	// Direct JSON decode auto-fill agrees with the binary auto-fill. A DIRECT
+	// DecodeJSON of the empty outer materializes the stored default via
+	// applyFieldDefault — NOT a JSON encode→decode round-trip, which on these
+	// overlapping record branches would hit the documented bare untagged-union
+	// first-match loss (NOT_BUGS #5).
+	var dj map[string]any
+	if err := s.DecodeJSON([]byte(fillJSON), &dj); err != nil {
+		t.Fatalf("json decode auto-fill: %v", err)
+	}
+	if !matEqual(dj, a1) {
+		t.Errorf("JSON decode auto-fill disagrees with binary:\n  bin  = %#v\n  json = %#v", a1, dj)
+	}
+
+	// Root().Schema() rebuild re-encodes the auto-fill BYTE-IDENTICALLY on both wire
+	// formats — the severe surface: a wrapped/wrong-branch default silently changes
+	// the schema's own wire through the documented metadata round-trip. This is
+	// representation-agnostic, so it covers logical leaves too.
+	rn := s.Root()
+	rebuilt, err := rn.Schema()
+	if err != nil {
+		t.Fatalf("Root().Schema(): %v", err)
+	}
+	rw, err := rebuilt.Encode(fillVal)
+	if err != nil {
+		t.Fatalf("rebuilt binary auto-fill: %v", err)
+	}
+	if !bytes.Equal(rw, w1) {
+		t.Errorf("Root().Schema() binary rebuild auto-fill = %x, want %x (rebuilt default selects a different branch/value)", rw, w1)
+	}
+	rj, err := rebuilt.AppendEncodeJSON(nil, fillVal)
+	if err != nil {
+		t.Fatalf("rebuilt json auto-fill: %v", err)
+	}
+	if !bytes.Equal(rj, j1) {
+		t.Errorf("Root().Schema() JSON rebuild auto-fill = %s, want %s (original)", rj, j1)
+	}
+	return s, a1, rebuilt
 }
 
 // TestMatrix_GenerativeProps pins Root().Props / Fields[].Props: they observe
