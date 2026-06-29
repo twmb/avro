@@ -1019,6 +1019,161 @@ func TestMatrix_GenerativeDefaultFill(t *testing.T) {
 	}
 }
 
+// TestMatrix_GenerativeUnionContainerDefaultFill is the durable net for the
+// union-default metadata↔wire class: when a union field's branches are CONTAINERS
+// (record/array/map) holding a leaf and the field has a default, the branch+value
+// the metadata selector (branchAcceptsDefault → coerceMetadataDefault) reports must
+// match the branch+value the wire auto-fill produces, on BOTH wire formats. Two
+// findings landed in this class from the SAME uncovered cells — a float string→float
+// coercion in a nested branch, then an int64→int32 overflow wrap — both hidden
+// because the prior nets (the flat TestMatrix_GenerativeDefaultFill above, and the
+// matFrags×matCtxs core matrix) drove only IN-RANGE values. This matrix crosses the
+// boundary/overflow value classes those miss.
+//
+// Wire-as-oracle (the AUDIT_CORE matrix contract — the binary auto-fill decode is
+// canonical). Per cell × container:
+//   - Root().Schema() rebuild re-encodes the auto-fill BYTE-IDENTICALLY on binary
+//     AND JSON. This is the severe surface: a wrapped or wrong-branch default
+//     silently changes the schema's own wire through the documented "Root preserves
+//     all metadata" round-trip. Representation-agnostic, so it holds for a logical
+//     leaf whose Default surfaces the raw Avro-native value (NOT_BUGS #30) while the
+//     wire decodes the transformed value.
+//   - the direct JSON decode auto-fill (DecodeJSON of an empty object, which
+//     materializes the stored default via applyFieldDefault) agrees with the binary
+//     auto-fill (matEqual).
+//   - for non-logical leaves, Root().Fields[].Default equals the binary auto-fill
+//     decode type-exactly (matEqual) — the direct metadata pin the int64→int32 wrap
+//     violated (int32(-1294967296) where the wire decoded float64(3e9)).
+//
+// Each cell pairs a leaf branch with a VALUE-ADMITTING wider/other sibling branch so
+// the schema parses: an overflow default the leaf rejects is held by the sibling and
+// the divergence surfaces. A same-class-rejecting sibling would reject the schema at
+// parse and hide the cell behind a parse error — exactly how these escaped (see
+// TestRegression_UnionContainerNestedIntDefaultOverflowMatchesWire and
+// TestRegression_UnionContainerNestedFloatDefaultSelectionMatchesWire, the
+// single-shape pins this matrix generalizes).
+func TestMatrix_GenerativeUnionContainerDefaultFill(t *testing.T) {
+	// leaf branch | value-admitting sibling | default literal (in-range + boundary).
+	cells := []struct{ name, leaf, sib, defLit string }{
+		// int: in-range, both int32 boundaries, and the two overflow forms of the
+		// int64→int32 wrap — MaxInt32+1 wraps to a negative, 2^32 to a deceptively
+		// valid 0 — both of which the leaf branch must REJECT (sibling long holds it).
+		{"int_in_range", `"int"`, `"long"`, `42`},
+		{"int_max", `"int"`, `"long"`, `2147483647`},
+		{"int_min", `"int"`, `"long"`, `-2147483648`},
+		{"int_overflow_negwrap", `"int"`, `"long"`, `2147483648`},
+		{"int_overflow_zerowrap", `"int"`, `"long"`, `4294967296`},
+		// long: in-range, both int64 boundaries, beyond-int64 (sibling double holds it).
+		{"long_in_range", `"long"`, `"double"`, `42`},
+		{"long_max", `"long"`, `"double"`, `9223372036854775807`},
+		{"long_min", `"long"`, `"double"`, `-9223372036854775808`},
+		{"long_beyond_int64", `"long"`, `"double"`, `99999999999999999999`},
+		// float/double overflow is lossy-by-destination (float32→±Inf), CONSISTENT on
+		// both surfaces — a control that must NOT be "fixed" to reject like the int arm.
+		{"float_in_range", `"float"`, `"double"`, `1.5`},
+		{"float_overflow_inf", `"float"`, `"double"`, `1e300`},
+		{"double_in_range", `"double"`, `"string"`, `1.5`},
+		{"double_large", `"double"`, `"string"`, `1e300`},
+		// stringy leaves vs a string sibling: in-range picks the leaf, the boundary
+		// (codepoint>0xFF / wrong fixed size / enum non-member) picks the sibling.
+		{"bytes_in_range", `"bytes"`, `"string"`, `"Aÿ"`},
+		{"bytes_codepoint_over_0xFF", `"bytes"`, `"string"`, `"Ā"`},
+		{"fixed_right_size", `{"type":"fixed","name":"FX","size":2}`, `"string"`, `"AB"`},
+		{"fixed_wrong_size", `{"type":"fixed","name":"FX","size":4}`, `"string"`, `"AB"`},
+		{"enum_member", `{"type":"enum","name":"EN","symbols":["A","B"]}`, `"string"`, `"A"`},
+		{"enum_nonmember", `{"type":"enum","name":"EN","symbols":["A","B"]}`, `"string"`, `"Z"`},
+		{"string_any", `"string"`, `"bytes"`, `"hello"`},
+		// logical leaf (long-backed): Default surfaces the raw long, the wire decodes
+		// time.Time — checked by the representation-agnostic rebuild + JSON agreement.
+		{"timestamp_millis_in_range", `{"type":"long","logicalType":"timestamp-millis"}`, `"double"`, `1717243496789`},
+		{"timestamp_millis_beyond_int64", `{"type":"long","logicalType":"timestamp-millis"}`, `"double"`, `99999999999999999999`},
+	}
+	// Each container holds the leaf as a record field's value so the union stays
+	// legal (a union cannot hold two arrays or two maps directly).
+	containers := []struct {
+		name string
+		wrap func(leaf string) string  // the branch field "x"'s type
+		def  func(lit string) string   // the default literal in field-"x" container form
+	}{
+		{"record_field", func(l string) string { return l }, func(lit string) string { return `{"x":` + lit + `}` }},
+		{"array_element", func(l string) string { return `{"type":"array","items":` + l + `}` }, func(lit string) string { return `{"x":[` + lit + `]}` }},
+		{"map_value", func(l string) string { return `{"type":"map","values":` + l + `}` }, func(lit string) string { return `{"x":{"k":` + lit + `}}` }},
+	}
+	for _, c := range cells {
+		for _, cont := range containers {
+			t.Run(c.name+"/"+cont.name, func(t *testing.T) {
+				branchA := fmt.Sprintf(`{"type":"record","name":"A","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.leaf))
+				branchB := fmt.Sprintf(`{"type":"record","name":"B","fields":[{"name":"x","type":%s}]}`, cont.wrap(c.sib))
+				schema := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"f","type":[%s,%s],"default":%s}]}`,
+					branchA, branchB, cont.def(c.defLit))
+				s, err := avro.Parse(schema)
+				if err != nil {
+					t.Fatalf("parse: %v\n  %s", err, schema)
+				}
+
+				// Binary auto-fill of an empty outer record is the oracle.
+				w1, err := s.Encode(map[string]any{})
+				if err != nil {
+					t.Fatalf("binary auto-fill encode: %v", err)
+				}
+				var a1 map[string]any
+				if _, err := s.Decode(w1, &a1); err != nil {
+					t.Fatalf("binary decode: %v", err)
+				}
+				j1, err := s.AppendEncodeJSON(nil, map[string]any{})
+				if err != nil {
+					t.Fatalf("json auto-fill encode: %v", err)
+				}
+
+				// Non-logical: Root().Default equals the binary auto-fill decode,
+				// type-exactly. (A logical leaf surfaces the raw Avro-native value per
+				// NOT_BUGS #30, covered by the rebuild + JSON-decode checks below.)
+				if !strings.Contains(c.leaf, "logicalType") {
+					if meta := s.Root().Fields[0].Default; !matEqual(a1["f"], meta) {
+						t.Errorf("Root().Default disagrees with the binary auto-fill (wrong branch/value):\n  wire = %#v\n  meta = %#v", a1["f"], meta)
+					}
+				}
+
+				// Direct JSON decode auto-fill agrees with the binary auto-fill. A
+				// DIRECT DecodeJSON of an empty object materializes the stored default
+				// via applyFieldDefault — NOT a JSON encode→decode round-trip, which on
+				// these overlapping record branches would hit the documented bare
+				// untagged-union first-match loss (NOT_BUGS #5).
+				var dj map[string]any
+				if err := s.DecodeJSON([]byte(`{}`), &dj); err != nil {
+					t.Fatalf("json decode auto-fill: %v", err)
+				}
+				if !matEqual(dj["f"], a1["f"]) {
+					t.Errorf("JSON decode auto-fill disagrees with binary:\n  bin  = %#v\n  json = %#v", a1["f"], dj["f"])
+				}
+
+				// Root().Schema() rebuild re-encodes the auto-fill BYTE-IDENTICALLY on
+				// both wire formats — a wrapped/wrong-branch default silently changes
+				// the schema's wire through the documented metadata round-trip.
+				rn := s.Root()
+				rebuilt, err := rn.Schema()
+				if err != nil {
+					t.Fatalf("Root().Schema(): %v", err)
+				}
+				rw, err := rebuilt.Encode(map[string]any{})
+				if err != nil {
+					t.Fatalf("rebuilt binary auto-fill: %v", err)
+				}
+				if !bytes.Equal(rw, w1) {
+					t.Errorf("Root().Schema() binary rebuild auto-fill = %x, want %x (original — rebuilt default selects a different branch/value)", rw, w1)
+				}
+				rj, err := rebuilt.AppendEncodeJSON(nil, map[string]any{})
+				if err != nil {
+					t.Fatalf("rebuilt json auto-fill: %v", err)
+				}
+				if !bytes.Equal(rj, j1) {
+					t.Errorf("Root().Schema() JSON rebuild auto-fill = %s, want %s (original)", rj, j1)
+				}
+			})
+		}
+	}
+}
+
 // TestMatrix_GenerativeProps pins Root().Props / Fields[].Props: they observe
 // the parsed custom attributes, survive the metadata rebuild, and are stripped
 // by Parsing Canonical Form (so they never perturb the fingerprint).
