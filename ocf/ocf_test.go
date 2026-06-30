@@ -596,6 +596,25 @@ func (e *errAfterN) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// failFirstWriteSink fails its first Write with err, then accepts every
+// subsequent write into buf. It models a sink whose state is "not knowable"
+// after a failed header write during Reset (the first write to the new sink):
+// an un-poisoned Writer would go on to emit a headerless block here, so the
+// poison contract is what stops the silent corruption.
+type failFirstWriteSink struct {
+	buf    bytes.Buffer
+	err    error
+	failed bool
+}
+
+func (f *failFirstWriteSink) Write(p []byte) (int, error) {
+	if !f.failed {
+		f.failed = true
+		return 0, f.err
+	}
+	return f.buf.Write(p)
+}
+
 func TestShortHeader(t *testing.T) {
 	// Only 3 bytes — not enough for magic.
 	_, err := NewReader(bytes.NewReader([]byte{0x4f, 0x62, 0x6a}))
@@ -1687,23 +1706,50 @@ func TestResetRandError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	v := int32(9)
 
-	var buf1 bytes.Buffer
-	w, err := NewWriter(&buf1, s)
+	// LIVE writer: NewWriter generates the initial sync before the override is
+	// installed. (Pre-fix this closed the writer first, so Reset returned
+	// errClosed and the randRead override below never ran — the test pinned
+	// nothing.)
+	var first bytes.Buffer
+	w, err := NewWriter(&first, s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Close(); err != nil {
+	if err := w.Encode(&v); err != nil {
 		t.Fatal(err)
 	}
 
+	// Fail sync-marker generation across the Reset.
 	orig := randRead
-	randRead = func(b []byte) (int, error) { return 0, errors.New("rand failed") }
+	boom := errors.New("rand boom")
+	randRead = func(b []byte) (int, error) { return 0, boom }
 	defer func() { randRead = orig }()
 
-	var buf2 bytes.Buffer
-	if err := w.Reset(&buf2); err == nil {
-		t.Fatal("expected error from rand during reset")
+	var second bytes.Buffer
+	rerr := w.Reset(&second)
+	if rerr == nil {
+		t.Fatal("Reset should return the sync-generation error")
+	}
+	if !errors.Is(rerr, boom) {
+		t.Fatalf("Reset error should wrap the rand error, got %v", rerr)
+	}
+	// The sink was repointed before sync generation failed, so the Writer is
+	// poisoned: every subsequent call returns the sticky error.
+	if err := w.Encode(&v); !errors.Is(err, boom) {
+		t.Fatalf("Encode after failed Reset: want sticky %v, got %v", boom, err)
+	}
+	if err := w.Flush(); !errors.Is(err, boom) {
+		t.Fatalf("Flush after failed Reset: want sticky %v, got %v", boom, err)
+	}
+	if err := w.Close(); !errors.Is(err, boom) {
+		t.Fatalf("Close after failed Reset: want sticky %v, got %v", boom, err)
+	}
+	// Sync generation fails before any header write, so the new sink is
+	// untouched — no partial/headerless stream.
+	if second.Len() != 0 {
+		t.Fatalf("new sink must be untouched after a sync-gen failure, got %d bytes", second.Len())
 	}
 }
 
@@ -2015,20 +2061,89 @@ func TestResetHeaderWriteError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	v := int32(7)
 
-	var buf bytes.Buffer
-	w, err := NewWriter(&buf, s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
+	// A failed Reset header write must POISON a LIVE writer: the sink was
+	// already repointed, so a subsequent Encode/Flush/Close must return the
+	// sticky error rather than silently emit a headerless block onto the new
+	// sink. (Pre-fix this used Close-before-Reset, so Reset returned errClosed
+	// and the header-write path was never exercised.)
+	t.Run("poisons", func(t *testing.T) {
+		var first bytes.Buffer
+		w, err := NewWriter(&first, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Encode(&v); err != nil {
+			t.Fatal(err)
+		}
 
-	// Reset to a writer that fails.
-	if err := w.Reset(&errAfterN{max: 0}); err == nil {
-		t.Fatal("expected error writing header during reset")
-	}
+		boom := errors.New("header write boom")
+		bad := &failFirstWriteSink{err: boom}
+		rerr := w.Reset(bad)
+		if rerr == nil {
+			t.Fatal("Reset should return the header-write error")
+		}
+		if !errors.Is(rerr, boom) {
+			t.Fatalf("Reset error should wrap the sink error, got %v", rerr)
+		}
+		// Sticky on every subsequent call.
+		if err := w.Encode(&v); !errors.Is(err, boom) {
+			t.Fatalf("Encode after failed Reset: want sticky %v, got %v", boom, err)
+		}
+		if err := w.Flush(); !errors.Is(err, boom) {
+			t.Fatalf("Flush after failed Reset: want sticky %v, got %v", boom, err)
+		}
+		if err := w.Close(); !errors.Is(err, boom) {
+			t.Fatalf("Close after failed Reset: want sticky %v, got %v", boom, err)
+		}
+		// No readable OCF leaked onto the new sink (un-poisoned, the post-Reset
+		// Encode/Flush would have written a headerless block here).
+		if _, err := NewReader(bytes.NewReader(bad.buf.Bytes())); err == nil {
+			t.Fatalf("new sink must not hold a readable OCF; %d bytes parsed", bad.buf.Len())
+		}
+	})
+
+	// A later successful Reset clears the poison and recovers, matching the
+	// flush arm.
+	t.Run("recovers", func(t *testing.T) {
+		var first bytes.Buffer
+		w, err := NewWriter(&first, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Encode(&v); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Reset(&failFirstWriteSink{err: errors.New("boom")}); err == nil {
+			t.Fatal("Reset to a failing sink should error")
+		}
+		if err := w.Encode(&v); err == nil {
+			t.Fatal("writer should be poisoned after a failed Reset")
+		}
+
+		var good bytes.Buffer
+		if err := w.Reset(&good); err != nil {
+			t.Fatalf("Reset to a good sink should recover, got %v", err)
+		}
+		if err := w.Encode(&v); err != nil {
+			t.Fatalf("Encode after recovery: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close after recovery: %v", err)
+		}
+		r, err := NewReader(&good)
+		if err != nil {
+			t.Fatalf("recovered OCF should be readable: %v", err)
+		}
+		var got int32
+		if err := r.Decode(&got); err != nil {
+			t.Fatalf("decode recovered datum: %v", err)
+		}
+		if got != v {
+			t.Fatalf("recovered datum = %d, want %d", got, v)
+		}
+	})
 }
 
 // ---------- Write (pre-encoded bytes) ----------

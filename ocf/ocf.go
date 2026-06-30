@@ -691,6 +691,14 @@ func (w *Writer) flush() error {
 // Writer is in an error state the flush is skipped and the error is cleared.
 // Reset returns an error if the Writer has been closed — its codec is no
 // longer usable.
+//
+// If Reset fails after it has repointed to dst — a sync-marker generation
+// error or a header write error — the Writer is poisoned exactly as a failed
+// [Writer.Encode] or [Writer.Flush] is: every subsequent Encode/Flush/Close
+// returns the sticky error until a later successful Reset clears it. (The
+// flush of the OLD destination, which runs before the repoint, also poisons
+// on failure.) Without this a caller that ignores Reset's returned error and
+// keeps writing would emit a silent headerless byte stream onto dst.
 func (w *Writer) Reset(dst io.Writer) error {
 	if w.closed {
 		return errClosed
@@ -704,12 +712,22 @@ func (w *Writer) Reset(dst io.Writer) error {
 	w.buf = w.buf[:0]
 	w.count = 0
 	w.err = nil
+	// The two steps below run AFTER the sink has been repointed to dst. A
+	// failure here leaves the Writer half-reset (new sink, no header written),
+	// so poison it — otherwise a caller that ignores the returned error and
+	// keeps writing emits a silent headerless stream onto dst. A later Reset
+	// clears w.err and recovers, matching the flush arm above.
 	if !w.hasSync {
 		if _, err := randRead(w.sync[:]); err != nil {
-			return fmt.Errorf("ocf: generating sync marker: %w", err)
+			w.err = fmt.Errorf("ocf: generating sync marker: %w", err)
+			return w.err
 		}
 	}
-	return w.writeHeader()
+	if err := w.writeHeader(); err != nil {
+		w.err = err
+		return w.err
+	}
+	return nil
 }
 
 // NewAppendWriter opens an existing OCF for appending. It reads the header

@@ -247,4 +247,168 @@ func (f *failAfterWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// toggleSink writes into buf until fail is flipped, then fails every Write
+// with err. Letting the test flip fail at a precise moment makes a chosen I/O
+// step (a specific block write, the Reset old-block flush) the one that fails
+// while every earlier write — including the header NewWriter emits — succeeds.
+type toggleSink struct {
+	buf  bytes.Buffer
+	fail bool
+	err  error
+}
+
+func (s *toggleSink) Write(p []byte) (int, error) {
+	if s.fail {
+		return 0, s.err
+	}
+	return s.buf.Write(p)
+}
+
+// Class invariant (NOT_BUGS #28): EVERY fallible I/O step in EVERY Writer
+// method must poison the Writer — once a sink write or the sync-marker source
+// fails, no later Encode/Flush silently succeeds and no further bytes land that
+// a reader would accept. TestMatrixOCF_StatefulPoison covers only Encode/Flush
+// after a block-write failure; this crosses the remaining (method × I/O step)
+// cells. Reset has THREE fallible steps — the old-block flush (before the
+// repoint), sync-marker generation, and the header write (both after the
+// repoint) — and the sync/header cells are the ones a prior gap missed
+// (Reset cleared w.err then failed without re-setting it, so the writer kept
+// emitting a headerless stream onto the new sink).
+func TestMatrixOCF_WriterIOFailurePoisonsEveryStep(t *testing.T) {
+	schema := avro.MustParse(`"int"`)
+	v := int32(7)
+
+	// Not-yet-closed Writer: poisoned with the exact sentinel on every call.
+	assertSticky := func(t *testing.T, w *Writer, sentinel error) {
+		t.Helper()
+		if err := w.Encode(&v); !errors.Is(err, sentinel) {
+			t.Fatalf("Encode after failure: want sticky %v, got %v", sentinel, err)
+		}
+		if err := w.Flush(); !errors.Is(err, sentinel) {
+			t.Fatalf("Flush after failure: want sticky %v, got %v", sentinel, err)
+		}
+		if err := w.Close(); !errors.Is(err, sentinel) {
+			t.Fatalf("Close after failure: want sticky %v, got %v", sentinel, err)
+		}
+	}
+	// Possibly-closed Writer (the Close cell): must never silently accept more.
+	assertNoSilentSuccess := func(t *testing.T, w *Writer) {
+		t.Helper()
+		if err := w.Encode(&v); err == nil {
+			t.Fatal("Encode after failure silently succeeded")
+		}
+		if err := w.Flush(); err == nil {
+			t.Fatal("Flush after failure silently succeeded")
+		}
+	}
+
+	t.Run("encode-block-write", func(t *testing.T) {
+		s := &toggleSink{err: errors.New("encblk")}
+		w, err := NewWriter(s, schema, WithBlockCount(1)) // header written
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.fail = true
+		if err := w.Encode(&v); !errors.Is(err, s.err) { // 1-count → block write
+			t.Fatalf("Encode block write: want %v, got %v", s.err, err)
+		}
+		assertSticky(t, w, s.err)
+	})
+
+	t.Run("flush-block-write", func(t *testing.T) {
+		s := &toggleSink{err: errors.New("flushblk")}
+		w, err := NewWriter(s, schema, WithBlockCount(1000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Encode(&v); err != nil { // buffered, no flush yet
+			t.Fatal(err)
+		}
+		s.fail = true
+		if err := w.Flush(); !errors.Is(err, s.err) {
+			t.Fatalf("Flush block write: want %v, got %v", s.err, err)
+		}
+		assertSticky(t, w, s.err)
+	})
+
+	t.Run("close-final-flush", func(t *testing.T) {
+		s := &toggleSink{err: errors.New("closeblk")}
+		w, err := NewWriter(s, schema, WithBlockCount(1000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Encode(&v); err != nil {
+			t.Fatal(err)
+		}
+		s.fail = true
+		if err := w.Close(); !errors.Is(err, s.err) {
+			t.Fatalf("Close final flush: want %v, got %v", s.err, err)
+		}
+		// Close legitimately closes; subsequent ops error (errClosed), not silent.
+		assertNoSilentSuccess(t, w)
+	})
+
+	t.Run("reset-old-block-flush", func(t *testing.T) {
+		a := &toggleSink{err: errors.New("resetoldblk")}
+		w, err := NewWriter(a, schema, WithBlockCount(1000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Encode(&v); err != nil { // buffered in the OLD sink
+			t.Fatal(err)
+		}
+		a.fail = true
+		var b bytes.Buffer
+		if err := w.Reset(&b); !errors.Is(err, a.err) { // old-block flush fails
+			t.Fatalf("Reset old-block flush: want %v, got %v", a.err, err)
+		}
+		assertSticky(t, w, a.err)
+	})
+
+	t.Run("reset-sync-generation", func(t *testing.T) {
+		var a bytes.Buffer
+		w, err := NewWriter(&a, schema) // initial sync generated here
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Encode(&v); err != nil {
+			t.Fatal(err)
+		}
+		orig := randRead
+		boom := errors.New("resetsync")
+		randRead = func(b []byte) (int, error) { return 0, boom }
+		defer func() { randRead = orig }()
+		var b bytes.Buffer
+		if err := w.Reset(&b); !errors.Is(err, boom) {
+			t.Fatalf("Reset sync gen: want %v, got %v", boom, err)
+		}
+		if b.Len() != 0 { // sync fails before any header write
+			t.Fatalf("new sink touched after sync-gen failure: %d bytes", b.Len())
+		}
+		assertSticky(t, w, boom)
+	})
+
+	t.Run("reset-header-write", func(t *testing.T) {
+		var a bytes.Buffer
+		w, err := NewWriter(&a, schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Encode(&v); err != nil {
+			t.Fatal(err)
+		}
+		boom := errors.New("resethdr")
+		b := &failFirstWriteSink{err: boom} // header write to new sink fails
+		if err := w.Reset(b); !errors.Is(err, boom) {
+			t.Fatalf("Reset header write: want %v, got %v", boom, err)
+		}
+		// Un-poisoned, the post-Reset Encode/Flush would emit a headerless block
+		// onto b; poisoned, nothing lands and b holds no readable OCF.
+		if _, err := NewReader(bytes.NewReader(b.buf.Bytes())); err == nil {
+			t.Fatalf("new sink holds a readable OCF (%d bytes)", b.buf.Len())
+		}
+		assertSticky(t, w, boom)
+	})
+}
+
 var _ = reflect.DeepEqual // keep reflect imported for future model asserts
