@@ -327,3 +327,79 @@ func jnStringSample(label string) any {
 		return "ab"
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Class-elimination differential net: a logical-on-numeric type must treat a
+// json.Number encode SOURCE identically to its underlying numeric type.
+//
+// json.Number is a numeric carrier (NOT_BUGS #35): its content must be a valid
+// RFC 8259 number, so a logical layered on a numeric base — date on int;
+// time-*/timestamp-*/local-timestamp-* on int/long — must never be MORE LENIENT
+// about non-numeric json.Number content than the plain int/long it wraps. The
+// ORACLE is calibration-free: the underlying numeric schema's own accept/reject
+// verdict for the same json.Number. No hardcoded "what is a number" list, so it
+// cannot rot as the numeric parser's grammar evolves.
+//
+// The discriminating input is content that is a valid TEMPORAL STRING but an
+// INVALID number ("2024-01-01", "2024-01-01T00:00:00Z"): the date/timestamp
+// encode string-convenience arms (tryParseDateString / tryParseTimeString) once
+// fired for json.Number (whose Kind() is reflect.String), encoding it as a
+// date/timestamp where the numeric twin rejects it. A generic non-numeric
+// battery ("xyz", "1.2.3") never reaches that arm — those fail time.Parse too,
+// so they reject with or without the leniency; only a temporal-shaped string
+// separates the buggy path from the correct one. This net is the differential
+// complement to TestMatrix_JSONNumberPolicy (which asserts the numeric base's
+// ABSOLUTE reject of non-numeric content); together they pin both "the base
+// rejects" and "the logical matches the base," across every encode context.
+func TestMatrix_JSONNumberLogicalMatchesNumericTwin(t *testing.T) {
+	logicals := []struct {
+		label, schema, twin string
+	}{
+		{"date", `{"type":"int","logicalType":"date"}`, `"int"`},
+		{"time-millis", `{"type":"int","logicalType":"time-millis"}`, `"int"`},
+		{"time-micros", `{"type":"long","logicalType":"time-micros"}`, `"long"`},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, `"long"`},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, `"long"`},
+		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, `"long"`},
+		{"local-timestamp-millis", `{"type":"long","logicalType":"local-timestamp-millis"}`, `"long"`},
+		{"local-timestamp-micros", `{"type":"long","logicalType":"local-timestamp-micros"}`, `"long"`},
+		{"local-timestamp-nanos", `{"type":"long","logicalType":"local-timestamp-nanos"}`, `"long"`},
+	}
+	// valid-number (both accept), two temporal-shaped strings that are invalid
+	// numbers (the discriminators — both must reject after the fix), and garbage
+	// (both reject via the numeric parser regardless).
+	contents := []string{"19723", "2024-01-01", "2024-01-01T00:00:00Z", "xyz"}
+
+	// verdicts returns whether (binary, JSON) encode of val against schemaJSON
+	// succeeds.
+	verdicts := func(schemaJSON string, val any) (binOK, jsonOK bool) {
+		s := avro.MustParse(schemaJSON)
+		_, be := s.AppendEncode(nil, val)
+		_, je := s.AppendEncodeJSON(nil, val)
+		return be == nil, je == nil
+	}
+
+	// Reuse jnPositions for the ENCODE-CONTEXT axis (top / record field / array
+	// element / map value / addressable struct field / nullable-union branch) —
+	// a json.Number at a struct field or container element can reach a different
+	// encode path than a top-level value.
+	for _, pos := range jnPositions {
+		for _, lg := range logicals {
+			for _, content := range contents {
+				t.Run(pos.label+"/"+lg.label+"/"+content, func(t *testing.T) {
+					val := pos.encodeVal(json.Number(content))
+					logBin, logJSON := verdicts(pos.schema(lg.schema), val)
+					twBin, twJSON := verdicts(pos.schema(lg.twin), val)
+					if logBin != twBin {
+						t.Errorf("binary encode verdict divergence: %s(json.Number(%q))=%v but numeric twin %s=%v — a logical must match its numeric base for a json.Number source",
+							lg.label, content, logBin, lg.twin, twBin)
+					}
+					if logJSON != twJSON {
+						t.Errorf("JSON encode verdict divergence: %s(json.Number(%q))=%v but numeric twin %s=%v",
+							lg.label, content, logJSON, lg.twin, twJSON)
+					}
+				})
+			}
+		}
+	}
+}

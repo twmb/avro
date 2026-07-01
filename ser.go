@@ -2020,8 +2020,17 @@ func (d Duration) String() string {
 }
 
 // tryParseTimeString attempts to parse a string value as RFC 3339.
+//
+// json.Number is excluded even though its Kind() is reflect.String: it is a
+// numeric carrier (its stdlib contract is an RFC 8259 number literal), so it
+// must fall through to the numeric encode arm (serLong / jsonCoerceToInt64),
+// which validates its content as a number and rejects non-numeric content —
+// rather than being reinterpreted here as a timestamp string. This mirrors the
+// decode side (formatToStringKindTarget) and keeps the numeric-carrier
+// exclusion uniform across every string-Kind encode gate (string/bytes/fixed/
+// enum all reject json.Number too).
 func tryParseTimeString(v reflect.Value) (time.Time, bool) {
-	if v.Kind() != reflect.String {
+	if v.Kind() != reflect.String || v.Type() == jsonNumberType {
 		return time.Time{}, false
 	}
 	t, err := time.Parse(time.RFC3339Nano, v.String())
@@ -2044,9 +2053,11 @@ func extractTime(v reflect.Value) (time.Time, bool) {
 }
 
 // tryParseDateString attempts to parse a string value as either RFC 3339 or
-// ISO 8601 date-only ("2006-01-02").
+// ISO 8601 date-only ("2006-01-02"). json.Number is excluded for the same
+// reason as [tryParseTimeString]: a numeric carrier must fall through to the
+// numeric encode arm, not be reinterpreted as a date string.
 func tryParseDateString(v reflect.Value) (time.Time, bool) {
-	if v.Kind() != reflect.String {
+	if v.Kind() != reflect.String || v.Type() == jsonNumberType {
 		return time.Time{}, false
 	}
 	s := v.String()

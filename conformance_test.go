@@ -21010,6 +21010,59 @@ func TestRegression_JSONNumberTargetAcceptedForTimeLogicals(t *testing.T) {
 	})
 }
 
+// TestRegression_JSONNumberNonNumericRejectedForTemporalEncode pins the encode
+// complement of TestRegression_JSONNumberTargetAcceptedForTimeLogicals. A
+// json.Number is a numeric carrier (NOT_BUGS #35 — its underlying string must
+// be a valid RFC 8259 number literal), so a json.Number whose content is a
+// valid date/RFC 3339 STRING but NOT a number must REJECT on every temporal
+// logical, exactly as the plain int/long base type and the decode side
+// (formatToStringKindTarget's json.Number exclusion) already do. Before the fix
+// the date/timestamp encode string-convenience arms (tryParseDateString /
+// tryParseTimeString) gated only on Kind()==reflect.String — which json.Number
+// satisfies — so they reinterpreted the json.Number as a date/timestamp string
+// and silently encoded it on both wire formats, a leniency the numeric twin and
+// the round-trippable numeric-carrier contract both forbid.
+func TestRegression_JSONNumberNonNumericRejectedForTemporalEncode(t *testing.T) {
+	cases := []struct {
+		name, schema, badContent string
+	}{
+		{"date", `{"type":"int","logicalType":"date"}`, "2024-01-01"},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, "2024-01-01T00:00:00Z"},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, "2024-01-01T00:00:00Z"},
+		{"timestamp-nanos", `{"type":"long","logicalType":"timestamp-nanos"}`, "2024-01-01T00:00:00Z"},
+		{"local-timestamp-millis", `{"type":"long","logicalType":"local-timestamp-millis"}`, "2024-01-01T00:00:00Z"},
+		{"local-timestamp-micros", `{"type":"long","logicalType":"local-timestamp-micros"}`, "2024-01-01T00:00:00Z"},
+		{"local-timestamp-nanos", `{"type":"long","logicalType":"local-timestamp-nanos"}`, "2024-01-01T00:00:00Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := avro.MustParse(tc.schema)
+			// The contract-violating (non-numeric) json.Number must reject on
+			// BOTH wire formats.
+			if _, err := s.AppendEncode(nil, json.Number(tc.badContent)); err == nil {
+				t.Errorf("binary Encode(json.Number(%q)) accepted; want reject (non-numeric json.Number per NOT_BUGS #35)", tc.badContent)
+			}
+			if _, err := s.AppendEncodeJSON(nil, json.Number(tc.badContent)); err == nil {
+				t.Errorf("EncodeJSON(json.Number(%q)) accepted; want reject", tc.badContent)
+			}
+			// Control 1: a numeric json.Number is the valid carrier and must
+			// still encode on both wires — the fix must not over-tighten.
+			if _, err := s.AppendEncode(nil, json.Number("19723")); err != nil {
+				t.Errorf("binary Encode(json.Number(\"19723\")) rejected; the numeric carrier must still work: %v", err)
+			}
+			if _, err := s.AppendEncodeJSON(nil, json.Number("19723")); err != nil {
+				t.Errorf("EncodeJSON(json.Number(\"19723\")) rejected; the numeric carrier must still work: %v", err)
+			}
+			// Control 2: a plain Go string keeps the RFC 3339 / DateOnly
+			// convenience — only json.Number is excluded, not string-kind values
+			// in general.
+			if _, err := s.AppendEncode(nil, tc.badContent); err != nil {
+				t.Errorf("binary Encode(string %q) rejected; the Go-string convenience must remain: %v", tc.badContent, err)
+			}
+		})
+	}
+}
+
 // TestRegression_JSONNumberStringSourceRejectedOnEncode pins that the encode
 // side rejects json.Number for EVERY non-numeric Avro type — string,
 // string+uuid, bytes, fixed, and fixed+uuid. json.Number is a numeric carrier
