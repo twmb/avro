@@ -71,9 +71,12 @@ type SchemaNode struct {
 	// namespace-prefixed metadata like "com.example.tag").
 	//
 	// Values use the natural Go types from JSON: string, bool, nil,
-	// []any, map[string]any, plus int64 for whole numbers, float64
-	// for fractional, and json.Number for whole numbers too large for
-	// int64. Whole-valued exponents collapse to int64 (1e3 reads as
+	// []any, map[string]any, plus int64 for whole numbers and float64
+	// for fractional. A number is preserved as json.Number when it
+	// cannot be represented otherwise: a whole number too large for
+	// int64, or a fractional literal too long to parse as a float
+	// (over 1024 bytes), whose digits are kept verbatim rather than
+	// rounded. Whole-valued exponents collapse to int64 (1e3 reads as
 	// int64(1000)), and exponents that overflow float64 give ±Inf.
 	//
 	// math.NaN() stored in Props re-reads as string "NaN" after

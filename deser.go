@@ -2220,10 +2220,14 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	if ok, err := setDecimalValue(v, b, s.scale); ok {
 		return src, err
 	}
-	// Opaque-bytes pass-through: mirrors serBytesDecimal's fall-through
-	// to serBytes when the input isn't a coercible numeric type — see
-	// also deserFixedDecimal below. Without this, an []byte/string
-	// target encoded via the pass-through can't be decoded back.
+	// Opaque-bytes pass-through for a []byte target: mirrors
+	// serBytesDecimal's fall-through to serBytes for a []byte carrier (the
+	// opaque escape hatch) — see also deserFixedDecimal below. A string
+	// target never reaches here: setDecimalRat's string arm (above) always
+	// reads the wire as numeric decimal text, and the encoder rejects a
+	// non-numeric string for a decimal (rejectNonNumericDecimalString,
+	// ser.go), so string is numeric-text-only on BOTH sides while []byte is
+	// the sole opaque carrier, symmetric on both sides.
 	return src, setBytesValue(v, b, "decimal")
 }
 

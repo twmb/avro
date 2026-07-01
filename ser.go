@@ -2360,6 +2360,30 @@ func appendDecimalFixed(dst, b []byte, size int, goType reflect.Type) ([]byte, e
 	return append(dst, b...), nil
 }
 
+// rejectNonNumericDecimalString rejects a reflect.String carrier that reached a
+// decimal-on-bytes / decimal-on-fixed opaque fall-through. A numeric string is
+// consumed by decimalRatFor (ok==true) before this point, so a string that
+// reaches here is non-numeric — and decimal's string DECODE target always reads
+// numeric text (setDecimalRat, deser.go), so encoding it opaquely emits bytes
+// the decoder reads back as decimal text, breaking the round trip. For the
+// decimal logical the string carrier is the numeric-text form ONLY; []byte is
+// the opaque escape hatch (Kind Slice, not matched here) and round-trips
+// symmetrically on both sides. Mirrors tryCoerceToRat's json.Number reject and
+// keeps encode symmetric with decode.
+//
+// This is deliberately stricter than the plain bytes/fixed encode-side string
+// leniency: there a string round-trips opaquely because a plain bytes/fixed
+// string DECODE target reads raw bytes, so accepting it is symmetric. It is NOT
+// applied to big-decimal, whose string DECODE target also falls through to raw
+// bytes (applyBigDecimalPayload, deser.go), so a big-decimal string carrier
+// round-trips opaquely on both sides and stays accepted.
+func rejectNonNumericDecimalString(v reflect.Value, avroType string) error {
+	if v.Kind() == reflect.String {
+		return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("invalid decimal string %q", truncForError(v.String()))}
+	}
+	return nil
+}
+
 type serBytesDecimal struct {
 	precision int
 	scale     int
@@ -2381,6 +2405,9 @@ func (s *serBytesDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 	}
 	if ok {
 		return s.serRat(dst, r)
+	}
+	if err := rejectNonNumericDecimalString(v, "bytes"); err != nil {
+		return nil, err
 	}
 	return serBytes(dst, v, depth)
 }
@@ -2406,6 +2433,9 @@ func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 	}
 	if ok {
 		return s.serRat(dst, r)
+	}
+	if err := rejectNonNumericDecimalString(v, "fixed"); err != nil {
+		return nil, err
 	}
 	return (&serSize{s.size}).ser(dst, v, depth)
 }

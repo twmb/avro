@@ -6353,12 +6353,14 @@ func TestRegression_IsNilValueDepth5Parity(t *testing.T) {
 }
 
 // TestRegression_SchemaNodePropsDocstringContract pins the boundary
-// behavior the SchemaNode.Props docstring describes: "literals
-// exceeding maxParseFloatLen (1024) chars fall back to json.Number."
-// Without this assertion the docstring could drift away from the
-// DoS-defense length cap in the implementation. This test asserts
-// the documented contract at boundary points so future docstring
-// edits stay aligned.
+// behavior the SchemaNode.Props docstring describes: a small fractional
+// surfaces as float64, an exponent that overflows float64 as ±Inf, and a
+// fractional literal too long to parse as a float (over maxParseFloatLen =
+// 1024 bytes) is preserved as json.Number with its digits verbatim rather
+// than rounded. Without these assertions the docstring could drift away
+// from the DoS-defense length cap in the implementation; this test asserts
+// the documented contract at boundary points so future docstring edits
+// stay aligned.
 func TestRegression_SchemaNodePropsDocstringContract(t *testing.T) {
 	t.Run("small_fractional_is_float64", func(t *testing.T) {
 		s := avro.MustParse(`{"type":"long","my.x":1.5}`)
@@ -15891,14 +15893,26 @@ func TestParity_AcceptedLeniencies(t *testing.T) {
 		}
 	})
 	t.Run("decimal opaque-bytes pass-through on encode", func(t *testing.T) {
-		// serBytesDecimal falls through to serBytes when the input
-		// isn't a coercible numeric type — preserves the documented
-		// opaque-bytes pass-through for users who construct the wire
-		// payload manually. AppendEncode of an arbitrary string
-		// silently encodes the raw bytes.
+		// The opaque-bytes pass-through remains for a []byte carrier (the
+		// escape hatch for users who construct the wire payload manually)
+		// and for big-decimal strings (whose decode target is opaque too, so
+		// they round-trip symmetrically). A regular decimal's STRING carrier
+		// is numeric-text-only: a non-numeric string is REJECTED, symmetric
+		// with decode (whose string target always reads numeric decimal
+		// text) — see NOT_BUGS #51.
 		s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
-		if _, err := s.AppendEncode(nil, "not a number"); err != nil {
-			t.Errorf("string pass-through should succeed: %v", err)
+		// []byte carrier: opaque pass-through still succeeds.
+		if _, err := s.AppendEncode(nil, []byte("ab")); err != nil {
+			t.Errorf("[]byte opaque pass-through should succeed: %v", err)
+		}
+		// Non-numeric string carrier: now rejected (numeric-text-only).
+		if _, err := s.AppendEncode(nil, "not a number"); err == nil {
+			t.Errorf("non-numeric string against a regular decimal should REJECT (numeric-text-only); accepted")
+		}
+		// big-decimal keeps the string opaque pass-through.
+		bd := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
+		if _, err := bd.AppendEncode(nil, "not a number"); err != nil {
+			t.Errorf("big-decimal string opaque pass-through should succeed: %v", err)
 		}
 	})
 	t.Run("whole-number float encodes against int", func(t *testing.T) {
@@ -17480,18 +17494,24 @@ func TestRegression_NumberGrammarParityMatrix(t *testing.T) {
 
 // TestRegression_NumberGrammarParityMatrix_Decimal extends the grammar
 // matrix to the decimal / big-decimal encode paths, where the coercion
-// runs through tryCoerceToRat → boundedRatFromString. Same grammar rule:
-// json.Number must be RFC 8259 valid; strings are coerced only when
-// they look like JSON numbers (first char '-' or digit), otherwise fall
-// through to opaque-bytes encoding.
+// runs through tryCoerceToRat → boundedRatFromString. Same grammar rule
+// for what counts as a number: json.Number must be RFC 8259 valid.
+//
+// The STRING carrier differs by logical type. For a regular decimal
+// (bytes/fixed) a string is the numeric-text form ONLY — a non-numeric
+// string is REJECTED, identically to the json.Number arm (the jn column),
+// so encode stays symmetric with decode (whose string target reads
+// numeric decimal text). For big-decimal a non-numeric string falls
+// through to opaque-bytes encoding (its decode target is opaque too, so
+// it round-trips symmetrically). See NOT_BUGS #51.
 func TestRegression_NumberGrammarParityMatrix_Decimal(t *testing.T) {
-	// (input, jsonNumberAccepts, stringAccepts) — string arm's
-	// "fall-through to raw bytes" path differs from json.Number's
-	// "always treat as a number".
+	// (input, jsonNumberAccepts, stringAccepts) — the string arm matches
+	// json.Number for a regular decimal (numeric-text-only) and keeps the
+	// opaque fall-through only for big-decimal.
 	cases := []struct {
 		input string
 		jn    bool // json.Number behavior: accept (valid) / reject (invalid)
-		str   bool // string behavior: accept (number) / fall-through (opaque) — both succeed; both error states are when bound exceeded or numeric-looking but malformed
+		str   bool // big-decimal string behavior: accept (number OR opaque non-numeric fall-through) / error (numeric-looking but malformed). A regular decimal uses the jn column instead (numeric-text-only).
 		desc  string
 	}{
 		// Valid JSON-number inputs encode successfully on both arms.
@@ -17513,16 +17533,21 @@ func TestRegression_NumberGrammarParityMatrix_Decimal(t *testing.T) {
 		{"+5", false, false, "leading plus"},
 		{"01", false, false, "leading zero"},
 
-		// Non-numeric inputs: json.Number arm errors (json.Number's
-		// type asserts "this is a number"); string arm falls through
-		// to opaque-bytes encoding so encode succeeds.
+		// Non-numeric inputs: the json.Number arm errors (its type asserts
+		// "this is a number"). The string arm falls through to opaque-bytes
+		// encoding ONLY for big-decimal (str=true); a regular decimal now
+		// rejects it (numeric-text-only — the test uses the jn column there,
+		// via the schema loop's opaqueString flag).
 		{"abc", false, true, "non-numeric string"},
 		{"hello", false, true, "non-numeric word"},
 	}
 
-	for _, sj := range []struct{ schemaJSON, name string }{
-		{`{"type":"bytes","logicalType":"decimal","precision":20,"scale":4}`, "decimal-bytes"},
-		{`{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal"},
+	for _, sj := range []struct {
+		schemaJSON, name string
+		opaqueString     bool // big-decimal: a non-numeric string encodes opaque; a regular decimal rejects it (numeric-text-only)
+	}{
+		{`{"type":"bytes","logicalType":"decimal","precision":20,"scale":4}`, "decimal-bytes", false},
+		{`{"type":"bytes","logicalType":"big-decimal"}`, "big-decimal", true},
 	} {
 		s, err := avro.Parse(sj.schemaJSON)
 		if err != nil {
@@ -17535,10 +17560,16 @@ func TestRegression_NumberGrammarParityMatrix_Decimal(t *testing.T) {
 				if (jnErr == nil) != c.jn {
 					t.Errorf("json.Number %q against %s: want accept=%v, got err=%v", c.input, sj.name, c.jn, jnErr)
 				}
-				// String arm.
+				// String arm. For a regular decimal a string is
+				// numeric-text-only, so it matches the json.Number column;
+				// big-decimal keeps the opaque non-numeric fall-through.
+				wantStr := c.jn
+				if sj.opaqueString {
+					wantStr = c.str
+				}
 				_, sErr := s.AppendEncode(nil, c.input)
-				if (sErr == nil) != c.str {
-					t.Errorf("string %q against %s: want accept=%v, got err=%v", c.input, sj.name, c.str, sErr)
+				if (sErr == nil) != wantStr {
+					t.Errorf("string %q against %s: want accept=%v, got err=%v", c.input, sj.name, wantStr, sErr)
 				}
 			})
 		}

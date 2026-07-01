@@ -499,6 +499,14 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 					}
 					return appendAvroJSONBytes(buf, b), nil
 				}
+				// A non-numeric string carrier is not a valid decimal; reject
+				// it (numeric-text-only, symmetric with decode and with the
+				// binary serBytesDecimal path) rather than fall through to the
+				// opaque raw-bytes string arm below. []byte keeps the opaque
+				// fall-through; big-decimal (next case) stays opaque-symmetric.
+				if err := rejectNonNumericDecimalString(v, "bytes"); err != nil {
+					return nil, err
+				}
 			}
 		case "big-decimal":
 			if noCustomEnc {
@@ -581,6 +589,14 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 						return nil, err
 					}
 					return appendAvroJSONBytes(buf, padded), nil
+				}
+				// A non-numeric string carrier is not a valid decimal; reject
+				// it (numeric-text-only, symmetric with decode and with the
+				// binary serFixedDecimal path) rather than fall through to the
+				// size-checked opaque raw arm below. []byte keeps the opaque
+				// fall-through.
+				if err := rejectNonNumericDecimalString(v, "fixed"); err != nil {
+					return nil, err
 				}
 			case "duration":
 				// Duration.Bytes() always emits 12 bytes, so it is only correct
