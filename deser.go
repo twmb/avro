@@ -2225,7 +2225,7 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	// opaque escape hatch) — see also deserFixedDecimal below. A string
 	// target never reaches here: setDecimalRat's string arm (above) always
 	// reads the wire as numeric decimal text, and the encoder rejects a
-	// non-numeric string for a decimal (rejectNonNumericDecimalString,
+	// non-numeric string for a decimal (rejectNonNumericStructuredString,
 	// ser.go), so string is numeric-text-only on BOTH sides while []byte is
 	// the sole opaque carrier, symmetric on both sides.
 	return src, setBytesValue(v, b, "decimal")

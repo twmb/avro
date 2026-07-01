@@ -2360,26 +2360,31 @@ func appendDecimalFixed(dst, b []byte, size int, goType reflect.Type) ([]byte, e
 	return append(dst, b...), nil
 }
 
-// rejectNonNumericDecimalString rejects a reflect.String carrier that reached a
-// decimal-on-bytes / decimal-on-fixed opaque fall-through. A numeric string is
-// consumed by decimalRatFor (ok==true) before this point, so a string that
-// reaches here is non-numeric — and decimal's string DECODE target always reads
-// numeric text (setDecimalRat, deser.go), so encoding it opaquely emits bytes
-// the decoder reads back as decimal text, breaking the round trip. For the
-// decimal logical the string carrier is the numeric-text form ONLY; []byte is
-// the opaque escape hatch (Kind Slice, not matched here) and round-trips
-// symmetrically on both sides. Mirrors tryCoerceToRat's json.Number reject and
-// keeps encode symmetric with decode.
+// rejectNonNumericStructuredString rejects a reflect.String carrier that reached
+// a decimal / big-decimal opaque fall-through. A numeric string is consumed by
+// decimalRatFor (ok==true) before this point, so a string that reaches here is
+// non-numeric — and the string DECODE target of both logicals reads the wire as
+// numeric text whenever it can (decimal: setDecimalRat always; big-decimal:
+// setDecimalRat via applyBigDecimalPayload whenever the payload parses as valid
+// framing). Encoding a non-numeric string opaquely therefore emits bytes the
+// decoder reads back as a number — and a crafted string whose raw bytes ARE a
+// valid framing (for big-decimal, e.g. the 3 bytes that spell unscaled 5) decode
+// to a different value, silently breaking the round trip. For both logicals the
+// string carrier is the numeric-text form ONLY; []byte is the opaque escape
+// hatch (Kind Slice, not matched here) and round-trips symmetrically on both
+// sides (its decode target reads raw bytes unconditionally). Mirrors
+// tryCoerceToRat's json.Number reject and keeps encode symmetric with decode.
 //
 // This is deliberately stricter than the plain bytes/fixed encode-side string
 // leniency: there a string round-trips opaquely because a plain bytes/fixed
-// string DECODE target reads raw bytes, so accepting it is symmetric. It is NOT
-// applied to big-decimal, whose string DECODE target also falls through to raw
-// bytes (applyBigDecimalPayload, deser.go), so a big-decimal string carrier
-// round-trips opaquely on both sides and stays accepted.
-func rejectNonNumericDecimalString(v reflect.Value, avroType string) error {
+// string DECODE target reads raw bytes, so accepting it is symmetric. Neither
+// Java nor fastavro accepts a native string for a decimal / big-decimal schema
+// at all, so there is no interop cost. logical labels the SemanticError message
+// ("decimal" or "big-decimal"); avroType is the underlying Avro type ("bytes" /
+// "fixed").
+func rejectNonNumericStructuredString(v reflect.Value, avroType, logical string) error {
 	if v.Kind() == reflect.String {
-		return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("invalid decimal string %q", truncForError(v.String()))}
+		return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("invalid %s string %q", logical, truncForError(v.String()))}
 	}
 	return nil
 }
@@ -2406,7 +2411,7 @@ func (s *serBytesDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 	if ok {
 		return s.serRat(dst, r)
 	}
-	if err := rejectNonNumericDecimalString(v, "bytes"); err != nil {
+	if err := rejectNonNumericStructuredString(v, "bytes", "decimal"); err != nil {
 		return nil, err
 	}
 	return serBytes(dst, v, depth)
@@ -2434,7 +2439,7 @@ func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 	if ok {
 		return s.serRat(dst, r)
 	}
-	if err := rejectNonNumericDecimalString(v, "fixed"); err != nil {
+	if err := rejectNonNumericStructuredString(v, "fixed", "decimal"); err != nil {
 		return nil, err
 	}
 	return (&serSize{s.size}).ser(dst, v, depth)
@@ -2450,8 +2455,19 @@ func (s *serBigDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, err
 	if ok {
 		return s.serRat(dst, r, v.Type())
 	}
-	// Fall back to plain bytes: preserves opaque-bytes pass-through
-	// for users who construct the wire payload manually.
+	// A non-numeric string carrier is not a valid big-decimal; reject it
+	// (numeric-text-only, symmetric with decode) rather than fall through to
+	// the opaque raw-bytes path below. A big-decimal string DECODE target reads
+	// numeric text whenever the wire parses as valid framing
+	// (applyBigDecimalPayload → setDecimalRat, deser.go), so a crafted string
+	// whose bytes ARE a valid framing would decode to a different value —
+	// mirrors serBytesDecimal / serFixedDecimal.
+	if err := rejectNonNumericStructuredString(v, "bytes", "big-decimal"); err != nil {
+		return nil, err
+	}
+	// Fall back to plain bytes for a []byte carrier: preserves opaque-bytes
+	// pass-through for users who construct the wire payload manually. A []byte
+	// decode target reads raw bytes unconditionally, so []byte is symmetric.
 	return serBytes(dst, v, depth)
 }
 

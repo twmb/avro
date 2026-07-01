@@ -504,7 +504,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				// binary serBytesDecimal path) rather than fall through to the
 				// opaque raw-bytes string arm below. []byte keeps the opaque
 				// fall-through; big-decimal (next case) stays opaque-symmetric.
-				if err := rejectNonNumericDecimalString(v, "bytes"); err != nil {
+				if err := rejectNonNumericStructuredString(v, "bytes", "decimal"); err != nil {
 					return nil, err
 				}
 			}
@@ -520,6 +520,15 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 						return nil, semErrW(v, "bytes", err)
 					}
 					return appendAvroJSONBytes(buf, inner), nil
+				}
+				// A non-numeric string carrier is not a valid big-decimal;
+				// reject it (numeric-text-only, symmetric with decode and the
+				// binary serBigDecimal path) rather than fall through to the
+				// opaque raw string arm below. A crafted string whose bytes form
+				// valid framing would otherwise decode to a different value.
+				// []byte keeps the opaque fall-through.
+				if err := rejectNonNumericStructuredString(v, "bytes", "big-decimal"); err != nil {
+					return nil, err
 				}
 			}
 		}
@@ -595,7 +604,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				// binary serFixedDecimal path) rather than fall through to the
 				// size-checked opaque raw arm below. []byte keeps the opaque
 				// fall-through.
-				if err := rejectNonNumericDecimalString(v, "fixed"); err != nil {
+				if err := rejectNonNumericStructuredString(v, "fixed", "decimal"); err != nil {
 					return nil, err
 				}
 			case "duration":

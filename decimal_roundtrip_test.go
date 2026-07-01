@@ -1,6 +1,7 @@
 package avro_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -104,9 +105,11 @@ func TestDecimalFloat32SourcePrecision(t *testing.T) {
 // decoder read back as a decimal number ("abcxyz" -> "107075203529.082"),
 // breaking the round trip. []byte remains the sole opaque escape hatch
 // (symmetric on both sides); a numeric string and a numeric json.Number still
-// encode. big-decimal is excluded — its string decode target falls through to
-// raw bytes, so its string carrier is opaque-symmetric and must stay accepted
-// (asserted here as a control that the fix did not over-reach).
+// encode. big-decimal is numeric-text-only too: its string decode target reads
+// numeric text whenever the wire parses as valid AVRO-4124 framing (via
+// applyBigDecimalPayload), so a crafted string whose bytes ARE a valid framing
+// would decode to a different value — it is rejected on encode identically to
+// decimal (a []byte carrier stays opaque-symmetric).
 func TestRegression_DecimalStringCarrierIsNumericTextOnly(t *testing.T) {
 	const nonNumeric = "abcxyz" // 6 bytes: fits a fixed[6] as raw bytes, but is not a number
 	const numeric = "0.312"     // unscaled 312 at scale 3
@@ -170,21 +173,51 @@ func TestRegression_DecimalStringCarrierIsNumericTextOnly(t *testing.T) {
 		})
 	}
 
-	// Control: big-decimal's string carrier stays opaque-symmetric on both
-	// wires (the fix must NOT reach big-decimal).
+	// big-decimal is numeric-text-only too (like decimal): a non-numeric string
+	// carrier is rejected on both wires — INCLUDING a crafted string whose raw
+	// bytes form valid AVRO-4124 framing, which the string decode target would
+	// otherwise read back as a number (the silent round-trip corruption). A
+	// numeric string round-trips as numeric text; []byte stays opaque.
 	bd := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
+	// varint(uLen=1) || unscaled 0x05 (=5) || varint(scale=0): byte-identical to
+	// the structured big-decimal wire for the number 5, so an opaque encode of
+	// this string decoded back to "5".
+	const bdFraming = "\x02\x05\x00"
 	for _, bin := range []bool{true, false} {
-		wire, err := encodeWire(bd, nonNumeric, bin)
+		// Reject: the valid-framing string (the corruption trigger).
+		if _, err := encodeWire(bd, bdFraming, bin); err == nil {
+			t.Errorf("big-decimal %s Encode(valid-framing string) accepted; a big-decimal string carrier is numeric-text-only (its bytes would decode to a number)", wireName(bin))
+		}
+		// Reject: a non-framing non-numeric string too (consistent with decimal).
+		if _, err := encodeWire(bd, nonNumeric, bin); err == nil {
+			t.Errorf("big-decimal %s Encode(non-numeric string) accepted; want reject", wireName(bin))
+		}
+		// Control: a numeric string round-trips as numeric text.
+		wire, err := encodeWire(bd, "5", bin)
 		if err != nil {
-			t.Fatalf("big-decimal %s Encode(string): %v (must stay opaque-accepted)", wireName(bin), err)
+			t.Fatalf("big-decimal %s Encode(numeric string): %v", wireName(bin), err)
 		}
 		var back string
 		if err := decodeWire(bd, wire, &back, bin); err != nil {
-			t.Fatalf("big-decimal %s decode: %v", wireName(bin), err)
+			t.Fatalf("big-decimal %s decode numeric: %v", wireName(bin), err)
 		}
-		if back != nonNumeric {
-			t.Errorf("big-decimal %s string round-trip broke: got %q want %q", wireName(bin), back, nonNumeric)
+		if back != "5" {
+			t.Errorf("big-decimal %s numeric string round-trip: got %q want %q", wireName(bin), back, "5")
 		}
+	}
+	// Control: []byte stays the opaque escape hatch even for bytes that form
+	// valid framing — a []byte decode target reads raw bytes unconditionally.
+	craft := []byte{0x02, 0x05, 0x00}
+	bw, err := bd.AppendEncode(nil, craft)
+	if err != nil {
+		t.Fatalf("big-decimal Encode([]byte opaque): %v", err)
+	}
+	var bback []byte
+	if _, err := bd.Decode(bw, &bback); err != nil {
+		t.Fatalf("big-decimal Decode []byte opaque: %v", err)
+	}
+	if !bytes.Equal(bback, craft) {
+		t.Errorf("big-decimal []byte opaque round-trip: got %x want %x", bback, craft)
 	}
 }
 
@@ -194,17 +227,17 @@ func TestRegression_DecimalStringCarrierIsNumericTextOnly(t *testing.T) {
 // REJECTED on encode, on both wire formats, in EVERY encode context — rather
 // than silently written as opaque raw bytes, keeping encode symmetric with
 // decode (whose string target always reads numeric decimal text). []byte is the
-// sole opaque carrier and encodes in every cell. big-decimal is excluded (its
-// string decode target falls through to raw bytes, so its string carrier is
-// opaque-symmetric; TestRegression_DecimalStringCarrierIsNumericTextOnly pins
-// that separately).
+// sole opaque carrier and encodes in every cell. big-decimal has the same
+// numeric-text-only contract (a non-numeric string rejects); the whole logical-
+// on-bytes/fixed carrier class — big-decimal, uuid, duration included — is
+// covered by TestMatrix_LogicalStringCarrierRoundTripContract.
 //
 // Axes: carrier {string, []byte, json.Number} × content {numeric, non-numeric}
 // × backing {bytes, fixed} × wire {binary, JSON} × encode context {top-level,
 // record field, array element, map value} (the path-divergence axis — a decimal
 // leaf is reachable at each). The oracle is calibration-free: string and
 // json.Number reject a non-numeric carrier identically and accept a numeric
-// one; []byte always encodes. Neuter: reverting rejectNonNumericDecimalString
+// one; []byte always encodes. Neuter: reverting rejectNonNumericStructuredString
 // (ser.go + json_codec.go) reds every string/json.Number + non-numeric cell
 // across contexts, backings, and wires; the numeric and []byte controls stay
 // green.
@@ -292,4 +325,230 @@ func decodeWire(s *avro.Schema, wire []byte, v any, bin bool) error {
 		return err
 	}
 	return s.DecodeJSON(wire, v)
+}
+
+// carrierStrRec / carrierBytesRec are typed record targets for the string-
+// carrier round-trip net: decoding a wrapped logical leaf into a concrete
+// string / []byte field observes the LEAF value directly. An `any` target would
+// surface the logical's default Go type (e.g. *big.Rat for a decimal) and hide a
+// string-target corruption, which is precisely the observation that matters.
+type carrierStrRec struct {
+	F string `avro:"f"`
+}
+
+type carrierBytesRec struct {
+	F []byte `avro:"f"`
+}
+
+// decodeCarrierLeaf decodes wire (a leaf wrapped by ctxName) into a typed
+// string / []byte target and returns the leaf value, so a string-target
+// round-trip can be compared byte-for-byte against the encoded input.
+func decodeCarrierLeaf(s *avro.Schema, wire []byte, isBytes bool, ctxName string, bin bool) (any, error) {
+	switch ctxName {
+	case "top":
+		if isBytes {
+			var b []byte
+			err := decodeWire(s, wire, &b, bin)
+			return b, err
+		}
+		var str string
+		err := decodeWire(s, wire, &str, bin)
+		return str, err
+	case "record_field":
+		if isBytes {
+			var r carrierBytesRec
+			err := decodeWire(s, wire, &r, bin)
+			return r.F, err
+		}
+		var r carrierStrRec
+		err := decodeWire(s, wire, &r, bin)
+		return r.F, err
+	case "array_element":
+		if isBytes {
+			var a [][]byte
+			err := decodeWire(s, wire, &a, bin)
+			if err == nil && len(a) > 0 {
+				return a[0], nil
+			}
+			return []byte(nil), err
+		}
+		var a []string
+		err := decodeWire(s, wire, &a, bin)
+		if err == nil && len(a) > 0 {
+			return a[0], nil
+		}
+		return "", err
+	case "map_value":
+		if isBytes {
+			var m map[string][]byte
+			err := decodeWire(s, wire, &m, bin)
+			return m["k"], err
+		}
+		var m map[string]string
+		err := decodeWire(s, wire, &m, bin)
+		return m["k"], err
+	}
+	return nil, fmt.Errorf("unknown context %q", ctxName)
+}
+
+func sameCarrier(got, want any) bool {
+	switch w := want.(type) {
+	case string:
+		g, ok := got.(string)
+		return ok && g == w
+	case []byte:
+		g, ok := got.([]byte)
+		return ok && bytes.Equal(g, w)
+	}
+	return false
+}
+
+// TestMatrix_LogicalStringCarrierRoundTripContract is the class net for EVERY
+// logical on bytes/fixed whose Go string carrier could encode OPAQUELY while its
+// string DECODE target reads a STRUCTURED value — the encode-opaque/decode-
+// structured mismatch that silently corrupts a round trip. It closes the whole
+// class, not just the big-decimal instance that motivated it.
+//
+// Invariant per cell (calibration-free): a STRING carrier either round-trips
+// EXACTLY (string-in == string-out) OR is REJECTED at encode. It must NEVER
+// both-succeed with string-in != string-out — that is the silent corruption. A
+// []byte carrier is the opaque escape hatch and round-trips exactly.
+//
+// CRITICAL — for each logical the string samples MUST include a string whose raw
+// bytes form VALID STRUCTURED FRAMING for that logical's decode (the corruption
+// trigger), NOT merely random/garbage bytes. Garbage that fails the decode's
+// structured parse falls through to the opaque path and round-trips by accident,
+// masking the bug — that is exactly how big-decimal slipped through the earlier
+// decimal fix, whose control sampled only "abcxyz" (first byte 0x61 zig-zags to
+// a negative length, so the framing parse fails). For big-decimal the trigger is
+// "\x02\x05\x00" (varint uLen=1 || unscaled 5 || varint scale=0 — byte-identical
+// to the structured wire for the number 5). Do NOT weaken these to garbage-only.
+//
+// Class map (verified): decimal (bytes+fixed) and big-decimal are numeric-text-
+// only — a non-numeric string rejects. uuid-on-fixed rejects a non-canonical
+// string (parseUUID). uuid-on-string and duration decode raw, so any correctly-
+// sized string round-trips opaquely. []byte is opaque-symmetric everywhere.
+//
+// Neuter: reverting the big-decimal rejectNonNumericStructuredString arms
+// (serBigDecimal.ser in ser.go + the json_codec.go `case "big-decimal"` arm)
+// reds the big-decimal string_valid_framing cell (encode succeeds, decode
+// returns "5" != the input) in every context and on both wires; every other cell
+// stays green.
+func TestMatrix_LogicalStringCarrierRoundTripContract(t *testing.T) {
+	// A valid 12-byte duration wire value (months=0, days=0, milliseconds=1),
+	// little-endian uint32 triples — decodes raw into a []byte/string target.
+	dur12 := string([]byte{0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0})
+	const uuidCanon = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+	type sample struct {
+		name    string
+		val     any  // string or []byte
+		isBytes bool
+		reject  bool // encode MUST reject; otherwise MUST round-trip exactly
+	}
+	leaves := []struct {
+		name    string
+		schema  string
+		samples []sample
+	}{
+		{"decimal_bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":0}`, []sample{
+			{"string_numeric", "5", false, false},
+			// Every byte sequence is a valid unscaled decimal, so ANY non-numeric
+			// string is a valid-framing corruption trigger (decodes to a number).
+			{"string_nonnumeric_framing", "abc", false, true},
+			{"bytes_opaque", []byte{0x01, 0x02}, true, false},
+		}},
+		{"decimal_fixed", `{"type":"fixed","name":"DFa","size":8,"logicalType":"decimal","precision":10,"scale":0}`, []sample{
+			{"string_numeric", "5", false, false},
+			{"string_nonnumeric_framing", "abc", false, true},
+			{"bytes_opaque", []byte{0, 0, 0, 0, 0, 0, 0, 1}, true, false},
+		}},
+		{"big_decimal", `{"type":"bytes","logicalType":"big-decimal"}`, []sample{
+			{"string_numeric", "5", false, false},
+			// Valid AVRO-4124 framing == the structured wire for 5. Pre-fix this
+			// encoded opaque and decoded to "5" (corruption); now it rejects.
+			{"string_valid_framing", "\x02\x05\x00", false, true},
+			// Non-framing (parse fails): pre-fix round-tripped opaque; now rejects
+			// too, keeping the big-decimal string carrier numeric-text-only.
+			{"string_nonframing", "abcxyz", false, true},
+			{"bytes_opaque", []byte{0x02, 0x05, 0x00}, true, false},
+		}},
+		{"uuid_fixed", `{"type":"fixed","name":"UFa","size":16,"logicalType":"uuid"}`, []sample{
+			{"string_canonical", uuidCanon, false, false},
+			// A non-canonical string is rejected by parseUUID (symmetric — the
+			// encoder never emits a wire the string decoder can't reproduce).
+			{"string_noncanonical", "not-a-uuid-value!!!!", false, true},
+			{"bytes_raw16", make([]byte, 16), true, false},
+		}},
+		{"uuid_string", `{"type":"string","logicalType":"uuid"}`, []sample{
+			// uuid-on-string is wire-equivalent to plain string: raw pass-through
+			// on both sides, so ANY string round-trips exactly (no validation).
+			{"string_canonical", uuidCanon, false, false},
+			{"string_arbitrary", "hello-not-a-uuid", false, false},
+		}},
+		{"duration_fixed", `{"type":"fixed","name":"DURa","size":12,"logicalType":"duration"}`, []sample{
+			// duration decodes raw into a string/[]byte target (opaque both sides).
+			{"string_valid12", dur12, false, false},
+			// Wrong length is rejected by the fixed size check (symmetric).
+			{"string_wrongsize", "short", false, true},
+			{"bytes_raw12", make([]byte, 12), true, false},
+		}},
+	}
+	contexts := []struct {
+		name string
+		wrap func(leaf string) string
+		val  func(carrier any) any
+	}{
+		{"top", func(l string) string { return l }, func(c any) any { return c }},
+		{"record_field",
+			func(l string) string {
+				return fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":%s}]}`, l)
+			},
+			func(c any) any { return map[string]any{"f": c} }},
+		{"array_element",
+			func(l string) string { return fmt.Sprintf(`{"type":"array","items":%s}`, l) },
+			func(c any) any { return []any{c} }},
+		{"map_value",
+			func(l string) string { return fmt.Sprintf(`{"type":"map","values":%s}`, l) },
+			func(c any) any { return map[string]any{"k": c} }},
+	}
+
+	for _, lf := range leaves {
+		for _, smp := range lf.samples {
+			for _, ctx := range contexts {
+				// The []byte opaque control runs at top-level and record contexts.
+				// Decoding a fixed-decimal element into a []byte-element array/map
+				// CONTAINER currently routes through a length-prefixed fast loop
+				// that mis-reads the raw fixed bytes ("short buffer for uvarlong")
+				// — a separate decode-path divergence from the string-carrier class
+				// this net targets. The string carrier (the corruption class) runs
+				// in all four contexts.
+				if smp.isBytes && (ctx.name == "array_element" || ctx.name == "map_value") {
+					continue
+				}
+				for _, bin := range []bool{true, false} {
+					t.Run(fmt.Sprintf("%s/%s/%s/%s", lf.name, smp.name, ctx.name, wireName(bin)), func(t *testing.T) {
+						s := avro.MustParse(ctx.wrap(lf.schema))
+						wire, err := encodeWireAny(s, ctx.val(smp.val), bin)
+						if smp.reject {
+							if err == nil {
+								t.Fatalf("encode accepted a carrier that must reject: a string carrier is numeric-text/canonical/size-valid-only; an opaque encode of a valid-framing string would decode to a different value")
+							}
+							return
+						}
+						if err != nil {
+							t.Fatalf("encode rejected a carrier that must round-trip: %v", err)
+						}
+						got, derr := decodeCarrierLeaf(s, wire, smp.isBytes, ctx.name, bin)
+						if derr != nil {
+							t.Fatalf("decode: %v", derr)
+						}
+						if !sameCarrier(got, smp.val) {
+							t.Errorf("round-trip corruption: encoded %#v, decoded %#v", smp.val, got)
+						}
+					})
+				}
+			}
+		}
+	}
 }
