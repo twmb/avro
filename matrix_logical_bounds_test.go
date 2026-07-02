@@ -178,6 +178,71 @@ func TestMatrix_DurationAndDecimalEdges(t *testing.T) {
 			}
 		}
 	})
+	t.Run("decimal-over-precision-wire-decodes", func(t *testing.T) {
+		// VALUE precision — the unscaled magnitude's digit count against the
+		// declared "precision" — is an ENCODE-side check only, matching Java's
+		// Conversions.DecimalConversion: toBytes/toFixed run validate(), while
+		// fromBytes/fromFixed build the BigDecimal unchecked. So a wire whose
+		// unscaled value EXCEEDS the declared precision but still fits the byte
+		// container must DECODE to a *big.Rat on both wire formats, and
+		// re-encoding that same value must reject with the precision error.
+		// Both directions are pinned: adding a decode-side precision reject
+		// would refuse valid foreign wire Java accepts; relaxing the encode
+		// check would diverge from Java's validate().
+		overUnscaled := []byte{0x41, 0x41, 0x41, 0x41} // 1094795585: 10 digits > precision 9
+		overRat := big.NewRat(1094795585, 100)         // at scale 2
+		for _, tc := range []struct {
+			name    string
+			schema  string
+			binWire []byte // binary wire carrying overUnscaled
+		}{
+			{"fixed", `{"type":"fixed","name":"DOP","size":4,"logicalType":"decimal","precision":9,"scale":2}`,
+				overUnscaled},
+			{"bytes", `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`,
+				append([]byte{0x08}, overUnscaled...)}, // zigzag(len 4) prefix
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := avro.MustParse(tc.schema)
+				var fromBin big.Rat
+				if _, err := s.Decode(tc.binWire, &fromBin); err != nil {
+					t.Fatalf("binary decode of over-precision wire: %v", err)
+				}
+				if fromBin.Cmp(overRat) != 0 {
+					t.Fatalf("binary decode: got %v, want %v", &fromBin, overRat)
+				}
+				// JSON wire: the spec codepoint-per-byte string of the unscaled
+				// bytes (0x41 = "A").
+				var fromJSON big.Rat
+				if err := s.DecodeJSON([]byte(`"AAAA"`), &fromJSON); err != nil {
+					t.Fatalf("JSON decode of over-precision wire: %v", err)
+				}
+				if fromJSON.Cmp(overRat) != 0 {
+					t.Fatalf("JSON decode: got %v, want %v", &fromJSON, overRat)
+				}
+				// Re-encoding the decoded value rejects on BOTH wire formats,
+				// specifically via the precision check.
+				if _, err := s.AppendEncode(nil, &fromBin); err == nil || !strings.Contains(err.Error(), "exceeds schema precision") {
+					t.Fatalf("binary re-encode of over-precision value: want precision reject, got %v", err)
+				}
+				if _, err := s.AppendEncodeJSON(nil, &fromBin); err == nil || !strings.Contains(err.Error(), "exceeds schema precision") {
+					t.Fatalf("JSON re-encode of over-precision value: want precision reject, got %v", err)
+				}
+				// One digit narrower (9 digits = the declared precision) both
+				// decodes and re-encodes: the boundary sits between the two
+				// values, so the asymmetry above is precision-driven, not
+				// container-driven.
+				within := big.NewRat(123456789, 100)
+				wbin, err := s.AppendEncode(nil, within)
+				if err != nil {
+					t.Fatalf("at-precision encode: %v", err)
+				}
+				var back big.Rat
+				if _, err := s.Decode(wbin, &back); err != nil || back.Cmp(within) != 0 {
+					t.Fatalf("at-precision round-trip: err=%v got=%v want=%v", err, &back, within)
+				}
+			})
+		}
+	})
 }
 
 // The decimalScaleLimit magnitude gate in boundedRatFromString must sit at
