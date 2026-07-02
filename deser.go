@@ -2327,8 +2327,18 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	if ok, err := setDecimalValue(v, b, s.scale); ok {
 		return src, err
 	}
-	// Fall back to [N]byte fixed.
-	return (&deserFixed{s.size}).deser(append(b[:0:0], b...), v, sl)
+	// Fall back to [N]byte / []byte fixed (the opaque escape hatch). The
+	// delegate receives a synthesized COPY of just the payload (the copy
+	// isolates the target from the caller's src buffer, mirroring
+	// deserFixed's own never-alias-the-wire invariant), so ITS remainder is
+	// the copy's empty tail — return the outer src advanced above, never the
+	// delegate's remainder, or every byte after this value in the enclosing
+	// stream is dropped (empty rest at top level, short-buffer on the next
+	// record field / array element / map entry).
+	if _, err := (&deserFixed{s.size}).deser(append(b[:0:0], b...), v, sl); err != nil {
+		return nil, err
+	}
+	return src, nil
 }
 
 // RatFromBytes converts Avro decimal bytes (big-endian two's complement)

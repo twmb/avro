@@ -516,16 +516,6 @@ func TestMatrix_LogicalStringCarrierRoundTripContract(t *testing.T) {
 	for _, lf := range leaves {
 		for _, smp := range lf.samples {
 			for _, ctx := range contexts {
-				// The []byte opaque control runs at top-level and record contexts.
-				// Decoding a fixed-decimal element into a []byte-element array/map
-				// CONTAINER currently routes through a length-prefixed fast loop
-				// that mis-reads the raw fixed bytes ("short buffer for uvarlong")
-				// — a separate decode-path divergence from the string-carrier class
-				// this net targets. The string carrier (the corruption class) runs
-				// in all four contexts.
-				if smp.isBytes && (ctx.name == "array_element" || ctx.name == "map_value") {
-					continue
-				}
 				for _, bin := range []bool{true, false} {
 					t.Run(fmt.Sprintf("%s/%s/%s/%s", lf.name, smp.name, ctx.name, wireName(bin)), func(t *testing.T) {
 						s := avro.MustParse(ctx.wrap(lf.schema))
@@ -550,5 +540,352 @@ func TestMatrix_LogicalStringCarrierRoundTripContract(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestRegression_FixedDecimalByteTargetPreservesRemainder pins the decode
+// consumption invariant for fixed+decimal into a []byte / [N]byte target: a
+// deserializer must return exactly src minus the bytes it consumed. The
+// []byte/[N]byte fall-back (the opaque escape hatch) delegates to the plain
+// fixed decoder with a synthesized copy of just the payload bytes; returning
+// THAT call's remainder would yield the copy's (always empty) tail instead of
+// the enclosing stream's true remainder. The observable breakage: a top-level
+// Decode with trailing data returns an empty rest with NO error (silent
+// stream truncation), and any value AFTER the fixed-decimal in the same
+// stream (a later record field, the next array element, the next map entry)
+// reads from an empty buffer and errors on the library's own wire.
+func TestRegression_FixedDecimalByteTargetPreservesRemainder(t *testing.T) {
+	const leaf = `{"type":"fixed","name":"F","size":4,"logicalType":"decimal","precision":9,"scale":2}`
+
+	t.Run("top_level_rest", func(t *testing.T) {
+		s := avro.MustParse(leaf)
+		buf := []byte{0, 0, 1, 200, 0xAA, 0xBB} // one fixed(4) value + 2 trailing bytes
+		var b []byte
+		rest, err := s.Decode(buf, &b)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal(b, []byte{0, 0, 1, 200}) {
+			t.Errorf("value = % x, want 00 00 01 c8", b)
+		}
+		if !bytes.Equal(rest, []byte{0xAA, 0xBB}) {
+			t.Errorf("rest = % x, want aa bb (trailing bytes must survive a []byte fixed-decimal decode)", rest)
+		}
+	})
+
+	t.Run("record_field_then_field", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"d","type":` + leaf + `},
+			{"name":"x","type":"int"}]}`)
+		type R struct {
+			D []byte `avro:"d"`
+			X int32  `avro:"x"`
+		}
+		wire, err := s.Encode(R{D: []byte{0, 0, 1, 200}, X: 7})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out R
+		if _, err := s.Decode(wire, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal(out.D, []byte{0, 0, 1, 200}) || out.X != 7 {
+			t.Errorf("got %+v, want D=00 00 01 c8 X=7", out)
+		}
+	})
+
+	t.Run("array_elements", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":` + leaf + `}`)
+		in := [][]byte{{0, 0, 0, 5}, {0, 0, 1, 200}}
+		wire, err := s.Encode(in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out [][]byte
+		if _, err := s.Decode(wire, &out); err != nil {
+			t.Fatalf("decode [][]byte: %v", err)
+		}
+		if len(out) != 2 || !bytes.Equal(out[0], in[0]) || !bytes.Equal(out[1], in[1]) {
+			t.Errorf("got %v, want %v", out, in)
+		}
+		var arr [][4]byte
+		if _, err := s.Decode(wire, &arr); err != nil {
+			t.Fatalf("decode [][4]byte: %v", err)
+		}
+		if len(arr) != 2 || arr[1] != [4]byte{0, 0, 1, 200} {
+			t.Errorf("[][4]byte got %v", arr)
+		}
+	})
+
+	t.Run("map_entries", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":` + leaf + `}`)
+		in := map[string][]byte{"a": {0, 0, 0, 5}, "b": {0, 0, 1, 200}}
+		wire, err := s.Encode(in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out map[string][]byte
+		if _, err := s.Decode(wire, &out); err != nil {
+			t.Fatalf("decode map[string][]byte: %v", err)
+		}
+		if len(out) != 2 || !bytes.Equal(out["a"], in["a"]) || !bytes.Equal(out["b"], in["b"]) {
+			t.Errorf("got %v, want %v", out, in)
+		}
+	})
+
+	t.Run("nested_record_boundary", func(t *testing.T) {
+		// The fixed-decimal is the LAST field of an inner record, with more
+		// data following the inner record in the outer one — the consumption
+		// error crosses a record boundary before it becomes observable.
+		s := avro.MustParse(`{"type":"record","name":"O","fields":[
+			{"name":"inner","type":{"type":"record","name":"I","fields":[
+				{"name":"d","type":` + leaf + `}]}},
+			{"name":"x","type":"int"}]}`)
+		type I struct {
+			D []byte `avro:"d"`
+		}
+		type O struct {
+			Inner I     `avro:"inner"`
+			X     int32 `avro:"x"`
+		}
+		wire, err := s.Encode(O{Inner: I{D: []byte{0, 0, 0, 5}}, X: 9})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out O
+		if _, err := s.Decode(wire, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal(out.Inner.D, []byte{0, 0, 0, 5}) || out.X != 9 {
+			t.Errorf("got %+v", out)
+		}
+	})
+}
+
+// TestMatrix_FixedDecimalTargetConsumptionContract is the class net for the
+// decode-consumption invariant: for EVERY Go target a decimal-carrying leaf
+// accepts, the decoded value must match the leaf's contract AND the stream
+// position after the value must be exact. Position is asserted two ways:
+// trailing bytes after a top-level value must come back as Decode's rest, and
+// data following the value inside one stream (a later record field, further
+// array elements, further map entries, a field-reordered resolved record)
+// must still decode. JSON decode runs the same value grid (it has no stream
+// remainder, so it doubles as the value oracle for the typed setter arms).
+//
+// Leaves: fixed+decimal (the historical drift site), bytes+decimal and plain
+// fixed as always-green controls — the three must agree that no accepted
+// target disturbs stream framing. Targets: []byte, [4]byte (the opaque
+// escape hatch pair), string, *big.Rat, json.Number (the structured arms),
+// and any (the independent oracle).
+//
+// Non-vacuity (verified at introduction by re-introducing the wrong
+// remainder return in deserFixedDecimal's fall-back): every fixed_decimal
+// byte-target binary cell reds (top: rest empty; record/array/map/resolved:
+// "short buffer" on the following value) while both control leaves and all
+// structured-target cells stay green.
+func TestMatrix_FixedDecimalTargetConsumptionContract(t *testing.T) {
+	// One payload for every leaf: unscaled 456 at scale 2 -> 4.56.
+	payload := []byte{0, 0, 1, 200}
+	rat456 := big.NewRat(456, 100)
+
+	leaves := []struct {
+		name    string
+		schema  string
+		isRat   bool   // decimal leaves decode structured targets via *big.Rat
+		wantStr string // string-target expectation
+	}{
+		{"fixed_decimal", `{"type":"fixed","name":"F","size":4,"logicalType":"decimal","precision":9,"scale":2}`, true, "4.56"},
+		{"bytes_decimal", `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`, true, "4.56"},
+		{"fixed_plain", `{"type":"fixed","name":"F","size":4}`, false, string(payload)},
+	}
+
+	for _, lf := range leaves {
+		// checkTarget decodes via the supplied decode fn into one typed
+		// target per kind and asserts the value.
+		targets := []struct {
+			name string
+			run  func(t *testing.T, decode func(v any) error)
+		}{
+			{"bytes_slice", func(t *testing.T, decode func(v any) error) {
+				var b []byte
+				if err := decode(&b); err != nil {
+					t.Fatalf("decode []byte: %v", err)
+				}
+				if !bytes.Equal(b, payload) {
+					t.Errorf("[]byte = % x, want % x", b, payload)
+				}
+			}},
+			{"byte_array", func(t *testing.T, decode func(v any) error) {
+				var b [4]byte
+				if err := decode(&b); err != nil {
+					t.Fatalf("decode [4]byte: %v", err)
+				}
+				if !bytes.Equal(b[:], payload) {
+					t.Errorf("[4]byte = % x, want % x", b[:], payload)
+				}
+			}},
+			{"string", func(t *testing.T, decode func(v any) error) {
+				var s string
+				if err := decode(&s); err != nil {
+					t.Fatalf("decode string: %v", err)
+				}
+				if s != lf.wantStr {
+					t.Errorf("string = %q, want %q", s, lf.wantStr)
+				}
+			}},
+			{"big_rat", func(t *testing.T, decode func(v any) error) {
+				if !lf.isRat {
+					t.Skip("no *big.Rat arm for a plain fixed")
+				}
+				var r *big.Rat
+				if err := decode(&r); err != nil {
+					t.Fatalf("decode *big.Rat: %v", err)
+				}
+				if r == nil || r.Cmp(rat456) != 0 {
+					t.Errorf("*big.Rat = %v, want %v", r, rat456)
+				}
+			}},
+			{"json_number", func(t *testing.T, decode func(v any) error) {
+				if !lf.isRat {
+					t.Skip("no json.Number arm for a plain fixed")
+				}
+				var n json.Number
+				if err := decode(&n); err != nil {
+					t.Fatalf("decode json.Number: %v", err)
+				}
+				if n != json.Number("4.56") {
+					t.Errorf("json.Number = %q, want 4.56", n)
+				}
+			}},
+			{"any", func(t *testing.T, decode func(v any) error) {
+				var v any
+				if err := decode(&v); err != nil {
+					t.Fatalf("decode any: %v", err)
+				}
+				if lf.isRat {
+					r, ok := v.(*big.Rat)
+					if !ok || r.Cmp(rat456) != 0 {
+						t.Errorf("any = %T %v, want *big.Rat %v", v, v, rat456)
+					}
+				} else if b, ok := v.([]byte); !ok || !bytes.Equal(b, payload) {
+					t.Errorf("any = %T %v, want []byte % x", v, v, payload)
+				}
+			}},
+		}
+
+		for _, tgt := range targets {
+			t.Run(lf.name+"/"+tgt.name+"/binary_top_trailing", func(t *testing.T) {
+				s := avro.MustParse(lf.schema)
+				wire, err := s.Encode(payload)
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				buf := append(append([]byte{}, wire...), 0xAA, 0xBB)
+				tgt.run(t, func(v any) error {
+					rest, err := s.Decode(buf, v)
+					if err != nil {
+						return err
+					}
+					if !bytes.Equal(rest, []byte{0xAA, 0xBB}) {
+						t.Errorf("rest = % x, want aa bb", rest)
+					}
+					return nil
+				})
+			})
+			t.Run(lf.name+"/"+tgt.name+"/json", func(t *testing.T) {
+				s := avro.MustParse(lf.schema)
+				jw, err := s.EncodeJSON(payload)
+				if err != nil {
+					t.Fatalf("encode json: %v", err)
+				}
+				tgt.run(t, func(v any) error { return s.DecodeJSON(jw, v) })
+			})
+		}
+
+		// Stream contexts: data FOLLOWS the leaf value inside one binary
+		// stream, decoded through the byte-carrier targets (the opaque
+		// escape hatch, where consumption drift is possible at all — the
+		// structured arms above share one setter that never re-frames).
+		t.Run(lf.name+"/binary_record_then_field", func(t *testing.T) {
+			s := avro.MustParse(`{"type":"record","name":"R","fields":[
+				{"name":"d","type":` + lf.schema + `},
+				{"name":"x","type":"int"}]}`)
+			type R struct {
+				D []byte `avro:"d"`
+				X int32  `avro:"x"`
+			}
+			wire, err := s.Encode(R{D: payload, X: 7})
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var out R
+			if _, err := s.Decode(wire, &out); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !bytes.Equal(out.D, payload) || out.X != 7 {
+				t.Errorf("got %+v, want D=% x X=7", out, payload)
+			}
+		})
+		t.Run(lf.name+"/binary_array_elements", func(t *testing.T) {
+			s := avro.MustParse(`{"type":"array","items":` + lf.schema + `}`)
+			in := [][]byte{{0, 0, 0, 5}, payload}
+			wire, err := s.Encode(in)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var out [][]byte
+			if _, err := s.Decode(wire, &out); err != nil {
+				t.Fatalf("decode [][]byte: %v", err)
+			}
+			if len(out) != 2 || !bytes.Equal(out[0], in[0]) || !bytes.Equal(out[1], in[1]) {
+				t.Errorf("got %v, want %v", out, in)
+			}
+		})
+		t.Run(lf.name+"/binary_map_entries", func(t *testing.T) {
+			s := avro.MustParse(`{"type":"map","values":` + lf.schema + `}`)
+			in := map[string][]byte{"a": {0, 0, 0, 5}, "b": payload}
+			wire, err := s.Encode(in)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var out map[string][]byte
+			if _, err := s.Decode(wire, &out); err != nil {
+				t.Fatalf("decode map: %v", err)
+			}
+			if len(out) != 2 || !bytes.Equal(out["a"], in["a"]) || !bytes.Equal(out["b"], in["b"]) {
+				t.Errorf("got %v, want %v", out, in)
+			}
+		})
+		t.Run(lf.name+"/binary_resolved_reordered", func(t *testing.T) {
+			// Field-reordered reader: canonical forms differ, so Resolve
+			// cannot canonical-equality fast-path to the natural decoder —
+			// the resolved record machinery drives the leaf deserializer,
+			// and the following field still must decode.
+			writer := avro.MustParse(`{"type":"record","name":"R","fields":[
+				{"name":"d","type":` + lf.schema + `},
+				{"name":"x","type":"int"}]}`)
+			reader := avro.MustParse(`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"int"},
+				{"name":"d","type":` + lf.schema + `}]}`)
+			resolved, err := avro.Resolve(writer, reader)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			wire, err := writer.Encode(map[string]any{"d": payload, "x": 7})
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			type R struct {
+				X int32  `avro:"x"`
+				D []byte `avro:"d"`
+			}
+			var out R
+			if _, err := resolved.Decode(wire, &out); err != nil {
+				t.Fatalf("resolved decode: %v", err)
+			}
+			if !bytes.Equal(out.D, payload) || out.X != 7 {
+				t.Errorf("got %+v", out)
+			}
+		})
 	}
 }
