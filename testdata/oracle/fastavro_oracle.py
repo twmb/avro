@@ -12,6 +12,13 @@ Jobs:
       -> {"ok":true,"hex":"<schemaless-encoded bytes, hex>"}
   {"op":"decode","schema":<avro schema>,"hex":"<bytes hex>"}
       -> {"ok":true}                       (decodes without error)
+  {"op":"ocf","hex":"<whole OCF file bytes, hex>"}
+      -> {"ok":true,"values":[...]}        (every record, via fastavro.reader;
+                                            the schema comes from the file's own
+                                            header. Records must be
+                                            JSON-representable — used by the
+                                            foreign block-framing matrix, whose
+                                            datums are plain strings.)
 On any failure: {"ok":false,"err":"<message>"}
 
 "kind" (optional, default "") tells the oracle how to turn the JSON value into
@@ -62,6 +69,14 @@ def _parse(schema):
 
 def handle(job):
     op = job.get("op")
+    if op == "ocf":
+        # Whole-container read: iterate every record from an OCF file's raw
+        # bytes; the writer schema comes from the file's own header. This
+        # exercises fastavro's block-framing loop (count / size / payload /
+        # sync per block) on hand-framed foreign files, not just files
+        # fastavro or twmb wrote themselves.
+        buf = io.BytesIO(bytes.fromhex(job["hex"]))
+        return {"ok": True, "values": list(fastavro.reader(buf))}
     schema = _parse(job["schema"])
     if op == "encode":
         value = _coerce(job["value"], job.get("kind", ""))
