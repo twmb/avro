@@ -996,119 +996,139 @@ func (rd *Reader) Close() error {
 	return rd.codec.Close()
 }
 
+// readBlock advances the reader to the next block containing at least one
+// datum. Validated count-0 blocks are skipped; io.EOF means the block-count
+// read hit the true end of the stream.
 func (rd *Reader) readBlock() error {
-	count, err := binary.ReadVarint(rd.r)
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return io.EOF
+	for {
+		count, err := binary.ReadVarint(rd.r)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return io.EOF
+			}
+			return fmt.Errorf("ocf: reading block count: %w", err)
 		}
-		return fmt.Errorf("ocf: reading block count: %w", err)
-	}
-	size, err := binary.ReadVarint(rd.r)
-	if err != nil {
-		return fmt.Errorf("ocf: reading block size: %w", err)
-	}
-	if count < 0 {
-		return fmt.Errorf("ocf: invalid negative block count %d", count)
-	}
-	if size < 0 {
-		return fmt.Errorf("ocf: invalid negative block size %d", size)
-	}
-	if size > rd.maxBlockBytes {
-		return fmt.Errorf("ocf: block size %d exceeds safety limit of %d (raise WithMaxBlockBytes)", size, rd.maxBlockBytes)
-	}
-	// Guard against int truncation on 32-bit even when the user-configured
-	// limit allows large values (e.g. larger than MaxInt32).
-	if size > math.MaxInt {
-		return fmt.Errorf("ocf: block size %d exceeds platform max int", size)
-	}
-	// size is the attacker-declared block length, bounded only by the
-	// user-configurable WithMaxBlockBytes. Eagerly allocating it would let a
-	// tiny hostile file (a huge declared size with few bytes behind it) force
-	// an allocation up to that cap: at a raised cap a multi-GiB transient
-	// spike, and near the cap's MaxInt64 ceiling an unrecoverable
-	// out-of-memory the caller cannot recover() from. Only allocate the full
-	// size up front when it is within a bounded window (the common path, where
-	// it never exceeds the default cap); beyond that, read incrementally so
-	// the buffer grows only to the bytes actually present and a declared-but-
-	// absent size fails after consuming what is there — the same bounded-
-	// allocation discipline the decompressed side already applies.
-	var compressed []byte
-	if size <= ocfEagerBlockAllocLimit {
-		compressed = make([]byte, int(size))
-		if _, err := io.ReadFull(rd.r, compressed); err != nil {
-			return fmt.Errorf("ocf: reading block data: %w", err)
+		size, err := binary.ReadVarint(rd.r)
+		if err != nil {
+			return fmt.Errorf("ocf: reading block size: %w", err)
 		}
-	} else {
-		var buf bytes.Buffer
-		if n, err := io.CopyN(&buf, rd.r, size); err != nil {
-			return fmt.Errorf("ocf: reading block data (%d of %d bytes): %w", n, size, err)
+		if count < 0 {
+			return fmt.Errorf("ocf: invalid negative block count %d", count)
 		}
-		compressed = buf.Bytes()
+		if size < 0 {
+			return fmt.Errorf("ocf: invalid negative block size %d", size)
+		}
+		if size > rd.maxBlockBytes {
+			return fmt.Errorf("ocf: block size %d exceeds safety limit of %d (raise WithMaxBlockBytes)", size, rd.maxBlockBytes)
+		}
+		// Guard against int truncation on 32-bit even when the user-configured
+		// limit allows large values (e.g. larger than MaxInt32).
+		if size > math.MaxInt {
+			return fmt.Errorf("ocf: block size %d exceeds platform max int", size)
+		}
+		// size is the attacker-declared block length, bounded only by the
+		// user-configurable WithMaxBlockBytes. Eagerly allocating it would let a
+		// tiny hostile file (a huge declared size with few bytes behind it) force
+		// an allocation up to that cap: at a raised cap a multi-GiB transient
+		// spike, and near the cap's MaxInt64 ceiling an unrecoverable
+		// out-of-memory the caller cannot recover() from. Only allocate the full
+		// size up front when it is within a bounded window (the common path, where
+		// it never exceeds the default cap); beyond that, read incrementally so
+		// the buffer grows only to the bytes actually present and a declared-but-
+		// absent size fails after consuming what is there — the same bounded-
+		// allocation discipline the decompressed side already applies.
+		var compressed []byte
+		if size <= ocfEagerBlockAllocLimit {
+			compressed = make([]byte, int(size))
+			if _, err := io.ReadFull(rd.r, compressed); err != nil {
+				return fmt.Errorf("ocf: reading block data: %w", err)
+			}
+		} else {
+			var buf bytes.Buffer
+			if n, err := io.CopyN(&buf, rd.r, size); err != nil {
+				return fmt.Errorf("ocf: reading block data (%d of %d bytes): %w", n, size, err)
+			}
+			compressed = buf.Bytes()
+		}
+		var sync [16]byte
+		if _, err := io.ReadFull(rd.r, sync[:]); err != nil {
+			return fmt.Errorf("ocf: reading block sync marker: %w", err)
+		}
+		if sync != rd.sync {
+			return errors.New("ocf: sync marker mismatch")
+		}
+		// A count=0 block still requires reading size + data + 16-byte sync
+		// first, per spec ("Each block consists of: count, size, objects,
+		// sync marker") — bailing on count alone would accept a
+		// tail-truncated file whose count byte reads as 0 as a clean end.
+		// Once the sync validates, the empty block is SKIPPED and reading
+		// continues: the spec leaves a block's object count unconstrained
+		// (unlike Avro arrays and maps, whose zero count is an explicit
+		// terminator, file data blocks have none — end of file is simply
+		// end of stream), so io.EOF comes only from the count read at the
+		// top of this loop. fastavro reads past empty blocks the same way
+		// (_read_py.py _iter_avro_records: a count-0 block yields no
+		// records, skip_sync validates the marker, the while loop
+		// continues). Java never writes one (DataFileWriter.writeBlock is
+		// guarded by blockCount > 0) and its for-each reader stops at one —
+		// though a re-called hasNext() advances past it — so treating the
+		// shape as end-of-stream silently truncated files only foreign
+		// writers produce; goavro errors on it, avro-rs stops. The skipped
+		// payload was consumed off the wire (bounded by WithMaxBlockBytes
+		// like any block) but is NOT handed to the codec: there are no
+		// records to decode, so nothing is decompressed. fastavro and Java
+		// both decompress count-0 payloads eagerly and so error on an
+		// undecompressable one that this reader skips — deliberate
+		// leniency, no records are lost either way.
+		if count == 0 {
+			continue
+		}
+		// Prefer the codec's bounded path: it refuses an over-cap block BEFORE
+		// allocating it (the only effective defense — a post-decompression size
+		// check is false comfort once the allocation has happened). Every built-in
+		// implements BoundedDecompressor. A custom codec that does not is honestly
+		// unbounded; for untrusted data supply a codec that bounds itself. For a
+		// BoundedDecompressor, len(block) <= maxDecompressed, which also caps the
+		// per-block decode loop below (count is bounded relative to len(block)).
+		var block []byte
+		if b, ok := rd.codec.(BoundedDecompressor); ok {
+			block, err = b.DecompressBounded(compressed, rd.maxDecompressed)
+		} else {
+			block, err = rd.codec.Decompress(compressed)
+		}
+		if err != nil {
+			return fmt.Errorf("ocf: decompressing block: %w", err)
+		}
+		// Bound count against the decompressed block length plus a small
+		// slack for zero-byte-record schemas (EmptyRecord, records of all
+		// null-typed fields). Each Avro record encodes to at least 0 bytes;
+		// for non-zero-byte schemas count > len(block) is corruption, and
+		// for zero-byte schemas count can grow unboundedly relative to len
+		// (block) unless capped — without this check a 5-byte zigzag varint
+		// claiming count=10^9 against a zero-byte schema would force the
+		// user's `for rd.Decode(&v) == nil` loop to iterate that many times
+		// (each call advancing rd.block by 0 bytes), producing a ~10^9 CPU
+		// amplification on a tiny attacker input.
+		//
+		// Mirrors the maxZeroByteItems philosophy in deser.go:558 (Avro
+		// array<null> / array<EmptyRecord> block-count cap): legitimate use
+		// of zero-byte records with more than a few thousand per block is
+		// essentially always a schema-design problem; tighter producers can
+		// split into multiple blocks.
+		//
+		// Java's DataFileStream (DataFileStream.java:303) and fastavro's
+		// _iter_avro_records (_read_py.py:807) leave this uncapped. twmb's
+		// defense-in-depth strategy already applies the same shape to Avro
+		// arrays and maps; OCF blocks are the structural twin.
+		if count > int64(len(block))+maxOCFZeroByteSlack {
+			return fmt.Errorf("ocf: block claims %d records but decompressed block is %d bytes (zero-byte slack: %d)",
+				count, len(block), maxOCFZeroByteSlack)
+		}
+		rd.block = block
+		rd.remain = count
+		rd.zeroRun = 0
+		return nil
 	}
-	var sync [16]byte
-	if _, err := io.ReadFull(rd.r, sync[:]); err != nil {
-		return fmt.Errorf("ocf: reading block sync marker: %w", err)
-	}
-	if sync != rd.sync {
-		return errors.New("ocf: sync marker mismatch")
-	}
-	// count == 0 still requires reading size + (zero-or-otherwise) data
-	// + 16-byte sync, per spec ("Each block consists of: count, size,
-	// objects, sync marker"). Java's DataFileStream.nextRawBlock and
-	// fastavro's _iter_avro_records both validate the sync on count=0
-	// blocks; bailing early on count alone meant a tail-truncated file
-	// with a corrupt sync (where count happens to read as 0) was
-	// silently accepted as clean EOF. After the sync is validated as a
-	// real block boundary, an empty block is end-of-stream.
-	if count == 0 {
-		return io.EOF
-	}
-	// Prefer the codec's bounded path: it refuses an over-cap block BEFORE
-	// allocating it (the only effective defense — a post-decompression size
-	// check is false comfort once the allocation has happened). Every built-in
-	// implements BoundedDecompressor. A custom codec that does not is honestly
-	// unbounded; for untrusted data supply a codec that bounds itself. For a
-	// BoundedDecompressor, len(block) <= maxDecompressed, which also caps the
-	// per-block decode loop below (count is bounded relative to len(block)).
-	var block []byte
-	if b, ok := rd.codec.(BoundedDecompressor); ok {
-		block, err = b.DecompressBounded(compressed, rd.maxDecompressed)
-	} else {
-		block, err = rd.codec.Decompress(compressed)
-	}
-	if err != nil {
-		return fmt.Errorf("ocf: decompressing block: %w", err)
-	}
-	// Bound count against the decompressed block length plus a small
-	// slack for zero-byte-record schemas (EmptyRecord, records of all
-	// null-typed fields). Each Avro record encodes to at least 0 bytes;
-	// for non-zero-byte schemas count > len(block) is corruption, and
-	// for zero-byte schemas count can grow unboundedly relative to len
-	// (block) unless capped — without this check a 5-byte zigzag varint
-	// claiming count=10^9 against a zero-byte schema would force the
-	// user's `for rd.Decode(&v) == nil` loop to iterate that many times
-	// (each call advancing rd.block by 0 bytes), producing a ~10^9 CPU
-	// amplification on a tiny attacker input.
-	//
-	// Mirrors the maxZeroByteItems philosophy in deser.go:558 (Avro
-	// array<null> / array<EmptyRecord> block-count cap): legitimate use
-	// of zero-byte records with more than a few thousand per block is
-	// essentially always a schema-design problem; tighter producers can
-	// split into multiple blocks.
-	//
-	// Java's DataFileStream (DataFileStream.java:303) and fastavro's
-	// _iter_avro_records (_read_py.py:807) leave this uncapped. twmb's
-	// defense-in-depth strategy already applies the same shape to Avro
-	// arrays and maps; OCF blocks are the structural twin.
-	if count > int64(len(block))+maxOCFZeroByteSlack {
-		return fmt.Errorf("ocf: block claims %d records but decompressed block is %d bytes (zero-byte slack: %d)",
-			count, len(block), maxOCFZeroByteSlack)
-	}
-	rd.block = block
-	rd.remain = count
-	rd.zeroRun = 0
-	return nil
 }
 
 // maxOCFZeroByteSlack is the cap on count - len(block) for an OCF block.

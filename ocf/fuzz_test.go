@@ -290,11 +290,13 @@ func FuzzOCFBlockEnvelope(f *testing.F) {
 		blk = append(blk, trailer[:]...)
 		f.Add(blk, syncMode)
 	}
-	// count=0 + good sync — should be clean EOF (post-fix).
+	// count=0 + good sync: a validated empty block is skipped; at the
+	// tail (as here) the next count read hits real EOF — clean end.
 	addCase(0, 0, nil, 0)
-	// count=0 + corrupt sync — should error (the new fix).
+	// count=0 + corrupt sync must error, not read as a clean end.
 	addCase(0, 0, nil, 1)
-	// count=0 with non-zero size and good sync — valid empty block.
+	// count=0 with non-zero size and good sync — valid empty block; the
+	// payload is consumed but never decompressed.
 	addCase(0, 5, []byte("hello"), 0)
 	// Negative count.
 	addCase(-1, 0, nil, 0)

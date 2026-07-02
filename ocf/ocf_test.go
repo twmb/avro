@@ -3389,12 +3389,17 @@ func TestRegression_AppendWriterSchemaOpts(t *testing.T) {
 	}
 }
 
-// TestRegression_BlockCountZeroTerminatesStream verifies that an OCF
-// block with count==0 is treated as end-of-stream — AFTER reading and
-// validating the block's size and sync marker per spec. Java's
-// DataFileStream.nextRawBlock and fastavro both read the full block
-// envelope (count + size + data + sync) before signalling EOF.
-func TestRegression_BlockCountZeroTerminatesStream(t *testing.T) {
+// TestRegression_TrailingEmptyBlockIsCleanEOF verifies that a count=0
+// block at the very end of a file yields a clean io.EOF: the block's
+// size, payload, and sync marker are read and validated first, the empty
+// block is skipped, and the next block-count read hits the true end of
+// stream. (A validated count-0 block is skipped wherever it appears —
+// see TestRegression_EmptyBlockMidStreamSkipped for the mid-stream case
+// and the cross-implementation notes.) Reading the full envelope first
+// means a tail-truncated file whose count byte happens to read as 0 is
+// never mistaken for a clean end — see
+// TestRegression_BlockCountZeroValidatesSync.
+func TestRegression_TrailingEmptyBlockIsCleanEOF(t *testing.T) {
 	sync := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	var buf bytes.Buffer
 	s, err := avro.Parse(recordSchema)
@@ -3474,6 +3479,73 @@ func TestRegression_BlockCountZeroValidatesSync(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sync marker mismatch") {
 		t.Fatalf("expected sync marker mismatch error, got: %v", err)
+	}
+}
+
+// TestRegression_EmptyBlockMidStreamSkipped verifies that a count=0 block
+// whose sync marker validates is SKIPPED — reading continues with the next
+// block — rather than treated as end-of-stream. The spec places no
+// constraint on a block's object count: unlike Avro arrays and maps, whose
+// zero count is an explicit terminator, file blocks have no terminator (end
+// of file is simply end of stream), so a zero-count block is valid framing.
+// fastavro's record iterator reads straight past one (_read_py.py
+// _iter_avro_records: a count-0 block yields no records, skip_sync validates
+// the marker, and the while loop continues to the next block), so treating
+// it as EOF silently dropped every record after it. Java never emits the
+// shape (DataFileWriter.writeBlock is guarded by blockCount > 0) and its
+// for-each reader stops at one — though a re-called hasNext() advances past
+// it — while goavro errors loudly and avro-rs stops; skipping reads
+// everything a foreign writer put in the file and loses nothing. A corrupt
+// sync on the same shape still errors (see
+// TestRegression_BlockCountZeroValidatesSync).
+func TestRegression_EmptyBlockMidStreamSkipped(t *testing.T) {
+	sync := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	s := avro.MustParse(`"string"`)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, s, WithSyncMarker(sync))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Encode("first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil { // seals block 1: [count=1]["first"][sync]
+		t.Fatal(err)
+	}
+
+	// Block 2: count=0, size=0, valid sync — spec-valid empty framing.
+	buf.Write(binary.AppendVarint(nil, 0))
+	buf.Write(binary.AppendVarint(nil, 0))
+	buf.Write(sync[:])
+
+	// Block 3: count=1, one "second" datum, valid sync.
+	datum, err := s.AppendEncode(nil, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf.Write(binary.AppendVarint(nil, 1))
+	buf.Write(binary.AppendVarint(nil, int64(len(datum))))
+	buf.Write(datum)
+	buf.Write(sync[:])
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for {
+		var v string
+		err := r.Decode(&v)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		got = append(got, v)
+	}
+	if len(got) != 2 || got[0] != "first" || got[1] != "second" {
+		t.Fatalf("records across a mid-stream empty block: got %v, want [first second]", got)
 	}
 }
 

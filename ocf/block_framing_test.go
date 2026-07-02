@@ -13,11 +13,13 @@ import (
 // ---------------------------------------------------------------------------
 // Block-FRAMING contract: the writer's block boundaries are an operational
 // contract (sync-point density for splittable processing, the WithBlockCount
-// and WithBlockBytes knobs), and the no-empty-block invariant is a hard
-// correctness rule — a count-0 block mid-file reads as end-of-stream in this
-// package's Reader AND in Java's DataFileStream, silently truncating
-// everything after it. Round-trip tests can't see any of this (every split
-// is a valid file), so the framing itself is parsed and asserted here.
+// and WithBlockBytes knobs), and the no-empty-block invariant keeps
+// twmb-written files fully readable everywhere: this package's Reader and
+// fastavro SKIP a validated count-0 block, but Java's DataFileStream
+// for-each stops at one (silently truncating everything after it for Java
+// consumers), avro-rs stops, and goavro errors — so the writer must never
+// emit one. Round-trip tests can't see any of this (every split is a valid
+// file), so the framing itself is parsed and asserted here.
 // ---------------------------------------------------------------------------
 
 // parseBlockCounts parses an OCF's raw container framing and returns the
@@ -96,7 +98,7 @@ func wantCounts(t *testing.T, data []byte, want ...int64) {
 	}
 	for _, c := range got {
 		if c <= 0 {
-			t.Fatalf("EMPTY BLOCK in framing (%v): a count-0 block reads as end-of-stream", got)
+			t.Fatalf("EMPTY BLOCK in framing (%v): Java's for-each reader stops at a count-0 block, truncating twmb-written files for Java consumers", got)
 		}
 	}
 }
