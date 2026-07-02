@@ -3,7 +3,10 @@ package avro_test
 import (
 	"bytes"
 	"fmt"
+	"math/big"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/twmb/avro"
 )
@@ -464,5 +467,172 @@ func TestMatrix_AliasEvolution(t *testing.T) {
 				t.Fatalf("aliased array value: got %#v want %#v", got, []any{c.want})
 			}
 		})
+	}
+}
+
+// Promotion pairs × TYPED reader targets: the resolved decode of a writer
+// wire into a concrete Go target must agree with the NATURAL decode (the
+// reader schema reading its own wire) into that same target — the same
+// accept/reject verdict and, on accept, the identical value — across
+// composition contexts (top level, record field via a reflect-built struct,
+// array element, null-union branch behind a pointer). The natural path is
+// the independent oracle: the promotion arms delegate to the same target
+// dispatchers (setLongValue, setFloatValue, setBytesValue, setStringValue,
+// and the logical wrappers), so a promotion arm that hand-rolls its own
+// target handling — or a union/record resolution that drops the reader's
+// logical promotion wrapper — drifts observably here. Reject cells (a
+// negative long into uint64, a UUID-invalid byte payload into [16]byte)
+// pin verdict parity, not just value parity. The logical-reader rows drive
+// promotionDeserForLogical's typed arms (time.Time / time.Duration /
+// big.Rat / json.Number / [16]byte), which no other generative axis
+// reaches.
+func TestMatrix_PromotionTypedTargets(t *testing.T) {
+	type row struct {
+		name    string
+		wSchema string
+		rSchema string
+		wVal    any // encoded against wSchema → the promoted wire
+		rVal    any // encoded against rSchema → the natural (oracle) wire
+		targets []reflect.Type
+	}
+	var (
+		anyT = reflect.TypeFor[any]()
+		i32  = reflect.TypeFor[int32]()
+		i64  = reflect.TypeFor[int64]()
+		u64  = reflect.TypeFor[uint64]()
+		f32  = reflect.TypeFor[float32]()
+		f64  = reflect.TypeFor[float64]()
+		str  = reflect.TypeFor[string]()
+		bs   = reflect.TypeFor[[]byte]()
+		b2   = reflect.TypeFor[[2]byte]()
+		b16  = reflect.TypeFor[[16]byte]()
+		tt   = reflect.TypeFor[time.Time]()
+		td   = reflect.TypeFor[time.Duration]()
+		rat  = reflect.TypeFor[big.Rat]()
+	)
+	const uuidStr = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+	rows := []row{
+		// The negative value makes the uint64 target a reject-parity cell on
+		// both int→long and long→double; float64 stays exact (accept).
+		{"int-to-long", `"int"`, `"long"`, int32(-77), int64(-77),
+			[]reflect.Type{i64, i32, u64, f64, anyT}},
+		{"int-to-float", `"int"`, `"float"`, int32(123), float32(123),
+			[]reflect.Type{f32, f64, anyT}},
+		{"int-to-double", `"int"`, `"double"`, int32(-9), float64(-9),
+			[]reflect.Type{f64, f32, anyT}},
+		{"long-to-float", `"long"`, `"float"`, int64(1 << 10), float32(1 << 10),
+			[]reflect.Type{f32, f64, anyT}},
+		{"long-to-double", `"long"`, `"double"`, int64(-5), float64(-5),
+			[]reflect.Type{f64, u64, anyT}},
+		{"float-to-double", `"float"`, `"double"`, float32(1.5), float64(1.5),
+			[]reflect.Type{f64, f32, anyT}},
+		{"string-to-bytes", `"string"`, `"bytes"`, "sb", []byte("sb"),
+			[]reflect.Type{bs, b2, str, anyT}},
+		{"bytes-to-string", `"bytes"`, `"string"`, []byte("bs"), "bs",
+			[]reflect.Type{str, bs, anyT}},
+		// Logical readers: promotionDeserForLogical wraps the writer's wire
+		// read with the reader's logical conversion.
+		{"int-to-long-timestamp-millis", `"int"`, `{"type":"long","logicalType":"timestamp-millis"}`,
+			int32(86400001), time.UnixMilli(86400001).UTC(),
+			[]reflect.Type{tt, i64, anyT}},
+		{"int-to-long-time-micros", `"int"`, `{"type":"long","logicalType":"time-micros"}`,
+			int32(5_000_000), 5 * time.Second,
+			[]reflect.Type{td, i64, anyT}},
+		// The writer string's raw bytes 0x41 0x42 are the reader's unscaled
+		// two's-complement payload: 16706 at scale 2 = 167.06.
+		{"string-to-bytes-decimal", `"string"`, `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`,
+			"AB", big.NewRat(16706, 100),
+			[]reflect.Type{rat, bs, anyT}},
+		{"bytes-to-string-uuid", `"bytes"`, `{"type":"string","logicalType":"uuid"}`,
+			[]byte(uuidStr), uuidStr,
+			[]reflect.Type{str, b16, bs, anyT}},
+		// UUID-invalid payload: the [16]byte target must reject on BOTH the
+		// promoted and natural paths (parseUUID), while string accepts.
+		{"bytes-to-string-uuid-invalid", `"bytes"`, `{"type":"string","logicalType":"uuid"}`,
+			[]byte("definitely-not-a-uuid-but-36-chars-x"), "definitely-not-a-uuid-but-36-chars-x",
+			[]reflect.Type{str, b16, anyT}},
+	}
+
+	type ctx struct {
+		label  string
+		schema func(inner string) string
+		wrap   func(v any) any
+		target func(elem reflect.Type) reflect.Type
+		unwrap func(target reflect.Value) reflect.Value // target is the *T decode destination
+	}
+	ctxs := []ctx{
+		{
+			label:  "top",
+			schema: func(s string) string { return s },
+			wrap:   func(v any) any { return v },
+			target: func(e reflect.Type) reflect.Type { return e },
+			unwrap: func(v reflect.Value) reflect.Value { return v.Elem() },
+		},
+		{
+			label: "record-field",
+			schema: func(s string) string {
+				return fmt.Sprintf(`{"type":"record","name":"PTT","fields":[{"name":"f","type":%s}]}`, s)
+			},
+			wrap: func(v any) any { return map[string]any{"f": v} },
+			target: func(e reflect.Type) reflect.Type {
+				return reflect.StructOf([]reflect.StructField{{Name: "F", Type: e, Tag: `avro:"f"`}})
+			},
+			unwrap: func(v reflect.Value) reflect.Value { return v.Elem().Field(0) },
+		},
+		{
+			label:  "array-elem",
+			schema: func(s string) string { return fmt.Sprintf(`{"type":"array","items":%s}`, s) },
+			wrap:   func(v any) any { return []any{v} },
+			target: func(e reflect.Type) reflect.Type { return reflect.SliceOf(e) },
+			unwrap: func(v reflect.Value) reflect.Value { return v.Elem().Index(0) },
+		},
+		{
+			label:  "null-union",
+			schema: func(s string) string { return fmt.Sprintf(`["null",%s]`, s) },
+			wrap:   func(v any) any { return v },
+			target: func(e reflect.Type) reflect.Type { return reflect.PointerTo(e) },
+			unwrap: func(v reflect.Value) reflect.Value { return v.Elem().Elem() },
+		},
+	}
+
+	for _, rw := range rows {
+		for _, cx := range ctxs {
+			t.Run(rw.name+"/"+cx.label, func(t *testing.T) {
+				w := avro.MustParse(cx.schema(rw.wSchema))
+				r := avro.MustParse(cx.schema(rw.rSchema))
+				res, err := resolveBoth(t, w, r)
+				if err != nil {
+					t.Fatalf("Resolve: %v", err)
+				}
+				promotedWire, err := w.AppendEncode(nil, cx.wrap(rw.wVal))
+				if err != nil {
+					t.Fatalf("writer encode: %v", err)
+				}
+				naturalWire, err := r.AppendEncode(nil, cx.wrap(rw.rVal))
+				if err != nil {
+					t.Fatalf("reader encode: %v", err)
+				}
+				for _, elem := range rw.targets {
+					tgtType := cx.target(elem)
+					promoted := reflect.New(tgtType)
+					natural := reflect.New(tgtType)
+					_, perr := res.Decode(promotedWire, promoted.Interface())
+					_, nerr := r.Decode(naturalWire, natural.Interface())
+					if (perr == nil) != (nerr == nil) {
+						t.Fatalf("target %v: verdict divergence: promoted err=%v, natural err=%v",
+							elem, perr, nerr)
+					}
+					if perr != nil {
+						continue
+					}
+					pv := cx.unwrap(promoted)
+					nv := cx.unwrap(natural)
+					if !reflect.DeepEqual(pv.Interface(), nv.Interface()) {
+						t.Fatalf("target %v: value divergence: promoted %#v, natural %#v",
+							elem, pv.Interface(), nv.Interface())
+					}
+				}
+			})
+		}
 	}
 }
