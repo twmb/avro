@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -346,6 +347,134 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 			}
 		}
 	}
+
+	// Hostile and non-canonical block-COUNT / block-SIZE values, spliced at
+	// the mid position (D <cell> D) — the position where a wrong verdict
+	// silently truncates the data behind the cell. The invariant every cell
+	// asserts: a loud error or a consistent skip, never a silent io.EOF
+	// before the tail datum.
+	t.Run("count-values", func(t *testing.T) {
+		vi := func(v int64) []byte { return binary.AppendVarint(nil, v) }
+		s := avro.MustParse(`"string"`)
+		datum, err := s.AppendEncode(nil, "dX")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cells := []struct {
+			name string
+			raw  []byte // hand-framed cell bytes spliced between the two data blocks
+			// wantErr: substring of the error Decode must return at the cell;
+			// "" = consistent skip (both data blocks read, then clean io.EOF).
+			wantErr string
+		}{
+			{
+				// A negative count is corruption no writer produces (the
+				// spec's count is the number of objects in the block): loud
+				// error. Guard: readBlock's `count < 0` reject, reached after
+				// both header varints are read and before any payload byte is
+				// consumed. fastavro 1.12.2 instead reads the file fully: its
+				// record loop `for i in range(block_count)` over a negative
+				// count is an empty loop (_read_py.py _iter_avro_records), so
+				// it skips the block like a count-0 one — nothing is
+				// truncated on either side.
+				name:    "negative-count",
+				raw:     bytes.Join([][]byte{vi(-1), vi(0), foreignSync[:]}, nil),
+				wantErr: "invalid negative block count",
+			},
+			{
+				// A negative size errors even when the count is 0: the
+				// count/size guards precede the skip arm, so an "empty" block
+				// cannot smuggle a hostile size. Guard: readBlock's
+				// `size < 0` reject, before any payload read — the cell
+				// deliberately carries no payload or sync; the reader must
+				// never get that far. fastavro 1.12.2 also errors (EOFError
+				// "Expected -1 bytes").
+				name:    "negative-size-on-count0",
+				raw:     bytes.Join([][]byte{vi(0), vi(-1)}, nil),
+				wantErr: "invalid negative block size",
+			},
+			{
+				// An absurd count over a tiny real payload reaches the
+				// deepest guard: the envelope validates (count/size guards
+				// pass, payload and sync consumed), the skip arm doesn't fire
+				// (count != 0), the codec decompresses, and the
+				// count-vs-decompressed-length cap rejects — the
+				// CPU-amplification guard (a 7-byte varint must not buy a
+				// 2^40-iteration decode loop). Guard: readBlock's
+				// `count > int64(len(block))+maxOCFZeroByteSlack`. fastavro
+				// 1.12.2 also errors (EOFError once the 3-byte block runs
+				// dry).
+				name:    "huge-count-tiny-block",
+				raw:     bytes.Join([][]byte{vi(1 << 40), vi(int64(len(datum))), datum, foreignSync[:]}, nil),
+				wantErr: "records but decompressed block is",
+			},
+			{
+				// An overlong (non-minimal two-byte) varint encoding of count
+				// 0: binary.ReadVarint accepts non-canonical varints, so the
+				// cell decodes to 0 and takes the same validated-skip arm as
+				// a canonical count-0 block — consistent skip, both datums
+				// read. fastavro 1.12.2 reads it identically. Pinned so a
+				// future varint tightening that rejects overlong counts flips
+				// this cell red and forces a deliberate re-pin: a loud error
+				// would also satisfy the invariant; silent truncation never
+				// does.
+				name:    "overlong-varint-count0",
+				raw:     bytes.Join([][]byte{{0x80, 0x00}, vi(0), foreignSync[:]}, nil),
+				wantErr: "",
+			},
+		}
+		for _, c := range cells {
+			t.Run(c.name, func(t *testing.T) {
+				var buf bytes.Buffer
+				w, err := NewWriter(&buf, s, WithSyncMarker(foreignSync))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := w.Encode("d0"); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.Flush(); err != nil {
+					t.Fatal(err)
+				}
+				buf.Write(c.raw)
+				if err := w.Encode("d1"); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				r, err := NewReader(bytes.NewReader(buf.Bytes()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				var v string
+				if err := r.Decode(&v); err != nil || v != "d0" {
+					t.Fatalf("first datum: %v %q", err, v)
+				}
+				err = r.Decode(&v)
+				if c.wantErr == "" {
+					if err != nil || v != "d1" {
+						t.Fatalf("skip cell: second datum %v %q", err, v)
+					}
+					if err := r.Decode(&v); err != io.EOF {
+						t.Fatalf("skip cell: want io.EOF after both datums, got %v", err)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatalf("want error containing %q at the cell, decoded %q", c.wantErr, v)
+				}
+				if errors.Is(err, io.EOF) {
+					t.Fatalf("cell verdict is io.EOF — silent truncation of the tail datum: %v", err)
+				}
+				if !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("want error containing %q, got: %v", c.wantErr, err)
+				}
+			})
+		}
+	})
 
 	// Corrupt sync on an empty block errors at sync validation, BEFORE the
 	// skip arm — skipping must not weaken corruption detection.
