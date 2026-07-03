@@ -120,11 +120,15 @@ jobs:
       # round-trip: the matrix sweeps (schema × value) across primitives,
       # logicals, containers, records, and unions, asserting both wires;
       # the invalid-UTF-8 test asserts the documented U+FFFD-on-JSON /
-      # verbatim-on-binary policy stays Java-identical.
-      - name: Java value differentials (matrix + invalid-UTF-8)
+      # verbatim-on-binary policy stays Java-identical; the wire-leniency
+      # pins hand-frame non-canonical writer bytes (boolean 0x02, overlong
+      # union-index varint, empty-record JsonEncoder zero-byte output) and
+      # assert Java's documented verdicts so an avro-tools upgrade that
+      # changes them fails here instead of silently rotting the citations.
+      - name: Java value differentials (matrix + invalid-UTF-8 + wire leniencies)
         env:
           AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
-        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaValueMatrix|TestDifferentialJavaInvalidUTF8' -v .
+        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaValueMatrix|TestDifferentialJavaInvalidUTF8|TestDifferentialJavaWireLeniencies' -v .
       # The combinatorial matrix through the Java oracle: every composed
       # (fragment × context) cell and every recursive shape — twmb's wire
       # bytes must survive a Java decode→re-encode byte-identically, and
