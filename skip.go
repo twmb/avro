@@ -102,8 +102,11 @@ func skipRecord(w *schemaNode) skipfn {
 }
 
 // skipBlocks iterates Avro block-framed data, invoking inner once per
-// item/entry. blockType labels readBlockHeader errors ("array block" /
-// "map block"). When negative-count byte-size framing is present the
+// item/entry. blockType labels readBlockHeader errors ("array" / "map",
+// the same labels the value-path block walkers pass, so the two paths
+// report identical text for identical corruption — readBlockHeader's
+// formats append their own "block"). When negative-count byte-size
+// framing is present the
 // block is fast-skipped via byteSize; otherwise totalGuard (when non-nil)
 // gates the per-block count, and inner is called for each item/entry.
 // Shared by skipArray and skipMap.
@@ -149,7 +152,7 @@ func skipArray(w *schemaNode) skipfn {
 	itemSkip := buildSkip(w.items)
 	minItemBytes := schemaMinBytes(w.items)
 	return func(src []byte, sl *slab) ([]byte, error) {
-		return skipBlocks(src, sl, "array block",
+		return skipBlocks(src, sl, "array",
 			func(count, total int64, srcLen int) error {
 				return checkArrayBlockBounds(count, total, srcLen, minItemBytes)
 			},
@@ -163,7 +166,7 @@ func skipMap(w *schemaNode) skipfn {
 	// the value's minimum wire bytes — identical to deserMap.minEntryBytes.
 	minEntryBytes := 1 + schemaMinBytes(w.values)
 	return func(src []byte, sl *slab) ([]byte, error) {
-		return skipBlocks(src, sl, "map block",
+		return skipBlocks(src, sl, "map",
 			// Bound the block count against the remaining buffer, matching
 			// deserMap (deser.go) and skipArray's checkArrayBlockBounds.
 			// Without it, skipBlocks' `for range int(count)` loop truncates

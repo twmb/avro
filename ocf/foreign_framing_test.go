@@ -549,3 +549,166 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 		}
 	})
 }
+
+// TestReaderMetaMapFraming hand-frames the OCF HEADER's metadata map — the
+// one wire map every reader must parse before it knows anything about the
+// file — across the container framings and hostile values the spec's map
+// grammar admits. The writer always emits a single-block canonical meta map,
+// so foreign framings reach this parser only from other writers.
+//
+//   - Duplicate keys: the spec is silent; Java's DataFileStream reads meta
+//     into a HashMap (put = last wins), fastavro's header lands in a Python
+//     dict (last wins), and decodeMap's m[key]=val is the same rule. Pinned
+//     with the codec key (a first-wins regression would resolve the WRONG
+//     codec — observable, not cosmetic) and the schema key.
+//   - Multi-block and size-prefixed-block framings: legal per the map
+//     grammar; must parse identically to the canonical single block.
+//   - MinInt64 block count: the negation-overflow guard must reject loudly.
+//
+// Every accept cell asserts the file's records read fully, and — when a
+// fastavro interpreter is available — that fastavro reads the identical
+// bytes to the identical records.
+func TestReaderMetaMapFraming(t *testing.T) {
+	fa := fastavroOCFReader(t)
+
+	schemaJSON := []byte(`"string"`)
+	s := avro.MustParse(string(schemaJSON))
+	datum, err := s.AppendEncode(nil, "d0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deflated := func() []byte {
+		var b bytes.Buffer
+		zw, _ := flate.NewWriter(&b, flate.DefaultCompression)
+		zw.Write(datum)
+		zw.Close()
+		return b.Bytes()
+	}()
+
+	entry := func(k string, v []byte) []byte {
+		e := binary.AppendVarint(nil, int64(len(k)))
+		e = append(e, k...)
+		e = binary.AppendVarint(e, int64(len(v)))
+		e = append(e, v...)
+		return e
+	}
+	// file assembles magic + the given meta-map bytes + sync + one data
+	// block carrying payload.
+	file := func(metaMap []byte, payload []byte) []byte {
+		var buf bytes.Buffer
+		buf.Write(magic[:])
+		buf.Write(metaMap)
+		buf.Write(foreignSync[:])
+		appendRawBlock(&buf, 1, payload, foreignSync)
+		return buf.Bytes()
+	}
+	block := func(entries ...[]byte) []byte {
+		b := binary.AppendVarint(nil, int64(len(entries)))
+		for _, e := range entries {
+			b = append(b, e...)
+		}
+		return b
+	}
+	terminator := []byte{0x00}
+
+	schemaEntry := entry("avro.schema", schemaJSON)
+
+	accepts := []struct {
+		name    string
+		metaMap []byte
+		payload []byte
+	}{
+		{
+			// Two avro.codec entries: an unresolvable name, then null. Only
+			// last-wins reads this file; first-wins fails codec resolution.
+			name: "dup-codec-bogus-then-null",
+			metaMap: append(block(
+				schemaEntry,
+				entry("avro.codec", []byte("bogus")),
+				entry("avro.codec", []byte("null")),
+			), terminator...),
+			payload: datum,
+		},
+		{
+			// Two avro.codec entries naming two REAL codecs, with the data
+			// block compressed by the second: only the last-wins winner
+			// decompresses it.
+			name: "dup-codec-null-then-deflate",
+			metaMap: append(block(
+				schemaEntry,
+				entry("avro.codec", []byte("null")),
+				entry("avro.codec", []byte("deflate")),
+			), terminator...),
+			payload: deflated,
+		},
+		{
+			// Two avro.schema entries: garbage JSON, then the real schema.
+			name: "dup-schema-bogus-then-valid",
+			metaMap: append(block(
+				entry("avro.schema", []byte("{not json")),
+				schemaEntry,
+			), terminator...),
+			payload: datum,
+		},
+		{
+			// The meta map split across two blocks.
+			name: "meta-two-blocks",
+			metaMap: append(append(
+				block(schemaEntry),
+				block(entry("avro.codec", []byte("null")))...,
+			), terminator...),
+			payload: datum,
+		},
+		{
+			// Negative-count size-prefixed meta block (count -2 + byte size).
+			name: "meta-size-prefixed-block",
+			metaMap: func() []byte {
+				entries := append(append([]byte{}, schemaEntry...), entry("avro.codec", []byte("null"))...)
+				m := binary.AppendVarint(nil, -2)
+				m = binary.AppendVarint(m, int64(len(entries)))
+				m = append(m, entries...)
+				return append(m, terminator...)
+			}(),
+			payload: datum,
+		},
+	}
+	for _, c := range accepts {
+		t.Run(c.name, func(t *testing.T) {
+			f := file(c.metaMap, c.payload)
+			got := readAllStrings(t, f)
+			if len(got) != 1 || got[0] != "d0" {
+				t.Fatalf("read %v, want [d0]", got)
+			}
+			if fa != nil {
+				faGot, faErr := fa(f)
+				if faErr != "" || len(faGot) != 1 || faGot[0] != "d0" {
+					t.Errorf("fastavro: values=%v err=%s", faGot, faErr)
+				}
+			}
+		})
+	}
+
+	t.Run("meta-minint64-count", func(t *testing.T) {
+		// MinInt64's negation is itself: the guard must reject before the
+		// count drives anything. The negative-count grammar puts a byte size
+		// next (present so foreign readers see well-formed framing); the
+		// reject fires before it is read. fastavro 1.12.2 also errors (its
+		// count-driven header read walks entry reads into EOF).
+		m := binary.AppendVarint(nil, int64(-1)<<63)
+		m = binary.AppendVarint(m, 0)
+		m = append(m, terminator...)
+		f := file(m, datum)
+		_, err := NewReader(bytes.NewReader(f))
+		if err == nil {
+			t.Fatal("reader accepted a MinInt64 meta-map block count")
+		}
+		if !strings.Contains(err.Error(), "invalid metadata map block count") {
+			t.Fatalf("error %q, want the metadata block-count reject", err)
+		}
+		if fa != nil {
+			if faGot, faErr := fa(f); faErr == "" {
+				t.Errorf("fastavro read the MinInt64-meta-count file: %v (recalibrate this cell)", faGot)
+			}
+		}
+	})
+}

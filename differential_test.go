@@ -51,6 +51,9 @@ type oracleJob struct {
 	Hex string `json:"hex"`
 	// JSON carries the Avro-JSON text for the "jsonread" op.
 	JSON string `json:"json,omitempty"`
+	// Reader carries the reader schema for the "readresolve" op (resolved
+	// read; dropped writer fields route through fastavro's skip_* twins).
+	Reader json.RawMessage `json:"reader,omitempty"`
 }
 
 type oracleResp struct {

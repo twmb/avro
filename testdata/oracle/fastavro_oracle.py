@@ -24,6 +24,13 @@ Jobs:
   {"op":"jsonread","schema":<avro schema>,"json":"<Avro-JSON text>"}
       -> {"ok":true,"values":[...]}        (one datum via json_reader; values
                                             must be strict-JSON-representable)
+  {"op":"readresolve","schema":<writer schema>,"reader":<reader schema>,
+   "hex":"<bytes hex>"}
+      -> {"ok":true,"values":[<datum>]}    (schemaless_reader with schema
+                                            RESOLUTION — exercises fastavro's
+                                            skip_* functions for writer fields
+                                            the reader drops; the datum must be
+                                            strict-JSON-representable)
 On any failure: {"ok":false,"err":"<message>"}
 
 "kind" (optional, default "") tells the oracle how to turn the JSON value into
@@ -93,8 +100,23 @@ def handle(job):
         return {"ok": True, "hex": buf.getvalue().hex()}
     if op == "decode":
         buf = io.BytesIO(bytes.fromhex(job["hex"]))
-        fastavro.schemaless_reader(buf, schema)
-        return {"ok": True}
+        value = fastavro.schemaless_reader(buf, schema)
+        # Values ride back only when strict-JSON-representable; a decode whose
+        # value cannot travel still reports ok (the op's original contract).
+        try:
+            json.dumps([value], allow_nan=False)
+            return {"ok": True, "values": [value]}
+        except (TypeError, ValueError):
+            return {"ok": True}
+    if op == "readresolve":
+        # Resolved read: the reader schema differs from the writer's, so
+        # fastavro routes dropped writer fields through its skip_* functions
+        # (_read_py.py) — the reference twin of twmb's skip path.
+        reader = _parse(job["reader"])
+        buf = io.BytesIO(bytes.fromhex(job["hex"]))
+        value = fastavro.schemaless_reader(buf, schema, reader)
+        json.dumps([value], allow_nan=False)  # reject non-representable early
+        return {"ok": True, "values": [value]}
     if op == "parse":
         # Schema-acceptance probe: _parse already ran above; reaching here
         # means fastavro accepted the schema. (A rejection surfaces as the
