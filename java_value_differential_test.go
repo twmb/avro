@@ -426,3 +426,70 @@ func TestDifferentialJavaInvalidUTF8(t *testing.T) {
 		})
 	}
 }
+
+// TestDifferentialJavaWireLeniencies executes, against live Java, the
+// specific Java wire-level behaviors this package's comments cite as the
+// rationale for its own decode leniencies and test exclusions. Each cell
+// hand-frames non-canonical (or degenerate) writer bytes, round-trips them
+// through Java's decoder via the RT oracle, and asserts Java's DOCUMENTED
+// verdict — so an avro-tools upgrade that changes the behavior fails CI
+// instead of silently rotting the citation.
+func TestDifferentialJavaWireLeniencies(t *testing.T) {
+	rt := startSchemaOracle(t)
+
+	t.Run("boolean non-1 byte decodes false", func(t *testing.T) {
+		// BinaryDecoder.readBoolean is `return n == 1` — byte 2 is false
+		// (BinaryDecoder.java:150-151). twmb's Decode matches Java here;
+		// fastavro diverges (any non-zero is True there). This cell pins the
+		// Java anchor the leniency comment on Schema.Decode cites.
+		ok, jsonOut, binOut, errMsg := rt(t, `"boolean"`, []byte{0x02})
+		if !ok {
+			t.Fatalf("Java rejected boolean wire byte 0x02: %q", errMsg)
+		}
+		if string(jsonOut) != "false" || string(binOut) != "\x00" {
+			t.Errorf("Java boolean(0x02): JSON %q binary % x, want false / 00 — Java's readBoolean semantics changed, update deser.go's boolean-leniency comment",
+				jsonOut, binOut)
+		}
+	})
+
+	t.Run("overlong union index varint accepted", func(t *testing.T) {
+		// BinaryDecoder.readIndex is a plain readInt() varint loop that
+		// accepts non-minimal encodings within 5 bytes. 0x82 0x00 is the
+		// two-byte overlong form of index 1; Java must decode the union's
+		// int branch and re-encode the canonical single-byte form. Pins the
+		// readNullUnionIndex parity comment in deser.go.
+		ok, jsonOut, binOut, errMsg := rt(t, `["null","int"]`, []byte{0x82, 0x00, 0x0e})
+		if !ok {
+			t.Fatalf("Java rejected overlong union-index varint: %q", errMsg)
+		}
+		if string(binOut) != "\x02\x0e" {
+			t.Errorf("Java re-encode of overlong-index union: % x, want 02 0e", binOut)
+		}
+		if string(jsonOut) != `{"int":7}` {
+			t.Errorf("Java JSON for overlong-index union: %q, want {\"int\":7}", jsonOut)
+		}
+	})
+
+	t.Run("empty record JsonEncoder emits zero bytes", func(t *testing.T) {
+		// avro-tools 1.12.0's JsonEncoder emits NOTHING for a datum that is
+		// entirely empty records: the grammar's implicit actions only run
+		// when a terminal pulls advance(), and an empty record has no
+		// terminals (JsonGrammarGenerator.java:83-90; the flush drain's
+		// `while (pos > 1)` guard at Parser.java:108 never fires). twmb's
+		// "{}" is the only valid JSON for an empty record and matches
+		// fastavro. This cell pins Java's CURRENT zero-byte output — the
+		// reason rec0 is excluded from the JSON-form parity sweep in
+		// TestDifferentialJavaJSONForm. When a Java release fixes the bug,
+		// this cell flips: re-include rec0 there and retire this pin.
+		ok, jsonOut, binOut, errMsg := rt(t, `{"type":"record","name":"E0","fields":[]}`, nil)
+		if !ok {
+			t.Fatalf("Java rejected the empty-record round-trip: %q", errMsg)
+		}
+		if len(binOut) != 0 {
+			t.Errorf("Java binary re-encode of empty record: % x, want empty", binOut)
+		}
+		if len(jsonOut) != 0 {
+			t.Errorf("Java JsonEncoder now emits %q for an empty record (historically zero bytes) — the upstream bug is fixed; re-include rec0 in TestDifferentialJavaJSONForm", jsonOut)
+		}
+	})
+}

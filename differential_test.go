@@ -49,12 +49,16 @@ type oracleJob struct {
 	// No omitempty: a zero-byte encoding (e.g. the "null" type) has an empty
 	// hex string that must still be sent, or the oracle sees no "hex" key.
 	Hex string `json:"hex"`
+	// JSON carries the Avro-JSON text for the "jsonread" op.
+	JSON string `json:"json,omitempty"`
 }
 
 type oracleResp struct {
 	OK        bool   `json:"ok"`
 	Hex       string `json:"hex"`
 	Canonical string `json:"canonical"`
+	JSON      string `json:"json"`
+	Values    []any  `json:"values"`
 	Err       string `json:"err"`
 	Fatal     string `json:"fatal"`
 }

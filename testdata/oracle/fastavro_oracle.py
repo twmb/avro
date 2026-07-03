@@ -19,6 +19,11 @@ Jobs:
                                             JSON-representable — used by the
                                             foreign block-framing matrix, whose
                                             datums are plain strings.)
+  {"op":"jsonwrite","schema":<avro schema>,"value":<json value>,"kind":<kind>}
+      -> {"ok":true,"json":"<one datum's Avro-JSON text via json_writer>"}
+  {"op":"jsonread","schema":<avro schema>,"json":"<Avro-JSON text>"}
+      -> {"ok":true,"values":[...]}        (one datum via json_reader; values
+                                            must be strict-JSON-representable)
 On any failure: {"ok":false,"err":"<message>"}
 
 "kind" (optional, default "") tells the oracle how to turn the JSON value into
@@ -49,6 +54,9 @@ def _coerce(value, kind):
     # encoded and are rebuilt here.
     if kind in ("bytes", "fixed"):
         return base64.b64decode(value)
+    if kind == "nan":
+        # NaN cannot travel as strict JSON; the job carries null + this kind.
+        return float("nan")
     if kind == "decimal":
         return decimal.Decimal(value)
     if kind == "timestamp-millis":
@@ -110,6 +118,22 @@ def handle(job):
         from fastavro.schema import to_parsing_canonical_form
 
         return {"ok": True, "canonical": to_parsing_canonical_form(json.loads(json.dumps(job["schema"])))}
+    if op == "jsonwrite":
+        # Avro-JSON encoding of one datum via fastavro.json_writer; the
+        # caller compares the text against twmb's EncodeJSON for JSON-wire
+        # parity (byte/fixed codepoint strings, tagged-union envelopes,
+        # special-float spelling).
+        value = _coerce(job["value"], job.get("kind", ""))
+        out = io.StringIO()
+        fastavro.json_writer(out, schema, [value])
+        return {"ok": True, "json": out.getvalue().strip("\n")}
+    if op == "jsonread":
+        # Avro-JSON decode of one datum via fastavro.json_reader. Values
+        # must be strict-JSON-representable to travel back over the line
+        # protocol (a non-representable result surfaces as ok:false).
+        vals = list(fastavro.json_reader(io.StringIO(job["json"]), schema))
+        json.dumps(vals, allow_nan=False)  # reject non-representable early
+        return {"ok": True, "values": vals}
     return {"ok": False, "err": "unknown op %r" % op}
 
 

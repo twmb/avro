@@ -14,8 +14,11 @@ import (
 // axis takes every composed matrix schema, derives structurally-broken
 // mutants whose rejection is spec-required and reference-verified (each
 // mutator class was checked against Java's parser source and conformance
-// behavior), and asserts twmb, fastavro, and Java agree: the original
-// schema parses everywhere, every mutant is rejected everywhere.
+// behavior), and asserts the originals parse everywhere and the mutants
+// reject in twmb and Java (the cisuite twin asserts the full set) —
+// fastavro validates only a subset at parse, and the executed
+// fastavroLaxMutants calibration below witnesses which mutant classes
+// it accepts.
 //
 // Mutators deliberately avoid the documented-divergence territory (quoted
 // size leniency, logical-type soft-drop vs hard-reject of bad decimal
@@ -243,11 +246,20 @@ func TestMatrix_AcceptanceMutantsRejectLocally(t *testing.T) {
 }
 
 // fastavroLaxMutants are mutator classes fastavro's parser does NOT
-// validate (it defers them to read time or skips them entirely), verified
-// against a live fastavro: missing/duplicate/empty-named record fields and
-// negative fixed sizes all parse there. Java enforces every class — the
-// cisuite twin (TestDifferentialJavaAcceptance) asserts the full set; the
-// fastavro differential asserts only what fastavro enforces.
+// validate per se (it defers them to read time or skips them entirely):
+// missing/duplicate/empty-named record fields and negative fixed sizes
+// parse there IN THEIR PLAIN FORM. The laxness is class-level, not
+// uniform — a specific mutant cell can still reject when the mutation
+// collaterally trips an orthogonal fastavro validation (a duplicated
+// field whose type DEFINES a named type re-defines that name; a
+// negative-size fixed carrying a decimal fails the precision-capacity
+// check) — so the differential below requires an executed ACCEPT
+// WITNESS per lax class rather than skipping or asserting uniformly: a
+// fastavro upgrade that starts validating a class wholesale drops its
+// witness count to zero and flips the calibration loudly. Java enforces
+// every class — the cisuite twin (TestDifferentialJavaAcceptance)
+// asserts the full set; the fastavro differential asserts reject only
+// for what fastavro enforces.
 var fastavroLaxMutants = map[string]bool{
 	"record-missing-fields":   true,
 	"record-duplicate-field":  true,
@@ -256,22 +268,37 @@ var fastavroLaxMutants = map[string]bool{
 }
 
 // TestDifferentialAcceptance: fastavro must agree on every cell (accept)
-// and every mutant it validates (reject). Skips without the oracle python.
+// and every mutant it validates (reject); each documented-lax mutant
+// class must produce at least one observed fastavro ACCEPT across the
+// sweep (the executed fastavroLaxMutants calibration). Skips without the
+// oracle python.
 func TestDifferentialAcceptance(t *testing.T) {
 	o := startOracle(t)
+	laxSeen := map[string]int{}
+	laxAccepted := map[string]int{}
 	for _, cell := range acceptanceCells() {
 		resp := o.call(oracleJob{Op: "parse", Schema: json.RawMessage(cell)})
 		if !resp.OK {
 			t.Fatalf("fastavro rejected a schema twmb accepts: %s\n%s", resp.Err, cell)
 		}
 		for _, m := range schemaMutants(cell) {
+			resp := o.call(oracleJob{Op: "parse", Schema: json.RawMessage(m.schema)})
 			if fastavroLaxMutants[m.label] {
+				laxSeen[m.label]++
+				if resp.OK {
+					laxAccepted[m.label]++
+				}
 				continue
 			}
-			resp := o.call(oracleJob{Op: "parse", Schema: json.RawMessage(m.schema)})
 			if resp.OK {
 				t.Errorf("fastavro accepted mutant %s that twmb rejects:\n%s", m.label, m.schema)
 			}
+		}
+	}
+	for label := range fastavroLaxMutants {
+		if laxSeen[label] > 0 && laxAccepted[label] == 0 {
+			t.Errorf("fastavro now REJECTS every %s mutant (%d cells) — its parser started validating this class; recalibrate fastavroLaxMutants",
+				label, laxSeen[label])
 		}
 	}
 }
