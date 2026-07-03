@@ -2016,10 +2016,14 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	return nil
 }
 
-// addUnionShortNameFallbacks applies the fastavro-short-name fallback:
+// addUnionShortNameFallbacks applies the unqualified-short-name fallback:
 // for named branches (record/enum/fixed) whose canonical name carries a
 // namespace, also accept the unqualified short name on tagged-union
-// encode IFF it's unique across the union. Mirrors findUnionBranch's
+// encode IFF it's unique across the union. A twmb leniency for
+// hand-written input — no reference implementation emits or reads
+// short-name union tags (fastavro 1.12.2's tuple notation and JSON
+// reader both require the fullname, observed; its short-name matching
+// exists only in schema resolution). Mirrors findUnionBranch's
 // JSON-side fallback (json_codec.go:findUnionBranch) so binary and JSON
 // encode accept the same tagged input shape. The ambiguity guard
 // prevents silent misrouting when two namespaces share a short name.
@@ -2365,9 +2369,16 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// Aliases are NOT name-validated: the Avro spec (§Aliases) states
 		// "any string is accepted as an alias", precisely so evolution can
 		// alias a reader's valid name to a writer's illegal/legacy name.
-		// Java and fastavro do no alias-name validation either. qualifyAliases
-		// (below) still applies namespace qualification and the leading-dot
-		// null-namespace escape; resolution matches aliases as plain strings.
+		// fastavro does no alias validation (a "123 !bad" alias parses,
+		// observed 1.12.2), and Java stores FIELD aliases as raw strings
+		// (Field.addAlias, Schema.java:674-677) — though Java's default
+		// parser DOES run its NameValidator over TYPE aliases
+		// (parseAliases → NamedSchema.addAlias → new Name,
+		// Schema.java:2000-2004/:847, rejecting e.g. digit-start), its
+		// own divergence from the spec sentence. twmb follows the spec
+		// and fastavro. qualifyAliases (below) still applies namespace
+		// qualification and the leading-dot null-namespace escape;
+		// resolution matches aliases as plain strings.
 		ns := ""
 		hasNS := false
 		if o.Namespace != nil {
@@ -3012,7 +3023,7 @@ var logicalUnderlyingAccept = map[string]func(o *aobject) bool{
 	"local-timestamp-nanos":  func(o *aobject) bool { return o.Type == "long" },
 	"big-decimal":            func(o *aobject) bool { return o.Type == "bytes" },
 	// Duration on non-fixed, or fixed with size != 12, soft-drops.
-	// Java's Duration.validate at LogicalTypes.java:526-530 throws
+	// Java's Duration.validate at LogicalTypes.java:323-327 throws
 	// IllegalArgumentException for `type != FIXED || size != 12`;
 	// fromSchemaIgnoreInvalid catches and drops. hamba's
 	// parseFixedLogicalType at schema_parse.go:517 only matches
@@ -3045,10 +3056,19 @@ func (o *aobject) validateLogical() error {
 		// Wrong underlying type is the one fall-back-on-mismatch case
 		// the spec implies: an unknown logical type pinned on the wrong
 		// primitive should not block schema parse. Precision/scale
-		// constraints, on the other hand, are explicit Avro 1.12 rules
-		// (LogicalTypes.Decimal.validate in Java rejects each); a
-		// schema that violates them is malformed. Java and fastavro
-		// reject; we do too, to avoid silent interop divergence.
+		// constraints, on the other hand, are explicit Avro 1.12 rules;
+		// a schema that violates them is malformed. twmb hard-rejects,
+		// aligning with fastavro's parse_schema (which raises for
+		// negative precision/scale and scale > precision — though its
+		// truthiness guards skip the checks for 0-or-missing values,
+		// observed 1.12.2). Java's LogicalTypes.Decimal.validate throws
+		// for each violation (precision <= 0, scale < 0,
+		// scale > precision — LogicalTypes.java:383-394), but at schema
+		// parse that throw is caught by fromSchemaIgnoreInvalid and the
+		// logical soft-drops to bare bytes/fixed rather than failing
+		// the parse. Hard-rejecting beats Java's silent drop here: a
+		// producer-declared decimal quietly becoming plain bytes is a
+		// silent interop divergence.
 		if o.Type != "bytes" && o.Type != "fixed" {
 			o.Logical = ""
 			return nil
@@ -3984,10 +4004,19 @@ func validateLeaf(val any, node *schemaNode) (any, error) {
 		// Unconditional membership: a non-nil enum node always carries its
 		// final symbols (definitions build them in one shot; forward refs
 		// are nil until finalize and defaults resolve post-wiring). An
-		// empty enum therefore rejects every default — Java parity
-		// (EnumSchema's constructor and isValidDefault both test
-		// containment), and union-default branch selection must skip an
-		// empty-enum branch so a later branch can accept (Java's anyMatch).
+		// empty enum therefore rejects every default. Membership here is
+		// deliberately STRICTER than the references' parse-time checks:
+		// Java validates containment only for the enum-level "default"
+		// attribute (EnumSchema's constructor, Schema.java:1100), while
+		// its FIELD-default validation accepts any textual value
+		// (isValidDefault's ENUM arm is isTextual() only,
+		// Schema.java:1755-1759 — a non-member surfaces later, at
+		// default-encode time), and fastavro 1.12.2 parses a non-member
+		// enum field default outright (observed). twmb fails fast at
+		// parse because a non-member default can never encode. The
+		// membership check also makes union-default branch selection
+		// skip an empty/non-member enum branch so a later branch can
+		// accept.
 		if !slices.Contains(node.symbols, sym) {
 			return val, fmt.Errorf("enum default %q is not a member of symbols", truncForError(sym))
 		}

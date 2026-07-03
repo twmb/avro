@@ -2750,9 +2750,12 @@ func TestRegression_NamedTypeNotPrimitiveName(t *testing.T) {
 
 // Avro §Aliases: "any string is accepted as an alias" — so a reader can
 // alias its valid name to a writer's illegal/legacy name during evolution.
-// Java and fastavro do no alias-name validation; twmb formerly rejected
-// aliases that weren't valid Avro names, breaking interop with their
-// schemas. Names themselves stay strictly validated; only aliases relax.
+// fastavro does no alias validation (observed 1.12.2), and Java stores
+// FIELD aliases as raw strings (Field.addAlias, Schema.java:674-677;
+// its default parser does validate TYPE aliases via NameValidator —
+// Java's own spec divergence). twmb formerly rejected aliases that
+// weren't valid Avro names, breaking interop with schemas the spec
+// blesses. Names themselves stay strictly validated; only aliases relax.
 func TestRegression_AliasAcceptsAnyString(t *testing.T) {
 	t.Run("field aliases any string", func(t *testing.T) {
 		for _, alias := range []string{"1stField", "com.example.legacy_x", "weird name!", "has.dots", ""} {

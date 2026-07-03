@@ -10,9 +10,10 @@ import (
 // zero-branch unions. The Avro spec sets no minimum for any of the three
 // ("size: an integer", "symbols: a JSON array", a union is "a JSON array");
 // Java, fastavro, and avro-rs all parse all three (Java:
-// SystemLimitException.checkMaxBytesLength rejects only negative sizes,
-// EnumSchema's constructor does per-symbol checks only, UnionSchema's
-// constructor loop no-ops on empty). A size-0 fixed is a usable type whose
+// SystemLimitException.checkMaxBytesLength rejects negative sizes — and
+// caps above Integer.MAX_VALUE-8 — so 0 passes, EnumSchema's constructor
+// does per-symbol checks only, UnionSchema's constructor loop no-ops on
+// empty). A size-0 fixed is a usable type whose
 // every value is the empty byte string; empty enums and unions are
 // unusable-but-parseable (every encode/decode of the node itself errors),
 // which matters for schema passthrough: a reader must be able to parse a

@@ -400,8 +400,10 @@ func TestDoSBattery_C2_LargeCountLength(t *testing.T) {
 		return err
 	})
 
-	// fixed: size is a schema integer with no upper bound at parse (only
-	// negatives reject, matching fastavro/avro-rs), but deserFixed.deser calls
+	// fixed: size is a schema integer with no upper bound at parse — only
+	// negatives reject, as avro-rs does (its size parse is as_u64, rejecting
+	// negatives with no maximum; fastavro 1.12.2 is laxer still and parses
+	// even a negative size, observed) — but deserFixed.deser calls
 	// needLen before make([]byte, size), so a 2e9-size fixed against an empty
 	// wire rejects without allocating. Sibling parse-time alloc bounds:
 	// TestRegression_DecimalFixedSizeCapacityNoOverflow, _FixedLogicalProbeSizeBounded.

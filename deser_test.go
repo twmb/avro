@@ -8682,7 +8682,13 @@ func TestBytesDecimalDecodeFloat64Overflow(t *testing.T) {
 }
 
 func TestDecimalSchemaValidation(t *testing.T) {
-	// decimal without precision is invalid per spec; Java + fastavro reject.
+	// decimal without precision is invalid per spec; twmb rejects at parse.
+	// The references are laxer here: fastavro 1.12.2's parse validation
+	// skips a missing precision entirely (parses; its writer then KeyErrors
+	// at use — observed), and Java's Decimal.validate throw is caught by
+	// fromSchemaIgnoreInvalid, soft-dropping the logical to bare bytes.
+	// Rejecting beats both: a spec-required attribute is missing, and
+	// silently dropping the decimal is a silent interop divergence.
 	if _, err := Parse(`{"type":"bytes","logicalType":"decimal"}`); err == nil {
 		t.Fatal("expected error for decimal missing precision")
 	}
@@ -9517,8 +9523,13 @@ func TestDeserUUIDTextUnmarshalerError(t *testing.T) {
 // ---- Coverage: decimal precision <= 0, scale > precision ----
 
 func TestDecimalPrecisionZero(t *testing.T) {
-	// Java's LogicalTypes.Decimal.validate rejects precision <= 0;
-	// fastavro's parse_schema does too. We now match.
+	// Java's LogicalTypes.Decimal.validate throws for precision <= 0
+	// (LogicalTypes.java:383-385) — though its schema parse catches the
+	// throw and soft-drops the logical rather than failing. fastavro's
+	// parse_schema hard-rejects NEGATIVE precision but its `if precision:`
+	// truthiness guard skips the check for 0 (parses, observed 1.12.2).
+	// twmb hard-rejects the whole <= 0 range: a decimal that can hold
+	// zero digits is malformed per the spec's positive-precision rule.
 	if _, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":0}`); err == nil {
 		t.Fatal("expected error for decimal precision=0")
 	}
@@ -10419,19 +10430,22 @@ func TestRegression_EncodeJSONBareUnionsByDefault(t *testing.T) {
 	}
 }
 
-// TestRegression_DecodeJSONUnionTagFastavroShortName locks in that
-// the JSON union decoder accepts the unqualified short-name tag form
-// emitted by fastavro (e.g. {"User": {...}} for a record named
-// com.example.User). Java emits and requires the fullname form, which
-// we already accept. fastavro emits the short-name form, which is
-// non-spec-conformant but common in Python pipelines.
-func TestRegression_DecodeJSONUnionTagFastavroShortName(t *testing.T) {
+// TestRegression_DecodeJSONUnionTagShortName locks in that the JSON
+// union decoder accepts the unqualified short-name tag form (e.g.
+// {"User": {...}} for a record named com.example.User) as a leniency
+// for hand-written JSON. No reference implementation emits or reads
+// this form: Java emits and requires the fullname envelope, and
+// fastavro 1.12.2 does too (its json_writer keys by fullname and its
+// AvroJSONDecoder.read_index exact-matches branch labels — a
+// short-name tag raises, observed). The uniqueness guard in
+// findUnionBranch keeps the leniency unambiguous.
+func TestRegression_DecodeJSONUnionTagShortName(t *testing.T) {
 	sch := MustParse(`{"type":"record","name":"Wrapper","fields":[
 		{"name":"u","type":["null",{"type":"record","name":"User","namespace":"com.example","fields":[
 			{"name":"name","type":"string"}
 		]}]}
 	]}`)
-	// fastavro-style short-name tag.
+	// Short-name tag (hand-written-JSON leniency).
 	in := []byte(`{"u":{"User":{"name":"alice"}}}`)
 	var out map[string]any
 	if err := sch.DecodeJSON(in, &out); err != nil {
@@ -10548,10 +10562,13 @@ func TestRegression_LongDefaultPrecisionLoss(t *testing.T) {
 
 // TestRegression_InvalidDecimalRejected verifies that malformed decimal
 // logical types (precision <= 0, scale > precision, missing precision,
-// precision exceeding fixed capacity) are rejected at parse time, matching
-// Java's LogicalTypes.Decimal.validate and fastavro's parse_schema.
-// Silently stripping the logical type and treating the schema as plain
-// bytes/fixed would be an interop hazard.
+// precision exceeding fixed capacity) are rejected at parse time,
+// aligning with fastavro's parse_schema hard-rejects (negative values
+// and scale > precision; its truthiness guards skip 0/missing, observed
+// 1.12.2). Java's Decimal.validate throws for each, but schema parse
+// catches the throw (fromSchemaIgnoreInvalid) and soft-drops the
+// logical — silently stripping the logical type and treating the schema
+// as plain bytes/fixed is exactly the interop hazard rejecting avoids.
 func TestRegression_InvalidDecimalRejected(t *testing.T) {
 	cases := []struct {
 		name, schema string
@@ -10638,8 +10655,9 @@ func TestRegression_CanonicalU2028Escaping(t *testing.T) {
 // TestRegression_UnionResolutionPrefersExactKindOverPromotion verifies
 // that union resolution does a two-pass scan: exact-kind branches win
 // over promotion branches even when the promotion branch comes first
-// in declaration order. Matches Java's bestBranch
-// (ResolvingGrammarGenerator.java) and fastavro. A single-pass scan
+// in declaration order. Matches Java's Resolver.firstMatchingBranch
+// (Resolver.java:634 "first scan for exact match", :666 "then scan
+// match via numeric promotion") and fastavro. A single-pass scan
 // would silently pick the first promotion match, producing float64
 // for an int writer when the reader is ["double","int"].
 func TestRegression_UnionResolutionPrefersExactKindOverPromotion(t *testing.T) {

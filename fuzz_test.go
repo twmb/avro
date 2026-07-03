@@ -2187,7 +2187,7 @@ func FuzzFindUnionBranch(f *testing.F) {
 	// 2: two fixed branches differing by logical type (same kind, same-
 	//    kind pair-match: only legal for fixed)
 	// 3: two records with the same short name in different namespaces
-	//    (fastavro short-name ambiguity guard)
+	//    (short-name-leniency ambiguity guard)
 	// 4: enum + record (short-name fallback)
 	unions := []string{
 		`[{"type":"long","logicalType":"timestamp-millis"}]`,

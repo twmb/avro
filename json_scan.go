@@ -206,12 +206,15 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 //
 // Accepts the same bare special-float tokens decodeJSONFloat accepts on
 // known float/double fields — NaN, Infinity, -Infinity, INF, -INF, Inf,
-// -Inf — so a record produced by Java JsonEncoder or fastavro (both
-// emit bare NaN/Infinity by convention) with such a token in a
-// writer-only field can be decoded against a reader that doesn't have
-// the field. parseSpecialFloat's exact-match gate is applied so invalid
-// bare tokens (e.g. "Naive", lowercase "nan") still error, matching
-// the strict-JSON posture decodeJSONFloat enforces.
+// -Inf — so a record produced by fastavro (Python json.dumps with
+// allow_nan=True emits bare NaN/Infinity, observed) with such a token
+// in a writer-only field can be decoded against a reader that doesn't
+// have the field. (Java's JsonEncoder emits the QUOTED string form —
+// Jackson's default quotes non-numeric numbers — which the string arm
+// already skips as a plain JSON string.) parseSpecialFloat's
+// exact-match gate is applied so invalid bare tokens (e.g. "Naive",
+// lowercase "nan") still error, matching the strict-JSON posture
+// decodeJSONFloat enforces.
 //
 // Case-sensitivity note: lowercase 'n' is unambiguously the JSON null
 // literal; lowercase 'i' isn't a valid token start (Java's JsonParser,

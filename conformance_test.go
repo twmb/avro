@@ -4053,10 +4053,14 @@ func TestSchemaFixedSizeValidation(t *testing.T) {
 
 func TestSchemaInvalidLogicalIgnored(t *testing.T) {
 	// Decimal-specific malformations (invalid precision / scale > precision /
-	// precision over fixed capacity) are now rejected at parse time, matching
-	// Java's LogicalTypes.Decimal.validate and fastavro's parse_schema.
-	// Unknown logical types still fall back to the underlying type for
-	// forward-compat; that's the case below.
+	// precision over fixed capacity) are now rejected at parse time, aligning
+	// with fastavro's parse_schema hard-rejects (negative precision/scale,
+	// scale > precision — its truthiness guards skip 0/missing, observed
+	// 1.12.2). Java's Decimal.validate throws for each, but schema parse
+	// catches the throw in fromSchemaIgnoreInvalid and soft-drops the logical
+	// to bare bytes/fixed rather than failing. Unknown logical types still
+	// fall back to the underlying type for forward-compat; that's the case
+	// below.
 	t.Run("decimal precision zero rejected", func(t *testing.T) {
 		if _, err := avro.Parse(`{"type":"bytes","logicalType":"decimal","precision":0,"scale":0}`); err == nil {
 			t.Fatal("expected decimal precision=0 to error")
@@ -5191,9 +5195,10 @@ func TestSpecNumericDefaultRejectedForNonNumericField(t *testing.T) {
 }
 
 // TestSpecEnumSymbolRegexValidation locks in that enum symbols must
-// match [A-Za-z_][A-Za-z0-9_]*. fastavro test_schema.py:1114 pins
-// digit-start, spaces, non-ASCII letter, and dash as invalid;
-// leading underscore is valid.
+// match [A-Za-z_][A-Za-z0-9_]*. fastavro test_schema.py:1113-1141 pins
+// digit-start, spaces, and a non-ASCII letter as invalid and a leading
+// underscore as valid (its param lists carry no dash case; the dash
+// reject below follows from the regex itself).
 func TestSpecEnumSymbolRegexValidation(t *testing.T) {
 	invalid := []string{"0nope", "string with spaces", "Ż", "-foo", ""}
 	for _, sym := range invalid {
@@ -5211,7 +5216,9 @@ func TestSpecEnumSymbolRegexValidation(t *testing.T) {
 
 // TestSpecFingerprintKnownVectorsSHA256AndMD5 locks in exact hex values
 // for spec-required SHA-256 and MD5 fingerprints over primitive schemas.
-// fastavro test_fingerprint.py:12 pins these. The CRC-64 vectors at
+// fastavro's tests/test_fingerprint.py:28-47 pins the identical "int"
+// digests in its parametrized vector cases (its opening test at :12
+// pins only the required algorithm names). The CRC-64 vectors at
 // conformance_test.go:1256/2037 don't cover the other two required
 // algorithms, and a regression in the SHA-256/MD5 hash plumbing or in
 // Canonical() output would silently break schema-registry consumers.
@@ -10314,11 +10321,16 @@ func TestRegression_UnionDefaultMetadataMatchesWireBranch_StructuralArms(t *test
 // accepted "Z" and the coerce step preserved the unmatched string
 // verbatim.
 //
-// Cross-impl: Java's Schema.isValidValue (Schema.java:1786) for an
-// ENUM defaultValue checks `getEnumSymbols().contains(...)`; fastavro
-// _default_matches_schema enum branch checks `default in schema['symbols']`.
-// Both reject non-member enum defaults and let the union pick a later
-// branch.
+// Cross-impl: the membership check is twmb-stricter-than-references.
+// Java's parse-time validation accepts ANY textual value for an enum
+// default (isValidDefault groups ENUM with STRING/BYTES/FIXED and
+// checks only isTextual(), Schema.java:1755-1759; containment is
+// enforced only for the enum-LEVEL "default" attribute in
+// EnumSchema's constructor, Schema.java:1100), and fastavro 1.12.2
+// parses a non-member enum field default outright (observed). twmb
+// validates membership at parse because a non-member default can
+// never encode — and that check is what lets the union pick a later
+// branch here instead of mis-selecting the enum.
 func TestRegression_UnionDefaultMetadataMatchesWireBranch_EnumArm(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -10913,14 +10925,17 @@ func TestRegression_UnionDefaultEncodeMatchesValidateBranch(t *testing.T) {
 }
 
 // TestRegression_TaggedUnionShortNameBinaryParity locks binary ↔ JSON
-// parity on fastavro's unqualified-short-name tagged-union shape.
+// parity on the unqualified-short-name tagged-union shape (a twmb
+// leniency for hand-written input; no reference implementation emits
+// or reads short-name union tags — fastavro 1.12.2's tuple notation
+// and JSON reader both require the fullname, observed).
 // The binary `serUnion.tryUnwrapTagged` must apply the same short-
 // name fallback (with ambiguity guard) as the JSON encoder's
 // `findUnionBranch` (json_codec.go:775-789). Otherwise binary's
 // plain map lookup on `serUnion.branchNames` (populated with only
 // the canonical fully-qualified name + the goavro "type.logical"
 // form) would reject an input shape that round-trips through JSON.
-// `TestRegression_DecodeJSONUnionTagFastavroShortName` locks the
+// `TestRegression_DecodeJSONUnionTagShortName` locks the
 // JSON-decode side.
 func TestRegression_TaggedUnionShortNameBinaryParity(t *testing.T) {
 	t.Run("namespaced record short-name in tagged union", func(t *testing.T) {
@@ -10931,7 +10946,7 @@ func TestRegression_TaggedUnionShortNameBinaryParity(t *testing.T) {
 		]}`)
 		in := map[string]any{
 			"u": map[string]any{
-				"User": map[string]any{"id": int32(42)}, // fastavro short name
+				"User": map[string]any{"id": int32(42)}, // short-name leniency
 			},
 		}
 		_, jerr := s.AppendEncodeJSON(nil, in)
@@ -11703,8 +11718,11 @@ func TestParity_RuntimeRejectionMatrix(t *testing.T) {
 			{"float truncated 3 bytes", `"float"`, []byte{0, 0, 0}},
 			{"double truncated 5 bytes", `"double"`, []byte{0, 0, 0, 0, 0}},
 			{"boolean empty", `"boolean"`, nil},
-			// "boolean invalid byte 2" — INTENTIONAL: Java's BinaryDecoder and fastavro
-			// both treat any non-1 byte as false. We match the reference impls.
+			// "boolean invalid byte 2" — INTENTIONAL: Java's BinaryDecoder treats
+			// any non-1 byte as false (`return n == 1`, BinaryDecoder.java:150-151)
+			// and we match Java. fastavro diverges the OTHER way: its read_boolean
+			// is `!= 0`, so byte 2 decodes True there (observed 1.12.2) — the
+			// impls disagree on this spec-invalid wire, and Java is our anchor.
 			{"string negative length", `"string"`, []byte{0x01}},
 			{"string truncated body", `"string"`, []byte{0x0a, 'a', 'b'}},
 			{"bytes negative length", `"bytes"`, []byte{0x01}},
@@ -14865,7 +14883,9 @@ func TestParity_ConcurrentSchema(t *testing.T) {
 // accepts every documented tag form for a tagged union:
 //   - Spec/Java fullname: "long" / "com.example.User"
 //   - goavro form: "type.logicalType"
-//   - fastavro short name: "User" (for "com.example.User") iff unambiguous
+//   - short name: "User" (for "com.example.User") iff unambiguous — a
+//     twmb hand-written-JSON leniency; no reference impl emits or
+//     reads it (see findUnionBranch)
 //
 // Catches "we forgot to support tag form X" gaps in findUnionBranch.
 func TestParity_JSONUnionTagFormMatrix(t *testing.T) {
@@ -15881,8 +15901,11 @@ func TestParity_AcceptedLeniencies(t *testing.T) {
 		}
 	})
 	t.Run("boolean decoder accepts any non-1 byte as false", func(t *testing.T) {
-		// Mirrors Java's BinaryDecoder.readBoolean and fastavro's
-		// `ord(b.read(1)) == 1` — both treat any non-1 byte as false.
+		// Mirrors Java's BinaryDecoder.readBoolean (`return n == 1`,
+		// BinaryDecoder.java:150-151): any non-1 byte is false. fastavro
+		// diverges — its read_boolean is `unpack("B", ...)[0] != 0`, so any
+		// non-ZERO byte is True there (byte 2 → True observed on 1.12.2).
+		// The impls disagree on this spec-invalid wire; Java is our anchor.
 		// Locked here so a future audit doesn't introduce a strict
 		// 0x00/0x01-only check that diverges from the reference impls.
 		s := avro.MustParse(`"boolean"`)

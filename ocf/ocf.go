@@ -640,8 +640,9 @@ func (w *Writer) Flush() error {
 // Close flushes any remaining items and closes the codec. The codec
 // is closed even if the writer is in a poisoned state — zstd and
 // similar codecs hold goroutines and buffers whose lifetime must be
-// bounded; mirrors Java DataFileWriter.close's try { flush } finally
-// { codec.close }.
+// bounded. (Deliberately more careful than Java: DataFileWriter.close
+// is a plain flush-then-close sequence with no finally, so a failing
+// flush skips its close — DataFileWriter.java:483-489.)
 //
 // Close is idempotent: subsequent calls return nil without re-closing the
 // codec. After Close, Encode, Write, Flush, and Reset all return an error
@@ -1165,8 +1166,9 @@ const maxOCFZeroByteSlack = 4 << 10
 //     zero-byte slack).
 //
 // Java's SnappyCodec (ByteBuffer.allocate(Snappy.uncompressedLength(...))) and
-// fastavro's python-snappy decompress leave the decompressed side unbounded —
-// the cap is twmb defense-in-depth, in the same family as WithMaxBlockBytes and
+// fastavro's snappy decompress (cramjam decompress_raw; python-snappy is its
+// deprecated fallback) leave the decompressed side unbounded — the cap is twmb
+// defense-in-depth, in the same family as WithMaxBlockBytes and
 // maxZeroByteItems.
 
 type nullCodec struct{}

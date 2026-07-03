@@ -86,9 +86,10 @@ func TestDifferentialMatrixRecursion(t *testing.T) {
 		if sh.label == "fwd-ref-union" {
 			// Forward references are a twmb+Java extension beyond the
 			// spec's "forward references are not permitted"; fastavro
-			// rejects the schema outright (KeyError on the name), so the
-			// oracle cannot validate this shape. Java-side parity for
-			// fwd-refs is covered by the cisuite Java differential.
+			// rejects the schema outright (UnknownType on the name,
+			// observed 1.12.2), so the oracle cannot validate this
+			// shape. Java-side parity for fwd-refs is covered by the
+			// cisuite Java differential.
 			continue
 		}
 		for _, d := range []int{0, 3} {

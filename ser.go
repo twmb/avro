@@ -678,10 +678,12 @@ func parseInt64Lenient(s string) (int64, error) {
 	// the JSON spec rejects — leading '+' ("+5" → 5), leading-zero
 	// multi-digit ("01" → 1). Validate first so the fast path agrees
 	// with the slow path on grammar (boundedRatFromString applies the
-	// same gate). Java's JsonParser rejects "+5"/"01" at JSON parse,
-	// fastavro's int() raises ValueError on Python int("+5") only
-	// in some versions but always on "01" → IntegerParseError; both
-	// match strict JSON.
+	// same gate). Java's JsonParser rejects "+5"/"01" at JSON parse;
+	// fastavro's JSON layer is Python's json, whose grammar rejects
+	// both too (json.loads("+5") "Expecting value", json.loads("01")
+	// "Extra data" — observed on 3.14; Python's int() itself is
+	// lenient and accepts both, but never sees them). Both match
+	// strict JSON.
 	if !isJSONNumber(s) {
 		return 0, fmt.Errorf("invalid JSON number %q", s)
 	}
@@ -2256,9 +2258,11 @@ func decimalRatFor(v reflect.Value) (*big.Rat, bool, error) {
 // approach via Double.toString; the user-visible value 0.33 becomes
 // the big.Rat 33/100, which rounds exactly at schema scale 2.
 //
-// Cross-impl: fastavro requires decimal.Decimal, hamba requires *big.Rat,
-// linkedin-goavro requires a textual string — twmb is the only Go impl
-// accepting native float input for the decimal logical type. The float
+// Cross-impl: fastavro requires decimal.Decimal, and hamba and
+// linkedin-goavro both require *big.Rat (goavro's textual decimal is
+// the wire form only — its encoder rejects any Go value that is not a
+// *big.Rat, logical_type.go "expected *big.Rat") — twmb is the only Go
+// impl accepting native float input for the decimal logical type. The float
 // arm bypasses boundedRatFromString's isJSONNumber / magnitude gates:
 // FormatFloat's 'f'-format output is JSON-valid by construction (≤310
 // chars, no hex / underscore / rational forms), and float64's bounded
@@ -2274,7 +2278,9 @@ func tryCoerceToRat(v reflect.Value) (*big.Rat, bool, error) {
 		f := v.Float()
 		// Reject non-finite values: NaN/±Inf are not in the decimal value
 		// set. Java's BigDecimal.valueOf(double) rejects with
-		// NumberFormatException; fastavro raises InvalidOperation.
+		// NumberFormatException; fastavro's prepare_bytes_decimal also
+		// errors (observed 1.12.2: a TypeError from Decimal("nan")'s
+		// non-integer as_tuple exponent).
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return nil, false, nil
 		}

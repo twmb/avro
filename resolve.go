@@ -698,9 +698,10 @@ func resolveWriterUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 
 // resolveReaderUnion: reader is union, writer is not.
 // Find first matching reader branch — two-pass to match Java's
-// bestBranch (exact-kind first, promotion fallback only if no exact
-// match exists). Single-pass would silently produce float64 for an
-// int writer when the reader is ["double","int"].
+// Resolver.firstMatchingBranch (exact match scanned first, numeric
+// promotion as a fallback pass only if no exact match exists,
+// Resolver.java:634/:666). Single-pass would silently produce float64
+// for an int writer when the reader is ["double","int"].
 func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
 	rb := findMatchingBranch(r, w)
 	if rb == nil {

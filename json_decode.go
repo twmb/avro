@@ -571,7 +571,8 @@ func isBareSpecialFloatStart(s *jsonScanner, p byte) bool {
 //
 //   - quoted-string "NaN"/"Infinity"/"-Infinity"/"INF"/"-INF"/"Inf"/"-Inf"
 //     (Java JsonEncoder form, twmb's default emit form). parseSpecialFloat
-//     gates exact-match (Java/fastavro/goavro parity — see its docstring).
+//     gates exact-match (Java parity — see its docstring for the per-impl
+//     accept sets; fastavro reads only the bare-token forms).
 //   - bare null → NaN (goavro convention). isJSONNullStart disambiguates
 //     from bare special-float tokens whose first byte is unambiguously
 //     uppercase post-tightening.

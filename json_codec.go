@@ -43,9 +43,11 @@ func (taggedUnions) opt() {}
 // "Expected start-union" / equivalent on the first non-null union
 // field. Pass TaggedUnions when interop with Java, fastavro, or
 // avro-tools fromjson is required. The bare default is for
-// round-trips through goavro and for the natural Go map[string]any
-// shape; see Apache Avro Jira issue AVRO-2899 for the long-standing
-// upstream discussion.
+// round-trips through goavro's bare-JSON codecs
+// (NewCodecForStandardJSON / NewCodecForStandardJSONFull — goavro's
+// plain codec requires the tagged form too) and for the natural Go
+// map[string]any shape; see Apache Avro Jira issue AVRO-2899 for the
+// long-standing upstream discussion.
 //
 // Branch identity: a bare (untagged) union value does not name its
 // branch, so [Schema.DecodeJSON] cannot recover which branch the
@@ -1318,13 +1320,20 @@ func appendTaggedUnion(buf []byte, branch *schemaNode, encoded []byte, tagLogica
 // interop, in order:
 //
 //  1. Exact match against the spec/Java fullname (e.g. "long" or
-//     "com.example.User"). This is what we emit on output.
+//     "com.example.User"). This is what we emit on output, and the only
+//     form the references emit or read (Java's JsonEncoder keys by
+//     getFullName(); fastavro 1.12.2's json_writer emits the fullname
+//     and its AvroJSONDecoder.read_index exact-matches branch labels —
+//     a short-name tag raises there, observed).
 //  2. goavro's "type.logicalType" form (e.g. "long.timestamp-millis"):
 //     match the base primitive before the dot.
-//  3. fastavro's unqualified short-name form for named types (e.g.
-//     "User" instead of "com.example.User"). Only applied when the
-//     input has no namespace AND exactly one branch matches by short
-//     name; ambiguous cases return no match rather than guess.
+//  3. Unqualified short-name form for named types ("User" instead of
+//     "com.example.User") — a twmb leniency for hand-written JSON; no
+//     reference implementation emits or reads it (fastavro's short-name
+//     matching exists only in schema RESOLUTION, match_schemas'
+//     unqualified-name tier, not in union-tag decoding). Only applied
+//     when the input has no namespace AND exactly one branch matches by
+//     short name; ambiguous cases return no match rather than guess.
 func findUnionBranch(union *schemaNode, name string) *schemaNode {
 	for _, b := range union.branches {
 		if unionBranchName(b) == name {
@@ -1352,8 +1361,9 @@ func findUnionBranch(union *schemaNode, name string) *schemaNode {
 		}
 		return nil
 	}
-	// Fallback (fastavro): unqualified short name. The ambiguity guard
-	// prevents silent misrouting when two namespaces share a short name.
+	// Fallback (twmb leniency, convention 3 above): unqualified short
+	// name. The ambiguity guard prevents silent misrouting when two
+	// namespaces share a short name.
 	var match *schemaNode
 	for _, b := range union.branches {
 		switch b.kind {
@@ -1369,12 +1379,18 @@ func findUnionBranch(union *schemaNode, name string) *schemaNode {
 	return match
 }
 
-// parseSpecialFloat parses NaN/Infinity string forms. Accepts the
-// Java/fastavro set {"NaN", "Infinity", "INF", "-Infinity", "-INF"}
-// plus Go-strconv-style "Inf"/"-Inf". Java/fastavro/goavro all reject
-// lowercase; the lowercase 'n' would collide with the JSON null
-// literal in the union dispatcher, so case-strict matters here. The goavro null→NaN and ±1e999→±Inf conventions are handled
-// separately by the bare-token/number paths in decodeJSONFloat.
+// parseSpecialFloat parses NaN/Infinity string forms. Accepts Java's
+// exact set {"NaN", "Infinity", "INF", "-Infinity", "-INF"}
+// (JsonDecoder's isNaNString/is*InfinityString equality checks, which
+// only ever see QUOTED strings) plus Go-strconv-style "Inf"/"-Inf".
+// fastavro's accept set is the BARE-token subset Python json takes —
+// NaN, Infinity, -Infinity; not INF/-INF, and it does not parse the
+// quoted forms at all (observed 1.12.2). Everything rejects
+// lowercase (Java exact-equals, Python json, goavro); the lowercase
+// 'n' would collide with the JSON null literal in the union
+// dispatcher, so case-strict matters here. The goavro null→NaN and
+// ±1e999→±Inf conventions are handled separately by the
+// bare-token/number paths in decodeJSONFloat.
 func parseSpecialFloat(s string) (float64, error) {
 	switch s {
 	case "NaN":

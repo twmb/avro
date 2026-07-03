@@ -3590,7 +3590,9 @@ func (f *failAfterNWrites) Write(p []byte) (int, error) {
 // the writer is in an error state from a prior flush failure. Pre-
 // fix Close() short-circuited on w.err != nil and never called
 // codec.Close() — zstd and similar codecs leak goroutines/buffers
-// in that path. Mirrors Java's DataFileWriter.close's try/finally.
+// in that path. (Deliberately more careful than Java, whose
+// DataFileWriter.close is flush-then-close with no finally — a
+// failing flush skips its close, DataFileWriter.java:483-489.)
 func TestRegression_OCFWriterCloseClosesCodecWhenPoisoned(t *testing.T) {
 	codec := &leakDetectCodec{name: "null"}
 	// One successful write for the header; subsequent writes fail.
@@ -3973,8 +3975,9 @@ func TestRegression_OCFBigDecimalJavaInterop(t *testing.T) {
 // TestRegression_OCFCodecMatrix pins round-trip behavior for every
 // supported codec (null, deflate, snappy, zstd) at writer and reader
 // sides. Snappy specifically uses a trailing CRC32 that the reader
-// verifies (fastavro skips this verification — see AUDIT.md known
-// divergences); the matrix asserts CRC mismatches are detected.
+// verifies, as Java's SnappyCodec does; fastavro reads the 4 CRC bytes
+// but never compares them (_read_py.py snappy_read_block — see
+// NOT_BUGS.md #20); the matrix asserts CRC mismatches are detected.
 func TestRegression_OCFCodecMatrix(t *testing.T) {
 	schema := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`)
 	records := []map[string]any{
