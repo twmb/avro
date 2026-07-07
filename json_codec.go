@@ -243,8 +243,23 @@ func (s *Schema) decodeJSONResolved(src []byte, rv reflect.Value, opts ...Opt) e
 	// cannot invert (a Decode-only custom has no Encode), failing where binary
 	// Decode succeeds. The reader's custom types apply only in the final
 	// resolving s.Decode below; the caller's opts likewise apply only there.
+	//
+	// Decode the intermediate with TaggedUnions so union values keep their
+	// {"branch": value} envelope, and the re-encode's tagged-map dispatch
+	// (serUnion.tryUnwrapTagged) routes them back to the exact branch. The
+	// envelope is the only carrier of the writer's branch choice: a bare
+	// intermediate would force the re-encode to re-derive the branch by
+	// first-match, silently rewriting branch identity whenever a later
+	// branch's value also satisfies an earlier one (two records, two enums
+	// sharing a symbol, enum vs string, ...) — and changing the decoded
+	// value where writer→reader resolution differs per branch. Java's
+	// JsonDecoder.readIndex reads the tag straight to the branch index;
+	// this envelope round-trip is the composed-path equivalent. Bare
+	// (untagged) writer JSON is unaffected in substance: its decode commits
+	// to the documented first-match branch and the envelope then pins that
+	// same branch through the re-encode.
 	var inter any
-	if err := w.DecodeJSON(src, &inter); err != nil {
+	if err := w.DecodeJSON(src, &inter, TaggedUnions()); err != nil {
 		return err
 	}
 	wb, err := w.Encode(inter)

@@ -1547,6 +1547,149 @@ func TestRegression_ResolvedDecodeJSONMatchesBinary(t *testing.T) {
 	})
 }
 
+// A resolved schema's DecodeJSON must preserve TAGGED union branch identity
+// through its decode→re-encode round trip, including the decoded VALUE when
+// writer→reader resolution differs per branch. The spec's JSON encoding names
+// the branch in a {"branch": value} envelope and Java's JsonDecoder.readIndex
+// reads that label into the exact branch index (unknown labels throw) — so
+// when two branches accept the same value (two enums sharing a symbol), the
+// envelope is the ONLY carrier of the writer's choice. Discarding it in the
+// intermediate and re-deriving the branch by first-match rewrites branch
+// identity, and when resolution differs per branch the value changes too:
+// here the writer says E2/"A", reader E2 drops "A" (enum default "Y"), so
+// resolving the true branch yields "Y" while a flip to E1 (which keeps "A")
+// yields "A". Binary Decode of the equivalent tagged wire and fastavro's
+// json_reader with writer→reader migration (executed against fastavro 1.12.2)
+// both produce "Y"; DecodeJSON must agree.
+func TestRegression_ResolvedJSONTaggedUnionValueMatchesBinary(t *testing.T) {
+	w := avro.MustParse(`[{"type":"enum","name":"E1","symbols":["A"]},{"type":"enum","name":"E2","symbols":["A","Y"]}]`)
+	r := avro.MustParse(`[{"type":"enum","name":"E1","symbols":["A"]},{"type":"enum","name":"E2","symbols":["Y"],"default":"Y"}]`)
+	resolved, err := avro.Resolve(w, r)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	// Binary oracle: the same tagged branch choice on the binary wire.
+	wire, err := w.Encode(map[string]any{"E2": "A"})
+	if err != nil {
+		t.Fatalf("writer Encode tagged: %v", err)
+	}
+	var binOut any
+	if _, err := resolved.Decode(wire, &binOut); err != nil {
+		t.Fatalf("resolved.Decode: %v", err)
+	}
+	if binOut != "Y" {
+		t.Fatalf("binary oracle: got %#v, want reader enum default \"Y\"", binOut)
+	}
+
+	var jsonOut any
+	if err := resolved.DecodeJSON([]byte(`{"E2":"A"}`), &jsonOut); err != nil {
+		t.Fatalf("resolved.DecodeJSON tagged: %v", err)
+	}
+	if !reflect.DeepEqual(jsonOut, binOut) {
+		t.Errorf("resolved JSON decode diverged from binary on a tagged union:\n  binary=%#v\n  json  =%#v", binOut, jsonOut)
+	}
+}
+
+// The tagged {"branch": value} envelope names the writer's union branch; a
+// resolved DecodeJSON must dispatch on that name exactly like binary Decode
+// dispatches on the wire index. Each shape below declares a branch pair whose
+// values are interchangeable, so only the envelope carries the choice —
+// naming the later branch must not silently rewrite it to the earlier one.
+// The union sits in a record and the reader adds a defaulted field so
+// writer≠reader (Resolve returns a resolving schema rather than the reader
+// itself). Resolution is branch-identical; the observable is the
+// TaggedUnions envelope key of the decoded value, compared against binary
+// Decode of the equivalent tagged wire.
+func TestRegression_ResolvedJSONTaggedUnionBranchIdentity(t *testing.T) {
+	cases := []struct {
+		name   string
+		union  string // the colliding union (writer == reader)
+		branch string // tagged branch the writer names (the later, collision-prone one)
+		value  any    // the branch value for the binary-oracle encode
+		json   string // the branch value as writer-shaped JSON
+	}{
+		{
+			"enum-vs-string",
+			`["string",{"type":"enum","name":"E","symbols":["A"]}]`,
+			"E", "A", `"A"`,
+		},
+		{
+			"two-records",
+			`[{"type":"record","name":"R1","fields":[{"name":"f","type":"string"}]},{"type":"record","name":"R2","fields":[{"name":"f","type":"string"}]}]`,
+			"R2", map[string]any{"f": "x"}, `{"f":"x"}`,
+		},
+		{
+			"two-enums",
+			`[{"type":"enum","name":"E1","symbols":["A","B"]},{"type":"enum","name":"E2","symbols":["A","C"]}]`,
+			"E2", "A", `"A"`,
+		},
+		{
+			"two-fixed",
+			`[{"type":"fixed","name":"F1","size":2},{"type":"fixed","name":"F2","size":2}]`,
+			"F2", []byte("ab"), `"ab"`,
+		},
+		{
+			"map-vs-record",
+			`[{"type":"map","values":"string"},{"type":"record","name":"R","fields":[{"name":"f","type":"string"}]}]`,
+			"R", map[string]any{"f": "x"}, `{"f":"x"}`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := avro.MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":` + c.union + `}]}`)
+			r := avro.MustParse(`{"type":"record","name":"Top","fields":[{"name":"u","type":` + c.union + `},{"name":"pad","type":"int","default":0}]}`)
+			resolved, err := avro.Resolve(w, r)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			wire, err := w.Encode(map[string]any{"u": map[string]any{c.branch: c.value}})
+			if err != nil {
+				t.Fatalf("writer Encode tagged: %v", err)
+			}
+			var binOut, jsonOut any
+			if _, err := resolved.Decode(wire, &binOut, avro.TaggedUnions()); err != nil {
+				t.Fatalf("resolved.Decode: %v", err)
+			}
+			if err := resolved.DecodeJSON([]byte(`{"u":{"`+c.branch+`":`+c.json+`}}`), &jsonOut, avro.TaggedUnions()); err != nil {
+				t.Fatalf("resolved.DecodeJSON tagged: %v", err)
+			}
+			binKey := unionEnvelopeKey(t, binOut)
+			jsonKey := unionEnvelopeKey(t, jsonOut)
+			if binKey != c.branch {
+				t.Fatalf("binary oracle picked branch %q, want %q (test construction)", binKey, c.branch)
+			}
+			if jsonKey != c.branch {
+				t.Errorf("tagged JSON branch rewritten: envelope named %q, decoded as %q", c.branch, jsonKey)
+			}
+			if !reflect.DeepEqual(jsonOut, binOut) {
+				t.Errorf("resolved JSON decode != binary decode:\n  binary=%#v\n  json  =%#v", binOut, jsonOut)
+			}
+		})
+	}
+}
+
+// unionEnvelopeKey extracts the single {branch: value} envelope key of a
+// decoded record's "u" union field.
+func unionEnvelopeKey(t *testing.T, out any) string {
+	t.Helper()
+	m, ok := out.(map[string]any)
+	if !ok {
+		t.Fatalf("decoded top not a map: %#v", out)
+	}
+	env, ok := m["u"].(map[string]any)
+	if !ok {
+		t.Fatalf("union field not enveloped: %#v", m["u"])
+	}
+	if len(env) != 1 {
+		t.Fatalf("envelope not single-key: %#v", env)
+	}
+	for k := range env {
+		return k
+	}
+	return ""
+}
+
 // A resolved schema's DecodeJSON must match its binary Decode (the oracle) even
 // when the WRITER carries a CustomType whose Decode the writer's own Encode
 // cannot reproduce — a Decode-only "read-side mapping" custom being the common
