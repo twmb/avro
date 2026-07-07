@@ -739,7 +739,12 @@ func (w *Writer) Reset(dst io.Writer) error {
 // against the header). [WithSchemaOpts] passes schema options to the
 // header-schema parse — required when the header schema needs an option
 // to parse at all (e.g. [avro.WithLaxNames] for a file written with a
-// lax-named schema). Other options are ignored.
+// lax-named schema). [WithSchema], [WithSyncMarker], and [WithMetadata]
+// are ignored: the header is already on disk and is never rewritten, so
+// the schema, sync marker, and metadata always come from the existing
+// file. (Reference implementations behave the same on append — neither
+// Java's DataFileWriter.appendTo nor fastavro's append mode lands new
+// metadata in the file.) Any remaining options are likewise ignored.
 func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error) {
 	var schemaOpts []avro.SchemaOpt
 	for _, o := range opts {

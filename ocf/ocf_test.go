@@ -4428,3 +4428,77 @@ func TestRegression_OCFWriterValueErrorRecovers(t *testing.T) {
 		}
 	}
 }
+
+// NewAppendWriter never rewrites the existing file's header: the schema,
+// sync marker, and metadata always come from the file, so WithSchema,
+// WithSyncMarker, and WithMetadata are accepted-and-ignored on append (see
+// the NewAppendWriter doc). Reference implementations behave the same:
+// Java's DataFileWriter.appendTo copies schema/sync/meta from the file and
+// its setMeta throws "already open" once appending (setMetaInternal →
+// assertNotOpen, DataFileWriter.java:285-289 / :93-96), and fastavro's
+// append mode silently drops its metadata kwarg (executed against fastavro
+// 1.12.2: appending with metadata={"added":"later"} leaves the file's
+// metadata unchanged). This pin locks the ignore, so a future change that
+// honors or rejects these options on append is a deliberate flip, not a
+// silent one. The appended records decoding cleanly is the sync-marker
+// assertion: blocks appended under a different marker would fail the
+// reader's per-block sync check.
+func TestAppendWriterIgnoresHeaderOptions(t *testing.T) {
+	schema := `{"type":"record","name":"R","fields":[{"name":"f","type":"string"}]}`
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, avro.MustParse(schema), WithMetadata(map[string][]byte{"orig": []byte("yes")}))
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.Encode(map[string]any{"f": "one"}); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	f := newMemFile(buf.Bytes())
+	aw, err := NewAppendWriter(f,
+		WithSchema(`{"type":"record","name":"Other","fields":[{"name":"f","type":"string"}]}`),
+		WithSyncMarker([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}),
+		WithMetadata(map[string][]byte{"added": []byte("later")}),
+	)
+	if err != nil {
+		t.Fatalf("NewAppendWriter: %v", err)
+	}
+	if err := aw.Encode(map[string]any{"f": "two"}); err != nil {
+		t.Fatalf("append Encode: %v", err)
+	}
+	if err := aw.Close(); err != nil {
+		t.Fatalf("append Close: %v", err)
+	}
+
+	rd, err := NewReader(bytes.NewReader(f.data))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	meta := rd.Metadata()
+	if v, ok := meta["added"]; ok {
+		t.Errorf("append-time WithMetadata landed in the header: added=%q", v)
+	}
+	if string(meta["orig"]) != "yes" {
+		t.Errorf("original metadata lost: orig=%q", meta["orig"])
+	}
+	if !bytes.Equal(rd.Schema().Canonical(), avro.MustParse(schema).Canonical()) {
+		t.Errorf("append-time WithSchema replaced the header schema: %s", rd.Schema().String())
+	}
+	var got []string
+	for {
+		var v map[string]any
+		if err := rd.Decode(&v); err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("Decode: %v", err)
+			}
+			break
+		}
+		got = append(got, v["f"].(string))
+	}
+	if len(got) != 2 || got[0] != "one" || got[1] != "two" {
+		t.Errorf("file datums: got %v, want [one two]", got)
+	}
+}

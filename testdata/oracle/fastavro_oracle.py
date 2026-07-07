@@ -23,7 +23,10 @@ Jobs:
       -> {"ok":true,"json":"<one datum's Avro-JSON text via json_writer>"}
   {"op":"jsonread","schema":<avro schema>,"json":"<Avro-JSON text>"}
       -> {"ok":true,"values":[...]}        (one datum via json_reader; values
-                                            must be strict-JSON-representable)
+                                            must be strict-JSON-representable.
+                                            An optional "reader" schema applies
+                                            writer->reader migration, the JSON
+                                            twin of "readresolve".)
   {"op":"readresolve","schema":<writer schema>,"reader":<reader schema>,
    "hex":"<bytes hex>"}
       -> {"ok":true,"values":[<datum>]}    (schemaless_reader with schema
@@ -152,8 +155,12 @@ def handle(job):
     if op == "jsonread":
         # Avro-JSON decode of one datum via fastavro.json_reader. Values
         # must be strict-JSON-representable to travel back over the line
-        # protocol (a non-representable result surfaces as ok:false).
-        vals = list(fastavro.json_reader(io.StringIO(job["json"]), schema))
+        # protocol (a non-representable result surfaces as ok:false). An
+        # optional reader schema applies writer->reader migration — the
+        # JSON-wire twin of "readresolve" (json_reader parses against the
+        # WRITER schema, then resolves into reader shape).
+        reader = _parse(job["reader"]) if job.get("reader") else None
+        vals = list(fastavro.json_reader(io.StringIO(job["json"]), schema, reader))
         json.dumps(vals, allow_nan=False)  # reject non-representable early
         return {"ok": True, "values": vals}
     return {"ok": False, "err": "unknown op %r" % op}
