@@ -807,6 +807,12 @@ func TestTruncatedBlockSize(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for truncated block size")
 	}
+	// The count varint promised a block, so this cut is truncation, not the
+	// end-of-stream sentinel: the error must be unexpected-EOF-shaped, never
+	// io.EOF-shaped (io.EOF is reserved for a clean end at a block boundary).
+	if errors.Is(err, io.EOF) || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated block size must match io.ErrUnexpectedEOF and not io.EOF, got: %v", err)
+	}
 }
 
 func TestTruncatedBlockData(t *testing.T) {
@@ -834,6 +840,9 @@ func TestTruncatedBlockData(t *testing.T) {
 	err = r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected error for truncated block data")
+	}
+	if errors.Is(err, io.EOF) || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated block data must match io.ErrUnexpectedEOF and not io.EOF, got: %v", err)
 	}
 }
 
@@ -863,6 +872,9 @@ func TestTruncatedBlockSyncMarker(t *testing.T) {
 	err = r.Decode(&v)
 	if err == nil {
 		t.Fatal("expected error for truncated sync marker")
+	}
+	if errors.Is(err, io.EOF) || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated sync marker must match io.ErrUnexpectedEOF and not io.EOF, got: %v", err)
 	}
 }
 

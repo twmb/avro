@@ -815,12 +815,33 @@ type Reader struct {
 	closed          bool
 }
 
+// noEOF converts a bare io.EOF from a mid-structure read into
+// io.ErrUnexpectedEOF before the caller wraps it with %w. io.EOF is Decode's
+// end-of-stream sentinel, so it must be reachable only from the clean-end
+// path (the block-count read at the top of readBlock, with zero bytes
+// consumed); a stream that ends after a complete count varint, after the
+// size varint, mid block data, or at the sync boundary promised more bytes
+// and is truncated, not ended. The stdlib readers return bare io.EOF for
+// exactly those cuts — io.ReadFull and binary.ReadVarint when zero bytes
+// remain, and io.CopyN on ANY shortfall (partial copies included) — and a
+// %w wrap keeps errors.Is(err, io.EOF) true, which would make the idiomatic
+// termination check read a truncated file as a clean, complete one.
+func noEOF(err error) error {
+	if errors.Is(err, io.EOF) {
+		return io.ErrUnexpectedEOF
+	}
+	return err
+}
+
 // readHeader reads and validates the OCF header, returning the parsed
-// schema, raw metadata, and sync marker.
+// schema, raw metadata, and sync marker. Header reads never return a bare
+// io.EOF: NewReader has no end-of-stream sentinel (a stream that ends
+// anywhere inside the header is truncated), so every read error is
+// normalized via noEOF for uniformity with readBlock.
 func readHeader(br *bufio.Reader, schemaOpts []avro.SchemaOpt) (schema *avro.Schema, meta map[string][]byte, sync [16]byte, err error) {
 	var m [4]byte
 	if _, err = io.ReadFull(br, m[:]); err != nil {
-		return nil, nil, sync, fmt.Errorf("ocf: reading magic: %w", err)
+		return nil, nil, sync, fmt.Errorf("ocf: reading magic: %w", noEOF(err))
 	}
 	if m != magic {
 		return nil, nil, sync, fmt.Errorf("ocf: invalid magic %x", m)
@@ -828,7 +849,9 @@ func readHeader(br *bufio.Reader, schemaOpts []avro.SchemaOpt) (schema *avro.Sch
 
 	meta, err = decodeMap(br)
 	if err != nil {
-		return nil, nil, sync, fmt.Errorf("ocf: reading metadata: %w", err)
+		// Single normalization chokepoint for every stream read inside
+		// decodeMap (map counts, key/value lengths, key/value bytes).
+		return nil, nil, sync, fmt.Errorf("ocf: reading metadata: %w", noEOF(err))
 	}
 
 	schemaBytes, ok := meta["avro.schema"]
@@ -841,7 +864,7 @@ func readHeader(br *bufio.Reader, schemaOpts []avro.SchemaOpt) (schema *avro.Sch
 	}
 
 	if _, err = io.ReadFull(br, sync[:]); err != nil {
-		return nil, nil, sync, fmt.Errorf("ocf: reading sync marker: %w", err)
+		return nil, nil, sync, fmt.Errorf("ocf: reading sync marker: %w", noEOF(err))
 	}
 
 	return schema, meta, sync, nil
@@ -941,6 +964,10 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 }
 
 // Decode reads the next datum into v, returning [io.EOF] at end of file.
+// [io.EOF] is returned only at a clean end of stream — the file ends exactly
+// at a block boundary; a stream truncated mid-block (a promised block header,
+// data, or sync marker cut short) returns an error matching
+// [io.ErrUnexpectedEOF] instead, never one matching [io.EOF].
 func (rd *Reader) Decode(v any) error {
 	if rd.closed {
 		return errClosed
@@ -1011,7 +1038,10 @@ func (rd *Reader) readBlock() error {
 		}
 		size, err := binary.ReadVarint(rd.r)
 		if err != nil {
-			return fmt.Errorf("ocf: reading block size: %w", err)
+			// A complete count varint promised a block; a stream ending
+			// here is truncated, not ended — noEOF keeps the io.EOF
+			// sentinel exclusive to the count read above.
+			return fmt.Errorf("ocf: reading block size: %w", noEOF(err))
 		}
 		if count < 0 {
 			return fmt.Errorf("ocf: invalid negative block count %d", count)
@@ -1042,18 +1072,21 @@ func (rd *Reader) readBlock() error {
 		if size <= ocfEagerBlockAllocLimit {
 			compressed = make([]byte, int(size))
 			if _, err := io.ReadFull(rd.r, compressed); err != nil {
-				return fmt.Errorf("ocf: reading block data: %w", err)
+				return fmt.Errorf("ocf: reading block data: %w", noEOF(err))
 			}
 		} else {
 			var buf bytes.Buffer
 			if n, err := io.CopyN(&buf, rd.r, size); err != nil {
-				return fmt.Errorf("ocf: reading block data (%d of %d bytes): %w", n, size, err)
+				// io.CopyN reports ANY shortfall — zero bytes or a partial
+				// copy — as bare io.EOF, unlike io.ReadFull's
+				// ErrUnexpectedEOF on partial reads; both shapes normalize.
+				return fmt.Errorf("ocf: reading block data (%d of %d bytes): %w", n, size, noEOF(err))
 			}
 			compressed = buf.Bytes()
 		}
 		var sync [16]byte
 		if _, err := io.ReadFull(rd.r, sync[:]); err != nil {
-			return fmt.Errorf("ocf: reading block sync marker: %w", err)
+			return fmt.Errorf("ocf: reading block sync marker: %w", noEOF(err))
 		}
 		if sync != rd.sync {
 			return errors.New("ocf: sync marker mismatch")
