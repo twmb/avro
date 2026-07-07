@@ -246,33 +246,52 @@ func afieldFromAny(v any, f *afield) error {
 	// Flat ("linkedin/goavro") field format and field-level logicalType
 	// lift, mirroring the former afield.UnmarshalJSON. When "type" is a
 	// string naming a complex kind and that kind's defining key (symbols
-	// / items / values / fields) sits alongside the field's own keys,
-	// lift those into a nested type object.
-	if f.Type != nil && f.Type.primitive != "" {
-		tp := f.Type.primitive
-		if tp == "enum" || tp == "array" || tp == "map" || tp == "record" || tp == "error" || tp == "fixed" {
-			needsLift := false
-			for key, forType := range afieldComplexKeys {
-				if _, ok := lookupCI(m, key); ok && (forType == tp || (key == "fields" && tp == "error")) {
-					needsLift = true
-					break
-				}
-			}
-			if needsLift {
-				return f.liftFlatFieldType(m, tp)
-			}
-		}
+	// / items / values / fields / size) sits alongside the field's own
+	// keys, lift those into a nested type object.
+	if f.Type != nil && f.Type.primitive != "" && flatFieldNeedsLift(m, f.Type.primitive) {
+		return f.liftFlatFieldType(m, f.Type.primitive)
 	}
 	f.liftFieldLogicalIntoType()
 	return nil
 }
 
-// liftFlatFieldType builds the field's nested type object from the field's
-// own JSON keys (excluding field-only keys), for the flat field format.
-// Mirrors the former afield.UnmarshalJSON flat-form branch: logicalType /
-// precision / scale flow into the type object (they are not field-only),
-// so the field-level copies are cleared afterward.
-func (f *afield) liftFlatFieldType(m map[string]any, tp string) error {
+// flatFieldNeedsLift reports whether the field JSON object m, whose "type"
+// attribute is the bare string tp, is written in the flat (goavro-style)
+// field format: tp names a complex kind and that kind's defining key
+// (symbols / items / values / fields / size) sits alongside the field's own
+// keys, case-insensitively. "error" is the record alias, defined by the
+// "fields" key like "record".
+//
+// Shared by the wire parser (afieldFromAny) and the metadata walker
+// (nodeFromJSONObject's field loop, schema_node.go): the wire schema and
+// the Root() metadata tree must lift the SAME fields, or the tree would
+// describe a different schema than the one that encodes — sharing the
+// predicate makes the agreement structural.
+func flatFieldNeedsLift(m map[string]any, tp string) bool {
+	switch tp {
+	case "enum", "array", "map", "record", "error", "fixed":
+	default:
+		return false
+	}
+	for key, forType := range afieldComplexKeys {
+		if _, ok := lookupCI(m, key); ok && (forType == tp || (key == "fields" && tp == "error")) {
+			return true
+		}
+	}
+	return false
+}
+
+// flatLiftTypeMap builds the nested type object's JSON map from a flat
+// field's own keys: "default" and "order" are field-only and never
+// propagate; "aliases" belongs to the field (flat-format aliases are field
+// aliases); "name" and "namespace" propagate only for named kinds;
+// everything else — the defining key, "type" itself, logicalType /
+// precision / scale, doc, and custom properties — moves into the type.
+//
+// Shared by the wire parser (liftFlatFieldType) and the metadata walker
+// (nodeFromJSONObject, schema_node.go) so the two sides cannot drift on
+// WHAT the lift routes; flatFieldNeedsLift is the shared WHEN.
+func flatLiftTypeMap(m map[string]any, tp string) map[string]any {
 	named := tp == "record" || tp == "error" || tp == "enum" || tp == "fixed"
 	typeMap := make(map[string]any, len(m))
 	for k, v := range m {
@@ -289,7 +308,17 @@ func (f *afield) liftFlatFieldType(m map[string]any, tp string) error {
 			typeMap[k] = v
 		}
 	}
-	o, err := aobjectFromMap(typeMap)
+	return typeMap
+}
+
+// liftFlatFieldType builds the field's nested type object from the field's
+// own JSON keys (excluding field-only keys), for the flat field format.
+// Mirrors the former afield.UnmarshalJSON flat-form branch. The key routing
+// lives in flatLiftTypeMap (shared with the metadata walker): logicalType /
+// precision / scale flow into the type object (they are not field-only),
+// so the field-level copies are cleared afterward.
+func (f *afield) liftFlatFieldType(m map[string]any, tp string) error {
+	o, err := aobjectFromMap(flatLiftTypeMap(m, tp))
 	if err != nil {
 		return err
 	}

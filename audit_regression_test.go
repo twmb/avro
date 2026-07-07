@@ -3233,3 +3233,117 @@ func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
 		})
 	}
 }
+
+// A schema written in the flat (goavro-style) field format — a bare string
+// complex-kind type with the kind's defining key (symbols / items / values /
+// fields / size) alongside the field's own keys — parses by design: the wire
+// parser lifts the defining keys into a nested type definition, naming a
+// lifted named type after the field (liftFlatFieldType, schema_parse.go).
+// Root() must describe that same post-lift schema (the type node carries the
+// name and defining content, not an empty shell with the defining keys
+// stranded in Field.Props), and Root().Schema() must rebuild it with an
+// identical canonical form. The metadata walker shares the wire parser's
+// lift predicate and key routing (flatFieldNeedsLift / flatLiftTypeMap), so
+// this pins that the two sides describe one schema.
+func TestRegression_FlatFieldRootSchemaRoundTrip(t *testing.T) {
+	for _, tt := range []struct {
+		name, schema string
+		check        func(t *testing.T, f avro.SchemaField)
+	}{
+		{
+			"enum",
+			`{"type":"record","name":"R","fields":[{"name":"E","type":"enum","symbols":["A","B"]}]}`,
+			func(t *testing.T, f avro.SchemaField) {
+				if f.Type.Name != "E" || len(f.Type.Symbols) != 2 {
+					t.Errorf("lifted enum: Name=%q Symbols=%v, want E / [A B]", f.Type.Name, f.Type.Symbols)
+				}
+			},
+		},
+		{
+			"fixed",
+			`{"type":"record","name":"R","fields":[{"name":"F","type":"fixed","size":4}]}`,
+			func(t *testing.T, f avro.SchemaField) {
+				if f.Type.Name != "F" || f.Type.Size != 4 {
+					t.Errorf("lifted fixed: Name=%q Size=%d, want F / 4", f.Type.Name, f.Type.Size)
+				}
+			},
+		},
+		{
+			"array",
+			`{"type":"record","name":"R","fields":[{"name":"A","type":"array","items":"int"}]}`,
+			func(t *testing.T, f avro.SchemaField) {
+				if f.Type.Items == nil || f.Type.Items.Type != "int" {
+					t.Errorf("lifted array: Items=%v, want int items", f.Type.Items)
+				}
+			},
+		},
+		{
+			"map",
+			`{"type":"record","name":"R","fields":[{"name":"M","type":"map","values":"long"}]}`,
+			func(t *testing.T, f avro.SchemaField) {
+				if f.Type.Values == nil || f.Type.Values.Type != "long" {
+					t.Errorf("lifted map: Values=%v, want long values", f.Type.Values)
+				}
+			},
+		},
+		{
+			"record",
+			`{"type":"record","name":"R","fields":[{"name":"Sub","type":"record","fields":[{"name":"x","type":"int"}]}]}`,
+			func(t *testing.T, f avro.SchemaField) {
+				if f.Type.Name != "Sub" || len(f.Type.Fields) != 1 {
+					t.Errorf("lifted record: Name=%q Fields=%v, want Sub with 1 field", f.Type.Name, f.Type.Fields)
+				}
+			},
+		},
+		{
+			"error",
+			`{"type":"record","name":"R","fields":[{"name":"Sub","type":"error","fields":[{"name":"x","type":"int"}]}]}`,
+			func(t *testing.T, f avro.SchemaField) {
+				if f.Type.Type != "error" || f.Type.Name != "Sub" || len(f.Type.Fields) != 1 {
+					t.Errorf("lifted error: Type=%q Name=%q Fields=%v, want error/Sub with 1 field", f.Type.Type, f.Type.Name, f.Type.Fields)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := avro.Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			root := s.Root()
+			if len(root.Fields) != 1 {
+				t.Fatalf("Root fields: %d, want 1", len(root.Fields))
+			}
+			tt.check(t, root.Fields[0])
+			rebuilt, err := root.Schema()
+			if err != nil {
+				t.Fatalf("Root().Schema(): %v", err)
+			}
+			if got, want := string(rebuilt.Canonical()), string(s.Canonical()); got != want {
+				t.Fatalf("canonical mismatch:\n got %s\nwant %s", got, want)
+			}
+		})
+	}
+}
+
+// A sibling field referencing a flat-defined fixed by name must surface its
+// default as []byte per the SchemaField.Default contract ("bytes and fixed
+// schemas give []byte"): the lifted fixed carries the field's name, so it is
+// registered in the metadata name table and the name-referencing sibling's
+// default coerces exactly as it would against a nested-form definition.
+func TestRegression_FlatFixedNameRefDefaultCoerced(t *testing.T) {
+	s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+		{"name":"F","type":"fixed","size":4},
+		{"name":"F2","type":"F","default":"abcd"}]}`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	f2 := s.Root().Fields[1]
+	b, ok := f2.Default.([]byte)
+	if !ok {
+		t.Fatalf("F2 default: got %T (%v), want []byte", f2.Default, f2.Default)
+	}
+	if string(b) != "abcd" {
+		t.Fatalf("F2 default bytes: %q, want %q", b, "abcd")
+	}
+}

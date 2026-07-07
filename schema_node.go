@@ -178,6 +178,16 @@ type deduper struct {
 // matching, so the metadata reported here stays consistent with the parsed
 // schema and the encoded wire.
 //
+// A field written in the flat (goavro-style) format — a bare string
+// complex-kind type with the kind's defining key (symbols, items, values,
+// fields, size) alongside the field's own keys — is described post-lift,
+// exactly as it parses: the field's type is the lifted nested definition
+// (named after the field for record/error/enum/fixed), and the keys the
+// lift routed into the type (the defining key, doc, logicalType, precision,
+// scale, and custom properties) appear on the type node rather than in
+// [SchemaField.Props]. [SchemaNode.Schema] rebuilds the nested form, which
+// parses to the same schema.
+//
 // Root re-parses the JSON on each call. Cache the result if you need
 // to access it repeatedly (e.g. in a per-message processing loop).
 func (s *Schema) Root() SchemaNode {
@@ -1684,8 +1694,32 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 				fm, _ := f.(map[string]any)
 				sf := SchemaField{}
 				getCIString(fm, "name", &sf.Name)
+				// Flat (goavro-style) field format: the wire parser lifts
+				// the field's defining keys into a nested type definition,
+				// naming a lifted named type after the field
+				// (liftFlatFieldType, schema_parse.go). The metadata tree
+				// must describe that same post-lift schema — otherwise the
+				// type node surfaces as an empty shell (no name / symbols /
+				// items / values / size / fields), Root().Schema() cannot
+				// rebuild it (the rebuild emits a nested type OBJECT, which
+				// the wire lift's bare-string gate ignores, so the flat
+				// shape is unrepresentable through the round trip), and the
+				// lifted named type is invisible to name-reference default
+				// coercion (collectNamedTypes keys on Name). The lift
+				// decision and key routing are the wire parser's own
+				// flatFieldNeedsLift / flatLiftTypeMap, so the two sides
+				// cannot drift; flatType doubles as the routed-key set the
+				// Props loop below excludes. The routed doc belongs to the
+				// lifted type (nodeFromJSONObject reads it from flatType),
+				// not the field, exactly as the wire lift routes it.
+				var flatType map[string]any
 				if t, ok := lookupCI(fm, "type"); ok {
-					sf.Type = nodeFromJSON(t, childNS)
+					if ts, isStr := t.(string); isStr && flatFieldNeedsLift(fm, ts) {
+						flatType = flatLiftTypeMap(fm, ts)
+						sf.Type = nodeFromJSONObject(flatType, childNS)
+					} else {
+						sf.Type = nodeFromJSON(t, childNS)
+					}
 				}
 				if d, ok := lookupCI(fm, "default"); ok {
 					// Coerce string defaults to typed float64 for
@@ -1703,11 +1737,16 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 					sf.Default = coerceMetadataDefault(d, &sf.Type, nil, "")
 					sf.HasDefault = true
 				}
-				getCIString(fm, "doc", &sf.Doc)
+				if flatType == nil {
+					getCIString(fm, "doc", &sf.Doc)
+				}
 				getCIStringSlice(fm, "aliases", &sf.Aliases)
 				getCIString(fm, "order", &sf.Order)
 				for k, v := range fm {
 					if fieldReservedKeyCI(k) {
+						continue
+					}
+					if _, routed := flatType[k]; routed {
 						continue
 					}
 					if sf.Props == nil {
