@@ -47,12 +47,13 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 		return nil, err
 	}
 	s := &Schema{
-		ser:    reader.ser,
-		deser:  resolved.deser,
-		c:      reader.c,
-		node:   reader.node,
-		full:   reader.full,
-		custom: reader.custom,
+		ser:         reader.ser,
+		deser:       resolved.deser,
+		c:           reader.c,
+		node:        reader.node,
+		full:        reader.full,
+		custom:      reader.custom,
+		customBaked: reader.customBaked,
 	}
 	s.resolveWriter = writer
 	// decodeJSONResolved transforms writer-shaped JSON into RAW writer binary
@@ -60,12 +61,16 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 	// would run them during that transform and then fail to re-encode the
 	// resulting Go-domain value (a Decode-only custom has no Encode to invert it).
 	// Re-parse the writer custom-free for that round-trip; the reader's custom
-	// types still apply in the final s.Decode. Lenient names so a lax-named writer
-	// (which already parsed once) re-parses — names do not affect wire bytes. With
-	// no custom on the writer there is nothing to suppress, so reuse it directly.
+	// types still apply in the final s.Decode. Names are accepted wholesale
+	// (internalReparseNames) so any writer the user's validator already accepted
+	// re-parses — names do not affect wire bytes. With no custom effects
+	// anywhere in the writer's tree there is nothing to suppress, so reuse it
+	// directly. customBaked, not len(writer.custom): a cache-parsed writer
+	// whose customs match only SchemaCache-inherited subtrees has an empty
+	// overlay while the inherited ser/deser still carry the baked conversions.
 	s.resolveWriterRaw = writer
-	if len(writer.custom) > 0 {
-		raw, err := Parse(writer.full, WithLaxNames(nil))
+	if writer.customBaked {
+		raw, err := Parse(writer.full, internalReparseNames)
 		if err != nil {
 			return nil, fmt.Errorf("avro: building custom-free writer view for resolved JSON decode: %w", err)
 		}

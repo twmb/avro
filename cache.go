@@ -193,19 +193,24 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 					if rerr != nil {
 						// The spliced form is self-contained but may carry a
 						// name an inherited type was defined with under
-						// WithLaxNames, which a strict re-parse rejects. Lax
-						// names are sticky: a schema containing one is not
-						// strict-parseable, cache or not (see the SchemaCache
-						// doc). Retry permissively so the metadata forms still
-						// describe the full self-contained schema instead of
-						// falling back to a dangling reference; the result still
-						// needs WithLaxNames to re-parse. WithLaxNames(nil) only
-						// accepts the already-final names — it does not transform
-						// them — so the canonical/fingerprint bytes match a
-						// standalone lax parse of the same schema.
+						// WithLaxNames, which a re-parse under this call's own
+						// opts rejects. Lax names are sticky: a schema
+						// containing one is not strict-parseable, cache or not
+						// (see the SchemaCache doc). Retry with the internal
+						// accept-everything validator (appended last, so it
+						// wins over any user lax fn — the retry only ever
+						// broadens) so the metadata forms still describe the
+						// full self-contained schema instead of falling back
+						// to a dangling reference; the result still needs
+						// WithLaxNames to re-parse. See internalReparseNames
+						// for why accept-all is sound here: every spliced name
+						// was validated by the parse that defined it, and
+						// names pass through verbatim, so the canonical/
+						// fingerprint bytes match a standalone lax parse of
+						// the same schema.
 						laxOpts := make([]SchemaOpt, len(opts)+1)
 						copy(laxOpts, opts)
-						laxOpts[len(opts)] = WithLaxNames(nil)
+						laxOpts[len(opts)] = internalReparseNames
 						s2, rerr = Parse(string(marshaled), laxOpts...)
 					}
 					if rerr == nil {
@@ -317,12 +322,8 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 	case map[string]any:
 		typVal, hasType := lookupCI(v, "type")
 		typ, _ := typVal.(string)
-		name := ""
-		if nm, ok := lookupCI(v, "name"); ok {
-			name, _ = nm.(string)
-		}
 		childNS := ns
-		if name != "" && isNamedKind(typ) {
+		if nodeHasStringName(v) && isNamedKind(typ) {
 			childNS = nodeNamespace(v, ns)
 			visit(nodeFullnameTree(v, ns), v)
 		}
@@ -511,16 +512,12 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		// defines the name twice, the rebuild Parse rejects it, and the
 		// metadata forms silently fall back to the dangling original.
 		if typVal, ok := lookupCI(v, "type"); ok {
-			if typ, _ := typVal.(string); isNamedKind(typ) {
-				if nameVal, ok := lookupCI(v, "name"); ok {
-					if name, _ := nameVal.(string); name != "" {
-						fullname := nodeFullnameTree(v, ns)
-						if ref, ok := dupDefRef(fullname, ns, seen); ok {
-							return ref
-						}
-						seen[fullname] = true
-					}
+			if typ, _ := typVal.(string); isNamedKind(typ) && nodeHasStringName(v) {
+				fullname := nodeFullnameTree(v, ns)
+				if ref, ok := dupDefRef(fullname, ns, seen); ok {
+					return ref
 				}
+				seen[fullname] = true
 			}
 		}
 		// A node's own "type" value sits at the enclosing namespace; its
@@ -556,15 +553,13 @@ func inlineNodeContainers(v map[string]any, ns string, defs map[string]any, seen
 					// duplicate-definition case as inlineTreeDefs's map arm,
 					// but a field object cannot be replaced by a bare string —
 					// rewrite it to the equivalent normal-form reference field.
-					if nameVal, ok := lookupCI(fo, "name"); ok {
-						if name, _ := nameVal.(string); name != "" {
-							fullname := nodeFullnameTree(fo, ns)
-							if ref, ok := dupDefRef(fullname, ns, seen); ok {
-								rewriteFlatFieldToRef(fo, ref)
-								continue
-							}
-							seen[fullname] = true
+					if nodeHasStringName(fo) {
+						fullname := nodeFullnameTree(fo, ns)
+						if ref, ok := dupDefRef(fullname, ns, seen); ok {
+							rewriteFlatFieldToRef(fo, ref)
+							continue
 						}
+						seen[fullname] = true
 					}
 					inlineNodeContainers(fo, nodeNamespace(fo, ns), defs, seen, inlined)
 					continue
@@ -581,6 +576,23 @@ func inlineNodeContainers(v map[string]any, ns string, defs map[string]any, seen
 	if vk, ok := ciKey(v, "values"); ok {
 		v[vk] = inlineTreeDefs(v[vk], ns, defs, seen, inlined)
 	}
+}
+
+// nodeHasStringName reports whether a string-typed "name" key is present
+// (case-insensitively, mirroring the parser). PRESENCE marks a named-type
+// definition; the VALUE may be empty — a user WithLaxNames fn can accept
+// "", and an empty short name with a namespace (fullname "ns.") is
+// referenceable across parses by exact dotted lookup, so the splice
+// walkers must treat it like any other definition. Shared by
+// collectTreeDefs, inlineTreeDefs, and inlineNodeContainers so the
+// definition predicate cannot drift between them.
+func nodeHasStringName(v map[string]any) bool {
+	nm, ok := lookupCI(v, "name")
+	if !ok {
+		return false
+	}
+	_, ok = nm.(string)
+	return ok
 }
 
 // dupDefRef decides how a SECOND definition of fullname, encountered at a

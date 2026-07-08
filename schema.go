@@ -70,6 +70,18 @@ type Schema struct {
 	// shared node is not mutated — different schemas parsed with
 	// different custom types get different overlays.
 	custom map[*schemaNode]*customWiring
+
+	// customBaked reports custom-conversion effects reachable through this
+	// schema's node tree even when the custom overlay above is empty: a
+	// reference to a SchemaCache-inherited named type whose DEFINING parse
+	// wired custom types carries the binary callback wraps composed inside
+	// the inherited ser/deser and the JSON wrap baked on the shared
+	// node.decodeJSON, but no entry in THIS parse's overlay
+	// (applyCustomTypes visits only newly built nodes). Resolve's
+	// custom-free writer view must be built whenever either signal is set;
+	// keying on len(custom) alone resurrected the decode-only re-encode
+	// failure (3333e9b) for cache-parsed custom-typed writers.
+	customBaked bool
 }
 
 // customWiring bundles the per-node custom-type artifacts. Allocated
@@ -181,6 +193,22 @@ func (parseOptLax) schemaOpt() {}
 // split before calling fn. Ignored by [SchemaFor].
 func WithLaxNames(fn func(string) error) SchemaOpt { return parseOptLax{fn} }
 
+// internalReparseNames is the name validator for the library's internal
+// re-parses of schema text it produced itself: Resolve's custom-free writer
+// view (resolve.go) and SchemaCache's self-contained splice rebuild
+// (cache.go). Both sites re-parse text whose names the ORIGINAL parse
+// already validated under the user's chosen validator (strict, or any
+// WithLaxNames fn), so validation here has no safety role — it can only
+// wrongly reject names the user accepted. It therefore accepts everything:
+// WithLaxNames(nil), the previous validator at both sites, rejected empty
+// name components (namespace "a..b") — the one class a user fn can accept
+// that lax(nil) does not — hard-failing Resolve on an already-parsed,
+// wire-valid writer and silently degrading the cache's metadata forms to a
+// dangling reference. Validation never transforms names — they pass
+// through verbatim — so the canonical/fingerprint/wire bytes match a
+// standalone parse of the same schema under the user's validator.
+var internalReparseNames = WithLaxNames(func(string) error { return nil })
+
 // MustParse is like [Parse] but panics on error.
 func MustParse(schema string, opts ...SchemaOpt) *Schema {
 	s, err := Parse(schema, opts...)
@@ -253,12 +281,13 @@ func parse(schema string, b *builder) (*Schema, error) {
 		return nil, boundErrorLen(err)
 	}
 	s := &Schema{
-		ser:    b.ser,
-		deser:  b.deser,
-		c:      b.canon,
-		node:   b.node,
-		full:   schema,
-		custom: b.custom,
+		ser:         b.ser,
+		deser:       b.deser,
+		c:           b.canon,
+		node:        b.node,
+		full:        schema,
+		custom:      b.custom,
+		customBaked: len(b.custom) > 0 || b.sawInheritedCustom,
 	}
 	s.soe[0] = 0xC3
 	s.soe[1] = 0x01
@@ -965,7 +994,13 @@ type builder struct {
 	checkName   func(string) error // nil means strict (default)
 	customTypes []CustomType
 	custom      map[*schemaNode]*customWiring
-	cachedNames map[string]bool // names inherited from SchemaCache, not from this parse
+	// sawInheritedCustom is set when a reference resolves to a
+	// SchemaCache-inherited named type stamped hadCustomType by its
+	// defining parse: that type's subtree carries baked custom effects
+	// this parse's own overlay (b.custom) knows nothing about. Feeds
+	// Schema.customBaked.
+	sawInheritedCustom bool
+	cachedNames        map[string]bool // names inherited from SchemaCache, not from this parse
 	// allowReRegister permits re-DEFINING an inherited (cachedNames) type
 	// instead of erroring "duplicate named type". Set by SchemaCache.Parse only
 	// for parses that skip dedup and re-parse to get fresh CustomType wiring
@@ -1028,6 +1063,7 @@ func (b *builder) unnest(nest *builder) {
 		}
 		maps.Copy(b.custom, nest.custom)
 	}
+	b.sawInheritedCustom = b.sawInheritedCustom || nest.sawInheritedCustom
 }
 
 // hasCustomTypeWired reports whether the builder has accumulated any
@@ -1251,6 +1287,11 @@ func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (boo
 	if err := b.rejectCachedRefIfCustomTypeWouldMatch(resolved, nt); err != nil {
 		return true, err
 	}
+	// Only an INHERITED type can carry the stamp at reference time: local
+	// definitions are stamped at this parse's own finalize, after build.
+	if nt.hadCustomType {
+		b.sawInheritedCustom = true
+	}
 	if setCanon {
 		b.canon = aschema{primitive: resolved}
 	}
@@ -1402,6 +1443,25 @@ func (b *builder) finalize() error {
 	if b.hasCustomTypeWired() {
 		for _, nt := range b.definedNamed {
 			nt.hadCustomType = true
+		}
+	} else if len(b.customTypes) > 0 {
+		// A parse can register a non-wildcard CustomType yet wire NOTHING
+		// new, because every matching node lives in a subtree inherited
+		// from the SchemaCache — the wraps were baked by the inherited
+		// type's own defining parse, and applyCustomTypes visits only
+		// newly built nodes. The types THIS parse defines around such
+		// references still depend on those baked effects, and the
+		// cache-boundary guard tests the reference side with
+		// findCustomTypeMatchInSubtree — so stamp with the SAME predicate.
+		// Without this arm, consistent registration is unsatisfiable for
+		// transitive chains: the guard demands "re-parse <name> with the
+		// CustomType first" when that is exactly how <name> was parsed
+		// (define Inner with the custom, wrap it WITH the custom, then
+		// reference the wrapper WITH the custom — rejected).
+		for _, nt := range b.definedNamed {
+			if b.findCustomTypeMatchInSubtree(nt.node, make(map[*schemaNode]bool)) != "" {
+				nt.hadCustomType = true
+			}
 		}
 	}
 	return nil
