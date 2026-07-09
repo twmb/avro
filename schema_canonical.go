@@ -88,7 +88,13 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 		return append(dst, ':')
 	}
 
-	if o.Name != "" {
+	// A named KIND always emits its name — including the empty fullname a
+	// user WithLaxNames fn can accept ("name":""), matching fastavro's PCF
+	// (executed, 1.12.2), the only other implementation known to parse the
+	// shape; omitting it emitted a missing-name spelling instead. The
+	// Name != "" arm keeps emission for hand-built objects that carry a
+	// name on a non-named kind.
+	if o.Name != "" || isNamedKind(o.Type) {
 		dst = key(dst, "name")
 		dst = appendCanonString(dst, o.Name)
 	}

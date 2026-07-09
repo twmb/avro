@@ -21,8 +21,10 @@ package avro_test
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -583,20 +585,141 @@ func TestMatrix_InternalReparseBareEmptyName(t *testing.T) {
 		t.Errorf("String() re-parse: %v\nString(): %s", err, writer.String())
 	}
 
-	// OBSERVED, pinned as-is (maintainer-adjudicated: keep the emission,
-	// document — NOT_BUGS #60): the canonical form of a bare empty-name
-	// ROOT omits the record's own "name" key entirely, so Canonical() of
-	// THIS class does not re-parse. The shape only arises under a user
-	// WithLaxNames fn — the default parse enforces the strict name grammar
-	// (see the WithLaxNames doc). Executed cross-impl status (fastavro
-	// 1.12.2): fastavro parses the shape and its PCF KEEPS the empty name
-	// key ({"name":"",...}), so the bare-empty-name class
-	// fingerprint-diverges from fastavro; the namespaced empty name
-	// ("ok.") and empty-component ("a..b") classes are
-	// fingerprint-IDENTICAL with fastavro (executed — see NOT_BUGS #60 for
-	// the values). The wire path, String(), and Resolve are unaffected.
-	// This pin flips if canonical emission for the class ever changes.
-	if canon := string(writer.Canonical()); canon != `{"type":"record","fields":[{"name":"f","type":"long"}]}` {
-		t.Errorf("bare empty-name canonical changed (pin flipped — re-adjudicate): %s", canon)
+	// RULED (re-adjudicated on executed evidence — NOT_BUGS #60): the bare
+	// empty-name root EMITS "name":"" in canonical form, matching fastavro
+	// (1.12.2, executed), the only other implementation known to parse the
+	// shape. The previous omission emitted a missing-name spelling that
+	// fingerprinted like nothing else; canonical bytes and the Rabin
+	// fingerprint are pinned against fastavro's EXECUTED values, and the
+	// canonical form re-parses under the user's accept-all validator
+	// (missing name and empty name are the same fullname "" there, so the
+	// re-parse held before and after — the BYTES are the discriminator).
+	wantCanon := `{"name":"","type":"record","fields":[{"name":"f","type":"long"}]}`
+	if canon := string(writer.Canonical()); canon != wantCanon {
+		t.Errorf("bare empty-name canonical:\n got %s\nwant %s", canon, wantCanon)
 	}
+	if got, want := writer.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, "3d741707ff4bfa45"); !bytes.Equal(got, want) {
+		t.Errorf("bare empty-name rabin: got %x, want %x (fastavro-executed)", got, want)
+	}
+	if _, err := avro.Parse(string(writer.Canonical()), avro.WithLaxNames(acceptAll)); err != nil {
+		t.Errorf("bare empty-name canonical must re-parse under accept-all: %v", err)
+	}
+}
+
+// fastavroRabinBytes converts a fastavro-printed CRC-64-AVRO fingerprint
+// (big-endian hex, as fastavro.schema.fingerprint prints) to the
+// little-endian byte order Schema.Fingerprint(NewRabin()) returns, so
+// pins compare BYTES rather than presentation.
+func fastavroRabinBytes(t *testing.T, beHex string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(beHex)
+	if err != nil {
+		t.Fatalf("bad hex %q: %v", beHex, err)
+	}
+	slices.Reverse(b)
+	return b
+}
+
+// Canonical-form parity for the empty-name classes against EXECUTED
+// fastavro 1.12.2 (2026-07-09): every twmb Canonical() must byte-match
+// fastavro's PCF and Rabin fingerprint for {class} × {position}, and
+// re-parse under the user's accept-all validator. The reference-position
+// bare cell is a DOCUMENTED DIVERGENCE: twmb structurally rejects the ""
+// reference spelling upstream of any validator, while fastavro accepts it
+// (its PCF keeps the bare "" ref; rabin f9afa0dabf6cd566) — pinned as
+// twmb's rejection. Forward references are twmb-only territory (fastavro
+// rejects ALL forward references — executed: UnknownType), so the fwd-ref
+// cell pins twmb's Java-rule first-occurrence form with no fastavro
+// comparison.
+func TestMatrix_CanonicalEmptyNameFastavroParity(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	const (
+		bareDef = `{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}`
+		okDef   = `{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"}]}`
+		abDef   = `{"type":"record","name":"R","namespace":"a..b","fields":[{"name":"f","type":"long"}]}`
+	)
+	nested := func(def string) string {
+		return `{"type":"record","name":"Top","fields":[{"name":"a","type":` + def + `}]}`
+	}
+	diamond := func(def, ref string) string {
+		return `{"type":"record","name":"Top","fields":[{"name":"a","type":` + def + `},{"name":"b","type":"` + ref + `"}]}`
+	}
+	cells := []struct {
+		key       string
+		schema    string
+		wantPCF   string // fastavro's executed PCF, byte-for-byte
+		rabinBEHx string // fastavro's executed fingerprint (big-endian hex)
+	}{
+		{"root/bare", bareDef,
+			`{"name":"","type":"record","fields":[{"name":"f","type":"long"}]}`, "3d741707ff4bfa45"},
+		{"root/ok", okDef,
+			`{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"}]}`, "6cfba61a610c50c2"},
+		{"root/ab", abDef,
+			`{"name":"a..b.R","type":"record","fields":[{"name":"f","type":"long"}]}`, "cad3b2bee0fed6fa"},
+		{"nested/bare", nested(bareDef),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"","type":"record","fields":[{"name":"f","type":"long"}]}}]}`, "c5948d734d487874"},
+		{"nested/ok", nested(okDef),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"}]}}]}`, "0c2a9622507ffbc7"},
+		{"nested/ab", nested(abDef),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"a..b.R","type":"record","fields":[{"name":"f","type":"long"}]}}]}`, "493fc67a41ba56e9"},
+		{"reference/ok", diamond(okDef, "ok."),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"}]}},{"name":"b","type":"ok."}]}`, "3801ed908d3951d8"},
+		{"reference/ab", diamond(abDef, "a..b.R"),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"a..b.R","type":"record","fields":[{"name":"f","type":"long"}]}},{"name":"b","type":"a..b.R"}]}`, "b6e281b385d18d8c"},
+		{"recursive/ok", `{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","ok."]}]}`,
+			`{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","ok."]}]}`, "fe8d701fc807f4ec"},
+	}
+	for _, c := range cells {
+		t.Run(c.key, func(t *testing.T) {
+			s, err := avro.Parse(c.schema, avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if got := string(s.Canonical()); got != c.wantPCF {
+				t.Errorf("canonical vs fastavro PCF:\n got %s\nwant %s", got, c.wantPCF)
+			}
+			if got, want := s.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, c.rabinBEHx); !bytes.Equal(got, want) {
+				t.Errorf("rabin bytes vs fastavro: got %x, want %x", got, want)
+			}
+			re, err := avro.Parse(string(s.Canonical()), avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("canonical re-parse under accept-all: %v", err)
+			}
+			if !bytes.Equal(re.Canonical(), s.Canonical()) {
+				t.Errorf("canonical not idempotent:\n re %s\ngot %s", re.Canonical(), s.Canonical())
+			}
+		})
+	}
+
+	// Documented divergence: the "" reference spelling. twmb rejects it
+	// structurally (a field type must be a primitive, complex, or union);
+	// fastavro accepts and resolves it (executed: PCF keeps the bare ""
+	// ref, rabin f9afa0dabf6cd566). Pinned as the rejection.
+	t.Run("reference/bare-divergence", func(t *testing.T) {
+		_, err := avro.Parse(diamond(bareDef, ""), avro.WithLaxNames(acceptAll))
+		if err == nil {
+			t.Fatal(`"" reference unexpectedly accepted (divergence pin flipped — recalibrate against fastavro)`)
+		}
+		if !strings.Contains(err.Error(), "not a primitive") {
+			t.Errorf("rejection shape changed: %v", err)
+		}
+	})
+
+	// Forward reference to the empty-named type: twmb-only (fastavro
+	// rejects every forward reference — executed: UnknownType "ok.").
+	// Java's first-occurrence rule: the full body is emitted at the FIRST
+	// walk occurrence (the referencing field), a bare fullname afterward.
+	t.Run("fwdref/ok", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"record","name":"Top","fields":[{"name":"b","type":"ok."},{"name":"a","type":`+okDef+`}]}`, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		want := `{"name":"Top","type":"record","fields":[{"name":"b","type":{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"}]}},{"name":"a","type":"ok."}]}`
+		if got := string(s.Canonical()); got != want {
+			t.Errorf("fwd-ref first-occurrence canonical:\n got %s\nwant %s", got, want)
+		}
+		if _, err := avro.Parse(string(s.Canonical()), avro.WithLaxNames(acceptAll)); err != nil {
+			t.Fatalf("canonical re-parse: %v", err)
+		}
+	})
 }

@@ -712,7 +712,11 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		// return nil-stable JSON in the bare walker (snapshot/equality
 		// comparison stays meaningful: two equal cyclic subtrees
 		// produce the same partial JSON).
-		if isNamedKind(n.Type) && n.Name != "" {
+		// Keyed on the FULLNAME being expressible, not the short name: an
+		// empty short name with a namespace (fullname "ns.") is a valid
+		// reference target (recursive "ns." types parse), while fullname
+		// "" has no reference spelling and stays the cycle error.
+		if isNamedKind(n.Type) && nodeFullname(n) != "" {
 			return nodeFullname(n)
 		}
 		if d != nil && d.err == nil {
@@ -735,7 +739,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// short name re-binds in-scope — the same inherent reference
 	// ambiguity Java's getQualified/Names.get pair has; references have
 	// no "namespace":"" escape syntax.)
-	if d != nil && isNamedKind(n.Type) && n.Name != "" {
+	if d != nil && isNamedKind(n.Type) && nodeFullname(n) != "" {
 		if prev, exists := d.defined[nodeFullname(n)]; exists {
 			// A repeated fullname becomes a bare name reference. Marshal-
 			// compare the bodies only when the two are DISTINCT nodes (a
@@ -799,16 +803,24 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// every named type eagerly is O(depth*subtree) on nested schemas, and
 	// the body is only needed if a duplicate fullname actually appears.
 	if d != nil {
-		if isNamedKind(n.Type) && n.Name != "" {
+		// Fullname-keyed like the duplicate check above: fullname "" has
+		// no reference spelling, so it stays un-deduped (inline is its
+		// only representation).
+		if isNamedKind(n.Type) && nodeFullname(n) != "" {
 			d.defined[nodeFullname(n)] = n
 		}
 	}
 
 	m := map[string]any{"type": n.Type}
-	if n.Name != "" {
+	// A named KIND always emits its name — including the empty short name
+	// a user WithLaxNames fn can accept — mirroring the canonical emitter
+	// (appendCanonObject) and the parser, for which a missing and an empty
+	// name are the same fullname; the Name != "" arm keeps emission for
+	// hand-built names on non-named kinds.
+	if n.Name != "" || isNamedKind(n.Type) {
 		m["name"] = n.Name
 	}
-	if isNamedKind(n.Type) && n.Name != "" && !strings.Contains(n.Name, ".") {
+	if isNamedKind(n.Type) && !strings.Contains(n.Name, ".") {
 		// Emit the namespace relative to the enclosing scope, mirroring
 		// Java's Name.writeName: omit when equal (re-parse inherits it),
 		// "namespace":"" to escape inheritance for a null-namespace type
@@ -1322,7 +1334,11 @@ func nodeFullname(n *SchemaNode) string {
 // type opens its own scope; unnamed nodes pass the enclosing scope
 // through.
 func nsForChildren(n *SchemaNode, enclosing string) string {
-	if n != nil && n.Name != "" {
+	// Named KINDS open their own scope even with an empty short name (a
+	// user WithLaxNames fn can accept ""; nodeEffNS carries the resolved
+	// namespace either way); the Name != "" arm keeps hand-built names on
+	// non-named kinds scoping as before.
+	if n != nil && (n.Name != "" || isNamedKind(n.Type)) {
 		return nodeEffNS(n)
 	}
 	return enclosing
@@ -1377,7 +1393,10 @@ func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {
 	if n == nil {
 		return
 	}
-	if n.Name != "" { // record / enum / fixed
+	// Empty-short-name named kinds register too when their fullname is
+	// expressible (fullname "ns."), matching the wire builder's
+	// registration; fullname "" has no reference spelling to serve.
+	if n.Name != "" || (isNamedKind(n.Type) && nodeFullname(n) != "") { // record / enum / fixed
 		// Namespace is resolved at construction (see [SchemaNode]), so
 		// the fullname is direct — no inheritance walk needed here.
 		// Register exactly what the wire builder registers: every type
@@ -1650,7 +1669,10 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 		}
 	}
 	switch {
-	case n.Name != "" && !strings.Contains(n.Name, "."):
+	// Named kinds with an empty short name inherit/take-explicit exactly
+	// like any undotted name (the parser resolves "name":"" under an
+	// enclosing namespace to fullname "ns.").
+	case (n.Name != "" || isNamedKind(n.Type)) && !strings.Contains(n.Name, "."):
 		if hasExplicitNS {
 			n.Namespace = explicitNS
 		} else {

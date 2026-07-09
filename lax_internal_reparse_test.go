@@ -191,6 +191,45 @@ func TestRegression_CacheSpliceTransitiveLaxNames(t *testing.T) {
 	}
 }
 
+// Siblings of the canonical empty-name emission fix, in the metadata
+// rebuild: toJSONWalk (SchemaNode.Schema()) guarded its name-key,
+// namespace, cycle-reference, and dedup arms with Name != "", and
+// nsForChildren/collectNamedTypes/nodeFromJSONObject used the same idiom
+// — all conflating "structurally unnamed node" (array/map) with "named
+// kind whose short name is empty". Reachable damage through parsed
+// schemas: the "ok." class rebuilt to the WRONG schema silently (name +
+// namespace dropped, fullname "ok." became ""); recursive and diamond
+// "ok." shapes hard-failed the rebuilt re-parse ("unknown type"); a named
+// child inside an empty-named parent lost its inherited scope. The named
+// KIND, or a non-empty fullname where a reference must exist, is the
+// distinction — mirroring the canonical emitter fix.
+func TestRegression_SchemaNodeRebuildEmptyNames(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	for _, c := range []struct{ desc, js string }{
+		{"bare", `{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}`},
+		{"ok", `{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"}]}`},
+		{"ab", `{"type":"record","name":"R","namespace":"a..b","fields":[{"name":"f","type":"long"}]}`},
+		{"recursive-ok", `{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","ok."]}]}`},
+		{"diamond-ok", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"}]}},{"name":"b","type":"ok."}]}`},
+		{"nested-child-in-ok", `{"type":"record","name":"","namespace":"ok","fields":[{"name":"c","type":{"type":"record","name":"Child","fields":[{"name":"f","type":"long"}]}}]}`},
+	} {
+		t.Run(c.desc, func(t *testing.T) {
+			s, err := avro.Parse(c.js, avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			root := s.Root()
+			re, err := root.Schema(avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("Root().Schema() rebuild: %v", err)
+			}
+			if !bytes.Equal(re.Canonical(), s.Canonical()) {
+				t.Errorf("rebuilt schema diverges:\n orig %s\n rebuilt %s", s.Canonical(), re.Canonical())
+			}
+		})
+	}
+}
+
 // The reader-side twin of the customBaked writer-trigger fix: resolved
 // decode DROPPED the reader's custom on SchemaCache-inherited subtrees.
 // resolveNode re-applies reader customs to REBUILT nodes through
