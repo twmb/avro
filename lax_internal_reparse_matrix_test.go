@@ -337,6 +337,182 @@ func TestMatrix_InternalReparseLaxNames(t *testing.T) {
 	})
 }
 
+// Reader-side cells for the overlay-completion fix: a cache-parsed READER
+// whose custom matches only SchemaCache-inherited subtrees must apply the
+// custom on RESOLVED decode exactly as on direct decode. Every cell
+// asserts resolved == direct on value AND type (both against an explicit
+// custom-wrapped want), resolved DecodeJSON agreement, and that the
+// no-custom twin's wire bytes are unchanged by the custom registration.
+// The evolution axis lives INSIDE the inherited subtree and picks the
+// three resolve-time custom re-application families: added-field (a
+// custom-matched long default filled through defaultOp's wrap), promotion
+// (int→long through the promoted-node wrap + suppression gate), and
+// reorder (record rebuild + direct-reuse wrap).
+func TestMatrix_CacheReaderInheritedCustomResolve(t *testing.T) {
+	type evo struct {
+		key         string
+		writerInner string // writer Inner fields (pre-evolution)
+		readerInner string // reader Inner fields (post-evolution)
+		writerVal   map[string]any
+		nativeVal   map[string]any // reader-shaped, native values
+		ctVal       map[string]any // reader-shaped, domain-typed values
+		wantInner   map[string]any
+	}
+	evos := []evo{
+		{
+			key:         "addedfield",
+			writerInner: `[{"name":"f","type":"long"}]`,
+			readerInner: `[{"name":"f","type":"long"},{"name":"g","type":"long","default":9}]`,
+			writerVal:   map[string]any{"f": int64(7)},
+			nativeVal:   map[string]any{"f": int64(7), "g": int64(9)},
+			ctVal:       map[string]any{"f": ctLong{7}, "g": ctLong{9}},
+			wantInner:   map[string]any{"f": ctLong{7}, "g": ctLong{9}},
+		},
+		{
+			key:         "promotion",
+			writerInner: `[{"name":"f","type":"int"}]`,
+			readerInner: `[{"name":"f","type":"long"}]`,
+			writerVal:   map[string]any{"f": int32(7)},
+			nativeVal:   map[string]any{"f": int64(7)},
+			ctVal:       map[string]any{"f": ctLong{7}},
+			wantInner:   map[string]any{"f": ctLong{7}},
+		},
+		{
+			key:         "reorder",
+			writerInner: `[{"name":"f","type":"long"},{"name":"g","type":"string"}]`,
+			readerInner: `[{"name":"g","type":"string"},{"name":"f","type":"long"}]`,
+			writerVal:   map[string]any{"f": int64(7), "g": "z"},
+			nativeVal:   map[string]any{"f": int64(7), "g": "z"},
+			ctVal:       map[string]any{"f": ctLong{7}, "g": "z"},
+			wantInner:   map[string]any{"f": ctLong{7}, "g": "z"},
+		},
+	}
+	customs := []struct {
+		key string
+		ct  avro.CustomType
+	}{
+		{"decodeonly", ctLongDecodeOnly()},
+		{"encdec", ctLongEncDec()},
+	}
+
+	for _, e := range evos {
+		for _, cm := range customs {
+			readerInnerDef := `{"type":"record","name":"Inner","fields":` + e.readerInner + `}`
+			writerInnerDef := `{"type":"record","name":"Inner","fields":` + e.writerInner + `}`
+
+			runCell := func(t *testing.T, reader, twin, writer *avro.Schema, wrap func(map[string]any) map[string]any) {
+				t.Helper()
+				want := wrap(e.wantInner)
+				resolved, err := avro.Resolve(writer, reader)
+				if err != nil {
+					t.Fatalf("Resolve: %v", err)
+				}
+				// Direct decode — the parity target.
+				directWire, err := reader.Encode(wrap(e.nativeVal))
+				if err != nil {
+					t.Fatalf("direct encode: %v", err)
+				}
+				var direct map[string]any
+				if _, err := reader.Decode(directWire, &direct); err != nil {
+					t.Fatalf("direct decode: %v", err)
+				}
+				if !reflect.DeepEqual(direct, want) {
+					t.Fatalf("direct decode: got %#v, want %#v", direct, want)
+				}
+				// Resolved decode must match it, value and type.
+				wire, err := writer.Encode(wrap(e.writerVal))
+				if err != nil {
+					t.Fatalf("writer encode: %v", err)
+				}
+				var viaBinary map[string]any
+				if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+					t.Fatalf("resolved decode: %v", err)
+				}
+				if !reflect.DeepEqual(viaBinary, want) {
+					t.Errorf("resolved binary decode: got %#v, want %#v", viaBinary, want)
+				}
+				wjson, err := writer.EncodeJSON(wrap(e.writerVal))
+				if err != nil {
+					t.Fatalf("writer EncodeJSON: %v", err)
+				}
+				var viaJSON map[string]any
+				if err := resolved.DecodeJSON(wjson, &viaJSON); err != nil {
+					t.Fatalf("resolved DecodeJSON: %v", err)
+				}
+				if !reflect.DeepEqual(viaJSON, want) {
+					t.Errorf("resolved DecodeJSON: got %#v, want %#v", viaJSON, want)
+				}
+				// The custom never changes the wire: reader bytes equal the
+				// no-custom twin's, from native input and (encode+decode
+				// cells) from domain-typed input.
+				twinWire, err := twin.Encode(wrap(e.nativeVal))
+				if err != nil {
+					t.Fatalf("twin encode: %v", err)
+				}
+				if !bytes.Equal(directWire, twinWire) {
+					t.Errorf("reader wire bytes diverge from no-custom twin: %x vs %x", directWire, twinWire)
+				}
+				if cm.key == "encdec" {
+					ctWire, err := reader.Encode(wrap(e.ctVal))
+					if err != nil {
+						t.Fatalf("domain-typed encode: %v", err)
+					}
+					if !bytes.Equal(ctWire, twinWire) {
+						t.Errorf("domain-typed wire bytes diverge from no-custom twin: %x vs %x", ctWire, twinWire)
+					}
+				}
+			}
+
+			t.Run("reader/"+e.key+"/direct/"+cm.key, func(t *testing.T) {
+				var c avro.SchemaCache
+				if _, err := c.Parse(readerInnerDef, cm.ct); err != nil {
+					t.Fatalf("cache define: %v", err)
+				}
+				reader, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":"Inner"}]}`, cm.ct)
+				if err != nil {
+					t.Fatalf("cache reader parse: %v", err)
+				}
+				twin, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":` + readerInnerDef + `}]}`)
+				if err != nil {
+					t.Fatalf("twin parse: %v", err)
+				}
+				writer, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":` + writerInnerDef + `}]}`)
+				if err != nil {
+					t.Fatalf("writer parse: %v", err)
+				}
+				runCell(t, reader, twin, writer, func(inner map[string]any) map[string]any {
+					return map[string]any{"i": inner}
+				})
+			})
+
+			t.Run("reader/"+e.key+"/transitive/"+cm.key, func(t *testing.T) {
+				var c avro.SchemaCache
+				if _, err := c.Parse(readerInnerDef, cm.ct); err != nil {
+					t.Fatalf("cache define: %v", err)
+				}
+				if _, err := c.Parse(`{"type":"record","name":"Wrapper","namespace":"mid","fields":[{"name":"i","type":"Inner"}]}`, cm.ct); err != nil {
+					t.Fatalf("cache wrapper parse: %v", err)
+				}
+				reader, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"w","type":"mid.Wrapper"}]}`, cm.ct)
+				if err != nil {
+					t.Fatalf("cache reader parse: %v", err)
+				}
+				twin, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"w","type":{"type":"record","name":"Wrapper","namespace":"mid","fields":[{"name":"i","type":` + readerInnerDef + `}]}}]}`)
+				if err != nil {
+					t.Fatalf("twin parse: %v", err)
+				}
+				writer, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"w","type":{"type":"record","name":"Wrapper","namespace":"mid","fields":[{"name":"i","type":` + writerInnerDef + `}]}}]}`)
+				if err != nil {
+					t.Fatalf("writer parse: %v", err)
+				}
+				runCell(t, reader, twin, writer, func(inner map[string]any) map[string]any {
+					return map[string]any{"w": map[string]any{"i": inner}}
+				})
+			})
+		}
+	}
+}
+
 // The bare empty name ("" with no namespace) is DEFINABLE under a user
 // accept-all validator but not REFERENCEABLE: its only spelling as a
 // reference is the empty string, which the parser rejects structurally
@@ -407,16 +583,19 @@ func TestMatrix_InternalReparseBareEmptyName(t *testing.T) {
 		t.Errorf("String() re-parse: %v\nString(): %s", err, writer.String())
 	}
 
-	// OBSERVED, pinned as-is (surfaced for adjudication, pre-existing and
-	// untouched by the internal re-parse fix): the canonical form of a bare
-	// empty-name ROOT omits the record's own "name" key entirely, so
-	// Canonical() of THIS class does not re-parse. The shape only arises
-	// under a user WithLaxNames fn — the default parse enforces the strict
-	// name grammar (see the WithLaxNames doc) — so canonical-form interop
-	// carries no expectation here; the namespaced empty name "ok." keeps
-	// its name key (see the emptyname matrix cells), and the wire path,
-	// String(), and Resolve are unaffected. This pin flips if canonical
-	// emission for the class ever changes.
+	// OBSERVED, pinned as-is (maintainer-adjudicated: keep the emission,
+	// document — NOT_BUGS #60): the canonical form of a bare empty-name
+	// ROOT omits the record's own "name" key entirely, so Canonical() of
+	// THIS class does not re-parse. The shape only arises under a user
+	// WithLaxNames fn — the default parse enforces the strict name grammar
+	// (see the WithLaxNames doc). Executed cross-impl status (fastavro
+	// 1.12.2): fastavro parses the shape and its PCF KEEPS the empty name
+	// key ({"name":"",...}), so the bare-empty-name class
+	// fingerprint-diverges from fastavro; the namespaced empty name
+	// ("ok.") and empty-component ("a..b") classes are
+	// fingerprint-IDENTICAL with fastavro (executed — see NOT_BUGS #60 for
+	// the values). The wire path, String(), and Resolve are unaffected.
+	// This pin flips if canonical emission for the class ever changes.
 	if canon := string(writer.Canonical()); canon != `{"type":"record","fields":[{"name":"f","type":"long"}]}` {
 		t.Errorf("bare empty-name canonical changed (pin flipped — re-adjudicate): %s", canon)
 	}

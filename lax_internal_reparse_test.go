@@ -191,6 +191,119 @@ func TestRegression_CacheSpliceTransitiveLaxNames(t *testing.T) {
 	}
 }
 
+// The reader-side twin of the customBaked writer-trigger fix: resolved
+// decode DROPPED the reader's custom on SchemaCache-inherited subtrees.
+// resolveNode re-applies reader customs to REBUILT nodes through
+// resolveCtx.custom (= reader.custom), and a cache parse's overlay had no
+// entries for inherited nodes (applyCustomTypes visits only newly built
+// nodes; the guard-satisfying form registers the custom on BOTH parses,
+// but the referencing parse wires nothing new) — so a resolution against
+// a pre-evolution writer silently returned raw values where the direct
+// decode returned the custom-wrapped ones. tryAssignNamedRef now
+// completes the overlay for cross-parse inherited subtrees
+// (overlayInheritedCustom, the pure-wiring half of applyCustomTypes).
+func TestRegression_ResolvedDecodeCacheInheritedReaderCustom(t *testing.T) {
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}`, ctLongDecodeOnly()); err != nil {
+		t.Fatalf("cache define: %v", err)
+	}
+	reader, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":"Inner"},{"name":"added","type":"string","default":"x"}]}`, ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("cache reader parse: %v", err)
+	}
+	writer, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}}]}`)
+	if err != nil {
+		t.Fatalf("writer parse: %v", err)
+	}
+	resolved, err := avro.Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	want := map[string]any{"i": map[string]any{"f": ctLong{7}}, "added": "x"}
+
+	// The parity the finding broke: resolved decode must equal the direct
+	// decode — same value, same type.
+	directWire, err := reader.Encode(map[string]any{"i": map[string]any{"f": int64(7)}, "added": "x"})
+	if err != nil {
+		t.Fatalf("direct encode: %v", err)
+	}
+	var direct map[string]any
+	if _, err := reader.Decode(directWire, &direct); err != nil {
+		t.Fatalf("direct decode: %v", err)
+	}
+	if !reflect.DeepEqual(direct, want) {
+		t.Fatalf("direct decode (control): got %#v, want %#v", direct, want)
+	}
+
+	in := map[string]any{"i": map[string]any{"f": int64(7)}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("writer encode: %v", err)
+	}
+	var viaBinary map[string]any
+	if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+		t.Fatalf("resolved binary decode: %v", err)
+	}
+	if !reflect.DeepEqual(viaBinary, want) {
+		t.Errorf("resolved binary decode dropped the reader custom: got %#v, want %#v", viaBinary, want)
+	}
+	wjson, err := writer.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("writer EncodeJSON: %v", err)
+	}
+	var viaJSON map[string]any
+	if err := resolved.DecodeJSON(wjson, &viaJSON); err != nil {
+		t.Fatalf("resolved DecodeJSON: %v", err)
+	}
+	if !reflect.DeepEqual(viaJSON, want) {
+		t.Errorf("resolved DecodeJSON dropped the reader custom: got %#v, want %#v", viaJSON, want)
+	}
+}
+
+// Control pinned as SAFE (probed during the 2026-07-08 round): a
+// bare-reference-as-whole-schema cache parse keeps the defining parse's
+// custom behavior — the composed ser/deser of the inherited named type
+// carry the callback wraps — both on direct decode and as a
+// custom-typed writer through Resolve (customBaked fires via the
+// inherited hadCustomType stamp) and resolved DecodeJSON.
+func TestRegression_BareRefWriterCustomControl(t *testing.T) {
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}`, ctLongDecodeOnly()); err != nil {
+		t.Fatalf("cache define: %v", err)
+	}
+	bare, err := c.Parse(`"Inner"`, ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("bare ref parse: %v", err)
+	}
+	wire, err := bare.Encode(map[string]any{"f": int64(7)})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got map[string]any
+	if _, err := bare.Decode(wire, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if want := map[string]any{"f": ctLong{7}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("bare-ref direct decode: got %#v, want %#v", got, want)
+	}
+	reader, err := avro.Parse(`{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"},{"name":"added","type":"string","default":"x"}]}`, ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("reader parse: %v", err)
+	}
+	resolved, err := avro.Resolve(bare, reader)
+	if err != nil {
+		t.Fatalf("Resolve with bare-ref writer: %v", err)
+	}
+	var viaJSON map[string]any
+	if err := resolved.DecodeJSON([]byte(`{"f":7}`), &viaJSON); err != nil {
+		t.Fatalf("resolved DecodeJSON: %v", err)
+	}
+	if want := map[string]any{"f": ctLong{7}, "added": "x"}; !reflect.DeepEqual(viaJSON, want) {
+		t.Errorf("resolved DecodeJSON via bare-ref writer: got %#v, want %#v", viaJSON, want)
+	}
+}
+
 // Sibling of the lax-view finding, in the splice walkers rather than the
 // re-parse validator: collectTreeDefs / inlineTreeDefs guarded named-type
 // definitions with `name != ""`, conflating "no name key" (an unnamed

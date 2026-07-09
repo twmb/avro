@@ -1066,29 +1066,6 @@ func (b *builder) unnest(nest *builder) {
 	b.sawInheritedCustom = b.sawInheritedCustom || nest.sawInheritedCustom
 }
 
-// hasCustomTypeWired reports whether the builder has accumulated any
-// custom encoders or decoders. Used to stamp namedType.hadCustomType so
-// later cached references can skip the rejectCachedRefIfCustomTypeWouldMatch
-// check when this Parse already wired its own CTs.
-func (b *builder) hasCustomTypeWired() bool {
-	// Only a NON-wildcard CustomType bakes state onto the shared cached node
-	// (suppressLogical = true, set whenever a non-wildcard CT matches). A
-	// wildcard CT (empty LogicalType AND AvroType) suppresses nothing — its
-	// conversion lives entirely in the per-parse overlay — so a wildcard-only
-	// parse does NOT make its defined types "custom-affected" for the
-	// cache-boundary guard. Counting wildcards here (the old len(b.custom)>0)
-	// disagreed with findCustomTypeMatchInSubtree's wildcard SKIP, so a
-	// wildcard registered consistently across cache parses was spuriously
-	// rejected at a cache reference. Mirror that skip: count only wirings that
-	// actually suppress a built-in on the node.
-	for _, w := range b.custom {
-		if w.suppressLogical {
-			return true
-		}
-	}
-	return false
-}
-
 // putCustomWiring stores the wiring under node, allocating b.custom on
 // demand. Used by applyCustomTypes after building the per-node closures.
 func (b *builder) putCustomWiring(node *schemaNode, w *customWiring) {
@@ -1292,6 +1269,14 @@ func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (boo
 	if nt.hadCustomType {
 		b.sawInheritedCustom = true
 	}
+	// Cross-parse inherited subtree (same condition family as the guard
+	// above: not defined this parse, name inherited from the cache):
+	// complete the overlay so resolve-time custom re-application sees the
+	// inherited nodes. Locally defined types are wired by applyCustomTypes
+	// at their own build.
+	if len(b.customTypes) > 0 && !b.definedSet[nt] && b.cachedNames[resolved] {
+		b.overlayInheritedCustom(nt.node, make(map[*schemaNode]bool))
+	}
 	if setCanon {
 		b.canon = aschema{primitive: resolved}
 	}
@@ -1430,34 +1415,28 @@ func (b *builder) finalize() error {
 			return err
 		}
 	}
-	// Stamp every named type DEFINED by this parse as custom-affected
-	// when any CustomType wired. Custom effects are baked onto the
-	// shared nodes, and the SchemaCache boundary guard
-	// (rejectCachedRefIfCustomTypeWouldMatch) compares this flag against
-	// the NEXT parse's registrations. Deliberately coarse — every name
-	// defined by a custom-wired parse counts as custom-affected,
-	// documented on the guard — and taken here, after applyCustomTypes
-	// has seen every node, because registration happens early to support
+	// Stamp each named type THIS parse defined as custom-affected iff a
+	// non-wildcard registration matches somewhere in ITS OWN subtree —
+	// exactly when baked custom effects (logical suppression on the
+	// shared leaf nodes, callback wraps in the composed ser/deser) live
+	// inside the type. This is the SAME predicate the cache-boundary
+	// guard (rejectCachedRefIfCustomTypeWouldMatch) applies on the
+	// reference side — findCustomTypeMatchInSubtree, whose wildcard skip
+	// mirrors that a wildcard bakes nothing onto shared nodes — so the
+	// stamp and the guard cannot disagree in either direction: the walk
+	// crosses into SchemaCache-inherited subtrees, so a wrapper defined
+	// around an inherited custom-baked reference is stampable (a
+	// wired-this-parse test made the guard's "re-parse <name> with the
+	// CustomType first" remediation unsatisfiable for transitive chains
+	// — define with the custom, wrap with the custom, reference with the
+	// custom: rejected), and a sibling type whose own subtree has no
+	// match is NOT stamped merely because the parse wired something
+	// elsewhere (the earlier coarse posture, which false-rejected later
+	// no-custom references to such types). Taken at finalize, after the
+	// tree is fully built, because registration happens early to support
 	// self-references. Inherited (cache) entries are not in definedNamed
 	// and keep the flag from their defining parse.
-	if b.hasCustomTypeWired() {
-		for _, nt := range b.definedNamed {
-			nt.hadCustomType = true
-		}
-	} else if len(b.customTypes) > 0 {
-		// A parse can register a non-wildcard CustomType yet wire NOTHING
-		// new, because every matching node lives in a subtree inherited
-		// from the SchemaCache — the wraps were baked by the inherited
-		// type's own defining parse, and applyCustomTypes visits only
-		// newly built nodes. The types THIS parse defines around such
-		// references still depend on those baked effects, and the
-		// cache-boundary guard tests the reference side with
-		// findCustomTypeMatchInSubtree — so stamp with the SAME predicate.
-		// Without this arm, consistent registration is unsatisfiable for
-		// transitive chains: the guard demands "re-parse <name> with the
-		// CustomType first" when that is exactly how <name> was parsed
-		// (define Inner with the custom, wrap it WITH the custom, then
-		// reference the wrapper WITH the custom — rejected).
+	if len(b.customTypes) > 0 {
 		for _, nt := range b.definedNamed {
 			if b.findCustomTypeMatchInSubtree(nt.node, make(map[*schemaNode]bool)) != "" {
 				nt.hadCustomType = true
@@ -1608,6 +1587,64 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		}
 	}
 
+	wiring := b.buildCustomWiring(node)
+	if wiring == nil {
+		return nil
+	}
+
+	if wiring.encode != nil {
+		// Wrap the binary serializer. We update b.ser (which becomes the
+		// Schema's ser) but NOT node.ser, so named types in the cache
+		// keep their unwrapped ser/deser. The wrap closure is built by
+		// makeCustomSer, shared with the forward-ref finalize fixups
+		// (customWrappedSer) so an in-order reference and a forward reference
+		// to the same custom-encoded named type apply the SAME wrap.
+		b.ser = makeCustomSer(wiring.encode, node.ser)
+	}
+
+	// jsonAppliesLogical narrows suppression to nodes whose JSON decoder
+	// actually transforms the raw value (a logical decodeKind would apply):
+	// only those need a JSON-side suppress-wrapper to mirror the binary raw
+	// decode. See buildCustomWiring for the suppression contract.
+	jsonAppliesLogical := wiring.suppressLogical && jsonDecodeAppliesLogical(node)
+	if len(wiring.decoders) > 0 {
+		b.deser = wrapDeserWithCustomDecoders(node.deser, wiring.decoders, wiring.sn)
+		// JSON-side: wrap the node's per-decode dispatch with a
+		// closure that captures the decoder chain. The JSON runtime
+		// (decodeValue) checks node.decodeJSON first and falls back
+		// to decodeKind otherwise — no per-call map lookup, no
+		// recursion guard, no shared mutable state.
+		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(wiring.decoders, wiring.sn, wiring.suppressLogical)
+	} else if jsonAppliesLogical {
+		// No Decode callback (Encode-only, OR no callbacks at all) on a logical
+		// node that the binary path suppresses (non-wildcard): the user
+		// receives the RAW Avro-native value (CustomType.Decode docstring:
+		// "If nil, the built-in logical type handler is bypassed ... the
+		// base Avro type decoder is used directly, producing raw values").
+		// decodeKind applies the logical transform unless suppressed, so
+		// install the raw-decode wrapper with an empty decoder chain to
+		// produce the same raw value through DecodeJSON. A wildcard
+		// (suppressLogical false ⇒ jsonAppliesLogical false) skips this —
+		// decodeKind keeps the logical transform, matching the binary wildcard.
+		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(nil, wiring.sn, wiring.suppressLogical)
+	}
+
+	b.putCustomWiring(node, wiring)
+	b.meta.hasCustomType = true
+	return nil
+}
+
+// buildCustomWiring collects the per-node custom-type wiring from this
+// parse's registrations: the encode chain closure, the decoder chain, the
+// callback SchemaNode, and the suppression flags. Returns nil when no
+// registration matches or applies. PURE with respect to the builder and
+// the node — no ser/deser wraps, no node mutation, no overlay insertion —
+// so it is shared by applyCustomTypes (newly built nodes: wraps + overlay)
+// and overlayInheritedCustom (SchemaCache-inherited nodes: overlay only;
+// the wraps already live inside the inherited composition, baked by the
+// type's own defining parse under the guard-enforced identical
+// registrations).
+func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 	// Collect all matching encoders and decoders for this node.
 	type encoder struct {
 		goType reflect.Type
@@ -1714,17 +1751,9 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 			return v, nil // no encoder matched, pass through
 		}
 
-		// Store the customEncode in the builder's overlay (not on the
+		// Store the customEncode in the wiring overlay (not on the
 		// shared node) so it doesn't leak via the cache.
 		wiring.encode = customEncode
-
-		// Wrap the binary serializer. We update b.ser (which becomes the
-		// Schema's ser) but NOT node.ser, so named types in the cache
-		// keep their unwrapped ser/deser. The wrap closure is built by
-		// makeCustomSer, shared with the forward-ref finalize fixups
-		// (customWrappedSer) so an in-order reference and a forward reference
-		// to the same custom-encoded named type apply the SAME wrap.
-		b.ser = makeCustomSer(customEncode, node.ser)
 	}
 
 	wiring.suppressLogical = suppressLogical
@@ -1736,30 +1765,43 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 
 	if len(decoders) > 0 {
 		wiring.decoders = decoders
-		b.deser = wrapDeserWithCustomDecoders(node.deser, decoders, sn)
-		// JSON-side: wrap the node's per-decode dispatch with a
-		// closure that captures the decoder chain. The JSON runtime
-		// (decodeValue) checks node.decodeJSON first and falls back
-		// to decodeKind otherwise — no per-call map lookup, no
-		// recursion guard, no shared mutable state.
-		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(decoders, sn, suppressLogical)
-	} else if jsonAppliesLogical {
-		// No Decode callback (Encode-only, OR no callbacks at all) on a logical
-		// node that the binary path suppresses (non-wildcard): the user
-		// receives the RAW Avro-native value (CustomType.Decode docstring:
-		// "If nil, the built-in logical type handler is bypassed ... the
-		// base Avro type decoder is used directly, producing raw values").
-		// decodeKind applies the logical transform unless suppressed, so
-		// install the raw-decode wrapper with an empty decoder chain to
-		// produce the same raw value through DecodeJSON. A wildcard
-		// (suppressLogical false ⇒ jsonAppliesLogical false) skips this —
-		// decodeKind keeps the logical transform, matching the binary wildcard.
-		node.decodeJSON = wrapDecodeJSONWithCustomDecoders(nil, sn, suppressLogical)
 	}
+	return wiring
+}
 
-	b.putCustomWiring(node, wiring)
-	b.meta.hasCustomType = true
-	return nil
+// overlayInheritedCustom completes this parse's custom overlay (b.custom)
+// for a SchemaCache-inherited subtree: applyCustomTypes visits only newly
+// built nodes, so a reference to an inherited type left its matching
+// nodes without overlay entries — the binary/JSON callback wraps still
+// fire on DIRECT decode (they are composed inside the inherited ser/deser
+// by the type's defining parse), but every consumer that RE-APPLIES
+// customs from the overlay silently skipped them: Resolve's
+// resolveCtx.custom dropped the reader's custom (and the no-callback
+// logical suppression gate) on rebuilt nodes, so a resolved decode
+// returned raw values where the direct decode returned custom-wrapped
+// ones. Walks exactly like findCustomTypeMatchInSubtree (fields, items,
+// values, branches; visited set for recursion) and inserts pure wiring
+// only — no ser/deser wraps, no node mutation — since the composition
+// already carries the wraps. Existing entries are kept (a node can be
+// reached through multiple references).
+func (b *builder) overlayInheritedCustom(node *schemaNode, visited map[*schemaNode]bool) {
+	if node == nil || visited[node] {
+		return
+	}
+	visited[node] = true
+	if b.custom[node] == nil {
+		if w := b.buildCustomWiring(node); w != nil {
+			b.putCustomWiring(node, w)
+		}
+	}
+	for _, f := range node.fields {
+		b.overlayInheritedCustom(f.node, visited)
+	}
+	b.overlayInheritedCustom(node.items, visited)
+	b.overlayInheritedCustom(node.values, visited)
+	for _, br := range node.branches {
+		b.overlayInheritedCustom(br, visited)
+	}
 }
 
 func (b *builder) buildPrimitive(parentName string, s *aschema) error {
