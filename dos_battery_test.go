@@ -28,6 +28,14 @@ package avro
 //                              deep per-node Props/Default value.
 //   C7 cyclic Go type        — decode target / SchemaFor field type whose
 //                              reflect graph is cyclic: unbounded recursion.
+//   C9 registration-scaled   — a registered CustomType must not change
+//      parse cost              Parse's complexity class: the custom-match
+//                              subtree walks (finalize stamping, the cache
+//                              boundary guard, the inherited-overlay
+//                              completion) share one per-parse memo, else a
+//                              backward-reference chain or a many-refs cache
+//                              parse goes quadratic. Absolute wall-clock
+//                              bounds, not ratios.
 //
 // Each cell drives the real public API with a hostile input and asserts the
 // bound holds: it returns (an error, or terminates) FAST, never hangs, never
@@ -44,6 +52,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
@@ -717,5 +726,102 @@ func TestDoSBattery_C8_DirectByteAPIs(t *testing.T) {
 	wantTerminate(t, "Fingerprint/recursive-schema", func() error {
 		_ = MustParse(recursiveNodeSchema).Fingerprint(NewRabin())
 		return nil
+	})
+}
+
+// wantAcceptUnder asserts fn ACCEPTS (nil error) within bound. The C9 cells
+// pin a complexity CLASS on the accept path, so unlike the reject cells they
+// carry per-cell absolute bounds: generous multiples of the healthy cost
+// (linear parse lands well under a tenth of each bound on a laden host) yet
+// far below the quadratic cost the bound exists to catch — the two sit an
+// order of magnitude apart, so the exact value is not the point.
+func wantAcceptUnder(t *testing.T, name string, bound time.Duration, fn func() error) {
+	t.Helper()
+	start := time.Now()
+	err := fn()
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Errorf("%s: %v", name, err)
+		return
+	}
+	if elapsed > bound {
+		t.Errorf("%s: took %v (> %v) — the custom-match walk lost its complexity bound", name, elapsed, bound)
+	}
+}
+
+// dosChainSchema builds a backward-reference chain: Top's field i defines
+// record Ri whose single field references R(i-1). Every custom-match subtree
+// walk from Ri reaches all of R0..R(i-1), so without a shared per-parse memo
+// the finalize stamping loop costs O(n^2) node visits over ~60n bytes of
+// schema text.
+func dosChainSchema(n int) string {
+	var sb strings.Builder
+	sb.WriteString(`{"type":"record","name":"Top","fields":[`)
+	for i := range n {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		if i == 0 {
+			sb.WriteString(`{"name":"f0","type":{"type":"record","name":"R0","fields":[{"name":"v","type":"long"}]}}`)
+		} else {
+			fmt.Fprintf(&sb, `{"name":"f%d","type":{"type":"record","name":"R%d","fields":[{"name":"r","type":"R%d"}]}}`, i, i, i-1)
+		}
+	}
+	sb.WriteString(`]}`)
+	return sb.String()
+}
+
+func TestDoSBattery_C9_CustomTypeParseCost(t *testing.T) {
+	chain := dosChainSchema(3000) // ~200KB of well-formed schema text
+	noMatch := CustomType{LogicalType: "no-such-logical", AvroType: "string"}
+	match := CustomType{AvroType: "long"} // matches every chain leaf
+
+	// Parse × non-matching CustomType: every stamp walk completes clean, the
+	// worst case for a memo (nothing to short-circuit on). Healthy cost is
+	// the plain-parse neighborhood (tens of ms); quadratic is ~500ms+ here
+	// and grows 4x per doubling.
+	wantAcceptUnder(t, "Parse/chain-noMatch-custom", 200*time.Millisecond, func() error {
+		_, err := Parse(chain, noMatch)
+		return err
+	})
+
+	// Parse × MATCHING CustomType: walks short-circuit at the chain's leaf,
+	// which without a memo is still O(n) per walk = O(n^2) total. The memo
+	// must bound the match case too, not only the clean case.
+	wantAcceptUnder(t, "Parse/chain-matching-custom", 200*time.Millisecond, func() error {
+		_, err := Parse(chain, match)
+		return err
+	})
+
+	// SchemaCache × many references to a large inherited type: the boundary
+	// guard and the overlay completion each walk the inherited subtree per
+	// reference — without per-parse sharing that is O(refs × nodes) (seconds
+	// at 1000 × 5000); with it, one walk total.
+	var big strings.Builder
+	big.WriteString(`{"type":"record","name":"Big","fields":[`)
+	for i := range 5000 {
+		if i > 0 {
+			big.WriteString(",")
+		}
+		fmt.Fprintf(&big, `{"name":"f%d","type":"long"}`, i)
+	}
+	big.WriteString(`]}`)
+	var wide strings.Builder
+	wide.WriteString(`{"type":"record","name":"Wide","fields":[`)
+	for i := range 1000 {
+		if i > 0 {
+			wide.WriteString(",")
+		}
+		fmt.Fprintf(&wide, `{"name":"r%d","type":"Big"}`, i)
+	}
+	wide.WriteString(`]}`)
+
+	c := new(SchemaCache)
+	if _, err := c.Parse(big.String(), noMatch); err != nil {
+		t.Fatalf("cache parse of the inherited type: %v", err)
+	}
+	wantAcceptUnder(t, "SchemaCache.Parse/many-refs-custom", 400*time.Millisecond, func() error {
+		_, err := c.Parse(wide.String(), noMatch)
+		return err
 	})
 }

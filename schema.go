@@ -258,6 +258,16 @@ func applySchemaOpts(b *builder, opts []SchemaOpt) {
 			b.customTypes = append(b.customTypes, o)
 		}
 	}
+	// The custom-match walk memos exist exactly when CustomTypes are
+	// registered (their consumers are all gated on len(customTypes) > 0).
+	// Allocated here — before any build work and before any nest(), which
+	// shares them by reference — so the whole parse sees one memo.
+	// b.customTypes is never appended to after this point; that is the
+	// memo's correctness invariant (see customMatchInSubtree).
+	if len(b.customTypes) > 0 {
+		b.customMatch = make(map[*schemaNode]string)
+		b.overlayDone = make(map[*schemaNode]bool)
+	}
 }
 
 func parse(schema string, b *builder) (*Schema, error) {
@@ -1000,7 +1010,26 @@ type builder struct {
 	// this parse's own overlay (b.custom) knows nothing about. Feeds
 	// Schema.customBaked.
 	sawInheritedCustom bool
-	cachedNames        map[string]bool // names inherited from SchemaCache, not from this parse
+	// customMatch memoizes custom-match subtree verdicts per node for this
+	// parse ("" = proven match-free, non-"" = a matched-type location; key
+	// PRESENCE marks a computed verdict, so "" is a valid entry). Allocated
+	// by applySchemaOpts only when CustomTypes are registered, and shared
+	// by reference across nest() so the finalize stamping loop and the
+	// per-reference cache walks collapse to one walk per node per parse.
+	// See customMatchInSubtree for the soundness rules. Nil on white-box
+	// test builders — every write is guarded, degrading to unshared walks.
+	customMatch map[*schemaNode]string
+	// overlayDone marks inherited subtrees overlayInheritedCustom has
+	// completed, so N references to the same cached type overlay its nodes
+	// once per parse instead of re-walking per reference. Sharing one set
+	// across references is sound because the walk's effect is idempotent
+	// and order-independent within a parse: buildCustomWiring is
+	// deterministic (b.customTypes is fixed after applySchemaOpts) and
+	// existing overlay entries are kept, so a second walk over the same
+	// nodes could only rebuild identical wiring. Allocated alongside
+	// customMatch; nil-tolerated the same way.
+	overlayDone map[*schemaNode]bool
+	cachedNames map[string]bool // names inherited from SchemaCache, not from this parse
 	// allowReRegister permits re-DEFINING an inherited (cachedNames) type
 	// instead of erroring "duplicate named type". Set by SchemaCache.Parse only
 	// for parses that skip dedup and re-parse to get fresh CustomType wiring
@@ -1043,6 +1072,8 @@ func (b *builder) nest() *builder {
 		checkName:       b.checkName,
 		customTypes:     b.customTypes,
 		custom:          b.custom,
+		customMatch:     b.customMatch,
+		overlayDone:     b.overlayDone,
 		cachedNames:     b.cachedNames,
 		definedSet:      b.definedSet,
 		allowReRegister: b.allowReRegister,
@@ -1273,9 +1304,15 @@ func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (boo
 	// above: not defined this parse, name inherited from the cache):
 	// complete the overlay so resolve-time custom re-application sees the
 	// inherited nodes. Locally defined types are wired by applyCustomTypes
-	// at their own build.
+	// at their own build. The visited set is the per-parse b.overlayDone,
+	// so repeated references to the same inherited type walk its subtree
+	// once per parse, not once per reference (see the field's soundness
+	// note); the nil fallback covers white-box test builders only.
 	if len(b.customTypes) > 0 && !b.definedSet[nt] && b.cachedNames[resolved] {
-		b.overlayInheritedCustom(nt.node, make(map[*schemaNode]bool))
+		if b.overlayDone == nil {
+			b.overlayDone = make(map[*schemaNode]bool)
+		}
+		b.overlayInheritedCustom(nt.node, b.overlayDone)
 	}
 	if setCanon {
 		b.canon = aschema{primitive: resolved}
@@ -1438,7 +1475,7 @@ func (b *builder) finalize() error {
 	// and keep the flag from their defining parse.
 	if len(b.customTypes) > 0 {
 		for _, nt := range b.definedNamed {
-			if b.findCustomTypeMatchInSubtree(nt.node, make(map[*schemaNode]bool)) != "" {
+			if b.customMatchInSubtree(nt.node) != "" {
 				nt.hadCustomType = true
 			}
 		}
@@ -1784,6 +1821,14 @@ func (b *builder) buildCustomWiring(node *schemaNode) *customWiring {
 // only — no ser/deser wraps, no node mutation — since the composition
 // already carries the wraps. Existing entries are kept (a node can be
 // reached through multiple references).
+//
+// visited is the PER-PARSE b.overlayDone set, shared across every
+// reference this parse makes: sharing is sound because the walk's effect
+// is idempotent and order-independent within a parse — b.customTypes is
+// fixed after applySchemaOpts, so buildCustomWiring(node) is
+// deterministic, and a re-visit could only rebuild wiring identical to
+// the entry already kept. Skipping the re-visit therefore changes cost
+// (one subtree walk per parse instead of per reference), never outcome.
 func (b *builder) overlayInheritedCustom(node *schemaNode, visited map[*schemaNode]bool) {
 	if node == nil || visited[node] {
 		return
@@ -1887,7 +1932,7 @@ func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *name
 	// directions are rejected with the same "make them consistent" remediation.
 	currentMatches := ""
 	if len(b.customTypes) > 0 {
-		currentMatches = b.findCustomTypeMatchInSubtree(nt.node, make(map[*schemaNode]bool))
+		currentMatches = b.customMatchInSubtree(nt.node)
 	}
 	switch {
 	case currentMatches != "" && !nt.hadCustomType:
@@ -1908,7 +1953,74 @@ func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *name
 	return nil
 }
 
-// findCustomTypeMatchInSubtree walks node and its descendants,
+// customMatchInSubtree is the memoized entry point over
+// findCustomTypeMatchInSubtree: one walk per node per parse, shared by the
+// finalize stamping loop, the cache boundary guard
+// (rejectCachedRefIfCustomTypeWouldMatch), and — through the shared
+// b.customMatch the recursion consults — the overlay completion's guard
+// twin. Without the memo each caller re-walks the subtree from scratch:
+// O(defs × reachable nodes) at finalize (quadratic on a backward-reference
+// chain) and O(references × subtree) on a SchemaCache parse (the
+// dos_battery_test.go C9 cells pin both bounds).
+//
+// The memo is sound because b.customTypes is FIXED for the builder's
+// lifetime (applySchemaOpts runs before any build or finalize work, and
+// nothing appends afterwards), so a node's verdict can never change within
+// the parse; and every queried subtree is fully built when walked (cached
+// inherited types are complete from their defining parse; this parse's own
+// types are stamped at finalize, after the forward-ref fixups wire every
+// child). Two write rules keep memoized verdicts EXACT on cyclic graphs:
+//
+//   - A clean completion writes "" for EVERY node the walk visited:
+//     reachability is transitive, so each visited node's reachable set is a
+//     subset of the root's, which the walk just proved match-free. (A "" that
+//     merely bubbled up mid-walk is NOT written per-node — a completed child
+//     can still reach a match through a back-edge to a node higher on the
+//     walk stack, so only the top-level clean result proves anything.)
+//   - A match writes the location for exactly the nodes it unwinds through
+//     (see findCustomTypeMatchInSubtree): each stack node reaches the match
+//     inside its own subtree, so the verdict is exact regardless of what the
+//     rest of the walk would have found.
+//
+// The location STRING for a node is frozen at whichever walk order first
+// found a match — different roots could name a different first match, but
+// callers branch only on emptiness; the string just names a matched type in
+// the guard's error message.
+func (b *builder) customMatchInSubtree(node *schemaNode) string {
+	if m, ok := b.customMatch[node]; ok {
+		return m
+	}
+	visited := make(map[*schemaNode]bool)
+	m := b.findCustomTypeMatchInSubtree(node, visited)
+	if b.customMatch != nil && m == "" {
+		for n := range visited {
+			b.customMatch[n] = ""
+		}
+	}
+	return m
+}
+
+// findCustomTypeMatchInSubtree is the per-node recursion step: consult the
+// per-parse memo, else walk via findCustomTypeMatchInSubtreeWalk, and record
+// a found match for this node on the unwind (every node on the walk stack
+// reaches the match, so the write is exact; see customMatchInSubtree for the
+// full memo contract). White-box test builders may lack the memo map — reads
+// of a nil map miss and writes are guarded, degrading to the unshared walk.
+func (b *builder) findCustomTypeMatchInSubtree(node *schemaNode, visited map[*schemaNode]bool) string {
+	if node == nil {
+		return ""
+	}
+	if m, ok := b.customMatch[node]; ok {
+		return m
+	}
+	m := b.findCustomTypeMatchInSubtreeWalk(node, visited)
+	if m != "" && b.customMatch != nil {
+		b.customMatch[node] = m
+	}
+	return m
+}
+
+// findCustomTypeMatchInSubtreeWalk walks node and its descendants,
 // returning a short location string for the first node whose
 // (kind, logical) would match any of b.customTypes. Returns "" if
 // no descendant matches. Recursive types are handled via the
@@ -1916,7 +2028,7 @@ func (b *builder) rejectCachedRefIfCustomTypeWouldMatch(refName string, nt *name
 // cover every container shape (record, array, map, union). Named-
 // type recursion is rare in cached-reuse scenarios but the visited
 // set keeps it safe.
-func (b *builder) findCustomTypeMatchInSubtree(node *schemaNode, visited map[*schemaNode]bool) string {
+func (b *builder) findCustomTypeMatchInSubtreeWalk(node *schemaNode, visited map[*schemaNode]bool) string {
 	if node == nil || visited[node] {
 		return ""
 	}
