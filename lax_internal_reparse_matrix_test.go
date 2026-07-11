@@ -723,3 +723,139 @@ func TestMatrix_CanonicalEmptyNameFastavroParity(t *testing.T) {
 		}
 	})
 }
+
+// Tagged-union JSON naming for an EMPTY-NAMED union branch (short name ""
+// with and without a namespace — reachable only under a user WithLaxNames
+// fn). The tag is the branch's FULLNAME, exactly as for any other named
+// branch: "ok." for the namespaced class and "" for the bare class —
+// matching fastavro's json_writer (1.12.2, executed: `{"ok.": "A"}`; its
+// reader resolves only that exact key, rejecting "" and the kind name).
+// fastavro cannot WRITE the bare class (its writer errors "No key was set"
+// on the falsy fullname) but its reader accepts the "" key, so twmb's
+// `{"":"A"}` emission is fastavro-readable on both classes.
+//
+//	{class: bare "", namespaced "ok."}
+//	  x {tagged encode emission (exact bytes),
+//	     decode of own emission (plain and TaggedUnions),
+//	     tagged-map encode routing (fullname key; "" short-name fallback),
+//	     resolved DecodeJSON routing (per-branch-divergent resolution)}
+func TestMatrix_EmptyNameTaggedUnion(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	for _, tc := range []struct {
+		class    string
+		schema   string
+		wantTag  string // exact tagged EncodeJSON output for symbol "A"
+		mapKeys  []string
+		rejected []string
+	}{
+		{
+			class:   "ok",
+			schema:  `["null",{"type":"enum","name":"","namespace":"ok","symbols":["A","B"]}]`,
+			wantTag: `{"ok.":"A"}`,
+			// The "" key routes via the unique-short-name fallback
+			// (unqualified("ok.") is ""), the same input leniency every
+			// namespaced branch's short name gets; the kind never tags a
+			// named branch (goavro/Java: the envelope key is the fullname).
+			mapKeys:  []string{"ok.", ""},
+			rejected: []string{"enum"},
+		},
+		{
+			class:    "bare",
+			schema:   `["null",{"type":"enum","name":"","symbols":["A","B"]}]`,
+			wantTag:  `{"":"A"}`,
+			mapKeys:  []string{""},
+			rejected: []string{"ok.", "enum"},
+		},
+	} {
+		t.Run(tc.class, func(t *testing.T) {
+			s, err := avro.Parse(tc.schema, avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+
+			got, err := s.EncodeJSON("A", avro.TaggedUnions())
+			if err != nil {
+				t.Fatalf("tagged EncodeJSON: %v", err)
+			}
+			if string(got) != tc.wantTag {
+				t.Errorf("tagged emission: got %s, want %s", got, tc.wantTag)
+			}
+
+			var plain any
+			if err := s.DecodeJSON(got, &plain); err != nil {
+				t.Errorf("plain decode of own tagged emission: %v", err)
+			} else if plain != "A" {
+				t.Errorf("plain decode: got %#v, want %q", plain, "A")
+			}
+			wantKey := "ok."
+			if tc.class == "bare" {
+				wantKey = ""
+			}
+			var tagged any
+			if err := s.DecodeJSON(got, &tagged, avro.TaggedUnions()); err != nil {
+				t.Errorf("tagged decode of own tagged emission: %v", err)
+			} else if !reflect.DeepEqual(tagged, map[string]any{wantKey: "A"}) {
+				t.Errorf("tagged decode: got %#v, want map[%q:A]", tagged, wantKey)
+			}
+
+			wire, err := s.Encode("A")
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			for _, key := range tc.mapKeys {
+				in := map[string]any{key: "A"}
+				bin, err := s.Encode(in)
+				if err != nil {
+					t.Errorf("binary Encode(map[%q]): %v", key, err)
+				} else if !bytes.Equal(bin, wire) {
+					t.Errorf("binary Encode(map[%q]): wire %x, want %x", key, bin, wire)
+				}
+				j, err := s.EncodeJSON(in, avro.TaggedUnions())
+				if err != nil {
+					t.Errorf("tagged EncodeJSON(map[%q]): %v", key, err)
+				} else if string(j) != tc.wantTag {
+					t.Errorf("tagged EncodeJSON(map[%q]): got %s, want %s", key, j, tc.wantTag)
+				}
+			}
+			for _, key := range tc.rejected {
+				if _, err := s.Encode(map[string]any{key: "A"}); err == nil {
+					t.Errorf("binary Encode(map[%q]) unexpectedly accepted", key)
+				}
+			}
+		})
+	}
+
+	// Resolved DecodeJSON keeps the empty-named branch's identity through
+	// the tagged intermediate: the writer names the enum branch whose value
+	// "B" would ALSO satisfy the string branch, and the reader's enum drops
+	// "B" for its declared default — so a routing flip is observable both
+	// as branch identity and as the resolved value.
+	t.Run("resolved-routing", func(t *testing.T) {
+		w, err := avro.Parse(`["null",{"type":"enum","name":"","namespace":"ok","symbols":["A","B"]},"string"]`, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("parse writer: %v", err)
+		}
+		r, err := avro.Parse(`["null","string",{"type":"enum","name":"","namespace":"ok","symbols":["A"],"default":"A"}]`, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("parse reader: %v", err)
+		}
+		resolved, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		wire, err := w.Encode(map[string]any{"ok.": "B"})
+		if err != nil {
+			t.Fatalf("writer encode: %v", err)
+		}
+		var viaBinary, viaJSON any
+		if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+			t.Fatalf("resolved binary decode: %v", err)
+		}
+		if err := resolved.DecodeJSON([]byte(`{"ok.": "B"}`), &viaJSON); err != nil {
+			t.Fatalf("resolved DecodeJSON: %v", err)
+		}
+		if viaBinary != "A" || viaJSON != "A" {
+			t.Errorf("resolved enum-default routing: binary %#v, JSON %#v, want %q on both (string-branch flip would keep %q)", viaBinary, viaJSON, "A", "B")
+		}
+	})
+}

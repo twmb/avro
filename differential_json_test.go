@@ -214,4 +214,65 @@ func TestDifferentialFastavroJSON(t *testing.T) {
 			t.Errorf("twmb accepted trailing content")
 		}
 	})
+
+	t.Run("empty-named branch tagged envelope parity", func(t *testing.T) {
+		// A union branch whose short name is empty (lax names) tags by its
+		// FULLNAME like any named branch. fastavro is the only reference
+		// impl that parses the shape; both engines emit `{"ok.": ...}` and
+		// each reads the other's text.
+		acceptAll := func(string) error { return nil }
+		schema := `["null",{"type":"enum","name":"","namespace":"ok","symbols":["A","B"]}]`
+		s, err := avro.Parse(schema, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("twmb parse: %v", err)
+		}
+		got, err := s.EncodeJSON("A", avro.TaggedUnions())
+		if err != nil {
+			t.Fatalf("twmb EncodeJSON: %v", err)
+		}
+		resp := o.call(oracleJob{Op: "jsonwrite", Schema: json.RawMessage(schema),
+			Value: json.RawMessage(`"A"`)})
+		if !resp.OK {
+			t.Fatalf("fastavro json_writer: %s", resp.Err)
+		}
+		if compact(t, resp.JSON) != compact(t, string(got)) {
+			t.Errorf("empty-named union tag: twmb %s, fastavro %s", got, resp.JSON)
+		}
+		read := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(schema), JSON: string(got)})
+		if !read.OK || len(read.Values) != 1 || fmt.Sprint(read.Values[0]) != "A" {
+			t.Errorf("fastavro json_read of twmb tag: ok=%v values=%v err=%s", read.OK, read.Values, read.Err)
+		}
+		var back any
+		if err := s.DecodeJSON([]byte(resp.JSON), &back); err != nil || back != "A" {
+			t.Errorf("twmb DecodeJSON of fastavro tag: %v %v", back, err)
+		}
+
+		// Calibration: the BARE empty-name class ("" fullname). twmb emits
+		// and round-trips `{"":"A"}`; fastavro's json_writer cannot produce
+		// the envelope (observed 1.12.2: "No key was set" — the falsy
+		// fullname never becomes the key) while its json_reader accepts the
+		// "" key, so twmb's emission stays fastavro-readable. An upgrade
+		// that makes the write succeed flips this pin — recalibrate.
+		bare := `["null",{"type":"enum","name":"","symbols":["A","B"]}]`
+		bs, err := avro.Parse(bare, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("twmb parse bare: %v", err)
+		}
+		bgot, err := bs.EncodeJSON("A", avro.TaggedUnions())
+		if err != nil {
+			t.Fatalf("twmb EncodeJSON bare: %v", err)
+		}
+		if string(bgot) != `{"":"A"}` {
+			t.Errorf("twmb bare tag: %s, want {\"\":\"A\"}", bgot)
+		}
+		bwrite := o.call(oracleJob{Op: "jsonwrite", Schema: json.RawMessage(bare),
+			Value: json.RawMessage(`"A"`)})
+		if bwrite.OK {
+			t.Errorf("fastavro json_writer wrote the bare empty-name envelope %q (recalibrate: 1.12.2 errored)", bwrite.JSON)
+		}
+		bread := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(bare), JSON: string(bgot)})
+		if !bread.OK || len(bread.Values) != 1 || fmt.Sprint(bread.Values[0]) != "A" {
+			t.Errorf("fastavro json_read of twmb bare tag: ok=%v values=%v err=%s", bread.OK, bread.Values, bread.Err)
+		}
+	})
 }
