@@ -374,6 +374,41 @@ func init() {
 	featureWalkerRows = append(featureWalkerRows, featureWalkerLiftRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerCaseKeyRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerRefFormRows...)
+	featureWalkerRows = append(featureWalkerRows, featureWalkerAliasRows...)
+}
+
+// Aliases accept ANY string — never name-validated (type AND field aliases),
+// including the leading-dot null-namespace escape. Aliases are stripped by
+// the canonical form and inert on the wire, so the twin is the alias-FREE
+// spelling: parity asserts exactly that inertness through every walker,
+// while the weird alias strings survive verbatim into the forms String(),
+// Root(), and the cache splice emit — each self-containment re-parse in the
+// drivers re-accepts them (a walker that re-validated aliases, or dropped
+// them and changed the emitted form's parse, dies here). Resolution parity
+// holds because primary names match on both sides; the alias-MATCHING
+// semantics (a reader alias binding a writer's legacy name) are a
+// resolution feature deliberately outside this net's twin-parity shape,
+// pinned by the alias regression tests.
+var featureWalkerAliasRows = []featureWalkerRow{
+	{
+		name:    "aliases-any-string",
+		feature: `{"type":"record","name":"ns.Top","aliases":["1st!","com.example.legacy x",".NullNs"],"fields":[{"name":"w","type":"int","aliases":["9 lives","!"]},{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"],"aliases":["énum,alias"]}}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"w","type":"int"},{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"]}}]}`,
+		sample:  map[string]any{"w": int32(1), "c": "B"},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"w","type":"int"},{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"]}},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"w": int32(1), "c": "B", "pad": int32(5)},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"ns.Top","aliases":["1st!"],"fields":[{"name":"e","type":"Elem","aliases":["old e"]}]}`,
+		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"e","type":"Elem"}]}`,
+		refSample:  map[string]any{"e": map[string]any{"x": int32(1)}},
+
+		defFeature:      `{"type":"record","name":"ns.HF","fields":[{"name":"d","type":{"type":"record","name":"DE","aliases":["!weird def","."],"fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"ns.HF","fields":[{"name":"d","type":{"type":"record","name":"DE","fields":[{"name":"x","type":"int"}]}}]}`,
+		defFollow:       `{"type":"record","name":"ns.FF","fields":[{"name":"d","type":"DE"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
 }
 
 // Name-reference FORMS: the wrapped-object reference spelling
