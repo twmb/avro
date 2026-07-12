@@ -35,12 +35,17 @@ import (
 // the wire parser / the vanilla twin — never a hardcoded expectation, so
 // rows stay cheap to add.
 //
-// Adding a feature to the net = adding a row. Feature families still to be
-// seeded as rows: lax names (WithLaxNames spellings, via opts),
-// field-level logicalType lift shapes, case-variant object keys,
-// wrapped ({"type":"X"}) and forward references, aliases, degenerate
-// cardinalities (empty fields/symbols/branches), duplicate-key last-wins
-// spellings, and implicit null defaults.
+// Adding a feature to the net = adding a row. Seeded families: the flat
+// (goavro field-format) lift across all six kinds plus composition and the
+// namespace-decoy trap; lax names (WithLaxNames-only shapes, split-vs-inline
+// fullname twins); the three field-level logicalType lift shapes;
+// case-variant reserved keys; wrapped ({"type":"X"}) and forward references
+// (diamond + recursive); aliases-any-string; degenerate cardinalities
+// (empty fields/symbols/branches, size-0 fixed); duplicate-key last-wins;
+// and implicit null defaults. Each family block below documents what its
+// twin means and where its feature survives to; drivers skip explicitly
+// (with the reason at the row or driver) where a row has no structural
+// position for them — a nil sample marks a parseable-but-unusable kind.
 type featureWalkerRow struct {
 	name string
 
