@@ -376,6 +376,78 @@ func init() {
 	featureWalkerRows = append(featureWalkerRows, featureWalkerRefFormRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerAliasRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerDegenerateRows...)
+	featureWalkerRows = append(featureWalkerRows, featureWalkerDupKeyRows...)
+}
+
+// Duplicate JSON keys in the SCHEMA document: the last occurrence wins
+// (encoding/json map decode; Java's Jackson ObjectNode and fastavro's dict
+// behave the same). The duplicates survive in the schema text that every
+// walker independently re-consumes — String()'s re-parse, the Root() tree,
+// the cache splice — so each walker's own decode must collapse to the same
+// LAST value the wire parser used; a walker swapped to an order-sensitive
+// scanner that takes the FIRST occurrence diverges. Twins spell the
+// single-key last-value form; first values are decoys chosen so a
+// first-wins reading produces a structurally DIFFERENT schema (wrong
+// size/symbols/items, a different registered type, an invalid default)
+// rather than a coincidentally-equal one. Non-vacuity is proven by the
+// twin-flip check (spell the twin with the FIRST values and watch the
+// cells die) rather than an arm neuter: the collapse lives in the stdlib
+// decoder, which has no production arm of ours to disable.
+var featureWalkerDupKeyRows = []featureWalkerRow{
+	{
+		// Type-defining keys duplicated: record name, fields (empty decoy
+		// then real), fixed size (999 then 2), enum symbols, array items
+		// (string then int).
+		name:    "dupkey-structural",
+		feature: `{"type":"record","name":"decoy.Top","name":"ns.Top","fields":[],"fields":[{"name":"fx","type":{"type":"fixed","name":"fx","size":999,"size":2}},{"name":"c","type":{"type":"enum","name":"decoyc","name":"c","symbols":["X"],"symbols":["A","B"]}},{"name":"list","type":{"type":"array","items":"string","items":"int"}}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"fx","type":{"type":"fixed","name":"fx","size":2}},{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"]}},{"name":"list","type":{"type":"array","items":"int"}}]}`,
+		sample:  map[string]any{"fx": []byte{1, 2}, "c": "B", "list": []any{int32(1)}},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"fx","type":{"type":"fixed","name":"fx","size":2}},{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"]}},{"name":"list","type":{"type":"array","items":"int"}},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"fx": []byte{1, 2}, "c": "B", "list": []any{int32(1)}, "pad": int32(5)},
+
+		// The dup-items pair references cached types: decoy.Elem first,
+		// ns.Elem last, BOTH registered — a first-wins walker binds the
+		// wrong type (different field shape) instead of dangling.
+		refDefs:    []string{fwElemDef, fwDecoyElemDef},
+		refFeature: `{"type":"record","name":"ns.Top","fields":[{"name":"list","type":{"type":"array","items":"decoy.Elem","items":"ns.Elem"}}]}`,
+		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"list","type":{"type":"array","items":"ns.Elem"}}]}`,
+		refSample:  map[string]any{"list": []any{map[string]any{"x": int32(1)}}},
+
+		// The DEFINITION carries duplicated name and fields keys; the
+		// follow-up reference binds the last-wins name, whose last-wins
+		// fields must have been collected.
+		defFeature:      `{"type":"record","name":"ns.HI","fields":[{"name":"d","type":{"type":"record","name":"decoy.DD","name":"DD","fields":[],"fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"ns.HI","fields":[{"name":"d","type":{"type":"record","name":"DD","fields":[{"name":"x","type":"int"}]}}]}`,
+		defFollow:       `{"type":"record","name":"ns.FI","fields":[{"name":"d","type":"DD"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
+	{
+		// Annotation keys duplicated: namespace (decoy then real — the
+		// real one governs which cached Elem a bare reference binds),
+		// field default (an INVALID first value: 7 cannot default a
+		// null-first union, so a first-wins parse errors outright),
+		// order, aliases, doc, and logicalType (time-micros then
+		// timestamp-millis — the time.Time sample encodes only against
+		// the last).
+		name:    "dupkey-annotations",
+		feature: `{"type":"record","name":"Top","namespace":"decoy","namespace":"ns","fields":[{"name":"o","type":["null","int"],"default":7,"default":null},{"name":"w","type":"int","order":"ascending","order":"descending","aliases":["a1"],"aliases":["a2"],"doc":"d1","doc":"d2"},{"name":"ts","type":{"type":"long","logicalType":"time-micros","logicalType":"timestamp-millis"}}]}`,
+		twin:    `{"type":"record","name":"Top","namespace":"ns","fields":[{"name":"o","type":["null","int"],"default":null},{"name":"w","type":"int","order":"descending","aliases":["a2"],"doc":"d2"},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}`,
+		sample:  map[string]any{"w": int32(1), "ts": fwTime},
+
+		resolveAgainst: `{"type":"record","name":"Top","namespace":"ns","fields":[{"name":"o","type":["null","int"],"default":null},{"name":"w","type":"int","order":"descending","aliases":["a2"],"doc":"d2"},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"o": nil, "w": int32(1), "ts": fwTime, "pad": int32(5)},
+
+		refDefs:    []string{fwElemDef, fwDecoyElemDef},
+		refFeature: `{"type":"record","name":"Top","namespace":"decoy","namespace":"ns","fields":[{"name":"e","type":"Elem"}]}`,
+		refTwin:    `{"type":"record","name":"Top","namespace":"ns","fields":[{"name":"e","type":"Elem"}]}`,
+		refSample:  map[string]any{"e": map[string]any{"x": int32(1)}},
+
+		defFeature:      `{"type":"record","name":"HJ","namespace":"decoy","namespace":"ns","fields":[{"name":"d","type":{"type":"record","name":"DJ","aliases":["z1"],"aliases":["z2"],"fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"HJ","namespace":"ns","fields":[{"name":"d","type":{"type":"record","name":"DJ","aliases":["z2"],"fields":[{"name":"x","type":"int"}]}}]}`,
+		defFollow:       `{"type":"record","name":"ns.FJ","fields":[{"name":"d","type":"DJ"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
 }
 
 // Degenerate cardinalities, all reference-legal: the empty-fields record,
