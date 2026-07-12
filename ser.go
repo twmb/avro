@@ -364,6 +364,12 @@ var serPrimitive = map[string]serfn{
 // hit "null" at the start with an error. This error is saved to avoid allocs.
 var errNonNil = errors.New("cannot encode non-nil value as null")
 
+// errAppendTextShrunk reports an encoding.TextAppender implementation that
+// violated its append contract by returning a slice shorter than its input.
+// Saved as a var so a union try-each that hits the same violating value on
+// multiple branches doesn't allocate the message per attempt.
+var errAppendTextShrunk = errors.New("AppendText returned a slice shorter than its input")
+
 func serNull(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 	if !v.IsValid() {
 		return dst, nil
@@ -1024,6 +1030,23 @@ func appendAvroString(dst []byte, v reflect.Value) ([]byte, error) {
 		dst, err = a.AppendText(dst)
 		if err != nil {
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "string", Err: err}
+		}
+		// A contract-violating AppendText that returns a slice SHORTER than
+		// its input (typically `return []byte(s), nil` — a fresh slice
+		// instead of an append) would drive the backfill arithmetic below
+		// out of bounds: textLen goes negative and dst[mark:] indexes past
+		// the end of the returned slice, a slice-bounds panic through
+		// Encode. Name the violation instead. A fresh return that is >= the
+		// input length is NOT detectable without comparing prefix bytes on
+		// every encode (a per-string memcmp of everything encoded so far);
+		// that cost is deliberately not paid for the caller's own contract
+		// violation, so an over-long fresh return silently replaces earlier
+		// output — encoding/json/v2's jsontext.AppendRaw takes the same
+		// trusting posture (executed, go1.26.2: identical slice-bounds
+		// panic on the short shape). Observed outputs for the undetectable
+		// shapes are pinned in text_appender_contract_test.go.
+		if len(dst) < mark+hdrLen {
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "string", Err: errAppendTextShrunk}
 		}
 		textLen := len(dst) - mark - hdrLen
 		var buf [10]byte
