@@ -734,9 +734,18 @@ func TestDoSBattery_C8_DirectByteAPIs(t *testing.T) {
 // carry per-cell absolute bounds: generous multiples of the healthy cost
 // (linear parse lands well under a tenth of each bound on a laden host) yet
 // far below the quadratic cost the bound exists to catch — the two sit an
-// order of magnitude apart, so the exact value is not the point.
+// order of magnitude apart, so the exact value is not the point. Under -race
+// the bound gets the same ~3s ceiling every other wall-clock cell takes
+// (see avro_test's raceRelaxed for the canonical rationale):
+// instrumentation puts the healthy linear cost past the tight bound
+// (~350ms observed for the 200ms chain cells), while the quadratic classes
+// these cells catch are multi-second under -race; the tight bound stays in
+// force for normal runs.
 func wantAcceptUnder(t *testing.T, name string, bound time.Duration, fn func() error) {
 	t.Helper()
+	if raceEnabled && bound < 3*time.Second {
+		bound = 3 * time.Second
+	}
 	start := time.Now()
 	err := fn()
 	elapsed := time.Since(start)
