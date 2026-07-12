@@ -2,9 +2,11 @@ package avro_test
 
 import (
 	"bytes"
+	"math/big"
 	"reflect"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/twmb/avro"
 )
@@ -362,6 +364,74 @@ var featureWalkerRows = []featureWalkerRow{
 // broadest WithLaxNames contract: every component string — including the
 // empty string — passes through verbatim.
 var laxAcceptAll = []avro.SchemaOpt{avro.WithLaxNames(func(string) error { return nil })}
+
+// fwTime is a millisecond-precision instant every timestamp-millis row
+// encodes; millisecond precision means the round trip is lossless, so
+// cross-spelling decode comparisons see the identical instant.
+var fwTime = time.Date(2021, 3, 4, 5, 6, 7, 891_000_000, time.UTC)
+
+func init() {
+	featureWalkerRows = append(featureWalkerRows, featureWalkerLiftRows...)
+}
+
+// The three supported field-level logicalType lift shapes: a field-level
+// logicalType annotation (plus precision/scale for decimal) whose type is a
+// primitive STRING form, a union STRING form (first non-null branch), or a
+// SINGLE OBJECT without its own annotation, is lifted into the type
+// definition at parse. Twins spell the canonical nested form. The lift
+// happens in the wire parser, so the LIFTED schema (logical effective)
+// reaches the codec, canonical form, resolution, and SOE walkers, while the
+// AS-WRITTEN field-level spelling survives in the schema text that String()
+// and the Root() metadata tree re-consume — both sides of that split must
+// keep describing the same wire behavior as the nested twin. Sample values
+// (time.Time / *big.Rat) encode only if the logical is EFFECTIVE, so every
+// encode-bearing cell dies if the lift is dropped.
+var featureWalkerLiftRows = []featureWalkerRow{
+	{
+		// Shape 1: primitive string form. No reference can appear inside
+		// the lifted subtree (the shape wraps a primitive by definition)
+		// and no named type can be defined there — both cache directions
+		// are skipped as structurally inapplicable.
+		name:    "lift-logical-primitive-form",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"ts","type":"long","logicalType":"timestamp-millis"},{"name":"w","type":"int"}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},{"name":"w","type":"int"}]}`,
+		sample:  map[string]any{"ts": fwTime, "w": int32(1)},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},{"name":"w","type":"int"},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"ts": fwTime, "w": int32(1), "pad": int32(5)},
+	},
+	{
+		// Shape 2: union string form — the lift lands on the first
+		// non-null branch. Cache directions skipped as in shape 1.
+		name:    "lift-logical-union-string-form",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"},{"name":"w","type":"int"}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]},{"name":"w","type":"int"}]}`,
+		sample:  map[string]any{"ts": fwTime, "w": int32(1)},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]},{"name":"w","type":"int"},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"ts": fwTime, "w": int32(1), "pad": int32(5)},
+	},
+	{
+		// Shape 3: single-object form, with the decimal precision/scale
+		// pair riding the lift. The main pair lifts onto bytes; the cache
+		// DEFINITION direction lifts onto a NAMED fixed, so the collected
+		// definition and its later splice must carry the lifted logical
+		// identically to the nested twin. No reference position exists
+		// inside the lifted subtree (skip documented).
+		name:    "lift-logical-object-form",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"px","type":{"type":"bytes"},"logicalType":"decimal","precision":6,"scale":2},{"name":"w","type":"int"}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"px","type":{"type":"bytes","logicalType":"decimal","precision":6,"scale":2}},{"name":"w","type":"int"}]}`,
+		sample:  map[string]any{"px": big.NewRat(1234, 100), "w": int32(1)},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"px","type":{"type":"bytes","logicalType":"decimal","precision":6,"scale":2}},{"name":"w","type":"int"},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"px": big.NewRat(1234, 100), "w": int32(1), "pad": int32(5)},
+
+		defFeature:      `{"type":"record","name":"ns.H9","fields":[{"name":"px","type":{"type":"fixed","name":"DF9","size":4},"logicalType":"decimal","precision":6,"scale":2}]}`,
+		defTwin:         `{"type":"record","name":"ns.H9","fields":[{"name":"px","type":{"type":"fixed","name":"DF9","size":4,"logicalType":"decimal","precision":6,"scale":2}}]}`,
+		defFollow:       `{"type":"record","name":"ns.F9","fields":[{"name":"d","type":"DF9"}]}`,
+		defFollowSample: map[string]any{"d": big.NewRat(1234, 100)},
+	},
+}
 
 // fwParse parses a schema with the row's opts, failing the test on error.
 func fwParse(t *testing.T, schema string, row featureWalkerRow, extra ...avro.SchemaOpt) *avro.Schema {
