@@ -240,7 +240,128 @@ var featureWalkerRows = []featureWalkerRow{
 		defFollow:       `{"type":"record","name":"ns.F8","fields":[{"name":"d","type":"D8"}]}`,
 		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
 	},
+
+	// ─── Lax names ───
+	//
+	// Names only a WithLaxNames user fn accepts: an empty namespace
+	// component, the bare empty name, a trailing-dot fullname (empty final
+	// component), and characters outside the strict grammar. There is no
+	// strict spelling of these schemas; each row's twin is instead the SAME
+	// fullname spelled the other way the grammar allows — split
+	// name+namespace attributes vs the inline dotted fullname (for the bare
+	// empty name: omitted namespace vs the explicit-empty-namespace escape).
+	// Both spellings resolve to one fullname, so parity here exercises the
+	// name split/join and namespace-inheritance logic of every walker on
+	// name components the strict grammar never produces. The names survive
+	// parse verbatim (validation never transforms them) and reach every
+	// walker: canonical emission, String() re-parse, the Root() tree and its
+	// rebuild, cache collection/splicing, resolution's name matching, and
+	// SOE fingerprints.
+	{
+		// Empty namespace COMPONENT (ns "a..b"), recursive: the self
+		// reference "a..b.R" exercises the second-occurrence reference
+		// path through every walker, not just the definition path.
+		name:    "lax-ns-empty-component",
+		opts:    laxAcceptAll,
+		feature: `{"type":"record","name":"R","namespace":"a..b","fields":[{"name":"x","type":"int"},{"name":"next","type":["null","a..b.R"]}]}`,
+		twin:    `{"type":"record","name":"a..b.R","fields":[{"name":"x","type":"int"},{"name":"next","type":["null","a..b.R"]}]}`,
+		sample:  map[string]any{"x": int32(7), "next": map[string]any{"x": int32(8), "next": nil}},
+
+		resolveAgainst: `{"type":"record","name":"a..b.R","fields":[{"name":"x","type":"int"},{"name":"next","type":["null","a..b.R"]},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"x": int32(7), "next": nil, "pad": int32(5)},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"R","namespace":"a..b","fields":[{"name":"e","type":"ns.Elem"}]}`,
+		refTwin:    `{"type":"record","name":"a..b.R","fields":[{"name":"e","type":"ns.Elem"}]}`,
+		refSample:  map[string]any{"e": map[string]any{"x": int32(1)}},
+
+		defFeature:      `{"type":"record","name":"H","namespace":"a..b","fields":[{"name":"d","type":{"type":"record","name":"DL1","namespace":"nsd","fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"a..b.H","fields":[{"name":"d","type":{"type":"record","name":"DL1","namespace":"nsd","fields":[{"name":"x","type":"int"}]}}]}`,
+		defFollow:       `{"type":"record","name":"ns.F","fields":[{"name":"d","type":"nsd.DL1"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
+	{
+		// Bare empty name at root (fullname ""). Twin: the explicit
+		// empty-namespace escape, the one other spelling of fullname "".
+		// No self/cross reference to "" is possible — the "" REFERENCE
+		// spelling is structurally rejected (documented divergence from
+		// fastavro), so the ref/def directions use ordinary names around
+		// and inside the empty-named container instead.
+		name:    "lax-empty-name",
+		opts:    laxAcceptAll,
+		feature: `{"type":"record","name":"","fields":[{"name":"x","type":"int"}]}`,
+		twin:    `{"type":"record","name":"","namespace":"","fields":[{"name":"x","type":"int"}]}`,
+		sample:  map[string]any{"x": int32(7)},
+
+		resolveAgainst: `{"type":"record","name":"","fields":[{"name":"x","type":"int"},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"x": int32(7), "pad": int32(5)},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"","fields":[{"name":"e","type":"ns.Elem"}]}`,
+		refTwin:    `{"type":"record","name":"","namespace":"","fields":[{"name":"e","type":"ns.Elem"}]}`,
+		refSample:  map[string]any{"e": map[string]any{"x": int32(1)}},
+
+		defFeature:      `{"type":"record","name":"","fields":[{"name":"d","type":{"type":"record","name":"nsd.DL2","fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"","namespace":"","fields":[{"name":"d","type":{"type":"record","name":"nsd.DL2","fields":[{"name":"x","type":"int"}]}}]}`,
+		defFollow:       `{"type":"record","name":"ns.F","fields":[{"name":"d","type":"nsd.DL2"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
+	{
+		// Trailing-dot fullname "ok." — namespace "ok", EMPTY final name
+		// component. Twin: the split spelling (name "", namespace "ok").
+		// Recursive via the "ok." self reference (the dotted reference
+		// spelling is accepted; only the bare "" reference is not).
+		name:    "lax-trailing-dot-name",
+		opts:    laxAcceptAll,
+		feature: `{"type":"record","name":"ok.","fields":[{"name":"x","type":"int"},{"name":"next","type":["null","ok."]}]}`,
+		twin:    `{"type":"record","name":"","namespace":"ok","fields":[{"name":"x","type":"int"},{"name":"next","type":["null","ok."]}]}`,
+		sample:  map[string]any{"x": int32(7), "next": map[string]any{"x": int32(8), "next": nil}},
+
+		resolveAgainst: `{"type":"record","name":"ok.","fields":[{"name":"x","type":"int"},{"name":"next","type":["null","ok."]},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"x": int32(7), "next": nil, "pad": int32(5)},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"ok.","fields":[{"name":"e","type":"ns.Elem"}]}`,
+		refTwin:    `{"type":"record","name":"","namespace":"ok","fields":[{"name":"e","type":"ns.Elem"}]}`,
+		refSample:  map[string]any{"e": map[string]any{"x": int32(1)}},
+
+		defFeature:      `{"type":"record","name":"okh.","fields":[{"name":"d","type":{"type":"record","name":"nsd.DL3","fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"","namespace":"okh","fields":[{"name":"d","type":{"type":"record","name":"nsd.DL3","fields":[{"name":"x","type":"int"}]}}]}`,
+		defFollow:       `{"type":"record","name":"ns.F","fields":[{"name":"d","type":"nsd.DL3"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
+	{
+		// Characters outside the strict grammar (space, '!'), in a DIAMOND:
+		// field a defines "my ns.we!rd", field b references it again, so
+		// the weird name travels the reference path as well as the
+		// definition path. Feature spells the definition split and the
+		// re-reference bare-short (in-scope binding); the twin spells the
+		// definition inline-dotted and the re-reference fully qualified.
+		name:    "lax-weird-chars",
+		opts:    laxAcceptAll,
+		feature: `{"type":"record","name":"Top","namespace":"my ns","fields":[{"name":"a","type":{"type":"record","name":"we!rd","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"we!rd"}]}`,
+		twin:    `{"type":"record","name":"my ns.Top","fields":[{"name":"a","type":{"type":"record","name":"my ns.we!rd","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"my ns.we!rd"}]}`,
+		sample:  map[string]any{"a": map[string]any{"x": int32(7)}, "b": map[string]any{"x": int32(8)}},
+
+		resolveAgainst: `{"type":"record","name":"my ns.Top","fields":[{"name":"a","type":{"type":"record","name":"my ns.we!rd","fields":[{"name":"x","type":"int"},{"name":"pad","type":"int","default":5}]}},{"name":"b","type":"my ns.we!rd"}]}`,
+		resolveSample:  map[string]any{"a": map[string]any{"x": int32(7), "pad": int32(5)}, "b": map[string]any{"x": int32(8), "pad": int32(5)}},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"Top","namespace":"my ns","fields":[{"name":"e","type":"ns.Elem"}]}`,
+		refTwin:    `{"type":"record","name":"my ns.Top","fields":[{"name":"e","type":"ns.Elem"}]}`,
+		refSample:  map[string]any{"e": map[string]any{"x": int32(1)}},
+
+		defFeature:      `{"type":"record","name":"H","namespace":"my ns","fields":[{"name":"d","type":{"type":"record","name":"DL4","namespace":"nsd","fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"my ns.H","fields":[{"name":"d","type":{"type":"record","name":"DL4","namespace":"nsd","fields":[{"name":"x","type":"int"}]}}]}`,
+		defFollow:       `{"type":"record","name":"ns.F","fields":[{"name":"d","type":"nsd.DL4"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
 }
+
+// laxAcceptAll parses names under an accept-everything user validator, the
+// broadest WithLaxNames contract: every component string — including the
+// empty string — passes through verbatim.
+var laxAcceptAll = []avro.SchemaOpt{avro.WithLaxNames(func(string) error { return nil })}
 
 // fwParse parses a schema with the row's opts, failing the test on error.
 func fwParse(t *testing.T, schema string, row featureWalkerRow, extra ...avro.SchemaOpt) *avro.Schema {
