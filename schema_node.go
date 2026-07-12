@@ -999,7 +999,7 @@ func jsonNumericInt(v any) (int, bool) {
 
 // getCIString assigns *dst to m[key] when present and string-typed.
 // Mirrors the lookupCI + type-assert pattern repeated ~6 times in
-// nodeFromJSONObject and its inner field loop.
+// nodeFromJSONObject and metadataField.
 func getCIString(m map[string]any, key string, dst *string) {
 	if v, ok := lookupCI(m, key); ok {
 		if s, ok := v.(string); ok {
