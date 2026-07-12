@@ -373,6 +373,91 @@ var fwTime = time.Date(2021, 3, 4, 5, 6, 7, 891_000_000, time.UTC)
 func init() {
 	featureWalkerRows = append(featureWalkerRows, featureWalkerLiftRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerCaseKeyRows...)
+	featureWalkerRows = append(featureWalkerRows, featureWalkerRefFormRows...)
+}
+
+// Name-reference FORMS: the wrapped-object reference spelling
+// ({"type":"X"}, accepted where fastavro/hamba reject) and forward
+// references (a reference textually preceding its definition). The parsed
+// schema resolves every reference to the same named type either way; the
+// AS-WRITTEN reference/definition positions survive in the text String(),
+// Root(), and the cache splice re-consume, and the canonical form must
+// re-home each definition to its first-occurrence position identically for
+// both spellings. Rows are deliberately multi-occurrence (diamond) or
+// recursive so the second-occurrence reference path is crossed, not just
+// the definition path.
+var featureWalkerRefFormRows = []featureWalkerRow{
+	{
+		// Wrapped BACKWARD reference: field b re-references the type
+		// field a defined, spelled {"type":"WB"} vs the bare "WB" twin.
+		// The cache-ref direction wraps a CROSS-PARSE reference to a
+		// cached type, so the splice walker must resolve the wrapped
+		// spelling too.
+		name:    "wrapped-backward-ref",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"record","name":"WB","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":{"type":"WB"}}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"record","name":"WB","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"WB"}]}`,
+		sample:  map[string]any{"a": map[string]any{"x": int32(7)}, "b": map[string]any{"x": int32(8)}},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"record","name":"WB","fields":[{"name":"x","type":"int"},{"name":"pad","type":"int","default":5}]}},{"name":"b","type":"WB"}]}`,
+		resolveSample:  map[string]any{"a": map[string]any{"x": int32(7), "pad": int32(5)}, "b": map[string]any{"x": int32(8), "pad": int32(5)}},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"ns.Top","fields":[{"name":"e","type":{"type":"Elem"}}]}`,
+		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"e","type":"Elem"}]}`,
+		refSample:  map[string]any{"e": map[string]any{"x": int32(1)}},
+
+		defFeature:      `{"type":"record","name":"ns.HC","fields":[{"name":"a","type":{"type":"record","name":"DC","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":{"type":"DC"}}]}`,
+		defTwin:         `{"type":"record","name":"ns.HC","fields":[{"name":"a","type":{"type":"record","name":"DC","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"DC"}]}`,
+		defFollow:       `{"type":"record","name":"ns.FC","fields":[{"name":"d","type":"DC"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
+	{
+		// Bare FORWARD reference in a diamond: field a references FR
+		// before field b defines it, field c references it again after.
+		// The twin defines at first use. Canonical form must re-home the
+		// definition to field a (first occurrence) for BOTH spellings —
+		// the position-dependent inlining is exactly where a walker that
+		// re-derives the parser's resolution can drift.
+		name:    "forward-ref-diamond",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":"FR"},{"name":"b","type":{"type":"record","name":"FR","fields":[{"name":"x","type":"int"}]}},{"name":"c","type":"FR"}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"record","name":"FR","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"FR"},{"name":"c","type":"FR"}]}`,
+		sample:  map[string]any{"a": map[string]any{"x": int32(1)}, "b": map[string]any{"x": int32(2)}, "c": map[string]any{"x": int32(3)}},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"record","name":"FR","fields":[{"name":"x","type":"int"},{"name":"pad","type":"int","default":5}]}},{"name":"b","type":"FR"},{"name":"c","type":"FR"}]}`,
+		resolveSample:  map[string]any{"a": map[string]any{"x": int32(1), "pad": int32(5)}, "b": map[string]any{"x": int32(2), "pad": int32(5)}, "c": map[string]any{"x": int32(3), "pad": int32(5)}},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":"FR2"},{"name":"b","type":{"type":"record","name":"FR2","fields":[{"name":"e","type":"Elem"}]}}]}`,
+		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"record","name":"FR2","fields":[{"name":"e","type":"Elem"}]}},{"name":"b","type":"FR2"}]}`,
+		refSample:  map[string]any{"a": map[string]any{"e": map[string]any{"x": int32(1)}}, "b": map[string]any{"e": map[string]any{"x": int32(1)}}},
+
+		defFeature:      `{"type":"record","name":"ns.HD","fields":[{"name":"a","type":"FR3"},{"name":"b","type":{"type":"record","name":"FR3","fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"ns.HD","fields":[{"name":"a","type":{"type":"record","name":"FR3","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"FR3"}]}`,
+		defFollow:       `{"type":"record","name":"ns.FD","fields":[{"name":"d","type":"FR3"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
+	{
+		// Wrapped FORWARD reference, recursive: field a holds
+		// {"type":"WF"} before WF exists, and WF's own definition closes
+		// the loop with a wrapped SELF-reference inside a null union.
+		name:    "wrapped-forward-ref-recursive",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"WF"}},{"name":"b","type":{"type":"record","name":"WF","fields":[{"name":"x","type":"int"},{"name":"next","type":["null",{"type":"WF"}]}]}}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"record","name":"WF","fields":[{"name":"x","type":"int"},{"name":"next","type":["null","WF"]}]}},{"name":"b","type":"WF"}]}`,
+		sample:  map[string]any{"a": map[string]any{"x": int32(1), "next": nil}, "b": map[string]any{"x": int32(2), "next": map[string]any{"x": int32(3), "next": nil}}},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"record","name":"WF","fields":[{"name":"x","type":"int"},{"name":"next","type":["null","WF"]},{"name":"pad","type":"int","default":5}]}},{"name":"b","type":"WF"}]}`,
+		resolveSample:  map[string]any{"a": map[string]any{"x": int32(1), "next": nil, "pad": int32(5)}, "b": map[string]any{"x": int32(2), "next": nil, "pad": int32(5)}},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"WF2"}},{"name":"b","type":{"type":"record","name":"WF2","fields":[{"name":"e","type":"Elem"}]}}]}`,
+		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":{"type":"record","name":"WF2","fields":[{"name":"e","type":"Elem"}]}},{"name":"b","type":"WF2"}]}`,
+		refSample:  map[string]any{"a": map[string]any{"e": map[string]any{"x": int32(1)}}, "b": map[string]any{"e": map[string]any{"x": int32(1)}}},
+
+		defFeature:      `{"type":"record","name":"ns.HE","fields":[{"name":"a","type":{"type":"WF3"}},{"name":"b","type":{"type":"record","name":"WF3","fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"ns.HE","fields":[{"name":"a","type":{"type":"record","name":"WF3","fields":[{"name":"x","type":"int"}]}},{"name":"b","type":"WF3"}]}`,
+		defFollow:       `{"type":"record","name":"ns.FE","fields":[{"name":"d","type":"WF3"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
 }
 
 // Reserved Avro attribute keys spelled in non-canonical ASCII case ("tYpe",
