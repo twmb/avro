@@ -377,6 +377,38 @@ func init() {
 	featureWalkerRows = append(featureWalkerRows, featureWalkerAliasRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerDegenerateRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerDupKeyRows...)
+	featureWalkerRows = append(featureWalkerRows, featureWalkerImplicitNullRows...)
+}
+
+// Implicit null default: a ["null", T] union field with NO explicit default
+// implicitly defaults to null (a twmb ergonomic beyond Java/fastavro). The
+// twin spells "default": null explicitly — the same logical schema here.
+// The sample OMITS the field, so the synthesized default must drive the
+// encoder's auto-fill byte-identically to the explicit twin on every
+// encode-bearing driver, and the resolve variant LACKS the field entirely,
+// so reader-side resolution must fill it from the synthesized default. The
+// cache directions cross the synthesis with a null union whose branch is a
+// cross-parse REFERENCE and with one holding an inline DEFINITION.
+var featureWalkerImplicitNullRows = []featureWalkerRow{
+	{
+		name:    "implicit-null-default",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"o","type":["null","int"]},{"name":"w","type":"int"}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"o","type":["null","int"],"default":null},{"name":"w","type":"int"}]}`,
+		sample:  map[string]any{"w": int32(1)},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"w","type":"int"},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"w": int32(1), "pad": int32(5)},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"ns.Top","fields":[{"name":"o","type":["null","Elem"]},{"name":"w","type":"int"}]}`,
+		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"o","type":["null","Elem"],"default":null},{"name":"w","type":"int"}]}`,
+		refSample:  map[string]any{"w": int32(1)},
+
+		defFeature:      `{"type":"record","name":"ns.HK","fields":[{"name":"o","type":["null",{"type":"record","name":"DK","fields":[{"name":"x","type":"int"}]}]}]}`,
+		defTwin:         `{"type":"record","name":"ns.HK","fields":[{"name":"o","type":["null",{"type":"record","name":"DK","fields":[{"name":"x","type":"int"}]}],"default":null}]}`,
+		defFollow:       `{"type":"record","name":"ns.FK","fields":[{"name":"d","type":"DK"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
 }
 
 // Duplicate JSON keys in the SCHEMA document: the last occurrence wins
