@@ -116,6 +116,117 @@ func TestRegression_SchemaCacheSelfContainedFlatFormDef(t *testing.T) {
 	assertSelfContained(t, viaCache, inline, map[string]any{"x": "B"})
 }
 
+// A flat ("linkedin/goavro") field can also carry an UNNAMED complex kind:
+// {"name":"a","type":"array","items":...} puts the element type in the
+// field's own "items" key, and the wire parser lifts it exactly like the
+// named flat kinds (flatFieldNeedsLift covers all six complex kinds). A
+// cross-parse reference inside those items resolves against the cache and
+// the wire codec works, so the self-containment walkers must splice the
+// same subtree — otherwise the JSON-derived forms keep a dangling bare
+// reference: Canonical()/String() fail to re-parse and the fingerprint
+// diverges from the logically-identical schema (SOE/registry interop
+// break). The nested-spelling twin of the same reference is the control.
+func TestRegression_FlatArrayFieldCrossParseRefSplices(t *testing.T) {
+	const itemDef = `{"type":"record","name":"ns.Item","fields":[{"name":"x","type":"int"}]}`
+	inline := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"list","type":"array","items":` + itemDef + `}]}`)
+	val := map[string]any{"list": []any{map[string]any{"x": int32(1)}}}
+
+	t.Run("nested-twin-control", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(itemDef); err != nil {
+			t.Fatalf("register Item: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"list","type":{"type":"array","items":"ns.Item"}}]}`)
+		if err != nil {
+			t.Fatalf("nested-spelling parse via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+
+	t.Run("flat", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(itemDef); err != nil {
+			t.Fatalf("register Item: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"list","type":"array","items":"ns.Item"}]}`)
+		if err != nil {
+			t.Fatalf("flat-spelling parse via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+}
+
+// The map twin of the flat-array cross-parse reference, with the reference
+// spelled by SHORT name: the lift drops name/namespace keys for unnamed
+// kinds (flatLiftTypeMap), so a flat field's items/values sit directly in
+// the RECORD's namespace scope and a short reference resolves there. The
+// splice walkers must bind the reference in that same scope.
+func TestRegression_FlatMapFieldCrossParseRefSplices(t *testing.T) {
+	const itemDef = `{"type":"record","name":"ns.Item","fields":[{"name":"x","type":"int"}]}`
+	inline := avro.MustParse(`{"type":"record","name":"ns.R","fields":[{"name":"m","type":"map","values":` + itemDef + `}]}`)
+	val := map[string]any{"m": map[string]any{"k": map[string]any{"x": int32(2)}}}
+
+	t.Run("nested-twin-control", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(itemDef); err != nil {
+			t.Fatalf("register Item: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"ns.R","fields":[{"name":"m","type":{"type":"map","values":"Item"}}]}`)
+		if err != nil {
+			t.Fatalf("nested-spelling parse via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+
+	t.Run("flat", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(itemDef); err != nil {
+			t.Fatalf("register Item: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"ns.R","fields":[{"name":"m","type":"map","values":"Item"}]}`)
+		if err != nil {
+			t.Fatalf("flat-spelling parse via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+}
+
+// The definition direction of the flat array/map subtree: a named type
+// DEFINED inside a flat array field's items is lifted and registered by the
+// wire parser (later parses can reference it), so the collection walker
+// must also capture its definition — otherwise a later referencing parse
+// resolves on the wire but never splices, leaving its JSON-derived forms
+// dangling. The nested-spelling twin of the same definition is the control.
+func TestRegression_FlatArrayFieldInlineDefCollected(t *testing.T) {
+	const dDef = `{"type":"record","name":"ns.D","fields":[{"name":"x","type":"int"}]}`
+	inline := avro.MustParse(`{"type":"record","name":"R2","fields":[{"name":"d","type":` + dDef + `}]}`)
+	val := map[string]any{"d": map[string]any{"x": int32(3)}}
+
+	t.Run("nested-twin-control", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":"H","fields":[{"name":"list","type":{"type":"array","items":` + dDef + `}}]}`); err != nil {
+			t.Fatalf("register nested-spelling def: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"R2","fields":[{"name":"d","type":"ns.D"}]}`)
+		if err != nil {
+			t.Fatalf("reference ns.D via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+
+	t.Run("flat", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":"H","fields":[{"name":"list","type":"array","items":` + dDef + `}]}`); err != nil {
+			t.Fatalf("register flat-spelling def: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"R2","fields":[{"name":"d","type":"ns.D"}]}`)
+		if err != nil {
+			t.Fatalf("reference ns.D via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+}
+
 // Sibling of the flat-form case: a prior definition written with a
 // case-variant object key (e.g. "tYpe", accepted by the parser's lookupCI)
 // must also be collected so the cross-parse reference self-contains.

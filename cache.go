@@ -311,8 +311,11 @@ func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
 // collectTreeDefs calls visit for every named-type definition in the tree, with
 // its resolved fullname and sub-tree, tracking namespace scope. It mirrors the
 // parser EXACTLY: object keys are read case-insensitively (lookupCI), and a
-// flat-form ("linkedin/goavro") field whose own keys define a named type is
-// itself a definition (the parser lifts it via liftFlatFieldType).
+// flat-form ("linkedin/goavro") field is walked as its lifted type object —
+// the lift decision and key routing are the parser's own flatFieldNeedsLift /
+// flatLiftTypeMap, so a named type defined by the field (record/error/enum/
+// fixed) or inside the field's items/values (array/map) is collected exactly
+// where the parser registers it.
 func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) {
 	switch v := node.(type) {
 	case []any:
@@ -337,11 +340,11 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 					if !ok {
 						continue
 					}
-					if lifted, ok := flatFieldNamedDef(fo); ok {
-						collectTreeDefs(lifted, childNS, visit)
-						continue
-					}
 					if t, ok := lookupCI(fo, "type"); ok {
+						if ts, isStr := t.(string); isStr && flatFieldNeedsLift(fo, ts) {
+							collectTreeDefs(flatLiftTypeMap(fo, ts), childNS, visit)
+							continue
+						}
 						collectTreeDefs(t, childNS, visit)
 					}
 				}
@@ -354,45 +357,6 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 			collectTreeDefs(vv, childNS, visit)
 		}
 	}
-}
-
-// flatFieldNamedDef reports whether fo is a flat-form ("linkedin/goavro")
-// field that itself defines a NAMED type — its "type" names a named kind
-// (record/error/enum/fixed) and that kind's defining key (fields/symbols/
-// size) sits inline — and if so returns the lifted type object with field-
-// only keys dropped, mirroring the parser's liftFlatFieldType. Only named
-// kinds are referenceable across parses; flat array/map fields define no name.
-func flatFieldNamedDef(fo map[string]any) (map[string]any, bool) {
-	tv, ok := lookupCI(fo, "type")
-	if !ok {
-		return nil, false
-	}
-	ts, ok := tv.(string)
-	if !ok || !isNamedKind(ts) {
-		return nil, false
-	}
-	var defKey string
-	switch ts {
-	case "record", "error":
-		defKey = "fields"
-	case "enum":
-		defKey = "symbols"
-	case "fixed":
-		defKey = "size"
-	}
-	if _, ok := lookupCI(fo, defKey); !ok {
-		return nil, false
-	}
-	lifted := make(map[string]any, len(fo))
-	for k, val := range fo {
-		switch {
-		case strings.EqualFold(k, "default"), strings.EqualFold(k, "order"), strings.EqualFold(k, "aliases"):
-			// Field-only keys, not part of the type definition.
-		default:
-			lifted[k] = val
-		}
-	}
-	return lifted, true
 }
 
 // ciKey returns the key actually present in m matching key case-insensitively
@@ -533,10 +497,12 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 
 // inlineNodeContainers splices inherited refs in a node's record-fields,
 // array-items, and map-values positions (all inside the node's own namespace
-// scope). A flat-form ("linkedin/goavro") field defines its named type via the
-// field's own structural keys, so its inline subtree is recursed directly
-// rather than through a "type" value. Keys are read case-insensitively and
-// written back to the present key, mirroring the parser and collectTreeDefs.
+// scope). A flat-form ("linkedin/goavro") field carries its type's structural
+// keys inline, so its subtree is recursed directly rather than through a
+// "type" value — gated on the parser's own flatFieldNeedsLift so the splice
+// walks exactly the fields the parser lifts. Keys are read case-insensitively
+// and written back to the present key, mirroring the parser and
+// collectTreeDefs.
 func inlineNodeContainers(v map[string]any, ns string, defs map[string]any, seen, inlined map[string]bool) {
 	if fk, ok := ciKey(v, "fields"); ok {
 		if fs, ok := v[fk].([]any); ok {
@@ -545,24 +511,39 @@ func inlineNodeContainers(v map[string]any, ns string, defs map[string]any, seen
 				if !ok {
 					continue
 				}
-				if _, isFlat := flatFieldNamedDef(fo); isFlat {
-					// The flat field is itself a named type opening its own
-					// namespace; recurse its structural keys for transitive
-					// refs (its "type" is a bare kind string, not a reference).
-					// A flat definition of an already-defined name is the same
-					// duplicate-definition case as inlineTreeDefs's map arm,
-					// but a field object cannot be replaced by a bare string —
-					// rewrite it to the equivalent normal-form reference field.
-					if nodeHasStringName(fo) {
-						fullname := nodeFullnameTree(fo, ns)
-						if ref, ok := dupDefRef(fullname, ns, seen); ok {
-							rewriteFlatFieldToRef(fo, ref)
+				if tv, ok := lookupCI(fo, "type"); ok {
+					if ts, isStr := tv.(string); isStr && flatFieldNeedsLift(fo, ts) {
+						if isNamedKind(ts) {
+							// The flat field is itself a named type opening its
+							// own namespace; recurse its structural keys for
+							// transitive refs (its "type" is a bare kind string,
+							// not a reference). A flat definition of an
+							// already-defined name is the same duplicate-
+							// definition case as inlineTreeDefs's map arm, but a
+							// field object cannot be replaced by a bare string —
+							// rewrite it to the equivalent normal-form reference
+							// field.
+							if nodeHasStringName(fo) {
+								fullname := nodeFullnameTree(fo, ns)
+								if ref, ok := dupDefRef(fullname, ns, seen); ok {
+									rewriteFlatFieldToRef(fo, ref)
+									continue
+								}
+								seen[fullname] = true
+							}
+							inlineNodeContainers(fo, nodeNamespace(fo, ns), defs, seen, inlined)
 							continue
 						}
-						seen[fullname] = true
+						// Flat array/map: the lift drops name/namespace keys for
+						// unnamed kinds (flatLiftTypeMap), so the field's items/
+						// values sit directly in the RECORD's namespace scope —
+						// splice there, keeping the flat spelling in place. A
+						// flat field carrying a structural key of a DIFFERENT
+						// kind never reaches here: the lift keeps the stray key
+						// and the per-kind build rejects it, failing the parse.
+						inlineNodeContainers(fo, ns, defs, seen, inlined)
+						continue
 					}
-					inlineNodeContainers(fo, nodeNamespace(fo, ns), defs, seen, inlined)
-					continue
 				}
 				if ftk, ok := ciKey(fo, "type"); ok {
 					fo[ftk] = inlineTreeDefs(fo[ftk], ns, defs, seen, inlined)
