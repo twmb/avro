@@ -457,7 +457,6 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 				}
 			}
 		}
-		childNS := nodeNamespace(v, ns)
 		// Register this node's own name BEFORE walking its children, mirroring
 		// the parser's early self-registration (a type is in scope for its own
 		// descendants). A later sibling/descendant reference then sees it; an
@@ -484,79 +483,55 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 				seen[fullname] = true
 			}
 		}
-		// A node's own "type" value sits at the enclosing namespace; its
-		// fields/items/values sit inside the node's own namespace scope.
-		if tk, ok := ciKey(v, "type"); ok {
-			v[tk] = inlineTreeDefs(v[tk], ns, defs, seen, inlined)
-		}
-		inlineNodeContainers(v, childNS, defs, seen, inlined)
+		inlineNodeChildren(v, ns, defs, seen, inlined)
 		return v
 	}
 	return node
 }
 
-// inlineNodeContainers splices inherited refs in a node's record-fields,
-// array-items, and map-values positions (all inside the node's own namespace
-// scope). A flat-form ("linkedin/goavro") field carries its type's structural
-// keys inline, so its subtree is recursed directly rather than through a
-// "type" value — gated on the parser's own flatFieldNeedsLift so the splice
-// walks exactly the fields the parser lifts. Keys are read case-insensitively
-// and written back to the present key, mirroring the parser and
-// collectTreeDefs.
-func inlineNodeContainers(v map[string]any, ns string, defs map[string]any, seen, inlined map[string]bool) {
-	if fk, ok := ciKey(v, "fields"); ok {
-		if fs, ok := v[fk].([]any); ok {
-			for _, f := range fs {
-				fo, ok := f.(map[string]any)
-				if !ok {
-					continue
+// inlineNodeChildren splices inherited refs in v's child-schema positions
+// via walkNodeChildren: the node's own "type" value (a bare reference there
+// resolves in the ENCLOSING scope — see nodeChildVisitor.typeValue), each
+// record field's type, and array items / map values (the node's own child
+// scope). A flat-form ("linkedin/goavro") field is recursed IN PLACE: the
+// field object itself carries the lifted type's structural keys, so the
+// splice walks exactly the children the parser lifts while mutations land
+// in the original tree (its "type" value is a bare kind string, never a
+// reference, so the typeValue splice leaves it as-is). A flat NAMED field
+// opens its own namespace scope
+// (nodeChildScope on the field object, whose "type" is the lifted kind)
+// and, when it re-defines an already-seen name, is rewritten to the
+// equivalent normal-form reference field — the same duplicate-definition
+// case as inlineTreeDefs's map arm, but a field object cannot be replaced
+// by a bare string. A flat UNNAMED field (array/map) keeps the enclosing
+// record's scope: the lift drops name/namespace keys for unnamed kinds
+// (flatLiftTypeMap), so its items/values sit directly in the RECORD's
+// namespace scope. A flat field carrying a structural key of a DIFFERENT
+// kind never reaches here: the lift keeps the stray key and the per-kind
+// build rejects it, failing the parse.
+func inlineNodeChildren(v map[string]any, ns string, defs map[string]any, seen, inlined map[string]bool) {
+	spliceAt := func(key, scope string) {
+		v[key] = inlineTreeDefs(v[key], scope, defs, seen, inlined)
+	}
+	walkNodeChildren(v, ns, nodeChildScope(v, ns), nodeChildVisitor{
+		typeValue: spliceAt,
+		field: func(_ int, fo map[string]any, typeKey, scope string) {
+			fo[typeKey] = inlineTreeDefs(fo[typeKey], scope, defs, seen, inlined)
+		},
+		flatField: func(_ int, fo map[string]any, kind, scope string) {
+			if isNamedKind(kind) && nodeHasStringName(fo) {
+				fullname := nodeFullnameTree(fo, scope)
+				if ref, ok := dupDefRef(fullname, scope, seen); ok {
+					rewriteFlatFieldToRef(fo, ref)
+					return
 				}
-				if tv, ok := lookupCI(fo, "type"); ok {
-					if ts, isStr := tv.(string); isStr && flatFieldNeedsLift(fo, ts) {
-						if isNamedKind(ts) {
-							// The flat field is itself a named type opening its
-							// own namespace; recurse its structural keys for
-							// transitive refs (its "type" is a bare kind string,
-							// not a reference). A flat definition of an
-							// already-defined name is the same duplicate-
-							// definition case as inlineTreeDefs's map arm, but a
-							// field object cannot be replaced by a bare string —
-							// rewrite it to the equivalent normal-form reference
-							// field.
-							if nodeHasStringName(fo) {
-								fullname := nodeFullnameTree(fo, ns)
-								if ref, ok := dupDefRef(fullname, ns, seen); ok {
-									rewriteFlatFieldToRef(fo, ref)
-									continue
-								}
-								seen[fullname] = true
-							}
-							inlineNodeContainers(fo, nodeNamespace(fo, ns), defs, seen, inlined)
-							continue
-						}
-						// Flat array/map: the lift drops name/namespace keys for
-						// unnamed kinds (flatLiftTypeMap), so the field's items/
-						// values sit directly in the RECORD's namespace scope —
-						// splice there, keeping the flat spelling in place. A
-						// flat field carrying a structural key of a DIFFERENT
-						// kind never reaches here: the lift keeps the stray key
-						// and the per-kind build rejects it, failing the parse.
-						inlineNodeContainers(fo, ns, defs, seen, inlined)
-						continue
-					}
-				}
-				if ftk, ok := ciKey(fo, "type"); ok {
-					fo[ftk] = inlineTreeDefs(fo[ftk], ns, defs, seen, inlined)
-				}
+				seen[fullname] = true
 			}
-		}
-	}
-	if ik, ok := ciKey(v, "items"); ok {
-		v[ik] = inlineTreeDefs(v[ik], ns, defs, seen, inlined)
-	}
-	if vk, ok := ciKey(v, "values"); ok {
-		v[vk] = inlineTreeDefs(v[vk], ns, defs, seen, inlined)
-	}
+			inlineNodeChildren(fo, scope, defs, seen, inlined)
+		},
+		items:  spliceAt,
+		values: spliceAt,
+	})
 }
 
 // nodeHasStringName reports whether a string-typed "name" key is present
@@ -565,8 +540,8 @@ func inlineNodeContainers(v map[string]any, ns string, defs map[string]any, seen
 // "", and an empty short name with a namespace (fullname "ns.") is
 // referenceable across parses by exact dotted lookup, so the splice
 // walkers must treat it like any other definition. Shared by
-// collectTreeDefs, inlineTreeDefs, and inlineNodeContainers so the
-// definition predicate cannot drift between them.
+// collectTreeDefs and inlineTreeDefs (map arm and flat-field callback)
+// so the definition predicate cannot drift between them.
 func nodeHasStringName(v map[string]any) bool {
 	nm, ok := lookupCI(v, "name")
 	if !ok {
