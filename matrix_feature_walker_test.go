@@ -375,6 +375,74 @@ func init() {
 	featureWalkerRows = append(featureWalkerRows, featureWalkerCaseKeyRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerRefFormRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerAliasRows...)
+	featureWalkerRows = append(featureWalkerRows, featureWalkerDegenerateRows...)
+}
+
+// Degenerate cardinalities, all reference-legal: the empty-fields record,
+// the size-0 fixed, the zero-symbol enum, and the zero-branch union. The
+// first two are USABLE (an empty record and a size-0 fixed both encode zero
+// bytes); the last two are parseable-but-unusable — no value inhabits them,
+// so encode-bearing drivers skip (sample == nil) and only the pure schema
+// walkers (String() re-parse, canonical, Root() rebuild, compatibility)
+// run. Where the kind can be spelled two ways the twin is the flat (goavro
+// field-format) vs nested spelling, composing this family with the flat
+// lift; the empty union has a single spelling, so its twin is the same
+// text and parity degenerates to independent-parse determinism plus
+// self-containment of every emitted form.
+var featureWalkerDegenerateRows = []featureWalkerRow{
+	{
+		name:    "degenerate-empty-fields-record",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"er","type":"record","fields":[]},{"name":"w","type":"int"}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"er","type":{"type":"record","name":"er","fields":[]}},{"name":"w","type":"int"}]}`,
+		sample:  map[string]any{"er": map[string]any{}, "w": int32(1)},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"er","type":{"type":"record","name":"er","fields":[]}},{"name":"w","type":"int"},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"er": map[string]any{}, "w": int32(1), "pad": int32(5)},
+
+		// An empty-fields record has no child position, so no reference
+		// can sit INSIDE the feature's subtree; the definition direction
+		// registers the empty record itself as a cross-parse definition.
+		defFeature:      `{"type":"record","name":"ns.HG","fields":[{"name":"der","type":"record","fields":[]}]}`,
+		defTwin:         `{"type":"record","name":"ns.HG","fields":[{"name":"der","type":{"type":"record","name":"der","fields":[]}}]}`,
+		defFollow:       `{"type":"record","name":"ns.FG","fields":[{"name":"d","type":"der"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{}},
+	},
+	{
+		name:    "degenerate-size0-fixed",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"fx","type":"fixed","size":0},{"name":"w","type":"int"}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"fx","type":{"type":"fixed","name":"fx","size":0}},{"name":"w","type":"int"}]}`,
+		sample:  map[string]any{"fx": []byte{}, "w": int32(1)},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"fx","type":{"type":"fixed","name":"fx","size":0}},{"name":"w","type":"int"},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"fx": []byte{}, "w": int32(1), "pad": int32(5)},
+
+		// No child position inside a fixed (see empty-fields note).
+		defFeature:      `{"type":"record","name":"ns.HH","fields":[{"name":"dfx0","type":"fixed","size":0}]}`,
+		defTwin:         `{"type":"record","name":"ns.HH","fields":[{"name":"dfx0","type":{"type":"fixed","name":"dfx0","size":0}}]}`,
+		defFollow:       `{"type":"record","name":"ns.FH","fields":[{"name":"d","type":"dfx0"}]}`,
+		defFollowSample: map[string]any{"d": []byte{}},
+	},
+	{
+		// Parseable-but-unusable: no value encodes against a zero-symbol
+		// enum, so sample is nil (encode drivers skip) and the cache
+		// definition direction — whose follow-up parse would have to
+		// ENCODE through the reference — is likewise skipped; resolve
+		// variants need an encodable sample too. The walkers that remain
+		// must still treat flat and nested spellings identically.
+		name:    "degenerate-empty-enum",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"c","type":"enum","symbols":[]},{"name":"w","type":"int"}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"c","type":{"type":"enum","name":"c","symbols":[]}},{"name":"w","type":"int"}]}`,
+	},
+	{
+		// Zero-branch union: single spelling, twin is the same text —
+		// parity is independent-parse determinism and self-containment.
+		// Unusable (nothing inhabits []), so encode-bearing drivers and
+		// both cache directions skip; there is also no subtree to hold a
+		// reference or definition.
+		name:    "degenerate-empty-union",
+		feature: `{"type":"record","name":"ns.Top","fields":[{"name":"u","type":[]},{"name":"w","type":"int"}]}`,
+		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"u","type":[]},{"name":"w","type":"int"}]}`,
+	},
 }
 
 // Aliases accept ANY string — never name-validated (type AND field aliases),
@@ -713,6 +781,9 @@ var featureWalkerDrivers = []struct {
 		// wire — byte-equal binary and JSON encodes, equal decodes.
 		name: "wire-parity",
 		run: func(t *testing.T, row featureWalkerRow) {
+			if row.sample == nil {
+				t.Skip("parseable-but-unusable kind: no value inhabits it, nothing encodes")
+			}
 			sF := fwParse(t, row.feature, row)
 			sT := fwParse(t, row.twin, row)
 			encF, err := sF.Encode(row.sample)
@@ -1029,6 +1100,9 @@ var featureWalkerDrivers = []struct {
 		// carries the writer fingerprint) and cross-spelling decode.
 		name: "soe-roundtrip",
 		run: func(t *testing.T, row featureWalkerRow) {
+			if row.sample == nil {
+				t.Skip("parseable-but-unusable kind: no value inhabits it, nothing encodes")
+			}
 			sF := fwParse(t, row.feature, row)
 			sT := fwParse(t, row.twin, row)
 			bF, err := sF.AppendSingleObject(nil, row.sample)
