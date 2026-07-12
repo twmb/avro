@@ -308,14 +308,30 @@ func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
 	return short
 }
 
-// collectTreeDefs calls visit for every named-type definition in the tree, with
-// its resolved fullname and sub-tree, tracking namespace scope. It mirrors the
-// parser EXACTLY: object keys are read case-insensitively (lookupCI), and a
-// flat-form ("linkedin/goavro") field is walked as its lifted type object —
-// the lift decision and key routing are the parser's own flatFieldNeedsLift /
-// flatLiftTypeMap, so a named type defined by the field (record/error/enum/
-// fixed) or inside the field's items/values (array/map) is collected exactly
-// where the parser registers it.
+// collectTreeDefs calls visit for every named-type definition in the tree,
+// with its resolved fullname and sub-tree, tracking namespace scope. Child
+// positions, key casing, and the flat-form ("linkedin/goavro") field lift
+// come from walkNodeChildren, so a named type defined by a flat field
+// (record/error/enum/fixed) or inside the field's items/values (array/map)
+// is collected exactly where the parser registers it. The node's own
+// "type" value is not walked: on a parser-accepted tree it is always a
+// string (aobjectFromMap rejects any other JSON type there), and a string
+// defines nothing to collect.
+//
+// Documented divergence, preserved as-is by the walkNodeChildren
+// conversion: both the visit and the child scope are gated on a string
+// "name" key being PRESENT (nodeHasStringName), where the parser — and
+// nodeChildScope, which inlineTreeDefs and the Root() walker follow —
+// scopes a named kind's children by its namespace attribute regardless.
+// The two differ only for a named kind with NO "name" key, parseable
+// solely under a WithLaxNames validator accepting "" (fullname "ns."):
+// here nested definitions are collected under ENCLOSING-scoped fullnames,
+// so a later cross-parse reference to the parser-scoped fullname finds no
+// def to splice (its metadata forms degrade to the dangling reference),
+// and a later parse that references-then-locally-defines the misfiled
+// short name can splice the stale def, diverging its metadata forms from
+// its wire codec. Filed 2026-07-12 under AUDIT_PATTERNS.md B7/B9; the
+// scope fix is a behavior change owned by a fix round, not a cleanup.
 func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) {
 	switch v := node.(type) {
 	case []any:
@@ -323,39 +339,23 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 			collectTreeDefs(b, ns, visit)
 		}
 	case map[string]any:
-		typVal, hasType := lookupCI(v, "type")
+		typVal, _ := lookupCI(v, "type")
 		typ, _ := typVal.(string)
 		childNS := ns
 		if nodeHasStringName(v) && isNamedKind(typ) {
 			childNS = nodeNamespace(v, ns)
 			visit(nodeFullnameTree(v, ns), v)
 		}
-		if hasType {
-			collectTreeDefs(typVal, ns, visit)
-		}
-		if fs, ok := lookupCI(v, "fields"); ok {
-			if fsa, ok := fs.([]any); ok {
-				for _, f := range fsa {
-					fo, ok := f.(map[string]any)
-					if !ok {
-						continue
-					}
-					if t, ok := lookupCI(fo, "type"); ok {
-						if ts, isStr := t.(string); isStr && flatFieldNeedsLift(fo, ts) {
-							collectTreeDefs(flatLiftTypeMap(fo, ts), childNS, visit)
-							continue
-						}
-						collectTreeDefs(t, childNS, visit)
-					}
-				}
-			}
-		}
-		if it, ok := lookupCI(v, "items"); ok {
-			collectTreeDefs(it, childNS, visit)
-		}
-		if vv, ok := lookupCI(v, "values"); ok {
-			collectTreeDefs(vv, childNS, visit)
-		}
+		walkNodeChildren(v, ns, childNS, nodeChildVisitor{
+			field: func(_ int, fo map[string]any, typeKey, scope string) {
+				collectTreeDefs(fo[typeKey], scope, visit)
+			},
+			flatField: func(_ int, fo map[string]any, kind, scope string) {
+				collectTreeDefs(flatLiftTypeMap(fo, kind), scope, visit)
+			},
+			items:  func(key, scope string) { collectTreeDefs(v[key], scope, visit) },
+			values: func(key, scope string) { collectTreeDefs(v[key], scope, visit) },
+		})
 	}
 }
 
