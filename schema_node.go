@@ -1700,86 +1700,44 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 		}
 	}
 
-	if items, ok := lookupCI(m, "items"); ok {
-		node := nodeFromJSON(items, childNS)
-		n.Items = &node
-	}
-	if values, ok := lookupCI(m, "values"); ok {
-		node := nodeFromJSON(values, childNS)
-		n.Values = &node
-	}
-
-	if v, ok := lookupCI(m, "fields"); ok {
-		if fields, ok := v.([]any); ok {
-			n.Fields = make([]SchemaField, len(fields))
-			for i, f := range fields {
-				fm, _ := f.(map[string]any)
-				sf := SchemaField{}
-				getCIString(fm, "name", &sf.Name)
-				// Flat (goavro-style) field format: the wire parser lifts
-				// the field's defining keys into a nested type definition,
-				// naming a lifted named type after the field
-				// (liftFlatFieldType, schema_parse.go). The metadata tree
-				// must describe that same post-lift schema — otherwise the
-				// type node surfaces as an empty shell (no name / symbols /
-				// items / values / size / fields), Root().Schema() cannot
-				// rebuild it (the rebuild emits a nested type OBJECT, which
-				// the wire lift's bare-string gate ignores, so the flat
-				// shape is unrepresentable through the round trip), and the
-				// lifted named type is invisible to name-reference default
-				// coercion (collectNamedTypes keys on Name). The lift
-				// decision and key routing are the wire parser's own
-				// flatFieldNeedsLift / flatLiftTypeMap, so the two sides
-				// cannot drift; flatType doubles as the routed-key set the
-				// Props loop below excludes. The routed doc belongs to the
-				// lifted type (nodeFromJSONObject reads it from flatType),
-				// not the field, exactly as the wire lift routes it.
-				var flatType map[string]any
-				if t, ok := lookupCI(fm, "type"); ok {
-					if ts, isStr := t.(string); isStr && flatFieldNeedsLift(fm, ts) {
-						flatType = flatLiftTypeMap(fm, ts)
-						sf.Type = nodeFromJSONObject(flatType, childNS)
-					} else {
-						sf.Type = nodeFromJSON(t, childNS)
-					}
-				}
-				if d, ok := lookupCI(fm, "default"); ok {
-					// Coerce string defaults to typed float64 for
-					// float/double fields (and recurse through nested
-					// record/array/map/union types), matching Java's
-					// Schema.parseField text→DoubleNode coercion and
-					// the wire-encode pipeline's coerceDefault — so
-					// SchemaField.Default reflects the materialized
-					// wire form instead of the raw JSON string.
-					// nil name-table: best-effort inline coercion only;
-					// fixupNameRefDefaults (called at the end of Root)
-					// re-coerces with a populated table to resolve
-					// name-references that aren't visible during this
-					// per-field construction.
-					sf.Default = coerceMetadataDefault(d, &sf.Type, nil, "")
-					sf.HasDefault = true
-				}
-				if flatType == nil {
-					getCIString(fm, "doc", &sf.Doc)
-				}
-				getCIStringSlice(fm, "aliases", &sf.Aliases)
-				getCIString(fm, "order", &sf.Order)
-				for k, v := range fm {
-					if fieldReservedKeyCI(k) {
-						continue
-					}
-					if _, routed := flatType[k]; routed {
-						continue
-					}
-					if sf.Props == nil {
-						sf.Props = make(map[string]any)
-					}
-					sf.Props[k] = v
-				}
-				n.Fields[i] = sf
-			}
-		}
-	}
+	// Child schemas (items / values / field types, with flat-form fields
+	// lifted) come from walkNodeChildren, so the child set, the lift
+	// decision and key routing (the wire parser's own flatFieldNeedsLift /
+	// flatLiftTypeMap), and each child's namespace scope cannot drift from
+	// the wire parser or the SchemaCache walkers. A field with no type key
+	// never parses (the build rejects a nil field type), so every
+	// parseable field fires exactly one callback and no pre-sized zero
+	// SchemaField is left behind.
+	walkNodeChildren(m, parentNS, childNS, nodeChildVisitor{
+		fields: func(arr []any) { n.Fields = make([]SchemaField, len(arr)) },
+		field: func(i int, fm map[string]any, typeKey, scope string) {
+			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope), nil)
+		},
+		flatField: func(i int, fm map[string]any, kind, scope string) {
+			// Flat (goavro-style) field format: the wire parser lifts
+			// the field's defining keys into a nested type definition,
+			// naming a lifted named type after the field
+			// (liftFlatFieldType, schema_parse.go). The metadata tree
+			// must describe that same post-lift schema — otherwise the
+			// type node surfaces as an empty shell (no name / symbols /
+			// items / values / size / fields), Root().Schema() cannot
+			// rebuild it (the rebuild emits a nested type OBJECT, which
+			// the wire lift's bare-string gate ignores, so the flat
+			// shape is unrepresentable through the round trip), and the
+			// lifted named type is invisible to name-reference default
+			// coercion (collectNamedTypes keys on Name).
+			flatType := flatLiftTypeMap(fm, kind)
+			n.Fields[i] = metadataField(fm, nodeFromJSONObject(flatType, scope), flatType)
+		},
+		items: func(key, scope string) {
+			node := nodeFromJSON(m[key], scope)
+			n.Items = &node
+		},
+		values: func(key, scope string) {
+			node := nodeFromJSON(m[key], scope)
+			n.Values = &node
+		},
+	})
 
 	// Collect custom properties (anything not in the reserved set).
 	for k, v := range m {
@@ -1793,6 +1751,49 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 	}
 
 	return n
+}
+
+// metadataField builds one SchemaField from its raw field object and
+// already-built type node. flatType, non-nil for a flat-form field, is the
+// lifted key set (the flatLiftTypeMap output): keys the lift routed into
+// the type are excluded from Props, and the routed doc belongs to the
+// lifted type (nodeFromJSONObject reads it from flatType), not the field,
+// exactly as the wire lift routes it.
+func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) SchemaField {
+	sf := SchemaField{Type: typ}
+	getCIString(fm, "name", &sf.Name)
+	if d, ok := lookupCI(fm, "default"); ok {
+		// Coerce string defaults to typed float64 for float/double
+		// fields (and recurse through nested record/array/map/union
+		// types), matching Java's Schema.parseField text→DoubleNode
+		// coercion and the wire-encode pipeline's coerceDefault — so
+		// SchemaField.Default reflects the materialized wire form
+		// instead of the raw JSON string. nil name-table: best-effort
+		// inline coercion only; fixupNameRefDefaults (called at the end
+		// of Root) re-coerces with a populated table to resolve
+		// name-references that aren't visible during this per-field
+		// construction.
+		sf.Default = coerceMetadataDefault(d, &sf.Type, nil, "")
+		sf.HasDefault = true
+	}
+	if flatType == nil {
+		getCIString(fm, "doc", &sf.Doc)
+	}
+	getCIStringSlice(fm, "aliases", &sf.Aliases)
+	getCIString(fm, "order", &sf.Order)
+	for k, v := range fm {
+		if fieldReservedKeyCI(k) {
+			continue
+		}
+		if _, routed := flatType[k]; routed {
+			continue
+		}
+		if sf.Props == nil {
+			sf.Props = make(map[string]any)
+		}
+		sf.Props[k] = v
+	}
+	return sf
 }
 
 // reservedKeyCI is a case-insensitive wrapper for membership in a

@@ -262,11 +262,12 @@ func afieldFromAny(v any, f *afield) error {
 // keys, case-insensitively. "error" is the record alias, defined by the
 // "fields" key like "record".
 //
-// Shared by the wire parser (afieldFromAny) and the metadata walker
-// (nodeFromJSONObject's field loop, schema_node.go): the wire schema and
-// the Root() metadata tree must lift the SAME fields, or the tree would
-// describe a different schema than the one that encodes — sharing the
-// predicate makes the agreement structural.
+// Shared by the wire parser (afieldFromAny) and, via walkNodeChildren
+// (schema_walk.go), every JSON-map walker — the SchemaCache
+// self-containment walkers and the Root() metadata tree: all must lift
+// the SAME fields, or a walker would describe a different schema than
+// the one that encodes — sharing the predicate makes the agreement
+// structural.
 func flatFieldNeedsLift(m map[string]any, tp string) bool {
 	switch tp {
 	case "enum", "array", "map", "record", "error", "fixed":
@@ -288,9 +289,10 @@ func flatFieldNeedsLift(m map[string]any, tp string) bool {
 // everything else — the defining key, "type" itself, logicalType /
 // precision / scale, doc, and custom properties — moves into the type.
 //
-// Shared by the wire parser (liftFlatFieldType) and the metadata walker
-// (nodeFromJSONObject, schema_node.go) so the two sides cannot drift on
-// WHAT the lift routes; flatFieldNeedsLift is the shared WHEN.
+// Shared by the wire parser (liftFlatFieldType) and the JSON-map walkers'
+// flatField callbacks (collectTreeDefs, metadataField's callers) so the
+// sides cannot drift on WHAT the lift routes; flatFieldNeedsLift is the
+// shared WHEN.
 func flatLiftTypeMap(m map[string]any, tp string) map[string]any {
 	named := tp == "record" || tp == "error" || tp == "enum" || tp == "fixed"
 	typeMap := make(map[string]any, len(m))
