@@ -393,3 +393,155 @@ func TestRegression_CacheSpliceEmptyShortName(t *testing.T) {
 		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
 	}
 }
+
+// AUDIT_PATTERNS.md B7 second instance, the stale-splice arm. A KEYLESS
+// definition — no "name" key at all, parseable only under a user
+// WithLaxNames fn accepting "" — registers the parser fullname "x." for
+// {"type":"record","namespace":"x",...} and builds its children under x,
+// so the nested Inner definition is x.Inner. collectTreeDefs gated both
+// the def visit and the child namespace scope on a string "name" KEY
+// being present, so parse-1's nested definition was misfiled in
+// SchemaCache.defs under the ENCLOSING-scoped fullname "Inner". A later
+// same-cache parse that references the short name "Inner" BEFORE locally
+// defining a DIFFERENT Inner is bound by the parser to the LOCAL later
+// definition (the cache's named table holds only x-scoped keys, so the
+// reference is a forward reference — eager, positional), and the wire
+// codec implements Inner{z:string}; the splice walker instead found the
+// misfiled stale def, inlined Inner{w:long} at the reference, and
+// rewrote the local definition to a reference (dupDefRef), shipping
+// String()/Root()/Canonical() that describe a field the wire rejects.
+// Post-fix the defs table holds only parser-scoped fullnames, nothing
+// splices, and every metadata form equals the directly-parsed twin's.
+func TestRegression_CacheKeylessDefStaleSplice(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (keyless define): %v", err)
+	}
+	src := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":"Inner"},{"name":"b","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}}]}`
+	writer, err := c.Parse(src)
+	if err != nil {
+		t.Fatalf("parse-2 (reference-then-define): %v", err)
+	}
+	// The text is self-contained (the reference forward-binds the local
+	// definition), so the cache-less parse of the same bytes is the twin.
+	twin, err := avro.Parse(src)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
+	}
+	re, err := avro.Parse(writer.String())
+	if err != nil {
+		t.Fatalf("String() must re-parse standalone: %v\nString(): %s", err, writer.String())
+	}
+	if !bytes.Equal(re.Canonical(), twin.Canonical()) {
+		t.Errorf("String() re-parse describes a different schema than the wire codec:\n re: %s\nwant: %s", re.Canonical(), twin.Canonical())
+	}
+	// Root(): field a is the bare forward reference, field b the local
+	// definition carrying the string field z (the schema the wire
+	// implements). Pre-fix the splice inverted this: field a carried the
+	// stale inherited Inner{w:long} definition and field b was rewritten
+	// to a reference.
+	root := writer.Root()
+	if got := root.Fields[0].Type.Type; got != "Inner" {
+		t.Errorf("Root() field a: got type %q, want the bare reference %q", got, "Inner")
+	}
+	fb := root.Fields[1].Type
+	if fb.Type != "record" || len(fb.Fields) != 1 || fb.Fields[0].Name != "z" || fb.Fields[0].Type.Type != "string" {
+		t.Errorf("Root() field b: got %s %v, want the local record definition with the single string field z", fb.Type, fb.Fields)
+	}
+	// Wire controls (correct before and after the fix): the codec
+	// implements the LOCAL Inner{z:string} at both fields and rejects the
+	// stale inherited shape.
+	in := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+	var out map[string]any
+	if _, err := writer.Decode(wire, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Errorf("decode round-trip: got %#v, want %#v", out, in)
+	}
+	if _, err := writer.Encode(map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}}); err == nil {
+		t.Error("wire unexpectedly accepts the stale inherited Inner{w:long} shape")
+	}
+}
+
+// AUDIT_PATTERNS.md B7 second instance, the cross-parse dangle arm
+// (B9's coherent-degrade shape). Parse-1 (lax) defines x.Inner nested
+// inside a keyless record; parse-2 — no lax option, transitive
+// reachability is the point — references the parser-scoped fullname
+// "x.Inner", which the wire resolves from the cache's named table.
+// Pre-fix the definition sat misfiled in SchemaCache.defs under "Inner",
+// so the exact dotted lookup found nothing to splice and
+// String()/Canonical() kept the dangling reference (unresolvable under
+// any opts). Post-fix the splice fires and the metadata forms are
+// self-contained, strict-parseable (every spliced name here is
+// strict-valid), and byte-equal to the directly-parsed twin's.
+func TestRegression_CacheKeylessDefCrossParseRef(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (keyless define): %v", err)
+	}
+	writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x.Inner"}]}`)
+	if err != nil {
+		t.Fatalf("parse-2 (cross-parse reference): %v", err)
+	}
+	re, err := avro.Parse(writer.String())
+	if err != nil {
+		t.Fatalf("String() must re-parse self-contained: %v\nString(): %s", err, writer.String())
+	}
+	twin, err := avro.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","namespace":"x","fields":[{"name":"w","type":"long"}]}}]}`)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(re.Canonical(), twin.Canonical()) {
+		t.Errorf("String() re-parse canonical diverges from twin:\n re: %s\nwant: %s", re.Canonical(), twin.Canonical())
+	}
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
+	}
+	// Root() describes the spliced definition, not a dangling reference.
+	fa := writer.Root().Fields[0].Type
+	if fa.Type != "record" || fa.Name != "Inner" || fa.Namespace != "x" || len(fa.Fields) != 1 || fa.Fields[0].Name != "w" {
+		t.Errorf("Root() field a: got type=%q name=%q namespace=%q fields=%v, want the spliced x.Inner definition", fa.Type, fa.Name, fa.Namespace, fa.Fields)
+	}
+	in := map[string]any{"a": map[string]any{"w": int64(7)}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+	var out map[string]any
+	if _, err := writer.Decode(wire, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Errorf("decode round-trip: got %#v, want %#v", out, in)
+	}
+}

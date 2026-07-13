@@ -89,8 +89,9 @@ type nodeChildVisitor struct {
 // flat-form fields lifted), array items, and map values. Keys are read
 // case-insensitively exactly as the parser reads them. ns is the scope v
 // itself sits in (handed to typeValue); childNS is the scope v's
-// containers resolve in — nodeChildScope(v, ns) unless the caller
-// preserves a documented divergence (collectTreeDefs).
+// containers resolve in — nodeChildScope(v, ns), or the metadata
+// walker's equivalent derivation from its already-built node
+// (nsForChildren, schema_node.go).
 //
 // The enumeration order is fixed: type, fields in declaration order,
 // items, values. On a parser-accepted tree no per-walker order could be

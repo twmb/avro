@@ -318,20 +318,22 @@ func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
 // string (aobjectFromMap rejects any other JSON type there), and a string
 // defines nothing to collect.
 //
-// Documented divergence, preserved as-is by the walkNodeChildren
-// conversion: both the visit and the child scope are gated on a string
-// "name" key being PRESENT (nodeHasStringName), where the parser — and
-// nodeChildScope, which inlineTreeDefs and the Root() walker follow —
-// scopes a named kind's children by its namespace attribute regardless.
-// The two differ only for a named kind with NO "name" key, parseable
-// solely under a WithLaxNames validator accepting "" (fullname "ns."):
-// here nested definitions are collected under ENCLOSING-scoped fullnames,
-// so a later cross-parse reference to the parser-scoped fullname finds no
-// def to splice (its metadata forms degrade to the dangling reference),
-// and a later parse that references-then-locally-defines the misfiled
-// short name can splice the stale def, diverging its metadata forms from
-// its wire codec. Filed 2026-07-12 under AUDIT_PATTERNS.md B7/B9; the
-// scope fix is a behavior change owned by a fix round, not a cleanup.
+// The visit fires for every named KIND, "name" key or not, and the
+// child scope is nodeChildScope: the parser resolves and registers a
+// fullname even when the name key is absent entirely (an empty short
+// name a WithLaxNames fn accepted — fullname "ns.", or "" with no
+// namespace in scope), and scopes the children by its namespace
+// attribute regardless, so a keyless definition is collected under the
+// parser's fullname and its nested definitions under the parser's
+// scope. Gating either on name-key presence misfiled nested defs under
+// ENCLOSING-scoped fullnames: a cross-parse reference to the
+// parser-scoped fullname found nothing to splice (the metadata forms
+// degraded to the dangling reference), and a parse that
+// references-then-locally-defines the misfiled short name spliced the
+// STALE def over its own local definition — metadata describing a
+// schema the wire codec rejects (AUDIT_PATTERNS.md B7 second instance).
+// The "" fullname is collected but inert: no reference can spell it
+// (avroNamedRef rejects the empty string, and no scoped key is empty).
 func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) {
 	switch v := node.(type) {
 	case []any:
@@ -340,13 +342,10 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 		}
 	case map[string]any:
 		typVal, _ := lookupCI(v, "type")
-		typ, _ := typVal.(string)
-		childNS := ns
-		if nodeHasStringName(v) && isNamedKind(typ) {
-			childNS = nodeNamespace(v, ns)
+		if typ, _ := typVal.(string); isNamedKind(typ) {
 			visit(nodeFullnameTree(v, ns), v)
 		}
-		walkNodeChildren(v, ns, childNS, nodeChildVisitor{
+		walkNodeChildren(v, ns, nodeChildScope(v, ns), nodeChildVisitor{
 			field: func(_ int, fo map[string]any, typeKey, scope string) {
 				collectTreeDefs(fo[typeKey], scope, visit)
 			},
@@ -461,7 +460,13 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		// the parser's early self-registration (a type is in scope for its own
 		// descendants). A later sibling/descendant reference then sees it; an
 		// earlier one already resolved against the cache above. Keys are read
-		// case-insensitively, mirroring collectTreeDefs and the parser.
+		// case-insensitively, mirroring collectTreeDefs and the parser. The
+		// registration fires for every named KIND, "name" key or not — the
+		// parser registers a keyless definition's fullname ("ns.", lax-only)
+		// the same way, and a spliced subtree can carry one as-written, so a
+		// later reference to that fullname must see it in scope (or the walk
+		// would splice a second copy and the rebuild would reject the
+		// duplicate, degrading the metadata forms to the dangling original).
 		//
 		// If the name is ALREADY defined at this point in the walk, this node
 		// is a SECOND definition arriving inside another spliced subtree: two
@@ -475,7 +480,7 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		// defines the name twice, the rebuild Parse rejects it, and the
 		// metadata forms silently fall back to the dangling original.
 		if typVal, ok := lookupCI(v, "type"); ok {
-			if typ, _ := typVal.(string); isNamedKind(typ) && nodeHasStringName(v) {
+			if typ, _ := typVal.(string); isNamedKind(typ) {
 				fullname := nodeFullnameTree(v, ns)
 				if ref, ok := dupDefRef(fullname, ns, seen); ok {
 					return ref
@@ -519,7 +524,7 @@ func inlineNodeChildren(v map[string]any, ns string, defs map[string]any, seen, 
 			fo[typeKey] = inlineTreeDefs(fo[typeKey], scope, defs, seen, inlined)
 		},
 		flatField: func(_ int, fo map[string]any, kind, scope string) {
-			if isNamedKind(kind) && nodeHasStringName(fo) {
+			if isNamedKind(kind) {
 				fullname := nodeFullnameTree(fo, scope)
 				if ref, ok := dupDefRef(fullname, scope, seen); ok {
 					rewriteFlatFieldToRef(fo, ref)
@@ -532,23 +537,6 @@ func inlineNodeChildren(v map[string]any, ns string, defs map[string]any, seen, 
 		items:  spliceAt,
 		values: spliceAt,
 	})
-}
-
-// nodeHasStringName reports whether a string-typed "name" key is present
-// (case-insensitively, mirroring the parser). PRESENCE marks a named-type
-// definition; the VALUE may be empty — a user WithLaxNames fn can accept
-// "", and an empty short name with a namespace (fullname "ns.") is
-// referenceable across parses by exact dotted lookup, so the splice
-// walkers must treat it like any other definition. Shared by
-// collectTreeDefs and inlineTreeDefs (map arm and flat-field callback)
-// so the definition predicate cannot drift between them.
-func nodeHasStringName(v map[string]any) bool {
-	nm, ok := lookupCI(v, "name")
-	if !ok {
-		return false
-	}
-	_, ok = nm.(string)
-	return ok
 }
 
 // dupDefRef decides how a SECOND definition of fullname, encountered at a
@@ -569,7 +557,10 @@ func nodeHasStringName(v map[string]any) bool {
 // shadowed case (Java's toString shares the limitation), so it stays a
 // definition.
 func dupDefRef(fullname, ns string, seen map[string]bool) (string, bool) {
-	if !seen[fullname] {
+	// The "" fullname (a keyless definition with no namespace in scope)
+	// has no reference spelling at all — avroNamedRef rejects the empty
+	// string — so a second definition stays in place unconditionally.
+	if fullname == "" || !seen[fullname] {
 		return "", false
 	}
 	if strings.Contains(fullname, ".") {

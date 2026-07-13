@@ -79,99 +79,14 @@ func TestMatrix_InternalReparseLaxNames(t *testing.T) {
 		{"decodeonly", []avro.SchemaOpt{ctLongDecodeOnly()}, true},
 		{"encdec", []avro.SchemaOpt{ctLongEncDec()}, true},
 	}
-	nameOnly := func(nc reparseNameClass) []avro.SchemaOpt {
-		if nc.opt != nil {
-			return []avro.SchemaOpt{nc.opt}
-		}
-		return nil
-	}
 	withCustom := func(nc reparseNameClass, cm reparseCustomMode) []avro.SchemaOpt {
-		return append(nameOnly(nc), cm.opts...)
+		return append(nameOnlyOpts(nc), cm.opts...)
 	}
 	L := func(wrap bool, v int64) any {
 		if wrap {
 			return ctLong{v}
 		}
 		return v
-	}
-
-	// battery runs the shared per-cell assertions. writer is the schema under
-	// test (plain-parsed or cache-parsed, possibly custom-typed); twin is the
-	// independent oracle: the same self-contained schema text parsed directly
-	// with the name opt only. reader adds a defaulted field.
-	battery := func(t *testing.T, nc reparseNameClass, writer, twin, reader *avro.Schema, in, inCt, want map[string]any) {
-		t.Helper()
-		// Names pass through verbatim.
-		if canon := string(writer.Canonical()); !strings.Contains(canon, `"`+nc.full+`"`) {
-			t.Errorf("canonical does not carry fullname %q verbatim: %s", nc.full, canon)
-		}
-		// String()/Canonical() re-parse self-contained under the user's
-		// validator, preserving canonical identity.
-		re, err := avro.Parse(writer.String(), nameOnly(nc)...)
-		if err != nil {
-			t.Fatalf("String() re-parse: %v\nString(): %s", err, writer.String())
-		}
-		if !bytes.Equal(re.Canonical(), writer.Canonical()) {
-			t.Errorf("String() re-parse canonical diverges:\n re: %s\ngot: %s", re.Canonical(), writer.Canonical())
-		}
-		reC, err := avro.Parse(string(writer.Canonical()), nameOnly(nc)...)
-		if err != nil {
-			t.Fatalf("Canonical() re-parse: %v\nCanonical(): %s", err, writer.Canonical())
-		}
-		if !bytes.Equal(reC.Canonical(), writer.Canonical()) {
-			t.Errorf("Canonical() re-parse not idempotent:\n re: %s\ngot: %s", reC.Canonical(), writer.Canonical())
-		}
-		// Parity with the twin: canonical, fingerprint, wire bytes.
-		if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
-			t.Errorf("canonical diverges from twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
-		}
-		if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
-			t.Errorf("rabin fingerprint diverges from twin: %x vs %x", fp, fpTwin)
-		}
-		wire, err := writer.Encode(in)
-		if err != nil {
-			t.Fatalf("encode: %v", err)
-		}
-		wireTwin, err := twin.Encode(in)
-		if err != nil {
-			t.Fatalf("twin encode: %v", err)
-		}
-		if !bytes.Equal(wire, wireTwin) {
-			t.Errorf("wire bytes diverge from twin: %x vs %x", wire, wireTwin)
-		}
-		if inCt != nil {
-			wireCt, err := writer.Encode(inCt)
-			if err != nil {
-				t.Fatalf("custom-typed encode: %v", err)
-			}
-			if !bytes.Equal(wireCt, wire) {
-				t.Errorf("custom-typed input wire bytes diverge: %x vs %x", wireCt, wire)
-			}
-		}
-		// Resolve survives, then binary decode and resolved DecodeJSON agree
-		// on the exact expected value (writer-shaped JSON from the twin).
-		resolved, err := avro.Resolve(writer, reader)
-		if err != nil {
-			t.Fatalf("Resolve: %v", err)
-		}
-		var viaBinary map[string]any
-		if _, err := resolved.Decode(wire, &viaBinary); err != nil {
-			t.Fatalf("resolved binary decode: %v", err)
-		}
-		if !reflect.DeepEqual(viaBinary, want) {
-			t.Errorf("resolved binary decode: got %#v, want %#v", viaBinary, want)
-		}
-		wjson, err := twin.EncodeJSON(in)
-		if err != nil {
-			t.Fatalf("twin EncodeJSON: %v", err)
-		}
-		var viaJSON map[string]any
-		if err := resolved.DecodeJSON(wjson, &viaJSON); err != nil {
-			t.Fatalf("resolved DecodeJSON(%s): %v", wjson, err)
-		}
-		if !reflect.DeepEqual(viaJSON, want) {
-			t.Errorf("resolved DecodeJSON: got %#v, want %#v", viaJSON, want)
-		}
 	}
 
 	// Site: resolve-view. The lax-named type is the writer root with a
@@ -196,7 +111,7 @@ func TestMatrix_InternalReparseLaxNames(t *testing.T) {
 				if err != nil {
 					t.Fatalf("writer parse: %v", err)
 				}
-				twin, err := avro.Parse(writerJSON, nameOnly(nc)...)
+				twin, err := avro.Parse(writerJSON, nameOnlyOpts(nc)...)
 				if err != nil {
 					t.Fatalf("twin parse: %v", err)
 				}
@@ -220,7 +135,7 @@ func TestMatrix_InternalReparseLaxNames(t *testing.T) {
 				if err != nil {
 					t.Fatalf("writer parse: %v", err)
 				}
-				twin, err := avro.Parse(writerJSON, nameOnly(nc)...)
+				twin, err := avro.Parse(writerJSON, nameOnlyOpts(nc)...)
 				if err != nil {
 					t.Fatalf("twin parse: %v", err)
 				}
@@ -254,7 +169,7 @@ func TestMatrix_InternalReparseLaxNames(t *testing.T) {
 					t.Fatalf("cache reference parse: %v", err)
 				}
 				twinJSON := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"i","type":%s}]}`, innerDef)
-				twin, err := avro.Parse(twinJSON, nameOnly(nc)...)
+				twin, err := avro.Parse(twinJSON, nameOnlyOpts(nc)...)
 				if err != nil {
 					t.Fatalf("twin parse: %v", err)
 				}
@@ -291,7 +206,7 @@ func TestMatrix_InternalReparseLaxNames(t *testing.T) {
 					t.Fatalf("cache transitive reference parse: %v", err)
 				}
 				twinJSON := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"x","type":{"type":"record","name":"WrapA","namespace":"mid","fields":[{"name":"i","type":%s}]}},{"name":"y","type":{"type":"record","name":"WrapB","namespace":"mid","fields":[{"name":"i","type":%q}]}}]}`, innerDef, nc.full)
-				twin, err := avro.Parse(twinJSON, nameOnly(nc)...)
+				twin, err := avro.Parse(twinJSON, nameOnlyOpts(nc)...)
 				if err != nil {
 					t.Fatalf("twin parse: %v", err)
 				}
@@ -603,6 +518,415 @@ func TestMatrix_InternalReparseBareEmptyName(t *testing.T) {
 	}
 	if _, err := avro.Parse(string(writer.Canonical()), avro.WithLaxNames(acceptAll)); err != nil {
 		t.Errorf("bare empty-name canonical must re-parse under accept-all: %v", err)
+	}
+}
+
+// Class matrix for KEYLESS definitions in the SchemaCache def table —
+// named-kind nodes with NO "name" key at all, parseable only under a
+// user WithLaxNames fn accepting "" (AUDIT_PATTERNS.md B7 second
+// instance). The parser registers a fullname for them regardless
+// ("ns." from the namespace attribute, or "" bare) and scopes their
+// children by that namespace, so the def-collection and splice walkers
+// must do the same: collectTreeDefs's visit fires with the parser's
+// fullname and scopes children by nodeChildScope, and inlineTreeDefs's
+// local-definition registration (map arm and flat-field arm) has no
+// keyless carve-out.
+//
+//	{namespace attr: present "x", absent}
+//	  x {parse-2 shape: cross-parse reference to the parser fullname
+//	     (define-then-reference), reference-then-LOCAL-define of the
+//	     nested short name, local-define-then-reference}
+//	plus keyless-def-visit cells (reference to "x." itself: recursive
+//	self-ref, diamond with the nested x.Inner), seen-parity cells
+//	(nested and flat keyless defs arriving inside a spliced subtree),
+//	and a same-string lax re-parse stability cell (dupDefRef on a
+//	keyless local definition).
+//
+// Invariant per cell, as everywhere in this file: the metadata forms
+// describe the wire codec's schema, twin-parity where a twin exists.
+// The bare-namespace reference-then-define orders have NO twin: the
+// parser itself rejects the parse (the cache's named table already
+// holds "Inner", so the local re-definition is a duplicate) — pinned
+// as the rejection.
+func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	lax := avro.WithLaxNames(acceptAll)
+	// battery inputs shared by most cells.
+	addedReader := func(twinJSON string) string {
+		i := strings.LastIndex(twinJSON, "]")
+		return twinJSON[:i] + `,{"name":"added","type":"string","default":"x"}` + twinJSON[i:]
+	}
+	runBattery := func(t *testing.T, nc reparseNameClass, writer *avro.Schema, twinJSON string, in, want map[string]any) {
+		t.Helper()
+		twin, err := avro.Parse(twinJSON, nameOnlyOpts(nc)...)
+		if err != nil {
+			t.Fatalf("twin parse: %v", err)
+		}
+		reader, err := avro.Parse(addedReader(twinJSON), nameOnlyOpts(nc)...)
+		if err != nil {
+			t.Fatalf("reader parse: %v", err)
+		}
+		battery(t, nc, writer, twin, reader, in, nil, want)
+	}
+
+	const keylessNS = `{"type":"record","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`
+	const keylessBare = `{"type":"record","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`
+
+	// Cross-parse reference to the nested definition's parser-scoped
+	// fullname (define-then-reference across parses). With the namespace
+	// attribute present the nested def is x.Inner; pre-fix it was
+	// misfiled under "Inner" and the exact dotted lookup dangled.
+	t.Run("ns/crossref-inner", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessNS, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x.Inner"}]}`)
+		if err != nil {
+			t.Fatalf("reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-ns", "x", "Inner", "x.Inner", nil}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","namespace":"x","fields":[{"name":"w","type":"long"}]}}]}`
+		in := map[string]any{"a": map[string]any{"w": int64(7)}}
+		want := map[string]any{"a": map[string]any{"w": int64(7)}, "added": "x"}
+		runBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// With the namespace attribute absent, the parser scopes the nested
+	// def in the ENCLOSING (null) namespace — the walkers agreed here
+	// even pre-fix; the cell is the control for the scope rule's other
+	// half. The spliced definition carries the explicit-empty namespace
+	// escape and stays strict-parseable.
+	t.Run("bare/crossref-inner", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessBare, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"Inner"}]}`)
+		if err != nil {
+			t.Fatalf("reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-bare", "", "Inner", "Inner", nil}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","namespace":"","fields":[{"name":"w","type":"long"}]}}]}`
+		in := map[string]any{"a": map[string]any{"w": int64(7)}}
+		want := map[string]any{"a": map[string]any{"w": int64(7)}, "added": "x"}
+		runBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Reference-then-define: parse-2 references the short name "Inner"
+	// BEFORE locally defining a DIFFERENT Inner{z:string}. The parser
+	// forward-binds the reference to the LOCAL definition (the cache's
+	// named table holds only x-scoped keys); pre-fix the splice walker
+	// inlined the misfiled stale Inner{w:long} instead and rewrote the
+	// local definition to a reference — the stale-splice divergence.
+	t.Run("ns/refdefine", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessNS, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		src := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":"Inner"},{"name":"b","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}}]}`
+		writer, err := c.Parse(src)
+		if err != nil {
+			t.Fatalf("reference-then-define parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-ns-refdefine", "", "Inner", "Inner", nil}
+		in := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}}
+		want := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}, "added": "x"}
+		runBattery(t, nc, writer, src, in, want)
+		if _, err := writer.Encode(map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}}); err == nil {
+			t.Error("wire unexpectedly accepts the stale inherited Inner{w:long} shape")
+		}
+	})
+
+	// Define-then-reference: the local definition precedes the
+	// reference, so the parser and the splice walker's positional seen
+	// tracking both bind the local type (the shape pre-fix behavior
+	// already got right — the order dual that makes the matrix's
+	// position axis non-vacuous).
+	t.Run("ns/definref", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessNS, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		src := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}},{"name":"b","type":"Inner"}]}`
+		writer, err := c.Parse(src)
+		if err != nil {
+			t.Fatalf("define-then-reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-ns-definref", "", "Inner", "Inner", nil}
+		in := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}}
+		want := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}, "added": "x"}
+		runBattery(t, nc, writer, src, in, want)
+	})
+
+	// With the namespace attribute absent the nested def registers the
+	// bare "Inner" in the parser's named table, so a parse that locally
+	// re-defines it is a DUPLICATE — rejected by the parser in either
+	// order. No twin exists; the rejection is the pinned verdict.
+	for _, order := range []struct{ key, src string }{
+		{"bare/refdefine", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":"Inner"},{"name":"b","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}}]}`},
+		{"bare/definref", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}},{"name":"b","type":"Inner"}]}`},
+	} {
+		t.Run(order.key, func(t *testing.T) {
+			var c avro.SchemaCache
+			if _, err := c.Parse(keylessBare, lax); err != nil {
+				t.Fatalf("keyless define: %v", err)
+			}
+			_, err := c.Parse(order.src)
+			if err == nil {
+				t.Fatal("local re-definition of the cache-inherited bare Inner unexpectedly parsed")
+			}
+			if !strings.Contains(err.Error(), `duplicate named type "Inner"`) {
+				t.Errorf("rejection shape changed: %v", err)
+			}
+		})
+	}
+
+	// The def visit itself: the keyless definition is collected under
+	// the parser's fullname "x." and is referenceable across parses by
+	// exact dotted lookup. The definition self-references (recursive),
+	// so the spliced body's own "x." reference must stay bare.
+	t.Run("ns/crossref-outer-recursive", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","namespace":"x","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","x."]}]}`, lax); err != nil {
+			t.Fatalf("keyless recursive define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x."}]}`)
+		if err != nil {
+			t.Fatalf("reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-outer", "x", "", "x.", lax}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"x","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","x."]}]}}]}`
+		in := map[string]any{"a": map[string]any{"f": int64(7), "next": map[string]any{"f": int64(8), "next": nil}}}
+		want := map[string]any{"a": map[string]any{"f": int64(7), "next": map[string]any{"f": int64(8), "next": nil}}, "added": "x"}
+		runBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Diamond through the keyless def: parse-2 references BOTH "x." and
+	// the x.Inner nested inside it. The splice at the first reference
+	// carries the Inner definition; walking the spliced copy registers
+	// it, so the second reference stays bare and resolves backward into
+	// the first splice — one definition per name, the
+	// first-define-then-reference rule the splice dedup implements (see
+	// inlineTreeDefs).
+	t.Run("ns/diamond", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessNS, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x."},{"name":"b","type":"x.Inner"}]}`)
+		if err != nil {
+			t.Fatalf("diamond reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-diamond", "x", "", "x.", lax}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}},{"name":"b","type":"x.Inner"}]}`
+		in := map[string]any{"a": map[string]any{"i": map[string]any{"w": int64(7)}}, "b": map[string]any{"w": int64(8)}}
+		want := map[string]any{"a": map[string]any{"i": map[string]any{"w": int64(7)}}, "b": map[string]any{"w": int64(8)}, "added": "x"}
+		runBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Seen-parity, map arm: a KEYLESS definition arriving INSIDE a
+	// spliced subtree (as-written, no name key) must register its
+	// parser fullname "n." during the walk, or the later "n." reference
+	// splices a SECOND copy and the duplicate-rejecting rebuild degrades
+	// the metadata to the dangling original.
+	t.Run("ns/nested-keyless-diamond", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":"X","namespace":"n","fields":[{"name":"k","type":{"type":"record","fields":[{"name":"f","type":"long"}]}}]}`, lax); err != nil {
+			t.Fatalf("nested keyless define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"n.X"},{"name":"b","type":"n."}]}`)
+		if err != nil {
+			t.Fatalf("diamond reference parse: %v", err)
+		}
+		nc := reparseNameClass{"nested-keyless", "n", "", "n.", lax}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"X","namespace":"n","fields":[{"name":"k","type":{"type":"record","fields":[{"name":"f","type":"long"}]}}]}},{"name":"b","type":"n."}]}`
+		in := map[string]any{"a": map[string]any{"k": map[string]any{"f": int64(7)}}, "b": map[string]any{"f": int64(8)}}
+		want := map[string]any{"a": map[string]any{"k": map[string]any{"f": int64(7)}}, "b": map[string]any{"f": int64(8)}, "added": "x"}
+		runBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Seen-parity, flat-field arm: the keyless definition is spelled as
+	// a FLAT field (goavro-style, no field name either — the lift
+	// produces the keyless type). The parse-1 pins lock the flat
+	// keyless lift end-to-end: canonical form, the metadata walker's
+	// keyless handling, and the empty-string field name on the wire.
+	t.Run("ns/flat-keyless", func(t *testing.T) {
+		var c avro.SchemaCache
+		s1, err := c.Parse(`{"type":"record","name":"X","namespace":"n","fields":[{"type":"record","fields":[{"name":"f","type":"long"}]}]}`, lax)
+		if err != nil {
+			t.Fatalf("flat keyless define: %v", err)
+		}
+		wantCanon := `{"name":"n.X","type":"record","fields":[{"name":"","type":{"name":"n.","type":"record","fields":[{"name":"f","type":"long"}]}}]}`
+		if got := string(s1.Canonical()); got != wantCanon {
+			t.Errorf("flat keyless canonical:\n got %s\nwant %s", got, wantCanon)
+		}
+		f0 := s1.Root().Fields[0]
+		if f0.Name != "" || f0.Type.Type != "record" || f0.Type.Name != "" || f0.Type.Namespace != "n" || len(f0.Type.Fields) != 1 || f0.Type.Fields[0].Name != "f" {
+			t.Errorf("Root() flat keyless field: got name=%q type=%q typeName=%q ns=%q fields=%v", f0.Name, f0.Type.Type, f0.Type.Name, f0.Type.Namespace, f0.Type.Fields)
+		}
+		wire1, err := s1.Encode(map[string]any{"": map[string]any{"f": int64(7)}})
+		if err != nil {
+			t.Fatalf("encode by empty field name: %v", err)
+		}
+		if !bytes.Equal(wire1, []byte{0x0e}) {
+			t.Errorf("flat keyless wire: got %x, want 0e", wire1)
+		}
+
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"n."}]}`)
+		if err != nil {
+			t.Fatalf("reference parse: %v", err)
+		}
+		nc := reparseNameClass{"flat-keyless", "n", "", "n.", lax}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"n","fields":[{"name":"f","type":"long"}]}}]}`
+		in := map[string]any{"a": map[string]any{"f": int64(7)}}
+		want := map[string]any{"a": map[string]any{"f": int64(7)}, "added": "x"}
+		runBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Same-string lax re-parse: the second parse re-enters the builder
+	// with the first parse's defs in the cache, so its splice walk sees
+	// the LOCAL keyless definition after splicing the (identical)
+	// inherited one at the forward reference — dupDefRef must rewrite
+	// the local keyless definition to its dotted reference, keeping the
+	// canonical forms byte-stable across the two parses.
+	t.Run("samestring-reparse", func(t *testing.T) {
+		src := `{"type":"record","name":"Top","fields":[{"name":"a","type":["null","x."]},{"name":"b","type":{"type":"record","namespace":"x","fields":[{"name":"f","type":"long"}]}}]}`
+		var c avro.SchemaCache
+		s1, err := c.Parse(src, lax)
+		if err != nil {
+			t.Fatalf("parse-1: %v", err)
+		}
+		s2, err := c.Parse(src, lax)
+		if err != nil {
+			t.Fatalf("parse-2 (same string): %v", err)
+		}
+		if !bytes.Equal(s1.Canonical(), s2.Canonical()) {
+			t.Errorf("canonical unstable across same-string re-parse:\n s1: %s\n s2: %s", s1.Canonical(), s2.Canonical())
+		}
+		twin, err := avro.Parse(src, lax)
+		if err != nil {
+			t.Fatalf("twin parse: %v", err)
+		}
+		if !bytes.Equal(s2.Canonical(), twin.Canonical()) {
+			t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", s2.Canonical(), twin.Canonical())
+		}
+		if _, err := avro.Parse(s2.String(), lax); err != nil {
+			t.Fatalf("String() must re-parse: %v\nString(): %s", err, s2.String())
+		}
+		// The splice route is pinned structurally, not just coherently:
+		// the parser bound the forward reference at field a to the CACHED
+		// type (eager), so the faithful metadata materializes the
+		// definition there and field b — the local re-definition of the
+		// same fullname — becomes the dotted reference (dupDefRef on a
+		// keyless definition). A fallback to the as-written text would
+		// also be value-coherent here (same string, identical defs) but
+		// would invert the binding structure the wire used.
+		if !strings.Contains(s2.String(), `{"name":"b","type":"x."}`) {
+			t.Errorf("String() does not carry the dupDefRef-rewritten reference at field b:\n%s", s2.String())
+		}
+		in := map[string]any{"a": map[string]any{"f": int64(7)}, "b": map[string]any{"f": int64(8)}}
+		w1, err := s1.Encode(in)
+		if err != nil {
+			t.Fatalf("s1 encode: %v", err)
+		}
+		w2, err := s2.Encode(in)
+		if err != nil {
+			t.Fatalf("s2 encode: %v", err)
+		}
+		if !bytes.Equal(w1, w2) {
+			t.Errorf("wire bytes diverge across same-string re-parse: %x vs %x", w1, w2)
+		}
+	})
+}
+
+// nameOnlyOpts returns the schema opts for a class's name validator
+// alone (nil for strict), shared by the reparse batteries' twin/reader
+// parses.
+func nameOnlyOpts(nc reparseNameClass) []avro.SchemaOpt {
+	if nc.opt != nil {
+		return []avro.SchemaOpt{nc.opt}
+	}
+	return nil
+}
+
+// battery runs the shared per-cell assertions for the reparse matrices.
+// writer is the schema under test (plain-parsed or cache-parsed, possibly
+// custom-typed); twin is the independent oracle: the same self-contained
+// schema text parsed directly with the name opt only. reader adds a
+// defaulted field.
+func battery(t *testing.T, nc reparseNameClass, writer, twin, reader *avro.Schema, in, inCt, want map[string]any) {
+	t.Helper()
+	// Names pass through verbatim.
+	if canon := string(writer.Canonical()); !strings.Contains(canon, `"`+nc.full+`"`) {
+		t.Errorf("canonical does not carry fullname %q verbatim: %s", nc.full, canon)
+	}
+	// String()/Canonical() re-parse self-contained under the user's
+	// validator, preserving canonical identity.
+	re, err := avro.Parse(writer.String(), nameOnlyOpts(nc)...)
+	if err != nil {
+		t.Fatalf("String() re-parse: %v\nString(): %s", err, writer.String())
+	}
+	if !bytes.Equal(re.Canonical(), writer.Canonical()) {
+		t.Errorf("String() re-parse canonical diverges:\n re: %s\ngot: %s", re.Canonical(), writer.Canonical())
+	}
+	reC, err := avro.Parse(string(writer.Canonical()), nameOnlyOpts(nc)...)
+	if err != nil {
+		t.Fatalf("Canonical() re-parse: %v\nCanonical(): %s", err, writer.Canonical())
+	}
+	if !bytes.Equal(reC.Canonical(), writer.Canonical()) {
+		t.Errorf("Canonical() re-parse not idempotent:\n re: %s\ngot: %s", reC.Canonical(), writer.Canonical())
+	}
+	// Parity with the twin: canonical, fingerprint, wire bytes.
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from twin: %x vs %x", fp, fpTwin)
+	}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from twin: %x vs %x", wire, wireTwin)
+	}
+	if inCt != nil {
+		wireCt, err := writer.Encode(inCt)
+		if err != nil {
+			t.Fatalf("custom-typed encode: %v", err)
+		}
+		if !bytes.Equal(wireCt, wire) {
+			t.Errorf("custom-typed input wire bytes diverge: %x vs %x", wireCt, wire)
+		}
+	}
+	// Resolve survives, then binary decode and resolved DecodeJSON agree
+	// on the exact expected value (writer-shaped JSON from the twin).
+	resolved, err := avro.Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	var viaBinary map[string]any
+	if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+		t.Fatalf("resolved binary decode: %v", err)
+	}
+	if !reflect.DeepEqual(viaBinary, want) {
+		t.Errorf("resolved binary decode: got %#v, want %#v", viaBinary, want)
+	}
+	wjson, err := twin.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("twin EncodeJSON: %v", err)
+	}
+	var viaJSON map[string]any
+	if err := resolved.DecodeJSON(wjson, &viaJSON); err != nil {
+		t.Fatalf("resolved DecodeJSON(%s): %v", wjson, err)
+	}
+	if !reflect.DeepEqual(viaJSON, want) {
+		t.Errorf("resolved DecodeJSON: got %#v, want %#v", viaJSON, want)
 	}
 }
 
