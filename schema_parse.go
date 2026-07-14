@@ -176,8 +176,12 @@ func aobjectFromMap(m map[string]any) (*aobject, error) {
 	// UseNumber; normalizeJSONValue applies the same value-based numeric
 	// normalization (json.Number → int64/float64, exponent-overflow →
 	// ±Inf) the former unmarshalAnyPreservePrecision capture did.
+	// precision/scale count as extra everywhere except on a recognized
+	// decimal carrier (schemaReservedKeyForObject) — these extras feed
+	// node.props, so the CustomType-callback SchemaNode surfaces stray
+	// precision/scale in Props exactly like Root() does.
 	for k, v := range m {
-		if schemaReservedKeyCI(k) {
+		if schemaReservedKeyForObject(k, o.Type, o.Logical) {
 			continue
 		}
 		if o.extra == nil {

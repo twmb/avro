@@ -2498,12 +2498,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		if o.Logical == "" && origLogical != "" {
 			nd.unknownLogical = origLogical
 		}
-		if o.Precision != nil {
-			nd.precision = *o.Precision
-		}
-		if o.Scale != nil {
-			nd.scale = *o.Scale
-		}
+		// o.Precision/o.Scale are deliberately NOT copied here: the node
+		// fields hold validated decimal parameters only (the bytes-decimal
+		// branch above and the fixed build's decimal arm). On this path the
+		// keys were never consumed — a soft-dropped/resurrected decimal on a
+		// wrong carrier, or a stray placement — so their values are
+		// unvalidated inert metadata, surfaced via extra→props instead.
 		b.node = nd
 		return nil
 	}
@@ -3307,7 +3307,8 @@ func logicalUnderlyingAcceptsObject(o *aobject) bool {
 func (o *aobject) validateLogical() error {
 	switch o.Logical {
 	case "":
-		// No logical type: validate no scale / precision below.
+		// No logical type. Stray precision/scale are inert metadata —
+		// see the note below the switch.
 
 	case "decimal":
 		// Wrong underlying type is the one fall-back-on-mismatch case
@@ -3384,20 +3385,25 @@ func (o *aobject) validateLogical() error {
 		if accept, known := logicalUnderlyingAccept[o.Logical]; known {
 			if !accept(o) {
 				o.Logical = ""
-				return nil
 			}
 		} else {
 			// Per the Avro spec, unknown logical types are ignored and the
 			// underlying type is used as-is.
 			o.Logical = ""
-			return nil
 		}
 	}
 
-	if o.Scale != nil || o.Precision != nil {
-		return fmt.Errorf("type %q logicalType %q: invalid scale or precision specified", truncForError(o.Type), truncForError(o.Logical))
-	}
-
+	// Leftover precision/scale — any placement other than the decimal arm
+	// above, which consumes and validates them — are inert metadata, NOT a
+	// parse error: the spec permits attributes it does not define as
+	// metadata, Java's LogicalTypes.fromSchemaImpl never consults
+	// precision without a logicalType (extra attributes become props), and
+	// fastavro accepts every such placement (executed 1.12.2). They
+	// surface as custom properties (see decimalConsumesPrecisionScale) and
+	// no wire codec reads them. Rejecting here used to make twmb disagree
+	// with itself: the same stray keys parsed when an unknown logical or a
+	// wrong-carrier decimal soft-dropped above, and the FIELD level always
+	// kept them as inert props.
 	return nil
 }
 

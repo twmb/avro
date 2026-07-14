@@ -63,6 +63,12 @@ type SchemaNode struct {
 	EnumDefault    string // default symbol for enum schema evolution
 	HasEnumDefault bool   // true if an enum default is defined
 
+	// Precision and Scale are the decimal logical type's parameters, set
+	// (and validated) exactly when LogicalType is "decimal" on a bytes or
+	// fixed carrier. A stray "precision"/"scale" attribute anywhere else —
+	// no logical type, an unknown one, a non-decimal one, or a decimal on
+	// a carrier it soft-drops from — is inert metadata surfaced in Props,
+	// matching the field level.
 	Precision int // decimal precision
 	Scale     int // decimal scale
 
@@ -1693,9 +1699,15 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 	getCIString(m, "logicalType", &n.LogicalType)
 	// precision/scale/size are int per spec. After
 	// unmarshalAnyPreservePrecision, integer JSON literals come back as
-	// int64 (not float64); jsonNumericInt accepts both.
-	getCIInt(m, "precision", &n.Precision)
-	getCIInt(m, "scale", &n.Scale)
+	// int64 (not float64); jsonNumericInt accepts both. Precision/Scale
+	// hold validated decimal parameters only: consumption happens exactly
+	// on a recognized decimal carrier, and every other placement leaves
+	// the keys to the Props loop below (decimalConsumesPrecisionScale,
+	// mirrored by the wire parser's extra routing).
+	if decimalConsumesPrecisionScale(n.Type, n.LogicalType) {
+		getCIInt(m, "precision", &n.Precision)
+		getCIInt(m, "scale", &n.Scale)
+	}
 	getCIInt(m, "size", &n.Size)
 	getCIStringSlice(m, "aliases", &n.Aliases)
 	getCIStringSlice(m, "symbols", &n.Symbols)
@@ -1746,9 +1758,11 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 		},
 	})
 
-	// Collect custom properties (anything not in the reserved set).
+	// Collect custom properties (anything not in the reserved set;
+	// precision/scale are reserved only when consumed by a recognized
+	// decimal carrier above).
 	for k, v := range m {
-		if schemaReservedKeyCI(k) {
+		if schemaReservedKeyForObject(k, n.Type, n.LogicalType) {
 			continue
 		}
 		if n.Props == nil {
@@ -1820,3 +1834,30 @@ func reservedKeyCI(k string, reserved map[string]bool) bool {
 
 func fieldReservedKeyCI(k string) bool  { return reservedKeyCI(k, fieldReservedKeys) }
 func schemaReservedKeyCI(k string) bool { return reservedKeyCI(k, schemaReservedKeys) }
+
+// decimalConsumesPrecisionScale reports whether a type object with the
+// given type and logicalType (values as-written; matched exactly, like the
+// parser's own logical dispatch) is a recognized decimal carrier — the one
+// placement where the parser consumes "precision"/"scale" as decimal
+// parameters and validates them (validateLogical's decimal arm). On every
+// other placement the two keys are inert metadata surfaced as custom
+// properties, matching the field level: the spec permits attributes it
+// does not define as metadata, and no wire codec reads an unconsumed
+// precision/scale.
+func decimalConsumesPrecisionScale(typ, logical string) bool {
+	return logical == "decimal" && (typ == "bytes" || typ == "fixed")
+}
+
+// schemaReservedKeyForObject reports whether key k is reserved (consumed
+// by the parser, excluded from custom properties) on a type object with
+// the given type/logicalType: every schemaReservedKeys member, except
+// that precision/scale are reserved only on a recognized decimal carrier.
+// Shared by the wire parser's extra-property routing (aobjectFromMap) and
+// the metadata tree (nodeFromJSONObject) so the two Props surfaces cannot
+// drift.
+func schemaReservedKeyForObject(k, typ, logical string) bool {
+	if strings.EqualFold(k, "precision") || strings.EqualFold(k, "scale") {
+		return decimalConsumesPrecisionScale(typ, logical)
+	}
+	return schemaReservedKeyCI(k)
+}

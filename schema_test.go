@@ -910,9 +910,10 @@ func TestValidateLogical(t *testing.T) {
 		{"uuid ok", aobject{Type: "string", Logical: "uuid"}, false, false},
 		{"uuid wrong type", aobject{Type: "int", Logical: "uuid"}, false, true},
 		{"uuid wrong fixed size", aobject{Type: "fixed", Logical: "uuid", Size: ptr(laxInt(12))}, false, true},
-		// scale/precision on uuid (correct underlying type): still errors
-		// per validateLogical's trailing scale/precision check.
-		{"uuid with scale", aobject{Type: "string", Logical: "uuid", Scale: &zeroPrec}, true, false},
+		// scale/precision on uuid (correct underlying type): inert
+		// metadata — the logical stays applied, the stray key surfaces
+		// as a custom property (see TestRegression_StrayPrecisionScaleParses).
+		{"uuid with scale", aobject{Type: "string", Logical: "uuid", Scale: &zeroPrec}, false, false},
 
 		// date / time-millis / time-micros / timestamp-* /
 		// local-timestamp-* / big-decimal: wrong-underlying soft-drops.
@@ -940,9 +941,9 @@ func TestValidateLogical(t *testing.T) {
 		// unknown logical types are ignored per spec.
 		{"unknown logical", aobject{Type: "int", Logical: "foobar"}, false, true},
 
-		// scale/precision on non-decimal (correct underlying): still
-		// errors per the trailing scale/precision check.
-		{"date with precision", aobject{Type: "int", Logical: "date", Precision: &somePrec}, true, false},
+		// scale/precision on non-decimal (correct underlying): inert
+		// metadata, logical stays applied.
+		{"date with precision", aobject{Type: "int", Logical: "date", Precision: &somePrec}, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
