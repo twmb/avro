@@ -3160,6 +3160,10 @@ func TestMatrix_JSONEncodeErrorSemanticParity(t *testing.T) {
 		{"string", `"string"`, 5},
 		{"bytes", `"bytes"`, 5},
 		{"enum", `{"type":"enum","name":"E","symbols":["A"]}`, 5.5},
+		// Right Go type, wrong CONTENT: a string naming no symbol is a
+		// user-value failure and must carry the same SemanticError identity
+		// and field path as the type-mismatch rows on both wires.
+		{"enum-unknown-symbol", `{"type":"enum","name":"E","symbols":["A"]}`, "NOPE"},
 		{"fixed", `{"type":"fixed","name":"Fx","size":2}`, 5},
 		{"array", `{"type":"array","items":"int"}`, 5},
 		{"map", `{"type":"map","values":"int"}`, 5},

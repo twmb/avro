@@ -693,7 +693,10 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			return nil, semErr(v, "fixed")
 		}
 		if len(raw) != node.size {
-			return nil, fmt.Errorf("avro json: fixed size mismatch: got %d bytes, need %d", len(raw), node.size)
+			// The same user-value failure serSize rejects on binary; both
+			// wires carry *SemanticError identity (the JSON message keeps
+			// the got/need detail in the chain).
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: fmt.Errorf("size mismatch: got %d bytes, need %d", len(raw), node.size)}
 		}
 		return appendAvroJSONBytes(buf, raw), nil
 
@@ -706,7 +709,13 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if slices.Contains(node.symbols, needle) {
 				return appendJSONString(buf, needle), nil
 			}
-			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(needle))
+			// A value naming no symbol is the same user-value failure the
+			// binary encoder rejects (serEnum); both wires surface it as an
+			// errors.As-able *SemanticError so callers get one error identity
+			// per failure regardless of wire format. (Decode-side wire-content
+			// errors — a bad ordinal, an unknown wire symbol — are plain on
+			// both wires, a separate family.)
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(needle))}
 		}
 		// Text-out first (uniformity / name-based matching), then named string
 		// without a text method, then the int-ordinal arm.
@@ -716,7 +725,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if slices.Contains(node.symbols, text) {
 				return appendJSONString(buf, text), nil
 			}
-			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(text))
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(text))}
 		}
 		if v.Kind() == reflect.String {
 			// See serEnum.ser: json.Number (Kind reflect.String) is a numeric
@@ -729,12 +738,12 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if slices.Contains(node.symbols, needle) {
 				return appendJSONString(buf, needle), nil
 			}
-			return nil, fmt.Errorf("avro json: unknown enum symbol %q", truncForError(needle))
+			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(needle))}
 		}
 		if v.CanInt() || v.CanUint() {
 			n, err := enumOrdinalIndex(v, len(node.symbols))
 			if err != nil {
-				return nil, fmt.Errorf("avro json: enum %w", err)
+				return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: err}
 			}
 			return appendJSONString(buf, node.symbols[n]), nil
 		}
@@ -936,8 +945,9 @@ func appendAvroJSONNativeArray(buf []byte, v reflect.Value, kind string, cfg *op
 
 // appendJSONFieldDefault appends a missing record field's default value
 // to buf — JSON `null` for nil defaultVal, otherwise recursive
-// appendAvroJSON. Errors with "missing required field" when the field
-// has no default. Shared by the map[string]any fast path and the
+// appendAvroJSON. Errors with "missing key" when the field has no
+// default (the callers wrap it with the record type and field path via
+// recordFieldError). Shared by the map[string]any fast path and the
 // generic-map arm in appendAvroJSONRecord so the missing-required /
 // nil-default-to-null / default-via-appendAvroJSON sequence agrees
 // across both. Defaults route through appendAvroJSON (not a pre-
@@ -970,9 +980,12 @@ func appendAvroJSONNativeArray(buf []byte, v reflect.Value, kind string, cfg *op
 // post-convert acceptance set (the bytes/fixed appendAvroJSON arms accept
 // []byte) and matches encodeDefault's new try-each loop on the binary
 // side branch-by-branch.
-func appendJSONFieldDefault(buf []byte, recordName string, f fieldNode, cfg *optConfig, depth int) ([]byte, error) {
+func appendJSONFieldDefault(buf []byte, f fieldNode, cfg *optConfig, depth int) ([]byte, error) {
 	if !f.hasDefault {
-		return nil, fmt.Errorf("avro json: record %q missing required field %q", truncForError(recordName), truncForError(f.name))
+		// The callers wrap through recordFieldError, so this renders with
+		// the field path and *SemanticError identity — the same "missing
+		// key" construction the binary record loops build.
+		return nil, errors.New("missing key")
 	}
 	if f.defaultVal == nil {
 		return append(buf, "null"...), nil
@@ -1037,9 +1050,9 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 				value, exists := m[f.name]
 				var err error
 				if !exists {
-					buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, depth)
+					buf, err = appendJSONFieldDefault(buf, f, cfg, depth)
 					if err != nil {
-						return nil, err
+						return nil, recordFieldError(v.Type(), f.name, err)
 					}
 				} else {
 					buf, err = appendAvroJSON(buf, reflect.ValueOf(value), f.node, cfg, custom, depth+1)
@@ -1064,9 +1077,9 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			value := v.MapIndex(mapKeyAs(mapType, f.nameVal))
 			var err error
 			if !value.IsValid() {
-				buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, depth)
+				buf, err = appendJSONFieldDefault(buf, f, cfg, depth)
 				if err != nil {
-					return nil, err
+					return nil, recordFieldError(v.Type(), f.name, err)
 				}
 			} else {
 				buf, err = appendAvroJSON(buf, value, f.node, cfg, custom, depth+1)
@@ -1096,9 +1109,9 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 			if mapping.omitzero[i] && valueIsZero(fv) {
 				switch node.serRecord.fields[i].omitzeroAction() {
 				case ozDefault:
-					buf, err = appendJSONFieldDefault(buf, node.name, f, cfg, depth)
+					buf, err = appendJSONFieldDefault(buf, f, cfg, depth)
 					if err != nil {
-						return nil, err
+						return nil, recordFieldError(v.Type(), f.name, err)
 					}
 					continue
 				case ozNull:

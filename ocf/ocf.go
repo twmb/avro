@@ -559,7 +559,7 @@ func (w *Writer) writeHeader() error {
 	hdr = append(hdr, magic[:]...)
 	hdr = encodeMap(hdr, meta)
 	hdr = append(hdr, w.sync[:]...)
-	if _, err := w.w.Write(hdr); err != nil {
+	if err := writeFull(w.w, hdr); err != nil {
 		return fmt.Errorf("ocf: writing header: %w", err)
 	}
 	return nil
@@ -678,7 +678,7 @@ func (w *Writer) flush() error {
 	block = binary.AppendVarint(block, int64(len(compressed)))
 	block = append(block, compressed...)
 	block = append(block, w.sync[:]...)
-	if _, err := w.w.Write(block); err != nil {
+	if err := writeFull(w.w, block); err != nil {
 		w.err = err
 		return fmt.Errorf("ocf: writing block: %w", err)
 	}
@@ -752,7 +752,7 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 			schemaOpts = append(schemaOpts, o...)
 		}
 	}
-	br := bufio.NewReader(rws)
+	br := bufio.NewReader(&checkedReader{r: rws})
 	schema, meta, sync, err := readHeader(br, schemaOpts)
 	if err != nil {
 		return nil, err
@@ -803,6 +803,60 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 		wr.maxBytes = defaultBlockBytes
 	}
 	return wr, nil
+}
+
+// checkedReader converts an io.Reader contract violation — a returned
+// count outside [0, len(p)] with a nil error — into a named error before
+// bufio's buffer arithmetic sees it. Unguarded, a negative count trips
+// bufio's own panic and an over-length count drives the buffer slice out
+// of range: a panic through NewReader / NewAppendWriter that the caller
+// cannot recover from. It also bounds a reader stuck returning (0, nil):
+// bufio applies its io.ErrNoProgress bound only on its buffered path and
+// hands large direct reads through verbatim, where the block-data
+// io.ReadFull would spin forever. A contract-abiding Read passes through
+// untouched.
+type checkedReader struct {
+	r          io.Reader
+	emptyReads int
+}
+
+// maxConsecutiveEmptyReads mirrors bufio's bound before it reports
+// io.ErrNoProgress, applied here uniformly so every read path shares it.
+const maxConsecutiveEmptyReads = 100
+
+func (c *checkedReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n < 0 || n > len(p) {
+		return 0, fmt.Errorf("ocf: reader returned invalid count %d for a %d-byte read", n, len(p))
+	}
+	if n == 0 && err == nil && len(p) > 0 {
+		c.emptyReads++
+		if c.emptyReads >= maxConsecutiveEmptyReads {
+			return 0, io.ErrNoProgress
+		}
+	} else {
+		c.emptyReads = 0
+	}
+	return n, err
+}
+
+// writeFull writes p and converts an io.Writer contract violation (a nil
+// error with n != len(p)) into an error: trusting the lying count would
+// silently truncate the file, detectable only when a reader later hits
+// the corruption. A short count maps to io.ErrShortWrite (io.Copy's and
+// bufio.Writer's discipline); a count outside [0, len(p)] is named.
+func writeFull(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if err != nil {
+		return err
+	}
+	if n != len(p) {
+		if n < 0 || n > len(p) {
+			return fmt.Errorf("ocf: writer returned invalid count %d for a %d-byte write", n, len(p))
+		}
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 // Reader decodes Avro values from an OCF.
@@ -910,7 +964,7 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 		maxDecompressed = defaultMaxDecompressedBytes
 	}
 
-	br := bufio.NewReader(r)
+	br := bufio.NewReader(&checkedReader{r: r})
 	schema, meta, sync, err := readHeader(br, schemaOpts)
 	if err != nil {
 		return nil, err
@@ -984,7 +1038,9 @@ func (rd *Reader) Decode(v any) error {
 	}
 	rest, err := rd.schema.Decode(rd.block, v)
 	if err != nil {
-		return fmt.Errorf("ocf: decoding datum: %w", err)
+		// noEOF: a datum error matching io.EOF (e.g. a CustomType decode
+		// callback returning it) must not surface as the clean-end sentinel.
+		return fmt.Errorf("ocf: decoding datum: %w", noEOF(err))
 	}
 	// Bound zero-byte records. A datum that consumes 0 wire bytes (the "null"
 	// schema, or a record whose every field is null-typed) lets a block's
@@ -1136,7 +1192,10 @@ func (rd *Reader) readBlock() error {
 			block, err = rd.codec.Decompress(compressed)
 		}
 		if err != nil {
-			return fmt.Errorf("ocf: decompressing block: %w", err)
+			// noEOF: a codec error matching io.EOF must not surface as Decode's
+			// clean-end sentinel (the user's failing Decompress would read as a
+			// silently shorter file).
+			return fmt.Errorf("ocf: decompressing block: %w", noEOF(err))
 		}
 		// Bound count against the decompressed block length plus a small
 		// slack for zero-byte-record schemas (EmptyRecord, records of all
