@@ -1042,9 +1042,16 @@ func TestBuildComplexErrors(t *testing.T) {
 	})
 
 	t.Run("namespace on non-record", func(t *testing.T) {
-		_, err := Parse(`{"type":"array","namespace":"com","items":"int"}`)
-		if err == nil {
-			t.Fatal("expected error for namespaced array")
+		// A stray namespace on an unnamed kind is inert metadata (never
+		// scoping, stripped from the canonical form), matching the
+		// primitive type-object posture and both references; the full
+		// placement matrix is TestMatrix_AttributePlacementCensus.
+		s, err := Parse(`{"type":"array","namespace":"com","items":"int"}`)
+		if err != nil {
+			t.Fatalf("stray namespace on an array must parse as inert metadata: %v", err)
+		}
+		if got, want := string(s.Canonical()), `{"type":"array","items":"int"}`; got != want {
+			t.Errorf("canonical form kept the inert namespace: %s", got)
 		}
 	})
 

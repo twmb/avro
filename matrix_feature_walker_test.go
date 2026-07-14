@@ -380,6 +380,7 @@ func init() {
 	featureWalkerRows = append(featureWalkerRows, featureWalkerCaseKeyRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerRefFormRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerAliasRows...)
+	featureWalkerRows = append(featureWalkerRows, featureWalkerStrayNSRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerDegenerateRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerDupKeyRows...)
 	featureWalkerRows = append(featureWalkerRows, featureWalkerImplicitNullRows...)
@@ -584,6 +585,51 @@ var featureWalkerAliasRows = []featureWalkerRow{
 		defFeature:      `{"type":"record","name":"ns.HF","fields":[{"name":"d","type":{"type":"record","name":"DE","aliases":["!weird def","."],"fields":[{"name":"x","type":"int"}]}}]}`,
 		defTwin:         `{"type":"record","name":"ns.HF","fields":[{"name":"d","type":{"type":"record","name":"DE","fields":[{"name":"x","type":"int"}]}}]}`,
 		defFollow:       `{"type":"record","name":"ns.FF","fields":[{"name":"d","type":"DE"}]}`,
+		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
+	},
+}
+
+// A stray "namespace" attribute on the unnamed container kinds (array,
+// map) is inert metadata: accepted at parse, surfaced as-written, stripped
+// by the canonical form, and NEVER a namespace scope — named types defined
+// or referenced under it resolve in the ENCLOSING scope on every path
+// (parser, cache walkers, metadata rebuild; fastavro executed the same
+// scoping). The attrs here are DECOYS: a walker that scoped children by
+// the stray attribute would bind decoy.AE / look up decoy-scoped names and
+// die on parity or a dangling reference, not merely tolerate the key. The
+// twin is the attribute-free spelling.
+var featureWalkerStrayNSRows = []featureWalkerRow{
+	{
+		name: "stray-namespace-on-container",
+		feature: `{"type":"record","name":"ns.Top","fields":[
+			{"name":"ar","type":{"type":"array","namespace":"decoy","items":{"type":"record","name":"AE","fields":[{"name":"x","type":"int"}]}}},
+			{"name":"mp","type":{"type":"map","namespace":"decoy","values":"AE"}}]}`,
+		twin: `{"type":"record","name":"ns.Top","fields":[
+			{"name":"ar","type":{"type":"array","items":{"type":"record","name":"AE","fields":[{"name":"x","type":"int"}]}}},
+			{"name":"mp","type":{"type":"map","values":"AE"}}]}`,
+		sample: map[string]any{
+			"ar": []any{map[string]any{"x": int32(1)}},
+			"mp": map[string]any{"k": map[string]any{"x": int32(2)}},
+		},
+
+		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[
+			{"name":"ar","type":{"type":"array","items":{"type":"record","name":"AE","fields":[{"name":"x","type":"int"}]}}},
+			{"name":"mp","type":{"type":"map","values":"AE"}},
+			{"name":"pad","type":"int","default":5}]}`,
+		resolveSample: map[string]any{
+			"ar":  []any{map[string]any{"x": int32(1)}},
+			"mp":  map[string]any{"k": map[string]any{"x": int32(2)}},
+			"pad": int32(5),
+		},
+
+		refDefs:    []string{fwElemDef},
+		refFeature: `{"type":"record","name":"ns.Top","fields":[{"name":"e","type":{"type":"array","namespace":"decoy","items":"Elem"}}]}`,
+		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"e","type":{"type":"array","items":"Elem"}}]}`,
+		refSample:  map[string]any{"e": []any{map[string]any{"x": int32(1)}}},
+
+		defFeature:      `{"type":"record","name":"ns.HN","fields":[{"name":"d","type":{"type":"array","namespace":"decoy","items":{"type":"record","name":"DN","fields":[{"name":"x","type":"int"}]}}}]}`,
+		defTwin:         `{"type":"record","name":"ns.HN","fields":[{"name":"d","type":{"type":"array","items":{"type":"record","name":"DN","fields":[{"name":"x","type":"int"}]}}}]}`,
+		defFollow:       `{"type":"record","name":"ns.FN","fields":[{"name":"d","type":"DN"}]}`,
 		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
 	},
 }

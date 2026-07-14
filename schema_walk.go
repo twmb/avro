@@ -27,15 +27,16 @@ package avro
 // presence would be wrong: the build resolves and registers a fullname
 // even when the "name" key is absent entirely (an empty short name that a
 // WithLaxNames validator accepted — fullname "ns."), and the children
-// build under that fullname's namespace. Non-named kinds never reach
-// nodeNamespace's attribute reads on a parser-accepted tree: the build
-// rejects a non-empty "name" or any "namespace" key on them ("only
-// record, enum, and fixed can have a name", schema.go), and the one
-// non-named object shape that may carry a "namespace" — a wrapped
-// reference {"type":"X","namespace":...}, which returns from the build
-// before that check — parses only with no container children for the
-// scope to apply to (any of items/values/size/non-empty fields alongside
-// the reference falls through to the "unknown complex type" reject).
+// build under that fullname's namespace. Non-named kinds never open a
+// scope: a stray "namespace" key on them is inert metadata the parser
+// never reads (the build rejects a non-empty "name" on unnamed CONTAINER
+// kinds — "only record, enum, and fixed can have a name", schema.go — so
+// the kind check here and the parser agree that container children keep
+// the enclosing scope), and a wrapped reference
+// {"type":"X","namespace":...} parses only with no container children for
+// a scope to apply to (any of items/values/size/non-empty fields
+// alongside the reference falls through to the "unknown complex type"
+// reject).
 func nodeChildScope(v map[string]any, ns string) string {
 	if typVal, ok := lookupCI(v, "type"); ok {
 		if typ, _ := typVal.(string); isNamedKind(typ) {
