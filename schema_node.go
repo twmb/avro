@@ -1318,10 +1318,17 @@ func nodeEffNS(n *SchemaNode) string {
 	return n.Namespace
 }
 
-// nodeFullname returns n's fullname: the dotted Name verbatim, or the
-// resolved namespace joined with the name.
+// nodeFullname returns n's fullname: the dotted Name verbatim (with a
+// single LEADING dot collapsing per the null-namespace escape
+// (leadingDotName) the parser normalizes at build, so an as-written
+// ".x" is the fullname "x" and "." is the bare empty name; nodeEffNS's
+// prefix split already yields "" for both), or the resolved namespace
+// joined with the name.
 func nodeFullname(n *SchemaNode) string {
 	if strings.Contains(n.Name, ".") {
+		if short, ok := leadingDotName(n.Name); ok {
+			return short
+		}
 		return n.Name
 	}
 	if n.Namespace != "" {

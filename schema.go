@@ -1240,6 +1240,24 @@ func (b *builder) registerNamed(name string, nt *namedType) {
 // bare-string named-ref path and buildComplex's wrapped-form
 // {"type":"Name"} path so the rejectCachedRefIfCustomTypeWouldMatch
 // gate and the namespace-qualified retry agree.
+// leadingDotName reports whether name spells the explicit
+// null-namespace escape — a single leading dot with no other dot —
+// and returns the fullname it denotes: ".x" is the null-namespace
+// fullname "x", and "." is the bare empty name "". This is Java's Name
+// constructor rule (Schema.java ~1455, release-1.12.0: lastDot split,
+// then `if ("".equals(space)) space = null`), the same rule
+// qualifyAliases applies to aliases; a name whose namespace part is
+// non-empty (".a.b", "a.b") is a fullname verbatim. Shared by the
+// definition build (aobject naming), reference resolution
+// (scopedRefKeys), and the metadata fullname computation
+// (nodeFullname) so the escape cannot drift between them.
+func leadingDotName(name string) (string, bool) {
+	if strings.LastIndexByte(name, '.') == 0 {
+		return name[1:], true
+	}
+	return name, false
+}
+
 // scopedRefKeys writes the lookup keys for a name reference into dst in
 // binding-precedence order and returns the filled prefix: a dotted
 // reference is an exact fullname lookup; a bare reference tries the
@@ -1255,6 +1273,17 @@ func (b *builder) registerNamed(name string, nt *namedType) {
 // order here so the precedence cannot drift between them.
 func scopedRefKeys(dst *[2]string, ref, ns string) []string {
 	if strings.Contains(ref, ".") {
+		if short, ok := leadingDotName(ref); ok && short != "" {
+			// ".x" is the explicit null-namespace escape (the same
+			// Name-ctor rule the definition side normalizes by): an
+			// exact lookup of the null-namespace fullname "x", never
+			// qualified into the enclosing namespace. A bare "." stays
+			// as-written and can only miss — nothing registers "." —
+			// keeping the empty-name type unreferenceable in every
+			// spelling (NOT_BUGS #60).
+			dst[0] = short
+			return dst[:1]
+		}
 		dst[0] = ref
 		return dst[:1]
 	}
@@ -2603,6 +2632,20 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			// Fullname (dot-separated): ignore parent & our own namespace.
 			parentName = ""
 			hasNS = false
+			if short, ok := leadingDotName(o.Name); ok {
+				// ".x" is the null-namespace fullname "x" and "."
+				// collapses to the bare empty name "" (leadingDotName).
+				// Reachable only under a WithLaxNames fn accepting ""
+				// (validFullnameErr already rejected the empty component
+				// for strict parses, above), so strict acceptance is
+				// unchanged. Without this the name registered VERBATIM
+				// while child registration prefixed parentName[:dot+1]
+				// and reference resolution used namespaceOf — three
+				// rules that disagree exactly when the namespace part is
+				// empty, so a bare sibling reference inside ".x" could
+				// not resolve at all.
+				o.Name = short
+			}
 		}
 		if hasNS && ns != "" {
 			o.Name = ns + "." + o.Name // have namespace: prefix our name

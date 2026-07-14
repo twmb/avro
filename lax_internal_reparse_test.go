@@ -545,3 +545,125 @@ func TestRegression_CacheKeylessDefCrossParseRef(t *testing.T) {
 		t.Errorf("decode round-trip: got %#v, want %#v", out, in)
 	}
 }
+
+// AUDIT_PATTERNS.md B7 third instance, arm one: parser self-consistency
+// for leading-dot names. One leading dot (and no other dot) is the
+// explicit null-namespace escape — the rule qualifyAliases already
+// applies to aliases and Java's Name constructor applies to every name
+// (Schema.java ~1455: lastDot split; `if ("".equals(space)) space =
+// null`) — so {"name":".x"} builds as name "x" in the null namespace
+// (lax-only: the empty leading component never passes strict
+// validation). Pre-fix the name registered VERBATIM as ".x" and child
+// registration prefixed parentName[:dot+1] (nested Inner registered
+// ".Inner") while reference resolution used namespaceOf(".x") = "" —
+// the parser disagreed with itself, and a bare sibling reference
+// inside ".x" failed to parse: unknown type "Inner". Post-fix children
+// build in the null namespace and the bare reference binds.
+func TestRegression_LeadingDotSiblingRefResolves(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	src := `{"type":"record","name":".x","fields":[{"name":"k","type":{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}},{"name":"r","type":"Inner"}]}`
+	writer, err := avro.Parse(src, avro.WithLaxNames(acceptAll))
+	if err != nil {
+		t.Fatalf("bare sibling reference inside a leading-dot name must parse: %v", err)
+	}
+	// The ".x" spelling and the plain "x" spelling are the same type.
+	twin, err := avro.Parse(`{"type":"record","name":"x","fields":[{"name":"k","type":{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}},{"name":"r","type":"Inner"}]}`)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from the plain-spelled twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from the plain-spelled twin: %x vs %x", fp, fpTwin)
+	}
+	in := map[string]any{"k": map[string]any{"f": int64(7)}, "r": map[string]any{"f": int64(8)}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from the plain-spelled twin: %x vs %x", wire, wireTwin)
+	}
+}
+
+// AUDIT_PATTERNS.md B7 third instance, arm two: a cross-parse ".x"
+// reference splices self-contained. Parse-1 defines {"name":".x"}
+// (lax); the def collectors already stored it under the collapsed
+// fullname "x" (nodeFullnameTree's split-rejoin implements exactly the
+// Name-ctor rule), but pre-fix the parser registered ".x" verbatim and
+// scopedRefKeys looked the reference up verbatim, so the exact dotted
+// lookup missed the def table and String()/Canonical() kept the
+// dangling reference. Post-fix definition and reference both normalize
+// to "x", the splice fires, and the spliced form (name "x", explicit
+// null namespace) is strict-parseable.
+func TestRegression_LeadingDotCrossParseRefSplices(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":".x","fields":[{"name":"w","type":"long"}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (leading-dot define): %v", err)
+	}
+	writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":".x"}]}`)
+	if err != nil {
+		t.Fatalf("parse-2 (cross-parse reference): %v", err)
+	}
+	re, err := avro.Parse(writer.String())
+	if err != nil {
+		t.Fatalf("String() must re-parse self-contained: %v\nString(): %s", err, writer.String())
+	}
+	twin, err := avro.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}}]}`)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(re.Canonical(), twin.Canonical()) {
+		t.Errorf("String() re-parse canonical diverges from twin:\n re: %s\nwant: %s", re.Canonical(), twin.Canonical())
+	}
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
+	}
+	in := map[string]any{"a": map[string]any{"w": int64(7)}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+}
+
+// AUDIT_PATTERNS.md B7 third instance, arm three: the executed
+// stale-splice divergence heals. Pre-fix, parse-1's {"name":".x"}
+// registered ".x" in the parser but "x" in the def table, so a later
+// parse that references-then-locally-defines the bare "x" parsed (no
+// name conflict — ".x" != "x" in the parser's table), forward-bound
+// the reference to the LOCAL x{z:string}, and then spliced the STALE
+// misfiled def at the reference: canonical described x{w:long} while
+// the wire accepted {z:string} and rejected {w:long}. Post-fix ".x"
+// IS the fullname "x", so the local re-definition is a DUPLICATE of
+// the cache-inherited name and the parse is rejected outright — the
+// same verdict every other same-fullname redefinition gets.
+func TestRegression_LeadingDotStaleSpliceHealed(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":".x","fields":[{"name":"w","type":"long"}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (leading-dot define): %v", err)
+	}
+	_, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x"},{"name":"b","type":{"type":"record","name":"x","fields":[{"name":"z","type":"string"}]}}]}`)
+	if err == nil {
+		t.Fatal("local re-definition of the cache-inherited fullname x unexpectedly parsed")
+	}
+	if !strings.Contains(err.Error(), `duplicate named type "x"`) {
+		t.Errorf("rejection shape changed: %v", err)
+	}
+}

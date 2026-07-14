@@ -551,23 +551,6 @@ func TestMatrix_InternalReparseBareEmptyName(t *testing.T) {
 func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	lax := avro.WithLaxNames(acceptAll)
-	// battery inputs shared by most cells.
-	addedReader := func(twinJSON string) string {
-		i := strings.LastIndex(twinJSON, "]")
-		return twinJSON[:i] + `,{"name":"added","type":"string","default":"x"}` + twinJSON[i:]
-	}
-	runBattery := func(t *testing.T, nc reparseNameClass, writer *avro.Schema, twinJSON string, in, want map[string]any) {
-		t.Helper()
-		twin, err := avro.Parse(twinJSON, nameOnlyOpts(nc)...)
-		if err != nil {
-			t.Fatalf("twin parse: %v", err)
-		}
-		reader, err := avro.Parse(addedReader(twinJSON), nameOnlyOpts(nc)...)
-		if err != nil {
-			t.Fatalf("reader parse: %v", err)
-		}
-		battery(t, nc, writer, twin, reader, in, nil, want)
-	}
 
 	const keylessNS = `{"type":"record","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`
 	const keylessBare = `{"type":"record","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`
@@ -589,7 +572,7 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","namespace":"x","fields":[{"name":"w","type":"long"}]}}]}`
 		in := map[string]any{"a": map[string]any{"w": int64(7)}}
 		want := map[string]any{"a": map[string]any{"w": int64(7)}, "added": "x"}
-		runBattery(t, nc, writer, twinJSON, in, want)
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
 	})
 
 	// With the namespace attribute absent, the parser scopes the nested
@@ -610,7 +593,7 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","namespace":"","fields":[{"name":"w","type":"long"}]}}]}`
 		in := map[string]any{"a": map[string]any{"w": int64(7)}}
 		want := map[string]any{"a": map[string]any{"w": int64(7)}, "added": "x"}
-		runBattery(t, nc, writer, twinJSON, in, want)
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
 	})
 
 	// Reference-then-define: parse-2 references the short name "Inner"
@@ -632,7 +615,7 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 		nc := reparseNameClass{"keyless-ns-refdefine", "", "Inner", "Inner", nil}
 		in := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}}
 		want := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}, "added": "x"}
-		runBattery(t, nc, writer, src, in, want)
+		runReparseBattery(t, nc, writer, src, in, want)
 		if _, err := writer.Encode(map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}}); err == nil {
 			t.Error("wire unexpectedly accepts the stale inherited Inner{w:long} shape")
 		}
@@ -656,7 +639,7 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 		nc := reparseNameClass{"keyless-ns-definref", "", "Inner", "Inner", nil}
 		in := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}}
 		want := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}, "added": "x"}
-		runBattery(t, nc, writer, src, in, want)
+		runReparseBattery(t, nc, writer, src, in, want)
 	})
 
 	// With the namespace attribute absent the nested def registers the
@@ -699,7 +682,7 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"x","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","x."]}]}}]}`
 		in := map[string]any{"a": map[string]any{"f": int64(7), "next": map[string]any{"f": int64(8), "next": nil}}}
 		want := map[string]any{"a": map[string]any{"f": int64(7), "next": map[string]any{"f": int64(8), "next": nil}}, "added": "x"}
-		runBattery(t, nc, writer, twinJSON, in, want)
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
 	})
 
 	// Diamond through the keyless def: parse-2 references BOTH "x." and
@@ -722,7 +705,7 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}},{"name":"b","type":"x.Inner"}]}`
 		in := map[string]any{"a": map[string]any{"i": map[string]any{"w": int64(7)}}, "b": map[string]any{"w": int64(8)}}
 		want := map[string]any{"a": map[string]any{"i": map[string]any{"w": int64(7)}}, "b": map[string]any{"w": int64(8)}, "added": "x"}
-		runBattery(t, nc, writer, twinJSON, in, want)
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
 	})
 
 	// Seen-parity, map arm: a KEYLESS definition arriving INSIDE a
@@ -743,7 +726,7 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"X","namespace":"n","fields":[{"name":"k","type":{"type":"record","fields":[{"name":"f","type":"long"}]}}]}},{"name":"b","type":"n."}]}`
 		in := map[string]any{"a": map[string]any{"k": map[string]any{"f": int64(7)}}, "b": map[string]any{"f": int64(8)}}
 		want := map[string]any{"a": map[string]any{"k": map[string]any{"f": int64(7)}}, "b": map[string]any{"f": int64(8)}, "added": "x"}
-		runBattery(t, nc, writer, twinJSON, in, want)
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
 	})
 
 	// Seen-parity, flat-field arm: the keyless definition is spelled as
@@ -781,7 +764,7 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"n","fields":[{"name":"f","type":"long"}]}}]}`
 		in := map[string]any{"a": map[string]any{"f": int64(7)}}
 		want := map[string]any{"a": map[string]any{"f": int64(7)}, "added": "x"}
-		runBattery(t, nc, writer, twinJSON, in, want)
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
 	})
 
 	// Same-string lax re-parse: the second parse re-enters the builder
@@ -840,6 +823,228 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 	})
 }
 
+// Class matrix for LEADING-DOT names (AUDIT_PATTERNS.md B7 third
+// instance). A single leading dot with no other dot is the explicit
+// null-namespace escape: {"name":".x"} builds as name "x" in the null
+// namespace and "." collapses to the bare empty name "" — the rule
+// qualifyAliases already applies to aliases and Java's Name constructor
+// applies to every name (Schema.java ~1455: lastDot split; `if
+// ("".equals(space)) space = null`). Lax-only: strict parses still
+// reject the empty leading component (twmb stays stricter than Java —
+// documented, not widened). fastavro 1.12.2 holds a THIRD posture,
+// executed 2026-07-14: it keeps ".x" VERBATIM in PCF (rabin
+// c69859279c1a5fbe) and rejects the bare-"x" reference (UnknownType)
+// while still scoping children in the null namespace; twmb follows
+// Java's normalized identity instead, so post-fix PCF/fingerprints for
+// the lax-only ".x" spelling match Java and diverge from fastavro
+// (pre-fix twmb matched fastavro's bytes on definition-only shapes but
+// was SELF-inconsistent on references: a bare sibling ref inside ".x"
+// could not parse at all).
+//
+//	{".x" definition x reference spelling {"x", ".x"} x cross-parse
+//	 x {pure reference, reference-then-define, define-then-reference}}
+//	plus same-parse spelling-equivalence cells (both orders, both ref
+//	spellings), the "." -> empty-name family cell (joins NOT_BUGS #60's
+//	adjudicated behavior numerically), a multi-dot verbatim control
+//	(".a.b" — all three implementations agree), and the
+//	Root()/nodeFullnameTree/parser agreement cell.
+func TestMatrix_LeadingDotNameNormalization(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	lax := avro.WithLaxNames(acceptAll)
+	const dotXDef = `{"type":"record","name":".x","fields":[{"name":"w","type":"long"}]}`
+
+	// Cross-parse reference, both spellings: definition ".x" and
+	// references "x" / ".x" all denote the null-namespace fullname "x",
+	// so the splice fires and the spliced form (name "x") is
+	// strict-parseable.
+	for _, ref := range []string{"x", ".x"} {
+		t.Run("crossref/"+strings.ReplaceAll(ref, ".", "dot"), func(t *testing.T) {
+			var c avro.SchemaCache
+			if _, err := c.Parse(dotXDef, lax); err != nil {
+				t.Fatalf("leading-dot define: %v", err)
+			}
+			writer, err := c.Parse(fmt.Sprintf(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":%q}]}`, ref))
+			if err != nil {
+				t.Fatalf("reference parse (%q): %v", ref, err)
+			}
+			nc := reparseNameClass{"leadingdot", "", "x", "x", nil}
+			twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}}]}`
+			in := map[string]any{"a": map[string]any{"w": int64(7)}}
+			want := map[string]any{"a": map[string]any{"w": int64(7)}, "added": "x"}
+			runReparseBattery(t, nc, writer, twinJSON, in, want)
+		})
+	}
+
+	// Reference-then-define and define-then-reference with a LOCAL "x"
+	// definition: ".x" now IS the fullname "x", so the local
+	// re-definition duplicates the cache-inherited name in either order
+	// and with either reference spelling — the parser's standard
+	// conflict rejection, same as every other same-fullname family.
+	for _, order := range []struct{ key, src string }{
+		{"refdefine/x", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x"},{"name":"b","type":{"type":"record","name":"x","fields":[{"name":"z","type":"string"}]}}]}`},
+		{"refdefine/dotx", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":".x"},{"name":"b","type":{"type":"record","name":"x","fields":[{"name":"z","type":"string"}]}}]}`},
+		{"definref", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"z","type":"string"}]}},{"name":"b","type":"x"}]}`},
+	} {
+		t.Run(order.key, func(t *testing.T) {
+			var c avro.SchemaCache
+			if _, err := c.Parse(dotXDef, lax); err != nil {
+				t.Fatalf("leading-dot define: %v", err)
+			}
+			_, err := c.Parse(order.src)
+			if err == nil {
+				t.Fatal("local re-definition of the cache-inherited fullname x unexpectedly parsed")
+			}
+			if !strings.Contains(err.Error(), `duplicate named type "x"`) {
+				t.Errorf("rejection shape changed: %v", err)
+			}
+		})
+	}
+
+	// Same-parse spelling equivalence: the ".x" spelling and the plain
+	// "x" spelling are one type, in both definition positions and both
+	// reference directions (backward and forward). The twin is the same
+	// schema spelled plainly; canonical, fingerprint, and wire bytes
+	// must be identical.
+	for _, cell := range []struct{ key, src, twin string }{
+		{"sameparse/definref", `{"type":"record","name":"Top","fields":[{"name":"a","type":` + dotXDef + `},{"name":"b","type":"x"}]}`,
+			`{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}},{"name":"b","type":"x"}]}`},
+		{"sameparse/refdefine", `{"type":"record","name":"Top","fields":[{"name":"a","type":"x"},{"name":"b","type":` + dotXDef + `}]}`,
+			`{"type":"record","name":"Top","fields":[{"name":"a","type":"x"},{"name":"b","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}}]}`},
+		{"sameparse/dotx-ref", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}},{"name":"b","type":".x"}]}`,
+			`{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}},{"name":"b","type":"x"}]}`},
+	} {
+		t.Run(cell.key, func(t *testing.T) {
+			writer, err := avro.Parse(cell.src, lax)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			nc := reparseNameClass{"leadingdot-sameparse", "", "x", "x", lax}
+			in := map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}}
+			want := map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}, "added": "x"}
+			runReparseBattery(t, nc, writer, cell.twin, in, want)
+		})
+	}
+
+	// "." collapses into the adjudicated empty-name family (NOT_BUGS
+	// #60): its canonical form and Rabin fingerprint are byte-identical
+	// to the bare {"name":""} definition's — 3d741707ff4bfa45 is the
+	// fastavro-EXECUTED value pinned for that family — and the type
+	// stays unreferenceable in EVERY spelling: the "" reference is
+	// structurally rejected (pinned in
+	// TestMatrix_InternalReparseBareEmptyName) and the "." reference
+	// finds nothing to bind, same-parse and cross-parse. fastavro
+	// 1.12.2 keeps "." verbatim in PCF (executed 2026-07-14: rabin
+	// b1eae635ed69c128) — the same verbatim-identity divergence as the
+	// ".x" root, documented not adopted.
+	t.Run("dot-family", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"record","name":".","fields":[{"name":"f","type":"long"}]}`, lax)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		wantCanon := `{"name":"","type":"record","fields":[{"name":"f","type":"long"}]}`
+		if got := string(s.Canonical()); got != wantCanon {
+			t.Errorf("canonical:\n got %s\nwant %s", got, wantCanon)
+		}
+		if got, want := s.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, "3d741707ff4bfa45"); !bytes.Equal(got, want) {
+			t.Errorf("rabin: got %x, want %x (the #60 family value)", got, want)
+		}
+		twin, err := avro.Parse(`{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}`, lax)
+		if err != nil {
+			t.Fatalf("twin parse: %v", err)
+		}
+		if !bytes.Equal(s.Canonical(), twin.Canonical()) {
+			t.Errorf("canonical diverges from the {\"name\":\"\"} twin:\n got: %s\nwant: %s", s.Canonical(), twin.Canonical())
+		}
+		in := map[string]any{"f": int64(7)}
+		wire, err := s.Encode(in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		wireTwin, err := twin.Encode(in)
+		if err != nil {
+			t.Fatalf("twin encode: %v", err)
+		}
+		if !bytes.Equal(wire, wireTwin) {
+			t.Errorf("wire bytes diverge from the {\"name\":\"\"} twin: %x vs %x", wire, wireTwin)
+		}
+		// Unreferenceable in the "." spelling, same-parse and cross-parse.
+		if _, err := avro.Parse(`{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":".","fields":[{"name":"f","type":"long"}]}},{"name":"b","type":"."}]}`, lax); err == nil {
+			t.Error(`same-parse "." reference unexpectedly bound`)
+		} else if !strings.Contains(err.Error(), `unknown type "."`) {
+			t.Errorf("same-parse rejection shape changed: %v", err)
+		}
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":".","fields":[{"name":"f","type":"long"}]}`, lax); err != nil {
+			t.Fatalf("cache define: %v", err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"."}]}`); err == nil {
+			t.Error(`cross-parse "." reference unexpectedly bound`)
+		} else if !strings.Contains(err.Error(), `unknown type "."`) {
+			t.Errorf("cross-parse rejection shape changed: %v", err)
+		}
+	})
+
+	// Multi-dot control: the escape is ONLY the single leading dot.
+	// ".a.b" keeps its verbatim identity (namespace ".a") — Java's Name
+	// ctor keeps any non-empty space, and fastavro's executed PCF
+	// agrees byte-for-byte (rabin 013f503d468af517, 2026-07-14) — a
+	// three-way agreement cell pinning the boundary of the rule.
+	t.Run("multidot-verbatim", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"record","name":".a.b","fields":[{"name":"f","type":"long"}]}`, lax)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		wantCanon := `{"name":".a.b","type":"record","fields":[{"name":"f","type":"long"}]}`
+		if got := string(s.Canonical()); got != wantCanon {
+			t.Errorf("canonical:\n got %s\nwant %s", got, wantCanon)
+		}
+		if got, want := s.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, "013f503d468af517"); !bytes.Equal(got, want) {
+			t.Errorf("rabin: got %x, want %x (fastavro-executed)", got, want)
+		}
+		re, err := avro.Parse(string(s.Canonical()), lax)
+		if err != nil {
+			t.Fatalf("canonical re-parse under accept-all: %v", err)
+		}
+		if !bytes.Equal(re.Canonical(), s.Canonical()) {
+			t.Errorf("canonical not idempotent:\n re %s\ngot %s", re.Canonical(), s.Canonical())
+		}
+	})
+
+	// Agreement cell: the metadata walkers, the cache walkers, and the
+	// parser now agree on the ".x" identity. SchemaNode preserves the
+	// as-written spellings (Name ".x" on the definition, Type ".x" on
+	// the reference) while every computed identity — canonical form,
+	// name-ref binding, the Schema() rebuild's dedup/cycle emission —
+	// resolves to the fullname "x".
+	t.Run("agreement", func(t *testing.T) {
+		writer, err := avro.Parse(`{"type":"record","name":"Top","fields":[{"name":"k","type":`+dotXDef+`},{"name":"r","type":".x"}]}`, lax)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		twin, err := avro.Parse(`{"type":"record","name":"Top","fields":[{"name":"k","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}},{"name":"r","type":"x"}]}`)
+		if err != nil {
+			t.Fatalf("twin parse: %v", err)
+		}
+		if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+			t.Errorf("canonical diverges from the plain-spelled twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+		}
+		root := writer.Root()
+		if got := root.Fields[0].Type.Name; got != ".x" {
+			t.Errorf("Root() definition Name: got %q, want the as-written %q", got, ".x")
+		}
+		if got := root.Fields[1].Type.Type; got != ".x" {
+			t.Errorf("Root() reference Type: got %q, want the as-written %q", got, ".x")
+		}
+		rebuilt, err := root.Schema(lax)
+		if err != nil {
+			t.Fatalf("Root().Schema() rebuild: %v", err)
+		}
+		if !bytes.Equal(rebuilt.Canonical(), writer.Canonical()) {
+			t.Errorf("Schema() rebuild canonical diverges:\n got: %s\nwant: %s", rebuilt.Canonical(), writer.Canonical())
+		}
+	})
+}
+
 // nameOnlyOpts returns the schema opts for a class's name validator
 // alone (nil for strict), shared by the reparse batteries' twin/reader
 // parses.
@@ -848,6 +1053,28 @@ func nameOnlyOpts(nc reparseNameClass) []avro.SchemaOpt {
 		return []avro.SchemaOpt{nc.opt}
 	}
 	return nil
+}
+
+// reparseAddedReader derives the reader schema for a battery cell by
+// appending a defaulted top-level field to the twin's JSON.
+func reparseAddedReader(twinJSON string) string {
+	i := strings.LastIndex(twinJSON, "]")
+	return twinJSON[:i] + `,{"name":"added","type":"string","default":"x"}` + twinJSON[i:]
+}
+
+// runReparseBattery parses the twin and reader from twinJSON under the
+// class's name opts and runs the shared battery against writer.
+func runReparseBattery(t *testing.T, nc reparseNameClass, writer *avro.Schema, twinJSON string, in, want map[string]any) {
+	t.Helper()
+	twin, err := avro.Parse(twinJSON, nameOnlyOpts(nc)...)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	reader, err := avro.Parse(reparseAddedReader(twinJSON), nameOnlyOpts(nc)...)
+	if err != nil {
+		t.Fatalf("reader parse: %v", err)
+	}
+	battery(t, nc, writer, twin, reader, in, nil, want)
 }
 
 // battery runs the shared per-cell assertions for the reparse matrices.
