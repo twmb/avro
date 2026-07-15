@@ -2966,6 +2966,47 @@ func TestResolveFullyQualifiedAlias(t *testing.T) {
 	}
 }
 
+// A namespace-qualified alias names exactly that fullname — spec "Aliases":
+// if a type named "a.b" has aliases of "c" and "x.y", the fully qualified
+// names of its aliases are "a.c" and "x.y". It must not match a
+// same-short-name type in a DIFFERENT namespace. Java rewrites writer names
+// through a fullname-keyed alias map (Schema.applyAliases); fastavro
+// matches the writer's fullname or bare short name against the alias
+// strings as written (match_schemas); both reject this pair. Only an alias
+// declared WITHOUT a dot short-matches across namespaces (fastavro's
+// raw-string tier, executed; Java is stricter and fullname-only).
+func TestResolveQualifiedAliasIsNamespaceScoped(t *testing.T) {
+	writer := MustParse(`{"type":"record","name":"n2.Old","fields":[{"name":"a","type":"int"}]}`)
+	reader := MustParse(`{"type":"record","name":"n1.New","aliases":["n1.Old"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writer, reader); err == nil {
+		t.Errorf("CheckCompatibility: qualified alias n1.Old matched writer n2.Old")
+	}
+	if _, err := Resolve(writer, reader); err == nil {
+		t.Errorf("Resolve: qualified alias n1.Old matched writer n2.Old")
+	}
+
+	// The union-branch matcher applies the same rule.
+	readerUnion := MustParse(`["int",{"type":"record","name":"n1.New","aliases":["n1.Old"],"fields":[{"name":"a","type":"int"}]}]`)
+	if err := CheckCompatibility(writer, readerUnion); err == nil {
+		t.Errorf("CheckCompatibility union branch: qualified alias n1.Old matched writer n2.Old")
+	}
+	if _, err := Resolve(writer, readerUnion); err == nil {
+		t.Errorf("Resolve union branch: qualified alias n1.Old matched writer n2.Old")
+	}
+
+	// Kept behaviors: an alias declared without a dot short-matches a
+	// foreign-namespace writer (fastavro's raw-string tier)...
+	readerBare := MustParse(`{"type":"record","name":"n1.New","aliases":["Old"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writer, readerBare); err != nil {
+		t.Errorf("bare alias must keep short-matching a foreign-namespace writer: %v", err)
+	}
+	// ...and a qualified alias matches its exact fullname.
+	writerN1 := MustParse(`{"type":"record","name":"n1.Old","fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writerN1, reader); err != nil {
+		t.Errorf("qualified alias must keep matching its exact fullname: %v", err)
+	}
+}
+
 func TestResolveNullUnionDefault(t *testing.T) {
 	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"x","type":"int"}

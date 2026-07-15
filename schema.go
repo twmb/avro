@@ -128,6 +128,7 @@ type schemaNode struct {
 	kind        string        // "null","boolean","int","long","float","double","bytes","string","record","enum","array","map","fixed","union"
 	name        string        // fully-qualified name (named types only)
 	aliases     []string      // named type aliases (fully qualified)
+	bareAliases []string      // aliases declared without a dot, as written (short-name match tier; see bareAliasShorts)
 	logical     string        // logical type
 	fields      []fieldNode   // record fields
 	symbols     []string      // enum symbols
@@ -2740,6 +2741,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			name:        o.Name,
 			logical:     o.Logical,
 			aliases:     qualifyAliases(origAliases, o.Name),
+			bareAliases: bareAliasShorts(origAliases),
 			ser:         b.ser,
 			deser:       b.deser,
 			serRecord:   sr,
@@ -2961,13 +2963,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.meta = fieldMeta{avroType: "enum"}
 
 		nd := &schemaNode{
-			kind:    "enum",
-			name:    o.Name,
-			logical: o.Logical,
-			aliases: qualifyAliases(origAliases, o.Name),
-			symbols: o.Symbols,
-			ser:     b.ser,
-			deser:   b.deser,
+			kind:        "enum",
+			name:        o.Name,
+			logical:     o.Logical,
+			aliases:     qualifyAliases(origAliases, o.Name),
+			bareAliases: bareAliasShorts(origAliases),
+			symbols:     o.Symbols,
+			ser:         b.ser,
+			deser:       b.deser,
 		}
 		if len(origEnumDefault) > 0 {
 			var defStr string
@@ -3232,13 +3235,14 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		}
 		b.meta = fieldMeta{avroType: "fixed", logical: s.object.Logical}
 		nd := &schemaNode{
-			kind:    "fixed",
-			name:    o.Name,
-			aliases: qualifyAliases(origAliases, o.Name),
-			logical: s.object.Logical,
-			size:    size,
-			ser:     b.ser,
-			deser:   b.deser,
+			kind:        "fixed",
+			name:        o.Name,
+			aliases:     qualifyAliases(origAliases, o.Name),
+			bareAliases: bareAliasShorts(origAliases),
+			logical:     s.object.Logical,
+			size:        size,
+			ser:         b.ser,
+			deser:       b.deser,
 		}
 		if s.object.Logical == "decimal" && s.object.Precision != nil {
 			nd.precision = *s.object.Precision
@@ -3250,6 +3254,28 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.registerNamed(o.Name, &namedType{ser: b.ser, deser: b.deser, node: nd})
 	}
 	return nil
+}
+
+// bareAliasShorts collects the aliases declared WITHOUT any dot, as
+// written. A dotted alias (including the ".Name" null-namespace escape) is
+// an explicit fullname spelling and matches only exactly, via the
+// qualifyAliases output; an alias declared bare ALSO short-name-matches a
+// writer type in any namespace — fastavro's raw-string tier
+// (match_schemas: `w_unqual_name in r_aliases`), the permissive side of
+// the reference behaviors (Java's applyAliases map is fullname-keyed and
+// has no short tier). Distinguishing bare from qualified requires the
+// DECLARED spelling: reconstructing it from the qualified form would
+// over-widen an explicitly-written same-namespace alias ("a.Old" declared
+// on a type in namespace a is indistinguishable from bare "Old" after
+// qualification).
+func bareAliasShorts(aliases []string) []string {
+	var shorts []string
+	for _, a := range aliases {
+		if !strings.Contains(a, ".") {
+			shorts = append(shorts, a)
+		}
+	}
+	return shorts
 }
 
 // qualifyAliases fully qualifies alias names using the parent name's namespace.

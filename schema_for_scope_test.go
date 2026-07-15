@@ -212,6 +212,133 @@ func TestRegression_SchemaForLogicalTagOnCustomMatchedFieldRejected(t *testing.T
 	}
 }
 
+// SchemaFor builds on a private copy of a CustomType.Schema's rendered
+// tree: the metadata walk hands Props container values over by reference
+// when they need no JSON fixup, and the composition walkers (namespace
+// pinning, named-type dedup) write into the tree they are given — so
+// without the copy a build would write into the caller's own storage.
+func TestRegression_SchemaForLeavesCallerSchemaStorageUnmutated(t *testing.T) {
+	userOwned := map[string]any{"type": "fixed", "name": "F", "size": 1}
+	want := map[string]any{"type": "fixed", "name": "F", "size": 1}
+	ct := CustomType{
+		GoType: reflect.TypeFor[scopePinMoney](),
+		Schema: &SchemaNode{Type: "string", Props: map[string]any{"items": userOwned}},
+	}
+	if _, err := SchemaFor[scopePinOneField](WithNamespace("com.example"), ct); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !reflect.DeepEqual(userOwned, want) {
+		t.Fatalf("SchemaFor mutated caller-owned Props storage:\n got:  %v\n want: %v", userOwned, want)
+	}
+}
+
+// Parse matches reserved attribute names case-insensitively (see
+// Schema.Root's doc): a Props key differing from "namespace" only by ASCII
+// case IS the namespace attribute. The SchemaFor composition walkers must
+// apply the same fold — keying the dedup by the fullname Parse will bind —
+// or the reference they emit for a second occurrence dangles.
+func TestRegression_SchemaForCaseVariantNamespaceKeySharedType(t *testing.T) {
+	ct := CustomType{
+		GoType: reflect.TypeFor[scopePinMoney](),
+		Schema: &SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"NAMESPACE": "x.y"}},
+	}
+	s, err := SchemaFor[scopePinTwoFields](ct)
+	if err != nil {
+		t.Fatalf("case-variant-namespaced custom on two fields: %v", err)
+	}
+	root := s.Root()
+	for i := range root.Fields {
+		if got := namedFullname(root.Fields[i].Type); got != "x.y.F" {
+			t.Errorf("field %q type fullname = %q, want %q", root.Fields[i].Name, got, "x.y.F")
+		}
+	}
+	if _, err := Parse(s.String()); err != nil {
+		t.Errorf("SchemaFor output does not re-parse: %v", err)
+	}
+}
+
+// Under WithNamespace the frontier pin must SEE a case-variant namespace
+// key as the namespace declaration it is (Parse folds it onto the
+// attribute) and leave the node alone: injecting an exact-case
+// "namespace":"" would shadow the declared namespace at parse — a silent,
+// wire-visible identity change (x.y.F would become F).
+func TestRegression_SchemaForCaseVariantNamespaceUnderWithNamespace(t *testing.T) {
+	ct := CustomType{
+		GoType: reflect.TypeFor[scopePinMoney](),
+		Schema: &SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"NAMESPACE": "x.y"}},
+	}
+	s, err := SchemaFor[scopePinOneField](WithNamespace("com.example"), ct)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := namedFullname(s.Root().Fields[0].Type); got != "x.y.F" {
+		t.Errorf("fixed fullname = %q, want %q (the declared namespace must survive WithNamespace)", got, "x.y.F")
+	}
+}
+
+// A CustomType.Schema whose rendered tree exceeds the schema-tree budgets
+// must fail the build with the budget error. SchemaFor has an error
+// channel, so the silent truncate-to-nil posture of the error-less
+// surfaces (Schema.String, MarshalJSON) does not apply here: silently
+// replacing an over-budget Props value with null would alter the user's
+// schema, and the composed output still parses (a null prop is valid), so
+// no downstream Parse catches it.
+func TestRegression_SchemaForOverBudgetCustomSchemaErrors(t *testing.T) {
+	huge := strings.Repeat("x", 1<<26+1024) // just over the tree byte budget
+	ct := CustomType{
+		GoType: reflect.TypeFor[scopePinMoney](),
+		Schema: &SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"p": huge}},
+	}
+	if _, err := SchemaFor[scopePinOneField](ct); err == nil || !strings.Contains(err.Error(), "bytes") {
+		t.Fatalf("over-budget custom schema must fail the build with the budget error, got: %v", err)
+	}
+}
+
+// Every axis of the schema-tree walk budget must surface as a build error
+// from SchemaFor, matching the error-reporting posture of SchemaNode.Schema
+// (the same deduper-carrying walk): the BYTES axis (scalar payload), the
+// NODES axis (emitted node count), and the unnamed-cycle detection. A
+// modest schema stays well under every budget (the success control).
+func TestRegression_SchemaForCustomSchemaBudgetAxes(t *testing.T) {
+	build := func(node *SchemaNode) error {
+		ct := CustomType{GoType: reflect.TypeFor[scopePinMoney](), Schema: node}
+		_, err := SchemaFor[scopePinOneField](ct)
+		return err
+	}
+
+	t.Run("bytes", func(t *testing.T) {
+		huge := strings.Repeat("x", 1<<26+1024)
+		err := build(&SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"p": huge}})
+		if err == nil || !strings.Contains(err.Error(), "bytes") {
+			t.Fatalf("bytes-axis overflow must fail the build with the budget error, got: %v", err)
+		}
+	})
+	t.Run("nodes", func(t *testing.T) {
+		wide := make([]any, 1<<20+1024)
+		for i := range wide {
+			wide[i] = 0
+		}
+		err := build(&SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"p": wide}})
+		if err == nil || !strings.Contains(err.Error(), "nodes") {
+			t.Fatalf("nodes-axis overflow must fail the build with the budget error, got: %v", err)
+		}
+	})
+	t.Run("cycle", func(t *testing.T) {
+		n := &SchemaNode{Type: "array"}
+		n.Items = n
+		err := build(n)
+		if err == nil || !strings.Contains(err.Error(), "cyclic") {
+			t.Fatalf("an unnamed pointer cycle must fail the build with the cycle error, got: %v", err)
+		}
+	})
+	t.Run("control", func(t *testing.T) {
+		if err := build(&SchemaNode{Type: "fixed", Name: "F", Size: 4,
+			Props: map[string]any{"p": strings.Repeat("x", 1<<10)}}); err != nil {
+			t.Fatalf("a modest custom schema must build: %v", err)
+		}
+	})
+}
+
 // Control: the DOTTED spelling of the shared-type pin. The parser stores a
 // dotted name verbatim, so this spelling worked before the split spelling
 // did; it must keep working, and per the spec the two spellings must agree.

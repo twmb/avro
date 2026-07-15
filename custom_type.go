@@ -80,6 +80,12 @@ type CustomType struct {
 	// type used on two or more fields under WithNamespace, because Avro
 	// has no reference spelling that reaches the null namespace from
 	// inside another namespace.
+	//
+	// SchemaFor composes a private copy of the rendered schema, so the
+	// SchemaNode and everything reachable from it (including Props
+	// container values) are never mutated by a build, and it fails the
+	// build with the walk's named error when the schema exceeds the
+	// schema-tree budgets or contains an unnamed pointer cycle.
 	Schema *SchemaNode
 
 	// Encode converts a caller-provided Go value to an Avro-native

@@ -381,6 +381,7 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 		kind:        "record",
 		name:        r.name,
 		aliases:     r.aliases,
+		bareAliases: r.bareAliases,
 		fields:      r.fields,
 		ser:         r.ser,
 		deser:       rr.buildDeser(),
@@ -604,12 +605,13 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 		return src, setEnumTarget(indirectAlloc(v), ri, readerSymbols[ri])
 	})
 	nd := &schemaNode{
-		kind:    "enum",
-		name:    r.name,
-		aliases: r.aliases,
-		symbols: r.symbols,
-		ser:     r.ser,
-		deser:   deser,
+		kind:        "enum",
+		name:        r.name,
+		aliases:     r.aliases,
+		bareAliases: r.bareAliases,
+		symbols:     r.symbols,
+		ser:         r.ser,
+		deser:       deser,
 	}
 	ctx.applyCustomToNode(nd, r)
 	return nd, nil

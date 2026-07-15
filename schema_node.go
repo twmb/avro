@@ -630,15 +630,6 @@ func boundedSerializableValue(d *deduper, depth int, b *walkBudget, v any) any {
 	return jsonSerializableValue(v)
 }
 
-// toJSON converts a SchemaNode to a JSON-serializable representation.
-// Cycles in n's Items/Values pointers (programmatically constructed)
-// are detected and emitted as the cyclic node's name (for named types)
-// or nil (for unnamed).
-func (n *SchemaNode) toJSON() any {
-	b := newWalkBudget()
-	return n.toJSONShared(&b)
-}
-
 // toJSONShared snapshots n's full JSON body (no dedup) for the conflict
 // comparison in toJSONWalk, charging the SHARED per-walk budget rather than a
 // fresh one. A named type that re-occurs as a DISTINCT pointer with an identical

@@ -240,7 +240,21 @@ func checkEnumCompat(r, w *schemaNode, path string) error {
 
 // namesMatch checks if two named types match by fully-qualified name,
 // unqualified name, or aliases. Per the Avro spec, named types in
-// different namespaces match if their unqualified names are the same.
+// different namespaces match if their unqualified names are the same
+// ("both schemas are records with the same (unqualified) name" — the same
+// wording for enum and fixed).
+//
+// Aliases carry their qualification: a reader alias matches the writer's
+// exact fullname (aliases are stored fully qualified, so a bare alias
+// covers its own namespace this way), and an alias DECLARED without a dot
+// additionally short-name-matches the writer in any namespace — fastavro's
+// raw-string tier (match_schemas checks the writer's fullname and bare
+// short name against the alias strings as written; executed), the
+// permissive side of the references (Java's applyAliases map is
+// fullname-keyed only). An explicitly-qualified alias never short-matches:
+// the spec ("Aliases") makes "x.y" the fully qualified name of that alias,
+// so it denotes exactly x.y — matching it against a same-short-name type
+// in another namespace is what both references reject.
 func namesMatch(r, w *schemaNode) bool {
 	if r.name == w.name {
 		return true
@@ -248,12 +262,10 @@ func namesMatch(r, w *schemaNode) bool {
 	if unqualified(r.name) == unqualified(w.name) {
 		return true
 	}
-	for _, a := range r.aliases {
-		if a == w.name || unqualified(a) == unqualified(w.name) {
-			return true
-		}
+	if slices.Contains(r.aliases, w.name) {
+		return true
 	}
-	return false
+	return slices.Contains(r.bareAliases, unqualified(w.name))
 }
 
 // unqualified returns the unqualified portion of a possibly dot-separated name.
@@ -357,10 +369,12 @@ func kindsMatchTier(r, w *schemaNode) matchTier {
 			if unqualified(r.name) == unqualified(w.name) {
 				return matchUnqualifiedName
 			}
-			for _, a := range r.aliases {
-				if unqualified(a) == unqualified(w.name) {
-					return matchUnqualifiedName
-				}
+			// Only an alias DECLARED without a dot short-matches across
+			// namespaces; an explicitly-qualified alias denotes exactly its
+			// fullname (already handled by the exact tier above). Same rule
+			// as namesMatch — see its alias-qualification comment.
+			if slices.Contains(r.bareAliases, unqualified(w.name)) {
+				return matchUnqualifiedName
 			}
 			return matchNone
 		default:

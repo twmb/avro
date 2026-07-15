@@ -136,14 +136,25 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 // the namespace scope the node opens for its children (record fields
 // resolve inside it). Shared by dedupNamedTypes and normalizeSchemaScope so
 // the keying walk and the equality walk cannot drift on scope rules.
+//
+// Reserved keys are read via lookupCI: the tree this walk keys is the tree
+// Parse will consume, and Parse matches reserved attribute names
+// case-insensitively (a Props key differing from "namespace" only by ASCII
+// case IS the namespace attribute — see [Schema.Root]). Reading exact-case
+// here would key a definition under a fullname Parse won't bind.
 func resolveNameScope(v map[string]any, enclosingNS string) (full, ns string) {
-	name, _ := v["name"].(string)
+	var name string
+	if nv, ok := lookupCI(v, "name"); ok {
+		name, _ = nv.(string)
+	}
 	short := name
 	ns = enclosingNS
 	if i := strings.LastIndex(name, "."); i >= 0 {
 		short, ns = name[i+1:], name[:i]
-	} else if attr, ok := v["namespace"].(string); ok {
-		ns = attr
+	} else if nsv, ok := lookupCI(v, "namespace"); ok {
+		if attr, ok := nsv.(string); ok {
+			ns = attr
+		}
 	}
 	return avroFullName(ns, short), ns
 }
@@ -163,17 +174,25 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 		childNS := enclosingNS
 		var full string
 		named := false
-		if typ, _ := v["type"].(string); isNamedKind(typ) {
-			named = true
-			full, childNS = resolveNameScope(v, enclosingNS)
+		if tv, ok := lookupCI(v, "type"); ok {
+			if typ, _ := tv.(string); isNamedKind(typ) {
+				named = true
+				full, childNS = resolveNameScope(v, enclosingNS)
+			}
 		}
+		// Key classification is case-insensitive to match the Parse this
+		// tree feeds (see resolveNameScope): a case-variant reserved key IS
+		// the reserved attribute, so it normalizes — and, for "namespace",
+		// folds away — exactly like the exact-case spelling. Both
+		// occurrences of one definition carry identical keys, so writing
+		// through the as-written key keeps the comparison deterministic.
 		for k, val := range v {
 			switch {
-			case named && k == "name":
+			case named && strings.EqualFold(k, "name"):
 				out[k] = full
-			case named && k == "namespace":
+			case named && strings.EqualFold(k, "namespace"):
 				// Folded into the fullname.
-			case k == "fields":
+			case strings.EqualFold(k, "fields"):
 				fields, ok := val.([]map[string]any)
 				if !ok {
 					out[k] = val
@@ -183,7 +202,7 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 				for i, f := range fields {
 					cf := make(map[string]any, len(f))
 					for fk, fv := range f {
-						if fk == "type" {
+						if strings.EqualFold(fk, "type") {
 							cf[fk] = normalizeSchemaScope(fv, childNS)
 						} else {
 							cf[fk] = fv
@@ -192,7 +211,7 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 					nf[i] = cf
 				}
 				out[k] = nf
-			case k == "items" || k == "values":
+			case strings.EqualFold(k, "items") || strings.EqualFold(k, "values"):
 				out[k] = normalizeSchemaScope(val, childNS)
 			default:
 				out[k] = val
@@ -231,9 +250,23 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 func pinCustomSchemaScope(v any) {
 	switch v := v.(type) {
 	case map[string]any:
-		if typ, _ := v["type"].(string); isNamedKind(typ) {
-			if name, _ := v["name"].(string); !strings.Contains(name, ".") {
-				if _, has := v["namespace"]; !has {
+		var typ string
+		if tv, ok := lookupCI(v, "type"); ok {
+			typ, _ = tv.(string)
+		}
+		if isNamedKind(typ) {
+			var name string
+			if nv, ok := lookupCI(v, "name"); ok {
+				name, _ = nv.(string)
+			}
+			if !strings.Contains(name, ".") {
+				// A namespace key of ANY casing is the namespace attribute
+				// (Parse folds case-variants onto it — see resolveNameScope),
+				// so its presence means the node already pins its scope.
+				// Injecting an exact-case "namespace":"" over a case-variant
+				// spelling would shadow the declared namespace at parse,
+				// silently renaming the type.
+				if _, has := lookupCI(v, "namespace"); !has {
 					v["namespace"] = ""
 				}
 			}
@@ -241,10 +274,10 @@ func pinCustomSchemaScope(v any) {
 		}
 		// Unnamed containers pass the enclosing scope through; descend to
 		// the named frontier.
-		if items, ok := v["items"]; ok {
+		if items, ok := lookupCI(v, "items"); ok {
 			pinCustomSchemaScope(items)
 		}
-		if values, ok := v["values"]; ok {
+		if values, ok := lookupCI(v, "values"); ok {
 			pinCustomSchemaScope(values)
 		}
 	case []any: // union branches
@@ -252,6 +285,74 @@ func pinCustomSchemaScope(v any) {
 			pinCustomSchemaScope(b)
 		}
 	}
+}
+
+// renderCustomSchemaTree renders a CustomType.Schema subtree for embedding
+// into a SchemaFor tree. Two boundary duties live here, both consequences
+// of the render being a metadata walk over a CALLER-owned SchemaNode
+// rather than a SchemaFor-built tree:
+//
+//   - It uses the error-reporting (deduper-carrying) walk, the same one
+//     [SchemaNode.Schema] uses, so a subtree that exceeds the schema-tree
+//     budgets or contains an unnamed cycle fails the build with the named
+//     error. The bare walk truncates over-budget values to nil — the right
+//     posture for the error-LESS surfaces (Schema.String, MarshalJSON,
+//     where the alternative is a panic) — but SchemaFor has an error
+//     channel, and a truncated Props VALUE parses cleanly as a null prop,
+//     so no downstream Parse catches the silent alteration.
+//
+//   - It deep-copies the rendered tree before returning it. The walk hands
+//     Props container values (and SchemaField Props/Default containers)
+//     over BY REFERENCE whenever they need no JSON fixup
+//     (jsonSerializableValue's documented allocation-free fast path), and
+//     the composition walkers write into the tree they are given:
+//     pinCustomSchemaScope injects "namespace":"" at the named frontier,
+//     dedupNamedTypes rewrites items/values/union slots and field types
+//     into references. Without the copy those writes would land in the
+//     caller's own SchemaNode storage. This render is the only path
+//     caller-owned containers enter the pre-Parse tree — every other node
+//     comes fresh from inferType/inferRecord literals or toJSONWalk's own
+//     map construction — so the copy at this boundary covers them all.
+func renderCustomSchemaTree(n *SchemaNode) (any, error) {
+	d := &deduper{
+		defined: make(map[string]*SchemaNode),
+		visited: make(map[*SchemaNode]struct{}),
+	}
+	tree := n.toJSONDedup(d)
+	if d.err != nil {
+		return nil, fmt.Errorf("avro: SchemaFor: CustomType.Schema: %w", d.err)
+	}
+	return deepCopyJSONTree(tree), nil
+}
+
+// deepCopyJSONTree copies every container level of a rendered schema tree
+// (attribute maps, union slices, field-map slices) so mutating walkers
+// cannot reach storage shared with the SchemaNode that produced it. Scalar
+// leaves are immutable and stay shared; []byte never survives a render
+// (the walk's JSON fixup converts it to the codepoint-string form), and
+// the walkers never write into string slices ([]string aliases/symbols).
+func deepCopyJSONTree(v any) any {
+	switch v := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, val := range v {
+			out[k] = deepCopyJSONTree(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, e := range v {
+			out[i] = deepCopyJSONTree(e)
+		}
+		return out
+	case []map[string]any: // record fields
+		out := make([]map[string]any, len(v))
+		for i, m := range v {
+			out[i] = deepCopyJSONTree(m).(map[string]any)
+		}
+		return out
+	}
+	return v
 }
 
 // dedupNamedTypes walks a JSON-like schema tree (maps, slices, strings) and
@@ -290,7 +391,11 @@ func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any,
 		// registration key; fullname "" (an empty lax name with no
 		// namespace) has no reference spelling, so it stays inline and
 		// un-deduped, mirroring the metadata rebuild's dedup walker.
-		if typ, _ := v["type"].(string); isNamedKind(typ) {
+		var typ string
+		if tv, ok := lookupCI(v, "type"); ok {
+			typ, _ = tv.(string)
+		}
+		if isNamedKind(typ) {
 			full, ns := resolveNameScope(v, enclosingNS)
 			childNS = ns
 			if full != "" {
@@ -323,29 +428,40 @@ func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any,
 		// Recurse into children that can hold schemas. Record fields
 		// resolve in the record's own namespace scope; items and values
 		// belong to unnamed array/map nodes, which pass the scope through
-		// (childNS == enclosingNS there).
-		if fields, ok := v["fields"].([]map[string]any); ok {
-			for i, f := range fields {
-				nt, err := dedupNamedTypes(f["type"], defined, childNS)
-				if err != nil {
-					return nil, err
+		// (childNS == enclosingNS there). Reads are case-insensitive to
+		// match Parse (see resolveNameScope), and rewrites go back to the
+		// key actually present (ciKey) so a case-variant spelling is
+		// updated in place — writing a new exact-case key alongside it
+		// would leave both spellings in the map, and Parse's exact-first
+		// preference would then read whichever this walk did NOT rewrite.
+		if fv, ok := lookupCI(v, "fields"); ok {
+			if fields, ok := fv.([]map[string]any); ok {
+				for i := range fields {
+					tk, ok := ciKey(fields[i], "type")
+					if !ok {
+						continue
+					}
+					nt, err := dedupNamedTypes(fields[i][tk], defined, childNS)
+					if err != nil {
+						return nil, err
+					}
+					fields[i][tk] = nt
 				}
-				fields[i]["type"] = nt
 			}
 		}
-		if items, ok := v["items"]; ok {
-			nt, err := dedupNamedTypes(items, defined, childNS)
+		if ik, ok := ciKey(v, "items"); ok {
+			nt, err := dedupNamedTypes(v[ik], defined, childNS)
 			if err != nil {
 				return nil, err
 			}
-			v["items"] = nt
+			v[ik] = nt
 		}
-		if values, ok := v["values"]; ok {
-			nt, err := dedupNamedTypes(values, defined, childNS)
+		if vk, ok := ciKey(v, "values"); ok {
+			nt, err := dedupNamedTypes(v[vk], defined, childNS)
 			if err != nil {
 				return nil, err
 			}
-			v["values"] = nt
+			v[vk] = nt
 		}
 		return v, nil
 	case []any: // union branches
@@ -959,6 +1075,19 @@ type typeAliasResult struct {
 // This supports the type-alias struct tag, which sets aliases on the
 // named type referenced by a field (as opposed to alias= which sets
 // aliases on the field itself).
+//
+// Unlike the composition walkers (resolveNameScope and friends), this
+// walk reads its keys exact-case, which is sound because its input space
+// is structurally exact-case at every position the walk consults with
+// observable effect: inferType output is either an inferred literal or a
+// rendered custom tree, and the render (toJSONWalk) emits "type", "name",
+// "namespace", "aliases", "items", and "values" as literal keys. A
+// case-variant spelling can enter only through a Props value, which
+// cannot re-route this walk — a Props-smuggled "ITEMS" sits on a
+// non-array kind, where both spellings fall through to the same
+// not-a-named-type result — and the refName identity is used only as a
+// per-build bookkeeping key (applied[]), consistent across occurrences
+// within one build whichever way it resolves.
 func addTypeAliases(schema any, aliases []string) typeAliasResult {
 	switch s := schema.(type) {
 	case map[string]any:
@@ -1069,13 +1198,16 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 				return nil, fmt.Errorf("avro: a CustomType is registered for %s and supplies the schema; the field's logical-type tag %q has no effect — remove the tag, or set LogicalType/Schema on the CustomType", t, logical)
 			}
 			if ct.Schema != nil {
-				tree := ct.Schema.toJSON()
+				tree, err := renderCustomSchemaTree(ct.Schema)
+				if err != nil {
+					return nil, err
+				}
 				// The subtree is rendered relative to the null namespace;
 				// embedding it inside a namespaced tree must not let
 				// namespace inheritance capture its null-namespace types
 				// (see pinCustomSchemaScope). Only a namespaced SchemaFor
 				// scope can capture, so the null-scope build leaves the
-				// tree exactly as toJSON rendered it.
+				// tree exactly as rendered.
 				if namespace != "" {
 					pinCustomSchemaScope(tree)
 				}

@@ -48,7 +48,28 @@ type (
 // dedupNamedTypes → Marshal → Parse with the same opts) over a
 // reflect.StructOf-built struct, so cells can vary field layout at runtime
 // where the compile-time-generic SchemaFor[T] cannot.
-func schemaForScopeCell(fields []reflect.StructField, namespace string, customs []CustomType) (*Schema, error) {
+//
+// Every cell doubles as a mutation probe: each CustomType.Schema is
+// deep-snapshotted before the build and deep-compared after, pinning the
+// contract that a build never writes into caller-owned SchemaNode storage
+// (the metadata render hands Props containers over by reference, and the
+// composition walkers mutate the tree they are given — the boundary copy
+// in renderCustomSchemaTree is what keeps those writes off the caller's
+// maps). The comparison runs whether or not the build errors: a mutation
+// on an error path is just as much a contract break.
+func schemaForScopeCell(t *testing.T, fields []reflect.StructField, namespace string, customs []CustomType) (*Schema, error) {
+	t.Helper()
+	snaps := make([]*SchemaNode, len(customs))
+	for i, ct := range customs {
+		snaps[i] = snapshotSchemaNode(ct.Schema, make(map[*SchemaNode]*SchemaNode))
+	}
+	defer func() {
+		for i, ct := range customs {
+			if !reflect.DeepEqual(snaps[i], ct.Schema) {
+				t.Errorf("build mutated caller-owned CustomType.Schema storage (custom %d):\n before: %#v\n after:  %#v", i, snaps[i], ct.Schema)
+			}
+		}
+	}()
 	st := reflect.StructOf(fields)
 	seen := make(map[reflect.Type]seenForm)
 	s, err := inferRecord(st, "Top", namespace, seen, customs, make(appliedTypeAliases))
@@ -68,6 +89,78 @@ func schemaForScopeCell(fields []reflect.StructField, namespace string, customs 
 		opts[i] = ct
 	}
 	return Parse(string(b), opts...)
+}
+
+// snapshotSchemaNode deep-copies a SchemaNode tree, including the dynamic
+// containers reachable through Props and Default values, so a post-build
+// reflect.DeepEqual against the original detects any write the build made
+// into caller-owned storage. visited maps original Items/Values pointers to
+// their copies so pointer-built cycles copy with their topology intact.
+func snapshotSchemaNode(n *SchemaNode, visited map[*SchemaNode]*SchemaNode) *SchemaNode {
+	if n == nil {
+		return nil
+	}
+	if c, ok := visited[n]; ok {
+		return c
+	}
+	c := &SchemaNode{}
+	visited[n] = c
+	*c = *n
+	c.Aliases = append([]string(nil), n.Aliases...)
+	c.Symbols = append([]string(nil), n.Symbols...)
+	c.Items = snapshotSchemaNode(n.Items, visited)
+	c.Values = snapshotSchemaNode(n.Values, visited)
+	if n.Props != nil {
+		c.Props = snapshotAnyValue(n.Props).(map[string]any)
+	}
+	if n.Branches != nil {
+		c.Branches = make([]SchemaNode, len(n.Branches))
+		for i := range n.Branches {
+			c.Branches[i] = *snapshotSchemaNode(&n.Branches[i], visited)
+		}
+	}
+	if n.Fields != nil {
+		c.Fields = make([]SchemaField, len(n.Fields))
+		for i, f := range n.Fields {
+			cf := f
+			cf.Aliases = append([]string(nil), f.Aliases...)
+			cf.Type = *snapshotSchemaNode(&f.Type, visited)
+			cf.Default = snapshotAnyValue(f.Default)
+			if f.Props != nil {
+				cf.Props = snapshotAnyValue(f.Props).(map[string]any)
+			}
+			c.Fields[i] = cf
+		}
+	}
+	return c
+}
+
+// snapshotAnyValue deep-copies the JSON-shaped dynamic containers a Props
+// or Default value can hold; scalars are immutable and copy by value.
+func snapshotAnyValue(v any) any {
+	switch v := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, val := range v {
+			out[k] = snapshotAnyValue(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, e := range v {
+			out[i] = snapshotAnyValue(e)
+		}
+		return out
+	case []map[string]any:
+		out := make([]map[string]any, len(v))
+		for i, m := range v {
+			out[i] = snapshotAnyValue(m).(map[string]any)
+		}
+		return out
+	case []byte:
+		return append([]byte(nil), v...)
+	}
+	return v
 }
 
 // buildScopeCustomNode returns the custom schema for one (spelling, kind,
@@ -260,7 +353,7 @@ func TestMatrix_SchemaForCustomSchemaScope(t *testing.T) {
 					t.Run(name, func(t *testing.T) {
 						node, fullnames := buildScopeCustomNode(t, spelling, ks.kind, ks.shape)
 						ct := CustomType{GoType: primary, Schema: node}
-						s, err := schemaForScopeCell(scopeCellFields(occurrences, primary), ns, []CustomType{ct})
+						s, err := schemaForScopeCell(t, scopeCellFields(occurrences, primary), ns, []CustomType{ct})
 
 						// The one unrepresentable combination: a
 						// null-namespace type recurring inside a namespaced
@@ -312,7 +405,7 @@ func TestMatrix_SchemaForCustomSchemaScope(t *testing.T) {
 				{GoType: primary, Schema: aNode},
 				{GoType: partner, Schema: nullNode},
 			}
-			s, err := schemaForScopeCell(fields, ns, customs)
+			s, err := schemaForScopeCell(t, fields, ns, customs)
 			if err != nil {
 				t.Fatalf("a.X + null-namespace X must coexist: %v", err)
 			}
@@ -333,7 +426,7 @@ func TestMatrix_SchemaForCustomSchemaScope(t *testing.T) {
 				{GoType: primary, Schema: aNode},
 				{GoType: partner, Schema: &bRoot},
 			}
-			s, err := schemaForScopeCell(fields, ns, customs)
+			s, err := schemaForScopeCell(t, fields, ns, customs)
 			if err != nil {
 				t.Fatalf("a.X + b.X must coexist: %v", err)
 			}
@@ -354,7 +447,7 @@ func TestMatrix_SchemaForCustomSchemaScope(t *testing.T) {
 				{GoType: primary, Schema: n1},
 				{GoType: partner, Schema: n2},
 			}
-			s, err := schemaForScopeCell(fields, ns, customs)
+			s, err := schemaForScopeCell(t, fields, ns, customs)
 			if err != nil {
 				t.Fatalf("identical a.X definitions from two customs must dedup: %v", err)
 			}
@@ -381,7 +474,7 @@ func TestMatrix_SchemaForCustomSchemaScope(t *testing.T) {
 			{Name: "F3", Type: primary},
 		}
 		customs := []CustomType{{GoType: primary, Schema: nullNode}}
-		_, err := schemaForScopeCell(fields, "b", customs)
+		_, err := schemaForScopeCell(t, fields, "b", customs)
 		if err == nil || !strings.Contains(err.Error(), `the null-namespace type "X" recurs inside namespace "b"`) {
 			t.Fatalf("decoy cell must hit the corner error, got: %v", err)
 		}
@@ -397,11 +490,11 @@ func TestMatrix_SchemaForCustomSchemaScope(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					splitNode, _ := buildScopeCustomNode(t, "split", ks.kind, ks.shape)
 					dottedNode, _ := buildScopeCustomNode(t, "dotted", ks.kind, ks.shape)
-					sSplit, err := schemaForScopeCell(scopeCellFields(occurrences, primary), ns, []CustomType{{GoType: primary, Schema: splitNode}})
+					sSplit, err := schemaForScopeCell(t, scopeCellFields(occurrences, primary), ns, []CustomType{{GoType: primary, Schema: splitNode}})
 					if err != nil {
 						t.Fatalf("split: %v", err)
 					}
-					sDotted, err := schemaForScopeCell(scopeCellFields(occurrences, primary), ns, []CustomType{{GoType: primary, Schema: dottedNode}})
+					sDotted, err := schemaForScopeCell(t, scopeCellFields(occurrences, primary), ns, []CustomType{{GoType: primary, Schema: dottedNode}})
 					if err != nil {
 						t.Fatalf("dotted: %v", err)
 					}
@@ -410,6 +503,39 @@ func TestMatrix_SchemaForCustomSchemaScope(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+
+	// Props-carried container routes: a Props VALUE shaped like (or
+	// containing) a named definition is reachable by the composition
+	// walkers through the items/values keys and union slices, and the
+	// metadata render hands it over BY REFERENCE when it needs no JSON
+	// fixup. Every route × scope must leave the caller's storage untouched
+	// — the cell helper's snapshot asserts that — and the direct map check
+	// below re-asserts it on the user's own map object, independent of the
+	// snapshot machinery.
+	for _, route := range []string{"items", "values", "unionslice"} {
+		for _, ns := range []string{"", "b"} {
+			t.Run(fmt.Sprintf("propscarried/%s/ns=%q", route, ns), func(t *testing.T) {
+				userOwned := map[string]any{"type": "fixed", "name": "G", "size": 1}
+				want := map[string]any{"type": "fixed", "name": "G", "size": 1}
+				var carried any = userOwned
+				if route == "unionslice" {
+					carried = []any{userOwned}
+				}
+				key := route
+				if route == "unionslice" {
+					key = "items"
+				}
+				node := &SchemaNode{Type: "string", Props: map[string]any{key: carried}}
+				_, err := schemaForScopeCell(t, scopeCellFields(1, primary), ns, []CustomType{{GoType: primary, Schema: node}})
+				if err != nil {
+					t.Fatalf("cell errored: %v", err)
+				}
+				if !reflect.DeepEqual(userOwned, want) {
+					t.Errorf("caller-owned Props map changed: %v, want %v", userOwned, want)
+				}
+			})
 		}
 	}
 }
