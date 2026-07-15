@@ -3105,3 +3105,119 @@ had zero grep hits here before this section); the earlier 2026-07-12…
   conform, fastavro-PCF-calibrated) — all otherwise clean · RESET:
   streak to zero (the 79ed5b3-2nd clean full is superseded); fix is
   opt-in; next round quarantines commits after 79ed5b3.
+
+### Round narrative (2026-07-15 fix round, HEAD e4605fd), verbatim
+
+Fix granted for the SchemaFor x CustomType.Schema namespace finding; the
+overseer reproduced all three modes and ruled FIX (permissive: the dotted
+spelling proves the representation exists). Ruled behavior implemented
+exactly: dedupNamedTypes tracks the enclosing namespace with the parser's
+scope rules (shared helper resolveNameScope: dotted name takes precedence
+and its namespace attribute is ignored; an explicit attribute including the
+"" escape is authoritative; otherwise inherit), keys `defined` by RESOLVED
+FULLNAME, compares duplicate definitions on a SCOPE-NORMALIZED form
+(normalizeSchemaScope: definitions carry fullnames, bare references
+qualified by enclosing scope; dotted-vs-split and attribute-vs-inheritance
+renderings of one definition compare equal), and emits dedup references as
+the DOTTED FULLNAME. A null-namespace type's fullname has no dotted
+spelling: its bare reference is emitted only where the enclosing scope is
+null; anywhere else dedupNamedTypes returns a named error ("the
+null-namespace type %q recurs inside namespace %q ..."), the same corner
+the metadata rebuild documents at schema_node.go's reference-emission
+comment. A null-namespace DEFINITION landing in a non-null scope gets
+"namespace":"" injected by pinCustomSchemaScope, a frontier walk over
+ct.Schema.toJSON() output applied only when SchemaFor has a namespace: the
+subtree is rendered relative to the null namespace, so a frontier named
+node lacking a dot and an attribute declares null-namespace identity that
+inheritance would otherwise capture; below any pinned node every descendant
+renders relative to that node, so the walk stops at the first named node
+per path. No leading-dot spellings are emitted anywhere.
+
+Red-then-green pins, verified failing before the fix (schema_for_scope_test.go):
+TestRegression_SchemaForCustomSchemaSplitNamespaceSharedType (was: unknown
+type "X"), TestRegression_SchemaForCustomSchemaShortNameAcrossNamespaces
+(was: false "two different definitions"),
+TestRegression_SchemaForNullNamespaceCustomUnderWithNamespace (was: silent
+capture, namespace "b"), with
+TestRegression_SchemaForDottedCustomSchemaControl green throughout.
+
+Class matrix (permanent): TestMatrix_SchemaForCustomSchemaScope, 87 cells —
+spelling {split Root()-derived, dotted hand-built SchemaNode,
+null-namespace} x kind {record, enum, fixed} x occurrences {1, 2} x scope
+{default, WithNamespace("b")} x shape {flat; recursive (the custom schema
+references itself; its internal reference must still bind after embedding);
+nested named type in a DIFFERENT namespace (q.Inner) inside the subtree},
+plus coexistence cells (a.X + null-ns X; a.X + b.X; two customs carrying
+IDENTICAL a.X definitions in different spellings dedup to one definition +
+one reference — the scope-normalized-equality cell), the unrepresentable
+corner (null-ns x two fields x WithNamespace = exactly the named error) and
+a wrong-bind decoy (null-ns custom used before AND after a Go type that
+owns b.X: the corner error must fire; a bare reference would silently bind
+the DIFFERENT type b.X). Oracles per cell: build succeeds or hits exactly
+the corner error; output re-parses; parsed metadata preserves every
+declared fullname (definitions compared as a SET, references checked to
+BIND under enclosing-first-then-null-fallback rules — the first oracle
+draft treated reference SPELLINGS as fullnames and false-failed the
+split-recursive cells whose as-written internal bare reference is correct);
+split and dotted spellings byte-identical on Canonical() (20 equivalence
+pairs). The EXECUTED fastavro arm (TestDifferentialFastavroSchemaForScope,
+6 representative cells incl. dotted references, "namespace":"" escapes,
+recursion, nested-foreign, fixed): fastavro parses every output and its
+parsing canonical form matches twmb's byte-for-byte (PCF equality subsumes
+fingerprint equality with no byte-order presentation trap).
+
+Neuter verification, each component separately, disjoint signatures:
+(1) fullname keying reverted to short-name keying -> red: coexist/aX_nullX
+x2, coexist/aX_bX x2, corner/wrongbind_decoy,
+TestRegression_SchemaForCustomSchemaShortNameAcrossNamespaces.
+(2) dotted-reference emission reverted to short names -> red: every
+split+dotted occ2 cell (20), coexist/identical_dedup x2, equiv occ2 x10,
+TestRegression_SchemaForCustomSchemaSplitNamespaceSharedType,
+TestRegression_SchemaForDottedCustomSchemaControl.
+(3) "namespace":"" injection dropped -> red: all ten nullns x ns="b" cells
+(occ1 = capture, occ2 = corner-not-firing), coexist/aX_nullX/ns="b",
+corner/wrongbind_decoy,
+TestRegression_SchemaForNullNamespaceCustomUnderWithNamespace.
+(4) corner error replaced by bare-reference emission -> red: the five
+nullns/occ2/ns="b" cells and corner/wrongbind_decoy (the bare reference
+PARSES via the null-namespace fallback — only the must-error assertion and
+the decoy's wrong-bind detection catch it).
+
+Sibling sweep: seen[] record registration PROBED (recursive struct under
+WithNamespace emits the dotted "ns.recNS" self-reference) and fixed
+inference PROBED (definition inherits the namespace, repeat reference is
+the bare short name binding in that same scope; re-parses) — both pinned as
+control rows in TestRegression_SchemaForInferenceNameSpellings; inference
+repeats never reach dedupNamedTypes' reference arm (seen[] dedups them
+first), so the corner error cannot fire for inference-origin types.
+applied[]/addTypeAliases: the def-side refName (avroFullName over
+name+attribute) and the reference side (seen[]-emitted spellings) derive
+identically per family; custom trees never appear as references before
+dedup runs (each occurrence is a full definition), so the alias-dedup state
+is scope-consistent — unaffected. The metadata rebuild's deduper
+(toJSONWalk) was already fullname-keyed with fullname references and the
+documented null-ns corner — it was the model for this fix; the parser-side
+name RESOLVERS are untouched (this fix changes emission, not resolution).
+The one additional ct.Schema-pipeline consumer probe — the logical-tag
+validation path — found a real pre-existing silent drop: a logical-type tag
+on a CustomType-matched field was ignored (the custom arm returns before
+any tag validation), contradicting the documented strict-reject posture
+(NOT_BUGS #38). Fixed same round with its own red-then-green pin
+(TestRegression_SchemaForLogicalTagOnCustomMatchedFieldRejected; reject any
+logical tag when a custom matches, message directs to
+CustomType.LogicalType/Schema); NOT_BUGS #38 extended; CustomType docs
+gained the contract sentences (fullname preservation, the corner error, the
+tag reject).
+
+FIX.md checklist: retrospective gate verdict "not documented" (pickaxe:
+dedupNamedTypes landed in 3613195 for same-fullname collision
+generalization; namespace semantics never in scope; NOT_BUGS #38 covers
+tag strictness only); no new stdlib-amplification surface (the normalized
+compare is the same per-definition marshal shape the old code had, bounded
+by toJSON's node/byte budgets and maxDepth); suite green with zero existing
+assertion changes; vet clean; -race green on all new tests; isNamedKind
+covers "error" so error-kind customs flow through the same scope walk;
+DRY: resolveNameScope shared by the keying and equality walks (the
+parser/toJSONWalk scope rules remain type-distinct parallels, noted as
+lockstep). Full suite + fastavro differential green (exit 0); Java oracle
+not run locally (no JRE; everything since 5b8ce9d still unpushed).
