@@ -132,7 +132,7 @@ func schemaForType(t reflect.Type, opts ...SchemaOpt) (*Schema, error) {
 	if err != nil {
 		return nil, err
 	}
-	s, err = dedupNamedTypes(s, make(map[string]string))
+	s, err = dedupNamedTypes(s, make(map[string]string), "")
 	if err != nil {
 		return nil, err
 	}

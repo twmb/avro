@@ -59,15 +59,27 @@ type CustomType struct {
 	//
 	// [SchemaFor] uses GoType to match struct fields: when a field's Go
 	// type equals GoType, SchemaFor emits AvroType + LogicalType (or
-	// Schema) instead of the default type mapping. If nil, the custom
-	// type does not affect schema generation, but is still wired into
-	// the returned [*Schema] for encode/decode.
+	// Schema) instead of the default type mapping. Because the custom
+	// supplies the whole field schema, a logical-type tag on a matched
+	// field has no effect and is rejected — set LogicalType (or Schema)
+	// here instead. If nil, the custom type does not affect schema
+	// generation, but is still wired into the returned [*Schema] for
+	// encode/decode.
 	GoType reflect.Type
 
 	// Schema is the full schema to emit in SchemaFor. Only needed for
 	// types requiring extra metadata (fixed needs name+size, decimal
 	// needs precision+scale, records need fields). If nil, SchemaFor
 	// infers from AvroType + LogicalType.
+	//
+	// SchemaFor preserves every fullname the schema declares: a
+	// namespaced type keeps its namespace, and a null-namespace type
+	// embedded under [WithNamespace] keeps its null namespace (the
+	// emitted definition carries the "namespace":"" inheritance escape).
+	// One combination is unrepresentable and errors: a null-namespace
+	// type used on two or more fields under WithNamespace, because Avro
+	// has no reference spelling that reaches the null namespace from
+	// inside another namespace.
 	Schema *SchemaNode
 
 	// Encode converts a caller-provided Go value to an Avro-native

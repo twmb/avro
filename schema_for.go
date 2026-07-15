@@ -117,7 +117,7 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	if err != nil {
 		return nil, err
 	}
-	s, err = dedupNamedTypes(s, make(map[string]string))
+	s, err = dedupNamedTypes(s, make(map[string]string), "")
 	if err != nil {
 		return nil, err
 	}
@@ -128,38 +128,205 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 	return Parse(string(b), opts...)
 }
 
-// dedupNamedTypes walks a JSON-like schema tree (maps, slices, strings) and
-// replaces a repeated, IDENTICAL named-type definition (record/enum/fixed) with
-// a name reference. It also enforces the named-type invariant: each Avro name
-// must map to exactly ONE definition. When two DIFFERENT definitions claim the
-// same name — two different Go types, or two forms of one type (a [16]byte
-// named "uuid" used both ,uuid and plain; or, once supported, an avro.Duration
-// alongside a plain [12]byte named "duration") — it returns an error rather
-// than emitting an unrepresentable schema. This is the single, general
-// collision check; the fixed/record/enum arms above need not detect it.
-func dedupNamedTypes(v any, defined map[string]string) (any, error) {
+// resolveNameScope resolves a named-kind node's identity at its position,
+// following the parser's rules (spec, "Names"): a dotted name is a fullname
+// whose namespace attribute is ignored; an explicit namespace attribute
+// (including the "" inheritance escape) is authoritative; otherwise the
+// name inherits the enclosing namespace. Returns the resolved fullname and
+// the namespace scope the node opens for its children (record fields
+// resolve inside it). Shared by dedupNamedTypes and normalizeSchemaScope so
+// the keying walk and the equality walk cannot drift on scope rules.
+func resolveNameScope(v map[string]any, enclosingNS string) (full, ns string) {
+	name, _ := v["name"].(string)
+	short := name
+	ns = enclosingNS
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		short, ns = name[i+1:], name[:i]
+	} else if attr, ok := v["namespace"].(string); ok {
+		ns = attr
+	}
+	return avroFullName(ns, short), ns
+}
+
+// normalizeSchemaScope returns a copy of a schema tree with every name
+// resolved against its position — named definitions carry their fullname in
+// "name" with no separate namespace attribute, and bare name references are
+// qualified by the enclosing scope — so two renderings of one definition
+// compare equal exactly when they denote the same types. The raw relative
+// JSON of one definition can differ by position (an explicit namespace
+// attribute at one site, inheritance at another; dotted vs split
+// spellings), so dedupNamedTypes compares this normalized form.
+func normalizeSchemaScope(v any, enclosingNS string) any {
 	switch v := v.(type) {
 	case map[string]any:
-		// Is this a named type definition?
-		if name, _ := v["name"].(string); name != "" {
-			if typ, _ := v["type"].(string); isNamedKind(typ) {
-				cur, _ := json.Marshal(v)
-				if prev, exists := defined[name]; exists {
-					if string(cur) == prev {
-						return name, nil // identical — emit reference
-					}
-					return nil, fmt.Errorf("avro: SchemaFor: the Avro name %q is produced by two different "+
-						"definitions (two Go types, or a logical and a plain form of one type, mapping to one "+
-						"fixed/record/enum name); each Avro named type must be unique — rename a Go type so the "+
-						"names are distinct", name)
+		out := make(map[string]any, len(v))
+		childNS := enclosingNS
+		var full string
+		named := false
+		if typ, _ := v["type"].(string); isNamedKind(typ) {
+			named = true
+			full, childNS = resolveNameScope(v, enclosingNS)
+		}
+		for k, val := range v {
+			switch {
+			case named && k == "name":
+				out[k] = full
+			case named && k == "namespace":
+				// Folded into the fullname.
+			case k == "fields":
+				fields, ok := val.([]map[string]any)
+				if !ok {
+					out[k] = val
+					continue
 				}
-				defined[name] = string(cur)
+				nf := make([]map[string]any, len(fields))
+				for i, f := range fields {
+					cf := make(map[string]any, len(f))
+					for fk, fv := range f {
+						if fk == "type" {
+							cf[fk] = normalizeSchemaScope(fv, childNS)
+						} else {
+							cf[fk] = fv
+						}
+					}
+					nf[i] = cf
+				}
+				out[k] = nf
+			case k == "items" || k == "values":
+				out[k] = normalizeSchemaScope(val, childNS)
+			default:
+				out[k] = val
 			}
 		}
-		// Recurse into children that can hold schemas.
+		return out
+	case []any: // union branches
+		out := make([]any, len(v))
+		for i, b := range v {
+			out[i] = normalizeSchemaScope(b, enclosingNS)
+		}
+		return out
+	case string:
+		// A primitive stays itself; a dotted reference is already a
+		// fullname; a bare reference resolves in the enclosing namespace.
+		if avroPrimitives[v] || strings.Contains(v, ".") || enclosingNS == "" {
+			return v
+		}
+		return enclosingNS + "." + v
+	}
+	return v
+}
+
+// pinCustomSchemaScope pins the namespace scope of a CustomType.Schema
+// subtree that is about to be embedded inside a namespaced SchemaFor tree.
+// toJSON renders the subtree relative to the null namespace, so a named
+// node that neither carries a dotted name nor a namespace attribute
+// declares the NULL namespace — but at a namespaced embedding position the
+// parser's inheritance would capture it into the surrounding namespace,
+// silently renaming the user's declared type. Inject the "namespace":""
+// inheritance escape on each such node — the same escape toJSONWalk emits
+// for a null-namespace type inside a namespaced scope. The walk stops at
+// the first named node on every path: once a node pins its scope (dotted
+// name, explicit attribute, or this injection), everything below it renders
+// relative to that node and is position-independent already.
+func pinCustomSchemaScope(v any) {
+	switch v := v.(type) {
+	case map[string]any:
+		if typ, _ := v["type"].(string); isNamedKind(typ) {
+			if name, _ := v["name"].(string); !strings.Contains(name, ".") {
+				if _, has := v["namespace"]; !has {
+					v["namespace"] = ""
+				}
+			}
+			return
+		}
+		// Unnamed containers pass the enclosing scope through; descend to
+		// the named frontier.
+		if items, ok := v["items"]; ok {
+			pinCustomSchemaScope(items)
+		}
+		if values, ok := v["values"]; ok {
+			pinCustomSchemaScope(values)
+		}
+	case []any: // union branches
+		for _, b := range v {
+			pinCustomSchemaScope(b)
+		}
+	}
+}
+
+// dedupNamedTypes walks a JSON-like schema tree (maps, slices, strings) and
+// replaces a repeated, IDENTICAL named-type definition (record/enum/fixed)
+// with a name reference. It tracks the enclosing namespace exactly as the
+// parser does (resolveNameScope: a named definition opens its own scope),
+// so:
+//
+//   - definitions are keyed by their RESOLVED FULLNAME — name equality is
+//     defined on the fullname (spec, "Names"), so distinct fullnames that
+//     share a short name (a.X and X) coexist rather than collide;
+//   - a repeated identical definition dedups to a DOTTED fullname
+//     reference, which re-binds position-independently anywhere; a
+//     null-namespace type's fullname has no dotted spelling, so its bare
+//     reference is emitted only where the enclosing scope is null — at any
+//     namespaced position a bare name binds in the enclosing namespace and
+//     references have no "namespace":"" escape, so that corner returns a
+//     named error instead of a dangling or wrong-binding reference;
+//   - two occurrences of one fullname compare on their SCOPE-NORMALIZED
+//     forms (normalizeSchemaScope), since the same definition's relative
+//     JSON differs by position.
+//
+// It also enforces the named-type invariant: each Avro fullname must map to
+// exactly ONE definition. When two DIFFERENT definitions claim the same
+// fullname — two different Go types, or two forms of one type (a [16]byte
+// named "uuid" used both ,uuid and plain; or, once supported, an
+// avro.Duration alongside a plain [12]byte named "duration") — it returns
+// an error rather than emitting an unrepresentable schema. This is the
+// single, general collision check; the fixed/record/enum arms above need
+// not detect it.
+func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any, error) {
+	switch v := v.(type) {
+	case map[string]any:
+		childNS := enclosingNS
+		// Is this a named type definition? An expressible fullname is the
+		// registration key; fullname "" (an empty lax name with no
+		// namespace) has no reference spelling, so it stays inline and
+		// un-deduped, mirroring the metadata rebuild's dedup walker.
+		if typ, _ := v["type"].(string); isNamedKind(typ) {
+			full, ns := resolveNameScope(v, enclosingNS)
+			childNS = ns
+			if full != "" {
+				cur, err := json.Marshal(normalizeSchemaScope(v, enclosingNS))
+				if err != nil {
+					return nil, fmt.Errorf("avro: SchemaFor: marshaling %q for the duplicate-definition check: %w", full, err)
+				}
+				if prev, exists := defined[full]; exists {
+					if string(cur) != prev {
+						return nil, fmt.Errorf("avro: SchemaFor: the Avro name %q is produced by two different "+
+							"definitions (two Go types, or a logical and a plain form of one type, mapping to one "+
+							"fixed/record/enum fullname); each Avro named type must be unique — rename a Go type so the "+
+							"names are distinct", full)
+					}
+					// Identical — emit a reference. A dotted fullname
+					// re-binds position-independently; a null-namespace
+					// fullname is spellable only from a null enclosing
+					// scope.
+					if strings.Contains(full, ".") || enclosingNS == "" {
+						return full, nil
+					}
+					return nil, fmt.Errorf("avro: SchemaFor: the null-namespace type %q recurs inside namespace %q, "+
+						"where no reference can denote it (a bare name binds in the enclosing namespace, and "+
+						"references have no \"namespace\":\"\" escape); give the type a namespace so a dotted "+
+						"reference can name it, or build without WithNamespace", full, enclosingNS)
+				}
+				defined[full] = string(cur)
+			}
+		}
+		// Recurse into children that can hold schemas. Record fields
+		// resolve in the record's own namespace scope; items and values
+		// belong to unnamed array/map nodes, which pass the scope through
+		// (childNS == enclosingNS there).
 		if fields, ok := v["fields"].([]map[string]any); ok {
 			for i, f := range fields {
-				nt, err := dedupNamedTypes(f["type"], defined)
+				nt, err := dedupNamedTypes(f["type"], defined, childNS)
 				if err != nil {
 					return nil, err
 				}
@@ -167,14 +334,14 @@ func dedupNamedTypes(v any, defined map[string]string) (any, error) {
 			}
 		}
 		if items, ok := v["items"]; ok {
-			nt, err := dedupNamedTypes(items, defined)
+			nt, err := dedupNamedTypes(items, defined, childNS)
 			if err != nil {
 				return nil, err
 			}
 			v["items"] = nt
 		}
 		if values, ok := v["values"]; ok {
-			nt, err := dedupNamedTypes(values, defined)
+			nt, err := dedupNamedTypes(values, defined, childNS)
 			if err != nil {
 				return nil, err
 			}
@@ -183,7 +350,7 @@ func dedupNamedTypes(v any, defined map[string]string) (any, error) {
 		return v, nil
 	case []any: // union branches
 		for i, elem := range v {
-			nt, err := dedupNamedTypes(elem, defined)
+			nt, err := dedupNamedTypes(elem, defined, enclosingNS)
 			if err != nil {
 				return nil, err
 			}
@@ -892,8 +1059,27 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 	// Check custom types before anything else (including pointer unwrapping).
 	for _, ct := range customTypes {
 		if ct.GoType != nil && ct.GoType == t {
+			// The custom supplies the field's schema, so a logical-type tag
+			// on the field has nothing to apply to. Accepting it would
+			// silently drop the user's tag — the lying-schema outcome the
+			// logical-tag strictness rejects everywhere else (the
+			// avro.Duration and uuid/decimal wrong-kind arms) — so reject
+			// with the remedy: the logical type belongs on the CustomType.
+			if logical != "" {
+				return nil, fmt.Errorf("avro: a CustomType is registered for %s and supplies the schema; the field's logical-type tag %q has no effect — remove the tag, or set LogicalType/Schema on the CustomType", t, logical)
+			}
 			if ct.Schema != nil {
-				return ct.Schema.toJSON(), nil
+				tree := ct.Schema.toJSON()
+				// The subtree is rendered relative to the null namespace;
+				// embedding it inside a namespaced tree must not let
+				// namespace inheritance capture its null-namespace types
+				// (see pinCustomSchemaScope). Only a namespaced SchemaFor
+				// scope can capture, so the null-scope build leaves the
+				// tree exactly as toJSON rendered it.
+				if namespace != "" {
+					pinCustomSchemaScope(tree)
+				}
+				return tree, nil
 			}
 			if ct.AvroType == "" {
 				return nil, fmt.Errorf("avro: CustomType for %s has no AvroType or Schema; cannot infer schema (set AvroType or Schema for SchemaFor)", t)
