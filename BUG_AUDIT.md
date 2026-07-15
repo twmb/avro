@@ -2907,3 +2907,201 @@ or quoted this round (fastavro probes + arm; Java Schema.java read).
 CONVERGENCE: 1 behavioral fixed same round; the counter stays at ZERO
 (dedicated round, not a bare full round); the rebuild still needs two
 consecutive clean bare FULL rounds.
+
+## Distillation archive (2026-07-15)
+
+Round-ledger entry originals moved VERBATIM from AUDIT_CORE.md §Round
+ledger on 2026-07-15, when the file stood at 62,336 B against its ~55KB
+bound and the 2026-07-12-onward entries had accumulated full narratives in
+place of the one-entry-per-round format. The compressed lines now in
+AUDIT_CORE.md are operative; these originals are kept so compression loses
+nothing. The 3a4d233 (2nd) trust-boundary census and the 79ed5b3 (2nd) and
+(3rd) FULL-round narratives had never been archived (their distinctive
+phrases — checkedReader, callback_contract, soe/rabin, dedupNamedTypes —
+had zero grep hits here before this section); the earlier 2026-07-12…
+2026-07-14 entries are archived as they stood at compression time.
+
+### Round-ledger entry originals (2026-07-12 through 2026-07-14 · 79ed5b3 3rd), verbatim
+
+- 2026-07-12 · 8ee2b1b (2nd) · FULL · empty · 1 behavioral FILED→FIXED same
+  round as 9733042 (appendAvroString trusted AppendText's returned slice:
+  fresh-short PANICS Encode, fresh-long silently replaces sibling bytes;
+  minimal shrunk-return guard ruled; return-shape × position matrix + JSON
+  immunity, neuter-verified; #61; json/v2 panics identically, EXECUTED) ·
+  fastavro RAN · RESET (stands; fixed same round). ser/resolve/custom_type
+  first walks otherwise clean.
+- 2026-07-12 · 9733042 (2nd) · FULL · 8ee2b1b..9733042 clear · 1 behavioral
+  FILED→FIXED same round as b25d878 (SchemaCache splice walkers never
+  walked FLAT array/map items/values — cross-parse refs dangled, defs
+  uncollected; walkers gated on flatFieldNeedsLift; FEATURE × WALKER
+  harness landed: 8 rows × 11 drivers, neuter ×2 incl. the ns-decoy
+  wrong-bind trap) · fastavro RAN · RESET (stands; fixed same round).
+  json_scan/promote/cache walks otherwise clean.
+- 2026-07-12 · b25d878 (3rd; commits → c6908cd) · DEDICATED census
+  (neutral) · empty · 0 behavioral · FEATURE × WALKER harness populated to
+  28 rows / 308 cells (1c24aba..44e4ffa + c6908cd), every family
+  neuter-proven; §Open net gaps EMPTY · oracles not run (test-only).
+- 2026-07-12 · afe3b68 (4th) · DEDICATED cleanliness per CLEAN.md (neutral)
+  · own commits f336025..afe3b68 (walkNodeChildren/nodeChildScope
+  consolidation 3→1; C9 race-ceiling repair) · 0 behavioral shipped; 1
+  behavioral FILED (collectTreeDefs keyless-def carve-out — B7 2nd
+  instance: defs misfile, stale splice) · fastavro RAN each step.
+- 2026-07-13 · 18988c2 · FIX · keyless defs FIXED (collect visits every
+  named KIND under the parser's fullname; sibling seen-gates dropped;
+  nodeHasStringName deleted; keyless matrix, lockstep-guard neuter) · 1 NEW
+  behavioral FILED (leading-dot names stored verbatim, parser internally
+  inconsistent — B7 3rd instance, BLOCKING) · oracles not run
+  (metadata-only fix, twin-asserted per cell).
+- 2026-07-14 · f47083c · FIX · leading-dot FIXED (ruled NORMALIZE AT PARSE:
+  one leading dot = the null-namespace escape; Java Name-ctor quoted,
+  fastavro EXECUTED, premise correction recorded; shared leadingDotName ×3
+  resolvers; normalization matrix, "." family joins #60 numerically; #62) ·
+  fastavro EXECUTED for the family.
+- 2026-07-14 · f47083c (2nd) · FULL · empty · 0 behavioral · fastavro RAN;
+  -race + fuzz clean; Java in CI (all since 5b8ce9d UNPUSHED) ·
+  skip/reflect/logical/schema_walk walks clean · clean full #1 since the
+  07-12 reset.
+- 2026-07-14 · f47083c (3rd) · FULL · empty · 1 behavioral FILED (stray
+  precision/scale HARD-REJECTED at parse exactly when no logical or a valid
+  non-decimal logical accompanies them — fastavro EXECUTED 9/9 accept, Java
+  props source-quoted, field-level twin already Props) + 2 policy items ·
+  fastavro EXECUTED · RESET pending adjudication. schema.go +
+  schema_parse.go end-to-end walks otherwise clean.
+- 2026-07-14 · 5717f32 · FIX · stray precision/scale FIXED (adjudicated
+  ACCEPT AS INERT METADATA: recognized-decimal carriers consume, every
+  other placement is Props on all surfaces; 70-cell placement × level ×
+  kind matrix + fastavro PCF calibration, neuter ×2 both components; #63
+  structural-key keep-strict + #54 extended) · fastavro RAN; Java in CI
+  (still unpushed) · counter at ZERO; rebuild needs two consecutive clean
+  FULL rounds. Next round quarantines commits after 5717f32.
+- 2026-07-14 · 5717f32 (2nd) · DEDICATED distillation + ATTRIBUTE ×
+  PLACEMENT census (streak-neutral save the finding) · empty · 1 behavioral
+  FILED→FIXED same round as 70c7c1c (stray namespace on array/map
+  hard-rejected while primitives parsed it — fastavro EXECUTED accept +
+  non-scoping, Java SCHEMA_RESERVED quoted; ruled ACCEPT AS INERT; the
+  o.Name half KEPT strict per nsForChildren's scope-by-Name walker-parity
+  hazard; canon tree clears the attr; one unmarked 13a pin flipped; #64;
+  #63 capture-drop edge corrected by execution) · CENSUS: 12 attrs × 14
+  kinds (+union field) × 2 levels = 272 cells — 24 documented #63 rejects
+  (fastavro-accept asserted per cell), 2 findings (fixed), 246 parity
+  accepts, routing pinned (28 props / 98 captured / 120 field Props) +
+  dropped-subtree agreement cells + the harness decoy row; fastavro arm EXECUTED 273/273 0 skips; Java
+  cisuite arm added (CI-filter-matching, PCF equality per accept cell),
+  not run locally (no JRE; all since 5b8ce9d UNPUSHED) · NEUTER ×3
+  disjoint (validateLogical tail reject → the 28 precision/scale cells;
+  namespace guard → 19 cells incl. all 11 harness drivers; canon-clear →
+  the canonical-sensitive subset) · DISTILLATION:
+  AUDIT_CORE 163,716→~55,000 B, AUDIT_PATTERNS 147,594→138,745 B
+  (B7/B33/B34 tombstoned), BUG_AUDIT holds every removed byte · fastavro
+  RAN ×3; -race green · counter stays ZERO; rebuild needs two
+  consecutive clean bare FULL rounds. Commits 70c7c1c (fix+census) +
+  3a4d233 (docs), NOT pushed. Next round quarantines 5717f32..3a4d233
+  (fix UNCONVERGED).
+- 2026-07-14 · 3a4d233 (2nd) · DEDICATED trust-boundary census
+  (streak-neutral save findings) · 5717f32..3a4d233 cleared
+  (decoy-qualified ref dangles, rebuild stable — executed) · 6
+  behavioral FILED→FIXED same round: (1) lying io.Reader count (n<0 /
+  n>len, nil err) PANICKED through ocf.NewReader/NewAppendWriter
+  (bufio arithmetic; encoding/json panics identically EXECUTED) →
+  checkedReader named error; (2) lying io.Writer count silently
+  truncated the file at both write sites (encoding/json trusts
+  identically EXECUTED; io.Copy/bufio discipline chosen) → writeFull
+  io.ErrShortWrite + invalid-count; (3) JSON-encode user-value rejects
+  lacked the binary twins' *SemanticError identity (enum unknown-symbol
+  ×4 input arms + ordinal, fixed size mismatch, missing defaultless
+  field) → unified to binary constructions; decode wire-content stays
+  plain BOTH wires + already-agreeing families PINNED as the boundary;
+  (4) a (0,nil)-stuck reader LIVELOCKED the block-data io.ReadFull
+  (bufio bounds only its buffered path — executed 5s spin mid-block vs
+  ErrNoProgress mid-header) → checkedReader 100-empty-reads bound;
+  (5)+(6) user-originated io.EOF (codec Decompress error; CustomType
+  decode callback) matched Decode's clean-end sentinel through the
+  decompress/datum %w wraps, contradicting #57's exclusivity →
+  noEOF at both wraps · CENSUS: 16 callback-return sites classified
+  (site → guarded / signature-immune / trusted-documented / fixed;
+  table in the round report): AppendText-inplace GUARDED #61 ·
+  materializing text-out ×6 sites guarded-by-construction ·
+  TextUnmarshaler signature-immune · CustomType Encode/Decode guarded
+  (nil reject / setCustomResult / errors.Is skip) · WithLaxNames +
+  IsZero signature-immune · Compress trusted-content (error poisons,
+  Close still runs) · Decompress real-len arithmetic (lying bound =
+  #45 clause; aliasing safe — owned-values pin incl. reused-buffer
+  codec) · io.Reader FIXED ×2 · io.Writer FIXED · ReaderSchemaFunc
+  guarded · Codec.Name capped · Seek ignored · map keys never
+  consulted (pinned) · Props stdlib-named · permanent matrices ~126
+  avro + ~26 ocf cells, neuter ×9 incl. two dodge catches
+  (recordFieldError fallback masks top-level arms; helper-message
+  neuter masked by call-site wrap) · #65 #66 new + #45 clause; B10
+  extended (wrong-CONTENT axis, top-level assertion rule) · fastavro
+  EXECUTED; -race green both pkgs; Java oracle validated through
+  18988c2 (CI run 29345609516 GREEN) — unvalidated remainder
+  f47083c..HEAD incl. this round · counter stays ZERO (fixed same
+  round). Commit 79ed5b3, NOT pushed. Next round quarantines
+  3a4d233..79ed5b3 (fix UNCONVERGED).
+- 2026-07-14 · 79ed5b3 (2nd) · FULL · 3a4d233..79ed5b3 cleared
+  (checkedReader wraps BOTH construction sites and every read path incl.
+  the io.CopyN limit-reader route; NewAppendWriter seek is absolute-end;
+  writeFull at both user-writer sites, flate write is internal
+  bytes.Buffer; noEOF→ErrUnexpectedEOF at both new wraps; JSON
+  SemanticError arms — 4 enum + ordinal + fall-through + fixed size +
+  missing-key via recordFieldError — byte-shape-match the binary twins)
+  · 0 behavioral · fastavro RAN (venv rebuilt, 1.12.2); -race green both
+  pkgs; fuzz RT+jsonRT 75s×2 sequential clean; Java NOT run (no JRE;
+  validated in CI through 18988c2, f47083c..79ed5b3 unpushed) · fronts:
+  B25 inverse-density soe/rabin/compat (alias-collision candidate killed
+  by #50's parse guard — reachable double-claim variant probe-verified
+  consistent *CompatibilityError from both paths; recursive memo,
+  promotion order, resolved-SOE fp gating probe-verified) +
+  json_decode.go materializer (native gates exclude logical+custom;
+  json.Number keys forced to validated reflect path; [N]T count errors
+  match binary SemanticError; alias-keyed decode is Java-parity pinned
+  conformance_test.go:7547) + Y4/P1/B20/P18 grep refresh (all hits
+  guarded) + deser.go spot walk — all clean · NOTE (comment-only):
+  resolveRecord's fastavro claim ("second falls through to skip_data")
+  holds only for the name+alias sub-case; a two-ALIAS double-claim
+  last-wins in fastavro (aliases_field_dict never pruned) — behavior
+  unaffected, both twmb paths reject; candidate for next CLEAN pass ·
+  clean full #1 since the 07-14 zero; one more consecutive clean bare
+  FULL converges. Next round quarantines commits after 79ed5b3 (none
+  yet — empty scope unless new code lands).
+- 2026-07-14 · 79ed5b3 (3rd) · FULL · empty · 1 behavioral FILED
+  (SchemaFor composes CustomType.Schema toJSON subtrees scope-naively:
+  dedupNamedTypes keys defined[] and emits references by SHORT name while
+  toJSON splits name/namespace — a split-spelling namespaced custom on
+  two fields dedups to a bare ref that dangles ("unknown type \"X\"");
+  distinct fullnames a.X vs X false-collide ("two different
+  definitions"); and a null-namespace custom under WithNamespace is
+  silently CAPTURED into the SchemaFor namespace at the internal Parse
+  (wire-visible identity change, no "namespace":"" escape emitted) — 3
+  probes verified failing in /tmp/avro_audit_verify/round6; the
+  dotted-name spelling of the same schemas passes (parser stores dotted
+  Name verbatim), so the two spec-equivalent spellings diverge; spec
+  Names ¶ quoted (_index.md:250-254), Java Name.full cited
+  (Schema.java:719-739), fastavro N/A (no SchemaFor — internal
+  consistency, NOT_BUGS #38 framing); inference-only trees immune
+  (seen[] refs are fullnames, single uniform namespace)) · fastavro RAN
+  (differential executing confirmed via -v); -race green both pkgs; fuzz
+  RT+jsonRT 75s×2 sequential clean; Java NOT run (no JRE; CI-validated
+  through 18988c2, f47083c..79ed5b3 unpushed) · fronts: schema_for.go +
+  atype end-to-end (B21/inverse-density: big.Rat VALUE encode/decode
+  cells verified both directions (decimalRatFor tmp-copy /
+  setDecimalRat), inferTimeLike × ser time-arm cells parity-checked
+  incl. duration-on-date serInt fallback (doc'd meaningless-but-
+  allowed), dedup fields-shape matches toJSONWalk's []map[string]any,
+  bigRatPtrType switch arm unreachable (pointer arm intercepts — dead
+  code, cosmetic only)) + json_codec.go end-to-end (every arm twin-cited
+  vs ser.go and verified: tagged-map→nil-first→type-name→try-each with
+  2-branch null-skip hook parity, union tag = fullname (Java
+  getFullName parity), encodeDefault as union-default branch authority,
+  codepoint bytes mapping inverse-paired, jsonCoerce* SemanticError
+  wraps, native fast-path gates exclude logical+custom+json.Number
+  keys) + narrow-before-check trilogy grep refresh (int(v.Uint()) /
+  int64(f) / k*size: only live hit 8*len(b) in bytesToBigInt guarded by
+  checkDecimalUnscaledLen at every wire caller incl. json fixed-decimal
+  *any at json_decode.go:780; varint shifts loop-counter-bounded) +
+  varint.go/errors.go/schema_canonical.go walks (uvarintLens verified
+  per Len32 index 0-32, 5th/10th-byte canonical-overflow rejects;
+  render-truncation uniform across *Error types; PCF [ORDER]/[STRINGS]
+  conform, fastavro-PCF-calibrated) — all otherwise clean · RESET:
+  streak to zero (the 79ed5b3-2nd clean full is superseded); fix is
+  opt-in; next round quarantines commits after 79ed5b3.
