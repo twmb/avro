@@ -3221,3 +3221,409 @@ DRY: resolveNameScope shared by the keying and equality walks (the
 parser/toJSONWalk scope rules remain type-distinct parallels, noted as
 lockstep). Full suite + fastavro differential green (exit 0); Java oracle
 not run locally (no JRE; everything since 5b8ce9d still unpushed).
+
+## Distillation archive (2026-07-15)
+
+Verbatim originals archived at the 2026-07-15 fix round's close: the
+2026-07-15 FULL round's report (filed in-conversation, never previously
+archived), followed by the fix round's narrative. The compressed ledger
+lines in AUDIT_CORE.md are the operative record; these are the full
+narratives behind them.
+
+### 2026-07-15 FULL round report (HEAD c6f75a2) — verbatim
+
+# Audit round 2026-07-15 · FULL · HEAD c6f75a2
+
+**TL;DR: 5 behavioral findings filed (verified failing, no fixes applied — fix mode is opt-in). The quarantine of yesterday's `e4605fd` fix is NOT clean: 3 findings in its new code, all one family (schema_for's walkers read reserved attribute keys exact-case while the Parse they feed folds case-insensitively per NOT_BUGS #46, plus a by-reference mutation of caller-owned memory). The walk added 2: alias matching accepts what Java+fastavro both reject, and SchemaFor silently nulls an over-budget Props value. Convergence counter stays at zero.**
+
+Net: `go test -count=1 ./...` green (avro 26.5s, ocf 6.1s); fastavro differential **EXECUTED** (venv alive, differential subtests ran); `-race` green both packages; fuzz `FuzzDecodeEncodeRoundTrip` + `FuzzDecodeJSONRoundTrip` 60s each, clean. **Java oracle NOT run** (no local JRE; CI green only through 18988c2 — everything since is unpushed), so Java-parity claims below cite source, and the two alias probes were corroborated by *executed* fastavro instead.
+
+---
+
+## Quarantine: 79ed5b3..e4605fd — 3 findings
+
+Finding: SchemaFor mutates caller-owned CustomType.Schema Props storage
+File:line: schema_for.go:237 (mutator), schema_node.go:260-265 (by-reference mechanism)
+Severity: correctness (library writes into caller-owned memory)
+Why it's wrong: toJSON returns Props container values BY REFERENCE when no
+JSON fixup is needed — documented: "the user's SchemaNode storage is never
+mutated" (schema_node.go:257-259). pinCustomSchemaScope then walks the
+emitted tree and writes "namespace":"" into any bare-named named-kind map it
+reaches via an items/values key or union slice. When that map is the user's
+own Props value, SchemaFor permanently mutates the caller's data.
+
+Broken code (verbatim from disk):
+
+    // schema_for.go:231-239
+    func pinCustomSchemaScope(v any) {
+        switch v := v.(type) {
+        case map[string]any:
+            if typ, _ := v["type"].(string); isNamedKind(typ) {
+                if name, _ := v["name"].(string); !strings.Contains(name, ".") {
+                    if _, has := v["namespace"]; !has {
+                        v["namespace"] = "" // ← this map can be the CALLER'S Props value,
+                    }                       //   returned by reference from jsonSerializableValue
+                }
+                return
+            }
+
+User-visible breakage (what a caller writes that doesn't work):
+
+    package main
+
+    import (
+        "fmt"
+        "reflect"
+        "github.com/twmb/avro"
+    )
+
+    type C struct{ V string }
+    type R struct{ A C `avro:"a"` }
+
+    func main() {
+        mine := map[string]any{"type": "fixed", "name": "F", "size": 1}
+        ct := avro.CustomType{
+            GoType: reflect.TypeOf(C{}),
+            Schema: &avro.SchemaNode{Type: "string", Props: map[string]any{"items": mine}},
+            Encode: func(v any, _ *avro.SchemaNode) (any, error) { return v.(C).V, nil },
+            Decode: func(v any, _ *avro.SchemaNode) (any, error) { return C{V: v.(string)}, nil },
+        }
+        avro.SchemaFor[R](avro.WithNamespace("com.example"), avro.WithCustomType(ct))
+        fmt.Println(mine) // my map changed
+    }
+
+Expected (doc-string contract): `map[name:F size:1 type:fixed]` — user storage never mutated
+Actual: `map[name:F namespace: size:1 type:fixed]` — gained `"namespace":""`
+
+Verification output:
+
+    --- FAIL: TestRegression_SchemaForMutatesUserPropsStorage (0.00s)
+        quarantine_test.go:45: user map after:  map[name:F namespace: size:1 type:fixed]
+        quarantine_test.go:47: SchemaFor mutated the caller-owned Props map: gained key "namespace" (value "")
+
+Sibling sweep: `normalizeSchemaScope` copies (clean). `dedupNamedTypes`' in-place rewrites (`v["items"] = nt`, `f["type"] = nt`, pre-existing) have the same reachability through Props-carried containers — same root cause, same fix, not separately tested. Suggested fix: defensively copy the custom subtree at the SchemaFor embedding boundary (schema_for.go:1072) before pin/dedup touch it.
+
+---
+
+Finding: schema_for walkers read reserved keys exact-case; Parse folds case-insensitively → dedup reference dangles
+File:line: schema_for.go:140,145 (resolveNameScope); same family: 235-236, 285+ reads
+Severity: correctness (spurious reject of a documented-equivalent spelling)
+Why it's wrong: NOT_BUGS #46: "Reserved Avro attribute names are matched
+case-insensitively; a custom Props key differing from a reserved name only by
+ASCII case is folded onto the reserved attribute (same on parse and Root(),
+so no metadata↔wire divergence)." schema_for is now a third surface, and it
+does NOT fold: dedup keys the definition under the inherited-namespace
+fullname while the final Parse binds it under the CI-folded namespace, so the
+emitted dedup reference dangles.
+
+Broken code (verbatim from disk):
+
+    // schema_for.go:139-149
+    func resolveNameScope(v map[string]any, enclosingNS string) (full, ns string) {
+        name, _ := v["name"].(string)                        // ← exact-case read
+        short := name
+        ns = enclosingNS
+        if i := strings.LastIndex(name, "."); i >= 0 {
+            short, ns = name[i+1:], name[:i]
+        } else if attr, ok := v["namespace"].(string); ok {  // ← exact-case; Parse uses lookupCI
+            ns = attr
+        }
+        return avroFullName(ns, short), ns
+    }
+
+User-visible breakage: a `CustomType.Schema` fixed named `F` with `Props{"NAMESPACE": "x.y"}` used on **two** struct fields.
+Expected (per #46 — the exact-case spelling and the one-field case both work): schema with one definition + reference `"x.y.F"`
+Actual: `SchemaFor` fails: `unknown type "F"`
+
+Verification output (controls prove input validity — exact-case twin and one-field form both succeed):
+
+    --- FAIL: TestRegression_SchemaForCaseFoldedNamespaceDedup (0.00s)
+        control (namespace, two fields): err=<nil> ... {"name":"F","namespace":"x.y",...},{"name":"b","type":"x.y.F"}
+        one field (NAMESPACE): err=<nil>
+        two fields (NAMESPACE) failed while one field parses and the exact-case twin works: unknown type "F"
+
+---
+
+Finding: pin injection silently overrides a CI-spelled namespace — wire-visible identity change (regression in e4605fd)
+File:line: schema_for.go:237 + schema_node.go:1052-1055 (lookupCI exact-case preference)
+Severity: correctness / silent identity change
+Why it's wrong: with Props{"NAMESPACE":"x.y"} and WithNamespace, pin sees no
+exact-case "namespace" key and injects "namespace":""; at Parse the injected
+exact-case key WINS over the user's CI-spelled one (lookupCI prefers exact),
+so the type's declared namespace is silently replaced by the null namespace.
+Before e4605fd this spelling parsed correctly (identity x.y.F). Fingerprints,
+references, and resolution identity all change silently.
+
+Verification output (canonical form asserts the identity):
+
+    --- FAIL: TestRegression_SchemaForPinOverridesCaseFoldedNamespaceIdentity (0.00s)
+        bare canonical:          {...{"name":"x.y.F","type":"fixed","size":1}}]}
+        WithNamespace canonical: {...{"name":"F","type":"fixed","size":1}}]}   ← x.y silently dropped
+
+Suggested fix (covers both #46 findings): schema_for's four walkers (`resolveNameScope`, `pinCustomSchemaScope`, `dedupNamedTypes`, `normalizeSchemaScope`) read `name`/`namespace`/`type`/`fields`/`items`/`values` via `lookupCI`, matching the parser they feed. Natural spellings (the fix's 87-cell matrix) are unaffected — exact-case always wins in lookupCI.
+
+---
+
+## Full walk — 2 findings
+
+Finding: an explicitly namespace-qualified reader alias matches a writer type in a DIFFERENT namespace
+File:line: compat.go:252 (namesMatch), compat.go:360-363 (kindsMatchTier, union branches); Resolve inherits via resolve.go:35
+Severity: interop / parity divergence (accepts what Java AND fastavro reject)
+Why it's wrong: spec (Specification/_index.md:267): "if a type named 'a.b'
+has aliases of 'c' and 'x.y', then the fully qualified names of its aliases
+are 'a.c' and 'x.y'" — a qualified alias denotes exactly that fullname.
+qualifyAliases (schema.go:3256) builds the correct qualified set, but the
+match tier then throws the qualification away.
+
+Broken code (verbatim from disk):
+
+    // compat.go:244-257
+    func namesMatch(r, w *schemaNode) bool {
+        if r.name == w.name {
+            return true
+        }
+        if unqualified(r.name) == unqualified(w.name) {   // spec-sanctioned for NAMES (lines 690-692)
+            return true
+        }
+        for _, a := range r.aliases {
+            if a == w.name || unqualified(a) == unqualified(w.name) {
+                return true                               // ← unqualified(a): "n1.Old" matches "n2.Old"
+            }
+        }
+        return false
+    }
+    // compat.go:360-363 — same clause at the union-branch tier
+
+User-visible breakage:
+
+    w, _ := avro.Parse(`{"type":"record","name":"n2.Old","fields":[{"name":"a","type":"int"}]}`)
+    r, _ := avro.Parse(`{"type":"record","name":"n1.New","aliases":["n1.Old"],"fields":[{"name":"a","type":"int"}]}`)
+    err := avro.CheckCompatibility(w, r) // and avro.Resolve(w, r)
+
+Expected (Java + fastavro): schema mismatch error — the alias names exactly `n1.Old`
+Actual: both succeed; `n2.Old` data is read as `n1.New`
+
+Verification output:
+
+    --- FAIL: TestRegression_QualifiedAliasMatchesForeignNamespace (0.00s)
+        f3b_test.go:28: CheckCompatibility: qualified alias n1.Old matched writer n2.Old (Java+fastavro reject)
+        f3b_test.go:31: Resolve: qualified alias n1.Old matched writer n2.Old (Java+fastavro reject)
+
+Validation against apache/avro:main:
+- Spec: `doc/content/en/docs/++version++/Specification/_index.md:267` (alias qualification, quoted above); `:690-692` (unqualified matching is blessed for **names** only).
+- Java: `Schema.java:2066-2094` — `applyAliases` renames via a `Name`-keyed map (`if (aliases.containsKey(name))`, line 2093); `n2.Old` isn't renamed → record names don't match → reject.
+- fastavro: `_read_py.py:122-129` — writer fullname or unqualified name vs **raw** alias strings; **EXECUTED**: `qualified alias n1.Old vs writer n2.Old: REJECT → SchemaResolutionError`.
+
+Gate notes: NOT_BUGS #44 documents the unqualified **name** tier at the union site (fastavro-aligned) — it does not cover the alias clause. Existing pins (`TestResolveNamespacedAlias`, `TestResolveFullyQualifiedAlias`) pin positive matches only. Per the divergence policy this is a maintainer call on the fix direction, with a recommendation: **fastavro-parity** — bare-declared aliases short-match (keeps the fastavro-EXECUTED-accepted case below), explicitly-qualified aliases match exactly (drops only the twmb-only widening). Java-strict would also drop the bare cross-ns acceptance fastavro allows; status quo matches data neither reference matches.
+
+---
+
+Finding: SchemaFor silently nulls an over-budget Props value
+File:line: schema_for.go:1072 (bare toJSON), schema_node.go:487-491 (fail is a no-op on the bare walk)
+Severity: correctness (silent metadata alteration), extreme input (>64 MiB Props value)
+Why it's wrong: ct.Schema.toJSON() runs the BARE walk, whose over-budget
+handling "truncates to nil" on the assumption that "a truncated subtree
+Parse then rejects" (toJSONWalk comment). That backstop is FALSE on the
+Props axis: a truncated Props VALUE becomes "myprop": null, which Parse
+happily accepts — so SchemaFor succeeds with the user's metadata silently
+replaced. SchemaFor has an error channel; the crash-safety truncation
+posture is only justified for the error-less surfaces (String/MarshalJSON).
+
+Verification output:
+
+    --- FAIL: TestSuspected_SchemaForSilentlyNullsOverBudgetProp (0.02s)
+        f5_test.go:45: myprop present=true value=<nil> (len of original: 67109888)
+        f5_test.go:47: SchemaFor silently replaced the over-budget prop value with null instead of erroring
+
+Suggested fix: route the custom-subtree render through the deduper-carrying walk (as `SchemaNode.Schema()` does) so over-budget errors surface from SchemaFor.
+
+---
+
+## Verified clean
+
+Verified: JSON datum-encode identifier emission (inverse-density front)
+Checked:
+  - appendJSONString / appendAvroJSONBytes are the only quote-emitting sites (grep over all emitters)
+  - field names (all 3 record arms), map keys, tagged-union branch names, enum symbols all route through appendJSONString
+  - EXECUTED: lax-named schema with quotes, backslash, 0x01, 0x1F, U+2028 in field/enum/fixed names — output json.Valid, round-trips exactly; the emitted form (escapes as printed by the probe):
+    {"f\"\\ \u0001\u2028end":"s\"\u001fym","u":{"F\"x":"\u0007"}}
+Conclusion: uniform escaping, no raw-identifier bypass; invalid-UTF-8 posture is documented (#6).
+
+Verified: stdlib parser/allocator callsite refresh (P1/P9/Y4 greps)
+Checked: every non-test hit of strconv.Parse*/SetFloat64/SetString/time.Unix*/MakeSlice/big.Exp
+  classified: decimal-string sites behind boundedRatFromString; MakeSlice sites behind block caps;
+  time sites behind the logical-bounds matrix; parseFloatAcceptOverflow is the 1b net.
+  setDecimalRat (deser.go:2188-2199) explicitly rejects the big.Rat→float64 ±Inf overflow and float32 overflow.
+Conclusion: no uncovered axis; no new callsites since the battery landed.
+
+Verified: reader-alias namespace qualification (positive paths)
+Checked:
+  - bare alias on a namespaced reader qualifies into the reader's namespace (matches writer n1.Old; resolved decode OK)
+  - cross-namespace bare alias ("Old" vs writer n2.Old): twmb accepts — fastavro EXECUTED accepts the same
+    (raw-alias vs unqualified-writer tier), so this is rule-2 permissive, fastavro-aligned; not a finding
+  - qualifyAliases handles the ".Name" null-namespace escape per Java's Name-ctor rule
+Conclusion: only the explicitly-qualified-alias widening (finding above) diverges from both references.
+
+Verified: OCF writer metadata reserved keys
+Checked: ocf.go:473 rejects user meta keys in the avro.* namespace before header write; NewAppendWriter never rewrites headers (#58).
+Conclusion: no schema/codec override path via WithMetadata.
+
+Not re-litigated (documented intentional, gate hit): the logical-tag reject on custom-matched fields (#38, ruled in e4605fd), eager name binding, empty-name reference rejection (#60/#62).
+
+Ledger updated in AUDIT_CORE.md; next round quarantines `c6f75a2..HEAD` code commits. Convergence counter stays at zero — the rebuild still needs two consecutive clean bare FULLs.
+
+**Recommended priority if you want fixes**: findings 1–3 are one patch (CI-fold reads in schema_for's four walkers + defensive copy at the embedding boundary — call it "fix 1-3"); finding 4 needs your adjudication on the table above before code (my recommendation: fastavro-parity); finding 5 is a small error-channel change ("fix 5"). Reply "fix 1-3", "fix 5", and/or a ruling on 4, and I'll apply with red-first pins, the FIX.md sweep, and matrix nets.
+
+### 2026-07-15 FIX round narrative (all five findings, maintainer-granted)
+
+The maintainer granted fixes for all five 2026-07-15 FULL-round findings
+(overseer-confirmed with independent probes, fastavro executed on both alias
+directions, Java/spec citations verified), organized as four fix families
+with red-then-green in-repo pins first and a class matrix each, plus a
+method repair.
+
+W4 pre-action gate (run before any compat.go edit): pickaxe
+`-S 'unqualified(a) == unqualified(w.name)'` → 62b4c9f (introduced at
+namesMatch; its comment rationale — "Per the Avro spec, named types in
+different namespaces match if their unqualified names are the same" —
+covers only the NAME tier) and 55787af (replicated at the union site in the
+landed patch-set). Both predate the working branch: untouched-in-range.
+NOT_BUGS #44 covers the union NAME tier only; the existing alias pins pin
+positive matches that stay green. Verdict: not documented → the maintainer's
+ruled policy proceeds; new pins + NOT_BUGS #67 record it.
+
+Red pins, all verified failing before any fix (exact divergences quoted in
+the conversation): TestRegression_SchemaForLeavesCallerSchemaStorageUnmutated
+(caller map gained "namespace":""),
+TestRegression_SchemaForCaseVariantNamespaceKeySharedType (unknown type "F"),
+TestRegression_SchemaForCaseVariantNamespaceUnderWithNamespace (fullname F,
+want x.y.F), TestRegression_SchemaForOverBudgetCustomSchemaErrors (nil error),
+TestResolveQualifiedAliasIsNamespaceScoped (4 wrong matches: both APIs ×
+both sites; kept-behavior controls silent).
+
+Fixes:
+- Q1 (caller-owned storage): renderCustomSchemaTree at the inferType custom
+  arm deep-copies the rendered tree (deepCopyJSONTree: map[string]any /
+  []any / []map[string]any levels; scalar leaves shared — []byte never
+  survives a render, walkers never write string slices). Entry-path
+  enumeration stated in the helper doc: the render's by-reference Props
+  containers are the ONLY path caller-owned storage enters the pre-Parse
+  tree; all other nodes are inferType/inferRecord literals or toJSONWalk's
+  own construction. Covers pin injection AND dedup's in-place rewrites with
+  one boundary copy.
+- Q2+Q3 (reserved-key case-fold): all four walkers read name / namespace /
+  type / fields / items / values via lookupCI; dedupNamedTypes writes back
+  through ciKey (write-to-exact-alongside-variant would leave both
+  spellings, and Parse's exact-first preference would read whichever the
+  walk did NOT rewrite); normalizeSchemaScope classifies keys by EqualFold;
+  pinCustomSchemaScope's injection-skip consults lookupCI, so a CI-spelled
+  namespace suppresses injection and x.y.F survives WithNamespace (Q3 falls
+  out, canonically asserted). addTypeAliases examined as a fifth walker and
+  deliberately left exact-case with the structural-boundedness rationale on
+  the function (its consumed keys are toJSONWalk literals at every
+  observably-reachable position; refName keying is per-build-consistent;
+  no red probe constructible — the dangling construction fails because
+  custom trees re-render per field, so the reference arm never fires for
+  them). cache.go:612's exact-case name/namespace WRITES classified safe
+  (exact-first wins at every CI reader).
+- W4 (alias qualification): ruled fastavro-raw-string-tier semantics at
+  BOTH sites. schemaNode gains bareAliases (shorts of aliases DECLARED
+  without any dot — the raw form is retained at the three build sites
+  because bare-vs-qualified is not reconstructible post-qualifyAliases;
+  resolve.go's two node-copy sites carry it). namesMatch: exact fullname or
+  unqualified-name or qualified-alias-exact or bare-alias-short.
+  kindsMatchTier: alias-exact stays matchExact; the bare-alias short tier
+  is matchUnqualifiedName; qualified aliases never short-match.
+- W5 (over-budget render): renderCustomSchemaTree uses the deduper-carrying
+  walk and returns d.err named errors (bytes / nodes / cycle). The dead
+  bare toJSON() wrapper was deleted; the only bare-mode walk left is
+  toJSONDedup's conflict-compare, whose over-budget reporting the caller's
+  budget check owns (pre-existing walk-budget pins). There is no
+  SchemaNode.String/MarshalJSON — the instruction's control-pin premise has
+  no surface here; the budget-axes test is the control.
+
+Matrices: (1) every TestMatrix_SchemaForCustomSchemaScope cell now
+deep-snapshots each CustomType.Schema before the build and asserts
+deep-equality after (mutation probes ×87 cells), plus Props-carried
+container routes (items/values/union-slice × scope). (2)
+TestMatrix_SchemaForReservedKeyCaseFold: spelling {exact,upper,mixed} ×
+reserved key {namespace, items, values, union-slice, fields} × occurrences
+× WithNamespace, with canonical-identity (x.y.F) assertions, cross-spelling
+verdict/canonical/inline-body parity, and NAME/TYPE inert controls
+(exact-case is always structurally present, so variants ride along
+inertly). (3) TestMatrix_AliasResolutionCensus: alias spelling {bare,
+dotted-own, dotted-foreign, leading-dot} × writer namespace {same, foreign,
+null} × kind {record, enum, fixed} × site {top, union} × API
+{CheckCompatibility, Resolve} = 144 verdict cells + accepted-cell resolved
+decodes + a scan-past discrimination cell (single-candidate union cells are
+DOMINATED by the downstream direct-match recheck — a spurious tier match
+still rejects — so only a two-candidate reader whose correct branch carries
+a defaulted extra field makes kindsMatchTier's own verdict observable) +
+unqualified-name controls + field-alias controls (dotted field alias
+matches the literal illegal writer field name under lax parse; no short
+tier). TestDifferentialFastavroAliasResolution EXECUTES all 72
+spelling×ns×kind×site cells against fastavro via the oracle's readresolve
+op (fixed-kind accepts classified through the oracle's
+bytes-not-JSON-serializable transport limitation — schemaless_reader
+returned, so resolution accepted), asserting fastavro's table, twmb's
+table, and their agreement everywhere except the four leading-dot cells
+(twmb+Java Name-ctor accept null-writer; fastavro verbatim rejects —
+NOT_BUGS #67). (4) TestRegression_SchemaForCustomSchemaBudgetAxes:
+bytes/nodes/cycle each error named through SchemaFor, modest-schema
+control builds.
+
+Neuter verification, each component separately (restored after each):
+- boundary copy (return tree uncopied): 27 red — the Q1 pin, 3
+  propscarried/*/ns="b" snapshot cells, 23 case-fold stray-route cells
+  (pin injection + dedup rewrites landing in user storage).
+- lookupCI reads (resolveNameScope namespace read → exact): 6 red — the Q2
+  pin + namespace/{upper,mixed}/occ2 cells at both scopes (occ1 cells
+  legitimately survive: identity is Parse-side; only dedup keying needs
+  the fold).
+- CI descent (dedup items read → exact): parent-level parity assertions
+  red at items+unionslice routes — occ2 body counts 2≠1 and the ns="b"
+  corner-error verdict diverges (variant cells wrongly succeed with the
+  captured b.G identity — the capture class).
+- injection skip (pin namespace check → exact): 6 red — the Q3 pin +
+  namespace/{upper,mixed} ns="b" cells at both occurrence counts.
+- alias exact-tier at namesMatch (unqualified(a) loop restored): 20 red —
+  every top-site reject cell across all kinds + the W4 pin; union cells
+  green (independently pinned).
+- alias exact-tier at kindsMatchTier: initially ZERO red — the vacuity the
+  scan-past cell was added to close; with it, scanpast/unionqualifiedalias
+  red.
+- error-walk routing (ignore d.err): 5 red — the W5 pin + bytes/nodes/cycle
+  axes; control green.
+
+FIX.md sweep: items 0–14 worked (gate retrospective pre-run; predicate
+symmetry across walker arms; build/Parse/Root() three-surface agreement;
+sibling sweeps — lookupCI/ciKey/qualifyAliases/toJSONDedup/bareAliases
+caller walks, raw-map-read grep leaving only classified-safe sites;
+dispatcher interplay pinned by scan-past; DoS: copy bounded by the
+pre-checked budgets, lookupCI misses linear per node key set; no
+existing-test edits needed; CustomType.Schema doc extended with the
+copy+error contract; vet clean; -race scoped to new tests green;
+pattern-grep refresh done; DRY: census tables deliberately duplicated
+across avro/avro_test packages, bareAliasShorts kept separate from
+qualifyAliases at N=3 same-file; immunity claims each executed or
+source-verified — fastavro claims by the 73-subtest executed arm, Java by
+Schema.java:2066-2094 read directly, the Name-ctor ~1455 cite inherited
+from #62's verified quote). Full suite + fastavro differential green (avro
+14.5s, ocf 2.8s); -race on all new tests green; fuzz not required this
+round per the grant.
+
+Method repair: FIX.md item 15 ("New surface × documented invariants of the
+shared representation") — any fix introducing a reader/walker/mutator of
+the schema-JSON / SchemaNode representation enumerates the representation's
+documented invariants (#46 case-fold; by-reference ownership; walk-budget
+bare-vs-error split; #60 empty-name; #62 leading-dot; #63/#64 structural-key
+posture; namespace scoping) with a matrix row or boundedness argument per
+invariant, plus the matcher sub-case (positive-only pins; scan-past
+observability). NOT_BUGS: #46 extended (schema_for is a folded surface;
+walkers list; class net named), #67 added (alias semantics incl. the
+leading-dot divergence and the multi-dot-leading-dot unpinned corner
+flagged), #68 added (SchemaFor render error posture + private-copy
+contract). The one adjacent flag left unruled: qualifyAliases strips ANY
+leading dot while Java keeps a non-empty ".a.b" space verbatim and
+leadingDotName (names) strips only the single-dot escape — recorded in #67
+as observed-adjacent, unpinned.
