@@ -3687,3 +3687,320 @@ discrimination lives in the fastavro-executed parity, not the neuter.
 updated); ledger addendum uses the start-HEAD convention (the existing
 c6f75a2..HEAD quarantine covers this commit — no scope change). Full suite
 + fastavro differential green; -race green on the changed tests.
+
+## Distillation archive (2026-07-16)
+
+Verbatim originals archived at the 2026-07-16 round's opening distillation
+pass, mandated by AUDIT_CORE.md's size guard (the file stood at 59,122 B
+against its ~55KB cap). §Round ledger's entries from 2026-07-01 through the
+2026-07-15 addendum were compressed to era lines / tightened entries in
+place; these are the originals. The round NARRATIVES those lines reference
+were archived earlier (see the 2026-07-14 and 2026-07-15 archive sections
+above) — this section archives only the ledger lines themselves.
+
+### Round-ledger lines (verbatim, pre-compression)
+
+- 2026-07-01 · ea9a2ce · FULL · 9944fad..ea9a2ce clear · 0 behavioral (policy #52).
+- 2026-07-02 · ea9a2ce · FULL · empty · 0 behavioral · fastavro RAN · 2nd clean full → CONVERGED.
+- 2026-07-02 · fdc6df5 · FULL · ea9a2ce..fdc6df5 clear · 1 behavioral FIXED same round (OCF count-0-as-EOF; #53) · RESET.
+- 2026-07-02 · bcb7fa9 · DEDICATED claims-hardening (neutral) · fdc6df5..bcb7fa9 clear · 0 behavioral · 21 claims corrected; 3 nets.
+- 2026-07-02 · 2609823 · DEDICATED reader-grammar census (neutral) · bcb7fa9..2609823 clear · 0 behavioral · 7 gap families closed; #54 #55.
+- 2026-07-06 · 150b688 · FULL · 2609823..150b688 clear · 0 behavioral · clean full #1.
+- 2026-07-06 · 150b688 (2nd) · FULL · empty · 1 behavioral FILED (flat-field metadata twin never lifts) · RESET.
+- 2026-07-07 · 4719830 · FIX · flat-field metadata lift twin FIXED (30-cell matrix; #56).
+- 2026-07-07 · 4719830 (2nd) · FULL · 150b688..4719830 clear · 1 behavioral FILED (OCF truncation leaked the io.EOF sentinel) · counter stays reset.
+- 2026-07-07 · 29a65fb · FIX · truncation sentinel FIXED (noEOF ×7; sweep matrix; #57).
+- 2026-07-07 · 29a65fb (2nd) · FULL · 4719830..29a65fb clear · 1 behavioral FILED (resolved DecodeJSON flipped tagged-union branches; contradicts #2) + append-writer policy Suspected · RESET.
+- 2026-07-07 · 29a65fb (fix) · FIX · tagged-preserving intermediate FIXED (matrix neuter 28 red; #2 rewritten; #58).
+- 2026-07-07 · 509010b · FULL · 29a65fb..509010b clear · 1 behavioral FILED (internal re-parses assumed lax(nil) subsumes user lax fns, 2 sites) · counter stays reset.
+- 2026-07-08/09 · 9283a9d→27c8781 · FIX (3 commits) · lax-reparse + 4 sibling/reader findings FIXED; #60 flipped to EMIT "name":"" · matrices + neuters ×6 · #59 #60.
+- 2026-07-10 · 27c8781 (2nd) · FULL · 509010b..27c8781 clear · 0 behavioral; 1 RESOURCE-BOUND FILED→FIXED same round (CustomType parse superlinear; customMatch memo; C9 battery; 5b8ce9d+8ee2b1b) · clean full #1 (DoS does not reset).
+- 2026-07-11 · 8ee2b1b · FULL · 27c8781..8ee2b1b clear · 0 behavioral · commits UNPUSHED · 2nd clean full → RE-CONVERGED.
+- 2026-07-12 · 8ee2b1b (2nd) · FULL · empty · 1 behavioral FILED→FIXED same
+  round (appendAvroString shrunk-return guard; #61) · fastavro RAN · RESET
+  (fixed same round).
+- 2026-07-12 · 9733042 (2nd) · FULL · 8ee2b1b..9733042 clear · 1 behavioral
+  FILED→FIXED same round (splice walkers missed flat items/values;
+  FEATURE × WALKER harness) · fastavro RAN · RESET (fixed same round).
+- 2026-07-12 · b25d878 (3rd; commits → c6908cd) · DEDICATED census (neutral)
+  · empty · 0 behavioral · oracles not run (test-only) · 28 rows × 11
+  drivers = 308 cells neuter-proven; §Open net gaps EMPTY.
+- 2026-07-12 · afe3b68 (4th) · DEDICATED cleanliness (neutral) ·
+  f336025..afe3b68 clear · 0 behavioral shipped; 1 FILED (keyless-def
+  carve-out; B7 2nd) · fastavro RAN each step.
+- 2026-07-13 · 18988c2 · FIX · keyless defs FIXED · 1 NEW behavioral FILED
+  (leading-dot names; B7 3rd, BLOCKING) · oracles not run (metadata-only,
+  twin-asserted).
+- 2026-07-14 · f47083c · FIX · leading-dot FIXED (normalize at parse, ×3
+  resolvers; "." joins #60; #62) · fastavro EXECUTED.
+- 2026-07-14 · f47083c (2nd) · FULL · empty · 0 behavioral · fastavro RAN;
+  -race + fuzz clean; Java in CI (all since 5b8ce9d UNPUSHED) · clean full
+  #1 since the 07-12 reset.
+- 2026-07-14 · f47083c (3rd) · FULL · empty · 1 behavioral FILED (stray
+  precision/scale parse reject; fastavro EXECUTED 9/9) + 2 policy items ·
+  fastavro EXECUTED · RESET pending adjudication.
+- 2026-07-14 · 5717f32 · FIX · stray precision/scale FIXED (ACCEPT AS INERT;
+  70-cell matrix, neuter ×2; #63 + #54 extended) · fastavro RAN; Java in CI
+  (unpushed) · counter at ZERO; rebuild needs two consecutive clean FULLs.
+- 2026-07-14 · 5717f32 (2nd) · DEDICATED distillation + ATTRIBUTE ×
+  PLACEMENT census (neutral save the finding) · empty · 1 behavioral
+  FILED→FIXED same round as 70c7c1c (stray namespace on array/map ACCEPT AS
+  INERT, o.Name kept strict; #64; #63 edge corrected) · 272 cells, fastavro
+  EXECUTED 273/273, Java arm added, neuter ×3 · distilled: CORE
+  163,716→~55,000 B; B7/B33/B34 tombstoned · -race green · counter stays
+  ZERO. Commits 70c7c1c + 3a4d233 (docs) NOT pushed.
+- 2026-07-14 · 3a4d233 (2nd) · DEDICATED trust-boundary census (neutral save
+  findings) · 5717f32..3a4d233 cleared · 6 behavioral FILED→FIXED same round
+  (lying io.Reader/io.Writer counts, JSON-encode SemanticError arms, (0,nil)
+  livelock bound, user io.EOF ×2) · 16 callback sites censused, neuter ×9;
+  #65 #66 + #45 clause; B10 extended · fastavro EXECUTED; -race green; Java
+  CI GREEN through 18988c2 (run 29345609516) · counter stays ZERO (fixed
+  same round). Commit 79ed5b3 NOT pushed.
+- 2026-07-14 · 79ed5b3 (2nd) · FULL · 3a4d233..79ed5b3 cleared · 0
+  behavioral · fastavro RAN; -race green; fuzz RT+jsonRT clean; Java NOT run
+  (CI through 18988c2) · clean full #1 since the 07-14 zero.
+- 2026-07-14 · 79ed5b3 (3rd) · FULL · empty · 1 behavioral FILED (SchemaFor
+  namespaced CustomType.Schema composition: short-name dedup ref dangles,
+  cross-namespace false collision, null-ns capture under WithNamespace; 3
+  probes verified failing) · fastavro RAN; -race green; fuzz RT+jsonRT
+  clean; Java NOT run (CI through 18988c2; f47083c..79ed5b3 unpushed) ·
+  RESET: streak to zero; fix opt-in. Next round quarantines commits after
+  79ed5b3.
+- 2026-07-15 · e4605fd · FIX · empty (docs-only 32af0cc since 79ed5b3) ·
+  SchemaFor namespaced-custom composition FIXED as ruled (fullname-keyed
+  dedup via parser scope rules; dotted-fullname refs; null-ns recurrence
+  under a namespace = named corner error; "namespace":"" injection at the
+  custom embedding frontier; scope-normalized duplicate compare) + 1 sweep
+  sibling FIXED with own red pin (logical tag on custom-matched field was
+  silently dropped → reject; NOT_BUGS #38 extended) · pins 3 red→green +
+  dotted control + inference-spelling controls;
+  TestMatrix_SchemaForCustomSchemaScope 87 cells incl. corner + wrong-bind
+  decoy, neuter ×4 disjoint (keying / ref emission / injection / corner
+  error); fastavro arm EXECUTED 6/6 PCF byte-equal · full suite + fastavro
+  RAN; -race green on new tests; Java NOT run (no JRE; all since 5b8ce9d
+  unpushed) · counter stays ZERO (fix round; rebuild needs two consecutive
+  clean bare FULLs). Next round quarantines 79ed5b3..HEAD code commits —
+  the fix e4605fd itself (docs commits 32af0cc/c6f75a2 don't count); this
+  line's HEAD is the round's END head, so "commits after it" would wrongly
+  skip the fix (fix UNCONVERGED, overseer-verified 2026-07-15).
+- 2026-07-15 · c6f75a2 · FULL · 79ed5b3..e4605fd quarantined: NOT clean —
+  3 behavioral FILED from the fix's new code (pinCustomSchemaScope writes
+  "namespace":"" into caller-owned Props storage reached via an items key
+  — toJSON's no-fixup by-reference return; schema_for's walkers read
+  name/namespace exact-case while Parse CI-folds per NOT_BUGS #46 →
+  CI-spelled "NAMESPACE" custom dedups to a dangling bare ref on 2 fields,
+  and under WithNamespace the injected exact-case "namespace":"" WINS over
+  a CI-spelled namespace → silent wire-visible identity change x.y.F→F,
+  pre-fix this parsed correctly) · walk: 2 more FILED — namesMatch +
+  kindsMatchTier match an EXPLICITLY-QUALIFIED reader alias by unqualified
+  short name (writer n2.Old matches reader alias "n1.Old"; Java
+  applyAliases Name-keyed Schema.java:2093 rejects, fastavro EXECUTED
+  rejects; adjacent to #44 which covers only the NAME tier); SchemaFor's
+  bare toJSON silently NULLS an over-budget (>64MiB) Props value — the
+  walker comment's "Parse then rejects" backstop is false on the Props
+  axis (parse accepts prop:null) · clean fronts: hostile lax-name JSON
+  emission EXECUTED (field names/symbols/tagged branch names/map keys all
+  escape via appendJSONString; ctrl chars + U+2028 + quotes round-trip);
+  stdlib-callsite refresh all classified to existing gates (setDecimalRat
+  rejects the big.Rat→float Inf edge explicitly); bare alias on namespaced
+  reader qualifies correctly (relative spelling matches n1.Old; bare
+  cross-ns match is fastavro-EXECUTED-aligned, rule-2 permissive); OCF
+  reserved avro.* meta keys reject (ocf.go:473) · fastavro RAN+EXECUTED;
+  -race green; fuzz RT+jsonRT 60s clean; Java NOT run (no JRE; CI through
+  18988c2; f47083c..HEAD unpushed) · counter stays ZERO (5 FILED; fix
+  opt-in). Next round quarantines c6f75a2..HEAD code commits.
+- 2026-07-15 · c6f75a2 (2nd; START head — the fix commit lands after this
+  line, so the next round's c6f75a2..HEAD scope quarantines it) · FIX ·
+  all five 2026-07-15 findings FIXED as granted: Q1 boundary deep-copy in
+  renderCustomSchemaTree (sole caller-owned entry path enumerated in the
+  helper doc); Q2+Q3 lookupCI/ciKey reads in all four walkers + CI-aware
+  injection skip (#46 EXTENDED — schema_for is a folded surface;
+  addTypeAliases examined, stays exact-case with a boundedness rationale);
+  W4 fastavro-raw-tier alias matching at namesMatch + kindsMatchTier via
+  retained bareAliases (#67; leading-dot divergence pinned with EXECUTED
+  fastavro rejects; multi-dot leading-dot qualifyAliases corner flagged
+  unruled); W5 error-walk render + dead bare toJSON() deleted (#68) · pins
+  5 red→green; nets: scope-matrix cells all mutation-snapshotted + Props
+  routes; casefold matrix spelling × reserved key × occ × scope; alias
+  census 144 cells + scan-past + controls with fastavro EXECUTED 72/72
+  (readresolve); budget axes bytes/nodes/cycle+control · neuter ×7
+  disjoint (27 / 6 / parity / 6 / 20 / scanpast / 5 red; the initially-
+  vacuous kindsMatchTier neuter forced the scan-past cell) · FIX.md item
+  15 added (new-surface × documented-invariants) · full suite + fastavro
+  RAN; -race on new tests green; Java NOT run (no JRE; all unpushed) ·
+  counter stays ZERO (fix round). CORE at 56KB crosses the ~55KB cap:
+  next round OPENS with a distillation pass.
+- 2026-07-15 · c6f75a2 (addendum, same generation — the start-HEAD
+  c6f75a2..HEAD quarantine already covers this commit) · FIX addendum ·
+  qualifyAliases leading-dot corner RULED + FIXED: dotted aliases follow
+  the names' dot rule via the SHARED leadingDotName (".x" escape kept and
+  never bare; ".a.b"/"..x" VERBATIM — the strip-any-dot arm matched writer
+  "a.b", a match neither reference makes; "." joins the empty-name family)
+  · gate pickaxed the arm to cf91ceb whose comment over-generalized Java's
+  Name ctor (nulls only an EMPTY space) — documented-but-contradicted; #67
+  rewritten to the ruled text · pin TestResolveLeadingDotAliasDotRule
+  red→green (flip + verbatim-accept + escape control); census dotrule rows
+  4 spellings × 4 writers × 2 sites + verbatim scan-past;
+  TestDifferentialFastavroAliasDotRule EXECUTED 32/32 (fastavro parsed the
+  lax-only ".a.b"/empty-name writers; sole mutual accept ".a.b"×".a.b";
+  divergent escape cells ".x"×x and "."×"" twmb-only per Name-ctor rule) ·
+  neuter (strip-any-dot restored): exactly dotrule/multidot/{ab,laxdotab}/
+  {top,union} + dotrule/scanpast + the pin red · full suite + fastavro
+  RAN; -race on changed tests green · counter stays ZERO.
+
+### 2026-07-16 FULL round report (HEAD 6a5b8ee) — narrative
+
+The round opened with the size-guard-mandated distillation (59,122→53,281 B
+before the new ledger line; the §Round-ledger lines above are the verbatim
+originals). Nets: full suite green; fastavro differential RAN and EXECUTED
+(venv alive at 1.12.2; differential subtests confirmed actually driving
+cells via -v spot-check); -race green both packages; fuzz RoundTrip +
+JSONRoundTrip 60s each (-parallel 2) clean; Java NOT run (no JRE; CI covers
+through 18988c2 — f47083c..HEAD unpushed, so no Java oracle has seen the
+recent fix generations).
+
+Quarantine c6f75a2..6a5b8ee (= aeb9565 + 6454754): NOT clean — two
+behavioral findings in aeb9565's surface, both item-15 axes enumerable in
+advance (#63 kind-gating; ownership's []string append form):
+
+(1) The composition walkers (dedupNamedTypes, pinCustomSchemaScope,
+normalizeSchemaScope) descended into items/values/fields keys UNGATED BY
+KIND while Parse's grammar is kind-keyed (#63's primitive-object
+capture-drop: a stray structural key on a primitive is captured inert and
+never name-bound; on container kinds it hard-rejects). The render emits
+Props keys verbatim (schema_node.go Props loop), so a caller-built
+CustomType.Schema can carry "items" on an int; the walkers then treated the
+Props-carried value as a schema position. Three verified-failing
+manifestations: a stray def body DIFFERENT from a real same-fullname def →
+false "two different definitions" conflict; an IDENTICAL body → the real
+definition dedup'd into a reference to the inert copy → "unknown type
+n.X" (both rejecting compositions whose hand-composed counterfactual tree
+Parse accepts — asserted inside each probe); and under WithNamespace the
+pin injected "namespace":"" into a bare-named def inside the stray,
+altering caller metadata in the stored schema text. The fix round's own
+casefold matrix pinned SPELLING PARITY only ("same verdict, same canonical,
+same inline-body count" across case variants — satisfied by walking every
+spelling identically, including wrongly), so no pin blessed the descent.
+
+(2) addTypeAliases appended into the rendered tree's "aliases" []string,
+which emitStrings returns BY REFERENCE from the caller's
+SchemaNode.Aliases and deepCopyJSONTree deliberately passed through
+("the walkers never write into string slices" — executed-false). With
+spare capacity in the caller's slice (arr[:1:2]), the append wrote
+"NewAlias" over the caller's arr[1] — a mutation the deep-equal
+mutation-snapshot cannot see (it lands past len), violating the
+never-mutated contract aeb9565 itself added to CustomType.Schema's doc.
+
+6454754 audited clean: leadingDotName verified for ".x" (escape), ".a.b"
+and "..x" (verbatim), "." (empty-name), and identity on plain-dotted
+"a.b"; bareAliases classification unaffected. Clean quarantine threads:
+bareAliases threaded at both resolve reconstruction sites (record/enum),
+fixed resolution reuses the reader node, SchemaCache splice re-parses JSON
+text and Root() re-parses the original stored text so the DECLARED alias
+spelling (bare vs qualified) survives rebuild, and a non-string namespace
+value hard-errors at parse (schemaTypeMismatch) so the CI-aware
+injection-skip cannot be bypassed by value type.
+
+Walk fronts, all clean: (F1, inverse-density) the atype package — zero
+test files, never audited — every constant verified verbatim against the
+spec source (big-decimal at _index.md:817, local-timestamp-nanos at :891)
+and recognized by the library. (F2) field-alias resolution:
+findReaderFieldIndex matches reader field aliases by EXACT string,
+two-pass name-then-alias — no unqualified() mangling, no case fold; the
+one corner where the references genuinely diverge (Java Schema.java:2100 +
+getFieldAlias:2179 renames the writer field so an alias STEALS it from an
+exactly-named reader sibling; fastavro's readers_field_dict.get(name,
+aliases_field_dict.get(name)) is name-first) is unreachable in twmb —
+NOT_BUGS #50's parse-time field name/alias uniqueness reject; on any
+accepted schema the orders coincide. The pre-action gate caught this as
+documented-intentional before filing. (F3) pattern-grep refresh: Y4
+narrow-before-check trilogy — only the fixed sites' own comments; P18
+sub-buffer delegation — all five hits correct shapes (fresh copy +
+discarded remainder, or true pass-through); P9 amplification —
+deser.go:857's SetString sits under the decimal-magnitude gate,
+ser.go:2582's Exp is bEstF-bounded pre-materialization, pow10 is the
+documented chokepoint.
+
+Counter stays ZERO (2 behavioral FILED; fix opt-in — granted same day, see
+the fix narrative below).
+
+### 2026-07-16 FIX round narrative (both quarantine findings, maintainer-granted)
+
+Fix shape, as mandated: (1) every structural descent in the three
+composition walkers gated on the kind that BINDS the key — fields on
+record/error (isRecordKind), items on array, values on map — mirroring the
+parser's binding grammar (aobjectFromMap decodes syntactically kind-blind,
+but only the matching builder BINDS; the container hard-rejects and
+primitive inertness then produce the verdict, so the walkers need only the
+binding gate and Parse supplies accept/reject parity for free). A stray on
+any other kind passes through untouched and byte-preserved (#63's new
+composition clause). Corollary ruled with the fix: inert stray content
+compares VERBATIM in the dedup identity — two same-fullname defs differing
+only in a stray's as-written spelling are different definitions (the
+inline pair cannot parse; spelling-equivalence is a bound-position
+property). (2) deepCopyJSONTree copies []string (aliases/symbols); its
+false "walkers never write into string slices" justification rewritten to
+name the append-with-spare-capacity form; addTypeAliases' "safe for
+freshly-inferred schemas" comment corrected to cite the render-boundary
+copy.
+
+Red-then-green pins (all verified failing pre-fix, passing post-fix):
+TestRegression_StrayStructuralKeyFalseDuplicate,
+TestRegression_StrayStructuralKeyDanglingRef (each asserting the
+hand-composed counterfactual PARSES inside the test),
+TestRegression_StrayStructuralKeyPinInjection,
+TestRegression_StrayStructuralKeyVerbatimCompare (asserting the inline
+pair does NOT parse + a single-occurrence inertness control),
+TestRegression_TypeAliasSpareCapacityOwnership (arr[:1:2] sentinel), plus
+TestStrayStructuralKeyControl (no-stray builds).
+
+Class nets: TestMatrix_SchemaForStrayStructuralKey — carrier kind {int,
+string, fixed, enum, record, array, map} × stray key {items, values,
+fields} minus the three defining-key placements × body {identdef, diffdef,
+baredef, plain, nonschema} × scope {default, WithNamespace} × occurrence
+{1,2} = 360 cells; per-cell oracle: (a) SchemaFor's verdict equals bare
+Parse's verdict on a hand-composed counterfactual carrying the stray
+verbatim, (b) accepted cells preserve the stray byte-identically in the
+composed text AND keep genuine behavior (real def inline at F2; second
+occurrence dedups to a reference), (c) the existing 87-cell scope matrix +
+casefold matrix run untouched as controls. Strays plant through Props —
+typed Items/Values/Fields on a bare primitive are dropped by the render's
+defined-placement posture (executed: the 72 typed-planting cells came back
+bare "int"/"string"), so Props is the caller-reachable carrier. The
+baredef body row exists because the pin-injection arm skips dotted names —
+without it the pin gate's neuter was discriminated only by the instance
+pin. TestMatrix_TypeAliasAliasOwnership — named kinds × scopes with
+declared Aliases (+Symbols, +field aliases), a type-alias'd field, all
+[]string inputs sentinel-planted. Harness extension: schemaForScopeCell
+now plants a sentinel past the length of EVERY []string reachable from
+every cell's SchemaNode (plantStringSliceSentinels: Aliases, Symbols,
+field Aliases, recursively) and verifies them after the build alongside
+the deep-equal snapshot — closing the [len:cap) blind spot for every
+existing and future cell of the mutation harness.
+
+Neuters, each component separately, exact reds: (N1) dedup gates removed →
+FalseDuplicate + DanglingRef pins + exactly 32 matrix cells (int|string ×
+items|values × identdef|diffdef × 2 scopes × 2 occs). (N2) pin gates
+removed → PinInjection pin + exactly 8 cells (int|string × items|values ×
+baredef × ns × 2 occs). (N3) normalize gates removed → exactly
+VerbatimCompare (the fold makes spelling-divergent strays compare equal →
+accept where the ruled behavior rejects). (N4) []string copy removed →
+SpareCapacityOwnership pin + all 6 TypeAliasAliasOwnership cells
+(sentinels clobbered). Each neuter reverted and the suite re-greened
+before the next.
+
+Sweeps: the five gated descents are the only structural-key walks in
+schema_for.go (grep); addTypeAliases was already kind-gated (the
+precedent); the in-parse walkers are kind-keyed per #63's census. DRY
+considered and declined: the three gates are single existing predicate
+tokens (isRecordKind / =="array" / =="map") in structurally different
+positions; a key-string-dispatching helper adds surface without removing
+the per-site key naming. Hostile-input: the gates only remove work; the
+[]string copy is charged by the render's existing byte budget
+(emitStrings) before the copy runs. Immunity claims in new comments all
+executed: the render's defined-placement drop (the 72-cell failure run),
+the render-boundary copy (N4's reds), stray inertness (#63 census + the
+per-cell counterfactual). Full suite + fastavro EXECUTED green; -race
+green (full suite). FIX.md item 15 rewritten to require the explicit
+invariant × surface TABLE (two generations of prose sweeps each left an
+enumerable axis uncrossed); NOT_BUGS #63 gains the composition clause.
