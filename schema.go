@@ -3290,14 +3290,21 @@ func qualifyAliases(aliases []string, fullname string) []string {
 	out := make([]string, len(aliases))
 	for i, a := range aliases {
 		switch {
-		case strings.HasPrefix(a, "."):
-			// Java's explicit null-namespace escape: ".Name" aliases the
-			// null-namespace fullname "Name" (Schema.java's Name constructor
-			// treats the leading dot as a null-namespace marker) — never
-			// qualified into the type's own namespace.
-			out[i] = a[1:]
 		case strings.ContainsRune(a, '.'):
-			out[i] = a // already fully qualified
+			// Dotted aliases follow the names' dot rule, via the SAME
+			// helper (leadingDotName): a single leading dot with a dotless
+			// remainder is the explicit null-namespace escape (".x" is the
+			// fullname "x", "." the empty name), never qualified into the
+			// type's own namespace; any other dotted spelling is a fullname
+			// VERBATIM. Java's Name constructor nulls the space only when
+			// it is EMPTY (Schema.java ~1455: lastDot split, then
+			// `if ("".equals(space)) space = null`), so ".a.b" keeps its
+			// non-empty space ".a" and denotes ".a.b" as written — a name
+			// only a lax-parsed writer can carry. Stripping any leading dot
+			// here made alias ".a.b" match writer "a.b", a match neither
+			// Java (space kept) nor fastavro (raw-string comparison) makes.
+			short, _ := leadingDotName(a)
+			out[i] = short
 		default:
 			out[i] = ns + a
 		}

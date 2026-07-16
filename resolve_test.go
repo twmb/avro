@@ -3007,6 +3007,46 @@ func TestResolveQualifiedAliasIsNamespaceScoped(t *testing.T) {
 	}
 }
 
+// Aliases follow the names' dot rule (leadingDotName): a single leading dot
+// with a DOTLESS remainder is the null-namespace escape (".x" is the
+// fullname "x"), and any other dotted spelling is a fullname VERBATIM —
+// Java's Name constructor nulls the space only when it is empty (lastDot
+// split, then `if ("".equals(space)) space = null`), so ".a.b" keeps its
+// non-empty space ".a"; fastavro compares alias strings as written, so a
+// raw ".a.b" matches only a writer literally named ".a.b". Stripping the
+// dot from ".a.b" would match writer "a.b" — a match neither reference
+// makes.
+func TestResolveLeadingDotAliasDotRule(t *testing.T) {
+	lax := WithLaxNames(func(string) error { return nil })
+
+	// The escape spelling keeps working: ".x" aliases the null-namespace x.
+	writerX := MustParse(`{"type":"record","name":"x","fields":[{"name":"a","type":"int"}]}`)
+	readerEsc := MustParse(`{"type":"record","name":"n1.New","aliases":[".x"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writerX, readerEsc); err != nil {
+		t.Errorf(`alias ".x" must keep matching the null-namespace writer x: %v`, err)
+	}
+
+	// A multi-dot leading-dot alias is verbatim: it must NOT match the
+	// dotless-namespace writer a.b ...
+	writerAB := MustParse(`{"type":"record","name":"a.b","fields":[{"name":"a","type":"int"}]}`)
+	readerDot := MustParse(`{"type":"record","name":"n1.New","aliases":[".a.b"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writerAB, readerDot); err == nil {
+		t.Errorf(`alias ".a.b" matched writer "a.b"; the verbatim spelling denotes only a writer literally named ".a.b"`)
+	}
+	if _, err := Resolve(writerAB, readerDot); err == nil {
+		t.Errorf(`Resolve: alias ".a.b" matched writer "a.b"`)
+	}
+
+	// ... and it DOES match a (lax-named) writer literally called ".a.b".
+	writerDot, err := Parse(`{"type":"record","name":".a.b","fields":[{"name":"a","type":"int"}]}`, lax)
+	if err != nil {
+		t.Fatalf("lax writer .a.b: %v", err)
+	}
+	if err := CheckCompatibility(writerDot, readerDot); err != nil {
+		t.Errorf(`alias ".a.b" must match the writer literally named ".a.b": %v`, err)
+	}
+}
+
 func TestResolveNullUnionDefault(t *testing.T) {
 	writer, err := Parse(`{"type":"record","name":"R","fields":[
 		{"name":"x","type":"int"}

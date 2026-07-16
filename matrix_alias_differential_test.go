@@ -135,3 +135,87 @@ func TestDifferentialFastavroAliasResolution(t *testing.T) {
 		}
 	}
 }
+
+// TestDifferentialFastavroAliasDotRule executes the dotted-alias dot-rule
+// census rows (TestMatrix_AliasResolutionCensus's dotrule section) against
+// fastavro: alias spelling {".x", ".a.b", "..x", "."} × writer {null-ns x,
+// a.b, lax ".a.b", empty-name ""}. fastavro compares alias strings as
+// written, so its table accepts exactly one cell — raw ".a.b" against the
+// writer literally named ".a.b" — where twmb agrees; the two divergent
+// cells are the escape spellings, which twmb (and Java's Name constructor,
+// which nulls only an EMPTY space) normalize and fastavro does not: ".x"
+// matches the null-namespace writer x in twmb only, and "." (the empty-name
+// family) matches the empty-named writer in twmb only. Every cell is
+// EXECUTED; a schema fastavro cannot parse would surface as a non-"chema"
+// reject and fail the cell's classification — nothing is silently skipped.
+func TestDifferentialFastavroAliasDotRule(t *testing.T) {
+	o := startOracle(t)
+
+	aliases := map[string]string{"escape": ".x", "multidot": ".a.b", "doubledot": "..x", "dotonly": "."}
+	writers := map[string]string{"nullx": "x", "ab": "a.b", "laxdotab": ".a.b", "emptyname": ""}
+	fastAccept := map[string]map[string]bool{
+		"escape":    {"nullx": false, "ab": false, "laxdotab": false, "emptyname": false},
+		"multidot":  {"nullx": false, "ab": false, "laxdotab": true, "emptyname": false},
+		"doubledot": {"nullx": false, "ab": false, "laxdotab": false, "emptyname": false},
+		"dotonly":   {"nullx": false, "ab": false, "laxdotab": false, "emptyname": false},
+	}
+	twmbAccept := map[string]map[string]bool{
+		"escape":    {"nullx": true, "ab": false, "laxdotab": false, "emptyname": false},
+		"multidot":  {"nullx": false, "ab": false, "laxdotab": true, "emptyname": false},
+		"doubledot": {"nullx": false, "ab": false, "laxdotab": false, "emptyname": false},
+		"dotonly":   {"nullx": false, "ab": false, "laxdotab": false, "emptyname": true},
+	}
+	divergent := map[string]bool{"escape/nullx": true, "dotonly/emptyname": true}
+
+	lax := avro.WithLaxNames(func(string) error { return nil })
+	for spelling, alias := range aliases {
+		for wKey, wname := range writers {
+			for _, site := range []string{"top", "union"} {
+				name := fmt.Sprintf("%s/%s/%s", spelling, wKey, site)
+				t.Run(name, func(t *testing.T) {
+					writerJSON := fmt.Sprintf(`{"type":"record","name":%q,"fields":[{"name":"a","type":"int"}]}`, wname)
+					readerJSON := fmt.Sprintf(`{"type":"record","name":"n1.New","aliases":[%q],"fields":[{"name":"a","type":"int"}]}`, alias)
+					if site == "union" {
+						readerJSON = `["boolean",` + readerJSON + `]`
+					}
+
+					writer, err := avro.Parse(writerJSON, lax)
+					if err != nil {
+						t.Fatalf("twmb writer: %v", err)
+					}
+					wire, err := writer.Encode(map[string]any{"a": int32(7)})
+					if err != nil {
+						t.Fatalf("twmb encode: %v", err)
+					}
+
+					resp := o.call(oracleJob{
+						Op:     "readresolve",
+						Schema: json.RawMessage(writerJSON),
+						Reader: json.RawMessage(readerJSON),
+						Hex:    hex.EncodeToString(wire),
+					})
+					if resp.OK != fastAccept[spelling][wKey] {
+						t.Fatalf("fastavro accept=%v, want %v (err: %s)", resp.OK, fastAccept[spelling][wKey], resp.Err)
+					}
+					if !resp.OK && !strings.Contains(resp.Err, "chema") {
+						t.Fatalf("fastavro rejected for a non-resolution reason (parse or transport): %s", resp.Err)
+					}
+
+					reader := avro.MustParse(readerJSON)
+					twmbGot := avro.CheckCompatibility(writer, reader) == nil
+					if twmbGot != twmbAccept[spelling][wKey] {
+						t.Fatalf("twmb accept=%v, want %v", twmbGot, twmbAccept[spelling][wKey])
+					}
+					cell := spelling + "/" + wKey
+					if divergent[cell] {
+						if !twmbGot || resp.OK {
+							t.Fatalf("documented divergence inverted: twmb=%v fastavro=%v (twmb+Java normalize the escape; fastavro is verbatim)", twmbGot, resp.OK)
+						}
+					} else if twmbGot != resp.OK {
+						t.Fatalf("undocumented twmb/fastavro divergence: twmb=%v fastavro=%v", twmbGot, resp.OK)
+					}
+				})
+			}
+		}
+	}
+}

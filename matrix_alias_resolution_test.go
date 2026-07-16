@@ -125,6 +125,109 @@ func TestMatrix_AliasResolutionCensus(t *testing.T) {
 		}
 	}
 
+	// Dotted-alias dot rule: aliases follow the names' rule (leadingDotName,
+	// shared helper) — a single leading dot with a DOTLESS remainder is the
+	// null-namespace escape (".x" ≡ fullname "x", "." ≡ the empty name,
+	// joining the empty-name family), and any other dotted spelling is a
+	// fullname VERBATIM (Java's Name ctor nulls only an EMPTY space, so
+	// ".a.b" keeps space ".a"; fastavro compares raw alias strings, so
+	// ".a.b" matches only a writer literally named ".a.b"). None of these
+	// spellings contain no dot, so none is bare-declared and none ever
+	// short-matches (the main census's leadingdot × foreign-namespace rows
+	// pin that for the escape spelling). Writers ".a.b" and "" are lax-only
+	// names (#62 keeps multi-dot leading-dot names verbatim; #60 the empty
+	// name). The fastavro arm executes every parseable cell in
+	// TestDifferentialFastavroAliasDotRule.
+	dotAliases := map[string]string{"escape": ".x", "multidot": ".a.b", "doubledot": "..x", "dotonly": "."}
+	dotWriters := map[string]struct {
+		name string
+		lax  bool
+	}{
+		"nullx":     {"x", false},
+		"ab":        {"a.b", false},
+		"laxdotab":  {".a.b", true},
+		"emptyname": {"", true},
+	}
+	dotAccept := map[string]map[string]bool{
+		"escape":    {"nullx": true, "ab": false, "laxdotab": false, "emptyname": false},
+		"multidot":  {"nullx": false, "ab": false, "laxdotab": true, "emptyname": false},
+		"doubledot": {"nullx": false, "ab": false, "laxdotab": false, "emptyname": false},
+		"dotonly":   {"nullx": false, "ab": false, "laxdotab": false, "emptyname": true},
+	}
+	lax := WithLaxNames(func(string) error { return nil })
+	for spelling, alias := range dotAliases {
+		for wKey, w := range dotWriters {
+			for _, site := range []string{"top", "union"} {
+				want := dotAccept[spelling][wKey]
+				t.Run(fmt.Sprintf("dotrule/%s/%s/%s", spelling, wKey, site), func(t *testing.T) {
+					writerJSON := fmt.Sprintf(`{"type":"record","name":%q,"fields":[{"name":"a","type":"int"}]}`, w.name)
+					var writer *Schema
+					var err error
+					if w.lax {
+						writer, err = Parse(writerJSON, lax)
+					} else {
+						writer, err = Parse(writerJSON)
+					}
+					if err != nil {
+						t.Fatalf("writer: %v", err)
+					}
+					readerJSON := fmt.Sprintf(`{"type":"record","name":"n1.New","aliases":[%q],"fields":[{"name":"a","type":"int"}]}`, alias)
+					if site == "union" {
+						readerJSON = `["boolean",` + readerJSON + `]`
+					}
+					reader := MustParse(readerJSON)
+
+					compatErr := CheckCompatibility(writer, reader)
+					resolved, resolveErr := Resolve(writer, reader)
+					if (compatErr == nil) != (resolveErr == nil) {
+						t.Fatalf("CheckCompatibility (%v) and Resolve (%v) disagree", compatErr, resolveErr)
+					}
+					if got := compatErr == nil; got != want {
+						t.Fatalf("accept=%v, want %v (CheckCompatibility: %v)", got, want, compatErr)
+					}
+					if !want {
+						return
+					}
+					wire, err := writer.Encode(map[string]any{"a": int32(7)})
+					if err != nil {
+						t.Fatalf("encode: %v", err)
+					}
+					var got any
+					if _, err := resolved.Decode(wire, &got); err != nil {
+						t.Fatalf("resolved decode: %v", err)
+					}
+				})
+			}
+		}
+	}
+
+	// Scan-past discrimination for the verbatim arm: a multi-dot
+	// leading-dot alias must yield matchNone at the union tier so
+	// selection scans past it — a dot-stripping arm would store "a.b" and
+	// exact-match the writer, silently winning over the branch that
+	// legitimately matches on its unqualified name.
+	t.Run("dotrule/scanpast", func(t *testing.T) {
+		writer := MustParse(`{"type":"record","name":"a.b","fields":[{"name":"a","type":"int"}]}`)
+		reader := MustParse(`["boolean",
+			{"type":"record","name":"n1.New","aliases":[".a.b"],"fields":[{"name":"a","type":"int"}]},
+			{"type":"record","name":"n3.b","fields":[{"name":"a","type":"int"},{"name":"b","type":"string","default":"x"}]}]`)
+		resolved, err := Resolve(writer, reader)
+		if err != nil {
+			t.Fatalf("selection must scan past the verbatim-alias branch to n3.b: %v", err)
+		}
+		wire, err := writer.Encode(map[string]any{"a": int32(7)})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got map[string]any
+		if _, err := resolved.Decode(wire, &got); err != nil {
+			t.Fatalf("resolved decode: %v", err)
+		}
+		if got["b"] != "x" {
+			t.Fatalf("selected branch lacks n3.b's defaulted field (got %v); the verbatim alias branch was wrongly preferred", got)
+		}
+	})
+
 	// Scan-past discrimination for the union-branch matcher: with a single
 	// named candidate, a spurious tier-match on a qualified alias is
 	// dominated by the direct matcher's recheck of the selected branch, so
