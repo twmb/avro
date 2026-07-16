@@ -59,6 +59,15 @@ type (
 // on an error path is just as much a contract break.
 func schemaForScopeCell(t *testing.T, fields []reflect.StructField, namespace string, customs []CustomType) (*Schema, error) {
 	t.Helper()
+	// Every []string reachable from a cell's SchemaNode gets one sentinel
+	// element hidden past its length (len < cap) before the build: a
+	// deep-equal of the tree cannot see a write into the [len:cap) region
+	// of a caller-owned backing array (an append with spare capacity lands
+	// exactly there), so the sentinels are checked separately after.
+	var sentinels []func() error
+	for _, ct := range customs {
+		plantStringSliceSentinels(ct.Schema, make(map[*SchemaNode]bool), &sentinels)
+	}
 	snaps := make([]*SchemaNode, len(customs))
 	for i, ct := range customs {
 		snaps[i] = snapshotSchemaNode(ct.Schema, make(map[*SchemaNode]*SchemaNode))
@@ -67,6 +76,11 @@ func schemaForScopeCell(t *testing.T, fields []reflect.StructField, namespace st
 		for i, ct := range customs {
 			if !reflect.DeepEqual(snaps[i], ct.Schema) {
 				t.Errorf("build mutated caller-owned CustomType.Schema storage (custom %d):\n before: %#v\n after:  %#v", i, snaps[i], ct.Schema)
+			}
+		}
+		for _, check := range sentinels {
+			if err := check(); err != nil {
+				t.Error(err)
 			}
 		}
 	}()
@@ -89,6 +103,47 @@ func schemaForScopeCell(t *testing.T, fields []reflect.StructField, namespace st
 		opts[i] = ct
 	}
 	return Parse(string(b), opts...)
+}
+
+// plantStringSliceSentinels rebuilds every []string reachable from n
+// (type aliases, enum symbols, field aliases) as a slice with one sentinel
+// element past its length over a fresh backing array, and appends a
+// checker per slice that verifies the sentinel after the build. A build
+// that appends into one of these slices in place — instead of into its own
+// copy — overwrites the sentinel.
+func plantStringSliceSentinels(n *SchemaNode, visited map[*SchemaNode]bool, checks *[]func() error) {
+	if n == nil || visited[n] {
+		return
+	}
+	visited[n] = true
+	n.Aliases = plantOneStringSentinel(n.Aliases, "SchemaNode.Aliases", checks)
+	n.Symbols = plantOneStringSentinel(n.Symbols, "SchemaNode.Symbols", checks)
+	plantStringSliceSentinels(n.Items, visited, checks)
+	plantStringSliceSentinels(n.Values, visited, checks)
+	for i := range n.Branches {
+		plantStringSliceSentinels(&n.Branches[i], visited, checks)
+	}
+	for i := range n.Fields {
+		n.Fields[i].Aliases = plantOneStringSentinel(n.Fields[i].Aliases, "SchemaField.Aliases", checks)
+		plantStringSliceSentinels(&n.Fields[i].Type, visited, checks)
+	}
+}
+
+func plantOneStringSentinel(ss []string, what string, checks *[]func() error) []string {
+	if ss == nil {
+		return nil
+	}
+	const sentinel = "caller-owned-past-len"
+	backing := make([]string, len(ss)+1)
+	copy(backing, ss)
+	backing[len(ss)] = sentinel
+	*checks = append(*checks, func() error {
+		if got := backing[len(backing)-1]; got != sentinel {
+			return fmt.Errorf("build wrote past len into a caller-owned %s backing array: %q", what, got)
+		}
+		return nil
+	})
+	return backing[: len(ss) : len(ss)+1]
 }
 
 // snapshotSchemaNode deep-copies a SchemaNode tree, including the dynamic

@@ -172,10 +172,11 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		childNS := enclosingNS
-		var full string
+		var typ, full string
 		named := false
 		if tv, ok := lookupCI(v, "type"); ok {
-			if typ, _ := tv.(string); isNamedKind(typ) {
+			typ, _ = tv.(string)
+			if isNamedKind(typ) {
 				named = true
 				full, childNS = resolveNameScope(v, enclosingNS)
 			}
@@ -186,13 +187,21 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 		// folds away — exactly like the exact-case spelling. Both
 		// occurrences of one definition carry identical keys, so writing
 		// through the as-written key keeps the comparison deterministic.
+		//
+		// Structural keys normalize only on the kind that BINDS them
+		// (fields on record/error, items on array, values on map),
+		// mirroring the parser's kind-keyed grammar: on any other kind
+		// the key is inert as-written metadata (never name-bound), so it
+		// compares VERBATIM — two occurrences are one definition exactly
+		// when their inert content is byte-identical, not merely
+		// spelling-equivalent under a scope the parser never applies.
 		for k, val := range v {
 			switch {
 			case named && strings.EqualFold(k, "name"):
 				out[k] = full
 			case named && strings.EqualFold(k, "namespace"):
 				// Folded into the fullname.
-			case strings.EqualFold(k, "fields"):
+			case isRecordKind(typ) && strings.EqualFold(k, "fields"):
 				fields, ok := val.([]map[string]any)
 				if !ok {
 					out[k] = val
@@ -211,7 +220,8 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 					nf[i] = cf
 				}
 				out[k] = nf
-			case strings.EqualFold(k, "items") || strings.EqualFold(k, "values"):
+			case typ == "array" && strings.EqualFold(k, "items"),
+				typ == "map" && strings.EqualFold(k, "values"):
 				out[k] = normalizeSchemaScope(val, childNS)
 			default:
 				out[k] = val
@@ -273,12 +283,21 @@ func pinCustomSchemaScope(v any) {
 			return
 		}
 		// Unnamed containers pass the enclosing scope through; descend to
-		// the named frontier.
-		if items, ok := lookupCI(v, "items"); ok {
-			pinCustomSchemaScope(items)
+		// the named frontier — only through the key the node's kind BINDS
+		// (items on array, values on map), mirroring the parser's
+		// kind-keyed grammar. On any other kind the key is inert
+		// as-written metadata: a named-kind-shaped value inside it is
+		// never name-bound by Parse, so injecting the inheritance escape
+		// there would alter caller metadata, not pin a scope.
+		if typ == "array" {
+			if items, ok := lookupCI(v, "items"); ok {
+				pinCustomSchemaScope(items)
+			}
 		}
-		if values, ok := lookupCI(v, "values"); ok {
-			pinCustomSchemaScope(values)
+		if typ == "map" {
+			if values, ok := lookupCI(v, "values"); ok {
+				pinCustomSchemaScope(values)
+			}
 		}
 	case []any: // union branches
 		for _, b := range v {
@@ -326,11 +345,16 @@ func renderCustomSchemaTree(n *SchemaNode) (any, error) {
 }
 
 // deepCopyJSONTree copies every container level of a rendered schema tree
-// (attribute maps, union slices, field-map slices) so mutating walkers
-// cannot reach storage shared with the SchemaNode that produced it. Scalar
-// leaves are immutable and stay shared; []byte never survives a render
-// (the walk's JSON fixup converts it to the codepoint-string form), and
-// the walkers never write into string slices ([]string aliases/symbols).
+// (attribute maps, union slices, field-map slices, string slices) so
+// mutating walkers cannot reach storage shared with the SchemaNode that
+// produced it. Scalar leaves are immutable and stay shared; []byte never
+// survives a render (the walk's JSON fixup converts it to the
+// codepoint-string form). String slices ([]string aliases/symbols) come
+// over by reference from the render (emitStrings returns the caller's
+// slice) and MUST be copied: addTypeAliases appends to a type's "aliases"
+// value, and an append into a caller slice with spare capacity writes the
+// caller's backing array past its length — a write no deep-equal of the
+// caller's tree can see.
 func deepCopyJSONTree(v any) any {
 	switch v := v.(type) {
 	case map[string]any:
@@ -351,6 +375,8 @@ func deepCopyJSONTree(v any) any {
 			out[i] = deepCopyJSONTree(m).(map[string]any)
 		}
 		return out
+	case []string: // aliases, symbols
+		return append([]string(nil), v...)
 	}
 	return v
 }
@@ -434,34 +460,48 @@ func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any,
 		// updated in place — writing a new exact-case key alongside it
 		// would leave both spellings in the map, and Parse's exact-first
 		// preference would then read whichever this walk did NOT rewrite.
-		if fv, ok := lookupCI(v, "fields"); ok {
-			if fields, ok := fv.([]map[string]any); ok {
-				for i := range fields {
-					tk, ok := ciKey(fields[i], "type")
-					if !ok {
-						continue
+		//
+		// Each descent is gated on the kind that BINDS the key (fields on
+		// record/error, items on array, values on map), mirroring the
+		// parser's kind-keyed grammar: on any other kind the key is inert
+		// as-written metadata. Walking it would register definitions
+		// Parse never binds — a later genuine definition of the same
+		// fullname would then dedup into a dangling reference or report a
+		// false duplicate — so the stray passes through untouched.
+		if isRecordKind(typ) {
+			if fv, ok := lookupCI(v, "fields"); ok {
+				if fields, ok := fv.([]map[string]any); ok {
+					for i := range fields {
+						tk, ok := ciKey(fields[i], "type")
+						if !ok {
+							continue
+						}
+						nt, err := dedupNamedTypes(fields[i][tk], defined, childNS)
+						if err != nil {
+							return nil, err
+						}
+						fields[i][tk] = nt
 					}
-					nt, err := dedupNamedTypes(fields[i][tk], defined, childNS)
-					if err != nil {
-						return nil, err
-					}
-					fields[i][tk] = nt
 				}
 			}
 		}
-		if ik, ok := ciKey(v, "items"); ok {
-			nt, err := dedupNamedTypes(v[ik], defined, childNS)
-			if err != nil {
-				return nil, err
+		if typ == "array" {
+			if ik, ok := ciKey(v, "items"); ok {
+				nt, err := dedupNamedTypes(v[ik], defined, childNS)
+				if err != nil {
+					return nil, err
+				}
+				v[ik] = nt
 			}
-			v[ik] = nt
 		}
-		if vk, ok := ciKey(v, "values"); ok {
-			nt, err := dedupNamedTypes(v[vk], defined, childNS)
-			if err != nil {
-				return nil, err
+		if typ == "map" {
+			if vk, ok := ciKey(v, "values"); ok {
+				nt, err := dedupNamedTypes(v[vk], defined, childNS)
+				if err != nil {
+					return nil, err
+				}
+				v[vk] = nt
 			}
-			v[vk] = nt
 		}
 		return v, nil
 	case []any: // union branches
@@ -1094,9 +1134,11 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 		typ, _ := s["type"].(string)
 		switch {
 		case isNamedKind(typ):
-			// The existing aliases come from inferRecord/inferType which
-			// builds the schema as map[string]any with []string values.
-			// This assertion is safe for freshly-inferred schemas.
+			// The existing aliases are []string on every input this walk
+			// sees: freshly-inferred literals build them that way, and a
+			// rendered custom tree's []string was copied at the render
+			// boundary (deepCopyJSONTree), so the append below can never
+			// write into a caller-owned backing array.
 			existing, _ := s["aliases"].([]string)
 			s["aliases"] = append(existing, aliases...)
 			// refName must be the type's fullname (namespace + name) — the
