@@ -3627,3 +3627,63 @@ contract). The one adjacent flag left unruled: qualifyAliases strips ANY
 leading dot while Java keeps a non-empty ".a.b" space verbatim and
 leadingDotName (names) strips only the single-dot escape — recorded in #67
 as observed-adjacent, unpinned.
+
+### 2026-07-15 FIX addendum narrative (qualifyAliases leading-dot corner, same generation)
+
+The corner flagged unruled in #67 was ruled same-day: aliases follow the
+SAME dot rule as names (#62's leadingDotName). A single leading dot with a
+dotless remainder stays the null-namespace escape (".x" → stored "x",
+current behavior kept; ".x" is not bare-declared so it never short-matches);
+an alias whose remainder still contains a dot (".a.b", "..x") stays
+VERBATIM — Java's Name constructor keeps a non-empty space (the arm's
+comment had over-generalized the ctor: it nulls the space only when EMPTY,
+`if ("".equals(space)) space = null`), and fastavro's raw tier agrees (raw
+".a.b" matches only a writer literally named ".a.b"); "." joins the
+empty-name family per leadingDotName. The pre-rule strip-any-dot arm made
+alias ".a.b" match writer "a.b" — a match neither reference makes.
+
+Pre-action gate before the edit: pickaxe -S/-G on the HasPrefix arm →
+single introducing commit cf91ceb ("all: correctness, DoS, and interop
+fixes from a multi-round audit"), whose comment carried the over-general
+Name-ctor claim; NOT_BUGS #62 itself already asserted "same rule
+qualifyAliases already applied to aliases" — the shipped multi-dot behavior
+contradicted the entry's own text. Verdict: documented-but-contradicted;
+maintainer ruled.
+
+Fix: qualifyAliases consumes leadingDotName (one shared helper, no
+replica) — `short, _ := leadingDotName(a)` handles all three shapes in one
+call (escape strips, "." empties, everything else returns verbatim with
+ok=false). bareAliases classification untouched (keyed on the DECLARED
+spelling; every dotted spelling stays non-bare). Red-then-green pin
+TestResolveLeadingDotAliasDotRule: the ".a.b"×"a.b" flip (accept→reject,
+both APIs), the ".a.b"×lax-".a.b" verbatim accept (was reject: stored
+"a.b" ≠ ".a.b"), and the kept ".x"×"x" escape control.
+
+Census rows added to TestMatrix_AliasResolutionCensus (dotrule section):
+alias spelling {".x", ".a.b", "..x", "."} × writer {null-ns x, a.b, lax
+".a.b", empty-name} × site {top, union}, plus a verbatim-arm scan-past
+cell (writer "a.b"; reader union [boolean, n1.New(aliases[".a.b"]),
+n3.b{...,b default "x"}] — the verbatim arm must yield matchNone so
+selection reaches n3.b; a stripping arm exact-matches the wrong branch,
+visible as the missing defaulted field). "..x" rows pin all-reject against
+the axis writers under both the old and new arm — their value is the
+spelling-parity record, not neuter discrimination. Every cell EXECUTED in
+TestDifferentialFastavroAliasDotRule: fastavro parsed the lax-only writers
+(".a.b", empty-name) — corroborating its name-laxness — accepted exactly
+the mutual ".a.b"×".a.b" cell, and rejected the two escape cells twmb+Java
+normalize (".x"×x, "."×"" — "." also rejects at Java's validateName; twmb
+accepts per #27's any-string aliases + the empty-name family), asserted as
+the documented divergent cells; nothing skipped.
+
+Neuter (strip-any-dot restored): exactly
+TestMatrix_AliasResolutionCensus/dotrule/multidot/ab/{top,union},
+dotrule/multidot/laxdotab/{top,union}, dotrule/scanpast, and
+TestResolveLeadingDotAliasDotRule red; the escape/doubledot/dotonly rows
+stay green by construction (the strip coincides with the rule for ".x" and
+".", and "..x"→".x" matches none of the axis writers either way) — their
+discrimination lives in the fastavro-executed parity, not the neuter.
+
+#67's observed-adjacent sentence rewritten to the ruled text (index line
+updated); ledger addendum uses the start-HEAD convention (the existing
+c6f75a2..HEAD quarantine covers this commit — no scope change). Full suite
++ fastavro differential green; -race green on the changed tests.
