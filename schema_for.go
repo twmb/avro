@@ -1116,31 +1116,29 @@ type typeAliasResult struct {
 // named type referenced by a field (as opposed to alias= which sets
 // aliases on the field itself).
 //
-// Unlike the composition walkers (resolveNameScope and friends), this
-// walk reads its keys exact-case, which is sound because its input space
-// is structurally exact-case at every position the walk consults with
-// observable effect: inferType output is either an inferred literal or a
-// rendered custom tree, and the render (toJSONWalk) emits "type", "name",
-// "namespace", "aliases", "items", and "values" as literal keys. A
-// case-variant spelling can enter only through a Props value, which
-// cannot re-route this walk — a Props-smuggled "ITEMS" sits on a
-// non-array kind, where both spellings fall through to the same
-// not-a-named-type result — and the refName identity is used only as a
-// per-build bookkeeping key (applied[]), consistent across occurrences
-// within one build whichever way it resolves.
+// Like the composition walkers (resolveNameScope and friends), this walk
+// reads reserved keys case-insensitively (lookupCI) and writes the
+// aliases attribute back through its as-written key
+// (appendTypeAliasValues), matching how the Parse consuming the composed
+// tree binds them: a rendered custom tree can carry any reserved key as
+// a Props case-variant, and Parse folds every spelling onto the reserved
+// attribute — including a container's binding key (a Props-carried
+// "Items" on an array whose Items field is nil IS the array's items),
+// so the walk must route and write by the folded key, never the literal
+// spelling. The one consumer with no Parse counterpart is refName: a
+// per-build bookkeeping key (applied[]), which only needs to be
+// CONSISTENT across occurrences within one build — the shared lookupCI
+// reads make every occurrence resolve it identically.
 func addTypeAliases(schema any, aliases []string) typeAliasResult {
 	switch s := schema.(type) {
 	case map[string]any:
-		typ, _ := s["type"].(string)
+		var typ string
+		if tv, ok := lookupCI(s, "type"); ok {
+			typ, _ = tv.(string)
+		}
 		switch {
 		case isNamedKind(typ):
-			// The existing aliases are []string on every input this walk
-			// sees: freshly-inferred literals build them that way, and a
-			// rendered custom tree's []string was copied at the render
-			// boundary (deepCopyJSONTree), so the append below can never
-			// write into a caller-owned backing array.
-			existing, _ := s["aliases"].([]string)
-			s["aliases"] = append(existing, aliases...)
+			appendTypeAliasValues(s, aliases)
 			// refName must be the type's fullname (namespace + name) — the
 			// same identity inferRecord registers in seen[t] and a later
 			// field's name reference resolves to. The definition carries
@@ -1149,15 +1147,20 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 			// by one identity. (A namespace-less type's fullname is its
 			// bare name, so fixed types and no-namespace records are
 			// unchanged.)
-			name, _ := s["name"].(string)
-			ns, _ := s["namespace"].(string)
+			var name, ns string
+			if nv, ok := lookupCI(s, "name"); ok {
+				name, _ = nv.(string)
+			}
+			if nsv, ok := lookupCI(s, "namespace"); ok {
+				ns, _ = nsv.(string)
+			}
 			return typeAliasResult{applied: true, refName: avroFullName(ns, name)}
 		case typ == "array":
-			if items, ok := s["items"]; ok {
+			if items, ok := lookupCI(s, "items"); ok {
 				return addTypeAliases(items, aliases)
 			}
 		case typ == "map":
-			if values, ok := s["values"]; ok {
+			if values, ok := lookupCI(s, "values"); ok {
 				return addTypeAliases(values, aliases)
 			}
 		}
@@ -1182,6 +1185,37 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 		}
 	}
 	return typeAliasResult{}
+}
+
+// appendTypeAliasValues merges the tag's aliases into the type's existing
+// aliases attribute through its as-written key (ciKey): a Props-carried
+// case-variant spelling is EXTENDED in place, because an exact-case write
+// beside it would leave two spellings of one attribute in the composed
+// object and Parse's duplicate-key resolution keeps only one — silently
+// dropping the caller's aliases. The existing value is []string on the
+// field routes (freshly-inferred literals build []string; a rendered
+// custom tree's []string was copied at the render boundary by
+// deepCopyJSONTree, so the appends below never write into a caller-owned
+// backing array) and []any on the Props route. Any other shape is left
+// untouched for the final Parse to reject ("aliases" must be a JSON
+// array of strings) with the caller's content intact.
+func appendTypeAliasValues(s map[string]any, aliases []string) {
+	k, ok := ciKey(s, "aliases")
+	if !ok {
+		s["aliases"] = append([]string(nil), aliases...)
+		return
+	}
+	switch existing := s[k].(type) {
+	case []string:
+		s[k] = append(existing, aliases...)
+	case []any:
+		merged := make([]any, 0, len(existing)+len(aliases))
+		merged = append(merged, existing...)
+		for _, a := range aliases {
+			merged = append(merged, a)
+		}
+		s[k] = merged
+	}
 }
 
 // inferType returns the Avro schema for a Go type.

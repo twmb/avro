@@ -4004,3 +4004,118 @@ per-cell counterfactual). Full suite + fastavro EXECUTED green; -race
 green (full suite). FIX.md item 15 rewritten to require the explicit
 invariant × surface TABLE (two generations of prose sweeps each left an
 enumerable axis uncrossed); NOT_BUGS #63 gains the composition clause.
+
+## Distillation archive (2026-07-17) — type-alias case-fold fix round
+
+FIX round (granted): fold `addTypeAliases` into the composition walkers'
+CI uniformity (#46). The walk read type/aliases/items/values/name/
+namespace exact-case while Parse and every sibling walker fold; a
+container custom whose binding structural key arrived only as a Props
+case-variant ("Items"/"Values" with the structural field nil — the render
+omits the literal key for a nil field, so the variant is the ONLY
+spelling and Parse binds it) wrong-rejected the type-alias tag on an
+array/map carrier ("type is not a named type") and silently landed the
+alias on a LATER named union branch. The aeb9565 soundness comment's
+premise ("a Props-smuggled 'ITEMS' sits on a non-array kind") was
+executed-false for exactly that construction; gate verdict
+documented-but-contradicted, maintainer confirmed both modes and granted.
+
+Fix: reads via lookupCI (type, name, namespace, items, values); the
+aliases attribute read/written through its as-written key via a new
+`appendTypeAliasValues` helper with a type-tolerant merge — []string on
+the field routes (render-boundary copy makes the append safe), []any on
+the Props route (fresh merged slice), any other shape left untouched for
+Parse's "aliases must be a JSON array of strings" reject (executed
+verdicts: scalar and numeric aliases both hard-reject, so leaving the
+value preserves the caller's content in the loud failure). An exact-case
+write beside a CI-variant key would leave two spellings of one attribute
+and Parse's duplicate-key resolution (encoding/json last-key-wins over
+sorted map-marshal order) keeps only one — the shadow class the
+namespace pin had. The soundness comment shrank to the surviving
+argument: refName is a per-build bookkeeping key needing only
+per-occurrence consistency, which the shared lookupCI reads guarantee.
+
+Pins red→green (in-repo, matrix_schemafor_casefold_test.go, exact-case
+controls in-test): TestRegression_TypeAliasBindingKeyCaseFold (Items/
+ITEMS red pre-fix, error mode), TestRegression_TypeAliasUnionPlacementCaseFold
+(Items red: alias on Y not X — metadata-asserted via findNodeAliases,
+not string-grep), TestRegression_TypeAliasExtendsCaseVariantAliases
+(caller aliases dropped: got [Old], want [prior.P Old]). Class net:
+TestMatrix_TypeAliasCaseFold, 26 cells — binding-key routing {array, map,
+union-with-X-behind-the-key} × spelling {exact, upper, mixed} ×
+structural-field {nil, set} (18; per-carrier family asserts one verdict,
+one canonical, one alias placement), aliases arrival routes {field,
+props-exact, props-upper, props-mixed} (4; extend-never-shadow, the
+props-exact []any cell included), name/namespace inert-variant cells (2),
+two-tagged-fields dedup shape {namespace-field route, Props-variant
+route} (2; one definition + one dotted reference, canonical-identical).
+Every cell runs under schemaForScopeCell's mutation snapshot + []string
+sentinels. Neuters disjoint: N1 (gate reads back to exact) reds pins 1+2
+(3 subtests) + route-family divergence asserts (array, map verdict;
+union placement + 2 placement cells), pin 3 green; N2 (aliases merge
+back to exact []string-only) reds pin 3 + all three aliases/props-*
+cells + the family assert, pins 1+2 green.
+
+Sibling sweep post-fix: zero exact-case reserved-key READS remain in
+schema_for.go; remaining exact-case writes classified — freshly-built
+maps (inferRecord/inferField literals) or CI-absence-guarded
+(pinCustomSchemaScope's injection behind lookupCI-!has;
+appendTypeAliasValues' fresh-key arm behind ciKey-!ok). Name-walk:
+toJSONWalk/cache emit sites are construction, not readers. The refName
+REFERENCE arm (applied[] lookup) is reachable only via seen-registered
+inferred literals, which are exact-case by construction. NOT_BUGS #46
+extended (fifth surface; old exact-case sentence replaced). Full suite +
+fastavro differential EXECUTED green; -race green on the casefold family;
+vet clean. Item-15 table in the round report (all six invariants ×
+the touched walker crossed or discharged).
+
+## Distillation archive (2026-07-17) — case-fold policy adjudication round
+
+POLICY round. The maintainer adjudicated the reserved-key case-sensitivity
+question: KEEP the v1/CI semantics; the flip to exact-case (encoding/json
+v2 intent + spec + Java/fastavro/goavro) was considered and DECLINED.
+Rationale: hamba-migration ease (hamba is case-insensitive too) and zero
+conformant producers of case-variant reserved keys. The held addTypeAliases
+CI fix was released and landed exactly as granted (see the 2026-07-17
+type-alias fix-round archive above: lookupCI/ciKey uniformity, three pins,
+TestMatrix_TypeAliasCaseFold 26 cells, disjoint neuters) — closing the
+fifth and final reading surface; v1 semantics are COMPLETE and
+class-guarded.
+
+NOT_BUGS #46 rewritten as the adjudicated entry: maintainer-ruled
+2026-07-17 replacing the inferred-deliberate label, plus a new file-wide
+convention (every entry states WHO adjudicated — maintainer-stated vs
+inferred-from-consistency; maintainer-stated entries need new executed
+evidence AND a maintainer decision to re-open). All lineage and table
+claims EXECUTED or source-cited this round before entering the entry:
+encoding/json v1 binds {"Items":5} to an items-tagged field, v2 does not
+(both executed, go1.26.2, GOEXPERIMENT=jsonv2 for v2); fastavro 1.12.2
+Items-only array rejects KeyError 'items' and Fields-only record accepts
+as a ZERO-field record with "fields":[] synthesized (executed); goavro
+rejects both ("Array ought to have items key" array.go:23, "Record %q
+ought to have fields key" record.go:26); hamba binds BOTH shapes
+(executed via local clone — record WITH fields, array with items;
+mechanism go-viper/mapstructure/v2 default MatchName strings.EqualFold,
+mapstructure.go:511); Java exact-case (SCHEMA_RESERVED Schema.java:175-176,
+JsonProperties.java:287, source-cited; Fields-only record rejects, fields
+missing). Lineage attribution corrected by execution: lookupCI landed at
+84601dd — itself the iceberg-go-migration-off-hamba commit, so the CI
+helper was born hamba-shaped — while the "Avro keys are case-sensitive
+per spec" concession sentence was added later at cf91ceb (the overseer's
+84601dd attribution of the comment was off by one commit; pickaxe
+verified).
+
+The known tri-posture edge ({"type":"record","name":"R","Fields":[...]}:
+twmb+hamba record WITH fields, fastavro zero-field record, Java reject)
+is now PINNED, not prosed: TestRegression_CaseVariantStructuralKeyParsePosture
+(matrix_schemafor_casefold_test.go) asserts the exact posture — canonical
+bytes + wire round-trip for both the record and array shapes — so a
+future fold change is a visible policy flip. FIX.md item 15's fold line
+updated: the exact-case carve-out is GONE (the one surface that claimed
+it had an executed-false premise); a new surface claiming exact-case
+soundness owes an executed probe of the variant-only binding-key shape.
+
+Suite + fastavro differential EXECUTED green; -race green on the casefold
+family + posture pin; Java oracle NOT run (no jar). Committed on branch
+fixes (fix + tests + BUG_AUDIT; the other framework docs stay untracked
+per convention).
