@@ -4244,3 +4244,74 @@ in AUDIT_CORE.md §Round ledger. Verbatim originals:
   stays RESET (fix round; rebuild needs two clean bare FULLs). CORE >
   cap: next round STILL opens with distillation. Narrative: BUG_AUDIT.md
   archive (2026-07-17).
+
+## Distillation archive (2026-07-17) — FULL round report (HEAD dd31464), verbatim
+
+Round opened with the mandated CORE distillation (59,237 → 52,371 B;
+ledger originals 79ed5b3-3rd..84bac19-2nd archived above, compressed to
+three era lines).
+
+Net: full suite green with fastavro RAN+EXECUTED (no skips, verified);
+-race FULL green (from file); fuzz clean 2×30s (FuzzMatrixCore 126k execs,
+FuzzSchemaNode 147k execs, healthy rates, no artifacts); Java NOT run (no
+AVRO_TOOLS_JAR) — Java-differential areas verified modulo that oracle.
+
+Quarantine 84bac19..HEAD = b2c7601 (addTypeAliases CI fold): NOT clean.
+The new appendTypeAliasValues helper's fallback premise ("any other shape
+is left for Parse's array-of-strings reject") is executed-false for shapes
+whose json.Marshal output is a valid JSON array of strings: a
+`type A []string` or `[1]string` aliases value matches neither the
+[]string nor the []any merge arm, is left untouched, and Parse ACCEPTS
+the marshal — so the type-alias tag's aliases silently vanish (the exact
+outcome the as-written-key merge was built to prevent). Probes red ×2
+(named slice, [N]string; sandbox typealias_shape_test.go).
+
+Walk (sibling sweep of the quarantine finding → new blind spot B36):
+caller-owned `any` values consumed BEFORE the marshal→Parse round trip
+through exact-Go-type switches. Red probes:
+  - named-map (`type M map[string]any`) Props-carried "items" def:
+    opaque to pinCustomSchemaScope → "namespace":"" injection missed →
+    composed fullname silently changes (X vs com.x.X, canonical bytes
+    diverge); the same input wrong-rejects a type-alias tag ("type is
+    not a named type") while canonical map[string]any succeeds. Red ×2
+    (namedmap_shape_test.go).
+  - needsJSONFixup/applyJSONFixup exact leaf types: named []byte Props
+    value rebuilds as base64 TEXT ("AQID") instead of codepoint form
+    ("\x01\x02\x03") — the corruption the fixup's own doc warns about;
+    the same miss on a bytes FIELD DEFAULT materializes the wrong
+    default bytes ({0x41,0x51,0x49,0x44} for {1,2,3}) which auto-fills
+    into EncodeJSON output (wire-visible); named float −0.0 collapses
+    to +0 (canonical float64 preserves the sign by design); named float
+    NaN errors loudly (acceptable posture). Red ×3
+    (namedleaf_fixup_test.go).
+Root cause (one): pre-marshal consumers dispatch on exact Go types while
+tree semantics are marshal-defined; valueWalkLimit already walks by
+reflect KIND for exactly this reason — the copy/fixup/merge layers do
+not. Fix direction: kind-driven canonicalization at the two boundaries
+(deepCopyJSONTree + jsonSerializableValue), respecting
+json.Marshaler/TextMarshaler precedence; or a marshal+rescan
+normalization at the render boundary for full closure. Filed as two
+findings (composition-container class; leaf-fixup class); fix opt-in.
+The b2c7601 26-cell matrix held the Go dynamic type CONSTANT at
+canonical — the B32 held-axis lesson; the class net wants a Go-dynamic-
+type axis {canonical, named-container, named-leaf, [N]array,
+Marshaler-carrying} across the scope/casefold/fixup cells.
+
+Clean fronts:
+  - skip.go inverse-density walk: skipBytes/skipBlocks bounds via shared
+    readLength (length ≤ len(src)) and readBlockHeader
+    validateByteSize=true (incl. MinInt64 negation guard); block loops
+    on shared checkArray/MapBlockBounds (P8 honored); framing-through-
+    skip netted (TestMatrix_ForeignFramingThroughSkip asserts the
+    following field survives every variant); hostile truncation/
+    corruption drives resolved(R) in matrix_hostile; content-leniency
+    on skip (unvalidated enum ordinal/boolean) matches Java/fastavro
+    skip semantics. No findings.
+  - P1/P9 grep refresh: every hit classified to a netted family
+    (boundedRatFromString gates, MakeSlice reuse family, time.Unix*
+    behind matrix_logical_bounds, parseFloatAcceptOverflow caps,
+    JSON-number integer gates). Y4 delta-verified (b2c7601 contains no
+    numeric narrowing; full sweep was last round).
+
+Counter: RESET (2 behavioral FILED). Fix-application opt-in; sandbox
+probes in the session scratchpad, in-repo pins land with the fix round.
