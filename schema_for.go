@@ -320,18 +320,23 @@ func pinCustomSchemaScope(v any) {
 //     channel, and a truncated Props VALUE parses cleanly as a null prop,
 //     so no downstream Parse catches the silent alteration.
 //
-//   - It deep-copies the rendered tree before returning it. The walk hands
-//     Props container values (and SchemaField Props/Default containers)
-//     over BY REFERENCE whenever they need no JSON fixup
-//     (jsonSerializableValue's documented allocation-free fast path), and
-//     the composition walkers write into the tree they are given:
-//     pinCustomSchemaScope injects "namespace":"" at the named frontier,
-//     dedupNamedTypes rewrites items/values/union slots and field types
-//     into references. Without the copy those writes would land in the
-//     caller's own SchemaNode storage. This render is the only path
-//     caller-owned containers enter the pre-Parse tree — every other node
-//     comes fresh from inferType/inferRecord literals or toJSONWalk's own
-//     map construction — so the copy at this boundary covers them all.
+//   - It deep-copies AND canonicalizes the rendered tree before returning
+//     it. The walk hands Props container values (and SchemaField
+//     Props/Default containers) over BY REFERENCE whenever they need no
+//     JSON fixup (jsonSerializableValue's documented allocation-free fast
+//     path), and the composition walkers write into the tree they are
+//     given: pinCustomSchemaScope injects "namespace":"" at the named
+//     frontier, dedupNamedTypes rewrites items/values/union slots and
+//     field types into references. Without the copy those writes would
+//     land in the caller's own SchemaNode storage; without the
+//     canonicalization (canonicalizeTreeValue) a caller-typed value —
+//     `type M map[string]any`, whose marshal is identical to its
+//     canonical twin's — would pass through every walker type-switch
+//     untouched while Parse binds its marshal as real structure. This
+//     render is the only path caller-owned containers enter the pre-Parse
+//     tree — every other node comes fresh from inferType/inferRecord
+//     literals or toJSONWalk's own map construction — so the boundary
+//     covers them all.
 func renderCustomSchemaTree(n *SchemaNode) (any, error) {
 	d := &deduper{
 		defined: make(map[string]*SchemaNode),
@@ -344,17 +349,23 @@ func renderCustomSchemaTree(n *SchemaNode) (any, error) {
 	return deepCopyJSONTree(tree), nil
 }
 
-// deepCopyJSONTree copies every container level of a rendered schema tree
-// (attribute maps, union slices, field-map slices, string slices) so
-// mutating walkers cannot reach storage shared with the SchemaNode that
-// produced it. Scalar leaves are immutable and stay shared; []byte never
-// survives a render (the walk's JSON fixup converts it to the
-// codepoint-string form). String slices ([]string aliases/symbols) come
-// over by reference from the render (emitStrings returns the caller's
-// slice) and MUST be copied: addTypeAliases appends to a type's "aliases"
-// value, and an append into a caller slice with spare capacity writes the
-// caller's backing array past its length — a write no deep-equal of the
-// caller's tree can see.
+// deepCopyJSONTree copies AND CANONICALIZES every container level of a
+// rendered schema tree so the composition walkers — which dispatch on the
+// canonical Go types — provably see every value the final Parse will bind,
+// and so mutating walkers cannot reach storage shared with the SchemaNode
+// that produced it. The copy duty: string slices ([]string
+// aliases/symbols) come over by reference from the render (emitStrings
+// returns the caller's slice) and MUST be copied — addTypeAliases appends
+// to a type's "aliases" value, and an append into a caller slice with
+// spare capacity writes the caller's backing array past its length, a
+// write no deep-equal of the caller's tree can see. The canonicalization
+// duty: the tree's semantics are defined by its json.Marshal output, and a
+// caller-typed value (`type M map[string]any` in Props) marshals
+// identically to its canonical twin — left as-is it would thread through
+// every walker type-switch untouched while Parse binds its marshal as real
+// structure (canonicalizeTreeValue). Immutable scalar leaves stay shared;
+// []byte never survives a render (the walk's JSON fixup converts it to
+// the codepoint-string form).
 func deepCopyJSONTree(v any) any {
 	switch v := v.(type) {
 	case map[string]any:
@@ -377,6 +388,83 @@ func deepCopyJSONTree(v any) any {
 		return out
 	case []string: // aliases, symbols
 		return append([]string(nil), v...)
+	case nil, string, bool, float64, float32, int, int32, int64, json.Number:
+		return v
+	}
+	return canonicalizeTreeValue(v)
+}
+
+// canonicalizeTreeValue rewrites a caller-typed tree value into the
+// canonical Go shape whose json.Marshal output is identical: a named
+// string-keyed map into map[string]any, a named slice/array into []any
+// (or []string when every element is a plain string kind, matching the
+// aliases/symbols form), a byte-kinded slice into []byte, named leaves
+// into their predeclared types, with pointers and interfaces unwrapped.
+// Values whose marshal is self-defined (own MarshalJSON/MarshalText,
+// json.Number — treeValueMarshalOpaque) and shapes with no same-marshal
+// canonical twin (structs; maps with non-string-kind or TextMarshaler
+// keys; slices whose elements' marshal is position-dependent) stay as
+// they are: opaque leaves the walkers pass through untouched and Parse
+// reads from the marshal — the documented residual posture. Cyclic
+// values cannot reach here: the render's budgeted walk (valueWalkLimit)
+// errors on them before the copy runs.
+func canonicalizeTreeValue(v any) any {
+	if v == nil || treeValueMarshalOpaque(v) {
+		return v
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if rv.IsNil() {
+			return nil
+		}
+		return deepCopyJSONTree(rv.Elem().Interface())
+	case reflect.Map:
+		if !canonicalStringKeyMap(rv.Type()) {
+			return v
+		}
+		out := make(map[string]any, rv.Len())
+		for it := rv.MapRange(); it.Next(); {
+			out[it.Key().String()] = deepCopyJSONTree(it.Value().Interface())
+		}
+		return out
+	case reflect.Slice, reflect.Array:
+		if rv.Kind() == reflect.Slice && canonicalByteSliceKind(rv.Type()) {
+			b := make([]byte, rv.Len())
+			for i := range b {
+				b[i] = byte(rv.Index(i).Uint())
+			}
+			return b
+		}
+		elem := rv.Type().Elem()
+		if sliceElemMarshalPositionDependent(elem) {
+			return v
+		}
+		if elem.Kind() == reflect.String && elem != jsonNumberType &&
+			!elem.Implements(jsonMarshalerType) && !elem.Implements(textMarshalerType) {
+			out := make([]string, rv.Len())
+			for i := range out {
+				out[i] = rv.Index(i).String()
+			}
+			return out
+		}
+		out := make([]any, rv.Len())
+		for i := range out {
+			out[i] = deepCopyJSONTree(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.String:
+		return rv.String()
+	case reflect.Bool:
+		return rv.Bool()
+	case reflect.Float64:
+		return rv.Float()
+	case reflect.Float32:
+		return float32(rv.Float())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return rv.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return rv.Uint()
 	}
 	return v
 }
@@ -1192,13 +1280,15 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 // case-variant spelling is EXTENDED in place, because an exact-case write
 // beside it would leave two spellings of one attribute in the composed
 // object and Parse's duplicate-key resolution keeps only one — silently
-// dropping the caller's aliases. The existing value is []string on the
-// field routes (freshly-inferred literals build []string; a rendered
-// custom tree's []string was copied at the render boundary by
-// deepCopyJSONTree, so the appends below never write into a caller-owned
-// backing array) and []any on the Props route. Any other shape is left
-// untouched for the final Parse to reject ("aliases" must be a JSON
-// array of strings) with the caller's content intact.
+// dropping the caller's aliases. The existing value is []string or []any
+// on every route: freshly-inferred literals build []string, and the
+// render boundary canonicalizes every caller-typed array shape into
+// []string/[]any fresh copies (deepCopyJSONTree/canonicalizeTreeValue —
+// so the appends below never write into a caller-owned backing array).
+// The one shape that reaches here outside those two is a marshal-opaque
+// value (its own MarshalJSON/MarshalText): left untouched for Parse to
+// read from its marshal, the documented opacity residual — a merge would
+// require marshaling it early, and its output is its author's contract.
 func appendTypeAliasValues(s map[string]any, aliases []string) {
 	k, ok := ciKey(s, "aliases")
 	if !ok {

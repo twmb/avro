@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"encoding"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -286,6 +287,111 @@ func needsJSONFixup(v any) bool {
 		}
 	case []any:
 		return slices.ContainsFunc(tv, needsJSONFixup)
+	case nil, string, bool, json.Number, int, int32, int64:
+	default:
+		return needsJSONFixupKind(v)
+	}
+	return false
+}
+
+var jsonMarshalerType = reflect.TypeFor[json.Marshaler]()
+
+// treeValueMarshalOpaque reports whether v's JSON form is self-defined —
+// its own MarshalJSON/MarshalText method, or json.Number (whose
+// number-not-string marshal encoding/json special-cases internally). Such
+// values keep their marshal semantics untouched: the fixups and the
+// canonicalizing render copy leave them alone, and the composition
+// walkers treat them as opaque leaves that Parse reads from the marshal.
+// The assertions use the value's own method set, matching what
+// encoding/json consults for an interface-carried (unaddressable) value.
+func treeValueMarshalOpaque(v any) bool {
+	switch v.(type) {
+	case json.Number, json.Marshaler, encoding.TextMarshaler:
+		return true
+	}
+	return false
+}
+
+// canonicalByteSliceKind reports whether t marshals as a raw byte string:
+// a slice with uint8-kind elements whose element type supplies no marshal
+// of its own — mirroring encoding/json's byte-slice rule, which consults
+// the element's POINTER method set because slice elements are addressable.
+func canonicalByteSliceKind(t reflect.Type) bool {
+	if t.Kind() != reflect.Slice || t.Elem().Kind() != reflect.Uint8 {
+		return false
+	}
+	p := reflect.PointerTo(t.Elem())
+	return !p.Implements(jsonMarshalerType) && !p.Implements(textMarshalerType)
+}
+
+// sliceElemMarshalPositionDependent reports whether moving a t-typed
+// slice/array element into an interface box would CHANGE its marshal: a
+// pointer-receiver-only marshaler is reachable from an addressable element
+// in place but not from an interface-carried copy, so containers of such
+// elements stay opaque rather than being canonicalized into a
+// semantically different []any.
+func sliceElemMarshalPositionDependent(t reflect.Type) bool {
+	p := reflect.PointerTo(t)
+	if !p.Implements(jsonMarshalerType) && !p.Implements(textMarshalerType) {
+		return false
+	}
+	return !t.Implements(jsonMarshalerType) && !t.Implements(textMarshalerType)
+}
+
+// canonicalStringKeyMap reports whether t's keys marshal as their plain
+// string value: string kind with no TextMarshaler override (encoding/json
+// uses a key's TextMarshaler when present; json.Marshaler is never
+// consulted for keys, and a key's method set is the value set since map
+// keys are unaddressable).
+func canonicalStringKeyMap(t reflect.Type) bool {
+	return t.Key().Kind() == reflect.String && !t.Key().Implements(textMarshalerType)
+}
+
+// needsJSONFixupKind extends the fixup detection to caller-typed values by
+// reflect kind, so a named `type B []byte` or a named float behaves like
+// the canonical twin its marshal is indistinguishable from. Marshal-opaque
+// values (treeValueMarshalOpaque) are exempt — their marshal wins. One
+// deliberate asymmetry: the numeric-PRESERVING fixups (±Inf, -0.0) apply
+// to named float kinds, but the type-CHANGING NaN→"NaN"-string conversion
+// stays canonical-only — a named float NaN keeps json.Marshal's loud
+// unsupported-value error rather than being silently stringified.
+func needsJSONFixupKind(v any) bool {
+	if treeValueMarshalOpaque(v) {
+		return false
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Float64, reflect.Float32:
+		f := rv.Float()
+		return math.IsInf(f, 0) || isNegativeZero(f)
+	case reflect.Slice:
+		if canonicalByteSliceKind(rv.Type()) {
+			return true
+		}
+		fallthrough
+	case reflect.Array:
+		if sliceElemMarshalPositionDependent(rv.Type().Elem()) {
+			return false
+		}
+		for i := range rv.Len() {
+			if needsJSONFixup(rv.Index(i).Interface()) {
+				return true
+			}
+		}
+	case reflect.Map:
+		if !canonicalStringKeyMap(rv.Type()) {
+			return false
+		}
+		for it := rv.MapRange(); it.Next(); {
+			if needsJSONFixup(it.Value().Interface()) {
+				return true
+			}
+		}
+	case reflect.Pointer, reflect.Interface:
+		if rv.IsNil() {
+			return false
+		}
+		return needsJSONFixup(rv.Elem().Interface())
 	}
 	return false
 }
@@ -339,6 +445,65 @@ func applyJSONFixup(v any) any {
 			out[i] = applyJSONFixup(val)
 		}
 		return out
+	}
+	return applyJSONFixupKind(v)
+}
+
+// applyJSONFixupKind is needsJSONFixupKind's conversion twin: it rebuilds
+// the caller-typed value in canonical shape with the same fixups the
+// exact-type arms apply, leaving marshal-opaque values and the
+// no-canonical-twin residuals untouched. A named float NaN deliberately
+// falls through un-fixed (needsJSONFixupKind never selects it) so the
+// marshal error stays loud.
+func applyJSONFixupKind(v any) any {
+	if v == nil || treeValueMarshalOpaque(v) {
+		return v
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Float64, reflect.Float32:
+		f := rv.Float()
+		switch {
+		case math.IsInf(f, 1):
+			return json.Number("1e1000")
+		case math.IsInf(f, -1):
+			return json.Number("-1e1000")
+		case isNegativeZero(f):
+			return json.Number("-0.0")
+		}
+		return v
+	case reflect.Slice:
+		if canonicalByteSliceKind(rv.Type()) {
+			b := make([]byte, rv.Len())
+			for i := range b {
+				b[i] = byte(rv.Index(i).Uint())
+			}
+			return bytesToAvroJSONString(b)
+		}
+		fallthrough
+	case reflect.Array:
+		if sliceElemMarshalPositionDependent(rv.Type().Elem()) {
+			return v
+		}
+		out := make([]any, rv.Len())
+		for i := range out {
+			out[i] = applyJSONFixup(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Map:
+		if !canonicalStringKeyMap(rv.Type()) {
+			return v
+		}
+		out := make(map[string]any, rv.Len())
+		for it := rv.MapRange(); it.Next(); {
+			out[it.Key().String()] = applyJSONFixup(it.Value().Interface())
+		}
+		return out
+	case reflect.Pointer, reflect.Interface:
+		if rv.IsNil() {
+			return nil
+		}
+		return applyJSONFixup(rv.Elem().Interface())
 	}
 	return v
 }

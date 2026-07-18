@@ -4315,3 +4315,117 @@ Clean fronts:
 
 Counter: RESET (2 behavioral FILED). Fix-application opt-in; sandbox
 probes in the session scratchpad, in-repo pins land with the fix round.
+
+## Distillation archive (2026-07-17) — B36 canonicalization fix round
+
+Maintainer granted both B36 findings with the architecture ruled: (1)
+deepCopyJSONTree becomes a CANONICALIZING copy at the render boundary
+(reflect-kind dispatch, valueWalkLimit as template) so the composition
+walkers stay exact-type and provably see only canonical shapes; (2)
+needsJSONFixup/applyJSONFixup go kind-driven (serving every rebuild
+surface — Schema()/Root()/String() — where the Props/Default corruptions
+lived); (3) json.Marshaler/encoding.TextMarshaler-carrying values (and
+json.Number) are EXEMPT — their marshal wins (#39 precedence family),
+documented residual with posture pins; marshal+rescan was ruled OUT as
+the mechanism (marshal is lossy: NaN errors loudly — posture kept and
+pinned; −0 collapses; bytes base64).
+
+Pre-action gate: appendTypeAliasValues's "Any other shape is left
+untouched for the final Parse to reject" and deepCopyJSONTree's "copies
+every container level" premises quoted — documented-but-contradicted
+(both this-generation: b2c7601, aeb9565/1b0155a; contradiction executed
+by the round's seven red probes). needsJSONFixup pickaxed separately:
+landed 7cc1089 (bytes-default parity work), predates the arc, no
+named-type ruling — not documented; new policy per the maintainer
+ruling.
+
+Fix (one commit): canonicalizeTreeValue (schema_for.go) — named
+string-keyed maps → map[string]any, named slices/arrays → []any or
+[]string (all-plain-string), byte-kinded slices → []byte (mirroring
+encoding/json's element-pointer byte-slice rule so json.RawMessage is
+exempt), named leaves → predeclared types, pointers/interfaces
+unwrapped, structs / non-string-kind or TextMarshaler-keyed maps /
+position-dependent-element slices left opaque. needsJSONFixupKind /
+applyJSONFixupKind (schema_node.go) with the same classification
+helpers (treeValueMarshalOpaque, canonicalByteSliceKind,
+sliceElemMarshalPositionDependent, canonicalStringKeyMap); the
+float-kind arms extend ±Inf/−0.0 only — named-float NaN deliberately
+un-fixed (loud error). Docs: renderCustomSchemaTree +
+appendTypeAliasValues premises rewritten to the boundary guarantee.
+
+Nets: 6 pins red→green in matrix_tree_value_types_test.go
+(TypeAliasAliasesValueGoTypes ×2 subtests; NamedMapItemsDefComposes-
+Canonically ×2 — canonical-parity under WithNamespace anchored to
+"name":"X", verdict parity; NamedBytesPropsRebuildCodepointForm;
+NamedFloatPropsRebuildSpecials — negzero red→green, nan_posture pinned
+green; NamedBytesFieldDefaultValue + the DecodeJSON `{}` default-fill
+WIRE cell; CyclicNamedMapPropsBudgetError pinning the budget-before-
+canonicalizer ordering the copy relies on, kind-descent of named
+containers executed). TestMatrix_TreeValueGoTypes ~28 cells:
+Go-dynamic-type axis {canonical, named-map, named-slice-of-any,
+named-[]string, slice-of-named-elem, [N]array, named-[]byte,
+named-float64 (−0/±Inf), named-float32 (−0/+Inf), named-string,
+json.Number, MarshalJSON carriers (slice/map/string kinds),
+TextMarshaler carrier, json.RawMessage} × consumer {aliases-merge,
+namespace pin, dedup (two-field one-def), rebuild Props, rebuild
+Default, String() render, render-Props scalar}; controls anchored to
+executed values FIRST; attribute-carrying cells observe via Root()
+metadata (PCF strips aliases/doc/props — a Canonical()-only diff is
+vacuous there); marshaler cells assert the EXEMPTION posture (no
+merge / pin-stays-out / verbatim splice).
+
+Neuters ×3, disjoint red sets, exact:
+  N1 canonicalize (deepCopy fallback → return v): TypeAliasAliases-
+  ValueGoTypes{named_string_slice,string_array} + NamedMapItemsDef-
+  ComposesCanonically{namespace_pin_parity,type_alias_verdict_parity} +
+  matrix {aliases_merge/{named_string_slice,slice_of_named_string,
+  string_array,named_slice_of_any}, namespace_pin, dedup} — rebuild
+  cells all green (clean component split).
+  N2 kind-fixups (needsJSONFixup default → false): NamedBytesProps-
+  RebuildCodepointForm + NamedBytesFieldDefaultValue + NamedFloatProps-
+  RebuildSpecials/negative_zero + matrix rebuild_props/{named_bytes,
+  named_f64_negzero,named_f64_posinf,named_f64_neginf,named_f32_negzero,
+  named_f32_posinf} — SchemaFor cells all green.
+  N3 marshaler exemption (marshaler cases → false): matrix
+  {aliases_merge/json_marshaler_opaque, namespace_pin/
+  json_marshaler_opaque, rebuild_props/raw_message_opaque,
+  render_props_marshaler} red the other way. FIRST N3 ATTEMPT WAS
+  VACUOUS: dropping the cases orphaned the "encoding" import, the run
+  was a BUILD FAILURE whose output matches no "--- FAIL" grep and read
+  as all-green — caught by a verbose re-run; the B31 lesson holds for
+  neuter RUNS too: verify the neutered build actually executed (an
+  "ok"/FAIL line, never an empty grep).
+
+Item-15 invariant × surface table (canonicalizeTreeValue ×
+needsJSONFixupKind/applyJSONFixupKind): #46 CI-fold — keys preserved
+byte-for-byte by both layers (casefold matrix green post-fix);
+ownership — the canonicalizer strengthens the copy (named containers
+were BY REFERENCE pre-fix), cells run under the scope-cell snapshot +
+[]string sentinels; budgets — canonicalizer runs post-budget
+(renderCustomSchemaTree order) and the kind fixup adds one O(n) pass
+over values json.Marshal already walks O(n), cyclic named containers
+error in the budget walk first (CyclicNamedMapPropsBudgetError,
+executed); #60/#62 — string content passes verbatim (rv.String());
+#63/#64 — stray content canonicalizes to a marshal-identical form, so
+byte-preservation of the EMITTED form and VERBATIM dedup identity hold
+(360-cell stray matrix green post-fix); namespace scoping — pin/dedup
+matrix cells. Sweep (B36 table, all 16 exact-type-switch sites over
+tree values classified): kind-fixed ×2 (deepCopyJSONTree+
+canonicalizeTreeValue; needsJSONFixup/applyJSONFixup+kind twins);
+boundary-covered ×5 (normalizeSchemaScope, pinCustomSchemaScope,
+dedupNamedTypes, addTypeAliases, appendTypeAliasValues — marshal-
+opaque residual documented); post-Parse-immune ×9 (collectTreeDefs,
+inlineTreeDefs, deepCopyTree in cache.go; nodeFromJSON, jsonNumericInt,
+coerceMetadataDefault, defaultMatchesBytesOrFixedKind in
+schema_node.go; normalizeJSONValue, numericDefault/defaultAsFloat in
+schema.go — all consume Parse output, canonical by construction).
+Callers swept: deepCopyJSONTree ← renderCustomSchemaTree only;
+needs/applyJSONFixup ← jsonSerializableValue only (schema_node.go:795
+choke point).
+
+NOT_BUGS #69 (marshaler-opacity + named-NaN + no-twin residuals,
+maintainer-ruled, adjudicator-labeled); FIX.md item 15 gains the B36
+boundary line (exact-type dispatch legal only downstream); B36 entry
+NETTED with the re-open grep. Suite + fastavro EXECUTED green (zero
+skips); -race green on the new family; Java NOT run (no jar).
+Committed on fixes (fix + tests + BUG_AUDIT).
