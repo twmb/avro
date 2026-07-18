@@ -4429,3 +4429,160 @@ boundary line (exact-type dispatch legal only downstream); B36 entry
 NETTED with the re-open grep. Suite + fastavro EXECUTED green (zero
 skips); -race green on the new family; Java NOT run (no jar).
 Committed on fixes (fix + tests + BUG_AUDIT).
+
+## Distillation archive (2026-07-18) — ledger compression (84bac19-era lines)
+
+AUDIT_CORE.md crossed its ~55KB cap (55,748 B); the 2026-07-18 round opened
+with the mandated distillation pass. The two 84bac19-era ledger entries
+below were compressed to short lines in AUDIT_CORE.md §Round ledger; the
+originals are preserved here verbatim. (Their full round narratives were
+already archived on 2026-07-17; this section preserves the LEDGER LINE
+text itself.)
+
+### Round-ledger entry originals (84bac19 era + 84bac19 3rd), verbatim
+
+- 2026-07-16..17 · 84bac19 · era (FULL + FIX): quarantine CLEAN; FULL
+  FILED 1 — addTypeAliases exact-case vs #46 CI-fold (counter RESET) →
+  FIXED as granted (lookupCI reads; appendTypeAliasValues as-written-key
+  merge; 26-cell casefold matrix; #46 fifth surface; rebuild needs two
+  clean bare FULLs) · fastavro EXECUTED; Java NOT run (no jar).
+  Verbatim: archive (2026-07-17).
+- 2026-07-17 · 84bac19 (3rd; START head — 84bac19..HEAD quarantines the
+  commit landed after this line) · POLICY · maintainer RULED: keep v1/CI
+  reserved-key semantics (hamba-compat — hamba CI too, EXECUTED via
+  local clone + mapstructure MatchName=EqualFold cite; zero conformant
+  case-variant producers; exact-case flip DECLINED); held addTypeAliases
+  CI fix RELEASED as granted (fifth surface closed; v1 semantics
+  COMPLETE + class-guarded) · #46 rewritten as adjudicated entry
+  (maintainer-ruled 2026-07-17; NOT_BUGS gains the adjudicator-labeling
+  convention; lineage EXECUTED: json v1 binds/v2 doesn't, fastavro
+  KeyError + zero-field record, goavro rejects cited, Java exact-case
+  cited; lookupCI landed 84601dd = the hamba-migration commit, spec
+  concession cf91ceb — overseer's attribution corrected by pickaxe) ·
+  tri-posture Fields-only edge PINNED exact
+  (TestRegression_CaseVariantStructuralKeyParsePosture: canonical bytes +
+  wire round-trip, record + array shapes); FIX.md item-15 fold line: no
+  exact-case carve-out, executed-probe bar for any new claim · suite +
+  fastavro EXECUTED green; -race green (casefold family + posture pin);
+  Java NOT run (no jar) · committed on fixes (fix + tests + BUG_AUDIT) ·
+  counter unchanged (policy round). CORE > cap: next round opens with
+  distillation. Narrative: BUG_AUDIT.md archive (2026-07-17).
+
+## Distillation archive (2026-07-18) — caller-value domain census (DEDICATED round, HEAD f06bdeb)
+
+Round shape: distillation pass (CORE 55,748 B over cap; the two 84bac19-era
+ledger lines compressed, originals archived above) → net (suite green;
+fastavro differential EXECUTED, 464 subtests, zero skips; Java oracle NOT
+run — no avro-tools jar) → quarantine of 6c992b3..HEAD (= f06bdeb, the
+canonicalize-at-the-boundary fix) → the dedicated census of the
+caller-value domain — the composition surface's input domain (arbitrary
+caller Go values in SchemaNode.Props / SchemaField.Default /
+SchemaField.Props / CustomType.Schema trees), enumerated the way the wire
+and schema-JSON domains were.
+
+THE INVARIANT (now codified in AUDIT_PATTERNS.md B36): the composed/rebuilt
+schema is a function of the MARSHAL IMAGE of caller values, never their Go
+representation — except where a documented image-owner holds the pen (own
+MarshalJSON/MarshalText, json.Number; the []byte codepoint fixup; ±Inf/−0.0;
+canonical-only NaN→"NaN").
+
+Mechanical enumeration (the proof of coverage): entry points are exactly
+SchemaNode.Props values, SchemaField.Default, SchemaField.Props values,
+plus whole trees via CustomType.Schema and via mutating a Schema.Root()
+result. Consumers: the rebuild pipeline (toJSONWalk →
+boundedSerializableValue = budget walk then jsonSerializableValue fixups →
+json.Marshal → Parse) and the SchemaFor render (same walk +
+deepCopyJSONTree/canonicalizeTreeValue, then pinCustomSchemaScope /
+dedupNamedTypes / normalizeSchemaScope / addTypeAliases — all post-copy).
+Every exact-type switch hit in schema_for.go/schema_node.go classified:
+boundary layers themselves, post-boundary walkers, or post-Parse (Root-side
+nodeFromJSON / coerceMetadataDefault family / getCI*). The cache splice is
+out of the domain (text-only). checkIntDefaultFitsGoKind consumes tag-JSON
+(canonical source). No consumer outside the two files touches pre-marshal
+caller values.
+
+QUARANTINE RESULT — NOT clean. Two finding classes filed (round read-only;
+findings HALTED for adjudication):
+
+(1) The render-boundary copy does not preserve container nil-ness, in
+either direction — a marshal-image violation. deepCopyJSONTree's exact
+arms (aeb9565, pre-existing): map[string]any(nil) → make → "{}", []any(nil)
+→ make → "[]" (image null). canonicalizeTreeValue's arms (f06bdeb, new):
+named nil maps/slices → make → "{}"/"[]"; named nil []string-kind → "[]"
+while canonical []string(nil) → append → null (a named/canonical twin
+SPLIT). The append arm also inverts: canonical EMPTY []string{} → append
+returns nil → "null" (image "[]"). Six sandbox probes red
+(/…/avro_audit_verify): nil-[]string twin split; cross-surface null-vs-{}
+and null-vs-[] for nil map/[]any; a ["null","long"] union field default of
+map[string]any(nil) builds via node.Schema() but REJECTS via SchemaFor
+("default does not match any union branch: map[]") — a build-verdict flip
+on identical caller input; empty-[]string cross-surface + empty-twin
+divergence. Fix sketch: every copy arm preserves nil-ness (nil in → nil
+out; empty in → empty out), i.e. IsNil guards on the canonicalize Map/Slice
+arms and the two exact make arms, and an explicit nil/empty split for the
+[]string append arm. Gate: no documented-intentional entry, no pin, pickaxe
+shows aeb9565 introduced the arms without nil consideration.
+
+(2) NOT_BUGS #69's "no same-marshal canonical twin" rationale is
+EXECUTED-FALSE for TextMarshaler-keyed maps whose key type is STRING-KIND:
+encoding/json v1 resolves string-kind keys to the raw string before
+consulting TextMarshaler (executed: map[tmKey]any{"a":1} → {"a":1}), so an
+identical-marshal twin EXISTS today; the opacity is observable — a def
+carried in such a map misses the null-namespace pin (X binds as com.x.X;
+probe red) and a []byte inside misses the codepoint fixup (base64 "AQID" vs
+"\x01\x02\x03"; probe red). BUT GOEXPERIMENT=jsonv2 flips the precedence
+(executed: {"a!":1}) — the marshal image of such maps is
+toolchain-dependent, so canonicalizing on v1 semantics would bake in
+version dependence while staying opaque keeps output marshal-defined (and
+version-dependent) either way. Genuine toss-up → decision table HALTED for
+the maintainer; #69's rationale needs rewording regardless of the ruling.
+
+CENSUS RESULT — the rest of the domain verified clean by anchored
+twin-parity cells, all landed in-repo (matrix_tree_value_types_test.go):
+TestMatrix_TreeValueLeafTwins (bool/int-width/uint-width/uint64-max/
+int64-precision/float-width incl. float32 "0.1" 32-bit-image/empty
+json.Number→0/typed nils/nil bytes/empty containers × both surfaces,
+controls anchored to the documented Props contract),
+TestMatrix_TreeValueContainerTwins (deep named nesting, slice-of-named-
+bytes, [N]any carrying Inf, [N]string, [N]namedString),
+TestMatrix_TreeValueDefaultWire (long-width twins, [2]string, named-map
+record default — auto-fill values), TestMatrix_TreeValueFieldProps (the
+SchemaField.Props position), TestMatrix_TreeValueVerdictParity (bad-default
+rejects, unmarshalable-kind loudness, reserved-key clobber twins),
+TestRegression_TreeValueOwnershipBoundary (diamond shared def + no
+namespace injection into caller storage + spare-capacity sentinels), the
+SchemaFor arm of the cyclic budget pin, and the STANDING ARM
+FuzzTreeValueTwinParity (generator twins; verdict + rendered text +
+metadata parity + Parse fixed point across Props rebuild, field Default,
+SchemaFor render; 30s × 2 workers clean, 94,632 execs, 185 corpus finds,
+zero counterexamples). Neuter ×2 with disjoint executed red sets:
+kind-fixups neutered → codepoint/Inf cells + fuzz seeds red; canonicalize
+neutered → aliases-merge/namespace-pin/dedup red. Additional executed-fact
+probes green: renderCustomSchemaTree checks the walk error before the copy
+(cycles cannot reach the canonicalizer, both surfaces), precision leaves
+(uint64 max survives as json.Number through both surfaces),
+float32-vs-float64 image discipline, [2]byte-as-number-array vs []byte
+base64/codepoint split, marshaler-key maps (json.Marshaler never consulted
+for keys — canonicalizing them is image-correct).
+
+Oracles: suite + fastavro EXECUTED green twice (before and after the net
+additions); -race green on the family; fuzz session clean; Java NOT run
+(no jar) — Java-adjacent areas verified modulo that oracle. Counter stays
+ZERO (dedicated round, streak-neutral; two finding classes FILED and
+HALTED; fix application is opt-in next round). Framework: B36 gains the
+census codification (invariant + axes replacing the accreted instance
+list); the two 84bac19-era ledger originals archived above; NOT_BUGS #69
+rewording PROPOSED in the round report, pending the maintainer's table
+ruling.
+
+### Round-ledger entry original (2026-07-14 · 5717f32→79ed5b3 era), verbatim (compressed 2026-07-18)
+
+- 2026-07-14 · 5717f32→79ed5b3 · era (3 rounds): DEDICATED distillation +
+  ATTRIBUTE × PLACEMENT census (stray namespace on array/map FILED→FIXED
+  as 70c7c1c, ACCEPT AS INERT, o.Name strict; #64; 272 cells fastavro
+  EXECUTED 273/273; CORE 163,716→~55,000 B; B7/B33/B34 tombstoned) +
+  DEDICATED trust-boundary census (6 behavioral FILED→FIXED same round:
+  lying io.Reader/io.Writer counts, JSON-encode SemanticError arms, (0,nil)
+  livelock bound, user io.EOF ×2; 16 callback sites; neuter ×9; #65 #66;
+  Java CI GREEN through 18988c2, run 29345609516) + FULL (79ed5b3 2nd)
+  clean #1 · counter ZERO.

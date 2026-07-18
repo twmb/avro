@@ -538,4 +538,616 @@ func TestRegression_CyclicNamedMapPropsBudgetError(t *testing.T) {
 	if _, err := (&SchemaNode{Type: "int", Props: map[string]any{"x": m}}).Schema(); err == nil {
 		t.Fatalf("cyclic named-map Props: want the walk's budget error, got success")
 	}
+	// The SchemaFor render shares the budgeted walk and must error before
+	// its canonicalizing copy (which recurses unbudgeted) can see the cycle.
+	node := &SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"x": m}}
+	primary := reflect.TypeFor[scopeMatrixPrimary]()
+	fields := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
+	if _, err := schemaForScopeCell(t, fields, "", []CustomType{{GoType: primary, Schema: node}}); err == nil {
+		t.Fatalf("cyclic named-map Props through the SchemaFor render: want the walk's budget error, got success")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The caller-value domain, enumerated. Arbitrary Go values enter the tree in
+// exactly three positions — SchemaNode.Props values, SchemaField.Default,
+// SchemaField.Props values (plus whole trees of those via CustomType.Schema,
+// and again via mutating a Schema.Root() result) — and are consumed
+// pre-marshal by exactly two pipelines: the Schema()/String()/Root() rebuild
+// (budget walk → JSON fixups → json.Marshal → Parse) and the SchemaFor
+// render (the same walk plus the canonicalizing copy and the composition
+// walkers). The invariant the cells below pin: the composed schema is a
+// function of the value's MARSHAL IMAGE, never of its Go representation —
+// two values with identical json.Marshal output must produce identical
+// observable results — except where the marshal is the value author's
+// contract (own MarshalJSON/MarshalText, json.Number) or a documented fixup
+// owns the image (the []byte codepoint form, ±Inf, −0.0, the canonical-only
+// NaN string). Controls are anchored to executed values before any twin
+// diff, so a cell cannot pass vacuously.
+
+type (
+	tvNamedBool    bool
+	tvNamedI8      int8
+	tvNamedInt     int
+	tvNamedU64     uint64
+	tvNamedF32     float32
+	tvNamedF64     float64
+	tvNamedBytes   []byte
+	tvNamedStrings []string
+	tvNamedMap     map[string]any
+	tvNamedSlice   []any
+	tvNamedString  string
+)
+
+// treeValuePropsObserved composes v as a Props value through the given
+// surface and returns the observed metadata value: the direct
+// SchemaNode.Schema() rebuild, or the SchemaFor render of a custom tree
+// (which adds the canonicalizing copy and the composition walkers).
+func treeValuePropsObserved(t *testing.T, surface string, v any) (any, error) {
+	t.Helper()
+	if surface == "rebuild" {
+		s, err := (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}).Schema()
+		if err != nil {
+			return nil, err
+		}
+		return s.Root().Props["x"], nil
+	}
+	primary := reflect.TypeFor[scopeMatrixPrimary]()
+	fields := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
+	node := &SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"x": v}}
+	s, err := schemaForScopeCell(t, fields, "", []CustomType{{GoType: primary, Schema: node}})
+	if err != nil {
+		return nil, err
+	}
+	return s.Root().Fields[0].Type.Props["x"], nil
+}
+
+var treeValueSurfaces = []string{"rebuild", "schemafor"}
+
+// TestMatrix_TreeValueLeafTwins crosses leaf-value Go dynamic types with
+// both composition surfaces: every variant marshals identically to its
+// row's control, so the observed Props value must be identical too. The
+// control anchors to the documented read-back contract first
+// (SchemaNode.Props: int64 for whole numbers, float64 for fractional,
+// json.Number only past int64's range, the []byte codepoint string form).
+func TestMatrix_TreeValueLeafTwins(t *testing.T) {
+	rows := []struct {
+		name     string
+		expect   any // anchored control read-back
+		control  any
+		variants []any
+		image    string // non-empty: assert every value's marshal image first
+	}{
+		{name: "named_bool", expect: true, control: true,
+			variants: []any{tvNamedBool(true)}},
+		{name: "int_widths_42", expect: int64(42), control: int64(42),
+			variants: []any{int8(42), int16(42), int32(42), int(42),
+				uint8(42), uint16(42), uint32(42), uint(42), uint64(42),
+				json.Number("42"), tvNamedI8(42), tvNamedInt(42)},
+			image: "42"},
+		{name: "int64_max", expect: int64(math.MaxInt64), control: int64(math.MaxInt64),
+			variants: []any{json.Number("9223372036854775807")}},
+		{name: "int64_past_float53", expect: int64(1<<53 + 1), control: int64(1<<53 + 1),
+			variants: []any{json.Number("9007199254740993")}},
+		{name: "uint64_max", expect: json.Number("18446744073709551615"),
+			control:  json.Number("18446744073709551615"),
+			variants: []any{uint64(math.MaxUint64), tvNamedU64(math.MaxUint64)}},
+		{name: "float_tenth", expect: float64(0.1), control: float64(0.1),
+			variants: []any{float32(0.1), tvNamedF32(0.1), tvNamedF64(0.1)},
+			image:    "0.1"},
+		{name: "empty_json_number_is_zero", expect: int64(0), control: int64(0),
+			variants: []any{json.Number("")}},
+		{name: "typed_nils", expect: nil, control: nil,
+			variants: []any{(*int)(nil), json.RawMessage(nil)}},
+		{name: "nil_bytes_empty_codepoint", expect: "", control: []byte(nil),
+			variants: []any{tvNamedBytes(nil)}},
+		{name: "empty_map", expect: map[string]any{}, control: map[string]any{},
+			variants: []any{tvNamedMap{}}},
+		{name: "empty_slice", expect: []any{}, control: []any{},
+			variants: []any{[0]string{}, tvNamedStrings{}, tvNamedSlice{}}},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			if row.image != "" {
+				for _, v := range append([]any{row.control}, row.variants...) {
+					b, err := json.Marshal(v)
+					if err != nil || string(b) != row.image {
+						t.Fatalf("twin premise: %T marshals %s (%v), want %s", v, b, err, row.image)
+					}
+				}
+			}
+			for _, surface := range treeValueSurfaces {
+				control, err := treeValuePropsObserved(t, surface, row.control)
+				if err != nil {
+					t.Fatalf("%s control %T: %v", surface, row.control, err)
+				}
+				if !reflect.DeepEqual(control, row.expect) {
+					t.Fatalf("%s anchored control: got %#v, want %#v", surface, control, row.expect)
+				}
+				for _, v := range row.variants {
+					got, err := treeValuePropsObserved(t, surface, v)
+					if err != nil {
+						t.Fatalf("%s %T: %v", surface, v, err)
+					}
+					if !reflect.DeepEqual(got, control) {
+						t.Errorf("%s: %T observed %#v, control %T observed %#v",
+							surface, v, got, row.control, control)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestMatrix_TreeValueContainerTwins: container shapes whose marshal images
+// coincide must compose identically through both surfaces, including
+// fixup-carrying content under named or array wrappers, at any nesting
+// depth.
+func TestMatrix_TreeValueContainerTwins(t *testing.T) {
+	rows := []struct {
+		name          string
+		control, twin any
+		image         bool // both values marshal; assert identical images
+	}{
+		{name: "deep_named_nesting",
+			control: map[string]any{
+				"bs":   []any{[]byte{9}, []byte{8}},
+				"deep": map[string]any{"ss": []any{"a"}, "m": map[string]any{"b": []byte{7}}},
+			},
+			twin: tvNamedMap{
+				"bs":   []tvNamedBytes{{9}, {8}},
+				"deep": tvNamedMap{"ss": tvNamedStrings{"a"}, "m": tvNamedMap{"b": tvNamedBytes{7}}},
+			},
+			image: true},
+		{name: "slice_of_named_bytes",
+			control: []any{[]byte{9}, []byte{8}}, twin: []tvNamedBytes{{9}, {8}}, image: true},
+		{name: "array_carrying_inf",
+			control: []any{math.Inf(1), "x"}, twin: [2]any{math.Inf(1), "x"}},
+		{name: "one_elem_string_array",
+			control: []any{"a"}, twin: [1]string{"a"}, image: true},
+		{name: "array_of_named_string",
+			control: []any{"a", "b"}, twin: [2]tvNamedString{"a", "b"}, image: true},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			if row.image {
+				cb, cerr := json.Marshal(row.control)
+				tb, terr := json.Marshal(row.twin)
+				if cerr != nil || terr != nil || string(cb) != string(tb) {
+					t.Fatalf("twin premise: images differ or fail: %s (%v) vs %s (%v)", cb, cerr, tb, terr)
+				}
+			}
+			var acrossSurfaces []any
+			for _, surface := range treeValueSurfaces {
+				control, err := treeValuePropsObserved(t, surface, row.control)
+				if err != nil {
+					t.Fatalf("%s control: %v", surface, err)
+				}
+				if control == nil {
+					t.Fatalf("%s control observed nil; the anchor is gone", surface)
+				}
+				got, err := treeValuePropsObserved(t, surface, row.twin)
+				if err != nil {
+					t.Fatalf("%s twin: %v", surface, err)
+				}
+				if !reflect.DeepEqual(got, control) {
+					t.Errorf("%s: twin observed %#v, control %#v", surface, got, control)
+				}
+				acrossSurfaces = append(acrossSurfaces, control)
+			}
+			if !reflect.DeepEqual(acrossSurfaces[0], acrossSurfaces[1]) {
+				t.Errorf("surfaces disagree on the control: rebuild %#v, schemafor %#v",
+					acrossSurfaces[0], acrossSurfaces[1])
+			}
+		})
+	}
+}
+
+// TestMatrix_TreeValueDefaultWire: field defaults with identical marshal
+// images must materialize identical auto-filled values on JSON decode of an
+// input missing the field — the wire-visible consequence of the composed
+// default.
+func TestMatrix_TreeValueDefaultWire(t *testing.T) {
+	fill := func(t *testing.T, fieldType SchemaNode, def any) any {
+		t.Helper()
+		s, err := (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+			{Name: "v", Type: fieldType, Default: def, HasDefault: true},
+		}}).Schema()
+		if err != nil {
+			t.Fatalf("Schema() with %T default: %v", def, err)
+		}
+		var out map[string]any
+		if err := s.DecodeJSON([]byte(`{}`), &out); err != nil {
+			t.Fatalf("DecodeJSON fill with %T default: %v", def, err)
+		}
+		return out["v"]
+	}
+
+	t.Run("long_width_twins", func(t *testing.T) {
+		long := SchemaNode{Type: "long"}
+		control := fill(t, long, int64(42))
+		if control != int64(42) {
+			t.Fatalf("anchored control: long fill = %#v, want int64(42)", control)
+		}
+		for _, v := range []any{int8(42), json.Number("42"), tvNamedI8(42)} {
+			if got := fill(t, long, v); !reflect.DeepEqual(got, control) {
+				t.Errorf("%T default fills %#v, control %#v", v, got, control)
+			}
+		}
+	})
+
+	t.Run("string_array_twin", func(t *testing.T) {
+		arr := SchemaNode{Type: "array", Items: &SchemaNode{Type: "string"}}
+		control := fill(t, arr, []any{"a", "b"})
+		if got := fill(t, arr, [2]string{"a", "b"}); !reflect.DeepEqual(got, control) {
+			t.Errorf("[2]string default fills %#v, []any control %#v", got, control)
+		}
+	})
+
+	t.Run("record_map_twin", func(t *testing.T) {
+		rec := SchemaNode{Type: "record", Name: "S", Fields: []SchemaField{
+			{Name: "c", Type: SchemaNode{Type: "long"}},
+		}}
+		control := fill(t, rec, map[string]any{"c": 7})
+		if got := fill(t, rec, tvNamedMap{"c": 7}); !reflect.DeepEqual(got, control) {
+			t.Errorf("named-map default fills %#v, map control %#v", got, control)
+		}
+	})
+}
+
+// TestMatrix_TreeValueFieldProps pins the SchemaField.Props position: field
+// property values follow the same marshal-image contract as node Props.
+func TestMatrix_TreeValueFieldProps(t *testing.T) {
+	build := func(t *testing.T, v any) any {
+		t.Helper()
+		s, err := (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+			{Name: "n", Type: SchemaNode{Type: "long"}, Props: map[string]any{"x": v}},
+		}}).Schema()
+		if err != nil {
+			t.Fatalf("Schema() with %T field prop: %v", v, err)
+		}
+		return s.Root().Fields[0].Props["x"]
+	}
+	t.Run("named_bytes", func(t *testing.T) {
+		control := build(t, []byte{1, 2, 3})
+		if control != "\x01\x02\x03" {
+			t.Fatalf("anchored control: field-Props []byte = %#v, want the codepoint string", control)
+		}
+		if got := build(t, tvNamedBytes{1, 2, 3}); !reflect.DeepEqual(got, control) {
+			t.Errorf("named bytes field prop observed %#v, control %#v", got, control)
+		}
+	})
+	t.Run("named_map", func(t *testing.T) {
+		control := build(t, map[string]any{"k": "v"})
+		if got := build(t, tvNamedMap{"k": "v"}); !reflect.DeepEqual(got, control) {
+			t.Errorf("named map field prop observed %#v, control %#v", got, control)
+		}
+	})
+}
+
+// TestMatrix_TreeValueVerdictParity: where a tree value draws an
+// accept/reject verdict, the verdict must not depend on the value's Go
+// dynamic type, and must agree across both composition surfaces.
+func TestMatrix_TreeValueVerdictParity(t *testing.T) {
+	primary := reflect.TypeFor[scopeMatrixPrimary]()
+	fields := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
+
+	t.Run("bad_long_default", func(t *testing.T) {
+		mk := func(def any) *SchemaNode {
+			return &SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+				{Name: "n", Type: SchemaNode{Type: "long"}, Default: def, HasDefault: true},
+			}}
+		}
+		for _, def := range []any{"x", tvNamedString("x")} {
+			if _, err := mk(def).Schema(); err == nil {
+				t.Errorf("%T string default for long via node.Schema(): want reject", def)
+			}
+			if _, err := schemaForScopeCell(t, fields, "",
+				[]CustomType{{GoType: primary, Schema: mk(def)}}); err == nil {
+				t.Errorf("%T string default for long via SchemaFor: want reject", def)
+			}
+		}
+	})
+
+	t.Run("unmarshalable_kinds_loud", func(t *testing.T) {
+		for _, v := range []any{make(chan int), complex(1, 2)} {
+			if _, err := (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}).Schema(); err == nil {
+				t.Errorf("%T Props via node.Schema(): want a loud error, got success", v)
+			}
+			node := &SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"x": v}}
+			if _, err := schemaForScopeCell(t, fields, "",
+				[]CustomType{{GoType: primary, Schema: node}}); err == nil {
+				t.Errorf("%T Props via SchemaFor: want a loud error, got success", v)
+			}
+		}
+	})
+
+	t.Run("reserved_key_clobber_twins", func(t *testing.T) {
+		// Whatever the policy for a caller Props key that collides with a
+		// reserved attribute, it cannot depend on the value's Go type.
+		build := func(v any) (string, error) {
+			node := &SchemaNode{Type: "fixed", Name: "F", Size: 4,
+				Props: map[string]any{"name": v}}
+			s, err := schemaForScopeCell(t, fields, "",
+				[]CustomType{{GoType: primary, Schema: node}})
+			if err != nil {
+				return "", err
+			}
+			return string(s.Canonical()), nil
+		}
+		canon, cErr := build("Q")
+		named, nErr := build(tvNamedString("Q"))
+		if (cErr == nil) != (nErr == nil) {
+			t.Fatalf("verdict diverges: plain err=%v, named err=%v", cErr, nErr)
+		}
+		if canon != named {
+			t.Errorf("clobber result diverges:\n plain: %s\n named: %s", canon, named)
+		}
+	})
+}
+
+// TestRegression_TreeValueOwnershipBoundary pins the ownership contract at
+// the composition boundary: a build never writes into caller storage (no
+// namespace injection into a caller def map, no append into a caller
+// slice's spare capacity), and a value SHARED across two Props keys
+// composes exactly like two independent equal values.
+func TestRegression_TreeValueOwnershipBoundary(t *testing.T) {
+	primary := reflect.TypeFor[scopeMatrixPrimary]()
+
+	t.Run("diamond_shared_def", func(t *testing.T) {
+		fields := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
+		mkDef := func() map[string]any {
+			return map[string]any{"type": "record", "name": "X",
+				"fields": []any{map[string]any{"name": "c", "type": "long"}}}
+		}
+		shared := mkDef()
+		node := &SchemaNode{Type: "array",
+			Props: map[string]any{"items": shared, "alsoitems": shared}}
+		s, err := schemaForScopeCell(t, fields, "com.x",
+			[]CustomType{{GoType: primary, Schema: node}})
+		if err != nil {
+			t.Fatalf("diamond build: %v", err)
+		}
+		if _, leaked := shared["namespace"]; leaked {
+			t.Errorf("build mutated the shared caller map: %#v", shared)
+		}
+		node2 := &SchemaNode{Type: "array",
+			Props: map[string]any{"items": mkDef(), "alsoitems": mkDef()}}
+		s2, err := schemaForScopeCell(t, fields, "com.x",
+			[]CustomType{{GoType: primary, Schema: node2}})
+		if err != nil {
+			t.Fatalf("independent twin build: %v", err)
+		}
+		if a, b := s.String(), s2.String(); a != b {
+			t.Errorf("shared-value diamond composes differently from independent copies:\n shared:      %s\n independent: %s", a, b)
+		}
+	})
+
+	t.Run("aliases_spare_capacity", func(t *testing.T) {
+		aliasFields := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f,type-alias=Old"`}}
+		backing := make(tvNamedStrings, 1, 3)
+		backing[0] = "prior.P"
+		backing = backing[:3]
+		backing[1], backing[2] = "SENTINEL1", "SENTINEL2"
+		arg := backing[:1]
+
+		build := func(v any) (string, error) {
+			node := &SchemaNode{Type: "fixed", Name: "F", Size: 4,
+				Props: map[string]any{"aliases": v}}
+			s, err := schemaForScopeCell(t, aliasFields, "",
+				[]CustomType{{GoType: primary, Schema: node}})
+			if err != nil {
+				return "", err
+			}
+			return s.String(), nil
+		}
+		got, err := build(arg)
+		if err != nil {
+			t.Fatalf("spare-capacity build: %v", err)
+		}
+		exact, err := build(tvNamedStrings{"prior.P"})
+		if err != nil {
+			t.Fatalf("exact-capacity build: %v", err)
+		}
+		if got != exact {
+			t.Errorf("spare-capacity twin diverges:\n spare: %s\n exact: %s", got, exact)
+		}
+		if backing[1] != "SENTINEL1" || backing[2] != "SENTINEL2" {
+			t.Errorf("build wrote into the caller backing array past len: %#v", backing)
+		}
+	})
+}
+
+// tvTwinGen interprets a fuzz byte program as a bounded value generator
+// producing a (canonical, named-twin) pair whose marshal images are
+// identical by construction. Wrapper choices ride the program's high bits;
+// wrapAll forces wrapping so short programs still produce named shapes. The
+// domain deliberately excludes the documented image-owning shapes (values
+// with their own MarshalJSON/MarshalText, json.Number, NaN) and nil/empty
+// []string-kind containers, whose image handling is pinned separately.
+type tvTwinGen struct {
+	prog    []byte
+	i       int
+	wrapAll bool
+}
+
+func (g *tvTwinGen) next() byte {
+	if g.i >= len(g.prog) {
+		return 0
+	}
+	b := g.prog[g.i]
+	g.i++
+	return b
+}
+
+func (g *tvTwinGen) build(depth int, budget *int) (any, any) {
+	if *budget <= 0 || depth >= 3 {
+		return "leaf", "leaf"
+	}
+	*budget--
+	op := g.next()
+	wrap := g.wrapAll || op&0x80 != 0
+	switch op % 9 {
+	case 0:
+		s := string(rune('a' + int(op>>4)%3))
+		if wrap {
+			return s, tvNamedString(s)
+		}
+		return s, s
+	case 1:
+		n := int64(int8(g.next()))
+		if wrap {
+			return n, int8(n)
+		}
+		return n, n
+	case 2:
+		// Finite float chosen float32-exact so width twins share an image.
+		fv := float64(int8(g.next())) / 4
+		if wrap {
+			return fv, tvNamedF64(fv)
+		}
+		return fv, fv
+	case 3:
+		b := op&0x40 != 0
+		if wrap {
+			return b, tvNamedBool(b)
+		}
+		return b, b
+	case 4:
+		bs := []byte{g.next(), g.next()}
+		if wrap {
+			return bs, tvNamedBytes(bs)
+		}
+		return bs, bs
+	case 5:
+		// ±Inf: the numeric-preserving fixups extend to named float kinds.
+		fv := math.Inf(1)
+		if op&0x40 != 0 {
+			fv = math.Inf(-1)
+		}
+		if wrap {
+			return fv, tvNamedF64(fv)
+		}
+		return fv, fv
+	case 6:
+		n := 1 + int(op>>4)%2
+		cm := make(map[string]any, n)
+		nm := make(map[string]any, n)
+		for i := range n {
+			k := string(rune('k' + i))
+			cv, nv := g.build(depth+1, budget)
+			cm[k] = cv
+			nm[k] = nv
+		}
+		if wrap {
+			return cm, tvNamedMap(nm)
+		}
+		return cm, nm
+	case 7:
+		n := 1 + int(op>>4)%2
+		cs := make([]any, n)
+		ns := make([]any, n)
+		for i := range n {
+			cs[i], ns[i] = g.build(depth+1, budget)
+		}
+		if wrap {
+			return cs, tvNamedSlice(ns)
+		}
+		return cs, ns
+	default:
+		// Non-empty []string; the nil/empty []string image handling is
+		// pinned separately.
+		n := 1 + int(op>>4)%2
+		ss := make([]string, n)
+		for i := range ss {
+			ss[i] = string(rune('a' + i))
+		}
+		if wrap {
+			return ss, tvNamedStrings(append([]string(nil), ss...))
+		}
+		return ss, append([]string(nil), ss...)
+	}
+}
+
+// FuzzTreeValueTwinParity fuzzes the caller-value domain of the composition
+// surface: a generated canonical value and its named twin (identical
+// marshal images) must draw the same accept/reject verdict, produce the
+// same rendered schema text and observed metadata, and the rendered text
+// must be a Parse fixed point — through the Props rebuild, the field
+// Default position, and the SchemaFor render.
+func FuzzTreeValueTwinParity(f *testing.F) {
+	f.Add([]byte{0}, true)
+	f.Add([]byte{6, 2, 1, 7, 3, 0xC1, 5}, true)
+	f.Add([]byte{7, 3, 0x86, 2, 0x81, 4}, false)
+	f.Add([]byte{6, 1, 8, 2, 0x83, 0x84}, true)
+	f.Add([]byte{5, 0xFF, 6, 1, 5, 1}, true)
+	f.Add([]byte{4, 9, 8, 6, 2, 0, 1}, true)
+	f.Fuzz(func(t *testing.T, prog []byte, wrapAll bool) {
+		if len(prog) > 48 {
+			prog = prog[:48]
+		}
+		g := &tvTwinGen{prog: prog, wrapAll: wrapAll}
+		budget := 20
+		canon, named := g.build(0, &budget)
+		cImg, cErr := json.Marshal(canon)
+		nImg, nErr := json.Marshal(named)
+		if (cErr == nil) != (nErr == nil) {
+			t.Fatalf("twin marshal verdicts diverge: canonical %v, named %v", cErr, nErr)
+		}
+		if cErr == nil && string(cImg) != string(nImg) {
+			t.Fatalf("generator twin premise broken:\n canon: %s\n named: %s", cImg, nImg)
+		}
+
+		check := func(label string, run func(v any) (string, any, error)) {
+			t.Helper()
+			cs, cObs, cErrr := run(canon)
+			ns, nObs, nErrr := run(named)
+			if (cErrr == nil) != (nErrr == nil) {
+				t.Fatalf("%s verdict diverges: canonical %v, named %v", label, cErrr, nErrr)
+			}
+			if cErrr != nil {
+				return
+			}
+			if cs != ns {
+				t.Fatalf("%s rendered text diverges:\n canon: %s\n named: %s", label, cs, ns)
+			}
+			if !reflect.DeepEqual(cObs, nObs) {
+				t.Fatalf("%s observed metadata diverges: %#v vs %#v", label, cObs, nObs)
+			}
+			s2, err := Parse(cs)
+			if err != nil {
+				t.Fatalf("%s rendered schema does not reparse: %v\n%s", label, err, cs)
+			}
+			if s2.String() != cs {
+				t.Fatalf("%s String() is not a Parse fixed point:\n first: %s\n again: %s", label, cs, s2.String())
+			}
+		}
+
+		check("props-rebuild", func(v any) (string, any, error) {
+			s, err := (&SchemaNode{Type: "int", Props: map[string]any{"x": v}}).Schema()
+			if err != nil {
+				return "", nil, err
+			}
+			return s.String(), s.Root().Props["x"], nil
+		})
+		check("field-default", func(v any) (string, any, error) {
+			s, err := (&SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+				{Name: "v", Type: SchemaNode{Type: "long"}, Default: v, HasDefault: true},
+			}}).Schema()
+			if err != nil {
+				return "", nil, err
+			}
+			return s.String(), s.Root().Fields[0].Default, nil
+		})
+		check("schemafor-render", func(v any) (string, any, error) {
+			primary := reflect.TypeFor[scopeMatrixPrimary]()
+			flds := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
+			node := &SchemaNode{Type: "fixed", Name: "F", Size: 4, Props: map[string]any{"x": v}}
+			s, err := schemaForScopeCell(t, flds, "", []CustomType{{GoType: primary, Schema: node}})
+			if err != nil {
+				return "", nil, err
+			}
+			return s.String(), s.Root().Fields[0].Type.Props["x"], nil
+		})
+	})
 }
