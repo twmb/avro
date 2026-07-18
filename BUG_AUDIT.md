@@ -4119,3 +4119,128 @@ Suite + fastavro differential EXECUTED green; -race green on the casefold
 family + posture pin; Java oracle NOT run (no jar). Committed on branch
 fixes (fix + tests + BUG_AUDIT; the other framework docs stay untracked
 per convention).
+
+## Distillation archive (2026-07-17) — ledger compression (79ed5b3 3rd through 84bac19 2nd)
+
+AUDIT_CORE.md crossed its ~55KB cap (59,237 B); the 2026-07-17 round opened
+with the mandated distillation pass. The ledger entries below — superseded
+by the 84bac19 convergence anchor era — were compressed to era one-liners
+in AUDIT_CORE.md §Round ledger. Verbatim originals:
+
+### Round-ledger entry originals (2026-07-14 · 79ed5b3 3rd through 2026-07-17 · 84bac19 2nd), verbatim
+
+- 2026-07-14 · 79ed5b3 (3rd) · FULL · empty · 1 behavioral FILED (SchemaFor
+  namespaced CustomType.Schema composition: short-name dedup ref dangles,
+  cross-ns false collision, null-ns capture under WithNamespace; 3 probes
+  verified failing) · fastavro RAN; Java NOT run · RESET; fix opt-in.
+- 2026-07-15 · e4605fd · FIX · SchemaFor namespaced-custom composition
+  FIXED as ruled (fullname-keyed dedup; dotted refs; null-ns-under-
+  namespace corner error; "namespace":"" injection at the custom frontier)
+  + 1 sweep sibling FIXED (logical tag on custom-matched field silently
+  dropped → reject; #38 extended) · 87-cell scope matrix, neuter ×4;
+  fastavro EXECUTED 6/6 · counter ZERO; fix UNCONVERGED (start-HEAD
+  convention: quarantined by the next round). Narrative: BUG_AUDIT.md
+  archive (2026-07-15).
+- 2026-07-15 · c6f75a2 · FULL · 79ed5b3..e4605fd quarantined: NOT clean —
+  3 behavioral FILED from the fix's new code (by-ref Props mutation via
+  injected "namespace":""; walkers exact-case vs Parse's CI-fold #46 →
+  dangling ref + silent wire identity change) + 2 walk FILED (short-name
+  match of an explicitly-qualified reader alias — Java+fastavro reject;
+  bare toJSON NULLS an over-budget Props value) · clean fronts: lax-name
+  JSON emission EXECUTED, stdlib refresh, bare-alias scoping, OCF
+  reserved keys · fastavro RAN+EXECUTED; -race green; fuzz clean; Java
+  NOT run · counter ZERO (5 FILED). Report: archive (2026-07-15).
+- 2026-07-15 · c6f75a2 (2nd; START head — c6f75a2..HEAD quarantines the
+  fix commits after this line) · FIX · all five FIXED as granted: Q1
+  boundary deep-copy (renderCustomSchemaTree); Q2+Q3 lookupCI/ciKey in
+  all four walkers + CI-aware injection skip (#46 EXTENDED); W4 alias
+  tiers via retained bareAliases (#67); W5 error-walk render (#68) ·
+  pins 5 red→green; casefold matrix; alias census fastavro EXECUTED
+  72/72; budget axes; neuter ×7 · FIX.md item 15 added · counter ZERO.
+  CORE > cap: next round opens with distillation. Narrative: archive
+  (2026-07-15).
+- 2026-07-15 · c6f75a2 (addendum, same generation — inside c6f75a2..HEAD)
+  · FIX addendum · qualifyAliases leading-dot RULED+FIXED via shared
+  leadingDotName (".x" escape; ".a.b"/"..x" VERBATIM; "." → empty-name
+  family); gate: cf91ceb comment over-generalized Java's Name ctor —
+  documented-but-contradicted; #67 rewritten · pin red→green; dotrule
+  census + scan-past; fastavro EXECUTED 32/32; neuter exact · counter
+  ZERO. Narrative: archive (2026-07-15).
+- 2026-07-16 · 6a5b8ee · FULL · distillation done (verbatim ledger lines
+  archived 2026-07-16) · c6f75a2..6a5b8ee quarantined (aeb9565+6454754):
+  NOT clean — 2 behavioral FILED from aeb9565 (item-15 axes): (1)
+  composition walkers descend into items/values/fields UNGATED BY KIND vs
+  Parse's kind-keyed grammar (#63 capture-drop) — a Props-carried "items"
+  def on a primitive false-conflicts / dangles a real definition, takes
+  the pin injection (3 probes red; casefold matrix pins spelling parity
+  only); (2) addTypeAliases appends into the render-shared []string
+  (deepCopyJSONTree carve-out) → writes caller-owned Aliases backing
+  memory past len (probe red) · 6454754 clean; clean threads: bareAliases
+  record/enum, fixed reuses reader node, splice+Root() re-parse declared
+  text, non-string namespace hard-errors · fronts CLEAN: atype census
+  (zero-test pkg, spec-verbatim); field-alias resolution (exact two-pass;
+  precedence corner = #50 parse reject; Java alias-steals vs fastavro
+  name-first, from source); grep refresh Y4/P18/P9 classified · fastavro
+  RAN+EXECUTED; -race green; fuzz clean; Java NOT run (CI through
+  18988c2; f47083c..HEAD unpushed) · counter ZERO (2 FILED). Report:
+  BUG_AUDIT.md archive (2026-07-16). Next round quarantines 6a5b8ee..HEAD.
+- 2026-07-16 · 6a5b8ee (2nd; START head — the 6a5b8ee..HEAD quarantine
+  covers the fix commits landed after this line) · FIX · both FIXED as
+  granted: kind-gated descents in all three walkers (fields→record/error,
+  items→array, values→map; strays untouched + byte-preserved; verdict
+  parity with Parse; stray content compares VERBATIM in dedup identity —
+  ruled with the fix); deepCopyJSONTree copies []string (carve-out
+  justification executed-false); comments corrected · pins 5 red→green
+  with in-test counterfactuals + controls;
+  TestMatrix_SchemaForStrayStructuralKey 360 cells (carrier × key × body
+  incl. baredef × scope × occ; counterfactual-Parse verdict oracle +
+  preservation + genuine-dedup asserts); TestMatrix_TypeAliasAliasOwnership
+  6 cells; plantStringSliceSentinels past every caller []string across the
+  snapshot harness ([len:cap) blind spot) · neuter ×4 disjoint: dedup →
+  2 pins + exactly 32 cells; pin → 1 pin + exactly 8 baredef/ns cells;
+  normalize → exactly VerbatimCompare; []string copy → 1 pin + 6 cells ·
+  #63 composition clause; FIX.md item 15 requires the invariant × surface
+  TABLE · suite + fastavro EXECUTED green; -race FULL green; Java NOT run
+  (unpushed) · counter stays ZERO (fix round). Narrative: BUG_AUDIT.md
+  archive (2026-07-16).
+- 2026-07-16 · 84bac19 · FULL · 6a5b8ee..84bac19 quarantined (1b0155a
+  code + docs): CLEAN — kind gates verified (both-spellings composed-vs-
+  Parse parity probe; duplicate-CI-key last-wins matches counterfactual);
+  []string copy sentinel-verified · 1 behavioral FILED from the walk:
+  addTypeAliases (schema_for.go:1131) reads type/aliases/items/values/
+  name/namespace EXACT-CASE while Parse + all other composition walkers
+  CI-fold (#46) — a type-alias tag on a custom whose binding structural
+  key arrives as a Props case-variant ("Items"/"Values") wrong-rejects
+  (array/map carrier, probe red) and SILENTLY lands the alias on a LATER
+  named union branch (probe red); aeb9565's immunity comment ("cannot
+  re-route this walk") executed-false — gate verdict documented-but-
+  contradicted, maintainer decision requested · clean fronts: SOE+rabin+
+  varint-encode inverse-density (LE header vs Java LE bytes; Fingerprint
+  BE documented; boundary battery EXECUTED); Y4/P18 grep refresh all
+  classified; B20 error-echo sweep (all bounded/trunc'd); B28 big-decimal
+  string-fallback {natural,resolved}×{binary,JSON}+promotion 5 cells
+  EXECUTED; slab read · fastavro RAN+EXECUTED; -race FULL green; fuzz
+  clean (2×30s); Java NOT run (no jar) · counter RESET (1 FILED); fix
+  opt-in. CORE > cap: next round opens with distillation.
+- 2026-07-17 · 84bac19 (2nd; START head — the 84bac19..HEAD quarantine
+  covers the fix commits landed after this line) · FIX · FIXED as
+  granted: addTypeAliases folded into #46 CI uniformity (lookupCI reads
+  for type/name/namespace/items/values; aliases read/written through the
+  as-written key via appendTypeAliasValues — []string/[]any tolerant
+  merge, extend-never-shadow, other shapes left for Parse's
+  array-of-strings reject, verdict executed); soundness comment shrunk
+  to the surviving refName-bookkeeping argument · pins 3 red→green with
+  in-test exact-case controls, union placement asserted via metadata
+  (findNodeAliases); TestMatrix_TypeAliasCaseFold 26 cells (carrier
+  route × spelling × structural-nil/set × aliases arrival route ×
+  two-fields dedup shape; per-family one-verdict/one-canonical/
+  one-placement oracles; all under the scope-cell snapshot + []string
+  sentinels) · neuter ×2 disjoint: gate-reads → pins 1+2 (3 subtests) +
+  route-family asserts; aliases-merge → pin 3 + 3 props cells + family
+  assert · sibling sweep: zero exact-case reserved-key reads remain in
+  schema_for.go, writes classified fresh-map or CI-absence-guarded;
+  NOT_BUGS #46 fifth-surface extension · suite + fastavro EXECUTED
+  green; -race green (casefold family); Java NOT run (no jar) · counter
+  stays RESET (fix round; rebuild needs two clean bare FULLs). CORE >
+  cap: next round STILL opens with distillation. Narrative: BUG_AUDIT.md
+  archive (2026-07-17).
