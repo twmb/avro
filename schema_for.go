@@ -363,31 +363,47 @@ func renderCustomSchemaTree(n *SchemaNode) (any, error) {
 // caller-typed value (`type M map[string]any` in Props) marshals
 // identically to its canonical twin — left as-is it would thread through
 // every walker type-switch untouched while Parse binds its marshal as real
-// structure (canonicalizeTreeValue). Immutable scalar leaves stay shared;
-// []byte never survives a render (the walk's JSON fixup converts it to
-// the codepoint-string form).
+// structure (canonicalizeTreeValue). Nil-ness is part of the marshal image
+// (a nil map/slice marshals null, a non-nil empty one {}/[]), so every arm
+// preserves it exactly: nil in, nil out; empty in, empty out. Immutable
+// scalar leaves stay shared; []byte never survives a render (the walk's
+// JSON fixup converts it to the codepoint-string form).
 func deepCopyJSONTree(v any) any {
 	switch v := v.(type) {
 	case map[string]any:
+		if v == nil {
+			return v
+		}
 		out := make(map[string]any, len(v))
 		for k, val := range v {
 			out[k] = deepCopyJSONTree(val)
 		}
 		return out
 	case []any:
+		if v == nil {
+			return v
+		}
 		out := make([]any, len(v))
 		for i, e := range v {
 			out[i] = deepCopyJSONTree(e)
 		}
 		return out
 	case []map[string]any: // record fields
+		if v == nil {
+			return v
+		}
 		out := make([]map[string]any, len(v))
 		for i, m := range v {
 			out[i] = deepCopyJSONTree(m).(map[string]any)
 		}
 		return out
 	case []string: // aliases, symbols
-		return append([]string(nil), v...)
+		if v == nil {
+			return v
+		}
+		out := make([]string, len(v))
+		copy(out, v)
+		return out
 	case nil, string, bool, float64, float32, int, int32, int64, json.Number:
 		return v
 	}
@@ -400,10 +416,12 @@ func deepCopyJSONTree(v any) any {
 // (or []string when every element is a plain string kind, matching the
 // aliases/symbols form), a byte-kinded slice into []byte, named leaves
 // into their predeclared types, with pointers and interfaces unwrapped.
-// Values whose marshal is self-defined (own MarshalJSON/MarshalText,
-// json.Number — treeValueMarshalOpaque) and shapes with no same-marshal
-// canonical twin (structs; maps with non-string-kind or TextMarshaler
-// keys; slices whose elements' marshal is position-dependent) stay as
+// A nil named map/slice canonicalizes to nil — its marshal image is null,
+// exactly like its canonical twin's. Values whose marshal is self-defined
+// (own MarshalJSON/MarshalText, json.Number — treeValueMarshalOpaque) and
+// shapes with no stable same-marshal canonical twin (structs; maps with
+// non-string-kind keys, whose MarshalText output is the key on every
+// toolchain; slices whose elements' marshal is position-dependent) stay as
 // they are: opaque leaves the walkers pass through untouched and Parse
 // reads from the marshal — the documented residual posture. Cyclic
 // values cannot reach here: the render's budgeted walk (valueWalkLimit)
@@ -423,12 +441,18 @@ func canonicalizeTreeValue(v any) any {
 		if !canonicalStringKeyMap(rv.Type()) {
 			return v
 		}
+		if rv.IsNil() {
+			return nil
+		}
 		out := make(map[string]any, rv.Len())
 		for it := rv.MapRange(); it.Next(); {
 			out[it.Key().String()] = deepCopyJSONTree(it.Value().Interface())
 		}
 		return out
 	case reflect.Slice, reflect.Array:
+		if rv.Kind() == reflect.Slice && rv.IsNil() {
+			return nil
+		}
 		if rv.Kind() == reflect.Slice && canonicalByteSliceKind(rv.Type()) {
 			b := make([]byte, rv.Len())
 			for i := range b {

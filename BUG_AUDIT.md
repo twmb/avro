@@ -4586,3 +4586,123 @@ ruling.
   livelock bound, user io.EOF ×2; 16 callback sites; neuter ×9; #65 #66;
   Java CI GREEN through 18988c2, run 29345609516) + FULL (79ed5b3 2nd)
   clean #1 · counter ZERO.
+
+## Distillation archive (2026-07-19) — ledger compression (dd31464 FULL + 6c992b3 FIX lines)
+
+Ledger-line originals preserved verbatim before compression (their full
+round narratives were archived 2026-07-17; both rounds' fix generations
+were quarantined and cleared by the 2026-07-18 round).
+
+- 2026-07-17 · dd31464 · FULL · distillation done (CORE 59,237→52,371 B;
+  79ed5b3-3rd..84bac19-2nd originals archived) · 84bac19..HEAD
+  quarantined (b2c7601): NOT clean — appendTypeAliasValues fallback
+  ("left for Parse's reject") executed-false for marshal-to-string-array
+  shapes: named-[]string / [N]string aliases value skips both merge
+  arms, Parse ACCEPTS the marshal, type-alias tag silently dropped
+  (probes red ×2) · walk generalized the class (B36 NEW: caller-owned
+  any values consumed pre-marshal via exact-type switches): named-map
+  items def opaque to pinCustomSchemaScope/dedup → composed fullname
+  silently changes + type-alias wrong-reject (red ×2); needsJSONFixup
+  exact leaf types → named-[]byte Props AND bytes-field Default rebuild
+  as base64-vs-codepoint corruption (Default auto-fills → wire-visible),
+  named-float −0.0 → +0 (red ×3; NaN errors loud=acceptable); 2 FILED
+  (composition-container class; leaf-fixup class), fix sketch =
+  kind-driven canonicalization at deepCopyJSONTree +
+  jsonSerializableValue (valueWalkLimit precedent), Marshaler
+  precedence caveat; b2c7601 matrix held Go-type axis constant (B32) ·
+  clean fronts: skip.go inverse-density (shared bounds helpers,
+  framing-through-skip + hostile nets, content-leniency=Java/fastavro
+  skip); P1/P9 grep refresh all classified; Y4 delta-verified · fastavro
+  RAN+EXECUTED (no skips); -race FULL green; fuzz clean (2×30s ×2);
+  Java NOT run (no jar) · counter RESET (2 FILED); fix opt-in.
+  Report: BUG_AUDIT.md archive (2026-07-17). Next round quarantines
+  dd31464..HEAD (code commits only).
+- 2026-07-17 · 6c992b3 (START head — the 6c992b3..HEAD quarantine
+  covers the fix commit landed after this line) · FIX · both B36
+  findings FIXED as ruled: deepCopyJSONTree → canonicalizing copy
+  (canonicalizeTreeValue, kind dispatch, valueWalkLimit precedent;
+  walkers stay exact-type downstream); needsJSONFixup/applyJSONFixup
+  gain kind twins on every rebuild surface; marshal-opaque values (own
+  marshalers, json.Number) EXEMPT everywhere (#39 family); named-float
+  NaN keeps the loud error (numeric-preserving ±Inf/−0.0 extend,
+  type-changing NaN→string stays canonical-only); no-twin shapes
+  (structs, non-string/TextMarshaler-keyed maps, ptr-receiver-elem
+  slices) opaque — NOT_BUGS #69 · pins 6 red→green (incl. DecodeJSON
+  default-fill wire cell + cyclic named-map budget-order pin);
+  TestMatrix_TreeValueGoTypes ~28 cells (Go-dynamic-type × consumer;
+  anchored controls; Root()-observed where PCF strips) · neuter ×3
+  disjoint: canonicalize → 2 pins (4 subtests) + 6 cells; kind-fixups
+  → 3 pins + 6 cells; marshaler exemption → 4 cells (first N3 attempt
+  was a BUILD FAILURE read as all-green — B31 extends to neuter runs:
+  verify the neutered build executed) · item-15 TABLE in narrative;
+  FIX.md gains the B36 boundary line; B36 NETTED with re-open grep ·
+  sweep: 16 exact-type switch sites classified (2 kind-fixed, 5
+  boundary-covered, 9 post-Parse-immune); callers = single choke
+  points · suite + fastavro EXECUTED green; -race green (new family);
+  Java NOT run (no jar) · counter stays ZERO (fix round; rebuild needs
+  two clean bare FULLs). CORE > cap: next round opens with distillation
+  (84bac19-era lines are the candidates). Narrative: BUG_AUDIT.md
+  archive (2026-07-17).
+
+## Distillation archive (2026-07-19) — the nil-image + string-kind-key fix round (START head 656d118)
+
+Both findings filed by the 2026-07-18 caller-value census were RULED FIX
+and landed as one commit. Red-then-green throughout: 21 pre-fix failures
+recorded (the four ported pins, TestMatrix_TreeValueNilEmptyImage's
+nil/empty rows across props+default, the two string-kind-key pins, and
+TestMatrix_TreeValueMapKeyShapes' pin/dedup/fixup string_text_key cells),
+then all green post-fix with the full suite.
+
+Ruling 1 — nil-ness preservation. Every boundary copy arm now preserves
+nil-ness in both directions: deepCopyJSONTree's four exact arms gained
+`if v == nil` guards and the []string arm became an explicit
+nil-in/nil-out, empty-in/empty-out make+copy (the append form returned
+nil for empty input); canonicalizeTreeValue's Map arm and Slice arm
+gained IsNil→nil. The doc comments state the invariant (nil-ness is part
+of the marshal image). The test-infra snapshot helper (snapshotAnyValue,
+matrix_schemafor_scope_test.go) carried the IDENTICAL defect — its
+make/append arms normalized nil, which surfaced as a phantom
+caller-mutation report the moment a nil-container cell ran — and got the
+same guards plus a previously-missing []string arm (a []string Props
+value was snapshot-shared by reference) and an emptiness-preserving
+[]byte arm. Fixup rebuild arms need no guards: a nil container can never
+satisfy needsJSONFixup* (zero-element iteration), discharged by the green
+nil rows exercising the full pipeline. Walker copies (normalizeSchemaScope
+/dedup) see nil only at structural positions where the verdict is a
+reject either way — pinned by the nil_map_at_structural_key cell (both
+surfaces reject).
+
+Ruling 2 — string-kind map keys. canonicalStringKeyMap drops the
+TextMarshaler exclusion: every string-KIND-keyed map canonicalizes to
+plain map[string]any with raw keys, matching encoding/json v1's executed
+key-resolver precedence (string kind first; MarshalText not consulted)
+and making the composed schema identical across toolchains (jsonv2 flips
+the precedence — executed — so opacity would have made the output
+toolchain-dependent). NON-string-kind MarshalText keys remain opaque
+image-owners: the method wins on BOTH toolchains (executed: int-kind key
+marshals "i7" with and without GOEXPERIMENT=jsonv2). The predicate's
+comment now records the executed facts; its three consumers
+(canonicalizeTreeValue, needsJSONFixupKind, applyJSONFixupKind) follow
+uniformly, so string-kind-keyed maps are visible to the namespace pin,
+the dedup registry, and the codepoint fixup.
+
+Nets: TestMatrix_TreeValueNilEmptyImage (6 container-kind rows ×
+{canonical, named} × {props, default} × both surfaces, cross-surface
+parity per cell, anchored expectations incl. the union-null default
+fill); TestMatrix_TreeValueMapKeyShapes (plain / string-kind+MarshalText
+/ string-kind+ptr-receiver-MarshalText / int-kind+MarshalText × pin,
+dedup, fixup, rebuild, with executed marshal-image premise cells and
+opaque posture cells); four nil-image pins + two string-kind-key pins.
+FuzzTreeValueTwinParity's generator gained nil/empty container emission
+(three container cases each produce nil or empty pairs; +3 seeds) —
+30s × 2 workers clean, 96,896 execs. Neuter per component with disjoint
+red sets: nil guards reverted to the pre-fix arms → exactly the
+nil/empty family (23 failures incl. fuzz seed#7, the nil named map;
+empty-map/empty-[]any controls green); the key exclusion restored →
+exactly the tmKey family (9 failures; the ptr-receiver-key cells and
+both int-kind posture cells green both ways). Suite + fastavro EXECUTED
+green; -race green on the family; Java NOT run (no jar). FIX.md item 15
+gained the nil-ness invariant row and the string-kind-key ruling note;
+NOT_BUGS #69 rewritten with the executed v1/v2 facts and both rulings;
+the B36 census codification's known-open clause resolved. Counter stays
+ZERO (fix round; rebuild needs two clean bare FULLs).

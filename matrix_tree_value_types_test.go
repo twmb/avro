@@ -862,6 +862,21 @@ func TestMatrix_TreeValueVerdictParity(t *testing.T) {
 		}
 	})
 
+	t.Run("nil_map_at_structural_key", func(t *testing.T) {
+		// A typed-nil map at a STRUCTURAL Props key composes as null,
+		// which is never a valid schema there — the verdict is a loud
+		// reject on both surfaces (nil-ness at structural positions can
+		// change no accepted output).
+		node := &SchemaNode{Type: "array", Props: map[string]any{"items": map[string]any(nil)}}
+		if _, err := (&SchemaNode{Type: "array", Props: map[string]any{"items": map[string]any(nil)}}).Schema(); err == nil {
+			t.Errorf("nil map as items via node.Schema(): want reject, got success")
+		}
+		if _, err := schemaForScopeCell(t, fields, "",
+			[]CustomType{{GoType: primary, Schema: node}}); err == nil {
+			t.Errorf("nil map as items via SchemaFor: want reject, got success")
+		}
+	})
+
 	t.Run("reserved_key_clobber_twins", func(t *testing.T) {
 		// Whatever the policy for a caller Props key that collides with a
 		// reserved attribute, it cannot depend on the value's Go type.
@@ -960,11 +975,12 @@ func TestRegression_TreeValueOwnershipBoundary(t *testing.T) {
 
 // tvTwinGen interprets a fuzz byte program as a bounded value generator
 // producing a (canonical, named-twin) pair whose marshal images are
-// identical by construction. Wrapper choices ride the program's high bits;
-// wrapAll forces wrapping so short programs still produce named shapes. The
-// domain deliberately excludes the documented image-owning shapes (values
-// with their own MarshalJSON/MarshalText, json.Number, NaN) and nil/empty
-// []string-kind containers, whose image handling is pinned separately.
+// identical by construction — including nil and empty containers, whose
+// nil-ness is part of the image (null vs {}/[]). Wrapper choices ride the
+// program's high bits; wrapAll forces wrapping so short programs still
+// produce named shapes. The domain deliberately excludes the documented
+// image-owning shapes (values with their own MarshalJSON/MarshalText,
+// json.Number, NaN).
 type tvTwinGen struct {
 	prog    []byte
 	i       int
@@ -1030,7 +1046,19 @@ func (g *tvTwinGen) build(depth int, budget *int) (any, any) {
 		}
 		return fv, fv
 	case 6:
-		n := 1 + int(op>>4)%2
+		n := int(op>>4) % 3
+		if n == 0 {
+			if op&0x40 != 0 {
+				if wrap {
+					return map[string]any(nil), tvNamedMap(nil)
+				}
+				return map[string]any(nil), map[string]any(nil)
+			}
+			if wrap {
+				return map[string]any{}, tvNamedMap{}
+			}
+			return map[string]any{}, map[string]any{}
+		}
 		cm := make(map[string]any, n)
 		nm := make(map[string]any, n)
 		for i := range n {
@@ -1044,7 +1072,19 @@ func (g *tvTwinGen) build(depth int, budget *int) (any, any) {
 		}
 		return cm, nm
 	case 7:
-		n := 1 + int(op>>4)%2
+		n := int(op>>4) % 3
+		if n == 0 {
+			if op&0x40 != 0 {
+				if wrap {
+					return []any(nil), tvNamedSlice(nil)
+				}
+				return []any(nil), []any(nil)
+			}
+			if wrap {
+				return []any{}, tvNamedSlice{}
+			}
+			return []any{}, []any{}
+		}
 		cs := make([]any, n)
 		ns := make([]any, n)
 		for i := range n {
@@ -1055,9 +1095,19 @@ func (g *tvTwinGen) build(depth int, budget *int) (any, any) {
 		}
 		return cs, ns
 	default:
-		// Non-empty []string; the nil/empty []string image handling is
-		// pinned separately.
-		n := 1 + int(op>>4)%2
+		n := int(op>>4) % 3
+		if n == 0 {
+			if op&0x40 != 0 {
+				if wrap {
+					return []string(nil), tvNamedStrings(nil)
+				}
+				return []string(nil), []string(nil)
+			}
+			if wrap {
+				return []string{}, tvNamedStrings{}
+			}
+			return []string{}, []string{}
+		}
 		ss := make([]string, n)
 		for i := range ss {
 			ss[i] = string(rune('a' + i))
@@ -1082,6 +1132,9 @@ func FuzzTreeValueTwinParity(f *testing.F) {
 	f.Add([]byte{6, 1, 8, 2, 0x83, 0x84}, true)
 	f.Add([]byte{5, 0xFF, 6, 1, 5, 1}, true)
 	f.Add([]byte{4, 9, 8, 6, 2, 0, 1}, true)
+	f.Add([]byte{0x69}, true)        // nil named map
+	f.Add([]byte{0x08, 0x6B}, true)  // empty then nil []string, named twins
+	f.Add([]byte{0x61, 0x33}, false) // nil []any; empty map
 	f.Fuzz(func(t *testing.T, prog []byte, wrapAll bool) {
 		if len(prog) > 48 {
 			prog = prog[:48]
@@ -1148,6 +1201,543 @@ func FuzzTreeValueTwinParity(f *testing.F) {
 				return "", nil, err
 			}
 			return s.String(), s.Root().Fields[0].Type.Props["x"], nil
+		})
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Nil-ness is part of the marshal image: a nil map/slice marshals as null
+// and a non-nil empty one as {}/[], so the boundary copy must preserve
+// nil-ness in BOTH directions — nil in, nil out; empty in, empty out — for
+// the exact container arms and the named-kind canonicalization alike. The
+// pins and matrix below hold that across surface (node.Schema() vs the
+// SchemaFor render) and position (Props, field Default).
+
+// treeValueSchemaForRecord composes a record-typed custom tree through
+// SchemaFor and returns the composed schema (the record lands as the one
+// field's type).
+func treeValueSchemaForRecord(t *testing.T, node *SchemaNode) (*Schema, error) {
+	t.Helper()
+	primary := reflect.TypeFor[scopeMatrixPrimary]()
+	fields := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
+	return schemaForScopeCell(t, fields, "", []CustomType{{GoType: primary, Schema: node}})
+}
+
+// TestRegression_NilContainerPropsPreserveNullImage: a nil container Props
+// value (marshal image null) must survive the SchemaFor render exactly as
+// it survives the direct rebuild — null in the composed JSON, nil in the
+// re-read metadata.
+func TestRegression_NilContainerPropsPreserveNullImage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		v    any
+	}{
+		{"nil_map", map[string]any(nil)},
+		{"nil_any_slice", []any(nil)},
+		{"nil_string_slice", []string(nil)},
+		{"nil_field_map_slice", []map[string]any(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			direct, err := treeValuePropsObserved(t, "rebuild", tc.v)
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+			if direct != nil {
+				t.Fatalf("anchored control: rebuild of %T gives %#v, want nil (image null)", tc.v, direct)
+			}
+			composed, err := treeValuePropsObserved(t, "schemafor", tc.v)
+			if err != nil {
+				t.Fatalf("SchemaFor: %v", err)
+			}
+			if composed != nil {
+				t.Errorf("SchemaFor render changes the nil image of %T: got %#v, want nil", tc.v, composed)
+			}
+		})
+	}
+}
+
+// TestRegression_NilNamedContainerTwinImage: named nil containers marshal
+// null exactly like their canonical twins, so both must compose to nil.
+func TestRegression_NilNamedContainerTwinImage(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		canon, variant any
+	}{
+		{"named_nil_string_slice", []string(nil), tvNamedStrings(nil)},
+		{"named_nil_map", map[string]any(nil), tvNamedMap(nil)},
+		{"named_nil_any_slice", []any(nil), tvNamedSlice(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, surface := range treeValueSurfaces {
+				canon, err := treeValuePropsObserved(t, surface, tc.canon)
+				if err != nil {
+					t.Fatalf("%s canonical: %v", surface, err)
+				}
+				got, err := treeValuePropsObserved(t, surface, tc.variant)
+				if err != nil {
+					t.Fatalf("%s named: %v", surface, err)
+				}
+				if !reflect.DeepEqual(got, canon) {
+					t.Errorf("%s: named nil observed %#v, canonical nil observed %#v", surface, got, canon)
+				}
+			}
+		})
+	}
+}
+
+// TestRegression_EmptyStringSlicePreservesEmptyImage: the inverse
+// direction — a non-nil empty []string marshals as [], and the copy must
+// not collapse it to nil (null).
+func TestRegression_EmptyStringSlicePreservesEmptyImage(t *testing.T) {
+	direct, err := treeValuePropsObserved(t, "rebuild", []string{})
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if !reflect.DeepEqual(direct, []any{}) {
+		t.Fatalf("anchored control: rebuild of []string{} gives %#v, want []any{} (image [])", direct)
+	}
+	composed, err := treeValuePropsObserved(t, "schemafor", []string{})
+	if err != nil {
+		t.Fatalf("SchemaFor: %v", err)
+	}
+	if !reflect.DeepEqual(composed, direct) {
+		t.Errorf("SchemaFor render changes the empty image of []string{}: got %#v, want %#v", composed, direct)
+	}
+}
+
+// TestRegression_NilMapUnionDefaultBuildsBothSurfaces: the build verdict on
+// an identical tree cannot depend on the surface. A ["null","long"] union
+// field default of a nil map marshals as null — a valid default — so both
+// the direct rebuild and the SchemaFor render must accept it, and the
+// auto-filled JSON-decode value is nil.
+func TestRegression_NilMapUnionDefaultBuildsBothSurfaces(t *testing.T) {
+	mkNode := func() *SchemaNode {
+		return &SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+			{Name: "u", Type: SchemaNode{Type: "union", Branches: []SchemaNode{
+				{Type: "null"}, {Type: "long"},
+			}}, Default: map[string]any(nil), HasDefault: true},
+		}}
+	}
+	s, err := mkNode().Schema()
+	if err != nil {
+		t.Fatalf("node.Schema() nil-map union default: %v", err)
+	}
+	var out map[string]any
+	if err := s.DecodeJSON([]byte(`{}`), &out); err != nil {
+		t.Fatalf("DecodeJSON fill: %v", err)
+	}
+	if got, ok := out["u"]; !ok || got != nil {
+		t.Fatalf("anchored control: null default fills %#v, want nil", got)
+	}
+	if _, err := treeValueSchemaForRecord(t, mkNode()); err != nil {
+		t.Errorf("SchemaFor rejects the identical nil-map union default the rebuild accepts: %v", err)
+	}
+}
+
+// TestMatrix_TreeValueNilEmptyImage: container kind × {nil, empty} ×
+// {canonical, named} × surface × position. Per cell: the two surfaces
+// agree, the named twin matches the canonical, and the observed value is
+// the anchored expectation (nil for image null; empty map/slice for image
+// {}/[]).
+func TestMatrix_TreeValueNilEmptyImage(t *testing.T) {
+	type variant struct {
+		name string
+		v    any
+	}
+	rows := []struct {
+		name     string
+		expect   any // observed Props value; anchored
+		variants []variant
+		// Default-position field type and expected observed Default.
+		defType   SchemaNode
+		defExpect any
+	}{
+		{name: "nil_map", expect: nil,
+			variants:  []variant{{"canonical", map[string]any(nil)}, {"named", tvNamedMap(nil)}},
+			defType:   SchemaNode{Type: "union", Branches: []SchemaNode{{Type: "null"}, {Type: "long"}}},
+			defExpect: nil},
+		{name: "nil_any_slice", expect: nil,
+			variants:  []variant{{"canonical", []any(nil)}, {"named", tvNamedSlice(nil)}},
+			defType:   SchemaNode{Type: "union", Branches: []SchemaNode{{Type: "null"}, {Type: "long"}}},
+			defExpect: nil},
+		{name: "nil_string_slice", expect: nil,
+			variants:  []variant{{"canonical", []string(nil)}, {"named", tvNamedStrings(nil)}},
+			defType:   SchemaNode{Type: "union", Branches: []SchemaNode{{Type: "null"}, {Type: "long"}}},
+			defExpect: nil},
+		{name: "empty_map", expect: map[string]any{},
+			variants:  []variant{{"canonical", map[string]any{}}, {"named", tvNamedMap{}}},
+			defType:   SchemaNode{Type: "map", Values: &SchemaNode{Type: "long"}},
+			defExpect: map[string]any{}},
+		{name: "empty_any_slice", expect: []any{},
+			variants:  []variant{{"canonical", []any{}}, {"named", tvNamedSlice{}}},
+			defType:   SchemaNode{Type: "array", Items: &SchemaNode{Type: "string"}},
+			defExpect: []any{}},
+		{name: "empty_string_slice", expect: []any{},
+			variants:  []variant{{"canonical", []string{}}, {"named", tvNamedStrings{}}},
+			defType:   SchemaNode{Type: "array", Items: &SchemaNode{Type: "string"}},
+			defExpect: []any{}},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			t.Run("props", func(t *testing.T) {
+				var perSurface [2]any
+				for si, surface := range treeValueSurfaces {
+					var first any
+					for vi, va := range row.variants {
+						got, err := treeValuePropsObserved(t, surface, va.v)
+						if err != nil {
+							t.Fatalf("%s %s: %v", surface, va.name, err)
+						}
+						if vi == 0 {
+							first = got
+							if !reflect.DeepEqual(got, row.expect) {
+								t.Fatalf("%s anchored control: got %#v, want %#v", surface, got, row.expect)
+							}
+						} else if !reflect.DeepEqual(got, first) {
+							t.Errorf("%s: %s observed %#v, canonical observed %#v", surface, va.name, got, first)
+						}
+					}
+					perSurface[si] = first
+				}
+				if !reflect.DeepEqual(perSurface[0], perSurface[1]) {
+					t.Errorf("surfaces disagree: rebuild %#v, schemafor %#v", perSurface[0], perSurface[1])
+				}
+			})
+			t.Run("default", func(t *testing.T) {
+				mkNode := func(def any) *SchemaNode {
+					return &SchemaNode{Type: "record", Name: "R", Fields: []SchemaField{
+						{Name: "v", Type: row.defType, Default: def, HasDefault: true},
+					}}
+				}
+				var perSurface [2]any
+				for si, surface := range treeValueSurfaces {
+					var first any
+					for vi, va := range row.variants {
+						var s *Schema
+						var err error
+						if surface == "rebuild" {
+							s, err = mkNode(va.v).Schema()
+						} else {
+							s, err = treeValueSchemaForRecord(t, mkNode(va.v))
+						}
+						if err != nil {
+							t.Fatalf("%s %s: %v", surface, va.name, err)
+						}
+						root := s.Root()
+						var got any
+						if surface == "rebuild" {
+							got = root.Fields[0].Default
+						} else {
+							got = root.Fields[0].Type.Fields[0].Default
+						}
+						if vi == 0 {
+							first = got
+							if !reflect.DeepEqual(got, row.defExpect) {
+								t.Fatalf("%s anchored control default: got %#v, want %#v", surface, got, row.defExpect)
+							}
+						} else if !reflect.DeepEqual(got, first) {
+							t.Errorf("%s: %s default observed %#v, canonical observed %#v", surface, va.name, got, first)
+						}
+					}
+					perSurface[si] = first
+				}
+				if !reflect.DeepEqual(perSurface[0], perSurface[1]) {
+					t.Errorf("surfaces disagree on the default: rebuild %#v, schemafor %#v", perSurface[0], perSurface[1])
+				}
+			})
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Map keys of STRING KIND always marshal as their raw string under
+// encoding/json (the key resolver checks the string kind before consulting
+// TextMarshaler), so a map whose key type is string-kind — with or without
+// a MarshalText method, value or pointer receiver — is image-identical to
+// the plain map[string]any twin and canonicalizes to it: the walkers see
+// its defs, the fixups reach its values, and the composed output does not
+// depend on which stdlib JSON implementation a future toolchain ships.
+// NON-string-kind keys with MarshalText keep the method on every toolchain
+// (executed both ways: an int-kind key marshals as its MarshalText output
+// with and without GOEXPERIMENT=jsonv2), so those maps remain marshal-
+// opaque image-owners.
+
+type tvIntTextKey int
+
+func (k tvIntTextKey) MarshalText() ([]byte, error) {
+	return []byte("i" + string(rune('0'+int(k)%10))), nil
+}
+
+type tvTextKeyPtr string
+
+func (k *tvTextKeyPtr) MarshalText() ([]byte, error) { return []byte(string(*k) + "P"), nil }
+
+// TestRegression_StringKindTextKeyMapComposesAsPlainMap pins the
+// name-identity consequence: a def carried in a string-kind+MarshalText
+// keyed map composes exactly like the plain-map twin, null-namespace pin
+// included (name identity observed through Canonical(); String() renders
+// namespaces relative).
+func TestRegression_StringKindTextKeyMapComposesAsPlainMap(t *testing.T) {
+	primary := reflect.TypeFor[scopeMatrixPrimary]()
+	fields := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
+	xDef := func() map[string]any {
+		return map[string]any{"type": "record", "name": "X",
+			"fields": []any{map[string]any{"name": "c", "type": "long"}}}
+	}
+	build := func(items any) (string, error) {
+		node := &SchemaNode{Type: "array", Props: map[string]any{"items": items}}
+		s, err := schemaForScopeCell(t, fields, "com.x", []CustomType{{GoType: primary, Schema: node}})
+		if err != nil {
+			return "", err
+		}
+		return string(s.Canonical()), nil
+	}
+	control, err := build(xDef())
+	if err != nil {
+		t.Fatalf("plain map: %v", err)
+	}
+	if !strings.Contains(control, `"name":"X"`) {
+		t.Fatalf("anchored control lost the null-namespace pin: %s", control)
+	}
+	tmDef := map[tvTextStr]any{}
+	for k, v := range xDef() {
+		tmDef[tvTextStr(k)] = v
+	}
+	got, err := build(tmDef)
+	if err != nil {
+		t.Fatalf("string-kind text-key map: %v", err)
+	}
+	if got != control {
+		t.Errorf("image-identical maps compose differently:\n plain: %s\n text-key: %s", control, got)
+	}
+}
+
+// TestRegression_StringKindTextKeyMapBytesFixup pins the content
+// consequence on the plain rebuild surface: a []byte inside a string-kind
+// text-keyed map gets the codepoint fixup exactly like the plain-map twin
+// (base64 leaking through would silently change the re-read content).
+func TestRegression_StringKindTextKeyMapBytesFixup(t *testing.T) {
+	control, err := treeValuePropsObserved(t, "rebuild", map[string]any{"b": []byte{1, 2, 3}})
+	if err != nil {
+		t.Fatalf("plain map: %v", err)
+	}
+	want := map[string]any{"b": "\x01\x02\x03"}
+	if !reflect.DeepEqual(control, want) {
+		t.Fatalf("anchored control: plain map rebuilds as %#v, want %#v", control, want)
+	}
+	got, err := treeValuePropsObserved(t, "rebuild", map[tvTextStr]any{"b": []byte{1, 2, 3}})
+	if err != nil {
+		t.Fatalf("text-key map: %v", err)
+	}
+	if !reflect.DeepEqual(got, control) {
+		t.Errorf("text-key map rebuilds as %#v, plain twin as %#v", got, control)
+	}
+}
+
+// TestMatrix_TreeValueMapKeyShapes: key shape × consequence surface. The
+// string-kind shapes (plain, MarshalText value receiver, MarshalText
+// pointer receiver) are image-identical — asserted as an executed premise
+// per cell family — and must compose identically: null-namespace pin
+// applied, defs deduplicated, byte values codepoint-fixed, Props parity on
+// rebuild. The int-kind MarshalText shape is the documented opaque
+// image-owner: its marshal (method output keys, base64 bytes) is the
+// contract, defs inside are invisible to the walkers, and a duplicated
+// invisible def stays a loud Parse-side reject.
+func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
+	primary := reflect.TypeFor[scopeMatrixPrimary]()
+	oneField := []reflect.StructField{{Name: "F", Type: primary, Tag: `avro:"f"`}}
+	twoFields := []reflect.StructField{
+		{Name: "F", Type: primary, Tag: `avro:"f"`},
+		{Name: "G", Type: primary, Tag: `avro:"g"`},
+	}
+	xDef := func() map[string]any {
+		return map[string]any{"type": "record", "name": "X",
+			"fields": []any{map[string]any{"name": "c", "type": "long"}}}
+	}
+	asTextKey := func(m map[string]any) map[tvTextStr]any {
+		out := map[tvTextStr]any{}
+		for k, v := range m {
+			out[tvTextStr(k)] = v
+		}
+		return out
+	}
+	asPtrTextKey := func(m map[string]any) map[tvTextKeyPtr]any {
+		out := map[tvTextKeyPtr]any{}
+		for k, v := range m {
+			out[tvTextKeyPtr(k)] = v
+		}
+		return out
+	}
+
+	t.Run("premise_string_kind_keys_marshal_raw", func(t *testing.T) {
+		plain := map[string]any{"a": 1}
+		for _, v := range []any{map[tvTextStr]any{"a": 1}, map[tvTextKeyPtr]any{"a": 1}} {
+			pb, perr := json.Marshal(plain)
+			vb, verr := json.Marshal(v)
+			if perr != nil || verr != nil || string(pb) != string(vb) {
+				t.Fatalf("string-kind key premise: %T marshals %s (%v), plain %s (%v)", v, vb, verr, pb, perr)
+			}
+		}
+	})
+	t.Run("premise_int_kind_key_uses_marshal_text", func(t *testing.T) {
+		b, err := json.Marshal(map[tvIntTextKey]any{7: 1})
+		if err != nil || string(b) != `{"i7":1}` {
+			t.Fatalf("int-kind key premise: got %s (%v), want the MarshalText key i7", b, err)
+		}
+	})
+
+	shapes := []struct {
+		name   string
+		items  func() any // the pin/dedup def carrier
+		bytes  any        // the fixup carrier
+		opaque bool
+	}{
+		{name: "string_text_key",
+			items: func() any { return asTextKey(xDef()) },
+			bytes: map[tvTextStr]any{"b": []byte{1, 2, 3}}},
+		{name: "string_ptr_text_key",
+			items: func() any { return asPtrTextKey(xDef()) },
+			bytes: map[tvTextKeyPtr]any{"b": []byte{1, 2, 3}}},
+		{name: "int_text_key_opaque",
+			items:  func() any { return map[tvIntTextKey]any{} },
+			bytes:  map[tvIntTextKey]any{2: []byte{1, 2, 3}},
+			opaque: true},
+	}
+
+	t.Run("pin", func(t *testing.T) {
+		build := func(fields []reflect.StructField, items any) (string, error) {
+			node := &SchemaNode{Type: "array", Props: map[string]any{"items": items}}
+			s, err := schemaForScopeCell(t, fields, "com.x", []CustomType{{GoType: primary, Schema: node}})
+			if err != nil {
+				return "", err
+			}
+			return string(s.Canonical()), nil
+		}
+		control, err := build(oneField, xDef())
+		if err != nil {
+			t.Fatalf("plain control: %v", err)
+		}
+		if !strings.Contains(control, `"name":"X"`) {
+			t.Fatalf("anchored control lost the null-namespace pin: %s", control)
+		}
+		for _, sh := range shapes {
+			if sh.opaque {
+				continue // the opaque def carrier has no X inside; posture covered below
+			}
+			t.Run(sh.name, func(t *testing.T) {
+				got, err := build(oneField, sh.items())
+				if err != nil {
+					t.Fatalf("build: %v", err)
+				}
+				if got != control {
+					t.Errorf("pin diverges from the plain twin:\n plain: %s\n shape: %s", control, got)
+				}
+			})
+		}
+		t.Run("int_text_key_opaque_posture", func(t *testing.T) {
+			// An int-keyed map at a structural position marshals verbatim
+			// as its own keyed object — never a valid schema there — so
+			// the build is a loud Parse-side reject, not a silent rebind.
+			if _, err := build(oneField, map[tvIntTextKey]any{1: xDef()}); err == nil {
+				t.Errorf("opaque map as the items schema: want the loud Parse reject, got success")
+			}
+		})
+	})
+
+	t.Run("dedup", func(t *testing.T) {
+		build := func(items func() any) (string, error) {
+			node := &SchemaNode{Type: "array", Props: map[string]any{"items": items()}}
+			s, err := schemaForScopeCell(t, twoFields, "", []CustomType{{GoType: primary, Schema: node}})
+			if err != nil {
+				return "", err
+			}
+			return string(s.Canonical()), nil
+		}
+		control, err := build(func() any { return xDef() })
+		if err != nil {
+			t.Fatalf("plain control: %v", err)
+		}
+		if got := strings.Count(control, `"fields":[{"name":"c"`); got != 1 {
+			t.Fatalf("anchored control: want exactly one X definition, got %d: %s", got, control)
+		}
+		for _, sh := range shapes {
+			if sh.opaque {
+				continue
+			}
+			t.Run(sh.name, func(t *testing.T) {
+				got, err := build(sh.items)
+				if err != nil {
+					t.Fatalf("build: %v", err)
+				}
+				if got != control {
+					t.Errorf("dedup diverges from the plain twin:\n plain: %s\n shape: %s", control, got)
+				}
+			})
+		}
+	})
+
+	t.Run("fixup", func(t *testing.T) {
+		control, err := treeValuePropsObserved(t, "rebuild", map[string]any{"b": []byte{1, 2, 3}})
+		if err != nil {
+			t.Fatalf("plain control: %v", err)
+		}
+		if !reflect.DeepEqual(control, map[string]any{"b": "\x01\x02\x03"}) {
+			t.Fatalf("anchored control: got %#v, want the codepoint form", control)
+		}
+		for _, sh := range shapes {
+			t.Run(sh.name, func(t *testing.T) {
+				got, err := treeValuePropsObserved(t, "rebuild", sh.bytes)
+				if err != nil {
+					t.Fatalf("rebuild: %v", err)
+				}
+				if sh.opaque {
+					want := map[string]any{"i2": "AQID"}
+					if !reflect.DeepEqual(got, want) {
+						t.Errorf("opaque posture: got %#v, want the map's own marshal %#v", got, want)
+					}
+					return
+				}
+				if !reflect.DeepEqual(got, control) {
+					t.Errorf("fixup diverges: got %#v, plain twin %#v", got, control)
+				}
+			})
+		}
+	})
+
+	t.Run("rebuild", func(t *testing.T) {
+		control, err := treeValuePropsObserved(t, "rebuild", map[string]any{"k": "v"})
+		if err != nil {
+			t.Fatalf("plain control: %v", err)
+		}
+		for _, sh := range shapes {
+			if sh.opaque {
+				continue
+			}
+			t.Run(sh.name, func(t *testing.T) {
+				var m any
+				switch sh.name {
+				case "string_text_key":
+					m = map[tvTextStr]any{"k": "v"}
+				default:
+					m = map[tvTextKeyPtr]any{"k": "v"}
+				}
+				got, err := treeValuePropsObserved(t, "rebuild", m)
+				if err != nil {
+					t.Fatalf("rebuild: %v", err)
+				}
+				if !reflect.DeepEqual(got, control) {
+					t.Errorf("rebuild diverges: got %#v, plain twin %#v", got, control)
+				}
+			})
+		}
+		t.Run("int_text_key_opaque_posture", func(t *testing.T) {
+			got, err := treeValuePropsObserved(t, "rebuild", map[tvIntTextKey]any{7: "v"})
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+			if !reflect.DeepEqual(got, map[string]any{"i7": "v"}) {
+				t.Errorf("opaque posture: got %#v, want the MarshalText-keyed map", got)
+			}
 		})
 	})
 }

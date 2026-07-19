@@ -338,13 +338,18 @@ func sliceElemMarshalPositionDependent(t reflect.Type) bool {
 	return !t.Implements(jsonMarshalerType) && !t.Implements(textMarshalerType)
 }
 
-// canonicalStringKeyMap reports whether t's keys marshal as their plain
-// string value: string kind with no TextMarshaler override (encoding/json
-// uses a key's TextMarshaler when present; json.Marshaler is never
-// consulted for keys, and a key's method set is the value set since map
-// keys are unaddressable).
+// canonicalStringKeyMap reports whether t's keys canonicalize to their
+// plain string value: every string-KIND key does. encoding/json's key
+// resolver checks the string kind FIRST — a string-kind key marshals as
+// its raw string and any MarshalText on it is not consulted (executed;
+// jsonv2 flips that precedence, so pinning the raw string here keeps the
+// composed schema identical across toolchains). json.Marshaler is never
+// consulted for keys on either toolchain. NON-string-kind keys are the
+// opposite: their MarshalText output is the key under both
+// implementations (executed), so those maps stay marshal-opaque
+// image-owners.
 func canonicalStringKeyMap(t reflect.Type) bool {
-	return t.Key().Kind() == reflect.String && !t.Key().Implements(textMarshalerType)
+	return t.Key().Kind() == reflect.String
 }
 
 // needsJSONFixupKind extends the fixup detection to caller-typed values by

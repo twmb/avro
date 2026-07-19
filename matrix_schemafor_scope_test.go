@@ -191,29 +191,53 @@ func snapshotSchemaNode(n *SchemaNode, visited map[*SchemaNode]*SchemaNode) *Sch
 }
 
 // snapshotAnyValue deep-copies the JSON-shaped dynamic containers a Props
-// or Default value can hold; scalars are immutable and copy by value.
+// or Default value can hold; scalars are immutable and copy by value. The
+// snapshot must reproduce the value EXACTLY for the post-build DeepEqual,
+// so every arm preserves nil-ness (nil in, nil out; empty in, empty out) —
+// a snapshot that normalized nil would report a phantom mutation.
 func snapshotAnyValue(v any) any {
 	switch v := v.(type) {
 	case map[string]any:
+		if v == nil {
+			return v
+		}
 		out := make(map[string]any, len(v))
 		for k, val := range v {
 			out[k] = snapshotAnyValue(val)
 		}
 		return out
 	case []any:
+		if v == nil {
+			return v
+		}
 		out := make([]any, len(v))
 		for i, e := range v {
 			out[i] = snapshotAnyValue(e)
 		}
 		return out
 	case []map[string]any:
+		if v == nil {
+			return v
+		}
 		out := make([]map[string]any, len(v))
 		for i, m := range v {
 			out[i] = snapshotAnyValue(m).(map[string]any)
 		}
 		return out
+	case []string:
+		if v == nil {
+			return v
+		}
+		out := make([]string, len(v))
+		copy(out, v)
+		return out
 	case []byte:
-		return append([]byte(nil), v...)
+		if v == nil {
+			return v
+		}
+		out := make([]byte, len(v))
+		copy(out, v)
+		return out
 	}
 	return v
 }
