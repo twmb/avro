@@ -4706,3 +4706,166 @@ gained the nil-ness invariant row and the string-kind-key ruling note;
 NOT_BUGS #69 rewritten with the executed v1/v2 facts and both rulings;
 the B36 census codification's known-open clause resolved. Counter stays
 ZERO (fix round; rebuild needs two clean bare FULLs).
+
+## Distillation archive (2026-07-19) — FULL round report (HEAD 9f0fb26), verbatim
+
+Round shape: net ×2 (run 1 tripped the DecodeJSON float-cap DoS pin's
+100ms wall-clock at 130ms UNDER concurrent fastavro-venv-rebuild load;
+triaged, not dismissed — isolated 3/3 pass at 7-9ms real cost, cap
+applied, error bounded 168B with "length cap" present; run 2 with
+AVRO_FASTAVRO_PYTHON and no competing load: ci exit 0, differential
+executed). Java oracle NOT run (no jar); -race not run in the FULL round
+(run in the fix round). Quarantine of 9f0fb26 CLEAN on six checks:
+nil-guard uniformity across all deepCopyJSONTree/canonicalizeTreeValue
+arms; applyJSONFixup/Kind's make-arms needs-gate-unreachable for nil
+containers; byte-kind nil→"" deliberate and uniform (fixup runs before
+the copy in toJSONDedup, pinned both surfaces by the LeafTwins
+nil_bytes_empty_codepoint row); canonicalStringKeyMap consulted at
+exactly 3 sites in lockstep; valueWalkLimit descends every map by KIND
+so the widened canonicalize descent stays budget-bounded and cycles
+error before the copy; the typed-vs-untyped nil difference between the
+two copy functions is invisible to dedup identity (marshal-bytes
+comparison at schema_for.go:540).
+
+FILED 1 behavioral: SchemaCache stray-position def poisoning.
+walkNodeChildren fired items/values (and the fields loop) for ANY node
+carrying the key, and both SchemaCache visitors (collectTreeDefs
+cache.go:348-357, inlineNodeChildren :518-525) passed them un-gated —
+while NOT_BUGS #63's capture-drop edge means {"type":"int","items":…}
+parses with items inert. A record def inside a primitive's stray
+items/values/fields was therefore collected into the FIRST-WINS c.defs
+(:232) and occupied the fullname; a later real definition could not
+displace it; a later cross-parse reference wire-resolved the real def
+(c.named) while the splice-rebuild (:186-220, s.c/s.soe/s.full ←
+spliced text) baked the STRAY def into Canonical/Fingerprint/SOE/
+String/Root — executed: canonical said Ghost{g:int} while the codec
+accepted only {h:string}. Splice side of the same missing gate:
+cache-Parse of {"type":"int","items":"Real"} spliced the full cached
+def into the inert position where plain Parse keeps the as-written ref
+node. fastavro EXECUTED: parse drops the stray to bare {"type":"int"},
+named_schemas stays empty, later ref rejects UnknownType. Java:
+SCHEMA_RESERVED includes items/values (Schema.java:175-176) — never
+walked on a primitive. Pickaxe: the un-gated shape predates the audit
+era (5859d56 DRY-converted it verbatim); 1b0155a kind-gated ONLY the
+schema_for walkers — the sweep was file-scoped where the shape's true
+scope was the shared enumerator's caller set. B7's tombstone re-open
+condition MET (the FEATURE × WALKER harness had no SchemaCache ×
+stray-key rows). Two sandbox pins verified failing (poisoning
+×{items,values}; splice sibling).
+
+FILED 1 doc: doc.go:156-158's omitzero-vs-map-fill "one difference"
+sentence was false for ["null",T] — NOT_BUGS #16's implicit null
+default means map fill fills null there (executed cell matrix:
+null-first fills 00 both routes; null-second map-fill errors while
+omitzero encodes 02; non-nullable map-fill errors while omitzero keeps
+00). README:148-153 and ser.go's omitzeroAction comment were correct as
+written.
+
+Clean fronts: atype (all constants spec-verbatim); soe.go (the
+resolved-schema reader-fp acceptance + writer-shaped-payload posture is
+documented-intentional at resolve.go:88-96, #2 family — the gate caught
+the candidate); rabin.go operation-for-operation vs the spec's
+reference pseudo-code; P18 sub-buffer remainder sites (deser.go:2338
+returns the OUTER advanced src with the hazard documented in place;
+resolve.go:549 clones the stored default and discards the delegate
+remainder); B27 unionTypeNameForValue's peel is `for range
+maxIndirectDepth` with the cyclic-input rationale in place; B20
+Parse-side error echo bounded (nine 5-MiB hostile probes — unknown
+type ref/obj, bad name/symbol/namespace, dup field, bad default, bad
+JSON — all errors 103-210 chars, linear time; stray 5-MB logicalType
+accepts as inert, spec-correct); doc.go's other sharp claims executed
+true (null-branch decode zeroes/nils a pre-filled target; float
+lossy-silent vs long-exact precision contract at the 2^53 boundary;
+String() returns the original text for plain Parse).
+
+## Distillation archive (2026-07-19) — stray-structural-key cache gate fix round (START head 9f0fb26)
+
+Fix granted for all three FULL-round items; overseer independently
+reproduced the poisoning chain, the splice divergence, and both doc
+cells, and executed the fastavro corroboration.
+
+In-repo pins landed FIRST and red-verified against the pre-fix tree —
+25 red subtests + 4 parent FAILs, exactly the predicted set:
+TestRegression_CacheStrayKeyDefCrossParseSurfaces ×{items,values,
+fields}, TestRegression_CacheSpliceStrayKeyAsWritten ×3,
+TestRegression_MetadataNameTableIgnoresStrayKeyDef/real_then_stray
+(the last-wins order; stray_then_real green pre-fix), and
+TestMatrix_CacheStrayStructuralKey's stray_first + diamond cells
+(2 carriers × 3 keys × {conflicting,recursive} stray-first + diamond).
+The metadata-walker surfacing pin
+(TestRegression_MetadataStrayKeySurfacedAsWritten) is a policy pin,
+green by construction, asserting exact surfaced shapes.
+
+The fields-on-primitive variant was probed reachable-and-poisonable
+before writing (int+fields with a def PARSES and poisoned c.defs), so
+the class extent is {items, values, fields}, all three pinned. A probe
+of the SchemaNode-side name-walk siblings found collectNamedTypes
+registering stray-surfaced defs into the LAST-WINS metadata name table
+— real-then-stray order flipped a name-referenced record default's
+string field into the stray's bytes materialization ([]byte{65,81} for
+"AQ") — a same-round [sibling-of-fix], fixed with the same gate. The
+rebuild deduper probe came back clean: toJSONWalk's emitter is
+kind-gated, so strays die at rebuild and never reach the rebuild's
+first-define-then-reference machinery.
+
+Fix shape: the binding-kind gate became walkNodeChildren's DEFAULT
+(fields → isRecordKind, items → "array", values → "map" — the parser's
+kind-keyed grammar), with a strayKeys opt-in that ONLY the metadata
+walker (nodeFromJSONObject) sets — its as-written stray surfacing is a
+read-only duty, documented at the visitor field, the call site, and
+pinned. collectNamedTypes gained the same per-kind descent gates
+(Branches stay unconditional — no JSON key routes a stray there).
+cache.go itself needed zero changes: both cache visitors inherit the
+gate by default. The splice test's String comparison is STRUCTURAL
+(SchemaCache.Parse marshal-normalizes its input text up front, so key
+order differs from the caller's spelling by design — discovered when
+the byte-wise assert tripped on reordered-but-unspliced text; recorded
+in the #63 clause).
+
+Class net: TestMatrix_CacheStrayStructuralKey — carrier {int,string} ×
+stray key {items,values,fields} × def relation {conflicting/recursive
+stray body × stray-first/real-first order, diamond (two defs sharing
+the real n.G spliced into one referencing schema)} × surfaces
+{Canonical, Rabin fingerprint, SOE header via AppendSingleObject,
+String, Root} + wire verdicts (bound-def value accepts, stray-shaped
+value rejects), PLUS fixed/enum exclusivity-reject cells (the guard
+that keeps those carriers un-poisonable) and array/map/record
+genuine-binding controls (defs in BOUND positions register, resolve
+cross-parse, and splice — the gate does not over-tighten). The census
+header in matrix_feature_walker_test.go routes the stray-key family to
+this matrix + the schema_for twin (the family deliberately breaks
+feature/twin parity on as-written surfaces, so it nets outside the
+row/driver shape).
+
+Neuters ×4, disjoint, each grep-confirmed applied before running:
+N1 strayKeys:true at collectTreeDefs' visitor → exactly 21 red
+(cross-parse ×3 + matrix stray_first ×12 + diamond ×6; splice family,
+name table, surfacing all green). N2 strayKeys:true at
+inlineNodeChildren's visitor → exactly the 3 splice cells. N3
+collectNamedTypes gates reverted → exactly
+MetadataNameTableIgnoresStrayKeyDef/real_then_stray. N4 the
+parseFloatAcceptOverflow length cap disabled → the hardened DoS pin
+still fails deterministically (1025-char boundary reject + 1 MiB
+accept + both 4-axis asymmetry probes red) — the timing hardening
+(best-of-4 serial re-measure on a trip, bound unchanged at 100ms)
+did not blunt the pin's teeth.
+
+Doc item: doc.go's map-fill paragraph now names the implicit null
+default and scopes the omitzero difference to fields with no EFFECTIVE
+default ([T,"null"] with none written — no null default can exist and
+none is inferred), pinned by
+TestRegression_OmitzeroMapFillEffectiveDefaultParity (three field
+shapes × both routes, exact wire bytes and the missing-key error).
+
+Docs: NOT_BUGS #63 gained the cache + metadata clause (and the old
+"cache walkers never collect definitions from inside it" sentence was
+corrected to name wire-resolution agreement as what was executed in
+2026-07-14 — the definition store's gate is 2026-07-19); B7's
+tombstone records the re-open instance, the file-scoped-sweep root
+lesson, and the walkNodeChildren caller table (collectTreeDefs GATED /
+inlineNodeChildren GATED / nodeFromJSONObject strayKeys-by-design;
+name-walk siblings dedupNamedTypes, pinCustomSchemaScope,
+normalizeSchemaScope, addTypeAliases with their own gates;
+collectNamedTypes gated this round; coerceTreeDefaults and the
+toJSONWalk emitter un-gated by design with the structural reason);
+FIX.md item 3 gained the caller-set sweep-scope rule.

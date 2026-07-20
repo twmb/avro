@@ -20034,19 +20034,37 @@ func TestRegression_DecodeJSONFloatLengthCapDoS(t *testing.T) {
 			}
 
 			// 1 MiB hostile: must reject in O(1) (the asymptotic guarantee).
+			// The threshold is the pin — a capped reject scans the literal
+			// once (~10ms) while an uncapped one runs strconv.ParseFloat's
+			// slow path far past the bound. Wall-clock samples under a
+			// parallel suite (or other machine load) can exceed the bound
+			// from scheduler contention alone, so a trip re-measures
+			// serially and the BEST observed sample is compared: external
+			// load inflates individual samples but cannot push a capped
+			// reject over the bound on every attempt, while a genuinely
+			// uncapped parse exceeds it on all of them.
 			hostile1M := mk(1 << 20)
 			threshold := 100 * time.Millisecond
 			if isRaceEnabled() {
 				threshold = 1 * time.Second // race adds 5-10x overhead
 			}
-			t0 := time.Now()
-			err = s.DecodeJSON(hostile1M, target)
-			d := time.Since(t0)
-			if err == nil {
-				t.Errorf("decode of 1 MiB hostile literal UNEXPECTEDLY accepted")
+			var best time.Duration
+			for attempt := 0; attempt < 4; attempt++ {
+				t0 := time.Now()
+				err = s.DecodeJSON(hostile1M, target)
+				d := time.Since(t0)
+				if err == nil {
+					t.Fatalf("decode of 1 MiB hostile literal UNEXPECTEDLY accepted")
+				}
+				if attempt == 0 || d < best {
+					best = d
+				}
+				if best <= threshold {
+					break
+				}
 			}
-			if d > threshold {
-				t.Errorf("1 MiB hostile decode took %s > %s threshold; length cap not applied in O(1) before strconv.ParseFloat", d, threshold)
+			if best > threshold {
+				t.Errorf("1 MiB hostile decode took %s > %s threshold on every attempt; length cap not applied in O(1) before strconv.ParseFloat", best, threshold)
 			}
 		})
 	}

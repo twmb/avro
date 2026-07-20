@@ -46,6 +46,17 @@ import (
 // twin means and where its feature survives to; drivers skip explicitly
 // (with the reason at the row or driver) where a row has no structural
 // position for them — a nil sample marks a parseable-but-unusable kind.
+//
+// One walker family lives OUTSIDE the row/driver shape because its
+// feature deliberately breaks twin parity on the as-written surfaces:
+// STRAY structural keys (a reserved container key on a kind that does not
+// bind it — inert to the parser, surfaced as-written by the metadata
+// walker). Its walkers-must-not-consume-strays net is
+// TestMatrix_CacheStrayStructuralKey (this package: SchemaCache collect /
+// splice / metadata name table, carrier × key × def relation × surface)
+// and TestMatrix_SchemaForStrayStructuralKey (the composition walkers);
+// a new consumer of walkNodeChildren — or any same-contract child
+// enumerator — owes cells there, not a row here.
 type featureWalkerRow struct {
 	name string
 

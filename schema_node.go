@@ -1582,14 +1582,25 @@ func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {
 		// whenever short names collide.
 		table[nodeFullname(n)] = n
 	}
-	if n.Items != nil {
+	// Descend only the structural fields the node's KIND binds. The
+	// metadata walker surfaces stray container keys as-written (a stray
+	// "items" on an "int" populates Items), so an unconditional descent
+	// would register a definition-shaped stray body under its fullname —
+	// and the map is last-write-wins, so a stray walked after the real
+	// definition would silently become the table's answer for that name,
+	// coercing name-referenced defaults through a body the wire never
+	// bound. Branches stay unconditional: only genuine union parsing
+	// populates them (no JSON key routes a stray there).
+	if n.Type == "array" && n.Items != nil {
 		collectNamedTypes(n.Items, table)
 	}
-	if n.Values != nil {
+	if n.Type == "map" && n.Values != nil {
 		collectNamedTypes(n.Values, table)
 	}
-	for i := range n.Fields {
-		collectNamedTypes(&n.Fields[i].Type, table)
+	if isRecordKind(n.Type) {
+		for i := range n.Fields {
+			collectNamedTypes(&n.Fields[i].Type, table)
+		}
 	}
 	for i := range n.Branches {
 		collectNamedTypes(&n.Branches[i], table)
@@ -1888,7 +1899,18 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 	// never parses (the build rejects a nil field type), so every
 	// parseable field fires exactly one callback and no pre-sized zero
 	// SchemaField is left behind.
+	//
+	// strayKeys: this walker alone also enumerates container keys the
+	// node's kind does not bind — a stray "items" on an "int" — because
+	// SchemaNode's contract is to SURFACE such keys as-written on the
+	// matching structural field (they are kept out of Props by the
+	// reserved-key loop below). Surfacing is read-only: nothing here
+	// registers a name or mutates the tree, which is why the stray
+	// positions are safe for this walker and gated off for every other
+	// (see nodeChildVisitor.strayKeys and
+	// TestRegression_MetadataStrayKeySurfacedAsWritten).
 	walkNodeChildren(m, parentNS, childNS, nodeChildVisitor{
+		strayKeys: true,
 		fields: func(arr []any) { n.Fields = make([]SchemaField, len(arr)) },
 		field: func(i int, fm map[string]any, typeKey, scope string) {
 			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope), nil)

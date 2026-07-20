@@ -149,13 +149,18 @@
 // schema naming a record "r508" instead of "FieldSummary".
 //
 // When encoding a map[string]any as a record, missing keys are filled from the
-// schema's default values. The omitzero tag applies the same fill to a struct's
-// zero-valued fields (or fields whose IsZero() method returns true): a zero
-// value encodes the field's default, or null for a nullable field that has no
-// default, or — for a non-nullable field with no default — the zero value
-// itself (there is nothing to fill with). The one difference from map fill is
-// that nullable-with-no-default case: omitzero encodes null where map fill
-// instead errors on the missing key.
+// schema's default values. A ["null", T] union field declared without a
+// default has an implicit null default (Parse infers it for the canonical
+// nullable pattern), so a missing key there fills null rather than erroring.
+// The omitzero tag applies the same fill to a struct's zero-valued fields
+// (or fields whose IsZero() method returns true): a zero value encodes the
+// field's default, or null for a nullable field that has no default, or —
+// for a non-nullable field with no default — the zero value itself (there
+// is nothing to fill with). The one difference from map fill is the
+// nullable field with no EFFECTIVE default — a [T, "null"] union declared
+// without one, where no null default can exist (a union default must match
+// the first branch) and none is inferred: omitzero encodes null where map
+// fill instead errors on the missing key.
 //
 // Embedded (anonymous) struct fields are automatically inlined. To prevent
 // inlining, give the field an explicit name tag. When multiple fields

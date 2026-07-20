@@ -83,6 +83,30 @@ type nodeChildVisitor struct {
 	// resolving in the node's child scope.
 	items  func(key, scope string)
 	values func(key, scope string)
+
+	// strayKeys additionally fires the container callbacks on nodes whose
+	// kind does not BIND the key. The parser's grammar is kind-keyed —
+	// "fields" binds on record/error, "items" on array, "values" on map —
+	// and on any other kind a present container key is inert as-written
+	// metadata (primitive objects accept such keys; container and named
+	// kinds reject foreign structural keys at build). By default the walk
+	// enumerates bound keys only, so a consumer that treats these
+	// positions as SCHEMA positions (collecting definitions for
+	// cross-parse reference, splicing cached definitions, registering
+	// names) can never consume structure the parse never bound — a
+	// definition-shaped value inside a stray key would otherwise occupy
+	// its fullname in a first-wins store and shadow the real definition's
+	// metadata everywhere the store feeds (Canonical, fingerprints, the
+	// single-object header, String, Root).
+	//
+	// The metadata walker alone sets strayKeys: SchemaNode surfaces stray
+	// container keys as-written on the matching structural field, a
+	// read-only surfacing duty with no registration or mutation. That
+	// asymmetry is deliberate and pinned
+	// (TestRegression_MetadataStrayKeySurfacedAsWritten); a uniformity
+	// change that gates the metadata walker too breaks the surfacing
+	// contract.
+	strayKeys bool
 }
 
 // walkNodeChildren enumerates the child-schema positions of the raw-JSON
@@ -95,19 +119,28 @@ type nodeChildVisitor struct {
 // (nsForChildren, schema_node.go).
 //
 // The enumeration order is fixed: type, fields in declaration order,
-// items, values. On a parser-accepted tree no per-walker order could be
-// observed to differ: each kind's build rejects the other kinds'
-// structural keys ("invalid <kind> has schema for other types",
-// schema.go), so a node carries at most one of fields/items/values — the
-// only coexistence is the empty "fields":[] escape (a zero-length array
-// passes the len(o.Fields) > 0 rejections), which enumerates nothing.
+// items, values. Each container key fires only on the kind that BINDS it
+// (fields → record/error, items → array, values → map — the parser's
+// kind-keyed grammar) unless vis.strayKeys opts into the stray positions
+// too; see the strayKeys doc. Under the bound-only default a node fires
+// at most one of fields/items/values: container and named kinds reject
+// foreign structural keys at build ("invalid <kind> has schema for other
+// types", schema.go), and the empty "fields":[] escape (a zero-length
+// array passes the len(o.Fields) > 0 rejections) enumerates nothing. A
+// strayKeys walk of a primitive object can fire several — a primitive
+// carries any of them as inert metadata.
 func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor) {
+	var typ string
+	if tv, ok := lookupCI(v, "type"); ok {
+		typ, _ = tv.(string)
+	}
 	if vis.typeValue != nil {
 		if key, ok := ciKey(v, "type"); ok {
 			vis.typeValue(key, ns)
 		}
 	}
-	if vis.fields != nil || vis.field != nil || vis.flatField != nil {
+	if (vis.strayKeys || isRecordKind(typ)) &&
+		(vis.fields != nil || vis.field != nil || vis.flatField != nil) {
 		if fk, ok := ciKey(v, "fields"); ok {
 			if arr, ok := v[fk].([]any); ok {
 				if vis.fields != nil {
@@ -135,12 +168,12 @@ func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor
 			}
 		}
 	}
-	if vis.items != nil {
+	if vis.items != nil && (vis.strayKeys || typ == "array") {
 		if key, ok := ciKey(v, "items"); ok {
 			vis.items(key, childNS)
 		}
 	}
-	if vis.values != nil {
+	if vis.values != nil && (vis.strayKeys || typ == "map") {
 		if key, ok := ciKey(v, "values"); ok {
 			vis.values(key, childNS)
 		}

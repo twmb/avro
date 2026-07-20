@@ -7329,6 +7329,54 @@ func TestRegression_OmitzeroNullSecondUnionPtr(t *testing.T) {
 	}
 }
 
+// TestRegression_OmitzeroMapFillEffectiveDefaultParity pins the exact
+// relationship between map default-fill and omitzero across the three
+// no-written-default field shapes (the doc.go "Struct tags" contract):
+//
+//   - ["null", T]: an implicit null default is inferred (the canonical
+//     nullable pattern), so BOTH routes encode null — map fill does not
+//     error here.
+//   - [T, "null"]: a union default must match the first branch, so no
+//     null default can exist and none is inferred. This is the one
+//     divergence: omitzero encodes the null branch, map fill errors on
+//     the missing key.
+//   - plain T: nothing to fill with — omitzero keeps the zero value,
+//     map fill errors on the missing key.
+func TestRegression_OmitzeroMapFillEffectiveDefaultParity(t *testing.T) {
+	type R struct {
+		F int64 `avro:"f,omitzero"`
+	}
+	for _, tc := range []struct {
+		name      string
+		fieldType string
+		mapWire   string // hex of map-fill encoding; "" means map fill errors
+		omitWire  string // hex of omitzero encoding
+	}{
+		{"null_first_union", `["null","long"]`, "00", "00"},
+		{"null_second_union", `["long","null"]`, "", "02"},
+		{"non_nullable", `"long"`, "", "00"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":` + tc.fieldType + `}]}`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mw, merr := s.Encode(map[string]any{})
+			if tc.mapWire == "" {
+				if merr == nil || !strings.Contains(merr.Error(), "missing key") {
+					t.Errorf("map fill: got (%x, %v), want the missing-key error", mw, merr)
+				}
+			} else if merr != nil || fmt.Sprintf("%x", mw) != tc.mapWire {
+				t.Errorf("map fill: got (%x, %v), want wire %s", mw, merr, tc.mapWire)
+			}
+			ow, oerr := s.Encode(&R{})
+			if oerr != nil || fmt.Sprintf("%x", ow) != tc.omitWire {
+				t.Errorf("omitzero: got (%x, %v), want wire %s", ow, oerr, tc.omitWire)
+			}
+		})
+	}
+}
+
 func TestOmitzeroWithIsZero(t *testing.T) {
 	type R struct {
 		When time.Time `avro:"when,omitzero"`
