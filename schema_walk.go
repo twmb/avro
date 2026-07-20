@@ -84,20 +84,28 @@ type nodeChildVisitor struct {
 	items  func(key, scope string)
 	values func(key, scope string)
 
+	// fieldNoType fires for a field element that carries no "type" key —
+	// reachable only inside a STRAY "fields" (a bound record build
+	// rejects a nil field type, so bound walks never see one). Only the
+	// strayKeys walker sets it: the element still surfaces as-written.
+	fieldNoType func(i int, fo map[string]any)
+
 	// strayKeys additionally fires the container callbacks on nodes whose
-	// kind does not BIND the key. The parser's grammar is kind-keyed —
-	// "fields" binds on record/error, "items" on array, "values" on map —
-	// and on any other kind a present container key is inert as-written
-	// metadata (primitive objects accept such keys; container and named
-	// kinds reject foreign structural keys at build). By default the walk
-	// enumerates bound keys only, so a consumer that treats these
-	// positions as SCHEMA positions (collecting definitions for
-	// cross-parse reference, splicing cached definitions, registering
-	// names) can never consume structure the parse never bound — a
-	// definition-shaped value inside a stray key would otherwise occupy
-	// its fullname in a first-wins store and shadow the real definition's
-	// metadata everywhere the store feeds (Canonical, fingerprints, the
-	// single-object header, String, Root).
+	// kind does not BIND the key, for bodies that parse as the key's
+	// schema shape (strayBodyShapeOK — a non-schema-shaped stray body
+	// stays a Props entry and is never walked). The parser's grammar is
+	// kind-keyed — "fields" binds on record/error, "items" on array,
+	// "values" on map — and on any other kind a present container key is
+	// inert as-written metadata (primitive objects accept such keys;
+	// container and named kinds reject foreign SCHEMA-SHAPED structural
+	// keys at build). By default the walk enumerates bound keys only, so
+	// a consumer that treats these positions as SCHEMA positions
+	// (collecting definitions for cross-parse reference, splicing cached
+	// definitions, registering names) can never consume structure the
+	// parse never bound — a definition-shaped value inside a stray key
+	// would otherwise occupy its fullname in a first-wins store and
+	// shadow the real definition's metadata everywhere the store feeds
+	// (Canonical, fingerprints, the single-object header, String, Root).
 	//
 	// The metadata walker alone sets strayKeys: SchemaNode surfaces stray
 	// container keys as-written on the matching structural field, a
@@ -139,9 +147,9 @@ func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor
 			vis.typeValue(key, ns)
 		}
 	}
-	if (vis.strayKeys || isRecordKind(typ)) &&
-		(vis.fields != nil || vis.field != nil || vis.flatField != nil) {
-		if fk, ok := ciKey(v, "fields"); ok {
+	if vis.fields != nil || vis.field != nil || vis.flatField != nil {
+		if fk, ok := ciKey(v, "fields"); ok &&
+			(isRecordKind(typ) || (vis.strayKeys && strayBodyShapeOK("fields", v[fk]))) {
 			if arr, ok := v[fk].([]any); ok {
 				if vis.fields != nil {
 					vis.fields(arr)
@@ -153,6 +161,17 @@ func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor
 					}
 					tk, ok := ciKey(fo, "type")
 					if !ok {
+						// A field with no type key never parses at a BOUND
+						// position (the record build rejects a nil field
+						// type), but inside a STRAY "fields" the record
+						// build never runs, so such elements are parseable
+						// and must surface as-written — fieldNoType lets
+						// the strayKeys walker fill the pre-sized slot with
+						// the element's own attributes instead of leaving a
+						// fabricated zero field behind.
+						if vis.fieldNoType != nil {
+							vis.fieldNoType(i, fo)
+						}
 						continue
 					}
 					if ts, isStr := fo[tk].(string); isStr && flatFieldNeedsLift(fo, ts) {
@@ -168,13 +187,15 @@ func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor
 			}
 		}
 	}
-	if vis.items != nil && (vis.strayKeys || typ == "array") {
-		if key, ok := ciKey(v, "items"); ok {
+	if vis.items != nil {
+		if key, ok := ciKey(v, "items"); ok &&
+			(typ == "array" || (vis.strayKeys && strayBodyShapeOK("items", v[key]))) {
 			vis.items(key, childNS)
 		}
 	}
-	if vis.values != nil && (vis.strayKeys || typ == "map") {
-		if key, ok := ciKey(v, "values"); ok {
+	if vis.values != nil {
+		if key, ok := ciKey(v, "values"); ok &&
+			(typ == "map" || (vis.strayKeys && strayBodyShapeOK("values", v[key]))) {
 			vis.values(key, childNS)
 		}
 	}

@@ -315,105 +315,151 @@ func TestMatrix_SchemaForStrayStructuralKey(t *testing.T) {
 			if definingKey[kind] == key {
 				continue // the genuine schema position, not a stray
 			}
-			for _, body := range []string{"identdef", "diffdef", "baredef", "plain", "nonschema"} {
-				for _, ns := range []string{"", "b"} {
-					for _, occ := range []int{1, 2} {
-						name := kind + "/" + key + "/" + body + "/occ" + string(rune('0'+occ))
-						if ns != "" {
-							name += "/ns"
+			for _, route := range []string{"props", "typed"} {
+				for _, body := range []string{"identdef", "diffdef", "baredef", "plain", "nonschema"} {
+					if route == "typed" && body == "nonschema" {
+						continue // a non-schema value has no SchemaNode spelling
+					}
+					for _, ns := range []string{"", "b"} {
+						if route == "typed" && ns != "" {
+							// The typed route's expected stray image is the
+							// node's render, which at a namespaced scope adds
+							// the "namespace":"" escape for bare-named defs;
+							// the props route covers the ns axis.
+							continue
 						}
-						t.Run(name, func(t *testing.T) {
-							// Plant the stray through Props — the caller's
-							// route for a key the node's kind does not bind
-							// (the render emits Props keys verbatim; typed
-							// Items/Values/Fields on a bare primitive are
-							// dropped by the render's defined-placement
-							// posture, so Props is the reachable carrier).
-							// A "fields" stray wraps its body in a proper
-							// field list so the stray itself decodes.
-							strayFor := func() any {
-								switch {
-								case body == "nonschema":
-									return 42
-								case key == "fields":
-									return []any{map[string]any{"name": "f", "type": bodyJSON(body)}}
-								}
-								return bodyJSON(body)
-							}
-							carrier := carrierNode(kind)
-							carrier.Props = map[string]any{key: strayFor()}
-							strayJSON := strayFor()
-
-							customs := []CustomType{
-								{GoType: reflect.TypeFor[scopeMatrixPrimary](), Schema: carrier},
-								{GoType: reflect.TypeFor[scopeMatrixPartner](), Schema: realNXNode()},
-							}
-							fields := []reflect.StructField{
-								{Name: "F1", Type: reflect.TypeFor[scopeMatrixPrimary]()},
-								{Name: "F2", Type: reflect.TypeFor[scopeMatrixPartner]()},
-							}
-							if occ == 2 {
-								customs = append(customs,
-									CustomType{GoType: reflect.TypeFor[strayMatrixThird](), Schema: realNXNode()})
-								fields = append(fields,
-									reflect.StructField{Name: "F3", Type: reflect.TypeFor[strayMatrixThird]()})
-							}
-
-							// Hand-composed counterfactual: same carrier +
-							// stray verbatim, the real definition inline
-							// once, a reference at the second occurrence.
-							cfCarrier := carrierJSON(kind)
-							cfCarrier[key] = strayJSON
-							cfFields := []any{
-								map[string]any{"name": "F1", "type": cfCarrier},
-								map[string]any{"name": "F2", "type": bodyJSON("identdef")},
-							}
-							if occ == 2 {
-								cfFields = append(cfFields, map[string]any{"name": "F3", "type": "n.X"})
-							}
-							cfRoot := map[string]any{"type": "record", "name": "Top", "fields": cfFields}
+						for _, occ := range []int{1, 2} {
+							name := kind + "/" + key + "/" + body + "/occ" + string(rune('0'+occ))
 							if ns != "" {
-								cfRoot["namespace"] = ns
+								name += "/ns"
 							}
-							cfText, err := json.Marshal(cfRoot)
-							if err != nil {
-								t.Fatalf("marshal counterfactual: %v", err)
+							if route == "typed" {
+								name += "/typed"
 							}
-							_, cfErr := Parse(string(cfText))
-
-							s, err := schemaForScopeCell(t, fields, ns, customs)
-							if (err == nil) != (cfErr == nil) {
-								t.Fatalf("verdict parity broken:\n build: %v\n parse of counterfactual: %v", err, cfErr)
-							}
-							if err != nil {
-								return // reject cell: parity established
-							}
-
-							var root map[string]any
-							if err := json.Unmarshal([]byte(s.String()), &root); err != nil {
-								t.Fatalf("composed text: %v", err)
-							}
-							composed, _ := root["fields"].([]any)
-							if len(composed) < 2 {
-								t.Fatalf("composed fields missing: %s", s.String())
-							}
-							f1type, _ := composed[0].(map[string]any)["type"].(map[string]any)
-							if f1type == nil {
-								t.Fatalf("composed F1 type not an object: %s", s.String())
-							}
-							if got, want := f1type[key], jsonReencode(t, strayJSON); !reflect.DeepEqual(got, want) {
-								t.Errorf("stray not preserved verbatim:\n got:  %#v\n want: %#v", got, want)
-							}
-							f2type, _ := composed[1].(map[string]any)["type"].(map[string]any)
-							if f2type == nil || f2type["name"] != "n.X" {
-								t.Errorf("real definition not inline at F2: %s", s.String())
-							}
-							if occ == 2 {
-								if ref, _ := composed[2].(map[string]any)["type"].(string); ref != "n.X" {
-									t.Errorf("second genuine occurrence did not dedup to a reference: %s", s.String())
+							t.Run(name, func(t *testing.T) {
+								// Two planting routes for a key the node's
+								// kind does not bind. "props": the value rides
+								// in Props and the render emits it verbatim.
+								// "typed": the caller sets the STRUCTURAL
+								// field (Items/Values/Fields) directly; the
+								// render preserves it as-written too — the
+								// bare-string emission requires structural
+								// emptiness, so a stray-carrying primitive
+								// takes the object render. Both routes
+								// compose the same schema text.
+								// A "fields" stray wraps its body in a proper
+								// field list so the stray itself decodes.
+								strayFor := func() any {
+									switch {
+									case body == "nonschema":
+										return 42
+									case key == "fields":
+										return []any{map[string]any{"name": "f", "type": bodyJSON(body)}}
+									}
+									return bodyJSON(body)
 								}
-							}
-						})
+								bodyNode := func() *SchemaNode {
+									switch body {
+									case "identdef":
+										return &SchemaNode{Type: "record", Name: "n.X",
+											Fields: []SchemaField{{Name: "a", Type: SchemaNode{Type: "int"}}}}
+									case "diffdef":
+										return &SchemaNode{Type: "record", Name: "n.X",
+											Fields: []SchemaField{{Name: "a", Type: SchemaNode{Type: "long"}}}}
+									case "baredef":
+										return &SchemaNode{Type: "record", Name: "Bare",
+											Fields: []SchemaField{{Name: "a", Type: SchemaNode{Type: "int"}}}}
+									case "plain":
+										return &SchemaNode{Type: "array", Items: &SchemaNode{Type: "long"}}
+									}
+									return nil
+								}
+								carrier := carrierNode(kind)
+								if route == "props" {
+									carrier.Props = map[string]any{key: strayFor()}
+								} else {
+									switch key {
+									case "items":
+										carrier.Items = bodyNode()
+									case "values":
+										carrier.Values = bodyNode()
+									case "fields":
+										carrier.Fields = []SchemaField{{Name: "f", Type: *bodyNode()}}
+									}
+								}
+								strayJSON := strayFor()
+
+								customs := []CustomType{
+									{GoType: reflect.TypeFor[scopeMatrixPrimary](), Schema: carrier},
+									{GoType: reflect.TypeFor[scopeMatrixPartner](), Schema: realNXNode()},
+								}
+								fields := []reflect.StructField{
+									{Name: "F1", Type: reflect.TypeFor[scopeMatrixPrimary]()},
+									{Name: "F2", Type: reflect.TypeFor[scopeMatrixPartner]()},
+								}
+								if occ == 2 {
+									customs = append(customs,
+										CustomType{GoType: reflect.TypeFor[strayMatrixThird](), Schema: realNXNode()})
+									fields = append(fields,
+										reflect.StructField{Name: "F3", Type: reflect.TypeFor[strayMatrixThird]()})
+								}
+
+								// Hand-composed counterfactual: same carrier +
+								// stray verbatim, the real definition inline
+								// once, a reference at the second occurrence.
+								cfCarrier := carrierJSON(kind)
+								cfCarrier[key] = strayJSON
+								cfFields := []any{
+									map[string]any{"name": "F1", "type": cfCarrier},
+									map[string]any{"name": "F2", "type": bodyJSON("identdef")},
+								}
+								if occ == 2 {
+									cfFields = append(cfFields, map[string]any{"name": "F3", "type": "n.X"})
+								}
+								cfRoot := map[string]any{"type": "record", "name": "Top", "fields": cfFields}
+								if ns != "" {
+									cfRoot["namespace"] = ns
+								}
+								cfText, err := json.Marshal(cfRoot)
+								if err != nil {
+									t.Fatalf("marshal counterfactual: %v", err)
+								}
+								_, cfErr := Parse(string(cfText))
+
+								s, err := schemaForScopeCell(t, fields, ns, customs)
+								if (err == nil) != (cfErr == nil) {
+									t.Fatalf("verdict parity broken:\n build: %v\n parse of counterfactual: %v", err, cfErr)
+								}
+								if err != nil {
+									return // reject cell: parity established
+								}
+
+								var root map[string]any
+								if err := json.Unmarshal([]byte(s.String()), &root); err != nil {
+									t.Fatalf("composed text: %v", err)
+								}
+								composed, _ := root["fields"].([]any)
+								if len(composed) < 2 {
+									t.Fatalf("composed fields missing: %s", s.String())
+								}
+								f1type, _ := composed[0].(map[string]any)["type"].(map[string]any)
+								if f1type == nil {
+									t.Fatalf("composed F1 type not an object: %s", s.String())
+								}
+								if got, want := f1type[key], jsonReencode(t, strayJSON); !reflect.DeepEqual(got, want) {
+									t.Errorf("stray not preserved verbatim:\n got:  %#v\n want: %#v", got, want)
+								}
+								f2type, _ := composed[1].(map[string]any)["type"].(map[string]any)
+								if f2type == nil || f2type["name"] != "n.X" {
+									t.Errorf("real definition not inline at F2: %s", s.String())
+								}
+								if occ == 2 {
+									if ref, _ := composed[2].(map[string]any)["type"].(string); ref != "n.X" {
+										t.Errorf("second genuine occurrence did not dedup to a reference: %s", s.String())
+									}
+								}
+							})
+						}
 					}
 				}
 			}

@@ -4900,3 +4900,328 @@ exact net built to catch cache-walker divergence had no stray-key rows
 and the un-gated descent survived two generations of green census runs.
 This round's back-fill is TestMatrix_CacheStrayStructuralKey plus the
 census-header routing that sends the family's future rows there.
+
+## Distillation archive (2026-07-20) — CORE size-guard distillation (ledger compression c6f75a2-era through 9f0fb26 FIX + divergence-policy relocation)
+
+AUDIT_CORE.md crossed its ~55KB size guard (59.7KB at round start; the
+2026-07-19 fix round's ledger line mandated this pass). Two moves: the
+verbose round-ledger entries below compressed to the format-target
+few-line form, and §Cross-implementation divergence policy relocated to
+NOT_BUGS.md (the filing-time file where it is consulted), leaving a
+spine pointer in CORE. Originals verbatim:
+
+### Round-ledger entry originals (2026-07-14..15 · c6f75a2 era through 2026-07-19 · 9f0fb26 FIX), verbatim
+
+- 2026-07-14..15 · 79ed5b3→c6f75a2 · era (5 rounds): SchemaFor
+  namespaced-custom composition FILED→FIXED (fullname dedup, dotted refs,
+  ns-injection; #38 ext); quarantine NOT clean — 5 FILED→all FIXED (by-ref
+  Props deep-copy; walker CI-fold #46 EXT; bareAliases tiers #67;
+  error-walk render #68) + qualifyAliases leading-dot RULED+FIXED
+  (leadingDotName; #67 rewritten) · fastavro EXECUTED per round · counter
+  ZERO. Verbatim: archive (2026-07-17).
+- 2026-07-17 · 84bac19 (3rd) · POLICY: v1/CI reserved-key semantics
+  KEPT by maintainer ruling (hamba-compat; exact-case flip DECLINED);
+  addTypeAliases CI fix RELEASED as granted; #46 rewritten adjudicated;
+  tri-posture parse-posture edge PINNED · counter unchanged.
+  Verbatim: archive (2026-07-17, 2026-07-18).
+- 2026-07-17 · dd31464 · FULL · distillation done · quarantine
+  (b2c7601) NOT clean — B36 class NEW (caller any values through
+  exact-type switches): 2 FILED (composition-container; leaf-fixup;
+  probes red ×7) · clean fronts: skip.go inverse-density, P1/P9
+  refresh, Y4 · fastavro EXECUTED; -race FULL green; Java NOT run ·
+  counter RESET. Verbatim: archive (2026-07-17, 2026-07-19).
+- 2026-07-17 · 6c992b3 (START head) · FIX · both B36 findings FIXED
+  as ruled (canonicalizing copy + kind fixup twins; marshal-opaque
+  exempt; #69 residuals) · 6 pins red→green +
+  TestMatrix_TreeValueGoTypes ~28 cells · neuter ×3 disjoint (B31
+  extends to neuter runs: verify the neutered build executed) · suite
+  + fastavro EXECUTED green; Java NOT run · counter stays ZERO.
+  Verbatim: archive (2026-07-17, 2026-07-19).
+- 2026-07-18 · f06bdeb · DEDICATED caller-value census (streak-neutral) ·
+  distillation done · quarantine (f06bdeb) NOT clean — 2 classes FILED,
+  HALTED: render copy breaks container nil-ness both directions (6 probes
+  red incl. union-null default verdict flip; fix = nil-preserving arms);
+  #69 TextMarshaler-string-key rationale executed-contradicted (v1 twin
+  exists, jsonv2 flips; 2 probes red; maintainer table) · census clean
+  otherwise: invariant + axes codified in B36, ~70 green cells + STANDING
+  ARM FuzzTreeValueTwinParity landed, neuter ×2 disjoint · suite +
+  fastavro EXECUTED ×2; -race green; Java NOT run (no jar) · counter
+  stays ZERO; next round quarantines f06bdeb..HEAD. Narrative + full
+  detail: BUG_AUDIT.md archive (2026-07-18).
+- 2026-07-19 · 656d118 (START head — 656d118..HEAD quarantines the fix
+  commit landed after this line) · FIX · both census findings FIXED as
+  ruled: nil-ness preserved at every boundary copy arm (deepCopyJSONTree
+  ×4 arms, []string make+copy split; canonicalizeTreeValue Map/Slice
+  IsNil; snapshotAnyValue test helper same defect + fix, gains []string
+  arm) — 4 pins + TestMatrix_TreeValueNilEmptyImage (6 kinds ×
+  props/default × 2 surfaces) + structural-nil verdict cell;
+  canonicalStringKeyMap drops the string-KIND TextMarshaler exclusion
+  (raw key = executed v1 precedence + toolchain stability; non-string
+  kinds stay opaque, "i7" executed both toolchains) — 2 pins +
+  TestMatrix_TreeValueMapKeyShapes (4 key shapes × 4 surfaces, executed
+  premises) · red 21 recorded pre-fix, all green post · neuter ×2
+  disjoint: nil guards → exactly nil/empty family (23, incl. fuzz
+  seed#7); exclusion restored → exactly tmKey family (9; ptr-key +
+  int-posture green both ways) · fuzzer nil/empty exclusions LIFTED
+  (+3 seeds; 30s×2 clean, 96.9k execs) · FIX.md gains the nil-ness
+  invariant row; #69 rewritten (both rulings + executed v1/v2 facts);
+  B36 codification resolved · suite + fastavro EXECUTED green; -race
+  green (family); Java NOT run (no jar) · counter stays ZERO (fix
+  round; rebuild needs two clean bare FULLs). Narrative: BUG_AUDIT.md
+  archive (2026-07-19).
+- 2026-07-19 · 9f0fb26 · FULL (read-only) · quarantine (9f0fb26) CLEAN
+  (nil-guard uniformity ×6 arms; fixup make-arms needs-gate-unreachable
+  for nil containers; byte-nil ""-image pinned both surfaces via
+  fixup-before-copy order; canonicalStringKeyMap lockstep ×3 sites,
+  valueWalkLimit kind-descent bounds the widened canonicalize; typed- vs
+  untyped-nil invisible to marshal-bytes dedup identity; sibling copy
+  sites text-provenance or len-guarded) · behavioral FILED 1: SchemaCache
+  stray-position def poisoning — collectTreeDefs/inlineTreeDefs
+  items/values descents un-gated by kind (cache.go visitors) vs #63's
+  primitive capture-drop edge; first-wins c.defs occupation → a
+  cross-parse reference's Canonical/Fingerprint/String/Root/SOE rebuilt
+  from the WRONG def while the wire codec resolves the real one (the
+  exact #24 metadata↔wire disagreement the splice-rebuild exists to
+  prevent); 2 sandbox pins verified-failing (poisoning ×{items,values};
+  splice-mutates-inert sibling); fastavro EXECUTED (drops stray,
+  registers nothing, rejects ref), Java SCHEMA_RESERVED Schema.java:176;
+  1b0155a gated only the schema_for twins — B7 tombstone re-open
+  condition MET (FEATURE × WALKER harness missed the SchemaCache ×
+  stray-key intersection) · doc FILED 1: doc.go omitzero-vs-map-fill
+  "one difference" sentence false for ["null",T] (#16 implicit default
+  fills; README + ser.go wordings correct) · clean fronts: atype
+  constants vs spec; soe.go (resolved reader-fp posture
+  documented-intentional, resolve.go:88-96, #2 family); rabin.go vs spec
+  pseudo-code; P18 sub-buffer remainder sites (deser.go:2338 self-
+  documenting, resolve.go:549); B27 unionTypeNameForValue capped peel;
+  B20 Parse-echo bounded (9 hostile 5-MiB probes, 103-210-char errors);
+  Parse stray-logicalType inert-accept spec-correct · suite ×2 green
+  (run-1 DecodeJSONFloatLengthCapDoS threshold trip TRIAGED, not
+  dismissed: 7-9ms isolated vs 100ms cap, cap applied, error bounded
+  168B; failure only under concurrent venv-rebuild load — consider
+  measuring with margin or non-parallel), fastavro differential EXECUTED
+  green; Java NOT run (no jar); -race NOT run · counter RESET
+  (behavioral filed).
+- 2026-07-19 · 9f0fb26 (START head — 9f0fb26..HEAD quarantines the fix
+  commit landed after this line) · FIX · all three granted items landed:
+  binding-kind gate is walkNodeChildren's DEFAULT (fields→record/error,
+  items→array, values→map) with strayKeys opt-in held ONLY by the
+  metadata walker (as-written surfacing pinned as a deliberate
+  asymmetry); collectNamedTypes gains the same per-kind descent gates
+  (the [sibling-of-fix] found by the name-walk sweep: last-wins
+  metadata table poisoned name-ref default coercion, probe red both
+  directions of the class); cache.go itself unchanged (visitors inherit
+  the default) · pins red 25 recorded pre-fix, all green post; class
+  extent {items,values,fields} probed (fields-on-primitive poisonable);
+  rebuild deduper probed CLEAN (emitter kind-gated, strays die at
+  rebuild) · TestMatrix_CacheStrayStructuralKey: carrier × key ×
+  relation (conflicting/recursive × order, diamond) × 5 surfaces + wire
+  verdicts + fixed/enum exclusivity rejects + array/map/record binding
+  controls; census header routes the stray family here + schema_for
+  twin · doc.go map-fill/omitzero reworded (implicit-null named,
+  difference scoped to no-EFFECTIVE-default) + parity pin (3 shapes ×
+  both routes, exact wires); DoS timing pin hardened (best-of-4 serial
+  re-measure on trip, bound unchanged) · neuter ×4 disjoint,
+  grep-confirmed: N1 collect gate → exactly 21 (crossparse 3 +
+  stray_first 12 + diamond 6); N2 splice gate → exactly 3 splice cells;
+  N3 collectNamedTypes → exactly the last-wins order cell; N4 float cap
+  → boundary+accept+4-axis asserts red (hardening kept the teeth) ·
+  cache String vs plain is STRUCTURAL by design (upfront marshal
+  normalization; recorded in #63 clause) · #63 gains the
+  cache+metadata clause (+ 2026-07-14 wire-agreement sentence
+  corrected); B7 tombstone records the re-open + caller table +
+  file-scoped-sweep lesson; FIX.md item 3 gains the caller-set
+  sweep-scope rule; FIX.md item 15 becomes BOTH-DIRECTIONS (a fix
+  minting a new invariant sweeps every EXISTING consumer same round,
+  per-consumer conforms/different-by-design table — the caller table is
+  the first execution); §Feedback loop gains the census back-fill rule
+  (a newly adjudicated posture family back-fills every census whose
+  axis it extends in the adjudicating round — the FEATURE × WALKER
+  census's #63 blindness is the instance; this round's back-fill =
+  TestMatrix_CacheStrayStructuralKey + the census-header routing) ·
+  suite + fastavro EXECUTED green; FULL -race green;
+  Java NOT run (no jar) · counter stays ZERO (fix round; rebuild needs
+  two clean bare FULLs; next round OPENS with the mandated CORE
+  distillation — size over the 55KB cap). Narrative: BUG_AUDIT.md
+  archive (2026-07-19).
+
+### AUDIT_CORE.md §Cross-implementation divergence policy original (relocated to NOT_BUGS.md 2026-07-20), verbatim
+
+## Cross-implementation divergence policy (Java vs fastavro vs spec)
+
+When twmb's behavior on some input could match Java, fastavro, or the spec and they disagree, resolve by this order — NOT by spec-literalism, and NOT by "matches reference X" alone:
+
+1. **Correctness/safety is absolute.** Never accept an input that yields silently wrong output, unresolvable ambiguity, or a DoS/security issue. If accepting risks that, reject — regardless of what any reference does.
+
+2. **Otherwise lean PERMISSIVE — least surprise, maximum interop.** Prefer the more relaxed behavior: if EITHER Java or fastavro safely accepts an input, lean toward accepting it too; if the spec is loose, be loose even when an impl is strict. A user whose data one major impl accepts is surprised when twmb alone rejects. Strictness (rejecting) is earned only by rule 1, never by "the spec/Java technically forbids it" when accepting is safe.
+
+3. **The spec is an INPUT, not the sole authority.** A decisive spec resolves a case only when it agrees with rules 1–2. A *strict* spec does not force a reject if both impls safely accept; a *loose* spec is honored over a strict impl.
+
+4. **Genuine toss-up → table + HALT for the maintainer.** When there is a real tradeoff and no clear least-surprise winner, present a decision table (option / spec / Java / fastavro / what the user gains / surprise / corruption-risk) and stop. Never auto-pick a divergence.
+
+5. **Record every resolution in NOT_BUGS** with the spec citation, the Java/fastavro behavior, and which rule decided it.
+
+Instance: D (fixed-union size masking) — spec + fastavro accept (safe: a reorder-decodable value, no corruption), Java rejects (bug-for-bug 1.8.x compat; its own comment admits the spec-divergence). Rules 2+3 → be relaxed, **accept** (fold size into branch selection). The earlier "match Java, document as a deliberate residual" resolution was wrong: it applied rule "matches Java" without the spec or the permissive lean.
+
+## Distillation archive (2026-07-20) — stray render/routing + wrapped-ref splice fix round (START head 489e8ce)
+
+All five maintainer rulings landed as one commit. The six sandbox pins
+were re-derived in-repo and verified red before any fix (red run
+recorded: 3 render-dedup subs + element as-written + rebuild-survival +
+splice ×3 positions + PCF-invariance + battery ×2; reject-boundary
+controls green pre- and post-fix).
+
+1. RENDER DEDUPER: toJSONWalk threads a stray-position flag through its
+structural descents (items stray when the node's kind is not "array",
+values not "map", fields not record/error; union branches inherit).
+The dedup consult — registration, second-definition→reference rewrite,
+conflict marshal-compare — skips stray-reached nodes entirely; the
+cycle arm's named-reference return is likewise !stray-gated (a
+stray-reached name is no reference target; a stray cycle takes the
+error path). The render still emits stray content verbatim.
+
+2. STRAY FIELDS ELEMENT: walkNodeChildren gains fieldNoType, fired for
+a field element with no "type" key — reachable only inside a stray
+"fields" (bound record builds reject nil field types; the element
+decode is kind-blind, so stray positions parse). The metadata walker
+surfaces such elements as-written (name/doc/aliases/order/default/
+props, zero Type); the adjacent comment's "a field with no type key
+never parses" claim was false under strayKeys and now scopes itself to
+bound positions.
+
+3. LEAF SHORTCUTS: both bare-emission arms (the 8-primitive switch and
+the unnamed-kind fallthrough) additionally require Items == nil &&
+Values == nil && len(Fields) == 0, so a stray-carrying primitive always
+takes the object render: stray survival at Root().Schema() is
+props-INDEPENDENT (always-preserve). This supersedes the prior round's
+observed "strays die at rebuild", which held only for prop-less
+carriers (the props-carrying cell was the net's held-constant axis —
+B32's lesson, back-filled below).
+
+4. WRAPPED REF WITH PROPS (ruled option a): inlineTreeDefs' map arm now
+handles BOTH wrapper arities before the general path. A wrapper whose
+reference splices is REPLACED by the inherited definition with the
+wrapper's props merged on (value-aware: only keys the DEF's kind routes
+to props — so a malformed "items":3 merges while "namespace":3 on a
+record never does, keeping the spliced text parseable; def wins
+collisions; reserved usage-site attributes do not survive — #25 gains
+the structural-limit note). A wrapper whose reference stays bare keeps
+its shape (sole-key still collapses). Reference behavior recorded with
+evidence per the ruling's executed-or-cited bar: Java ACCEPTS the
+spelling and DROPS usage-site extras (Schema.java:1829 and :1846 —
+context.find(...) returned with no properties pass; the anticipated
+"Java merges usage-site props" premise is FALSE on apache/avro main),
+fastavro REJECTS it outright (UnknownType, executed). twmb's
+preserve-as-props is the most faithful of the three. PCF-invariance
+pinned: canonical bytes identical across bare / sole-key / props
+wrapper spellings.
+
+5. MALFORMED STRAY BODIES (ruled option a): aobjectFromMap's
+structural/naming arms (name, namespace, symbols, aliases, items,
+values, size, fields) error only when the node's kind BINDS the key
+(strayKeyBinds — the parser's kind-keyed grammar); a failed parse on a
+non-binding kind leaves the aobject field unset and the extra loop
+routes the raw value to props. precision/scale gate on
+decimalConsumesPrecisionScale the same way — the FILED premise
+"precision:'abc' accepts today (kind-aware)" was EXECUTED-FALSE
+(intPtrFrom propagated the error; both families rejected pre-fix), so
+the healed-uniformity pin asserts both families now accept-inert
+together. schemaReservedKeyForObject became value-aware: reserved
+unless (non-binding AND not strayBodyShapeOK) — the same predicate the
+metadata walker's stray arms consult (shared decode functions:
+aschemaFromAny / afieldFromAny / string-slice / laxInt), so the wire
+and metadata surfaces cannot disagree on a body's route. Non-schema-
+shaped bodies surface VERBATIM in Props (asserted against a custom-prop
+twin as the oracle); schema-shaped bodies keep structural surfacing.
+Wrapped references accept malformed structural keys as props too (the
+guard consults only successfully parsed attributes). Controls pinned
+un-loosened: binding-kind shape rejects, #63 exclusivity, #64
+stray-name-on-container, wrapped-ref schema-shaped structural reject.
+References for the accept: Java skips SCHEMA_RESERVED wholesale on
+non-binding kinds (Schema.java:175-176; parsePrimitive :1855-1859);
+fastavro accepts all twelve battery shapes (executed, plus the
+per-cell differential arm below).
+
+Nets: TestMatrix_StrayBodyShapeRouting (key × body shape × carrier ×
+route, 72 runs incl. TestDifferentialFastavroStrayBodyShapes executing
+every accept cell against fastavro); TestMatrix_CacheStrayRebuildSurface
+(carrier × key × def relation × carrier-props × order, 48 cells — the
+props axis is the census back-fill; asserts rebuild success, wire
+verdicts, stray-presence markers, prop survival, generation-2
+stability); TestMatrix_SchemaForStrayStructuralKey gains the TYPED
+planting route (caller sets Items/Values/Fields directly; 48 new cells
+prove composition preserves typed strays as-written with verdict parity
+— the file's "typed structural fields are dropped by the render" claim
+was made stale by fix 3 and corrected).
+
+Neuters, each disjoint, each build-executed: N1 dedup ignores the flag
+→ 53 red (exactly the 48 rebuild-surface cells + parent +
+RenderDedupIgnoresStrayDefinitions's 3 subs + parent); N2 fieldNoType
+removed → 1 red (element as-written pin); N3 shortcut gates reverted →
+76 red (24 bare rebuild cells + 48 typed-route composition cells + the
+two presence pins + parents; withprop cells stay green = the
+props-conditional teeth); N4 wrapper branch re-gated len==1 → 5 red
+(3 splice positions + parent + PCF-invariance); N5 strayKeyBinds→true
+→ 35 red (32 routing cells + parent + 2 battery pins;
+precision/scale cells stay green — they sit behind the decimal gate,
+not strayKeyBinds).
+
+SchemaNode-tree walker table (cross-cutting (i), QUESTION-SCOPED per
+the amended FIX.md item 3 — "who consumes container-key positions as
+schema positions?", every answerer classified, EXECUTED:
+
+- toJSONWalk render descent — different-by-design (as-written fidelity
+  must descend) — TestRegression_StrayKeySurvivesSchemaRebuild + the
+  rebuild matrix.
+- toJSONWalk dedup consult — CONFORMS via the stray flag (this fix) —
+  TestRegression_RenderDedupIgnoresStrayDefinitions; N1's 53-red set.
+- toJSONShared (conflict-compare render) — same walker, flag threaded —
+  covered by the conflict cells.
+- collectNamedTypes — conforms (kind gates, prior round); its
+  unconditional Branches arm is unreachable for hand-built trees (sole
+  caller fixupNameRefDefaults is Root-internal; Parse trees carry
+  Branches only under unions) — residual (ii) EXECUTED:
+  TestRegression_NonUnionBranchesInertInRebuild (render drops them,
+  dedup blind, bare primitive still emits "int").
+- coerceTreeDefaults — different-by-design (consumes the gated table;
+  applies the uniform default normalization to surfaced stray bodies;
+  registers nothing) — TestRegression_StrayBodyDefaultNormalization.
+- coerceMetadataDefault / branchAcceptsDefault — conform (every
+  container arm Type-gated, record arm isRecordKind-gated —
+  source-verified at the fields-search arm).
+- deepCopyJSONTree / canonicalizeTreeValue / snapshotAnyValue /
+  needsJSONFixup(Kind) / valueWalkLimit — value walkers with no schema
+  positions — nil-image and budget pins.
+- walkNodeChildren callers (raw-JSON): cache collectTreeDefs +
+  inlineNodeChildren conform (bound-only default);
+  nodeFromJSONObject different-by-design (strayKeys opt-in, now
+  shape-gated) — surfacing pins + routing matrix.
+- Parser internals (aobjectFromMap / afieldFromAny) — conform post-fix
+  (binding-gated shape validation, shared predicate) — routing matrix.
+- Canonical emitters — conform (kind-dispatched canon; strays never
+  enter) — PCF-invariance pin + canonical cells.
+- Cache tables (c.defs / dedup maps) — conform (gated collectors;
+  value-aware splice merge) — splice pins.
+- SchemaFor composition walkers — conform (kind-gated) — the matrix's
+  props AND typed routes.
+- resolve/compat matchers — no stray positions exist in the parsed
+  *schemaNode graph (the build never materializes strays into internal
+  nodes); wire-verdict cells in every matrix assert the codec side.
+
+Framework: FIX.md items 3 + 15 amended QUESTION-SCOPED, REPO-WIDE with
+the named representation checklist and the three-scope-failure history
+(file-scoped missed cache.go; helper-caller-scoped missed the render
+deduper; each syntactic where the invariant was semantic). #63 gains
+the shape-conditional routing + render/rebuild + wrapped-ref
+splice-merge clauses, and its 2026-07-14 "a named REFERENCE with the
+same alien key keeps it as a prop" sentence was executed-corrected
+(schema-shaped structural keys on wrapped refs REJECT at dispatch).
+#25 gains the reserved-usage-site-attr splice limit. B7 re-netted with
+the new matrices and the checklist-scoped re-open condition. Census
+header routes the render/rebuild/routing families. SchemaNode.Props
+doc documents the verbatim Props route.
+
+Suite + fastavro EXECUTED green (exit 0 from file; the stray
+differential arm runs 0-skip under AVRO_FASTAVRO_PYTHON); FULL -race
+green (exit 0 from file, both packages). Java oracle NOT run (no jar).
+Counter stays ZERO (fix round; rebuild needs two clean bare FULLs).

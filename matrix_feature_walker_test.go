@@ -51,12 +51,19 @@ import (
 // feature deliberately breaks twin parity on the as-written surfaces:
 // STRAY structural keys (a reserved container key on a kind that does not
 // bind it — inert to the parser, surfaced as-written by the metadata
-// walker). Its walkers-must-not-consume-strays net is
-// TestMatrix_CacheStrayStructuralKey (this package: SchemaCache collect /
-// splice / metadata name table, carrier × key × def relation × surface)
-// and TestMatrix_SchemaForStrayStructuralKey (the composition walkers);
-// a new consumer of walkNodeChildren — or any same-contract child
-// enumerator — owes cells there, not a row here.
+// walker: schema-shaped bodies structurally, non-schema-shaped bodies in
+// Props verbatim). Its walkers-must-not-consume-strays net is
+// TestMatrix_CacheStrayStructuralKey (SchemaCache collect / splice /
+// metadata name table, carrier × key × def relation × surface),
+// TestMatrix_CacheStrayRebuildSurface (the render + its dedup consult:
+// rebuild succeeds, preserves strays props-independently, stays stable
+// across generations), TestMatrix_StrayBodyShapeRouting (key × body
+// shape × carrier × surfacing route, with the fastavro differential
+// arm), and TestMatrix_SchemaForStrayStructuralKey (the composition
+// walkers, props and typed planting routes); a new consumer of
+// walkNodeChildren — or any walker/consult of either tree
+// representation (FIX.md item 3's representation checklist) — owes
+// cells there, not a row here.
 type featureWalkerRow struct {
 	name string
 

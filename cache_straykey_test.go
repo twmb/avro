@@ -384,3 +384,368 @@ func TestMatrix_CacheStrayStructuralKey(t *testing.T) {
 		})
 	}
 }
+
+// The rebuild walker (SchemaNode.Schema) descends stray container keys to
+// render them as-written, but its dedup consult must not treat those
+// positions as SCHEMA positions: the wire parser registers nothing there,
+// so a named definition inside a stray key can neither conflict with nor
+// stand in for the real definition of the same fullname.
+func TestRegression_RenderDedupIgnoresStrayDefinitions(t *testing.T) {
+	t.Parallel()
+	real := `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`
+	conflicting := `{"type":"record","name":"R","fields":[{"name":"x","type":"string"}]}`
+	carrier := func(def string) string {
+		return `{"type":"int","foo":1,"items":` + def + `}`
+	}
+	t.Run("conflicting_body", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[
+			{"name":"a","type":` + carrier(conflicting) + `},
+			{"name":"b","type":` + real + `}]}`)
+		root := s.Root()
+		if _, err := root.Schema(); err != nil {
+			t.Errorf("rebuild failed for a wire-valid schema: %v", err)
+		}
+	})
+	t.Run("identical_body", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[
+			{"name":"a","type":` + carrier(real) + `},
+			{"name":"b","type":` + real + `}]}`)
+		root := s.Root()
+		if _, err := root.Schema(); err != nil {
+			t.Errorf("rebuild failed for a wire-valid schema: %v", err)
+		}
+	})
+	t.Run("stray_after_real", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"Top","fields":[
+			{"name":"b","type":` + real + `},
+			{"name":"a","type":` + carrier(real) + `}]}`)
+		root := s.Root()
+		rb, err := root.Schema()
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+		if strings.Contains(rb.String(), `"items":"R"`) {
+			t.Errorf("stray definition rewritten to a reference: %s", rb.String())
+		}
+	})
+}
+
+// A field element inside a stray "fields" key surfaces as-written even
+// when it has no "type" key: the record build (which requires a field
+// type) never runs for stray positions, so such elements are parseable
+// and their written attributes must appear on the surfaced SchemaField —
+// never a fabricated zero element.
+func TestRegression_StrayFieldElementSurfacedAsWritten(t *testing.T) {
+	t.Parallel()
+	s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"a","type":
+		{"type":"int","fields":[{"name":"x","doc":"d","myprop":1}]}}]}`)
+	fs := s.Root().Fields[0].Type.Fields
+	if len(fs) != 1 {
+		t.Fatalf("stray fields arity: got %d, want 1", len(fs))
+	}
+	if fs[0].Name != "x" || fs[0].Doc != "d" {
+		t.Errorf("stray field element not surfaced as written: %+v", fs[0])
+	}
+	if got, ok := fs[0].Props["myprop"]; !ok || got != int64(1) {
+		t.Errorf("stray field element props: got %v, want myprop=1", fs[0].Props)
+	}
+	if fs[0].Type.Type != "" {
+		t.Errorf("typeless stray element must surface a zero Type, got %q", fs[0].Type.Type)
+	}
+}
+
+// A stray container key survives SchemaNode.Schema() regardless of
+// whether the carrier also has custom props or a logical type: surfacing
+// is as-written, so the rebuilt schema must keep the stray on every
+// carrier shape, and a second generation must be stable.
+func TestRegression_StrayKeySurvivesSchemaRebuild(t *testing.T) {
+	t.Parallel()
+	for _, carrier := range []string{
+		`{"type":"int","items":"long"}`,
+		`{"type":"int","foo":1,"items":"long"}`,
+	} {
+		s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"a","type":` + carrier + `}]}`)
+		root := s.Root()
+		rb, err := root.Schema()
+		if err != nil {
+			t.Fatalf("%s: rebuild: %v", carrier, err)
+		}
+		if !strings.Contains(rb.String(), `"items":"long"`) {
+			t.Errorf("%s: stray dropped by rebuild: %s", carrier, rb.String())
+			continue
+		}
+		rbRoot := rb.Root()
+		rb2, err := rbRoot.Schema()
+		if err != nil {
+			t.Fatalf("%s: second-generation rebuild: %v", carrier, err)
+		}
+		if rb.String() != rb2.String() {
+			t.Errorf("%s: rebuild not stable across generations:\n gen1: %s\n gen2: %s", carrier, rb.String(), rb2.String())
+		}
+	}
+}
+
+// A reserved-key body that does not parse as the key's schema shape is
+// inert on a kind that does not bind the key: it cannot define, scope, or
+// bind anything, so it surfaces verbatim in Props — the same treatment
+// every non-reserved key gets. (Java skips reserved keys wholesale on
+// non-binding kinds — Schema.java's SCHEMA_RESERVED set — and fastavro
+// ignores them; rejecting was a twmb-only strictness.) Schema-shaped
+// bodies keep the structural-field surfacing.
+func TestRegression_MalformedStrayBodyAcceptedAsProps(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		carrier string
+		key     string
+		want    any
+	}{
+		{`{"type":"int","items":3}`, "items", int64(3)},
+		{`{"type":"int","values":true}`, "values", true},
+		{`{"type":"int","fields":[3]}`, "fields", nil},
+		{`{"type":"int","fields":3}`, "fields", int64(3)},
+		{`{"type":"int","symbols":3}`, "symbols", int64(3)},
+		{`{"type":"int","size":"x"}`, "size", "x"},
+		{`{"type":"int","name":3}`, "name", int64(3)},
+		{`{"type":"int","namespace":3}`, "namespace", int64(3)},
+		{`{"type":"int","aliases":3}`, "aliases", int64(3)},
+		{`{"type":"int","precision":"abc"}`, "precision", "abc"},
+		{`{"type":"int","scale":"abc"}`, "scale", "abc"},
+		{`{"type":"string","items":{"type":3}}`, "items", nil},
+	}
+	for _, c := range cases {
+		s, err := Parse(`{"type":"record","name":"Top","fields":[{"name":"a","type":` + c.carrier + `}]}`)
+		if err != nil {
+			t.Errorf("%s: rejected: %v", c.carrier, err)
+			continue
+		}
+		n := s.Root().Fields[0].Type
+		got, ok := n.Props[c.key]
+		if !ok {
+			t.Errorf("%s: stray %q not surfaced in Props: %v", c.carrier, c.key, n.Props)
+			continue
+		}
+		if c.want != nil && !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: Props[%q] = %v (%T), want %v", c.carrier, c.key, got, got, c.want)
+		}
+		var enc []byte
+		enc, err = s.Encode(map[string]any{"a": int32(7)})
+		if c.carrier[9:15] == "string" {
+			enc, err = s.Encode(map[string]any{"a": "v"})
+		}
+		if err != nil {
+			t.Errorf("%s: encode: %v", c.carrier, err)
+			continue
+		}
+		var out map[string]any
+		if _, err := s.Decode(enc, &out); err != nil {
+			t.Errorf("%s: decode: %v", c.carrier, err)
+		}
+	}
+}
+
+// A malformed reserved-key body on a wrapped named REFERENCE rides as a
+// prop too: the reference guard consults only successfully parsed
+// structural attributes, and a body that cannot parse as the key's shape
+// cannot be an attempt to define a type.
+func TestRegression_MalformedStrayBodyOnWrappedRef(t *testing.T) {
+	t.Parallel()
+	s, err := Parse(`{"type":"record","name":"Top","fields":[
+		{"name":"b","type":{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}},
+		{"name":"a","type":{"type":"R","items":3}}]}`)
+	if err != nil {
+		t.Fatalf("rejected: %v", err)
+	}
+	n := s.Root().Fields[1].Type
+	if n.Type != "R" {
+		t.Fatalf("reference not preserved: %+v", n)
+	}
+	if got, ok := n.Props["items"]; !ok || got != int64(3) {
+		t.Errorf("malformed stray on reference not in Props: %v", n.Props)
+	}
+}
+
+// The adjudicated reject boundaries do not loosen with the malformed-body
+// acceptance: a BINDING kind still shape-validates its own key; a
+// container kind still rejects another kind's schema-shaped defining key;
+// a schema-shaped stray name on an unnamed container still rejects; and a
+// schema-shaped structural key on a wrapped reference still rejects.
+func TestRegression_StrayShapeRejectBoundaries(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ schema, wantErr string }{
+		{`{"type":"array","items":3}`, "invalid schema"},
+		{`{"type":"map","values":true}`, "invalid schema"},
+		{`{"type":"record","name":"N","fields":3}`, `"fields" must be a JSON array`},
+		{`{"type":"enum","name":"N","symbols":3}`, "array"},
+		{`{"type":"fixed","name":"N","size":"x"}`, ""},
+		{`{"type":"array","items":"int","fields":[{"name":"x","type":"int"}]}`, "has schema for other types"},
+		{`{"type":"array","items":"int","name":"x"}`, ""},
+	} {
+		_, err := Parse(`{"type":"record","name":"Top","fields":[{"name":"a","type":` + c.schema + `}]}`)
+		if err == nil {
+			t.Errorf("%s: accepted, want reject", c.schema)
+			continue
+		}
+		if c.wantErr != "" && !strings.Contains(err.Error(), c.wantErr) {
+			t.Errorf("%s: error %q does not mention %q", c.schema, err, c.wantErr)
+		}
+	}
+	if _, err := Parse(`{"type":"record","name":"Top","fields":[
+		{"name":"b","type":{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}},
+		{"name":"a","type":{"type":"R","items":"long"}}]}`); err == nil {
+		t.Errorf("schema-shaped structural key on a wrapped reference accepted, want reject")
+	}
+}
+
+// cacheStrayCarrierProps is cacheStrayCarrier with an extra custom
+// property on the carrier object — the carrier shape that forces the
+// rebuild's object render (a bare primitive emits as its type string).
+func cacheStrayCarrierProps(kind, key, payload string) string {
+	if key == "fields" {
+		return `{"type":"` + kind + `","foo":1,"fields":[{"name":"f","type":` + payload + `}]}`
+	}
+	return `{"type":"` + kind + `","foo":1,"` + key + `":` + payload + `}`
+}
+
+// TestMatrix_CacheStrayRebuildSurface crosses carrier kind × stray key ×
+// definition relation × carrier props × order for a SINGLE parse holding
+// both a stray-planted definition and the real definition of the same
+// fullname: the metadata rebuild must succeed (the dedup consult skips
+// stray positions), preserve the wire verdicts, and be stable across a
+// second generation — independent of whether the carrier's props force
+// the object render.
+func TestMatrix_CacheStrayRebuildSurface(t *testing.T) {
+	t.Parallel()
+	strayBodies := map[string]string{
+		"conflicting": cacheStrayGDef("int"),
+		"recursive":   `{"type":"record","name":"n.G","fields":[{"name":"s","type":["null","n.G"]}]}`,
+	}
+	// A substring of each body's rebuilt image, proving the stray content
+	// survived the rebuild verbatim rather than being dropped or
+	// rewritten to a reference.
+	strayMarkers := map[string]string{
+		"conflicting": `"name":"g"`,
+		"recursive":   `"name":"s"`,
+	}
+	carrierValue := map[string]any{"int": int32(7), "string": "v"}
+	for _, carrier := range []string{"int", "string"} {
+		for _, key := range []string{"items", "values", "fields"} {
+			for bodyName, body := range strayBodies {
+				for _, props := range []string{"bare", "withprop"} {
+					for _, order := range []string{"stray_first", "real_first"} {
+						name := fmt.Sprintf("%s_%s_%s_%s_%s", carrier, key, bodyName, props, order)
+						t.Run(name, func(t *testing.T) {
+							strayType := cacheStrayCarrier(carrier, key, body)
+							if props == "withprop" {
+								strayType = cacheStrayCarrierProps(carrier, key, body)
+							}
+							fa := `{"name":"a","type":` + strayType + `}`
+							fb := `{"name":"b","type":` + cacheStrayRealGDef + `}`
+							if order == "real_first" {
+								fa, fb = fb, fa
+							}
+							s := MustParse(`{"type":"record","name":"Top","fields":[` + fa + `,` + fb + `]}`)
+							accept := map[string]any{"a": carrierValue[carrier], "b": map[string]any{"h": "x"}}
+							reject := map[string]any{"a": carrierValue[carrier], "b": map[string]any{"g": int32(9)}}
+							if _, err := s.Encode(accept); err != nil {
+								t.Fatalf("encode of the bound-definition value: %v", err)
+							}
+							if _, err := s.Encode(reject); err == nil {
+								t.Fatalf("encode of the stray-shaped value unexpectedly accepted")
+							}
+							root := s.Root()
+							rb, err := root.Schema()
+							if err != nil {
+								t.Fatalf("rebuild: %v", err)
+							}
+							if _, err := rb.Encode(accept); err != nil {
+								t.Errorf("rebuilt schema rejects the bound-definition value: %v", err)
+							}
+							if _, err := rb.Encode(reject); err == nil {
+								t.Errorf("rebuilt schema accepts the stray-shaped value")
+							}
+							if !strings.Contains(rb.String(), strayMarkers[bodyName]) {
+								t.Errorf("stray body did not survive the rebuild: %s", rb.String())
+							}
+							if props == "withprop" && !strings.Contains(rb.String(), `"foo":1`) {
+								t.Errorf("carrier props did not survive the rebuild: %s", rb.String())
+							}
+							rbRoot := rb.Root()
+							rb2, err := rbRoot.Schema()
+							if err != nil {
+								t.Fatalf("second-generation rebuild: %v", err)
+							}
+							if rb.String() != rb2.String() {
+								t.Errorf("rebuild unstable across generations:\n gen1 %s\n gen2 %s", rb.String(), rb2.String())
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+// Defaults inside a stray-surfaced body get the same normalization every
+// SchemaField.Default gets (string→float for float kinds, codepoint
+// string→[]byte for bytes) — the default pipeline is uniform over the
+// surfaced tree, and the render's inverse fixups keep the re-emitted
+// image equal to the written one. The name table consulted for
+// name-referenced defaults is built from BOUND positions only, so the
+// normalization inside a stray can never register or resolve a name.
+func TestRegression_StrayBodyDefaultNormalization(t *testing.T) {
+	t.Parallel()
+	s := MustParse(`{"type":"record","name":"Top","fields":[{"name":"a","type":
+		{"type":"int","items":{"type":"record","name":"SB","fields":[
+			{"name":"f","type":"bytes","default":"abc"},
+			{"name":"g","type":"double","default":"1.5"}]}}}]}`)
+	stray := s.Root().Fields[0].Type.Items
+	if stray == nil {
+		t.Fatalf("stray items not surfaced")
+	}
+	if got, ok := stray.Fields[0].Default.([]byte); !ok || string(got) != "abc" {
+		t.Errorf("bytes default in a stray body: got %T %v, want []byte(\"abc\")", stray.Fields[0].Default, stray.Fields[0].Default)
+	}
+	if got, ok := stray.Fields[1].Default.(float64); !ok || got != 1.5 {
+		t.Errorf("double default in a stray body: got %T %v, want float64(1.5)", stray.Fields[1].Default, stray.Fields[1].Default)
+	}
+	root := s.Root()
+	rb, err := root.Schema()
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if !strings.Contains(rb.String(), `"default":"abc"`) || !strings.Contains(rb.String(), `"default":1.5`) {
+		t.Errorf("stray-body defaults did not re-emit their written images: %s", rb.String())
+	}
+}
+
+// Branches on a non-union kind have no JSON spelling the parser could
+// bind — only a hand-built tree can carry them — and every consumer
+// treats them as inert: the render never descends them (a bare primitive
+// emits its type string; the object render has no branches arm outside
+// the union case), so the rebuild neither emits them, registers names
+// from them, nor conflicts on them.
+func TestRegression_NonUnionBranchesInertInRebuild(t *testing.T) {
+	t.Parallel()
+	branch := SchemaNode{Type: "record", Name: "R",
+		Fields: []SchemaField{{Name: "x", Type: SchemaNode{Type: "string"}}}}
+	node := SchemaNode{Type: "record", Name: "Top", Fields: []SchemaField{
+		{Name: "a", Type: SchemaNode{Type: "int", Props: map[string]any{"p": int64(1)}, Branches: []SchemaNode{branch}}},
+		{Name: "b", Type: SchemaNode{Type: "record", Name: "R",
+			Fields: []SchemaField{{Name: "x", Type: SchemaNode{Type: "int"}}}}},
+	}}
+	s, err := node.Schema()
+	if err != nil {
+		t.Fatalf("rebuild with non-union Branches: %v", err)
+	}
+	if strings.Contains(s.String(), `"string"`) {
+		t.Errorf("non-union Branches leaked into the rebuild: %s", s.String())
+	}
+	bare := SchemaNode{Type: "int", Branches: []SchemaNode{branch}}
+	s2, err := bare.Schema()
+	if err != nil {
+		t.Fatalf("bare-primitive rebuild with Branches: %v", err)
+	}
+	if s2.String() != `"int"` {
+		t.Errorf("bare primitive with non-union Branches: got %s, want \"int\"", s2.String())
+	}
+}

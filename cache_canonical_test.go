@@ -2,6 +2,7 @@ package avro_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/twmb/avro"
@@ -570,5 +571,73 @@ func TestRegression_SchemaCacheCrossNamespaceSplice(t *testing.T) {
 				t.Errorf("Parse(cache.Canonical()) FAILS: %v\n  %s", err, viaCache.Canonical())
 			}
 		})
+	}
+}
+
+// A cross-parse reference spelled as a props-carrying wrapped object
+// ({"type":"R","foo":1}) must splice to self-contained metadata like its
+// bare-string and sole-key-wrapped twins: the inherited definition
+// replaces the wrapper at that position and the wrapper's props ride on
+// the emitted definition (props are canonical-stripped, so the schema's
+// identity is unchanged; Java instead DROPS usage-site props at reference
+// sites — Schema.java's textual-reference arms return context.find(...)
+// without a properties pass — so preserving them is the more faithful
+// treatment of accepted input).
+func TestRegression_CacheSpliceWrappedRefProps(t *testing.T) {
+	t.Parallel()
+	def := `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`
+	for name, use := range map[string]string{
+		"field_pos":  `{"type":"R","foo":1}`,
+		"union_pos":  `["null",{"type":"R","foo":1}]`,
+		"items_pos":  `{"type":"array","items":{"type":"R","foo":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var c avro.SchemaCache
+			if _, err := c.Parse(def); err != nil {
+				t.Fatalf("parse def: %v", err)
+			}
+			s, err := c.Parse(`{"type":"record","name":"Top","fields":[{"name":"a","type":` + use + `}]}`)
+			if err != nil {
+				t.Fatalf("parse use: %v", err)
+			}
+			if _, err := avro.Parse(s.String()); err != nil {
+				t.Errorf("String() not self-contained: %v\n%s", err, s.String())
+			}
+			if _, err := avro.Parse(string(s.Canonical())); err != nil {
+				t.Errorf("Canonical() not self-contained: %v\n%s", err, s.Canonical())
+			}
+			if !strings.Contains(s.String(), `"foo":1`) {
+				t.Errorf("wrapper props dropped by the splice: %s", s.String())
+			}
+		})
+	}
+}
+
+// The three reference spellings of the same schema — bare string,
+// sole-key wrapper, and props-carrying wrapper — must produce identical
+// canonical bytes: canonical form strips props and resolves references,
+// so spelling cannot be identity.
+func TestRegression_WrappedRefSpellingsCanonicalInvariant(t *testing.T) {
+	t.Parallel()
+	def := `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`
+	use := func(ref string) string {
+		return `{"type":"record","name":"Top","fields":[{"name":"a","type":` + ref + `}]}`
+	}
+	canonical := func(ref string) string {
+		var c avro.SchemaCache
+		if _, err := c.Parse(def); err != nil {
+			t.Fatalf("parse def: %v", err)
+		}
+		s, err := c.Parse(use(ref))
+		if err != nil {
+			t.Fatalf("parse use %s: %v", ref, err)
+		}
+		return string(s.Canonical())
+	}
+	bare := canonical(`"R"`)
+	sole := canonical(`{"type":"R"}`)
+	props := canonical(`{"type":"R","foo":1}`)
+	if bare != sole || bare != props {
+		t.Errorf("canonical bytes differ across reference spellings:\n bare:  %s\n sole:  %s\n props: %s", bare, sole, props)
 	}
 }

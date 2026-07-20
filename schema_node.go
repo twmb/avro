@@ -75,7 +75,12 @@ type SchemaNode struct {
 
 	// Props holds custom (non-reserved) schema attributes — anything
 	// in the schema JSON that is not a standard Avro field (e.g.
-	// namespace-prefixed metadata like "com.example.tag").
+	// namespace-prefixed metadata like "com.example.tag"). A reserved
+	// structural key whose value does not parse as that key's schema
+	// shape, sitting on a kind that does not bind the key (a stray
+	// "items":3 on an "int"), is inert metadata and is reported here
+	// verbatim; a schema-shaped stray body instead surfaces as-written
+	// on the matching structural field (Items / Values / Fields).
 	//
 	// Values use the natural Go types from JSON: string, bool, nil,
 	// []any, map[string]any, plus int64 for whole numbers and float64
@@ -212,7 +217,7 @@ func (s *Schema) Root() SchemaNode {
 // definition; subsequent occurrences emit the name as a reference.
 func (n *SchemaNode) toJSONDedup(d *deduper) any {
 	b := newWalkBudget()
-	return n.toJSONWalk(d.visited, d, "", 0, &b)
+	return n.toJSONWalk(d.visited, d, "", 0, &b, false)
 }
 
 // jsonSerializableValue returns v with three Avro-JSON-specific shape
@@ -813,7 +818,7 @@ func boundedSerializableValue(d *deduper, depth int, b *walkBudget, v any) any {
 // over-budget rather than a spurious body conflict (asymmetric truncation of n
 // vs prev could otherwise make identical bodies compare unequal).
 func (n *SchemaNode) toJSONShared(b *walkBudget) any {
-	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0, b)
+	return n.toJSONWalk(make(map[*SchemaNode]struct{}), nil, "", 0, b, false)
 }
 
 // toJSONWalk is the cycle-aware walker shared by toJSON and toJSONDedup.
@@ -840,7 +845,19 @@ func (n *SchemaNode) toJSONShared(b *walkBudget) any {
 // so a usable tree is never rejected, and a deeper one stops with a clean
 // error (dedup path) or a truncated subtree Parse then rejects (bare
 // path) instead of crashing.
-func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string, depth int, b *walkBudget) any {
+//
+// stray is true when n was reached through a structural key its parent's
+// kind does not bind (a stray "items" on an "int", surfaced as-written by
+// the metadata walker) — and, transitively, for everything below such a
+// node. The wire parser never binds names at those positions, so the
+// walk renders them verbatim but the dedup consult skips them entirely:
+// no registration, no second-definition→reference rewrite, no conflict
+// comparison. Otherwise a definition-shaped stray body would stand in
+// for (or spuriously conflict with) the real definition of the same
+// fullname, and the rebuilt text would either fail to re-parse (the
+// reference points at a def sitting in a position the re-parse correctly
+// ignores) or silently rewrite the as-written stray content.
+func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, enclosingNS string, depth int, b *walkBudget, stray bool) any {
 	if depth > maxSchemaJSONDepth {
 		d.fail(fmt.Errorf("avro: SchemaNode tree nests deeper than the supported limit (%d)", maxSchemaJSONDepth))
 		return nil
@@ -882,8 +899,10 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		// Keyed on the FULLNAME being expressible, not the short name: an
 		// empty short name with a namespace (fullname "ns.") is a valid
 		// reference target (recursive "ns." types parse), while fullname
-		// "" has no reference spelling and stays the cycle error.
-		if isNamedKind(n.Type) && nodeFullname(n) != "" {
+		// "" has no reference spelling and stays the cycle error. A
+		// stray-reached name is no reference target at all (nothing
+		// registers it), so a stray cycle takes the error path.
+		if isNamedKind(n.Type) && nodeFullname(n) != "" && !stray {
 			return nodeFullname(n)
 		}
 		if d != nil && d.err == nil {
@@ -906,7 +925,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// short name re-binds in-scope — the same inherent reference
 	// ambiguity Java's getQualified/Names.get pair has; references have
 	// no "namespace":"" escape syntax.)
-	if d != nil && isNamedKind(n.Type) && nodeFullname(n) != "" {
+	if d != nil && !stray && isNamedKind(n.Type) && nodeFullname(n) != "" {
 		if prev, exists := d.defined[nodeFullname(n)]; exists {
 			// A repeated fullname becomes a bare name reference. Marshal-
 			// compare the bodies only when the two are DISTINCT nodes (a
@@ -948,20 +967,26 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 
 	switch n.Type {
 	case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
-		if n.LogicalType == "" && len(n.Props) == 0 {
+		// Bare-string emission requires STRUCTURAL emptiness too: a
+		// stray-surfaced Items/Values/Fields on a primitive is part of
+		// the as-written image and must survive the rebuild, so such a
+		// node takes the object render regardless of props.
+		if n.LogicalType == "" && len(n.Props) == 0 &&
+			n.Items == nil && n.Values == nil && len(n.Fields) == 0 {
 			return n.Type
 		}
 	case "union":
 		branches := make([]any, len(n.Branches))
 		for i := range n.Branches {
-			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1, b)
+			branches[i] = n.Branches[i].toJSONWalk(visited, d, childNS, depth+1, b, stray)
 		}
 		return branches
 	}
 
 	if n.Name == "" && n.Type != "array" && n.Type != "map" &&
 		!isNamedKind(n.Type) &&
-		n.Type != "union" && n.LogicalType == "" && len(n.Props) == 0 {
+		n.Type != "union" && n.LogicalType == "" && len(n.Props) == 0 &&
+		n.Items == nil && n.Values == nil && len(n.Fields) == 0 {
 		return n.Type
 	}
 
@@ -969,10 +994,12 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// conflict check. Store the node, not its marshaled body — marshaling
 	// every named type eagerly is O(depth*subtree) on nested schemas, and
 	// the body is only needed if a duplicate fullname actually appears.
-	if d != nil {
+	if d != nil && !stray {
 		// Fullname-keyed like the duplicate check above: fullname "" has
 		// no reference spelling, so it stays un-deduped (inline is its
-		// only representation).
+		// only representation). Stray-reached names register nothing —
+		// the wire parser does not bind them, so they can neither be
+		// referenced nor conflicted with.
 		if isNamedKind(n.Type) && nodeFullname(n) != "" {
 			d.defined[nodeFullname(n)] = n
 		}
@@ -1046,20 +1073,21 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		m["symbols"] = b.emitStrings(d, n.Symbols)
 	}
 	if n.Items != nil {
-		m["items"] = n.Items.toJSONWalk(visited, d, childNS, depth+1, b)
+		m["items"] = n.Items.toJSONWalk(visited, d, childNS, depth+1, b, stray || n.Type != "array")
 	}
 	if n.Values != nil {
-		m["values"] = n.Values.toJSONWalk(visited, d, childNS, depth+1, b)
+		m["values"] = n.Values.toJSONWalk(visited, d, childNS, depth+1, b, stray || n.Type != "map")
 	}
 	// record.fields is a required attribute per the Avro spec (Complex
 	// Types > Records: "fields: a JSON array, listing fields (required)"),
 	// always emit for record/error types even when empty.
 	if isRecordKind(n.Type) || len(n.Fields) > 0 {
+		fieldStray := stray || !isRecordKind(n.Type)
 		fields := make([]map[string]any, len(n.Fields))
 		for i, f := range n.Fields {
 			fd := map[string]any{
 				"name": b.emitString(d, f.Name),
-				"type": f.Type.toJSONWalk(visited, d, childNS, depth+1, b),
+				"type": f.Type.toJSONWalk(visited, d, childNS, depth+1, b, fieldStray),
 			}
 			if f.HasDefault || f.Default != nil {
 				// jsonSerializableValue converts ±Inf — which a Root()
@@ -1895,10 +1923,12 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 	// lifted) come from walkNodeChildren, so the child set, the lift
 	// decision and key routing (the wire parser's own flatFieldNeedsLift /
 	// flatLiftTypeMap), and each child's namespace scope cannot drift from
-	// the wire parser or the SchemaCache walkers. A field with no type key
-	// never parses (the build rejects a nil field type), so every
-	// parseable field fires exactly one callback and no pre-sized zero
-	// SchemaField is left behind.
+	// the wire parser or the SchemaCache walkers. At a BOUND position a
+	// field with no type key never parses (the record build rejects a nil
+	// field type) — but inside a STRAY "fields" the record build never
+	// runs, so a typeless element is parseable and fires fieldNoType
+	// below; every element therefore fires exactly one callback and no
+	// pre-sized zero SchemaField is left behind.
 	//
 	// strayKeys: this walker alone also enumerates container keys the
 	// node's kind does not bind — a stray "items" on an "int" — because
@@ -1914,6 +1944,13 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 		fields: func(arr []any) { n.Fields = make([]SchemaField, len(arr)) },
 		field: func(i int, fm map[string]any, typeKey, scope string) {
 			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope), nil)
+		},
+		fieldNoType: func(i int, fm map[string]any) {
+			// Typeless element inside a stray "fields": surface the
+			// written attributes (name / doc / aliases / order / default
+			// / props) on the field with a zero Type — as-written, never
+			// a fabricated zero element.
+			n.Fields[i] = metadataField(fm, SchemaNode{}, nil)
 		},
 		flatField: func(i int, fm map[string]any, kind, scope string) {
 			// Flat (goavro-style) field format: the wire parser lifts
@@ -1945,7 +1982,7 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 	// precision/scale are reserved only when consumed by a recognized
 	// decimal carrier above).
 	for k, v := range m {
-		if schemaReservedKeyForObject(k, n.Type, n.LogicalType) {
+		if schemaReservedKeyForObject(k, v, n.Type, n.LogicalType) {
 			continue
 		}
 		if n.Props == nil {
@@ -2038,9 +2075,24 @@ func decimalConsumesPrecisionScale(typ, logical string) bool {
 // Shared by the wire parser's extra-property routing (aobjectFromMap) and
 // the metadata tree (nodeFromJSONObject) so the two Props surfaces cannot
 // drift.
-func schemaReservedKeyForObject(k, typ, logical string) bool {
+// schemaReservedKeyForObject reports whether key k (value v) on a node of
+// the given kind/logical is consumed or structurally surfaced — and so
+// kept OUT of Props. precision/scale are reserved only on a recognized
+// decimal carrier. A structural/naming key on a kind that does not bind
+// it, holding a body that does not parse as the key's schema shape, is
+// inert metadata with no possible binding reading: it stays a custom
+// property, surfaced verbatim (the route unconsumed precision/scale
+// already take). Shape-OK strays remain reserved — the metadata walker
+// surfaces them as-written on the matching structural field.
+func schemaReservedKeyForObject(k string, v any, typ, logical string) bool {
 	if strings.EqualFold(k, "precision") || strings.EqualFold(k, "scale") {
 		return decimalConsumesPrecisionScale(typ, logical)
 	}
-	return schemaReservedKeyCI(k)
+	if !schemaReservedKeyCI(k) {
+		return false
+	}
+	if key := canonicalStrayKey(k); key != "" && !strayKeyBinds(typ, key) && !strayBodyShapeOK(key, v) {
+		return false
+	}
+	return true
 }
