@@ -4869,3 +4869,34 @@ normalizeSchemaScope, addTypeAliases with their own gates;
 collectNamedTypes gated this round; coerceTreeDefaults and the
 toJSONWalk emitter un-gated by design with the structural reason);
 FIX.md item 3 gained the caller-set sweep-scope rule.
+
+## Distillation archive (2026-07-19) — framework rules minted from the stray-key round
+
+Two rules landed with the round's docs, each citing the round's finding
+as its instance:
+
+1. FIX.md item 15 is now BOTH-DIRECTIONS. The existing direction: a new
+surface over a shared representation crosses every documented invariant.
+The mirror: a fix that MINTS a new invariant/posture about a shared
+representation must, in the SAME round, sweep every EXISTING consumer of
+that representation against it, landing a per-consumer table — conforms
+(named cell/pin) or different-by-design (with the pin that locks the
+asymmetry). Instance: the kind-keyed descent gate was adjudicated for
+the SchemaFor composition walkers with a matrix over those walkers only;
+no rule propagated it to the other consumers of the same raw-JSON child
+enumeration, so walkNodeChildren's cache callers and collectNamedTypes
+kept consuming stray positions for two more generations. The
+walkNodeChildren caller table (kept current in AUDIT_PATTERNS B7) is the
+rule's first execution.
+
+2. AUDIT_CORE §Feedback loop gains the census back-fill rule: when a
+round adjudicates a NEW posture family, the adjudicating round's ledger
+line names every existing census/matrix whose axis the family extends,
+and those rows are back-filled THEN — a census's rows freeze at its
+creation date, so every posture adjudicated later is invisible to it
+unless explicitly folded in. Instance: the FEATURE × WALKER census
+predated the stray-key family's adjudication (NOT_BUGS #63), so the
+exact net built to catch cache-walker divergence had no stray-key rows
+and the un-gated descent survived two generations of green census runs.
+This round's back-fill is TestMatrix_CacheStrayStructuralKey plus the
+census-header routing that sends the family's future rows there.
