@@ -481,7 +481,11 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 						if strings.EqualFold(k, "type") {
 							continue
 						}
-						if schemaReservedKeyForObject(k, wv, defTyp, defLogical) {
+						// The wrapper's props are a flat key set (never a
+						// nested-stray schema), so no recorded verdict is
+						// needed and no re-decode compounds: a nil verdict
+						// resolves each key with a fresh single shape check.
+						if schemaReservedKeyForObject(k, wv, defTyp, defLogical, nil) {
 							continue
 						}
 						if _, exists := lookupCI(def, k); exists {

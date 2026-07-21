@@ -321,6 +321,47 @@ func TestDoSBattery_C1_DeepNesting(t *testing.T) {
 		_, err := s.DecodeSingleObject(soeDeep, &n)
 		return err
 	})
+
+	// A reserved structural key on a kind that does not bind it (a stray
+	// "items"/"values"/"fields" on an "int") is inert metadata the parser
+	// ACCEPTS, so it never reaches the bracket-depth reject above — but it is
+	// still decoded to decide whether it surfaces as-written or rides in
+	// Props. That decode must happen ONCE per level; a routing pass that
+	// re-decodes it re-enters the recursive schema decode, and two decodes per
+	// level compound to O(2^depth) — a sub-KB stray schema that hangs Parse.
+	// The bracket-depth arms above use the BINDING form (array/items), which
+	// never routes a stray, so they cannot see this; these arms exercise the
+	// stray form at every parse entry point and the metadata rebuild. Depth
+	// 1000 stays under the bracket pre-scan for all three keys (fields nests 3
+	// brackets/level); the bound is far above the linear cost (single-digit ms)
+	// and far below the exponential (unbounded) and quadratic (multi-hundred-ms
+	// at this depth) it exists to catch.
+	const strayDepth = 1000
+	for _, key := range []string{"items", "values", "fields"} {
+		open, closeStr := `{"type":"int","`+key+`":`, `}`
+		if key == "fields" {
+			open, closeStr = `{"type":"int","fields":[{"name":"f","type":`, `}]}`
+		}
+		straySchema := strings.Repeat(open, strayDepth) + `"int"` + strings.Repeat(closeStr, strayDepth)
+		wantAcceptUnder(t, "Parse/nested-stray-"+key, 300*time.Millisecond, func() error {
+			_, err := Parse(straySchema)
+			return err
+		})
+		wantAcceptUnder(t, "SchemaCache.Parse/nested-stray-"+key, 300*time.Millisecond, func() error {
+			var c SchemaCache
+			_, err := c.Parse(straySchema)
+			return err
+		})
+		wantAcceptUnder(t, "Root().Schema()/nested-stray-"+key, 300*time.Millisecond, func() error {
+			ss, err := Parse(straySchema)
+			if err != nil {
+				return err
+			}
+			root := ss.Root()
+			_, err = root.Schema()
+			return err
+		})
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////////

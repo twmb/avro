@@ -255,3 +255,139 @@ func TestRegression_FieldNameErrorEchoBounded(t *testing.T) {
 		assertBounded(t, err)
 	})
 }
+
+// nestStrayContainer builds a stray-container-key chain d levels deep on a
+// non-binding kind ("int"). key is one of the recursive stray-routed keys:
+// "items"/"values" wrap a schema, "fields" wraps a one-field record shape.
+// Every level's key is a stray (int binds none of them), so the whole input
+// is accepted as inert metadata — and each level's body is a valid schema
+// shape, so the parser and the Root() metadata walker both descend it.
+func nestStrayContainer(key string, d int) string {
+	open, closeStr := `{"type":"int","`+key+`":`, `}`
+	if key == "fields" {
+		open, closeStr = `{"type":"int","fields":[{"name":"f","type":`, `}]}`
+	}
+	var sb strings.Builder
+	for range d {
+		sb.WriteString(open)
+	}
+	sb.WriteString(`"int"`)
+	for range d {
+		sb.WriteString(closeStr)
+	}
+	return sb.String()
+}
+
+func bestOfDuration(n int, fn func()) time.Duration {
+	best := time.Duration(1) << 62
+	for range n {
+		t0 := time.Now()
+		fn()
+		if d := time.Since(t0); d < best {
+			best = d
+		}
+	}
+	return best
+}
+
+// A reserved structural/naming key on a kind that does not bind it (a stray
+// "items" on an "int") is decoded once by the parser's arm to decide whether
+// it surfaces as-written or rides in Props. That decode must not be repeated:
+// the props-routing loop and the Root() metadata walk each ROUTE the same
+// bodies, and a second decode re-enters the recursive schema decode, so two
+// decodes per level compound to O(2^depth) over a nested-stray schema — a
+// sub-KB input that hangs Parse for seconds. This pins BOTH the parse path
+// (every string entry point) and the Root().Schema() rebuild to linear cost:
+// an absolute sub-KB ceiling on each entry point (a doubling regression blows
+// it by orders of magnitude at this depth), plus a growth-shape assertion
+// (doubling the depth may only ~double the time) that catches a superlinear
+// regression a fast machine would otherwise sail past under the ceiling.
+func TestRegression_NestedStrayContainerKeyLinearCost(t *testing.T) {
+	t.Parallel()
+
+	// Sub-KB ceiling at every parse entry point + the metadata rebuild, for
+	// each recursive stray-routed key. At depth 20 the pre-fix exponential
+	// cost was multiple SECONDS on this <1KB input; linear cost is
+	// microseconds, so a generous 100ms ceiling catches any doubling
+	// regression by orders of magnitude.
+	const ceilDepth = 20
+	ceiling := raceRelaxed(100 * time.Millisecond)
+	for _, key := range []string{"items", "values", "fields"} {
+		schema := nestStrayContainer(key, ceilDepth)
+		if len(schema) >= 1024 {
+			t.Fatalf("%s depth %d schema is %d bytes, not sub-KB", key, ceilDepth, len(schema))
+		}
+		entryPoints := []struct {
+			name string
+			run  func()
+		}{
+			{"Parse", func() {
+				if _, err := avro.Parse(schema); err != nil {
+					t.Errorf("Parse(%s): %v", key, err)
+				}
+			}},
+			{"MustParse", func() { _ = avro.MustParse(schema) }},
+			{"SchemaCache.Parse", func() {
+				var c avro.SchemaCache
+				if _, err := c.Parse(schema); err != nil {
+					t.Errorf("SchemaCache.Parse(%s): %v", key, err)
+				}
+			}},
+			{"Root().Schema()", func() {
+				s := avro.MustParse(schema)
+				root := s.Root()
+				if _, err := root.Schema(); err != nil {
+					t.Errorf("Root().Schema()(%s): %v", key, err)
+				}
+			}},
+		}
+		for _, ep := range entryPoints {
+			t0 := time.Now()
+			ep.run()
+			if d := time.Since(t0); d > ceiling {
+				t.Errorf("%s of a %d-deep stray %q schema (%d bytes) took %v; want <%v (exponential re-decode regression?)",
+					ep.name, ceilDepth, key, len(schema), d, ceiling)
+			}
+		}
+	}
+
+	// Growth shape: doubling the depth must ~double the time (linear), not
+	// square or explode it. Measured at ms scale (best-of-N minimum, so a
+	// scheduler hiccup on one sample doesn't skew the ratio) where the signal
+	// is clean. The pre-fix exponential blows this ratio to astronomical; a
+	// quadratic regression (the metadata walker re-validating each subtree per
+	// enclosing level) lands near 4. Skipped under -race: instrumentation
+	// distorts the ratio, and the absolute ceilings above still catch the
+	// exponential there.
+	if raceEnabled {
+		return
+	}
+	// Deep enough that fixed per-call overhead does not dilute the growth
+	// signal: a linear impl lands near 2, a quadratic one near 4, so the 3.0
+	// bound separates them with margin on both sides.
+	const dLo, dHi = 400, 800
+	// Warm caches/JIT-like effects out.
+	for range 20 {
+		s := avro.MustParse(nestStrayContainer("items", dLo))
+		r := s.Root()
+		_, _ = r.Schema()
+	}
+	sLo, sHi := nestStrayContainer("items", dLo), nestStrayContainer("items", dHi)
+	assertLinear := func(name string, lo, hi func(string)) {
+		tLo := bestOfDuration(25, func() { lo(sLo) })
+		tHi := bestOfDuration(25, func() { hi(sHi) })
+		if ratio := float64(tHi) / float64(tLo); ratio > 3.0 {
+			t.Errorf("%s: depth %d took %v, depth %d took %v — ratio %.2f > 3.0 for a 2x depth increase (superlinear regression)",
+				name, dLo, tLo, dHi, tHi, ratio)
+		}
+	}
+	assertLinear("Parse",
+		func(s string) { _, _ = avro.Parse(s) },
+		func(s string) { _, _ = avro.Parse(s) })
+	rootSchema := func(s string) {
+		sc := avro.MustParse(s)
+		r := sc.Root()
+		_, _ = r.Schema()
+	}
+	assertLinear("Root().Schema()", rootSchema, rootSchema)
+}

@@ -115,6 +115,14 @@ type nodeChildVisitor struct {
 	// change that gates the metadata walker too breaks the surfacing
 	// contract.
 	strayKeys bool
+
+	// strayShapeMemo, when set, memoizes the stray-body shape checks below
+	// by subtree pointer across a whole walk, so a nested-stray schema is
+	// validated once (linear) instead of once per enclosing level
+	// (O(depth^2)). The metadata walker sets it (one memo per Root() call);
+	// a nil memo takes the plain per-call check. Only consulted when
+	// strayKeys is set, so non-stray walkers never touch it.
+	strayShapeMemo strayShapeMemo
 }
 
 // walkNodeChildren enumerates the child-schema positions of the raw-JSON
@@ -149,7 +157,7 @@ func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor
 	}
 	if vis.fields != nil || vis.field != nil || vis.flatField != nil {
 		if fk, ok := ciKey(v, "fields"); ok &&
-			(isRecordKind(typ) || (vis.strayKeys && strayBodyShapeOK("fields", v[fk]))) {
+			(isRecordKind(typ) || (vis.strayKeys && strayBodyShapeOKMemo(vis.strayShapeMemo, "fields", v[fk]))) {
 			if arr, ok := v[fk].([]any); ok {
 				if vis.fields != nil {
 					vis.fields(arr)
@@ -189,13 +197,13 @@ func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor
 	}
 	if vis.items != nil {
 		if key, ok := ciKey(v, "items"); ok &&
-			(typ == "array" || (vis.strayKeys && strayBodyShapeOK("items", v[key]))) {
+			(typ == "array" || (vis.strayKeys && strayBodyShapeOKMemo(vis.strayShapeMemo, "items", v[key]))) {
 			vis.items(key, childNS)
 		}
 	}
 	if vis.values != nil {
 		if key, ok := ciKey(v, "values"); ok &&
-			(typ == "map" || (vis.strayKeys && strayBodyShapeOK("values", v[key]))) {
+			(typ == "map" || (vis.strayKeys && strayBodyShapeOKMemo(vis.strayShapeMemo, "values", v[key]))) {
 			vis.values(key, childNS)
 		}
 	}

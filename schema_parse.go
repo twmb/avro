@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 )
 
@@ -37,7 +38,7 @@ func parseSchemaTree(schema string) (*aschema, error) {
 		return nil, errors.New("invalid schema: unexpected trailing content")
 	}
 	var s aschema
-	if err := aschemaFromAny(v, &s); err != nil {
+	if err := aschemaFromAny(v, &s, nil); err != nil {
 		return nil, err
 	}
 	return &s, nil
@@ -47,7 +48,7 @@ func parseSchemaTree(schema string) (*aschema, error) {
 // primitive / name reference, an array is a union, an object is a complex
 // type. Mirrors the dispatch the former aschema.UnmarshalJSON did on the
 // first byte.
-func aschemaFromAny(v any, s *aschema) error {
+func aschemaFromAny(v any, s *aschema, memo strayShapeMemo) error {
 	switch t := v.(type) {
 	case string:
 		s.primitive = t
@@ -55,13 +56,13 @@ func aschemaFromAny(v any, s *aschema) error {
 	case []any:
 		s.union = make([]aschema, len(t))
 		for i := range t {
-			if err := aschemaFromAny(t[i], &s.union[i]); err != nil {
+			if err := aschemaFromAny(t[i], &s.union[i], memo); err != nil {
 				return err
 			}
 		}
 		return nil
 	case map[string]any:
-		o, err := aobjectFromMap(t)
+		o, err := aobjectFromMap(t, memo)
 		if err != nil {
 			return err
 		}
@@ -79,8 +80,26 @@ func schemaTypeMismatch(key, want string) error {
 	return fmt.Errorf("invalid schema: %q must be a JSON %s", key, want)
 }
 
-func aobjectFromMap(m map[string]any) (*aobject, error) {
-	o := &aobject{}
+func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err error) {
+	// memo is set ONLY on the metadata walker's stray-shape validity path
+	// (strayBodyShapeOKMemo), never on a real parse. There the caller
+	// discards the built aobject and only reads whether this subtree is a
+	// valid schema shape, so a subtree already validated returns its cached
+	// verdict without the O(subtree) rebuild — turning the walker's repeated
+	// per-ancestor-level checks over a nested schema from O(depth^2) back
+	// into one linear pass. The verdict is recorded by this same decode, so
+	// it is identical to a fresh strayBodyShapeOK.
+	if memo != nil {
+		p := reflect.ValueOf(m).Pointer()
+		if valid, ok := memo[p]; ok {
+			if valid {
+				return &aobject{}, nil
+			}
+			return nil, errStrayShapeCached
+		}
+		defer func() { memo[p] = err == nil }()
+	}
+	o = &aobject{}
 
 	if v, ok := lookupCI(m, "type"); ok {
 		ts, ok := v.(string)
@@ -99,9 +118,11 @@ func aobjectFromMap(m map[string]any) (*aobject, error) {
 	// Schema.java:175-176) and fastavro take. A shape-OK body still
 	// parses into the aobject field even on a non-binding kind (the
 	// documented as-written structural surfacing).
+	nameIsString := false
 	if v, ok := lookupCI(m, "name"); ok {
 		if ns, ok := v.(string); ok {
 			o.Name = ns
+			nameIsString = true
 		} else if strayKeyBinds(o.Type, "name") {
 			return nil, schemaTypeMismatch("name", "string")
 		}
@@ -129,7 +150,7 @@ func aobjectFromMap(m map[string]any) (*aobject, error) {
 	}
 	if v, ok := lookupCI(m, "items"); ok {
 		it := &aschema{}
-		if err := aschemaFromAny(v, it); err != nil {
+		if err := aschemaFromAny(v, it, memo); err != nil {
 			if strayKeyBinds(o.Type, "items") {
 				return nil, err
 			}
@@ -139,7 +160,7 @@ func aobjectFromMap(m map[string]any) (*aobject, error) {
 	}
 	if v, ok := lookupCI(m, "values"); ok {
 		vs := &aschema{}
-		if err := aschemaFromAny(v, vs); err != nil {
+		if err := aschemaFromAny(v, vs, memo); err != nil {
 			if strayKeyBinds(o.Type, "values") {
 				return nil, err
 			}
@@ -195,7 +216,7 @@ func aobjectFromMap(m map[string]any) (*aobject, error) {
 			fields := make([]afield, len(fs))
 			ferr := error(nil)
 			for i := range fs {
-				if err := afieldFromAny(fs[i], &fields[i]); err != nil {
+				if err := afieldFromAny(fs[i], &fields[i], memo); err != nil {
 					ferr = err
 					break
 				}
@@ -217,8 +238,16 @@ func aobjectFromMap(m map[string]any) (*aobject, error) {
 	// decimal carrier (schemaReservedKeyForObject) — these extras feed
 	// node.props, so the CustomType-callback SchemaNode surfaces stray
 	// precision/scale in Props exactly like Root() does.
+	// The stray-body verdict is already recorded: the arms above set
+	// o.Items/o.Values/o.Fields/... exactly when the body parsed as the
+	// key's schema shape, an exact mirror of strayBodyShapeOK. Route on
+	// that recorded verdict so a stray body is decoded ONCE (by its arm),
+	// never a second time here — a second decode re-enters aschemaFromAny,
+	// which routes its own stray keys, so the two decodes per level
+	// compound to O(2^depth) over a nested-stray schema.
+	shapeOK := o.strayShapeRecorded(nameIsString)
 	for k, v := range m {
-		if schemaReservedKeyForObject(k, v, o.Type, o.Logical) {
+		if schemaReservedKeyForObject(k, v, o.Type, o.Logical, shapeOK) {
 			continue
 		}
 		if o.extra == nil {
@@ -229,7 +258,7 @@ func aobjectFromMap(m map[string]any) (*aobject, error) {
 	return o, nil
 }
 
-func afieldFromAny(v any, f *afield) error {
+func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return errors.New("invalid record field: must be a JSON object")
@@ -279,7 +308,7 @@ func afieldFromAny(v any, f *afield) error {
 	}
 	if v, ok := lookupCI(m, "type"); ok {
 		f.Type = &aschema{}
-		if err := aschemaFromAny(v, f.Type); err != nil {
+		if err := aschemaFromAny(v, f.Type, memo); err != nil {
 			return err
 		}
 	}
@@ -361,7 +390,9 @@ func flatLiftTypeMap(m map[string]any, tp string) map[string]any {
 // precision / scale flow into the type object (they are not field-only),
 // so the field-level copies are cleared afterward.
 func (f *afield) liftFlatFieldType(m map[string]any, tp string) error {
-	o, err := aobjectFromMap(flatLiftTypeMap(m, tp))
+	// The lifted type is a freshly constructed map (flatLiftTypeMap), not a
+	// node of the caller's tree, so no shape memo applies — pass nil.
+	o, err := aobjectFromMap(flatLiftTypeMap(m, tp), nil)
 	if err != nil {
 		return err
 	}
@@ -490,7 +521,7 @@ func strayBodyShapeOK(key string, v any) bool {
 		return l.UnmarshalJSON(raw) == nil
 	case "items", "values":
 		var s aschema
-		return aschemaFromAny(v, &s) == nil
+		return aschemaFromAny(v, &s, nil) == nil
 	case "fields":
 		arr, ok := v.([]any)
 		if !ok {
@@ -498,11 +529,103 @@ func strayBodyShapeOK(key string, v any) bool {
 		}
 		for i := range arr {
 			var f afield
-			if afieldFromAny(arr[i], &f) != nil {
+			if afieldFromAny(arr[i], &f, nil) != nil {
 				return false
 			}
 		}
 		return true
 	}
 	return false
+}
+
+// strayShapeMemo caches, by subtree pointer, whether a schema-position
+// subtree parses as a valid schema shape. The metadata walker's stray gates
+// consult a stray body's shape once per node, and a nested-stray schema
+// nests those bodies, so without memoization each body is re-validated once
+// per enclosing level — O(depth^2). One memo shared across a Root() walk
+// makes it linear: the FIRST validation of a subtree records it and every
+// nested subtree it decodes (aobjectFromMap defers the record), so a later
+// level's check of an inner subtree is a cache hit. The recorded verdict is
+// produced by the SAME parser decodes strayBodyShapeOK runs, so it is
+// identical to a fresh check; the map is used only by the metadata walker,
+// and a nil memo (every other caller) takes the un-memoized path.
+type strayShapeMemo map[uintptr]bool
+
+// errStrayShapeCached is the sentinel aobjectFromMap returns for a subtree
+// the memo already recorded as an invalid schema shape. It never escapes
+// the shape-validity path (the only caller that passes a non-nil memo reads
+// only whether the error is nil), so its text is never surfaced.
+var errStrayShapeCached = errors.New("avro: stray shape (cached invalid)")
+
+// strayBodyShapeOKMemo is strayBodyShapeOK with per-subtree memoization for
+// the recursive keys (items/values/fields), whose bodies can nest and so
+// drive the O(depth^2). A miss runs the ordinary decode threaded with the
+// memo (recording this body and every subtree it walks); a later query of
+// an already-walked subtree short-circuits at aobjectFromMap. The
+// non-recursive keys carry no compounding cost and take the plain check.
+func strayBodyShapeOKMemo(memo strayShapeMemo, key string, v any) bool {
+	if memo == nil {
+		return strayBodyShapeOK(key, v)
+	}
+	switch key {
+	case "items", "values":
+		var s aschema
+		return aschemaFromAny(v, &s, memo) == nil
+	case "fields":
+		arr, ok := v.([]any)
+		if !ok {
+			return false
+		}
+		for i := range arr {
+			var f afield
+			if afieldFromAny(arr[i], &f, memo) != nil {
+				return false
+			}
+		}
+		return true
+	default:
+		return strayBodyShapeOK(key, v)
+	}
+}
+
+// strayShapeVerdict reports whether a stray-routed reserved key's body
+// (canonical key spelling, raw value v) parsed as that key's schema shape.
+// A caller that already decoded the body once passes its RECORDED verdict
+// here so the props-routing (schemaReservedKeyForObject) and the metadata
+// child-surfacing never re-decode a subtree the caller already walked —
+// the re-decode is what turns a nested-stray schema into O(2^depth) work.
+type strayShapeVerdict func(canonKey string, v any) bool
+
+// strayShapeRecorded returns the aobject's own arm verdicts as a
+// strayShapeVerdict: a stray-routed body parsed as its schema shape iff the
+// matching arm set the aobject field (o.Items for "items", o.Values for
+// "values", o.Fields for "fields", and so on). The arms run aschemaFromAny/
+// afieldFromAny/the string-slice and laxInt reads — the SAME decodes
+// strayBodyShapeOK runs — so field-set is an exact mirror of the shape
+// check, and consulting it lets the extra-property loop skip a second
+// decode of every already-walked body. nameIsString carries the name arm's
+// string-ness (o.Name is a bare string with no present/absent flag of its
+// own; the empty short name "" is a valid name shape).
+func (o *aobject) strayShapeRecorded(nameIsString bool) strayShapeVerdict {
+	return func(canonKey string, _ any) bool {
+		switch canonKey {
+		case "items":
+			return o.Items != nil
+		case "values":
+			return o.Values != nil
+		case "fields":
+			return o.Fields != nil
+		case "symbols":
+			return o.Symbols != nil
+		case "size":
+			return o.Size != nil
+		case "aliases":
+			return o.Aliases != nil
+		case "namespace":
+			return o.Namespace != nil
+		case "name":
+			return nameIsString
+		}
+		return false
+	}
 }

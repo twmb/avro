@@ -5225,3 +5225,353 @@ Suite + fastavro EXECUTED green (exit 0 from file; the stray
 differential arm runs 0-skip under AVRO_FASTAVRO_PYTHON); FULL -race
 green (exit 0 from file, both packages). Java oracle NOT run (no jar).
 Counter stays ZERO (fix round; rebuild needs two clean bare FULLs).
+
+## Distillation archive (2026-07-20) — CORE size-guard distillation #2 (ledger compression, dd31464 through the 489e8ce-era FIX)
+
+The 2026-07-20 consistency-grid census round opened with the mandated
+CORE distillation (the previous round's ledger entry crossed the ~55KB
+cap). Eight ledger entries — 2026-07-17 dd31464 FULL through the
+2026-07-20 489e8ce-START FIX — compressed to four era lines. The entry
+texts below are the forms replaced, verbatim. The 2026-07-17..19
+entries were themselves once-compressed forms whose longer originals
+live in the 2026-07-19 / 2026-07-20 archive sections above; the two
+2026-07-20 entries are archived in ledger-line form here for the first
+time (their full round narratives are in the two sections immediately
+above).
+
+### Round-ledger entry originals (2026-07-17 · dd31464 through 2026-07-20 · 489e8ce START-head FIX), verbatim
+
+- 2026-07-17 · dd31464 · FULL · quarantine (b2c7601) NOT clean — B36
+  class NEW: 2 FILED · fastavro EXECUTED; -race green; Java NOT run ·
+  counter RESET. Verbatim: archive (2026-07-17, 2026-07-19, 2026-07-20).
+- 2026-07-17 · 6c992b3 (START head) · FIX · both B36 findings FIXED as
+  ruled (canonicalizing copy + kind fixup twins; #69 residuals) · 6 pins
+  + TestMatrix_TreeValueGoTypes · neuter ×3 (B31 extends to neuter runs)
+  · suite + fastavro green · counter ZERO. Verbatim: archive
+  (2026-07-17, 2026-07-19, 2026-07-20).
+- 2026-07-18 · f06bdeb · DEDICATED caller-value census · quarantine NOT
+  clean — 2 FILED, HALTED (render-copy container nil-ness; #69 rationale
+  executed-contradicted) · B36 codified: ~70 cells +
+  FuzzTreeValueTwinParity standing arm, neuter ×2 · suite + fastavro ×2;
+  -race green · counter ZERO. Verbatim: archive (2026-07-18, 2026-07-20).
+- 2026-07-19 · 656d118 (START head) · FIX · both census findings FIXED
+  as ruled: nil-ness preserved at every boundary copy arm
+  (deepCopyJSONTree, canonicalizeTreeValue, snapshotAnyValue);
+  canonicalStringKeyMap drops the string-kind TextMarshaler exclusion ·
+  21 pins red→green + TestMatrix_TreeValueNilEmptyImage +
+  TestMatrix_TreeValueMapKeyShapes · neuter ×2; fuzz nil/empty
+  exclusions LIFTED · #69 rewritten · suite + fastavro green; -race
+  family · counter ZERO. Verbatim: archive (2026-07-19, 2026-07-20).
+- 2026-07-19 · 9f0fb26 · FULL (read-only) · quarantine CLEAN ·
+  behavioral FILED 1: SchemaCache stray-position def poisoning
+  (collectTreeDefs/inlineTreeDefs items/values descents un-gated vs #63;
+  B7 re-open MET) · doc FILED 1 (doc.go omitzero) · clean fronts: atype,
+  soe.go, rabin.go, P18, B27, B20, stray-logicalType · suite ×2 +
+  fastavro green (DoS timing trip TRIAGED as load); Java NOT run; -race
+  NOT run · counter RESET. Verbatim: archive (2026-07-19, 2026-07-20).
+- 2026-07-19 · 9f0fb26 (START head — 9f0fb26..HEAD quarantines the fix
+  commit landed after this line) · FIX · binding-kind gate is
+  walkNodeChildren's DEFAULT (strayKeys opt-in = metadata walker only);
+  collectNamedTypes gains the same gates (name-walk sibling); cache.go
+  inherits · 25 pins red→green + TestMatrix_CacheStrayStructuralKey
+  (census header routes the stray family here); doc.go reword + parity
+  pin; DoS timing pin hardened (best-of-4 serial) · neuter ×4 disjoint
+  grep-confirmed · #63 cache+metadata clause; B7 caller-table lesson;
+  FIX.md item-3 caller-set scope + item-15 BOTH-DIRECTIONS; census
+  back-fill rule minted · suite + fastavro green; FULL -race green; Java
+  NOT run · counter ZERO (rebuild needs two clean bare FULLs; CORE
+  distillation mandated → executed 2026-07-20). Verbatim: archive
+  (2026-07-19, 2026-07-20).
+- 2026-07-20 · 489e8ce · FULL (read-only) · CORE distillation DONE
+  (59.7→52.8KB; 8 ledger lines compressed, divergence policy → NOT_BUGS
+  live copy; originals archived) · quarantine (8d59ca9) NOT clean —
+  FILED: toJSONWalk's dedup consult treats stray descents as schema
+  positions once props/logicalType defeat the primitive leaf shortcut
+  (wire-valid schemas: fabricated "conflicting definitions"; dangling-
+  ref rebuild "unknown type R"; silent def→ref rewrite inside stray
+  bodies), + zero-SchemaField fabrication (typeless stray-fields
+  element drops the written name; the walker comment's "never parses"
+  justification is false under strayKeys), + props-conditional stray
+  survival at rebuild (bare drops, foo:1 keeps) — 5 pins verified-
+  failing (sandbox); the fix's own gates verified consistent (exact-
+  case kind dispatch, parse-before-walk, lookupCI/ciKey lockstep) ·
+  walk FILED: cache splice skips props-carrying wrapped refs
+  ({"type":"R","foo":1} cross-parse → String/Canonical dangling while
+  the bare twin splices; len(v)==1 collapse gate; fix-space
+  constrained — HALT table) + malformed-stray reject divergence
+  (11 reserved-key shapes on primitives reject via kind-blind
+  aobjectFromMap while precision:"abc" accepts; fastavro EXECUTED
+  accepts ×12; Java SCHEMA_RESERVED skips, Schema.java:175-176;
+  twmb-only-strict — HALT table) · #63 refs-keep-props parenthetical
+  executed-contradicted → corrected; B7 re-open #2 (SchemaNode-tree
+  walker caller table incl. the dedup consult) · clean fronts:
+  logical.go (overflow guards + regrouped adjustment math verified;
+  duration = composition-only), errors.go (B20 truncation, #66
+  identity), promote.go (netted twins, bounded prefixes);
+  custom_type.go classified B24-netted (dark-scan filename-mention
+  metric flaw noted) · suite + fastavro EXECUTED green; FULL -race
+  green; Java oracle NOT run (no jar) · counter RESET (behavioral
+  filed).
+- 2026-07-20 · 489e8ce (START head — 489e8ce..HEAD quarantines the fix
+  commit landed after this line) · FIX · all five rulings landed:
+  toJSONWalk threads a stray-position flag (dedup consult skips
+  stray-reached names — no register/rewrite/compare; cycle-arm ref
+  !stray-gated; render verbatim); typeless stray-fields elements
+  surface as-written (fieldNoType; false "never parses" comment
+  scoped); BOTH bare-emission shortcuts require structural emptiness
+  (stray survival at rebuild props-INDEPENDENT, always-preserve —
+  supersedes the prop-less-only "strays die at rebuild" observation);
+  cache splice replaces props-carrying wrapped refs with the def +
+  value-aware props merge (def-wins; Java DROPS usage-site extras
+  Schema.java:1829/:1846 — the anticipated merge premise
+  executed-false; fastavro REJECTS the spelling, executed; reserved
+  wrapper attrs unsurvivable, #25 limit); shape-conditional stray
+  routing (strayKeyBinds + strayBodyShapeOK shared across parser
+  arms / extra→props loops / walker stray arms; malformed bodies on
+  non-binding kinds → Props verbatim incl. precision/scale — the
+  FILED "precision accepts today" premise was executed-false, both
+  families rejected pre-fix; binding/exclusivity/#64/wrapped-ref-
+  schema-shaped rejects pinned unchanged) · pins red 9 pre-fix all
+  green post + TestMatrix_StrayBodyShapeRouting (72 runs, per-cell
+  fastavro arm) + TestMatrix_CacheStrayRebuildSurface (48; carrier-
+  props axis = the B32 back-fill) + schema_for matrix TYPED planting
+  route (48; stale drop-claim comment fixed) · neuter ×5 disjoint,
+  build-executed: N1→53 dedup family, N2→1 element, N3→76
+  props-independence, N4→5 splice, N5→35 routing (precision/scale
+  cells correctly behind the decimal gate) · SchemaNode-tree walker
+  table EXECUTED (13 rows, archive); Branches-on-non-union residual
+  EXECUTED-inert + pinned · FIX.md items 3+15 amended QUESTION-SCOPED
+  REPO-WIDE (representation checklist; three-scope-failure history);
+  #63 shape-conditional + render + splice clauses (+ 07-14 ref-props
+  sentence executed-corrected); #25 splice-attr limit; B7 re-netted;
+  census header routes the new matrices; SchemaNode.Props doc ·
+  suite + fastavro EXECUTED green; FULL -race green; Java NOT run
+  (no jar) · counter stays ZERO (fix round; rebuild needs two clean
+  bare FULLs; next round OPENS with the mandated CORE distillation —
+  this entry crosses the 55KB cap). Narrative: BUG_AUDIT.md archive
+  (2026-07-20).
+
+## Distillation archive (2026-07-20) — consistency-grid census (DEDICATED, read-only, HEAD 7b1b168)
+
+DEDICATED round, streak-neutral. Opened with CORE distillation #2
+(the 489e8ce-FIX ledger line crossed the ~55KB cap): the dd31464 FULL
+through the 489e8ce-START FIX era (8 lines) compressed to 4 era lines;
+originals archived in the "CORE size-guard distillation #2" section
+above. CORE 56→52.6KB pre-ledger-line, 54.6KB after the round's own
+line.
+
+### Quarantine (489e8ce..HEAD = 7b1b168) — NOT clean, 1 DoS FILED
+
+**Finding: `strayBodyShapeOK` re-decode makes Parse O(2^depth) on nested
+stray container keys (DoS).** The quarantine commit 7b1b168 added
+`strayBodyShapeOK` (schema_parse.go:468) and made `schemaReservedKeyForObject`
+value-aware (schema_parse.go:461, schema_node.go:2094) to route malformed
+stray bodies to Props. But at a stray (non-binding) container key, the
+parser's own arm ALREADY decodes the body once (`aschemaFromAny`, the
+`else { o.Items = it }` success branch, schema_parse.go:129), and then the
+extra-props loop calls `schemaReservedKeyForObject` → `strayBodyShapeOK` →
+`aschemaFromAny` a SECOND time on the same subtree. Each `aschemaFromAny`
+re-enters `aobjectFromMap`, which spawns the same two decodes on ITS child.
+So `T(d) = 2·T(d-1)` → `Parse` is O(2^depth) in the stray-nesting depth.
+
+Measured (sandbox, `avro.Parse` on `{"type":"int","items":{...}}` d deep,
+terminating "int"): depth 8 = 1.5ms, 12 = 22ms, 16 = 241ms, 18 = 2.5s,
+20 = 6.5s — a clean 2×/level on a 465-byte input. Sibling sweep: all three
+stray-routed container keys explode (items 2.9s / values 2.9s / fields 6.0s
+at depth 20); the BINDING-form control (`{"type":"array","items":...}` d
+deep, which never consults `strayBodyShapeOK` because array binds items)
+is linear — 0.56ms at depth 20, ~5000× faster. The metadata path shares the
+root cause: `nodeFromJSONObject`'s stray arms + extra loop re-decode via
+`strayBodyShapeOK` (schema_walk.go:152/192/198), so `Root().Schema()` on a
+depth-20 stray took 8.2s.
+
+The pre-scan `checkSchemaNestingDepth` (schema.go:329, cap = 4000 brackets)
+does NOT bound this: the exponential is catastrophic at ~30 nesting levels
+(60 brackets), astronomically below the cap. The schema.go:311 comment
+"Parse itself is O(n)" is now FALSE on the stray form. Pattern-16 class (a
+routing/correctness fix whose new helper introduced its own unbounded cost),
+blind-spot B14. The DoS battery's C1 (`TestDoSBattery_C1_DeepNesting`,
+dos_battery_test.go:197) uses only the binding array/items form → MISSED
+this entry; a fix must add a stray-form arm to the battery (convergence
+"fix the battery too" rule).
+
+Documented-intentional gate: `git log -S 'func strayBodyShapeOK'` and
+`-S 'schemaReservedKeyForObject(k, v,'` → both introduced ONLY in 7b1b168.
+NOT_BUGS grep: #48 is the closest analog but documents a POLYNOMIAL
+(O(depth²), bounded by maxDepth) re-decode as the accepted CustomType-skip
+trade-off; this is EXPONENTIAL and bounded by no maxDepth. Verdict: not
+documented — a new DoS. HALT for adjudication (read-only round). Suggested
+fix (maintainer's call): the parser arm already computes the shape verdict
+(`o.Items` set ⇔ shape-OK), so thread that verdict into the props-routing
+decision instead of re-decoding — restoring linear cost; the metadata
+`walkNodeChildren` gates can consult the same recorded verdict.
+
+Non-finding inspected: the typeless stray-`fields` element rebuild emits
+`{"name":"x","doc":"d","type":""}` — adds a `"type":""` the written element
+lacked. This is consistent with the ruled as-written zero-Type surface
+(`TestRegression_StrayFieldElementSurfacedAsWritten` pins `Type.Type == ""`);
+the rebuild is second-generation stable and wire-inert (the actual type is
+"int"; strays don't touch the codec), and there is no reference to diverge
+from (Java SCHEMA_RESERVED-skips, fastavro ignores). Not a finding.
+
+### Deliverable: the R1 semantic-consistency registry
+
+Landed as AUDIT_PATTERNS.md §Semantic-consistency registry (R1), indexed.
+Eight semantic-question rows (registers/collects names; what a structural
+key binds; namespace scope; surfaces/routes stray content; resolves/splices
+refs; dedup/conflict identity; walk budgets; copies/owns caller storage) ×
+seven representation columns (PARSE / WIRE-WALK / NODE-WALK / RENDER / CACHE /
+SCHEMAFOR / RESOLVE). Every cell carries a code pointer, a posture (✓ conforms
+/ ◆ different-by-design + locking pin / ∅ no-answer + structural reason /
+⚠ drifted), and its net. The enumeration was mechanical (greps recorded in
+the round). The one ⚠ cell is R1-Q7 × {PARSE, WIRE-WALK} = the DoS above,
+the sole un-netted cell. FIX.md items 3 and 15 now point at R1 as the
+pre-enumerated answerer grid (read the row, don't re-derive scope); the B7
+tombstone index folds its representation-checklist prose into a pointer at
+R1. Landing R1 crossed AUDIT_PATTERNS ~150KB (157.9KB) → next round opens
+with the mandated AUDIT_PATTERNS distillation.
+
+Oracles: `go test ./...` + fastavro differential EXECUTED green at round
+start (exit 0 from file; the round made no code changes, only .md edits, so
+the net is unaffected). Java oracle NOT run (no avro-tools jar). -race not
+re-run (no code change). Counter unchanged — DEDICATED/streak-neutral, and
+the DoS is resource-bound (does not reset the behavioral-finding counter).
+
+## Distillation archive (2026-07-21) — AUDIT_PATTERNS size-guard pass
+
+AUDIT_PATTERNS.md crossed its ~150KB soft cap (157,934 bytes) when the R1
+semantic-consistency registry landed. Per the framework rule (crossing a
+bound mandates a distillation pass — archive, never delete), the fattest
+HISTORICAL / already-netted prose below was moved here VERBATIM and replaced
+in AUDIT_PATTERNS.md with a terse pointer back to this section. Nothing was
+dropped: the compressed stubs retain each pattern's bold name, root cause,
+Probe, and pin-test tokens. Three chunks were moved — the Net inventory (N1)
+per-wave calibration prose, and two structural blind-spot instance histories
+(the lenient-walker four-sub-shape narrative and the cyclic-Go-type
+reflect-walk unsafe-compile deep-dive).
+
+### Net inventory (N1) — per-wave prose (lines 94–106), verbatim; compressed to one-line-per-wave in AUDIT_PATTERNS.md
+
+- **Combinatorial matrix (`TestMatrix_*`, matrix_*_test.go)** — ~4,000 cells crossing 29 schema fragments (incl. every logical type, degenerate-cardinality types, boundary values) × 14 composition contexts (record fields at 3 depths, arrays, maps, null-first/null-second/multibranch unions, containers-of-unions) × two-level context pairs × 9 recursive shapes × depths 0/1/3/17 × plain+tagged × typed-struct × promotion-inside-recursion × per-kind defaulted fields × same-token-class tagged unions × SchemaCache cross-parse refs × StructOf-assembled typed struct fields through the unsafe path × 4 positions. Core invariant is calibration-free: the binary decoder's output is the canonical form, and binary re-encode, JSON round-trip, JSON re-encode, `Root().Schema()` rebuild (fingerprint + both wires), and identity-resolve must all land byte-identically. Constraints honored (documented behavior, not gaps): multi-entry maps assert value-equality not byte-identity (Go map iteration order); same-token-class unions round-trip only in tagged form (documented untagged first-match loss); union-padding branches are chosen token-class-distinct.
+
+- **Mutation testing measures the NET, not the code — run it to find assertions the matrix is missing, not bugs.** Gremlins (`go-gremlins`) injects one operator/boundary/arithmetic mutation per build and reports which mutants the suite fails to kill. A SURVIVOR is a line you can break with every test still green — either a missing assertion (real gap → pin it) or an equivalent mutant (no observable behavior change → document, don't pin). Real gaps found were bounds/size-arithmetic edges observable only in a specific runtime state: `boundedRatFromString` decimal-magnitude DoS gate; `deserFixedArray` remaining-capacity bound; OCF `zeroRun` zero-byte-record DoS cap (invertible — the security-relevant one); `appendAvroString`'s AppendText header-growth slow path. All pinned with neuter-proofed regression tests (`TestMatrix_DecimalStringMagnitudeBoundary`, `TestMatrix_MultiBlockIntoFixedArray`, `TestReaderZeroRunCapIndependentOfBlockLength` + `TestWriterBlockFramingContract`, `TestRegression_TextAppenderHeaderGrowth`). Bug density was extreme in `ocf.go` because the package is tested almost entirely through `Encode→Decode` round-trips, which cannot observe block STRUCTURE or a DEFEATED bound. Operational notes (see [[no-local-mutation-testing]]): the stock binary leaks per-mutant toolchain children on timeout and fills disk via `GOTMPDIR` build-temp accumulation — durable fixes are a patched gremlins with process-GROUP kill (`Setpgid` + `cmd.Cancel = kill(-pgid)`) plus a watchdog reaping stale `go-build*` dirs. Deadline calibration is the main distortion: gremlins derives the per-mutant timeout from a WARM baseline, but cache trims force COLD recompiles that blow it, so much of "TIMED OUT" is a harness artifact — trust the confirmed KILLED and LIVED buckets. A SCOPED re-run (one file, `-E`-excluding the rest, timeout-coefficient 40, orphan cleanup) gives 0 false timeouts. Re-run mutation testing after adding new test axes to find what they still miss; treat survivors as the to-pin list, not as bugs.
+
+  The commit-history-derived extension axes (each maps a historical fix CLASS to a generative axis): **CustomType parity** (matrix_custom_test.go); **evolution** (matrix_evolution_test.go — all 8 promotion pairs, field drop/add, reorder, union widening/fail-fast-narrowing, enum reader-default, aliases; `resolveBoth` asserts Resolve ⇔ CheckCompatibility agree; `TestMatrix_PromotionTypedTargets` crosses the pairs PLUS logical-reader promotions (`promotionDeserForLogical`: int→long+timestamp/time-micros, string→bytes+decimal, bytes→string+uuid) × TYPED Go targets (int/uint/float widths, string/[]byte/[N]byte/[16]byte, time.Time, time.Duration, big.Rat, any) × contexts (top, record field, array elem, null-union pointer), asserting verdict+value parity against the natural decode as the independent oracle — reject cells included; neuter-verified on both the value-delegation arm and the logical-wrapper drop); **names** (matrix_names_test.go — namespace inheritance, forward refs at fixup positions, the three documented field-level logicalType lift shapes); **hostile wire** (matrix_hostile_test.go — DETERMINISTIC exhaustive truncation + per-byte corruption, pure no-panic invariant run every execution); **lenient input forms** (matrix_extensions_test.go); **metadata preservation** (through two generations of `Root().Schema()`); **lax names**; **nil-equivalent encode shapes**; and an **SOE round-trip edge inside runCore**. Found on extension: `SchemaNode.Schema()` took no SchemaOpts so lax-named/CustomType schemas couldn't rebuild from metadata — fixed with backward-compatible variadic opts.
+
+  Second-wave axes: **rejection parity** (matrix_reject_test.go — binary and JSON encoders agree on rejection per-kind, decoders agree on mismatched-target reject; two documented leniencies encoded as expectations); **foreign container framing** (matrix_framing_test.go — block-per-item, split blocks, negative-count blocks, overlong varint counts decode to the same value and re-encode canonically); **target reuse** (matrix_reuse_test.go — decode-twice asserting documented stale-key retention, slice/pointer reuse); **typed extras + per-fragment typed containers**; **OCF matrix** (ocf/matrix_ocf_test.go — fragments × deflate/snappy/zstd × multi-block × NewAppendWriter × evolution; codecs never shared writer↔reader because Close closes the codec); **runCore edges**; and the **external-oracle matrix** (matrix_differential_test.go + `rt`/`canonical` ops — every cell's wire decoded AND re-encoded by a real fastavro process byte-identically; fastavro PCF must equal `Canonical()`; fwd-refs excluded as fastavro rejects them). The JAVA twin (`java_matrix_differential_test.go`, cisuite, in the GHA java-differential job) drives the same cells plus all recursion shapes through `SchemaOracle`; Java is the one external oracle accepting forward references. Harness honors: NaN payload bits differ Go vs Python (oracle cells drive non-NaN values); per-build custom-Encode suppression means count configs drive calibrated raw trees.
+
+  Third-wave axes: **schema-ACCEPTANCE parity** (matrix_acceptance_test.go + oracle `parse` op + `TestDifferentialJavaAcceptance` — every cell parses in twmb AND fastavro AND Java, structurally-broken mutants reject in all three; fastavro scoped out of the four classes its parser is lax about; caught twmb accepting a record with NO fields attribute, fixed via `o.Fields == nil` reject mirroring symbols); **the fuzz bridge** (`FuzzMatrixCore` — fuzz input selects a matrix cell and XORs mutations over its valid wire); **second-order CustomType crosses** (matrix_custom_cross_test.go); and the **options cube** (all 8 combinations of TaggedUnions × TagLogicalTypes × LinkedinFloats).
+
+  Fourth-wave axes: **hostile-size rejects** (matrix_hostile_size_test.go — 1 MiB wrong-typed values reject FAST <250ms with BOUNDED error messages <2KB, both wire formats); **logical boundary tables** (matrix_logical_bounds_test.go — time logical extremes round-trip exactly; MaxInt64/MinInt64±1 wires either reject or re-encode byte-identically; silent boundary corruption is the only forbidden outcome); **the concurrency hammer** (matrix_concurrent_test.go — 8 goroutines × all five operations on one shared *Schema, every result byte-compared to single-threaded reference, plus concurrent SchemaCache and concurrent first-use racing lazily-built once-init tables; under `-race`); **the OCF stateful model** (ocf/matrix_stateful_test.go — seeded random programs of Encode / value-error-Encode / raw Write / Flush / Close with a model tracking accepted datums; across NewAppendWriter; I/O-error poisoning stickiness); and the **Java JSON-form differential** (`TestDifferentialJavaJSONForm`, cisuite — twmb's Avro-JSON compared SEMANTICALLY against Java's JsonEncoder; numbers by rational value, strings by codepoints; scoped to non-logical fragments; zero-field record excluded because avro-tools 1.12.0 emits ZERO bytes for an empty record — twmb's `{}` matches fastavro and is the only valid JSON, do not re-flag against Java's empty output).
+
+  Fifth-wave axis: **pointer-indirection depth × container context** (`TestMatrix_GenerativePointerIndirection`, matrix_generative_test.go — pointer-target depth {0, 1, at-cap, past-cap} × context {top, record field, 2-branch null union, 3+-branch union, array, map} × base primitive × binary/JSON encode × {binary,JSON}×{natural,resolved} decode; asserts all six paths agree on accept/reject AGAINST the explicit `maxIndirectDepth` cap — so a reject-everything regression is caught too, not merely mutual agreement — and that an accepted value round-trips to the identical base on every path with pointer wrapping wire-invariant). The codec peels a pointer/interface chain on BOTH encode input and decode target, capped at `maxIndirectDepth`; the recurring bug shape is a context-local peel that RE-INDIRECTS an already-peeled value (a union concrete target indirected at two stages → up to 2×cap; a primitive container element unwrapped one level inline then handed to a full-budget `indirect` → 1+cap), accepting a chain one-or-two-times deeper than every leaf — an encode-produces-unreadable-wire / binary↔JSON divergence invisible to round-trip-from-typed-input (the input never nests past the cap) and to value/wire sweeps (depth carries no wire bytes). Found on landing: `unwrapElemPtr` peeled `1+maxIndirectDepth` for `array<prim>`/`map<prim>` pointer elements, so binary encode of a `[]******int32` / `map[string]******int32` succeeded and emitted a wire its own binary decoder, the JSON encoder, and every other context all refused. The three prior union-pointer fixes (per-branch JSON indirection; *CustomType pointer target across union arity; the 2×cap JSON-union concrete-target cap) dribbled this family one context at a time precisely because no matrix crossed depth × context; this axis now does. (The custom-decode pointer-RESULT sub-family — a `CustomType.Decode` returning `*T` into a reused interface / concrete `*T` field — is a distinct axis pinned by union_custom_pointer_reuse_test.go and the customFrags matrix, not this one.) **This matrix's contexts all encode at TOP LEVEL or as a SCALAR field, so they structurally never reach the unsafe struct-field CONTAINER fast paths** (`tryCompileFieldSer`/`tryCompileFieldDeser`'s `usArrayRecord`→`usArrayPtrRecord`/`udArrayPtrRecord` and `udNullUnionRecord`), which fire only for an array/nullunion-of-record INSIDE a struct field — so the same `1+cap` double-peel (consume the element/optional pointer inline via `goType.Elem()`, then hand the remainder to a full-budget `indirect`/`indirectAlloc`) recurred there, one container arm at a time: a `[]******record` struct field BIN-encoded a wire its own JSON encoder and a top-level encode both refused (`usArrayRecord`, decode twin `udArrayPtrRecord`), and a `******record` `["null",record]` field DECODED one level past the cap where encode — which already declines `**T` to reflect — rejected (`udNullUnionRecord`). The sibling encode field-/array-nullunion arms already declined a multi-pointer element; the record arms had not. Fix: decline a multi-level-pointer element to the reflect path (single budget) at every unsafe container arm, mirroring the nullunion decline; pinned by `TestRegression_ArrayRecordElementPointerChainDepthParity` / `TestRegression_NullUnionRecordFieldPointerChainDepthParity`. Durable net: `TestMatrix_GenerativePointerIndirectionUnsafeContainers` covers the FIELD-OF-CONTAINER cross (field-array / field-nullunion / field-array-nullunion / field-map contexts × int/string/RECORD bases × depths {0,1,2,at-cap,past-cap}), asserting the addressable-*struct (unsafe container arm) and struct-value (reflect) encodes agree with each other, the generic-tree wire, and the explicit cap, and that all four decode paths ({binary,JSON}×{natural,resolved}) into depth-D typed targets agree.
+
+### Structural blind spot "Lenient walker skips a nil child that its strict sibling dereferences" — full four-sub-shape narrative, verbatim
+
+- **Lenient walker skips a nil child that its strict sibling dereferences.** A family of walkers over the same node tree (`walkDefault` driving `validateDefault`/`convertDefaultBytes` vs `encodeDefault`) must agree on nil-child handling. Lenient walkers guard `node == nil`/`child != nil` and SKIP (validating vacuously); the strict walker derefs `node.kind` unguarded → nil-panic at `Parse` on a transiently-nil forward-ref child. Invisible to lenient-walker tests (pass vacuously) and wire round-trip tests (panic at parse, before encode). Probe: for any tree-walk family, list which walkers guard nil children and which deref unguarded — the asymmetry IS the bug; fix is usually ordering (wire all children before the strict walk), not a nil-guard. Four escalating sub-shapes: (1) forward-ref array-items/map-values/nested-record defaults panicked in `encodeDefault` while `validateDefault` skipped — fixed by deferring default resolution+encode to a two-phase finalize. (2) **dual-representation**: forward-ref UNION branches left `node.branches[i]` nil even after finalize because the union fixup patched only the wire fn tables (`m.ser.fns[idx]`/`m.deser.fns[idx]`), never the structure node — binary worked, JSON/`resolveWriterUnion`/`CheckCompatibility`/`firstUnionBranchAcceptingDefault` nil-panicked or mis-rejected. A fixup must update EVERY representation: wire dispatch AND node tree (`branches[idx] = nt.node`). (3) **name-derived artifacts captured at parse time**: dup-detection key, TaggedUnions `branchNames`/`logicalNames`, tagged-map `ser.branchNames` held the unresolved as-written name even after fn-table and node-tree patch → order-dependent dup detection, binary↔JSON-divergent TaggedUnions envelopes, order-dependent tagged-map accept. Fix: `finalizeUnionNames` re-derives dup check + name tables from resolved nodes. (4) **non-nil-but-INCOMPLETE node, and a recursion bound the incompleteness hid**: the deferral DECISION (`nodeAwaitsForwardRef`) treated only a NIL child as not-ready, so a self-/mutual-recursive reference back into a record STILL UNDER CONSTRUCTION (non-nil pointer, partial `fields` slice) was encoded INLINE against the partial node — emitting a default carrying only the fields declared before the current one: silently truncated, non-decodable wire (binary `Encode` auto-fill produced bytes its own `Decode` rejected; `EncodeJSON`/`Resolve` re-encode at runtime against the complete node and were correct, so the divergence is binary-vs-JSON and invisible to round-trip-from-typed-input). Fix: track in-construction records (`b.building`, shared through `nest`) so `nodeAwaitsForwardRef` defers their defaults exactly like a nil forward-ref. But that deferral RELOCATED the encode from the incomplete node — whose missing fields had ACCIDENTALLY BOUNDED the recursion — to the complete node, exposing that `encodeDefault` FILLS absent fields from their own defaults (unlike `validateDefault`, which SKIPS absent fields and so terminated vacuously), so an infinite default (`record R{ R self={} }`, `R{ array<R> kids=[{}] }`) recursed to a Parse-time stack overflow. Second fix: bound `encodeDefault` with the wire codec's `maxDepth` (`encodeDefaultDepth`) → clean errTooDeep parse rejection. Meta-lesson: a deferral that moves an encode from a PARTIAL node to a COMPLETE one can expose recursion the partiality was silently bounding — after any "defer to finalize / re-encode against the resolved node" fix, re-probe the relocated encoder against an infinite-default schema. General rule: enumerate every name-derived artifact a build site computes and either compute from the resolved node or re-derive in finalize. Instances: `encodeDefault` on forward-ref nested-record defaults; `nodeAwaitsForwardRef`'s `b.building` in-construction check + `encodeDefaultDepth` bound on self-/mutual-recursive container defaults.
+
+### Structural blind spot "A reflect Type/Value-graph walk that re-implements indirection without the bound its sibling has — cyclic Go types crash/hang" — full narrative, verbatim
+
+- **A reflect Type/Value-graph walk that re-implements indirection without the bound its sibling has — cyclic Go types crash/hang.** Go permits recursive NON-struct types (`type P *P`, `type S []S`, `type M map[string]M`, and chains that never pass through a named struct) whose reflect type graph is cyclic (`P.Elem() == P`). The codebase bounds the canonical walks — `indirect`/`indirectAlloc` cap pointer/interface unwrap at `maxIndirectDepth`, and `inferRecord` breaks struct cycles by registering `seen[t]` before recursing — but SIBLING walks that re-implement the same traversal omit the bound and run until OOM (an unbounded `for v.Kind()==reflect.Pointer` Value walk) or stack-overflow-the-PROCESS (an unbounded type-graph recursion). The crash is unrecoverable (`recover()` can't catch a stack overflow), and the trigger is CALLER-supplied (a decode target type or a `SchemaFor[T]` field type), not attacker wire — so it's invisible to every wire/value/fuzz net (a byte fuzzer can't synthesize a Go type; the matrix is schema→value, never Go-type→graph) and to round-trip tests (the common recursive STRUCT — linked list / tree — works fine via `seen`, masking the non-struct gap). Probe: enumerate every `for … Kind()==reflect.Pointer` loop and every function that recurses on `reflect.Type.Elem()` / `reflect.Value.Elem()`; for each, ask "does a cyclic type/value reach this, and is it bounded like `indirect`/`inferRecord`?" Pair `type P *P` / `[]S` / `map[string]M` as a decode target AND a `SchemaFor` field type. Sole bounded references to mirror: `indirect`/`indirectAlloc` (`maxIndirectDepth`), `inferRecord`'s `seen[t]`. **The `tryCompileFieldSer`/`tryCompileFieldDeser` UNSAFE-COMPILE pointer arms are part of this family and recurse on `goType.Elem()` at COMPILE time (a once-per-concrete-type build), not per value — so the crash fires on the first `Encode` of a struct whose FIELD type is a cyclic pointer (`struct{ F P }`, `type P *P`), invisible to value fuzzers and to the deser side (`tryCompileFieldDeser` declines all pointers). The encode bound must also MATCH the reflect encoder's accept set, not merely terminate: `indirect` peels `maxIndirectDepth` levels and confirms a non-pointer only on a FOLLOWING iteration, so it accepts `maxIndirectDepth-1` levels — decline the fast path at `levels >= maxIndirectDepth` (not `>`), or the fast path encodes a depth the reflect path and `Decode` reject. The array-element/nullunion arms route through the same pointer arm (bounded transitively) and are otherwise schema-bounded (the finite schema, not the Go type, caps their recursion).** Instance: `setCustomResult` (custom_type.go) walked the decode target's pointer chain unbounded (custom-decode hang/OOM where the non-custom path errored via `indirectAlloc`); `inferType`'s pointer/slice/map arms (schema_for.go) recursed the type graph unbounded (`SchemaFor` process-killing stack overflow); `checkIntDefaultFitsGoKind`'s pointer peel was unbounded; `tryCompileFieldSer`'s Pointer arm (unsafe.go) recursed the field type graph unbounded (cyclic pointer field → fatal stack overflow at first `Encode`; 6+-level chains compiled wire `Decode` rejected). Fixed by `maxIndirectDepth` caps on the pointer walks (the unsafe-compile arm at `levels >= maxIndirectDepth`), a `depth`-param `maxDepth` bound on `inferType` (reset per record-field boundary so distinct nested structs stay bounded by `seen`, not depth). Pinned by `TestRegression_CustomDecodeBoundsRecursivePointerTarget`, `TestRegression_SchemaForRecursiveNonStructTypeErrors`, `TestRegression_SchemaForRecursivePtrDefaultTerminates`, `TestRegression_EncodeStructCyclicPointerFieldTerminates`, `TestRegression_StructFieldPointerChainMatchesReflect` (+ the `TestSchemaForRecursiveStructStillBuilds` / nested-container controls that the bound must NOT false-reject).
+
+## Distillation archive (2026-07-21) — R1-Q7 stray-body re-decode DoS fix (START head 7b1b168)
+
+Maintainer-granted fix for the DoS filed by the 2026-07-20 consistency-grid
+census (R1-Q7's ⚠ cell): `Parse` and `Root().Schema()` were O(2^depth) on a
+nested-stray schema because the stray-body shape check re-decoded a subtree
+the parser had already walked. The ruling: eliminate the re-decode by
+threading the recorded verdict, not bound it; both paths return to linear;
+pins assert the growth SHAPE (not just a wall-clock ceiling); sibling sweep =
+the R1-Q7 registry row; add the stray-form arm to the DoS battery.
+
+### The fix
+
+**Parse (the verdict thread).** The arms of `aobjectFromMap` already decode
+each stray container body once and record the verdict in the aobject
+(`o.Items`/`o.Values`/`o.Fields`/... set iff the body parsed as the key's
+schema shape — an exact mirror of `strayBodyShapeOK`). A new
+`aobject.strayShapeRecorded(nameIsString)` exposes that as a
+`strayShapeVerdict` closure; `schemaReservedKeyForObject` gains a
+`shapeOK strayShapeVerdict` parameter and consults it instead of re-decoding.
+The extra-props loop passes the recorded verdict, so each stray body is
+decoded ONCE. Measured: ratio 2.0 per depth-doubling (linear); depth-24
+465-byte input dropped from 5+ seconds to ~100µs. The name arm gained a
+`nameIsString` flag (o.Name is a bare string with no present/absent bit; the
+empty short name "" is a valid name shape). The cache splice-merge caller
+(`inlineTreeDefs`) passes a nil verdict — its wrapper props are a flat key
+set, never a nested stray, so the nil fallback cannot compound.
+
+**Metadata walk (the memo).** `Root()`→`nodeFromJSONObject`→`walkNodeChildren`
+re-decodes each stray body in its gate to decide surfacing, and a nested-stray
+schema nests those bodies, so even after the Parse fix (which made each decode
+linear) the walk was O(depth^2) — each subtree re-validated once per enclosing
+level. A record-only `strayShapeMemo` (`map[uintptr]bool`, keyed by subtree
+pointer) is threaded through `aschemaFromAny`/`aobjectFromMap`/`afieldFromAny`
+(nil on a real parse — zero behavior change, provable by the nil path being
+the old code); `aobjectFromMap` defers `memo[ptr] = err == nil` and
+short-circuits a cached subtree (returning a discarded empty aobject — safe
+because a non-nil memo reaches the parser ONLY via the metadata gate's
+validity check, which discards the aobject and reads only the error). The gate
+now calls `strayBodyShapeOKMemo(vis.strayShapeMemo, ...)`: the FIRST validation
+of the deepest chain records every subtree it decodes, so every later level is
+a cache hit. `Root()` allocates one memo per call and threads it through
+`nodeFromJSON`/`nodeFromJSONObject`. The metadata extra-loop routes
+items/values/fields on the surfaced `n.Items`/`n.Values`/`n.Fields` (the gate's
+already-computed result), and the non-recursive stray keys (name/namespace/
+symbols/size/aliases) take the plain `strayBodyShapeOK` (no compounding).
+Measured: ratio 2.0 per depth-doubling (linear); Root().Schema() at depth 1600
+dropped from 1.6s (O(depth^2)) to 10ms.
+
+### Pins, neuters, sweep
+
+- `TestRegression_NestedStrayContainerKeyLinearCost` (error_bound_test.go):
+  for each recursive stray-routed key (items/values/fields), a sub-KB (depth
+  20, <1KB) absolute ceiling of raceRelaxed(100ms) at Parse / MustParse /
+  SchemaCache.Parse / Root().Schema(); plus a growth-shape assertion (best-of-N
+  minimum at depths 400/800, ratio < 3.0) skipped under -race. Red-then-green.
+- `TestDoSBattery_C1_DeepNesting` gains the nested-stray arm: depth-1000
+  items/values/fields (under the bracket pre-scan for all three) accepted
+  under 300ms at Parse / SchemaCache.Parse / Root().Schema() — the permanent
+  R1-Q7 net (the pre-existing C1 arms used only the BINDING array/items form,
+  which never routes a stray, and so could not see this class).
+- Neuter ×2, build-executed: (1) revert the Parse verdict thread (route via
+  the nil fallback) → the pin's depth-100 warmup hangs, 90s timeout
+  (exponential reproduced); (2) drop the metadata memo (Root passes nil) →
+  Parse stays green but Root().Schema()'s shape assert reds at ratio 4.14 > 3.0
+  (quadratic reproduced). Both restored exactly.
+- Sibling sweep = a read of the R1-Q7 row across the seven representation
+  columns: PARSE (verdict-threaded), metadata WIRE-WALK gate (memoized) +
+  extra-loop (surfaced-node verdict), cache WIRE-WALK collect/inline
+  (strayKeys=false, never route a stray — structurally exempt), CACHE
+  splice-merge (nil verdict on flat props), SchemaFor (NO stray-shape call at
+  all — grep of schema_for.go for strayBodyShapeOK/schemaReservedKeyForObject/
+  walkNodeChildren is empty; composition passes structural keys through
+  untouched per #63), NODE-WALK/RENDER/RESOLVE (do not call the shape check).
+
+### Re-audit of the patched functions
+
+The memo cache-hit in `aobjectFromMap` returns a fresh empty `&aobject{}` — a
+correctness hazard only if a caller consumed it as a parsed schema. It cannot:
+`memo` is non-nil ONLY on the metadata gate's validity path
+(`strayBodyShapeOKMemo` → `aschemaFromAny(v, &s, memo)`), which discards `s`
+and reads only whether the error is nil, and the internal recursion (items/
+values/fields arms) likewise builds into that discarded aobject. `nodeFromJSON`
+threads the memo but builds SchemaNodes (never calls the parser), so the memo
+reaches the parser only through the gate. The verdict recorded is produced by
+the SAME decode `strayBodyShapeOK` runs, so a memoized verdict is identical to
+a fresh one — the full suite's stray-routing matrices
+(TestMatrix_StrayBodyShapeRouting, TestMatrix_CacheStrayRebuildSurface,
+TestRegression_StrayFieldElementSurfacedAsWritten, ...) pass unchanged,
+confirming behavior preservation.
+
+NOT_BUGS #48 gains the boundary clause: an accepted re-decode is FAITHFUL
+(re-attempts each level in a legitimately-changing context) and BOUNDED (by
+maxDepth); a redundant one (the verdict was already computed) or an unbounded
+one is a bug — do not cite #48 to excuse it.
+
+Oracles: `go test ./...` + the fastavro differential EXECUTED green (exit 0,
+both packages); -race green on the new pin + the stray/cache family (the memo
+is per-Root()-call, no shared state). Java oracle NOT run (no jar). The counter
+stays ZERO — this fixes a resource-bound DoS, which does not gate the
+behavioral-finding streak; the walk rebuild still needs two consecutive clean
+bare FULLs.

@@ -207,7 +207,11 @@ func (s *Schema) Root() SchemaNode {
 	if err != nil {
 		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
 	}
-	n := nodeFromJSON(raw, "")
+	// One shape memo for the whole walk: the stray gates validate a stray
+	// body's schema shape once per node, and a nested-stray schema nests
+	// those bodies, so a shared memo keeps the walk linear instead of
+	// re-validating each subtree once per enclosing level.
+	n := nodeFromJSON(raw, "", make(strayShapeMemo))
 	fixupNameRefDefaults(&n)
 	return n
 }
@@ -1132,18 +1136,18 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 // nodeFromJSON converts a parsed JSON value into a SchemaNode. parentNS
 // is the enclosing namespace scope; named types without an explicit
 // "namespace" attribute resolve into it (see [SchemaNode].Namespace).
-func nodeFromJSON(v any, parentNS string) SchemaNode {
+func nodeFromJSON(v any, parentNS string, memo strayShapeMemo) SchemaNode {
 	switch s := v.(type) {
 	case string:
 		return SchemaNode{Type: s}
 	case []any:
 		branches := make([]SchemaNode, len(s))
 		for i, b := range s {
-			branches[i] = nodeFromJSON(b, parentNS)
+			branches[i] = nodeFromJSON(b, parentNS, memo)
 		}
 		return SchemaNode{Type: "union", Branches: branches}
 	case map[string]any:
-		return nodeFromJSONObject(s, parentNS)
+		return nodeFromJSONObject(s, parentNS, memo)
 	default:
 		return SchemaNode{}
 	}
@@ -1863,7 +1867,7 @@ func firstMetadataBranchAcceptingDefault(t *SchemaNode, val any, table map[strin
 	return nil
 }
 
-func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
+func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) SchemaNode {
 	n := SchemaNode{}
 
 	getCIString(m, "type", &n.Type)
@@ -1940,10 +1944,11 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 	// (see nodeChildVisitor.strayKeys and
 	// TestRegression_MetadataStrayKeySurfacedAsWritten).
 	walkNodeChildren(m, parentNS, childNS, nodeChildVisitor{
-		strayKeys: true,
-		fields: func(arr []any) { n.Fields = make([]SchemaField, len(arr)) },
+		strayKeys:      true,
+		strayShapeMemo: memo,
+		fields:         func(arr []any) { n.Fields = make([]SchemaField, len(arr)) },
 		field: func(i int, fm map[string]any, typeKey, scope string) {
-			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope), nil)
+			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope, memo), nil)
 		},
 		fieldNoType: func(i int, fm map[string]any) {
 			// Typeless element inside a stray "fields": surface the
@@ -1966,23 +1971,40 @@ func nodeFromJSONObject(m map[string]any, parentNS string) SchemaNode {
 			// lifted named type is invisible to name-reference default
 			// coercion (collectNamedTypes keys on Name).
 			flatType := flatLiftTypeMap(fm, kind)
-			n.Fields[i] = metadataField(fm, nodeFromJSONObject(flatType, scope), flatType)
+			n.Fields[i] = metadataField(fm, nodeFromJSONObject(flatType, scope, memo), flatType)
 		},
 		items: func(key, scope string) {
-			node := nodeFromJSON(m[key], scope)
+			node := nodeFromJSON(m[key], scope, memo)
 			n.Items = &node
 		},
 		values: func(key, scope string) {
-			node := nodeFromJSON(m[key], scope)
+			node := nodeFromJSON(m[key], scope, memo)
 			n.Values = &node
 		},
 	})
 
 	// Collect custom properties (anything not in the reserved set;
 	// precision/scale are reserved only when consumed by a recognized
-	// decimal carrier above).
+	// decimal carrier above). The recursive container keys already
+	// surfaced: walkNodeChildren set n.Items/n.Values/n.Fields exactly when
+	// the stray body was shape-OK (the same verdict strayBodyShapeOK
+	// computes — the gate that fired each callback IS that check), so route
+	// them on the recorded result instead of decoding the subtree a second
+	// time here. The non-recursive stray keys (name/namespace/symbols/size/
+	// aliases) carry no compounding cost, so a fresh single check is fine.
+	shapeOK := func(canonKey string, v any) bool {
+		switch canonKey {
+		case "items":
+			return n.Items != nil
+		case "values":
+			return n.Values != nil
+		case "fields":
+			return n.Fields != nil
+		}
+		return strayBodyShapeOK(canonKey, v)
+	}
 	for k, v := range m {
-		if schemaReservedKeyForObject(k, v, n.Type, n.LogicalType) {
+		if schemaReservedKeyForObject(k, v, n.Type, n.LogicalType, shapeOK) {
 			continue
 		}
 		if n.Props == nil {
@@ -2084,15 +2106,29 @@ func decimalConsumesPrecisionScale(typ, logical string) bool {
 // property, surfaced verbatim (the route unconsumed precision/scale
 // already take). Shape-OK strays remain reserved — the metadata walker
 // surfaces them as-written on the matching structural field.
-func schemaReservedKeyForObject(k string, v any, typ, logical string) bool {
+//
+// shapeOK answers "did this stray key's body parse as the key's schema
+// shape" from a verdict the caller ALREADY computed — the parser's arms
+// record it in the aobject, the metadata walker records it as it surfaces
+// children. Consulting the recorded verdict is what keeps this routing
+// from re-decoding a subtree the caller already walked: a fresh
+// strayBodyShapeOK here would re-enter aschemaFromAny on the same body,
+// and because that decode itself routes stray keys, the two decodes per
+// level compound to O(2^depth) over a nested-stray schema. A nil shapeOK
+// falls back to a fresh decode, for the one caller (the cache splice
+// merge) that has no recorded verdict and walks no nested strays.
+func schemaReservedKeyForObject(k string, v any, typ, logical string, shapeOK strayShapeVerdict) bool {
 	if strings.EqualFold(k, "precision") || strings.EqualFold(k, "scale") {
 		return decimalConsumesPrecisionScale(typ, logical)
 	}
 	if !schemaReservedKeyCI(k) {
 		return false
 	}
-	if key := canonicalStrayKey(k); key != "" && !strayKeyBinds(typ, key) && !strayBodyShapeOK(key, v) {
-		return false
+	if key := canonicalStrayKey(k); key != "" && !strayKeyBinds(typ, key) {
+		if shapeOK != nil {
+			return shapeOK(key, v)
+		}
+		return strayBodyShapeOK(key, v)
 	}
 	return true
 }
