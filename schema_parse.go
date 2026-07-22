@@ -101,7 +101,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 	}
 	o = &aobject{}
 
-	if v, ok := lookupCI(m, "type"); ok {
+	if v, ok := m["type"]; ok {
 		ts, ok := v.(string)
 		if !ok {
 			return nil, schemaTypeMismatch("type", "string")
@@ -119,7 +119,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 	// parses into the aobject field even on a non-binding kind (the
 	// documented as-written structural surfacing).
 	nameIsString := false
-	if v, ok := lookupCI(m, "name"); ok {
+	if v, ok := m["name"]; ok {
 		if ns, ok := v.(string); ok {
 			o.Name = ns
 			nameIsString = true
@@ -127,7 +127,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			return nil, schemaTypeMismatch("name", "string")
 		}
 	}
-	if v, ok := lookupCI(m, "namespace"); ok {
+	if v, ok := m["namespace"]; ok {
 		if ns, ok := v.(string); ok {
 			o.Namespace = &ns
 		} else if strayKeyBinds(o.Type, "namespace") {
@@ -148,7 +148,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 	} else if ok {
 		o.Aliases = ss
 	}
-	if v, ok := lookupCI(m, "items"); ok {
+	if v, ok := m["items"]; ok {
 		it := &aschema{}
 		if err := aschemaFromAny(v, it, memo); err != nil {
 			if strayKeyBinds(o.Type, "items") {
@@ -158,7 +158,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			o.Items = it
 		}
 	}
-	if v, ok := lookupCI(m, "values"); ok {
+	if v, ok := m["values"]; ok {
 		vs := &aschema{}
 		if err := aschemaFromAny(v, vs, memo); err != nil {
 			if strayKeyBinds(o.Type, "values") {
@@ -168,7 +168,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			o.Values = vs
 		}
 	}
-	if v, ok := lookupCI(m, "size"); ok {
+	if v, ok := m["size"]; ok {
 		if raw, err := json.Marshal(v); err == nil {
 			var l laxInt
 			if err := l.UnmarshalJSON(raw); err == nil {
@@ -180,7 +180,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			return nil, err
 		}
 	}
-	if v, ok := lookupCI(m, "logicalType"); ok {
+	if v, ok := m["logicalType"]; ok {
 		ls, ok := v.(string)
 		if !ok {
 			return nil, schemaTypeMismatch("logicalType", "string")
@@ -204,14 +204,14 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 	} else {
 		o.Precision = p
 	}
-	if v, ok := lookupCI(m, "default"); ok {
+	if v, ok := m["default"]; ok {
 		raw, err := json.Marshal(v)
 		if err != nil {
 			return nil, err
 		}
 		o.Default = json.RawMessage(raw)
 	}
-	if v, ok := lookupCI(m, "fields"); ok {
+	if v, ok := m["fields"]; ok {
 		if fs, ok := v.([]any); ok {
 			fields := make([]afield, len(fs))
 			ferr := error(nil)
@@ -244,14 +244,13 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 	// that recorded verdict so a stray body is decoded ONCE (by its arm),
 	// never a second time here — a second decode re-enters aschemaFromAny,
 	// which routes its own stray keys, so the two decodes per level
-	// compound to O(2^depth) over a nested-stray schema. The verdict is
-	// consulted only for each reserved key's CI pick — the spelling the
-	// arms read, so the recorded verdict describes exactly the queried
-	// body; every unpicked case-variant spelling routes to extra verbatim.
+	// compound to O(2^depth) over a nested-stray schema. Reserved keys
+	// match exact-lowercase only, so the verdict is consulted exactly for
+	// the spelling the arms read; a case-variant spelling is an ordinary
+	// custom property routed to extra verbatim.
 	shapeOK := o.strayShapeRecorded(nameIsString)
-	variantPicks := reservedKeyVariantPicks(m, schemaReservedKeys)
 	for k, v := range m {
-		if schemaReservedKeyForObject(m, k, v, o.Type, o.Logical, variantPicks, shapeOK) {
+		if schemaReservedKeyForObject(k, v, o.Type, o.Logical, shapeOK) {
 			continue
 		}
 		if o.extra == nil {
@@ -267,14 +266,14 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	if !ok {
 		return errors.New("invalid record field: must be a JSON object")
 	}
-	if v, ok := lookupCI(m, "name"); ok {
+	if v, ok := m["name"]; ok {
 		ns, ok := v.(string)
 		if !ok {
 			return schemaTypeMismatch("name", "string")
 		}
 		f.Name = ns
 	}
-	if v, ok := lookupCI(m, "order"); ok {
+	if v, ok := m["order"]; ok {
 		os, ok := v.(string)
 		if !ok {
 			return schemaTypeMismatch("order", "string")
@@ -286,7 +285,7 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	} else if ok {
 		f.Aliases = ss
 	}
-	if v, ok := lookupCI(m, "logicalType"); ok {
+	if v, ok := m["logicalType"]; ok {
 		ls, ok := v.(string)
 		if !ok {
 			return schemaTypeMismatch("logicalType", "string")
@@ -303,14 +302,14 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	} else {
 		f.Precision = p
 	}
-	if v, ok := lookupCI(m, "default"); ok {
+	if v, ok := m["default"]; ok {
 		raw, err := json.Marshal(v)
 		if err != nil {
 			return err
 		}
 		f.Default = json.RawMessage(raw)
 	}
-	if v, ok := lookupCI(m, "type"); ok {
+	if v, ok := m["type"]; ok {
 		f.Type = &aschema{}
 		if err := aschemaFromAny(v, f.Type, memo); err != nil {
 			return err
@@ -333,8 +332,8 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 // attribute is the bare string tp, is written in the flat (goavro-style)
 // field format: tp names a complex kind and that kind's defining key
 // (symbols / items / values / fields / size) sits alongside the field's own
-// keys, case-insensitively. "error" is the record alias, defined by the
-// "fields" key like "record".
+// keys. "error" is the record alias, defined by the "fields" key like
+// "record".
 //
 // Shared by the wire parser (afieldFromAny) and, via walkNodeChildren
 // (schema_walk.go), every JSON-map walker — the SchemaCache
@@ -349,7 +348,7 @@ func flatFieldNeedsLift(m map[string]any, tp string) bool {
 		return false
 	}
 	for key, forType := range afieldComplexKeys {
-		if _, ok := lookupCI(m, key); ok && (forType == tp || (key == "fields" && tp == "error")) {
+		if _, ok := m[key]; ok && (forType == tp || (key == "fields" && tp == "error")) {
 			return true
 		}
 	}
@@ -371,12 +370,12 @@ func flatLiftTypeMap(m map[string]any, tp string) map[string]any {
 	named := tp == "record" || tp == "error" || tp == "enum" || tp == "fixed"
 	typeMap := make(map[string]any, len(m))
 	for k, v := range m {
-		switch {
-		case strings.EqualFold(k, "default"), strings.EqualFold(k, "order"):
+		switch k {
+		case "default", "order":
 			// Field-only keys, do not propagate.
-		case strings.EqualFold(k, "aliases"):
+		case "aliases":
 			// Flat-format aliases belong to the field, not the type.
-		case strings.EqualFold(k, "name"), strings.EqualFold(k, "namespace"):
+		case "name", "namespace":
 			if named {
 				typeMap[k] = v
 			}
@@ -405,11 +404,11 @@ func (f *afield) liftFlatFieldType(m map[string]any, tp string) error {
 	return nil
 }
 
-// stringSliceFrom reads m[key] (case-insensitive) as a []string. The
-// second return reports presence; a present non-array or non-string
-// element is an error, matching encoding/json's []string decode.
+// stringSliceFrom reads m[key] as a []string. The second return reports
+// presence; a present non-array or non-string element is an error,
+// matching encoding/json's []string decode.
 func stringSliceFrom(m map[string]any, key string) ([]string, bool, error) {
-	v, ok := lookupCI(m, key)
+	v, ok := m[key]
 	if !ok {
 		return nil, false, nil
 	}
@@ -428,12 +427,12 @@ func stringSliceFrom(m map[string]any, key string) ([]string, bool, error) {
 	return out, true, nil
 }
 
-// intPtrFrom reads m[key] (case-insensitive) as a *int by re-marshaling
+// intPtrFrom reads m[key] as a *int by re-marshaling
 // the small value and reusing stdlib int decode, so the accept/reject
 // behavior (rejecting floats, strings, overflow) is identical to the
 // former *int struct field.
 func intPtrFrom(m map[string]any, key string) (*int, error) {
-	v, ok := lookupCI(m, key)
+	v, ok := m[key]
 	if !ok {
 		return nil, nil
 	}
@@ -453,17 +452,17 @@ func intPtrFrom(m map[string]any, key string) (*int, error) {
 // body that parses as the key's schema shape surfaces on the matching
 // SchemaNode structural field (as-written), anything else rides in Props
 // verbatim — the same route unconsumed precision/scale already take.
-// Reserved-key casing is matched case-insensitively, like every reserved
-// key.
+// Only the exact lowercase spelling is a reserved key; a case-variant
+// spelling is an ordinary custom property with no routing of its own.
 var strayRoutedKeys = [...]string{
 	"items", "values", "fields", "symbols", "size", "name", "namespace", "aliases",
 }
 
-// canonicalStrayKey maps k (any letter case) to the canonical spelling of
-// the stray-routed key it names, or "" when it is not one.
+// canonicalStrayKey returns k when it is one of the stray-routed keys
+// (exact lowercase spelling, like every reserved-key match), else "".
 func canonicalStrayKey(k string) string {
 	for _, key := range strayRoutedKeys {
-		if strings.EqualFold(k, key) {
+		if k == key {
 			return key
 		}
 	}

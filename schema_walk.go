@@ -9,9 +9,11 @@ package avro
 // (nodeFromJSONObject, schema_node.go). All three consume one rule: WHICH
 // keys of a node hold child schemas, WHAT a flat-form ("linkedin/goavro")
 // field lifts to, and WHAT namespace scope each child resolves in — with
-// the parser's case-insensitive key reads. walkNodeChildren is that rule's
-// single implementation, built on the parser's own predicates (lookupCI /
-// ciKey, flatFieldNeedsLift / flatLiftTypeMap, isNamedKind); the walkers
+// the parser's exact-name key reads (a reserved attribute name matches
+// only its exact lowercase spelling; a case-variant key is an ordinary
+// custom property). walkNodeChildren is that rule's single
+// implementation, built on the parser's own predicates
+// (flatFieldNeedsLift / flatLiftTypeMap, isNamedKind); the walkers
 // differ only in what they DO at each position (collect a definition,
 // splice a reference, build a SchemaNode), supplied as callbacks.
 
@@ -38,10 +40,8 @@ package avro
 // alongside the reference falls through to the "unknown complex type"
 // reject).
 func nodeChildScope(v map[string]any, ns string) string {
-	if typVal, ok := lookupCI(v, "type"); ok {
-		if typ, _ := typVal.(string); isNamedKind(typ) {
-			return nodeNamespace(v, ns)
-		}
+	if typ, _ := v["type"].(string); isNamedKind(typ) {
+		return nodeNamespace(v, ns)
 	}
 	return ns
 }
@@ -49,10 +49,9 @@ func nodeChildScope(v map[string]any, ns string) string {
 // nodeChildVisitor receives the child-schema positions of one raw-JSON
 // schema node from walkNodeChildren. A nil callback skips its position
 // (the lookups have no side effects, so skipping is free). Every key
-// handed to a callback is the key actually present in the map, resolved
-// case-insensitively with an exact match preferred (ciKey — the same
-// selection lookupCI makes), so mutating walkers write back to the
-// present key instead of introducing a duplicate canonical-cased key.
+// handed to a callback is the exact lowercase reserved spelling — the
+// only spelling that binds — so mutating walkers write back to the key
+// actually present in the map.
 type nodeChildVisitor struct {
 	// typeValue is the node's own "type" value (v[key]). It resolves in
 	// the ENCLOSING namespace scope, not the node's own child scope: a
@@ -128,7 +127,7 @@ type nodeChildVisitor struct {
 // walkNodeChildren enumerates the child-schema positions of the raw-JSON
 // schema node v: its own "type" value, each record field's type (with
 // flat-form fields lifted), array items, and map values. Keys are read
-// case-insensitively exactly as the parser reads them. ns is the scope v
+// by exact name, exactly as the parser reads them. ns is the scope v
 // itself sits in (handed to typeValue); childNS is the scope v's
 // containers resolve in — nodeChildScope(v, ns), or the metadata
 // walker's equivalent derivation from its already-built node
@@ -146,19 +145,16 @@ type nodeChildVisitor struct {
 // strayKeys walk of a primitive object can fire several — a primitive
 // carries any of them as inert metadata.
 func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor) {
-	var typ string
-	if tv, ok := lookupCI(v, "type"); ok {
-		typ, _ = tv.(string)
-	}
+	typ, _ := v["type"].(string)
 	if vis.typeValue != nil {
-		if key, ok := ciKey(v, "type"); ok {
-			vis.typeValue(key, ns)
+		if _, ok := v["type"]; ok {
+			vis.typeValue("type", ns)
 		}
 	}
 	if vis.fields != nil || vis.field != nil || vis.flatField != nil {
-		if fk, ok := ciKey(v, "fields"); ok &&
-			(isRecordKind(typ) || (vis.strayKeys && strayBodyShapeOKMemo(vis.strayShapeMemo, "fields", v[fk]))) {
-			if arr, ok := v[fk].([]any); ok {
+		if fv, ok := v["fields"]; ok &&
+			(isRecordKind(typ) || (vis.strayKeys && strayBodyShapeOKMemo(vis.strayShapeMemo, "fields", fv))) {
+			if arr, ok := fv.([]any); ok {
 				if vis.fields != nil {
 					vis.fields(arr)
 				}
@@ -167,7 +163,7 @@ func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor
 					if !ok {
 						continue
 					}
-					tk, ok := ciKey(fo, "type")
+					tv, ok := fo["type"]
 					if !ok {
 						// A field with no type key never parses at a BOUND
 						// position (the record build rejects a nil field
@@ -182,29 +178,29 @@ func walkNodeChildren(v map[string]any, ns, childNS string, vis nodeChildVisitor
 						}
 						continue
 					}
-					if ts, isStr := fo[tk].(string); isStr && flatFieldNeedsLift(fo, ts) {
+					if ts, isStr := tv.(string); isStr && flatFieldNeedsLift(fo, ts) {
 						if vis.flatField != nil {
 							vis.flatField(i, fo, ts, childNS)
 						}
 						continue
 					}
 					if vis.field != nil {
-						vis.field(i, fo, tk, childNS)
+						vis.field(i, fo, "type", childNS)
 					}
 				}
 			}
 		}
 	}
 	if vis.items != nil {
-		if key, ok := ciKey(v, "items"); ok &&
-			(typ == "array" || (vis.strayKeys && strayBodyShapeOKMemo(vis.strayShapeMemo, "items", v[key]))) {
-			vis.items(key, childNS)
+		if iv, ok := v["items"]; ok &&
+			(typ == "array" || (vis.strayKeys && strayBodyShapeOKMemo(vis.strayShapeMemo, "items", iv))) {
+			vis.items("items", childNS)
 		}
 	}
 	if vis.values != nil {
-		if key, ok := ciKey(v, "values"); ok &&
-			(typ == "map" || (vis.strayKeys && strayBodyShapeOKMemo(vis.strayShapeMemo, "values", v[key]))) {
-			vis.values(key, childNS)
+		if vv, ok := v["values"]; ok &&
+			(typ == "map" || (vis.strayKeys && strayBodyShapeOKMemo(vis.strayShapeMemo, "values", vv))) {
+			vis.values("values", childNS)
 		}
 	}
 }

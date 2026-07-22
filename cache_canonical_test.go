@@ -2,6 +2,7 @@ package avro_test
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -228,30 +229,47 @@ func TestRegression_FlatArrayFieldInlineDefCollected(t *testing.T) {
 	})
 }
 
-// Sibling of the flat-form case: a prior definition written with a
-// case-variant object key (e.g. "tYpe", accepted by the parser's lookupCI)
-// must also be collected so the cross-parse reference self-contains.
-func TestRegression_SchemaCacheSelfContainedCaseVariantKey(t *testing.T) {
+// A case-variant object key ("tYpe") is an ordinary custom property, so
+// an object spelling its type only as a variant has no type attribute:
+// the registering parse fails loud and nothing enters the cache. A
+// definition carrying a variant key BESIDE its exact structure registers
+// normally, and the cross-parse splice preserves the variant verbatim as
+// a prop without letting it scope, rename, or restructure the def.
+func TestRegression_SchemaCacheCaseVariantKey(t *testing.T) {
 	var c avro.SchemaCache
-	if _, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"tYpe":"record","name":"Inner","fields":[{"name":"a","type":"int"}]}}]}`); err != nil {
-		t.Fatalf("register case-variant Inner: %v", err)
+	if _, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"tYpe":"record","name":"Inner","fields":[{"name":"a","type":"int"}]}}]}`); err == nil {
+		t.Fatalf("variant-only tYpe object accepted; it has no type attribute and must reject")
 	}
-	viaCache, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"x","type":"Inner"}]}`)
-	if err != nil {
-		t.Fatalf("reference Inner via cache: %v", err)
+	if _, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"x","type":"Inner"}]}`); err == nil {
+		t.Fatalf("Inner resolved from a rejected parse; a failed parse must register nothing")
 	}
-	inline := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":{"type":"record","name":"Inner","fields":[{"name":"a","type":"int"}]}}]}`)
 
+	if _, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"inner","type":{"type":"record","name":"Inner2","nAmespace":"decoy","fields":[{"name":"a","type":"int"}]}}]}`); err != nil {
+		t.Fatalf("register Inner2: %v", err)
+	}
+	viaCache, err := c.Parse(`{"type":"record","name":"R2","fields":[{"name":"x","type":"Inner2"}]}`)
+	if err != nil {
+		t.Fatalf("reference Inner2 via cache: %v", err)
+	}
+	inline := avro.MustParse(`{"type":"record","name":"R2","fields":[{"name":"x","type":{"type":"record","name":"Inner2","nAmespace":"decoy","fields":[{"name":"a","type":"int"}]}}]}`)
 	assertSelfContained(t, viaCache, inline, map[string]any{"x": map[string]any{"a": int32(7)}})
+	spliced := viaCache.Root().Fields[0].Type
+	if got := spliced.Props["nAmespace"]; !reflect.DeepEqual(got, "decoy") {
+		t.Errorf(`spliced Props["nAmespace"] = %#v; want the variant preserved verbatim`, got)
+	}
+	if spliced.Namespace != "" {
+		t.Errorf("Namespace = %q; a variant key must not scope the def", spliced.Namespace)
+	}
 }
 
 // The splice walker (inlineTreeDefs) is the parallel of collectTreeDefs and
 // must mirror the parser the same way, or a TRANSITIVE inherited reference
-// reached through a case-variant structural key or a flat-form definition
-// dangles: the self-containment re-parse then fails and the whole splice is
-// abandoned, leaving even the top-level reference bare. These cases require
-// inlineTreeDefs to read keys case-insensitively (writing back to the present
-// key) and to recurse into a flat-form field's own structural subtree.
+// reached through a flat-form definition dangles: the self-containment
+// re-parse then fails and the whole splice is abandoned, leaving even the
+// top-level reference bare. A case-variant structural key cannot smuggle a
+// definition anywhere near the cache: the variant is an ordinary custom
+// property, so the record it rode on has no fields attribute and its parse
+// rejects before any registration.
 func TestRegression_SchemaCacheSelfContainedTransitiveRefs(t *testing.T) {
 	check := func(name string, defs []string, ref string) {
 		t.Run(name, func(t *testing.T) {
@@ -274,15 +292,6 @@ func TestRegression_SchemaCacheSelfContainedTransitiveRefs(t *testing.T) {
 		})
 	}
 
-	// A's definition reached transitively through B, where B's def uses a
-	// case-variant structural key ("fIelds").
-	check("case_variant_key_transitive",
-		[]string{
-			`{"type":"record","name":"A","fields":[{"name":"a","type":"int"}]}`,
-			`{"type":"record","name":"B","fIelds":[{"name":"x","type":"A"}]}`,
-		},
-		`{"type":"record","name":"R","fields":[{"name":"y","type":"B"}]}`)
-
 	// B defined in flat field form, transitively referencing A.
 	check("flat_form_transitive",
 		[]string{
@@ -291,12 +300,21 @@ func TestRegression_SchemaCacheSelfContainedTransitiveRefs(t *testing.T) {
 		},
 		`{"type":"record","name":"R","fields":[{"name":"y","type":"B"}]}`)
 
-	// Case-variant structural key at the top-level schema being spliced.
-	check("case_variant_top_level",
-		[]string{
-			`{"type":"record","name":"A","fields":[{"name":"a","type":"int"}]}`,
-		},
-		`{"type":"record","name":"R","fIelds":[{"name":"y","type":"A"}]}`)
+	// A record spelling "fields" only as a case-variant has no fields
+	// attribute: it rejects at parse (as a would-be cached def AND as the
+	// referencing schema), so no variant-keyed definition can register.
+	t.Run("case_variant_key_rejects", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":"B","fIelds":[{"name":"x","type":"int"}]}`); err == nil || !strings.Contains(err.Error(), "record is missing fields") {
+			t.Errorf("variant-fIelds def: got %v; want the missing-fields reject", err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"A","fields":[{"name":"a","type":"int"}]}`); err != nil {
+			t.Fatalf("parse def A: %v", err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"R","fIelds":[{"name":"y","type":"A"}]}`); err == nil || !strings.Contains(err.Error(), "record is missing fields") {
+			t.Errorf("variant-fIelds referencing schema: got %v; want the missing-fields reject", err)
+		}
+	})
 }
 
 // assertSelfContained checks that a cache-built schema is byte-for-byte the

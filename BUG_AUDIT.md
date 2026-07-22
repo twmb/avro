@@ -5795,3 +5795,137 @@ bytes path rejects >255; no impl consensus for rejection) + parseJSONInt64
 pre-multiply cutoff with sign-split last digit; stray × compiled surfaces
 executed (Canonical byte-identical to the stray-free twin, Resolve both
 directions, SOE cross-decode by fingerprint, CheckCompatibility both ways).
+
+
+## Distillation archive (2026-07-21 #2)
+
+### Round narrative — the #46 exact-case policy flip (2026-07-21, START head 113837b)
+
+Dedicated behavior-change round, maintainer-adjudicated: reserved-attribute-key
+matching flipped from case-INSENSITIVE (the 2026-07-17 KEEP ruling's fold) to
+EXACT-lowercase-only, on every surface. Pre-action gate ran with verdict
+"documented but contradicted by new evidence": #46 was the documented policy;
+the new evidence was four case-fold correctness findings in one month (07-15
+composition-walker dangle + namespace shadow, 07-17 addTypeAliases fold gap,
+07-21 case-variant-duplicate mis-routing) plus executed unanimity of
+Java/fastavro/goavro on exact-case; the maintainer's 2026-07-21 ruling IS the
+required re-adjudication. Recorded per the anti-ping-pong clause: the fold and
+the 113837b pick apparatus were introduced deliberately; the ruling supersedes
+them explicitly, not silently.
+
+Quarantine (113837b, the per-raw-key stray-verdict fix): re-read end-to-end.
+The pick selection (reservedKeyIsPick == lookupCI's exact-first/lex-smallest)
+was internally consistent across all four routing sites; strayShapeRecorded's
+verdict thread (the R1-Q7 linear-parse fix) is keyed per canonical key and was
+consulted only for the pick, so verdict and body could not diverge; the splice
+pre-merge defKeys snapshot was deterministic. One resource-bound observation:
+defHasCI was an O(wrapper-keys × def-keys) EqualFold scan — eliminated
+structurally by the flip (exact map lookups). No behavioral findings; the
+apparatus itself was then removed by the flip, so the quarantine's surviving
+subjects are the verdict thread (kept, exact-spelling-consulted) and the
+splice merge (kept, exact presence check).
+
+Mechanism: lookupCI / ciKey / getCIString / getCIInt / getCIStringSlice /
+reservedKeyCanon / reservedKeyVariantPicks / reservedKeyIsPick all deleted;
+every reserved-key read in schema_parse.go / schema_node.go / schema_walk.go /
+cache.go / schema_for.go is a plain exact map access; walkNodeChildren hands
+callbacks the literal lowercase keys; the cache splice def-wins collapsed to a
+live-map exact presence check (order-independent because map keys are unique);
+strings.EqualFold has zero non-test occurrences.
+
+References EXECUTED for the ruling: fastavro 1.12.2 (17 probes: structural
+variants KeyError/required-field reject; variants preserved as props; two
+per-cell laxities recorded — fields-less record accepts as zero fields,
+precision-less decimal drops the logical); goavro (13 probes: "Array ought to
+have items key" family; variants inert); hamba (sole folder: ITEMS binds as
+items, NAMESPACE variant rescopes to ns.R — mapstructure EqualFold). Java
+cited from source (SCHEMA_RESERVED/ENUM_RESERVED Schema.java:175-178,
+FIELD_RESERVED :503-504, exact HashSets + exact Jackson structural reads);
+local runtime jarless, NOT executed.
+
+Tests: five pins written first and verified RED against the fold (structural
+variant binding, tYpe acceptance, NAMESPACE scoping zed.R, ALIASES resolving,
+DEFAULT setting), then green post-flip. New nets: reserved_exactcase_test.go —
+TestRegression_CaseVariant{StructuralKeyRejects,NamingKeyInert,
+StrayBodyStaysProp,TypeKeyRejects}, TestRegression_FieldCaseVariantKeyInert,
+TestMatrix_ReservedKeyVariantOnly (schema-level variant-only axis: required →
+loud reject incl. decimal precision; optional → attribute unset + Props
+verbatim + rebuild + self-resolve) + TestMatrix_FieldReservedKeyVariantOnly +
+TestDifferentialFastavroReservedExactCase (every cell executed, laxities
+asserted per cell). Inverted: matrix_schemafor_casefold_test.go →
+matrix_schemafor_exactcase_test.go (fold-convergence assertions became
+calibrated divergence: exact binds x.y.F, variants inert-prop F identical to
+the no-namespace control — including matching the control's null-namespace-
+recurrence reject under WithNamespace; type-alias variant-only cells pin the
+walk's own "type is not a named type" diagnosis for array/map and the
+parse-level missing-items reject for the union's itemless branch);
+TestRegression_SchemaForCaseVariantNamespace* flipped (variant declares
+nothing; pin injects the escape); cache pins flipped
+(TestRegression_SchemaCacheCaseVariantKey: variant-tYpe def rejects and
+registers nothing, nAmespace-decoy def splices with prop preserved and no
+rescope; transitive variant-fIelds cells → missing-fields rejects);
+conformance's LookupCIDeterminism → CaseVariantKeysNoPickAmbiguity (variant-
+only rejects; variants-beside-exact are stable inert props). The reserved-dup
+matrices survive almost verbatim — their variant→Props assertions are
+policy-invariant (same observable under fold-with-pick-gate and exact-case);
+comments re-framed, two tests renamed (DuplicatePickMalformed →
+DuplicateExactMalformed, DupUnpickedValidVariantPreserved →
+DupValidVariantPreserved), and the cache-splice DOC cell flipped (a merged
+variant is no longer CI-consumed by the def's reparse — it stays a prop).
+FEATURE × WALKER: the two all-variant casekey rows (whose schemas now reject)
+were replaced by one variantkey-props row — exact structure with variant
+decoys at every placement riding all 11 drivers inert, including a nAmespace
+decoy on a cache-spliced def (pre-flip that decoy re-scoped the definition).
+
+Neuter ×5, one per surface: re-folding the parse items arm / metadata
+getString / walker items gate / resolveNameScope namespace read / cache
+nodeNamespace each turned that surface's inverted cells red (verified, then
+restored byte-exact).
+
+Docs: #46 rewritten (exact-case, five-impl table, WHY-overturned, migration
+note); #63's pick-gate clause rewritten (placement-conditional only; exact
+splice merge); FIX.md item-15 reserved-key bullet flipped (+ historical
+concrete-record annotated); AUDIT_PATTERNS R1-Q4 case sub-row rewritten; P19
+instance annotated subsumed (lesson unchanged); README §Schema Introspection +
+Root() doc carry the hamba migration note. Suite + fastavro differential
+green; -race green on the changed family; Java oracle NOT run (jarless).
+Policy round — does not count toward the streak-rebuild's two clean fulls.
+
+### Superseded verbatim — NOT_BUGS #46 as ruled 2026-07-17 (replaced 2026-07-21)
+
+46. **Reserved Avro attribute names are matched case-insensitively — MAINTAINER-RULED 2026-07-17 (previously inferred-from-consistency).** A key differing from a reserved name only by ASCII case IS that reserved attribute, uniformly across all five reading surfaces: the wire parser (schema_parse.go), the metadata re-parse (`Root()` → `nodeFromJSON`), SchemaFor's composition walkers (`resolveNameScope`, `pinCustomSchemaScope`, `dedupNamedTypes`, `normalizeSchemaScope`), the cache splice walkers (cache.go), and the type-alias walk (`addTypeAliases` + `appendTypeAliasValues`) — reads via `lookupCI` (exact match first, then `strings.EqualFold`), in-place rewrites via `ciKey` (the as-written key, never a shadowing exact-case duplicate). A sole (picked) case-variant spelling is NOT surfaced in `Root().Props` (documented on `Root()`). **Duplicate-spelling clause (MAINTAINER-RULED 2026-07-21):** when several spellings of one reserved key are present simultaneously, exactly ONE — the exact-case-preferred, else lexicographically smallest CI pick, `lookupCI`/`ciKey`'s selection — is consulted for structural binding and consumed; EVERY other raw spelling rides to Props verbatim on both reading surfaces (parse-side `node.props` and `Root()`), deterministically, with no branching on its body (`reservedKeyIsPick`). Props == all raw keys minus the consumed picks. This deliberately CHANGED the both-valid-duplicate behavior — the unpicked valid spelling previously vanished (consumed as reserved, never surfaced); it now rides to Props, because every non-pick is preserved uniformly. Field-level reserved keys follow the same rule into `SchemaField.Props`. References corroborate preservation: Java's `SCHEMA_RESERVED` skip set is exact-lowercase (a case-variant is an ordinary preserved prop); fastavro reads known keys by exact name and preserves the rest (executed per accept cell). Nets: `TestMatrix_ReservedKeyDuplicateSpellings` (10 keys × carriers × 3 variant bodies × 3 surfaces + pick-only controls), `TestMatrix_FieldReservedKeyDuplicateSpellings`, `TestRegression_ReservedDup*` / `TestRegression_FieldReservedDupVariantPreserved`, `TestDifferentialFastavroReservedDupSpellings`.
+    RATIONALE (maintainer-stated): hamba-migration ease — hamba/avro is the one major implementation that is also case-insensitive (EXECUTED: hamba binds `{"type":"record","name":"R","Fields":[…]}` as a record WITH the fields and `{"type":"array","Items":"int"}` as a bound array; mechanism: hamba's schema_parse.go decodes via go-viper/mapstructure/v2, whose default `MatchName` is `strings.EqualFold`, mapstructure.go:511) — and zero conformant producers emit case-variant reserved keys, so the leniency is unobservable on conformant data. The flip to exact-case (encoding/json v2 intent + spec + Java/fastavro/goavro) was considered and DECLINED.
+    LINEAGE (executed): encoding/json v1's default case-insensitive field matching, inherited by the original struct-decode parser (ab1f036: `json.Unmarshal` into `json:`-tagged aschema structs; EXECUTED: v1 binds `{"Items":5}` to an `items`-tagged field, encoding/json/v2 does not); preserved for self-compatibility when `lookupCI` landed at the metadata surfaces in 84601dd — itself the iceberg-go-migration-off-hamba commit, so the CI helper was born hamba-shaped; the spec concession ("Avro keys are case-sensitive per spec, so two case-variants of one key are already non-conformant", lookupCI's doc) was added at cf91ceb; ratified by the maintainer 2026-07-17 for hamba compat.
+    FIVE-IMPLEMENTATION TABLE: Java exact-case (`SCHEMA_RESERVED` is an exact-case `HashSet`, Schema.java:175-176, tested via `reserved.contains(name)`, JsonProperties.java:287 — variants are distinct custom props; a Fields-only record REJECTS, "fields" missing); fastavro 1.12.2 exact-case (EXECUTED: Items-only array rejects `KeyError: 'items'`; Fields-only record ACCEPTS as a ZERO-field record — `"fields":[]` synthesized, `"Fields"` kept as a prop); goavro exact-case ("Array ought to have items key", array.go:23; `Record %q ought to have fields key`, record.go:26); hamba case-INSENSITIVE (EXECUTED above — the implementation twmb keeps matching); twmb case-insensitive (this entry).
+    STANDING RULE: any NEW reader/walker/mutator of schema trees consults `lookupCI`/`ciKey` (FIX.md item 15's invariant list keeps the fold line). Enforcement history: exact-case composition walkers dedup'd a CI-spelled namespaced custom to a dangling reference and shadowed a CI-spelled namespace with an injected exact-case `"namespace":""` (fixed; class net `TestMatrix_SchemaForReservedKeyCaseFold`, pins `TestRegression_SchemaForCaseVariantNamespaceKeySharedType`, `TestRegression_SchemaForCaseVariantNamespaceUnderWithNamespace`); the type-alias walk wrong-rejected a tag whose container binding key arrived only as a Props case-variant (a nil structural field renders without the literal key, so the variant is the ONLY spelling and Parse binds it) and silently landed the alias on a later union branch, and an exact-case aliases write beside a CI-variant key would shadow the caller's aliases at Parse's duplicate-key resolution (fixed; class net `TestMatrix_TypeAliasCaseFold`, pins `TestRegression_TypeAliasBindingKeyCaseFold`, `TestRegression_TypeAliasUnionPlacementCaseFold`, `TestRegression_TypeAliasExtendsCaseVariantAliases`). Do NOT "fix" `lookupCI` to be case-sensitive — beyond the ruling, it would break `TestRegression_SchemaCacheSelfContainedCaseVariantKey` (cache_canonical_test.go) and the posture pins above.
+
+### Compressed-away ledger lines (verbatim, AUDIT_CORE.md §Round ledger, compressed 2026-07-21 #2)
+
+- 2026-07-01..02 · ea9a2ce→2609823 · era (5 rounds): FULL clean ×2 →
+  CONVERGED; RESET by OCF count-0-as-EOF FILED→FIXED (#53); DEDICATED
+  claims-hardening (21 claims; 3 nets) + reader-grammar census (7 gap
+  families; #54 #55). Verbatim lines: BUG_AUDIT.md archive (2026-07-16).
+- 2026-07-06..09 · 150b688→27c8781 · era (9 rounds): FULL clean #1, then
+  FILED→FIXED cycles resetting each time — flat-field metadata lift twin
+  (#56), OCF truncation io.EOF sentinel (#57), resolved-DecodeJSON
+  tagged-union flip (#2 rewritten; #58), lax-reparse + 4 siblings
+  (#59 #60).
+- 2026-07-10..11 · 27c8781→8ee2b1b · FULL clean #1 (CustomType parse
+  superlinear FILED→FIXED same round; resource-bound, no reset) + FULL
+  clean #2 → RE-CONVERGED.
+- 2026-07-12 · 8ee2b1b→afe3b68 · era (4 rounds): FULL ×2 each FILED→FIXED
+  same round + RESET (appendAvroString shrunk-return guard #61; splice
+  walkers missed flat items/values → FEATURE × WALKER harness); DEDICATED
+  census (28 rows × 11 drivers = 308 cells neuter-proven; §Open net gaps
+  EMPTY); DEDICATED cleanliness (keyless-def carve-out FILED; B7 2nd).
+- 2026-07-13..14 · 18988c2→5717f32 · era (5 rounds): keyless defs FIXED;
+  leading-dot names FILED→FIXED (parse-time normalize, ×3 resolvers; #62);
+  FULL clean #1 (f47083c 2nd); FULL filed stray precision/scale reject →
+  FIXED as ACCEPT-AS-INERT (70-cell matrix; #63; #54 extended) · fastavro
+  EXECUTED per round · counter ZERO; rebuild needs two consecutive clean
+  bare FULLs.
+- 2026-07-14 · 5717f32→79ed5b3 · era (3 rounds): DEDICATED distillation +
+  ATTRIBUTE × PLACEMENT census (#64 FIXED; B7/B33/B34 tombstoned) +
+  DEDICATED trust-boundary census (6 FILED→FIXED; #65 #66; Java CI GREEN
+  through 18988c2) + FULL clean #1 · counter ZERO.
+  Verbatim: archive (2026-07-18).

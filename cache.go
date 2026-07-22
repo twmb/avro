@@ -277,27 +277,20 @@ func avroNamedRef(typ string) bool {
 
 // nodeNamespace returns the namespace in scope inside a named-type object: the
 // prefix of a dotted name, else its "namespace" attribute, else inherited.
-// Keys are read case-insensitively, mirroring the parser's lookupCI.
+// Keys are read by exact name, mirroring the parser.
 func nodeNamespace(obj map[string]any, enclosingNS string) string {
-	if v, ok := lookupCI(obj, "name"); ok {
-		if name, ok := v.(string); ok && strings.Contains(name, ".") {
-			return name[:strings.LastIndex(name, ".")]
-		}
+	if name, ok := obj["name"].(string); ok && strings.Contains(name, ".") {
+		return name[:strings.LastIndex(name, ".")]
 	}
-	if v, ok := lookupCI(obj, "namespace"); ok {
-		if ns, ok := v.(string); ok {
-			return ns
-		}
+	if ns, ok := obj["namespace"].(string); ok {
+		return ns
 	}
 	return enclosingNS
 }
 
 // nodeFullnameTree resolves a named-type object's fullname.
 func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
-	name := ""
-	if v, ok := lookupCI(obj, "name"); ok {
-		name, _ = v.(string)
-	}
+	name, _ := obj["name"].(string)
 	short := name
 	if i := strings.LastIndex(name, "."); i >= 0 {
 		short = name[i+1:]
@@ -341,8 +334,7 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 			collectTreeDefs(b, ns, visit)
 		}
 	case map[string]any:
-		typVal, _ := lookupCI(v, "type")
-		if typ, _ := typVal.(string); isNamedKind(typ) {
+		if typ, _ := v["type"].(string); isNamedKind(typ) {
 			visit(nodeFullnameTree(v, ns), v)
 		}
 		walkNodeChildren(v, ns, nodeChildScope(v, ns), nodeChildVisitor{
@@ -356,23 +348,6 @@ func collectTreeDefs(node any, ns string, visit func(fullname string, def any)) 
 			values: func(key, scope string) { collectTreeDefs(v[key], scope, visit) },
 		})
 	}
-}
-
-// ciKey returns the key actually present in m matching key case-insensitively
-// (exact match preferred, else the lexicographically smallest case-insensitive
-// match — same selection as lookupCI). A mutating walker uses it to write back
-// to the present key instead of introducing a duplicate canonical-cased key.
-func ciKey(m map[string]any, key string) (string, bool) {
-	if _, ok := m[key]; ok {
-		return key, true
-	}
-	pick, found := "", false
-	for k := range m {
-		if strings.EqualFold(k, key) && (!found || k < pick) {
-			pick, found = k, true
-		}
-	}
-	return pick, found
 }
 
 // inlineTreeDefs replaces the FIRST occurrence of each reference to a cache-
@@ -466,71 +441,44 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		// emits bare fullnames, matching Java's NamedSchema.writeNameRef;
 		// only String saw the wrapper). A props-carrying wrapper keeps
 		// its shape — collapsing would drop the props.
-		if typVal, ok := lookupCI(v, "type"); ok {
-			if ref, ok := typVal.(string); ok && avroNamedRef(ref) {
-				resolved := inlineTreeDefs(ref, ns, defs, seen, inlined)
-				if def, isMap := resolved.(map[string]any); isMap {
-					defTyp, defLogical := "", ""
-					if tv, ok := lookupCI(def, "type"); ok {
-						defTyp, _ = tv.(string)
+		if ref, ok := v["type"].(string); ok && avroNamedRef(ref) {
+			resolved := inlineTreeDefs(ref, ns, defs, seen, inlined)
+			if def, isMap := resolved.(map[string]any); isMap {
+				defTyp, _ := def["type"].(string)
+				defLogical, _ := def["logicalType"].(string)
+				// The wrapper's props are a flat key set (never a
+				// nested-stray schema), so no recorded verdict is
+				// needed and no re-decode compounds: a nil verdict
+				// resolves each key with a fresh single shape check.
+				// The reference's own "type" key is consumed by the
+				// reserved routing below; a case-variant spelling of
+				// any reserved key is an ordinary prop and merges like
+				// one. Definition-wins is an exact-key presence check:
+				// map keys are unique, so merging one wrapper prop can
+				// never change another's verdict and the merge is
+				// order-independent.
+				for k, wv := range v {
+					if schemaReservedKeyForObject(k, wv, defTyp, defLogical, nil) {
+						continue
 					}
-					if lv, ok := lookupCI(def, "logicalType"); ok {
-						defLogical, _ = lv.(string)
+					if _, has := def[k]; has {
+						continue
 					}
-					// The wrapper's props are a flat key set (never a
-					// nested-stray schema), so no recorded verdict is
-					// needed and no re-decode compounds: a nil verdict
-					// resolves each key with a fresh single shape check.
-					// The reference's own "type" key is its pick and is
-					// consumed by the reserved routing below; an unpicked
-					// case-variant spelling of any reserved key is an
-					// ordinary prop and merges like one.
-					//
-					// Definition-wins is checked against the definition's
-					// OWN keys, snapshotted before any merge: a wrapper
-					// prop colliding (case-insensitively) with a
-					// definition attribute dies, but two distinct wrapper
-					// props that collide only with EACH OTHER both merge —
-					// checking the mutating map instead would keep
-					// whichever the random map order merged first.
-					defKeys := make([]string, 0, len(def))
-					for dk := range def {
-						defKeys = append(defKeys, dk)
-					}
-					defHasCI := func(k string) bool {
-						for _, dk := range defKeys {
-							if strings.EqualFold(dk, k) {
-								return true
-							}
-						}
-						return false
-					}
-					wrapPicks := reservedKeyVariantPicks(v, schemaReservedKeys)
-					for k, wv := range v {
-						if schemaReservedKeyForObject(v, k, wv, defTyp, defLogical, wrapPicks, nil) {
-							continue
-						}
-						if defHasCI(k) {
-							continue
-						}
-						def[k] = wv
-					}
-					return def
+					def[k] = wv
 				}
-				if len(v) == 1 {
-					return resolved
-				}
-				if key, ok := ciKey(v, "type"); ok {
-					v[key] = resolved
-				}
-				return v
+				return def
 			}
+			if len(v) == 1 {
+				return resolved
+			}
+			v["type"] = resolved
+			return v
 		}
 		// Register this node's own name BEFORE walking its children, mirroring
 		// the parser's early self-registration (a type is in scope for its own
 		// descendants). A later sibling/descendant reference then sees it; an
 		// earlier one already resolved against the cache above. Keys are read
-		// case-insensitively, mirroring collectTreeDefs and the parser. The
+		// by exact name, mirroring collectTreeDefs and the parser. The
 		// registration fires for every named KIND, "name" key or not — the
 		// parser registers a keyless definition's fullname ("ns.", lax-only)
 		// the same way, and a spliced subtree can carry one as-written, so a
@@ -549,14 +497,12 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 		// NamedSchema.writeNameRef. Without the rewrite the rebuilt JSON
 		// defines the name twice, the rebuild Parse rejects it, and the
 		// metadata forms silently fall back to the dangling original.
-		if typVal, ok := lookupCI(v, "type"); ok {
-			if typ, _ := typVal.(string); isNamedKind(typ) {
-				fullname := nodeFullnameTree(v, ns)
-				if ref, ok := dupDefRef(fullname, ns, seen); ok {
-					return ref
-				}
-				seen[fullname] = true
+		if typ, _ := v["type"].(string); isNamedKind(typ) {
+			fullname := nodeFullnameTree(v, ns)
+			if ref, ok := dupDefRef(fullname, ns, seen); ok {
+				return ref
 			}
+			seen[fullname] = true
 		}
 		inlineNodeChildren(v, ns, defs, seen, inlined)
 		return v
@@ -651,18 +597,13 @@ func dupDefRef(fullname, ns string, seen map[string]bool) (string, bool) {
 // carried by its first definition.
 func rewriteFlatFieldToRef(fo map[string]any, ref string) {
 	for k := range fo {
-		switch {
-		case strings.EqualFold(k, "name"),
-			strings.EqualFold(k, "default"),
-			strings.EqualFold(k, "order"),
-			strings.EqualFold(k, "aliases"),
-			strings.EqualFold(k, "type"):
+		switch k {
+		case "name", "default", "order", "aliases", "type":
 		default:
 			delete(fo, k)
 		}
 	}
-	tk, _ := ciKey(fo, "type")
-	fo[tk] = ref
+	fo["type"] = ref
 }
 
 // defWithExplicitNamespace deep-copies a named-type definition and makes its

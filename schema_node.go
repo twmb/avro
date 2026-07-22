@@ -183,16 +183,15 @@ type deduper struct {
 // for how values decode.
 //
 // Reserved Avro attribute names (such as "type", "name", "namespace",
-// "doc", "aliases") are matched case-insensitively, so a custom property
-// whose key differs from a reserved name only by ASCII letter case (for
-// example "Aliases") is interpreted as that reserved attribute and is not
-// reported in [SchemaNode.Props]. When several spellings of one reserved
-// attribute are present, exactly one is interpreted as the attribute —
-// the exact-case spelling when present, else the smallest
-// case-insensitive match — and every other spelling is an ordinary
-// custom property, reported in Props verbatim. Parsing applies the same
-// selection, so the metadata reported here stays consistent with the
-// parsed schema and the encoded wire.
+// "doc", "aliases") are matched only by their exact lowercase spelling,
+// as in the Avro reference implementations. A key differing from a
+// reserved name only by letter case (for example "Aliases") is an
+// ordinary custom property: it never binds the attribute, and it is
+// reported in [SchemaNode.Props] verbatim. Parsing applies the same
+// rule, so the metadata reported here stays consistent with the parsed
+// schema and the encoded wire — in particular, a schema whose only
+// spelling of a structural key is a case variant (say "ITEMS" on an
+// array) fails Parse, because the structural attribute is absent.
 //
 // A field written in the flat (goavro-style) format — a bare string
 // complex-kind type with the kind's defining key (symbols, items, values,
@@ -1200,71 +1199,38 @@ func jsonNumericInt(v any) (int, bool) {
 	return 0, false
 }
 
-// getCIString assigns *dst to m[key] when present and string-typed.
-// Mirrors the lookupCI + type-assert pattern repeated ~6 times in
-// nodeFromJSONObject and metadataField.
-func getCIString(m map[string]any, key string, dst *string) {
-	if v, ok := lookupCI(m, key); ok {
-		if s, ok := v.(string); ok {
-			*dst = s
-		}
+// getString assigns *dst to m[key] when present and string-typed. Mirrors
+// the exact-lookup + type-assert pattern repeated ~6 times in
+// nodeFromJSONObject and metadataField. Reserved attribute names match
+// ONLY their exact lowercase spelling — a case-variant key is an ordinary
+// custom property (Java's reserved sets are exact-lowercase HashSets,
+// Schema.java:175-176; fastavro and goavro read exact names too).
+func getString(m map[string]any, key string, dst *string) {
+	if s, ok := m[key].(string); ok {
+		*dst = s
 	}
 }
 
-// getCIInt assigns *dst to m[key] when present and parseable via
+// getInt assigns *dst to m[key] when present and parseable via
 // jsonNumericInt (precision/scale/size).
-func getCIInt(m map[string]any, key string, dst *int) {
-	if v, ok := lookupCI(m, key); ok {
+func getInt(m map[string]any, key string, dst *int) {
+	if v, ok := m[key]; ok {
 		if p, ok := jsonNumericInt(v); ok {
 			*dst = p
 		}
 	}
 }
 
-// getCIStringSlice assigns *dst to m[key] when it is a []any of strings
+// getStringSlice assigns *dst to m[key] when it is a []any of strings
 // (aliases, symbols).
-func getCIStringSlice(m map[string]any, key string, dst *[]string) {
-	if v, ok := lookupCI(m, key); ok {
-		if vs, ok := v.([]any); ok {
-			out := make([]string, len(vs))
-			for i, x := range vs {
-				out[i], _ = x.(string)
-			}
-			*dst = out
+func getStringSlice(m map[string]any, key string, dst *[]string) {
+	if vs, ok := m[key].([]any); ok {
+		out := make([]string, len(vs))
+		for i, x := range vs {
+			out[i], _ = x.(string)
 		}
+		*dst = out
 	}
-}
-
-// lookupCI looks up key k in m, matching case-insensitively, so schemas
-// with non-canonical casing ("tYpe" instead of "type") round-trip through
-// Root/Schema. An EXACT-case match wins first (the common path). When no
-// exact match exists but multiple keys collide case-insensitively (e.g.
-// both "tYpe" and "TYpe", with no plain "type"), the smallest by Unicode
-// code-point wins — a deterministic tie-break for that malformed input
-// (Avro keys are case-sensitive per spec, so two case-variants of one key
-// are already non-conformant). This differs from a struct-decode's
-// document-order resolution on that degenerate case, but is deterministic
-// where a bare `for k := range m` was not — Go's randomized map iteration
-// otherwise made Root() return different branches on different calls.
-func lookupCI(m map[string]any, key string) (any, bool) {
-	if v, ok := m[key]; ok {
-		return v, true
-	}
-	var pickKey string
-	var found bool
-	for k := range m {
-		if !strings.EqualFold(k, key) {
-			continue
-		}
-		if !found || k < pickKey {
-			pickKey = k
-			found = true
-		}
-	}
-	if found {
-		return m[pickKey], true
-	}
-	return nil, false
 }
 
 // isRecordKind reports whether typ names the Avro record kind in
@@ -1874,8 +1840,8 @@ func firstMetadataBranchAcceptingDefault(t *SchemaNode, val any, table map[strin
 func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) SchemaNode {
 	n := SchemaNode{}
 
-	getCIString(m, "type", &n.Type)
-	getCIString(m, "name", &n.Name)
+	getString(m, "type", &n.Type)
+	getString(m, "name", &n.Name)
 	// Namespace resolves at build: an explicit attribute wins (including
 	// the explicit-empty "namespace":"" null-namespace form — a DIFFERENT
 	// type than one inheriting the enclosing namespace, per the spec's
@@ -1884,10 +1850,8 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	// namespace; any attribute alongside it is preserved as-written for
 	// fidelity but ignored, exactly as the parser ignores it.
 	explicitNS, hasExplicitNS := "", false
-	if v, ok := lookupCI(m, "namespace"); ok {
-		if s, ok := v.(string); ok {
-			explicitNS, hasExplicitNS = s, true
-		}
+	if s, ok := m["namespace"].(string); ok {
+		explicitNS, hasExplicitNS = s, true
 	}
 	switch {
 	// Named kinds with an empty short name inherit/take-explicit exactly
@@ -1903,8 +1867,8 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 		n.Namespace = explicitNS
 	}
 	childNS := nsForChildren(&n, parentNS)
-	getCIString(m, "doc", &n.Doc)
-	getCIString(m, "logicalType", &n.LogicalType)
+	getString(m, "doc", &n.Doc)
+	getString(m, "logicalType", &n.LogicalType)
 	// precision/scale/size are int per spec. After
 	// unmarshalAnyPreservePrecision, integer JSON literals come back as
 	// int64 (not float64); jsonNumericInt accepts both. Precision/Scale
@@ -1913,15 +1877,15 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	// the keys to the Props loop below (decimalConsumesPrecisionScale,
 	// mirrored by the wire parser's extra routing).
 	if decimalConsumesPrecisionScale(n.Type, n.LogicalType) {
-		getCIInt(m, "precision", &n.Precision)
-		getCIInt(m, "scale", &n.Scale)
+		getInt(m, "precision", &n.Precision)
+		getInt(m, "scale", &n.Scale)
 	}
-	getCIInt(m, "size", &n.Size)
-	getCIStringSlice(m, "aliases", &n.Aliases)
-	getCIStringSlice(m, "symbols", &n.Symbols)
+	getInt(m, "size", &n.Size)
+	getStringSlice(m, "aliases", &n.Aliases)
+	getStringSlice(m, "symbols", &n.Symbols)
 
-	if v, ok := lookupCI(m, "default"); ok && n.Type == "enum" {
-		if d, ok := v.(string); ok {
+	if n.Type == "enum" {
+		if d, ok := m["default"].(string); ok {
 			n.EnumDefault = d
 			n.HasEnumDefault = true
 		}
@@ -1996,8 +1960,8 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	// them on the recorded result instead of decoding the subtree a second
 	// time here. The non-recursive stray keys (name/namespace/symbols/size/
 	// aliases) carry no compounding cost, so a fresh single check is fine.
-	shapeOK := func(canonKey string, v any) bool {
-		switch canonKey {
+	shapeOK := func(key string, v any) bool {
+		switch key {
 		case "items":
 			return n.Items != nil
 		case "values":
@@ -2005,11 +1969,10 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 		case "fields":
 			return n.Fields != nil
 		}
-		return strayBodyShapeOK(canonKey, v)
+		return strayBodyShapeOK(key, v)
 	}
-	variantPicks := reservedKeyVariantPicks(m, schemaReservedKeys)
 	for k, v := range m {
-		if schemaReservedKeyForObject(m, k, v, n.Type, n.LogicalType, variantPicks, shapeOK) {
+		if schemaReservedKeyForObject(k, v, n.Type, n.LogicalType, shapeOK) {
 			continue
 		}
 		if n.Props == nil {
@@ -2029,8 +1992,8 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 // exactly as the wire lift routes it.
 func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) SchemaField {
 	sf := SchemaField{Type: typ}
-	getCIString(fm, "name", &sf.Name)
-	if d, ok := lookupCI(fm, "default"); ok {
+	getString(fm, "name", &sf.Name)
+	if d, ok := fm["default"]; ok {
 		// Coerce string defaults to typed float64 for float/double
 		// fields (and recurse through nested record/array/map/union
 		// types), matching Java's Schema.parseField text→DoubleNode
@@ -2045,18 +2008,17 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 		sf.HasDefault = true
 	}
 	if flatType == nil {
-		getCIString(fm, "doc", &sf.Doc)
+		getString(fm, "doc", &sf.Doc)
 	}
-	getCIStringSlice(fm, "aliases", &sf.Aliases)
-	getCIString(fm, "order", &sf.Order)
-	// Exactly one spelling of each field reserved key — the CI readers'
-	// pick above — is consumed into the SchemaField attribute; every
-	// other spelling (a case-variant duplicate) is an ordinary field
-	// property, preserved verbatim. Same rule as the type-object Props
-	// routing (schemaReservedKeyForObject).
-	variantPicks := reservedKeyVariantPicks(fm, fieldReservedKeys)
+	getStringSlice(fm, "aliases", &sf.Aliases)
+	getString(fm, "order", &sf.Order)
+	// The exact-lowercase field reserved keys are consumed into the
+	// SchemaField attributes above; every other key — including a
+	// case-variant spelling of a reserved key, which is an ordinary
+	// custom property — is preserved verbatim. Same rule as the
+	// type-object Props routing (schemaReservedKeyForObject).
 	for k, v := range fm {
-		if canon, ok := reservedKeyCanon(k, fieldReservedKeys); ok && reservedKeyIsPick(fm, variantPicks, k, canon) {
+		if fieldReservedKeys[k] {
 			continue
 		}
 		if _, routed := flatType[k]; routed {
@@ -2068,64 +2030,6 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 		sf.Props[k] = v
 	}
 	return sf
-}
-
-// reservedKeyCanon returns the canonical spelling of the reserved key
-// that k names under case-insensitive matching, if any. The single
-// case-insensitive fall-through scan shared by every reserved-key check.
-func reservedKeyCanon(k string, reserved map[string]bool) (string, bool) {
-	if reserved[k] {
-		return k, true
-	}
-	for rk := range reserved {
-		if strings.EqualFold(k, rk) {
-			return rk, true
-		}
-	}
-	return "", false
-}
-
-// reservedKeyVariantPicks returns, for each reserved key that appears in
-// m ONLY under non-canonical spellings, the lexicographically smallest
-// such spelling — the one the CI readers (lookupCI / ciKey / getCI*)
-// consult when no exact-case spelling exists. Maps whose reserved keys
-// are all exact-case (the overwhelmingly common shape) return nil with
-// no allocation; reservedKeyIsPick treats the exact spelling as its own
-// pick without consulting this table.
-func reservedKeyVariantPicks(m map[string]any, reserved map[string]bool) map[string]string {
-	var picks map[string]string
-	for k := range m {
-		canon, ok := reservedKeyCanon(k, reserved)
-		if !ok || canon == k {
-			continue
-		}
-		if picks == nil {
-			picks = make(map[string]string)
-		}
-		if cur, have := picks[canon]; !have || k < cur {
-			picks[canon] = k
-		}
-	}
-	return picks
-}
-
-// reservedKeyIsPick reports whether raw spelling k (canonical form canon)
-// is the ONE spelling of that reserved key the readers consult in m: the
-// exact-case spelling when present, else the lexicographically smallest
-// case-insensitive match — the same selection lookupCI, ciKey, and the
-// getCI* helpers make. Exactly the pick is consumed by the matching
-// attribute read; every other spelling of the same reserved key is an
-// ordinary custom property that rides to Props verbatim, whatever its
-// body — the pick owns the structural slot, so an unpicked spelling has
-// nothing to bind and nothing about its content changes its routing.
-func reservedKeyIsPick(m map[string]any, variantPicks map[string]string, k, canon string) bool {
-	if k == canon {
-		return true
-	}
-	if _, exact := m[canon]; exact {
-		return false
-	}
-	return variantPicks[canon] == k
 }
 
 // decimalConsumesPrecisionScale reports whether a type object with the
@@ -2142,19 +2046,16 @@ func decimalConsumesPrecisionScale(typ, logical string) bool {
 }
 
 // schemaReservedKeyForObject reports whether key k (value v) on a type
-// object m of the given kind/logical is consumed or structurally
+// object of the given kind/logical is consumed or structurally
 // surfaced — and so kept OUT of Props.
 //
-// Exactly ONE spelling of each reserved key — the exact-case-preferred,
-// else lexicographically smallest case-insensitive pick, the same
-// selection every CI reader makes — is consulted for structural binding
-// and consumed. Every other raw key, including case-variant duplicates
-// of a reserved key, is an ordinary custom property that rides to Props
-// verbatim, deterministically, with no branching on its body: the pick
-// owns the structural slot, so an unpicked spelling has nothing to bind.
-// Props == all raw keys minus the consumed picks.
+// Reserved attribute names match ONLY their exact lowercase spelling.
+// Every other key — including a case-variant spelling of a reserved key —
+// is an ordinary custom property that rides to Props verbatim: it binds
+// nothing, and nothing about its body changes its routing. Props == all
+// raw keys minus the consumed reserved keys.
 //
-// For the pick itself: precision/scale are reserved only on a recognized
+// For a reserved key: precision/scale are reserved only on a recognized
 // decimal carrier. A structural/naming key on a kind that does not bind
 // it, holding a body that does not parse as the key's schema shape, is
 // inert metadata with no possible binding reading: it stays a custom
@@ -2165,31 +2066,26 @@ func decimalConsumesPrecisionScale(typ, logical string) bool {
 // shapeOK answers "did this stray key's body parse as the key's schema
 // shape" from a verdict the caller ALREADY computed — the parser's arms
 // record it in the aobject, the metadata walker records it as it surfaces
-// children. It is consulted only for the pick, whose body is exactly the
-// one the caller's arm decoded, so the recorded verdict always describes
-// the queried body. Consulting the recorded verdict is what keeps this
-// routing from re-decoding a subtree the caller already walked: a fresh
+// children — so the recorded verdict always describes the queried body.
+// Consulting the recorded verdict is what keeps this routing from
+// re-decoding a subtree the caller already walked: a fresh
 // strayBodyShapeOK here would re-enter aschemaFromAny on the same body,
 // and because that decode itself routes stray keys, the two decodes per
 // level compound to O(2^depth) over a nested-stray schema. A nil shapeOK
 // falls back to a fresh decode, for the one caller (the cache splice
 // merge) that has no recorded verdict and walks no nested strays.
-func schemaReservedKeyForObject(m map[string]any, k string, v any, typ, logical string, variantPicks map[string]string, shapeOK strayShapeVerdict) bool {
-	canon, ok := reservedKeyCanon(k, schemaReservedKeys)
-	if !ok {
+func schemaReservedKeyForObject(k string, v any, typ, logical string, shapeOK strayShapeVerdict) bool {
+	if !schemaReservedKeys[k] {
 		return false
 	}
-	if !reservedKeyIsPick(m, variantPicks, k, canon) {
-		return false
-	}
-	if canon == "precision" || canon == "scale" {
+	if k == "precision" || k == "scale" {
 		return decimalConsumesPrecisionScale(typ, logical)
 	}
-	if key := canonicalStrayKey(canon); key != "" && !strayKeyBinds(typ, key) {
+	if canonicalStrayKey(k) != "" && !strayKeyBinds(typ, k) {
 		if shapeOK != nil {
-			return shapeOK(key, v)
+			return shapeOK(k, v)
 		}
-		return strayBodyShapeOK(key, v)
+		return strayBodyShapeOK(k, v)
 	}
 	return true
 }

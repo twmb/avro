@@ -137,24 +137,19 @@ func SchemaFor[T any](opts ...SchemaOpt) (*Schema, error) {
 // resolve inside it). Shared by dedupNamedTypes and normalizeSchemaScope so
 // the keying walk and the equality walk cannot drift on scope rules.
 //
-// Reserved keys are read via lookupCI: the tree this walk keys is the tree
-// Parse will consume, and Parse matches reserved attribute names
-// case-insensitively (a Props key differing from "namespace" only by ASCII
-// case IS the namespace attribute — see [Schema.Root]). Reading exact-case
-// here would key a definition under a fullname Parse won't bind.
+// Reserved keys are read by exact name: the tree this walk keys is the
+// tree Parse will consume, and Parse matches reserved attribute names
+// only by their exact lowercase spelling (a case-variant key is an
+// ordinary custom property — see [Schema.Root]), so exact reads here key
+// definitions exactly as Parse binds them.
 func resolveNameScope(v map[string]any, enclosingNS string) (full, ns string) {
-	var name string
-	if nv, ok := lookupCI(v, "name"); ok {
-		name, _ = nv.(string)
-	}
+	name, _ := v["name"].(string)
 	short := name
 	ns = enclosingNS
 	if i := strings.LastIndex(name, "."); i >= 0 {
 		short, ns = name[i+1:], name[:i]
-	} else if nsv, ok := lookupCI(v, "namespace"); ok {
-		if attr, ok := nsv.(string); ok {
-			ns = attr
-		}
+	} else if attr, ok := v["namespace"].(string); ok {
+		ns = attr
 	}
 	return avroFullName(ns, short), ns
 }
@@ -174,19 +169,18 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 		childNS := enclosingNS
 		var typ, full string
 		named := false
-		if tv, ok := lookupCI(v, "type"); ok {
+		if tv, ok := v["type"]; ok {
 			typ, _ = tv.(string)
 			if isNamedKind(typ) {
 				named = true
 				full, childNS = resolveNameScope(v, enclosingNS)
 			}
 		}
-		// Key classification is case-insensitive to match the Parse this
-		// tree feeds (see resolveNameScope): a case-variant reserved key IS
-		// the reserved attribute, so it normalizes — and, for "namespace",
-		// folds away — exactly like the exact-case spelling. Both
-		// occurrences of one definition carry identical keys, so writing
-		// through the as-written key keeps the comparison deterministic.
+		// Key classification is by exact name, matching the Parse this
+		// tree feeds (see resolveNameScope): only the exact lowercase
+		// spelling is the reserved attribute, so only it normalizes — a
+		// case-variant key is an ordinary custom property and compares
+		// verbatim like any other.
 		//
 		// Structural keys normalize only on the kind that BINDS them
 		// (fields on record/error, items on array, values on map),
@@ -197,11 +191,11 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 		// spelling-equivalent under a scope the parser never applies.
 		for k, val := range v {
 			switch {
-			case named && strings.EqualFold(k, "name"):
+			case named && k == "name":
 				out[k] = full
-			case named && strings.EqualFold(k, "namespace"):
+			case named && k == "namespace":
 				// Folded into the fullname.
-			case isRecordKind(typ) && strings.EqualFold(k, "fields"):
+			case isRecordKind(typ) && k == "fields":
 				fields, ok := val.([]map[string]any)
 				if !ok {
 					out[k] = val
@@ -211,7 +205,7 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 				for i, f := range fields {
 					cf := make(map[string]any, len(f))
 					for fk, fv := range f {
-						if strings.EqualFold(fk, "type") {
+						if fk == "type" {
 							cf[fk] = normalizeSchemaScope(fv, childNS)
 						} else {
 							cf[fk] = fv
@@ -220,8 +214,8 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 					nf[i] = cf
 				}
 				out[k] = nf
-			case typ == "array" && strings.EqualFold(k, "items"),
-				typ == "map" && strings.EqualFold(k, "values"):
+			case typ == "array" && k == "items",
+				typ == "map" && k == "values":
 				out[k] = normalizeSchemaScope(val, childNS)
 			default:
 				out[k] = val
@@ -260,23 +254,15 @@ func normalizeSchemaScope(v any, enclosingNS string) any {
 func pinCustomSchemaScope(v any) {
 	switch v := v.(type) {
 	case map[string]any:
-		var typ string
-		if tv, ok := lookupCI(v, "type"); ok {
-			typ, _ = tv.(string)
-		}
+		typ, _ := v["type"].(string)
 		if isNamedKind(typ) {
-			var name string
-			if nv, ok := lookupCI(v, "name"); ok {
-				name, _ = nv.(string)
-			}
+			name, _ := v["name"].(string)
 			if !strings.Contains(name, ".") {
-				// A namespace key of ANY casing is the namespace attribute
-				// (Parse folds case-variants onto it — see resolveNameScope),
-				// so its presence means the node already pins its scope.
-				// Injecting an exact-case "namespace":"" over a case-variant
-				// spelling would shadow the declared namespace at parse,
-				// silently renaming the type.
-				if _, has := lookupCI(v, "namespace"); !has {
+				// Only the exact "namespace" key is the namespace
+				// attribute (a case-variant spelling is an ordinary
+				// custom property Parse never reads), so the node pins
+				// its scope exactly when the exact key is present.
+				if _, has := v["namespace"]; !has {
 					v["namespace"] = ""
 				}
 			}
@@ -290,12 +276,12 @@ func pinCustomSchemaScope(v any) {
 		// never name-bound by Parse, so injecting the inheritance escape
 		// there would alter caller metadata, not pin a scope.
 		if typ == "array" {
-			if items, ok := lookupCI(v, "items"); ok {
+			if items, ok := v["items"]; ok {
 				pinCustomSchemaScope(items)
 			}
 		}
 		if typ == "map" {
-			if values, ok := lookupCI(v, "values"); ok {
+			if values, ok := v["values"]; ok {
 				pinCustomSchemaScope(values)
 			}
 		}
@@ -529,10 +515,7 @@ func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any,
 		// registration key; fullname "" (an empty lax name with no
 		// namespace) has no reference spelling, so it stays inline and
 		// un-deduped, mirroring the metadata rebuild's dedup walker.
-		var typ string
-		if tv, ok := lookupCI(v, "type"); ok {
-			typ, _ = tv.(string)
-		}
+		typ, _ := v["type"].(string)
 		if isNamedKind(typ) {
 			full, ns := resolveNameScope(v, enclosingNS)
 			childNS = ns
@@ -566,12 +549,9 @@ func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any,
 		// Recurse into children that can hold schemas. Record fields
 		// resolve in the record's own namespace scope; items and values
 		// belong to unnamed array/map nodes, which pass the scope through
-		// (childNS == enclosingNS there). Reads are case-insensitive to
-		// match Parse (see resolveNameScope), and rewrites go back to the
-		// key actually present (ciKey) so a case-variant spelling is
-		// updated in place — writing a new exact-case key alongside it
-		// would leave both spellings in the map, and Parse's exact-first
-		// preference would then read whichever this walk did NOT rewrite.
+		// (childNS == enclosingNS there). Reads and rewrites use the
+		// exact reserved spelling — the only spelling Parse binds (see
+		// resolveNameScope).
 		//
 		// Each descent is gated on the kind that BINDS the key (fields on
 		// record/error, items on array, values on map), mirroring the
@@ -581,38 +561,35 @@ func dedupNamedTypes(v any, defined map[string]string, enclosingNS string) (any,
 		// fullname would then dedup into a dangling reference or report a
 		// false duplicate — so the stray passes through untouched.
 		if isRecordKind(typ) {
-			if fv, ok := lookupCI(v, "fields"); ok {
-				if fields, ok := fv.([]map[string]any); ok {
-					for i := range fields {
-						tk, ok := ciKey(fields[i], "type")
-						if !ok {
-							continue
-						}
-						nt, err := dedupNamedTypes(fields[i][tk], defined, childNS)
-						if err != nil {
-							return nil, err
-						}
-						fields[i][tk] = nt
+			if fields, ok := v["fields"].([]map[string]any); ok {
+				for i := range fields {
+					if _, ok := fields[i]["type"]; !ok {
+						continue
 					}
+					nt, err := dedupNamedTypes(fields[i]["type"], defined, childNS)
+					if err != nil {
+						return nil, err
+					}
+					fields[i]["type"] = nt
 				}
 			}
 		}
 		if typ == "array" {
-			if ik, ok := ciKey(v, "items"); ok {
-				nt, err := dedupNamedTypes(v[ik], defined, childNS)
+			if _, ok := v["items"]; ok {
+				nt, err := dedupNamedTypes(v["items"], defined, childNS)
 				if err != nil {
 					return nil, err
 				}
-				v[ik] = nt
+				v["items"] = nt
 			}
 		}
 		if typ == "map" {
-			if vk, ok := ciKey(v, "values"); ok {
-				nt, err := dedupNamedTypes(v[vk], defined, childNS)
+			if _, ok := v["values"]; ok {
+				nt, err := dedupNamedTypes(v["values"], defined, childNS)
 				if err != nil {
 					return nil, err
 				}
-				v[vk] = nt
+				v["values"] = nt
 			}
 		}
 		return v, nil
@@ -1229,25 +1206,19 @@ type typeAliasResult struct {
 // aliases on the field itself).
 //
 // Like the composition walkers (resolveNameScope and friends), this walk
-// reads reserved keys case-insensitively (lookupCI) and writes the
-// aliases attribute back through its as-written key
-// (appendTypeAliasValues), matching how the Parse consuming the composed
-// tree binds them: a rendered custom tree can carry any reserved key as
-// a Props case-variant, and Parse folds every spelling onto the reserved
-// attribute — including a container's binding key (a Props-carried
-// "Items" on an array whose Items field is nil IS the array's items),
-// so the walk must route and write by the folded key, never the literal
-// spelling. The one consumer with no Parse counterpart is refName: a
-// per-build bookkeeping key (applied[]), which only needs to be
-// CONSISTENT across occurrences within one build — the shared lookupCI
-// reads make every occurrence resolve it identically.
+// reads reserved keys by exact name, matching how the Parse consuming
+// the composed tree binds them: only the exact lowercase spelling is the
+// reserved attribute — a Props case-variant is an ordinary custom
+// property that neither the walk nor Parse routes through — so the walk
+// descends and writes exactly the keys Parse will bind. The one consumer
+// with no Parse counterpart is refName: a per-build bookkeeping key
+// (applied[]), which only needs to be CONSISTENT across occurrences
+// within one build — the shared exact reads make every occurrence
+// resolve it identically.
 func addTypeAliases(schema any, aliases []string) typeAliasResult {
 	switch s := schema.(type) {
 	case map[string]any:
-		var typ string
-		if tv, ok := lookupCI(s, "type"); ok {
-			typ, _ = tv.(string)
-		}
+		typ, _ := s["type"].(string)
 		switch {
 		case isNamedKind(typ):
 			appendTypeAliasValues(s, aliases)
@@ -1259,20 +1230,15 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 			// by one identity. (A namespace-less type's fullname is its
 			// bare name, so fixed types and no-namespace records are
 			// unchanged.)
-			var name, ns string
-			if nv, ok := lookupCI(s, "name"); ok {
-				name, _ = nv.(string)
-			}
-			if nsv, ok := lookupCI(s, "namespace"); ok {
-				ns, _ = nsv.(string)
-			}
+			name, _ := s["name"].(string)
+			ns, _ := s["namespace"].(string)
 			return typeAliasResult{applied: true, refName: avroFullName(ns, name)}
 		case typ == "array":
-			if items, ok := lookupCI(s, "items"); ok {
+			if items, ok := s["items"]; ok {
 				return addTypeAliases(items, aliases)
 			}
 		case typ == "map":
-			if values, ok := lookupCI(s, "values"); ok {
+			if values, ok := s["values"]; ok {
 				return addTypeAliases(values, aliases)
 			}
 		}
@@ -1300,12 +1266,10 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 }
 
 // appendTypeAliasValues merges the tag's aliases into the type's existing
-// aliases attribute through its as-written key (ciKey): a Props-carried
-// case-variant spelling is EXTENDED in place, because an exact-case write
-// beside it would leave two spellings of one attribute in the composed
-// object and Parse's duplicate-key resolution keeps only one — silently
-// dropping the caller's aliases. The existing value is []string or []any
-// on every route: freshly-inferred literals build []string, and the
+// exact-key "aliases" attribute — the only spelling Parse binds (a
+// Props-carried case-variant is an ordinary custom property, left
+// untouched beside the real attribute). The existing value is []string or
+// []any on every route: freshly-inferred literals build []string, and the
 // render boundary canonicalizes every caller-typed array shape into
 // []string/[]any fresh copies (deepCopyJSONTree/canonicalizeTreeValue —
 // so the appends below never write into a caller-owned backing array).
@@ -1314,21 +1278,21 @@ func addTypeAliases(schema any, aliases []string) typeAliasResult {
 // read from its marshal, the documented opacity residual — a merge would
 // require marshaling it early, and its output is its author's contract.
 func appendTypeAliasValues(s map[string]any, aliases []string) {
-	k, ok := ciKey(s, "aliases")
+	v, ok := s["aliases"]
 	if !ok {
 		s["aliases"] = append([]string(nil), aliases...)
 		return
 	}
-	switch existing := s[k].(type) {
+	switch existing := v.(type) {
 	case []string:
-		s[k] = append(existing, aliases...)
+		s["aliases"] = append(existing, aliases...)
 	case []any:
 		merged := make([]any, 0, len(existing)+len(aliases))
 		merged = append(merged, existing...)
 		for _, a := range aliases {
 			merged = append(merged, a)
 		}
-		s[k] = merged
+		s["aliases"] = merged
 	}
 }
 

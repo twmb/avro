@@ -9,23 +9,20 @@ import (
 	"github.com/twmb/avro"
 )
 
-// Reserved keys are matched case-insensitively, and two case-variant
-// spellings of one reserved key ("items" and "ITEMS") are distinct JSON
-// keys the parser accepts. The routing invariant: exactly ONE spelling of
-// each reserved key — the exact-case-preferred, else lexicographically
-// smallest case-insensitive pick, the same selection every reader uses —
-// is consulted for structural binding and consumed; EVERY other raw map
-// key that is not itself a consumed pick, including case-variants of
-// reserved keys and unpicked valid duplicates, rides to Props verbatim.
-// Props == all raw keys minus the picked reserved keys consumed into
-// structural fields — deterministic, with no per-shape branching on the
-// unpicked spelling's body. Both reading surfaces (the parse-side props
-// handed to CustomType callbacks, and the Root() metadata walk) apply the
-// same rule and must agree; the Root().Schema() rebuild preserves the
-// preserved keys. Java treats reserved keys case-sensitively (the
-// SCHEMA_RESERVED skip set is exact-lowercase, Schema.java:175-176), so a
-// case-variant spelling is an ordinary preserved property there; fastavro
-// likewise reads known keys by exact name and preserves the rest.
+// Reserved keys match ONLY their exact lowercase spelling, so a
+// case-variant spelling ("ITEMS" beside "items") is an ordinary custom
+// property — two distinct JSON keys with no contention over the reserved
+// slot. The routing invariant: the exact spelling alone is consulted for
+// structural binding and consumed; EVERY other raw map key, including
+// case-variants of reserved keys, rides to Props verbatim with no
+// branching on its body. Props == all raw keys minus the consumed
+// exact-lowercase reserved keys. Both reading surfaces (the parse-side
+// props handed to CustomType callbacks, and the Root() metadata walk)
+// apply the same rule and must agree; the Root().Schema() rebuild
+// preserves the preserved keys. Java's reserved sets are exact-lowercase
+// HashSets (SCHEMA_RESERVED, Schema.java:175-176), so a case-variant
+// spelling is an ordinary preserved property there too; fastavro and
+// goavro likewise read known keys by exact name (both executed).
 
 // propsCaptureCustom returns a match-all CustomType whose Encode records
 // the Props of the node matching typ (+ name, when non-empty) and then
@@ -91,7 +88,7 @@ type reservedDupRow struct {
 	key      string // canonical spelling; variant spelling is ToUpper(key)
 	carriers []reservedDupCarrier
 	// variant bodies: one valid for the key's shape, one malformed
-	// container/content, one wrong-JSON-kind scalar. The unpicked
+	// container/content, one wrong-JSON-kind scalar. The variant
 	// spelling's routing must be IDENTICAL for all three.
 	bodies []string
 }
@@ -149,7 +146,7 @@ func reservedDupRows() []reservedDupRow {
 // wantKey with wantVal on all of: Root().Props, the CustomType-callback
 // node's Props, and the Root().Schema() rebuild's Props. When wantKey is
 // "", asserts Props carries NO spelling of dropKey on any surface (the
-// consumed-pick control).
+// consumed-exact-key control).
 func checkReservedDupCell(t *testing.T, cell string, carrier reservedDupCarrier, wantKey string, wantVal any, dropKey string) {
 	t.Helper()
 	var captured map[string]any
@@ -172,14 +169,14 @@ func checkReservedDupCell(t *testing.T, cell string, carrier reservedDupCarrier,
 		if wantKey != "" {
 			got, ok := props[wantKey]
 			if !ok {
-				t.Errorf("%s missing %q (unpicked reserved-key spellings are ordinary properties, preserved verbatim): %#v\ncell: %s", surface, wantKey, props, cell)
+				t.Errorf("%s missing %q (case-variant reserved-key spellings are ordinary properties, preserved verbatim): %#v\ncell: %s", surface, wantKey, props, cell)
 			} else if !reflect.DeepEqual(got, wantVal) {
 				t.Errorf("%s[%q] = %#v (%T); want %#v (%T)\ncell: %s", surface, wantKey, got, got, wantVal, wantVal, cell)
 			}
 		} else {
 			for k := range props {
 				if strings.EqualFold(k, dropKey) {
-					t.Errorf("%s carries consumed pick spelling %q: %#v\ncell: %s", surface, k, props, cell)
+					t.Errorf("%s carries a spelling of consumed key %q: %#v\ncell: %s", surface, k, props, cell)
 				}
 			}
 		}
@@ -229,20 +226,20 @@ func findNodeByType(n *avro.SchemaNode, typ, name string) *avro.SchemaNode {
 }
 
 // TestMatrix_ReservedKeyDuplicateSpellings crosses every reserved key that
-// has a structural consumption arm × spellings-present {pick-only,
-// pick+case-variant} × the variant's body {valid for the key's shape,
+// has a structural consumption arm × spellings-present {exact-only,
+// exact+case-variant} × the variant's body {valid for the key's shape,
 // malformed, non-schema scalar} × carrier {binding kind, non-binding
 // stray placement} × reading surface {parse-side callback Props, Root()
-// Props, Root().Schema() rebuild}. The unpicked spelling must ride to
+// Props, Root().Schema() rebuild}. The variant spelling must ride to
 // Props verbatim in every cell — its body's shape must not change the
-// routing — and the pick-only controls prove the consumed pick never
-// leaks into Props.
+// routing — and the exact-only controls prove the consumed exact key
+// never leaks into Props.
 func TestMatrix_ReservedKeyDuplicateSpellings(t *testing.T) {
 	t.Parallel()
 	for _, row := range reservedDupRows() {
 		variant := strings.ToUpper(row.key)
 		for _, carrier := range row.carriers {
-			t.Run(row.key+"/"+carrier.label+"/pick-only", func(t *testing.T) {
+			t.Run(row.key+"/"+carrier.label+"/exact-only", func(t *testing.T) {
 				checkReservedDupCell(t, carrier.build(""), carrier, "", nil, row.key)
 			})
 			for _, body := range row.bodies {
@@ -255,12 +252,12 @@ func TestMatrix_ReservedKeyDuplicateSpellings(t *testing.T) {
 	}
 }
 
-// The unpicked-spelling rule is body-independent in the other direction
-// too: when the PICK's body is malformed on a non-binding kind (so the
-// pick itself rides to Props), the unpicked valid spelling still rides to
-// Props — nothing is silently dropped and nothing is promoted to the
-// structural field.
-func TestMatrix_ReservedKeyDuplicatePickMalformed(t *testing.T) {
+// The variant-spelling rule is body-independent in the other direction
+// too: when the EXACT key's body is malformed on a non-binding kind (so
+// the exact key itself rides to Props), the variant's valid body still
+// rides to Props — nothing is silently dropped and nothing is promoted
+// to the structural field.
+func TestMatrix_ReservedKeyDuplicateExactMalformed(t *testing.T) {
 	t.Parallel()
 	s, err := avro.Parse(`{"type":"int","items":12,"ITEMS":"int"}`)
 	if err != nil {
@@ -268,20 +265,20 @@ func TestMatrix_ReservedKeyDuplicatePickMalformed(t *testing.T) {
 	}
 	root := s.Root()
 	if root.Items != nil {
-		t.Errorf("malformed pick body must not surface structurally: %+v", root.Items)
+		t.Errorf("malformed exact-key body must not surface structurally: %+v", root.Items)
 	}
 	props := root.Props
 	if got := props["items"]; !reflect.DeepEqual(got, int64(12)) {
-		t.Errorf(`Props["items"] = %#v; want 12 (malformed pick body rides to Props)`, got)
+		t.Errorf(`Props["items"] = %#v; want 12 (malformed exact-key body rides to Props)`, got)
 	}
 	if got := props["ITEMS"]; !reflect.DeepEqual(got, "int") {
-		t.Errorf(`Props["ITEMS"] = %#v; want "int" (unpicked spelling rides to Props verbatim)`, got)
+		t.Errorf(`Props["ITEMS"] = %#v; want "int" (variant spelling rides to Props verbatim)`, got)
 	}
 }
 
-// A malformed body under an unpicked case-variant spelling must ride to
-// Props on every surface; it must not inherit the picked spelling's
-// shape-OK verdict and be consumed.
+// A malformed body under a case-variant spelling must ride to Props on
+// every surface; the exact key's shape-OK verdict must never leak onto
+// it.
 func TestRegression_ReservedDupMalformedVariantPreserved(t *testing.T) {
 	t.Parallel()
 	carrier := reservedDupCarrier{"stray", func(extra string) string {
@@ -290,26 +287,25 @@ func TestRegression_ReservedDupMalformedVariantPreserved(t *testing.T) {
 	checkReservedDupCell(t, carrier.build(`,"ITEMS":12`), carrier, "ITEMS", int64(12), "")
 }
 
-// An unpicked case-variant spelling whose body is ITSELF a valid schema
-// shape also rides to Props: only the picked spelling is consulted for
-// structural surfacing, and the single structural slot is the pick's.
-// Uniform preservation is the adjudicated rule — previously the unpicked
-// valid spelling was silently dropped (consumed as reserved but never
-// surfaced), losing user data with no observable trace.
-func TestRegression_ReservedDupUnpickedValidVariantPreserved(t *testing.T) {
+// A case-variant spelling whose body is ITSELF a valid schema shape also
+// rides to Props: only the exact spelling is consulted for structural
+// surfacing, and the single structural slot is the exact key's. Uniform
+// preservation is the rule — a valid-shaped variant body must not be
+// silently dropped or promoted.
+func TestRegression_ReservedDupValidVariantPreserved(t *testing.T) {
 	t.Parallel()
 	carrier := reservedDupCarrier{"stray", func(extra string) string {
 		return `{"type":"int","items":"int"` + extra + `}`
 	}, int32(1), "int", ""}
 	checkReservedDupCell(t, carrier.build(`,"ITEMS":"long"`), carrier, "ITEMS", "long", "")
-	// The structural slot carries the pick's body, not the variant's.
+	// The structural slot carries the exact key's body, not the variant's.
 	s, err := avro.Parse(`{"type":"int","items":"int","ITEMS":"long"}`)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
 	root := s.Root()
 	if root.Items == nil || root.Items.Type != "int" {
-		t.Errorf("structural Items = %+v; want the picked body (int)", root.Items)
+		t.Errorf("structural Items = %+v; want the exact key's body (int)", root.Items)
 	}
 }
 
@@ -338,7 +334,7 @@ func TestRegression_ReservedDupParseMetadataPropsParity(t *testing.T) {
 	}
 }
 
-// Field-level reserved keys follow the same rule: the picked spelling is
+// Field-level reserved keys follow the same rule: the exact spelling is
 // consumed into the SchemaField attribute, every other spelling is an
 // ordinary field property preserved in SchemaField.Props and by the
 // rebuild.
@@ -351,10 +347,10 @@ func TestRegression_FieldReservedDupVariantPreserved(t *testing.T) {
 	}
 	f := s.Root().Fields[0]
 	if f.Doc != "d" {
-		t.Errorf("Doc = %q; want the picked spelling's body", f.Doc)
+		t.Errorf("Doc = %q; want the exact spelling's body", f.Doc)
 	}
 	if got := f.Props["DOC"]; !reflect.DeepEqual(got, int64(12)) {
-		t.Errorf(`Props["DOC"] = %#v; want 12 (unpicked field reserved-key spelling preserved)`, got)
+		t.Errorf(`Props["DOC"] = %#v; want 12 (case-variant field reserved-key spelling preserved)`, got)
 	}
 	root := s.Root()
 	rb, err := root.Schema()
@@ -367,8 +363,8 @@ func TestRegression_FieldReservedDupVariantPreserved(t *testing.T) {
 }
 
 // TestMatrix_FieldReservedKeyDuplicateSpellings is the field-level arm of
-// the duplicate-spelling matrix: every field reserved key × {pick-only,
-// pick+case-variant} × {valid-shaped, non-schema} variant bodies, on
+// the duplicate-spelling matrix: every field reserved key × {exact-only,
+// exact+case-variant} × {valid-shaped, non-schema} variant bodies, on
 // SchemaField.Props and its rebuild.
 func TestMatrix_FieldReservedKeyDuplicateSpellings(t *testing.T) {
 	t.Parallel()
@@ -398,12 +394,12 @@ func TestMatrix_FieldReservedKeyDuplicateSpellings(t *testing.T) {
 		}
 		return props, rb.Root().Fields[0].Props
 	}
-	t.Run("pick-only", func(t *testing.T) {
+	t.Run("exact-only", func(t *testing.T) {
 		props, rbProps := fieldProps(t, host(""))
 		for _, p := range []map[string]any{props, rbProps} {
 			for k := range p {
 				if _, reserved := fieldBodies[strings.ToLower(k)]; reserved {
-					t.Errorf("consumed field pick spelling %q leaked into Props: %#v", k, p)
+					t.Errorf("consumed field key spelling %q leaked into Props: %#v", k, p)
 				}
 			}
 		}
@@ -457,19 +453,14 @@ func TestDifferentialFastavroReservedDupSpellings(t *testing.T) {
 }
 
 // The cache splice-merge applies the same rule when a props-carrying
-// wrapped reference is replaced by its definition: the wrapper's picked
-// reserved spellings die (definition-wins; Java drops usage-site extras
-// at reference sites entirely), while unpicked spellings and picked stray
-// spellings with non-shape bodies merge onto the spliced definition as
-// ordinary props. Two wrapper props that collide case-insensitively only
-// with EACH OTHER both merge, deterministically — the definition-wins
-// check is against the definition's own (pre-merge) keys, never against
-// what an earlier random-order iteration already merged. A merged variant
-// that the DEFINITION's own next parse consumes (a def-side reserved key
-// like doc, where the merged spelling becomes the sole pick) is consumed
-// by that reparse — the merge is deterministic, and String() keeps the
-// self-contained text verbatim, exactly like a plain parse whose raw text
-// carries a consumed spelling.
+// wrapped reference is replaced by its definition: the wrapper's
+// exact-lowercase reserved spellings die (consumed; Java drops usage-site
+// extras at reference sites entirely), while case-variant spellings —
+// ordinary custom properties — and exact stray spellings with non-shape
+// bodies merge onto the spliced definition as ordinary props.
+// Definition-wins is an exact-key presence check, so the merge is
+// order-independent: map keys are unique and merging one wrapper prop can
+// never change another's verdict.
 func TestRegression_CacheSpliceWrapperVariantPropsPreserved(t *testing.T) {
 	t.Parallel()
 	// Repeat to shake out map-iteration-order dependence: every parse of
@@ -490,16 +481,17 @@ func TestRegression_CacheSpliceWrapperVariantPropsPreserved(t *testing.T) {
 		}
 		props := spliced.Props
 		want := map[string]any{
-			// Picked stray spelling with a non-shape body: a prop.
+			// Exact stray spelling with a non-shape body: a prop.
 			"symbols": []any{int64(1)},
-			// Unpicked spelling: a prop, regardless of its body's shape.
+			// Case-variant spellings: ordinary props, preserved verbatim
+			// regardless of body shape.
 			"SYMBOLS": []any{"B"},
-			// Non-reserved props colliding only with each other: both merge.
+			"DOC":     int64(12),
+			// Non-reserved props: both merge.
 			"foo": int64(1),
 			"FOO": int64(2),
-			// doc (picked; definition-wins) and DOC (merged, then consumed
-			// by the definition's own reparse as its sole doc spelling) are
-			// both absent.
+			// The wrapper's exact "doc" is a consumed reserved usage-site
+			// attribute: it dies at the splice and is absent.
 		}
 		if !reflect.DeepEqual(props, want) {
 			t.Fatalf("spliced Props = %#v; want %#v", props, want)

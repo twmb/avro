@@ -278,6 +278,18 @@ node := &avro.SchemaNode{
 schema, err := node.Schema()
 ```
 
+Reserved attribute names (`type`, `name`, `items`, ...) match only their
+exact lowercase spelling, as in the Java, Python (fastavro), and goavro
+implementations. A key differing from a reserved name only by letter case
+(`"ITEMS"`, `"Namespace"`) is an ordinary custom property, preserved in
+`Props`. One migration note: hamba/avro matches these keys
+case-insensitively, so a schema that parsed there but fails here has a
+miscased reserved key. A miscased *structural* key fails loudly at parse
+time — `{"type":"array","Items":"int"}` errors with "array is missing
+items schema"; fix the casing — while a miscased non-structural key
+(`"Doc"`, `"Aliases"`) simply becomes a harmless custom property instead
+of binding the attribute.
+
 ## Logical Types
 
 Logical types decode to their natural Go equivalents:

@@ -13458,33 +13458,36 @@ func TestRegression_TimeLogicalStringRoundTrip(t *testing.T) {
 	})
 }
 
-// TestRegression_LookupCIDeterminism pins the deterministic
-// case-insensitive key lookup. Without this, lookupCI's `for k :=
-// range m` could return different keys on different Root() calls for
-// the same parsed Schema (Go randomizes map iteration order), so a
-// schema with multiple keys folding to the same canonical key (e.g.
-// both "tYpe" and "TYpe" → "type" via EqualFold) made Root() flap
-// between branch shapes. Resolution: lookupCI picks the smallest
-// matching key by code-point ordering; aschema.UnmarshalJSON's
-// struct decode picks last-by-input-order. Both rules are
-// deterministic and individually consistent across repeated Root() /
-// Canonical() calls. The test uses two case-insensitive duplicates
-// whose VALUES are both valid Avro primitives so the test isolates
-// determinism from type-validity concerns.
-func TestRegression_LookupCIDeterminism(t *testing.T) {
-	// Multiple keys that fold to the same canonical: both "tYpe"
-	// and "TYpe" → "type" via EqualFold. Both values are valid
-	// primitive types.
-	schemaJSON := `{"tYpe":"record","NaMe":"R","fields":[{"name":"x","tYpe":"long","TYpe":"int"}]}`
-	s, err := avro.Parse(schemaJSON)
+// TestRegression_CaseVariantKeysNoPickAmbiguity pins that multiple
+// case-variant spellings of one reserved key introduce NO key-selection
+// ambiguity: reserved attributes match only their exact lowercase
+// spelling, so "tYpe" and "TYpe" are two ordinary custom properties and
+// there is nothing to pick between — an object whose type exists only
+// under variant spellings has no type attribute and rejects, while
+// variants riding beside the exact key are inert props whose metadata
+// (map-valued Props; sorted-key marshal on the rebuild) is trivially
+// stable across repeated Root() / Canonical() calls.
+func TestRegression_CaseVariantKeysNoPickAmbiguity(t *testing.T) {
+	// No exact "type"/"name" spelling anywhere: nothing binds, reject.
+	if _, err := avro.Parse(`{"tYpe":"record","NaMe":"R","fields":[{"name":"x","tYpe":"long","TYpe":"int"}]}`); err == nil {
+		t.Fatalf("variant-only type/name keys accepted; the object has no type attribute and must reject")
+	}
+	// Variants beside the exact keys: inert props, stable metadata.
+	s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int","tYpe":"long","TYpe":"string"}]}`)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
 	root1 := s.Root()
+	if root1.Fields[0].Type.Type != "int" {
+		t.Fatalf("field type = %q; the exact spelling binds", root1.Fields[0].Type.Type)
+	}
+	wantProps := map[string]any{"tYpe": "long", "TYpe": "string"}
+	if !reflect.DeepEqual(root1.Fields[0].Props, wantProps) {
+		t.Fatalf("field Props = %#v; want both variants preserved verbatim", root1.Fields[0].Props)
+	}
 	for i := range 100 {
-		root := s.Root()
-		if !reflect.DeepEqual(root, root1) {
-			t.Fatalf("Root() flapping on iter %d:\n  expected: %+v\n  got:      %+v", i, root1, root)
+		if root := s.Root(); !reflect.DeepEqual(root, root1) {
+			t.Fatalf("Root() flapping on iter %d", i)
 		}
 	}
 	canon1 := string(s.Canonical())

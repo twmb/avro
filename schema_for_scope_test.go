@@ -232,11 +232,13 @@ func TestRegression_SchemaForLeavesCallerSchemaStorageUnmutated(t *testing.T) {
 	}
 }
 
-// Parse matches reserved attribute names case-insensitively (see
-// Schema.Root's doc): a Props key differing from "namespace" only by ASCII
-// case IS the namespace attribute. The SchemaFor composition walkers must
-// apply the same fold — keying the dedup by the fullname Parse will bind —
-// or the reference they emit for a second occurrence dangles.
+// Reserved attribute names match only their exact lowercase spelling (see
+// Schema.Root's doc): a Props key differing from "namespace" only by
+// letter case is an ordinary custom property, NOT a namespace
+// declaration. The SchemaFor composition walkers read the same exact keys
+// Parse binds, so the type's identity is its null-namespace fullname, the
+// second occurrence references that fullname, and the variant key rides
+// along as an inert prop.
 func TestRegression_SchemaForCaseVariantNamespaceKeySharedType(t *testing.T) {
 	ct := CustomType{
 		GoType: reflect.TypeFor[scopePinMoney](),
@@ -244,24 +246,28 @@ func TestRegression_SchemaForCaseVariantNamespaceKeySharedType(t *testing.T) {
 	}
 	s, err := SchemaFor[scopePinTwoFields](ct)
 	if err != nil {
-		t.Fatalf("case-variant-namespaced custom on two fields: %v", err)
+		t.Fatalf("variant-namespace-prop custom on two fields: %v", err)
 	}
 	root := s.Root()
 	for i := range root.Fields {
-		if got := namedFullname(root.Fields[i].Type); got != "x.y.F" {
-			t.Errorf("field %q type fullname = %q, want %q", root.Fields[i].Name, got, "x.y.F")
+		if got := namedFullname(root.Fields[i].Type); got != "F" {
+			t.Errorf("field %q type fullname = %q, want %q (a NAMESPACE variant key must not scope the type)", root.Fields[i].Name, got, "F")
 		}
+	}
+	if got := root.Fields[0].Type.Props["NAMESPACE"]; !reflect.DeepEqual(got, "x.y") {
+		t.Errorf(`definition Props["NAMESPACE"] = %#v; want the variant preserved verbatim`, got)
 	}
 	if _, err := Parse(s.String()); err != nil {
 		t.Errorf("SchemaFor output does not re-parse: %v", err)
 	}
 }
 
-// Under WithNamespace the frontier pin must SEE a case-variant namespace
-// key as the namespace declaration it is (Parse folds it onto the
-// attribute) and leave the node alone: injecting an exact-case
-// "namespace":"" would shadow the declared namespace at parse — a silent,
-// wire-visible identity change (x.y.F would become F).
+// Under WithNamespace the frontier pin sees no exact "namespace" key on
+// the node (the case-variant Props key is an ordinary custom property),
+// so it injects the exact-case "namespace":"" inheritance escape exactly
+// as it does for any null-namespace type: the type's identity stays its
+// null-namespace fullname F under the surrounding com.example scope, and
+// the variant prop rides along untouched.
 func TestRegression_SchemaForCaseVariantNamespaceUnderWithNamespace(t *testing.T) {
 	ct := CustomType{
 		GoType: reflect.TypeFor[scopePinMoney](),
@@ -271,8 +277,12 @@ func TestRegression_SchemaForCaseVariantNamespaceUnderWithNamespace(t *testing.T
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if got := namedFullname(s.Root().Fields[0].Type); got != "x.y.F" {
-		t.Errorf("fixed fullname = %q, want %q (the declared namespace must survive WithNamespace)", got, "x.y.F")
+	node := s.Root().Fields[0].Type
+	if got := namedFullname(node); got != "F" {
+		t.Errorf("fixed fullname = %q, want %q (the variant key declares nothing; the injected escape keeps the null namespace)", got, "F")
+	}
+	if got := node.Props["NAMESPACE"]; !reflect.DeepEqual(got, "x.y") {
+		t.Errorf(`Props["NAMESPACE"] = %#v; want the variant preserved verbatim`, got)
 	}
 }
 

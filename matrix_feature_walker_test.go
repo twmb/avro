@@ -740,60 +740,39 @@ var featureWalkerRefFormRows = []featureWalkerRow{
 	},
 }
 
-// Reserved Avro attribute keys spelled in non-canonical ASCII case ("tYpe",
-// "iTems", ...). Reserved-key matching is case-insensitive on parse AND on
-// the metadata re-parse, so a case-variant key folds onto the reserved
-// attribute rather than surviving as a custom property. Twins spell
-// canonical case. The variant spelling survives verbatim in the schema text
-// that String(), the Root() tree, and the cache splice re-consume — each of
-// those walkers must fold it the same way the wire parser did or its cell
-// diverges from the twin.
+// Reserved Avro attribute keys spelled in non-canonical ASCII case
+// ("nAmespace", "iTems", ...) are ordinary custom properties:
+// reserved-attribute matching is exact-lowercase-only on parse AND on
+// every metadata surface, so a case-variant key binds nothing — it must
+// ride verbatim as a prop through every walker (the schema text that
+// String(), the Root() tree, and the cache splice re-consume all carry
+// it), and no walker may bind, fold, or drop it. Structure is spelled
+// exact-case (the only spelling that binds); the twin is the identical
+// text, so every driver asserts the decoy keys change nothing about wire
+// behavior, identity, or resolution while surviving each metadata
+// surface. The decimal fixed encodes a *big.Rat and the timestamp a
+// time.Time, so the EXACT logical keys must stay effective with decoys
+// riding beside them; field w's dEfault decoy is no default at all, so w
+// must be supplied; DA's nAmespace decoy must not re-scope the spliced
+// definition (its fullname stays ns.DA).
 var featureWalkerCaseKeyRows = []featureWalkerRow{
 	{
-		// Record-side keys: tYpe/nAme/nAmespace/fIelds on the record, and
-		// the field keys nAme/tYpe/dEfault/aLiases/oRder plus the enum's
-		// own dEfault. The sample omits field w so its case-variant
-		// dEfault drives the encoder's auto-fill — the default VALUE only
-		// reaches the wire if the variant key folded onto "default".
-		name:    "casekey-record",
-		feature: `{"tYpe":"record","nAme":"Top","nAmespace":"ns","fIelds":[{"nAme":"c","tYpe":{"tYpe":"enum","nAme":"c","sYmbols":["A","B"],"dEfault":"A"},"aLiases":["c_old"],"oRder":"descending"},{"nAme":"w","tYpe":"int","dEfault":9}]}`,
-		twin:    `{"type":"record","name":"Top","namespace":"ns","fields":[{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"],"default":"A"},"aliases":["c_old"],"order":"descending"},{"name":"w","type":"int","default":9}]}`,
-		sample:  map[string]any{"c": "B"},
+		name:    "variantkey-props",
+		feature: `{"type":"record","name":"Top","namespace":"ns","nAmespace":"decoy","fIelds":"decoy","fields":[{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"],"default":"A","dEfault":"B","sYmbols":["Z"]},"aLiases":["c_old"],"oRder":"descending"},{"name":"w","type":"int","dEfault":9},{"name":"list","type":{"type":"array","items":"int","iTems":"decoy"}},{"name":"m","type":{"type":"map","values":"int","vAlues":"decoy"}},{"name":"fx","type":{"type":"fixed","name":"fx","size":2,"sIze":99}},{"name":"px","type":{"type":"fixed","name":"px","size":4,"logicalType":"decimal","precision":6,"scale":2,"pRecision":60}},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis","lOgicalType":"decoy"}}]}`,
+		twin:    `{"type":"record","name":"Top","namespace":"ns","nAmespace":"decoy","fIelds":"decoy","fields":[{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"],"default":"A","dEfault":"B","sYmbols":["Z"]},"aLiases":["c_old"],"oRder":"descending"},{"name":"w","type":"int","dEfault":9},{"name":"list","type":{"type":"array","items":"int","iTems":"decoy"}},{"name":"m","type":{"type":"map","values":"int","vAlues":"decoy"}},{"name":"fx","type":{"type":"fixed","name":"fx","size":2,"sIze":99}},{"name":"px","type":{"type":"fixed","name":"px","size":4,"logicalType":"decimal","precision":6,"scale":2,"pRecision":60}},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis","lOgicalType":"decoy"}}]}`,
+		sample:  map[string]any{"c": "B", "w": int32(7), "list": []any{int32(1)}, "m": map[string]any{"k": int32(1)}, "fx": []byte{1, 2}, "px": big.NewRat(1234, 100), "ts": fwTime},
 
-		resolveAgainst: `{"type":"record","name":"Top","namespace":"ns","fields":[{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"],"default":"A"},"aliases":["c_old"],"order":"descending"},{"name":"w","type":"int","default":9},{"name":"pad","type":"int","default":5}]}`,
-		resolveSample:  map[string]any{"c": "B", "w": int32(9), "pad": int32(5)},
+		resolveAgainst: `{"type":"record","name":"Top","namespace":"ns","fields":[{"name":"c","type":{"type":"enum","name":"c","symbols":["A","B"],"default":"A"},"aliases":["c_old"],"order":"descending"},{"name":"w","type":"int"},{"name":"list","type":{"type":"array","items":"int"}},{"name":"m","type":{"type":"map","values":"int"}},{"name":"fx","type":{"type":"fixed","name":"fx","size":2}},{"name":"px","type":{"type":"fixed","name":"px","size":4,"logicalType":"decimal","precision":6,"scale":2}},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},{"name":"pad","type":"int","default":5}]}`,
+		resolveSample:  map[string]any{"c": "B", "w": int32(7), "list": []any{int32(1)}, "m": map[string]any{"k": int32(1)}, "fx": []byte{1, 2}, "px": big.NewRat(1234, 100), "ts": fwTime, "pad": int32(5)},
 
 		refDefs:    []string{fwElemDef},
-		refFeature: `{"tYpe":"record","nAme":"ns.Top","fIelds":[{"nAme":"e","tYpe":"Elem"}]}`,
-		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"e","type":"Elem"}]}`,
+		refFeature: `{"type":"record","name":"ns.Top","fIelds":"decoy","fields":[{"name":"e","type":"Elem","nAme":"decoy"}]}`,
+		refTwin:    `{"type":"record","name":"ns.Top","fIelds":"decoy","fields":[{"name":"e","type":"Elem","nAme":"decoy"}]}`,
 		refSample:  map[string]any{"e": map[string]any{"x": int32(1)}},
 
-		defFeature:      `{"tYpe":"record","nAme":"ns.HA","fIelds":[{"nAme":"d","tYpe":{"tYpe":"record","nAme":"DA","fIelds":[{"nAme":"x","tYpe":"int"}]}}]}`,
-		defTwin:         `{"type":"record","name":"ns.HA","fields":[{"name":"d","type":{"type":"record","name":"DA","fields":[{"name":"x","type":"int"}]}}]}`,
+		defFeature:      `{"type":"record","name":"ns.HA","fields":[{"name":"d","type":{"type":"record","name":"DA","nAmespace":"decoyns","fields":[{"name":"x","type":"int"}]}}]}`,
+		defTwin:         `{"type":"record","name":"ns.HA","fields":[{"name":"d","type":{"type":"record","name":"DA","nAmespace":"decoyns","fields":[{"name":"x","type":"int"}]}}]}`,
 		defFollow:       `{"type":"record","name":"ns.FA","fields":[{"name":"d","type":"DA"}]}`,
-		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
-	},
-	{
-		// Container and logical keys: iTems, vAlues, sIze, and
-		// lOgicalType/pRecision/sCale (the decimal fixed encodes a
-		// *big.Rat, so the folded logical must be EFFECTIVE, and the
-		// timestamp field likewise carries a time.Time).
-		name:    "casekey-containers",
-		feature: `{"tYpe":"record","nAme":"ns.Top","fIelds":[{"nAme":"list","tYpe":{"tYpe":"array","iTems":"int"}},{"nAme":"m","tYpe":{"tYpe":"map","vAlues":"int"}},{"nAme":"fx","tYpe":{"tYpe":"fixed","nAme":"fx","sIze":2}},{"nAme":"px","tYpe":{"tYpe":"fixed","nAme":"px","sIze":4,"lOgicalType":"decimal","pRecision":6,"sCale":2}},{"nAme":"ts","tYpe":{"tYpe":"long","lOgicalType":"timestamp-millis"}}]}`,
-		twin:    `{"type":"record","name":"ns.Top","fields":[{"name":"list","type":{"type":"array","items":"int"}},{"name":"m","type":{"type":"map","values":"int"}},{"name":"fx","type":{"type":"fixed","name":"fx","size":2}},{"name":"px","type":{"type":"fixed","name":"px","size":4,"logicalType":"decimal","precision":6,"scale":2}},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}]}`,
-		sample:  map[string]any{"list": []any{int32(1)}, "m": map[string]any{"k": int32(1)}, "fx": []byte{1, 2}, "px": big.NewRat(1234, 100), "ts": fwTime},
-
-		resolveAgainst: `{"type":"record","name":"ns.Top","fields":[{"name":"list","type":{"type":"array","items":"int"}},{"name":"m","type":{"type":"map","values":"int"}},{"name":"fx","type":{"type":"fixed","name":"fx","size":2}},{"name":"px","type":{"type":"fixed","name":"px","size":4,"logicalType":"decimal","precision":6,"scale":2}},{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}},{"name":"pad","type":"int","default":5}]}`,
-		resolveSample:  map[string]any{"list": []any{int32(1)}, "m": map[string]any{"k": int32(1)}, "fx": []byte{1, 2}, "px": big.NewRat(1234, 100), "ts": fwTime, "pad": int32(5)},
-
-		refDefs:    []string{fwElemDef},
-		refFeature: `{"tYpe":"record","nAme":"ns.Top","fIelds":[{"nAme":"list","tYpe":{"tYpe":"array","iTems":"Elem"}}]}`,
-		refTwin:    `{"type":"record","name":"ns.Top","fields":[{"name":"list","type":{"type":"array","items":"Elem"}}]}`,
-		refSample:  map[string]any{"list": []any{map[string]any{"x": int32(1)}}},
-
-		defFeature:      `{"tYpe":"record","nAme":"ns.HB","fIelds":[{"nAme":"list","tYpe":{"tYpe":"array","iTems":{"tYpe":"record","nAme":"DB","fIelds":[{"nAme":"x","tYpe":"int"}]}}}]}`,
-		defTwin:         `{"type":"record","name":"ns.HB","fields":[{"name":"list","type":{"type":"array","items":{"type":"record","name":"DB","fields":[{"name":"x","type":"int"}]}}}]}`,
-		defFollow:       `{"type":"record","name":"ns.FB","fields":[{"name":"d","type":"DB"}]}`,
 		defFollowSample: map[string]any{"d": map[string]any{"x": int32(2)}},
 	},
 }
