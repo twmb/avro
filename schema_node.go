@@ -186,9 +186,13 @@ type deduper struct {
 // "doc", "aliases") are matched case-insensitively, so a custom property
 // whose key differs from a reserved name only by ASCII letter case (for
 // example "Aliases") is interpreted as that reserved attribute and is not
-// reported in [SchemaNode.Props]. Parsing applies the same case-insensitive
-// matching, so the metadata reported here stays consistent with the parsed
-// schema and the encoded wire.
+// reported in [SchemaNode.Props]. When several spellings of one reserved
+// attribute are present, exactly one is interpreted as the attribute —
+// the exact-case spelling when present, else the smallest
+// case-insensitive match — and every other spelling is an ordinary
+// custom property, reported in Props verbatim. Parsing applies the same
+// selection, so the metadata reported here stays consistent with the
+// parsed schema and the encoded wire.
 //
 // A field written in the flat (goavro-style) format — a bare string
 // complex-kind type with the kind's defining key (symbols, items, values,
@@ -2003,8 +2007,9 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 		}
 		return strayBodyShapeOK(canonKey, v)
 	}
+	variantPicks := reservedKeyVariantPicks(m, schemaReservedKeys)
 	for k, v := range m {
-		if schemaReservedKeyForObject(k, v, n.Type, n.LogicalType, shapeOK) {
+		if schemaReservedKeyForObject(m, k, v, n.Type, n.LogicalType, variantPicks, shapeOK) {
 			continue
 		}
 		if n.Props == nil {
@@ -2044,8 +2049,14 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 	}
 	getCIStringSlice(fm, "aliases", &sf.Aliases)
 	getCIString(fm, "order", &sf.Order)
+	// Exactly one spelling of each field reserved key — the CI readers'
+	// pick above — is consumed into the SchemaField attribute; every
+	// other spelling (a case-variant duplicate) is an ordinary field
+	// property, preserved verbatim. Same rule as the type-object Props
+	// routing (schemaReservedKeyForObject).
+	variantPicks := reservedKeyVariantPicks(fm, fieldReservedKeys)
 	for k, v := range fm {
-		if fieldReservedKeyCI(k) {
+		if canon, ok := reservedKeyCanon(k, fieldReservedKeys); ok && reservedKeyIsPick(fm, variantPicks, k, canon) {
 			continue
 		}
 		if _, routed := flatType[k]; routed {
@@ -2059,23 +2070,63 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 	return sf
 }
 
-// reservedKeyCI is a case-insensitive wrapper for membership in a
-// reserved-key map. Shared by fieldReservedKeyCI / schemaReservedKeyCI
-// so the case-insensitive fall-through scan lives in one place.
-func reservedKeyCI(k string, reserved map[string]bool) bool {
+// reservedKeyCanon returns the canonical spelling of the reserved key
+// that k names under case-insensitive matching, if any. The single
+// case-insensitive fall-through scan shared by every reserved-key check.
+func reservedKeyCanon(k string, reserved map[string]bool) (string, bool) {
 	if reserved[k] {
-		return true
+		return k, true
 	}
 	for rk := range reserved {
 		if strings.EqualFold(k, rk) {
-			return true
+			return rk, true
 		}
 	}
-	return false
+	return "", false
 }
 
-func fieldReservedKeyCI(k string) bool  { return reservedKeyCI(k, fieldReservedKeys) }
-func schemaReservedKeyCI(k string) bool { return reservedKeyCI(k, schemaReservedKeys) }
+// reservedKeyVariantPicks returns, for each reserved key that appears in
+// m ONLY under non-canonical spellings, the lexicographically smallest
+// such spelling — the one the CI readers (lookupCI / ciKey / getCI*)
+// consult when no exact-case spelling exists. Maps whose reserved keys
+// are all exact-case (the overwhelmingly common shape) return nil with
+// no allocation; reservedKeyIsPick treats the exact spelling as its own
+// pick without consulting this table.
+func reservedKeyVariantPicks(m map[string]any, reserved map[string]bool) map[string]string {
+	var picks map[string]string
+	for k := range m {
+		canon, ok := reservedKeyCanon(k, reserved)
+		if !ok || canon == k {
+			continue
+		}
+		if picks == nil {
+			picks = make(map[string]string)
+		}
+		if cur, have := picks[canon]; !have || k < cur {
+			picks[canon] = k
+		}
+	}
+	return picks
+}
+
+// reservedKeyIsPick reports whether raw spelling k (canonical form canon)
+// is the ONE spelling of that reserved key the readers consult in m: the
+// exact-case spelling when present, else the lexicographically smallest
+// case-insensitive match — the same selection lookupCI, ciKey, and the
+// getCI* helpers make. Exactly the pick is consumed by the matching
+// attribute read; every other spelling of the same reserved key is an
+// ordinary custom property that rides to Props verbatim, whatever its
+// body — the pick owns the structural slot, so an unpicked spelling has
+// nothing to bind and nothing about its content changes its routing.
+func reservedKeyIsPick(m map[string]any, variantPicks map[string]string, k, canon string) bool {
+	if k == canon {
+		return true
+	}
+	if _, exact := m[canon]; exact {
+		return false
+	}
+	return variantPicks[canon] == k
+}
 
 // decimalConsumesPrecisionScale reports whether a type object with the
 // given type and logicalType (values as-written; matched exactly, like the
@@ -2090,16 +2141,20 @@ func decimalConsumesPrecisionScale(typ, logical string) bool {
 	return logical == "decimal" && (typ == "bytes" || typ == "fixed")
 }
 
-// schemaReservedKeyForObject reports whether key k is reserved (consumed
-// by the parser, excluded from custom properties) on a type object with
-// the given type/logicalType: every schemaReservedKeys member, except
-// that precision/scale are reserved only on a recognized decimal carrier.
-// Shared by the wire parser's extra-property routing (aobjectFromMap) and
-// the metadata tree (nodeFromJSONObject) so the two Props surfaces cannot
-// drift.
-// schemaReservedKeyForObject reports whether key k (value v) on a node of
-// the given kind/logical is consumed or structurally surfaced — and so
-// kept OUT of Props. precision/scale are reserved only on a recognized
+// schemaReservedKeyForObject reports whether key k (value v) on a type
+// object m of the given kind/logical is consumed or structurally
+// surfaced — and so kept OUT of Props.
+//
+// Exactly ONE spelling of each reserved key — the exact-case-preferred,
+// else lexicographically smallest case-insensitive pick, the same
+// selection every CI reader makes — is consulted for structural binding
+// and consumed. Every other raw key, including case-variant duplicates
+// of a reserved key, is an ordinary custom property that rides to Props
+// verbatim, deterministically, with no branching on its body: the pick
+// owns the structural slot, so an unpicked spelling has nothing to bind.
+// Props == all raw keys minus the consumed picks.
+//
+// For the pick itself: precision/scale are reserved only on a recognized
 // decimal carrier. A structural/naming key on a kind that does not bind
 // it, holding a body that does not parse as the key's schema shape, is
 // inert metadata with no possible binding reading: it stays a custom
@@ -2110,21 +2165,27 @@ func decimalConsumesPrecisionScale(typ, logical string) bool {
 // shapeOK answers "did this stray key's body parse as the key's schema
 // shape" from a verdict the caller ALREADY computed — the parser's arms
 // record it in the aobject, the metadata walker records it as it surfaces
-// children. Consulting the recorded verdict is what keeps this routing
-// from re-decoding a subtree the caller already walked: a fresh
+// children. It is consulted only for the pick, whose body is exactly the
+// one the caller's arm decoded, so the recorded verdict always describes
+// the queried body. Consulting the recorded verdict is what keeps this
+// routing from re-decoding a subtree the caller already walked: a fresh
 // strayBodyShapeOK here would re-enter aschemaFromAny on the same body,
 // and because that decode itself routes stray keys, the two decodes per
 // level compound to O(2^depth) over a nested-stray schema. A nil shapeOK
 // falls back to a fresh decode, for the one caller (the cache splice
 // merge) that has no recorded verdict and walks no nested strays.
-func schemaReservedKeyForObject(k string, v any, typ, logical string, shapeOK strayShapeVerdict) bool {
-	if strings.EqualFold(k, "precision") || strings.EqualFold(k, "scale") {
-		return decimalConsumesPrecisionScale(typ, logical)
-	}
-	if !schemaReservedKeyCI(k) {
+func schemaReservedKeyForObject(m map[string]any, k string, v any, typ, logical string, variantPicks map[string]string, shapeOK strayShapeVerdict) bool {
+	canon, ok := reservedKeyCanon(k, schemaReservedKeys)
+	if !ok {
 		return false
 	}
-	if key := canonicalStrayKey(k); key != "" && !strayKeyBinds(typ, key) {
+	if !reservedKeyIsPick(m, variantPicks, k, canon) {
+		return false
+	}
+	if canon == "precision" || canon == "scale" {
+		return decimalConsumesPrecisionScale(typ, logical)
+	}
+	if key := canonicalStrayKey(canon); key != "" && !strayKeyBinds(typ, key) {
 		if shapeOK != nil {
 			return shapeOK(key, v)
 		}

@@ -477,18 +477,40 @@ func inlineTreeDefs(node any, ns string, defs map[string]any, seen, inlined map[
 					if lv, ok := lookupCI(def, "logicalType"); ok {
 						defLogical, _ = lv.(string)
 					}
+					// The wrapper's props are a flat key set (never a
+					// nested-stray schema), so no recorded verdict is
+					// needed and no re-decode compounds: a nil verdict
+					// resolves each key with a fresh single shape check.
+					// The reference's own "type" key is its pick and is
+					// consumed by the reserved routing below; an unpicked
+					// case-variant spelling of any reserved key is an
+					// ordinary prop and merges like one.
+					//
+					// Definition-wins is checked against the definition's
+					// OWN keys, snapshotted before any merge: a wrapper
+					// prop colliding (case-insensitively) with a
+					// definition attribute dies, but two distinct wrapper
+					// props that collide only with EACH OTHER both merge —
+					// checking the mutating map instead would keep
+					// whichever the random map order merged first.
+					defKeys := make([]string, 0, len(def))
+					for dk := range def {
+						defKeys = append(defKeys, dk)
+					}
+					defHasCI := func(k string) bool {
+						for _, dk := range defKeys {
+							if strings.EqualFold(dk, k) {
+								return true
+							}
+						}
+						return false
+					}
+					wrapPicks := reservedKeyVariantPicks(v, schemaReservedKeys)
 					for k, wv := range v {
-						if strings.EqualFold(k, "type") {
+						if schemaReservedKeyForObject(v, k, wv, defTyp, defLogical, wrapPicks, nil) {
 							continue
 						}
-						// The wrapper's props are a flat key set (never a
-						// nested-stray schema), so no recorded verdict is
-						// needed and no re-decode compounds: a nil verdict
-						// resolves each key with a fresh single shape check.
-						if schemaReservedKeyForObject(k, wv, defTyp, defLogical, nil) {
-							continue
-						}
-						if _, exists := lookupCI(def, k); exists {
+						if defHasCI(k) {
 							continue
 						}
 						def[k] = wv

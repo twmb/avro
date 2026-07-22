@@ -5575,3 +5575,223 @@ is per-Root()-call, no shared state). Java oracle NOT run (no jar). The counter
 stays ZERO — this fixes a resource-bound DoS, which does not gate the
 behavioral-finding streak; the walk rebuild still needs two consecutive clean
 bare FULLs.
+
+## Distillation archive (2026-07-21) — size-guard pass #3 (CORE + PATTERNS both over cap)
+
+The 2026-07-21 FULL round's ledger line pushed AUDIT_CORE.md to 56.4KB and
+the P19 entry pushed AUDIT_PATTERNS.md to 152.3KB, so the granted fix round
+opens with the mandated distillation of both. Two yield-map/blind-spot
+entries and three ledger entries moved here VERBATIM; compressed stubs (with
+names, probes, and pin tokens) replace them in place.
+
+### AUDIT_PATTERNS "Error-construction sites" yield-map entry, verbatim
+
+- **Error-construction sites — every `fmt.Errorf("…%q…", x)` where x is user-controllable.** Distinct from parser-DoS sweeps (patterns 9, 16) that target rejection-CPU-time: the rejection is fine but the *error message* is hostile-size. `truncForError` / `truncBytesForError` / `truncValueForError` exist precisely for this; bypass is a real DoS (10 MiB hostile JSON.Number → 10 MiB error message → 1:1 log/RPC/metric-label amplification). See the structural-blind-spots entry "Error messages echo unbounded user-controllable input" for classification rules. The `ocf` package has its OWN `truncForError` (the root helper is unexported); OCF write-side metadata-key echoes (`NewWriter`'s reserved-key and over-cap-key errors) bypassed it while the read-side codec-name error already used it — a caller-supplied `WithMetadata` key is wire-equivalent user input, so every package's error sweep must cover BOTH directions (read AND write) and BOTH packages. **The sweep is per-FILE within a package, and per-ARM within a function — not just per-package.** `compat.go` used `truncForError` zero times while its cross-path twin `resolve.go` used it five (both build the same `CompatibilityError` from the same user names); and INSIDE `resolveEnum`, the enum-default echo (`r.enumDef`) was wrapped while the enum-symbol echo (`ws`) two lines away was not. A whole-file grep of `truncForError` *count* per file is the cheap tell — a cold-path file with zero uses next to a sibling with many is the smell. **Rendering-truncation vs construction-truncation is a real distinction for composed messages.** A single-value field (`CompatibilityError.Path` / `ReaderType` / `WriterType`) can be bounded once at the RENDER point (`Error()`), covering every construction site across both files AND preserving the public field's full value for callers that inspect the struct. A COMPOSED field (`Detail`, any `fmt.Sprintf("…%q…", name)` sentence) must NOT be blanket-truncated at render (it would chop the sentence) — its embedded user values are truncated at CONSTRUCTION. So the two layers coexist: render-truncate the single-name fields, construction-truncate the names embedded in composed sentences. **The render-truncation sweep is per-error-TYPE, not just per-file: enumerate every `*Error` type's `Error()` and check each single-value user-controlled field.** `SemanticError.Field` (a dotted record-field path built from parsed, registry-controlled field names — unbounded under `WithLaxNames` or even default grammar) was rendered raw in `SemanticError.Error()` while the sibling `CompatibilityError.Error()` in the SAME file already render-truncated its `Path`/`ReaderType`/`WriterType`. `SemanticError` fires PER-DATUM (every mismatched value), so it is 1:N amplification, worse than a per-parse echo — a hostile field name produces a multi-MB error string on every decode. Fix: `truncForError(e.Field)` at the render point; the public `e.Field` keeps its full value. Note: AUDIT_CORE's own echo-classification calls schema field-name echoes "schema-bounded: safe (1:1 with the schema input)" — TRUE for a parse-time reject (one echo per parse), FALSE for a runtime per-datum error; the maintainer's `CompatibilityError` precedent bounds exactly this single-value shape. Pinned by `TestRegression_SemanticErrorFieldRenderBounded`.
+
+### AUDIT_PATTERNS "Superlinear cost in the parse/unmarshal pass" entry, verbatim
+
+- **Superlinear cost in the parse/unmarshal pass itself, separate from the values it produces.** The encode/decode-parity and stdlib-call sweeps target the VALUE pipeline; the cost of PARSING the schema (or any container framing) before values exist is a distinct axis. Structural question: for a parse step that recurses per nesting level, does any per-level operation re-scan content proportional to the REMAINING input (not just the current level)? If so the parse is O(depth × size) = O(n²) over nesting, and a result-size/semantic guard (e.g. a maxDepth firing during the BUILD) does NOT bound it — the quadratic ran during the earlier unmarshal. (Instance: `aschema.UnmarshalJSON`'s object case did a second full `json.Unmarshal(data, &raw)` into `map[string]json.RawMessage` at every level, re-scanning each node's entire subtree; a ~250 KB deeply-nested schema took ~22 s to parse-then-reject.) The practical ceiling was `encoding/json`'s 10000-deep nesting cap, so the worst case was tens of seconds, not unbounded. Backstop fix (`checkSchemaNestingDepth`, schema.go): a single O(input) bracket-depth pre-scan rejecting input past `maxSchemaJSONDepth` (4×maxDepth) BEFORE the build — but the prior claim that this made parse cost "independent of nesting depth" was FALSE: within the cap parse was still O(depth²) (a build-acceptable 999-deep schema burned ~0.4 s, a hostile sub-cap one ~3.5 s). The real fix was the tight O(n) one: replace the per-node `json.Unmarshaler` (whose stdlib `d.skip` re-scans each subtree) with a SINGLE generic decode + a pure-Go tree walk (`parseSchemaTree`, schema_parse.go). **Two structural lessons.** (1) **A nested-custom-method quadratic has a MIRROR in the opposite direction via the same mechanism.** Fixing the unmarshal exposed a SECOND O(n²): `aobject`/`aschema` `MarshalJSON` (used only by `Canonical()`, which `Parse` calls for the SOE fingerprint) had each level return its full subtree bytes the parent then COPIED into its buffer. Both custom `Unmarshaler` (d.skip re-scan) and nested custom `Marshaler` (return-and-copy-up) are inherently O(n²) over nesting; a single-pass writer to ONE shared buffer (`canonicalBytes`, schema_canonical.go) is the cure for the marshal half. When you kill a parse quadratic, immediately time the SERIALIZE path on the same depth matrix. (2) **The escape-then-string-replace round trip is unsound.** The old `Canonical()` HTML-escaped via `json.Marshal` then `bytes.ReplaceAll`-un-escaped `<`/`>`/`&`/U+2028/U+2029 — but the 6-byte `\uXXXX` target appears INSIDE the `\\uXXXX` escape of a name containing a literal backslash, so ReplaceAll collapsed it to invalid JSON and a corrupt fingerprint (reachable via `WithLaxNames`). The single-pass writer emits raw UTF-8 directly (PCF [STRINGS]), killing the corruption and the quadratic together. Sweep angle: time-box `Parse`, `Canonical`, `DecodeJSON`/`Decode` on a depth-vs-width matrix (a deep chain and a wide-but-shallow blob of equal byte size) — a large gap localizes a depth-quadratic. Pinned by `TestRegression_DeepSchemaNestingRejectedInBoundedTime`, `TestRegression_DeepValidSchemaParsesLinear`, `TestRegression_CanonicalBackslashNameValid`.
+
+### AUDIT_CORE ledger entries (2026-07-19, 2026-07-20, 2026-07-20..21), verbatim
+
+- 2026-07-19 · 9f0fb26→8d59ca9 · era (2 rounds): FULL (read-only) —
+  quarantine CLEAN; FILED 1 behavioral (SchemaCache stray-position def
+  poisoning: collectTreeDefs/inlineTreeDefs descents un-gated vs #63;
+  B7 re-open) + 1 doc → FIX: binding-kind gate is walkNodeChildren's
+  DEFAULT (strayKeys opt-in = metadata walker only), collectNamedTypes
+  gains the gates, cache.go inherits (25 pins +
+  TestMatrix_CacheStrayStructuralKey; neuter ×4; FIX.md items 3+15
+  amended; census back-fill rule minted) · suite + fastavro green;
+  FULL -race green; Java NOT run · counter RESET→ZERO. Verbatim:
+  archive (2026-07-19, 2026-07-20).
+- 2026-07-20 · 489e8ce→7b1b168 · era (2 rounds): FULL (read-only;
+  CORE distillation 59.7→52.8KB) — quarantine (8d59ca9) NOT clean:
+  FILED toJSONWalk stray-dedup-consult family ×3 (fabricated conflict /
+  dangling-ref rebuild / silent def→ref rewrite) + zero-SchemaField
+  fabrication + props-conditional stray survival; walk FILED wrapped-
+  ref splice skip + malformed-stray reject divergence (both HALT
+  tables); #63 parenthetical executed-corrected; B7 re-open #2 → FIX
+  all five rulings (stray-position dedup flag; fieldNoType as-written;
+  emptiness-gated bare emission = props-independent stray survival;
+  splice with def-wins props merge — Java DROPS usage-site extras,
+  fastavro REJECTS the spelling; shape-conditional routing via
+  strayKeyBinds/strayBodyShapeOK) · 9 pins red→green + 3 matrices
+  (72/48/48, per-cell fastavro arm) · neuter ×5 disjoint · FIX.md
+  items 3+15 QUESTION-SCOPED REPO-WIDE; #63 +3 clauses; #25
+  splice-attr limit; B7 re-netted · suite + fastavro EXECUTED green;
+  FULL -race green; Java NOT run · counter ZERO (rebuild needs two
+  clean bare FULLs). Verbatim: archive (2026-07-20).
+- 2026-07-20..21 · 7b1b168 (START head — 7b1b168..HEAD quarantines the
+  fix commit) · era (2 rounds): DEDICATED consistency-grid census
+  (CORE distillation #2 56→52.6KB) delivering the **R1
+  semantic-consistency registry** (AUDIT_PATTERNS §Semantic-consistency
+  registry; 8 semantic questions × 7 representations, every cell =
+  pointer + posture + net; FIX.md items 3/15 point at it; B7 index
+  folded in) — quarantine (7b1b168) NOT clean, behavioral/DoS FILED 1
+  (R1-Q7's ⚠ cell): the quarantine's `strayBodyShapeOK` re-decodes each
+  stray container body the parser's arm ALSO decodes and recurses
+  through the same doubling, so `Parse` and `Root().Schema()` were
+  **O(2^depth)** on nested stray keys (465-byte depth-20 = 6.5s,
+  unbounded below the 4000-bracket pre-scan; items/values/fields all
+  explode, binding control linear; pattern-16, DoS battery C1 MISSED it;
+  gate NOT documented — #48 is POLYNOMIAL/bounded) → FIX (maintainer-
+  granted): the arm records its shape verdict in the aobject
+  (`strayShapeRecorded`) and the props-routing consults it
+  (`schemaReservedKeyForObject` verdict-parameterized) — Parse LINEAR
+  (ratio 2.0); the metadata walk memoizes the per-subtree decode
+  (`strayShapeMemo` threaded record-only through aschemaFromAny/
+  aobjectFromMap/afieldFromAny, nil on real parse; gate uses
+  `strayBodyShapeOKMemo`, extra-loop routes on surfaced n.Items/n.Values/
+  n.Fields) — Root().Schema() LINEAR (was O(depth^2), 1.6s→10ms at
+  depth 1600) · pin TestRegression_NestedStrayContainerKeyLinearCost
+  (shape ratio + sub-KB ceiling at every parse entry point AND
+  Root().Schema(), per key) red-then-green; DoS battery C1 gains the
+  nested-stray arm (permanent R1-Q7 net) · neuter ×2 (drop verdict → 90s
+  timeout; drop memo → Root() ratio 4.14>3.0) · sibling sweep = R1-Q7
+  row read; #48 gains the faithful-bounded-vs-redundant-unbounded
+  clause; R1-Q7 ⚠→✓; AUDIT_PATTERNS distillation #1 DONE
+  (157.9→149.4KB) · suite + fastavro green; -race green; Java NOT run ·
+  counter stays ZERO (resource-bound DoS fix). Narrative: archive
+  (2026-07-20, 2026-07-21).
+
+## Distillation archive (2026-07-21) — reserved-key duplicate-spelling fix (START head 9004009)
+
+Maintainer-granted fix for the quarantine finding (P19): the stray-verdict
+thread keyed per CANONICAL reserved key while the extra-props loops iterate
+RAW keys, so case-variant duplicates inherited the lookupCI-picked body's
+verdict (malformed variants vanished from Props on both surfaces; the parse
+loop's all-8-key conversion beside the metadata loop's per-body non-recursive
+checks split CustomType-callback props from Root().Props). Ruled to eliminate
+the class: ONE INVARIANT — exactly one spelling of each reserved key (the
+exact-case-preferred, else lexicographically smallest CI pick; lookupCI/ciKey's
+selection) is consulted for structural binding and consumed; EVERY other raw
+key rides to Props verbatim, deterministically, with no per-shape branching;
+Props == all raw keys minus the consumed picks; both surfaces identical.
+
+### The fix
+
+Three shared helpers (schema_node.go): `reservedKeyCanon` (the CI scan,
+replacing reservedKeyCI/fieldReservedKeyCI/schemaReservedKeyCI),
+`reservedKeyVariantPicks` (per-map lex-smallest variant table, allocated only
+when a non-canonical reserved spelling exists — the common all-exact map stays
+zero-alloc), and `reservedKeyIsPick` (exact spelling always wins; else the
+variant table). `schemaReservedKeyForObject` gained (m, variantPicks) and
+returns false for every non-pick BEFORE any shape consult — so the recorded
+stray verdict is only ever asked about the body the arm actually decoded,
+structurally eliminating the mis-attribution. All four consult sites
+converted: the parse extra loop (schema_parse.go), the metadata extra loop
+(nodeFromJSONObject), metadataField's field-props loop (pick-gated via the
+same helpers over fieldReservedKeys), and the cache splice merge
+(inlineTreeDefs; the redundant EqualFold type-skip folded into the reserved
+routing — the type pick consumes, a TYPE variant merges as a prop).
+
+Ruled rows, all pinned: picked-valid + variant-malformed → variant to Props
+(the filed regression); picked-malformed + variant-valid → both to Props
+(unchanged); both-valid → unpicked to Props (DELIBERATE change — previously
+the unpicked valid spelling was consumed as reserved and never surfaced,
+silent data loss; the pin comment states the adjudicated uniform rule).
+
+### Sweep-discovered second defect: splice def-wins nondeterminism
+
+The wrapped-ref splice merge checked definition-wins via lookupCI against the
+MUTATING def, so two wrapper props colliding case-insensitively only with
+each other (symbols:[1] + SYMBOLS:["B"], or foo + FOO — the latter reachable
+pre-fix too) merged or died by map iteration order; one order merged a
+shape-OK SYMBOLS alone, whose reparse tripped record exclusivity and silently
+fell back to a DANGLING wrapper. Fixed: def-wins snapshots the def's
+pre-merge keys (defKeys/defHasCI) — definition attributes stay protected,
+wrapper-vs-wrapper collisions both merge, deterministic. A merged variant
+that becomes the def's sole spelling of a def-consumed key (doc → DOC) is
+consumed by the definition's own reparse: per-map invariant, deterministic,
+still more preserving than Java (which drops usage-site extras wholesale,
+Schema.java:1829/:1846). String() keeps the self-contained text verbatim —
+same posture as a plain parse whose raw text carries a consumed spelling.
+
+### Pins, matrices, neuters, sweep
+
+- Red-then-green (verified failing pre-fix, 158 assertion failures):
+  TestRegression_ReservedDupMalformedVariantPreserved,
+  _ReservedDupUnpickedValidVariantPreserved (+ structural-slot-is-the-pick),
+  _ReservedDupParseMetadataPropsParity, _FieldReservedDupVariantPreserved;
+  TestMatrix_ReservedKeyDuplicateSpellings (10 keys × {binding, stray}
+  carriers (type/logicalType universal) × 3 variant bodies × 3 surfaces
+  {callback props, Root().Props, rebuild} + pick-only controls + parity
+  assert per cell = 72 parse cells); TestMatrix_FieldReservedKeyDuplicateSpellings
+  (6 field keys × 2 bodies + control); TestMatrix_ReservedKeyDuplicatePickMalformed
+  (green-stable ruled row); TestRegression_CacheSpliceWrapperVariantPropsPreserved
+  (8-run determinism; written post-sweep, red under the splice neuter);
+  TestDifferentialFastavroReservedDupSpellings (every cell through fastavro's
+  parser, EXECUTED — fastavro preserves the variants; Java SCHEMA_RESERVED
+  exact-case cited, Schema.java:175-176).
+- Neuter ×3, each surface separately, build-executed and restored:
+  (1) parse-side pick gate reverted (canonical-consume + recorded-verdict
+  for all spellings) → 54 object-matrix variant cells + 3 object pins red,
+  field matrix + field pin + splice pin green (surface isolated);
+  (2) metadata-side unification reverted (canonical-consume in the metadata
+  loop; fieldReservedKeyCI-style field loop) → 44 object cells + all 12
+  field cells + 4 pins red (the parity pin correctly green there — that
+  neuter reproduces the old per-body metadata behavior, which agrees with
+  the fixed parse side on name+NAME:12; the 44 are the cells where
+  consumption differs); (3) splice snapshot reverted to live-map lookupCI →
+  determinism pin red (FOO + SYMBOLS silently dropped).
+- Sibling sweep, R1-Q4 row executed per column: PARSE/WIRE-WALK-metadata/
+  metadataField/CACHE-splice = the four fixed sites; cache collect walkers
+  strayKeys=false (enumerate picks via ciKey, no props routing) ∅;
+  NODE-WALK default coercion reads bound picks only ∅; RENDER emits, never
+  routes ∅ (rebuild surface matrix-asserted); SCHEMAFOR executed-preserving
+  (a Props case-variant on a CustomType.Schema survives composition
+  end-to-end; normalizeSchemaScope's CI arms sit on the dedup-comparison
+  path where identity requires byte-equal content); flat-lift routers
+  (flatLiftTypeMap, rewriteFlatFieldToRef) route per-raw-key by CLASS —
+  uniform across variants, no pick attribution, unpicked variants preserved
+  field-side; RESOLVE/COMPAT compiled-tree ∅.
+- Docs: NOT_BUGS #46 duplicate-spelling clause + #63 pick-gate/splice
+  clause; Root() doc-string qualified (sole variant consumed, unpicked
+  duplicates reported in Props); P19 resolution recorded; R1-Q4
+  duplicate-spelling sub-row; feature-walker census header routes the axis.
+
+Oracles: go test ./... + fastavro differential EXECUTED green twice
+(post-pick-gate and post-snapshot-fix); FULL -race green; GOGC=1 stress on
+the memo family green (the prior round's uintptr-aliasing question,
+executed). Java oracle NOT run (no runtime). Counter stays ZERO (fix round;
+rebuild needs two consecutive clean bare FULLs).
+
+## Distillation archive (2026-07-21) — the FULL round's ledger-line original (compressed same day when the fix round's line crossed the CORE cap)
+
+- 2026-07-21 · 9004009 · FULL (read-only) · quarantine (9004009) NOT
+  clean — behavioral FILED 1 (P19 NEW): the verdict thread keys per
+  CANONICAL stray key while both extra-props loops iterate RAW keys, so
+  a case-variant duplicate inherits the lookupCI-picked body's verdict —
+  `{"type":"int","items":"int","ITEMS":12}` consumes ITEMS from BOTH
+  surfaces (vs #63 Props-verbatim clause; fastavro preserves ITEMS:12,
+  executed), and converting all 8 parse-loop keys while the metadata
+  loop kept per-body checks for the 5 non-recursive ones splits
+  CustomType-callback props from Root().Props (`name`/`NAME`) — 3 pins
+  verified failing (sandbox round9); both-valid-dup vanish (pre-existing)
+  + picked-invalid both-to-Props asymmetry executed; fix awaits ruling
+  (per-raw-key verdict: picked key → arm verdict, unpicked → fresh
+  per-body check; linear, each body decoded ≤ once) · clean fronts:
+  ocf.go full structural walk (writer framing/header caps/readBlock
+  eager-incremental/count-0 skip/4 codec bounds/checkedReader), skip.go
+  (readLength + validateByteSize bounds verified; hostile-through-
+  resolution net drives the skips), json_scan surrogate arm +
+  parseJSONInt64 boundary (stdlib-contract parity), stray × compiled
+  surfaces (Canonical/Resolve/SOE/compat stray-blind, executed green) ·
+  suite + fastavro EXECUTED green; FULL -race green; Java NOT run (no
+  runtime) · counter stays ZERO (behavioral filed; rebuild needs two
+  clean bare FULLs) · CORE (56.4KB) AND PATTERNS (152.3KB) cross their
+  caps — next round OPENS with the mandated distillation of both.
+
+The FULL round's fronts in one line each: ocf.go walked end-to-end (writer
+framing + zero-byte slack, header caps mirrored writer/reader, readBlock
+eager/incremental split + MinInt64 negation + MaxInt guards, count-0 skip
+loop progress-bounded, all four codec DecompressBounded bounds, checkedReader
+contract normalization); skip.go bounds verified (readLength length<=len(src),
+readBlockHeader validateByteSize, MinInt64 negation; skipEnum's no-validate =
+Java/fastavro skip parity) + TestMatrix_HostileThroughResolution confirmed
+driving the skip paths; json_scan surrogate arm bounds-correct and
+stdlib-contract-parity (unpaired high surrogate → U+FFFD like encoding/json;
+bytes path rejects >255; no impl consensus for rejection) + parseJSONInt64
+pre-multiply cutoff with sign-split last digit; stray × compiled surfaces
+executed (Canonical byte-identical to the stray-free twin, Resolve both
+directions, SOE cross-decode by fingerprint, CheckCompatibility both ways).

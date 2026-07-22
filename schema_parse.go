@@ -244,10 +244,14 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 	// that recorded verdict so a stray body is decoded ONCE (by its arm),
 	// never a second time here — a second decode re-enters aschemaFromAny,
 	// which routes its own stray keys, so the two decodes per level
-	// compound to O(2^depth) over a nested-stray schema.
+	// compound to O(2^depth) over a nested-stray schema. The verdict is
+	// consulted only for each reserved key's CI pick — the spelling the
+	// arms read, so the recorded verdict describes exactly the queried
+	// body; every unpicked case-variant spelling routes to extra verbatim.
 	shapeOK := o.strayShapeRecorded(nameIsString)
+	variantPicks := reservedKeyVariantPicks(m, schemaReservedKeys)
 	for k, v := range m {
-		if schemaReservedKeyForObject(k, v, o.Type, o.Logical, shapeOK) {
+		if schemaReservedKeyForObject(m, k, v, o.Type, o.Logical, variantPicks, shapeOK) {
 			continue
 		}
 		if o.extra == nil {

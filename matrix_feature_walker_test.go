@@ -59,10 +59,14 @@ import (
 // rebuild succeeds, preserves strays props-independently, stays stable
 // across generations), TestMatrix_StrayBodyShapeRouting (key × body
 // shape × carrier × surfacing route, with the fastavro differential
-// arm), and TestMatrix_SchemaForStrayStructuralKey (the composition
-// walkers, props and typed planting routes); a new consumer of
-// walkNodeChildren — or any walker/consult of either tree
-// representation (FIX.md item 3's representation checklist) — owes
+// arm), TestMatrix_SchemaForStrayStructuralKey (the composition
+// walkers, props and typed planting routes), and — for SIMULTANEOUS
+// case-variant duplicate spellings of one reserved key, the axis the
+// single-spelling rows here never cross — TestMatrix_ReservedKeyDuplicateSpellings
+// + its field-level and cache-splice twins (only the CI pick is
+// consulted/consumed; every other spelling rides to Props verbatim); a
+// new consumer of walkNodeChildren — or any walker/consult of either
+// tree representation (FIX.md item 3's representation checklist) — owes
 // cells there, not a row here.
 type featureWalkerRow struct {
 	name string
