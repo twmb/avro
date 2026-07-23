@@ -694,6 +694,45 @@ func (f *afield) liftFieldLogicalIntoType() {
 	f.Logical, f.Scale, f.Precision = "", nil, nil
 }
 
+// fieldDecimalLiftConsumesPrecisionScale reports whether the field-level
+// logical lift consumes "precision"/"scale" as decimal parameters: the
+// field declares logicalType "decimal" and the lift's target — the field's
+// primitive type name, the first non-null union branch's kind, or the type
+// object's kind — is a bytes/fixed carrier, matched as-written like the
+// type level's decimalConsumesPrecisionScale (a named reference is not a
+// carrier spelling, and the target's own logicalType annotation does not
+// change where the lift points). Everywhere else the pair is inert field
+// metadata and a malformed body rides to the field's props verbatim.
+func (f *afield) fieldDecimalLiftConsumesPrecisionScale() bool {
+	if f.Type == nil || f.Logical != "decimal" {
+		return false
+	}
+	t := f.Type
+	switch {
+	case t.primitive != "":
+		return decimalConsumesPrecisionScale(t.primitive, f.Logical)
+	case len(t.union) > 0:
+		for i := range t.union {
+			b := &t.union[i]
+			if b.primitive == "null" {
+				continue
+			}
+			// First non-null branch only, mirroring the lift.
+			switch {
+			case b.primitive != "":
+				return decimalConsumesPrecisionScale(b.primitive, f.Logical)
+			case b.object != nil:
+				return decimalConsumesPrecisionScale(b.object.Type, f.Logical)
+			}
+			return false
+		}
+		return false
+	case t.object != nil:
+		return decimalConsumesPrecisionScale(t.object.Type, f.Logical)
+	}
+	return false
+}
+
 // newLogicalObject builds an aobject describing the field's primitive type
 // promoted with the field-level logicalType / precision / scale.
 func (f *afield) newLogicalObject(primitiveType string) *aobject {

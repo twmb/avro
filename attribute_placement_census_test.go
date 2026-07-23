@@ -35,7 +35,10 @@ import (
 //     map, namespace/aliases on named kinds, default on enum — #54,
 //     precision/scale on recognized decimal carriers — #55).
 //   - precision/scale anywhere else are custom properties (Props), at both
-//     levels.
+//     levels — including malformed (non-int) bodies at the FIELD level
+//     when no decimal lift consumes them; the body-shape axis for the
+//     pair lives in the strayPS placement matrix
+//     (stray_precision_scale_test.go, NOT_BUGS #71).
 //   - Every OTHER reserved key on a kind that does not consume it is
 //     captured and surfaced AS-WRITTEN on the matching SchemaNode field
 //     where one exists (items/values/symbols/size/fields; name/namespace;

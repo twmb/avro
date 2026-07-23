@@ -440,3 +440,186 @@ func TestRegression_SchemaCacheWrappedFormCrossParseRefSelfContains(t *testing.T
 		}
 	})
 }
+
+// TestMatrix_SpliceWrapperReservedKeyMerge drives the SchemaCache splice
+// merge's reserved-key routing (the shared schemaReservedKeyForObject
+// predicate at its cache call site) with wrapper props on cached
+// definitions. A wrapper key the def's kind/logical CONSUMES never survives
+// the splice (reserved usage-site attributes drop, matching Java's
+// reference arms, which return the found schema with no properties pass);
+// an UNCONSUMED key merges onto the definition as an ordinary custom
+// property, definition-wins on collision. A non-string logicalType is
+// unconsumed everywhere; precision/scale are consumed exactly on a decimal
+// carrier def. The decimal def omits "scale" on purpose (spec default 0):
+// a consumed wrapper "scale" must be dropped by the ROUTING, not masked by
+// the def-wins presence check. fastavro rejects the props-carrying
+// wrapped-reference spelling outright, so these cells have no differential
+// arm; Java is the reference (usage-site extras drop at reference sites).
+func TestMatrix_SpliceWrapperReservedKeyMerge(t *testing.T) {
+	plainDef := `{"type":"fixed","name":"F","size":4}`
+	decimalDef := `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":2}`
+
+	cases := []struct {
+		name    string
+		def     string
+		wrapper string
+		check   func(t *testing.T, n avro.SchemaNode)
+	}{
+		{
+			"nonstring-logicaltype-numeric-merges",
+			plainDef,
+			`{"type":"F","logicalType":123}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got := n.Props["logicalType"]; got != int64(123) {
+					t.Errorf("Props[logicalType] = %#v; want int64(123) merged as ordinary prop", got)
+				}
+				if n.LogicalType != "" {
+					t.Errorf("non-string logicalType activated: %q", n.LogicalType)
+				}
+			},
+		},
+		{
+			"nonstring-logicaltype-null-merges",
+			plainDef,
+			`{"type":"F","logicalType":null}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got, ok := n.Props["logicalType"]; !ok || got != nil {
+					t.Errorf("Props[logicalType] = %#v (present=%v); want JSON null merged as nil prop", got, ok)
+				}
+			},
+		},
+		{
+			"string-logicaltype-consumed-drops",
+			plainDef,
+			`{"type":"F","logicalType":"decimal"}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got, ok := n.Props["logicalType"]; ok {
+					t.Errorf("consumed usage-site logicalType survived the splice as a prop: %#v", got)
+				}
+				if n.LogicalType != "" {
+					t.Errorf("usage-site logicalType activated on the def: %q", n.LogicalType)
+				}
+			},
+		},
+		{
+			"unconsumed-precision-valid-merges",
+			plainDef,
+			`{"type":"F","precision":3}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got := n.Props["precision"]; got != int64(3) {
+					t.Errorf("Props[precision] = %#v; want int64(3)", got)
+				}
+				if n.Precision != 0 {
+					t.Errorf("unconsumed precision landed structurally: %d", n.Precision)
+				}
+			},
+		},
+		{
+			"unconsumed-precision-malformed-merges-verbatim",
+			plainDef,
+			`{"type":"F","precision":"x"}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got := n.Props["precision"]; got != "x" {
+					t.Errorf("Props[precision] = %#v; want verbatim \"x\"", got)
+				}
+				if n.Precision != 0 {
+					t.Errorf("malformed precision landed structurally: %d", n.Precision)
+				}
+			},
+		},
+		{
+			"consumed-scale-malformed-drops",
+			decimalDef,
+			`{"type":"D","scale":"bogus"}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got, ok := n.Props["scale"]; ok {
+					t.Errorf("consumed usage-site scale survived the splice as a prop: %#v", got)
+				}
+				if n.Scale != 0 {
+					t.Errorf("usage-site scale mutated the def: Scale = %d; want spec-default 0", n.Scale)
+				}
+			},
+		},
+		{
+			"consumed-scale-valid-drops-def-wins",
+			decimalDef,
+			`{"type":"D","scale":1}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got, ok := n.Props["scale"]; ok {
+					t.Errorf("consumed usage-site scale survived the splice as a prop: %#v", got)
+				}
+				if n.Scale != 0 {
+					t.Errorf("usage-site scale mutated the def: Scale = %d; want spec-default 0", n.Scale)
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cache := &avro.SchemaCache{}
+			if _, err := cache.Parse(c.def); err != nil {
+				t.Fatalf("def Parse: %v", err)
+			}
+			s, err := cache.Parse(c.wrapper)
+			if err != nil {
+				t.Fatalf("wrapper Parse: %v", err)
+			}
+			n := s.Root()
+			c.check(t, n)
+
+			// Wrapper props are metadata: the wire image is the def's own
+			// ([]byte is the opaque carrier for both plain and decimal
+			// fixed).
+			def := avro.MustParse(c.def)
+			got, err := s.Encode([]byte{1, 2, 3, 4})
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			want, err := def.Encode([]byte{1, 2, 3, 4})
+			if err != nil {
+				t.Fatalf("def Encode: %v", err)
+			}
+			if string(got) != string(want) {
+				t.Errorf("wrapper props changed the wire: %x vs %x", got, want)
+			}
+
+			// The spliced, self-contained metadata tree must rebuild to a
+			// schema that reparses and keeps the same routing.
+			rb, err := n.Schema()
+			if err != nil {
+				t.Fatalf("Root().Schema() rebuild: %v", err)
+			}
+			c.check(t, rb.Root())
+		})
+	}
+}
+
+// A cached definition whose RECORD field carries an unconsumed malformed
+// precision splices through by-subtree: the field rides verbatim inside the
+// inlined definition, the spliced tree rebuilds, and the pair stays on the
+// field's Props — the splice merge touches only the WRAPPER's own keys,
+// never field attributes inside the definition.
+func TestRegression_SpliceDefFieldMalformedPrecisionRidesThrough(t *testing.T) {
+	cache := &avro.SchemaCache{}
+	if _, err := cache.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int","precision":"x"}]}`); err != nil {
+		t.Fatalf("def Parse: %v", err)
+	}
+	s, err := cache.Parse(`{"type":"R","myprop":1}`)
+	if err != nil {
+		t.Fatalf("wrapper Parse: %v", err)
+	}
+	n := s.Root()
+	if got := n.Fields[0].Props["precision"]; got != "x" {
+		t.Errorf("spliced def's field Props[precision] = %#v; want verbatim \"x\"", got)
+	}
+	if got := n.Props["myprop"]; got != int64(1) {
+		t.Errorf("wrapper prop lost: %#v", got)
+	}
+	rb, err := n.Schema()
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := rb.Root().Fields[0].Props["precision"]; got != "x" {
+		t.Errorf("rebuild field Props[precision] = %#v; want \"x\"", got)
+	}
+}

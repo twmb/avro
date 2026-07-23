@@ -137,7 +137,13 @@ type SchemaField struct {
 	Doc        string   // documentation string
 
 	// Props holds custom (non-reserved) field properties. Numbers decode as
-	// in [SchemaNode.Props].
+	// in [SchemaNode.Props]. Field-level "logicalType", "precision", and
+	// "scale" appear here as written: the wire-side lift is a codec
+	// concession that never removes them from this surface, and an
+	// unconsumed precision/scale — no field logicalType, a non-decimal
+	// one, or a decimal whose lift target is not a bytes/fixed carrier —
+	// is an ordinary property whatever its value's JSON shape (only a
+	// consumed placement shape-validates the pair at parse).
 	Props map[string]any
 }
 

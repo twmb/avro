@@ -289,13 +289,21 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	if ls, ok := m["logicalType"].(string); ok {
 		f.Logical = ls
 	}
+	// precision/scale shape verdicts are RECORDED here and decided after
+	// the type parses: whether the pair is consumed depends on the
+	// field-level logicalType and the lift target's kind (and a flat
+	// field routes the raw pair into the lifted type object, where the
+	// type-level gate rules) — none of which is known yet. An unconsumed
+	// malformed body is inert field metadata riding to props verbatim; a
+	// consumed one rejects loudly below, from these recorded errors.
+	var scaleErr, precisionErr error
 	if p, err := intPtrFrom(m, "scale"); err != nil {
-		return err
+		scaleErr = err
 	} else {
 		f.Scale = p
 	}
 	if p, err := intPtrFrom(m, "precision"); err != nil {
-		return err
+		precisionErr = err
 	} else {
 		f.Precision = p
 	}
@@ -320,6 +328,24 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	// keys, lift those into a nested type object.
 	if f.Type != nil && f.Type.primitive != "" && flatFieldNeedsLift(m, f.Type.primitive) {
 		return f.liftFlatFieldType(m, f.Type.primitive)
+	}
+	// The decimal lift is the only field-level consumer of precision/
+	// scale. Where it consumes (logicalType "decimal" with a bytes/fixed
+	// lift target), a malformed body must reject LOUDLY rather than be
+	// treated as absent: scale is optional (spec default 0), so silently
+	// dropping a malformed scale beside a valid precision would parse as
+	// decimal(p,0) — a silent wire-semantics change. Everywhere else the
+	// pair is inert and the recorded error is deliberately dropped — the
+	// key rides to the field's metadata props verbatim, like any custom
+	// property (Java's FIELD_RESERVED excludes the pair, so its parser
+	// never validates them; fastavro preserves them verbatim).
+	if f.fieldDecimalLiftConsumesPrecisionScale() {
+		if precisionErr != nil {
+			return fmt.Errorf("invalid record field %q: %w", "precision", precisionErr)
+		}
+		if scaleErr != nil {
+			return fmt.Errorf("invalid record field %q: %w", "scale", scaleErr)
+		}
 	}
 	f.liftFieldLogicalIntoType()
 	return nil
