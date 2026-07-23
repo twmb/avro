@@ -5929,3 +5929,148 @@ Policy round — does not count toward the streak-rebuild's two clean fulls.
   DEDICATED trust-boundary census (6 FILED→FIXED; #65 #66; Java CI GREEN
   through 18988c2) + FULL clean #1 · counter ZERO.
   Verbatim: archive (2026-07-18).
+
+## Distillation archive (2026-07-23) — FULL round (HEAD 882c817) + the capture⟺shape-verdict / logicalType-inert FIX (START head 882c817)
+
+### The FULL round (2026-07-22, read-only)
+
+Net: suite + fastavro differential EXECUTED green (467 RUN / 0 SKIP);
+FULL -race green; Java oracle NOT run (jarless). Quarantine of 882c817
+(the #46 exact-case policy flip, the sole commit since ledger head
+113837b): CLEAN — the CI→exact conversion verified surface-by-surface
+across all five files (parse arms, walker gates, metadata getters, cache
+collect/splice, SchemaFor composition + type-alias walks); the fold
+apparatus removal complete; the recorded stray-verdict thread still
+describes exactly the spelling the arms read (P19 re-checked — one
+spelling binds, so coarseness is impossible); splice def-wins a plain
+exact presence test, order-independent; exact reads strictly cheaper (no
+new DoS surface).
+
+FILED 2 behavioral (both verified failing in /tmp/avro_audit_verify):
+
+1. Metadata stray-capture fabrication (schema_node.go:1883-1885). The
+   capture getters were LAXER than the shape verdict that routes the
+   same malformed stray body to Props: getStringSlice type-asserted
+   []any and element-wise-asserted strings (non-string element → ""),
+   and getInt→jsonNumericInt's float64 arm truncated (int(3.7)=3). So
+   {"type":"int","aliases":["a",1]} surfaced Root().Aliases ["a",""]
+   AND Props["aliases"] ["a",1]; symbols identical; "size":3.7 surfaced
+   Size 3 beside Props 3.7. The wire parser's twin arms
+   (stringSliceFrom, laxInt) decline the same bodies — a parse↔metadata
+   split of #63's single-routing-predicate rule. The rebuild was masked
+   by map-write ordering (the Props loop writes the same key last), so
+   rebuilt JSON was verbatim-correct while the metadata API fabricated.
+   Why 360+ stray cells missed it: the routing matrix asserted ONLY the
+   Props route on malformed cells (never structural-zero), and its
+   malformed bodies missed the capture-accepts×shape-rejects wedge
+   (aliases/symbols had [3] — which already fabricated [""] unobserved —
+   but not ["a",1]; size had "x"/true, never a float). Over-int64
+   integer sizes were safe (stay json.Number → uncaptured).
+
+2. Non-string logicalType hard-reject, twmb-only
+   (schema_parse.go logicalType arms, schema+field level). twmb already
+   inert-accepted any garbage STRING logical ("total-nonsense" parses,
+   surfaced as-written; "date" on string carrier inert) but rejected
+   {"logicalType":123}/null loudly at both levels — inherited
+   stdlib-struct-decode strictness preserved by the parse-tree rewrite
+   (schemaTypeMismatch mirrors the former `Logical string` field),
+   never separately adjudicated. Java: LogicalTypes.fromSchemaImpl
+   reads schema.getProp (textual only) → non-text → null → no logical,
+   prop preserved (LogicalTypes.java:124-130); field-level is
+   warn-and-ignore (Schema.java:1874-1877). fastavro EXECUTED: accepts
+   123/null/field-level, preserved verbatim. goavro: codec.go:712
+   value-switch, falls through to plain type. Three references
+   accept-as-inert; the reject protected nothing.
+
+Killed at the gate (do not re-file): type-level default/order
+captured-dropped (the ATTRIBUTE × PLACEMENT census header documents
+"silently dropped from the metadata tree where none does (order,
+default at type level)… canonical-identical, not text-identical", with
+pins + executed fastavro arm; String() returns s.full verbatim so its
+"preservation" is not a render); enum non-string default reject (#54,
+fastavro-corroborated); non-string namespace-on-named reject (#63
+binding-kind clause, matrix-pinned).
+
+Clean fronts: atype package (zero test files — all 28 constants
+character-checked against spec spellings); soe.go + rabin.go (SOE
+magic + LE fingerprint construction schema.go:303-307; validateSOEHeader
+shared by both entry points; zero-writerSoe non-match reasoning;
+CRC-64-AVRO table/update = spec pseudo-code; Sum big-endian per
+hash.Hash with the endianness split documented); compat.go full walk
+(coinductive seen memo, mark-before-check; writer-union eager fail #1;
+tier-based branch selection with fixed size folded into the match
+predicate #44; alias qualification #67; claims-unique guard mirroring
+resolveRecord; enum default gate; decimal param equality); Y4/P1/B20
+grep refresh (every hit pre-guarded/documented).
+
+### The FIX round (2026-07-23, START head 882c817)
+
+Overseer reproduced both findings, executed fastavro, source-verified
+Java; RULED: (1) capture⟺parse-shape-verdict — pure parse↔metadata
+consistency, no new policy; (2) non-string logicalType → inert-Props
+(permissive lean rule 2; the internal garbage-string asymmetry showed
+type-strictness protected nothing) — new policy, NOT_BUGS #70.
+
+Implementation (all red-then-green; 18 cells verified failing pre-fix:
+3 fabrication pins + 8 logicalType cells + 10 matrix structural-zero
+leaf cells, minus overlap in the count line = 18 total FAIL lines):
+
+- nodeFromJSONObject captures now run the parser's OWN decodes:
+  stringSliceFrom for aliases/symbols (shared with the parse arms; the
+  lax getStringSlice helper DELETED; metadataField's field-aliases read
+  swapped too), and decodeLaxInt for size — a new N=3 extraction
+  (json.Marshal + laxInt) shared by the aobjectFromMap size arm, the
+  metadata capture, and strayBodyShapeOK's size case, so the capture
+  value and the verdict are the same decode and cannot disagree.
+- The Props-routing closure consults RECORDED verdicts for
+  symbols/aliases/size (extending the items/values/fields thread) — one
+  decode per key per node, removing the previously-fresh second check.
+- logicalType arms (schema + field) become string-conditional
+  type-asserts; schemaReservedKeyForObject gains the string-conditional
+  logicalType clause, shared by parse extras / Root() Props / cache
+  splice merge — a wrapper carrying "logicalType":123 splices with the
+  value merged onto the def as an ordinary prop (probed; def-wins,
+  re-parses clean).
+- SchemaNode docs: Props doc gains the ONLY-surface clause + the
+  logicalType non-string note; LogicalType field doc notes the Props
+  route; jsonNumericInt's stale size sentence corrected (its callers
+  are now precision/scale only).
+
+Nets: TestMatrix_StrayBodyShapeRouting gained assertStrayStructuralZero
+on every malformed cell (carrier + wrapped-reference surfaces, all ten
+keys) + wedge bodies (aliases/symbols ["a",1]; size 3.7 +
+99999999999999999999; fields [{"name":"f","type":"int","aliases":[1]}]);
+pins TestRegression_Stray{Aliases,Symbols,Size}MalformedNotStructurallySurfaced;
+logicaltype_value_test.go: TestRegression_NonStringLogicalTypeInert
+(numeric+null × schema+field), TestMatrix_LogicalTypeValueTypes (value
+type {valid string, unknown string, numeric, null} × placement, with
+wire-twin identity for inert cells + rebuild preservation incl.
+present-nil Props null), TestDifferentialFastavroLogicalTypeValueTypes
+(EXECUTED per cell).
+
+Neuters ×4, each turning exactly its own cells red, restored byte-exact:
+(A) lax slice capture re-introduced → 10 (2 pins + 8 aliases/symbols
+matrix cells); (B) lax size capture (getInt) → 3 (1 pin + 2 size-3.7
+cells; overflow/"x"/true stay green — getInt declines those); (C1)
+reject arms restored → 8 (4+4 logicalType parse cells); (C2) predicate
+clause dropped (consume unconditionally) → 2 (type-level Props
+preservation cells, exact "not in Props" divergence; field cells stay
+green via the fieldReservedKeys route — the deliberate asymmetry).
+
+FIX.md sweep: retrospective gates "not documented" both (pickaxes:
+getStringSlice/jsonNumericInt bodies predate under 7fde736/4cbdd5c,
+refactor-only in range via a0eb6d6/882c817; the logicalType reject
+preserved-by-construction in cf91ceb); predicate symmetry structural
+(shared decodes); three-axis n/a (parse+metadata only — wire inertness
+pinned by the twin cells); sibling sweep question-scoped over R1-Q4's
+columns (PARSE/NODE-WALK updated+shared; WIRE-WALK gates unchanged;
+RENDER now single-surface for malformed strays — no more reliance on
+Props-overwrite ordering; CACHE splice probed; SCHEMAFOR/RESOLVE ∅);
+immunity claims from the report each re-verified (precision/scale +
+name/namespace zero-asserted in the matrix; field-aliases
+structurally gated now; overflow-size pinned as a matrix cell); DRY:
+getStringSlice deleted, decodeLaxInt extracted (N=3), no new copies;
+vet clean; suite + fastavro EXECUTED green ×2; -race on the changed
+family green. Docs landed: NOT_BUGS #63 capture⟺verdict clause +
+#70 entry + index lines; R1-Q4 gains the CAPTURE⟺VERDICT and
+LOGICALTYPE VALUE-TYPE sub-rows; SchemaNode/LogicalType doc updates.

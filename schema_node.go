@@ -35,7 +35,7 @@ import (
 // name (e.g. com.example.Address) with no other fields.
 type SchemaNode struct {
 	Type        string // Avro type or named type reference
-	LogicalType string // e.g. date, timestamp-millis, decimal, uuid; empty if none
+	LogicalType string // e.g. date, timestamp-millis, decimal, uuid; empty if none (or if the attribute's value is not a string — see Props)
 
 	Name string // name for record, enum, fixed
 
@@ -79,8 +79,12 @@ type SchemaNode struct {
 	// structural key whose value does not parse as that key's schema
 	// shape, sitting on a kind that does not bind the key (a stray
 	// "items":3 on an "int"), is inert metadata and is reported here
-	// verbatim; a schema-shaped stray body instead surfaces as-written
-	// on the matching structural field (Items / Values / Fields).
+	// verbatim as its ONLY surface — the matching structural field stays
+	// zero; a schema-shaped stray body instead surfaces as-written on
+	// the matching structural field (Items / Values / Fields). A
+	// logicalType attribute whose value is not a JSON string is likewise
+	// inert and reported here verbatim (no value but a string can name a
+	// logical).
 	//
 	// Values use the natural Go types from JSON: string, bool, nil,
 	// []any, map[string]any, plus int64 for whole numbers and float64
@@ -1186,10 +1190,10 @@ func jsonNumericInt(v any) (int, bool) {
 			return int(i), true
 		}
 	case string:
-		// The Avro [INTEGERS] rule allows a quoted-string size (e.g.
-		// "size":"16"), accepted at parse via laxInt; the metadata tree
-		// must read it too, or Root().Size returns 0 and Root().Schema()
-		// round-trips to "missing size".
+		// The Avro [INTEGERS] rule allows quoted-string integers; kept
+		// for symmetry with laxInt even though the current callers
+		// (precision/scale on a validated decimal carrier — size reads
+		// through decodeLaxInt) never see the quoted form post-parse.
 		if len(t) <= maxLaxIntDataLen {
 			if i, err := strconv.Atoi(t); err == nil {
 				return i, true
@@ -1218,18 +1222,6 @@ func getInt(m map[string]any, key string, dst *int) {
 		if p, ok := jsonNumericInt(v); ok {
 			*dst = p
 		}
-	}
-}
-
-// getStringSlice assigns *dst to m[key] when it is a []any of strings
-// (aliases, symbols).
-func getStringSlice(m map[string]any, key string, dst *[]string) {
-	if vs, ok := m[key].([]any); ok {
-		out := make([]string, len(vs))
-		for i, x := range vs {
-			out[i], _ = x.(string)
-		}
-		*dst = out
 	}
 }
 
@@ -1880,9 +1872,27 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 		getInt(m, "precision", &n.Precision)
 		getInt(m, "scale", &n.Scale)
 	}
-	getInt(m, "size", &n.Size)
-	getStringSlice(m, "aliases", &n.Aliases)
-	getStringSlice(m, "symbols", &n.Symbols)
+	// Size/aliases/symbols capture through the SAME decodes the parser's
+	// arms run (decodeLaxInt, stringSliceFrom), so a structural field is
+	// set exactly when the parse consumes the key out of props: a
+	// malformed stray body (mixed-type array, non-integral number) rides
+	// to Props verbatim as its ONLY surface — capturing a coerced image
+	// of it here would fabricate metadata that appears nowhere in the
+	// input. At BOUND positions the parse already validated the value, so
+	// the gates never decline there.
+	sizeOK := false
+	if v, ok := m["size"]; ok {
+		if l, err := decodeLaxInt(v); err == nil {
+			n.Size = int(l)
+			sizeOK = true
+		}
+	}
+	if ss, ok, err := stringSliceFrom(m, "aliases"); err == nil && ok {
+		n.Aliases = ss
+	}
+	if ss, ok, err := stringSliceFrom(m, "symbols"); err == nil && ok {
+		n.Symbols = ss
+	}
 
 	if n.Type == "enum" {
 		if d, ok := m["default"].(string); ok {
@@ -1953,13 +1963,14 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 
 	// Collect custom properties (anything not in the reserved set;
 	// precision/scale are reserved only when consumed by a recognized
-	// decimal carrier above). The recursive container keys already
-	// surfaced: walkNodeChildren set n.Items/n.Values/n.Fields exactly when
-	// the stray body was shape-OK (the same verdict strayBodyShapeOK
-	// computes — the gate that fired each callback IS that check), so route
-	// them on the recorded result instead of decoding the subtree a second
-	// time here. The non-recursive stray keys (name/namespace/symbols/size/
-	// aliases) carry no compounding cost, so a fresh single check is fine.
+	// decimal carrier above). The keys with structural surfaces already
+	// recorded their verdicts: walkNodeChildren set n.Items/n.Values/
+	// n.Fields exactly when the stray body was shape-OK (the gate that
+	// fired each callback IS that check), and the size/aliases/symbols
+	// captures above ran the parser's own decodes — so route on the
+	// recorded results instead of decoding a second time here. The
+	// remaining stray keys (name/namespace) are single string asserts
+	// with no compounding cost, so a fresh check is fine.
 	shapeOK := func(key string, v any) bool {
 		switch key {
 		case "items":
@@ -1968,6 +1979,12 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 			return n.Values != nil
 		case "fields":
 			return n.Fields != nil
+		case "symbols":
+			return n.Symbols != nil
+		case "aliases":
+			return n.Aliases != nil
+		case "size":
+			return sizeOK
 		}
 		return strayBodyShapeOK(key, v)
 	}
@@ -2010,7 +2027,13 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 	if flatType == nil {
 		getString(fm, "doc", &sf.Doc)
 	}
-	getStringSlice(fm, "aliases", &sf.Aliases)
+	// Field aliases read through the parser's own decode (stringSliceFrom):
+	// bound fields are parse-validated and stray-fields elements are
+	// shape-checked before this runs, so the gate never declines here — it
+	// exists so this surface structurally cannot coerce a malformed body.
+	if ss, ok, err := stringSliceFrom(fm, "aliases"); err == nil && ok {
+		sf.Aliases = ss
+	}
 	getString(fm, "order", &sf.Order)
 	// The exact-lowercase field reserved keys are consumed into the
 	// SchemaField attributes above; every other key — including a
@@ -2080,6 +2103,15 @@ func schemaReservedKeyForObject(k string, v any, typ, logical string, shapeOK st
 	}
 	if k == "precision" || k == "scale" {
 		return decimalConsumesPrecisionScale(typ, logical)
+	}
+	// logicalType is consumed only when string-typed: a non-string value
+	// can never name a logical, so it is an ordinary custom property
+	// (Java reads only textual logicalType props; fastavro and goavro
+	// treat any non-matching value as inert). Mirrors the parse arm's
+	// string-conditional read.
+	if k == "logicalType" {
+		_, isString := v.(string)
+		return isString
 	}
 	if canonicalStrayKey(k) != "" && !strayKeyBinds(typ, k) {
 		if shapeOK != nil {

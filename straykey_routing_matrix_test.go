@@ -20,17 +20,59 @@ type strayRouteCase struct {
 	binding   string   // a carrier that BINDS the key (malformed must reject)
 }
 
+// The malformed bodies deliberately include shapes that pass a LAX capture
+// but fail the key's schema shape — a mixed-type array is a []any (a lax
+// []any assert accepts it) but not a []string; 3.7 is a JSON number (a lax
+// numeric read truncates it) but not an integer. These wedge bodies pin
+// that the capture predicate and the shape verdict are the SAME predicate.
 var strayRouteCases = []strayRouteCase{
 	{"items", `"int"`, []string{`3`, `{"type":3}`}, `{"type":"array","items":%s}`},
 	{"values", `"int"`, []string{`true`, `[3]`}, `{"type":"map","values":%s}`},
-	{"fields", `[{"name":"f","type":"int"}]`, []string{`3`, `[3]`}, `{"type":"record","name":"BN","fields":%s}`},
-	{"symbols", `["A"]`, []string{`3`, `[3]`}, `{"type":"enum","name":"BN","symbols":%s}`},
-	{"size", `4`, []string{`"x"`, `true`}, `{"type":"fixed","name":"BN","size":%s}`},
+	{"fields", `[{"name":"f","type":"int"}]`, []string{`3`, `[3]`, `[{"name":"f","type":"int","aliases":[1]}]`}, `{"type":"record","name":"BN","fields":%s}`},
+	{"symbols", `["A"]`, []string{`3`, `[3]`, `["a",1]`}, `{"type":"enum","name":"BN","symbols":%s}`},
+	{"size", `4`, []string{`"x"`, `true`, `3.7`, `99999999999999999999`}, `{"type":"fixed","name":"BN","size":%s}`},
 	{"name", `"nm"`, []string{`3`, `[3]`}, `{"type":"record","name":%s,"fields":[]}`},
 	{"namespace", `"ns"`, []string{`3`, `{}`}, `{"type":"record","namespace":%s,"name":"BN","fields":[]}`},
-	{"aliases", `["al"]`, []string{`3`, `[3]`}, `{"type":"record","name":"BN","aliases":%s,"fields":[]}`},
+	{"aliases", `["al"]`, []string{`3`, `[3]`, `["a",1]`}, `{"type":"record","name":"BN","aliases":%s,"fields":[]}`},
 	{"precision", `3`, []string{`"abc"`, `3.5`}, `{"type":"bytes","logicalType":"decimal","scale":0,"precision":%s}`},
 	{"scale", `0`, []string{`"abc"`, `1.5`}, `{"type":"bytes","logicalType":"decimal","precision":3,"scale":%s}`},
+}
+
+// assertStrayStructuralZero asserts the structural surface for key is the
+// zero value on n: a malformed stray body's ONLY surface is Props verbatim.
+// The metadata walker's capture and the Props routing share one shape
+// verdict, so a body that rides to Props can never also surface a coerced
+// image on the structural field (structural-field-set ⟺ consumed-out-of-
+// Props).
+func assertStrayStructuralZero(t *testing.T, key string, n avro.SchemaNode, when string) {
+	t.Helper()
+	zero := true
+	var got any
+	switch key {
+	case "items":
+		zero, got = n.Items == nil, n.Items
+	case "values":
+		zero, got = n.Values == nil, n.Values
+	case "fields":
+		zero, got = n.Fields == nil, n.Fields
+	case "symbols":
+		zero, got = n.Symbols == nil, n.Symbols
+	case "aliases":
+		zero, got = n.Aliases == nil, n.Aliases
+	case "size":
+		zero, got = n.Size == 0, n.Size
+	case "name":
+		zero, got = n.Name == "", n.Name
+	case "namespace":
+		zero, got = n.Namespace == "", n.Namespace
+	case "precision":
+		zero, got = n.Precision == 0, n.Precision
+	case "scale":
+		zero, got = n.Scale == 0, n.Scale
+	}
+	if !zero {
+		t.Errorf("%s: malformed stray %q fabricated a structural surface: %#v (want zero; Props verbatim is the only route)", when, key, got)
+	}
 }
 
 // TestMatrix_StrayBodyShapeRouting crosses reserved key × body shape ×
@@ -65,6 +107,7 @@ func TestMatrix_StrayBodyShapeRouting(t *testing.T) {
 				if !reflect.DeepEqual(got, want) {
 					t.Errorf("Props[%q] = %#v, want the custom-prop image %#v", c.key, got, want)
 				}
+				assertStrayStructuralZero(t, c.key, n, "carrier")
 				enc, err := s.Encode(map[string]any{"a": int32(7)})
 				if err != nil {
 					t.Fatalf("encode: %v", err)
@@ -101,6 +144,7 @@ func TestMatrix_StrayBodyShapeRouting(t *testing.T) {
 				if _, ok := n.Props[c.key]; !ok {
 					t.Errorf("stray %q not in the reference's Props: %v", c.key, n.Props)
 				}
+				assertStrayStructuralZero(t, c.key, n, "wrapped reference")
 			})
 		}
 		t.Run(c.key+"_shapeok_structural", func(t *testing.T) {
@@ -169,5 +213,59 @@ func TestDifferentialFastavroStrayBodyShapes(t *testing.T) {
 				t.Errorf("fastavro rejected an accepted stray-shape cell: %s\n%s", resp.Err, cell)
 			}
 		}
+	}
+}
+
+// The three pins below lock the malformed-stray single-surface invariant at
+// the top level (no host record): a body that does not parse as the reserved
+// key's schema shape rides in Props verbatim and sets NO structural field.
+// The wedge bodies are exactly the shapes a lax capture would coerce — a
+// mixed-type array type-asserts as []any (element-wise assert fabricates ""
+// for non-strings), and a non-integral number truncates under a plain
+// numeric conversion — so a fabricated value here means the capture
+// predicate has drifted from the shape verdict.
+
+func TestRegression_StrayAliasesMalformedNotStructurallySurfaced(t *testing.T) {
+	t.Parallel()
+	s, err := avro.Parse(`{"type":"int","aliases":["a",1]}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	n := s.Root()
+	if _, ok := n.Props["aliases"]; !ok {
+		t.Fatalf("malformed stray aliases not in Props: %#v", n.Props)
+	}
+	if n.Aliases != nil {
+		t.Errorf("malformed stray aliases fabricated a structural surface: %#v (want nil)", n.Aliases)
+	}
+}
+
+func TestRegression_StraySymbolsMalformedNotStructurallySurfaced(t *testing.T) {
+	t.Parallel()
+	s, err := avro.Parse(`{"type":"int","symbols":["a",1]}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	n := s.Root()
+	if _, ok := n.Props["symbols"]; !ok {
+		t.Fatalf("malformed stray symbols not in Props: %#v", n.Props)
+	}
+	if n.Symbols != nil {
+		t.Errorf("malformed stray symbols fabricated a structural surface: %#v (want nil)", n.Symbols)
+	}
+}
+
+func TestRegression_StraySizeMalformedNotStructurallySurfaced(t *testing.T) {
+	t.Parallel()
+	s, err := avro.Parse(`{"type":"int","size":3.7}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	n := s.Root()
+	if _, ok := n.Props["size"]; !ok {
+		t.Fatalf("malformed stray size not in Props: %#v", n.Props)
+	}
+	if n.Size != 0 {
+		t.Errorf("malformed stray size fabricated a structural surface: %d (want 0)", n.Size)
 	}
 }

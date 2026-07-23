@@ -169,22 +169,20 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 		}
 	}
 	if v, ok := m["size"]; ok {
-		if raw, err := json.Marshal(v); err == nil {
-			var l laxInt
-			if err := l.UnmarshalJSON(raw); err == nil {
-				o.Size = &l
-			} else if strayKeyBinds(o.Type, "size") {
-				return nil, err
-			}
+		if l, err := decodeLaxInt(v); err == nil {
+			o.Size = &l
 		} else if strayKeyBinds(o.Type, "size") {
 			return nil, err
 		}
 	}
-	if v, ok := m["logicalType"]; ok {
-		ls, ok := v.(string)
-		if !ok {
-			return nil, schemaTypeMismatch("logicalType", "string")
-		}
+	// logicalType is read only when string-typed. A non-string value can
+	// never name a logical, so it is inert metadata riding to props
+	// verbatim (schemaReservedKeyForObject's string-conditional arm) —
+	// matching Java (only textual logicalType props are read;
+	// LogicalTypes.fromSchemaImpl via Schema.getProp), fastavro, and
+	// goavro, and matching the treatment an unknown STRING logical
+	// already gets here (inert, surfaced as-written).
+	if ls, ok := m["logicalType"].(string); ok {
 		o.Logical = ls
 	}
 	// precision/scale are consumed (and shape-validated) only on a
@@ -285,11 +283,10 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 	} else if ok {
 		f.Aliases = ss
 	}
-	if v, ok := m["logicalType"]; ok {
-		ls, ok := v.(string)
-		if !ok {
-			return schemaTypeMismatch("logicalType", "string")
-		}
+	// String-conditional like the type-object arm: a non-string
+	// logicalType is an inert custom property (it lifts nothing onto the
+	// field's type and rides in the field's metadata Props verbatim).
+	if ls, ok := m["logicalType"].(string); ok {
 		f.Logical = ls
 	}
 	if p, err := intPtrFrom(m, "scale"); err != nil {
@@ -427,6 +424,26 @@ func stringSliceFrom(m map[string]any, key string) ([]string, bool, error) {
 	return out, true, nil
 }
 
+// decodeLaxInt re-marshals a decoded JSON value and reads it back through
+// laxInt — the schema grammar's integer decode (plain integer syntax or
+// the quoted [INTEGERS] form, length-capped). This is the ONE integer
+// predicate for the "size" attribute, shared by the parse arm
+// (aobjectFromMap), the metadata capture (nodeFromJSONObject), and the
+// stray shape verdict (strayBodyShapeOK), so the surfaces cannot drift on
+// what counts as a size: a value that fails here rides to props verbatim
+// on every surface and never yields a coerced structural value.
+func decodeLaxInt(v any) (laxInt, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return 0, err
+	}
+	var l laxInt
+	if err := l.UnmarshalJSON(raw); err != nil {
+		return 0, err
+	}
+	return l, nil
+}
+
 // intPtrFrom reads m[key] as a *int by re-marshaling
 // the small value and reusing stdlib int decode, so the accept/reject
 // behavior (rejecting floats, strings, overflow) is identical to the
@@ -516,12 +533,8 @@ func strayBodyShapeOK(key string, v any) bool {
 		}
 		return true
 	case "size":
-		raw, err := json.Marshal(v)
-		if err != nil {
-			return false
-		}
-		var l laxInt
-		return l.UnmarshalJSON(raw) == nil
+		_, err := decodeLaxInt(v)
+		return err == nil
 	case "items", "values":
 		var s aschema
 		return aschemaFromAny(v, &s, nil) == nil
