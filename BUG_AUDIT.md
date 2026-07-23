@@ -6284,3 +6284,61 @@ non-grammar key → SchemaField.Props verbatim matching parseProperties;
 precision/scale the sole divergent pair (the filed finding).
 
 Counter ZERO (behavioral filed in a FULL round).
+
+### Re-run verification + walk extension (2026-07-23, later session; code HEAD unchanged at 06c95e5, the archive above committed as docs-only 9c511d6)
+
+The maintainer directed a fresh run of this round after the prior session
+ended with its BUG_AUDIT.md changes uncommitted. The opening distillation
+was found ALREADY APPLIED on disk (CORE 53.7KiB / PATTERNS 149.9KB;
+archive #2 matches the live files section-by-section — ledger one-liners,
+B7 tombstone, B20 pointer, N1 compression); the commit was the only gap,
+and the maintainer made it mid-session.
+
+The quarantine of 06c95e5 was re-run from scratch and CONFIRMS the filed
+finding with fresh sandbox pins (3 verified failing: field
+precision-string and scale-float inert-without-consumer, flat-vs-nested
+twin divergence; controls green: valid-int accept, consumed-decimal
+reject, type-level stray inert), fastavro 1.12.2 re-executed (accepts +
+preserves all three field cases verbatim; flat form UnknownType, N/A),
+Java re-verified at apache/avro main 892d6997d (FIELD_RESERVED
+Schema.java:503-504; parseProperties :1905), and the pre-action gate
+re-run (#41's pin covers decimal-consumed placements only; pickaxe: the
+intPtrFrom field arms landed in cf91ceb as a struct-tag-decode-preserving
+refactor, never separately adjudicated). Fix seams re-probed
+independently: splice merge of a non-string logicalType onto a cached def
+(Props verbatim, wire = twin, rebuild preserves — the shared predicate's
+cache.go call site has no PERMANENT net cell; add one when the fix
+lands), recursive wrapped self-ref with logicalType:123 (canonical
+round-trip), the wrapper structural-key claims (shape-OK rejects "unknown
+complex type"; malformed merges as prop), hostile costs (256KiB inert
+logicalType linear-fast at both placements; 4000-deep wrapper body
+depth-capped in 13ms; bound enum symbols echo-bounded).
+
+Walk extension, three fronts, all clean: (1) inverse-density promote.go
+(least-cited-per-KB substantial file): promotion table spec-exact (8
+pairs, no extras); promotionDeserForLogical covers all 7 long logicals +
+decimal/big-decimal/uuid, unknown-logical fall-through matching natural
+(probed: int→long+date stays raw int64); natural-twin arm parity probed
+×4 — bytes→string+uuid invalid content (any = plain string on both
+paths, [16]byte rejects on both), string→bytes+decimal value parity with
+the exact value (0x616263 scale 2), int→long+timestamp-millis into any =
+time.Time; recorded: fastavro keys promoted logicals off the WRITER
+schema (returns raw b'abc' for the promoted-decimal cell) while twmb
+applies the READER conversion matching Java's GenericDatumReader —
+fastavro-side quirk, no action; the promoted decimal fallback labels
+SemanticError.AvroType "bytes" where natural says "decimal" (cosmetic,
+same type + verdict). (2) P9 + B27 grep refresh: every
+big.Int/Lsh/Exp hit is wire-length-bounded, decimalScaleLimit-capped, or
+linear in the caller's own value; all three manual pointer-peel loops
+bounded (unsafe.go's is in-body). (3) errors.go: render echoes truncated
+(Field/Path/ReaderType/WriterType), errors.As chain preserved through
+the recordFieldError unwind (a leaf ShortBufferError survives to the
+top); the dotted-path rebuild is quadratic in depth × name length but
+the parse depth caps bound it — MEASURED at 900 levels × 1KiB names
+(≈1MB schema): decode-error unwind 99.4ms, under the 250ms battery bar,
+rendered message 67B; not filed (bounded slow path).
+
+Net re-run this session: suite + fastavro differential EXECUTED green
+(900 RUN / 0 SKIP across the differential families); FULL -race green
+(avro + ocf); Java oracle NOT run (jarless). Counter ZERO (same
+behavioral finding re-confirmed).
