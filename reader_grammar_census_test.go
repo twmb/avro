@@ -2,8 +2,11 @@ package avro_test
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -677,4 +680,207 @@ func TestDifferentialFastavroReaderGrammar(t *testing.T) {
 			t.Errorf("fastavro keep after 4097-null skip: %v", resp.Values[0])
 		}
 	})
+}
+
+// TestDifferentialFastavroPromotion executes every spec promotion pair, plus
+// the two value-level resolution features (enum reader-default, reader field
+// default-fill), against fastavro's resolved read. Per cell: the writer wire
+// is byte-parity-checked between the implementations, then the SAME wire is
+// resolved-read by both and the decoded values compared. A third leg drives
+// the WRITER-SHAPED JSON of the same value through the resolved schema's
+// DecodeJSON, which must land exactly where the binary resolved read lands —
+// the wire format cannot change the resolution semantics (Java runs the same
+// ResolvingDecoder over a JsonDecoder built with the writer schema).
+//
+// Mantissa-boundary values make the reader-width contract observable. twmb
+// converts through the reader's width — float64(float32(n)) for a float
+// reader, matching Java's ResolvingDecoder readDouble(): `return (double)
+// readFloat()` on a promoted int/long (the float32 cast is Java's) — while
+// fastavro (observed 1.12.2) returns the writer's value at full precision
+// with no float32 narrowing. That divergence and the bytes→string one below
+// are pinned at the observed verdicts so a fastavro release that changes
+// either flips the cell and forces a deliberate recalibration.
+//
+// bytes→string with invalid UTF-8: twmb preserves the raw bytes in the
+// resulting Go string (Java's Utf8 carries raw bytes likewise); fastavro's
+// strict utf-8 decode rejects the wire (observed 1.12.2, its default
+// handle_unicode_errors="strict").
+func TestDifferentialFastavroPromotion(t *testing.T) {
+	o := startOracle(t)
+
+	const f32b = 1 << 24 // 2^24: +1 is the smallest positive int not exactly float32-representable
+	const f64b = 1 << 53 // 2^53: +1 is the smallest positive int not exactly float64-representable
+
+	cells := []struct {
+		name    string
+		writer  string
+		reader  string
+		val     any    // writer value, twmb-typed
+		valJSON string // the same value in the oracle's JSON transport form
+		kind    string // oracle Kind tag ("bytes" for base64 transport)
+		wJSON   string // the writer-SHAPED Avro-JSON text of val (bytes are codepoint strings)
+		want    any    // twmb resolved-decode expectation (into an any target)
+		// wantF64: non-nil for float-reader cells — ALSO decode into a
+		// float64 target and assert this value. An any target materializes
+		// the reader's float32 and re-rounds at assignment, which would MASK
+		// a conversion arm that lost the float32 narrowing; the float64
+		// target observes the intermediate directly.
+		wantF64 any
+
+		// fastavro's resolved read, exactly one of:
+		//   fastWant  — assert values[0] equals this (JSON-decoded form:
+		//               numbers arrive as float64, records as map[string]any)
+		//   fastBytes — the datum is Python bytes: resolution ACCEPT is
+		//               classified via the oracle's "not JSON serializable"
+		//               transport error (schemaless_reader returned; a
+		//               resolution reject raises before the response dumps)
+		//   fastErr   — assert NOT ok and the error contains this (a
+		//               calibrated divergence: fastavro rejects wire twmb
+		//               and Java accept)
+		fastWant  any
+		fastBytes bool
+		fastErr   string
+	}{
+		{name: "int-to-long", writer: `"int"`, reader: `"long"`,
+			val: int32(math.MinInt32), valJSON: `-2147483648`, wJSON: `-2147483648`,
+			want: int64(math.MinInt32), fastWant: float64(math.MinInt32)},
+		{name: "int-to-float-mantissa", writer: `"int"`, reader: `"float"`,
+			val: int32(f32b + 1), valJSON: `16777217`, wJSON: `16777217`,
+			want: float32(f32b), wantF64: float64(float32(f32b + 1)),
+			fastWant: float64(f32b + 1)}, // twmb+Java float32-round; fastavro full precision
+		{name: "int-to-double", writer: `"int"`, reader: `"double"`,
+			val: int32(f32b + 1), valJSON: `16777217`, wJSON: `16777217`,
+			want: float64(f32b + 1), fastWant: float64(f32b + 1)}, // every int32 is float64-exact
+		{name: "long-to-float-mantissa", writer: `"long"`, reader: `"float"`,
+			val: int64(f32b + 1), valJSON: `16777217`, wJSON: `16777217`,
+			want: float32(f32b), wantF64: float64(float32(f32b + 1)),
+			fastWant: float64(f32b + 1)}, // twmb+Java float32-round; fastavro full precision
+		{name: "long-to-double-mantissa", writer: `"long"`, reader: `"double"`,
+			val: int64(f64b + 1), valJSON: `9007199254740993`, wJSON: `9007199254740993`,
+			// 2^53+1 rounds to 2^53 at the float64 mantissa on BOTH sides
+			// (twmb converts; fastavro's raw int collapses identically in
+			// the JSON transport), so the cell agrees while still proving
+			// the wire carried the unrounded long.
+			want: float64(f64b), fastWant: float64(f64b)},
+		{name: "float-to-double", writer: `"float"`, reader: `"double"`,
+			// 0.1 is not float32-exact: the widened double must be the
+			// float32 value 0.10000000149011612, not 0.1 — both impls widen
+			// the wire's float32 bit pattern.
+			val: float32(0.1), valJSON: `0.1`, wJSON: `0.1`,
+			want: float64(float32(0.1)), fastWant: float64(float32(0.1))},
+		{name: "string-to-bytes", writer: `"string"`, reader: `"bytes"`,
+			val: "h✓i", valJSON: `"h✓i"`, wJSON: `"h✓i"`,
+			want: []byte("h✓i"), fastBytes: true},
+		{name: "bytes-to-string-valid-utf8", writer: `"bytes"`, reader: `"string"`,
+			val: []byte("ok✓"), valJSON: `"b2vinJM="`, kind: "bytes",
+			// bytes as Avro-JSON: each BYTE codepoint-mapped (utf-8 e2 9c 93).
+			wJSON: `"ok\u00e2\u009c\u0093"`,
+			want:  "ok✓", fastWant: "ok✓"},
+		{name: "bytes-to-string-invalid-utf8", writer: `"bytes"`, reader: `"string"`,
+			val: []byte{0x68, 0xff, 0x69}, valJSON: `"aP9p"`, kind: "bytes", wJSON: `"h\u00ffi"`,
+			want:    "h\xffi", // raw bytes preserved, Java Utf8 semantics
+			fastErr: "can't decode"},
+		{name: "enum-reader-default", writer: `{"type":"enum","name":"E","symbols":["A","B","C"]}`,
+			reader: `{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`,
+			val:    "C", valJSON: `"C"`, wJSON: `"C"`,
+			want: "A", fastWant: "A"},
+		{name: "field-default-fill", writer: `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`,
+			reader: `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string","default":"d"}]}`,
+			val:    map[string]any{"a": int32(7)}, valJSON: `{"a":7}`, wJSON: `{"a":7}`,
+			want: map[string]any{"a": int32(7), "b": "d"}, fastWant: map[string]any{"a": float64(7), "b": "d"}},
+	}
+
+	for _, c := range cells {
+		t.Run(c.name, func(t *testing.T) {
+			w := avro.MustParse(c.writer)
+			r := avro.MustParse(c.reader)
+
+			wire, err := w.Encode(c.val)
+			if err != nil {
+				t.Fatalf("twmb encode: %v", err)
+			}
+
+			// Writer-wire byte parity: both impls must produce the same
+			// bytes for the writer value, so the resolved reads below
+			// consume ONE agreed wire (none of these schemas contain maps,
+			// whose entry order would legitimately differ).
+			enc := o.call(oracleJob{Op: "encode", Schema: json.RawMessage(c.writer),
+				Value: json.RawMessage(c.valJSON), Kind: c.kind})
+			if !enc.OK {
+				t.Fatalf("fastavro encode: %s", enc.Err)
+			}
+			if got := hex.EncodeToString(wire); got != enc.Hex {
+				t.Fatalf("writer wire mismatch:\n twmb     %s\n fastavro %s", got, enc.Hex)
+			}
+
+			// twmb resolved read.
+			res, err := avro.Resolve(w, r)
+			if err != nil {
+				t.Fatalf("twmb Resolve: %v", err)
+			}
+			var got any
+			rest, err := res.Decode(wire, &got)
+			if err != nil {
+				t.Fatalf("twmb resolved decode: %v", err)
+			}
+			if len(rest) != 0 {
+				t.Fatalf("twmb resolved decode left %d bytes", len(rest))
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("twmb resolved decode: got %T %#v, want %T %#v", got, got, c.want, c.want)
+			}
+			if c.wantF64 != nil {
+				var f64 float64
+				if _, err := res.Decode(wire, &f64); err != nil {
+					t.Fatalf("twmb resolved decode into float64: %v", err)
+				}
+				if f64 != c.wantF64.(float64) {
+					t.Fatalf("twmb resolved decode into float64: got %v, want %v (reader-width rounding must happen at the conversion, not the target assignment)", f64, c.wantF64)
+				}
+			}
+
+			// twmb resolved JSON read of the writer-shaped JSON: same
+			// landing point as the binary resolved read, both targets.
+			var jgot any
+			if err := res.DecodeJSON([]byte(c.wJSON), &jgot); err != nil {
+				t.Fatalf("twmb resolved DecodeJSON: %v", err)
+			}
+			if !reflect.DeepEqual(jgot, c.want) {
+				t.Fatalf("twmb resolved DecodeJSON: got %T %#v, want %T %#v", jgot, jgot, c.want, c.want)
+			}
+			if c.wantF64 != nil {
+				var f64 float64
+				if err := res.DecodeJSON([]byte(c.wJSON), &f64); err != nil {
+					t.Fatalf("twmb resolved DecodeJSON into float64: %v", err)
+				}
+				if f64 != c.wantF64.(float64) {
+					t.Fatalf("twmb resolved DecodeJSON into float64: got %v, want %v (reader-width rounding must happen at the conversion, not the target assignment)", f64, c.wantF64)
+				}
+			}
+
+			// fastavro resolved read of the same wire.
+			resp := o.call(oracleJob{Op: "readresolve", Schema: json.RawMessage(c.writer),
+				Reader: json.RawMessage(c.reader), Hex: hex.EncodeToString(wire)})
+			switch {
+			case c.fastErr != "":
+				if resp.OK {
+					t.Fatalf("fastavro accepted (%v), want reject containing %q — recalibrate the divergence note", resp.Values, c.fastErr)
+				}
+				if !strings.Contains(resp.Err, c.fastErr) {
+					t.Fatalf("fastavro error %q does not contain %q", resp.Err, c.fastErr)
+				}
+			case c.fastBytes:
+				if !resp.OK && !strings.Contains(resp.Err, "not JSON serializable") {
+					t.Fatalf("fastavro resolved read failed: %s", resp.Err)
+				}
+			default:
+				if !resp.OK {
+					t.Fatalf("fastavro resolved read failed: %s", resp.Err)
+				}
+				if len(resp.Values) != 1 || !reflect.DeepEqual(resp.Values[0], c.fastWant) {
+					t.Fatalf("fastavro resolved value %#v, want %#v", resp.Values, c.fastWant)
+				}
+			}
+		})
+	}
 }
