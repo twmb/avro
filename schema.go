@@ -3012,8 +3012,23 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			deser:       b.deser,
 		}
 		if len(origEnumDefault) > 0 {
+			// The default must be a JSON STRING token naming a symbol,
+			// decided by token type BEFORE the membership check: on a
+			// non-string body json.Unmarshal leaves the zero value ""
+			// (for an explicit null it is even a no-error no-op), and ""
+			// can be a legitimate MEMBER under a WithLaxNames validator
+			// that accepts empty name components — membership alone would
+			// silently bind such garbage to the "" symbol and schema
+			// evolution would fill it. fastavro rejects every non-member
+			// (hence every non-string) enum default at parse; Java binds
+			// NO default for a non-text token (Schema.java:1921-1925,
+			// textValue() → null skips EnumSchema's containment check) —
+			// neither reference ever binds one.
+			tok := bytes.TrimSpace(origEnumDefault)
 			var defStr string
-			json.Unmarshal(origEnumDefault, &defStr)
+			if len(tok) == 0 || tok[0] != '"' || json.Unmarshal(tok, &defStr) != nil {
+				return fmt.Errorf("enum default %s is not a string", truncForError(string(tok)))
+			}
 			if !seenSymbols[defStr] {
 				return fmt.Errorf("enum default %q is not a member of symbols", truncForError(defStr))
 			}
