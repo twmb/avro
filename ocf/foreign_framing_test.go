@@ -203,7 +203,12 @@ func fastavroOCFReader(t *testing.T) func(file []byte) ([]string, string) {
 
 // codecUnsupportedByFastavro reports whether errMsg is fastavro's
 // missing-optional-dependency error (e.g. snappy without cramjam) — an
-// environment limitation, not a divergence.
+// environment limitation, not a divergence. When AVRO_FASTAVRO_PYTHON is
+// explicitly set, that limitation FAILS the test instead of skipping:
+// these cells log-and-continue rather than t.Skip, so a venv that loses
+// cramjam/zstandard silently thins the differential while every skip
+// count still reads zero. Only the opportunistic python3 fallback (env
+// unset) may skip quietly.
 func codecUnsupportedByFastavro(errMsg string) bool {
 	return strings.Contains(errMsg, "need to install")
 }
@@ -308,7 +313,11 @@ func TestReaderForeignEmptyBlockFraming(t *testing.T) {
 				}
 				faSupported[c.name] = true
 			case codecUnsupportedByFastavro(errMsg):
-				t.Logf("codec %s: fastavro missing optional dependency (%s); cross-checks skipped", c.name, errMsg)
+				if os.Getenv("AVRO_FASTAVRO_PYTHON") != "" {
+					t.Errorf("codec %s: fastavro is missing an optional dependency with AVRO_FASTAVRO_PYTHON set (%s) — `pip install cramjam zstandard` into that interpreter so the cross-checks execute", c.name, errMsg)
+				} else {
+					t.Logf("codec %s: fastavro missing optional dependency (%s); cross-checks skipped", c.name, errMsg)
+				}
 			default:
 				t.Errorf("codec %s: fastavro failed to read a plain twmb-written file: %s", c.name, errMsg)
 			}
