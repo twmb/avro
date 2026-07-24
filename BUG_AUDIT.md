@@ -6509,3 +6509,647 @@ size-guard hygiene (maintainer-flagged): entries #46, #62, #63, #65,
 #67, #69 tombstone-compressed (one-line claim + guarding net + re-open
 condition; verbatim originals in §Distillation archive 2026-07-23 #4);
 a ~120KB size-guard line added; 145.9KB → 115.8KB with #71 included.
+
+
+## Distillation archive (2026-07-23 #6) — pre-round distillation (size-guard mandate: CORE 57.8KB / PATTERNS 151.9KB)
+
+AUDIT_CORE.md §Round ledger entries compressed to one-liners (verbatim originals):
+
+- 2026-07-22 · 882c817 · FULL (read-only) · quarantine (882c817 policy
+  flip) CLEAN — exact-case conversion verified across all five surfaces,
+  splice def-wins order-independent, fold-apparatus removal complete, no
+  new DoS surface · behavioral FILED 2, fixes await ruling: (i) metadata
+  stray-capture fabrication — nodeFromJSONObject's capture getters
+  (getStringSlice; getInt via jsonNumericInt's truncating float64 arm)
+  are LAXER than the shape verdict that routes the same malformed stray
+  body to Props, so the structural field surfaces a fabricated image
+  beside the verbatim Props copy (aliases/symbols ["a",1] → ["a",""];
+  size 3.7 → 3); 3 pins verified failing (sandbox); the routing matrix
+  pins Props-route only (never structural-zero) and its malformed bodies
+  miss the wedge (capture-accepts × shape-rejects); B17/P19-family
+  shape; (ii) non-string logicalType hard-rejects on every kind at
+  schema+field level while unknown-STRING logicals are inert — twmb-only
+  vs Java (LogicalTypes.java:124-130 textual-prop-else-null;
+  Schema.java:1874-1877 field-level warn+ignore), fastavro (EXECUTED
+  accept, verbatim preserve), goavro (codec.go:712 value-switch inert);
+  1 pin verified failing · census pre-action gate KILLED the type-level
+  default/order candidate (documented captured-dropped, census header +
+  pins) and #54 killed the enum non-string default candidate · clean
+  fronts: atype constants 28/28 spec spellings; soe.go + rabin.go (SOE
+  magic/LE-fingerprint construction, CRC-64-AVRO table matches spec
+  pseudo-code); compat.go full walk (coinductive seen memo, #44 tier
+  selection, #67 alias qualification, claims-unique resolve mirror);
+  Y4/P1/B20 grep refresh all hits pre-guarded · suite + fastavro
+  EXECUTED green (467 RUN / 0 SKIP); FULL -race green; Java NOT run
+  (jarless) · counter ZERO (behavioral filed in a FULL round).
+- 2026-07-23 · 882c817 (START head — 882c817..HEAD quarantines the fix
+  commit) · FIX · both 07-22 findings ruled + FIXED: (i)
+  capture⟺shape-verdict — nodeFromJSONObject's structural captures run
+  the parser's own decodes (stringSliceFrom shared, lax getStringSlice
+  DELETED incl. metadataField; decodeLaxInt N=3 extraction shared by
+  parse arm + capture + strayBodyShapeOK), Props closure consults
+  recorded verdicts for symbols/aliases/size — structural-field-set ⟺
+  parse-consumed, malformed strays Props-only, render no longer relies
+  on Props-overwrite ordering; (ii) non-string logicalType INERT as
+  ruled (#70 NEW) — string-conditional arms at schema+field level +
+  schemaReservedKeyForObject clause shared by parse extras / Root()
+  Props / cache splice merge (wrapper-prop merge probed); unknown-STRING
+  logicals stay first-class-inert (deliberate asymmetry, pinned) · pins
+  red→green: 18 FAIL cells pre-fix (3 fabrication pins + 8 logicalType
+  cells + matrix structural-zero cells) · nets: structural-ZERO asserted
+  on EVERY malformed matrix cell (carrier + wrapped ref) + wedge bodies
+  (["a",1]; 3.7 + int64-overflow; invalid-fields-element);
+  TestMatrix_LogicalTypeValueTypes (value type × placement, wire-twin +
+  rebuild) + fastavro arm EXECUTED per cell · neuter ×4 = 10/3/8/2
+  cells, each exactly its own · #63 capture⟺verdict clause + #70 +
+  index; R1-Q4 CAPTURE⟺VERDICT + LOGICALTYPE VALUE-TYPE sub-rows;
+  SchemaNode/LogicalType docs · suite + fastavro EXECUTED green ×2;
+  -race changed family green; Java NOT run · counter ZERO (fix round) ·
+  CORE 58.5KB + PATTERNS 150.9KB over caps → distillation mandated at
+  the top of the next round.
+- 2026-07-23 · 06c95e5 · FULL (read-only) · opened with the mandated
+  distillation (CORE 58.6→53.7KB, PATTERNS 150.9→149.9KB; verbatim →
+  archive 2026-07-23 #2) · quarantine (06c95e5) NOT clean — behavioral
+  FILED 1, fix awaits ruling: field-level precision/scale malformed-body
+  hard-reject with NO consumer (afieldFromAny intPtrFrom arms; lift
+  consumes only with a field logicalType) — un-swept sibling of #70;
+  #63 net positive-only at this placement; flat spelling rejects vs
+  nested twin accepts (#56); 3 pins verified failing; fastavro EXECUTED
+  accepts+preserves; Java cited Schema.java:503-504/:1905; gate NOT
+  documented · rest of fix verified (verdict mirrors exact, decodes
+  lockstep ×3, splice nil-verdict sound, laxInt int-backed, echoes
+  bounded, linear) · clean fronts: decoder options (LinkedinFloats
+  centralized ×6→appendJSONFloat; default-fill × non-finite × both
+  conventions green; order matches Java; "nan"-default = lean-
+  permissive, not filed) · Y4+P18 grep refresh clean (guard order
+  deser.go:1832/1844) · field-attribute × malformed census closed
+  (precision/scale sole divergent pair) · suite + fastavro EXECUTED
+  green; FULL -race green; Java NOT run (jarless) · counter ZERO
+  (behavioral filed in a FULL round). Narrative: archive (2026-07-23
+  #3).
+- 2026-07-23 · 06c95e5 (docs 9c511d6) · FULL re-run (read-only;
+  maintainer-directed — the prior session ended uncommitted) ·
+  distillation found already applied on disk (archive #2 ⟺ live files
+  verified section-by-section; the commit was the only gap, made by the
+  maintainer mid-session) · quarantine (06c95e5) re-run CONFIRMS the
+  precision/scale finding: 3 fresh pins failing; fastavro re-executed
+  accepts+preserves; Java re-verified (892d6997d,
+  Schema.java:503-504/:1905); gate NOT documented; splice/recursive/
+  hostile seams clean; splice-logicalType permanent cell missing → add
+  at fix · new fronts clean: promote.go inverse-density (8-pair table
+  exact; logical-reader table complete; natural-twin parity ×4; fastavro
+  writer-keyed-logical quirk recorded — twmb matches Java reader-keyed);
+  P9+B27 refresh bounded ×all; errors.go unwind MEASURED 900×1KiB →
+  99.4ms < 250ms bar · suite+fastavro EXECUTED green (900/0); FULL -race
+  green; Java NOT run · counter ZERO (same behavioral re-confirmed).
+  Narrative: archive (2026-07-23 #3, re-run subsection).
+
+AUDIT_PATTERNS.md B36 tombstoned — fully guarded by the permanent net (TestMatrix_TreeValueGoTypes ~70 cells + FuzzTreeValueTwinParity + the canonicalizeTreeValue/applyJSONFixupKind boundary layers); no B36 finding since 2026-07-19. Verbatim original (index line + body):
+
+- B36. Caller-owned `any` values consumed BEFORE the marshal→Parse round trip through exact-Go-type switches — named-type twins of canonical shapes marshal identically but thread through untouched
+
+- **Caller-owned `any` values consumed BEFORE the marshal→Parse round trip, through exact-Go-type switches.** A composed/rendered schema tree's semantics are whatever `json.Marshal` → Parse will make of it, but pre-marshal consumers (composition walkers, render fixups, merge helpers) dispatch on exact Go types (`case map[string]any / []any / []string / []byte / float64`). Named Go types (`type M map[string]any`, `type B []byte`, `type A []string`, `[N]string`, named floats) marshal identically to their canonical twins yet thread through every switch untouched: structure the walkers never saw gets bound by Parse (fullname/scope silently changes; dedup misses), merges silently skip (a struct-tag attribute vanishes without error), and leaf fixups silently miss (codepoint-form []byte becomes base64 text in rebuilt Props AND field defaults — wire-visible via EncodeJSON auto-fill; −0.0 collapses to +0; NaN becomes a hard marshal error). Values consumed only AFTER the round trip are immune — Parse canonicalizes. The in-repo precedent is the budget walk (`valueWalkLimit`), which walks by reflect KIND for exactly this reason; the fixup and copy layers did not. Probe: for every type-switch over values reachable from caller-owned SchemaNode storage (Props values, SchemaField.Default, hand-built CustomType.Schema trees), feed the named-type twin of each canonical arm and diff verdict + canonical bytes + rebuilt Props/Default content against the canonical twin. Watch json.Marshaler/TextMarshaler-carrying types separately — kind-canonicalization must not override their marshal. Instance: `appendTypeAliasValues` left a `type A []string` aliases value unmerged (type-alias tag silently dropped, Parse accepted the marshal); `pinCustomSchemaScope`/dedup missed a named-map items def (composed fullname silently changed; type-alias wrong-rejected); `needsJSONFixup` missed named []byte / float64 (base64-vs-codepoint Props and Default corruption, −0.0 sign flip). NETTED (2026-07-17, maintainer-ruled architecture): `canonicalizeTreeValue` at the render boundary (SchemaFor walkers see only canonical shapes) + kind-driven `needsJSONFixupKind`/`applyJSONFixupKind` (every rebuild surface); marshal-opaque values (own MarshalJSON/MarshalText, json.Number) and no-same-marshal-twin shapes stay opaque as documented posture — NOT_BUGS #69 — with named-float NaN keeping the loud marshal error. Net: `TestMatrix_TreeValueGoTypes` (Go-dynamic-type × consumer surface, ~28 cells) + 6 regression pins, neuter-verified per component with disjoint red sets. Exact-type dispatch on tree values is legal only DOWNSTREAM of the two boundary layers (FIX.md item 15's B36 line); re-opens if a new pre-boundary type-switch lands (grep `case map\[string\]any|case \[\]any|case \[\]string` in schema_for.go/schema_node.go and classify against the boundary).
+
+## Distillation archive (2026-07-24) — FULL round narrative (code HEAD c428ae3, docs 6da4304, read-only) — WALK RE-CONVERGED
+
+Round opened with the size guard passing (CORE 53KB < 55KB, PATTERNS 146KB
+< 150KB — no distillation mandated). Quarantine scope EMPTY: no code
+commits since the newest ledger line (HEAD 6da4304 is docs-only atop code
+c428ae3), so the round went straight to the full-codebase walk.
+
+**Net.** `go test -count=1 ./...` green. The fastavro venv had broken since
+the last round (python3.14.4 homebrew upgrade wiped site-packages; import
+failed); rebuilt with `python3 -m venv --clear` + fastavro 1.12.2, then the
+suite re-ran green with the differential arms EXECUTED (0 SKIP; 10+
+TestDifferentialFastavro* PASS confirmed by -run filter). FULL `-race`
+green (0 FAIL, 0 DATA RACE). Java oracle NOT run — no JVM and no
+avro-tools jar on the machine; Java-parity areas are verified-modulo-Java
+this round. Capstone fuzz (sequential, nice -19, 75s each):
+FuzzSingleObject 595K execs, FuzzResolveBroad 944K execs, no crashers.
+
+**Fronts (all clean, zero behavioral findings):**
+
+1. B25 inverse-density #1 — soe.go + rabin.go (never walked per B25's
+   list). Rabin table init and per-byte update are the spec pseudo-code
+   verbatim (uint64 logical shift; `-(fp&1)` all-ones mask; `byte(crc)^b`
+   indexing; EMPTY = 0xc15d213aa4d7a795); vectors already netted. SOE
+   header layout verified against the spec quote ("8-byte little-endian
+   CRC-64-AVRO fingerprint", Specification/_index.md:421) and Java's
+   BinaryMessageEncoder (V1_HEADER C3 01; SchemaNormalization.fingerprint
+   little-endian byte loop, SchemaNormalization.java:64-73). soe built at
+   parse-finalize via LittleEndian.PutUint64(Sum64) — conformant.
+   Fingerprint() big-endian-per-hash.Hash vs SOE little-endian split is
+   documented on Fingerprint's doc with the cross-reference. Resolved
+   schemas' dual-fingerprint accept (reader.soe + writerSoe) carries the
+   documented non-supported reader-shaped round-trip caveat; zero-value
+   writerSoe can never match a valid header (magic byte reasoning in
+   code). validateSOEHeader shared by DecodeSingleObject and
+   SingleObjectFingerprint so error shapes agree. AppendEncode's on-error
+   returned-slice convention is mixed (107 nil / 5 dst) but the API makes
+   no promise about the slice on error — Go convention applies; not a
+   finding.
+
+2. B25 inverse-density #2 / B21 — schema_for.go + reflect.go. The two
+   parallel tag tokenizers share one grammar (splitFieldTag delegates to
+   splitTag); the runtime's malformed-tag fallback (name-only, drop
+   options) is documented lenient-by-design vs SchemaFor's loud reject —
+   coherent split since SchemaFor errors mean no schema exists to diverge
+   against, and encode/decode stay symmetric via the shared mapper.
+   parseSchemaTag rejects unknown options loudly (no P7 silent fallback);
+   `avro:"name,inline"` diverges (runtime flattens/ignores name, SchemaFor
+   rejects) in the safe direction only. collectFields⟺typeFieldMapping
+   dedup precedence documented lockstep (tagged-beats-untagged, shallowest
+   wins, deferred-vs-eager ambiguity split documented with Java
+   Schema.java:981 cite) and netted by the embed-shape net. uint64/uint →
+   long is documented policy (NOT_BUGS #38 lists them for long-wire
+   logicals; roundtrip net has a uint64 leaf) with encode-time >MaxInt64
+   reject (appendAvroLong); NOT a B21 instance. All reflect-indirection
+   loops bounded by maxIndirectDepth (setCustomResult in-loop check;
+   unsafe tryCompileFieldSer levels-count declines to the reflect path;
+   checkIntDefaultFitsGoKind bounded peel). One nit, chat-only: the
+   SchemaFor doc-string's inference table omits uint64/uint → long
+   (works-better-than-documented; omission, not falsehood — no doc pin).
+
+3. Resolution edges — resolve.go + compat.go full walk. resolveNode's
+   cycle placeholder/trampoline is sound (post-copy the trampoline
+   forwards to the real deser; pre-copy invocation impossible since deser
+   runs only after Resolve returns). findMatchingBranch's single-pass
+   best-tier scan is provably equivalent to the documented three-walk
+   semantics (strict `>` keeps first-of-best-tier; ties by declaration
+   order); fixed-size-in-match-predicate carries its NOT_BUGS reference.
+   checkRecordFieldClaimsUnique mirrors resolveRecord's alias-collision
+   guard (CheckCompatibility⟺Resolve lockstep, both quoting Java
+   applyAliases/setFields and fastavro _read_py.py:553). resolveEnum
+   remaps writer symbols with reader-default fallback (hasEnumDef gate);
+   identity fast-path only on exact symbol-list match. resolveArray/Map
+   bound minItemBytes against the WRITER wire (documented). Writer-union
+   fail-fast and exact-beats-promotion two-pass remain documented
+   intentional (P5). encodeDefault is lockstep-documented with the
+   parse-time first-accepting-branch picker (AVRO-3649 relaxed union
+   defaults; clean per-branch retry via dst[:base] reslice), distinguishes
+   hasDefault from null-default, bounds recursive record-default fill at
+   maxDepth. deserStruct's per-fill encodedDefault copy vs the
+   interface/map paths' shared-buffer use are both safe (safe-path decode
+   never aliases src — setBytesValue copies, slab strings copy);
+   asymmetry harmless. Resolved record-as-map targets thread
+   validateJSONNumberMapKey (json.Number policy holds on the resolved
+   path). Resolve's canonical-form fast path deliberately AFTER
+   CheckCompatibility (decimal precision/scale stripped from PCF —
+   documented in code).
+
+4. Pattern-grep refresh — P1 (strconv.Parse/SetFloat64/time.Unix/
+   MakeSlice), P9/P16 (big.Int.Exp/big.Rat.SetString/big.Float), P18
+   (deser-append), Y4 trilogy, B20 (error echo), B27 (indirection loops)
+   across all non-test files: every hit triaged as bounded-at-entry
+   (parseInt64Lenient's 64-byte cap bounds all downstream echo+walk),
+   netted (boundedRatFromString family, capacity-capped MakeSlice growth,
+   decimalScaleLimit-bounded Exp), deliberate discarded-remainder
+   delegation (resolve.go:549, deser.go:2338), or grep false-positive
+   (reflect Value.SetString string-kind setters). Zero new candidates.
+
+5. Public-API rotation — decoder options TaggedUnions / TagLogicalTypes /
+   LinkedinFloats. Implementations match their (extensive) docs:
+   appendJSONFloat convention split + float32-narrow-then-classify;
+   findUnionBranch's three-tier accept (fullname exact; goavro
+   "kind.logical" pair-match — the pre-tightening first-kind-match loss is
+   recorded in-code; unqualified short-name with ambiguity guard);
+   unionBranchNames' name-supersedes-logical rule for named types.
+   Executed-reference observations present in-code (fastavro 1.12.2
+   json_writer/AvroJSONDecoder behavior "observed"). Coverage confirmed in
+   matrix_custom_cross_test.go + matrix_phase3_test.go + fuzz_test.go +
+   conformance — not an §Open net gaps candidate.
+
+**Convergence.** Behavioral findings: ZERO. With the 2026-07-23 FULL
+(clean #1) this is the second consecutive clean full round → the walk
+RE-CONVERGES; the feature freeze lifts per §Convergence. No new patterns,
+no NOT_BUGS entries, no net changes (nothing to fold). Oracles not run:
+Java (jarless + JVM-less) — first post-convergence action available when a
+JVM lands is a cisuite run to clear the verified-modulo-Java areas.
+
+## Distillation archive (2026-07-24 #2) — pre-round distillation (size-guard mandate: CORE 55.7KB)
+
+Compressed-away ledger lines (verbatim, AUDIT_CORE.md §Round ledger): the
+2026-07-23 FIX entry and the 2026-07-23 FULL clean #1 entry, replaced by
+one-liners at the top of the first post-convergence FULL round
+(2026-07-24, second session). The 2026-07-24 clean FULL #2 entry stays
+verbatim in the ledger as the newest line / convergence anchor.
+
+### The 2026-07-23 FIX ledger entry, verbatim
+
+- 2026-07-23 · 06c95e5→c428ae3 (docs 9c511d6/99f3dd8/6da4304) · FIX ·
+  the re-run round's finding ruled + FIXED as ruled (#71 NEW): field
+  precision/scale consumed-conditional — afieldFromAny records per-key
+  shape verdicts, decides post-type-parse via
+  fieldDecimalLiftConsumesPrecisionScale (delegates to the type level's
+  decimalConsumesPrecisionScale on the as-written lift-target kind);
+  consumed malformed rejects loud from the recorded error naming the
+  key (scale-0 trap — malformed-as-absent forbidden); unconsumed →
+  SchemaField.Props verbatim on every surface; flat defers to the type
+  gate (#56 parity); stray-fields verdict inherits · pins red→green
+  (5 inert + flat twin failing pre-fix; 5 consumed cells red on
+  key-naming; controls green) · strayPS matrix +BODY axis
+  {valid,quoted,float,nonnum,overflow,array} + union-field level = 630
+  cells, fastavro arm EXECUTED per accepted cell (fastavro non-carrier
+  decimal-param strictness pinned by DIRECTION; Java
+  fromSchemaIgnoreInvalid drops without reading) · splice cells landed
+  (7-cell wrapper-merge matrix + def-field ride-through probe) ·
+  neuter ×5, each exactly its own cells (3/4/315/2/102; never-reject's
+  2 = the cells whose ONLY guard is the gate) · R1-Q4 sub-row; #71 +
+  #41/#56/#70 clauses; SchemaField.Props doc; census headers ·
+  NOT_BUGS hygiene: #46/#62/#63/#65/#67/#69 tombstoned (verbatim →
+  archive #4), ~120KB cap line added, 145.9→115.8KB · suite + fastavro
+  EXECUTED green after every edit; -race family green; Java NOT run ·
+  counter ZERO (fix round) · CORE + PATTERNS cross their caps →
+  distillation at the top of the next round. Narrative: BUG_AUDIT
+  (2026-07-23 #5).
+
+### The 2026-07-23 FULL clean #1 ledger entry, verbatim
+
+- 2026-07-23 · code HEAD c428ae3 (docs 6da4304) · FULL (read-only) ·
+  opened with the mandated distillation (CORE 57.8→52.3KB, PATTERNS
+  151.9→149.7KB; ledger one-liners + B36 tombstone; verbatim → archive
+  2026-07-23 #6) · quarantine (c428ae3) CLEAN — predicate⟺lift mirror
+  probed at the object-null union wedge (both stop at the null OBJECT
+  branch; fastavro EXECUTED accepts+preserves), named-ref + recursive
+  lift targets inert with wire-identical twins, direct-object backfill
+  validated post-lift (scale>precision rejects equal both twins),
+  hostile 1MiB pair bodies ~19ms / 89B bounded error both routes,
+  scale-0 trap loud · fronts clean: B25 inverse-density plumbing —
+  varint.go (uvarintLens reachable indices 0–32 exact, junk padding
+  unreachable; 5th/10th-byte overflow gates; zigzag arms), slab
+  (capacity-capped heads never revisited; readLength int64-domain
+  guard; setBytesValue copies — no block-buffer aliasing), OCF codec
+  internals (deflate max+1/MaxInt64 LimitReader; snappy BE-CRC32 +
+  DecodedLen-before-alloc; zstd once-cached window cap documented;
+  null len-vs-max) · P11+P15+B35 refresh (20 bare continues each
+  paired with its handler — tier cascades complete, nil-first dispatch
+  covers every nil kind across arities; uuid/temporal strict-parser
+  arms per documented cross-wire contracts; both embed resolvers
+  record-and-clear) · logical.go (scaled-conversion adjustment algebra
+  exact + overflow-free; Java nanos-typo divergence RE-VERIFIED on
+  main 892d6997d — TimeConversions nanos toLong subtracts 1_000_000;
+  unionTypeNameForValue peel bounded) · schema_canonical.go (PCF key
+  order + always-emit rules; escaper forms EXECUTED equal to Go 1.25
+  encoding/json AND python json — comment claim true, near-miss filed
+  on nothing) · suite + fastavro EXECUTED green (0 SKIP); FULL -race
+  green; Java NOT run (no JVM on machine — jar and runtime absent) ·
+  behavioral ZERO → clean FULL #1 of 2; convergence needs the next
+  full round clean.
+
+## Distillation archive (2026-07-24 #3) — pre-round distillation (size-guard mandate: CORE 57.1KB)
+
+CORE crossed the ~55KB cap when the 2026-07-24 third-FULL ledger entry
+landed; per the size guard, the ledger entries below (superseded by the
+newest convergence anchor, the 4th-clean-FULL line) compress to one-liners
+in AUDIT_CORE.md §Round ledger. Verbatim originals:
+
+- 2026-07-21 · 113837b→882c817 · POLICY FLIP (#46 documented-but-contradicted → re-ruled): reserved-key matching EXACT lowercase — case-variants are ordinary props on every R1 column; variant-of-required rejects loud; fold/pick apparatus REMOVED; splice def-wins exact + order-independent; refs EXECUTED (fastavro 17 probes, goavro 13, hamba sole folder; Java cited Schema.java:175-178/:503, jarless); 5 pins + TestMatrix_ReservedKeyVariantOnly (25 cells, fastavro arm executed) + inverted exact-case matrices + walker variantkey-props row; neuter ×5 per surface; #46+#63 rewritten; README + Root() hamba-migration note · counter unchanged (policy round, NOT a bare FULL). Narrative: archive (2026-07-21 #2).
+
+- 2026-07-24 · code HEAD c428ae3 (docs 6da4304) · FULL (read-only) ·
+  quarantine EMPTY (no code commits since the newest line) · net: suite +
+  fastavro EXECUTED green 0-SKIP (venv rebuilt after python3.14 upgrade
+  wiped it; fastavro 1.12.2); FULL -race green; Java NOT run (no JVM/jar)
+  · fronts clean: B25 inverse-density soe.go+rabin.go (SOE layout vs spec
+  LE-fingerprint quote + Java BinaryMessageEncoder/SchemaNormalization;
+  Rabin == spec pseudo-code) · B25/B21 schema_for.go+reflect.go (shared
+  splitTag grammar, documented loud/lenient tokenizer split, dedup
+  lockstep, uint64→long = NOT_BUGS #38 + netted, indirection loops all
+  bounded; doc-table uint64/uint omission = chat nit only) · resolution
+  edges resolve.go+compat.go (trampoline sound; best-tier scan ≡
+  documented three-walk; claims-unique lockstep; encodeDefault lockstep
+  w/ parse-time picker; resolved map targets keep json.Number key gate) ·
+  pattern-grep refresh P1/P9/P16/P18/Y4/B20/B27 zero new candidates ·
+  decoder options TaggedUnions/TagLogicalTypes/LinkedinFloats impl==docs,
+  matrix+fuzz coverage confirmed · capstone fuzz FuzzSingleObject 595K +
+  FuzzResolveBroad 944K execs no crashers · behavioral ZERO → clean FULL
+  #2 of 2 → WALK RE-CONVERGED, freeze lifts. Narrative: archive
+  (2026-07-24).
+
+- 2026-07-24 · code HEAD c428ae3 (docs 6da4304) · FULL (read-only), 2nd
+  of the day · opened with the mandated distillation (CORE 55.7→52.4KB:
+  the two long 2026-07-23 ledger entries → one-liners, verbatim →
+  archive 2026-07-24 #2) · quarantine EMPTY (docs-only since c428ae3) ·
+  net: suite + fastavro EXECUTED green 0-SKIP; FULL -race green; Java
+  NOT run (JVM absent; its JSON-form differential is the named un-netted
+  residue, partially closed via fastavro below) · fronts clean: B25
+  inverse-density json_codec.go FULL walk (never previously fronted —
+  escape/codepoint/union-envelope/special-float arms all shared-helper
+  lockstep with binary; 4 EXECUTED fastavro jsonwrite cells close the
+  Java-absent residue: logical-primitive union envelope keys by base
+  kind, named-fixed-decimal envelope keyed by NAME with codepoint
+  payload, date-on-int bare number, time-micros envelope) · schema.go
+  inverse-density slice: canonical first-occurrence rewrite (fwd==back
+  byte-equal incl. diamond + array/union positions, idempotent, null-ns
+  vs scoped collision binds a.B in both directions, 6 PCF cells MATCH
+  fastavro EXECUTED; lookupCanonDef's global-short fallback shown
+  unreachable for parseable inputs — parse rejects every feeding shape)
+  + finalizeUnionNames/addUnionShortNameFallbacks (dup keyspace sound;
+  primitive-named types match Java Schema.java:811 name.full exactly —
+  bare rejects, namespaced accepts, fastavro laxer both cells) ·
+  custom_type.go whole-file (setCustomResult indirection-bounded,
+  probe/re-decode counter logic sound, both passes consume identical
+  wire — no P18 exposure) · doc.go B3 claims sweep (every claim mapped
+  to its named net; README contract section present) · P17 constants
+  inventory (10 constants, rationales re-derived within 3 rounds, zero
+  code delta) + panic-reachability sweep (4 sites: 3 documented Must*
+  contracts + Root's parser-output invariant) · capstone FuzzMatrixCore
+  1.19M execs no crashers · behavioral ZERO → walk REMAINS converged
+  (3rd consecutive clean FULL).
+
+## Round narrative (2026-07-24 #4) — FULL round + promotion net fold (code HEAD c428ae3, read-only)
+
+Ledger-entry original (compressed in AUDIT_CORE.md §Round ledger same day, at round end):
+
+- 2026-07-24 · code HEAD c428ae3 (docs 6da4304) · FULL (read-only) + net
+  fold, 4th of the day · opened with the mandated distillation (CORE
+  57.1→53.8KB: POLICY-FLIP + first two 2026-07-24 ledger entries →
+  one-liners, verbatim → archive 2026-07-24 #3) · quarantine EMPTY
+  (docs-only since c428ae3) · net: suite + fastavro EXECUTED green
+  0-SKIP (×3 runs); FULL -race green; Java NOT run (JVM absent) ·
+  §Open net gaps CLOSED: TestDifferentialFastavroPromotion
+  (reader_grammar_census_test.go) — 11 cells (8 spec pairs + enum
+  reader-default + field default-fill) × {writer-wire byte parity, twmb
+  resolved binary any+float64 targets, twmb resolved DecodeJSON both
+  targets, fastavro readresolve EXECUTED}; mantissa boundaries 2^24+1 /
+  2^53+1; calibration divergences pinned at executed verdicts (→float:
+  fastavro full-precision vs twmb+Java float32-round; bytes→string
+  0xff: fastavro strict-utf-8 reject vs twmb+Java raw preserve);
+  neuter-verified — promote.go float32-cast neuter trips binary+JSON
+  legs (the any-target-only draft stayed GREEN under it, the B31
+  any-target dodge caught in-round and fixed via the float64-target
+  leg), oracle-leg flips ×3 all trip · resolved-JSON × promotion seam:
+  9 probe cells binary↔JSON parity EXACT (float→double widens THROUGH
+  float32: JSON "0.1" → 0.10000000149011612; invalid-utf8 raw
+  preserved); fastavro jsonread EXECUTED agrees outside the two
+  calibrated families (its float-width laxness extends to the JSON
+  wire incl. float→double 0.1; UnicodeDecodeError strict); neuter
+  proved the JSON path SHARES promoteIntFloatMantissa (lockstep flip —
+  no hidden JSON twin arm) · fronts clean: B25 inverse-density
+  schema_walk.go FULL walk (least-fronted file, 8 archive mentions; 3
+  doc-claims verified in-source: non-string node-level "type" rejects
+  at aobjectFromMap:104-108; strayShapeMemo has ONE record point +
+  ONE semantic, pointer-keyed, validity-only consumption —
+  schema_node/cache contain ZERO aobjectFromMap/aschemaFromAny call
+  sites, the built-node verdict closure answers from n.* fields;
+  fieldNoType reachability == afieldFromAny's typeless-field accept) ·
+  pattern-grep refresh: P19 first refresh since minted (memo/verdict
+  sites all pointer- or same-map-keyed, zero coarser-keyed consults) ·
+  B18 ("error" normalizes to "record" at build schema.go:2779;
+  kind:o.Type arms are primitive-path-only; EXECUTED bare/tagged/top
+  JSON probes identical to the record twin — json_decode's == "record"
+  gates sound; unsafe.go's are perf-gates only) · B17 (type-switch
+  census: every dense file fronted ≤3 rounds ago or matrix-netted;
+  zero new candidates) · capstone FuzzSchemaNode 1.30M + FuzzResolve
+  1.09M execs no crashers · behavioral ZERO → 5th consecutive clean
+  FULL, walk REMAINS converged.
+
+## Round narrative (2026-07-24 #5) — FULL round, schema.go first full line-walk + foreign-OCF front (code HEAD c428ae3, read-only) — FINDING FILED, counter RESETS
+
+Round type: FULL (read-only), 5th at code HEAD c428ae3 (docs 6da4304;
+working tree carries the prior round's promotion-net test + archive
+docs, uncommitted).
+
+Net: suite + fastavro EXECUTED green (exit 0, 0 fails; the uncommitted
+TestDifferentialFastavroPromotion re-run verbosely — 11 subtests PASS
+against the live oracle, which clears the round's only quarantine
+item); FULL -race green (102.7s main + 30.7s ocf); Java NOT run
+(/usr/bin/java is still the JVM-less macOS stub; Java claims
+source-cited). MID-ROUND NET REPAIR: the fastavro venv had LOST both
+cramjam AND zstandard — the ocf foreign-framing fastavro cross-checks
+for snappy/zstd had been silently log-skipping (they t.Logf+skip on
+"need to install", which never registers as a test SKIP, so "0-SKIP"
+claims don't see them). Reinstalled both into /private/tmp/fastavro_venv;
+ocf suite re-run with ZERO "missing optional dependency" lines, green.
+Future rounds: grep the output for "missing optional dependency" —
+skip-counting alone cannot prove these cells executed.
+
+Front C (foreign-oracle, NEW intersection): twmb-reads-fastavro-WRITTEN
+OCF. The oracle's "ocf" op only covers fastavro READING twmb bytes;
+nothing had ever pointed twmb's reader at files fastavro's WRITER
+produced. Corpus: 18 files of real fastavro 1.12.2 writer output —
+4 codecs × {3-record, 5000-record multi-block (sync_interval=256),
+empty-file}, a rich record schema in fastavro's own spelling
+(namespace/doc/aliases, all primitives, fixed/enum/null-union/array/map,
+int32/int64 extremes), special doubles (NaN/+Inf/-Inf/-0.0/0.0),
+logicals (decimal on bytes AND fixed, date, timestamp-millis) with
+custom metadata keys, plus bzip2- and xz-coded files. Every value cell
+EXACT (real cramjam-snappy CRC framing, python-zstandard frames, zlib
+raw-deflate all decode; -0.0 signbit preserved; decimal *big.Rat
+values exact; invalid-utf8-free). Unknown codecs reject loudly
+(`ocf: unknown codec "bzip2"` / `"xz"`). Extended cells: twmb
+NewAppendWriter APPENDS onto fastavro-written files across all 4
+codecs (foreign header/sync-marker/codec adoption), twmb re-reads the
+mixed-writer file AND fastavro re-reads it — all exact; OCF-level
+resolution (WithReaderSchema) over a foreign file (int→long promotion,
+enum reader-default on unknown symbol, field default-fill, field drop)
+exact. CLEAN — recorded as an §Open net gaps line for a permanent fold
+(oracle needs an `ocfwrite` op; until folded, a fastavro/codec-lib
+upgrade regressing this surface goes unseen).
+
+Front A (B25 inverse-density): schema.go FIRST-EVER full line-walk —
+4434 lines / 93 funcs, the largest file, never end-to-end walked (only
+its name-system and canonical regions had dedicated walks; both
+re-skimmed). ONE FINDING (below). Everything else matched existing
+pins/policies: checkSchemaNestingDepth backstop semantics, laxInt caps,
+fixup phase ordering, customMatch memo soundness, buildUnion
+fwd-ref/dup handling, fixed/decimal CT suppression gates, alias
+qualification, validateLogical soft-drop table, the default pipeline
+(walkDefault/coerceDefault/validateLeaf) and its copy-per-branch union
+acceptance.
+
+FINDING (behavioral, 1): schema.go:3016 ignores json.Unmarshal's error
+on the enum-LEVEL "default" token. Non-string default → defStr stays
+"" → strict parses reject via symbol-membership with a wrong echo
+(cosmetic), but under a WithLaxNames fn accepting "" AND a schema whose
+symbols include "", `{"symbols":["","A"],"default":5}` (and
+`"default":null`, where Unmarshal is a no-error no-op) PARSES and BINDS
+the enum default to the "" symbol: wire layer sets
+hasEnumDef=true/enumDef="", and resolution FILLS "" for a writer symbol
+absent from the reader (EXECUTED: Resolve(W{A,B,C}→lax R).Decode of
+writer "C" yields "" where fastavro rejects the schema outright —
+SchemaParseException, executed — and Java binds NO default:
+Schema.java:1921-1925 textValue()→null skips EnumSchema's containment
+check). Metadata simultaneously reports Root().HasEnumDefault=false
+(schema_node.go:1904's m["default"].(string) type-assert drops
+non-strings) — a wire↔metadata split on whether the default exists.
+Violates NOT_BUGS #54's ruled posture ("enum-LEVEL non-string/null
+defaults reject too — fastavro-corroborated"). Sibling sweep:
+schema.go:3016 is the ONLY ignored json.Unmarshal in non-test code.
+Sandbox: scratchpad enum_default_probe,
+TestRegression_LaxEnumNonStringDefaultBindsEmptySymbol verified failing
+(plus strict-reject + explicit-"" control + null-sibling probes). Fix
+direction per the ruled posture: validate the default token IS a JSON
+string before membership (rejecting `null` explicitly), which also
+fixes the strict-mode error echo.
+
+Front B: pattern-grep refresh at HEAD — P1 battery (37 hits, all inside
+the capped/classified helper families), P9 (boundedRat gate + scale-
+bounded Exp sites), P18 (the classified same-src delegates + both
+fresh-copy sites), Y4 trilogy (comment-only + pinned platform guards +
+cap-guarded multiplies): ZERO new candidates. B20 covered by the
+error-bound net.
+
+Capstone: FuzzMatrixCore 1.48M execs + FuzzOCFReader 3.26M execs, no
+crashers.
+
+Convergence: behavioral FILED 1 → the consecutive-clean counter RESETS
+(was 5); freeze re-engages pending the fix + two clean FULLs. CORE
+crosses ~55KB with this round's ledger entry → distillation mandated at
+the next round's open.
+
+## Distillation archive (2026-07-24 #6) — pre-fix-round distillation (size-guard mandate: CORE 57.3KB)
+
+Two ledger entries compressed to anchor lines in AUDIT_CORE §Round ledger; verbatim originals:
+
+- 2026-07-24 · code HEAD c428ae3 (docs 6da4304) · FULL (read-only), 3rd
+  of the day · quarantine EMPTY (docs-only since c428ae3) · net: suite +
+  fastavro EXECUTED green 0-SKIP; FULL -race green; Java NOT run
+  (/usr/bin/java is the macOS stub, still JVM-less; Java claims
+  source-cited instead) · fronts clean: duplicate-JSON-key semantics
+  across every JSON surface (schema side stdlib last-wins uniform incl.
+  Root/cache/schema_for decodes; value-record last-wins already pinned +
+  alias-collision reject; map last-wins EXECUTED == fastavro;
+  nested-record dup full-occurrence overwrite + per-occurrence
+  default-fill EXECUTED == fastavro collapse incl. no-default reject
+  both; union-envelope dup-key REJECT == Java JsonDecoder.java:475-494
+  one-pair UNION_END, fastavro pre-collapse laxer witnessed) · atype/
+  package B25 walk (zero test files; all 31 constants match
+  parser/metadata string sets; "error" preserved-on-Type +
+  PCF-normalized-to-record, EXECUTED == fastavro PCF + wire; order
+  "bogus" parse-REJECT == Java Schema.java:1897 valueOf, fastavro
+  accepts-inert; order "" accept-as-absent leniency shared with
+  fastavro, Java-only reject; PCF strips order/doc/aliases EXECUTED
+  byte-equal fastavro) · numeric token forms of size/precision/scale
+  (float/exp forms all reject == Java isInt()/instanceof-Integer; #41
+  quoted postures re-executed: size "4" accepts, fastavro size-4.0
+  laxer + precision-2.0 reject witnessed) · promotion × foreign-oracle
+  residue CLOSED by EXECUTED 11-cell battery (8 spec pairs + enum
+  reader-default + field default-fill; wires byte-identical every cell;
+  →float float32-rounds == Java ResolvingDecoder.java:174 cast,
+  fastavro full-precision laxer; bytes→string 0xff raw-preserved ==
+  Java Utf8, fastavro utf-8-errors) — permanent-net fold recorded in
+  §Open net gaps · capstone FuzzDecodeJSON 1.28M + FuzzPromoteLogical
+  445K execs no crashers · behavioral ZERO → 4th consecutive clean
+  FULL, walk REMAINS converged · CORE crosses ~55KB with this entry →
+  distillation mandated at next round's open.
+- 2026-07-24 · code HEAD c428ae3 (docs 6da4304) · FULL (read-only) + net
+  fold, 4th of the day · opened w/ mandated distillation (CORE
+  57.1→53.8KB → archive 2026-07-24 #3) · quarantine EMPTY · net: suite
+  + fastavro EXECUTED green 0-SKIP; FULL -race green; Java NOT run
+  (JVM absent) · §Open net gaps CLOSED:
+  TestDifferentialFastavroPromotion — 11 cells (8 spec pairs + enum
+  reader-default + field default-fill) × {writer-wire byte parity,
+  resolved binary any+float64 targets, resolved DecodeJSON both,
+  fastavro readresolve EXECUTED}; both calibration divergences pinned
+  at executed verdicts; neuter-verified (promote.go float32-cast trips
+  binary+JSON legs — the any-target-only draft stayed green, B31
+  any-target dodge caught in-round, fixed via the float64-target leg;
+  oracle-leg flips ×3 trip; JSON path SHARES promoteIntFloatMantissa)
+  · resolved-JSON × promotion probes 9 cells binary↔JSON EXACT,
+  fastavro jsonread EXECUTED agrees outside the two calibrated
+  families · fronts clean: B25 inverse-density schema_walk.go FULL
+  walk (3 doc-claims verified in-source; strayShapeMemo one record
+  point/semantic, validity-only) · grep refresh P19 first-since-minted
+  + B18 ("error"→"record" at build, EXECUTED == record twin) + B17 —
+  zero new candidates · capstone FuzzSchemaNode 1.30M + FuzzResolve
+  1.09M no crashers · behavioral ZERO → 5th consecutive clean FULL,
+  walk REMAINS converged. Narrative: archive (2026-07-24 #4).
+
+## Round narrative (2026-07-24 #7) — FIX round: enum-level default token-type reject (ruling-directed; c428ae3→fb6b6ba)
+
+Ruling (maintainer-adjudicated, closing NOT_BUGS #54's enforcement
+hole): an enum-LEVEL "default" must be a JSON STRING token — any
+non-string body (number, bool, array, object, explicit null) hard-rejects
+in BOTH strict and lax modes, decided by TOKEN TYPE before the membership
+check; `"default":""` stays legal exactly when "" is a member; no route
+may bind a default the metadata surface denies.
+
+Pre-action gate (produced pre-edit): site schema.go enum build
+(3014-3022 pre-fix). Pickaxe: `origEnumDefault` introduced by 80a318b
+("all: add schema evolution & compatibility checking") — untouched in
+the current patch-set range, no ping-pong. No test pinned the old
+message. Governing entry NOT_BUGS #54; verdict "documented but
+contradicted by the code," resolved by the ruling in favor of the entry;
+the required entry update landed as the #54 closing clause.
+
+Order of work: mandated CORE distillation first (57.3→54.3KB; the two
+2026-07-24 clean-round ledger entries compressed to anchors, verbatims
+in archive #6). In-repo pins next, VERIFIED FAILING against pre-fix
+code: TestRegression_EnumDefaultLaxPhantomBindRejected (its red output
+demonstrates all three symptoms in one line: parse accepted,
+HasEnumDefault=false, resolution filled ""),
+TestRegression_EnumDefaultExplicitNullRejected (strict leg red on the
+message class, lax leg red on the accept),
+TestRegression_EnumDefaultNonStringEchoNamesToken (red on the `""`
+echo); controls green pre- and post-fix
+(TestEnumDefaultEmptySymbolBoundary explicit-""-binds +
+empty-not-member-rejects; field row; wrapper row). Pre-fix red = the 3
+pins + 15 non-string matrix cells (strict/plain, lax/plain,
+lax/with-empty × 5 non-string tokens; strict/with-empty correctly
+green — the symbol reject precedes) = 21.
+
+Fix (b5c09b1): token-type gate before membership — TrimSpace, require a
+leading `"`, Unmarshal error also rejects; echo
+`enum default <token> is not a string` via truncForError (bounded).
+Family green; full suite + fastavro green; family -race green; FULL
+-race green (101s+29s).
+
+Class-elimination matrix
+(TestMatrix_EnumDefaultTokenClassElimination): token {member,
+non-member, "", number, null, bool, array, object} × {strict, lax} ×
+symbols {plain, with-""} = 32 cells; expected verdict derived from the
+RULE (independent oracle function), and per accepted cell: metadata
+parity (HasEnumDefault/EnumDefault), render round-trip
+(Root().Schema(opts) re-parse preserves the default), canonical
+stripping, resolution fill (writer symbol absent from reader fills the
+default; helper enumResolutionFill). Field row
+(TestMatrix_EnumFieldDefaultTokenTypes): the other consumption site
+(validateLeaf enum arm) — member accepts, non-member/number/null/bool
+reject (already-strict posture pinned). Wrapper row
+(TestRegression_EnumRefWrapperDefaultInert): a "default" riding an enum
+REFERENCE wrapper is inert for every token type — not bound, not a
+prop, dropped by rebuild — direct parse AND SchemaCache splice
+(executed discovery this round).
+
+Differential (TestDifferentialFastavroEnumDefaultToken, 36 subtests
+EXECUTED): verdict parity on every fastavro-parseable level cell
+(with-"" symbol sets are fastavro-blocked — the no-default twin rejects
+— self-calibrating skip). TWO executed calibration corrections to my
+dictated expectations (the reason these arms execute): (1) fastavro
+TYPE-checks enum FIELD defaults ("Default value <5> must match schema
+type: enum" — number/null reject) while accepting non-MEMBER strings;
+twmb is stricter only on the membership half. (2) fastavro rejects the
+WRAPPED named-reference form itself (UnknownType for {"type":"E"} with
+or without extras) — a shape twmb and Java (TestUnionSelfReference)
+accept — so the inert-default posture is fastavro-untestable; pinned as
+shape-blocked with a flip guard.
+
+Neuter verification: restored the ignored-error path → exactly the
+pre-fix 21 red (3 pins + 15 cells + parents), controls and differential
+green under the neuter (each neuter reddens exactly its own cells); 88
+RUN lines accounted (32 matrix + 36 differential + 12 pin/control
+subtests + parents). Fix restored, all green.
+
+R1-Q9 back-filled (AUDIT_PATTERNS §R1): the enum-level-default consumer
+grid — PARSE the sole binder (fixed); NODE-WALK's
+m["default"].(string) satisfiable-only post-gate; RENDER emits iff
+HasEnumDefault; canonical strips; CACHE/wrapper inert (pinned);
+SCHEMAFOR ∅; RESOLVE fill with its own membership re-check
+(resolve.go readerIdx) + compat presence gate. The FIELD-level twin
+(validateLeaf) is the same contract's other site, matrix-pinned.
+
+Oracle-harness hardening (fb6b6ba): with AVRO_FASTAVRO_PYTHON set, a
+missing optional codec dep (cramjam/zstandard) now t.Errorf's the ocf
+foreign-framing support probe instead of log-skipping (the round's
+net-repair lesson: those cells never register as skips, so a thinned
+venv reads as 0-SKIP). Verified red-then-green by uninstalling and
+reinstalling cramjam. python3-fallback keeps the quiet skip. Round
+template gains the `missing optional dependency` output-grep line.
+Sole site (swept: the one codecUnsupportedByFastavro consumer).
+
+Commits: 62f2bf0 (promotion net, closing the promotion §Open net gaps
+fold as its own commit), b5c09b1 (fix + pins + matrix + differential),
+fb6b6ba (harness hardening). Docs follow. The ocfwrite §Open net gaps
+line stays live. Fix lands UNCONVERGED: next round quarantines
+62f2bf0..fb6b6ba (+ the docs commit). PATTERNS crossed ~150KB with the
+R1-Q9 fold → PATTERNS distillation mandated at the next round's open.
