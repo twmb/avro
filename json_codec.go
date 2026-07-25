@@ -296,9 +296,15 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			// "do not match" rejection. The library's own DecodeJSON
 			// also rejects null against a no-null union (see
 			// TestRegression_UnionWithoutNullBranchAcceptsJsonNull).
-			return nil, fmt.Errorf("avro json: nil value for union without a null branch")
+			// An untyped nil is an encode-side user-value failure, so it
+			// carries *SemanticError identity exactly like the binary
+			// entry guard (AppendEncode) and serUnion's no-match wrap; a
+			// TYPED nil pointer never reaches here (the peel loop hands
+			// it to the branch encoders, which surface the plain
+			// indirection sentinel on both wires).
+			return nil, &SemanticError{AvroType: "union", Err: errors.New("avro json: nil value for union without a null branch")}
 		}
-		return nil, fmt.Errorf("avro json: nil value for non-nullable type %q", node.kind)
+		return nil, &SemanticError{AvroType: node.kind, Err: fmt.Errorf("avro json: nil value for non-nullable type %q", node.kind)}
 	}
 	// Union dispatch BEFORE dereferencing and the custom hook: the branch
 	// encoders must receive the un-peeled value so a branch's custom encoder
@@ -346,7 +352,18 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			break
 		}
 		if v.IsNil() {
-			return appendAvroJSON(buf, reflect.Value{}, node, cfg, custom, depth+1)
+			// A nil pointer/interface layer inside a TYPED value: the
+			// "null" schema accepts it (JSON null, mirroring serNull's
+			// isNilValue accept); every other kind rejects it with the
+			// SAME plain indirection sentinel the binary encoders
+			// surface from indirect() — NOT the *SemanticError the
+			// untyped-nil entry arms above carry. Unions never reach
+			// this loop (they dispatch before the peel), so the two
+			// arms cannot disagree on a union's nil handling.
+			if node.kind == "null" {
+				return append(buf, "null"...), nil
+			}
+			return nil, errIndirectNil
 		}
 		v = v.Elem()
 	}
@@ -384,7 +401,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			case "date":
 				d, err := timeToDate(t)
 				if err != nil {
-					return nil, err
+					// Same identity as serDate: a range failure of the
+					// user's value carries *SemanticError on both wires.
+					return nil, &SemanticError{GoType: timeType, AvroType: "date", Err: err}
 				}
 				return strconv.AppendInt(buf, int64(d), 10), nil
 			case "time-millis":
@@ -398,7 +417,8 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			case "time-millis":
 				ms, err := durationToTimeMillis(d)
 				if err != nil {
-					return nil, err
+					// Same identity as serTimeMillis' duration arm.
+					return nil, &SemanticError{GoType: durationType, AvroType: "time-millis", Err: err}
 				}
 				return strconv.AppendInt(buf, int64(ms), 10), nil
 			}
@@ -407,7 +427,12 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if t, ok := tryParseDateString(v); ok {
 				d, err := timeToDate(t)
 				if err != nil {
-					return nil, err
+					// Same identity as serDate's date-string arm. (The
+					// 4-digit-year formats tryParseDateString accepts
+					// cannot express a date outside timeToDate's range,
+					// so this arm is not reachable today; it mirrors the
+					// binary twin so the two cannot drift.)
+					return nil, semErrW(v, "date", err)
 				}
 				return strconv.AppendInt(buf, int64(d), 10), nil
 			}
@@ -423,7 +448,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 			if t, ok := extractTime(v); ok {
 				n, err := conv(t)
 				if err != nil {
-					return nil, err
+					// Same identity as serTimeAsLong: a timestamp range
+					// failure carries *SemanticError on both wires.
+					return nil, semErrW(v, "long", err)
 				}
 				return strconv.AppendInt(buf, n, 10), nil
 			}
@@ -1283,10 +1310,27 @@ tryAll:
 		}
 		lastErr = err
 	}
-	if lastErr != nil {
-		return nil, fmt.Errorf("avro json: no union branch matched value of type %s: %w", v.Type(), lastErr)
+	// No-match identity mirrors the binary dispatch split exactly. A
+	// 2-branch null union takes serNullUnionAt on the binary side, which
+	// hands a non-nil value straight to the value branch and returns THAT
+	// branch's error unwrapped (AvroType = the branch's own type) — so
+	// surface lastErr bare here. Every other union shape goes through
+	// serUnion.ser, whose no-match verdict wraps UNCONDITIONALLY in the
+	// union's own *SemanticError — never inherited from lastErr's chain
+	// (a typed nil's per-branch failure is the plain indirection
+	// sentinel, which must not leave the no-match plain).
+	if len(node.branches) == 2 &&
+		(node.branches[0].kind == "null" || node.branches[1].kind == "null") &&
+		lastErr != nil {
+		return nil, lastErr
 	}
-	return nil, fmt.Errorf("avro json: no union branch matched value of type %s", v.Type())
+	e := &SemanticError{GoType: v.Type(), AvroType: "union"}
+	if lastErr != nil {
+		e.Err = fmt.Errorf("avro json: no union branch matched: %w", lastErr)
+	} else {
+		e.Err = errors.New("avro json: no union branch matched")
+	}
+	return nil, e
 }
 
 // unionBranchName returns the Avro JSON type name for a union branch.
