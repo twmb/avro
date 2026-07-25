@@ -19,6 +19,19 @@ Jobs:
                                             JSON-representable — used by the
                                             foreign block-framing matrix, whose
                                             datums are plain strings.)
+  {"op":"ocfread","hex":"<whole OCF file bytes, hex>"}
+      -> {"ok":true,"records":["<hex>",...]}  (every record via fastavro.reader,
+                                            re-encoded schemaless against the
+                                            file's own header schema — byte
+                                            transport, so records need not be
+                                            JSON-representable)
+  {"op":"ocfwrite","schema":<avro schema>,"records":["<hex>",...],
+   "codec":<name>,"syncInterval":<int>,"meta":{...}}
+      -> {"ok":true,"hex":"<whole OCF file fastavro's writer produced>"}
+                                           (records are schemaless bytes the
+                                            oracle decodes then container-writes
+                                            with its own codec framing and block
+                                            sizing)
   {"op":"jsonwrite","schema":<avro schema>,"value":<json value>,"kind":<kind>}
       -> {"ok":true,"json":"<one datum's Avro-JSON text via json_writer>"}
   {"op":"jsonread","schema":<avro schema>,"json":"<Avro-JSON text>"}
@@ -95,6 +108,20 @@ def handle(job):
         # fastavro or twmb wrote themselves.
         buf = io.BytesIO(bytes.fromhex(job["hex"]))
         return {"ok": True, "values": list(fastavro.reader(buf))}
+    if op == "ocfread":
+        # Whole-container read, byte transport: every record from the file
+        # (writer schema from the file's own header), each re-encoded
+        # schemaless against that header schema and returned as hex. The
+        # caller compares Avro bytes, so records need not be
+        # JSON-representable (bytes/fixed/decimal/NaN travel fine).
+        buf = io.BytesIO(bytes.fromhex(job["hex"]))
+        rdr = fastavro.reader(buf)
+        outs = []
+        for rec in rdr:
+            out = io.BytesIO()
+            fastavro.schemaless_writer(out, rdr.writer_schema, rec)
+            outs.append(out.getvalue().hex())
+        return {"ok": True, "records": outs}
     schema = _parse(job["schema"])
     if op == "encode":
         value = _coerce(job["value"], job.get("kind", ""))
@@ -135,6 +162,27 @@ def handle(job):
         value = fastavro.schemaless_reader(buf, schema)
         out = io.BytesIO()
         fastavro.schemaless_writer(out, schema, value)
+        return {"ok": True, "hex": out.getvalue().hex()}
+    if op == "ocfwrite":
+        # Foreign-WRITER differential: fastavro WRITES a whole OCF file.
+        # Each record arrives as twmb's schemaless bytes (byte transport, no
+        # cross-language value coercion); fastavro decodes them and its
+        # writer produces the container — its own header rendering of the
+        # schema, its own block sizing (sync_interval), its own codec
+        # framing (cramjam snappy CRC, zstandard frames, raw-deflate,
+        # stdlib bzip2/xz). Returns the whole file's bytes for the caller's
+        # reader to consume.
+        records = [
+            fastavro.schemaless_reader(io.BytesIO(bytes.fromhex(h)), schema)
+            for h in job.get("records") or []
+        ]
+        kwargs = {}
+        if job.get("syncInterval"):
+            kwargs["sync_interval"] = job["syncInterval"]
+        if job.get("meta"):
+            kwargs["metadata"] = job["meta"]
+        out = io.BytesIO()
+        fastavro.writer(out, schema, records, codec=job.get("codec", "null"), **kwargs)
         return {"ok": True, "hex": out.getvalue().hex()}
     if op == "canonical":
         # Parsing Canonical Form per fastavro (Java-validated rules); the
