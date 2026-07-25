@@ -725,6 +725,15 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 				if tag == "-" {
 					continue
 				}
+				// Same guard as the named-field path below, in the same
+				// position relative to the exact-match skip: an embedded
+				// struct is where "-,opt" is likeliest to be written, and
+				// deferring to Avro's name grammar is not a substitute —
+				// WithLaxNames can accept "-", and then the embed silently
+				// becomes a field the tag asked to skip.
+				if err := checkSkipDirectiveExact(sf.Name, tag); err != nil {
+					return nil, err
+				}
 				parts, err := splitTag(tag)
 				if err != nil {
 					return nil, err
@@ -775,15 +784,10 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 		if tag == "-" {
 			continue
 		}
-		// Reject "-,opt" / "-foo" — the "-" skip directive is exact-match
-		// only. Anything else starting with "-" is a typo (user meant to
-		// skip but added options, or means to name a field literally "-"
-		// which Avro's naming rules reject anyway). Erroring here matches
-		// the user's likely intent and avoids the silent-empty-record
-		// outcome that "tag = '-,opt'" produced before this check.
-		if strings.HasPrefix(tag, "-") {
-			return nil, fmt.Errorf("avro: field %s has tag %q: the skip directive %q is exact-match only; remove the suffix or rename the field",
-				sf.Name, truncForError(tag), "-")
+		// Same guard as the anonymous-embed path above; rationale lives on
+		// checkSkipDirectiveExact.
+		if err := checkSkipDirectiveExact(sf.Name, tag); err != nil {
+			return nil, err
 		}
 		parts, err := splitTag(tag)
 		if err != nil {
@@ -924,6 +928,27 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 		}
 	}
 	return result, nil
+}
+
+// checkSkipDirectiveExact rejects an avro tag that begins with the "-" skip
+// directive without being exactly "-" ("-,omitzero", "-foo"). The directive
+// is exact-match only, so anything else is a typo: the user meant to skip but
+// left options attached, or means a field literally named "-", which Avro's
+// naming rules reject anyway — and which [WithLaxNames] would let through as
+// a real field the tag asked to skip.
+//
+// Both tag-reading paths in collectFields call this immediately after their
+// own exact `tag == "-"` skip: the named-field path and the anonymous
+// embedded-struct path, which handles its own tag and never reaches the
+// named path's checks. Sharing one implementation is what keeps the two from
+// drifting on the directive's grammar, and the position after the exact-match
+// skip is what keeps plain "-" skipping on both.
+func checkSkipDirectiveExact(fieldName, tag string) error {
+	if !strings.HasPrefix(tag, "-") {
+		return nil
+	}
+	return fmt.Errorf("avro: field %s has tag %q: the skip directive %q is exact-match only; remove the suffix or rename the field",
+		fieldName, truncForError(tag), "-")
 }
 
 // splitTag splits a struct tag value on commas, but respects parentheses
@@ -1131,7 +1156,7 @@ func inferField(f schemaField, namespace string, seen map[reflect.Type]seenForm,
 		if err := checkIntDefaultFitsGoKind(v, f.goType); err != nil {
 			return nil, fmt.Errorf("default for field %q: %w", f.name, err)
 		}
-	} else if union, ok := schema.([]any); ok && len(union) > 0 && union[0] == "null" {
+	} else if union, ok := schema.([]any); ok && len(union) > 0 && isNullBranchTree(union[0]) {
 		// Null-first unions (from *T or CustomType) default to null so
 		// the field is backward-compatible (readers can read data written
 		// before this field existed). Explicit default= overrides this.
@@ -1189,6 +1214,33 @@ func checkIntDefaultFitsGoKind(v any, t reflect.Type) error {
 var avroPrimitives = map[string]bool{
 	"null": true, "boolean": true, "int": true, "long": true,
 	"float": true, "double": true, "string": true, "bytes": true,
+}
+
+// isNullBranchTree reports whether a union branch in a PRE-PARSE schema tree
+// is the "null" type, in either spelling Avro admits: the bare primitive
+// string "null", or an object whose "type" is "null". Props and a logicalType
+// on a wrapped null are inert — Avro defines no null logical type, so nothing
+// can consume either key and the branch's type and wire form are unchanged —
+// so a carrier-bearing wrapped null is still a null branch.
+//
+// This is the `any`-tree mirror of [aschema.isNullBranch] (schema.go), which
+// answers the same question on the parsed tree. The two must agree because
+// this tree is handed directly to that parser: a branch this predicate calls
+// non-null but the parser calls null produces a schema whose emitted shape
+// contradicts its parsed meaning. The question is answered once per schema
+// representation — isNullBranch for the parsed tree, the normalized node kind
+// for the compiled and metadata trees, and this for the pre-Parse tree — so a
+// new asker on this representation belongs here rather than in a fresh
+// comparison against the bare spelling.
+func isNullBranchTree(v any) bool {
+	switch v := v.(type) {
+	case string:
+		return v == "null"
+	case map[string]any:
+		typ, _ := v["type"].(string)
+		return typ == "null"
+	}
+	return false
 }
 
 // typeAliasResult describes what addTypeAliases found.
@@ -1401,7 +1453,7 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		if err != nil {
 			return nil, err
 		}
-		if u, ok := inner.([]any); ok && len(u) > 0 && u[0] == "null" {
+		if u, ok := inner.([]any); ok && len(u) > 0 && isNullBranchTree(u[0]) {
 			return u, nil
 		}
 		return []any{"null", inner}, nil

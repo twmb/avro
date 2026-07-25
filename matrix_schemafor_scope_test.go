@@ -57,7 +57,10 @@ type (
 // in renderCustomSchemaTree is what keeps those writes off the caller's
 // maps). The comparison runs whether or not the build errors: a mutation
 // on an error path is just as much a contract break.
-func schemaForScopeCell(t *testing.T, fields []reflect.StructField, namespace string, customs []CustomType) (*Schema, error) {
+// extra carries SchemaOpts beyond the customs (e.g. WithLaxNames) through to
+// the final Parse, so a cell can vary the name validator the emitted schema
+// is read back under.
+func schemaForScopeCell(t *testing.T, fields []reflect.StructField, namespace string, customs []CustomType, extra ...SchemaOpt) (*Schema, error) {
 	t.Helper()
 	// Every []string reachable from a cell's SchemaNode gets one sentinel
 	// element hidden past its length (len < cap) before the build: a
@@ -98,10 +101,11 @@ func schemaForScopeCell(t *testing.T, fields []reflect.StructField, namespace st
 	if err != nil {
 		return nil, err
 	}
-	opts := make([]SchemaOpt, len(customs))
-	for i, ct := range customs {
-		opts[i] = ct
+	opts := make([]SchemaOpt, 0, len(customs)+len(extra))
+	for _, ct := range customs {
+		opts = append(opts, ct)
 	}
+	opts = append(opts, extra...)
 	return Parse(string(b), opts...)
 }
 

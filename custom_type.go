@@ -86,6 +86,15 @@ type CustomType struct {
 	// container values) are never mutated by a build, and it fails the
 	// build with the walk's named error when the schema exceeds the
 	// schema-tree budgets or contains an unnamed pointer cycle.
+	//
+	// A union branch's type may be written in either spelling Avro
+	// admits — the bare name ("null") or the wrapped object
+	// ({"type":"null"}) — and composition treats the two as the one type
+	// they are. A null branch is recognized in both spellings, and in the
+	// wrapped form regardless of any properties or logicalType it carries
+	// (Avro defines no null logical type, so both are inert): a nullable
+	// union collapses through a pointer field and receives its null
+	// default identically either way.
 	Schema *SchemaNode
 
 	// Encode converts a caller-provided Go value to an Avro-native
