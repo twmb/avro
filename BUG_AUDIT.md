@@ -7473,3 +7473,171 @@ family); DRY = constructions stay inline, the census is the
 cross-path drift guard (hot-path inline budget); item 13 = the one
 immunity claim executed, found false, became fix wave 3 + a census
 row.
+
+## Distillation archive (2026-07-25 #3) — pre-round double distillation (size-guard mandate: PATTERNS 149.9KB at cap / NOT_BUGS 120.4KB over cap)
+
+Tombstoned this pass, verbatim originals below. NOT_BUGS #11, #45, #47, #59 (all fully netted by named permanent nets) and AUDIT_PATTERNS B27 (cyclic Go types; five named regression pins plus a not-false-reject control). Entry numbers are never reused or renumbered; the live files carry one-line claims naming the guarding net and the re-open condition.
+
+### NOT_BUGS #11 (verbatim)
+
+11. **DOS-resistance defense-in-depth.** twmb caps several values Java and fastavro leave unbounded: `errTooDeep` recursion at 1000 levels; `maxZeroByteItems=4096` for `array<null>`/`array<EmptyRecord>` block-counts; `maxMapPreAllocSize=4096`; `WithMaxBlockBytes` OCF compressed-block ceiling (default 64 MiB; Java rejects only >2 GiB); `WithMaxDecompressedBlockBytes` OCF decompressed-block ceiling (default 64 MiB; bounds zip-bomb amplification — an ~89-byte snappy frame would otherwise demand ~200 MiB) plus a per-block consecutive-zero-byte-record cap (`zeroRun ≤ maxOCFZeroByteSlack` in `Reader.Decode`; the WRITER enforces the same via `shouldFlush`). Lesson: every reader-side cap needs a producer-side compliance check (the one exception is the OCF block-size caps, reader-only by design — see the dedicated entry). Found this way for top-level null/all-null-record/size-0-fixed OCFs (`TestWriterZeroByteDatumsSelfReadable`), then for the core array `serArray.ser` (`TestRegression_ArrayZeroByteProducerCompliance`), and OCF metadata caps (`ocfMetadataSafetyLimit`; `avro.schema` got `ocfSchemaSafetyLimit=64 MiB`; user metadata kept 1 MiB with a writer check — `TestRegression_OCFLargeSchemaSelfReadable` + `TestRegression_OCFLargeUserMetadataProducerCompliance`). These survived the small-scale shape matrix because every cap lives at large scale; the standing guard is `TestMatrix_SelfReadableAtScale` (asserts Encode-succeeds ⟹ Decode-of-that-wire-succeeds; any NEW cap MUST add a generator there). Also `maxIndirectDepth=5` reflect-unwrap; `decimalScaleLimit=65536` caps decimal scale/precision at parse and decode (only twmb materializes the `10^scale` magnitude during decode; Java/avro-rs defer it). `maxDecimalUnscaledBytes=32 KiB` caps the decimal/big-decimal UNSCALED-value byte length on DECODE — the orthogonal axis to `decimalScaleLimit` (scale): a legal-scale value with a multi-megabit unscaled magnitude otherwise drives `big.Rat.FloatString` base-conversion (json.Number/string targets) or `SetFrac` GCD (high-scale targets) at O(M(n)·log n) — a 1 MiB unscaled value spent ~1 s. precision is parse-capped at `decimalScaleLimit`, so a minimally-encoded in-precision value needs ≤ ~27 KiB and is never rejected; the cap fires only on out-of-precision / sign-padded hostile input, and applies to every decode entry point uniformly (bytes/fixed/big-decimal × binary/JSON × every target) via `checkDecimalUnscaledLen` (plus a defensive silent-zero in `bytesToRat` for the public `RatFromBytes`). Java/fastavro/avro-rs store significand+scale and never base-convert. Pinned by `TestRegression_DecimalUnscaledLengthDoS`. Future audits may flag these as "too restrictive" — deliberate.
+
+### NOT_BUGS #45 (verbatim)
+
+45. **`WithMaxDecompressedBlockBytes` is enforced UP FRONT and UNIFORMLY via the `BoundedDecompressor` capability — for every codec that implements it, whether resolved by name from the header OR supplied as an instance via `WithCodec` (including a `NopCloser`-wrapped one).** `Reader.readBlock` type-asserts the codec to `BoundedDecompressor` and calls `DecompressBounded(compressed, maxDecompressed)`, which refuses an over-cap block BEFORE allocating it (a post-decompression size check is false comfort once the allocation has happened — there is no such backstop). All four built-ins implement it: null/snappy reject via a declared-length pre-check, deflate via `io.LimitReader(max+1)`, and zstd by lazily building its decoder with `zstd.WithDecoderMaxMemory(max)` on first `DecompressBounded`. Because the zstd decoder is not built until first read, a SUPPLIED `ZstdCodec` instance is auto-bounded exactly like a name-resolved one (the reader's cap is folded in at build time) — a frame inflating past the cap rejects on its declared window/content size. The ONLY unbounded case is a custom codec that does NOT implement `BoundedDecompressor`: the reader honestly adds no backstop, so supply a self-bounding codec for untrusted data. A custom `DecompressBounded` that IGNORES max and returns an over-cap block is the same honestly-unbounded posture — the reader does no post-decompression re-check (false comfort once allocated), and there is no arithmetic hazard because the count bound and the trailing-bytes check use the RETURNED slice's real length (`TestMatrix_CodecDecompressReturnShapes` pins every return shape: alias/nil/short/pad/error). (This capability contract REPLACED an earlier architecture that injected `maxOut` in `resolveCodec` for built-in instances and relied on a post-decompression backstop; `resolveCodec` no longer injects anything, and there is no `zstdReaderDopts`.) Documented on `WithMaxDecompressedBlockBytes`, `WithCodec`, `ZstdCodec`, and `BoundedDecompressor` (ocf.go). Do NOT re-file "a supplied zstd instance ignores WithMaxDecompressedBlockBytes" — it does not. Pinned by `TestRegression_OCFUserBuiltinCodecBoundsDecompression` (deflate/snappy + NopCloser instance, allocation-bounded), `TestRegression_OCFSuppliedZstdInstanceBounded` (supplied zstd + NopCloser, rejected at cap / accepted when raised), and `TestRegression_OCFCustomCodecBoundedDecompressorContract` (bounded vs honestly-unbounded capability contract).
+
+### NOT_BUGS #47 (verbatim)
+
+47. **The binary decoder rejects a WIDTH-OVERFLOW varint — one whose FINAL byte carries value-bits beyond the type width (int 5th byte `> 0x0f`, long 10th byte `> 0x01`) — with "uvarint/uvarlong overflows N bits". This is NOT the overlong-COUNT form: a legal-width non-canonical varint that spends extra bytes but keeps every value-bit inside the type width (e.g. `0x80 0x00` = 0) IS accepted. twmb is liberal on encoding WIDTH (any spelling that fits the type) and strict only on bits that overflow it.** `readUvarint`/`readUvarlong` (varint.go) reject only the final-byte width overflow. Java's `BinaryDecoder.readInt`/`readLong` instead MASK the surplus bits and accept (`n ^= (b & 0x7f) << 28` / `<< 63`, throwing only on the continuation bit) — but the three references DISAGREE on the resulting value, and every non-error result is silently-wrong: `FF FF FF FF 7F` against `"int"` decodes to `-2147483648` in Java (masked to int32), to `-17179869184` in goavro (full int64) and fastavro (unbounded Python int — out of int32 range entirely), and errors in twmb. With no cross-impl consensus and every accept being a masked-or-out-of-range value, cross-implementation policy rule 1 (never accept silently-wrong output) governs: twmb rejects. No conformant encoder emits a width-overflow varint (twmb/Java/goavro/fastavro all encode canonically — twmb: MinInt32 → `ff ff ff ff 0f`, MinInt64 → `…01`), so twmb reads every real foreign file and only ever rejects corruption. twmb is also internally self-consistent: it accepts canonical AND legal-width overlong forms and never produces what it rejects, so there is NO encode/decode route divergence. Deliberate, added in the `62b4c9f` spec-compliance pass. Distinct from index #4 (the JSON decoder accepting legal-WIDTH non-canonical union-index varints — a different leniency, not this overflow reject). Do NOT "fix" to mask like Java. Pins: the reject line is exercised by `varint_overflow`/`varlong_overflow` (deser_test.go, via the maxed-out `0x80`×5 / `0x80`×10 form whose continuation bit Java also rejects — so the Java-divergent surplus-VALUE-bit final byte `0x10`–`0x7f` is not itself directly pinned); the accepted legal-width overlong form is pinned by `overlong-count` (matrix_framing_test.go, `putZigzagOverlong`).
+
+### NOT_BUGS #59 (verbatim)
+
+59. **Internal re-parses of library-produced schema text use an accept-everything name validator (`internalReparseNames`, schema.go) BY DESIGN — do not re-flag as a validation bypass (maintainer-adjudicated: normalize internal re-parses to accept-all).** Two sites re-parse text the library itself produced from an already-validated parse: Resolve's custom-free writer view (resolve.go; 3333e9b's stated rationale — "lenient names so a lax-named writer (which already parsed once) re-parses; names do not affect wire bytes" — the fix implements that intent) and SchemaCache's self-contained splice-rebuild retry (cache.go; the retry only ever BROADENS: the first rebuild attempt still runs under the caller's own opts). Per the WithLaxNames contract (schema.go: "If fn is nil, only non-empty names are required. If fn is non-nil, it is called for each name component"), the USER's validator is the acceptance authority at the public parse, and a user fn can accept empty name components — the one class `WithLaxNames(nil)` (the previous internal validator) rejects — so internal re-validation could only wrongly reject names the user accepted: Resolve HARD-FAILED an already-parsed, wire-valid custom-typed writer (ns "a..b"), and the cache's metadata forms silently degraded to a dangling reference, reachable transitively by parses that never passed a lax option. Validation never transforms names — they pass through verbatim — so wire bytes, canonical form, and Rabin fingerprints are unchanged by the validator choice (asserted per-cell against no-custom / directly-parsed twins). Census at fix time: zero `WithLaxNames(nil)` call sites remain in non-test code; every other internal `Parse` is a documented user-opts boundary (`SchemaFor`, `SchemaNode.Schema`, ocf) or the splice rebuild's by-design first attempt. Pinned by `TestRegression_ResolveCustomTypedLaxWriterView`, `TestRegression_CacheSpliceTransitiveLaxNames`, `TestRegression_CacheSpliceEmptyShortName`, and the class matrix `TestMatrix_InternalReparseLaxNames` (+ `TestMatrix_InternalReparseBareEmptyName` for the definable-but-structurally-unreferenceable bare `""` verdicts).
+
+### AUDIT_PATTERNS B27 (verbatim)
+
+- **A reflect Type/Value-graph walk that re-implements indirection without the bound its sibling has — cyclic Go types crash/hang.** Go permits recursive NON-struct types (`type P *P`, `type S []S`, `type M map[string]M`, and chains that never pass through a named struct) whose reflect type graph is cyclic (`P.Elem() == P`). The canonical walks bound it — `indirect`/`indirectAlloc` cap unwrap at `maxIndirectDepth`, `inferRecord` breaks struct cycles via `seen[t]` — but SIBLING walks that re-implement the traversal omit the bound and run to OOM (unbounded `for v.Kind()==reflect.Pointer`) or stack-overflow the PROCESS (unbounded `Elem()` type-graph recursion; `recover()` can't catch it). The trigger is CALLER-supplied (a decode target type or a `SchemaFor[T]` field type), not attacker wire — invisible to every wire/value/fuzz net and to round-trip tests (the common recursive STRUCT works via `seen`, masking the non-struct gap). Probe: enumerate every `for … Kind()==reflect.Pointer` loop and every fn recursing on `reflect.Type.Elem()`/`reflect.Value.Elem()`; for each ask "does a cyclic type/value reach this, and is it bounded like `indirect`/`inferRecord`?" Pair `type P *P` / `[]S` / `map[string]M` as a decode target AND a `SchemaFor` field type. The `tryCompileFieldSer`/`tryCompileFieldDeser` UNSAFE-COMPILE pointer arms are part of this family (recurse on `goType.Elem()` at COMPILE time; the encode bound must MATCH the reflect encoder's accept set — the two must be IDENTICAL at the cap boundary. Do NOT copy a comparison spelling from this entry into the code: the correct `>=` vs `>` depends on the loop's local counting base (the current `levels := 1` walk declines at `>` and is parity-correct); the authority is the executed parity net — TestRegression_StructFieldPointerChainMatchesReflect + the generative at-cap/past-cap matrix — which reds on any off-by-one in either direction). Full narrative (every instance + the accept-set subtlety + array/nullunion arm routing): BUG_AUDIT.md §Distillation archive (2026-07-21). Instances: `setCustomResult` (custom_type.go), `inferType`'s pointer/slice/map arms (schema_for.go), `checkIntDefaultFitsGoKind`'s pointer peel, `tryCompileFieldSer`'s Pointer arm (unsafe.go); fixed by `maxIndirectDepth` caps + a `depth`-param `maxDepth` on `inferType`. Pinned by `TestRegression_CustomDecodeBoundsRecursivePointerTarget`, `TestRegression_SchemaForRecursiveNonStructTypeErrors`, `TestRegression_SchemaForRecursivePtrDefaultTerminates`, `TestRegression_EncodeStructCyclicPointerFieldTerminates`, `TestRegression_StructFieldPointerChainMatchesReflect` (+ the `TestSchemaForRecursiveStructStillBuilds` control the bound must NOT false-reject).
+
+
+## Distillation archive (2026-07-25 #4) — pre-fix-round double distillation (size-guard mandate: CORE 58.0KB / PATTERNS 151.4KB, both crossed)
+
+Two passes. (1) AUDIT_CORE §Round ledger: every line superseded by the 2026-07-23..24 RE-CONVERGED anchor compressed into era summaries; the pre-compression one-liners are reproduced verbatim below (their own full narratives live in the archive sections each line cites). (2) AUDIT_PATTERNS B8 tombstoned — fully netted by five named regression pins.
+
+### AUDIT_CORE §Round ledger, pre-anchor lines (verbatim)
+
+- 2026-07-01..02 · ea9a2ce→2609823 · era (5): CONVERGED then RESET (#53); #54 #55.
+- 2026-07-06..09 · 150b688→27c8781 · era (9): #56–#60 FILED→FIXED.
+- 2026-07-10..11 · 27c8781→8ee2b1b · FULL clean ×2 → RE-CONVERGED.
+- 2026-07-12 · 8ee2b1b→afe3b68 · era (4): #61; FEATURE × WALKER census (308 cells).
+- 2026-07-13..14 · 18988c2→5717f32 · era (5): keyless defs; #62; #63 stray family (70 cells).
+- 2026-07-14 · 5717f32→79ed5b3 · era (3): #64 census; #65 #66 trust boundary; FULL clean #1.
+- 2026-07-14..15 · 79ed5b3→c6f75a2 · era (5): #38 ext; quarantine 5 FILED→FIXED (#46 EXT; #67 ×2; #68).
+- 2026-07-16 · 6a5b8ee · era (2): walker descents kind-gated ×3 (#63); 360-cell stray-key matrix.
+- 2026-07-16..17 · 84bac19 · era: addTypeAliases CI-fold FIXED (#46 fifth surface; counter RESET).
+- 2026-07-17 · 84bac19 (3rd) · POLICY: CI reserved-key semantics KEPT — superseded by the 2026-07-21 exact-case flip.
+- 2026-07-17 · dd31464→6c992b3 · era (2): B36 class NEW; canonicalizing copy + kind fixup twins FIXED (#69).
+- 2026-07-18..19 · f06bdeb→656d118 · era (2): B36 caller-value census (~70 cells + FuzzTreeValueTwinParity); 2 FIXED.
+- 2026-07-19 · 9f0fb26→8d59ca9 · era (2): cache stray-position def poisoning FIXED (binding-kind gate = walkNodeChildren default; census back-fill rule minted).
+- 2026-07-20 · 489e8ce→7b1b168 · era (2): stray dedup/render/splice family, 5 rulings → all FIXED; #63 +3 clauses.
+- 2026-07-20..21 · 7b1b168 · era (2): R1 registry minted (8 questions × 7 representations); R1-Q7 stray-body re-decode DoS FIXED (Parse + Root().Schema() LINEAR).
+- 2026-07-21 · 9004009 · FULL (read-only): quarantine NOT clean — P19 NEW (canonical-key verdict × raw-key loop) FILED; clean fronts: ocf.go, skip.go, json_scan, stray × compiled.
+- 2026-07-21 · 9004009→113837b · FIX: P19 fixed as ruled + splice def-wins determinism; 72+12-cell matrices (pick apparatus later removed by the flip).
+- 2026-07-21 · 113837b→882c817 · POLICY FLIP (#46 re-ruled): reserved-key EXACT-lowercase matching; variant-of-required rejects loud; fold/pick REMOVED; pins + matrices landed. Narrative: archive (2026-07-21 #2); ledger verbatim: archive (2026-07-24 #3).
+- 2026-07-22 · 882c817 · FULL: quarantine (882c817 flip) CLEAN; behavioral FILED 2 (capture-getter fabrication; non-string logicalType hard-reject).
+- 2026-07-23 · 882c817→06c95e5 · FIX (2): captures share parser decodes; non-string logicalType INERT (#70).
+- 2026-07-23 · 06c95e5 · FULL: opened with distillation; quarantine NOT clean — field precision/scale no-consumer reject FILED.
+- 2026-07-23 · 06c95e5 · FULL re-run (maintainer-directed): finding re-confirmed ×3 pins; promote.go inverse-density + errors.go unwind clean.
+- 2026-07-23 · 06c95e5→c428ae3 · FIX: #71 field precision/scale
+  consumed-conditional FIXED as ruled; strayPS 630-cell matrix + splice
+  cells; neuter ×5; NOT_BUGS tombstones ×6. Narrative: BUG_AUDIT
+  (2026-07-23 #5); ledger verbatim: archive (2026-07-24 #2).
+
+### AUDIT_PATTERNS B8 (verbatim)
+
+- **A validator runs on a RAW attribute before a transform that INTRODUCES MORE of the validated thing.** A check placed on an input field before a normalization/qualification step validates only what was spelled in that field, missing components the later step folds in from a SIBLING attribute. The two spellings of the same logical value then validate asymmetrically, and a downstream surface that INLINES the sibling (canonical form, fingerprint) re-exposes the unvalidated spelling — so a strict-accepted schema's own `Canonical()` fails to re-parse in the same mode. Probe: for every `validX(field)` call, ask "is `field` later combined with another attribute (namespace prefix, parent scope, alias qualification) into the thing the check is really guarding? If so, validate the COMBINED result, or validate the sibling attribute too." Cross both spellings (inline vs attribute) and assert `Parse(s.Canonical())` succeeds for everything `Parse` accepts. A related shape is two PARALLEL tokenizers/validators for one input that drift: the SchemaFor-side and runtime-side struct-tag parsers must share grammar, or a tag means two different things on the two paths. Instances: `validFullnameErr(o.Name)` (schema.go) ran on the bare name BEFORE namespace qualification, so `{"name":"R","namespace":"bad ns"}` skipped validation while `{"name":"bad ns.R"}` was rejected and the accepted schema's PCF (which inlines the namespace) wouldn't re-parse; the `WithLaxNames` fn never saw namespace components either — fixed by validating the namespace attribute's components beside the name. Sibling: the runtime field mapper (`typeFieldMapping`, reflect.go) split the avro tag with a naive `strings.Split(",")` while `SchemaFor`'s `splitTag` stops at `default=` and is bracket-aware, so `default=a,omitzero` / `alias=[x,inline,y]` spuriously fired `omitzero`/`inline` at encode time — fixed by a shared `splitFieldTag` wrapping `splitTag`. **14a follow-up (the shared wrapper's parse-FAILURE fallback was the residual gap):** `splitFieldTag` returns `splitTag`'s tokens on success but FELL BACK to `strings.Split(tag, ",")` when `splitTag` REJECTS (an unbalanced bracket/paren) — re-surfacing interior tokens and re-firing the exact spurious `inline`/`omitzero` the wrapper was added to kill, for the malformed-tag sibling. A bracket TYPO flips it: `alias=[a,inline]` (closed) keeps inline OFF, `alias=[a,inline` (unclosed) fires inline → a struct field silently flattens, `Encode` errors "missing field f" against a hand-written nested-record schema. The grammar can't tokenize a malformed tag, so option parsing is unreliable; stay lenient (no new error for a hand-written-schema user) but fire NO options — map the field under its name (`strings.Cut` to the first comma) and drop the unparseable fragments. Lesson: a strict-tokenizer fix with a LENIENT FALLBACK on parse-failure must give the fallback the SAME protections, or the malformed-input path keeps the original bug. Pinned by `TestRegression_NamespaceAttributeValidatedLikeFullname`, `TestRegression_LaxNamesValidatorSeesNamespaceComponents`, `TestRegression_RuntimeTagDefaultValueWithKeyword`, `TestRegression_RuntimeTagAliasListWithKeyword`, `TestRegression_RuntimeMalformedTagFiresNoOption`.
+
+
+### AUDIT_CORE §Round ledger, the three 2026-07-24 round lines (verbatim, compressed 2026-07-25 #4)
+
+- 2026-07-24 · code c428ae3 (docs 6da4304) · FULL (read-only), 5th of
+  day · quarantine EMPTY · behavioral FILED 1: enum-level default
+  json.Unmarshal error ignored (schema.go:3016) — lax-""-symbol corner
+  binds phantom "" (violates #54 posture; fastavro rejects EXECUTED,
+  Java no-binds) → counter RESETS (was 5), freeze re-engages ·
+  MID-ROUND venv repair: cramjam+zstandard were missing, ocf fastavro
+  cells log-skip invisibly → template output-grep line added · NEW
+  front: twmb reads fastavro-WRITTEN OCF (18-file corpus ×4 codecs +
+  append-onto-foreign + reader-schema-over-foreign) ALL EXACT;
+  §Open net gaps ocfwrite line added · schema.go FIRST full line-walk
+  (4434 lines, 93 funcs) · Narrative: archive (2026-07-24 #5); ledger
+  verbatim: archive (2026-07-24 #8).
+- 2026-07-24 · c428ae3→fb6b6ba · FIX (1, ruling-directed): enum-level
+  default is a JSON STRING token, decided BEFORE membership (b5c09b1);
+  explicit null rejects both modes · red-then-green 3 pins + 15 matrix
+  cells; neuter reddens exactly those 21, controls green · nets:
+  32-cell token matrix ×5 surfaces + field-default row + wrapper-ref
+  inertness + 36-executed-subtest fastavro differential (calibrated:
+  fastavro TYPE-checks field defaults, not membership; with-empty
+  carrier cells SKIP by design — fastavro rejects "" as a symbol) ·
+  R1-Q9 back-filled · NOT_BUGS #54 closing clause · promotion net
+  COMMITTED (62f2bf0) · harness: missing codec deps FAIL loudly under
+  AVRO_FASTAVRO_PYTHON (fb6b6ba) · suite + fastavro green every edit;
+  FULL -race green; Java absent · UNCONVERGED — next round quarantines
+  62f2bf0..fb6b6ba (+ docs) · BOTH caps crossed → double distillation
+  mandated. Narrative: archive (2026-07-24 #7); ledger verbatim:
+  archive (2026-07-24 #8).
+- 2026-07-24 · fb6b6ba · FULL 6th: double distillation; quarantine
+  62f2bf0..fb6b6ba CLEAN; venv rebuilt, 927 diff PASS; ocfwrite gap
+  CLOSED (oracle ops + foreign-WRITER differential, 24 subtests,
+  neuter ×4, fold left uncommitted); json_decode.go FIRST line-walk
+  CLEAN; clean 1 of 2. Ledger verbatim: archive (2026-07-25 #1).
+- 2026-07-24 · fb6b6ba · FULL 7th: quarantine EMPTY; 952 diff PASS,
+  Java absent; B25 bundle compat/schema_walk/soe/varint/rabin + P2
+  twin json_codec.go all FIRST line-walks CLEAN; greps
+  P11/P15/B17/B35/P19 zero · behavioral FILED 1: top-level UNTYPED-nil
+  encode error identity diverges by wire (ser.go:52 SemanticError vs
+  json_codec.go:299/:301 bare; typed nil agrees plain-on-both; record
+  positions masked; #66 nil clause executed-FALSE for untyped) →
+  counter RESETS, freeze stays. Ledger verbatim: archive
+  (2026-07-25 #1).
+
+## Distillation archive (2026-07-25 #5) — the five-finding FIX round's ledger line, verbatim
+
+- 2026-07-25 · 2f0c8ab→(uncommitted) · FIX (5, ruling-directed) ·
+  opened with the mandated DOUBLE distillation: CORE 58.0→54.3KB (ledger
+  era-compressed past the RE-CONVERGED anchor), PATTERNS 151.4→149.6KB
+  (B8 tombstoned), NOT_BUGS 115.4→118.6KB after the new clauses; originals
+  verbatim to archive (2026-07-25 #4) · F5+F4 ONE ROOT: binary's
+  null-branch predicates keyed on the AS-WRITTEN spelling while the
+  compiled/JSON side keyed on the resolved kind — new shared
+  `aschema.isNullBranch` (bare `"null"` OR `{"type":"null"}`; props and a
+  logicalType are INERT on a null and do NOT make it non-null — decided
+  explicitly, pinned by the wrapped+props / wrapped+logicalType /
+  wrapped+nonstring-logicalType spelling rows) now answers all four
+  as-written sites (isNullableUnion, liftFieldLogicalIntoType,
+  fieldDecimalLiftConsumesPrecisionScale, the buildUnion 2-branch
+  selection); json_codec.go UNTOUCHED as ruled and now agrees · verified
+  per site, not assumed: serNullUnion/serNullSecondUnion +
+  buildNullUnionMeta engage for wrapped spellings (omitzero encodes NULL,
+  not the empty-string value branch), and the two lift siblings recover —
+  time.Time (#33) and *big.Rat (#71) encode again · REPO-WIDE SWEEP by
+  semantic question: every `.kind ==` site reads the compiled node
+  (normalized — CONFORMS by construction); the remaining `.primitive`
+  sites are rendering/shape dispatch whose arms cover both spellings
+  (DIFFERENT BY DESIGN, canonical + fingerprint parity EXECUTED across
+  spellings); zero `primitive == "null"` predicates remain · F2+F3
+  budget walker: `marshalEmitLen` (json.Marshaler before TextMarshaler,
+  nil not called, erroring method left uncharged) + `mapKeyEmitLen`
+  (string KIND first, then TextMarshaler, then 20 for integer kinds) —
+  measurement bounded by stopping at the first over-budget value, so N
+  marshalers materialize ONE image; #69 opacity intact · F1: splice
+  honors the refTarget stamp only while `nodeRefTargetAgrees` (fullname
+  or short name) — an edited Type wins, node behaves hand-built; no new
+  API · SIBLING CLAIM EXECUTED: only CustomType and SchemaNode have both
+  exported fields and hidden state (the other four exported structs have
+  ZERO exported fields), frozen by
+  TestInvariant_HiddenStateOnPublicStructs +
+  TestInvariant_CustomTypeHiddenStateFailsLoud · nets, red-then-green,
+  all neuter-verified with disjoint red sets: NEUTER-D (isNullBranch →
+  bare-only) reds exactly the 4 spelling pins + TestMatrix_
+  NullBranchSpellingParity (841 cell errors), missing-key control stays
+  GREEN; NEUTER-E (marshaler arm) reds exactly 8 marshaler subtests +
+  MeasurementIsItselfBounded; NEUTER-F (map-key arm) reds exactly the 4
+  non-string-key subtests — E and F DISJOINT; controls (plain string,
+  string-kind keys) pass in every run · CLASS net
+  TestMatrix_NullBranchSpellingParity reuses matFrags × matCtxs (NOT
+  forked): 519 respelled cells / 1380 value checks over canonical +
+  fingerprint + wire + decoded value + JSON form + cross-wire and
+  cross-spelling error identity · §Open net gaps spelling line CLOSED ·
+  docs: #68 enforcement clause, #33 + #71 + #66 spelling-agnostic
+  clauses, P20 marked FIXED with its net; no renumbering · suite +
+  fastavro green after EVERY edit (final: 952 differential PASS, 0 fail,
+  0 `missing optional dependency`, 47 documented skips); FULL -race
+  green (135s + 51s), 0 data races; Java oracle absent (no local JRE) ·
+  FIX.md sweep worked: charge-site census (boundedSerializableValue is
+  the sole valueWalkLimit entry, no sibling budget walker), refTarget
+  reader census (both reads inside the gated splice) · UNCONVERGED
+  (counter 0), freeze stays; working tree UNCOMMITTED · NEXT ROUND owns
+  the line-walk remainder: schema_for.go (1703) + the five post-walk
+  drift hunks (schema_parse.go, cache.go, ocf/ocf.go, custom_type.go,
+  resolve.go).
