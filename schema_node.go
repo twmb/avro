@@ -1134,7 +1134,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// definition, preserving today's output byte-for-byte for
 	// self-contained trees (forward references included).
 	refType := n.Type
-	if d != nil && !stray && n.refTarget != nil && nodeIsNameRefShape(n) {
+	if d != nil && !stray && nodeRefTargetAgrees(n) && nodeIsNameRefShape(n) {
 		if fn := nodeFullname(n.refTarget); fn != "" && !d.localNames[fn] {
 			if _, emitted := d.defined[fn]; !emitted {
 				// The target walk gets a FRESH visited map: a recursive
@@ -1846,6 +1846,30 @@ func nodeIsNameRefShape(n *SchemaNode) bool {
 	return n.Name == "" && n.Items == nil && n.Values == nil &&
 		n.Fields == nil && n.Branches == nil && n.Symbols == nil &&
 		n.Size == 0 && !n.HasEnumDefault
+}
+
+// nodeRefTargetAgrees reports whether n's stamped refTarget is still the type
+// n's exported Type NAMES. The stamp is hidden state that survives a struct
+// copy — which is exactly how a caller extracts a sub-node — so a caller who
+// then edits Type would otherwise get the ORIGINAL spelling's definition
+// spliced in, hidden state silently beating the exported field they just set.
+//
+// Agreement is "Type is one of the spellings that could have produced this
+// stamp": the target's fullname, or its short name (the two forms
+// lookupNameRef binds, per scopedRefKeys). Anything else — a primitive, a
+// different name — means the node was edited after Root() stamped it, so the
+// stamp is stale and ignored; the node then renders as an as-written
+// reference and behaves exactly like a hand-built one, binding to a
+// definition the converted tree provides or dangling loudly.
+func nodeRefTargetAgrees(n *SchemaNode) bool {
+	t := n.refTarget
+	if t == nil {
+		return false
+	}
+	if fn := nodeFullname(t); fn != "" && n.Type == fn {
+		return true
+	}
+	return t.Name != "" && n.Type == t.Name
 }
 
 

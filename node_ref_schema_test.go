@@ -126,6 +126,80 @@ func TestNodeRefSchema_HandBuiltStillDangles(t *testing.T) {
 	}
 }
 
+// The refTarget stamp is hidden state that survives a struct copy, which is
+// exactly how a caller extracts a sub-node. If the caller then edits the
+// node's exported Type, the stamp is STALE: it still points at whatever the
+// ORIGINAL spelling named. Honoring it would let hidden state silently beat
+// the exported field the caller just set, so the stamp is used only while it
+// still names the node's Type. An edited node behaves hand-built — it
+// resolves against the tree being converted, or dangles loudly.
+func TestNodeRefSchema_EditedTypeIgnoresStaleStamp(t *testing.T) {
+	const twoNamed = `{"type":"record","name":"R","fields":[
+		{"name":"f","type":{"type":"fixed","name":"Dec","size":8}},
+		{"name":"g","type":"Dec"}]}`
+
+	t.Run("retyped-to-primitive", func(t *testing.T) {
+		root := MustParse(twoNamed).Root()
+		g := root.Fields[1].Type // struct copy: carries the stamp
+		if g.Type != "Dec" {
+			t.Fatalf("precondition: extracted node Type = %q", g.Type)
+		}
+		g.Type = "int"
+		sub, err := g.Schema()
+		if err != nil {
+			t.Fatalf("Schema() after retyping to a primitive: %v", err)
+		}
+		if got := string(sub.Canonical()); got != `"int"` {
+			t.Fatalf("retyped node produced %s, want \"int\" — the stale stamp resurrected the old definition", got)
+		}
+		// And it must actually encode as an int.
+		wire, err := sub.Encode(int32(1))
+		if err != nil {
+			t.Fatalf("encode int: %v", err)
+		}
+		if !bytes.Equal(wire, []byte{2}) {
+			t.Fatalf("int wire = %v, want [2]", wire)
+		}
+	})
+
+	t.Run("redirected-to-another-name", func(t *testing.T) {
+		root := MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"a","type":{"type":"fixed","name":"A","size":1}},
+			{"name":"b","type":{"type":"fixed","name":"B","size":2}},
+			{"name":"c","type":"A"}]}`).Root()
+		c := root.Fields[2].Type
+		c.Type = "B" // the caller redirects the reference
+		// The tree being converted defines neither name, so an as-written
+		// reference dangles — the hand-built posture. What must NOT happen
+		// is silently emitting A's definition under the new spelling.
+		sub, err := c.Schema()
+		if err == nil {
+			t.Fatalf("redirected reference produced %s; it names B, which this tree does not define, so it must dangle loudly like a hand-built node", sub.Canonical())
+		}
+	})
+
+	t.Run("unedited-still-splices", func(t *testing.T) {
+		// The control: the whole point of the stamp must still work.
+		root := MustParse(twoNamed).Root()
+		requireSubSchema(t, &root.Fields[1].Type, `{"type":"fixed","name":"Dec","size":8}`, []byte{1, 2, 3, 4, 5, 6, 7, 8})
+	})
+
+	t.Run("retyped-to-a-name-the-tree-defines", func(t *testing.T) {
+		// Editing Type to a name the CONVERTED TREE defines must bind to
+		// that local definition, not to the stamp.
+		root := MustParse(twoNamed).Root()
+		rec := root // the whole record defines "Dec" locally
+		rec.Fields[1].Type.Type = "Dec"
+		sub, err := rec.Schema()
+		if err != nil {
+			t.Fatalf("Schema(): %v", err)
+		}
+		if !bytes.Equal(sub.Canonical(), MustParse(twoNamed).Canonical()) {
+			t.Fatalf("locally-defined name drifted: %s", sub.Canonical())
+		}
+	})
+}
+
 // TestNodeRefSchemaMatrix is the class-elimination net for reference-node
 // extraction: kind × namespace spelling × extraction site × structure.
 // Each cell builds an enclosing schema whose extraction site holds a NAME
