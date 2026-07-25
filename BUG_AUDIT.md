@@ -7153,3 +7153,323 @@ fb6b6ba (harness hardening). Docs follow. The ocfwrite §Open net gaps
 line stays live. Fix lands UNCONVERGED: next round quarantines
 62f2bf0..fb6b6ba (+ the docs commit). PATTERNS crossed ~150KB with the
 R1-Q9 fold → PATTERNS distillation mandated at the next round's open.
+
+## Distillation archive (2026-07-24 #8) — pre-round double distillation (size-guard mandate: CORE 56.3KB / PATTERNS 150.9KB)
+
+Verbatim originals of everything compressed at the 2026-07-24 sixth
+round's open (both caps crossed by the FIX round's folds).
+
+### AUDIT_PATTERNS.md — B7 tombstone entry, verbatim pre-compression
+
+- *(tombstone -- netted, once re-opened)* **A non-wire path re-derives a resolution the parser already computed -- and must reproduce it EXACTLY, including position-dependence AND the binding grammar's kind-gating.** The parser computes name bindings / branch selections / scopes once (eager, in-scope-first, POSITIONAL, and KIND-KEYED -- a container key binds only on the kind that binds it); any re-deriving path (SchemaCache splice, canonical emitter, metadata walker) must reproduce precedence + namespace scoping + position/order + the binding gate in full, or consume the binding directly. Class net: the FEATURE x WALKER parity harness (matrix_feature_walker_test.go -- feature rows x 11 walker-drivers, per-cell parity with a vanilla twin; adding a feature or walker = adding a ROW/DRIVER, never a hardcoded expectation) plus the instance matrices TestMatrix_CacheKeylessDefCollection, TestMatrix_LeadingDotNameNormalization, and TestMatrix_CacheStrayStructuralKey (SchemaCache x stray-key: carrier x key x def relation incl. recursive+diamond x five metadata surfaces + wire verdict); four instance families (positional splice, keyless carve-out, leading-dot family -- NOT_BUGS #62 -- and the stray-key definition store, NOT_BUGS #63 cache clause) all fixed and neuter-proven. RE-OPEN INSTANCE (2026-07-19, the harness gap this tombstone warned about): the harness's rows never crossed SchemaCache with STRAY structural keys, so collectTreeDefs/inlineNodeChildren descended parser-inert items/values/fields for two audit generations after the schema_for twins were gated -- a stray-key def occupied the first-wins c.defs and poisoned every later cross-parse reference's Canonical/Fingerprint/SOE/String/Root, and collectNamedTypes' last-wins metadata table flipped name-referenced default coercion. Root lesson: the gating sweep that fixed the schema_for walkers was FILE-scoped; the shape's true scope is the shared enumerator's CALLER SET. The walkNodeChildren caller table (keep current when adding a caller): collectTreeDefs GATED, inlineNodeChildren GATED, nodeFromJSONObject strayKeys-by-design (as-written surfacing, pinned by TestRegression_MetadataStrayKeySurfacedAsWritten); name-walk siblings with their own kind gates: dedupNamedTypes / pinCustomSchemaScope / normalizeSchemaScope / addTypeAliases (schema_for), collectNamedTypes (schema_node, gated 2026-07-19); un-gated by design: coerceTreeDefaults (surface-local default materialization inside surfaced strays, registration-free), toJSONWalk's emitter (kind-gated emission drops strays at rebuild). Re-opens if a new walker / name-resolution rule / feature spelling lands without its harness row or driver, a parser resolution gains a dimension the twins don't cross, or a new walkNodeChildren caller (or same-contract enumerator under another name) lands without a row in the caller table. Full entry: BUG_AUDIT.md, Distillation archive (2026-07-14, 2026-07-19).
+
+### AUDIT_PATTERNS.md — B36 census-codification block, verbatim pre-compression
+
+  **Census codification (2026-07-18) — the domain's first principles; probe from these axes, not from past instances.** INVARIANT: the composed/rebuilt schema is a function of the MARSHAL IMAGE of every caller value, never of its Go representation; the only values whose image the pipeline may change are the documented image-owners (own MarshalJSON/MarshalText and json.Number — the author's contract; the []byte codepoint fixup; ±Inf/−0.0 json.Number literals; the canonical-only NaN→"NaN"). ENTRY POINTS (the whole domain, mechanically enumerated): SchemaNode.Props values, SchemaField.Default, SchemaField.Props values — plus whole trees of those via CustomType.Schema, and again via mutating a Schema.Root() result. CONSUMERS (two pipelines, one value choke point each): the rebuild (toJSONWalk → boundedSerializableValue = budget walk THEN kind fixups → json.Marshal → Parse) and the SchemaFor render (same walk, plus deepCopyJSONTree/canonicalizeTreeValue, then composition walkers that see only canonical shapes); the cache splice is OUT of the domain (text-only — no caller Go value reaches it). AXES for any new cell: Go dynamic-type class {canonical leaf/container; named leaf (bool, int widths, uint widths incl. uint64 past int64, float32/float64 incl. specials); named container (map, slice, []string-kind); slice-of-named-elem; [N]array; marshaler-carrying; json.Number; nil vs empty vs absent} × ownership {fresh; shared/diamond; spare-capacity sentinels; caller-retained-after-build} × position {node Props scalar/container/carried-subtree; field Default; field Props; whole custom tree} × surface {rebuild; SchemaFor render; wire via default auto-fill} — attribute-carrying cells observe via Root()/String() (PCF strips props/aliases/doc), every control anchored to an executed value before any twin diff. Net: TestMatrix_TreeValue{LeafTwins,ContainerTwins,DefaultWire,FieldProps,VerdictParity,NilEmptyImage,MapKeyShapes}, TestRegression_TreeValueOwnershipBoundary, the nil-image and string-kind-key pins, the SchemaFor arm of TestRegression_CyclicNamedMapPropsBudgetError, and FuzzTreeValueTwinParity (generator-built twin pairs incl. nil/empty containers; oracle = verdict + rendered-text + observed-metadata parity + Parse fixed point; the generator excludes only the documented image-owners and NaN). Neuter-verified with disjoint red sets per component: kind-fixups off → codepoint/Inf cells + fuzz seeds red; canonicalize off → aliases-merge/namespace-pin/dedup cells red; nil guards off → exactly the nil/empty family (23 fails incl. the nil-named-map fuzz seed; empty-map/[]any controls stay green); string-kind key exclusion restored → exactly the tmKey family (9 fails; ptr-receiver-key and int-kind posture cells green both ways). Both census findings RULED and FIXED 2026-07-19: every boundary copy arm preserves nil-ness in both directions (nil→nil, empty→empty — FIX.md gained the invariant row; the snapshot test helper carried the same defect and the same fix), and string-KIND map keys canonicalize to their raw string (v1 key-resolver precedence executed; jsonv2 flips it, so raw-string canonicalization is also the toolchain-stable image) while NON-string-kind MarshalText keys remain opaque image-owners (method wins on both toolchains, executed) — NOT_BUGS #69 records both rulings.
+
+### AUDIT_CORE.md — ledger entries compressed this pass, verbatim
+
+- 2026-07-23 · c428ae3 · FULL clean #1 of 2 (quarantine CLEAN; fronts
+  varint/slab/OCF-codec + P11/P15/B35 + logical + canonical; fastavro
+  0-SKIP, -race green, Java absent). Verbatim: archive (2026-07-24 #2).
+- 2026-07-24 · c428ae3 · FULL clean #2 of 2 → WALK RE-CONVERGED, freeze
+  lifts (fronts: soe/rabin, schema_for/reflect, resolve/compat; fastavro
+  EXECUTED 0-SKIP; Java absent). Verbatim: archive (2026-07-24 #3;
+  narrative 2026-07-24).
+- 2026-07-24 · c428ae3 · FULL clean, 3rd consecutive (opened w/
+  distillation CORE 55.7→52.4KB; fronts: json_codec full walk, schema.go
+  canonical rewrite, custom_type.go, doc-claims, P17 + panic sweep;
+  fastavro EXECUTED 0-SKIP; Java absent). Verbatim: archive
+  (2026-07-24 #3).
+- 2026-07-24 · c428ae3 · FULL clean, 3rd of day (dup-JSON-key semantics
+  every surface; atype B25 walk; size/precision/scale token forms;
+  promotion × foreign-oracle 11-cell probe) → 4th consecutive clean.
+  Ledger verbatim: archive (2026-07-24 #6).
+- 2026-07-24 · c428ae3 · FULL clean + promotion net fold, 4th of day
+  (TestDifferentialFastavroPromotion 11 cells, neuter-verified, B31
+  any-target dodge caught in-round; schema_walk.go B25 walk) → 5th
+  consecutive clean. Narrative: archive (2026-07-24 #4); ledger
+  verbatim: archive (2026-07-24 #6).
+- 2026-07-24 · code HEAD c428ae3 (docs 6da4304) · FULL (read-only),
+  5th of the day · quarantine EMPTY; working-tree promotion net
+  EXECUTED green (11 subtests vs live oracle) · net: suite + fastavro
+  green 0-fail; FULL -race green; Java absent (JVM-less stub) ·
+  MID-ROUND venv repair: cramjam AND zstandard were MISSING — ocf
+  snappy/zstd fastavro cross-checks had been log-skipping invisibly
+  (no test SKIP registered); reinstalled, ocf re-run ZERO
+  "missing optional dependency", green — future rounds must grep that
+  phrase, skip-counts can't see these cells · NEW front: twmb reads
+  fastavro-WRITTEN OCF (18-file corpus: 4 codecs × plain/multiblock/
+  empty + rich schema + special doubles + decimal/date/ts logicals +
+  custom meta; append-onto-foreign ×4 codecs re-read by BOTH impls;
+  WithReaderSchema-over-foreign) ALL EXACT; bzip2/xz loud-reject;
+  §Open net gaps line added for the permanent fold (oracle `ocfwrite`
+  op) · B25 inverse-density: schema.go FIRST full line-walk (4434
+  lines, 93 funcs) → behavioral FILED 1: enum-level default
+  json.Unmarshal error ignored (schema.go:3016) — lax-""-symbol
+  corner ACCEPTS non-string/null default, binds "" (resolution fills
+  it, EXECUTED; Root().HasEnumDefault=false — wire↔metadata split;
+  violates NOT_BUGS #54 posture; fastavro reject EXECUTED, Java
+  no-bind Schema.java:1921-1925); strict mode still rejects (echo
+  cosmetic); sole ignored-Unmarshal site (sibling sweep) · grep
+  refresh P1/P9/P18/Y4 zero new candidates · capstone FuzzMatrixCore
+  1.48M + FuzzOCFReader 3.26M no crashers · behavioral 1 →
+  consecutive-clean counter RESETS (was 5), freeze re-engages ·
+  CORE crosses ~55KB → distillation mandated at next round's open.
+  Narrative: archive (2026-07-24 #5).
+- 2026-07-24 · c428ae3→fb6b6ba · FIX (1, ruling-directed): enum-level
+  default is a JSON STRING token, decided BEFORE membership (schema.go;
+  b5c09b1) — the lax-""-symbol phantom bind is closed, explicit null
+  rejects both modes, the reject echo names the token · opened w/ the
+  mandated distillation (CORE 57.3→54.3KB → archive 2026-07-24 #6) ·
+  red-then-green: 3 pins + 15 matrix cells verified failing pre-fix;
+  neuter reddens exactly those 21 with controls green (88 RUN lines
+  accounted, no silent truncation) · nets: 32-cell token matrix ×
+  {parse verdict, metadata parity, render round-trip, canonical strip,
+  resolution fill} + 5-cell field-default row + wrapper-ref inertness
+  (direct + cache splice) + 36-subtest fastavro differential EXECUTED
+  (calibrated: fastavro TYPE-checks field defaults but not membership;
+  rejects the wrapped named-reference shape outright) · R1-Q9
+  back-filled — every enum-default consumer conforms (resolve's fill
+  carries its own membership re-check) · NOT_BUGS #54 closing clause
+  (the "cosmetic only" call on the "" echo was wrong about the
+  mechanism) · promotion net COMMITTED (62f2bf0); ocfwrite gap stays
+  live · oracle harness hardened: missing codec deps FAIL loudly when
+  AVRO_FASTAVRO_PYTHON is set (fb6b6ba; red-then-green via dep
+  uninstall/reinstall); round-template output-grep line added · gates:
+  full suite + fastavro green after every edit; FULL -race green
+  (101s+29s); Java absent · fix lands UNCONVERGED — next round
+  quarantines 62f2bf0..fb6b6ba (+ docs) · BOTH caps crossed (CORE
+  56.2KB with this entry; PATTERNS 150.9KB with the R1-Q9 fold) →
+  distillation of both mandated at next round's open. Narrative:
+  archive (2026-07-24 #7).
+
+## Round narrative (2026-07-24 #9) — FULL round, ocfwrite net fold + json_decode.go first line-walk (code HEAD fb6b6ba, docs 8ee5a64, read-only) — CLEAN
+
+Opened with the mandated DOUBLE distillation: CORE 56.3→53.5KB and
+PATTERNS 150.9→147.7KB (B7 tombstone compressed to charter + caller
+table + re-open conditions; B36 census-codification block compressed to
+invariant + net + rulings; seven ledger entries compressed; verbatim
+originals in archive #8).
+
+Net: the oracle venv was EMPTY (/tmp wipe since the prior round —
+/tmp/avro_oracle_venv had bare interpreters, no packages); rebuilt with
+fastavro 1.12.2 + cramjam + zstandard. Suite + fastavro green 0-fail,
+zero `missing optional dependency` lines; 927 differential subtests
+PASS with exactly the 16 calibrated with-empty skips (the enum-default
+differential's carrier-blocked cells — count matches the fix round's
+"36 executed" arithmetic). Java absent (JVM-less). fastavro version
+matches the pinned 1.12.2 calibrations exactly.
+
+Quarantine 62f2bf0..fb6b6ba CLEAN: b5c09b1's token gate covers the
+full JSON token set (string validates via Unmarshal; every non-string
+first byte rejects post-TrimSpace; whitespace-only trims empty and
+rejects; trailing-garbage strings reject via Unmarshal), capture site
+s.object.Default is raw token bytes, consumers conform (resolve.go:585
+re-checks membership; schema_node.go:1906 metadata flag); 62f2bf0's
+promotion differential asserts VALUES on typed float64 legs (no
+any-target dodge); fb6b6ba's fail-loud arm hard-errors with env set
+and the default arm still catches unknown fastavro errors.
+
+Front A — §Open net gaps ocfwrite CLOSED. fastavro_oracle.py gains
+`ocfwrite` (fastavro WRITES a container from twmb-encoded schemaless
+records: codec, sync_interval, metadata) and `ocfread` (whole-file
+read, every record re-encoded schemaless against the header schema —
+byte transport, so bytes/fixed/decimal/NaN travel). New permanent net
+ocf/foreign_writer_differential_test.go::TestDifferentialFastavroOCFForeignWriter
+(24 subtests): 4 codecs × plain/multiblock/empty (multiblock proven
+non-degenerate by sync-marker counting), rich foreign schema spelling,
+special doubles (NaN/±Inf/−0.0 bit-exact through both writers), decimal/
+date/timestamp logicals, custom metadata, append-onto-foreign ×4 codecs
+re-read by BOTH impls byte-exactly, WithReaderSchema-over-foreign
+(int→long promotion + reader-default fill), bzip2/xz loud-reject naming
+the codec. Neuter-verified ×4 with disjoint exact red sets: snappy
+decompress output flip → 4 snappy cells; Resolve(schema,schema) → the
+reader-schema cell (caught by the int64-promotion assert); append sync
+corruption → 4 append cells; Metadata()→nil → the custom-meta cell.
+ocf.go byte-identical to HEAD after reverts (git diff empty). Full
+suite + ocf -race green with the fold in place. Harness detail: the
+oracle client takes the calling subtest's *testing.T per call — an
+oracle struct capturing the parent t FailNow'd the parent from a
+subtest (caught in-round); records:null from a nil Go slice needed
+`or []` on the Python side.
+
+Front B — B25 inverse-density: json_decode.go FIRST full line-walk
+(1856 lines; the decode sibling of already-walked json_codec.go; lowest
+attention density of the never-walked files). CLEAN. Verified in the
+walk: depth accounting composes across the JSON→binary default-fill
+boundary (applyFieldDefault hands ctx.slab to the binary deser fn, so
+sl.depth continues; defaultBytes copied per fill against slab
+aliasing); scanner skipValue carries its own maxDepth-bounded recursion
+(fresh budget per skipped value, documented ~2*maxDepth worst case);
+unionTarget's per-branch indirection matches binary (custom branch gets
+the un-indirected target; concrete target returns rawV so the leaf's
+single indirectAlloc is the only peel — no 2*maxIndirectDepth accept);
+suppressLogical threads uniformly through int/long/string/bytes/fixed
+with kind-gated logical arms (assignBytes) and never reaches kinds
+without logicals; native slice/map fast paths are exact-type-gated with
+range-checked parsers (long→int only at IntSize==64); dup-key semantics
+= last-wins for the same canonical key, reject for two different keys
+resolving to one field slot (pinned "resolved from both"), and the
+zero-copy seenKey strings stay valid (input buffer is call-stable);
+container-commit bare-union dispatch and the tagged-form container
+commit both pinned (2^depth defense); decodeBareDecimal bounds via
+boundedRatFromString; jsonDecodeAppliesLogical's probe alloc capped
+(maxFixedLogicalLen). Every risky corner traced to an executed pin.
+
+Front C — grep refresh: Y4 trilogy (int-narrow / float→int /
+k*size), P9 amplification, P18 delegate-buffer, P1 sentinel, B27
+cyclic walks, B20 error echo, Unmarshal-precision: zero new
+candidates. deser.go:857's raw SetString is boundedRatFromString's own
+interior post-gates. B27 pattern-text hazard fixed: the entry
+prescribed "decline at `>=`, not `>`" verbatim, but the current
+`levels := 1` counting makes `>` parity-correct — a future reader
+copying the spelling would have BROKEN parity; the entry now states
+the invariant (accept sets identical at the cap; authority = the
+executed at-cap/past-cap matrix) instead of a spelling.
+
+Zero behavioral findings → consecutive-clean 1 of 2 (counter had
+reset at the enum-default finding). Freeze stays engaged. Working
+tree holds the net fold (fastavro_oracle.py + the ocf differential)
+uncommitted for the maintainer, alongside the BUG_AUDIT/CORE/PATTERNS
+doc updates.
+
+## Ledger verbatim (2026-07-25 #1) — the 2026-07-24 6th and 7th FULL rounds (compressed in AUDIT_CORE.md at the 2026-07-25 fix-round distillation)
+
+- 2026-07-24 · code fb6b6ba (docs 8ee5a64) · FULL (read-only), 6th of
+  day · opened w/ the mandated DOUBLE distillation (CORE 56.3→53.5KB,
+  PATTERNS 150.9→147.7KB; verbatim → archive 2026-07-24 #8) ·
+  quarantine 62f2bf0..fb6b6ba CLEAN (token gate covers the full JSON
+  token set; promotion differential value-asserting on typed legs;
+  harness fail-loud arm verified) · net: venv REBUILT (/tmp wipe had
+  emptied it; fastavro 1.12.2 matches pinned calibrations); suite +
+  fastavro green 0-fail, 0 missing-dep; 927 differential subtests PASS,
+  16 = exactly the calibrated with-empty skips; Java absent · §Open net
+  gaps ocfwrite CLOSED: oracle `ocfwrite`/`ocfread` ops +
+  TestDifferentialFastavroOCFForeignWriter (24 subtests: 4 codecs ×
+  plain/multiblock-with-degeneracy-probe/empty + rich foreign spelling
+  + special doubles + logicals + custom meta + append-onto-foreign
+  re-read by BOTH + WithReaderSchema-over-foreign + bzip2/xz
+  loud-reject) EXECUTED green; neuter ×4 disjoint exact red sets
+  (snappy decompress / resolve arm / append sync / Metadata); ocf
+  -race green; fold uncommitted in working tree · B25 inverse-density:
+  json_decode.go FIRST full line-walk (1856 lines) CLEAN — depth
+  composes across JSON→binary default-fill, skipValue independently
+  bounded, per-branch unionTarget indirection, suppression kind-gated,
+  native fast paths range-check-parity, dup-key/alias-collision/
+  container-commit all pinned · grep refresh Y4/P9/P18/P1/B27/B20 zero
+  new candidates; B27 entry's `>=` spelling REWRITTEN to state the
+  cap-boundary invariant (verbatim copy would have broken parity;
+  authority = executed at-cap matrix) · behavioral 0 →
+  consecutive-clean 1 of 2 (post-reset); freeze stays engaged.
+  Narrative: archive (2026-07-24 #9).
+- 2026-07-24 · code fb6b6ba (docs 8ee5a64) · FULL (read-only), 7th of
+  day · quarantine EMPTY (no code commits since ledger HEAD; ocfwrite
+  fold still uncommitted in tree, re-ran green) · net: suite + fastavro
+  green (952 differential PASS / 16 = calibrated with-empty skips,
+  0 missing-dep); Java absent · fronts: B25 inverse-density bundle
+  compat.go + schema_walk.go + soe.go + varint.go + rabin.go FIRST full
+  line-walks CLEAN (compat⇔resolve field-matcher existence-parity
+  proven via #50 parse-reject + Resolve's CheckCompatibility pre-check;
+  SOE header LE locked end-to-end; uvarintLens table hand-verified;
+  strayBodyShapeOK gates non-object stray-fields elements to Props) ·
+  P2 twin-walk json_codec.go FIRST full line-walk (1682 lines):
+  tagged-map acceptance tiers symmetric (branchNames = standard +
+  logical + unambiguous short), goto-tryAll provably ≡ binary
+  fall-through (nil-first/type-name are no-ops for maps), record
+  extra-key/missing-key/nil-field parity confirmed vs serRecord ·
+  grep refresh P11/P15/B17/B35/P19 zero new candidates
+  (boundedRatFromString 3-lane bounded; tryParse* fall-throughs
+  pinned; textValue single impl) · behavioral FILED 1: top-level
+  UNTYPED-nil encode error IDENTITY diverges by wire (Encode
+  *SemanticError via entry guard ser.go:52 + serUnion wrap;
+  EncodeJSON bare fmt.Errorf json_codec.go:299/:301); typed nil
+  agrees plain-on-both; record positions masked by recordFieldError;
+  NOT_BUGS #66 nil clause ("plain on both") executed-FALSE for the
+  untyped shape → documented-but-contradicted, maintainer fork filed
+  (align-JSON-to-binary recommended), no edit · counter RESETS
+  (was 1 of 2), freeze stays engaged.
+
+## Round narrative (2026-07-25 #2) — FIX round (overseer-adjudicated ruling C): encode error IDENTITY unification, JSON aligned to binary
+
+Ruling C completed NOT_BUGS #66's unification: the JSON encoder's two
+untyped-nil arms wrap in *SemanticError (union arm AvroType "union",
+non-nullable arm AvroType node.kind, message content preserved in Err);
+typed nil stays plain on both wires; #66's executed-false "nil is plain
+on both" clause rewritten to the executed truth. No binary-side change
+anywhere in the round.
+
+Opened with the mandated CORE distillation (56.6→53.9KB; the two
+2026-07-24 FULL-round ledger entries archived verbatim as 2026-07-25 #1
+and compressed in place).
+
+Red-then-green, three waves, each caught by a different net layer:
+
+1. The census construction itself surfaced TWO more diverging families
+   beyond the filed nil arms: time-logical range rejects (JSON returned
+   the conv/timeToDate/durationToTimeMillis errors BARE where binary
+   wraps — serTimeAsLong semErrW "long", serDate "date", serTimeMillis
+   "time-millis") and, later, the union no-match. Initial red: 7
+   subtests (2 pins + nil x2, timestamp-millis, date, time-millis rows).
+2. The first fix wave leaked SemanticError into the TYPED-nil path: the
+   JSON peel loop recursed nil pointer layers into the (now-wrapped)
+   !IsValid arms. Caught by the census's own typed-nil control rows.
+   Fix: the peel loop returns errIndirectNil directly for non-null
+   kinds ("null" emits null), mirroring indirect(); unions dispatch
+   before the peel so the arms cannot disagree.
+3. FIX.md item 13 (immunity-claim verification) executed the commit
+   message's "typed nil against a no-null union wraps on both wires"
+   claim — FALSE on JSON: the union no-match error was
+   fmt.Errorf-wrapping-lastErr, so its identity was INHERITED from the
+   last branch error's chain (plain exactly when the last failure was
+   the errIndirectNil sentinel) while serUnion.ser wraps
+   unconditionally. Mirroring that wrap uniformly then broke
+   TestMatrix_TextOutCallbackReturnShapes' union-no-match row at
+   AvroType precision, exposing the DISPATCH SPLIT: binary's 2-branch
+   null union (serNullUnionAt) surfaces the value branch's OWN error
+   bare; only the generic serUnion.ser path wraps as "union". The JSON
+   dispatcher now reproduces the split exactly (bare lastErr for
+   2-branch-null, unconditional union wrap otherwise). B10 gained
+   refinements (3) chain-inherited identity is identity-by-luck and
+   (4) identity mirrors must reproduce the twin's dispatch split.
+
+Census: TestMatrix_EncodeErrorIdentityCensus, one triggering input per
+error-return family at TOP LEVEL through BOTH encoders — 19
+SemanticError families (nil x2 + typed-nil-vs-no-null-union +
+type-mismatch x4 + json.Number content + enum x2 + fixed size +
+missing field + union no-match + decimal x2 + map-key + timestamp +
+date + time-millis-duration), 3 agreeing-plain families (typed nil
+non-union; CustomType.Encode errors verbatim — errors.Is-pinned;
+fixed-uuid parseUUID bare on both, serFixedUUIDReflect executed), 3
+decode-side wire-content rows pinned plain (binary enum ordinal, JSON
+unknown symbol, binary union index), + the record-position masking row
+(recordFieldError wraps both wires, Field="f"). Neuter: unwrapping the
+non-nullable nil arm reds exactly 2 of 30 subtests (the two
+non-nullable-nil cells; union/typed-nil/time rows are disjoint arms).
+-race green on the family. Discovery calibration: durationToTimeMillis
+errors only past ±MaxInt32 ms (~596h), so the census duration row uses
+700h; date range needs year ~5.88M+ (year 6M used); the date-STRING
+mirror arm is unreachable (4-digit-year formats) and exists so the
+twins cannot drift.
+
+Housekeeping: OCF foreign-writer fold COMMITTED (0229290) after a
+fresh snappy-output neuter red exactly its 4 snappy cells (of 24;
+empty-block cell structurally immune — no byte to corrupt) and a
+25/25 green re-run. Fix + census committed as 51d2db2 (amended once to
+fold in the union-wrap wave and correct the executed-false immunity
+sentence). Suite + fastavro differential green after every wave (952
+PASS / 16 calibrated skips); Java absent (JVM-less). Maintainer
+commits ce088f4 + 3e51329 (landed at round open) untouched — next
+round's quarantine.
+
+FIX.md sweep: item 0 gate = documented-but-contradicted, resolved by
+the explicit ruling, entry updated same round; item 1 predicate
+symmetry via the census arms; item 2 three-axis N/A (identity-only —
+no accept/reject boundary moved, differential byte-parity unchanged);
+item 3 scope = the encoder-surface invariant (unsafe arms are
+structurally record-position → recordFieldError-masked; resolved
+encode shares the reader's ser; decode is the separate pinned-plain
+family); DRY = constructions stay inline, the census is the
+cross-path drift guard (hot-path inline budget); item 13 = the one
+immunity claim executed, found false, became fix wave 3 + a census
+row.
