@@ -792,6 +792,70 @@ const (
 // CustomType.Schema can store ANY Go value the map[string]any field accepts).
 // []byte/[N]byte are a codepoint/base64 scalar (charged by length, not walked as
 // a nested array).
+// marshalEmitLen reports how many bytes json.Marshal will emit for a value
+// that defines its own JSON form, and whether it is such a value at all.
+// json.Marshal consults json.Marshaler first, then encoding.TextMarshaler,
+// so this checks them in that order. json.Number is deliberately NOT here:
+// it is a string-KIND value the String arm already charges by content.
+//
+// Measuring costs one call to the caller's own method, whose result is
+// charged and immediately dropped. That keeps the MEASUREMENT bounded in the
+// way that matters: the walk stops at the first value that busts the budget,
+// so a tree of N over-budget marshalers materializes one image, not N, and
+// the walk never accumulates or retains them. The single transient image is
+// produced by the caller's own method on the caller's own value — no walk
+// can be cheaper than asking it what it emits.
+//
+// A method returning an error is left uncharged and unhandled: the eventual
+// json.Marshal will surface that same error, and inventing a budget verdict
+// for a value that will never be emitted would reject a tree that actually
+// fails for a different, better-named reason.
+func marshalEmitLen(rv reflect.Value) (int, bool) {
+	if !rv.IsValid() || !rv.CanInterface() {
+		return 0, false
+	}
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if rv.IsNil() {
+			return 0, false // json.Marshal emits "null" without calling the method
+		}
+	}
+	switch m := rv.Interface().(type) {
+	case json.Marshaler:
+		out, err := m.MarshalJSON()
+		if err != nil {
+			return 0, false
+		}
+		return len(out), true
+	case encoding.TextMarshaler:
+		out, err := m.MarshalText()
+		if err != nil {
+			return 0, false
+		}
+		return len(out) + 2, true // emitted as a quoted JSON string
+	}
+	return 0, false
+}
+
+// mapKeyEmitLen reports the bytes json.Marshal emits for one map key. Its key
+// resolver checks the string KIND first — a string-kind key marshals as its
+// raw string and any MarshalText on it is not consulted — then
+// encoding.TextMarshaler, then integer formatting. Every key is charged;
+// none is free.
+func mapKeyEmitLen(k reflect.Value) int {
+	if k.Kind() == reflect.String {
+		return k.Len()
+	}
+	if k.CanInterface() {
+		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
+			if out, err := tm.MarshalText(); err == nil {
+				return len(out)
+			}
+		}
+	}
+	return 20 // integer kinds: a signed 64-bit decimal is at most 20 bytes
+}
+
 func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 	if depthLeft < 0 {
 		return valueWalkTooDeep
@@ -802,6 +866,21 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 	if !b.takeNode() {
 		return valueWalkTooWide
 	}
+	// A value carrying its own MarshalJSON / MarshalText does not get walked
+	// by json.Marshal at all: the method's return IS the emission, so the
+	// structural recursion below would charge the value's Go shape while
+	// json.Marshal emits something else entirely (an empty struct whose
+	// MarshalJSON returns a megabyte charges one node and no bytes). Charge
+	// what the method actually emits, and stop the walk here — mirroring
+	// json.Marshal's own dispatch, which never descends into such a value.
+	// The value stays marshal-opaque: charging reads the method's output and
+	// discards it, so nothing about its rendering changes.
+	if n, ok := marshalEmitLen(rv); ok {
+		if !b.takeBytes(n) {
+			return valueWalkTooLarge
+		}
+		return valueWalkOK
+	}
 	switch rv.Kind() {
 	case reflect.Interface, reflect.Pointer:
 		if rv.IsNil() {
@@ -810,8 +889,11 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 		return valueWalkLimit(rv.Elem(), depthLeft-1, b)
 	case reflect.Map:
 		for iter := rv.MapRange(); iter.Next(); {
-			// json.Marshal emits each map key as an object key string.
-			if k := iter.Key(); k.Kind() == reflect.String && !b.takeBytes(k.Len()) {
+			// json.Marshal emits EVERY map key as an object key, whatever the
+			// key's Kind: a string-kind key as its raw string, and any other
+			// kind through MarshalText or integer formatting. Charging only
+			// string-kind keys left the rest free (see mapKeyEmitLen).
+			if !b.takeBytes(mapKeyEmitLen(iter.Key())) {
 				return valueWalkTooLarge
 			}
 			if r := valueWalkLimit(iter.Value(), depthLeft-1, b); r != valueWalkOK {
@@ -1765,6 +1847,7 @@ func nodeIsNameRefShape(n *SchemaNode) bool {
 		n.Fields == nil && n.Branches == nil && n.Symbols == nil &&
 		n.Size == 0 && !n.HasEnumDefault
 }
+
 
 func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {
 	if n == nil {
