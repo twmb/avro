@@ -7641,3 +7641,243 @@ Two passes. (1) AUDIT_CORE §Round ledger: every line superseded by the 2026-07-
   the line-walk remainder: schema_for.go (1703) + the five post-walk
   drift hunks (schema_parse.go, cache.go, ocf/ocf.go, custom_type.go,
   resolve.go).
+
+## Distillation archive (2026-07-25 #6) — pre-round CORE size-guard distillation (mandate: CORE 56.8KB, over the ~55KB cap)
+
+Compressed three superseded §Round ledger entries (the 2026-07-24 era line,
+the 2026-07-25 ruling-C FIX line, and the 2026-07-25 LINE-WALK-CAMPAIGN FULL
+line). All three are superseded: the era line's finding was fixed by the FIX
+line that follows it; the FULL line's five findings were all FIXED and
+committed by the b66d101 line that follows it; the FULL line's walk-remainder
+scope is executed by the round opening with this distillation. Verbatim below.
+
+### AUDIT_CORE §Round ledger, the three lines compressed this pass (verbatim)
+
+- 2026-07-24 · c428ae3→fb6b6ba · era (3 FULL + 1 FIX): enum-level default json.Unmarshal error ignored FILED→FIXED (b5c09b1: enum-level default is a JSON STRING token, decided BEFORE membership; explicit null rejects both modes; 3 pins + 15 matrix cells + 32-cell token matrix ×5 surfaces + 36-subtest fastavro differential; R1-Q9 back-filled; #54 closing clause) · venv repaired, then rebuilt (927 diff PASS); harness now FAILS loudly on missing codec deps under AVRO_FASTAVRO_PYTHON (fb6b6ba) · ocfwrite gap CLOSED (oracle ops + foreign-WRITER differential, 24 subtests, neuter ×4) · FIRST full line-walks CLEAN: schema.go (4434), json_decode.go (1856), json_codec.go (1682), compat/schema_walk/soe/varint/rabin · behavioral FILED 1 at the end: top-level UNTYPED-nil encode error identity diverges by wire (#66 nil clause executed-FALSE) · Narratives: archive (2026-07-24 #5, #7; 2026-07-25 #1).
+- 2026-07-25 · 3e51329→2f0c8ab · FIX (ruling C): CORE distilled
+  56.6→53.9KB · JSON encode error identity aligned to binary (no
+  binary change): untyped-nil arms wrap; typed nil plain via peel-loop
+  errIndirectNil; +2 census-found families FIXED — time-logical range
+  mirrors + union no-match chain-inheritance; union wrap ARITY-SPLIT
+  (2-branch-null = branch error bare, else unconditional "union"),
+  pinned at AvroType precision · red-then-green ×3 waves; census 19
+  SemanticError + 3 agreeing-plain + 3 decode-plain + masking row;
+  neuter 2/30 exact; -race green · #66 REWRITTEN; B10 +2 (chain
+  identity-by-luck; mirror the dispatch split) · ocfwrite fold
+  COMMITTED 0229290 (snappy neuter 4/24 exact); fix 51d2db2; docs
+  2f0c8ab · suite+fastavro green every wave; Java absent ·
+  UNCONVERGED (counter 0), freeze stays; next quarantine
+  ce088f4..2f0c8ab · PATTERNS 149.9KB at cap. Narrative: archive
+  (2026-07-25 #2).
+- 2026-07-25 · 2f0c8ab · FULL (read-only), LINE-WALK CAMPAIGN ·
+  opened with DOUBLE distillation: NOT_BUGS 120.4→115.4KB (#11 #45 #47
+  #59 tombstoned, fully-netted, verbatim to archive 2026-07-25 #3),
+  PATTERNS B27 tombstoned + stale fuzz-triage class count FOUR→FIVE ·
+  net GREEN: 952 differential PASS, 0 fail, 0 `missing optional
+  dependency`, 47 documented-constraint skips; fastavro 1.12.2
+  (/tmp/fastavro_venv, cramjam+zstandard present); Java oracle NOT run
+  (no local JRE) · quarantine ce088f4..2f0c8ab: both fix nets
+  neuter-verified as CLAIMS — slabFreeKinds+="string" reds
+  Classifier+Oracle in the PANIC direction, slabFree=false reds all
+  three incl. the claimed 3 mallocs/op, splice-off reds EXACTLY 95 ·
+  slab classifier CLEAN on its held-constant axis (22 schemas × 34
+  targets = 748 cells, 0 panics, 0 nil-vs-pooled lane divergence) and
+  on 11 adversarial construction paths (cache-inherited, all-skip
+  custom, logical-only custom, rebuild, 4 resolve shapes, 8 promotions,
+  splice, lax/empty-name/wrapped spellings) · emission walk CLEAN vs
+  #46 exact-case (5 variants ride, real size:8 survives), #63 stray
+  hybrids (decline→loud), #60 empty-name (`ok.` class coherent),
+  wrapped-ref props/splice (matches SchemaCache splice exactly), and
+  budgets (400-link chain 6ms, 2000-ref fanout 15ms, self-ref
+  self-contained) · behavioral FILED 5, ONE BATCH: (1) hidden
+  refTarget stamp overrides an EDITED exported Type (schema_node.go
+  :1055); (2) valueWalkLimit has no marshaler arm → byte budget
+  bypassed, 128 MiB / 1280 MiB alloc, reproduced through BOTH
+  SchemaNode.Schema and SchemaFor+CustomType.Schema (contradicts #68);
+  (3) non-string-kind map keys uncharged (:814); (4) P20 wrapped-null
+  error-identity divergence across wires (6 spellings); (5) P20
+  wrapped-null omitzero encodes the VALUE branch — empty string where
+  bare encodes null (wire corruption) + #33/#71 lift siblings ·
+  counter STAYS 0, freeze stays · CAMPAIGN derivation EXECUTED-FALSE
+  (23/26 non-test files carry explicit full-walk records): walked
+  doc.go (all 7 doc claims verified TRUE), schema_node.go, and the
+  quarantine drift; REMAINING for next session: schema_for.go (1703,
+  B21-scoped walk only), schema_parse.go/cache.go/ocf.go/
+  custom_type.go/resolve.go post-walk DRIFT hunks · P20 minted +
+  spelling net gap opened · BOTH caps crossed (CORE 58.0KB, PATTERNS
+  151.4KB) → DOUBLE distillation mandated at the top of next round.
+
+## Distillation archive (2026-07-25 #7) — pre-fix-round double distillation (size-guard mandate: CORE 56.0KB / PATTERNS 150.7KB, both crossed)
+
+Compressed two AUDIT_CORE.md prose sections whose operative content is held
+in full elsewhere: §"Re-auditing the patched function after every fix" (the
+detailed playbook is FIX.md; the pattern bodies are AUDIT_PATTERNS 14a/15/16)
+and §"Scope — public-API entry-point coverage" (the recency argument is
+already stated at length in the top-of-document §Scope). Verbatim below.
+
+### AUDIT_CORE.md §"Re-auditing the patched function after every fix" (verbatim)
+
+The detailed playbook lives in FIX.md. The premise: once a fix is in place, the function in its new shape is itself audit territory. Patterns 14a (a recent fix that covered the reported input but not the helper's full set), 15 (a stale dispatcher skip widened by a sibling fix), and 16 (a precision fix that swapped a bounded check for an O(n²) helper without bounding the new caller) all arose this way.
+
+The patched function compares against: its fast/slow twin; its JSON/binary counterpart; the helper docstring it claims to mirror (every shape the helper handles, not the report's — 14a); the dispatchers routing into it (stale skip predicates — 15); the cost of the new path on a hostile 1 MiB input (<100ms reject through each touched entry point — 16); and pattern 1's axes 3 & 4 in BOTH directions (parse-validate + metadata observability — probe recipes in AUDIT_PATTERNS.md "Axes 3 & 4").
+
+Findings surfaced by re-audit ship in the same round; the loop converges only when the fix and its consequences are both clean.
+
+### AUDIT_CORE.md §"Scope — public-API entry-point coverage" (verbatim)
+
+The top-of-document "Scope — read this first" section is the operational rule: whole codebase, never a branch or diff. This section enumerates the public-API entry points that get a walk every round, regardless of when (or whether) they were last touched. The list is the *minimum* coverage — anything else in the codebase is equally in scope.
+
+**Recency is not a signal.** A function untouched since 2022 is exactly as likely to harbor a bug as one rewritten last week. The 2022-era code has had more rounds of "looks fine" sweeps — and "looks fine" is precisely what hides the structurally-invisible bug. Don't let antiquity become camouflage. Don't let recency become a magnet.
+
+Public-API entry points each get a walk regardless of when last touched —
+the minimum coverage list: Decode/DecodeJSON/DecodeSingleObject (safe +
+unsafe variants per Go target type); Encode/AppendEncode/EncodeJSON/
+AppendEncodeJSON/EncodeSingleObject/AppendSingleObject (same split);
+Parse/MustParse/SchemaCache/SchemaFor + options (WithLaxNames,
+WithCustomTypes, ...); Root/Canonical/Fingerprint/JSON/String;
+Resolve/CheckCompatibility; ocf.NewWriter/NewReader (snappy/deflate/zstd,
+WithMaxBlockBytes, WithCodec, WithReaderSchema[Func], WithSchemaOpts);
+single-object encoding (magic-byte framing, fingerprint endianness);
+CustomType/WithCustomTypes at all nested positions; every logical type
+(regular and via custom types); decoder options (TaggedUnions,
+TagLogicalTypes, LinkedinFloats).
+
+### AUDIT_CORE §Round ledger, the five pre-2026-07-23 era lines (verbatim, compressed 2026-07-25 #7)
+
+- 2026-07-01..12 · ea9a2ce→afe3b68 · era: CONVERGED→RESET (#53); #54 #55; #56–#60 FILED→FIXED; FULL clean ×2 → RE-CONVERGED; #61 + FEATURE × WALKER census (308 cells).
+- 2026-07-13..15 · 18988c2→c6f75a2 · era: keyless defs; #62; #63 stray family; #64 census; #65 #66 trust boundary; #38 ext; quarantine 5 FILED→FIXED (#46 EXT; #67 ×2; #68).
+- 2026-07-16..19 · 6a5b8ee→8d59ca9 · era: walker descents kind-gated ×3 + 360-cell stray matrix; addTypeAliases CI-fold (#46 fifth surface); CI reserved-key POLICY kept (later flipped); B36 class NEW + canonicalizing copy/kind-fixup twins (#69) + ~70-cell caller-value census + FuzzTreeValueTwinParity; cache stray-position def poisoning FIXED (census back-fill rule minted).
+- 2026-07-20..21 · 489e8ce→882c817 · era: stray dedup/render/splice family (5 rulings, all FIXED, #63 +3 clauses); R1 registry minted (8 questions × 7 representations) + R1-Q7 stray-body re-decode DoS FIXED; P19 NEW, FILED then FIXED + splice def-wins determinism; POLICY FLIP (#46 re-ruled): reserved-key EXACT-lowercase, variant-of-required rejects loud, fold/pick REMOVED.
+- 2026-07-22..23 · 882c817→c428ae3 · era: quarantine of the flip CLEAN; capture-getter fabrication + non-string logicalType FILED→FIXED (#70); #71 field precision/scale consumed-conditional FILED (re-confirmed ×3) → FIXED, strayPS 630-cell matrix, neuter ×5, NOT_BUGS tombstones ×6.
+
+## Distillation archive (2026-07-25 #8) — AUDIT_PATTERNS P20 compression (size-guard mandate: PATTERNS 151.2KB, over the ~150KB cap)
+
+P20 was compressed after its family closed: both representations now route through a shared predicate and three nets (two matrices + a foreign differential) guard it, so the per-instance narratives are history rather than working material. The entry keeps the structural question, the grep-the-literal probe, the representation list, and the standing one-predicate-per-representation lesson. Verbatim pre-compression text below.
+
+### AUDIT_PATTERNS.md entry 20, verbatim
+
+20. **A predicate keys on ONE SPELLING of a type whose grammar admits several, so semantically identical schemas take different code paths.** Avro spells the same type more than one way: bare `"null"` and wrapped `{"type":"null"}` are the same branch (likewise `"int"` / `{"type":"int"}`), and the wrapped form may additionally carry props or a logicalType. The parser stores them in DIFFERENT fields — `aschema.primitive` is set only for the bare form, the wrapped form lands in `aschema.object`, and the metadata tree normalizes both into `SchemaNode.kind` — so a predicate written `x.primitive == "null"` silently means "bare null only", while its cross-wire twin written `x.kind == "null"` sees both. Invisible to every round-trip and wire net, because the two spellings produce IDENTICAL wire bytes; only the derived artifacts diverge (selected ser/deser arm, `fieldMeta`, lift target, consume verdict, error identity). Invisible to a matrix whose union fragments are all bare-spelled — spelling is the held-CONSTANT axis (B32). Probe: **grep the LITERAL, not the accessor** — `grep -n '== "null"'` over non-test files, then classify each hit by REPRESENTATION. An accessor-shaped sweep (`\.primitive ==\|\.kind ==\|\.Type ==`) covers only the parsed/compiled node and is structurally blind to the third representation: the pre-Parse composed JSON tree of `any`, where a branch is an `[]any` ELEMENT (`union[0] == "null"`) with no field to name. For each hit ask "which spellings does the parser produce for this type, and does this comparison see all of them?"; cross the two sides of any pair documented as agreeing (binary vs JSON dispatch) on EVERY spelling, not just the bare one. Three representations to enumerate: parsed `aschema` (bare vs wrapped fields) · compiled `schemaNode.kind` (normalized) · pre-Parse `any` tree (SchemaFor composition, cache splice) — a shared-predicate fix reaches only the representations that CALL it. Netted by `TestMatrix_NullBranchSpellingParity` (the spelling axis crossed into the existing union matrices) plus per-symptom pins; the null family is fixed by the one shared `aschema.isNullBranch` predicate every as-written null-branch decision routes through. Instances (all executed, all FIXED 2026-07-25): the binary null-union selection `len(s.union)==2 && s.union[i].primitive=="null"` vs the JSON no-match arity split `node.branches[i].kind=="null"` — error identity diverged for wrapped-null unions after the identity unification closed the bare case; the same selection gates `buildNullUnionMeta`, so `omitzero` on a wrapped `[T,{"type":"null"}]` encoded the VALUE branch (empty string) instead of null; `liftFieldLogicalIntoType` and `fieldDecimalLiftConsumesPrecisionScale` both `continue` on `branch.primitive == "null"`, so a wrapped null branch is mistaken for the first NON-null branch and absorbs the #33/#71 lift. **Third-representation instances (FILED + FIXED 2026-07-25, the round AFTER the shared-predicate fix): `schema_for.go`'s `union[0] == "null"` (inferField null-first fill) and `u[0] == "null"` (inferType pointer collapse) — neither is an accessor, so the fix round's accessor sweep was blind to both; a `*T` field whose CustomType schema is a props-carrying wrapped-null union emitted `["null",[...]]` and SchemaFor HARD-FAILED on nested unions, and its non-pointer twin dropped the `"default":null` Java/fastavro require explicitly (fastavro executed: rejected the emitted schema). Fixed by `isNullBranchTree`, the `any`-tree mirror of `isNullBranch`; netted by TestMatrix_SchemaForNullBranchSpellingParity (96 cells) + TestDifferentialFastavroSchemaForNullSpelling (foreign readresolve over the EMITTED schema). Lesson: one shared predicate per representation is the ceiling — a fix routed through a predicate reaches only the representations that call it, so the sweep must enumerate representations, not call sites.**
+
+## Distillation archive (2026-07-25 #9) — the three-fix round's ledger line, verbatim
+
+- 2026-07-25 · b66d101 (START head — b66d101..HEAD quarantines the fix
+  commits landed after this line) · FIX (3, ruling-directed) ·
+  FRAMEWORK AMENDMENT FIRST: §Convergence + §Round ledger now require a
+  FIX line to record its START head, because a line carrying its own
+  post-fix HEAD makes the next round compute an EMPTY scope and clears a
+  fix generation that was never quarantined ("exactly once, not zero
+  times") · ACCOUNTING CORRECTION: fa349c7 / 539dcc5 / d620116 were
+  auto-cleared that way and join this round's commits as the next
+  quarantine scope · opened with double distillation (CORE two prose
+  sections + 5 era ledger lines → archive 2026-07-25 #7; PATTERNS P20
+  compressed → #8): CORE 56.0→55.6KB, PATTERNS 150.7→149.5KB · F1+F2 ONE
+  ROOT — new `isNullBranchTree` (bare `"null"` OR a map whose `"type"` is
+  `"null"`; props/logicalType inert), the `any`-tree mirror of
+  `isNullBranch`, routed through BOTH askers (pointer collapse :1455,
+  null-first fill :1160) · representation sweep EXECUTED by the QUESTION:
+  every `== "null"` in non-test code classified — parsed `aschema`
+  (isNullBranch, authority) · compiled/metadata kind (normalized by
+  construction) · pre-Parse `any` tree (the two fixed sites); cache.go's
+  tree sites are name-REFERENCE classification, not null decisions; post-
+  fix grep shows no tree-level null decision outside the shared predicate
+  · F3 — `checkSkipDirectiveExact` extracted and called from BOTH tag
+  readers after their exact `tag == "-"` skip, so plain "-" still skips
+  (pinned as a control on both paths, both name modes) · 14a CENSUS
+  EXECUTED: 14 guards × 2 paths × 2 name modes = 56 cells, exactly 4 red
+  pre-fix, all the same guard on the embed path — every other named-path
+  guard was already reached · red-then-green throughout (39 + 4 + 6 red
+  first) · neuters DISJOINT by CALL SITE: A pointer-collapse 18 leaf
+  fails {PointerCollapse, SpellingParity}; B default-fill 36
+  {NullFirstDefault, SpellingParity, DifferentialFastavro — the foreign
+  oracle reds ONLY here}; C embed-guard 10 {TagGuardPathCensus,
+  EmbeddedSkipDirective} · nets: TestMatrix_SchemaForNullBranchSpellingParity
+  (96 cells, REUSES schemaForScopeCell — which gained variadic opts so a
+  cell can vary the name validator) + TestDifferentialFastavroSchemaForNull
+  Spelling (5 RUN, 0 SKIP; canonical + readresolve arms) +
+  TestRegression_SkipDirectiveGuardIsSchemaForScoped (immunity control:
+  reflect.go's runtime mapper is untouched, never reds) · a differential
+  arm caught a TEST bug first (writer/reader record names must match —
+  the bare CONTROL failed, which is the tell) · SchemaFor × spelling gap
+  CLOSED · docs: CustomType.Schema gains the spelling-agnostic statement,
+  NOT_BUGS #16 gains the emission clause (twmb infers the implicit null
+  default, Java/fastavro do not, so SchemaFor must WRITE it), P20
+  compressed to its probe + the one-predicate-per-representation lesson ·
+  suite + fastavro green after every edit (0 fail, 0 `missing optional
+  dependency`); -race green on the new families; Java absent ·
+  UNCONVERGED (counter 0), freeze stays.
+
+## Distillation archive (2026-07-25 #10) — the three 2026-07-25 campaign ledger lines, verbatim (compressed when the fix round's line crossed the CORE cap)
+
+- 2026-07-25 · 2f0c8ab · FULL (read-only), campaign cont'd: walked
+  schema_node.go + the quarantine drift; behavioral FILED 5 in ONE
+  BATCH (refTarget stamp vs edited Type; valueWalkLimit marshaler-arm
+  budget bypass ×2 surfaces; non-string-kind map keys uncharged; P20
+  wrapped-null error identity; P20 wrapped-null omitzero wire
+  corruption) — all five FIXED by the next line · P20 minted; spelling
+  net gap opened · Ledger verbatim: archive (2026-07-25 #6).
+- 2026-07-25 · 2f0c8ab→b66d101 · FIX (5, ruling-directed):
+  opened with DOUBLE distillation (CORE era-compression; PATTERNS B8
+  tombstone; archive 2026-07-25 #4) · F5+F4 ONE ROOT — new shared
+  `aschema.isNullBranch` (bare `"null"` OR `{"type":"null"}`;
+  props/logicalType INERT on a null, decided + pinned) answers all four
+  as-written null-branch DECISIONS across five call sites
+  (isNullableUnion; liftFieldLogicalIntoType;
+  fieldDecimalLiftConsumesPrecisionScale; the buildUnion 2-branch
+  selection, both arms); json_codec.go untouched as ruled (zero diff)
+  and now agrees; omitzero encodes NULL, #33 time.Time and #71 *big.Rat
+  encode again · repo-wide sweep: every `.kind ==` reads the compiled
+  node (conforms by construction), remaining `.primitive` sites are
+  rendering dispatch covering both arms (canonical+fingerprint parity
+  EXECUTED); the only `primitive == "null"` left is inside the predicate
+  · F2+F3 — `marshalEmitLen` + `mapKeyEmitLen` close the two unmirrored
+  json.Marshal emission routes; measurement bounded (stop at first
+  over-budget → ONE image, not N); #69 opacity intact · F1 — splice
+  honors the stamp only while `nodeRefTargetAgrees`; edited Type wins; no
+  new API · sibling claim EXECUTED: only CustomType + SchemaNode pair
+  exported fields with hidden state, frozen by
+  TestInvariant_HiddenStateOnPublicStructs · red-then-green throughout;
+  neuters D/E/F DISJOINT · CLASS net
+  TestMatrix_NullBranchSpellingParity REUSES matFrags × matCtxs (519
+  cells / 1380 checks); spelling net gap CLOSED (re-opened for the
+  SchemaFor representation the next round) · docs: #68 enforcement
+  clause, spelling-agnostic clauses on #33/#66/#71, P20 minted ·
+  COMMITTED fa349c7 (null spelling), 539dcc5 (budget charging), d620116
+  (stamp agreement), b66d101 (docs); framework .md files remain UNTRACKED
+  (pre-existing; `git grep` cannot see them — maintainer's call) ·
+  suite+fastavro green after every edit; FULL -race green; Java absent ·
+  UNCONVERGED (counter 0). Narrative: archive (2026-07-25 #5).
+- 2026-07-25 · b66d101 · FULL (read-only), LINE-WALK CAMPAIGN COMPLETE ·
+  opened with CORE distillation 56.8→53.5KB (three superseded ledger
+  lines compressed, verbatim to archive 2026-07-25 #6); PATTERNS 149.6KB
+  under cap · net GREEN: suite 0 fail, 952 differential PASS / 16 skip /
+  0 fail, 0 `missing optional dependency`; fastavro 1.12.2
+  (/tmp/fastavro_venv, cramjam+zstandard present); Java oracle NOT run
+  (no local JRE — every Java-facing conclusion is verified-modulo-Java)
+  · quarantine EMPTY (HEAD == the newest ledger line's HEAD) · WALK
+  REMAINDER FINISHED: schema_for.go first full 1703-line walk + the five
+  post-walk drift hunks (schema_parse.go, cache.go, ocf/ocf.go,
+  custom_type.go, resolve.go) — every non-test file now carries a
+  full-walk record · behavioral FILED 3, ONE BATCH, all in schema_for.go:
+  (1) inferType pointer collapse `u[0] == "null"` → wrapped-null custom
+  union emits a nested union, SchemaFor HARD-FAILS (:1404); (2)
+  inferField null-first fill `union[0] == "null"` → wrapped twin drops
+  `"default":null`, fastavro EXECUTED rejects the emitted schema (:1134);
+  (3) the "-" skip-directive exact-match guard (:784) sits below the
+  anonymous-embed branch, so an embedded `-,opt` bypasses it — under
+  WithLaxNames it silently emits a field named `"-"` the user asked to
+  skip · all three gated (fa349c7 touched schema.go only; introducing
+  commits 606f4a9/3b62a71/4037240 months out of range; no NOT_BUGS
+  entry, no pin) · CLEAN, structural reason named: maybeWrapResolvedNode's
+  dropped size/items/values/symbols unobservable (4 kinds × 8 surfaces —
+  metadata reads retained JSON, wire reads copied closures); stray-shape
+  memo keyed on freshly-unmarshaled maps (no aliasing/nil-map key); cache
+  props-merge writes a deepCopyTree not the stored def; ocf
+  writeFull/checkedReader/noEOF swept complete (2/2 writes, 2/2 readers,
+  10/10 EOF paths); custom_type.go drift doc-only, 3 new claims EXECUTED
+  TRUE (#68 pins the other 2) · P20 Probe REWRITTEN (grep the LITERAL not
+  the accessor; 3 representations named) · SchemaFor × spelling gap
+  OPENED · counter STAYS 0, freeze stays · PROCESS NOTE: findings 1–2 are
+  direct siblings of fa349c7, which the quarantine could not have caught —
+  a FIX round ledgering its own HEAD clears its commits without ever
+  quarantining them; the walk, not the quarantine, found them. Amended
+  into §Convergence the next round.
