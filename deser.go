@@ -121,6 +121,30 @@ func (s *slab) string(src []byte, n int) string {
 
 var slabPool = sync.Pool{New: func() any { return &slab{} }}
 
+// slabFreeKinds are the scalar leaf kinds whose desers never touch the
+// *slab, for any logical type and any target: the slab's string buffer is
+// used only by string decodes (setStringValue / readMapKey / readOneString),
+// its depth guard is bumped only at recursive dispatch (union / record /
+// array / map), and its remaining state is written only by option parsing
+// and custom-decoder wrappers. A schema whose top-level kind is in this set
+// therefore has no slab-touching path at all — barring custom wiring, which
+// Schema.slabFree excludes separately — and Decode passes a nil slab
+// (verified two-sidedly by TestSlabFreeMatchesNilSlabOracle: every frag ×
+// ctx cell must decode nil-slab iff classified slab-free). "string" is
+// deliberately absent; "bytes" is safe because a string TARGET of a bytes
+// schema copies via string(b), not the slab.
+var slabFreeKinds = map[string]bool{
+	"null":    true,
+	"boolean": true,
+	"int":     true,
+	"long":    true,
+	"float":   true,
+	"double":  true,
+	"bytes":   true,
+	"fixed":   true,
+	"enum":    true,
+}
+
 // put resets sl's per-call state and returns it to the pool. The buf field
 // is intentionally retained so subsequent callers reuse its backing memory.
 func (sl *slab) put() {
@@ -175,6 +199,15 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, errors.New("decode requires a non-nil pointer")
+	}
+	// Slab-free schemas (scalar leaves, no custom wiring) never touch the
+	// slab, so skip the pool entirely: a nil slab keeps scalar decodes
+	// allocation-free even when GC has drained the pool. Opts only ever
+	// alter slab state (and are inert outside union paths, which are never
+	// slab-free), so their mere presence takes the pooled path to keep the
+	// nil-slab proof trivial.
+	if s.slabFree && len(opts) == 0 {
+		return s.deser(src, rv.Elem(), nil)
 	}
 	sl := slabPool.Get().(*slab)
 	if len(opts) > 0 {

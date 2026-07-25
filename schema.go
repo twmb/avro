@@ -82,6 +82,17 @@ type Schema struct {
 	// keying on len(custom) alone resurrected the decode-only re-encode
 	// failure (3333e9b) for cache-parsed custom-typed writers.
 	customBaked bool
+
+	// slabFree marks a schema whose compiled deser provably never touches
+	// the per-call *slab: a scalar leaf kind (see slabFreeKinds) with no
+	// custom-decoder wiring anywhere (customBaked covers both this parse's
+	// overlay and cache-inherited wraps). Decode skips the slab pool for
+	// such schemas and passes a nil slab, so scalar decodes stay
+	// allocation-free even when GC has drained the pool (issue #41). The
+	// zero value false is the safe default: a construction path that does
+	// not classify (Resolve's non-identity path, whose promote/skip
+	// routines do use the slab) keeps the pool.
+	slabFree bool
 }
 
 // customWiring bundles the per-node custom-type artifacts. Allocated
@@ -300,6 +311,7 @@ func parse(schema string, b *builder) (*Schema, error) {
 		custom:      b.custom,
 		customBaked: len(b.custom) > 0 || b.sawInheritedCustom,
 	}
+	s.slabFree = slabFreeKinds[b.node.kind] && !s.customBaked
 	s.soe[0] = 0xC3
 	s.soe[1] = 0x01
 	h := NewRabin()
