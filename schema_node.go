@@ -33,6 +33,15 @@ import (
 // A named type (record, enum, fixed) that has already been defined
 // elsewhere in the schema can be referenced by setting Type to its full
 // name (e.g. com.example.Address) with no other fields.
+//
+// In a tree obtained from [Schema.Root], such references also work the
+// other way around: converting ANY node of the tree with
+// [SchemaNode.Schema] resolves references against the schema the tree
+// came from, so a field's type, a union branch, or any deeper node
+// converts to a working schema even when the referenced definition lives
+// outside the extracted node. Hand-built trees have no enclosing schema:
+// there, every referenced name must be defined somewhere in the tree
+// being converted, or Schema returns an error.
 type SchemaNode struct {
 	Type        string // Avro type or named type reference
 	LogicalType string // e.g. date, timestamp-millis, decimal, uuid; empty if none (or if the attribute's value is not a string — see Props)
@@ -99,6 +108,18 @@ type SchemaNode struct {
 	// round-tripping through Schema() and Root(), because JSON has
 	// no NaN literal. ±Inf round-trips correctly as float64(±Inf).
 	Props map[string]any
+
+	// refTarget is set only by [Schema.Root], on nodes whose Type is a
+	// name reference, and points at the referenced definition inside the
+	// same Root tree. [SchemaNode.Schema] reads it to emit the referenced
+	// definition when the tree being converted does not define the name
+	// itself, which is what lets a node extracted at ANY depth of a Root
+	// tree convert to a working schema: the definition its references
+	// need travels with the node. It is invisible otherwise: hand-built
+	// nodes leave it nil (a dangling reference stays a loud parse error),
+	// struct copies and slice extractions carry it, and a node rebuilt
+	// field-by-field drops it (the rebuilt node then behaves hand-built).
+	refTarget *SchemaNode
 }
 
 // SchemaField represents a field in an Avro record schema.
@@ -156,6 +177,19 @@ type SchemaField struct {
 // the fullname as a reference. Two types sharing a short name across
 // namespaces are distinct and both emit full definitions.
 //
+// A node extracted from a [Schema.Root] tree may contain name references
+// whose definitions live elsewhere in the enclosing schema — an earlier
+// field, a prior [SchemaCache] parse, or the enclosing type itself for a
+// recursive schema. Those resolve automatically: the referenced
+// definition is emitted at the reference's first occurrence, so the
+// result is self-contained and needs neither the enclosing schema nor
+// any cache. A name the tree defines itself always wins over the
+// enclosing schema's definition, and custom properties on a wrapped
+// reference ride onto the emitted definition (reserved attributes at the
+// usage site do not survive, matching the SchemaCache splice). Hand-built
+// nodes carry no enclosing schema, so a reference the tree does not
+// define is an error there.
+//
 // opts are passed through to the internal [Parse]: a schema originally
 // parsed with [SchemaOpt]s that change what Parse accepts or wires —
 // [WithLaxNames] for non-standard names, [CustomType] registrations —
@@ -185,6 +219,16 @@ type deduper struct {
 	defined map[string]*SchemaNode   // fullname → first definition's node
 	visited map[*SchemaNode]struct{} // seen *SchemaNode pointers (cycle detection)
 	err     error                    // first conflict or cycle encountered
+
+	// localNames holds the fullname of every named type DEFINED somewhere
+	// in the tree being converted, collected up front (collectLocalNames).
+	// The refTarget splice consults it so a reference whose definition is
+	// present in the tree — before OR after the reference position — is
+	// emitted as-written and binds to that local definition on re-parse
+	// (forward references included), exactly as it does today. Only a
+	// reference to a name the tree nowhere defines splices the stamped
+	// target in.
+	localNames map[string]bool
 }
 
 // Root returns a SchemaNode tree describing the parsed schema. All
@@ -213,6 +257,12 @@ type deduper struct {
 // [SchemaField.Props]. [SchemaNode.Schema] rebuilds the nested form, which
 // parses to the same schema.
 //
+// Every node of the returned tree converts back to a usable [*Schema]
+// via [SchemaNode.Schema], including nodes whose type is a name
+// reference: the tree carries the schema's named-type definitions with
+// it, so extracting a field's type, a union branch, or any deeper node
+// yields a self-contained schema.
+//
 // Root re-parses the JSON on each call. Cache the result if you need
 // to access it repeatedly (e.g. in a per-message processing loop).
 func (s *Schema) Root() SchemaNode {
@@ -225,7 +275,13 @@ func (s *Schema) Root() SchemaNode {
 	// those bodies, so a shared memo keeps the walk linear instead of
 	// re-validating each subtree once per enclosing level.
 	n := nodeFromJSON(raw, "", make(strayShapeMemo))
-	fixupNameRefDefaults(&n)
+	table := fixupNameRefDefaults(&n)
+	// Stamp every name-reference node with its resolved target so a
+	// sub-tree extracted from this Root converts via [SchemaNode.Schema]
+	// even when the referenced definition lives outside the extraction.
+	// The table is the same one the default fixup resolved through, so the
+	// two surfaces cannot bind a reference differently.
+	stampNameRefs(&n, table, "")
 	return n
 }
 
@@ -234,6 +290,8 @@ func (s *Schema) Root() SchemaNode {
 // definition; subsequent occurrences emit the name as a reference.
 func (n *SchemaNode) toJSONDedup(d *deduper) any {
 	b := newWalkBudget()
+	d.localNames = make(map[string]bool)
+	collectLocalNames(n, d.localNames, make(map[*SchemaNode]struct{}), 0)
 	return n.toJSONWalk(d.visited, d, "", 0, &b, false)
 }
 
@@ -982,6 +1040,65 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// The namespace scope inside this node: a named type opens its own.
 	childNS := nsForChildren(n, enclosingNS)
 
+	// Name-reference resolution (the hidden Root stamp): a reference to a
+	// name this tree does not define emits the stamped definition at its
+	// first occurrence — walked through this same budgeted, cycle-checked,
+	// deduped recursion — and the fullname thereafter, so a sub-tree
+	// extracted from a Root converts to a self-contained schema. Gated on
+	// d != nil (conflict snapshots stay splice-free on both sides of a
+	// comparison) and !stray (the wire parser binds no names at stray
+	// positions). References the tree DOES define locally — before or
+	// after this position — stay as-written and re-bind to the local
+	// definition, preserving today's output byte-for-byte for
+	// self-contained trees (forward references included).
+	refType := n.Type
+	if d != nil && !stray && n.refTarget != nil && nodeIsNameRefShape(n) {
+		if fn := nodeFullname(n.refTarget); fn != "" && !d.localNames[fn] {
+			if _, emitted := d.defined[fn]; !emitted {
+				// The target walk gets a FRESH visited map: a recursive
+				// definition reaches back through the extraction point
+				// (splicing Node re-enters the union the outer walk is
+				// still inside), a revisit that is finite — the target
+				// registers in d.defined before walking its children, so
+				// every name splices at most once and interior re-visits
+				// terminate at the fullname arm — but that the shared
+				// map's cycle arm would misread as an unnamed cycle.
+				// True cycles inside the target are still caught by the
+				// fresh map, and the shared depth ceiling and node/byte
+				// budgets bound the whole emission either way.
+				spliced := n.refTarget.toJSONWalk(make(map[*SchemaNode]struct{}), d, enclosingNS, depth, b, false)
+				// A wrapped reference's custom properties ride onto the
+				// spliced definition — definition-wins, reserved keys
+				// dropped — the same treatment the SchemaCache splice
+				// gives wrapper props (inlineTreeDefs's wrapper arm).
+				if m2, ok := spliced.(map[string]any); ok && len(n.Props) > 0 {
+					defTyp, _ := m2["type"].(string)
+					defLogical, _ := m2["logicalType"].(string)
+					for k, v := range n.Props {
+						if !b.takeBytes(len(k)) {
+							d.fail(errSchemaTreeBytes())
+							continue
+						}
+						pv := boundedSerializableValue(d, depth, b, v)
+						if schemaReservedKeyForObject(k, pv, defTyp, defLogical, nil) {
+							continue
+						}
+						if _, has := m2[k]; has {
+							continue
+						}
+						m2[k] = pv
+					}
+				}
+				return spliced
+			}
+			// Already emitted (an earlier splice, or the walk passed the
+			// definition): reference it by fullname — the spelling that
+			// re-binds exactly regardless of the standalone parse's
+			// namespace scope at this position.
+			refType = fn
+		}
+	}
+
 	switch n.Type {
 	case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
 		// Bare-string emission requires STRUCTURAL emptiness too: a
@@ -1004,7 +1121,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		!isNamedKind(n.Type) &&
 		n.Type != "union" && n.LogicalType == "" && len(n.Props) == 0 &&
 		n.Items == nil && n.Values == nil && len(n.Fields) == 0 {
-		return n.Type
+		return refType
 	}
 
 	// Dedup: remember this named type's node for the next occurrence's
@@ -1022,7 +1139,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		}
 	}
 
-	m := map[string]any{"type": n.Type}
+	m := map[string]any{"type": refType}
 	// A named KIND always emits its name — including the empty short name
 	// a user WithLaxNames fn can accept — mirroring the canonical emitter
 	// (appendCanonObject) and the parser, for which a missing and an empty
@@ -1554,13 +1671,99 @@ func lookupNameRef(t *SchemaNode, table map[string]*SchemaNode, ns string) *Sche
 // HasDefault fields with the table so name-referenced defaults (and
 // defaults whose union contains a name-ref branch) materialize the
 // way inline-typed siblings already do via the synchronous coerce.
-func fixupNameRefDefaults(root *SchemaNode) {
+// The table is returned for Root's reference stamping, so both surfaces
+// resolve through the identical name set.
+func fixupNameRefDefaults(root *SchemaNode) map[string]*SchemaNode {
 	table := map[string]*SchemaNode{}
 	collectNamedTypes(root, table)
 	if len(table) == 0 {
-		return
+		return table
 	}
 	coerceTreeDefaults(root, table, "")
+	return table
+}
+
+// stampNameRefs records, on every node whose Type is a name reference
+// that resolves in table, the referenced definition (SchemaNode.refTarget).
+// Resolution is lookupNameRef — the same scopedRefKeys precedence every
+// other resolver derives from — at the reference's enclosing namespace
+// scope, so the stamp cannot bind differently than the wire or the
+// default coercion did. Descent is kind-bound like collectNamedTypes:
+// a stray-surfaced body (an "items" on an "int") neither defines nor
+// references, so nothing inside one is stamped. Root trees are
+// JSON-derived and acyclic, and their depth is bounded by the parse's
+// own nesting cap, so the plain recursion terminates.
+func stampNameRefs(n *SchemaNode, table map[string]*SchemaNode, ns string) {
+	if n == nil || len(table) == 0 {
+		return
+	}
+	if t := lookupNameRef(n, table, ns); t != nil {
+		n.refTarget = t
+	}
+	child := nsForChildren(n, ns)
+	if n.Type == "array" {
+		stampNameRefs(n.Items, table, child)
+	}
+	if n.Type == "map" {
+		stampNameRefs(n.Values, table, child)
+	}
+	if isRecordKind(n.Type) {
+		for i := range n.Fields {
+			stampNameRefs(&n.Fields[i].Type, table, child)
+		}
+	}
+	for i := range n.Branches {
+		stampNameRefs(&n.Branches[i], table, child)
+	}
+}
+
+// collectLocalNames gathers the fullnames of every named type defined in
+// n's tree, descending the same kind-bound structure the emission walk
+// treats as non-stray. Unlike collectNamedTypes it must survive arbitrary
+// hand-built input, because it runs at the START of [SchemaNode.Schema],
+// before the emission walk's own cycle and depth guards: visited
+// terminates Items/Values pointer cycles, and depth stops chains past the
+// emission walk's own ceiling (names below it sit in a region the walk
+// rejects before any splice could consult them).
+func collectLocalNames(n *SchemaNode, names map[string]bool, visited map[*SchemaNode]struct{}, depth int) {
+	if n == nil || depth > maxSchemaJSONDepth {
+		return
+	}
+	if _, ok := visited[n]; ok {
+		return
+	}
+	visited[n] = struct{}{}
+	if isNamedKind(n.Type) {
+		if fn := nodeFullname(n); fn != "" {
+			names[fn] = true
+		}
+	}
+	if n.Type == "array" {
+		collectLocalNames(n.Items, names, visited, depth+1)
+	}
+	if n.Type == "map" {
+		collectLocalNames(n.Values, names, visited, depth+1)
+	}
+	if isRecordKind(n.Type) {
+		for i := range n.Fields {
+			collectLocalNames(&n.Fields[i].Type, names, visited, depth+1)
+		}
+	}
+	for i := range n.Branches {
+		collectLocalNames(&n.Branches[i], names, visited, depth+1)
+	}
+}
+
+// nodeIsNameRefShape reports whether n can be emitted as a pure name
+// reference (bare, or wrapped with custom properties): no structural,
+// naming, or kind-specific keys of its own. A stamped node that fails
+// this (a hand-mutated tree grafted structure onto a reference) renders
+// as-written instead of splicing, so nothing it carries is silently
+// discarded — the re-parse then judges the hybrid loudly.
+func nodeIsNameRefShape(n *SchemaNode) bool {
+	return n.Name == "" && n.Items == nil && n.Values == nil &&
+		n.Fields == nil && n.Branches == nil && n.Symbols == nil &&
+		n.Size == 0 && !n.HasEnumDefault
 }
 
 func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {

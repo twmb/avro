@@ -32,7 +32,10 @@ import (
 //
 // The returned [*Schema] from each Parse call is fully resolved and
 // independent of the cache — it can be used for [Schema.Encode] and
-// [Schema.Decode] without the cache.
+// [Schema.Decode] without the cache. That independence extends to
+// sub-schemas: a node extracted from the returned schema's [Schema.Root]
+// tree converts via [SchemaNode.Schema] with every cross-parse reference
+// resolved, so the cache is never needed again once Parse returns.
 //
 // [WithLaxNames] is sticky across the cache: if a type is defined with
 // WithLaxNames, pass WithLaxNames to every later Parse that references it.
