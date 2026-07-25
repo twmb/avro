@@ -561,10 +561,34 @@ type aschema struct {
 	union     []aschema
 }
 
+// isNullBranch reports whether s is the "null" type, in EITHER spelling the
+// grammar admits: the bare `"null"` primitive or the wrapped object form
+// `{"type":"null"}`. The two are the same type — they select the same union
+// branch and encode to the same bytes — so every decision made by matching a
+// branch's written spelling routes through here, and none of them may see
+// only the bare form.
+//
+// Props and a logicalType on a wrapped null are inert metadata and do NOT
+// make it a non-null branch: Avro defines no null logical type, so nothing
+// downstream can consume either key, and the branch's type and wire form are
+// unchanged. Deciding it the other way would make `[{"type":"null","x":1},T]`
+// a two-non-null-branch union whose first branch encodes zero bytes — a shape
+// no other reader agrees with.
+//
+// The compiled tree answers the same question as schemaNode.kind, which
+// normalizes both spellings; this is the as-written (pre-build) view of that
+// same fact, so the two cannot disagree.
+func (s *aschema) isNullBranch() bool {
+	if s.primitive == "null" {
+		return true
+	}
+	return s.object != nil && s.object.Type == "null"
+}
+
 // isNullableUnion reports whether s is a union whose first branch is "null".
 // Per the Avro spec, such unions implicitly default to null.
 func (s *aschema) isNullableUnion() bool {
-	return len(s.union) >= 2 && s.union[0].primitive == "null"
+	return len(s.union) >= 2 && s.union[0].isNullBranch()
 }
 
 // aschema, aobject, and afield are populated by parseSchemaTree
@@ -669,7 +693,7 @@ func (f *afield) liftFieldLogicalIntoType() {
 		// duplicate union member).
 		for i := range f.Type.union {
 			branch := &f.Type.union[i]
-			if branch.primitive == "null" {
+			if branch.isNullBranch() {
 				continue
 			}
 			switch {
@@ -726,7 +750,7 @@ func (f *afield) fieldDecimalLiftConsumesPrecisionScale() bool {
 	case len(t.union) > 0:
 		for i := range t.union {
 			b := &t.union[i]
-			if b.primitive == "null" {
+			if b.isNullBranch() {
 				continue
 			}
 			// First non-null branch only, mirroring the lift.
@@ -2280,11 +2304,11 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	}
 
 	switch {
-	case len(s.union) == 2 && s.union[0].primitive == "null":
+	case len(s.union) == 2 && s.union[0].isNullBranch():
 		b.ser = serNullUnion(ser)
 		b.deser = deserNullUnion(deser)
 		b.meta = b.buildNullUnionMeta(parentName, missing, branchMetas, 1, false)
-	case len(s.union) == 2 && s.union[1].primitive == "null":
+	case len(s.union) == 2 && s.union[1].isNullBranch():
 		b.ser = serNullSecondUnion(ser)
 		b.deser = deserNullSecondUnion(deser)
 		b.meta = b.buildNullUnionMeta(parentName, missing, branchMetas, 0, true)
