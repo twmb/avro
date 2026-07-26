@@ -403,6 +403,38 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q8",
+		question: "Does this struct tag SKIP the field?",
+		authority: "no external authority: `tag == \"-\"` is spelled identically at all four sites and the " +
+			"invariant is AGREEMENT between the two subsystems — SchemaFor decides what a generated schema " +
+			"CONTAINS, the runtime field mapper decides what an encode/decode BINDS, and a field excluded by " +
+			"one must be excluded by the other",
+		answerers: []censusAnswerer{
+			{repr: "SchemaFor, named-field path", site: `tag == "-"`, file: "schema_for.go"},
+			{repr: "SchemaFor, anonymous-embed path", site: `tag == "-"`, file: "schema_for.go"},
+			{repr: "runtime mapper, both paths", site: `tag == "-"`, file: "reflect.go"},
+			{
+				repr: "grammar guard (SchemaFor only)", site: "checkSkipDirectiveExact", file: "schema_for.go",
+				note: "different-by-design and SINGLE-answerer by intent: rejecting a tag that begins with the directive without being it is a typo SchemaFor can name while generating. The runtime mapper has never enforced tag grammar — it takes any tag as a field name, which is what it does with every other malformed tag — so extending the guard there would be a behavior change to a documented boundary, not a consistency fix. Both directions are asserted so neither side can drift into the other.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `tag == "-"`, counts: map[string]int{
+				// The two paths, plus one occurrence inside the guard's own
+				// doc comment describing where it is called from.
+				"schema_for.go": 3,
+				"reflect.go":    2, // the runtime mapper's two paths
+			}},
+			{pattern: `checkSkipDirectiveExact`, counts: map[string]int{
+				// Definition, both call sites, and two doc references.
+				"schema_for.go": 5,
+			}},
+			// Rejected tell: `HasPrefix(tag` — it also matches the
+			// "default=" option scan, a different question entirely, and it
+			// misses the exact-match skips that are the agreement invariant.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -1944,5 +1976,177 @@ func TestCensus_Q15_CorpusIsNotVacuous(t *testing.T) {
 	}
 	if named < 4 || unnamed < 8 || rec < 2 {
 		t.Fatalf("corpus is lopsided: named=%d unnamed=%d record=%d", named, unnamed, rec)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q8 — does this struct tag skip the field?
+// ---------------------------------------------------------------------
+
+// Two subsystems read avro struct tags and each reads them on two
+// structurally distinct paths: SchemaFor's named-field and anonymous-embed
+// paths decide what a GENERATED schema contains, and the runtime field
+// mapper's two paths decide what an encode/decode BINDS. All four spell the
+// exact-match skip as `tag == "-"`, and they must agree — a subsystem that
+// stopped skipping would put back a field the caller excluded, on one side
+// only.
+//
+// This was flagged as a possible demotion (one answerer, no external
+// authority). Grepping the RULE's shape rather than the helper's name
+// disproves that: `tag == "-"` appears at reflect.go 481 and 510 and
+// schema_for.go 725 and 784. What IS single-answerer is the GRAMMAR guard
+// (checkSkipDirectiveExact), and its scope is deliberate — see the
+// different-by-design cell below.
+type skipTagCell struct {
+	name string
+	// schemaFor renders a schema from a type carrying the tag; mapped
+	// reports whether the runtime mapper binds a field of that name.
+	schemaHas func(t *testing.T) (rendered string, buildErr error)
+	mapped    func(t *testing.T) bool
+}
+
+type skipNamed struct {
+	A int `avro:"a"`
+	B int `avro:"-"`
+}
+
+type skipInner struct {
+	C int `avro:"c"`
+}
+
+type skipEmbed struct {
+	A         int `avro:"a"`
+	skipInner `avro:"-"`
+}
+
+// TestCensus_Q8_SkipDirectiveAgreesAcrossSubsystems requires the generated
+// schema and the runtime binding to agree that a plain "-" skips, on both
+// the named-field and the anonymous-embed path.
+func TestCensus_Q8_SkipDirectiveAgreesAcrossSubsystems(t *testing.T) {
+	t.Run("named field", func(t *testing.T) {
+		s, err := SchemaFor[skipNamed]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if strings.Contains(s.String(), `"b"`) || strings.Contains(s.String(), `"B"`) {
+			t.Errorf("SchemaFor emitted the skipped field: %s", s.String())
+		}
+		// The runtime mapper registers NO target for a skipped field, which
+		// the strict decoder surfaces as "missing field" on a schema that
+		// carries one. That error IS the skip: an unskipped sibling binds.
+		full := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"B","type":"int"}]}`)
+		wire, err := full.Encode(map[string]any{"a": int32(1), "B": int32(9)})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got skipNamed
+		_, err = full.Decode(wire, &got)
+		if err == nil {
+			t.Errorf("the runtime mapper bound a field the tag skips: B = %d", got.B)
+		} else if !strings.Contains(err.Error(), "missing field B") {
+			t.Errorf("want the no-target error for the skipped field, got: %v", err)
+		}
+		// Control: the same struct against the schema SchemaFor generates
+		// for it — the two subsystems agreeing is exactly the invariant.
+		gen, err := SchemaFor[skipNamed]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		genWire, err := gen.Encode(skipNamed{A: 1, B: 9})
+		if err != nil {
+			t.Fatalf("encode against the generated schema: %v", err)
+		}
+		var rt skipNamed
+		if _, err := gen.Decode(genWire, &rt); err != nil {
+			t.Fatalf("the generated schema must round-trip its own type: %v", err)
+		}
+		if rt.A != 1 || rt.B != 0 {
+			t.Errorf("round trip through the generated schema = %+v; the skipped field must not travel", rt)
+		}
+	})
+
+	t.Run("anonymous embed", func(t *testing.T) {
+		s, err := SchemaFor[skipEmbed]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if strings.Contains(s.String(), `"c"`) {
+			t.Errorf("SchemaFor inlined a skipped embedded struct: %s", s.String())
+		}
+		full := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"c","type":"int"}]}`)
+		wire, err := full.Encode(map[string]any{"a": int32(1), "c": int32(9)})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got skipEmbed
+		_, err = full.Decode(wire, &got)
+		if err == nil {
+			t.Errorf("the runtime mapper bound a field inside a skipped embed: C = %d", got.C)
+		} else if !strings.Contains(err.Error(), "missing field c") {
+			t.Errorf("want the no-target error for the skipped embed's field, got: %v", err)
+		}
+		gen, err := SchemaFor[skipEmbed]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		genWire, err := gen.Encode(skipEmbed{A: 1})
+		if err != nil {
+			t.Fatalf("encode against the generated schema: %v", err)
+		}
+		var rt skipEmbed
+		if _, err := gen.Decode(genWire, &rt); err != nil {
+			t.Fatalf("the generated schema must round-trip its own type: %v", err)
+		}
+	})
+}
+
+type skipSuffixNamed struct {
+	A int `avro:"a"`
+	B int `avro:"-,omitzero"`
+}
+
+// The GRAMMAR guard is deliberately scoped to SchemaFor, and this asserts
+// BOTH directions of that split so neither side can drift into the other.
+// SchemaFor rejects a tag that starts with the directive without being it,
+// because that is a typo it can name; the runtime mapper has never enforced
+// tag grammar and treats the tag as a field name, which is what every other
+// malformed tag does there. Collapsing either way would be a behavior change
+// to a documented boundary, not a consistency fix.
+func TestCensus_Q8_GrammarGuardIsSchemaForScoped(t *testing.T) {
+	if _, err := SchemaFor[skipSuffixNamed](); err == nil {
+		t.Error("SchemaFor must reject a tag that begins with the skip directive without being exactly it")
+	} else if !strings.Contains(err.Error(), "exact-match only") {
+		t.Errorf("reject does not name the directive rule: %v", err)
+	}
+
+	// The runtime mapper takes it as a field name and binds nothing unless
+	// the schema happens to carry that name — no grammar error either way.
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	wire, err := s.Encode(map[string]any{"a": int32(1)})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got skipSuffixNamed
+	if _, err := s.Decode(wire, &got); err != nil {
+		t.Errorf("the runtime mapper must not enforce tag grammar, but it errored: %v", err)
+	}
+	if got.A != 1 {
+		t.Errorf("the sibling field did not bind: %+v", got)
+	}
+}
+
+// Both paths and both subsystems must actually be exercised, and the
+// exact-match boundary needs its near-miss.
+func TestCensus_Q8_CorpusIsNotVacuous(t *testing.T) {
+	if _, err := SchemaFor[skipNamed](); err != nil {
+		t.Fatalf("the named-path control does not build: %v", err)
+	}
+	if _, err := SchemaFor[skipEmbed](); err != nil {
+		t.Fatalf("the embed-path control does not build: %v", err)
+	}
+	// The near-miss must differ from the directive, or the guard test is
+	// asserting nothing.
+	if reflect.TypeFor[skipSuffixNamed]().Field(1).Tag.Get("avro") == "-" {
+		t.Fatal("the near-miss tag IS the directive; the grammar guard cell tests nothing")
 	}
 }
