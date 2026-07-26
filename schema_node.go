@@ -1940,7 +1940,6 @@ func nodeRefTargetAgrees(n *SchemaNode) bool {
 	return lookupNameRef(n, map[string]*SchemaNode{fn: t}, n.refNS) == t
 }
 
-
 func collectNamedTypes(n *SchemaNode, table map[string]*SchemaNode) {
 	if n == nil {
 		return
