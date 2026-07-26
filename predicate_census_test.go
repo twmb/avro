@@ -294,6 +294,41 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q10",
+		question: "Is this Go value nil-equivalent — does it encode as Avro null?",
+		authority: "isNilValue (ser.go) is the shared predicate, and its own doc enumerates the five dispatch " +
+			"sites that must agree. serNull peels SEPARATELY rather than calling it, and the two have drifted: " +
+			"a fix once claimed parity but added only Interface peeling, leaving &nilPtr rejected",
+		answerers: []censusAnswerer{
+			{repr: "reflect value, shared predicate", site: "isNilValue", file: "ser.go"},
+			{
+				repr: "binary null encoder", site: "serNull's own peel loop", file: "ser.go",
+				note: "different-by-design as an IMPLEMENTATION, not as an answer: serNull is the null type's encoder and runs before any union dispatch, so it cannot consult a predicate written for the union arms without inverting the call order. It owes the identical accept set, which the driver checks by routing the same values through the try-each path.",
+			},
+			{repr: "JSON null arm + 2-branch short-circuit", site: "appendAvroJSON / appendAvroJSONUnion", file: "json_codec.go"},
+			{
+				repr: "unsafe struct fast path", site: "usNullUnionEnter / usArrayNullUnionPtr", file: "unsafe.go",
+				note: "different-by-design: it holds an unsafe.Pointer, not a reflect.Value, so it CANNOT call isNilValue. It tests only the outer pointer — which equals isNilValue exactly when the inner kind is not itself nilable — and its tryCompileFieldSer gate declines every isNilableKind inner to the reflect path. That is lockstep by exclusion rather than by sharing, and the struct-field driver is what proves the exclusion holds.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `isNilValue`, counts: map[string]int{
+				"ser.go":        13,
+				"json_codec.go": 5,
+				"unsafe.go":     4,
+				"reflect.go":    1,
+			}},
+			{pattern: `isNilableKind`, counts: map[string]int{
+				"ser.go":    5,
+				"unsafe.go": 4,
+			}},
+			// Rejected tell: `IsNil()` — 41 hits across 11 files, and most
+			// answer a different question entirely (is this reflect.Value
+			// safe to deref, is this pointer field set). A tell that broad
+			// cannot fail for THIS question.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -1363,5 +1398,214 @@ func TestCensus_Q5_CorpusIsNotVacuous(t *testing.T) {
 	if unions < 4 || wrappedNull < 1 || preAnnotated < 2 || nonCarrier < 3 {
 		t.Fatalf("corpus misses a navigation class: unions=%d wrappedNull=%d preAnnotated=%d nonCarrier=%d",
 			unions, wrappedNull, preAnnotated, nonCarrier)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q10 — is this Go value nil-equivalent (does it encode as Avro null)?
+// ---------------------------------------------------------------------
+
+// isNilValue's own doc names five dispatch sites that must agree on what
+// counts as nil: the binary 2-branch [null,T] optimization, the binary
+// try-each path through serNull, the JSON 2-branch short-circuit, the JSON
+// try-each "null" arm, and the unsafe struct fast path. Four of them are
+// reachable by choosing the schema shape and the wire; the fifth is chosen
+// by the builder from the target's shape, so it gets a struct cell.
+//
+// serNull peels separately from isNilValue rather than calling it, and the
+// two have drifted before — a fix once claimed to bring serNull "into
+// parity" but added only Interface peeling, leaving &nilPtr rejected.
+type nilShapeCell struct {
+	name  string
+	value func() any
+	isNil bool
+}
+
+func nilShapeCorpus() []nilShapeCell {
+	return []nilShapeCell{
+		{"untyped-nil", func() any { return nil }, true},
+		{"typed-nil-pointer", func() any { return (*string)(nil) }, true},
+		{"pointer-to-nil-pointer", func() any { p := (*string)(nil); return &p }, true},
+		{"any-wrapping-typed-nil", func() any { var a any = (*string)(nil); return a }, true},
+		{"nil-map", func() any { return map[string]string(nil) }, true},
+		{"nil-slice", func() any { return []string(nil) }, true},
+		{"nil-chan", func() any { return (chan int)(nil) }, true},
+		{"nil-func", func() any { return (func())(nil) }, true},
+		{"pointer-to-nil-map", func() any { m := map[string]string(nil); return &m }, true},
+		{"deep-nil-pointer-chain", func() any {
+			p := (*string)(nil)
+			pp := &p
+			ppp := &pp
+			return &ppp
+		}, true},
+		{"plain-string", func() any { return "s" }, false},
+		{"empty-string", func() any { return "" }, false},
+		{"pointer-to-string", func() any { s := "s"; return &s }, false},
+		{"pointer-to-empty-string", func() any { s := ""; return &s }, false},
+	}
+}
+
+// nilVerdictOf reports whether the schema encoded v as its NULL branch. The
+// schemas are chosen so the null branch is index 0, whose binary tag byte is
+// 0x00 and whose JSON form is the bare literal null.
+func nilVerdictOf(t *testing.T, schema string, v any, jsonWire bool) (tookNull, encoded bool) {
+	t.Helper()
+	s, err := Parse(schema)
+	if err != nil {
+		t.Fatalf("Parse(%s): %v", schema, err)
+	}
+	var out []byte
+	if jsonWire {
+		out, err = s.EncodeJSON(v)
+	} else {
+		out, err = s.Encode(v)
+	}
+	if err != nil {
+		return false, false
+	}
+	if jsonWire {
+		return string(out) == "null", true
+	}
+	return len(out) == 1 && out[0] == 0x00, true
+}
+
+// TestCensus_Q10_NilEquivalenceAgreesAcrossDispatchSites requires every site
+// to reach the same verdict as the shared predicate. A site that disagrees
+// encodes a value as null where another encodes it as data, or rejects it
+// outright — the same Go value meaning two different things depending on the
+// union's arity or the wire format.
+func TestCensus_Q10_NilEquivalenceAgreesAcrossDispatchSites(t *testing.T) {
+	const (
+		twoBranch   = `["null","string"]`
+		threeBranch = `["null","string","long"]`
+	)
+	for _, cell := range nilShapeCorpus() {
+		t.Run(cell.name, func(t *testing.T) {
+			// The predicate itself, called directly.
+			predicate := isNilValue(reflect.ValueOf(cell.value()))
+			if predicate != cell.isNil {
+				t.Fatalf("isNilValue = %v, want %v — the corpus and the predicate disagree before any dispatch site is asked", predicate, cell.isNil)
+			}
+
+			sites := map[string]bool{}
+			for _, site := range []struct {
+				name   string
+				schema string
+				asJSON bool
+			}{
+				{"binary 2-branch optimization", twoBranch, false},
+				{"binary union try-each dispatcher", threeBranch, false},
+				{"JSON 2-branch short-circuit", twoBranch, true},
+				{"JSON try-each null arm", threeBranch, true},
+			} {
+				tookNull, encoded := nilVerdictOf(t, site.schema, cell.value(), site.asJSON)
+				if !encoded && cell.isNil {
+					t.Errorf("%s REJECTED a nil-equivalent value that isNilValue accepts", site.name)
+					continue
+				}
+				sites[site.name] = tookNull
+			}
+			// serNull itself is NOT reachable through a union: serUnion.ser
+			// short-circuits on isNilValue before trying any branch, so a
+			// union cell measures the predicate rather than serNull's own
+			// peel. The bare "null" schema is the only path that reaches it,
+			// and it is the site that has actually drifted.
+			bare, err := Parse(`"null"`)
+			if err != nil {
+				t.Fatalf("Parse null: %v", err)
+			}
+			out, encErr := bare.Encode(cell.value())
+			serNullAccepted := encErr == nil && len(out) == 0
+			if serNullAccepted != cell.isNil {
+				t.Errorf("serNull (bare \"null\" schema) accepted=%v, isNilValue says %v — the null encoder's own peel disagrees with the shared predicate (err %v)",
+					serNullAccepted, cell.isNil, encErr)
+			}
+			sites["serNull via bare null schema"] = serNullAccepted
+
+			for name, tookNull := range sites {
+				if tookNull != cell.isNil {
+					t.Errorf("%s encoded null=%v, but isNilValue says %v — the dispatch sites disagree: %v",
+						name, tookNull, cell.isNil, sites)
+				}
+			}
+		})
+	}
+}
+
+// The fifth site is chosen by the BUILDER from the target's shape, not by the
+// schema, so it needs a struct whose field is a nullable pointer. Its own
+// documented contract is that it cannot call isNilValue (it holds an
+// unsafe.Pointer, not a reflect.Value) and instead declines every nilable
+// inner kind to the reflect path — so the agreement it owes is that a struct
+// field reaches the same verdict as the bare value did above.
+func TestCensus_Q10_StructFieldPathAgrees(t *testing.T) {
+	type holder struct {
+		F *string `avro:"f"`
+	}
+	type holderMap struct {
+		F map[string]string `avro:"f"`
+	}
+	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":["null","string"]}]}`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sm, err := Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"map","values":"string"}]}]}`)
+	if err != nil {
+		t.Fatalf("Parse map holder: %v", err)
+	}
+
+	for _, c := range []struct {
+		name  string
+		sch   *Schema
+		v     any
+		isNil bool
+	}{
+		{"nil-pointer-field", s, holder{}, true},
+		{"set-pointer-field", s, holder{F: new(string)}, false},
+		{"nil-map-field", sm, holderMap{}, true},
+		{"empty-map-field", sm, holderMap{F: map[string]string{}}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			bin, err := c.sch.Encode(c.v)
+			if err != nil {
+				t.Fatalf("binary: %v", err)
+			}
+			jsn, err := c.sch.EncodeJSON(c.v)
+			if err != nil {
+				t.Fatalf("json: %v", err)
+			}
+			binNull := len(bin) == 1 && bin[0] == 0x00
+			jsonNull := string(jsn) == `{"f":null}`
+			if binNull != c.isNil || jsonNull != c.isNil {
+				t.Errorf("struct-field path disagrees: binary null=%v json null=%v, want %v (binary %x, json %s)",
+					binNull, jsonNull, c.isNil, bin, jsn)
+			}
+		})
+	}
+}
+
+// The corpus must span every nilable KIND the predicate accepts plus the
+// indirection shapes that once broke it, and must contain non-nil controls —
+// otherwise "everything is nil" passes.
+func TestCensus_Q10_CorpusIsNotVacuous(t *testing.T) {
+	var nils, nonNils int
+	kinds := map[reflect.Kind]bool{}
+	for _, c := range nilShapeCorpus() {
+		if c.isNil {
+			nils++
+		} else {
+			nonNils++
+		}
+		if rv := reflect.ValueOf(c.value()); rv.IsValid() {
+			kinds[rv.Kind()] = true
+		}
+	}
+	for _, k := range []reflect.Kind{reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func} {
+		if !kinds[k] {
+			t.Errorf("corpus never exercises the nilable kind %v, which isNilableKind accepts", k)
+		}
+	}
+	if nils < 6 || nonNils < 3 {
+		t.Fatalf("corpus is lopsided: %d nil, %d non-nil", nils, nonNils)
 	}
 }
