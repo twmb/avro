@@ -3,6 +3,7 @@ package avro
 import (
 	"encoding"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -758,10 +759,11 @@ func errSchemaTreeBytes() error {
 
 // valueWalkLimit result codes.
 const (
-	valueWalkOK       = iota // safe to hand to jsonSerializableValue / json.Marshal
-	valueWalkTooDeep         // nests past the depth budget (stack-overflow risk)
-	valueWalkTooWide         // expands to too many nodes (fan-out / json.Marshal cost)
-	valueWalkTooLarge        // expands to too many payload bytes (json.Marshal output size)
+	valueWalkOK        = iota // safe to hand to jsonSerializableValue / json.Marshal
+	valueWalkTooDeep          // nests past the depth budget (stack-overflow risk)
+	valueWalkTooWide          // expands to too many nodes (fan-out / json.Marshal cost)
+	valueWalkTooLarge         // expands to too many payload bytes (json.Marshal output size)
+	valueWalkBadMapKey        // a map key json.Marshal's key resolver cannot name
 )
 
 // valueWalkLimit walks v — a Props value or a SchemaField.Default, an arbitrary
@@ -845,23 +847,57 @@ func marshalEmitLen(rv reflect.Value) (int, bool) {
 	return 0, false
 }
 
-// mapKeyEmitLen reports the bytes json.Marshal emits for one map key. Its key
-// resolver checks the string KIND first — a string-kind key marshals as its
-// raw string and any MarshalText on it is not consulted — then
-// encoding.TextMarshaler, then integer formatting. Every key is charged;
-// none is free.
-func mapKeyEmitLen(k reflect.Value) int {
+// mapKeyEmitLen reports the bytes json.Marshal emits for one map key, and
+// whether its key resolver can name the key at all.
+//
+// The arms mirror encoding/json's resolveKeyName IN ORDER, GUARDS INCLUDED,
+// because that function is the authority on what a key emits: string KIND
+// first (a string-kind key marshals as its raw string and any MarshalText on
+// it is not consulted), then encoding.TextMarshaler, then integer
+// formatting. Charging only the arms it is convenient to model leaves the
+// rest free; skipping the guards is worse, because a guard is the arm that
+// keeps a legal value from being handed to code that cannot take it.
+//
+// The nil-pointer guard is the one that matters: a nil pointer key whose
+// type has a pointer-receiver MarshalText is an ordinary Go value, and
+// json.Marshal resolves it to "" WITHOUT calling the method. Calling it
+// dereferences nil — a panic raised INSIDE the walk whose whole purpose is
+// to make an arbitrary caller-supplied tree safe to marshal.
+//
+// The final arm is resolveKeyName's `panic("unexpected map key type")`,
+// reached by a key that named no arm — a nil interface key in a
+// map[encoding.TextMarshaler]V, which json's encoder-construction check
+// admits (the interface implements itself) and its resolver then cannot
+// name. The walk reports it as a named error instead, which is also what
+// the key kinds json rejects at encoder construction (float, array, a
+// struct with no text method) now get: this budget's contract is that every
+// key is accounted for, so "json cannot emit this key" is a verdict the
+// walk owns, not a panic to forward.
+func mapKeyEmitLen(k reflect.Value) (int, bool) {
 	if k.Kind() == reflect.String {
-		return k.Len()
+		return k.Len(), true
 	}
 	if k.CanInterface() {
 		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
-			if out, err := tm.MarshalText(); err == nil {
-				return len(out)
+			if k.Kind() == reflect.Pointer && k.IsNil() {
+				return 0, true // resolved to "" without calling the method
 			}
+			out, err := tm.MarshalText()
+			if err != nil {
+				// Left uncharged, like marshalEmitLen: the eventual
+				// json.Marshal surfaces this same error by its own name.
+				return 0, true
+			}
+			return len(out), true
 		}
 	}
-	return 20 // integer kinds: a signed 64-bit decimal is at most 20 bytes
+	switch k.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Uintptr:
+		return 20, true // a signed 64-bit decimal is at most 20 bytes
+	}
+	return 0, false
 }
 
 func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
@@ -901,7 +937,11 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 			// key's Kind: a string-kind key as its raw string, and any other
 			// kind through MarshalText or integer formatting. Charging only
 			// string-kind keys left the rest free (see mapKeyEmitLen).
-			if !b.takeBytes(mapKeyEmitLen(iter.Key())) {
+			n, ok := mapKeyEmitLen(iter.Key())
+			if !ok {
+				return valueWalkBadMapKey
+			}
+			if !b.takeBytes(n) {
 				return valueWalkTooLarge
 			}
 			if r := valueWalkLimit(iter.Value(), depthLeft-1, b); r != valueWalkOK {
@@ -965,6 +1005,9 @@ func boundedSerializableValue(d *deduper, depth int, b *walkBudget, v any) any {
 		return nil
 	case valueWalkTooLarge:
 		d.fail(fmt.Errorf("avro: SchemaNode default/property value expands to more than the supported %d bytes", maxSchemaJSONBytes))
+		return nil
+	case valueWalkBadMapKey:
+		d.fail(errors.New("avro: SchemaNode default/property value contains a map whose key type has no JSON object-key form (not a string kind, an integer kind, or a usable encoding.TextMarshaler)"))
 		return nil
 	}
 	return jsonSerializableValue(v)

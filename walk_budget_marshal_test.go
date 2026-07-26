@@ -21,6 +21,9 @@ package avro
 // vacuously.
 
 import (
+	"encoding"
+	"encoding/json"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -203,5 +206,92 @@ func TestRegression_WalkBudgetMeasurementIsItselfBounded(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bytes") {
 		t.Fatalf("want the byte-budget error, got: %v", err)
+	}
+}
+
+type textKeyVal struct{ s string }
+
+func (k textKeyVal) MarshalText() ([]byte, error) { return []byte(k.s), nil }
+
+type textKeyPtr struct{ s string }
+
+func (k *textKeyPtr) MarshalText() ([]byte, error) { return []byte(k.s), nil }
+
+type namedStringKey string
+
+// callNoPanic runs fn and reports what it produced, converting a panic into
+// an ordinary failure verdict so the two sides can be compared at all. The
+// authority is allowed to panic (its resolver does, on a key it cannot
+// name); this package's walk is not, which is the invariant below.
+func callNoPanic(fn func() (string, error)) (out string, err error, panicked any) {
+	defer func() { panicked = recover() }()
+	out, err = fn()
+	return
+}
+
+// The map-key charge arm exists to mirror encoding/json's resolveKeyName, so
+// that function — not a restatement of its rules — decides every cell here.
+// For each key shape: whatever json.Marshal makes of the value is what
+// SchemaNode.Schema must make of it as a Props value. If json can name the
+// keys, the walk must emit exactly those bytes; if it cannot, the walk must
+// fail with a named error. The walk may never panic, including on the shapes
+// where the authority itself does — a nil pointer key whose type carries a
+// pointer-receiver MarshalText is an ordinary Go value json resolves to ""
+// without calling the method, and a nil interface key is one its resolver
+// admits and then cannot name.
+//
+// Single-key maps throughout: with one key there is no ordering question, so
+// a byte comparison against the authority is exact.
+func TestRegression_WalkBudgetMapKeyMatchesJSONKeyResolver(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		v    any
+	}{
+		{"string-kind", map[string]int{"a": 1}},
+		{"named-string-kind", map[namedStringKey]int{"a": 1}},
+		{"int-negative", map[int]int{-1: 1}},
+		{"int64-min", map[int64]int{math.MinInt64: 1}},
+		{"uint64-max", map[uint64]int{math.MaxUint64: 1}},
+		{"value-textmarshaler", map[textKeyVal]int{{s: "a"}: 1}},
+		{"pointer-textmarshaler", map[*textKeyPtr]int{{s: "a"}: 1}},
+		{"pointer-textmarshaler-nil", map[*textKeyPtr]int{nil: 1}},
+		{"interface-textmarshaler", map[encoding.TextMarshaler]int{textKeyVal{s: "a"}: 1}},
+		{"interface-textmarshaler-nil", map[encoding.TextMarshaler]int{nil: 1}},
+		{"float-kind", map[float64]int{1.5: 1}},
+		{"array-kind", map[[2]int]int{{1, 2}: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The authority, executed.
+			want, wantErr, wantPanic := callNoPanic(func() (string, error) {
+				b, err := json.Marshal(tc.v)
+				return string(b), err
+			})
+			authorityCanEmit := wantErr == nil && wantPanic == nil
+
+			node := propsNode(tc.v)
+			got, gotErr, gotPanic := callNoPanic(func() (string, error) {
+				s, err := node.Schema()
+				if err != nil {
+					return "", err
+				}
+				return s.String(), nil
+			})
+			if gotPanic != nil {
+				t.Fatalf("SchemaNode.Schema panicked on a Props map key: %v", gotPanic)
+			}
+
+			if !authorityCanEmit {
+				if gotErr == nil {
+					t.Fatalf("json.Marshal cannot emit these keys (err=%v panic=%v) but the walk accepted them: %s", wantErr, wantPanic, got)
+				}
+				return
+			}
+			if gotErr != nil {
+				t.Fatalf("json.Marshal emits %s but the walk rejected it: %v", want, gotErr)
+			}
+			if !strings.Contains(got, `"p":`+want) {
+				t.Fatalf("emitted prop disagrees with json.Marshal:\n got: %s\nwant substring: %s", got, `"p":`+want)
+			}
+		})
 	}
 }
