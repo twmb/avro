@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // SchemaNode is a read-write representation of an Avro schema. It can be
@@ -213,7 +214,7 @@ func (n *SchemaNode) Schema(opts ...SchemaOpt) (*Schema, error) {
 	if d.err != nil {
 		return nil, d.err
 	}
-	b, err := json.Marshal(tree)
+	b, err := marshalSchemaTree(tree)
 	if err != nil {
 		return nil, fmt.Errorf("avro: marshaling schema node: %w", err)
 	}
@@ -820,7 +821,7 @@ const (
 // json.Marshal will surface that same error, and inventing a budget verdict
 // for a value that will never be emitted would reject a tree that actually
 // fails for a different, better-named reason.
-func marshalEmitLen(rv reflect.Value) (int, bool) {
+func marshalEmitLen(rv reflect.Value, limit int) (int, bool) {
 	if !rv.IsValid() || !rv.CanInterface() {
 		return 0, false
 	}
@@ -836,15 +837,154 @@ func marshalEmitLen(rv reflect.Value) (int, bool) {
 		if err != nil {
 			return 0, false
 		}
-		return len(out), true
+		return compactedEmitLen(out, limit), true
 	case encoding.TextMarshaler:
 		out, err := m.MarshalText()
 		if err != nil {
 			return 0, false
 		}
-		return len(out) + 2, true // emitted as a quoted JSON string
+		// Emitted as a quoted JSON string, through the same escaper.
+		return jsonEscapedLenBytes(out, limit) + 2, true
 	}
 	return 0, false
+}
+
+// marshalSchemaTree is the ONE call that turns a rendered schema tree into
+// bytes. The walk budget charges against exactly this emitter's escaping and
+// the census differential derives its expectation from it, so a change here
+// — an Encoder with SetEscapeHTML(false), say — moves the charge and the
+// test that proves the charge together, instead of silently parting them.
+func marshalSchemaTree(tree any) ([]byte, error) { return json.Marshal(tree) }
+
+// asciiEscapedLen is the emitted length of one byte below utf8.RuneSelf.
+// Escaping is byte-LOCAL below RuneSelf — a byte's cost never depends on its
+// neighbours — so this table plus the multi-byte arms below is a complete
+// description of the emitter's string output, and testing all 256 values is
+// a domain proof rather than a sample.
+func asciiEscapedLen(b byte) int {
+	switch b {
+	case '\\', '"', '\b', '\f', '\n', '\r', '\t':
+		return 2 // two-character escape
+	case '<', '>', '&':
+		return 6 // < — the emitter escapes HTML
+	}
+	if b < 0x20 {
+		return 6 // \u00XX
+	}
+	return 1
+}
+
+// jsonEscapedLen reports how many bytes the emitter writes for s's CONTENT
+// (what lands between the quotes), and stops once the running total passes
+// limit, returning a value greater than it.
+//
+// It COUNTS; it never builds. Measuring by emitting would allocate the very
+// image the budget exists to prevent, so the escape rules are restated here
+// rather than delegated to. Restating an authority is the mistake this
+// package works hardest to avoid, and it is permitted only because
+// delegation is impossible for MEASUREMENT — so the restatement carries an
+// executed differential over the authority's complete single-byte domain
+// plus every multi-byte case (census Q9), derived from marshalSchemaTree
+// itself.
+//
+// The early exit is what bounds the scan by the BUDGET instead of by the
+// input: escaping never shrinks a string — every input byte costs at least
+// one output byte — so the total passes limit within limit+1 input bytes. A
+// hostile 1 GiB string is abandoned after ~64 MiB, and the bytes scanned
+// were already resident in the caller's own value.
+func jsonEscapedLen(s string, limit int) int {
+	n := 0
+	for i := 0; i < len(s); {
+		if b := s[i]; b < utf8.RuneSelf {
+			n += asciiEscapedLen(b)
+			i++
+		} else {
+			c, size := utf8.DecodeRuneInString(s[i:])
+			switch {
+			case c == utf8.RuneError && size == 1:
+				n += 6 // invalid UTF-8 is emitted as �
+			case c == ' ' || c == ' ':
+				n += 6 // escaped unconditionally, JSONP safety
+			default:
+				n += size // emitted verbatim
+			}
+			i += size
+		}
+		if n > limit {
+			return n
+		}
+	}
+	return n
+}
+
+// jsonEscapedLenBytes is jsonEscapedLen over a byte slice, for text a
+// TextMarshaler returned (the emitter runs it through the same escaper).
+func jsonEscapedLenBytes(s []byte, limit int) int {
+	n := 0
+	for i := 0; i < len(s); {
+		if b := s[i]; b < utf8.RuneSelf {
+			n += asciiEscapedLen(b)
+			i++
+		} else {
+			c, size := utf8.DecodeRune(s[i:])
+			switch {
+			case c == utf8.RuneError && size == 1:
+				n += 6
+			case c == ' ' || c == ' ':
+				n += 6
+			default:
+				n += size
+			}
+			i += size
+		}
+		if n > limit {
+			return n
+		}
+	}
+	return n
+}
+
+// avroCodepointEscapedLen is the emitted length of a byte slice that the JSON
+// fixup renders as the Avro codepoint string: byte v becomes U+00v, so a byte
+// at or above 0x80 costs the two bytes of its UTF-8 form and everything below
+// costs what the ASCII table says. Charging the value's json-FACING image
+// rather than its Go shape is the rule: a []byte never reaches the emitter as
+// a byte slice.
+func avroCodepointEscapedLen(rv reflect.Value, limit int) int {
+	n := 0
+	for i := range rv.Len() {
+		if b := byte(rv.Index(i).Uint()); b < utf8.RuneSelf {
+			n += asciiEscapedLen(b)
+		} else {
+			n += 2
+		}
+		if n > limit {
+			return n
+		}
+	}
+	return n
+}
+
+// compactedEmitLen upper-bounds what the emitter writes for JSON a
+// json.Marshaler returned. That output is re-scanned by encoding/json's
+// compactor, which escapes <, > and & (one byte becoming six) and U+2028 /
+// U+2029 (three becoming six), and drops insignificant whitespace. Only the
+// GROWTH is counted: ignoring the shrinkage over-charges slightly, which is
+// the safe direction for a cap, and it avoids re-running a JSON scanner.
+func compactedEmitLen(out []byte, limit int) int {
+	n := len(out)
+	for i := 0; i < len(out); i++ {
+		switch c := out[i]; {
+		case c == '<' || c == '>' || c == '&':
+			n += 5
+		case c == 0xE2 && i+2 < len(out) && out[i+1] == 0x80 && out[i+2]&^1 == 0xA8:
+			n += 3
+		}
+		if n > limit {
+			return n
+		}
+	}
+	return n
 }
 
 // mapKeyEmitLen reports the bytes json.Marshal emits for one map key, and
@@ -873,9 +1013,9 @@ func marshalEmitLen(rv reflect.Value) (int, bool) {
 // struct with no text method) now get: this budget's contract is that every
 // key is accounted for, so "json cannot emit this key" is a verdict the
 // walk owns, not a panic to forward.
-func mapKeyEmitLen(k reflect.Value) (int, bool) {
+func mapKeyEmitLen(k reflect.Value, limit int) (int, bool) {
 	if k.Kind() == reflect.String {
-		return k.Len(), true
+		return jsonEscapedLen(k.String(), limit), true
 	}
 	if k.CanInterface() {
 		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
@@ -888,7 +1028,7 @@ func mapKeyEmitLen(k reflect.Value) (int, bool) {
 				// json.Marshal surfaces this same error by its own name.
 				return 0, true
 			}
-			return len(out), true
+			return jsonEscapedLenBytes(out, limit), true
 		}
 	}
 	switch k.Kind() {
@@ -919,7 +1059,7 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 	// json.Marshal's own dispatch, which never descends into such a value.
 	// The value stays marshal-opaque: charging reads the method's output and
 	// discards it, so nothing about its rendering changes.
-	if n, ok := marshalEmitLen(rv); ok {
+	if n, ok := marshalEmitLen(rv, b.bytes); ok {
 		if !b.takeBytes(n) {
 			return valueWalkTooLarge
 		}
@@ -937,7 +1077,7 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 			// key's Kind: a string-kind key as its raw string, and any other
 			// kind through MarshalText or integer formatting. Charging only
 			// string-kind keys left the rest free (see mapKeyEmitLen).
-			n, ok := mapKeyEmitLen(iter.Key())
+			n, ok := mapKeyEmitLen(iter.Key(), b.bytes)
 			if !ok {
 				return valueWalkBadMapKey
 			}
@@ -949,9 +1089,14 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 			}
 		}
 	case reflect.Slice, reflect.Array:
-		if rv.Type().Elem().Kind() == reflect.Uint8 {
-			// []byte/[N]byte → codepoint/base64 scalar; charge its bytes, not a walk.
-			if !b.takeBytes(rv.Len()) {
+		if canonicalByteSliceKind(rv.Type()) || (rv.Kind() == reflect.Array && rv.Type().Elem().Kind() == reflect.Uint8) {
+			// The JSON fixup renders these as the Avro codepoint STRING, so
+			// that is the image to charge — not the Go length. The gate is
+			// the fixup's OWN predicate, so a byte slice whose element type
+			// carries a marshaler (which the fixup declines to rewrite, and
+			// json emits as an ARRAY) falls through to the walk below
+			// instead of being charged as a scalar it never becomes.
+			if !b.takeBytes(avroCodepointEscapedLen(rv, b.bytes)) {
 				return valueWalkTooLarge
 			}
 			return valueWalkOK
@@ -976,9 +1121,10 @@ func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 			}
 		}
 	case reflect.String:
-		// string AND json.Number (type Number string) — charge the content
-		// bytes json.Marshal will copy.
-		if !b.takeBytes(rv.Len()) {
+		// string AND json.Number (type Number string) — charge what the
+		// emitter WRITES, which is the escaped form: a control byte costs
+		// six output bytes, and the emitter escapes HTML.
+		if !b.takeBytes(jsonEscapedLen(rv.String(), b.bytes)) {
 			return valueWalkTooLarge
 		}
 	}

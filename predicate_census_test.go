@@ -49,6 +49,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // censusAnswerer is one site that answers a question. note is empty when the
@@ -196,6 +197,10 @@ var censusRegistry = []censusQuestion{
 		answerers: []censusAnswerer{
 			{repr: "caller `any` tree, budget walk", site: "valueWalkLimit + marshalEmitLen + mapKeyEmitLen", file: "schema_node.go"},
 			{
+				repr: "caller `any` tree, escaped-length scan", site: "jsonEscapedLen / jsonEscapedLenBytes / asciiEscapedLen / avroCodepointEscapedLen / compactedEmitLen", file: "schema_node.go",
+				note: "RESTATES the authority rather than delegating, which this census otherwise treats as the bug. Permitted only because delegation is impossible for MEASUREMENT: asking the emitter how long its output is means producing that output, which is the allocation the budget exists to prevent. The licence is conditional on the executed differential over the authority's COMPLETE domain — every one of the 256 single-byte values, the multi-byte runes, invalid UTF-8, the HTML trio and the two-character escapes — derived from marshalSchemaTree, the package's own emitter, so a future SetEscapeHTML(false) moves the expectation and reds this until the restatement follows. Escaping below utf8.RuneSelf is byte-LOCAL, so per-byte totality is a proof over that part of the domain, not a sample of it.",
+			},
+			{
 				repr: "caller `any` tree, fixup detection", site: "treeValueMarshalOpaque / needsJSONFixupKind", file: "schema_node.go",
 				note: "different-by-design: asks whether a value's JSON form is SELF-DEFINED (so the fixups must leave it alone), not how many bytes it costs. Same authority, different projection of it — a value can be opaque and cheap, or transparent and huge.",
 			},
@@ -214,7 +219,7 @@ var censusRegistry = []censusQuestion{
 				"schema_for.go":  1,
 			}},
 			{pattern: `json.Marshaler`, counts: map[string]int{
-				"schema_node.go": 5,
+				"schema_node.go": 6,
 				// Not an answerer: a COMMENT recording that aschema is
 				// deliberately NOT a json.Marshaler (so the stdlib decoder does
 				// not re-scan each nested subtree).
@@ -622,14 +627,12 @@ type emissionRouteCell struct {
 	openRuling string
 }
 
-// escapeUnderCharge is the recorded open ruling shared by every route whose
-// content is a STRING whose bytes json.Marshal escapes.
-const escapeUnderCharge = "the walk charges a string's CONTENT length while json.Marshal emits its ESCAPED length: " +
-	"a control byte costs six output bytes (\\u00XX) and Go escapes <, > and & the same way by default, so the " +
-	"64 MiB cap admits up to ~384 MiB of emission. NOT_BUGS #68 says the budget is measured against what " +
-	"json.Marshal will EMIT, which this contradicts. Charging exactly needs a per-byte scan (delegating to " +
-	"json.Marshal to measure would allocate the very image the cap exists to prevent); charging the 6x worst " +
-	"case would reject legitimate all-ASCII schemas at a sixth of the documented cap. Maintainer ruling pending."
+// The openRuling machinery below stays even though no question currently
+// uses it: it is how a disagreement with two defensible resolutions gets
+// recorded without either leaving the suite red or letting the question
+// close itself silently. Its first use was the escaped-vs-content byte
+// charge, now FIXED — those cells are ordinary agreement cells again, which
+// is the mechanism working as designed.
 
 func emissionRouteCorpus() []emissionRouteCell {
 	const (
@@ -645,17 +648,17 @@ func emissionRouteCorpus() []emissionRouteCell {
 		// HTML-escaped set becomes < and friends. An all-printable cell
 		// cannot see the difference between charging content and charging
 		// emission.
-		{name: "string-control-bytes", small: strings.Repeat("\x01", lo), large: strings.Repeat("\x01", hi), openRuling: escapeUnderCharge},
-		{name: "string-html-escaped", small: strings.Repeat("<", lo), large: strings.Repeat("<", hi), openRuling: escapeUnderCharge},
-		{name: "string-map-key-control", small: map[string]int{strings.Repeat("\x01", lo): 1}, large: map[string]int{strings.Repeat("\x01", hi): 1}, openRuling: escapeUnderCharge},
+		{name: "string-control-bytes", small: strings.Repeat("\x01", lo), large: strings.Repeat("\x01", hi)},
+		{name: "string-html-escaped", small: strings.Repeat("<", lo), large: strings.Repeat("<", hi)},
+		{name: "string-map-key-control", small: map[string]int{strings.Repeat("\x01", lo): 1}, large: map[string]int{strings.Repeat("\x01", hi): 1}},
 		// []byte reaches json.Marshal as the Avro codepoint STRING, not as a
 		// byte slice, so its emitted size depends on the byte VALUES: ASCII
 		// costs one byte, 0x80-0xFF two (UTF-8), and a control byte six
 		// (\u00XX). The walk charges the raw length, so the three classes
 		// are separate cells — a single ASCII cell would never see it.
 		{name: "byte-slice-ascii", small: []byte(big(lo)), large: []byte(big(hi))},
-		{name: "byte-slice-high", small: bytes.Repeat([]byte{0xff}, lo), large: bytes.Repeat([]byte{0xff}, hi), openRuling: escapeUnderCharge},
-		{name: "byte-slice-control", small: bytes.Repeat([]byte{0x01}, lo), large: bytes.Repeat([]byte{0x01}, hi), openRuling: escapeUnderCharge},
+		{name: "byte-slice-high", small: bytes.Repeat([]byte{0xff}, lo), large: bytes.Repeat([]byte{0xff}, hi)},
+		{name: "byte-slice-control", small: bytes.Repeat([]byte{0x01}, lo), large: bytes.Repeat([]byte{0x01}, hi)},
 		{name: "string-kind-map-key", small: map[string]int{big(lo): 1}, large: map[string]int{big(hi): 1}},
 		{name: "map-value", small: map[string]any{"k": big(lo)}, large: map[string]any{"k": big(hi)}},
 		{name: "slice-element", small: []any{big(lo)}, large: []any{big(hi)}},
@@ -665,6 +668,13 @@ func emissionRouteCorpus() []emissionRouteCell {
 		{name: "json-marshaler-in-slice", small: []any{bigJSONMarshaler{n: lo}}, large: []any{bigJSONMarshaler{n: hi}}},
 		{name: "text-marshaler-map-key", small: map[textKeyVal]int{{s: big(lo)}: 1}, large: map[textKeyVal]int{{s: big(hi)}: 1}},
 		{name: "struct-field-value", small: struct{ F string }{big(lo)}, large: struct{ F string }{big(hi)}},
+		// Routes the escape-aware charge newly has to model: a Marshaler's
+		// output is re-scanned by the compactor, which expands the HTML trio
+		// one byte into six, and a TextMarshaler's output goes through the
+		// same string escaper a plain string does.
+		{name: "json-marshaler-html", small: htmlJSONMarshaler{n: lo}, large: htmlJSONMarshaler{n: hi}},
+		{name: "text-marshaler-control", small: ctrlTextMarshaler{n: lo}, large: ctrlTextMarshaler{n: hi}},
+		{name: "text-marshaler-key-control", small: map[textKeyVal]int{{s: strings.Repeat("\x01", lo)}: 1}, large: map[textKeyVal]int{{s: strings.Repeat("\x01", hi)}: 1}},
 		{name: "nested-two-levels", small: map[string]any{"a": []any{big(lo)}}, large: map[string]any{"a": []any{big(hi)}}},
 	}
 }
@@ -901,4 +911,143 @@ func TestCensus_Q11_CorpusIsNotVacuous(t *testing.T) {
 	if containers < 3 || fieldPos < 1 {
 		t.Fatalf("corpus misses a position class: containers=%d fieldPos=%d", containers, fieldPos)
 	}
+}
+
+// ---------------------------------------------------------------------
+// Q9 differential: the escape-length restatement vs the real emitter
+// ---------------------------------------------------------------------
+
+// jsonEscapedLen restates encoding/json's escape rules instead of delegating
+// to them, because delegation is impossible for MEASUREMENT: asking the
+// emitter how long its output is means producing that output, which is the
+// allocation the budget exists to prevent. A restatement is only allowed
+// with an executed differential over the authority's COMPLETE domain, and
+// that is what this is.
+//
+// Expectations come from marshalSchemaTree — the package's own emitter —
+// not from json.Marshal named directly, so if this package ever switches to
+// an Encoder with SetEscapeHTML(false) the expected values move with it and
+// this test fails until the restatement is updated to match.
+//
+// Escaping below utf8.RuneSelf is byte-LOCAL: a byte's emitted cost never
+// depends on its neighbours. Testing all 256 single-byte values is therefore
+// a proof over that part of the domain rather than a sample of it; the
+// multi-byte cases are enumerated separately below.
+func emittedContentLen(t *testing.T, s string) int {
+	t.Helper()
+	out, err := marshalSchemaTree(s)
+	if err != nil {
+		t.Fatalf("the package emitter rejected %q: %v", s, err)
+	}
+	if len(out) < 2 || out[0] != '"' || out[len(out)-1] != '"' {
+		t.Fatalf("emitter produced a non-string form for %q: %s", s, out)
+	}
+	return len(out) - 2 // strip the quotes; the charge is for content
+}
+
+func TestCensus_Q9_EscapedLenMatchesEmitterOverEveryByte(t *testing.T) {
+	const noLimit = 1 << 30
+	for v := 0; v < 256; v++ {
+		s := string([]byte{byte(v)})
+		want := emittedContentLen(t, s)
+		if got := jsonEscapedLen(s, noLimit); got != want {
+			t.Errorf("byte 0x%02x: jsonEscapedLen=%d, emitter wrote %d", v, got, want)
+		}
+		if got := jsonEscapedLenBytes([]byte{byte(v)}, noLimit); got != want {
+			t.Errorf("byte 0x%02x: jsonEscapedLenBytes=%d, emitter wrote %d", v, got, want)
+		}
+	}
+}
+
+func TestCensus_Q9_EscapedLenMatchesEmitterOnMultiByte(t *testing.T) {
+	const noLimit = 1 << 30
+	for _, s := range []string{
+		"", "plain ascii",
+		"é",          // 2-byte rune
+		"€",          // 3-byte rune
+		"\U0001d11e", // 4-byte rune
+		" ", " ",     // escaped unconditionally
+		"a b c",         // interleaved with plain text
+		"<>&", `"`, `\`, // the HTML trio and the two-character escapes
+		"\x00\x01\x1f", // control run
+		"\n\r\t\b\f",   // the named escapes
+		"\x80",         // lone continuation byte: invalid UTF-8
+		"\xe2\x80",     // truncated 3-byte sequence
+		"\xff\xfe",     // never-valid bytes
+		"a\x80b",       // invalid byte between valid ones
+		"\xf0\x9f\x92", // truncated 4-byte sequence
+		"héllo <world> & \"quotes\"\n",
+	} {
+		want := emittedContentLen(t, s)
+		if got := jsonEscapedLen(s, noLimit); got != want {
+			t.Errorf("%q: jsonEscapedLen=%d, emitter wrote %d", s, got, want)
+		}
+		if got := jsonEscapedLenBytes([]byte(s), noLimit); got != want {
+			t.Errorf("%q: jsonEscapedLenBytes=%d, emitter wrote %d", s, got, want)
+		}
+	}
+}
+
+// The []byte arm charges the value's json-FACING image — the Avro codepoint
+// string the fixup produces — so its differential runs through that fixup.
+func TestCensus_Q9_CodepointEscapedLenMatchesEmitterOverEveryByte(t *testing.T) {
+	const noLimit = 1 << 30
+	for v := 0; v < 256; v++ {
+		raw := []byte{byte(v)}
+		fixed, ok := jsonSerializableValue(raw).(string)
+		if !ok {
+			t.Fatalf("byte 0x%02x: the fixup did not produce a string", v)
+		}
+		want := emittedContentLen(t, fixed)
+		if got := avroCodepointEscapedLen(reflect.ValueOf(raw), noLimit); got != want {
+			t.Errorf("byte 0x%02x: avroCodepointEscapedLen=%d, emitter wrote %d for the codepoint form", v, got, want)
+		}
+	}
+}
+
+// The early exit is what makes the scan bounded by the BUDGET rather than by
+// the input. Proven deterministically rather than by timing: escaping never
+// shrinks, so the running total passes the limit within limit+1 input bytes,
+// and the returned value is therefore the same for inputs of wildly
+// different sizes. A scan without the exit would return a total proportional
+// to its input.
+func TestCensus_Q9_EscapedLenScanIsBoundedByTheLimit(t *testing.T) {
+	const limit = 100
+	var prev int
+	for _, size := range []int{1 << 10, 1 << 16, 1 << 20, 1 << 23} {
+		got := jsonEscapedLen(strings.Repeat("\x01", size), limit)
+		if got > limit+6 {
+			t.Fatalf("size %d: scan returned %d, past limit %d by more than one byte's cost — it did not stop early", size, got, limit)
+		}
+		if prev != 0 && got != prev {
+			t.Fatalf("size %d returned %d but size before returned %d; the result must not depend on input length once the limit is passed", size, got, prev)
+		}
+		prev = got
+	}
+	// And the cost of the whole walk over a value far larger than the budget
+	// stays small, since the scan abandons it.
+	huge := strings.Repeat("\x01", 32<<20) // 32 MiB of 6x-escaping content
+	start := time.Now()
+	b := newWalkBudget()
+	if r := valueWalkLimit(reflect.ValueOf(huge), maxSchemaJSONDepth, &b); r != valueWalkTooLarge {
+		t.Fatalf("a 32 MiB control-byte string must bust the byte budget, got code %d", r)
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Fatalf("rejecting an over-budget string took %v; the scan is not bounded by the budget", el)
+	}
+}
+
+// htmlJSONMarshaler emits JSON whose string content is the HTML trio, which
+// the compactor expands one byte into six.
+type htmlJSONMarshaler struct{ n int }
+
+func (h htmlJSONMarshaler) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + strings.Repeat("<", h.n) + `"`), nil
+}
+
+// ctrlTextMarshaler returns text the string escaper expands six-fold.
+type ctrlTextMarshaler struct{ n int }
+
+func (c ctrlTextMarshaler) MarshalText() ([]byte, error) {
+	return []byte(strings.Repeat("\x01", c.n)), nil
 }
