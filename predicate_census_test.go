@@ -41,6 +41,7 @@ package avro
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 
 	"os"
 	"path/filepath"
@@ -232,6 +233,45 @@ var censusRegistry = []censusQuestion{
 			//     package; a tell that matches everything reports nothing.
 			// The usable pair above is narrow because both names exist ONLY
 			// to answer "does this type define its own JSON form".
+		},
+	},
+	{
+		id:       "Q11",
+		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
+		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
+			"drivers assert is AGREEMENT between the wire formats. Which identity a family carries is policy; a " +
+			"caller who only changes format finding errors.As change its answer is not",
+		answerers: []censusAnswerer{
+			{repr: "binary encode", site: "ser.go's SemanticError construction + semErr", file: "ser.go"},
+			{repr: "JSON encode", site: "json_codec.go's SemanticError construction + semErr", file: "json_codec.go"},
+			{repr: "binary decode", site: "deser.go's SemanticError construction + semErr", file: "deser.go"},
+			{repr: "JSON decode", site: "json_decode.go's SemanticError construction + semErr", file: "json_decode.go"},
+			{
+				repr: "unsafe struct fast paths", site: "unsafe.go's SemanticError construction", file: "unsafe.go",
+				note: "different-by-design as a SITE, not as an answer: the unsafe paths are a compiled specialization of the reflect ones and must produce the IDENTICAL identity. That is asserted by the dual-path suites rather than here, because a census cell cannot choose which path a decode takes — the builder does, by target shape.",
+			},
+			{
+				repr: "resolved decode", site: "resolve.go + promote.go", file: "resolve.go",
+				note: "different-by-design as a SITE: a resolved decode adds writer→reader translation, so its failures include families the natural path has no equivalent of. Its parity with the natural path is the resolved-vs-natural suites' question, not this one.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `&SemanticError{`, counts: map[string]int{
+				"ser.go":         32,
+				"json_codec.go":  10,
+				"deser.go":       30,
+				"json_decode.go": 5,
+				"unsafe.go":      11,
+				"resolve.go":     1,
+				"promote.go":     1,
+				"reflect.go":     6,
+				"custom_type.go": 2,
+				"errors.go":      4,
+			}},
+			// Rejected tell: `semErr(` — it is the CONSTRUCTOR most of these
+			// sites call, so counting it double-counts the same answerers and
+			// misses the ones that build the struct literally. `&SemanticError{`
+			// is the shape a NEW hand-written identity decision takes.
 		},
 	},
 }
@@ -711,11 +751,154 @@ func TestCensus_Q9_CorpusIsNotVacuous(t *testing.T) {
 	if delegating < 3 || nested < 3 || mapKey < 2 {
 		t.Fatalf("corpus misses a route class: delegating=%d nested=%d mapKey=%d", delegating, nested, mapKey)
 	}
+	q9NotVacuousTail(t)
+}
+
+func q9NotVacuousTail(t *testing.T) {
+	t.Helper()
 	// And the walk must actually be measuring something: a cell whose charge
 	// is zero for both twins would pass the delta test vacuously only if the
 	// authority delta were zero, which is separately guarded — but a corpus
 	// where NOTHING is charged means chargedBytes is broken.
 	if got := chargedBytes(t, strings.Repeat("x", 128)); got < 128 {
 		t.Fatalf("chargedBytes reports %d for a 128-byte string; the measurement itself is broken", got)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q11 — what identity does a failure carry?
+// ---------------------------------------------------------------------
+
+// A caller's only programmatic handle on a failure is its IDENTITY: whether
+// it is errors.As-able to *SemanticError, and what that error's Field path
+// says. The same failure reached through the binary and the JSON decoder
+// must present the same handle, or `errors.As` succeeds on one wire and
+// fails on the other for a caller who only changed format.
+//
+// The ENCODE half of this question is already driven by
+// TestMatrix_EncodeErrorIdentityCensus (encode_error_identity_census_test.go).
+// This is the DECODE half, which had only three spot subtests: the same
+// schema and the same VALUE presented on both wires, decoded into a Go
+// target that cannot hold it, so both decoders reach a target-type failure
+// from equivalent input.
+type decodeIdentityCell struct {
+	name   string
+	schema string
+	value  any // encoded to both wires with the schema itself
+	target func() any
+}
+
+func decodeIdentityCorpus() []decodeIdentityCell {
+	return []decodeIdentityCell{
+		{"int-into-string", `"int"`, int32(1), func() any { return new(string) }},
+		{"string-into-int", `"string"`, "s", func() any { return new(int32) }},
+		{"bool-into-string", `"boolean"`, true, func() any { return new(string) }},
+		{"double-into-string", `"double"`, 1.5, func() any { return new(string) }},
+		{"bytes-into-int", `"bytes"`, []byte{1}, func() any { return new(int32) }},
+		{
+			"array-into-string", `{"type":"array","items":"int"}`,
+			[]any{int32(1)}, func() any { return new(string) },
+		},
+		{
+			"map-into-int", `{"type":"map","values":"int"}`,
+			map[string]any{"k": int32(1)}, func() any { return new(int32) },
+		},
+		{
+			"record-into-int",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}]}`,
+			map[string]any{"f": int32(1)}, func() any { return new(int32) },
+		},
+		{
+			// NOT *int32: decoding an enum into an integer target is the
+			// documented ORDINAL behavior and succeeds on both wires, so it
+			// is not a failure family at all. A bool cannot hold a symbol
+			// under any rule.
+			"enum-into-bool",
+			`{"type":"enum","name":"E","symbols":["A","B"]}`,
+			"A", func() any { return new(bool) },
+		},
+		{
+			"fixed-into-int",
+			`{"type":"fixed","name":"F","size":2}`,
+			[]byte{1, 2}, func() any { return new(int32) },
+		},
+		{
+			"record-field-into-string",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}]}`,
+			map[string]any{"f": int32(1)},
+			func() any {
+				return new(struct {
+					F string `avro:"f"`
+				})
+			},
+		},
+	}
+}
+
+// identityOf reduces an error to the handle a caller can act on.
+func identityOf(err error) (semantic bool, field string) {
+	var se *SemanticError
+	if errors.As(err, &se) {
+		return true, se.Field
+	}
+	return false, ""
+}
+
+// TestCensus_Q11_DecodeFailureIdentityAgreesAcrossWires presents the same
+// value on both wires and decodes it into a target that cannot hold it. The
+// invariant is AGREEMENT, not a particular verdict: which identity a family
+// carries is policy (doc.go "# Errors"), but a caller who switches format
+// must not find errors.As changing its answer.
+func TestCensus_Q11_DecodeFailureIdentityAgreesAcrossWires(t *testing.T) {
+	for _, cell := range decodeIdentityCorpus() {
+		t.Run(cell.name, func(t *testing.T) {
+			s, err := Parse(cell.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			bin, err := s.Encode(cell.value)
+			if err != nil {
+				t.Fatalf("corpus value does not encode to binary: %v", err)
+			}
+			jsn, err := s.EncodeJSON(cell.value)
+			if err != nil {
+				t.Fatalf("corpus value does not encode to JSON: %v", err)
+			}
+
+			_, errB := s.Decode(bin, cell.target())
+			errJ := s.DecodeJSON(jsn, cell.target())
+			if errB == nil || errJ == nil {
+				t.Fatalf("both wires must reject this target; binary=%v json=%v", errB, errJ)
+			}
+
+			semB, fieldB := identityOf(errB)
+			semJ, fieldJ := identityOf(errJ)
+			if semB != semJ {
+				t.Errorf("identity disagrees across wires: binary errors.As(*SemanticError)=%v, json=%v\n  binary: %v\n  json:   %v\n  A caller who only changed wire format finds errors.As changing its answer.",
+					semB, semJ, errB, errJ)
+			}
+			if semB && semJ && fieldB != fieldJ {
+				t.Errorf("SemanticError.Field disagrees across wires: binary=%q json=%q\n  binary: %v\n  json:   %v",
+					fieldB, fieldJ, errB, errJ)
+			}
+		})
+	}
+}
+
+// The corpus must span both scalar and CONTAINER targets, and must include a
+// record-FIELD position: the field path is where the two decoders most
+// plausibly diverge, since only one of them threads a field name.
+func TestCensus_Q11_CorpusIsNotVacuous(t *testing.T) {
+	var containers, fieldPos int
+	for _, c := range decodeIdentityCorpus() {
+		if strings.HasPrefix(c.name, "array") || strings.HasPrefix(c.name, "map") || strings.HasPrefix(c.name, "record") {
+			containers++
+		}
+		if strings.Contains(c.name, "field") {
+			fieldPos++
+		}
+	}
+	if containers < 3 || fieldPos < 1 {
+		t.Fatalf("corpus misses a position class: containers=%d fieldPos=%d", containers, fieldPos)
 	}
 }
