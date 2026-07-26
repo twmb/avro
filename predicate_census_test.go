@@ -39,10 +39,12 @@ package avro
 // the point: the registry is the list of places an answer can drift.
 
 import (
+	"bytes"
 	"encoding/json"
 
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -180,6 +182,56 @@ var censusRegistry = []censusQuestion{
 			{pattern: `k.Kind() == reflect.String`, counts: map[string]int{
 				"schema_node.go": 1, // mapKeyEmitLen's string-kind arm
 			}},
+		},
+	},
+	{
+		id:       "Q9",
+		question: "What will json.Marshal emit for this caller-supplied value?",
+		authority: "EXTERNAL: encoding/json. Executed per cell by TestCensus_Q9_EmissionRouteChargeTracksJSON, " +
+			"which compares the walk's charge against json.Marshal's ACTUAL output on the same value. " +
+			"This is the authority behind both of the fixes that motivated the census, and the widest " +
+			"answerer set in the package: the schema-tree budget models json.Marshal's recursion, and " +
+			"anything it fails to model is emitted for free",
+		answerers: []censusAnswerer{
+			{repr: "caller `any` tree, budget walk", site: "valueWalkLimit + marshalEmitLen + mapKeyEmitLen", file: "schema_node.go"},
+			{
+				repr: "caller `any` tree, fixup detection", site: "treeValueMarshalOpaque / needsJSONFixupKind", file: "schema_node.go",
+				note: "different-by-design: asks whether a value's JSON form is SELF-DEFINED (so the fixups must leave it alone), not how many bytes it costs. Same authority, different projection of it — a value can be opaque and cheap, or transparent and huge.",
+			},
+			{
+				repr: "caller `any` tree, canonicalization", site: "canonicalByteSliceKind / sliceElemMarshalPositionDependent", file: "schema_node.go",
+				note: "different-by-design: asks whether a value's marshal is INDISTINGUISHABLE from its canonical twin's, so the tree can be rewritten without changing the emission. Mirrors newSliceEncoder's byte-slice rule and json's addressability rule respectively.",
+			},
+			{
+				repr: "SchemaFor pre-Parse tree", site: "deepCopyJSONTree's slice arm", file: "schema_for.go",
+				note: "different-by-design: the same canonicalization question on the tree SchemaFor composes. It consults the same jsonMarshalerType/textMarshalerType reflect vars rather than re-deriving the rule.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `jsonMarshalerType`, counts: map[string]int{
+				"schema_node.go": 4,
+				"schema_for.go":  1,
+			}},
+			{pattern: `json.Marshaler`, counts: map[string]int{
+				"schema_node.go": 5,
+				// Not an answerer: a COMMENT recording that aschema is
+				// deliberately NOT a json.Marshaler (so the stdlib decoder does
+				// not re-scan each nested subtree).
+				"schema.go": 1,
+			}},
+			// Rejected tells, recorded so the next question's design starts
+			// from evidence rather than from scratch:
+			//   `MarshalText()`        — 4 hits, but reflect.go:161 and
+			//     ser.go:1063 are the AVRO ENCODE path (Q13, text-interface
+			//     precedence). A tell that spans two questions cannot fail
+			//     for one of them.
+			//   `encoding.TextMarshaler` — 16 hits across doc.go, reflect.go
+			//     and ser.go, dominated by that same encode question. Same
+			//     defect, larger.
+			//   `reflect.Kind` switches — matches nearly every walker in the
+			//     package; a tell that matches everything reports nothing.
+			// The usable pair above is narrow because both names exist ONLY
+			// to answer "does this type define its own JSON form".
 		},
 	},
 }
@@ -494,5 +546,176 @@ func TestCensus_Q2_CorpusIsNotVacuous(t *testing.T) {
 	}
 	if inherited < 1 || attr < 1 || nullEscape < 2 || dotted < 2 {
 		t.Fatalf("corpus misses a namespace arrival form: inherited=%d attr=%d nullEscape=%d dotted=%d", inherited, attr, nullEscape, dotted)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q9 — what will json.Marshal emit for this value?
+// ---------------------------------------------------------------------
+
+// chargedBytes runs the schema-tree budget walk over v and reports how many
+// BYTES it charged — the walk's own answer to "how much will json.Marshal
+// emit for this".
+func chargedBytes(t *testing.T, v any) int {
+	t.Helper()
+	b := newWalkBudget()
+	before := b.bytes
+	if r := valueWalkLimit(reflect.ValueOf(v), maxSchemaJSONDepth, &b); r != valueWalkOK {
+		t.Fatalf("walk did not complete over %T (code %d) — the corpus cell must fit the budget", v, r)
+	}
+	return before - b.bytes
+}
+
+// emissionRouteCell is one ROUTE by which content reaches json.Marshal's
+// output, given as a small value and a larger twin that differs ONLY in how
+// much content travels that route. Comparing the two isolates the route: a
+// walk that does not model it charges the same for both while json.Marshal
+// emits the difference.
+type emissionRouteCell struct {
+	name         string
+	small, large any
+	// openRuling, when set, records that this route is KNOWN to under-charge
+	// and the question of what to do about it is with the maintainer. Such a
+	// cell asserts the under-charge still holds, so whichever way the ruling
+	// goes the cell reds and forces this registry to be updated — the
+	// disagreement cannot be silently resolved in either direction.
+	openRuling string
+}
+
+// escapeUnderCharge is the recorded open ruling shared by every route whose
+// content is a STRING whose bytes json.Marshal escapes.
+const escapeUnderCharge = "the walk charges a string's CONTENT length while json.Marshal emits its ESCAPED length: " +
+	"a control byte costs six output bytes (\\u00XX) and Go escapes <, > and & the same way by default, so the " +
+	"64 MiB cap admits up to ~384 MiB of emission. NOT_BUGS #68 says the budget is measured against what " +
+	"json.Marshal will EMIT, which this contradicts. Charging exactly needs a per-byte scan (delegating to " +
+	"json.Marshal to measure would allocate the very image the cap exists to prevent); charging the 6x worst " +
+	"case would reject legitimate all-ASCII schemas at a sixth of the documented cap. Maintainer ruling pending."
+
+func emissionRouteCorpus() []emissionRouteCell {
+	const (
+		lo = 64
+		hi = 4096
+	)
+	big := func(n int) string { return strings.Repeat("v", n) }
+	return []emissionRouteCell{
+		{name: "plain-string", small: big(lo), large: big(hi)},
+		{name: "named-string-kind", small: namedStringKey(big(lo)), large: namedStringKey(big(hi))},
+		// json.Marshal ESCAPES a string's contents, so a byte of content is
+		// not a byte of output: a control byte becomes \u00XX (six), and the
+		// HTML-escaped set becomes < and friends. An all-printable cell
+		// cannot see the difference between charging content and charging
+		// emission.
+		{name: "string-control-bytes", small: strings.Repeat("\x01", lo), large: strings.Repeat("\x01", hi), openRuling: escapeUnderCharge},
+		{name: "string-html-escaped", small: strings.Repeat("<", lo), large: strings.Repeat("<", hi), openRuling: escapeUnderCharge},
+		{name: "string-map-key-control", small: map[string]int{strings.Repeat("\x01", lo): 1}, large: map[string]int{strings.Repeat("\x01", hi): 1}, openRuling: escapeUnderCharge},
+		// []byte reaches json.Marshal as the Avro codepoint STRING, not as a
+		// byte slice, so its emitted size depends on the byte VALUES: ASCII
+		// costs one byte, 0x80-0xFF two (UTF-8), and a control byte six
+		// (\u00XX). The walk charges the raw length, so the three classes
+		// are separate cells — a single ASCII cell would never see it.
+		{name: "byte-slice-ascii", small: []byte(big(lo)), large: []byte(big(hi))},
+		{name: "byte-slice-high", small: bytes.Repeat([]byte{0xff}, lo), large: bytes.Repeat([]byte{0xff}, hi), openRuling: escapeUnderCharge},
+		{name: "byte-slice-control", small: bytes.Repeat([]byte{0x01}, lo), large: bytes.Repeat([]byte{0x01}, hi), openRuling: escapeUnderCharge},
+		{name: "string-kind-map-key", small: map[string]int{big(lo): 1}, large: map[string]int{big(hi): 1}},
+		{name: "map-value", small: map[string]any{"k": big(lo)}, large: map[string]any{"k": big(hi)}},
+		{name: "slice-element", small: []any{big(lo)}, large: []any{big(hi)}},
+		{name: "json-marshaler", small: bigJSONMarshaler{n: lo}, large: bigJSONMarshaler{n: hi}},
+		{name: "text-marshaler", small: bigTextMarshaler{n: lo}, large: bigTextMarshaler{n: hi}},
+		{name: "json-marshaler-in-map", small: map[string]any{"k": bigJSONMarshaler{n: lo}}, large: map[string]any{"k": bigJSONMarshaler{n: hi}}},
+		{name: "json-marshaler-in-slice", small: []any{bigJSONMarshaler{n: lo}}, large: []any{bigJSONMarshaler{n: hi}}},
+		{name: "text-marshaler-map-key", small: map[textKeyVal]int{{s: big(lo)}: 1}, large: map[textKeyVal]int{{s: big(hi)}: 1}},
+		{name: "struct-field-value", small: struct{ F string }{big(lo)}, large: struct{ F string }{big(hi)}},
+		{name: "nested-two-levels", small: map[string]any{"a": []any{big(lo)}}, large: map[string]any{"a": []any{big(hi)}}},
+	}
+}
+
+// TestCensus_Q9_EmissionRouteChargeTracksJSON asserts the walk's model of
+// json.Marshal against json.Marshal itself, per route. The budget exists to
+// bound what json.Marshal will emit, so for every route the charge must grow
+// at least as fast as the real output does: an under-charge means that route
+// is FREE, which is precisely how a value with its own MarshalJSON once
+// cost one node and zero bytes while emitting megabytes.
+//
+// Over-charging is allowed (the walk may be conservative); under-charging is
+// the bug. The comparison is a DELTA rather than an absolute, because the
+// walk deliberately does not charge for structural punctuation — but it
+// cannot decline to charge for content without the delta collapsing.
+func TestCensus_Q9_EmissionRouteChargeTracksJSON(t *testing.T) {
+	for _, cell := range emissionRouteCorpus() {
+		t.Run(cell.name, func(t *testing.T) {
+			// The authority is json.Marshal of what the pipeline actually
+			// hands it: boundedSerializableValue charges the budget and then
+			// returns jsonSerializableValue(v), so the fixups (a []byte
+			// becoming the Avro codepoint string, ±Inf becoming a literal)
+			// are part of the emission the budget is supposed to bound.
+			// Marshaling the raw value instead would compare against bytes
+			// this package never emits.
+			smallOut, err := json.Marshal(jsonSerializableValue(cell.small))
+			if err != nil {
+				t.Fatalf("authority could not marshal the small twin: %v", err)
+			}
+			largeOut, err := json.Marshal(jsonSerializableValue(cell.large))
+			if err != nil {
+				t.Fatalf("authority could not marshal the large twin: %v", err)
+			}
+			authorityDelta := len(largeOut) - len(smallOut)
+			if authorityDelta <= 0 {
+				t.Fatalf("corpus cell is not a growth pair: json.Marshal emitted %d then %d bytes", len(smallOut), len(largeOut))
+			}
+
+			chargedDelta := chargedBytes(t, cell.large) - chargedBytes(t, cell.small)
+
+			if cell.openRuling != "" {
+				// A recorded disagreement. Assert it STILL holds, so that
+				// resolving it either way reds this cell and forces the
+				// registry to be updated — an open question must not be able
+				// to close itself silently.
+				if chargedDelta >= authorityDelta {
+					t.Errorf("route %q no longer under-charges (json +%d, charged +%d) — the recorded open ruling has been resolved in the code; update the registry and delete openRuling.\n  Recorded question: %s",
+						cell.name, authorityDelta, chargedDelta, cell.openRuling)
+				} else {
+					t.Logf("route %q under-charges by %.1fx (json +%d, charged +%d) — RECORDED OPEN RULING: %s",
+						cell.name, float64(authorityDelta)/float64(chargedDelta), authorityDelta, chargedDelta, cell.openRuling)
+				}
+				return
+			}
+
+			if chargedDelta < authorityDelta {
+				t.Errorf("route %q is under-charged: json.Marshal emits %d more bytes for the large twin, the walk charged only %d more.\n  A route the budget does not model is emitted for free, so the cap it advertises does not bound json.Marshal's output.",
+					cell.name, authorityDelta, chargedDelta)
+			}
+		})
+	}
+}
+
+// TestCensus_Q9_CorpusIsNotVacuous proves the corpus reaches the routes that
+// matter: the two DELEGATING routes (a value's own MarshalJSON / MarshalText,
+// which the structural walk never descends into) and the container positions
+// that carry them, plus a non-string map key. Without those, the corpus only
+// exercises the plain structural recursion that was never the bug.
+func TestCensus_Q9_CorpusIsNotVacuous(t *testing.T) {
+	var delegating, nested, mapKey int
+	for _, c := range emissionRouteCorpus() {
+		switch {
+		case strings.Contains(c.name, "map-key"):
+			mapKey++
+		case strings.Contains(c.name, "-in-"), strings.Contains(c.name, "nested"):
+			nested++
+			if strings.Contains(c.name, "marshaler") {
+				delegating++
+			}
+		case strings.Contains(c.name, "marshaler"):
+			delegating++
+		}
+	}
+	if delegating < 3 || nested < 3 || mapKey < 2 {
+		t.Fatalf("corpus misses a route class: delegating=%d nested=%d mapKey=%d", delegating, nested, mapKey)
+	}
+	// And the walk must actually be measuring something: a cell whose charge
+	// is zero for both twins would pass the delta test vacuously only if the
+	// authority delta were zero, which is separately guarded — but a corpus
+	// where NOTHING is charged means chargedBytes is broken.
+	if got := chargedBytes(t, strings.Repeat("x", 128)); got < 128 {
+		t.Fatalf("chargedBytes reports %d for a 128-byte string; the measurement itself is broken", got)
 	}
 }
