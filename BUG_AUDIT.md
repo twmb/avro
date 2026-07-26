@@ -7881,3 +7881,331 @@ P20 was compressed after its family closed: both representations now route throu
   a FIX round ledgering its own HEAD clears its commits without ever
   quarantining them; the walk, not the quarantine, found them. Amended
   into §Convergence the next round.
+
+## Distillation archive (2026-07-26)
+
+### 1. AUDIT_PATTERNS §Semantic-consistency registry (R1) — verbatim before compression
+
+Compressed in place to an INDEX INTO THE EXECUTABLE CENSUS (predicate_census_test.go).
+R1 was a prose grid of semantic question x representation; the census is the same
+grid as running code. Rows whose question is registered there are now machine-checked
+and their prose is redundant; rows not yet registered keep their prose until they are.
+Re-open condition: none — this text is superseded row by row as questions land.
+
+## Semantic-consistency registry (R1)
+
+The permanent grid behind FIX.md items 3 & 15's question-scoped sweep. Each
+row is a SEMANTIC QUESTION about the schema representation; the answer names
+the code that answers it in every REPRESENTATION the question touches, with
+its posture and the net that guards it. When a fix adjudicates or changes one
+of these questions, do NOT re-derive scope — read the row: every answerer is a
+consumer the invariant must stay consistent across, and every `∅` names the
+structural reason a representation has no answer (so a later sweep tells
+"checked, none" from "forgot"). A new answerer in the code missing here is a
+hole; back-fill it in the round that adds it.
+
+Columns = FIX.md item 3's representation checklist, one identifier each:
+**PARSE** (`aobjectFromMap`/`aschemaFromAny`/`afieldFromAny` + the schema.go
+builder) · **WIRE-WALK** (the `walkNodeChildren` callers `collectTreeDefs`,
+`inlineNodeChildren`, `nodeFromJSONObject`) · **NODE-WALK** (`collectNamedTypes`,
+`coerceTreeDefaults`, `coerceMetadataDefault`, `lookupNameRef`) · **RENDER**
+(`toJSONWalk`/`toJSONShared`, `appendCanon*`) · **CACHE** (`c.defs`/`c.dedup`/
+`c.named`, `inlineTreeDefs`) · **SCHEMAFOR** (`renderCustomSchemaTree`,
+`deepCopyJSONTree`, `canonicalizeTreeValue`, `dedupNamedTypes`) · **RESOLVE**
+(`Resolve`/`CheckCompatibility`).
+
+Posture: **✓** conforms · **◆** different-by-design (+ the locking pin) · **∅**
+no answer (+ structural reason) · **⚠** DRIFTED, filed this round.
+
+**R1-Q1 — REGISTERS/COLLECTS named definitions** (occupy a fullname → a
+reference target). PARSE ✓ `registerNamed` (schema.go:1224) — the authority
+every column mirrors. WIRE-WALK ✓ `collectTreeDefs` visits every named kind
+under `nodeChildScope`, BOUND positions only (cache.go:337). NODE-WALK ✓
+`collectNamedTypes` → `table[nodeFullname]` (schema_node.go:1611), same
+kind-gate. RENDER ✓ `d.defined[...]` (schema_node.go:1004) only when `!stray`.
+CACHE ✓ `c.defs` first-wins (cache.go:232), bound only. SCHEMAFOR ✓
+`dedupNamedTypes` (schema_for.go:524). RESOLVE ∅ — runs on the built graph,
+never re-collects. Net: reference-resolution suite + TestMatrix_CacheStrayStructuralKey
++ TestRegression_MetadataNameTableIgnoresStrayKeyDef + FEATURE × WALKER.
+
+**R1-Q2 — decides WHAT A STRUCTURAL KEY BINDS on which kind** ("items"→array,
+"values"→map, "fields"→record, "symbols"→enum, "size"→fixed,
+name/ns/aliases→named). PARSE ✓ `strayKeyBinds` (schema_parse.go:443) is the
+one predicate; per-key arms shape-validate only where it is true. WIRE-WALK ✓
+`walkNodeChildren` gates each callback on the kind, opening stray enumeration
+only under `strayKeys && strayBodyShapeOK` (schema_walk.go:150). NODE-WALK ✓
+same `isNamedKind`/`isRecordKind` predicates. RENDER ✓ `n.Type` switch never
+emits another kind's key. CACHE ✓ inherits WIRE-WALK. SCHEMAFOR ✓ same kinds
+(schema_for.go:179). RESOLVE ∅ — binding decided at PARSE. Net:
+TestMatrix_StrayBodyShapeRouting, TestMatrix_FeatureWalkerParity, #63.
+
+**R1-Q3 — computes NAMESPACE SCOPE.** PARSE ✓ `namespaceOf` (compat.go:281),
+authority. WIRE-WALK ✓ `nodeChildScope`→`nodeNamespace` mirrors it
+(schema_walk.go:40). NODE-WALK ✓ `nsForChildren` scopes by any non-empty Name
+(schema_node.go:1538, the #64 premise). RENDER ◆ String namespaces
+enclosing-RELATIVE vs Canonical ABSOLUTE fullnames — the observability split;
+locked by PCF-invariance pins. CACHE ✓ `defWithExplicitNamespace` freezes each
+def's fullname (cache.go:653). SCHEMAFOR ✓ `dedupNamedTypes` threads
+`enclosingNS`. RESOLVE ✓ `scopedRefKeys` (schema.go:1275) drives both PARSE
+binding and `lookupNameRef`. Net: matrix_names, #64 pins, cross-namespace
+splice pins.
+
+**R1-Q4 — SURFACES/ROUTES stray content** (a reserved key on a non-binding
+kind — NOT_BUGS #63). PARSE ✓ shape-conditional: schema-shaped body parses
+into the aobject field as-written; malformed body → Props verbatim via
+`schemaReservedKeyForObject(k,v,typ,logical)` (schema_parse.go:461). WIRE-WALK
+◆ `nodeFromJSONObject` ALONE opts into stray enumeration and surfaces
+Items/Values/Fields as-written, incl. a typeless element via `fieldNoType`
+(schema_node.go:1945); collect/inline keep the default (bound-only) — the
+pinned asymmetry. RENDER ◆ stray subtrees render verbatim, bare-emission
+shortcuts require structural emptiness so stray survival is props-INDEPENDENT
+(schema_node.go:970). CACHE ◆ props-carrying wrapped ref splices to the def
+with props merged, def-wins (cache.go:469). NODE-WALK ✓ default coercion
+kind-gated, never treats a stray as a default position. SCHEMAFOR ◆ typed
+structural fields on non-binding kinds render as-written. RESOLVE ∅ — strays
+never materialize into the built graph. Locked by
+TestRegression_MalformedStrayBodyAcceptedAsProps, _StrayFieldElementSurfacedAsWritten,
+_StrayKeySurvivesSchemaRebuild, _CacheSpliceWrappedRefProps,
+TestMatrix_SchemaForStrayStructuralKey, _StrayBodyDefaultNormalization. RESERVED-KEY CASE sub-row (re-ruled EXACT 2026-07-21, #46): every
+column reads reserved keys by exact lowercase name — a case-variant is an
+ordinary custom prop, never bound/consumed/shape-routed on any surface;
+variant-only spellings of required keys reject loud (the attribute is
+absent). The former CI-fold and its pick apparatus (lookupCI/ciKey/getCI*/
+reservedKeyIsPick/variantPicks, the splice pre-merge snapshot) are REMOVED —
+exact map access everywhere; splice def-wins is an order-independent exact
+presence check. flat-lift routers (flatLiftTypeMap / rewriteFlatFieldToRef)
+route by exact key class. Net: TestMatrix_ReservedKeyVariantOnly + field
+twin + TestDifferentialFastavroReservedExactCase (executed per cell), the
+dup matrices (variant→Props cells policy-invariant), the exact-case
+composition matrices, the FEATURE × WALKER variantkey-props row;
+neuter-verified per surface (parse arm / getString / walker gate /
+resolveNameScope / nodeNamespace). CAPTURE⟺VERDICT sub-row (fixed
+2026-07-23): the NODE-WALK column's structural captures (aliases/symbols/
+size in nodeFromJSONObject; field aliases in metadataField) run the
+parser's OWN decodes — stringSliceFrom shared, decodeLaxInt the one size
+predicate (parse arm + capture + strayBodyShapeOK), lax getStringSlice
+DELETED — and record their verdicts for the Props routing, so
+structural-field-set ⟺ parse-consumed on every reserved key; a malformed
+stray body's only surface is Props verbatim (pre-fix the lax captures
+fabricated Aliases ["a",""] / Size 3 beside the verbatim Props copy).
+LOGICALTYPE VALUE-TYPE sub-row (ruled 2026-07-23, #70): logicalType is
+consumed only when string-typed — the string-conditional arm lives in
+schemaReservedKeyForObject, shared by PARSE extras / NODE-WALK Props /
+CACHE splice merge, so non-strings ride to Props verbatim on every
+column while unknown STRINGS stay first-class-inert on LogicalType;
+Java/fastavro(executed)/goavro all accept-as-inert. Nets:
+TestMatrix_StrayBodyShapeRouting structural-ZERO assertions on every
+malformed cell (carrier + wrapped-reference) + wedge bodies (["a",1],
+3.7, int64-overflow literal, valid-array-of-invalid-fields);
+TestMatrix_LogicalTypeValueTypes (value type × placement + wire-twin
+identity + rebuild, fastavro arm executed per cell); pins
+TestRegression_Stray{Aliases,Symbols,Size}MalformedNotStructurallySurfaced
++ TestRegression_NonStringLogicalTypeInert; neuter ×4 (lax slice capture
+/ lax size capture / reject arms / predicate clause — each turned exactly
+its own cells red: 10 / 3 / 8 / 2). FIELD PRECISION/SCALE
+CONSUMED-CONDITIONAL sub-row (ruled 2026-07-23, #71): afieldFromAny
+RECORDS per-key shape verdicts (intPtrFrom) and decides after the type
+parses — consumed ⟺ field logicalType "decimal" with a bytes/fixed lift
+target as-written (fieldDecimalLiftConsumesPrecisionScale, delegating to
+the type level's decimalConsumesPrecisionScale; primitive / first
+non-null union branch / type object, annotation-independent; a named ref
+is not a carrier spelling). Consumed malformed → loud key-named reject
+from the recorded error (malformed-as-absent forbidden: optional scale
+defaults 0, silently yielding decimal(p,0)); unconsumed malformed →
+inert, SchemaField.Props verbatim on PARSE-render / NODE-WALK / rebuild
+(the metadata API gains no fields; metadataField never validates —
+pinned asymmetry); FLAT fields defer to the PARSE type-level gate
+(flatLiftTypeMap routes the pair; #56 verdict parity); the stray-fields
+shape verdict inherits the rule (element with unconsumed-malformed pair
+is shape-OK). CACHE ✓ splice merge consumes wrapper precision/scale
+exactly on decimal-carrier defs (drop; else merge-as-prop), netted at
+last. Nets: the strayPS matrix's BODY axis (placement × kind ×
+{type,field,union-field} × {valid,quoted,float,nonnum,overflow,array},
+fastavro arm executed per accepted cell; fastavro's
+non-carrier-decimal-param strictness pinned by direction);
+TestRegression_FieldPrecisionScaleMalformedUnconsumedInert /
+_FlatFieldMalformedPrecisionMatchesNestedTwin /
+_FieldDecimalConsumedMalformedParamReject (scale-0 guard + union-
+annotated cell) / _FieldPrecisionValidUnconsumedSurfacesInProps /
+_StrayFieldsElementPrecisionRouting; TestMatrix_SpliceWrapperReservedKeyMerge
++ TestRegression_SpliceDefFieldMalformedPrecisionRidesThrough; neuter ×5
+(splice never/all-consumed 3/4 cells; field always/never-reject 315/2
+cells — the never-reject pair being exactly the cells whose ONLY guard
+is the gate; carrier clause 102 cells).
+
+**R1-Q5 — RESOLVES/SPLICES references.** PARSE ✓ eager in-scope-first
+positional binding via `scopedRefKeys` + `captureFwdRef` (schema.go:2795).
+CACHE ✓ `inlineTreeDefs` mirrors PARSE binding exactly (local-before-ref via
+`seen`; cache.go:408). NODE-WALK ✓ `lookupNameRef` same `scopedRefKeys`
+(schema_node.go:1556). RENDER ◆ second occurrence → bare ref (String relative,
+Canonical absolute) — writeNameRef parity, locked by #60. SCHEMAFOR ✓
+`dedupNamedTypes` rewrites repeats to refs. RESOLVE ✓ writer↔reader name/alias
+match (#67). Net: matrix_names, transitive-ref pins, alias matrices.
+
+**R1-Q6 — computes DEDUP/CONFLICT identity.** CACHE ✓ `c.dedup` keys on the
+exact schema string, skipped for lax/custom (cache.go:104); `dupDefRef`
+rewrites a diamond's second def (cache.go:603). RENDER ⚠→✓ `toJSONWalk`'s dedup
+consult (`d.defined`, body marshal-compare, schema_node.go:929) is now
+STRAY-GATED — the drifted cell of the 489e8ce round (fabricated conflicts /
+dangling rebuild / silent def→ref rewrite), fixed via the `stray` param and
+locked by TestRegression_RenderDedupIgnoresStrayDefinitions,
+_StrayStructuralKeyFalseDuplicate. SCHEMAFOR ✓ `dedupNamedTypes` collision
+check (schema_for.go:120). PARSE ✓ duplicate-fullname reject at build
+(schema.go:2673). NODE-WALK/WIRE-WALK/RESOLVE ∅ — consume the resolved
+single-type-per-name graph.
+
+**R1-Q7 — enforces WALK BUDGETS** (structural depth, node count, value
+fan-out, byte total, RE-DECODE cost). PARSE ✓ (was ⚠, FIXED 2026-07-21)
+`checkSchemaNestingDepth` (schema.go, 4000-bracket pre-scan) + builder
+`b.depth` bound STRUCTURAL nesting; the stray-body shape check is no longer a
+SECOND decode — the arm records its verdict in the aobject
+(`strayShapeRecorded`) and the props-routing (`schemaReservedKeyForObject`,
+now verdict-parameterized) consults it, so a nested-stray schema parses in
+ONE linear pass (was O(2^depth): the arm decoded each stray body and the
+extra-props loop re-decoded it, doubling per level). WIRE-WALK ✓ (was ⚠)
+`nodeFromJSONObject`'s stray gates use `strayBodyShapeOKMemo` over a
+Root()-scoped `strayShapeMemo` (records each subtree's verdict via the SAME
+parser decode, so a nested-stray metadata rebuild is one linear pass, not
+O(depth^2)); its extra-loop routes items/values/fields on the surfaced
+`n.Items/n.Values/n.Fields`. RENDER ✓ `newWalkBudget` (nodes+bytes) +
+`maxSchemaJSONDepth` threaded via `toJSONShared`; fan-out via `valueWalkLimit`
+(schema_node.go). SCHEMAFOR ✓ same ceiling + `maxIndirectDepth`
+(schema_for.go; #68) — and no shape-check calls at all (composition passes
+structural keys through untouched, #63). CACHE ✓ `inlineTreeDefs` walks a
+pre-scan-capped tree; its wrapped-ref splice merge calls
+`schemaReservedKeyForObject(...,nil)` on the wrapper's FLAT props (no nested
+stray, so the nil fallback cannot compound). NODE-WALK/RESOLVE ✓ parsed-tree /
+`errTooDeep` bounded. Net: TestRegression_NestedStrayContainerKeyLinearCost
+(shape ratio + sub-KB ceiling at every parse entry point AND Root().Schema(),
+per key) + TestDoSBattery_C1's nested-stray arm (the permanent battery net) +
+schema_node budget pins (B34); neuter-verified — dropping the parse verdict
+thread or the metadata memo reintroduces the blow-up.
+
+**R1-Q8 — COPIES/OWNS caller storage** (a walk must not mutate caller
+tree/Props; nil-ness is part of the value — #69). CACHE ✓ `deepCopyTree`
+(cache.go:663) before every splice mutation. SCHEMAFOR ✓
+`deepCopyJSONTree`+`canonicalizeTreeValue` (schema_for.go:371) copy AND
+canonicalize every level, preserving nil-vs-empty both ways (#69); the build
+never mutates caller Props (#68). RENDER ✓ `boundedSerializableValue` copies on
+fixup, marshal-opaque residuals verbatim. PARSE ∅ — builds fresh, owns
+everything. WIRE-WALK ◆ `inlineNodeChildren` mutates in place, but on CACHE's
+own fresh unmarshal (cache.go:230), never caller storage. NODE-WALK/RESOLVE ∅
+— library-built graphs, not caller storage (`snapshotAnyValue` is test-only).
+Net: TestMatrix_TreeValueNilEmptyImage, _TreeValueMapKeyShapes,
+_TreeValueGoTypes, FuzzTreeValueTwinParity.
+
+**R1-Q9 — binds/consumes the ENUM-LEVEL "default"** (a JSON STRING token
+naming a member symbol; token type decided BEFORE membership so garbage can
+never bind the ""-symbol under lax names). PARSE ✓ schema.go enum build —
+the SOLE binder (string-token gate, then membership on the decoded string;
+the FIELD-level twin is validateLeaf's enum arm, string+membership, same
+contract at the other consumption site). WIRE-WALK ∅ — enum has no child
+positions; a "default" riding a REFERENCE wrapper is never consumed (inert,
+pinned). NODE-WALK ✓ schema_node.go `m["default"].(string)` on Type=="enum"
+— satisfiable-only post-gate. RENDER ✓ emits iff HasEnumDefault; canonical
+strips per PCF. CACHE ∅ — splice materializes definitions; wrapper-ref
+"default" inert (TestRegression_EnumRefWrapperDefaultInert). SCHEMAFOR ∅ —
+no Go-type source for an enum default. RESOLVE ✓ fill with its own
+membership re-check (resolve.go readerIdx lookup) + compat's presence gate.
+Net: TestMatrix_EnumDefaultTokenClassElimination +
+TestMatrix_EnumFieldDefaultTokenTypes + TestRegression_EnumDefault* pins +
+TestDifferentialFastavroEnumDefaultToken (field/wrapper cells calibrate
+fastavro's type-check-not-membership split and its wrapped-ref reject).
+
+Every cell now cites a net. The R1-Q7 PARSE + WIRE-WALK cells were ⚠ when this
+grid was first built (the `strayBodyShapeOK` re-decode made Parse and
+Root().Schema() O(2^depth) on a nested-stray schema); both were FIXED
+2026-07-21 by threading the parser's recorded shape verdict into the routing
+(PARSE) and memoizing the per-subtree decode across the metadata walk
+(WIRE-WALK), and netted by TestRegression_NestedStrayContainerKeyLinearCost +
+TestDoSBattery_C1's nested-stray arm. The registry's job held: the fix's
+sibling sweep was a straight read of the R1-Q7 row — every consumer of the
+stray-shape check across the seven columns, each confirmed covered or
+structurally exempt.
+
+
+### 2. AUDIT_CORE §Round ledger — the 2026-07-24..25 entries, verbatim before compression to one-liners
+
+- 2026-07-24..25 · c428ae3→2f0c8ab · era (4 FULL + 2 FIX): enum-level
+  default json.Unmarshal error ignored FIXED (b5c09b1); ocfwrite gap
+  CLOSED; JSON⇄binary encode error identity aligned + union wrap
+  ARITY-SPLIT (#66 rewritten, B10 +2); FIRST full line-walks CLEAN
+  (schema.go, json_decode.go, json_codec.go, compat/schema_walk/soe/
+  varint/rabin, doc.go); LINE-WALK CAMPAIGN derivation EXECUTED-FALSE
+  (23/26 non-test files carry full-walk records) · Narratives: archive
+  (2026-07-24 #5, #7; 2026-07-25 #1, #2); ledger verbatim: archive
+  (2026-07-25 #6).
+- 2026-07-25 · 2f0c8ab→b66d101 · ERA (2 FULL + 1 FIX, verbatim: archive
+  2026-07-25 #10): the LINE-WALK CAMPAIGN completed — every non-test file
+  now carries a full-walk record (schema_node.go, schema_for.go, doc.go,
+  and the five post-walk drift hunks last). 8 behavioral FILED→FIXED
+  across the two walks: refTarget stamp vs an edited Type; valueWalkLimit
+  marshaler-arm budget bypass ×2 surfaces; non-string-kind map keys
+  uncharged; P20 wrapped-null error identity + omitzero wire corruption
+  (fa349c7 539dcc5 d620116 b66d101); then the pre-Parse-tree P20 siblings
+  and the embed-path skip-directive hole this round fixes. P20 minted.
+
+- 2026-07-25 · b66d101 (START head — b66d101..HEAD quarantines the fix
+  commits landed after this line) · FIX (3, ruling-directed) · FRAMEWORK
+  AMENDMENT FIRST: a FIX line must record its START head, else the next
+  round computes an EMPTY scope and clears a fix generation that was
+  never quarantined ("exactly once, not zero times"); §Convergence and
+  the §Round ledger format note both amended · ACCOUNTING CORRECTION:
+  fa349c7 / 539dcc5 / d620116 were auto-cleared that way and join this
+  round's commits as the next quarantine scope · opened with double
+  distillation (archive 2026-07-25 #7, #8): CORE 56.0→55.6KB, PATTERNS
+  150.7→149.5KB · F1+F2 ONE ROOT — `isNullBranchTree`, the `any`-tree
+  mirror of `isNullBranch`, routed through both askers; representation
+  sweep EXECUTED by the QUESTION (parsed aschema / compiled-metadata kind
+  / pre-Parse tree), post-fix grep shows no tree-level null decision
+  outside the shared predicate · F3 — `checkSkipDirectiveExact` shared by
+  both tag readers after their exact `tag == "-"` skip; 14a census 14
+  guards × 2 paths × 2 name modes = 56 cells, exactly 4 red pre-fix, all
+  one guard on the embed path · red-then-green (39 + 4 + 6 red first);
+  neuters DISJOINT by CALL SITE (A 18 / B 36 / C 10 leaf fails; the
+  foreign oracle reds only under B) · nets:
+  TestMatrix_SchemaForNullBranchSpellingParity (96 cells, reuses
+  schemaForScopeCell, now variadic-opts) +
+  TestDifferentialFastavroSchemaForNullSpelling (5 RUN 0 SKIP; canonical
+  + readresolve) + TestRegression_SkipDirectiveGuardIsSchemaForScoped
+  (immunity control, never reds) · a differential arm caught a TEST bug
+  first — the bare CONTROL failed, which is the tell · SchemaFor ×
+  spelling gap CLOSED · docs: CustomType.Schema spelling clause, NOT_BUGS
+  #16 emission clause, P20 compressed to probe + the
+  one-predicate-per-representation lesson · suite + fastavro green after
+  every edit (0 fail, 0 `missing optional dependency`); -race green on
+  the new families; Java absent · UNCONVERGED (counter 0), freeze stays.
+  Narrative: archive (2026-07-25 #9).
+
+- 2026-07-25 · 455cd37 · FULL (read-only, no fixes applied) · quarantine
+  fa349c7/539dcc5/d620116 (the accounting-corrected trio) + e06f6b4;
+  b66d101 docs-only, excluded · 2 BEHAVIORAL, BOTH introduced by the
+  quarantined generation and BOTH proven by worktree bisect (pass at the
+  fix's parent, fail at HEAD) — the quarantine paying for itself in the
+  round it was meant to · F1 `nodeRefTargetAgrees` under-enumerates
+  `scopedRefKeys` (2 shapes: `.x` escape; dotted def Name + short ref) →
+  unedited extracted sub-node stops converting · F2 `mapKeyEmitLen` omits
+  json's nil-pointer-key guard → panic on both reporting surfaces; the
+  nil-INTERFACE-key sibling is PRE-EXISTING (stdlib's own panic escaping
+  a public API) · P21 minted (hand-enumerated authority) — both findings
+  are its two directions · NEW OPEN NET GAP: caller-composed/edited
+  SchemaNode trees (§Open net gaps) · fa349c7 + e06f6b4 CLEAR (spelling
+  set exhaustive per representation; both tag paths guarded) · gated OUT
+  as documented-intentional: wrapped-ref reserved usage-site attrs
+  dropping at the splice (NOT_BUGS #25 + #70) — probe written, gate
+  caught it before filing · verified clean: text-encode nil battery (8
+  positions × 2 wires), the json-modeling predicates
+  (canonicalByteSliceKind / sliceElemMarshalPositionDependent /
+  canonicalStringKeyMap / treeValueMarshalOpaque all match encoding/json
+  exactly), hand-built node combos + shared-pointer DAG + exotic Props,
+  huge-fixed decode cost (16µs) · doc-precision note (NOT filed): "Avro
+  has no reference spelling that reaches the null namespace"
+  (custom_type.go:81, cache.go:575) is false for twmb+Java, true for
+  fastavro — the EMIT posture is portability-correct, only the phrasing
+  overreaches · oracles: suite green, fastavro differential RAN (1550
+  subtests, 0 fail, 0 `missing optional dependency`), Java oracle ABSENT
+  (no JVM) — every Java-facing conclusion is source-cited, not executed ·
+  SIZE GUARD: this round's P21 + gap entry pushed CORE 52.0→56.4KB and
+  PATTERNS 146.4→152.4KB, BOTH over cap — next round opens with a DOUBLE
+  distillation pass · UNCONVERGED (counter 0), freeze stays.
+
