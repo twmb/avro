@@ -329,6 +329,42 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q13",
+		question: "Which text route does this type take — its MarshalText, its raw string kind, or raw bytes?",
+		authority: "NOT_BUGS #39's precedence order, enforced by two gates: stringFastPathEligibleEncode / " +
+			"stringFastPathEligibleDecode (reflect.go) are the single source of truth for which types may ride " +
+			"the raw-string fast paths, and the fast paths themselves are the second answerer — they read the " +
+			"underlying string directly and bypass the text arm, so the EXCLUSION LIST is the sibling set",
+		answerers: []censusAnswerer{
+			{repr: "type-level gate", site: "stringFastPathEligibleEncode / Decode", file: "reflect.go"},
+			{repr: "value-level dispatch", site: "textOutFor / textValue", file: "reflect.go"},
+			{
+				repr: "unsafe + container fast paths", site: "usString / usFixedUUIDString / array + map fast loops", file: "unsafe.go",
+				note: "different-by-design: these CANNOT consult the value-level dispatch — they exist to skip it — so they consult the type-level gate at compile time instead, once per type rather than per value. Agreement is therefore a property of the gate's exclusion list, which is what the driver checks by encoding the same value at every position and requiring the same bytes.",
+			},
+			{
+				repr: "uuid raw-bytes exception", site: "isUUIDType + the [16]byte arms", file: "ser.go",
+				note: "different-by-design and documented (#39 rule 1): a [16]byte-shaped uuid TRUSTS its raw bytes and does not consult the text interface at all, because the 16 bytes ARE the uuid and a round trip through a non-canonical text method would diverge binary from JSON.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `stringFastPathEligible`, counts: map[string]int{
+				"reflect.go": 4,
+				"unsafe.go":  10,
+				"deser.go":   2,
+			}},
+			{pattern: `implementsTextMarshaler`, counts: map[string]int{
+				"reflect.go":    5,
+				"schema_for.go": 2,
+			}},
+			// Rejected tell: `MarshalText()` — it names the CALL, not the
+			// routing decision, and spans the schema-tree budget's emission
+			// question (Q9) as well. `textOutFor` was also rejected: it is
+			// the shared helper, so counting it misses exactly the sites that
+			// bypass it, which are the ones that can drift.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -1607,5 +1643,134 @@ func TestCensus_Q10_CorpusIsNotVacuous(t *testing.T) {
 	}
 	if nils < 6 || nonNils < 3 {
 		t.Fatalf("corpus is lopsided: %d nil, %d non-nil", nils, nonNils)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q13 — which text route does this type take on encode?
+// ---------------------------------------------------------------------
+
+// A string-kind type with a MarshalText method encodes its MARSHALED form,
+// not its raw string. The eligibility gates exist because the unsafe and
+// container fast paths read the underlying string directly and bypass
+// appendAvroString's text arm entirely, so a type with a text method must be
+// kept OFF those paths — the gate's answer and the route actually taken are
+// two answers to one question, and the fast-path exclusion list IS the
+// sibling set.
+//
+// The method TRANSFORMS its input, so the two routes are distinguishable: an
+// identity method would make a bypassed fast path and a working text arm
+// produce the same bytes, and the probe would pass either way.
+type censusUpperText string
+
+func (c censusUpperText) MarshalText() ([]byte, error) {
+	return []byte(strings.ToUpper(string(c))), nil
+}
+
+type censusPlainString string
+
+// TestCensus_Q13_TextRouteAgreesWithTheEligibilityGate crosses the gate's
+// verdict with the route actually taken at every position a value can hold:
+// scalar, struct field (the unsafe fast path's home), array element, and map
+// value. A type the gate calls ineligible must encode its marshaled form
+// everywhere; a type it calls eligible must encode its raw string everywhere.
+func TestCensus_Q13_TextRouteAgreesWithTheEligibilityGate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		typ  reflect.Type
+		// positions, each producing the encoded STRING content
+		scalar func() any
+		field  func() any
+		array  func() any
+		mapv   func() any
+		want   string // the content every position must carry
+	}{
+		{
+			name:   "string-kind with a transforming MarshalText",
+			typ:    reflect.TypeFor[censusUpperText](),
+			scalar: func() any { return censusUpperText("ab") },
+			field: func() any {
+				return struct {
+					F censusUpperText `avro:"f"`
+				}{"ab"}
+			},
+			array: func() any { return []censusUpperText{"ab"} },
+			mapv:  func() any { return map[string]censusUpperText{"k": "ab"} },
+			want:  "AB",
+		},
+		{
+			name:   "string-kind with no text method",
+			typ:    reflect.TypeFor[censusPlainString](),
+			scalar: func() any { return censusPlainString("ab") },
+			field: func() any {
+				return struct {
+					F censusPlainString `avro:"f"`
+				}{"ab"}
+			},
+			array: func() any { return []censusPlainString{"ab"} },
+			mapv:  func() any { return map[string]censusPlainString{"k": "ab"} },
+			want:  "ab",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eligible := stringFastPathEligibleEncode(tc.typ)
+			// The gate's contract: a type with a text method is INELIGIBLE
+			// for the raw-string fast paths, precisely so its method runs.
+			if wantEligible := tc.want == "ab"; eligible != wantEligible {
+				t.Fatalf("stringFastPathEligibleEncode = %v, but the type's route produces %q — the gate and the route disagree before any position is encoded", eligible, tc.want)
+			}
+
+			for _, pos := range []struct {
+				name   string
+				schema string
+				value  func() any
+			}{
+				{"scalar", `"string"`, tc.scalar},
+				{"struct field", `{"type":"record","name":"R","fields":[{"name":"f","type":"string"}]}`, tc.field},
+				{"array element", `{"type":"array","items":"string"}`, tc.array},
+				{"map value", `{"type":"map","values":"string"}`, tc.mapv},
+			} {
+				s, err := Parse(pos.schema)
+				if err != nil {
+					t.Fatalf("%s: Parse: %v", pos.name, err)
+				}
+				bin, err := s.Encode(pos.value())
+				if err != nil {
+					t.Fatalf("%s: encode: %v", pos.name, err)
+				}
+				if !bytes.Contains(bin, []byte(tc.want)) {
+					t.Errorf("%s (binary) does not carry %q: %q — this position took a different text route than the gate promises",
+						pos.name, tc.want, bin)
+				}
+				jsn, err := s.EncodeJSON(pos.value())
+				if err != nil {
+					t.Fatalf("%s: encodeJSON: %v", pos.name, err)
+				}
+				if !bytes.Contains(jsn, []byte(tc.want)) {
+					t.Errorf("%s (JSON) does not carry %q: %s", pos.name, tc.want, jsn)
+				}
+			}
+		})
+	}
+}
+
+// The corpus must contain a type on BOTH sides of the gate, and the text
+// method must TRANSFORM — an identity method cannot distinguish a bypassed
+// fast path from a working text arm, so the whole driver would pass
+// vacuously.
+func TestCensus_Q13_CorpusIsNotVacuous(t *testing.T) {
+	if !implementsTextMarshaler(reflect.TypeFor[censusUpperText]()) {
+		t.Fatal("the marked type does not implement TextMarshaler; the driver tests nothing")
+	}
+	if implementsTextMarshaler(reflect.TypeFor[censusPlainString]()) {
+		t.Fatal("the control type implements TextMarshaler; there is no eligible side")
+	}
+	out, err := censusUpperText("ab").MarshalText()
+	if err != nil || string(out) == "ab" {
+		t.Fatalf("the text method must TRANSFORM its input, got %q (err %v) — an identity method makes every position look correct", out, err)
+	}
+	if stringFastPathEligibleEncode(reflect.TypeFor[censusUpperText]()) ==
+		stringFastPathEligibleEncode(reflect.TypeFor[censusPlainString]()) {
+		t.Fatal("both corpus types land on the same side of the gate")
 	}
 }
