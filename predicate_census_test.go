@@ -365,6 +365,44 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q15",
+		question: "Is this kind a NAMED type (occupies a fullname others can reference), and is it a RECORD?",
+		authority: "isNamedKind / isRecordKind (schema_node.go) are the shared predicates. The same " +
+			"classification is ALSO written as literal case sets in four other files, which is why the " +
+			"question is here: those copies cannot call the predicates from inside a switch, so they can " +
+			"only be kept honest by driving the classification's observable consequence",
+		answerers: []censusAnswerer{
+			{repr: "shared predicates", site: "isNamedKind / isRecordKind", file: "schema_node.go"},
+			{
+				repr: "compat + JSON codec literal sets", site: `case "record", "enum", "fixed":`, file: "compat.go",
+				note: "different-by-design as a FORM, not as an answer: a switch arm cannot call a predicate and still be a switch arm. They owe the identical classification, which the driver checks through the property that defines it — whether a definition of that kind can be referenced by name.",
+			},
+			{
+				repr: "canonical + parse literal sets", site: `case "record", "error":`, file: "schema_canonical.go",
+				note: "same form-vs-answer split for the RECORD half: canonical emission and the parse arm both spell the record kinds literally.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `isNamedKind`, counts: map[string]int{
+				"cache.go": 3, "schema_canonical.go": 1, "schema_for.go": 4,
+				"schema_node.go": 13, "schema_parse.go": 1, "schema_walk.go": 2, "schema.go": 5,
+			}},
+			{pattern: `isRecordKind`, counts: map[string]int{
+				"schema_for.go": 2, "schema_node.go": 10, "schema_parse.go": 1, "schema_walk.go": 1,
+			}},
+			{pattern: `"record", "enum", "fixed"`, counts: map[string]int{
+				"compat.go": 1, "json_codec.go": 2,
+			}},
+			{pattern: `"record", "error"`, counts: map[string]int{
+				"schema_canonical.go": 1, "schema_node.go": 3, "schema_parse.go": 1, "schema.go": 3,
+			}},
+			// Rejected tell: `== "record"` — it also matches the RECURSION
+			// question (json_decode.go's `kind == "record" || kind == "array"
+			// || kind == "map"`, which asks whether a kind nests, not whether
+			// it is named). Two questions, one tell.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -1772,5 +1810,139 @@ func TestCensus_Q13_CorpusIsNotVacuous(t *testing.T) {
 	if stringFastPathEligibleEncode(reflect.TypeFor[censusUpperText]()) ==
 		stringFastPathEligibleEncode(reflect.TypeFor[censusPlainString]()) {
 		t.Fatal("both corpus types land on the same side of the gate")
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q15 — is this kind a NAMED type, and is it a RECORD?
+// ---------------------------------------------------------------------
+
+// "Named" is the property that decides whether a kind occupies a fullname
+// other schemas can reference. isNamedKind and isRecordKind are the shared
+// predicates, but the same classification is also written out as literal
+// case sets — `case "record", "enum", "fixed":` in compat.go and
+// json_codec.go, `case "record", "error":` in schema_canonical.go and
+// schema_node.go — so the rule exists in several hand-written copies.
+//
+// The observable is exact rather than a proxy: a kind is named iff a
+// definition of that kind can be REFERENCED by name from a sibling position.
+// On an unnamed kind a "name" key is a stray custom property (it binds
+// nothing), so the reference must fail to resolve — which is the same
+// statement from the other side.
+type kindCell struct {
+	kind    string
+	def     string // a definition of this kind carrying "name":"N"
+	isNamed bool
+	isRec   bool
+}
+
+func kindCorpus() []kindCell {
+	prim := func(k string) string { return `{"type":"` + k + `","name":"N"}` }
+	return []kindCell{
+		{kind: "null", def: prim("null")},
+		{kind: "boolean", def: prim("boolean")},
+		{kind: "int", def: prim("int")},
+		{kind: "long", def: prim("long")},
+		{kind: "float", def: prim("float")},
+		{kind: "double", def: prim("double")},
+		{kind: "bytes", def: prim("bytes")},
+		{kind: "string", def: prim("string")},
+		{kind: "array", def: `{"type":"array","items":"int","name":"N"}`},
+		{kind: "map", def: `{"type":"map","values":"int","name":"N"}`},
+		{kind: "record", def: `{"type":"record","name":"N","fields":[]}`, isNamed: true, isRec: true},
+		{kind: "error", def: `{"type":"error","name":"N","fields":[]}`, isNamed: true, isRec: true},
+		{kind: "enum", def: `{"type":"enum","name":"N","symbols":["A"]}`, isNamed: true},
+		{kind: "fixed", def: `{"type":"fixed","name":"N","size":1}`, isNamed: true},
+	}
+}
+
+// TestCensus_Q15_NamedKindAgreesWithNameBinding crosses the predicates with
+// the binding behavior they describe. A kind the predicate calls named whose
+// definition cannot be referenced — or an unnamed kind whose stray "name"
+// nonetheless binds a reference — means the name table and the predicate
+// disagree about which types exist.
+func TestCensus_Q15_NamedKindAgreesWithNameBinding(t *testing.T) {
+	for _, cell := range kindCorpus() {
+		t.Run(cell.kind, func(t *testing.T) {
+			if got := isNamedKind(cell.kind); got != cell.isNamed {
+				t.Errorf("isNamedKind(%q) = %v, want %v", cell.kind, got, cell.isNamed)
+			}
+			if got := isRecordKind(cell.kind); got != cell.isRec {
+				t.Errorf("isRecordKind(%q) = %v, want %v", cell.kind, got, cell.isRec)
+			}
+
+			// The observable: can a sibling field reference the name?
+			src := `{"type":"record","name":"Top","fields":[` +
+				`{"name":"a","type":` + cell.def + `},` +
+				`{"name":"b","type":"N"}]}`
+			_, err := Parse(src)
+			bound := err == nil
+			if bound != cell.isNamed {
+				t.Errorf("a reference to the declared name %s for kind %q, but isNamedKind says %v.\n  schema: %s\n  err: %v",
+					map[bool]string{true: "RESOLVED", false: "did NOT resolve"}[bound], cell.kind, cell.isNamed, src, err)
+			}
+		})
+	}
+}
+
+// TestCensus_Q15_RecordKindAgreesWithFieldBinding checks the record half
+// against the key only a record binds: a "fields" attribute is structural on
+// record and error, and on nothing else.
+func TestCensus_Q15_RecordKindAgreesWithFieldBinding(t *testing.T) {
+	for _, cell := range kindCorpus() {
+		if cell.kind == "null" || cell.kind == "record" || cell.kind == "error" {
+			continue // null carries no fields anywhere; the record kinds are the positive control
+		}
+		t.Run(cell.kind, func(t *testing.T) {
+			// "fields" on a non-record kind binds nothing, so the compiled
+			// node must carry no fields regardless of the attribute.
+			var withFields string
+			if cell.kind == "array" {
+				withFields = `{"type":"array","items":"int","fields":[{"name":"x","type":"int"}]}`
+			} else if cell.kind == "map" {
+				withFields = `{"type":"map","values":"int","fields":[{"name":"x","type":"int"}]}`
+			} else if cell.kind == "enum" {
+				withFields = `{"type":"enum","name":"E2","symbols":["A"],"fields":[{"name":"x","type":"int"}]}`
+			} else if cell.kind == "fixed" {
+				withFields = `{"type":"fixed","name":"F2","size":1,"fields":[{"name":"x","type":"int"}]}`
+			} else {
+				withFields = `{"type":"` + cell.kind + `","fields":[{"name":"x","type":"int"}]}`
+			}
+			s, err := Parse(withFields)
+			if err != nil {
+				t.Logf("kind %q rejects a stray fields attribute (%v) — the exclusivity rule, not this question", cell.kind, err)
+				return
+			}
+			if n := len(s.node.fields); n != 0 {
+				t.Errorf("kind %q is not a record kind but the compiled node bound %d fields", cell.kind, n)
+			}
+		})
+	}
+}
+
+// The corpus must cover every kind the parser produces on both sides of both
+// predicates, or a classification error in an uncovered kind passes.
+func TestCensus_Q15_CorpusIsNotVacuous(t *testing.T) {
+	var named, unnamed, rec int
+	seen := map[string]bool{}
+	for _, c := range kindCorpus() {
+		seen[c.kind] = true
+		if c.isNamed {
+			named++
+		} else {
+			unnamed++
+		}
+		if c.isRec {
+			rec++
+		}
+	}
+	for _, k := range []string{"null", "boolean", "int", "long", "float", "double",
+		"bytes", "string", "record", "error", "enum", "fixed", "array", "map"} {
+		if !seen[k] {
+			t.Errorf("corpus is missing the kind %q", k)
+		}
+	}
+	if named < 4 || unnamed < 8 || rec < 2 {
+		t.Fatalf("corpus is lopsided: named=%d unnamed=%d record=%d", named, unnamed, rec)
 	}
 }
