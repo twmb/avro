@@ -266,6 +266,33 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q5",
+		question: "Does a field-level decimal lift CONSUME precision/scale — so a malformed body must reject rather than ride to Props?",
+		authority: "decimalConsumesPrecisionScale (schema_node.go) owns the carrier test and both sides delegate to it. " +
+			"What is answered TWICE is the NAVIGATION to the lift target: fieldDecimalLiftConsumesPrecisionScale " +
+			"computes the verdict, liftFieldLogicalIntoType performs the move, and the verdict's comment claims to " +
+			"mirror the lift. They drifted before, on the wrapped-null branch",
+		answerers: []censusAnswerer{
+			{repr: "as-written aschema, verdict", site: "fieldDecimalLiftConsumesPrecisionScale", file: "schema.go"},
+			{repr: "as-written aschema, mutation", site: "liftFieldLogicalIntoType", file: "schema.go"},
+			{
+				repr: "compiled schemaNode + metadata", site: "decimalConsumesPrecisionScale call sites", file: "schema_node.go",
+				note: "not a separate answerer: the shared carrier test, consulted by the render and Props routing. Registered so the guard watches its count — a new hand-rolled bytes/fixed check beside it would be the drift.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `decimalConsumesPrecisionScale`, counts: map[string]int{
+				"schema_node.go":  5,
+				"schema_parse.go": 2,
+				"schema.go":       6,
+			}},
+			// Rejected tell: `Logical == ""` — 6 hits in schema.go, three of
+			// them the lift's closer-to-the-type gates and three unrelated
+			// (canonical emission, logical dispatch). It spans two questions,
+			// so it can never fail cleanly for either.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -1165,5 +1192,167 @@ func TestCensus_Q14_CorpusIsNotVacuous(t *testing.T) {
 	}
 	if match < 3 || nonMatch < 3 || wildcard < 3 {
 		t.Fatalf("corpus is trivial: match=%d nonMatch=%d wildcard=%d", match, nonMatch, wildcard)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q5 — does a field-level decimal lift CONSUME precision/scale?
+// ---------------------------------------------------------------------
+
+// Two answerers navigate the field's type to find where a field-level
+// logicalType lands. fieldDecimalLiftConsumesPrecisionScale decides whether
+// the pair is CONSUMED — which makes a malformed body reject loudly instead
+// of riding to Props — and liftFieldLogicalIntoType decides where the
+// annotation actually goes. The verdict's own comment says it mirrors the
+// lift, and that is a claim: they have drifted before, when one skipped a
+// wrapped null branch and the other did not.
+//
+// Both run inside parseSchemaTree, so neither is callable on a pre-lift
+// tree. Each is observed through the consequence it owns instead: the
+// verdict through whether a MALFORMED pair rejects, the lift through where
+// the parsed metadata ended up carrying the decimal annotation.
+type liftTargetCell struct {
+	name      string
+	fieldType string // the field's "type" as written
+	// byDesign, when set, is the documented reason the two navigations
+	// deliberately disagree here. Such a cell asserts BOTH directions, so
+	// either side changing reds it.
+	byDesign string
+}
+
+func liftTargetCorpus() []liftTargetCell {
+	return []liftTargetCell{
+		{name: "bare-bytes", fieldType: `"bytes"`},
+		{name: "bare-long-not-a-carrier", fieldType: `"long"`},
+		{name: "bare-string-not-a-carrier", fieldType: `"string"`},
+		{name: "wrapped-bytes", fieldType: `{"type":"bytes"}`},
+		{name: "fixed", fieldType: `{"type":"fixed","name":"F","size":4}`},
+		{name: "record-not-a-carrier", fieldType: `{"type":"record","name":"R2","fields":[]}`},
+		{name: "union-null-first-bytes", fieldType: `["null","bytes"]`},
+		{name: "union-wrapped-null-first-bytes", fieldType: `[{"type":"null"},"bytes"]`},
+		{name: "union-null-first-long", fieldType: `["null","long"]`},
+		{name: "union-bytes-first", fieldType: `["bytes","null"]`},
+		{name: "union-null-then-wrapped-bytes", fieldType: `["null",{"type":"bytes"}]`},
+		// The suspect shape: the lift's "closer-to-the-type wins" rule
+		// declines to overwrite an annotation the target already has, so the
+		// field's "decimal" never lands — but the verdict reads the FIELD's
+		// logical, not the one that survives.
+		{name: "target-already-annotated", fieldType: `{"type":"bytes","logicalType":"uuid"}`, byDesign: annotationIndependent},
+		{name: "union-target-already-annotated", fieldType: `["null",{"type":"bytes","logicalType":"uuid"}]`, byDesign: annotationIndependent},
+	}
+}
+
+// annotationIndependent is the documented reason the two navigations part
+// company on a target that already carries its own logicalType: consumption
+// follows the lift TARGET's carrier KIND as written, deliberately
+// independent of the target's own annotation, while the lift's
+// closer-to-the-type rule declines to overwrite that annotation. So the pair
+// is validated as decimal parameters on a carrier the field's "decimal"
+// never reaches. Ruled and pinned (NOT_BUGS #71,
+// TestRegression_FieldDecimalConsumedMalformedParamReject's
+// union-annotated-carrier cell); the alternative would treat a malformed
+// scale as absent and parse as decimal(p,0), a silent wire-semantics change.
+const annotationIndependent = "consumption follows the lift target's carrier KIND as written, independent of the target's own annotation (NOT_BUGS #71)"
+
+func liftFieldSchema(fieldType, precision string) string {
+	return `{"type":"record","name":"R","fields":[{"name":"f","type":` + fieldType +
+		`,"logicalType":"decimal","precision":` + precision + `,"scale":2}]}`
+}
+
+// consumedByRejection asks the VERDICT's question: a malformed precision
+// body rejects only where the pair is consumed.
+//
+// "Parse failed" is NOT the signal — it is confounded. When the pair is
+// unconsumed the malformed value is dropped, and if the lift still put a
+// decimal annotation on a carrier, the TYPE-level decimal validation then
+// fails for a missing precision instead. Both paths return non-nil. The
+// discriminator is the field gate's own message, which names the key it
+// refused; that is the only error the verdict itself produces.
+func consumedByRejection(t *testing.T, fieldType string) bool {
+	t.Helper()
+	if _, err := Parse(liftFieldSchema(fieldType, "4")); err != nil {
+		t.Fatalf("the valid control must parse for %s: %v", fieldType, err)
+	}
+	_, err := Parse(liftFieldSchema(fieldType, "3.7"))
+	return err != nil && strings.Contains(err.Error(), `record field "precision"`)
+}
+
+// consumedByLift asks the LIFT's question: after parsing, is the field's
+// decimal annotation actually sitting on a bytes/fixed carrier — the only
+// place precision/scale mean anything?
+func consumedByLift(t *testing.T, fieldType string) bool {
+	t.Helper()
+	s, err := Parse(liftFieldSchema(fieldType, "4"))
+	if err != nil {
+		t.Fatalf("valid control: %v", err)
+	}
+	// The COMPILED tree is where the lift's effect lives: the metadata tree
+	// preserves the schema as written, keeping the field-level annotation on
+	// the FIELD, so reading it would report that no lift ever happened.
+	target := s.node.fields[0].node
+	// A union's annotation lands on its first non-null branch.
+	if len(target.branches) > 0 {
+		for _, br := range target.branches {
+			if br.kind != "null" {
+				target = br
+				break
+			}
+		}
+	}
+	return decimalConsumesPrecisionScale(target.kind, target.logical)
+}
+
+// TestCensus_Q5_DecimalLiftConsumeVerdictMatchesWhereTheLiftLanded requires
+// the two navigations to agree. A verdict of "consumed" over a target the
+// lift did not annotate as decimal means a malformed pair rejects loudly on
+// a schema where the pair is inert metadata — the opposite of the
+// unconsumed-is-a-custom-property rule.
+func TestCensus_Q5_DecimalLiftConsumeVerdictMatchesWhereTheLiftLanded(t *testing.T) {
+	for _, cell := range liftTargetCorpus() {
+		t.Run(cell.name, func(t *testing.T) {
+			byVerdict := consumedByRejection(t, cell.fieldType)
+			byLift := consumedByLift(t, cell.fieldType)
+
+			if cell.byDesign != "" {
+				// Both directions asserted, so either side changing reds this.
+				if !byVerdict {
+					t.Errorf("the verdict must still CONSUME here (a malformed pair must reject): %s", cell.byDesign)
+				}
+				if byLift {
+					t.Errorf("the lift must still DECLINE to overwrite the target's own annotation: %s", cell.byDesign)
+				}
+				return
+			}
+
+			if byVerdict != byLift {
+				t.Errorf("the two navigations disagree for field type %s:\n  verdict (malformed pair rejects) = %v\n  lift    (decimal landed on a carrier) = %v\n  One of them is reading a type the other never addressed.",
+					cell.fieldType, byVerdict, byLift)
+			}
+		})
+	}
+}
+
+// The corpus must contain carriers AND non-carriers, both bare and wrapped,
+// unions with both null spellings, and a target that already carries its own
+// annotation — otherwise the navigation is never actually exercised.
+func TestCensus_Q5_CorpusIsNotVacuous(t *testing.T) {
+	var unions, wrappedNull, preAnnotated, nonCarrier int
+	for _, c := range liftTargetCorpus() {
+		if strings.HasPrefix(c.fieldType, "[") {
+			unions++
+		}
+		if strings.Contains(c.fieldType, `{"type":"null"}`) {
+			wrappedNull++
+		}
+		if strings.Contains(c.fieldType, `"logicalType"`) {
+			preAnnotated++
+		}
+		if strings.Contains(c.name, "not-a-carrier") {
+			nonCarrier++
+		}
+	}
+	if unions < 4 || wrappedNull < 1 || preAnnotated < 2 || nonCarrier < 3 {
+		t.Fatalf("corpus misses a navigation class: unions=%d wrappedNull=%d preAnnotated=%d nonCarrier=%d",
+			unions, wrappedNull, preAnnotated, nonCarrier)
 	}
 }
