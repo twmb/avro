@@ -43,6 +43,7 @@ import (
 
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -108,6 +109,76 @@ var censusRegistry = []censusQuestion{
 				// compares a compression CODEC's name.
 				"json_scan.go": 1,
 				"ocf/ocf.go":   1,
+			}},
+		},
+	},
+	{
+		id:        "Q2",
+		question:  "What fullname does this named-type DEFINITION occupy?",
+		authority: "the wire builder's registration (schema.go, `o.Name = ns + \".\" + o.Name` feeding registerNamed) — every other representation must land on the same string, because the fullname is what a reference binds to",
+		answerers: []censusAnswerer{
+			{repr: "as-written aschema → compiled schemaNode", site: "builder namespace qualification → schemaNode.name", file: "schema.go"},
+			{repr: "metadata SchemaNode", site: "nodeFullname", file: "schema_node.go"},
+			{repr: "cache raw JSON tree", site: "nodeFullnameTree", file: "cache.go"},
+			{
+				repr: "pre-Parse any tree", site: "SchemaFor's namespace joins", file: "schema_for.go",
+				note: "not driven by the census: SchemaFor COMPOSES a tree rather than reading one, so it has no definition in hand to ask about. Its output is checked instead by handing the emitted schema to Parse — the authority above — in the SchemaFor round-trip suites.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `+ "." +`, counts: map[string]int{
+				"cache.go":       1, // nodeFullnameTree
+				"schema_node.go": 1, // nodeFullname
+				"schema_for.go":  2, // SchemaFor composition
+				"schema.go":      2, // builder qualification (2727); logical key (2165) — not this question
+				// Not answerers: an error FIELD PATH join, not a schema name.
+				"compat.go": 1,
+				"errors.go": 1,
+				// Not an answerer: a kind.logicalType lookup key.
+				"json_codec.go": 1,
+			}},
+			{pattern: `+"."+`, counts: map[string]int{
+				"schema.go": 1, // scopedRefKeys — the binding side of the same rule
+				"cache.go":  1, // dupDefRef — which spelling re-binds after a splice
+			}},
+		},
+	},
+	{
+		id:       "Q3",
+		question: "What does json.Marshal emit as the object key for this Go map key?",
+		authority: "EXTERNAL: encoding/json's resolveKeyName. It is executed per corpus cell by " +
+			"TestRegression_WalkBudgetMapKeyMatchesJSONKeyResolver, which compares against json.Marshal's " +
+			"actual output rather than any restatement of its rules — the whole point, since the two bugs " +
+			"in this area were both a restatement that was narrower than the authority",
+		answerers: []censusAnswerer{
+			{repr: "caller `any` tree, budget walk", site: "mapKeyEmitLen", file: "schema_node.go"},
+			{
+				repr: "caller `any` tree, fixup + canonicalize walk", site: "canonicalStringKeyMap", file: "schema_node.go",
+				note: "different-by-design: this arm asks a NARROWER question — 'do these keys canonicalize to their plain string value', which is true only for the string KIND. A non-string key's object-key form comes from its MarshalText, so such maps stay marshal-opaque and are never rewritten. It must not be collapsed into mapKeyEmitLen, whose question is 'how many bytes does this key cost'; the two agree on the string-kind arm and are deliberately different elsewhere.",
+			},
+			// SchemaFor's tree canonicalizer (canonicalizeTreeValue,
+			// schema_for.go) is NOT a separate answerer: it calls
+			// canonicalStringKeyMap. That is the shape this census wants —
+			// a second representation consuming the one predicate instead
+			// of restating it — and it is recorded here so a later edit
+			// that inlines the check reads as the regression it would be.
+		},
+		tells: []censusTell{
+			{pattern: `.Key().Kind()`, counts: map[string]int{
+				"schema_node.go": 1, // canonicalStringKeyMap
+				// Not answerers of this question: these decide the Go type of
+				// an AVRO map's keys for encode/decode/resolve/SchemaFor,
+				// where the key form is Avro's own string wire, not a JSON
+				// object key.
+				"deser.go":       2,
+				"json_codec.go":  2,
+				"json_decode.go": 2,
+				"resolve.go":     1,
+				"schema_for.go":  1,
+				"ser.go":         3,
+			}},
+			{pattern: `k.Kind() == reflect.String`, counts: map[string]int{
+				"schema_node.go": 1, // mapKeyEmitLen's string-kind arm
 			}},
 		},
 	},
@@ -309,5 +380,119 @@ func TestCensus_Q1_CorpusIsNotVacuous(t *testing.T) {
 	}
 	if nulls < 2 || nonNulls < 2 || wrappedNulls < 2 {
 		t.Fatalf("corpus is too thin to discriminate: %d null (%d wrapped), %d non-null", nulls, wrappedNulls, nonNulls)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q2 — what fullname does a named-type definition occupy?
+// ---------------------------------------------------------------------
+
+// A definition's fullname is the string a reference has to bind to, so
+// every representation that computes one has to land on the same answer.
+// The name can arrive dotted, split across a "namespace" attribute,
+// inherited from the enclosing scope, or explicitly escaped back to the
+// null namespace — and the rules interact (a dotted name outranks both the
+// attribute and the enclosing scope).
+type fullnameCell struct {
+	name     string // the definition's "name" as written
+	nsAttr   string // its "namespace" attribute; "" means the key is absent
+	hasNSKey bool   // whether "namespace" is present at all (present-and-empty differs)
+	lax      bool   // needs an accept-all name validator to parse at all
+	want     string
+}
+
+var fullnameCorpus = []fullnameCell{
+	{name: "Foo", want: "ns.Foo"},                                     // inherited from the enclosing scope
+	{name: "Foo", nsAttr: "other", hasNSKey: true, want: "other.Foo"}, // attribute overrides the enclosing scope
+	{name: "Foo", nsAttr: "", hasNSKey: true, want: "Foo"},            // present-and-empty: the null-namespace escape
+	{name: "x.Foo", want: "x.Foo"},                                    // dotted name outranks the enclosing scope
+	{name: "x.Foo", nsAttr: "other", hasNSKey: true, want: "x.Foo"},   // dotted name outranks the attribute
+	{name: "a.b.c.Foo", want: "a.b.c.Foo"},                            // multi-component
+	// The leading-dot escape is normalized at parse into the
+	// null-namespace fullname. In a DEFINITION it carries an empty
+	// namespace component, which the strict grammar rejects, so these
+	// cells only exist under an accept-all validator — which is exactly
+	// where a normalization that only one representation performs would
+	// go unnoticed.
+	{name: ".Foo", lax: true, want: "Foo"},
+	{name: ".Foo", nsAttr: "other", hasNSKey: true, lax: true, want: "Foo"},
+}
+
+// TestCensus_Q2_DefinitionFullnameAgreement builds one enclosing schema per
+// cell and asks each representation what fullname the inner definition
+// occupies. The compiled tree is the authority — it is the name the wire
+// builder registers, and therefore the name a reference actually binds to —
+// so a metadata or cache-tree answer that differs means a reference resolves
+// to one type on the wire and another in the surface that re-emits it.
+func TestCensus_Q2_DefinitionFullnameAgreement(t *testing.T) {
+	for _, cell := range fullnameCorpus {
+		label := cell.name
+		if cell.hasNSKey {
+			label += "+ns=" + strconv.Quote(cell.nsAttr)
+		}
+		t.Run(label, func(t *testing.T) {
+			inner := `{"type":"record","name":` + strconv.Quote(cell.name)
+			if cell.hasNSKey {
+				inner += `,"namespace":` + strconv.Quote(cell.nsAttr)
+			}
+			inner += `,"fields":[{"name":"x","type":"int"}]}`
+			// The enclosing record establishes the "ns" scope the inner
+			// definition may or may not inherit.
+			text := `{"type":"record","name":"ns.Top","fields":[{"name":"a","type":` + inner + `}]}`
+
+			var opts []SchemaOpt
+			if cell.lax {
+				opts = append(opts, WithLaxNames(func(string) error { return nil }))
+			}
+			s, err := Parse(text, opts...)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			compiled := s.node.fields[0].node.name
+
+			root := s.Root()
+			metadata := nodeFullname(&root.Fields[0].Type)
+
+			var tree any
+			if err := json.Unmarshal([]byte(inner), &tree); err != nil {
+				t.Fatalf("inner is not valid JSON: %v", err)
+			}
+			cacheTree := nodeFullnameTree(tree.(map[string]any), "ns")
+
+			got := map[string]string{
+				"compiled schemaNode (authority)": compiled,
+				"metadata SchemaNode":             metadata,
+				"cache raw JSON tree":             cacheTree,
+			}
+			for repr, v := range got {
+				if v != cell.want {
+					t.Errorf("%s answered %q for definition %s, want %q — the representations disagree: %v",
+						repr, v, inner, cell.want, got)
+				}
+			}
+		})
+	}
+}
+
+// The corpus must exercise every way a namespace can arrive, or a
+// representation that mishandles one of them passes by not being asked.
+func TestCensus_Q2_CorpusIsNotVacuous(t *testing.T) {
+	var inherited, attr, nullEscape, dotted int
+	for _, c := range fullnameCorpus {
+		switch {
+		case strings.HasPrefix(c.name, "."):
+			nullEscape++
+		case strings.Contains(c.name, "."):
+			dotted++
+		case c.hasNSKey && c.nsAttr == "":
+			nullEscape++
+		case c.hasNSKey:
+			attr++
+		default:
+			inherited++
+		}
+	}
+	if inherited < 1 || attr < 1 || nullEscape < 2 || dotted < 2 {
+		t.Fatalf("corpus misses a namespace arrival form: inherited=%d attr=%d nullEscape=%d dotted=%d", inherited, attr, nullEscape, dotted)
 	}
 }
