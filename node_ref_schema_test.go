@@ -200,6 +200,73 @@ func TestNodeRefSchema_EditedTypeIgnoresStaleStamp(t *testing.T) {
 	})
 }
 
+// Whether an extracted reference node still names its stamped target is a
+// question the name resolver already owns: scopedRefKeys decides which
+// spellings bind, and it admits three — a fullname, a short name qualified
+// by the enclosing namespace, and the leading-dot null-namespace escape —
+// resolving the short form against the target's RESOLVED FULLNAME, which is
+// not the same string as its Name field when the definition writes its name
+// dotted. Every spelling the resolver binds must therefore convert; a guard
+// that re-lists the accepted spellings by hand instead of asking the
+// resolver under-accepts, and the node it wrongly calls stale emits a
+// dangling reference that fails its own re-parse.
+//
+// The scope the question is asked at is the scope the reference was WRITTEN
+// in, not the converted tree's: extraction re-roots the node at the null
+// namespace, so a short-name reference lifted out of its namespace is still
+// the same unedited reference.
+func TestNodeRefSchema_EverySpellingTheResolverBindsConverts(t *testing.T) {
+	fooVal := map[string]any{"x": int32(1)}
+
+	for _, tc := range []struct {
+		name    string
+		enclose string // enclosing schema; field "b" holds the reference
+		want    string // equivalent standalone definition
+	}{
+		{
+			name: "fullname",
+			enclose: `{"type":"record","name":"ns.Top","fields":[
+				{"name":"a","type":{"type":"record","name":"Foo","namespace":"ns","fields":[{"name":"x","type":"int"}]}},
+				{"name":"b","type":"ns.Foo"}]}`,
+			want: `{"type":"record","name":"Foo","namespace":"ns","fields":[{"name":"x","type":"int"}]}`,
+		},
+		{
+			name: "short-name-with-namespace-attribute",
+			enclose: `{"type":"record","name":"ns.Top","fields":[
+				{"name":"a","type":{"type":"record","name":"Foo","namespace":"ns","fields":[{"name":"x","type":"int"}]}},
+				{"name":"b","type":"Foo"}]}`,
+			want: `{"type":"record","name":"Foo","namespace":"ns","fields":[{"name":"x","type":"int"}]}`,
+		},
+		{
+			// The definition's name is written as a dotted fullname, so its
+			// Name field holds "ns.Foo" while the reference spells "Foo".
+			// Comparing the reference against the Name field misses this;
+			// comparing against the resolved fullname, as the resolver does,
+			// binds it.
+			name: "short-name-against-a-dotted-definition-name",
+			enclose: `{"type":"record","name":"ns.Top","fields":[
+				{"name":"a","type":{"type":"record","name":"ns.Foo","fields":[{"name":"x","type":"int"}]}},
+				{"name":"b","type":"Foo"}]}`,
+			want: `{"type":"record","name":"ns.Foo","fields":[{"name":"x","type":"int"}]}`,
+		},
+		{
+			// ".Foo" is the explicit null-namespace escape: an exact lookup
+			// of the null-namespace fullname, never qualified into the
+			// enclosing namespace.
+			name: "leading-dot-null-namespace-escape",
+			enclose: `{"type":"record","name":"ns.Top","fields":[
+				{"name":"a","type":{"type":"record","name":"Foo","namespace":"","fields":[{"name":"x","type":"int"}]}},
+				{"name":"b","type":".Foo"}]}`,
+			want: `{"type":"record","name":"Foo","fields":[{"name":"x","type":"int"}]}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := MustParse(tc.enclose).Root()
+			requireSubSchema(t, &root.Fields[1].Type, tc.want, fooVal)
+		})
+	}
+}
+
 // TestNodeRefSchemaMatrix is the class-elimination net for reference-node
 // extraction: kind × namespace spelling × extraction site × structure.
 // Each cell builds an enclosing schema whose extraction site holds a NAME

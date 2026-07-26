@@ -49,7 +49,7 @@ func TestInvariant_HiddenStateOnPublicStructs(t *testing.T) {
 	// test; adding a name here requires doing the same.
 	composableWithHiddenState := map[string]string{
 		"CustomType": "needsAvroType is fail-loud only: it can make Parse REJECT (when AvroType is empty), never silently substitute a value — pinned by TestInvariant_CustomTypeHiddenStateFailsLoud",
-		"SchemaNode": "refTarget is consulted only while it still names the node's exported Type (nodeRefTargetAgrees), so an edited Type always wins — pinned by TestNodeRefSchema_EditedTypeIgnoresStaleStamp",
+		"SchemaNode": "refTarget (with refNS, the scope it was resolved in — the two are one stamp and are only meaningful together) is consulted only while the name resolver still binds the node's exported Type to it (nodeRefTargetAgrees), so an edited Type always wins — pinned by TestNodeRefSchema_EditedTypeIgnoresStaleStamp",
 	}
 	for _, ty := range types {
 		exported, hidden := fieldSplit(ty)

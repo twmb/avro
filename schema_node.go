@@ -120,6 +120,14 @@ type SchemaNode struct {
 	// struct copies and slice extractions carry it, and a node rebuilt
 	// field-by-field drops it (the rebuilt node then behaves hand-built).
 	refTarget *SchemaNode
+
+	// refNS is the namespace scope refTarget was resolved in, recorded
+	// alongside the stamp because the two are only meaningful together:
+	// whether Type still names the target is a question about the scope the
+	// reference was WRITTEN in, and an extracted node is re-rooted at the
+	// null namespace, losing it. Set and read only with refTarget
+	// (nodeRefTargetAgrees); nil stamp means the value is unused.
+	refNS string
 }
 
 // SchemaField represents a field in an Avro record schema.
@@ -1781,6 +1789,7 @@ func stampNameRefs(n *SchemaNode, table map[string]*SchemaNode, ns string) {
 	}
 	if t := lookupNameRef(n, table, ns); t != nil {
 		n.refTarget = t
+		n.refNS = ns
 	}
 	child := nsForChildren(n, ns)
 	if n.Type == "array" {
@@ -1854,22 +1863,38 @@ func nodeIsNameRefShape(n *SchemaNode) bool {
 // then edits Type would otherwise get the ORIGINAL spelling's definition
 // spliced in, hidden state silently beating the exported field they just set.
 //
-// Agreement is "Type is one of the spellings that could have produced this
-// stamp": the target's fullname, or its short name (the two forms
-// lookupNameRef binds, per scopedRefKeys). Anything else — a primitive, a
-// different name — means the node was edited after Root() stamped it, so the
-// stamp is stale and ignored; the node then renders as an as-written
-// reference and behaves exactly like a hand-built one, binding to a
-// definition the converted tree provides or dangling loudly.
+// Agreement is decided by ASKING THE RESOLVER, never by restating which
+// spellings it binds: lookupNameRef against a one-entry table holding only
+// the stamped target. That inherits every form scopedRefKeys admits (the
+// fullname, a short name qualified by the enclosing namespace, and the
+// leading-dot null-namespace escape), the fullname-vs-Name distinction, and
+// the structural-kind rejection — including any later change to the resolver.
+// A hand-written list of accepted spellings is a snapshot that silently
+// under-accepts the day the resolver grows a form.
+//
+// The scope asked at is the one the stamp was MADE in (refNS), not the
+// walk's current enclosing namespace. Extraction is the whole point of the
+// splice, and an extracted node is re-rooted at the null namespace, so
+// asking at the walk's scope would call a short-name reference stale purely
+// because it was lifted out of its namespace — the node was never edited.
+// The question this predicate answers is "is Type still the spelling that
+// produced this stamp", and only the stamping scope can answer it.
+//
+// Anything else — a primitive, a different name — means the node was edited
+// after Root() stamped it, so the stamp is stale and ignored; the node then
+// renders as an as-written reference and behaves exactly like a hand-built
+// one, binding to a definition the converted tree provides or dangling
+// loudly.
 func nodeRefTargetAgrees(n *SchemaNode) bool {
 	t := n.refTarget
 	if t == nil {
 		return false
 	}
-	if fn := nodeFullname(t); fn != "" && n.Type == fn {
-		return true
+	fn := nodeFullname(t)
+	if fn == "" {
+		return false
 	}
-	return t.Name != "" && n.Type == t.Name
+	return lookupNameRef(n, map[string]*SchemaNode{fn: t}, n.refNS) == t
 }
 
 
