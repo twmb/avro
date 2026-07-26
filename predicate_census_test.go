@@ -273,8 +273,9 @@ var censusRegistry = []censusQuestion{
 			"computes the verdict, liftFieldLogicalIntoType performs the move, and the verdict's comment claims to " +
 			"mirror the lift. They drifted before, on the wrapped-null branch",
 		answerers: []censusAnswerer{
-			{repr: "as-written aschema, verdict", site: "fieldDecimalLiftConsumesPrecisionScale", file: "schema.go"},
-			{repr: "as-written aschema, mutation", site: "liftFieldLogicalIntoType", file: "schema.go"},
+			{repr: "as-written aschema, SHARED navigation", site: "liftTarget + liftEffectiveLogical", file: "schema.go"},
+			{repr: "as-written aschema, verdict", site: "fieldDecimalLiftConsumesPrecisionScale (reads through liftEffectiveLogical)", file: "schema.go"},
+			{repr: "as-written aschema, mutation", site: "liftFieldLogicalIntoType (moves through liftTarget)", file: "schema.go"},
 			{
 				repr: "compiled schemaNode + metadata", site: "decimalConsumesPrecisionScale call sites", file: "schema_node.go",
 				note: "not a separate answerer: the shared carrier test, consulted by the render and Props routing. Registered so the guard watches its count — a new hand-rolled bytes/fixed check beside it would be the drift.",
@@ -284,7 +285,7 @@ var censusRegistry = []censusQuestion{
 			{pattern: `decimalConsumesPrecisionScale`, counts: map[string]int{
 				"schema_node.go":  5,
 				"schema_parse.go": 2,
-				"schema.go":       6,
+				"schema.go":       3,
 			}},
 			// Rejected tell: `Logical == ""` — 6 hits in schema.go, three of
 			// them the lift's closer-to-the-type gates and three unrelated
@@ -1237,22 +1238,34 @@ func liftTargetCorpus() []liftTargetCell {
 		// declines to overwrite an annotation the target already has, so the
 		// field's "decimal" never lands — but the verdict reads the FIELD's
 		// logical, not the one that survives.
-		{name: "target-already-annotated", fieldType: `{"type":"bytes","logicalType":"uuid"}`, byDesign: annotationIndependent},
-		{name: "union-target-already-annotated", fieldType: `["null",{"type":"bytes","logicalType":"uuid"}]`, byDesign: annotationIndependent},
+		{name: "target-already-annotated", fieldType: `{"type":"bytes","logicalType":"uuid"}`},
+		{name: "union-target-already-annotated", fieldType: `["null",{"type":"bytes","logicalType":"uuid"}]`},
+		// The DISCRIMINATOR: the target's own logical IS decimal, so the
+		// field's parameters land on a real decimal carrier and ARE
+		// consumed. Without this cell the rule could be loosened into
+		// "a target with any annotation of its own is inert".
+		{name: "target-own-logical-is-decimal", fieldType: `{"type":"bytes","logicalType":"decimal"}`},
+		// The union twin of the cell above is deliberately absent: it cannot
+		// be measured, because its VALID control does not parse. The lift's
+		// object arm fills precision/scale onto a target that already has its
+		// own logical, but its union arm does not, so
+		// ["null",{"type":"bytes","logicalType":"decimal"}] with field-level
+		// params never receives them and rejects with "decimal logical type
+		// requires precision" — while the nested twin above builds. That
+		// asymmetry is inside the lift and is reported separately; a cell
+		// whose control fails measures nothing.
+		{name: "fixed-target-own-logical-is-decimal", fieldType: `{"type":"fixed","name":"F","size":4,"logicalType":"decimal"}`},
+		// Non-decimal effective logical on a carrier: inert.
+		{name: "target-own-logical-big-decimal", fieldType: `{"type":"bytes","logicalType":"big-decimal"}`},
 	}
 }
 
-// annotationIndependent is the documented reason the two navigations part
-// company on a target that already carries its own logicalType: consumption
-// follows the lift TARGET's carrier KIND as written, deliberately
-// independent of the target's own annotation, while the lift's
-// closer-to-the-type rule declines to overwrite that annotation. So the pair
-// is validated as decimal parameters on a carrier the field's "decimal"
-// never reaches. Ruled and pinned (NOT_BUGS #71,
-// TestRegression_FieldDecimalConsumedMalformedParamReject's
-// union-annotated-carrier cell); the alternative would treat a malformed
-// scale as absent and parse as decimal(p,0), a silent wire-semantics change.
-const annotationIndependent = "consumption follows the lift target's carrier KIND as written, independent of the target's own annotation (NOT_BUGS #71)"
+// Consumption is decided by what LANDS, not by where the lift points: the
+// pair is consumed iff the target's EFFECTIVE logical — its own when it has
+// one, else the field's — is "decimal" on a bytes/fixed carrier. The two
+// pre-annotated-target cells below were once recorded as different-by-design
+// on the opposite reading; wire evidence retired that (see the discriminator
+// cells, which prove consumed-ness rather than assuming it).
 
 func liftFieldSchema(fieldType, precision string) string {
 	return `{"type":"record","name":"R","fields":[{"name":"f","type":` + fieldType +

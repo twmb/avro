@@ -669,47 +669,103 @@ var afieldComplexKeys = map[string]string{
 // definition wins (closer-to-the-type wins). After lifting, the
 // field-level copies are cleared so canonical re-emit does not duplicate
 // them.
+// liftTarget returns the aschema a field-level logicalType annotation lands
+// on, or nil when the field carries none or nothing can receive it.
+//
+// This is the ONE navigation for the field-level lift: liftFieldLogicalIntoType
+// moves the annotation through it, and fieldDecimalLiftConsumesPrecisionScale
+// reads through it. Keeping both on one function is what stops the verdict
+// from validating parameters against a type the lift never addressed; the two
+// drifted apart once already, on the wrapped-null branch.
+func (f *afield) liftTarget() *aschema {
+	if f.Logical == "" || f.Type == nil {
+		return nil
+	}
+	switch {
+	case f.Type.primitive != "":
+		return f.Type
+	case len(f.Type.union) > 0:
+		for i := range f.Type.union {
+			if f.Type.union[i].isNullBranch() {
+				continue
+			}
+			return &f.Type.union[i] // first non-null branch only, like the lift
+		}
+		return nil
+	case f.Type.object != nil:
+		return f.Type
+	}
+	return nil
+}
+
+// liftEffectiveLogical reports the lift target's kind and the logical type in
+// EFFECT there once the lift has run: the target's OWN annotation when it has
+// one — closer to the type wins, so the field's is dropped — and otherwise the
+// field's.
+//
+// Consumption is a question about what LANDS, not about where the lift points.
+// A field-level "decimal" that never reaches its target cannot make that
+// target read precision/scale, so the pair is inert metadata there and rides
+// to Props like any custom property.
+func (f *afield) liftEffectiveLogical() (kind, logical string, ok bool) {
+	t := f.liftTarget()
+	if t == nil {
+		return "", "", false
+	}
+	switch {
+	case t.primitive != "":
+		// A bare primitive carries no annotation of its own, so the field's
+		// always takes effect.
+		return t.primitive, f.Logical, true
+	case t.object != nil:
+		if t.object.Logical != "" {
+			return t.object.Type, t.object.Logical, true
+		}
+		return t.object.Type, f.Logical, true
+	}
+	return "", "", false
+}
+
 func (f *afield) liftFieldLogicalIntoType() {
 	if f.Logical == "" || f.Type == nil {
 		return
 	}
 
+	// The target comes from the SHARED navigation, so the lift and the
+	// consume verdict can never address different types. Apply to the FIRST
+	// non-null union branch only. Closer-to-the-type wins: if the target is
+	// already an object with its own annotation, the field-level one is
+	// redundant and dropped — we do NOT fall through to a later non-null
+	// branch (that would silently mutate a different type than the
+	// spec-equivalent nested form would have addressed, and on the
+	// `[null, T+logical, T]` shape would even synthesize a duplicate union
+	// member).
+	target := f.liftTarget()
+	if target == nil {
+		return
+	}
 	switch {
+	case target != f.Type && target.primitive != "":
+		// A union branch written as a bare primitive:
+		// {"type":["null","long"], "logicalType":"x"} →
+		//   {"type":["null",{"type":"long","logicalType":"x"}]}
+		*target = aschema{object: f.newLogicalObject(target.primitive)}
+
+	case target != f.Type && target.object != nil:
+		if target.object.Logical == "" {
+			target.object.Logical = f.Logical
+			if target.object.Scale == nil {
+				target.object.Scale = clonePtrInt(f.Scale)
+			}
+			if target.object.Precision == nil {
+				target.object.Precision = clonePtrInt(f.Precision)
+			}
+		}
+
 	case f.Type.primitive != "":
 		// {"type":"long", "logicalType":"x"} →
 		//   {"type":{"type":"long", "logicalType":"x"}}
 		f.Type = &aschema{object: f.newLogicalObject(f.Type.primitive)}
-
-	case len(f.Type.union) > 0:
-		// {"type":["null","long"], "logicalType":"x"} →
-		//   {"type":["null",{"type":"long","logicalType":"x"}]}
-		// Apply to the FIRST non-null branch only. Closer-to-the-type
-		// wins: if that branch is already an object with its own
-		// annotation, the field-level annotation is redundant and we
-		// drop it — we do NOT fall through to a later non-null branch
-		// (that would silently mutate a different type than the spec-
-		// equivalent nested form would have addressed, and on the
-		// `[null, T+logical, T]` shape would even synthesize a
-		// duplicate union member).
-		for i := range f.Type.union {
-			branch := &f.Type.union[i]
-			if branch.isNullBranch() {
-				continue
-			}
-			switch {
-			case branch.primitive != "":
-				f.Type.union[i] = aschema{object: f.newLogicalObject(branch.primitive)}
-			case branch.object != nil && branch.object.Logical == "":
-				branch.object.Logical = f.Logical
-				if branch.object.Scale == nil {
-					branch.object.Scale = clonePtrInt(f.Scale)
-				}
-				if branch.object.Precision == nil {
-					branch.object.Precision = clonePtrInt(f.Precision)
-				}
-			}
-			break // first non-null branch only
-		}
 
 	case f.Type.object != nil:
 		// {"type":{"type":"long"}, "logicalType":"x"} →
@@ -740,33 +796,8 @@ func (f *afield) liftFieldLogicalIntoType() {
 // change where the lift points). Everywhere else the pair is inert field
 // metadata and a malformed body rides to the field's props verbatim.
 func (f *afield) fieldDecimalLiftConsumesPrecisionScale() bool {
-	if f.Type == nil || f.Logical != "decimal" {
-		return false
-	}
-	t := f.Type
-	switch {
-	case t.primitive != "":
-		return decimalConsumesPrecisionScale(t.primitive, f.Logical)
-	case len(t.union) > 0:
-		for i := range t.union {
-			b := &t.union[i]
-			if b.isNullBranch() {
-				continue
-			}
-			// First non-null branch only, mirroring the lift.
-			switch {
-			case b.primitive != "":
-				return decimalConsumesPrecisionScale(b.primitive, f.Logical)
-			case b.object != nil:
-				return decimalConsumesPrecisionScale(b.object.Type, f.Logical)
-			}
-			return false
-		}
-		return false
-	case t.object != nil:
-		return decimalConsumesPrecisionScale(t.object.Type, f.Logical)
-	}
-	return false
+	kind, logical, ok := f.liftEffectiveLogical()
+	return ok && decimalConsumesPrecisionScale(kind, logical)
 }
 
 // newLogicalObject builds an aobject describing the field's primitive type

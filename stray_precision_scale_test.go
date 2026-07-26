@@ -2,6 +2,7 @@ package avro_test
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -355,9 +356,12 @@ func TestRegression_FlatFieldMalformedPrecisionMatchesNestedTwin(t *testing.T) {
 // against "treat malformed as absent": scale is OPTIONAL (spec default 0),
 // so silently dropping a malformed scale beside a valid precision would
 // parse as decimal(p,0) — a silent wire-semantics change (#55
-// anti-silent-drop). The union-annotated cell pins that consumption follows
-// the lift TARGET's carrier kind as-written, independent of the target's
-// own logical annotation.
+// anti-silent-drop). Consumption follows what the lift LANDS, not
+// where it points: the pair is consumed exactly where the target's EFFECTIVE
+// logical — its own when it has one, else the field's — is "decimal" on a
+// bytes/fixed carrier. The pre-annotated-target cells therefore live in the
+// INERT test below, and the own-logical-is-decimal cells here are what keep
+// the rule from being loosened into "any annotation of its own is inert".
 func TestRegression_FieldDecimalConsumedMalformedParamReject(t *testing.T) {
 	cases := []struct{ name, src, key string }{
 		{
@@ -381,8 +385,16 @@ func TestRegression_FieldDecimalConsumedMalformedParamReject(t *testing.T) {
 			"precision",
 		},
 		{
-			"union-annotated-carrier-precision",
-			`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"fixed","name":"F","size":4,"logicalType":"uuid"}],"logicalType":"decimal","precision":"x"}]}`,
+			// DISCRIMINATOR: the target's OWN logical is decimal, so the
+			// field's parameters land on a real decimal carrier and are
+			// genuinely consumed. Proven by wire below, not assumed.
+			"target-own-logical-decimal-precision",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"bytes","logicalType":"decimal"},"logicalType":"decimal","precision":"x","scale":2}]}`,
+			"precision",
+		},
+		{
+			"fixed-target-own-logical-decimal-precision",
+			`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"fixed","name":"F","size":4,"logicalType":"decimal"},"logicalType":"decimal","precision":"x","scale":2}]}`,
 			"precision",
 		},
 		{
@@ -938,6 +950,88 @@ func TestRegression_StrayFieldsElementPrecisionRouting(t *testing.T) {
 		}
 		if _, ok := n.Props["fields"]; !ok {
 			t.Errorf("malformed stray fields body missing from Props: %#v", n.Props)
+		}
+	})
+}
+
+// A field-level "decimal" whose lift TARGET already carries its own logical
+// type never lands: closer-to-the-type wins, so the target keeps its own
+// annotation and the field's precision/scale annotate nothing. The pair is
+// therefore inert metadata there and rides to Props like any custom
+// property, malformed or not.
+//
+// Inertness is PROVEN on the wire rather than asserted: the encoding is
+// byte-identical with scale 0, with scale 2, and with no field-level logical
+// at all. The discriminator is the sibling case where the target's own
+// logical IS decimal — there the same parameters DO land, and scale 0 versus
+// 2 diverges, which is what keeps this rule from being loosened into "a
+// target with any annotation of its own is inert".
+func TestRegression_FieldDecimalNotLandingIsInert(t *testing.T) {
+	field := func(target, fieldAttrs string) string {
+		return `{"type":"record","name":"R","fields":[{"name":"f","type":` + target + fieldAttrs + `}]}`
+	}
+	const bigDec = `{"type":"bytes","logicalType":"big-decimal"}`
+
+	t.Run("malformed params are inert and reach Props", func(t *testing.T) {
+		for _, target := range []string{
+			bigDec,
+			`["null",{"type":"fixed","name":"F","size":4,"logicalType":"uuid"}]`,
+			`{"type":"bytes","logicalType":"uuid"}`,
+		} {
+			src := field(target, `,"logicalType":"decimal","precision":"x"`)
+			s, err := avro.Parse(src)
+			if err != nil {
+				t.Fatalf("Parse(%s): a pair that annotates nothing must be inert, not a reject: %v", src, err)
+			}
+			if got := s.Root().Fields[0].Props["precision"]; got != "x" {
+				t.Errorf("target %s: Props[precision] = %#v; an unconsumed pair rides verbatim, want \"x\"", target, got)
+			}
+		}
+	})
+
+	t.Run("wire proves the field decimal never landed", func(t *testing.T) {
+		val := map[string]any{"f": big.NewRat(123, 100)}
+		var wires []string
+		for _, attrs := range []string{
+			`,"logicalType":"decimal","precision":4,"scale":2`,
+			`,"logicalType":"decimal","precision":4,"scale":0`,
+			``, // no field-level logical at all
+		} {
+			s, err := avro.Parse(field(bigDec, attrs))
+			if err != nil {
+				t.Fatalf("Parse(%s): %v", attrs, err)
+			}
+			b, err := s.Encode(val)
+			if err != nil {
+				t.Fatalf("encode(%s): %v", attrs, err)
+			}
+			wires = append(wires, hex.EncodeToString(b))
+		}
+		for i := range wires {
+			if wires[i] != wires[0] {
+				t.Fatalf("wire differs across field-level params (%v); the field decimal DID land, so the pair is not inert", wires)
+			}
+		}
+	})
+
+	t.Run("discriminator: when the target's own logical IS decimal the params land", func(t *testing.T) {
+		const ownDec = `{"type":"bytes","logicalType":"decimal"}`
+		val := map[string]any{"f": big.NewRat(123, 100)}
+
+		s2, err := avro.Parse(field(ownDec, `,"logicalType":"decimal","precision":4,"scale":2`))
+		if err != nil {
+			t.Fatalf("scale 2: %v", err)
+		}
+		if _, err := s2.Encode(val); err != nil {
+			t.Fatalf("scale 2 must encode 123/100 exactly: %v", err)
+		}
+
+		s0, err := avro.Parse(field(ownDec, `,"logicalType":"decimal","precision":4,"scale":0`))
+		if err != nil {
+			t.Fatalf("scale 0: %v", err)
+		}
+		if _, err := s0.Encode(val); err == nil {
+			t.Fatal("scale 0 must refuse 123/100 (it cannot be represented without rounding); if it does not, the field's scale never landed and this cell no longer discriminates")
 		}
 	})
 }
