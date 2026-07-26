@@ -1035,3 +1035,124 @@ func TestRegression_FieldDecimalNotLandingIsInert(t *testing.T) {
 		}
 	})
 }
+
+// A field-level logicalType annotation reaches its target through one
+// navigation, and the target is written in one of four spellings: a bare
+// primitive, a type object, a bare primitive as the first non-null union
+// branch, or an object as that branch. All four describe the same post-lift
+// schema, so all four must reach the same verdict and the same wire.
+//
+// The arms disagreed before: the object arm completed missing precision/scale
+// onto a target that already declared its own logicalType, while the union
+// arm declined, so {"type":"bytes","logicalType":"decimal"} with field-level
+// parameters built and its ["null", ...] twin rejected for a missing
+// precision. Annotation and parameters are separate questions — closer to the
+// type wins the annotation, and the field still completes parameters where
+// the effective logical is decimal.
+func TestRegression_FieldLogicalLiftSpellingParity(t *testing.T) {
+	const fieldAttrs = `,"logicalType":"decimal","precision":4,"scale":2`
+	val := map[string]any{"f": big.NewRat(123, 100)}
+
+	build := func(t *testing.T, fieldType string) (string, error) {
+		t.Helper()
+		s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":` + fieldType + fieldAttrs + `}]}`)
+		if err != nil {
+			return "", err
+		}
+		b, err := s.Encode(val)
+		if err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(b), nil
+	}
+
+	// Group 1: the target declares its own "decimal" and the field supplies
+	// the parameters. Every spelling must build, and the two union spellings
+	// must agree with each other (they carry a branch index the nested forms
+	// do not).
+	t.Run("target declares decimal, field supplies params", func(t *testing.T) {
+		nested, err := build(t, `{"type":"bytes","logicalType":"decimal"}`)
+		if err != nil {
+			t.Fatalf("nested object spelling: %v", err)
+		}
+		union, err := build(t, `["null",{"type":"bytes","logicalType":"decimal"}]`)
+		if err != nil {
+			t.Fatalf("union spelling rejected while its nested twin built — the arms disagree: %v", err)
+		}
+		if union != "02"+nested {
+			t.Errorf("union wire %s is not the null-union framing of the nested wire %s", union, nested)
+		}
+	})
+
+	// Group 2: the field carries the annotation and the target declares
+	// none. The bare-primitive and object spellings are the same schema.
+	t.Run("field supplies annotation and params", func(t *testing.T) {
+		bare, err := build(t, `"bytes"`)
+		if err != nil {
+			t.Fatalf("bare primitive: %v", err)
+		}
+		object, err := build(t, `{"type":"bytes"}`)
+		if err != nil {
+			t.Fatalf("type object: %v", err)
+		}
+		if bare != object {
+			t.Errorf("bare primitive %s and type object %s describe the same schema but encode differently", bare, object)
+		}
+		unionBare, err := build(t, `["null","bytes"]`)
+		if err != nil {
+			t.Fatalf("union of bare primitive: %v", err)
+		}
+		unionObject, err := build(t, `["null",{"type":"bytes"}]`)
+		if err != nil {
+			t.Fatalf("union of type object: %v", err)
+		}
+		if unionBare != unionObject {
+			t.Errorf("union spellings diverge: bare branch %s, object branch %s", unionBare, unionObject)
+		}
+		if unionBare != "02"+bare {
+			t.Errorf("union wire %s is not the null-union framing of %s", unionBare, bare)
+		}
+	})
+}
+
+// Completing precision/scale only where the effective logical is "decimal"
+// also stops them being written into a type whose logical is something else.
+// That is unobservable, and this pins the claim rather than reasoning about
+// it: the parameters are absent from the canonical form either way (the
+// canonical transform strips them), and the wire is byte-identical, because
+// nothing but the decimal codec reads them.
+//
+// Note this pin cannot fail by neutering the gate — both behaviors produce
+// the same bytes, which is precisely what it asserts. It exists so the claim
+// is recorded as measured rather than assumed, and it WOULD fail if some
+// future consumer started reading precision/scale off a non-decimal type.
+func TestRegression_FieldParamsOnNonDecimalTargetAreUnobservable(t *testing.T) {
+	for _, c := range []struct{ name, fieldType, logical string }{
+		{"bare-primitive-uuid", `"string"`, "uuid"},
+		{"bare-primitive-unknown", `"long"`, "nonsense"},
+		{"object-big-decimal", `{"type":"bytes","logicalType":"big-decimal"}`, "decimal"},
+		{"object-uuid", `{"type":"bytes","logicalType":"uuid"}`, "decimal"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mk := func(params string) *avro.Schema {
+				t.Helper()
+				s, err := avro.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":` +
+					c.fieldType + `,"logicalType":"` + c.logical + `"` + params + `}]}`)
+				if err != nil {
+					t.Fatalf("Parse(params=%q): %v", params, err)
+				}
+				return s
+			}
+			with, without := mk(`,"precision":4,"scale":2`), mk(``)
+			if !bytes.Equal(with.Canonical(), without.Canonical()) {
+				t.Errorf("canonical form differs with/without the parameters:\n with: %s\n  w/o: %s", with.Canonical(), without.Canonical())
+			}
+			// Same for the scale, which is the parameter that would change a
+			// decimal encoding if it were ever read here.
+			other := mk(`,"precision":4,"scale":0`)
+			if !bytes.Equal(with.Canonical(), other.Canonical()) {
+				t.Errorf("canonical form depends on the scale on a non-decimal target: %s vs %s", with.Canonical(), other.Canonical())
+			}
+		})
+	}
+}

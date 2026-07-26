@@ -1245,15 +1245,11 @@ func liftTargetCorpus() []liftTargetCell {
 		// consumed. Without this cell the rule could be loosened into
 		// "a target with any annotation of its own is inert".
 		{name: "target-own-logical-is-decimal", fieldType: `{"type":"bytes","logicalType":"decimal"}`},
-		// The union twin of the cell above is deliberately absent: it cannot
-		// be measured, because its VALID control does not parse. The lift's
-		// object arm fills precision/scale onto a target that already has its
-		// own logical, but its union arm does not, so
-		// ["null",{"type":"bytes","logicalType":"decimal"}] with field-level
-		// params never receives them and rejects with "decimal logical type
-		// requires precision" — while the nested twin above builds. That
-		// asymmetry is inside the lift and is reported separately; a cell
-		// whose control fails measures nothing.
+		// The union twin of the cell above. It was once unmeasurable — its
+		// VALID control did not parse, because the lift's union arm declined
+		// to complete parameters the object arm supplied — and now exists,
+		// which is the whole point of aligning the arms.
+		{name: "union-target-own-logical-is-decimal", fieldType: `["null",{"type":"bytes","logicalType":"decimal"}]`},
 		{name: "fixed-target-own-logical-is-decimal", fieldType: `{"type":"fixed","name":"F","size":4,"logicalType":"decimal"}`},
 		// Non-decimal effective logical on a carrier: inert.
 		{name: "target-own-logical-big-decimal", fieldType: `{"type":"bytes","logicalType":"big-decimal"}`},

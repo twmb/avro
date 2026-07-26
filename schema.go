@@ -727,33 +727,48 @@ func (f *afield) liftEffectiveLogical() (kind, logical string, ok bool) {
 }
 
 func (f *afield) liftFieldLogicalIntoType() {
-	if f.Logical == "" || f.Type == nil {
-		return
-	}
-
 	// The target comes from the SHARED navigation, so the lift and the
-	// consume verdict can never address different types. Apply to the FIRST
-	// non-null union branch only. Closer-to-the-type wins: if the target is
-	// already an object with its own annotation, the field-level one is
-	// redundant and dropped — we do NOT fall through to a later non-null
-	// branch (that would silently mutate a different type than the
-	// spec-equivalent nested form would have addressed, and on the
-	// `[null, T+logical, T]` shape would even synthesize a duplicate union
-	// member).
+	// consume verdict can never address different types. It is the FIRST
+	// non-null union branch, the type object, or the bare primitive — we do
+	// NOT fall through to a later non-null branch (that would silently mutate
+	// a different type than the spec-equivalent nested form would have
+	// addressed, and on the `[null, T+logical, T]` shape would even
+	// synthesize a duplicate union member).
 	target := f.liftTarget()
 	if target == nil {
 		return
 	}
-	switch {
-	case target != f.Type && target.primitive != "":
-		// A union branch written as a bare primitive:
-		// {"type":["null","long"], "logicalType":"x"} →
-		//   {"type":["null",{"type":"long","logicalType":"x"}]}
-		*target = aschema{object: f.newLogicalObject(target.primitive)}
 
-	case target != f.Type && target.object != nil:
+	// ANNOTATION and PARAMETERS are separate questions, and conflating them
+	// made the two spellings of one schema disagree. Closer-to-the-type wins
+	// the ANNOTATION: a target that already declares its own logicalType
+	// keeps it and the field's is dropped. The field still completes missing
+	// PARAMETERS, but only where they mean something — where the EFFECTIVE
+	// logical (the target's own if it has one, else the field's) is
+	// "decimal". Anywhere else precision/scale annotate nothing, so copying
+	// them in would write inert keys into the type.
+	_, effLogical, _ := f.liftEffectiveLogical()
+	fillParams := effLogical == "decimal"
+
+	switch {
+	case target.primitive != "":
+		// A bare primitive, at the field's type position or as a union
+		// branch: {"type":["null","long"], "logicalType":"x"} →
+		//   {"type":["null",{"type":"long","logicalType":"x"}]}
+		obj := &aobject{Type: target.primitive, Logical: f.Logical}
+		if fillParams {
+			obj.Scale = clonePtrInt(f.Scale)
+			obj.Precision = clonePtrInt(f.Precision)
+		}
+		*target = aschema{object: obj}
+
+	case target.object != nil:
+		// {"type":{"type":"long"}, "logicalType":"x"} →
+		//   {"type":{"type":"long","logicalType":"x"}}
 		if target.object.Logical == "" {
 			target.object.Logical = f.Logical
+		}
+		if fillParams {
 			if target.object.Scale == nil {
 				target.object.Scale = clonePtrInt(f.Scale)
 			}
@@ -761,29 +776,7 @@ func (f *afield) liftFieldLogicalIntoType() {
 				target.object.Precision = clonePtrInt(f.Precision)
 			}
 		}
-
-	case f.Type.primitive != "":
-		// {"type":"long", "logicalType":"x"} →
-		//   {"type":{"type":"long", "logicalType":"x"}}
-		f.Type = &aschema{object: f.newLogicalObject(f.Type.primitive)}
-
-	case f.Type.object != nil:
-		// {"type":{"type":"long"}, "logicalType":"x"} →
-		//   {"type":{"type":"long","logicalType":"x"}}.
-		// Closer-to-the-type annotation wins; only fill in fields the
-		// inner object didn't already declare.
-		if f.Type.object.Logical == "" {
-			f.Type.object.Logical = f.Logical
-		}
-		if f.Type.object.Scale == nil {
-			f.Type.object.Scale = clonePtrInt(f.Scale)
-		}
-		if f.Type.object.Precision == nil {
-			f.Type.object.Precision = clonePtrInt(f.Precision)
-		}
 	}
-
-	f.Logical, f.Scale, f.Precision = "", nil, nil
 }
 
 // fieldDecimalLiftConsumesPrecisionScale reports whether the field-level
