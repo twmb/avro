@@ -8209,3 +8209,80 @@ structurally exempt.
   PATTERNS 146.4→152.4KB, BOTH over cap — next round opens with a DOUBLE
   distillation pass · UNCONVERGED (counter 0), freeze stays.
 
+
+## Distillation archive (2026-07-26 #3)
+
+### AUDIT_CORE §Round ledger — the two census-era entries, verbatim before compression
+
+Compressed to one-liners in place; the census's own registry and the NOT_BUGS
+clauses are the durable record of what these rounds built.
+
+- 2026-07-25 · 455cd37 (START head — 455cd37..HEAD quarantines this
+  round's commits) · FIX + CONSOLIDATION (ruling-directed) · 4 commits:
+  b74095e ref-stamp, 197d96c map-key, 0cc91ab census+Q1, bcb687b Q2+Q3 ·
+  BOTH fixes by DELEGATION, not restatement: nodeRefTargetAgrees now asks
+  lookupNameRef with a one-entry table; mapKeyEmitLen mirrors
+  resolveKeyName arm-for-arm INCLUDING its guards, and its terminal panic
+  becomes valueWalkBadMapKey → a named error (closes the PRE-EXISTING
+  nil-interface stdlib panic too) · DEVIATION from the literal ruling,
+  executed not assumed: `lookupNameRef(..., enclosingNS)` reds 35 cells
+  (the whole inherit/shadow families of the existing extraction matrix)
+  because toJSONDedup re-roots an extraction at the null namespace — the
+  stamp's SCOPE is recorded as refNS and asked at instead; neuter B is
+  that evidence · CENSUS LANDED (predicate_census_test.go): generates over
+  IMPLEMENTATIONS, the axis every input matrix is blind to; drift guard
+  scans sources, per-file tell COUNTS, vacuity in both directions ·
+  registered Q1 null-spelling (3 reprs/11 cells) · Q2 definition fullname
+  (3 reprs/8 cells, incl. lax leading-dot) · Q3 json map object-key
+  (EXTERNAL authority EXECUTED per cell) · Q2/Q3 both AGREE today — a
+  clean question is a valid outcome; the driver is what keeps it true ·
+  MY ERROR, self-caught before commit: registered SchemaFor's
+  canonicalizeTreeValue as a third Q3 answerer; it DELEGATES to
+  canonicalStringKeyMap, and the site I meant was inferType's Avro-map-key
+  check — verify the site, never the recollection · 7 neuters all
+  disjoint (A 2-cell / B 35 / C 1 / D 1 / guard-count / guard-vacuity /
+  Q2-metadata 3) · docs: P20+P21 collapsed to one class pointing at the
+  registry (both numbers kept), NOT_BUGS #68 key-resolver clause, FIX.md
+  item 0a + pre-action-gate census line (a fix touching a predicate MUST
+  register it), §Open net gaps updated to PARTLY closed with the
+  combinatorial remainder named · suite + fastavro green after every
+  commit (0 fail, 0 `missing optional dependency`), -race green on every
+  new family; Java ABSENT (no JVM) · CORE 55.1KB (at cap), PATTERNS
+  154.6KB OVER — next round still opens with distillation · census
+  enumeration is PARTIAL: 3 of ~13 questions registered, remainder in the
+  round report · UNCONVERGED (counter 0), freeze stays.
+
+- 2026-07-26 · bcb687b (START head — bcb687b..HEAD quarantines this round's
+  commits) · CENSUS continuation · 4 commits: 47f467a Q9, af23eea Q11,
+  fb77dfa archive, + the doc edits · OPENED with the mandated DOUBLE
+  distillation: R1 (15.7KB prose grid) compressed to an INDEX INTO THE
+  CENSUS — it is the same grid as running code — and the older ledger
+  entries to one-liners; verbatim to archive (2026-07-26 #1, #2). PATTERNS
+  154.6→141.6KB, CORE 57.5→53.5KB, both under cap · **Q9** (what
+  json.Marshal emits) — EXTERNAL authority executed per cell, driver is a
+  DELTA OVER ROUTES so an unmodelled route shows as literally free; 18
+  cells · **Q11** (failure identity) — the DECODE half of B10, 11 cells,
+  same value on both wires into an unholdable target; invariant is
+  AGREEMENT, not a verdict · **OPEN RULING FILED (Q9): the walk charges a
+  string's CONTENT length while json.Marshal emits its ESCAPED length** —
+  6× for control bytes and for <,>,& (Go escapes HTML by default), 2× for
+  high bytes via []byte's codepoint form; the 64 MiB cap admits ~384 MiB,
+  against #68's own "measured against what json.Marshal will EMIT". Both
+  fixes have a real cost (exact = per-byte scan, since delegating to
+  json.Marshal to measure allocates the image the cap prevents; worst-case
+  6× rejects legitimate ASCII schemas at a sixth of the cap) → recorded as
+  an `openRuling` that asserts the under-charge STILL HOLDS, so resolving
+  it either way reds and forces the update · TWO CORPUS ERRORS self-caught
+  by the drivers: Q9's first authority marshaled the RAW value (a Props
+  []byte reaches json as the Avro codepoint string, so it measured base64
+  bytes we never emit); Q11's enum→int cell was not a failure family at
+  all (documented ordinal decode, succeeds both wires) · lesson recorded
+  in PATTERNS: an agreement driver needs an ASYMMETRIC neuter — breaking
+  both wires equally leaves it green · neuters: Q9 marshalEmitLen off → 4
+  marshaler routes, each "charged only 0 more"; Q11 JSON-decode-only plain
+  → 6 cells naming binary=true json=false · tell-design evidence recorded
+  per question (rejected: `semErr(`, `MarshalText()`, `.Key()`) · suite +
+  fastavro green after every commit (0 fail, 0 `missing optional
+  dependency`), -race green; Java ABSENT · census 5 of ~13; NONE demoted ·
+  UNCONVERGED (counter 0), freeze stays.
+
