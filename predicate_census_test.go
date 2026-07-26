@@ -241,6 +241,31 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q14",
+		question: "Does this registered CustomType match this schema node (kind + logicalType)?",
+		authority: "no external authority. hasMatchingCustomTypeCond (schema.go) is the build-time answer that decides " +
+			"codec suppression; CustomType.matches is the runtime answer. The two must agree on the BASE rule -- an " +
+			"empty field means \"any\", a set field must equal the node's -- and they implement it separately",
+		answerers: []censusAnswerer{
+			{repr: "build-time suppression", site: "hasMatchingCustomTypeCond", file: "schema.go"},
+			{repr: "runtime dispatch", site: "CustomType.matches", file: "custom_type.go"},
+		},
+		tells: []censusTell{
+			{pattern: `.AvroType != "" &&`, counts: map[string]int{
+				"schema.go":      1, // hasMatchingCustomTypeCond
+				"custom_type.go": 1, // CustomType.matches
+			}},
+			{pattern: `.LogicalType != "" &&`, counts: map[string]int{
+				"schema.go":      1,
+				"custom_type.go": 1,
+			}},
+			// Rejected tell: `matches(` — too generic, and it names only one
+			// of the two answerers, so the site most likely to drift away
+			// (the hand-rolled clause pair inside the build-time loop) would
+			// not be watched at all.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -1050,4 +1075,95 @@ type ctrlTextMarshaler struct{ n int }
 
 func (c ctrlTextMarshaler) MarshalText() ([]byte, error) {
 	return []byte(strings.Repeat("\x01", c.n)), nil
+}
+
+// ---------------------------------------------------------------------
+// Q14 — does this CustomType match this node?
+// ---------------------------------------------------------------------
+
+// customMatchCell crosses a CustomType's declared shape with a node's actual
+// kind and logical type. The base rule is the same on both sides: an empty
+// field means "any", a set field must equal the node's.
+type customMatchCell struct {
+	ctAvro, ctLogical string
+	nodeKind, nodeLog string
+}
+
+func customMatchCorpus() []customMatchCell {
+	shapes := []struct{ avro, logical string }{
+		{"", ""},             // wildcard
+		{"bytes", ""},        // kind only
+		{"", "decimal"},      // logical only
+		{"bytes", "decimal"}, // both
+		{"long", "timestamp-millis"},
+	}
+	nodes := []struct{ kind, log string }{
+		{"bytes", "decimal"},
+		{"bytes", ""},
+		{"long", "timestamp-millis"},
+		{"long", ""},
+		{"string", "uuid"},
+	}
+	var out []customMatchCell
+	for _, sh := range shapes {
+		for _, n := range nodes {
+			out = append(out, customMatchCell{sh.avro, sh.logical, n.kind, n.log})
+		}
+	}
+	return out
+}
+
+// TestCensus_Q14_CustomTypeMatchAgreesAcrossAnswerers runs both answerers
+// over the cross. They must agree everywhere except on the WILDCARD, where
+// the build-time answerer deliberately declines: a CustomType that names
+// neither a kind nor a logical type must not suppress the built-in handlers,
+// because it decides per value at runtime via ErrSkipCustomType. That
+// exception is asserted explicitly rather than skipped, so if the build-time
+// side ever stops excluding wildcards this cell reds.
+func TestCensus_Q14_CustomTypeMatchAgreesAcrossAnswerers(t *testing.T) {
+	for _, c := range customMatchCorpus() {
+		name := "ct(" + c.ctAvro + "/" + c.ctLogical + ")-node(" + c.nodeKind + "/" + c.nodeLog + ")"
+		t.Run(name, func(t *testing.T) {
+			ct := CustomType{AvroType: c.ctAvro, LogicalType: c.ctLogical}
+			runtimeAns := ct.matches(&schemaNode{kind: c.nodeKind, logical: c.nodeLog})
+
+			b := &builder{customTypes: []CustomType{ct}}
+			buildAns := b.hasMatchingCustomTypeCond(c.nodeKind, c.nodeLog, false)
+
+			isWildcard := c.ctAvro == "" && c.ctLogical == ""
+			if isWildcard {
+				if !runtimeAns {
+					t.Errorf("a wildcard CustomType must match at RUNTIME (it decides per value via ErrSkipCustomType), got false")
+				}
+				if buildAns {
+					t.Errorf("a wildcard CustomType must NOT suppress built-in handlers at BUILD time, got true")
+				}
+				return
+			}
+			if runtimeAns != buildAns {
+				t.Errorf("the two answerers disagree: CustomType.matches=%v, hasMatchingCustomTypeCond=%v.\n  The base rule (empty means any, set must equal) is implemented twice; a node reaching one answer at build time and the other at runtime is wired to a codec that does not handle it.",
+					runtimeAns, buildAns)
+			}
+		})
+	}
+}
+
+// The cross must contain cells that answer BOTH ways on each axis, or the
+// agreement is trivial.
+func TestCensus_Q14_CorpusIsNotVacuous(t *testing.T) {
+	var match, nonMatch, wildcard int
+	for _, c := range customMatchCorpus() {
+		ct := CustomType{AvroType: c.ctAvro, LogicalType: c.ctLogical}
+		switch {
+		case c.ctAvro == "" && c.ctLogical == "":
+			wildcard++
+		case ct.matches(&schemaNode{kind: c.nodeKind, logical: c.nodeLog}):
+			match++
+		default:
+			nonMatch++
+		}
+	}
+	if match < 3 || nonMatch < 3 || wildcard < 3 {
+		t.Fatalf("corpus is trivial: match=%d nonMatch=%d wildcard=%d", match, nonMatch, wildcard)
+	}
 }
