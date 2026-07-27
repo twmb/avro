@@ -496,10 +496,19 @@ var censusRegistry = []censusQuestion{
 		authority: "nodeCarriesOnlyType (schema_node.go), DERIVED from SchemaNode's field set rather than " +
 			"written as a list. Two sites ask it — the primitive arm and the name-reference arm of toJSONWalk " +
 			"— and each previously held its OWN incomplete copy of the list, which is how a stray Symbols, " +
-			"Size or Aliases was silently dropped by the rebuild while a stray Name was caught by one copy only",
+			"Size or Aliases was silently dropped by the rebuild while a stray Name was caught by one copy only. " +
+			"The MEMBERS are classified rather than merely counted (bareEmissionFieldRules): Branches and " +
+			"EnumDefault exempt (no emitted form — Branches has no JSON key outside a union, EnumDefault has no " +
+			"carrier without HasEnumDefault); HasEnumDefault, Precision and Scale block but do not come back on " +
+			"their own field (precision/scale ride to Props per #71, \"default\" is dropped by the reserved-name " +
+			"routing the attribute-placement census pins); the remaining 11 block and round-trip on their own field",
 		answerers: []censusAnswerer{
 			{repr: "metadata render, primitive arm", site: "nodeCarriesOnlyType", file: "schema_node.go"},
 			{repr: "metadata render, name-reference arm", site: "nodeCarriesOnlyType", file: "schema_node.go"},
+			{
+				repr: "the shared field-set walk", site: "nodeCarriesNothingBut", file: "schema_node.go",
+				note: "not a second answerer but the ONE walk both questions run — Q16 and Q17 differ only in the exemption function they pass. Two structurally identical reflect loops is the shape this pair of questions was already burned by, so there is one loop and the difference is data.",
+			},
 		},
 		tells: []censusTell{
 			{pattern: `nodeCarriesOnlyType`, counts: map[string]int{
@@ -507,6 +516,9 @@ var censusRegistry = []censusQuestion{
 				// (counted with grep -o; doc comments count, and reasoning
 				// about the number has been wrong every time).
 				"schema_node.go": 6,
+			}},
+			{pattern: `bareEmissionExempt`, counts: map[string]int{
+				"schema_node.go": 3,
 			}},
 			// Rejected tell: `len(n.Props) == 0` — the shape the OLD
 			// hand-written lists shared. It still appears in unrelated
@@ -517,9 +529,60 @@ var censusRegistry = []censusQuestion{
 			// The durable guard for this question is not a tell but
 			// TestInvariant_BareEmissionCoversEverySchemaNodeField, which
 			// sets every exported field in turn and requires the predicate to
-			// notice. A field added later fails there until classified, so
-			// the enumeration checks ITSELF rather than trusting the next
-			// author — which a tell count cannot do.
+			// notice BOTH halves — that the field blocks, and that the object
+			// form it falls through to actually carries the value through an
+			// emit → re-parse round trip. Proving only the blocking half left
+			// the emitter free to drop the value with nothing but the render
+			// changed, which is exactly what EnumDefault did. A field added
+			// later fails there until classified, so the enumeration checks
+			// ITSELF rather than trusting the next author — which a tell count
+			// cannot do.
+		},
+	},
+	{
+		id:       "Q17",
+		question: "Is this node a pure NAME-REFERENCE SHAPE — may the definition it names be SPLICED in place of it?",
+		authority: "nodeIsNameRefShape (schema_node.go), derived from SchemaNode's field set through the same " +
+			"walk as Q16 with a different exemption set. The two questions are siblings, not one question: Q16 asks " +
+			"whether a node may collapse to its bare type NAME, Q17 whether a stamped reference may be REPLACED by " +
+			"the definition it names — and a splice discards whatever the usage site carried. The exemption set is " +
+			"therefore the ADJUDICATED usage-site attributes and nothing else (nameRefSpliceFieldRules): Doc, " +
+			"Aliases, Namespace and LogicalType, because a definition cannot carry a second name/namespace/doc for " +
+			"its usage site (NOT_BUGS #25) and the parse LANDS those on the structural fields, so blocking them " +
+			"would convert an adjudicated silent drop into a hard \"unknown complex type\" error on the extraction " +
+			"feature; plus Props, which the splice MERGES onto the definition (#63's splice-merge clause). " +
+			"Precision and Scale are NOT exempt even though they too are usage-site attributes, because the parse " +
+			"routes an unconsumed pair to Props (#71) — a non-zero value on those FIELDS can only come from a " +
+			"caller writing them, and that write must not vanish",
+		answerers: []censusAnswerer{
+			{repr: "metadata render, splice gate", site: "nodeIsNameRefShape", file: "schema_node.go"},
+			{
+				repr: "cache splice merge", site: "inlineTreeDefs's wrapper arm", file: "cache.go",
+				note: "different-by-design as a SITE: the cache splices a wrapped reference in the RAW JSON tree, before any SchemaNode exists, so it asks the question of a key map rather than of a field set. It answers the same policy — reserved usage-site keys drop, custom props merge definition-wins — and TestMatrix_SpliceWrapperReservedKeyMerge is what holds the two in step.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `nodeIsNameRefShape`, counts: map[string]int{
+				// Definition, its one call site, and one doc reference.
+				"schema_node.go": 3,
+			}},
+			{pattern: `nameRefUsageSiteExempt`, counts: map[string]int{
+				"schema_node.go": 3,
+			}},
+			// Rejected tell: `n.refTarget` — it marks the STAMP, which is
+			// nodeRefTargetAgrees's question ("does Type still name this
+			// target"), asked immediately beside this one at the same call
+			// site. Counting it would make this question fire on stamp
+			// changes that have nothing to do with what the node may carry.
+			//
+			// As with Q16 the durable guard is not a tell:
+			// TestInvariant_NameRefSpliceCoversEverySchemaNodeField sets each
+			// exported field on an EXTRACTED reference and requires the
+			// predicate to notice, and TestMatrix_CallerComposedAndEditedNodes
+			// crosses that with the recursive, diamond, forward-reference and
+			// cache-cross-parse structures. A tell watches where a rule is
+			// WRITTEN; this class's failure mode is a member the rule never
+			// mentioned, which no count can see.
 		},
 	},
 	{
@@ -578,10 +641,6 @@ var censusOutstanding = []struct {
 	{
 		question:   "Does this BODY parse as the key's schema SHAPE?",
 		revealedBy: "strayBodyShapeOK / strayBodyShapeOKMemo — REJECTED as a Q4 tell because it answers the shape question that FEEDS routing, not reservedness itself; 20 hits across schema_parse.go, schema_node.go and schema_walk.go, and #63(b)'s capture-implies-verdict clause says the metadata captures must run the parser's own decodes, which is an agreement question of its own",
-	},
-	{
-		question:   "Is this node a pure NAME-REFERENCE SHAPE (emittable as a bare name)?",
-		revealedBy: "nodeIsNameRefShape, the cache's sole-key wrapper collapse, and the bare-emission shortcuts in toJSONWalk",
 	},
 	{
 		question:   "Which union BRANCH NAME does this Go value dispatch to?",
@@ -2676,4 +2735,223 @@ func TestCensus_Q4_CorpusIsNotVacuous(t *testing.T) {
 	if consumed < 3 || propped < 4 || rejected < 2 {
 		t.Fatalf("corpus misses an outcome: consumed=%d propped=%d rejected=%d", consumed, propped, rejected)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Q17 driver: the SPLICE question has two answerers on two representations.
+//
+// The metadata splice (toJSONWalk, gated by nodeIsNameRefShape) works on a
+// SchemaNode tree; the cache splice (inlineTreeDefs's wrapper arm) works on
+// the raw JSON tree before any SchemaNode exists. Neither can call the other,
+// so the only thing keeping them in step is that they answer the same policy:
+// a RESERVED usage-site key cannot survive onto the definition, a CUSTOM
+// property merges onto it definition-wins.
+//
+// This drives both over the same corpus of wrapper keys and requires the same
+// verdict per key. The verdict is read off the OBSERVABLE — where the key
+// surfaces on the resulting schema — never off either implementation, so the
+// test cannot be satisfied by the two sharing a bug.
+type spliceWrapperCell struct {
+	key  string
+	body string
+	// merges is the expected verdict, taken from the RULINGS rather than
+	// re-derived from either implementation — otherwise agreement between two
+	// answerers that share a bug would read as a pass. A key MERGES onto the
+	// definition exactly when it is an ordinary custom property there; a key
+	// the definition's kind would CONSUME is usage-site metadata and drops,
+	// because a definition cannot carry a second one for its usage site.
+	merges bool
+	ruling string
+	// def overrides the plain fixed definition. A wrapper key is only ever
+	// SKIPPED by the merge because the DEFINITION's own kind and logical
+	// consume it, so a corpus of plain definitions never reaches that arm at
+	// all — disabling the skip guard changed nothing until these cells
+	// existed.
+	def string
+}
+
+func spliceWrapperCells() []spliceWrapperCell {
+	const usageSite = "#25: a definition cannot carry a second name/namespace/doc for its usage site"
+	return []spliceWrapperCell{
+		{"doc", `"usage-site"`, false, usageSite, ""},
+		{"aliases", `["Other"]`, false, usageSite, ""},
+		{"namespace", `"z"`, false, usageSite, ""},
+		{"logicalType", `"uuid"`, false, "#70: a STRING logicalType is first-class and consumed, so it is usage-site metadata here", ""},
+		{"logicalType", `123`, true, "#70: no value but a string can name a logical, so a non-string spelling is an ordinary prop", ""},
+		{"precision", `3`, true, "#71: precision/scale are reserved only on a recognized decimal carrier; unconsumed they ride verbatim", ""},
+		{"scale", `1`, true, "#71, same clause", ""},
+		{"order", `"ignore"`, false, "a reserved name never enters Props (the attribute-placement census's routing rule)", ""},
+		{"default", `"D"`, false, "a reserved name never enters Props; only an enum consumes a schema-level default", ""},
+		{"my.custom", `"v"`, true, "#63 splice-merge: wrapper custom properties merge onto the definition, definition-wins", ""},
+		{"my.custom", `{"nested":[1,2]}`, true, "#63 splice-merge, container body", ""},
+		// Definition-consumes cells: the def is a decimal carrier, so its own
+		// precision/scale/logicalType are meaningful and a usage-site copy
+		// must not overwrite or accompany them.
+		{"precision", `9`, false, "#63 splice-merge is definition-wins: a key the DEFINITION consumes cannot be re-supplied by the usage site", decimalCarrierDef},
+		{"scale", `7`, false, "#63 splice-merge, definition-wins, same clause", decimalCarrierDef},
+		{"logicalType", `"uuid"`, false, "#63 splice-merge, definition-wins: the def's own logical stands", decimalCarrierDef},
+		{"my.custom", `"v"`, true, "#63 splice-merge: a custom property merges even onto a def that consumes reserved keys", decimalCarrierDef},
+		// The one cell where ONLY the reserved-key skip can decide. The def
+		// consumes scale but emits none (spec default 0 is not written), so
+		// the definition-wins exact-key check sees no collision and would let
+		// a usage-site scale through — silently changing the definition's
+		// decimal semantics. Every other cell is decided earlier, by the
+		// parse routing or by the key already being present.
+		{"scale", `7`, false, "#63 splice-merge is definition-wins on CONSUMED-ness, not merely on keys the def happens to emit: an omitted scale is the spec default 0, not an opening", decimalNoScaleDef},
+	}
+}
+
+// decimalNoScaleDef consumes scale but emits none, so only the reserved-key
+// skip stands between a usage-site scale and the definition's semantics.
+const decimalNoScaleDef = `{"type":"fixed","name":"x.y.F","size":4,"logicalType":"decimal","precision":4}`
+
+// decimalCarrierDef is a definition whose kind and logical CONSUME
+// precision/scale, so a wrapper carrying them reaches the merge's skip arm.
+const decimalCarrierDef = `{"type":"fixed","name":"x.y.F","size":4,"logicalType":"decimal","precision":4,"scale":2}`
+
+// spliceVerdict is what a splice did with the wrapper's key, phrased so both
+// representations can be asked the same way.
+type spliceVerdict struct {
+	spliced   bool // did the definition materialize in place of the reference?
+	inProps   bool // did the key ride onto the result as a custom property?
+	propValue string
+}
+
+func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testing.T) {
+	const plainDef = `{"type":"fixed","name":"x.y.F","size":4}`
+
+	for _, c := range spliceWrapperCells() {
+		t.Run(c.key+"="+c.body+defLabel(c.def), func(t *testing.T) {
+			def := plainDef
+			if c.def != "" {
+				def = c.def
+			}
+			wrapper := `{"type":"x.y.F",` + strconv.Quote(c.key) + `:` + c.body + `}`
+
+			// Answerer 1 — the METADATA splice. A second occurrence inside one
+			// self-contained schema, extracted so the walk actually splices
+			// (a whole-schema walk never does: the tree defines the name).
+			meta := func() (spliceVerdict, error) {
+				s, err := Parse(`{"type":"record","name":"x.y.R","fields":[
+					{"name":"a","type":` + def + `},
+					{"name":"b","type":` + wrapper + `}]}`)
+				if err != nil {
+					return spliceVerdict{}, err
+				}
+				sub := s.Root().Fields[1].Type
+				out, err := sub.Schema()
+				if err != nil {
+					return spliceVerdict{}, err
+				}
+				return verdictFromSpliced(out.Root(), c.key), nil
+			}
+
+			// Answerer 2 — the CACHE splice, on the raw JSON tree. The
+			// definition arrives from a prior Parse, so the wrapper is the
+			// only occurrence and the cache must inline it.
+			cache := func() (spliceVerdict, error) {
+				var cc SchemaCache
+				if _, err := cc.Parse(def); err != nil {
+					return spliceVerdict{}, err
+				}
+				s, err := cc.Parse(`{"type":"record","name":"x.y.R2","fields":[{"name":"b","type":` + wrapper + `}]}`)
+				if err != nil {
+					return spliceVerdict{}, err
+				}
+				return verdictFromSpliced(s.Root().Fields[0].Type, c.key), nil
+			}
+
+			mv, merr := meta()
+			cv, cerr := cache()
+			if (merr == nil) != (cerr == nil) {
+				t.Fatalf("the two representations disagree on ACCEPTANCE: metadata err=%v, cache err=%v", merr, cerr)
+			}
+			if merr != nil {
+				return // both rejected; the rejection parity is the verdict
+			}
+			if mv != cv {
+				t.Fatalf("the two representations disagree on what the splice did with %q:\n metadata %+v\n    cache %+v", c.key, mv, cv)
+			}
+			// And the policy itself, so agreement on a WRONG answer still
+			// fails. The expectation comes from the ruling the cell cites.
+			if mv.inProps != c.merges {
+				got, want := "dropped", "merge onto the definition"
+				if mv.inProps {
+					got, want = "merged as a prop ("+mv.propValue+")", "drop as usage-site metadata"
+				}
+				t.Errorf("wrapper key %q was %s; the ruling says it must %s — %s", c.key, got, want, c.ruling)
+			}
+			if !mv.spliced {
+				t.Errorf("the wrapper did not splice at all, so this cell measures nothing")
+			}
+		})
+	}
+}
+
+// verdictFromSpliced reads the observable off a spliced result.
+//
+// The identity compared is the FULLNAME, not the raw Name: the metadata
+// splice preserves the definition's dotted spelling while the cache splice
+// re-emits it as name+namespace, and that normalization difference is not
+// this question's answer. Comparing the raw field made every cell disagree,
+// which is the tell that a driver is measuring the wrong thing — genuine
+// divergence is selective.
+func verdictFromSpliced(n SchemaNode, key string) spliceVerdict {
+	full := n.Name
+	if !strings.Contains(full, ".") && n.Namespace != "" {
+		full = n.Namespace + "." + full
+	}
+	v := spliceVerdict{spliced: n.Type == "fixed" && n.Size == 4 && full == "x.y.F"}
+	if raw, ok := n.Props[key]; ok {
+		v.inProps = true
+		b, _ := json.Marshal(raw)
+		v.propValue = string(b)
+	}
+	return v
+}
+
+// The corpus must exercise BOTH sides of the policy, or agreement is vacuous.
+func TestCensus_Q17_CorpusIsNotVacuous(t *testing.T) {
+	var drop, merge int
+	for _, c := range spliceWrapperCells() {
+		if c.ruling == "" {
+			t.Errorf("cell %q cites no ruling; the expectation must be derived from policy, not from the code", c.key)
+		}
+		if c.merges {
+			merge++
+		} else {
+			drop++
+		}
+	}
+	if drop < 5 || merge < 4 {
+		t.Fatalf("corpus expects %d drops and %d merges; it must drive both sides of the policy", drop, merge)
+	}
+	// The same SPELLING must appear on both sides, or the corpus proves only
+	// that the routing reads key names — the logicalType pair is what makes
+	// the verdict body-dependent rather than name-dependent.
+	bodies := map[string]map[bool]bool{}
+	for _, c := range spliceWrapperCells() {
+		if bodies[c.key] == nil {
+			bodies[c.key] = map[bool]bool{}
+		}
+		bodies[c.key][c.merges] = true
+	}
+	var split bool
+	for _, v := range bodies {
+		if len(v) == 2 {
+			split = true
+		}
+	}
+	if !split {
+		t.Fatal("no key appears with both verdicts; the corpus cannot tell name-conditional routing from body-conditional routing")
+	}
+}
+
+// defLabel distinguishes the plain-definition cells from the
+// definition-consumes cells in subtest names.
+func defLabel(def string) string {
+	if def == "" {
+		return ""
+	}
+	return "/on-decimal-def"
 }

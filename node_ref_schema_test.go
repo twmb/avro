@@ -3,6 +3,7 @@ package avro
 import (
 	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -494,66 +495,297 @@ func TestNodeRefSchemaMatrix(t *testing.T) {
 // defN2ref quotes a fullname as a JSON reference token.
 func defN2ref(n string) string { return `"` + n + `"` }
 
+// schemaNodeFieldRule classifies one exported SchemaNode field for the two
+// invariants below. The zero rule is the ordinary case: the field BLOCKS the
+// shortcut, and its value survives on the same field after a round trip.
+//
+// Losslessness is a CONJUNCTION, and a guard that proves only the blocking
+// half proves only half of it. The shortcut must decline to collapse a node
+// that carries content, AND the longer form it falls through to must actually
+// emit that content. EnumDefault is why both halves are checked: it blocked
+// the collapse, the emitter keyed "default" off HasEnumDefault rather than
+// off it, and the value was dropped exactly as before with only the render
+// changed.
+type schemaNodeFieldRule struct {
+	// exempt, when non-empty, is the reason this field has NO emitted form
+	// at this site, so taking the shortcut cannot lose it. An exempt field
+	// must NOT block — an exemption that blocks is a contradiction, and the
+	// test says which half is wrong.
+	exempt string
+	// propsKey, when non-empty, names the JSON key the emission arm writes
+	// and the Props entry the value comes back under, because the carrier
+	// kind does not BIND that key. The value is preserved as inert metadata
+	// on its only surface, not lost; the field itself reads back zero.
+	propsKey string
+	// droppedKey, when non-empty, names a JSON key the emission arm writes
+	// that the RE-PARSE then drops: it is a reserved name, so it never
+	// enters Props, and the carrier kind has no structural field to capture
+	// it into. The value IS lost, and the loss is policy rather than an
+	// oversight, so the rule quotes the policy and the test asserts the drop
+	// still happens — the day the policy changes, this cell reds and has to
+	// be reclassified rather than silently passing.
+	droppedKey string
+	why        string
+}
+
+// bareEmissionFieldRules classifies every exported SchemaNode field whose
+// treatment under nodeCarriesOnlyType is not the ordinary
+// blocks-and-round-trips case. Everything absent from this map must block the
+// collapse AND come back on its own field.
+var bareEmissionFieldRules = map[string]schemaNodeFieldRule{
+	"Branches":    {exempt: "no JSON key routes to Branches outside a union — the union arm returns before the collapse is reached — so a hand-built value on another kind is inert"},
+	"EnumDefault": {exempt: "HasEnumDefault is the carrier the \"default\" key is emitted from; with the carrier false the node declares no default, so there is nothing to emit and nothing to lose"},
+	"HasEnumDefault": {
+		droppedKey: "default",
+		why: "\"default\" is a reserved name, so it never enters Props, and only an enum has a structural field to capture it into. " +
+			"On every other carrier the reserved-name-capture rule drops it from the metadata tree — the same treatment \"order\" gets " +
+			"on every kind, pinned across the kind axis by TestMatrix_AttributePlacementCensus and by " +
+			"TestRegression_EnumRefWrapperDefaultInert for the reference-wrapper spelling. Setting this field on a non-enum node is " +
+			"therefore lossy, and changing that is a routing-policy decision, not a fix to make here",
+	},
+	"Precision": {propsKey: "precision"},
+	"Scale":     {propsKey: "scale"},
+}
+
 // A schema node collapses to its bare type name only when it carries nothing
 // else. That question used to be answered by two hand-written lists of the
-// fields someone remembered, and both were missing the same four — a
+// fields someone remembered, and both were missing the same members — a
 // stray-surfaced Symbols, Size, Aliases or Name on a primitive survived
 // String() and Root() and vanished through Root().Schema().
 //
-// The durable fix is not "add the four": it is that the enumeration must
-// check ITSELF. This sets every exported field of SchemaNode in turn and
-// requires nodeCarriesOnlyType to notice, so a field added later fails here
-// until someone classifies it. A field may only be exempt with a stated
-// reason, because an exemption is the claim "this field has no emitted form,
-// so collapsing cannot lose it".
+// The durable fix is not "add the missing ones": it is that the enumeration
+// must check ITSELF. This sets every exported field of SchemaNode in turn and
+// requires BOTH halves of losslessness — nodeCarriesOnlyType declines to
+// collapse, and the value then survives an emit → re-parse round trip, read
+// back off the metadata FIELDS rather than off the rendered text (key order
+// alone makes a text comparison report losses that did not happen). A field
+// added later fails here until someone classifies it.
 func TestInvariant_BareEmissionCoversEverySchemaNodeField(t *testing.T) {
-	// The classified exemptions. Adding a name here is a claim that the
-	// field cannot be emitted for the kinds that reach bare emission.
-	exempt := map[string]string{
-		"Branches": "no JSON key routes to Branches outside a union, so a hand-built value on another kind is inert and cannot be lost by collapsing",
-	}
-
 	base := SchemaNode{Type: "int"}
 	if !nodeCarriesOnlyType(&base) {
 		t.Fatal("a bare primitive must carry only its Type; the control is broken so nothing below means anything")
 	}
+	// Branches is exempt only OFF a union. On a union it carries the whole
+	// schema, so the exemption must not leak there.
+	if u := (SchemaNode{Type: "union", Branches: []SchemaNode{{Type: "null"}}}); nodeCarriesOnlyType(&u) {
+		t.Error("Branches is exempt only outside a union; on a union it carries the branch list and must block")
+	}
 
 	rt := reflect.TypeFor[SchemaNode]()
-	var checked, exempted int
+	var checked, exempted, relocated, dropped int
 	for i := range rt.NumField() {
 		f := rt.Field(i)
 		if !f.IsExported() || f.Name == "Type" {
 			continue
 		}
+		rule := bareEmissionFieldRules[f.Name]
 		n := SchemaNode{Type: "int"}
 		fv := reflect.ValueOf(&n).Elem().Field(i)
-		if !setNonZeroForTest(fv) {
+		if !setNonZeroForTest(f.Name, fv) {
 			t.Errorf("field %s has kind %s, which this test does not know how to populate — teach it, or the field is silently unchecked", f.Name, f.Type.Kind())
 			continue
 		}
-		got := nodeCarriesOnlyType(&n)
-		if why, ok := exempt[f.Name]; ok {
+		want := fv.Interface()
+
+		if blocks := !nodeCarriesOnlyType(&n); rule.exempt != "" {
 			exempted++
-			if !got {
-				t.Errorf("field %s is listed exempt (%s) but blocks bare emission; either the exemption is wrong or the field gained an emitted form", f.Name, why)
+			if blocks {
+				t.Errorf("field %s is classified exempt (%s) but blocks bare emission; either the exemption is wrong or the field gained an emitted form", f.Name, rule.exempt)
 			}
+			continue
+		} else if !blocks {
+			t.Errorf("setting %s does NOT block bare emission, so its value would be silently dropped by Root().Schema(). Give it an emission arm, or classify it exempt with the reason it cannot be emitted.", f.Name)
 			continue
 		}
 		checked++
-		if got {
-			t.Errorf("setting %s does NOT block bare emission, so its value would be silently dropped by Root().Schema(). Give it an emission arm, or classify it as exempt with the reason it cannot be emitted.", f.Name)
+
+		// The other half: the object form it fell through to must carry the
+		// value somewhere a reader can find it.
+		s, err := n.Schema()
+		if err != nil {
+			t.Errorf("field %s: blocking is not enough — the emission failed outright: %v", f.Name, err)
+			continue
+		}
+		back := s.Root()
+		switch {
+		case rule.propsKey != "":
+			relocated++
+			if _, ok := back.Props[rule.propsKey]; !ok {
+				t.Errorf("field %s emits %q on a carrier that does not bind it, so the value must ride to Props as its only surface; Props came back %v from %s",
+					f.Name, rule.propsKey, back.Props, s)
+			}
+		case rule.droppedKey != "":
+			dropped++
+			// Both halves of the classification are checked. The emission
+			// arm must WRITE the key (otherwise the loss is the emitter's,
+			// not the routing's, and this rule is the wrong diagnosis)...
+			if !strings.Contains(s.String(), `"`+rule.droppedKey+`"`) {
+				t.Errorf("field %s is classified as dropped by the reserved-name routing of %q, but the emission never wrote that key at all — the loss is in the emitter, so give it an emission arm: %s",
+					f.Name, rule.droppedKey, s)
+			}
+			// ...and the re-parse must still drop it. If this stops
+			// failing, the routing policy changed and the classification
+			// has to be revisited, not silently kept.
+			if got := reflect.ValueOf(back).Field(i).Interface(); !reflect.DeepEqual(reflect.Zero(f.Type).Interface(), got) {
+				t.Errorf("field %s now SURVIVES the round trip (%#v), so the documented drop no longer happens: reclassify it as an ordinary round-tripping field. Rule quoted: %s",
+					f.Name, got, rule.why)
+			}
+			if _, ok := back.Props[rule.droppedKey]; ok {
+				t.Errorf("field %s: %q now reaches Props, so the reserved-name-capture rule changed; reclassify with propsKey. Rule quoted: %s",
+					f.Name, rule.droppedKey, rule.why)
+			}
+		default:
+			if got := reflect.ValueOf(back).Field(i).Interface(); !reflect.DeepEqual(want, got) {
+				t.Errorf("field %s blocks the collapse but does not survive the rebuild: set %#v, emitted %s, read back %#v. The value is dropped with only the render changed — give it an emission arm, classify where it relocates, or classify it exempt.",
+					f.Name, want, s, got)
+			}
+		}
+		// Wherever the value landed, emission must be a FIXPOINT from there:
+		// a second pass that drops it would mean the first round trip only
+		// postponed the loss. The one classification exempt from this is the
+		// dropped key, whose whole content is that the loss happens on the
+		// FIRST re-parse; there the second pass must instead land exactly on
+		// the untouched control, proving the drop is total rather than
+		// leaving a half-emitted residue.
+		s2, err := back.Schema()
+		switch {
+		case err != nil:
+			t.Errorf("field %s: re-emitting the rebuilt node failed: %v", f.Name, err)
+		case rule.droppedKey != "":
+			ctrl, err := base.Schema()
+			if err != nil {
+				t.Fatalf("the untouched control must emit: %v", err)
+			}
+			if s2.String() != ctrl.String() {
+				t.Errorf("field %s: the drop left a residue — second pass %s, untouched control %s", f.Name, s2, ctrl)
+			}
+		case s2.String() != s.String():
+			t.Errorf("field %s: emission is not a fixpoint, so something is lost on the second pass:\n first %s\nsecond %s", f.Name, s, s2)
 		}
 	}
 	if checked < 12 {
 		t.Fatalf("only %d fields were actually checked; the walk is not seeing SchemaNode", checked)
 	}
-	t.Logf("bare-emission coverage: %d fields must block, %d classified exempt", checked, exempted)
+	t.Logf("bare-emission coverage: %d fields block, of which %d round-trip on their own field, %d relocate to Props and %d are dropped by the reserved-name routing; %d classified exempt", checked, checked-relocated-dropped, relocated, dropped, exempted)
 }
 
-// setNonZeroForTest gives fv a non-zero value, reporting false for kinds it
-// does not handle so an unhandled kind is a loud failure rather than a
-// silently skipped field.
-func setNonZeroForTest(fv reflect.Value) bool {
+// nameRefSpliceFieldRules classifies every exported SchemaNode field whose
+// treatment under nodeIsNameRefShape is not the ordinary blocking case. The
+// exemptions are the reserved USAGE-SITE attributes a splice is already
+// adjudicated to drop, plus the custom properties it merges; deriving the
+// predicate without exactly these would turn an adjudicated silent drop into
+// a hard "unknown complex type" error on the extraction feature.
+var nameRefSpliceFieldRules = map[string]schemaNodeFieldRule{
+	"Doc":         {exempt: "a definition cannot carry a second doc for one of its usage sites, so the splice drops it"},
+	"Aliases":     {exempt: "usage-site aliases have no place on the spliced definition"},
+	"Namespace":   {exempt: "a definition cannot carry a second namespace for one of its usage sites"},
+	"LogicalType": {exempt: "a usage-site logicalType annotates the reference, not the definition it names"},
+	"Props":       {exempt: "the wrapper's custom properties MERGE onto the spliced definition, definition-wins, rather than being discarded"},
+}
+
+// The sibling invariant, for the other predicate on the same walk. A stamped
+// name-reference node splices the definition it names in place of itself, so
+// every field the node carries that the splice does not merge is DISCARDED.
+// nodeIsNameRefShape is what decides whether that is allowed, and it too used
+// to be a hand-written list — of eight fields, silently discarding the seven
+// it did not name.
+//
+// The probe has to REACH the splice: the stamp must be present (extraction
+// from Root, not a hand-built node), Type must be left alone (an edited Type
+// makes the stamp stale, a different question), and the extracted sub-tree
+// must not define the name locally, since a whole-schema walk never splices.
+func TestInvariant_NameRefSpliceCoversEverySchemaNodeField(t *testing.T) {
+	const src = `{"type":"record","name":"Root","namespace":"x.y","fields":[
+		{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"q","type":"int"}]}},
+		{"name":"b","type":"x.y.Inner"}]}`
+	base := MustParse(src)
+	extract := func() SchemaNode { return base.Root().Fields[1].Type }
+
+	unedited := extract()
+	control, err := unedited.Schema()
+	if err != nil {
+		t.Fatalf("the unedited extraction must splice; the control is broken so nothing below means anything: %v", err)
+	}
+	if !strings.Contains(control.String(), `"fields"`) {
+		t.Fatalf("control did not splice the definition: %s", control)
+	}
+
+	rt := reflect.TypeFor[SchemaNode]()
+	var blocked, exempted int
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() || f.Name == "Type" {
+			continue
+		}
+		rule := nameRefSpliceFieldRules[f.Name]
+		n := extract()
+		fv := reflect.ValueOf(&n).Elem().Field(i)
+		if !setNonZeroForTest(f.Name, fv) {
+			t.Errorf("field %s has kind %s, which this test does not know how to populate — teach it, or the field is silently unchecked", f.Name, f.Type.Kind())
+			continue
+		}
+		splices := nodeIsNameRefShape(&n)
+		if rule.exempt != "" {
+			exempted++
+			if !splices {
+				t.Errorf("field %s is classified exempt (%s) but blocks the splice; blocking it converts an adjudicated usage-site drop into a hard parse error", f.Name, rule.exempt)
+				continue
+			}
+			// The exemption's own claim, executed: the splice still happens.
+			if s, err := n.Schema(); err != nil {
+				t.Errorf("field %s is exempt, so the reference must still splice; it errored instead: %v", f.Name, err)
+			} else if !strings.Contains(s.String(), `"fields"`) {
+				t.Errorf("field %s is exempt, so the reference must still splice the definition; got %s", f.Name, s)
+			}
+			continue
+		}
+		blocked++
+		if splices {
+			t.Errorf("setting %s still lets the node splice, so its value is silently discarded in favor of the definition. Give it a place on the spliced form, or classify it exempt with the reason its loss is adjudicated.", f.Name)
+			continue
+		}
+		// Blocking means rendering as-written. The re-parse must then JUDGE
+		// the hybrid — a named error is the honest outcome, and a silent
+		// success that dropped the field is the outcome this rules out.
+		s, err := n.Schema()
+		if err != nil {
+			continue // loud, which is the contract
+		}
+		if got := reflect.ValueOf(s.Root()).Field(i).Interface(); !reflect.DeepEqual(fv.Interface(), got) {
+			t.Errorf("field %s blocks the splice but the as-written render still lost it: set %#v, emitted %s, read back %#v",
+				f.Name, fv.Interface(), s, got)
+		}
+	}
+	if blocked < 8 {
+		t.Fatalf("only %d fields were required to block; the walk is not seeing SchemaNode", blocked)
+	}
+	t.Logf("name-reference splice coverage: %d fields must block, %d classified exempt as usage-site attributes", blocked, exempted)
+}
+
+// setNonZeroForTest gives fv a non-zero, SCHEMA-VALID value, reporting false
+// for kinds it does not handle so an unhandled kind is a loud failure rather
+// than a silently skipped field. The values must be schema-valid because both
+// invariants above emit the node and re-parse it: a zero SchemaNode child has
+// Type "" and could never parse, which would report every container field as
+// an emission failure rather than as the round trip it is meant to measure.
+func setNonZeroForTest(name string, fv reflect.Value) bool {
+	switch name {
+	case "Items", "Values":
+		fv.Set(reflect.ValueOf(&SchemaNode{Type: "int"}))
+		return true
+	case "Fields":
+		fv.Set(reflect.ValueOf([]SchemaField{{Name: "f", Type: SchemaNode{Type: "int"}}}))
+		return true
+	case "Branches":
+		fv.Set(reflect.ValueOf([]SchemaNode{{Type: "null"}, {Type: "int"}}))
+		return true
+	case "Symbols", "Aliases":
+		fv.Set(reflect.ValueOf([]string{"A"}))
+		return true
+	case "Props":
+		fv.Set(reflect.ValueOf(map[string]any{"my.p": "v"}))
+		return true
+	}
 	switch fv.Kind() {
 	case reflect.String:
 		fv.SetString("x")
@@ -561,14 +793,6 @@ func setNonZeroForTest(fv reflect.Value) bool {
 		fv.SetInt(1)
 	case reflect.Bool:
 		fv.SetBool(true)
-	case reflect.Slice:
-		fv.Set(reflect.MakeSlice(fv.Type(), 1, 1))
-	case reflect.Map:
-		m := reflect.MakeMap(fv.Type())
-		m.SetMapIndex(reflect.ValueOf("k").Convert(fv.Type().Key()), reflect.Zero(fv.Type().Elem()))
-		fv.Set(m)
-	case reflect.Pointer:
-		fv.Set(reflect.New(fv.Type().Elem()))
 	default:
 		return false
 	}

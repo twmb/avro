@@ -2036,38 +2036,27 @@ func collectLocalNames(n *SchemaNode, names map[string]bool, visited map[*Schema
 	}
 }
 
-// nodeCarriesOnlyType reports whether n holds no information beyond its
-// Type, so collapsing it to the bare type name (`"int"` rather than
-// `{"type":"int"}`) loses nothing.
+// nodeCarriesNothingBut walks n's exported fields and reports whether every
+// one of them other than Type is zero, skipping the fields exempt reports as
+// carrying no loss.
 //
-// It is DERIVED from the struct's field set rather than written as a list of
-// the fields someone remembered. That distinction is the whole point: the
-// hand-listed version checked LogicalType, Props, Items, Values and Fields,
-// and silently dropped a stray-surfaced Symbols, Size, Aliases or Name on a
-// primitive — the as-written image survived String() and Root() and vanished
-// through Root().Schema(), against this package's own rule that such a body
-// surfaces structurally as-written as its ONLY surface. A subset can always
-// be missing a member; asking the field set cannot.
+// The walk is DERIVED from the struct's field set rather than written as a
+// list of the fields someone remembered, and that distinction is the whole
+// point of both callers below. Each previously held its own hand-written
+// list; both lists were missing members, so a value in a forgotten field
+// vanished. A subset can always be missing a member; asking the field set
+// cannot. There is one walk rather than two so a later field cannot be seen
+// by one question and overlooked by the other.
 //
 // Unexported state is skipped deliberately: it is derived bookkeeping (the
 // name-reference stamp and its scope), not as-written content, so it must
-// not force the object form. TestInvariant_BareEmissionCoversEverySchemaNodeField
-// proves the coverage by setting each exported field in turn and requiring
-// this to notice.
-func nodeCarriesOnlyType(n *SchemaNode) bool {
+// not force a different emission.
+func nodeCarriesNothingBut(n *SchemaNode, exempt func(*SchemaNode, string) bool) bool {
 	rv := reflect.ValueOf(n).Elem()
 	t := rv.Type()
 	for i := range t.NumField() {
 		f := t.Field(i)
-		if !f.IsExported() || f.Name == "Type" {
-			continue
-		}
-		if f.Name == "Branches" && n.Type != "union" {
-			// The one CLASSIFIED exemption: Branches has no emitted form
-			// outside a union — no JSON key routes to it on any other kind,
-			// so a hand-built value there is inert and collapsing to the
-			// bare name cannot lose it. Every other field has an emission
-			// arm, so a non-zero value in it would be dropped.
+		if !f.IsExported() || f.Name == "Type" || exempt(n, f.Name) {
 			continue
 		}
 		if !rv.Field(i).IsZero() {
@@ -2077,16 +2066,74 @@ func nodeCarriesOnlyType(n *SchemaNode) bool {
 	return true
 }
 
+// bareEmissionExempt classifies the fields whose value cannot be lost by
+// collapsing a node to its bare type name, because they have no emitted form
+// there at all. An exemption is a CLAIM, and
+// TestInvariant_BareEmissionCoversEverySchemaNodeField checks both halves of
+// it: an exempt field must not block, and a non-exempt field must both block
+// and survive the emit → re-parse round trip.
+func bareEmissionExempt(n *SchemaNode, field string) bool {
+	switch field {
+	case "Branches":
+		// No JSON key routes to Branches outside a union — the union arm
+		// returns before reaching here — so a hand-built value on another
+		// kind is inert and collapsing cannot lose it.
+		return n.Type != "union"
+	case "EnumDefault":
+		// HasEnumDefault is the carrier: the "default" key is emitted from
+		// it, and a node with EnumDefault set but HasEnumDefault false
+		// declares no default at all, so there is nothing to carry. The
+		// carrier itself is NOT exempt.
+		return !n.HasEnumDefault
+	}
+	return false
+}
+
+// nameRefUsageSiteExempt classifies the fields a node may carry and still be
+// emitted as a pure NAME REFERENCE — that is, the fields whose loss at a
+// reference's usage site is already adjudicated, so blocking on them would
+// convert a documented silent drop into a hard parse error.
+//
+//   - Doc, Aliases, Namespace and LogicalType are reserved USAGE-SITE
+//     attributes on a wrapped reference (`{"type":"Inner","doc":"x"}`). The
+//     parse lands them on these structural fields, and a definition cannot
+//     carry a second name, namespace or doc for one of its usage sites, so
+//     the splice-to-definition drops them by design.
+//   - Props is the wrapper's custom properties, which the splice MERGES onto
+//     the definition (definition-wins, reserved keys dropped) rather than
+//     discarding.
+//
+// Every other field blocks: the node then renders as-written instead of
+// splicing, so nothing it carries is silently discarded and the re-parse
+// judges the hybrid loudly. Precision and Scale are NOT exempt even though
+// they too are usage-site attributes, because the parse routes an unconsumed
+// precision/scale to Props rather than to these fields — a non-zero value
+// here can only have come from a caller writing the field directly, and that
+// write must not vanish.
+func nameRefUsageSiteExempt(_ *SchemaNode, field string) bool {
+	switch field {
+	case "Doc", "Aliases", "Namespace", "LogicalType", "Props":
+		return true
+	}
+	return false
+}
+
+// nodeCarriesOnlyType reports whether n holds no information beyond its
+// Type, so collapsing it to the bare type name (`"int"` rather than
+// `{"type":"int"}`) loses nothing.
+func nodeCarriesOnlyType(n *SchemaNode) bool {
+	return nodeCarriesNothingBut(n, bareEmissionExempt)
+}
+
 // nodeIsNameRefShape reports whether n can be emitted as a pure name
 // reference (bare, or wrapped with custom properties): no structural,
-// naming, or kind-specific keys of its own. A stamped node that fails
-// this (a hand-mutated tree grafted structure onto a reference) renders
+// naming, or kind-specific keys of its own beyond the usage-site attributes
+// a splice is already documented to drop or merge. A stamped node that fails
+// this (a caller grafted content onto an extracted reference) renders
 // as-written instead of splicing, so nothing it carries is silently
 // discarded — the re-parse then judges the hybrid loudly.
 func nodeIsNameRefShape(n *SchemaNode) bool {
-	return n.Name == "" && n.Items == nil && n.Values == nil &&
-		n.Fields == nil && n.Branches == nil && n.Symbols == nil &&
-		n.Size == 0 && !n.HasEnumDefault
+	return nodeCarriesNothingBut(n, nameRefUsageSiteExempt)
 }
 
 // nodeRefTargetAgrees reports whether n's stamped refTarget is still the type
