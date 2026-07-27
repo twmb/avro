@@ -521,17 +521,49 @@ var censusOutstanding = []struct {
 		revealedBy: "nodeIsNameRefShape, the cache's sole-key wrapper collapse, and the bare-emission shortcuts in toJSONWalk",
 	},
 	{
-		question:   "Is this field written in the FLAT (goavro-style) form needing a lift?",
-		revealedBy: "flatFieldNeedsLift, plus the cache walker's flatField visitor and flatLiftTypeMap",
-	},
-	{
 		question:   "Which union BRANCH NAME does this Go value dispatch to?",
 		revealedBy: "unionTypeNameForValue — binary (serUnion.ser) and JSON (appendAvroJSONUnion) dispatch it separately; surfaced while driving Q10, whose nil short-circuit sits beside it",
 	},
+}
+
+// censusDemoted records questions examined and found NOT to be census
+// material, with the evidence. A genuine one-answerer question with no
+// external authority has nothing to disagree with, so a driver for it would
+// assert a function against itself. Saying so is a result; leaving it
+// unexplained invites a later round to re-derive the same enumeration.
+//
+// The bar is the RULE's shape, not the helper's name — two questions were
+// wrongly flagged for demotion before this bar was applied, and both turned
+// out to have several hand-written answerers.
+var censusDemoted = []struct {
+	question string
+	evidence string
+}{
 	{
-		question:   "Does this kind RECURSE (nest further schema nodes)?",
-		revealedBy: `json_decode.go's kind == "record" || "array" || "map" — REJECTED as a Q15 tell because it answers nesting, not namedness, which is what marks it a row of its own`,
+		question: "Does this kind RECURSE (can a union branch of it nest further nodes)?",
+		evidence: `the rule shape kind == "record" || "array" || "map" appears EXACTLY ONCE, in unionBranchRecurses (json_decode.go:1530); its three call sites (1626, 1653, 1786) all consume that one predicate, and no second representation asks the question. The per-kind ` + "`case \"array\":`" + ` switches elsewhere answer "how do I handle this kind", not "does it recurse". No external authority either: the rule is a DoS-motivated backtracking policy internal to the JSON union decoder (scalar branches keep their bounded backtrack; container branches would be 2^depth).`,
 	},
+}
+
+// TestCensus_DemotedIsJustified requires every demotion to carry its
+// evidence, and re-checks the claim that makes it a demotion: a
+// single-answerer question must still have exactly one occurrence of its
+// rule shape in the sources.
+func TestCensus_DemotedIsJustified(t *testing.T) {
+	for _, d := range censusDemoted {
+		if d.question == "" || d.evidence == "" {
+			t.Errorf("demotion is unexplained: %+v", d)
+		}
+	}
+	files := censusSourceFiles(t)
+	found := occurrences(t, files, `kind == "record" || kind == "array" || kind == "map"`)
+	total := 0
+	for _, lines := range found {
+		total += len(lines)
+	}
+	if total != 1 {
+		t.Errorf("the recursion rule shape now appears %d times (%v); it was demoted as single-answerer, so a second occurrence means the demotion must be revisited", total, found)
+	}
 }
 
 // TestCensus_OutstandingIsRecorded keeps the open end honest: every entry
@@ -543,7 +575,8 @@ func TestCensus_OutstandingIsRecorded(t *testing.T) {
 			t.Errorf("outstanding entry is incomplete: %+v", q)
 		}
 	}
-	t.Logf("census: %d registered, %d outstanding, enumeration open", len(censusRegistry), len(censusOutstanding))
+	t.Logf("census: %d registered, %d outstanding, %d demoted, enumeration open",
+		len(censusRegistry), len(censusOutstanding), len(censusDemoted))
 }
 
 // censusSourceFiles returns every non-test .go file the census scans, as
