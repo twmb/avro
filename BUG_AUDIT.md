@@ -8531,3 +8531,220 @@ this is the second tier of that same material.
   races); Java ABSENT · census 15 registered / 2 outstanding / 1 demoted,
   enumeration OPEN · UNCONVERGED (counter 0), freeze stays.
 ```
+
+## Distillation archive (2026-07-27 #3) — the ruled type-level default/order FIX round, verbatim
+
+The AUDIT_CORE ledger line for this round, verbatim (written at round end;
+the size figures in it were measured with `wc -c` AFTER the round's writes,
+not copied from an earlier line):
+
+```
+- 2026-07-27 · c8365de (START head — c8365de..HEAD quarantines this round's
+  commits) · FIX (ruling-directed; the policy question the previous round
+  surfaced and the gate reverted) · the outstanding BUG_AUDIT archive append
+  committed FIRST as its own docs commit, so "nothing deleted" is durable
+  rather than a claim about an uncommitted tree · **the type-level `default`
+  (on a kind that does not bind it) and `order` (on every kind) now ROUTE TO
+  PROPS.** Both were captured-then-DROPPED, reaching neither a structural
+  field nor Props — a violation of the biconditional Q4 drives and the same
+  class as the bare-emission loss. The fix is not a third case but a
+  DERIVATION: `schemaReservedKeyForObject` now asks one binding predicate
+  (`schemaKeyBinds`) and keeps a key out of Props for exactly two reasons —
+  BOUND, or SURFACED as-written on a structural field. An enumeration of
+  consumed keys is a subset, and these two fell through its fall-through ·
+  executed basis, both references: Java SCHEMA_RESERVED omits both
+  (:175-176), ENUM_RESERVED adds `default` alone (:178-180), FIELD_RESERVED
+  binds both (:503-504) — the field level is therefore the SCOPE BOUNDARY and
+  is pinned, not assumed; fastavro 1.12.2 preserves both on every kind
+  (EXECUTED per cell through a new `parsedump` oracle op that returns what
+  fastavro KEPT, so the arm asserts PRESERVATION rather than acceptance) ·
+  **#46 is refined, not reversed** — it governs CASE VARIANTS and presumes
+  the exact spelling is consumed, a premise absent where the kind does not
+  bind; the reasoning is written into #63(j) so the next round does not
+  re-litigate it · MEASURED over 77 shapes × 7 surfaces: canonical form,
+  Rabin, wire and Avro-JSON BYTE-IDENTICAL with both sides confirmed
+  non-empty (the trap this walk hit twice), every field-level row identical
+  on every column; changed = metadata tree, rebuild, CustomType callback
+  Props, and ONE cache-splice `String()` where a wrapper `order` now merges
+  onto the definition as the ordinary prop it became · 27 census cells + 2
+  enum-wrapper cells + 2 Q17 cells + the `HasEnumDefault` classification
+  flipped, each with its new expectation stated; the guard's fourth
+  "dropped-by-policy" class is now EMPTY and was removed, so a field that
+  emits a key the re-parse discards fails instead of being classified as an
+  accepted loss · Q4 extended (5 corpus cells, `schemaKeyBinds` registered,
+  tell counts updated — the drift guard caught the new site before the driver
+  did, the intended order) · SIX neuters, triple-checked (exit≠0 · RUN=30247
+  under `-v` · no `panic:`), red sets disjoint by key (order-only 41,
+  default-only 38, both 74) and by level (field boundary 33, type cells
+  green) · **one driver defect of my own, caught by a neuter reddening every
+  cell EXCEPT the one added to watch that guard** — a Props-only observable
+  is blind when the DEFINITION binds the key; PATTERNS gained that as the
+  third costume of the neuter-diagnosis lesson · post-fix sweep executed, not
+  asserted: SchemaFor pass-through, Resolve/CheckCompatibility, OCF
+  round-trip, single-object framing byte-identical, and a 1 MiB hostile
+  `default` body timed against the same body under an ordinary custom-prop
+  key (same cost class; the depth axis rejects at ~12µs on the existing
+  bracket guard) · suite + fastavro + `-race` green (0 data races); Java
+  ABSENT · **SIZE GUARD, measured with `wc -c` after this round's writes:
+  AUDIT_CORE 58.8KB (cap ~55KB, CROSSED) and AUDIT_PATTERNS 151.0KB (cap
+  ~150KB, CROSSED); NOT_BUGS 123.5KB — the next round opens with a DOUBLE
+  distillation.** ·
+  UNCONVERGED (counter 0), freeze stays. Verbatim: archive (2026-07-27 #3).
+```
+
+### The gate, run before the edit and discharged by ruling
+
+The change was DOCUMENTED INTENTIONAL. NOT_BUGS #63(h) named the drop as
+POLICY in as many words ("That loss is POLICY, pinned across 14 kinds by
+`TestMatrix_AttributePlacementCensus` and for the reference-wrapper spelling
+by `TestRegression_EnumRefWrapperDefaultInert`; the guard asserts the drop
+STILL happens"), the attribute-placement census header described it, and
+`bareEmissionFieldRules["HasEnumDefault"].why` quoted it back. Under the
+framework that verdict is a STOP. The previous round derived the change,
+applied it, hit that verdict, and REVERTED — surfacing it as a policy
+question rather than a fix. This round is the maintainer's ruling on that
+question, so the gate is discharged by the "documented but contradicted"
+path: the change lands AND every documented entry that asserted the drop is
+updated in the same round.
+
+Pickaxes over the touched predicate since the last large patch-set on main
+(base 55787af): `schemaReservedKeyForObject` was touched by 3e51329, 06c95e5,
+9004009, 7b1b168, 5717f32 and `strayKeyBinds` by 06c95e5, 7b1b168 — every hit
+concerns the OTHER keys (stray shape routing, precision/scale, logicalType).
+The `default`/`order` behavior was the original `return true` fall-through and
+predates the patch-set entirely; `-G` over the reserved-key set literal
+returns nothing in range. Verdict: not introduced-deliberately-in-range.
+
+### The measurement, and why it was the round's first executed step
+
+The ruling made the measurement a stop condition: if the canonical form, the
+fingerprint or the wire bytes were NOT identical across the change, the keys
+would reach further than either reference suggests and the ruling would need
+revisiting. A dump harness (77 cells × 7 columns: CANON, RABIN, WIRE, JSON,
+STRING, REBUILD, ROOTPROPS, plus the CustomType callback's Props) was run
+against the tree BEFORE any edit, then again after. Result:
+
+  CANON     IDENTICAL, 77 rows, 77 non-empty
+  RABIN     IDENTICAL, 77 rows, 77 non-empty
+  WIRE      IDENTICAL, 75 rows, 70 non-empty (the 5 empties are the "null"
+            kind, whose encoding is legitimately zero bytes)
+  JSON      IDENTICAL, 75 rows, 75 non-empty
+
+Both sides confirmed non-empty per column, which is the trap this walk has
+hit twice: an all-empty comparison is identical for the wrong reason.
+
+Changed columns, all expected: ROOTPROPS on the 27 non-binding type-level
+cells plus the recursive definition, the enum carrying `order` beside its
+bound `default`, and the cache splice; REBUILD on those plus the wrapper /
+recursive-reference / diamond shapes; CBPROPS on 3 of 4 (the enum's own
+`default` stays bound); and STRING on exactly ONE row — the SchemaCache
+self-containment splice, whose `String()` is rebuilt JSON rather than source
+text, where the wrapper `order` now merges onto the spliced fixed definition.
+`cache/enum-default` did NOT change: the enum definition BINDS `default`, so
+the merge skips it, definition-wins on consumed-ness.
+
+Every FIELD-level row was byte-identical on every column — the scope boundary
+held by measurement, not by assertion.
+
+### What flipped, cell by cell
+
+  TestMatrix_AttributePlacementCensus   27 type-level cells (14 order across
+                                        every kind; 13 default, enum skipped
+                                        because it binds) from censusCaptured
+                                        to censusProps. "default" needed a
+                                        per-kind expected Props value, so
+                                        censusAttr gained propsValFor.
+  TestRegression_EnumRefWrapperDefaultInert
+                                        2 direct cells: the wrapper default is
+                                        now preserved in Props and survives
+                                        the rebuild; what is asserted instead
+                                        is that it never BINDS, checked by
+                                        re-parsing the rebuild and requiring
+                                        no field to carry an enum default. The
+                                        cache-splice cell is UNCHANGED and its
+                                        reason is now written down.
+  TestInvariant_BareEmissionCoversEverySchemaNodeField
+                                        HasEnumDefault moves from dropped to
+                                        RELOCATED, joining Precision/Scale.
+                                        The dropped classification is deleted
+                                        outright: after this ruling no emitted
+                                        key is discarded by the re-parse, so
+                                        an empty class would assert a policy
+                                        no longer in force. The propsKey arm
+                                        gained the second half the deleted arm
+                                        had — the emission must WRITE the key
+                                        and the field must read back ZERO —
+                                        and `why` became mandatory for it,
+                                        which forced Precision/Scale to quote
+                                        #71 instead of stating nothing.
+  TestCensus_Q17 (splice wrapper)       order and default flip to merges,
+                                        with rulings restated; a NEW cell adds
+                                        an enum definition, the one kind that
+                                        binds "default", so the same key and
+                                        the same wrapper spelling get opposite
+                                        verdicts from the DEFINITION's kind.
+  TestCensus_Q4 (reserved-key routing)  5 corpus cells added, including the
+                                        discriminating enum pair (one key
+                                        bound, the other not, on one kind) and
+                                        a "Default" variant for the #46 axis.
+
+### The driver defect a neuter found, and the general form
+
+Six neuters were run, each triple-checked (exit != 0 · RUN = 30247 under `-v`
+· no `panic:`):
+
+  1  both keys bind everywhere (the old routing)   74 red
+  2  order only                                    41 red, zero default cells
+  3  default only                                  38 red, zero order cells
+  4  FIELD_RESERVED loses both keys                33 red, all field-level;
+                                                   every type-level cell green
+  5  metadata splice stops skipping reserved keys  see below
+  6  cache splice stops skipping reserved keys     3 red
+
+Neuter 5 initially redded exactly ONE cell — and not the cell added to watch
+that arm. The new enum-definition cell passed with the guard disabled. The
+cause was the driver's observable, not the guard: the driver read the verdict
+off `Props`, and a `default` merged onto an ENUM definition is CONSUMED on
+re-parse, so it disappears from Props and reappears as `HasEnumDefault`. A
+Props-only reader cannot tell "the merge skipped it" from "the merge supplied
+the definition's own default". The verdict now also reads the STRUCTURAL
+landing, and a dropped key must reach NEITHER surface; the cell then reds
+under neuter 5 as intended.
+
+The general form, folded into AUDIT_PATTERNS as the third costume of the
+neuter-diagnosis lesson: a neuter reddening every cell EXCEPT the one added
+for that guard is not the guard being fine — it is the new cell's observable
+being blind on exactly the case it was written for. Read a neuter's red set
+against the cells you EXPECTED, never merely against zero.
+
+### Post-fix sweep — executed, not asserted
+
+Every "unaffected" claim was driven rather than reasoned:
+
+  SchemaFor composition   a CustomType whose Schema node carries both keys in
+                          Props emits them verbatim
+                          ({"default":7,"order":"ignore","type":"long"});
+                          #63(d) pass-through confirmed.
+  Resolve / compatibility a writer carrying both keys resolves against a
+                          reader without them; decoded value identical, both
+                          compatibility directions nil.
+  OCF                     round trip through NewWriter/NewReader unchanged.
+  Single-object encoding  framing byte-identical to the key-free twin.
+  Hostile input           a 1 MiB "default" body now reaches the props
+                          normalization it previously skipped. Timed against
+                          the SAME body under an ordinary custom-property key,
+                          which has always taken that path: parse 86ms vs
+                          62ms, rebuild 189ms vs 154ms — the same cost class,
+                          no new one. The depth axis is rejected by the
+                          existing bracket guard at ~12us for both spellings.
+
+### Reported, not fixed — a third key in the same class
+
+A NON-STRING `doc` is captured-then-dropped exactly as `default`/`order` were,
+at BOTH levels: `{"type":"int","doc":5}` yields `Doc=""`, `Props={}`, and the
+rebuild emits a bare `"int"`; the field-level spelling behaves the same. The
+condition is the key's BODY (like logicalType's string-conditional arm) rather
+than its PLACEMENT, and closing it at the field level would cross the scope
+boundary this ruling drew, so it is filed for the maintainer rather than
+folded in.
+
