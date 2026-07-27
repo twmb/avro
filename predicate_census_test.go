@@ -463,13 +463,21 @@ var censusRegistry = []censusQuestion{
 		id:       "Q4",
 		question: "Is this key RESERVED on this kind — consumed into a structural field, or an ordinary custom property?",
 		authority: "the RULINGS, not the code: NOT_BUGS #46 (reserved names match only their exact lowercase " +
-			"spelling; a variant is an ordinary prop on every surface, body-independent) and #63(b)/(f) " +
-			"(shape-conditional routing on a non-binding kind; placement-conditional, never case-conditional). " +
-			"strayKeyBinds decides binding and schemaReservedKeyForObject decides routing; both are checked " +
-			"against the parse's observable rather than against each other",
+			"spelling; a variant is an ordinary prop on every surface, body-independent) and #63(b)/(f)/(j) " +
+			"(shape-conditional routing on a non-binding kind; placement-conditional, never case-conditional; " +
+			"and a reserved key that is neither bound nor surfaceable has Props as its ONLY surface). " +
+			"schemaKeyBinds decides binding -- strayKeyBinds for the keys the kind alone settles, plus the two " +
+			"whose binding depends on the value or the logical type -- and schemaReservedKeyForObject decides " +
+			"routing, as the disjunction of exactly two ways a reserved key stays out of Props: the kind BINDS " +
+			"it, or the kind SURFACES it as-written on a structural field. Both are checked against the parse's " +
+			"observable rather than against each other",
 		answerers: []censusAnswerer{
 			{repr: "as-written parse", site: "strayKeyBinds + the per-key shape arms", file: "schema_parse.go"},
 			{repr: "metadata Root + render", site: "schemaReservedKeyForObject", file: "schema_node.go"},
+			{
+				repr: "the shared binding question", site: "schemaKeyBinds", file: "schema_node.go",
+				note: "not a fourth answerer but the ONE binding predicate the routing asks, which is what keeps the routing from enumerating the consumed keys as a hand-written list. An enumeration is a subset and a subset can be missing a member: the type-level \"default\" and \"order\" fell through such a list and were dropped, reaching neither a structural field nor Props.",
+			},
 			{repr: "cache splice merge", site: "schemaReservedKeyForObject (nil shape verdict)", file: "cache.go"},
 			{
 				repr: "tree walker", site: "strayBodyShapeOK gating stray enumeration", file: "schema_walk.go",
@@ -478,10 +486,13 @@ var censusRegistry = []censusQuestion{
 		},
 		tells: []censusTell{
 			{pattern: `strayKeyBinds`, counts: map[string]int{
-				"schema_parse.go": 11, "schema_node.go": 1,
+				"schema_parse.go": 11, "schema_node.go": 2,
+			}},
+			{pattern: `schemaKeyBinds`, counts: map[string]int{
+				"schema_node.go": 3, "schema_parse.go": 1,
 			}},
 			{pattern: `schemaReservedKeyForObject`, counts: map[string]int{
-				"schema_node.go": 5, "schema_parse.go": 5, "cache.go": 1,
+				"schema_node.go": 6, "schema_parse.go": 5, "cache.go": 1,
 			}},
 			// Rejected tell: `strayBodyShapeOK` — 20 hits across three files,
 			// but it answers the SHAPE question (does this body parse as the
@@ -2595,6 +2606,30 @@ func reservedKeyCorpus() []reservedKeyCell {
 		{name: "int-symbols-variant-malformed", kind: "int", key: "Symbols", body: `3.7`,
 			binds: false, inProps: true},
 
+		// The two FIELD attributes at the TYPE level. Only an enum binds a
+		// schema-level "default" (Java's ENUM_RESERVED is SCHEMA_RESERVED
+		// plus that one key, Schema.java:178-180); no kind binds "order"
+		// (neither reserved set contains it, :175-180). Where the kind does
+		// not bind, there is no structural field for the key to surface on,
+		// so Props is its ONLY surface — the biconditional's other arm. The
+		// enum pair is the discriminating cell: same kind, one key bound and
+		// the other not, so a routing that keyed off the kind alone would
+		// get one of them wrong.
+		{name: "enum-default-exact", kind: "enum", key: "default", body: `"Z"`,
+			binds: true, structural: true},
+		{name: "enum-order-stray", kind: "enum", key: "order", body: `"ignore"`,
+			binds: false, inProps: true},
+		{name: "int-default-stray", kind: "int", key: "default", body: `3`,
+			binds: false, inProps: true},
+		{name: "int-order-stray", kind: "int", key: "order", body: `"ignore"`,
+			binds: false, inProps: true},
+
+		// #46 on the newly routed keys: a case-variant is an ordinary prop
+		// even on the kind whose EXACT spelling would bind it, so the enum's
+		// own default stays unbound and the variant rides verbatim.
+		{name: "enum-default-variant", kind: "enum", key: "Default", body: `"Z"`,
+			binds: false, inProps: true},
+
 		// A key that is not reserved at all, as the baseline both sides of
 		// the rule must agree on.
 		{name: "int-plain-custom-key", kind: "int", key: "customThing", body: `7`,
@@ -2634,6 +2669,13 @@ func structuralFieldFor(n *SchemaNode, key string) bool {
 		return n.Size != 0
 	case "aliases", "Aliases":
 		return len(n.Aliases) > 0
+	case "default", "Default":
+		return n.HasEnumDefault
+	case "order", "Order":
+		// No type-level kind binds "order", so there is no SchemaNode
+		// field for it to reach — which is exactly why Props must be its
+		// surface. The absence is the answer, not a gap in this reader.
+		return false
 	}
 	return false
 }
@@ -2780,8 +2822,8 @@ func spliceWrapperCells() []spliceWrapperCell {
 		{"logicalType", `123`, true, "#70: no value but a string can name a logical, so a non-string spelling is an ordinary prop", ""},
 		{"precision", `3`, true, "#71: precision/scale are reserved only on a recognized decimal carrier; unconsumed they ride verbatim", ""},
 		{"scale", `1`, true, "#71, same clause", ""},
-		{"order", `"ignore"`, false, "a reserved name never enters Props (the attribute-placement census's routing rule)", ""},
-		{"default", `"D"`, false, "a reserved name never enters Props; only an enum consumes a schema-level default", ""},
+		{"order", `"ignore"`, true, "no type-level kind BINDS \"order\" — it is a field attribute — so on a definition of any kind it is an ordinary custom property and merges like one", ""},
+		{"default", `"D"`, true, "only an enum binds a schema-level \"default\"; on a definition of any other kind it is an ordinary custom property and merges", ""},
 		{"my.custom", `"v"`, true, "#63 splice-merge: wrapper custom properties merge onto the definition, definition-wins", ""},
 		{"my.custom", `{"nested":[1,2]}`, true, "#63 splice-merge, container body", ""},
 		// Definition-consumes cells: the def is a decimal carrier, so its own
@@ -2798,8 +2840,18 @@ func spliceWrapperCells() []spliceWrapperCell {
 		// decimal semantics. Every other cell is decided earlier, by the
 		// parse routing or by the key already being present.
 		{"scale", `7`, false, "#63 splice-merge is definition-wins on CONSUMED-ness, not merely on keys the def happens to emit: an omitted scale is the spec default 0, not an opening", decimalNoScaleDef},
+		// The one kind that BINDS a schema-level "default". Same key, same
+		// wrapper spelling, opposite verdict from the plain-def cell above —
+		// so the corpus proves the routing reads the DEFINITION's kind and
+		// not the key's name.
+		{"default", `"D"`, false, "#63 splice-merge, definition-wins: an enum consumes \"default\" as its evolution default, so a usage site cannot supply a second one", enumCarrierDef},
 	}
 }
+
+// enumCarrierDef is a definition whose kind CONSUMES "default" (the enum
+// evolution default), so a wrapper carrying that key reaches the merge's
+// reserved-key skip.
+const enumCarrierDef = `{"type":"enum","name":"x.y.F","symbols":["D","E"]}`
 
 // decimalNoScaleDef consumes scale but emits none, so only the reserved-key
 // skip stands between a usage-site scale and the definition's semantics.
@@ -2812,9 +2864,15 @@ const decimalCarrierDef = `{"type":"fixed","name":"x.y.F","size":4,"logicalType"
 // spliceVerdict is what a splice did with the wrapper's key, phrased so both
 // representations can be asked the same way.
 type spliceVerdict struct {
-	spliced   bool // did the definition materialize in place of the reference?
-	inProps   bool // did the key ride onto the result as a custom property?
-	propValue string
+	spliced bool // did the definition materialize in place of the reference?
+	inProps bool // did the key ride onto the result as a custom property?
+	// structural records the key landing on the definition's own structural
+	// field. Props alone is a blind observable whenever the DEFINITION's kind
+	// BINDS the key: a merged "default" onto an enum is consumed on re-parse
+	// and vanishes from Props, so a Props-only reader cannot tell "the merge
+	// skipped it" from "the merge supplied the definition's own default".
+	structural bool
+	propValue  string
 }
 
 func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testing.T) {
@@ -2825,6 +2883,15 @@ func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testin
 			def := plainDef
 			if c.def != "" {
 				def = c.def
+			}
+			// The def's own kind, read off the definition rather than
+			// assumed, so "did it splice" is asked of whatever kind the
+			// cell's carrier is.
+			var defObj struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal([]byte(def), &defObj); err != nil {
+				t.Fatalf("cell definition is not a JSON object: %v", err)
 			}
 			wrapper := `{"type":"x.y.F",` + strconv.Quote(c.key) + `:` + c.body + `}`
 
@@ -2843,7 +2910,7 @@ func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testin
 				if err != nil {
 					return spliceVerdict{}, err
 				}
-				return verdictFromSpliced(out.Root(), c.key), nil
+				return verdictFromSpliced(out.Root(), c.key, defObj.Type), nil
 			}
 
 			// Answerer 2 — the CACHE splice, on the raw JSON tree. The
@@ -2858,7 +2925,7 @@ func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testin
 				if err != nil {
 					return spliceVerdict{}, err
 				}
-				return verdictFromSpliced(s.Root().Fields[0].Type, c.key), nil
+				return verdictFromSpliced(s.Root().Fields[0].Type, c.key, defObj.Type), nil
 			}
 
 			mv, merr := meta()
@@ -2881,6 +2948,14 @@ func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testin
 				}
 				t.Errorf("wrapper key %q was %s; the ruling says it must %s — %s", c.key, got, want, c.ruling)
 			}
+			// A dropped key must reach NEITHER surface. Where the
+			// definition's own kind BINDS the key, a merged copy is consumed
+			// on re-parse and disappears from Props, so Props alone cannot
+			// see the drop fail — the structural landing is what makes those
+			// cells measure anything.
+			if !c.merges && mv.structural {
+				t.Errorf("wrapper key %q landed on the definition's structural field; a usage site cannot supply a value the definition binds — %s", c.key, c.ruling)
+			}
 			if !mv.spliced {
 				t.Errorf("the wrapper did not splice at all, so this cell measures nothing")
 			}
@@ -2888,7 +2963,10 @@ func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testin
 	}
 }
 
-// verdictFromSpliced reads the observable off a spliced result.
+// verdictFromSpliced reads the observable off a spliced result. defKind is
+// the definition's own kind, so "did it splice" means the node carries that
+// kind's DEFINING content rather than still being a bare name reference —
+// every cell's definition is named x.y.F, but not every one is a fixed.
 //
 // The identity compared is the FULLNAME, not the raw Name: the metadata
 // splice preserves the definition's dotted spelling while the cache splice
@@ -2896,12 +2974,22 @@ func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testin
 // this question's answer. Comparing the raw field made every cell disagree,
 // which is the tell that a driver is measuring the wrong thing — genuine
 // divergence is selective.
-func verdictFromSpliced(n SchemaNode, key string) spliceVerdict {
+func verdictFromSpliced(n SchemaNode, key, defKind string) spliceVerdict {
 	full := n.Name
 	if !strings.Contains(full, ".") && n.Namespace != "" {
 		full = n.Namespace + "." + full
 	}
-	v := spliceVerdict{spliced: n.Type == "fixed" && n.Size == 4 && full == "x.y.F"}
+	defined := false
+	switch defKind {
+	case "fixed":
+		defined = n.Size == 4
+	case "enum":
+		defined = len(n.Symbols) > 0
+	}
+	v := spliceVerdict{
+		spliced:    n.Type == defKind && defined && full == "x.y.F",
+		structural: structuralFieldFor(&n, key),
+	}
 	if raw, ok := n.Props[key]; ok {
 		v.inProps = true
 		b, _ := json.Marshal(raw)
@@ -2950,8 +3038,12 @@ func TestCensus_Q17_CorpusIsNotVacuous(t *testing.T) {
 // defLabel distinguishes the plain-definition cells from the
 // definition-consumes cells in subtest names.
 func defLabel(def string) string {
-	if def == "" {
+	switch def {
+	case "":
 		return ""
+	case enumCarrierDef:
+		return "/on-enum-def"
+	default:
+		return "/on-decimal-def"
 	}
-	return "/on-decimal-def"
 }

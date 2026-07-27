@@ -42,13 +42,14 @@ import (
 //   - Every OTHER reserved key on a kind that does not consume it is
 //     captured and surfaced AS-WRITTEN on the matching SchemaNode field
 //     where one exists (items/values/symbols/size/fields; name/namespace;
-//     aliases; logicalType), and silently dropped from the metadata tree
-//     where none does (order, default at type level). None of them enter
-//     Props (reserved-name capture, #46), none reach the wire, the
-//     canonical form strips them, and the Root().Schema() rebuild emits
-//     only the defined-placement attributes — so the rebuild is
-//     canonical-identical, not text-identical. NOT_BUGS #63 records the
-//     structural-key edges.
+//     aliases; logicalType), and rides to Props verbatim where none does
+//     (order on every kind, default on every kind but enum — the two
+//     field attributes, which no type object has a structural field for).
+//     Exactly one surface per key, never both and never neither. None of
+//     them reach the wire, the canonical form strips them, and the
+//     Root().Schema() rebuild emits the defined-placement attributes plus
+//     the Props-routed ones — so the rebuild is canonical-identical, not
+//     text-identical. NOT_BUGS #63 records the structural-key edges.
 //   - A container kind carrying ANOTHER container kind's defining
 //     structural key hard-rejects ("invalid <kind> has schema for other
 //     types") — NOT_BUGS #63, the cache/metadata walkers' kind-keyed
@@ -114,6 +115,19 @@ type censusAttr struct {
 	// propsVal is the normalized Props value expected for censusProps and
 	// field-level cells.
 	propsVal any
+	// propsValFor overrides propsVal per kind, for the attributes whose
+	// value axis is kind-plausible (a "default" body has to be a value the
+	// kind can take). nil falls back to propsVal.
+	propsValFor func(kind string) any
+}
+
+// propsValue is the expected Props entry for a cell, preferring the per-kind
+// override where the attribute has one.
+func (a censusAttr) propsValue(kind string) any {
+	if a.propsValFor != nil {
+		return a.propsValFor(kind)
+	}
+	return a.propsVal
 }
 
 // structuralExclusive returns the #63 verdict table for one structural key:
@@ -204,16 +218,21 @@ func censusAttrs() []censusAttr {
 			},
 		},
 		{
-			// order is a FIELD attribute; at the type level no kind consumes
-			// it and no SchemaNode field exists for it — dropped everywhere.
+			// order is a FIELD attribute; no type-level kind consumes it and
+			// no SchemaNode field exists for it to land on, so Props is its
+			// only surface. Java keeps it as a schema property on every kind
+			// (SCHEMA_RESERVED omits it, Schema.java:175-176; ENUM_RESERVED
+			// adds only "default", :178-180) and fastavro 1.12.2 keeps it on
+			// every kind too (executed).
 			key: "order", val: constVal(`"ascending"`),
-			verdict: always(censusCaptured), fieldLevel: false,
+			verdict: always(censusProps), fieldLevel: false, propsVal: "ascending",
 		},
 		{
 			// default is a FIELD attribute plus the enum-level evolution
 			// default (defined there, membership-validated — #54; that is
 			// the census's "enum-default" attribute). Every other type-level
-			// placement is captured-dropped: no SchemaNode field surfaces it.
+			// placement binds nothing and has no SchemaNode field, so it
+			// rides to Props — Java's ENUM_RESERVED is the same split.
 			key: "default",
 			val: func(kind string) string {
 				switch kind {
@@ -240,9 +259,30 @@ func censusAttrs() []censusAttr {
 				if kind == "enum" {
 					return censusSkip // enum-default: defined, #54-validated
 				}
-				return censusCaptured
+				return censusProps
 			},
 			fieldLevel: false,
+			propsValFor: func(kind string) any {
+				switch kind {
+				case "null":
+					return nil
+				case "boolean":
+					return true
+				case "int", "long":
+					return int64(3)
+				case "float", "double":
+					return 1.5
+				case "string", "bytes":
+					return "s"
+				case "fixed":
+					return "AAAA"
+				case "record", "error", "map":
+					return map[string]any{}
+				case "array":
+					return []any{}
+				}
+				return nil
+			},
 		},
 		{
 			// aliases are defined on named kinds (any string accepted, #27)
@@ -473,7 +513,7 @@ func TestMatrix_AttributePlacementCensus(t *testing.T) {
 
 				root := s.Root()
 				if verdict == censusProps {
-					want := map[string]any{attr.key: attr.propsVal}
+					want := map[string]any{attr.key: attr.propsValue(kind)}
 					if !reflect.DeepEqual(root.Props, want) {
 						t.Errorf("Props = %#v; want %#v", root.Props, want)
 					}
@@ -506,7 +546,7 @@ func TestMatrix_AttributePlacementCensus(t *testing.T) {
 					t.Fatalf("Parse(%s): %v", src, err)
 				}
 				f := s.Root().Fields[0]
-				want := map[string]any{attr.key: attr.propsVal}
+				want := map[string]any{attr.key: attr.propsValue(kind)}
 				if !reflect.DeepEqual(f.Props, want) {
 					t.Errorf("field Props = %#v; want %#v", f.Props, want)
 				}

@@ -517,16 +517,16 @@ type schemaNodeFieldRule struct {
 	// kind does not BIND that key. The value is preserved as inert metadata
 	// on its only surface, not lost; the field itself reads back zero.
 	propsKey string
-	// droppedKey, when non-empty, names a JSON key the emission arm writes
-	// that the RE-PARSE then drops: it is a reserved name, so it never
-	// enters Props, and the carrier kind has no structural field to capture
-	// it into. The value IS lost, and the loss is policy rather than an
-	// oversight, so the rule quotes the policy and the test asserts the drop
-	// still happens — the day the policy changes, this cell reds and has to
-	// be reclassified rather than silently passing.
-	droppedKey string
-	why        string
+	why      string
 }
+
+// There is deliberately no "dropped" classification. A reserved key the
+// carrier kind does not bind has Props as its only surface, so an emitted
+// value always comes back somewhere: on its own field, or under propsKey.
+// A field that emits a key the re-parse then discards therefore fails here
+// with "give it an emission arm, classify where it relocates, or classify it
+// exempt" rather than being classified as an accepted loss — which is the
+// routing rule stated as a test.
 
 // bareEmissionFieldRules classifies every exported SchemaNode field whose
 // treatment under nodeCarriesOnlyType is not the ordinary
@@ -536,15 +536,22 @@ var bareEmissionFieldRules = map[string]schemaNodeFieldRule{
 	"Branches":    {exempt: "no JSON key routes to Branches outside a union — the union arm returns before the collapse is reached — so a hand-built value on another kind is inert"},
 	"EnumDefault": {exempt: "HasEnumDefault is the carrier the \"default\" key is emitted from; with the carrier false the node declares no default, so there is nothing to emit and nothing to lose"},
 	"HasEnumDefault": {
-		droppedKey: "default",
-		why: "\"default\" is a reserved name, so it never enters Props, and only an enum has a structural field to capture it into. " +
-			"On every other carrier the reserved-name-capture rule drops it from the metadata tree — the same treatment \"order\" gets " +
-			"on every kind, pinned across the kind axis by TestMatrix_AttributePlacementCensus and by " +
-			"TestRegression_EnumRefWrapperDefaultInert for the reference-wrapper spelling. Setting this field on a non-enum node is " +
-			"therefore lossy, and changing that is a routing-policy decision, not a fix to make here",
+		propsKey: "default",
+		why: "the carrier emits \"default\", and only an enum BINDS that key at the type level — on any other carrier it is a " +
+			"field attribute the kind does not bind, with no structural field to land on, so it rides to Props as its only " +
+			"surface exactly like precision/scale off a decimal carrier. Pinned across the kind axis by " +
+			"TestMatrix_AttributePlacementCensus and for the reference-wrapper spelling by TestRegression_EnumRefWrapperDefaultInert",
 	},
-	"Precision": {propsKey: "precision"},
-	"Scale":     {propsKey: "scale"},
+	"Precision": {
+		propsKey: "precision",
+		why: "precision and scale are decimal PARAMETERS, bound only on a recognized decimal carrier " +
+			"(decimalConsumesPrecisionScale); on any other carrier the pair is inert metadata that rides to Props verbatim, " +
+			"pinned across the placement axis by TestMatrix_StrayPrecisionScalePlacement",
+	},
+	"Scale": {
+		propsKey: "scale",
+		why:      "the same clause as Precision: unconsumed off a decimal carrier, so Props is its only surface",
+	},
 }
 
 // A schema node collapses to its bare type name only when it carries nothing
@@ -572,7 +579,7 @@ func TestInvariant_BareEmissionCoversEverySchemaNodeField(t *testing.T) {
 	}
 
 	rt := reflect.TypeFor[SchemaNode]()
-	var checked, exempted, relocated, dropped int
+	var checked, exempted, relocated int
 	for i := range rt.NumField() {
 		f := rt.Field(i)
 		if !f.IsExported() || f.Name == "Type" {
@@ -610,29 +617,24 @@ func TestInvariant_BareEmissionCoversEverySchemaNodeField(t *testing.T) {
 		switch {
 		case rule.propsKey != "":
 			relocated++
-			if _, ok := back.Props[rule.propsKey]; !ok {
-				t.Errorf("field %s emits %q on a carrier that does not bind it, so the value must ride to Props as its only surface; Props came back %v from %s",
-					f.Name, rule.propsKey, back.Props, s)
-			}
-		case rule.droppedKey != "":
-			dropped++
 			// Both halves of the classification are checked. The emission
-			// arm must WRITE the key (otherwise the loss is the emitter's,
-			// not the routing's, and this rule is the wrong diagnosis)...
-			if !strings.Contains(s.String(), `"`+rule.droppedKey+`"`) {
-				t.Errorf("field %s is classified as dropped by the reserved-name routing of %q, but the emission never wrote that key at all — the loss is in the emitter, so give it an emission arm: %s",
-					f.Name, rule.droppedKey, s)
+			// arm must WRITE the key (otherwise the relocation never had a
+			// value to carry and this rule is the wrong diagnosis)...
+			if !strings.Contains(s.String(), `"`+rule.propsKey+`"`) {
+				t.Errorf("field %s is classified as relocating to Props under %q, but the emission never wrote that key at all — the loss would be the emitter's, so give it an emission arm: %s",
+					f.Name, rule.propsKey, s)
 			}
-			// ...and the re-parse must still drop it. If this stops
-			// failing, the routing policy changed and the classification
-			// has to be revisited, not silently kept.
+			// ...and the re-parse must land it in Props rather than lose it.
+			if _, ok := back.Props[rule.propsKey]; !ok {
+				t.Errorf("field %s emits %q on a carrier that does not bind it, so the value must ride to Props as its only surface; Props came back %v from %s. Rule quoted: %s",
+					f.Name, rule.propsKey, back.Props, s, rule.why)
+			}
+			// It is a RELOCATION, so the field itself must read back zero.
+			// If it starts coming back on its own field the carrier began
+			// binding the key and the classification is stale.
 			if got := reflect.ValueOf(back).Field(i).Interface(); !reflect.DeepEqual(reflect.Zero(f.Type).Interface(), got) {
-				t.Errorf("field %s now SURVIVES the round trip (%#v), so the documented drop no longer happens: reclassify it as an ordinary round-tripping field. Rule quoted: %s",
-					f.Name, got, rule.why)
-			}
-			if _, ok := back.Props[rule.droppedKey]; ok {
-				t.Errorf("field %s: %q now reaches Props, so the reserved-name-capture rule changed; reclassify with propsKey. Rule quoted: %s",
-					f.Name, rule.droppedKey, rule.why)
+				t.Errorf("field %s now comes back on its OWN field (%#v) rather than in Props, so the carrier binds %q after all: reclassify it as an ordinary round-tripping field. Rule quoted: %s",
+					f.Name, got, rule.propsKey, rule.why)
 			}
 		default:
 			if got := reflect.ValueOf(back).Field(i).Interface(); !reflect.DeepEqual(want, got) {
@@ -642,23 +644,11 @@ func TestInvariant_BareEmissionCoversEverySchemaNodeField(t *testing.T) {
 		}
 		// Wherever the value landed, emission must be a FIXPOINT from there:
 		// a second pass that drops it would mean the first round trip only
-		// postponed the loss. The one classification exempt from this is the
-		// dropped key, whose whole content is that the loss happens on the
-		// FIRST re-parse; there the second pass must instead land exactly on
-		// the untouched control, proving the drop is total rather than
-		// leaving a half-emitted residue.
+		// postponed the loss.
 		s2, err := back.Schema()
 		switch {
 		case err != nil:
 			t.Errorf("field %s: re-emitting the rebuilt node failed: %v", f.Name, err)
-		case rule.droppedKey != "":
-			ctrl, err := base.Schema()
-			if err != nil {
-				t.Fatalf("the untouched control must emit: %v", err)
-			}
-			if s2.String() != ctrl.String() {
-				t.Errorf("field %s: the drop left a residue — second pass %s, untouched control %s", f.Name, s2, ctrl)
-			}
 		case s2.String() != s.String():
 			t.Errorf("field %s: emission is not a fixpoint, so something is lost on the second pass:\n first %s\nsecond %s", f.Name, s, s2)
 		}
@@ -666,7 +656,7 @@ func TestInvariant_BareEmissionCoversEverySchemaNodeField(t *testing.T) {
 	if checked < 12 {
 		t.Fatalf("only %d fields were actually checked; the walk is not seeing SchemaNode", checked)
 	}
-	t.Logf("bare-emission coverage: %d fields block, of which %d round-trip on their own field, %d relocate to Props and %d are dropped by the reserved-name routing; %d classified exempt", checked, checked-relocated-dropped, relocated, dropped, exempted)
+	t.Logf("bare-emission coverage: %d fields block, of which %d round-trip on their own field and %d relocate to Props; %d classified exempt", checked, checked-relocated, relocated, exempted)
 }
 
 // nameRefSpliceFieldRules classifies every exported SchemaNode field whose

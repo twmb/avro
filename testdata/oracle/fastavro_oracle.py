@@ -152,6 +152,16 @@ def handle(job):
         # means fastavro accepted the schema. (A rejection surfaces as the
         # handler's exception -> {"ok": false}.)
         return {"ok": True}
+    if op == "parsedump":
+        # Acceptance PLUS what fastavro kept: the parsed schema itself, so a
+        # caller can assert an attribute was PRESERVED rather than merely
+        # that the schema parsed. fastavro's own bookkeeping keys are
+        # dunder-prefixed (__named_schemas, __fastavro_parsed) and are
+        # stripped so only the schema's own attributes travel.
+        if not isinstance(schema, dict):
+            return {"ok": True, "parsed": json.dumps(schema)}
+        kept = {k: v for k, v in schema.items() if not k.startswith("__")}
+        return {"ok": True, "parsed": json.dumps(kept)}
     if op == "rt":
         # Round-trip THROUGH fastavro: decode twmb's bytes, re-encode the
         # decoded value, return fastavro's bytes. Byte equality means both

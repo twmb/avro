@@ -62,8 +62,12 @@ type oracleResp struct {
 	Canonical string `json:"canonical"`
 	JSON      string `json:"json"`
 	Values    []any  `json:"values"`
-	Err       string `json:"err"`
-	Fatal     string `json:"fatal"`
+	// Parsed carries the "parsedump" op's schema-as-fastavro-kept-it, so a
+	// differential can assert an attribute was PRESERVED rather than only
+	// that the schema parsed.
+	Parsed string `json:"parsed"`
+	Err    string `json:"err"`
+	Fatal  string `json:"fatal"`
 }
 
 type oracle struct {

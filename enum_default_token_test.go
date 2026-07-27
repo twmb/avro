@@ -2,6 +2,7 @@ package avro_test
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -315,35 +316,68 @@ func TestMatrix_EnumFieldDefaultTokenTypes(t *testing.T) {
 	}
 }
 
-// A "default" key riding a WRAPPER around an enum REFERENCE is never
-// consumed: the enum-level default is read only at the definition site,
-// and reference wrappers resolve before the enum build runs. The key is
-// inert for EVERY token type — not bound, not surfaced as metadata or a
-// prop, dropped by the rebuild — mirroring the consumed-conditional
-// posture of other type-parameter attributes. This holds for direct
-// parses and for SchemaCache cross-parse references (where the splice
-// materializes the definition without the wrapper key).
+// A "default" key riding a WRAPPER around an enum REFERENCE never BINDS:
+// the enum-level default is read only at the definition site, and a
+// reference wrapper's own kind is the referenced NAME, which binds nothing.
+// The key is therefore an ordinary custom property of the usage site for
+// EVERY token type — it rides in Props as its only surface, it is preserved
+// by the rebuild as written, and the enum it names still declares no
+// default. Nothing about the wrapper's token type changes that: binding is
+// decided by placement, never by the body.
+//
+// The SchemaCache cross-parse spelling differs by design and the difference
+// is the splice, not the routing: the cache materializes the DEFINITION in
+// place of the reference, and the merge is definition-wins on
+// consumed-ness — a key the definition's own kind consumes cannot be
+// re-supplied by a usage site, so an enum definition swallows the wrapper's
+// "default" rather than carrying a second one.
 func TestRegression_EnumRefWrapperDefaultInert(t *testing.T) {
-	for _, tok := range []string{`"B"`, `5`} {
-		t.Run("direct-"+tok, func(t *testing.T) {
+	for _, tok := range []struct {
+		src  string
+		want any
+	}{
+		{`"B"`, "B"},
+		{`5`, int64(5)},
+	} {
+		t.Run("direct-"+tok.src, func(t *testing.T) {
 			s, err := avro.Parse(fmt.Sprintf(`{"type":"record","name":"R","fields":[
 				{"name":"a","type":{"type":"enum","name":"E","symbols":["A","B"]}},
-				{"name":"b","type":{"type":"E","default":%s}}]}`, tok))
+				{"name":"b","type":{"type":"E","default":%s}}]}`, tok.src))
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
 			root := s.Root()
 			b := root.Fields[1].Type
-			if b.HasEnumDefault || b.EnumDefault != "" || len(b.Props) != 0 {
-				t.Fatalf("wrapper default leaked: HasEnumDefault=%v EnumDefault=%q Props=%v",
-					b.HasEnumDefault, b.EnumDefault, b.Props)
+			// Not bound: the usage site declares no enum default.
+			if b.HasEnumDefault || b.EnumDefault != "" {
+				t.Fatalf("wrapper default BOUND at a reference: HasEnumDefault=%v EnumDefault=%q",
+					b.HasEnumDefault, b.EnumDefault)
+			}
+			// Preserved: Props is its only surface, as written.
+			if got, ok := b.Props["default"]; !ok || !reflect.DeepEqual(got, tok.want) {
+				t.Fatalf("wrapper default not preserved as written: Props=%#v, want %#v", b.Props, tok.want)
+			}
+			// And the definition it names is untouched.
+			if a := root.Fields[0].Type; a.HasEnumDefault {
+				t.Fatalf("the usage site's default reached the DEFINITION: %+v", a)
 			}
 			rebuilt, err := root.Schema()
 			if err != nil {
 				t.Fatalf("rebuild: %v", err)
 			}
-			if strings.Contains(rebuilt.String(), "default") {
-				t.Fatalf("rebuild carries the inert wrapper default: %s", rebuilt.String())
+			if !strings.Contains(rebuilt.String(), "default") {
+				t.Fatalf("rebuild dropped the as-written wrapper default: %s", rebuilt.String())
+			}
+			// Re-parsing the rebuild still binds no enum default anywhere:
+			// preservation is not promotion.
+			again, err := avro.Parse(rebuilt.String())
+			if err != nil {
+				t.Fatalf("reparse: %v", err)
+			}
+			for i, f := range again.Root().Fields {
+				if f.Type.HasEnumDefault {
+					t.Fatalf("field %d bound an enum default after the round trip: %s", i, rebuilt)
+				}
 			}
 		})
 	}
@@ -358,6 +392,9 @@ func TestRegression_EnumRefWrapperDefaultInert(t *testing.T) {
 		}
 		root := s.Root()
 		f := root.Fields[0].Type
+		// The splice replaced the reference with the enum definition, which
+		// CONSUMES "default" — definition-wins, so the usage-site copy does
+		// not ride along and does not become the definition's default.
 		if f.HasEnumDefault || f.EnumDefault != "" || len(f.Props) != 0 {
 			t.Fatalf("spliced wrapper default leaked: HasEnumDefault=%v EnumDefault=%q Props=%v",
 				f.HasEnumDefault, f.EnumDefault, f.Props)

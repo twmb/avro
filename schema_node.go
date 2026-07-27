@@ -2687,6 +2687,35 @@ func decimalConsumesPrecisionScale(typ, logical string) bool {
 	return logical == "decimal" && (typ == "bytes" || typ == "fixed")
 }
 
+// schemaKeyBinds reports whether a type object of the given kind/logical
+// BINDS reserved key k (raw value v) — the whole grammar in one place,
+// [strayKeyBinds] for the keys the kind alone decides plus the two whose
+// binding also depends on the value or the logical type.
+//
+// It exists so [schemaReservedKeyForObject] can ask the binding question
+// once instead of enumerating the keys that are consumed. An enumeration
+// of consumed keys is a hand-written list, and a subset can always be
+// missing a member: "default" on a kind that binds nothing and "order" on
+// every kind were captured by that list's fall-through and then dropped,
+// reaching neither a structural field nor Props.
+func schemaKeyBinds(k string, v any, typ, logical string) bool {
+	switch k {
+	case "precision", "scale":
+		// Decimal parameters only on a recognized carrier; anywhere else
+		// the pair is inert metadata (#71).
+		return decimalConsumesPrecisionScale(typ, logical)
+	case "logicalType":
+		// Consumed only when string-typed: a non-string value can never
+		// name a logical, so it is an ordinary custom property (Java reads
+		// only textual logicalType props; fastavro and goavro treat any
+		// non-matching value as inert). Mirrors the parse arm's
+		// string-conditional read.
+		_, isString := v.(string)
+		return isString
+	}
+	return strayKeyBinds(typ, k)
+}
+
 // schemaReservedKeyForObject reports whether key k (value v) on a type
 // object of the given kind/logical is consumed or structurally
 // surfaced — and so kept OUT of Props.
@@ -2697,13 +2726,18 @@ func decimalConsumesPrecisionScale(typ, logical string) bool {
 // nothing, and nothing about its body changes its routing. Props == all
 // raw keys minus the consumed reserved keys.
 //
-// For a reserved key: precision/scale are reserved only on a recognized
-// decimal carrier. A structural/naming key on a kind that does not bind
-// it, holding a body that does not parse as the key's schema shape, is
-// inert metadata with no possible binding reading: it stays a custom
-// property, surfaced verbatim (the route unconsumed precision/scale
-// already take). Shape-OK strays remain reserved — the metadata walker
-// surfaces them as-written on the matching structural field.
+// The rule is a disjunction of exactly two ways a reserved key can be kept
+// out of Props, and nothing else: the kind BINDS it, or the kind does not
+// bind it but SURFACES it as-written on a structural field — which needs
+// both a field for it to land on ([canonicalStrayKey]) and a body that
+// parses as the key's schema shape. A reserved key that is neither bound
+// nor surfaceable has Props as its only possible surface, which is where
+// the type-level "default" and "order" land: no kind but enum binds
+// "default", no kind binds "order", and neither has a SchemaNode field of
+// its own on a kind that does not bind it. Java keeps both as schema
+// properties for the same reason (SCHEMA_RESERVED omits both,
+// Schema.java:175-176; ENUM_RESERVED adds "default" alone, :178-180), and
+// fastavro 1.12.2 keeps both on every kind (executed).
 //
 // shapeOK answers "did this stray key's body parse as the key's schema
 // shape" from a verdict the caller ALREADY computed — the parser's arms
@@ -2720,23 +2754,14 @@ func schemaReservedKeyForObject(k string, v any, typ, logical string, shapeOK st
 	if !schemaReservedKeys[k] {
 		return false
 	}
-	if k == "precision" || k == "scale" {
-		return decimalConsumesPrecisionScale(typ, logical)
+	if schemaKeyBinds(k, v, typ, logical) {
+		return true
 	}
-	// logicalType is consumed only when string-typed: a non-string value
-	// can never name a logical, so it is an ordinary custom property
-	// (Java reads only textual logicalType props; fastavro and goavro
-	// treat any non-matching value as inert). Mirrors the parse arm's
-	// string-conditional read.
-	if k == "logicalType" {
-		_, isString := v.(string)
-		return isString
+	if canonicalStrayKey(k) == "" {
+		return false
 	}
-	if canonicalStrayKey(k) != "" && !strayKeyBinds(typ, k) {
-		if shapeOK != nil {
-			return shapeOK(k, v)
-		}
-		return strayBodyShapeOK(k, v)
+	if shapeOK != nil {
+		return shapeOK(k, v)
 	}
-	return true
+	return strayBodyShapeOK(k, v)
 }

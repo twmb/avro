@@ -517,8 +517,17 @@ func canonicalStrayKey(k string) string {
 // value and consumes it; on any other kind the key is a stray the parse
 // never binds, so a malformed body there cannot be an attempt to define,
 // scope, or reference anything.
+//
+// The keys whose binding also depends on the VALUE or on the logical type
+// (logicalType, precision/scale) are answered by [schemaKeyBinds], which
+// wraps this; every key whose binding is decided by the kind alone is
+// answered here, so the two are one question with one kind-keyed table.
 func strayKeyBinds(typ, key string) bool {
 	switch key {
+	case "type", "doc":
+		// Read on every kind: "type" names the kind itself, and "doc" is
+		// documentation the metadata surfaces on any node.
+		return true
 	case "items":
 		return typ == "array"
 	case "values":
@@ -531,6 +540,18 @@ func strayKeyBinds(typ, key string) bool {
 		return typ == "fixed"
 	case "name", "namespace", "aliases":
 		return isNamedKind(typ)
+	case "default":
+		// The enum evolution default is the ONLY type-level binding of
+		// "default" (Java's ENUM_RESERVED is SCHEMA_RESERVED plus this one
+		// key, Schema.java:178-180, applied at :1928). A record FIELD binds
+		// it too, but a field object is read by afieldFromAny against the
+		// field grammar, never by this kind-keyed one.
+		return typ == "enum"
+	case "order":
+		// A field-only sort attribute: no type-level kind binds it, and
+		// neither reference reserves it on a schema object (Java's
+		// SCHEMA_RESERVED and ENUM_RESERVED both omit it, Schema.java:175-180).
+		return false
 	}
 	return false
 }

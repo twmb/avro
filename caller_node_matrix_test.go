@@ -299,10 +299,10 @@ func TestMatrix_CallerComposedAndEditedNodes(t *testing.T) {
 					bare := bareEmissionFieldRules[f.Name]
 					back := re(t, rep.text)
 					switch {
-					case bare.exempt != "" || bare.droppedKey != "":
-						// Classified as carrying nothing on this carrier, or
-						// as dropped by the reserved-name routing; either way
-						// the loss is adjudicated in that table, not here.
+					case bare.exempt != "":
+						// Classified as carrying nothing on this carrier, so
+						// there is nothing for the render to lose; the
+						// exemption is adjudicated in that table, not here.
 					case bare.propsKey != "":
 						if _, has := back.Props[bare.propsKey]; !has {
 							t.Errorf("%s renders as-written and must ride to Props under %q; Props came back %v from %s", f.Name, bare.propsKey, back.Props, rep.text)
@@ -446,13 +446,13 @@ func TestInvariant_NodeFieldRuleTablesNameRealFields(t *testing.T) {
 				t.Errorf("%s classifies %q, which is not an exported SchemaNode field", tbl.name, field)
 				continue
 			}
-			if rule.exempt == "" && rule.propsKey == "" && rule.droppedKey == "" {
+			if rule.exempt == "" && rule.propsKey == "" {
 				t.Errorf("%s[%q] states no classification at all; the zero rule is the ordinary case and belongs OUT of the table", tbl.name, field)
 			}
-			if rule.droppedKey != "" && rule.why == "" {
-				t.Errorf("%s[%q] records a dropped key with no policy quoted; a documented loss must name the policy that makes it one", tbl.name, field)
+			if rule.propsKey != "" && rule.why == "" {
+				t.Errorf("%s[%q] relocates a value to Props with no rule quoted; a field whose value does not come back on its own field must name the routing that moved it", tbl.name, field)
 			}
-			if rule.exempt != "" && (rule.propsKey != "" || rule.droppedKey != "") {
+			if rule.exempt != "" && rule.propsKey != "" {
 				t.Errorf("%s[%q] is both exempt and routed; a field has exactly one classification", tbl.name, field)
 			}
 		}
