@@ -8286,3 +8286,248 @@ clauses are the durable record of what these rounds built.
   dependency`), -race green; Java ABSENT · census 5 of ~13; NONE demoted ·
   UNCONVERGED (counter 0), freeze stays.
 
+
+## Distillation archive (2026-07-27) — pre-fix-round TRIPLE distillation (size-guard mandate: CORE 58.6KB / PATTERNS 151.5KB / NOT_BUGS 129.7KB, all three crossed)
+
+Compressed at the top of the 2026-07-27 FIX round (the round that closed the
+bare-emission completeness contract and derived nodeIsNameRefShape). Nothing
+below is deleted; the live files carry a compressed form pointing here.
+
+### AUDIT_CORE.md §Round ledger — the eight 2026-07-26 lines plus the two 2026-07-27 lines, verbatim
+
+NOTE ON A FALSE FACT PRESERVED HERE: the second 2026-07-27 line (`ff3fc9d`,
+the FIX) ends with "CORE trimmed 57.6->56.2KB". That clause is a copy-paste
+from the `faa5d80` line above it and is FALSE: that round ran no distillation
+pass, its commit (b0d60cf) touched only Go files, and appending its own ledger
+entry GREW AUDIT_CORE.md to 58.6KB. The corrected fact lives in the compressed
+era line in the live file. Kept verbatim here because the archive records what
+was written, not what was true.
+
+```
+- 2026-07-26 · bcb687b (START head) · CENSUS: R1 distilled to an index into
+  the census; Q9 + Q11 registered; Q9 exposed the escaped-vs-content
+  under-charge, recorded as an openRuling. Verbatim: archive (2026-07-26 #3).
+- 2026-07-26 · fb77dfa (START head) · FIX + CENSUS: **Q9 RULED and FIXED** —
+  a non-allocating COUNTING SCAN with EARLY EXIT dominated the false dilemma;
+  exact (ASCII bills 1x, no over-rejection) and bounded by the budget not the
+  input (escaping never shrinks). The cap's stated number is now the number
+  enforced — 64 MiB previously admitted 402,628,629 bytes. **RULE 7a minted**
+  (restatement escape hatch: delegation impossible for MEASUREMENT licenses a
+  restatement at the fixed price of an EXECUTED differential over the
+  COMPLETE domain, derived from the package's own call site). The drift guard
+  caught this fix adding an unregistered site. Both demotion candidates
+  REJECTED on evidence; CustomType match registered as **Q14**. Full detail:
+  NOT_BUGS #68 escaped-length clause + PATTERNS §census rule 7a.
+- 2026-07-26 · 71717ef (START head) · CENSUS: **Q5** registered (decimal-lift
+  navigation, 13 cells). TWO DRIVER DEFECTS of my own, both caught by the
+  neuter — read the METADATA tree for a lift's effect (it preserves
+  as-written; the COMPILED tree is where the effect lives), and took "parse
+  failed" as a verdict signal (CONFOUNDED). **The tell was a neuter that
+  redded NOTHING** → PATTERNS lesson. Q5's 2 disagreeing cells gated
+  documented-intentional (re-opened the next round).
+- 2026-07-26 · 46b0dc4 (START head) · FIX (overseer re-opened a GATED cell):
+  **the gate was procedurally right and the documented clause was wrong** —
+  #71's "annotation-independent" was true of NAVIGATION and wrongly applied
+  to LANDING. Consumed iff the target's EFFECTIVE logical is "decimal" on a
+  carrier. Pattern-13 pin flipped; inertness proven by WIRE identity +
+  discriminator cells. Detail: NOT_BUGS #71 navigation/landing clause.
+- 2026-07-26 · 14f5cf6 (START head) · FIX: the lift's two arms aligned —
+  annotation and PARAMETERS are separate questions; both arms complete
+  missing precision/scale iff the EFFECTIVE logical is "decimal", via
+  liftEffectiveLogical. Side effect MEASURED unobservable (canonical + wire
+  identical across 4 shapes). PATTERNS gained the two process traps.
+  Detail: NOT_BUGS #33 params-fill clause.
+- 2026-07-26 · dae3fdf (START head) · CENSUS-ONLY (scheduling change proven:
+  2 questions vs 0 in each fix-attached round) · **Q10** nil-equivalence (the
+  5 dispatch sites isNilValue's own doc enumerates) + **Q13** text route vs
+  the fast-path eligibility gate. The neuter caught a driver defect a third
+  time: a union cell cannot reach serNull (serUnion.ser short-circuits on
+  isNilValue first), so the bare "null" schema is the sole live observer.
+- 2026-07-26 · ebf1cd5 (START head) · CENSUS-ONLY · **Q15** named/record KIND
+  (observable IS the definition: named iff referenceable by name) + **Q8**
+  skip directive (4 answerers / 2 subsystems; demotion instinct wrong again).
+  THIRD costume of measurement-never-happened: a neuter that BUILDS but
+  panics in a package-level init reports 0 fails on a green build.
+- 2026-07-26 · ba4799f (START head) · CENSUS-ONLY · **Q7** flat field form +
+  the enumeration's OPEN END as code (censusOutstanding / censusDemoted) +
+  the FIRST demotion (does-this-kind-RECURSE), guarded by a re-count test.
+  Neuter rule amended to the TRIPLE: exit != 0 · RUN > 0 under `-v` · no
+  `panic:`.
+- 2026-07-27 · faa5d80 (START head — faa5d80..HEAD quarantines this round's
+  commits) · CENSUS-ONLY · 1 commit: ff3fc9d · **Q4** reserved-key routing —
+  the most adjudicated question in the repo, so the corpus was shaped BY THE
+  RULINGS (#46 exact-lowercase; #63(b) shape-conditional, (f)
+  placement-not-case-conditional) rather than re-derived from the code. The
+  invariant they share is a BICONDITIONAL and that is what is driven:
+  structural field set IFF consumed, Props = raw keys minus consumed, never
+  both and never neither. 13 cells; the walker's bound-only view is the
+  documented #63(e) asymmetry · **REPORTED FINDING (not fixed — census
+  round)**: `toJSONWalk`'s bare-emission shortcut requires structural
+  emptiness before collapsing a primitive to its bare name but enumerates
+  only THREE of the structural fields (Items/Values/Fields), so a
+  schema-shaped stray `symbols`/`size`/`aliases`/`name` on a primitive
+  survives String() and Root() and is SILENTLY DROPPED by Root().Schema().
+  Measured per field: Items/Values/Fields survive, Symbols/Size/Aliases/Name
+  do not. Contradicts #63(b) ("its ONLY surface") AND the shortcut's own
+  comment ("must survive the rebuild"). The 2 cells assert the loss STILL
+  happens, so a fix reds them · TWO corpus bugs of mine, both caught by
+  running it: the variant-of-required cells supplied the exact spelling
+  alongside the variant (turning them into the exact-consumed case); and a
+  String()-comparison survival check reported items/values/fields as dropped
+  when they were merely RE-ORDERED — measuring the metadata fields separated
+  the real loss from the false one · demotion re-count guard made MANDATORY
+  in PATTERNS (overseer proved it non-vacuous by adding a second answerer) ·
+  neuter triple: exit=1 ran=15 panics=0, reds enum-symbols · suite + fastavro
+  green, -race green; Java ABSENT · CORE trimmed 57.6→56.2KB · census 13
+  registered / 3 outstanding / 1 demoted, enumeration OPEN · UNCONVERGED
+  (counter 0), freeze stays.
+
+- 2026-07-27 · ff3fc9d (START head — ff3fc9d..HEAD quarantines this round's
+  commits) · FIX (ruling-directed) · 1 commit: b0d60cf · the stray-rebuild
+  loss FIXED at its class, not its instance · **TWO copies of the same
+  hand-written field list** (toJSONWalk's primitive arm AND its
+  name-reference arm), both missing the same members — which is why a stray
+  `name` was caught by one and not the other, and why `symbols`/`size`/
+  `aliases`/`doc` vanished. Both now ask ONE DERIVED predicate,
+  `nodeCarriesOnlyType`, computed from SchemaNode's field set · **the durable
+  half is the REFLECT COMPLETENESS GUARD**
+  (TestInvariant_BareEmissionCoversEverySchemaNodeField): sets every exported
+  field in turn and requires the predicate to notice, so a field added later
+  FAILS until classified — 15 must-block, 1 classified exempt (`Branches`:
+  no JSON key routes to it outside a union, so a hand-built value is inert;
+  that exemption is exactly what the pre-existing non-union-Branches pin
+  asserts, and it survives) · **BLAST RADIUS MEASURED**: 15 shapes × 5
+  surfaces before/after via a worktree (both sides length-checked
+  non-empty) — EXACTLY 5 lines differ, all in the rebuild column; canonical,
+  String and wire byte-identical. A 5th lost field (`doc`) surfaced that the
+  report had not named · registered as census **Q16**, whose entry records
+  that a TELL CANNOT guard this question — a tell watches where a rule is
+  written, and this class's failure is a member the rule never mentioned ·
+  Q4's reported cells FLIPPED to ordinary agreement cells · neuters per arm,
+  triple-checked: primitive arm → exit=1 ran=16 panics=0, reds the stray
+  cells; bogus exemption → reds the completeness guard alone · gate:
+  documented-but-contradicted (#63(b) + the shortcut's own comment), fixed
+  toward the doc; no reference bearing · #63 gains clause (g) · CORE trimmed
+  57.6→56.2KB · census 14 registered / 3 outstanding / 1 demoted,
+  enumeration OPEN · UNCONVERGED (counter 0), freeze stays.
+```
+
+### AUDIT_PATTERNS.md §Net inventory (N1) — extension axes, waves one through four, verbatim
+
+Compressed in the live file to a per-wave file+cross table. The per-wave
+CALIBRATION prose these lines pointed at was already archived 2026-07-21;
+this is the second tier of that same material.
+
+```
+  Extension axes (each maps a historical fix CLASS to a generative axis); full per-wave calibration prose in BUG_AUDIT.md §Distillation archive (2026-07-21):
+  - **First-wave (commit-history):** CustomType parity (matrix_custom_test.go); evolution (matrix_evolution_test.go — 8 promotion pairs, field drop/add/reorder, union widen/narrow, enum reader-default, aliases; `resolveBoth` asserts Resolve⇔CheckCompatibility; `TestMatrix_PromotionTypedTargets` crosses the pairs + logical-reader promotions (`promotionDeserForLogical`) × typed Go targets × contexts, verdict+value parity vs natural decode, neuter-verified); names (matrix_names_test.go); hostile wire (matrix_hostile_test.go — exhaustive truncation + per-byte corruption, no-panic every run); lenient input (matrix_extensions_test.go); metadata preservation; lax names; nil-equivalent encode; SOE round-trip in runCore. Found: `SchemaNode.Schema()` took no SchemaOpts (fixed via backward-compatible variadic opts).
+  - **Second-wave:** rejection parity (matrix_reject_test.go); foreign container framing (matrix_framing_test.go — block-per-item, split/negative-count blocks, overlong varint counts decode-same + re-encode-canonical); target reuse (matrix_reuse_test.go — stale-key retention, slice/pointer reuse); typed extras + per-fragment typed containers; OCF matrix (ocf/matrix_ocf_test.go — fragments × deflate/snappy/zstd × multi-block × NewAppendWriter × evolution); runCore edges; external-oracle matrix (matrix_differential_test.go + `rt`/`canonical` ops — every cell decoded+re-encoded by a real fastavro process byte-identically; fastavro PCF == `Canonical()`; fwd-refs excluded). JAVA twin (`java_matrix_differential_test.go`, cisuite) drives the same cells + all recursion shapes through `SchemaOracle` (the one external oracle accepting forward references). OCF foreign-WRITER differential (ocf/foreign_writer_differential_test.go + oracle `ocfwrite`/`ocfread` ops, byte transport): fastavro's WRITER produces the container — its schema spelling, block sizing, real codec framings — and twmb reads it back byte-exactly: 4 codecs × plain/multiblock (sync-marker-count degeneracy probe)/empty + rich foreign spelling + special doubles + decimal/date/timestamp logicals + custom metadata + append-onto-foreign re-read by BOTH impls + WithReaderSchema-over-foreign (promotion + default fill) + bzip2/xz loud-reject; neuter-verified ×4 disjoint red sets (snappy decompress output, reader-schema resolve arm, append sync adoption, Metadata surface).
+  - **Third-wave:** schema-ACCEPTANCE parity (matrix_acceptance_test.go + oracle `parse` op + `TestDifferentialJavaAcceptance` — every cell parses in twmb + fastavro + Java, structurally-broken mutants reject in all three; caught twmb accepting a record with NO `fields` attribute, fixed via `o.Fields == nil` reject); the fuzz bridge (`FuzzMatrixCore`); second-order CustomType crosses (matrix_custom_cross_test.go); the options cube (all 8 of TaggedUnions × TagLogicalTypes × LinkedinFloats).
+  - **Fourth-wave:** hostile-size rejects (matrix_hostile_size_test.go — 1 MiB wrong-typed values reject FAST <250ms with BOUNDED error messages <2KB, both wires); logical boundary tables (matrix_logical_bounds_test.go — time extremes round-trip exactly; MaxInt64/MinInt64±1 reject or re-encode byte-identically; silent boundary corruption is the only forbidden outcome); the concurrency hammer (matrix_concurrent_test.go — 8 goroutines × all five ops on one shared *Schema vs a single-threaded reference, + concurrent SchemaCache + racing once-init tables, under `-race`); the OCF stateful model (ocf/matrix_stateful_test.go — seeded random Encode/value-error-Encode/raw-Write/Flush/Close programs, I/O-error poisoning stickiness); the Java JSON-form differential (`TestDifferentialJavaJSONForm`, cisuite — Avro-JSON compared SEMANTICALLY vs Java's JsonEncoder; zero-field record excluded because avro-tools emits zero bytes for an empty record).
+```
+
+### NOT_BUGS.md #66 — encode-side SemanticError identity, verbatim (tombstoned in the live file)
+
+```
+66. **Encode-side USER-VALUE failures carry `*SemanticError` identity on BOTH wire formats; decode-side WIRE-CONTENT failures are plain errors on BOTH (JSON arms unified 2026-07-14; nil + time-logical arms unified 2026-07-25, overseer-adjudicated).** The JSON encoder's enum unknown-symbol rejects (all four input arms — plain string, named string without text methods, text-out, int ordinal), the fixed size-mismatch reject, and the missing-defaultless-field reject were bare `fmt.Errorf` while their binary twins carried `*SemanticError` — `errors.As` gave different verdicts per wire format for the same failing input. Unified to the binary constructions: enum arms `{GoType, AvroType: "enum"}`, fixed `{GoType, AvroType: "fixed"}` (got/need detail in the chain), missing field via `recordFieldError` wrapping the binary loops' exact `errors.New("missing key")`. The two-family boundary is deliberate: decode-side wire-content failures — a binary ordinal outside the symbol table, a JSON string naming no symbol, a union index out of range, an invalid map-key length — stay PLAIN on both wires (distinct from deser.go's ordinal-OVERFLOW-into-narrow-target, which is a target-type failure and carries SemanticError); numeric-content rejects already agreed as SemanticError. Union no-match identity is ARITY-SPLIT on both wires (2026-07-25), and the split is SPELLING-AGNOSTIC: binary selected its null-union arm by the as-written `primitive == "null"` while JSON keyed on the resolved `kind`, so a wrapped `{"type":"null"}` branch made the two wires disagree again after the bare case was unified — both sides now agree for every null spelling (`aschema.isNullBranch`; json_codec.go was already correct and is unchanged). The split itself: a 2-branch null union surfaces the value branch's OWN error (binary `serNullUnionAt` hands a non-nil value straight to the value branch; the JSON dispatcher returns lastErr bare for that shape — `TestMatrix_TextOutCallbackReturnShapes`' union-no-match row pins this at AvroType precision), while every other union shape wraps UNCONDITIONALLY in the union's `*SemanticError` (binary `serUnion.ser`; the JSON no-match now constructs the same wrap rather than inheriting whatever identity lastErr's chain carried — a typed nil's per-branch sentinel is plain and previously left the JSON no-match plain). The nil split (2026-07-25, replacing this entry's earlier "nil is plain on both" clause, which was executed-false on the binary side — `AppendEncode`'s entry guard has wrapped untyped nil in `SemanticError{AvroType: kind}` since the initial code): an UNTYPED nil at top level is a user-value failure and carries `*SemanticError` on BOTH wires (`AppendEncode` entry guard + `serUnion`'s no-match wrap on binary; the two `appendAvroJSON` !IsValid arms on JSON, `AvroType` "union" / node kind); a TYPED nil pointer/interface chain surfaces the PLAIN shared indirection sentinel (`errIndirectNil`) on both wires for non-union kinds — the JSON peel loop returns the sentinel directly rather than recursing into the untyped-nil arms, mirroring `indirect()` — while against a no-null union both wires wrap in the union's SemanticError. Also unified 2026-07-25: the JSON time-logical range rejects (timestamp/local-timestamp conv errors → `semErrW(v, "long")`, date `timeToDate` → `AvroType "date"`, time-millis duration → `AvroType "time-millis"`) mirror `serTimeAsLong`/`serDate`/`serTimeMillis` exactly; the date-STRING arm's mirror is unreachable today (4-digit-year formats cannot express an out-of-range date) and exists so the twins cannot drift. Deliberately agreeing-PLAIN encode-side families (do NOT re-file): CustomType.Encode callback errors (the user's own error value returns verbatim on both wires), and fixed-uuid `parseUUID` rejects (bare on both — `serFixedUUIDReflect` and the JSON fixed-uuid arms agree). Identity must be asserted at TOP LEVEL: record positions wrap ANY field error into a SemanticError via `recordFieldError`'s fallback arm, masking an unwrapped inner arm (the neuter-dodge shape). Pinned by `TestMatrix_TextOutCallbackReturnShapes` (enum-arm-identity per input arm, fixed/missing-field identity, decode-content-stays-plain, cross-wire-identity-agreement), the enum-unknown-symbol row in `TestMatrix_JSONEncodeErrorSemanticParity` (Field threading at record positions), and — for the nil split, the time-logical arms, the union no-match wrap, and the per-family census (19 SemanticError families, 3 agreeing-plain, 3 decode-plain, the record-position masking row) — `TestRegression_UntypedNilEncodeSemanticErrorBothWires` + `TestMatrix_EncodeErrorIdentityCensus` (encode_error_identity_census_test.go).
+```
+
+### NOT_BUGS.md #68 — SchemaFor CustomType.Schema render + the walk-budget clauses, verbatim (tombstoned in the live file)
+
+```
+68. **SchemaFor renders `CustomType.Schema` through the error-reporting walk and composes a PRIVATE COPY (2026-07-15).** The render (`renderCustomSchemaTree`) is the deduper-carrying walk `SchemaNode.Schema` uses, so a custom schema exceeding the schema-tree budgets (bytes/nodes) or containing an unnamed pointer cycle fails the build with the walk's named error. The bare walk's truncate-to-nil posture is for error-LESS surfaces; SchemaFor has an error channel, and a truncated Props VALUE parses cleanly as a null prop, so the pre-fix pipeline silently altered the user's schema (67 MB prop → null, build "succeeded"). The walk's by-reference Props fast path (jsonSerializableValue's documented no-mutation contract) plus the composition walkers' in-place writes (pin injection, dedup rewrites) is why the boundary deep-copies: a build must never write into caller-owned SchemaNode storage, on success or error paths. The only bare-mode walk left is the conflict-compare inside toJSONDedup, whose over-budget reporting the caller's budget check owns (pinned by the walk-budget suite). **Enforcement clause (2026-07-25):** "exceeding the budgets" is measured against what `json.Marshal` will EMIT, not against the value's Go shape. `valueWalkLimit` models json.Marshal's structural recursion, so two emission routes escaped it and made the posture unenforced: a value with its own `MarshalJSON`/`MarshalText` (json.Marshal delegates to the method and emits its return, which the structural walk never sees — a 128 MiB image charged one node and zero bytes, reproducing this entry's own pre-fix mode through BOTH `SchemaNode.Schema` and `SchemaFor`+`CustomType.Schema`), and a map key whose Kind is not string (charged only for string kinds, though this budget's contract is "every Props key"; a non-string key reaches json.Marshal via `MarshalText`). Both are now charged — `marshalEmitLen` (json.Marshaler before TextMarshaler, matching json.Marshal's own order; a nil pointer/interface is not called; a method that ERRORS is left uncharged so the eventual marshal reports its own better-named failure) and `mapKeyEmitLen` (string KIND first — its MarshalText is not consulted — then TextMarshaler, then 20 bytes for integer kinds). **Key-resolver clause (2026-07-25):** charging a key is not enough — `mapKeyEmitLen` mirrors `encoding/json`'s `resolveKeyName` arm-for-arm INCLUDING ITS GUARDS, because a guard is the arm that keeps a legal value away from code that cannot take it. Two shapes were unguarded, and both PANICKED out of the walk whose purpose is to make an arbitrary caller-supplied tree safe: a **nil pointer key** whose type carries a pointer-receiver `MarshalText` (json resolves it to `""` WITHOUT calling the method, `encode.go` `resolveKeyName`; the walk called it and dereferenced nil — introduced with the charge arm itself), and a **nil interface key** in a `map[encoding.TextMarshaler]V` (json's encoder-construction admits the type — the interface implements itself — and its resolver then reaches `panic("unexpected map key type")`; the walk charged 20 and forwarded it — PRE-EXISTING, a stdlib panic escaping a public API that documents an error return). The resolver's terminal panic arm is now a walk verdict, `valueWalkBadMapKey` → a named error, which the key kinds json rejects at encoder construction (float, array, struct with no text method) also take: this budget's contract is that every key is accounted for, so "json cannot emit this key" is a verdict the walk owns rather than a panic it forwards. **Escaped-length clause (2026-07-26) — the cap's stated number is now the number enforced.** "What json.Marshal will EMIT" means the ESCAPED length, and the walk charged CONTENT length: a control byte costs six output bytes (`\u00XX`), the emitter escapes `<`, `>` and `&` the same way by default, and a `[]byte` reaches the emitter as its Avro codepoint string (a high byte costing two). Measured before the fix: a string admitted under the 64 MiB cap emitted **402,628,629 bytes — 6.0x**. Charging is now EXACT, by a NON-ALLOCATING counting scan with EARLY EXIT (`jsonEscapedLen` / `jsonEscapedLenBytes` / `avroCodepointEscapedLen` / `compactedEmitLen`, schema_node.go): it counts, never builds, and abandons the value the instant the accrued charge passes the REMAINING budget. That is bounded by the budget rather than by the input, because escaping never SHRINKS — every input byte costs at least one output byte, so the total passes the limit within limit+1 input bytes and a 1 GiB hostile string is abandoned after ~64 MiB, over bytes already resident in the caller's own value. Exactness is what makes it safe in the other direction: ASCII bills at 1x, so nothing legitimate is newly rejected (charging a 6x worst case instead would have rejected all-ASCII schemas at a sixth of the documented cap). The value charged is the PIPELINE's json-facing image, not the caller's Go value. Restating the emitter's escape rules is exactly what this codebase treats as a bug (P21), and is licensed here ONLY because delegation is impossible for measurement — asking the emitter for its output length means producing that output. The licence is conditional on `TestCensus_Q9_EscapedLenMatchesEmitterOverEveryByte` + `_OnMultiByte` + `_CodepointEscapedLenMatchesEmitterOverEveryByte`, which assert computed == emitted for all 256 single-byte values, multi-byte runes, invalid UTF-8, U+2028/9, the HTML trio and the two-character escapes, deriving every expectation from `marshalSchemaTree` (the package's own emitter) so a future `SetEscapeHTML(false)` reds them until the restatement follows. Escaping below `utf8.RuneSelf` is byte-LOCAL, so per-byte totality is a DOMAIN PROOF over that range, not a sample. Boundedness is pinned deterministically by `_EscapedLenScanIsBoundedByTheLimit` (the returned total is identical for inputs from 1 KiB to 8 MiB once the limit is passed). Same fix aligned the `[]byte` arm's gate with the fixup's own predicate (`canonicalByteSliceKind`), so a byte slice whose element type carries a marshaler — which the fixup declines to rewrite and json emits as an ARRAY — falls through to the structural walk instead of being charged as a scalar it never becomes. Executable pin: `TestRegression_WalkBudgetMapKeyMatchesJSONKeyResolver` runs 12 key shapes and asserts against `json.Marshal` EXECUTED per cell (authority-can-emit ⟺ walk-accepts, and identical emitted bytes when both do), never against a restatement of its rules; neuter-verified disjoint (nil-pointer guard off → only the nil-pointer cell; charge-and-forward instead of the error → only the nil-interface cell). Charging leaves #69's marshal-opaque posture intact: the method's output is measured and dropped, never substituted. The measurement is itself bounded in the way that matters — the walk stops at the first value that busts the budget, so N over-budget marshalers materialize ONE image, not N. Pins: `TestRegression_WalkBudgetChargesEveryEmissionRoute` (2 surfaces × 8 value shapes, plain-string and string-kind-key CONTROLS first so the cap is proven live), `TestRegression_WalkBudgetKeepsMarshalOpaqueValuesOpaque`, `TestRegression_WalkBudgetMeasurementIsItselfBounded`; neuter-verified with disjoint red sets (marshaler arm off → exactly the 8 marshaler subtests + the bounded-measurement test; map-key arm off → exactly the 4 non-string-key subtests). Pins: `TestRegression_SchemaForOverBudgetCustomSchemaErrors`, `TestRegression_SchemaForCustomSchemaBudgetAxes` (bytes/nodes/cycle/control), `TestRegression_SchemaForLeavesCallerSchemaStorageUnmutated`; class net: every `TestMatrix_SchemaForCustomSchemaScope` cell deep-snapshots the caller's SchemaNode and asserts it unchanged, plus the Props-carried container routes (items/values/union-slice).
+```
+
+### AUDIT_PATTERNS.md — the CustomType logical-codec suppression instance catalogue (a)–(r), verbatim (tombstoned in the live file; the cross statement and the five standing traps stay live)
+
+```
+    - (a) `Decode==nil` custom on a logical node: JSON returned transformed type, binary raw -- TestRegression_CustomDecode*BinaryJSONParity.
+    - (b) `Encode!=nil` custom with non-matching pass-through value: JSON ran the coercion binary suppressed.
+    - (c) pointer/interface-GoType custom at a union branch: JSON peeled the pointer before union dispatch -- dispatch union first.
+    - (d) WILDCARD custom over-suppressed on both directions via runtime proxies -- TestRegression_Wildcard*.
+    - (e) wildcard Encode DOUBLE-FIRES on EncodeJSON 2-branch null-first union -- test callback INVOCATION COUNTS across arities.
+    - (f) NO-CALLBACK custom bailed before the wrapper install -- compute suppression flags before the early return -- TestRegression_CustomNoCallbackSuppressionBinaryJSONParity.
+    - (g) resolution PROMOTION re-applied the reader's logical under suppression -- TestRegression_CustomPromotionHonorsLogicalSuppression; compare VALUES fed to the callback, not result types.
+    - (h) self-/forward-ref named type with a CT-matched logical failed Parse -- gate the cache guard on cross-Parse membership -- TestRegression_RecursiveCustomTypeParsesAndParity.
+    - (i) forward-ref fixup wired the UNWRAPPED ser/deser -- one shared makeCustomSer/customWrappedSer/customWrappedDeser.
+    - (j) no-Decode suppression into `[N]byte` diverged -- decode straight into the target via decodeKind.
+    - (k) SchemaCache type cached WITH a custom, referenced WITHOUT, inherited it -- symmetric cache-boundary custom-presence guard -- TestRegression_SchemaCacheCustomBoundaryGuard.
+    - (l) custom Decode returning `*T` into a `*T` target: JSON peeled a pointer level -- call the shared helper identically (drop indirectAlloc).
+    - (m) no-Decode suppression into a SCALAR typed target still applied the logical arm on JSON (both-succeed VALUE divergence) -- thread the `raw` flag and return before the logical switch; sweep every sibling decoder -- TestRegression_CustomSuppressionScalarTargetParity.
+    - (n) record-level custom DROPPED by schema resolution -- `applyCustomToNode` in resolveRecord, mirroring every other resolve arm (unions are the one deliberate non-wrap) -- TestRegression_RecordCustomTypeThroughResolve.
+    - (o) wrong-KIND resurrected logical (uuid/duration on bytes, big-decimal on fixed) transformed on JSON decode while binary stayed raw -- gate each shared `assignBytes` arm AND its lenient-form sibling `hasDecimalBareNumberArm` to spec-valid kinds -- TestRegression_DecimalBareNumberArmHonorsKindValidity + false rows in TestRegression_JSONDecodeAppliesLogicalMatchesDecode.
+    - (p) wrong-kind resurrected logical encoded via the logical serializer on BINARY (`logicalSer` keyed on name, kind-blind; self-incompatible wire) -- gate on `logicalUnderlyingAccept` -- TestRegression_CustomSuppressionWrongKindLogicalEncodeParity + TestRegression_CustomSuppressionSpecValidLogicalStillApplied.
+    - (q) wrong-SIZE fixed logical (uuid at size!=16, duration at size!=12) size-blind on BOTH wires -- gate the fixed-switch (binary) and the JSON uuid/duration arms on the declared size with raw fall-through -- TestRegression_CustomSuppressionWrongSizeFixedLogicalEncodeParity; proof of trap (5): (p)'s own "fixed build already immune" parenthetical was where (q) surfaced.
+    - (r) all-skip (`ErrSkipCustomType`) fall-through boxed a probe `any` + `AssignableTo`, restricting typed targets vs no-custom -- RE-DECODE the original wire into the target through the base deser (NOT_BUGS #48; a value-PLACING converter diverged on reuse / logical-into-base / branch-index / TaggedUnions and was removed) -- TestRegression_CustomSkipDecodeMatchesNoCustom, neuter-verified. Census lesson: when enumerating a recursion's targets, count reachable KINDS (a record/array/map field can be a union). Option-dimension pin: run parity matrices under BOTH default and TaggedUnions.
+```
+
+### NOT_BUGS.md #57 — OCF truncation strictness, verbatim (tombstoned in the live file)
+
+```
+57. **OCF truncation is STRICT: a stream cut anywhere inside a promised block (or the header) is an ERROR whose identity matches `io.ErrUnexpectedEOF` — never `io.EOF`, which is `Reader.Decode`'s end-of-stream sentinel, returned only when the stream ends exactly at a block boundary (maintainer-adjudicated: normalize-to-strict).** The stdlib readers return BARE `io.EOF` at the zero-bytes-available cuts (`binary.ReadVarint`/`io.ReadFull` with nothing to read; `io.CopyN` on ANY shortfall, partial copies included), and a `%w` wrap keeps `errors.Is(err, io.EOF)` true — so without normalization the idiomatic `errors.Is` termination check read a file truncated right after a complete block-count varint, after the size varint, mid block data, or at the sync boundary as a CLEAN, complete stream (silent tail loss). `noEOF` (ocf.go) converts those to `io.ErrUnexpectedEOF` at every mid-structure read: the four `readBlock` sites, and `readHeader`'s magic/metadata/header-sync reads (NewReader has no EOF sentinel; normalized for uniformity — the metadata wrap is the single chokepoint for all six `decodeMap` stream reads). This deliberately diverges from Java, which is silently LENIENT at EVERY truncation cut including mid-varint: `DataFileStream.hasNext()` and `hasNextBlock()` catch `EOFException` and return false (`DataFileStream.java:234` `catch (EOFException e) { return false; }`, `:311` `catch (EOFException eof) { return false; }` — the catch spans the size read, the block-data `readFixed`, and the sync `readFixed` via `nextRawBlock` inside `hasNext`'s try), ending iteration as if the file were complete. fastavro 1.12.2 errors at every cut (executed: `EOFError`, `EOFError: Expected N bytes, read 0`, `ValueError: expected sync marker not found`). twmb was ALREADY strict at mid-varint/partial-read cuts (`ErrUnexpectedEOF`), so strict is the established posture and cross-impl rule 1 governs (silent tail loss is silently-wrong output; the spec makes all four block parts — count, size, objects, sync — mandatory, `_index.md:483-488`). Do NOT re-file "Java reads truncated OCFs twmb rejects" as an interop divergence, and do NOT re-introduce a bare-`io.EOF` return from any mid-structure read. Contract documented on `Reader.Decode`; pinned by `TestRegression_TruncatedBlockHeaderNotEOF`, `TestRegression_TruncatedLargeBlockDataNotEOF` (CopyN zero + partial shortfall), the strengthened `TestTruncatedBlockSize/Data/SyncMarker`, and the per-prefix class net `TestMatrix_TruncationTerminalErrorIdentity` (every byte offset × {null, deflate} × spliced count-0 block; boundary cuts must be BARE `io.EOF` with exact record counts, all others non-nil and not Is-EOF; neuter-verified — an identity `noEOF` reproduces the leak on every zero-bytes cut).
+```
+
+### NOT_BUGS.md #44 and #51, verbatim (tombstoned in the live file)
+
+```
+44. **Union-branch selection matches named types (record/enum/fixed) by UNQUALIFIED short-name across namespaces — deliberately siding with fastavro over the stricter Java.** When the reader is a union and the writer is a bare named type, `findMatchingBranch` / `kindsMatchTier` (compat.go) rank candidate branches full-name > unqualified-name > promotion, and the unqualified-name tier applies to record, enum, AND fixed. Java's `Resolver.firstMatchingBranch` (`Resolver.java:632-664`, the 1.8.x "soft match" whose own comment admits it "seems to disagree with the spec," kept for bug-for-bug compat) does structural short-name matching ONLY for RECORD — enum and fixed require an exact full-name match inside a union. fastavro's `match_types` (`fastavro/_read_py.py`) does unqualified matching for all three named kinds, matching twmb. So `Resolve(ns1.Color, ["null", ns2.Color])` (same symbols, different namespace) resolves in twmb + fastavro but errors in Java; the resolved value is correct because enums map by symbol string and fixed still requires equal `size` (folded into the union match predicate in `kindsMatchTier` per the spec — see the fixed-SIZE note below; the direct non-union path also checks it in `checkSameKind`, compat.go:140). This reuses the same lenient `namesMatch` tier (compat.go) that direct (non-union) same-kind resolution relies on — where Java IS lenient (matches on the short name) — so direct and union resolution stay internally consistent. Deliberate fastavro alignment; do NOT "fix" toward Java's record-only union rule. The `findMatchingBranch` comment's "matching Java/fastavro" is accurate for fastavro, imprecise for Java (record-only).
+
+51. **A Go `string` carrier for a `decimal` OR `big-decimal` logical (bytes AND fixed) is the numeric-text form ONLY — a non-numeric string is REJECTED on encode (both wire formats, every encode context), NOT written as opaque raw bytes. This is deliberately STRICTER than the plain bytes/fixed encode-side string leniency (a non-numeric string on a plain `bytes`/`fixed` schema encodes opaquely and round-trips), and is REQUIRED for round-trip symmetry: the string DECODE target of both logicals reads the wire as numeric text whenever it can — decimal always (`setDecimalRat`, deser.go), big-decimal whenever the payload parses as valid AVRO-4124 framing (`applyBigDecimalPayload` → `setDecimalRat`) — so a string encoded opaquely would decode back as a number, silently breaking the round trip.** For decimal the trigger is any non-numeric string (`"abcxyz"` → `"107075203529.082"`); for big-decimal it is a crafted string whose raw bytes ARE a valid framing (`"\x02\x05\x00"` = varint(uLen=1)‖unscaled 5‖varint(scale=0), byte-identical to the structured wire for 5, → `"5"`). `rejectNonNumericStructuredString` (ser.go) fires at the `serBytesDecimal`/`serFixedDecimal`/`serBigDecimal` opaque fall-throughs and at the JSON `appendAvroJSON` bytes/fixed `decimal` and `big-decimal` arms (json_codec.go), after `decimalRatFor` declines the value; a `[]byte` carrier (Kind Slice) is NOT matched and remains the sole opaque escape hatch, symmetric on both sides (its decode target reads raw bytes unconditionally, even for bytes that form valid framing). This mirrors the existing non-numeric `json.Number` reject in `tryCoerceToRat` (a numeric carrier must carry a number), so `string` and `json.Number` reject a non-numeric carrier identically while `[]byte` stays opaque. Neither Java nor fastavro accepts a native string for a decimal / big-decimal schema at all (`Conversions.BigDecimalConversion` is BigDecimal-only; fastavro has no big-decimal), so there is no interop cost — a twmb-only convenience made internally consistent. **History: an earlier fix rejected only regular decimal and EXCLUDED big-decimal on the false premise that its "string decode falls through to raw bytes so it round-trips opaquely on both sides"; that premise is wrong — the decode falls through to raw bytes only when the framing FAILS to parse, so a crafted valid-framing string silently corrupted the round trip. Do NOT re-introduce a big-decimal exclusion.** Pinned by `TestRegression_DecimalStringCarrierIsNumericTextOnly` (decimal instance + numeric/[]byte/json.Number controls + a big-decimal reject block with a valid-framing sample), `TestMatrix_DecimalCarrierNumericTextContract` (decimal carrier {string,[]byte,json.Number} × content × backing × wire × context, neuter-verified), and `TestMatrix_LogicalStringCarrierRoundTripContract` (the whole logical-on-bytes/fixed carrier class: decimal, big-decimal, uuid, duration × string/[]byte carrier × wire × context, with per-logical VALID-FRAMING string samples and a round-trip-exact-or-reject invariant, neuter-verified against the big-decimal reject).
+```
+
+## Distillation archive (2026-07-27 #2) — the FIX round ledger line, verbatim (compressed at write time; it crossed the CORE cap on its own)
+
+```
+- 2026-07-27 · b0d60cf (START head — b0d60cf..HEAD quarantines this round's
+  commits) · FIX (ruling-directed; 2 gaps in the durable half of the
+  bare-emission work, neither a regression from it) · TRIPLE distillation
+  first: CORE 58.6→53.7KB, PATTERNS 151.5→150.0KB, NOT_BUGS 129.7→119.6KB,
+  everything compressed archived verbatim (2026-07-27); the previous line's
+  "CORE trimmed 57.6→56.2KB" CORRECTED — copy-pasted, no distillation ran,
+  and appending the line itself pushed the file over cap · **G1 — the
+  completeness guard proved only half its contract.** It required each field
+  to BLOCK the collapse and said nothing about whether the arm it falls
+  through to EMITS it, so `EnumDefault` blocked and was dropped anyway (the
+  emitter keys `"default"` off `HasEnumDefault`). Now a ROUND TRIP read off
+  the metadata FIELDS, every member in one of THREE checked classes — exempt
+  / relocated-to-Props / round-tripping — plus a FOURTH the ruling had not
+  anticipated: `HasEnumDefault` blocks, EMITS, and is then dropped, because
+  `"default"` is a reserved name with no field to land on off an enum. That
+  drop is PINNED POLICY, so the guard asserts it still happens and a change
+  reds the cell · **G2 — `nodeIsNameRefShape` DERIVED** through the same walk
+  as its sibling (`nodeCarriesNothingBut`; two structurally identical reflect
+  loops is the shape this pair was already burned by, so the difference is
+  data). The literal ruling applied and VERIFIED: exemption set exactly {Doc,
+  Aliases, Namespace, LogicalType} + {Props}; 3 cells flip silent→loud
+  (EnumDefault / Precision / Scale), ZERO real cells red, suite green through
+  the flip — which is itself the measurement that nothing covered them · **a
+  THIRD change was derived, applied, and REVERTED BY THE GATE**: routing a
+  schema-level `default`/`order` on a non-binding kind to Props restores
+  #63(b)'s biconditional and matches BOTH references EXECUTED (Java's
+  SCHEMA_RESERVED omits both, ENUM_RESERVED adds "default" alone,
+  Schema.java:175-180; fastavro round-trips both on every kind) — and it is
+  DOCUMENTED INTENTIONAL, pinned across 14 kinds by
+  TestMatrix_AttributePlacementCensus and by
+  TestRegression_EnumRefWrapperDefaultInert. Reverted; surfaced as a policy
+  question, not a fix · §Open net gaps: caller-composed/edited trees CLOSED
+  by TestMatrix_CallerComposedAndEditedNodes (205 cells; recursive + diamond
+  + cache-cross-parse; each structure asserts its own
+  probe-reaches-the-splice precondition), and the caller-supplied VALUE
+  domain × structure opened in its place · census **Q17** registered WITH a
+  driver (metadata splice vs CACHE splice over one corpus, expectations taken
+  from the RULINGS), Q16 re-registered with per-member classifications; the
+  drift guard caught my tell count · FOUR driver defects of my own, all
+  caught by running it: a cache probe that picked the DEFINITION and never
+  reached the splice; a verdict compared on `Name` (dotted vs
+  name+namespace) that made all 11 cells disagree at once; and TWO neuters
+  that redded nothing because every cell was decided before the guard ·
+  neuters, triple-checked, each red set disjoint: emitter drops `doc` → the
+  new round-trip half alone; hand-list restored → exactly {EnumDefault,
+  Precision, Scale}; exemption dropped → the bare guard alone; exemption
+  widened → the splice guard alone; merge-skip disabled → the one decisive
+  cell · PATTERNS gained both lessons (half-contract guards; ALL cells
+  disagree = driver defect, NO cell reds = corpus never reaches the guard) ·
+  #63 gains clauses (h) and (i) · suite + fastavro green, -race green (0 data
+  races); Java ABSENT · census 15 registered / 2 outstanding / 1 demoted,
+  enumeration OPEN · UNCONVERGED (counter 0), freeze stays.
+```
