@@ -460,6 +460,37 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q4",
+		question: "Is this key RESERVED on this kind — consumed into a structural field, or an ordinary custom property?",
+		authority: "the RULINGS, not the code: NOT_BUGS #46 (reserved names match only their exact lowercase " +
+			"spelling; a variant is an ordinary prop on every surface, body-independent) and #63(b)/(f) " +
+			"(shape-conditional routing on a non-binding kind; placement-conditional, never case-conditional). " +
+			"strayKeyBinds decides binding and schemaReservedKeyForObject decides routing; both are checked " +
+			"against the parse's observable rather than against each other",
+		answerers: []censusAnswerer{
+			{repr: "as-written parse", site: "strayKeyBinds + the per-key shape arms", file: "schema_parse.go"},
+			{repr: "metadata Root + render", site: "schemaReservedKeyForObject", file: "schema_node.go"},
+			{repr: "cache splice merge", site: "schemaReservedKeyForObject (nil shape verdict)", file: "cache.go"},
+			{
+				repr: "tree walker", site: "strayBodyShapeOK gating stray enumeration", file: "schema_walk.go",
+				note: "different-by-design and PINNED as an asymmetry (#63(e)): the binding-kind gate is walkNodeChildren's default, and only the METADATA walker opts into stray enumeration. Collect and inline keep the bound-only view deliberately, so this site answers a deliberately narrower question than the others.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `strayKeyBinds`, counts: map[string]int{
+				"schema_parse.go": 11, "schema_node.go": 1,
+			}},
+			{pattern: `schemaReservedKeyForObject`, counts: map[string]int{
+				"schema_node.go": 5, "schema_parse.go": 5, "cache.go": 1,
+			}},
+			// Rejected tell: `strayBodyShapeOK` — 20 hits across three files,
+			// but it answers the SHAPE question (does this body parse as the
+			// key's schema form), which is an input to the routing rather
+			// than the routing itself. Counting it would make the guard fire
+			// on shape-check refactors that do not touch reservedness.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -513,8 +544,8 @@ var censusOutstanding = []struct {
 	revealedBy string
 }{
 	{
-		question:   "Is this key RESERVED, and at exactly which case?",
-		revealedBy: "schemaReservedKeyForObject / strayKeyBinds / strayBodyShapeOK, plus the per-kind reserved sets in the parse arms",
+		question:   "Does this BODY parse as the key's schema SHAPE?",
+		revealedBy: "strayBodyShapeOK / strayBodyShapeOKMemo — REJECTED as a Q4 tell because it answers the shape question that FEEDS routing, not reservedness itself; 20 hits across schema_parse.go, schema_node.go and schema_walk.go, and #63(b)'s capture-implies-verdict clause says the metadata captures must run the parser's own decodes, which is an agreement question of its own",
 	},
 	{
 		question:   "Is this node a pure NAME-REFERENCE SHAPE (emittable as a bare name)?",
@@ -2376,5 +2407,248 @@ func TestCensus_Q7_CorpusIsNotVacuous(t *testing.T) {
 	}
 	if flat < 5 || notFlat < 2 || mismatched < 1 {
 		t.Fatalf("corpus is thin: flat=%d notFlat=%d mismatched=%d", flat, notFlat, mismatched)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q4 — is this key RESERVED on this kind, or an ordinary custom property?
+// ---------------------------------------------------------------------
+
+// The most heavily adjudicated question in the package, and the corpus is
+// defined by the rulings rather than re-derived from the code:
+//
+//   - NOT_BUGS #46: reserved names match ONLY their exact lowercase
+//     spelling. A case-variant is an ordinary custom property on EVERY
+//     reading surface, body-independent; exact and variant together means
+//     the exact one is consumed and the variant is a prop.
+//   - NOT_BUGS #63(b): on a kind that does NOT bind the key, routing is
+//     shape-conditional — a schema-shaped body surfaces structurally
+//     as-written as its only surface, a malformed body rides in Props
+//     verbatim as its only surface, and the structural field stays ZERO.
+//   - NOT_BUGS #63(f): routing is placement-conditional, never
+//     case-conditional.
+//
+// The invariant those clauses share is a biconditional, and that is what the
+// driver asserts: the structural field is set IFF the key was consumed, and
+// Props holds exactly the raw keys that were not. Two surfaces, one rule.
+// strayKeyBinds is the binding predicate and schemaReservedKeyForObject the
+// routing one; both are callable, so the driver checks them against the
+// parse's observable rather than against each other.
+type reservedKeyCell struct {
+	name string
+	kind string // the type object's kind
+	key  string // the attribute spelling as written
+	body string // its JSON value
+	// Expectations, from the rulings above.
+	binds      bool // strayKeyBinds: does this kind bind this key at all?
+	structural bool // does the structural field end up populated?
+	inProps    bool // does the key survive in Props verbatim?
+	rejects    bool // or does the schema fail to parse outright?
+	// reportedFinding, when set, records that the REBUILD loses this key
+	// today, contrary to the documented posture. The cell asserts the loss
+	// still happens, so fixing it reds here and forces this registry to be
+	// updated — a reported finding must not be able to close itself
+	// silently, exactly like an open ruling.
+	reportedFinding string
+}
+
+// strayRebuildLoss is a REPORTED FINDING, not a policy question:
+// toJSONWalk's bare-emission shortcut requires structural emptiness before
+// collapsing a primitive to its bare name, but enumerates only three of the
+// structural fields (Items, Values, Fields). A schema-shaped stray
+// "symbols", "size", "aliases" or "name" on a primitive therefore survives
+// String() and Root() and is SILENTLY DROPPED by Root().Schema() — against
+// NOT_BUGS #63(b), which says such a body "surfaces structurally as-written
+// as its ONLY surface", and against the shortcut's own comment, which claims
+// the as-written image "must survive the rebuild".
+const strayRebuildLoss = "Root().Schema() drops a schema-shaped stray symbols/size/aliases/name on a primitive: " +
+	"toJSONWalk's bare-emission shortcut checks Items/Values/Fields for structural emptiness and misses the " +
+	"other four fields (schema_node.go). Items/Values/Fields survive; Symbols/Size/Aliases/Name do not."
+
+func reservedKeyCorpus() []reservedKeyCell {
+	return []reservedKeyCell{
+		// Binding kind, exact spelling: consumed. The structural field is
+		// set and the key never reaches Props.
+		{name: "enum-symbols-exact", kind: "enum", key: "symbols", body: `["A","B"]`,
+			binds: true, structural: true},
+		{name: "fixed-size-exact", kind: "fixed", key: "size", body: `4`,
+			binds: true, structural: true},
+
+		// #46: a case-variant is an ordinary custom property, on a kind that
+		// WOULD bind the exact spelling. Body-independent, so the variant
+		// rides to Props and the structural field stays zero — and because
+		// the exact spelling is then absent, a REQUIRED key's variant means
+		// the attribute is missing and the parse rejects loudly.
+		{name: "enum-symbols-variant-required-missing", kind: "enum", key: "Symbols", body: `["A","B"]`,
+			binds: false, rejects: true},
+		{name: "fixed-size-variant-required-missing", kind: "fixed", key: "Size", body: `4`,
+			binds: false, rejects: true},
+
+		// #46 on an OPTIONAL reserved key: the variant is inert and
+		// preserved in Props verbatim, the exact-spelled attribute absent.
+		{name: "record-aliases-variant-optional-inert", kind: "record", key: "Aliases", body: `["x"]`,
+			binds: false, inProps: true},
+		{name: "record-aliases-exact", kind: "record", key: "aliases", body: `["x"]`,
+			binds: true, structural: true},
+
+		// #63(b): a kind that does NOT bind the key. A schema-shaped body
+		// surfaces structurally as-written; a malformed body rides in Props
+		// and leaves the structural field at zero.
+		{name: "int-symbols-shaped-stray", kind: "int", key: "symbols", body: `["A"]`,
+			binds: false, structural: true, reportedFinding: strayRebuildLoss},
+		{name: "int-symbols-malformed-stray", kind: "int", key: "symbols", body: `3.7`,
+			binds: false, inProps: true},
+		{name: "int-size-shaped-stray", kind: "int", key: "size", body: `4`,
+			binds: false, structural: true, reportedFinding: strayRebuildLoss},
+		{name: "int-size-malformed-stray", kind: "int", key: "size", body: `["a"]`,
+			binds: false, inProps: true},
+
+		// #63(f): the same stray on the same kind in its VARIANT spelling is
+		// an ordinary prop whatever its body — placement-conditional routing,
+		// never case-conditional.
+		{name: "int-symbols-variant-shaped", kind: "int", key: "Symbols", body: `["A"]`,
+			binds: false, inProps: true},
+		{name: "int-symbols-variant-malformed", kind: "int", key: "Symbols", body: `3.7`,
+			binds: false, inProps: true},
+
+		// A key that is not reserved at all, as the baseline both sides of
+		// the rule must agree on.
+		{name: "int-plain-custom-key", kind: "int", key: "customThing", body: `7`,
+			binds: false, inProps: true},
+	}
+}
+
+func reservedKeySchema(c reservedKeyCell) string {
+	obj := `{"type":"` + c.kind + `"`
+	if isNamedKind(c.kind) {
+		obj += `,"name":"N"`
+	}
+	// Named kinds need their own defining key present unless this cell IS
+	// that key; otherwise the schema is invalid for an unrelated reason.
+	// NOT strings.EqualFold-exempt: a case-VARIANT of the defining key must
+	// leave the attribute genuinely absent, so supplying the exact spelling
+	// alongside it would defeat the cell (it would become the documented
+	// exact-consumed / variant-a-prop case instead).
+	switch {
+	case c.kind == "enum" && !strings.EqualFold(c.key, "symbols"):
+		obj += `,"symbols":["Z"]`
+	case c.kind == "fixed" && !strings.EqualFold(c.key, "size"):
+		obj += `,"size":1`
+	case isRecordKind(c.kind) && !strings.EqualFold(c.key, "fields"):
+		obj += `,"fields":[]`
+	}
+	return obj + `,"` + c.key + `":` + c.body + `}`
+}
+
+// structuralFieldFor reads the metadata field the key would populate, so
+// "structural field set" is measured rather than inferred.
+func structuralFieldFor(n *SchemaNode, key string) bool {
+	switch key {
+	case "symbols", "Symbols":
+		return len(n.Symbols) > 0
+	case "size", "Size":
+		return n.Size != 0
+	case "aliases", "Aliases":
+		return len(n.Aliases) > 0
+	}
+	return false
+}
+
+// TestCensus_Q4_ReservedKeyRoutingIsOneRuleAcrossSurfaces asserts the
+// biconditional the rulings share: consumed keys populate their structural
+// field and never appear in Props; unconsumed keys appear in Props verbatim
+// and leave the structural field at zero. The two predicates are checked
+// against that observable, not against each other.
+func TestCensus_Q4_ReservedKeyRoutingIsOneRuleAcrossSurfaces(t *testing.T) {
+	for _, cell := range reservedKeyCorpus() {
+		t.Run(cell.name, func(t *testing.T) {
+			if got := strayKeyBinds(cell.kind, cell.key); got != cell.binds {
+				t.Errorf("strayKeyBinds(%q, %q) = %v, want %v", cell.kind, cell.key, got, cell.binds)
+			}
+
+			src := reservedKeySchema(cell)
+			s, err := Parse(src)
+			if cell.rejects {
+				if err == nil {
+					t.Fatalf("Parse(%s) accepted; a case-variant of a REQUIRED key means the attribute is absent, which must reject loudly", src)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Parse(%s): %v", src, err)
+			}
+
+			root := s.Root()
+			gotStructural := structuralFieldFor(&root, cell.key)
+			_, gotProps := root.Props[cell.key]
+
+			if gotStructural != cell.structural {
+				t.Errorf("structural field set = %v, want %v (schema %s)", gotStructural, cell.structural, src)
+			}
+			if gotProps != cell.inProps {
+				t.Errorf("key in Props = %v, want %v (schema %s, props %v)", gotProps, cell.inProps, src, root.Props)
+			}
+			// The biconditional itself: exactly one surface, never both and
+			// never neither, for a key that reaches the node at all.
+			if gotStructural && gotProps {
+				t.Errorf("key %q surfaced BOTH structurally and in Props — the routing is meant to pick exactly one", cell.key)
+			}
+
+			// The rebuild must reach the same routing, or one representation
+			// reads the key differently than the parser did.
+			rebuilt, err := root.Schema()
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+			rb := rebuilt.Root()
+			if cell.reportedFinding != "" {
+				if structuralFieldFor(&rb, cell.key) == gotStructural {
+					t.Errorf("the rebuild no longer loses %q — the reported finding is fixed; update the registry and delete reportedFinding.\n  %s", cell.key, cell.reportedFinding)
+				} else {
+					t.Logf("REPORTED FINDING (not fixed in a census round): %s", cell.reportedFinding)
+				}
+				return
+			}
+			if structuralFieldFor(&rb, cell.key) != gotStructural {
+				t.Errorf("the rebuild changed the structural verdict for %q", cell.key)
+			}
+			if _, p := rb.Props[cell.key]; p != gotProps {
+				t.Errorf("the rebuild changed the Props verdict for %q", cell.key)
+			}
+		})
+	}
+}
+
+// The corpus must exercise every axis the rulings distinguish, or a
+// case-folding or shape-blind implementation would pass.
+func TestCensus_Q4_CorpusIsNotVacuous(t *testing.T) {
+	var binding, nonBinding, variant, malformed, consumed, propped, rejected int
+	for _, c := range reservedKeyCorpus() {
+		if c.binds {
+			binding++
+		} else {
+			nonBinding++
+		}
+		if c.key != strings.ToLower(c.key) {
+			variant++
+		}
+		if c.body == `3.7` || c.body == `["a"]` {
+			malformed++
+		}
+		switch {
+		case c.rejects:
+			rejected++
+		case c.structural:
+			consumed++
+		case c.inProps:
+			propped++
+		}
+	}
+	if binding < 3 || nonBinding < 6 || variant < 4 || malformed < 3 {
+		t.Fatalf("corpus misses an axis: binding=%d nonBinding=%d variant=%d malformed=%d",
+			binding, nonBinding, variant, malformed)
+	}
+	if consumed < 3 || propped < 4 || rejected < 2 {
+		t.Fatalf("corpus misses an outcome: consumed=%d propped=%d rejected=%d", consumed, propped, rejected)
 	}
 }
