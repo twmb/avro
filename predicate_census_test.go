@@ -435,6 +435,31 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q7",
+		question: "Is this field written in the FLAT (goavro-style) form, needing a lift into a nested type?",
+		authority: "flatFieldNeedsLift (schema_parse.go) is the one predicate, and THREE representations call " +
+			"it — the parser, the tree walker, the metadata renderer. Sharing makes the agreement structural, " +
+			"so what can still drift is the INPUT: a walker that reconstructs the field map differently reaches " +
+			"a different verdict from the same predicate",
+		answerers: []censusAnswerer{
+			{repr: "as-written parse", site: "flatFieldNeedsLift → liftFlatFieldType", file: "schema_parse.go"},
+			{repr: "cache / tree walker", site: "flatFieldNeedsLift → flatLiftTypeMap", file: "schema_walk.go"},
+			{repr: "metadata renderer", site: "flatFieldNeedsLift", file: "schema_node.go"},
+		},
+		tells: []censusTell{
+			{pattern: `flatFieldNeedsLift`, counts: map[string]int{
+				"schema_parse.go": 4, "schema_walk.go": 3, "schema_node.go": 1,
+			}},
+			{pattern: `flatLiftTypeMap`, counts: map[string]int{
+				"schema_parse.go": 5, "schema_walk.go": 2, "schema_node.go": 3, "cache.go": 2,
+			}},
+			// Rejected tell: `liftFlatFieldType` — it names the MUTATOR, which
+			// only the parse path calls, so the walker and renderer sites
+			// (the ones that could reconstruct the map differently) would go
+			// unwatched.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -473,6 +498,52 @@ var censusRegistry = []censusQuestion{
 			// is the shape a NEW hand-written identity decision takes.
 		},
 	},
+}
+
+// censusOutstanding is the enumeration's OPEN end. A question lands here the
+// moment it is discovered — usually when a candidate tell has to be REJECTED
+// because it answers a different question, which is the census noticing a
+// row it has not asked yet. Recording it with the tell that revealed it is
+// what stops it being lost between rounds.
+//
+// The total is not fixed and should not be reported as if it were: say "N
+// registered, M outstanding, enumeration open".
+var censusOutstanding = []struct {
+	question   string
+	revealedBy string
+}{
+	{
+		question:   "Is this key RESERVED, and at exactly which case?",
+		revealedBy: "schemaReservedKeyForObject / strayKeyBinds / strayBodyShapeOK, plus the per-kind reserved sets in the parse arms",
+	},
+	{
+		question:   "Is this node a pure NAME-REFERENCE SHAPE (emittable as a bare name)?",
+		revealedBy: "nodeIsNameRefShape, the cache's sole-key wrapper collapse, and the bare-emission shortcuts in toJSONWalk",
+	},
+	{
+		question:   "Is this field written in the FLAT (goavro-style) form needing a lift?",
+		revealedBy: "flatFieldNeedsLift, plus the cache walker's flatField visitor and flatLiftTypeMap",
+	},
+	{
+		question:   "Which union BRANCH NAME does this Go value dispatch to?",
+		revealedBy: "unionTypeNameForValue — binary (serUnion.ser) and JSON (appendAvroJSONUnion) dispatch it separately; surfaced while driving Q10, whose nil short-circuit sits beside it",
+	},
+	{
+		question:   "Does this kind RECURSE (nest further schema nodes)?",
+		revealedBy: `json_decode.go's kind == "record" || "array" || "map" — REJECTED as a Q15 tell because it answers nesting, not namedness, which is what marks it a row of its own`,
+	},
+}
+
+// TestCensus_OutstandingIsRecorded keeps the open end honest: every entry
+// names the code that revealed it, so a later round can pick it up without
+// re-deriving why it exists.
+func TestCensus_OutstandingIsRecorded(t *testing.T) {
+	for _, q := range censusOutstanding {
+		if q.question == "" || q.revealedBy == "" {
+			t.Errorf("outstanding entry is incomplete: %+v", q)
+		}
+	}
+	t.Logf("census: %d registered, %d outstanding, enumeration open", len(censusRegistry), len(censusOutstanding))
 }
 
 // censusSourceFiles returns every non-test .go file the census scans, as
@@ -2148,5 +2219,129 @@ func TestCensus_Q8_CorpusIsNotVacuous(t *testing.T) {
 	// asserting nothing.
 	if reflect.TypeFor[skipSuffixNamed]().Field(1).Tag.Get("avro") == "-" {
 		t.Fatal("the near-miss tag IS the directive; the grammar guard cell tests nothing")
+	}
+}
+
+// ---------------------------------------------------------------------
+// Q7 — is this field written in the FLAT form, needing a lift?
+// ---------------------------------------------------------------------
+
+// The flat (goavro-style) field form puts a complex kind's defining key
+// beside the field's own keys — {"name":"f","type":"enum","symbols":[...]}
+// instead of nesting a type object. Deciding whether to lift is one
+// predicate, flatFieldNeedsLift, and three representations call it: the
+// parser, the tree walker, and the metadata renderer. Sharing makes the
+// agreement structural, so what this drives is that the three consult it on
+// the SAME input — a walker that reconstructs the field map differently
+// would reach a different verdict from the same predicate.
+//
+// The discriminator is a MISMATCHED defining key: "symbols" beside
+// "type":"array" is not the array's key, so it is a stray custom property
+// and no lift happens. A corpus without that cell would pass on a predicate
+// that lifted whenever ANY complex key was present.
+type flatFieldCell struct {
+	name     string
+	field    string // the field object as written inside a record's "fields"
+	wantLift bool
+	wantKind string // the compiled field's kind; "" when the schema must reject
+}
+
+func flatFieldCorpus() []flatFieldCell {
+	return []flatFieldCell{
+		{"flat-enum", `{"name":"f","type":"enum","name2":"","symbols":["A"]}`, true, "enum"},
+		{"flat-array", `{"name":"f","type":"array","items":"int"}`, true, "array"},
+		{"flat-map", `{"name":"f","type":"map","values":"int"}`, true, "map"},
+		{"flat-fixed", `{"name":"f","type":"fixed","size":4}`, true, "fixed"},
+		{"flat-record", `{"name":"f","type":"record","fields":[{"name":"x","type":"int"}]}`, true, "record"},
+		{"nested-enum-not-flat", `{"name":"f","type":{"type":"enum","name":"E","symbols":["A"]}}`, false, "enum"},
+		{"plain-primitive", `{"name":"f","type":"int"}`, false, "int"},
+		// The discriminator. The lift still fires — "items" IS array's
+		// defining key — and it carries the foreign "symbols" into the
+		// lifted array object, where the per-kind exclusivity rule rejects
+		// it. So the verdict is LIFT and the outcome is a parse error, which
+		// is the documented path (NOT_BUGS #63(a)); a predicate that lifted
+		// on any complex key, or one that declined here, would both look
+		// fine without this cell.
+		{"mismatched-defining-key", `{"name":"f","type":"array","items":"int","symbols":["A"]}`, true, ""},
+	}
+}
+
+func TestCensus_Q7_FlatLiftVerdictAgreesWithTheParsedShape(t *testing.T) {
+	for _, cell := range flatFieldCorpus() {
+		t.Run(cell.name, func(t *testing.T) {
+			// The predicate, called directly on the field map the parser sees.
+			var fm map[string]any
+			if err := json.Unmarshal([]byte(cell.field), &fm); err != nil {
+				t.Fatalf("corpus cell is not valid JSON: %v", err)
+			}
+			tp, _ := fm["type"].(string)
+			predicate := flatFieldNeedsLift(fm, tp)
+			if predicate != cell.wantLift {
+				t.Errorf("flatFieldNeedsLift = %v, want %v", predicate, cell.wantLift)
+			}
+
+			// The parser's observable: whatever the verdict, the field's
+			// compiled kind must be the complex kind, reached either by the
+			// lift or by the nested form.
+			src := `{"type":"record","name":"R","fields":[` + cell.field + `]}`
+			s, err := Parse(src)
+			if cell.wantKind == "" {
+				if err == nil {
+					t.Fatalf("Parse(%s) accepted; the lift carries the foreign defining key into the lifted type, where the exclusivity rule must reject it", src)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Parse(%s): %v", src, err)
+			}
+			if got := s.node.fields[0].node.kind; got != cell.wantKind {
+				t.Errorf("compiled field kind = %q, want %q — the lift verdict and the parsed shape disagree", got, cell.wantKind)
+			}
+
+			// The walker + metadata observable: rebuilding through the
+			// metadata tree must reach the same compiled kind, or one
+			// representation reconstructed the field map differently than
+			// the parser handed it to the predicate.
+			root := s.Root()
+			rebuilt, err := root.Schema()
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+			if got := rebuilt.node.fields[0].node.kind; got != cell.wantKind {
+				t.Errorf("rebuilt field kind = %q, want %q — the metadata walker disagrees with the parser about the flat form", got, cell.wantKind)
+			}
+			if !bytes.Equal(s.Canonical(), rebuilt.Canonical()) {
+				t.Errorf("canonical form changed across the rebuild:\n orig: %s\n  new: %s", s.Canonical(), rebuilt.Canonical())
+			}
+		})
+	}
+}
+
+// The corpus must contain a flat form for every complex kind that can take
+// one, a non-flat control, and the mismatched-key discriminator — otherwise
+// a predicate that lifts on any complex key present would pass.
+func TestCensus_Q7_CorpusIsNotVacuous(t *testing.T) {
+	kinds := map[string]bool{}
+	var flat, notFlat, mismatched int
+	for _, c := range flatFieldCorpus() {
+		if c.wantLift {
+			flat++
+			if c.wantKind != "" {
+				kinds[c.wantKind] = true
+			}
+		} else {
+			notFlat++
+		}
+		if strings.Contains(c.name, "mismatched") {
+			mismatched++
+		}
+	}
+	for _, k := range []string{"enum", "array", "map", "fixed", "record"} {
+		if !kinds[k] {
+			t.Errorf("corpus has no flat form for the kind %q", k)
+		}
+	}
+	if flat < 5 || notFlat < 2 || mismatched < 1 {
+		t.Fatalf("corpus is thin: flat=%d notFlat=%d mismatched=%d", flat, notFlat, mismatched)
 	}
 }
