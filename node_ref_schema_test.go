@@ -2,6 +2,7 @@ package avro
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 )
 
@@ -492,3 +493,84 @@ func TestNodeRefSchemaMatrix(t *testing.T) {
 
 // defN2ref quotes a fullname as a JSON reference token.
 func defN2ref(n string) string { return `"` + n + `"` }
+
+// A schema node collapses to its bare type name only when it carries nothing
+// else. That question used to be answered by two hand-written lists of the
+// fields someone remembered, and both were missing the same four — a
+// stray-surfaced Symbols, Size, Aliases or Name on a primitive survived
+// String() and Root() and vanished through Root().Schema().
+//
+// The durable fix is not "add the four": it is that the enumeration must
+// check ITSELF. This sets every exported field of SchemaNode in turn and
+// requires nodeCarriesOnlyType to notice, so a field added later fails here
+// until someone classifies it. A field may only be exempt with a stated
+// reason, because an exemption is the claim "this field has no emitted form,
+// so collapsing cannot lose it".
+func TestInvariant_BareEmissionCoversEverySchemaNodeField(t *testing.T) {
+	// The classified exemptions. Adding a name here is a claim that the
+	// field cannot be emitted for the kinds that reach bare emission.
+	exempt := map[string]string{
+		"Branches": "no JSON key routes to Branches outside a union, so a hand-built value on another kind is inert and cannot be lost by collapsing",
+	}
+
+	base := SchemaNode{Type: "int"}
+	if !nodeCarriesOnlyType(&base) {
+		t.Fatal("a bare primitive must carry only its Type; the control is broken so nothing below means anything")
+	}
+
+	rt := reflect.TypeFor[SchemaNode]()
+	var checked, exempted int
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() || f.Name == "Type" {
+			continue
+		}
+		n := SchemaNode{Type: "int"}
+		fv := reflect.ValueOf(&n).Elem().Field(i)
+		if !setNonZeroForTest(fv) {
+			t.Errorf("field %s has kind %s, which this test does not know how to populate — teach it, or the field is silently unchecked", f.Name, f.Type.Kind())
+			continue
+		}
+		got := nodeCarriesOnlyType(&n)
+		if why, ok := exempt[f.Name]; ok {
+			exempted++
+			if !got {
+				t.Errorf("field %s is listed exempt (%s) but blocks bare emission; either the exemption is wrong or the field gained an emitted form", f.Name, why)
+			}
+			continue
+		}
+		checked++
+		if got {
+			t.Errorf("setting %s does NOT block bare emission, so its value would be silently dropped by Root().Schema(). Give it an emission arm, or classify it as exempt with the reason it cannot be emitted.", f.Name)
+		}
+	}
+	if checked < 12 {
+		t.Fatalf("only %d fields were actually checked; the walk is not seeing SchemaNode", checked)
+	}
+	t.Logf("bare-emission coverage: %d fields must block, %d classified exempt", checked, exempted)
+}
+
+// setNonZeroForTest gives fv a non-zero value, reporting false for kinds it
+// does not handle so an unhandled kind is a loud failure rather than a
+// silently skipped field.
+func setNonZeroForTest(fv reflect.Value) bool {
+	switch fv.Kind() {
+	case reflect.String:
+		fv.SetString("x")
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		fv.SetInt(1)
+	case reflect.Bool:
+		fv.SetBool(true)
+	case reflect.Slice:
+		fv.Set(reflect.MakeSlice(fv.Type(), 1, 1))
+	case reflect.Map:
+		m := reflect.MakeMap(fv.Type())
+		m.SetMapIndex(reflect.ValueOf("k").Convert(fv.Type().Key()), reflect.Zero(fv.Type().Elem()))
+		fv.Set(m)
+	case reflect.Pointer:
+		fv.Set(reflect.New(fv.Type().Elem()))
+	default:
+		return false
+	}
+	return true
+}

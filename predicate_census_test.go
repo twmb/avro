@@ -491,6 +491,38 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q16",
+		question: "Does this node carry anything beyond its Type — i.e. is it structurally empty?",
+		authority: "nodeCarriesOnlyType (schema_node.go), DERIVED from SchemaNode's field set rather than " +
+			"written as a list. Two sites ask it — the primitive arm and the name-reference arm of toJSONWalk " +
+			"— and each previously held its OWN incomplete copy of the list, which is how a stray Symbols, " +
+			"Size or Aliases was silently dropped by the rebuild while a stray Name was caught by one copy only",
+		answerers: []censusAnswerer{
+			{repr: "metadata render, primitive arm", site: "nodeCarriesOnlyType", file: "schema_node.go"},
+			{repr: "metadata render, name-reference arm", site: "nodeCarriesOnlyType", file: "schema_node.go"},
+		},
+		tells: []censusTell{
+			{pattern: `nodeCarriesOnlyType`, counts: map[string]int{
+				// Definition, its two call sites, and three doc references
+				// (counted with grep -o; doc comments count, and reasoning
+				// about the number has been wrong every time).
+				"schema_node.go": 6,
+			}},
+			// Rejected tell: `len(n.Props) == 0` — the shape the OLD
+			// hand-written lists shared. It still appears in unrelated
+			// emptiness checks, so it would fire on changes that have nothing
+			// to do with bare emission; and after the fix it no longer marks
+			// this question's sites at all, which is the point.
+			//
+			// The durable guard for this question is not a tell but
+			// TestInvariant_BareEmissionCoversEverySchemaNodeField, which
+			// sets every exported field in turn and requires the predicate to
+			// notice. A field added later fails there until classified, so
+			// the enumeration checks ITSELF rather than trusting the next
+			// author — which a tell count cannot do.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -2452,18 +2484,11 @@ type reservedKeyCell struct {
 	reportedFinding string
 }
 
-// strayRebuildLoss is a REPORTED FINDING, not a policy question:
-// toJSONWalk's bare-emission shortcut requires structural emptiness before
-// collapsing a primitive to its bare name, but enumerates only three of the
-// structural fields (Items, Values, Fields). A schema-shaped stray
-// "symbols", "size", "aliases" or "name" on a primitive therefore survives
-// String() and Root() and is SILENTLY DROPPED by Root().Schema() — against
-// NOT_BUGS #63(b), which says such a body "surfaces structurally as-written
-// as its ONLY surface", and against the shortcut's own comment, which claims
-// the as-written image "must survive the rebuild".
-const strayRebuildLoss = "Root().Schema() drops a schema-shaped stray symbols/size/aliases/name on a primitive: " +
-	"toJSONWalk's bare-emission shortcut checks Items/Values/Fields for structural emptiness and misses the " +
-	"other four fields (schema_node.go). Items/Values/Fields survive; Symbols/Size/Aliases/Name do not."
+// The reportedFinding mechanism is retained though no cell uses it: the
+// stray-rebuild loss it recorded is FIXED (the bare-emission sites now ask
+// one derived predicate, and a reflect guard keeps its field set complete),
+// so those cells are ordinary agreement cells again — the mechanism working
+// as designed.
 
 func reservedKeyCorpus() []reservedKeyCell {
 	return []reservedKeyCell{
@@ -2495,11 +2520,11 @@ func reservedKeyCorpus() []reservedKeyCell {
 		// surfaces structurally as-written; a malformed body rides in Props
 		// and leaves the structural field at zero.
 		{name: "int-symbols-shaped-stray", kind: "int", key: "symbols", body: `["A"]`,
-			binds: false, structural: true, reportedFinding: strayRebuildLoss},
+			binds: false, structural: true},
 		{name: "int-symbols-malformed-stray", kind: "int", key: "symbols", body: `3.7`,
 			binds: false, inProps: true},
 		{name: "int-size-shaped-stray", kind: "int", key: "size", body: `4`,
-			binds: false, structural: true, reportedFinding: strayRebuildLoss},
+			binds: false, structural: true},
 		{name: "int-size-malformed-stray", kind: "int", key: "size", body: `["a"]`,
 			binds: false, inProps: true},
 

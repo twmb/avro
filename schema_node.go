@@ -1380,12 +1380,10 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 
 	switch n.Type {
 	case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
-		// Bare-string emission requires STRUCTURAL emptiness too: a
-		// stray-surfaced Items/Values/Fields on a primitive is part of
-		// the as-written image and must survive the rebuild, so such a
-		// node takes the object render regardless of props.
-		if n.LogicalType == "" && len(n.Props) == 0 &&
-			n.Items == nil && n.Values == nil && len(n.Fields) == 0 {
+		// Bare-string emission is only lossless when the node carries
+		// NOTHING but its Type — see nodeCarriesOnlyType, which derives that
+		// from the field set rather than listing the fields it remembers.
+		if nodeCarriesOnlyType(n) {
 			return n.Type
 		}
 	case "union":
@@ -1396,10 +1394,14 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		return branches
 	}
 
-	if n.Name == "" && n.Type != "array" && n.Type != "map" &&
-		!isNamedKind(n.Type) &&
-		n.Type != "union" && n.LogicalType == "" && len(n.Props) == 0 &&
-		n.Items == nil && n.Values == nil && len(n.Fields) == 0 {
+	// The same losslessness question as the primitive arm above, for a NAME
+	// REFERENCE: it may collapse to the bare name only when the node carries
+	// nothing else. Both sites ask nodeCarriesOnlyType rather than repeating
+	// a field list — they previously held two copies of the same incomplete
+	// list, which is why a stray Symbols/Size/Aliases vanished here while a
+	// stray Name was caught.
+	if n.Type != "array" && n.Type != "map" && !isNamedKind(n.Type) &&
+		n.Type != "union" && nodeCarriesOnlyType(n) {
 		return refType
 	}
 
@@ -2032,6 +2034,47 @@ func collectLocalNames(n *SchemaNode, names map[string]bool, visited map[*Schema
 	for i := range n.Branches {
 		collectLocalNames(&n.Branches[i], names, visited, depth+1)
 	}
+}
+
+// nodeCarriesOnlyType reports whether n holds no information beyond its
+// Type, so collapsing it to the bare type name (`"int"` rather than
+// `{"type":"int"}`) loses nothing.
+//
+// It is DERIVED from the struct's field set rather than written as a list of
+// the fields someone remembered. That distinction is the whole point: the
+// hand-listed version checked LogicalType, Props, Items, Values and Fields,
+// and silently dropped a stray-surfaced Symbols, Size, Aliases or Name on a
+// primitive — the as-written image survived String() and Root() and vanished
+// through Root().Schema(), against this package's own rule that such a body
+// surfaces structurally as-written as its ONLY surface. A subset can always
+// be missing a member; asking the field set cannot.
+//
+// Unexported state is skipped deliberately: it is derived bookkeeping (the
+// name-reference stamp and its scope), not as-written content, so it must
+// not force the object form. TestInvariant_BareEmissionCoversEverySchemaNodeField
+// proves the coverage by setting each exported field in turn and requiring
+// this to notice.
+func nodeCarriesOnlyType(n *SchemaNode) bool {
+	rv := reflect.ValueOf(n).Elem()
+	t := rv.Type()
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if !f.IsExported() || f.Name == "Type" {
+			continue
+		}
+		if f.Name == "Branches" && n.Type != "union" {
+			// The one CLASSIFIED exemption: Branches has no emitted form
+			// outside a union — no JSON key routes to it on any other kind,
+			// so a hand-built value there is inert and collapsing to the
+			// bare name cannot lose it. Every other field has an emission
+			// arm, so a non-zero value in it would be dropped.
+			continue
+		}
+		if !rv.Field(i).IsZero() {
+			return false
+		}
+	}
+	return true
 }
 
 // nodeIsNameRefShape reports whether n can be emitted as a pure name
