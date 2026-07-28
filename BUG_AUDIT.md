@@ -9577,3 +9577,146 @@ enumeration itself (§Open net gaps) and NOT_BUGS #74, not this prose.
   a pass on those two. Not nibbled further on purpose: the remaining fat is
   live ruling text the pre-action gate quotes, and trading that for a soft
   size target is the wrong trade** · UNCONVERGED (counter 0), freeze stays.
+
+## Distillation archive (2026-07-28 #5) — the placement-authority FIX round's ledger line, verbatim
+
+Compressed in AUDIT_CORE.md §Round ledger during the size-guard pass at the top of
+the decimal-length FIX round (CORE 56.6KB, over cap after the rule-2a amendment).
+Its standing content is PLACEMENT AUTHORITY (now a named rule), NOT_BUGS #74/#75,
+and §Open net gaps' record that the reserved-attribute space has no open gap.
+
+- 2026-07-28 · 9ff2d27 (START head — 9ff2d27..HEAD quarantines this round's
+  commits) · FIX (ruling-directed, 3 groups) · **TRIPLE distillation FIRST**,
+  as mandated: 51.8KB archived verbatim; six blind-spot entries, six NOT_BUGS
+  entries and every pre-current ledger era line compressed — CORE 55.3→52.9,
+  PATTERNS 151.2→132.4, NOT_BUGS 124.9→120.6 KB, all under bound BEFORE the
+  round's writes · quarantine b1c42bb..HEAD = 9ff2d27 CLEARED · **all three
+  groups were cells the ENUMERATION had reported and refused to guess: it
+  produced the questions, this round answered them, unruled went 71 → 0** ·
+  **PLACEMENT AUTHORITY minted** — the authority for a placement is whichever
+  reference actually HAS it, governing the empty and non-empty body ALIKE;
+  where NEITHER has it, this package's adjudicated posture does (#33/#71's
+  basis). It settles two groups and CORRECTS my previous round's ruling: I read
+  Apache Avro's ABSENCE of a doc slot on a primitive as a drop while the
+  non-empty twin at that same placement already followed fastavro's PRESENCE —
+  one placement answering to two authorities. Primitive `doc:""` now PRESERVED,
+  the test split, the aliases half standing on Java's own non-EMPTY condition ·
+  **G1 (63 cells) FIXED**: a structural key written as its destination's zero
+  at a stray placement reached NEITHER surface; presence extended to the stray
+  destinations as ONE bitmask replacing two bools, so the hidden-state census
+  entry updated instead of growing · **the trap was real, pinned per cell**:
+  exclusivity is decided on the VALUE, so `symbols:["A"]` on an array rejects
+  while `symbols:[]` is accepted; a neuter making the emitter write a readable
+  body where the parse took an empty one reds exactly the binding-kind cells · **G2 STOP-SIGNED as #75**: the #70 analogy fails on one
+  executed probe — garbage STRING namespaces reject too, so the rule judges
+  what a namespace can BE, not the token class · 5 neuters, red sets
+  distinguishable; one corrected an OVERCLAIM in my own test comment
+  (`SchemaNode.Schema()` parses what it marshals, so a rejected emission fails
+  at the REBUILD; the re-parse leg adds the rendered TEXT) · suite + fastavro +
+  `-race` green; Java ABSENT · **sizes after every write, this line included:
+  CORE 55.4 / PATTERNS 132.4 / NOT_BUGS 120.6 KB — PATTERNS well
+  under after the pass, CORE and NOT_BUGS back AT their bounds, which is where
+  the round found them; the pass bought this round's two rulings, not headroom** ·
+  UNCONVERGED (counter 0), freeze stays.
+
+## Distillation archive (2026-07-28 #6) — the decimal-length FIX round ledger line, verbatim
+
+- 2026-07-28 · b045c18 (START head — b045c18..HEAD quarantines this round's
+  commits) · FIX (ruling-directed) · **RULING 1 applied: the decimal
+  unscaled-LENGTH bound is now charged on BOTH sides, through one function.**
+  #11's re-open condition was met (grep -c for the cap in the very net #11 names
+  as the Encode-implies-Decode guarantor = 0), and 7d1ccac landed the cap
+  decode-only, so no ping-pong · **I re-ran both corrections rather than
+  accepting them, and one needed refining while the other held exactly.** (b)
+  held: a writer schema with an over-cap decimal fixed resolves to a reader that
+  DROPS the field and decodes (`got=map[keep:7]`), so a parse reject would kill a
+  working reader — the check is on ENCODE. (a) was right where it mattered and
+  imprecise at the edge: `*big.Rat`, numeric string and float64 all reach the
+  fixed face through `appendDecimalFixed`'s PADDING, so charging the opaque
+  carrier alone closes nothing — but `[]byte` is NOT excluded there, it is
+  rejected only when its length differs from the fixed size and accepted at
+  exactly-size. Charging the emit paths rather than the carriers covers both
+  readings, which is why the delegating design was the right one · **and the
+  site set I derived by the semantic question found a face neither of us had
+  counted: `big-decimal` carries no `precision` attribute, so nothing upstream
+  bounds it and an ORDINARY `*big.Rat` — no opaque escape involved — encodes 33
+  KB that no target reads.** That is the one arm where the value domain itself
+  escapes · **mechanism**: one bound, asked by one function. `checkDecimalLen`
+  splits into a size-keyed twin so a fixed carrier, whose padded width is known
+  before the bytes exist, delegates instead of restating; the three SHARED
+  builders charge (covering every numeric arm on both wires at once), and the
+  opaque escape gets `chargeOpaqueDecimalBytes`, which must decide WHICH BYTES
+  itself because the payload is the framing on a big-decimal and the unscaled
+  value on a decimal. A framing it cannot read is left alone DELIBERATELY —
+  that is the grammar question, not this bound, and quietly folding it in would
+  have been me ruling on something unruled · over-rejection impossible BY
+  CONSTRUCTION and pinned as such: both sides ask the same function about the
+  same bytes, so encode refuses exactly what decode refuses; cap-exact still
+  encodes AND decodes on both containers · **the generator went IN
+  `TestMatrix_SelfReadableAtScale` per #11's own requirement**, crossing carrier
+  × logical × container × wire (binary, JSON, single-object, OCF) × length ·
+  **its first version red for the wrong reason** — raw 0x01 bytes on a
+  big-decimal die on the framing grammar (zigzag -1) before the bound is ever
+  consulted, so the cell never exercised the axis; the probe now builds the
+  path-reaching form, which is the standing lesson about nets that sample a
+  shape the safe fallback catches · 5 neuters, all satisfying the triple, red
+  sets pairwise DISJOINT and each naming its own mechanism; N4/N5 prove the two
+  fixed-opaque charges are not dead · census **Q19** registered, and the census
+  immediately earned its keep by failing three ways: an unsupported alternation
+  in my tell, and two `&SemanticError{` counts my edits had moved · **RULING 2
+  accepted without argument** — #49 already carried the auto-fill clause I had
+  offered as new, states the ruling in both directions, and cites Java; added
+  the re-filing guard naming the #49-composed-with-#51 shape and separating it
+  from the length axis · **rule 2a minted**: reference SILENCE is not a
+  reference SPLIT, so silence routes to rule 4 (table + HALT), never to the
+  permissive tiebreak; added to the gate's verdict set with a mechanical test
+  (name the file:line that accepts, or you have silence) · convention 1 grew
+  (e), the class-elimination rule, which was being retyped into prompts because
+  it lived in neither framework doc · suite + fastavro + `-race` green; Java
+  ABSENT (no JVM) · sizes after every write: CORE 54.3 / PATTERNS 134.7 /
+  NOT_BUGS 123.4 KB · **one adjacent question left UNRULED and reported rather
+  than folded in**: arbitrary opaque bytes on a big-decimal produce a wire the
+  natural target cannot read, which is #51's documented opaque trade-off
+  ([]byte→wire→[]byte round-trips) but has never been ruled as such ·
+  UNCONVERGED (counter 0), freeze stays.
+
+## Distillation archive (2026-07-28 #7) — three superseded ledger era lines, verbatim
+
+The 2026-07-01..26 era block and the two 2026-07-27 era lines, compressed to a
+single pre-era line in AUDIT_CORE.md §Round ledger. Their rulings all live in
+NOT_BUGS (#53-#75), the patterns in AUDIT_PATTERNS (P19-P22), and the closed
+gaps in §Open net gaps; what is archived here is the ledger prose.
+
+- 2026-07-01..26 · ea9a2ce→ba4799f · ERA BLOCK (verbatim: archive 2026-07-28
+  #1, and the round narratives it cites). CONVERGED→RESET→RE-CONVERGED cycles;
+  #53–#71 filed and fixed; the #63 stray-structural-key family and #64; the
+  #46 reserved-key POLICY FLIP to EXACT-lowercase; P19/P20/P21 minted; the
+  LINE-WALK CAMPAIGN completed (every non-test file carries a full-walk
+  record); R1 distilled into the PREDICATE-AGREEMENT CENSUS, which then took
+  its first demotion and grew a mandatory re-count guard; **Q9 ruled and
+  fixed** (a counting scan with early exit dominated the false dilemma — the
+  cap's stated number is now the number enforced) and **RULE 7a minted**
+  (restatement licensed only where delegation is impossible, priced at an
+  executed differential over the complete domain); **#71 re-ruled** after the
+  overseer re-opened a gated cell — the gate was procedurally right and the
+  documented clause was wrong, "annotation-independent" being true of
+  NAVIGATION and false of LANDING. The era's standing process lesson, in three
+  costumes: MEASUREMENT NEVER HAPPENED — a neuter that reds nothing, a neuter
+  that panics in a package-level init and reports 0 fails, a verdict read off
+  the metadata tree when the effect lives in the compiled one. Neuter rule
+  amended to the TRIPLE: exit != 0 · RUN > 0 under `-v` · no `panic:`.
+- 2026-07-27 · faa5d80→c8365de · ERA BLOCK (1 CENSUS + 3 FIX) — census Q4
+  registered (reserved-key routing, corpus shaped BY THE RULINGS), the
+  biconditional it drives closed at its CLASS by three derivations
+  (`nodeCarriesOnlyType`, `nodeCarriesNothingBut`, `schemaKeyBinds`), each
+  durably guarded by a REFLECT COMPLETENESS GUARD over SchemaNode's field set;
+  Q16/Q17 registered; caller-composed/edited gap CLOSED. Verbatim: archive
+  (2026-07-28 #2); narrative: archive (2026-07-27 #4).
+- 2026-07-27 · b7717b3→b1c42bb · ERA (1 FULL + 1 FIX) — **#72 RULED**
+  (non-string `doc` dropped at both levels = Java parity; the predicting fact is
+  RESERVED-SET MEMBERSHIP, which settles #70 and #72 together), P22 minted off 4
+  behavioral findings with one root, and **#73 RULED** (a JSON null is a
+  PRESENT-but-unreadable body → the malformed route everywhere; predicate
+  `jsonNullBody` = census Q18; swept BY SEMANTIC QUESTION to two sites of
+  fourteen keys). Verbatim: archive (2026-07-28 #2); narratives: archive
+  (2026-07-27 #6).
