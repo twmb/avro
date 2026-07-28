@@ -10038,3 +10038,88 @@ Compressed once the FIX round it directed closed both findings at the class.
   index/body now agree 75/75 · quarantine 27a4e69 NOT cleared · suite + fastavro
   + `-race` green; Java ABSENT · one gap consciously deferred · verbatim:
   archive (2026-07-28 #13) · UNCONVERGED.
+
+## Distillation archive (2026-07-28 #18) — the FULL round ledger line, verbatim
+
+- 2026-07-28 · d60a3b8 · FULL (read-only) · **1 BEHAVIORAL, in the fix this
+  round quarantined, found by auditing the CHANGE rather than the class**: the
+  default walk's UNION arm passes a nil sink, so the chosen branch's payload is
+  never charged — `[decimal,null]` as a field default, the same union inside a
+  record default, and an array of such unions all Encode over-cap wires their
+  own Decode refuses. The nil is not a slip: a verdict returned from a trial
+  branch would make it look unacceptable and silently select a different one, so
+  the fix is a PER-ATTEMPT sink merged only for the branch that wins ·
+  **`TestMatrix_CapProducerCompliance` stayed green, and why is the second half
+  of the finding**: its nesting axis is {flat, in-record, in-array, in-map}, and
+  the union is precisely the composite whose walk arm behaves differently. The
+  axis existed and did not include the shape the bug lives in — the same lesson
+  as the round that added the axis · **the zero-behavior naming change did more
+  than name**: `ocfEagerBlockAllocLimit` carried a comment ASSERTING it equalled
+  the default WithMaxBlockBytes, and it did — as `64<<20` against the use site's
+  `1<<26`, one number in two spellings, hand-maintained. It now DERIVES from the
+  new constant, so the property that comment describes cannot be broken by
+  editing one spelling; the classifier can see the bound, and its row covers
+  instead of records · quarantine 463e21d..HEAD = acc3dcc, NOT cleared · fronts:
+  `json_scan.go` as the inverse-density pick (B22's named blind spot) — CLEAN
+  and well-netted, `matrix_json_strictness_parity_test.go` drives the SKIP path
+  against the VALUE path under a calibration-free equality invariant, which is
+  the differential B22 asks for · suite + fastavro + `-race` green, zero
+  thinned-venv skips; Java ABSENT · one gap consciously deferred (caller VALUE ×
+  STRUCTURE) · UNCONVERGED (counter 0), freeze stays.
+
+## Distillation archive (2026-07-28 #19) — the cap-table round's ledger line, verbatim
+
+Compressed the round after, once the FULL round found the union arm its table
+did not reach.
+
+- 2026-07-28 · 463e21d (START head — 463e21d..HEAD quarantines this round's
+  commits) · FIX (ruling-directed, at the CLASS) · **the measurement first,
+  reported both ways: the compiled serializer IS reachable at the default
+  pre-encode and is NOT substitutable.** Reachable: failing loudly on a nil
+  `node.ser` there reds nothing across the suite. Substitutable: swapping it in
+  reds 8 tests, naming the documented reason — parse time chose the union branch
+  by DECLARATION ORDER, the runtime dispatcher re-chooses by Go kind. So the
+  second encoder stays and the fallback was taken · **fix at the class**: the
+  charge lives INSIDE the recursion at the LEAF, where the carrier's own kind is
+  in hand, and each leaf asks the SAME authority its serializer asks — the array
+  arm through `arrayZeroByteEncodeCompliance`, the array encoders' own shared
+  helper whose doc already demanded it. No per-kind cap table · **the four
+  deltas landed**: the OCF pair asserted AS the exception on the type system's
+  evidence (`WithMaxBlockBytes` is a ReaderOpt — producer enforcement is
+  UNEXPRESSIBLE, not absent); applicability recorded per cap, six bounds
+  not-applicable because they refuse no wire; the TABLE is the deliverable; and
+  a cap landing without a row now FAILS · **the completeness guard earned its
+  keep immediately**: #11's list is NOT the set of caps — it surfaced TEN more,
+  caught two row names I had GUESSED, and exposed one nothing can guard: the
+  reader-side COMPRESSED block bound is an inline `1<<26` with no constant ·
+  **the table found its own defect first** — the in-record cell was measuring
+  "missing key" · 2 neuters, disjoint, each covering all four nestings · NOT_BUGS
+  pass as its own guard prescribes: #74 tombstoned, 7.3KB archived, 121.3 →
+  115.6 KB · suite + fastavro + `-race` green; Java ABSENT · verbatim: archive
+  (2026-07-28 #16) · UNCONVERGED.
+
+## Distillation archive (2026-07-28 #20) — two ledger lines merged into the producer-compliance era block
+
+- 2026-07-28 · 15669c8 · FULL (read-only) · **2 BEHAVIORAL, one root — the fix
+  it quarantined**: the default pre-encode is a SECOND encoder keying on
+  `node.kind`, so a decimal nested in a container default went uncharged, and
+  applying P23 to the other caps found an array-of-zero-byte-items default
+  encoding to FIVE bytes that Decode refuses. Filed as the class, not the
+  instance. Also: the JSON arm's pin (the matrix reds only through a RELATIVE
+  invariant), and a self-report — my index trim had dropped #64's walker-parity
+  rationale, and #64 was the only entry of 75 with no body, so that line was its
+  sole live copy. Body restored; index/body agree 75/75. Verbatim: archive
+  (2026-07-28 #13, #17).
+- 2026-07-28 · 463e21d (START head) · FIX (ruling-directed, at the CLASS) ·
+  **measured both ways before designing**: the compiled serializer IS reachable
+  at the default pre-encode (a nil-`node.ser` tripwire reds nothing) and is NOT
+  substitutable (swapping it reds 8 tests — parse picks a union branch by
+  DECLARATION ORDER, the runtime dispatcher by Go kind). So the charge went
+  INSIDE the recursion, at the leaf, each leaf asking the SAME authority its
+  serializer asks — the array arm through `arrayZeroByteEncodeCompliance`, whose
+  own doc already demanded it. **The deliverable was the TABLE**:
+  `TestMatrix_CapProducerCompliance` + `TestInvariant_EveryCapIsClassified` (a
+  cap landing without a row FAILS) + the OCF exception ASSERTED on the type
+  system's evidence. The guard proved #11's list was not the set of caps —
+  ten more bounds, two row names taken from memory, one bound with no name at
+  all. Verbatim: archive (2026-07-28 #16, #19).
