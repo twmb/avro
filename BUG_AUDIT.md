@@ -10123,3 +10123,21 @@ did not reach.
   system's evidence. The guard proved #11's list was not the set of caps —
   ten more bounds, two row names taken from memory, one bound with no name at
   all. Verbatim: archive (2026-07-28 #16, #19).
+
+## Distillation archive (2026-07-28 #21) — the pre-era ledger block, verbatim
+
+- 2026-07-01..28 · ea9a2ce→c8365de · PRE-ERA BLOCK (verbatim: archive
+  2026-07-28 #7, and the round narratives it cites). CONVERGED→RESET→
+  RE-CONVERGED cycles; #53–#73 filed and fixed; the #63 stray-structural-key
+  family; the #46 reserved-key POLICY FLIP to EXACT-lowercase; P19–P22 minted;
+  the LINE-WALK CAMPAIGN completed; R1 distilled into the PREDICATE-AGREEMENT
+  CENSUS (Q4/Q16/Q17/Q18 registered, its first demotion taken, a mandatory
+  re-count guard grown); **Q9 ruled** (a counting scan with early exit dominated
+  the false dilemma) and **RULE 7a minted** (restatement licensed only where
+  delegation is impossible, priced at an executed differential); **#71 re-ruled**
+  after the overseer re-opened a gated cell — the gate was procedurally right and
+  the documented clause was wrong. The era's standing process lesson, in three
+  costumes: MEASUREMENT NEVER HAPPENED — a neuter that reds nothing, a neuter
+  that panics in a package-level init and reports 0 fails, a verdict read off the
+  metadata tree when the effect lives in the compiled one. Neuter rule amended to
+  the TRIPLE: exit != 0 · RUN > 0 under `-v` · no `panic:`.
