@@ -9720,3 +9720,24 @@ gaps in §Open net gaps; what is archived here is the ledger prose.
   `jsonNullBody` = census Q18; swept BY SEMANTIC QUESTION to two sites of
   fourteen keys). Verbatim: archive (2026-07-28 #2); narratives: archive
   (2026-07-27 #6).
+
+## Distillation archive (2026-07-28 #8) — the enumeration round's ledger line, verbatim
+
+Compressed in AUDIT_CORE.md §Round ledger; its standing content is the
+reserved-attribute enumeration itself (§Open net gaps) and NOT_BUGS #74.
+
+- 2026-07-27 · b1c42bb (START head) · FIX (ruling-directed) · **the round's unit
+  was a CLASS and the deliverable the ENUMERATION rather than its members**:
+  every reserved attribute × {absent, valid, written-zero, JSON-null,
+  wrong-typed, quoted} × {type, field} × every kind = 2184 cells, expectations
+  DERIVED PER CELL from the references (a Schema.java source model carrying the
+  line each rule came from, plus fastavro EXECUTED) and never from this package;
+  `reservedProvenance` records what settled each family, and 71 cells were
+  reported UNRULED rather than guessed. **The table found four of its own
+  defects before it found any of the package's** — the calibration cells are
+  what surfaced them. 3 BEHAVIORAL, one root: **P22's WRITTEN-ZERO half**, closed
+  by presence state (a body decode reads PERFECTLY into a value
+  indistinguishable from absence needs presence, not a body check), and **#74
+  RULED — the emission condition is PER ATTRIBUTE**, so a blanket presence
+  mechanism would have shipped a divergence at two of four. Verbatim: archive
+  (2026-07-28 #4).
