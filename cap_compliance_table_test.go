@@ -205,9 +205,15 @@ func capRows() []capRow {
 			applicability: capReaderOnly,
 			reason: "the OCF block-size pair is READER-ONLY BY DESIGN — the documented exception to the producer-compliance rule. " +
 				"Producer enforcement was implemented once and REVERTED: it traps data at flush and leaves an unclosable " +
-				"compressed-size residual. The table asserts the exception; it must not be closed. " +
-				"NOTE: only the DECOMPRESSED half has a named constant — the compressed bound is an inline 1<<26 in NewReader, " +
-				"so no name-keyed guard can see it. Naming it would put it under this table",
+				"compressed-size residual. The table asserts the exception; it must not be closed",
+		},
+		{
+			konst:         "defaultMaxBlockBytes",
+			applicability: capReaderOnly,
+			reason: "the COMPRESSED half of the same reader-only pair. It was an inline literal until this table asked for it: a " +
+				"bound with no name cannot be classified by a guard keyed on names, so the row recorded a hole rather than " +
+				"covering one. Naming it also made ocfEagerBlockAllocLimit DERIVE from it instead of restating the same number " +
+				"in a second spelling under a comment asserting the two were equal",
 		},
 
 		// Below: bounds the #11 entry does not enumerate. The completeness

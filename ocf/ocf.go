@@ -306,14 +306,23 @@ func WithMaxBlockBytes(n int64) ReaderOpt { return optMaxBlockBytes{n} }
 // producers writing larger blocks raise it with WithMaxDecompressedBlockBytes.
 const defaultMaxDecompressedBytes = 64 << 20
 
+// defaultMaxBlockBytes is the reader's default ceiling on a block's DECLARED
+// COMPRESSED size — the [WithMaxBlockBytes] default. It is named rather than
+// written inline at its use because a bound with no name is invisible to any
+// guard keyed on names: the producer-compliance table classifies each cap by
+// its constant, and this half of the reader-only block pair could not be
+// classified while it was a literal.
+const defaultMaxBlockBytes = 1 << 26
+
 // ocfEagerBlockAllocLimit is the largest declared compressed block size that
 // readBlock allocates in one shot (make + ReadFull, the fast common path).
-// It equals the default WithMaxBlockBytes, so a reader at the default cap
-// never leaves the eager path. A block larger than this is only reachable
-// when the caller raises WithMaxBlockBytes; those are read incrementally so an
-// attacker-declared-but-absent size cannot force an allocation up to the
-// raised cap. See readBlock.
-const ocfEagerBlockAllocLimit = 64 << 20
+// It IS the default WithMaxBlockBytes — derived from it rather than restated,
+// so the property it depends on ("a reader at the default cap never leaves the
+// eager path") cannot be broken by changing one of two spellings of the same
+// number. A block larger than this is only reachable when the caller raises
+// WithMaxBlockBytes; those are read incrementally so an attacker-declared-but-
+// absent size cannot force an allocation up to the raised cap. See readBlock.
+const ocfEagerBlockAllocLimit = defaultMaxBlockBytes
 
 // WithMaxDecompressedBlockBytes sets the maximum DECOMPRESSED size in bytes of
 // a single block that the reader will accept. The default is 64 MiB.
@@ -958,7 +967,7 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 		return nil, errors.New("ocf: WithReaderSchema and WithReaderSchemaFunc are mutually exclusive")
 	}
 	if maxBlockBytes <= 0 {
-		maxBlockBytes = 1 << 26 // 64 MiB default
+		maxBlockBytes = defaultMaxBlockBytes
 	}
 	if maxDecompressed <= 0 {
 		maxDecompressed = defaultMaxDecompressedBytes
