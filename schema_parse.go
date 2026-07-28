@@ -169,7 +169,7 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 		}
 	}
 	if v, ok := m["size"]; ok {
-		if l, err := decodeLaxInt(v); err == nil {
+		if l, err := decodeLaxInt("size", v); err == nil {
 			o.Size = &l
 		} else if strayKeyBinds(o.Type, "size") {
 			return nil, err
@@ -450,6 +450,33 @@ func stringSliceFrom(m map[string]any, key string) ([]string, bool, error) {
 	return out, true, nil
 }
 
+// jsonNullBody reports whether a decoded JSON body is the null literal.
+//
+// null is the one body shape a typed decode accepts in silence: encoding/json
+// documents that unmarshaling null into a destination other than a pointer,
+// interface or map "has no effect on the value and produces no error". So a
+// reader that decides PRESENCE by asking whether the decode failed reads a
+// present-but-unreadable attribute as an ABSENT one and keeps the
+// destination's zero value.
+//
+// That zero is not neutral here. Several Avro attributes have a legal,
+// meaningful zero — a fixed of size 0 is a distinct usable schema, and a
+// decimal of scale 0 is a distinct scale that changes what every value on
+// the wire means — so coercing a null body into one substitutes a schema
+// nobody wrote for the one that was written. Every read of a body into a
+// typed destination asks this first and treats a null as malformed, which
+// puts it on the same route as any other body of the wrong JSON type: a
+// hard reject where the kind binds the key, and a verbatim ride to props
+// where it does not.
+//
+// The keys whose bodies are read by type ASSERTION (name, namespace, doc,
+// logicalType, aliases, symbols, items, values, fields) need no such guard:
+// a JSON null decodes to a nil any, which satisfies no assertion, so those
+// reads already decline it exactly as they decline a wrong-typed body.
+func jsonNullBody(v any) bool {
+	return v == nil
+}
+
 // decodeLaxInt re-marshals a decoded JSON value and reads it back through
 // laxInt — the schema grammar's integer decode (plain integer syntax or
 // the quoted [INTEGERS] form, length-capped). This is the ONE integer
@@ -458,7 +485,14 @@ func stringSliceFrom(m map[string]any, key string) ([]string, bool, error) {
 // stray shape verdict (strayBodyShapeOK), so the surfaces cannot drift on
 // what counts as a size: a value that fails here rides to props verbatim
 // on every surface and never yields a coerced structural value.
-func decodeLaxInt(v any) (laxInt, error) {
+//
+// key names the attribute in the error, and is what makes the null verdict
+// readable: a body that names no integer is reported against the key that
+// was written, not as a decode of an anonymous value.
+func decodeLaxInt(key string, v any) (laxInt, error) {
+	if jsonNullBody(v) {
+		return 0, schemaTypeMismatch(key, "integer")
+	}
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return 0, err
@@ -470,14 +504,24 @@ func decodeLaxInt(v any) (laxInt, error) {
 	return l, nil
 }
 
-// intPtrFrom reads m[key] as a *int by re-marshaling
-// the small value and reusing stdlib int decode, so the accept/reject
-// behavior (rejecting floats, strings, overflow) is identical to the
-// former *int struct field.
+// intPtrFrom reads m[key] as a *int by re-marshaling the small value and
+// reusing stdlib int decode, so the accept/reject behavior (rejecting
+// floats, strings, overflow) is identical to the former *int struct field —
+// with one shape the re-marshal cannot inherit. Unmarshaling into that
+// struct field handled null by setting the POINTER to nil (absent); the
+// re-marshal decodes into a plain int, where null is a no-op that would
+// hand back a pointer to zero. [jsonNullBody] restores the distinction by
+// rejecting the body outright, which is stricter than the struct field was
+// and is the right verdict for both callers: precision and scale are
+// consumed only on a decimal carrier, and a decimal whose parameter names
+// no number is not a decimal.
 func intPtrFrom(m map[string]any, key string) (*int, error) {
 	v, ok := m[key]
 	if !ok {
 		return nil, nil
+	}
+	if jsonNullBody(v) {
+		return nil, schemaTypeMismatch(key, "integer")
 	}
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -580,7 +624,7 @@ func strayBodyShapeOK(key string, v any) bool {
 		}
 		return true
 	case "size":
-		_, err := decodeLaxInt(v)
+		_, err := decodeLaxInt(key, v)
 		return err == nil
 	case "items", "values":
 		var s aschema

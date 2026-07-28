@@ -2501,7 +2501,7 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	// the gates never decline there.
 	sizeOK := false
 	if v, ok := m["size"]; ok {
-		if l, err := decodeLaxInt(v); err == nil {
+		if l, err := decodeLaxInt("size", v); err == nil {
 			n.Size = int(l)
 			sizeOK = true
 		}

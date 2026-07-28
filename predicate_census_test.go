@@ -597,6 +597,51 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q18",
+		question: "Is this attribute's body PRESENT but unreadable, as opposed to ABSENT?",
+		authority: "jsonNullBody (schema_parse.go). The authority under it is encoding/json's documented null " +
+			"handling: unmarshaling the null literal into a destination that is not a pointer, interface or map " +
+			"\"has no effect on the value and produces no error\". So null is the ONE body a typed decode accepts " +
+			"in silence, and any reader that answers this question by asking whether the decode FAILED answers it " +
+			"wrong — it reports a written attribute as absent and keeps the destination's zero. That zero is a " +
+			"legal setting for several Avro attributes (a fixed of size 0, a decimal of scale 0), so the wrong " +
+			"answer substitutes a schema nobody wrote. Java asks the question by TOKEN TYPE and rejects the same " +
+			"bodies (Schema.java:1957-1960 for size; LogicalTypes.java:414-421 for the decimal parameters)",
+		answerers: []censusAnswerer{
+			{repr: "size, all three surfaces", site: "decodeLaxInt", file: "schema_parse.go"},
+			{repr: "precision/scale, type and field level", site: "intPtrFrom", file: "schema_parse.go"},
+			{
+				repr: "enum-level default", site: "the token-type check before json.Unmarshal", file: "schema.go",
+				note: "different-by-design as a SITE: the default's body is kept as raw JSON, so the question is asked of the raw TOKEN (its first byte must be a quote) rather than of a decoded any. It is registered here because it is the same question and the same hazard — its own ruling records that the pre-fix membership check let the Unmarshal zero flow through — and because it is the shape the two decoded-value answerers were brought into line with.",
+			},
+			{
+				repr: "every assertion-read key", site: "getString / jsonNumericInt / stringSliceFrom / the m[k].(T) arms", file: "schema_node.go",
+				note: "different-by-design as an ANSWER, not a site: a JSON null decodes to a nil any, which satisfies no type assertion and matches no case of a type switch, so these reads decline it exactly as they decline a wrong-typed body. They answer the question structurally and need no guard — which is why the hazard is confined to the two re-marshal-then-decode helpers. Registering them is what keeps a later refactor from turning one of them into a typed decode without noticing it has joined this question.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `jsonNullBody`, counts: map[string]int{
+				// The doc heading, the definition, one call in each of the two
+				// decode helpers, and one doc reference from intPtrFrom, whose
+				// comment records what the guard restores.
+				"schema_parse.go": 5,
+			}},
+			// Rejected tell: `== nil` — it is the most common comparison in
+			// the package and answers "is this pointer/error/interface unset"
+			// almost everywhere it appears. The question here is about a
+			// DECODED JSON BODY specifically, which is exactly what the named
+			// predicate marks.
+			//
+			// The durable guard is not a tell either:
+			// TestMatrix_ReservedKeyBodyPresence crosses every reserved key
+			// that has a typed destination with {absent, valid, null,
+			// wrong-typed, quoted} at both levels and requires the null
+			// verdict to equal the wrong-typed one on every surface. A tell
+			// watches where the rule is written; this class's failure mode is
+			// a new typed read that never asks it.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -802,9 +847,15 @@ func TestCensus_NoUnregisteredAnswerers(t *testing.T) {
 			}
 		}
 	}
-	// The registry must not silently empty out.
-	if len(censusRegistry) < 1 {
-		t.Fatal("census registry is empty")
+	// The registry must not silently shrink. Deleting a question is a
+	// decision — it means the question stopped being one, or was demoted
+	// into censusDemoted with its evidence — so it has to be made here
+	// rather than by a row quietly disappearing.
+	const registered = 16
+	if len(censusRegistry) < registered {
+		t.Fatalf("census registry has %d questions, was %d; a question was removed without "+
+			"recording why. Demote it into censusDemoted with its evidence, or lower this floor "+
+			"deliberately", len(censusRegistry), registered)
 	}
 }
 
