@@ -676,11 +676,13 @@ var censusRegistry = []censusQuestion{
 				// (one line names both, so it matches twice), the delegation
 				// line, two binary consume sites, and the RatFromBytes comment
 				// recording why that public entry keeps its own guard.
-				// ser.go 5: decimalUnscaledBytes, appendDecimalFixed,
-				// chargeOpaqueDecimalBytes, the fixed opaque arm, and
-				// buildBigDecimalPayload — every emit route to the wire.
+				// ser.go 6: decimalUnscaledBytes, appendDecimalFixed,
+				// chargeOpaqueDecimalBytes, the fixed opaque arm and
+				// buildBigDecimalPayload — every emit route to the wire —
+				// plus decimalChargeLen's doc naming the function whose input
+				// it computes.
 				"deser.go":       9,
-				"ser.go":         5,
+				"ser.go":         6,
 				"json_decode.go": 2,
 				"json_codec.go":  1,
 			}},

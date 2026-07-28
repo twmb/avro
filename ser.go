@@ -2452,25 +2452,45 @@ func chargeOpaqueDecimalBytes(v reflect.Value, avroType, logical string) error {
 	if v.Type().Elem().Kind() != reflect.Uint8 {
 		return nil
 	}
-	n := v.Len()
-	if logical == "big-decimal" {
-		// Only the leading varlong is needed, so read a bounded prefix rather
-		// than materializing the payload (which may be an unaddressable array).
-		const varlongMax = 10 // a zigzag varlong is 1-10 bytes (appendVarlong)
-		prefix := make([]byte, 0, varlongMax)
-		for i := 0; i < v.Len() && i < varlongMax; i++ {
-			prefix = append(prefix, byte(v.Index(i).Uint()))
-		}
-		uLen, _, err := readVarlong(prefix)
-		if err != nil || uLen < 0 {
-			return nil
-		}
-		n = int(min(uLen, int64(maxDecimalUnscaledBytes)+1))
+	// Read a bounded prefix rather than materializing the payload, which may
+	// be an unaddressable array: only the leading varlong is ever needed.
+	const varlongMax = 10 // a zigzag varlong is 1-10 bytes (appendVarlong)
+	prefix := make([]byte, 0, varlongMax)
+	for i := 0; i < v.Len() && i < varlongMax; i++ {
+		prefix = append(prefix, byte(v.Index(i).Uint()))
+	}
+	n, ok := decimalChargeLen(prefix, v.Len(), logical)
+	if !ok {
+		return nil
 	}
 	if err := checkDecimalUnscaledSize(n); err != nil {
 		return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
 	}
 	return nil
+}
+
+// decimalChargeLen answers the one question every decimal emit path has to ask
+// before it writes: how many bytes will the DECODER hand to
+// checkDecimalUnscaledLen for a payload this long whose leading bytes are
+// prefix. It is one function because the answer differs only by wire shape and
+// nothing else, and each caller having its own copy is how the two shapes drift.
+//
+// On "decimal" the payload IS the unscaled value. On "big-decimal" the payload
+// is a framing and the charged slice is the length-prefixed INNER value, so the
+// leading varlong is read to find it — and ok is false when that varlong cannot
+// be read, because a payload whose framing is unreadable fails on the framing,
+// which is a different rule than this bound.
+func decimalChargeLen(prefix []byte, totalLen int, logical string) (int, bool) {
+	if logical != "big-decimal" {
+		return totalLen, true
+	}
+	uLen, _, err := readVarlong(prefix)
+	if err != nil || uLen < 0 {
+		return 0, false
+	}
+	// Clamp so the int conversion cannot overflow on a 32-bit build; anything
+	// at or past the bound rejects identically.
+	return int(min(uLen, int64(maxDecimalUnscaledBytes)+1)), true
 }
 
 type serBytesDecimal struct {
