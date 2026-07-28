@@ -22687,12 +22687,28 @@ func TestRegression_DecimalDefaultVerdictDefersToEncode(t *testing.T) {
 			} {
 				t.Run(fill.name, func(t *testing.T) {
 					w, err := s.Encode(fill.value)
+					// The JSON wire reaches the same bound by a DIFFERENT
+					// mechanism — appendAvroJSON encodes the default VALUE
+					// through the ordinary emit arms, so it never consults the
+					// deferred verdict the binary splice sites read. Asserting
+					// it here rather than leaning on the round-trip matrix is
+					// the point: that matrix checks encode-implies-decode, a
+					// RELATIVE property two coordinated regressions satisfy,
+					// while this checks that this input is refused by this
+					// bound at all.
+					jw, jerr := s.EncodeJSON(fill.value)
 					if overCap {
 						if err == nil {
 							t.Fatalf("filling an unwritable default produced %d wire bytes instead of an error", len(w))
 						}
 						if !strings.Contains(err.Error(), "exceeds") {
 							t.Errorf("the error must name the bound that refused it, got: %v", err)
+						}
+						if jerr == nil {
+							t.Fatalf("the JSON wire filled the same unwritable default, producing %d bytes", len(jw))
+						}
+						if !strings.Contains(jerr.Error(), "exceeds") {
+							t.Errorf("the JSON error must name the same bound, got: %v", jerr)
 						}
 						return
 					}
@@ -22702,6 +22718,13 @@ func TestRegression_DecimalDefaultVerdictDefersToEncode(t *testing.T) {
 					var into any
 					if _, err := s.Decode(w, &into); err != nil {
 						t.Fatalf("the filled wire must decode: %v", err)
+					}
+					if jerr != nil {
+						t.Fatalf("a default at the bound must still fill on the JSON wire: %v", jerr)
+					}
+					var jinto any
+					if err := s.DecodeJSON(jw, &jinto); err != nil {
+						t.Fatalf("the filled JSON wire must decode: %v", err)
 					}
 				})
 			}
