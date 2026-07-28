@@ -551,6 +551,192 @@ func TestRegression_FieldLevelDefaultOrderStayConsumed(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// "doc" is the one reserved key that BINDS on every kind while its capture
+// silently declines a non-string body — so a non-string doc reaches neither
+// structural field nor Props, and is the single documented exception to the
+// "never neither" half of the reserved-key routing rule.
+//
+// This is exact Apache Avro (Java) behavior, and the two tests below pin both
+// directions of it so neither can drift alone:
+//
+//   - Java reads doc ONLY through parseDoc (Schema.java:1996-1998, called at
+//     :1864 for records, :1912 for enums, :1956 for fixed) and, for a field,
+//     at :1888. Both are getOptionalText (:2039-2042), which is
+//     jsonNode.textValue() — null for ANY non-text node, including an
+//     explicit JSON null.
+//   - doc is then a member of SCHEMA_RESERVED (:176) and of FIELD_RESERVED
+//     (:504), so parseProperties (:1982-1988) skips it at every call site.
+//
+// Those two facts together mean Java keeps a non-string doc nowhere, and the
+// same membership fact is what makes a non-string logicalType behave the
+// OPPOSITE way: logicalType is absent from SCHEMA_RESERVED, so Java's
+// parseProperties keeps it as an ordinary schema property. One reserved-set
+// membership test predicts both routings, which is why the two must not be
+// "made consistent" with each other.
+//
+// fastavro 1.12.2 preserves a non-string doc verbatim at both levels; the
+// references disagree and this package follows Java. Nothing observable on
+// the wire depends on it: the canonical form and the fingerprint never carry
+// doc, which each case asserts against a doc-free twin.
+// ---------------------------------------------------------------------------
+
+// docBodiesNonString spans the JSON token classes a doc can be written as
+// while not being a string. An explicit null is included because it is the
+// one shape where a lenient reader could plausibly treat the key as absent
+// rather than as present-and-unusable, and Java's textValue() maps both to
+// the same null.
+var docBodiesNonString = []string{`5`, `[]`, `null`, `{"a":1}`, `true`}
+
+func TestRegression_NonStringDocDroppedAtBothLevels(t *testing.T) {
+	for _, body := range docBodiesNonString {
+		t.Run("type-level/"+body, func(t *testing.T) {
+			s, err := avro.Parse(`{"type":"int","doc":` + body + `}`)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			n := s.Root()
+			if n.Doc != "" {
+				t.Errorf("Doc = %q, want empty: a non-text body cannot become documentation", n.Doc)
+			}
+			if _, ok := n.Props["doc"]; ok {
+				t.Errorf(`"doc" reached Props: %#v — the key is bound on every kind, so Props is not its surface`, n.Props)
+			}
+			rb, err := (&n).Schema()
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+			if strings.Contains(rb.String(), `"doc"`) {
+				t.Errorf("the rebuild emitted a doc that never landed: %s", rb)
+			}
+			twin := avro.MustParse(`{"type":"int"}`)
+			if !bytes.Equal(s.Canonical(), twin.Canonical()) {
+				t.Errorf("canonical form differs from the doc-free twin: %s vs %s", s.Canonical(), twin.Canonical())
+			}
+			if !bytes.Equal(s.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin())) {
+				t.Errorf("fingerprint differs from the doc-free twin: %x vs %x",
+					s.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()))
+			}
+		})
+
+		t.Run("field-level/"+body, func(t *testing.T) {
+			s, err := avro.Parse(`{"type":"record","name":"R","fields":[
+				{"name":"f","type":"int","doc":` + body + `}]}`)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			f := s.Root().Fields[0]
+			if f.Doc != "" {
+				t.Errorf("SchemaField.Doc = %q, want empty", f.Doc)
+			}
+			if _, ok := f.Props["doc"]; ok {
+				t.Errorf(`"doc" reached SchemaField.Props: %#v — FIELD_RESERVED binds it, so Props is not its surface`, f.Props)
+			}
+			hostRoot := s.Root()
+			rb, err := hostRoot.Schema()
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+			if strings.Contains(rb.String(), `"doc"`) {
+				t.Errorf("the rebuild emitted a field doc that never landed: %s", rb)
+			}
+			twin := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}]}`)
+			if !bytes.Equal(s.Canonical(), twin.Canonical()) {
+				t.Errorf("canonical form differs from the doc-free twin: %s vs %s", s.Canonical(), twin.Canonical())
+			}
+		})
+	}
+}
+
+// TestRegression_StringDocConsumedAndSurfaced is the other direction, and the
+// control that keeps the drop above from being "fixed" by never reading doc at
+// all: with a string body the key is consumed into the structural field on
+// every level and kind that has one, stays out of Props, and survives the
+// metadata rebuild.
+//
+// The body is deliberately non-empty. SchemaNode.Doc has no present/absent
+// companion, so an EMPTY doc string is indistinguishable from an absent one
+// on the structural field — a separate question about the zero value of a
+// string field, not about the token type this pair of tests fixes.
+func TestRegression_StringDocConsumedAndSurfaced(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		// doc reads the documentation off the surface that should hold it.
+		doc func(avro.SchemaNode) string
+	}{
+		{
+			name: "primitive-type-object",
+			src:  `{"type":"int","doc":"d"}`,
+			doc:  func(n avro.SchemaNode) string { return n.Doc },
+		},
+		{
+			name: "record",
+			src:  `{"type":"record","name":"R","doc":"d","fields":[]}`,
+			doc:  func(n avro.SchemaNode) string { return n.Doc },
+		},
+		{
+			name: "enum",
+			src:  `{"type":"enum","name":"E","doc":"d","symbols":["A"]}`,
+			doc:  func(n avro.SchemaNode) string { return n.Doc },
+		},
+		{
+			name: "fixed",
+			src:  `{"type":"fixed","name":"F","doc":"d","size":2}`,
+			doc:  func(n avro.SchemaNode) string { return n.Doc },
+		},
+		{
+			name: "array",
+			src:  `{"type":"array","items":"int","doc":"d"}`,
+			doc:  func(n avro.SchemaNode) string { return n.Doc },
+		},
+		{
+			name: "map",
+			src:  `{"type":"map","values":"int","doc":"d"}`,
+			doc:  func(n avro.SchemaNode) string { return n.Doc },
+		},
+		{
+			name: "record-field",
+			src:  `{"type":"record","name":"R","fields":[{"name":"f","type":"int","doc":"d"}]}`,
+			doc:  func(n avro.SchemaNode) string { return n.Fields[0].Doc },
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := avro.Parse(c.src)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			root := s.Root()
+			if got := c.doc(root); got != "d" {
+				t.Errorf("doc = %q, want %q — a string body must be consumed into the structural field", got, "d")
+			}
+			if _, ok := root.Props["doc"]; ok {
+				t.Errorf(`a consumed "doc" also reached Props: %#v`, root.Props)
+			}
+			if !strings.Contains(s.String(), `"doc"`) {
+				t.Errorf("String() dropped the doc: %s", s)
+			}
+			rb, err := root.Schema()
+			if err != nil {
+				t.Fatalf("rebuild: %v", err)
+			}
+			if !strings.Contains(rb.String(), `"doc":"d"`) {
+				t.Errorf("the rebuild dropped the consumed doc: %s", rb)
+			}
+			// Re-parsing the rebuild must reach the same surface, or the
+			// emitter and the reader disagree about where doc lives.
+			back, err := avro.Parse(rb.String())
+			if err != nil {
+				t.Fatalf("re-parse of the rebuild: %v", err)
+			}
+			if got := c.doc(back.Root()); got != "d" {
+				t.Errorf("doc did not round-trip through the rebuild: %q", got)
+			}
+		})
+	}
+}
+
 // TestDifferentialFastavroTypeLevelBindingRouting executes every accepted cell
 // against fastavro and asserts the PRESERVATION claim rather than mere
 // acceptance: fastavro 1.12.2 keeps both keys on the parsed schema of every

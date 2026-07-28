@@ -2536,6 +2536,23 @@ func TestCensus_Q7_CorpusIsNotVacuous(t *testing.T) {
 // strayKeyBinds is the binding predicate and schemaReservedKeyForObject the
 // routing one; both are callable, so the driver checks them against the
 // parse's observable rather than against each other.
+//
+// The biconditional decomposes into three implications, and only two of them
+// are universal:
+//
+//   - consumed => NOT in Props            (universal)
+//   - structural field set => consumed    (universal)
+//   - consumed => structural field set    (one documented exception)
+//
+// The exception is NOT_BUGS #72: "doc" is bound on every kind, but its
+// capture is a silently-declining string read, so a NON-STRING doc is
+// consumed and yet lands nowhere — neither surface. That is exact Apache
+// Avro behavior (parseDoc reads through getOptionalText, which is
+// jsonNode.textValue() and null for a non-text node, Schema.java:1996-1998
+// and :2039-2042; "doc" is then in SCHEMA_RESERVED :176 and FIELD_RESERVED
+// :504, so parseProperties skips it). It is spelled here as a cell OUTCOME
+// rather than left to fall through the corpus counters, so the exception is
+// counted, cannot widen unnoticed, and cannot close itself silently.
 type reservedKeyCell struct {
 	name string
 	kind string // the type object's kind
@@ -2546,6 +2563,13 @@ type reservedKeyCell struct {
 	structural bool // does the structural field end up populated?
 	inProps    bool // does the key survive in Props verbatim?
 	rejects    bool // or does the schema fail to parse outright?
+	// dropped marks the documented exception to "consumed => structural
+	// field set": the key is bound, so it stays out of Props, but the
+	// binding read declines this body, so no structural field is set
+	// either. See NOT_BUGS #72; it is one key ("doc") with a non-string
+	// body, and every other reserved key with a non-conforming body either
+	// routes to Props or rejects.
+	dropped bool
 	// reportedFinding, when set, records that the REBUILD loses this key
 	// today, contrary to the documented posture. The cell asserts the loss
 	// still happens, so fixing it reds here and forces this registry to be
@@ -2630,6 +2654,20 @@ func reservedKeyCorpus() []reservedKeyCell {
 		{name: "enum-default-variant", kind: "enum", key: "Default", body: `"Z"`,
 			binds: false, inProps: true},
 
+		// "doc" is bound on EVERY kind, which is what makes it the one place
+		// the third implication can fail. With a string body it behaves like
+		// any other consumed key; with a non-string body the read declines
+		// and the value lands nowhere (NOT_BUGS #72). The variant cell is
+		// #46's control: a case-variant binds nothing, so it is an ordinary
+		// prop whatever its body, and the drop cannot be reproduced by
+		// spelling.
+		{name: "int-doc-string", kind: "int", key: "doc", body: `"d"`,
+			binds: true, structural: true},
+		{name: "int-doc-nonstring", kind: "int", key: "doc", body: `5`,
+			binds: true, dropped: true},
+		{name: "int-doc-variant", kind: "int", key: "Doc", body: `5`,
+			binds: false, inProps: true},
+
 		// A key that is not reserved at all, as the baseline both sides of
 		// the rule must agree on.
 		{name: "int-plain-custom-key", kind: "int", key: "customThing", body: `7`,
@@ -2671,6 +2709,8 @@ func structuralFieldFor(n *SchemaNode, key string) bool {
 		return len(n.Aliases) > 0
 	case "default", "Default":
 		return n.HasEnumDefault
+	case "doc", "Doc":
+		return n.Doc != ""
 	case "order", "Order":
 		// No type-level kind binds "order", so there is no SchemaNode
 		// field for it to reach — which is exactly why Props must be its
@@ -2714,10 +2754,21 @@ func TestCensus_Q4_ReservedKeyRoutingIsOneRuleAcrossSurfaces(t *testing.T) {
 			if gotProps != cell.inProps {
 				t.Errorf("key in Props = %v, want %v (schema %s, props %v)", gotProps, cell.inProps, src, root.Props)
 			}
-			// The biconditional itself: exactly one surface, never both and
-			// never neither, for a key that reaches the node at all.
+			// The biconditional itself. "Never both" is universal. "Never
+			// neither" holds for every cell except the documented
+			// drop (NOT_BUGS #72), which is why the exception is an
+			// expectation the cell states rather than a silence.
 			if gotStructural && gotProps {
 				t.Errorf("key %q surfaced BOTH structurally and in Props — the routing is meant to pick exactly one", cell.key)
+			}
+			if cell.dropped {
+				if gotStructural || gotProps {
+					t.Errorf("key %q reached a surface; the documented exception (NOT_BUGS #72) says a bound key whose read declines this body lands nowhere. If the drop is gone, delete `dropped` and state the new routing",
+						cell.key)
+				}
+			} else if !gotStructural && !gotProps {
+				t.Errorf("key %q reached NEITHER surface and is not the documented exception — either the routing lost it, or a new exception needs a ruling and a `dropped` cell",
+					cell.key)
 			}
 
 			// The rebuild must reach the same routing, or one representation
@@ -2748,7 +2799,8 @@ func TestCensus_Q4_ReservedKeyRoutingIsOneRuleAcrossSurfaces(t *testing.T) {
 // The corpus must exercise every axis the rulings distinguish, or a
 // case-folding or shape-blind implementation would pass.
 func TestCensus_Q4_CorpusIsNotVacuous(t *testing.T) {
-	var binding, nonBinding, variant, malformed, consumed, propped, rejected int
+	var binding, nonBinding, variant, malformed int
+	var consumed, propped, rejected, dropped, unclassified int
 	for _, c := range reservedKeyCorpus() {
 		if c.binds {
 			binding++
@@ -2764,10 +2816,14 @@ func TestCensus_Q4_CorpusIsNotVacuous(t *testing.T) {
 		switch {
 		case c.rejects:
 			rejected++
+		case c.dropped:
+			dropped++
 		case c.structural:
 			consumed++
 		case c.inProps:
 			propped++
+		default:
+			unclassified++
 		}
 	}
 	if binding < 3 || nonBinding < 6 || variant < 4 || malformed < 3 {
@@ -2776,6 +2832,18 @@ func TestCensus_Q4_CorpusIsNotVacuous(t *testing.T) {
 	}
 	if consumed < 3 || propped < 4 || rejected < 2 {
 		t.Fatalf("corpus misses an outcome: consumed=%d propped=%d rejected=%d", consumed, propped, rejected)
+	}
+	// The documented exception must stay exercised, and must stay an
+	// exception: a corpus with no drop cell would let the "never neither"
+	// assertion pass vacuously, and one where drops outnumbered the ordinary
+	// outcomes would mean the rule had quietly become the other way round.
+	if dropped != 1 {
+		t.Fatalf("the drop exception is meant to be exactly one cell (NOT_BUGS #72), got %d — a new one needs its own ruling", dropped)
+	}
+	// A cell that declares no outcome at all is a corpus bug: it would run
+	// every assertion against zero expectations and report agreement.
+	if unclassified != 0 {
+		t.Fatalf("%d corpus cells declare no outcome — each must state rejects, dropped, structural or inProps", unclassified)
 	}
 }
 
