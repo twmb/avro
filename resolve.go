@@ -804,8 +804,34 @@ func extractDefaultBytes(val any, typeLabel string) ([]byte, error) {
 	return nil, fmt.Errorf("expected []byte or string for %s default, got %T", typeLabel, val)
 }
 
+// defaultChargeSink collects producer-compliance verdicts raised while a field
+// default is pre-encoded, WITHOUT failing the walk.
+//
+// The two must stay separate. A default that cannot be WRITTEN is still a
+// schema that must PARSE — a reader dropping the field never writes it — and
+// the same walk is used by the union try-each, where an error means "this
+// branch does not accept the value" and a compliance verdict would silently
+// select a different branch. So the verdict rides out here and is surfaced by
+// the encode-side consumers of the pre-encoded bytes.
+type defaultChargeSink struct{ err error }
+
+func (s *defaultChargeSink) record(err error) {
+	if s != nil && err != nil && s.err == nil {
+		s.err = err
+	}
+}
+
 func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
-	return encodeDefaultDepth(dst, val, node, 0)
+	return encodeDefaultDepth(dst, val, node, 0, nil)
+}
+
+// encodeDefaultCharged is encodeDefault for the one caller that installs the
+// result as a field's pre-encoded default: it additionally reports the
+// producer-compliance verdict for the payload it just built.
+func encodeDefaultCharged(val any, node *schemaNode) ([]byte, error, error) {
+	var sink defaultChargeSink
+	b, err := encodeDefaultDepth(nil, val, node, 0, &sink)
+	return b, sink.err, err
 }
 
 // encodeDefaultDepth bounds the recursion encodeDefault performs while filling
@@ -818,7 +844,7 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 // errTooDeep parse error. A legitimately finite default nests far below the
 // bound (each level resolves a concrete value), so this never false-rejects a
 // real default.
-func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int) ([]byte, error) {
+func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *defaultChargeSink) ([]byte, error) {
 	if depth >= maxDepth {
 		return nil, errTooDeep
 	}
@@ -875,6 +901,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int) ([]byt
 		if err != nil {
 			return nil, err
 		}
+		sink.record(chargeDecimalLeaf(b, node.logical))
 		dst = appendVarlong(dst, int64(len(b)))
 		return append(dst, b...), nil
 	case "enum":
@@ -896,6 +923,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int) ([]byt
 		if len(b) != node.size {
 			return nil, fmt.Errorf("fixed default length %d != size %d", len(b), node.size)
 		}
+		sink.record(chargeDecimalLeaf(b, node.logical))
 		return append(dst, b...), nil
 	case "array":
 		// null is not an array. Rejecting it here keeps the union try-
@@ -911,12 +939,17 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int) ([]byt
 			return appendVarlong(dst, 0), nil
 		}
 		dst = appendVarlong(dst, int64(len(arr)))
+		bodyStart := len(dst)
 		for _, item := range arr {
-			dst, err = encodeDefaultDepth(dst, item, node.items, depth+1)
+			dst, err = encodeDefaultDepth(dst, item, node.items, depth+1, sink)
 			if err != nil {
 				return nil, err
 			}
 		}
+		// Ask the array encoders' own shared compliance helper, whose doc
+		// requires exactly this: every array encoder routes through it, or the
+		// paths drift. The default walk is one, and was the third to be missed.
+		sink.record(arrayZeroByteEncodeCompliance(len(dst) == bodyStart, len(arr)))
 		return append(dst, 0), nil
 	case "map":
 		m, err := defaultObjectShape(val, "map")
@@ -930,7 +963,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int) ([]byt
 		for k, v := range m {
 			dst = appendVarlong(dst, int64(len(k)))
 			dst = append(dst, k...)
-			dst, err = encodeDefaultDepth(dst, v, node.values, depth+1)
+			dst, err = encodeDefaultDepth(dst, v, node.values, depth+1, sink)
 			if err != nil {
 				return nil, err
 			}
@@ -949,7 +982,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int) ([]byt
 				}
 				fval = f.defaultVal
 			}
-			dst, err = encodeDefaultDepth(dst, fval, f.node, depth+1)
+			dst, err = encodeDefaultDepth(dst, fval, f.node, depth+1, sink)
 			if err != nil {
 				return nil, err
 			}
@@ -981,7 +1014,7 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int) ([]byt
 		base := len(dst)
 		for i, branch := range node.branches {
 			attempt := appendVarlong(dst[:base], int64(i))
-			if encoded, err := encodeDefaultDepth(attempt, val, branch, depth+1); err == nil {
+			if encoded, err := encodeDefaultDepth(attempt, val, branch, depth+1, nil); err == nil {
 				return encoded, nil
 			}
 		}

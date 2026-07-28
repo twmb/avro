@@ -2518,40 +2518,16 @@ func decimalChargeLen(prefix []byte, totalLen int, logical string) (int, bool) {
 	return int(min(uLen, int64(maxDecimalUnscaledBytes)+1)), true
 }
 
-// decimalDefaultPayload returns the slice of a pre-encoded field default that
-// the DECODER will charge against the unscaled bound, and whether the question
-// applies at all. The framing differs by carrier: encodeDefault writes a bytes
-// default as a length prefix followed by the payload, while a fixed default IS
-// the payload. Anything else carries no decimal.
-func decimalDefaultPayload(defaultBytes []byte, kind string) ([]byte, bool) {
-	switch kind {
-	case "fixed":
-		return defaultBytes, true
-	case "bytes":
-		n, rest, err := readVarlong(defaultBytes)
-		if err != nil || n < 0 || n > int64(len(rest)) {
-			return nil, false
-		}
-		return rest[:n], true
-	}
-	return nil, false
-}
-
-// chargeDecimalDefault reports the verdict a field default must carry from
-// parse to encode: whether writing it would put a decimal payload on the wire
-// that this package's own decoder refuses.
+// chargeDecimalLeaf is the producer-compliance charge for a decimal payload
+// emitted by the DEFAULT walk. It is called at the LEAF — the bytes/fixed arm
+// that actually writes the payload — because that is the only place the
+// carrier's own kind and logical are in hand; asking at the field's node
+// answers for a container whenever the decimal is nested inside one.
 //
-// The default pipeline is the one emit path where the caller never chose a
-// carrier — a bytes/fixed default is []byte by construction — and the one that
-// runs at PARSE, which is why the answer is recorded rather than returned. It
-// asks the same function every other emit path asks, so it refuses exactly the
-// payloads decode refuses.
-func chargeDecimalDefault(defaultBytes []byte, kind, logical string) error {
+// It asks the same authority the serializers ask, through the same two
+// functions, so it refuses exactly the payloads decode refuses.
+func chargeDecimalLeaf(payload []byte, logical string) error {
 	if logical != "decimal" && logical != "big-decimal" {
-		return nil
-	}
-	payload, ok := decimalDefaultPayload(defaultBytes, kind)
-	if !ok {
 		return nil
 	}
 	n, ok := decimalChargeLen(payload, len(payload), logical)

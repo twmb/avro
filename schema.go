@@ -3760,7 +3760,7 @@ func resolveFieldDefaultValue(defaultVal any, node *schemaNode, fieldName string
 // VALUE first (encodeDefault reads sibling/nested f.defaultVal for absent
 // fields).
 func encodeFieldDefaultBytes(defaultVal any, node *schemaNode, fieldName string, srf *serRecordField) error {
-	defaultBytes, err := encodeDefault(nil, defaultVal, node)
+	defaultBytes, deferred, err := encodeDefaultCharged(defaultVal, node)
 	if err != nil {
 		return fmt.Errorf("record field %q: encoding default: %v", truncForError(fieldName), err)
 	}
@@ -3770,7 +3770,10 @@ func encodeFieldDefaultBytes(defaultVal any, node *schemaNode, fieldName string,
 	// the schema PARSING, because a reader that drops this field never writes
 	// it and reads such data correctly today. The encode-side consumers of
 	// defaultBytes surface this at the moment the default would reach the wire.
-	srf.defaultErr = chargeDecimalDefault(defaultBytes, node.kind, node.logical)
+	// The verdict comes from INSIDE the walk, where each leaf asked the same
+	// predicate its serializer asks — asking here instead would answer for the
+	// field's kind and miss every cap nested inside a container.
+	srf.defaultErr = deferred
 	return nil
 }
 
