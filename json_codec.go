@@ -551,6 +551,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				if err := rejectNonNumericStructuredString(v, "bytes", "decimal"); err != nil {
 					return nil, err
 				}
+				if err := chargeOpaqueDecimalBytes(v, "bytes", "decimal"); err != nil {
+					return nil, err
+				}
 			}
 		case "big-decimal":
 			if noCustomEnc {
@@ -572,6 +575,9 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				// valid framing would otherwise decode to a different value.
 				// []byte keeps the opaque fall-through.
 				if err := rejectNonNumericStructuredString(v, "bytes", "big-decimal"); err != nil {
+					return nil, err
+				}
+				if err := chargeOpaqueDecimalBytes(v, "bytes", "big-decimal"); err != nil {
 					return nil, err
 				}
 			}
@@ -650,6 +656,12 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				// fall-through.
 				if err := rejectNonNumericStructuredString(v, "fixed", "decimal"); err != nil {
 					return nil, err
+				}
+				// The opaque arm below writes exactly node.size bytes, which is
+				// what the decoder charges — the same condition
+				// appendDecimalFixed applies to the numeric arm above.
+				if err := checkDecimalUnscaledSize(node.size); err != nil {
+					return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: err}
 				}
 			case "duration":
 				// Duration.Bytes() always emits 12 bytes, so it is only correct

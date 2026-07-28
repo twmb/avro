@@ -642,6 +642,61 @@ var censusRegistry = []censusQuestion{
 		},
 	},
 	{
+		id:       "Q19",
+		question: "How many bytes will the DECODER charge against the decimal unscaled-value bound, and does this emit path stay inside it?",
+		authority: "checkDecimalUnscaledLen (deser.go) owns the bound, and checkDecimalUnscaledSize is the same " +
+			"function for a caller that knows the width before it has the bytes. Asking ONE function on both " +
+			"sides is what makes over-rejection impossible by construction: encode refuses exactly the payloads " +
+			"decode refuses, so a wire this package produces is a wire it can read. The bound itself is " +
+			"twmb-specific DoS defense (Java/fastavro/avro-rs store significand+scale and never base-convert), " +
+			"which is precisely why no reference can be consulted about the emit side — the standing rule that " +
+			"every reader-side cap needs a producer-side compliance check is the authority there. " +
+			"What is genuinely answered more than once is WHICH BYTES, because the three wire shapes differ: on " +
+			"a bytes/decimal the payload IS the unscaled value, on a fixed/decimal it is the schema SIZE after " +
+			"padding, and on a big-decimal it is the length-prefixed INNER slice",
+		answerers: []censusAnswerer{
+			{repr: "bytes/fixed decimal, both wires, consume", site: "setDecimalValue", file: "deser.go"},
+			{repr: "big-decimal inner unscaled, both wires, consume", site: "parseBigDecimalPayload", file: "deser.go"},
+			{repr: "JSON codepoint payload, consume", site: "assignBytes + the into-any arm", file: "json_decode.go"},
+			{repr: "numeric carrier -> bytes/decimal, both wires, emit", site: "decimalUnscaledBytes", file: "ser.go"},
+			{repr: "numeric carrier -> fixed/decimal, both wires, emit", site: "appendDecimalFixed (charges SIZE, the padded width)", file: "ser.go"},
+			{repr: "numeric carrier -> big-decimal, both wires, emit", site: "buildBigDecimalPayload (charges the INNER unscaled)", file: "ser.go"},
+			{
+				repr: "opaque []byte escape, both logicals, emit", site: "chargeOpaqueDecimalBytes", file: "ser.go",
+				note: "the arm that reaches the wire without any of the shared builders. It delegates the bound but must decide WHICH BYTES itself, because the caller-supplied payload is the framing on a big-decimal and the unscaled value on a decimal. A framing it cannot read is left alone deliberately: the decoder then fails on the framing, which is a different question than this bound.",
+			},
+			{
+				repr: "opaque escape -> fixed, binary and JSON, emit", site: "the size charge in serFixedDecimal.ser and the JSON fixed decimal arm", file: "ser.go + json_codec.go",
+				note: "not a separate rule: the fixed opaque arm writes exactly the schema size, the same quantity appendDecimalFixed charges for the numeric arm. It is a separate SITE only because the opaque path never reaches that builder, and neutering either one alone reds its own cells.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `checkDecimalUnscaled`, counts: map[string]int{
+				// deser.go 9 over 8 lines: the doc heading, both definitions
+				// (one line names both, so it matches twice), the delegation
+				// line, two binary consume sites, and the RatFromBytes comment
+				// recording why that public entry keeps its own guard.
+				// ser.go 5: decimalUnscaledBytes, appendDecimalFixed,
+				// chargeOpaqueDecimalBytes, the fixed opaque arm, and
+				// buildBigDecimalPayload — every emit route to the wire.
+				"deser.go":       9,
+				"ser.go":         5,
+				"json_decode.go": 2,
+				"json_codec.go":  1,
+			}},
+			// Rejected tell: `maxDecimalUnscaledBytes` — it names the CONSTANT,
+			// not the question. A new emit path that hard-codes 32<<10 instead
+			// of asking would keep this count unchanged while being exactly the
+			// drift the question exists to catch; the predicate name is what
+			// distinguishes delegating from restating.
+			//
+			// The durable guard is TestMatrix_SelfReadableAtScale's
+			// decimal-unscaled-length axis, which crosses carrier x logical x
+			// container x wire x length and asserts the encode-implies-decode
+			// invariant rather than any count.
+		},
+	},
+	{
 		id:       "Q11",
 		question: "What IDENTITY does a failure carry — is it errors.As-able to *SemanticError, and what Field path does it report?",
 		authority: "no external authority: the contract is doc.go's \"# Errors\" section, and the invariant the " +
@@ -663,8 +718,13 @@ var censusRegistry = []censusQuestion{
 		},
 		tells: []censusTell{
 			{pattern: `&SemanticError{`, counts: map[string]int{
-				"ser.go":         32,
-				"json_codec.go":  10,
+				// ser.go and json_codec.go carry the decimal unscaled-length
+				// producer charges (Q19): the three shared builders and the
+				// fixed opaque arm on the binary side, the fixed opaque arm on
+				// the JSON side. They name the same identity as every other
+				// encode-side user-value reject.
+				"ser.go":         36,
+				"json_codec.go":  11,
 				"deser.go":       30,
 				"json_decode.go": 5,
 				"unsafe.go":      11,

@@ -774,9 +774,23 @@ const maxDecimalUnscaledBytes = 32 << 10
 // the big.Int materialization / base conversion it would otherwise drive (see
 // maxDecimalUnscaledBytes). Shared by the bytes-, fixed-, and big-decimal
 // decode paths on both wire formats so the bound cannot drift between them.
+//
+// It is also the ENCODE-side gate, and that is what makes the bound a property
+// of the format rather than of the reader: every decimal emit path charges the
+// bytes this function will be handed on the way back in, through this same
+// function, before they reach the wire. Asking one function on both sides is
+// what makes over-rejection impossible — encode rejects EXACTLY the payloads
+// decode rejects, so a wire this package produces is a wire it can read.
 func checkDecimalUnscaledLen(b []byte) error {
-	if len(b) > maxDecimalUnscaledBytes {
-		return fmt.Errorf("decimal unscaled value of %d bytes exceeds %d byte limit", len(b), maxDecimalUnscaledBytes)
+	return checkDecimalUnscaledSize(len(b))
+}
+
+// checkDecimalUnscaledSize is checkDecimalUnscaledLen for a caller that knows
+// the length before it has the bytes — a fixed carrier, whose padded width is
+// the schema's size and is therefore decidable without building the payload.
+func checkDecimalUnscaledSize(n int) error {
+	if n > maxDecimalUnscaledBytes {
+		return fmt.Errorf("decimal unscaled value of %d bytes exceeds %d byte limit", n, maxDecimalUnscaledBytes)
 	}
 	return nil
 }

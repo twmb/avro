@@ -2366,7 +2366,16 @@ func decimalUnscaledBytes(r *big.Rat, scale, precision int, avroType string, goT
 	if err := checkDecimalPrecision(unscaled, precision); err != nil {
 		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
 	}
-	return bigIntToBytes(unscaled), nil
+	b := bigIntToBytes(unscaled)
+	// Charge the emitted payload against the bound the DECODER will apply to
+	// these same bytes. Declared precision already keeps a parse-valid decimal
+	// well inside it, so this arm cannot fire today; it is here because the
+	// bound belongs to the format, not to whichever gate happens to imply it
+	// — a later precision change must not silently reopen an unreadable emit.
+	if err := checkDecimalUnscaledLen(b); err != nil {
+		return nil, &SemanticError{GoType: goType, AvroType: avroType, Err: err}
+	}
+	return b, nil
 }
 
 // appendDecimalFixed pads/sign-extends b into exactly size bytes and
@@ -2378,6 +2387,12 @@ func appendDecimalFixed(dst, b []byte, size int, goType reflect.Type) ([]byte, e
 	if len(b) > size {
 		return nil, &SemanticError{GoType: goType, AvroType: "fixed",
 			Err: fmt.Errorf("decimal value requires %d bytes, exceeds fixed size %d", len(b), size)}
+	}
+	// The padding below widens the payload to the schema's size, and SIZE is
+	// what the decoder charges — not len(b). A fixed wider than the bound can
+	// therefore never carry a readable decimal, whatever the value.
+	if err := checkDecimalUnscaledSize(size); err != nil {
+		return nil, &SemanticError{GoType: goType, AvroType: "fixed", Err: err}
 	}
 	pad := byte(0)
 	if len(b) > 0 && b[0]&0x80 != 0 {
@@ -2418,6 +2433,46 @@ func rejectNonNumericStructuredString(v reflect.Value, avroType, logical string)
 	return nil
 }
 
+// chargeOpaqueDecimalBytes charges the opaque []byte escape hatch — the carrier
+// for a caller who assembles the payload themselves — against the bound the
+// DECODER applies to those same bytes. The numeric carriers are charged inside
+// the shared builders (decimalUnscaledBytes / appendDecimalFixed /
+// buildBigDecimalPayload); this is the arm that reaches the wire without them.
+//
+// logical decides WHICH bytes the decoder will charge, because the two wire
+// shapes differ: for "decimal" the payload IS the unscaled value, while for
+// "big-decimal" the payload is a framing whose length-prefixed INNER unscaled
+// value is what parseBigDecimalPayload charges. A framing this cannot read is
+// left alone deliberately — the decoder then fails on the framing itself, and
+// judging framing here would be a different rule than this bound.
+func chargeOpaqueDecimalBytes(v reflect.Value, avroType, logical string) error {
+	if k := v.Kind(); k != reflect.Slice && k != reflect.Array {
+		return nil // not a byte carrier; the base serializer names its own error
+	}
+	if v.Type().Elem().Kind() != reflect.Uint8 {
+		return nil
+	}
+	n := v.Len()
+	if logical == "big-decimal" {
+		// Only the leading varlong is needed, so read a bounded prefix rather
+		// than materializing the payload (which may be an unaddressable array).
+		const varlongMax = 10 // a zigzag varlong is 1-10 bytes (appendVarlong)
+		prefix := make([]byte, 0, varlongMax)
+		for i := 0; i < v.Len() && i < varlongMax; i++ {
+			prefix = append(prefix, byte(v.Index(i).Uint()))
+		}
+		uLen, _, err := readVarlong(prefix)
+		if err != nil || uLen < 0 {
+			return nil
+		}
+		n = int(min(uLen, int64(maxDecimalUnscaledBytes)+1))
+	}
+	if err := checkDecimalUnscaledSize(n); err != nil {
+		return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
+	}
+	return nil
+}
+
 type serBytesDecimal struct {
 	precision int
 	scale     int
@@ -2441,6 +2496,9 @@ func (s *serBytesDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 		return s.serRat(dst, r)
 	}
 	if err := rejectNonNumericStructuredString(v, "bytes", "decimal"); err != nil {
+		return nil, err
+	}
+	if err := chargeOpaqueDecimalBytes(v, "bytes", "decimal"); err != nil {
 		return nil, err
 	}
 	return serBytes(dst, v, depth)
@@ -2471,6 +2529,12 @@ func (s *serFixedDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, e
 	if err := rejectNonNumericStructuredString(v, "fixed", "decimal"); err != nil {
 		return nil, err
 	}
+	// The opaque arm writes exactly s.size bytes, which is what the decoder
+	// charges — the same condition appendDecimalFixed applies to the numeric
+	// arm, so the two carriers agree on which schemas can emit at all.
+	if err := checkDecimalUnscaledSize(s.size); err != nil {
+		return nil, &SemanticError{GoType: v.Type(), AvroType: "fixed", Err: err}
+	}
 	return (&serSize{s.size}).ser(dst, v, depth)
 }
 
@@ -2492,6 +2556,9 @@ func (s *serBigDecimal) ser(dst []byte, v reflect.Value, depth int) ([]byte, err
 	// whose bytes ARE a valid framing would decode to a different value —
 	// mirrors serBytesDecimal / serFixedDecimal.
 	if err := rejectNonNumericStructuredString(v, "bytes", "big-decimal"); err != nil {
+		return nil, err
+	}
+	if err := chargeOpaqueDecimalBytes(v, "bytes", "big-decimal"); err != nil {
 		return nil, err
 	}
 	// Fall back to plain bytes for a []byte carrier: preserves opaque-bytes
@@ -2523,6 +2590,13 @@ func buildBigDecimalPayload(r *big.Rat) ([]byte, error) {
 	// Remainder is provably 0 since finiteScale chose s to make
 	// 10^s / Denom an integer.
 	uBytes := bigIntToBytes(unscaled)
+	// big-decimal carries no precision attribute, so nothing upstream bounds
+	// the magnitude: this is the one numeric-carrier arm where an ordinary
+	// *big.Rat reaches the wire unbounded. Charge the INNER unscaled bytes —
+	// the exact slice parseBigDecimalPayload hands to the same function.
+	if err := checkDecimalUnscaledLen(uBytes); err != nil {
+		return nil, err
+	}
 	// Inner payload: zigzag-len(uBytes) || uBytes || zigzag(scale).
 	inner := appendVarlong(nil, int64(len(uBytes)))
 	inner = append(inner, uBytes...)

@@ -22511,3 +22511,125 @@ func TestRegression_DecimalUnscaledLengthDoS(t *testing.T) {
 		}
 	})
 }
+
+// The decimal unscaled-length bound is enforced on BOTH sides of the wire, and
+// the encode side rejects EXACTLY the payloads the decode side rejects.
+//
+// That equality is what makes the producer check safe to add: it cannot refuse
+// a value any reader would have accepted, because both sides ask the same
+// function (checkDecimalUnscaledLen) about the same bytes. The three routes to
+// the wire reach it differently and so are all driven here — a numeric carrier
+// on "decimal" is held short of the bound by its declared precision, a numeric
+// carrier on "big-decimal" has no precision to be held by, and the opaque
+// []byte escape has neither. A fixed carrier is a fourth route: it pads to the
+// schema's SIZE whatever the value, so size alone decides the emitted width.
+func TestRegression_DecimalUnscaledLengthProducerCompliance(t *testing.T) {
+	const cap = 32 << 10 // must match maxDecimalUnscaledBytes (deser.go)
+
+	raw := func(n int) []byte { return bytes.Repeat([]byte{0x01}, n) }
+	// bigDecFraming wraps n unscaled bytes in the big-decimal inner framing, so
+	// the payload reaches the LENGTH check instead of dying on the grammar.
+	bigDecFraming := func(n int) []byte {
+		out := zigzagEncode64(int64(n))
+		out = append(out, raw(n)...)
+		return append(out, zigzagEncode64(0)...)
+	}
+	// ratOfLen: 2^(8n-9) has bit length 8n-8, so its minimal two's-complement
+	// form fills n-1 magnitude bytes plus a sign byte = exactly n.
+	ratOfLen := func(n int) *big.Rat {
+		return new(big.Rat).SetInt(new(big.Int).Lsh(big.NewInt(1), uint(8*n-9)))
+	}
+
+	bytesDec := `{"type":"bytes","logicalType":"decimal","precision":65536,"scale":0}`
+	bigDec := `{"type":"bytes","logicalType":"big-decimal"}`
+
+	for _, n := range []int{cap - 1, cap, cap + 1} {
+		overCap := n > cap
+		fixedDec := fmt.Sprintf(`{"type":"fixed","name":"F","size":%d,"logicalType":"decimal","precision":65536,"scale":0}`, n)
+		for _, c := range []struct {
+			name   string
+			schema string
+			value  any
+			// reachesBound is false where an upstream gate (declared precision)
+			// rejects before the length is ever consulted; those cells assert
+			// only that nothing unreadable escapes, not which error fired.
+			reachesBound bool
+		}{
+			{"bytes/decimal/opaque", bytesDec, raw(n), true},
+			{"bytes/big-decimal/rat", bigDec, ratOfLen(n), true},
+			{"bytes/big-decimal/opaque", bigDec, bigDecFraming(n), true},
+			{"fixed/decimal/rat", fixedDec, big.NewRat(5, 1), true},
+			{"fixed/decimal/opaque", fixedDec, raw(n), true},
+			{"fixed/decimal/text", fixedDec, "5", true},
+			{"bytes/decimal/rat", bytesDec, ratOfLen(n), false},
+		} {
+			t.Run(fmt.Sprintf("%s@%+d", c.name, n-cap), func(t *testing.T) {
+				s, err := avro.Parse(c.schema)
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+				w, encErr := s.Encode(c.value)
+				if overCap {
+					if encErr == nil {
+						t.Fatalf("encode accepted a %d-byte unscaled payload (bound is %d) and produced %d wire bytes", n, cap, len(w))
+					}
+					return
+				}
+				// At and below the bound the value must still ENCODE and the
+				// wire must still DECODE — the check must not have moved the
+				// boundary inward.
+				if encErr != nil {
+					if !c.reachesBound {
+						return // precision gate, not this bound
+					}
+					t.Fatalf("encode rejected a %d-byte unscaled payload at or under the %d bound: %v", n, cap, encErr)
+				}
+				var into any
+				if _, err := s.Decode(w, &into); err != nil {
+					t.Fatalf("decode of this package's own %d-byte wire failed: %v", len(w), err)
+				}
+				var j any
+				jw, err := s.EncodeJSON(c.value)
+				if err != nil {
+					t.Fatalf("EncodeJSON: %v", err)
+				}
+				if err := s.DecodeJSON(jw, &j); err != nil {
+					t.Fatalf("DecodeJSON of this package's own JSON failed: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// The producer check lives on ENCODE, never on parse: a writer schema whose
+// decimal fixed is wider than the unscaled bound must keep parsing, because a
+// reader that DROPS that field decodes such data correctly today. Skipping
+// never materializes the decimal, so the bound is not its business, and a
+// parse-time reject would break a working reader to protect a write that
+// reader never performs.
+func TestRegression_OverCapDecimalFixedParsesAndSkips(t *testing.T) {
+	const cap = 32 << 10
+	writer, err := avro.Parse(fmt.Sprintf(
+		`{"type":"record","name":"R","fields":[{"name":"d","type":{"type":"fixed","name":"F","size":%d,"logicalType":"decimal","precision":38,"scale":0}},{"name":"keep","type":"int"}]}`, cap+1))
+	if err != nil {
+		t.Fatalf("writer schema must still parse; the producer check belongs on encode: %v", err)
+	}
+	reader := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
+	resolved, err := avro.Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	wire := append(bytes.Repeat([]byte{0x01}, cap+1), 0x0e) // 0x0e = zigzag 7
+	var got map[string]any
+	if _, err := resolved.Decode(wire, &got); err != nil {
+		t.Fatalf("a reader dropping the over-cap decimal field must still decode: %v", err)
+	}
+	if got["keep"] != int32(7) {
+		t.Fatalf("keep = %#v, want int32(7)", got["keep"])
+	}
+	// The same schema still refuses to WRITE that field, which is the whole
+	// point of siting the check on encode.
+	if _, err := writer.Encode(map[string]any{"d": bytes.Repeat([]byte{0x01}, cap+1), "keep": int32(7)}); err == nil {
+		t.Fatalf("encode of the over-cap decimal fixed must be rejected")
+	}
+}

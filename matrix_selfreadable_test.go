@@ -1,12 +1,14 @@
 package avro_test
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
 	"strings"
 	"testing"
 
 	"github.com/twmb/avro"
+	"github.com/twmb/avro/ocf"
 )
 
 // ---------------------------------------------------------------------------
@@ -153,6 +155,117 @@ func TestMatrix_SelfReadableAtScale(t *testing.T) {
 		})
 	}
 
+	// Decimal UNSCALED-LENGTH axis (maxDecimalUnscaledBytes = 32 KiB), the
+	// bound orthogonal to the scale generator above.
+	//
+	// This axis has to sweep the CARRIER, because the carrier is what decides
+	// whether any upstream gate is reached at all — and the gates differ:
+	//
+	//   - a numeric carrier on "decimal" is bounded by the DECLARED PRECISION,
+	//     itself parse-capped, so it cannot reach the length bound;
+	//   - a numeric carrier on "big-decimal" is bounded by NOTHING, because
+	//     that logical type has no precision attribute to declare;
+	//   - the opaque []byte escape hatch is bounded by neither, on either.
+	//
+	// The fixed container is a third route again: it pads to the schema's SIZE
+	// whatever the value, so the size alone decides the emitted width and every
+	// carrier lands in the same place. A net that drove only *big.Rat on a
+	// bytes/decimal would see the precision gate fire and conclude the bound
+	// was unreachable from the producer side.
+	//
+	// The single-object and OCF wires are here because they re-frame the same
+	// encoder output: an escape that reaches them ships a FILE whose reader
+	// cannot open it, which is strictly worse than a rejected call.
+	const unscaledCap = 32 << 10
+	rawOf := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = 0x01
+		}
+		return b
+	}
+	// The opaque carrier's payload must be the shape whose UNSCALED part is n
+	// bytes, and that shape differs per logical: on "decimal" the payload IS
+	// the unscaled value, while on "big-decimal" it is a framing that WRAPS it.
+	// Handing big-decimal n raw bytes would test the framing grammar instead —
+	// 0x01 reads as a zigzag -1 and dies on the length before the bound is ever
+	// consulted, so the cell would red for a reason that has nothing to do with
+	// this axis and would never exercise it.
+	bigDecFramingOf := func(n int) []byte {
+		out := zigzagEncode64(int64(n))
+		out = append(out, rawOf(n)...)
+		return append(out, zigzagEncode64(0)...)
+	}
+	// ratOfLen returns a rational whose minimal two's-complement unscaled form
+	// is exactly n bytes: 2^(8n-9) has bit length 8n-8, so its magnitude fills
+	// n-1 bytes with the top bit set, and the sign byte makes it n.
+	ratOfLen := func(n int) *big.Rat {
+		return new(big.Rat).SetInt(new(big.Int).Lsh(big.NewInt(1), uint(8*n-9)))
+	}
+
+	type decCell struct {
+		label  string
+		schema string
+		value  any
+	}
+	var decCells []decCell
+	for _, n := range []int{unscaledCap - 1, unscaledCap, unscaledCap + 1} {
+		bytesDec := `{"type":"bytes","logicalType":"decimal","precision":65536,"scale":0}`
+		bigDec := `{"type":"bytes","logicalType":"big-decimal"}`
+		fixedDec := fmt.Sprintf(`{"type":"fixed","name":"F","size":%d,"logicalType":"decimal","precision":65536,"scale":0}`, n)
+		for _, c := range []struct {
+			carrier string
+			schema  string
+			value   any
+		}{
+			{"rat", bytesDec, ratOfLen(n)},
+			{"opaque", bytesDec, rawOf(n)},
+			{"text", bytesDec, ratOfLen(n).RatString()},
+			{"rat", bigDec, ratOfLen(n)},
+			{"opaque", bigDec, bigDecFramingOf(n)},
+			{"text", bigDec, ratOfLen(n).RatString()},
+			{"rat", fixedDec, big.NewRat(5, 1)},
+			{"opaque", fixedDec, rawOf(n)},
+			{"text", fixedDec, "5"},
+		} {
+			logical := "decimal"
+			if c.schema == bigDec {
+				logical = "big-decimal"
+			}
+			container := "bytes"
+			if c.schema == fixedDec {
+				container = fmt.Sprintf("fixed%+d", n-unscaledCap)
+			}
+			base := fmt.Sprintf("%s/%s/%s@%+d", logical, container, c.carrier, n-unscaledCap)
+			decCells = append(decCells, decCell{base, c.schema, c.value})
+			// The same value delivered through an `any`-typed record field, so
+			// the record dispatch is crossed too and not just the top level.
+			decCells = append(decCells, decCell{
+				label:  base + "/in-record",
+				schema: fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"d","type":%s}]}`, c.schema),
+				value:  map[string]any{"d": c.value},
+			})
+		}
+	}
+	for _, g := range decCells {
+		t.Run("decimal-unscaled-length/"+g.label, func(t *testing.T) {
+			s, err := avro.Parse(g.schema)
+			if err != nil {
+				return // schema itself rejected at parse — fine
+			}
+			check(t, g.label, g.value,
+				func(b []byte, v any) ([]byte, error) { return s.AppendEncode(b, v) },
+				func(b []byte, tgt any) error { _, e := s.Decode(b, tgt); return e }, "binary")
+			check(t, g.label, g.value,
+				func(b []byte, v any) ([]byte, error) { return s.AppendEncodeJSON(b, v) },
+				func(b []byte, tgt any) error { return s.DecodeJSON(b, tgt) }, "json")
+			check(t, g.label, g.value,
+				func(b []byte, v any) ([]byte, error) { return s.AppendSingleObject(b, v) },
+				func(b []byte, tgt any) error { _, e := s.DecodeSingleObject(b, tgt); return e }, "single-object")
+			checkOCF(t, g.label, s, g.value)
+		})
+	}
+
 	// UNSAFE struct-field path. The generators above pass top-level []any /
 	// map[string]any values, which route through the REFLECT encoders. A
 	// zero-byte array that is an addressable struct field instead routes
@@ -171,6 +284,39 @@ func TestMatrix_SelfReadableAtScale(t *testing.T) {
 					func(b []byte, tgt any) error { _, e := s.Decode(b, tgt); return e }, "binary")
 			})
 		}
+	}
+}
+
+// checkOCF is the container-wire arm of the self-readability invariant: a
+// value the OCF writer accepts must be one the OCF reader can read back. It is
+// a separate closure because the container re-frames encoder output rather
+// than being another (encode, decode) pair — a wire an encoder emits and a
+// reader refuses becomes a FILE on disk here.
+func checkOCF(t *testing.T, label string, s *avro.Schema, v any) {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := ocf.NewWriter(&buf, s)
+	if err != nil {
+		return // writer construction rejected — acceptable
+	}
+	if err := w.Encode(v); err != nil {
+		return // encode-time rejection is always acceptable
+	}
+	if err := w.Close(); err != nil {
+		return
+	}
+	size := buf.Len()
+	r, err := ocf.NewReader(&buf)
+	if err != nil {
+		t.Errorf("SELF-INCOMPATIBLE [ocf wire]: %s — the writer produced a %d-byte file NewReader REJECTS: %v",
+			label, size, err)
+		return
+	}
+	defer r.Close()
+	var sink any
+	if err := r.Decode(&sink); err != nil {
+		t.Errorf("SELF-INCOMPATIBLE [ocf wire]: %s — the writer produced a %d-byte file the reader REJECTS: %v",
+			label, size, err)
 	}
 }
 
