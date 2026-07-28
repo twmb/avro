@@ -9741,3 +9741,85 @@ reserved-attribute enumeration itself (§Open net gaps) and NOT_BUGS #74.
   RULED — the emission condition is PER ATTRIBUTE**, so a blanket presence
   mechanism would have shipped a divergence at two of four. Verbatim: archive
   (2026-07-28 #4).
+
+## Distillation archive (2026-07-28 #9) — NOT_BUGS #68, verbatim
+
+Compressed to the standard tombstone form during the NOT_BUGS size pass, the
+first taken after the file's ~120KB cap was written into AUDIT_CORE's size
+guard (it had been enforced from memory for many rounds). The entry is fully
+netted, so what it keeps in NOT_BUGS is the ruling, the nets and the re-open
+condition; the budget-derivation detail lives here.
+
+68. **(tombstone, fully netted) SchemaFor renders `CustomType.Schema` through the ERROR-REPORTING walk and composes a PRIVATE COPY.** The bare walk's truncate-to-nil posture belongs to error-LESS surfaces; SchemaFor has an error channel, so an over-budget or cyclic custom schema FAILS the build with the walk's named error rather than silently parsing as a null prop, and never mutates caller-owned SchemaNode storage (the boundary deep-copies). **Budgets are measured against what `json.Marshal` will EMIT, not the value's Go shape** — three escapes closed: a value's own `MarshalJSON`/`MarshalText` (`marshalEmitLen`, Marshaler first, matching json.Marshal's order; an erroring method left uncharged so the marshal names its own failure); a non-string map key (`mapKeyEmitLen`, mirroring `encoding/json`'s `resolveKeyName` ARM FOR ARM INCLUDING ITS GUARDS, its terminal panic arm becoming `valueWalkBadMapKey`); and ESCAPED length (a control byte costs six output bytes; 64 MiB had admitted 402,628,629). Charging is EXACT, by a NON-ALLOCATING counting scan with EARLY EXIT — exactness keeps ASCII billing at 1x instead of a 6x worst case rejecting ordinary schemas at a sixth of the cap. **The P21 restatement licence is CONDITIONAL and is the re-open condition.** Nets: `TestCensus_Q9_EscapedLenMatchesEmitterOverEveryByte` (+ `_OnMultiByte`, `_Codepoint…`; expectations derived from the package's own emitter over all 256 bytes, multi-byte runes, invalid UTF-8, U+2028/9, the HTML trio — `SetEscapeHTML(false)` reds them) · `_EscapedLenScanIsBoundedByTheLimit` · `TestRegression_WalkBudgetMapKeyMatchesJSONKeyResolver` (12 key shapes vs `json.Marshal` EXECUTED) · `_WalkBudgetChargesEveryEmissionRoute` · `_KeepsMarshalOpaqueValuesOpaque` · `_MeasurementIsItselfBounded` · `_SchemaForOverBudgetCustomSchemaErrors` · `_CustomSchemaBudgetAxes` · `_SchemaForLeavesCallerSchemaStorageUnmutated` · the caller-storage snapshot in every `TestMatrix_SchemaForCustomSchemaScope` cell. Re-opens: a NEW emission route json.Marshal takes that the walk does not charge, or a new boundary marshalling caller values without the canonicalizing copy. Verbatim: archive (2026-07-27; 2026-07-27 #5).
+## Distillation archive (2026-07-28 #10) — the default-face FIX round ledger line, verbatim
+
+- 2026-07-28 · 40c36e4 (START head) · FIX (ruling-directed) · **the
+  pre-encoded DEFAULT face closed, on encode, never at parse** · both handed
+  measurements re-run and confirmed: the JSON default arm ALREADY charges
+  because it encodes `defaultVal` through `appendAvroJSON` rather than splicing
+  pre-encoded bytes — so it is not a site, and the neuter later proved it by
+  redding every wire EXCEPT json; the reader-side fill errors at decode, pinned
+  as the twin · **the site set re-derived to FOUR, not the ~5 I had estimated**:
+  three absent-field splice sites plus the COMPILED unsafe path, with the JSON
+  arm and the JSON-decode fill both measured out · **the suggested alternative
+  was measured and REJECTED on evidence, which is why it was worth measuring**:
+  declining to install an over-cap pre-encoded default does NOT let the field
+  fall to the serializer — it reports "missing key", a misleading error for a
+  field that HAS a default; it diverges binary from JSON; it leaves the metadata
+  API saying HasDefault=true while the encoder behaves otherwise; and worst, the
+  omitzero arm silently emitted a **2-byte wire that decoded OK**, substituting a
+  different value for the field. Silent wrong output is the one forbidden
+  outcome, so the deferred verdict was built instead · my first crude detection
+  of "over-cap" charged the FRAMED length rather than the payload and reds
+  cap-exact, which would have manufactured the wrong conclusion — the experiment
+  was re-run with the payload before any verdict was drawn · **mechanism**: the
+  verdict is recorded once where the default is pre-encoded and read through ONE
+  accessor (`serRecordField.appendDefault`), so a later consumer cannot pick up
+  the bytes without the verdict that governs them; the compiled path carries it
+  as `omitzeroErr`, because copying bytes without their verdict at compile time
+  is exactly how a fast path emits what its slow twin refuses · 2 neuters,
+  triple satisfied, red sets separable BY WIRE — the unsafe copy reds ALONE on
+  `binary-omitzero`, proving it is a distinct mechanism rather than redundant
+  with the parse-side recording · all four constraints pinned and green · census
+  Q19 grew the default answerer, and caught the new site itself before I
+  registered it · **doc obligation**: NOT_BUGS' ~120KB cap WRITTEN into the size
+  guard, with the reason it matters (NOT_BUGS is what the pre-action gate quotes
+  from) and a preference order for the pass — tombstone a fully-netted entry
+  before shortening live ruling text. The pass it called for then ran: 123.3 →
+  119.1 KB, taken almost entirely out of the INDEX (a recognition aid that had
+  grown to duplicate entry text, 13.1 → 9.9 KB) plus one over-long tombstone
+  compressed with its text archived, so not one ruling lost a word · suite +
+  fastavro + `-race` green; Java ABSENT · CORE 54.3 / PATTERNS 134.7 / NOT_BUGS
+  119.1 KB, all three under a bound that is now WRITTEN for all three ·
+  UNCONVERGED (counter 0), freeze stays.
+
+## Distillation archive (2026-07-28 #11) — the decimal-length round's ledger line, verbatim
+
+Compressed once its follow-on round closed the face it had left open.
+
+- 2026-07-28 · b045c18 (START head — b045c18..HEAD quarantines this round's
+  commits) · FIX (ruling-directed) · **RULING 1: the decimal unscaled-LENGTH
+  bound is charged on the emit side through ONE function** — the three shared
+  builders cover every numeric arm on both wires at once, a size-keyed twin lets
+  a fixed carrier delegate rather than restate, and the opaque escape gets its
+  own helper because WHICH BYTES differs per logical (`decimalChargeLen` asks
+  that once). Over-rejection impossible BY CONSTRUCTION and pinned as such ·
+  **both corrections re-run, not taken on faith**: (b) held exactly; (a) held
+  where it mattered (padding carries rat/string/float64 to the fixed face) but
+  `[]byte` is not excluded there, only length-mismatched · **the derived site set
+  found a face neither count had — `big-decimal` has no `precision`, so an
+  ORDINARY `*big.Rat` escapes with no opaque carrier involved** · generator IN
+  `TestMatrix_SelfReadableAtScale` per #11's own requirement; **its first version
+  red for the wrong reason** — raw bytes on a big-decimal die on the framing
+  before the bound is consulted, so the cell never exercised the axis · 6
+  neuters, triple satisfied, red sets pairwise DISJOINT; N6 CONFIRMS the arm
+  documented unreachable reds nothing · census **Q19**, which failed four times
+  across the round, each time on a real count my own edits had moved · **the
+  after-fix sweep found a FIFTH emit path in my own fix, and closing it in place
+  contradicted correction (b), so it was REVERTED and filed as an OPEN gap
+  rather than shipped** — defaults are pre-encoded at PARSE, so the charge broke
+  the dropped-field reader; the fix needs parse-records/encode-surfaces across
+  ~5 sites, which is a ruling · **RULING 2 accepted**: #49 already carried it ·
+  **rule 2a minted** — reference SILENCE is not a SPLIT, routes to rule 4 (table
+  + HALT) · convention 1 grew (e), class-elimination · suite + fastavro +
+  `-race` green; Java ABSENT · verbatim: archive (2026-07-28 #6) · UNCONVERGED.
