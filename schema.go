@@ -607,6 +607,15 @@ type afield struct {
 	Default json.RawMessage `json:"default,omitempty"`
 	Order   string          `json:"order,omitempty"`
 
+	// orderSet records that "order" was written, which Order alone cannot:
+	// the empty string is its zero, so a validator reading `Order != ""` as
+	// "the caller chose an order" skips exactly the one written value that
+	// is not a legal order. Apache Avro has no such gap because it decides
+	// on the NODE — `if (orderNode != null) Order.valueOf(...)`
+	// (Schema.java:1895-1897) — where an empty string reaches valueOf and
+	// throws. This restores that: presence and validity are one question.
+	orderSet bool
+
 	// Field-level logical type annotations — the Java/JDBC Avro idiom
 	// where logicalType (and, for decimal, precision/scale) sit as
 	// siblings of `type` on the field object rather than nested inside
@@ -2882,7 +2891,15 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 				return fmt.Errorf("duplicate record field name %q", truncForError(of.Name))
 			}
 			seenFields[of.Name] = true
-			if of.Order != "" && of.Order != "ascending" && of.Order != "descending" && of.Order != "ignore" {
+			// Written-ness, not non-emptiness, is what admits the value to
+			// the check: "order":"" is a written order and not one of the
+			// three the spec defines, so it fails here like every other
+			// non-spec spelling. The comparison stays EXACT-case — Apache
+			// Avro upper-cases before its own lookup, but reserved
+			// attribute VALUES are matched by exact spelling here (a
+			// case-variant is a different string, not a different case of
+			// the same one).
+			if of.orderSet && of.Order != "ascending" && of.Order != "descending" && of.Order != "ignore" {
 				return fmt.Errorf("invalid field order %q for field %q", truncForError(of.Order), truncForError(of.Name))
 			}
 			bf := b.nest()

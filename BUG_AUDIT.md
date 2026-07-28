@@ -9131,3 +9131,130 @@ These submissions don't qualify as findings:
 #### NOT_BUGS #68
 
 68. **(tombstone, fully netted) SchemaFor renders `CustomType.Schema` through the ERROR-REPORTING walk and composes a PRIVATE COPY (2026-07-15, clauses through 2026-07-26).** The bare walk's truncate-to-nil posture belongs to error-LESS surfaces; SchemaFor has an error channel, so an over-budget or cyclic custom schema FAILS the build with the walk's named error rather than silently parsing as a null prop. A build never mutates caller-owned SchemaNode storage, so the boundary deep-copies. **Budgets are measured against what `json.Marshal` will EMIT, not against the value's Go shape** — three escapes closed: a value with its own `MarshalJSON`/`MarshalText` (`marshalEmitLen`, json.Marshaler first, matching json.Marshal's order; an erroring method left uncharged so the marshal names its own failure); a non-string map key (`mapKeyEmitLen`, mirroring `encoding/json`'s `resolveKeyName` ARM FOR ARM INCLUDING ITS GUARDS, the resolver's terminal panic arm becoming the named verdict `valueWalkBadMapKey`); and ESCAPED length (a control byte costs six output bytes; 64 MiB had admitted 402,628,629). Charging is EXACT, by a NON-ALLOCATING counting scan with EARLY EXIT bounded by the budget — exactness is what keeps ASCII billing at 1x instead of a 6x worst case rejecting ordinary schemas at a sixth of the documented cap. **The P21 restatement licence is CONDITIONAL and is the re-open condition.** Nets: `TestCensus_Q9_EscapedLenMatchesEmitterOverEveryByte` + `_OnMultiByte` + `_CodepointEscapedLenMatchesEmitterOverEveryByte` (every expectation derived from the package's own emitter over all 256 byte values, multi-byte runes, invalid UTF-8, U+2028/9, the HTML trio — a `SetEscapeHTML(false)` reds them) · `_EscapedLenScanIsBoundedByTheLimit` · `TestRegression_WalkBudgetMapKeyMatchesJSONKeyResolver` (12 key shapes vs `json.Marshal` EXECUTED) · `_WalkBudgetChargesEveryEmissionRoute` · `_KeepsMarshalOpaqueValuesOpaque` · `_MeasurementIsItselfBounded` · `_SchemaForOverBudgetCustomSchemaErrors` · `_CustomSchemaBudgetAxes` · `_SchemaForLeavesCallerSchemaStorageUnmutated` · the caller-storage snapshot in every `TestMatrix_SchemaForCustomSchemaScope` cell. Re-opens: a NEW emission route json.Marshal takes that the walk does not charge, or a new boundary marshalling caller values without the canonicalizing copy. Verbatim: archive (2026-07-27).
+
+
+## Distillation archive (2026-07-27 #6) — the mandated triple pass, run at the END of the enumeration round rather than its top
+
+The previous line mandated a triple pass at the top of this round; the round's
+own instruction opened with the enumeration instead, so the pass runs here,
+against the sizes the round actually produced. Nothing below is deleted; the
+live files keep a compressed form plus this pointer.
+
+### NOT_BUGS.md entries superseded as COMPLETENESS questions by TestMatrix_ReservedAttributeEnumeration, verbatim before compression
+
+The enumeration now crosses every reserved attribute with every body shape at
+both levels on every kind, so these entries no longer have to carry their own
+per-axis inventories: what each still owns is its RULING and the evidence for
+it. The inventories are archived here.
+
+
+#### NOT_BUGS #63
+
+63. **(tombstone, fully netted) The stray-structural-key family (maintainer-adjudicated 2026-07-14; clauses through 2026-07-27).** Per-clause narrative — how each was found, what the blast-radius measurement showed, which driver defect a neuter caught — is archived (2026-07-23 #4; 2026-07-27 #2, #3, #4); every clause below keeps its ruling and its pin.
+
+  **(a) EXCLUSIVITY.** A container kind carrying ANOTHER kind's defining key hard-rejects (`invalid <kind> has schema for other types`) — keep-strict; Java (props) and fastavro (executed accepts) diverge. The reject is the cache/metadata walkers' kind-keyed-child-scope soundness premise.
+
+  **(b) SHAPE-CONDITIONAL ROUTING** on a kind that does not bind the key: a schema-shaped stray body surfaces structurally as-written as its ONLY surface (render dedup skips stray-reached names; survival is props-independent); a malformed body rides in Props verbatim as its ONLY surface, structural field ZERO. capture⟺verdict: the metadata captures run the parser's own decodes (`stringSliceFrom`/`decodeLaxInt`), so structural-field-set ⟺ parse-consumed.
+
+  **(c) A WRAPPED REFERENCE** rejects schema-shaped structural keys ("unknown complex type"); non-structural/malformed extras merge onto the spliced def as props, def-wins exact-key (Java drops usage-site extras; fastavro rejects the spelling — executed).
+
+  **(d)** SchemaFor's walkers pass unbound structural keys through untouched, verdict-parity with Parse. **(e)** The binding-kind gate is `walkNodeChildren`'s DEFAULT; only the metadata walker opts into stray enumeration (pinned asymmetry). **(f)** Exact-case only (#46): stray routing is placement-conditional, never case-conditional.
+
+  **(g)/(h) BARE-EMISSION losslessness, which is a CONJUNCTION.** Clause (b)'s "as-written is its ONLY surface" holds through `Root().Schema()`. The render collapses a node to its bare type name only when it carries NOTHING beyond `Type`, asked once as `nodeCarriesOnlyType` (schema_node.go), DERIVED from SchemaNode's field set; two sites ask it (`toJSONWalk`'s primitive and name-reference arms), each previously holding its own hand-written list, both missing members. A guard requiring the shortcut to BLOCK proves only half — it says nothing about whether the longer form it falls through to EMITS, which `EnumDefault` did not. The guard `TestInvariant_BareEmissionCoversEverySchemaNodeField` is therefore a ROUND TRIP: set every exported field in turn, emit, re-parse, read the value back off the metadata FIELDS (never the rendered text, whose key ORDER made an earlier survival check report losses that had not happened). Every field carries one of three classifications, checked both directions: EXEMPT (`Branches` off a union — no JSON key routes to it, `TestRegression_NonUnionBranchesInertInRebuild`; `EnumDefault` without its carrier), RELOCATED (`Precision`/`Scale`/`HasEnumDefault` — the emitted key rides to Props on a carrier that does not bind it, #71), or ROUND-TRIPPING on its own field. There is deliberately NO fourth "dropped by policy" class, so a field emitting a key the re-parse discards FAILS here instead of being classified as an accepted loss, and a field added later fails until someone classifies it.
+
+  **(i) The SIBLING predicate on the same walk.** `nodeIsNameRefShape` — may a stamped reference be replaced by the definition it names — was the other hand-written list, of eight fields, silently discarding the seven it did not name on an extracted-then-EDITED node. It is now derived through the same walk, `nodeCarriesNothingBut`, exempting EXACTLY the adjudicated usage-site attributes: `Doc`/`Aliases`/`Namespace`/`LogicalType` per #25 (deriving without them would turn #25's adjudicated silent drop into a hard "unknown complex type" on the extraction feature), plus `Props`, which clause (c) MERGES. `Precision`/`Scale` are NOT exempt: the parse routes an unconsumed pair to Props, so a non-zero value on those FIELDS can only be a caller's direct write. Census **Q17**.
+
+  **(j) A reserved key that is neither BOUND nor SURFACEABLE has Props as its only surface — the type-level `default` and `order` (maintainer-RULED 2026-07-27, reversing the drop clause (h) had recorded as policy).** Both are FIELD attributes: at the type level only an enum binds `"default"` (#54) and NO kind binds `"order"`, so on a non-binding kind neither has a SchemaNode field to land on, and both were captured by the reserved-key set and then dropped — violating the biconditional the family drives, in the same class as (g)'s loss. Both references PRESERVE where the kind does not bind: Java's `SCHEMA_RESERVED` (Schema.java:175-176) omits both and `ENUM_RESERVED` (:178-180) adds `default` alone (applied :1857/:1880/:1940/:1950/:1963 vs :1928 for enum); fastavro 1.12.2 keeps both on every kind (EXECUTED, 28 cells). PRESERVATION, not an accept/reject loosening; cross-impl rule 2 agrees. **#46 is REFINED, not reversed:** it governs CASE VARIANTS and presumes the exact spelling is CONSUMED, so where the kind does not bind its premise is absent and `"Default"`/`"Order"` stay ordinary props everywhere. **SCOPE is type-level only:** Java's `FIELD_RESERVED` (:503-504) binds both at the FIELD level and so does twmb, so a record field's `default`/`order` stay consumed and must never reach `SchemaField.Props`. The routing is DERIVED: `schemaReservedKeyForObject` asks `schemaKeyBinds` and keeps a key out of Props for exactly two reasons — the kind BINDS it, or the kind SURFACES it as-written on a structural field (`canonicalStrayKey` plus a shape-OK body). Consumed-ness still wins at a splice. The one reserved key BOUND on every kind that still reaches neither surface is `doc` with a non-string body (#72). A body the shape check cannot READ AT ALL — an explicit JSON null — is #73: malformed, so Props-verbatim here and reject where the kind binds.
+
+  **Nets:** the 360-cell stray-key matrix · `TestMatrix_StrayBodyShapeRouting` (wedge bodies; structural-zero on every malformed cell) · the strayPS placement × kind × {type,field,union-field} × body matrices · `TestMatrix_SpliceWrapperReservedKeyMerge` · the FEATURE × WALKER harness rows · `TestInvariant_BareEmissionCoversEverySchemaNodeField` · `_NameRefSpliceCoversEverySchemaNodeField` · `_NodeFieldRuleTablesNameRealFields` (the exemption SET is pinned, so widening it is a visible policy change) · `TestMatrix_CallerComposedAndEditedNodes` (204 cells over second-occurrence, forward-reference, RECURSIVE, DIAMOND and cache-cross-parse structures, each asserting its probe reaches a stamped bare reference) · `TestMatrix_TypeLevelBindingRouting` ({default, order} × 14 kinds × {type, field} × 6 surfaces, attribute-free twin per cell) · `TestRegression_TypeLevelDefaultOrderSurviveTheRebuild` · `_FieldLevelDefaultOrderStayConsumed` (the scope boundary, neuter-verified disjoint) · `TestMatrix_ReservedKeyBodyPresence` (the unreadable-body axis, #73) · `TestDifferentialFastavroTypeLevelBindingRouting` (preservation, not mere acceptance) · census Q4/Q16/Q17/Q18. **Re-opens:** a new walker/consult of either tree representation without its R1 row, or a new reserved-key read/shape check not shared with the parser's decodes.
+
+#### NOT_BUGS #71
+
+71. **Field-level "precision"/"scale" are consumed-conditional: unconsumed placements are inert custom properties whatever the value's JSON shape; consumed placements shape-reject loudly (maintainer-ruled 2026-07-23, cross-impl rules 1+2).** Derivation narrative: archive (2026-07-27 #4).
+    **UNCONSUMED** — no field logicalType, a non-"decimal" one, or "decimal" whose lift target is not a bytes/fixed carrier as-written (a named reference is not a carrier spelling) — the pair rides to `SchemaField.Props` verbatim on every surface, exactly like a valid-int unconsumed pair: `afieldFromAny` records per-key shape verdicts and decides AFTER the type parses, because consumed-ness is unknowable at the arms. Java never validates the pair at field level (FIELD_RESERVED, Schema.java:503-504; parseProperties :1905); fastavro 1.12.2 accepts + preserves verbatim (executed, including the consumed-decimal malformed case — fastavro has no field lift).
+    **CONSUMED** — exactly where the lift's annotation LANDS on a decimal carrier: the target's EFFECTIVE logical (its own when it has one — closer-to-the-type wins — else the field's) is "decimal" AND the target kind is bytes/fixed. The target is the primitive, the first non-null union branch, or the type object. There a malformed body keeps the LOUD reject, fired from the recorded shape error and naming the key.
+    **Navigation vs LANDING (re-ruled 2026-07-26 on executed wire evidence; supersedes the earlier "annotation-independent" wording, which was true of NAVIGATION — which target the lift addresses — and wrongly applied to LANDING — whether the decimal applies).** A field "decimal" whose target already carries its own logical never lands, so its precision/scale are INERT and ride to Props. Proven on the wire: `{"type":"bytes","logicalType":"big-decimal"}` under a field decimal(4,2) encodes `06027b04`, byte-identical at scale 0, scale 2, and no field logical at all. DISCRIMINATOR against loosening into "any own annotation is inert": when the target's own logical IS "decimal" the parameters DO land, and scale 0 vs 2 diverges (scale 0 refuses 123/100) — those cells keep rejecting. #55 untouched. Enforcement is structural: `liftTarget` is the ONE navigation question and `liftEffectiveLogical` the one landing question, so the mover (`liftFieldLogicalIntoType`) and the judge (`fieldDecimalLiftConsumesPrecisionScale`) cannot address different types; census Q5 drives them against each other.
+    Malformed-as-absent is forbidden: scale is OPTIONAL (spec default 0), so a malformed scale beside a valid precision would silently parse as decimal(p,0) — a silent wire-semantics change (#55 anti-silent-drop). FLAT fields defer entirely to the TYPE-level gate, so the flat verdict equals the nested twin's on every body shape (#56). Recorded divergence, pinned BY DIRECTION in the fastavro arm: fastavro validates decimal params on ANY logicalType-"decimal" object including non-carriers; Java drops the logical on non-carriers via `LogicalTypes.fromSchemaIgnoreInvalid` (LogicalTypes.java:120, called Schema.java:1979) without reading the params — twmb follows Java. **Spelling-agnostic clause:** the union arm's "first non-null branch" scan skips a null branch in EITHER spelling via the shared `aschema.isNullBranch` (P20), so the consume verdict cannot flip with the spelling.
+    Nets: `TestRegression_FieldDecimalNotLandingIsInert` · `_FieldPrecisionScaleMalformedUnconsumedInert` · `_FlatFieldMalformedPrecisionMatchesNestedTwin` · `_FieldDecimalConsumedMalformedParamReject` · `_FieldPrecisionValidUnconsumedSurfacesInProps` · `_StrayFieldsElementPrecisionRouting` · `_FieldDecimalLiftNullBranchSpellingAgnostic` · the strayPS placement × kind × {type, field, union-field} × body matrix with its fastavro arm executed per accepted cell · `TestMatrix_SpliceWrapperReservedKeyMerge` + `_SpliceDefFieldMalformedPrecisionRidesThrough` · `TestMatrix_NullBranchSpellingParity`; five neuters, each red exactly its own cells.
+
+#### NOT_BUGS #72
+
+72. **A non-string `doc` is captured-then-DROPPED, at the type level and the field level alike — exact Java parity, and the ONE reserved key whose value reaches neither surface (maintainer-RULED 2026-07-27).** `{"type":"int","doc":5}` (and `[]`, `null`, `{}`, `true`, on every kind) parses; `SchemaNode.Doc` stays empty, `Props` stays empty, and `Root().Schema()` collapses the node — the attribute is gone. Same at the field level: `SchemaField.Doc` and `.Props` both empty, the rebuilt field carries no `doc`. A NON-EMPTY string `doc` is consumed and surfaced normally on both levels and survives the rebuild. The spec types `doc` as a string, so the input is spec-invalid to begin with.
+    **Scope — this rules the TOKEN TYPE, not the empty string.** `"doc":""` is a string, so it is consumed by the same read, but it lands on a structural field whose zero value is indistinguishable from absent and is therefore dropped by the rebuild as well. That is a DIFFERENT question with a different reference posture — Java emits a `""` doc (`getDoc() != null` guards the write, Schema.java:1038-1040, and `""` is not null) and fastavro preserves it (executed) — so it is not settled here and must not be filed as covered by this entry. The same shape reaches `"logicalType":""`.
+    **Java, executed against `apache/avro:main`:** the only type-level read is `parseDoc` (Schema.java:1996-1998, called :1864/:1912/:1956), the only field-level read is :1888; both are `getOptionalText` (:2039-2042) = `jsonNode.textValue()`, **null for any non-text node including `NullNode`**. `doc` is then in `SCHEMA_RESERVED` (:176) and `FIELD_RESERVED` (:504), so `parseProperties` (:1982-1988) skips it at every call site. Java drops it on both levels, exactly as twmb does. **fastavro 1.12.2 disagrees:** it PRESERVES the key verbatim at both levels on every kind (EXECUTED, 16 cells). References split; twmb sides with Java.
+    **The one fact that PREDICTS the asymmetry with #70 — Java's RESERVED-SET MEMBERSHIP.** #70 rules a non-string `logicalType` into `Props`; this rules a non-string `doc` out of everything, and that is not a judgement made twice. `logicalType` is NOT in `SCHEMA_RESERVED`, so `parseProperties` keeps it as an ordinary property (what #70 follows); `doc` IS, so `parseProperties` skips it and the lenient `textValue()` read is the only thing that could have kept it (what this follows). One membership test explains both routings — a later round must not re-file `doc` as inconsistent with #70.
+    **Severity gate — stop-sign, not a fix.** No wrong bytes (wire, canonical form and Rabin never carry `doc`), no wrong accept/reject, no DoS (the body is discarded, not walked): a bounded metadata characteristic of a spec-invalid attribute, at exact reference parity. Do NOT re-file as a #63(j)-class loss.
+    **The class is CLOSED at one member, executed** — an exhaustive sweep of every reserved key × 14 kinds × {number, array, null, object, bool} at both levels. On a kind that does NOT bind the key, a malformed body rides to `Props` (#63(b), #63(j), #70, #71); on a kind that DOES bind it, a malformed body hard-REJECTS (`aliases:5`, `namespace:5`; field-level `aliases:5`, `order:5`). `doc` alone is swallowed, being the only reserved key that BINDS on EVERY kind (`strayKeyBinds`, schema_parse.go:527-530) while its capture is a silently-declining `getString`. The one other key Java reads through `getOptionalText` is the ENUM-level `default`, and there twmb deliberately does NOT follow Java's silent drop — it hard-rejects by token type, fastavro-corroborated (#54). The leniency is one key, not a posture toward Java's text reads.
+    **Q4's biconditional is SCOPED by this ruling, not contradicted.** Two of its three implications hold universally (consumed ⇒ not in Props; structural-set ⇒ consumed); the third, consumed ⇒ structural-set, has exactly this exception, recorded IN the driver as a named outcome class (`dropped`) rather than falling silently through the corpus counters — a `dropped` cell that stops dropping reds, so the exception cannot widen or close itself unnoticed. Pins BOTH directions: `TestRegression_NonStringDocDroppedAtBothLevels` (five non-string bodies × both levels) and `_StringDocConsumedAndSurfaced` (same placements, non-empty string), plus Q4 cells `int-doc-string`, `int-doc-nonstring`, `int-doc-variant` (#46: `"Doc"` is an ordinary prop whatever its body).
+
+### AUDIT_CORE.md §Round ledger — the 2026-07-27 FULL line and the null-body FIX line, verbatim before compression to an era block
+
+
+- 2026-07-27 · b7717b3 · FULL (read-only) · TRIPLE distillation first (~35KB
+  archived), re-measured AFTER its own writes: CORE 55.6 / NOT_BUGS 120.0 KB
+  both AT cap, mandating this round's CORE + NOT_BUGS pass · quarantine
+  c8365de..HEAD = e32a7eb CLEARED (hostile 1 MiB bodies in the control's cost
+  class, rebuild a FIXED POINT over 8 shapes incl. recursive + diamond) ·
+  **#72 RULED** — non-string `doc` dropped at both levels = exact Java parity,
+  the predicting fact being Java's RESERVED-SET MEMBERSHIP, which settles #70
+  and #72 with ONE test instead of two judgements; Q4's biconditional SCOPED,
+  not contradicted (third implication carries `dropped` as a counted outcome).
+  SIX neuters, red sets disjoint · 5 FRONTS incl. `atype` (54 lines, ZERO test
+  files — the inverse-density pick: CLEAN) and the leading-dot escape (gate
+  STOPPED it, #62 rules strict rejection) · **4 BEHAVIORAL, one root cause —
+  P22 minted: a parsed attribute's ZERO VALUE is its own absence sentinel.**
+  `"scale":null` → decimal(p,0), which #71 declares FORBIDDEN; `"size":null` →
+  a zero-width fixed Java rejects; `"order":""` parses while every other
+  non-spec order rejects; `"doc":""`/`"logicalType":""` die in the rebuild where
+  BOTH references preserve. `precision:null` is the same shape SAVED by #55's
+  unrelated positivity check — compensating guard named, not assumed · 1 DOC
+  PIN (#33's unsupported-shapes list named a shape its own spelling clause had
+  made supported) · ZERO-VALUE axis added to §Open net gaps · suite + fastavro +
+  `-race` green; Java ABSENT · UNCONVERGED (counter 0), freeze stays.
+- 2026-07-27 · 81e8f6b (START head — 81e8f6b..HEAD quarantines this round's
+  commits) · FIX (ruling-directed, P22's NULL half) · opened by COMMITTING the
+  previous round's own uncommitted output as its own docs/test commit (81e8f6b),
+  the second round running in a tree whose round output had never landed — a
+  ledger line and a quarantine boundary can only describe commits · then the
+  mandated CORE + NOT_BUGS pass (CORE 55.6→50.7, NOT_BUGS 120.0→116.1 KB;
+  36KB archived verbatim; seven entries carrying "(tombstone)" in the INDEX
+  while keeping a full body were finally given the one-line form the tombstone
+  contract asks for) · quarantine b7717b3..HEAD = 81e8f6b, test+docs only, its
+  pins re-run green before the round's own edits · **P22's null half FIXED at
+  its CLASS.** The root was stated as a SEMANTIC question and swept repo-wide
+  by it — "which code decodes a JSON body into a typed destination and treats
+  decode-success as presence?" — which is what bounded the fix at TWO sites out
+  of fourteen reserved keys: every other key is read by type ASSERTION, and a
+  nil `any` satisfies none, so those answer the question structurally. The two
+  now ask one named predicate, `jsonNullBody`, registered as census **Q18**
+  whose answerer list carries the immune ones EXPLICITLY, so a key that switches
+  from an assertion to a decode joins the question visibly · **#73 RULED**: a
+  null body is a MALFORMED body, never an absent one — reject where the kind
+  binds it, Props-verbatim where it does not. Java rejects by TOKEN TYPE at both
+  keys (Schema.java:1957-1960; LogicalTypes.java:414-421 + the
+  `fromSchemaIgnoreInvalid` swallow #55 declined to copy); fastavro accepts at
+  parse and fails EVERY write, EXECUTED against a written-value twin so the
+  probe cannot pass on broken plumbing — an accept the permissive lean cannot
+  follow · the compensating guard was NAMED AND DISPROVED rather than assumed:
+  `precision:null` used to reject through #55's positivity check on a coerced 0,
+  and the pin asserts the error now names the KEY, so the measurement shows
+  which guard fires · FOUR neuters, triple-verified, red sets DISJOINT between
+  the two decode helpers and a third proving the METADATA answerer is watched
+  on its own; a fourth thinned the corpus and reddened only the non-vacuity
+  guard · blast radius MEASURED across 5082 shape × surface cells, 32 rows
+  differ, both sides non-empty: the intended rejects, the stray nulls restored
+  to Props (#63(b)), a message refinement, and ONE loosening — `size:null` on a
+  container no longer trips exclusivity, because exclusivity is about keys that
+  parsed as a real DEFINITION, pinned from both sides · entry-point axis
+  executed (Parse / MustParse / SchemaCache.Parse / a hand-built OCF header,
+  each with a non-vacuous control) · ZERO-VALUE gap SPLIT: null half CLOSED,
+  written-zero half restated as the open one · suite + fastavro + `-race` green;
+  Java ABSENT (JVM-less) · **sizes re-measured with `wc -c` AFTER every write of
+  this round, THIS LINE INCLUDED: CORE 54.9 / PATTERNS 150.3 / NOT_BUGS 121.5 KB.
+  All three sit at or just over their bounds — the pass genuinely ran (CORE
+  −4.9, NOT_BUGS −3.9) and the round's own output spent it back, so the next
+  round opens with a TRIPLE pass. A first draft of this line claimed CORE 50.9;
+  that was the pre-line measurement, which is the same copied-forward error the
+  previous round corrected — a size claim is only true of the file as the round
+  LEAVES it, and this line is part of the file** · UNCONVERGED (counter 0),
+  freeze stays.

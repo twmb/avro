@@ -277,6 +277,7 @@ func afieldFromAny(v any, f *afield, memo strayShapeMemo) error {
 			return schemaTypeMismatch("order", "string")
 		}
 		f.Order = os
+		f.orderSet = true
 	}
 	if ss, ok, err := stringSliceFrom(m, "aliases"); err != nil {
 		return err

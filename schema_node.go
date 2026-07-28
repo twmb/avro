@@ -123,6 +123,28 @@ type SchemaNode struct {
 	// field-by-field drops it (the rebuilt node then behaves hand-built).
 	refTarget *SchemaNode
 
+	// docSet and logicalSet record that the attribute was WRITTEN, which
+	// its string field cannot: the empty string is both a legal value and
+	// the field's zero, so `Doc != ""` means two things at once and drops
+	// exactly the value that was written as "". They are hidden because a
+	// caller composing a SchemaNode by hand has no empty-doc to express —
+	// the distinction only exists for text that came from a parse — and
+	// because an exported companion would be a new API for a case the
+	// reference implementations reach without one.
+	//
+	// Presence is recorded ONLY where the attribute is consumed, and for
+	// doc only where the kind carries one: Apache Avro reads "doc" in
+	// parseRecord/parseEnum/parseFixed and parseField and nowhere else
+	// (Schema.java:1864/:1912/:1956/:1888), so a doc on a primitive or a
+	// container has no Java analogue and keeps the value-only behavior.
+	// The emission conditions that read these mirror Java's, which differ
+	// PER ATTRIBUTE: doc emits when non-null (:1039/:1154/:1367/:1062) so
+	// an empty doc survives, while aliases emits when non-EMPTY (:886,
+	// :1070) so an empty alias list is dropped. One blanket "was it
+	// written" rule for every attribute would ship a divergence.
+	docSet     bool
+	logicalSet bool
+
 	// refNS is the namespace scope refTarget was resolved in, recorded
 	// alongside the stamp because the two are only meaningful together:
 	// whether Type still names the target is a question about the scope the
@@ -166,6 +188,12 @@ type SchemaField struct {
 	Aliases    []string // field aliases for schema evolution
 	Order      string   // sort order: "ascending" (default), "descending", or "ignore"
 	Doc        string   // documentation string
+
+	// docSet is the field-level twin of [SchemaNode]'s: a field's "doc"
+	// key written as the empty string is a written doc, and Apache Avro
+	// emits it (Schema.java:1062 asks f.doc() != null). See the SchemaNode
+	// field for why the state is hidden.
+	docSet bool
 
 	// Props holds custom (non-reserved) field properties. Numbers decode as
 	// in [SchemaNode.Props]. Field-level "logicalType", "precision", and
@@ -1452,13 +1480,21 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	if len(n.Aliases) > 0 {
 		m["aliases"] = b.emitStrings(d, n.Aliases)
 	}
-	if n.Doc != "" {
+	// Emitted when the attribute was WRITTEN, not when it is non-empty:
+	// an empty doc is a doc, and Apache Avro emits it (Schema.java:1039 /
+	// :1154 / :1367 all ask getDoc() != null). Contrast aliases just
+	// above, whose emission condition is non-EMPTY (:886) — the per-
+	// attribute difference is why presence is asked here and not there.
+	if n.Doc != "" || n.docSet {
 		m["doc"] = b.emitString(d, n.Doc)
 	}
 	if n.HasEnumDefault {
 		m["default"] = b.emitString(d, n.EnumDefault)
 	}
-	if n.LogicalType != "" {
+	// logicalType is not in Java's reserved set, so it survives as an
+	// ordinary schema property whatever its content, empty string included
+	// (parseProperties :1983, writeProps).
+	if n.LogicalType != "" || n.logicalSet {
 		m["logicalType"] = b.emitString(d, n.LogicalType)
 	}
 	if n.Precision != 0 {
@@ -1518,7 +1554,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 			if f.Order != "" {
 				fd["order"] = b.emitString(d, f.Order)
 			}
-			if f.Doc != "" {
+			if f.Doc != "" || f.docSet {
 				fd["doc"] = b.emitString(d, f.Doc)
 			}
 			for k, v := range f.Props {
@@ -1613,10 +1649,16 @@ func jsonNumericInt(v any) (int, bool) {
 // ONLY their exact lowercase spelling — a case-variant key is an ordinary
 // custom property (Java's reserved sets are exact-lowercase HashSets,
 // Schema.java:175-176; fastavro and goavro read exact names too).
-func getString(m map[string]any, key string, dst *string) {
-	if s, ok := m[key].(string); ok {
+// getString reads m[key] into dst when the body is a JSON string, and
+// reports whether it did. The bool is the attribute's PRESENCE as distinct
+// from its value: an empty string sets dst to the field's own zero, so the
+// field alone can no longer say whether the key was written.
+func getString(m map[string]any, key string, dst *string) bool {
+	s, ok := m[key].(string)
+	if ok {
 		*dst = s
 	}
+	return ok
 }
 
 // getInt assigns *dst to m[key] when present and parseable via
@@ -2059,11 +2101,35 @@ func nodeCarriesNothingBut(n *SchemaNode, exempt func(*SchemaNode, string) bool)
 		if !f.IsExported() || f.Name == "Type" || exempt(n, f.Name) {
 			continue
 		}
-		if !rv.Field(i).IsZero() {
+		if !rv.Field(i).IsZero() || nodePresenceSet(n, f.Name) {
 			return false
 		}
 	}
 	return true
+}
+
+// nodePresenceSet reports whether the named exported field carries content
+// its VALUE cannot show — an attribute written as the field's own zero.
+//
+// Without it the emptiness walk above and the emitter disagree by
+// construction: the walk asks IsZero, so a doc written as "" reads as an
+// empty node and the shortcut collapses it to a bare type name, discarding
+// the very attribute the emitter was taught to write. The two questions
+// ("does this node carry anything" and "does this node emit anything") must
+// read the SAME state or the answer depends on which one runs first.
+//
+// It is keyed by field NAME so it composes with the exemption sets rather
+// than overriding them: at a name-reference splice Doc and LogicalType are
+// exempt usage-site attributes (NOT_BUGS #25), so their presence is ignored
+// there exactly as their value is.
+func nodePresenceSet(n *SchemaNode, field string) bool {
+	switch field {
+	case "Doc":
+		return n.docSet
+	case "LogicalType":
+		return n.logicalSet
+	}
+	return false
 }
 
 // bareEmissionExempt classifies the fields whose value cannot be lost by
@@ -2478,8 +2544,12 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 		n.Namespace = explicitNS
 	}
 	childNS := nsForChildren(&n, parentNS)
-	getString(m, "doc", &n.Doc)
-	getString(m, "logicalType", &n.LogicalType)
+	// getString consumes only a STRING body, so recording presence off the
+	// same read keeps the two in step: a non-string doc/logicalType is
+	// routed elsewhere (dropped and Props respectively) and must not count
+	// as a written one.
+	n.docSet = getString(m, "doc", &n.Doc) && isNamedKind(n.Type)
+	n.logicalSet = getString(m, "logicalType", &n.LogicalType)
 	// precision/scale/size are int per spec. After
 	// unmarshalAnyPreservePrecision, integer JSON literals come back as
 	// int64 (not float64); jsonNumericInt accepts both. Precision/Scale
@@ -2644,7 +2714,7 @@ func metadataField(fm map[string]any, typ SchemaNode, flatType map[string]any) S
 		sf.HasDefault = true
 	}
 	if flatType == nil {
-		getString(fm, "doc", &sf.Doc)
+		sf.docSet = getString(fm, "doc", &sf.Doc)
 	}
 	// Field aliases read through the parser's own decode (stringSliceFrom):
 	// bound fields are parse-validated and stray-fields elements are

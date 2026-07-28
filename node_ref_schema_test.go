@@ -659,6 +659,159 @@ func TestInvariant_BareEmissionCoversEverySchemaNodeField(t *testing.T) {
 	t.Logf("bare-emission coverage: %d fields block, of which %d round-trip on their own field and %d relocate to Props; %d classified exempt", checked, checked-relocated, relocated, exempted)
 }
 
+// presenceOnlyFields names the fields whose content can be entirely INVISIBLE
+// in the field's value: an attribute written as the field's own zero. Each
+// entry is a schema that writes exactly that, and the key the rebuild must
+// still carry.
+//
+// This is the half the loop above structurally cannot reach. It populates
+// every field with a NON-ZERO value, which is the only way it can tell
+// "blocks" from "does not block" — so the zero is the axis it holds constant,
+// and a node whose only content is presence looks empty to it. That is not a
+// gap in the test's diligence but in its method, which is why the case needs
+// its own arm rather than a stronger assertion in the existing one.
+// reachesCollapse marks the cells whose probe node carries NOTHING but the
+// presence, so the bare-emission shortcut is actually on the path. A cell
+// that does not reach it cannot test the walk at all — only the emitter — and
+// saying so is the difference between a net and a net-shaped assertion.
+var presenceOnlyFields = map[string]struct {
+	src             string // a schema whose node carries the attribute written as the zero
+	key             string // the JSON key the rebuild must still carry
+	reachesCollapse bool
+}{
+	"Doc": {
+		// doc is recorded only where Apache Avro reads one — the named
+		// kinds and fields — and a named kind always carries its name, so
+		// the collapse is structurally out of reach here. The emitter is
+		// what this cell tests.
+		src: `{"type":"record","name":"R","doc":"","fields":[]}`,
+		key: "doc",
+	},
+	"LogicalType": {
+		// logicalType rides on any kind, so a primitive carrying nothing
+		// but an empty one is exactly the node the shortcut collapses.
+		src:             `{"type":"int","logicalType":""}`,
+		key:             "logicalType",
+		reachesCollapse: true,
+	},
+}
+
+// TestInvariant_BareEmissionCoversPresenceOnlyFields is the completeness
+// guard's other half: for every field that can carry presence without
+// carrying a value, the collapse must still be blocked and the attribute must
+// still survive the rebuild.
+//
+// The emptiness walk and the emitter answer two different questions ("does
+// this node carry anything" and "does this node emit anything"), and they
+// must read the same state. Teaching only the emitter about presence leaves
+// the walk deciding the node is empty and collapsing it to a bare type name
+// before the emitter is ever consulted — the value would vanish exactly as it
+// did before, with the emission arm sitting right there unreached.
+func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
+	rt := reflect.TypeFor[SchemaNode]()
+	seen := 0
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		spec, ok := presenceOnlyFields[f.Name]
+		if !ok {
+			// Every OTHER field must have no presence state, or it belongs
+			// in the table above with its own cell.
+			var probe SchemaNode
+			if nodePresenceSet(&probe, f.Name) {
+				t.Errorf("field %s answers nodePresenceSet but has no presence-only cell; add one so its zero-valued form is checked", f.Name)
+			}
+			continue
+		}
+		seen++
+		n := MustParse(spec.src).Root()
+		fv := reflect.ValueOf(n).Field(i)
+		if !fv.IsZero() {
+			t.Errorf("field %s: the probe schema did not leave the field at its zero (%#v), so this cell is testing the ordinary value case", f.Name, fv.Interface())
+			continue
+		}
+		if !nodePresenceSet(&n, f.Name) {
+			t.Errorf("field %s: the parse did not record the attribute as written, so the probe never reaches the question", f.Name)
+			continue
+		}
+		if spec.reachesCollapse {
+			// The precondition: strip the presence and the node IS empty,
+			// so the shortcut would fire. Without this the "blocks" check
+			// below could pass because of unrelated content the probe
+			// happens to carry, and the walk would never be tested.
+			bare := SchemaNode{Type: n.Type}
+			if !nodeCarriesOnlyType(&bare) {
+				t.Errorf("field %s: the probe's kind does not collapse even when empty, so this cell cannot reach the shortcut; clear reachesCollapse or pick another kind", f.Name)
+				continue
+			}
+			if nodeCarriesOnlyType(&n) {
+				t.Errorf("field %s carries a written attribute whose value is the field's zero, and the emptiness walk still calls the node empty — the collapse drops it before the emitter is ever reached", f.Name)
+				continue
+			}
+		}
+		s, err := n.Schema()
+		if err != nil {
+			t.Errorf("field %s: rebuild failed: %v", f.Name, err)
+			continue
+		}
+		if !strings.Contains(s.String(), `"`+spec.key+`"`) {
+			t.Errorf("field %s: the rebuild dropped the written %q: %s", f.Name, spec.key, s)
+			continue
+		}
+		// And it must be a FIXPOINT: the re-parse has to record the presence
+		// again, or the attribute survives one rebuild and dies on the next.
+		back := s.Root()
+		if !nodePresenceSet(&back, f.Name) {
+			t.Errorf("field %s: the re-parse did not record the attribute, so a second rebuild would drop it", f.Name)
+			continue
+		}
+		s2, err := back.Schema()
+		if err != nil {
+			t.Errorf("field %s: second rebuild failed: %v", f.Name, err)
+			continue
+		}
+		if s2.String() != s.String() {
+			t.Errorf("field %s: emission is not a fixpoint:\n first %s\nsecond %s", f.Name, s, s2)
+		}
+	}
+	if seen != len(presenceOnlyFields) {
+		t.Fatalf("checked %d presence-only fields, the table names %d — a name in the table no longer matches a SchemaNode field", seen, len(presenceOnlyFields))
+	}
+}
+
+// The field-level twin. SchemaField carries its own presence state, and the
+// bare-emission collapse is a node-level question, so the surface that can
+// lose a field's empty doc is the field emitter rather than the walk.
+func TestInvariant_FieldPresenceOnlyDocSurvivesTheRebuild(t *testing.T) {
+	n := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int","doc":""}]}`).Root()
+	if got := n.Fields[0].Doc; got != "" {
+		t.Fatalf("the probe did not leave the field doc at its zero: %q", got)
+	}
+	if !n.Fields[0].docSet {
+		t.Fatal("the parse did not record the field doc as written")
+	}
+	s, err := n.Schema()
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if !strings.Contains(s.String(), `"doc"`) {
+		t.Errorf("the rebuild dropped the written empty field doc: %s", s)
+	}
+	back := s.Root()
+	if !back.Fields[0].docSet {
+		t.Error("the re-parse did not record the field doc, so a second rebuild would drop it")
+	}
+	s2, err := back.Schema()
+	if err != nil {
+		t.Fatalf("second rebuild: %v", err)
+	}
+	if s2.String() != s.String() {
+		t.Errorf("field doc emission is not a fixpoint:\n first %s\nsecond %s", s, s2)
+	}
+}
+
 // nameRefSpliceFieldRules classifies every exported SchemaNode field whose
 // treatment under nodeIsNameRefShape is not the ordinary blocking case. The
 // exemptions are the reserved USAGE-SITE attributes a splice is already

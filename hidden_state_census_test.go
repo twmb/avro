@@ -49,7 +49,9 @@ func TestInvariant_HiddenStateOnPublicStructs(t *testing.T) {
 	// test; adding a name here requires doing the same.
 	composableWithHiddenState := map[string]string{
 		"CustomType": "needsAvroType is fail-loud only: it can make Parse REJECT (when AvroType is empty), never silently substitute a value — pinned by TestInvariant_CustomTypeHiddenStateFailsLoud",
-		"SchemaNode": "refTarget (with refNS, the scope it was resolved in — the two are one stamp and are only meaningful together) is consulted only while the name resolver still binds the node's exported Type to it (nodeRefTargetAgrees), so an edited Type always wins — pinned by TestNodeRefSchema_EditedTypeIgnoresStaleStamp",
+		"SchemaNode": "refTarget (with refNS, the scope it was resolved in — the two are one stamp and are only meaningful together) is consulted only while the name resolver still binds the node's exported Type to it (nodeRefTargetAgrees), so an edited Type always wins — pinned by TestNodeRefSchema_EditedTypeIgnoresStaleStamp. " +
+			"docSet/logicalSet are PRESENCE-ONLY and value-transparent: they decide whether an attribute whose value IS the field's zero gets written at all, never what any attribute says, so the value a caller sets is the value that comes back for every input — pinned by TestInvariant_PresenceStateIsValueTransparent",
+		"SchemaField": "docSet is the field-level twin of SchemaNode's, and carries the same proof: presence-only and value-transparent — pinned by TestInvariant_PresenceStateIsValueTransparent",
 	}
 	for _, ty := range types {
 		exported, hidden := fieldSplit(ty)
@@ -94,4 +96,100 @@ func TestInvariant_CustomTypeHiddenStateFailsLoud(t *testing.T) {
 		t.Fatalf("unexpected error %v; want the loud unsupported-Avro-native-type reject", err)
 	}
 	t.Logf("fails loud as required: %v", err)
+}
+
+// TestInvariant_PresenceStateIsValueTransparent executes the claim that the
+// presence flags cannot win over a caller.
+//
+// They differ in kind from refTarget, which selects a DEFINITION and so could
+// substitute one schema for another. A presence flag decides one thing only:
+// whether an attribute whose value is the field's own zero is written at all.
+// It never chooses a value, so for every value a caller can set, the value
+// that comes back is the value they set — with the flag set and with it
+// clear. That is the property proved here, over both a node extracted from a
+// parse (flags set) and the same node hand-composed (flags clear), including
+// the case a caller cannot otherwise reach: clearing the field to "".
+//
+// The wire, the canonical form and the fingerprint must be identical across
+// the pair as well: presence is a metadata-fidelity question, and none of
+// those surfaces carries doc or logicalType at all.
+func TestInvariant_PresenceStateIsValueTransparent(t *testing.T) {
+	// extracted carries every presence flag set; composed carries none.
+	extracted := MustParse(`{"type":"record","name":"R","doc":"","fields":[` +
+		`{"name":"f","type":{"type":"int","logicalType":""},"doc":""}]}`).Root()
+	if !extracted.docSet {
+		t.Fatal("the extracted node did not record a written doc; the control is broken")
+	}
+	if !extracted.Fields[0].docSet {
+		t.Fatal("the extracted field did not record a written doc; the control is broken")
+	}
+	if !extracted.Fields[0].Type.logicalSet {
+		t.Fatal("the extracted type did not record a written logicalType; the control is broken")
+	}
+
+	for _, docValue := range []string{"", "x", "a longer doc string"} {
+		for _, ltValue := range []string{"", "date", "not-a-logical"} {
+			withState := extracted
+			withState.Fields = append([]SchemaField(nil), extracted.Fields...)
+			withState.Fields[0].Type = extracted.Fields[0].Type
+			withState.Doc = docValue
+			withState.Fields[0].Doc = docValue
+			withState.Fields[0].Type.LogicalType = ltValue
+
+			clean := SchemaNode{Type: "record", Name: "R", Doc: docValue,
+				Fields: []SchemaField{{Name: "f", Doc: docValue,
+					Type: SchemaNode{Type: "int", LogicalType: ltValue}}}}
+
+			for label, n := range map[string]SchemaNode{"extracted": withState, "composed": clean} {
+				s, err := n.Schema()
+				if err != nil {
+					t.Fatalf("%s doc=%q lt=%q: Schema(): %v", label, docValue, ltValue, err)
+				}
+				back := s.Root()
+				if back.Doc != docValue {
+					t.Errorf("%s: node Doc set to %q came back %q — hidden state changed a caller's value",
+						label, docValue, back.Doc)
+				}
+				if back.Fields[0].Doc != docValue {
+					t.Errorf("%s: field Doc set to %q came back %q", label, docValue, back.Fields[0].Doc)
+				}
+				if back.Fields[0].Type.LogicalType != ltValue {
+					t.Errorf("%s: LogicalType set to %q came back %q",
+						label, ltValue, back.Fields[0].Type.LogicalType)
+				}
+			}
+
+			// The surfaces presence must not reach.
+			sa, err := withState.Schema()
+			if err != nil {
+				t.Fatalf("extracted Schema(): %v", err)
+			}
+			sb, err := clean.Schema()
+			if err != nil {
+				t.Fatalf("composed Schema(): %v", err)
+			}
+			if string(sa.Canonical()) != string(sb.Canonical()) {
+				t.Errorf("presence state changed the canonical form:\n %s\n %s", sa.Canonical(), sb.Canonical())
+			}
+			if len(sa.Canonical()) == 0 {
+				t.Fatal("canonical form came back empty, so the comparison proved nothing")
+			}
+			fa, fb := sa.Fingerprint(NewRabin()), sb.Fingerprint(NewRabin())
+			if string(fa) != string(fb) {
+				t.Errorf("presence state changed the fingerprint: %x vs %x", fa, fb)
+			}
+			val := map[string]any{"f": 0}
+			ea, err := sa.AppendEncode(nil, val)
+			if err != nil {
+				t.Fatalf("extracted encode: %v", err)
+			}
+			eb, err := sb.AppendEncode(nil, val)
+			if err != nil {
+				t.Fatalf("composed encode: %v", err)
+			}
+			if string(ea) != string(eb) {
+				t.Errorf("presence state changed the wire: %x vs %x", ea, eb)
+			}
+		}
+	}
 }
