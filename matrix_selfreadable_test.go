@@ -266,6 +266,63 @@ func TestMatrix_SelfReadableAtScale(t *testing.T) {
 		})
 	}
 
+	// The DEFAULT fill is a distinct emit route to the same bytes, and it is
+	// the one route where the caller never chose a carrier: a bytes/fixed
+	// default is []byte by construction. It is also pre-encoded at PARSE, so
+	// its verdict has to travel to encode rather than being raised where it is
+	// computed — a schema whose default cannot be written must still parse,
+	// because a reader that DROPS the field never writes it.
+	//
+	// Four fill routes reach it and they are not one path: an absent key in a
+	// map[string]any, an absent key in a typed map, a struct field tagged
+	// omitzero (reflect), and the same field through the COMPILED unsafe
+	// record path, which copies the pre-encoded bytes at compile time and so
+	// can emit what its reflect twin refuses if the verdict does not travel
+	// with them.
+	for _, n := range []int{unscaledCap - 1, unscaledCap, unscaledCap + 1} {
+		for _, c := range []struct {
+			label string
+			inner string
+		}{
+			{"bytes/decimal", `{"type":"bytes","logicalType":"decimal","precision":65536,"scale":0}`},
+			{"bytes/big-decimal", `{"type":"bytes","logicalType":"big-decimal"}`},
+			{"fixed/decimal", fmt.Sprintf(`{"type":"fixed","name":"DF","size":%d,"logicalType":"decimal","precision":65536,"scale":0}`, n)},
+		} {
+			payload := rawOf(n)
+			if c.label == "bytes/big-decimal" {
+				payload = bigDecFramingOf(n)
+			}
+			schema := fmt.Sprintf(
+				`{"type":"record","name":"R","fields":[{"name":"d","type":%s,"default":%s},{"name":"keep","type":"int"}]}`,
+				c.inner, codepointLit(payload))
+			label := fmt.Sprintf("default/%s@%+d", c.label, n-unscaledCap)
+			t.Run("decimal-unscaled-length/"+label, func(t *testing.T) {
+				s, err := avro.Parse(schema)
+				if err != nil {
+					t.Fatalf("a schema whose default cannot be WRITTEN must still PARSE: %v", err)
+				}
+				absent := map[string]any{"keep": int32(7)}
+				check(t, label, absent,
+					func(b []byte, v any) ([]byte, error) { return s.AppendEncode(b, v) },
+					func(b []byte, tgt any) error { _, e := s.Decode(b, tgt); return e }, "binary")
+				check(t, label, absent,
+					func(b []byte, v any) ([]byte, error) { return s.AppendEncodeJSON(b, v) },
+					func(b []byte, tgt any) error { return s.DecodeJSON(b, tgt) }, "json")
+				check(t, label, absent,
+					func(b []byte, v any) ([]byte, error) { return s.AppendSingleObject(b, v) },
+					func(b []byte, tgt any) error { _, e := s.DecodeSingleObject(b, tgt); return e }, "single-object")
+				checkOCF(t, label, s, absent)
+				// omitzero, reflect and compiled-unsafe both: an addressable
+				// struct pointer is what routes into the compiled path.
+				if c.label != "fixed/decimal" {
+					check(t, label+"/omitzero", &srOmitBytes{Keep: 7},
+						func(b []byte, v any) ([]byte, error) { return s.AppendEncode(b, v) },
+						func(b []byte, tgt any) error { _, e := s.Decode(b, tgt); return e }, "binary-omitzero")
+				}
+			})
+		}
+	}
+
 	// UNSAFE struct-field path. The generators above pass top-level []any /
 	// map[string]any values, which route through the REFLECT encoders. A
 	// zero-byte array that is an addressable struct field instead routes
@@ -318,6 +375,27 @@ func checkOCF(t *testing.T, label string, s *avro.Schema, v any) {
 		t.Errorf("SELF-INCOMPATIBLE [ocf wire]: %s — the writer produced a %d-byte file the reader REJECTS: %v",
 			label, size, err)
 	}
+}
+
+// srOmitBytes routes a zero-valued defaulted field through the omitzero arm,
+// as an addressable struct pointer so the COMPILED unsafe record path is the
+// one that fills the default.
+type srOmitBytes struct {
+	D    []byte `avro:"d,omitzero"`
+	Keep int32  `avro:"keep"`
+}
+
+// codepointLit renders bytes as an Avro-JSON codepoint default literal using
+// \u escapes, so the source carries no raw control bytes.
+func codepointLit(b []byte) string {
+	var sb strings.Builder
+	sb.Grow(len(b)*6 + 2)
+	sb.WriteByte('"')
+	for _, c := range b {
+		fmt.Fprintf(&sb, "\\u%04x", c)
+	}
+	sb.WriteByte('"')
+	return sb.String()
 }
 
 // srEmptyRec maps to an empty record; the typed slices below force the unsafe

@@ -1144,6 +1144,25 @@ type serRecordField struct {
 	meta         *fieldMeta
 	defaultBytes []byte // pre-encoded Avro binary for the field's default value
 	hasDefault   bool
+	// defaultErr defers a verdict about defaultBytes from PARSE to ENCODE.
+	// A field default is pre-encoded once at parse, which is the wrong moment
+	// to refuse it: a schema whose default cannot be WRITTEN is still a schema
+	// a reader must be able to PARSE, because a reader that drops the field
+	// never writes that default and decodes such data correctly. So the parse
+	// records the reason here and every consumer of defaultBytes surfaces it
+	// at the moment the default would actually reach the wire.
+	defaultErr error
+}
+
+// appendDefault appends the field's pre-encoded default, or returns the
+// verdict recorded when it was built. One accessor rather than a check beside
+// each append, so a later consumer of defaultBytes cannot pick up the bytes
+// without the verdict that governs them.
+func (f *serRecordField) appendDefault(dst []byte) ([]byte, error) {
+	if f.defaultErr != nil {
+		return nil, f.defaultErr
+	}
+	return append(dst, f.defaultBytes...), nil
 }
 
 // ozAction is what an omitzero-tagged field does when its Go value is zero (or
@@ -1240,7 +1259,9 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 					if !f.hasDefault {
 						return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: errors.New("missing key")}
 					}
-					dst = append(dst, f.defaultBytes...)
+					if dst, err = f.appendDefault(dst); err != nil {
+						return nil, recordFieldError(t, f.name, err)
+					}
 					continue
 				}
 				// reflect.ValueOf(nil) returns the invalid zero Value,
@@ -1272,7 +1293,9 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 				if !f.hasDefault {
 					return nil, &SemanticError{GoType: t, AvroType: "record", Field: f.name, Err: errors.New("missing key")}
 				}
-				dst = append(dst, f.defaultBytes...)
+				if dst, err = f.appendDefault(dst); err != nil {
+					return nil, recordFieldError(t, f.name, err)
+				}
 				continue
 			}
 			if dst, err = f.fn(dst, value, depth+1); err != nil {
@@ -1312,7 +1335,9 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 		if mapping.omitzero[i] && valueIsZero(fv) {
 			switch f.omitzeroAction() {
 			case ozDefault:
-				dst = append(dst, f.defaultBytes...)
+				if dst, err = f.appendDefault(dst); err != nil {
+					return nil, recordFieldError(t, f.name, err)
+				}
 				continue
 			case ozNull:
 				nullByte, _ := nullUnionBytes(f.meta != nil && f.meta.nullSecond)
@@ -2491,6 +2516,49 @@ func decimalChargeLen(prefix []byte, totalLen int, logical string) (int, bool) {
 	// Clamp so the int conversion cannot overflow on a 32-bit build; anything
 	// at or past the bound rejects identically.
 	return int(min(uLen, int64(maxDecimalUnscaledBytes)+1)), true
+}
+
+// decimalDefaultPayload returns the slice of a pre-encoded field default that
+// the DECODER will charge against the unscaled bound, and whether the question
+// applies at all. The framing differs by carrier: encodeDefault writes a bytes
+// default as a length prefix followed by the payload, while a fixed default IS
+// the payload. Anything else carries no decimal.
+func decimalDefaultPayload(defaultBytes []byte, kind string) ([]byte, bool) {
+	switch kind {
+	case "fixed":
+		return defaultBytes, true
+	case "bytes":
+		n, rest, err := readVarlong(defaultBytes)
+		if err != nil || n < 0 || n > int64(len(rest)) {
+			return nil, false
+		}
+		return rest[:n], true
+	}
+	return nil, false
+}
+
+// chargeDecimalDefault reports the verdict a field default must carry from
+// parse to encode: whether writing it would put a decimal payload on the wire
+// that this package's own decoder refuses.
+//
+// The default pipeline is the one emit path where the caller never chose a
+// carrier — a bytes/fixed default is []byte by construction — and the one that
+// runs at PARSE, which is why the answer is recorded rather than returned. It
+// asks the same function every other emit path asks, so it refuses exactly the
+// payloads decode refuses.
+func chargeDecimalDefault(defaultBytes []byte, kind, logical string) error {
+	if logical != "decimal" && logical != "big-decimal" {
+		return nil
+	}
+	payload, ok := decimalDefaultPayload(defaultBytes, kind)
+	if !ok {
+		return nil
+	}
+	n, ok := decimalChargeLen(payload, len(payload), logical)
+	if !ok {
+		return nil
+	}
+	return checkDecimalUnscaledSize(n)
 }
 
 type serBytesDecimal struct {

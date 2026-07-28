@@ -22633,3 +22633,124 @@ func TestRegression_OverCapDecimalFixedParsesAndSkips(t *testing.T) {
 		t.Fatalf("encode of the over-cap decimal fixed must be rejected")
 	}
 }
+
+// A field default that cannot be WRITTEN must not stop its schema being
+// PARSED. The two are different questions and only one of them is the reader's:
+// a reader that DROPS the field never writes the default, and decodes such data
+// correctly, so refusing the schema at parse breaks a working reader to prevent
+// a write that reader never performs. The verdict is therefore recorded when
+// the default is pre-encoded and surfaced at the moment it would reach the wire.
+//
+// Four fill routes reach the pre-encoded bytes and they are not one path: an
+// absent key in a map[string]any, an absent key in a typed map, a struct field
+// tagged omitzero through reflect, and the same field through the COMPILED
+// unsafe record path, which copies those bytes at compile time and would emit
+// what its reflect twin refuses if the verdict did not travel with them.
+func TestRegression_DecimalDefaultVerdictDefersToEncode(t *testing.T) {
+	const cap = 32 << 10
+
+	cpLit := func(b []byte) string {
+		var sb strings.Builder
+		sb.Grow(len(b)*6 + 2)
+		sb.WriteByte('"')
+		for _, c := range b {
+			fmt.Fprintf(&sb, "\\u%04x", c)
+		}
+		sb.WriteByte('"')
+		return sb.String()
+	}
+	schemaWith := func(n int) string {
+		return fmt.Sprintf(
+			`{"type":"record","name":"R","fields":[{"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":65536,"scale":0},"default":%s},{"name":"keep","type":"int"}]}`,
+			cpLit(bytes.Repeat([]byte{0x01}, n)))
+	}
+
+	for _, n := range []int{cap, cap + 1} {
+		overCap := n > cap
+		t.Run(fmt.Sprintf("n=%+d", n-cap), func(t *testing.T) {
+			s, err := avro.Parse(schemaWith(n))
+			if err != nil {
+				t.Fatalf("the schema must PARSE whether or not its default can be written: %v", err)
+			}
+			type omitT struct {
+				D    []byte `avro:"d,omitzero"`
+				Keep int32  `avro:"keep"`
+			}
+			for _, fill := range []struct {
+				name  string
+				value any
+			}{
+				{"absent map[string]any key", map[string]any{"keep": int32(7)}},
+				{"absent typed-map key", map[string]int32{"keep": 7}},
+				{"omitzero struct (compiled unsafe path)", &omitT{Keep: 7}},
+				{"omitzero struct value (reflect path)", omitT{Keep: 7}},
+			} {
+				t.Run(fill.name, func(t *testing.T) {
+					w, err := s.Encode(fill.value)
+					if overCap {
+						if err == nil {
+							t.Fatalf("filling an unwritable default produced %d wire bytes instead of an error", len(w))
+						}
+						if !strings.Contains(err.Error(), "exceeds") {
+							t.Errorf("the error must name the bound that refused it, got: %v", err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("a default at the bound must still fill: %v", err)
+					}
+					var into any
+					if _, err := s.Decode(w, &into); err != nil {
+						t.Fatalf("the filled wire must decode: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+// The reader-side twin of the writer case: when the READER carries a field the
+// writer lacks and the reader's own default is over-bound, the failure surfaces
+// at decode. That is the bound working on the side that owns it — the default
+// is materialized into a value here, not written — and it is pinned so the
+// asymmetry with the writer case is not re-filed as an inconsistency.
+func TestRegression_ReaderSideDecimalDefaultFillRejectsAtDecode(t *testing.T) {
+	const cap = 32 << 10
+	cpLit := func(n int) string {
+		var sb strings.Builder
+		sb.WriteByte('"')
+		for range n {
+			fmt.Fprintf(&sb, "\\u%04x", 1)
+		}
+		sb.WriteByte('"')
+		return sb.String()
+	}
+	writer := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
+	wire, err := writer.Encode(map[string]any{"keep": int32(7)})
+	if err != nil {
+		t.Fatalf("writer encode: %v", err)
+	}
+	for _, n := range []int{cap, cap + 1} {
+		reader, err := avro.Parse(fmt.Sprintf(
+			`{"type":"record","name":"R","fields":[{"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":65536,"scale":0},"default":%s},{"name":"keep","type":"int"}]}`,
+			cpLit(n)))
+		if err != nil {
+			t.Fatalf("n=%d: the reader schema must parse: %v", n, err)
+		}
+		resolved, err := avro.Resolve(writer, reader)
+		if err != nil {
+			t.Fatalf("n=%d: resolve: %v", n, err)
+		}
+		var got map[string]any
+		_, decErr := resolved.Decode(wire, &got)
+		if n > cap {
+			if decErr == nil {
+				t.Errorf("n=%d: an over-bound reader default must not materialize silently", n)
+			}
+			continue
+		}
+		if decErr != nil {
+			t.Errorf("n=%d: a reader default at the bound must fill: %v", n, decErr)
+		}
+	}
+}

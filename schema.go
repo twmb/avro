@@ -3766,6 +3766,11 @@ func encodeFieldDefaultBytes(defaultVal any, node *schemaNode, fieldName string,
 	}
 	srf.defaultBytes = defaultBytes
 	srf.hasDefault = true
+	// Recorded, not returned: a default that cannot be WRITTEN must not stop
+	// the schema PARSING, because a reader that drops this field never writes
+	// it and reads such data correctly today. The encode-side consumers of
+	// defaultBytes surface this at the moment the default would reach the wire.
+	srf.defaultErr = chargeDecimalDefault(defaultBytes, node.kind, node.logical)
 	return nil
 }
 

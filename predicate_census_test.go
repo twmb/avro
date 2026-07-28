@@ -666,6 +666,10 @@ var censusRegistry = []censusQuestion{
 				note: "the arm that reaches the wire without any of the shared builders. It delegates the bound but must decide WHICH BYTES itself, because the caller-supplied payload is the framing on a big-decimal and the unscaled value on a decimal. A framing it cannot read is left alone deliberately: the decoder then fails on the framing, which is a different question than this bound.",
 			},
 			{
+				repr: "pre-encoded field DEFAULT, emit", site: "chargeDecimalDefault, recorded on serRecordField.defaultErr", file: "ser.go",
+				note: "the only answerer whose verdict is RECORDED rather than raised: a default is pre-encoded at parse, and refusing it there would refuse the schema, which a reader that DROPS the field must still be able to parse. Four consumers read the pre-encoded bytes and each surfaces the verdict at the moment they would reach the wire (three splice sites via serRecordField.appendDefault, plus the compiled unsafe path's omitzeroErr). The JSON default arm is deliberately NOT here: it encodes the default VALUE through appendAvroJSON, so it is already charged as an ordinary emit.",
+			},
+			{
 				repr: "opaque escape -> fixed, binary and JSON, emit", site: "the size charge in serFixedDecimal.ser and the JSON fixed decimal arm", file: "ser.go + json_codec.go",
 				note: "not a separate rule: the fixed opaque arm writes exactly the schema size, the same quantity appendDecimalFixed charges for the numeric arm. It is a separate SITE only because the opaque path never reaches that builder, and neutering either one alone reds its own cells.",
 			},
@@ -676,13 +680,13 @@ var censusRegistry = []censusQuestion{
 				// (one line names both, so it matches twice), the delegation
 				// line, two binary consume sites, and the RatFromBytes comment
 				// recording why that public entry keeps its own guard.
-				// ser.go 6: decimalUnscaledBytes, appendDecimalFixed,
-				// chargeOpaqueDecimalBytes, the fixed opaque arm and
-				// buildBigDecimalPayload — every emit route to the wire —
-				// plus decimalChargeLen's doc naming the function whose input
-				// it computes.
+				// ser.go 7: decimalUnscaledBytes, appendDecimalFixed,
+				// chargeOpaqueDecimalBytes, the fixed opaque arm,
+				// buildBigDecimalPayload and chargeDecimalDefault — every emit
+				// route to the wire — plus decimalChargeLen's doc naming the
+				// function whose input it computes.
 				"deser.go":       9,
-				"ser.go":         6,
+				"ser.go":         7,
 				"json_decode.go": 2,
 				"json_codec.go":  1,
 			}},

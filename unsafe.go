@@ -38,6 +38,11 @@ type fastFieldSer struct {
 	// default (ozDefault) or the null-branch index byte (ozNull). Precomputed
 	// at compile from omitzeroAction so the fast path matches the reflect path.
 	omitzeroBytes []byte
+	// omitzeroErr carries serRecordField.defaultErr through the compile, so
+	// the fast path refuses exactly where the reflect path refuses. Copying
+	// the bytes without the verdict that governs them is how a fast path
+	// silently emits what its slow twin rejects.
+	omitzeroErr error
 }
 
 type fastRecordDeser struct {
@@ -92,6 +97,7 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 				switch f.omitzeroAction() {
 				case ozDefault:
 					ffs.omitzeroBytes = f.defaultBytes
+					ffs.omitzeroErr = f.defaultErr
 				case ozNull:
 					nb, _ := nullUnionBytes(f.meta != nil && f.meta.nullSecond)
 					ffs.omitzeroBytes = []byte{nb}
@@ -170,6 +176,9 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 				// from omitzeroAction — the field's default, or the
 				// null-branch byte (0x00 for ["null",T], 0x02 for
 				// ["T","null"]).
+				if f.omitzeroErr != nil {
+					return nil, recordFieldError(fast.typ, f.name, f.omitzeroErr)
+				}
 				dst = append(dst, f.omitzeroBytes...)
 				continue
 			}
