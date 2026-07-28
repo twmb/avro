@@ -9443,3 +9443,137 @@ compressed form plus this pointer.
 #### NOT_BUGS #56
 
 56. **Flat-format (goavro-style) fields surface POST-LIFT in the metadata API (maintainer-adjudicated).** A field written as a bare string complex-kind type with the kind's defining key alongside the field's own keys (`{"name":"E","type":"enum","symbols":[...]}`) is a deliberate parse-input concession to linkedin/goavro's flat field format; the wire parser lifts the defining keys into a nested type definition named after the field (`liftFlatFieldType`, schema_parse.go). `Root()` describes that same post-lift schema: the type node carries the name and defining content, the routed keys (defining key, doc, logicalType/precision/scale, custom props; name/namespace for named kinds) do NOT appear in `SchemaField.Props`, and `Root().Schema()` rebuilds the nested form. Rationale: the as-written flat shape is unrepresentable through the rebuild (`toJSONWalk` emits a SchemaNode as a nested type OBJECT, and the lift gate fires only on a bare STRING type, so a Props-carrying posture cannot round-trip), and no reference posture exists because both references reject the flat form outright — fastavro 1.12.2 raises `UnknownType` (executed), and Java resolves a textual field type as a NAME (Schema.java:1828-1829; the complex-kind dispatch at :1830-1844 applies only to object nodes), so `"enum"` is an undefined name there. Deliberately DIFFERENT from #33's Props-carrying posture: the logicalType lift's as-written shape IS preserved by the rebuild and re-lifts on re-parse, so Props-carrying round-trips there. The lift decision and key routing are shared helpers (`flatFieldNeedsLift` / `flatLiftTypeMap`) used by both the wire parser and the metadata walker, so the two cannot drift. Pinned by `TestRegression_FlatFieldRootSchemaRoundTrip`, `_FlatFixedNameRefDefaultCoerced`, and the `TestMatrix_FlatFieldLift*` suite (kind × namespace × logicals × name-ref-default shapes × no-lift boundary parity × degenerate content; neuter-verified — gating the metadata twin off reproduces the empty-node / rebuild-error / uncoerced-default shapes on every lift-dependent cell while the no-lift parity cells stay green). Verdict parity (#71): malformed precision/scale in the flat spelling take the TYPE-level consumed gate's verdict, so flat and nested twins agree on every body shape (`TestRegression_FlatFieldMalformedPrecisionMatchesNestedTwin`).
+
+## Distillation archive (2026-07-28 #2) — two 2026-07-27 ledger era lines, verbatim
+
+Compressed to one-liners in AUDIT_CORE.md §Round ledger during the size-guard
+pass at the top of the 2026-07-28 FULL round (CORE 55.4KB, at cap). Their
+rulings live in NOT_BUGS #63/#73/#74 and the round narratives they cite; what
+is archived here is the ledger prose itself.
+
+- 2026-07-27 · faa5d80→c8365de · ERA BLOCK (1 CENSUS + 3 FIX; verbatim:
+  archive 2026-07-27 #4). **Q4 registered** — reserved-key routing, corpus
+  shaped BY THE RULINGS rather than re-derived from the code, driving the
+  BICONDITIONAL they share (structural field set IFF consumed; Props = raw
+  minus consumed; never both, never neither). It REPORTED a loss it could not
+  fix, and three FIX lines closed it AT ITS CLASS, each by DERIVATION over an
+  enumeration: `nodeCarriesOnlyType`, `nodeCarriesNothingBut`,
+  `schemaKeyBinds` (#63(j)). The durable half each time is a REFLECT
+  COMPLETENESS GUARD over SchemaNode's field set, upgraded mid-era from "the
+  shortcut BLOCKS" to a ROUND TRIP read off the metadata FIELDS. **Q16/Q17
+  registered**; the caller-composed/edited gap CLOSED (204 cells); a fourth
+  derived change was REVERTED BY THE GATE, then ruled and landed as its own
+  round. Eleven driver defects of my own, every one caught by RUNNING the
+  driver or by a neuter.
+- 2026-07-27 · b7717b3→b1c42bb · ERA (1 FULL + 1 FIX; verbatim: archive
+  2026-07-27 #6). FULL: triple distillation, quarantine e32a7eb CLEARED, **#72
+  RULED** (non-string `doc` dropped at both levels = exact Java parity, the
+  predicting fact being RESERVED-SET MEMBERSHIP, which settles #70 and #72 with
+  one test), 5 fronts incl. `atype` (the inverse-density pick: CLEAN) and a
+  leading-dot escape the gate STOPPED, **4 BEHAVIORAL one root — P22 minted**.
+  FIX: **#73 RULED** — a JSON null is a PRESENT-but-unreadable body, so it takes
+  the malformed route everywhere; swept by SEMANTIC QUESTION, which bounded it
+  at TWO sites of fourteen keys (the rest read by assertion, which a nil `any`
+  fails), one predicate `jsonNullBody` = census **Q18**; the compensating guard
+  (#55 positivity) was NAMED AND DISPROVED rather than assumed; blast radius 32
+  of 5082 cells, one deliberate loosening; ledger corrected a size claim that
+  was true before the line was written and false after.
+
+## Distillation archive (2026-07-28 #3) — the FULL round ledger line, verbatim (compressed at write time; it crossed the CORE cap on its own)
+
+- 2026-07-28 · b045c18 · FULL (read-only) · quarantine 9ff2d27..HEAD = b045c18
+  CLEARED — the presence bitmask probed at every position the enumeration holds
+  CONSTANT (array items, map values, union branch, record field type,
+  second-occurrence reference, recursive, diamond, forward reference, field
+  level, and the SchemaCache cross-parse splice): all fourteen zero-body cells
+  preserve and round-trip, `emitStrings` returns a non-nil empty slice so no
+  cell emits `null`, and the wrapped-reference `size:0` reject is #63(c), not
+  new · **1 BEHAVIORAL (+1 subordinate ask), one root: a reader-side cap whose
+  "can't happen" rationale holds for ONE carrier of two.**
+  `maxDecimalUnscaledBytes` (32 KiB, deser.go:771) is documented under #11 as
+  needing a producer-side compliance check; the check is the parse-time
+  precision cap, and the archive's rationale states the premise outright — "a
+  legitimate unscaled value needs ≤ ~27 KiB, well under the 32 KiB cap". True of
+  the `*big.Rat` value domain, FALSE of the `[]byte` opaque carrier (#51),
+  which reaches the wire without `checkDecimalPrecision`. So `Encode` emits a
+  decimal wire NO decode target reads — `any`, `[]byte`, `*big.Rat`, and the
+  JSON wire all reject — with an exact boundary (32768 passes, 32769 fails) on
+  both the bytes and fixed carriers. Second face: a decimal on a `fixed` whose
+  SIZE exceeds the cap parses, and then NO value of that schema is decodable,
+  which a producer-side check on the carrier alone would not reach · **P23
+  minted** · gate verdict documented-BUT-CONTRADICTED with executed evidence;
+  introduced decode-only by 7d1ccac, so no ping-pong · both nets that own the
+  question named as the new OPEN gap rather than assumed adequate · 4 more
+  fronts CLEAN, each with the structural angle recorded: the caller hostile-VALUE
+  domain × STRUCTURE gap (504 cells, splice/recursive/diamond/forward-ref × 18
+  hostile values × 4 slots — zero panics, error CLASS identical at every
+  structure; the gap still wants a NET, so it stays open) · `skip.go` (the
+  inverse-density pick: skip-vs-decode consumption differential over 38
+  fragments through resolution field-drop, all agree; already netted by the
+  reader-grammar census) · Y4's narrow-before-check trilogy (every site carries
+  an explicit guard + the hazard in prose) · `LinkedinFloats`' three doc-string
+  contracts EXECUTED (direct, tagged-branch, bare-union-null, ±Inf-regardless),
+  plus containers, promotion and typed targets — all exact · suite + fastavro +
+  `-race` green; **Java ABSENT (no JVM), so every parity claim here is
+  fastavro-corroborated only** · size pass at the TOP as mandated: CORE
+  55.4→54.5 KB (two 2026-07-27 era lines compressed, verbatim to archive
+  2026-07-28 #2), PATTERNS 132.4, NOT_BUGS 120.6 · UNCONVERGED (counter 0),
+  freeze stays.
+
+## Distillation archive (2026-07-28 #4) — the reserved-attribute ENUMERATION round's ledger line, verbatim
+
+Compressed to a short line in AUDIT_CORE.md §Round ledger: its 71 unruled
+cells went to 0 in the very next round, so the standing content is the
+enumeration itself (§Open net gaps) and NOT_BUGS #74, not this prose.
+
+- 2026-07-27 · b1c42bb (START head — b1c42bb..HEAD quarantines this round's
+  commits) · FIX (ruling-directed) · **the round's unit was a CLASS, and the
+  deliverable is the ENUMERATION rather than its members**: every reserved
+  attribute × {absent, valid, written-zero, JSON-null, wrong-typed, quoted} ×
+  {type, field} × every kind = 2184 cells, each read off {parse verdict,
+  structural field, Props, String, Canonical, Fingerprint, rebuild, wire} ·
+  quarantine 81e8f6b..HEAD = b1c42bb CLEARED (its cells are in the
+  enumeration and agree) · **method**: expectations DERIVED PER CELL from the
+  references and never from this package — a source model of Schema.java
+  carrying the line each rule came from (JVM-less), plus fastavro EXECUTED
+  per cell; where they disagree the expectation is one of THEIR answers and
+  `reservedProvenance` says which; where neither can adjudicate (a stray key
+  has no analogue in either) the standing rulings govern; where nothing
+  settles it the cell is recorded UNRULED and asserted only to exist ·
+  **the table found four of its own defects before it found any of the
+  package's** — an "absent" axis that left the base object's own copy of
+  required keys in place, a survival test that asked String() (the SOURCE
+  text, so every accepted cell read as preserved), a bare-type carrier the
+  walker could not see through, and a Java model that let a field with no
+  type through. Each was a harness defect that would have manufactured
+  findings; the calibration cells are what surfaced them · **3 BEHAVIORAL,
+  one root — P22's WRITTEN-ZERO half, closed by a mechanism unlike the null
+  half's**: a body the decode reads PERFECTLY into a value indistinguishable
+  from absence needs presence state, not a body check. `doc:""` and
+  `logicalType:""` died in the rebuild; `order:""` parsed while every other
+  non-spec order rejected · **#74 RULED — the emission condition is PER
+  ATTRIBUTE**, and that is the entry's content: Java emits doc when non-NULL
+  and aliases when non-EMPTY, decides order on the NODE, and keeps anything
+  outside SCHEMA_RESERVED whatever its content. A blanket presence mechanism
+  would have shipped a divergence at two of the four, which the N5 neuter
+  proves the net now catches · presence lives in HIDDEN state, registered in
+  the hidden-state census with the proof it cannot beat a caller
+  (presence-only ⇒ VALUE-TRANSPARENT, unlike refTarget which selects a
+  definition) · the completeness guard grew the half it structurally could
+  not reach, and its FIRST version could not red because the probe was a
+  named kind, which never collapses — a reachability precondition is now part
+  of the cell · 5 neuters, red sets distinguishable, plus a matrix neuter
+  (18 cells) · **71 cells reported UNRULED, not guessed**: 63 stray
+  written-zeros reaching neither surface, and 8 where twmb answers a
+  malformed `namespace` differently from BOTH references · zero-value gap
+  RETIRED, replaced by the unruled family · suite + fastavro + `-race` green;
+  Java ABSENT (JVM-less; the model is the substitute and says so) · **the
+  mandated triple pass ran at the END of this round rather than its top, since
+  the round's own instruction opened with the enumeration — 21.9KB archived
+  verbatim, four entries and two ledger lines compressed. Measured with `wc -c`
+  after every write, this line included: CORE 55.3 (at) / PATTERNS 151.2 /
+  NOT_BUGS 124.9 KB. The pass recovered ~6.6KB and the round's own two rulings
+  spent more, so PATTERNS and NOT_BUGS stay over and the next round opens with
+  a pass on those two. Not nibbled further on purpose: the remaining fat is
+  live ruling text the pre-action gate quotes, and trading that for a soft
+  size target is the wrong trade** · UNCONVERGED (counter 0), freeze stays.
