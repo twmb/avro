@@ -123,27 +123,32 @@ type SchemaNode struct {
 	// field-by-field drops it (the rebuilt node then behaves hand-built).
 	refTarget *SchemaNode
 
-	// docSet and logicalSet record that the attribute was WRITTEN, which
-	// its string field cannot: the empty string is both a legal value and
-	// the field's zero, so `Doc != ""` means two things at once and drops
-	// exactly the value that was written as "". They are hidden because a
-	// caller composing a SchemaNode by hand has no empty-doc to express —
-	// the distinction only exists for text that came from a parse — and
-	// because an exported companion would be a new API for a case the
-	// reference implementations reach without one.
+	// present records which attributes were WRITTEN, which their own
+	// fields cannot: an attribute whose body is the field's zero — `""`,
+	// `[]`, `0` — leaves the field indistinguishable from one nobody
+	// wrote, so `Doc != ""` / `len(Aliases) > 0` / `Size != 0` each mean
+	// two things at once and drop exactly the value that was written as
+	// the zero. It is hidden because a caller composing a SchemaNode by
+	// hand has no empty-doc to express — the distinction exists only for
+	// text that came from a parse — and because an exported companion
+	// would be new API for a case the references reach without one.
 	//
-	// Presence is recorded ONLY where the attribute is consumed, and for
-	// doc only where the kind carries one: Apache Avro reads "doc" in
-	// parseRecord/parseEnum/parseFixed and parseField and nowhere else
-	// (Schema.java:1864/:1912/:1956/:1888), so a doc on a primitive or a
-	// container has no Java analogue and keeps the value-only behavior.
-	// The emission conditions that read these mirror Java's, which differ
-	// PER ATTRIBUTE: doc emits when non-null (:1039/:1154/:1367/:1062) so
-	// an empty doc survives, while aliases emits when non-EMPTY (:886,
-	// :1070) so an empty alias list is dropped. One blanket "was it
-	// written" rule for every attribute would ship a divergence.
-	docSet     bool
-	logicalSet bool
+	// Presence is recorded ONLY where the attribute is CONSUMED, and it is
+	// consulted per attribute rather than as one blanket rule, because the
+	// authority differs per PLACEMENT:
+	//
+	//   - Where Apache Avro has the placement, its emission condition
+	//     governs, and those conditions differ from each other: doc emits
+	//     when non-null (Schema.java:1039/:1154/:1367/:1062) so an empty
+	//     doc survives, while aliases emits when non-EMPTY (:886, :1070)
+	//     so an empty alias list is dropped even on a kind that binds it.
+	//   - Where NEITHER reference has the placement — a structural key on
+	//     a kind that does not bind it, which Apache Avro skips wholesale
+	//     as reserved and fastavro keeps wholesale as a property — this
+	//     package's own stray-routing posture governs: as-written is the
+	//     key's ONLY surface, so it must survive the rebuild rather than
+	//     reaching neither surface.
+	present presenceSet
 
 	// refNS is the namespace scope refTarget was resolved in, recorded
 	// alongside the stamp because the two are only meaningful together:
@@ -1454,7 +1459,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// (appendCanonObject) and the parser, for which a missing and an empty
 	// name are the same fullname; the Name != "" arm keeps emission for
 	// hand-built names on non-named kinds.
-	if n.Name != "" || isNamedKind(n.Type) {
+	if n.Name != "" || isNamedKind(n.Type) || n.present.has(presName) {
 		m["name"] = n.Name
 	}
 	if isNamedKind(n.Type) && !strings.Contains(n.Name, ".") {
@@ -1472,12 +1477,18 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		default:
 			m["namespace"] = eff
 		}
-	} else if n.Namespace != "" && !isNamedKind(n.Type) {
-		// Unnamed node with a namespace attribute set by hand: preserve
-		// as-written (the parser ignores it; fidelity only).
+	} else if (n.Namespace != "" || n.present.has(presNamespace)) && !isNamedKind(n.Type) {
+		// Unnamed node with a namespace attribute: preserve as-written
+		// (the parser ignores it; fidelity only). Presence carries the
+		// explicit-empty form, which the value alone cannot show.
 		m["namespace"] = n.Namespace
 	}
-	if len(n.Aliases) > 0 {
+	// aliases emits when NON-EMPTY where a kind BINDS it, which is Apache
+	// Avro's own condition (Schema.java:886) — an empty alias list is
+	// dropped there deliberately. On a kind that does not bind it there is
+	// no such condition to follow, and the stray-routing posture says
+	// as-written is the key's only surface, so presence decides.
+	if len(n.Aliases) > 0 || (n.present.has(presAliases) && !strayKeyBinds(n.Type, "aliases")) {
 		m["aliases"] = b.emitStrings(d, n.Aliases)
 	}
 	// Emitted when the attribute was WRITTEN, not when it is non-empty:
@@ -1485,7 +1496,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// :1154 / :1367 all ask getDoc() != null). Contrast aliases just
 	// above, whose emission condition is non-EMPTY (:886) — the per-
 	// attribute difference is why presence is asked here and not there.
-	if n.Doc != "" || n.docSet {
+	if n.Doc != "" || n.present.has(presDoc) {
 		m["doc"] = b.emitString(d, n.Doc)
 	}
 	if n.HasEnumDefault {
@@ -1494,7 +1505,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// logicalType is not in Java's reserved set, so it survives as an
 	// ordinary schema property whatever its content, empty string included
 	// (parseProperties :1983, writeProps).
-	if n.LogicalType != "" || n.logicalSet {
+	if n.LogicalType != "" || n.present.has(presLogicalType) {
 		m["logicalType"] = b.emitString(d, n.LogicalType)
 	}
 	if n.Precision != 0 {
@@ -1508,7 +1519,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// the re-emitted schema unparseable ("fixed is missing size").
 	if n.Type == "fixed" {
 		m["size"] = n.Size
-	} else if n.Size != 0 {
+	} else if n.Size != 0 || n.present.has(presSize) {
 		m["size"] = n.Size
 	}
 	// enum.symbols is a required attribute per the Avro spec (Complex
@@ -1520,7 +1531,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 		} else {
 			m["symbols"] = b.emitStrings(d, n.Symbols)
 		}
-	} else if len(n.Symbols) > 0 {
+	} else if len(n.Symbols) > 0 || n.present.has(presSymbols) {
 		m["symbols"] = b.emitStrings(d, n.Symbols)
 	}
 	if n.Items != nil {
@@ -1532,7 +1543,7 @@ func (n *SchemaNode) toJSONWalk(visited map[*SchemaNode]struct{}, d *deduper, en
 	// record.fields is a required attribute per the Avro spec (Complex
 	// Types > Records: "fields: a JSON array, listing fields (required)"),
 	// always emit for record/error types even when empty.
-	if isRecordKind(n.Type) || len(n.Fields) > 0 {
+	if isRecordKind(n.Type) || len(n.Fields) > 0 || n.present.has(presFields) {
 		fieldStray := stray || !isRecordKind(n.Type)
 		fields := make([]map[string]any, len(n.Fields))
 		for i, f := range n.Fields {
@@ -2108,6 +2119,55 @@ func nodeCarriesNothingBut(n *SchemaNode, exempt func(*SchemaNode, string) bool)
 	return true
 }
 
+// presenceSet is a bit per attribute that can be written with a body its
+// destination stores as that destination's own zero. One field rather than
+// one bool each keeps the hidden state on the public struct at a single
+// member, and keeps every consumer asking the same question.
+type presenceSet uint16
+
+const (
+	presDoc presenceSet = 1 << iota
+	presLogicalType
+	presName
+	presNamespace
+	presAliases
+	presSymbols
+	presSize
+	presFields
+)
+
+func (p presenceSet) has(b presenceSet) bool { return p&b != 0 }
+
+func (p *presenceSet) setIf(cond bool, b presenceSet) {
+	if cond {
+		*p |= b
+	}
+}
+
+// presenceBitFor maps an exported SchemaNode field name to its bit, so the
+// emptiness walk, the emitter and the guards all key on one vocabulary.
+func presenceBitFor(field string) (presenceSet, bool) {
+	switch field {
+	case "Doc":
+		return presDoc, true
+	case "LogicalType":
+		return presLogicalType, true
+	case "Name":
+		return presName, true
+	case "Namespace":
+		return presNamespace, true
+	case "Aliases":
+		return presAliases, true
+	case "Symbols":
+		return presSymbols, true
+	case "Size":
+		return presSize, true
+	case "Fields":
+		return presFields, true
+	}
+	return 0, false
+}
+
 // nodePresenceSet reports whether the named exported field carries content
 // its VALUE cannot show — an attribute written as the field's own zero.
 //
@@ -2123,13 +2183,8 @@ func nodeCarriesNothingBut(n *SchemaNode, exempt func(*SchemaNode, string) bool)
 // exempt usage-site attributes (NOT_BUGS #25), so their presence is ignored
 // there exactly as their value is.
 func nodePresenceSet(n *SchemaNode, field string) bool {
-	switch field {
-	case "Doc":
-		return n.docSet
-	case "LogicalType":
-		return n.logicalSet
-	}
-	return false
+	b, ok := presenceBitFor(field)
+	return ok && n.present.has(b)
 }
 
 // bareEmissionExempt classifies the fields whose value cannot be lost by
@@ -2518,7 +2573,7 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	n := SchemaNode{}
 
 	getString(m, "type", &n.Type)
-	getString(m, "name", &n.Name)
+	n.present.setIf(getString(m, "name", &n.Name), presName)
 	// Namespace resolves at build: an explicit attribute wins (including
 	// the explicit-empty "namespace":"" null-namespace form — a DIFFERENT
 	// type than one inheriting the enclosing namespace, per the spec's
@@ -2530,6 +2585,7 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	if s, ok := m["namespace"].(string); ok {
 		explicitNS, hasExplicitNS = s, true
 	}
+	n.present.setIf(hasExplicitNS, presNamespace)
 	switch {
 	// Named kinds with an empty short name inherit/take-explicit exactly
 	// like any undotted name (the parser resolves "name":"" under an
@@ -2548,8 +2604,18 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	// same read keeps the two in step: a non-string doc/logicalType is
 	// routed elsewhere (dropped and Props respectively) and must not count
 	// as a written one.
-	n.docSet = getString(m, "doc", &n.Doc) && isNamedKind(n.Type)
-	n.logicalSet = getString(m, "logicalType", &n.LogicalType)
+	//
+	// doc is recorded on EVERY kind, not only the ones Apache Avro reads it
+	// on. The authority for a placement is whichever reference actually HAS
+	// that placement, and it governs the empty and the non-empty body
+	// alike: Apache Avro has no doc slot on a primitive or a container, so
+	// it cannot rule there, and this package already sides with fastavro at
+	// that placement by preserving `{"type":"int","doc":"d"}`. Deriving the
+	// empty twin from Apache Avro's ABSENCE while the non-empty twin
+	// follows fastavro's PRESENCE would split one placement between two
+	// authorities.
+	n.present.setIf(getString(m, "doc", &n.Doc), presDoc)
+	n.present.setIf(getString(m, "logicalType", &n.LogicalType), presLogicalType)
 	// precision/scale/size are int per spec. After
 	// unmarshalAnyPreservePrecision, integer JSON literals come back as
 	// int64 (not float64); jsonNumericInt accepts both. Precision/Scale
@@ -2574,13 +2640,16 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 		if l, err := decodeLaxInt("size", v); err == nil {
 			n.Size = int(l)
 			sizeOK = true
+			n.present |= presSize
 		}
 	}
 	if ss, ok, err := stringSliceFrom(m, "aliases"); err == nil && ok {
 		n.Aliases = ss
+		n.present |= presAliases
 	}
 	if ss, ok, err := stringSliceFrom(m, "symbols"); err == nil && ok {
 		n.Symbols = ss
+		n.present |= presSymbols
 	}
 
 	if n.Type == "enum" {
@@ -2613,7 +2682,7 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	walkNodeChildren(m, parentNS, childNS, nodeChildVisitor{
 		strayKeys:      true,
 		strayShapeMemo: memo,
-		fields:         func(arr []any) { n.Fields = make([]SchemaField, len(arr)) },
+		fields:         func(arr []any) { n.Fields = make([]SchemaField, len(arr)); n.present |= presFields },
 		field: func(i int, fm map[string]any, typeKey, scope string) {
 			n.Fields[i] = metadataField(fm, nodeFromJSON(fm[typeKey], scope, memo), nil)
 		},

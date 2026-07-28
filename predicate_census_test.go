@@ -385,7 +385,7 @@ var censusRegistry = []censusQuestion{
 		tells: []censusTell{
 			{pattern: `isNamedKind`, counts: map[string]int{
 				"cache.go": 3, "schema_canonical.go": 1, "schema_for.go": 4,
-				"schema_node.go": 14, "schema_parse.go": 1, "schema_walk.go": 2, "schema.go": 5,
+				"schema_node.go": 13, "schema_parse.go": 1, "schema_walk.go": 2, "schema.go": 5,
 			}},
 			{pattern: `isRecordKind`, counts: map[string]int{
 				"schema_for.go": 2, "schema_node.go": 10, "schema_parse.go": 1, "schema_walk.go": 1,
@@ -486,7 +486,7 @@ var censusRegistry = []censusQuestion{
 		},
 		tells: []censusTell{
 			{pattern: `strayKeyBinds`, counts: map[string]int{
-				"schema_parse.go": 11, "schema_node.go": 2,
+				"schema_parse.go": 11, "schema_node.go": 3,
 			}},
 			{pattern: `schemaKeyBinds`, counts: map[string]int{
 				"schema_node.go": 3, "schema_parse.go": 1,

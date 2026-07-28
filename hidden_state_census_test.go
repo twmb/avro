@@ -50,7 +50,7 @@ func TestInvariant_HiddenStateOnPublicStructs(t *testing.T) {
 	composableWithHiddenState := map[string]string{
 		"CustomType": "needsAvroType is fail-loud only: it can make Parse REJECT (when AvroType is empty), never silently substitute a value — pinned by TestInvariant_CustomTypeHiddenStateFailsLoud",
 		"SchemaNode": "refTarget (with refNS, the scope it was resolved in — the two are one stamp and are only meaningful together) is consulted only while the name resolver still binds the node's exported Type to it (nodeRefTargetAgrees), so an edited Type always wins — pinned by TestNodeRefSchema_EditedTypeIgnoresStaleStamp. " +
-			"docSet/logicalSet are PRESENCE-ONLY and value-transparent: they decide whether an attribute whose value IS the field's zero gets written at all, never what any attribute says, so the value a caller sets is the value that comes back for every input — pinned by TestInvariant_PresenceStateIsValueTransparent",
+			"present is PRESENCE-ONLY and value-transparent: one bit per attribute whose body can be its own destination's zero, deciding whether such an attribute gets written at all, never what any attribute says — so the value a caller sets is the value that comes back for every input, pinned by TestInvariant_PresenceStateIsValueTransparent",
 		"SchemaField": "docSet is the field-level twin of SchemaNode's, and carries the same proof: presence-only and value-transparent — pinned by TestInvariant_PresenceStateIsValueTransparent",
 	}
 	for _, ty := range types {
@@ -117,13 +117,13 @@ func TestInvariant_PresenceStateIsValueTransparent(t *testing.T) {
 	// extracted carries every presence flag set; composed carries none.
 	extracted := MustParse(`{"type":"record","name":"R","doc":"","fields":[` +
 		`{"name":"f","type":{"type":"int","logicalType":""},"doc":""}]}`).Root()
-	if !extracted.docSet {
+	if !extracted.present.has(presDoc) {
 		t.Fatal("the extracted node did not record a written doc; the control is broken")
 	}
 	if !extracted.Fields[0].docSet {
 		t.Fatal("the extracted field did not record a written doc; the control is broken")
 	}
-	if !extracted.Fields[0].Type.logicalSet {
+	if !extracted.Fields[0].Type.present.has(presLogicalType) {
 		t.Fatal("the extracted type did not record a written logicalType; the control is broken")
 	}
 

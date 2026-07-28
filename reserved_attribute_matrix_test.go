@@ -37,9 +37,17 @@ import (
 //   - Where neither can adjudicate — a stray structural key has no analogue in
 //     either, since neither exposes a metadata tree — the standing rulings
 //     govern and the provenance says so.
-//   - Where nothing settles the cell, it is recorded as UNRULED and asserted
-//     only to be stable, never to be right. Locking in an answer nobody chose
-//     would turn an open question into a pin.
+//   - Where NEITHER reference has the placement at all, PLACEMENT AUTHORITY
+//     decides: the authority for a placement is whichever reference actually
+//     HAS it, and it governs the empty and the non-empty body alike. Where
+//     neither has it — a structural key on a kind that binds nothing, which
+//     Apache Avro skips wholesale and fastavro keeps wholesale — this
+//     package's own adjudicated posture governs, and the provenance says so.
+//
+// Every cell the enumeration produces is now settled. The UNRULED code stays
+// in the vocabulary because a later round widening an axis will produce cells
+// nothing rules yet, and recording one is the honest move; what may not
+// happen is a cell quietly acquiring today's behavior as its expectation.
 //
 // The surfaces are read through the REBUILD (Root().Schema()), because that is
 // the one that loses things. String() is the schema's own source text and
@@ -104,19 +112,19 @@ var reservedCellTable = []reservedCellRow{
 	{"type", "field", "array", "RRRRR-"},
 	{"type", "field", "map", "RRRRR-"},
 	{"type", "field", "fixed", "RRRRR-"},
-	{"name", "type", "null", "AK?KK-"},
-	{"name", "type", "boolean", "AK?KK-"},
-	{"name", "type", "int", "AK?KK-"},
-	{"name", "type", "long", "AK?KK-"},
-	{"name", "type", "float", "AK?KK-"},
-	{"name", "type", "double", "AK?KK-"},
-	{"name", "type", "bytes", "AK?KK-"},
-	{"name", "type", "string", "AK?KK-"},
+	{"name", "type", "null", "AKKKK-"},
+	{"name", "type", "boolean", "AKKKK-"},
+	{"name", "type", "int", "AKKKK-"},
+	{"name", "type", "long", "AKKKK-"},
+	{"name", "type", "float", "AKKKK-"},
+	{"name", "type", "double", "AKKKK-"},
+	{"name", "type", "bytes", "AKKKK-"},
+	{"name", "type", "string", "AKKKK-"},
 	{"name", "type", "record", "RKRRR-"},
 	{"name", "type", "error", "RKRRR-"},
 	{"name", "type", "enum", "RKRRR-"},
-	{"name", "type", "array", "AR?KK-"},
-	{"name", "type", "map", "AR?KK-"},
+	{"name", "type", "array", "ARKKK-"},
+	{"name", "type", "map", "ARKKK-"},
 	{"name", "type", "fixed", "RKRRR-"},
 	{"name", "field", "null", "RKRRR-"},
 	{"name", "field", "boolean", "RKRRR-"},
@@ -132,20 +140,20 @@ var reservedCellTable = []reservedCellRow{
 	{"name", "field", "array", "RKRRR-"},
 	{"name", "field", "map", "RKRRR-"},
 	{"name", "field", "fixed", "RKRRR-"},
-	{"namespace", "type", "null", "AK?KK-"},
-	{"namespace", "type", "boolean", "AK?KK-"},
-	{"namespace", "type", "int", "AK?KK-"},
-	{"namespace", "type", "long", "AK?KK-"},
-	{"namespace", "type", "float", "AK?KK-"},
-	{"namespace", "type", "double", "AK?KK-"},
-	{"namespace", "type", "bytes", "AK?KK-"},
-	{"namespace", "type", "string", "AK?KK-"},
-	{"namespace", "type", "record", "AKD??-"},
-	{"namespace", "type", "error", "AKD??-"},
-	{"namespace", "type", "enum", "AKD??-"},
-	{"namespace", "type", "array", "AK?KK-"},
-	{"namespace", "type", "map", "AK?KK-"},
-	{"namespace", "type", "fixed", "AKD??-"},
+	{"namespace", "type", "null", "AKKKK-"},
+	{"namespace", "type", "boolean", "AKKKK-"},
+	{"namespace", "type", "int", "AKKKK-"},
+	{"namespace", "type", "long", "AKKKK-"},
+	{"namespace", "type", "float", "AKKKK-"},
+	{"namespace", "type", "double", "AKKKK-"},
+	{"namespace", "type", "bytes", "AKKKK-"},
+	{"namespace", "type", "string", "AKKKK-"},
+	{"namespace", "type", "record", "AKDRR-"},
+	{"namespace", "type", "error", "AKDRR-"},
+	{"namespace", "type", "enum", "AKDRR-"},
+	{"namespace", "type", "array", "AKKKK-"},
+	{"namespace", "type", "map", "AKKKK-"},
+	{"namespace", "type", "fixed", "AKDRR-"},
 	{"namespace", "field", "null", "AKKKK-"},
 	{"namespace", "field", "boolean", "AKKKK-"},
 	{"namespace", "field", "int", "AKKKK-"},
@@ -160,19 +168,19 @@ var reservedCellTable = []reservedCellRow{
 	{"namespace", "field", "array", "AKKKK-"},
 	{"namespace", "field", "map", "AKKKK-"},
 	{"namespace", "field", "fixed", "AKKKK-"},
-	{"doc", "type", "null", "AKDDD-"},
-	{"doc", "type", "boolean", "AKDDD-"},
-	{"doc", "type", "int", "AKDDD-"},
-	{"doc", "type", "long", "AKDDD-"},
-	{"doc", "type", "float", "AKDDD-"},
-	{"doc", "type", "double", "AKDDD-"},
-	{"doc", "type", "bytes", "AKDDD-"},
-	{"doc", "type", "string", "AKDDD-"},
+	{"doc", "type", "null", "AKKDD-"},
+	{"doc", "type", "boolean", "AKKDD-"},
+	{"doc", "type", "int", "AKKDD-"},
+	{"doc", "type", "long", "AKKDD-"},
+	{"doc", "type", "float", "AKKDD-"},
+	{"doc", "type", "double", "AKKDD-"},
+	{"doc", "type", "bytes", "AKKDD-"},
+	{"doc", "type", "string", "AKKDD-"},
 	{"doc", "type", "record", "AKKDD-"},
 	{"doc", "type", "error", "AKKDD-"},
 	{"doc", "type", "enum", "AKKDD-"},
-	{"doc", "type", "array", "AKDDD-"},
-	{"doc", "type", "map", "AKDDD-"},
+	{"doc", "type", "array", "AKKDD-"},
+	{"doc", "type", "map", "AKKDD-"},
 	{"doc", "type", "fixed", "AKKDD-"},
 	{"doc", "field", "null", "AKKDD-"},
 	{"doc", "field", "boolean", "AKKDD-"},
@@ -188,19 +196,19 @@ var reservedCellTable = []reservedCellRow{
 	{"doc", "field", "array", "AKKDD-"},
 	{"doc", "field", "map", "AKKDD-"},
 	{"doc", "field", "fixed", "AKKDD-"},
-	{"aliases", "type", "null", "AK?KK-"},
-	{"aliases", "type", "boolean", "AK?KK-"},
-	{"aliases", "type", "int", "AK?KK-"},
-	{"aliases", "type", "long", "AK?KK-"},
-	{"aliases", "type", "float", "AK?KK-"},
-	{"aliases", "type", "double", "AK?KK-"},
-	{"aliases", "type", "bytes", "AK?KK-"},
-	{"aliases", "type", "string", "AK?KK-"},
+	{"aliases", "type", "null", "AKKKK-"},
+	{"aliases", "type", "boolean", "AKKKK-"},
+	{"aliases", "type", "int", "AKKKK-"},
+	{"aliases", "type", "long", "AKKKK-"},
+	{"aliases", "type", "float", "AKKKK-"},
+	{"aliases", "type", "double", "AKKKK-"},
+	{"aliases", "type", "bytes", "AKKKK-"},
+	{"aliases", "type", "string", "AKKKK-"},
 	{"aliases", "type", "record", "AKDRR-"},
 	{"aliases", "type", "error", "AKDRR-"},
 	{"aliases", "type", "enum", "AKDRR-"},
-	{"aliases", "type", "array", "AK?KK-"},
-	{"aliases", "type", "map", "AK?KK-"},
+	{"aliases", "type", "array", "AKKKK-"},
+	{"aliases", "type", "map", "AKKKK-"},
 	{"aliases", "type", "fixed", "AKDRR-"},
 	{"aliases", "field", "null", "AKDRR-"},
 	{"aliases", "field", "boolean", "AKDRR-"},
@@ -216,20 +224,20 @@ var reservedCellTable = []reservedCellRow{
 	{"aliases", "field", "array", "AKDRR-"},
 	{"aliases", "field", "map", "AKDRR-"},
 	{"aliases", "field", "fixed", "AKDRR-"},
-	{"fields", "type", "null", "AK?KK-"},
-	{"fields", "type", "boolean", "AK?KK-"},
-	{"fields", "type", "int", "AK?KK-"},
-	{"fields", "type", "long", "AK?KK-"},
-	{"fields", "type", "float", "AK?KK-"},
-	{"fields", "type", "double", "AK?KK-"},
-	{"fields", "type", "bytes", "AK?KK-"},
-	{"fields", "type", "string", "AK?KK-"},
+	{"fields", "type", "null", "AKKKK-"},
+	{"fields", "type", "boolean", "AKKKK-"},
+	{"fields", "type", "int", "AKKKK-"},
+	{"fields", "type", "long", "AKKKK-"},
+	{"fields", "type", "float", "AKKKK-"},
+	{"fields", "type", "double", "AKKKK-"},
+	{"fields", "type", "bytes", "AKKKK-"},
+	{"fields", "type", "string", "AKKKK-"},
 	{"fields", "type", "record", "RKKRR-"},
 	{"fields", "type", "error", "RKKRR-"},
-	{"fields", "type", "enum", "AR?KK-"},
-	{"fields", "type", "array", "AR?KK-"},
-	{"fields", "type", "map", "AR?KK-"},
-	{"fields", "type", "fixed", "AR?KK-"},
+	{"fields", "type", "enum", "ARKKK-"},
+	{"fields", "type", "array", "ARKKK-"},
+	{"fields", "type", "map", "ARKKK-"},
+	{"fields", "type", "fixed", "ARKKK-"},
 	{"fields", "field", "null", "AKKKK-"},
 	{"fields", "field", "boolean", "AKKKK-"},
 	{"fields", "field", "int", "AKKKK-"},
@@ -300,20 +308,20 @@ var reservedCellTable = []reservedCellRow{
 	{"values", "field", "array", "AKKKK-"},
 	{"values", "field", "map", "AKKKK-"},
 	{"values", "field", "fixed", "AKKKK-"},
-	{"symbols", "type", "null", "AK?KK-"},
-	{"symbols", "type", "boolean", "AK?KK-"},
-	{"symbols", "type", "int", "AK?KK-"},
-	{"symbols", "type", "long", "AK?KK-"},
-	{"symbols", "type", "float", "AK?KK-"},
-	{"symbols", "type", "double", "AK?KK-"},
-	{"symbols", "type", "bytes", "AK?KK-"},
-	{"symbols", "type", "string", "AK?KK-"},
-	{"symbols", "type", "record", "AR?KK-"},
-	{"symbols", "type", "error", "AR?KK-"},
+	{"symbols", "type", "null", "AKKKK-"},
+	{"symbols", "type", "boolean", "AKKKK-"},
+	{"symbols", "type", "int", "AKKKK-"},
+	{"symbols", "type", "long", "AKKKK-"},
+	{"symbols", "type", "float", "AKKKK-"},
+	{"symbols", "type", "double", "AKKKK-"},
+	{"symbols", "type", "bytes", "AKKKK-"},
+	{"symbols", "type", "string", "AKKKK-"},
+	{"symbols", "type", "record", "ARKKK-"},
+	{"symbols", "type", "error", "ARKKK-"},
 	{"symbols", "type", "enum", "RKKRR-"},
-	{"symbols", "type", "array", "AR?KK-"},
-	{"symbols", "type", "map", "AR?KK-"},
-	{"symbols", "type", "fixed", "AR?KK-"},
+	{"symbols", "type", "array", "ARKKK-"},
+	{"symbols", "type", "map", "ARKKK-"},
+	{"symbols", "type", "fixed", "ARKKK-"},
 	{"symbols", "field", "null", "AKKKK-"},
 	{"symbols", "field", "boolean", "AKKKK-"},
 	{"symbols", "field", "int", "AKKKK-"},
@@ -328,14 +336,14 @@ var reservedCellTable = []reservedCellRow{
 	{"symbols", "field", "array", "AKKKK-"},
 	{"symbols", "field", "map", "AKKKK-"},
 	{"symbols", "field", "fixed", "AKKKK-"},
-	{"size", "type", "null", "AK?KKK"},
-	{"size", "type", "boolean", "AK?KKK"},
-	{"size", "type", "int", "AK?KKK"},
-	{"size", "type", "long", "AK?KKK"},
-	{"size", "type", "float", "AK?KKK"},
-	{"size", "type", "double", "AK?KKK"},
-	{"size", "type", "bytes", "AK?KKK"},
-	{"size", "type", "string", "AK?KKK"},
+	{"size", "type", "null", "AKKKKK"},
+	{"size", "type", "boolean", "AKKKKK"},
+	{"size", "type", "int", "AKKKKK"},
+	{"size", "type", "long", "AKKKKK"},
+	{"size", "type", "float", "AKKKKK"},
+	{"size", "type", "double", "AKKKKK"},
+	{"size", "type", "bytes", "AKKKKK"},
+	{"size", "type", "string", "AKKKKK"},
 	{"size", "type", "record", "ARRKKR"},
 	{"size", "type", "error", "ARRKKR"},
 	{"size", "type", "enum", "ARRKKR"},
@@ -517,7 +525,7 @@ var reservedProvenance = []reservedProvRow{
 	{"aliases", "wrong", "field", "both-references"},
 	{"aliases", "wrong", "type", "follows-java|standing-ruling"},
 	{"aliases", "zero", "field", "follows-java"},
-	{"aliases", "zero", "type", "follows-java|unruled"},
+	{"aliases", "zero", "type", "placement-authority(stray-routing)"},
 	{"default", "absent", "field", "java-model"},
 	{"default", "absent", "type", "java-model"},
 	{"default", "null", "field", "both-references|follows-fastavro"},
@@ -531,13 +539,13 @@ var reservedProvenance = []reservedProvRow{
 	{"doc", "absent", "field", "java-model"},
 	{"doc", "absent", "type", "java-model"},
 	{"doc", "null", "field", "follows-java"},
-	{"doc", "null", "type", "follows-java"},
+	{"doc", "null", "type", "follows-java|placement-authority(fastavro-has-the-placement)"},
 	{"doc", "valid", "field", "both-references"},
-	{"doc", "valid", "type", "both-references|follows-fastavro"},
+	{"doc", "valid", "type", "both-references|placement-authority(fastavro-has-the-placement)"},
 	{"doc", "wrong", "field", "follows-java"},
-	{"doc", "wrong", "type", "follows-java"},
+	{"doc", "wrong", "type", "follows-java|placement-authority(fastavro-has-the-placement)"},
 	{"doc", "zero", "field", "both-references"},
-	{"doc", "zero", "type", "both-references|follows-java"},
+	{"doc", "zero", "type", "both-references|placement-authority(fastavro-has-the-placement)"},
 	{"fields", "absent", "field", "java-model"},
 	{"fields", "absent", "type", "java-model"},
 	{"fields", "null", "field", "standing-ruling"},
@@ -547,7 +555,7 @@ var reservedProvenance = []reservedProvRow{
 	{"fields", "wrong", "field", "standing-ruling"},
 	{"fields", "wrong", "type", "both-references|standing-ruling"},
 	{"fields", "zero", "field", "standing-ruling"},
-	{"fields", "zero", "type", "both-references|unruled"},
+	{"fields", "zero", "type", "placement-authority(stray-routing)"},
 	{"items", "absent", "field", "java-model"},
 	{"items", "absent", "type", "java-model"},
 	{"items", "null", "field", "standing-ruling"},
@@ -577,17 +585,17 @@ var reservedProvenance = []reservedProvRow{
 	{"name", "wrong", "field", "follows-java"},
 	{"name", "wrong", "type", "both-references|standing-ruling"},
 	{"name", "zero", "field", "follows-java"},
-	{"name", "zero", "type", "follows-java|unruled"},
+	{"name", "zero", "type", "placement-authority(stray-routing)"},
 	{"namespace", "absent", "field", "java-model"},
 	{"namespace", "absent", "type", "java-model"},
 	{"namespace", "null", "field", "standing-ruling"},
-	{"namespace", "null", "type", "standing-ruling|unruled"},
+	{"namespace", "null", "type", "ruled(uniform-name-strictness)"},
 	{"namespace", "valid", "field", "standing-ruling"},
 	{"namespace", "valid", "type", "both-references|standing-ruling"},
 	{"namespace", "wrong", "field", "standing-ruling"},
-	{"namespace", "wrong", "type", "standing-ruling|unruled"},
+	{"namespace", "wrong", "type", "ruled(uniform-name-strictness)"},
 	{"namespace", "zero", "field", "standing-ruling"},
-	{"namespace", "zero", "type", "follows-java|unruled"},
+	{"namespace", "zero", "type", "placement-authority(stray-routing)"},
 	{"order", "absent", "field", "java-model"},
 	{"order", "absent", "type", "java-model"},
 	{"order", "null", "field", "follows-java"},
@@ -633,7 +641,7 @@ var reservedProvenance = []reservedProvRow{
 	{"size", "wrong", "field", "standing-ruling"},
 	{"size", "wrong", "type", "follows-java|standing-ruling"},
 	{"size", "zero", "field", "standing-ruling"},
-	{"size", "zero", "type", "both-references|standing-ruling|unruled"},
+	{"size", "zero", "type", "placement-authority(stray-routing)"},
 	{"symbols", "absent", "field", "java-model"},
 	{"symbols", "absent", "type", "java-model"},
 	{"symbols", "null", "field", "standing-ruling"},
@@ -643,7 +651,7 @@ var reservedProvenance = []reservedProvRow{
 	{"symbols", "wrong", "field", "standing-ruling"},
 	{"symbols", "wrong", "type", "both-references|standing-ruling"},
 	{"symbols", "zero", "field", "standing-ruling"},
-	{"symbols", "zero", "type", "both-references|unruled"},
+	{"symbols", "zero", "type", "placement-authority(stray-routing)"},
 	{"type", "absent", "field", "java-model"},
 	{"type", "absent", "type", "java-model"},
 	{"type", "null", "field", "both-references"},
@@ -917,9 +925,9 @@ func TestMatrix_ReservedAttributeEnumeration(t *testing.T) {
 			got := reservedCellOutcome(t, row.Attr, row.Level, src, class)
 			if want == outUnruled {
 				unruled++
-				// Recorded, not asserted. The cell is real and its answer is
-				// open; pinning today's behavior would convert a question the
-				// references cannot settle into a decision nobody made.
+				// Recorded, not asserted: the cell is real and its answer is
+				// open. Pinning today's behavior would convert a question
+				// nothing settles into a decision nobody made.
 				continue
 			}
 			checked++
@@ -932,6 +940,9 @@ func TestMatrix_ReservedAttributeEnumeration(t *testing.T) {
 	t.Logf("reserved-attribute enumeration: %d cells asserted, %d recorded unruled", checked, unruled)
 	if checked < 2000 {
 		t.Fatalf("only %d cells were asserted; the corpus is not spanning the cross product", checked)
+	}
+	if unruled != 0 {
+		t.Errorf("%d cells are unruled; every cell this corpus produces is settled, so a new one is a ruling to make rather than a gap to leave", unruled)
 	}
 }
 
@@ -967,11 +978,11 @@ func TestMatrix_ReservedAttributeEnumerationIsNotVacuous(t *testing.T) {
 			t.Errorf("outcome %q appears %d times; the table has collapsed toward one answer", string(c), codes[c])
 		}
 	}
-	// The unruled cells must stay a small, named minority: they are open
-	// questions, and a table where they grew would mean the derivation had
-	// stopped settling things.
-	if codes[outUnruled] > 120 {
-		t.Errorf("%d cells are unruled; the derivation is no longer settling the enumeration", codes[outUnruled])
+	// Every cell is settled. A table that grew an unruled one has produced a
+	// question, which is fine — but it must be answered rather than left, so
+	// the driver above reports it.
+	if codes[outUnruled] != 0 {
+		t.Errorf("%d cells carry the unruled code", codes[outUnruled])
 	}
 	// Provenance must exist for every (attribute, body, level) family the
 	// corpus produces, or a cell's authority is unrecorded.
