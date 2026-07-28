@@ -9823,3 +9823,125 @@ Compressed once its follow-on round closed the face it had left open.
   **rule 2a minted** — reference SILENCE is not a SPLIT, routes to rule 4 (table
   + HALT) · convention 1 grew (e), class-elimination · suite + fastavro +
   `-race` green; Java ABSENT · verbatim: archive (2026-07-28 #6) · UNCONVERGED.
+
+## Distillation archive (2026-07-28 #12) — the default-face round's ledger line, verbatim
+
+Compressed the round after, once the FULL round found the recursion its fix
+had not reached.
+
+- 2026-07-28 · 40c36e4 (START head — 40c36e4..HEAD quarantines this round's
+  commits) · FIX (ruling-directed) · **the pre-encoded DEFAULT face closed, on
+  encode, never at parse** · both handed measurements re-run and confirmed; the
+  JSON arm is NOT a site (it encodes `defaultVal` through the serializer, so it
+  was already charged — the neuter later proved it by redding every wire except
+  json), and the site set **re-derived to FOUR, not the ~5 I had estimated** ·
+  **the suggested alternative was measured and REJECTED on evidence**: declining
+  to install an over-cap default does not fall through to the serializer — it
+  says "missing key", diverges binary from JSON, leaves the metadata API
+  disagreeing with the encoder, and worst, the omitzero arm silently emitted a
+  **2-byte wire that decoded OK**. Silent wrong output is the forbidden outcome,
+  so the deferred verdict was built instead · my first detection of "over-cap"
+  charged the FRAMED length, not the payload, and red cap-exact; re-run before
+  any conclusion was drawn · **mechanism**: recorded once at the pre-encode, read
+  through ONE accessor so no consumer can take the bytes without the verdict;
+  the compiled path carries it as `omitzeroErr` · 2 neuters, triple satisfied,
+  red sets separable BY WIRE — the unsafe copy reds ALONE on `binary-omitzero` ·
+  four constraints pinned · census Q19 grew the default answerer and caught the
+  site itself first · **NOT_BUGS' ~120KB cap WRITTEN into the size guard** (with
+  why it matters — it is what the gate quotes from — and a preference order),
+  then the pass it mandates: 123.3 → 119.1 KB, taken almost entirely from the
+  INDEX, which had grown to duplicate entry text (13.1 → 9.9 KB), so no ruling
+  lost a word · suite + fastavro + `-race` green; Java ABSENT · CORE 54.3 /
+  PATTERNS 134.7 / NOT_BUGS 119.1 KB · verbatim: archive (2026-07-28 #10) ·
+  UNCONVERGED.
+
+## Distillation archive (2026-07-28 #13) — the FULL round ledger line, verbatim
+
+- 2026-07-28 · 15669c8 · FULL (read-only) · **2 BEHAVIORAL, one root — and the
+  root is the fix this round quarantined.** `encodeDefaultDepth` is a SECOND
+  encoder: it pre-encodes a field default by recursing on `node.kind` and shares
+  nothing with the serializers where every producer-side compliance check lives.
+  Last round's charge keyed on the FIELD's kind, so a decimal nested inside a
+  record/array/map default reaches it as "record"/"array"/"map" and is never
+  charged — Encode emits 32773/32775/32777 bytes its own Decode refuses, and the
+  JSON wire refuses what the binary wire emitted, which is the divergence the new
+  JSON pin exists to name · **the second face came from applying P23's probe to
+  the OTHER caps through the same carrier**: an array-of-zero-byte-items default
+  at 10000 items Encodes to FIVE bytes and Decodes as "exceeds 4096", on all
+  three item shapes. So this is not a decimal gap; the DEFAULT carrier crosses
+  every cap in #11 and no cap's producer check is on it —
+  `TestRegression_ArrayZeroByteProducerCompliance` and every
+  `TestMatrix_SelfReadableAtScale` generator drive the VALUE carrier only. Filed
+  as an OPEN gap with the closing shape named · **handed item 1 done, with a
+  correction to its premise**: the matrix DOES red when the JSON arm is
+  neutered — but only through encode-implies-decode, a RELATIVE property two
+  coordinated regressions satisfy. Nothing asserted that this input is refused by
+  this bound, so the cell was added to the existing pin and neuter-proved
+  ("the JSON wire filled the same unwritable default, producing 196631 bytes") ·
+  **handed item 2 done, with two corrections and one self-report**: #64's
+  original IS archived — under a `###` sub-heading inside archive (2026-07-27
+  #4), which is why a top-level search missed it; and NOT_BUGS was NOT enforcing
+  its cap from memory, it has carried its OWN size guard in its preamble all
+  along, so what was missing was its presence in AUDIT_CORE's line, which is
+  where rounds actually look. **The self-report: my own index trim last round
+  dropped `(walker-parity: nsForChildren scopes by any non-empty Name)` and the
+  primitive-object clause from #64's one-liner — and because #64 was the only
+  entry of 75 with no body, that one-liner was the sole live copy of its
+  rationale. I trimmed what I believed was a recognition aid and removed a
+  ruling.** #64's body is restored from the archive; index and body now agree at
+  75/75 with no orphans either way, so the anomaly that made the damage possible
+  is gone · quarantine 40c36e4..HEAD = 27a4e69, NOT cleared — it carries the
+  root above · suite + fastavro + `-race` green, zero thinned-venv skips; Java
+  ABSENT · one gap CONSCIOUSLY DEFERRED (caller VALUE × STRUCTURE: probed clean
+  two rounds ago at 504 cells, still un-netted) · sizes CORE 54.9 / PATTERNS
+  134.7 / NOT_BUGS 120.1 KB · UNCONVERGED (counter 0), freeze stays.
+
+## Distillation archive (2026-07-28 #14) — four compressed FIX ledger lines, merged into one era line
+
+The reserved-attribute enumeration, placement authority, the decimal-length
+bound and the default face. Each already points at its own full narrative;
+this preserves the compressed forms the merge replaces.
+
+- 2026-07-27 · b1c42bb (START head) · FIX (ruling-directed) · **the unit was a
+  CLASS and the deliverable the ENUMERATION rather than its members**: every
+  reserved attribute × body shape × level × kind = 2184 cells, expectations
+  DERIVED PER CELL from the references and never from this package, with 71
+  reported UNRULED rather than guessed. **The table found four of its own defects
+  before it found any of the package's.** 3 BEHAVIORAL, one root — P22's
+  WRITTEN-ZERO half — and **#74 RULED: the emission condition is PER ATTRIBUTE**,
+  so a blanket presence mechanism would have shipped a divergence at two of four.
+  Verbatim: archive (2026-07-28 #8).
+- 2026-07-28 · 9ff2d27 (START head) · FIX (ruling-directed, 3 groups) ·
+  **PLACEMENT AUTHORITY minted** — the authority for a placement is whichever
+  reference actually HAS it, governing the empty and non-empty body alike; where
+  NEITHER does, this package's adjudicated posture governs. It settled two groups
+  and CORRECTED the prior round's ruling (primitive `doc:""` now PRESERVED —
+  reading Apache Avro's ABSENCE as a drop split one placement between two
+  authorities, the reversal rule 2a now names). G1's 63 cells fixed by extending
+  presence to the stray destinations as ONE bitmask; exclusivity pinned per cell
+  (decided on the VALUE); G2 stop-signed as **#75**. Unruled 71 → 0. Verbatim:
+  archive (2026-07-28 #5).
+- 2026-07-28 · b045c18 (START head) · FIX (ruling-directed) · **the decimal
+  unscaled-LENGTH bound charged on the emit side through ONE function** — three
+  shared builders cover every numeric arm on both wires, a size-keyed twin lets
+  a fixed carrier delegate, the opaque escape gets its own helper.
+  Over-rejection impossible BY CONSTRUCTION. Both handed corrections re-run;
+  the derived site set found a face neither count had (`big-decimal` has no
+  `precision`, so an ORDINARY `*big.Rat` escapes). Generator IN
+  `TestMatrix_SelfReadableAtScale`; its first version red for the wrong reason
+  (raw bytes die on the big-decimal framing before the bound is consulted).
+  6 neuters, red sets disjoint. **Rule 2a minted** — reference SILENCE is not a
+  SPLIT, routes to rule 4. Convention 1 grew (e), class-elimination. The
+  after-fix sweep found a FIFTH path whose in-place fix contradicted a standing
+  ruling, so it was REVERTED and filed rather than shipped. Verbatim: archive
+  (2026-07-28 #6, #11).
+- 2026-07-28 · 40c36e4 (START head) · FIX (ruling-directed) · **the pre-encoded
+  DEFAULT face closed, on encode, never at parse** — the verdict is recorded
+  where the default is pre-encoded and read through ONE accessor; the compiled
+  unsafe path carries it as `omitzeroErr`. The suggested alternative was
+  MEASURED AND REJECTED: declining to install does not fall through to the
+  serializer, and its omitzero arm silently emitted a 2-byte wire that decoded
+  OK. Site set re-derived to FOUR (the JSON arm was already charged). 2 neuters,
+  red sets separable BY WIRE. NOT_BUGS' cap written into the size guard, and the
+  pass taken (123.3 → 119.1 KB, almost all from the INDEX). Verbatim: archive
+  (2026-07-28 #10, #12).
