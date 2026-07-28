@@ -9945,3 +9945,96 @@ this preserves the compressed forms the merge replaces.
   red sets separable BY WIRE. NOT_BUGS' cap written into the size guard, and the
   pass taken (123.3 → 119.1 KB, almost all from the INDEX). Verbatim: archive
   (2026-07-28 #10, #12).
+
+## Distillation archive (2026-07-28 #15) — NOT_BUGS #74, verbatim
+
+Compressed to tombstone form during the NOT_BUGS pass the cap-table round's
+own writes mandated. Fully netted by the reserved-attribute enumeration; what
+the live entry keeps is the ruling, the per-attribute conditions the gate must
+quote, and the net.
+
+74. **An attribute WRITTEN AS ITS DESTINATION'S ZERO is written, and the emission condition that decides its fate is PER ATTRIBUTE — copied from Apache Avro's emitters, not generalized from one of them (maintainer-RULED 2026-07-27).** `doc:""` survives on the four named kinds and on a record field; `logicalType:""` survives on every kind; `order:""` REJECTS; `aliases:[]` and a `doc:""` on a primitive or container keep being dropped. The four answers come from four different Apache Avro sites, and a blanket "was it written" mechanism would have shipped a divergence at two of them.
+    **Why the value alone cannot answer it.** An attribute read into a plain `string`/`int` has no present/absent companion, so `x != ""` means both "the caller chose a value" and "the caller chose the value that is my zero": a VALIDATOR guarded that way skips exactly the zero (`order:""` parsed while every other non-spec order rejected), an EMITTER drops it (`doc:""`/`logicalType:""` died in the rebuild). Distinct from #73, a body the decode cannot READ: this one decodes perfectly into a value indistinguishable from absence, so no body check can see it.
+    **Java, source-derived per site (apache/avro:main, JVM-less here so every rule carries its line):** doc emits when NON-NULL — `if (getDoc() != null)` at Schema.java:1039 (record), :1154 (enum), :1367 (fixed) and :1062 (field) — and `parseDoc`→`getOptionalText` (:1997, :2041) returns `""` unchanged, so an empty doc is a doc. `aliases` emits when NON-EMPTY (`aliases == null || aliases.isEmpty()` :886; `f.aliases != null && !f.aliases.isEmpty()` :1070), so an empty list is dropped. `order` is decided on the NODE (`if (orderNode != null) Order.valueOf(...)` :1895-1897), so `""` reaches valueOf and throws. `logicalType` is absent from SCHEMA_RESERVED (:175-176), so `parseProperties` (:1983) keeps it as an ordinary property whatever its content. **fastavro 1.12.2 preserves all four verbatim (executed), so the two drops below are Java-siding, recorded as such rather than left looking like oversights.**
+    **PLACEMENT AUTHORITY decides a cell no single reference can, and it is the rule the rest of this entry rests on: the authority for a placement is whichever reference actually HAS that placement, and it governs the empty and the non-empty body ALIKE.** Apache Avro has no doc slot on a primitive or a container — `parseDoc` is called from `parseRecord`/`parseEnum`/`parseFixed`/`parseField` and nowhere else — so it does not drop a doc there, it has no opinion there; fastavro has the placement and preserves. This package already followed fastavro at that placement for a non-empty doc, so `{"type":"int","doc":""}` is PRESERVED too (ruled 2026-07-28, correcting an earlier ruling that read Apache Avro's ABSENCE as a drop while its non-empty sibling followed fastavro's PRESENCE — one placement cannot answer to two authorities). `logicalType` rides on every kind for the same reason.
+    **Where NEITHER reference has the placement, this package's own adjudicated posture governs** — the same basis #33 and #71 rest on. A structural key written as its destination's ZERO on a kind that does not bind it (`name:""`, `namespace:""`, `aliases:[]`, `symbols:[]`, `size:0`, `fields:[]`) reached NEITHER surface: consumed out of Props because the body is shape-OK, then dropped by the rebuild because the value is the zero. Apache Avro skips every stray key as reserved and keeps none; fastavro keeps every stray key and drops none; neither is answering a question about a metadata tree. #63(b) is: as-written is the key's ONLY surface. So presence decides at the stray placement while the BINDING placement keeps its reference-derived condition — which is why `aliases:[]` still drops on a record (Apache Avro's own condition there is non-EMPTY) and survives on an int (no condition to follow).
+    **The trap in preserving an empty body:** the exclusivity rule (#63(a)) is decided on the VALUE, so `symbols:["A"]` on an array rejects while `symbols:[]` is accepted. Preserving the empty one therefore emits a schema whose own re-parse has to be CHECKED — `TestRegression_StrayZeroBodySurvivesTheRebuild` asserts the emitted form's round trip per cell, and a neuter that makes the emitter write a readable body where the parse accepted an empty one reds exactly the two cells where a kind binds another defining key.
+    **Presence is HIDDEN state (`docSet`/`logicalSet` on SchemaNode, `docSet` on SchemaField, `orderSet` on the parse-side field), never a new exported field.** It is registered in the hidden-state census with the proof it cannot beat a caller: unlike `refTarget`, which selects a DEFINITION, a presence flag decides only whether an attribute whose value IS the field's zero gets written, so for every value a caller sets the value that comes back is the value they set — pinned by `TestInvariant_PresenceStateIsValueTransparent` over both an extracted node (flags set) and a hand-composed twin (flags clear), with the wire, canonical form and fingerprint asserted identical across the pair.
+    **The trap.** `nodeCarriesNothingBut` asks `IsZero`, so an empty doc reads as an empty node and the bare-emission shortcut collapses it BEFORE the emitter is consulted — teaching only the emitter changes nothing. The walk now asks `nodePresenceSet` for the same fields, keyed by field NAME so it composes with the exemption sets (at a splice, Doc and LogicalType are exempt usage-site attributes per #25, so presence is ignored there exactly as the value is). The guard carries an explicit REACHABILITY precondition after its first version could not red: the probe must be a node the shortcut would actually collapse.
+    **Nets:** `TestMatrix_ReservedAttributeEnumeration` — the whole reserved-attribute cross product (every attribute × {absent, valid, written-zero, JSON-null, wrong-typed, quoted} × {type, field} × every kind; 2184 cells, ALL asserted, none unruled), whose expectations are DERIVED PER CELL from a cited Java source model plus executed fastavro and never from this package, with `reservedProvenance` naming what settled each family · `TestRegression_EmptyOrderRejected` (with the absent and the three legal orders as the boundary, and the case variants still rejected — #46 governs, the case-fold family stays closed) · `_EmptyDocSurvivesWhereJavaEmitsOne` (five placements, fixpoint, wire/canonical/fingerprint identical to the doc-free twin) · `_EmptyLogicalTypeSurvives` · `_EmptyAliasesStayDropped` (binding placements only, with non-empty controls so the drop is about the BODY) · `_PrimitiveDocSurvivesEitherWay` (both bodies, one authority) · `_StrayZeroBodySurvivesTheRebuild` (14 cells, each asserting the emitted form's round trip) · `_StrayReadableBodyStillRejectsOnExclusivity` (the boundary preservation must not cross) · `TestInvariant_BareEmissionCoversPresenceOnlyFields` · `_FieldPresenceOnlyDocSurvivesTheRebuild` · `_PresenceStateIsValueTransparent` · the hidden-state census. **Re-opens:** a new attribute whose zero is a legal value and whose presence nothing records, or an Apache Avro release that changes one of the four emission conditions — each is a separate cell, and the whole point of this entry is that they do not move together.
+
+## Distillation archive (2026-07-28 #16) — the cap-table FIX round ledger line, verbatim
+
+- 2026-07-28 · 463e21d (START head) · FIX (ruling-directed, at the CLASS) ·
+  **the measurement first, reported both ways: the compiled serializer IS
+  reachable at the default pre-encode and is NOT substitutable.** Reachable was
+  measured by failing loudly on a nil `node.ser` there and running the whole
+  suite — zero hits, so Phase 1 wiring does precede Phase 2 defaults for every
+  shape the suite carries. Substitutable was measured by actually swapping in
+  `node.ser`: 8 tests red, and they name the documented reason —
+  `TestRegression_UnionDefaultEncodeMatchesValidateBranch` and the three
+  `GenerativeUnionContainerDefaultFill*` matrices, because parse time already
+  chose the branch by DECLARATION ORDER while the runtime dispatcher re-chooses
+  by Go kind. So the second encoder could not be deleted, and the fallback was
+  taken · **fix at the class**: the charge now lives INSIDE the recursion, at the
+  leaf, where the carrier's own kind and logical are in hand — asking at the
+  field's node is what made every nested leaf go unasked. Each leaf asks the
+  SAME authority its serializer asks: the decimal leaf through the shared
+  `decimalChargeLen`/`checkDecimalUnscaledSize` pair, and the array arm through
+  `arrayZeroByteEncodeCompliance` — the array encoders' OWN shared helper, whose
+  doc already demanded exactly this ("every array encoder MUST route through
+  this one helper or the paths drift"); the default walk was the third encoder
+  and the second to be missed. No per-kind cap table was written · the verdict
+  rides out on a sink so the walk still cannot fail: parse must not break, and
+  the union try-each uses the same walk where an error means "branch does not
+  accept" and a compliance verdict would silently pick a different branch ·
+  **the addendum's four deltas, each landed**: the OCF block pair is asserted AS
+  the exception and not closed, on the type system's own evidence — producer
+  enforcement is not absent but UNEXPRESSIBLE, since `WithMaxBlockBytes` is a
+  ReaderOpt; every cap carries an APPLICABILITY verdict with its reason, and six
+  bounds are recorded not-applicable because they refuse no wire (an allocation
+  hint, a probe buffer, an error-message bound, a caller-reader guard, the
+  writer's flush threshold, a Go-target-type depth); the deliverable is the
+  TABLE; and the completeness half FAILS on any cap landing without a row ·
+  **the completeness guard earned its keep immediately and repeatedly**: #11's
+  written list is NOT the set of caps — it surfaced TEN more bounds; it caught
+  two OCF row names I had GUESSED rather than read; and its reverse check would
+  catch a renamed constant. It also surfaced something no name-keyed guard can
+  fix: the reader-side COMPRESSED block bound is an inline `1<<26` in NewReader
+  with no constant at all, so it is structurally invisible — recorded in the row
+  · **the table found its own defect before it found the package's**, as these
+  tables keep doing: the in-record cell hung the default on the INNER field,
+  leaving the outer one defaultless, so it was measuring "missing key" rather
+  than the cap · 2 neuters, triple satisfied, red sets DISJOINT and each
+  covering all four nestings — the axis the bug turned on · NOT_BUGS pass taken
+  as its own guard prescribes (tombstone a fully-netted entry before shortening
+  live text): #74 compressed with its 7.3KB archived, 121.3 → 115.6 KB · suite +
+  fastavro + `-race` green; Java ABSENT · UNCONVERGED (counter 0), freeze stays.
+
+## Distillation archive (2026-07-28 #17) — the FULL round's ledger line, verbatim
+
+Compressed once the FIX round it directed closed both findings at the class.
+
+- 2026-07-28 · 15669c8 · FULL (read-only) · **2 BEHAVIORAL, one root — and the
+  root is the fix this round quarantined.** `encodeDefaultDepth` is a SECOND
+  encoder that pre-encodes a default by recursing on `node.kind`, sharing nothing
+  with the serializers where every producer-side check lives. Last round's charge
+  keyed on the FIELD's kind, so a decimal nested in a record/array/map default is
+  never charged: Encode emits ~32.7 KB its own Decode refuses, and JSON refuses
+  what binary emitted · **the second face came from applying P23 to the OTHER
+  caps through the same carrier**: an array-of-zero-byte-items default at 10000
+  items Encodes to FIVE bytes and Decodes as "exceeds 4096", all three item
+  shapes. So the DEFAULT carrier crosses EVERY cap in #11 and no producer check
+  is on it — filed as an OPEN gap · **item 1 done, premise corrected**: the
+  matrix reds on a JSON neuter, but only via encode-implies-decode, a RELATIVE
+  property two coordinated regressions satisfy; the absolute cell was added and
+  neuter-proved · **item 2 done, two corrections + a self-report**: #64's
+  original IS archived (under a `###` sub-heading, which is why the search
+  missed it), and NOT_BUGS was never enforcing from memory — it has carried its
+  own guard in its preamble; what was missing was AUDIT_CORE's copy. **My index
+  trim last round dropped #64's walker-parity rationale, and since #64 was the
+  only entry of 75 with no body, that line was its sole live copy — I removed a
+  ruling while believing I was trimming a recognition aid.** Body restored;
+  index/body now agree 75/75 · quarantine 27a4e69 NOT cleared · suite + fastavro
+  + `-race` green; Java ABSENT · one gap consciously deferred · verbatim:
+  archive (2026-07-28 #13) · UNCONVERGED.
