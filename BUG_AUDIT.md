@@ -10141,3 +10141,103 @@ did not reach.
   that panics in a package-level init and reports 0 fails, a verdict read off the
   metadata tree when the effect lives in the compiled one. Neuter rule amended to
   the TRIPLE: exit != 0 · RUN > 0 under `-v` · no `panic:`.
+
+## Distillation archive (2026-07-28 #22) — the union-arm FIX round ledger line, verbatim
+
+- 2026-07-28 · 9357918 (START head) · FIX (ruling-directed) · **the union arm's
+  nil sink fixed, and the constraint that made it falsifiable is what the round
+  is actually about.** The mechanism is a per-attempt sink merged ONLY for the
+  winning branch, and it is correct BY CONSTRUCTION rather than by test:
+  selection reads `err` alone, and the verdict never touches `err`, so a
+  compliance failure — which says an ACCEPTED payload is too large to read back,
+  not that the branch rejects the value — cannot move the branch index ·
+  **the trap was real and the pin catches it, on two counts**: the naive fix
+  (hand the verdict back as the attempt's error) stops the unreadable wire by
+  falling through to a LATER branch, so the wire would name a branch the
+  metadata API does not — and for `[decimal,null]` it is worse still, because
+  null does not accept a `[]byte` either, so the whole SCHEMA stops parsing.
+  Neutered to the naive form, the pin reds 10 tests naming exactly that · the
+  pin reads the WIRE BRANCH INDEX, not the presence of an error, at each shape's
+  own offset — **and finding that offset was the round's own defect**: an array
+  of unions leads with its BLOCK COUNT, so reading byte 0 there measures the item
+  count and reports a branch move that never happened · **scope widened as
+  ruled**: the union arm hid EVERY cap, not decimal alone — `[array<null>,null]`
+  at 4097 zero-byte items reproduced it, and both caps are now driven through the
+  arm · **the axis is DERIVED, not listed**: `TestInvariant_EveryDefault
+  WalkArmHasANestingCell` scans `encodeDefaultDepth` for the arms that actually
+  recurse (`[array map record union]`) and fails on any without a nesting cell,
+  because hand-listing is what let union hide and a longer hand list only moves
+  the blind spot. Same shape as the cap classifier, reused rather than reinvented
+  · 3 neuters: dropping the in-union nesting reds the derived guard with its own
+  message, neutering the winner-merge reds exactly the two in-union over-cap
+  cells, and the naive fix reds the branch pin · constraints pinned — at-cap
+  union defaults encode AND decode on all three shapes with branch 0 on the
+  wire, non-union carriers keep rejecting, parse never fails, and a control
+  proves selection still falls through when a branch genuinely rejects ·
+  quarantine 9357918..HEAD = 90e8055 CLEARED (a naming change; its derived
+  constant is classified and the value is unchanged) · suite + fastavro +
+  `-race` green; Java ABSENT · UNCONVERGED (counter 0), freeze stays.
+
+## Distillation archive (2026-07-28 #23) — the FULL round's ledger line, verbatim
+
+Compressed once the FIX round it directed closed the union arm.
+
+- 2026-07-28 · d60a3b8 · FULL (read-only) · **1 BEHAVIORAL, in the fix this
+  round quarantined, found by auditing the CHANGE rather than the class**: the
+  default walk's UNION arm passes a nil sink, so the chosen branch's payload goes
+  uncharged and three shapes Encode over-cap wires their own Decode refuses. The
+  nil is not a slip — a verdict from a TRIAL branch would silently select a
+  different one — so the fix is a per-attempt sink merged only for the WINNER ·
+  **the table stayed green, and that is the second half**: its nesting axis is
+  {flat, in-record, in-array, in-map}, and the union is exactly the composite
+  whose walk arm differs — an axis that exists without the shape the bug lives in
+  · **the zero-behavior naming change did more than name**: `ocfEagerBlockAlloc
+  Limit` asserted in a COMMENT that it equalled the default block bound, as
+  `64<<20` against `1<<26` — one number, two spellings, hand-maintained. It now
+  DERIVES from the named constant · quarantine acc3dcc NOT cleared ·
+  inverse-density front `json_scan.go` (B22) CLEAN, well-netted by the
+  skip-vs-value strictness parity net · suite + fastavro + `-race` green, zero
+  skips; Java ABSENT · verbatim: archive (2026-07-28 #18) · UNCONVERGED.
+
+## Distillation archive (2026-07-28 #24) — the reserved-attribute FIX era block, verbatim
+
+- 2026-07-27..28 · b1c42bb→40c36e4 · FIX ERA BLOCK, four ruling-directed rounds
+  (verbatim: archive 2026-07-28 #14, and the narratives it cites). **The
+  reserved-attribute ENUMERATION** (2184 cells, expectations derived PER CELL
+  from the references, 71 reported UNRULED rather than guessed — the table found
+  four of its own defects before any of the package's) and **#74: the emission
+  condition is PER ATTRIBUTE**. **PLACEMENT AUTHORITY minted** — the authority
+  for a placement is whichever reference actually HAS it; where neither does,
+  this package's posture governs. It corrected a prior ruling, the reversal that
+  **rule 2a** now names in the gate: reference SILENCE is not a SPLIT, so it
+  routes to rule 4 (table + HALT), never the permissive tiebreak. **The decimal
+  unscaled-LENGTH bound charged on the emit side through ONE function**, with
+  over-rejection impossible by construction; the derived site set found a face
+  neither count had (`big-decimal` has no `precision`). **The pre-encoded DEFAULT
+  face closed on ENCODE, never at parse**, its verdict recorded once and read
+  through one accessor — the alternative was MEASURED and rejected because its
+  omitzero arm silently emitted a 2-byte wire that decoded OK. Convention 1 grew
+  (e), class-elimination; NOT_BUGS' cap reached AUDIT_CORE's size guard. Standing
+  lesson across all four: a net that reds is not a net that MEASURES — twice a
+  cell red for a reason unrelated to its axis, and both times the probe was the
+  bug.
+
+## Distillation archive (2026-07-28 #25) — the producer-compliance era block, verbatim
+
+- 2026-07-28 · 15669c8→463e21d · PRODUCER-COMPLIANCE ERA (1 FULL + 1 FIX;
+  verbatim: archive 2026-07-28 #20, and the narratives it cites). The FULL round
+  found the class behind two instances — the DEFAULT carrier is pre-encoded by a
+  SECOND encoder sharing no code with the serializers, so no cap's producer check
+  was on it — and the FIX round answered at the class rather than the instance.
+  It **measured before designing**: the compiled serializer is reachable at the
+  pre-encode but NOT substitutable (swapping it reds 8 tests, because parse picks
+  a union branch by DECLARATION ORDER and the runtime dispatcher by Go kind), so
+  the charge went inside the recursion at the LEAF, each leaf asking the same
+  authority its serializer asks. **The deliverable was the TABLE**:
+  `TestMatrix_CapProducerCompliance` + `TestInvariant_EveryCapIsClassified` (a
+  cap landing without a row FAILS) + #12's exception ASSERTED on the type
+  system's own evidence. The guard proved #11's written list was not the set of
+  caps — ten more bounds, two row names taken from memory, and one bound with no
+  name at all, since fixed. Standing lesson: **an axis that exists but omits the
+  shape the bug lives in is a green net over an open hole** — the nesting axis
+  had no union cell, and the union arm is exactly where the next finding was.
