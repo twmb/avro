@@ -10459,3 +10459,287 @@ Compressed once the following round replaced the net's oracle.
   removed a hand-maintained equality: `ocfEagerBlockAllocLimit` ASSERTED in a
   comment that it equalled the default block bound, as `64<<20` against `1<<26`.
   Verbatim: archive (2026-07-28 #18, #23).
+
+## Distillation archive (2026-07-28 #33) — the key-space round's narrative, verbatim
+
+FULL read-only round at HEAD 4131d72. Quarantine `a6dd44e..HEAD` was one
+test-only commit (371a96f, the caller-value net's absolute oracle) plus a docs
+commit; the oracle's authority split — 14 values decided by an EXECUTED
+`json.Marshal`, 3 by a named package rule — was re-read against the code and
+nothing was owed.
+
+**Two behavioral findings, and they are ONE SHAPE seen twice: a guard keyed in
+a different space than the thing it protects.** That framing is what produced
+the second finding; banking the first and moving to an unrelated front would
+have left it.
+
+Finding 1 — `compat.go:207/213`. `checkRecordFieldClaimsUnique` allocates
+`claimedBy := make([]string, len(r.fields))`, stores the claiming writer-field
+NAME, and reads presence off `claimedBy[ri] != ""`. A writer field named `""`
+therefore claims a reader slot invisibly, and a second writer field reaching
+the same slot through a reader ALIAS is not detected. `CheckCompatibility`
+returns nil where `Resolve` returns a `*CompatibilityError` — precisely the
+divergence the guard's own comment says it exists to prevent, and whose pin
+(`conformance_test.go`, "CheckCompatibility also rejects
+(CheckCompatibility/Resolve parity)") asserts the lockstep using `old_name` /
+`new_name`. Order is the control: with the `""`-named writer field declared
+SECOND the sentinel has already been overwritten and both APIs reject, so the
+declaration order alone flips the verdict. Sibling sweep found both siblings
+clean and structurally so, not accidentally: `resolve.go:312` carries a
+separate `readerMatched []bool` and uses the name string only for the message;
+`json_decode.go:1297` carries `seen []bool` and guards `seen[idx] &&
+seenKey[idx] != key`. compat.go is the sole site that made one variable do both
+jobs. Reachability is `WithLaxNames` with a caller fn that accepts `""` — a
+shape the package already knows it must carry, since `internalReparseNames`
+exists exactly because the library re-parses user text under an
+accept-everything validator.
+
+Finding 2 — `schema.go:2312-2315` (and its twin in `finalizeUnionNames`). The
+union duplicate-branch check keys named branches by FULLNAME and unnamed ones
+by KIND; the tag table is keyed by fullname AND by `kind + "." + logical`. Two
+key spaces, one guard. Both halves of the mismatch are reachable:
+
+  - Over-rejects. `[{"type":"record","name":"map",...},{"type":"map",...}]` is
+    a union of two different types and is refused as `duplicate union type
+    "map"`. Java refuses it too (`Schema.java:1261-1266` keys `indexByName` by
+    `getFullName()`, which for an unnamed schema returns the kind string —
+    source-read, no JVM available); fastavro 1.12.2 ACCEPTS all five variants
+    (executed). A real reference SPLIT, but rule 1 backs the rejection: the
+    Avro JSON union envelope would be ambiguous between the two branches. NOT
+    filed as a finding.
+  - Under-rejects, and this is the bug.
+    `[{"type":"bytes","logicalType":"decimal",...},{"type":"fixed","name":"decimal","namespace":"bytes","size":4}]`
+    passes the check (keys `bytes` / `bytes.decimal`) while both branches tag
+    as `bytes.decimal`. `ser.branchNames[bn] = i` / `[ln] = i` are unguarded,
+    so the later branch silently wins, and the decimal branch's own
+    `TaggedUnions+TagLogicalTypes` JSON fails to decode against the schema that
+    produced it. `string.uuid` and `int.date` are the same cell; every name
+    involved is valid under the STRICT Avro regex.
+
+The tell that made finding 2 findable: four lines below the unguarded writes,
+`addUnionShortNameFallbacks` writes into the SAME map and guards it twice —
+`shortCount[short] != 1` and `if _, exists := ser.branchNames[short]`. An
+asymmetric arm next to a guarded one is the shape, not the absolution.
+
+**Two of my own probes were wrong before they were right, and controls caught
+both — not inspection.** (a) I predicted union-branch selection would mask a
+decodable branch for array/map the way it once did for fixed SIZE; the parser
+rejects a union of two arrays outright, which IS the compensating guard and is
+why only the NAMED kinds needed size folded in. (b) I read `Root().Schema()` as
+broken under lax names across seven cells until its own doc-string said the
+original Parse's opts must be threaded through; with `lax` passed, all twelve
+cells round-trip. Both were premise errors of the kind the framework's
+"execute reference claims" rule exists for.
+
+Fronts: compat/resolve lockstep (2 findings) · inverse-density by test-reference
+COUNT over every exported identifier, which is what surfaced `atype` (zero
+references anywhere in the repo) and `rabin` · lax-names × every surface ·
+union branch selection · the OCF writer state machine. Verified: `atype`'s 31
+constants each round-trip through the surface its package doc names;
+`rabin.go`'s full `hash.Hash64` contract plus a table/step check against the
+Java reference; twelve empty-name schemas round-trip String/Canonical/
+Fingerprint and the metadata rebuild; `Writer.count` tracks buffered datums on
+both the `Encode` and the `Write` path, so `Reset`/`Flush`/`Close` cannot
+discard a buffered block.
+
+Gate: finding 1's `claimedBy` was introduced in-range by `8a1efc1`, finding 2's
+check key scheme by `cf91ceb` — both introduced deliberately, and in both cases
+the proposed change EXTENDS the introducing commit's stated intent
+(CheckCompatibility↔Resolve parity; unambiguous union branches) rather than
+reversing it, so there is no ping-pong to halt on. Nothing in NOT_BUGS covers
+either; #42 fixes the tag SPELLING and is what makes the collision possible,
+without addressing the shared key space.
+
+Oracles: `go test -count=1 ./...` and the fastavro differential (1.12.2, venv at
+`~/.cache/avro-audit-venv` intact with cramjam + zstandard) both green, 0 skips,
+no `missing optional dependency` marker. Java ABSENT — JVM-less — so every Java
+claim in this round is source-read, not executed.
+
+## Distillation archive (2026-07-28 #34) — three closed-gap entries from §Open net gaps, verbatim
+
+Compressed in AUDIT_CORE to one line each (net name + date + re-open condition)
+when the file crossed its 55000 bound; a CLOSED gap only has to answer "covered,
+and by what net", and the counts + neuter evidence live in each closing round's
+ledger entry per that section's own rule.
+
+- **The WHOLE reserved-attribute cross product — 2026-07-27,
+  `TestMatrix_ReservedAttributeEnumeration`.** Every reserved attribute ×
+  {absent, valid, written-zero, JSON-null, wrong-typed, quoted} × {type,
+  field} × every kind = 2184 cells, 2113 asserted and 71 recorded UNRULED.
+  Its expectations are DERIVED FROM THE REFERENCES per cell — a source model
+  of Schema.java carrying the line each rule came from, plus fastavro
+  executed — never read off this package, and `reservedProvenance` records
+  what settled each family (both-references / follows-java / follows-fastavro
+  / standing-ruling / documented-divergence / unruled). This supersedes the
+  attribute-shaped matrices as the completeness question; they remain as the
+  per-ruling pins.
+- Caller-supplied VALUE domain × STRUCTURE — 2026-07-28,
+  `TestMatrix_CallerValueDomainAcrossStructures` (384 cells: 16 hostile values ×
+  4 caller-writable slots × the 5 splice structures PLUS a flat baseline). The
+  oracle is calibration-free — the verdict CLASS must not depend on the
+  structure — and the FLAT BASELINE is what makes it one: every member of
+  `callerNodeStructures()` splices, so comparing them only to each other cannot
+  see a change affecting the splice uniformly. Reuses the existing structure
+  builders and surface driver rather than re-deriving them. `nil` is deliberately
+  excluded from the value domain (a LEGAL default whose verdict is decided by the
+  field's type, so its class legitimately differs).
+- **DoS caps × the DEFAULT carrier, closed at the CLASS — 2026-07-28,
+  `TestMatrix_CapProducerCompliance`.** cap × applicability × carrier {value,
+  DEFAULT} × nesting × wire, with three guards that make it a table rather than
+  a pile of pins: `TestInvariant_EveryCapIsClassified` (a cap landing without a
+  row FAILS — it proved #11's written list was not the set of caps),
+  `TestInvariant_EveryDefaultWalkArmHasANestingCell` (the nesting axis DERIVES
+  from the arms `encodeDefaultDepth` recurses through, because hand-listing is
+  what let the union arm hide), and `TestInvariant_OCFBlockCapsStayReaderOnly`
+  (#12's exception ASSERTED, not closed). Per-ruling pins: the
+  decimal-unscaled-length axis of `TestMatrix_SelfReadableAtScale`,
+  `TestRegression_DecimalDefaultVerdictDefersToEncode`,
+  `_ReaderSideDecimalDefaultFillRejectsAtDecode`,
+  `_UnionDefaultComplianceDoesNotMoveTheBranch` (reads the WIRE BRANCH INDEX,
+  since the naive fix stops the bad wire by moving the branch), census Q19.
+  The family's two standing facts: a default that cannot be WRITTEN must not
+  stop its schema PARSING, and a cap is not one question — the carrier decides
+  which gate is even reached. Verbatim of the four original entries: archive
+  (2026-07-28 #26).
+
+
+## Distillation archive (2026-07-28 #35) — three pre-reset ledger lines, verbatim
+
+Compressed in AUDIT_CORE when the file crossed its 55000 bound. Each already
+cited its own round narrative in this archive (#22/#29, #28/#31, #30), and the
+2026-07-28 key-space round reset the convergence counter to 0, so none of the
+three carries live convergence or quarantine weight any more.
+
+- 2026-07-28 · 9357918 (START head) · FIX (ruling-directed) · **the union arm's
+  nil sink fixed with a per-attempt sink merged ONLY for the winner, correct BY
+  CONSTRUCTION**: selection reads `err` alone and the verdict never touches it,
+  so a compliance failure cannot move the branch index. The naive fix (verdict as
+  the attempt's error) stops the bad wire by falling through to a LATER branch —
+  and for `[decimal,null]` null takes no `[]byte` either, so the schema stops
+  PARSING; neutered to that form, 10 tests red. The pin reads the WIRE BRANCH
+  INDEX at each shape's own offset. The nesting axis became DERIVED from the arms
+  `encodeDefaultDepth` recurses through, because hand-listing is what let this
+  arm hide. Verbatim: archive (2026-07-28 #22, #29).
+- 2026-07-28 · 7c0faa1 · FULL (read-only) · **CLEAN — zero behavioral findings**;
+  quarantine 1773ec4 cleared by probing the union arm nested inside ITSELF. **The
+  size guard became ARITHMETIC** after two rounds reported CORE at 55.1 and 55.8
+  KB as in-bound and skipped the pass they owed. The last OPEN gap closed (caller
+  VALUE × STRUCTURE), and the net was vacuous twice before it was real — writing
+  into the COPY `pick` returns, then an agreement oracle whose members all splice
+  — both caught by neutering. B31 grew the AGREEMENT-ORACLE dodge. Front:
+  SchemaFor round-trip × BOUNDARY values, CLEAN. Verbatim: archive (2026-07-28
+  #28, #31).
+- 2026-07-28 · a6dd44e (START head — a6dd44e..HEAD quarantines this round's
+  commits) · FIX (ruling-directed) · **the caller-value net now asserts an
+  ABSOLUTE verdict per cell, not agreement.** For 14 of 17 values the authority
+  is EXECUTED — `json.Marshal` called per cell, since the package emits caller
+  values through it — and 3 have a documented package rule that overrides the
+  stdlib, each naming which. Agreement is KEPT as a second assertion for
+  structure-dependence · **both halves proven, disjoint**: removing the
+  documented non-finite fixup moves every member identically and reds 36 cells
+  through the expectation and ZERO through agreement; the splice neuter still
+  reds 78 through agreement · **B31's fifth dodge sharpened** — a baseline that
+  is a MEMBER of the agreement set is not an anchor · **the premise correction,
+  executed**: removing `valueWalkBadMapKey` does NOT flip the map-key values
+  reject→accept; it RELOCATES the error (walk message → marshal message), the
+  value is refused either way, and nothing caller-observable changes. What the
+  map-key pin reds on is the finer #68 property that the walk's ACCOUNTING
+  mirrors the stdlib resolver. The structural criticism held regardless, and is
+  what produced the absolute oracle · **going absolute caught three wrong
+  expectations of my own**: a depth of 2000 I expected refused when the measured
+  bound is between 2000 and 3000 (the pair now straddles it), and the Default
+  slot, where marshalability decides nothing because a default is validated
+  against the field's DECLARED TYPE · 408 cells · suite + fastavro + `-race`
+  green; Java ABSENT · verbatim: archive (2026-07-28 #30) · UNCONVERGED.
+
+## Distillation archive (2026-07-29 #36) — the key-space FIX round narrative, verbatim
+
+FIX round, START head 4131d72 (the two fixes and their nets land after it).
+Both findings from the preceding round were one shape — a guard keyed in a
+different space than the thing it protects — and the round's real content was
+that the two halves needed OPPOSITE fixes.
+
+**F1, the presence sentinel.** `checkRecordFieldClaimsUnique` read presence off
+the claiming writer-field NAME (`claimedBy[ri] != ""`). Split into a `claimed
+[]bool` for presence and the name for the message only, which is what
+`resolveRecord` and `iterateRecordFields` already did — compat.go was the sole
+site making one variable do both jobs.
+
+The maintainer's direction was that the class is wider than the three
+claim-tracking sites: which guards assume a value cannot be empty, in a package
+whose documented lax-names mode makes "" a legal name? The sweep ran over every
+`== ""` / `!= ""` on a name-valued string in non-test sources. Everything else
+was already structurally safe, and mostly on purpose: the emission guards carry
+`|| isNamedKind(...)` or a hidden presence bit so an empty name still emits; the
+union duplicate key falls back to the KIND rather than treating "" as absent;
+`unionBranchName` returns "" for an empty-named branch and `findUnionBranch`
+matches "" back, so that pair is self-consistent; `unionTypeNameForValue`
+returns only primitive kind names, so its "" can never be a name. Net form:
+`empty_name_component_test.go`, 13 name-shaped positions × the two
+self-consistency invariants, plus the claim-collision cross.
+
+**The net found a second reachable path the report did not have.** Crossing the
+reader field's NAME with the reader field's ALIAS (not just the name) produced
+`reader field "a" alias "" / writer alias-then-name` — an empty ALIAS claimed
+first by the writer's ""-named field. Same defect, different position, and it
+only appeared because the matrix crossed two axes the instance had fixed.
+
+**F2, the tag namespace — and the maintainer's correction, executed.** The
+reported claim that the binary tagged-map encode was affected was wrong as a
+general statement, and re-executing it produced a sharper fact than either
+version. `tryUnwrapTagged` ATTEMPTS the tag's branch and falls through to
+try-each on failure, so binary self-heals — but only sometimes, and which way
+depends on DECLARATION ORDER:
+
+  - fixed-first `["null",{fixed bytes.decimal},{bytes decimal}]`: the ser table
+    resolves "bytes.decimal" to the decimal branch (it wrote last), the JSON
+    decoder resolves it to the fixed. SER AND DESER DISAGREE. Binary encode
+    succeeds (wire 040219, branch 2) — the maintainer's executed result.
+  - decimal-first: the ser table resolves to the fixed and so does the decoder,
+    so they agree, and binary tagged-map encode of a `*big.Rat` ERRORS instead.
+
+What is order-INDEPENDENT is the JSON defect: `findUnionBranch` scans exact
+branch names before the qualifier fallback, and the fixed's fullname IS
+"bytes.decimal", so the decimal branch's own emitted tag always routes to the
+fixed. Worse than reported: for a `[]byte` value the round trip did not error at
+all, it silently came back as the OTHER branch.
+
+**The fix belongs in the tag table, not the parse check**, per the maintainer's
+ruling on a Java citation they verified: `UnionSchema` keys `indexByName` by
+`getFullName()`, giving "bytes" and "bytes.decimal" — no collision, so Java
+ACCEPTS this union and so does twmb. Rejecting it at parse would break callers
+who never enable TaggedUnions. One rule now: AN EXACT BRANCH NAME OUTRANKS A
+LOGICAL QUALIFIER, which is the order `findUnionBranch` already resolves in.
+`unionEmitTag` applies it for the two per-value emitters (JSON encode, JSON
+decode wrap) and `fillUnionTagTables` for the two compiled tables, with exact
+names placed first and qualifiers only into free keys — which is what makes the
+encoder's answer independent of declaration order, as the decoder's already was.
+A fourth site, `resolveWriterUnion`, keeps raw names because its wrap is
+suppressed outright; that immunity is now a pinned control row rather than a
+parenthetical.
+
+**Nets and their neuters.** Three neuters, each giving the triple (exit != 0,
+RUN > 0 under -v, no `panic:`), and each reding a DIFFERENT set: neutering the
+emitter arm reds only the TagLogicalTypes cells plus the tag-uniqueness
+invariant; neutering the table precedence reds BOTH option combos and only in
+one declaration order, leaving the invariant green; neutering the presence flag
+reds the two claim-collision cells and leaves all controls green. The
+over-correction guard matters as much as the matrix: dropping the qualifier
+everywhere satisfies encode-implies-decode while silently disabling
+TagLogicalTypes, so the unambiguous case is pinned to still emit the qualified
+form.
+
+**A probe of my own was wrong again, and the control caught it.** The first
+run of the tag matrix red on a cell whose decimal used `precision:4`; the value
+its own JSON round trip produced needed more digits than that, so the failure
+was the documented encode-side decimal precision rejection and not a tag
+problem at all. Widened to `precision:20`.
+
+Registered as census Q20 (which tag does a branch emit, and which branch does a
+tag resolve to) and Q21 (has this reader slot already been claimed) — the second
+being the durable form of the sibling sweep, since it lists every site that can
+drift. Both tell guards verified non-vacuous by adding a matching line and
+watching the count guard red. The `[record "map", map]` over-rejection was ruled
+a stop-sign, NOT_BUGS #76, on the maintainer's verified Java citation
+(Schema.java:1265) plus rule 1: those two branches would share one JSON envelope
+name, which is unresolvable ambiguity.
