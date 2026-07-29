@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -263,27 +264,38 @@ func capRows() []capRow {
 // every nested leaf went unasked, and no existing generator varied it.
 var capNestings = []struct {
 	name string
+	// arm is the encodeDefaultDepth case this nesting drives, or "" for the
+	// flat shape which drives no composite arm. The completeness guard matches
+	// on it, so a composite arm with no nesting here fails loudly.
+	arm string
 	// field renders the record field holding the leaf, given the leaf schema
 	// and a leaf default literal (empty for the value carrier).
 	field func(inner, deflt string) string
 	// value renders the Go value for the leaf at this nesting.
 	value func(leaf any) any
 }{
-	{"flat", func(inner, d string) string { return fieldOf("d", inner, d) },
+	{"flat", "", func(inner, d string) string { return fieldOf("d", inner, d) },
 		func(leaf any) any { return leaf }},
-	{"in-record", func(inner, d string) string {
+	{"in-record", "record", func(inner, d string) string {
 		// The default has to sit on the OUTER field: a record-typed field
 		// defaults as a whole object. Hanging it on the inner field instead
 		// leaves the outer one defaultless, and the cell then measures
 		// "missing key" rather than the cap.
 		return fieldOf("d", `{"type":"record","name":"Inner","fields":[`+fieldOf("x", inner, "")+`]}`, objKeyOf("x", d))
 	}, func(leaf any) any { return map[string]any{"x": leaf} }},
-	{"in-array", func(inner, d string) string {
+	{"in-array", "array", func(inner, d string) string {
 		return fieldOf("d", `{"type":"array","items":`+inner+`}`, arrOf(d))
 	}, func(leaf any) any { return []any{leaf} }},
-	{"in-map", func(inner, d string) string {
+	{"in-map", "map", func(inner, d string) string {
 		return fieldOf("d", `{"type":"map","values":`+inner+`}`, objOf(d))
 	}, func(leaf any) any { return map[string]any{"k": leaf} }},
+	// A union default corresponds to the FIRST branch, so the leaf's own
+	// literal is the union's literal. This arm hid every cap until it was
+	// driven: it selects a branch by trying each and keeping the first that
+	// encodes, and it charged nothing at all.
+	{"in-union", "union", func(inner, d string) string {
+		return fieldOf("d", `[`+inner+`,"null"]`, d)
+	}, func(leaf any) any { return leaf }},
 }
 
 func fieldOf(name, typ, deflt string) string {
@@ -550,4 +562,84 @@ func TestInvariant_EveryCapIsClassified(t *testing.T) {
 			t.Errorf("row %s names no constant in the sources — it was renamed or deleted, and this row now watches nothing", name)
 		}
 	}
+}
+
+// scanDefaultWalkCompositeArms returns the kinds encodeDefaultDepth RECURSES
+// through — the arms that can nest a cap's carrier below the field's own node.
+// It is derived from the source rather than listed, because a hand-listed axis
+// is what let the union arm hide: it was a composite the table never drove, and
+// a longer hand list would only move the blind spot to the next arm.
+func scanDefaultWalkCompositeArms(src string) []string {
+	start := strings.Index(src, "func encodeDefaultDepth(")
+	if start < 0 {
+		return nil
+	}
+	body := src[start:]
+	if end := strings.Index(body, "\n}\n"); end > 0 {
+		body = body[:end]
+	}
+	caseLine := regexp.MustCompile(`^\tcase ("[a-z]+"(?:, "[a-z]+")*):`)
+	quoted := regexp.MustCompile(`"([a-z]+)"`)
+	var out []string
+	var current []string
+	recursed := false
+	flush := func() {
+		if recursed {
+			out = append(out, current...)
+		}
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if m := caseLine.FindStringSubmatch(line); m != nil {
+			flush()
+			current, recursed = nil, false
+			for _, q := range quoted.FindAllStringSubmatch(m[1], -1) {
+				current = append(current, q[1])
+			}
+			continue
+		}
+		if current != nil && strings.Contains(line, "encodeDefaultDepth(") {
+			recursed = true
+		}
+	}
+	flush()
+	return out
+}
+
+// TestInvariant_EveryDefaultWalkArmHasANestingCell is the completeness half of
+// the NESTING axis, mirroring the cap classifier: every composite arm of the
+// default walk must be driven by a nesting, or land with no cell and FAIL.
+//
+// The union arm is why this exists. It recursed like the other three, behaved
+// differently from all of them (it selects a branch by trying each), and was
+// simply absent from a hand-written axis — so the table stayed green over an
+// open hole. An axis that exists but omits the shape a bug lives in is worse
+// than no axis, because it reads as coverage.
+func TestInvariant_EveryDefaultWalkArmHasANestingCell(t *testing.T) {
+	src, err := os.ReadFile("resolve.go")
+	if err != nil {
+		t.Fatalf("read resolve.go: %v", err)
+	}
+	arms := scanDefaultWalkCompositeArms(string(src))
+	if len(arms) == 0 {
+		t.Fatal("the scan found no recursing arms at all — encodeDefaultDepth moved or was renamed, and this guard is watching nothing")
+	}
+	driven := map[string]bool{}
+	for _, n := range capNestings {
+		if n.arm != "" {
+			driven[n.arm] = true
+		}
+	}
+	for _, arm := range arms {
+		if !driven[arm] {
+			t.Errorf("encodeDefaultDepth recurses through the %q arm, but no nesting in capNestings drives it.\n"+
+				"  A composite arm can nest a cap's carrier below the field's own node, which is exactly where the\n"+
+				"  charge is asked. Add a nesting with arm: %q, or this axis reads as coverage it does not have.", arm, arm)
+		}
+	}
+	for arm := range driven {
+		if !slices.Contains(arms, arm) {
+			t.Errorf("nesting drives the %q arm, but encodeDefaultDepth no longer recurses through it — the cell is stale", arm)
+		}
+	}
+	t.Logf("composite arms derived from source: %v", arms)
 }

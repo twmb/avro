@@ -1014,7 +1014,19 @@ func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *
 		base := len(dst)
 		for i, branch := range node.branches {
 			attempt := appendVarlong(dst[:base], int64(i))
-			if encoded, err := encodeDefaultDepth(attempt, val, branch, depth+1, nil); err == nil {
+			// Each attempt charges into its OWN sink, and only the WINNER's
+			// verdict is merged. Selection must stay byte-identical: it is
+			// decided by err alone, so a compliance verdict — which says the
+			// payload is too large to read back, not that the branch rejects
+			// the value — can never move the branch index. Handing the verdict
+			// back as the attempt's err would look like a fix (no unreadable
+			// wire is emitted) while silently selecting a LATER branch, and the
+			// metadata API would then report a different branch than the wire
+			// names. Passing nil instead, as this loop first did, keeps
+			// selection right and charges nothing at all.
+			var attemptSink defaultChargeSink
+			if encoded, err := encodeDefaultDepth(attempt, val, branch, depth+1, &attemptSink); err == nil {
+				sink.record(attemptSink.err)
 				return encoded, nil
 			}
 		}

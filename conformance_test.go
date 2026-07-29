@@ -22777,3 +22777,107 @@ func TestRegression_ReaderSideDecimalDefaultFillRejectsAtDecode(t *testing.T) {
 		}
 	}
 }
+
+// A union default's producer-compliance verdict must not participate in BRANCH
+// SELECTION. Selection is decided by whether a branch ACCEPTS the value; a
+// compliance verdict says something else entirely — that the accepted payload
+// is too large to read back — and letting it reach the selector would silently
+// move the branch.
+//
+// That failure is invisible to a test asserting only "no unreadable wire is
+// emitted": returning the verdict as the attempt's error also stops the bad
+// wire, by falling through to a later branch, and then the wire names a branch
+// the metadata API does not. So this pins the WIRE BRANCH INDEX, not just the
+// presence of an error.
+func TestRegression_UnionDefaultComplianceDoesNotMoveTheBranch(t *testing.T) {
+	const unscaledCap = 32 << 10
+	const zeroByteCap = 4 << 10
+	cpLit := func(n int) string {
+		var sb strings.Builder
+		sb.WriteByte('"')
+		for range n {
+			fmt.Fprintf(&sb, "\\u%04x", 1)
+		}
+		sb.WriteByte('"')
+		return sb.String()
+	}
+	nulls := func(n int) string {
+		return "[" + strings.TrimSuffix(strings.Repeat("null,", n), ",") + "]"
+	}
+	dec := `{"type":"bytes","logicalType":"decimal","precision":65536,"scale":0}`
+	arr := `{"type":"array","items":"null"}`
+
+	for _, c := range []struct {
+		name    string
+		inner   string
+		atCap   string
+		overCap string
+	}{
+		{"decimal", dec, cpLit(unscaledCap), cpLit(unscaledCap + 1)},
+		{"zero-byte array", arr, nulls(zeroByteCap), nulls(zeroByteCap + 1)},
+	} {
+		// Three shapes the union can sit at, all of which route through the
+		// union arm of the default walk.
+		// idx is where the UNION index sits in the record's bytes. An array
+		// of unions leads with its block count, so the index is one byte in;
+		// reading offset 0 there measures the item count instead and reports a
+		// branch move that did not happen.
+		shapes := func(deflt string) []struct {
+			name, schema string
+			idx          int
+		} {
+			return []struct {
+				name, schema string
+				idx          int
+			}{
+				{"field-level", fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"u","type":[%s,"null"],"default":%s}]}`, c.inner, deflt), 0},
+				{"inside a record default", fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"r","type":{"type":"record","name":"In","fields":[{"name":"u","type":[%s,"null"]}]},"default":{"u":%s}}]}`, c.inner, deflt), 0},
+				{"array of unions", fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":[%s,"null"]},"default":[%s]}]}`, c.inner, deflt), 1},
+			}
+		}
+		for _, sh := range shapes(c.atCap) {
+			t.Run(c.name+"/at-cap/"+sh.name, func(t *testing.T) {
+				s, err := avro.Parse(sh.schema)
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+				w, err := s.Encode(map[string]any{})
+				if err != nil {
+					t.Fatalf("an at-cap union default must still encode: %v", err)
+				}
+				// Branch 0 is 0x00 at the shape's union-index offset.
+				if w[sh.idx] != 0x00 {
+					t.Fatalf("wire names branch byte %#x at offset %d, want 0x00 — selection moved", w[sh.idx], sh.idx)
+				}
+				var back map[string]any
+				if _, err := s.Decode(w, &back); err != nil {
+					t.Fatalf("the encoded wire must decode: %v", err)
+				}
+			})
+		}
+		for _, sh := range shapes(c.overCap) {
+			t.Run(c.name+"/over-cap/"+sh.name, func(t *testing.T) {
+				s, err := avro.Parse(sh.schema)
+				if err != nil {
+					t.Fatalf("the schema must still parse; the bound belongs on encode: %v", err)
+				}
+				w, err := s.Encode(map[string]any{})
+				if err == nil {
+					t.Fatalf("an over-cap union default must be refused, not resolved to a later branch; "+
+						"encoded %d bytes naming branch byte %#x", len(w), w[sh.idx])
+				}
+			})
+		}
+	}
+
+	// Selection itself is untouched: where the first branch genuinely does not
+	// accept the value, the walk still falls through to the one that does.
+	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"u","type":["int","string"],"default":"hello"}]}`)
+	w, err := s.Encode(map[string]any{})
+	if err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	if w[0] != 0x02 {
+		t.Fatalf("control: an int branch cannot take a string default, so selection must reach branch 1 (0x02); got %#x", w[0])
+	}
+}
