@@ -746,6 +746,70 @@ var censusRegistry = []censusQuestion{
 			// is the shape a NEW hand-written identity decision takes.
 		},
 	},
+	{
+		id:       "Q20",
+		question: "Which tag does this union branch emit, and which branch does a tag resolve to?",
+		authority: "findUnionBranch (json_codec.go) is the RESOLVER and therefore the authority: it scans exact " +
+			"branch names first and only then tries the \"<kind>.<logicalType>\" qualifier. unionEmitTag is the " +
+			"canonical predicate for the emit direction, and it exists to respect that order rather than restate " +
+			"it. The two spellings share one namespace — \"bytes.decimal\" is both the qualifier of a " +
+			"decimal-on-bytes branch and the fullname of a fixed named \"decimal\" in namespace \"bytes\" — so a " +
+			"branch whose qualifier another branch owns exactly must emit its unqualified name instead. Without " +
+			"that, a value's own tagged JSON decodes back onto a different branch. The oracle is " +
+			"calibration-free and needs no reference: a tag must name exactly one branch, and a value's tagged " +
+			"round trip must land where it started",
+		answerers: []censusAnswerer{
+			{repr: "JSON encode envelope", site: "appendTaggedUnion", file: "json_codec.go"},
+			{repr: "JSON decode tagged-map wrap", site: "wrapUnion", file: "json_decode.go"},
+			{repr: "resolved union wrap tables", site: "resolveReaderUnion / resolveUnionUnion", file: "resolve.go"},
+			{
+				repr: "compiled tag tables (binary decode wrap + binary tagged-map encode lookup)",
+				site: "fillUnionTagTables", file: "schema.go",
+				note: "different-by-design as a SITE, same rule: these are TABLES built once at parse time rather than a per-value call, and one of them is a map keyed the other way (tag to index), so they cannot literally call unionEmitTag per branch. fillUnionTagTables applies the identical precedence — every exact name is placed first, then a qualifier only into a key no exact name claimed — which is what makes the encoder's idea of who owns a tag independent of branch DECLARATION ORDER, as the resolver's already is. The tables and unionEmitTag are held together by the round-trip matrix, not by sharing a call.",
+			},
+		},
+		tells: []censusTell{
+			{pattern: `unionEmitTag`, counts: map[string]int{
+				// Definition, its doc heading, and the one call in
+				// appendTaggedUnion.
+				"json_codec.go": 3,
+				// wrapUnion's call plus the comment naming why it is shared
+				// with the encode side.
+				"json_decode.go": 2,
+				// Two calls, each with a comment line naming the reader union
+				// as the namespace the tag resolves against.
+				"resolve.go": 4,
+			}},
+		},
+	},
+	{
+		id:       "Q21",
+		question: "Has this reader field slot already been claimed by an earlier writer field / JSON key?",
+		authority: "a dedicated presence flag, never the claiming NAME. The empty string is a legal name " +
+			"component under a caller-supplied WithLaxNames validator, so a name-valued slot cannot distinguish " +
+			"\"unclaimed\" from \"claimed by the field named \\\"\\\"\" — the guard then skips its own check for " +
+			"exactly one input and reports a collision as clean. Presence is a []bool; the claiming name is kept " +
+			"only to name the collision in the error message. All three sites answer the same question because " +
+			"two writer fields (or two JSON keys) reaching one reader slot is the same misconfiguration on every " +
+			"wire, and compat.go must agree with resolve.go in particular: Resolve calls CheckCompatibility " +
+			"first, so a disagreement means a caller is told a schema pair is fine and then fails at Resolve",
+		answerers: []censusAnswerer{
+			{repr: "CheckCompatibility, writer field to reader slot", site: "checkRecordFieldClaimsUnique", file: "compat.go"},
+			{repr: "Resolve, writer field to reader slot", site: "resolveRecord", file: "resolve.go"},
+			{repr: "JSON object decode, JSON key to reader slot", site: "iterateRecordFields", file: "json_decode.go"},
+		},
+		tells: []censusTell{
+			{pattern: `make([]bool,`, counts: map[string]int{
+				"compat.go":      1, // claimed
+				"resolve.go":     1, // readerMatched
+				"json_decode.go": 1, // seen
+				// Not an answerer, registered so the guard does not flag it:
+				// this tracks which struct fields carry an omitzero directive,
+				// which is a property of the Go type and claims no slot.
+				"reflect.go": 1,
+			}},
+		},
+	},
 }
 
 // censusOutstanding is the enumeration's OPEN end. A question lands here the

@@ -1617,7 +1617,7 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 						if err == nil {
 							if ctx.scanner.peek() == '}' {
 								ctx.scanner.pos++
-								return assignAny(target, ctx.wrapUnion(target, val, branch), branch.kind)
+								return assignAny(target, ctx.wrapUnion(target, val, node, branch), branch.kind)
 							}
 						} else if errors.Is(err, errTooDeep) {
 							// Don't fall through to bare-union retry; the recursion
@@ -1684,7 +1684,7 @@ func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) err
 // uses an inline tmp `any` instead since it must hold the decoded value
 // pending a close-brace check before committing to v — see the comment
 // on its tagged-path arm.
-func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, branch *schemaNode) error {
+func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, union, branch *schemaNode) error {
 	v, toAny := unionTarget(rawV, branch)
 	if toAny {
 		var val any
@@ -1694,7 +1694,7 @@ func (ctx *jsonDecoder) decodeBranchInto(rawV reflect.Value, branch *schemaNode)
 		// wrapUnion returns nil for null branches; reflect.ValueOf(nil)
 		// is the invalid zero Value, so use assignAny which sets a typed
 		// nil for interface targets.
-		return assignAny(v, ctx.wrapUnion(v, val, branch), branch.kind)
+		return assignAny(v, ctx.wrapUnion(v, val, union, branch), branch.kind)
 	}
 	return ctx.decodeValue(v, branch)
 }
@@ -1761,7 +1761,7 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byt
 			continue
 		}
 		savedPos := ctx.scanner.pos
-		if err := ctx.decodeBranchInto(v, branch); err == nil {
+		if err := ctx.decodeBranchInto(v, node, branch); err == nil {
 			return nil
 		} else if errors.Is(err, errTooDeep) {
 			return err
@@ -1795,7 +1795,7 @@ func (ctx *jsonDecoder) decodeUnionBare(v reflect.Value, node *schemaNode, p byt
 	return fmt.Errorf("avro json: no union branch matched at offset %d", ctx.scanner.pos)
 }
 
-func (ctx *jsonDecoder) wrapUnion(v reflect.Value, val any, branch *schemaNode) any {
+func (ctx *jsonDecoder) wrapUnion(v reflect.Value, val any, union, branch *schemaNode) any {
 	if !ctx.wrapUnions || val == nil {
 		return val
 	}
@@ -1807,17 +1807,14 @@ func (ctx *jsonDecoder) wrapUnion(v reflect.Value, val any, branch *schemaNode) 
 	if v.Kind() == reflect.Interface && !mapStringAnyType.AssignableTo(v.Type()) {
 		return val
 	}
-	// Reuse unionBranchNames so the tagged-map key produced on decode is
+	// Reuse unionEmitTag so the tagged-map key produced on decode is
 	// byte-identical to what the encode side emits — in particular, a
 	// named fixed carrying a logical type wraps under its NAME, not
 	// "fixed.<logicalType>" (see unionBranchNames for the goavro/Java
-	// references this mirrors).
-	standard, logical := unionBranchNames(branch)
-	name := standard
-	if ctx.qualifyLogical {
-		name = logical
-	}
-	return map[string]any{name: val}
+	// references this mirrors), and a logical qualifier another branch
+	// owns as its exact name degrades to the unqualified name on BOTH
+	// sides rather than only one.
+	return map[string]any{unionEmitTag(union, branch, ctx.qualifyLogical): val}
 }
 
 // jsonTokenMatchesBranch returns true if a JSON token type could

@@ -730,8 +730,10 @@ func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 	// runs — so the two paths share one TaggedUnions contract: targets
 	// that map[string]any is not assignable to (concrete types,
 	// non-empty interfaces) skip the wrap silently rather than erroring.
-	bn, ln := unionBranchNames(rb)
-	wrap := &deserUnion{branchNames: []string{bn}, logicalNames: []string{ln}}
+	// unionEmitTag, not the raw logical qualifier: the tag is resolved against
+	// the READER union, whose other branches may own that spelling exactly.
+	bn, _ := unionBranchNames(rb)
+	wrap := &deserUnion{branchNames: []string{bn}, logicalNames: []string{unionEmitTag(r, rb, true)}}
 	inner := resolved.deser
 	deser := func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		src, err := inner(src, v, sl)
@@ -773,7 +775,10 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 		// schema declares — not the writer's. Otherwise a promoted
 		// int→long branch decoded with TaggedUnions would emit
 		// {"int": ...} against a reader that knows the field as "long".
-		bnames[i], lnames[i] = unionBranchNames(rb)
+		// The logical spelling goes through unionEmitTag so it degrades to
+		// the unqualified name when another READER branch owns it exactly.
+		bnames[i], _ = unionBranchNames(rb)
+		lnames[i] = unionEmitTag(r, rb, true)
 	}
 	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
 	deser := du.deser

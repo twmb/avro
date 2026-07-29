@@ -2233,6 +2233,12 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		sawTypes    = make(map[string]bool)
 		branchMetas = make([]fieldMeta, len(s.union))
 		branchNodes = make([]*schemaNode, len(s.union))
+		// Per-branch tag spellings, collected across the loop and turned
+		// into the three tag tables in one place afterward — the collision
+		// rule needs every branch's exact name, so it cannot be applied
+		// branch-by-branch inside the loop.
+		unionStd = make([]string, 0, len(s.union))
+		unionLog = make([]string, 0, len(s.union))
 	)
 	// A zero-branch union appends nothing below; the canon tree still
 	// needs a non-nil union so the canonical writer emits `[]` (union-ness
@@ -2304,17 +2310,10 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		} else {
 			bn, ln = typ, typ
 		}
-		deser.branchNames = append(deser.branchNames, bn)
-		deser.logicalNames = append(deser.logicalNames, ln)
-		if ser.branchNames == nil {
-			ser.branchNames = make(map[string]int, len(s.union))
-		}
-		ser.branchNames[bn] = i
-		if ln != bn {
-			ser.branchNames[ln] = i
-		}
+		unionStd = append(unionStd, bn)
+		unionLog = append(unionLog, ln)
 	}
-	addUnionShortNameFallbacks(ser, deser.branchNames)
+	fillUnionTagTables(ser, deser, unionStd, unionLog)
 	// Populate branchKinds for type-name dispatch in serUnion.ser /
 	// appendAvroJSONUnion / encodeDefault's union case (see
 	// unionTypeNameForValue). Primitive kinds only — record/enum/fixed
@@ -2381,6 +2380,53 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 // prevents silent misrouting when two namespaces share a short name.
 // Called from buildUnion (in-order branches) and finalizeUnionNames
 // (after forward-ref branches resolve) so the rule lives in one place.
+// fillUnionTagTables builds a union's three tag tables from the per-branch
+// (standard, logical) name pairs: the two the DECODER emits
+// (deser.branchNames / deser.logicalNames) and the one the ENCODER resolves a
+// tagged map through (ser.branchNames). All three get one precedence rule —
+// AN EXACT BRANCH NAME OUTRANKS A LOGICAL QUALIFIER — which is the order
+// findUnionBranch already resolves in, so every table and the JSON emitter
+// agree on which branch owns a tag.
+//
+// Two writes were unguarded before, and they disagreed in opposite ways. The
+// emit table stored a "<kind>.<logicalType>" qualifier that another branch
+// owns as its exact name, so a branch emitted a tag the decoder handed to
+// that other branch. The ser map took whichever branch wrote last, so the
+// encoder's idea of who owns the tag depended on DECLARATION ORDER while the
+// decoder's did not. Both are fixed here rather than at parse: the schema is
+// legal Avro and Java accepts it, so refusing it would break callers who
+// never enable TaggedUnions.
+func fillUnionTagTables(ser *serUnion, deser *deserUnion, standard, logical []string) {
+	deser.branchNames = append(deser.branchNames[:0], standard...)
+	deser.logicalNames = deser.logicalNames[:0]
+	for i, ln := range logical {
+		if ln != standard[i] && unionLogicalTagOwnedElsewhere(standard, i, ln) {
+			ln = standard[i]
+		}
+		deser.logicalNames = append(deser.logicalNames, ln)
+	}
+	ser.branchNames = make(map[string]int, len(standard))
+	// Exact names first, first-write-wins, mirroring findUnionBranch's
+	// first-match scan. Duplicates among them are a duplicate union type and
+	// are rejected before this runs (buildUnion defers only forward-ref
+	// branches, which finalizeUnionNames re-checks over resolved names).
+	for i, bn := range standard {
+		if _, taken := ser.branchNames[bn]; !taken {
+			ser.branchNames[bn] = i
+		}
+	}
+	// Qualifiers land only in keys no exact name claimed.
+	for i, ln := range deser.logicalNames {
+		if ln == standard[i] {
+			continue
+		}
+		if _, taken := ser.branchNames[ln]; !taken {
+			ser.branchNames[ln] = i
+		}
+	}
+	addUnionShortNameFallbacks(ser, deser.branchNames)
+}
+
 func addUnionShortNameFallbacks(ser *serUnion, branchNames []string) {
 	if len(branchNames) == 0 {
 		return
@@ -2426,10 +2472,7 @@ func addUnionShortNameFallbacks(ser *serUnion, branchNames []string) {
 //     the tables identical to what an in-order reference produces.
 func finalizeUnionNames(ser *serUnion, deser *deserUnion, branches []*schemaNode) error {
 	saw := make(map[string]bool, len(branches))
-	deser.branchNames = deser.branchNames[:0]
-	deser.logicalNames = deser.logicalNames[:0]
-	ser.branchNames = make(map[string]int, len(branches))
-	for i, n := range branches {
+	for _, n := range branches {
 		key := n.kind
 		if n.name != "" {
 			key = n.name
@@ -2438,15 +2481,13 @@ func finalizeUnionNames(ser *serUnion, deser *deserUnion, branches []*schemaNode
 			return fmt.Errorf("duplicate union type %q", truncForError(key))
 		}
 		saw[key] = true
-		bn, ln := unionBranchNames(n)
-		deser.branchNames = append(deser.branchNames, bn)
-		deser.logicalNames = append(deser.logicalNames, ln)
-		ser.branchNames[bn] = i
-		if ln != bn {
-			ser.branchNames[ln] = i
-		}
 	}
-	addUnionShortNameFallbacks(ser, deser.branchNames)
+	std := unionStandardNames(branches)
+	log := make([]string, len(branches))
+	for i, n := range branches {
+		_, log[i] = unionBranchNames(n)
+	}
+	fillUnionTagTables(ser, deser, std, log)
 	return nil
 }
 

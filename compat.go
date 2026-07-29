@@ -204,13 +204,23 @@ func checkRecordFieldClaimsUnique(r, w *schemaNode, path string) error {
 	if len(r.fields) == 0 {
 		return nil
 	}
+	// Presence and identity are SEPARATE variables. A field name is not a
+	// usable presence sentinel: the empty string is a legal name component
+	// under a caller-supplied [WithLaxNames] validator, so a writer field
+	// named "" would claim a reader slot while leaving the slot's record
+	// indistinguishable from unclaimed — and the second writer field
+	// reaching that slot through a reader alias would go undetected. The
+	// name is kept only to name the collision in the error. resolveRecord
+	// (resolve.go) splits the two the same way, which is what this check
+	// has to stay in lockstep with.
+	claimed := make([]bool, len(r.fields))
 	claimedBy := make([]string, len(r.fields))
 	for _, wf := range w.fields {
 		ri := findReaderFieldIndex(r, wf.name)
 		if ri < 0 {
 			continue
 		}
-		if claimedBy[ri] != "" {
+		if claimed[ri] {
 			return &CompatibilityError{
 				Path:       pathOrRoot(path),
 				ReaderType: "record",
@@ -219,6 +229,7 @@ func checkRecordFieldClaimsUnique(r, w *schemaNode, path string) error {
 					truncForError(claimedBy[ri]), truncForError(wf.name), truncForError(r.fields[ri].name)),
 			}
 		}
+		claimed[ri] = true
 		claimedBy[ri] = wf.name
 	}
 	return nil

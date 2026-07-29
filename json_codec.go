@@ -1058,7 +1058,7 @@ func appendJSONFieldDefault(buf []byte, f fieldNode, cfg *optConfig, depth int) 
 			if err != nil {
 				return nil, err
 			}
-			return appendUnionBranch(buf, branch, encoded, cfg), nil
+			return appendUnionBranch(buf, f.node, branch, encoded, cfg), nil
 		}
 		return nil, fmt.Errorf("avro json: union default for field %q does not match any branch", truncForError(f.name))
 	}
@@ -1188,9 +1188,9 @@ func appendAvroJSONRecord(buf []byte, v reflect.Value, node *schemaNode, cfg *op
 // before the appendAvroJSON peel loop, so the un-peeled nil reaches the
 // union dispatcher) — would emit `{"null":null}` under TaggedUnions
 // instead of the spec-required bare `null`.
-func appendUnionBranch(buf []byte, branch *schemaNode, encoded []byte, cfg *optConfig) []byte {
+func appendUnionBranch(buf []byte, union, branch *schemaNode, encoded []byte, cfg *optConfig) []byte {
 	if cfg.tagged && branch.kind != "null" {
-		return appendTaggedUnion(buf, branch, encoded, cfg.tagLogical)
+		return appendTaggedUnion(buf, union, branch, encoded, cfg.tagLogical)
 	}
 	return append(buf, encoded...)
 }
@@ -1236,7 +1236,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 					// matching Encode's serUnion behavior.
 					goto tryAll
 				}
-				return appendUnionBranch(buf, branch, encoded, cfg), nil
+				return appendUnionBranch(buf, node, branch, encoded, cfg), nil
 			}
 		}
 	}
@@ -1255,7 +1255,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 	if isNilValue(v) {
 		for _, branch := range node.branches {
 			if branch.kind == "null" {
-				return appendUnionBranch(buf, branch, []byte("null"), cfg), nil
+				return appendUnionBranch(buf, node, branch, []byte("null"), cfg), nil
 			}
 		}
 	}
@@ -1273,7 +1273,7 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 			}
 			encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
 			if err == nil {
-				return appendUnionBranch(buf, branch, encoded, cfg), nil
+				return appendUnionBranch(buf, node, branch, encoded, cfg), nil
 			}
 			if errors.Is(err, errTooDeep) {
 				return nil, err
@@ -1312,7 +1312,7 @@ tryAll:
 		}
 		encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
 		if err == nil {
-			return appendUnionBranch(buf, branch, encoded, cfg), nil
+			return appendUnionBranch(buf, node, branch, encoded, cfg), nil
 		}
 		// Propagate too-deep without trying further branches; the
 		// trial loop would otherwise mask the recursion limit error
@@ -1383,14 +1383,64 @@ func unionBranchNames(node *schemaNode) (standard, logical string) {
 	return standard, logical
 }
 
+// unionLogicalTagOwnedElsewhere reports whether ln — the
+// "<kind>.<logicalType>" qualifier computed for branch i — is some OTHER
+// branch's EXACT name. The two spellings share one tag namespace:
+// "bytes.decimal" is the qualifier for a decimal-on-bytes branch AND the
+// fullname of a fixed named "decimal" in namespace "bytes". findUnionBranch
+// resolves an exact name before it tries the qualifier fallback, so emitting
+// the qualifier in that case hands the decoder a tag it routes to the other
+// branch — the schema's own output stops decoding against the schema that
+// produced it.
+//
+// The rule this expresses, applied identically by every tag table and by the
+// JSON emitter: AN EXACT BRANCH NAME OUTRANKS A LOGICAL QUALIFIER. A branch
+// whose qualifier is taken falls back to its unqualified name, which is what
+// TagLogicalTypes emits for that branch anyway when no logical type is
+// present. Nothing else about the union changes: the schema still parses (it
+// is legal Avro — Java accepts it too), only the tag spelling degrades, and
+// only for the colliding branch.
+func unionLogicalTagOwnedElsewhere(standard []string, i int, ln string) bool {
+	for j, bn := range standard {
+		if j != i && bn == ln {
+			return true
+		}
+	}
+	return false
+}
+
+// unionStandardNames returns the exact (unqualified) tag of every branch.
+func unionStandardNames(branches []*schemaNode) []string {
+	out := make([]string, len(branches))
+	for i, b := range branches {
+		if b != nil {
+			out[i] = unionBranchName(b)
+		}
+	}
+	return out
+}
+
+// unionEmitTag returns the tag branch emits inside union, under tagLogical.
+// Single source of truth for the JSON encoder; the binary side reads the
+// equivalent value out of deserUnion.logicalNames, which fillUnionTagTables
+// builds with this same rule.
+func unionEmitTag(union, branch *schemaNode, tagLogical bool) string {
+	bn, ln := unionBranchNames(branch)
+	if !tagLogical || ln == bn {
+		return bn
+	}
+	for _, b := range union.branches {
+		if b != nil && b != branch && unionBranchName(b) == ln {
+			return bn
+		}
+	}
+	return ln
+}
+
 // appendTaggedUnion appends the Avro JSON tagged-union wrapping
 // `{"<branch>":<encoded>}` for the given branch and pre-encoded body.
-func appendTaggedUnion(buf []byte, branch *schemaNode, encoded []byte, tagLogical bool) []byte {
-	bn, ln := unionBranchNames(branch)
-	name := bn
-	if tagLogical {
-		name = ln
-	}
+func appendTaggedUnion(buf []byte, union, branch *schemaNode, encoded []byte, tagLogical bool) []byte {
+	name := unionEmitTag(union, branch, tagLogical)
 	buf = append(buf, '{')
 	buf = appendJSONString(buf, name)
 	buf = append(buf, ':')
