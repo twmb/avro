@@ -10371,3 +10371,91 @@ at their own narratives.
   fails, and a control proves selection still falls through when a branch truly
   rejects · quarantine 90e8055 CLEARED · suite + fastavro + `-race` green; Java
   ABSENT · verbatim: archive (2026-07-28 #22) · UNCONVERGED.
+
+## Distillation archive (2026-07-28 #30) — the absolute-oracle FIX round ledger line, verbatim
+
+- 2026-07-28 · a6dd44e (START head) · FIX (ruling-directed) · **the net now
+  asserts an ABSOLUTE verdict per cell, not agreement.** Each hostile value
+  carries a required outcome derived from an authority outside this package,
+  and for fourteen of seventeen that authority is EXECUTED rather than written
+  down — `json.Marshal` is called per cell, because the package emits caller
+  values through it, so the expectation tracks the stdlib instead of a snapshot
+  of it. Three values have a documented package rule that overrides the stdlib
+  and each says which: the two non-finite floats a documented fixup rewrites,
+  and a nesting depth the documented walk budget refuses. Agreement is KEPT as a
+  second assertion, since it catches what the absolute one cannot — a verdict
+  that depends on which structure the value sits in · **the absolute half is
+  necessary and it is proven, not asserted**: removing the documented non-finite
+  fixup moves every member identically and reds 36 cells through the
+  expectation and ZERO through agreement. The splice neuter still reds 78
+  through agreement. Two halves, two disjoint failure classes · **B31's fifth
+  dodge sharpened**: a baseline that is a MEMBER of the agreement set is not an
+  anchor, because it moves with a uniform change too · **the correction I owe on
+  the premise, executed**: removing the `valueWalkBadMapKey` guard does NOT flip
+  floatKeyMap/structKeyMap reject→accept. It relocates the error — with the
+  guard, `Schema()` fails with "map whose key type has..."; without it, with
+  "json: unsupported type: map[float64]string". The value is refused either way,
+  so nothing caller-observable changes and this net legitimately stays green;
+  what `TestRegression_WalkBudgetMapKeyMatchesJSONKeyResolver` reds on is the
+  finer #68 property that the walk's ACCOUNTING mirrors the stdlib's key resolver
+  arm for arm. The structural criticism was right regardless, and acting on it is
+  what produced the absolute oracle · **making it absolute immediately caught
+  three wrong expectations of my own** — a depth of 2000 that I expected to be
+  refused when the measured bound sits between 2000 and 3000 (the pair now
+  straddles it), and the Default slot, where marshalability decides nothing
+  because a default is additionally validated against the field's DECLARED TYPE,
+  so that slot has its own authority · 408 cells · quarantine a6dd44e..HEAD is
+  this round's own · suite + fastavro + `-race` green; Java ABSENT · UNCONVERGED
+  (counter 0), freeze stays.
+
+## Distillation archive (2026-07-28 #31) — the clean FULL round's ledger line, verbatim
+
+Compressed once the following round replaced the net's oracle.
+
+- 2026-07-28 · 7c0faa1 · FULL (read-only) · **CLEAN — zero behavioral
+  findings**; the substance is a net built and twice caught measuring nothing by
+  its own neuter · quarantine 1773ec4 CLEARED, probed at the shape it could not
+  have been designed against: the union arm nested inside ITSELF
+  (union→record/array/map→union), where an inner verdict must survive out through
+  an outer WINNING attempt and be discarded with a losing one · **the size guard
+  is now ARITHMETIC** — stating the number was not the check, and two rounds
+  running reported CORE at 55.1 and 55.8 KB as in-bound and skipped the pass they
+  owed; it now prints bytes, bound and a CROSSED/under verdict, and this round
+  took the owed pass first · **the last OPEN gap closed**: caller VALUE domain ×
+  STRUCTURE, 384 cells, reusing the existing builders · **the net was vacuous
+  twice before it was real, both caught by neutering**: the slot wrote into the
+  COPY `pick` returns and drove the root; then a splice neuter still would not
+  red, because all five structures splice and an agreement oracle cannot see a
+  change that moves every member alike. A FLAT baseline fixed it — same neuter,
+  12 cells red · **B31 grew that fifth dodge**, the AGREEMENT-ORACLE shape:
+  neuter the shared arm UNIFORMLY, not per-member · front: SchemaFor round-trip ×
+  BOUNDARY values (its generative net holds the VALUE constant at one sample per
+  leaf) — CLEAN · suite + fastavro + `-race` green, zero skips; Java ABSENT ·
+  **§Open net gaps is empty for the first time in the walk** · verbatim: archive
+  (2026-07-28 #28) · UNCONVERGED (counter 0 — one clean FULL round; two
+  consecutive are needed).
+
+## Distillation archive (2026-07-28 #32) — the producer-compliance era line, verbatim
+
+- 2026-07-28 · 15669c8→463e21d · PRODUCER-COMPLIANCE ERA (1 FULL + 1 FIX;
+  verbatim: archive 2026-07-28 #25). The FULL round found the CLASS behind two
+  instances — the DEFAULT carrier is pre-encoded by a SECOND encoder sharing no
+  code with the serializers — and the FIX answered at the class. It **measured
+  before designing**: the compiled serializer is reachable at the pre-encode but
+  NOT substitutable (swapping it reds 8 tests, because parse picks a union branch
+  by DECLARATION ORDER and the runtime dispatcher by Go kind), so the charge went
+  inside the recursion at the LEAF, each leaf asking the authority its serializer
+  asks. **The deliverable was the TABLE** — `TestMatrix_CapProducerCompliance`
+  plus a classifier that FAILS on any cap landing without a row, and #12's
+  exception ASSERTED on the type system's own evidence. That classifier proved
+  #11's written list was not the set of caps: ten more bounds, two row names
+  taken from memory, one bound with no name at all.
+- 2026-07-28 · d60a3b8 · FULL (read-only) · **1 BEHAVIORAL, in the fix it
+  quarantined**: the default walk's UNION arm passed a nil sink, so the chosen
+  branch went uncharged and three shapes Encoded over-cap wires Decode refuses.
+  **The table stayed green, which was the second half** — its nesting axis was
+  hand-listed as {flat, in-record, in-array, in-map}, and the union is exactly
+  the composite whose walk arm differs. The zero-behavior naming change also
+  removed a hand-maintained equality: `ocfEagerBlockAllocLimit` ASSERTED in a
+  comment that it equalled the default block bound, as `64<<20` against `1<<26`.
+  Verbatim: archive (2026-07-28 #18, #23).
