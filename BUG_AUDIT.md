@@ -10241,3 +10241,133 @@ Compressed once the FIX round it directed closed the union arm.
   name at all, since fixed. Standing lesson: **an axis that exists but omits the
   shape the bug lives in is a green net over an open hole** — the nesting axis
   had no union cell, and the union arm is exactly where the next finding was.
+
+## Distillation archive (2026-07-28 #26) — four producer-compliance closed-gap entries, verbatim
+
+Merged into one entry in AUDIT_CORE.md §Open net gaps: the table closed them
+as a single family, so four separate lines overstated how many questions were
+actually distinct.
+
+- DEFAULT pre-encode of a decimal payload — 2026-07-28, the default arm of
+  `TestMatrix_SelfReadableAtScale`'s decimal-unscaled-length axis (three
+  carriers × four fill routes × four wires) +
+  `TestRegression_DecimalDefaultVerdictDefersToEncode` +
+  `_ReaderSideDecimalDefaultFillRejectsAtDecode`, census Q19. The verdict is
+  RECORDED at parse and surfaced at encode, because a default that cannot be
+  WRITTEN must not stop its schema being PARSED. 2 neuters, red sets separable
+  BY WIRE (the compiled unsafe path reds alone on `binary-omitzero`).
+- The default walk's COMPOSITE ARMS × every cap — 2026-07-28, the nesting axis
+  of `TestMatrix_CapProducerCompliance` is now DERIVED from the arms
+  `encodeDefaultDepth` actually recurses through
+  (`TestInvariant_EveryDefaultWalkArmHasANestingCell`), so a new composite arm
+  lands with no cell and FAILS. Hand-listing the axis is what let the union arm
+  hide. Selection-safety is pinned separately by
+  `TestRegression_UnionDefaultComplianceDoesNotMoveTheBranch`, which reads the
+  WIRE BRANCH INDEX rather than the presence of an error — the naive fix stops
+  the bad wire by moving the branch, and reds there.
+- DoS caps × the DEFAULT carrier, at the CLASS — 2026-07-28,
+  `TestMatrix_CapProducerCompliance` (cap × applicability × carrier × nesting ×
+  wire) + `TestInvariant_EveryCapIsClassified` (a cap landing without a row
+  FAILS) + `TestInvariant_OCFBlockCapsStayReaderOnly` (#12's exception asserted,
+  not closed). The guard proved #11's written list was not the set of caps.
+- PRODUCER side of `maxDecimalUnscaledBytes` — 2026-07-28,
+  `TestMatrix_SelfReadableAtScale`'s decimal-unscaled-length axis (carrier ×
+  logical × container × wire incl. single-object and OCF × length) + census
+  **Q19**. The axis had to sweep the CARRIER: on `decimal` a numeric carrier is
+  held short of the bound by declared precision, so a net driving only `*big.Rat`
+  watches the precision gate fire and concludes the bound is unreachable.
+- Caller-COMPOSED and caller-EDITED SchemaNode trees — 2026-07-27,
+  `TestMatrix_CallerComposedAndEditedNodes` (204 cells: {hand-built,
+  extracted-unedited, extracted-edited} × every exported field × {Schema,
+  String, Canonical, Fingerprint, JSON} over second-occurrence,
+  forward-reference, RECURSIVE, DIAMOND and cache-cross-parse structures;
+  value-or-named-error, never a panic; each structure asserts its own
+  probe-reaches-the-splice precondition, because the cache inlines its first
+  occurrence and a pick landing on the definition never splices).
+
+
+## Distillation archive (2026-07-28 #27) — the pre-era and reserved-attribute era ledger blocks, verbatim
+
+Merged into one historical block; both were already compressed forms pointing
+at their own narratives.
+
+- 2026-07-01..28 · ea9a2ce→c8365de · PRE-ERA BLOCK (verbatim: archive
+  2026-07-28 #21, and the round narratives it cites). CONVERGED→RESET→
+  RE-CONVERGED cycles; #53–#73 filed and fixed; the #63 stray-structural-key
+  family; the #46 reserved-key flip to EXACT-lowercase; P19–P22 minted; R1
+  distilled into the PREDICATE-AGREEMENT CENSUS; **Q9 ruled** and **RULE 7a
+  minted** (restatement licensed only where delegation is impossible, priced at
+  an executed differential); **#71 re-ruled** after the overseer re-opened a
+  gated cell. The era's standing lesson, in three costumes: MEASUREMENT NEVER
+  HAPPENED — a neuter that reds nothing, a neuter that panics in an init and
+  reports 0 fails, a verdict read off the metadata tree when the effect lives in
+  the compiled one. Neuter rule amended to the TRIPLE: exit != 0 · RUN > 0 under
+  `-v` · no `panic:`.
+- 2026-07-27..28 · b1c42bb→40c36e4 · RESERVED-ATTRIBUTE FIX ERA, four
+  ruling-directed rounds (verbatim: archive 2026-07-28 #24). The 2184-cell
+  ENUMERATION with expectations derived per cell from the references and 71 cells
+  reported UNRULED rather than guessed; **#74** (the emission condition is PER
+  ATTRIBUTE); **PLACEMENT AUTHORITY** (the authority for a placement is whichever
+  reference actually HAS it, and where neither does, this package's posture
+  governs) — which corrected a prior ruling and produced **rule 2a**: reference
+  SILENCE is not a SPLIT, so it routes to rule 4 (table + HALT), never the
+  permissive tiebreak. Convention 1 grew (e), class-elimination. Standing lesson:
+  a net that reds is not a net that MEASURES — twice a cell red for a reason
+  unrelated to its axis, and both times the probe was the bug.
+
+## Distillation archive (2026-07-28 #28) — the clean FULL round ledger line, verbatim
+
+- 2026-07-28 · 7c0faa1 · FULL (read-only) · **CLEAN — zero behavioral findings**,
+  and the round's substance is a net built, twice caught measuring nothing by its
+  own neuter · quarantine 9357918..HEAD = 1773ec4 CLEARED: the winner-merge was
+  probed at the shape it could not have been designed against — the union arm
+  nested inside ITSELF (union→record→union, union→array→union, union→map→union),
+  where an inner verdict must survive out through an outer WINNING attempt and be
+  discarded with a losing one. All three propagate, at-cap keeps branch 0,
+  over-cap rejects · **the size guard is now ARITHMETIC**, because stating the
+  number was not the check: two rounds running reported CORE at 55.1 and 55.8 KB
+  as if in bound and skipped the pass they owed. The guard now prints bytes,
+  bound and a CROSSED/under verdict, and this round took the pass it was owed
+  before doing anything else · **the last OPEN gap closed** — caller VALUE domain
+  × STRUCTURE, 384 cells, reusing the existing structure builders and surface
+  driver rather than re-deriving them · **and the net was vacuous twice before it
+  was real, both found by neutering rather than by reading**: first the slot wrote
+  into the COPY `pick` returns and drove the root, so it exercised nothing; then,
+  with that fixed, a neuter dropping caller props at the splice STILL did not red,
+  because all five structures splice and an agreement oracle cannot see a change
+  that moves every member the same way. A FLAT baseline joined the comparison and
+  the same neuter red 12 cells · **B31 grew that fifth dodge**: the
+  AGREEMENT-ORACLE shape, whose probe is to neuter the shared arm UNIFORMLY, not
+  per-member · fronts: `SchemaFor` round-trip × BOUNDARY values (the generative
+  net crosses shape × tag × text × logical but holds the VALUE constant at one
+  sample per leaf) — CLEAN across int/float extremes, invalid UTF-8, nil-vs-empty
+  containers, empty map keys and time at year 1 and 9999 · suite + fastavro +
+  `-race` green, zero thinned-venv skips; Java ABSENT · **§Open net gaps is now
+  empty for the first time in the walk** · UNCONVERGED (counter 0 — this is one
+  clean FULL round; two consecutive are needed), freeze stays.
+
+## Distillation archive (2026-07-28 #29) — the union-arm FIX round's ledger line, verbatim
+
+- 2026-07-28 · 9357918 (START head — 9357918..HEAD quarantines this round's
+  commits) · FIX (ruling-directed) · **the union arm's nil sink fixed with a
+  per-attempt sink merged ONLY for the winner, correct BY CONSTRUCTION**:
+  selection reads `err` alone and the verdict never touches `err`, so a
+  compliance failure cannot move the branch index · **the trap was real and the
+  pin catches it on two counts**: the naive fix (verdict as the attempt's error)
+  stops the bad wire by falling through to a LATER branch — and for
+  `[decimal,null]` null does not accept a `[]byte` either, so the whole SCHEMA
+  stops parsing. Neutered to that form, 10 tests red · the pin reads the WIRE
+  BRANCH INDEX at each shape's own offset, **and finding that offset was the
+  round's own defect** — an array of unions leads with its BLOCK COUNT, so byte 0
+  measures the item count and reports a move that never happened · **scope
+  widened as ruled**: the arm hid EVERY cap, not decimal alone;
+  `[array<null>,null]` at 4097 items reproduced it · **the axis is DERIVED**:
+  `TestInvariant_EveryDefaultWalkArmHasANestingCell` scans the walk for the arms
+  that actually recurse (`[array map record union]`) and fails on any without a
+  cell — hand-listing is what let union hide, and a longer list only moves the
+  blind spot; same shape as the cap classifier, reused · 3 neuters, each
+  precise · constraints pinned: at-cap encodes AND decodes on all three shapes
+  with branch 0 on the wire, non-union carriers keep rejecting, parse never
+  fails, and a control proves selection still falls through when a branch truly
+  rejects · quarantine 90e8055 CLEARED · suite + fastavro + `-race` green; Java
+  ABSENT · verbatim: archive (2026-07-28 #22) · UNCONVERGED.
