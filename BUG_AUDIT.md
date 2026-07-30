@@ -10743,3 +10743,90 @@ watching the count guard red. The `[record "map", map]` over-rejection was ruled
 a stop-sign, NOT_BUGS #76, on the maintainer's verified Java citation
 (Schema.java:1265) plus rule 1: those two branches would share one JSON envelope
 name, which is unresolvable ambiguity.
+
+## Distillation archive (2026-07-29 #37) — the guards-in-series round, verbatim
+
+Hybrid round: one commit correcting the previous round's net (3a56c4f), then the
+FULL read-only walk. START head 7c177c7.
+
+**The maintainer's neuter report was right and mine was coarser.** They neutered
+three guards independently — the qualifier `taken` check, the
+`unionLogicalTagOwnedElsewhere` degrade, and the pass ordering — and all three
+stayed green with byte-identical output. Reproduced exactly. My own two tag
+neuters had each bundled more than one mechanism: the one I called the emitter
+arm removed `unionEmitTag`'s inline loop (a genuinely separate implementation,
+which is why it redded), and the one I called the table precedence replaced the
+whole block with the pre-fix single-pass form reading the RAW logical array,
+which bypassed the degrade as well. So neither of mine isolated a single guard,
+and the maintainer's finer cut is the correct account.
+
+**The guards are not three-in-series over one path; they are one guard per
+consumer, plus a redundant pair.** Measured:
+
+  - `unionEmitTag`'s own loop → the JSON encode emitter and the JSON decode
+    wrap. Covered; my neuter redded it.
+  - `unionLogicalTagOwnedElsewhere` inside `fillUnionTagTables` → the
+    `deser.logicalNames` table, which is the tag the BINARY decoder wraps a
+    value in. SOLE protection, and the net never drove that consumer — the
+    round-trip matrix went JSON-encode → JSON-decode and never called Decode
+    with the tag options. That is the gap.
+  - the qualifier `taken` check and the pass ordering → `ser.branchNames`.
+    Unreachable while the degrade stands, because a degraded qualifier equals
+    its branch's exact name and the loop skips it before either fires.
+
+Attribution runs, on the colliding schema: at HEAD the binary wrap emits
+`{"bytes":…}`. Degrade off alone: the binary wrap emits `{"bytes.decimal":…}`
+while `ser.branchNames` stays correct — the `taken` check catches what the
+degrade would have. `taken` off alone: byte-identical to HEAD. Degrade AND
+`taken` off together: the tagged map `{"bytes.decimal": v}` encodes onto the
+decimal branch while the JSON decoder still resolves that tag to the fixed —
+the ser/deser split the function exists to prevent. So the pair is a genuine
+second line, reachable only once the first is gone, which is why no
+single-neuter cell can discriminate it.
+
+Resolution: the matrix now runs the same branch-preservation assertion through
+the BINARY decode wrap, which gives the degrade a discriminating cell (six red
+under its neuter, triple satisfied). The redundant pair is recorded where it
+lives, with the measurement above, rather than pinned — the treatment given to
+`resolveWriterUnion`'s suppressed wrap.
+
+**Quarantine of 6a43824.** The tag net's gap was a WIRE axis, so the first
+question asked of the sibling net was whether it had the same shape of hole:
+the empty-name matrix asserts schema-level properties and never drives a VALUE,
+and an empty field name is invisible on the binary wire but IS a JSON object
+key. Probed six shapes — empty field name alone and beside a normal one, an
+empty enum symbol both selected and not, an empty map key, an empty-named
+record in a union — on both wires plus the cross-wire re-encode, and a tagged
+union whose branch tags as "". All clean. That gap does not exist.
+
+**FULL walk, front 1 — the two tag RESOLVERS.** The round's own lesson
+generalized: `ser.branchNames` (a map, binary tagged-map encode) and
+`findUnionBranch` (a three-tier scan, JSON) are independent implementations of
+one question, and every existing net only exercises tags the encoder ITSELF
+emitted. A caller can write any string. A differential over 8 unions × 20 tag
+strings found one divergent class: `findUnionBranch`'s legacy
+`"<kind>.<logicalType>"` tier matches a NAMED fixed carrying a logical
+(`fixed.uuid`, `fixed.decimal`, `fixed.duration`), while `ser.branchNames`
+never holds that spelling — `unionBranchNames` returns the fixed's fullname for
+both its standard and logical name. So the same `map[string]any{"fixed.uuid":
+v}` encodes as JSON and is refused on binary. `addUnionShortNameFallbacks`'
+comment claims it "Mirrors findUnionBranch's JSON-side fallback ... so binary
+and JSON encode accept the same tagged input shape" — it mirrors only the
+short-name tier, not the legacy one, so the comment is a claim the code does
+not keep. NOT_BUGS #42 documents the DECODER accepting the legacy form; nothing
+documents the encode-side asymmetry.
+
+**Front 2, inverse density.** The "functions no test names" cut was run and
+discarded as low-signal: 733 functions, and an internal helper being unnamed by
+any test says nothing, since almost all are exercised through public entry
+points. Recorded so a later round does not re-run it.
+
+**Front 3, the mirror-claim sweep** (the finding's own shape: a duplicated
+accept-set whose comment claims parity). Every `Mirrors`/`in lockstep`/`must
+stay identical` comment in non-test sources was listed and the binary↔JSON ones
+checked. `tryUnwrapTagged`'s entry peel is already pinned by
+`TestRegression_TaggedUnionEncodeIndirection`. The SchemaFor-tag-default vs
+Parse-default lockstep on number precision was executed across seven edges —
+MaxInt64, MaxInt64+1, 2^53+1, 1e3, 1.5, and the `-0` / `-0.0` split — and holds
+exactly, including surfacing `float64 -0` for the float-syntax form and
+`float64 0` for the integer-syntax one.
