@@ -2313,7 +2313,7 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		unionStd = append(unionStd, bn)
 		unionLog = append(unionLog, ln)
 	}
-	fillUnionTagTables(ser, deser, unionStd, unionLog)
+	fillUnionTagTables(ser, deser, branchNodes, unionStd, unionLog)
 	// Populate branchKinds for type-name dispatch in serUnion.ser /
 	// appendAvroJSONUnion / encodeDefault's union case (see
 	// unionTypeNameForValue). Primitive kinds only — record/enum/fixed
@@ -2367,36 +2367,15 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	return nil
 }
 
-// addUnionShortNameFallbacks applies the unqualified-short-name fallback:
-// for named branches (record/enum/fixed) whose canonical name carries a
-// namespace, also accept the unqualified short name on tagged-union
-// encode IFF it's unique across the union. A twmb leniency for
-// hand-written input — no reference implementation emits or reads
-// short-name union tags (fastavro 1.12.2's tuple notation and JSON
-// reader both require the fullname, observed; its short-name matching
-// exists only in schema resolution). Mirrors findUnionBranch's
-// JSON-side fallback (json_codec.go:findUnionBranch) so binary and JSON
-// encode accept the same tagged input shape. The ambiguity guard
-// prevents silent misrouting when two namespaces share a short name.
-// Called from buildUnion (in-order branches) and finalizeUnionNames
-// (after forward-ref branches resolve) so the rule lives in one place.
-// fillUnionTagTables builds a union's three tag tables from the per-branch
-// (standard, logical) name pairs: the two the DECODER emits
-// (deser.branchNames / deser.logicalNames) and the one the ENCODER resolves a
-// tagged map through (ser.branchNames). All three get one precedence rule —
-// AN EXACT BRANCH NAME OUTRANKS A LOGICAL QUALIFIER — which is the order
-// findUnionBranch already resolves in, so every table and the JSON emitter
-// agree on which branch owns a tag.
+// fillUnionTagTables builds a union's three tag tables: the two the DECODER
+// EMITS (deser.branchNames / deser.logicalNames) and the one the ENCODER
+// RESOLVES a caller-written tagged map through (ser.branchNames).
 //
-// Two writes were unguarded before, and they disagreed in opposite ways. The
-// emit table stored a "<kind>.<logicalType>" qualifier that another branch
-// owns as its exact name, so a branch emitted a tag the decoder handed to
-// that other branch. The ser map took whichever branch wrote last, so the
-// encoder's idea of who owns the tag depended on DECLARATION ORDER while the
-// decoder's did not. Both are fixed here rather than at parse: the schema is
-// legal Avro and Java accepts it, so refusing it would break callers who
-// never enable TaggedUnions.
-func fillUnionTagTables(ser *serUnion, deser *deserUnion, standard, logical []string) {
+// The emit tables carry one precedence rule — an exact branch name outranks a
+// logical qualifier, the order findUnionBranch resolves in — so a branch never
+// emits a tag the decoder would hand to a different branch. The accept table is
+// built by asking unionTagTiers instead of restating any of it; see below.
+func fillUnionTagTables(ser *serUnion, deser *deserUnion, branches []*schemaNode, standard, logical []string) {
 	deser.branchNames = append(deser.branchNames[:0], standard...)
 	deser.logicalNames = deser.logicalNames[:0]
 	for i, ln := range logical {
@@ -2405,67 +2384,71 @@ func fillUnionTagTables(ser *serUnion, deser *deserUnion, standard, logical []st
 		}
 		deser.logicalNames = append(deser.logicalNames, ln)
 	}
-	// The degrade above is the OPERATIVE guard, and it is the only one with a
-	// consumer of its own: deser.logicalNames is the tag the BINARY decoder
-	// wraps a value in, and nothing else recomputes it. The two guards below
-	// protect ser.branchNames, and while the degrade stands they have no
-	// reachable input — a degraded qualifier equals its branch's exact name,
-	// so the loop skips it before either can fire.
+	// The degrade above is the OPERATIVE guard for the EMIT tables, and it is
+	// the only one with a consumer of its own: deser.logicalNames is the tag
+	// the BINARY decoder wraps a value in, and nothing else recomputes it.
 	//
-	// That redundancy is deliberate and it is MEASURED, not assumed. Dropping
-	// either guard below on its own leaves every tag table byte-identical.
-	// Dropping the degrade alone corrupts the binary wrap tag but leaves
-	// ser.branchNames correct, because the `taken` check catches what the
-	// degrade would have. Dropping the degrade AND the `taken` check together
-	// is what moves the ser table: the tagged map {"bytes.decimal": v} then
-	// encodes onto the decimal branch while the JSON decoder still resolves
-	// that tag to the fixed, which is the ser/deser split this whole function
-	// exists to prevent. So these are a second line, reachable only once the
-	// first is gone; a test cannot discriminate them while it stands.
+	// The ACCEPT table below is a different question and is built by asking
+	// unionTagTiers (json_codec.go) rather than restating any of it. Each tier
+	// is offered every branch, in tier order, so this table's accept-set is
+	// findUnionBranch's accept-set by construction: a tier added there is
+	// honored here without an edit, and neither can grow a tier the other
+	// lacks. Two rules ride along, both of them the resolver's:
+	//
+	//   - Across tiers, FIRST WRITE WINS, because the resolver stops at the
+	//     first tier that answers.
+	//   - Within a guarded tier, a name two branches could claim is
+	//     registered NOWHERE, because the resolver refuses it rather than
+	//     picking one. The refusal has to be on BOTH wires or the caller gets
+	//     a value on one and an error on the other.
+	//
+	// A branch node is nil only for a forward reference buildUnion has not
+	// bound yet; its exact name is registered from `standard` so the table is
+	// usable in the interim, and finalizeUnionNames rebuilds over the resolved
+	// nodes.
 	ser.branchNames = make(map[string]int, len(standard))
-	// Exact names first, first-write-wins, mirroring findUnionBranch's
-	// first-match scan. Duplicates among them are a duplicate union type and
-	// are rejected before this runs (buildUnion defers only forward-ref
-	// branches, which finalizeUnionNames re-checks over resolved names).
-	for i, bn := range standard {
-		if _, taken := ser.branchNames[bn]; !taken {
-			ser.branchNames[bn] = i
+	// ONE scratch pair for the whole walk, not a map pair per tier. A union
+	// has a handful of branches, so the duplicate check is a linear scan over
+	// this slice; building maps per tier put six allocations on every union a
+	// parse contains, which is a cost the tier factoring must not add.
+	claims := make([]string, len(branches))
+	claimed := make([]bool, len(branches))
+	for _, tier := range unionTagTiers {
+		for i, b := range branches {
+			switch {
+			case b != nil:
+				claims[i], claimed[i] = tierClaim(tier, b)
+			case i == 0 || tier.name == unionTagTiers[0].name:
+				// A forward reference has no node yet; its as-written name is
+				// the exact-name tier's claim until finalizeUnionNames rebuilds.
+				claims[i], claimed[i] = "", false
+				if tier.name == unionTagTiers[0].name && i < len(standard) {
+					claims[i], claimed[i] = standard[i], true
+				}
+			default:
+				claims[i], claimed[i] = "", false
+			}
 		}
-	}
-	// Qualifiers land only in keys no exact name claimed.
-	for i, ln := range deser.logicalNames {
-		if ln == standard[i] {
-			continue
+		for i := range branches {
+			if !claimed[i] {
+				continue
+			}
+			if tier.guarded {
+				dup := false
+				for j := range branches {
+					if j != i && claimed[j] && claims[j] == claims[i] {
+						dup = true
+						break
+					}
+				}
+				if dup {
+					continue
+				}
+			}
+			if _, taken := ser.branchNames[claims[i]]; !taken {
+				ser.branchNames[claims[i]] = i
+			}
 		}
-		if _, taken := ser.branchNames[ln]; !taken {
-			ser.branchNames[ln] = i
-		}
-	}
-	addUnionShortNameFallbacks(ser, deser.branchNames)
-}
-
-func addUnionShortNameFallbacks(ser *serUnion, branchNames []string) {
-	if len(branchNames) == 0 {
-		return
-	}
-	shortCount := make(map[string]int, len(branchNames))
-	for _, bn := range branchNames {
-		if short := unqualified(bn); short != bn {
-			shortCount[short]++
-		}
-	}
-	for i, bn := range branchNames {
-		short := unqualified(bn)
-		if short == bn {
-			continue
-		}
-		if shortCount[short] != 1 {
-			continue
-		}
-		if _, exists := ser.branchNames[short]; exists {
-			continue
-		}
-		ser.branchNames[short] = i
 	}
 }
 
@@ -2504,7 +2487,7 @@ func finalizeUnionNames(ser *serUnion, deser *deserUnion, branches []*schemaNode
 	for i, n := range branches {
 		_, log[i] = unionBranchNames(n)
 	}
-	fillUnionTagTables(ser, deser, std, log)
+	fillUnionTagTables(ser, deser, branches, std, log)
 	return nil
 }
 

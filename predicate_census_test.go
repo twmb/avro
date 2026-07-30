@@ -759,13 +759,17 @@ var censusRegistry = []censusQuestion{
 			"calibration-free and needs no reference: a tag must name exactly one branch, and a value's tagged " +
 			"round trip must land where it started",
 		answerers: []censusAnswerer{
-			{repr: "JSON encode envelope", site: "appendTaggedUnion", file: "json_codec.go"},
-			{repr: "JSON decode tagged-map wrap", site: "wrapUnion", file: "json_decode.go"},
-			{repr: "resolved union wrap tables", site: "resolveReaderUnion / resolveUnionUnion", file: "resolve.go"},
+			{repr: "JSON encode envelope (EMIT)", site: "appendTaggedUnion", file: "json_codec.go"},
+			{repr: "JSON decode tagged-map wrap (EMIT)", site: "wrapUnion", file: "json_decode.go"},
+			{repr: "resolved union wrap tables (EMIT)", site: "resolveReaderUnion / resolveUnionUnion", file: "resolve.go"},
 			{
-				repr: "compiled tag tables (binary decode wrap + binary tagged-map encode lookup)",
-				site: "fillUnionTagTables", file: "schema.go",
-				note: "different-by-design as a SITE, same rule: these are TABLES built once at parse time rather than a per-value call, and one of them is a map keyed the other way (tag to index), so they cannot literally call unionEmitTag per branch. fillUnionTagTables applies the identical precedence — every exact name is placed first, then a qualifier only into a key no exact name claimed — which is what makes the encoder's idea of who owns a tag independent of branch DECLARATION ORDER, as the resolver's already is. The tables and unionEmitTag are held together by the round-trip matrix, not by sharing a call.",
+				repr: "compiled EMIT tables (binary decode wrap)",
+				site: "fillUnionTagTables, deser.logicalNames", file: "schema.go",
+				note: "different-by-design as a SITE, same rule: a TABLE built once at parse time cannot call unionEmitTag per branch, so it applies the identical degrade. It is the SOLE guard for the binary decode wrap tag, and the round-trip matrix drives that consumer directly rather than inferring it from the JSON one.",
+			},
+			{
+				repr: "the ACCEPT side, both wires", site: "unionTagTiers", file: "json_codec.go",
+				note: "the accept question is the INVERSE of the emit question — which branch does a caller-written tag name — and it has its own authority: findUnionBranch's tier order. Both of its consumers (findUnionBranch itself, and fillUnionTagTables building ser.branchNames) WALK unionTagTiers, so the accept-sets are equal by construction rather than by agreement. Registered here because emitting a tag no consumer accepts, or accepting one on a single wire, are the same defect seen from two ends. Guarded by TestInvariant_UnionTagTiersAreDerived (source: neither consumer may open-code a tier) and TestInvariant_EveryUnionTagTierIsReachable (a tier no corpus reaches ships unexercised).",
 			},
 		},
 		tells: []censusTell{
@@ -807,6 +811,14 @@ var censusRegistry = []censusQuestion{
 				// this tracks which struct fields carry an omitzero directive,
 				// which is a property of the Go type and claims no slot.
 				"reflect.go": 1,
+				// Not an answerer either, and a near miss worth naming: this
+				// one marks which union BRANCHES produced a tag claim while
+				// the tag tables are built. It is per-branch bookkeeping inside
+				// one walk, not a record of who claimed a reader FIELD slot,
+				// and no second writer can contend for it — a duplicate claim
+				// there is resolved by the tier's own ambiguity rule (Q20),
+				// which is a different question with a different remedy.
+				"schema.go": 1,
 			}},
 		},
 	},

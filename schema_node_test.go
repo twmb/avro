@@ -1168,7 +1168,7 @@ func TestRegression_SchemaNodeSharedDAGExpansionBounded(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), wantMsg) {
 				t.Fatalf("want %q, got %v", wantMsg, err)
 			}
-		case <-time.After(30 * time.Second):
+		case <-time.After(hangDeadline):
 			t.Fatalf("did not reject within 30s — the node budget is not bounding the fan-out")
 		}
 	}
@@ -1238,7 +1238,7 @@ func TestRegression_SchemaNodeSharedDAGExpansionBounded(t *testing.T) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(30 * time.Second):
+		case <-time.After(hangDeadline):
 			t.Fatal("SchemaFor on a shared-DAG CustomType.Schema did not terminate")
 		}
 	})
@@ -1318,7 +1318,7 @@ func TestRegression_SchemaNodeDuplicateNamedDefinitionBounded(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "expands to more") {
 				t.Fatalf("want an over-budget rejection (the conflict marshal must share the node budget), got %v", err)
 			}
-		case <-time.After(30 * time.Second):
+		case <-time.After(hangDeadline):
 			t.Fatal("did not complete within 30s — the conflict-comparison marshal is not bounded by the shared node budget")
 		}
 	})
@@ -1446,7 +1446,7 @@ func TestRegression_SchemaNodeWalkBudgetBattery(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Fatalf("want a bounded error containing %q, got %v", want, err)
 			}
-		case <-time.After(30 * time.Second):
+		case <-time.After(hangDeadline):
 			t.Fatalf("did not reject within 30s — the %q bound is not firing", want)
 		}
 	}
@@ -1661,7 +1661,7 @@ func TestRegression_SchemaNodeWalkBudgetBattery(t *testing.T) {
 			}()
 			select {
 			case <-done:
-			case <-time.After(30 * time.Second):
+			case <-time.After(hangDeadline):
 				t.Fatal("bare-path walk did not terminate")
 			}
 		}

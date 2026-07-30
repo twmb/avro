@@ -1468,49 +1468,133 @@ func appendTaggedUnion(buf []byte, union, branch *schemaNode, encoded []byte, ta
 //     unqualified-name tier, not in union-tag decoding). Only applied
 //     when the input has no namespace AND exactly one branch matches by
 //     short name; ambiguous cases return no match rather than guess.
-func findUnionBranch(union *schemaNode, name string) *schemaNode {
-	for _, b := range union.branches {
-		if unionBranchName(b) == name {
-			return b
-		}
+// unionTagTier is one tier of the union tag namespace: the rule by which a tag
+// a caller wrote names a branch. A tier answers ONE question — which name does
+// this tier make this branch answer to — and both consumers of the namespace
+// walk this same slice in this same order, so the set of tiers is asked rather
+// than restated. findUnionBranch resolves a name through it; fillUnionTagTables
+// (schema.go) builds the binary tagged-map lookup through it. Adding a tier
+// here reaches both; adding one by hand inside either reaches neither, which is
+// what TestInvariant_UnionTagTiersAreDerived exists to refuse.
+//
+// claim appends the name to dst and reports whether the tier applies at all.
+// The empty string is a legal branch name (an empty-named record under a
+// caller's [WithLaxNames] validator), so applicability cannot be signalled by
+// an empty result. Appending rather than returning a string keeps resolution
+// allocation-free: `string(appended) == name` compiles to a comparison.
+type unionTagTier struct {
+	name string
+	// guarded marks a tier where a name two branches could claim resolves
+	// NOWHERE instead of to the first of them. Silently picking one is a
+	// coin flip between two branches the caller may have meant either of.
+	guarded bool
+	// sep joins head and tail into the claimed name. Splitting the name into
+	// pieces instead of returning it built is what keeps RESOLUTION
+	// allocation-free: matching compares the pieces in place, and only the
+	// parse-time table build ever joins them. Returning a built string, or
+	// appending into a caller's buffer, both put an allocation on a per-value
+	// JSON path — the buffer because it escapes through this indirect call.
+	sep string
+	// claim reports the name this tier makes b answer to, as head+sep+tail,
+	// and whether the tier applies to b at all. The empty string is a legal
+	// branch name (an empty-named record under a caller's [WithLaxNames]
+	// validator), so applicability cannot be signalled by an empty result.
+	claim func(b *schemaNode) (head, tail string, ok bool)
+}
+
+// tierMatches reports whether b's claim under tier is exactly name, without
+// building the claim.
+func tierMatches(tier unionTagTier, b *schemaNode, name string) bool {
+	head, tail, ok := tier.claim(b)
+	if !ok || len(name) != len(head)+len(tier.sep)+len(tail) {
+		return false
 	}
-	// Fallback (goavro / TagLogicalTypes): "type.logicalType" → match a
-	// branch whose kind == base AND whose logicalType == suffix. Includes
-	// primitives and "fixed" (the only named type that can carry a
-	// logical type — duration/decimal/uuid are valid on fixed; enum
-	// can't have a logical type per spec). Matching on the (kind, logical)
-	// pair — not just kind — prevents silently misrouting a tagged
-	// branch when a union contains two same-kind branches that differ
-	// only by logical type (e.g. [long, {"type":"long","logicalType":
-	// "timestamp-millis"}]). Pre-tightening, this fallback returned the
-	// first kind-match, which lost the logical-type distinction.
-	if base, suffix, ok := strings.Cut(name, "."); ok {
-		for _, b := range union.branches {
+	return name[:len(head)] == head &&
+		name[len(head):len(head)+len(tier.sep)] == tier.sep &&
+		name[len(head)+len(tier.sep):] == tail
+}
+
+// tierClaim builds b's claim under tier. Parse-time only.
+func tierClaim(tier unionTagTier, b *schemaNode) (string, bool) {
+	head, tail, ok := tier.claim(b)
+	if !ok {
+		return "", false
+	}
+	return head + tier.sep + tail, true
+}
+
+// unionTagTiers is the tag namespace, most specific first.
+var unionTagTiers = []unionTagTier{
+	{
+		// The branch's own name: its fullname for a named type, its kind
+		// otherwise. Two branches cannot share one — that is a duplicate
+		// union type and the parse refuses it — so first match is exact.
+		name: "exact name",
+		claim: func(b *schemaNode) (string, string, bool) {
+			return unionBranchName(b), "", true
+		},
+	},
+	{
+		// "<kind>.<logicalType>", the goavro-interop spelling that
+		// TagLogicalTypes emits for a primitive-backed logical. Accepted for
+		// a named fixed carrying a logical too, where the emitted tag is the
+		// fixed's NAME instead: the decoder has always taken this legacy form
+		// and the encoder has to take the same input shape.
+		//
+		// Matching the (kind, logicalType) PAIR rather than the kind alone is
+		// what keeps [long, {long, timestamp-millis}] from misrouting. The
+		// kind list lives here and nowhere else — it is the one set of kinds
+		// this spelling is defined for, and `fixed` is in it as the only
+		// named kind that can carry a logical type.
+		name:    "logical qualifier",
+		guarded: true,
+		sep:     ".",
+		claim: func(b *schemaNode) (string, string, bool) {
+			if b.logical == "" {
+				return "", "", false
+			}
 			switch b.kind {
 			case "null", "boolean", "int", "long", "float", "double", "string", "bytes", "fixed":
-				if b.kind == base && b.logical == suffix {
-					return b
-				}
+				return b.kind, b.logical, true
 			}
-		}
-		return nil
-	}
-	// Fallback (twmb leniency, convention 3 above): unqualified short
-	// name. The ambiguity guard prevents silent misrouting when two
-	// namespaces share a short name.
-	var match *schemaNode
-	for _, b := range union.branches {
-		switch b.kind {
-		case "record", "enum", "fixed":
-			if unqualified(b.name) == name {
-				if match != nil {
-					return nil // ambiguous
-				}
-				match = b
+			return "", "", false
+		},
+	},
+	{
+		// Unqualified short name for a namespaced named type — a twmb
+		// leniency for hand-written input; no reference emits or reads it.
+		name:    "unqualified short name",
+		guarded: true,
+		claim: func(b *schemaNode) (string, string, bool) {
+			switch b.kind {
+			case "record", "enum", "fixed":
+				return unqualified(b.name), "", true
 			}
+			return "", "", false
+		},
+	},
+}
+
+func findUnionBranch(union *schemaNode, name string) *schemaNode {
+	for _, tier := range unionTagTiers {
+		var match *schemaNode
+		for _, b := range union.branches {
+			if b == nil || !tierMatches(tier, b, name) {
+				continue
+			}
+			if !tier.guarded {
+				return b
+			}
+			if match != nil {
+				return nil // ambiguous within this tier
+			}
+			match = b
+		}
+		if match != nil {
+			return match
 		}
 	}
-	return match
+	return nil
 }
 
 // parseSpecialFloat parses NaN/Infinity string forms. Accepts Java's

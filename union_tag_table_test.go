@@ -407,3 +407,75 @@ func TestRegression_ResolvedWriterUnionEmitsNoTag(t *testing.T) {
 		}
 	}
 }
+
+// TestMatrix_UnionTagTierAcrossConsumers crosses every tier of the tag
+// namespace with every consumer that reads it. Three consumers resolve a
+// caller-written tag — the binary tagged-map encoder, the JSON tagged-map
+// encoder, and the JSON tagged decoder — and a tier honored by some of them
+// and not others is precisely the shape that let the legacy
+// "<kind>.<logicalType>" spelling work on JSON and fail on binary.
+//
+// The oracle is agreement plus an explicit verdict per cell, so "all three
+// reject everything" cannot pass.
+func TestMatrix_UnionTagTierAcrossConsumers(t *testing.T) {
+	const fixedUUID = `{"type":"fixed","name":"F","namespace":"n","size":16,"logicalType":"uuid"}`
+	const recNS = `{"type":"record","name":"R","namespace":"ns","fields":[{"name":"x","type":"int"}]}`
+	cells := []struct {
+		tier   string
+		schema string
+		tag    string
+		value  any
+		want   bool // must every consumer accept it?
+	}{
+		{"exact name / kind", `["null","int"]`, "int", int32(7), true},
+		{"exact name / fullname", `["null",` + recNS + `]`, "ns.R", map[string]any{"x": int32(1)}, true},
+		{"exact name / named fixed", `["null",` + fixedUUID + `]`, "n.F", []byte("0123456789abcdef"), true},
+		{"logical qualifier / primitive", `["null",{"type":"long","logicalType":"timestamp-millis"}]`,
+			"long.timestamp-millis", int64(1600000000000), true},
+		{"logical qualifier / named fixed", `["null",` + fixedUUID + `]`,
+			"fixed.uuid", []byte("0123456789abcdef"), true},
+		{"unqualified short name", `["null",` + recNS + `]`, "R", map[string]any{"x": int32(1)}, true},
+		// Guarded tiers refuse a name two branches claim, on every consumer.
+		{"logical qualifier / ambiguous",
+			`["null",{"type":"fixed","name":"A","size":16,"logicalType":"uuid"},{"type":"fixed","name":"B","size":16,"logicalType":"uuid"}]`,
+			"fixed.uuid", []byte("0123456789abcdef"), false},
+		{"unqualified short name / ambiguous",
+			`["null",{"type":"record","name":"R","namespace":"n1","fields":[{"name":"x","type":"int"}]},{"type":"record","name":"R","namespace":"n2","fields":[{"name":"y","type":"int"}]}]`,
+			"R", map[string]any{"x": int32(1)}, false},
+		// A tag no tier claims is refused everywhere.
+		{"no tier claims it", `["null","int"]`, "nope", int32(7), false},
+	}
+	for _, c := range cells {
+		t.Run(c.tier+"/"+c.tag, func(t *testing.T) {
+			s, err := avro.Parse(c.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			tagged := map[string]any{c.tag: c.value}
+
+			_, binErr := s.Encode(tagged)
+			_, jsonEncErr := s.EncodeJSON(tagged)
+			// The JSON DECODER is driven from the JSON encoder's own output
+			// when there is one, so the body shape is always right for the
+			// branch; when the encoder refused, the tag is what is under test
+			// and a minimal body is enough to see the routing verdict.
+			jsonDecErr := error(nil)
+			jsonBody, jerr := s.EncodeJSON(c.value)
+			if jerr != nil {
+				jsonBody = []byte("null")
+			}
+			var back any
+			jsonDecErr = s.DecodeJSON([]byte(`{"`+c.tag+`":`+string(jsonBody)+`}`), &back, avro.TaggedUnions())
+
+			got := map[string]error{"binary encode": binErr, "json encode": jsonEncErr, "json decode": jsonDecErr}
+			for name, err := range got {
+				if c.want && err != nil {
+					t.Errorf("%s REFUSED a tag every consumer must accept: %v", name, err)
+				}
+				if !c.want && err == nil {
+					t.Errorf("%s ACCEPTED a tag every consumer must refuse", name)
+				}
+			}
+		})
+	}
+}
