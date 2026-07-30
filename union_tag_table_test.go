@@ -163,6 +163,30 @@ func TestMatrix_UnionTagRoundTripPreservesBranch(t *testing.T) {
 							"  emitted %s\n  the tag it emitted resolves to a different branch than the one that produced it",
 							fam.name, order.name, vi, combo.name, before, got, j)
 					}
+
+					// The BINARY decode wrap is a SEPARATE consumer of the tag
+					// namespace: it reads a table built at parse time rather
+					// than computing the tag per value, so the JSON round trip
+					// above cannot see it. Its envelope has to name the same
+					// branch, because the value it produces is a tagged map a
+					// caller hands straight back to Encode.
+					var wrapped any
+					if _, err := s.Decode(wire, &wrapped, combo.opts...); err != nil {
+						t.Errorf("%s/%s/value#%d/%s: binary decode of the schema's own wire: %v",
+							fam.name, order.name, vi, combo.name, err)
+						continue
+					}
+					rewire, err := s.Encode(wrapped)
+					if err != nil {
+						t.Errorf("%s/%s/value#%d/%s: the binary decoder's tagged envelope does not re-encode: %v\n"+
+							"  envelope %#v — its tag names a branch that will not take the value inside it",
+							fam.name, order.name, vi, combo.name, err, wrapped)
+						continue
+					}
+					if got := unionBranchIndexOf(t, rewire); got != before {
+						t.Errorf("%s/%s/value#%d/%s: the BINARY tagged wrap MOVED the branch: %d -> %d\n"+
+							"  envelope %#v", fam.name, order.name, vi, combo.name, before, got, wrapped)
+					}
 				}
 			}
 		}

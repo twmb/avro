@@ -2405,6 +2405,23 @@ func fillUnionTagTables(ser *serUnion, deser *deserUnion, standard, logical []st
 		}
 		deser.logicalNames = append(deser.logicalNames, ln)
 	}
+	// The degrade above is the OPERATIVE guard, and it is the only one with a
+	// consumer of its own: deser.logicalNames is the tag the BINARY decoder
+	// wraps a value in, and nothing else recomputes it. The two guards below
+	// protect ser.branchNames, and while the degrade stands they have no
+	// reachable input — a degraded qualifier equals its branch's exact name,
+	// so the loop skips it before either can fire.
+	//
+	// That redundancy is deliberate and it is MEASURED, not assumed. Dropping
+	// either guard below on its own leaves every tag table byte-identical.
+	// Dropping the degrade alone corrupts the binary wrap tag but leaves
+	// ser.branchNames correct, because the `taken` check catches what the
+	// degrade would have. Dropping the degrade AND the `taken` check together
+	// is what moves the ser table: the tagged map {"bytes.decimal": v} then
+	// encodes onto the decimal branch while the JSON decoder still resolves
+	// that tag to the fixed, which is the ser/deser split this whole function
+	// exists to prevent. So these are a second line, reachable only once the
+	// first is gone; a test cannot discriminate them while it stands.
 	ser.branchNames = make(map[string]int, len(standard))
 	// Exact names first, first-write-wins, mirroring findUnionBranch's
 	// first-match scan. Duplicates among them are a duplicate union type and
