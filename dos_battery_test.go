@@ -795,7 +795,7 @@ func wantAcceptUnder(t *testing.T, name string, bound time.Duration, fn func() e
 		return
 	}
 	if elapsed > bound {
-		t.Errorf("%s: took %v (> %v) — the custom-match walk lost its complexity bound", name, elapsed, bound)
+		t.Errorf("%s: took %v (> %v) — the pass lost its complexity bound at this size", name, elapsed, bound)
 	}
 }
 

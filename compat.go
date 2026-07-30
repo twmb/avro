@@ -215,8 +215,9 @@ func checkRecordFieldClaimsUnique(r, w *schemaNode, path string) error {
 	// has to stay in lockstep with.
 	claimed := make([]bool, len(r.fields))
 	claimedBy := make([]string, len(r.fields))
+	readerByName := newReaderFieldLookup(r)
 	for _, wf := range w.fields {
-		ri := findReaderFieldIndex(r, wf.name)
+		ri := readerByName.index(wf.name)
 		if ri < 0 {
 			continue
 		}

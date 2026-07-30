@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"slices"
 	"sync"
 )
 
@@ -285,15 +284,8 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 }
 
 func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
-	// Build writer field lookup.
-	type writerFieldInfo struct {
-		idx  int
-		node *fieldNode
-	}
-	writerByName := make(map[string]writerFieldInfo, len(w.fields))
-	for i := range w.fields {
-		writerByName[w.fields[i].name] = writerFieldInfo{i, &w.fields[i]}
-	}
+	// One lookup for the whole record, asked once per writer field below.
+	readerByName := newReaderFieldLookup(r)
 
 	rr := &resolvedRecord{
 		readerNames:    make([]string, len(r.fields)),
@@ -314,7 +306,7 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 
 	// For each writer field (in wire order), find matching reader field.
 	for _, wf := range w.fields {
-		ri := findReaderFieldIndex(r, wf.name)
+		ri := readerByName.index(wf.name)
 		if ri < 0 {
 			// Writer field not in reader: skip it.
 			rr.wireOps = append(rr.wireOps, wireOp{
@@ -401,18 +393,54 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 	return nd, nil
 }
 
-// findReaderFieldIndex finds a writer field name in reader fields by name or
-// reader field aliases.
-func findReaderFieldIndex(r *schemaNode, writerFieldName string) int {
-	for i, rf := range r.fields {
-		if rf.name == writerFieldName {
-			return i
+// readerFieldLookup answers "which reader field does this writer field name?"
+// in constant time per question, for one reader record.
+//
+// The two maps are SEPARATE and consulted in that order, because the rule is
+// that EVERY field name outranks EVERY field alias — not that a name outranks
+// an alias on the same field. A single merged map cannot express that: a
+// writer name that is one reader field's alias and a LATER reader field's name
+// would resolve to whichever entry was written last, silently reversing the
+// routing. That routing is what the parse-time rejection of field name/alias
+// collisions is justified by, so it is a contract, not an implementation
+// detail. Within each map the FIRST field wins, matching the scan this
+// replaced; a parse rejects the collisions that would make that observable.
+//
+// It is built once per reader record and asked once per writer field. Building
+// it per question would be the same scan-inside-a-loop it exists to avoid,
+// since a record's field count is set by the schema text.
+type readerFieldLookup struct {
+	byName  map[string]int
+	byAlias map[string]int
+}
+
+func newReaderFieldLookup(r *schemaNode) readerFieldLookup {
+	lk := readerFieldLookup{byName: make(map[string]int, len(r.fields))}
+	for i := range r.fields {
+		if _, taken := lk.byName[r.fields[i].name]; !taken {
+			lk.byName[r.fields[i].name] = i
 		}
 	}
-	for i, rf := range r.fields {
-		if slices.Contains(rf.aliases, writerFieldName) {
-			return i
+	for i := range r.fields {
+		for _, alias := range r.fields[i].aliases {
+			if lk.byAlias == nil {
+				lk.byAlias = make(map[string]int, len(r.fields))
+			}
+			if _, taken := lk.byAlias[alias]; !taken {
+				lk.byAlias[alias] = i
+			}
 		}
+	}
+	return lk
+}
+
+// index reports the reader-field index writerFieldName resolves to, or -1.
+func (lk readerFieldLookup) index(writerFieldName string) int {
+	if i, ok := lk.byName[writerFieldName]; ok {
+		return i
+	}
+	if i, ok := lk.byAlias[writerFieldName]; ok {
+		return i
 	}
 	return -1
 }

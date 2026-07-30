@@ -184,7 +184,8 @@ type fieldNode struct {
 	// aliases: schema-evolution alternate field names. Consumers are
 	// all decode/resolve side — JSON decode (via node.fieldIdx, which
 	// is built from this slice at parse time), CheckCompatibility's
-	// findWriterField (compat.go), and Resolve's findReaderFieldIndex
+	// findWriterField (compat.go), and readerFieldLookup, which both
+	// Resolve and CheckCompatibility match writer fields through
 	// (resolve.go). Not consulted on encode — aliases are a reader-
 	// side concept per the Avro 1.12 spec.
 	aliases    []string
@@ -2407,12 +2408,19 @@ func fillUnionTagTables(ser *serUnion, deser *deserUnion, branches []*schemaNode
 	// usable in the interim, and finalizeUnionNames rebuilds over the resolved
 	// nodes.
 	ser.branchNames = make(map[string]int, len(standard))
-	// ONE scratch pair for the whole walk, not a map pair per tier. A union
-	// has a handful of branches, so the duplicate check is a linear scan over
-	// this slice; building maps per tier put six allocations on every union a
-	// parse contains, which is a cost the tier factoring must not add.
+	// ONE scratch set for the whole walk, not one per tier. Branch count is
+	// set by the schema TEXT — a union of twenty thousand named records is
+	// legal Avro a registry or an OCF header can carry — so the ambiguity
+	// check below has to answer "does another branch claim this name" in
+	// constant time per branch. Asking it by scanning the branch slice is a
+	// scan inside a loop over that same slice, which is quadratic in a number
+	// the caller chooses; counting claims once per tier is linear in it. The
+	// count map is allocated on first use and reused across tiers, so an
+	// ordinary union pays at most one allocation for the whole walk and a
+	// union with no guarded tier pays none.
 	claims := make([]string, len(branches))
 	claimed := make([]bool, len(branches))
+	var claimCount map[string]int
 	for _, tier := range unionTagTiers {
 		for i, b := range branches {
 			switch {
@@ -2429,21 +2437,27 @@ func fillUnionTagTables(ser *serUnion, deser *deserUnion, branches []*schemaNode
 				claims[i], claimed[i] = "", false
 			}
 		}
+		if tier.guarded {
+			if claimCount == nil {
+				claimCount = make(map[string]int, len(branches))
+			} else {
+				clear(claimCount)
+			}
+			for i := range branches {
+				if claimed[i] {
+					claimCount[claims[i]]++
+				}
+			}
+		}
 		for i := range branches {
 			if !claimed[i] {
 				continue
 			}
-			if tier.guarded {
-				dup := false
-				for j := range branches {
-					if j != i && claimed[j] && claims[j] == claims[i] {
-						dup = true
-						break
-					}
-				}
-				if dup {
-					continue
-				}
+			// A name two branches could claim is registered NOWHERE: the
+			// resolver refuses it rather than picking one, and the two sides
+			// have to refuse the same set.
+			if tier.guarded && claimCount[claims[i]] > 1 {
+				continue
 			}
 			if _, taken := ser.branchNames[claims[i]]; !taken {
 				ser.branchNames[claims[i]] = i
@@ -3063,7 +3077,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// schema slot. Register every alias→idx mapping in addition to the
 		// canonical name so JSON producers that emit using an alias name
 		// route to the right field. The binary path's resolve.go does the
-		// equivalent alias-aware lookup via findReaderFieldIndex.
+		// equivalent alias-aware lookup via readerFieldLookup.
 		// Per Avro spec ("Aliases are alternative names, and thus subject
 		// to the same uniqueness constraints as names"), a field name AND
 		// alias share one namespace within a record. Reject symmetrically:
@@ -4085,8 +4099,9 @@ func intFitsFloat(n int64, bitSize int) (float64, error) {
 // Length cap: strconv.ParseFloat is O(n) and processes ~30-50ms per MiB
 // of input. Schema parse for a record with one float/double field
 // calls this helper twice (validateDefault + encodeDefault), so a 1 MiB
-// hostile default literal can drive ~130ms per parse — past the
-// audit's 100ms DoS threshold. Legitimate float64 literals (including
+// hostile default literal can drive ~130ms per parse — past the 100ms
+// per-entry-point bound hostile input is held to. Legitimate float64
+// literals (including
 // hex-float and max-exponent forms) fit in well under 350 chars;
 // maxParseFloatLen=1024 is generous and rejects hostile input in O(1).
 // Mirrors the same length-cap pattern as boundedRatFromString
