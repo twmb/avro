@@ -10830,3 +10830,115 @@ Parse-default lockstep on number precision was executed across seven edges —
 MaxInt64, MaxInt64+1, 2^53+1, 1e3, 1.5, and the `-0` / `-0.0` split — and holds
 exactly, including surfacing `float64 -0` for the float-syntax form and
 `float64 0` for the integer-syntax one.
+
+## Distillation archive (2026-07-30 #38) — the derive-the-set round, verbatim
+
+FIX round, START head 1b1933f. Ruling: fix the legacy-tag divergence
+PERMISSIVE, and do it by DERIVING findUnionBranch's tier set rather than
+hand-adding the one tier the report named.
+
+**The set, and what enumerates it.** The set is findUnionBranch's TIERS. Read
+off its source there were three, each a `range union.branches` scan: the exact
+branch name; the goavro-interop `"<kind>.<logicalType>"` qualifier, which
+returns nil for any dotted name it does not match and so short-circuits what
+follows; and the unqualified short name for a namespaced named type, with an
+ambiguity guard. Nothing in source enumerated them — they were three open-coded
+loops, and the lookup table restated two of the three by hand, which is exactly
+why the second one worked on JSON and not on binary.
+
+They are now `unionTagTiers`, a slice both consumers WALK: findUnionBranch
+resolves through it, fillUnionTagTables builds ser.branchNames through it. The
+accept-sets are equal by construction rather than by agreement, and
+`addUnionShortNameFallbacks` — the hand-written restatement of tier 3 — is
+deleted rather than kept in sync.
+
+**One behavioral change fell out of deriving.** Tier 2 had no ambiguity guard
+where tier 3 did, so an ambiguous legacy tag resolved to the FIRST claimant.
+Executed before the fix: `[{fixed A uuid},{fixed B uuid}]` parses (two distinct
+named types), and `{"fixed.uuid": v}` silently decoded as A on JSON while
+binary refused it outright. `fixed` is the only named kind in tier 2's
+vocabulary, so it is the only shape where two branches can claim one legacy tag
+— confirmed by executing the same-kind duplicates for long/int/bytes, all of
+which the parser refuses as duplicate union types. Both wires now refuse the
+ambiguous tag, per the ruling.
+
+**The tier-2 short-circuit was dropped, and it was provably dead.** A dotted
+name can never match tier 3, because `unqualified` returns everything after the
+LAST dot and so never itself contains one. Removing the early `return nil`
+therefore changes no verdict.
+
+**The guard, attacked in both directions.** Four attacks, each giving the
+triple (exit != 0, RUN > 0, no `panic:`) and each a distinct red set: adding a
+tier to the slice reds the stated count AND the reachability invariant;
+open-coding a tier inside findUnionBranch reds the derivation guard, which
+requires exactly one `range union.branches` in that function and one
+`range unionTagTiers` in each consumer; removing a tier reds count,
+reachability and the ambiguity invariant; unguarding a tier reds the ambiguity
+invariant alone. The reachability guard is the half that matters most for the
+rule: a tier nothing in the corpus reaches ships unexercised, and its own guard
+would neuter green.
+
+**The perf gate caught a regression the design introduced.** The first version
+passed a stack scratch buffer into each tier's claim so matching could compare
+without allocating. The buffer ESCAPES through the indirect call, so every
+resolve allocated once — on a per-value JSON path. `testing.AllocsPerRun` over
+five tags, including one no tier claims so all three run, is what surfaced it.
+The tier now returns its claim as (head, sep, tail) pieces: matching compares
+in place and allocates nothing, and only the parse-time table build ever joins
+them. That pin is permanent, because a later tier built with fmt or
+strings.Join would silently reintroduce the cost.
+
+**Sibling sweep, done the way the rule requires rather than by grepping
+callers.** The question is "which branch does a caller-written tag name", and
+the sweep looked for a SECOND IMPLEMENTATION of it, not for callers of
+findUnionBranch: every `range .*\.branches` in non-test sources and every read
+of a tag-keyed table. Two accept sites exist — `ser.branchNames[key]` in
+serUnion.tryUnwrapTagged and findUnionBranch — and both now walk the tiers.
+`unionEmitTag`'s scan is the EMIT question, a different one, and stays separate.
+
+Nets: `TestMatrix_UnionTagTierAcrossConsumers` crosses every tier with all
+three consumers that resolve a caller tag (binary tagged-map encode, JSON
+tagged encode, JSON tagged decode), with explicit accept/refuse verdicts so
+"everything refuses" cannot pass, plus ambiguity cells for both guarded tiers
+and a no-tier-claims-it cell. Census Q20 grew an ACCEPT-side answerer naming
+the tier slice as the authority. NOT_BUGS #42 updated: the legacy spelling is
+accepted on BOTH wires on input, EMIT is unchanged, and an ambiguous legacy tag
+resolves nowhere.
+
+### 2026-07-30 #38, continued — what `-race` surfaced at close
+
+Two things, neither of them the fix.
+
+**A wall-clock deadline mis-sized for its purpose.** Two schema-node budget
+batteries failed under `-race`, a different one on each of two runs
+(`SchemaNodeWalkBudgetBattery` at 56.6s, `SchemaNodeDuplicateNamedDefinitionBounded`
+at 30.0s). Neither is a data race — the detector reported none. Measured in
+ISOLATION under `-race` they run 32.8s and 21.5s against a 30s deadline, so the
+deadline sat INSIDE the band of legitimate work and full-suite parallelism
+decided the outcome. Those batteries are the one place whose work is at the
+budget by construction (a cell must exceed `maxSchemaJSONNodes` or nothing is
+over budget), so they are the slowest thing in the suite and the first to trip.
+The deadline is a LIVENESS backstop, stated as such in the tests' own comments —
+it converts a hang into a failure — so it now scales with the instrumentation
+via a `//go:build race` pair: 30s uninstrumented, 4 minutes under `-race`. The
+suite came back to 205s, next to the 203s baseline from before this round.
+
+**The hypothesis that the fix caused it was measured and REJECTED.** The tier
+factoring added, per union, two map allocations per tier at parse time, which
+was a plausible suite-wide cost. Measured with `AllocsPerRun` over a five-union
+parse: 411 allocations before, 412 after replacing the per-tier maps with one
+reused scratch pair — the maps had been stack-allocated all along, so they were
+never the cost. The rewrite is kept anyway (a linear scan over a handful of
+branches is the right shape), but it is not a fix for anything, and the
+slowdown it was meant to explain does not exist. One of the two failing tests
+also provably executes no union code at all: it builds records of `long` fields.
+
+**The census caught the rewrite's own near miss, unprompted.** Replacing those
+maps introduced `claimed := make([]bool, len(branches))`, which matches Q21's
+tell — the shape that watches "has this reader slot already been claimed". It
+is not an answerer: it marks which union BRANCHES produced a tag claim inside
+one walk, and a duplicate there is settled by the tier's ambiguity rule (Q20),
+a different question with a different remedy. Registered with that reason. This
+is the guard-that-fails-when-a-member-appears-unrouted working on the very
+round that wrote the rule down, and it fired on code that had passed review,
+the suite, and the fastavro differential.
