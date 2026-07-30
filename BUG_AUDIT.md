@@ -10942,3 +10942,192 @@ a different question with a different remedy. Registered with that reason. This
 is the guard-that-fails-when-a-member-appears-unrouted working on the very
 round that wrote the rule down, and it fired on code that had passed review,
 the suite, and the fastavro differential.
+
+### 2026-07-30 #39 — the WIDTH half of a matrix the archive had already prescribed
+
+FULL read-only round at HEAD c17986f. Zero behavioral findings; two
+resource-bound findings, both members of one axis the DoS battery has no column
+for.
+
+**The quarantine handed over the first one.** The tier factoring that landed in
+3ba6f57 replaced a map-keyed dedup with a scan nested inside the loop over the
+same branch slice, under a comment reading "A union has a handful of branches,
+so the duplicate check is a linear scan over this slice". Measured: a 1 MiB
+schema of a wide union parses in 96.9ms at the parent and 1.89s at HEAD, growing
+x3.9 per doubling of branch count. `fillUnionTagTables` is 87.4% of the profile,
+`runtime.memequal` 30% flat.
+
+Two things make this more than a slow path. The rationale is an assertion about
+INPUT — union branches are sized by schema text, and a schema arrives from a
+registry, an RPC handshake, or an OCF header. And the perf argument that chose
+the scan had already been measured false BY THE ROUND THAT MADE IT: its own
+`AllocsPerRun` run reported 411 vs 412 allocations, "the maps had been
+stack-allocated all along". So the fix costs nothing it was avoiding. Verified
+in a worktree: one scratch map, `clear()`ed per tier, restores 94.96ms — the
+parent's number — with the full suite green, the tier guards intact and the
+allocation pin still passing. Gate verdict was introduced-deliberately-in-range,
+so it was reported and not edited.
+
+**Taking the axis seriously rather than the instance produced the second.** A
+breadth sweep over five schema shapes × eight entry points, with the parse moved
+OUTSIDE the timed region (inside it, the union shape's own quadratic makes every
+downstream entry point look superlinear — the first run of this probe reported
+five false positives for exactly that reason). What survived: `Resolve` and
+`CheckCompatibility` are quadratic in RECORD FIELD count, x4.17 and x4.35 per
+doubling, 2.94s and 2.56s on a 1 MiB schema. Both reach `findReaderFieldIndex`
+(resolve.go:406), a linear scan over reader fields called once per writer field
+— from `resolveRecord` (resolve.go:317) and from `checkRecordFieldClaimsUnique`
+(compat.go:219). Java's equivalent is a HashMap (`Schema.java:947-950`,
+`SchemaCompatibility.java:116-124`). Pre-existing since 80a318b; the worst case
+is the alias pass, where every writer name misses the exact-name scan before
+walking the aliases — 6x the plain case at the same n.
+
+**The reachability finding is the one that sets severity.** `ocf.go:929` parses
+the file header's writer schema, and `WithReaderSchema` resolves it. Both
+quadratics are therefore reached by OPENING A FILE — 861ms and 522ms on
+sub-1MB files, before one datum is read. The findings were written against
+`Parse` and `Resolve`; the API a finding is written against is not the API that
+decides how bad it is.
+
+**The archive had already prescribed the probe.** The superlinear-parse entry
+(#5593 and its earlier copy) names the sweep angle as "a depth-vs-width matrix
+(a deep chain and a wide-but-shallow blob of equal byte size)". Only the depth
+half was ever built — `TestRegression_DeepValidSchemaParsesLinear`. The width
+half had no pin anywhere, which is why two quadratics could sit in three public
+entry points through many clean rounds. That is the shape now written as P25 and
+opened as the BREADTH gap: a prescribed measurement that was never executed
+reads, from the ledger, exactly like one that passed.
+
+**Cleared by measurement, not by argument.** Linear on parse: record fields,
+enum symbols, aliases, reference fan-out, sibling record definitions. Linear on
+Canonical / Fingerprint / String / Root-rebuild against field-shaped breadth.
+`findMatchingBranch`'s union-union O(W×R) is real but matches Java's own
+`firstMatchingBranch` (Resolver.java:632), which additionally runs a full
+recursive record resolution per non-exact candidate — recorded, not filed.
+`resolveRecord` builds a `writerByName` map (resolve.go:293-296) that nothing
+reads; noted with the fix, not as its own finding.
+
+**The inverse-density front went to a boundary nothing drives.** The widest enum
+in the entire test corpus is four symbols, and the widest union literal is
+comparable — so the zigzag varint's 1→2-byte crossing at index 64, which every
+enum symbol index and union branch index passes through, had never been
+exercised. Driven at indices 0, 62, 63, 64, 65, 126, 127, 128, 199 across binary
+round-trip, JSON round-trip, tagged-union branch identity, and a resolve against
+a reader listing the same symbols reversed: all clean. A boundary with no bug
+behind it is still worth the pin, because the reason it was uncovered was
+structural rather than accidental — every fragment in the matrices is small by
+construction.
+
+**One immunity measured rather than assumed.** The quarantined commit made tier
+2 refuse an ambiguous `fixed.uuid` on both wires. The obvious follow-on worry is
+that the decoder still EMITS that tag, which would leave the package producing
+JSON its own decoder rejects. It does not: `unionBranchNames` (json_codec.go:
+1374-1383) computes the qualifier only when `standard == node.kind`, and a named
+fixed's standard name is its fullname, so the emitted tag is the name and the
+ambiguous qualifier is accept-side only. Read from the emit path rather than
+inferred from the accept path.
+
+Oracles: suite green, fastavro differential green (venv
+`~/.cache/avro-audit-venv`, fastavro 1.12.2, all compression deps present, zero
+`missing optional dependency`). Java ABSENT — `/usr/bin/java` exists but there
+is no runtime, so every Java-dependent area is verified-modulo-Java and counts
+as un-netted.
+
+### 2026-07-30 #40 — fixing both quadratics, and deriving the axis that would have caught them
+
+FIX round, START head c17986f. Both resource-bound findings fixed; the durable
+half is a breadth column whose every axis is derived from source.
+
+**F1 — the tier walk survives; only the ambiguity check's shape changed.** The
+constraint was that deriving the tier set must not be bought back, and it is
+not: `fillUnionTagTables` still offers every branch to every tier of
+`unionTagTiers`, and the accept-set is unchanged. What changed is how a guarded
+tier answers "does another branch claim this name" — a scan of the branch slice
+became a count map, allocated on first use and `clear()`ed between tiers, so an
+ordinary union pays at most one allocation for the whole walk and a union with
+no guarded tier pays none. 1 MiB schema: 1.89s → 94.96ms, the parent's number.
+
+The gate's escape hatch held up under its own terms. The introducing round had
+already measured the maps it removed at 411 vs 412 allocations — stack-allocated
+— so the perf objection behind the deliberate choice was disproven by its own
+author, and the fix costs nothing it was avoiding.
+
+**F2 — two maps, and the reason they cannot be one.** `readerFieldLookup` is
+built once per reader record and asked once per writer field. The two maps stay
+separate because the rule is that EVERY field name outranks EVERY field alias,
+not that a name outranks an alias on the same field: a writer name that is one
+reader field's alias and a LATER reader field's name resolves to whichever entry
+was written last in a merged map. NOT_BUGS #50 justifies twmb's parse-time
+rejection of field name/alias collisions by citing that routing, so it is a
+contract rather than an implementation detail, and #50's stale `findReaderFieldIndex`
+citation was re-pointed. The dead `writerByName` map — built per record
+resolution and never read — is gone.
+
+**A neuter came back GREEN, and that was the finding.** Merging the two maps
+while still filling all names before all aliases is behaviorally IDENTICAL, so
+the pin stayed green and was measuring nothing about the merge. The mistake
+worth guarding is the PER-FIELD merge (name, then that field's aliases, field by
+field), which reverses the routing; re-aimed at that, the pin reds naming the
+`alias-before-name` cell. A neuter that does not red is not automatically a
+vacuous pin — here it was a correct refactor, and telling the two apart is what
+located the cell that actually discriminates.
+
+**Two probes did not reach their path; a guard caught both, review caught
+neither.** The routing pin's first form built its records through `Parse`, which
+refuses the collision — every cell logged the refusal and asserted nothing, so
+it was rebuilt against a hand-constructed node. And the `name-hit` cost cell
+built writer and reader from one schema text, which `Resolve` short-circuits on
+canonical equality (resolve.go:37) before any per-field matching: the cell timed
+the equality check. Both are now structurally guarded — the field shapes assert
+their writer and reader are NOT canonically equal, and the tier shapes assert
+their tier actually claims their branches.
+
+**The breadth column derives all three axes rather than listing them.** The tier
+axis is read from `unionTagTiers`; the lookup-site axis from the
+`newReaderFieldLookup` builders found in `resolve.go`/`compat.go`; and the
+ENTRY-POINT axis from the cell labels the battery's OTHER columns already drive
+— 18 entry points derived, 15 with cells, 4 exempt. An exemption carries the
+input it takes instead and is stale-checked, and `SchemaFor` is exempt on a
+structural ground rather than a size one: its input is a compile-time type
+parameter, so the field count is authored in the caller's own source and cannot
+be supplied at runtime. Adding an entry point to any column now lands here
+uncovered and fails.
+
+**Seven attacks, seven distinct red sets**, each direction of each derivation:
+restore the quadratic scan (C10a alone); rebuild the lookup per field (C10b, all
+three Resolve cells, no CheckCompatibility cell — the neuter touched only
+`resolveRecord`); merge the maps per field (the routing pin, naming its cell);
+add a tier / remove a tier (the tier invariant, uncovered vs stale); add a third
+builder / remove a registered one (the builder invariant, uncovered vs stale);
+add an entry point to another column / delete a breadth cell (the entry-point
+invariant, both ways). One neuter build-failed on first attempt and printed
+exit!=0 with RUN=0 — the costume that reads as a red — and was only caught by
+checking the triple.
+
+**The sibling sweep found the same shape and cleared it on a structural bound.**
+The emit tables' degrade (`unionLogicalTagOwnedElsewhere`) is also a scan of the
+branch names run once per branch. It is bounded, and not because unions are
+small: its condition holds only where a branch's emitted qualifier differs from
+its own name, which is only for an UNNAMED kind carrying a logical type, and a
+union may hold at most one branch per unnamed kind — a second is refused at
+parse as a duplicate union type. Executed, not reasoned: a union of two `long`
+branches differing only in `logicalType` is rejected with "duplicate union type".
+Eight unnamed kinds cap that outer loop at eight. The distinction is the whole
+of P25: an immunity may rest on what the parser ACCEPTS, never on what callers
+are expected to send. The remaining scan-in-a-loop sites (`schema_for.go`'s
+field walk, `unsafe.go`'s two field walks, `computeFieldOffset`) are single
+passes with O(1) or O(embedding-depth) bodies, and `findWriterField` — the
+inverse lookup, reader field to writer field — is already map-backed and matches
+Java's `lookupWriterField` shape.
+
+**The standing lesson.** A prescribed measurement that never ran is
+indistinguishable, from the ledger, from one that passed. The depth-vs-width
+matrix was written down as a sweep angle and half-built, and the unbuilt half
+held two quadratics through many clean rounds. The remedy that generalizes is
+not to remember better: it is to make the prescription EXECUTE — the battery's
+row list was prose claiming coverage it did not have (`MustParse` and `Resolve`
+were named as rows with no cell driving them), and the entry-point axis is now
+read off the cells themselves, so the claim and the coverage cannot drift apart.
+
+Oracles: suite green, fastavro differential green, `-race` green. Java ABSENT
+(no JVM), so Java-dependent areas remain verified-modulo-Java.
