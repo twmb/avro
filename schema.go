@@ -3717,19 +3717,19 @@ func maxDecimalDigits(size int) int {
 	if size <= 0 {
 		return 0
 	}
-	// Cap size before the bit multiply. A fixed size is an int that can
-	// exceed 2^60 on a 64-bit build (twmb accepts sizes Java's int32 can't),
-	// where 8*size-1 wraps the platform int negative and the capacity comes
-	// back negative — falsely rejecting a valid precision. Any size past
-	// decimalScaleLimit yields a capacity far above that limit, and precision
-	// itself is capped at decimalScaleLimit upstream, so the exact digit count
-	// is irrelevant there: returning the ceiling both avoids the wrap and
-	// keeps the comparison correct (precision <= decimalScaleLimit can never
-	// exceed it).
-	if size > decimalScaleLimit {
-		return decimalScaleLimit
-	}
-	bits := 8*size - 1 // sign bit excluded
+	// Saturate before the bit multiply. A fixed size is an int that can exceed
+	// 2^60 on a 64-bit build (twmb accepts sizes Java's int32 can't), where
+	// 8*size-1 wraps the platform int negative and the capacity comes back
+	// negative — falsely rejecting a valid precision. The ceiling is
+	// maxSchemaMagnitude, shared with every other consumer of a
+	// schema-declared magnitude and chosen against the multiply on the next
+	// line (magnitudeWidestMultiplier), rather than a second ceiling reasoned
+	// out here. The verdict is unchanged either way: this result is only ever
+	// compared against a precision, and validateLogical rejects a precision
+	// above decimalScaleLimit before calling in, while the saturated capacity
+	// is far larger than that.
+	size = saturateSchemaMagnitude(size)
+	bits := magnitudeWidestMultiplier*size - 1 // sign bit excluded
 	// log10(2^bits - 1) ≈ bits * log10(2)
 	return int(math.Floor(float64(bits) * math.Log10(2)))
 }

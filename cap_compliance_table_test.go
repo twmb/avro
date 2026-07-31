@@ -509,6 +509,13 @@ func scanCapConsts(src string) []string {
 var capNotABound = map[string]string{
 	"maxVarintLen":  "an encoding width, not a bound on accepted input",
 	"maxVarlongLen": "an encoding width, not a bound on accepted input",
+	// Saturating a magnitude REFUSES nothing: a schema declaring a fixed
+	// larger than this still parses, encodes and decodes exactly as before.
+	// The ceiling only keeps arithmetic on that magnitude inside the integer
+	// range, so there is no over-cap input to build and no producer-side
+	// compliance to check. Its own guards are the ones that watch the
+	// arithmetic (magnitude_arithmetic_test.go).
+	"maxSchemaMagnitude": "an arithmetic ceiling, not a bound on accepted input — nothing is refused for exceeding it",
 }
 
 // TestInvariant_EveryCapIsClassified is the completeness half: a cap added

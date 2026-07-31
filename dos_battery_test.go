@@ -875,3 +875,124 @@ func TestDoSBattery_C9_CustomTypeParseCost(t *testing.T) {
 		return err
 	})
 }
+
+//////////////////////////////////////////////////////////////////////////////
+// C11 — SCHEMA-DECLARED MAGNITUDE at the top of the integer range.
+//////////////////////////////////////////////////////////////////////////////
+
+// TestDoSBattery_C11_SchemaDeclaredMagnitude is the column this battery was
+// missing. C2 drives hostile counts and lengths off the WIRE; nothing drove a
+// magnitude the SCHEMA TEXT declares. A `fixed` size is the one parse-time
+// quantity whose value is not bounded by the length of the text declaring it —
+// nineteen characters name 2^63, and the parser deliberately leaves the upper
+// bound open to match the lenient majority — so any entry point that does
+// arithmetic on it has to survive the top of the range.
+//
+// The bound is saturation at the producer (saturateSchemaMagnitude, deser.go),
+// and the shapes below are chosen so the arithmetic is reached in each of the
+// ways it can be: a magnitude standing alone, a SUM over record fields that
+// carries past the range, and a union whose smallest branch is one. dosRun's
+// "never panics" assertion is the operative one here — an unsaturated sum
+// reaches a divisor as zero.
+func TestDoSBattery_C11_SchemaDeclaredMagnitude(t *testing.T) {
+	const huge = `{"type":"fixed","name":"BigF","size":9223372036854775807}`
+	// A record whose field minimums sum past the range and land on -1.
+	const sumWrap = `{"type":"record","name":"SumWrap","fields":[
+		{"name":"lead","type":"long"},
+		{"name":"a","type":{"type":"fixed","name":"SWA","size":9223372036854775807}},
+		{"name":"b","type":{"type":"fixed","name":"SWB","size":9223372036854775807}}]}`
+
+	shapes := []struct{ name, schema string }{
+		{"fixed-alone", huge},
+		{"sum-wrap-record", sumWrap},
+		{"union-of-huge", `[` + huge + `]`},
+		{"map-of-sum-wrap", `{"type":"map","values":` + sumWrap + `}`},
+		{"array-of-sum-wrap", `{"type":"array","items":` + sumWrap + `}`},
+		{"map-of-huge", `{"type":"map","values":` + huge + `}`},
+		{"decimal-on-huge-fixed", `{"type":"fixed","name":"BigD","size":9223372036854775807,"logicalType":"decimal","precision":4,"scale":2}`},
+	}
+
+	// One block header claiming a single element, and nothing after it. Every
+	// shape above needs more bytes for one element than any wire can hold.
+	claimsOne := []byte{0x02}
+
+	for _, sh := range shapes {
+		// Parse must accept these — an open upper bound is the documented
+		// posture, so rejecting here would be the other kind of bug.
+		s, err := Parse(sh.schema)
+		if err != nil {
+			t.Errorf("%s: parse rejected a schema the open-size posture accepts: %v", sh.name, err)
+			continue
+		}
+
+		wantTerminate(t, "Decode/"+sh.name, func() error {
+			var v any
+			_, err := s.Decode(claimsOne, &v)
+			return err
+		})
+		wantTerminate(t, "DecodeJSON/"+sh.name, func() error {
+			var v any
+			return s.DecodeJSON([]byte(`{}`), &v)
+		})
+		wantTerminate(t, "Encode/"+sh.name, func() error {
+			_, err := s.Encode(map[string]any{})
+			return err
+		})
+		wantTerminate(t, "EncodeJSON/"+sh.name, func() error {
+			_, err := s.EncodeJSON(map[string]any{})
+			return err
+		})
+		// The metadata surfaces read the same magnitude back out.
+		wantTerminate(t, "Root/"+sh.name, func() error {
+			r := s.Root()
+			_, err := r.Schema()
+			return err
+		})
+		wantTerminate(t, "Canonical/"+sh.name, func() error {
+			_ = s.Canonical()
+			_ = s.String()
+			_ = s.Fingerprint(NewRabin())
+			return nil
+		})
+		// Resolution derives the same bounds a second and third time — once
+		// for the resolved reader tree, once for the skip of a dropped field.
+		wantTerminate(t, "Resolve/"+sh.name, func() error {
+			_, err := Resolve(s, s)
+			return err
+		})
+		wantTerminate(t, "CheckCompatibility/"+sh.name, func() error {
+			return CheckCompatibility(s, s)
+		})
+
+		dropW, errW := Parse(`{"type":"record","name":"DropOuter","fields":[
+			{"name":"c","type":` + sh.schema + `},{"name":"keep","type":"int"}]}`)
+		dropR, errR := Parse(`{"type":"record","name":"DropOuter","fields":[{"name":"keep","type":"int"}]}`)
+		if errW == nil && errR == nil {
+			wantTerminate(t, "Resolve+Decode/"+sh.name, func() error {
+				res, err := Resolve(dropW, dropR)
+				if err != nil {
+					return err
+				}
+				var v any
+				_, err = res.Decode(append(append([]byte{}, claimsOne...), 0x02), &v)
+				return err
+			})
+		}
+	}
+
+	// SchemaCache.Parse derives the same bounds through the cache's own
+	// build path, and a second parse re-derives them over inherited nodes.
+	wantTerminate(t, "SchemaCache.Parse/sum-wrap", func() error {
+		var c SchemaCache
+		if _, err := c.Parse(sumWrap); err != nil {
+			return err
+		}
+		s, err := c.Parse(`{"type":"map","values":"SumWrap"}`)
+		if err != nil {
+			return err
+		}
+		var v any
+		_, err = s.Decode(claimsOne, &v)
+		return err
+	})
+}

@@ -832,6 +832,50 @@ var censusRegistry = []censusQuestion{
 			}},
 		},
 	},
+	{
+		id:       "Q22",
+		question: "Is this schema-declared magnitude saturated before it enters arithmetic?",
+		authority: "saturateSchemaMagnitude / maxSchemaMagnitude (deser.go) — ONE ceiling for every consumer, " +
+			"stated where the reason for its value lives. A `fixed` size is the only parse-time quantity whose " +
+			"VALUE is not bounded by the length of the text declaring it (nineteen characters name 2^63, and the " +
+			"parser deliberately leaves the upper bound open); precision and scale are capped during validation, " +
+			"and field / branch / symbol counts each cost bytes to write. The magnitude PROPAGATES, which is what " +
+			"makes this a question rather than a field read: a per-record SUM over field minimums contains no " +
+			"size read anywhere in its expression and wraps just as readily, so a set built by grepping the field " +
+			"is the wrong set. A second consumer reasoning out its own ceiling is the drift this watches — there " +
+			"were two before this question existed, and the second one's comment named the hazard correctly while " +
+			"the first stayed open for the arithmetic that actually crashed.",
+		answerers: []censusAnswerer{
+			{repr: "the accessor itself", site: "saturateSchemaMagnitude", file: "deser.go"},
+			{repr: "per-element wire minimum (fixed / union / record arms)", site: "schemaMinBytesSeen", file: "deser.go"},
+			{repr: "decimal capacity for a fixed size", site: "maxDecimalDigits", file: "schema.go"},
+			{
+				repr: "probe-buffer allocation for a fixed logical", site: "jsonDecodeAppliesLogical", file: "json_decode.go",
+				note: "different-by-design, and the ONE place a different ceiling is correct: this magnitude becomes " +
+					"a make() length, and the arithmetic ceiling is a fine addend but a terrible allocation. It caps " +
+					"at the largest length any fixed logical inspects. The accessor's doc states why allocation is a " +
+					"separate question, so the reason lives in one place even though the number cannot.",
+			},
+		},
+		// The counts include doc mentions, because the reason a ceiling has its
+		// value is part of what must not drift: a consumer added with a comment
+		// explaining its own bound is exactly the shape this question exists to
+		// catch, and it would arrive as a count change here.
+		tells: []censusTell{
+			{pattern: `saturateSchemaMagnitude(`, counts: map[string]int{
+				"deser.go":  4, // the definition plus the fixed / union / record arms
+				"schema.go": 1, // maxDecimalDigits
+			}},
+			{pattern: `maxSchemaMagnitude`, counts: map[string]int{
+				"deser.go":  10, // the const and the accessor, plus the prose stating the ceiling once
+				"schema.go": 1,  // maxDecimalDigits' note that it asks the shared ceiling
+			}},
+			{pattern: `magnitudeWidestMultiplier`, counts: map[string]int{
+				"deser.go":  3, // the const and the prose tying the ceiling to it
+				"schema.go": 2, // the multiply itself, and the note naming it
+			}},
+		},
+	},
 }
 
 // censusOutstanding is the enumeration's OPEN end. A question lands here the
@@ -3316,5 +3360,56 @@ func defLabel(def string) string {
 		return "/on-enum-def"
 	default:
 		return "/on-decimal-def"
+	}
+}
+
+// TestCensus_Q22_MagnitudeConsumersAgreeOnTheCeiling is Q22's driver. The
+// agreement it asserts is not that the consumers return the same NUMBER —
+// they compute different things — but that none of them lets a magnitude
+// leave the integer range, which is the whole content of the question. The
+// corpus spans the domain from zero to the largest value the grammar admits,
+// with the ceiling's own neighbours in it because a clamp is exactly where an
+// off-by-one lives.
+func TestCensus_Q22_MagnitudeConsumersAgreeOnTheCeiling(t *testing.T) {
+	const maxInt = int(^uint(0) >> 1)
+	corpus := []int{0, 1, 2, 12, 16, 8192, decimalScaleLimit, decimalScaleLimit + 1,
+		maxSchemaMagnitude - 1, maxSchemaMagnitude, maxSchemaMagnitude + 1,
+		1 << 40, maxInt - 1, maxInt}
+
+	prevCapacity := -1
+	for _, size := range corpus {
+		if got := saturateSchemaMagnitude(size); got < 0 || got > maxSchemaMagnitude {
+			t.Errorf("saturateSchemaMagnitude(%d) = %d, outside [0, %d]", size, got, maxSchemaMagnitude)
+		}
+		// The decimal capacity consumer: a digit capacity is a count, so it is
+		// never negative, and it never shrinks as the size grows. A wrap shows
+		// up as either.
+		capacity := maxDecimalDigits(size)
+		if capacity < 0 {
+			t.Errorf("maxDecimalDigits(%d) = %d; a digit capacity cannot be negative, and a negative one "+
+				"falsely rejects every precision", size, capacity)
+		}
+		if capacity < prevCapacity {
+			t.Errorf("maxDecimalDigits(%d) = %d, below the capacity %d reported for a SMALLER size; "+
+				"a bigger fixed cannot hold fewer digits", size, capacity, prevCapacity)
+		}
+		prevCapacity = capacity
+		// Every precision the parser can still be holding when it asks must
+		// fit, or a valid schema is refused.
+		if size > 0 && capacity < 1 {
+			t.Errorf("maxDecimalDigits(%d) = %d; a fixed of any positive size holds at least one digit", size, capacity)
+		}
+	}
+
+	// Non-vacuity: the corpus must actually cross the ceiling, or it is
+	// measuring the identity function.
+	crossed := false
+	for _, size := range corpus {
+		if size > maxSchemaMagnitude {
+			crossed = true
+		}
+	}
+	if !crossed {
+		t.Fatal("the corpus never exceeds the ceiling, so it cannot observe a clamp")
 	}
 }

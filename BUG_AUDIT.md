@@ -11282,3 +11282,107 @@ Oracles: suite green; fastavro differential green; `-race` green (280s, zero
 data races), which is what confirms the table shared between node and
 serializer is read-only after build. Java ABSENT (no JVM), so Java-dependent
 areas remain verified-modulo-Java.
+
+### 2026-07-31 #43 — the arithmetic under a bound nobody had driven
+
+FULL round, quarantining the one-table-per-question fix. Net green (suite +
+fastavro; Java absent, no JVM). The quarantine cleared on the axis that
+mattered for a shared table — `resolve.go`'s synthesized union nodes carry
+`r.branches` and `r.tags` as one pair, and `unionTypeNameForValue`'s output
+range is exactly the key set `byKind` is built over, so the table and the scan
+it replaced answer over the same domain.
+
+The inverse-density front was a new metric: per-FUNCTION test-mention count.
+783 non-test functions, cross-referenced against every `_test.go` and the whole
+audit corpus. Zero were unmentioned everywhere, but **76 are named by no test
+at all** — the streetlight's shadow at function granularity. Reading them found
+no bug. Reading what their CALLERS do with their return values found one.
+
+`schemaMinBytes` returns a per-element minimum wire size. Its `fixed` arm
+returns the declared size, which the parser deliberately leaves unbounded
+(matching fastavro and avro-rs). Its `record` arm sums field minimums under a
+guard that tests only `s >= math.MaxInt32` — and a wrapped-negative sum is not
+greater than a positive number, so it passes through. `checkMapBlockBounds`
+then divides by `1 + that`. A record of `{long, fixed(MaxInt64), fixed(MaxInt64)}`
+sums to exactly -1; the divisor is zero.
+
+All four derivations of that bound panic on a ONE-BYTE payload: the parse-time
+one, the resolver's rebuild, the skip compiled for a dropped writer field, and
+the container reader's — the last reachable through `ocf.NewReader`, where the
+schema comes from the file itself. `checkArrayBlockBounds` does not panic (its
+`minItemBytes > 0` gate catches it) but silently reclassifies a real element as
+a zero-byte one, applying the wrong cap.
+
+The shape was already known here: `maxDecimalDigits` clamps the identical
+unbounded-size overflow, with a comment naming the hazard exactly. The sweep
+that produced that clamp stopped at one site.
+
+Also verified clean: resolved `Decode` vs resolved `DecodeJSON` over 17
+writer/reader pairs; `DecodeJSON→any→Encode` over 31 logical and container
+cells (the sub-contract the composed resolved-JSON path rests on); PCF against
+fastavro over 23 name-scoping shapes, both divergences being documented
+leniencies; the narrow-before-check trilogy; and kind-switch completeness (no
+`schemaNode` ever carries kind `"error"`, so the bare `case "record"` arms are
+whole).
+
+### 2026-07-31 #44 — one ceiling, and a set that is not readers-of-the-field
+
+FIX round. Two maintainer corrections shaped it, and both were right.
+
+**The union arm cannot wrap.** `m := math.MaxInt` means a `fixed(MaxInt64)`
+branch fails `v < m`, hits the sentinel, and reports the union as costing one
+byte. That is a sentinel COLLISION, not an overflow; the overflow is entirely
+the record arm's sum. Both are fixed, but only one was the crash.
+
+**Clamping to a second ceiling would have made it worse.** `maxDecimalDigits`
+already clamped this magnitude — to `decimalScaleLimit`, its own ceiling — and
+`jsonDecodeAppliesLogical` clamps it again to a third. Three numbers for one
+question. The fix is one accessor, `saturateSchemaMagnitude`, with the ceiling
+chosen against the widest multiplier any consumer applies to a magnitude
+(`magnitudeWidestMultiplier` = 8, keeping the product inside a 32-bit int on
+every build). `maxDecimalDigits` asks it; its verdict is unchanged because
+validation rejects a precision above `decimalScaleLimit` before it is called.
+The third ceiling stays, because it bounds an ALLOCATION rather than arithmetic
+— and that distinction is stated in the accessor, not at the site, so a fourth
+consumer cannot re-reason it.
+
+**The set is not readers-of-`.size`.** The wrap is a sum over field count and
+contains no `.size` in its expression at all; meanwhile the field has 27
+non-test reads, most of them comparisons, which cannot overflow. So the
+derivation is a taint reachability, not a pattern:
+
+- Seeds are the magnitude-bearing fields. Magnitude propagates through
+  arithmetic, through an integer-returning function, and through an
+  integer-typed PARAMETER — the third being what reaches `maxDecimalDigits`,
+  whose magnitude arrives as an argument and which is invisible without it.
+- Sinks are `+ - * / % <<`, compound assignment, and `make()` lengths.
+  Comparisons, formatting and assignment are not sinks.
+- Results and parameters are filtered to INTEGER types: a magnitude handed on
+  as `[]byte` or `string` has left the domain. Without that filter the fixpoint
+  claims 140 functions and string concatenation reads as a hazard.
+
+That yields **17 expressions in 13 functions** — small enough to classify by
+hand, which is the deliverable. Seven saturated, one bounded-at-site (the
+allocation), four not-a-magnitude (`reflect.Type.Size()` reads as one, since
+the derivation has no type information), one wrap-is-the-contract (zigzag).
+The guard fails on an unrowed site, on a stale row, on a drifted count, and on
+its own rot if the producer is renamed.
+
+**Three of five first-pass attacks came back wrong, and that was the yield.**
+A union probe of `["null", huge]` has minimum 0 from its null branch, so it
+never drove the union arm — the cell looked like coverage and was not. Two
+neuters reported exit≠0 with RUN=0: compile errors, which read as reds if only
+the exit code is checked. And the sentinel is correct-unobservable on its own
+(it needs an unsaturated branch minimum to collide), so it is recorded as a
+measured immunity naming the combination — with an oracle of its own, because
+its wrong answer is `1`, which is small, plausible and inside every range check
+anyone would assert. The property that catches it is calibration-free: a
+union writes a branch index and then a branch, so it cannot cost less than its
+cheapest branch alone.
+
+The DoS battery had no column for a schema-declared magnitude — C2 drives
+hostile counts off the WIRE. C11 adds it, and it reds on `SchemaCache.Parse`,
+an entry point this round's own matrix never drove. Adding a column then red
+the breadth column's derived entry-point guard, which is the machinery working:
+a new battery cell is a new entry point, and every other derived axis must
+cross it or name it exempt.

@@ -908,10 +908,80 @@ func boundedRatFromString(s string) (*big.Rat, bool, error) {
 	return r, true, nil
 }
 
+// magnitudeWidestMultiplier is the largest constant factor this package
+// applies to a single schema-declared magnitude: bits per byte, in
+// maxDecimalDigits' capacity calculation. maxSchemaMagnitude is chosen against
+// it, so a consumer that scales a saturated magnitude by up to this much
+// stays inside a 32-bit int on every build. A consumer needing a WIDER factor
+// belongs here, lowering the ceiling for everyone, rather than clamping to a
+// private ceiling of its own.
+const magnitudeWidestMultiplier = 8
+
+// maxSchemaMagnitude is the one ceiling every schema-declared magnitude is
+// saturated to before it enters arithmetic.
+//
+// A `fixed` size is the only parse-time quantity whose VALUE is not bounded by
+// the length of the text declaring it — nineteen characters name 2^63, and the
+// parser deliberately leaves the upper bound open to match the lenient
+// majority. Precision and scale are capped at decimalScaleLimit during
+// validation; field, branch and symbol counts each cost bytes to write. So an
+// unsaturated magnitude is the one way arithmetic here can leave the int
+// range, and it does not take a product to do it: a running SUM over a
+// record's fields wraps just as readily, and a guard testing only the positive
+// side of the range (`s >= someCeiling`) never sees the wrapped value, because
+// a negative number is not greater than a positive one.
+//
+// 1<<27 is the largest power of two that survives magnitudeWidestMultiplier
+// inside a 32-bit int (1<<27 * 8 == 1<<30, with the sign bit to spare). It is
+// also 128 MiB — orders of magnitude above any fixed anyone declares — so no
+// real schema is clipped.
+//
+// What clipping an absurd one costs, stated exactly rather than waved at: a
+// buffer-relative block bound derived from a clipped magnitude is looser than
+// one derived from the true magnitude, so for a buffer at least this large a
+// block count can pass the bound and then fail at the element decode instead
+// of at the bound. Both reject; only the error moves. For any buffer below the
+// ceiling — which is every buffer the bound was written for — the verdict is
+// identical, and TestInvariant_ClippedMagnitudeStillRejects pins that.
+const maxSchemaMagnitude = 1 << 27
+
+// saturateSchemaMagnitude clamps a schema-declared magnitude into
+// [0, maxSchemaMagnitude] so arithmetic on the result cannot wrap. It is TOTAL
+// on purpose: callers must not have to know whether their input was validated
+// upstream, since the whole failure mode is a site assuming someone else
+// bounded the value.
+//
+// This bounds ARITHMETIC RANGE, not allocation size. A magnitude that becomes
+// a make() length needs its own, far tighter bound — maxSchemaMagnitude is
+// 128 MiB, which is a fine addend and a terrible allocation — and that bound
+// belongs at the allocating site, where the reason for its size lives
+// (jsonDecodeAppliesLogical's probe buffer is the instance: it caps at the
+// largest length any fixed logical inspects, because it only has to tell 12
+// and 16 apart from everything else). The two are different questions; this
+// one is only the first.
+func saturateSchemaMagnitude(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > maxSchemaMagnitude {
+		return maxSchemaMagnitude
+	}
+	return n
+}
+
 // schemaMinBytes returns the minimum number of wire bytes required to
 // encode one value of node's type. Used at decode time to bound array
 // block counts. Cycles fall back to 1 (conservative — defaults to the
 // existing tight buffer-relative guard).
+//
+// The result is always in [0, maxSchemaMagnitude]. Three callers compute
+// `1 + schemaMinBytes(...)` and one of them divides by it, so a wrapped or
+// negative return is not a loose bound but a crash and a misclassification:
+// zero divides, and a negative value routes an element that occupies real
+// bytes through the ZERO-BYTE element cap instead of the buffer-relative one.
+// Saturating here rather than at each consumer is deliberate — the consumers
+// are four separate derivations of the same bound (parse, resolve, skip, and
+// the container reader's), and a ceiling applied at one leaves three open.
 func schemaMinBytes(n *schemaNode) int {
 	return schemaMinBytesSeen(n, map[*schemaNode]struct{}{})
 }
@@ -937,26 +1007,37 @@ func schemaMinBytesSeen(n *schemaNode, seen map[*schemaNode]struct{}) int {
 	case "bytes", "string":
 		return 1
 	case "fixed":
-		return n.size
+		// The declared size is the one magnitude here the schema text names
+		// outright and the parser leaves unbounded; every wrap below is built
+		// from it, so it is saturated at the point it enters.
+		return saturateSchemaMagnitude(n.size)
 	case "array", "map":
 		return 1 // empty-collection terminator is 1 byte
 	case "union":
-		m := math.MaxInt
+		// found, not a sentinel value: a branch minimum that happened to equal
+		// the sentinel would otherwise read as "no branches at all" and report
+		// the union as costing one byte.
+		m, found := 0, false
 		for _, b := range n.branches {
-			if v := schemaMinBytesSeen(b, seen); v < m {
-				m = v
+			v := schemaMinBytesSeen(b, seen)
+			if !found || v < m {
+				m, found = v, true
 			}
 		}
-		if m == math.MaxInt {
+		if !found {
 			return 1
 		}
-		return 1 + m
+		return saturateSchemaMagnitude(1 + m)
 	case "record":
+		// Saturating the RUNNING SUM, not just the result: every term is
+		// already in range, so `s + term` cannot wrap, and the clamp keeps it
+		// that way for the next field. A guard on the result alone would test
+		// a value the wrap already destroyed.
 		var s int
 		for i := range n.fields {
-			s += schemaMinBytesSeen(n.fields[i].node, seen)
-			if s >= math.MaxInt32 {
-				return math.MaxInt32
+			s = saturateSchemaMagnitude(s + schemaMinBytesSeen(n.fields[i].node, seen))
+			if s == maxSchemaMagnitude {
+				return maxSchemaMagnitude
 			}
 		}
 		return s
