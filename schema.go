@@ -160,6 +160,16 @@ type schemaNode struct {
 	props    map[string]any // extra schema properties (for CustomType callbacks)
 	fieldIdx map[string]int // record field name → index; built at parse time
 
+	// tags is a union's name→branch lookup and symbolIdx is an enum's
+	// symbol→ordinal lookup. Both live HERE, beside fieldIdx, rather than
+	// on the serializer, because a per-value question has to be answerable
+	// from whatever the asker holds — and the JSON codec holds a
+	// *schemaNode, never a *serUnion. A table only one wire can reach is a
+	// table the other wire re-derives per value by scanning the siblings,
+	// which is linear in a count the schema's author chooses.
+	tags      *unionTags     // union: see unionTags
+	symbolIdx map[string]int // enum: symbol → ordinal; nil below enumIndexMin
+
 	// unknownLogical preserves the schema's original logicalType value
 	// when it failed validateLogical (no built-in handler matched AND
 	// no registered CustomType matched at this Parse). The runtime
@@ -1489,7 +1499,7 @@ func (b *builder) finalize() error {
 		// branch-name tables) from the RESOLVED names — buildUnion ran
 		// them with the unresolved as-written names for fwd-ref branches.
 		if m.branches != nil && m.deser != nil {
-			if err := finalizeUnionNames(m.ser, m.deser, m.branches); err != nil {
+			if err := finalizeUnionNames(m.ser.tags, m.deser, m.branches); err != nil {
 				return err
 			}
 		}
@@ -2228,7 +2238,11 @@ func (b *builder) findCustomTypeMatchInSubtreeWalk(node *schemaNode, visited map
 // things that are not yet declared. We fixup at the very end.
 func (b *builder) buildUnion(parentName string, s *aschema) error {
 	var (
-		ser         = new(serUnion)
+		// ONE table for the whole union, handed to the serializer and to the
+		// node below so both wires ask the same allocation. finalizeUnionNames
+		// refills it in place, so neither holder can go stale.
+		tags        = new(unionTags)
+		ser         = &serUnion{tags: tags}
 		deser       = new(deserUnion)
 		missing     = make(map[int]string)
 		sawTypes    = make(map[string]bool)
@@ -2314,24 +2328,28 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 		unionStd = append(unionStd, bn)
 		unionLog = append(unionLog, ln)
 	}
-	fillUnionTagTables(ser, deser, branchNodes, unionStd, unionLog)
-	// Populate branchKinds for type-name dispatch in serUnion.ser /
+	fillUnionTagTables(tags, deser, branchNodes, unionStd, unionLog)
+	// Populate byKind for type-name dispatch in serUnion.ser /
 	// appendAvroJSONUnion / encodeDefault's union case (see
 	// unionTypeNameForValue). Primitive kinds only — record/enum/fixed
 	// branches go through tagged-union dispatch, and the spec
 	// guarantees primitive kinds are unique within a union (so this
 	// map is unambiguous by construction).
+	//
+	// Not rebuilt by finalizeUnionNames: a branch is nil there only while a
+	// forward reference is unbound, and a forward reference always names a
+	// NAMED type, which none of the kinds below can be.
 	for i, branch := range branchNodes {
 		if branch == nil {
 			continue
 		}
 		switch branch.kind {
 		case "null", "boolean", "int", "long", "float", "double", "string", "bytes":
-			if ser.branchKinds == nil {
-				ser.branchKinds = make(map[string]int, len(branchNodes))
+			if tags.byKind == nil {
+				tags.byKind = make(map[string]int, len(branchNodes))
 			}
-			if _, exists := ser.branchKinds[branch.kind]; !exists {
-				ser.branchKinds[branch.kind] = i
+			if _, exists := tags.byKind[branch.kind]; !exists {
+				tags.byKind[branch.kind] = i
 			}
 		}
 	}
@@ -2362,21 +2380,59 @@ func (b *builder) buildUnion(parentName string, s *aschema) error {
 	b.node = &schemaNode{
 		kind:     "union",
 		branches: branchNodes,
+		tags:     tags,
 		ser:      b.ser,
 		deser:    b.deser,
 	}
 	return nil
 }
 
+// unionTags is a union's parse-time name lookup: "which branch does this name
+// select?", answered once and asked by BOTH wires.
+//
+// byName is findUnionBranch's accept-set, built by offering every branch to
+// every unionTagTiers tier. byKind routes a value whose Go type names an Avro
+// primitive kind, and routes nil to the null branch.
+//
+// It is allocated ONCE per union and refilled IN PLACE, never reassigned:
+// finalizeUnionNames rebuilds these tables after forward references bind, and
+// every holder — the serializer and the node — has to see that rebuild rather
+// than keep a stale map. Reassigning a field would leave whichever holder was
+// wired first pointing at the pre-finalize table.
+//
+// The methods tolerate a nil receiver so a caller that holds a union node
+// built without tables (a hand-assembled node in a test) asks once and takes
+// the scan, rather than every caller repeating the nil check.
+type unionTags struct {
+	byName map[string]int // caller-written tag → branch index
+	byKind map[string]int // primitive branch kind → branch index; first wins
+}
+
+func (t *unionTags) branchByName(name string) (int, bool) {
+	if t == nil {
+		return 0, false
+	}
+	i, ok := t.byName[name]
+	return i, ok
+}
+
+func (t *unionTags) branchByKind(kind string) (int, bool) {
+	if t == nil {
+		return 0, false
+	}
+	i, ok := t.byKind[kind]
+	return i, ok
+}
+
 // fillUnionTagTables builds a union's three tag tables: the two the DECODER
-// EMITS (deser.branchNames / deser.logicalNames) and the one the ENCODER
-// RESOLVES a caller-written tagged map through (ser.branchNames).
+// EMITS (deser.branchNames / deser.logicalNames) and the one both ENCODERS and
+// the JSON decoder RESOLVE a caller-written tag through (tags.byName).
 //
 // The emit tables carry one precedence rule — an exact branch name outranks a
 // logical qualifier, the order findUnionBranch resolves in — so a branch never
 // emits a tag the decoder would hand to a different branch. The accept table is
 // built by asking unionTagTiers instead of restating any of it; see below.
-func fillUnionTagTables(ser *serUnion, deser *deserUnion, branches []*schemaNode, standard, logical []string) {
+func fillUnionTagTables(tags *unionTags, deser *deserUnion, branches []*schemaNode, standard, logical []string) {
 	deser.branchNames = append(deser.branchNames[:0], standard...)
 	deser.logicalNames = deser.logicalNames[:0]
 	for i, ln := range logical {
@@ -2407,7 +2463,11 @@ func fillUnionTagTables(ser *serUnion, deser *deserUnion, branches []*schemaNode
 	// bound yet; its exact name is registered from `standard` so the table is
 	// usable in the interim, and finalizeUnionNames rebuilds over the resolved
 	// nodes.
-	ser.branchNames = make(map[string]int, len(standard))
+	if tags.byName == nil {
+		tags.byName = make(map[string]int, len(standard))
+	} else {
+		clear(tags.byName)
+	}
 	// ONE scratch set for the whole walk, not one per tier. Branch count is
 	// set by the schema TEXT — a union of twenty thousand named records is
 	// legal Avro a registry or an OCF header can carry — so the ambiguity
@@ -2459,8 +2519,8 @@ func fillUnionTagTables(ser *serUnion, deser *deserUnion, branches []*schemaNode
 			if tier.guarded && claimCount[claims[i]] > 1 {
 				continue
 			}
-			if _, taken := ser.branchNames[claims[i]]; !taken {
-				ser.branchNames[claims[i]] = i
+			if _, taken := tags.byName[claims[i]]; !taken {
+				tags.byName[claims[i]] = i
 			}
 		}
 	}
@@ -2484,7 +2544,7 @@ func fillUnionTagTables(ser *serUnion, deser *deserUnion, branches []*schemaNode
 //     and the tagged-map encode acceptance use the resolved full name,
 //     matching the JSON side's node-based unionBranchNames and making
 //     the tables identical to what an in-order reference produces.
-func finalizeUnionNames(ser *serUnion, deser *deserUnion, branches []*schemaNode) error {
+func finalizeUnionNames(tags *unionTags, deser *deserUnion, branches []*schemaNode) error {
 	saw := make(map[string]bool, len(branches))
 	for _, n := range branches {
 		key := n.kind
@@ -2501,7 +2561,7 @@ func finalizeUnionNames(ser *serUnion, deser *deserUnion, branches []*schemaNode
 	for i, n := range branches {
 		_, log[i] = unionBranchNames(n)
 	}
-	fillUnionTagTables(ser, deser, branches, std, log)
+	fillUnionTagTables(tags, deser, branches, std, log)
 	return nil
 }
 
@@ -3129,7 +3189,8 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			}
 			seenSymbols[e] = true
 		}
-		b.ser = newSerEnum(o.Symbols).ser
+		symbolIdx := enumSymbolIndex(o.Symbols)
+		b.ser = newSerEnum(o.Symbols, symbolIdx).ser
 		b.deser = (&deserEnum{symbols: o.Symbols}).deser
 		b.meta = fieldMeta{avroType: "enum"}
 
@@ -3140,6 +3201,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			aliases:     qualifyAliases(origAliases, o.Name),
 			bareAliases: bareAliasShorts(origAliases),
 			symbols:     o.Symbols,
+			symbolIdx:   symbolIdx,
 			ser:         b.ser,
 			deser:       b.deser,
 		}

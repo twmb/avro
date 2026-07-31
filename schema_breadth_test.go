@@ -22,6 +22,7 @@ import (
 	_ "crypto/sha256"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -37,6 +38,22 @@ const breadthN = 20000
 
 // breadthBound is the per-cell ceiling. wantAcceptUnder raises it under -race.
 const breadthBound = 500 * time.Millisecond
+
+// breadthParseBound is the ceiling for the two cells that parse the schema TEXT
+// rather than walking an already-parsed tree.
+//
+// A bound only separates linear from quadratic if it sits far above the linear
+// cost, and those two do not qualify at breadthBound: a 20000-branch union is
+// close to a megabyte of JSON, and parsing it is ~140ms (Parse) and ~300ms
+// (SchemaCache.Parse) of legitimate, measured-linear work — doubling the branch
+// count doubles both (x2.03/x2.04/x2.03 and x1.98/x1.87/x2.34 across
+// 5k/10k/20k/40k). At 500ms those cells sat within 1.7x of their own linear
+// cost, so a merely BUSY host crossed the line and the cell reported a
+// complexity change that had not happened. The quadratic passes this column
+// exists to catch measured 1.9s to 32s at this size, so the ceiling below still
+// separates the two classes by more than 2x on each side. Every other cell
+// walks a parsed tree in tens of milliseconds and keeps the tighter bound.
+const breadthParseBound = 1500 * time.Millisecond
 
 //////////////////////////////////////////////////////////////////////////////
 // The entry-point axis, derived from the battery's other columns
@@ -302,11 +319,11 @@ func TestDoSBattery_C10a_UnionTagBreadth(t *testing.T) {
 		union := s.build(breadthN)
 		schema := `{"type":"record","name":"Top","fields":[{"name":"f","type":` + union + `}]}`
 
-		wantAcceptUnder(t, "Parse/wide-union-"+s.tier, breadthBound, func() error {
+		wantAcceptUnder(t, "Parse/wide-union-"+s.tier, breadthParseBound, func() error {
 			_, err := Parse(schema)
 			return err
 		})
-		wantAcceptUnder(t, "SchemaCache.Parse/wide-union-"+s.tier, breadthBound, func() error {
+		wantAcceptUnder(t, "SchemaCache.Parse/wide-union-"+s.tier, breadthParseBound, func() error {
 			var c SchemaCache
 			_, err := c.Parse(schema)
 			return err
@@ -317,7 +334,7 @@ func TestDoSBattery_C10a_UnionTagBreadth(t *testing.T) {
 		fwd := `{"type":"record","name":"Top","fields":[` +
 			`{"name":"a","type":"a.Fwd"},` +
 			`{"name":"f","type":` + union[:len(union)-1] + `,{"type":"record","name":"a.Fwd","fields":[]}]}]}`
-		wantAcceptUnder(t, "Parse/wide-union-forward-ref-"+s.tier, breadthBound, func() error {
+		wantAcceptUnder(t, "Parse/wide-union-forward-ref-"+s.tier, breadthParseBound, func() error {
 			_, err := Parse(fwd)
 			return err
 		})
@@ -660,4 +677,379 @@ func TestDoSBattery_C10c_WideRecordSurfaces(t *testing.T) {
 		_, err := root.Schema()
 		return err
 	})
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// The sibling-KIND axis, derived from schemaNode's own slice fields
+//////////////////////////////////////////////////////////////////////////////
+
+// A schema declares siblings in more than one place. The column above drives
+// exactly one of them — a record's fields — through every entry point, and a
+// union's branches through Parse alone. That left the SHAPE hand-picked per
+// cell, and a shape nobody picked is a shape nobody bounded: the union and enum
+// containers carried per-value passes over their siblings on the JSON side for
+// as long as the column existed.
+//
+// So the shape axis is derived too. Every schemaNode field whose length is set
+// by the schema TEXT is a sibling kind, those fields are read out of the struct
+// by reflection, and each one must be driven or exempted with the reason it
+// cannot grow. A sibling-bearing field added to schemaNode later arrives here
+// with no cell and fails.
+//
+// The second half is the VALUE count. A cell that encodes ONE value against a
+// wide schema cannot see a pass that runs once per value — which is exactly the
+// class the union tag and enum symbol lookups were in. Where a single value's
+// own size is independent of the sibling count, the cells drive many values and
+// place the answer LAST, because a table cannot tell first from last and a scan
+// takes the whole list to reach the end.
+
+// breadthValueN is the value count the per-value cells drive. Chosen with
+// breadthN so a per-value scan of the siblings is seconds of work while a table
+// lookup stays in the milliseconds.
+const breadthValueN = 2000
+
+// breadthSiblingKind is one sibling-bearing schemaNode field and the schemas
+// that grow it.
+type breadthSiblingKind struct {
+	// field is the schemaNode field this kind grows, and is what ties the
+	// table to the reflected set.
+	field string
+	// schema declares n siblings of this kind; twin resolves against it
+	// without being canonically equal to it, so the resolve cells time the
+	// matching rather than the equality short-circuit.
+	schema func(n int) string
+	twin   func(n int) string
+	// value is a datum for schema(n). perValue says whether a single value's
+	// own size is independent of the sibling count: when it is, the cells
+	// drive breadthValueN of them, because that is where a once-per-value pass
+	// over the siblings shows up. When it is not — a record value carries one
+	// entry per field — driving many values would only be timing the values.
+	value    func(n int) any
+	perValue bool
+}
+
+func breadthAliasList(n int, qualified bool) string {
+	var sb strings.Builder
+	for i := range n {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		if qualified {
+			fmt.Fprintf(&sb, `"ns%d.A%d"`, i, i)
+		} else {
+			fmt.Fprintf(&sb, `"A%d"`, i)
+		}
+	}
+	return sb.String()
+}
+
+// breadthAliasedRecord wraps the aliased record in an array so a cell can drive
+// many values through it: the alias list's length is independent of a value's
+// size, so a per-value pass over it is exactly the shape worth bounding.
+func breadthAliasedRecord(n int, qualified bool, fieldType string) string {
+	return fmt.Sprintf(`{"type":"array","items":{"type":"record","name":"x.R","aliases":[%s],"fields":[{"name":"f","type":%q}]}}`,
+		breadthAliasList(n, qualified), fieldType)
+}
+
+// breadthWideUnionArray wraps a union of n named records in an array so a cell
+// can drive many values through one schema. The LAST branch is the one the
+// values name.
+func breadthWideUnionArray(ns string, n int) string {
+	var sb strings.Builder
+	sb.WriteString(`{"type":"array","items":["null"`)
+	for i := range n {
+		fmt.Fprintf(&sb, `,{"type":"record","name":"%s.R%d","fields":[]}`, ns, i)
+	}
+	sb.WriteString(`]}`)
+	return sb.String()
+}
+
+func breadthWideEnumArray(n int, defaulted bool) string {
+	var sb strings.Builder
+	sb.WriteString(`{"type":"array","items":{"type":"enum","name":"E","symbols":[`)
+	for i := range n {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, `"S%d"`, i)
+	}
+	sb.WriteString(`]`)
+	if defaulted {
+		sb.WriteString(`,"default":"S0"`)
+	}
+	sb.WriteString(`}}`)
+	return sb.String()
+}
+
+// breadthSiblingKinds is the table the reflected field set is checked against.
+var breadthSiblingKinds = []breadthSiblingKind{
+	{
+		field:  "fields",
+		schema: breadthLongFields("f", nil, false),
+		// int fields promote into the long ones, so the pair resolves and the
+		// canonical forms differ.
+		twin: func(n int) string {
+			var sb strings.Builder
+			sb.WriteString(`{"type":"record","name":"Top","fields":[`)
+			for i := range n {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				fmt.Fprintf(&sb, `{"name":"f%d","type":"int"}`, i)
+			}
+			sb.WriteString(`]}`)
+			return sb.String()
+		},
+		value: func(n int) any {
+			m := make(map[string]any, n)
+			for i := range n {
+				m[fmt.Sprintf("f%d", i)] = int64(i)
+			}
+			return m
+		},
+		perValue: false,
+	},
+	{
+		field:  "branches",
+		schema: func(n int) string { return breadthWideUnionArray("a", n) },
+		// A different namespace, so the branches match on the unqualified
+		// short name rather than short-circuiting on canonical equality.
+		twin: func(n int) string { return breadthWideUnionArray("b", n) },
+		value: func(n int) any {
+			// The LAST branch: a scan has to walk every earlier one to reach it.
+			tag := fmt.Sprintf("a.R%d", n-1)
+			vals := make([]any, breadthValueN)
+			for i := range vals {
+				vals[i] = map[string]any{tag: map[string]any{}}
+			}
+			return vals
+		},
+		perValue: true,
+	},
+	{
+		field:  "symbols",
+		schema: func(n int) string { return breadthWideEnumArray(n, false) },
+		// One fewer symbol on the writer side, all of them present in the
+		// reader, so the pair resolves and is not canonically equal.
+		twin: func(n int) string { return breadthWideEnumArray(n-1, false) },
+		value: func(n int) any {
+			last := fmt.Sprintf("S%d", n-1)
+			vals := make([]string, breadthValueN)
+			for i := range vals {
+				vals[i] = last
+			}
+			return vals
+		},
+		perValue: true,
+	},
+	{
+		field:  "aliases",
+		schema: func(n int) string { return breadthAliasedRecord(n, true, "long") },
+		twin:   func(n int) string { return breadthAliasedRecord(n, true, "int") },
+		value: func(n int) any {
+			vals := make([]any, breadthValueN)
+			for i := range vals {
+				vals[i] = map[string]any{"f": int64(i)}
+			}
+			return vals
+		},
+		perValue: true,
+	},
+	{
+		field: "bareAliases",
+		// An alias declared WITHOUT a dot lands in bareAliases as well, which
+		// is the slice the short-name match tier reads.
+		schema: func(n int) string { return breadthAliasedRecord(n, false, "long") },
+		twin:   func(n int) string { return breadthAliasedRecord(n, false, "int") },
+		value: func(n int) any {
+			vals := make([]any, breadthValueN)
+			for i := range vals {
+				vals[i] = map[string]any{"f": int64(i)}
+			}
+			return vals
+		},
+		perValue: true,
+	},
+}
+
+// breadthSiblingExempt names schemaNode slice fields with no schema-text
+// length, and why. An exemption is a claim that the field cannot grow with what
+// a caller writes.
+//
+// It is empty today, and that is the honest state rather than an oversight:
+// every slice schemaNode carries is filled from something the schema declares,
+// so every one of them is driven. The map stays because the next slice field
+// added may not be — and an exemption without a reason is how a cell goes
+// missing quietly. Slices on the SERIALIZERS (deserUnion's index→name lists)
+// are sized by the branch count and are grown by the branches row; they are not
+// schemaNode fields and so are outside what the reflection reads.
+var breadthSiblingExempt = map[string]string{}
+
+// breadthSiblingFieldSet reads every slice-valued schemaNode field out of the
+// struct. Slice-valued is the mechanical form of "its length comes from the
+// schema text": every one of them is filled by the builder from something the
+// schema declares.
+func breadthSiblingFieldSet() []string {
+	rt := reflect.TypeFor[schemaNode]()
+	var out []string
+	for i := range rt.NumField() {
+		if f := rt.Field(i); f.Type.Kind() == reflect.Slice {
+			out = append(out, f.Name)
+		}
+	}
+	return out
+}
+
+// TestInvariant_EveryBreadthSiblingKindIsCelled derives the sibling-kind axis
+// from schemaNode instead of listing it. Adding a slice field to schemaNode
+// declares a new way for a caller to make a schema wide; this fails until that
+// way is either driven or exempted with the reason it cannot grow.
+func TestInvariant_EveryBreadthSiblingKindIsCelled(t *testing.T) {
+	derived := breadthSiblingFieldSet()
+	if len(derived) == 0 {
+		t.Fatal("the reflection found no slice fields on schemaNode at all — this guard is watching nothing")
+	}
+	celled := map[string]bool{}
+	for _, k := range breadthSiblingKinds {
+		if celled[k.field] {
+			t.Errorf("two breadthSiblingKinds entries both drive %s", k.field)
+		}
+		celled[k.field] = true
+	}
+	for _, field := range derived {
+		if celled[field] || breadthSiblingExempt[field] != "" {
+			continue
+		}
+		t.Errorf("schemaNode.%s is a slice whose length comes from the schema text, and no breadth cell drives it.\n"+
+			"  A caller chooses how many of these a schema declares, so every pass over them has to stay linear.\n"+
+			"  Add a breadthSiblingKinds entry, or a breadthSiblingExempt entry saying why the length cannot grow.", field)
+	}
+	for field := range celled {
+		if !slices.Contains(derived, field) {
+			t.Errorf("breadthSiblingKinds drives %q, which is not a slice field on schemaNode — the cell is watching a field that moved or was renamed", field)
+		}
+	}
+	for field := range breadthSiblingExempt {
+		if !slices.Contains(derived, field) {
+			t.Errorf("breadthSiblingExempt names %q, which schemaNode no longer has — the exemption is stale", field)
+		}
+	}
+	t.Logf("schemaNode sibling slices: %d, celled %d, exempt %d", len(derived), len(celled), len(breadthSiblingExempt))
+}
+
+// TestDoSBattery_C10d_SiblingKindSurfaces crosses every entry point with every
+// sibling kind. The record column above is one row of this cross; the rows that
+// did not exist are where both of the per-value lookups hid.
+func TestDoSBattery_C10d_SiblingKindSurfaces(t *testing.T) {
+	for _, kind := range breadthSiblingKinds {
+		t.Run(kind.field, func(t *testing.T) {
+			text := kind.schema(breadthN)
+			s, err := Parse(text)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			twinText := kind.twin(breadthN)
+			twin, err := Parse(twinText)
+			if err != nil {
+				t.Fatalf("parse twin: %v", err)
+			}
+			// A twin canonically equal to the schema takes Resolve's equality
+			// short-circuit, and the resolve cells would time that instead of
+			// the sibling matching they exist to bound.
+			if string(s.Canonical()) == string(twin.Canonical()) {
+				t.Fatal("the twin is canonically equal to the schema, so the resolve cells would time the equality short-circuit rather than the match")
+			}
+			val := kind.value(breadthN)
+			wire, err := s.Encode(val)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			jsonWire, err := s.EncodeJSON(val)
+			if err != nil {
+				t.Fatalf("encode json: %v", err)
+			}
+			soe, err := s.AppendSingleObject(nil, val)
+			if err != nil {
+				t.Fatalf("single object: %v", err)
+			}
+
+			label := func(entry string) string { return entry + "/wide-" + kind.field }
+			wantAcceptUnder(t, label("Parse"), breadthParseBound, func() error {
+				_, err := Parse(text)
+				return err
+			})
+			wantAcceptUnder(t, label("SchemaCache.Parse"), breadthParseBound, func() error {
+				var c SchemaCache
+				_, err := c.Parse(text)
+				return err
+			})
+			wantAcceptUnder(t, label("Resolve"), breadthBound, func() error {
+				_, err := Resolve(twin, s)
+				return err
+			})
+			wantAcceptUnder(t, label("CheckCompatibility"), breadthBound, func() error {
+				return CheckCompatibility(twin, s)
+			})
+			wantAcceptUnder(t, label("Encode"), breadthBound, func() error {
+				_, err := s.Encode(val)
+				return err
+			})
+			wantAcceptUnder(t, label("Decode"), breadthBound, func() error {
+				var out any
+				_, err := s.Decode(wire, &out)
+				return err
+			})
+			wantAcceptUnder(t, label("EncodeJSON"), breadthBound, func() error {
+				_, err := s.EncodeJSON(val)
+				return err
+			})
+			wantAcceptUnder(t, label("DecodeJSON"), breadthBound, func() error {
+				var out any
+				return s.DecodeJSON(jsonWire, &out)
+			})
+			// The tagged form routes every value through the union tag table
+			// rather than through try-each, which is the consumer the bare
+			// form never reaches.
+			wantAcceptUnder(t, label("DecodeJSON+TaggedUnions"), breadthBound, func() error {
+				var out any
+				return s.DecodeJSON(jsonWire, &out, TaggedUnions())
+			})
+			wantAcceptUnder(t, label("AppendSingleObject"), breadthBound, func() error {
+				_, err := s.AppendSingleObject(nil, val)
+				return err
+			})
+			wantAcceptUnder(t, label("DecodeSingleObject"), breadthBound, func() error {
+				var out any
+				_, err := s.DecodeSingleObject(soe, &out)
+				return err
+			})
+			wantAcceptUnder(t, label("Canonical"), breadthBound, func() error {
+				if len(s.Canonical()) == 0 {
+					return fmt.Errorf("empty canonical form")
+				}
+				return nil
+			})
+			wantAcceptUnder(t, label("Fingerprint"), breadthBound, func() error {
+				if len(s.Fingerprint(crypto.SHA256.New())) == 0 {
+					return fmt.Errorf("empty fingerprint")
+				}
+				return nil
+			})
+			wantAcceptUnder(t, label("String"), breadthBound, func() error {
+				if len(s.String()) == 0 {
+					return fmt.Errorf("empty string form")
+				}
+				return nil
+			})
+			var root SchemaNode
+			wantAcceptUnder(t, label("Root"), breadthBound, func() error {
+				root = s.Root()
+				return nil
+			})
+			wantAcceptUnder(t, label("SchemaNode.Schema"), breadthBound, func() error {
+				_, err := root.Schema()
+				return err
+			})
+		})
+	}
 }

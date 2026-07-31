@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -745,7 +744,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		// string types fall through to textValue, so uniformity holds.
 		if v.Type() == stringType {
 			needle := v.String()
-			if slices.Contains(node.symbols, needle) {
+			if _, ok := node.symbolIndex(needle); ok {
 				return appendJSONString(buf, needle), nil
 			}
 			// A value naming no symbol is the same user-value failure the
@@ -761,7 +760,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 		if text, ok, err := textValue(v, "enum"); err != nil {
 			return nil, err
 		} else if ok {
-			if slices.Contains(node.symbols, text) {
+			if _, ok := node.symbolIndex(text); ok {
 				return appendJSONString(buf, text), nil
 			}
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(text))}
@@ -774,7 +773,7 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 				return nil, err
 			}
 			needle := v.String()
-			if slices.Contains(node.symbols, needle) {
+			if _, ok := node.symbolIndex(needle); ok {
 				return appendJSONString(buf, needle), nil
 			}
 			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown enum symbol %q", truncForError(needle))}
@@ -1253,10 +1252,8 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 	// producing a binary↔JSON parity gap for the 2-branch case and a
 	// binary 2-branch↔3-branch inconsistency for the N-branch case.
 	if isNilValue(v) {
-		for _, branch := range node.branches {
-			if branch.kind == "null" {
-				return appendUnionBranch(buf, node, branch, []byte("null"), cfg), nil
-			}
+		if branch := unionBranchOfKind(node, "null"); branch != nil {
+			return appendUnionBranch(buf, node, branch, []byte("null"), cfg), nil
 		}
 	}
 
@@ -1267,10 +1264,9 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 	// numeric value that needs promotion via the encoder's lenient
 	// arms — try-each preserves those paths).
 	if name := unionTypeNameForValue(v); name != "" {
-		for _, branch := range node.branches {
-			if branch.kind != name {
-				continue
-			}
+		if branch := unionBranchOfKind(node, name); branch != nil {
+			// Only one branch has this kind, so there is nothing to fall
+			// through TO — a failure here goes straight to try-each.
 			encoded, err := appendAvroJSON(nil, v, branch, cfg, custom, depth+1)
 			if err == nil {
 				return appendUnionBranch(buf, node, branch, encoded, cfg), nil
@@ -1278,7 +1274,6 @@ func appendAvroJSONUnion(buf []byte, v reflect.Value, node *schemaNode, cfg *opt
 			if errors.Is(err, errTooDeep) {
 				return nil, err
 			}
-			break // only one branch has this kind; don't waste cycles
 		}
 	}
 
@@ -1468,6 +1463,7 @@ func appendTaggedUnion(buf []byte, union, branch *schemaNode, encoded []byte, ta
 //     unqualified-name tier, not in union-tag decoding). Only applied
 //     when the input has no namespace AND exactly one branch matches by
 //     short name; ambiguous cases return no match rather than guess.
+//
 // unionTagTier is one tier of the union tag namespace: the rule by which a tag
 // a caller wrote names a branch. A tier answers ONE question — which name does
 // this tier make this branch answer to — and both consumers of the namespace
@@ -1576,6 +1572,51 @@ var unionTagTiers = []unionTagTier{
 }
 
 func findUnionBranch(union *schemaNode, name string) *schemaNode {
+	// The tier walk below is the RULE; unionTags.byName is that rule already
+	// applied, once, at parse time. Asking the table here is what keeps this
+	// question O(1) per value: a union's branch count is chosen by whoever
+	// wrote the schema, and this is asked once per union value decoded or
+	// encoded, so a scan multiplies two numbers a caller picks.
+	//
+	// A node without a table (hand-assembled, never parsed) falls through to
+	// the walk, which is the same answer computed the slow way rather than a
+	// different one. TestInvariant_UnionTagTableMatchesTheTierWalk drives the
+	// two against each other so "the same answer" stays true, and
+	// TestInvariant_EveryUnionNodeCarriesItsTagTable rejects a parsed or
+	// resolved node that reaches this fallback at all.
+	if union.tags != nil {
+		i, ok := union.tags.byName[name]
+		if !ok {
+			return nil
+		}
+		return union.branches[i]
+	}
+	return scanUnionBranch(union, name)
+}
+
+// unionBranchOfKind returns the union's first branch of the given Avro kind,
+// or nil. Reads the same table serUnion.ser dispatches through (unionTags.byKind),
+// so the two encoders route a Go value's canonical type name to one branch;
+// a table-less node takes the scan for the same answer.
+func unionBranchOfKind(union *schemaNode, kind string) *schemaNode {
+	if i, ok := union.tags.branchByKind(kind); ok {
+		return union.branches[i]
+	}
+	if union.tags != nil {
+		return nil
+	}
+	for _, b := range union.branches {
+		if b != nil && b.kind == kind {
+			return b
+		}
+	}
+	return nil
+}
+
+// scanUnionBranch answers findUnionBranch's question by walking unionTagTiers
+// directly. It is the tier rule in executable form — the table fillUnionTagTables
+// builds is this walk's result — and stays the fallback for a table-less node.
+func scanUnionBranch(union *schemaNode, name string) *schemaNode {
 	for _, tier := range unionTagTiers {
 		var match *schemaNode
 		for _, b := range union.branches {

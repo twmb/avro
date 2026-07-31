@@ -638,8 +638,12 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 		aliases:     r.aliases,
 		bareAliases: r.bareAliases,
 		symbols:     r.symbols,
-		ser:         r.ser,
-		deser:       deser,
+		// The symbol slice is the reader's, so its lookup is too. A
+		// resolved node that carries the siblings without the table sends
+		// every consumer back to scanning them.
+		symbolIdx: r.symbolIdx,
+		ser:       r.ser,
+		deser:     deser,
 	}
 	ctx.applyCustomToNode(nd, r)
 	return nd, nil
@@ -738,7 +742,7 @@ func resolveWriterUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 // Resolver.java:634/:666). Single-pass would silently produce float64
 // for an int writer when the reader is ["double","int"].
 func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
-	rb := findMatchingBranch(r, w)
+	rb := newReaderBranchLookup(r).match(w)
 	if rb == nil {
 		return nil, &CompatibilityError{
 			Path:       pathOrRoot(path),
@@ -773,8 +777,11 @@ func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 	return &schemaNode{
 		kind:     "union",
 		branches: r.branches,
-		ser:      r.ser,
-		deser:    deser,
+		// Same slice, same table: the indexes in tags address r.branches,
+		// which is exactly what this node carries.
+		tags:  r.tags,
+		ser:   r.ser,
+		deser: deser,
 	}, nil
 }
 
@@ -784,8 +791,11 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 	branchDesers := make([]deserfn, len(w.branches))
 	bnames := make([]string, len(w.branches))
 	lnames := make([]string, len(w.branches))
+	// Built once for the whole loop: this asks per WRITER branch, and the
+	// answer is a property of the READER union.
+	readerBranches := newReaderBranchLookup(r)
 	for i, wb := range w.branches {
-		rb := findMatchingBranch(r, wb)
+		rb := readerBranches.match(wb)
 		if rb == nil {
 			return nil, &CompatibilityError{
 				Path:       pathOrRoot(path),
@@ -817,8 +827,11 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 	return &schemaNode{
 		kind:     "union",
 		branches: r.branches,
-		ser:      r.ser,
-		deser:    deser,
+		// Same slice, same table: the indexes in tags address r.branches,
+		// which is exactly what this node carries.
+		tags:  r.tags,
+		ser:   r.ser,
+		deser: deser,
 	}, nil
 }
 

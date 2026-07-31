@@ -96,10 +96,20 @@ var censusRegistry = []censusQuestion{
 				repr: "compiled schemaNode", site: "kind == \"null\" (json_codec.go, json_decode.go, resolve.go)", file: "json_codec.go",
 				note: "different-by-design: the BUILDER normalizes both spellings into schemaNode.kind, so by the time these sites run there is only one spelling left to compare. A shared predicate here would wrap a field read that is already canonical. The census driver is what proves the normalization actually holds — it asks these sites the same question as the two as-written predicates and requires the same answer.",
 			},
+			{
+				repr: "compiled schemaNode, by TABLE", site: "unionBranchOfKind(node, \"null\") / serUnion's tags.branchByKind(\"null\")", file: "json_codec.go",
+				note: "the JSON and binary encoders' nil-first dispatch asks WHICH branch is the null one, once per value. Both read unionTags.byKind, which schema.go's buildUnion keys off branch.kind — so the comparison still happens, once at parse time, in the case arm that builds the table. Registered as its own answerer because the tell for the comparison form cannot see a map lookup: the question is spelled as an argument here, and a site that changes which kind string it passes would otherwise be invisible to this census.",
+			},
 		},
 		tells: []censusTell{
+			{pattern: `unionBranchOfKind(node, "null")`, counts: map[string]int{
+				"json_codec.go": 1,
+			}},
+			{pattern: `branchByKind("null")`, counts: map[string]int{
+				"ser.go": 1,
+			}},
 			{pattern: `== "null"`, counts: map[string]int{
-				"json_codec.go":  7,
+				"json_codec.go":  6,
 				"json_decode.go": 2,
 				"resolve.go":     1,
 				"schema_for.go":  2, // both inside isNullBranchTree
@@ -769,7 +779,7 @@ var censusRegistry = []censusQuestion{
 			},
 			{
 				repr: "the ACCEPT side, both wires", site: "unionTagTiers", file: "json_codec.go",
-				note: "the accept question is the INVERSE of the emit question — which branch does a caller-written tag name — and it has its own authority: findUnionBranch's tier order. Both of its consumers (findUnionBranch itself, and fillUnionTagTables building ser.branchNames) WALK unionTagTiers, so the accept-sets are equal by construction rather than by agreement. Registered here because emitting a tag no consumer accepts, or accepting one on a single wire, are the same defect seen from two ends. Guarded by TestInvariant_UnionTagTiersAreDerived (source: neither consumer may open-code a tier) and TestInvariant_EveryUnionTagTierIsReachable (a tier no corpus reaches ships unexercised).",
+				note: "the accept question is the INVERSE of the emit question — which branch does a caller-written tag name — and it has its own authority: the tier order in unionTagTiers. There is now ONE walk of it, in fillUnionTagTables, whose result is unionTags.byName; every consumer (the binary tagged-map encoder, the JSON encoder, the JSON decoder) asks that table, and findUnionBranch is the ask. So the accept-sets are equal by IDENTITY rather than by two walks agreeing. scanUnionBranch keeps the walk as the fallback for a node built without a table and as the net's oracle. Registered here because emitting a tag no consumer accepts, or accepting one on a single wire, are the same defect seen from two ends. Guarded by TestInvariant_UnionTagTiersAreDerived (source: the walk stays in one place and findUnionBranch may not re-open it), TestInvariant_EveryUnionTagTierIsReachable (a tier no corpus reaches ships unexercised), TestInvariant_UnionTagTableMatchesTheTierWalk (the table answers what the walk answers) and TestInvariant_EveryUnionNodeCarriesItsTagTable (a node holding branches without the table sends its consumers back to the walk, once per value).",
 			},
 		},
 		tells: []censusTell{

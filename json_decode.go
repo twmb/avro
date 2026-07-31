@@ -696,14 +696,13 @@ func (ctx *jsonDecoder) decodeEnum(v reflect.Value, node *schemaNode) error {
 	if err != nil {
 		return err
 	}
-	idx := -1
-	for i, sym := range node.symbols {
-		if sym == s {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+	// Through the node's shared symbol table, not a scan of the symbol
+	// slice: an enum's symbol count is set by the schema text and this runs
+	// once per value, so a scan multiplies two caller-chosen numbers. The
+	// binary encoder resolves the same question through the same table
+	// (serEnum.indexOfSymbol).
+	idx, ok := node.symbolIndex(s)
+	if !ok {
 		return fmt.Errorf("avro json: unknown enum symbol %q", truncForError(s))
 	}
 	// Mirrors deserEnum's target dispatch: Interface→symbol; String→symbol;

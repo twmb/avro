@@ -72,17 +72,28 @@ func funcBody(t *testing.T, file, fn string) string {
 // "<kind>.<logicalType>" spelling came to be honored by the resolver and not
 // by the lookup table.
 func TestInvariant_UnionTagTiersAreDerived(t *testing.T) {
-	resolver := funcBody(t, "json_codec.go", "findUnionBranch")
+	resolver := funcBody(t, "json_codec.go", "scanUnionBranch")
 	if n := strings.Count(resolver, "range unionTagTiers"); n != 1 {
-		t.Errorf("findUnionBranch walks the tier slice %d times, want exactly 1", n)
+		t.Errorf("scanUnionBranch walks the tier slice %d times, want exactly 1", n)
 	}
 	// One scan over the branches, and it must be the one INSIDE the tier walk.
 	// A second scan is a hand-written tier: it answers names the lookup table
 	// will never register.
 	if n := strings.Count(resolver, "range union.branches"); n != 1 {
-		t.Errorf("findUnionBranch scans union.branches %d times, want exactly 1 (inside the tier walk).\n"+
+		t.Errorf("scanUnionBranch scans union.branches %d times, want exactly 1 (inside the tier walk).\n"+
 			"A scan outside the walk is a tier only the resolver knows about; move it into unionTagTiers "+
 			"so fillUnionTagTables honors it too.", n)
+	}
+	// The name a caller writes is resolved through the parse-time table, not
+	// by re-walking the tiers per value. A tier walk reappearing here is both
+	// a per-value cost linear in the branch count and a second place the tier
+	// rule could be stated.
+	lookup := funcBody(t, "json_codec.go", "findUnionBranch")
+	if n := strings.Count(lookup, "range unionTagTiers"); n != 0 {
+		t.Errorf("findUnionBranch walks the tier slice %d times, want 0 — it must ask the table the walk already built", n)
+	}
+	if !strings.Contains(lookup, "union.tags.byName[name]") {
+		t.Error("findUnionBranch no longer reads unionTags.byName; the per-value question has to be answered by the table")
 	}
 	builder := funcBody(t, "schema.go", "fillUnionTagTables")
 	if n := strings.Count(builder, "range unionTagTiers"); n != 1 {

@@ -65,14 +65,14 @@ func (s *Schema) Encode(v any, opts ...Opt) ([]byte, error) {
 ///////////
 
 type serUnion struct {
-	fns         []serfn
-	branchNames map[string]int // branch name → index for tagged union map unwrapping
-	// branchKinds maps an Avro primitive kind name (boolean, int, long,
-	// float, double, string, bytes) to its branch index when the union
-	// contains exactly one branch of that kind. Used by ser to prefer
-	// a type-name match over try-each — mirrors Java's
-	// GenericData.resolveUnion and hamba/fastavro's name-based dispatch.
-	branchKinds map[string]int
+	fns []serfn
+	// tags is the union's name lookup, shared with the union's schemaNode
+	// (schema.go) so the binary and JSON encoders and the JSON decoder all
+	// resolve a caller-written tag and a Go-type name through ONE table.
+	// byName unwraps a tagged union map; byKind prefers a type-name match
+	// over try-each — mirroring Java's GenericData.resolveUnion and
+	// hamba/fastavro's name-based dispatch — and routes nil to null.
+	tags *unionTags
 }
 
 // tryUnwrapTagged checks if v is a single-key map whose key matches a
@@ -97,7 +97,7 @@ func (s *serUnion) tryUnwrapTagged(v reflect.Value) (int, reflect.Value, bool) {
 	}
 	iter := v.MapRange()
 	iter.Next()
-	if idx, ok := s.branchNames[iter.Key().String()]; ok {
+	if idx, ok := s.tags.branchByName(iter.Key().String()); ok {
 		return idx, iter.Value(), true
 	}
 	return 0, v, false
@@ -131,13 +131,13 @@ func (s *serUnion) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) {
 	// ["null","int","bytes"] routed to "bytes" (empty bytes) while the
 	// 2-branch sibling ["null","bytes"] routed to null. The two
 	// behaviors now agree.
-	if nullIdx, ok := s.branchKinds["null"]; ok && isNilValue(v) {
+	if nullIdx, ok := s.tags.branchByKind("null"); ok && isNilValue(v) {
 		return appendVarint(dst, int32(nullIdx)), nil
 	}
 
 	base := dst
 	if name := unionTypeNameForValue(v); name != "" {
-		if idx, ok := s.branchKinds[name]; ok {
+		if idx, ok := s.tags.branchByKind(name); ok {
 			attempt := appendVarint(base, int32(idx))
 			if result, err := s.fns[idx](attempt, v, depth+1); err == nil {
 				return result, nil
@@ -1355,36 +1355,66 @@ func (s *serRecord) ser(dst []byte, v reflect.Value, depth int) ([]byte, error) 
 
 type serEnum struct {
 	symbols []string
-	// symbolIdx maps symbol → index for O(1) lookup; nil for small enums
-	// (≤8) where the linear scan is faster than a map lookup. Built once
-	// at schema-build time to avoid lock-or-race choices on the hot path.
+	// symbolIdx is the shared symbol → ordinal lookup; see enumSymbolIndex
+	// for when it is nil. The enum's schemaNode holds the same map, so the
+	// JSON arms resolve a symbol through this table too rather than
+	// scanning the symbol slice once per value.
 	symbolIdx map[string]int
 }
 
-// newSerEnum constructs a serEnum with an optional lookup index.
-func newSerEnum(symbols []string) *serEnum {
-	e := &serEnum{symbols: symbols}
-	if len(symbols) > 8 {
-		e.symbolIdx = make(map[string]int, len(symbols))
-		for i, sym := range symbols {
-			e.symbolIdx[sym] = i
+// enumIndexMin is the symbol count above which an enum gets a lookup map.
+// Below it the linear scan beats a map lookup and the scan's cost is capped
+// by the constant itself, so both wires stay O(1) in the symbol count either
+// way. ONE threshold, applied here and read by every consumer — a second
+// spelling of it is how the two wires would come to disagree about which
+// enums are cheap to search.
+const enumIndexMin = 8
+
+// enumSymbolIndex builds the symbol → ordinal lookup an enum's consumers
+// share, or nil when the enum is small enough to scan. Built once at
+// schema-build time to avoid lock-or-race choices on the hot path.
+func enumSymbolIndex(symbols []string) map[string]int {
+	if len(symbols) <= enumIndexMin {
+		return nil
+	}
+	idx := make(map[string]int, len(symbols))
+	for i, sym := range symbols {
+		if _, dup := idx[sym]; !dup {
+			idx[sym] = i
 		}
 	}
-	return e
+	return idx
+}
+
+// newSerEnum constructs a serEnum sharing idx with the enum's schemaNode.
+func newSerEnum(symbols []string, idx map[string]int) *serEnum {
+	return &serEnum{symbols: symbols, symbolIdx: idx}
 }
 
 // indexOfSymbol resolves a symbol name to its ordinal.
 func (s *serEnum) indexOfSymbol(needle string) (int, bool) {
-	if s.symbolIdx != nil {
-		i, ok := s.symbolIdx[needle]
+	return lookupEnumSymbol(s.symbols, s.symbolIdx, needle)
+}
+
+// lookupEnumSymbol resolves a symbol name to its ordinal against an enum's
+// symbols and its (possibly nil) index. Both wires ask through here, so the
+// binary encoder cannot be answering from a table while a JSON arm scans.
+func lookupEnumSymbol(symbols []string, idx map[string]int, needle string) (int, bool) {
+	if idx != nil {
+		i, ok := idx[needle]
 		return i, ok
 	}
-	for i, symbol := range s.symbols {
+	for i, symbol := range symbols {
 		if symbol == needle {
 			return i, true
 		}
 	}
 	return 0, false
+}
+
+// symbolIndex resolves a symbol name to its ordinal on an enum node.
+func (n *schemaNode) symbolIndex(needle string) (int, bool) {
+	return lookupEnumSymbol(n.symbols, n.symbolIdx, needle)
 }
 
 // enumOrdinalIndex validates an integer-kind enum carrier as an ordinal in
