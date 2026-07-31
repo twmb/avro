@@ -11131,3 +11131,154 @@ read off the cells themselves, so the claim and the coverage cannot drift apart.
 
 Oracles: suite green, fastavro differential green, `-race` green. Java ABSENT
 (no JVM), so Java-dependent areas remain verified-modulo-Java.
+
+### 2026-07-30 #41 — one table, one wire: the class behind six per-value scans
+
+FULL read-only round at HEAD f29f4c2. Zero behavioral findings; six
+resource-bound findings, five of them one class.
+
+**The class.** A union's tag table and an enum's symbol index are the tier rule
+and the symbol list applied ONCE at parse time. Both were built for the BINARY
+encoder and hung off the SERIALIZER — `serUnion.branchNames`,
+`serUnion.branchKinds`, `serEnum.symbolIdx`. The JSON codec walks
+`*schemaNode`, from which a `*serUnion` is not reachable, so every question
+those tables answer was re-derived per VALUE by scanning the siblings:
+`findUnionBranch` at the JSON encode tagged-map dispatch and the JSON decode
+tagged attempt, `slices.Contains(node.symbols, …)` at three JSON enum encode
+arms, a hand-rolled scan at `decodeEnum`, and two more scans for the nil-to-null
+and Go-type-name dispatches. Cost is values x siblings, both numbers chosen by
+a caller, where the binary twin is O(1).
+
+**Mirroring is the tell, and it is why no existing net could see this.** Each
+scanning site carries a comment saying it mirrors `serUnion.ser` or
+`serEnum.indexOfSymbol`. Every one of those comments is TRUE about the answer
+and silent about the cost, so parity nets, accept-set nets and the differential
+all pass by construction — they compare verdicts, and the verdicts agree. The
+counterexample in the same package is `node.fieldIdx`: the one lookup hung on
+the NODE is the one both wires share, which shows the placement was a choice
+rather than a constraint.
+
+Measured with the answer placed LAST, at the battery's own breadthN=20000:
+DecodeJSON of a tagged union 19.3s, EncodeJSON 19.9s, DecodeJSON of a wide enum
+6.8s, EncodeJSON 6.25s, the type-name dispatch 9.7s, nil-into-a-wide-union 3.1s
+— against 8-33ms for the same values on binary. The sharpest framing is a FIXED
+20000-symbol schema and a 1.17 MB attacker JSON payload: `DecodeJSON` 5.19s vs
+`Decode` 5.58ms on the same 130,000 values, a 931x gap driven entirely by which
+symbol the data names. Placing the answer FIRST instead collapses the JSON cost
+to 36ms, which is the discriminator no value-count-of-one cell can produce.
+
+**The sixth is a different shape.** `findMatchingBranch` is called inside the
+loop over writer branches at both `checkWriterUnion` and `resolveUnionUnion`
+and scans every reader branch, so `Resolve` took 31.8s and `CheckCompatibility`
+15.6s on two 20000-branch unions. Java's `Resolver.firstMatchingBranch`
+(`Resolver.java:632-659`) scans per writer branch too, so this is a COST bound
+this package holds itself to, not a parity fix — and the correction matters,
+because the previous round's authority for the record-field quadratic was
+"Java's lookup is a HashMap", which is true of fields and false of branches.
+
+**Method: the axis the net held constant.** The breadth column had derived its
+entry-point axis from the cells the rest of the battery drives, and passed. But
+every entry-point cell used a wide RECORD and encoded ONE value, so the union
+and enum containers had no cell at all and no once-per-value pass could show.
+The finding came from crossing the entry points with the container kind, which
+is the shape axis nobody had derived.
+
+**Inverse-density front: line coverage, a metric this walk had not used.** At
+96.8% statement coverage, the outliers were `newLogicalObject` (0.0%, zero
+callers, a duplicate of the live inline lift), `appendCanonField`'s six
+attribute branches (unreachable: `canonicalBytes`'s only caller feeds a
+stripped tree, under a comment claiming a "general-purpose writer mode" that
+has no caller), and `jsonNumericInt`'s unguarded `float64` arm — the last
+verified NOT reachable by tracing all three producers of its map to
+`unmarshalAnyPreservePrecision`, which yields int64. The existing test's claim
+that no public path produces a float64 there holds; it was checked rather than
+taken.
+
+Oracles: suite green; fastavro differential green with zero skips (venv rebuilt
+under `~/.cache/avro-audit/`, fastavro 1.12.2, cramjam/zstandard/snappy
+present). Java ABSENT — no JVM on the host — so acceptance, JSON-form and
+value differentials count as un-netted this round.
+
+### 2026-07-30 #42 — hanging the question on the node, and the neuter that came back green
+
+FIX round, START head f29f4c2. All six sites closed; the durable half derives
+the axis that was hand-picked.
+
+**F1 — one table, on the node, asked by both wires.** `unionTags` (byName +
+byKind) and the enum `symbolIdx` now live on `schemaNode` beside `fieldIdx`.
+The table is allocated ONCE per union and refilled IN PLACE rather than
+reassigned, which is what makes `finalizeUnionNames`' post-forward-reference
+rebuild reach every holder: a reassigned field would leave whichever holder was
+wired first pointing at the pre-finalize map. `serUnion` and `serEnum` hold the
+same allocation, so the two wires' accept-sets are equal by IDENTITY rather
+than by two walks agreeing — a stronger statement than the one the census
+previously recorded, and its note was corrected to say so.
+`findUnionBranch` asks the table; `scanUnionBranch` keeps the tier walk as the
+fallback for a table-less node and as the net's oracle. Results, with the
+answer still placed LAST: 19.3s->37ms, 19.9s->14ms, 6.8s->23ms, 6.25s->7.5ms,
+9.7s->8.0ms, 3.1s->2.2ms. The tag position no longer changes the cost at all
+(`a.R0` 36ms vs `a.R19999` 37ms), and that equality IS the table's signature.
+
+**F2 — the rule as data, because mirroring is what this round is about.**
+Indexing a rule is where a rule quietly changes, so the inversion is not
+written twice: `branchMatchTiers` states each rank as the names a reader branch
+ANSWERS TO and the name a writer node ASKS WITH, and both the builder and the
+query read that one table. The promotion rank derives its vocabulary from the
+`promotions` map itself. Since Java scans too, there is no reference to
+re-derive the verdict from and no interop pressure that would surface a drift,
+so the net is verdict IDENTITY against an independently written best-tier scan:
+361 cells, all four ranks driven (exact 28, unqualified 17, promotion 7, none
+309), plus twelve named pins. `Resolve` 31.8s->57ms, `CheckCompatibility`
+15.6s->11.7ms. Every new helper INLINES, including at the three binary
+hot-path call sites, so the indirection costs nothing.
+
+**The durable half: three rounds of deriving one level and listing the next.**
+Depth was built while breadth was prescribed; breadth's entry points were prose
+until they were read off the cells; and then the SHAPE was hand-picked per
+cell, which is exactly what left this class alive. So the shape axis is derived
+too: `reflect.TypeFor[schemaNode]()` reads out every slice-valued field — the
+mechanical form of "its length comes from the schema text" — and each of the
+five must be celled or exempt with a reason, with staleness checked in both
+directions. Crossing them with the entry points at many VALUES with the answer
+placed LAST is the second half, because a cell that encodes one value cannot
+see a once-per-value pass. `aliases` and `bareAliases` had never been driven by
+anything. Attacked both ways: adding a slice field reds naming
+`probeSiblings`; renaming a cell reds naming both the uncovered field and the
+stale entry.
+
+**Eleven attacks, and the one that came back GREEN was the finding.** Neutering
+`resolveUnionUnion`'s table carry passed. The cause is `Resolve` returning
+`node: reader.node` and keeping only the resolved tree's `deser` — so a probe
+on `Resolve`'s result walks the PARSE's output, and the pin that claimed to
+check the resolved carry was asserting nothing. Re-aimed at `resolveNode`
+directly, the three carry sites red with three DISTINCT cells, one each. The
+correction runs the other way too: the fast path does not silently miss on a
+resolved node, because no walker reaches a synthesized node at all. The carry
+is measured defense-in-depth, and the code and the pin now say that rather than
+implying a live consumer.
+
+**A pre-existing cell red under host load, and the root cause was the BOUND.**
+`SchemaCache.Parse/wide-union` hit 505-540ms against a 500ms ceiling. Three
+measurements settled it: the fix made that cell FASTER (pre-fix min 433ms,
+post-fix 316ms), the pass is cleanly linear (x2.03/x2.04/x2.03 for `Parse` and
+x1.98/x1.87/x2.34 for the cache path across 5k/10k/20k/40k branches), and the
+two cells that parse a megabyte of schema TEXT cost ~140ms and ~300ms of real
+linear work. A bound sitting 1.7x above its own measured cost cannot tell
+blowup from host noise. Those two cells were given `breadthParseBound` = 1.5s
+and every tree-walking cell kept 500ms; restoring the old O(n^2) tier dup scan
+reds all nine parse cells at 2.0-2.8s, so the raised ceiling still
+discriminates. Independently reproduced by the maintainer at 2.50-2.85s.
+
+**The standing lesson.** The previous round's remedy was to make a prescription
+EXECUTE rather than to remember better. This round is the same lesson one level
+in: a derived axis only protects the axes below it that are also derived, and
+each of the last three rounds derived one level and hand-listed the next, with
+the hand-listed level holding the next finding every time. The mechanical test
+for whether a level is really derived is whether ADDING a member reds — not
+just whether removing a cell does — because a guard that only notices removals
+lets the next member ship unexercised.
+
+Oracles: suite green; fastavro differential green; `-race` green (280s, zero
+data races), which is what confirms the table shared between node and
+serializer is read-only after build. Java ABSENT (no JVM), so Java-dependent
+areas remain verified-modulo-Java.
