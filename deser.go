@@ -984,19 +984,28 @@ func saturateSchemaMagnitude(n int) int {
 // the container reader's), and a ceiling applied at one leaves three open.
 func schemaMinBytes(n *schemaNode) int {
 	w := minBytesWalk{
-		path:   make(map[*schemaNode]bool),
-		done:   make(map[*schemaNode]int),
-		budget: maxMinBytesVisits,
+		path:      make(map[*schemaNode]bool),
+		done:      make(map[*schemaNode]int),
+		allowance: maxMinBytesWork,
 	}
 	v, _ := w.minBytes(n)
 	return v
 }
 
-// maxMinBytesVisits bounds the node computations one schemaMinBytes call may
-// perform. The memo makes an acyclic graph linear no matter how many paths
-// reach a node, but a CYCLIC one cannot be memoized at all (see minBytesWalk),
-// and a chain whose levels are mutually recursive still fans out per
-// reference. This is the backstop for that residue.
+// maxMinBytesWork bounds the WORK one schemaMinBytes call may perform, counted
+// in children examined. The memo makes an acyclic graph linear no matter how
+// many paths reach a node, but a CYCLIC one cannot be memoized at all (see
+// minBytesWalk), and a chain whose levels are mutually recursive still fans out
+// per reference. This is the backstop for that residue.
+//
+// It is charged per CHILD, not per node entered, and that is the whole point of
+// the constant rather than an implementation detail. Entering a record iterates
+// its own fields, so an allowance spent one unit per entry bounds how many
+// nodes are entered while the cost of each is a SECOND magnitude the schema
+// author picks — and a bound on one factor of a product is not a bound. Charged
+// per child, the unit of the allowance is the unit of the work and the product
+// cannot reappear. walkBudget.takeNodes (schema_node.go) charges the same way
+// for the same reason.
 //
 // Exhausting it is sound in the one direction that matters. Reaching the cap
 // requires a subtree of cyclic references, which means the node the caller
@@ -1004,10 +1013,15 @@ func schemaMinBytes(n *schemaNode) int {
 // costs at least one wire byte, since the reference closing a cycle can be
 // neither `null` nor an all-null record. So the stand-in below is never
 // ABOVE the true minimum, and a bound derived from it is loose rather than
-// wrong. The value is far above the node count of any schema that is not
-// built to hit it: a schema the memo handles never approaches it, which is
-// what TestInvariant_MemoAgreesWithUnmemoizedWalk relies on.
-const maxMinBytesVisits = 1 << 16
+// wrong.
+//
+// The value is far above the work any schema that is not built to hit it costs:
+// the memo makes an acyclic graph cost the sum of its nodes' child counts,
+// which is bounded by the schema TEXT (a field costs bytes to write), so a
+// schema would have to run to tens of megabytes before an honest parse traded
+// its exact bound for the loose one. That headroom is what
+// TestInvariant_MemoAgreesWithUnmemoizedWalk relies on.
+const maxMinBytesWork = 1 << 22
 
 // minBytesWalk carries the state of one schemaMinBytes computation.
 //
@@ -1044,9 +1058,38 @@ const maxMinBytesVisits = 1 << 16
 // consumed from inside X, produce a total that differs from the walk with no
 // memo at all. TestInvariant_MemoAgreesWithUnmemoizedWalk is what settles it.
 type minBytesWalk struct {
-	path   map[*schemaNode]bool // the nodes currently being computed
-	done   map[*schemaNode]int  // results for nodes whose subtree has no cycle
-	budget int                  // node computations left; see maxMinBytesVisits
+	path      map[*schemaNode]bool // the nodes currently being computed
+	done      map[*schemaNode]int  // results for nodes whose subtree has no cycle
+	allowance int                  // children left to examine; see maxMinBytesWork
+}
+
+// take charges n children about to be examined, reporting false once the
+// allowance cannot cover them. Mirrors walkBudget.takeNodes: an over-large
+// request drives the allowance to zero rather than partially spending it, so
+// exhaustion is permanent and every later entry takes the stand-in.
+func (w *minBytesWalk) take(n int) bool {
+	if n > w.allowance {
+		w.allowance = 0
+		return false
+	}
+	w.allowance -= n
+	return true
+}
+
+// minBytesChildren is how many children entering n will examine — the cost of
+// one entry, and so what it is charged. It is read off the same fields
+// minBytesFromChildren iterates, so the charge cannot drift from the work: an
+// arm that grows a new child list has to be added to both or neither. The
+// container arms are absent from both, deliberately — an array or a map
+// answers with its own terminator byte and never descends into its element.
+func minBytesChildren(n *schemaNode) int {
+	switch n.kind {
+	case "union":
+		return len(n.branches)
+	case "record":
+		return len(n.fields)
+	}
+	return 0
 }
 
 // minBytes returns node n's minimum wire bytes and whether n's subtree is
@@ -1064,10 +1107,13 @@ func (w *minBytesWalk) minBytes(n *schemaNode) (int, bool) {
 	if v, ok := w.done[n]; ok {
 		return v, true
 	}
-	if w.budget <= 0 {
+	// Charged BEFORE descending, and charged for the whole child list: the
+	// loops below iterate a count the schema author chose, so charging one
+	// unit for the entry would bound the number of entries and leave the work
+	// each one does unbounded.
+	if !w.take(1 + minBytesChildren(n)) {
 		return 1, false
 	}
-	w.budget--
 	w.path[n] = true
 	v, acyclic := w.minBytesFromChildren(n)
 	delete(w.path, n)

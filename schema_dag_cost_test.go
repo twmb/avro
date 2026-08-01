@@ -691,3 +691,227 @@ func TestInvariant_EveryMinBytesEntryPointIsBounded(t *testing.T) {
 		return err
 	})
 }
+
+// ---------- the WIDTH axis ----------
+
+// dagWideSCC crosses the cyclic shapes with the axis the other cost cells
+// hold constant: how many children ONE node has.
+//
+// dagSingleSCC and dagSelfRecursive fix fan at 2 or 3 because fan is what
+// drives DEPTH — the number of distinct root-to-leaf paths — so every cyclic
+// cell measures the visit allowance times two. But the work a single node
+// costs is its own child count, and that is a SECOND number the schema author
+// picks independently. This shape separates them: the chain stays fan-narrow
+// so the path count still exhausts the allowance, and the record every path
+// ENDS at carries `width` extra fields, so each recomputation of that one
+// record pays `width`.
+//
+// Three properties decide whether this shape measures anything at all, and
+// each was MEASURED at a matched text size of ~124 KB rather than reasoned
+// about — the whole point being that a plausible-looking variant of this
+// schema costs milliseconds and proves the opposite of what it looks like:
+//
+//   - CYCLIC, and that is the enabling one: the wide record closes back to L0,
+//     so every node in the chain is in one strongly-connected component and
+//     nothing is memoizable. Point that back-edge at "int" instead and the
+//     same 124 KB parses in 10.7 ms rather than 6.5 s — 600x — because the
+//     memo then answers each node once and there is no repetition for the
+//     width to multiply.
+//   - CONCENTRATED, and that is the dominant one: a node is recomputed once
+//     per path that reaches it, so revisits are highest at the node every
+//     root-to-leaf path ENDS at. Putting the whole width there is what makes
+//     the most-revisited node also the widest. Spreading the same total width
+//     evenly over the levels instead costs 435 ms against 6.5 s — 15x — since
+//     the allowance is spent on computations, and spreading width over D
+//     levels makes each computation cost width/D.
+//   - ZERO-MINIMUM fillers (`null`), worth 3x on top of the other two (6.5 s
+//     vs 2.2 s for `double`). Not, as it first appears, because a wide record
+//     saturates its own running sum — 4000 doubles is 32000, far under the
+//     ceiling — but because the CHAIN above it doubles that figure per level
+//     and reaches the ceiling a dozen levels up, and a saturated sum returns
+//     EARLY, before the field that continues the fan-out. Nulls keep every
+//     level's minimum small enough that no level short-circuits.
+func dagWideSCC(levels, fan, width int) string {
+	var wide strings.Builder
+	wide.WriteString(`{"type":"record","name":"W","fields":[{"name":"back","type":"L0"}`)
+	for k := range width {
+		fmt.Fprintf(&wide, `,{"name":"p%d","type":"null"}`, k)
+	}
+	wide.WriteString(`]}`)
+
+	inner := wide.String()
+	for i := levels - 1; i >= 0; i-- {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == levels-1 {
+			next = "W"
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, `{"type":"record","name":"L%d","fields":[{"name":"f0","type":%s}`, i, inner)
+		for k := 1; k < fan; k++ {
+			fmt.Fprintf(&b, `,{"name":"f%d","type":"%s"}`, k, next)
+		}
+		b.WriteString(`]}`)
+		inner = b.String()
+	}
+	return inner
+}
+
+// dagWideLevels / dagWideWidth are the width cell's two magnitudes. Levels is
+// chosen so the path count reaches the walk's allowance (a narrower chain
+// never exhausts it and the width has nothing to multiply); width is chosen so
+// that allowance x width is decisively past dosBudget while the schema text
+// stays a few hundred KB and the walk still finishes on its own.
+const (
+	dagWideLevels = 16
+	dagWideWidth  = 8000
+)
+
+// TestInvariant_CyclicWalkCostIsBoundedByWork is the WIDTH half of the cost
+// guard: an allowance spent per NODE ENTERED bounds how many nodes are
+// entered, not how much work they do, so a cap counting entries is bounded
+// only when every entry costs the same. Here they do not — a record's entry
+// iterates its own fields — and both factors are chosen by whoever wrote the
+// schema, so the guard has to be charged in the unit of the work.
+func TestInvariant_CyclicWalkCostIsBoundedByWork(t *testing.T) {
+	for _, tr := range minBytesTriggers {
+		t.Run(tr.name, func(t *testing.T) {
+			s := tr.wrap(dagWideSCC(dagWideLevels, 2, dagWideWidth))
+			parsed, err := Parse(s)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			// Same trigger claim the depth cells check: a shape that reaches
+			// no caller of the walk measures nothing whatever the walk does.
+			if got := schemaAsksMinBytes(parsed.node); got != tr.walks {
+				t.Fatalf("trigger %q is registered as walks=%v but the parsed schema %s a container that asks for a per-element minimum",
+					tr.name, tr.walks, map[bool]string{true: "contains", false: "does not contain"}[got])
+			}
+			wantTerminate(t, "Parse/wide-scc/"+tr.name, func() error {
+				_, err := Parse(s)
+				return err
+			})
+		})
+	}
+}
+
+// TestInvariant_WideCyclicWalkReachesEveryEntryPoint drives the same shape
+// through the entry points that do not take the schema from the caller.
+func TestInvariant_WideCyclicWalkReachesEveryEntryPoint(t *testing.T) {
+	inner := dagWideSCC(dagWideLevels, 2, dagWideWidth)
+	s := `{"type":"array","items":` + inner + `}`
+
+	wantTerminate(t, "SchemaCache.Parse/wide-scc", func() error {
+		var c SchemaCache
+		_, err := c.Parse(s)
+		return err
+	})
+	parsed := MustParse(s)
+	wantTerminate(t, "Resolve/wide-scc", func() error {
+		_, err := Resolve(parsed, parsed)
+		return err
+	})
+	// The writer field is DROPPED, which compiles a skip — a separate
+	// derivation of the same per-element bound.
+	w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + s + `},{"name":"y","type":"int"}]}`)
+	r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
+	wantTerminate(t, "Resolve/wide-scc-dropped-field", func() error {
+		_, err := Resolve(w, r)
+		return err
+	})
+	// ocf-header: the executable cell lives in ocf/dos_battery_test.go
+	// (package avro cannot import ocf); this pins the parse that reaches it.
+	wantTerminate(t, "ocf-header/wide-scc-schema-parse", func() error {
+		_, err := Parse(s)
+		return err
+	})
+}
+
+// TestInvariant_MinBytesChargeCoversEveryChildArm derives the charge's set
+// from source instead of trusting the two switches to stay in step.
+//
+// The allowance is charged by the PARENT, for the whole child list, before it
+// descends — so every child examination is paid for exactly once by whoever
+// performs it. That accounting is complete only while minBytesChildren counts
+// the children of exactly the kinds minBytesFromChildren descends into. They
+// are two switches over the same vocabulary, and a kind added to one alone is
+// silent: an unaccounted arm restores the unbounded product, and an
+// over-counted one spends the allowance on descents that never happen. So the
+// arms are read out of the source and compared rather than reviewed.
+func TestInvariant_MinBytesChargeCoversEveryChildArm(t *testing.T) {
+	src, err := os.ReadFile("deser.go")
+	if err != nil {
+		t.Fatalf("reading deser.go: %v", err)
+	}
+	body := func(sig string) string {
+		i := strings.Index(string(src), sig)
+		if i < 0 {
+			t.Fatalf("%q not found in deser.go — the guard is aimed at a function that no longer exists", sig)
+		}
+		rest := string(src)[i:]
+		if j := strings.Index(rest[1:], "\nfunc "); j >= 0 {
+			rest = rest[:j+1]
+		}
+		return rest
+	}
+	// caseKinds returns the quoted kind labels of every `case` arm in s for
+	// which keep reports true of the arm's body.
+	caseKinds := func(s string, keep func(arm string) bool) map[string]bool {
+		out := map[string]bool{}
+		parts := strings.Split(s, "\n\tcase ")
+		for _, p := range parts[1:] {
+			head, arm, _ := strings.Cut(p, ":")
+			if !keep(arm) {
+				continue
+			}
+			for _, lit := range strings.Split(head, ",") {
+				out[strings.Trim(strings.TrimSpace(lit), `"`)] = true
+			}
+		}
+		return out
+	}
+	charged := caseKinds(body("func minBytesChildren("), func(string) bool { return true })
+	descends := caseKinds(body("func (w *minBytesWalk) minBytesFromChildren("),
+		func(arm string) bool { return strings.Contains(arm, "w.minBytes(") })
+
+	if len(charged) == 0 || len(descends) == 0 {
+		t.Fatalf("extracted no arms (charged=%v descends=%v) — the guard cannot see what it is guarding", charged, descends)
+	}
+	for k := range descends {
+		if !charged[k] {
+			t.Errorf("minBytesFromChildren descends into %q's children but minBytesChildren does not count them: "+
+				"entering such a node costs its child count and is charged as if it cost one, "+
+				"which is the unbounded product this allowance exists to prevent", k)
+		}
+	}
+	for k := range charged {
+		if !descends[k] {
+			t.Errorf("minBytesChildren counts %q's children but minBytesFromChildren never descends into them: "+
+				"the allowance is spent on work that does not happen, tightening the bound for no reason", k)
+		}
+	}
+}
+
+// TestInvariant_MetadataWalkChargesPerChild is the measured half of an
+// immunity claim rather than a read of it. The SchemaNode->JSON walk carries
+// its own allowance, and the reason it has no width residue is structural: it
+// charges takeNode at the TOP of every entry, ahead of the cycle and dedup
+// checks that can return early, so a child costs a unit whether or not the
+// walk descends through it. The min-bytes walk charged AFTER its memo, which
+// is exactly how a memo hit could examine a child for free.
+//
+// A claim like that is worth no more than the probe behind it, so the same
+// wide cyclic shape that took the min-bytes walk past the budget is driven
+// through the metadata surfaces here.
+func TestInvariant_MetadataWalkChargesPerChild(t *testing.T) {
+	s := MustParse(`{"type":"array","items":` + dagWideSCC(dagWideLevels, 2, dagWideWidth) + `}`)
+	wantTerminate(t, "Root+Schema/wide-scc", func() error {
+		root := s.Root()
+		_, _ = root.Schema()
+		return nil
+	})
+	wantTerminate(t, "String+Canonical/wide-scc", func() error {
+		_ = s.String()
+		_ = s.Canonical()
+		return nil
+	})
+}

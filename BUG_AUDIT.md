@@ -11846,3 +11846,145 @@ it mutates nothing, resolves no names, reads no reserved keys, and its descents 
 kind-gated by construction (the array and map arms return without touching items or
 values). It has no error channel, so the silent-degrade posture is the right one
 for its budget. `go test -race ./...` green.
+
+## Distillation archive (2026-08-01 #57) — the c17986f ledger line, verbatim
+
+Compressed out of AUDIT_CORE §Round ledger on 2026-08-01, when that file
+crossed its 55000-byte bound. Its siblings in the same compression pass were
+already archived at their own round ends (#51, #52, #55, #56); this is the one
+that was not. The durable half is P25 (a collection-size assumption written as
+a rationale) plus the breadth column that derives its axes.
+
+- 2026-07-30 · c17986f (FULL, then START head for the FIX) · **0 behavioral; 2 DoS**
+  on an axis the battery had no column for, both quadratic in a caller-chosen SIBLING
+  count; the tag-table one's rationale was an INPUT assumption the introducing round had
+  measured false. **Severity is set by reachability** — `ocf.NewReader` resolves a file's
+  own header schema. P25. Both fixed; the durable half is a breadth column DERIVING its
+  axes. `readerFieldLookup` keeps TWO maps consulted in order — every field NAME outranks
+  every ALIAS, which a merged map reverses; #50 cites that routing, so it is a CONTRACT.
+  **One neuter came back GREEN and that was the finding.** Archive (2026-07-30 #39, #40).
+
+## Distillation archive (2026-08-01 #58) — AUDIT_PATTERNS P28's fix-lessons block, verbatim
+
+Compressed to a pointer on 2026-08-01, when AUDIT_PATTERNS crossed its bound.
+Both lessons are now carried by live code and a permanent net: the memo
+condition is stated on `minBytesWalk` (deser.go) and enforced by
+TestInvariant_MemoAgreesWithUnmemoizedWalk; the budget-vs-memo masking is
+enforced by the value cell and the cost cells reddening disjointly.
+
+  **Fixing it taught three things the shape does not advertise.** (i) The memo
+  condition is not "did a back-edge escape ABOVE me while I was computed" — a
+  result must also be safe to CONSUME, and a later entry has a different path,
+  so a node whose subtree contains any cycle can be re-entered with one of its
+  own descendants on the path and compute a different answer. The exact
+  condition is subtree-cycle-free, and the weaker one is wrong in a way no cost
+  test can see. (ii) Therefore the oracle is agreement with an UN-MEMOIZED
+  transcription of the same walk, run per node: a wrong memo is FASTER, not
+  slower, so cost cells are blind to it, and a fully-expanded twin cannot help
+  because the discriminating schemas are cyclic and have no finite expansion.
+  (iii) A memo and a visit BUDGET bound different things and mask each other:
+  with a budget in place, removing the memo leaves every cost cell green,
+  because the budget stops the walk either way. Give the memo a VALUE cell
+  (the exact answer at a scale only a memo reaches) and the budget the COST
+  cells, or one neuter proves nothing about the other mechanism
+
+## Distillation archive (2026-08-01 #59) — the charge-unit FIX round narrative, verbatim
+
+START head 0e526c2. One DoS from the preceding FULL round fixed, plus the width
+axis the cost cells never had and the guard that keeps the charge honest.
+
+### The finding, and why the preceding round's own cap did not stop it
+
+The DAG round ended by giving `schemaMinBytes` a memo plus a visit budget, and
+the budget's rationale reasoned carefully about what EXHAUSTING it costs in
+correctness — the stand-in is never above the true minimum, so the derived bound
+goes loose rather than wrong — and never about what REACHING it costs in time.
+`maxMinBytesVisits` was decremented once per node entered. Entering a record
+iterates that record's own fields. Both numbers are chosen by whoever wrote the
+schema, so the cost was their product and only one factor was capped: a cyclic
+SCC whose widest record carried 16k fields took `ocf.NewReader` 21.7 s on a
+502 KB file-supplied header.
+
+The cost cells DO carry a cyclic shape — `dagSingleSCC` — and it passed. Its fan
+is 2, because fan is what drives the path count and the cells were built to drive
+DEPTH. Every cyclic cell therefore measured budget x 2. That is the completeness
+critic's shape (B32) landing on a net built one round earlier: the axis was
+named, the deciding magnitude was held constant.
+
+### Reproducing it was the round's real work
+
+The maintainer could not reproduce the magnitude — 13 ms cyclic against 2 ms
+acyclic at 15 KB, and at depth 20 / width 800 no separation at all, cost tracking
+bytes, which is the parser and not the walk. Three orders below the reported
+figure. That is the right place to stop and hand over a constructor, and the
+ruling did.
+
+My first hypothesis was that the discriminator was the filler fields' wire
+minimum: a nonzero minimum makes the record arm's running sum saturate, and a
+saturated sum returns EARLY, before the field that continues the fan-out. It was
+measured and it was wrong as a primary — on the uniform-width shape it moves the
+number by 1.3x (435 ms vs 447 ms). Sending it back as "the property" would have
+produced another shape that did not reproduce.
+
+A matched-size factorial at ~124 KB gives the actual answer, and it is three
+properties rather than one:
+
+  - CYCLIC (600x). Point the back-edge at "int" and the same text parses in
+    10.7 ms: the memo answers each node once and there is no repetition for
+    width to multiply.
+  - CONCENTRATED (15x). A node is recomputed once per path that REACHES it, so
+    revisits peak at the node every root-to-leaf path ENDS at. Putting the whole
+    width there is what makes the most-revisited node also the widest. Spread the
+    same total width over D levels and each computation costs width/D — the
+    deep-but-narrow levels absorb the allowance while the wide-but-shallow ones
+    are barely revisited. That factor of D is why the uniform shape reads as
+    parser-dominated.
+  - ZERO-MINIMUM fillers (3x), and only once the width is concentrated. Not
+    because the wide record saturates its own sum — 4000 doubles is 32000, far
+    under the ceiling — but because the CHAIN above it doubles that figure per
+    level and reaches the ceiling a dozen levels up.
+
+Recorded as `dagWideSCC`, in-repo, with those numbers on it: the constructor is
+the deliverable, because the shape is easy to build slightly wrong and a slightly
+wrong one proves the opposite of what it looks like.
+
+### The fix, and the sharper statement of the class the sweep produced
+
+Charged per CHILD EXAMINED — `1 + minBytesChildren(n)`, taken before descending,
+mirroring `walkBudget.takeNodes` rather than inventing a second discipline. The
+constant is renamed `maxMinBytesWork` because the unit changed, and raised to
+1<<22 so an acyclic schema keeps its exact bound (the memo makes an acyclic walk
+cost the sum of the nodes' child counts, which the schema TEXT bounds).
+
+The sibling sweep is where the class got its real statement. `walkBudget` is
+immune, and the reason is not that it charges bytes — it is WHERE it charges.
+`takeNode` runs at the TOP of every entry, ahead of the cycle and dedup checks
+that can return early, so a child costs a unit whether or not the walk descends
+through it. The min-bytes walk charged AFTER its memo, and that is precisely how
+a memo hit examined a child for free. So the probe for the class is: does any
+path reach real work without passing the charge. That immunity is now MEASURED
+(TestInvariant_MetadataWalkChargesPerChild drives the wide cyclic shape through
+Root().Schema(), String() and Canonical()) rather than read off the source.
+
+Behavior direction, both ways: schemas between the old and the new exhaustion
+points now compute the EXACT minimum where they used to get the stand-in, which
+tightens the derived block bound and rejects only wire claiming more elements
+than could fit; a single record past 4M fields now takes the stand-in where it
+used to compute exactly, which loosens. No test asserted either.
+
+### The guard, and the neuters
+
+The charge and the work are two switches over one vocabulary, and a kind added to
+one alone is silent: an unaccounted arm restores the product, an over-counted one
+spends the allowance on descents that never happen. So they are read out of
+deser.go and compared — TestInvariant_MinBytesChargeCoversEveryChildArm — and
+attacked in both directions, removing the union arm from the charge and adding
+array/map to it.
+
+Four attacks, and the interesting result is that two of them are in SERIES rather
+than disjoint. Charge-per-entry reds ONLY the width cells. Allowance-removed reds
+the cyclic DEPTH cells too. That is B32b: the width cells' operative guard is the
+UNIT, the depth cells' is the allowance's existence, and naming which is which is
+what keeps a later round from deleting one and reading the other's red as
+coverage. The OCF cell reds alone on the charge neuter, RUN=1, which is what says
+the entry point that sets the severity is really driven.

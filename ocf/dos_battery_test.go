@@ -276,6 +276,46 @@ func TestDoSBattery_OCF_C1_Header(t *testing.T) {
 			return err
 		})
 	}
+	// The same DAG with the WIDTH axis turned up. Depth alone is only half of
+	// what a walk over this graph costs: a node is recomputed once per path
+	// that reaches it, and each recomputation iterates that node's OWN field
+	// list, so the cost is a product of two magnitudes the header's author
+	// chooses independently. Holding the second at two — which every depth
+	// cell above does, because two is what makes the path count grow — leaves
+	// the product untested. Here the chain is cyclic (so nothing memoizes) and
+	// the record every path ends at is wide, which is the combination that
+	// makes the most-revisited node also the most expensive one.
+	wantTerminate(t, "NewReader/wide-cyclic-header-schema", func() error {
+		r, err := NewReader(bytes.NewReader(ocfWith(dagWideCyclicHeader(16, 8000), "null", 0, nil)))
+		if r != nil {
+			r.Close()
+		}
+		return err
+	})
+}
+
+// dagWideCyclicHeader builds the header form of the width shape: a fan-2 chain
+// of `levels` records whose deepest member references the shallowest (one
+// strongly-connected component, so no result is memoizable) and carries `width`
+// zero-minimum filler fields. Mirrors dagWideSCC in the avro package, which
+// this package cannot import.
+func dagWideCyclicHeader(levels, width int) string {
+	var wide strings.Builder
+	wide.WriteString(`{"type":"record","name":"W","fields":[{"name":"back","type":"L0"}`)
+	for k := range width {
+		fmt.Fprintf(&wide, `,{"name":"p%d","type":"null"}`, k)
+	}
+	wide.WriteString(`]}`)
+	inner := wide.String()
+	for i := levels - 1; i >= 0; i-- {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == levels-1 {
+			next = "W"
+		}
+		inner = fmt.Sprintf(`{"type":"record","name":"L%d","fields":[{"name":"f0","type":%s},{"name":"f1","type":"%s"}]}`,
+			i, inner, next)
+	}
+	return `{"type":"array","items":` + inner + `}`
 }
 
 // dagRefHeaderNested builds an array-of-record header schema where every level
