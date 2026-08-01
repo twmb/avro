@@ -1534,6 +1534,17 @@ func (b *builder) finalize() error {
 		m.nd.fields[m.idx].node = nt.node
 	}
 	// Phase 1b: wire every forward-referenced array/map container child.
+	//
+	// One walk is shared across the whole loop rather than one per fixup: a
+	// schema can point any number of containers at one forward-referenced
+	// subtree (N array fields all of items "L0"), and each is a distinct fixup
+	// here. A fresh walk per fixup would recompute that subtree N times — for a
+	// cyclic one, N times the full allowance — so the loop's cost would be the
+	// container count times the per-walk bound while only the second factor was
+	// capped. The graph is fully wired by this phase (phase 1a resolved every
+	// field reference), so the shared memo caches exact values for the acyclic
+	// case and the shared allowance bounds the cyclic residue once.
+	mbw := newMinBytesWalk()
 	for _, m := range b.containerFixups {
 		_, nt := b.resolveNamedRef(m.name, m.parentName)
 		if nt == nil {
@@ -1541,7 +1552,7 @@ func (b *builder) finalize() error {
 		}
 		*m.serItem = b.customWrappedSer(nt.node, nt.ser)
 		*m.deserItem = b.customWrappedDeser(nt.node, nt.deser)
-		m.setMinBytes(schemaMinBytes(nt.node))
+		m.setMinBytes(mbw.minBytesOf(nt.node))
 		*m.nodeChild = nt.node
 	}
 	// Phase 2 — deferred field defaults, in two passes. encodeDefault fills

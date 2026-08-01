@@ -86,9 +86,17 @@ func skipRecord(w *schemaNode) skipfn {
 		sl.depth++
 		defer func() { sl.depth-- }()
 		s.once.Do(func() {
+			// One walk for this record's whole field set: the fields can point
+			// many containers at one shared subtree, and compiling them here
+			// (once per record, guarded by once) with a fresh walk per field
+			// would recompute that subtree per field. Sharing bounds the record's
+			// compile cost the way finalize and resolve bound theirs; the cost
+			// across DIFFERENT records is bounded separately because each
+			// record's once.Do fires only when the wire actually reaches it.
+			mbw := newMinBytesWalk()
 			s.fields = make([]skipfn, len(s.node.fields))
 			for i := range s.node.fields {
-				s.fields[i] = buildSkip(s.node.fields[i].node)
+				s.fields[i] = buildSkip(s.node.fields[i].node, mbw)
 			}
 		})
 		var err error
@@ -148,9 +156,9 @@ func skipBlocks(src []byte, sl *slab, blockType string,
 	}
 }
 
-func skipArray(w *schemaNode) skipfn {
-	itemSkip := buildSkip(w.items)
-	minItemBytes := schemaMinBytes(w.items)
+func skipArray(w *schemaNode, mbw *minBytesWalk) skipfn {
+	itemSkip := buildSkip(w.items, mbw)
+	minItemBytes := mbw.minBytesOf(w.items)
 	return func(src []byte, sl *slab) ([]byte, error) {
 		return skipBlocks(src, sl, "array",
 			func(count, total int64, srcLen int) error {
@@ -160,11 +168,11 @@ func skipArray(w *schemaNode) skipfn {
 	}
 }
 
-func skipMap(w *schemaNode) skipfn {
-	valueSkip := buildSkip(w.values)
+func skipMap(w *schemaNode, mbw *minBytesWalk) skipfn {
+	valueSkip := buildSkip(w.values, mbw)
 	// minEntryBytes = 1 (key length varint, ≥1 byte for an empty key) +
 	// the value's minimum wire bytes — identical to deserMap.minEntryBytes.
-	minEntryBytes := 1 + schemaMinBytes(w.values)
+	minEntryBytes := 1 + mbw.minBytesOf(w.values)
 	return func(src []byte, sl *slab) ([]byte, error) {
 		return skipBlocks(src, sl, "map",
 			// Bound the block count against the remaining buffer, matching
@@ -192,10 +200,10 @@ func skipMap(w *schemaNode) skipfn {
 	}
 }
 
-func skipUnion(w *schemaNode) skipfn {
+func skipUnion(w *schemaNode, mbw *minBytesWalk) skipfn {
 	branchSkips := make([]skipfn, len(w.branches))
 	for i, br := range w.branches {
-		branchSkips[i] = buildSkip(br)
+		branchSkips[i] = buildSkip(br, mbw)
 	}
 	return func(src []byte, sl *slab) ([]byte, error) {
 		if sl.depth >= maxDepth {
@@ -225,7 +233,13 @@ var primitiveSkips = map[string]skipfn{
 	"string":  skipString,
 }
 
-func buildSkip(w *schemaNode) skipfn {
+// buildSkip compiles a skipper for writer node w. mbw is the min-bytes walk
+// shared across the containers reached WITHOUT crossing a record boundary — the
+// array/map/union arms consult it and pass it down, so a record-free chain of N
+// nested containers over one shared subtree computes that subtree once. A record
+// breaks the chain: skipRecord compiles its fields lazily and starts its own
+// walk (see there), so mbw does not thread into it.
+func buildSkip(w *schemaNode, mbw *minBytesWalk) skipfn {
 	if f, ok := primitiveSkips[w.kind]; ok {
 		return f
 	}
@@ -235,11 +249,11 @@ func buildSkip(w *schemaNode) skipfn {
 	case "enum":
 		return skipEnum
 	case "array":
-		return skipArray(w)
+		return skipArray(w, mbw)
 	case "map":
-		return skipMap(w)
+		return skipMap(w, mbw)
 	case "union":
-		return skipUnion(w)
+		return skipUnion(w, mbw)
 	case "fixed":
 		return skipFixed(w.size)
 	default:

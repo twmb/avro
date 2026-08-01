@@ -794,7 +794,7 @@ func TestSkipUnion(t *testing.T) {
 	sentinel := byte(0xFE)
 	data := append(encoded, sentinel)
 
-	skip := buildSkip(s.node)
+	skip := buildSkip(s.node, newMinBytesWalk())
 	rem, err := skip(data, &slab{})
 	if err != nil {
 		t.Fatal(err)
@@ -841,7 +841,7 @@ func TestSkipFunctions(t *testing.T) {
 			sentinel := byte(0xFE)
 			data := append(encoded, sentinel)
 
-			skip := buildSkip(s.node)
+			skip := buildSkip(s.node, newMinBytesWalk())
 			rem, err := skip(data, &slab{})
 			if err != nil {
 				t.Fatal(err)
@@ -1431,7 +1431,7 @@ func TestSkipFixedShortBuffer(t *testing.T) {
 func TestSkipArrayErrors(t *testing.T) {
 	intNode := &schemaNode{kind: "int"}
 	arrNode := &schemaNode{kind: "array", items: intNode}
-	skip := buildSkip(arrNode)
+	skip := buildSkip(arrNode, newMinBytesWalk())
 
 	// Empty buffer: readVarlong fails.
 	_, err := skip(nil, &slab{})
@@ -1485,7 +1485,7 @@ func TestSkipArrayErrors(t *testing.T) {
 func TestSkipMapErrors(t *testing.T) {
 	intNode := &schemaNode{kind: "int"}
 	mapNode := &schemaNode{kind: "map", values: intNode}
-	skip := buildSkip(mapNode)
+	skip := buildSkip(mapNode, newMinBytesWalk())
 
 	// Empty buffer.
 	_, err := skip(nil, &slab{})
@@ -1553,7 +1553,7 @@ func TestSkipUnionErrors(t *testing.T) {
 			{kind: "int"},
 		},
 	}
-	skip := buildSkip(node)
+	skip := buildSkip(node, newMinBytesWalk())
 
 	// Empty buffer: readVarint error.
 	_, err := skip(nil, &slab{})
@@ -1578,7 +1578,7 @@ func TestSkipUnionErrors(t *testing.T) {
 
 func TestBuildSkipUnknownType(t *testing.T) {
 	node := &schemaNode{kind: "unknown_type"}
-	skip := buildSkip(node)
+	skip := buildSkip(node, newMinBytesWalk())
 	_, err := skip([]byte{1, 2, 3}, &slab{})
 	if err == nil {
 		t.Fatal("expected error for unknown type")
@@ -1604,7 +1604,7 @@ func TestSkipRecordFieldError(t *testing.T) {
 			{name: "a", node: &schemaNode{kind: "int"}},
 		},
 	}
-	skip := buildSkip(node)
+	skip := buildSkip(node, newMinBytesWalk())
 	_, err := skip(nil, &slab{})
 	if err == nil {
 		t.Fatal("expected error for truncated record field")
@@ -2667,7 +2667,7 @@ func TestSkipArrayMinInt64(t *testing.T) {
 	// After reading as negative and negating, -math.MinInt64 overflows to math.MinInt64 (still negative).
 	intNode := &schemaNode{kind: "int"}
 	arrNode := &schemaNode{kind: "array", items: intNode}
-	skip := buildSkip(arrNode)
+	skip := buildSkip(arrNode, newMinBytesWalk())
 
 	// math.MinInt64 zigzag-encoded as varint.
 	data := appendVarlong(nil, math.MinInt64)
@@ -2680,7 +2680,7 @@ func TestSkipArrayMinInt64(t *testing.T) {
 func TestSkipMapMinInt64(t *testing.T) {
 	intNode := &schemaNode{kind: "int"}
 	mapNode := &schemaNode{kind: "map", values: intNode}
-	skip := buildSkip(mapNode)
+	skip := buildSkip(mapNode, newMinBytesWalk())
 
 	data := appendVarlong(nil, math.MinInt64)
 	_, err := skip(data, &slab{})

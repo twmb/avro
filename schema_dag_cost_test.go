@@ -577,9 +577,10 @@ var minBytesCallSites = []minBytesCallSite{
 		why: "the resolver rebuilds the bound against the WRITER's wire format for a resolved array and map"},
 	{file: "skip.go", count: 2, entry: "Resolve when a writer field is dropped",
 		why: "the skip compiled for a dropped writer field derives the same two bounds"},
-	{file: "deser.go", count: 3, entry: "n/a — not callers",
-		why: "the definition itself plus two doc references to it: schemaMinBytes' own body " +
-			"delegating to the memoized form, and deserMap's field comment naming where its bound comes from"},
+	{file: "deser.go", count: 4, entry: "n/a — not callers",
+		why: "the definition plus two doc references (schemaMinBytes' own doc and deserMap's " +
+			"field comment naming its bound), plus the one real delegation: schemaMinBytes " +
+			"spins up a fresh walk and calls minBytesOf on it for a single standalone node"},
 }
 
 // TestInvariant_MinBytesCallSites derives the set of sites that demand a
@@ -590,7 +591,16 @@ var minBytesCallSites = []minBytesCallSite{
 // drives.
 func TestInvariant_MinBytesCallSites(t *testing.T) {
 	files := censusSourceFiles(t)
+	// A per-element minimum is asked for two ways now: the standalone
+	// schemaMinBytes(n) (which spins up a fresh walk for one node), and
+	// walk.minBytesOf(n) (which joins the shared walk of an operation). Both are
+	// entry points into the shared-node walk and both must be rowed, so the site
+	// set is the union — a caller that switched to the shared form must not
+	// vanish from the guard.
 	found := occurrences(t, files, "schemaMinBytes(")
+	for f, lines := range occurrences(t, files, ".minBytesOf(") {
+		found[f] = append(found[f], lines...)
+	}
 	rowed := make(map[string]minBytesCallSite, len(minBytesCallSites))
 	for _, r := range minBytesCallSites {
 		rowed[r.file] = r
@@ -914,4 +924,130 @@ func TestInvariant_MetadataWalkChargesPerChild(t *testing.T) {
 		_ = s.Canonical()
 		return nil
 	})
+}
+
+// ---------- the CONTAINER-COUNT axis ----------
+
+// The two axes above — paths per walk (dagNested/dagSingleSCC) and children per
+// node (dagWideSCC) — each hold the container count at ONE: every cell wraps a
+// single array around a single DAG. But schemaMinBytes runs once per container,
+// and a schema chooses how many containers point at one subtree independently of
+// how deep or wide that subtree is. So the parse cost is a PRODUCT,
+//
+//	containers x paths-per-walk x children-per-node,
+//
+// and a bound that caps any single factor leaves the other two to multiply. The
+// walk's memo and allowance cap paths and children WITHIN one walk; the thing
+// that caps the container factor is that one walk is SHARED across all the
+// containers of an operation (newMinBytesWalk, threaded through finalize,
+// resolve, and each record's skip compile). These cells drive that shared walk
+// with the container count raised and the other two factors held where the
+// per-walk bounds already engage — so a regression to a fresh walk per container
+// restores the product and reds them.
+
+// nContainersOverSCC builds a record with narrays array fields, every one of
+// items "L0", above a cyclic SCC L0..L{levels-1} -> L0. The SCC is fixed text;
+// each extra array is ~48 bytes, so the container count is a caller-chosen
+// magnitude independent of the subtree it points at. The SCC is un-memoizable,
+// so a fresh walk per array pays the full allowance per array.
+func nContainersOverSCC(narrays, levels int) string {
+	var b strings.Builder
+	b.WriteString(`{"type":"record","name":"Root","fields":[`)
+	for j := 0; j < narrays; j++ {
+		if j > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"name":"z%d","type":{"type":"array","items":"L0"}}`, j)
+	}
+	for i := 0; i < levels; i++ {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == levels-1 {
+			next = "L0"
+		}
+		fmt.Fprintf(&b, `,{"name":"d%d","type":{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null","%s"]},{"name":"f1","type":["null","%s"]}]}}`, i, i, next, next)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// containerCountN / containerCountLevels are chosen so a fresh walk per
+// container costs containers x allowance — decisively past dosBudget — while one
+// shared walk pays the allowance once and finishes in well under it, four orders
+// of magnitude apart so no machine noise crosses the line.
+const (
+	containerCountN      = 220
+	containerCountLevels = 26
+)
+
+// TestInvariant_MinBytesContainerCountBounded is the container-count half of the
+// cost guard, crossed through every entry point the walk is reached from. Each
+// drives many containers over ONE shared cyclic SCC; the shared walk pays for it
+// once, a fresh-walk-per-container regression pays for it per container.
+func TestInvariant_MinBytesContainerCountBounded(t *testing.T) {
+	scc := nContainersOverSCC(containerCountN, containerCountLevels)
+
+	// Parse: the forward-referenced arrays resolve in finalize's container-fixup
+	// loop, which shares one walk across all of them.
+	wantTerminate(t, "Parse/many-containers", func() error {
+		_, err := Parse(scc)
+		return err
+	})
+	wantTerminate(t, "SchemaCache.Parse/many-containers", func() error {
+		var c SchemaCache
+		_, err := c.Parse(scc)
+		return err
+	})
+
+	// Resolve: a reader that differs (extra field) forces resolveRecord to
+	// recurse into every array, each calling ctx.minBytes on the shared walk.
+	w := MustParse(scc)
+	r := MustParse(strings.Replace(scc,
+		`{"type":"record","name":"Root","fields":[`,
+		`{"type":"record","name":"Root","fields":[{"name":"extra","type":"int","default":0},`, 1))
+	wantTerminate(t, "Resolve/many-containers", func() error {
+		_, err := Resolve(w, r)
+		return err
+	})
+
+	// Skip: a dropped writer field whose subtree is the many-containers record.
+	// The skip is compiled lazily at first decode, one walk per record's field
+	// set; this drives that compile.
+	wDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"x","type":` + scc + `},{"name":"y","type":"int"}]}`)
+	rDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"y","type":"int"}]}`)
+	wantTerminate(t, "Resolve+Decode/many-containers-dropped", func() error {
+		rs, err := Resolve(wDrop, rDrop)
+		if err != nil {
+			return err
+		}
+		// Minimal wire for wDrop: the SCC record's arrays empty, its records
+		// all null-union index 0, then y. The skip compile fires here.
+		wire := manyContainersMinimalWire(containerCountN, containerCountLevels)
+		var out map[string]any
+		_, err = rs.Decode(wire, &out)
+		return err
+	})
+
+	// ocf-header: the executable cell lives in ocf/dos_battery_test.go; this
+	// pins the parse of the identical header schema that reaches it.
+	wantTerminate(t, "ocf-header/many-containers", func() error {
+		_, err := Parse(scc)
+		return err
+	})
+}
+
+// manyContainersMinimalWire encodes a Top value for the skip cell: x = the SCC
+// record (narrays empty arrays + levels records of two null-union fields), then
+// y = 7. Every varint here is a single zigzag byte.
+func manyContainersMinimalWire(narrays, levels int) []byte {
+	var b []byte
+	appendZig := func(v int64) { b = append(b, byte(uint64(v)<<1)) }
+	for j := 0; j < narrays; j++ {
+		appendZig(0) // empty array block
+	}
+	for i := 0; i < levels; i++ {
+		appendZig(0) // f0 union index 0 (null)
+		appendZig(0) // f1 union index 0 (null)
+	}
+	appendZig(7) // y
+	return b
 }

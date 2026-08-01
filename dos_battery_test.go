@@ -78,6 +78,20 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		pan any
 	}
 	ch := make(chan result, 1)
+	// Under -race the bound gets the same wider ceiling wantAcceptUnder already
+	// takes (see its rationale): instrumentation multiplies a HEALTHY bounded
+	// walk's wall-clock several-fold — the widest metadata cell runs ~0.5s
+	// unraced and ~4-5s raced with zero data races and normal completion — so
+	// the tight bound false-trips it. The separation these cells rely on is
+	// preserved: an actually-unbounded walk here is tens of seconds unraced
+	// (the fresh-walk-per-container neuter is ~30s) and hundreds raced, still
+	// far past the raced ceiling. Never relax the UNRACED bound for a -race
+	// timeout — that would hide a real hang; this only widens what -race itself
+	// inflated.
+	budget := dosBudget
+	if raceEnabled {
+		budget = raceDosBudget
+	}
 	start := time.Now()
 	go func() {
 		var r result
@@ -95,15 +109,22 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 			t.Errorf("%s: panicked on hostile input (must return an error, not panic): %v", name, r.pan)
 			return nil, false
 		}
-		if d := time.Since(start); d > dosBudget {
-			t.Errorf("%s: completed but took %v (> %v) — cost not bounded for hostile input", name, d, dosBudget)
+		if d := time.Since(start); d > budget {
+			t.Errorf("%s: completed but took %v (> %v) — cost not bounded for hostile input", name, d, budget)
 		}
 		return r.err, true
-	case <-time.After(dosBudget):
-		t.Errorf("%s: did not return within %v — bound missing (hang/unbounded loop on hostile input)", name, dosBudget)
+	case <-time.After(budget):
+		t.Errorf("%s: did not return within %v — bound missing (hang/unbounded loop on hostile input)", name, budget)
 		return nil, false
 	}
 }
+
+// raceDosBudget is the -race ceiling for the wall-clock DoS cells. It sits above
+// the several-fold instrumentation inflation of the healthy bounded walks and
+// far below the raced cost of an unbounded one (tens of seconds unraced), so the
+// class separation the cells exist for survives -race while healthy cells do not
+// false-trip. Mirrors wantAcceptUnder's race relaxation for the dosRun harness.
+const raceDosBudget = 20 * time.Second
 
 // wantReject asserts fn rejects hostile input fast (non-nil error, no hang/panic).
 func wantReject(t *testing.T, name string, fn func() error) {

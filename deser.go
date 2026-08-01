@@ -982,21 +982,50 @@ func saturateSchemaMagnitude(n int) int {
 // Saturating here rather than at each consumer is deliberate — the consumers
 // are four separate derivations of the same bound (parse, resolve, skip, and
 // the container reader's), and a ceiling applied at one leaves three open.
+//
+// This spins up a fresh walk for one node. A caller that computes minimums for
+// SEVERAL containers in one operation must instead share ONE walk across them —
+// see newMinBytesWalk. The container count is caller-chosen (every array/map is
+// one), and a fresh walk per container makes the operation's cost that count
+// times the per-walk allowance while capping only the second factor. The memo
+// and allowance are node-keyed and path-independent, so sharing is exact for the
+// acyclic case and gives the same conservative stand-in for the cyclic one.
 func schemaMinBytes(n *schemaNode) int {
-	w := minBytesWalk{
+	return newMinBytesWalk().minBytesOf(n)
+}
+
+// newMinBytesWalk returns a walk carrying a full allowance and an empty memo.
+// One walk is threaded through all the container sites of a single operation —
+// a parse's finalize pass over its forward-referenced containers, one Resolve,
+// one record's skip compilation — so that the OPERATION's total min-bytes work
+// is what maxMinBytesWork bounds, not each container's independently. Reusing
+// the walk is what keeps a schema that points N containers at one shared
+// subtree from paying N times: the acyclic part is memoized after the first
+// container and the cyclic part exhausts the shared allowance once.
+func newMinBytesWalk() *minBytesWalk {
+	return &minBytesWalk{
 		path:      make(map[*schemaNode]bool),
 		done:      make(map[*schemaNode]int),
 		allowance: maxMinBytesWork,
 	}
+}
+
+// result returns node n's minimum wire bytes, consuming this walk's shared memo
+// and allowance so the cost joins that of every prior container computed on the
+// same walk.
+func (w *minBytesWalk) minBytesOf(n *schemaNode) int {
 	v, _ := w.minBytes(n)
 	return v
 }
 
-// maxMinBytesWork bounds the WORK one schemaMinBytes call may perform, counted
-// in children examined. The memo makes an acyclic graph linear no matter how
-// many paths reach a node, but a CYCLIC one cannot be memoized at all (see
-// minBytesWalk), and a chain whose levels are mutually recursive still fans out
-// per reference. This is the backstop for that residue.
+// maxMinBytesWork bounds the WORK one walk may perform, counted in children
+// examined. Because one walk is shared across every container of an operation
+// (see newMinBytesWalk), this bounds the OPERATION's total, not each container's
+// — the count of containers is caller-chosen, so a per-container allowance
+// would cap the wrong factor of the product. The memo makes an acyclic graph
+// linear no matter how many paths reach a node, but a CYCLIC one cannot be
+// memoized at all (see minBytesWalk), and a chain whose levels are mutually
+// recursive still fans out per reference. This is the backstop for that residue.
 //
 // It is charged per CHILD, not per node entered, and that is the whole point of
 // the constant rather than an implementation detail. Entering a record iterates
@@ -1023,7 +1052,8 @@ func schemaMinBytes(n *schemaNode) int {
 // TestInvariant_MemoAgreesWithUnmemoizedWalk relies on.
 const maxMinBytesWork = 1 << 22
 
-// minBytesWalk carries the state of one schemaMinBytes computation.
+// minBytesWalk carries the shared state of one operation's min-bytes work,
+// reused across every container the operation computes a bound for.
 //
 // A named type referenced twice binds BOTH references to one *schemaNode, so
 // the graph the walk descends is a DAG, not a tree, and a walk that

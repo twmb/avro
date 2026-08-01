@@ -11988,3 +11988,130 @@ UNIT, the depth cells' is the allowance's existence, and naming which is which i
 what keeps a later round from deleting one and reading the other's red as
 coverage. The OCF cell reds alone on the charge neuter, RUN=1, which is what says
 the entry point that sets the severity is really driven.
+
+## Distillation archive (2026-08-01 #60) — the container-factor FIX round + the budgeted-walk census, verbatim
+
+Full narrative of the FIX round ledgered at AUDIT_CORE `a5dd23c (START head)`.
+The ledger line and P30 are the compressed forms; this is the complete account.
+
+THE FINDING (filed the prior FULL round, fixed here). schemaMinBytes' cost is a
+PRODUCT of three caller-chosen factors — containers x paths-per-walk x
+children-per-node. The two prior rounds capped the inner two: 0e526c2 the paths
+(the done memo, P28), a5dd23c the children (the per-child charge, P29). This
+round's finding was the OUTER factor: schemaMinBytes built a FRESH minBytesWalk
+(fresh done + fresh allowance) on EVERY call, and it is called once per array/map
+container. So the per-call cap bounded one walk while the number of walks was the
+caller's container count. Confirmed at three entry points, each a file- or
+caller-supplied schema: Parse (finalize's forward-ref container-fixup loop) 56 KB
+-> 138 s; Resolve (reader differs, resolveArray per container) 17 KB -> 32 s;
+first Decode of a resolved decoder that DROPS a writer field (skip compiled via
+skipRecord's once.Do) 17 KB -> 33 s; ocf.NewReader on a 17 KB file header -> 30 s.
+The cyclic case is linear in container count with a ~135 ms/container constant
+(each container re-walks the un-memoizable SCC to allowance exhaustion); the
+acyclic case is O(N containers x M levels) quadratic (each container re-walks the
+whole chain with a fresh done memo), 600 KB -> 3.4 s. Isolated by a control: the
+SAME 17 KB graph made acyclic parses in 8.3 ms (3600x), naming the un-memoizable
+SCC + fresh-per-call allowance as the driver.
+
+THE SCOPE, MEASURED not reasoned. Build was measured NOT to carry the factor: a
+backward-ref container (SCC defined before the arrays) resolves its items to a
+cheap name-ref stub, so build's schemaMinBytes is shallow (256 arrays / 17 KB =
+3.3 ms). The amplification needs REFERENCES to share one SCC across many
+containers; a backward ref uses the stub, a forward ref is fixed up in finalize.
+So only finalize (of the two parse phases) carries it, and sharing across the
+build->finalize boundary was DELIBERATELY avoided: build-time calls run on
+unresolved fwd-ref stubs (distinct pointers from the resolved targets finalize
+walks) and on inline nodes whose value is final at build, so a fresh walk for
+finalize preserves every value while a shared build+finalize walk could leak a
+build-time provisional (inline record with a fwd-ref field) into finalize. Build
+stays per-call; finalize, resolve, and each record's skip compile each get ONE
+shared walk.
+
+THE FIX. newMinBytesWalk() returns *minBytesWalk with a full allowance and empty
+memo; (w).minBytesOf(n) is the shared-walk call; schemaMinBytes(n) =
+newMinBytesWalk().minBytesOf(n) for standalone build-time callers. One walk is
+threaded through: finalize's containerFixups loop (schema.go), resolveCtx.minBytes
+(resolve.go, used by resolveArray/resolveMap and passed to the dropped-field
+buildSkip), and skipRecord's once.Do (each record's field-compile makes its own,
+because that compile fires once per wire reach, so cross-record cost is
+wire-bounded already; within one record's field set the walk is shared). buildSkip
+gained an mbw parameter threaded through skipArray/skipMap/skipUnion; skipRecord
+ignores the incoming mbw and makes its own. All sites confirmed: every entry point
+drops to ~120 ms.
+
+SOUNDNESS / behavior change. Sharing the done memo changes no value: minBytes(n)
+is node-keyed and path-independent for the acyclic case, so a shared memo is exact
+memoization. Sharing the allowance is the one observable: after the first
+container drains it on a cyclic schema, later containers get the conservative
+stand-in (1) rather than the deterministic value a fresh 4M allowance would
+compute. This is looser, both sides reject on it, and it was maintainer-ruled
+acceptable ("a drained allowance gives later containers the conservative stand-in,
+which both sides already reject on"). For an acyclic schema the shared allowance
+is barely touched (each node charged once, total = schema text), so later
+containers get exact values.
+
+THE DELIVERABLE THE MAINTAINER ESCALATED TO. "Parse cost here is a PRODUCT of
+caller-chosen factors, and three consecutive rounds have each bounded ONE... a
+fourth factor would produce a fourth round. So the round's deliverable is the
+ENUMERATION: every budgeted walk in the package. For each, write its COST
+EXPRESSION with every caller-chosen factor named, and state which single bound
+binds the PRODUCT rather than a factor." Realized as budgeted_walk_census_test.go.
+Every budgeted walk is rowed with {factors, binds}, classified by WHAT it
+traverses: schemaDAG (shared *schemaNode/*SchemaNode — a memo or budget must cap
+the paths factor, depth cannot), goTypeDAG (reflect.Type — compile-time fixed,
+amortized by a per-type sync.Map, G3), valueTree/wire/textTree (node count = input
+size, depth cap suffices). The set is DERIVED from source two ways: (1) a
+graph-cost-marker scan (allowance / walkBudget / map[nodePair] / graph visited-sets
+/ defer-delete) attributes every occurrence to a rowed walk or an allow-listed
+non-walk datum; (2) a schema-graph self-recursion scan finds every function that
+recurses over *schemaNode/*SchemaNode and requires it rowed (catches a walk with
+NO cost marker at all, e.g. coerceTreeDefaults). A product-binding guard requires
+every schemaDAG row's binds to name a memo/budget/tree-structure, not a lone
+factor. Attacked both ways and verified: removing the checkCompat row -> its
+map[nodePair] marker unattributed (fail); a temporary self-recursive schemaNode
+function -> unrowed (fail); a temporary map[nodePair] var in a non-rowed file ->
+unattributed (fail); all pass after removal.
+
+THE ENUMERATION CLEARED EVERY OTHER WALK (measured, not assumed). checkCompat and
+resolveNode: bounded by a persistent (reader,writer) pair memo (seen, no
+defer-delete), diamonds at 28 levels in 14-93 us. toJSONWalk: bounded by walkBudget
+(nodes+bytes charged at the top of every entry, so a DAG re-descent still spends
+budget), 256 containers over a cyclic SCC -> String() 250 ns / Canonical() 203 us.
+overlayInheritedCustom, findCustomTypeMatchInSubtreeWalk, buildCustomWiring,
+collectLocalNames, stampNameRefs, nodeAwaitsForwardRefSeen: persistent visited/seen
+memos (mark on entry, return on hit). collectNamedTypes, coerceTreeDefaults: walk
+the public SchemaNode TREE (name-ref nodes are leaves, not followed), Root() on a
+diamond linear (160-290 us). coerceMetadataDefault, branchAcceptsDefault,
+walkDefault, coerceDefault, encodeDefaultDepth, appendAvroJSON: value-guided
+(the default/encoded VALUE is a finite tree), + depth caps. inlineTreeDefs (cache
+splice): dedup emits references, SchemaCache String() on a diamond grew linearly
+(90 B/level). collect/collectFieldsRaw (reflect): defer-delete visited, so
+EXPONENTIAL on a Go-type embed DAG — but a Go type is compile-time and amortized
+by sync.Map (G3, not attacker-grown at runtime). A false alarm on the way: a
+sandbox test called Root() without checking Parse's error, and Parse correctly
+REJECTS an empty {} record default, so nil.Root() panicked — a test bug, verified
+against both the working tree and an a5dd23c worktree, no avro defect.
+
+THE NET. TestInvariant_MinBytesContainerCountBounded crosses the container-count
+axis (220 arrays over one cyclic SCC) with the paths axis, through Parse,
+SchemaCache.Parse, Resolve (reader differs), Resolve+Decode (dropped-field skip),
+and ocf-header-parse; ocf/dos_battery_test.go gains the executable
+NewReader/many-container-header-schema cell (the file-supplied form that sets
+severity). Non-vacuity proven: neutering all three shared-walk sites back to a
+fresh walk per container reds all five package cells + the ocf cell (exit=1,
+RUN>0, no panic), each naming the restored product; restored, all green.
+
+FIX.md SWEEP. Item 0 gate: the min-bytes cost policy is documented in this archive
+(the same cost-bounding intent extended, no conflicting NOT_BUGS/doc.go entry); the
+one behavior change (drained-allowance stand-in) was maintainer-ruled. Item 3
+sibling sweep: the census IS the sweep, repo-wide over every schema-graph walk.
+Item 5 DoS: the whole finding, all entry points bounded. Item 8 vet: clean. Item 9
+-race: 0 data races, my fix's cells pass; one PRE-EXISTING dosBudget cell
+(TestInvariant_MetadataWalkChargesPerChild, schema_node.go UNTOUCHED, 0.54 s
+unraced, 0 data races, normal completion) tripped the fixed 4 s dosBudget under
+-race because instrumentation inflates a bounded walk several-fold — the same
+wall-clock-under-race class wantAcceptUnder already relaxes. dosRun now takes a
+raceDosBudget (20 s) under -race, sitting above the inflated healthy cost and far
+below an unbounded one (tens of seconds unraced -> hundreds raced); the UNRACED
+4 s bound is unchanged, so this is not a masking bump. Full suite + fastavro (0
+missing-optional-dep) + go test -race ./... all green; Java un-netted (no JRE).

@@ -292,6 +292,48 @@ func TestDoSBattery_OCF_C1_Header(t *testing.T) {
 		}
 		return err
 	})
+
+	// The third factor: how many CONTAINERS the header points at one subtree.
+	// The reader derives a per-element minimum for every array/map in the
+	// header, and a header can carry any number of them over one shared cyclic
+	// SCC. Depth and width are held where the per-walk bounds engage; the count
+	// is turned up. The reader shares one walk across the header's containers,
+	// so a fresh walk per container — the product this whole battery guards — is
+	// what this rejects. This is the file-supplied form of the class, so it is
+	// the cell that fixes the severity.
+	wantTerminate(t, "NewReader/many-container-header-schema", func() error {
+		r, err := NewReader(bytes.NewReader(ocfWith(dagManyContainerHeader(220, 26), "null", 0, nil)))
+		if r != nil {
+			r.Close()
+		}
+		return err
+	})
+}
+
+// dagManyContainerHeader builds a header record with narrays array fields, each
+// of items "L0", above a cyclic SCC L0..L{levels-1} -> L0. The count of arrays
+// is a magnitude the header author picks independently of the subtree, so the
+// walk cost is a product the reader must bound by sharing one walk across the
+// containers. Mirrors nContainersOverSCC in the avro package, which this package
+// cannot import.
+func dagManyContainerHeader(narrays, levels int) string {
+	var b strings.Builder
+	b.WriteString(`{"type":"record","name":"Root","fields":[`)
+	for j := 0; j < narrays; j++ {
+		if j > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"name":"z%d","type":{"type":"array","items":"L0"}}`, j)
+	}
+	for i := 0; i < levels; i++ {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == levels-1 {
+			next = "L0"
+		}
+		fmt.Fprintf(&b, `,{"name":"d%d","type":{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null","%s"]},{"name":"f1","type":["null","%s"]}]}}`, i, i, next, next)
+	}
+	b.WriteString(`]}`)
+	return b.String()
 }
 
 // dagWideCyclicHeader builds the header form of the width shape: a fan-2 chain

@@ -38,8 +38,9 @@ func Resolve(writer, reader *Schema) (*Schema, error) {
 		return reader, nil
 	}
 	ctx := &resolveCtx{
-		seen:   make(map[nodePair]*schemaNode),
-		custom: reader.custom,
+		seen:     make(map[nodePair]*schemaNode),
+		custom:   reader.custom,
+		minBytes: newMinBytesWalk(),
 	}
 	resolved, err := resolveNode(reader.node, writer.node, "", ctx)
 	if err != nil {
@@ -124,6 +125,12 @@ type defaultOp struct {
 type resolveCtx struct {
 	seen   map[nodePair]*schemaNode
 	custom map[*schemaNode]*customWiring
+	// minBytes is shared across every container this resolution derives a
+	// per-element bound for. resolveArray/resolveMap and the dropped-field
+	// skip compiler all consult it, so a writer pointing many containers at one
+	// subtree pays for that subtree once, not once per container. See
+	// newMinBytesWalk.
+	minBytes *minBytesWalk
 }
 
 // customDecodersFor returns the decoder chain registered against r, or
@@ -311,7 +318,7 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 			// Writer field not in reader: skip it.
 			rr.wireOps = append(rr.wireOps, wireOp{
 				readerIdx: -1,
-				skip:      buildSkip(wf.node),
+				skip:      buildSkip(wf.node, ctx.minBytes),
 			})
 			continue
 		}
@@ -666,7 +673,7 @@ func resolveArray(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, 
 		// with the writer's type — an int-on-wire promoted to a double
 		// reader is still 1 byte minimum on the wire. Mirrors the
 		// resolveMap site below.
-		deser: (&deserArray{deserItem: resolved.deser, minItemBytes: schemaMinBytes(w.items)}).deser,
+		deser: (&deserArray{deserItem: resolved.deser, minItemBytes: ctx.minBytes.minBytesOf(w.items)}).deser,
 	}
 	ctx.applyCustomToNode(nd, r)
 	return nd, nil
@@ -687,7 +694,7 @@ func resolveMap(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, er
 		// minEntryBytes: bound against the WRITER's wire format, not the
 		// reader's resolved schema (a long-on-wire promoted to a double
 		// reader is still 1 byte minimum on the wire).
-		deser: (&deserMap{deserItem: resolved.deser, minEntryBytes: 1 + schemaMinBytes(w.values)}).deser,
+		deser: (&deserMap{deserItem: resolved.deser, minEntryBytes: 1 + ctx.minBytes.minBytesOf(w.values)}).deser,
 	}
 	ctx.applyCustomToNode(nd, r)
 	return nd, nil
