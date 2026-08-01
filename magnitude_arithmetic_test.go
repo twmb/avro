@@ -136,7 +136,7 @@ func TestInvariant_UnionMinimumCoversItsBranches(t *testing.T) {
 		got := schemaMinBytes(s.node)
 		cheapest := -1
 		for _, b := range s.node.branches {
-			m := schemaMinBytesSeen(b, map[*schemaNode]struct{}{})
+			m := schemaMinBytes(b)
 			if cheapest < 0 || m < cheapest {
 				cheapest = m
 			}
@@ -251,10 +251,11 @@ type magnitudeSite struct {
 // while reading as coverage.
 var magnitudeSites = []magnitudeSite{
 	{
-		where: "deser.go::schemaMinBytesSeen", count: 2, verdict: magSaturated,
+		where: "deser.go::minBytesWalk.minBytesFromChildren", count: 2, verdict: magSaturated,
 		reason: "the producer. `1 + m` over the smallest branch and the running sum over a record's fields; " +
 			"both are clamped by saturateSchemaMagnitude, and the sum is clamped per FIELD so the next addition " +
-			"starts in range. This is the wrap that reached a divisor",
+			"starts in range. This is the wrap that reached a divisor. The recursion's own `depth+1` is not " +
+			"reported here and must not be: depth counts path length, which the fixpoint does not taint",
 	},
 	{
 		where: "deser.go::checkMapBlockBounds", count: 1, verdict: magSaturated,
@@ -644,7 +645,7 @@ func TestInvariant_EveryMagnitudeArithmeticSiteIsClassified(t *testing.T) {
 	// or of the producer would leave it scanning for nothing and reporting a
 	// clean table. These two functions ARE the class; if the fixpoint stops
 	// finding them, the guard is watching an empty set.
-	for _, want := range []string{"schemaMinBytesSeen", "maxDecimalDigits"} {
+	for _, want := range []string{"minBytesFromChildren", "maxDecimalDigits"} {
 		if !magFns[want] {
 			t.Fatalf("the taint fixpoint no longer reaches %s — the seed fields or the producer were renamed, "+
 				"and this guard is now watching nothing", want)

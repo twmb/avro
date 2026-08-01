@@ -604,11 +604,19 @@ func TestDoSBattery_C5_ErrorEcho(t *testing.T) {
 //////////////////////////////////////////////////////////////////////////////
 
 func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
-	// The deep-value, deep-structure, shared-DAG, and duplicate-named-def
-	// expansion axes of the SchemaNode->JSON walk are reachable only by HAND-
-	// BUILDING a SchemaNode (Parse's bracket pre-scan rejects the deep-JSON
-	// route up front — see C1). The intricate hand-built constructions are
-	// pinned by the dedicated battery in schema_node_test.go:
+	// A shared-reference DAG needs no hand-built SchemaNode and no deep JSON.
+	// A named type REFERENCED TWICE binds both references to one node, so
+	// ordinary schema text expresses the fan-out directly, and it can be
+	// written flat — every level a sibling field wired by forward reference —
+	// which puts it past any bracket pre-scan or nesting bound. So this axis
+	// is not one walker's problem: it belongs to EVERY walk a schema drives,
+	// and the cells below cross it with the entry-point list rather than with
+	// the metadata walk alone.
+	//
+	// The hand-built constructions still matter for the axes a caller cannot
+	// reach through Parse at all (deep VALUES inside Props, duplicate named
+	// definitions), and they stay pinned by the dedicated battery in
+	// schema_node_test.go:
 	//   - TestRegression_SchemaNodeSchemaDeepValueBounded   (deep Props/Default value)
 	//   - TestRegression_SchemaNodeWalkDepthAllChannels     (all 4 structural channels + value sites)
 	//   - TestRegression_SchemaNodeSharedDAGExpansionBounded (shared-reference 2^depth fan-out)
@@ -640,6 +648,116 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 		_ = rec.String()
 		return nil
 	})
+
+	// The DAG axis crossed with the ENTRY-POINT list. Each of these drives a
+	// different walk over the same shared-node graph, expressed as ordinary
+	// schema text a caller could be handed by a registry or read out of a
+	// file. Two spellings: nested, and flat with forward references, which is
+	// the one no depth bound can see.
+	for _, form := range []struct {
+		name   string
+		schema string
+	}{
+		{"nested", `{"type":"array","items":` + dagNested(dagCostDepth, 2) + `}`},
+		{"flat-forward-ref", dagFlat(dagCostDepth, 2)},
+	} {
+		wantTerminate(t, "Parse/shared-node-"+form.name, func() error {
+			_, err := Parse(form.schema)
+			return err
+		})
+		wantTerminate(t, "SchemaCache.Parse/shared-node-"+form.name, func() error {
+			var c SchemaCache
+			_, err := c.Parse(form.schema)
+			return err
+		})
+		s := MustParse(form.schema)
+		wantTerminate(t, "Root+Schema+String+Canonical/shared-node-"+form.name, func() error {
+			root := s.Root()
+			_, _ = root.Schema()
+			_ = s.String()
+			_ = s.Canonical()
+			return nil
+		})
+		wantTerminate(t, "Resolve/shared-node-"+form.name, func() error {
+			_, err := Resolve(s, s)
+			return err
+		})
+		// The writer field is DROPPED, which compiles a skip — a separate
+		// derivation of the same per-element bound.
+		w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + form.schema + `},{"name":"y","type":"int"}]}`)
+		r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
+		wantTerminate(t, "Resolve/shared-node-dropped-field-"+form.name, func() error {
+			_, err := Resolve(w, r)
+			return err
+		})
+		wantTerminate(t, "CheckCompatibility/shared-node-"+form.name, func() error {
+			return CheckCompatibility(s, s)
+		})
+		// A value round-trip, so the axis is crossed on the wire paths too —
+		// at a SMALL depth, because a shared node is shared in the schema and
+		// not in the datum: a record whose every level has two fields of the
+		// next genuinely CONTAINS 2^depth leaves, so the wire cost is the
+		// value's own size and there is nothing here to bound. What this cell
+		// asks is only that the encoder and decoder handle a node reached by
+		// several paths at all.
+		small := MustParse(`{"type":"array","items":` + dagNested(8, 2) + `}`)
+		wantTerminate(t, "Encode+Decode/shared-node-"+form.name, func() error {
+			var v any
+			b, err := small.Encode([]any{dagZeroValue(small.node.items)})
+			if err != nil {
+				return err
+			}
+			_, err = small.Decode(b, &v)
+			return err
+		})
+	}
+}
+
+// dagZeroValue builds one legal value for a shared-node schema, so the DAG
+// axis can be crossed with the wire paths and not only the parse paths.
+//
+// It memoizes per node for the same reason the walk under test does: a node
+// reachable by many paths must be built once, or the HARNESS is the
+// exponential thing and the cell measures it instead of the package.
+func dagZeroValue(n *schemaNode) any {
+	return dagZeroValueMemo(n, map[*schemaNode]any{})
+}
+
+func dagZeroValueMemo(n *schemaNode, seen map[*schemaNode]any) any {
+	if v, ok := seen[n]; ok {
+		return v
+	}
+	v := dagZeroValueOf(n, seen)
+	seen[n] = v
+	return v
+}
+
+func dagZeroValueOf(n *schemaNode, seen map[*schemaNode]any) any {
+	switch n.kind {
+	case "null":
+		return nil
+	case "boolean":
+		return false
+	case "int", "long":
+		return 0
+	case "float", "double":
+		return 0.0
+	case "string", "bytes":
+		return ""
+	case "array":
+		return []any{}
+	case "map":
+		return map[string]any{}
+	case "union":
+		return dagZeroValueMemo(n.branches[0], seen)
+	case "record", "error":
+		m := make(map[string]any, len(n.fields))
+		for i := range n.fields {
+			m[n.fields[i].name] = dagZeroValueMemo(n.fields[i].node, seen)
+		}
+		return m
+	}
+	return nil
 }
 
 //////////////////////////////////////////////////////////////////////////////

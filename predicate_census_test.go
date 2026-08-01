@@ -42,6 +42,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 
 	"os"
 	"path/filepath"
@@ -62,7 +65,32 @@ type censusAnswerer struct {
 	site string // function or identifier, for the failure message
 	file string
 	note string
+	// placement states WHERE the answer is computed, for a question whose
+	// rule ranges over a whole collected SET rather than over one value.
+	// Two answerers can agree on the rule and disagree on where it runs, and
+	// nothing that compares ANSWERS can see that: at the outermost call both
+	// placements give the same verdict, and the divergence only appears for
+	// the same construct nested one level deeper. Empty means the question's
+	// rule is per-value, so placement is not a property it has.
+	//
+	// The value is machine-checked against source by
+	// TestCensus_PlacementFactsMatchSource, which is what makes it a fact
+	// rather than a claim: placementWholeSet requires the site's function to
+	// contain NO recursion, and placementPerLevel requires it to contain one.
+	placement string
+	// walk names the recursion whose collected set the rule ranges over. The
+	// placement fact is meaningless without it: a rule may sit downstream of
+	// several recursions, and running once per level of a DIFFERENT one is
+	// often exactly right.
+	walk string
 }
+
+// The placement vocabulary. A whole-set rule evaluated per recursion level
+// decides on a PARTIAL set, which is a different rule wearing the same code.
+const (
+	placementWholeSet = "once, over the root's complete collected set (the site's function must not recurse)"
+	placementPerLevel = "once per recursion level, over that level's own set (the site's function recurses)"
+)
 
 // censusTell is a source substring whose every occurrence in non-test code
 // must be a registered site of the question. counts is file → number of
@@ -847,7 +875,7 @@ var censusRegistry = []censusQuestion{
 			"the first stayed open for the arithmetic that actually crashed.",
 		answerers: []censusAnswerer{
 			{repr: "the accessor itself", site: "saturateSchemaMagnitude", file: "deser.go"},
-			{repr: "per-element wire minimum (fixed / union / record arms)", site: "schemaMinBytesSeen", file: "deser.go"},
+			{repr: "per-element wire minimum (fixed / union / record arms)", site: "minBytesWalk.minBytesFromChildren", file: "deser.go"},
 			{repr: "decimal capacity for a fixed size", site: "maxDecimalDigits", file: "schema.go"},
 			{
 				repr: "probe-buffer allocation for a fixed logical", site: "jsonDecodeAppliesLogical", file: "json_decode.go",
@@ -873,6 +901,43 @@ var censusRegistry = []censusQuestion{
 			{pattern: `magnitudeWidestMultiplier`, counts: map[string]int{
 				"deser.go":  3, // the const and the prose tying the ceiling to it
 				"schema.go": 2, // the multiply itself, and the note naming it
+			}},
+		},
+	},
+	{
+		id:       "Q23",
+		question: "Which promoted struct field owns an Avro name, and when is the collision ambiguous?",
+		authority: "Go's own field promotion, EXECUTED via reflect.Type.FieldByName: it returns false for a name " +
+			"promoted ambiguously, which is the same condition a program hits as a compile error on x.V. The " +
+			"package adds ONE tier the language has no notion of — a tagged field beats an untagged one at equal " +
+			"depth, since the collision there is in Avro name space and Go sees two differently-named fields — so " +
+			"the untagged cells are decided by Go and the tagged tier by the documented tiebreaker.",
+		answerers: []censusAnswerer{
+			{
+				repr: "Go struct type, for the inferred schema", site: "resolvePromotedFields", file: "schema_for.go",
+				placement: placementWholeSet, walk: "collectFieldsRaw",
+			},
+			{
+				repr: "Go struct type, for the shared encode/decode field map", site: "typeFieldMapping", file: "reflect.go",
+				placement: placementWholeSet, walk: "collect",
+				note: "different-by-design as a FUNCTION — it produces index paths for a schema's field names, not " +
+					"schemaFields — but it must agree cell for cell, because a schema SchemaFor built has to be one " +
+					"Encode and Decode can use. What the two share is the rule and its placement, and the placement " +
+					"is the half no verdict comparison can see: this site keeps its resolution outside its own " +
+					"recursive closure, and the other keeps it outside collectFieldsRaw.",
+			},
+		},
+		tells: []censusTell{
+			// The report resolves index paths that accumulate from the ROOT, so
+			// it only denotes a field when the type it is resolved against is
+			// the root. Every occurrence of that resolution is an answerer.
+			{pattern: `t.FieldByIndex(existing.index).Name`, counts: map[string]int{
+				"schema_for.go": 1,
+				"reflect.go":    1,
+			}},
+			{pattern: `duplicate field name`, counts: map[string]int{
+				"schema_for.go": 1,
+				"reflect.go":    1,
 			}},
 		},
 	},
@@ -951,6 +1016,220 @@ func TestCensus_OutstandingIsRecorded(t *testing.T) {
 	}
 	t.Logf("census: %d registered, %d outstanding, %d demoted, enumeration open",
 		len(censusRegistry), len(censusOutstanding), len(censusDemoted))
+}
+
+// perLevelRanges returns the source ranges in file whose code runs once per
+// recursion level: the body of every function that calls itself, and the body
+// of every func literal that is called through the variable holding it. The
+// second shape is the one a name-only scan misses, and it is the one that
+// matters here — a function can DECLARE a recursive closure and still run a
+// rule outside it, which is exactly the correct arrangement.
+// callGraph is what the placement check is really asking about: not where a
+// rule is WRITTEN, but whether a body that repeats per recursion level can
+// reach it. Extracting the rule into its own function and calling it from
+// inside the walk moves the text and changes nothing, so a check that only
+// looked at containment would bless exactly the arrangement it exists to
+// forbid.
+// repeatingBody locates the body of the named walk in file — either a
+// function that calls itself, or a func literal called through the variable
+// holding it — and reports its byte range plus the names it calls directly.
+//
+// The walk has to be NAMED rather than derived, and that is the point rather
+// than a shortcut. "Reachable from some recursion" is a different question:
+// schema inference recurses too, and a field collector running once per level
+// of THAT walk is correct, because each level is a different record. What
+// makes a placement right or wrong is the recursion whose collected set the
+// rule ranges over, and only the author knows which one that is. Stating it
+// is the fact; everything below checks it.
+func repeatingBody(t *testing.T, file, walk string) (lo, hi int, calls map[string]bool) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", file, err)
+	}
+	off := func(p token.Pos) int { return fset.Position(p).Offset }
+	calleeOf := func(ce *ast.CallExpr) string {
+		switch fn := ce.Fun.(type) {
+		case *ast.Ident:
+			return fn.Name
+		case *ast.SelectorExpr:
+			return fn.Sel.Name
+		}
+		return ""
+	}
+	collect := func(body ast.Node) map[string]bool {
+		out := map[string]bool{}
+		ast.Inspect(body, func(n ast.Node) bool {
+			if ce, ok := n.(*ast.CallExpr); ok {
+				if c := calleeOf(ce); c != "" {
+					out[c] = true
+				}
+			}
+			return true
+		})
+		return out
+	}
+
+	var body *ast.BlockStmt
+	// A func literal bound to `walk`...
+	ast.Inspect(f, func(n ast.Node) bool {
+		bind := func(names []ast.Expr, vals []ast.Expr) {
+			for i, v := range vals {
+				fl, ok := v.(*ast.FuncLit)
+				if !ok || i >= len(names) {
+					continue
+				}
+				if id, ok := names[i].(*ast.Ident); ok && id.Name == walk {
+					body = fl.Body
+				}
+			}
+		}
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			bind(x.Lhs, x.Rhs)
+		case *ast.ValueSpec:
+			names := make([]ast.Expr, len(x.Names))
+			for i, id := range x.Names {
+				names[i] = id
+			}
+			bind(names, x.Values)
+		}
+		return true
+	})
+	// ...or a declared function of that name.
+	if body == nil {
+		for _, d := range f.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Body != nil && fd.Name.Name == walk {
+				body = fd.Body
+			}
+		}
+	}
+	if body == nil {
+		t.Fatalf("%s: no function or bound closure named %q — the registered walk is not there", file, walk)
+	}
+	calls = collect(body)
+	if !calls[walk] {
+		t.Fatalf("%s: %q does not call itself, so it is not a repeating body and naming it as the walk is wrong",
+			file, walk)
+	}
+	return off(body.Pos()), off(body.End()), calls
+}
+
+// enclosingFunc names the declared function containing the given byte offset.
+func enclosingFunc(t *testing.T, file string, offset int) string {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", file, err)
+	}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		if lo, hi := fset.Position(fd.Pos()).Offset, fset.Position(fd.End()).Offset; offset >= lo && offset < hi {
+			return fd.Name.Name
+		}
+	}
+	return ""
+}
+
+// TestCensus_PlacementFactsMatchSource turns a registered placement into a
+// checked fact.
+//
+// Some questions are answered by a rule that ranges over a whole collected
+// SET, not over one value: which promoted field owns a name cannot be decided
+// from one embedded struct's own fields, because a shallower field declared
+// anywhere above takes it. Such a rule has a second property besides its
+// content — WHERE it runs — and two implementations can match on the rule and
+// differ on that. Nothing that compares answers can see it, because at the
+// outermost call the two placements agree; the divergence only shows for the
+// same construct nested one level deeper.
+//
+// So the registry states the placement, and this asserts it against source in
+// both directions, at the position of the question's own tell rather than at
+// its function's name: a rule claiming to run over the complete set must not
+// sit inside a body that repeats per level, and one claiming to run per level
+// must. The distinction is finer than "does this function recurse" — a
+// function may declare a recursive closure and run the rule after it, which is
+// the correct arrangement and the one the fixed collector copies.
+//
+// Moving a whole-set resolution back inside its walk fails here as well as in
+// the behavioural matrix, and the two fail for different reasons: this one
+// names the structure, that one the verdict.
+func TestCensus_PlacementFactsMatchSource(t *testing.T) {
+	stated := 0
+	for _, q := range censusRegistry {
+		for _, a := range q.answerers {
+			if a.placement == "" {
+				continue
+			}
+			stated++
+			if a.walk == "" {
+				t.Errorf("%s: %s states a placement but names no walk; the fact is uncheckable without the recursion whose set the rule ranges over",
+					q.id, a.site)
+				continue
+			}
+			lo, hi, walkCalls := repeatingBody(t, a.file, a.walk)
+
+			// The question's tell IS the rule; find where it sits.
+			b, err := os.ReadFile(a.file)
+			if err != nil {
+				t.Fatalf("reading %s: %v", a.file, err)
+			}
+			var offsets []int
+			for _, tell := range q.tells {
+				if i := bytes.Index(b, []byte(tell.pattern)); i >= 0 {
+					offsets = append(offsets, i)
+				}
+			}
+			if len(offsets) == 0 {
+				t.Errorf("%s: answerer %s (%s) states a placement but none of the question's tells appear in that file — the row has rotted",
+					q.id, a.site, a.file)
+				continue
+			}
+			for _, off := range offsets {
+				// Two ways the rule can run per level: written inside the
+				// walk, or called from it. Extracting it into its own
+				// function and calling it from the walk moves the text and
+				// changes nothing, so containment alone is not the check.
+				inside := off >= lo && off < hi
+				fn := enclosingFunc(t, a.file, off)
+				called := fn != "" && walkCalls[fn]
+				perLevel := inside || called
+
+				switch a.placement {
+				case placementWholeSet:
+					if perLevel {
+						how := "is written inside " + a.walk
+						if !inside {
+							how = "is in " + fn + ", which " + a.walk + " calls"
+						}
+						t.Errorf("%s: %s (%s) is registered as running ONCE over the root's complete set, but the rule %s.\n"+
+							"  Run per level, a whole-set rule decides on a PARTIAL set — a collision below the root is settled before the level that resolves it has been read — and any index path it resolves is in the root's coordinate space while its receiver is the nested type.\n"+
+							"  Either take it back out of the walk, or change the placement fact and say why the rule is now per-level.",
+							q.id, a.site, a.file, how)
+					}
+				case placementPerLevel:
+					if !perLevel {
+						t.Errorf("%s: %s (%s) is registered as running per level of %s, but %s neither contains nor calls it — the fact describes code that is no longer there",
+							q.id, a.site, a.file, a.walk, a.walk)
+					}
+				default:
+					t.Errorf("%s: %s carries an unrecognized placement %q; use placementWholeSet or placementPerLevel so the fact is checkable",
+						q.id, a.site, a.placement)
+				}
+			}
+		}
+	}
+	// Anti-rot in the other direction: with nothing stating a placement this
+	// guard is watching an empty set and would pass forever.
+	if stated == 0 {
+		t.Fatal("no answerer states a placement, so this guard is checking nothing")
+	}
+	t.Logf("checked %d placement facts against source", stated)
 }
 
 // censusSourceFiles returns every non-test .go file the census scans, as
@@ -1047,7 +1326,7 @@ func TestCensus_NoUnregisteredAnswerers(t *testing.T) {
 	// decision — it means the question stopped being one, or was demoted
 	// into censusDemoted with its evidence — so it has to be made here
 	// rather than by a row quietly disappearing.
-	const registered = 16
+	const registered = 17
 	if len(censusRegistry) < registered {
 		t.Fatalf("census registry has %d questions, was %d; a question was removed without "+
 			"recording why. Demote it into censusDemoted with its evidence, or lower this floor "+

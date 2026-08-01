@@ -983,66 +983,154 @@ func saturateSchemaMagnitude(n int) int {
 // are four separate derivations of the same bound (parse, resolve, skip, and
 // the container reader's), and a ceiling applied at one leaves three open.
 func schemaMinBytes(n *schemaNode) int {
-	return schemaMinBytesSeen(n, map[*schemaNode]struct{}{})
+	w := minBytesWalk{
+		path:   make(map[*schemaNode]bool),
+		done:   make(map[*schemaNode]int),
+		budget: maxMinBytesVisits,
+	}
+	v, _ := w.minBytes(n)
+	return v
 }
 
-func schemaMinBytesSeen(n *schemaNode, seen map[*schemaNode]struct{}) int {
+// maxMinBytesVisits bounds the node computations one schemaMinBytes call may
+// perform. The memo makes an acyclic graph linear no matter how many paths
+// reach a node, but a CYCLIC one cannot be memoized at all (see minBytesWalk),
+// and a chain whose levels are mutually recursive still fans out per
+// reference. This is the backstop for that residue.
+//
+// Exhausting it is sound in the one direction that matters. Reaching the cap
+// requires a subtree of cyclic references, which means the node the caller
+// asked about is a record, union or container above them — every one of which
+// costs at least one wire byte, since the reference closing a cycle can be
+// neither `null` nor an all-null record. So the stand-in below is never
+// ABOVE the true minimum, and a bound derived from it is loose rather than
+// wrong. The value is far above the node count of any schema that is not
+// built to hit it: a schema the memo handles never approaches it, which is
+// what TestInvariant_MemoAgreesWithUnmemoizedWalk relies on.
+const maxMinBytesVisits = 1 << 16
+
+// minBytesWalk carries the state of one schemaMinBytes computation.
+//
+// A named type referenced twice binds BOTH references to one *schemaNode, so
+// the graph the walk descends is a DAG, not a tree, and a walk that
+// re-descends per reference does 2^depth work on a schema whose text grows
+// linearly. Nothing about that requires deep nesting — every level can be
+// declared as a sibling field wired by forward reference — so the memo is the
+// only thing that bounds it.
+//
+// The memo is not simply "have I seen this node", because that is also what
+// detects cycles, and the two want opposite lifetimes. Cycle detection needs a
+// mark removed on the way back OUT (a node is only a cycle if it is on the
+// CURRENT path); a memo needs one that survives. That is `path` and `done`.
+//
+// WHICH results may be remembered is the whole subtlety, and the condition is
+// stricter than it first looks. A back-edge does not return the referenced
+// node's minimum — it cannot, that computation is still running — it returns a
+// conservative stand-in. So a result computed through one is a property of the
+// PATH, not of the node.
+//
+// It is not enough to ask whether a back-edge escaped ABOVE the node while it
+// was being computed. A result must also be safe to CONSUME later, and a
+// second entry has a different path: if any node currently being computed lies
+// inside n's subtree, recomputing n would hit it as a back-edge and get a
+// different answer. That is only possible when n's subtree contains a cycle —
+// an on-path node inside n's subtree that also reaches n is exactly a cycle
+// through n — so the exact condition is that n's subtree is entirely
+// cycle-free, and `minBytes` reports that alongside the value.
+//
+// The weaker "no back-edge escaped above me" condition is wrong in a way no
+// cost test can see, because a wrong memo is faster rather than slower:
+// mutually recursive A and X, where A is computed from outside and then
+// consumed from inside X, produce a total that differs from the walk with no
+// memo at all. TestInvariant_MemoAgreesWithUnmemoizedWalk is what settles it.
+type minBytesWalk struct {
+	path   map[*schemaNode]bool // the nodes currently being computed
+	done   map[*schemaNode]int  // results for nodes whose subtree has no cycle
+	budget int                  // node computations left; see maxMinBytesVisits
+}
+
+// minBytes returns node n's minimum wire bytes and whether n's subtree is
+// entirely free of cycles — the condition for remembering the result.
+func (w *minBytesWalk) minBytes(n *schemaNode) (int, bool) {
 	if n == nil {
-		return 1
+		return 1, true
 	}
-	if _, cycle := seen[n]; cycle {
-		return 1
+	if w.path[n] {
+		// Same conservative stand-in as before the memo existed. The false
+		// travels back with it so every enclosing node learns its own result
+		// was reached through a back-edge and must not be remembered.
+		return 1, false
 	}
-	seen[n] = struct{}{}
-	defer delete(seen, n)
+	if v, ok := w.done[n]; ok {
+		return v, true
+	}
+	if w.budget <= 0 {
+		return 1, false
+	}
+	w.budget--
+	w.path[n] = true
+	v, acyclic := w.minBytesFromChildren(n)
+	delete(w.path, n)
+	if acyclic {
+		w.done[n] = v
+	}
+	return v, acyclic
+}
+
+func (w *minBytesWalk) minBytesFromChildren(n *schemaNode) (int, bool) {
 	switch n.kind {
 	case "null":
-		return 0
+		return 0, true
 	case "boolean", "int", "long", "enum":
-		return 1
+		return 1, true
 	case "float":
-		return 4
+		return 4, true
 	case "double":
-		return 8
+		return 8, true
 	case "bytes", "string":
-		return 1
+		return 1, true
 	case "fixed":
 		// The declared size is the one magnitude here the schema text names
 		// outright and the parser leaves unbounded; every wrap below is built
 		// from it, so it is saturated at the point it enters.
-		return saturateSchemaMagnitude(n.size)
+		return saturateSchemaMagnitude(n.size), true
 	case "array", "map":
-		return 1 // empty-collection terminator is 1 byte
+		return 1, true // empty-collection terminator is 1 byte
 	case "union":
 		// found, not a sentinel value: a branch minimum that happened to equal
 		// the sentinel would otherwise read as "no branches at all" and report
 		// the union as costing one byte.
 		m, found := 0, false
+		acyclic := true
 		for _, b := range n.branches {
-			v := schemaMinBytesSeen(b, seen)
+			v, ba := w.minBytes(b)
+			acyclic = acyclic && ba
 			if !found || v < m {
 				m, found = v, true
 			}
 		}
 		if !found {
-			return 1
+			return 1, acyclic
 		}
-		return saturateSchemaMagnitude(1 + m)
+		return saturateSchemaMagnitude(1 + m), acyclic
 	case "record":
 		// Saturating the RUNNING SUM, not just the result: every term is
 		// already in range, so `s + term` cannot wrap, and the clamp keeps it
 		// that way for the next field. A guard on the result alone would test
 		// a value the wrap already destroyed.
 		var s int
+		acyclic := true
 		for i := range n.fields {
-			s = saturateSchemaMagnitude(s + schemaMinBytesSeen(n.fields[i].node, seen))
+			v, fa := w.minBytes(n.fields[i].node)
+			acyclic = acyclic && fa
+			s = saturateSchemaMagnitude(s + v)
 			if s == maxSchemaMagnitude {
-				return maxSchemaMagnitude
+				return maxSchemaMagnitude, acyclic
 			}
 		}
-		return s
+		return s, acyclic
 	}
-	return 1
+	return 1, true
 }
 
 // fastPathSafeForElem reports whether a primitive fast loop with expected

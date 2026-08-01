@@ -494,7 +494,7 @@ func TestGenerative_EmbedShapeWalkerAgreement(t *testing.T) {
 
 		// (B) collectFields (SchemaFor's walker): eager-rejects any ambiguity,
 		//     else resolves every name to the oracle's winner.
-		cf, cfErr := collectFields(sh.t, nil, make(map[reflect.Type]bool))
+		cf, cfErr := collectFields(sh.t, make(map[reflect.Type]bool))
 		if anyAmbig {
 			if cfErr == nil {
 				t.Fatalf("%s: collectFields accepted an ambiguous shape (oracle ambiguous: %v)", sh.label, ambigNames(or))

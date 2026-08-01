@@ -25,6 +25,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +76,16 @@ func wantReject(t *testing.T, name string, fn func() error) {
 	t.Helper()
 	if err, ok := dosRun(t, name, fn); ok && err == nil {
 		t.Errorf("%s: hostile input was accepted (want a fast rejection)", name)
+	}
+}
+
+// wantTerminate asserts fn returns within the budget, whatever its verdict.
+// A legal schema must be ACCEPTED, so the property is termination rather than
+// rejection.
+func wantTerminate(t *testing.T, name string, fn func() error) {
+	t.Helper()
+	if err, ok := dosRun(t, name, fn); ok && err != nil {
+		t.Errorf("%s: legal input was rejected: %v", name, err)
 	}
 }
 
@@ -241,6 +252,63 @@ func TestDoSBattery_OCF_C1_Header(t *testing.T) {
 		}
 		return err
 	})
+
+	// A header schema whose named types are REFERENCED more than once is a
+	// DAG, not a tree: both spellings bind to one node, so any walk that
+	// re-descends per reference does 2^depth work on a header of a couple of
+	// kilobytes. This is the entry point where the schema comes from the INPUT
+	// rather than from the caller, which is what sets the class's severity.
+	//
+	// It needs no nesting at all — the second form declares every level as a
+	// sibling field wired by forward reference, so the header's JSON is four
+	// deep whatever the fan-out — and that is why the nesting pre-scan above
+	// is not the bound for this shape. The bound is that each node is walked
+	// once. Both forms must be ACCEPTED, promptly: they are legal schemas.
+	for _, form := range []struct{ name, schema string }{
+		{"nested", dagRefHeaderNested(26)},
+		{"flat-forward-ref", dagRefHeaderFlat(26)},
+	} {
+		wantTerminate(t, "NewReader/shared-node-header-schema/"+form.name, func() error {
+			r, err := NewReader(bytes.NewReader(ocfWith(form.schema, "null", 0, nil)))
+			if r != nil {
+				r.Close()
+			}
+			return err
+		})
+	}
+}
+
+// dagRefHeaderNested builds an array-of-record header schema where every level
+// declares the next inline and then references it a second time by name, so the
+// two bind to one node.
+func dagRefHeaderNested(levels int) string {
+	inner := `"int"`
+	for i := levels - 1; i >= 0; i-- {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == levels-1 {
+			next = "int"
+		}
+		inner = fmt.Sprintf(`{"type":"record","name":"L%d","fields":[{"name":"f0","type":%s},{"name":"f1","type":"%s"}]}`,
+			i, inner, next)
+	}
+	return `{"type":"array","items":` + inner + `}`
+}
+
+// dagRefHeaderFlat expresses the same type graph with a JSON nesting depth of
+// four regardless of levels, wiring the levels by forward reference.
+func dagRefHeaderFlat(levels int) string {
+	var b strings.Builder
+	b.WriteString(`{"type":"record","name":"Root","fields":[{"name":"z","type":{"type":"array","items":"L0"}}`)
+	for i := range levels {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == levels-1 {
+			next = "int"
+		}
+		fmt.Fprintf(&b, `,{"name":"d%d","type":{"type":"record","name":"L%d","fields":[{"name":"f0","type":"%s"},{"name":"f1","type":"%s"}]}}`,
+			i, i, next, next)
+	}
+	b.WriteString(`]}`)
+	return b.String()
 }
 
 //////////////////////////////////////////////////////////////////////////////

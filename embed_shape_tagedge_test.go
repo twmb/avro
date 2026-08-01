@@ -126,7 +126,7 @@ func TestGenerative_TagEdgeWalkerAgreement(t *testing.T) {
 		}
 		verdictPins++
 
-		cf, cfErr := collectFields(sh.t, nil, make(map[reflect.Type]bool))
+		cf, cfErr := collectFields(sh.t, make(map[reflect.Type]bool))
 		if cfErr == nil {
 			// (2) Two-walker agreement: every field collectFields produced must
 			// map to the SAME Go field under typeFieldMapping. A both-succeed-
@@ -208,7 +208,7 @@ func TestGenerative_UUIDPlainDedup(t *testing.T) {
 			t.Fatalf("order %v: uuid/plain dedup must build a schema: %v", fieldNamesOf(st), err)
 		}
 		// Two-walker agreement on both names.
-		cf, err := collectFields(st, nil, make(map[reflect.Type]bool))
+		cf, err := collectFields(st, make(map[reflect.Type]bool))
 		if err != nil {
 			t.Fatalf("order %v: collectFields: %v", fieldNamesOf(st), err)
 		}

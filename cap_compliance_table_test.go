@@ -516,6 +516,15 @@ var capNotABound = map[string]string{
 	// compliance to check. Its own guards are the ones that watch the
 	// arithmetic (magnitude_arithmetic_test.go).
 	"maxSchemaMagnitude": "an arithmetic ceiling, not a bound on accepted input — nothing is refused for exceeding it",
+	// Exhausting the walk budget REFUSES nothing either: the walk stops
+	// deriving a tighter per-element minimum and falls back to the same
+	// conservative stand-in it already uses for a cycle, which makes the
+	// block bound LOOSER. A schema past the budget parses, encodes and
+	// decodes exactly as before, so there is no over-budget input to build
+	// and no producer-side compliance to check. What watches it is the
+	// agreement with an un-memoized walk (schema_dag_cost_test.go), which is
+	// where a budget set low enough to change an answer would surface.
+	"maxMinBytesVisits": "a walk budget that loosens a derived bound, not a bound on accepted input — nothing is refused for exceeding it",
 }
 
 // TestInvariant_EveryCapIsClassified is the completeness half: a cap added

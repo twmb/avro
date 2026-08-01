@@ -11386,3 +11386,463 @@ an entry point this round's own matrix never drove. Adding a column then red
 the breadth column's derived entry-point guard, which is the machinery working:
 a new battery cell is a new entry point, and every other derived axis must
 cross it or name it exempt.
+
+
+## Distillation archive (2026-07-31 #45) — AUDIT_PATTERNS P22 tombstone
+
+Tombstoned to make room for P28 and B37 (PATTERNS was 5 bytes under its 150000
+bound). Both halves of P22 are closed by permanent mechanisms and it has not
+yielded since 2026-07-27; the tombstone in AUDIT_PATTERNS names the nets and the
+re-open condition. Full entry, verbatim:
+
+22. **A parsed attribute's ZERO VALUE is its own absence sentinel.** An attribute read into a struct field with no present/absent companion (`Doc string`, `Order string`, `LogicalType string`, `Size int`, `Scale int` — contrast `HasEnumDefault`/`HasDefault`, which are immune) cannot distinguish "written as the zero value" from "absent". Every downstream `x != ""` / `x != 0` test then means TWO things at once, and both readings are silently wrong for one input: a VALIDATOR guarded that way skips exactly the zero value (`{"order":""}` parses while every other non-spec order rejects), and an EMITTER guarded that way drops it (`{"type":"int","doc":""}` and `{"type":"int","logicalType":""}` die in `Root().Schema()` where both references preserve them). **The JSON-null sub-shape is sharper and is invisible to shape guards:** `json.Unmarshal([]byte("null"), &n)` for a non-pointer `n` is a documented NO-OP that returns a NIL ERROR, so a `null` body reaches the destination's zero through a decode that REPORTS SUCCESS — a guard that only checks "did the decode error" cannot see it (`"scale":null` -> decimal(p,0), the outcome NOT_BUGS #71 declares forbidden; `"size":null` -> a zero-width fixed Java rejects). **Probe:** for every parsed attribute, name the zero value of its destination field, then write the attribute AS that zero and as JSON `null`, and compare the metadata surface, the rebuild and the accept verdict against the same schema with the key ABSENT and MALFORMED-in-shape; a guard is only real if the verdicts differ where they should. Invisible to a completeness guard that sets each field to a NON-ZERO value — the zero is the axis such a guard holds constant (B32). Pairs with P1 and P7.
+
+  **BOTH halves closed 2026-07-27, by DIFFERENT mechanisms — the distinction is the pattern's real content.** The NULL half is a body the decode cannot READ, and it had exactly two vulnerable sites (the re-marshal-then-decode-into-a-typed-destination helpers), because every other reserved key is read by type ASSERTION and a JSON null satisfies none; both now ask one predicate (`jsonNullBody`, census **Q18**) and a null is a MALFORMED body everywhere. The WRITTEN-ZERO half is a body the decode reads PERFECTLY into a value indistinguishable from absence, so no body check can see it — it needs presence state beside the field (`docSet`/`logicalSet`/`orderSet`, hidden), and the emptiness walk must consult the SAME state as the emitter or the collapse fires before the emitter is reached.
+  **The trap in the written-zero half: the emission condition is PER ATTRIBUTE, so a blanket "was it written" rule ships a divergence.** Apache Avro emits doc when non-NULL (:1039/:1154/:1367/:1062) and aliases when non-EMPTY (:886/:1070); order is decided on the NODE (:1895-1897) so `""` reaches valueOf and throws; and anything absent from SCHEMA_RESERVED survives as a property whatever its content. Copy the conditions, not the idea. **Probe:** derive the expected cell from the reference's EMISSION site, not from its parse site — they disagree per attribute, and the parse site is the one people read.
+  **Net:** `TestMatrix_ReservedAttributeEnumeration` (2184 cells, expectations derived per cell from a cited Java source model plus executed fastavro, `reservedProvenance` naming what settled each) · `_BareEmissionCoversPresenceOnlyFields` (walk/emitter agreement, with a reachability precondition — its first version could not red, the probe being a named kind, which never collapses) · `_PresenceStateIsValueTransparent`. **PLACEMENT AUTHORITY is what settles a cell neither reference answers wholesale:** the authority for a placement is whichever reference actually HAS it, and it governs the empty and non-empty body alike; where neither has it, the package's own adjudicated posture does. Deriving one body of an attribute from a reference's ABSENCE while its sibling follows another reference's PRESENCE splits one placement between two authorities — the shape that produced a wrong ruling here once. **Re-opens:** a typed-destination read that does not ask Q18's predicate, or a new attribute whose zero is legal and whose presence nothing records.
+
+
+## Distillation archive (2026-07-31 #46) — three ledger lines merged into one era line
+
+CORE size-guard: the file was 21 bytes under its 55000 bound with a net-gap entry
+and a ledger line to add. The three lines below are all fully archived (2026-07-28
+#33; 2026-07-29 #36, #37; 2026-07-30 #38) and are superseded by the later
+convergence anchors, so they compress to one era line. Verbatim originals:
+
+- 2026-07-28 · 4131d72 · FULL · **2 behavioral findings; counter RESET to 0.**
+  Both ONE shape — a guard keyed in a different space than what it protects, now
+  P24. Method: the second came from taking the first's shape seriously, not a new
+  front. Inverse-density front was mechanical (test-reference COUNT per exported
+  identifier), surfacing `atype` and `rabin`. Archive (2026-07-28 #33).
+- 2026-07-29 · 4131d72→7c177c7 (START heads) · FIX + FIX/FULL · two halves of
+  ONE shape needing OPPOSITE fixes (presence split from identity; the TAG TABLE
+  fixed rather than the parse check — Java ACCEPTS that union, and the reported
+  binary claim was executed-WRONG both ways). **The maintainer could not red the
+  new tag nets in three neuters, and was right**: mine each bundled several
+  mechanisms, and the binary decode wrap tag had no cell because the matrix
+  never drove that CONSUMER (B32a/B32b). FULL found 1 behavioral: the two tag
+  RESOLVERS disagreed on the legacy tag under a parity comment. Census Q20+Q21;
+  NOT_BUGS #76. Archive (2026-07-29 #36, #37).
+- 2026-07-30 · 1b1933f (START head) · FIX · legacy tag fixed PERMISSIVE by
+  DERIVING the tier set (`unionTagTiers`, walked by both consumers); the hand
+  copy DELETED. **Deriving produced a behavioral change the report did not
+  contain** (tier 2 lacked tier 3's ambiguity guard, so `fixed.uuid` decoded on
+  JSON and refused on binary; both refuse now). Four attacks, four red sets.
+  Convention 1 grew **(f) DERIVE THE SET**. Archive (2026-07-30 #38).
+
+
+## Distillation archive (2026-07-31 #47) — the two c17986f ledger lines, verbatim
+
+Merged into one era line by the same CORE size-guard pass as #46; both are fully
+archived (2026-07-30 #39, #40). Verbatim originals:
+
+- 2026-07-30 · c17986f · FULL · **0 behavioral; 2 DoS** on an axis the battery
+  had no column for, both quadratic in a caller-chosen SIBLING count (the tag
+  tables' dup scan, whose rationale was an INPUT assumption the introducing
+  round had measured false; and the per-writer-field scan in Resolve +
+  CheckCompatibility). **Severity is set by reachability** — `ocf.NewReader`
+  resolves a file's own header schema. P25. Archive (2026-07-30 #39).
+- 2026-07-30 · c17986f (START head) · FIX · both quadratics fixed; the durable
+  half is a breadth column DERIVING its axes. `readerFieldLookup` keeps TWO maps
+  consulted in order — every field NAME outranks every ALIAS, which a merged map
+  reverses; #50 cites that routing, so it is a CONTRACT. One neuter came back
+  GREEN and that was the finding (the discriminating cell is the PER-FIELD
+  merge); two probes did not reach their path and a guard, not review, caught
+  both. Archive (2026-07-30 #40). UNCONVERGED.
+
+
+## Distillation archive (2026-07-31 #48) — the DAG-cost FULL round narrative, verbatim
+
+HEAD 5bd3ac0, read-only. Quarantine scope was 5bd3ac0 alone (299c392 was the prior
+line's START head, and the only code commit after it is the saturation fix).
+
+Nets: `go test -count=1 ./...` green; the fastavro differential green with
+AVRO_FASTAVRO_PYTHON set against fastavro 1.12.2, EXECUTED (the placement
+differential ran its full cell set, zero `missing optional dependency` lines). The
+Java oracle did not run — still no JVM on this machine — so every Java-value
+question is verified-modulo-that-oracle.
+
+Quarantine of the saturation fix, clean. `saturateSchemaMagnitude` is total, and
+every arm of `schemaMinBytesSeen` returns inside [0, maxSchemaMagnitude] (null 0,
+scalars 1/4/8, fixed saturated, containers 1, union saturate(1+m), record a
+saturated RUNNING sum, both fallbacks 1), so the documented postcondition holds by
+enumeration rather than by comment. Every `deserMap`/`deserArray` construction sets
+its bound through that one function, so `checkMapBlockBounds`' divisor is >= 1 by
+construction. `maxDecimalDigits`' rewrite is verdict-IDENTICAL: at or below
+`decimalScaleLimit` the multiply is unchanged (`magnitudeWidestMultiplier` is 8),
+and above it both the old ceiling and the new saturated capacity exceed a precision
+that `validateLogical` has already capped, so no input changes answer.
+
+The round's question was one no prior round had asked: what does a schema walk cost
+when the SAME node is reachable by two paths. A named type referenced twice IS that
+shape, and it is ordinary schema text.
+
+(a) `schemaMinBytesSeen` marks on entry and UNMARKS on exit (`defer delete(seen,
+n)`). That is a path set, which is the right structure for detecting cycles and the
+wrong one for a walk whose answer is path-INDEPENDENT: a node's minimum wire size
+does not depend on how you got there, so the result should have been memoized.
+`record Ln{a: Ln+1, b: Ln+1}` chained n deep therefore costs 2^n. Measured on the
+array-topped form: depth 22 = 0.92 s, 24 = 4.3 s, 26 = 19.2 s — 2.1x per level, on
+text growing ~88 bytes per level. Entry points, each measured: `avro.Parse` (arrays
+pay it twice, maps once — the exact 2x ratio that localized the walk),
+`SchemaCache.Parse` (the memo saves only a REPEATED text), `Resolve` when a writer
+field is dropped and a skip is compiled (486 ms at depth 22, timed after parse), and
+`ocf.NewReader`, where the schema comes out of the file header: a 1999-byte file
+took 892 ms.
+
+No depth cap can defend it. The same fan-out is reachable FLAT — every level
+declared as a sibling field of one record, wired by forward reference, JSON nesting
+depth 4 — and 2838 such bytes took 1.84 s, so the bracket pre-scan sees nothing.
+
+The battery already owns this axis and still missed it. C6 is titled "metadata DAG /
+shared-reference fan-out" and its own comment says the axis is "reachable only by
+HAND-BUILDING a SchemaNode (Parse's bracket pre-scan rejects the deep-JSON route up
+front)". That premise is the finding: a named reference is the carrier the column did
+not have, and it needs no depth at all. This is P23's shape one level up — a
+rationale gated on ONE carrier — applied to a NET rather than to a cap. Recorded as
+P28 and as gap G1.
+
+(b) The same DAG question in the Go type domain: a struct reachable through two
+sibling embed paths. `avro.SchemaFor` PANICS — `reflect: Field of non-struct type
+int` — because `collectFields`' duplicate-name resolution sits at the END of the
+RECURSIVE function, so it runs at every level, while the index paths it resolves are
+accumulated from the ROOT. Below the root it therefore calls
+`t.FieldByIndex(root-relative index)` on the NESTED type. Five tiny types reproduce
+it. Three consequences, all executed: it panics; where the mismatched path happens to
+resolve it names the WRONG Go fields (reported "Z" and "Z" for a collision on "V",
+and attributed to the nested type rather than the requested one); and it decides the
+ambiguity at a level that cannot see the outer scope, so a shallower field that Go's
+own promotion uses to resolve the collision never gets its turn — rejecting a struct
+that Go, `encoding/json`, and this package's own `Encode` all accept, which is
+exactly the parity the commit introducing the rejection set out to guarantee.
+
+The runtime twin carries the IDENTICAL line and is correct, because it puts the block
+OUTSIDE its recursive closure. So two copies of one rule agreed on the rule and
+disagreed on WHERE it runs — convention 1(f)'s "mirroring is not deriving" applied to
+structure rather than to rule text, which no accept-set or message-equality net can
+see. Recorded as B37.
+
+The inverse-density front was a new metric: the functions named in NO audit document
+AND in no `_test.go` — 153 of them, the shadow of the audit's own attention rather
+than of the test suite's. `collectFields` is in that set. The clusters were walked
+(time conversions, the hand-rolled JSON scanner, `metadataValueLimit`, the Y4
+narrowing trilogy) and only the embed collector yielded.
+
+Also verified clean, each with a probe rather than a reading: decoded values never
+alias the source buffer and encoded output never aliases caller input (scribble the
+buffer after the call, across 8 schema shapes x 2 target kinds); the Go type edge
+domain takes no panic anywhere (complex64/128, chan, func, uintptr, unsafe.Pointer,
+non-string map keys, reflect.Value, arrays, double pointers, crossed with 13 schemas
+over Encode / EncodeJSON / SchemaFor / Decode targets); `nodeAwaitsForwardRef` is
+linear in schema text despite a fresh visited set per call (352 KB in 47 ms); the OCF
+reader's metadata caps, block bounds, zero-byte slack and codec bounds; and the Y4
+narrow-before-check trilogy, whose every remaining hit is guarded or provably in
+range.
+- 2026-07-31 · 5bd3ac0 · FULL (+ quarantine of 5bd3ac0) · **1 behavioral + 1 DoS
+  CLASS; counter RESET to 0.** Both from ONE question no round had asked: what does
+  a walk cost when the same node is reachable by two paths. (a) `schemaMinBytesSeen`
+  detects cycles with a PATH set (`defer delete`) where its answer is
+  path-INDEPENDENT, so a named type referenced twice is a DAG it re-walks: 2.1 KB of
+  schema = 3.8 s, 2.3 KB = 19 s, 2× per level, through `avro.Parse`,
+  `SchemaCache.Parse`, `Resolve`, and `ocf.NewReader`, where the file supplies the
+  schema. Depth caps cannot defend it — the same fan-out is reachable at JSON depth
+  4 via forward references. Now **P28**, and gap **G1**: the battery's C6 already
+  NAMES this axis and misses it, because its rationale asserts one carrier. (b) The
+  same DAG in the Go type domain made `SchemaFor` PANIC (`reflect: Field of
+  non-struct type int`): `collectFields`' ambiguity block sits inside the recursion,
+  so below the root it resolves a ROOT-relative index against the NESTED type —
+  panicking, naming the wrong Go fields, and rejecting a struct that Go promotion,
+  `encoding/json`, and this package's own `Encode` all accept. Its runtime twin puts
+  the identical line OUTSIDE the recursion and is correct; now **B37**. Also clean:
+  quarantine (saturation is total, every arm in range, `maxDecimalDigits`
+  verdict-identical), decode/encode buffer ownership, the Go-type edge domain
+  (complex/chan/func/uintptr/non-string map keys across Encode/EncodeJSON/SchemaFor/
+  Decode targets — no panics), Y4 refresh, `nodeAwaitsForwardRef` cost. Java oracle
+  un-netted (no JVM); fastavro differential ran green. Inverse-density metric was NEW:
+  the 153 functions named in NO audit doc AND no test file — which is where
+  `collectFields`' report line was. PATTERNS + CORE both needed a distillation pass
+  to fit this round's entries (archive 2026-07-31 #45, #46, #47).
+
+
+## Distillation archive (2026-07-31 #49) — the two f29f4c2 ledger lines, verbatim
+
+Merged into one era line by the same CORE size-guard pass as #46/#47; both are
+fully archived (2026-07-30 #41, #42). Verbatim originals:
+
+- 2026-07-30 · f29f4c2 · FULL · **0 behavioral; 6 DoS, one CLASS** (P26): a
+  parse-time table built for the BINARY wire had no JSON consumer, so five JSON
+  sites re-derived it per value by scanning siblings, each under a
+  mirrors-the-binary comment true about the ANSWER and silent about COST.
+  Sixth: `findMatchingBranch` inside the writer-branch loop. Method: the
+  CONTAINER axis, held constant at `record` by every cell. Coverage as the
+  inverse-density metric (96.8%) found two dead branches. Archive (2026-07-30 #41).
+- 2026-07-30 · f29f4c2 (START head) · FIX · **six per-value sibling scans closed
+  by giving the question ONE table on the NODE** (`unionTags` + enum `symbolIdx`
+  beside `fieldIdx`, refilled IN PLACE; the serializers share the allocation, so
+  accept-sets are equal by IDENTITY). Branch selection restated as DATA
+  (`branchMatchTiers`), promotion tier deriving from `promotions`; Java scans
+  too, so the constraint was verdict IDENTITY. Durable half: the breadth
+  column's SHAPE axis derived by reflection over `schemaNode`'s slice fields.
+  **Eleven attacks; one came back GREEN and that was the finding** — `Resolve`
+  returns `node: reader.node`, so the resolved-carry pin asserted nothing until
+  re-aimed at `resolveNode`. Archive (2026-07-30 #42). UNCONVERGED.
+
+
+## Distillation archive (2026-07-31 #50) — the two oldest era blocks, verbatim
+
+Compressed by the same CORE size-guard pass as #46/#47/#49; both cite their own
+full narratives (2026-07-28 #27; #22, #28-#32, #35). Verbatim originals:
+
+- 2026-07-01..28 · ea9a2ce→40c36e4 · HISTORICAL BLOCK (archive 2026-07-28 #27 and
+  the narratives it cites). CONVERGED→RESET→RE-CONVERGED cycles; #53–#75 filed and
+  fixed; the #63 stray-key family; the #46 reserved-key flip; P19–P23; R1 distilled
+  into the PREDICATE CENSUS; the 2184-cell reserved-attribute ENUMERATION with
+  expectations derived per cell and 71 UNRULED rather than guessed, yielding
+  **#74** and **PLACEMENT AUTHORITY** → **rule 2a** (reference SILENCE is not a
+  SPLIT); **RULE 7a**; convention 1 grew (e). Two standing lessons: MEASUREMENT
+  NEVER HAPPENED (neuter rule amended to the TRIPLE), and a net that reds is not a
+  net that MEASURES — twice the probe was the bug.
+- 2026-07-28 · 15669c8→a6dd44e · PRODUCER-COMPLIANCE BLOCK (archive 2026-07-28 #22,
+  #28–#32, #35). The DEFAULT carrier is pre-encoded by a SECOND encoder sharing no
+  code with the serializers → a cap TABLE whose classifier FAILS on an unrowed cap,
+  proving #11's written list was not the set; the default walk's UNION arm got a
+  per-attempt sink merged only for the winner; one CLEAN FULL (the size guard became
+  ARITHMETIC); the caller-value net went from AGREEMENT to an ABSOLUTE per-cell
+  verdict, catching three wrong expectations of my own.
+
+
+## Distillation archive (2026-07-31 #51) — the saturation FIX round's ledger line, verbatim
+
+Compressed by the same CORE size-guard pass as #46/#47/#49/#50, once the DAG-cost
+FULL line superseded it as the quarantine boundary. Narrative: 2026-07-31 #44.
+Verbatim original:
+
+- 2026-07-31 · 299c392 (START head — 299c392..HEAD quarantines this round's
+  commits) · FIX · saturation at the PRODUCER, and the maintainer's two
+  corrections drove the round: the union arm CANNOT wrap (its sentinel start
+  makes a MaxInt64 branch fail `v < m`), so the overflow is entirely the record
+  arm's SUM; and `maxDecimalDigits` already clamped this to its OWN ceiling,
+  with a third site (`jsonDecodeAppliesLogical`) besides. ONE ceiling now,
+  chosen against the widest multiplier any consumer applies, with the
+  ALLOCATION-vs-arithmetic split stated in the accessor so a fourth site cannot
+  re-reason it. **The set is not readers-of-`.size`** — the wrap holds no
+  `.size` at all — so derive by taint fixpoint over arithmetic →
+  integer-returning fn → integer-typed PARAM, the last being what reaches
+  `maxDecimalDigits`. 17 expressions, 13 functions, each rowed with a reason
+  including over-reports; census Q22. **Three of five first-pass attacks came
+  back WRONG and that was the yield**: `["null",huge]` has minimum 0 from its
+  null branch so it never drove the union arm, and two neuters returned RUN=0 —
+  compile errors read as reds. The sentinel is correct-unobservable alone
+  (measured immunity) and its wrong answer is `1`, inside every range check, so
+  it needed an oracle of its own. Battery column C11 reds on `SchemaCache.Parse`,
+  which this round's own matrix never drove; the breadth column's derived guard
+  then red on C11 itself — adding a column adds ENTRY POINTS every other derived
+  axis must cross or exempt. Archive (2026-07-31 #44). UNCONVERGED.
+
+
+## Distillation archive (2026-07-31 #52) — the divide-by-zero FULL round's ledger line, verbatim
+
+Compressed by the same CORE size-guard pass as #46/#47/#49/#50/#51. Narrative:
+2026-07-31 #43. Verbatim original:
+
+- 2026-07-31 · 299c392 · FULL (+ quarantine of f2ad712) · **1 behavioral:
+  counter RESET to 0.** A reachable `integer divide by zero`: `schemaMinBytes`
+  wraps on `fixed(MaxInt64)`, so `checkMapBlockBounds`' divisor becomes 0 — all
+  four `minEntryBytes` producers panic on ONE wire byte, including a
+  file-supplied `ocf.NewReader` schema. Now P27. Inverse-density front was
+  per-FUNCTION test-mention count (76 with no test NAMES), but the finding came
+  from their CALLERS' arithmetic. Quarantine clean; also clean: resolved-JSON vs
+  resolved-binary, `DecodeJSON→any→Encode`, PCF vs fastavro, Y4, kind switches.
+  Archive (2026-07-31 #43).
+
+
+## Distillation archive (2026-07-31 #53) — AUDIT_PATTERNS P20/P21 body tombstones
+
+Their standing remedy is executable (`predicate_census_test.go`) and the Index entries carry
+the probes, which is what a reader needs; the bodies were duplicating both. Tombstoned to
+make room for the P28/B37 amendments this round earned. Verbatim originals:
+
+20. **A predicate keys on ONE SPELLING of a type whose grammar admits several, so semantically identical schemas take different code paths.** Avro spells one type more than one way — bare `"null"` and wrapped `{"type":"null"}` are the same branch (likewise `"int"`), and the wrapped form may carry props or a logicalType, both inert on a null. The spellings land in DIFFERENT fields (`aschema.primitive` vs `aschema.object`), so `x.primitive == "null"` silently means "bare only" while its twin `x.kind == "null"` sees both. Invisible to every round-trip and wire net (the two spellings produce IDENTICAL wire bytes — only derived artifacts diverge: ser/deser arm, `fieldMeta`, lift target, consume verdict, error identity) and to any matrix whose union fragments are all bare-spelled (spelling as the held-CONSTANT axis, B32). **Probe: grep the LITERAL, not the accessor** — `grep -n '== "null"'` over non-test files, then classify each hit by REPRESENTATION. An accessor sweep (`\.primitive ==\|\.kind ==\|\.Type ==`) sees only the parsed/compiled node and is structurally blind to the pre-Parse `any` tree, where a branch is an `[]any` ELEMENT (`union[0] == "null"`) with no field to name. The representations to enumerate: parsed `aschema` · compiled/metadata node kind (normalized) · pre-Parse `any` tree (SchemaFor composition, cache splice). **Standing lesson: one shared predicate per REPRESENTATION is the ceiling — a fix reaches only the representations that CALL it, so a sweep enumerates representations, not call sites.** Netted by `TestMatrix_NullBranchSpellingParity` + `_SchemaForNullBranchSpellingParity` + `TestDifferentialFastavroSchemaForNullSpelling`. Instances (`isNullBranch`, `isNullBranchTree`, fixed in two rounds because the first sweep was accessor-keyed): archive (2026-07-25 #8, 2026-07-27 #4).
+
+21. **A consult-side guard hand-enumerates what an AUTHORITY accepts, instead of asking the authority.** Some rule already has one owner — a resolver (`scopedRefKeys`/`lookupNameRef` owns "which spellings bind to this name"), or the stdlib (`encoding/json`'s `resolveKeyName` owns "what does a map key emit"). A later guard answering the SAME question restates the rule as a hand-written list. The list is a snapshot: missing members from the day it is written, and unable to track the authority. Two failure directions, both silent at review time because the restatement READS correct: **under-enumeration** rejects input the authority accepts, and **missing guards** drops a defensive branch the authority has (converting a valid value into a panic). The tell in review is prose of the form "the two forms X binds" / "mirrors X's resolver" beside a literal enumeration — that comment is a claim (convention 5), and the way to check it is to READ the authority and diff the sets, never to read the comment. **Probe:** for any predicate whose doc names another function as the rule's source, open that function, enumerate its accepted set / its guards, and cross every member against the predicate; then ask whether the predicate could have CALLED it instead — delegation is the fix, a longer literal list is the same bug with a later expiry. The same shape at the level of a whole ROUTING RULE is an enumeration of consumed cases where a DERIVED predicate belongs: a fall-through then silently absorbs whatever the list forgot (`schemaReservedKeyForObject` → `schemaKeyBinds`, #63(j)). Pairs with B14 and P19 (both "the replacement is coarser/narrower than what it replaced"). Instances (`nodeRefTargetAgrees` vs `scopedRefKeys`' three spellings; `mapKeyEmitLen` vs the stdlib's nil-pointer guard; the `strayShapeRecorded` verdict keyed per canonical key while the loop ran per raw key — P19's form) and the rule 7a restatement escape hatch: §The predicate-agreement census, and archive (2026-07-25 #8, 2026-07-27 #4).
+
+
+## Distillation archive (2026-07-31 #55) — the pre-era and key-space era ledger blocks, verbatim
+
+Merged into one line by the CORE size-guard pass this round; both cite their own full
+narratives. Verbatim originals:
+
+- 2026-07-01..28 · ea9a2ce→a6dd44e · PRE-ERA BLOCK (archive 2026-07-28 #27, #22,
+  #28-#32, #35, and the narratives they cite). CONVERGED→RESET→RE-CONVERGED cycles;
+  #53-#76 filed and fixed; the #63 stray-key family; the #46 reserved-key flip;
+  P19-P23; R1 distilled into the PREDICATE CENSUS; the 2184-cell reserved-attribute
+  ENUMERATION with expectations derived per cell and 71 left UNRULED rather than
+  guessed, yielding **#74** and **PLACEMENT AUTHORITY** → **rule 2a** (reference
+  SILENCE is not a SPLIT); **RULE 7a**; convention 1 grew (e). The DEFAULT carrier
+  proved to be pre-encoded by a SECOND encoder sharing no code with the serializers →
+  a cap TABLE whose classifier FAILS on an unrowed cap, proving #11's written list was
+  not the set. Two standing lessons: MEASUREMENT NEVER HAPPENED (the neuter rule
+  became the TRIPLE), and a net that reds is not a net that MEASURES.
+- 2026-07-28..30 · 4131d72→1b1933f · KEY-SPACE ERA (archive 2026-07-28 #33;
+  2026-07-29 #36, #37; 2026-07-30 #38). FULL found 2 behavioral, ONE shape — a guard
+  keyed in a different space than what it protects, now **P24**; counter RESET. The
+  two FIX halves needed OPPOSITE fixes (presence split from identity; the TAG TABLE
+  fixed, not the parse check — Java ACCEPTS that union, and the reported binary claim
+  was executed-WRONG both ways). **The maintainer could not red the new tag nets in
+  three neuters, and was right**: each bundled several mechanisms, and the binary
+  decode wrap tag had no cell because the matrix never drove that CONSUMER (B32a/b).
+  The legacy tag was then fixed PERMISSIVE by DERIVING the tier set (`unionTagTiers`,
+  walked by both consumers, hand copy DELETED), which produced a behavioral change the
+  report did not contain. Census Q20+Q21; NOT_BUGS #76; convention 1 grew **(f)**.
+
+
+## Distillation archive (2026-07-31 #56) — the f29f4c2 era line, verbatim
+
+Compressed by the same CORE size-guard pass; archived at 2026-07-30 #41, #42.
+
+- 2026-07-30 · f29f4c2 (FULL, then START head for the FIX) · **0 behavioral; 6 DoS,
+  one CLASS** (P26): a parse-time table built for the BINARY wire had no JSON consumer,
+  so five JSON sites re-derived it per value by scanning siblings, each under a
+  mirrors-the-binary comment true about the ANSWER and silent about COST; the sixth was
+  `findMatchingBranch` inside the writer-branch loop. Method: the CONTAINER axis, held
+  constant at `record` by every cell; coverage as the inverse-density metric (96.8%)
+  found two dead branches. Closed by giving the question ONE table on the NODE
+  (`unionTags` + enum `symbolIdx` beside `fieldIdx`, refilled IN PLACE, serializers
+  sharing the allocation so accept-sets are equal by IDENTITY); branch selection restated
+  as DATA (`branchMatchTiers`). Java scans too, so the constraint was verdict IDENTITY.
+  Durable half: the breadth column's SHAPE axis derived by reflection over `schemaNode`'s
+  slice fields. **Eleven attacks; one came back GREEN and that was the finding** —
+  `Resolve` returns `node: reader.node`, so the resolved-carry pin asserted nothing until
+  re-aimed at `resolveNode`. Archive (2026-07-30 #41, #42).
+
+
+## Distillation archive (2026-07-31 #54) — the DAG-cost FIX round narrative, verbatim
+
+START head 5bd3ac0. Both findings from the preceding FULL round fixed, plus the
+battery column and the census row the maintainer asked for.
+
+### F1 — the memo, and the condition that is not the obvious one
+
+The reported bug is a cycle detector standing in for a memo: `schemaMinBytesSeen`
+marked on entry and unmarked on exit, which is right for cycles and exponential on
+a DAG. The fix is to remember results — but WHICH results is the whole of it, and
+the first two conditions I wrote were both wrong.
+
+"No back-edge escaped ABOVE me while I was being computed" is the natural one and
+it is unsound. A memo is not only written, it is CONSUMED, and a later entry has a
+different path: if any node currently being computed lies inside n's subtree,
+recomputing n would hit it as a back-edge and get a different answer. Mutually
+recursive A and X, where A is computed from outside and then consumed from inside
+X, is the counterexample; it produced 67 where the walk with no memory at all says
+51. The exact condition is that n's subtree is entirely cycle-free — an on-path
+node inside n's subtree that also reaches n is exactly a cycle through n.
+
+Nothing already in the suite could have caught that, and nothing built from the
+bug's own axes would have either. A wrong memo is FASTER, so every cost cell is
+blind to it. The fully-expanded twin — the oracle that catches sharing changing an
+answer — cannot reach the class at all, because the discriminating schemas are
+cyclic and have no finite expansion. What settles it is a transcription of the
+walk with NO memo, run per node over a corpus: whatever it computes is
+entry-independent by construction, because it never carries anything between
+entries. That is TestInvariant_MemoAgreesWithUnmemoizedWalk, and it is the cell
+that failed twice while I was getting the condition right.
+
+The exact condition leaves a residue: a cyclic DAG cannot be memoized at all, so a
+chain whose levels are mutually recursive, or one big strongly-connected
+component, still fans out per reference. A visit BUDGET bounds that. Exhausting it
+is sound in the one direction that matters — reaching the cap requires a subtree of
+cyclic references, so the node the caller asked about is a record, union or
+container above them, every one of which costs at least one wire byte, since the
+reference closing a cycle can be neither `null` nor an all-null record. The
+stand-in is therefore never ABOVE the true minimum and the bound is loose rather
+than wrong. It is classified in the cap table as not-a-bound: nothing is refused
+for exceeding it.
+
+**The budget MASKED the memo, and the neuter is what said so.** With the budget in
+place, removing the memo leaves every cost cell green — the budget stops the walk
+either way. Neuter A came back green, which is a finding about the net rather than
+the code: the memo's observable is the VALUE, not the cost. The cell that
+discriminates it asserts the exact minimum at a scale only a memo reaches, and the
+expected number is arithmetic on the schema's own definition (fan^levels), not
+anything read off this package. Four attacks after that, four disjoint red sets:
+memo off reds only the exact-value cell; budget off reds only the cyclic cost
+cells; memoizing unconditionally reds only the un-memoized-walk agreement; and the
+F2 neuter reds only the placement family.
+
+The maintainer's carrier note was right and is now structural rather than
+remembered: `schemaMinBytes` is entered only where a container asks for a
+per-element minimum, so a cell built on a bare record DAG measures nothing.
+TestInvariant_MinBytesCallSites derives that set from source — every call, rowed
+with the public entry point that reaches it — and fails on an unrowed caller, a
+drifted count, and a row whose file no longer calls it.
+
+### F2 — hoisted, not re-based
+
+The resolution moved out of `collectFieldsRaw` into `resolvePromotedFields`, called
+once from `collectFields`. Re-basing the index would have fixed the panic and left
+the false rejection, which is the worse half: a type Go promotes unambiguously,
+`encoding/json` marshals, and this package's own encoder handles was being
+rejected. The index parameter is GONE from `collectFields`, so there is no
+root-relative path left to mis-resolve — the arrangement is enforced by the
+signature rather than by a comment.
+
+The doc string was already correct. doc.go and README both state the fixed rule
+("among fields with the same tagged status, the shallowest wins ... two fields at
+the same depth with the same tagged status are an ambiguous collision") and name
+Go itself as the authority ("Go itself makes such a field reference a compile
+error"). So the matrix uses `reflect.Type.FieldByName` as an EXECUTED oracle — it
+returns false for an ambiguously promoted name — and the documentation became true
+rather than needing a change.
+
+### The placement fact
+
+Two implementations agreeing on a RULE and disagreeing on WHERE IT RUNS is
+invisible to every net that compares answers: at the root both placements agree.
+The census now carries the fact per answerer (`placement` + `walk`, Q23), and
+three things make it checkable rather than decorative.
+
+It must NAME ITS WALK. "Is this rule reachable from some recursion" is a different
+question and answers yes for nearly everything — schema inference recurses too, and
+a field collector running once per level of THAT walk is correct, because each
+level is a different type. Only the author knows which recursion's collected set
+the rule ranges over.
+
+It must check REACHABILITY, not containment. Extracting the rule into its own
+function and calling it from inside the walk moves the text and changes nothing; a
+containment check blesses exactly the arrangement it exists to forbid. The check is
+written-inside-the-walk OR called-by-it.
+
+It must fail in both directions. Four attacks, four reds: move the call back into
+the walk; inline the rule into the walk's body; flip a whole-set fact to per-level;
+name a walk that does not recurse.
+
+### The battery, and what adding a column costs
+
+C6 already owned this axis — it is titled "metadata DAG / shared-reference
+fan-out" — and missed the finding because its rationale said the axis was
+"reachable only by HAND-BUILDING a SchemaNode". That premise is the finding: a
+named type referenced twice is the DAG, ordinary schema text expresses it, and the
+flat forward-reference spelling puts it past any nesting bound. The column now
+crosses the axis with the ENTRY-POINT list — Parse, SchemaCache.Parse, the metadata
+walk, Resolve both ways, CheckCompatibility, the wire paths — in both spellings,
+and ocf's C1 gained the cell where the schema comes out of the file. Every one reds
+on a neutered memo.
+
+Two things followed from adding it, both instructive. The breadth column's derived
+guard red again, because a new battery cell is a new entry point every other
+derived axis must cross or exempt — the same coupling the previous round recorded,
+and here it was only a naming convention (the cell label's first segment is the
+entry point). And in the wire cell my own value builder was the exponential thing:
+it recursed per reference over the shared graph. A harness that walks the same
+representation inherits the same hazard.
+
+### Also checked
+
+The sibling sweep: `schemaMinBytes` has eight call sites, all unchanged in
+signature and semantics; `collectFieldsRaw` is called only from itself,
+`resolvePromotedFields` only from `collectFields`, and neither helper is passed as
+a function value anywhere. The new walker reads only kind, size, fields, branches;
+it mutates nothing, resolves no names, reads no reserved keys, and its descents are
+kind-gated by construction (the array and map arms return without touching items or
+values). It has no error channel, so the silent-degrade posture is the right one
+for its budget. `go test -race ./...` green.

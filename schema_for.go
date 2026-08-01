@@ -654,7 +654,7 @@ func inferRecord(t reflect.Type, name, namespace string, seen map[reflect.Type]s
 	// references resolve to a name reference rather than re-entering here.
 	seen[t] = seenForm{name: fullName}
 
-	fields, err := collectFields(t, nil, make(map[reflect.Type]bool))
+	fields, err := collectFields(t, make(map[reflect.Type]bool))
 	if err != nil {
 		return nil, err
 	}
@@ -691,10 +691,39 @@ type schemaField struct {
 	decimal   [2]int   // [precision, scale]; zero if not decimal
 }
 
-// collectFields walks a struct type depth-first, handling embedded structs
-// and inline tags. Returns deduplicated fields (tagged wins over untagged,
-// shallower wins over deeper).
-func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) ([]schemaField, error) {
+// collectFields returns root's Avro fields: the full promoted set, then
+// resolved (tagged wins over untagged, shallower wins over deeper, and a tie
+// at the winning depth is an ambiguity to report).
+//
+// The resolution is HERE and not inside the walk, and that placement is the
+// contract rather than a layout choice. The rule ranges over the whole
+// collected set: which field wins a name is not decidable from one embedded
+// struct's own fields, because a shallower field declared anywhere above it
+// takes the name. Run per recursion level, the rule decides on a partial set —
+// a collision is called ambiguous before the level that resolves it has been
+// read, rejecting a type Go's own promotion resolves — and the index paths it
+// resolves, which accumulate from the ROOT, are read against whichever nested
+// type the level happened to be visiting.
+//
+// typeFieldMapping (reflect.go) answers the same question for encode and
+// decode and keeps its resolution outside its own recursion for the same
+// reason. The two must agree, and agreeing on the rule is not enough: they
+// have to agree on where it runs, which is why collectFields takes no index
+// parameter. There is no root-relative path to mis-resolve when the only
+// caller-supplied coordinate space is the root's.
+func collectFields(root reflect.Type, visited map[reflect.Type]bool) ([]schemaField, error) {
+	raw, err := collectFieldsRaw(root, nil, visited)
+	if err != nil {
+		return nil, err
+	}
+	return resolvePromotedFields(root, raw)
+}
+
+// collectFieldsRaw walks a struct type depth-first, handling embedded structs
+// and inline tags, and returns every promoted field it finds in encounter
+// order — shallower first, which is what the resolution downstream relies on.
+// It deliberately does NOT resolve name collisions; see collectFields.
+func collectFieldsRaw(t reflect.Type, index []int, visited map[reflect.Type]bool) ([]schemaField, error) {
 	if visited[t] {
 		return nil, nil
 	}
@@ -766,7 +795,7 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 							sf.Name, truncForError(tag), truncForError(p))
 					}
 				}
-				nested, err := collectFields(ft, idx, visited)
+				nested, err := collectFieldsRaw(ft, idx, visited)
 				if err != nil {
 					return nil, err
 				}
@@ -828,7 +857,7 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 				return nil, fmt.Errorf("avro: field %s has tag %q: inline requires a struct or pointer-to-struct field type; got %s (inline flattens the embed; there is no struct here to flatten)",
 					sf.Name, truncForError(tag), ft)
 			}
-			nested, err := collectFields(ft, idx, visited)
+			nested, err := collectFieldsRaw(ft, idx, visited)
 			if err != nil {
 				return nil, err
 			}
@@ -845,7 +874,13 @@ func collectFields(t reflect.Type, index []int, visited map[reflect.Type]bool) (
 		}
 	next:
 	}
+	return raw, nil
+}
 
+// resolvePromotedFields decides which promoted field owns each Avro name,
+// over the COMPLETE set collected from t. See collectFields: the rule ranges
+// over the whole set, and t is the type raw's index paths are rooted at.
+func resolvePromotedFields(t reflect.Type, raw []schemaField) ([]schemaField, error) {
 	// Deduplicate. Must agree with reflect.go's typeFieldMapping so
 	// SchemaFor's inferred schema and the runtime field mapping pick the
 	// same Go field for each Avro name. The precedence rules (documented on
