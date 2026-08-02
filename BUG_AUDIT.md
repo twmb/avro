@@ -12489,3 +12489,100 @@ re-open condition, with the full text preserved here.
 - **(tombstone) Caller-owned `any` values consumed BEFORE the marshal→Parse round trip.** Netted 2026-07-17 (maintainer-ruled architecture): `canonicalizeTreeValue` at the render boundary + kind-driven `needsJSONFixupKind`/`applyJSONFixupKind` on every rebuild surface; marshal-opaque values stay opaque (NOT_BUGS #69). Net: `TestMatrix_TreeValueGoTypes` (~70 cells) + `FuzzTreeValueTwinParity` + 6 pins, neuter-verified. Exact-type dispatch on tree values is legal only DOWNSTREAM of the two boundary layers (FIX.md item 15). Re-opens: a new pre-boundary type-switch (grep `case map\[string\]any|case \[\]any|case \[\]string` in schema_for.go/schema_node.go and classify against the boundary). Verbatim: archive (2026-07-23 #6).
 
   **Census codification (2026-07-18) — the domain's first principles.** INVARIANT: the composed/rebuilt schema is a function of the MARSHAL IMAGE of every caller value, never of its Go representation; the only image-changing values are the documented image-owners (own MarshalJSON/MarshalText and json.Number; the []byte codepoint fixup; ±Inf/−0.0 literals; canonical-only NaN→"NaN"). Entry points: SchemaNode.Props / SchemaField.Default / SchemaField.Props values, plus whole trees via CustomType.Schema and mutated Root() results; consumers: the rebuild and the SchemaFor render, one value choke point each (the cache splice is text-only, out of domain). Net: TestMatrix_TreeValue{LeafTwins,ContainerTwins,DefaultWire,FieldProps,VerdictParity,NilEmptyImage,MapKeyShapes} + TestRegression_TreeValueOwnershipBoundary + the nil-image and string-kind-key pins + FuzzTreeValueTwinParity — neuter-verified with disjoint red sets per component. Both census findings RULED and FIXED 2026-07-19: boundary copy arms preserve nil-ness in both directions (nil→nil, empty→empty; FIX.md invariant row), and string-KIND map keys canonicalize to their raw string while non-string-kind MarshalText keys stay opaque image-owners — NOT_BUGS #69 records both. Full axes (type-class × ownership × position × surface) + neuter red-set enumeration: archive (2026-07-18, 2026-07-24 #8).
+## Distillation archive (2026-08-02 #65) — the cost-cell measured-bound FIX round narrative, verbatim
+
+FIX round, START head 76acff6. The ruling: the measured-bound rule was stated
+for the walk CONSTRUCTION sites and never applied to the wall-clock cost cells,
+so five cells drove one magnitude each and the suite was green — a stated
+requirement whose guard passes its known violators.
+
+**Measured first, then designed.** All four factors are FLAT with a correct
+bound, which is what made the second value cheap to add rather than a fight:
+
+    paths      dagNested depth 13/20/26      260us / 224us / 195us   (text 1.2->2.4KB)
+    children   dagWideSCC width 80/800/8000   86ms /  96ms / 122ms   (text 3.8->248KB)
+    metadata   same widths, walk only        110ms / 101ms / 167ms
+    containers 1/48/220                      151ms / 159ms / 143ms
+
+The width row is the one worth keeping: the schema TEXT grows 65x while the
+parse grows 1.4x, because the walk dominates and the allowance caps it. So none
+of the five needed the exemption arm of the ruling.
+
+**The derivation found seven cells, not five.** A cost GENERATOR is derived from
+source (a func in the census sources taking magnitudes and returning a schema
+string); any test calling one is a cost cell. Beyond the five:
+
+- `TestInvariant_SharedSchemaNodeWalkedOnce` — its NAME reads like a value
+  oracle and the hand derivation classified it as one. It takes the wall-clock
+  harness, so the exemption cross-check caught it: an exemption cannot sit on a
+  timing cell.
+- `TestDoSBattery_C6_MetadataWalk` — missed entirely by hand; only the scan
+  found it. It is now one of the two cells the memo neuter reds.
+
+**My first derivation was wrong in both directions and the guard had to be
+fixed before it could be trusted.** (a) It matched generator names as
+substrings, so a generator NAMED IN A DOC COMMENT counted as a call —
+`TestInvariant_BudgetedWalkCensus` was reported as a cost cell on the strength
+of prose. (b) It missed a generator passed as a function VALUE
+(`build: dagNested`), which is how `SharedSchemaNodeWalkedOnce` drives all four
+shapes. (c) Function bodies were split at the NEXT test function rather than at
+the closing brace, so a var block or helper between two tests was attributed to
+the one above. Fixed with a position-preserving blanker (comments and string
+literals blanked to spaces, positions kept) plus brace matching, giving two
+views of the same bytes: identifier matching over code, and the self-naming
+check over raw text.
+
+**The cyclic shapes reach the cap, and that is the bound working.** Driving
+depth 13 -> 26 on `self-recursive` and `single-scc` goes 1.9ms -> 120ms, because
+a cyclic subtree cannot be memoized at all and walks until maxMinBytesWork stops
+it. That is the bound ENGAGING, not the cost scaling. So `floor` is not a noise
+threshold — it is the largest cost the bound itself permits at the top of the
+range, which for a cell spanning both regimes is one exhausted allowance. It
+stays orders of magnitude under an unbounded walk (seconds).
+
+**A cell named for a bound it does not measure.**
+`TestInvariant_MetadataWalkChargesPerChild` claimed the metadata walk's own
+charge. Executed: disabling `takeNode` entirely leaves it GREEN. The reason is
+structural — a PARSED schema is deduped before it reaches that walk, so no
+parse-driven cell can red the node budget. What the cell actually exercises is
+the Root+Schema ROUND TRIP, whose last step is a re-Parse of the rendered text
+(`SchemaNode.Schema` ends in `Parse`), which puts the MIN-BYTES charge on its
+path — neutering that charge reds it. Renamed
+`TestInvariant_MetadataSurfacesBoundedByWidth`, and its row now names the three
+cells that do own the node budget: running the full suite under the takeNode
+neuter reds `TestRegression_SchemaNodeWalkBudgetBattery`,
+`TestRegression_SchemaNodeDuplicateNamedDefinitionBounded` and
+`TestRegression_SchemaForCustomSchemaBudgetAxes` — all three hand-build trees
+Parse cannot express. The census row for `toJSONWalk` now says so.
+
+**The parse belongs outside the timed region.** The metadata cell had its
+MustParse inside it, so it moved when the PARSE's bound was neutered and sat
+still when its own was. `wantCostDoesNotScale` now takes a BUILD function
+returning the thunk to time, so per-magnitude preparation is structurally
+outside the clock.
+
+**Non-vacuity: five neuters, five distinct red sets, each asserted applied.**
+
+    memo dropped (PATHS)          -> EveryMinBytesEntryPointIsBounded, C6_MetadataWalk
+    per-NODE charge (CHILDREN)    -> CyclicWalkCostIsBoundedByWork, MetadataSurfaces...,
+                                     SharedSchemaNodeWalkedOnce, WideCyclicWalkReaches...
+    walk per container            -> MinBytesContainerCountBounded, alone
+    takeNode never charges        -> nothing here; three hand-built cells elsewhere
+    a row collapsed to one value  -> the guard's distinct-values arm, on that row
+
+**Guard arms, all mechanical.** A cell calling a generator and not rowed fails;
+a rowed timing cell with under two distinct values fails; a rowed cell that does
+not NAME ITSELF to the helper fails, so a private constant cannot disagree with
+the registry; an exemption on a cell that takes the wall-clock harness fails,
+and values on a cell that takes none fails; a row naming no test fails.
+
+**Value oracles, named rather than implicit** (the ruling asked for this so a
+later reader does not re-derive the question): MemoAgreesWithUnmemoizedWalk
+(equality against an un-memoized recomputation — and a wrong memo is FASTER, so
+timing is exactly what cannot settle it), DagMinBytesIsExactAtScale (DAG vs
+expanded TREE minimum), MinBytesSelfReadable (accept/reject of the package's own
+encoder output), SharingDoesNotChangeMinBytes (sharing does not change the
+answer; its fan x levels sweep is over SHAPES, not magnitudes).
+
+Nets: full suite, fastavro 1.12.2, and -race — all green, 0 data races. Java
+un-netted (no JVM).
