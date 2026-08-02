@@ -254,6 +254,7 @@ func Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 		named:      make(map[string]*namedType),
 		building:   make(map[*schemaNode]struct{}),
 		definedSet: make(map[*namedType]bool),
+		minBytes:   newMinBytesWalk(),
 	}
 	applySchemaOpts(b, opts)
 	return parse(schema, b)
@@ -1156,6 +1157,17 @@ type builder struct {
 	// (custom parses, and re-parses of a previously-custom-parsed schema).
 	allowReRegister bool
 	depth           int // current build recursion depth, bounded by maxDepth
+	// minBytes is the ONE min-bytes walk shared across every container built in
+	// this parse (shared across nests, like named/building). A backward name
+	// reference resolves to the fully-built node, so a container whose element is
+	// a cyclic type defined earlier pays a full walk at BUILD — and a schema can
+	// point any number of containers at that one type, so a fresh walk per
+	// container would make the build cost the container count times the per-walk
+	// bound. Sharing caps it once. Kept SEPARATE from finalize's walk: build-time
+	// calls can run over subtrees whose forward references are not yet wired
+	// (provisional), so their memo must not leak into finalize, which recomputes
+	// on the fully-wired graph.
+	minBytes *minBytesWalk
 }
 
 // validNameErr validates a simple name using the builder's configured validator.
@@ -1198,6 +1210,7 @@ func (b *builder) nest() *builder {
 		definedSet:      b.definedSet,
 		allowReRegister: b.allowReRegister,
 		depth:           b.depth,
+		minBytes:        b.minBytes,
 	}
 }
 
@@ -1675,6 +1688,14 @@ func (b *builder) build(parentName string, s *aschema) error {
 	}
 	if b.depth >= maxDepth {
 		return fmt.Errorf("schema nests deeper than the supported limit (%d)", maxDepth)
+	}
+	// Seed the shared per-parse min-bytes walk at the root's first build, before
+	// any nest() copies the pointer, so every container built below shares it.
+	// Parse and SchemaCache.Parse seed it in their constructors; this covers a
+	// builder constructed directly (white-box tests) so the build-path container
+	// sites never dereference a nil walk. See b.minBytes.
+	if b.minBytes == nil {
+		b.minBytes = newMinBytesWalk()
 	}
 	b.depth++
 	defer func() { b.depth-- }()
@@ -3274,7 +3295,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// alias; only the Items/Values pointer fields need the explicit sync.
 		canonObj.Items = &af.canon
 		sa := &serArray{serItem: af.ser}
-		da := &deserArray{deserItem: af.deser, minItemBytes: schemaMinBytes(af.node)}
+		da := &deserArray{deserItem: af.deser, minItemBytes: b.minBytes.minBytesOf(af.node)}
 		// Specialized array ser/deser fast paths bypass the inner
 		// schema's wrapped ser/deser functions. They are correct only
 		// when no per-element conversion is needed: no custom type,
@@ -3296,7 +3317,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.deser = da.deser
 		inner := new(fieldMeta)
 		*inner = af.meta
-		inner.minBytes = schemaMinBytes(af.node)
+		inner.minBytes = b.minBytes.minBytesOf(af.node)
 		b.meta = fieldMeta{avroType: "array", inner: inner}
 		arrayNode := &schemaNode{
 			kind:  "array",
@@ -3351,7 +3372,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// wire bytes. Matches deserArray.minItemBytes in spirit; bounds
 		// block-count against remaining-buffer to prevent memory
 		// amplification on hostile input.
-		dm := &deserMap{deserItem: mf.deser, minEntryBytes: 1 + schemaMinBytes(mf.node)}
+		dm := &deserMap{deserItem: mf.deser, minEntryBytes: 1 + b.minBytes.minBytesOf(mf.node)}
 		// Same gate as the array case above: skip specialization when
 		// values have a custom type, a logical type, OR a forward
 		// reference (the fast-path closure can't capture an unresolved

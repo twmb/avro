@@ -99,6 +99,7 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 		named:      cloned,
 		building:   make(map[*schemaNode]struct{}),
 		definedSet: make(map[*namedType]bool),
+		minBytes:   newMinBytesWalk(),
 	}
 	applySchemaOpts(b, opts)
 	hasCustomTypes := len(b.customTypes) > 0

@@ -308,6 +308,46 @@ func TestDoSBattery_OCF_C1_Header(t *testing.T) {
 		}
 		return err
 	})
+
+	// The SAME third factor reached by the other construction path: when the
+	// cyclic type is DEFINED FIRST and fully wired at parse-build (inline plus a
+	// backward name reference), each container's items resolves to the built node
+	// and the per-element minimum is computed on the reader's BUILD path, not
+	// finalize. A per-container fresh walk there costs the container count times a
+	// full walk — 8.3 s at 32 containers off a 64 KB header before the build path
+	// shared the walk. The header is file-supplied, so this is the severity cell
+	// for the backward reaching-path.
+	wantTerminate(t, "NewReader/many-container-header-schema-backward", func() error {
+		r, err := NewReader(bytes.NewReader(ocfWith(dagManyContainerWiredHeader(220, 26), "null", 0, nil)))
+		if r != nil {
+			r.Close()
+		}
+		return err
+	})
+}
+
+// dagManyContainerWiredHeader defines the cyclic type FIRST and fully wired at
+// build (each level nests the next inline and references it a second time by
+// name, deepest closes to the enclosing L0), then N arrays reference "L0" by
+// name. A backward reference resolves to the fully built node, so the reader
+// computes the per-element minimum at build. Mirrors nContainersOverWiredSCC in
+// the avro package.
+func dagManyContainerWiredHeader(narrays, levels int) string {
+	inner := `["null","L0"]`
+	for i := levels - 1; i >= 0; i-- {
+		if i == levels-1 {
+			inner = fmt.Sprintf(`{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null","L0"]},{"name":"f1","type":["null","L0"]}]}`, i)
+			continue
+		}
+		inner = fmt.Sprintf(`{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null",%s]},{"name":"f1","type":["null","L%d"]}]}`, i, inner, i+1)
+	}
+	var b strings.Builder
+	b.WriteString(`{"type":"record","name":"Root","fields":[{"name":"def","type":` + inner + `}`)
+	for j := 0; j < narrays; j++ {
+		fmt.Fprintf(&b, `,{"name":"z%d","type":{"type":"array","items":"L0"}}`, j)
+	}
+	b.WriteString(`]}`)
+	return b.String()
 }
 
 // dagManyContainerHeader builds a header record with narrays array fields, each

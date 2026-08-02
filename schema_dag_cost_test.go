@@ -946,10 +946,11 @@ func TestInvariant_MetadataWalkChargesPerChild(t *testing.T) {
 // restores the product and reds them.
 
 // nContainersOverSCC builds a record with narrays array fields, every one of
-// items "L0", above a cyclic SCC L0..L{levels-1} -> L0. The SCC is fixed text;
-// each extra array is ~48 bytes, so the container count is a caller-chosen
-// magnitude independent of the subtree it points at. The SCC is un-memoizable,
-// so a fresh walk per array pays the full allowance per array.
+// items "L0", above a cyclic SCC L0..L{levels-1} -> L0. The arrays come FIRST,
+// so their items are FORWARD references resolved in finalize's fixup loop — this
+// exercises the FINALIZE reaching-path. Each extra array is ~48 bytes, so the
+// container count is caller-chosen; the SCC is un-memoizable, so a fresh walk
+// per array pays the full allowance per array.
 func nContainersOverSCC(narrays, levels int) string {
 	var b strings.Builder
 	b.WriteString(`{"type":"record","name":"Root","fields":[`)
@@ -965,6 +966,35 @@ func nContainersOverSCC(narrays, levels int) string {
 			next = "L0"
 		}
 		fmt.Fprintf(&b, `,{"name":"d%d","type":{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null","%s"]},{"name":"f1","type":["null","%s"]}]}}`, i, i, next, next)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// nContainersOverWiredSCC builds the SAME cost — many containers over one cyclic
+// subtree — reached by the OTHER construction path. The cyclic node is defined
+// FIRST and fully wired at BUILD: each level nests the next inline (f0) and
+// references it a second time by name (f1, a BACKWARD reference to the just-built
+// inline), and the deepest closes to the enclosing "L0", so both spellings bind
+// to one node and the whole cycle is wired before any container is built. The N
+// arrays then reference "L0" by name (backward), and each resolves to the fully
+// built cyclic node — so the per-element minimum is computed at BUILD, not
+// finalize. A per-walk cost row cannot tell this path from the forward one; only
+// crossing the reaching-path axis does. Without the shared build walk each array
+// paid a full walk (measured 258 ms -> 7.4 s across 1..32 arrays before the fix).
+func nContainersOverWiredSCC(narrays, levels int) string {
+	inner := `["null","L0"]` // deepest closes the cycle to the enclosing L0
+	for i := levels - 1; i >= 0; i-- {
+		if i == levels-1 {
+			inner = fmt.Sprintf(`{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null","L0"]},{"name":"f1","type":["null","L0"]}]}`, i)
+			continue
+		}
+		inner = fmt.Sprintf(`{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null",%s]},{"name":"f1","type":["null","L%d"]}]}`, i, inner, i+1)
+	}
+	var b strings.Builder
+	b.WriteString(`{"type":"record","name":"Root","fields":[{"name":"def","type":` + inner + `}`)
+	for j := 0; j < narrays; j++ {
+		fmt.Fprintf(&b, `,{"name":"z%d","type":{"type":"array","items":"L0"}}`, j)
 	}
 	b.WriteString(`]}`)
 	return b.String()
@@ -986,15 +1016,32 @@ const (
 func TestInvariant_MinBytesContainerCountBounded(t *testing.T) {
 	scc := nContainersOverSCC(containerCountN, containerCountLevels)
 
-	// Parse: the forward-referenced arrays resolve in finalize's container-fixup
-	// loop, which shares one walk across all of them.
-	wantTerminate(t, "Parse/many-containers", func() error {
+	// Parse, FORWARD refs: the arrays precede the SCC, so their items resolve in
+	// finalize's container-fixup loop, which shares one walk across all of them.
+	wantTerminate(t, "Parse/many-containers-forward", func() error {
 		_, err := Parse(scc)
 		return err
 	})
-	wantTerminate(t, "SchemaCache.Parse/many-containers", func() error {
+	wantTerminate(t, "SchemaCache.Parse/many-containers-forward", func() error {
 		var c SchemaCache
 		_, err := c.Parse(scc)
+		return err
+	})
+
+	// Parse, BACKWARD refs: the SCC is defined first and fully wired at build, so
+	// each array's items resolves to the built cyclic node and the minimum is
+	// computed on the BUILD reaching-path, not finalize. This is the same walk and
+	// the same cost reached by a different construction path — the build path uses
+	// the builder's shared walk (b.minBytes). SchemaCache too, since it shares the
+	// builder.
+	wired := nContainersOverWiredSCC(containerCountN, containerCountLevels)
+	wantTerminate(t, "Parse/many-containers-backward", func() error {
+		_, err := Parse(wired)
+		return err
+	})
+	wantTerminate(t, "SchemaCache.Parse/many-containers-backward", func() error {
+		var c SchemaCache
+		_, err := c.Parse(wired)
 		return err
 	})
 

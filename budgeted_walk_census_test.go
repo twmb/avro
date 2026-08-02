@@ -73,6 +73,15 @@ type budgetedWalk struct {
 	class   walkClass // what it traverses — decides whether its bound is enough
 	factors string    // the cost as a product of caller-chosen magnitudes
 	binds   string    // the single bound that caps the PRODUCT, not one factor
+	// reachingPaths names every CONSTRUCTION PATH that reaches this walk and the
+	// bound each carries. One walk can be reached by more than one path (the
+	// min-bytes walk is reached at build, at finalize, at resolve, and at skip),
+	// and a bound that holds on one path but not another is invisible to the rows
+	// above — factors/binds describe the walk, not the paths. For the multi-path
+	// walks a guard derives the paths from source and checks each is bounded
+	// (TestInvariant_MinBytesReachingPaths); a single-construction walk names its
+	// one entry.
+	reachingPaths string
 }
 
 // budgetedWalks is the registry. Every recursive schema-graph walk and every
@@ -82,80 +91,104 @@ var budgetedWalks = []budgetedWalk{
 	// ---- schemaDAG: must bind the paths factor with a memo or a budget ----
 	{fn: "minBytes", file: "deser.go", class: schemaDAG,
 		factors: "containers x paths-per-walk x children-per-node",
-		binds: "one minBytesWalk SHARED per operation (containers) + done memo (paths) + per-child allowance charge (children); newMinBytesWalk is threaded through finalize, resolve, and each record's skip compile"},
+		binds: "one minBytesWalk SHARED per operation (containers) + done memo (paths) + per-child allowance charge (children)",
+		reachingPaths: "FOUR, each sharing one walk per operation: build (b.minBytes on the builder, forward refs fixed in finalize AND backward refs resolved to a fully-built node at build), finalize (one mbw before the container-fixup loop), resolve (ctx.minBytes), skip (one mbw per record's once.Do compile). The standalone schemaMinBytes is a fifth, single-node, outside any loop. Guarded by TestInvariant_MinBytesReachingPaths, which derives every newMinBytesWalk() site from source"},
 	{fn: "checkCompat", file: "compat.go", class: schemaDAG,
 		factors: "distinct (reader,writer) node pairs x children-per-pair",
-		binds: "the seen map[nodePair]bool memo, threaded from CheckCompatibility with no defer-delete, so each pair is walked once"},
+		binds: "the seen map[nodePair]bool memo, threaded from CheckCompatibility with no defer-delete, so each pair is walked once",
+		reachingPaths: "one: seen created in CheckCompatibility, threaded through the whole recursive check"},
 	{fn: "resolveNode", file: "resolve.go", class: schemaDAG,
 		factors: "distinct (reader,writer) pairs x (children + per-container min-bytes)",
-		binds: "ctx.seen pair memo (pairs) + ctx.minBytes shared walk (the container min-bytes factor)"},
+		binds: "ctx.seen pair memo (pairs) + ctx.minBytes shared walk (the container min-bytes factor)",
+		reachingPaths: "one: ctx (seen + minBytes) created in Resolve, threaded through the whole resolution"},
 	{fn: "toJSONWalk", file: "schema_node.go", class: schemaDAG,
 		factors: "nodes emitted x bytes per node",
-		binds: "walkBudget (nodes + bytes), charged by takeNode at the TOP of every entry so a DAG re-descent still spends budget; visited is only cycle detection"},
+		binds: "walkBudget (nodes + bytes), charged by takeNode at the TOP of every entry so a DAG re-descent still spends budget; visited is only cycle detection",
+		reachingPaths: "one walkBudget per metadata-API call (toJSONDedup), from Root().Schema()/String()/Canonical(); each walks the whole tree once"},
 	{fn: "collectLocalNames", file: "schema_node.go", class: schemaDAG,
 		factors: "distinct nodes x names per node",
-		binds: "the visited map[*SchemaNode]struct{} memo (mark on entry, return on hit)"},
+		binds: "the visited map[*SchemaNode]struct{} memo (mark on entry, return on hit)",
+		reachingPaths: "one: visited created per toJSONDedup, one walk of the tree"},
 	{fn: "stampNameRefs", file: "schema_node.go", class: schemaDAG,
 		factors: "distinct nodes",
-		binds: "the visited memo (mark on entry, return on hit)"},
+		binds: "the visited memo (mark on entry, return on hit)",
+		reachingPaths: "one: visited created per Root() name-ref stamping pass"},
 	{fn: "collectNamedTypes", file: "schema_node.go", class: schemaDAG,
 		factors: "tree nodes (name-ref nodes are leaves, not followed)",
-		binds: "structural: a reference SchemaNode carries no children, so the walk is over the definition TREE, linear in it"},
+		binds: "structural: a reference SchemaNode carries no children, so the walk is over the definition TREE, linear in it",
+		reachingPaths: "one: table created in fixupNameRefDefaults, per Root()"},
 	{fn: "coerceTreeDefaults", file: "schema_node.go", class: schemaDAG,
 		factors: "tree nodes (name-ref nodes are leaves)",
-		binds: "structural: references are leaves, so the walk is over the definition TREE, linear in it"},
+		binds: "structural: references are leaves, so the walk is over the definition TREE, linear in it",
+		reachingPaths: "one: same fixupNameRefDefaults pass, per Root()"},
 	{fn: "overlayInheritedCustom", file: "schema.go", class: schemaDAG,
 		factors: "distinct nodes x custom lookups",
-		binds: "the visited map[*schemaNode]bool memo (mark on entry, return on hit)"},
+		binds: "the visited map[*schemaNode]bool memo (mark on entry, return on hit)",
+		reachingPaths: "one: b.overlayDone created per parse, walked at inherited-custom overlay (build/reference-time)"},
 	{fn: "findCustomTypeMatchInSubtreeWalk", file: "schema.go", class: schemaDAG,
 		factors: "distinct nodes x registered custom types",
-		binds: "the visited map[*schemaNode]bool memo (mark on entry, return on hit)"},
+		binds: "the visited map[*schemaNode]bool memo (mark on entry, return on hit)",
+		reachingPaths: "one: visited created per findCustomTypeMatchInSubtree call at build"},
 	{fn: "buildCustomWiring", file: "schema.go", class: schemaDAG,
 		factors: "distinct nodes",
-		binds: "the visited memo (mark on entry, return on hit)"},
+		binds: "the visited memo (mark on entry, return on hit)",
+		reachingPaths: "one: visited created per applyCustomTypes pass at build"},
 	{fn: "nodeAwaitsForwardRefSeen", file: "schema.go", class: schemaDAG,
 		factors: "distinct nodes",
-		binds: "the seen map[*schemaNode]struct{} memo (mark on entry, return on hit); the separate building set is defer-delete cycle detection"},
+		binds: "the seen map[*schemaNode]struct{} memo (mark on entry, return on hit); the separate building set is defer-delete cycle detection",
+		reachingPaths: "one: seen created per nodeAwaitsForwardRef call at build"},
 
 	// ---- goTypeDAG: bound is compile-time fixedness + per-type sync.Map ----
 	{fn: "collect", file: "reflect.go", class: goTypeDAG,
 		factors: "2^(embed depth) on a shared-embed type DAG (visited is defer-delete, so it re-descends)",
-		binds: "NOT a runtime bound: a Go type is fixed at COMPILE time and the result is amortized by a per-type sync.Map, so the fan-out is not attacker-grown (G3)"},
+		binds: "NOT a runtime bound: a Go type is fixed at COMPILE time and the result is amortized by a per-type sync.Map, so the fan-out is not attacker-grown (G3)",
+		reachingPaths: "one: visited created per typeFieldMapping (per Go type; the sync.Map amortizes repeats across calls)"},
 	{fn: "collectFieldsRaw", file: "schema_for.go", class: goTypeDAG,
 		factors: "2^(embed depth) on a shared-embed type DAG (visited is defer-delete)",
-		binds: "compile-time fixedness + collectFields' per-call visited; not attacker-grown at runtime (G3)"},
+		binds: "compile-time fixedness + collectFields' per-call visited; not attacker-grown at runtime (G3)",
+		reachingPaths: "one: visited created per collectFields, per SchemaFor of a Go type"},
 	{fn: "inferType", file: "schema_for.go", class: goTypeDAG,
 		factors: "type nodes x ptr chains, bounded by depth and maxIndirectDepth",
-		binds: "seen map[reflect.Type]seenForm memo + depth/ptrChain caps; compile-time type"},
+		binds: "seen map[reflect.Type]seenForm memo + depth/ptrChain caps; compile-time type",
+		reachingPaths: "one: seen created per SchemaFor, per Go type"},
 
 	// ---- valueTree / wire / textTree: node count IS input size ----
 	{fn: "walkDefault", file: "schema.go", class: valueTree,
 		factors: "default value nodes",
-		binds: "the walk follows the concrete default VALUE (a finite JSON tree), linear in it"},
+		binds: "the walk follows the concrete default VALUE (a finite JSON tree), linear in it",
+		reachingPaths: "one: per default-encode pass, following the value"},
 	{fn: "coerceDefault", file: "schema.go", class: valueTree,
 		factors: "default value nodes, bounded by depth",
-		binds: "value-guided recursion + the depth>=maxDepth cap"},
+		binds: "value-guided recursion + the depth>=maxDepth cap",
+		reachingPaths: "one: per default coercion at parse, following the value"},
 	{fn: "coerceMetadataDefault", file: "schema_node.go", class: valueTree,
 		factors: "default value nodes",
-		binds: "value-guided recursion over the concrete default (name-ref follows are one hop, guided by the value)"},
+		binds: "value-guided recursion over the concrete default (name-ref follows are one hop, guided by the value)",
+		reachingPaths: "one: per Root() metadata default coercion, following the value"},
 	{fn: "branchAcceptsDefault", file: "schema_node.go", class: valueTree,
 		factors: "default value nodes",
-		binds: "value-guided recursion over the concrete default"},
+		binds: "value-guided recursion over the concrete default",
+		reachingPaths: "one: per branch-acceptance check, following the value"},
 	{fn: "encodeDefaultDepth", file: "resolve.go", class: valueTree,
 		factors: "default value nodes, bounded by depth",
-		binds: "value-guided recursion + the depth>=maxDepth cap"},
+		binds: "value-guided recursion + the depth>=maxDepth cap",
+		reachingPaths: "one: per default encode, following the value"},
 	{fn: "appendAvroJSON", file: "json_codec.go", class: valueTree,
 		factors: "encoded value nodes, bounded by depth",
-		binds: "value-guided recursion + the depth>=maxDepth cap"},
+		binds: "value-guided recursion + the depth>=maxDepth cap",
+		reachingPaths: "one: per EncodeJSON/AppendEncodeJSON call, following the value"},
 	{fn: "valueWalkLimit", file: "schema_node.go", class: valueTree,
 		factors: "value nodes x depth",
-		binds: "walkBudget + the depthLeft cap"},
+		binds: "walkBudget + the depthLeft cap",
+		reachingPaths: "one walkBudget per Props/value bounding pass (shared with toJSONWalk's budget)"},
 	{fn: "inlineTreeDefs", file: "cache.go", class: textTree,
 		factors: "JSON tree nodes (each definition inlined once)",
-		binds: "the seen/inlined map[string]bool sets: a name already inlined is emitted as a reference, so the output is linear in the definition set"},
+		binds: "the seen/inlined map[string]bool sets: a name already inlined is emitted as a reference, so the output is linear in the definition set",
+		reachingPaths: "one: seen/inlined created per SchemaCache self-containment splice"},
 	{fn: "build", file: "schema.go", class: textTree,
 		factors: "aschema text nodes, bounded by depth",
-		binds: "the parsed aschema is a TREE (each occurrence is its own text); depth>=maxDepth caps recursion"},
+		binds: "the parsed aschema is a TREE (each occurrence is its own text); depth>=maxDepth caps recursion",
+		reachingPaths: "one: per Parse; nested builders share depth but each occurrence is its own text"},
 }
 
 // graphCostMarker is a source pattern that marks a walk carrying graph-cost
@@ -223,6 +256,12 @@ func TestInvariant_BudgetedWalkCensus(t *testing.T) {
 			regexp.MustCompile(`\b`+q+` = func\(`).MatchString(src)
 		if !defined {
 			t.Errorf("census rows %q in %s but no such func is defined there — the row rotted (renamed or removed?)", w.fn, w.file)
+		}
+		// Every row must name its reaching paths: a walk reached by more than one
+		// construction path can be bounded on one and not another, invisible to
+		// factors/binds. A blank reachingPaths is an incomplete row.
+		if strings.TrimSpace(w.reachingPaths) == "" {
+			t.Errorf("census row %q has no reachingPaths — name every construction path that reaches it and the bound each carries", w.fn)
 		}
 	}
 
@@ -335,4 +374,105 @@ func readFile(t *testing.T, f string) string {
 		t.Fatalf("reading %s: %v", f, err)
 	}
 	return string(b)
+}
+
+// minBytesConstructionSite rows one place the min-bytes walk STATE is
+// constructed (newMinBytesWalk) — a reaching path of the minBytes walk. The
+// walk is one, but a schema reaches it by building a container, by finalizing a
+// forward reference, by resolving, or by compiling a dropped-field skip, and the
+// container FACTOR is bounded only if each of those paths constructs the walk
+// once per OPERATION and shares it across that operation's containers. A fresh
+// construction per container is the bug the forward/backward split exposed: the
+// build path resolved a backward name reference to a fully-built cyclic node and
+// walked it per container. The `context` is a source substring the construction
+// line must contain, so a construction that drifts to a per-container scope
+// fails to match its row.
+type minBytesConstructionSite struct {
+	file    string
+	context string // a substring uniquely identifying the construction line
+	scope   string // what operation the constructed walk is shared across
+}
+
+var minBytesConstructionSites = []minBytesConstructionSite{
+	{"deser.go", "return newMinBytesWalk().minBytesOf(n)", "standalone schemaMinBytes: ONE node, outside any container loop (the only fresh-per-call form)"},
+	{"schema.go", "minBytes:   newMinBytesWalk()", "the builder's b.minBytes seeded in Parse — the BUILD path (backward refs resolve to a built node here)"},
+	{"schema.go", "b.minBytes = newMinBytesWalk()", "lazy seed at the root's first build, before any nest, so a directly-constructed (white-box) builder still shares one walk across the build path"},
+	{"schema.go", "mbw := newMinBytesWalk()", "one walk before finalize's container-fixup loop — the FINALIZE path (forward refs)"},
+	{"cache.go", "minBytes:   newMinBytesWalk()", "SchemaCache's builder b.minBytes — the build path via the cache"},
+	{"resolve.go", "minBytes: newMinBytesWalk()", "resolveCtx.minBytes, shared across one Resolve — the RESOLVE path"},
+	{"skip.go", "mbw := newMinBytesWalk()", "one walk per record's once.Do skip compile — the SKIP path (cross-record cost is wire-bounded)"},
+}
+
+// TestInvariant_MinBytesReachingPaths is the reaching-path guard for the one
+// budgeted walk reached by more than one construction path. It derives every
+// newMinBytesWalk() construction from source and requires each to be a rowed,
+// per-operation site; it forbids a fresh-walk-per-call anywhere but the
+// standalone schemaMinBytes; and it forbids a production caller of schemaMinBytes
+// (which would rebuild the walk on every call). Attack it both ways: add a
+// newMinBytesWalk() at a new site -> unrowed; call schemaMinBytes in production
+// -> a fresh-per-call path.
+func TestInvariant_MinBytesReachingPaths(t *testing.T) {
+	files := censusSourceFiles(t)
+
+	// Derive every construction (a newMinBytesWalk() CALL, not the func decl) and
+	// require each to match a rowed site's context substring.
+	for _, f := range files {
+		src := readFile(t, f)
+		for i, line := range strings.Split(src, "\n") {
+			if !strings.Contains(line, "newMinBytesWalk()") || strings.Contains(line, "func newMinBytesWalk(") {
+				continue
+			}
+			rowed := false
+			for _, s := range minBytesConstructionSites {
+				if s.file == f && strings.Contains(line, s.context) {
+					rowed = true
+					break
+				}
+			}
+			if !rowed {
+				t.Errorf("%s:%d constructs a min-bytes walk that is not a rowed reaching path:\n    %s\n  Row it in minBytesConstructionSites with the operation it is shared across, or (if it is per-container) share an existing per-operation walk instead.", f, i+1, strings.TrimSpace(line))
+			}
+		}
+	}
+
+	// Every rowed construction must still exist (rot check, the other direction).
+	for _, s := range minBytesConstructionSites {
+		src := readFile(t, s.file)
+		if !strings.Contains(src, s.context) {
+			t.Errorf("minBytesConstructionSites rows %q in %s but the line is gone — the path rotted", s.context, s.file)
+		}
+	}
+
+	// The fresh-walk-per-CALL form (constructor immediately consumed) is legal
+	// only for the standalone single-node schemaMinBytes. Anywhere else it is a
+	// per-container path — exactly what the build finding was.
+	fresh := occurrences(t, files, "newMinBytesWalk().minBytesOf(")
+	total := 0
+	for f, lines := range fresh {
+		for _, ln := range lines {
+			total++
+			if f != "deser.go" {
+				t.Errorf("%s:%d consumes a FRESH min-bytes walk in one call — the container factor reappears if this runs per container; share a per-operation walk", f, ln)
+			}
+		}
+	}
+	if total != 1 {
+		t.Errorf("expected exactly ONE fresh-per-call min-bytes walk (the standalone schemaMinBytes); found %d — a new one is a per-container path unless proven otherwise", total)
+	}
+
+	// schemaMinBytes is that fresh-per-call standalone; a PRODUCTION caller would
+	// rebuild the walk each call, so there must be none (tests may use it for a
+	// single node). The set of production callers is derived, not assumed.
+	for _, f := range files {
+		src := readFile(t, f)
+		for i, line := range strings.Split(src, "\n") {
+			code := line
+			if c := strings.Index(code, "//"); c >= 0 {
+				code = code[:c]
+			}
+			if strings.Contains(code, "schemaMinBytes(") && !strings.Contains(code, "func schemaMinBytes(") {
+				t.Errorf("%s:%d calls schemaMinBytes in production — it builds a fresh walk per call; use a shared per-operation walk (b.minBytes / ctx.minBytes / the finalize or skip mbw)", f, i+1)
+			}
+		}
+	}
 }

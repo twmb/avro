@@ -12115,3 +12115,70 @@ raceDosBudget (20 s) under -race, sitting above the inflated healthy cost and fa
 below an unbounded one (tens of seconds unraced -> hundreds raced); the UNRACED
 4 s bound is unchanged, so this is not a masking bump. Full suite + fastavro (0
 missing-optional-dep) + go test -race ./... all green; Java un-netted (no JRE).
+
+## Distillation archive (2026-08-01 #61) — the build-path completion + the reaching-path axis, verbatim
+
+Follow-up within the same FIX round ledgered at `a5dd23c (START head)`. #60 landed
+the container fix on finalize/resolve/skip and excluded build with the rationale
+"backward refs use a cheap name stub, measured 3.3 ms, no factor." The maintainer
+executed that premise false and this is its correction.
+
+THE EXECUTED-FALSE PREMISE. The 3.3 ms measurement was of a backward-ref shape
+whose cyclic SCC used FORWARD internal references (L_i -> L_{i+1}): at the moment a
+container references L0 at build, L0's own children are still unwired forward-ref
+stubs (wired only in finalize), so schemaMinBytes(L0) stops at the stub and is
+cheap. That is one shape, not the class. When the cyclic type is DEFINED FIRST and
+fully WIRED at build — each level nests the next inline (f0) and references it a
+second time by NAME (f1, a backward reference to the just-built inline), and the
+deepest closes to the enclosing L0 — both spellings bind to one node and the whole
+cycle is built before any container. Then a container's `items: "L0"` resolves
+(tryAssignNamedRef sets b.node = the full node) to the fully-built cyclic node, and
+schemaMinBytes walks it in full at BUILD. A schema can point N containers at that
+one type, and the build path built a fresh walk per container. Reproduced: 258 ms /
+1.87 s / 3.75 s / 7.4 s at 1 / 8 / 16 / 32 containers (linear, ~230 ms each),
+matching the maintainer's ~280 ms/container and 8.3 s at 32 off a 64 KB header
+through ocf.NewReader.
+
+THE FIX. The builder gains a `minBytes *minBytesWalk`, shared across nests like
+`named`/`building`. Parse and SchemaCache.Parse seed it in their constructors; a
+lazy seed at the top of b.build (before any nest copies the pointer) covers a
+directly-constructed white-box builder so the build-path sites never dereference a
+nil walk. The three build container sites (array minItemBytes, its fieldMeta twin,
+map minEntryBytes) call `b.minBytes.minBytesOf(...)`. The build walk is kept
+SEPARATE from finalize's fresh walk: build-time calls can run over subtrees whose
+forward references are unwired (provisional), so their memo must not leak into
+finalize, which recomputes on the fully-wired graph. After the fix every path is
+flat ~120 ms. A nil-pointer surfaced first — TestDiff_ParseFrontEndEquivalence's
+buildFromAschema builds a builder directly — and drove the lazy-seed design (four
+white-box builder sites exist; a per-creator init would be fragile).
+
+THE REACHING-PATH AXIS (the maintainer's specification correction). "I asked you
+to enumerate WALKS. This is one walk reached by two PATHS, and a bound that holds
+on one path and not the other is invisible to a per-walk row." The census gains a
+reachingPaths field on every row and a guard, TestInvariant_MinBytesReachingPaths,
+that DERIVES every min-bytes state constructor from source (newMinBytesWalk() call
+sites, excluding the func decl), requires each to be a rowed per-operation site,
+forbids the fresh-per-call form (newMinBytesWalk().minBytesOf) anywhere but the
+single standalone schemaMinBytes, and forbids a production caller of that standalone
+(which would rebuild the walk per call). The construction paths, rowed: build
+(b.minBytes seeded in Parse + the lazy seed), finalize (the fixup-loop mbw), resolve
+(resolveCtx.minBytes), skip (per-record once.Do mbw), standalone (schemaMinBytes).
+Attacked both ways: the build neuter (fresh walk at a schema.go site) reds the guard
+via source ("consumes a FRESH min-bytes walk... found 2"), and a removed row's
+constructor site fails the rot check.
+
+THE NET. TestInvariant_MinBytesContainerCountBounded gains a BACKWARD family
+(nContainersOverWiredSCC: the cyclic type defined first and fully wired, N arrays
+referencing it by name) crossed through Parse and SchemaCache.Parse, and ocf gains
+NewReader/many-container-header-schema-backward (dagManyContainerWiredHeader), the
+file-supplied severity cell for the backward path. Non-vacuity: neutering ONLY the
+build sites reds EXACTLY the backward cells and leaves the forward/resolve/skip
+cells green — the reaching-path is discriminated, not merely covered.
+
+Full suite + fastavro (0 missing-optional-dep) + go test -race ./... all green (0
+data races; the -race dosBudget relaxation from #60 still holds); Java un-netted
+(no JRE). The general lesson, now P30's reaching-path corollary: a walk's cost row
+describes the walk, but a walk reached by several construction paths needs each
+path's bound named and derived from source, because reference DIRECTION (and, in
+general, WHICH construction path a caller takes) decides whether a shared bound is
+even on the path the caller reaches.
