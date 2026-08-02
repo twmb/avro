@@ -12182,3 +12182,298 @@ describes the walk, but a walk reached by several construction paths needs each
 path's bound named and derived from source, because reference DIRECTION (and, in
 general, WHICH construction path a caller takes) decides whether a shared bound is
 even on the path the caller reaches.
+
+## Distillation archive (2026-08-01 #62) — the record-count factor FULL round narrative, verbatim
+
+FULL, read-only, HEAD e9388a7. Quarantine scope a5dd23c..HEAD = 8f036ae +
+e9388a7 (the min-bytes sharing generation), now cleared.
+
+**The finding — the min-bytes product's FOURTH factor.** The quarantined
+generation threaded ONE `newMinBytesWalk()` per OPERATION at build, finalize and
+resolve, and at skip it threaded one per RECORD, inside `skipRecord`'s
+`once.Do` (skip.go:96). Its census row (budgeted_walk_census_test.go:403) states
+the bound as a sentence — "the SKIP path (cross-record cost is wire-bounded)" —
+and the source comment expands it: "the cost across DIFFERENT records is bounded
+separately because each record's once.Do fires only when the wire actually
+reaches it." Both are true. Neither bounds anything: reaching record k costs O(1)
+wire bytes while draining a full `maxMinBytesWork`, so the amplification is one
+full allowance PER WIRE BYTE.
+
+Executed. `Top` holds a cyclic SCC L0..L25 (each level referencing the next
+twice, so nothing memoizes) and ONE record `R = {z: array<L0>}`, then references
+`"R"` N more times — ~25 schema bytes per reference, and every reference is a
+separate `skipRecordFields` with its own `once` and its own fresh walk. Writer
+drops into a reader that keeps only a sibling field, so `resolveRecord` compiles
+a skip; the wire is one empty-array byte per reference.
+
+    n=  1  schema=3744B  wire= 54B  DECODE   121ms
+    n=  8  schema=3919B  wire= 61B  DECODE   939ms
+    n= 16  schema=4125B  wire= 69B  DECODE  1.894s
+    n= 32  schema=4541B  wire= 85B  DECODE  3.778s
+    n=256  schema=10521B wire=309B  DECODE 43.478s
+
+Perfectly linear at ~118 ms per record reference. Reached through the entry
+point where the writer schema is entirely attacker-supplied: a 4681-byte OCF
+file read with `ocf.NewReader(..., ocf.WithReaderSchema(app))` takes 5.411s at
+n=32.
+
+Gate: not documented. NOT_BUGS has no entry; the only statement is the census
+row's rationale, landed in-range at 8f036ae (pickaxe `-S 'newMinBytesWalk()'`
+and `-G 'skipRecord'` over 299c392..HEAD -- skip.go: one hit, 8f036ae). That
+commit strictly IMPROVED the site (it was fresh-per-container before), so this
+is not a ping-pong reversal — it is an unexecuted premise in an otherwise
+correct fix, and the verdict is "documented but contradicted by new evidence."
+
+Not fixed: the round is read-only, and the fix is not a drop-in. `ctx.minBytes`
+cannot simply be captured into the lazy compile, because `skipRecord` compiles at
+DECODE time on a `*Schema` shared across goroutines; per-record freshness is
+exactly what keeps the walk race-free today. Sharing needs a mutex on the walk
+(cheap — each record compiles once), or a shared atomic allowance with per-record
+memos. That trade is the maintainer's call, so it is filed as **G5** rather than
+patched.
+
+**Standing lesson — the ROW, not the walk.** The census built one round earlier
+to catch exactly this class did not catch it, and the reason generalizes: six of
+its seven `newMinBytesWalk()` rows carry a bound backed by a CELL; the seventh
+carries a bound backed by a SENTENCE. A row whose justification is prose is
+unverified until a cell drives the count that prose claims is bounded. The
+reaching-path corollary already said a per-walk row is not enough; this adds that
+a per-PATH row is not enough either if the path's row asserts its factor instead
+of measuring it. Concretely: the fix generation's own skip cell
+(`Resolve+Decode/many-containers-dropped`) held the record count at 1 and varied
+the container count — B32's held-constant-axis blind spot, in the net built to
+close the very class it missed.
+
+**Fronts — all clean, each an EXECUTED claim rather than a read one.**
+
+Verified: `Resolve` × `CheckCompatibility` accept-set diff. `checkSameKind`
+(compat.go:126) requires namesMatch for record/enum/fixed, equal fixed SIZE, and
+equal decimal precision/scale; `doResolve`'s same-kind arm (resolve.go:233)
+checks none of them and would mis-frame the wire on a fixed-size mismatch. Six
+divergence shapes built and run — all six reject identically, because `Resolve`
+pre-calls `CheckCompatibility` (resolve.go:34) before any resolution. The
+asymmetry is real in the arms and closed by the entry point.
+
+Verified: `readerFieldLookup`'s justification. Its doc rests the
+all-names-before-all-aliases routing on "the parse-time rejection of field
+name/alias collisions". compat walks READER fields (findWriterField:
+name-then-own-aliases); resolve walks WRITER fields (readerByName.index). Three
+shapes that would make the two relations disagree — two reader fields sharing one
+alias, an alias colliding with a later field's name, and the same with
+declaration order flipped — are all rejected at parse ("record field alias %q
+collides with another field name or alias"). The justification holds as written.
+
+Verified: promote.go's "mirrors the natural uuid deser" comment.
+`promoteBytesToStringUUID` vs the natural string+uuid decoder across
+{valid UUID, malformed content} × {string, [16]byte, any}: identical on all six,
+including the one cell that separates them (malformed content into [16]byte
+rejects on both with the same message; into string/any both pass it through).
+
+Verified by inverse density — the eight source files with ZERO mentions across
+AUDIT_PATTERNS + NOT_BUGS + AUDIT_CORE: rabin.go (CRC-64-AVRO table + the
+`-(fp&1)` mask idiom; `Sum` big-endian per the hash.Hash convention while the SOE
+header is little-endian via `binary.LittleEndian.PutUint64`, schema.go:331 — two
+different contracts, both correct), soe.go, varint.go (the `uvarintLens` table's
+reachable prefix 0..35 is exactly ceil(bits/7); the junk beyond is unreachable
+since `bits.Len32` ≤ 32; readUvarint/readUvarlong cap at 32/64 bits with the
+continuation bit folded into the overflow test), errors.go, logical.go
+(`timeToTimestampScaled`'s adjustment branch round-trips MinInt64 nanos exactly;
+`timeToDate`'s division is exact because the operand is always a UTC midnight),
+schema_canonical.go (PCF key order name/type/fields/symbols/items/values/size,
+raw-UTF-8 [STRINGS] with only the mandatory escapes), schema_walk.go, promote.go,
+plus atype (54 lines of constants that nothing in the module imports — a parallel
+hand-written vocabulary; all 13 logical spellings appear in schema.go, and the
+metadata surface really does report `Type == "error"` for an error kind, so the
+package doc's claim holds).
+
+**G3 measured and decided.** The gap asked for a cost cell. Both reflect
+collectors are 2^depth on a shared-reference embed fan-out (N levels, each
+embedding two distinct wrappers that both embed the next level):
+
+    depth  4    527µs      depth 12    9.078ms
+    depth  6    162µs      depth 14   17.454ms
+    depth  8    430µs      depth 16   60.789ms
+    depth 10  1.946ms      depth 18  248.942ms
+
+That is `SchemaFor` on an ACCEPTED type (empty leaf). With a field on the leaf
+the same shape costs 2.07s at depth 18 and then REJECTS ("duplicate field name")
+— the exponential is paid before the rejection. `typeFieldMapping` is the same
+class: 410ms at depth 18 on a cold cache. Carrier remains compile-time (a Go type
+is not attacker-supplied and the per-type `sync.Map` amortizes repeats), so the
+class is cost-only and stays open as a gap rather than becoming a finding — but
+it is now decided by measurement instead of assumed.
+
+Net: `go test -count=1 ./...` green (47.6s + ocf 4.7s, 0 skips, 0 "missing
+optional dependency"); re-run green with `AVRO_FASTAVRO_PYTHON` pointed at
+~/.cache/avro-audit-venv (fastavro 1.12.2), and the differential arm confirmed
+EXECUTING rather than skipping (`-run Fastavro -v` shows RUN lines). Java
+un-netted: no JVM on the machine (`java -version` → "Unable to locate a Java
+Runtime"), so every Java-oracle area is verified-modulo-that-oracle.
+
+## Distillation archive (2026-08-01 #63) — the stand-in-soundness FIX round narrative, verbatim
+
+FIX round, START head e9388a7.
+
+**Ruling 1 named a premise that outranked the fix, and executing it found a
+behavioral bug.** The premise: "a drained shared allowance only ever LOOSENS a
+later record's bound, so a nondeterministic drain order under concurrency
+cannot reject a valid wire." It is FALSE, and the reason generalizes past the
+drain.
+
+`checkArrayBlockBounds` does not treat the per-item minimum as a magnitude. It
+switches RULES on it: `> 0` takes the buffer-relative bound `count <=
+srcLen/min`, `== 0` takes the 4096-element zero-byte cap. The two are
+incomparable — neither admits a superset of the other. `minBytes` reported the
+stand-in **1** whenever it could not compute a value, and 1 is above the true
+minimum for any zero-minimum subtree. So an uncomputed minimum did not loosen
+the bound; it moved a legitimately zero-byte container onto a rule it cannot
+satisfy.
+
+Three instances, all encode/decode parity breaks — the package's own encoder
+producing a wire its own decoder rejects:
+
+1. **Exhaustion, build path.** Two schemas differing ONLY in field order.
+   `Root{def:<cyclic SCC>, a:array<L0>, z:array<null>}` drains the shared walk
+   at `a`, so `z` takes the stand-in; with `z` before `a` it does not. 6-byte
+   wire, 4096 nulls: accepted in one order, `array block count 4096 exceeds
+   remaining buffer length 1 (min 1 byte/item)` in the other.
+2. **Exhaustion, resolve path.** Same shape through `Resolve` + decode.
+3. **nil child — and this one needs no adversarial schema at all.**
+   `minBytes(nil)` returned `(1, true)` for an unwired forward reference, and
+   marked it ACYCLIC so the wrong value was memoized. `Root{z:array<Inner>,
+   d:Later}` with `Inner{g:Later}` and `Later` an empty record: 3-byte wire,
+   accept or reject decided purely by whether `Later` is declared before or
+   after. A container whose DIRECT child is resolvable is not in
+   `containerFixups`, so its build-time value is never recomputed.
+
+**The fix: no stand-in may be a guess.** The rule now stated at
+`minBytesUnknown`: a reported minimum must be a sound LOWER bound on the true
+per-value wire size, and must never be positive unless the true minimum is
+provably at least that. Under-reporting only loosens; over-reporting changes
+which rule applies.
+
+- nil child and exhausted allowance both report `minBytesUnknown` (-1), never
+  memoized.
+- The back-edge stand-in STAYS 1, now with its proof: a cyclic type's true
+  minimum is at least 1, because every finite value must somewhere decline to
+  re-enter the cycle, and the only constructs that can are a union (a
+  branch-index varint) and an array/map (a terminating zero block count) —
+  each at least one byte, each part of the node's own encoding. A cycle
+  offering neither is unencodable, so no wire can be false-rejected.
+- Record: the readable fields' sum is still a sound lower bound (unknown
+  fields contribute >= 0), so a positive partial sum is reported and keeps the
+  buffer-relative rule; only a partial sum of 0 is genuinely undecidable and
+  becomes unknown.
+- Union: an unknown branch yields 1, not unknown — a union always spends its
+  index varint, so 1 is sound AND positive.
+- `checkArrayBlockBounds` gains the unknown RULE: admit the union of what both
+  rules admit, `count <= max(srcLen, maxZeroByteItems-total)`. A superset of
+  both, so it false-rejects neither, while still bounding the count by the
+  input rather than by the declared number.
+- Maps never needed an unknown rule: an entry always carries its key's length
+  varint, so `mapEntryMinBytes` collapses unknown to 1, which is exact. It is
+  now the SINGLE constructor of that number for all four map sites, which is
+  also what keeps `1 + (-1) = 0` from reaching `checkMapBlockBounds`' divisor.
+- `inner.minBytes` (the unsafe array reader's copy) was computed by a SECOND
+  call and never patched by the forward-ref fixup, so the safe and unsafe
+  readers could hold different answers. One computation now feeds both slots
+  and the fixup patches both.
+
+**Ruling 1 proper — the skip walk.** With the above, the required property is
+true BY CONSTRUCTION rather than by argument: a drained allowance yields
+unknown, whose bound is a superset of every computable answer, so drain order
+— deterministic or not — can only loosen. That is what makes sharing safe.
+
+`skipRecord` now takes the operation's walk (threaded from `resolveCtx`)
+instead of constructing one per record. Measured, n = record references over one
+shared cyclic SCC:
+
+    n=256: 43.478s -> 147ms      (schema 10.5 KB, wire 309 bytes)
+    n= 32 via ocf.NewReader + WithReaderSchema: 5.411s -> 142ms (4681-byte file)
+    n=1/8/16/32 decode: 129/131/129/131ms — flat, where it was 121/939/1894/3778
+
+The alternatives were measured, not assumed:
+
+- **Mutex on the shared walk (chosen).** `minBytesOf` locks. It is never in the
+  decode path — every call site computes before returning its closure — so
+  steady-state decode is unaffected (BenchmarkResolvedDecodeWithSkips ~1.7-2.4
+  us/op for 64 dropped records). Uncontended in steady state: each record
+  compiles exactly once under its `once.Do`, and build/finalize/resolve are
+  single-threaded.
+- **Shared allowance, per-record memo.** Rejected on constraint (c), measured:
+  64 records over one shared ACYCLIC subtree compile in 496us on the shared
+  memo against ~14.2ms for 64 x the one-record cost. Losing the memo costs ~29x
+  on the axis the allowance does not bound.
+- `-race` with 32 goroutines x 20 decodes of one resolved schema: clean, and
+  the full suite is clean under `-race`.
+
+**Ruling 2 — the census.** Rows now carry `factors []reachFactor`; each factor
+names the caller-chosen count the walk is shared across and the cell that
+DRIVES it, at two or more distinct values. The cell reads its values from the
+row, so "the cell drives two values" is not a second claim to check against the
+first — it is the same fact read once.
+`TestInvariant_EveryReachingPathBoundIsMeasured` fails a row with no cell, a
+factor with fewer than two distinct values, and a cost that scales with its
+factor. The skip row is gone as a construction site; the resolve row now
+carries two factors — containers per resolution, and records compiled per
+resolution.
+
+Six factors, all flat across a 48x spread (125ms/126ms, 127/122, 129/126,
+124/126, 359/360, 124/125). Non-vacuity, three neuters, three DISTINCT red
+sets: rebuild the walk per record -> only the record factor's SCALE arm (4.001s
+at 48 vs 123ms at 1); collapse `reachCounts` to one value -> the
+distinct-values arm on all six; replace a row's factors with prose -> the
+no-cell arm on that row alone. The matrix's own non-vacuity took two SEPARATE
+neuters (a bundled one proves neither): nil-arm -> 1 reds exactly the
+nil-child cells, exhaustion-arm -> 1 reds exactly the drained cells. The first
+attempt at the nil neuter was a silent NO-OP (the anchor text did not match)
+and came back green; it was only caught by asserting the replacement applied,
+which is the same failure the measurement rule exists to prevent.
+
+**The audit ruling 2 asked for — other cells holding their own factor
+constant.** Derived mechanically (every cost cell, every cost-generator call,
+distinct magnitudes per call), not by eye. FIVE cells across THREE factors:
+
+- PATHS factor (P28's memo): `TestInvariant_EveryMinBytesEntryPointIsBounded`
+  drives `dagCostDepth = 26` only.
+- CHILDREN factor (P29's per-child charge): `dagWideWidth = 8000` only, in
+  THREE cells — `TestInvariant_CyclicWalkCostIsBoundedByWork`,
+  `TestInvariant_WideCyclicWalkReachesEveryEntryPoint`, and
+  `TestInvariant_MetadataWalkChargesPerChild` (the metadata walkBudget's own
+  children factor, same constant).
+- CONTAINER factor: `TestInvariant_MinBytesContainerCountBounded` pins
+  `containerCountN = 220`. Its two generator calls vary the REFERENCE
+  DIRECTION, not the count — the exact "names the right axis and holds the
+  deciding one constant" shape. This factor is now covered at two values by
+  the new guard, on every reaching path; the cell itself is still single-valued.
+
+Value oracles are correctly excluded: `TestInvariant_MemoAgreesWithUnmemoizedWalk`,
+`TestInvariant_DagMinBytesIsExactAtScale`, `TestInvariant_MinBytesSelfReadable`
+and `TestInvariant_SharingDoesNotChangeMinBytes` vary shapes to check a VALUE,
+not a cost, so the two-value rule does not apply to them.
+
+Two derive-the-set guards fired on the fix itself and were repaired rather than
+weakened: `TestInvariant_MinBytesCallSites` (schema.go went from 4 asks to 3
+when the duplicated array computation collapsed to one) and
+`TestInvariant_EveryMagnitudeArithmeticSiteIsClassified` (the new
+`mapEntryMinBytes` arithmetic needed a row; the three per-site `1 + <minimum>`
+derivations it replaced were removed, since three sites each reasoning out the
+same ceiling is the shape that leaves the question with no owner).
+
+Nets: full suite, fastavro differential (1.12.2, arm confirmed executing), and
+`-race` — all green, 0 data races. Java un-netted (no JVM).
+
+## Distillation archive (2026-08-01 #64) — three tombstoned blind-spot bodies, verbatim
+
+Moved out of AUDIT_PATTERNS §Structural blind spots when that file crossed its
+150000-byte bound. Each was already marked a tombstone (fully netted); the
+tombstone rule keeps an index marker plus a one-line body naming the net and the
+re-open condition, with the full text preserved here.
+
+- **(tombstone, netted) A validator runs on a RAW attribute BEFORE a transform that introduces more of the validated thing** — a name validator misses the components qualification later adds; the parallel form is a strict tokenizer whose LENIENT fallback skips the strict path's protections (an unclosed `alias=[a,inline` silently firing `inline`). Validate what the transform will PRODUCE, and give the fallback the same protections. Netted by 5 pins (`TestRegression_NamespaceAttributeValidatedLikeFullname`, `_LaxNamesValidatorSeesNamespaceComponents`, `_RuntimeTagDefaultValueWithKeyword`, `_RuntimeTagAliasListWithKeyword`, `_RuntimeMalformedTagFiresNoOption`). Re-opens: a new attribute validator ahead of a qualification step, or a new tokenizer with a lenient fallback. Verbatim: archive (2026-07-25 #4).
+
+- **(tombstone, netted) Reflect Type/Value-graph walks re-implementing indirection without the bound their sibling has — cyclic Go types (`type P *P`, `[]S`, `map[string]M`) crash or hang; the trigger is a CALLER type, not wire, so no wire/value/fuzz net sees it.** Netted: `maxIndirectDepth` on every pointer walk + a `depth`-param `maxDepth` on `inferType`, 5 pins, the at-cap/past-cap indirection matrix, and a must-not-false-reject control. Never copy a `>=`/`>` spelling from prose into code — the executed parity net is the authority. Re-opens: a new `Kind()==reflect.Pointer` loop or `Elem()` recursion without a bound, paired as a decode target AND a `SchemaFor` field type. Verbatim: archive (2026-07-25 #3) and (2026-07-21).
+
+- **(tombstone) Caller-owned `any` values consumed BEFORE the marshal→Parse round trip.** Netted 2026-07-17 (maintainer-ruled architecture): `canonicalizeTreeValue` at the render boundary + kind-driven `needsJSONFixupKind`/`applyJSONFixupKind` on every rebuild surface; marshal-opaque values stay opaque (NOT_BUGS #69). Net: `TestMatrix_TreeValueGoTypes` (~70 cells) + `FuzzTreeValueTwinParity` + 6 pins, neuter-verified. Exact-type dispatch on tree values is legal only DOWNSTREAM of the two boundary layers (FIX.md item 15). Re-opens: a new pre-boundary type-switch (grep `case map\[string\]any|case \[\]any|case \[\]string` in schema_for.go/schema_node.go and classify against the boundary). Verbatim: archive (2026-07-23 #6).
+
+  **Census codification (2026-07-18) — the domain's first principles.** INVARIANT: the composed/rebuilt schema is a function of the MARSHAL IMAGE of every caller value, never of its Go representation; the only image-changing values are the documented image-owners (own MarshalJSON/MarshalText and json.Number; the []byte codepoint fixup; ±Inf/−0.0 literals; canonical-only NaN→"NaN"). Entry points: SchemaNode.Props / SchemaField.Default / SchemaField.Props values, plus whole trees via CustomType.Schema and mutated Root() results; consumers: the rebuild and the SchemaFor render, one value choke point each (the cache splice is text-only, out of domain). Net: TestMatrix_TreeValue{LeafTwins,ContainerTwins,DefaultWire,FieldProps,VerdictParity,NilEmptyImage,MapKeyShapes} + TestRegression_TreeValueOwnershipBoundary + the nil-image and string-kind-key pins + FuzzTreeValueTwinParity — neuter-verified with disjoint red sets per component. Both census findings RULED and FIXED 2026-07-19: boundary copy arms preserve nil-ness in both directions (nil→nil, empty→empty; FIX.md invariant row), and string-KIND map keys canonicalize to their raw string while non-string-kind MarshalText keys stay opaque image-owners — NOT_BUGS #69 records both. Full axes (type-class × ownership × position × surface) + neuter red-set enumeration: archive (2026-07-18, 2026-07-24 #8).
