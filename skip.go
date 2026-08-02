@@ -75,10 +75,11 @@ type skipRecordFields struct {
 	once   sync.Once
 	fields []skipfn
 	node   *schemaNode
+	mbw    *minBytesWalk
 }
 
-func skipRecord(w *schemaNode) skipfn {
-	s := &skipRecordFields{node: w}
+func skipRecord(w *schemaNode, mbw *minBytesWalk) skipfn {
+	s := &skipRecordFields{node: w, mbw: mbw}
 	return func(src []byte, sl *slab) ([]byte, error) {
 		if sl.depth >= maxDepth {
 			return nil, errTooDeep
@@ -86,17 +87,20 @@ func skipRecord(w *schemaNode) skipfn {
 		sl.depth++
 		defer func() { sl.depth-- }()
 		s.once.Do(func() {
-			// One walk for this record's whole field set: the fields can point
-			// many containers at one shared subtree, and compiling them here
-			// (once per record, guarded by once) with a fresh walk per field
-			// would recompute that subtree per field. Sharing bounds the record's
-			// compile cost the way finalize and resolve bound theirs; the cost
-			// across DIFFERENT records is bounded separately because each
-			// record's once.Do fires only when the wire actually reaches it.
-			mbw := newMinBytesWalk()
+			// The OPERATION's walk, threaded down from Resolve — not a fresh
+			// one. A record is not a cost boundary: the schema chooses how many
+			// records a dropped subtree references, each reference compiles its
+			// own skipRecordFields, and a per-record walk therefore multiplied
+			// the per-walk allowance by a count the schema picks. Reaching each
+			// one costs O(1) wire bytes, so "the wire bounds how many compile"
+			// bounds the COUNT and not the WORK.
+			//
+			// This runs at decode time and the walk is shared, so minBytesOf
+			// locks; see minBytesWalk.mu for why that is uncontended and why a
+			// nondeterministic drain order is safe here.
 			s.fields = make([]skipfn, len(s.node.fields))
 			for i := range s.node.fields {
-				s.fields[i] = buildSkip(s.node.fields[i].node, mbw)
+				s.fields[i] = buildSkip(s.node.fields[i].node, s.mbw)
 			}
 		})
 		var err error
@@ -172,7 +176,7 @@ func skipMap(w *schemaNode, mbw *minBytesWalk) skipfn {
 	valueSkip := buildSkip(w.values, mbw)
 	// minEntryBytes = 1 (key length varint, ≥1 byte for an empty key) +
 	// the value's minimum wire bytes — identical to deserMap.minEntryBytes.
-	minEntryBytes := 1 + mbw.minBytesOf(w.values)
+	minEntryBytes := mapEntryMinBytes(mbw.minBytesOf(w.values))
 	return func(src []byte, sl *slab) ([]byte, error) {
 		return skipBlocks(src, sl, "map",
 			// Bound the block count against the remaining buffer, matching
@@ -233,19 +237,20 @@ var primitiveSkips = map[string]skipfn{
 	"string":  skipString,
 }
 
-// buildSkip compiles a skipper for writer node w. mbw is the min-bytes walk
-// shared across the containers reached WITHOUT crossing a record boundary — the
-// array/map/union arms consult it and pass it down, so a record-free chain of N
-// nested containers over one shared subtree computes that subtree once. A record
-// breaks the chain: skipRecord compiles its fields lazily and starts its own
-// walk (see there), so mbw does not thread into it.
+// buildSkip compiles a skipper for writer node w. mbw is the ONE min-bytes walk
+// of the operation that reached here (resolveCtx.minBytes), and every arm passes
+// it down — including the record arm, whose compile is deferred to decode time
+// but still joins this walk rather than starting a fresh one. Nothing along the
+// way is a cost boundary: containers, union branches and records are all counted
+// by the schema, so any per-unit allowance is the per-walk bound multiplied by a
+// number the schema author picks.
 func buildSkip(w *schemaNode, mbw *minBytesWalk) skipfn {
 	if f, ok := primitiveSkips[w.kind]; ok {
 		return f
 	}
 	switch w.kind {
 	case "record":
-		return skipRecord(w)
+		return skipRecord(w, mbw)
 	case "enum":
 		return skipEnum
 	case "array":

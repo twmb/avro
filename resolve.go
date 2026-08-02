@@ -694,7 +694,7 @@ func resolveMap(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, er
 		// minEntryBytes: bound against the WRITER's wire format, not the
 		// reader's resolved schema (a long-on-wire promoted to a double
 		// reader is still 1 byte minimum on the wire).
-		deser: (&deserMap{deserItem: resolved.deser, minEntryBytes: 1 + ctx.minBytes.minBytesOf(w.values)}).deser,
+		deser: (&deserMap{deserItem: resolved.deser, minEntryBytes: mapEntryMinBytes(ctx.minBytes.minBytesOf(w.values))}).deser,
 	}
 	ctx.applyCustomToNode(nd, r)
 	return nd, nil

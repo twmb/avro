@@ -705,7 +705,26 @@ const maxZeroByteItems = 4 << 10
 // totalItems after a non-error return. Used by skipArray, deserArray,
 // udArrayPtrRecord, and udArrayDirect to keep the four sites from
 // drifting on this rule.
+// minItemBytes selects the RULE, not just the magnitude: a positive value takes
+// the buffer-relative bound, zero takes the zero-byte cap, and the two are not
+// ordered — neither is uniformly the looser. That is why a per-item minimum may
+// never be rounded UP: reporting 1 for a type whose true minimum is 0 does not
+// loosen the bound, it moves a legitimately zero-byte array onto a
+// buffer-relative rule it cannot satisfy. minBytesUnknown is the third rule,
+// for when the walk could not compute one (see minBytes).
 func checkArrayBlockBounds(count int64, totalItems int64, srcLen int, minItemBytes int) error {
+	if minItemBytes == minBytesUnknown {
+		// Unknown: admit the union of what BOTH rules admit, so an
+		// uncomputed minimum can only ever loosen. A valid wire satisfies
+		// one of them — count <= srcLen/m for a true minimum m >= 1 (hence
+		// count <= srcLen), or count <= the zero-byte cap when m is 0 — so
+		// their union false-rejects neither, while still bounding the count
+		// by the input rather than by the declared number.
+		if lim := max(int64(srcLen), int64(maxZeroByteItems)-totalItems); count > lim {
+			return fmt.Errorf("array block count %d exceeds remaining buffer length %d with an uncomputed per-item minimum", count, srcLen)
+		}
+		return nil
+	}
 	if minItemBytes > 0 {
 		if count > int64(srcLen)/int64(minItemBytes) {
 			return fmt.Errorf("array block count %d exceeds remaining buffer length %d (min %d byte/item)", count, srcLen, minItemBytes)
@@ -716,6 +735,24 @@ func checkArrayBlockBounds(count int64, totalItems int64, srcLen int, minItemByt
 		return fmt.Errorf("array of zero-byte items exceeds %d-element limit", maxZeroByteItems)
 	}
 	return nil
+}
+
+// mapEntryMinBytes converts a map VALUE's minimum into the per-ENTRY minimum
+// every map block bound uses. It is the single constructor of that number for
+// all four map sites (build, the forward-ref fixup, resolve, skip) so none of
+// them can reach checkMapBlockBounds' divisor with an unknown, which would
+// otherwise arrive as 1 + (-1) = 0 and divide by zero.
+//
+// Unknown collapses to a 1-byte entry, and that is exact rather than a
+// fallback: a map entry always carries its key's length varint, so the entry
+// minimum is at least 1 whatever the value type costs. Maps therefore need no
+// unknown RULE the way arrays do — the weakest sound bound is also the only one
+// they ever had.
+func mapEntryMinBytes(valueMin int) int {
+	if valueMin == minBytesUnknown {
+		return 1
+	}
+	return 1 + valueMin
 }
 
 // checkMapBlockBounds bounds a map block's declared entry count against the
@@ -1014,6 +1051,8 @@ func newMinBytesWalk() *minBytesWalk {
 // and allowance so the cost joins that of every prior container computed on the
 // same walk.
 func (w *minBytesWalk) minBytesOf(n *schemaNode) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	v, _ := w.minBytes(n)
 	return v
 }
@@ -1052,6 +1091,20 @@ func (w *minBytesWalk) minBytesOf(n *schemaNode) int {
 // TestInvariant_MemoAgreesWithUnmemoizedWalk relies on.
 const maxMinBytesWork = 1 << 22
 
+// minBytesUnknown is what the walk reports when it cannot compute a node's
+// minimum — an unwired forward reference, or an exhausted allowance. It is a
+// distinct rule rather than a number because the consumers do not treat the
+// minimum as a pure magnitude: checkArrayBlockBounds switches between the
+// zero-byte cap and the buffer-relative bound on whether it is 0, and those two
+// rules are incomparable. So there is no numeric stand-in that is safe in both
+// directions, and any guess false-rejects one of them.
+//
+// The rule every producer here obeys: a reported minimum must be a sound LOWER
+// bound on the true per-value wire size, and must never be positive unless the
+// true minimum is provably at least that. Under-reporting only loosens a
+// bound; over-reporting changes which bound applies.
+const minBytesUnknown = -1
+
 // minBytesWalk carries the shared state of one operation's min-bytes work,
 // reused across every container the operation computes a bound for.
 //
@@ -1088,6 +1141,25 @@ const maxMinBytesWork = 1 << 22
 // consumed from inside X, produce a total that differs from the walk with no
 // memo at all. TestInvariant_MemoAgreesWithUnmemoizedWalk is what settles it.
 type minBytesWalk struct {
+	// mu guards the three fields below. One walk is shared across a whole
+	// operation, and the SKIP path's share of that operation runs at DECODE
+	// time — a record's field set is compiled inside its sync.Once, which fires
+	// on whichever goroutine first reaches that record on the wire. Two
+	// different records of one resolved schema can therefore compile
+	// concurrently on one walk.
+	//
+	// It is uncontended in steady state: each record compiles exactly once, and
+	// every non-skip reaching path (build, finalize, resolve) is single-threaded
+	// by construction. Sharing the memo is the whole point — see newMinBytesWalk
+	// — so a per-record walk is not an alternative to the lock, it is a
+	// different (and unbounded) cost.
+	//
+	// Drain ORDER is deliberately not made deterministic. It does not need to
+	// be: an exhausted allowance yields minBytesUnknown, whose bound admits the
+	// union of what every computable answer would admit (checkArrayBlockBounds),
+	// so which record drains the walk can only ever LOOSEN a later record's
+	// bound and can never reject a wire another order would have accepted.
+	mu        sync.Mutex
 	path      map[*schemaNode]bool // the nodes currently being computed
 	done      map[*schemaNode]int  // results for nodes whose subtree has no cycle
 	allowance int                  // children left to examine; see maxMinBytesWork
@@ -1126,12 +1198,24 @@ func minBytesChildren(n *schemaNode) int {
 // entirely free of cycles — the condition for remembering the result.
 func (w *minBytesWalk) minBytes(n *schemaNode) (int, bool) {
 	if n == nil {
-		return 1, true
+		// An unwired forward reference during build. Its subtree is not
+		// reachable yet, so its minimum is not merely expensive but unknown —
+		// and unknown is the only sound answer, because 0 and 1 select
+		// different block-bound RULES (see checkArrayBlockBounds) and this
+		// node's true minimum may be either.
+		return minBytesUnknown, false
 	}
 	if w.path[n] {
-		// Same conservative stand-in as before the memo existed. The false
-		// travels back with it so every enclosing node learns its own result
-		// was reached through a back-edge and must not be remembered.
+		// A cycle through n. The stand-in is 1 because a cyclic type's true
+		// minimum is at least 1: every finite value of n must, somewhere on
+		// the path back to n, decline to re-enter it, and the only constructs
+		// that can are a union (which spends a branch-index varint) and an
+		// array or map (which spends a terminating zero block count) — each at
+		// least one byte, and each part of n's own encoding. A cycle offering
+		// neither is unencodable, so no wire can be false-rejected by any
+		// bound derived from it. The false travels back so every enclosing
+		// node learns its own result came through a back-edge and must not be
+		// remembered.
 		return 1, false
 	}
 	if v, ok := w.done[n]; ok {
@@ -1142,7 +1226,12 @@ func (w *minBytesWalk) minBytes(n *schemaNode) (int, bool) {
 	// unit for the entry would bound the number of entries and leave the work
 	// each one does unbounded.
 	if !w.take(1 + minBytesChildren(n)) {
-		return 1, false
+		// Exhausted. Unknown, NOT a magnitude: exhaustion is permanent and
+		// global to the walk, so every later node takes this arm — including
+		// nodes with nothing cyclic about them, whose true minimum is 0. A
+		// numeric stand-in here would be a claim about a node the walk never
+		// looked at.
+		return minBytesUnknown, false
 	}
 	w.path[n] = true
 	v, acyclic := w.minBytesFromChildren(n)
@@ -1178,12 +1267,25 @@ func (w *minBytesWalk) minBytesFromChildren(n *schemaNode) (int, bool) {
 		// the union as costing one byte.
 		m, found := 0, false
 		acyclic := true
+		unknown := false
 		for _, b := range n.branches {
 			v, ba := w.minBytes(b)
 			acyclic = acyclic && ba
+			if v == minBytesUnknown {
+				unknown = true
+				continue
+			}
 			if !found || v < m {
 				m, found = v, true
 			}
+		}
+		if unknown {
+			// A union never needs the unknown rule: whatever the unreadable
+			// branch costs, it is at least 0, so the union is at least its own
+			// branch-index varint. 1 is a sound lower bound and — unlike a
+			// record's — it is positive, so it keeps the buffer-relative rule
+			// that a union's guaranteed byte justifies.
+			return 1, false
 		}
 		if !found {
 			return 1, acyclic
@@ -1196,13 +1298,35 @@ func (w *minBytesWalk) minBytesFromChildren(n *schemaNode) (int, bool) {
 		// a value the wrap already destroyed.
 		var s int
 		acyclic := true
+		unknown := false
 		for i := range n.fields {
 			v, fa := w.minBytes(n.fields[i].node)
 			acyclic = acyclic && fa
+			if v == minBytesUnknown {
+				// Keep summing the readable fields: their total is still a
+				// sound lower bound on the record, since the unknown ones
+				// contribute at least 0.
+				unknown = true
+				continue
+			}
 			s = saturateSchemaMagnitude(s + v)
 			if s == maxSchemaMagnitude {
-				return maxSchemaMagnitude, acyclic
+				// Already at the ceiling from the readable fields alone, so
+				// the ceiling is a sound lower bound whatever the rest cost.
+				return maxSchemaMagnitude, acyclic && !unknown
 			}
+		}
+		if unknown && s == 0 {
+			// Nothing readable to stand on. The record's true minimum may be
+			// 0 or positive, and those select different rules, so neither can
+			// be guessed.
+			return minBytesUnknown, false
+		}
+		if unknown {
+			// The readable fields alone guarantee s bytes; the unknown ones
+			// only add. A positive lower bound is all the buffer-relative
+			// rule needs.
+			return s, false
 		}
 		return s, acyclic
 	}

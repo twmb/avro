@@ -3295,7 +3295,12 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// alias; only the Items/Values pointer fields need the explicit sync.
 		canonObj.Items = &af.canon
 		sa := &serArray{serItem: af.ser}
-		da := &deserArray{deserItem: af.deser, minItemBytes: b.minBytes.minBytesOf(af.node)}
+		// One computation feeding both wire-side slots. They are the same
+		// question asked by the safe and the unsafe array reader, and asking
+		// it separately is how they came to hold different answers: only
+		// da's was patched by the forward-ref fixup below.
+		itemMin := b.minBytes.minBytesOf(af.node)
+		da := &deserArray{deserItem: af.deser, minItemBytes: itemMin}
 		// Specialized array ser/deser fast paths bypass the inner
 		// schema's wrapped ser/deser functions. They are correct only
 		// when no per-element conversion is needed: no custom type,
@@ -3317,7 +3322,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.deser = da.deser
 		inner := new(fieldMeta)
 		*inner = af.meta
-		inner.minBytes = b.minBytes.minBytesOf(af.node)
+		inner.minBytes = itemMin
 		b.meta = fieldMeta{avroType: "array", inner: inner}
 		arrayNode := &schemaNode{
 			kind:  "array",
@@ -3332,9 +3337,13 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			// depend on the resolved type so the fixup can patch
 			// them once b.named[fwdRefName] becomes available.
 			b.containerFixups = append(b.containerFixups, containerFixup{
-				serItem:     &sa.serItem,
-				deserItem:   &da.deserItem,
-				setMinBytes: func(n int) { da.minItemBytes = n },
+				serItem:   &sa.serItem,
+				deserItem: &da.deserItem,
+				// Both slots: da backs the safe array path, inner.minBytes
+				// the unsafe one. Patching one left the other holding the
+				// build-time answer, computed while this child was still an
+				// unwired forward reference.
+				setMinBytes: func(n int) { da.minItemBytes = n; inner.minBytes = n },
 				nodeChild:   &arrayNode.items,
 				name:        fwdRefName,
 				parentName:  parentName,
@@ -3372,7 +3381,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		// wire bytes. Matches deserArray.minItemBytes in spirit; bounds
 		// block-count against remaining-buffer to prevent memory
 		// amplification on hostile input.
-		dm := &deserMap{deserItem: mf.deser, minEntryBytes: 1 + b.minBytes.minBytesOf(mf.node)}
+		dm := &deserMap{deserItem: mf.deser, minEntryBytes: mapEntryMinBytes(b.minBytes.minBytesOf(mf.node))}
 		// Same gate as the array case above: skip specialization when
 		// values have a custom type, a logical type, OR a forward
 		// reference (the fast-path closure can't capture an unresolved
@@ -3401,7 +3410,7 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 			b.containerFixups = append(b.containerFixups, containerFixup{
 				serItem:     &sm.serItem,
 				deserItem:   &dm.deserItem,
-				setMinBytes: func(n int) { dm.minEntryBytes = 1 + n },
+				setMinBytes: func(n int) { dm.minEntryBytes = mapEntryMinBytes(n) },
 				nodeChild:   &mapNode.values,
 				name:        fwdRefName,
 				parentName:  parentName,

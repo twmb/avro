@@ -44,10 +44,12 @@ package avro
 //     a depth cap plus the input length bounds the walk. No product hides here.
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 type walkClass string
@@ -90,104 +92,104 @@ type budgetedWalk struct {
 var budgetedWalks = []budgetedWalk{
 	// ---- schemaDAG: must bind the paths factor with a memo or a budget ----
 	{fn: "minBytes", file: "deser.go", class: schemaDAG,
-		factors: "containers x paths-per-walk x children-per-node",
-		binds: "one minBytesWalk SHARED per operation (containers) + done memo (paths) + per-child allowance charge (children)",
-		reachingPaths: "FOUR, each sharing one walk per operation: build (b.minBytes on the builder, forward refs fixed in finalize AND backward refs resolved to a fully-built node at build), finalize (one mbw before the container-fixup loop), resolve (ctx.minBytes), skip (one mbw per record's once.Do compile). The standalone schemaMinBytes is a fifth, single-node, outside any loop. Guarded by TestInvariant_MinBytesReachingPaths, which derives every newMinBytesWalk() site from source"},
+		factors:       "containers x paths-per-walk x children-per-node",
+		binds:         "one minBytesWalk SHARED per operation (containers) + done memo (paths) + per-child allowance charge (children)",
+		reachingPaths: "THREE constructions, each shared across one operation: build (b.minBytes on the builder, forward refs fixed in finalize AND backward refs resolved to a fully-built node at build), finalize (one mbw before the container-fixup loop), and resolve (ctx.minBytes) — which also carries the SKIP path, since a dropped field's record compile is deferred to decode time but joins the resolution's walk rather than starting its own. The standalone schemaMinBytes is a fourth, single-node, outside any loop and with no production caller. Guarded by TestInvariant_MinBytesReachingPaths (the set, from source) and TestInvariant_EveryReachingPathBoundIsMeasured (each path's counts, driven at two values)"},
 	{fn: "checkCompat", file: "compat.go", class: schemaDAG,
-		factors: "distinct (reader,writer) node pairs x children-per-pair",
-		binds: "the seen map[nodePair]bool memo, threaded from CheckCompatibility with no defer-delete, so each pair is walked once",
+		factors:       "distinct (reader,writer) node pairs x children-per-pair",
+		binds:         "the seen map[nodePair]bool memo, threaded from CheckCompatibility with no defer-delete, so each pair is walked once",
 		reachingPaths: "one: seen created in CheckCompatibility, threaded through the whole recursive check"},
 	{fn: "resolveNode", file: "resolve.go", class: schemaDAG,
-		factors: "distinct (reader,writer) pairs x (children + per-container min-bytes)",
-		binds: "ctx.seen pair memo (pairs) + ctx.minBytes shared walk (the container min-bytes factor)",
+		factors:       "distinct (reader,writer) pairs x (children + per-container min-bytes)",
+		binds:         "ctx.seen pair memo (pairs) + ctx.minBytes shared walk (the container min-bytes factor)",
 		reachingPaths: "one: ctx (seen + minBytes) created in Resolve, threaded through the whole resolution"},
 	{fn: "toJSONWalk", file: "schema_node.go", class: schemaDAG,
-		factors: "nodes emitted x bytes per node",
-		binds: "walkBudget (nodes + bytes), charged by takeNode at the TOP of every entry so a DAG re-descent still spends budget; visited is only cycle detection",
+		factors:       "nodes emitted x bytes per node",
+		binds:         "walkBudget (nodes + bytes), charged by takeNode at the TOP of every entry so a DAG re-descent still spends budget; visited is only cycle detection",
 		reachingPaths: "one walkBudget per metadata-API call (toJSONDedup), from Root().Schema()/String()/Canonical(); each walks the whole tree once"},
 	{fn: "collectLocalNames", file: "schema_node.go", class: schemaDAG,
-		factors: "distinct nodes x names per node",
-		binds: "the visited map[*SchemaNode]struct{} memo (mark on entry, return on hit)",
+		factors:       "distinct nodes x names per node",
+		binds:         "the visited map[*SchemaNode]struct{} memo (mark on entry, return on hit)",
 		reachingPaths: "one: visited created per toJSONDedup, one walk of the tree"},
 	{fn: "stampNameRefs", file: "schema_node.go", class: schemaDAG,
-		factors: "distinct nodes",
-		binds: "the visited memo (mark on entry, return on hit)",
+		factors:       "distinct nodes",
+		binds:         "the visited memo (mark on entry, return on hit)",
 		reachingPaths: "one: visited created per Root() name-ref stamping pass"},
 	{fn: "collectNamedTypes", file: "schema_node.go", class: schemaDAG,
-		factors: "tree nodes (name-ref nodes are leaves, not followed)",
-		binds: "structural: a reference SchemaNode carries no children, so the walk is over the definition TREE, linear in it",
+		factors:       "tree nodes (name-ref nodes are leaves, not followed)",
+		binds:         "structural: a reference SchemaNode carries no children, so the walk is over the definition TREE, linear in it",
 		reachingPaths: "one: table created in fixupNameRefDefaults, per Root()"},
 	{fn: "coerceTreeDefaults", file: "schema_node.go", class: schemaDAG,
-		factors: "tree nodes (name-ref nodes are leaves)",
-		binds: "structural: references are leaves, so the walk is over the definition TREE, linear in it",
+		factors:       "tree nodes (name-ref nodes are leaves)",
+		binds:         "structural: references are leaves, so the walk is over the definition TREE, linear in it",
 		reachingPaths: "one: same fixupNameRefDefaults pass, per Root()"},
 	{fn: "overlayInheritedCustom", file: "schema.go", class: schemaDAG,
-		factors: "distinct nodes x custom lookups",
-		binds: "the visited map[*schemaNode]bool memo (mark on entry, return on hit)",
+		factors:       "distinct nodes x custom lookups",
+		binds:         "the visited map[*schemaNode]bool memo (mark on entry, return on hit)",
 		reachingPaths: "one: b.overlayDone created per parse, walked at inherited-custom overlay (build/reference-time)"},
 	{fn: "findCustomTypeMatchInSubtreeWalk", file: "schema.go", class: schemaDAG,
-		factors: "distinct nodes x registered custom types",
-		binds: "the visited map[*schemaNode]bool memo (mark on entry, return on hit)",
+		factors:       "distinct nodes x registered custom types",
+		binds:         "the visited map[*schemaNode]bool memo (mark on entry, return on hit)",
 		reachingPaths: "one: visited created per findCustomTypeMatchInSubtree call at build"},
 	{fn: "buildCustomWiring", file: "schema.go", class: schemaDAG,
-		factors: "distinct nodes",
-		binds: "the visited memo (mark on entry, return on hit)",
+		factors:       "distinct nodes",
+		binds:         "the visited memo (mark on entry, return on hit)",
 		reachingPaths: "one: visited created per applyCustomTypes pass at build"},
 	{fn: "nodeAwaitsForwardRefSeen", file: "schema.go", class: schemaDAG,
-		factors: "distinct nodes",
-		binds: "the seen map[*schemaNode]struct{} memo (mark on entry, return on hit); the separate building set is defer-delete cycle detection",
+		factors:       "distinct nodes",
+		binds:         "the seen map[*schemaNode]struct{} memo (mark on entry, return on hit); the separate building set is defer-delete cycle detection",
 		reachingPaths: "one: seen created per nodeAwaitsForwardRef call at build"},
 
 	// ---- goTypeDAG: bound is compile-time fixedness + per-type sync.Map ----
 	{fn: "collect", file: "reflect.go", class: goTypeDAG,
-		factors: "2^(embed depth) on a shared-embed type DAG (visited is defer-delete, so it re-descends)",
-		binds: "NOT a runtime bound: a Go type is fixed at COMPILE time and the result is amortized by a per-type sync.Map, so the fan-out is not attacker-grown (G3)",
+		factors:       "2^(embed depth) on a shared-embed type DAG (visited is defer-delete, so it re-descends)",
+		binds:         "NOT a runtime bound: a Go type is fixed at COMPILE time and the result is amortized by a per-type sync.Map, so the fan-out is not attacker-grown (G3)",
 		reachingPaths: "one: visited created per typeFieldMapping (per Go type; the sync.Map amortizes repeats across calls)"},
 	{fn: "collectFieldsRaw", file: "schema_for.go", class: goTypeDAG,
-		factors: "2^(embed depth) on a shared-embed type DAG (visited is defer-delete)",
-		binds: "compile-time fixedness + collectFields' per-call visited; not attacker-grown at runtime (G3)",
+		factors:       "2^(embed depth) on a shared-embed type DAG (visited is defer-delete)",
+		binds:         "compile-time fixedness + collectFields' per-call visited; not attacker-grown at runtime (G3)",
 		reachingPaths: "one: visited created per collectFields, per SchemaFor of a Go type"},
 	{fn: "inferType", file: "schema_for.go", class: goTypeDAG,
-		factors: "type nodes x ptr chains, bounded by depth and maxIndirectDepth",
-		binds: "seen map[reflect.Type]seenForm memo + depth/ptrChain caps; compile-time type",
+		factors:       "type nodes x ptr chains, bounded by depth and maxIndirectDepth",
+		binds:         "seen map[reflect.Type]seenForm memo + depth/ptrChain caps; compile-time type",
 		reachingPaths: "one: seen created per SchemaFor, per Go type"},
 
 	// ---- valueTree / wire / textTree: node count IS input size ----
 	{fn: "walkDefault", file: "schema.go", class: valueTree,
-		factors: "default value nodes",
-		binds: "the walk follows the concrete default VALUE (a finite JSON tree), linear in it",
+		factors:       "default value nodes",
+		binds:         "the walk follows the concrete default VALUE (a finite JSON tree), linear in it",
 		reachingPaths: "one: per default-encode pass, following the value"},
 	{fn: "coerceDefault", file: "schema.go", class: valueTree,
-		factors: "default value nodes, bounded by depth",
-		binds: "value-guided recursion + the depth>=maxDepth cap",
+		factors:       "default value nodes, bounded by depth",
+		binds:         "value-guided recursion + the depth>=maxDepth cap",
 		reachingPaths: "one: per default coercion at parse, following the value"},
 	{fn: "coerceMetadataDefault", file: "schema_node.go", class: valueTree,
-		factors: "default value nodes",
-		binds: "value-guided recursion over the concrete default (name-ref follows are one hop, guided by the value)",
+		factors:       "default value nodes",
+		binds:         "value-guided recursion over the concrete default (name-ref follows are one hop, guided by the value)",
 		reachingPaths: "one: per Root() metadata default coercion, following the value"},
 	{fn: "branchAcceptsDefault", file: "schema_node.go", class: valueTree,
-		factors: "default value nodes",
-		binds: "value-guided recursion over the concrete default",
+		factors:       "default value nodes",
+		binds:         "value-guided recursion over the concrete default",
 		reachingPaths: "one: per branch-acceptance check, following the value"},
 	{fn: "encodeDefaultDepth", file: "resolve.go", class: valueTree,
-		factors: "default value nodes, bounded by depth",
-		binds: "value-guided recursion + the depth>=maxDepth cap",
+		factors:       "default value nodes, bounded by depth",
+		binds:         "value-guided recursion + the depth>=maxDepth cap",
 		reachingPaths: "one: per default encode, following the value"},
 	{fn: "appendAvroJSON", file: "json_codec.go", class: valueTree,
-		factors: "encoded value nodes, bounded by depth",
-		binds: "value-guided recursion + the depth>=maxDepth cap",
+		factors:       "encoded value nodes, bounded by depth",
+		binds:         "value-guided recursion + the depth>=maxDepth cap",
 		reachingPaths: "one: per EncodeJSON/AppendEncodeJSON call, following the value"},
 	{fn: "valueWalkLimit", file: "schema_node.go", class: valueTree,
-		factors: "value nodes x depth",
-		binds: "walkBudget + the depthLeft cap",
+		factors:       "value nodes x depth",
+		binds:         "walkBudget + the depthLeft cap",
 		reachingPaths: "one walkBudget per Props/value bounding pass (shared with toJSONWalk's budget)"},
 	{fn: "inlineTreeDefs", file: "cache.go", class: textTree,
-		factors: "JSON tree nodes (each definition inlined once)",
-		binds: "the seen/inlined map[string]bool sets: a name already inlined is emitted as a reference, so the output is linear in the definition set",
+		factors:       "JSON tree nodes (each definition inlined once)",
+		binds:         "the seen/inlined map[string]bool sets: a name already inlined is emitted as a reference, so the output is linear in the definition set",
 		reachingPaths: "one: seen/inlined created per SchemaCache self-containment splice"},
 	{fn: "build", file: "schema.go", class: textTree,
-		factors: "aschema text nodes, bounded by depth",
-		binds: "the parsed aschema is a TREE (each occurrence is its own text); depth>=maxDepth caps recursion",
+		factors:       "aschema text nodes, bounded by depth",
+		binds:         "the parsed aschema is a TREE (each occurrence is its own text); depth>=maxDepth caps recursion",
 		reachingPaths: "one: per Parse; nested builders share depth but each occurrence is its own text"},
 }
 
@@ -212,22 +214,22 @@ var graphCostMarkers = []string{
 // A new marker occurrence that matches neither a rowed walk nor one of these
 // fails the completeness guard — which is the point.
 var nonWalkMarkerUses = map[string]string{
-	"custom map[*schemaNode]*customWiring":        "a DATA map of node->custom wiring, not a visited set",
-	"custom      map[*schemaNode]*customWiring":   "a DATA map of node->custom wiring, not a visited set",
-	"customMatch map[*schemaNode]string":          "a DATA map of node->matched-custom-name, not a visited set",
-	"overlayDone map[*schemaNode]bool":            "presence state recording which nodes' overlay ran, carried on the builder across nests; the WALK that fills it (overlayInheritedCustom) is rowed",
-	"building     map[*schemaNode]struct{}":       "the record-in-progress set for build-time cycle detection, carried on the builder; not a per-walk visited",
-	"building:   make(map[*schemaNode]struct{})":  "initializes the builder's record-in-progress set (two sites: schema.go and cache.go)",
-	"b.overlayDone = make(map[*schemaNode]bool)":  "re-inits the builder overlay presence state",
-	"b.customMatch = make(map[*schemaNode]string)": "re-inits the builder custom-match data map",
-	"b.custom = make(map[*schemaNode]*customWiring":"re-inits the builder custom data map",
-	"b.building = make(map[*schemaNode]struct{})":  "re-inits the builder record-in-progress set",
-	"seen := make(map[reflect.Type]seenForm)":      "SchemaFor's inferType memo init; the walk (inferType) is rowed",
-	"seen map[reflect.Type]seenForm":               "inferType/inferRecord/inferField memo parameter; inferType is rowed",
-	"collectFields(t, make(map[reflect.Type]bool))":"inits collectFieldsRaw's visited; the walk is rowed",
-	"visited map[reflect.Type]bool":                "collect/collectFieldsRaw visited parameter; both rowed",
-	"make(map[reflect.Type]bool)":                  "inits a Go-type walk visited set; the walks (collect/collectFieldsRaw) are rowed",
-	"sync.Map // map[reflect.Type]":                "a per-Go-type compiled-codec cache, amortized and keyed by fixed types; not a walk",
+	"custom map[*schemaNode]*customWiring":          "a DATA map of node->custom wiring, not a visited set",
+	"custom      map[*schemaNode]*customWiring":     "a DATA map of node->custom wiring, not a visited set",
+	"customMatch map[*schemaNode]string":            "a DATA map of node->matched-custom-name, not a visited set",
+	"overlayDone map[*schemaNode]bool":              "presence state recording which nodes' overlay ran, carried on the builder across nests; the WALK that fills it (overlayInheritedCustom) is rowed",
+	"building     map[*schemaNode]struct{}":         "the record-in-progress set for build-time cycle detection, carried on the builder; not a per-walk visited",
+	"building:   make(map[*schemaNode]struct{})":    "initializes the builder's record-in-progress set (two sites: schema.go and cache.go)",
+	"b.overlayDone = make(map[*schemaNode]bool)":    "re-inits the builder overlay presence state",
+	"b.customMatch = make(map[*schemaNode]string)":  "re-inits the builder custom-match data map",
+	"b.custom = make(map[*schemaNode]*customWiring": "re-inits the builder custom data map",
+	"b.building = make(map[*schemaNode]struct{})":   "re-inits the builder record-in-progress set",
+	"seen := make(map[reflect.Type]seenForm)":       "SchemaFor's inferType memo init; the walk (inferType) is rowed",
+	"seen map[reflect.Type]seenForm":                "inferType/inferRecord/inferField memo parameter; inferType is rowed",
+	"collectFields(t, make(map[reflect.Type]bool))": "inits collectFieldsRaw's visited; the walk is rowed",
+	"visited map[reflect.Type]bool":                 "collect/collectFieldsRaw visited parameter; both rowed",
+	"make(map[reflect.Type]bool)":                   "inits a Go-type walk visited set; the walks (collect/collectFieldsRaw) are rowed",
+	"sync.Map // map[reflect.Type]":                 "a per-Go-type compiled-codec cache, amortized and keyed by fixed types; not a walk",
 }
 
 // TestInvariant_BudgetedWalkCensus is the enumeration guard. It derives the walk
@@ -391,16 +393,244 @@ type minBytesConstructionSite struct {
 	file    string
 	context string // a substring uniquely identifying the construction line
 	scope   string // what operation the constructed walk is shared across
+	// factors is what this path's ONE walk is shared ACROSS, and every entry
+	// carries the cell that MEASURES it. A row may not state its bound in
+	// prose: a sentence is a claim, and the whole purpose of this census is to
+	// reject claims. The seventh row of this table once read "cross-record cost
+	// is wire-bounded" — true, and it bounded nothing, because reaching a record
+	// costs O(1) wire bytes while draining a full allowance. No cell drove a
+	// record count, so nothing contradicted it.
+	//
+	// Empty only when exempt is set.
+	factors []reachFactor
+	// exempt records why this construction needs no measured factor. Legal only
+	// for a site that is not shared across anything, and the guard checks that
+	// premise itself rather than believing this string.
+	exempt string
 }
 
+// reachFactor is one caller-chosen count a shared walk is spread across, with
+// the cell that drives it.
+//
+// values must hold at least TWO distinct numbers. One value can only ask
+// "does this finish?" — it cannot tell a bound from a cost that is merely
+// linear with a small constant, and it cannot see a factor it never varies.
+// The cell reads its values FROM here rather than from its own constant, so
+// "the cell drives two values" is not a second claim to be checked against the
+// first; it is the same fact read once.
+type reachFactor struct {
+	name   string
+	values []int
+	// drive runs the reaching path at one value of the factor. It returns an
+	// error rather than taking a *testing.T because it executes inside the
+	// watchdog goroutine, where t.Fatal would be illegal.
+	drive func(n int) error
+}
+
+// reachCounts are the two values every reaching-path factor is driven at. The
+// low one establishes the single-unit cost; the high one is far enough above it
+// that a per-unit walk shows up as a multiple rather than as noise.
+var reachCounts = []int{1, 48}
+
+const reachLevels = 26 // SCC depth: deep enough that one walk exhausts its allowance
+
 var minBytesConstructionSites = []minBytesConstructionSite{
-	{"deser.go", "return newMinBytesWalk().minBytesOf(n)", "standalone schemaMinBytes: ONE node, outside any container loop (the only fresh-per-call form)"},
-	{"schema.go", "minBytes:   newMinBytesWalk()", "the builder's b.minBytes seeded in Parse — the BUILD path (backward refs resolve to a built node here)"},
-	{"schema.go", "b.minBytes = newMinBytesWalk()", "lazy seed at the root's first build, before any nest, so a directly-constructed (white-box) builder still shares one walk across the build path"},
-	{"schema.go", "mbw := newMinBytesWalk()", "one walk before finalize's container-fixup loop — the FINALIZE path (forward refs)"},
-	{"cache.go", "minBytes:   newMinBytesWalk()", "SchemaCache's builder b.minBytes — the build path via the cache"},
-	{"resolve.go", "minBytes: newMinBytesWalk()", "resolveCtx.minBytes, shared across one Resolve — the RESOLVE path"},
-	{"skip.go", "mbw := newMinBytesWalk()", "one walk per record's once.Do skip compile — the SKIP path (cross-record cost is wire-bounded)"},
+	{file: "deser.go", context: "return newMinBytesWalk().minBytesOf(n)",
+		scope:  "standalone schemaMinBytes: ONE node, outside any container loop (the only fresh-per-call form)",
+		exempt: "shared across nothing — it is the fresh-per-call form itself, and the guard below derives from source that no production code calls it, so there is no count for a cell to drive"},
+
+	{file: "schema.go", context: "minBytes:   newMinBytesWalk()",
+		scope: "the builder's b.minBytes seeded in Parse — the BUILD path (backward refs resolve to a built node here)",
+		factors: []reachFactor{{name: "containers per parse (backward refs)", values: reachCounts,
+			drive: func(n int) error {
+				_, err := Parse(nContainersOverWiredSCC(n, reachLevels))
+				return err
+			}}}},
+
+	{file: "schema.go", context: "b.minBytes = newMinBytesWalk()",
+		scope: "lazy seed at the root's first build, before any nest, so a directly-constructed (white-box) builder still shares one walk across the build path",
+		factors: []reachFactor{{name: "containers per parse (build path, same factor the Parse seed carries)", values: reachCounts,
+			drive: func(n int) error {
+				_, err := Parse(nContainersOverWiredSCC(n, reachLevels))
+				return err
+			}}}},
+
+	{file: "schema.go", context: "mbw := newMinBytesWalk()",
+		scope: "one walk before finalize's container-fixup loop — the FINALIZE path (forward refs)",
+		factors: []reachFactor{{name: "containers per parse (forward refs)", values: reachCounts,
+			drive: func(n int) error {
+				_, err := Parse(nContainersOverSCC(n, reachLevels))
+				return err
+			}}}},
+
+	{file: "cache.go", context: "minBytes:   newMinBytesWalk()",
+		scope: "SchemaCache's builder b.minBytes — the build path via the cache",
+		factors: []reachFactor{{name: "containers per SchemaCache.Parse", values: reachCounts,
+			drive: func(n int) error {
+				var c SchemaCache
+				_, err := c.Parse(nContainersOverWiredSCC(n, reachLevels))
+				return err
+			}}}},
+
+	{file: "resolve.go", context: "minBytes: newMinBytesWalk()",
+		scope: "resolveCtx.minBytes, shared across one Resolve AND across every dropped-field skip that resolution compiles — including the record compiles deferred to decode time, which join this same walk rather than starting their own",
+		factors: []reachFactor{
+			{name: "containers per resolution", values: reachCounts,
+				drive: func(n int) error {
+					scc := nContainersOverSCC(n, reachLevels)
+					w := MustParse(scc)
+					r := MustParse(strings.Replace(scc,
+						`{"type":"record","name":"Root","fields":[`,
+						`{"type":"record","name":"Root","fields":[{"name":"extra","type":"int","default":0},`, 1))
+					_, err := Resolve(w, r)
+					return err
+				}},
+			// The factor the old skip row asserted instead of measuring. Each
+			// reference to one record compiles its own skipRecordFields, so a
+			// per-record walk multiplied the allowance by a count the schema
+			// picks while each compile was reached with a single wire byte.
+			{name: "records compiled per resolution (lazy, at decode)", values: reachCounts,
+				drive: func(n int) error {
+					top := nRecordsOverSCC(n, reachLevels)
+					w := MustParse(`{"type":"record","name":"Outer","fields":[{"name":"drop","type":` + top + `},{"name":"keep","type":"int"}]}`)
+					r := MustParse(`{"type":"record","name":"Outer","fields":[{"name":"keep","type":"int"}]}`)
+					res, err := Resolve(w, r)
+					if err != nil {
+						return err
+					}
+					var out struct {
+						Keep int32 `avro:"keep"`
+					}
+					_, err = res.Decode(nRecordsOverSCCWire(n, reachLevels), &out)
+					return err
+				}},
+		}},
+}
+
+// nRecordsOverSCC references ONE record definition nrecs times, each reference
+// holding one array over a shared cyclic SCC. Every reference compiles its own
+// skipRecordFields, so this drives the RECORD count with the container count
+// held at one — the axis the container cell holds constant.
+func nRecordsOverSCC(nrecs, levels int) string {
+	var b strings.Builder
+	b.WriteString(`{"type":"record","name":"Top","fields":[`)
+	for i := range levels {
+		next := fmt.Sprintf("L%d", i+1)
+		if i == levels-1 {
+			next = "L0"
+		}
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"name":"d%d","type":{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null","%s"]},{"name":"f1","type":["null","%s"]}]}}`, i, i, next, next)
+	}
+	b.WriteString(`,{"name":"r0","type":{"type":"record","name":"R","fields":[{"name":"z","type":{"type":"array","items":"L0"}}]}}`)
+	for j := 1; j < nrecs; j++ {
+		fmt.Fprintf(&b, `,{"name":"r%d","type":"R"}`, j)
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// nRecordsOverSCCWire is the minimal wire that reaches every record: two null
+// union bytes per SCC level, then one empty-array byte per reference. Reaching
+// the nth compile costs ONE byte, which is exactly why "the wire bounds how
+// many compile" bounds the count and not the work.
+func nRecordsOverSCCWire(nrecs, levels int) []byte {
+	w := make([]byte, 0, 2*levels+nrecs+1)
+	for range levels {
+		w = append(w, 0, 0)
+	}
+	for range nrecs {
+		w = append(w, 0)
+	}
+	return append(w, 2) // keep = 1
+}
+
+// reachScaleTol and reachScaleFloor separate "the walk is shared" from "the
+// walk is rebuilt per unit". A shared walk pays its allowance once, so the high
+// and low cells differ only by the genuinely linear part (a longer schema to
+// parse, more wire bytes to read). A per-unit walk multiplies the allowance by
+// the factor, which at reachCounts' spread is more than an order of magnitude
+// past this. The floor keeps a fast cell from being judged on a ratio of noise.
+const (
+	reachScaleTol   = 4
+	reachScaleFloor = 400 * time.Millisecond
+)
+
+// TestInvariant_EveryReachingPathBoundIsMeasured is the rule that a bound must
+// be MEASURED, not stated. Every reaching path names the counts its one walk is
+// shared across, and every count names a cell that drives it at two or more
+// distinct values.
+//
+// Both directions are mechanical, and the second is the one that bites:
+//
+//   - a row with no cell fails. Prose describing why a cost is bounded is a
+//     claim, and this census exists to reject claims.
+//   - a cell that holds its row's factor CONSTANT fails. One value asks only
+//     "does this finish?", which a cost that is merely linear in the factor
+//     also answers. The skip path was rowed with a true sentence about the wire
+//     and no cell that varied a record count, and the unbounded factor lived
+//     under it. Driving one value would not have found it; driving two does.
+//
+// Attack it both ways: delete a factor's second value -> the constant-factor
+// arm fires; drop a row's factors for a sentence -> the no-cell arm fires;
+// rebuild any shared walk per unit -> the scale arm fires.
+func TestInvariant_EveryReachingPathBoundIsMeasured(t *testing.T) {
+	for _, site := range minBytesConstructionSites {
+		if site.exempt != "" {
+			if len(site.factors) != 0 {
+				t.Errorf("%s (%s) is exempt AND names factors — say which it is", site.file, site.context)
+			}
+			// The exemption's premise is not taken on trust: the guard below
+			// derives from source that nothing in production calls the
+			// standalone form, which is what makes "shared across nothing" true.
+			continue
+		}
+		if len(site.factors) == 0 {
+			t.Errorf("%s (%s) states its bound only in prose (%q).\nA reaching path must name the count its walk is shared across and a cell that drives it; a sentence is not a measurement.",
+				site.file, site.context, site.scope)
+			continue
+		}
+		for _, f := range site.factors {
+			name := site.file + "/" + f.name
+			seen := make(map[int]bool, len(f.values))
+			for _, v := range f.values {
+				seen[v] = true
+			}
+			if len(seen) < 2 {
+				t.Errorf("%s: cell drives %d distinct value(s) of its own factor %v.\nA bound is a claim about how cost RESPONDS to this count, and one value cannot tell a bound from a linear cost.",
+					name, len(seen), f.values)
+				continue
+			}
+			if f.drive == nil {
+				t.Errorf("%s: factor has values but no cell to drive them", name)
+				continue
+			}
+			lo, hi := f.values[0], f.values[0]
+			for _, v := range f.values {
+				lo = min(lo, v)
+				hi = max(hi, v)
+			}
+			times := make(map[int]time.Duration, len(f.values))
+			for _, v := range f.values {
+				start := time.Now()
+				// Each value must also be bounded on its own — the watchdog
+				// catches an unbounded path that would never return to be timed.
+				wantTerminate(t, fmt.Sprintf("%s=%d", name, v), func() error { return f.drive(v) })
+				times[v] = time.Since(start)
+			}
+			floor := reachScaleFloor
+			if raceEnabled {
+				floor = reachScaleFloor * 5
+			}
+			if lim := max(reachScaleTol*times[lo], floor); times[hi] > lim {
+				t.Errorf("%s: cost scales with the factor — %v at %d vs %v at %d (limit %v).\nA walk shared across this count pays its allowance once; this is the shape of one walk per unit.",
+					name, times[hi], hi, times[lo], lo, lim)
+			}
+			t.Logf("%s: %v at %d, %v at %d", name, times[lo], lo, times[hi], hi)
+		}
+	}
 }
 
 // TestInvariant_MinBytesReachingPaths is the reaching-path guard for the one

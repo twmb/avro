@@ -258,6 +258,14 @@ var magnitudeSites = []magnitudeSite{
 			"reported here and must not be: depth counts path length, which the fixpoint does not taint",
 	},
 	{
+		where: "deser.go::mapEntryMinBytes", count: 1, verdict: magSaturated,
+		reason: "`1 + valueMin` — the SINGLE constructor of the per-entry minimum for all four map sites. " +
+			"valueMin is either a saturated minimum or minBytesUnknown, and the unknown is peeled off before " +
+			"the addition, so the operand is in [0, maxSchemaMagnitude] and the sum cannot wrap. Its whole " +
+			"job is that checkMapBlockBounds' divisor is >= 1: routing every site through here is what keeps " +
+			"an unknown from arriving as 1 + (-1) = 0",
+	},
+	{
 		where: "deser.go::checkMapBlockBounds", count: 1, verdict: magSaturated,
 		reason: "divides by minEntryBytes, which is `1 + a saturated minimum` at all four call sites, so it is >= 1. " +
 			"This is the division the wrap turned into a panic",
@@ -268,17 +276,11 @@ var magnitudeSites = []magnitudeSite{
 			"non-positive branch mean what it says, since only a genuinely zero-byte element can reach it now",
 	},
 	{
-		where: "resolve.go::resolveMap", count: 1, verdict: magSaturated,
-		reason: "`1 + schemaMinBytes(w.values)` — the resolver's own derivation of the per-entry bound",
-	},
-	{
-		where: "skip.go::skipMap", count: 1, verdict: magSaturated,
-		reason: "`1 + schemaMinBytes(w.values)` — the derivation used when a writer field is dropped and skipped",
-	},
-	{
-		where: "schema.go::builder.buildComplex", count: 2, verdict: magSaturated,
-		reason: "`1 + schemaMinBytes(mf.node)`, the parse-time derivation; and `make(_, len(nd.fields))`, whose " +
-			"length is a field COUNT — bounded by the input, since every field costs bytes to write",
+		where: "schema.go::builder.buildComplex", count: 1, verdict: magNotAMagnitude,
+		reason: "`make(_, len(nd.fields))`, whose length is a field COUNT — bounded by the input, since every " +
+			"field costs bytes to write. The per-entry `1 + <minimum>` that used to live here (and separately " +
+			"in resolveMap and skipMap) is now the single mapEntryMinBytes rowed above: three sites each " +
+			"reasoning out the same ceiling is the shape that leaves the question with no owner",
 	},
 	{
 		where: "schema.go::maxDecimalDigits", count: 3, verdict: magSaturated,
