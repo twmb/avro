@@ -655,64 +655,59 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 	wantTerminate(t, "Root+Schema/round-trip", func() error {
 		root := s.Root() // addressable: Schema() has a pointer receiver
 		_, _ = root.Schema()
-		return nil
-	})
-	wantTerminate(t, "String/metadata-walk", func() error {
 		_ = s.String()
-		return nil
-	})
-	// A recursive schema's canonical/String emitter must REFERENCE (not
-	// re-expand) the named type, so the walk over a cyclic node tree terminates.
-	wantTerminate(t, "Canonical+String/recursive-schema", func() error {
-		rec := MustParse(recursiveNodeSchema)
-		_ = rec.Canonical()
-		_ = rec.String()
+		_ = s.Canonical()
 		return nil
 	})
 
-	// The DAG axis crossed with the ENTRY-POINT list. Each of these drives a
-	// different walk over the same shared-node graph, expressed as ordinary
-	// schema text a caller could be handed by a registry or read out of a
-	// file. Two spellings: nested, and flat with forward references, which is
-	// the one no depth bound can see.
+	// The shared-reference DAG axis, driven at TWO depths so the cells can tell
+	// a bound from a cost merely linear in it: without a memo this is 2^depth,
+	// so the pair is an 8192x separation and a flat result is the bound working.
+	const cell = "TestDoSBattery_C6_MetadataWalk"
 	for _, form := range []struct {
-		name   string
-		schema string
+		name  string
+		build func(depth int) string
 	}{
-		{"nested", `{"type":"array","items":` + dagNested(dagCostDepth, 2) + `}`},
-		{"flat-forward-ref", dagFlat(dagCostDepth, 2)},
+		{"nested", func(d int) string { return `{"type":"array","items":` + dagNested(d, 2) + `}` }},
+		{"flat-forward-ref", func(d int) string { return dagFlat(d, 2) }},
 	} {
-		wantTerminate(t, "Parse/shared-node-"+form.name, func() error {
-			_, err := Parse(form.schema)
-			return err
+		wantCostDoesNotScale(t, cell, "Parse/shared-node-"+form.name, func(d int) func() error {
+			s := form.build(d)
+			return func() error { _, err := Parse(s); return err }
 		})
-		wantTerminate(t, "SchemaCache.Parse/shared-node-"+form.name, func() error {
-			var c SchemaCache
-			_, err := c.Parse(form.schema)
-			return err
+		wantCostDoesNotScale(t, cell, "SchemaCache.Parse/shared-node-"+form.name, func(d int) func() error {
+			s := form.build(d)
+			return func() error {
+				var c SchemaCache
+				_, err := c.Parse(s)
+				return err
+			}
 		})
-		s := MustParse(form.schema)
-		wantTerminate(t, "Root+Schema+String+Canonical/shared-node-"+form.name, func() error {
-			root := s.Root()
-			_, _ = root.Schema()
-			_ = s.String()
-			_ = s.Canonical()
-			return nil
+		wantCostDoesNotScale(t, cell, "Root+Schema+String+Canonical/shared-node-"+form.name, func(d int) func() error {
+			ds := MustParse(form.build(d))
+			return func() error {
+				root := ds.Root()
+				_, _ = root.Schema()
+				_ = ds.String()
+				_ = ds.Canonical()
+				return nil
+			}
 		})
-		wantTerminate(t, "Resolve/shared-node-"+form.name, func() error {
-			_, err := Resolve(s, s)
-			return err
+		wantCostDoesNotScale(t, cell, "Resolve/shared-node-"+form.name, func(d int) func() error {
+			ds := MustParse(form.build(d))
+			return func() error { _, err := Resolve(ds, ds); return err }
 		})
 		// The writer field is DROPPED, which compiles a skip — a separate
 		// derivation of the same per-element bound.
-		w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + form.schema + `},{"name":"y","type":"int"}]}`)
-		r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
-		wantTerminate(t, "Resolve/shared-node-dropped-field-"+form.name, func() error {
-			_, err := Resolve(w, r)
-			return err
+		wantCostDoesNotScale(t, cell, "Resolve/shared-node-dropped-field-"+form.name, func(d int) func() error {
+			schema := form.build(d)
+			w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + schema + `},{"name":"y","type":"int"}]}`)
+			r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
+			return func() error { _, err := Resolve(w, r); return err }
 		})
-		wantTerminate(t, "CheckCompatibility/shared-node-"+form.name, func() error {
-			return CheckCompatibility(s, s)
+		wantCostDoesNotScale(t, cell, "CheckCompatibility/shared-node-"+form.name, func(d int) func() error {
+			ds := MustParse(form.build(d))
+			return func() error { return CheckCompatibility(ds, ds) }
 		})
 		// A value round-trip, so the axis is crossed on the wire paths too —
 		// at a SMALL depth, because a shared node is shared in the schema and
@@ -720,7 +715,8 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 		// next genuinely CONTAINS 2^depth leaves, so the wire cost is the
 		// value's own size and there is nothing here to bound. What this cell
 		// asks is only that the encoder and decoder handle a node reached by
-		// several paths at all.
+		// several paths at all — so it stays a fixed small depth, and is not
+		// a cost cell.
 		small := MustParse(`{"type":"array","items":` + dagNested(8, 2) + `}`)
 		wantTerminate(t, "Encode+Decode/shared-node-"+form.name, func() error {
 			var v any

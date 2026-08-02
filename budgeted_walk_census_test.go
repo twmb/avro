@@ -104,8 +104,10 @@ var budgetedWalks = []budgetedWalk{
 		binds:         "ctx.seen pair memo (pairs) + ctx.minBytes shared walk (the container min-bytes factor)",
 		reachingPaths: "one: ctx (seen + minBytes) created in Resolve, threaded through the whole resolution"},
 	{fn: "toJSONWalk", file: "schema_node.go", class: schemaDAG,
-		factors:       "nodes emitted x bytes per node",
-		binds:         "walkBudget (nodes + bytes), charged by takeNode at the TOP of every entry so a DAG re-descent still spends budget; visited is only cycle detection",
+		factors: "nodes emitted x bytes per node",
+		binds: "walkBudget (nodes + bytes), charged by takeNode at the TOP of every entry so a DAG re-descent still spends budget; visited is only cycle detection. " +
+			"MEASURED BY TestRegression_SchemaNodeWalkBudgetBattery / _DuplicateNamedDefinitionBounded / TestRegression_SchemaForCustomSchemaBudgetAxes, which hand-build the trees Parse cannot express — " +
+			"a PARSED schema is deduped before it reaches this walk, so no parse-driven cell can red this bound, and one that claimed to was renamed",
 		reachingPaths: "one walkBudget per metadata-API call (toJSONDedup), from Root().Schema()/String()/Canonical(); each walks the whole tree once"},
 	{fn: "collectLocalNames", file: "schema_node.go", class: schemaDAG,
 		factors:       "distinct nodes x names per node",
@@ -704,5 +706,366 @@ func TestInvariant_MinBytesReachingPaths(t *testing.T) {
 				t.Errorf("%s:%d calls schemaMinBytes in production — it builds a fresh walk per call; use a shared per-operation walk (b.minBytes / ctx.minBytes / the finalize or skip mbw)", f, i+1)
 			}
 		}
+	}
+}
+
+// ---- cost cells: the same measured-bound rule, one level out ---------------
+
+// The reaching-path rule above says a bound must be MEASURED — a cell that
+// drives its factor at two or more values, because one value cannot tell a
+// bound from a cost that is merely linear. That rule was stated for the walk
+// CONSTRUCTION sites and then not applied to the wall-clock cost cells, which
+// is the same defect the rule exists to catch: a stated requirement whose guard
+// passes its known violators. Five cells drove one value each and the suite was
+// green.
+//
+// costCell is the registry that closes it. A cell's magnitudes live HERE and the
+// cell reads them, so the two cannot disagree, and the source derivation below
+// means a new cost cell cannot quietly skip the registry.
+type costCell struct {
+	fn     string // the test function
+	factor string // the caller-chosen magnitude its bound claims to cap
+	values []int  // what the cell drives — at least two distinct, unless exempt
+	// exempt is why one magnitude suffices. It is a CLAIM like any other, so it
+	// must name what the cell asserts INSTEAD of a wall-clock bound; the guard
+	// cross-checks it against whether the cell actually takes the wall-clock
+	// harness, so an exemption cannot be pasted onto a timing cell.
+	exempt string
+	// scaleTol bounds cost(max)/cost(min). Every one of these factors measured
+	// FLAT with a correct bound even where the schema TEXT grows with the factor
+	// (width 80 -> 8000 grows the text 65x and the parse 1.4x, because the walk
+	// dominates and the allowance caps it), so a small tolerance is honest.
+	scaleTol int
+	// floor is the largest cost the BOUND ITSELF permits at the top of the
+	// range, and the limit is max(scaleTol*cost(min), floor). For a cell whose
+	// shapes are all memoizable it is just machine noise. For one that includes
+	// an UN-memoizable shape it is one exhausted allowance (~120ms measured),
+	// because a cyclic subtree cannot be cached and legitimately walks until
+	// maxMinBytesWork stops it — that is the bound ENGAGING, not the cost
+	// scaling, and a cell spanning both regimes has to be judged against the
+	// looser of them. It stays orders of magnitude under an unbounded walk,
+	// which is seconds.
+	floor time.Duration
+}
+
+var costCells = []costCell{
+	{fn: "TestInvariant_EveryMinBytesEntryPointIsBounded",
+		factor: "dagNested DEPTH — the PATHS factor: without the memo this is 2^depth, so 13 vs 26 is a 8192x separation",
+		values: []int{13, 26}, scaleTol: 8, floor: 25 * time.Millisecond},
+
+	{fn: "TestInvariant_CyclicWalkCostIsBoundedByWork",
+		factor: "dagWideSCC WIDTH — the CHILDREN factor: a per-NODE charge makes cost allowance x width, a per-CHILD charge makes it flat",
+		values: []int{80, 8000}, scaleTol: 4, floor: 400 * time.Millisecond},
+
+	{fn: "TestInvariant_WideCyclicWalkReachesEveryEntryPoint",
+		factor: "dagWideSCC WIDTH, across the entry points that do not take the schema from the caller",
+		values: []int{80, 8000}, scaleTol: 4, floor: 400 * time.Millisecond},
+
+	{fn: "TestInvariant_MetadataSurfacesBoundedByWidth",
+		// Named for what it drives, after the old name was executed and found
+		// false. It does NOT measure the metadata walk's node budget: a PARSED
+		// schema is deduped before it reaches that walk, so disabling takeNode
+		// entirely leaves this cell green. What it does exercise is the
+		// Root+Schema ROUND TRIP, whose last step is a re-Parse of the rendered
+		// text (SchemaNode.Schema), which puts the min-bytes charge on its path
+		// — neutering that charge reds it. The node budget's own cells are
+		// TestRegression_SchemaNodeWalkBudgetBattery,
+		// TestRegression_SchemaNodeDuplicateNamedDefinitionBounded and
+		// TestRegression_SchemaForCustomSchemaBudgetAxes, which hand-build the
+		// trees Parse cannot express; all three red when takeNode stops charging.
+		factor: "dagWideSCC WIDTH through the metadata surfaces — Root+Schema (render, marshal, re-Parse), String and Canonical",
+		values: []int{80, 8000}, scaleTol: 4, floor: 400 * time.Millisecond},
+
+	{fn: "TestInvariant_MinBytesContainerCountBounded",
+		factor: "CONTAINER count. Its two generator calls vary reference DIRECTION (forward/backward), which is a different axis — the count itself was pinned at 220",
+		values: []int{1, 220}, scaleTol: 4, floor: 400 * time.Millisecond},
+
+	// Value oracles. Named explicitly rather than left to a reader to re-derive:
+	// each varies shapes to check an ANSWER and asserts equality, never
+	// wall-clock, so a second magnitude would measure nothing about a bound.
+	{fn: "TestInvariant_MemoAgreesWithUnmemoizedWalk",
+		exempt: "value oracle: compares the memoized walk's result against an un-memoized recomputation per node. Its oracle is equality of VALUES, and a wrong memo is FASTER, so timing is exactly what cannot settle it"},
+	{fn: "TestInvariant_DagMinBytesIsExactAtScale",
+		exempt: "value oracle: asserts the minimum a shared DAG reports equals the minimum its expanded TREE reports. Equality, not cost"},
+	{fn: "TestInvariant_MinBytesSelfReadable",
+		exempt: "value oracle: asserts a bound derived from the walk still admits wire this package's own encoder produces. Accept/reject, not cost"},
+	{fn: "TestInvariant_SharingDoesNotChangeMinBytes",
+		exempt: "value oracle: asserts sharing one walk across containers does not change the ANSWER. It already sweeps fan x levels; the sweep is over SHAPES to find a disagreement, not magnitudes to time"},
+	{fn: "TestInvariant_SharedSchemaNodeWalkedOnce",
+		factor: "dagNested/dagFlat/dagSelfRecursive/dagSingleSCC DEPTH — the PATHS factor across all four sharing shapes and both fans. Its name reads like a value oracle, and the hand derivation classified it as one; it takes the wall-clock harness, so the exemption cross-check caught it",
+		// Two of its four shapes are CYCLIC and cannot be memoized at all, so
+		// they climb to one exhausted allowance between the two depths (~1.9ms
+		// at 13, ~120ms at 26) while the memoizable two stay flat at ~200us.
+		// The floor is that allowance; without the charge the same shapes run
+		// for seconds.
+		values: []int{13, 26}, scaleTol: 8, floor: 500 * time.Millisecond},
+
+	{fn: "TestDoSBattery_C6_MetadataWalk",
+		factor: "dagNested/dagFlat DEPTH — the PATHS factor through the metadata + resolve + compat entry points. Missed by the hand derivation entirely; only the source scan found it",
+		values: []int{13, 26}, scaleTol: 8, floor: 25 * time.Millisecond},
+}
+
+// costFactorValues returns the magnitudes the named cost cell must drive. A cell
+// calls it with its OWN name, so its values cannot drift from the row the guard
+// reads; TestInvariant_EveryCostCellDrivesItsFactor checks from source that
+// every rowed timing cell does exactly that.
+func costFactorValues(t *testing.T, fn string) []int {
+	t.Helper()
+	for _, c := range costCells {
+		if c.fn == fn {
+			if c.exempt != "" {
+				t.Fatalf("%s is rowed EXEMPT but is asking for factor values", fn)
+			}
+			return c.values
+		}
+	}
+	t.Fatalf("%s is not rowed in costCells — a cost cell must declare the factor it drives", fn)
+	return nil
+}
+
+// wantCostDoesNotScale asserts that the named cell's operation costs about the
+// same at the top of its factor's range as at the bottom.
+//
+// build takes the magnitude and returns the thunk to TIME. Everything the
+// magnitude needs but the bound does not own — generating a schema whose TEXT
+// is linear in the factor, parsing it when the bound under test is downstream
+// of the parse — belongs in build, outside the returned closure. Putting it
+// inside is not a rounding error: the metadata cell had its MustParse in the
+// timed region, and since the parse of a width-8000 schema dominates the walk
+// that follows it, the cell moved when the PARSE's bound was neutered and sat
+// still when its own was.
+func wantCostDoesNotScale(t *testing.T, fn, label string, build func(n int) func() error) {
+	t.Helper()
+	var row costCell
+	for _, c := range costCells {
+		if c.fn == fn {
+			row = c
+		}
+	}
+	vals := costFactorValues(t, fn)
+	lo, hi := vals[0], vals[0]
+	for _, v := range vals {
+		lo, hi = min(lo, v), max(hi, v)
+	}
+	times := make(map[int]time.Duration, len(vals))
+	for _, v := range vals {
+		run := build(v)
+		start := time.Now()
+		wantTerminate(t, fmt.Sprintf("%s/%s=%d", label, row.factor, v), run)
+		times[v] = time.Since(start)
+	}
+	floor := row.floor
+	if raceEnabled {
+		floor *= 5
+	}
+	if lim := max(time.Duration(row.scaleTol)*times[lo], floor); times[hi] > lim {
+		t.Errorf("%s: cost scales with the factor — %v at %d vs %v at %d (limit %v).\nThe bound claims to cap this magnitude; a cost that grows with it is the bound missing, not a slow machine.",
+			label, times[hi], hi, times[lo], lo, lim)
+	}
+}
+
+// TestInvariant_EveryCostCellDrivesItsFactor applies the measured-bound rule to
+// the wall-clock cost cells, deriving the set the same way it was derived by
+// hand: a cost GENERATOR is a function in the census sources returning a schema
+// string from a magnitude, and any test that calls one is a cost cell.
+//
+// Mechanical in every direction:
+//
+//   - a cell that calls a cost generator and is not rowed FAILS (add a
+//     generator or a caller and it fires).
+//   - a rowed timing cell with fewer than two distinct values FAILS. This is
+//     the arm that was missing: the rule was stated for the walk construction
+//     sites and never applied here, so five cells pinned one magnitude each and
+//     the suite stayed green.
+//   - a rowed timing cell that does not READ its row FAILS, so a cell cannot
+//     keep a private constant that disagrees with the registry.
+//   - an EXEMPTION is a claim and is cross-checked: a cell rowed exempt that
+//     takes the wall-clock harness is a timing cell wearing a value-oracle
+//     label, and a cell rowed with values that takes no harness is the reverse.
+//   - a row naming no test FAILS, so the registry cannot go stale.
+func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
+	files := censusSourceFiles(t)
+	src := map[string]string{}
+	for _, f := range files {
+		src[f] = readFile(t, f)
+	}
+	for _, f := range []string{"schema_dag_cost_test.go", "budgeted_walk_census_test.go", "dos_battery_test.go"} {
+		src[f] = readFile(t, f)
+	}
+
+	// Derive the generator vocabulary: a func taking magnitudes and returning a
+	// schema string. Listing them would be the "written doc list is NOT an
+	// enumeration" trap.
+	genDecl := regexp.MustCompile(`(?m)^func ((?:dag|nContainers)[A-Za-z]*)\([^)]*int\) string \{`)
+	gens := map[string]bool{}
+	for _, m := range genDecl.FindAllStringSubmatch(src["schema_dag_cost_test.go"], -1) {
+		gens[m[1]] = true
+	}
+	if len(gens) < 4 {
+		t.Fatalf("derived only %d cost generators (%v) — the derivation broke, and a broken derivation reads as full coverage", len(gens), gens)
+	}
+
+	bodies := map[string][2]string{}
+	for _, v := range src {
+		testFuncBodies(v, bodies)
+	}
+
+	rowed := map[string]costCell{}
+	for _, c := range costCells {
+		if _, dup := rowed[c.fn]; dup {
+			t.Errorf("costCells rows %s twice", c.fn)
+		}
+		rowed[c.fn] = c
+	}
+
+	// Comments and string literals are stripped first: a generator NAMED in a
+	// comment is not a caller, and a cell that hands a generator to a table as a
+	// function VALUE (build: dagNested) is one even though it never writes
+	// "dagNested(". Both mistakes were made by the first derivation, in opposite
+	// directions, which is why this is matched on identifiers over stripped code.
+	callsGenerator := func(code string) bool {
+		for g := range gens {
+			if regexp.MustCompile(`\b` + g + `\b`).MatchString(code) {
+				return true
+			}
+		}
+		return false
+	}
+	// A cell that takes the wall-clock harness is asserting a COST.
+	takesHarness := func(code string) bool {
+		return strings.Contains(code, "wantTerminate(") || strings.Contains(code, "dosRun(") ||
+			strings.Contains(code, "wantCostDoesNotScale(")
+	}
+
+	for fn, bc := range bodies {
+		raw, code := bc[0], bc[1]
+		if !callsGenerator(code) {
+			continue
+		}
+		c, ok := rowed[fn]
+		if !ok {
+			t.Errorf("%s drives a cost generator but is not rowed in costCells.\nRow it with the factor its bound claims to cap and the values it drives, or row it exempt with what it asserts instead.", fn)
+			continue
+		}
+		if c.exempt != "" {
+			if takesHarness(code) {
+				t.Errorf("%s is rowed EXEMPT (%q) but takes the wall-clock harness — an exemption cannot sit on a timing cell", fn, c.exempt)
+			}
+			continue
+		}
+		if !takesHarness(code) {
+			t.Errorf("%s is rowed with factor values but never takes the wall-clock harness — it is a value oracle, and should be rowed exempt saying so", fn)
+		}
+		seen := map[int]bool{}
+		for _, v := range c.values {
+			seen[v] = true
+		}
+		if len(seen) < 2 {
+			t.Errorf("%s drives %d distinct value(s) of %q.\nOne value asks only whether the cell finishes, which a cost merely LINEAR in the factor also answers.", fn, len(seen), c.factor)
+		}
+		if !strings.Contains(raw, `"`+fn+`"`) {
+			t.Errorf("%s does not name itself to costFactorValues/wantCostDoesNotScale — its magnitudes are not read from its row, so the row and the cell can disagree.", fn)
+		}
+	}
+
+	// The other direction: a row that names no such test has rotted.
+	for _, c := range costCells {
+		bc, ok := bodies[c.fn]
+		if !ok {
+			t.Errorf("costCells rows %s but no such test exists — the row rotted", c.fn)
+			continue
+		}
+		if !callsGenerator(bc[1]) {
+			t.Errorf("costCells rows %s but it drives no cost generator — the row reads as coverage it does not have", c.fn)
+		}
+	}
+}
+
+// blankCode replaces the contents of comments and string literals with spaces,
+// preserving every byte position. Two derivations need it and they need
+// different views of the same bytes: identifier matching must not see a
+// generator NAMED in a doc comment, while the self-naming check must see string
+// literals. Blanking in place gives both from one pass, and lets a function's
+// extent be found by counting braces without a brace inside a string ending it
+// early.
+func blankCode(src string) string {
+	b := []byte(src)
+	blank := func(from, to int) {
+		for k := from; k < to && k < len(b); k++ {
+			if b[k] != '\n' {
+				b[k] = ' '
+			}
+		}
+	}
+	for i := 0; i < len(b); {
+		switch {
+		case b[i] == '/' && i+1 < len(b) && b[i+1] == '/':
+			j := i
+			for j < len(b) && b[j] != '\n' {
+				j++
+			}
+			blank(i, j)
+			i = j
+		case b[i] == '/' && i+1 < len(b) && b[i+1] == '*':
+			j := i + 2
+			for j+1 < len(b) && !(b[j] == '*' && b[j+1] == '/') {
+				j++
+			}
+			blank(i, j+2)
+			i = j + 2
+		case b[i] == '`':
+			j := i + 1
+			for j < len(b) && b[j] != '`' {
+				j++
+			}
+			blank(i, j+1)
+			i = j + 1
+		case b[i] == '"':
+			j := i + 1
+			for j < len(b) && b[j] != '"' {
+				if b[j] == '\\' {
+					j++
+				}
+				j++
+			}
+			blank(i, j+1)
+			i = j + 1
+		default:
+			i++
+		}
+	}
+	return string(b)
+}
+
+// testFuncBodies returns each test function's body from src, keyed by name, as
+// (raw, code) where code has comments and strings blanked. The extent is found
+// by brace matching from the signature, NOT by running to the next test
+// function — a helper or a var block declared between two tests would otherwise
+// be attributed to the one above it, which is how this derivation first
+// reported a census structural test as a driver of cost generators.
+func testFuncBodies(src string, into map[string][2]string) {
+	code := blankCode(src)
+	decl := regexp.MustCompile(`(?m)^func (Test[A-Za-z0-9_]+)\(t \*testing\.T\) \{`)
+	for _, loc := range decl.FindAllStringSubmatchIndex(code, -1) {
+		name := src[loc[2]:loc[3]]
+		depth, end := 0, -1
+		for k := loc[1] - 1; k < len(code); k++ {
+			switch code[k] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					end = k
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end < 0 {
+			end = len(code) - 1
+		}
+		into[name] = [2]string{src[loc[1]:end], code[loc[1]:end]}
 	}
 }

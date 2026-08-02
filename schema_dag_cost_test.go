@@ -225,6 +225,7 @@ const (
 // shape that produces the sharing and every container that asks for the
 // bound.
 func TestInvariant_SharedSchemaNodeWalkedOnce(t *testing.T) {
+	const cell = "TestInvariant_SharedSchemaNodeWalkedOnce"
 	shapes := []struct {
 		name  string
 		build func(levels, fan int) string
@@ -244,29 +245,38 @@ func TestInvariant_SharedSchemaNodeWalkedOnce(t *testing.T) {
 			for _, fan := range []int{2, 3} {
 				name := fmt.Sprintf("%s/%s/fan%d", sh.name, tr.name, fan)
 				t.Run(name, func(t *testing.T) {
-					levels := dagCostDepth
-					if fan == 3 {
-						levels = dagCostDepth3
+					// The factor is the PATH COUNT, fan^levels, so a fan-3
+					// shape reaches the same place in proportionally fewer
+					// levels. The row's pair is SCALED, not replaced, so both
+					// fans still drive two values of the one factor.
+					levelsFor := func(v int) int {
+						if fan == 3 {
+							return v * dagCostDepth3 / dagCostDepth
+						}
+						return v
 					}
-					s := sh.build(levels, fan)
-					if !sh.selfWrapped {
-						s = tr.wrap(s)
-					}
-					parsed, err := Parse(s)
-					if err != nil {
-						t.Fatalf("parse: %v", err)
+					build := func(v int) string {
+						s := sh.build(levelsFor(v), fan)
+						if !sh.selfWrapped {
+							s = tr.wrap(s)
+						}
+						return s
 					}
 					// The trigger claim, checked rather than asserted in a
 					// comment: a cell whose schema contains no container
 					// asking for a per-element minimum never enters the walk,
 					// so it would measure nothing whatever the walk did.
+					parsed, err := Parse(build(dagCostDepth))
+					if err != nil {
+						t.Fatalf("parse: %v", err)
+					}
 					if got := schemaAsksMinBytes(parsed.node); got != tr.walks {
 						t.Fatalf("trigger %q is registered as walks=%v but the parsed schema %s a container that asks for a per-element minimum",
 							tr.name, tr.walks, map[bool]string{true: "contains", false: "does not contain"}[got])
 					}
-					wantTerminate(t, name, func() error {
-						_, err := Parse(s)
-						return err
+					wantCostDoesNotScale(t, cell, name, func(v int) func() error {
+						s := build(v)
+						return func() error { _, err := Parse(s); return err }
 					})
 				})
 			}
@@ -662,36 +672,38 @@ func TestInvariant_DagCostMatrixDrivesEveryEntryPoint(t *testing.T) {
 // ocf cell is the one where the schema is supplied by the INPUT rather than
 // by the caller, which is what sets this class's severity.
 func TestInvariant_EveryMinBytesEntryPointIsBounded(t *testing.T) {
-	dag := `{"type":"array","items":` + dagNested(dagCostDepth, 2) + `}`
+	const cell = "TestInvariant_EveryMinBytesEntryPointIsBounded"
+	dagAt := func(depth int) string { return `{"type":"array","items":` + dagNested(depth, 2) + `}` }
 
-	wantTerminate(t, "Parse", func() error {
-		_, err := Parse(dag)
-		return err
+	wantCostDoesNotScale(t, cell, "Parse", func(depth int) func() error {
+		s := dagAt(depth)
+		return func() error { _, err := Parse(s); return err }
 	})
 
-	wantTerminate(t, "SchemaCache.Parse", func() error {
-		var cache SchemaCache
-		// The cache memoizes by TEXT, so it saves a REPEATED parse and
-		// nothing at all on the first one; this cell drives the first.
-		_, err := cache.Parse(dag)
-		return err
+	wantCostDoesNotScale(t, cell, "SchemaCache.Parse", func(depth int) func() error {
+		s := dagAt(depth)
+		return func() error {
+			// The cache memoizes by TEXT, so it saves a REPEATED parse and
+			// nothing at all on the first one; this cell drives the first.
+			var cache SchemaCache
+			_, err := cache.Parse(s)
+			return err
+		}
 	})
 
-	wDrop := MustParse(fmt.Sprintf(
-		`{"type":"record","name":"Top","fields":[{"name":"x","type":%s},{"name":"y","type":"int"}]}`, dag))
-	rDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"y","type":"int"}]}`)
-	wantTerminate(t, "Resolve/dropped-field-skip", func() error {
-		_, err := Resolve(wDrop, rDrop)
-		return err
+	wantCostDoesNotScale(t, cell, "Resolve/dropped-field-skip", func(depth int) func() error {
+		wDrop := MustParse(fmt.Sprintf(
+			`{"type":"record","name":"Top","fields":[{"name":"x","type":%s},{"name":"y","type":"int"}]}`, dagAt(depth)))
+		rDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"y","type":"int"}]}`)
+		return func() error { _, err := Resolve(wDrop, rDrop); return err }
 	})
 
-	wKeep := MustParse(fmt.Sprintf(
-		`{"type":"record","name":"Top","fields":[{"name":"x","type":%s}]}`, dag))
-	rKeep := MustParse(fmt.Sprintf(
-		`{"type":"record","name":"Top","fields":[{"name":"x","type":%s},{"name":"z","type":"int","default":0}]}`, dag))
-	wantTerminate(t, "Resolve/kept-field", func() error {
-		_, err := Resolve(wKeep, rKeep)
-		return err
+	wantCostDoesNotScale(t, cell, "Resolve/kept-field", func(depth int) func() error {
+		wKeep := MustParse(fmt.Sprintf(
+			`{"type":"record","name":"Top","fields":[{"name":"x","type":%s}]}`, dagAt(depth)))
+		rKeep := MustParse(fmt.Sprintf(
+			`{"type":"record","name":"Top","fields":[{"name":"x","type":%s},{"name":"z","type":"int","default":0}]}`, dagAt(depth)))
+		return func() error { _, err := Resolve(wKeep, rKeep); return err }
 	})
 
 	// ocf-header: the container reader derives the bound from a schema it
@@ -699,9 +711,9 @@ func TestInvariant_EveryMinBytesEntryPointIsBounded(t *testing.T) {
 	// by the caller. The ocf package cannot be imported from package avro,
 	// so the executable cell lives in ocf/dos_battery_test.go; this cell
 	// pins the parse of the identical header schema that reaches it.
-	wantTerminate(t, "ocf-header/schema-parse", func() error {
-		_, err := Parse(dag)
-		return err
+	wantCostDoesNotScale(t, cell, "ocf-header/schema-parse", func(depth int) func() error {
+		s := dagAt(depth)
+		return func() error { _, err := Parse(s); return err }
 	})
 }
 
@@ -786,22 +798,22 @@ const (
 // iterates its own fields — and both factors are chosen by whoever wrote the
 // schema, so the guard has to be charged in the unit of the work.
 func TestInvariant_CyclicWalkCostIsBoundedByWork(t *testing.T) {
+	const cell = "TestInvariant_CyclicWalkCostIsBoundedByWork"
 	for _, tr := range minBytesTriggers {
 		t.Run(tr.name, func(t *testing.T) {
-			s := tr.wrap(dagWideSCC(dagWideLevels, 2, dagWideWidth))
-			parsed, err := Parse(s)
+			// Same trigger claim the depth cells check: a shape that reaches
+			// no caller of the walk measures nothing whatever the walk does.
+			parsed, err := Parse(tr.wrap(dagWideSCC(dagWideLevels, 2, 8)))
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
-			// Same trigger claim the depth cells check: a shape that reaches
-			// no caller of the walk measures nothing whatever the walk does.
 			if got := schemaAsksMinBytes(parsed.node); got != tr.walks {
 				t.Fatalf("trigger %q is registered as walks=%v but the parsed schema %s a container that asks for a per-element minimum",
 					tr.name, tr.walks, map[bool]string{true: "contains", false: "does not contain"}[got])
 			}
-			wantTerminate(t, "Parse/wide-scc/"+tr.name, func() error {
-				_, err := Parse(s)
-				return err
+			wantCostDoesNotScale(t, cell, "Parse/wide-scc/"+tr.name, func(width int) func() error {
+				s := tr.wrap(dagWideSCC(dagWideLevels, 2, width))
+				return func() error { _, err := Parse(s); return err }
 			})
 		})
 	}
@@ -810,32 +822,36 @@ func TestInvariant_CyclicWalkCostIsBoundedByWork(t *testing.T) {
 // TestInvariant_WideCyclicWalkReachesEveryEntryPoint drives the same shape
 // through the entry points that do not take the schema from the caller.
 func TestInvariant_WideCyclicWalkReachesEveryEntryPoint(t *testing.T) {
-	inner := dagWideSCC(dagWideLevels, 2, dagWideWidth)
-	s := `{"type":"array","items":` + inner + `}`
+	const cell = "TestInvariant_WideCyclicWalkReachesEveryEntryPoint"
+	at := func(width int) string {
+		return `{"type":"array","items":` + dagWideSCC(dagWideLevels, 2, width) + `}`
+	}
 
-	wantTerminate(t, "SchemaCache.Parse/wide-scc", func() error {
-		var c SchemaCache
-		_, err := c.Parse(s)
-		return err
+	wantCostDoesNotScale(t, cell, "SchemaCache.Parse/wide-scc", func(width int) func() error {
+		s := at(width)
+		return func() error {
+			var c SchemaCache
+			_, err := c.Parse(s)
+			return err
+		}
 	})
-	parsed := MustParse(s)
-	wantTerminate(t, "Resolve/wide-scc", func() error {
-		_, err := Resolve(parsed, parsed)
-		return err
+	wantCostDoesNotScale(t, cell, "Resolve/wide-scc", func(width int) func() error {
+		parsed := MustParse(at(width))
+		return func() error { _, err := Resolve(parsed, parsed); return err }
 	})
 	// The writer field is DROPPED, which compiles a skip — a separate
 	// derivation of the same per-element bound.
-	w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + s + `},{"name":"y","type":"int"}]}`)
-	r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
-	wantTerminate(t, "Resolve/wide-scc-dropped-field", func() error {
-		_, err := Resolve(w, r)
-		return err
+	wantCostDoesNotScale(t, cell, "Resolve/wide-scc-dropped-field", func(width int) func() error {
+		s := at(width)
+		w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + s + `},{"name":"y","type":"int"}]}`)
+		r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
+		return func() error { _, err := Resolve(w, r); return err }
 	})
 	// ocf-header: the executable cell lives in ocf/dos_battery_test.go
 	// (package avro cannot import ocf); this pins the parse that reaches it.
-	wantTerminate(t, "ocf-header/wide-scc-schema-parse", func() error {
-		_, err := Parse(s)
-		return err
+	wantCostDoesNotScale(t, cell, "ocf-header/wide-scc-schema-parse", func(width int) func() error {
+		s := at(width)
+		return func() error { _, err := Parse(s); return err }
 	})
 }
 
@@ -904,7 +920,7 @@ func TestInvariant_MinBytesChargeCoversEveryChildArm(t *testing.T) {
 	}
 }
 
-// TestInvariant_MetadataWalkChargesPerChild is the measured half of an
+// TestInvariant_MetadataSurfacesBoundedByWidth is the measured half of an
 // immunity claim rather than a read of it. The SchemaNode->JSON walk carries
 // its own allowance, and the reason it has no width residue is structural: it
 // charges takeNode at the TOP of every entry, ahead of the cycle and dedup
@@ -915,17 +931,26 @@ func TestInvariant_MinBytesChargeCoversEveryChildArm(t *testing.T) {
 // A claim like that is worth no more than the probe behind it, so the same
 // wide cyclic shape that took the min-bytes walk past the budget is driven
 // through the metadata surfaces here.
-func TestInvariant_MetadataWalkChargesPerChild(t *testing.T) {
-	s := MustParse(`{"type":"array","items":` + dagWideSCC(dagWideLevels, 2, dagWideWidth) + `}`)
-	wantTerminate(t, "Root+Schema/wide-scc", func() error {
-		root := s.Root()
-		_, _ = root.Schema()
-		return nil
+func TestInvariant_MetadataSurfacesBoundedByWidth(t *testing.T) {
+	const cell = "TestInvariant_MetadataSurfacesBoundedByWidth"
+	at := func(width int) *Schema {
+		return MustParse(`{"type":"array","items":` + dagWideSCC(dagWideLevels, 2, width) + `}`)
+	}
+	wantCostDoesNotScale(t, cell, "Root+Schema/wide-scc", func(width int) func() error {
+		s := at(width)
+		return func() error {
+			root := s.Root()
+			_, _ = root.Schema()
+			return nil
+		}
 	})
-	wantTerminate(t, "String+Canonical/wide-scc", func() error {
-		_ = s.String()
-		_ = s.Canonical()
-		return nil
+	wantCostDoesNotScale(t, cell, "String+Canonical/wide-scc", func(width int) func() error {
+		s := at(width)
+		return func() error {
+			_ = s.String()
+			_ = s.Canonical()
+			return nil
+		}
 	})
 }
 
@@ -1017,71 +1042,78 @@ const (
 // drives many containers over ONE shared cyclic SCC; the shared walk pays for it
 // once, a fresh-walk-per-container regression pays for it per container.
 func TestInvariant_MinBytesContainerCountBounded(t *testing.T) {
-	scc := nContainersOverSCC(containerCountN, containerCountLevels)
+	const cell = "TestInvariant_MinBytesContainerCountBounded"
 
 	// Parse, FORWARD refs: the arrays precede the SCC, so their items resolve in
 	// finalize's container-fixup loop, which shares one walk across all of them.
-	wantTerminate(t, "Parse/many-containers-forward", func() error {
-		_, err := Parse(scc)
-		return err
+	wantCostDoesNotScale(t, cell, "Parse/many-containers-forward", func(n int) func() error {
+		s := nContainersOverSCC(n, containerCountLevels)
+		return func() error { _, err := Parse(s); return err }
 	})
-	wantTerminate(t, "SchemaCache.Parse/many-containers-forward", func() error {
-		var c SchemaCache
-		_, err := c.Parse(scc)
-		return err
+	wantCostDoesNotScale(t, cell, "SchemaCache.Parse/many-containers-forward", func(n int) func() error {
+		s := nContainersOverSCC(n, containerCountLevels)
+		return func() error {
+			var c SchemaCache
+			_, err := c.Parse(s)
+			return err
+		}
 	})
 
 	// Parse, BACKWARD refs: the SCC is defined first and fully wired at build, so
 	// each array's items resolves to the built cyclic node and the minimum is
-	// computed on the BUILD reaching-path, not finalize. This is the same walk and
-	// the same cost reached by a different construction path — the build path uses
-	// the builder's shared walk (b.minBytes). SchemaCache too, since it shares the
-	// builder.
-	wired := nContainersOverWiredSCC(containerCountN, containerCountLevels)
-	wantTerminate(t, "Parse/many-containers-backward", func() error {
-		_, err := Parse(wired)
-		return err
+	// computed on the BUILD reaching-path, not finalize. Reference DIRECTION is
+	// its own axis, and it is crossed here WITH the count rather than instead
+	// of it — varying only the direction is what left the count pinned.
+	wantCostDoesNotScale(t, cell, "Parse/many-containers-backward", func(n int) func() error {
+		s := nContainersOverWiredSCC(n, containerCountLevels)
+		return func() error { _, err := Parse(s); return err }
 	})
-	wantTerminate(t, "SchemaCache.Parse/many-containers-backward", func() error {
-		var c SchemaCache
-		_, err := c.Parse(wired)
-		return err
+	wantCostDoesNotScale(t, cell, "SchemaCache.Parse/many-containers-backward", func(n int) func() error {
+		s := nContainersOverWiredSCC(n, containerCountLevels)
+		return func() error {
+			var c SchemaCache
+			_, err := c.Parse(s)
+			return err
+		}
 	})
 
 	// Resolve: a reader that differs (extra field) forces resolveRecord to
 	// recurse into every array, each calling ctx.minBytes on the shared walk.
-	w := MustParse(scc)
-	r := MustParse(strings.Replace(scc,
-		`{"type":"record","name":"Root","fields":[`,
-		`{"type":"record","name":"Root","fields":[{"name":"extra","type":"int","default":0},`, 1))
-	wantTerminate(t, "Resolve/many-containers", func() error {
-		_, err := Resolve(w, r)
-		return err
+	wantCostDoesNotScale(t, cell, "Resolve/many-containers", func(n int) func() error {
+		scc := nContainersOverSCC(n, containerCountLevels)
+		w := MustParse(scc)
+		r := MustParse(strings.Replace(scc,
+			`{"type":"record","name":"Root","fields":[`,
+			`{"type":"record","name":"Root","fields":[{"name":"extra","type":"int","default":0},`, 1))
+		return func() error { _, err := Resolve(w, r); return err }
 	})
 
 	// Skip: a dropped writer field whose subtree is the many-containers record.
-	// The skip is compiled lazily at first decode, one walk per record's field
-	// set; this drives that compile.
-	wDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"x","type":` + scc + `},{"name":"y","type":"int"}]}`)
-	rDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"y","type":"int"}]}`)
-	wantTerminate(t, "Resolve+Decode/many-containers-dropped", func() error {
-		rs, err := Resolve(wDrop, rDrop)
-		if err != nil {
+	// The skip is compiled lazily at first decode, on the resolution's own walk;
+	// this drives that compile.
+	wantCostDoesNotScale(t, cell, "Resolve+Decode/many-containers-dropped", func(n int) func() error {
+		scc := nContainersOverSCC(n, containerCountLevels)
+		wDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"x","type":` + scc + `},{"name":"y","type":"int"}]}`)
+		rDrop := MustParse(`{"type":"record","name":"Top","fields":[{"name":"y","type":"int"}]}`)
+		// Minimal wire for wDrop: the SCC record's arrays empty, its records
+		// all null-union index 0, then y. The skip compile fires inside.
+		wire := manyContainersMinimalWire(n, containerCountLevels)
+		return func() error {
+			rs, err := Resolve(wDrop, rDrop)
+			if err != nil {
+				return err
+			}
+			var out map[string]any
+			_, err = rs.Decode(wire, &out)
 			return err
 		}
-		// Minimal wire for wDrop: the SCC record's arrays empty, its records
-		// all null-union index 0, then y. The skip compile fires here.
-		wire := manyContainersMinimalWire(containerCountN, containerCountLevels)
-		var out map[string]any
-		_, err = rs.Decode(wire, &out)
-		return err
 	})
 
 	// ocf-header: the executable cell lives in ocf/dos_battery_test.go; this
 	// pins the parse of the identical header schema that reaches it.
-	wantTerminate(t, "ocf-header/many-containers", func() error {
-		_, err := Parse(scc)
-		return err
+	wantCostDoesNotScale(t, cell, "ocf-header/many-containers", func(n int) func() error {
+		s := nContainersOverSCC(n, containerCountLevels)
+		return func() error { _, err := Parse(s); return err }
 	})
 }
 
