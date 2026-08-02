@@ -12343,8 +12343,20 @@ producing a wire its own decoder rejects:
    marked it ACYCLIC so the wrong value was memoized. `Root{z:array<Inner>,
    d:Later}` with `Inner{g:Later}` and `Later` an empty record: 3-byte wire,
    accept or reject decided purely by whether `Later` is declared before or
-   after. A container whose DIRECT child is resolvable is not in
-   `containerFixups`, so its build-time value is never recomputed.
+   after.
+
+   **The forward reference must sit BELOW the container's direct child, and
+   that requirement is the whole shape.** An `array` whose items IS the
+   forward reference (`{"type":"array","items":"Later"}`) is registered in
+   `containerFixups`, and finalize re-derives its minimum from the resolved
+   node — the build-time answer is overwritten and the nil stand-in never
+   reaches the wire path. Executed at e9388a7: that direct form ACCEPTS on
+   both declaration orders, and only the nested form rejects. One level down
+   nothing re-patches, because the array's items is an inline record
+   (immediately resolvable, so not a fixup) while that record's own FIELD is
+   the forward reference. Both shapes are now cells of the pin, the direct one
+   as a labelled CONTROL, so the distinction cannot be simplified away; the
+   nil-arm neuter reds the nested/forward cell alone.
 
 **The fix: no stand-in may be a guess.** The rule now stated at
 `minBytesUnknown`: a reported minimum must be a sound LOWER bound on the true

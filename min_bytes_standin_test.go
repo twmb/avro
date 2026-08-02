@@ -78,33 +78,67 @@ func TestRegression_ZeroMinimumContainerAfterDrainedAllowance(t *testing.T) {
 }
 
 // TestRegression_ZeroMinimumContainerBehindForwardRef pins the nil-child
-// stand-in, which needs no adversarial schema at all: a plain forward reference
-// to an empty record. The container's element is only reachable after finalize
-// wires it, so at build the walk sees a nil child.
+// stand-in. The forward reference must sit BELOW the container's direct child,
+// and that is the whole shape — do not "simplify" this to an
+// array-of-forward-reference.
+//
+// A container whose DIRECT child is the forward reference is registered in
+// containerFixups, and finalize re-derives its minimum from the resolved node
+// once the reference is wired; the build-time answer is overwritten and the nil
+// stand-in never reaches the wire path. That case is the "direct" control
+// below, and it is correct on both declaration orders even without this fix.
+//
+// One level down, nothing re-patches: the array's items is an inline record,
+// immediately resolvable, so the array is NOT a fixup — while that record's own
+// FIELD is the forward reference, so the walk sees a nil child at build and the
+// value it computes there is the value the decoder uses forever.
 func TestRegression_ZeroMinimumContainerBehindForwardRef(t *testing.T) {
-	const arr = `{"type":"array","items":{"type":"record","name":"Inner","fields":[{"name":"g","type":"Later"}]}}`
-	const later = `{"type":"record","name":"Later","fields":[]}`
-	for _, c := range []struct{ name, src string }{
-		{"element defined after the container (forward ref)",
-			`{"type":"record","name":"Root","fields":[{"name":"z","type":` + arr + `},{"name":"d","type":` + later + `}]}`},
-		{"element defined before the container (backward ref)",
-			`{"type":"record","name":"Root","fields":[{"name":"d","type":` + later + `},{"name":"z","type":` + arr + `}]}`},
+	const later = `{"type":"record","name":"Later","fields":[]}` // true minimum: 0 wire bytes
+	// nested: items is an inline record whose FIELD is the forward reference.
+	const nested = `{"type":"array","items":{"type":"record","name":"Inner","fields":[{"name":"g","type":"Later"}]}}`
+	// direct: items IS the forward reference — the fixup re-derives this one.
+	const direct = `{"type":"array","items":"Later"}`
+
+	for _, c := range []struct {
+		name    string
+		arr     string
+		elem    func() any
+		fixedUp bool // finalize re-derives the minimum for this shape
+	}{
+		{"nested (forward ref below the container's child)", nested,
+			func() any { return map[string]any{"g": map[string]any{}} }, false},
+		{"direct (forward ref IS the container's child — control)", direct,
+			func() any { return map[string]any{} }, true},
 	} {
-		t.Run(c.name, func(t *testing.T) {
-			s := MustParse(c.src)
-			items := make([]any, maxZeroByteItems)
-			for i := range items {
-				items[i] = map[string]any{"g": map[string]any{}}
-			}
-			wire, err := s.Encode(map[string]any{"z": items, "d": map[string]any{}})
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			var out map[string]any
-			if _, err := s.Decode(wire, &out); err != nil {
-				t.Fatalf("own encoder produced %d bytes its own decoder rejects: %v", len(wire), err)
-			}
-		})
+		for _, order := range []struct {
+			name    string
+			forward bool
+		}{{"Later declared after (forward ref)", true}, {"Later declared before (backward ref)", false}} {
+			t.Run(c.name+"/"+order.name, func(t *testing.T) {
+				z := `{"name":"z","type":` + c.arr + `}`
+				d := `{"name":"d","type":` + later + `}`
+				fields := z + "," + d
+				if !order.forward {
+					fields = d + "," + z
+				}
+				s := MustParse(`{"type":"record","name":"Root","fields":[` + fields + `]}`)
+				items := make([]any, maxZeroByteItems)
+				for i := range items {
+					items[i] = c.elem()
+				}
+				wire, err := s.Encode(map[string]any{"z": items, "d": map[string]any{}})
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				var out map[string]any
+				if _, err := s.Decode(wire, &out); err != nil {
+					t.Fatalf("own encoder produced %d bytes its own decoder rejects: %v", len(wire), err)
+				}
+				if got := len(out["z"].([]any)); got != maxZeroByteItems {
+					t.Fatalf("decoded %d zero-byte items, want %d", got, maxZeroByteItems)
+				}
+			})
+		}
 	}
 }
 
