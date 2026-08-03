@@ -550,12 +550,25 @@ func (s *Schema) Canonical() []byte {
 	return canonicalBytes(canonicalFirstOccurrence(s.c))
 }
 
-// Fingerprint hashes the schema's canonical form with h. Use [NewRabin] for
-// CRC-64-AVRO or crypto/sha256 for cross-language compatibility.
+// Fingerprint hashes the schema's canonical form with h and returns h's digest.
+// Use [NewRabin] for the spec's CRC-64-AVRO algorithm, or crypto/sha256 for its
+// 256-bit recommendation.
 //
-// The result is big-endian per [hash.Hash.Sum]. Single Object Encoding uses
-// little-endian fingerprints; use [Schema.DecodeSingleObject] or
-// [SingleObjectFingerprint] for that format.
+// For CRC-64-AVRO the byte order is worth stating, because most of the Avro
+// ecosystem goes the other way from Go. Go writes integer hashes high byte
+// first — crc32, crc64, adler32 and fnv all do — so [NewRabin] hands back the
+// fingerprint BIG-ENDIAN, while Java, fastavro and the single-object header all
+// write that same 64-bit value LITTLE-ENDIAN. Only the order differs: compare it
+// as a uint64, or reverse the bytes.
+//
+// Digest algorithms need none of that. A crypto/sha256 fingerprint is a byte
+// string with no byte order, and it already matches Java's and fastavro's byte
+// for byte — reversing it would break the comparison.
+//
+// There is no separate call returning the little-endian CRC-64-AVRO form:
+// [Schema.AppendSingleObject] writes it into the message header,
+// [SingleObjectFingerprint] reads it back out, and [Schema.DecodeSingleObject]
+// verifies it.
 func (s *Schema) Fingerprint(h hash.Hash) []byte {
 	h.Write(s.Canonical())
 	return h.Sum(nil)

@@ -1158,14 +1158,15 @@ func battery(t *testing.T, nc reparseNameClass, writer, twin, reader *avro.Schem
 }
 
 // fastavroRabinBytes converts a fastavro-printed CRC-64-AVRO fingerprint
-// (big-endian hex, as fastavro.schema.fingerprint prints) to the
-// little-endian byte order Schema.Fingerprint(NewRabin()) returns, so
-// pins compare BYTES rather than presentation.
-func fastavroRabinBytes(t *testing.T, beHex string) []byte {
+// (LITTLE-endian hex — fastavro prints the single-object wire order) to the
+// BIG-endian byte order Schema.Fingerprint(NewRabin()) returns, so pins
+// compare BYTES rather than presentation. The 64-bit value is the same one;
+// only the order differs.
+func fastavroRabinBytes(t *testing.T, leHex string) []byte {
 	t.Helper()
-	b, err := hex.DecodeString(beHex)
+	b, err := hex.DecodeString(leHex)
 	if err != nil {
-		t.Fatalf("bad hex %q: %v", beHex, err)
+		t.Fatalf("bad hex %q: %v", leHex, err)
 	}
 	slices.Reverse(b)
 	return b
@@ -1199,7 +1200,7 @@ func TestMatrix_CanonicalEmptyNameFastavroParity(t *testing.T) {
 		key       string
 		schema    string
 		wantPCF   string // fastavro's executed PCF, byte-for-byte
-		rabinBEHx string // fastavro's executed fingerprint (big-endian hex)
+		rabinLEHx string // fastavro's executed fingerprint (little-endian hex)
 	}{
 		{"root/bare", bareDef,
 			`{"name":"","type":"record","fields":[{"name":"f","type":"long"}]}`, "3d741707ff4bfa45"},
@@ -1229,7 +1230,7 @@ func TestMatrix_CanonicalEmptyNameFastavroParity(t *testing.T) {
 			if got := string(s.Canonical()); got != c.wantPCF {
 				t.Errorf("canonical vs fastavro PCF:\n got %s\nwant %s", got, c.wantPCF)
 			}
-			if got, want := s.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, c.rabinBEHx); !bytes.Equal(got, want) {
+			if got, want := s.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, c.rabinLEHx); !bytes.Equal(got, want) {
 				t.Errorf("rabin bytes vs fastavro: got %x, want %x", got, want)
 			}
 			re, err := avro.Parse(string(s.Canonical()), avro.WithLaxNames(acceptAll))
