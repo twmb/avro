@@ -12644,3 +12644,74 @@ when that file reached its size bound):
   longer exists); the stray-shape question's THREE implementations (accept-sets
   agree, empty collections included). Base + fastavro green; **-race RED**;
   Java un-netted.
+
+## Distillation archive (2026-08-02 #67) — the three superseded era ledger lines, verbatim
+
+Compressed out of AUDIT_CORE §Round ledger when CORE crossed its 55000-byte
+bound (+180). All three are superseded by a later convergence anchor, so the
+ledger keeps only date · HEAD · type · behavioral count · the pattern numbers,
+and the narrative lives here. Their own archive pointers are preserved below.
+
+- 2026-07-01..30 · ea9a2ce→1b1933f · PRE-ERA + KEY-SPACE ERA (archive 2026-07-28 #27,
+  #22, #28-#33, #35; 2026-07-29 #36, #37; 2026-07-30 #38; 2026-07-31 #55).
+  CONVERGED→RESET→RE-CONVERGED cycles; #53-#76 filed and fixed; the #63 stray-key
+  family; the #46 reserved-key flip; P19-P24; R1 → the PREDICATE CENSUS; the
+  2184-cell reserved-attribute ENUMERATION, 71 cells UNRULED rather than guessed →
+  **#74**, **PLACEMENT AUTHORITY**, **rule 2a**, **RULE 7a**; convention 1 grew (e)
+  then **(f) DERIVE THE SET**. Standing lessons: MEASUREMENT NEVER HAPPENED (the
+  neuter rule became the TRIPLE); a net that reds is not one that MEASURES.
+- 2026-07-30..31 · c17986f→299c392 · COST ERA, four rounds superseded by the
+  5bd3ac0 anchor (verbatim: archive 2026-08-01 #57; 2026-07-31 #56, #52, #51;
+  narratives 2026-07-30 #39-#42, 2026-07-31 #43, #44). 0 behavioral until the
+  last, then **1**: three DoS classes on axes no column had — quadratic in a
+  caller-chosen SIBLING count (**P25**), a parse-time table with no JSON consumer
+  so the twin rescanned per VALUE (**P26**), and a schema-declared magnitude
+  wrapping into a DIVISOR (**P27**, census Q22, a taint fixpoint). Standing
+  lessons: severity is set by REACHABILITY; a cell can name the right axis and
+  hold the deciding one constant; the yield is in the attacks.
+- 2026-07-31..08-01 · 5bd3ac0→0e526c2 · two FULL+FIX rounds, superseded by the
+  a5dd23c anchor (archives 2026-07-31 #48, #54, #45-#56; 2026-08-01 #57-#59).
+  The DAG-cost class opened here — a named type referenced twice IS the DAG.
+  **1 behavioral** (`SchemaFor` PANICS on it — **B37**, census Q23; counter RESET
+  to 0), plus the min-bytes product's first two factors: PATHS (**P28**/**G1**, a
+  `defer delete` path set standing in for a memo; oracle is the un-memoized run)
+  and CHILDREN (**P29**/**G2**, a budget counting NODE COMPUTATIONS while each
+  iterates its own fields). Closed **G1**, **G2**.
+
+## Distillation archive (2026-08-02 #68) — AUDIT_PATTERNS P28 and P29 bodies, verbatim
+
+Tombstoned out of the AUDIT_PATTERNS Index when PATTERNS crossed its
+150000-byte bound (+779). Both are the named FACTORS of P30's product and both
+state their own coverage — "netted by the P30 census" — so the live index keeps
+the marker, the net, and the re-open condition, and the probes live here.
+`budgeted_walk_census_test.go` is the net: it rows every budgeted walk with its
+cost as a product, DERIVES the walk set from source two ways (graph-cost
+markers; self-recursion over `*schemaNode`/`*SchemaNode`), fails on an unrowed
+walk, and — through `TestInvariant_EveryReachingPathBoundIsMeasured` — fails on
+a row whose bound is asserted rather than driven at two values of its own
+factor.
+
+- P28. A CYCLE DETECTOR standing in for a MEMO — the PATHS factor of P30's
+  product. A recursive schema walk marks the node on entry and UNMARKS on exit
+  (`defer delete(seen, n)`): correct for cycles, EXPONENTIAL on a DAG (a named type
+  referenced twice IS the DAG). Tell: the walk's answer is PATH-INDEPENDENT (a wire
+  minimum, a cost, a type verdict), so a per-path set buys nothing and the result
+  should be CACHED; depth caps do not defend it (the fan-out is reachable FLAT at
+  JSON depth 4 via forward-ref siblings). Probe: two-refs-per-level chain, time n vs
+  n+2 (4x is the signature), through EVERY entry point. Memo condition is
+  SUBTREE-CYCLE-FREE (oracle: an un-memoized run per node — a wrong memo is FASTER);
+  memo and budget MASK each other, each needs its own neuter. Instance
+  `schemaMinBytesSeen`; archive #48/#54/#58; netted by the P30 census.
+
+- P29. A CAP THAT COUNTS THE WRONG MAGNITUDE — the CHILDREN factor of P30's
+  product. A budget decremented once per ITEM where each item's own cost is a
+  second caller-chosen number, so the bound is `budget x fanout` and only the first
+  factor is capped; it looks airtight because the rationale reasons about EXHAUSTING
+  it, never REACHING it. Tells: a plain integer decremented at entry rather than
+  charged per unit of work; cost cells driving an axis chosen for a DIFFERENT reason
+  so every cell measures `budget x 2`. The residue hides where a walk returns EARLY
+  (a charge after a memo/path check is free on every hit) — ask whether any path
+  reaches work without passing the charge. Reproducing the width needs cyclic +
+  width-CONCENTRATED-at-leaf + zero-min fillers at once (`dagWideSCC`). Instance
+  `maxMinBytesVisits` -> `maxMinBytesWork` (`1 + childCount` before descending);
+  archive #57/#59; netted by the census.
