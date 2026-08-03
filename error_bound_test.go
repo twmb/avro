@@ -359,7 +359,7 @@ func TestRegression_NestedStrayContainerKeyLinearCost(t *testing.T) {
 	// enclosing level) lands near 4. Skipped under -race: instrumentation
 	// distorts the ratio, and the absolute ceilings above still catch the
 	// exponential there.
-	if raceEnabled {
+	if isRaceEnabled() {
 		return
 	}
 	// Deep enough that fixed per-call overhead does not dilute the growth

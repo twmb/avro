@@ -16,9 +16,12 @@ import (
 // canonicalization on the encoder side is fine; the Go-value
 // round-trip is what we lock in.
 //
-// Documented intentional asymmetries (see SKIPPED_FOLLOWUPS.md) are
-// excluded — see TestTextUnmarshalerOnlyAcceptedOnDecodeRejectedOnEncode
-// for the TextUnmarshaler-only case.
+// Documented intentional asymmetries are excluded here and pinned by their own
+// tests — [TestTextUnmarshalerOnlyDecodeOnly] below for the TextUnmarshaler-only
+// case, which is the one this sweep would otherwise report as a round-trip
+// failure. Both of this sentence's previous pointers had rotted: a
+// SKIPPED_FOLLOWUPS.md that no longer exists and a test name that never did, so
+// an exclusion the reader could not check read as one they could.
 func TestDecodeReencodeSymmetry(t *testing.T) {
 	type tc struct {
 		name   string

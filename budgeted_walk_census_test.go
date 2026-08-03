@@ -46,7 +46,9 @@ package avro
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -622,10 +624,7 @@ func TestInvariant_EveryReachingPathBoundIsMeasured(t *testing.T) {
 				wantTerminate(t, fmt.Sprintf("%s=%d", name, v), func() error { return f.drive(v) })
 				times[v] = time.Since(start)
 			}
-			floor := reachScaleFloor
-			if raceEnabled {
-				floor = reachScaleFloor * 5
-			}
+			floor := raceInflated(reachScaleFloor)
 			if lim := max(reachScaleTol*times[lo], floor); times[hi] > lim {
 				t.Errorf("%s: cost scales with the factor — %v at %d vs %v at %d (limit %v).\nA walk shared across this count pays its allowance once; this is the shape of one walk per unit.",
 					name, times[hi], hi, times[lo], lo, lim)
@@ -731,6 +730,17 @@ type costCell struct {
 	// cross-checks it against whether the cell actually takes the wall-clock
 	// harness, so an exemption cannot be pasted onto a timing cell.
 	exempt string
+	// carrier names what carries this cell's magnitude when it is NOT schema
+	// text. The derivation below finds cells by their calls to a cost
+	// GENERATOR (a func turning an int into schema text), which is the shape
+	// almost every magnitude here takes — but not all of them: a Go type, a
+	// hand-built node, a wire buffer. Those cells cannot be DISCOVERED by that
+	// derivation, so they are rowed by hand and this field is the declaration
+	// that they were. It is the one thing in this registry the source cannot
+	// check for us, which is why it has to be written down rather than
+	// inferred; everything else about such a row (two values, the harness, the
+	// self-naming) is checked exactly as for any other cell.
+	carrier string
 	// scaleTol bounds cost(max)/cost(min). Every one of these factors measured
 	// FLAT with a correct bound even where the schema TEXT grows with the factor
 	// (width 80 -> 8000 grows the text 65x and the parse 1.4x, because the walk
@@ -780,6 +790,37 @@ var costCells = []costCell{
 		factor: "CONTAINER count. Its two generator calls vary reference DIRECTION (forward/backward), which is a different axis — the count itself was pinned at 220",
 		values: []int{1, 220}, scaleTol: 4, floor: 400 * time.Millisecond},
 
+	{fn: "TestInvariant_EmbedDiamondCostFactors",
+		// The goTypeDAG walk. Its cost is paths x CALLS and the two collectors
+		// differ on the second factor — the decode mapping is memoized per
+		// reflect.Type, SchemaFor's collector is not — so a cell driving depth
+		// alone measures the factor they AGREE on and misses the one they do
+		// not. That is what closed this gap: not the depth number, which was
+		// already measured, but the second factor.
+		factor:  "sibling-embed DAG depth (the paths factor, 2^depth) crossed with CALL COUNT (the amortization factor, where the two collectors diverge)",
+		carrier: "a Go TYPE — the depth is carried by which declared embed-diamond type the cell instantiates, so no schema-text generator appears and the derivation cannot discover this cell. Rowed by hand; the depths the row names are asserted against the types inside the cell",
+		values:  []int{8, 12}, scaleTol: 32, floor: 2 * time.Second},
+
+	{fn: "TestDoSBattery_C9_CustomTypeParseCost",
+		factor: "backward-reference chain LENGTH — the per-parse custom-match memo's factor. Without it every stamp walk from Ri reaches R0..R(i-1), so the total is quadratic in this count while the schema text is linear in it",
+		values: []int{3000, 6000}, scaleTol: 4, floor: 200 * time.Millisecond},
+
+	{fn: "TestDoSBattery_OCF_C1_Header",
+		// In package ocf, which cannot import this registry. Its magnitudes are
+		// named vocabularies in that file and the guard checks these values
+		// appear there; see the cross-package arm of the guard for why the tie
+		// is checked that way round rather than by the cell reading its row.
+		factor: "the header DAG's three magnitudes — reference DEPTH, cyclic record WIDTH, and CONTAINER count — each driven at two values",
+		values: []int{26, 30, 8000, 16000, 220, 440}, scaleTol: 4, floor: 400 * time.Millisecond},
+
+	{fn: "TestRegression_NestedStrayContainerKeyLinearCost",
+		// Times inline rather than through a named helper, which is why the
+		// harness vocabulary includes time.Since: a cell that measures its own
+		// clock is still a timing cell, and an exemption must not be able to
+		// sit on one by avoiding the helpers.
+		factor: "nested stray-key DEPTH — the metadata walker's per-ancestor re-validation, whose absence is exponential. The absolute-ceiling half runs at depth 20 and the growth half compares 400 against 800",
+		values: []int{20, 400, 800}, scaleTol: 3, floor: 100 * time.Millisecond},
+
 	// Value oracles. Named explicitly rather than left to a reader to re-derive:
 	// each varies shapes to check an ANSWER and asserts equality, never
 	// wall-clock, so a second magnitude would measure nothing about a bound.
@@ -791,6 +832,10 @@ var costCells = []costCell{
 		exempt: "value oracle: asserts a bound derived from the walk still admits wire this package's own encoder produces. Accept/reject, not cost"},
 	{fn: "TestInvariant_SharingDoesNotChangeMinBytes",
 		exempt: "value oracle: asserts sharing one walk across containers does not change the ANSWER. It already sweeps fan x levels; the sweep is over SHAPES to find a disagreement, not magnitudes to time"},
+	{fn: "TestRegression_ZeroByteItemCapStillHolds",
+		exempt: "value oracle: asserts the zero-byte-item CAP still rejects an over-cap count both with and without a drained stand-in. Its use of the SCC generator is to exhaust the allowance — a state, not a magnitude — and its assertion is accept/reject, so a second depth would measure nothing about a bound"},
+	{fn: "TestRegression_ZeroMinimumContainerAfterDrainedAllowance",
+		exempt: "value oracle: encode-implies-decode across the two field ORDERS that decide whether the zero-minimum container is built before or after the allowance drains. The axis is order, not magnitude; the SCC depth only has to be enough to drain"},
 	{fn: "TestInvariant_SharedSchemaNodeWalkedOnce",
 		factor: "dagNested/dagFlat/dagSelfRecursive/dagSingleSCC DEPTH — the PATHS factor across all four sharing shapes and both fans. Its name reads like a value oracle, and the hand derivation classified it as one; it takes the wall-clock harness, so the exemption cross-check caught it",
 		// Two of its four shapes are CYCLIC and cannot be memoized at all, so
@@ -854,20 +899,95 @@ func wantCostDoesNotScale(t *testing.T, fn, label string, build func(n int) func
 		wantTerminate(t, fmt.Sprintf("%s/%s=%d", label, row.factor, v), run)
 		times[v] = time.Since(start)
 	}
-	floor := row.floor
-	if raceEnabled {
-		floor *= 5
-	}
+	floor := raceInflated(row.floor)
 	if lim := max(time.Duration(row.scaleTol)*times[lo], floor); times[hi] > lim {
 		t.Errorf("%s: cost scales with the factor — %v at %d vs %v at %d (limit %v).\nThe bound claims to cap this magnitude; a cost that grows with it is the bound missing, not a slow machine.",
 			label, times[hi], hi, times[lo], lo, lim)
 	}
 }
 
+// costGenerators derives the cost-generator vocabulary BY SHAPE, and returns
+// it with the file each was found in.
+//
+// A cost generator is a function that turns a caller-chosen MAGNITUDE into
+// AVRO SCHEMA TEXT: at least one int parameter, exactly one string result, and
+// a body that writes an Avro `type` key. All three conditions are structural.
+// The `type` key is what separates a schema builder from an integer formatter
+// of the same signature — there are several of those, and they drive nothing.
+//
+// SCOPE OF THIS DERIVATION, stated because it has one and because the previous
+// three attempts at this class each fixed one level and hand-scoped the next.
+// It reads every *_test.go file of this module, in every package
+// (moduleTestFiles). What it therefore CANNOT see, named rather than left to be
+// discovered:
+//
+//   - a magnitude that reaches production as something other than schema text
+//     — a []byte wire builder, a reflect.Type, a hand-built *schemaNode. Those
+//     are cost drivers this predicate does not match, and three of the value
+//     oracles rowed below are exactly that shape.
+//   - a generator that composes schema text without ever writing a `type` key
+//     itself, by delegating every fragment to a helper.
+//   - a magnitude spelled as a package-level constant with no int parameter at
+//     all, which is a generator of ONE size and so cannot drive a factor.
+//   - anything outside this module: the Java and fastavro oracle harnesses
+//     under testdata are a different language and a different module.
+//
+// The guard against the derivation silently collapsing is a floor on what it
+// finds AND a requirement that more than one package is represented — the
+// single-package scope is the specific way the previous version failed, so it
+// is the specific thing asserted.
+func costGenerators(t *testing.T, src map[string]string) (map[string]bool, map[string]string) {
+	t.Helper()
+	decl := regexp.MustCompile(`(?m)^func ([A-Za-z_][A-Za-z0-9_]*)\(([^)]*)\) string \{`)
+	intParam := regexp.MustCompile(`\bint\b`)
+	gens := map[string]bool{}
+	where := map[string]string{}
+	for f, s := range src {
+		code := blankCode(s)
+		for _, m := range decl.FindAllStringSubmatchIndex(code, -1) {
+			name := code[m[2]:m[3]]
+			if !intParam.MatchString(code[m[4]:m[5]]) {
+				continue
+			}
+			// Body extent by brace matching over the blanked view, then read
+			// the RAW bytes for the `type` key — the key lives in a string
+			// literal, which the blanked view has erased.
+			depth, end := 0, -1
+			for k := m[1] - 1; k < len(code) && end < 0; k++ {
+				switch code[k] {
+				case '{':
+					depth++
+				case '}':
+					depth--
+					if depth == 0 {
+						end = k
+					}
+				}
+			}
+			if end < 0 {
+				end = len(code) - 1
+			}
+			if !strings.Contains(s[m[1]:end], `"type"`) {
+				continue
+			}
+			gens[name] = true
+			where[name] = f
+		}
+	}
+	pkgs := map[string]bool{}
+	for _, f := range where {
+		pkgs[filepath.Dir(f)] = true
+	}
+	if len(gens) < 15 || len(pkgs) < 2 {
+		t.Fatalf("derived %d cost generators across %d packages (%v) — too few; the derivation broke, and a broken derivation reads as full coverage.\n"+
+			"The single-package scope is how the previous version of this derivation failed, so the package count is asserted and not assumed.", len(gens), len(pkgs), gens)
+	}
+	return gens, where
+}
+
 // TestInvariant_EveryCostCellDrivesItsFactor applies the measured-bound rule to
-// the wall-clock cost cells, deriving the set the same way it was derived by
-// hand: a cost GENERATOR is a function in the census sources returning a schema
-// string from a magnitude, and any test that calls one is a cost cell.
+// the wall-clock cost cells: a cost GENERATOR is a function that turns a
+// magnitude into schema text, and any test that calls one is a cost cell.
 //
 // Mechanical in every direction:
 //
@@ -884,30 +1004,26 @@ func wantCostDoesNotScale(t *testing.T, fn, label string, build func(n int) func
 //     label, and a cell rowed with values that takes no harness is the reverse.
 //   - a row naming no test FAILS, so the registry cannot go stale.
 func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
-	files := censusSourceFiles(t)
+	files := moduleTestFiles(t)
 	src := map[string]string{}
 	for _, f := range files {
 		src[f] = readFile(t, f)
 	}
-	for _, f := range []string{"schema_dag_cost_test.go", "budgeted_walk_census_test.go", "dos_battery_test.go"} {
-		src[f] = readFile(t, f)
-	}
 
-	// Derive the generator vocabulary: a func taking magnitudes and returning a
-	// schema string. Listing them would be the "written doc list is NOT an
-	// enumeration" trap.
-	genDecl := regexp.MustCompile(`(?m)^func ((?:dag|nContainers)[A-Za-z]*)\([^)]*int\) string \{`)
-	gens := map[string]bool{}
-	for _, m := range genDecl.FindAllStringSubmatch(src["schema_dag_cost_test.go"], -1) {
-		gens[m[1]] = true
-	}
-	if len(gens) < 4 {
-		t.Fatalf("derived only %d cost generators (%v) — the derivation broke, and a broken derivation reads as full coverage", len(gens), gens)
-	}
+	gens, genFile := costGenerators(t, src)
 
 	bodies := map[string][2]string{}
-	for _, v := range src {
+	bodyFile := map[string]string{}
+	for f, v := range src {
+		before := len(bodies)
 		testFuncBodies(v, bodies)
+		if len(bodies) > before {
+			for fn := range bodies {
+				if _, seen := bodyFile[fn]; !seen {
+					bodyFile[fn] = f
+				}
+			}
+		}
 	}
 
 	rowed := map[string]costCell{}
@@ -923,28 +1039,42 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 	// function VALUE (build: dagNested) is one even though it never writes
 	// "dagNested(". Both mistakes were made by the first derivation, in opposite
 	// directions, which is why this is matched on identifiers over stripped code.
-	callsGenerator := func(code string) bool {
+	callsGenerator := func(code string) string {
 		for g := range gens {
 			if regexp.MustCompile(`\b` + g + `\b`).MatchString(code) {
+				return g
+			}
+		}
+		return ""
+	}
+	// A cell that takes the wall-clock harness is asserting a COST.
+	// A cell that takes the wall-clock harness is asserting a COST. The set is
+	// every helper that TIMES something; wantAcceptUnder was missing from it,
+	// which is how the one cell driving a generator at a single magnitude
+	// through an absolute ceiling stayed invisible.
+	// time.Since( is in the set because a cell may time inline rather than
+	// through a named helper, and a timing cell that does so is still a timing
+	// cell — leaving it out would let an exemption sit on one.
+	harnesses := []string{"wantTerminate(", "dosRun(", "wantCostDoesNotScale(", "wantAcceptUnder(", "time.Since("}
+	takesHarness := func(code string) bool {
+		for _, h := range harnesses {
+			if strings.Contains(code, h) {
 				return true
 			}
 		}
 		return false
 	}
-	// A cell that takes the wall-clock harness is asserting a COST.
-	takesHarness := func(code string) bool {
-		return strings.Contains(code, "wantTerminate(") || strings.Contains(code, "dosRun(") ||
-			strings.Contains(code, "wantCostDoesNotScale(")
-	}
 
 	for fn, bc := range bodies {
 		raw, code := bc[0], bc[1]
-		if !callsGenerator(code) {
+		g := callsGenerator(code)
+		if g == "" {
 			continue
 		}
 		c, ok := rowed[fn]
 		if !ok {
-			t.Errorf("%s drives a cost generator but is not rowed in costCells.\nRow it with the factor its bound claims to cap and the values it drives, or row it exempt with what it asserts instead.", fn)
+			t.Errorf("%s (%s) drives cost generator %s (%s) but is not rowed in costCells.\nRow it with the factor its bound claims to cap and the values it drives, or row it exempt with what it asserts instead.",
+				fn, bodyFile[fn], g, genFile[g])
 			continue
 		}
 		if c.exempt != "" {
@@ -963,8 +1093,42 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 		if len(seen) < 2 {
 			t.Errorf("%s drives %d distinct value(s) of %q.\nOne value asks only whether the cell finishes, which a cost merely LINEAR in the factor also answers.", fn, len(seen), c.factor)
 		}
-		if !strings.Contains(raw, `"`+fn+`"`) {
-			t.Errorf("%s does not name itself to costFactorValues/wantCostDoesNotScale — its magnitudes are not read from its row, so the row and the cell can disagree.", fn)
+		// The cell has to be tied to its row. A cell in this package READS the
+		// row (it names itself to costFactorValues/wantCostDoesNotScale), so
+		// the two cannot disagree at all. A cell in another package cannot
+		// reach this registry — the ocf battery is a separate package by
+		// construction — so there the tie is checked the other way round:
+		// every value the row claims must appear as a literal in the cell.
+		// That is weaker (the cell could drive more than the row says) but it
+		// still fails when a cell stops driving what its row promises, which
+		// is the direction that turns a row into false coverage.
+		// The discriminator is the PACKAGE, not the directory: this registry
+		// is package avro, and the external avro_test package shares the
+		// directory while being just as unable to reach it as ocf is. Keying
+		// on the directory put a same-directory cell on the wrong arm.
+		if pkg := filePackage(src[bodyFile[fn]]); pkg == "avro" {
+			if !strings.Contains(raw, `"`+fn+`"`) {
+				t.Errorf("%s does not name itself to costFactorValues/wantCostDoesNotScale — its magnitudes are not read from its row, so the row and the cell can disagree.", fn)
+			}
+		} else {
+			// The magnitudes are checked against the whole FILE, not the test
+			// body: a cell that cannot read the registry keeps its pair in a
+			// named vocabulary beside itself, which is the readable form and
+			// is exactly where looking only at the body failed to find them.
+			//
+			// Against the BLANKED file. Checking the raw bytes let a magnitude
+			// NAMED IN A COMMENT satisfy the row — the comments here quote the
+			// measured numbers, so reverting a cell to one magnitude left its
+			// prose behind and the guard passed. That is the same
+			// comment-counts-as-code mistake the generator half of this
+			// derivation already paid for once.
+			file := blankCode(src[bodyFile[fn]])
+			for _, v := range c.values {
+				if !regexp.MustCompile(`\b` + strconv.Itoa(v) + `\b`).MatchString(file) {
+					t.Errorf("%s is in package %q, so it cannot read costCells; its row claims it drives %d and no such literal appears in %s.",
+						fn, pkg, v, bodyFile[fn])
+				}
+			}
 		}
 	}
 
@@ -975,11 +1139,21 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 			t.Errorf("costCells rows %s but no such test exists — the row rotted", c.fn)
 			continue
 		}
-		if !callsGenerator(bc[1]) {
-			t.Errorf("costCells rows %s but it drives no cost generator — the row reads as coverage it does not have", c.fn)
+		if callsGenerator(bc[1]) == "" && c.carrier == "" {
+			t.Errorf("costCells rows %s but it drives no cost generator and names no other carrier — the row reads as coverage it does not have.\nIf its magnitude is carried by something the generator derivation cannot see (a Go type, a hand-built node, a wire buffer), say so in carrier.", c.fn)
 		}
 	}
 }
+
+// filePackage returns the package a source file declares.
+func filePackage(src string) string {
+	if m := packageClauseRE.FindStringSubmatch(src); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+var packageClauseRE = regexp.MustCompile(`(?m)^package ([A-Za-z_][A-Za-z0-9_]*)`)
 
 // blankCode replaces the contents of comments and string literals with spaces,
 // preserving every byte position. Two derivations need it and they need

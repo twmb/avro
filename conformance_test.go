@@ -11771,9 +11771,10 @@ func TestParity_RuntimeRejectionMatrix(t *testing.T) {
 			{"map non-object", `{"type":"map","values":"int"}`, `42`},
 			{"truncated JSON brace", `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`, `{`},
 			{"truncated JSON string", `"string"`, `"abc`},
-			// "invalid escape in string" — twmb's JSON scanner is lenient on unknown \X
-			// escapes (accepts \q as q). encoding/json rejects. Documented lenience for
-			// now; if strictness is wanted, the fix is in json_scan.go's string parser.
+			// An unknown escape is rejected, at every position a JSON string can
+			// occupy — checked against encoding/json, which rejects the same six
+			// (\q \x41 \a \v \0 "\ ") with the same verdict.
+			{"invalid escape in string", `"string"`, `"\q"`},
 			{"union tag unknown", `["null","string"]`, `{"InvalidTag":"foo"}`},
 			{"union value not in any branch", `["int","string"]`, `true`},
 			{"date from non-int", `{"type":"int","logicalType":"date"}`, `"abc"`},
@@ -19836,10 +19837,7 @@ func TestRegression_ParseFloatLengthCapDoS(t *testing.T) {
 	// rejection here (the behavioral check above already pins that
 	// the cap fires); we're just guarding against future regressions
 	// that re-introduce the slow path on top of JSON parse cost.
-	threshold := 500 * time.Millisecond
-	if isRaceEnabled() {
-		threshold = 3 * time.Second // race adds 5-10x to everything; loose bound
-	}
+	threshold := raceRelaxed(500 * time.Millisecond)
 	_, _ = avro.Parse(schemaJSON) // warm-up
 	const runs = 3
 	var total time.Duration
@@ -19879,26 +19877,21 @@ func TestRegression_ParseFloatLengthCapDoS(t *testing.T) {
 	}
 }
 
-// isRaceEnabled reports whether the race detector is compiled into
-// this binary. Used to relax wall-clock thresholds when race
-// instrumentation adds ~5-10x overhead.
+// isRaceEnabled reports whether the race detector is compiled into this
+// binary. Forwards the module's single build-tagged predicate rather than
+// declaring a second one for this package.
 func isRaceEnabled() bool {
-	return raceEnabled
+	return avro.RaceEnabledForTest
 }
 
-// raceRelaxed returns a wall-clock DoS-timing ceiling: the tight normal bound,
-// or a generous ~3s ceiling under -race where instrumentation inflates
-// otherwise-fast bounded work (a µs/ms reject, a linear parse) past a tight
-// bound. The tight bound stays in effect normally so a regression is caught
-// sensitively; a real unbounded/superlinear blowup is multi-second and trips
-// even the generous ceiling, so detection is preserved under -race too. This is
-// the shared form of the inline branch on TestRegression_ParseFloatLengthCapDoS.
-// It never TIGHTENS (a normal bound already >= 3s is returned unchanged).
+// raceRelaxed returns the wall-clock ceiling for a normal bound. The rule and
+// both of its numbers live in race_bounds_test.go; this is the bridge, not a
+// second statement of it. The tight bound stays in effect without -race so a
+// regression is caught sensitively, and the relaxed ceiling still sits far
+// below what an unbounded or superlinear path costs, so detection survives in
+// both modes.
 func raceRelaxed(normal time.Duration) time.Duration {
-	if isRaceEnabled() && normal < 3*time.Second {
-		return 3 * time.Second
-	}
-	return normal
+	return avro.RaceRelaxedForTest(normal)
 }
 
 // TestRegression_OCFWriterPreservesLogicalTypeInHeader pins that the
@@ -20047,10 +20040,7 @@ func TestRegression_DecodeJSONFloatLengthCapDoS(t *testing.T) {
 			// reject over the bound on every attempt, while a genuinely
 			// uncapped parse exceeds it on all of them.
 			hostile1M := mk(1 << 20)
-			threshold := 100 * time.Millisecond
-			if isRaceEnabled() {
-				threshold = 1 * time.Second // race adds 5-10x overhead
-			}
+			threshold := raceRelaxed(100 * time.Millisecond)
 			var best time.Duration
 			for attempt := 0; attempt < 4; attempt++ {
 				t0 := time.Now()
@@ -22420,10 +22410,7 @@ func TestRegression_DecimalUnscaledLengthDoS(t *testing.T) {
 	// the sibling DoS timing tests (TestRegression_ParseFloatLengthCapDoS); a
 	// real unbounded base conversion (~2.7s for a 1 MiB unscaled value, far more
 	// under -race) still trips it, so the test stays meaningful in both modes.
-	timingThreshold := 100 * time.Millisecond
-	if isRaceEnabled() {
-		timingThreshold = 3 * time.Second
-	}
+	timingThreshold := raceRelaxed(100 * time.Millisecond)
 
 	avroBytesField := func(b []byte) []byte { return append(zigzagEncode64(int64(len(b))), b...) }
 	bigDecWire := func(uBytes []byte) []byte { // length-prefixed unscaled || zigzag scale(0), all wrapped as a bytes field

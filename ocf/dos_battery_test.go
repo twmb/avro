@@ -264,17 +264,23 @@ func TestDoSBattery_OCF_C1_Header(t *testing.T) {
 	// deep whatever the fan-out — and that is why the nesting pre-scan above
 	// is not the bound for this shape. The bound is that each node is walked
 	// once. Both forms must be ACCEPTED, promptly: they are legal schemas.
-	for _, form := range []struct{ name, schema string }{
-		{"nested", dagRefHeaderNested(26)},
-		{"flat-forward-ref", dagRefHeaderFlat(26)},
-	} {
-		wantTerminate(t, "NewReader/shared-node-header-schema/"+form.name, func() error {
-			r, err := NewReader(bytes.NewReader(ocfWith(form.schema, "null", 0, nil)))
-			if r != nil {
-				r.Close()
-			}
-			return err
-		})
+	// Driven at TWO depths. Without the memo this is 2^depth, so the pair is a
+	// 16x separation and a flat result is the bound working; one depth asks
+	// only whether that depth finishes, which a cost merely linear in it also
+	// answers. Measured flat: 456us at 26 and 317us at 30.
+	for _, levels := range headerDepths {
+		for _, form := range []struct{ name, schema string }{
+			{"nested", dagRefHeaderNested(levels)},
+			{"flat-forward-ref", dagRefHeaderFlat(levels)},
+		} {
+			wantTerminate(t, fmt.Sprintf("NewReader/shared-node-header-schema/%s/levels=%d", form.name, levels), func() error {
+				r, err := NewReader(bytes.NewReader(ocfWith(form.schema, "null", 0, nil)))
+				if r != nil {
+					r.Close()
+				}
+				return err
+			})
+		}
 	}
 	// The same DAG with the WIDTH axis turned up. Depth alone is only half of
 	// what a walk over this graph costs: a node is recomputed once per path
@@ -285,13 +291,19 @@ func TestDoSBattery_OCF_C1_Header(t *testing.T) {
 	// the product untested. Here the chain is cyclic (so nothing memoizes) and
 	// the record every path ends at is wide, which is the combination that
 	// makes the most-revisited node also the most expensive one.
-	wantTerminate(t, "NewReader/wide-cyclic-header-schema", func() error {
-		r, err := NewReader(bytes.NewReader(ocfWith(dagWideCyclicHeader(16, 8000), "null", 0, nil)))
-		if r != nil {
-			r.Close()
-		}
-		return err
-	})
+	// The WIDTH is driven at two values for the same reason: a per-node charge
+	// makes the cost allowance x width, a per-child charge makes it flat, and
+	// only a second value tells those apart. Measured 210ms at 8000 and 295ms
+	// at 16000 — the schema TEXT doubles while the walk does not.
+	for _, width := range headerWidths {
+		wantTerminate(t, fmt.Sprintf("NewReader/wide-cyclic-header-schema/width=%d", width), func() error {
+			r, err := NewReader(bytes.NewReader(ocfWith(dagWideCyclicHeader(16, width), "null", 0, nil)))
+			if r != nil {
+				r.Close()
+			}
+			return err
+		})
+	}
 
 	// The third factor: how many CONTAINERS the header points at one subtree.
 	// The reader derives a per-element minimum for every array/map in the
@@ -301,13 +313,18 @@ func TestDoSBattery_OCF_C1_Header(t *testing.T) {
 	// so a fresh walk per container — the product this whole battery guards — is
 	// what this rejects. This is the file-supplied form of the class, so it is
 	// the cell that fixes the severity.
-	wantTerminate(t, "NewReader/many-container-header-schema", func() error {
-		r, err := NewReader(bytes.NewReader(ocfWith(dagManyContainerHeader(220, 26), "null", 0, nil)))
-		if r != nil {
-			r.Close()
-		}
-		return err
-	})
+	// Container COUNT at two values: a fresh walk per container costs count x
+	// allowance, one shared walk is flat. Measured 142ms at 220 and 135ms at
+	// 440 — flat across a doubling of the count.
+	for _, narrays := range headerContainerCounts {
+		wantTerminate(t, fmt.Sprintf("NewReader/many-container-header-schema/n=%d", narrays), func() error {
+			r, err := NewReader(bytes.NewReader(ocfWith(dagManyContainerHeader(narrays, 26), "null", 0, nil)))
+			if r != nil {
+				r.Close()
+			}
+			return err
+		})
+	}
 
 	// The SAME third factor reached by the other construction path: when the
 	// cyclic type is DEFINED FIRST and fully wired at parse-build (inline plus a
@@ -317,14 +334,28 @@ func TestDoSBattery_OCF_C1_Header(t *testing.T) {
 	// full walk — 8.3 s at 32 containers off a 64 KB header before the build path
 	// shared the walk. The header is file-supplied, so this is the severity cell
 	// for the backward reaching-path.
-	wantTerminate(t, "NewReader/many-container-header-schema-backward", func() error {
-		r, err := NewReader(bytes.NewReader(ocfWith(dagManyContainerWiredHeader(220, 26), "null", 0, nil)))
-		if r != nil {
-			r.Close()
-		}
-		return err
-	})
+	for _, narrays := range headerContainerCounts {
+		wantTerminate(t, fmt.Sprintf("NewReader/many-container-header-schema-backward/n=%d", narrays), func() error {
+			r, err := NewReader(bytes.NewReader(ocfWith(dagManyContainerWiredHeader(narrays, 26), "null", 0, nil)))
+			if r != nil {
+				r.Close()
+			}
+			return err
+		})
+	}
 }
+
+// The magnitudes the header cost cells drive. They live here as named
+// vocabularies because this package cannot reach the avro package's costCells
+// registry — a test package boundary, not a choice — so the cross-package half
+// of that registry's guard checks these VALUES appear in this file instead.
+// Each is a pair for the same reason every cost cell now drives a pair: one
+// magnitude cannot tell a bound from a cost that is merely linear in it.
+var (
+	headerDepths          = []int{26, 30}
+	headerWidths          = []int{8000, 16000}
+	headerContainerCounts = []int{220, 440}
+)
 
 // dagManyContainerWiredHeader defines the cyclic type FIRST and fully wired at
 // build (each level nests the next inline and references it a second time by

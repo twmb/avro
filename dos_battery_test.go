@@ -88,10 +88,7 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 	// far past the raced ceiling. Never relax the UNRACED bound for a -race
 	// timeout — that would hide a real hang; this only widens what -race itself
 	// inflated.
-	budget := dosBudget
-	if raceEnabled {
-		budget = raceDosBudget
-	}
+	budget := raceInflated(dosBudget)
 	start := time.Now()
 	go func() {
 		var r result
@@ -118,13 +115,6 @@ func dosRun(t *testing.T, name string, fn func() error) (error, bool) {
 		return nil, false
 	}
 }
-
-// raceDosBudget is the -race ceiling for the wall-clock DoS cells. It sits above
-// the several-fold instrumentation inflation of the healthy bounded walks and
-// far below the raced cost of an unbounded one (tens of seconds unraced), so the
-// class separation the cells exist for survives -race while healthy cells do not
-// false-trip. Mirrors wantAcceptUnder's race relaxation for the dosRun harness.
-const raceDosBudget = 20 * time.Second
 
 // wantReject asserts fn rejects hostile input fast (non-nil error, no hang/panic).
 func wantReject(t *testing.T, name string, fn func() error) {
@@ -919,9 +909,7 @@ func TestDoSBattery_C8_DirectByteAPIs(t *testing.T) {
 // force for normal runs.
 func wantAcceptUnder(t *testing.T, name string, bound time.Duration, fn func() error) {
 	t.Helper()
-	if raceEnabled && bound < 3*time.Second {
-		bound = 3 * time.Second
-	}
+	bound = raceRelaxed(bound)
 	start := time.Now()
 	err := fn()
 	elapsed := time.Since(start)
@@ -957,26 +945,41 @@ func dosChainSchema(n int) string {
 }
 
 func TestDoSBattery_C9_CustomTypeParseCost(t *testing.T) {
-	chain := dosChainSchema(3000) // ~200KB of well-formed schema text
 	noMatch := CustomType{LogicalType: "no-such-logical", AvroType: "string"}
 	match := CustomType{AvroType: "long"} // matches every chain leaf
 
-	// Parse × non-matching CustomType: every stamp walk completes clean, the
-	// worst case for a memo (nothing to short-circuit on). Healthy cost is
-	// the plain-parse neighborhood (tens of ms); quadratic is ~500ms+ here
-	// and grows 4x per doubling.
-	wantAcceptUnder(t, "Parse/chain-noMatch-custom", 200*time.Millisecond, func() error {
-		_, err := Parse(chain, noMatch)
-		return err
-	})
+	// The chain LENGTH is the factor, and it is driven at two values read from
+	// the registry. One value cannot tell the memo from its absence: the cost
+	// this bound caps is quadratic without the memo, so a single length only
+	// asks whether that length finishes, and a bound generous enough for the
+	// linear cost at 3000 is generous enough for the QUADRATIC cost at some
+	// smaller length. Doubling separates them — linear doubles, quadratic
+	// quadruples — and the per-length ceiling scales with the length so the
+	// comparison is against the right neighbourhood at both.
+	//
+	// Measured linear at both, on both arms: 28ms and 25ms at 3000, 55ms and
+	// 58ms at 6000.
+	for _, n := range costFactorValues(t, "TestDoSBattery_C9_CustomTypeParseCost") {
+		chain := dosChainSchema(n) // ~60n bytes of well-formed schema text
+		bound := time.Duration(n/3000) * 200 * time.Millisecond
 
-	// Parse × MATCHING CustomType: walks short-circuit at the chain's leaf,
-	// which without a memo is still O(n) per walk = O(n^2) total. The memo
-	// must bound the match case too, not only the clean case.
-	wantAcceptUnder(t, "Parse/chain-matching-custom", 200*time.Millisecond, func() error {
-		_, err := Parse(chain, match)
-		return err
-	})
+		// Parse × non-matching CustomType: every stamp walk completes clean,
+		// the worst case for a memo (nothing to short-circuit on). Healthy
+		// cost is the plain-parse neighborhood (tens of ms); quadratic is
+		// ~500ms+ at 3000 and grows 4x per doubling.
+		wantAcceptUnder(t, fmt.Sprintf("Parse/chain-noMatch-custom/n=%d", n), bound, func() error {
+			_, err := Parse(chain, noMatch)
+			return err
+		})
+
+		// Parse × MATCHING CustomType: walks short-circuit at the chain's
+		// leaf, which without a memo is still O(n) per walk = O(n^2) total.
+		// The memo must bound the match case too, not only the clean case.
+		wantAcceptUnder(t, fmt.Sprintf("Parse/chain-matching-custom/n=%d", n), bound, func() error {
+			_, err := Parse(chain, match)
+			return err
+		})
+	}
 
 	// SchemaCache × many references to a large inherited type: the boundary
 	// guard and the overlay completion each walk the inherited subtree per
