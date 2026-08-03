@@ -12586,3 +12586,61 @@ answer; its fan x levels sweep is over SHAPES, not magnitudes).
 
 Nets: full suite, fastavro 1.12.2, and -race — all green, 0 data races. Java
 un-netted (no JVM).
+
+**Verbatim ledger text** (compressed in AUDIT_CORE §Round ledger on 2026-08-02
+when that file reached its size bound):
+
+- 2026-08-02 · 76acff6 (START head — 76acff6..HEAD quarantines this round's
+  commits) · FIX · **the measured-bound rule applied to the cost cells it was
+  never applied to.** Stated for the walk CONSTRUCTION sites, the wall-clock
+  cells kept one magnitude each and stayed green — a requirement whose
+  guard passes its known violators, the shape the rule exists to catch. Measured
+  before designing: every factor is FLAT with a correct bound (width 80→8000
+  grows the schema TEXT 65x and the parse 1.4x, the walk dominating and the
+  allowance capping it), so all took a second value and none needed the
+  exemption arm. **The derivation found SEVEN cells, not five** —
+  `SharedSchemaNodeWalkedOnce` (its NAME reads like a value oracle and the hand
+  pass believed it; caught by the cross-check, an exemption being illegal on a
+  cell that takes the wall-clock harness) and
+  `TestDoSBattery_C6_MetadataWalk` (missed by hand entirely). **My first
+  derivation was wrong in BOTH directions** — a generator NAMED IN A COMMENT
+  counted as a call, one passed as a function VALUE did not, and bodies ran to
+  the next test rather than the closing brace — fixed with a position-preserving
+  blanker plus brace matching.
+  **A cell named for a bound it does not measure:** `MetadataWalkChargesPerChild`
+  stayed GREEN with `takeNode` disabled entirely, because a PARSED schema is
+  deduped before that walk, so no parse-driven cell can red the node budget; it
+  reds on the MIN-BYTES charge instead, `SchemaNode.Schema` ending in a
+  re-`Parse`. Renamed `MetadataSurfacesBoundedByWidth`, the node budget's three
+  real cells named in its row and in `toJSONWalk`'s. The parse moved OUT of the
+  timed region, and `floor` is now the largest cost the BOUND permits — one
+  exhausted allowance where a shape is un-memoizable: those climb 1.9ms→120ms,
+  which is the bound engaging, not scaling. Five neuters, five distinct red sets,
+  each ASSERTED APPLIED. Full + fastavro + `-race` green; Java un-netted.
+  Narrative: archive (2026-08-02 #65).
+
+## Distillation archive (2026-08-02 #66) — the -race-gate FULL round ledger line, verbatim
+
+- 2026-08-02 · 8db5133 · FULL, read-only · **0 behavioral; 4 net/doc findings,
+  one of them RED right now: the `-race` net fails.** `wantAcceptUnder`'s race
+  relaxation is a 3s FLOOR, not a multiplier, so a cell whose NORMAL bound was
+  deliberately raised gets the least relative headroom — `breadthParseBound`
+  (1500ms, cells costing ~300ms) lands at 2x while every 500ms cell gets 6x.
+  `TestDoSBattery_C10a_UnionTagBreadth` reds at 3.50/3.54/4.92s, reproducible in
+  isolation; all three tiers measured LINEAR under -race across a doubling
+  (x1.63/x1.24/x1.99), so it is the ceiling, not a complexity regression.
+  **The quarantine's own guard passes its known violators**: the cost-cell
+  derivation reads generators from ONE file behind a `dag|nContainers` name
+  prefix, `takesHarness` omits `wantAcceptUnder(`, and `censusSourceFiles` skips
+  every `_test.go` — so C9 and the whole ocf DoS battery (five single-magnitude
+  cells, two of them the file-supplied SEVERITY cells) are invisible. Drove all
+  six anyway: flat/linear, no hidden cost. **G3's ruling rests on a false
+  premise** — the memo amortizes `typeFieldMapping` (952ms→3µs) and NOT
+  `SchemaFor`, which re-pays ~0.9s on EVERY call at depth 18, so its closing cell
+  needs CALL COUNT as a second factor. Fronts: statement-coverage inverse density
+  (a new metric — 273 unexercised blocks, every functional arm in the wire paths
+  probed and correct); the stdlib-JSON differential (3 divergence classes, all
+  documented — and it caught a conformance comment claiming a lenience that no
+  longer exists); the stray-shape question's THREE implementations (accept-sets
+  agree, empty collections included). Base + fastavro green; **-race RED**;
+  Java un-netted.
