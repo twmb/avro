@@ -570,6 +570,13 @@ func (s *Schema) Canonical() []byte {
 // [SingleObjectFingerprint] reads it back out, and [Schema.DecodeSingleObject]
 // verifies it.
 func (s *Schema) Fingerprint(h hash.Hash) []byte {
+	// Reset on the way IN, so the digest is a function of the schema and the
+	// algorithm alone: neither a hash already used for an earlier fingerprint
+	// nor one the caller wrote into can reach the answer. Resetting on the way
+	// out would cover only the first of those, and it would clear the state
+	// callers read back — taking Sum64 off the hash they passed is a
+	// supported way to get the CRC-64-AVRO value as a number.
+	h.Reset()
 	h.Write(s.Canonical())
 	return h.Sum(nil)
 }
