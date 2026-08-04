@@ -237,6 +237,14 @@ func (optSchemaOpts) writerOpt() {}
 // codec that is offered and declined as well, which makes the rule the same one
 // everywhere instead of one that depends on whether the offer was taken.
 //
+// A nil codec is ignored, on every constructor, and in both of the spellings Go
+// gives nil: WithCodec(nil), and a non-nil Codec holding a nil pointer — what
+// WithCodec(newMyCodec()) produces when newMyCodec has a concrete return type
+// and returns nil. Such an offer is never named, never adopted, and never
+// closed; the constructor behaves as though it were not written. It is still a
+// caller mistake, and if it is the ONLY offer for a codec the file names, the
+// constructor reports an unknown codec rather than silently reading nothing.
+//
 // For reader-side decompression bounding of a supplied codec, see
 // [WithMaxDecompressedBlockBytes]: it reaches any supplied codec implementing
 // [BoundedDecompressor] (every built-in does, including one wrapped by
@@ -536,9 +544,21 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (_ *Writer, err e
 	// codecs stay in supplied with adopted pointing past them, so the deferred
 	// sweep can tell "dropped" from "taken" instead of watching one field be
 	// overwritten.
-	if len(supplied) > 0 {
-		adopted = len(supplied) - 1
-		wr.codec = supplied[adopted]
+	//
+	// Last NON-NIL wins, because this is the writer's half of the same question
+	// resolveCodec answers by name: a nil offer is not a codec, so it cannot be
+	// the one that wins. Adopting it would install a nil in wr.codec and defer
+	// the crash to writeHeader's Name() call — and since the reader side skips
+	// nils in its scan, WithCodec(nil) would then be ignored by NewReader and
+	// fatal to NewWriter, which is the split this predicate exists to close. All
+	// offers nil leaves adopted at -1 and wr.codec at nullCodec, exactly as if
+	// WithCodec had not been written.
+	for i := len(supplied) - 1; i >= 0; i-- {
+		if !isNilCodec(supplied[i]) {
+			adopted = i
+			wr.codec = supplied[i]
+			break
+		}
 	}
 	// Validating reserved metadata keys after the option loop rather than
 	// inside it keeps the rejection independent of where WithMetadata sits
@@ -1532,6 +1552,17 @@ func (c *zstdCodec) Close() error {
 // from this one return rather than working it out again.
 func resolveCodec(name string, custom []Codec) (Codec, int, error) {
 	for i, c := range custom {
+		// A nil offer is skipped rather than asked. The scan is what DECIDES
+		// adoption, so it runs over offers that are about to be declined, and
+		// Name() on a nil codec is a nil-method call: without this, an offer
+		// that could not possibly be taken still crashes the constructor.
+		// [NewWriter] chooses by position instead of by name and so never asked,
+		// which is how one spelling of one option came to work on one
+		// constructor and SIGSEGV on the other two. Both sides now ask
+		// isNilCodec, so "what is a nil offer" has one answer.
+		if isNilCodec(c) {
+			continue
+		}
 		if c.Name() == name {
 			return c, i, nil
 		}
@@ -1580,7 +1611,12 @@ func resolveCodec(name string, custom []Codec) (Codec, int, error) {
 //     documented to be idempotent, and a caller's codec need not be.
 //
 // A nil codec — WithCodec(nil) — is never closed: calling a method on it would
-// panic, and it holds nothing to release.
+// panic, and it holds nothing to release. Nil is asked through [isNilCodec]
+// because the interface being non-nil does not mean the codec is: an interface
+// holding a nil *T passes c != nil and then panics inside Close. Nils are also
+// kept out of the repeat bookkeeping below rather than merely left unclosed —
+// recording a nil of an UNCOMPARABLE type would put that TYPE in the seen list
+// and make a later REAL codec of the same type read as a repeat, leaking it.
 //
 // Close errors are dropped: this runs on paths that already have an outcome to
 // report (a constructor error, or a Writer/Reader the caller is about to use),
@@ -1628,17 +1664,65 @@ func releaseUnadopted(supplied []Codec, adopted int) {
 
 	// The adopted codec is accounted for FIRST and never closed, so any later
 	// offer of that same codec is recognized as a repeat and left open too.
-	if adopted >= 0 && supplied[adopted] != nil {
+	//
+	// The nil test here is currently UNREACHABLE and is kept deliberately: both
+	// choosers already refuse to adopt a nil (resolveCodec skips them in its
+	// scan, NewWriter takes the last NON-nil), so nothing can hand this a nil
+	// adopted index today. Neutering it alone is therefore byte-identical —
+	// measured, not assumed. It becomes operative the moment a chooser stops
+	// filtering: with both of them neutered so a nil CAN be adopted, restoring
+	// the != nil spelling here reds exactly the cells where an uncomparable nil
+	// is adopted alongside a real codec of that same type, because recording the
+	// nil puts its TYPE in the seen list and the real codec then reads as a
+	// repeat and is silently never closed. That is the combination this line
+	// buys, and it is why the check is not simplified away.
+	if adopted >= 0 && !isNilCodec(supplied[adopted]) {
 		seen(supplied[adopted])
 	}
 	for i, c := range supplied {
-		if c == nil || i == adopted {
+		if isNilCodec(c) || i == adopted {
 			continue
 		}
 		if !seen(c) {
 			c.Close()
 		}
 	}
+}
+
+// isNilCodec reports whether c holds nothing to call a method on. Nil has TWO
+// spellings in Go and only one of them is c == nil: WithCodec(nil) stores a nil
+// interface, while a constructor with a concrete return type that yields nil —
+// func newCodec() *myCodec, the ordinary typed-nil shape — stores a non-nil
+// interface wrapping a nil pointer. The second passes c != nil and panics at the
+// first method call, so the interface test alone is not the question anyone
+// meant to ask.
+//
+// This is the same question [avro.Schema.Decode] asks of its target and answers
+// with reflect (Kind plus IsNil) rather than with ==; the difference is that a
+// decode target must be a pointer while a Codec may legitimately be any kind, so
+// the nilable kinds are enumerated instead of pointer being required. The kinds
+// listed are exactly those reflect.Value.IsNil accepts; Interface is not among
+// them because reflect.ValueOf resolves the interface to its dynamic value, so a
+// Kind of Interface cannot occur here. Every other kind — a struct codec like
+// nullCodec{}, a string- or int-backed one — has no nil value and is never nil.
+//
+// Every site that reaches into a caller's offers asks this one function: both
+// choosers — resolveCodec before it reads a name, NewWriter before it takes the
+// last one — and releaseUnadopted before it closes. That is the point. A
+// predicate answered in one place cannot drift between the constructor that
+// chooses by name and the one that chooses by position, which is exactly the
+// drift that made WithCodec(nil) a supported no-op on one and a crash on the
+// other two.
+func isNilCodec(c Codec) bool {
+	if c == nil {
+		return true
+	}
+	switch v := reflect.ValueOf(c); v.Kind() {
+	case reflect.Pointer, reflect.UnsafePointer, reflect.Map,
+		reflect.Slice, reflect.Func, reflect.Chan:
+		return v.IsNil()
+	}
+	return false
 }
 
 // truncForError caps a wire-derived string at 80 chars for inclusion in

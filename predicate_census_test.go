@@ -941,6 +941,44 @@ var censusRegistry = []censusQuestion{
 			}},
 		},
 	},
+	{
+		id:       "Q24",
+		question: "Is this caller-supplied ocf.Codec nil — i.e. is there nothing here to call a method on?",
+		authority: "ocf.isNilCodec. The external authority is the Go language itself: an interface holding a nil " +
+			"pointer is not equal to nil, so `c == nil` answers a NARROWER question than the one every caller " +
+			"means. The same distinction is already answered correctly in this package by Schema.Decode's target " +
+			"guard (deser.go), which asks reflect for Kind plus IsNil rather than comparing the interface.",
+		answerers: []censusAnswerer{
+			{
+				repr: "the offer chosen BY NAME (both reader-side constructors)",
+				site: "resolveCodec's scan", file: "ocf/ocf.go",
+				note: "the scan is what DECIDES adoption, so it runs over offers about to be declined; asking " +
+					"Name() of a nil there crashed a constructor on an offer it was never going to take.",
+			},
+			{
+				repr: "the offer chosen BY POSITION (NewWriter)",
+				site: "NewWriter's last-non-nil adoption loop", file: "ocf/ocf.go",
+				note: "the writer has no header to match against, so it answers the same question positionally. " +
+					"This is the answerer whose ABSENCE was the whole defect class: the two choosers disagreeing " +
+					"about what a nil offer is made one option work on one constructor and SIGSEGV on the others.",
+			},
+			{
+				repr: "the offers NOT chosen, at release", site: "releaseUnadopted's loop", file: "ocf/ocf.go",
+			},
+			{
+				repr: "the adopted offer, at release bookkeeping", site: "releaseUnadopted's pre-marking", file: "ocf/ocf.go",
+				note: "unreachable while both choosers filter, and kept deliberately — see the comment at the " +
+					"site, which records the measured combination that makes it operative.",
+			},
+		},
+		tells: []censusTell{
+			// Every consult of the predicate. A site that answers this question
+			// by hand instead shows up as a count that did not rise.
+			{pattern: `isNilCodec(`, counts: map[string]int{
+				"ocf/ocf.go": 5, // 4 consults + the declaration
+			}},
+		},
+	},
 }
 
 // censusOutstanding is the enumeration's OPEN end. A question lands here the
