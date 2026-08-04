@@ -89,6 +89,8 @@ import (
 	"hash/crc32"
 	"io"
 	"math"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 
@@ -217,13 +219,23 @@ func (optSchemaOpts) writerOpt() {}
 // registered for reading. A custom codec whose name matches a built-in
 // overrides it.
 //
-// The codec's Close method is called by [Writer.Close] and [Reader.Close] —
-// and by a constructor that takes the codec and then fails, since it returns no
+// Passing a codec hands it over. Whatever happens next, it is closed exactly
+// once: by [Writer.Close] or [Reader.Close] when the constructor returns a
+// usable one; by the constructor itself when it fails, since it returns no
 // Writer or Reader for the caller to close and the codec is often built inline
-// in the call. [NewWriter], [NewAppendWriter] and [NewReader] all release it
-// that way, so a codec handed to a failed constructor is closed exactly once.
-// Codecs that should not be closed (e.g. shared across multiple writers) should
-// return nil from Close, or be wrapped in [NopCloser].
+// in the call; and by the constructor when it succeeds without using the codec
+// at all. That last case is easy to reach and gives no sign it happened —
+// [NewReader] and [NewAppendWriter] take a supplied codec only when its Name
+// matches the header's avro.codec, and NewWriter takes only the last WithCodec
+// written — so an offer that is declined is released rather than dropped.
+//
+// The consequence for a codec used more than once: a caller that shares one
+// codec across several writers, readers, or files must give it a Close that
+// returns nil, or wrap it in [NopCloser]. That was already true — an adopted
+// codec is closed by [Writer.Close] and [Reader.Close], so a shared codec passed
+// bare was already closed out from under the next user — and it now holds for a
+// codec that is offered and declined as well, which makes the rule the same one
+// everywhere instead of one that depends on whether the offer was taken.
 //
 // For reader-side decompression bounding of a supplied codec, see
 // [WithMaxDecompressedBlockBytes]: it reaches any supplied codec implementing
@@ -489,10 +501,21 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (_ *Writer, err e
 		}
 	}()
 
+	// The other half of the same rule: WithCodec written more than once adopts
+	// the last and drops the rest, and a dropped codec has no owner at all — see
+	// releaseUnadopted. Registered before the loop for the same reason the defer
+	// above is: the closure reads both variables when it runs, so it covers
+	// whatever the loop collected however the loop exits. An error return added
+	// inside the loop leaves adopted at -1, which releases every codec collected
+	// so far rather than none of them.
+	var supplied []Codec
+	adopted := -1
+	defer func() { releaseUnadopted(supplied, adopted) }()
+
 	for _, o := range opts {
 		switch o := o.(type) {
 		case optCodec:
-			wr.codec = o.c
+			supplied = append(supplied, o.c)
 		case optBlockCount:
 			wr.maxCount = o.n
 		case optBlockBytes:
@@ -507,6 +530,15 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (_ *Writer, err e
 		case optSchema:
 			wr.schemaJSON = o.s
 		}
+	}
+	// Last WithCodec wins, as it always has. Adopting after the loop rather than
+	// inside it is what makes the supersede case observable: the superseded
+	// codecs stay in supplied with adopted pointing past them, so the deferred
+	// sweep can tell "dropped" from "taken" instead of watching one field be
+	// overwritten.
+	if len(supplied) > 0 {
+		adopted = len(supplied) - 1
+		wr.codec = supplied[adopted]
 	}
 	// Validating reserved metadata keys after the option loop rather than
 	// inside it keeps the rejection independent of where WithMetadata sits
@@ -785,9 +817,19 @@ func (w *Writer) Reset(dst io.Writer) error {
 // metadata in the file.) Any remaining options are likewise ignored.
 func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error) {
 	var schemaOpts []avro.SchemaOpt
+	var customCodecs []Codec
+	adopted := -1
+	// The header names ONE codec, so every other supplied codec is an offer this
+	// constructor declines and nothing else will ever close — see
+	// releaseUnadopted. Collected and deferred before the header read so a
+	// failure there, which adopts nothing, still releases all of them.
+	defer func() { releaseUnadopted(customCodecs, adopted) }()
 	for _, o := range opts {
-		if o, ok := o.(optSchemaOpts); ok {
+		switch o := o.(type) {
+		case optSchemaOpts:
 			schemaOpts = append(schemaOpts, o...)
+		case optCodec:
+			customCodecs = append(customCodecs, o.c)
 		}
 	}
 	br := bufio.NewReader(&checkedReader{r: rws})
@@ -800,15 +842,10 @@ func NewAppendWriter(rws io.ReadWriteSeeker, opts ...WriterOpt) (*Writer, error)
 	if c, ok := meta["avro.codec"]; ok {
 		codecName = string(c)
 	}
-	var customCodecs []Codec
-	for _, o := range opts {
-		if o, ok := o.(optCodec); ok {
-			customCodecs = append(customCodecs, o.c)
-		}
-	}
 	// The append-writer compresses new data and never decompresses untrusted
 	// blocks, so the read-side decompression cap does not apply here.
-	codec, err := resolveCodec(codecName, customCodecs)
+	var codec Codec
+	codec, adopted, err = resolveCodec(codecName, customCodecs)
 	if err != nil {
 		return nil, err
 	}
@@ -976,6 +1013,14 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 	var maxBlockBytes int64
 	var maxDecompressed int64
 	var schemaOpts []avro.SchemaOpt
+	adopted := -1
+	// The header names ONE codec; every other supplied codec is an offer this
+	// constructor declines and nothing else will ever close — see
+	// releaseUnadopted. Registered before the option loop so it covers whatever
+	// the loop collected however the constructor exits, including the arms that
+	// return before a codec has been chosen at all (adopted is still -1 there, so
+	// all of them are released).
+	defer func() { releaseUnadopted(customCodecs, adopted) }()
 	for _, o := range opts {
 		switch o := o.(type) {
 		case optCodec:
@@ -1013,7 +1058,8 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 	if c, ok := meta["avro.codec"]; ok {
 		codecName = string(c)
 	}
-	codec, err := resolveCodec(codecName, customCodecs)
+	var codec Codec
+	codec, adopted, err = resolveCodec(codecName, customCodecs)
 	if err != nil {
 		return nil, err
 	}
@@ -1471,31 +1517,128 @@ func (c *zstdCodec) Close() error {
 	return nil
 }
 
-// resolveCodec returns the codec named in the file header. A custom codec
-// matched by name is returned as-is. The per-block decompression bound
-// (WithMaxDecompressedBlockBytes) is NOT injected here: the reader passes it to
-// the codec at decode time via [BoundedDecompressor.DecompressBounded], which
-// every built-in implements — so the bound governs name-resolved and
+// resolveCodec returns the codec named in the file header, along with the index
+// into custom that supplied it, or -1 when the name resolved to a built-in. A
+// custom codec matched by name is returned as-is. The per-block decompression
+// bound (WithMaxDecompressedBlockBytes) is NOT injected here: the reader passes
+// it to the codec at decode time via [BoundedDecompressor.DecompressBounded],
+// which every built-in implements — so the bound governs name-resolved and
 // WithCodec-supplied codecs uniformly, including a codec instance constructed
 // before NewReader. A custom codec that does not implement BoundedDecompressor
 // decompresses unbounded.
-func resolveCodec(name string, custom []Codec) (Codec, error) {
-	for _, c := range custom {
+//
+// The index is what lets one caller answer "which supplied codecs went unused"
+// (releaseUnadopted); every constructor that offers codecs here gets that answer
+// from this one return rather than working it out again.
+func resolveCodec(name string, custom []Codec) (Codec, int, error) {
+	for i, c := range custom {
 		if c.Name() == name {
-			return c, nil
+			return c, i, nil
 		}
 	}
 	switch name {
 	case "null":
-		return nullCodec{}, nil
+		return nullCodec{}, -1, nil
 	case "deflate":
-		return deflateCodec{level: flate.DefaultCompression}, nil
+		return deflateCodec{level: flate.DefaultCompression}, -1, nil
 	case "snappy":
-		return snappyCodec{}, nil
+		return snappyCodec{}, -1, nil
 	case "zstandard":
-		return ZstdCodec(nil, nil)
+		c, err := ZstdCodec(nil, nil)
+		return c, -1, err
 	}
-	return nil, fmt.Errorf("ocf: unknown codec %q", truncForError(name))
+	return nil, -1, fmt.Errorf("ocf: unknown codec %q", truncForError(name))
+}
+
+// releaseUnadopted closes every codec the caller supplied that the constructor
+// did not adopt. [WithCodec] OFFERS a codec; at most one offer is taken — the
+// first whose Name matches the header's avro.codec for the two reader-side
+// constructors, the last one written for [NewWriter] — so any other supplied
+// codec is dropped.
+//
+// A dropped codec has no owner. The constructor SUCCEEDS, so nothing signals the
+// caller that their codec went unused, and the documented inline form —
+// WithCodec(MustZstdCodec(nil, nil)) — leaves no handle to close it with. That is
+// the same argument that makes a failing constructor release the codec it DID
+// adopt; this is the other half of it, and stating it in one function is what
+// keeps a constructor added later from re-deriving it.
+//
+// adopted is the INDEX of the offer that was taken, or -1 when none was — a
+// built-in resolved by name, or a constructor that failed before it chose, in
+// which case every supplied codec is released. An index rather than a codec
+// value because the position is what the choosers actually decide; but position
+// alone is not enough to decide whether to CLOSE, because the same codec can
+// occupy more than one position. What gets released is therefore each DISTINCT
+// supplied codec other than the adopted one, exactly once:
+//
+//   - Skipping the adopted codec by identity, not just by index, is what keeps
+//     WithCodec(c), WithCodec(c) from closing c and then handing back a Writer
+//     that compresses with it. Same on the reader side, where two offers of one
+//     codec can straddle the name match.
+//   - Skipping an earlier identical offer keeps a codec from being closed twice.
+//     [Codec.Close] is documented to release the codec's resources; it is not
+//     documented to be idempotent, and a caller's codec need not be.
+//
+// A nil codec — WithCodec(nil) — is never closed: calling a method on it would
+// panic, and it holds nothing to release.
+//
+// Close errors are dropped: this runs on paths that already have an outcome to
+// report (a constructor error, or a Writer/Reader the caller is about to use),
+// and a codec whose Close fails is no more usable than one whose Close was never
+// called.
+//
+// Recognizing repeats is a set-membership question, so a comparable codec goes
+// in a map and costs one lookup — the map's key equality IS the == this would
+// otherwise write by hand. A codec whose dynamic type is UNCOMPARABLE (a struct
+// with a map, slice, or func field) cannot be a key at all, and comparing two of
+// them with == panics rather than answering, so those are tracked separately and
+// matched by TYPE: two values of one uncomparable type cannot be told apart by
+// anything, so identical types answer "same codec". That answer is conservative
+// in the safe direction — "same" means the caller SKIPS a Close, and a skipped
+// Close leaks where a wrong Close hands back a Writer or Reader built on a
+// released codec.
+//
+// The split is on reflect.Type.Comparable, a property of the type, not a guess
+// about how many options a caller writes; the ordinary case (every built-in, and
+// any codec held by pointer) stays linear.
+func releaseUnadopted(supplied []Codec, adopted int) {
+	var decided map[Codec]bool      // comparable codecs already accounted for
+	var uncomparable []reflect.Type // the rest, tracked by type
+
+	// seen reports whether c has already been accounted for, recording it if
+	// not, so each distinct codec is decided exactly once.
+	seen := func(c Codec) bool {
+		t := reflect.TypeOf(c)
+		if t.Comparable() {
+			if decided[c] {
+				return true
+			}
+			if decided == nil {
+				decided = make(map[Codec]bool, len(supplied))
+			}
+			decided[c] = true
+			return false
+		}
+		if slices.Contains(uncomparable, t) {
+			return true
+		}
+		uncomparable = append(uncomparable, t)
+		return false
+	}
+
+	// The adopted codec is accounted for FIRST and never closed, so any later
+	// offer of that same codec is recognized as a repeat and left open too.
+	if adopted >= 0 && supplied[adopted] != nil {
+		seen(supplied[adopted])
+	}
+	for i, c := range supplied {
+		if c == nil || i == adopted {
+			continue
+		}
+		if !seen(c) {
+			c.Close()
+		}
+	}
 }
 
 // truncForError caps a wire-derived string at 80 chars for inclusion in

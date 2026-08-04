@@ -2723,12 +2723,20 @@ func TestWithSchema(t *testing.T) {
 func TestResolveCodecCustomOverridesBuiltin(t *testing.T) {
 	// A custom codec with a built-in name should override the built-in.
 	custom := &testCodec{name: "zstandard"}
-	codec, err := resolveCodec("zstandard", []Codec{custom})
+	codec, adopted, err := resolveCodec("zstandard", []Codec{custom})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if codec != Codec(custom) {
 		t.Fatal("expected custom codec to override built-in zstandard")
+	}
+	// The index identifies WHICH offer was taken, so the caller can release the
+	// ones that were not; a built-in resolved by name reports -1.
+	if adopted != 0 {
+		t.Fatalf("adopted index = %d, want 0 (the sole supplied codec)", adopted)
+	}
+	if _, adopted, err := resolveCodec("deflate", []Codec{custom}); err != nil || adopted != -1 {
+		t.Fatalf("built-in resolution: adopted = %d (want -1), err = %v", adopted, err)
 	}
 }
 
