@@ -3574,13 +3574,13 @@ func TestRegression_EmptyBlockMidStreamSkipped(t *testing.T) {
 // regression tests below.
 type leakDetectCodec struct {
 	name   string
-	closed bool
+	closes int
 }
 
 func (c *leakDetectCodec) Name() string                          { return c.name }
 func (c *leakDetectCodec) Compress(src []byte) ([]byte, error)   { return src, nil }
 func (c *leakDetectCodec) Decompress(src []byte) ([]byte, error) { return src, nil }
-func (c *leakDetectCodec) Close() error                          { c.closed = true; return nil }
+func (c *leakDetectCodec) Close() error                          { c.closes++; return nil }
 
 // failAfterNWrites is an io.Writer that succeeds for the first N
 // Write calls and then returns an error. Used to drive a Writer past
@@ -3617,7 +3617,7 @@ func TestRegression_OCFWriterCloseClosesCodecWhenPoisoned(t *testing.T) {
 	// which writes to the now-failing writer and poisons w.err.
 	_ = w.Encode(int64(1))
 	_ = w.Close()
-	if !codec.closed {
+	if codec.closes == 0 {
 		t.Fatal("Writer.Close() did not call codec.Close() after the writer was poisoned")
 	}
 }
@@ -3650,7 +3650,7 @@ func TestRegression_OCFNewReaderClosesCodecOnReaderSchemaFnError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from reader-schema func")
 	}
-	if !codec.closed {
+	if codec.closes == 0 {
 		t.Fatal("NewReader returned error without closing the codec")
 	}
 }
@@ -3681,7 +3681,7 @@ func TestRegression_OCFNewReaderClosesCodecOnResolveError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Resolve error")
 	}
-	if !codec.closed {
+	if codec.closes == 0 {
 		t.Fatal("NewReader returned Resolve error without closing the codec")
 	}
 }

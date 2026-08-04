@@ -138,9 +138,10 @@ type BoundedDecompressor interface {
 
 // NopCloser returns a Codec that wraps c but has a no-op Close method. This
 // is useful when sharing a single codec across multiple writers or readers
-// so that individual [Writer.Close] or [Reader.Close] calls do not release
-// shared resources. The caller is responsible for closing the underlying
-// codec when it is no longer needed.
+// so that an individual [Writer.Close] or [Reader.Close] — or a constructor
+// that fails and releases the codec it was handed — does not release shared
+// resources. The caller is responsible for closing the underlying codec when
+// it is no longer needed.
 //
 // If c implements [BoundedDecompressor], so does the returned Codec (the
 // reader's decompression bound is forwarded to c), so wrapping a built-in codec
@@ -216,9 +217,13 @@ func (optSchemaOpts) writerOpt() {}
 // registered for reading. A custom codec whose name matches a built-in
 // overrides it.
 //
-// The codec's Close method is called by [Writer.Close] and [Reader.Close].
-// Codecs that should not be closed (e.g. shared across multiple writers)
-// should return nil from Close.
+// The codec's Close method is called by [Writer.Close] and [Reader.Close] —
+// and by a constructor that takes the codec and then fails, since it returns no
+// Writer or Reader for the caller to close and the codec is often built inline
+// in the call. [NewWriter], [NewAppendWriter] and [NewReader] all release it
+// that way, so a codec handed to a failed constructor is closed exactly once.
+// Codecs that should not be closed (e.g. shared across multiple writers) should
+// return nil from Close, or be wrapped in [NopCloser].
 //
 // For reader-side decompression bounding of a supplied codec, see
 // [WithMaxDecompressedBlockBytes]: it reaches any supplied codec implementing
@@ -461,12 +466,28 @@ func (wr *Writer) Schema() *avro.Schema { return wr.schema }
 
 // NewWriter creates a Writer that writes an OCF to w. The file header is
 // written immediately.
-func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) {
+func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (_ *Writer, err error) {
 	wr := &Writer{
 		w:      w,
 		schema: s,
 		codec:  nullCodec{},
 	}
+	// Any error return from here on must release whatever codec wr holds. A
+	// failing constructor returns no Writer, so there is nothing left for the
+	// caller to Close, and the codec is commonly built inline in the call —
+	// WithCodec(MustZstdCodec(nil, nil)) — leaving no handle either. Named
+	// return so the deferred check sees the final err value; NewReader carries
+	// the same defer for the same reason. Registered BEFORE the option loop
+	// rather than after it: the closure reads wr.codec when it runs, so this
+	// covers the codec whenever the loop adopts it, and a future error return
+	// added inside the loop is guarded without anyone having to notice. Until
+	// WithCodec is seen wr.codec is nullCodec, whose Close is a no-op. Callers
+	// sharing one codec across writers wrap it in NopCloser, likewise a no-op.
+	defer func() {
+		if err != nil {
+			wr.codec.Close()
+		}
+	}()
 
 	for _, o := range opts {
 		switch o := o.(type) {
@@ -478,9 +499,6 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) 
 			wr.maxBytes = o.n
 		case optMetadata:
 			for k, v := range o.m {
-				if strings.HasPrefix(k, "avro.") {
-					return nil, fmt.Errorf("ocf: metadata key %q is reserved (avro.* namespace)", truncForError(k))
-				}
 				wr.userMeta = append(wr.userMeta, kv{k, v})
 			}
 		case optSyncMarker:
@@ -490,6 +508,17 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (*Writer, error) 
 			wr.schemaJSON = o.s
 		}
 	}
+	// Validating reserved metadata keys after the option loop rather than
+	// inside it keeps the rejection independent of where WithMetadata sits
+	// among the options: rejecting mid-loop returned before a later WithCodec
+	// had been adopted and after an earlier one had, so one spelling released
+	// the codec and the other never took it. Collect first, then check.
+	for _, e := range wr.userMeta {
+		if strings.HasPrefix(e.key, "avro.") {
+			return nil, fmt.Errorf("ocf: metadata key %q is reserved (avro.* namespace)", truncForError(e.key))
+		}
+	}
+
 	if wr.maxCount < 0 {
 		wr.maxCount = 0
 	}
