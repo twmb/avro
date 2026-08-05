@@ -4968,12 +4968,13 @@ type raceRelaxation struct {
 // The set is DERIVED from source below, not from this list; this list is what
 // the derivation is checked against. A consult that appears in no row fails,
 // and a row naming a file that no longer consults fails.
+// Rows are per FILE, and the test-file consolidation made some files hold
+// several of these sections. The `// ---------- x ----------` banner still
+// names which original file a consult sits in, so a row that covers more than
+// one says so and splits its count; the guard's arithmetic is unchanged.
 var raceRelaxations = []raceRelaxation{
-	{file: "race_bounds_test.go", sites: 3, kind: "authority",
-		why: "raceRelaxed and raceInflated — the two forms of the rule and the only place either number appears — plus the invariant that asserts neither ever tightens"},
-
-	{file: "export_test.go", sites: 1, kind: "authority",
-		why: "the bridge READS the predicate to hand it to package avro_test, so the two packages share one build-tagged mechanism instead of declaring one each"},
+	{file: "internal_nets_test.go", sites: 4, kind: "authority",
+		why: "two authority sections in one file. race_bounds (3): raceRelaxed and raceInflated — the two forms of the rule and the only place either number appears — plus the invariant that asserts neither ever tightens. export (1): the bridge READS the predicate to hand it to package avro_test, so the two packages share one build-tagged mechanism instead of declaring one each"},
 
 	{file: "conformance_test.go", sites: 3, kind: "authority+skip",
 		why: "isRaceEnabled forwards the bridged value (1); the two remaining consults SKIP their budgets rather than relax them, each for a reason recorded at the site. Every wall-clock CEILING in this file asks raceRelaxed — three of them used to compute their own, with three different multipliers"},
@@ -4981,8 +4982,8 @@ var raceRelaxations = []raceRelaxation{
 	{file: "audit_regression_test.go", sites: 1, kind: "skip",
 		why: "SKIPS its 2s deep-schema-reject budget under -race rather than relaxing it. A skip is a different decision from a ceiling and is kept as one: the quadratic it guards is seconds in the untraced run, which always executes"},
 
-	{file: "error_bound_test.go", sites: 1, kind: "skip",
-		why: "SKIPS a growth-RATIO check (linear lands near 2, quadratic near 4). Instrumentation distorts the ratio itself, not just the magnitude, so no multiplier can correct it; the absolute ceilings in the same test still run under -race"},
+	{file: "schema_semantics_test.go", sites: 1, kind: "skip",
+		why: "the error_bound section SKIPS a growth-RATIO check (linear lands near 2, quadratic near 4). Instrumentation distorts the ratio itself, not just the magnitude, so no multiplier can correct it; the absolute ceilings in the same test still run under -race"},
 }
 
 // raceConstrained reports whether src carries a build constraint mentioning
@@ -5246,7 +5247,13 @@ func moduleTestFiles(t *testing.T) []string {
 	for _, f := range out {
 		dirs[filepath.Dir(f)] = true
 	}
-	if len(out) < 25 || len(dirs) < 2 {
+	// A walk that finds one package is a walk that silently lost the others,
+	// which is the exact failure this replaced. The file floor was 25 when the
+	// suite was 192 files; it is 15 now that they are consolidated, so the
+	// floor is 10. Both halves still fail a walk that returns nearly nothing,
+	// which is all the count can honestly promise — the DIRECTORY half is the
+	// one that catches the failure that actually happened.
+	if len(out) < 10 || len(dirs) < 2 {
 		t.Fatalf("module walk found %d test files across %d directories — too few; the walk broke and a broken walk reads as full coverage", len(out), len(dirs))
 	}
 	return out

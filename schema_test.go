@@ -11630,19 +11630,13 @@ var breadthExempt = map[string]string{
 // so every entry point that takes one carries the axis; the exemptions are the
 // entry points that take bytes instead.
 func TestInvariant_EveryBatteryEntryPointHasABreadthCell(t *testing.T) {
-	otherColumns, err := os.ReadFile("dos_battery_test.go")
-	if err != nil {
-		t.Fatalf("read dos_battery_test.go: %v", err)
-	}
-	thisColumn, err := os.ReadFile("schema_breadth_test.go")
-	if err != nil {
-		t.Fatalf("read schema_breadth_test.go: %v", err)
-	}
-	derived := batteryEntryPoints(string(otherColumns))
+	otherColumns := testFileSection(t, "internal_nets_test.go", "dos_battery_test.go")
+	thisColumn := testFileSection(t, "schema_test.go", "schema_breadth_test.go")
+	derived := batteryEntryPoints(otherColumns)
 	if len(derived) == 0 {
 		t.Fatal("the scan found no battery cells at all — the cell-naming convention changed, and this guard is watching nothing")
 	}
-	covered := batteryEntryPoints(string(thisColumn))
+	covered := batteryEntryPoints(thisColumn)
 
 	for ep := range derived {
 		if covered[ep] {
@@ -13214,15 +13208,16 @@ func TestInvariant_MinBytesCallSites(t *testing.T) {
 
 // TestInvariant_DagCostMatrixDrivesEveryEntryPoint crosses the derived
 // carrier set with the matrix's own cells, so an entry point that gains a
-// caller cannot stay undriven. It reads this file rather than trusting a
-// count: the failure it prevents is a row added to minBytesCallSites with no
-// cell behind it.
+// caller cannot stay undriven. It reads the matrix's own source rather than
+// trusting a count: the failure it prevents is a row added to
+// minBytesCallSites with no cell behind it.
+//
+// It reads the SECTION, not the enclosing file. "cache.Parse(" is one of the
+// cells, and the schema_test.go the matrix now lives in uses that string
+// fifty-six more times outside this section — reading the whole file would
+// keep this guard green with the cell deleted.
 func TestInvariant_DagCostMatrixDrivesEveryEntryPoint(t *testing.T) {
-	src, err := os.ReadFile("schema_dag_cost_test.go")
-	if err != nil {
-		t.Fatalf("reading this file: %v", err)
-	}
-	body := string(src)
+	body := testFileSection(t, "schema_test.go", "schema_dag_cost_test.go")
 	for _, want := range []string{
 		"Parse(dag)",     // the parse-time derivation
 		"cache.Parse(",   // the cache's own parse
@@ -14076,6 +14071,42 @@ func readFile(t *testing.T, f string) string {
 	return string(b)
 }
 
+// sectionBanner matches the marker that delimits one merged-in file inside a
+// consolidated test file. It requires a *_test.go NAME: the same
+// `// ---------- x ----------` shape is also used for ordinary subsection
+// headings within a file ("the shapes", "triggers", "the WIDTH axis"), and
+// terminating on one of those truncates a section to a few lines — which reads
+// as "the claim is absent" or, worse, as a claim satisfied by a neighbour.
+var sectionBanner = regexp.MustCompile(`(?m)^// -{10} (\S+_test\.go) -{10}$`)
+
+// testFileSection returns the part of a consolidated test file that came from
+// orig, i.e. the text between orig's banner and the next file banner.
+//
+// A few guards below derive a claim from ONE file's source. Those files are now
+// sections of larger ones, and reading the whole enclosing file instead would
+// let an unrelated section satisfy the claim: the DAG-cost guard looks for
+// "cache.Parse(", which its own section uses twice and the rest of schema_test.go
+// uses fifty-six more times. That is a false pass in the direction that matters,
+// so the section is what gets read, and a missing banner is fatal rather than
+// silently the whole file.
+func testFileSection(t *testing.T, file, orig string) string {
+	t.Helper()
+	src := readFile(t, file)
+	ms := sectionBanner.FindAllStringSubmatchIndex(src, -1)
+	for i, m := range ms {
+		if src[m[2]:m[3]] != orig {
+			continue
+		}
+		end := len(src)
+		if i+1 < len(ms) {
+			end = ms[i+1][0]
+		}
+		return src[m[1]:end]
+	}
+	t.Fatalf("%s has no %q section banner — the consolidated-file markers moved, and a guard reading the wrong section reads as coverage", file, orig)
+	return ""
+}
+
 // minBytesConstructionSite rows one place the min-bytes walk STATE is
 // constructed (newMinBytesWalk) — a reaching path of the minBytes walk. The
 // walk is one, but a schema reaches it by building a container, by finalizing a
@@ -14849,13 +14880,24 @@ func filePackage(src string) string {
 
 var packageClauseRE = regexp.MustCompile(`(?m)^package ([A-Za-z_][A-Za-z0-9_]*)`)
 
-// blankCode replaces the contents of comments and string literals with spaces,
-// preserving every byte position. Two derivations need it and they need
-// different views of the same bytes: identifier matching must not see a
-// generator NAMED in a doc comment, while the self-naming check must see string
-// literals. Blanking in place gives both from one pass, and lets a function's
-// extent be found by counting braces without a brace inside a string ending it
-// early.
+// blankCode replaces the contents of comments, string literals and rune
+// literals with spaces, preserving every byte position. Two derivations need it
+// and they need different views of the same bytes: identifier matching must not
+// see a generator NAMED in a doc comment, while the self-naming check must see
+// string literals. Blanking in place gives both from one pass, and lets a
+// function's extent be found by counting braces without a brace inside a
+// literal ending it early.
+//
+// RUNE literals are blanked for exactly that last reason, and the cost of
+// omitting them is not theoretical: `s[0] != '{'` contributes an unmatched
+// brace, so the enclosing function's extent runs to end of file, and `s[1] !=
+// '"'` opens a phantom string that blanks the real code after it. Both were
+// present in one test whose extent then measured 7249 lines instead of 97 and
+// swallowed a cost generator declared far below it — a false edge in
+// TestInvariant_EveryCostCellDrivesItsFactor. The bug predates the test-file
+// consolidation; small files hid it because the over-run hit EOF within a few
+// hundred lines, and it fails in the silent direction too, since a phantom
+// string can blank a genuine call.
 func blankCode(src string) string {
 	b := []byte(src)
 	blank := func(from, to int) {
@@ -14891,6 +14933,16 @@ func blankCode(src string) string {
 		case b[i] == '"':
 			j := i + 1
 			for j < len(b) && b[j] != '"' {
+				if b[j] == '\\' {
+					j++
+				}
+				j++
+			}
+			blank(i, j+1)
+			i = j + 1
+		case b[i] == '\'':
+			j := i + 1
+			for j < len(b) && b[j] != '\'' {
 				if b[j] == '\\' {
 					j++
 				}
