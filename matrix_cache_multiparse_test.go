@@ -442,7 +442,7 @@ func mpAssertSelfContained(t *testing.T, viaCache, inline *avro.Schema, val any,
 	}
 
 	// Root: attribute-complete, namespace-resolved structural form.
-	if !mpRootEqual(viaCache.Root(), inline.Root()) {
+	if !mpRootEqual(*viaCache.Root(), *inline.Root()) {
 		t.Errorf("Root diverges:\n cache : %+v\n inline: %+v", viaCache.Root(), inline.Root())
 	}
 

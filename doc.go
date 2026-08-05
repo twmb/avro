@@ -53,8 +53,7 @@
 // Avro data is always written with a specific schema — the "writer schema."
 // When you read that data later, your application may expect a different
 // schema — the "reader schema." For example, you may have added a field,
-// removed one, or widened a type from int to long. The data on disk doesn't
-// change, but your code expects the new layout.
+// removed one, or widened a type from int to long.
 //
 // [Resolve] bridges this gap. Given the writer and reader schemas, it returns
 // a new schema that knows how to decode the old wire format and produce
@@ -167,8 +166,8 @@
 // resolve to the same name, a tagged field wins over an untagged one at any
 // depth; among fields with the same tagged status, the shallowest wins. Two
 // fields that resolve to the same name at the same depth with the same tagged
-// status are an ambiguous collision (Go itself makes such a field reference a
-// compile error). twmb errors rather than silently selecting one: [SchemaFor]
+// status are an ambiguous collision. twmb errors rather than silently
+// selecting one: [SchemaFor]
 // rejects the type, while encode and decode reject only when the schema
 // actually resolves a field to the ambiguous name — a coincidental collision
 // on a name the schema never references does not break the type.

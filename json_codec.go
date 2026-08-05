@@ -140,9 +140,8 @@ func parseOpts(opts []Opt) optConfig {
 // identically on both wire formats. This applies to string values and
 // map keys at any nesting depth.
 //
-// EncodeJSON accepts the same Go types as [Schema.Encode]. Map key order
-// in the output is non-deterministic — Go's map iteration order is
-// randomized and the encoder does not sort keys.
+// EncodeJSON accepts the same Go types as [Schema.Encode]. The encoder does
+// not sort map keys, so their order in the output is non-deterministic.
 //
 // Interop note: the default bare-union output is NOT readable by Java's
 // org.apache.avro.io.JsonDecoder, fastavro's JSON decoder, or

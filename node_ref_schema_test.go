@@ -269,6 +269,52 @@ func TestNodeRefSchema_EverySpellingTheResolverBindsConverts(t *testing.T) {
 	}
 }
 
+// TestNodeRefSchema_ConvertsOffTheRootExpression pins the other half of
+// issue #42: not that a reference node converts, but that a caller can
+// REACH one to convert it, without binding a temporary first.
+//
+// The root form is what the pointer return buys. A function result is
+// not addressable, so were Schema.Root to return a value again, the
+// pointer-receiver SchemaNode.Schema could not be called on it at all
+// and the s.Root().Schema() line below stops compiling — taking the
+// package with it. That was verified by reverting the signature: the
+// build fails there and only there.
+//
+// Only there, because the nested forms below compile under EITHER
+// signature — indexing a slice yields an addressable element no matter
+// how the slice was reached, so SchemaField.Type (a value field) is
+// addressable through Fields[i] either way. They are here to pin that,
+// which is the reason SchemaField.Type needs no pointer of its own, and
+// to pin that each reach shape still converts correctly.
+func TestNodeRefSchema_ConvertsOffTheRootExpression(t *testing.T) {
+	s := MustParse(`{
+		"type": "record", "name": "Outer", "namespace": "ns",
+		"fields": [
+			{"name": "a", "type": {"type": "record", "name": "Inner", "fields": [{"name": "x", "type": "long"}]}},
+			{"name": "b", "type": "Inner"},
+			{"name": "c", "type": ["null", "Inner"]},
+			{"name": "d", "type": {"type": "array", "items": "Inner"}}
+		]
+	}`)
+	const inner = `{"type":"record","name":"Inner","namespace":"ns","fields":[{"name":"x","type":"long"}]}`
+	innerVal := map[string]any{"x": int64(7)}
+
+	// The root itself, off the call expression.
+	if _, err := s.Root().Schema(); err != nil {
+		t.Fatalf("Root().Schema(): %v", err)
+	}
+	// Reached through SchemaField.Type, a VALUE field: the definition
+	// site, the bare name reference, and a reference one level deeper in
+	// a union branch (Branches is a []SchemaNode, so its elements are
+	// values too).
+	requireSubSchema(t, &s.Root().Fields[0].Type, inner, innerVal)
+	requireSubSchema(t, &s.Root().Fields[1].Type, inner, innerVal)
+	requireSubSchema(t, &s.Root().Fields[2].Type.Branches[1], inner, innerVal)
+	// Reached through Items, which is already a *SchemaNode: a different
+	// shape, and the one that worked before this change.
+	requireSubSchema(t, s.Root().Fields[3].Type.Items, inner, innerVal)
+}
+
 // TestNodeRefSchemaMatrix is the class-elimination net for reference-node
 // extraction: kind × namespace spelling × extraction site × structure.
 // Each cell builds an enclosing schema whose extraction site holds a NAME
@@ -632,12 +678,12 @@ func TestInvariant_BareEmissionCoversEverySchemaNodeField(t *testing.T) {
 			// It is a RELOCATION, so the field itself must read back zero.
 			// If it starts coming back on its own field the carrier began
 			// binding the key and the classification is stale.
-			if got := reflect.ValueOf(back).Field(i).Interface(); !reflect.DeepEqual(reflect.Zero(f.Type).Interface(), got) {
+			if got := reflect.ValueOf(back).Elem().Field(i).Interface(); !reflect.DeepEqual(reflect.Zero(f.Type).Interface(), got) {
 				t.Errorf("field %s now comes back on its OWN field (%#v) rather than in Props, so the carrier binds %q after all: reclassify it as an ordinary round-tripping field. Rule quoted: %s",
 					f.Name, got, rule.propsKey, rule.why)
 			}
 		default:
-			if got := reflect.ValueOf(back).Field(i).Interface(); !reflect.DeepEqual(want, got) {
+			if got := reflect.ValueOf(back).Elem().Field(i).Interface(); !reflect.DeepEqual(want, got) {
 				t.Errorf("field %s blocks the collapse but does not survive the rebuild: set %#v, emitted %s, read back %#v. The value is dropped with only the render changed — give it an emission arm, classify where it relocates, or classify it exempt.",
 					f.Name, want, s, got)
 			}
@@ -727,12 +773,12 @@ func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
 		}
 		seen++
 		n := MustParse(spec.src).Root()
-		fv := reflect.ValueOf(n).Field(i)
+		fv := reflect.ValueOf(n).Elem().Field(i)
 		if !fv.IsZero() {
 			t.Errorf("field %s: the probe schema did not leave the field at its zero (%#v), so this cell is testing the ordinary value case", f.Name, fv.Interface())
 			continue
 		}
-		if !nodePresenceSet(&n, f.Name) {
+		if !nodePresenceSet(n, f.Name) {
 			t.Errorf("field %s: the parse did not record the attribute as written, so the probe never reaches the question", f.Name)
 			continue
 		}
@@ -746,7 +792,7 @@ func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
 				t.Errorf("field %s: the probe's kind does not collapse even when empty, so this cell cannot reach the shortcut; clear reachesCollapse or pick another kind", f.Name)
 				continue
 			}
-			if nodeCarriesOnlyType(&n) {
+			if nodeCarriesOnlyType(n) {
 				t.Errorf("field %s carries a written attribute whose value is the field's zero, and the emptiness walk still calls the node empty — the collapse drops it before the emitter is ever reached", f.Name)
 				continue
 			}
@@ -763,7 +809,7 @@ func TestInvariant_BareEmissionCoversPresenceOnlyFields(t *testing.T) {
 		// And it must be a FIXPOINT: the re-parse has to record the presence
 		// again, or the attribute survives one rebuild and dies on the next.
 		back := s.Root()
-		if !nodePresenceSet(&back, f.Name) {
+		if !nodePresenceSet(back, f.Name) {
 			t.Errorf("field %s: the re-parse did not record the attribute, so a second rebuild would drop it", f.Name)
 			continue
 		}
@@ -894,7 +940,7 @@ func TestInvariant_NameRefSpliceCoversEverySchemaNodeField(t *testing.T) {
 		if err != nil {
 			continue // loud, which is the contract
 		}
-		if got := reflect.ValueOf(s.Root()).Field(i).Interface(); !reflect.DeepEqual(fv.Interface(), got) {
+		if got := reflect.ValueOf(s.Root()).Elem().Field(i).Interface(); !reflect.DeepEqual(fv.Interface(), got) {
 			t.Errorf("field %s blocks the splice but the as-written render still lost it: set %#v, emitted %s, read back %#v",
 				f.Name, fv.Interface(), s, got)
 		}

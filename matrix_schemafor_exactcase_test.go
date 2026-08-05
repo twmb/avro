@@ -94,7 +94,7 @@ func TestMatrix_SchemaForReservedKeyExactCase(t *testing.T) {
 					if got, want := string(s.Canonical()), string(sControl.Canonical()); got != want {
 						t.Errorf("variant %q canonical diverges from the no-namespace control (the variant must be inert):\n control: %s\n varied:  %s", key, want, got)
 					}
-					def := findNodeByTypeName(s.Root(), "fixed", "F")
+					def := findNodeByTypeName(*s.Root(), "fixed", "F")
 					if def == nil {
 						t.Fatalf("definition F not found")
 					}
@@ -273,7 +273,7 @@ func TestRegression_TypeAliasBindingKeyExactCase(t *testing.T) {
 		if err != nil {
 			t.Fatalf("exact-case items: %v", err)
 		}
-		if got := findNodeAliases(s.Root(), "X"); !reflect.DeepEqual(got, []string{"Old"}) {
+		if got := findNodeAliases(*s.Root(), "X"); !reflect.DeepEqual(got, []string{"Old"}) {
 			t.Errorf("alias not applied to X: got %#v, want [Old]", got)
 		}
 	})
@@ -312,10 +312,10 @@ func TestRegression_TypeAliasUnionPlacementExactCase(t *testing.T) {
 		t.Fatalf("exact-case items: %v", err)
 	}
 	root := s.Root()
-	if got := findNodeAliases(root, "X"); !reflect.DeepEqual(got, []string{"Old"}) {
+	if got := findNodeAliases(*root, "X"); !reflect.DeepEqual(got, []string{"Old"}) {
 		t.Errorf("alias not on first named type X: got %#v, want [Old]", got)
 	}
-	if got := findNodeAliases(root, "Y"); got != nil {
+	if got := findNodeAliases(*root, "Y"); got != nil {
 		t.Errorf("alias misdirected to later branch Y: %#v", got)
 	}
 	if _, err := build("Items"); err == nil || !strings.Contains(err.Error(), "array is missing items schema") {
@@ -338,7 +338,7 @@ func TestRegression_TypeAliasVariantAliasesInert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("control build: %v", err)
 	}
-	if got := findNodeAliases(sc.Root(), "F"); len(got) != 2 {
+	if got := findNodeAliases(*sc.Root(), "F"); len(got) != 2 {
 		t.Fatalf("control aliases: got %#v, want both prior.P and Old", got)
 	}
 
@@ -348,7 +348,7 @@ func TestRegression_TypeAliasVariantAliasesInert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("variant build: %v", err)
 	}
-	def := findNodeByTypeName(sv.Root(), "fixed", "F")
+	def := findNodeByTypeName(*sv.Root(), "fixed", "F")
 	if def == nil {
 		t.Fatalf("definition F not found")
 	}
@@ -455,10 +455,10 @@ func TestMatrix_TypeAliasExactCase(t *testing.T) {
 					}
 					canonicals[cell] = string(s.Canonical())
 					root := s.Root()
-					if got := findNodeAliases(root, "X"); !reflect.DeepEqual(got, []string{"Old"}) {
+					if got := findNodeAliases(*root, "X"); !reflect.DeepEqual(got, []string{"Old"}) {
 						t.Errorf("alias not on X: %#v", got)
 					}
-					if got := findNodeAliases(root, "Y"); got != nil {
+					if got := findNodeAliases(*root, "Y"); got != nil {
 						t.Errorf("alias misdirected to later branch Y: %#v", got)
 					}
 				})
@@ -476,7 +476,7 @@ func TestMatrix_TypeAliasExactCase(t *testing.T) {
 				if err != nil {
 					t.Fatalf("build: %v", err)
 				}
-				got := findNodeAliases(s.Root(), "F")
+				got := findNodeAliases(*s.Root(), "F")
 				aliasSets[name] = fmt.Sprintf("%v", got)
 				if len(got) != wantLen {
 					t.Errorf("aliases = %#v; want %d entries", got, wantLen)
@@ -517,7 +517,7 @@ func TestMatrix_TypeAliasExactCase(t *testing.T) {
 				t.Errorf("case-variant %s not inert under a type-alias tag:\n control: %s\n varied:  %s",
 					extra.key, sc.Canonical(), sv.Canonical())
 			}
-			if got := findNodeAliases(sv.Root(), "F"); !reflect.DeepEqual(got, []string{"Old"}) {
+			if got := findNodeAliases(*sv.Root(), "F"); !reflect.DeepEqual(got, []string{"Old"}) {
 				t.Errorf("alias not applied: %#v", got)
 			}
 		})
@@ -543,7 +543,7 @@ func TestMatrix_TypeAliasExactCase(t *testing.T) {
 			if defs != 1 || refs != 1 {
 				t.Errorf("want one definition + one dotted reference, got %d defs %d refs: %s", defs, refs, s.String())
 			}
-			if got := findNodeAliases(s.Root(), "X"); !reflect.DeepEqual(got, []string{"Old"}) {
+			if got := findNodeAliases(*s.Root(), "X"); !reflect.DeepEqual(got, []string{"Old"}) {
 				t.Errorf("alias not applied: %#v", got)
 			}
 		})
@@ -564,14 +564,14 @@ func TestMatrix_TypeAliasExactCase(t *testing.T) {
 			if defs := strings.Count(s.String(), `"c"`); defs != 1 {
 				t.Errorf("want one inline definition, got %d bodies: %s", defs, s.String())
 			}
-			def := findNodeByTypeName(s.Root(), "record", "X")
+			def := findNodeByTypeName(*s.Root(), "record", "X")
 			if def == nil {
 				t.Fatalf("definition X not found")
 			}
 			if got := def.Props["NameSpace"]; !reflect.DeepEqual(got, "x.y") {
 				t.Errorf(`Props["NameSpace"] = %#v; want the variant preserved verbatim`, got)
 			}
-			if got := findNodeAliases(s.Root(), "X"); !reflect.DeepEqual(got, []string{"Old"}) {
+			if got := findNodeAliases(*s.Root(), "X"); !reflect.DeepEqual(got, []string{"Old"}) {
 				t.Errorf("alias not applied: %#v", got)
 			}
 		})

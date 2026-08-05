@@ -565,7 +565,7 @@ func TestMatrix_SpliceWrapperReservedKeyMerge(t *testing.T) {
 				t.Fatalf("wrapper Parse: %v", err)
 			}
 			n := s.Root()
-			c.check(t, n)
+			c.check(t, *n)
 
 			// Wrapper props are metadata: the wire image is the def's own
 			// ([]byte is the opaque carrier for both plain and decimal
@@ -589,7 +589,7 @@ func TestMatrix_SpliceWrapperReservedKeyMerge(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Root().Schema() rebuild: %v", err)
 			}
-			c.check(t, rb.Root())
+			c.check(t, *rb.Root())
 		})
 	}
 }

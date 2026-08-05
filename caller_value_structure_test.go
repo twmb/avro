@@ -248,14 +248,14 @@ func TestMatrix_CallerValueDomainAcrossStructures(t *testing.T) {
 			// "ok" and the net stays green over the exact regression it names.
 			flat := MustParse(`{"type":"record","name":"Flat","fields":[{"name":"f","type":"int"}]}`).Root()
 			flatPick := flat
-			verdicts["flat-baseline"] = cvVerdict(driveSurfaces(slot.put(&flat, &flatPick, hv.val), nil))
+			verdicts["flat-baseline"] = cvVerdict(driveSurfaces(slot.put(flat, flatPick, hv.val), nil))
 			cells++
 
 			for _, st := range structures {
 				s := st.build(t)
 				root := s.Root()
-				picked := st.pick(root)
-				drive := slot.put(&root, &picked, hv.val)
+				picked := st.pick(*root)
+				drive := slot.put(root, &picked, hv.val)
 				verdicts[st.name] = cvVerdict(driveSurfaces(drive, st.val))
 				cells++
 			}

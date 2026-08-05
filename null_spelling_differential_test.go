@@ -68,7 +68,7 @@ func TestDifferentialFastavroSchemaForNullSpelling(t *testing.T) {
 				t.Fatalf("parse custom union: %v", err)
 			}
 			root := cs.Root()
-			ct := avro.CustomType{GoType: reflect.TypeFor[nullSpellDiffMarker](), Schema: &root}
+			ct := avro.CustomType{GoType: reflect.TypeFor[nullSpellDiffMarker](), Schema: root}
 
 			s, err := avro.SchemaFor[nullSpellDiffRec](ct)
 			if err != nil {

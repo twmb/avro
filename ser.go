@@ -2059,8 +2059,8 @@ func DurationFromBytes(b []byte) Duration {
 	}
 }
 
-// String returns an ISO 8601 duration string. Zero components are omitted
-// for readability. Examples: "P1Y3M15DT1H30M0.500S", "P30D", "PT1H".
+// String returns an ISO 8601 duration string. Zero components are omitted.
+// Examples: "P1Y3M15DT1H30M0.500S", "P30D", "PT1H".
 func (d Duration) String() string {
 	if d.Months == 0 && d.Days == 0 && d.Milliseconds == 0 {
 		return "P0D"

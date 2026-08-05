@@ -242,7 +242,7 @@ func TestMatrix_CallerComposedAndEditedNodes(t *testing.T) {
 			// reference. A structure whose pick lands on the DEFINITION (the
 			// cache inlines its first occurrence) never splices at all, so
 			// every verdict below would be answering a different question.
-			ctrl := st.pick(s.Root())
+			ctrl := st.pick(*s.Root())
 			if !nodeIsNameRefShape(&ctrl) || !nodeRefTargetAgrees(&ctrl) {
 				t.Fatalf("structure %q does not pick a stamped bare reference (Type=%q shape=%v stamp=%v); the probe never reaches the splice",
 					st.name, ctrl.Type, nodeIsNameRefShape(&ctrl), nodeRefTargetAgrees(&ctrl))
@@ -262,7 +262,7 @@ func TestMatrix_CallerComposedAndEditedNodes(t *testing.T) {
 
 			for _, f := range exportedFields {
 				t.Run("edit/"+f.Name, func(t *testing.T) {
-					n := st.pick(s.Root())
+					n := st.pick(*s.Root())
 					fv := reflect.ValueOf(&n).Elem().FieldByName(f.Name)
 					if !setNonZeroForTest(f.Name, fv) {
 						t.Fatalf("cannot populate %s (kind %s)", f.Name, f.Type.Kind())
@@ -386,7 +386,7 @@ func re(t *testing.T, text string) SchemaNode {
 	if err != nil {
 		t.Fatalf("re-parse of emitted text failed: %v\n%s", err, text)
 	}
-	return s.Root()
+	return *s.Root()
 }
 
 // alreadySetForTest reports whether the carrier already populates this field

@@ -3309,7 +3309,7 @@ func TestCensus_Q4_ReservedKeyRoutingIsOneRuleAcrossSurfaces(t *testing.T) {
 			}
 
 			root := s.Root()
-			gotStructural := structuralFieldFor(&root, cell.key)
+			gotStructural := structuralFieldFor(root, cell.key)
 			_, gotProps := root.Props[cell.key]
 
 			if gotStructural != cell.structural {
@@ -3343,14 +3343,14 @@ func TestCensus_Q4_ReservedKeyRoutingIsOneRuleAcrossSurfaces(t *testing.T) {
 			}
 			rb := rebuilt.Root()
 			if cell.reportedFinding != "" {
-				if structuralFieldFor(&rb, cell.key) == gotStructural {
+				if structuralFieldFor(rb, cell.key) == gotStructural {
 					t.Errorf("the rebuild no longer loses %q — the reported finding is fixed; update the registry and delete reportedFinding.\n  %s", cell.key, cell.reportedFinding)
 				} else {
 					t.Logf("REPORTED FINDING (not fixed in a census round): %s", cell.reportedFinding)
 				}
 				return
 			}
-			if structuralFieldFor(&rb, cell.key) != gotStructural {
+			if structuralFieldFor(rb, cell.key) != gotStructural {
 				t.Errorf("the rebuild changed the structural verdict for %q", cell.key)
 			}
 			if _, p := rb.Props[cell.key]; p != gotProps {
@@ -3542,7 +3542,7 @@ func TestCensus_Q17_SpliceWrapperKeyVerdictAgreesAcrossRepresentations(t *testin
 				if err != nil {
 					return spliceVerdict{}, err
 				}
-				return verdictFromSpliced(out.Root(), c.key, defObj.Type), nil
+				return verdictFromSpliced(*out.Root(), c.key, defObj.Type), nil
 			}
 
 			// Answerer 2 — the CACHE splice, on the raw JSON tree. The

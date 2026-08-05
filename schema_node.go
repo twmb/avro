@@ -176,8 +176,7 @@ type SchemaField struct {
 	//     even though the wire encoder writes -0.0 for that literal.
 	//   - string and enum schemas give string.
 	//   - bytes and fixed schemas give []byte, already decoded from
-	//     the JSON spec's codepoint-per-byte form so you can pass
-	//     Default straight back to AppendEncode without conversion.
+	//     the JSON spec's codepoint-per-byte form.
 	//   - record, array, and map schemas give map[string]any or []any
 	//     respectively, with each leaf following these same rules.
 	//
@@ -308,7 +307,7 @@ type deduper struct {
 //
 // Root re-parses the JSON on each call. Cache the result if you need
 // to access it repeatedly (e.g. in a per-message processing loop).
-func (s *Schema) Root() SchemaNode {
+func (s *Schema) Root() *SchemaNode {
 	raw, err := unmarshalAnyPreservePrecision([]byte(s.full))
 	if err != nil {
 		panic("avro: Schema.Root: invalid stored JSON: " + err.Error())
@@ -325,7 +324,7 @@ func (s *Schema) Root() SchemaNode {
 	// The table is the same one the default fixup resolved through, so the
 	// two surfaces cannot bind a reference differently.
 	stampNameRefs(&n, table, "")
-	return n
+	return &n
 }
 
 // toJSONDedup is like toJSON but deduplicates named types. The first
