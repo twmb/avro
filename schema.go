@@ -18,11 +18,6 @@ import (
 // Schema is a compiled Avro schema. Create one with [Parse] or [MustParse],
 // then use [Schema.Encode] / [Schema.Decode] to convert between Go values and
 // Avro binary. A Schema is safe for concurrent use.
-//
-// A nil *Schema is invalid; every method panics on it. Obtain a *Schema only
-// from [Parse], [MustParse], [Resolve], [SchemaFor], or [SchemaNode.Schema] —
-// each returns a non-nil *Schema or an error, so a nil *Schema is a
-// programming error and is surfaced as a panic rather than a returned error.
 type Schema struct {
 	ser   serfn
 	deser deserfn

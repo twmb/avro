@@ -2758,10 +2758,9 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 }
 
 // RatFromBytes converts Avro decimal bytes (big-endian two's complement)
-// to *big.Rat with the given scale. This is useful in [CustomType] Decode
-// callbacks that override the default decimal handling: the callback
-// receives raw []byte and can use this function to interpret the value
-// before converting to a custom Go type.
+// to *big.Rat with the given scale — the conversion a [CustomType] Decode
+// callback overriding the built-in decimal handling would otherwise write
+// itself, since such a callback receives the raw []byte.
 //
 // Negative scale is interpreted as `unscaled * 10^|scale|` (matching
 // Java/avro-rs big-decimal semantics). |scale| is bounded by

@@ -237,13 +237,12 @@ func (optSchemaOpts) writerOpt() {}
 // codec that is offered and declined as well, which makes the rule the same one
 // everywhere instead of one that depends on whether the offer was taken.
 //
-// A nil codec is ignored, on every constructor, and in both of the spellings Go
-// gives nil: WithCodec(nil), and a non-nil Codec holding a nil pointer — what
-// WithCodec(newMyCodec()) produces when newMyCodec has a concrete return type
-// and returns nil. Such an offer is never named, never adopted, and never
-// closed; the constructor behaves as though it were not written. It is still a
-// caller mistake, and if it is the ONLY offer for a codec the file names, the
-// constructor reports an unknown codec rather than silently reading nothing.
+// A nil codec is ignored, on every constructor, in both spellings: a nil
+// Codec, and a non-nil Codec holding a nil pointer. Such an offer is never
+// named, never adopted, and never closed; the constructor behaves as though
+// it were not written. It is still a caller mistake, and if it is the ONLY
+// offer for a codec the file names, the constructor reports an unknown codec
+// rather than silently reading nothing.
 //
 // For reader-side decompression bounding of a supplied codec, see
 // [WithMaxDecompressedBlockBytes]: it reaches any supplied codec implementing
@@ -420,10 +419,7 @@ func ZstdCodec(eopts []zstd.EOption, dopts []zstd.DOption) (Codec, error) {
 	return &zstdCodec{enc: enc, dopts: dopts}, nil
 }
 
-// MustZstdCodec is like [ZstdCodec] but panics on error. This is useful for
-// inline codec creation with static options:
-//
-//	w, err := ocf.NewWriter(f, schema, ocf.WithCodec(ocf.MustZstdCodec(nil, nil)))
+// MustZstdCodec is like [ZstdCodec] but panics on error.
 func MustZstdCodec(eopts []zstd.EOption, dopts []zstd.DOption) Codec {
 	c, err := ZstdCodec(eopts, dopts)
 	if err != nil {
@@ -1689,30 +1685,20 @@ func releaseUnadopted(supplied []Codec, adopted int) {
 	}
 }
 
-// isNilCodec reports whether c holds nothing to call a method on. Nil has TWO
-// spellings in Go and only one of them is c == nil: WithCodec(nil) stores a nil
-// interface, while a constructor with a concrete return type that yields nil —
-// func newCodec() *myCodec, the ordinary typed-nil shape — stores a non-nil
-// interface wrapping a nil pointer. The second passes c != nil and panics at the
-// first method call, so the interface test alone is not the question anyone
-// meant to ask.
+// isNilCodec reports whether c holds nothing to call a method on. A Codec can
+// be a non-nil interface wrapping a nil pointer, which passes c != nil and
+// panics at the first method call, so == is not the question worth asking.
 //
-// This is the same question [avro.Schema.Decode] asks of its target and answers
-// with reflect (Kind plus IsNil) rather than with ==; the difference is that a
-// decode target must be a pointer while a Codec may legitimately be any kind, so
-// the nilable kinds are enumerated instead of pointer being required. The kinds
-// listed are exactly those reflect.Value.IsNil accepts; Interface is not among
-// them because reflect.ValueOf resolves the interface to its dynamic value, so a
-// Kind of Interface cannot occur here. Every other kind — a struct codec like
-// nullCodec{}, a string- or int-backed one — has no nil value and is never nil.
+// The kinds listed are exactly those reflect.Value.IsNil accepts. Interface is
+// not among them: reflect.ValueOf resolves the interface to its dynamic value,
+// so that kind cannot occur here.
 //
-// Every site that reaches into a caller's offers asks this one function: both
-// choosers — resolveCodec before it reads a name, NewWriter before it takes the
-// last one — and releaseUnadopted before it closes. That is the point. A
-// predicate answered in one place cannot drift between the constructor that
-// chooses by name and the one that chooses by position, which is exactly the
-// drift that made WithCodec(nil) a supported no-op on one and a crash on the
-// other two.
+// Every site that reaches into a caller's offers asks this one function — both
+// choosers, resolveCodec before it reads a name and NewWriter before it takes
+// the last one, and releaseUnadopted before it closes. A predicate answered in
+// one place cannot drift between them, which is the drift that made
+// WithCodec(nil) a supported no-op on one constructor and a crash on the other
+// two.
 func isNilCodec(c Codec) bool {
 	if c == nil {
 		return true
