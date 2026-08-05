@@ -13218,12 +13218,26 @@ func TestInvariant_MinBytesCallSites(t *testing.T) {
 // keep this guard green with the cell deleted.
 func TestInvariant_DagCostMatrixDrivesEveryEntryPoint(t *testing.T) {
 	body := testFileSection(t, "schema_test.go", "schema_dag_cost_test.go")
+
+	// Cut THIS function out of what is searched. The want list below sits
+	// inside the very section being read, so every entry matched itself and
+	// the guard could not go red in any circumstance: renaming all six real
+	// "ocf-header" cells left it green. One entry, "Parse(dag)", never had a
+	// second occurrence at all — it was satisfied only by its own list line,
+	// so it asserted nothing from the day it was written. The wants below are
+	// the cells' LABELS, which is what the matrix actually names them.
+	if i := strings.Index(body, "func "+t.Name()); i >= 0 {
+		if j := strings.Index(body[i:], "\n}\n"); j >= 0 {
+			body = body[:i] + body[i+j:]
+		}
+	}
+
 	for _, want := range []string{
-		"Parse(dag)",     // the parse-time derivation
-		"cache.Parse(",   // the cache's own parse
-		"Resolve(wDrop,", // the skip compiled for a dropped writer field
-		"Resolve(wKeep,", // the resolver's rebuild of a kept container
-		"ocf-header",     // the container reader's, schema read from the file
+		`t, cell, "Parse"`,                      // the parse-time derivation
+		`t, cell, "SchemaCache.Parse"`,          // the cache's own parse
+		`t, cell, "Resolve/dropped-field-skip"`, // the skip compiled for a dropped writer field
+		`t, cell, "Resolve/kept-field"`,         // the resolver's rebuild of a kept container
+		`t, cell, "ocf-header/schema-parse"`,    // the container reader's, schema read from the file
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the cost matrix no longer drives %q; every rowed entry point needs a cell", want)
