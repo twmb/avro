@@ -192,10 +192,9 @@ func unionTypeNameForValue(v reflect.Value) string {
 			return ""
 		}
 		if v.Type() == jsonNumberType {
-			// json.Number's Kind() is reflect.String but it can also
-			// flow into int/long/float/double branches via numeric
-			// coercion — let try-each find the right branch rather
-			// than locking to "string".
+			// A json.Number can flow into any of int/long/float/double
+			// via numeric coercion — let try-each find the right branch
+			// rather than locking it to one. See jsonNumberType.
 			return ""
 		}
 		switch v.Kind() {
@@ -432,6 +431,14 @@ func serPrim(appendFn func([]byte, reflect.Value) ([]byte, error)) serfn {
 
 var serBoolean = serPrim(appendAvroBool)
 
+// jsonNumberType is compared by type, never by Kind: json.Number's Kind is
+// reflect.String, but its stdlib contract is an RFC 8259 number literal, so
+// the package treats it as a NUMERIC carrier and accepts it only for the
+// numeric Avro types (doc.go, "Encoding from JSON input"). Every string-Kind
+// gate on either wire — string, bytes, fixed, enum, the RFC 3339 timestamp
+// probe, the union type-name dispatcher, and SchemaFor's Kind switch — must
+// therefore exclude this type before it reads the Kind, or a json.Number
+// lands on the one Avro type the other wire is guaranteed to reject for it.
 var jsonNumberType = reflect.TypeFor[json.Number]()
 var mapStringAnyType = reflect.TypeFor[map[string]any]()
 
@@ -1473,14 +1480,10 @@ func (s *serEnum) ser(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("unknown symbol %q", truncForError(needle))}
 	}
 	if v.Kind() == reflect.String {
-		// json.Number's Kind() is reflect.String, but it is a numeric carrier
-		// (its stdlib contract is an RFC 8259 number literal), so a stringy
-		// enum target is a type mismatch — rejected here exactly as the
-		// string/bytes/fixed encoders reject it and the decode side
-		// (setEnumTarget → setStringTarget → rejectJSONNumberStringTarget)
-		// rejects it. Without this, the json.Number's content would be looked
-		// up as a symbol name and silently encode an ordinal the decoder can
-		// never read back.
+		// The jsonNumberType exclusion, at the enum gate: without it the
+		// number's content is looked up as a symbol name and silently
+		// encodes an ordinal the decoder (setEnumTarget → setStringTarget
+		// → rejectJSONNumberStringTarget) can never read back.
 		if err := rejectJSONNumberRawTarget(v, "enum"); err != nil {
 			return nil, err
 		}
@@ -2101,14 +2104,11 @@ func (d Duration) String() string {
 
 // tryParseTimeString attempts to parse a string value as RFC 3339.
 //
-// json.Number is excluded even though its Kind() is reflect.String: it is a
-// numeric carrier (its stdlib contract is an RFC 8259 number literal), so it
-// must fall through to the numeric encode arm (serLong / jsonCoerceToInt64),
-// which validates its content as a number and rejects non-numeric content —
-// rather than being reinterpreted here as a timestamp string. This mirrors the
-// decode side (formatToStringKindTarget) and keeps the numeric-carrier
-// exclusion uniform across every string-Kind encode gate (string/bytes/fixed/
-// enum all reject json.Number too).
+// The jsonNumberType exclusion, at the timestamp probe: a json.Number must
+// fall through to the numeric encode arm (serLong / jsonCoerceToInt64),
+// which validates its content as a number, rather than being reinterpreted
+// here as a timestamp string. Mirrors the decode side
+// (formatToStringKindTarget).
 func tryParseTimeString(v reflect.Value) (time.Time, bool) {
 	if v.Kind() != reflect.String || v.Type() == jsonNumberType {
 		return time.Time{}, false
