@@ -1,9 +1,14 @@
 package avro
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math/big"
+	"os"
 	"reflect"
 	"runtime/debug"
 	"slices"
@@ -8561,6 +8566,7 @@ type genShape struct {
 	t         reflect.Type
 	hasTag    bool // any avro tag anywhere -> FieldByName oracle applies only when false
 	hasInline bool // ,inline-flattened fields have no Go-promotion analog -> skip FieldByName
+	hasPtr    bool // carrier 0 is a POINTER embed -> the occupancy axis applies
 }
 
 // genStructuralShapes crosses: every ordered subset (size 1..3) of the carrier
@@ -8661,7 +8667,7 @@ func genStructuralShapes() []genShape {
 							}
 							label := fmt.Sprintf("carriers=%v inline=%v ptr=%v %s/%s keep=%v",
 								names, inl, ptr, d.label, pos, keep)
-							shapes = append(shapes, genShape{label: label, t: st, hasTag: hasTag, hasInline: inl})
+							shapes = append(shapes, genShape{label: label, t: st, hasTag: hasTag, hasInline: inl, hasPtr: ptr})
 						}
 					}
 				}
@@ -8723,6 +8729,7 @@ func intRecord(names []string) string {
 func TestGenerative_EmbedShapeWalkerAgreement(t *testing.T) {
 	shapes := genStructuralShapes()
 	var checkedWinners, checkedAmbig, roundTripped, fieldByNameChecks int
+	var nilEmbedRoundTrips int
 
 	for _, sh := range shapes {
 		or := oracleResolve(sh.t)
@@ -8841,6 +8848,10 @@ func TestGenerative_EmbedShapeWalkerAgreement(t *testing.T) {
 			}
 			roundTripWinners(t, sh, s, or)
 			roundTripped++
+			if sh.hasPtr {
+				roundTripNilEmbed(t, sh, s, or)
+				nilEmbedRoundTrips++
+			}
 		} else {
 			// Lazy contract: a schema over only the NON-ambiguous names still
 			// round-trips (the coincidental collision does not break the
@@ -8874,8 +8885,410 @@ func TestGenerative_EmbedShapeWalkerAgreement(t *testing.T) {
 		t.Fatalf("generator under-covered: winners=%d ambig=%d roundtrips=%d shapes=%d — generation regressed",
 			checkedWinners, checkedAmbig, roundTripped, len(shapes))
 	}
-	t.Logf("structural net: %d shapes | %d winner resolutions | %d ambiguity rejections | %d round trips | %d FieldByName cross-checks",
-		len(shapes), checkedWinners, checkedAmbig, roundTripped, fieldByNameChecks)
+	// The occupancy arm is only meaningful if pointer-embed shapes actually
+	// reach it: allocPointers made every generated pointer embed non-nil for
+	// this net's whole history, so a zero here means the axis went dead again.
+	if nilEmbedRoundTrips < 100 {
+		t.Fatalf("nil-embed occupancy arm ran %d times — the pointer-embed axis is not being generated",
+			nilEmbedRoundTrips)
+	}
+	t.Logf("structural net: %d shapes | %d winner resolutions | %d ambiguity rejections | %d round trips (%d with a NIL pointer embed) | %d FieldByName cross-checks",
+		len(shapes), checkedWinners, checkedAmbig, roundTripped, nilEmbedRoundTrips, fieldByNameChecks)
+}
+
+// roundTripNilEmbed is the OCCUPANCY arm of the pointer-embed axis. The shape
+// generator wraps carrier 0 in a pointer on half the shapes, but roundTripWinners
+// calls allocPointers before encoding, so for this net's whole history every
+// generated pointer embed reached the codecs ALLOCATED. A NIL embed takes a
+// different arm — fieldByIndexZero returns the zero of fieldTypeByIndex's
+// resolved type instead of walking — and that arm is reached from three distinct
+// encode sites (ser.go's reflect path, unsafe.go's compiled slow-field arm, and
+// json_codec.go), any of which could panic on a nil deref without the net
+// noticing.
+//
+// The expectation is not read off this package: a value whose fields are all
+// zero has one image, so the struct with the embed left NIL must encode to
+// exactly what the same schema produces for an explicit all-zero MAP — the map
+// encoder being a path that never touches fieldByIndexZero at all. Encode then
+// implies decode: the wire must read back, allocating the embed on the way in.
+func roundTripNilEmbed(t *testing.T, sh genShape, s *Schema, or oracleResult) {
+	t.Helper()
+
+	zeros := map[string]any{}
+	for _, n := range or.names {
+		zeros[n] = int32(0)
+	}
+	want, err := s.AppendEncode(nil, zeros)
+	if err != nil {
+		t.Fatalf("%s: encoding the all-zero map twin: %v", sh.label, err)
+	}
+	wantJSON, err := s.EncodeJSON(zeros)
+	if err != nil {
+		t.Fatalf("%s: JSON-encoding the all-zero map twin: %v", sh.label, err)
+	}
+
+	// nilV's pointer embeds are left exactly as reflect.New made them: nil.
+	nilV := reflect.New(sh.t)
+	for _, c := range []struct {
+		route string
+		enc   func() ([]byte, error)
+		want  []byte
+	}{
+		// Addressable: the compiled record, whose promoted field cannot have
+		// a fixed offset and so takes the slow fieldByIndexZero arm.
+		{"binary/compiled", func() ([]byte, error) { return s.AppendEncode(nil, nilV.Interface()) }, want},
+		// Non-addressable: ser.go's reflect path.
+		{"binary/reflect", func() ([]byte, error) { return s.AppendEncode(nil, nilV.Elem().Interface()) }, want},
+		{"json", func() ([]byte, error) { return s.EncodeJSON(nilV.Interface()) }, wantJSON},
+	} {
+		got, err := func() (b []byte, err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("%s: %s encode PANICKED on a nil embedded pointer: %v", sh.label, c.route, r)
+				}
+			}()
+			return c.enc()
+		}()
+		if err != nil {
+			t.Fatalf("%s: %s encode of a nil embedded pointer: %v", sh.label, c.route, err)
+		}
+		if !bytes.Equal(got, c.want) {
+			t.Fatalf("%s: %s encode of a nil embedded pointer = %x, want the all-zero image %x",
+				sh.label, c.route, got, c.want)
+		}
+	}
+
+	// Encode implies decode: the zero image must read back into the same shape,
+	// which is where fieldByIndex allocates the embed it just read as zero.
+	dst := reflect.New(sh.t)
+	if _, err := s.Decode(want, dst.Interface()); err != nil {
+		t.Fatalf("%s: decoding the all-zero image back into the shape: %v", sh.label, err)
+	}
+	for _, n := range or.names {
+		if got := readLeafInt(dst.Elem(), or.winner[n]); got != 0 {
+			t.Fatalf("%s: %q read back as %d, want 0", sh.label, n, got)
+		}
+	}
+}
+
+// embedIndexSites is the set of fieldByIndex / fieldByIndexZero call sites,
+// keyed "file.go:enclosingFunc" and valued by the number of calls there. It is
+// the set TestMatrix_NilEmbedPointerRouteAgreement claims to drive, and
+// TestInvariant_EveryFieldByIndexSiteHasARouteCell derives the REAL set from
+// source and fails when the two disagree in either direction — a new call site
+// landing without a route cell, or a listed one going away.
+//
+// A promoted field's Go destination is reached only through these two helpers,
+// so this table is the route inventory for the whole embedded-pointer class.
+var embedIndexSites = map[string]int{
+	// decode (fieldByIndex — allocates a nil embed, or refuses cleanly)
+	"unsafe.go:deserRecordFast":                     1, // binary: the ONLY binary decode route (struct records always compile)
+	"json_decode.go:jsonDecoder.decodeRecordStruct": 2, // JSON: present-key arm + default-fill arm
+	"resolve.go:resolvedRecord.deserStruct":         2, // resolved: writer-op arm + reader-default arm
+	// encode (fieldByIndexZero — reads a nil embed as zero)
+	"ser.go:serRecord.ser":               1, // binary, non-addressable (reflect path)
+	"unsafe.go:serRecordFast":            1, // binary, addressable (compiled slow-field arm)
+	"json_codec.go:appendAvroJSONRecord": 1, // JSON
+}
+
+// A field promoted through an embedded POINTER reaches its Go destination via
+// fieldByIndex (decode) and fieldByIndexZero (encode): helpers that allocate a
+// nil embed on the way in, refuse cleanly when Go reflection cannot allocate it
+// (an embed named through an UNEXPORTED type is unsettable), and read a nil
+// embed as zero on the way out.
+//
+// The verdict is a property of the Go SHAPE, not of the wire, so every route
+// reaching those helpers owes the same answer — and the routes are not one path.
+// Binary decode reaches fieldByIndex only through the COMPILED record
+// (deserRecordFast's slow-field arm); JSON decode has a present-key arm and a
+// separate default-fill arm; the RESOLVED decoder has its own writer-op and
+// reader-default arms. Five decode sites, three encode sites, all in
+// embedIndexSites.
+//
+// AXES: occupancy {nil, pre-allocated} x embed exportedness {exported,
+// unexported} x route {the eight sites above}.
+//
+// ORACLE: encoding/json, decoded into the SAME Go types. It is an independent
+// implementation of the same Go-reflection constraint, and fieldByIndex's own
+// comment claims parity with it — so the accept/reject verdict is taken from it
+// cell for cell rather than read off this package. Its ENCODE behavior is
+// deliberately NOT the oracle: json omits a nil embed's promoted fields, while
+// an Avro record has no absent field and writes the zero. The encode arm uses
+// the all-zero map twin instead (a path that never touches fieldByIndexZero).
+func TestMatrix_NilEmbedPointerRouteAgreement(t *testing.T) {
+	full := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"c","type":"int"}]}`)
+	// withDefault carries a default for "a" so the JSON decoder's default-fill
+	// arm — a SECOND fieldByIndex site — runs when "a" is absent.
+	withDefault := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int","default":5},{"name":"c","type":"int"}]}`)
+	// wideWriter carries a field the reader drops, so resolution is real (a skip
+	// op beside the reads) and the resolved decoder's WIRE-OP arm runs.
+	wideWriter := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"x","type":"int"},{"name":"c","type":"int"}]}`)
+	// thinWriter lacks "a" entirely, so the reader's own default fills it and the
+	// resolved decoder's DEFAULT arm runs.
+	thinWriter := MustParse(`{"type":"record","name":"R","fields":[{"name":"c","type":"int"}]}`)
+
+	resolvedWire, err := Resolve(wideWriter, full)
+	if err != nil {
+		t.Fatalf("resolve (writer-op arm): %v", err)
+	}
+	resolvedDflt, err := Resolve(thinWriter, withDefault)
+	if err != nil {
+		t.Fatalf("resolve (reader-default arm): %v", err)
+	}
+	mustEnc := func(s *Schema, v any) []byte {
+		t.Helper()
+		b, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatalf("encode fixture: %v", err)
+		}
+		return b
+	}
+	binFull := mustEnc(full, map[string]any{"a": int32(7), "c": int32(3)})
+	binWide := mustEnc(wideWriter, map[string]any{"a": int32(7), "x": int32(9), "c": int32(3)})
+	binThin := mustEnc(thinWriter, map[string]any{"c": int32(3)})
+
+	// The two targets differ ONLY in whether the embedded pointer's type is
+	// exported. Everything else — field names, tags, promoted depth — is equal,
+	// so a verdict that differs between them can only be the exportedness rule.
+	type target struct {
+		label string
+		fresh func(alloc bool) any
+		read  func(any) (a, c int32, embedSet bool)
+	}
+	targets := []target{{
+		label: "exported embed type (*EmbeddedInner)",
+		fresh: func(alloc bool) any {
+			v := &withNilEmbedPtr{}
+			if alloc {
+				v.EmbeddedInner = &EmbeddedInner{}
+			}
+			return v
+		},
+		read: func(p any) (int32, int32, bool) {
+			v := p.(*withNilEmbedPtr)
+			if v.EmbeddedInner == nil {
+				return 0, v.C, false
+			}
+			return v.A, v.C, true
+		},
+	}, {
+		label: "unexported embed type (*unexportedInner)",
+		fresh: func(alloc bool) any {
+			v := &withUnexportedEmbedPtr{}
+			if alloc {
+				v.unexportedInner = &unexportedInner{}
+			}
+			return v
+		},
+		read: func(p any) (int32, int32, bool) {
+			v := p.(*withUnexportedEmbedPtr)
+			if v.unexportedInner == nil {
+				return 0, v.C, false
+			}
+			return v.A, v.C, true
+		},
+	}}
+
+	type route struct {
+		label string
+		site  string // must be a key of embedIndexSites
+		wantA int32  // 7 from the wire, 5 from a schema default
+		run   func(dst any) error
+	}
+	routes := []route{{
+		"binary, compiled record", "unsafe.go:deserRecordFast", 7,
+		func(dst any) error { _, e := full.Decode(binFull, dst); return e },
+	}, {
+		"JSON, key present", "json_decode.go:jsonDecoder.decodeRecordStruct", 7,
+		func(dst any) error { return full.DecodeJSON([]byte(`{"a":7,"c":3}`), dst) },
+	}, {
+		"JSON, key absent (default fill)", "json_decode.go:jsonDecoder.decodeRecordStruct", 5,
+		func(dst any) error { return withDefault.DecodeJSON([]byte(`{"c":3}`), dst) },
+	}, {
+		"resolved, writer op", "resolve.go:resolvedRecord.deserStruct", 7,
+		func(dst any) error { _, e := resolvedWire.Decode(binWide, dst); return e },
+	}, {
+		"resolved, reader default", "resolve.go:resolvedRecord.deserStruct", 5,
+		func(dst any) error { _, e := resolvedDflt.Decode(binThin, dst); return e },
+	}}
+	for _, r := range routes {
+		if _, ok := embedIndexSites[r.site]; !ok {
+			t.Fatalf("route %q names site %q, which is not in embedIndexSites", r.label, r.site)
+		}
+	}
+
+	var accepted, rejected int
+	for _, tg := range targets {
+		for _, alloc := range []bool{false, true} {
+			occ := "nil embed"
+			if alloc {
+				occ = "pre-allocated embed"
+			}
+
+			// The oracle runs on the identical Go shape, one document carrying
+			// the same two values under encoding/json's own field names.
+			oracleDst := tg.fresh(alloc)
+			oracleErr := json.Unmarshal([]byte(`{"A":7,"C":3}`), oracleDst)
+			wantReject := oracleErr != nil
+			if wantReject {
+				rejected++
+			} else {
+				accepted++
+			}
+
+			for _, r := range routes {
+				t.Run(fmt.Sprintf("%s/%s/%s", tg.label, occ, r.label), func(t *testing.T) {
+					dst := tg.fresh(alloc)
+					err := func() (err error) {
+						defer func() {
+							if p := recover(); p != nil {
+								t.Fatalf("PANICKED where encoding/json returns %v: %v", oracleErr, p)
+							}
+						}()
+						return r.run(dst)
+					}()
+					if wantReject {
+						if err == nil {
+							t.Fatalf("accepted a shape encoding/json refuses (%v)", oracleErr)
+						}
+						if !strings.Contains(err.Error(), "unexported embedded pointer") {
+							t.Errorf("error must name what refused it, got: %v", err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("refused a shape encoding/json accepts: %v", err)
+					}
+					a, c, set := tg.read(dst)
+					if !set {
+						t.Fatalf("decode left the embedded pointer nil")
+					}
+					if a != r.wantA || c != 3 {
+						t.Fatalf("promoted a=%d c=%d, want a=%d c=3", a, c, r.wantA)
+					}
+				})
+			}
+		}
+	}
+	// A matrix whose oracle answers the same way in every cell is measuring
+	// nothing: the exportedness axis must actually split the verdict.
+	if accepted == 0 || rejected == 0 {
+		t.Fatalf("oracle never split: %d accepting cells, %d rejecting — the exportedness axis is not being exercised", accepted, rejected)
+	}
+
+	// ENCODE. fieldByIndexZero never needs to SET the embed, so a nil one is
+	// read as zero whatever its exportedness — on all three encode routes, which
+	// must agree with the all-zero map twin.
+	zeroImage := mustEnc(full, map[string]any{"a": int32(0), "c": int32(0)})
+	zeroJSON, err := full.EncodeJSON(map[string]any{"a": int32(0), "c": int32(0)})
+	if err != nil {
+		t.Fatalf("encoding the all-zero JSON twin: %v", err)
+	}
+	for _, tg := range targets {
+		nilV := tg.fresh(false)
+		for _, c := range []struct {
+			label, site string
+			enc         func() ([]byte, error)
+			want        []byte
+		}{
+			{"binary, compiled record", "unsafe.go:serRecordFast",
+				func() ([]byte, error) { return full.AppendEncode(nil, nilV) }, zeroImage},
+			{"binary, reflect path (non-addressable)", "ser.go:serRecord.ser",
+				func() ([]byte, error) { return full.AppendEncode(nil, reflect.ValueOf(nilV).Elem().Interface()) }, zeroImage},
+			{"JSON", "json_codec.go:appendAvroJSONRecord",
+				func() ([]byte, error) { return full.EncodeJSON(nilV) }, zeroJSON},
+		} {
+			t.Run(fmt.Sprintf("%s/nil embed/encode %s", tg.label, c.label), func(t *testing.T) {
+				if _, ok := embedIndexSites[c.site]; !ok {
+					t.Fatalf("encode route names site %q, which is not in embedIndexSites", c.site)
+				}
+				got, err := func() (b []byte, err error) {
+					defer func() {
+						if p := recover(); p != nil {
+							t.Fatalf("PANICKED encoding a nil embedded pointer: %v", p)
+						}
+					}()
+					return c.enc()
+				}()
+				if err != nil {
+					t.Fatalf("encoding a nil embedded pointer: %v", err)
+				}
+				if !bytes.Equal(got, c.want) {
+					t.Fatalf("nil embed encoded as %q, want the all-zero image %q", got, c.want)
+				}
+			})
+		}
+	}
+}
+
+// The route inventory must be DERIVED, not listed: a new fieldByIndex /
+// fieldByIndexZero call site is a new route through the embedded-pointer class,
+// and one landing without a cell in TestMatrix_NilEmbedPointerRouteAgreement is
+// exactly how four of the five decode sites came to be unreachable by the whole
+// suite. The guard fails in BOTH directions — an unlisted site appearing, and a
+// listed site going away — so it can neither let a new member ship unexercised
+// nor go stale after a removal.
+func TestInvariant_EveryFieldByIndexSiteHasARouteCell(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	found := map[string]int{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), e.Name(), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", e.Name(), err)
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			name := fd.Name.Name
+			if fd.Recv != nil && len(fd.Recv.List) == 1 {
+				rt := fd.Recv.List[0].Type
+				if star, ok := rt.(*ast.StarExpr); ok {
+					rt = star.X
+				}
+				if id, ok := rt.(*ast.Ident); ok {
+					name = id.Name + "." + name
+				}
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				id, ok := call.Fun.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				if id.Name == "fieldByIndex" || id.Name == "fieldByIndexZero" {
+					found[e.Name()+":"+name]++
+				}
+				return true
+			})
+		}
+	}
+
+	for site, n := range found {
+		switch want, ok := embedIndexSites[site]; {
+		case !ok:
+			t.Errorf("%s calls fieldByIndex/fieldByIndexZero %d time(s) but has no route cell — "+
+				"add it to embedIndexSites and drive it from TestMatrix_NilEmbedPointerRouteAgreement", site, n)
+		case want != n:
+			t.Errorf("%s has %d call(s), embedIndexSites claims %d — the extra call is a route with no cell", site, n, want)
+		}
+	}
+	for site := range embedIndexSites {
+		if _, ok := found[site]; !ok {
+			t.Errorf("embedIndexSites lists %s, which no longer calls fieldByIndex/fieldByIndexZero — "+
+				"the table is stale and its cell is measuring nothing", site)
+		}
+	}
 }
 
 // roundTripWinners proves, through the REAL Encode/Decode path (which consumes
