@@ -337,8 +337,8 @@ func parse(schema string, b *builder) (*Schema, error) {
 // the builder would accept; it short-circuits input deeper than the builder
 // accepts (and deeper than json's own ~10000 nesting cap) in one O(input)
 // pass. Parse itself is O(n) — see parseSchemaTree and canonicalBytes — so
-// this is a cheap early-reject, no longer the load-bearing DoS defense it was
-// when the unmarshal and canonical marshal were quadratic.
+// this is a cheap early-reject rather than the defense the DoS bound rests
+// on, as it was when the unmarshal and canonical marshal were quadratic.
 const maxSchemaJSONDepth = maxDepth * 4
 
 // checkSchemaNestingDepth reports an error if schema's JSON nests deeper than
@@ -1833,10 +1833,8 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		b.ser = makeCustomSer(wiring.encode, node.ser)
 	}
 
-	// jsonAppliesLogical narrows suppression to nodes whose JSON decoder
-	// actually transforms the raw value (a logical decodeKind would apply):
-	// only those need a JSON-side suppress-wrapper to mirror the binary raw
-	// decode. See buildCustomWiring for the suppression contract.
+	// See buildCustomWiring for what this narrowing buys and the
+	// suppression contract behind it.
 	jsonAppliesLogical := wiring.suppressLogical && jsonDecodeAppliesLogical(node)
 	if len(wiring.decoders) > 0 {
 		b.deser = wrapDeserWithCustomDecoders(node.deser, wiring.decoders, wiring.sn)
@@ -2057,14 +2055,10 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 		}
 		return nil
 	}
-	// Check if this is a named type reference (record, enum, fixed).
-	// setCanon=false: the buildPrimitive path's canon was already set to
-	// s.primitive above; only the namespace-qualified retry needs to
-	// rewrite it, which tryAssignNamedRef handles internally when given
-	// setCanon=true. To keep the bare-name canon as written (only the
-	// qualified retry rewrites it), we tell the helper
-	// to setCanon for both branches and let the bare path overwrite with
-	// the identical name.
+	// A named type reference (record, enum, fixed). setCanon is passed for
+	// both branches: only the namespace-qualified retry needs to rewrite
+	// the canon, and the bare path overwrites it with the identical name
+	// already set above.
 	if found, err := b.tryAssignNamedRef(s.primitive, parentName, true); err != nil || found {
 		return err
 	}
@@ -3002,8 +2996,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.deser = dr.deser
 		b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: dr}
 
-		// Register early so self-referencing fields (e.g. array
-		// items, map values) can resolve the type by name.
 		nd := &schemaNode{
 			kind:        "record",
 			name:        o.Name,
@@ -4094,22 +4086,6 @@ func normalizeJSONNumber(n json.Number) any {
 	}
 	return n
 }
-
-// defaultAsInt32 / defaultAsInt64 / defaultAsFloat extract a numeric
-// default. After unmarshalDefault, a JSON number arrives as json.Number
-// (full precision); a few callers also pass float64 (e.g. round-tripped
-// through coerceDefault). Float-defaulted-from-string is accepted for
-// float / double (Java parser leniency).
-//
-// All three are precision-aware:
-//   - defaultAsInt32 / defaultAsInt64 reject overflow via
-//     parseInt{32,64}Lenient (which uses boundedRatFromString for
-//     arbitrary-precision parsing).
-//   - defaultAsFloat rejects integer-form magnitudes exceeding the
-//     target's mantissa precision (1<<24 for float, 1<<53 for double)
-//     so the schema's declared default is reachable at runtime via
-//     the equivalent json.Number / typed-int encode arms, which apply
-//     the same predicate.
 
 // numericDefault extracts a typed integer default. After
 // unmarshalDefault, a JSON number arrives as json.Number (full precision);
