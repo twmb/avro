@@ -325,9 +325,20 @@ func indirectAlloc(v reflect.Value) reflect.Value {
 // the toAny=true branches in json_decode), do NOT use setIface. Pass rv
 // across a function boundary and escape analysis loses sight of it,
 // forcing every reflect.ValueOf(primitive) call to heap-allocate per
-// decode (~+2 allocs / +330 B per record decode in the bench). Those sites
-// inline the check instead, with the empty-interface case written first so
-// rv is only constructed on the typed-interface branch.
+// decode (~+2 allocs / +330 B per record decode in the bench). Inline the
+// check at the callsite instead, with the fast path written first so
+// rv only exists on the slow branch:
+//
+//	if v.Type().NumMethod() == 0 {        // empty interface (any) — common
+//	    v.Set(reflect.ValueOf(b))
+//	    return nil
+//	}
+//	rv := reflect.ValueOf(b)              // slow path: typed interface
+//	if !rv.Type().AssignableTo(v.Type()) {
+//	    return &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+//	}
+//	v.Set(rv)
+//	return nil
 func setIface(v, rv reflect.Value, avroType string) error {
 	if v.Kind() != reflect.Interface {
 		return &SemanticError{GoType: v.Type(), AvroType: avroType}
