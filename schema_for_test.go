@@ -1403,7 +1403,7 @@ func TestSchemaForTypeAliasCrossRecord(t *testing.T) {
 		}
 		type Outer struct {
 			Def    Inner  `avro:"def,type-alias=old_inner"` // defines Inner + alias (processed first)
-			Nested Nested `avro:"nested"`                    // its Ref references Inner from another record
+			Nested Nested `avro:"nested"`                   // its Ref references Inner from another record
 		}
 		s, err := SchemaFor[Outer]()
 		if err != nil {
@@ -4002,12 +4002,12 @@ func TestSchemaForEncodeParity(t *testing.T) {
 		// byte containers
 		reflect.TypeFor[[]byte](), reflect.TypeFor[[4]byte](), reflect.TypeFor[[16]byte](),
 		// codec-special-cased stdlib types (Kind misleads)
-		reflect.TypeFor[json.Number](),   // Kind String, codec rejects → SchemaFor must reject
-		reflect.TypeFor[time.Time](),     // Kind Struct → logical long
-		reflect.TypeFor[time.Duration](), // Kind Int64 → logical
-		reflect.TypeFor[Duration](),      // Kind Struct → duration fixed(12), NOT a record
-		reflect.TypeFor[*Duration](),     // nullable duration fixed
-		reflect.TypeFor[[]Duration](),    // array of duration fixed
+		reflect.TypeFor[json.Number](),         // Kind String, codec rejects → SchemaFor must reject
+		reflect.TypeFor[time.Time](),           // Kind Struct → logical long
+		reflect.TypeFor[time.Duration](),       // Kind Int64 → logical
+		reflect.TypeFor[Duration](),            // Kind Struct → duration fixed(12), NOT a record
+		reflect.TypeFor[*Duration](),           // nullable duration fixed
+		reflect.TypeFor[[]Duration](),          // array of duration fixed
 		reflect.TypeFor[map[string]Duration](), // map of duration fixed
 		reflect.TypeFor[big.Rat](),             // requires decimal tag → reject untagged
 		reflect.TypeFor[*big.Rat](),            // requires decimal tag → reject untagged
