@@ -799,42 +799,6 @@ const (
 	valueWalkBadMapKey        // a map key json.Marshal's key resolver cannot name
 )
 
-// valueWalkLimit walks v — a Props value or a SchemaField.Default, an arbitrary
-// user-supplied JSON tree — the way json.Marshal will, returning a non-OK code
-// when the value is unsafe to serialize at [SchemaNode.Schema]. It enforces two
-// orthogonal limits, because a value is handed to jsonSerializableValue
-// (needsJSONFixup/applyJSONFixup) and then to json.Marshal, neither of which
-// bounds anything:
-//
-//   - DEPTH (depthLeft): the longest container PATH. A value nested far enough
-//     overflows the goroutine stack uncatchably (recover cannot catch a stack
-//     overflow) in the fixup walk or in json.Marshal, before Schema's eventual
-//     Parse can reject it. depthLeft mirrors toJSONWalk's structural depth
-//     bound, charging the structural nesting already accrued so the total
-//     marshaled nesting stays within one ceiling.
-//
-//   - EXPANSION (b.nodes, the node budget shared with the structural
-//     toJSONWalk): the TOTAL nodes json.Marshal will emit. A value that shares a
-//     sub-value across sibling paths is shallow yet fans out into a 2^depth tree
-//     when serialized (see maxSchemaJSONNodes). The depth bound is blind to it;
-//     only counting emitted nodes catches it. b.nodes is decremented on EVERY
-//     node, so the walk itself terminates at the budget — it can neither overflow
-//     its own stack nor hang on a shared-reference DAG or a cyclic Go type
-//     (type P *P).
-//
-//   - PAYLOAD SIZE (b.bytes, the byte budget shared with the structural walk):
-//     the TOTAL bytes of every emitted scalar — string and json.Number content,
-//     []byte (codepoint-string) content, map keys, struct field names. A value
-//     whose leaves are huge or share one big string across many nodes is small
-//     in memory yet expands past memory in json.Marshal's output, invisible to
-//     the node count (see maxSchemaJSONBytes).
-//
-// The walk mirrors what json.Marshal recurses into — maps, slices, arrays,
-// structs, and pointer/interface indirection — not just the map[string]any /
-// []any shapes [Schema.Root] produces (a hand-built node or a SchemaFor
-// CustomType.Schema can store ANY Go value the map[string]any field accepts).
-// []byte/[N]byte are a codepoint/base64 scalar (charged by length, not walked as
-// a nested array).
 // marshalEmitLen reports how many bytes json.Marshal will emit for a value
 // that defines its own JSON form, and whether it is such a value at all.
 // json.Marshal consults json.Marshaler first, then encoding.TextMarshaler,
@@ -1072,6 +1036,42 @@ func mapKeyEmitLen(k reflect.Value, limit int) (int, bool) {
 	return 0, false
 }
 
+// valueWalkLimit walks v — a Props value or a SchemaField.Default, an arbitrary
+// user-supplied JSON tree — the way json.Marshal will, returning a non-OK code
+// when the value is unsafe to serialize at [SchemaNode.Schema]. It enforces
+// three orthogonal limits, because a value is handed to jsonSerializableValue
+// (needsJSONFixup/applyJSONFixup) and then to json.Marshal, neither of which
+// bounds anything:
+//
+//   - DEPTH (depthLeft): the longest container PATH. A value nested far enough
+//     overflows the goroutine stack uncatchably (recover cannot catch a stack
+//     overflow) in the fixup walk or in json.Marshal, before Schema's eventual
+//     Parse can reject it. depthLeft mirrors toJSONWalk's structural depth
+//     bound, charging the structural nesting already accrued so the total
+//     marshaled nesting stays within one ceiling.
+//
+//   - EXPANSION (b.nodes, the node budget shared with the structural
+//     toJSONWalk): the TOTAL nodes json.Marshal will emit. A value that shares a
+//     sub-value across sibling paths is shallow yet fans out into a 2^depth tree
+//     when serialized (see maxSchemaJSONNodes). The depth bound is blind to it;
+//     only counting emitted nodes catches it. b.nodes is decremented on EVERY
+//     node, so the walk itself terminates at the budget — it can neither overflow
+//     its own stack nor hang on a shared-reference DAG or a cyclic Go type
+//     (type P *P).
+//
+//   - PAYLOAD SIZE (b.bytes, the byte budget shared with the structural walk):
+//     the TOTAL bytes of every emitted scalar — string and json.Number content,
+//     []byte (codepoint-string) content, map keys, struct field names. A value
+//     whose leaves are huge or share one big string across many nodes is small
+//     in memory yet expands past memory in json.Marshal's output, invisible to
+//     the node count (see maxSchemaJSONBytes).
+//
+// The walk mirrors what json.Marshal recurses into — maps, slices, arrays,
+// structs, and pointer/interface indirection — not just the map[string]any /
+// []any shapes [Schema.Root] produces (a hand-built node or a SchemaFor
+// CustomType.Schema can store ANY Go value the map[string]any field accepts).
+// []byte/[N]byte are a codepoint/base64 scalar (charged by length, not walked as
+// a nested array).
 func valueWalkLimit(rv reflect.Value, depthLeft int, b *walkBudget) int {
 	if depthLeft < 0 {
 		return valueWalkTooDeep
@@ -1653,16 +1653,15 @@ func jsonNumericInt(v any) (int, bool) {
 	return 0, false
 }
 
-// getString assigns *dst to m[key] when present and string-typed. Mirrors
-// the exact-lookup + type-assert pattern repeated ~6 times in
-// nodeFromJSONObject and metadataField. Reserved attribute names match
-// ONLY their exact lowercase spelling — a case-variant key is an ordinary
-// custom property (Java's reserved sets are exact-lowercase HashSets,
-// Schema.java:175-176; fastavro and goavro read exact names too).
 // getString reads m[key] into dst when the body is a JSON string, and
 // reports whether it did. The bool is the attribute's PRESENCE as distinct
 // from its value: an empty string sets dst to the field's own zero, so the
 // field alone can no longer say whether the key was written.
+//
+// The lookup is by exact name: reserved attribute names match ONLY their
+// exact lowercase spelling, and a case-variant key is an ordinary custom
+// property (Java's reserved sets are exact-lowercase HashSets,
+// Schema.java:175-176; fastavro and goavro read exact names too).
 func getString(m map[string]any, key string, dst *string) bool {
 	s, ok := m[key].(string)
 	if ok {

@@ -851,17 +851,6 @@ func finiteFloat32Overflows(f float64) bool {
 	return !math.IsInf(f, 0) && !math.IsNaN(f) && math.IsInf(float64(float32(f)), 0)
 }
 
-// appendAvroFloat32 appends v's Avro-float (4-byte) encoding to dst.
-// Encoding into a float schema is lossy by destination: int/uint inputs
-// exceeding float32's 24-bit mantissa silently IEEE-round, and finite
-// float64 inputs that overflow float32's range silently narrow to ±Inf.
-// Matches Java's GenericDatumWriter (Number.floatValue()) and fastavro
-// (struct.pack("<f", v)). Users wanting precise round-trip for large
-// integers should use "long", not "float".
-//
-// Used by serFloat (top-level), serArray.serFloat / serMap.serFloat
-// (specialized container paths), and any other site that encodes a
-// reflect-typed value as Avro float.
 // float32WireBits returns f's exact 32-bit pattern, matching Java's
 // Float.floatToRawIntBits and the unsafe path (usFloat). reflect.Value.Float()
 // would widen to float64 and narrow back, quieting signaling-NaN payloads;
@@ -895,6 +884,17 @@ func float32WireBits(v reflect.Value) uint32 {
 	return *(*uint32)(unsafe.Pointer(tmp.UnsafeAddr()))
 }
 
+// appendAvroFloat32 appends v's Avro-float (4-byte) encoding to dst.
+// Encoding into a float schema is lossy by destination: int/uint inputs
+// exceeding float32's 24-bit mantissa silently IEEE-round, and finite
+// float64 inputs that overflow float32's range silently narrow to ±Inf.
+// Matches Java's GenericDatumWriter (Number.floatValue()) and fastavro
+// (struct.pack("<f", v)). Users wanting precise round-trip for large
+// integers should use "long", not "float".
+//
+// Used by serFloat (top-level), serArray.serFloat / serMap.serFloat
+// (specialized container paths), and any other site that encodes a
+// reflect-typed value as Avro float.
 func appendAvroFloat32(dst []byte, v reflect.Value) ([]byte, error) {
 	if v.Kind() == reflect.Float32 {
 		// Same-width: emit exact bits (preserve sNaN), matching Java + unsafe.

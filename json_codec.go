@@ -1442,27 +1442,6 @@ func appendTaggedUnion(buf []byte, union, branch *schemaNode, encoded []byte, ta
 	return append(buf, '}')
 }
 
-// findUnionBranch finds a union branch by type name.
-//
-// We accept three tag conventions on input for cross-implementation
-// interop, in order:
-//
-//  1. Exact match against the spec/Java fullname (e.g. "long" or
-//     "com.example.User"). This is what we emit on output, and the only
-//     form the references emit or read (Java's JsonEncoder keys by
-//     getFullName(); fastavro 1.12.2's json_writer emits the fullname
-//     and its AvroJSONDecoder.read_index exact-matches branch labels —
-//     a short-name tag raises there, observed).
-//  2. goavro's "type.logicalType" form (e.g. "long.timestamp-millis"):
-//     match the base primitive before the dot.
-//  3. Unqualified short-name form for named types ("User" instead of
-//     "com.example.User") — a twmb leniency for hand-written JSON; no
-//     reference implementation emits or reads it (fastavro's short-name
-//     matching exists only in schema RESOLUTION, match_schemas'
-//     unqualified-name tier, not in union-tag decoding). Only applied
-//     when the input has no namespace AND exactly one branch matches by
-//     short name; ambiguous cases return no match rather than guess.
-//
 // unionTagTier is one tier of the union tag namespace: the rule by which a tag
 // a caller wrote names a branch. A tier answers ONE question — which name does
 // this tier make this branch answer to — and both consumers of the namespace
@@ -1570,6 +1549,26 @@ var unionTagTiers = []unionTagTier{
 	},
 }
 
+// findUnionBranch finds a union branch by type name.
+//
+// We accept three tag conventions on input for cross-implementation
+// interop, in order:
+//
+//  1. Exact match against the spec/Java fullname (e.g. "long" or
+//     "com.example.User"). This is what we emit on output, and the only
+//     form the references emit or read (Java's JsonEncoder keys by
+//     getFullName(); fastavro 1.12.2's json_writer emits the fullname
+//     and its AvroJSONDecoder.read_index exact-matches branch labels —
+//     a short-name tag raises there, observed).
+//  2. goavro's "type.logicalType" form (e.g. "long.timestamp-millis"):
+//     match the base primitive before the dot.
+//  3. Unqualified short-name form for named types ("User" instead of
+//     "com.example.User") — a twmb leniency for hand-written JSON; no
+//     reference implementation emits or reads it (fastavro's short-name
+//     matching exists only in schema RESOLUTION, match_schemas'
+//     unqualified-name tier, not in union-tag decoding). Only applied
+//     when the input has no namespace AND exactly one branch matches by
+//     short name; ambiguous cases return no match rather than guess.
 func findUnionBranch(union *schemaNode, name string) *schemaNode {
 	// The tier walk below is the RULE; unionTags.byName is that rule already
 	// applied, once, at parse time. Asking the table here is what keeps this

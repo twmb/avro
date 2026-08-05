@@ -1383,7 +1383,6 @@ func appendTypeAliasValues(s map[string]any, aliases []string) {
 	}
 }
 
-// inferType returns the Avro schema for a Go type.
 // baseTypeForLogical returns the underlying Avro type required by the
 // given logical type per the Avro 1.12 spec. Used by SchemaFor's
 // inferType to produce schemas that validateLogical (schema.go) will
@@ -1402,6 +1401,8 @@ func baseTypeForLogical(logical, fallback string) string {
 	return fallback
 }
 
+// inferType returns the Avro schema for a Go type.
+//
 // ptrChain is the number of CONSECUTIVE pointer levels already unwrapped to
 // reach t, reset to 0 at every record-field / array-item / map-value boundary
 // (the codec calls indirect/indirectAlloc fresh on each such leaf value). The
