@@ -1,20 +1,29 @@
 package avro_test
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"crypto/md5"
 	"crypto/sha256"
+	"encoding"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/big"
+	"math/rand"
+	"net"
+	"os"
+	"os/exec"
 	"reflect"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +32,8 @@ import (
 	"github.com/twmb/avro"
 	"github.com/twmb/avro/ocf"
 )
+
+// ---------- conformance_test.go ----------
 
 // ---------- helpers_test.go ----------
 
@@ -22866,5 +22877,5292 @@ func TestRegression_UnionDefaultComplianceDoesNotMoveTheBranch(t *testing.T) {
 	}
 	if w[0] != 0x02 {
 		t.Fatalf("control: an int branch cannot take a string default, so selection must reach branch 1 (0x02); got %#x", w[0])
+	}
+}
+
+// ---------- example_test.go ----------
+
+func Example() {
+	schema := avro.MustParse(`{
+		"type": "record",
+		"name": "User",
+		"fields": [
+			{"name": "name", "type": "string"},
+			{"name": "age",  "type": "int"}
+		]
+	}`)
+
+	type User struct {
+		Name string `avro:"name"`
+		Age  int32  `avro:"age"`
+	}
+
+	data, err := schema.Encode(&User{Name: "Alice", Age: 30})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var u User
+	if _, err := schema.Decode(data, &u); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s is %d\n", u.Name, u.Age)
+	// Output: Alice is 30
+}
+
+func ExampleResolve() {
+	// v1 wrote User with just a name.
+	writerSchema := avro.MustParse(`{
+		"type": "record", "name": "User",
+		"fields": [{"name": "name", "type": "string"}]
+	}`)
+
+	// v2 added an email field with a default.
+	readerSchema := avro.MustParse(`{
+		"type": "record", "name": "User",
+		"fields": [
+			{"name": "name",  "type": "string"},
+			{"name": "email", "type": "string", "default": ""}
+		]
+	}`)
+
+	resolved, err := avro.Resolve(writerSchema, readerSchema)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Encode a v1 record (name only).
+	v1Data, err := writerSchema.Encode(map[string]any{"name": "Alice"})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Decode old data into the new layout; email gets the default.
+	type User struct {
+		Name  string `avro:"name"`
+		Email string `avro:"email"`
+	}
+	var u User
+	if _, err := resolved.Decode(v1Data, &u); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("name=%s email=%q\n", u.Name, u.Email)
+	// Output: name=Alice email=""
+}
+
+func ExampleSchema_AppendEncode() {
+	schema := avro.MustParse(`"string"`)
+
+	// AppendEncode reuses a buffer across calls, avoiding allocation.
+	var buf []byte
+	var err error
+	for _, s := range []string{"hello", "world"} {
+		buf, err = schema.AppendEncode(buf[:0], s)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("encoded %q: %d bytes\n", s, len(buf))
+	}
+	// Output:
+	// encoded "hello": 6 bytes
+	// encoded "world": 6 bytes
+}
+
+func ExampleSchemaCache() {
+	cache := new(avro.SchemaCache)
+
+	// Parse the Address type first.
+	if _, err := cache.Parse(`{
+		"type": "record",
+		"name": "Address",
+		"fields": [
+			{"name": "street", "type": "string"},
+			{"name": "city",   "type": "string"}
+		]
+	}`); err != nil {
+		log.Fatal(err)
+	}
+
+	// User references Address by name.
+	schema, err := cache.Parse(`{
+		"type": "record",
+		"name": "User",
+		"fields": [
+			{"name": "name",    "type": "string"},
+			{"name": "address", "type": "Address"}
+		]
+	}`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	type Address struct {
+		Street string `avro:"street"`
+		City   string `avro:"city"`
+	}
+	type User struct {
+		Name    string  `avro:"name"`
+		Address Address `avro:"address"`
+	}
+
+	data, err := schema.Encode(&User{
+		Name:    "Alice",
+		Address: Address{Street: "123 Main St", City: "Springfield"},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var u User
+	if _, err := schema.Decode(data, &u); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s lives at %s, %s\n", u.Name, u.Address.Street, u.Address.City)
+	// Output: Alice lives at 123 Main St, Springfield
+}
+
+func ExampleSchema_AppendSingleObject() {
+	schema := avro.MustParse(`{
+		"type": "record",
+		"name": "Event",
+		"fields": [
+			{"name": "id",   "type": "long"},
+			{"name": "name", "type": "string"}
+		]
+	}`)
+
+	type Event struct {
+		ID   int64  `avro:"id"`
+		Name string `avro:"name"`
+	}
+
+	// Encode: 2-byte magic + 8-byte fingerprint + Avro payload.
+	data, err := schema.AppendSingleObject(nil, &Event{ID: 1, Name: "click"})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Decode.
+	var e Event
+	if _, err := schema.DecodeSingleObject(data, &e); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("id=%d name=%s\n", e.ID, e.Name)
+	// Output: id=1 name=click
+}
+
+func ExampleSchema_EncodeJSON() {
+	schema := avro.MustParse(`{
+		"type": "record",
+		"name": "User",
+		"fields": [
+			{"name": "name",  "type": "string"},
+			{"name": "email", "type": ["null", "string"]}
+		]
+	}`)
+
+	type User struct {
+		Name  string  `avro:"name"`
+		Email *string `avro:"email"`
+	}
+	email := "alice@example.com"
+	u := User{Name: "Alice", Email: &email}
+
+	// Default: bare union values.
+	bare, err := schema.EncodeJSON(&u)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(bare))
+
+	// TaggedUnions: wrapped as {"type": value}.
+	tagged, err := schema.EncodeJSON(&u, avro.TaggedUnions())
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(tagged))
+	// Output:
+	// {"name":"Alice","email":"alice@example.com"}
+	// {"name":"Alice","email":{"string":"alice@example.com"}}
+}
+
+func ExampleSchema_DecodeJSON() {
+	schema := avro.MustParse(`{
+		"type": "record",
+		"name": "User",
+		"fields": [
+			{"name": "name",  "type": "string"},
+			{"name": "email", "type": ["null", "string"]}
+		]
+	}`)
+
+	type User struct {
+		Name  string  `avro:"name"`
+		Email *string `avro:"email"`
+	}
+
+	// DecodeJSON accepts both bare and tagged union formats.
+	var u1, u2 User
+	if err := schema.DecodeJSON([]byte(`{"name":"Alice","email":"a@b.com"}`), &u1); err != nil {
+		log.Fatal(err)
+	}
+	if err := schema.DecodeJSON([]byte(`{"name":"Bob","email":{"string":"b@c.com"}}`), &u2); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s: %s\n", u1.Name, *u1.Email)
+	fmt.Printf("%s: %s\n", u2.Name, *u2.Email)
+	// Output:
+	// Alice: a@b.com
+	// Bob: b@c.com
+}
+
+func ExampleSchemaFor() {
+	type Event struct {
+		ID     int64     `avro:"id"`
+		Name   string    `avro:"name,default=unnamed"`
+		Source string    `avro:"source,default=web"`
+		Time   time.Time `avro:"ts"`
+		Meta   *string   `avro:"meta"` // *T becomes ["null", T] union
+	}
+
+	schema := avro.MustSchemaFor[Event](avro.WithNamespace("com.example"))
+
+	// Encode, then decode back.
+	meta := "test"
+	data, err := schema.Encode(&Event{
+		ID:     1,
+		Name:   "click",
+		Source: "mobile",
+		Time:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Meta:   &meta,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var out Event
+	if _, err := schema.Decode(data, &out); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("id=%d name=%s source=%s meta=%s\n", out.ID, out.Name, out.Source, *out.Meta)
+
+	// Inspect the inferred schema.
+	root := schema.Root()
+	for _, f := range root.Fields {
+		if f.HasDefault {
+			fmt.Printf("field %s: default=%v\n", f.Name, f.Default)
+		}
+	}
+	// Output:
+	// id=1 name=click source=mobile meta=test
+	// field name: default=unnamed
+	// field source: default=web
+	// field meta: default=<nil>
+}
+
+func ExampleSchema_Encode_textMarshaler() {
+	// Types implementing encoding.TextMarshaler are encoded as Avro
+	// strings, and encoding.TextUnmarshaler types decode from them.
+	schema := avro.MustParse(`{
+		"type": "record",
+		"name": "Server",
+		"fields": [
+			{"name": "name", "type": "string"},
+			{"name": "ip",   "type": "string"}
+		]
+	}`)
+
+	type Server struct {
+		Name string `avro:"name"`
+		IP   net.IP `avro:"ip"`
+	}
+
+	data, err := schema.Encode(&Server{
+		Name: "web-1",
+		IP:   net.IPv4(192, 168, 1, 1),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var out Server
+	if _, err := schema.Decode(data, &out); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s: %s\n", out.Name, out.IP)
+	// Output: web-1: 192.168.1.1
+}
+
+type ExMoney struct {
+	Cents int64
+}
+
+func ExampleNewCustomType() {
+	// NewCustomType is the easiest way to map a custom Go type to/from a
+	// primitive Avro type. The type parameters wire everything up:
+	//   G = your Go type, A = the Avro-native Go type it maps to.
+	//
+	// A is the raw type on the wire:
+	//   int32 → Avro int       float32 → Avro float     bool   → Avro boolean
+	//   int64 → Avro long      float64 → Avro double    string → Avro string
+	//   []byte → Avro bytes
+	//
+	// The first argument is the logicalType to match. Pass "" to match
+	// all schema nodes of the inferred Avro type.
+	moneyType := avro.NewCustomType[ExMoney, int64]("money",
+		func(m ExMoney, _ *avro.SchemaNode) (int64, error) { return m.Cents, nil },
+		func(c int64, _ *avro.SchemaNode) (ExMoney, error) { return ExMoney{Cents: c}, nil },
+	)
+
+	schema := avro.MustParse(`{
+		"type": "record", "name": "Order",
+		"fields": [
+			{"name": "price", "type": {"type": "long", "logicalType": "money"}}
+		]
+	}`, moneyType)
+
+	type Order struct {
+		Price ExMoney `avro:"price"`
+	}
+
+	data, err := schema.Encode(&Order{Price: ExMoney{Cents: 1999}})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var out Order
+	if _, err := schema.Decode(data, &out); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%d cents\n", out.Price.Cents)
+	// Output: 1999 cents
+}
+
+func ExampleCustomType_override() {
+	// Use CustomType directly to override a built-in logical type handler.
+	// Here we suppress the timestamp-millis → time.Time conversion and
+	// keep the raw int64 epoch millis.
+	schema := avro.MustParse(`{
+		"type": "record", "name": "Event",
+		"fields": [
+			{"name": "ts", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+		]
+	}`, avro.CustomType{
+		LogicalType: "timestamp-millis",
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return v, nil // pass through raw int64
+		},
+	})
+
+	data, _ := schema.Encode(map[string]any{"ts": int64(1767225600000)})
+	var out any
+	schema.Decode(data, &out)
+	m := out.(map[string]any)
+	fmt.Printf("ts type: %T\n", m["ts"])
+	// Output: ts type: int64
+}
+
+func ExampleCustomType_schemaFor() {
+	// Setting GoType lets SchemaFor infer the Avro schema for struct
+	// fields of that type. Without GoType, SchemaFor doesn't know that
+	// a Cents field should map to {"type":"long","logicalType":"money"}.
+	type Cents int64
+	ct := avro.CustomType{
+		LogicalType: "money",
+		AvroType:    "long",
+		GoType:      reflect.TypeFor[Cents](),
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return int64(v.(Cents)), nil
+		},
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return Cents(v.(int64)), nil
+		},
+	}
+
+	type Order struct {
+		Price Cents `avro:"price"`
+	}
+	schema, err := avro.SchemaFor[Order](ct)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(schema.Root().Fields[0].Type.LogicalType)
+	// Output: money
+}
+
+func ExampleCustomType_propertyDispatch() {
+	// CustomType with no LogicalType/AvroType/GoType matches ALL schema
+	// nodes. Use ErrSkipCustomType to selectively handle nodes based on
+	// schema properties, e.g. Kafka Connect type annotations.
+	ct := avro.CustomType{
+		Decode: func(v any, node *avro.SchemaNode) (any, error) {
+			if node.Props["connect.type"] == "double-it" {
+				return v.(int64) * 2, nil
+			}
+			return nil, avro.ErrSkipCustomType
+		},
+	}
+
+	// Properties on the type object are available via node.Props in the
+	// custom type callback.
+	schema := avro.MustParse(`{
+		"type": "record", "name": "R",
+		"fields": [
+			{"name": "x", "type": {"type": "long", "connect.type": "double-it"}},
+			{"name": "y", "type": "long"}
+		]
+	}`, ct)
+
+	data, _ := schema.Encode(map[string]any{"x": int64(5), "y": int64(5)})
+	var out any
+	schema.Decode(data, &out)
+	m := out.(map[string]any)
+	fmt.Printf("x=%d y=%d\n", m["x"], m["y"])
+	// Output: x=10 y=5
+}
+
+// ---------- canonical_vectors_test.go ----------
+
+// Vectors in testdata/avro-schema-tests.txt are vendored from Apache Avro
+// (apache/avro), Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0
+
+// schemaTestVec is one case parsed from the Apache schema-tests.txt oracle.
+type schemaTestVec struct {
+	input       string
+	canonical   string
+	fingerprint string // empty when the case has no fingerprint line
+}
+
+// parseApacheSchemaTests parses the official heredoc-style format:
+//
+//	// NNN
+//	<<INPUT <schema json>            (single line) OR
+//	<<INPUT
+//	<multi-line schema json>
+//	INPUT                            (bare terminator)
+//	<<canonical <parsing-canonical-form json>
+//	<<fingerprint <signed int64 rabin>   (optional)
+func parseApacheSchemaTests(raw string) []schemaTestVec {
+	lines := strings.Split(raw, "\n")
+	var vecs []schemaTestVec
+	var cur *schemaTestVec
+	flush := func() {
+		if cur != nil && cur.input != "" {
+			vecs = append(vecs, *cur)
+		}
+		cur = nil
+	}
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		switch {
+		case strings.HasPrefix(line, "<<INPUT"):
+			flush()
+			rest := strings.TrimSpace(strings.TrimPrefix(line, "<<INPUT"))
+			if rest != "" {
+				cur = &schemaTestVec{input: rest}
+				break
+			}
+			// Heredoc: accumulate following lines until a bare "INPUT".
+			var b strings.Builder
+			for i++; i < len(lines) && strings.TrimSpace(lines[i]) != "INPUT"; i++ {
+				b.WriteString(lines[i])
+				b.WriteByte(' ')
+			}
+			cur = &schemaTestVec{input: strings.TrimSpace(b.String())}
+		case strings.HasPrefix(line, "<<canonical ") && cur != nil:
+			cur.canonical = strings.TrimPrefix(line, "<<canonical ")
+		case strings.HasPrefix(line, "<<fingerprint ") && cur != nil:
+			cur.fingerprint = strings.TrimSpace(strings.TrimPrefix(line, "<<fingerprint "))
+		}
+	}
+	flush()
+	return vecs
+}
+
+// schemaTestKnownDivergences maps an INPUT (verbatim from the vector file) to
+// the reason twmb intentionally does NOT match the Apache oracle. Each entry
+// is verified to STILL diverge (Parse must still fail / differ); a stale entry
+// — twmb starting to agree with the oracle — fails the test so it gets removed
+// and the case re-enabled. Keep this list short and every entry justified.
+var schemaTestKnownDivergences = map[string]string{}
+
+// TestApacheSchemaTestsVectors runs the ENTIRE official Apache Avro
+// schema-tests.txt cross-implementation oracle (vendored at
+// testdata/avro-schema-tests.txt; carries its own Apache-2.0 header). Each
+// case gives an INPUT schema, its expected Parsing Canonical Form, and — for
+// most — the expected CRC-64-AVRO (Rabin) fingerprint as a signed int64.
+// These values are validated by the Java reference implementation, so they
+// are a real external oracle, not the author's belief.
+//
+// This is the Tier-1 canonical/fingerprint differential: a future
+// canonical-form or fingerprint divergence (the F5 class) fails here
+// automatically instead of waiting for an audit. See CORRECTNESS_PLAN.md §T1a.
+func TestApacheSchemaTestsVectors(t *testing.T) {
+	raw, err := os.ReadFile("testdata/avro-schema-tests.txt")
+	if err != nil {
+		t.Fatalf("read vendored vectors: %v", err)
+	}
+	vecs := parseApacheSchemaTests(string(raw))
+	if len(vecs) < 30 {
+		t.Fatalf("parsed only %d vectors; expected ~35 — parser or file drift", len(vecs))
+	}
+
+	var canonChecked, fpChecked, diverged int
+	for _, v := range vecs {
+		if reason, known := schemaTestKnownDivergences[v.input]; known {
+			// Verify the documented divergence still holds (Parse fails or
+			// canonical differs); a now-agreeing case means a stale allowlist.
+			if s, err := avro.Parse(v.input); err == nil && string(s.Canonical()) == v.canonical {
+				t.Errorf("stale known-divergence: twmb now matches the oracle for %q — remove the allowlist entry", v.input)
+			} else {
+				diverged++
+				t.Logf("documented divergence for %q: %s", v.input, reason)
+			}
+			continue
+		}
+
+		s, err := avro.Parse(v.input)
+		if err != nil {
+			t.Errorf("Parse(%s): %v", v.input, err)
+			continue
+		}
+		if v.canonical != "" {
+			if got := string(s.Canonical()); got != v.canonical {
+				t.Errorf("Canonical(%s)\n got  %s\n want %s", v.input, got, v.canonical)
+			} else {
+				canonChecked++
+			}
+		}
+		if v.fingerprint != "" {
+			want, perr := strconv.ParseInt(v.fingerprint, 10, 64)
+			if perr != nil {
+				t.Errorf("bad fingerprint vector %q: %v", v.fingerprint, perr)
+				continue
+			}
+			h := avro.NewRabin()
+			h.Write(s.Canonical())
+			if got := int64(h.Sum64()); got != want {
+				t.Errorf("Rabin fingerprint for %s: got %d want %d", v.input, got, want)
+			} else {
+				fpChecked++
+			}
+		}
+	}
+	t.Logf("Apache oracle: %d canonical forms, %d fingerprints verified, %d documented divergences", canonChecked, fpChecked, diverged)
+}
+
+// Canonical() escapes control characters using the same short forms
+// encoding/json uses — including backspace (0x08) as \\b and formfeed
+// (0x0c) as \\f, not \\u0008 / \\u000c — so the canonical bytes (and
+// fingerprint) match the prior json.Marshal-based emitter for the lax
+// names that can carry them.
+func TestRegression_CanonicalBackspaceFormfeedShortForm(t *testing.T) {
+	// reachable only via a fully-permissive lax-name checker.
+	lax := avro.WithLaxNames(func(string) error { return nil })
+	s, err := avro.Parse("{\"type\":\"enum\",\"name\":\"E\",\"symbols\":[\"a\\b\\fz\"]}", lax)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c := string(s.Canonical())
+	if !strings.Contains(c, `\b`) || !strings.Contains(c, `\f`) {
+		t.Errorf("canonical should use \\b and \\f short forms: %s", c)
+	}
+	if strings.Contains(c, `\u0008`) || strings.Contains(c, `\u000c`) {
+		t.Errorf("canonical should NOT use \\u0008/\\u000c long forms: %s", c)
+	}
+	if !json.Valid(s.Canonical()) {
+		t.Errorf("canonical invalid JSON: %s", c)
+	}
+}
+
+// ---------- differential_test.go ----------
+
+// Tier-1 differential testing against fastavro (an independent reference
+// implementation). Everything is compared as Avro bytes, so there is no
+// fragile cross-language value coercion:
+//
+//   - encode parity:   twmb.Encode(v) bytes == fastavro encode(v) bytes
+//                      (skipped for map-containing schemas: map entry order
+//                       is unspecified, so bytes legitimately differ)
+//   - fastavro reads twmb: fastavro decodes twmb's bytes without error
+//   - twmb reads fastavro:  twmb.Decode succeeds on fastavro's bytes
+//
+// This retires the "twmb disagrees with the reference" commit class for the
+// covered schema shapes. The test SKIPS (does not fail) when fastavro is not
+// installed, so `go test ./...` stays green without the toolchain; CI/local
+// runs set AVRO_FASTAVRO_PYTHON to a python with fastavro. See
+// CORRECTNESS_PLAN.md §T1b/§T1c and testdata/oracle/README.md.
+//
+// Binary- and logical-typed values (bytes, fixed, decimal, uuid, timestamp)
+// are covered by TestDifferentialFastavroBinaryLogical in
+// differential_logical_test.go, which carries them to the oracle via the
+// Kind-tagged transport. Still NOT covered: ambiguous multi-numeric unions
+// (encode branch-selection can legitimately differ by impl).
+
+type oracleJob struct {
+	Op     string          `json:"op"`
+	Schema json.RawMessage `json:"schema"`
+	Value  json.RawMessage `json:"value,omitempty"`
+	// Kind tags how the oracle must reconstruct Value into a native Python
+	// type before fastavro encodes it: "" passes the JSON value through, while
+	// "bytes"/"fixed" base64-decode it, "decimal" builds a decimal.Decimal,
+	// and "timestamp-millis"/"timestamp-micros" build a UTC datetime. Lets the
+	// differential carry binary- and logical-typed values JSON cannot.
+	Kind string `json:"kind,omitempty"`
+	// No omitempty: a zero-byte encoding (e.g. the "null" type) has an empty
+	// hex string that must still be sent, or the oracle sees no "hex" key.
+	Hex string `json:"hex"`
+	// JSON carries the Avro-JSON text for the "jsonread" op.
+	JSON string `json:"json,omitempty"`
+	// Reader carries the reader schema for the "readresolve" op (resolved
+	// read; dropped writer fields route through fastavro's skip_* twins).
+	Reader json.RawMessage `json:"reader,omitempty"`
+}
+
+type oracleResp struct {
+	OK        bool   `json:"ok"`
+	Hex       string `json:"hex"`
+	Canonical string `json:"canonical"`
+	JSON      string `json:"json"`
+	Values    []any  `json:"values"`
+	// Parsed carries the "parsedump" op's schema-as-fastavro-kept-it, so a
+	// differential can assert an attribute was PRESERVED rather than only
+	// that the schema parsed.
+	Parsed string `json:"parsed"`
+	Err    string `json:"err"`
+	Fatal  string `json:"fatal"`
+}
+
+type oracle struct {
+	cmd *exec.Cmd
+	in  io.WriteCloser
+	out *bufio.Reader
+	t   *testing.T
+}
+
+func oraclePython() string {
+	if p := os.Getenv("AVRO_FASTAVRO_PYTHON"); p != "" {
+		return p
+	}
+	return "python3"
+}
+
+// startOracle launches the fastavro oracle subprocess, or skips the test when
+// python / fastavro is unavailable.
+func startOracle(t *testing.T) *oracle {
+	py := oraclePython()
+	if _, err := exec.LookPath(py); err != nil {
+		t.Skipf("python interpreter %q not found; set AVRO_FASTAVRO_PYTHON (skip differential)", py)
+	}
+	if err := exec.Command(py, "-c", "import fastavro").Run(); err != nil {
+		t.Skipf("fastavro not importable via %q (%v); `pip install fastavro` to enable the differential", py, err)
+	}
+	cmd := exec.Command(py, "testdata/oracle/fastavro_oracle.py")
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	outPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start oracle: %v", err)
+	}
+	o := &oracle{cmd: cmd, in: in, out: bufio.NewReader(outPipe), t: t}
+	t.Cleanup(func() { _ = o.in.Close(); _ = o.cmd.Wait() })
+	return o
+}
+
+func (o *oracle) call(job oracleJob) oracleResp {
+	o.t.Helper()
+	b, err := json.Marshal(job)
+	if err != nil {
+		o.t.Fatalf("marshal job: %v", err)
+	}
+	if _, err := o.in.Write(append(b, '\n')); err != nil {
+		o.t.Fatalf("write job: %v", err)
+	}
+	line, err := o.out.ReadBytes('\n')
+	if err != nil {
+		o.t.Fatalf("read oracle response: %v", err)
+	}
+	var resp oracleResp
+	if err := json.Unmarshal(line, &resp); err != nil {
+		o.t.Fatalf("unmarshal oracle response %q: %v", strings.TrimSpace(string(line)), err)
+	}
+	if resp.Fatal != "" {
+		o.t.Skipf("oracle fatal: %s", resp.Fatal)
+	}
+	return resp
+}
+
+type diffSeed struct {
+	name   string
+	schema string
+	value  any  // typed Go value (precise; not routed through json.Unmarshal-into-any)
+	hasMap bool // map entry order is unspecified → skip byte-parity, keep readability checks
+}
+
+func diffSeeds() []diffSeed {
+	enum := `{"type":"enum","name":"E","symbols":["A","B","C"]}`
+	rec := `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`
+	return []diffSeed{
+		{"null", `"null"`, nil, false},
+		{"bool true", `"boolean"`, true, false},
+		{"bool false", `"boolean"`, false, false},
+		{"int 0", `"int"`, int32(0), false},
+		{"int 42", `"int"`, int32(42), false},
+		{"int min", `"int"`, int32(math.MinInt32), false},
+		{"int max", `"int"`, int32(math.MaxInt32), false},
+		{"long 0", `"long"`, int64(0), false},
+		{"long 2^53+1", `"long"`, int64(9007199254740993), false}, // exact (typed int64, not float64)
+		{"long max", `"long"`, int64(math.MaxInt64), false},
+		{"long min", `"long"`, int64(math.MinInt64), false},
+		{"float 1.5", `"float"`, float32(1.5), false},
+		{"float -3.25", `"float"`, float32(-3.25), false},
+		{"double 1.5", `"double"`, float64(1.5), false},
+		{"double 1e308", `"double"`, float64(1e308), false},
+		{"string empty", `"string"`, "", false},
+		{"string unicode", `"string"`, "café 日本 🎉", false},
+		{"enum B", enum, "B", false},
+		{"array int", `{"type":"array","items":"int"}`, []int32{1, 2, 3, -7}, false},
+		{"array empty", `{"type":"array","items":"long"}`, []int64{}, false},
+		{"array string", `{"type":"array","items":"string"}`, []string{"a", "b", ""}, false},
+		{"record", rec, map[string]any{"a": int32(7), "b": "x"}, false},
+		{"union null/int -> int", `["null","int"]`, int32(5), false},
+		{"union null/int -> null", `["null","int"]`, nil, false},
+		{"union null/string -> string", `["null","string"]`, "s", false},
+		{"map int (decode-only)", `{"type":"map","values":"int"}`, map[string]any{"k": int32(1), "j": int32(2)}, true},
+	}
+}
+
+func TestDifferentialFastavro(t *testing.T) {
+	o := startOracle(t)
+	var encParity, faRead, twmbRead int
+	for _, sd := range diffSeeds() {
+		t.Run(sd.name, func(t *testing.T) {
+			s, err := avro.Parse(sd.schema)
+			if err != nil {
+				t.Fatalf("twmb Parse: %v", err)
+			}
+			valJSON, err := json.Marshal(sd.value)
+			if err != nil {
+				t.Fatalf("marshal seed value: %v", err)
+			}
+
+			// twmb encode.
+			bTwmb, err := s.Encode(sd.value)
+			if err != nil {
+				t.Fatalf("twmb Encode(%#v): %v", sd.value, err)
+			}
+
+			// fastavro encode.
+			enc := o.call(oracleJob{Op: "encode", Schema: json.RawMessage(sd.schema), Value: valJSON})
+			if !enc.OK {
+				t.Fatalf("fastavro encode failed: %s", enc.Err)
+			}
+
+			// (1) encode byte parity (non-map).
+			if !sd.hasMap {
+				if got := hex.EncodeToString(bTwmb); got != enc.Hex {
+					t.Errorf("encode byte mismatch vs fastavro:\n twmb     %s\n fastavro %s", got, enc.Hex)
+				} else {
+					encParity++
+				}
+			}
+
+			// (2) fastavro reads twmb's bytes.
+			if d := o.call(oracleJob{Op: "decode", Schema: json.RawMessage(sd.schema), Hex: hex.EncodeToString(bTwmb)}); !d.OK {
+				t.Errorf("fastavro cannot decode twmb's bytes: %s", d.Err)
+			} else {
+				faRead++
+			}
+
+			// (3) twmb reads fastavro's bytes.
+			faBytes, err := hex.DecodeString(enc.Hex)
+			if err != nil {
+				t.Fatalf("decode fastavro hex: %v", err)
+			}
+			var out any
+			if _, err := s.Decode(faBytes, &out); err != nil {
+				t.Errorf("twmb cannot decode fastavro's bytes: %v", err)
+			} else {
+				twmbRead++
+			}
+		})
+	}
+	t.Logf("fastavro differential: %d encode-parity, %d fastavro-reads-twmb, %d twmb-reads-fastavro", encParity, faRead, twmbRead)
+}
+
+// ---------- differential_json_test.go ----------
+
+// ---------------------------------------------------------------------------
+// JSON-wire differential vs fastavro's json_writer / json_reader: executes
+// the JSON-encoding behaviors this package documents against the reference
+// implementations, instead of citing them. Three cell classes:
+//
+//   - PARITY cells: twmb's EncodeJSON text must equal fastavro's
+//     json_writer text (bytes/fixed codepoint strings, tagged-union
+//     envelopes keyed by fullname), and each engine must read the other's
+//     text back to the same value.
+//   - REJECT-PARITY cells: both engines must reject the same malformed or
+//     unrepresentable inputs (bare value against a tagged-union reader,
+//     JSON null against a union without a null branch, lowercase "nan",
+//     trailing content).
+//   - CALIBRATION cells: documented divergences pinned at fastavro's
+//     OBSERVED verdict (1.12.2) so an upgrade that changes fastavro's
+//     behavior flips the cell and forces a deliberate recalibration —
+//     never a silently rotting claim: fastavro emits BARE NaN where twmb
+//     emits the quoted Java form, and fastavro's json_reader returns
+//     twmb's quoted "NaN" as a plain string (it applies no float
+//     validation) where twmb parses NaN.
+// ---------------------------------------------------------------------------
+
+func TestDifferentialFastavroJSON(t *testing.T) {
+	o := startOracle(t)
+
+	// twmbJSON encodes one value with twmb, failing the test on error.
+	twmbJSON := func(t *testing.T, schema string, v any, opts ...avro.Opt) string {
+		t.Helper()
+		s := avro.MustParse(schema)
+		out, err := s.EncodeJSON(v, opts...)
+		if err != nil {
+			t.Fatalf("twmb EncodeJSON: %v", err)
+		}
+		return string(out)
+	}
+
+	// compact normalizes insignificant JSON whitespace (fastavro's
+	// json.dump writes ": " where twmb writes ":") so parity compares
+	// content, not formatting. Non-JSON text (bare NaN) passes through.
+	compact := func(t *testing.T, s string) string {
+		t.Helper()
+		var buf strings.Builder
+		dec := json.NewDecoder(strings.NewReader(s))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return s
+		}
+		enc := json.NewEncoder(&buf)
+		if err := enc.Encode(v); err != nil {
+			return s
+		}
+		return strings.TrimRight(buf.String(), "\n")
+	}
+
+	t.Run("bytes codepoint string parity", func(t *testing.T) {
+		// Avro JSON writes bytes as a codepoint-per-byte string (spec;
+		// Java's JsonEncoder writeByteArray via ISO_8859_1). The 'A' byte
+		// stays literal, 0x00 and 0xE9 become \u escapes in both engines.
+		got := twmbJSON(t, `"bytes"`, []byte{0x00, 0xE9, 'A'})
+		resp := o.call(oracleJob{Op: "jsonwrite", Schema: json.RawMessage(`"bytes"`),
+			Value: json.RawMessage(`"AOlB"`), Kind: "bytes"}) // base64 of 00 e9 41
+		if !resp.OK {
+			t.Fatalf("fastavro json_writer: %s", resp.Err)
+		}
+		if resp.JSON != got {
+			t.Errorf("bytes JSON text: twmb %s, fastavro %s", got, resp.JSON)
+		}
+		// twmb reads fastavro's text back to the identical bytes.
+		var back []byte
+		if err := avro.MustParse(`"bytes"`).DecodeJSON([]byte(resp.JSON), &back); err != nil {
+			t.Fatalf("twmb DecodeJSON of fastavro text: %v", err)
+		}
+		if string(back) != "\x00\xe9A" {
+			t.Errorf("round-trip bytes: %x", back)
+		}
+	})
+
+	t.Run("fixed codepoint string parity", func(t *testing.T) {
+		schema := `{"type":"fixed","name":"F","size":3}`
+		got := twmbJSON(t, schema, []byte{0x01, 0xFF, 'B'})
+		resp := o.call(oracleJob{Op: "jsonwrite", Schema: json.RawMessage(schema),
+			Value: json.RawMessage(`"Af9C"`), Kind: "fixed"}) // base64 of 01 ff 42
+		if !resp.OK {
+			t.Fatalf("fastavro json_writer: %s", resp.Err)
+		}
+		if resp.JSON != got {
+			t.Errorf("fixed JSON text: twmb %s, fastavro %s", got, resp.JSON)
+		}
+	})
+
+	t.Run("tagged union envelope parity", func(t *testing.T) {
+		schema := `["null","int"]`
+		got := twmbJSON(t, schema, int32(7), avro.TaggedUnions())
+		resp := o.call(oracleJob{Op: "jsonwrite", Schema: json.RawMessage(schema),
+			Value: json.RawMessage(`7`)})
+		if !resp.OK {
+			t.Fatalf("fastavro json_writer: %s", resp.Err)
+		}
+		if compact(t, resp.JSON) != compact(t, got) {
+			t.Errorf("union JSON text: twmb %s, fastavro %s", got, resp.JSON)
+		}
+		// fastavro reads twmb's tagged output.
+		read := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(schema), JSON: got})
+		if !read.OK || len(read.Values) != 1 || fmt.Sprint(read.Values[0]) != "7" {
+			t.Errorf("fastavro json_read of twmb tagged output: ok=%v values=%v err=%s",
+				read.OK, read.Values, read.Err)
+		}
+	})
+
+	t.Run("tagged union envelope keyed by fullname", func(t *testing.T) {
+		schema := `["null",{"type":"record","name":"com.ex.User","fields":[{"name":"a","type":"int"}]}]`
+		got := twmbJSON(t, schema, map[string]any{"a": int32(1)}, avro.TaggedUnions())
+		resp := o.call(oracleJob{Op: "jsonwrite", Schema: json.RawMessage(schema),
+			Value: json.RawMessage(`{"a":1}`)})
+		if !resp.OK {
+			t.Fatalf("fastavro json_writer: %s", resp.Err)
+		}
+		if compact(t, resp.JSON) != compact(t, got) {
+			t.Errorf("named-branch envelope: twmb %s, fastavro %s", got, resp.JSON)
+		}
+		if !strings.Contains(got, `"com.ex.User"`) {
+			t.Errorf("envelope key is not the fullname: %s", got)
+		}
+	})
+
+	t.Run("bare union output is NOT readable by fastavro", func(t *testing.T) {
+		// The documented interop divergence behind the TaggedUnions doc:
+		// twmb's default bare-union output is rejected by the references'
+		// JSON decoders. Executed here for fastavro (Java's JsonDecoder
+		// readIndex throws "Expected start-union" for the same shape).
+		schema := `["null","int"]`
+		bare := twmbJSON(t, schema, int32(7)) // no TaggedUnions: "7"
+		read := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(schema), JSON: bare})
+		if read.OK {
+			t.Errorf("fastavro now READS twmb's bare union output %q (historically rejected) — revisit the TaggedUnions interop note", bare)
+		}
+	})
+
+	t.Run("json null rejected without a null branch", func(t *testing.T) {
+		schema := `["int","string"]`
+		read := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(schema), JSON: `null`})
+		if read.OK {
+			t.Errorf("fastavro accepted null against a no-null union")
+		}
+		var v any
+		if err := avro.MustParse(schema).DecodeJSON([]byte(`null`), &v); err == nil {
+			t.Errorf("twmb accepted null against a no-null union")
+		}
+	})
+
+	t.Run("special float spelling calibration", func(t *testing.T) {
+		// twmb (default) emits the quoted Java JsonEncoder form; fastavro
+		// emits the bare Python json.dumps(allow_nan=True) token. A
+		// documented divergence, pinned at both engines' observed output.
+		got := twmbJSON(t, `"double"`, math.NaN())
+		if got != `"NaN"` {
+			t.Errorf("twmb NaN spelling: %s, want quoted \"NaN\"", got)
+		}
+		resp := o.call(oracleJob{Op: "jsonwrite", Schema: json.RawMessage(`"double"`),
+			Value: json.RawMessage(`null`), Kind: "nan"})
+		if !resp.OK {
+			t.Fatalf("fastavro json_writer NaN: %s", resp.Err)
+		}
+		if resp.JSON != "NaN" {
+			t.Errorf("fastavro NaN spelling: %q, want bare NaN (recalibrate the parseSpecialFloat docstring if fastavro changed)", resp.JSON)
+		}
+		// twmb reads fastavro's bare token (the lenient accept the bare-token
+		// arm of decodeJSONFloat documents).
+		var f float64
+		if err := avro.MustParse(`"double"`).DecodeJSON([]byte(resp.JSON), &f); err != nil || !math.IsNaN(f) {
+			t.Errorf("twmb DecodeJSON of fastavro bare NaN: %v %v", f, err)
+		}
+		// fastavro reads twmb's QUOTED form as a plain string — it applies
+		// no float validation on JSON read (observed 1.12.2; the quoted
+		// convention is Java's, not fastavro's). Calibration pin.
+		read := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(`"double"`), JSON: got})
+		if !read.OK || len(read.Values) != 1 || fmt.Sprint(read.Values[0]) != "NaN" {
+			t.Errorf("fastavro json_read of quoted NaN: ok=%v values=%v err=%s (recalibrate: fastavro may have added float validation)",
+				read.OK, read.Values, read.Err)
+		}
+	})
+
+	t.Run("lowercase nan rejected by both", func(t *testing.T) {
+		read := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(`"double"`), JSON: `nan`})
+		if read.OK {
+			t.Errorf("fastavro accepted lowercase nan: %v", read.Values)
+		}
+		var f float64
+		if err := avro.MustParse(`"double"`).DecodeJSON([]byte(`nan`), &f); err == nil {
+			t.Errorf("twmb accepted lowercase nan")
+		}
+	})
+
+	t.Run("trailing content rejected by both", func(t *testing.T) {
+		read := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(`"int"`), JSON: `7 garbage`})
+		if read.OK {
+			t.Errorf("fastavro accepted trailing content: %v", read.Values)
+		}
+		var v int32
+		if err := avro.MustParse(`"int"`).DecodeJSON([]byte(`7 garbage`), &v); err == nil {
+			t.Errorf("twmb accepted trailing content")
+		}
+	})
+
+	t.Run("empty-named branch tagged envelope parity", func(t *testing.T) {
+		// A union branch whose short name is empty (lax names) tags by its
+		// FULLNAME like any named branch. fastavro is the only reference
+		// impl that parses the shape; both engines emit `{"ok.": ...}` and
+		// each reads the other's text.
+		acceptAll := func(string) error { return nil }
+		schema := `["null",{"type":"enum","name":"","namespace":"ok","symbols":["A","B"]}]`
+		s, err := avro.Parse(schema, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("twmb parse: %v", err)
+		}
+		got, err := s.EncodeJSON("A", avro.TaggedUnions())
+		if err != nil {
+			t.Fatalf("twmb EncodeJSON: %v", err)
+		}
+		resp := o.call(oracleJob{Op: "jsonwrite", Schema: json.RawMessage(schema),
+			Value: json.RawMessage(`"A"`)})
+		if !resp.OK {
+			t.Fatalf("fastavro json_writer: %s", resp.Err)
+		}
+		if compact(t, resp.JSON) != compact(t, string(got)) {
+			t.Errorf("empty-named union tag: twmb %s, fastavro %s", got, resp.JSON)
+		}
+		read := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(schema), JSON: string(got)})
+		if !read.OK || len(read.Values) != 1 || fmt.Sprint(read.Values[0]) != "A" {
+			t.Errorf("fastavro json_read of twmb tag: ok=%v values=%v err=%s", read.OK, read.Values, read.Err)
+		}
+		var back any
+		if err := s.DecodeJSON([]byte(resp.JSON), &back); err != nil || back != "A" {
+			t.Errorf("twmb DecodeJSON of fastavro tag: %v %v", back, err)
+		}
+
+		// Calibration: the BARE empty-name class ("" fullname). twmb emits
+		// and round-trips `{"":"A"}`; fastavro's json_writer cannot produce
+		// the envelope (observed 1.12.2: "No key was set" — the falsy
+		// fullname never becomes the key) while its json_reader accepts the
+		// "" key, so twmb's emission stays fastavro-readable. An upgrade
+		// that makes the write succeed flips this pin — recalibrate.
+		bare := `["null",{"type":"enum","name":"","symbols":["A","B"]}]`
+		bs, err := avro.Parse(bare, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("twmb parse bare: %v", err)
+		}
+		bgot, err := bs.EncodeJSON("A", avro.TaggedUnions())
+		if err != nil {
+			t.Fatalf("twmb EncodeJSON bare: %v", err)
+		}
+		if string(bgot) != `{"":"A"}` {
+			t.Errorf("twmb bare tag: %s, want {\"\":\"A\"}", bgot)
+		}
+		bwrite := o.call(oracleJob{Op: "jsonwrite", Schema: json.RawMessage(bare),
+			Value: json.RawMessage(`"A"`)})
+		if bwrite.OK {
+			t.Errorf("fastavro json_writer wrote the bare empty-name envelope %q (recalibrate: 1.12.2 errored)", bwrite.JSON)
+		}
+		bread := o.call(oracleJob{Op: "jsonread", Schema: json.RawMessage(bare), JSON: string(bgot)})
+		if !bread.OK || len(bread.Values) != 1 || fmt.Sprint(bread.Values[0]) != "A" {
+			t.Errorf("fastavro json_read of twmb bare tag: ok=%v values=%v err=%s", bread.OK, bread.Values, bread.Err)
+		}
+	})
+}
+
+// ---------- differential_logical_test.go ----------
+
+// TestDifferentialFastavroBinaryLogical extends the fastavro differential
+// (differential_test.go) to the binary- and logical-typed values JSON cannot
+// carry directly: bytes, fixed, decimal, uuid, and timestamps. These are the
+// belief-heavy types a self-consistent round-trip cannot police -- a symmetric
+// encode/decode bug round-trips cleanly yet writes the wrong wire. fastavro
+// reconstructs each value INDEPENDENTLY from the Kind-tagged transport (a
+// base64 string, a decimal string, an epoch integer) and encodes it, so byte
+// parity here means twmb and fastavro independently agree on the wire -- the
+// check that catches a symmetric bug. Skips (does not fail) without fastavro;
+// CI sets AVRO_FASTAVRO_PYTHON. See differential_test.go and the oracle README.
+
+type diffTypedSeed struct {
+	name    string
+	schema  string
+	goValue any    // value handed to twmb.Encode
+	kind    string // transport kind for the oracle ("" = plain JSON of oracle)
+	oracle  any    // value sent to the oracle; nil => marshal goValue directly
+}
+
+func diffTypedSeeds() []diffTypedSeed {
+	return []diffTypedSeed{
+		// bytes: goValue []byte marshals to a base64 string; kind tells the
+		// oracle to base64-decode it back to Python bytes.
+		{"bytes", `"bytes"`, []byte{0x00, 0x01, 0x7f, 0x80, 0xff}, "bytes", nil},
+		{"bytes empty", `"bytes"`, []byte{}, "bytes", nil},
+		{"bytes high", `"bytes"`, []byte{0xde, 0xad, 0xbe, 0xef}, "bytes", nil},
+
+		// fixed: raw N bytes, no length prefix.
+		{"fixed8", `{"type":"fixed","name":"F8","size":8}`, []byte{1, 2, 3, 4, 5, 6, 7, 8}, "fixed", nil},
+		{"fixed1", `{"type":"fixed","name":"F1","size":1}`, []byte{0xff}, "fixed", nil},
+
+		// decimal (bytes): twmb encodes a *big.Rat; fastavro builds the same
+		// value from a decimal string and encodes independently.
+		{"decimal 123.45", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(12345, 100), "decimal", "123.45"},
+		{"decimal -0.01", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(-1, 100), "decimal", "-0.01"},
+		{"decimal 0.00", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(0, 1), "decimal", "0.00"},
+		{"decimal 99999999.99", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(9999999999, 100), "decimal", "99999999.99"},
+
+		// uuid logical on string: the wire is the plain string, so no special
+		// transport is needed (kind "").
+		{"uuid string", `{"type":"string","logicalType":"uuid"}`, "550e8400-e29b-41d4-a716-446655440000", "", nil},
+
+		// timestamp logical on long: twmb encodes a time.Time; fastavro builds
+		// the same instant from an epoch integer.
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, time.UnixMilli(1600000000123).UTC(), "timestamp-millis", int64(1600000000123)},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`, time.UnixMicro(1600000000123456).UTC(), "timestamp-micros", int64(1600000000123456)},
+		{"timestamp-millis epoch", `{"type":"long","logicalType":"timestamp-millis"}`, time.UnixMilli(0).UTC(), "timestamp-millis", int64(0)},
+	}
+}
+
+func TestDifferentialFastavroBinaryLogical(t *testing.T) {
+	o := startOracle(t)
+	var encParity, faRead, twmbRead int
+	for _, sd := range diffTypedSeeds() {
+		t.Run(sd.name, func(t *testing.T) {
+			s, err := avro.Parse(sd.schema)
+			if err != nil {
+				t.Fatalf("twmb Parse: %v", err)
+			}
+
+			oracleVal := sd.oracle
+			if oracleVal == nil {
+				oracleVal = sd.goValue
+			}
+			valJSON, err := json.Marshal(oracleVal)
+			if err != nil {
+				t.Fatalf("marshal oracle value: %v", err)
+			}
+
+			// twmb encode.
+			bTwmb, err := s.Encode(sd.goValue)
+			if err != nil {
+				t.Fatalf("twmb Encode(%#v): %v", sd.goValue, err)
+			}
+
+			// fastavro encode, reconstructing the value from the transport.
+			enc := o.call(oracleJob{Op: "encode", Schema: json.RawMessage(sd.schema), Value: valJSON, Kind: sd.kind})
+			if !enc.OK {
+				t.Fatalf("fastavro encode failed: %s", enc.Err)
+			}
+
+			// (1) encode byte parity — twmb and fastavro independently agree.
+			if got := hex.EncodeToString(bTwmb); got != enc.Hex {
+				t.Errorf("encode byte mismatch vs fastavro:\n twmb     %s\n fastavro %s", got, enc.Hex)
+			} else {
+				encParity++
+			}
+
+			// (2) fastavro reads twmb's bytes.
+			if d := o.call(oracleJob{Op: "decode", Schema: json.RawMessage(sd.schema), Hex: hex.EncodeToString(bTwmb)}); !d.OK {
+				t.Errorf("fastavro cannot decode twmb's bytes: %s", d.Err)
+			} else {
+				faRead++
+			}
+
+			// (3) twmb reads fastavro's bytes.
+			faBytes, err := hex.DecodeString(enc.Hex)
+			if err != nil {
+				t.Fatalf("decode fastavro hex: %v", err)
+			}
+			var out any
+			if _, err := s.Decode(faBytes, &out); err != nil {
+				t.Errorf("twmb cannot decode fastavro's bytes: %v", err)
+			} else {
+				twmbRead++
+			}
+		})
+	}
+	t.Logf("fastavro binary/logical differential: %d encode-parity, %d fastavro-reads-twmb, %d twmb-reads-fastavro", encParity, faRead, twmbRead)
+}
+
+// ---------- null_spelling_differential_test.go ----------
+
+// nullSpellDiffMarker is the Go type the differential's CustomType matches on.
+type nullSpellDiffMarker struct{ A int64 }
+
+type nullSpellDiffRec struct {
+	F nullSpellDiffMarker
+}
+
+// The four spellings of one null branch. wrapped_plain renders back to bare
+// (the renderer emits a carrier-free wrapped null bare), so it is a control
+// that the axis itself is wired up; the carrier-bearing spellings are the
+// ones that reach the composition walkers as objects.
+var nullSpellDiffUnions = []struct{ name, union string }{
+	{"bare", `["null","string"]`},
+	{"wrapped_plain", `[{"type":"null"},"string"]`},
+	{"wrapped_props", `[{"type":"null","x":1},"string"]`},
+	{"wrapped_logicaltype", `[{"type":"null","logicalType":"nope"},"string"]`},
+}
+
+// TestDifferentialFastavroSchemaForNullSpelling drives a foreign
+// implementation over the schemas SchemaFor EMITS for each null spelling.
+// The emitted text is the artifact a caller publishes — to a registry, or
+// straight to another implementation — so a foreign reader is the oracle
+// that matters, and it is the only one that can see the consequence of a
+// dropped "default":null: twmb synthesizes an implicit null default for a
+// nullable union at parse, while Java and fastavro require it written.
+//
+// Two arms per spelling:
+//
+//   - canonical: fastavro must accept the emitted schema, and its own
+//     parsing canonical form must match twmb's Canonical() — which subsumes
+//     fingerprint equality with no byte-order presentation trap.
+//   - evolution (readresolve): data written by a writer that predates the
+//     field must still read through the emitted schema as the reader. This
+//     is the sharpest oracle for the default fill; with the default dropped
+//     fastavro raises SchemaResolutionError ("No default value for field F")
+//     while the bare spelling reads back a null.
+//
+// Skips without AVRO_FASTAVRO_PYTHON, like every differential.
+func TestDifferentialFastavroSchemaForNullSpelling(t *testing.T) {
+	o := startOracle(t)
+
+	// The writer predates field F: an empty record, so the datum is zero
+	// bytes and the reader must supply F from its own default. The record
+	// name must be the one SchemaFor derives from the Go type, since
+	// resolution matches records by name before it looks at fields.
+	writerSchema := `{"type":"record","name":"nullSpellDiffRec","fields":[]}`
+	writer := avro.MustParse(writerSchema)
+	wire, err := writer.Encode(map[string]any{})
+	if err != nil {
+		t.Fatalf("encode pre-field datum: %v", err)
+	}
+
+	for _, tc := range nullSpellDiffUnions {
+		t.Run(tc.name, func(t *testing.T) {
+			cs, err := avro.Parse(tc.union)
+			if err != nil {
+				t.Fatalf("parse custom union: %v", err)
+			}
+			root := cs.Root()
+			ct := avro.CustomType{GoType: reflect.TypeFor[nullSpellDiffMarker](), Schema: root}
+
+			s, err := avro.SchemaFor[nullSpellDiffRec](ct)
+			if err != nil {
+				t.Fatalf("SchemaFor: %v", err)
+			}
+			emitted := s.String()
+
+			// Arm 1: fastavro accepts the emitted schema and agrees on the
+			// canonical form.
+			resp := o.call(oracleJob{Op: "canonical", Schema: json.RawMessage(emitted)})
+			if !resp.OK {
+				t.Fatalf("fastavro rejected the emitted schema: %s\n%s", resp.Err, emitted)
+			}
+			if want := string(s.Canonical()); resp.Canonical != want {
+				t.Fatalf("canonical differs from fastavro:\n twmb     %s\n fastavro %s\n emitted  %s", want, resp.Canonical, emitted)
+			}
+
+			// Arm 2: a foreign reader resolves pre-field data through the
+			// emitted schema. A dropped "default":null fails here.
+			resp = o.call(oracleJob{
+				Op:     "readresolve",
+				Schema: json.RawMessage(writerSchema),
+				Reader: json.RawMessage(emitted),
+				Hex:    hex.EncodeToString(wire),
+			})
+			if !resp.OK {
+				t.Fatalf("fastavro cannot read pre-field data through the emitted schema: %s\n emitted %s",
+					resp.Err, emitted)
+			}
+			if len(resp.Values) != 1 {
+				t.Fatalf("want 1 resolved value, got %d", len(resp.Values))
+			}
+			got, ok := resp.Values[0].(map[string]any)
+			if !ok {
+				t.Fatalf("resolved value is %T, want an object: %#v", resp.Values[0], resp.Values[0])
+			}
+			if v, present := got["F"]; !present || v != nil {
+				t.Fatalf("fastavro resolved F = %#v (present=%v), want a filled null", v, present)
+			}
+
+			// twmb's own resolved read must agree with the foreign one.
+			resolved, err := avro.Resolve(writer, s)
+			if err != nil {
+				t.Fatalf("twmb Resolve: %v", err)
+			}
+			var out map[string]any
+			if _, err := resolved.Decode(wire, &out); err != nil {
+				t.Fatalf("twmb resolved decode: %v", err)
+			}
+			if v, present := out["F"]; !present || v != nil {
+				t.Fatalf("twmb resolved F = %#v (present=%v), want a filled null", v, present)
+			}
+		})
+	}
+}
+
+// ---------- matrix_alias_differential_test.go ----------
+
+// TestDifferentialFastavroAliasResolution executes every cell of the alias
+// census (TestMatrix_AliasResolutionCensus's spelling × writer-namespace ×
+// kind × site axes) against a real fastavro process: a value is encoded
+// with the writer schema and resolved-read with the reader schema
+// (schemaless_reader with both schemas — fastavro's match_schemas is the
+// matcher under test on their side).
+//
+// fastavro's verdict table differs from twmb's on exactly one row: the
+// leading-dot alias spelling. fastavro compares alias strings as written
+// (".Old" matches no writer fullname), while twmb applies Java's Name-
+// constructor rule (Schema.java ~1455: lastDot split, empty space → null
+// namespace), under which ".Old" is the null-namespace fullname "Old" —
+// so twmb and Java accept the null-namespace writer that fastavro rejects.
+// Every other row must agree exactly, both accept AND reject sides.
+func TestDifferentialFastavroAliasResolution(t *testing.T) {
+	o := startOracle(t)
+
+	writerName := map[string]string{"samens": "n1.Old", "foreignns": "n2.Old", "nullns": "Old"}
+	aliasSpelling := map[string]string{
+		"bare":          "Old",
+		"dottedown":     "n1.Old",
+		"dottedforeign": "n2.Old",
+		"leadingdot":    ".Old",
+	}
+	twmbAccept := map[string]map[string]bool{
+		"bare":          {"samens": true, "foreignns": true, "nullns": true},
+		"dottedown":     {"samens": true, "foreignns": false, "nullns": false},
+		"dottedforeign": {"samens": false, "foreignns": true, "nullns": false},
+		"leadingdot":    {"samens": false, "foreignns": false, "nullns": true},
+	}
+	fastavroAccept := map[string]map[string]bool{
+		"bare":          {"samens": true, "foreignns": true, "nullns": true},
+		"dottedown":     {"samens": true, "foreignns": false, "nullns": false},
+		"dottedforeign": {"samens": false, "foreignns": true, "nullns": false},
+		"leadingdot":    {"samens": false, "foreignns": false, "nullns": false}, // verbatim alias string: matches nothing
+	}
+
+	kindSchema := func(kind, name, aliases string) string {
+		aliasAttr := ""
+		if aliases != "" {
+			aliasAttr = fmt.Sprintf(`,"aliases":[%q]`, aliases)
+		}
+		switch kind {
+		case "record":
+			return fmt.Sprintf(`{"type":"record","name":%q%s,"fields":[{"name":"a","type":"int"}]}`, name, aliasAttr)
+		case "enum":
+			return fmt.Sprintf(`{"type":"enum","name":%q%s,"symbols":["A","B"]}`, name, aliasAttr)
+		case "fixed":
+			return fmt.Sprintf(`{"type":"fixed","name":%q%s,"size":2}`, name, aliasAttr)
+		}
+		panic("unknown kind")
+	}
+	value := map[string]any{
+		"record": map[string]any{"a": int32(7)},
+		"enum":   "A",
+		"fixed":  []byte{1, 2},
+	}
+
+	for spelling, alias := range aliasSpelling {
+		for wns, wname := range writerName {
+			for _, kind := range []string{"record", "enum", "fixed"} {
+				for _, site := range []string{"top", "union"} {
+					wantFast := fastavroAccept[spelling][wns]
+					wantTwmb := twmbAccept[spelling][wns]
+					name := fmt.Sprintf("%s/%s/%s/%s", spelling, wns, kind, site)
+					t.Run(name, func(t *testing.T) {
+						writerJSON := kindSchema(kind, wname, "")
+						readerJSON := kindSchema(kind, "n1.New", alias)
+						if site == "union" {
+							readerJSON = `["boolean",` + readerJSON + `]`
+						}
+
+						writer := avro.MustParse(writerJSON)
+						wire, err := writer.Encode(value[kind])
+						if err != nil {
+							t.Fatalf("twmb encode: %v", err)
+						}
+
+						resp := o.call(oracleJob{
+							Op:     "readresolve",
+							Schema: json.RawMessage(writerJSON),
+							Reader: json.RawMessage(readerJSON),
+							Hex:    hex.EncodeToString(wire),
+						})
+						fastGot := resp.OK
+						if !resp.OK && strings.Contains(resp.Err, "not JSON serializable") {
+							// A fixed decodes to Python bytes, which the
+							// oracle's response json.dumps cannot represent.
+							// schemaless_reader RETURNED — a resolution
+							// reject raises SchemaResolutionError before any
+							// dumps — so the resolution verdict is accept;
+							// only the datum transport failed.
+							fastGot = true
+						}
+						if fastGot != wantFast {
+							t.Fatalf("fastavro accept=%v, want %v (err: %s)", fastGot, wantFast, resp.Err)
+						}
+						if !fastGot && !strings.Contains(resp.Err, "chema") {
+							// Reject cells must reject on schema RESOLUTION
+							// (SchemaResolutionError / "Schema mismatch"),
+							// not on some value or transport error.
+							t.Fatalf("fastavro rejected for a non-resolution reason: %s", resp.Err)
+						}
+
+						// Cross-check twmb's verdict in the same cell, so the
+						// two tables cannot drift: they agree everywhere
+						// except the documented leading-dot divergence.
+						reader := avro.MustParse(readerJSON)
+						twmbGot := avro.CheckCompatibility(writer, reader) == nil
+						if twmbGot != wantTwmb {
+							t.Fatalf("twmb accept=%v, want %v", twmbGot, wantTwmb)
+						}
+						if spelling == "leadingdot" && wns == "nullns" {
+							if !twmbGot || fastGot {
+								t.Fatalf("documented divergence inverted: twmb=%v fastavro=%v (want twmb accept per Java's Name-ctor rule, fastavro reject verbatim)", twmbGot, fastGot)
+							}
+						} else if twmbGot != fastGot {
+							t.Fatalf("undocumented twmb/fastavro divergence: twmb=%v fastavro=%v", twmbGot, fastGot)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+// TestDifferentialFastavroAliasDotRule executes the dotted-alias dot-rule
+// census rows (TestMatrix_AliasResolutionCensus's dotrule section) against
+// fastavro: alias spelling {".x", ".a.b", "..x", "."} × writer {null-ns x,
+// a.b, lax ".a.b", empty-name ""}. fastavro compares alias strings as
+// written, so its table accepts exactly one cell — raw ".a.b" against the
+// writer literally named ".a.b" — where twmb agrees; the two divergent
+// cells are the escape spellings, which twmb (and Java's Name constructor,
+// which nulls only an EMPTY space) normalize and fastavro does not: ".x"
+// matches the null-namespace writer x in twmb only, and "." (the empty-name
+// family) matches the empty-named writer in twmb only. Every cell is
+// EXECUTED; a schema fastavro cannot parse would surface as a non-"chema"
+// reject and fail the cell's classification — nothing is silently skipped.
+func TestDifferentialFastavroAliasDotRule(t *testing.T) {
+	o := startOracle(t)
+
+	aliases := map[string]string{"escape": ".x", "multidot": ".a.b", "doubledot": "..x", "dotonly": "."}
+	writers := map[string]string{"nullx": "x", "ab": "a.b", "laxdotab": ".a.b", "emptyname": ""}
+	fastAccept := map[string]map[string]bool{
+		"escape":    {"nullx": false, "ab": false, "laxdotab": false, "emptyname": false},
+		"multidot":  {"nullx": false, "ab": false, "laxdotab": true, "emptyname": false},
+		"doubledot": {"nullx": false, "ab": false, "laxdotab": false, "emptyname": false},
+		"dotonly":   {"nullx": false, "ab": false, "laxdotab": false, "emptyname": false},
+	}
+	twmbAccept := map[string]map[string]bool{
+		"escape":    {"nullx": true, "ab": false, "laxdotab": false, "emptyname": false},
+		"multidot":  {"nullx": false, "ab": false, "laxdotab": true, "emptyname": false},
+		"doubledot": {"nullx": false, "ab": false, "laxdotab": false, "emptyname": false},
+		"dotonly":   {"nullx": false, "ab": false, "laxdotab": false, "emptyname": true},
+	}
+	divergent := map[string]bool{"escape/nullx": true, "dotonly/emptyname": true}
+
+	lax := avro.WithLaxNames(func(string) error { return nil })
+	for spelling, alias := range aliases {
+		for wKey, wname := range writers {
+			for _, site := range []string{"top", "union"} {
+				name := fmt.Sprintf("%s/%s/%s", spelling, wKey, site)
+				t.Run(name, func(t *testing.T) {
+					writerJSON := fmt.Sprintf(`{"type":"record","name":%q,"fields":[{"name":"a","type":"int"}]}`, wname)
+					readerJSON := fmt.Sprintf(`{"type":"record","name":"n1.New","aliases":[%q],"fields":[{"name":"a","type":"int"}]}`, alias)
+					if site == "union" {
+						readerJSON = `["boolean",` + readerJSON + `]`
+					}
+
+					writer, err := avro.Parse(writerJSON, lax)
+					if err != nil {
+						t.Fatalf("twmb writer: %v", err)
+					}
+					wire, err := writer.Encode(map[string]any{"a": int32(7)})
+					if err != nil {
+						t.Fatalf("twmb encode: %v", err)
+					}
+
+					resp := o.call(oracleJob{
+						Op:     "readresolve",
+						Schema: json.RawMessage(writerJSON),
+						Reader: json.RawMessage(readerJSON),
+						Hex:    hex.EncodeToString(wire),
+					})
+					if resp.OK != fastAccept[spelling][wKey] {
+						t.Fatalf("fastavro accept=%v, want %v (err: %s)", resp.OK, fastAccept[spelling][wKey], resp.Err)
+					}
+					if !resp.OK && !strings.Contains(resp.Err, "chema") {
+						t.Fatalf("fastavro rejected for a non-resolution reason (parse or transport): %s", resp.Err)
+					}
+
+					reader := avro.MustParse(readerJSON)
+					twmbGot := avro.CheckCompatibility(writer, reader) == nil
+					if twmbGot != twmbAccept[spelling][wKey] {
+						t.Fatalf("twmb accept=%v, want %v", twmbGot, twmbAccept[spelling][wKey])
+					}
+					cell := spelling + "/" + wKey
+					if divergent[cell] {
+						if !twmbGot || resp.OK {
+							t.Fatalf("documented divergence inverted: twmb=%v fastavro=%v (twmb+Java normalize the escape; fastavro is verbatim)", twmbGot, resp.OK)
+						}
+					} else if twmbGot != resp.OK {
+						t.Fatalf("undocumented twmb/fastavro divergence: twmb=%v fastavro=%v", twmbGot, resp.OK)
+					}
+				})
+			}
+		}
+	}
+}
+
+// ---------- matrix_differential_test.go ----------
+
+// ---------------------------------------------------------------------------
+// External-oracle matrix: every (fragment × context) cell is validated
+// against a real fastavro process. The relational matrix core cannot catch
+// a bug that is SYMMETRIC across twmb's encoder and decoder (both agreeing
+// on the same wrong bytes); an independent implementation can. Two checks
+// per cell, neither needing any cross-language value comparison:
+//
+//	rt        — twmb encodes; fastavro decodes those bytes and re-encodes;
+//	            the bytes must come back identical. Catches wire-layout
+//	            divergence (varints, lengths, union indices, logical byte
+//	            forms, container framing) in either implementation.
+//	canonical — fastavro's Parsing Canonical Form of the composed schema
+//	            must equal twmb's Canonical(), extending the vendored
+//	            vector oracle to every schema the matrix can compose.
+//
+// Skips (does not fail) when fastavro is unavailable; CI provides it via
+// AVRO_FASTAVRO_PYTHON.
+// ---------------------------------------------------------------------------
+
+func TestDifferentialMatrix(t *testing.T) {
+	o := startOracle(t)
+
+	for _, fr := range matFrags() {
+		for _, cx := range matCtxs() {
+			if cx.skip != nil && cx.skip(fr.kind) {
+				continue
+			}
+			t.Run(fr.label+"/"+cx.label, func(t *testing.T) {
+				u := &uniq{}
+				schemaJSON := cx.schema(fr.schema(u), fr.kind, u)
+				s, err := avro.Parse(schemaJSON)
+				if err != nil {
+					t.Fatalf("Parse: %v", err)
+				}
+				vin := cx.wrap(fr.values[0])
+				w1, err := s.AppendEncode(nil, vin)
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+
+				// Round-trip through fastavro.
+				resp := o.call(oracleJob{
+					Op:     "rt",
+					Schema: json.RawMessage(schemaJSON),
+					Hex:    hex.EncodeToString(w1),
+				})
+				if !resp.OK {
+					t.Fatalf("fastavro could not round-trip twmb's bytes: %s\nschema: %s\nwire: %x", resp.Err, schemaJSON, w1)
+				}
+				if resp.Hex != hex.EncodeToString(w1) {
+					t.Fatalf("fastavro re-encode differs from twmb:\n twmb=%x\n fast=%s\nschema: %s", w1, resp.Hex, schemaJSON)
+				}
+
+				// Canonical form parity.
+				cresp := o.call(oracleJob{
+					Op:     "canonical",
+					Schema: json.RawMessage(schemaJSON),
+				})
+				if !cresp.OK {
+					t.Fatalf("fastavro canonical failed: %s\nschema: %s", cresp.Err, schemaJSON)
+				}
+				if cresp.Canonical != string(s.Canonical()) {
+					t.Fatalf("canonical form diverges:\n twmb=%s\n fast=%s\nschema: %s", s.Canonical(), cresp.Canonical, schemaJSON)
+				}
+			})
+		}
+	}
+}
+
+// The recursion shapes through the same oracle: recursive wire layouts and
+// the canonical forms of self/mutually/forward-referential schemas.
+func TestDifferentialMatrixRecursion(t *testing.T) {
+	o := startOracle(t)
+	for _, sh := range recShapes() {
+		if sh.label == "fwd-ref-union" {
+			// Forward references are a twmb+Java extension beyond the
+			// spec's "forward references are not permitted"; fastavro
+			// rejects the schema outright (UnknownType on the name,
+			// observed 1.12.2), so the oracle cannot validate this
+			// shape. Java-side parity for fwd-refs is covered by the
+			// cisuite Java differential.
+			continue
+		}
+		for _, d := range []int{0, 3} {
+			t.Run(fmt.Sprintf("%s/depth%d", sh.label, d), func(t *testing.T) {
+				s := avro.MustParse(sh.schema)
+				w1, err := s.AppendEncode(nil, sh.value(d))
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				resp := o.call(oracleJob{
+					Op:     "rt",
+					Schema: json.RawMessage(sh.schema),
+					Hex:    hex.EncodeToString(w1),
+				})
+				if !resp.OK {
+					t.Fatalf("fastavro rt: %s\nschema: %s", resp.Err, sh.schema)
+				}
+				if resp.Hex != hex.EncodeToString(w1) {
+					t.Fatalf("recursive wire diverges:\n twmb=%x\n fast=%s", w1, resp.Hex)
+				}
+				cresp := o.call(oracleJob{Op: "canonical", Schema: json.RawMessage(sh.schema)})
+				if !cresp.OK {
+					t.Fatalf("fastavro canonical: %s", cresp.Err)
+				}
+				if cresp.Canonical != string(s.Canonical()) {
+					t.Fatalf("recursive canonical diverges:\n twmb=%s\n fast=%s", s.Canonical(), cresp.Canonical)
+				}
+			})
+		}
+	}
+}
+
+// ---------- matrix_schemafor_scope_differential_test.go ----------
+
+// TestDifferentialFastavroSchemaForScope drives representative SchemaFor
+// outputs from the custom-schema scope matrix (TestMatrix_SchemaForCustomSchemaScope)
+// through fastavro. The composed schemas carry dotted fullname references
+// and "namespace":"" inheritance escapes — both standard spellings — and
+// fastavro must both parse them and agree on the full parsing canonical
+// form. PCF string equality subsumes fingerprint equality (the fingerprint
+// is a pure function of the PCF bytes) without any byte-order presentation
+// comparison.
+func TestDifferentialFastavroSchemaForScope(t *testing.T) {
+	o := startOracle(t)
+
+	type scopeDiffMarker struct{ A int64 }
+	type oneField struct{ F1 scopeDiffMarker }
+	type twoFields struct {
+		F1 scopeDiffMarker
+		F2 scopeDiffMarker
+	}
+
+	customFor := func(schemaJSON string) avro.CustomType {
+		t.Helper()
+		s, err := avro.Parse(schemaJSON)
+		if err != nil {
+			t.Fatalf("parse custom schema: %v", err)
+		}
+		root := s.Root()
+		return avro.CustomType{GoType: reflect.TypeFor[scopeDiffMarker](), Schema: root}
+	}
+
+	cells := []struct {
+		name  string
+		build func() (*avro.Schema, error)
+	}{
+		{"split_record_two_withns", func() (*avro.Schema, error) {
+			ct := customFor(`{"type":"record","name":"X","namespace":"a","fields":[{"name":"n","type":"int"}]}`)
+			return avro.SchemaFor[twoFields](avro.WithNamespace("b"), ct)
+		}},
+		{"split_record_recursive_two", func() (*avro.Schema, error) {
+			ct := customFor(`{"type":"record","name":"N","namespace":"a","fields":[{"name":"next","type":["null","N"]}]}`)
+			return avro.SchemaFor[twoFields](ct)
+		}},
+		{"nullns_record_one_withns", func() (*avro.Schema, error) {
+			ct := customFor(`{"type":"record","name":"X","fields":[{"name":"n","type":"int"}]}`)
+			return avro.SchemaFor[oneField](avro.WithNamespace("b"), ct)
+		}},
+		{"nullns_record_two_default", func() (*avro.Schema, error) {
+			ct := customFor(`{"type":"record","name":"X","fields":[{"name":"n","type":"int"}]}`)
+			return avro.SchemaFor[twoFields](ct)
+		}},
+		{"dotted_nestedforeign_two_withns", func() (*avro.Schema, error) {
+			ct := customFor(`{"type":"record","name":"a.X","fields":[{"name":"inner","type":{"type":"record","name":"q.Inner","fields":[{"name":"m","type":"int"}]}}]}`)
+			return avro.SchemaFor[twoFields](avro.WithNamespace("b"), ct)
+		}},
+		{"split_fixed_two_withns", func() (*avro.Schema, error) {
+			ct := customFor(`{"type":"fixed","name":"X","namespace":"a","size":4}`)
+			return avro.SchemaFor[twoFields](avro.WithNamespace("b"), ct)
+		}},
+	}
+	for _, c := range cells {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := c.build()
+			if err != nil {
+				t.Fatalf("SchemaFor: %v", err)
+			}
+			schemaJSON := json.RawMessage(s.String())
+			if resp := o.call(oracleJob{Op: "parse", Schema: schemaJSON, Hex: ""}); !resp.OK {
+				t.Fatalf("fastavro rejects the composed schema %s: %s", schemaJSON, resp.Err)
+			}
+			resp := o.call(oracleJob{Op: "canonical", Schema: schemaJSON, Hex: ""})
+			if !resp.OK {
+				t.Fatalf("fastavro canonical failed for %s: %s", schemaJSON, resp.Err)
+			}
+			if got, want := string(s.Canonical()), resp.Canonical; got != want {
+				t.Errorf("parsing canonical form diverges:\n  twmb:     %s\n  fastavro: %s", got, want)
+			}
+		})
+	}
+}
+
+// ---------- property_test.go ----------
+
+// equalAvro compares two decoded `any` trees with Avro-semantic equality: a
+// nil slice/map equals an empty one (Avro doesn't distinguish them, and the
+// binary vs JSON decoders differ only cosmetically there — e.g. empty bytes
+// decode to []byte(nil) on the binary path and []byte{} on JSON). Floats are
+// compared with == (the generator avoids NaN). This keeps the round-trip
+// property focused on substantive value divergences.
+func equalAvro(a, b any) bool {
+	switch av := a.(type) {
+	case nil:
+		return b == nil
+	case []byte:
+		bv, ok := b.([]byte)
+		return ok && bytes.Equal(av, bv)
+	case []any:
+		bv, ok := b.([]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !equalAvro(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for k, v := range av {
+			bvv, ok := bv[k]
+			if !ok || !equalAvro(v, bvv) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
+}
+
+// Tier-2 property testing. A deterministic generator produces a valid schema
+// tree; values are then drawn from that tree on demand. Properties assert
+// invariants that hold for ALL generated (schema, value) pairs — instead of
+// the author hand-picking example inputs (which miss the intersections where
+// bugs live). The generator is seeded, so a failing case is reproducible:
+// re-run the reported seed. See CORRECTNESS_PLAN.md §T2.
+
+// genNode is a generated schema node: enough structure to (a) emit the schema
+// JSON and (b) draw arbitrarily many matching Go values.
+type genNode struct {
+	kind     string
+	schema   string // compact schema JSON for this node
+	symbols  []string
+	items    *genNode
+	values   *genNode
+	fields   []genField
+	branches []*genNode // union (primitive branches only, in v1)
+}
+
+type genField struct {
+	name string
+	node *genNode
+}
+
+type schemaGen struct {
+	r       *rand.Rand
+	nameSeq int
+}
+
+func (g *schemaGen) name(prefix string) string {
+	g.nameSeq++
+	return fmt.Sprintf("%s%d", prefix, g.nameSeq)
+}
+
+func (g *schemaGen) avroName() string {
+	const first = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+	const rest = first + "0123456789"
+	n := 1 + g.r.Intn(6)
+	var b strings.Builder
+	b.WriteByte(first[g.r.Intn(len(first))])
+	for i := 1; i < n; i++ {
+		b.WriteByte(rest[g.r.Intn(len(rest))])
+	}
+	return b.String()
+}
+
+// primitiveKinds are union-eligible (distinct kinds keep twmb's Go-type union
+// dispatch unambiguous, matching fastavro/Java).
+var primitiveKinds = []string{"null", "boolean", "int", "long", "float", "double", "string", "bytes"}
+
+func quoteJoin(ss []string) string {
+	q := make([]string, len(ss))
+	for i, s := range ss {
+		q[i] = fmt.Sprintf("%q", s)
+	}
+	return strings.Join(q, ",")
+}
+
+// build returns a generated schema node with its .schema populated. depth
+// bounds nesting; collections stay small to keep cases fast.
+func (g *schemaGen) build(depth int) *genNode {
+	if depth >= 4 || g.r.Intn(3) == 0 {
+		k := primitiveKinds[g.r.Intn(len(primitiveKinds))]
+		return &genNode{kind: k, schema: fmt.Sprintf("%q", k)}
+	}
+	switch g.r.Intn(5) {
+	case 0: // enum
+		nsym := 1 + g.r.Intn(4)
+		syms := make([]string, 0, nsym)
+		seen := map[string]bool{}
+		for len(syms) < nsym {
+			if s := g.avroName(); !seen[s] {
+				seen[s] = true
+				syms = append(syms, s)
+			}
+		}
+		n := &genNode{kind: "enum", symbols: syms}
+		n.schema = fmt.Sprintf(`{"type":"enum","name":%q,"symbols":[%s]}`, g.name("E"), quoteJoin(syms))
+		return n
+	case 1: // array
+		items := g.build(depth + 1)
+		return &genNode{kind: "array", items: items, schema: fmt.Sprintf(`{"type":"array","items":%s}`, items.schema)}
+	case 2: // map
+		values := g.build(depth + 1)
+		return &genNode{kind: "map", values: values, schema: fmt.Sprintf(`{"type":"map","values":%s}`, values.schema)}
+	case 3: // record
+		nf := g.r.Intn(4)
+		fields := make([]genField, 0, nf)
+		fragments := make([]string, 0, nf)
+		seen := map[string]bool{}
+		for range nf {
+			fn := g.avroName()
+			for seen[fn] {
+				fn = g.avroName()
+			}
+			seen[fn] = true
+			fnode := g.build(depth + 1)
+			fields = append(fields, genField{name: fn, node: fnode})
+			fragments = append(fragments, fmt.Sprintf(`{"name":%q,"type":%s}`, fn, fnode.schema))
+		}
+		n := &genNode{kind: "record", fields: fields}
+		n.schema = fmt.Sprintf(`{"type":"record","name":%q,"fields":[%s]}`, g.name("R"), strings.Join(fragments, ","))
+		return n
+	default: // union of distinct primitive kinds
+		nb := 1 + g.r.Intn(3)
+		perm := g.r.Perm(len(primitiveKinds))[:nb]
+		branches := make([]*genNode, nb)
+		frags := make([]string, nb)
+		for i, ki := range perm {
+			k := primitiveKinds[ki]
+			branches[i] = &genNode{kind: k, schema: fmt.Sprintf("%q", k)}
+			frags[i] = fmt.Sprintf("%q", k)
+		}
+		return &genNode{kind: "union", branches: branches, schema: "[" + strings.Join(frags, ",") + "]"}
+	}
+}
+
+func (g *schemaGen) genString() string {
+	runes := []rune("abcdefghijklmnopqrstuvwxyz0123456789 _-.ABCXYZéñ日本🎉")
+	n := g.r.Intn(8)
+	out := make([]rune, n)
+	for i := range out {
+		out[i] = runes[g.r.Intn(len(runes))]
+	}
+	return string(out)
+}
+
+func (g *schemaGen) finiteFloat() float64 {
+	for {
+		f := math.Float64frombits(g.r.Uint64())
+		if !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return f
+		}
+	}
+}
+
+// value draws a fresh Go value matching n. The value types are exactly what
+// Schema.Encode accepts in the dynamic (map[string]any / []any / primitive)
+// representation, and exactly what Decode/DecodeJSON produce into *any.
+func (g *schemaGen) value(n *genNode) any {
+	switch n.kind {
+	case "null":
+		return nil
+	case "boolean":
+		return g.r.Intn(2) == 0
+	case "int":
+		return int32(g.r.Uint32())
+	case "long":
+		return int64(g.r.Uint64())
+	case "float":
+		return float32(g.finiteFloat())
+	case "double":
+		return g.finiteFloat()
+	case "string":
+		return g.genString()
+	case "bytes":
+		b := make([]byte, g.r.Intn(8))
+		g.r.Read(b)
+		return b
+	case "enum":
+		return n.symbols[g.r.Intn(len(n.symbols))]
+	case "array":
+		k := g.r.Intn(4)
+		out := make([]any, k)
+		for i := range out {
+			out[i] = g.value(n.items)
+		}
+		return out
+	case "map":
+		k := g.r.Intn(4)
+		out := make(map[string]any, k)
+		for range k {
+			out[g.avroName()] = g.value(n.values)
+		}
+		return out
+	case "record":
+		out := make(map[string]any, len(n.fields))
+		for _, f := range n.fields {
+			out[f.name] = g.value(f.node)
+		}
+		return out
+	case "union":
+		return g.value(n.branches[g.r.Intn(len(n.branches))])
+	}
+	panic("unknown kind " + n.kind)
+}
+
+// TestProperty_LogicalCustomTypeParseNeverPanics crosses every logical type
+// with every underlying primitive AND a registered CustomType for that
+// logical, asserting Parse never panics. A logical on a wrong underlying is
+// soft-dropped, then resurrected by the matching CustomType; a resurrected
+// logical that enters a built-in code path assuming the right underlying
+// type can dereference a nil pointer (the F1 class). This generic matrix
+// covers that cell without a bug-specific test — reverting the F1 gate makes
+// it panic here.
+func TestProperty_LogicalCustomTypeParseNeverPanics(t *testing.T) {
+	logicals := []string{
+		"decimal", "big-decimal", "uuid", "date", "time-millis", "time-micros",
+		"timestamp-millis", "timestamp-micros", "timestamp-nanos", "duration", "unknownlogic",
+	}
+	underlyings := []string{"null", "boolean", "int", "long", "float", "double", "string", "bytes"}
+	dec := func(v any, _ *avro.SchemaNode) (any, error) { return v, nil }
+	for _, lt := range logicals {
+		for _, ut := range underlyings {
+			schema := fmt.Sprintf(`{"type":%q,"logicalType":%q}`, ut, lt)
+			cts := []avro.CustomType{
+				{LogicalType: lt, Decode: dec},
+				{LogicalType: lt, AvroType: ut, Decode: dec},
+			}
+			for _, ct := range cts {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							t.Errorf("Parse PANICKED: schema=%s + CustomType{logical=%q,avro=%q}: %v", schema, lt, ct.AvroType, r)
+						}
+					}()
+					_, _ = avro.Parse(schema, avro.WithCustomType(ct)) // result irrelevant; must not panic
+				}()
+			}
+		}
+	}
+}
+
+// TestProperty_BinaryJSONRoundTripAgree asserts that for every generated
+// (schema, value), decoding the binary encoding and decoding the JSON
+// encoding yield the SAME Go value. This is a within-twmb oracle: the binary
+// and JSON paths must agree on what a value round-trips to. A divergence (the
+// kind audits keep finding one example at a time) fails here for a whole
+// class of inputs at once.
+//
+// Unions are round-tripped in TAGGED form on both paths. A bare (untagged)
+// JSON union value carries no branch tag, so a multi-numeric union like
+// ["int","float","long"] legitimately resolves to the first token-matching
+// branch on bare-JSON decode while the binary wire carries the exact branch
+// — a documented leniency, not a divergence. TaggedUnions carries the branch
+// on both sides, so the comparison tests all union shapes without conflating
+// that documented behavior with a real bug.
+func TestProperty_BinaryJSONRoundTripAgree(t *testing.T) {
+	const iters = 3000
+	tagged := avro.TaggedUnions()
+	for seed := int64(1); seed <= iters; seed++ {
+		g := &schemaGen{r: rand.New(rand.NewSource(seed))}
+		root := g.build(0)
+		value := g.value(root)
+
+		s, err := avro.Parse(root.schema)
+		if err != nil {
+			t.Fatalf("seed %d: Parse(%s): %v", seed, root.schema, err)
+		}
+
+		bin, err := s.Encode(value)
+		if err != nil {
+			t.Fatalf("seed %d: Encode(%#v) [%s]: %v", seed, value, root.schema, err)
+		}
+		var binOut any
+		if _, err := s.Decode(bin, &binOut, tagged); err != nil {
+			t.Fatalf("seed %d: Decode [%s]: %v", seed, root.schema, err)
+		}
+
+		jsn, err := s.EncodeJSON(value, tagged)
+		if err != nil {
+			t.Fatalf("seed %d: EncodeJSON(%#v) [%s]: %v", seed, value, root.schema, err)
+		}
+		var jsonOut any
+		if err := s.DecodeJSON(jsn, &jsonOut, tagged); err != nil {
+			t.Fatalf("seed %d: DecodeJSON(%s) [%s]: %v", seed, jsn, root.schema, err)
+		}
+
+		if !equalAvro(binOut, jsonOut) {
+			t.Fatalf("seed %d: binary vs JSON round-trip disagree\n schema: %s\n value:  %#v\n binary: %#v\n json:   %#v\n binwire %x\n jsonout %s",
+				seed, root.schema, value, binOut, jsonOut, bin, jsn)
+		}
+	}
+}
+
+// ---------- invariants_test.go ----------
+
+// Tier-4 executable invariant (CORRECTNESS_PLAN.md): the encode/decode
+// target-type parity rule from BUG_AUDIT.md pattern 12 -- "for every Go type
+// the encoder accepts as input to a schema, the decoder MUST accept it as a
+// target, else a value round-trips one way but not back." This is the single
+// most recurring bug shape in the audit history. Rather than hand-pick cases,
+// it drives the actual encode and decode paths across a schema x Go-type
+// matrix.
+//
+// The sound form is round-trip-PER-TYPE: encode a type's own sample value,
+// then decode THAT wire back into the same type. Value-consistent by
+// construction, so a flag is a genuine "encoded the value, cannot read it
+// back into the type that produced it" -- never a content/range artifact (a
+// naive "mint one wire, try all target types" matrix instead conflates type
+// rejection with value rejection: decoding a 1000ms timestamp into int8
+// overflows, decoding raw 0x01 into json.Number is not a number literal, etc.
+// -- all value-driven, not type-driven). Asymmetries that are DOCUMENTED
+// intentional policy (BUG_AUDIT.md "Known intentional divergences") live in
+// the allowlist with a citation; anything else fails the build.
+
+type goTypeCand struct {
+	name   string
+	sample any        // value to attempt encoding
+	newPtr func() any // fresh pointer target for decoding
+}
+
+func goTypeCands() []goTypeCand {
+	return []goTypeCand{
+		{"bool", true, func() any { return new(bool) }},
+		{"int", int(1), func() any { return new(int) }},
+		{"int8", int8(1), func() any { return new(int8) }},
+		{"int16", int16(1), func() any { return new(int16) }},
+		{"int32", int32(1), func() any { return new(int32) }},
+		{"int64", int64(1), func() any { return new(int64) }},
+		{"uint", uint(1), func() any { return new(uint) }},
+		{"uint32", uint32(1), func() any { return new(uint32) }},
+		{"uint64", uint64(1), func() any { return new(uint64) }},
+		{"float32", float32(1), func() any { return new(float32) }},
+		{"float64", float64(1), func() any { return new(float64) }},
+		{"string", "1", func() any { return new(string) }},
+		{"bytes", []byte{1}, func() any { return new([]byte) }},
+		{"jsonNumber", json.Number("1"), func() any { return new(json.Number) }},
+		{"time.Time", time.Unix(1, 0).UTC(), func() any { return new(time.Time) }},
+		{"bigRat", big.NewRat(1, 1), func() any { return new(*big.Rat) }},
+		{"avroDuration", avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, func() any { return new(avro.Duration) }},
+	}
+}
+
+type paritySchema struct {
+	name string
+	json string
+}
+
+func paritySchemas() []paritySchema {
+	return []paritySchema{
+		{"int", `"int"`},
+		{"long", `"long"`},
+		{"float", `"float"`},
+		{"double", `"double"`},
+		{"string", `"string"`},
+		{"bytes", `"bytes"`},
+		{"boolean", `"boolean"`},
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`},
+		{"decimal", `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`},
+		{"uuid", `{"type":"string","logicalType":"uuid"}`},
+		{"duration", `{"type":"fixed","name":"duration","size":12,"logicalType":"duration"}`},
+		{"enum", `{"type":"enum","name":"E","symbols":["A","B","C"]}`},
+		{"null-union-long", `["null","long"]`},
+		{"union-string-long", `["string","long"]`},
+	}
+}
+
+// allowedAsymmetry holds axis/schema/type triples where a type encodes but its
+// own wire will not decode back into that same type BY DOCUMENTED, PINNED
+// POLICY. Keyed "axis/schema/type". Each entry must cite the pin(s) that
+// document the intentional asymmetry; anything NOT listed here fails the
+// invariant.
+//
+// Currently empty: json.Number is numeric-only (rejected for string, bytes,
+// fixed, and enum on BOTH encode and decode — see
+// TestRegression_JSONNumberStringSourceRejectedOnEncode), so no stringy
+// encode/decode round-trip asymmetry remains on either wire format.
+var allowedAsymmetry = map[string]string{}
+
+// parityAxis is one wire format's encode/decode pair. The target-type parity
+// rule must hold INDEPENDENTLY on each: a value encoded as binary must decode
+// back from binary into the same Go type, and likewise for JSON. The custom-
+// type logical-suppression bugs that recurred this audit were precisely a JSON
+// path diverging from the binary path, so the JSON axis is not redundant.
+type parityAxis struct {
+	name   string
+	encode func(s *avro.Schema, v any) ([]byte, error)
+	decode func(s *avro.Schema, wire []byte, ptr any) error
+}
+
+func parityAxes() []parityAxis {
+	return []parityAxis{
+		{
+			"binary",
+			func(s *avro.Schema, v any) ([]byte, error) { return s.Encode(v) },
+			func(s *avro.Schema, wire []byte, ptr any) error { _, err := s.Decode(wire, ptr); return err },
+		},
+		{
+			"json",
+			func(s *avro.Schema, v any) ([]byte, error) { return s.EncodeJSON(v) },
+			func(s *avro.Schema, wire []byte, ptr any) error { return s.DecodeJSON(wire, ptr) },
+		},
+	}
+}
+
+func TestInvariant_EncodeDecodeTargetParity(t *testing.T) {
+	cands := goTypeCands()
+	var (
+		breaks    []string // encode(sample) OK but decode(that wire)->*T rejects
+		checked   int
+		allowHits []string
+	)
+
+	for _, axis := range parityAxes() {
+		for _, sc := range paritySchemas() {
+			s, err := avro.Parse(sc.json)
+			if err != nil {
+				t.Fatalf("%s: Parse: %v", sc.name, err)
+			}
+			for _, c := range cands {
+				wireT, encErr := axis.encode(s, c.sample)
+				if encErr != nil {
+					continue // type not encode-accepted for this schema; not a round-trip concern
+				}
+				checked++
+				if decErr := axis.decode(s, wireT, c.newPtr()); decErr != nil {
+					key := axis.name + "/" + sc.name + "/" + c.name
+					msg := fmt.Sprintf("[%s] %s: Encode(%s) OK -> Decode(its own wire)->*%s rejects: %v", axis.name, sc.name, c.name, c.name, decErr)
+					if reason, ok := allowedAsymmetry[key]; ok {
+						allowHits = append(allowHits, msg+"  [allowed: "+reason+"]")
+					} else {
+						breaks = append(breaks, msg)
+					}
+				}
+			}
+		}
+	}
+
+	sort.Strings(breaks)
+	sort.Strings(allowHits)
+	for _, m := range allowHits {
+		t.Logf("documented asymmetry: %s", m)
+	}
+	for _, m := range breaks {
+		t.Errorf("round-trip break: %s", m)
+	}
+	if len(breaks) == 0 {
+		t.Logf("round-trip parity holds across binary+json: %d (axis, schema, Go type) triples encode AND decode back into the same type", checked)
+	}
+}
+
+// ---------- boundary_test.go ----------
+
+// Tier-2 boundary matrix (CORRECTNESS_PLAN.md §T2d). The recurring class here
+// is numeric boundary / overflow handling across paths, where the value is
+// exactly AT a representability edge (2^53±1, 2^63, 2^64, 2^24±1). Example
+// caught by reverting its fix: float→integer decode must bound in FLOAT space,
+// not via an int64(f) round-trip (the conversion is implementation-defined on
+// overflow — arm64 saturates, amd64 wraps — so the round-trip check silently
+// accepted an out-of-range whole float and stored an off-by-one value).
+//
+// Expectations are computed with big.Float/big.Int (exact), NOT via float
+// comparison — float64(2^63-1) rounds to 2^63, which is exactly how the bug
+// hid from a naive round-trip assertion.
+
+func intTypeBounds(t reflect.Type) (lo, hi *big.Int) {
+	bits := t.Bits()
+	if t.Kind() >= reflect.Int && t.Kind() <= reflect.Int64 {
+		// signed: [-2^(bits-1), 2^(bits-1)-1]
+		hi = new(big.Int).Lsh(big.NewInt(1), uint(bits-1))
+		lo = new(big.Int).Neg(hi)
+		hi.Sub(hi, big.NewInt(1))
+		return lo, hi
+	}
+	// unsigned: [0, 2^bits-1]
+	hi = new(big.Int).Lsh(big.NewInt(1), uint(bits))
+	hi.Sub(hi, big.NewInt(1))
+	return big.NewInt(0), hi
+}
+
+func bigOfReflect(v reflect.Value) *big.Int {
+	if v.CanInt() {
+		return big.NewInt(v.Int())
+	}
+	return new(big.Int).SetUint64(v.Uint())
+}
+
+func TestBoundaryMatrix_FloatToInteger(t *testing.T) {
+	doubleS := avro.MustParse(`"double"`)
+	floatS := avro.MustParse(`"float"`)
+
+	p63 := math.Ldexp(1, 63) // 2^63  (MaxInt64+1; NOT representable in int64)
+	p64 := math.Ldexp(1, 64) // 2^64  (NOT representable in uint64)
+	p53 := math.Ldexp(1, 53) // 2^53
+	p24 := math.Ldexp(1, 24) // 2^24
+	values := []float64{
+		0, 1, -1, 2, -2,
+		p24, p24 + 1, -(p24 + 1),
+		p53, p53 + 1, -(p53 + 1),
+		p63, -p63, // -2^63 == MinInt64 (representable); +2^63 is not
+		p63 + p63, p64, // 2^64 boundary for uint64
+		1.5, -2.5, 1e300, // non-whole / way out of range
+	}
+	intTypes := []reflect.Type{
+		reflect.TypeFor[int8](), reflect.TypeFor[int16](), reflect.TypeFor[int32](), reflect.TypeFor[int64](),
+		reflect.TypeFor[uint8](), reflect.TypeFor[uint16](), reflect.TypeFor[uint32](), reflect.TypeFor[uint64](),
+	}
+
+	type variant struct {
+		name string
+		s    *avro.Schema
+		// wireVal is the value actually on the wire (double keeps v; float
+		// narrows v to float32), used to compute the exact expectation.
+		wire func(v float64) (enc any, wireVal float64)
+	}
+	variants := []variant{
+		{"double", doubleS, func(v float64) (any, float64) { return v, v }},
+		{"float", floatS, func(v float64) (any, float64) { return float32(v), float64(float32(v)) }},
+	}
+
+	for _, va := range variants {
+		for _, v := range values {
+			enc, wireVal := va.wire(v)
+			wire, err := va.s.Encode(enc)
+			if err != nil {
+				t.Fatalf("%s: Encode(%v): %v", va.name, enc, err)
+			}
+			// Exact expectation: decode succeeds iff wireVal is a whole number
+			// within the target type's range. Computed with big.Float — exact.
+			bf := new(big.Float).SetFloat64(wireVal)
+			whole := bf.IsInt()
+			var exact *big.Int
+			if whole {
+				exact, _ = bf.Int(nil)
+			}
+			for _, it := range intTypes {
+				lo, hi := intTypeBounds(it)
+				expectOK := whole && exact.Cmp(lo) >= 0 && exact.Cmp(hi) <= 0
+
+				ptr := reflect.New(it)
+				_, derr := va.s.Decode(wire, ptr.Interface())
+
+				if (derr == nil) != expectOK {
+					t.Errorf("%s wire %v -> %s: decode err=%v, want ok=%v (exact=%v range [%v,%v])",
+						va.name, wireVal, it, derr, expectOK, exact, lo, hi)
+					continue
+				}
+				if expectOK {
+					if got := bigOfReflect(ptr.Elem()); got.Cmp(exact) != 0 {
+						t.Errorf("%s wire %v -> %s: decoded %v, want exact %v (silent precision loss)",
+							va.name, wireVal, it, got, exact)
+					}
+				}
+			}
+		}
+	}
+}
+
+// ---------- crosspath_test.go ----------
+
+// Tier-2 cross-path byte identity (CORRECTNESS_PLAN.md §T2c). The library
+// encodes an addressable struct through the unsafe fast path and a
+// map[string]any through the reflect path; for the same logical record they
+// MUST produce byte-identical wire. The recurring class this guards is
+// multi-representation float values — a signaling-NaN payload survives a raw
+// bit read but is quieted by reflect's float32->float64->float32 round-trip,
+// so the two paths can silently diverge on the exact bits.
+
+type cpRec struct {
+	B  bool    `avro:"b"`
+	I  int32   `avro:"i"`
+	L  int64   `avro:"l"`
+	F  float32 `avro:"f"`
+	D  float64 `avro:"d"`
+	S  string  `avro:"s"`
+	By []byte  `avro:"by"`
+}
+
+const cpSchema = `{"type":"record","name":"CP","fields":[
+	{"name":"b","type":"boolean"},
+	{"name":"i","type":"int"},
+	{"name":"l","type":"long"},
+	{"name":"f","type":"float"},
+	{"name":"d","type":"double"},
+	{"name":"s","type":"string"},
+	{"name":"by","type":"bytes"}
+]}`
+
+// structToMap builds the map[string]any equivalent of a struct using its avro
+// tags, so the struct and map encode the identical logical record.
+func structToMap(v any) map[string]any {
+	rv := reflect.ValueOf(v)
+	rt := rv.Type()
+	m := make(map[string]any, rt.NumField())
+	for i := range rt.NumField() {
+		tag := strings.Split(rt.Field(i).Tag.Get("avro"), ",")[0]
+		m[tag] = rv.Field(i).Interface()
+	}
+	return m
+}
+
+func TestCrossPath_StructVsMapBytes(t *testing.T) {
+	s := avro.MustParse(cpSchema)
+
+	f32 := func(bits uint32) float32 { return math.Float32frombits(bits) }
+	f64 := func(bits uint64) float64 { return math.Float64frombits(bits) }
+	recs := []cpRec{
+		{true, 42, 1 << 40, 1.5, 2.5, "hi", []byte{1, 2, 3}},
+		{false, -1, -1, f32(0x7f800001), f64(0x7ff0000000000001), "", nil},              // signaling NaNs
+		{true, 0, 0, f32(0x7fc00000), f64(0x7ff8000000000000), "x", []byte{}},           // quiet NaNs
+		{false, 1, 2, f32(0x80000000), f64(0x8000000000000000), "neg0", []byte{0}},      // -0.0
+		{true, -7, 7, f32(0x00000001), f64(0x0000000000000001), "denorm", []byte{0xff}}, // denormals
+		{false, 1 << 30, -(1 << 50), math.MaxFloat32, math.MaxFloat64, "max", []byte{0x80}},
+	}
+
+	for i, r := range recs {
+		structBytes, err := s.Encode(&r) // &r ⇒ addressable ⇒ unsafe struct fast path
+		if err != nil {
+			t.Fatalf("rec %d: Encode(struct): %v", i, err)
+		}
+		mapBytes, err := s.Encode(structToMap(r)) // map ⇒ reflect path
+		if err != nil {
+			t.Fatalf("rec %d: Encode(map): %v", i, err)
+		}
+		if string(structBytes) != string(mapBytes) {
+			t.Errorf("rec %d: unsafe struct path vs reflect map path differ\n struct %x\n map    %x\n (rec %+v)",
+				i, structBytes, mapBytes, r)
+		}
+	}
+}
+
+// TestCrossPath_FloatSignalingNaN isolates the float32/float64 signaling-NaN
+// case across struct (unsafe) and map (reflect) paths and a top-level encode,
+// pinning that the raw bits survive on every path.
+func TestCrossPath_FloatSignalingNaN(t *testing.T) {
+	floatS := avro.MustParse(`"float"`)
+	for _, bits := range []uint32{0x7f800001, 0x7fa00000, 0x7fbfffff, 0xff800001} {
+		want := bits
+		type fr struct {
+			F float32 `avro:"f"`
+		}
+		recS := avro.MustParse(`{"type":"record","name":"FR","fields":[{"name":"f","type":"float"}]}`)
+		v := math.Float32frombits(bits)
+
+		sb, _ := recS.Encode(&fr{F: v})              // unsafe
+		mb, _ := recS.Encode(map[string]any{"f": v}) // reflect (record-as-map)
+		tb, _ := floatS.Encode(v)                    // top-level reflect
+		if string(sb) != string(mb) {
+			t.Errorf("bits %#08x: struct vs map differ: %x vs %x", bits, sb, mb)
+		}
+		// The 4 trailing wire bytes of the top-level float are the raw LE bits.
+		if got := fmt.Sprintf("%08x", leUint32(tb)); got != fmt.Sprintf("%08x", want) {
+			t.Errorf("bits %#08x: top-level encode quieted to %s", bits, got)
+		}
+	}
+}
+
+func leUint32(b []byte) uint32 {
+	if len(b) < 4 {
+		return 0
+	}
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+
+// ---------- resolution_test.go ----------
+
+// Tier-2 schema-resolution matrix (CORRECTNESS_PLAN.md resolution gap).
+// Resolution (reader schema != writer schema) is a belief-heavy path. The
+// numeric promotion arms (int/long -> float/double) must round EXACTLY as a
+// direct Go conversion would, and crucially must SINGLE-round: an int64 widens
+// straight to float32, never int64 -> double -> float32, which double-rounds
+// and is off by one ULP for magnitudes past 2^53. Expectations are computed
+// with Go's own numeric conversions (independent of the library's promote.go)
+// and compared on the raw bits, so a one-ULP drift cannot hide behind == on
+// floats (where float32(n) and float32(float64(n)) often print the same).
+
+func resResolve(t *testing.T, w, r *avro.Schema) *avro.Schema {
+	t.Helper()
+	rs, err := avro.Resolve(w, r)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	return rs
+}
+
+func resEncode(t *testing.T, s *avro.Schema, v any) []byte {
+	t.Helper()
+	b, err := s.Encode(v)
+	if err != nil {
+		t.Fatalf("Encode(%v): %v", v, err)
+	}
+	return b
+}
+
+func TestResolutionPromotionMatrix(t *testing.T) {
+	intS := avro.MustParse(`"int"`)
+	longS := avro.MustParse(`"long"`)
+	floatS := avro.MustParse(`"float"`)
+	doubleS := avro.MustParse(`"double"`)
+
+	// int32 writer values, including the float32-rounding edges (2^24±1)
+	// and both signed extremes.
+	intVals := []int32{
+		0, 1, -1, 2, -2,
+		1 << 23, 1 << 24, (1 << 24) + 1, -((1 << 24) + 1),
+		math.MaxInt32, math.MinInt32,
+	}
+	// int64 writer values. dr is a constructed double-rounding witness:
+	// float32(dr) and float32(float64(dr)) differ by one float32 ULP, so an
+	// int64 -> double -> float32 promotion is provably wrong on this input.
+	// (float32(dr) = 0x5a000001, float32(float64(dr)) = 0x5a000002.)
+	const dr = int64(9007200865353727)
+	longVals := []int64{
+		0, 1, -1, 1 << 24, (1 << 24) + 1,
+		1 << 52, 1 << 53, (1 << 53) + 1,
+		dr, -dr,
+		math.MaxInt64, math.MinInt64,
+	}
+
+	checkF32 := func(t *testing.T, rs *avro.Schema, wire []byte, want float32, label string) {
+		t.Helper()
+		var got float32
+		if _, err := rs.Decode(wire, &got); err != nil {
+			t.Fatalf("%s: decode: %v", label, err)
+		}
+		if math.Float32bits(got) != math.Float32bits(want) {
+			t.Errorf("%s = %v (%#08x), want %v (%#08x) [one-ULP / double-rounding drift]",
+				label, got, math.Float32bits(got), want, math.Float32bits(want))
+		}
+	}
+	checkF64 := func(t *testing.T, rs *avro.Schema, wire []byte, want float64, label string) {
+		t.Helper()
+		var got float64
+		if _, err := rs.Decode(wire, &got); err != nil {
+			t.Fatalf("%s: decode: %v", label, err)
+		}
+		if math.Float64bits(got) != math.Float64bits(want) {
+			t.Errorf("%s = %v (%#016x), want %v (%#016x)",
+				label, got, math.Float64bits(got), want, math.Float64bits(want))
+		}
+	}
+
+	t.Run("int->long", func(t *testing.T) {
+		rs := resResolve(t, intS, longS)
+		for _, v := range intVals {
+			wire := resEncode(t, intS, v)
+			var got int64
+			if _, err := rs.Decode(wire, &got); err != nil {
+				t.Fatalf("v=%d: decode: %v", v, err)
+			}
+			if got != int64(v) {
+				t.Errorf("int %d -> long = %d, want %d", v, got, int64(v))
+			}
+		}
+	})
+
+	t.Run("int->float", func(t *testing.T) {
+		rs := resResolve(t, intS, floatS)
+		for _, v := range intVals {
+			wire := resEncode(t, intS, v)
+			checkF32(t, rs, wire, float32(v), fmt.Sprintf("int %d -> float", v))
+		}
+	})
+
+	t.Run("int->double", func(t *testing.T) {
+		rs := resResolve(t, intS, doubleS)
+		for _, v := range intVals {
+			wire := resEncode(t, intS, v)
+			checkF64(t, rs, wire, float64(v), fmt.Sprintf("int %d -> double", v))
+		}
+	})
+
+	t.Run("long->float", func(t *testing.T) {
+		rs := resResolve(t, longS, floatS)
+		for _, n := range longVals {
+			wire := resEncode(t, longS, n)
+			// Go's int64 -> float32 conversion is correctly rounded (single
+			// round). The library must match it bit-for-bit, including dr.
+			checkF32(t, rs, wire, float32(n), fmt.Sprintf("long %d -> float", n))
+		}
+	})
+
+	t.Run("long->double", func(t *testing.T) {
+		rs := resResolve(t, longS, doubleS)
+		for _, n := range longVals {
+			wire := resEncode(t, longS, n)
+			checkF64(t, rs, wire, float64(n), fmt.Sprintf("long %d -> double", n))
+		}
+	})
+
+	t.Run("float->double", func(t *testing.T) {
+		rs := resResolve(t, floatS, doubleS)
+		f32 := func(b uint32) float32 { return math.Float32frombits(b) }
+		floatVals := []float32{
+			0, 1, -1, 1.5, -2.5,
+			float32(math.Inf(1)), float32(math.Inf(-1)),
+			math.MaxFloat32, math.SmallestNonzeroFloat32,
+			f32(0x7f800001), // signaling NaN
+			f32(0x7fc00000), // quiet NaN
+			f32(0x80000000), // -0.0
+			f32(0x00000001), // smallest denormal
+		}
+		for _, f := range floatVals {
+			wire := resEncode(t, floatS, f)
+			// float32 -> float64 widening is lossless; want the exact widening.
+			checkF64(t, rs, wire, float64(f), fmt.Sprintf("float %#08x -> double", math.Float32bits(f)))
+		}
+	})
+}
+
+// TestResolutionLogicalPromotion pins that promoting int -> long with a
+// logical-typed reader (timestamp-millis / -micros) applies the SAME logical
+// conversion a native long+logical decode applies. int and long share the
+// zigzag-varint wire, so one set of writer bytes feeds both the resolved
+// promotion path and a native long+logical decode of the identical value; the
+// two must agree. This path (a logical-typed promotion target) had no
+// dedicated coverage, so a promotion that dropped or mis-scaled the logical
+// conversion would have gone unnoticed.
+func TestResolutionLogicalPromotion(t *testing.T) {
+	intS := avro.MustParse(`"int"`)
+	cases := []struct {
+		name   string
+		reader string
+	}{
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`},
+		{"timestamp-micros", `{"type":"long","logicalType":"timestamp-micros"}`},
+	}
+	// int32-range values; the int wire bytes equal the long wire bytes for the
+	// same numeric value, so the native reader decodes the identical instant.
+	vals := []int32{0, 1, 1000, -1000, 1 << 20, math.MaxInt32, math.MinInt32}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			readerS := avro.MustParse(c.reader)
+			rs := resResolve(t, intS, readerS)
+			for _, v := range vals {
+				wire := resEncode(t, intS, v) // int wire == long wire for v
+
+				var gotResolved, gotNative time.Time
+				if _, err := rs.Decode(wire, &gotResolved); err != nil {
+					t.Fatalf("v=%d: resolved decode: %v", v, err)
+				}
+				if _, err := readerS.Decode(wire, &gotNative); err != nil {
+					t.Fatalf("v=%d: native decode: %v", v, err)
+				}
+				if !gotResolved.Equal(gotNative) {
+					t.Errorf("v=%d: resolved promotion gave %v, native long+%s decode gave %v",
+						v, gotResolved, c.name, gotNative)
+				}
+			}
+		})
+	}
+}
+
+// ---------- metadata_test.go ----------
+
+// Tier-2 metadata-API <-> wire consistency (CORRECTNESS_PLAN.md metadata gap).
+// The recurring class: Schema.Root().Fields[i].Default (the metadata view)
+// drifting from the value the wire actually materializes for that default --
+// wrong Go type, lost precision, or a different union branch. The invariant
+// is that the metadata Default equals the default the decoder fills for an
+// absent field (DecodeJSON of an empty object fills schema defaults).
+func TestProperty_MetadataDefaultMatchesWire(t *testing.T) {
+	enum := `{"type":"enum","name":"E","symbols":["A","B","C"]}`
+	cases := []struct {
+		name      string
+		fieldType string
+		def       string
+	}{
+		{"int", `"int"`, `42`},
+		{"long exact >2^53", `"long"`, `9007199254740993`}, // must stay exact int64
+		{"float", `"float"`, `42`},
+		{"double exp-overflow to +Inf", `"double"`, `1e1000`},
+		{"double", `"double"`, `1.5`},
+		{"string", `"string"`, `"hi"`},
+		{"boolean", `"boolean"`, `true`},
+		{"bytes codepoint default", `"bytes"`, `"AB"`},
+		{"enum", enum, `"B"`},
+		{"union float,int picks float", `["float","int"]`, `42`},
+		{"union int,float picks int", `["int","float"]`, `42`},
+		{"union null,int default null", `["null","int"]`, `null`},
+		{"union null,string default string", `["null","string"]`, `"x"`},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			schema := fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":%s,"default":%s}]}`, c.fieldType, c.def)
+			s, err := avro.Parse(schema)
+			if err != nil {
+				t.Fatalf("Parse(%s): %v", schema, err)
+			}
+
+			root := s.Root()
+			if len(root.Fields) != 1 || !root.Fields[0].HasDefault {
+				t.Fatalf("expected one field with a default, got %+v", root.Fields)
+			}
+			metaDefault := root.Fields[0].Default
+
+			// Wire view: DecodeJSON of an empty object fills the field default.
+			var filled map[string]any
+			if err := s.DecodeJSON([]byte(`{}`), &filled); err != nil {
+				t.Fatalf("DecodeJSON({}): %v", err)
+			}
+			wireDefault, ok := filled["f"]
+			if !ok && metaDefault != nil {
+				t.Fatalf("decoder did not fill field f (got %+v)", filled)
+			}
+
+			if !equalAvro(metaDefault, wireDefault) {
+				t.Errorf("metadata Default (%T %v) != wire-filled default (%T %v) for %s",
+					metaDefault, metaDefault, wireDefault, wireDefault, schema)
+			}
+		})
+	}
+}
+
+// ---------- schema_for_roundtrip_test.go ----------
+
+// Tier-2 SchemaFor behavioral round-trip (CORRECTNESS_PLAN.md SchemaFor gap).
+// The existing schema_for tests assert the GENERATED SCHEMA STRING -- they
+// check the schema looks right, never that it behaves right. Two missing
+// oracles: (1) a schema SchemaFor builds for a Go type must losslessly carry a
+// value of that type (Encode -> Decode -> DeepEqual); (2) the emitted schema
+// must itself be a valid, stable schema (String -> Parse -> identical
+// canonical form). A SchemaFor change that emits a structurally-plausible but
+// behaviorally-wrong schema -- wrong integer width, a dangling named-type
+// reference, a malformed default -- is invisible to a string assertion but
+// caught here. (The dangling-reference case is exactly the uuid/plain dedup
+// class: the same Go array type used once uuid-tagged and once plain.)
+
+func schemaForRoundTrip[T any](t *testing.T, name string, vals []T) {
+	t.Helper()
+	s, err := avro.SchemaFor[T]()
+	if err != nil {
+		t.Fatalf("%s: SchemaFor: %v", name, err)
+	}
+	// Schema stability: the emitted schema must re-parse to the same canonical
+	// form. SchemaFor parses internally, so a failure here points at String().
+	reparsed, err := avro.Parse(s.String())
+	if err != nil {
+		t.Fatalf("%s: re-Parse(SchemaFor.String()): %v\nschema: %s", name, err, s.String())
+	}
+	if got, want := string(reparsed.Canonical()), string(s.Canonical()); got != want {
+		t.Errorf("%s: canonical drift after String->Parse:\n got %s\nwant %s", name, got, want)
+	}
+	for i, v := range vals {
+		wire, err := s.Encode(v)
+		if err != nil {
+			t.Fatalf("%s[%d]: Encode(%+v): %v", name, i, v, err)
+		}
+		var got T
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("%s[%d]: Decode: %v", name, i, err)
+		}
+		if !equalRoundTrip(got, v) {
+			t.Errorf("%s[%d]: round-trip mismatch\n got %+v\nwant %+v", name, i, got, v)
+		}
+	}
+}
+
+// equalRoundTrip compares two Go values for round-trip equality, treating a
+// nil and an empty slice/map as equal (Avro has no null-vs-empty distinction
+// for arrays/maps, so decode legitimately materializes one for the other) and
+// recursing through pointers and structs. It avoids reflect.DeepEqual's
+// nil/empty strictness without masking real value differences.
+func equalRoundTrip(a, b any) bool { return eqValue(reflect.ValueOf(a), reflect.ValueOf(b)) }
+
+func eqValue(a, b reflect.Value) bool {
+	if a.IsValid() != b.IsValid() {
+		return false
+	}
+	if !a.IsValid() {
+		return true
+	}
+	if a.Kind() != b.Kind() {
+		return false
+	}
+	switch a.Kind() {
+	case reflect.Slice, reflect.Array:
+		if a.Len() != b.Len() { // both-empty (nil or len 0) compares equal
+			return false
+		}
+		for i := 0; i < a.Len(); i++ {
+			if !eqValue(a.Index(i), b.Index(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Map:
+		if a.Len() != b.Len() {
+			return false
+		}
+		for _, k := range a.MapKeys() {
+			bv := b.MapIndex(k)
+			if !bv.IsValid() || !eqValue(a.MapIndex(k), bv) {
+				return false
+			}
+		}
+		return true
+	case reflect.Pointer, reflect.Interface:
+		if a.IsNil() || b.IsNil() {
+			return a.IsNil() == b.IsNil()
+		}
+		return eqValue(a.Elem(), b.Elem())
+	case reflect.Struct:
+		for i := 0; i < a.NumField(); i++ {
+			if !eqValue(a.Field(i), b.Field(i)) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a.Interface(), b.Interface())
+	}
+}
+
+type sfPrims struct {
+	B   bool    `avro:"b"`
+	I8  int8    `avro:"i8"`
+	I16 int16   `avro:"i16"`
+	I32 int32   `avro:"i32"`
+	I64 int64   `avro:"i64"`
+	U8  uint8   `avro:"u8"`
+	U16 uint16  `avro:"u16"`
+	U32 uint32  `avro:"u32"`
+	F32 float32 `avro:"f32"`
+	F64 float64 `avro:"f64"`
+	S   string  `avro:"s"`
+	By  []byte  `avro:"by"`
+}
+
+type sfInner struct {
+	X int32  `avro:"x"`
+	Y string `avro:"y"`
+}
+
+type sfComposite struct {
+	Inner  sfInner          `avro:"inner"`
+	List   []int32          `avro:"list"`
+	Dict   map[string]int64 `avro:"dict"`
+	Ptr    *int32           `avro:"ptr"`
+	Nested []sfInner        `avro:"nested"`
+}
+
+// sfUUIDPlain uses the SAME Go array type once uuid-tagged and once plain.
+// These are distinct Avro types (the uuid form carries a logicalType), so
+// SchemaFor must emit a full definition for each rather than a name reference
+// to the other -- the latter is a dangling reference Parse rejects. SchemaFor
+// returning an error (or the round-trip mismatching) on this shape catches the
+// dedup regression.
+type sfUUIDPlain struct {
+	A [16]byte `avro:"a,uuid"`
+	B [16]byte `avro:"b"`
+}
+
+func TestSchemaForValueRoundTrip(t *testing.T) {
+	t.Run("primitives", func(t *testing.T) {
+		schemaForRoundTrip(t, "sfPrims", []sfPrims{
+			{},
+			{B: true, I8: math.MaxInt8, I16: math.MaxInt16, I32: math.MaxInt32, I64: math.MaxInt64,
+				U8: math.MaxUint8, U16: math.MaxUint16, U32: math.MaxUint32,
+				F32: math.MaxFloat32, F64: math.MaxFloat64, S: "héllo", By: []byte{0, 1, 2, 0xff}},
+			{I8: math.MinInt8, I16: math.MinInt16, I32: math.MinInt32, I64: math.MinInt64,
+				F32: -1.5, F64: -2.5, S: "", By: []byte{}},
+		})
+	})
+
+	t.Run("composite", func(t *testing.T) {
+		p := int32(7)
+		schemaForRoundTrip(t, "sfComposite", []sfComposite{
+			{
+				Inner:  sfInner{X: 1, Y: "a"},
+				List:   []int32{1, 2, 3},
+				Dict:   map[string]int64{"k": 5, "j": -9},
+				Ptr:    &p,
+				Nested: []sfInner{{X: 10, Y: "x"}, {X: 20, Y: "y"}},
+			},
+			{
+				Inner:  sfInner{},
+				List:   []int32{},
+				Dict:   map[string]int64{},
+				Ptr:    nil, // nullable -> null branch
+				Nested: []sfInner{},
+			},
+		})
+	})
+
+	t.Run("uuid-and-plain-same-array-type", func(t *testing.T) {
+		schemaForRoundTrip(t, "sfUUIDPlain", []sfUUIDPlain{
+			{A: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, B: [16]byte{15: 0xff}},
+			{},
+		})
+	})
+}
+
+// TestSchemaForLogicalRoundTrip round-trips the logical-typed fields whose Go
+// representations (time.Time, *big.Rat) do not compare correctly under
+// DeepEqual, so they need type-aware equality. SchemaFor's time/decimal
+// inference is what binds these Go types to their Avro logical types; this
+// pins that the generated schema actually carries the value back.
+func TestSchemaForLogicalRoundTrip(t *testing.T) {
+	type sfLogical struct {
+		TS  time.Time `avro:"ts,timestamp-micros"`
+		Dur time.Time `avro:"d,timestamp-millis"`
+	}
+	s, err := avro.SchemaFor[sfLogical]()
+	if err != nil {
+		t.Fatalf("SchemaFor: %v", err)
+	}
+	in := sfLogical{
+		TS:  time.UnixMicro(1_600_000_000_123_456).UTC(),
+		Dur: time.UnixMilli(1_600_000_000_123).UTC(),
+	}
+	wire, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var got sfLogical
+	if _, err := s.Decode(wire, &got); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if !got.TS.Equal(in.TS) {
+		t.Errorf("timestamp-micros round-trip: got %v, want %v", got.TS, in.TS)
+	}
+	if !got.Dur.Equal(in.Dur) {
+		t.Errorf("timestamp-millis round-trip: got %v, want %v", got.Dur, in.Dur)
+	}
+
+	// Decimal (bytes + decimal logical) over *big.Rat, compared via Cmp.
+	type sfDecimal struct {
+		D *big.Rat `avro:"d,decimal(10,4)"`
+	}
+	ds, err := avro.SchemaFor[sfDecimal]()
+	if err != nil {
+		t.Fatalf("SchemaFor decimal: %v", err)
+	}
+	din := sfDecimal{D: big.NewRat(12345, 100)} // 123.45, fits scale 4
+	dwire, err := ds.Encode(din)
+	if err != nil {
+		t.Fatalf("Encode decimal: %v", err)
+	}
+	var dgot sfDecimal
+	if _, err := ds.Decode(dwire, &dgot); err != nil {
+		t.Fatalf("Decode decimal: %v", err)
+	}
+	if dgot.D == nil || dgot.D.Cmp(din.D) != 0 {
+		t.Errorf("decimal round-trip: got %v, want %v", dgot.D, din.D)
+	}
+}
+
+// ---------- decimal_roundtrip_test.go ----------
+
+// Tier-2 decimal round-trip matrix (CORRECTNESS_PLAN.md decimal gap). Decimal
+// is a recurring hot spot (scale derivation, source-precision, coercion). The
+// generalized invariant: a value exactly representable at a schema's scale
+// must survive Encode -> Decode unchanged, across bytes+decimal / fixed+decimal
+// and a span of (precision, scale). Expectations are exact (*big.Rat.Cmp), so
+// scale-rounding or unscaled-int corruption cannot hide. A float32 source arm
+// pins that float32 inputs format with float32's shortest-decimal rule, not
+// the float64 widening's IEEE noise (the regression that rejected
+// float32(0.33) at scale 2).
+
+func TestDecimalRoundTripMatrix(t *testing.T) {
+	schemas := []struct {
+		name      string
+		json      string
+		precision int
+		scale     int
+	}{
+		{"bytes/p10s2", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, 10, 2},
+		{"bytes/p18s4", `{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}`, 18, 4},
+		{"bytes/p4s0", `{"type":"bytes","logicalType":"decimal","precision":4,"scale":0}`, 4, 0},
+		{"fixed/p8s6", `{"type":"fixed","name":"Dec16","size":16,"logicalType":"decimal","precision":8,"scale":6}`, 8, 6},
+		{"fixed/p38s10", `{"type":"fixed","name":"Dec32","size":32,"logicalType":"decimal","precision":38,"scale":10}`, 38, 10},
+	}
+
+	for _, sc := range schemas {
+		t.Run(sc.name, func(t *testing.T) {
+			s := avro.MustParse(sc.json)
+			den := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(sc.scale)), nil)
+
+			// Unscaled integers whose digit count fits the precision, plus the
+			// largest in-precision magnitude (all-nines) and its negation.
+			maxUnscaled := new(big.Int).Sub(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(sc.precision)), nil), big.NewInt(1))
+			unscaled := []*big.Int{
+				big.NewInt(0), big.NewInt(1), big.NewInt(-1),
+				big.NewInt(5), big.NewInt(-5), big.NewInt(99), big.NewInt(-99),
+				new(big.Int).Set(maxUnscaled), new(big.Int).Neg(maxUnscaled),
+			}
+			for _, u := range unscaled {
+				want := new(big.Rat).SetFrac(u, den) // value = u / 10^scale, exact at this scale
+				wire, err := s.Encode(want)
+				if err != nil {
+					t.Fatalf("Encode(%v): %v", want, err)
+				}
+				var got *big.Rat
+				if _, err := s.Decode(wire, &got); err != nil {
+					t.Fatalf("Decode(%v wire): %v", want, err)
+				}
+				if got == nil || got.Cmp(want) != 0 {
+					t.Errorf("unscaled %v: round-trip got %v, want %v", u, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestDecimalFloat32SourcePrecision pins that a float32 decimal input is
+// formatted with float32's shortest-decimal rule, so values like 0.33 land on
+// their scale exactly instead of being rejected for the float64-widening tail.
+// Encode failing here is the regression signature (hardcoded float64 bitSize).
+func TestDecimalFloat32SourcePrecision(t *testing.T) {
+	s := avro.MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
+	cases := []struct {
+		in   float32
+		want *big.Rat
+	}{
+		{0.33, big.NewRat(33, 100)},
+		{1.5, big.NewRat(150, 100)},
+		{-12.34, big.NewRat(-1234, 100)},
+		{0.07, big.NewRat(7, 100)},
+		{99.99, big.NewRat(9999, 100)},
+	}
+	for _, c := range cases {
+		wire, err := s.Encode(c.in)
+		if err != nil {
+			t.Fatalf("Encode(float32 %v) at scale 2: %v [float64-widening noise leaked into the scale]", c.in, err)
+		}
+		var got *big.Rat
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("Decode(float32 %v wire): %v", c.in, err)
+		}
+		if got == nil || got.Cmp(c.want) != 0 {
+			t.Errorf("float32 %v -> %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestRegression_DecimalStringCarrierIsNumericTextOnly pins that a Go string
+// carrier for a decimal logical is the numeric-text form ONLY on encode, making
+// encode symmetric with decode — whose string target always reads the wire as
+// numeric decimal text (setDecimalRat). A non-numeric string is rejected on
+// BOTH wire formats for decimal-on-bytes and decimal-on-fixed rather than
+// silently written as opaque raw bytes: that fall-through emitted a wire the
+// decoder read back as a decimal number ("abcxyz" -> "107075203529.082"),
+// breaking the round trip. []byte remains the sole opaque escape hatch
+// (symmetric on both sides); a numeric string and a numeric json.Number still
+// encode. big-decimal is numeric-text-only too: its string decode target reads
+// numeric text whenever the wire parses as valid AVRO-4124 framing (via
+// applyBigDecimalPayload), so a crafted string whose bytes ARE a valid framing
+// would decode to a different value — it is rejected on encode identically to
+// decimal (a []byte carrier stays opaque-symmetric).
+func TestRegression_DecimalStringCarrierIsNumericTextOnly(t *testing.T) {
+	const nonNumeric = "abcxyz" // 6 bytes: fits a fixed[6] as raw bytes, but is not a number
+	const numeric = "0.312"     // unscaled 312 at scale 3
+
+	// A decimal (bytes and fixed) rejects a non-numeric string on both wires,
+	// while numeric string / numeric json.Number / opaque []byte all work.
+	for _, d := range []struct{ name, schema string }{
+		{"bytes", `{"type":"bytes","logicalType":"decimal","precision":12,"scale":3}`},
+		{"fixed", `{"type":"fixed","name":"DF","size":6,"logicalType":"decimal","precision":12,"scale":3}`},
+	} {
+		t.Run(d.name, func(t *testing.T) {
+			s := avro.MustParse(d.schema)
+
+			// Reject: a non-numeric string on BOTH wire formats.
+			if _, err := s.AppendEncode(nil, nonNumeric); err == nil {
+				t.Errorf("binary Encode(non-numeric string) accepted; a decimal string carrier is numeric-text-only")
+			}
+			if _, err := s.AppendEncodeJSON(nil, nonNumeric); err == nil {
+				t.Errorf("EncodeJSON(non-numeric string) accepted; a decimal string carrier is numeric-text-only")
+			}
+
+			// Control: a numeric string round-trips as text on both wires.
+			for _, bin := range []bool{true, false} {
+				wire, err := encodeWire(s, numeric, bin)
+				if err != nil {
+					t.Fatalf("%s Encode(numeric string) rejected: %v", wireName(bin), err)
+				}
+				var back string
+				if err := decodeWire(s, wire, &back, bin); err != nil {
+					t.Fatalf("%s decode numeric string: %v", wireName(bin), err)
+				}
+				if back != numeric {
+					t.Errorf("%s numeric string round-trip: got %q want %q", wireName(bin), back, numeric)
+				}
+			}
+
+			// Control: []byte is the opaque escape hatch and round-trips (binary).
+			bw, err := s.AppendEncode(nil, []byte(nonNumeric))
+			if err != nil {
+				t.Fatalf("Encode([]byte opaque): %v", err)
+			}
+			var bback []byte
+			if _, err := s.Decode(bw, &bback); err != nil {
+				t.Fatalf("Decode []byte opaque: %v", err)
+			}
+			if string(bback) != nonNumeric {
+				t.Errorf("[]byte opaque round-trip: got %q want %q", bback, nonNumeric)
+			}
+
+			// Control: a numeric json.Number still encodes on both wires; a
+			// non-numeric one rejects identically to a non-numeric string.
+			if _, err := s.AppendEncode(nil, json.Number(numeric)); err != nil {
+				t.Errorf("binary Encode(numeric json.Number) rejected: %v", err)
+			}
+			if _, err := s.AppendEncodeJSON(nil, json.Number(numeric)); err != nil {
+				t.Errorf("EncodeJSON(numeric json.Number) rejected: %v", err)
+			}
+			if _, err := s.AppendEncode(nil, json.Number(nonNumeric)); err == nil {
+				t.Errorf("binary Encode(non-numeric json.Number) accepted; want reject")
+			}
+		})
+	}
+
+	// big-decimal is numeric-text-only too (like decimal): a non-numeric string
+	// carrier is rejected on both wires — INCLUDING a crafted string whose raw
+	// bytes form valid AVRO-4124 framing, which the string decode target would
+	// otherwise read back as a number (the silent round-trip corruption). A
+	// numeric string round-trips as numeric text; []byte stays opaque.
+	bd := avro.MustParse(`{"type":"bytes","logicalType":"big-decimal"}`)
+	// varint(uLen=1) || unscaled 0x05 (=5) || varint(scale=0): byte-identical to
+	// the structured big-decimal wire for the number 5, so an opaque encode of
+	// this string decoded back to "5".
+	const bdFraming = "\x02\x05\x00"
+	for _, bin := range []bool{true, false} {
+		// Reject: the valid-framing string (the corruption trigger).
+		if _, err := encodeWire(bd, bdFraming, bin); err == nil {
+			t.Errorf("big-decimal %s Encode(valid-framing string) accepted; a big-decimal string carrier is numeric-text-only (its bytes would decode to a number)", wireName(bin))
+		}
+		// Reject: a non-framing non-numeric string too (consistent with decimal).
+		if _, err := encodeWire(bd, nonNumeric, bin); err == nil {
+			t.Errorf("big-decimal %s Encode(non-numeric string) accepted; want reject", wireName(bin))
+		}
+		// Control: a numeric string round-trips as numeric text.
+		wire, err := encodeWire(bd, "5", bin)
+		if err != nil {
+			t.Fatalf("big-decimal %s Encode(numeric string): %v", wireName(bin), err)
+		}
+		var back string
+		if err := decodeWire(bd, wire, &back, bin); err != nil {
+			t.Fatalf("big-decimal %s decode numeric: %v", wireName(bin), err)
+		}
+		if back != "5" {
+			t.Errorf("big-decimal %s numeric string round-trip: got %q want %q", wireName(bin), back, "5")
+		}
+	}
+	// Control: []byte stays the opaque escape hatch even for bytes that form
+	// valid framing — a []byte decode target reads raw bytes unconditionally.
+	craft := []byte{0x02, 0x05, 0x00}
+	bw, err := bd.AppendEncode(nil, craft)
+	if err != nil {
+		t.Fatalf("big-decimal Encode([]byte opaque): %v", err)
+	}
+	var bback []byte
+	if _, err := bd.Decode(bw, &bback); err != nil {
+		t.Fatalf("big-decimal Decode []byte opaque: %v", err)
+	}
+	if !bytes.Equal(bback, craft) {
+		t.Errorf("big-decimal []byte opaque round-trip: got %x want %x", bback, craft)
+	}
+}
+
+// TestMatrix_DecimalCarrierNumericTextContract is the generative net for the
+// decimal carrier contract: for a decimal logical (bytes AND fixed) a Go string
+// and a json.Number are the numeric-text form ONLY — a non-numeric one is
+// REJECTED on encode, on both wire formats, in EVERY encode context — rather
+// than silently written as opaque raw bytes, keeping encode symmetric with
+// decode (whose string target always reads numeric decimal text). []byte is the
+// sole opaque carrier and encodes in every cell. big-decimal has the same
+// numeric-text-only contract (a non-numeric string rejects); the whole logical-
+// on-bytes/fixed carrier class — big-decimal, uuid, duration included — is
+// covered by TestMatrix_LogicalStringCarrierRoundTripContract.
+//
+// Axes: carrier {string, []byte, json.Number} × content {numeric, non-numeric}
+// × backing {bytes, fixed} × wire {binary, JSON} × encode context {top-level,
+// record field, array element, map value} (the path-divergence axis — a decimal
+// leaf is reachable at each). The oracle is calibration-free: string and
+// json.Number reject a non-numeric carrier identically and accept a numeric
+// one; []byte always encodes. Neuter: reverting rejectNonNumericStructuredString
+// (ser.go + json_codec.go) reds every string/json.Number + non-numeric cell
+// across contexts, backings, and wires; the numeric and []byte controls stay
+// green.
+func TestMatrix_DecimalCarrierNumericTextContract(t *testing.T) {
+	// leaf schemas: a fixed sized to hold both a numeric value's unscaled bytes
+	// and the 6-byte non-numeric raw string.
+	backings := []struct{ name, leaf string }{
+		{"bytes", `{"type":"bytes","logicalType":"decimal","precision":12,"scale":3}`},
+		{"fixed", `{"type":"fixed","name":"DF","size":6,"logicalType":"decimal","precision":12,"scale":3}`},
+	}
+	// carriers: the value placed at the decimal leaf, plus whether encode must
+	// be REJECTED (a non-numeric string / json.Number) or ACCEPTED.
+	carriers := []struct {
+		name   string
+		val    any
+		reject bool
+	}{
+		{"string_numeric", "0.312", false},
+		{"string_nonnumeric", "abcxyz", true},
+		{"jsonnumber_numeric", json.Number("0.312"), false},
+		{"jsonnumber_nonnumeric", json.Number("abcxyz"), true},
+		{"bytes_opaque", []byte("abcxyz"), false}, // []byte: always opaque, always accepts
+	}
+	// encode contexts: wrap the leaf and place the carrier at it.
+	contexts := []struct {
+		name string
+		wrap func(leaf string) string
+		val  func(carrier any) any
+	}{
+		{"top", func(l string) string { return l }, func(c any) any { return c }},
+		{"record_field",
+			func(l string) string {
+				return fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":%s}]}`, l)
+			},
+			func(c any) any { return map[string]any{"f": c} }},
+		{"array_element",
+			func(l string) string { return fmt.Sprintf(`{"type":"array","items":%s}`, l) },
+			func(c any) any { return []any{c} }},
+		{"map_value",
+			func(l string) string { return fmt.Sprintf(`{"type":"map","values":%s}`, l) },
+			func(c any) any { return map[string]any{"k": c} }},
+	}
+
+	for _, b := range backings {
+		for _, car := range carriers {
+			for _, ctx := range contexts {
+				for _, bin := range []bool{true, false} {
+					t.Run(fmt.Sprintf("%s/%s/%s/%s", b.name, car.name, ctx.name, wireName(bin)), func(t *testing.T) {
+						s := avro.MustParse(ctx.wrap(b.leaf))
+						_, err := encodeWireAny(s, ctx.val(car.val), bin)
+						if car.reject && err == nil {
+							t.Errorf("%s encode accepted a non-numeric %s carrier; want reject (decimal carrier is numeric-text-only, []byte is the sole opaque form)", wireName(bin), car.name)
+						}
+						if !car.reject && err != nil {
+							t.Errorf("%s encode rejected a valid %s carrier: %v", wireName(bin), car.name, err)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+// encodeWire / decodeWire / encodeWireAny / wireName are shared helpers for the
+// decimal carrier tests: one place selects the binary vs JSON entry point.
+func wireName(bin bool) string {
+	if bin {
+		return "binary"
+	}
+	return "json"
+}
+
+func encodeWire(s *avro.Schema, v any, bin bool) ([]byte, error) { return encodeWireAny(s, v, bin) }
+
+func encodeWireAny(s *avro.Schema, v any, bin bool) ([]byte, error) {
+	if bin {
+		return s.AppendEncode(nil, v)
+	}
+	return s.AppendEncodeJSON(nil, v)
+}
+
+func decodeWire(s *avro.Schema, wire []byte, v any, bin bool) error {
+	if bin {
+		_, err := s.Decode(wire, v)
+		return err
+	}
+	return s.DecodeJSON(wire, v)
+}
+
+// carrierStrRec / carrierBytesRec are typed record targets for the string-
+// carrier round-trip net: decoding a wrapped logical leaf into a concrete
+// string / []byte field observes the LEAF value directly. An `any` target would
+// surface the logical's default Go type (e.g. *big.Rat for a decimal) and hide a
+// string-target corruption, which is precisely the observation that matters.
+type carrierStrRec struct {
+	F string `avro:"f"`
+}
+
+type carrierBytesRec struct {
+	F []byte `avro:"f"`
+}
+
+// decodeCarrierLeaf decodes wire (a leaf wrapped by ctxName) into a typed
+// string / []byte target and returns the leaf value, so a string-target
+// round-trip can be compared byte-for-byte against the encoded input.
+func decodeCarrierLeaf(s *avro.Schema, wire []byte, isBytes bool, ctxName string, bin bool) (any, error) {
+	switch ctxName {
+	case "top":
+		if isBytes {
+			var b []byte
+			err := decodeWire(s, wire, &b, bin)
+			return b, err
+		}
+		var str string
+		err := decodeWire(s, wire, &str, bin)
+		return str, err
+	case "record_field":
+		if isBytes {
+			var r carrierBytesRec
+			err := decodeWire(s, wire, &r, bin)
+			return r.F, err
+		}
+		var r carrierStrRec
+		err := decodeWire(s, wire, &r, bin)
+		return r.F, err
+	case "array_element":
+		if isBytes {
+			var a [][]byte
+			err := decodeWire(s, wire, &a, bin)
+			if err == nil && len(a) > 0 {
+				return a[0], nil
+			}
+			return []byte(nil), err
+		}
+		var a []string
+		err := decodeWire(s, wire, &a, bin)
+		if err == nil && len(a) > 0 {
+			return a[0], nil
+		}
+		return "", err
+	case "map_value":
+		if isBytes {
+			var m map[string][]byte
+			err := decodeWire(s, wire, &m, bin)
+			return m["k"], err
+		}
+		var m map[string]string
+		err := decodeWire(s, wire, &m, bin)
+		return m["k"], err
+	}
+	return nil, fmt.Errorf("unknown context %q", ctxName)
+}
+
+func sameCarrier(got, want any) bool {
+	switch w := want.(type) {
+	case string:
+		g, ok := got.(string)
+		return ok && g == w
+	case []byte:
+		g, ok := got.([]byte)
+		return ok && bytes.Equal(g, w)
+	}
+	return false
+}
+
+// TestMatrix_LogicalStringCarrierRoundTripContract is the class net for EVERY
+// logical on bytes/fixed whose Go string carrier could encode OPAQUELY while its
+// string DECODE target reads a STRUCTURED value — the encode-opaque/decode-
+// structured mismatch that silently corrupts a round trip. It closes the whole
+// class, not just the big-decimal instance that motivated it.
+//
+// Invariant per cell (calibration-free): a STRING carrier either round-trips
+// EXACTLY (string-in == string-out) OR is REJECTED at encode. It must NEVER
+// both-succeed with string-in != string-out — that is the silent corruption. A
+// []byte carrier is the opaque escape hatch and round-trips exactly.
+//
+// CRITICAL — for each logical the string samples MUST include a string whose raw
+// bytes form VALID STRUCTURED FRAMING for that logical's decode (the corruption
+// trigger), NOT merely random/garbage bytes. Garbage that fails the decode's
+// structured parse falls through to the opaque path and round-trips by accident,
+// masking the bug — that is exactly how big-decimal slipped through the earlier
+// decimal fix, whose control sampled only "abcxyz" (first byte 0x61 zig-zags to
+// a negative length, so the framing parse fails). For big-decimal the trigger is
+// "\x02\x05\x00" (varint uLen=1 || unscaled 5 || varint scale=0 — byte-identical
+// to the structured wire for the number 5). Do NOT weaken these to garbage-only.
+//
+// Class map (verified): decimal (bytes+fixed) and big-decimal are numeric-text-
+// only — a non-numeric string rejects. uuid-on-fixed rejects a non-canonical
+// string (parseUUID). uuid-on-string and duration decode raw, so any correctly-
+// sized string round-trips opaquely. []byte is opaque-symmetric everywhere.
+//
+// Neuter: reverting the big-decimal rejectNonNumericStructuredString arms
+// (serBigDecimal.ser in ser.go + the json_codec.go `case "big-decimal"` arm)
+// reds the big-decimal string_valid_framing cell (encode succeeds, decode
+// returns "5" != the input) in every context and on both wires; every other cell
+// stays green.
+func TestMatrix_LogicalStringCarrierRoundTripContract(t *testing.T) {
+	// A valid 12-byte duration wire value (months=0, days=0, milliseconds=1),
+	// little-endian uint32 triples — decodes raw into a []byte/string target.
+	dur12 := string([]byte{0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0})
+	const uuidCanon = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+	type sample struct {
+		name    string
+		val     any // string or []byte
+		isBytes bool
+		reject  bool // encode MUST reject; otherwise MUST round-trip exactly
+	}
+	leaves := []struct {
+		name    string
+		schema  string
+		samples []sample
+	}{
+		{"decimal_bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":0}`, []sample{
+			{"string_numeric", "5", false, false},
+			// Every byte sequence is a valid unscaled decimal, so ANY non-numeric
+			// string is a valid-framing corruption trigger (decodes to a number).
+			{"string_nonnumeric_framing", "abc", false, true},
+			{"bytes_opaque", []byte{0x01, 0x02}, true, false},
+		}},
+		{"decimal_fixed", `{"type":"fixed","name":"DFa","size":8,"logicalType":"decimal","precision":10,"scale":0}`, []sample{
+			{"string_numeric", "5", false, false},
+			{"string_nonnumeric_framing", "abc", false, true},
+			{"bytes_opaque", []byte{0, 0, 0, 0, 0, 0, 0, 1}, true, false},
+		}},
+		{"big_decimal", `{"type":"bytes","logicalType":"big-decimal"}`, []sample{
+			{"string_numeric", "5", false, false},
+			// Valid AVRO-4124 framing == the structured wire for 5. Pre-fix this
+			// encoded opaque and decoded to "5" (corruption); now it rejects.
+			{"string_valid_framing", "\x02\x05\x00", false, true},
+			// Non-framing (parse fails): pre-fix round-tripped opaque; now rejects
+			// too, keeping the big-decimal string carrier numeric-text-only.
+			{"string_nonframing", "abcxyz", false, true},
+			{"bytes_opaque", []byte{0x02, 0x05, 0x00}, true, false},
+		}},
+		{"uuid_fixed", `{"type":"fixed","name":"UFa","size":16,"logicalType":"uuid"}`, []sample{
+			{"string_canonical", uuidCanon, false, false},
+			// A non-canonical string is rejected by parseUUID (symmetric — the
+			// encoder never emits a wire the string decoder can't reproduce).
+			{"string_noncanonical", "not-a-uuid-value!!!!", false, true},
+			{"bytes_raw16", make([]byte, 16), true, false},
+		}},
+		{"uuid_string", `{"type":"string","logicalType":"uuid"}`, []sample{
+			// uuid-on-string is wire-equivalent to plain string: raw pass-through
+			// on both sides, so ANY string round-trips exactly (no validation).
+			{"string_canonical", uuidCanon, false, false},
+			{"string_arbitrary", "hello-not-a-uuid", false, false},
+		}},
+		{"duration_fixed", `{"type":"fixed","name":"DURa","size":12,"logicalType":"duration"}`, []sample{
+			// duration decodes raw into a string/[]byte target (opaque both sides).
+			{"string_valid12", dur12, false, false},
+			// Wrong length is rejected by the fixed size check (symmetric).
+			{"string_wrongsize", "short", false, true},
+			{"bytes_raw12", make([]byte, 12), true, false},
+		}},
+	}
+	contexts := []struct {
+		name string
+		wrap func(leaf string) string
+		val  func(carrier any) any
+	}{
+		{"top", func(l string) string { return l }, func(c any) any { return c }},
+		{"record_field",
+			func(l string) string {
+				return fmt.Sprintf(`{"type":"record","name":"R","fields":[{"name":"f","type":%s}]}`, l)
+			},
+			func(c any) any { return map[string]any{"f": c} }},
+		{"array_element",
+			func(l string) string { return fmt.Sprintf(`{"type":"array","items":%s}`, l) },
+			func(c any) any { return []any{c} }},
+		{"map_value",
+			func(l string) string { return fmt.Sprintf(`{"type":"map","values":%s}`, l) },
+			func(c any) any { return map[string]any{"k": c} }},
+	}
+
+	for _, lf := range leaves {
+		for _, smp := range lf.samples {
+			for _, ctx := range contexts {
+				for _, bin := range []bool{true, false} {
+					t.Run(fmt.Sprintf("%s/%s/%s/%s", lf.name, smp.name, ctx.name, wireName(bin)), func(t *testing.T) {
+						s := avro.MustParse(ctx.wrap(lf.schema))
+						wire, err := encodeWireAny(s, ctx.val(smp.val), bin)
+						if smp.reject {
+							if err == nil {
+								t.Fatalf("encode accepted a carrier that must reject: a string carrier is numeric-text/canonical/size-valid-only; an opaque encode of a valid-framing string would decode to a different value")
+							}
+							return
+						}
+						if err != nil {
+							t.Fatalf("encode rejected a carrier that must round-trip: %v", err)
+						}
+						got, derr := decodeCarrierLeaf(s, wire, smp.isBytes, ctx.name, bin)
+						if derr != nil {
+							t.Fatalf("decode: %v", derr)
+						}
+						if !sameCarrier(got, smp.val) {
+							t.Errorf("round-trip corruption: encoded %#v, decoded %#v", smp.val, got)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+// TestRegression_FixedDecimalByteTargetPreservesRemainder pins the decode
+// consumption invariant for fixed+decimal into a []byte / [N]byte target: a
+// deserializer must return exactly src minus the bytes it consumed. The
+// []byte/[N]byte fall-back (the opaque escape hatch) delegates to the plain
+// fixed decoder with a synthesized copy of just the payload bytes; returning
+// THAT call's remainder would yield the copy's (always empty) tail instead of
+// the enclosing stream's true remainder. The observable breakage: a top-level
+// Decode with trailing data returns an empty rest with NO error (silent
+// stream truncation), and any value AFTER the fixed-decimal in the same
+// stream (a later record field, the next array element, the next map entry)
+// reads from an empty buffer and errors on the library's own wire.
+func TestRegression_FixedDecimalByteTargetPreservesRemainder(t *testing.T) {
+	const leaf = `{"type":"fixed","name":"F","size":4,"logicalType":"decimal","precision":9,"scale":2}`
+
+	t.Run("top_level_rest", func(t *testing.T) {
+		s := avro.MustParse(leaf)
+		buf := []byte{0, 0, 1, 200, 0xAA, 0xBB} // one fixed(4) value + 2 trailing bytes
+		var b []byte
+		rest, err := s.Decode(buf, &b)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal(b, []byte{0, 0, 1, 200}) {
+			t.Errorf("value = % x, want 00 00 01 c8", b)
+		}
+		if !bytes.Equal(rest, []byte{0xAA, 0xBB}) {
+			t.Errorf("rest = % x, want aa bb (trailing bytes must survive a []byte fixed-decimal decode)", rest)
+		}
+	})
+
+	t.Run("record_field_then_field", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[
+			{"name":"d","type":` + leaf + `},
+			{"name":"x","type":"int"}]}`)
+		type R struct {
+			D []byte `avro:"d"`
+			X int32  `avro:"x"`
+		}
+		wire, err := s.Encode(R{D: []byte{0, 0, 1, 200}, X: 7})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out R
+		if _, err := s.Decode(wire, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal(out.D, []byte{0, 0, 1, 200}) || out.X != 7 {
+			t.Errorf("got %+v, want D=00 00 01 c8 X=7", out)
+		}
+	})
+
+	t.Run("array_elements", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"array","items":` + leaf + `}`)
+		in := [][]byte{{0, 0, 0, 5}, {0, 0, 1, 200}}
+		wire, err := s.Encode(in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out [][]byte
+		if _, err := s.Decode(wire, &out); err != nil {
+			t.Fatalf("decode [][]byte: %v", err)
+		}
+		if len(out) != 2 || !bytes.Equal(out[0], in[0]) || !bytes.Equal(out[1], in[1]) {
+			t.Errorf("got %v, want %v", out, in)
+		}
+		var arr [][4]byte
+		if _, err := s.Decode(wire, &arr); err != nil {
+			t.Fatalf("decode [][4]byte: %v", err)
+		}
+		if len(arr) != 2 || arr[1] != [4]byte{0, 0, 1, 200} {
+			t.Errorf("[][4]byte got %v", arr)
+		}
+	})
+
+	t.Run("map_entries", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"map","values":` + leaf + `}`)
+		in := map[string][]byte{"a": {0, 0, 0, 5}, "b": {0, 0, 1, 200}}
+		wire, err := s.Encode(in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out map[string][]byte
+		if _, err := s.Decode(wire, &out); err != nil {
+			t.Fatalf("decode map[string][]byte: %v", err)
+		}
+		if len(out) != 2 || !bytes.Equal(out["a"], in["a"]) || !bytes.Equal(out["b"], in["b"]) {
+			t.Errorf("got %v, want %v", out, in)
+		}
+	})
+
+	t.Run("nested_record_boundary", func(t *testing.T) {
+		// The fixed-decimal is the LAST field of an inner record, with more
+		// data following the inner record in the outer one — the consumption
+		// error crosses a record boundary before it becomes observable.
+		s := avro.MustParse(`{"type":"record","name":"O","fields":[
+			{"name":"inner","type":{"type":"record","name":"I","fields":[
+				{"name":"d","type":` + leaf + `}]}},
+			{"name":"x","type":"int"}]}`)
+		type I struct {
+			D []byte `avro:"d"`
+		}
+		type O struct {
+			Inner I     `avro:"inner"`
+			X     int32 `avro:"x"`
+		}
+		wire, err := s.Encode(O{Inner: I{D: []byte{0, 0, 0, 5}}, X: 9})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out O
+		if _, err := s.Decode(wire, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal(out.Inner.D, []byte{0, 0, 0, 5}) || out.X != 9 {
+			t.Errorf("got %+v", out)
+		}
+	})
+}
+
+// TestMatrix_FixedDecimalTargetConsumptionContract is the class net for the
+// decode-consumption invariant: for EVERY Go target a decimal-carrying leaf
+// accepts, the decoded value must match the leaf's contract AND the stream
+// position after the value must be exact. Position is asserted two ways:
+// trailing bytes after a top-level value must come back as Decode's rest, and
+// data following the value inside one stream (a later record field, further
+// array elements, further map entries, a field-reordered resolved record)
+// must still decode. JSON decode runs the same value grid (it has no stream
+// remainder, so it doubles as the value oracle for the typed setter arms).
+//
+// Leaves: fixed+decimal (the historical drift site), bytes+decimal and plain
+// fixed as always-green controls — the three must agree that no accepted
+// target disturbs stream framing. Targets: []byte, [4]byte (the opaque
+// escape hatch pair), string, *big.Rat, json.Number (the structured arms),
+// and any (the independent oracle).
+//
+// Non-vacuity (verified at introduction by re-introducing the wrong
+// remainder return in deserFixedDecimal's fall-back): every fixed_decimal
+// byte-target binary cell reds (top: rest empty; record/array/map/resolved:
+// "short buffer" on the following value) while both control leaves and all
+// structured-target cells stay green.
+func TestMatrix_FixedDecimalTargetConsumptionContract(t *testing.T) {
+	// One payload for every leaf: unscaled 456 at scale 2 -> 4.56.
+	payload := []byte{0, 0, 1, 200}
+	rat456 := big.NewRat(456, 100)
+
+	leaves := []struct {
+		name    string
+		schema  string
+		isRat   bool   // decimal leaves decode structured targets via *big.Rat
+		wantStr string // string-target expectation
+	}{
+		{"fixed_decimal", `{"type":"fixed","name":"F","size":4,"logicalType":"decimal","precision":9,"scale":2}`, true, "4.56"},
+		{"bytes_decimal", `{"type":"bytes","logicalType":"decimal","precision":9,"scale":2}`, true, "4.56"},
+		{"fixed_plain", `{"type":"fixed","name":"F","size":4}`, false, string(payload)},
+	}
+
+	for _, lf := range leaves {
+		// checkTarget decodes via the supplied decode fn into one typed
+		// target per kind and asserts the value.
+		targets := []struct {
+			name string
+			run  func(t *testing.T, decode func(v any) error)
+		}{
+			{"bytes_slice", func(t *testing.T, decode func(v any) error) {
+				var b []byte
+				if err := decode(&b); err != nil {
+					t.Fatalf("decode []byte: %v", err)
+				}
+				if !bytes.Equal(b, payload) {
+					t.Errorf("[]byte = % x, want % x", b, payload)
+				}
+			}},
+			{"byte_array", func(t *testing.T, decode func(v any) error) {
+				var b [4]byte
+				if err := decode(&b); err != nil {
+					t.Fatalf("decode [4]byte: %v", err)
+				}
+				if !bytes.Equal(b[:], payload) {
+					t.Errorf("[4]byte = % x, want % x", b[:], payload)
+				}
+			}},
+			{"string", func(t *testing.T, decode func(v any) error) {
+				var s string
+				if err := decode(&s); err != nil {
+					t.Fatalf("decode string: %v", err)
+				}
+				if s != lf.wantStr {
+					t.Errorf("string = %q, want %q", s, lf.wantStr)
+				}
+			}},
+			{"big_rat", func(t *testing.T, decode func(v any) error) {
+				if !lf.isRat {
+					t.Skip("no *big.Rat arm for a plain fixed")
+				}
+				var r *big.Rat
+				if err := decode(&r); err != nil {
+					t.Fatalf("decode *big.Rat: %v", err)
+				}
+				if r == nil || r.Cmp(rat456) != 0 {
+					t.Errorf("*big.Rat = %v, want %v", r, rat456)
+				}
+			}},
+			{"json_number", func(t *testing.T, decode func(v any) error) {
+				if !lf.isRat {
+					t.Skip("no json.Number arm for a plain fixed")
+				}
+				var n json.Number
+				if err := decode(&n); err != nil {
+					t.Fatalf("decode json.Number: %v", err)
+				}
+				if n != json.Number("4.56") {
+					t.Errorf("json.Number = %q, want 4.56", n)
+				}
+			}},
+			{"any", func(t *testing.T, decode func(v any) error) {
+				var v any
+				if err := decode(&v); err != nil {
+					t.Fatalf("decode any: %v", err)
+				}
+				if lf.isRat {
+					r, ok := v.(*big.Rat)
+					if !ok || r.Cmp(rat456) != 0 {
+						t.Errorf("any = %T %v, want *big.Rat %v", v, v, rat456)
+					}
+				} else if b, ok := v.([]byte); !ok || !bytes.Equal(b, payload) {
+					t.Errorf("any = %T %v, want []byte % x", v, v, payload)
+				}
+			}},
+		}
+
+		for _, tgt := range targets {
+			t.Run(lf.name+"/"+tgt.name+"/binary_top_trailing", func(t *testing.T) {
+				s := avro.MustParse(lf.schema)
+				wire, err := s.Encode(payload)
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				buf := append(append([]byte{}, wire...), 0xAA, 0xBB)
+				tgt.run(t, func(v any) error {
+					rest, err := s.Decode(buf, v)
+					if err != nil {
+						return err
+					}
+					if !bytes.Equal(rest, []byte{0xAA, 0xBB}) {
+						t.Errorf("rest = % x, want aa bb", rest)
+					}
+					return nil
+				})
+			})
+			t.Run(lf.name+"/"+tgt.name+"/json", func(t *testing.T) {
+				s := avro.MustParse(lf.schema)
+				jw, err := s.EncodeJSON(payload)
+				if err != nil {
+					t.Fatalf("encode json: %v", err)
+				}
+				tgt.run(t, func(v any) error { return s.DecodeJSON(jw, v) })
+			})
+		}
+
+		// Stream contexts: data FOLLOWS the leaf value inside one binary
+		// stream, decoded through the byte-carrier targets (the opaque
+		// escape hatch, where consumption drift is possible at all — the
+		// structured arms above share one setter that never re-frames).
+		t.Run(lf.name+"/binary_record_then_field", func(t *testing.T) {
+			s := avro.MustParse(`{"type":"record","name":"R","fields":[
+				{"name":"d","type":` + lf.schema + `},
+				{"name":"x","type":"int"}]}`)
+			type R struct {
+				D []byte `avro:"d"`
+				X int32  `avro:"x"`
+			}
+			wire, err := s.Encode(R{D: payload, X: 7})
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var out R
+			if _, err := s.Decode(wire, &out); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !bytes.Equal(out.D, payload) || out.X != 7 {
+				t.Errorf("got %+v, want D=% x X=7", out, payload)
+			}
+		})
+		t.Run(lf.name+"/binary_array_elements", func(t *testing.T) {
+			s := avro.MustParse(`{"type":"array","items":` + lf.schema + `}`)
+			in := [][]byte{{0, 0, 0, 5}, payload}
+			wire, err := s.Encode(in)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var out [][]byte
+			if _, err := s.Decode(wire, &out); err != nil {
+				t.Fatalf("decode [][]byte: %v", err)
+			}
+			if len(out) != 2 || !bytes.Equal(out[0], in[0]) || !bytes.Equal(out[1], in[1]) {
+				t.Errorf("got %v, want %v", out, in)
+			}
+		})
+		t.Run(lf.name+"/binary_map_entries", func(t *testing.T) {
+			s := avro.MustParse(`{"type":"map","values":` + lf.schema + `}`)
+			in := map[string][]byte{"a": {0, 0, 0, 5}, "b": payload}
+			wire, err := s.Encode(in)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var out map[string][]byte
+			if _, err := s.Decode(wire, &out); err != nil {
+				t.Fatalf("decode map: %v", err)
+			}
+			if len(out) != 2 || !bytes.Equal(out["a"], in["a"]) || !bytes.Equal(out["b"], in["b"]) {
+				t.Errorf("got %v, want %v", out, in)
+			}
+		})
+		t.Run(lf.name+"/binary_resolved_reordered", func(t *testing.T) {
+			// Field-reordered reader: canonical forms differ, so Resolve
+			// cannot canonical-equality fast-path to the natural decoder —
+			// the resolved record machinery drives the leaf deserializer,
+			// and the following field still must decode.
+			writer := avro.MustParse(`{"type":"record","name":"R","fields":[
+				{"name":"d","type":` + lf.schema + `},
+				{"name":"x","type":"int"}]}`)
+			reader := avro.MustParse(`{"type":"record","name":"R","fields":[
+				{"name":"x","type":"int"},
+				{"name":"d","type":` + lf.schema + `}]}`)
+			resolved, err := avro.Resolve(writer, reader)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			wire, err := writer.Encode(map[string]any{"d": payload, "x": 7})
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			type R struct {
+				X int32  `avro:"x"`
+				D []byte `avro:"d"`
+			}
+			var out R
+			if _, err := resolved.Decode(wire, &out); err != nil {
+				t.Fatalf("resolved decode: %v", err)
+			}
+			if !bytes.Equal(out.D, payload) || out.X != 7 {
+				t.Errorf("got %+v", out)
+			}
+		})
+	}
+}
+
+// ---------- nesting_test.go ----------
+
+// Mutually recursive types — must be at package level for Go.
+type mutA struct {
+	Val int32 `avro:"val"`
+	B   *mutB `avro:"b"`
+}
+type mutB struct {
+	Val string `avro:"val"`
+	A   *mutA  `avro:"a"`
+}
+
+// 3-way cross-referential types.
+type crossX struct {
+	ID int32   `avro:"id"`
+	Y  *crossY `avro:"y"`
+}
+type crossY struct {
+	ID int32   `avro:"id"`
+	Z  *crossZ `avro:"z"`
+}
+type crossZ struct {
+	ID int32   `avro:"id"`
+	X  *crossX `avro:"x"`
+}
+
+// testIP is a minimal TextMarshaler/TextUnmarshaler for testing.
+type testIP [4]byte
+
+var (
+	_ encoding.TextMarshaler   = testIP{}
+	_ encoding.TextUnmarshaler = (*testIP)(nil)
+)
+
+func (ip testIP) MarshalText() ([]byte, error) {
+	return []byte{
+		'0' + ip[0]/100, '0' + (ip[0]/10)%10, '0' + ip[0]%10, '.',
+		'0' + ip[1]/100, '0' + (ip[1]/10)%10, '0' + ip[1]%10, '.',
+		'0' + ip[2]/100, '0' + (ip[2]/10)%10, '0' + ip[2]%10, '.',
+		'0' + ip[3]/100, '0' + (ip[3]/10)%10, '0' + ip[3]%10,
+	}, nil
+}
+
+func (ip *testIP) UnmarshalText(b []byte) error {
+	var parts [4]byte
+	p := 0
+	for i := range 4 {
+		var v byte
+		for p < len(b) && b[p] != '.' {
+			v = v*10 + (b[p] - '0')
+			p++
+		}
+		parts[i] = v
+		p++ // skip '.'
+	}
+	*ip = parts
+	return nil
+}
+
+// -----------------------------------------------------------------------
+// Deep Multi-Level Nesting Tests
+//
+// These tests exercise multi-level type nesting: deep record/array/map
+// chains, logical types at depth, odd Go types (TextMarshaler, uint,
+// big.Rat, embedded structs, inline tags), recursive and cross-referential
+// schemas, schema resolution through nested types, and JSON codec.
+// -----------------------------------------------------------------------
+
+// ---------- deep record/collection chains ----------
+
+func TestDeepNestingRecordArrayRecordArrayRecord(t *testing.T) {
+	// Company → []Department → []Employee
+	schema := `{
+		"type": "record", "name": "Company", "fields": [
+			{"name": "name", "type": "string"},
+			{"name": "departments", "type": {"type": "array", "items": {
+				"type": "record", "name": "Department", "fields": [
+					{"name": "name", "type": "string"},
+					{"name": "employees", "type": {"type": "array", "items": {
+						"type": "record", "name": "Employee", "fields": [
+							{"name": "name", "type": "string"},
+							{"name": "age", "type": "int"}
+						]
+					}}}
+				]
+			}}}
+		]
+	}`
+	type Employee struct {
+		Name string `avro:"name"`
+		Age  int32  `avro:"age"`
+	}
+	type Department struct {
+		Name      string     `avro:"name"`
+		Employees []Employee `avro:"employees"`
+	}
+	type Company struct {
+		Name        string       `avro:"name"`
+		Departments []Department `avro:"departments"`
+	}
+
+	t.Run("typed round-trip", func(t *testing.T) {
+		input := Company{
+			Name: "Acme",
+			Departments: []Department{
+				{Name: "Eng", Employees: []Employee{{Name: "Alice", Age: 30}, {Name: "Bob", Age: 25}}},
+				{Name: "Sales", Employees: []Employee{{Name: "Charlie", Age: 35}}},
+			},
+		}
+		got := roundTrip(t, schema, input)
+		if !reflect.DeepEqual(got, input) {
+			t.Fatalf("got %+v, want %+v", got, input)
+		}
+	})
+
+	t.Run("decode to any", func(t *testing.T) {
+		s := mustParse(t, schema)
+		input := Company{Name: "Acme", Departments: []Department{
+			{Name: "Eng", Employees: []Employee{{Name: "Alice", Age: 30}}},
+		}}
+		encoded, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result any
+		rem, err := s.Decode(encoded, &result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rem) != 0 {
+			t.Fatalf("unconsumed: %d", len(rem))
+		}
+		m := result.(map[string]any)
+		depts := m["departments"].([]any)
+		emp := depts[0].(map[string]any)["employees"].([]any)[0].(map[string]any)
+		if emp["name"] != "Alice" || emp["age"] != int32(30) {
+			t.Fatalf("employee: got %v", emp)
+		}
+	})
+}
+
+func TestDeepNestingMapOfRecordWithArrayOfRecords(t *testing.T) {
+	schema := `{
+		"type": "map",
+		"values": {
+			"type": "record", "name": "Team", "fields": [
+				{"name": "lead", "type": "string"},
+				{"name": "members", "type": {"type": "array", "items": {
+					"type": "record", "name": "Member", "fields": [
+						{"name": "name", "type": "string"},
+						{"name": "role", "type": "string"}
+					]
+				}}}
+			]
+		}
+	}`
+	type Member struct {
+		Name string `avro:"name"`
+		Role string `avro:"role"`
+	}
+	type Team struct {
+		Lead    string   `avro:"lead"`
+		Members []Member `avro:"members"`
+	}
+	input := map[string]Team{
+		"backend":  {Lead: "Alice", Members: []Member{{Name: "Bob", Role: "dev"}, {Name: "Carol", Role: "dev"}}},
+		"frontend": {Lead: "Dave", Members: []Member{{Name: "Eve", Role: "design"}}},
+	}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+func TestDeepNestingMapMapMapRecord(t *testing.T) {
+	schema := `{
+		"type": "map", "values": {
+			"type": "map", "values": {
+				"type": "map", "values": {
+					"type": "record", "name": "Cell", "fields": [
+						{"name": "v", "type": "double"}
+					]
+				}
+			}
+		}
+	}`
+	type Cell struct {
+		V float64 `avro:"v"`
+	}
+	input := map[string]map[string]map[string]Cell{
+		"sheet1": {"row1": {"A": {V: 1.1}, "B": {V: 2.2}}},
+		"sheet2": {"row1": {"A": {V: 3.3}}},
+	}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+func TestDeepNestingArrayOfArrayOfArrayOfString(t *testing.T) {
+	schema := `{"type": "array", "items": {"type": "array", "items": {"type": "array", "items": "string"}}}`
+	input := [][][]string{{{"a", "b"}, {"c"}}, {{"d"}}}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+func TestDeepNesting5LevelArrayOfInt(t *testing.T) {
+	schema := `{"type":"array","items":{"type":"array","items":{"type":"array","items":{"type":"array","items":{"type":"array","items":"int"}}}}}`
+	input := [][][][][]int32{
+		{{{{1, 2}, {3}}}},
+		{{{{4}}, {{5, 6, 7}}}},
+	}
+	got := roundTrip(t, schema, input)
+	if got[0][0][0][0][0] != 1 || got[1][0][1][0][2] != 7 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestDeepNestingArrayOfMapOfArrayOfInt(t *testing.T) {
+	schema := `{"type": "array", "items": {"type": "map", "values": {"type": "array", "items": "int"}}}`
+	input := []map[string][]int32{
+		{"evens": {2, 4}, "odds": {1, 3}},
+		{"primes": {2, 3, 5, 7}},
+	}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+// ---------- unions at depth ----------
+
+func TestDeepNestingUnionWithNestedRecord(t *testing.T) {
+	// Top-level ["null", Record] union — exercises isNilValue peeling through **T.
+	schema := `["null", {
+		"type": "record", "name": "Order", "fields": [
+			{"name": "id", "type": "int"},
+			{"name": "shipping", "type": {
+				"type": "record", "name": "Address", "fields": [
+					{"name": "street", "type": "string"},
+					{"name": "city", "type": "string"}
+				]
+			}}
+		]
+	}]`
+	type Address struct {
+		Street string `avro:"street"`
+		City   string `avro:"city"`
+	}
+	type Order struct {
+		ID       int32   `avro:"id"`
+		Shipping Address `avro:"shipping"`
+	}
+	s := mustParse(t, schema)
+
+	input := &Order{ID: 42, Shipping: Address{Street: "123 Main", City: "Springfield"}}
+	encoded, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *Order
+	rem, err := s.Decode(encoded, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("unconsumed: %d", len(rem))
+	}
+	if got.ID != 42 || got.Shipping.Street != "123 Main" {
+		t.Fatalf("got %+v", got)
+	}
+
+	var nilInput *Order
+	encoded, err = s.AppendEncode(nil, &nilInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotNil *Order
+	if rem, err = s.Decode(encoded, &gotNil); err != nil {
+		t.Fatal(err)
+	}
+	if len(rem) != 0 || gotNil != nil {
+		t.Fatalf("expected nil, got %+v", gotNil)
+	}
+}
+
+func TestDeepNestingArrayOfRecordsWithNullableNestedRecord(t *testing.T) {
+	schema := `{
+		"type": "array",
+		"items": {
+			"type": "record", "name": "Node", "fields": [
+				{"name": "value", "type": "int"},
+				{"name": "meta", "type": ["null", {
+					"type": "record", "name": "Meta", "fields": [
+						{"name": "tag", "type": "string"},
+						{"name": "score", "type": "float"}
+					]
+				}]}
+			]
+		}
+	}`
+	type Meta struct {
+		Tag   string  `avro:"tag"`
+		Score float32 `avro:"score"`
+	}
+	type Node struct {
+		Value int32 `avro:"value"`
+		Meta  *Meta `avro:"meta"`
+	}
+	input := []Node{
+		{Value: 1, Meta: &Meta{Tag: "first", Score: 0.9}},
+		{Value: 2, Meta: nil},
+		{Value: 3, Meta: &Meta{Tag: "third", Score: 0.5}},
+	}
+	got := roundTrip(t, schema, input)
+	if got[0].Meta == nil || got[0].Meta.Tag != "first" {
+		t.Fatalf("got[0]: %+v", got[0])
+	}
+	if got[1].Meta != nil {
+		t.Fatalf("got[1]: expected nil meta")
+	}
+	if got[2].Meta == nil || got[2].Meta.Tag != "third" {
+		t.Fatalf("got[2]: %+v", got[2])
+	}
+}
+
+func TestDeepNestingRecordWithMapOfArrayOfUnions(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Config", "fields": [
+			{"name": "name", "type": "string"},
+			{"name": "settings", "type": {
+				"type": "map",
+				"values": {"type": "array", "items": ["null", "int", "string"]}
+			}}
+		]
+	}`
+	type Config struct {
+		Name     string           `avro:"name"`
+		Settings map[string][]any `avro:"settings"`
+	}
+	input := Config{
+		Name: "myconfig",
+		Settings: map[string][]any{
+			"ports":  {int32(8080), int32(443), nil},
+			"labels": {"web", nil, "api"},
+		},
+	}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got.Settings, input.Settings) {
+		t.Fatalf("got %+v, want %+v", got.Settings, input.Settings)
+	}
+}
+
+func TestDeepNesting3BranchUnionAtDepth(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Outer", "fields": [{
+			"name": "inner", "type": {
+				"type": "record", "name": "Inner", "fields": [{
+					"name": "payload", "type": [
+						"null",
+						{"type": "record", "name": "Text", "fields": [{"name": "body", "type": "string"}]},
+						{"type": "record", "name": "Num", "fields": [{"name": "val", "type": "long"}]}
+					]
+				}]
+			}
+		}]
+	}`
+	type Inner struct {
+		Payload any `avro:"payload"`
+	}
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
+	s := mustParse(t, schema)
+
+	for _, tc := range []struct {
+		name  string
+		in    any
+		check func(any)
+	}{
+		{"text", map[string]any{"body": "hello"}, func(v any) {
+			if v.(map[string]any)["body"] != "hello" {
+				panic("text mismatch")
+			}
+		}},
+		{"num", map[string]any{"val": int64(999)}, func(v any) {
+			if v.(map[string]any)["val"] != int64(999) {
+				panic("num mismatch")
+			}
+		}},
+		{"null", nil, func(v any) {
+			if v != nil {
+				panic("null mismatch")
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := Outer{Inner: Inner{Payload: tc.in}}
+			encoded, err := s.AppendEncode(nil, &in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got Outer
+			if _, err := s.Decode(encoded, &got); err != nil {
+				t.Fatal(err)
+			}
+			tc.check(got.Inner.Payload)
+		})
+	}
+}
+
+// ---------- named type reuse ----------
+
+func TestDeepNestingNamedTypeReuseInNestedRecords(t *testing.T) {
+	cache := &avro.SchemaCache{}
+	mustCacheParse := func(schema string) *avro.Schema {
+		s, err := cache.Parse(schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	mustCacheParse(`{"type":"record","name":"Coord","fields":[{"name":"lat","type":"double"},{"name":"lon","type":"double"}]}`)
+	mustCacheParse(`{"type":"record","name":"Location","fields":[{"name":"name","type":"string"},{"name":"coord","type":"Coord"}]}`)
+	s := mustCacheParse(`{
+		"type": "record", "name": "Trip", "fields": [
+			{"name": "origin", "type": "Location"},
+			{"name": "destination", "type": "Location"},
+			{"name": "waypoints", "type": {"type": "array", "items": "Location"}}
+		]
+	}`)
+
+	type Coord struct {
+		Lat float64 `avro:"lat"`
+		Lon float64 `avro:"lon"`
+	}
+	type Location struct {
+		Name  string `avro:"name"`
+		Coord Coord  `avro:"coord"`
+	}
+	type Trip struct {
+		Origin      Location   `avro:"origin"`
+		Destination Location   `avro:"destination"`
+		Waypoints   []Location `avro:"waypoints"`
+	}
+	input := Trip{
+		Origin:      Location{Name: "Home", Coord: Coord{Lat: 40.7, Lon: -74.0}},
+		Destination: Location{Name: "Office", Coord: Coord{Lat: 40.8, Lon: -73.9}},
+		Waypoints:   []Location{{Name: "Coffee", Coord: Coord{Lat: 40.75, Lon: -73.95}}},
+	}
+	encoded, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Trip
+	if rem, err := s.Decode(encoded, &got); err != nil || len(rem) != 0 {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+// ---------- empty collections at various levels ----------
+
+func TestDeepNestingEmptyCollections(t *testing.T) {
+	t.Run("record with empty nested array", func(t *testing.T) {
+		schema := `{
+			"type": "record", "name": "Outer", "fields": [
+				{"name": "items", "type": {"type": "array", "items": {
+					"type": "record", "name": "Inner", "fields": [{"name": "v", "type": "int"}]
+				}}},
+				{"name": "label", "type": "string"}
+			]
+		}`
+		type Inner struct {
+			V int32 `avro:"v"`
+		}
+		type Outer struct {
+			Items []Inner `avro:"items"`
+			Label string  `avro:"label"`
+		}
+		got := roundTrip(t, schema, Outer{Items: []Inner{}, Label: "empty"})
+		if len(got.Items) != 0 || got.Label != "empty" {
+			t.Fatalf("got %+v", got)
+		}
+	})
+
+	t.Run("nested empty maps", func(t *testing.T) {
+		schema := `{"type": "map", "values": {"type": "map", "values": "int"}}`
+		input := map[string]map[string]int32{"filled": {"a": 1}, "empty": {}}
+		got := roundTrip(t, schema, input)
+		if len(got["empty"]) != 0 || got["filled"]["a"] != 1 {
+			t.Fatalf("got %+v", got)
+		}
+	})
+
+	t.Run("deeply nested all empty", func(t *testing.T) {
+		schema := `{
+			"type": "record", "name": "Root", "fields": [
+				{"name": "data", "type": {"type": "map", "values": {
+					"type": "array", "items": {
+						"type": "record", "name": "Leaf", "fields": [
+							{"name": "tags", "type": {"type": "array", "items": "string"}}
+						]
+					}
+				}}}
+			]
+		}`
+		type Leaf struct {
+			Tags []string `avro:"tags"`
+		}
+		type Root struct {
+			Data map[string][]Leaf `avro:"data"`
+		}
+		got := roundTrip(t, schema, Root{Data: map[string][]Leaf{
+			"group1": {{Tags: []string{}}, {Tags: []string{}}},
+			"group2": {},
+		}})
+		if len(got.Data["group2"]) != 0 || len(got.Data["group1"]) != 2 {
+			t.Fatalf("got %+v", got)
+		}
+	})
+}
+
+// ---------- recursive / self-referential ----------
+
+func TestDeepNestingRecursiveTree(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "TreeNode", "fields": [
+			{"name": "value", "type": "int"},
+			{"name": "left", "type": ["null", "TreeNode"]},
+			{"name": "right", "type": ["null", "TreeNode"]}
+		]
+	}`
+	type TreeNode struct {
+		Value int32     `avro:"value"`
+		Left  *TreeNode `avro:"left"`
+		Right *TreeNode `avro:"right"`
+	}
+	input := TreeNode{
+		Value: 10,
+		Left:  &TreeNode{Value: 5, Left: &TreeNode{Value: 2}, Right: &TreeNode{Value: 7}},
+		Right: &TreeNode{Value: 15, Right: &TreeNode{Value: 20}},
+	}
+	got := roundTrip(t, schema, input)
+	if got.Left.Left.Value != 2 || got.Left.Right.Value != 7 || got.Right.Right.Value != 20 {
+		t.Fatalf("tree mismatch: %+v", got)
+	}
+}
+
+func TestDeepNestingRecursiveTreeWithArrayChildren(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "TreeNode", "fields": [
+			{"name": "name", "type": "string"},
+			{"name": "children", "type": {"type": "array", "items": "TreeNode"}}
+		]
+	}`
+	type TreeNode struct {
+		Name     string      `avro:"name"`
+		Children []*TreeNode `avro:"children"`
+	}
+	input := TreeNode{
+		Name: "root",
+		Children: []*TreeNode{
+			{Name: "a", Children: []*TreeNode{
+				{Name: "a1"},
+				{Name: "a2", Children: []*TreeNode{{Name: "a2i"}}},
+			}},
+			{Name: "b"},
+		},
+	}
+	got := roundTrip(t, schema, input)
+	if got.Children[0].Children[1].Children[0].Name != "a2i" {
+		t.Fatalf("a2i: got %q", got.Children[0].Children[1].Children[0].Name)
+	}
+}
+
+// ---------- mutually recursive / cross-referential ----------
+
+func TestDeepNestingMutualRecursion(t *testing.T) {
+	s := avro.MustParse(`{
+		"type": "record", "name": "A", "fields": [
+			{"name": "val", "type": "int"},
+			{"name": "b", "type": ["null", {
+				"type": "record", "name": "B", "fields": [
+					{"name": "val", "type": "string"},
+					{"name": "a", "type": ["null", "A"]}
+				]
+			}]}
+		]
+	}`)
+
+	t.Run("A-B-A-B-A deep", func(t *testing.T) {
+		input := mutA{Val: 1, B: &mutB{Val: "2", A: &mutA{Val: 3, B: &mutB{Val: "4", A: &mutA{Val: 5, B: nil}}}}}
+		encoded, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got mutA
+		if _, err := s.Decode(encoded, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.B.A.B.A.Val != 5 {
+			t.Fatalf("got %d, want 5", got.B.A.B.A.Val)
+		}
+	})
+
+	t.Run("decode to any", func(t *testing.T) {
+		input := mutA{Val: 1, B: &mutB{Val: "two", A: &mutA{Val: 3}}}
+		encoded, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got any
+		if _, err := s.Decode(encoded, &got); err != nil {
+			t.Fatal(err)
+		}
+		a2 := got.(map[string]any)["b"].(map[string]any)["a"].(map[string]any)
+		if a2["val"] != int32(3) {
+			t.Fatalf("b.a.val: got %v", a2["val"])
+		}
+	})
+}
+
+func TestDeepNesting3WayCrossReference(t *testing.T) {
+	s := avro.MustParse(`{
+		"type": "record", "name": "X", "fields": [
+			{"name": "id", "type": "int"},
+			{"name": "y", "type": ["null", {
+				"type": "record", "name": "Y", "fields": [
+					{"name": "id", "type": "int"},
+					{"name": "z", "type": ["null", {
+						"type": "record", "name": "Z", "fields": [
+							{"name": "id", "type": "int"},
+							{"name": "x", "type": ["null", "X"]}
+						]
+					}]}
+				]
+			}]}
+		]
+	}`)
+
+	t.Run("double cycle X-Y-Z-X-Y-Z-X", func(t *testing.T) {
+		input := crossX{ID: 1, Y: &crossY{ID: 2, Z: &crossZ{ID: 3, X: &crossX{
+			ID: 4, Y: &crossY{ID: 5, Z: &crossZ{ID: 6, X: &crossX{ID: 7}}},
+		}}}}
+		encoded, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got crossX
+		if _, err := s.Decode(encoded, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Y.Z.X.Y.Z.X.ID != 7 {
+			t.Fatalf("got %d, want 7", got.Y.Z.X.Y.Z.X.ID)
+		}
+	})
+
+	t.Run("partial nulls", func(t *testing.T) {
+		input := crossX{ID: 1, Y: &crossY{ID: 2, Z: nil}}
+		encoded, err := s.AppendEncode(nil, &input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got crossX
+		if _, err := s.Decode(encoded, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Y.Z != nil {
+			t.Fatalf("expected nil Z")
+		}
+	})
+}
+
+// ---------- schema resolution at depth ----------
+
+func TestDeepNestingResolve3LevelFieldChanges(t *testing.T) {
+	// 3-level: add field at L3, remove field at L2, promote int→long at L3.
+	writerSchema := `{
+		"type": "record", "name": "L1", "fields": [{
+			"name": "l2", "type": {
+				"type": "record", "name": "L2", "fields": [
+					{"name": "removed", "type": "string"},
+					{"name": "l3", "type": {
+						"type": "record", "name": "L3", "fields": [
+							{"name": "x", "type": "int"}
+						]
+					}}
+				]
+			}
+		}]
+	}`
+	readerSchema := `{
+		"type": "record", "name": "L1", "fields": [{
+			"name": "l2", "type": {
+				"type": "record", "name": "L2", "fields": [
+					{"name": "l3", "type": {
+						"type": "record", "name": "L3", "fields": [
+							{"name": "x", "type": "long"},
+							{"name": "y", "type": "string", "default": "new"}
+						]
+					}}
+				]
+			}
+		}]
+	}`
+	type L3W struct {
+		X int32 `avro:"x"`
+	}
+	type L2W struct {
+		Removed string `avro:"removed"`
+		L3      L3W    `avro:"l3"`
+	}
+	type L1W struct {
+		L2 L2W `avro:"l2"`
+	}
+	type L3R struct {
+		X int64  `avro:"x"`
+		Y string `avro:"y"`
+	}
+	type L2R struct {
+		L3 L3R `avro:"l3"`
+	}
+	type L1R struct {
+		L2 L2R `avro:"l2"`
+	}
+
+	var got L1R
+	resolveEncodeDecode(t, writerSchema, readerSchema,
+		&L1W{L2: L2W{Removed: "gone", L3: L3W{X: 7}}}, &got)
+	if got.L2.L3.X != 7 || got.L2.L3.Y != "new" {
+		t.Fatalf("got %+v", got.L2.L3)
+	}
+}
+
+// ---------- JSON codec at depth ----------
+
+func TestDeepNestingJSONCodec(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Root", "fields": [
+			{"name": "child", "type": {
+				"type": "record", "name": "Child", "fields": [
+					{"name": "ts", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+					{"name": "items", "type": {"type": "array", "items": {
+						"type": "record", "name": "Item", "fields": [
+							{"name": "id", "type": "int"},
+							{"name": "label", "type": "string"}
+						]
+					}}},
+					{"name": "opt", "type": ["null", "string"]}
+				]
+			}}
+		]
+	}`
+	type Item struct {
+		ID    int32  `avro:"id"`
+		Label string `avro:"label"`
+	}
+	type Child struct {
+		Ts    time.Time `avro:"ts"`
+		Items []Item    `avro:"items"`
+		Opt   *string   `avro:"opt"`
+	}
+	type Root struct {
+		Child Child `avro:"child"`
+	}
+	s := avro.MustParse(schema)
+	ts := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	opt := "yes"
+	input := Root{Child: Child{Ts: ts, Items: []Item{{1, "a"}, {2, "b"}}, Opt: &opt}}
+
+	jsonBytes, err := s.EncodeJSON(&input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Root
+	if err := s.DecodeJSON(jsonBytes, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Child.Ts.Equal(ts) || len(got.Child.Items) != 2 || got.Child.Opt == nil || *got.Child.Opt != "yes" {
+		t.Fatalf("got %+v", got)
+	}
+
+	// Null union case.
+	inputNil := Root{Child: Child{Ts: ts, Items: []Item{{1, "a"}}, Opt: nil}}
+	jsonBytes, err = s.EncodeJSON(&inputNil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotNil Root
+	if err := s.DecodeJSON(jsonBytes, &gotNil); err != nil {
+		t.Fatal(err)
+	}
+	if gotNil.Child.Opt != nil {
+		t.Fatalf("expected nil opt")
+	}
+}
+
+// ---------- complex mixed nesting ----------
+
+func TestDeepNestingRecordMapArrayRecordUnion(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Catalog", "fields": [
+			{"name": "sections", "type": {
+				"type": "map", "values": {
+					"type": "array", "items": {
+						"type": "record", "name": "Product", "fields": [
+							{"name": "name", "type": "string"},
+							{"name": "desc", "type": ["null", "string"]}
+						]
+					}
+				}
+			}}
+		]
+	}`
+	type Product struct {
+		Name string  `avro:"name"`
+		Desc *string `avro:"desc"`
+	}
+	type Catalog struct {
+		Sections map[string][]Product `avro:"sections"`
+	}
+	desc := "A widget"
+	input := Catalog{Sections: map[string][]Product{
+		"widgets": {{Name: "Widget A", Desc: &desc}, {Name: "Widget B", Desc: nil}},
+		"gadgets": {{Name: "Gadget X", Desc: nil}},
+	}}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+func TestDeepNestingRecordWithEnumArrayFixedMapUnion(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Complex", "fields": [
+			{"name": "statuses", "type": {"type": "array", "items": {
+				"type": "enum", "name": "Status", "symbols": ["ACTIVE", "INACTIVE", "PENDING"]
+			}}},
+			{"name": "checksums", "type": {"type": "map", "values": {
+				"type": "fixed", "name": "MD5", "size": 16
+			}}},
+			{"name": "payload", "type": ["null",
+				{"type":"record","name":"TextPayload","fields":[{"name":"body","type":"string"}]},
+				{"type":"record","name":"BinaryPayload","fields":[{"name":"data","type":"bytes"},{"name":"mime","type":"string"}]}
+			]}
+		]
+	}`
+	type Complex struct {
+		Statuses  []string            `avro:"statuses"`
+		Checksums map[string][16]byte `avro:"checksums"`
+		Payload   any                 `avro:"payload"`
+	}
+	s := mustParse(t, schema)
+	md5 := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	input := Complex{
+		Statuses: []string{"ACTIVE", "PENDING"}, Checksums: map[string][16]byte{"file1": md5},
+		Payload: map[string]any{"body": "hello"},
+	}
+	encoded, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Complex
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Statuses, input.Statuses) || !reflect.DeepEqual(got.Checksums, input.Checksums) {
+		t.Fatalf("got %+v", got)
+	}
+	if got.Payload.(map[string]any)["body"] != "hello" {
+		t.Fatalf("payload: %v", got.Payload)
+	}
+}
+
+// ---------- nullable pointer chains ----------
+
+func TestDeepNestingNullableChainWithLogicalTypes(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Root", "fields": [
+			{"name": "ts", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+			{"name": "mid", "type": ["null", {
+				"type": "record", "name": "Mid", "fields": [
+					{"name": "day", "type": {"type": "int", "logicalType": "date"}},
+					{"name": "leaf", "type": ["null", {
+						"type": "record", "name": "Leaf", "fields": [
+							{"name": "dur", "type": {"type": "int", "logicalType": "time-millis"}},
+							{"name": "hash", "type": {"type": "fixed", "name": "H4", "size": 4}}
+						]
+					}]}
+				]
+			}]}
+		]
+	}`
+	type Leaf struct {
+		Dur  time.Duration `avro:"dur"`
+		Hash [4]byte       `avro:"hash"`
+	}
+	type Mid struct {
+		Day  time.Time `avro:"day"`
+		Leaf *Leaf     `avro:"leaf"`
+	}
+	type Root struct {
+		Ts  time.Time `avro:"ts"`
+		Mid *Mid      `avro:"mid"`
+	}
+	ts := time.Date(2025, 3, 1, 10, 0, 0, 0, time.UTC)
+	day := time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC)
+
+	full := roundTrip(t, schema, Root{Ts: ts, Mid: &Mid{Day: day, Leaf: &Leaf{Dur: 2 * time.Hour, Hash: [4]byte{0xCA, 0xFE, 0xBA, 0xBE}}}})
+	if full.Mid.Leaf.Hash != [4]byte{0xCA, 0xFE, 0xBA, 0xBE} || full.Mid.Leaf.Dur != 2*time.Hour {
+		t.Fatalf("full: %+v", full)
+	}
+
+	partial := roundTrip(t, schema, Root{Ts: ts, Mid: &Mid{Day: day, Leaf: nil}})
+	if partial.Mid == nil || partial.Mid.Leaf != nil {
+		t.Fatalf("partial: %+v", partial)
+	}
+
+	none := roundTrip(t, schema, Root{Ts: ts, Mid: nil})
+	if none.Mid != nil {
+		t.Fatalf("none: %+v", none)
+	}
+}
+
+// ---------- logical types at depth ----------
+
+func TestDeepNestingTimestampsAtDepth(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "EventLog", "fields": [
+			{"name": "events", "type": {"type": "array", "items": {
+				"type": "record", "name": "Event", "fields": [
+					{"name": "name", "type": "string"},
+					{"name": "ts_ms", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+					{"name": "ts_us", "type": {"type": "long", "logicalType": "timestamp-micros"}},
+					{"name": "ts_ns", "type": {"type": "long", "logicalType": "timestamp-nanos"}},
+					{"name": "day", "type": {"type": "int", "logicalType": "date"}}
+				]
+			}}}
+		]
+	}`
+	type Event struct {
+		Name string    `avro:"name"`
+		TsMs time.Time `avro:"ts_ms"`
+		TsUs time.Time `avro:"ts_us"`
+		TsNs time.Time `avro:"ts_ns"`
+		Day  time.Time `avro:"day"`
+	}
+	type EventLog struct {
+		Events []Event `avro:"events"`
+	}
+	ts := time.Date(2025, 6, 15, 12, 30, 45, 123456789, time.UTC)
+	day := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
+	input := EventLog{Events: []Event{
+		{Name: "click", TsMs: ts.Truncate(time.Millisecond), TsUs: ts.Truncate(time.Microsecond), TsNs: ts, Day: day},
+	}}
+	got := roundTrip(t, schema, input)
+	e := got.Events[0]
+	if !e.TsMs.Equal(input.Events[0].TsMs) || !e.TsUs.Equal(input.Events[0].TsUs) || !e.TsNs.Equal(input.Events[0].TsNs) || !e.Day.Equal(day) {
+		t.Fatalf("got %+v", e)
+	}
+}
+
+func TestDeepNestingTimeDurationAtDepth(t *testing.T) {
+	// time-millis, time-micros, and Avro duration all at depth.
+	schema := `{
+		"type": "record", "name": "Outer", "fields": [{
+			"name": "inner", "type": {
+				"type": "record", "name": "Inner", "fields": [
+					{"name": "t_ms", "type": {"type": "int", "logicalType": "time-millis"}},
+					{"name": "t_us", "type": {"type": "long", "logicalType": "time-micros"}},
+					{"name": "span", "type": {"type": "fixed", "name": "dur", "size": 12, "logicalType": "duration"}}
+				]
+			}
+		}]
+	}`
+	type Inner struct {
+		TMs  time.Duration `avro:"t_ms"`
+		TUs  time.Duration `avro:"t_us"`
+		Span avro.Duration `avro:"span"`
+	}
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
+	input := Outer{Inner: Inner{
+		TMs:  8 * time.Hour,
+		TUs:  12*time.Hour + 30*time.Minute,
+		Span: avro.Duration{Months: 3, Days: 15, Milliseconds: 43200000},
+	}}
+	got := roundTrip(t, schema, input)
+	if got.Inner != input.Inner {
+		t.Fatalf("got %+v, want %+v", got.Inner, input.Inner)
+	}
+}
+
+func TestDeepNestingDecimalAtDepth(t *testing.T) {
+	// Bytes-backed and fixed-backed decimals in one nested schema.
+	schema := `{
+		"type": "record", "name": "Ledger", "fields": [{
+			"name": "entries", "type": {"type": "array", "items": {
+				"type": "record", "name": "Entry", "fields": [
+					{"name": "desc", "type": "string"},
+					{"name": "amount_b", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}},
+					{"name": "amount_f", "type": {"type": "fixed", "name": "Amt", "size": 8, "logicalType": "decimal", "precision": 12, "scale": 4}}
+				]
+			}}
+		}]
+	}`
+	type Entry struct {
+		Desc    string   `avro:"desc"`
+		AmountB *big.Rat `avro:"amount_b"`
+		AmountF *big.Rat `avro:"amount_f"`
+	}
+	type Ledger struct {
+		Entries []Entry `avro:"entries"`
+	}
+	input := Ledger{Entries: []Entry{
+		{Desc: "Credit", AmountB: new(big.Rat).SetFrac64(1999, 100), AmountF: new(big.Rat).SetFrac64(1745000, 10000)},
+		{Desc: "Debit", AmountB: new(big.Rat).SetFrac64(-150, 100), AmountF: new(big.Rat).SetFrac64(0, 1)},
+	}}
+	s := mustParse(t, schema)
+	encoded, err := s.AppendEncode(nil, &input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Ledger
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	for i, e := range got.Entries {
+		if e.AmountB.Cmp(input.Entries[i].AmountB) != 0 || e.AmountF.Cmp(input.Entries[i].AmountF) != 0 {
+			t.Fatalf("entries[%d]: got b=%s f=%s", i, e.AmountB.FloatString(2), e.AmountF.FloatString(4))
+		}
+	}
+}
+
+func TestDeepNestingUUIDAtDepth(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Cluster", "fields": [
+			{"name": "nodes", "type": {"type": "array", "items": {
+				"type": "record", "name": "Node", "fields": [
+					{"name": "id", "type": {"type": "fixed", "name": "uuid", "size": 16, "logicalType": "uuid"}},
+					{"name": "host", "type": "string"}
+				]
+			}}}
+		]
+	}`
+	type Node struct {
+		ID   [16]byte `avro:"id"`
+		Host string   `avro:"host"`
+	}
+	type Cluster struct {
+		Nodes []Node `avro:"nodes"`
+	}
+	id1 := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	input := Cluster{Nodes: []Node{{ID: id1, Host: "node-1.local"}}}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+// ---------- enums and fixed at depth ----------
+
+func TestDeepNestingEnumInRecordInArrayInMapInRecord(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Dashboard", "fields": [
+			{"name": "panels", "type": {"type": "map", "values": {
+				"type": "array", "items": {
+					"type": "record", "name": "Widget", "fields": [
+						{"name": "title", "type": "string"},
+						{"name": "severity", "type": {
+							"type": "enum", "name": "Severity",
+							"symbols": ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
+						}}
+					]
+				}
+			}}}
+		]
+	}`
+	type Widget struct {
+		Title    string `avro:"title"`
+		Severity string `avro:"severity"`
+	}
+	type Dashboard struct {
+		Panels map[string][]Widget `avro:"panels"`
+	}
+	input := Dashboard{Panels: map[string][]Widget{
+		"alerts": {{Title: "CPU", Severity: "WARN"}, {Title: "Disk", Severity: "FATAL"}},
+		"info":   {{Title: "Uptime", Severity: "INFO"}},
+	}}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+func TestDeepNestingEnumAsOrdinalAtDepth(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Outer", "fields": [{
+			"name": "inner", "type": {
+				"type": "record", "name": "Inner", "fields": [{
+					"name": "status", "type": {
+						"type": "enum", "name": "Status", "symbols": ["OFF", "ON", "STANDBY"]
+					}
+				}]
+			}
+		}]
+	}`
+	s := mustParse(t, schema)
+	type SI struct {
+		Status string `avro:"status"`
+	}
+	type OI struct {
+		Inner SI `avro:"inner"`
+	}
+	encoded, err := s.AppendEncode(nil, &OI{Inner: SI{Status: "STANDBY"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type II struct {
+		Status int `avro:"status"`
+	}
+	type OO struct {
+		Inner II `avro:"inner"`
+	}
+	var got OO
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Inner.Status != 2 {
+		t.Fatalf("ordinal: got %d, want 2", got.Inner.Status)
+	}
+}
+
+func TestDeepNestingFixedVariousSizesAtDepth(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Outer", "fields": [{
+			"name": "inner", "type": {
+				"type": "record", "name": "Inner", "fields": [
+					{"name": "flag", "type": {"type": "fixed", "name": "F1", "size": 1}},
+					{"name": "tag", "type": {"type": "fixed", "name": "F4", "size": 4}},
+					{"name": "hash", "type": {"type": "fixed", "name": "F32", "size": 32}}
+				]
+			}
+		}]
+	}`
+	type Inner struct {
+		Flag [1]byte  `avro:"flag"`
+		Tag  [4]byte  `avro:"tag"`
+		Hash [32]byte `avro:"hash"`
+	}
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
+	var hash [32]byte
+	for i := range hash {
+		hash[i] = byte(i)
+	}
+	input := Outer{Inner: Inner{Flag: [1]byte{0xFF}, Tag: [4]byte{0xDE, 0xAD, 0xBE, 0xEF}, Hash: hash}}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+func TestDeepNestingArrayOfMapsOfFixed(t *testing.T) {
+	schema := `{"type":"array","items":{"type":"map","values":{"type":"fixed","name":"Tag","size":4}}}`
+	input := []map[string][4]byte{{"x": {1, 2, 3, 4}, "y": {5, 6, 7, 8}}, {"z": {9, 10, 11, 12}}}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+func TestDeepNestingMapOfArrayOfEnums(t *testing.T) {
+	schema := `{"type":"map","values":{"type":"array","items":{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]}}}`
+	input := map[string][]string{"warm": {"RED"}, "cool": {"GREEN", "BLUE"}, "all": {"RED", "GREEN", "BLUE"}}
+	got := roundTrip(t, schema, input)
+	if !reflect.DeepEqual(got, input) {
+		t.Fatalf("got %+v, want %+v", got, input)
+	}
+}
+
+// ---------- odd Go types at depth ----------
+
+func TestDeepNestingTextMarshalerAtDepth(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Network", "fields": [
+			{"name": "hosts", "type": {"type": "array", "items": {
+				"type": "record", "name": "Host", "fields": [
+					{"name": "name", "type": "string"},
+					{"name": "addr", "type": "string"}
+				]
+			}}}
+		]
+	}`
+	type Host struct {
+		Name string `avro:"name"`
+		Addr testIP `avro:"addr"`
+	}
+	type Network struct {
+		Hosts []Host `avro:"hosts"`
+	}
+	input := Network{Hosts: []Host{
+		{Name: "gw", Addr: testIP{192, 168, 1, 1}},
+		{Name: "dns", Addr: testIP{8, 8, 8, 8}},
+	}}
+	got := roundTrip(t, schema, input)
+	if got.Hosts[0].Addr != input.Hosts[0].Addr || got.Hosts[1].Addr != input.Hosts[1].Addr {
+		t.Fatalf("got %+v", got.Hosts)
+	}
+}
+
+func TestDeepNestingStructCompositionAtDepth(t *testing.T) {
+	// Embedded struct + inline tag in nested records.
+	schema := `{
+		"type": "record", "name": "Wrapper", "fields": [
+			{"name": "items", "type": {"type": "array", "items": {
+				"type": "record", "name": "Item", "fields": [
+					{"name": "id", "type": "int"},
+					{"name": "name", "type": "string"},
+					{"name": "x", "type": "int"},
+					{"name": "y", "type": "int"},
+					{"name": "created", "type": {"type": "long", "logicalType": "timestamp-millis"}}
+				]
+			}}}
+		]
+	}`
+	type Base struct {
+		ID      int32     `avro:"id"`
+		Created time.Time `avro:"created"`
+	}
+	type Coords struct {
+		X int32 `avro:"x"`
+		Y int32 `avro:"y"`
+	}
+	type Item struct {
+		Base
+		Name   string `avro:"name"`
+		Coords `avro:",inline"`
+	}
+	type Wrapper struct {
+		Items []Item `avro:"items"`
+	}
+	ts := time.Date(2025, 3, 19, 10, 0, 0, 0, time.UTC)
+	input := Wrapper{Items: []Item{
+		{Base: Base{ID: 1, Created: ts}, Name: "first", Coords: Coords{X: 10, Y: 20}},
+	}}
+	got := roundTrip(t, schema, input)
+	if got.Items[0].ID != 1 || got.Items[0].X != 10 || got.Items[0].Y != 20 || !got.Items[0].Created.Equal(ts) {
+		t.Fatalf("got %+v", got.Items[0])
+	}
+}
+
+func TestDeepNestingUintTypesAtDepth(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Outer", "fields": [{
+			"name": "inner", "type": {
+				"type": "record", "name": "Inner", "fields": [
+					{"name": "a", "type": "int"},
+					{"name": "b", "type": "int"},
+					{"name": "c", "type": "long"},
+					{"name": "d", "type": "long"}
+				]
+			}
+		}]
+	}`
+	type Inner struct {
+		A uint8  `avro:"a"`
+		B uint16 `avro:"b"`
+		C uint32 `avro:"c"`
+		D uint   `avro:"d"`
+	}
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
+	input := Outer{Inner: Inner{A: 255, B: 65535, C: 4294967295, D: 123456789}}
+	got := roundTrip(t, schema, input)
+	if got.Inner != input.Inner {
+		t.Fatalf("got %+v", got.Inner)
+	}
+}
+
+func TestDeepNestingBytesStringCoercionAtDepth(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Outer", "fields": [{
+			"name": "inner", "type": {
+				"type": "record", "name": "Inner", "fields": [
+					{"name": "data", "type": "bytes"}
+				]
+			}
+		}]
+	}`
+	s := mustParse(t, schema)
+	type IB struct {
+		Data []byte `avro:"data"`
+	}
+	type OB struct {
+		Inner IB `avro:"inner"`
+	}
+	encoded, err := s.AppendEncode(nil, &OB{Inner: IB{Data: []byte("hello bytes")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type IS struct {
+		Data string `avro:"data"`
+	}
+	type OS struct {
+		Inner IS `avro:"inner"`
+	}
+	var got OS
+	if _, err := s.Decode(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Inner.Data != "hello bytes" {
+		t.Fatalf("got %q", got.Inner.Data)
+	}
+}
+
+func TestDeepNestingOmitzeroAtDepth(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Outer", "fields": [{
+			"name": "inner", "type": {
+				"type": "record", "name": "Inner", "fields": [
+					{"name": "required", "type": "string"},
+					{"name": "optional", "type": ["null", "int"]}
+				]
+			}
+		}]
+	}`
+	type Inner struct {
+		Required string `avro:"required"`
+		Optional *int32 `avro:"optional,omitzero"`
+	}
+	type Outer struct {
+		Inner Inner `avro:"inner"`
+	}
+
+	v := int32(42)
+	got := roundTrip(t, schema, Outer{Inner: Inner{Required: "yes", Optional: &v}})
+	if *got.Inner.Optional != 42 {
+		t.Fatalf("with value: %+v", got)
+	}
+
+	gotZero := roundTrip(t, schema, Outer{Inner: Inner{Required: "bare", Optional: nil}})
+	if gotZero.Inner.Optional != nil {
+		t.Fatalf("omitzero: %+v", gotZero)
+	}
+}
+
+// ---------- 10-level record chain with mixed odd types ----------
+
+func TestDeepNesting10LevelMixedTypes(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "L1", "fields": [
+			{"name": "ts", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+			{"name": "l2", "type": {
+				"type": "record", "name": "L2", "fields": [
+					{"name": "day", "type": {"type": "int", "logicalType": "date"}},
+					{"name": "l3", "type": {
+						"type": "record", "name": "L3", "fields": [
+							{"name": "status", "type": {"type": "enum", "name": "S", "symbols": ["A", "B", "C"]}},
+							{"name": "l4", "type": {
+								"type": "record", "name": "L4", "fields": [
+									{"name": "hash", "type": {"type": "fixed", "name": "H8", "size": 8}},
+									{"name": "l5", "type": {
+										"type": "record", "name": "L5", "fields": [
+											{"name": "dur", "type": {"type": "int", "logicalType": "time-millis"}},
+											{"name": "l6", "type": {
+												"type": "record", "name": "L6", "fields": [
+													{"name": "data", "type": "bytes"},
+													{"name": "l7", "type": {
+														"type": "record", "name": "L7", "fields": [
+															{"name": "tags", "type": {"type": "array", "items": "string"}},
+															{"name": "l8", "type": {
+																"type": "record", "name": "L8", "fields": [
+																	{"name": "meta", "type": {"type": "map", "values": "int"}},
+																	{"name": "l9", "type": {
+																		"type": "record", "name": "L9", "fields": [
+																			{"name": "flag", "type": "boolean"},
+																			{"name": "l10", "type": {
+																				"type": "record", "name": "L10", "fields": [
+																					{"name": "value", "type": "double"},
+																					{"name": "label", "type": "string"}
+																				]
+																			}}
+																		]
+																	}}
+																]
+															}}
+														]
+													}}
+												]
+											}}
+										]
+									}}
+								]
+							}}
+						]
+					}}
+				]
+			}}
+		]
+	}`
+	type L10 struct {
+		Value float64 `avro:"value"`
+		Label string  `avro:"label"`
+	}
+	type L9 struct {
+		Flag bool `avro:"flag"`
+		L10  L10  `avro:"l10"`
+	}
+	type L8 struct {
+		Meta map[string]int32 `avro:"meta"`
+		L9   L9               `avro:"l9"`
+	}
+	type L7 struct {
+		Tags []string `avro:"tags"`
+		L8   L8       `avro:"l8"`
+	}
+	type L6 struct {
+		Data []byte `avro:"data"`
+		L7   L7     `avro:"l7"`
+	}
+	type L5 struct {
+		Dur time.Duration `avro:"dur"`
+		L6  L6            `avro:"l6"`
+	}
+	type L4 struct {
+		Hash [8]byte `avro:"hash"`
+		L5   L5      `avro:"l5"`
+	}
+	type L3 struct {
+		Status string `avro:"status"`
+		L4     L4     `avro:"l4"`
+	}
+	type L2 struct {
+		Day time.Time `avro:"day"`
+		L3  L3        `avro:"l3"`
+	}
+	type L1 struct {
+		Ts time.Time `avro:"ts"`
+		L2 L2        `avro:"l2"`
+	}
+
+	ts := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
+	day := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
+	input := L1{Ts: ts, L2: L2{Day: day, L3: L3{Status: "B", L4: L4{
+		Hash: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
+		L5: L5{Dur: 5*time.Hour + 30*time.Minute, L6: L6{
+			Data: []byte{0xFF, 0x00, 0xAB},
+			L7: L7{Tags: []string{"deep", "test"}, L8: L8{
+				Meta: map[string]int32{"depth": 10},
+				L9:   L9{Flag: true, L10: L10{Value: 3.14159, Label: "bottom"}},
+			}},
+		}},
+	}}}}
+	got := roundTrip(t, schema, input)
+	if !got.Ts.Equal(ts) || !got.L2.Day.Equal(day) || got.L2.L3.Status != "B" {
+		t.Fatalf("top levels: %+v", got)
+	}
+	if got.L2.L3.L4.L5.Dur != input.L2.L3.L4.L5.Dur {
+		t.Fatalf("L5.dur: got %v", got.L2.L3.L4.L5.Dur)
+	}
+	if !got.L2.L3.L4.L5.L6.L7.L8.L9.Flag || got.L2.L3.L4.L5.L6.L7.L8.L9.L10.Label != "bottom" {
+		t.Fatalf("bottom: %+v", got.L2.L3.L4.L5.L6.L7.L8.L9)
+	}
+}
+
+// ---------- large collection within deep nesting ----------
+
+func TestDeepNestingLargeNestedCollections(t *testing.T) {
+	schema := `{
+		"type": "record", "name": "Batch", "fields": [
+			{"name": "items", "type": {"type": "array", "items": {
+				"type": "record", "name": "Row", "fields": [
+					{"name": "id", "type": "int"},
+					{"name": "attrs", "type": {"type": "map", "values": "string"}}
+				]
+			}}}
+		]
+	}`
+	type Row struct {
+		ID    int32             `avro:"id"`
+		Attrs map[string]string `avro:"attrs"`
+	}
+	type Batch struct {
+		Items []Row `avro:"items"`
+	}
+	items := make([]Row, 100)
+	for i := range items {
+		attrs := make(map[string]string, 10)
+		for j := range 10 {
+			attrs["key"+string(rune('0'+j))] = "val"
+		}
+		items[i] = Row{ID: int32(i), Attrs: attrs}
+	}
+	got := roundTrip(t, schema, Batch{Items: items})
+	if len(got.Items) != 100 || got.Items[99].ID != 99 || len(got.Items[50].Attrs) != 10 {
+		t.Fatalf("got %d items, last=%d, attrs=%d", len(got.Items), got.Items[99].ID, len(got.Items[50].Attrs))
 	}
 }
