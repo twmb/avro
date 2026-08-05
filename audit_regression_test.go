@@ -3,17 +3,22 @@ package avro_test
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"reflect"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/twmb/avro"
 )
+
+// ---------- audit_regression_test.go ----------
 
 // A decimal logical type on a non-bytes/fixed primitive is malformed; the
 // parser soft-drops the logical (matching Java's lenient parser). When a
@@ -3492,5 +3497,5822 @@ func TestRegression_FlatFixedNameRefDefaultCoerced(t *testing.T) {
 	}
 	if string(b) != "abcd" {
 		t.Fatalf("F2 default bytes: %q, want %q", b, "abcd")
+	}
+}
+
+// ---------- custom_named_avro_type_test.go ----------
+
+// A CustomType's Avro-native type A (the second NewCustomType parameter) may be
+// a NAMED Go type over a canonical kind — e.g. type UnixMillis int64 as the
+// long representation. inferAvroType classifies A by reflect.Kind, so such an A
+// registers as an ordinary primitive custom. On decode, the base deserializer
+// produces the CANONICAL Go value for that kind (int64, []byte, ...); the
+// generated decode wrapper must CONVERT that value to A before invoking the
+// user's decode, because the canonical value's dynamic type is the base kind,
+// not the named type, so a bare type assertion panics. The encode side already
+// type-guards (it fires only for an exact-A value), so only decode is exposed.
+// This pins every canonical kind on both wire formats.
+
+type namedBool bool
+type namedInt32 int32
+type namedInt64 int64
+type namedFloat32 float32
+type namedFloat64 float64
+type namedString string
+type namedBytes []byte
+
+func TestRegression_CustomNamedAvroNativeTypeDecodes(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		ct     avro.CustomType
+		in     any // a G value to encode
+		want   any // the expected decoded G value
+	}{
+		{"boolean", `{"type":"boolean"}`,
+			avro.NewCustomType[bool, namedBool]("",
+				func(g bool, _ *avro.SchemaNode) (namedBool, error) { return namedBool(g), nil },
+				func(a namedBool, _ *avro.SchemaNode) (bool, error) { return bool(a), nil }),
+			true, true},
+		{"int", `{"type":"int"}`,
+			avro.NewCustomType[int32, namedInt32]("",
+				func(g int32, _ *avro.SchemaNode) (namedInt32, error) { return namedInt32(g), nil },
+				func(a namedInt32, _ *avro.SchemaNode) (int32, error) { return int32(a), nil }),
+			int32(5), int32(5)},
+		{"long", `{"type":"long"}`,
+			avro.NewCustomType[int64, namedInt64]("",
+				func(g int64, _ *avro.SchemaNode) (namedInt64, error) { return namedInt64(g), nil },
+				func(a namedInt64, _ *avro.SchemaNode) (int64, error) { return int64(a), nil }),
+			int64(1700000000000), int64(1700000000000)},
+		{"float", `{"type":"float"}`,
+			avro.NewCustomType[float32, namedFloat32]("",
+				func(g float32, _ *avro.SchemaNode) (namedFloat32, error) { return namedFloat32(g), nil },
+				func(a namedFloat32, _ *avro.SchemaNode) (float32, error) { return float32(a), nil }),
+			float32(2.5), float32(2.5)},
+		{"double", `{"type":"double"}`,
+			avro.NewCustomType[float64, namedFloat64]("",
+				func(g float64, _ *avro.SchemaNode) (namedFloat64, error) { return namedFloat64(g), nil },
+				func(a namedFloat64, _ *avro.SchemaNode) (float64, error) { return float64(a), nil }),
+			float64(2.5), float64(2.5)},
+		{"string", `{"type":"string"}`,
+			avro.NewCustomType[string, namedString]("",
+				func(g string, _ *avro.SchemaNode) (namedString, error) { return namedString(g), nil },
+				func(a namedString, _ *avro.SchemaNode) (string, error) { return string(a), nil }),
+			"hello", "hello"},
+		{"bytes", `{"type":"bytes"}`,
+			avro.NewCustomType[[]byte, namedBytes]("",
+				func(g []byte, _ *avro.SchemaNode) (namedBytes, error) { return namedBytes(g), nil },
+				func(a namedBytes, _ *avro.SchemaNode) ([]byte, error) { return []byte(a), nil }),
+			[]byte("hi"), []byte("hi")},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := avro.Parse(c.schema, avro.WithCustomType(c.ct))
+			if err != nil {
+				t.Fatalf("registration/parse: %v", err)
+			}
+			// binary
+			decodeNoPanic(t, "binary", c.want, func() (any, error) {
+				wire, err := s.Encode(c.in)
+				if err != nil {
+					return nil, err
+				}
+				var got any
+				_, err = s.Decode(wire, &got)
+				return got, err
+			})
+			// JSON
+			decodeNoPanic(t, "json", c.want, func() (any, error) {
+				js, err := s.AppendEncodeJSON(nil, c.in)
+				if err != nil {
+					return nil, err
+				}
+				var got any
+				err = s.DecodeJSON(js, &got)
+				return got, err
+			})
+		})
+	}
+}
+
+func decodeNoPanic(t *testing.T, label string, want any, run func() (any, error)) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("%s: decode PANIC on a registration-accepted custom: %v", label, r)
+		}
+	}()
+	got, err := run()
+	if err != nil {
+		t.Fatalf("%s: %v", label, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("%s: round-trip = %#v, want %#v", label, got, want)
+	}
+}
+
+// ---------- custom_skip_decode_test.go ----------
+
+// Test types for the skip-custom parity matrix. Package-level so reflect.New
+// sees named (not anonymous) types, matching real caller targets.
+type csInner struct {
+	X int32 `avro:"x"`
+}
+type csStruct struct {
+	A int64  `avro:"a"`
+	B string `avro:"b"`
+}
+type csNest struct {
+	In csInner `avro:"in"`
+	N  int64   `avro:"n"`
+}
+type csMoney int64
+type csPtr struct {
+	P *int32 `avro:"p"`
+}
+type csDec struct {
+	D *big.Rat `avro:"d"`
+}
+
+// Named scalar types: the canonical Avro value (int32/string/bool/float32/
+// float64/[]byte) is NOT assignable to a named type, so a bare value placement
+// cannot satisfy these targets — the all-skip fall-through must re-decode the wire
+// into them through the base deserializer, exactly as a no-custom decode does. A
+// regression mishandling a named target reds the matching row.
+type (
+	csI32   int32
+	csStr   string
+	csBool  bool
+	csF32   float32
+	csF64   float64
+	csBytes []byte
+)
+
+// namedI32 is a NAMED int32 so that a *namedI32 union target is NOT trivially
+// assignable from the canonical int32 — the all-skip fall-through must re-decode
+// the union through the base deserializer, which reads the exact wire branch (a
+// plain *int32 is the easy case; the named type forces the full per-branch
+// decode).
+type namedI32 int32
+type csUPtr struct {
+	P *namedI32 `avro:"p"`
+}
+
+// TestRegression_CustomSkipDecodeMatchesNoCustom pins the contract that a custom
+// decoder returning ErrSkipCustomType (no decoder matched) falls through to
+// built-in decode: the value lands in the typed target EXACTLY as a no-custom
+// decode would, on binary, JSON, and resolved paths. A wildcard custom (empty
+// criteria) wraps every node and skips, so the all-skip fall-through re-decodes
+// every kind through the base deserializer; a wildcard does not suppress logicals
+// (suppressLogical=false), so its decode must equal the plain no-custom decode
+// value-for-value. Each row decodes the SAME wire with the plain schema and the
+// skip-custom schema into the SAME typed target and asserts equality.
+//
+// This is the net for the fall-through: a faithfulness regression (a zeroed
+// record/array/map, a dropped enum-ordinal, a mis-sized fixed) reds a row here.
+// Non-vacuity is proven by neutering the re-decode (placing a probe value instead)
+// and confirming rows go red.
+func TestRegression_CustomSkipDecodeMatchesNoCustom(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+	ptr := func(x int32) *int32 { return &x }
+	pn := func(x namedI32) *namedI32 { return &x }
+
+	rows := []struct {
+		name   string
+		schema string
+		value  any // typed value; its type is also the decode target
+	}{
+		{"record-struct", `{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}]}`, csStruct{A: 1, B: "x"}},
+		{"nested-struct", `{"type":"record","name":"R","fields":[{"name":"in","type":{"type":"record","name":"In","fields":[{"name":"x","type":"int"}]}},{"name":"n","type":"long"}]}`, csNest{In: csInner{X: 7}, N: 9}},
+		{"record-map", `{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"long"}]}`, map[string]int64{"a": 1, "b": 2}},
+		{"array-int", `{"type":"array","items":"long"}`, []int64{1, 2, 3}},
+		{"array-struct", `{"type":"array","items":{"type":"record","name":"In","fields":[{"name":"x","type":"int"}]}}`, []csInner{{X: 1}, {X: 2}}},
+		{"array-fixedlen", `{"type":"array","items":"int"}`, [3]int32{4, 5, 6}},
+		{"map-int", `{"type":"map","values":"long"}`, map[string]int64{"k": 5}},
+		{"map-struct", `{"type":"map","values":{"type":"record","name":"In","fields":[{"name":"x","type":"int"}]}}`, map[string]csInner{"k": {X: 3}}},
+		{"named-long", `"long"`, csMoney(42)},
+		{"named-int", `"int"`, csI32(7)},
+		{"named-string", `"string"`, csStr("hi")},
+		{"named-bool", `"boolean"`, csBool(true)},
+		{"named-float", `"float"`, csF32(1.5)},
+		{"named-double", `"double"`, csF64(2.5)},
+		{"named-bytes", `"bytes"`, csBytes{1, 2, 3}},
+		{"ptr-field-set", `{"type":"record","name":"R","fields":[{"name":"p","type":["null","int"]}]}`, csPtr{P: ptr(8)}},
+		{"ptr-field-nil", `{"type":"record","name":"R","fields":[{"name":"p","type":["null","int"]}]}`, csPtr{P: nil}},
+		// Union into a NAMED-pointer target: int32 is not assignable to namedI32,
+		// so setCustomResult's pointer-walk cannot resolve it and the union
+		// branches arm runs (recovers the lost branch index). A plain *int32
+		// (ptr-field-set above) is resolved before the loop, leaving it un-netted.
+		{"union-named-ptr-set", `{"type":"record","name":"R","fields":[{"name":"p","type":["null","int"]}]}`, csUPtr{P: pn(8)}},
+		{"union-named-ptr-nil", `{"type":"record","name":"R","fields":[{"name":"p","type":["null","int"]}]}`, csUPtr{P: nil}},
+		{"union-named-slice", `{"type":"array","items":["null","int"]}`, []*namedI32{pn(5), nil}},
+		{"enum-string", `{"type":"enum","name":"E","symbols":["A","B","C"]}`, "B"},
+		{"enum-named-int", `{"type":"enum","name":"E","symbols":["A","B","C"]}`, csMoney(2)},
+		{"fixed-array", `{"type":"fixed","name":"F","size":4}`, [4]byte{1, 2, 3, 4}},
+		{"bytes", `"bytes"`, []byte{9, 8, 7}},
+		{"bool", `"boolean"`, true},
+		{"float", `"float"`, float32(1.5)},
+		{"double", `"double"`, float64(2.5)},
+		{"string", `"string"`, "hi"},
+		{"timestamp", `{"type":"long","logicalType":"timestamp-millis"}`, time.UnixMilli(1600000000000).UTC()},
+		{"decimal-in-record", `{"type":"record","name":"R","fields":[{"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}}]}`, csDec{D: big.NewRat(33, 100)}},
+		{"uuid-string", `{"type":"string","logicalType":"uuid"}`, "12345678-1234-1234-1234-123456789abc"},
+	}
+
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			plain := avro.MustParse(r.schema)
+			sskip := avro.MustParse(r.schema, skip)
+			tt := reflect.TypeOf(r.value)
+
+			wireBin, err := plain.Encode(r.value)
+			if err != nil {
+				t.Fatalf("encode binary: %v", err)
+			}
+			wireJSON, err := plain.EncodeJSON(r.value)
+			if err != nil {
+				t.Fatalf("encode json: %v", err)
+			}
+
+			dec := func(s *avro.Schema, wire []byte, jsonForm bool, opts ...avro.Opt) (any, error) {
+				p := reflect.New(tt)
+				if jsonForm {
+					return p.Elem().Interface(), s.DecodeJSON(wire, p.Interface(), opts...)
+				}
+				_, err := s.Decode(wire, p.Interface(), opts...)
+				return p.Elem().Interface(), err
+			}
+
+			resolved, rerr := avro.Resolve(plain, sskip)
+			if rerr != nil {
+				t.Fatalf("resolve: %v", rerr)
+			}
+
+			// Run the matrix untagged AND with TaggedUnions. The all-skip
+			// fall-through re-decodes the wire into the target, so a union field
+			// lands identically to a no-custom decode under either option — the
+			// re-decode reads the exact wire branch, so neither a typed target nor
+			// a tagged envelope can be misplaced.
+			check := func(opt string, opts ...avro.Opt) {
+				// Oracle: plain no-custom decode (binary + JSON).
+				binPlain, e := dec(plain, wireBin, false, opts...)
+				if e != nil {
+					t.Fatalf("[%s] plain binary decode: %v", opt, e)
+				}
+				jsonPlain, e := dec(plain, wireJSON, true, opts...)
+				if e != nil {
+					t.Fatalf("[%s] plain json decode: %v", opt, e)
+				}
+				// Skip-custom and resolved (skip-custom reader) must equal it.
+				binSkip, e := dec(sskip, wireBin, false, opts...)
+				if e != nil {
+					t.Fatalf("[%s] skip-custom binary decode errored where no-custom succeeded: %v", opt, e)
+				}
+				if !matEqual(binPlain, binSkip) {
+					t.Errorf("[%s] binary skip-custom != no-custom:\n no-custom=%#v\n skip     =%#v", opt, binPlain, binSkip)
+				}
+				jsonSkip, e := dec(sskip, wireJSON, true, opts...)
+				if e != nil {
+					t.Fatalf("[%s] skip-custom json decode errored where no-custom succeeded: %v", opt, e)
+				}
+				if !matEqual(jsonPlain, jsonSkip) {
+					t.Errorf("[%s] json skip-custom != no-custom:\n no-custom=%#v\n skip     =%#v", opt, jsonPlain, jsonSkip)
+				}
+				binRes, e := dec(resolved, wireBin, false, opts...)
+				if e != nil {
+					t.Fatalf("[%s] resolved binary decode errored: %v", opt, e)
+				}
+				if !matEqual(binPlain, binRes) {
+					t.Errorf("[%s] resolved binary skip-custom != no-custom:\n no-custom=%#v\n resolved =%#v", opt, binPlain, binRes)
+				}
+				jsonRes, e := dec(resolved, wireJSON, true, opts...)
+				if e != nil {
+					t.Fatalf("[%s] resolved json decode errored: %v", opt, e)
+				}
+				if !matEqual(jsonPlain, jsonRes) {
+					t.Errorf("[%s] resolved json skip-custom != no-custom:\n no-custom=%#v\n resolved =%#v", opt, jsonPlain, jsonRes)
+				}
+			}
+			check("untagged")
+			check("tagged", avro.TaggedUnions())
+		})
+	}
+}
+
+type csTransformed struct{ Cents int64 }
+
+// TestRegression_CustomSkipDecodeMatchedTransformSurvives nets the deep-match
+// re-decode path — the main net's wildcard custom purely skips, so a
+// deeper-matched custom's transform is never carried through. A wildcard custom
+// TRANSFORMS one node (a long tagged "domain":"money" -> a domain Go type) and
+// SKIPS the rest. The record itself is skipped, but a nested custom matched in its
+// subtree, so the all-skip fall-through re-decodes the record with customs ACTIVE
+// (not bypassed) — reproducing the money field's transform in the typed field
+// while the skipped sibling decodes normally (== no-custom). A bypass here, or a
+// placement that dropped the match, would land int64 where csTransformed is
+// expected and fail.
+func TestRegression_CustomSkipDecodeMatchedTransformSurvives(t *testing.T) {
+	ct := avro.CustomType{
+		Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+			if sn.Props["domain"] == "money" {
+				return csTransformed{Cents: v.(int64)}, nil
+			}
+			return nil, avro.ErrSkipCustomType
+		},
+	}
+	schema := `{"type":"record","name":"R","fields":[{"name":"amt","type":{"type":"long","domain":"money"}},{"name":"name","type":"string"}]}`
+	plain := avro.MustParse(schema)
+	s := avro.MustParse(schema, ct)
+
+	// Encode the raw wire via a plain (int64) shape.
+	type Rw struct {
+		Amt  int64  `avro:"amt"`
+		Name string `avro:"name"`
+	}
+	wireBin, err := plain.Encode(Rw{Amt: 500, Name: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireJSON, err := plain.EncodeJSON(Rw{Amt: 500, Name: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type R struct {
+		Amt  csTransformed `avro:"amt"`
+		Name string        `avro:"name"`
+	}
+	want := R{Amt: csTransformed{Cents: 500}, Name: "alice"}
+
+	var gb R
+	if _, err := s.Decode(wireBin, &gb); err != nil {
+		t.Fatalf("binary decode: %v", err)
+	}
+	if gb != want {
+		t.Errorf("binary: matched transform did not survive (or skipped sibling wrong):\n got=%+v\n want=%+v", gb, want)
+	}
+	var gj R
+	if err := s.DecodeJSON(wireJSON, &gj); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if gj != want {
+		t.Errorf("json: matched transform did not survive (or skipped sibling wrong):\n got=%+v\n want=%+v", gj, want)
+	}
+}
+
+// TestRegression_CustomSkipDecodeReusesTarget pins that a wildcard all-skip custom
+// decode REUSES a pre-populated decode target identically to a no-custom decode.
+// A non-nil typed map and an interface already wrapping a map[string]any retain
+// keys absent from the wire — deserMap's `mapVal = v` reuse and deserRecord's
+// reuseOrMakeStringAnyMap stale-key contract. The all-skip fall-through RE-DECODES
+// the wire into the same target through the base deserializer, so reuse is
+// inherited for free rather than re-implemented.
+//
+// This axis is invisible to TestRegression_CustomSkipDecodeMatchesNoCustom, which
+// decodes only into fresh reflect.New targets. The oracle is a no-custom decode
+// into the SAME pre-populated target. The map[string]any subtest is the cell an
+// earlier assignable-fast-path placement swallowed (it replaced the whole map,
+// dropping stale keys); an Avro map decoded into `any` is the control: it does NOT
+// reuse (deserMap's iface arm allocates fresh), so the all-skip path matches that
+// too. Non-vacuity is verified by neutering the typed-target re-decode (placing the
+// probe value instead), which reds the map[string]any and record-into-any cells.
+func TestRegression_CustomSkipDecodeReusesTarget(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+
+	t.Run("typed-map", func(t *testing.T) {
+		schema := `{"type":"map","values":"long"}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+		bin, err := plain.Encode(map[string]int64{"k": 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jsonw, err := plain.EncodeJSON(map[string]int64{"k": 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		nb := map[string]int64{"stale": 99}
+		if _, err := plain.Decode(bin, &nb); err != nil {
+			t.Fatal(err)
+		}
+		sb := map[string]int64{"stale": 99}
+		if _, err := sskip.Decode(bin, &sb); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary typed-map: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
+		}
+		nj := map[string]int64{"stale": 99}
+		if err := plain.DecodeJSON(jsonw, &nj); err != nil {
+			t.Fatal(err)
+		}
+		sj := map[string]int64{"stale": 99}
+		if err := sskip.DecodeJSON(jsonw, &sj); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nj, sj) {
+			t.Errorf("json typed-map: skip-custom=%v != no-custom=%v", sj, nj)
+		}
+	})
+
+	t.Run("typed-map-any", func(t *testing.T) {
+		// map[string]any (Kind Map, any-valued): the value type an assignable
+		// fast-path placement swallowed — it replaced the whole map, dropping
+		// stale keys the base decoder retains. Re-decode reuses it like any other
+		// non-nil typed map, on binary AND JSON.
+		schema := `{"type":"map","values":"long"}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+		bin, err := plain.Encode(map[string]int64{"k": 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jsonw, err := plain.EncodeJSON(map[string]int64{"k": 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		nb := map[string]any{"stale": int64(99)}
+		if _, err := plain.Decode(bin, &nb); err != nil {
+			t.Fatal(err)
+		}
+		sb := map[string]any{"stale": int64(99)}
+		if _, err := sskip.Decode(bin, &sb); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary map[string]any: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
+		}
+		nj := map[string]any{"stale": int64(99)}
+		if err := plain.DecodeJSON(jsonw, &nj); err != nil {
+			t.Fatal(err)
+		}
+		sj := map[string]any{"stale": int64(99)}
+		if err := sskip.DecodeJSON(jsonw, &sj); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nj, sj) {
+			t.Errorf("json map[string]any: skip-custom=%v != no-custom=%v", sj, nj)
+		}
+	})
+
+	t.Run("record-into-any", func(t *testing.T) {
+		schema := `{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+		type Rw struct {
+			A int64 `avro:"a"`
+		}
+		bin, err := plain.Encode(Rw{A: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var nb any = map[string]any{"stale": int64(99)}
+		if _, err := plain.Decode(bin, &nb); err != nil {
+			t.Fatal(err)
+		}
+		var sb any = map[string]any{"stale": int64(99)}
+		if _, err := sskip.Decode(bin, &sb); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary record-into-any: skip-custom=%v != no-custom=%v (stale key must be retained)", sb, nb)
+		}
+	})
+
+	t.Run("map-into-any-control", func(t *testing.T) {
+		// Avro map into `any` must MATCH no-custom — and no-custom does NOT reuse
+		// (deserMap's iface arm allocates fresh), so the stale key is dropped on
+		// both. Guards against an over-eager reuse fix that retains the stale key
+		// where the base decoder would not.
+		schema := `{"type":"map","values":"long"}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+		bin, err := plain.Encode(map[string]int64{"k": 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var nb any = map[string]any{"stale": int64(99)}
+		if _, err := plain.Decode(bin, &nb); err != nil {
+			t.Fatal(err)
+		}
+		var sb any = map[string]any{"stale": int64(99)}
+		if _, err := sskip.Decode(bin, &sb); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary map-into-any: skip-custom=%v != no-custom=%v", sb, nb)
+		}
+	})
+}
+
+// TestRegression_CustomSkipDecodeLogicalIntoBaseTypedTarget pins that a WILDCARD
+// all-skip custom — which does NOT suppress logicals — decoding a logical node
+// into a base TYPED target lands the value identically to a no-custom decode. The
+// base (logical) deserializer fills the typed target natively (deserDate→int32 raw
+// days, deserDuration→[12]byte, decimal→raw []byte); the all-skip fall-through
+// RE-DECODES the wire through it. A box-into-any placement could not: the probe
+// holds the ENRICHED type (time.Time / avro.Duration / *big.Rat), which no
+// base-kind setter accepts, so it ERRORED where no-custom succeeds.
+//
+// Held constant by TestRegression_CustomSkipDecodeMatchesNoCustom (decode target =
+// the encode value's own type, so a timestamp decodes only into time.Time): this
+// crosses logical schema × base typed target, the foreclosed cell, on binary AND
+// JSON. Non-vacuity: neutering the typed re-decode to place the probe value reds
+// every row (the enriched probe value cannot fill the base target).
+func TestRegression_CustomSkipDecodeLogicalIntoBaseTypedTarget(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+	rows := []struct {
+		name   string
+		schema string
+		enc    any
+		mk     func() any
+	}{
+		{"date->int32", `{"type":"int","logicalType":"date"}`, int32(19000), func() any { return new(int32) }},
+		{"timestamp-millis->int64", `{"type":"long","logicalType":"timestamp-millis"}`, int64(1600000000000), func() any { return new(int64) }},
+		{"time-micros->int64", `{"type":"long","logicalType":"time-micros"}`, int64(3600000000), func() any { return new(int64) }},
+		{"duration->array12", `{"type":"fixed","name":"D","size":12,"logicalType":"duration"}`, avro.Duration{Months: 1, Days: 2, Milliseconds: 3}, func() any { return new([12]byte) }},
+		{"decimal->bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, big.NewRat(1234, 100), func() any { return new([]byte) }},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			plain := avro.MustParse(r.schema)
+			sskip := avro.MustParse(r.schema, skip)
+			bin, err := plain.Encode(r.enc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jsonw, err := plain.EncodeJSON(r.enc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			no := r.mk()
+			if _, err := plain.Decode(bin, no); err != nil {
+				t.Fatalf("no-custom binary: %v", err)
+			}
+			sk := r.mk()
+			if _, err := sskip.Decode(bin, sk); err != nil {
+				t.Fatalf("skip-custom binary errored where no-custom succeeded: %v", err)
+			}
+			if !reflect.DeepEqual(no, sk) {
+				t.Errorf("binary: skip-custom=%v != no-custom=%v", sk, no)
+			}
+			noj := r.mk()
+			if err := plain.DecodeJSON(jsonw, noj); err != nil {
+				t.Fatalf("no-custom json: %v", err)
+			}
+			skj := r.mk()
+			if err := sskip.DecodeJSON(jsonw, skj); err != nil {
+				t.Fatalf("skip-custom json errored where no-custom succeeded: %v", err)
+			}
+			if !reflect.DeepEqual(noj, skj) {
+				t.Errorf("json: skip-custom=%v != no-custom=%v", skj, noj)
+			}
+		})
+	}
+}
+
+// TestRegression_CustomSkipDecodeTaggedUnionIntoAny pins that a wildcard all-skip
+// custom decode into an interface target under TaggedUnions reproduces the
+// {branch: value} envelope a no-custom decode emits (deserUnion.maybeWrap /
+// wrapUnion). A fresh interface target is decoded straight through the base
+// deserializer with the caller's TaggedUnions option in force, so the envelope is
+// produced natively — no re-tag step. The main skip matrix decodes only into typed
+// targets, which maybeWrap never tags, so this axis was unnetted.
+//
+// Non-vacuous: the oracle is a no-custom TaggedUnions decode into the same `any`
+// target; a regression that decoded the interface untagged (or boxed an untagged
+// value) reds every cell. The rows are distinct-Go-type / single-non-null unions.
+func TestRegression_CustomSkipDecodeTaggedUnionIntoAny(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+	p := func(x int32) *int32 { return &x }
+
+	rows := []struct {
+		name   string
+		schema string
+		value  any
+	}{
+		{"null-first", `{"type":"record","name":"R","fields":[{"name":"u","type":["null","int"]}]}`, struct {
+			U *int32 `avro:"u"`
+		}{U: p(7)}},
+		{"null-second", `{"type":"record","name":"R","fields":[{"name":"u","type":["int","null"]}]}`, struct {
+			U *int32 `avro:"u"`
+		}{U: p(7)}},
+		{"multibranch-distinct", `{"type":"record","name":"R","fields":[{"name":"u","type":["int","string"]}]}`, struct {
+			U string `avro:"u"`
+		}{U: "hi"}},
+		{"array-of-nullunion", `{"type":"array","items":["null","int"]}`, []*int32{p(7), nil}},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			plain := avro.MustParse(r.schema)
+			sskip := avro.MustParse(r.schema, skip)
+			bin, err := plain.Encode(r.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jsonw, err := plain.EncodeJSON(r.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var nb any
+			if _, err := plain.Decode(bin, &nb, avro.TaggedUnions()); err != nil {
+				t.Fatal(err)
+			}
+			var sb any
+			if _, err := sskip.Decode(bin, &sb, avro.TaggedUnions()); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(nb, sb) {
+				t.Errorf("binary: skip-custom=%#v != no-custom=%#v", sb, nb)
+			}
+			var nj any
+			if err := plain.DecodeJSON(jsonw, &nj, avro.TaggedUnions()); err != nil {
+				t.Fatal(err)
+			}
+			var sj any
+			if err := sskip.DecodeJSON(jsonw, &sj, avro.TaggedUnions()); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(nj, sj) {
+				t.Errorf("json: skip-custom=%#v != no-custom=%#v", sj, nj)
+			}
+		})
+	}
+}
+
+// TestRegression_CustomSkipDecodeChainInputUntagged pins the custom decoder
+// chain's input contract: the chain receives the probe value decoded with the
+// caller's options in force — here, with no TaggedUnions, the RAW untagged value a
+// no-custom decode into `any` produces. The custom records its input and the test
+// compares it to that untagged oracle.
+//
+// Non-vacuous: a regression that fed the chain a tagged {branch: value} envelope
+// (or any transformed shape) reds this — the recorded input would not equal the
+// untagged oracle.
+func TestRegression_CustomSkipDecodeChainInputUntagged(t *testing.T) {
+	var captured any
+	rec := avro.CustomType{
+		AvroType: "record",
+		Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+			captured = v
+			return nil, avro.ErrSkipCustomType
+		},
+	}
+	schema := `{"type":"record","name":"R","fields":[` +
+		`{"name":"u","type":["null","int"]},` +
+		`{"name":"s","type":"string"},` +
+		`{"name":"arr","type":{"type":"array","items":["null","long"]}}]}`
+	plain := avro.MustParse(schema)
+	s := avro.MustParse(schema, rec)
+
+	type Rw struct {
+		U   *int32   `avro:"u"`
+		S   string   `avro:"s"`
+		Arr []*int64 `avro:"arr"`
+	}
+	x32, x64 := int32(7), int64(9)
+	in := Rw{U: &x32, S: "hi", Arr: []*int64{&x64, nil}}
+	bin, err := plain.Encode(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonw, err := plain.EncodeJSON(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Oracle: an UNtagged no-custom decode into any — exactly what the chain sees.
+	var oracle any
+	if _, err := plain.Decode(bin, &oracle); err != nil {
+		t.Fatal(err)
+	}
+
+	captured = nil
+	var sinkB any
+	if _, err := s.Decode(bin, &sinkB); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(captured, oracle) {
+		t.Errorf("binary: custom chain saw\n %#v\n want untagged\n %#v", captured, oracle)
+	}
+
+	captured = nil
+	var sinkJ any
+	if err := s.DecodeJSON(jsonw, &sinkJ); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(captured, oracle) {
+		t.Errorf("json: custom chain saw\n %#v\n want untagged\n %#v", captured, oracle)
+	}
+}
+
+// TestRegression_CustomSkipDecodeOverlappingUnion pins that the all-skip path
+// recovers the EXACT wire branch of an OVERLAPPING same-symbol union by
+// RE-DECODING the wire — the branch index comes from the wire itself, not a guess.
+// An enum-union → int-ordinal target gets the wire branch's ordinal, and an
+// overlapping enum-union → tagged-any gets the wire branch's name.
+//
+// Non-vacuous: a fall-through that placed a probe value instead of re-decoding
+// reds both cells — the ordinal arm cannot derive the right ordinal from an
+// untagged probe (first-match guesses wrong), and the any arm mis-tags.
+func TestRegression_CustomSkipDecodeOverlappingUnion(t *testing.T) {
+	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+
+	t.Run("ordinal-target", func(t *testing.T) {
+		// EnumA "X"@0, EnumB "X"@1; the wire selects EnumB.
+		schema := `{"type":"array","items":[` +
+			`{"type":"enum","name":"EnumA","symbols":["X","Y"]},` +
+			`{"type":"enum","name":"EnumB","symbols":["P","X"]}]}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+
+		// binary: array[1] = union branch 1 (EnumB) + enum idx 1 ("X"), end block.
+		bin := []byte{0x02, 0x02, 0x02, 0x00}
+		var nb, sb []int32
+		if _, err := plain.Decode(bin, &nb); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sskip.Decode(bin, &sb); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nb, sb) || len(nb) != 1 || nb[0] != 1 {
+			t.Errorf("binary ordinal: skip=%v no-custom=%v (want [1] = EnumB ordinal of X)", sb, nb)
+		}
+
+		// json: tagged-union spec form selecting EnumB.
+		jsonw := []byte(`[{"EnumB":"X"}]`)
+		var nj, sj []int32
+		if err := plain.DecodeJSON(jsonw, &nj); err != nil {
+			t.Fatal(err)
+		}
+		if err := sskip.DecodeJSON(jsonw, &sj); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nj, sj) || len(nj) != 1 || nj[0] != 1 {
+			t.Errorf("json ordinal: skip=%v no-custom=%v (want [1])", sj, nj)
+		}
+	})
+
+	t.Run("tagged-any-target", func(t *testing.T) {
+		schema := `{"type":"record","name":"R","fields":[{"name":"e","type":[` +
+			`{"type":"enum","name":"EA","symbols":["X","Y"]},` +
+			`{"type":"enum","name":"EB","symbols":["P","X"]}]}]}`
+		plain := avro.MustParse(schema)
+		sskip := avro.MustParse(schema, skip)
+
+		// binary: record -> union branch 1 (EB) -> enum idx 1 ("X").
+		bin := []byte{0x02, 0x02}
+		var nb, sb any
+		if _, err := plain.Decode(bin, &nb, avro.TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sskip.Decode(bin, &sb, avro.TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nb, sb) {
+			t.Errorf("binary tagged-any: skip=%#v no-custom=%#v", sb, nb)
+		}
+
+		jsonw := []byte(`{"e":{"EB":"X"}}`)
+		var nj, sj any
+		if err := plain.DecodeJSON(jsonw, &nj, avro.TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if err := sskip.DecodeJSON(jsonw, &sj, avro.TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nj, sj) {
+			t.Errorf("json tagged-any: skip=%#v no-custom=%#v", sj, nj)
+		}
+	})
+}
+
+// TestRegression_CustomSkipDecodeLogicalSuppression crosses the logical-suppression
+// axis through the all-skip path. A LogicalType-matching custom SUPPRESSES the
+// built-in logical (hasMatchingCustomType), so a skip falls through to the RAW
+// Avro-native value — identical to a no-callback (Decode==nil) LogicalType custom,
+// which suppresses the same way. A WILDCARD custom does NOT suppress, so a skip
+// preserves the enriched value. The all-skip placement must honor each.
+func TestRegression_CustomSkipDecodeLogicalSuppression(t *testing.T) {
+	schema := `{"type":"long","logicalType":"timestamp-millis"}`
+	matchSkip := avro.CustomType{LogicalType: "timestamp-millis", Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+	matchRaw := avro.CustomType{LogicalType: "timestamp-millis"} // Decode==nil → suppress → raw
+	wildSkip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
+
+	wire, err := avro.MustParse(schema).Encode(time.UnixMilli(1600000000000).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dec := func(opts ...avro.SchemaOpt) any {
+		var got any
+		if _, err := avro.MustParse(schema, opts...).Decode(wire, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return got
+	}
+
+	matchSkipVal := dec(matchSkip)
+	matchRawVal := dec(matchRaw)
+	wildSkipVal := dec(wildSkip)
+	noCustomVal := func() any {
+		var got any
+		avro.MustParse(schema).Decode(wire, &got)
+		return got
+	}()
+
+	// LogicalType-matching skip == no-callback (both suppress → raw int64).
+	if !reflect.DeepEqual(matchSkipVal, matchRawVal) {
+		t.Errorf("matching skip %T(%v) != no-callback %T(%v)", matchSkipVal, matchSkipVal, matchRawVal, matchRawVal)
+	}
+	if _, ok := matchSkipVal.(int64); !ok {
+		t.Errorf("suppressed logical: want raw int64, got %T", matchSkipVal)
+	}
+	// Wildcard skip preserves the logical == no-custom (enriched time.Time).
+	if !reflect.DeepEqual(wildSkipVal, noCustomVal) {
+		t.Errorf("wildcard skip %T(%v) != no-custom %T(%v)", wildSkipVal, wildSkipVal, noCustomVal, noCustomVal)
+	}
+	if _, ok := wildSkipVal.(time.Time); !ok {
+		t.Errorf("non-suppressing wildcard: want enriched time.Time, got %T", wildSkipVal)
+	}
+}
+
+// ---------- lax_internal_reparse_test.go ----------
+
+// Internal re-parse surfaces vs user lax names.
+//
+// Two sites re-parse LIBRARY-PRODUCED schema text: Resolve builds a
+// custom-free writer view from writer.full for resolved DecodeJSON
+// (resolve.go), and SchemaCache.Parse rebuilds the metadata forms from the
+// self-contained spliced JSON (cache.go). Both re-parses once used
+// WithLaxNames(nil), assuming it subsumes any user lax validator — false
+// for empty name components (ns "a..b"), the only class lax(nil) rejects
+// that a user fn can accept. The original parse already validated those
+// names under the user's chosen validator; the internal validator has no
+// safety role, so both sites now parse with an accept-everything name
+// validator (internalReparseNames). These pins lock the two finding
+// shapes; TestMatrix_InternalReparseLaxNames covers the class.
+
+// ctLong is a decode-side domain type so the custom wiring in these tests
+// is observable, not just registered.
+type ctLong struct{ V int64 }
+
+func ctLongDecodeOnly() avro.CustomType {
+	return avro.CustomType{
+		AvroType: "long",
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			n, ok := v.(int64)
+			if !ok {
+				return nil, fmt.Errorf("ctLong decode: got %T", v)
+			}
+			return ctLong{n}, nil
+		},
+	}
+}
+
+// The lax-view finding, site 1 (resolve.go's custom-free writer view).
+// A custom-typed writer parsed with a user WithLaxNames fn that accepts
+// empty name components (ns "a..b") is already-parsed, wire-valid text;
+// Resolve re-parses writer.full to build the custom-free view and must
+// not re-litigate the names. Pre-fix the WithLaxNames(nil) re-parse
+// rejected the empty component and Resolve HARD-FAILED ("building
+// custom-free writer view for resolved JSON decode: invalid record
+// namespace \"a..b\": name must be non-empty"), blocking binary
+// resolution too, while the no-custom control resolved. The reader
+// differs from the writer so Resolve's canonical fast path (return
+// reader as-is) cannot mask the view construction.
+func TestRegression_ResolveCustomTypedLaxWriterView(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	writerJSON := `{"type":"record","name":"R","namespace":"a..b","fields":[{"name":"f","type":"long"}]}`
+	readerJSON := `{"type":"record","name":"R","namespace":"a..b","fields":[{"name":"f","type":"long"},{"name":"g","type":"string","default":"x"}]}`
+
+	writer, err := avro.Parse(writerJSON, avro.WithLaxNames(acceptAll), ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("writer parse: %v", err)
+	}
+	reader, err := avro.Parse(readerJSON, avro.WithLaxNames(acceptAll), ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("reader parse: %v", err)
+	}
+
+	resolved, err := avro.Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("Resolve of an already-parsed lax-named custom-typed writer must succeed: %v", err)
+	}
+
+	// The writer's names pass through verbatim: parity with the no-custom
+	// twin on wire bytes and fingerprint (the custom is decode-only; the
+	// canonical form ignores custom registrations either way).
+	writerNC, err := avro.Parse(writerJSON, avro.WithLaxNames(acceptAll))
+	if err != nil {
+		t.Fatalf("no-custom writer parse: %v", err)
+	}
+	in := map[string]any{"f": int64(7)}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("writer encode: %v", err)
+	}
+	wireNC, err := writerNC.Encode(in)
+	if err != nil {
+		t.Fatalf("no-custom writer encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireNC) {
+		t.Errorf("wire bytes diverge from no-custom twin: %x vs %x", wire, wireNC)
+	}
+	if fp, fpNC := writer.Fingerprint(avro.NewRabin()), writerNC.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpNC) {
+		t.Errorf("rabin fingerprint diverges from no-custom twin: %x vs %x", fp, fpNC)
+	}
+	if canon := string(writer.Canonical()); !strings.Contains(canon, `"a..b.R"`) {
+		t.Errorf("canonical does not carry the lax fullname verbatim: %s", canon)
+	}
+
+	// End-to-end through the resolved schema: binary decode and resolved
+	// DecodeJSON (the path the custom-free view exists for) agree, the
+	// reader's decode-only custom fires, and the added field defaults.
+	want := map[string]any{"f": ctLong{7}, "g": "x"}
+	var viaBinary map[string]any
+	if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+		t.Fatalf("resolved binary decode: %v", err)
+	}
+	if !reflect.DeepEqual(viaBinary, want) {
+		t.Errorf("resolved binary decode: got %#v, want %#v", viaBinary, want)
+	}
+	var viaJSON map[string]any
+	if err := resolved.DecodeJSON([]byte(`{"f":7}`), &viaJSON); err != nil {
+		t.Fatalf("resolved DecodeJSON: %v", err)
+	}
+	if !reflect.DeepEqual(viaJSON, want) {
+		t.Errorf("resolved DecodeJSON: got %#v, want %#v", viaJSON, want)
+	}
+}
+
+// The lax-view finding, site 2 (cache.go's splice-rebuild retry), in its
+// transitive form: parse-1 defines a..b.Inner under a user lax fn;
+// parse-2 and parse-3 pass NO lax option and reference the name only
+// through the cache. Pre-fix both rebuild attempts rejected the spliced
+// form (strict, then WithLaxNames(nil) on the empty component), so the
+// metadata forms silently degraded to a dangling reference:
+// String()/Canonical() were unresolvable under ANY opts. Post-fix the
+// spliced self-contained forms survive, re-parse under the user's
+// validator, and match the directly-parsed twin byte-for-byte on
+// canonical form, fingerprint, and wire bytes.
+func TestRegression_CacheSpliceTransitiveLaxNames(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"Inner","namespace":"a..b","fields":[{"name":"f","type":"long"}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (lax define): %v", err)
+	}
+	s2, err := c.Parse(`{"type":"record","name":"Wrapper","namespace":"ok","fields":[{"name":"i","type":"a..b.Inner"}]}`)
+	if err != nil {
+		t.Fatalf("parse-2 (strict reference): %v", err)
+	}
+	s3, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"w","type":"ok.Wrapper"}]}`)
+	if err != nil {
+		t.Fatalf("parse-3 (strict transitive reference): %v", err)
+	}
+
+	// The wire path was correct all along — control, not the finding.
+	in := map[string]any{"w": map[string]any{"i": map[string]any{"f": int64(7)}}}
+	wire, err := s3.Encode(in)
+	if err != nil {
+		t.Fatalf("cache-parsed encode: %v", err)
+	}
+
+	// String() must be self-contained: standalone re-parse under the
+	// user's validator. Pre-fix: unknown type "ok.Wrapper".
+	re, err := avro.Parse(s3.String(), avro.WithLaxNames(acceptAll))
+	if err != nil {
+		t.Fatalf("parse-3 String() must re-parse self-contained: %v\nString(): %s", err, s3.String())
+	}
+	if !bytes.Equal(re.Canonical(), s3.Canonical()) {
+		t.Errorf("String() re-parse canonical diverges:\n re: %s\n s3: %s", re.Canonical(), s3.Canonical())
+	}
+	// Canonical() re-parses too (it is valid schema JSON).
+	if _, err := avro.Parse(string(s3.Canonical()), avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-3 Canonical() must re-parse: %v\nCanonical(): %s", err, s3.Canonical())
+	}
+	// Parse-2's metadata forms are equally self-contained.
+	if _, err := avro.Parse(s2.String(), avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-2 String() must re-parse self-contained: %v\nString(): %s", err, s2.String())
+	}
+
+	// Parity with the directly-parsed twin: same schema, spliced by hand.
+	twin, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"w","type":{"type":"record","name":"Wrapper","namespace":"ok","fields":[{"name":"i","type":{"type":"record","name":"Inner","namespace":"a..b","fields":[{"name":"f","type":"long"}]}}]}}]}`, avro.WithLaxNames(acceptAll))
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(s3.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", s3.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := s3.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+	// Names pass through verbatim in the spliced text.
+	if s := s3.String(); !strings.Contains(s, `"a..b"`) {
+		t.Errorf("String() does not carry the lax namespace verbatim: %s", s)
+	}
+}
+
+// Siblings of the canonical empty-name emission fix, in the metadata
+// rebuild: toJSONWalk (SchemaNode.Schema()) guarded its name-key,
+// namespace, cycle-reference, and dedup arms with Name != "", and
+// nsForChildren/collectNamedTypes/nodeFromJSONObject used the same idiom
+// — all conflating "structurally unnamed node" (array/map) with "named
+// kind whose short name is empty". Reachable damage through parsed
+// schemas: the "ok." class rebuilt to the WRONG schema silently (name +
+// namespace dropped, fullname "ok." became ""); recursive and diamond
+// "ok." shapes hard-failed the rebuilt re-parse ("unknown type"); a named
+// child inside an empty-named parent lost its inherited scope. The named
+// KIND, or a non-empty fullname where a reference must exist, is the
+// distinction — mirroring the canonical emitter fix.
+func TestRegression_SchemaNodeRebuildEmptyNames(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	for _, c := range []struct{ desc, js string }{
+		{"bare", `{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}`},
+		{"ok", `{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"}]}`},
+		{"ab", `{"type":"record","name":"R","namespace":"a..b","fields":[{"name":"f","type":"long"}]}`},
+		{"recursive-ok", `{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","ok."]}]}`},
+		{"diamond-ok", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"}]}},{"name":"b","type":"ok."}]}`},
+		{"nested-child-in-ok", `{"type":"record","name":"","namespace":"ok","fields":[{"name":"c","type":{"type":"record","name":"Child","fields":[{"name":"f","type":"long"}]}}]}`},
+	} {
+		t.Run(c.desc, func(t *testing.T) {
+			s, err := avro.Parse(c.js, avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			root := s.Root()
+			re, err := root.Schema(avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("Root().Schema() rebuild: %v", err)
+			}
+			if !bytes.Equal(re.Canonical(), s.Canonical()) {
+				t.Errorf("rebuilt schema diverges:\n orig %s\n rebuilt %s", s.Canonical(), re.Canonical())
+			}
+		})
+	}
+}
+
+// The reader-side twin of the customBaked writer-trigger fix: resolved
+// decode DROPPED the reader's custom on SchemaCache-inherited subtrees.
+// resolveNode re-applies reader customs to REBUILT nodes through
+// resolveCtx.custom (= reader.custom), and a cache parse's overlay had no
+// entries for inherited nodes (applyCustomTypes visits only newly built
+// nodes; the guard-satisfying form registers the custom on BOTH parses,
+// but the referencing parse wires nothing new) — so a resolution against
+// a pre-evolution writer silently returned raw values where the direct
+// decode returned the custom-wrapped ones. tryAssignNamedRef now
+// completes the overlay for cross-parse inherited subtrees
+// (overlayInheritedCustom, the pure-wiring half of applyCustomTypes).
+func TestRegression_ResolvedDecodeCacheInheritedReaderCustom(t *testing.T) {
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}`, ctLongDecodeOnly()); err != nil {
+		t.Fatalf("cache define: %v", err)
+	}
+	reader, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":"Inner"},{"name":"added","type":"string","default":"x"}]}`, ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("cache reader parse: %v", err)
+	}
+	writer, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}}]}`)
+	if err != nil {
+		t.Fatalf("writer parse: %v", err)
+	}
+	resolved, err := avro.Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	want := map[string]any{"i": map[string]any{"f": ctLong{7}}, "added": "x"}
+
+	// The parity the finding broke: resolved decode must equal the direct
+	// decode — same value, same type.
+	directWire, err := reader.Encode(map[string]any{"i": map[string]any{"f": int64(7)}, "added": "x"})
+	if err != nil {
+		t.Fatalf("direct encode: %v", err)
+	}
+	var direct map[string]any
+	if _, err := reader.Decode(directWire, &direct); err != nil {
+		t.Fatalf("direct decode: %v", err)
+	}
+	if !reflect.DeepEqual(direct, want) {
+		t.Fatalf("direct decode (control): got %#v, want %#v", direct, want)
+	}
+
+	in := map[string]any{"i": map[string]any{"f": int64(7)}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("writer encode: %v", err)
+	}
+	var viaBinary map[string]any
+	if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+		t.Fatalf("resolved binary decode: %v", err)
+	}
+	if !reflect.DeepEqual(viaBinary, want) {
+		t.Errorf("resolved binary decode dropped the reader custom: got %#v, want %#v", viaBinary, want)
+	}
+	wjson, err := writer.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("writer EncodeJSON: %v", err)
+	}
+	var viaJSON map[string]any
+	if err := resolved.DecodeJSON(wjson, &viaJSON); err != nil {
+		t.Fatalf("resolved DecodeJSON: %v", err)
+	}
+	if !reflect.DeepEqual(viaJSON, want) {
+		t.Errorf("resolved DecodeJSON dropped the reader custom: got %#v, want %#v", viaJSON, want)
+	}
+}
+
+// Control pinned as SAFE (probed during the 2026-07-08 round): a
+// bare-reference-as-whole-schema cache parse keeps the defining parse's
+// custom behavior — the composed ser/deser of the inherited named type
+// carry the callback wraps — both on direct decode and as a
+// custom-typed writer through Resolve (customBaked fires via the
+// inherited hadCustomType stamp) and resolved DecodeJSON.
+func TestRegression_BareRefWriterCustomControl(t *testing.T) {
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}`, ctLongDecodeOnly()); err != nil {
+		t.Fatalf("cache define: %v", err)
+	}
+	bare, err := c.Parse(`"Inner"`, ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("bare ref parse: %v", err)
+	}
+	wire, err := bare.Encode(map[string]any{"f": int64(7)})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got map[string]any
+	if _, err := bare.Decode(wire, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if want := map[string]any{"f": ctLong{7}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("bare-ref direct decode: got %#v, want %#v", got, want)
+	}
+	reader, err := avro.Parse(`{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"},{"name":"added","type":"string","default":"x"}]}`, ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("reader parse: %v", err)
+	}
+	resolved, err := avro.Resolve(bare, reader)
+	if err != nil {
+		t.Fatalf("Resolve with bare-ref writer: %v", err)
+	}
+	var viaJSON map[string]any
+	if err := resolved.DecodeJSON([]byte(`{"f":7}`), &viaJSON); err != nil {
+		t.Fatalf("resolved DecodeJSON: %v", err)
+	}
+	if want := map[string]any{"f": ctLong{7}, "added": "x"}; !reflect.DeepEqual(viaJSON, want) {
+		t.Errorf("resolved DecodeJSON via bare-ref writer: got %#v, want %#v", viaJSON, want)
+	}
+}
+
+// Sibling of the lax-view finding, in the splice walkers rather than the
+// re-parse validator: collectTreeDefs / inlineTreeDefs guarded named-type
+// definitions with `name != ""`, conflating "no name key" (an unnamed
+// node — array, map, field) with "name key present and empty" (a
+// definition a user lax validator accepted). An empty short name with a
+// namespace has fullname "ok." — dotted, hence referenceable across cache
+// parses ({"type":"ok."} resolves by exact lookup) — but its definition
+// was never collected into the cache's def table, so the splice never
+// fired and the metadata forms silently degraded to the dangling
+// reference even with the accept-all re-parse validator in place.
+func TestRegression_CacheSpliceEmptyShortName(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (empty short name define): %v", err)
+	}
+	s2, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":"ok."}]}`)
+	if err != nil {
+		t.Fatalf("parse-2 (strict reference): %v", err)
+	}
+	re, err := avro.Parse(s2.String(), avro.WithLaxNames(acceptAll))
+	if err != nil {
+		t.Fatalf("String() must re-parse self-contained: %v\nString(): %s", err, s2.String())
+	}
+	if !bytes.Equal(re.Canonical(), s2.Canonical()) {
+		t.Errorf("String() re-parse canonical diverges:\n re: %s\n s2: %s", re.Canonical(), s2.Canonical())
+	}
+	twin, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"}]}}]}`, avro.WithLaxNames(acceptAll))
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(s2.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", s2.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := s2.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
+	}
+	in := map[string]any{"i": map[string]any{"f": int64(7)}}
+	wire, err := s2.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+}
+
+// AUDIT_PATTERNS.md B7 second instance, the stale-splice arm. A KEYLESS
+// definition — no "name" key at all, parseable only under a user
+// WithLaxNames fn accepting "" — registers the parser fullname "x." for
+// {"type":"record","namespace":"x",...} and builds its children under x,
+// so the nested Inner definition is x.Inner. collectTreeDefs gated both
+// the def visit and the child namespace scope on a string "name" KEY
+// being present, so parse-1's nested definition was misfiled in
+// SchemaCache.defs under the ENCLOSING-scoped fullname "Inner". A later
+// same-cache parse that references the short name "Inner" BEFORE locally
+// defining a DIFFERENT Inner is bound by the parser to the LOCAL later
+// definition (the cache's named table holds only x-scoped keys, so the
+// reference is a forward reference — eager, positional), and the wire
+// codec implements Inner{z:string}; the splice walker instead found the
+// misfiled stale def, inlined Inner{w:long} at the reference, and
+// rewrote the local definition to a reference (dupDefRef), shipping
+// String()/Root()/Canonical() that describe a field the wire rejects.
+// Post-fix the defs table holds only parser-scoped fullnames, nothing
+// splices, and every metadata form equals the directly-parsed twin's.
+func TestRegression_CacheKeylessDefStaleSplice(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (keyless define): %v", err)
+	}
+	src := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":"Inner"},{"name":"b","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}}]}`
+	writer, err := c.Parse(src)
+	if err != nil {
+		t.Fatalf("parse-2 (reference-then-define): %v", err)
+	}
+	// The text is self-contained (the reference forward-binds the local
+	// definition), so the cache-less parse of the same bytes is the twin.
+	twin, err := avro.Parse(src)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
+	}
+	re, err := avro.Parse(writer.String())
+	if err != nil {
+		t.Fatalf("String() must re-parse standalone: %v\nString(): %s", err, writer.String())
+	}
+	if !bytes.Equal(re.Canonical(), twin.Canonical()) {
+		t.Errorf("String() re-parse describes a different schema than the wire codec:\n re: %s\nwant: %s", re.Canonical(), twin.Canonical())
+	}
+	// Root(): field a is the bare forward reference, field b the local
+	// definition carrying the string field z (the schema the wire
+	// implements). Pre-fix the splice inverted this: field a carried the
+	// stale inherited Inner{w:long} definition and field b was rewritten
+	// to a reference.
+	root := writer.Root()
+	if got := root.Fields[0].Type.Type; got != "Inner" {
+		t.Errorf("Root() field a: got type %q, want the bare reference %q", got, "Inner")
+	}
+	fb := root.Fields[1].Type
+	if fb.Type != "record" || len(fb.Fields) != 1 || fb.Fields[0].Name != "z" || fb.Fields[0].Type.Type != "string" {
+		t.Errorf("Root() field b: got %s %v, want the local record definition with the single string field z", fb.Type, fb.Fields)
+	}
+	// Wire controls (correct before and after the fix): the codec
+	// implements the LOCAL Inner{z:string} at both fields and rejects the
+	// stale inherited shape.
+	in := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+	var out map[string]any
+	if _, err := writer.Decode(wire, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Errorf("decode round-trip: got %#v, want %#v", out, in)
+	}
+	if _, err := writer.Encode(map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}}); err == nil {
+		t.Error("wire unexpectedly accepts the stale inherited Inner{w:long} shape")
+	}
+}
+
+// AUDIT_PATTERNS.md B7 second instance, the cross-parse dangle arm
+// (B9's coherent-degrade shape). Parse-1 (lax) defines x.Inner nested
+// inside a keyless record; parse-2 — no lax option, transitive
+// reachability is the point — references the parser-scoped fullname
+// "x.Inner", which the wire resolves from the cache's named table.
+// Pre-fix the definition sat misfiled in SchemaCache.defs under "Inner",
+// so the exact dotted lookup found nothing to splice and
+// String()/Canonical() kept the dangling reference (unresolvable under
+// any opts). Post-fix the splice fires and the metadata forms are
+// self-contained, strict-parseable (every spliced name here is
+// strict-valid), and byte-equal to the directly-parsed twin's.
+func TestRegression_CacheKeylessDefCrossParseRef(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (keyless define): %v", err)
+	}
+	writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x.Inner"}]}`)
+	if err != nil {
+		t.Fatalf("parse-2 (cross-parse reference): %v", err)
+	}
+	re, err := avro.Parse(writer.String())
+	if err != nil {
+		t.Fatalf("String() must re-parse self-contained: %v\nString(): %s", err, writer.String())
+	}
+	twin, err := avro.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","namespace":"x","fields":[{"name":"w","type":"long"}]}}]}`)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(re.Canonical(), twin.Canonical()) {
+		t.Errorf("String() re-parse canonical diverges from twin:\n re: %s\nwant: %s", re.Canonical(), twin.Canonical())
+	}
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
+	}
+	// Root() describes the spliced definition, not a dangling reference.
+	fa := writer.Root().Fields[0].Type
+	if fa.Type != "record" || fa.Name != "Inner" || fa.Namespace != "x" || len(fa.Fields) != 1 || fa.Fields[0].Name != "w" {
+		t.Errorf("Root() field a: got type=%q name=%q namespace=%q fields=%v, want the spliced x.Inner definition", fa.Type, fa.Name, fa.Namespace, fa.Fields)
+	}
+	in := map[string]any{"a": map[string]any{"w": int64(7)}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+	var out map[string]any
+	if _, err := writer.Decode(wire, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Errorf("decode round-trip: got %#v, want %#v", out, in)
+	}
+}
+
+// AUDIT_PATTERNS.md B7 third instance, arm one: parser self-consistency
+// for leading-dot names. One leading dot (and no other dot) is the
+// explicit null-namespace escape — the rule qualifyAliases already
+// applies to aliases and Java's Name constructor applies to every name
+// (Schema.java ~1455: lastDot split; `if ("".equals(space)) space =
+// null`) — so {"name":".x"} builds as name "x" in the null namespace
+// (lax-only: the empty leading component never passes strict
+// validation). Pre-fix the name registered VERBATIM as ".x" and child
+// registration prefixed parentName[:dot+1] (nested Inner registered
+// ".Inner") while reference resolution used namespaceOf(".x") = "" —
+// the parser disagreed with itself, and a bare sibling reference
+// inside ".x" failed to parse: unknown type "Inner". Post-fix children
+// build in the null namespace and the bare reference binds.
+func TestRegression_LeadingDotSiblingRefResolves(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	src := `{"type":"record","name":".x","fields":[{"name":"k","type":{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}},{"name":"r","type":"Inner"}]}`
+	writer, err := avro.Parse(src, avro.WithLaxNames(acceptAll))
+	if err != nil {
+		t.Fatalf("bare sibling reference inside a leading-dot name must parse: %v", err)
+	}
+	// The ".x" spelling and the plain "x" spelling are the same type.
+	twin, err := avro.Parse(`{"type":"record","name":"x","fields":[{"name":"k","type":{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}},{"name":"r","type":"Inner"}]}`)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from the plain-spelled twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from the plain-spelled twin: %x vs %x", fp, fpTwin)
+	}
+	in := map[string]any{"k": map[string]any{"f": int64(7)}, "r": map[string]any{"f": int64(8)}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from the plain-spelled twin: %x vs %x", wire, wireTwin)
+	}
+}
+
+// AUDIT_PATTERNS.md B7 third instance, arm two: a cross-parse ".x"
+// reference splices self-contained. Parse-1 defines {"name":".x"}
+// (lax); the def collectors already stored it under the collapsed
+// fullname "x" (nodeFullnameTree's split-rejoin implements exactly the
+// Name-ctor rule), but pre-fix the parser registered ".x" verbatim and
+// scopedRefKeys looked the reference up verbatim, so the exact dotted
+// lookup missed the def table and String()/Canonical() kept the
+// dangling reference. Post-fix definition and reference both normalize
+// to "x", the splice fires, and the spliced form (name "x", explicit
+// null namespace) is strict-parseable.
+func TestRegression_LeadingDotCrossParseRefSplices(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":".x","fields":[{"name":"w","type":"long"}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (leading-dot define): %v", err)
+	}
+	writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":".x"}]}`)
+	if err != nil {
+		t.Fatalf("parse-2 (cross-parse reference): %v", err)
+	}
+	re, err := avro.Parse(writer.String())
+	if err != nil {
+		t.Fatalf("String() must re-parse self-contained: %v\nString(): %s", err, writer.String())
+	}
+	twin, err := avro.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}}]}`)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	if !bytes.Equal(re.Canonical(), twin.Canonical()) {
+		t.Errorf("String() re-parse canonical diverges from twin:\n re: %s\nwant: %s", re.Canonical(), twin.Canonical())
+	}
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
+	}
+	in := map[string]any{"a": map[string]any{"w": int64(7)}}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+}
+
+// AUDIT_PATTERNS.md B7 third instance, arm three: the executed
+// stale-splice divergence heals. Pre-fix, parse-1's {"name":".x"}
+// registered ".x" in the parser but "x" in the def table, so a later
+// parse that references-then-locally-defines the bare "x" parsed (no
+// name conflict — ".x" != "x" in the parser's table), forward-bound
+// the reference to the LOCAL x{z:string}, and then spliced the STALE
+// misfiled def at the reference: canonical described x{w:long} while
+// the wire accepted {z:string} and rejected {w:long}. Post-fix ".x"
+// IS the fullname "x", so the local re-definition is a DUPLICATE of
+// the cache-inherited name and the parse is rejected outright — the
+// same verdict every other same-fullname redefinition gets.
+func TestRegression_LeadingDotStaleSpliceHealed(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":".x","fields":[{"name":"w","type":"long"}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("parse-1 (leading-dot define): %v", err)
+	}
+	_, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x"},{"name":"b","type":{"type":"record","name":"x","fields":[{"name":"z","type":"string"}]}}]}`)
+	if err == nil {
+		t.Fatal("local re-definition of the cache-inherited fullname x unexpectedly parsed")
+	}
+	if !strings.Contains(err.Error(), `duplicate named type "x"`) {
+		t.Errorf("rejection shape changed: %v", err)
+	}
+}
+
+// ---------- lax_internal_reparse_matrix_test.go ----------
+
+// Class matrix for the internal re-parse surfaces (Resolve's custom-free
+// writer view, resolve.go; SchemaCache's splice rebuild, cache.go) against
+// the full name class the ORIGINAL parse can accept:
+//
+//	{site: resolve-view, cache-splice}
+//	  x {name class: strict, lax-nonempty, empty-component ns, empty-string name}
+//	  x {custom: none, decode-only, encode+decode}
+//	  x {reference: direct (recursive self-ref), transitive (diamond)}
+//	plus a cache cell whose OUTER parse itself carries the user lax fn, and
+//	pinned verdicts for the structurally-unreferenceable bare "" name.
+//
+// Every cell is framed as PARITY WITH THE ORIGINAL PARSE: whatever the
+// public parse accepted must survive Resolve, String()/Canonical()
+// re-parse, and resolved DecodeJSON, and the wire bytes and Rabin
+// fingerprints must equal the no-custom / directly-parsed twin — names
+// pass through verbatim (asserted, not assumed). The reader always
+// differs from the writer (an added defaulted field) so Resolve's
+// canonical fast path cannot mask the writer-view construction.
+
+func ctLongEncDec() avro.CustomType {
+	return avro.CustomType{
+		AvroType: "long",
+		GoType:   reflect.TypeFor[ctLong](),
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) {
+			c, ok := v.(ctLong)
+			if !ok {
+				return nil, fmt.Errorf("ctLong encode: got %T", v)
+			}
+			return c.V, nil
+		},
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			n, ok := v.(int64)
+			if !ok {
+				return nil, fmt.Errorf("ctLong decode: got %T", v)
+			}
+			return ctLong{n}, nil
+		},
+	}
+}
+
+type reparseNameClass struct {
+	key  string
+	ns   string // namespace of the lax-named type
+	name string // short name of the lax-named type ("" = empty short name)
+	full string // expected verbatim fullname in canonical/spliced forms
+	opt  avro.SchemaOpt
+}
+
+type reparseCustomMode struct {
+	key  string
+	opts []avro.SchemaOpt
+	wrap bool // decoded longs surface as ctLong
+}
+
+func TestMatrix_InternalReparseLaxNames(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	classes := []reparseNameClass{
+		{"strict", "com.example", "N", "com.example.N", nil},
+		{"laxnonempty", "a-b", "N", "a-b.N", avro.WithLaxNames(nil)},
+		{"emptycomponent", "a..b", "N", "a..b.N", avro.WithLaxNames(acceptAll)},
+		{"emptyname", "ok", "", "ok.", avro.WithLaxNames(acceptAll)},
+	}
+	customs := []reparseCustomMode{
+		{"none", nil, false},
+		{"decodeonly", []avro.SchemaOpt{ctLongDecodeOnly()}, true},
+		{"encdec", []avro.SchemaOpt{ctLongEncDec()}, true},
+	}
+	withCustom := func(nc reparseNameClass, cm reparseCustomMode) []avro.SchemaOpt {
+		return append(nameOnlyOpts(nc), cm.opts...)
+	}
+	L := func(wrap bool, v int64) any {
+		if wrap {
+			return ctLong{v}
+		}
+		return v
+	}
+
+	// Site: resolve-view. The lax-named type is the writer root with a
+	// recursive self-reference (direct) or a nested definition whose name is
+	// referenced a second time (transitive; diamond).
+	for _, nc := range classes {
+		for _, cm := range customs {
+			var writerJSON, readerJSON string
+			var in, inCt, want map[string]any
+			innerDef := fmt.Sprintf(`{"type":"record","name":%q,"namespace":%q,"fields":[{"name":"f","type":"long"}]}`, nc.name, nc.ns)
+
+			t.Run("resolve/"+nc.key+"/direct/"+cm.key, func(t *testing.T) {
+				writerJSON = fmt.Sprintf(`{"type":"record","name":%q,"namespace":%q,"fields":[{"name":"f","type":"long"},{"name":"next","type":["null",%q]}]}`, nc.name, nc.ns, nc.full)
+				readerJSON = fmt.Sprintf(`{"type":"record","name":%q,"namespace":%q,"fields":[{"name":"f","type":"long"},{"name":"next","type":["null",%q]},{"name":"added","type":"string","default":"x"}]}`, nc.name, nc.ns, nc.full)
+				in = map[string]any{"f": int64(7), "next": map[string]any{"f": int64(8), "next": nil}}
+				if cm.key == "encdec" {
+					inCt = map[string]any{"f": ctLong{7}, "next": map[string]any{"f": ctLong{8}, "next": nil}}
+				}
+				want = map[string]any{"f": L(cm.wrap, 7), "next": map[string]any{"f": L(cm.wrap, 8), "next": nil, "added": "x"}, "added": "x"}
+
+				writer, err := avro.Parse(writerJSON, withCustom(nc, cm)...)
+				if err != nil {
+					t.Fatalf("writer parse: %v", err)
+				}
+				twin, err := avro.Parse(writerJSON, nameOnlyOpts(nc)...)
+				if err != nil {
+					t.Fatalf("twin parse: %v", err)
+				}
+				reader, err := avro.Parse(readerJSON, withCustom(nc, cm)...)
+				if err != nil {
+					t.Fatalf("reader parse: %v", err)
+				}
+				battery(t, nc, writer, twin, reader, in, inCt, want)
+			})
+
+			t.Run("resolve/"+nc.key+"/transitive/"+cm.key, func(t *testing.T) {
+				writerJSON = fmt.Sprintf(`{"type":"record","name":"Top","namespace":"root.ns","fields":[{"name":"a","type":%s},{"name":"b","type":%q}]}`, innerDef, nc.full)
+				readerJSON = fmt.Sprintf(`{"type":"record","name":"Top","namespace":"root.ns","fields":[{"name":"a","type":%s},{"name":"b","type":%q},{"name":"added","type":"string","default":"x"}]}`, innerDef, nc.full)
+				in = map[string]any{"a": map[string]any{"f": int64(7)}, "b": map[string]any{"f": int64(8)}}
+				if cm.key == "encdec" {
+					inCt = map[string]any{"a": map[string]any{"f": ctLong{7}}, "b": map[string]any{"f": ctLong{8}}}
+				}
+				want = map[string]any{"a": map[string]any{"f": L(cm.wrap, 7)}, "b": map[string]any{"f": L(cm.wrap, 8)}, "added": "x"}
+
+				writer, err := avro.Parse(writerJSON, withCustom(nc, cm)...)
+				if err != nil {
+					t.Fatalf("writer parse: %v", err)
+				}
+				twin, err := avro.Parse(writerJSON, nameOnlyOpts(nc)...)
+				if err != nil {
+					t.Fatalf("twin parse: %v", err)
+				}
+				reader, err := avro.Parse(readerJSON, withCustom(nc, cm)...)
+				if err != nil {
+					t.Fatalf("reader parse: %v", err)
+				}
+				battery(t, nc, writer, twin, reader, in, inCt, want)
+			})
+		}
+	}
+
+	// Site: cache-splice. The lax-named type is defined in an earlier cache
+	// parse and reaches the final parse's metadata only through the splice.
+	// The final parse passes NO name option (transitive reachability is the
+	// point); custom cells carry the custom on every parse in the chain (the
+	// cross-parse custom-boundary guard requires cache and referencing parse
+	// to agree). The cache-parsed writer then feeds Resolve, composing both
+	// internal re-parse sites when customs are wired.
+	for _, nc := range classes {
+		for _, cm := range customs {
+			innerDef := fmt.Sprintf(`{"type":"record","name":%q,"namespace":%q,"fields":[{"name":"f","type":"long"}]}`, nc.name, nc.ns)
+
+			t.Run("cache/"+nc.key+"/direct/"+cm.key, func(t *testing.T) {
+				var c avro.SchemaCache
+				if _, err := c.Parse(innerDef, withCustom(nc, cm)...); err != nil {
+					t.Fatalf("cache define: %v", err)
+				}
+				writer, err := c.Parse(fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"i","type":%q}]}`, nc.full), cm.opts...)
+				if err != nil {
+					t.Fatalf("cache reference parse: %v", err)
+				}
+				twinJSON := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"i","type":%s}]}`, innerDef)
+				twin, err := avro.Parse(twinJSON, nameOnlyOpts(nc)...)
+				if err != nil {
+					t.Fatalf("twin parse: %v", err)
+				}
+				readerJSON := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"i","type":%s},{"name":"added","type":"string","default":"x"}]}`, innerDef)
+				reader, err := avro.Parse(readerJSON, withCustom(nc, cm)...)
+				if err != nil {
+					t.Fatalf("reader parse: %v", err)
+				}
+				in := map[string]any{"i": map[string]any{"f": int64(7)}}
+				var inCt map[string]any
+				if cm.key == "encdec" {
+					inCt = map[string]any{"i": map[string]any{"f": ctLong{7}}}
+				}
+				want := map[string]any{"i": map[string]any{"f": L(cm.wrap, 7)}, "added": "x"}
+				battery(t, nc, writer, twin, reader, in, inCt, want)
+			})
+
+			t.Run("cache/"+nc.key+"/transitive/"+cm.key, func(t *testing.T) {
+				var c avro.SchemaCache
+				if _, err := c.Parse(innerDef, withCustom(nc, cm)...); err != nil {
+					t.Fatalf("cache define: %v", err)
+				}
+				// Two wrappers referencing the same inner type: the final
+				// splice inlines both wrapper definitions, and the SECOND
+				// arrival of the inner definition must dedupe to a reference
+				// (the diamond).
+				for _, w := range []string{"WrapA", "WrapB"} {
+					if _, err := c.Parse(fmt.Sprintf(`{"type":"record","name":%q,"namespace":"mid","fields":[{"name":"i","type":%q}]}`, w, nc.full), cm.opts...); err != nil {
+						t.Fatalf("cache wrapper %s parse: %v", w, err)
+					}
+				}
+				writer, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"x","type":"mid.WrapA"},{"name":"y","type":"mid.WrapB"}]}`, cm.opts...)
+				if err != nil {
+					t.Fatalf("cache transitive reference parse: %v", err)
+				}
+				twinJSON := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"x","type":{"type":"record","name":"WrapA","namespace":"mid","fields":[{"name":"i","type":%s}]}},{"name":"y","type":{"type":"record","name":"WrapB","namespace":"mid","fields":[{"name":"i","type":%q}]}}]}`, innerDef, nc.full)
+				twin, err := avro.Parse(twinJSON, nameOnlyOpts(nc)...)
+				if err != nil {
+					t.Fatalf("twin parse: %v", err)
+				}
+				readerJSON := fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"x","type":{"type":"record","name":"WrapA","namespace":"mid","fields":[{"name":"i","type":%s}]}},{"name":"y","type":{"type":"record","name":"WrapB","namespace":"mid","fields":[{"name":"i","type":%q}]}},{"name":"added","type":"string","default":"x"}]}`, innerDef, nc.full)
+				reader, err := avro.Parse(readerJSON, withCustom(nc, cm)...)
+				if err != nil {
+					t.Fatalf("reader parse: %v", err)
+				}
+				in := map[string]any{"x": map[string]any{"i": map[string]any{"f": int64(7)}}, "y": map[string]any{"i": map[string]any{"f": int64(8)}}}
+				var inCt map[string]any
+				if cm.key == "encdec" {
+					inCt = map[string]any{"x": map[string]any{"i": map[string]any{"f": ctLong{7}}}, "y": map[string]any{"i": map[string]any{"f": ctLong{8}}}}
+				}
+				want := map[string]any{"x": map[string]any{"i": map[string]any{"f": L(cm.wrap, 7)}}, "y": map[string]any{"i": map[string]any{"f": L(cm.wrap, 8)}}, "added": "x"}
+				battery(t, nc, writer, twin, reader, in, inCt, want)
+			})
+		}
+	}
+
+	// Extra cell: the OUTER cache parse itself carries the user lax fn, so
+	// the splice rebuild's FIRST attempt (this call's own opts) succeeds and
+	// the internal retry never fires. Guards the opts passthrough.
+	t.Run("cache/emptycomponent/direct/none/outer-lax", func(t *testing.T) {
+		nc := classes[2] // emptycomponent
+		innerDef := fmt.Sprintf(`{"type":"record","name":%q,"namespace":%q,"fields":[{"name":"f","type":"long"}]}`, nc.name, nc.ns)
+		var c avro.SchemaCache
+		if _, err := c.Parse(innerDef, nc.opt); err != nil {
+			t.Fatalf("cache define: %v", err)
+		}
+		writer, err := c.Parse(fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"i","type":%q}]}`, nc.full), nc.opt)
+		if err != nil {
+			t.Fatalf("cache reference parse (outer lax): %v", err)
+		}
+		twin, err := avro.Parse(fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"i","type":%s}]}`, innerDef), nc.opt)
+		if err != nil {
+			t.Fatalf("twin parse: %v", err)
+		}
+		reader, err := avro.Parse(fmt.Sprintf(`{"type":"record","name":"Outer","fields":[{"name":"i","type":%s},{"name":"added","type":"string","default":"x"}]}`, innerDef), nc.opt)
+		if err != nil {
+			t.Fatalf("reader parse: %v", err)
+		}
+		in := map[string]any{"i": map[string]any{"f": int64(7)}}
+		want := map[string]any{"i": map[string]any{"f": int64(7)}, "added": "x"}
+		battery(t, nc, writer, twin, reader, in, nil, want)
+	})
+}
+
+// Reader-side cells for the overlay-completion fix: a cache-parsed READER
+// whose custom matches only SchemaCache-inherited subtrees must apply the
+// custom on RESOLVED decode exactly as on direct decode. Every cell
+// asserts resolved == direct on value AND type (both against an explicit
+// custom-wrapped want), resolved DecodeJSON agreement, and that the
+// no-custom twin's wire bytes are unchanged by the custom registration.
+// The evolution axis lives INSIDE the inherited subtree and picks the
+// three resolve-time custom re-application families: added-field (a
+// custom-matched long default filled through defaultOp's wrap), promotion
+// (int→long through the promoted-node wrap + suppression gate), and
+// reorder (record rebuild + direct-reuse wrap).
+func TestMatrix_CacheReaderInheritedCustomResolve(t *testing.T) {
+	type evo struct {
+		key         string
+		writerInner string // writer Inner fields (pre-evolution)
+		readerInner string // reader Inner fields (post-evolution)
+		writerVal   map[string]any
+		nativeVal   map[string]any // reader-shaped, native values
+		ctVal       map[string]any // reader-shaped, domain-typed values
+		wantInner   map[string]any
+	}
+	evos := []evo{
+		{
+			key:         "addedfield",
+			writerInner: `[{"name":"f","type":"long"}]`,
+			readerInner: `[{"name":"f","type":"long"},{"name":"g","type":"long","default":9}]`,
+			writerVal:   map[string]any{"f": int64(7)},
+			nativeVal:   map[string]any{"f": int64(7), "g": int64(9)},
+			ctVal:       map[string]any{"f": ctLong{7}, "g": ctLong{9}},
+			wantInner:   map[string]any{"f": ctLong{7}, "g": ctLong{9}},
+		},
+		{
+			key:         "promotion",
+			writerInner: `[{"name":"f","type":"int"}]`,
+			readerInner: `[{"name":"f","type":"long"}]`,
+			writerVal:   map[string]any{"f": int32(7)},
+			nativeVal:   map[string]any{"f": int64(7)},
+			ctVal:       map[string]any{"f": ctLong{7}},
+			wantInner:   map[string]any{"f": ctLong{7}},
+		},
+		{
+			key:         "reorder",
+			writerInner: `[{"name":"f","type":"long"},{"name":"g","type":"string"}]`,
+			readerInner: `[{"name":"g","type":"string"},{"name":"f","type":"long"}]`,
+			writerVal:   map[string]any{"f": int64(7), "g": "z"},
+			nativeVal:   map[string]any{"f": int64(7), "g": "z"},
+			ctVal:       map[string]any{"f": ctLong{7}, "g": "z"},
+			wantInner:   map[string]any{"f": ctLong{7}, "g": "z"},
+		},
+	}
+	customs := []struct {
+		key string
+		ct  avro.CustomType
+	}{
+		{"decodeonly", ctLongDecodeOnly()},
+		{"encdec", ctLongEncDec()},
+	}
+
+	for _, e := range evos {
+		for _, cm := range customs {
+			readerInnerDef := `{"type":"record","name":"Inner","fields":` + e.readerInner + `}`
+			writerInnerDef := `{"type":"record","name":"Inner","fields":` + e.writerInner + `}`
+
+			runCell := func(t *testing.T, reader, twin, writer *avro.Schema, wrap func(map[string]any) map[string]any) {
+				t.Helper()
+				want := wrap(e.wantInner)
+				resolved, err := avro.Resolve(writer, reader)
+				if err != nil {
+					t.Fatalf("Resolve: %v", err)
+				}
+				// Direct decode — the parity target.
+				directWire, err := reader.Encode(wrap(e.nativeVal))
+				if err != nil {
+					t.Fatalf("direct encode: %v", err)
+				}
+				var direct map[string]any
+				if _, err := reader.Decode(directWire, &direct); err != nil {
+					t.Fatalf("direct decode: %v", err)
+				}
+				if !reflect.DeepEqual(direct, want) {
+					t.Fatalf("direct decode: got %#v, want %#v", direct, want)
+				}
+				// Resolved decode must match it, value and type.
+				wire, err := writer.Encode(wrap(e.writerVal))
+				if err != nil {
+					t.Fatalf("writer encode: %v", err)
+				}
+				var viaBinary map[string]any
+				if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+					t.Fatalf("resolved decode: %v", err)
+				}
+				if !reflect.DeepEqual(viaBinary, want) {
+					t.Errorf("resolved binary decode: got %#v, want %#v", viaBinary, want)
+				}
+				wjson, err := writer.EncodeJSON(wrap(e.writerVal))
+				if err != nil {
+					t.Fatalf("writer EncodeJSON: %v", err)
+				}
+				var viaJSON map[string]any
+				if err := resolved.DecodeJSON(wjson, &viaJSON); err != nil {
+					t.Fatalf("resolved DecodeJSON: %v", err)
+				}
+				if !reflect.DeepEqual(viaJSON, want) {
+					t.Errorf("resolved DecodeJSON: got %#v, want %#v", viaJSON, want)
+				}
+				// The custom never changes the wire: reader bytes equal the
+				// no-custom twin's, from native input and (encode+decode
+				// cells) from domain-typed input.
+				twinWire, err := twin.Encode(wrap(e.nativeVal))
+				if err != nil {
+					t.Fatalf("twin encode: %v", err)
+				}
+				if !bytes.Equal(directWire, twinWire) {
+					t.Errorf("reader wire bytes diverge from no-custom twin: %x vs %x", directWire, twinWire)
+				}
+				if cm.key == "encdec" {
+					ctWire, err := reader.Encode(wrap(e.ctVal))
+					if err != nil {
+						t.Fatalf("domain-typed encode: %v", err)
+					}
+					if !bytes.Equal(ctWire, twinWire) {
+						t.Errorf("domain-typed wire bytes diverge from no-custom twin: %x vs %x", ctWire, twinWire)
+					}
+				}
+			}
+
+			t.Run("reader/"+e.key+"/direct/"+cm.key, func(t *testing.T) {
+				var c avro.SchemaCache
+				if _, err := c.Parse(readerInnerDef, cm.ct); err != nil {
+					t.Fatalf("cache define: %v", err)
+				}
+				reader, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":"Inner"}]}`, cm.ct)
+				if err != nil {
+					t.Fatalf("cache reader parse: %v", err)
+				}
+				twin, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":` + readerInnerDef + `}]}`)
+				if err != nil {
+					t.Fatalf("twin parse: %v", err)
+				}
+				writer, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":` + writerInnerDef + `}]}`)
+				if err != nil {
+					t.Fatalf("writer parse: %v", err)
+				}
+				runCell(t, reader, twin, writer, func(inner map[string]any) map[string]any {
+					return map[string]any{"i": inner}
+				})
+			})
+
+			t.Run("reader/"+e.key+"/transitive/"+cm.key, func(t *testing.T) {
+				var c avro.SchemaCache
+				if _, err := c.Parse(readerInnerDef, cm.ct); err != nil {
+					t.Fatalf("cache define: %v", err)
+				}
+				if _, err := c.Parse(`{"type":"record","name":"Wrapper","namespace":"mid","fields":[{"name":"i","type":"Inner"}]}`, cm.ct); err != nil {
+					t.Fatalf("cache wrapper parse: %v", err)
+				}
+				reader, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"w","type":"mid.Wrapper"}]}`, cm.ct)
+				if err != nil {
+					t.Fatalf("cache reader parse: %v", err)
+				}
+				twin, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"w","type":{"type":"record","name":"Wrapper","namespace":"mid","fields":[{"name":"i","type":` + readerInnerDef + `}]}}]}`)
+				if err != nil {
+					t.Fatalf("twin parse: %v", err)
+				}
+				writer, err := avro.Parse(`{"type":"record","name":"Outer","fields":[{"name":"w","type":{"type":"record","name":"Wrapper","namespace":"mid","fields":[{"name":"i","type":` + writerInnerDef + `}]}}]}`)
+				if err != nil {
+					t.Fatalf("writer parse: %v", err)
+				}
+				runCell(t, reader, twin, writer, func(inner map[string]any) map[string]any {
+					return map[string]any{"w": map[string]any{"i": inner}}
+				})
+			})
+		}
+	}
+}
+
+// The bare empty name ("" with no namespace) is DEFINABLE under a user
+// accept-all validator but not REFERENCEABLE: its only spelling as a
+// reference is the empty string, which the parser rejects structurally
+// ("schema is not a primitive, complex, nor union") upstream of any name
+// validator. These verdicts are pinned as the original parse's behavior;
+// the reference cells of the empty-name class therefore run on the
+// namespaced form (fullname "ok.") in TestMatrix_InternalReparseLaxNames.
+func TestMatrix_InternalReparseBareEmptyName(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+
+	// Definition accepted; reference rejected — single parse.
+	if _, err := avro.Parse(`{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("bare empty-name definition must parse under accept-all: %v", err)
+	}
+	dia := `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}},{"name":"b","type":""}]}`
+	if _, err := avro.Parse(dia, avro.WithLaxNames(acceptAll)); err == nil {
+		t.Error(`reference "" must be structurally rejected (in-schema)`)
+	} else if !strings.Contains(err.Error(), "not a primitive") {
+		t.Errorf("in-schema rejection changed shape: %v", err)
+	}
+	// Reference rejected — cache cross-parse.
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}`, avro.WithLaxNames(acceptAll)); err != nil {
+		t.Fatalf("cache bare empty-name definition: %v", err)
+	}
+	if _, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"i","type":""}]}`); err == nil {
+		t.Error(`reference "" must be structurally rejected (cache cross-parse)`)
+	} else if !strings.Contains(err.Error(), "not a primitive") {
+		t.Errorf("cache rejection changed shape: %v", err)
+	}
+
+	// A bare empty-name ROOT still survives the resolve-view re-parse: the
+	// writer's own text carries "name":"" and parses under the internal
+	// accept-all validator.
+	writer, err := avro.Parse(`{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}`, avro.WithLaxNames(acceptAll), ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("bare empty-name custom writer parse: %v", err)
+	}
+	reader, err := avro.Parse(`{"type":"record","name":"","fields":[{"name":"f","type":"long"},{"name":"added","type":"string","default":"x"}]}`, avro.WithLaxNames(acceptAll), ctLongDecodeOnly())
+	if err != nil {
+		t.Fatalf("bare empty-name reader parse: %v", err)
+	}
+	resolved, err := avro.Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("Resolve of bare empty-name custom writer: %v", err)
+	}
+	wire, err := writer.Encode(map[string]any{"f": int64(7)})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	want := map[string]any{"f": ctLong{7}, "added": "x"}
+	var viaBinary map[string]any
+	if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+		t.Fatalf("resolved binary decode: %v", err)
+	}
+	if !reflect.DeepEqual(viaBinary, want) {
+		t.Errorf("resolved binary decode: got %#v, want %#v", viaBinary, want)
+	}
+	var viaJSON map[string]any
+	if err := resolved.DecodeJSON([]byte(`{"f":7}`), &viaJSON); err != nil {
+		t.Fatalf("resolved DecodeJSON: %v", err)
+	}
+	if !reflect.DeepEqual(viaJSON, want) {
+		t.Errorf("resolved DecodeJSON: got %#v, want %#v", viaJSON, want)
+	}
+	// String() re-parses (the as-written text keeps "name":"").
+	if _, err := avro.Parse(writer.String(), avro.WithLaxNames(acceptAll)); err != nil {
+		t.Errorf("String() re-parse: %v\nString(): %s", err, writer.String())
+	}
+
+	// RULED (re-adjudicated on executed evidence — NOT_BUGS #60): the bare
+	// empty-name root EMITS "name":"" in canonical form, matching fastavro
+	// (1.12.2, executed), the only other implementation known to parse the
+	// shape. The previous omission emitted a missing-name spelling that
+	// fingerprinted like nothing else; canonical bytes and the Rabin
+	// fingerprint are pinned against fastavro's EXECUTED values, and the
+	// canonical form re-parses under the user's accept-all validator
+	// (missing name and empty name are the same fullname "" there, so the
+	// re-parse held before and after — the BYTES are the discriminator).
+	wantCanon := `{"name":"","type":"record","fields":[{"name":"f","type":"long"}]}`
+	if canon := string(writer.Canonical()); canon != wantCanon {
+		t.Errorf("bare empty-name canonical:\n got %s\nwant %s", canon, wantCanon)
+	}
+	if got, want := writer.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, "3d741707ff4bfa45"); !bytes.Equal(got, want) {
+		t.Errorf("bare empty-name rabin: got %x, want %x (fastavro-executed)", got, want)
+	}
+	if _, err := avro.Parse(string(writer.Canonical()), avro.WithLaxNames(acceptAll)); err != nil {
+		t.Errorf("bare empty-name canonical must re-parse under accept-all: %v", err)
+	}
+}
+
+// Class matrix for KEYLESS definitions in the SchemaCache def table —
+// named-kind nodes with NO "name" key at all, parseable only under a
+// user WithLaxNames fn accepting "" (AUDIT_PATTERNS.md B7 second
+// instance). The parser registers a fullname for them regardless
+// ("ns." from the namespace attribute, or "" bare) and scopes their
+// children by that namespace, so the def-collection and splice walkers
+// must do the same: collectTreeDefs's visit fires with the parser's
+// fullname and scopes children by nodeChildScope, and inlineTreeDefs's
+// local-definition registration (map arm and flat-field arm) has no
+// keyless carve-out.
+//
+//	{namespace attr: present "x", absent}
+//	  x {parse-2 shape: cross-parse reference to the parser fullname
+//	     (define-then-reference), reference-then-LOCAL-define of the
+//	     nested short name, local-define-then-reference}
+//	plus keyless-def-visit cells (reference to "x." itself: recursive
+//	self-ref, diamond with the nested x.Inner), seen-parity cells
+//	(nested and flat keyless defs arriving inside a spliced subtree),
+//	and a same-string lax re-parse stability cell (dupDefRef on a
+//	keyless local definition).
+//
+// Invariant per cell, as everywhere in this file: the metadata forms
+// describe the wire codec's schema, twin-parity where a twin exists.
+// The bare-namespace reference-then-define orders have NO twin: the
+// parser itself rejects the parse (the cache's named table already
+// holds "Inner", so the local re-definition is a duplicate) — pinned
+// as the rejection.
+func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	lax := avro.WithLaxNames(acceptAll)
+
+	const keylessNS = `{"type":"record","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`
+	const keylessBare = `{"type":"record","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}`
+
+	// Cross-parse reference to the nested definition's parser-scoped
+	// fullname (define-then-reference across parses). With the namespace
+	// attribute present the nested def is x.Inner; pre-fix it was
+	// misfiled under "Inner" and the exact dotted lookup dangled.
+	t.Run("ns/crossref-inner", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessNS, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x.Inner"}]}`)
+		if err != nil {
+			t.Fatalf("reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-ns", "x", "Inner", "x.Inner", nil}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","namespace":"x","fields":[{"name":"w","type":"long"}]}}]}`
+		in := map[string]any{"a": map[string]any{"w": int64(7)}}
+		want := map[string]any{"a": map[string]any{"w": int64(7)}, "added": "x"}
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// With the namespace attribute absent, the parser scopes the nested
+	// def in the ENCLOSING (null) namespace — the walkers agreed here
+	// even pre-fix; the cell is the control for the scope rule's other
+	// half. The spliced definition carries the explicit-empty namespace
+	// escape and stays strict-parseable.
+	t.Run("bare/crossref-inner", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessBare, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"Inner"}]}`)
+		if err != nil {
+			t.Fatalf("reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-bare", "", "Inner", "Inner", nil}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","namespace":"","fields":[{"name":"w","type":"long"}]}}]}`
+		in := map[string]any{"a": map[string]any{"w": int64(7)}}
+		want := map[string]any{"a": map[string]any{"w": int64(7)}, "added": "x"}
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Reference-then-define: parse-2 references the short name "Inner"
+	// BEFORE locally defining a DIFFERENT Inner{z:string}. The parser
+	// forward-binds the reference to the LOCAL definition (the cache's
+	// named table holds only x-scoped keys); pre-fix the splice walker
+	// inlined the misfiled stale Inner{w:long} instead and rewrote the
+	// local definition to a reference — the stale-splice divergence.
+	t.Run("ns/refdefine", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessNS, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		src := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":"Inner"},{"name":"b","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}}]}`
+		writer, err := c.Parse(src)
+		if err != nil {
+			t.Fatalf("reference-then-define parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-ns-refdefine", "", "Inner", "Inner", nil}
+		in := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}}
+		want := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}, "added": "x"}
+		runReparseBattery(t, nc, writer, src, in, want)
+		if _, err := writer.Encode(map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}}); err == nil {
+			t.Error("wire unexpectedly accepts the stale inherited Inner{w:long} shape")
+		}
+	})
+
+	// Define-then-reference: the local definition precedes the
+	// reference, so the parser and the splice walker's positional seen
+	// tracking both bind the local type (the shape pre-fix behavior
+	// already got right — the order dual that makes the matrix's
+	// position axis non-vacuous).
+	t.Run("ns/definref", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessNS, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		src := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}},{"name":"b","type":"Inner"}]}`
+		writer, err := c.Parse(src)
+		if err != nil {
+			t.Fatalf("define-then-reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-ns-definref", "", "Inner", "Inner", nil}
+		in := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}}
+		want := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}, "added": "x"}
+		runReparseBattery(t, nc, writer, src, in, want)
+	})
+
+	// With the namespace attribute absent the nested def registers the
+	// bare "Inner" in the parser's named table, so a parse that locally
+	// re-defines it is a DUPLICATE — rejected by the parser in either
+	// order. No twin exists; the rejection is the pinned verdict.
+	for _, order := range []struct{ key, src string }{
+		{"bare/refdefine", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":"Inner"},{"name":"b","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}}]}`},
+		{"bare/definref", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"z","type":"string"}]}},{"name":"b","type":"Inner"}]}`},
+	} {
+		t.Run(order.key, func(t *testing.T) {
+			var c avro.SchemaCache
+			if _, err := c.Parse(keylessBare, lax); err != nil {
+				t.Fatalf("keyless define: %v", err)
+			}
+			_, err := c.Parse(order.src)
+			if err == nil {
+				t.Fatal("local re-definition of the cache-inherited bare Inner unexpectedly parsed")
+			}
+			if !strings.Contains(err.Error(), `duplicate named type "Inner"`) {
+				t.Errorf("rejection shape changed: %v", err)
+			}
+		})
+	}
+
+	// The def visit itself: the keyless definition is collected under
+	// the parser's fullname "x." and is referenceable across parses by
+	// exact dotted lookup. The definition self-references (recursive),
+	// so the spliced body's own "x." reference must stay bare.
+	t.Run("ns/crossref-outer-recursive", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","namespace":"x","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","x."]}]}`, lax); err != nil {
+			t.Fatalf("keyless recursive define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x."}]}`)
+		if err != nil {
+			t.Fatalf("reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-outer", "x", "", "x.", lax}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"x","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","x."]}]}}]}`
+		in := map[string]any{"a": map[string]any{"f": int64(7), "next": map[string]any{"f": int64(8), "next": nil}}}
+		want := map[string]any{"a": map[string]any{"f": int64(7), "next": map[string]any{"f": int64(8), "next": nil}}, "added": "x"}
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Diamond through the keyless def: parse-2 references BOTH "x." and
+	// the x.Inner nested inside it. The splice at the first reference
+	// carries the Inner definition; walking the spliced copy registers
+	// it, so the second reference stays bare and resolves backward into
+	// the first splice — one definition per name, the
+	// first-define-then-reference rule the splice dedup implements (see
+	// inlineTreeDefs).
+	t.Run("ns/diamond", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(keylessNS, lax); err != nil {
+			t.Fatalf("keyless define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x."},{"name":"b","type":"x.Inner"}]}`)
+		if err != nil {
+			t.Fatalf("diamond reference parse: %v", err)
+		}
+		nc := reparseNameClass{"keyless-diamond", "x", "", "x.", lax}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"x","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"w","type":"long"}]}}]}},{"name":"b","type":"x.Inner"}]}`
+		in := map[string]any{"a": map[string]any{"i": map[string]any{"w": int64(7)}}, "b": map[string]any{"w": int64(8)}}
+		want := map[string]any{"a": map[string]any{"i": map[string]any{"w": int64(7)}}, "b": map[string]any{"w": int64(8)}, "added": "x"}
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Seen-parity, map arm: a KEYLESS definition arriving INSIDE a
+	// spliced subtree (as-written, no name key) must register its
+	// parser fullname "n." during the walk, or the later "n." reference
+	// splices a SECOND copy and the duplicate-rejecting rebuild degrades
+	// the metadata to the dangling original.
+	t.Run("ns/nested-keyless-diamond", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":"X","namespace":"n","fields":[{"name":"k","type":{"type":"record","fields":[{"name":"f","type":"long"}]}}]}`, lax); err != nil {
+			t.Fatalf("nested keyless define: %v", err)
+		}
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"n.X"},{"name":"b","type":"n."}]}`)
+		if err != nil {
+			t.Fatalf("diamond reference parse: %v", err)
+		}
+		nc := reparseNameClass{"nested-keyless", "n", "", "n.", lax}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"X","namespace":"n","fields":[{"name":"k","type":{"type":"record","fields":[{"name":"f","type":"long"}]}}]}},{"name":"b","type":"n."}]}`
+		in := map[string]any{"a": map[string]any{"k": map[string]any{"f": int64(7)}}, "b": map[string]any{"f": int64(8)}}
+		want := map[string]any{"a": map[string]any{"k": map[string]any{"f": int64(7)}}, "b": map[string]any{"f": int64(8)}, "added": "x"}
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Seen-parity, flat-field arm: the keyless definition is spelled as
+	// a FLAT field (goavro-style, no field name either — the lift
+	// produces the keyless type). The parse-1 pins lock the flat
+	// keyless lift end-to-end: canonical form, the metadata walker's
+	// keyless handling, and the empty-string field name on the wire.
+	t.Run("ns/flat-keyless", func(t *testing.T) {
+		var c avro.SchemaCache
+		s1, err := c.Parse(`{"type":"record","name":"X","namespace":"n","fields":[{"type":"record","fields":[{"name":"f","type":"long"}]}]}`, lax)
+		if err != nil {
+			t.Fatalf("flat keyless define: %v", err)
+		}
+		wantCanon := `{"name":"n.X","type":"record","fields":[{"name":"","type":{"name":"n.","type":"record","fields":[{"name":"f","type":"long"}]}}]}`
+		if got := string(s1.Canonical()); got != wantCanon {
+			t.Errorf("flat keyless canonical:\n got %s\nwant %s", got, wantCanon)
+		}
+		f0 := s1.Root().Fields[0]
+		if f0.Name != "" || f0.Type.Type != "record" || f0.Type.Name != "" || f0.Type.Namespace != "n" || len(f0.Type.Fields) != 1 || f0.Type.Fields[0].Name != "f" {
+			t.Errorf("Root() flat keyless field: got name=%q type=%q typeName=%q ns=%q fields=%v", f0.Name, f0.Type.Type, f0.Type.Name, f0.Type.Namespace, f0.Type.Fields)
+		}
+		wire1, err := s1.Encode(map[string]any{"": map[string]any{"f": int64(7)}})
+		if err != nil {
+			t.Fatalf("encode by empty field name: %v", err)
+		}
+		if !bytes.Equal(wire1, []byte{0x0e}) {
+			t.Errorf("flat keyless wire: got %x, want 0e", wire1)
+		}
+
+		writer, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"n."}]}`)
+		if err != nil {
+			t.Fatalf("reference parse: %v", err)
+		}
+		nc := reparseNameClass{"flat-keyless", "n", "", "n.", lax}
+		twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"","namespace":"n","fields":[{"name":"f","type":"long"}]}}]}`
+		in := map[string]any{"a": map[string]any{"f": int64(7)}}
+		want := map[string]any{"a": map[string]any{"f": int64(7)}, "added": "x"}
+		runReparseBattery(t, nc, writer, twinJSON, in, want)
+	})
+
+	// Same-string lax re-parse: the second parse re-enters the builder
+	// with the first parse's defs in the cache, so its splice walk sees
+	// the LOCAL keyless definition after splicing the (identical)
+	// inherited one at the forward reference — dupDefRef must rewrite
+	// the local keyless definition to its dotted reference, keeping the
+	// canonical forms byte-stable across the two parses.
+	t.Run("samestring-reparse", func(t *testing.T) {
+		src := `{"type":"record","name":"Top","fields":[{"name":"a","type":["null","x."]},{"name":"b","type":{"type":"record","namespace":"x","fields":[{"name":"f","type":"long"}]}}]}`
+		var c avro.SchemaCache
+		s1, err := c.Parse(src, lax)
+		if err != nil {
+			t.Fatalf("parse-1: %v", err)
+		}
+		s2, err := c.Parse(src, lax)
+		if err != nil {
+			t.Fatalf("parse-2 (same string): %v", err)
+		}
+		if !bytes.Equal(s1.Canonical(), s2.Canonical()) {
+			t.Errorf("canonical unstable across same-string re-parse:\n s1: %s\n s2: %s", s1.Canonical(), s2.Canonical())
+		}
+		twin, err := avro.Parse(src, lax)
+		if err != nil {
+			t.Fatalf("twin parse: %v", err)
+		}
+		if !bytes.Equal(s2.Canonical(), twin.Canonical()) {
+			t.Errorf("canonical diverges from directly-parsed twin:\n got: %s\nwant: %s", s2.Canonical(), twin.Canonical())
+		}
+		if _, err := avro.Parse(s2.String(), lax); err != nil {
+			t.Fatalf("String() must re-parse: %v\nString(): %s", err, s2.String())
+		}
+		// The splice route is pinned structurally, not just coherently:
+		// the parser bound the forward reference at field a to the CACHED
+		// type (eager), so the faithful metadata materializes the
+		// definition there and field b — the local re-definition of the
+		// same fullname — becomes the dotted reference (dupDefRef on a
+		// keyless definition). A fallback to the as-written text would
+		// also be value-coherent here (same string, identical defs) but
+		// would invert the binding structure the wire used.
+		if !strings.Contains(s2.String(), `{"name":"b","type":"x."}`) {
+			t.Errorf("String() does not carry the dupDefRef-rewritten reference at field b:\n%s", s2.String())
+		}
+		in := map[string]any{"a": map[string]any{"f": int64(7)}, "b": map[string]any{"f": int64(8)}}
+		w1, err := s1.Encode(in)
+		if err != nil {
+			t.Fatalf("s1 encode: %v", err)
+		}
+		w2, err := s2.Encode(in)
+		if err != nil {
+			t.Fatalf("s2 encode: %v", err)
+		}
+		if !bytes.Equal(w1, w2) {
+			t.Errorf("wire bytes diverge across same-string re-parse: %x vs %x", w1, w2)
+		}
+	})
+}
+
+// Class matrix for LEADING-DOT names (AUDIT_PATTERNS.md B7 third
+// instance). A single leading dot with no other dot is the explicit
+// null-namespace escape: {"name":".x"} builds as name "x" in the null
+// namespace and "." collapses to the bare empty name "" — the rule
+// qualifyAliases already applies to aliases and Java's Name constructor
+// applies to every name (Schema.java ~1455: lastDot split; `if
+// ("".equals(space)) space = null`). Lax-only: strict parses still
+// reject the empty leading component (twmb stays stricter than Java —
+// documented, not widened). fastavro 1.12.2 holds a THIRD posture,
+// executed 2026-07-14: it keeps ".x" VERBATIM in PCF (rabin
+// c69859279c1a5fbe) and rejects the bare-"x" reference (UnknownType)
+// while still scoping children in the null namespace; twmb follows
+// Java's normalized identity instead, so post-fix PCF/fingerprints for
+// the lax-only ".x" spelling match Java and diverge from fastavro
+// (pre-fix twmb matched fastavro's bytes on definition-only shapes but
+// was SELF-inconsistent on references: a bare sibling ref inside ".x"
+// could not parse at all).
+//
+//	{".x" definition x reference spelling {"x", ".x"} x cross-parse
+//	 x {pure reference, reference-then-define, define-then-reference}}
+//	plus same-parse spelling-equivalence cells (both orders, both ref
+//	spellings), the "." -> empty-name family cell (joins NOT_BUGS #60's
+//	adjudicated behavior numerically), a multi-dot verbatim control
+//	(".a.b" — all three implementations agree), and the
+//	Root()/nodeFullnameTree/parser agreement cell.
+func TestMatrix_LeadingDotNameNormalization(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	lax := avro.WithLaxNames(acceptAll)
+	const dotXDef = `{"type":"record","name":".x","fields":[{"name":"w","type":"long"}]}`
+
+	// Cross-parse reference, both spellings: definition ".x" and
+	// references "x" / ".x" all denote the null-namespace fullname "x",
+	// so the splice fires and the spliced form (name "x") is
+	// strict-parseable.
+	for _, ref := range []string{"x", ".x"} {
+		t.Run("crossref/"+strings.ReplaceAll(ref, ".", "dot"), func(t *testing.T) {
+			var c avro.SchemaCache
+			if _, err := c.Parse(dotXDef, lax); err != nil {
+				t.Fatalf("leading-dot define: %v", err)
+			}
+			writer, err := c.Parse(fmt.Sprintf(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":%q}]}`, ref))
+			if err != nil {
+				t.Fatalf("reference parse (%q): %v", ref, err)
+			}
+			nc := reparseNameClass{"leadingdot", "", "x", "x", nil}
+			twinJSON := `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}}]}`
+			in := map[string]any{"a": map[string]any{"w": int64(7)}}
+			want := map[string]any{"a": map[string]any{"w": int64(7)}, "added": "x"}
+			runReparseBattery(t, nc, writer, twinJSON, in, want)
+		})
+	}
+
+	// Reference-then-define and define-then-reference with a LOCAL "x"
+	// definition: ".x" now IS the fullname "x", so the local
+	// re-definition duplicates the cache-inherited name in either order
+	// and with either reference spelling — the parser's standard
+	// conflict rejection, same as every other same-fullname family.
+	for _, order := range []struct{ key, src string }{
+		{"refdefine/x", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":"x"},{"name":"b","type":{"type":"record","name":"x","fields":[{"name":"z","type":"string"}]}}]}`},
+		{"refdefine/dotx", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":".x"},{"name":"b","type":{"type":"record","name":"x","fields":[{"name":"z","type":"string"}]}}]}`},
+		{"definref", `{"type":"record","name":"Outer2","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"z","type":"string"}]}},{"name":"b","type":"x"}]}`},
+	} {
+		t.Run(order.key, func(t *testing.T) {
+			var c avro.SchemaCache
+			if _, err := c.Parse(dotXDef, lax); err != nil {
+				t.Fatalf("leading-dot define: %v", err)
+			}
+			_, err := c.Parse(order.src)
+			if err == nil {
+				t.Fatal("local re-definition of the cache-inherited fullname x unexpectedly parsed")
+			}
+			if !strings.Contains(err.Error(), `duplicate named type "x"`) {
+				t.Errorf("rejection shape changed: %v", err)
+			}
+		})
+	}
+
+	// Same-parse spelling equivalence: the ".x" spelling and the plain
+	// "x" spelling are one type, in both definition positions and both
+	// reference directions (backward and forward). The twin is the same
+	// schema spelled plainly; canonical, fingerprint, and wire bytes
+	// must be identical.
+	for _, cell := range []struct{ key, src, twin string }{
+		{"sameparse/definref", `{"type":"record","name":"Top","fields":[{"name":"a","type":` + dotXDef + `},{"name":"b","type":"x"}]}`,
+			`{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}},{"name":"b","type":"x"}]}`},
+		{"sameparse/refdefine", `{"type":"record","name":"Top","fields":[{"name":"a","type":"x"},{"name":"b","type":` + dotXDef + `}]}`,
+			`{"type":"record","name":"Top","fields":[{"name":"a","type":"x"},{"name":"b","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}}]}`},
+		{"sameparse/dotx-ref", `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}},{"name":"b","type":".x"}]}`,
+			`{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}},{"name":"b","type":"x"}]}`},
+	} {
+		t.Run(cell.key, func(t *testing.T) {
+			writer, err := avro.Parse(cell.src, lax)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			nc := reparseNameClass{"leadingdot-sameparse", "", "x", "x", lax}
+			in := map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}}
+			want := map[string]any{"a": map[string]any{"w": int64(7)}, "b": map[string]any{"w": int64(8)}, "added": "x"}
+			runReparseBattery(t, nc, writer, cell.twin, in, want)
+		})
+	}
+
+	// "." collapses into the adjudicated empty-name family (NOT_BUGS
+	// #60): its canonical form and Rabin fingerprint are byte-identical
+	// to the bare {"name":""} definition's — 3d741707ff4bfa45 is the
+	// fastavro-EXECUTED value pinned for that family — and the type
+	// stays unreferenceable in EVERY spelling: the "" reference is
+	// structurally rejected (pinned in
+	// TestMatrix_InternalReparseBareEmptyName) and the "." reference
+	// finds nothing to bind, same-parse and cross-parse. fastavro
+	// 1.12.2 keeps "." verbatim in PCF (executed 2026-07-14: rabin
+	// b1eae635ed69c128) — the same verbatim-identity divergence as the
+	// ".x" root, documented not adopted.
+	t.Run("dot-family", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"record","name":".","fields":[{"name":"f","type":"long"}]}`, lax)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		wantCanon := `{"name":"","type":"record","fields":[{"name":"f","type":"long"}]}`
+		if got := string(s.Canonical()); got != wantCanon {
+			t.Errorf("canonical:\n got %s\nwant %s", got, wantCanon)
+		}
+		if got, want := s.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, "3d741707ff4bfa45"); !bytes.Equal(got, want) {
+			t.Errorf("rabin: got %x, want %x (the #60 family value)", got, want)
+		}
+		twin, err := avro.Parse(`{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}`, lax)
+		if err != nil {
+			t.Fatalf("twin parse: %v", err)
+		}
+		if !bytes.Equal(s.Canonical(), twin.Canonical()) {
+			t.Errorf("canonical diverges from the {\"name\":\"\"} twin:\n got: %s\nwant: %s", s.Canonical(), twin.Canonical())
+		}
+		in := map[string]any{"f": int64(7)}
+		wire, err := s.Encode(in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		wireTwin, err := twin.Encode(in)
+		if err != nil {
+			t.Fatalf("twin encode: %v", err)
+		}
+		if !bytes.Equal(wire, wireTwin) {
+			t.Errorf("wire bytes diverge from the {\"name\":\"\"} twin: %x vs %x", wire, wireTwin)
+		}
+		// Unreferenceable in the "." spelling, same-parse and cross-parse.
+		if _, err := avro.Parse(`{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"record","name":".","fields":[{"name":"f","type":"long"}]}},{"name":"b","type":"."}]}`, lax); err == nil {
+			t.Error(`same-parse "." reference unexpectedly bound`)
+		} else if !strings.Contains(err.Error(), `unknown type "."`) {
+			t.Errorf("same-parse rejection shape changed: %v", err)
+		}
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":".","fields":[{"name":"f","type":"long"}]}`, lax); err != nil {
+			t.Fatalf("cache define: %v", err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"a","type":"."}]}`); err == nil {
+			t.Error(`cross-parse "." reference unexpectedly bound`)
+		} else if !strings.Contains(err.Error(), `unknown type "."`) {
+			t.Errorf("cross-parse rejection shape changed: %v", err)
+		}
+	})
+
+	// Multi-dot control: the escape is ONLY the single leading dot.
+	// ".a.b" keeps its verbatim identity (namespace ".a") — Java's Name
+	// ctor keeps any non-empty space, and fastavro's executed PCF
+	// agrees byte-for-byte (rabin 013f503d468af517, 2026-07-14) — a
+	// three-way agreement cell pinning the boundary of the rule.
+	t.Run("multidot-verbatim", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"record","name":".a.b","fields":[{"name":"f","type":"long"}]}`, lax)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		wantCanon := `{"name":".a.b","type":"record","fields":[{"name":"f","type":"long"}]}`
+		if got := string(s.Canonical()); got != wantCanon {
+			t.Errorf("canonical:\n got %s\nwant %s", got, wantCanon)
+		}
+		if got, want := s.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, "013f503d468af517"); !bytes.Equal(got, want) {
+			t.Errorf("rabin: got %x, want %x (fastavro-executed)", got, want)
+		}
+		re, err := avro.Parse(string(s.Canonical()), lax)
+		if err != nil {
+			t.Fatalf("canonical re-parse under accept-all: %v", err)
+		}
+		if !bytes.Equal(re.Canonical(), s.Canonical()) {
+			t.Errorf("canonical not idempotent:\n re %s\ngot %s", re.Canonical(), s.Canonical())
+		}
+	})
+
+	// Agreement cell: the metadata walkers, the cache walkers, and the
+	// parser now agree on the ".x" identity. SchemaNode preserves the
+	// as-written spellings (Name ".x" on the definition, Type ".x" on
+	// the reference) while every computed identity — canonical form,
+	// name-ref binding, the Schema() rebuild's dedup/cycle emission —
+	// resolves to the fullname "x".
+	t.Run("agreement", func(t *testing.T) {
+		writer, err := avro.Parse(`{"type":"record","name":"Top","fields":[{"name":"k","type":`+dotXDef+`},{"name":"r","type":".x"}]}`, lax)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		twin, err := avro.Parse(`{"type":"record","name":"Top","fields":[{"name":"k","type":{"type":"record","name":"x","fields":[{"name":"w","type":"long"}]}},{"name":"r","type":"x"}]}`)
+		if err != nil {
+			t.Fatalf("twin parse: %v", err)
+		}
+		if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+			t.Errorf("canonical diverges from the plain-spelled twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+		}
+		root := writer.Root()
+		if got := root.Fields[0].Type.Name; got != ".x" {
+			t.Errorf("Root() definition Name: got %q, want the as-written %q", got, ".x")
+		}
+		if got := root.Fields[1].Type.Type; got != ".x" {
+			t.Errorf("Root() reference Type: got %q, want the as-written %q", got, ".x")
+		}
+		rebuilt, err := root.Schema(lax)
+		if err != nil {
+			t.Fatalf("Root().Schema() rebuild: %v", err)
+		}
+		if !bytes.Equal(rebuilt.Canonical(), writer.Canonical()) {
+			t.Errorf("Schema() rebuild canonical diverges:\n got: %s\nwant: %s", rebuilt.Canonical(), writer.Canonical())
+		}
+	})
+}
+
+// nameOnlyOpts returns the schema opts for a class's name validator
+// alone (nil for strict), shared by the reparse batteries' twin/reader
+// parses.
+func nameOnlyOpts(nc reparseNameClass) []avro.SchemaOpt {
+	if nc.opt != nil {
+		return []avro.SchemaOpt{nc.opt}
+	}
+	return nil
+}
+
+// reparseAddedReader derives the reader schema for a battery cell by
+// appending a defaulted top-level field to the twin's JSON.
+func reparseAddedReader(twinJSON string) string {
+	i := strings.LastIndex(twinJSON, "]")
+	return twinJSON[:i] + `,{"name":"added","type":"string","default":"x"}` + twinJSON[i:]
+}
+
+// runReparseBattery parses the twin and reader from twinJSON under the
+// class's name opts and runs the shared battery against writer.
+func runReparseBattery(t *testing.T, nc reparseNameClass, writer *avro.Schema, twinJSON string, in, want map[string]any) {
+	t.Helper()
+	twin, err := avro.Parse(twinJSON, nameOnlyOpts(nc)...)
+	if err != nil {
+		t.Fatalf("twin parse: %v", err)
+	}
+	reader, err := avro.Parse(reparseAddedReader(twinJSON), nameOnlyOpts(nc)...)
+	if err != nil {
+		t.Fatalf("reader parse: %v", err)
+	}
+	battery(t, nc, writer, twin, reader, in, nil, want)
+}
+
+// battery runs the shared per-cell assertions for the reparse matrices.
+// writer is the schema under test (plain-parsed or cache-parsed, possibly
+// custom-typed); twin is the independent oracle: the same self-contained
+// schema text parsed directly with the name opt only. reader adds a
+// defaulted field.
+func battery(t *testing.T, nc reparseNameClass, writer, twin, reader *avro.Schema, in, inCt, want map[string]any) {
+	t.Helper()
+	// Names pass through verbatim.
+	if canon := string(writer.Canonical()); !strings.Contains(canon, `"`+nc.full+`"`) {
+		t.Errorf("canonical does not carry fullname %q verbatim: %s", nc.full, canon)
+	}
+	// String()/Canonical() re-parse self-contained under the user's
+	// validator, preserving canonical identity.
+	re, err := avro.Parse(writer.String(), nameOnlyOpts(nc)...)
+	if err != nil {
+		t.Fatalf("String() re-parse: %v\nString(): %s", err, writer.String())
+	}
+	if !bytes.Equal(re.Canonical(), writer.Canonical()) {
+		t.Errorf("String() re-parse canonical diverges:\n re: %s\ngot: %s", re.Canonical(), writer.Canonical())
+	}
+	reC, err := avro.Parse(string(writer.Canonical()), nameOnlyOpts(nc)...)
+	if err != nil {
+		t.Fatalf("Canonical() re-parse: %v\nCanonical(): %s", err, writer.Canonical())
+	}
+	if !bytes.Equal(reC.Canonical(), writer.Canonical()) {
+		t.Errorf("Canonical() re-parse not idempotent:\n re: %s\ngot: %s", reC.Canonical(), writer.Canonical())
+	}
+	// Parity with the twin: canonical, fingerprint, wire bytes.
+	if !bytes.Equal(writer.Canonical(), twin.Canonical()) {
+		t.Errorf("canonical diverges from twin:\n got: %s\nwant: %s", writer.Canonical(), twin.Canonical())
+	}
+	if fp, fpTwin := writer.Fingerprint(avro.NewRabin()), twin.Fingerprint(avro.NewRabin()); !bytes.Equal(fp, fpTwin) {
+		t.Errorf("rabin fingerprint diverges from twin: %x vs %x", fp, fpTwin)
+	}
+	wire, err := writer.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	wireTwin, err := twin.Encode(in)
+	if err != nil {
+		t.Fatalf("twin encode: %v", err)
+	}
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from twin: %x vs %x", wire, wireTwin)
+	}
+	if inCt != nil {
+		wireCt, err := writer.Encode(inCt)
+		if err != nil {
+			t.Fatalf("custom-typed encode: %v", err)
+		}
+		if !bytes.Equal(wireCt, wire) {
+			t.Errorf("custom-typed input wire bytes diverge: %x vs %x", wireCt, wire)
+		}
+	}
+	// Resolve survives, then binary decode and resolved DecodeJSON agree
+	// on the exact expected value (writer-shaped JSON from the twin).
+	resolved, err := avro.Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	var viaBinary map[string]any
+	if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+		t.Fatalf("resolved binary decode: %v", err)
+	}
+	if !reflect.DeepEqual(viaBinary, want) {
+		t.Errorf("resolved binary decode: got %#v, want %#v", viaBinary, want)
+	}
+	wjson, err := twin.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("twin EncodeJSON: %v", err)
+	}
+	var viaJSON map[string]any
+	if err := resolved.DecodeJSON(wjson, &viaJSON); err != nil {
+		t.Fatalf("resolved DecodeJSON(%s): %v", wjson, err)
+	}
+	if !reflect.DeepEqual(viaJSON, want) {
+		t.Errorf("resolved DecodeJSON: got %#v, want %#v", viaJSON, want)
+	}
+}
+
+// fastavroRabinBytes converts a fastavro-printed CRC-64-AVRO fingerprint
+// (LITTLE-endian hex — fastavro prints the single-object wire order) to the
+// BIG-endian byte order Schema.Fingerprint(NewRabin()) returns, so pins
+// compare BYTES rather than presentation. The 64-bit value is the same one;
+// only the order differs.
+func fastavroRabinBytes(t *testing.T, leHex string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(leHex)
+	if err != nil {
+		t.Fatalf("bad hex %q: %v", leHex, err)
+	}
+	slices.Reverse(b)
+	return b
+}
+
+// Canonical-form parity for the empty-name classes against EXECUTED
+// fastavro 1.12.2 (2026-07-09): every twmb Canonical() must byte-match
+// fastavro's PCF and Rabin fingerprint for {class} × {position}, and
+// re-parse under the user's accept-all validator. The reference-position
+// bare cell is a DOCUMENTED DIVERGENCE: twmb structurally rejects the ""
+// reference spelling upstream of any validator, while fastavro accepts it
+// (its PCF keeps the bare "" ref; rabin f9afa0dabf6cd566) — pinned as
+// twmb's rejection. Forward references are twmb-only territory (fastavro
+// rejects ALL forward references — executed: UnknownType), so the fwd-ref
+// cell pins twmb's Java-rule first-occurrence form with no fastavro
+// comparison.
+func TestMatrix_CanonicalEmptyNameFastavroParity(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	const (
+		bareDef = `{"type":"record","name":"","fields":[{"name":"f","type":"long"}]}`
+		okDef   = `{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"}]}`
+		abDef   = `{"type":"record","name":"R","namespace":"a..b","fields":[{"name":"f","type":"long"}]}`
+	)
+	nested := func(def string) string {
+		return `{"type":"record","name":"Top","fields":[{"name":"a","type":` + def + `}]}`
+	}
+	diamond := func(def, ref string) string {
+		return `{"type":"record","name":"Top","fields":[{"name":"a","type":` + def + `},{"name":"b","type":"` + ref + `"}]}`
+	}
+	cells := []struct {
+		key       string
+		schema    string
+		wantPCF   string // fastavro's executed PCF, byte-for-byte
+		rabinLEHx string // fastavro's executed fingerprint (little-endian hex)
+	}{
+		{"root/bare", bareDef,
+			`{"name":"","type":"record","fields":[{"name":"f","type":"long"}]}`, "3d741707ff4bfa45"},
+		{"root/ok", okDef,
+			`{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"}]}`, "6cfba61a610c50c2"},
+		{"root/ab", abDef,
+			`{"name":"a..b.R","type":"record","fields":[{"name":"f","type":"long"}]}`, "cad3b2bee0fed6fa"},
+		{"nested/bare", nested(bareDef),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"","type":"record","fields":[{"name":"f","type":"long"}]}}]}`, "c5948d734d487874"},
+		{"nested/ok", nested(okDef),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"}]}}]}`, "0c2a9622507ffbc7"},
+		{"nested/ab", nested(abDef),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"a..b.R","type":"record","fields":[{"name":"f","type":"long"}]}}]}`, "493fc67a41ba56e9"},
+		{"reference/ok", diamond(okDef, "ok."),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"}]}},{"name":"b","type":"ok."}]}`, "3801ed908d3951d8"},
+		{"reference/ab", diamond(abDef, "a..b.R"),
+			`{"name":"Top","type":"record","fields":[{"name":"a","type":{"name":"a..b.R","type":"record","fields":[{"name":"f","type":"long"}]}},{"name":"b","type":"a..b.R"}]}`, "b6e281b385d18d8c"},
+		{"recursive/ok", `{"type":"record","name":"","namespace":"ok","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","ok."]}]}`,
+			`{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"},{"name":"next","type":["null","ok."]}]}`, "fe8d701fc807f4ec"},
+	}
+	for _, c := range cells {
+		t.Run(c.key, func(t *testing.T) {
+			s, err := avro.Parse(c.schema, avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if got := string(s.Canonical()); got != c.wantPCF {
+				t.Errorf("canonical vs fastavro PCF:\n got %s\nwant %s", got, c.wantPCF)
+			}
+			if got, want := s.Fingerprint(avro.NewRabin()), fastavroRabinBytes(t, c.rabinLEHx); !bytes.Equal(got, want) {
+				t.Errorf("rabin bytes vs fastavro: got %x, want %x", got, want)
+			}
+			re, err := avro.Parse(string(s.Canonical()), avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("canonical re-parse under accept-all: %v", err)
+			}
+			if !bytes.Equal(re.Canonical(), s.Canonical()) {
+				t.Errorf("canonical not idempotent:\n re %s\ngot %s", re.Canonical(), s.Canonical())
+			}
+		})
+	}
+
+	// Documented divergence: the "" reference spelling. twmb rejects it
+	// structurally (a field type must be a primitive, complex, or union);
+	// fastavro accepts and resolves it (executed: PCF keeps the bare ""
+	// ref, rabin f9afa0dabf6cd566). Pinned as the rejection.
+	t.Run("reference/bare-divergence", func(t *testing.T) {
+		_, err := avro.Parse(diamond(bareDef, ""), avro.WithLaxNames(acceptAll))
+		if err == nil {
+			t.Fatal(`"" reference unexpectedly accepted (divergence pin flipped — recalibrate against fastavro)`)
+		}
+		if !strings.Contains(err.Error(), "not a primitive") {
+			t.Errorf("rejection shape changed: %v", err)
+		}
+	})
+
+	// Forward reference to the empty-named type: twmb-only (fastavro
+	// rejects every forward reference — executed: UnknownType "ok.").
+	// Java's first-occurrence rule: the full body is emitted at the FIRST
+	// walk occurrence (the referencing field), a bare fullname afterward.
+	t.Run("fwdref/ok", func(t *testing.T) {
+		s, err := avro.Parse(`{"type":"record","name":"Top","fields":[{"name":"b","type":"ok."},{"name":"a","type":`+okDef+`}]}`, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		want := `{"name":"Top","type":"record","fields":[{"name":"b","type":{"name":"ok.","type":"record","fields":[{"name":"f","type":"long"}]}},{"name":"a","type":"ok."}]}`
+		if got := string(s.Canonical()); got != want {
+			t.Errorf("fwd-ref first-occurrence canonical:\n got %s\nwant %s", got, want)
+		}
+		if _, err := avro.Parse(string(s.Canonical()), avro.WithLaxNames(acceptAll)); err != nil {
+			t.Fatalf("canonical re-parse: %v", err)
+		}
+	})
+}
+
+// Tagged-union JSON naming for an EMPTY-NAMED union branch (short name ""
+// with and without a namespace — reachable only under a user WithLaxNames
+// fn). The tag is the branch's FULLNAME, exactly as for any other named
+// branch: "ok." for the namespaced class and "" for the bare class —
+// matching fastavro's json_writer (1.12.2, executed: `{"ok.": "A"}`; its
+// reader resolves only that exact key, rejecting "" and the kind name).
+// fastavro cannot WRITE the bare class (its writer errors "No key was set"
+// on the falsy fullname) but its reader accepts the "" key, so twmb's
+// `{"":"A"}` emission is fastavro-readable on both classes.
+//
+//	{class: bare "", namespaced "ok."}
+//	  x {tagged encode emission (exact bytes),
+//	     decode of own emission (plain and TaggedUnions),
+//	     tagged-map encode routing (fullname key; "" short-name fallback),
+//	     resolved DecodeJSON routing (per-branch-divergent resolution)}
+func TestMatrix_EmptyNameTaggedUnion(t *testing.T) {
+	acceptAll := func(string) error { return nil }
+	for _, tc := range []struct {
+		class    string
+		schema   string
+		wantTag  string // exact tagged EncodeJSON output for symbol "A"
+		mapKeys  []string
+		rejected []string
+	}{
+		{
+			class:   "ok",
+			schema:  `["null",{"type":"enum","name":"","namespace":"ok","symbols":["A","B"]}]`,
+			wantTag: `{"ok.":"A"}`,
+			// The "" key routes via the unique-short-name fallback
+			// (unqualified("ok.") is ""), the same input leniency every
+			// namespaced branch's short name gets; the kind never tags a
+			// named branch (goavro/Java: the envelope key is the fullname).
+			mapKeys:  []string{"ok.", ""},
+			rejected: []string{"enum"},
+		},
+		{
+			class:    "bare",
+			schema:   `["null",{"type":"enum","name":"","symbols":["A","B"]}]`,
+			wantTag:  `{"":"A"}`,
+			mapKeys:  []string{""},
+			rejected: []string{"ok.", "enum"},
+		},
+	} {
+		t.Run(tc.class, func(t *testing.T) {
+			s, err := avro.Parse(tc.schema, avro.WithLaxNames(acceptAll))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+
+			got, err := s.EncodeJSON("A", avro.TaggedUnions())
+			if err != nil {
+				t.Fatalf("tagged EncodeJSON: %v", err)
+			}
+			if string(got) != tc.wantTag {
+				t.Errorf("tagged emission: got %s, want %s", got, tc.wantTag)
+			}
+
+			var plain any
+			if err := s.DecodeJSON(got, &plain); err != nil {
+				t.Errorf("plain decode of own tagged emission: %v", err)
+			} else if plain != "A" {
+				t.Errorf("plain decode: got %#v, want %q", plain, "A")
+			}
+			wantKey := "ok."
+			if tc.class == "bare" {
+				wantKey = ""
+			}
+			var tagged any
+			if err := s.DecodeJSON(got, &tagged, avro.TaggedUnions()); err != nil {
+				t.Errorf("tagged decode of own tagged emission: %v", err)
+			} else if !reflect.DeepEqual(tagged, map[string]any{wantKey: "A"}) {
+				t.Errorf("tagged decode: got %#v, want map[%q:A]", tagged, wantKey)
+			}
+
+			wire, err := s.Encode("A")
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			for _, key := range tc.mapKeys {
+				in := map[string]any{key: "A"}
+				bin, err := s.Encode(in)
+				if err != nil {
+					t.Errorf("binary Encode(map[%q]): %v", key, err)
+				} else if !bytes.Equal(bin, wire) {
+					t.Errorf("binary Encode(map[%q]): wire %x, want %x", key, bin, wire)
+				}
+				j, err := s.EncodeJSON(in, avro.TaggedUnions())
+				if err != nil {
+					t.Errorf("tagged EncodeJSON(map[%q]): %v", key, err)
+				} else if string(j) != tc.wantTag {
+					t.Errorf("tagged EncodeJSON(map[%q]): got %s, want %s", key, j, tc.wantTag)
+				}
+			}
+			for _, key := range tc.rejected {
+				if _, err := s.Encode(map[string]any{key: "A"}); err == nil {
+					t.Errorf("binary Encode(map[%q]) unexpectedly accepted", key)
+				}
+			}
+		})
+	}
+
+	// Resolved DecodeJSON keeps the empty-named branch's identity through
+	// the tagged intermediate: the writer names the enum branch whose value
+	// "B" would ALSO satisfy the string branch, and the reader's enum drops
+	// "B" for its declared default — so a routing flip is observable both
+	// as branch identity and as the resolved value.
+	t.Run("resolved-routing", func(t *testing.T) {
+		w, err := avro.Parse(`["null",{"type":"enum","name":"","namespace":"ok","symbols":["A","B"]},"string"]`, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("parse writer: %v", err)
+		}
+		r, err := avro.Parse(`["null","string",{"type":"enum","name":"","namespace":"ok","symbols":["A"],"default":"A"}]`, avro.WithLaxNames(acceptAll))
+		if err != nil {
+			t.Fatalf("parse reader: %v", err)
+		}
+		resolved, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		wire, err := w.Encode(map[string]any{"ok.": "B"})
+		if err != nil {
+			t.Fatalf("writer encode: %v", err)
+		}
+		var viaBinary, viaJSON any
+		if _, err := resolved.Decode(wire, &viaBinary); err != nil {
+			t.Fatalf("resolved binary decode: %v", err)
+		}
+		if err := resolved.DecodeJSON([]byte(`{"ok.": "B"}`), &viaJSON); err != nil {
+			t.Fatalf("resolved DecodeJSON: %v", err)
+		}
+		if viaBinary != "A" || viaJSON != "A" {
+			t.Errorf("resolved enum-default routing: binary %#v, JSON %#v, want %q on both (string-branch flip would keep %q)", viaBinary, viaJSON, "A", "B")
+		}
+	})
+}
+
+// ---------- resolve_custom_record_test.go ----------
+
+// A record-level CustomType (AvroType:"record") Decode callback fires on a
+// direct Decode (applyCustomTypes wires record nodes at build time). It must
+// also fire through a resolved (writer→reader) decode: resolveRecord builds a
+// fresh node, and unless it re-applies the reader's custom wiring (as every
+// other resolve arm does), any real evolution silently returns the raw
+// map[string]any instead of the callback's converted value — a direct-vs-
+// resolved divergence. The callback is value-TRANSFORMING (wraps the value
+// under a marker key) so "fired" is distinguishable from "raw passthrough".
+func TestRegression_RecordCustomTypeThroughResolve(t *testing.T) {
+	const marker = "WRAPPED_BY_CUSTOM"
+	newCT := func() avro.CustomType {
+		return avro.CustomType{
+			AvroType: "record",
+			Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+				return map[string]any{marker: v}, nil
+			},
+		}
+	}
+
+	readerJSON := `{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},{"name":"b","type":"string"}]}`
+
+	// Each writer schema is compatible with the reader but has a different
+	// canonical form, so Resolve builds a real resolving decoder (the
+	// canonical-equality fast path that returns the reader as-is is bypassed).
+	writers := map[string]string{
+		"reorder": `{"type":"record","name":"R","fields":[
+			{"name":"b","type":"string"},{"name":"a","type":"int"}]}`,
+		"drop_extra_writer_field": `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"},{"name":"b","type":"string"},{"name":"c","type":"long"}]}`,
+		"add_reader_default": `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"}]}`, // reader's "b" filled from... needs a default
+	}
+
+	// Control: a direct decode fires the custom (proves the harness + callback).
+	reader := avro.MustParse(readerJSON, newCT())
+	wireDirect, err := reader.AppendEncode(nil, map[string]any{"a": int32(1), "b": "x"})
+	if err != nil {
+		t.Fatalf("direct encode: %v", err)
+	}
+	var direct any
+	if _, err := reader.Decode(wireDirect, &direct); err != nil {
+		t.Fatalf("direct decode: %v", err)
+	}
+	if dm, ok := direct.(map[string]any); !ok || dm[marker] == nil {
+		t.Fatalf("control: record custom did not fire on DIRECT decode: %#v", direct)
+	}
+
+	for name, writerJSON := range writers {
+		t.Run(name, func(t *testing.T) {
+			// The "add_reader_default" case needs the reader's dropped-from-writer
+			// field to have a default; rebuild the reader accordingly.
+			rJSON := readerJSON
+			if name == "add_reader_default" {
+				rJSON = `{"type":"record","name":"R","fields":[
+					{"name":"a","type":"int"},{"name":"b","type":"string","default":"d"}]}`
+			}
+			r := avro.MustParse(rJSON, newCT())
+			w := avro.MustParse(writerJSON)
+			res, err := avro.Resolve(w, r)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+
+			val := map[string]any{"a": int32(1), "b": "x"}
+			if name == "drop_extra_writer_field" {
+				val["c"] = int64(9)
+			}
+			if name == "add_reader_default" {
+				delete(val, "b")
+			}
+			wire, err := w.AppendEncode(nil, val)
+			if err != nil {
+				t.Fatalf("writer encode: %v", err)
+			}
+
+			// Resolved binary decode must fire the custom.
+			var gotBin any
+			if _, err := res.Decode(wire, &gotBin); err != nil {
+				t.Fatalf("resolved binary decode: %v", err)
+			}
+			if m, ok := gotBin.(map[string]any); !ok || m[marker] == nil {
+				t.Fatalf("record custom DROPPED through resolved binary decode: %#v", gotBin)
+			}
+
+			// Resolved JSON decode (consumes writer-shaped JSON) must agree.
+			wireJSON, err := w.AppendEncodeJSON(nil, val)
+			if err != nil {
+				t.Fatalf("writer encodeJSON: %v", err)
+			}
+			var gotJSON any
+			if err := res.DecodeJSON(wireJSON, &gotJSON); err != nil {
+				t.Fatalf("resolved JSON decode: %v", err)
+			}
+			if m, ok := gotJSON.(map[string]any); !ok || m[marker] == nil {
+				t.Fatalf("record custom DROPPED through resolved JSON decode: %#v", gotJSON)
+			}
+		})
+	}
+}
+
+// A record-level custom must also fire through resolution of a RECURSIVE
+// (self-referential) record at every level: resolveNode's cycle placeholder
+// copies the resolved node's contents, so the custom wrap applied before the
+// copy must propagate to the inner recursive references.
+func TestRegression_RecursiveRecordCustomThroughResolve(t *testing.T) {
+	const marker = "WRAP"
+	ct := avro.CustomType{
+		AvroType: "record",
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return map[string]any{marker: v}, nil
+		},
+	}
+	// Reader reorders fields vs writer so Resolve builds a real resolving decoder.
+	reader := avro.MustParse(`{"type":"record","name":"LL","fields":[{"name":"v","type":"int"},{"name":"next","type":["null","LL"]}]}`, ct)
+	writer := avro.MustParse(`{"type":"record","name":"LL","fields":[{"name":"next","type":["null","LL"]},{"name":"v","type":"int"}]}`)
+	res, err := avro.Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	val := map[string]any{"v": int32(1), "next": map[string]any{"v": int32(2), "next": nil}}
+	wire, err := writer.AppendEncode(nil, val)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got any
+	if _, err := res.Decode(wire, &got); err != nil {
+		t.Fatalf("resolved decode: %v", err)
+	}
+	m, ok := got.(map[string]any)
+	if !ok || m[marker] == nil {
+		t.Fatalf("record custom dropped at outer level: %#v", got)
+	}
+	inner, ok := m[marker].(map[string]any)["next"].(map[string]any)
+	if !ok || inner[marker] == nil {
+		t.Fatalf("record custom dropped at inner recursive level: %#v", m[marker])
+	}
+}
+
+// Control: a non-custom resolved record decode must NOT grow a marker key — the
+// re-applied wiring is a no-op when no CustomType is registered.
+func TestResolvedRecordWithoutCustomIsUnwrapped(t *testing.T) {
+	r := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	w := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"b","type":"string"},{"name":"a","type":"int"}]}`)
+	res, err := avro.Resolve(w, r)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	wire, err := w.AppendEncode(nil, map[string]any{"a": int32(1), "b": "x"})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got map[string]any
+	if _, err := res.Decode(wire, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if fmt.Sprintf("%v", got["a"]) != "1" || got["b"] != "x" {
+		t.Fatalf("plain resolved record decode wrong: %#v", got)
+	}
+}
+
+// ---------- union_custom_pointer_reuse_test.go ----------
+
+// A CustomType whose Decode returns a POINTER, registered on a logical type at a
+// UNION branch, must decode identically on the binary and JSON wires even when
+// the decode target is reused and already holds a non-nil pointer (the
+// streaming-decode-into-a-reused-struct pattern). The binary union deser passes
+// the un-indirected target to the custom wrapper (setCustomResult assigns the
+// pointer into an interface / walks a pointer target); the JSON union decoder
+// pre-dereferenced a reused *T held in an interface before dispatching to the
+// branch, so the fresh pointer result was rejected ("cannot use T with Avro type
+// long") from the 2nd datum onward — a binary↔JSON divergence on a value the
+// binary path decodes fine. These pin per-branch indirection parity.
+
+type ucpEvent struct{ T time.Time }
+
+func ucpCustom() avro.CustomType {
+	return avro.CustomType{
+		LogicalType: "timestamp-millis",
+		AvroType:    "long",
+		GoType:      reflect.TypeFor[*ucpEvent](),
+		Decode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return &ucpEvent{T: time.UnixMilli(v.(int64)).UTC()}, nil
+		},
+		Encode: func(v any, _ *avro.SchemaNode) (any, error) {
+			return v.(*ucpEvent).T.UnixMilli(), nil
+		},
+	}
+}
+
+func TestRegression_UnionCustomDecodePointerReusedTargetParity(t *testing.T) {
+	const schema = `{"type":"record","name":"R","fields":[{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}]}`
+	s, err := avro.Parse(schema, avro.WithCustomType(ucpCustom()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	type Event struct {
+		When any `avro:"when"`
+	}
+	want := time.UnixMilli(1700000000000).UTC()
+	mk := func() Event { return Event{When: &ucpEvent{T: want}} }
+
+	// Pre-encode three identical datums on each wire.
+	var bin [][]byte
+	var jsn [][]byte
+	for i := 0; i < 3; i++ {
+		b, err := s.AppendEncode(nil, mk())
+		if err != nil {
+			t.Fatalf("binary encode %d: %v", i, err)
+		}
+		bin = append(bin, b)
+		j, err := s.AppendEncodeJSON(nil, mk())
+		if err != nil {
+			t.Fatalf("json encode %d: %v", i, err)
+		}
+		jsn = append(jsn, j)
+	}
+
+	check := func(name string, got Event, i int) {
+		ev, ok := got.When.(*ucpEvent)
+		if !ok {
+			t.Fatalf("%s datum %d: got %T, want *ucpEvent", name, i, got.When)
+		}
+		if !ev.T.Equal(want) {
+			t.Fatalf("%s datum %d: got %v want %v", name, i, ev.T, want)
+		}
+	}
+
+	// Reused target (the streaming pattern): the same struct value decoded into
+	// repeatedly, its any field carrying the prior *ucpEvent.
+	var evB Event
+	for i, b := range bin {
+		if _, err := s.Decode(b, &evB); err != nil {
+			t.Fatalf("binary decode (reused) %d: %v", i, err)
+		}
+		check("binary-reused", evB, i)
+	}
+	var evJ Event
+	for i, j := range jsn {
+		if err := s.DecodeJSON(j, &evJ); err != nil {
+			t.Fatalf("json decode (reused) %d: %v", i, err)
+		}
+		check("json-reused", evJ, i)
+	}
+
+	// Fresh nil-interface target (first decode) must also produce the *ucpEvent
+	// on both wires — the boundary the reuse case builds on.
+	var freshB, freshJ Event
+	if _, err := s.Decode(bin[0], &freshB); err != nil {
+		t.Fatalf("binary decode (fresh): %v", err)
+	}
+	check("binary-fresh", freshB, 0)
+	if err := s.DecodeJSON(jsn[0], &freshJ); err != nil {
+		t.Fatalf("json decode (fresh): %v", err)
+	}
+	check("json-fresh", freshJ, 0)
+
+	// TaggedUnions decode: the {branchName: value} envelope must wrap the custom
+	// result identically — and still survive target reuse — on both wires. The
+	// envelope value is the (pointer) custom result; assert it key-agnostically.
+	taggedVal := func(name string, v any) *ucpEvent {
+		m, ok := v.(map[string]any)
+		if !ok || len(m) != 1 {
+			t.Fatalf("%s: got %T (%v), want single-entry map envelope", name, v, v)
+		}
+		for _, e := range m {
+			ev, ok := e.(*ucpEvent)
+			if !ok {
+				t.Fatalf("%s: envelope value %T, want *ucpEvent", name, e)
+			}
+			return ev
+		}
+		return nil
+	}
+	var tagB, tagJ Event
+	for i := range bin {
+		if _, err := s.Decode(bin[i], &tagB, avro.TaggedUnions()); err != nil {
+			t.Fatalf("binary tagged decode %d: %v", i, err)
+		}
+		if err := s.DecodeJSON(jsn[i], &tagJ, avro.TaggedUnions()); err != nil {
+			t.Fatalf("json tagged decode %d: %v", i, err)
+		}
+		eb := taggedVal("binary-tagged", tagB.When)
+		ej := taggedVal("json-tagged", tagJ.When)
+		if !eb.T.Equal(want) || !ej.T.Equal(want) {
+			t.Fatalf("tagged %d: binary=%v json=%v want %v", i, eb.T, ej.T, want)
+		}
+	}
+}
+
+// A CustomType.Decode returning a pointer must decode into a concrete *T field
+// target through a union branch on EVERY union shape and BOTH wires. The binary
+// general union deser (deserUnion.deser) passes the un-indirected target to the
+// branch fn, so setCustomResult lands the *T result; but the 2-branch null-union
+// fast path (deserNullUnionAt) pre-dereferenced a concrete pointer before the
+// branch fn, so a *T target FAILED in a ["null", customLong] union while
+// SUCCEEDING in a 3+-branch union — an arbitrary 2-branch-vs-general
+// inconsistency that rejected a target the general path decodes. The JSON
+// unionTarget likewise derefed concrete pointers. These pin that a *T custom
+// target decodes uniformly across union arity and wire format.
+func TestRegression_UnionCustomDecodePointerFieldTarget(t *testing.T) {
+	type EventPtr struct {
+		When *ucpEvent `avro:"when"`
+	}
+	want := time.UnixMilli(1700000000000).UTC()
+
+	cases := []struct {
+		name   string
+		schema string
+	}{
+		{"2-branch-null-union", `{"type":"record","name":"R","fields":[{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}]}`},
+		// A 3+-branch union routes through the general deserUnion.deser path.
+		{"3-branch-union", `{"type":"record","name":"R","fields":[{"name":"when","type":["null",{"type":"long","logicalType":"timestamp-millis"},"string"]}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := avro.Parse(tc.schema, avro.WithCustomType(ucpCustom()))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			in := EventPtr{When: &ucpEvent{T: want}}
+			b, err := s.AppendEncode(nil, in)
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			var gotB EventPtr
+			if _, err := s.Decode(b, &gotB); err != nil {
+				t.Fatalf("binary decode into *T field: %v", err)
+			}
+			if gotB.When == nil || !gotB.When.T.Equal(want) {
+				t.Fatalf("binary *T field: got %v", gotB.When)
+			}
+			j, err := s.AppendEncodeJSON(nil, in)
+			if err != nil {
+				t.Fatalf("json encode: %v", err)
+			}
+			var gotJ EventPtr
+			if err := s.DecodeJSON(j, &gotJ); err != nil {
+				t.Fatalf("json decode into *T field: %v", err)
+			}
+			if gotJ.When == nil || !gotJ.When.T.Equal(want) {
+				t.Fatalf("json *T field: got %v", gotJ.When)
+			}
+		})
+	}
+}
+
+// Boundary-1 control: NON-custom union decode into a reused interface that holds
+// a manually pre-populated *T must keep doing in-place reuse (the result's
+// dynamic type stays *T) identically on binary and JSON — the per-branch fix
+// must NOT regress this to a boxed value.
+func TestRegression_UnionNonCustomReuseInPlaceUnchanged(t *testing.T) {
+	s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"v","type":["null","long"]}]}`)
+	type Rec struct {
+		V any `avro:"v"`
+	}
+	bw, _ := s.AppendEncode(nil, Rec{V: int64(42)})
+	jw, _ := s.AppendEncodeJSON(nil, Rec{V: int64(42)})
+
+	// Manual *int64 pre-population → in-place reuse → result holds *int64 on both.
+	for _, tc := range []struct {
+		name   string
+		decode func(target *Rec) error
+		wire   []byte
+	}{
+		{"binary", func(r *Rec) error { _, e := s.Decode(bw, r); return e }, bw},
+		{"json", func(r *Rec) error { return s.DecodeJSON(jw, r) }, jw},
+	} {
+		p := int64(7)
+		r := Rec{V: &p}
+		if err := tc.decode(&r); err != nil {
+			t.Fatalf("%s decode: %v", tc.name, err)
+		}
+		pp, ok := r.V.(*int64)
+		if !ok {
+			t.Fatalf("%s: in-place reuse lost: got %T, want *int64", tc.name, r.V)
+		}
+		if *pp != 42 {
+			t.Fatalf("%s: got %d want 42", tc.name, *pp)
+		}
+	}
+
+	// Fresh nil interface → boxed value (int64) on both.
+	for _, tc := range []struct {
+		name   string
+		decode func(target *Rec) error
+	}{
+		{"binary", func(r *Rec) error { _, e := s.Decode(bw, r); return e }},
+		{"json", func(r *Rec) error { return s.DecodeJSON(jw, r) }},
+	} {
+		var r Rec
+		if err := tc.decode(&r); err != nil {
+			t.Fatalf("%s fresh decode: %v", tc.name, err)
+		}
+		if got, ok := r.V.(int64); !ok || got != 42 {
+			t.Fatalf("%s fresh: got %T %v, want int64 42", tc.name, r.V, r.V)
+		}
+	}
+}
+
+// ---------- cache_canonical_test.go ----------
+
+// TestRegression_SchemaCacheCanonicalSelfContained pins that a schema built via
+// SchemaCache that references a type registered in a PRIOR Parse produces a
+// self-contained Canonical()/Fingerprint()/Root()/String() — identical to the
+// logically-equal inline-defined schema. The cache stores only the resolved
+// node, so the JSON forms used to held a dangling bare reference ("ns.Inner"),
+// giving a non-re-parseable canonical form and a cross-language-divergent
+// fingerprint (breaking single-object-encoding interop).
+func TestRegression_SchemaCacheCanonicalSelfContained(t *testing.T) {
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"ns.Inner","fields":[{"name":"x","type":"int"}]}`); err != nil {
+		t.Fatalf("register Inner: %v", err)
+	}
+	viaCache, err := c.Parse(`{"type":"record","name":"Outer","fields":[` +
+		`{"name":"i","type":"ns.Inner"},{"name":"j","type":"ns.Inner"}]}`)
+	if err != nil {
+		t.Fatalf("parse Outer via cache: %v", err)
+	}
+	inline := avro.MustParse(`{"type":"record","name":"Outer","fields":[` +
+		`{"name":"i","type":{"type":"record","name":"ns.Inner","fields":[{"name":"x","type":"int"}]}},` +
+		`{"name":"j","type":"ns.Inner"}]}`)
+
+	// Control: identical wire (same logical schema).
+	val := map[string]any{"i": map[string]any{"x": int32(1)}, "j": map[string]any{"x": int32(2)}}
+	wc, err := viaCache.Encode(val)
+	if err != nil {
+		t.Fatalf("cache encode: %v", err)
+	}
+	wi, err := inline.Encode(val)
+	if err != nil {
+		t.Fatalf("inline encode: %v", err)
+	}
+	if string(wc) != string(wi) {
+		t.Fatalf("control: wire differs (not the same logical schema)")
+	}
+
+	// Canonical form must be self-contained and equal to the inline schema's.
+	if string(viaCache.Canonical()) != string(inline.Canonical()) {
+		t.Errorf("Canonical() diverges:\n cache : %s\n inline: %s", viaCache.Canonical(), inline.Canonical())
+	}
+	if _, err := avro.Parse(string(viaCache.Canonical())); err != nil {
+		t.Errorf("Parse(cache.Canonical()) FAILS — canonical form is not a valid schema: %v", err)
+	}
+
+	// Fingerprint must match (cross-language / SOE interop).
+	if string(viaCache.Fingerprint(avro.NewRabin())) != string(inline.Fingerprint(avro.NewRabin())) {
+		t.Errorf("Fingerprint() diverges for the same logical schema")
+	}
+
+	// Root() must rebuild a self-contained tree.
+	root := viaCache.Root()
+	if _, err := root.Schema(); err != nil {
+		t.Errorf("Root().Schema() FAILS to rebuild a cache-built schema: %v", err)
+	}
+}
+
+// TestRegression_SchemaCacheSOEInterop pins the user-visible consequence: a
+// single-object-encoded message from a cache-built producer round-trips through
+// a consumer holding the logically-identical inline schema (fingerprints match).
+func TestRegression_SchemaCacheSOEInterop(t *testing.T) {
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"ns.Inner","fields":[{"name":"x","type":"int"}]}`); err != nil {
+		t.Fatalf("register Inner: %v", err)
+	}
+	producer, err := c.Parse(`{"type":"record","name":"Outer","fields":[` +
+		`{"name":"i","type":"ns.Inner"},{"name":"j","type":"ns.Inner"}]}`)
+	if err != nil {
+		t.Fatalf("producer: %v", err)
+	}
+	consumer := avro.MustParse(`{"type":"record","name":"Outer","fields":[` +
+		`{"name":"i","type":{"type":"record","name":"ns.Inner","fields":[{"name":"x","type":"int"}]}},` +
+		`{"name":"j","type":"ns.Inner"}]}`)
+
+	val := map[string]any{"i": map[string]any{"x": int32(1)}, "j": map[string]any{"x": int32(2)}}
+	msg, err := producer.AppendSingleObject(nil, val)
+	if err != nil {
+		t.Fatalf("AppendSingleObject: %v", err)
+	}
+	var out map[string]any
+	if _, err := consumer.DecodeSingleObject(msg, &out); err != nil {
+		t.Errorf("DecodeSingleObject across cache/inline of the same schema FAILS: %v", err)
+	}
+}
+
+// The cross-parse self-containment splice harvests inherited definitions by
+// walking the prior schema's JSON tree. It must mirror the parser EXACTLY,
+// which (a) reads object keys case-insensitively (lookupCI) and (b) accepts
+// the flat ("linkedin/goavro") field form, where a record field carries a
+// named type's defining key (symbols/fields/size) alongside its own keys and
+// the parser lifts it into a registered named type. A walker that only
+// descended into a field's "type" value (and read keys case-sensitively)
+// never collected those definitions, so a later cross-parse reference stayed
+// a dangling bare ref: Canonical()/String() failed to re-parse and the
+// fingerprint diverged from the logically-identical schema (SOE/registry
+// interop break).
+func TestRegression_SchemaCacheSelfContainedFlatFormDef(t *testing.T) {
+	var c avro.SchemaCache
+	// Prior parse defines enum E in the FLAT field form.
+	if _, err := c.Parse(`{"type":"record","name":"H","fields":[{"name":"E","type":"enum","symbols":["A","B"]}]}`); err != nil {
+		t.Fatalf("register flat-form E: %v", err)
+	}
+	viaCache, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"x","type":"E"}]}`)
+	if err != nil {
+		t.Fatalf("reference E via cache: %v", err)
+	}
+	inline := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":{"type":"enum","name":"E","symbols":["A","B"]}}]}`)
+
+	assertSelfContained(t, viaCache, inline, map[string]any{"x": "B"})
+}
+
+// A flat ("linkedin/goavro") field can also carry an UNNAMED complex kind:
+// {"name":"a","type":"array","items":...} puts the element type in the
+// field's own "items" key, and the wire parser lifts it exactly like the
+// named flat kinds (flatFieldNeedsLift covers all six complex kinds). A
+// cross-parse reference inside those items resolves against the cache and
+// the wire codec works, so the self-containment walkers must splice the
+// same subtree — otherwise the JSON-derived forms keep a dangling bare
+// reference: Canonical()/String() fail to re-parse and the fingerprint
+// diverges from the logically-identical schema (SOE/registry interop
+// break). The nested-spelling twin of the same reference is the control.
+func TestRegression_FlatArrayFieldCrossParseRefSplices(t *testing.T) {
+	const itemDef = `{"type":"record","name":"ns.Item","fields":[{"name":"x","type":"int"}]}`
+	inline := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"list","type":"array","items":` + itemDef + `}]}`)
+	val := map[string]any{"list": []any{map[string]any{"x": int32(1)}}}
+
+	t.Run("nested-twin-control", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(itemDef); err != nil {
+			t.Fatalf("register Item: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"list","type":{"type":"array","items":"ns.Item"}}]}`)
+		if err != nil {
+			t.Fatalf("nested-spelling parse via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+
+	t.Run("flat", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(itemDef); err != nil {
+			t.Fatalf("register Item: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"list","type":"array","items":"ns.Item"}]}`)
+		if err != nil {
+			t.Fatalf("flat-spelling parse via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+}
+
+// The map twin of the flat-array cross-parse reference, with the reference
+// spelled by SHORT name: the lift drops name/namespace keys for unnamed
+// kinds (flatLiftTypeMap), so a flat field's items/values sit directly in
+// the RECORD's namespace scope and a short reference resolves there. The
+// splice walkers must bind the reference in that same scope.
+func TestRegression_FlatMapFieldCrossParseRefSplices(t *testing.T) {
+	const itemDef = `{"type":"record","name":"ns.Item","fields":[{"name":"x","type":"int"}]}`
+	inline := avro.MustParse(`{"type":"record","name":"ns.R","fields":[{"name":"m","type":"map","values":` + itemDef + `}]}`)
+	val := map[string]any{"m": map[string]any{"k": map[string]any{"x": int32(2)}}}
+
+	t.Run("nested-twin-control", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(itemDef); err != nil {
+			t.Fatalf("register Item: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"ns.R","fields":[{"name":"m","type":{"type":"map","values":"Item"}}]}`)
+		if err != nil {
+			t.Fatalf("nested-spelling parse via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+
+	t.Run("flat", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(itemDef); err != nil {
+			t.Fatalf("register Item: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"ns.R","fields":[{"name":"m","type":"map","values":"Item"}]}`)
+		if err != nil {
+			t.Fatalf("flat-spelling parse via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+}
+
+// The definition direction of the flat array/map subtree: a named type
+// DEFINED inside a flat array field's items is lifted and registered by the
+// wire parser (later parses can reference it), so the collection walker
+// must also capture its definition — otherwise a later referencing parse
+// resolves on the wire but never splices, leaving its JSON-derived forms
+// dangling. The nested-spelling twin of the same definition is the control.
+func TestRegression_FlatArrayFieldInlineDefCollected(t *testing.T) {
+	const dDef = `{"type":"record","name":"ns.D","fields":[{"name":"x","type":"int"}]}`
+	inline := avro.MustParse(`{"type":"record","name":"R2","fields":[{"name":"d","type":` + dDef + `}]}`)
+	val := map[string]any{"d": map[string]any{"x": int32(3)}}
+
+	t.Run("nested-twin-control", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":"H","fields":[{"name":"list","type":{"type":"array","items":` + dDef + `}}]}`); err != nil {
+			t.Fatalf("register nested-spelling def: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"R2","fields":[{"name":"d","type":"ns.D"}]}`)
+		if err != nil {
+			t.Fatalf("reference ns.D via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+
+	t.Run("flat", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":"H","fields":[{"name":"list","type":"array","items":` + dDef + `}]}`); err != nil {
+			t.Fatalf("register flat-spelling def: %v", err)
+		}
+		viaCache, err := c.Parse(`{"type":"record","name":"R2","fields":[{"name":"d","type":"ns.D"}]}`)
+		if err != nil {
+			t.Fatalf("reference ns.D via cache: %v", err)
+		}
+		assertSelfContained(t, viaCache, inline, val)
+	})
+}
+
+// A case-variant object key ("tYpe") is an ordinary custom property, so
+// an object spelling its type only as a variant has no type attribute:
+// the registering parse fails loud and nothing enters the cache. A
+// definition carrying a variant key BESIDE its exact structure registers
+// normally, and the cross-parse splice preserves the variant verbatim as
+// a prop without letting it scope, rename, or restructure the def.
+func TestRegression_SchemaCacheCaseVariantKey(t *testing.T) {
+	var c avro.SchemaCache
+	if _, err := c.Parse(`{"type":"record","name":"Outer","fields":[{"name":"inner","type":{"tYpe":"record","name":"Inner","fields":[{"name":"a","type":"int"}]}}]}`); err == nil {
+		t.Fatalf("variant-only tYpe object accepted; it has no type attribute and must reject")
+	}
+	if _, err := c.Parse(`{"type":"record","name":"R","fields":[{"name":"x","type":"Inner"}]}`); err == nil {
+		t.Fatalf("Inner resolved from a rejected parse; a failed parse must register nothing")
+	}
+
+	if _, err := c.Parse(`{"type":"record","name":"Outer2","fields":[{"name":"inner","type":{"type":"record","name":"Inner2","nAmespace":"decoy","fields":[{"name":"a","type":"int"}]}}]}`); err != nil {
+		t.Fatalf("register Inner2: %v", err)
+	}
+	viaCache, err := c.Parse(`{"type":"record","name":"R2","fields":[{"name":"x","type":"Inner2"}]}`)
+	if err != nil {
+		t.Fatalf("reference Inner2 via cache: %v", err)
+	}
+	inline := avro.MustParse(`{"type":"record","name":"R2","fields":[{"name":"x","type":{"type":"record","name":"Inner2","nAmespace":"decoy","fields":[{"name":"a","type":"int"}]}}]}`)
+	assertSelfContained(t, viaCache, inline, map[string]any{"x": map[string]any{"a": int32(7)}})
+	spliced := viaCache.Root().Fields[0].Type
+	if got := spliced.Props["nAmespace"]; !reflect.DeepEqual(got, "decoy") {
+		t.Errorf(`spliced Props["nAmespace"] = %#v; want the variant preserved verbatim`, got)
+	}
+	if spliced.Namespace != "" {
+		t.Errorf("Namespace = %q; a variant key must not scope the def", spliced.Namespace)
+	}
+}
+
+// The splice walker (inlineTreeDefs) is the parallel of collectTreeDefs and
+// must mirror the parser the same way, or a TRANSITIVE inherited reference
+// reached through a flat-form definition dangles: the self-containment
+// re-parse then fails and the whole splice is abandoned, leaving even the
+// top-level reference bare. A case-variant structural key cannot smuggle a
+// definition anywhere near the cache: the variant is an ordinary custom
+// property, so the record it rode on has no fields attribute and its parse
+// rejects before any registration.
+func TestRegression_SchemaCacheSelfContainedTransitiveRefs(t *testing.T) {
+	check := func(name string, defs []string, ref string) {
+		t.Run(name, func(t *testing.T) {
+			var c avro.SchemaCache
+			for i, d := range defs {
+				if _, err := c.Parse(d); err != nil {
+					t.Fatalf("parse def %d: %v", i, err)
+				}
+			}
+			s, err := c.Parse(ref)
+			if err != nil {
+				t.Fatalf("parse referencing schema: %v", err)
+			}
+			if _, err := avro.Parse(string(s.Canonical())); err != nil {
+				t.Errorf("Parse(Canonical()) FAILS — not self-contained: %v\n canonical=%s", err, s.Canonical())
+			}
+			if _, err := avro.Parse(s.String()); err != nil {
+				t.Errorf("Parse(String()) FAILS — not self-contained: %v", err)
+			}
+		})
+	}
+
+	// B defined in flat field form, transitively referencing A.
+	check("flat_form_transitive",
+		[]string{
+			`{"type":"record","name":"A","fields":[{"name":"a","type":"int"}]}`,
+			`{"type":"record","name":"H","fields":[{"name":"B","type":"record","fields":[{"name":"x","type":"A"}]}]}`,
+		},
+		`{"type":"record","name":"R","fields":[{"name":"y","type":"B"}]}`)
+
+	// A record spelling "fields" only as a case-variant has no fields
+	// attribute: it rejects at parse (as a would-be cached def AND as the
+	// referencing schema), so no variant-keyed definition can register.
+	t.Run("case_variant_key_rejects", func(t *testing.T) {
+		var c avro.SchemaCache
+		if _, err := c.Parse(`{"type":"record","name":"B","fIelds":[{"name":"x","type":"int"}]}`); err == nil || !strings.Contains(err.Error(), "record is missing fields") {
+			t.Errorf("variant-fIelds def: got %v; want the missing-fields reject", err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"A","fields":[{"name":"a","type":"int"}]}`); err != nil {
+			t.Fatalf("parse def A: %v", err)
+		}
+		if _, err := c.Parse(`{"type":"record","name":"R","fIelds":[{"name":"y","type":"A"}]}`); err == nil || !strings.Contains(err.Error(), "record is missing fields") {
+			t.Errorf("variant-fIelds referencing schema: got %v; want the missing-fields reject", err)
+		}
+	})
+}
+
+// assertSelfContained checks that a cache-built schema is byte-for-byte the
+// same logical schema as its inline-defined twin: identical wire for a value,
+// identical canonical form and fingerprint, and re-parseable Canonical()/
+// String()/Root().Schema().
+func assertSelfContained(t *testing.T, viaCache, inline *avro.Schema, val map[string]any) {
+	t.Helper()
+	wc, err := viaCache.Encode(val)
+	if err != nil {
+		t.Fatalf("cache encode: %v", err)
+	}
+	wi, err := inline.Encode(val)
+	if err != nil {
+		t.Fatalf("inline encode: %v", err)
+	}
+	if string(wc) != string(wi) {
+		t.Fatalf("control: wire differs (not the same logical schema)")
+	}
+	if string(viaCache.Canonical()) != string(inline.Canonical()) {
+		t.Errorf("Canonical() diverges:\n cache : %s\n inline: %s", viaCache.Canonical(), inline.Canonical())
+	}
+	if _, err := avro.Parse(string(viaCache.Canonical())); err != nil {
+		t.Errorf("Parse(cache.Canonical()) FAILS — not self-contained: %v", err)
+	}
+	if _, err := avro.Parse(viaCache.String()); err != nil {
+		t.Errorf("Parse(cache.String()) FAILS — not self-contained: %v", err)
+	}
+	if string(viaCache.Fingerprint(avro.NewRabin())) != string(inline.Fingerprint(avro.NewRabin())) {
+		t.Errorf("Fingerprint() diverges for the same logical schema (SOE/registry interop break)")
+	}
+	root := viaCache.Root()
+	if _, err := root.Schema(); err != nil {
+		t.Errorf("Root().Schema() FAILS to rebuild a cache-built schema: %v", err)
+	}
+}
+
+// TestRegression_SchemaCacheSelfContainedEdgeCases exercises the converter's
+// delicate paths: a recursive cache type (cycle handling), a cache type with a
+// field default (default round-trip), and enum/fixed cache refs (the bug is
+// kind-agnostic). Each cache-built schema must have canonical form and
+// fingerprint identical to the inline-defined equivalent, and re-parse.
+func TestRegression_SchemaCacheSelfContainedEdgeCases(t *testing.T) {
+	cases := []struct {
+		name   string
+		defs   []string // types to register first
+		ref    string   // schema referencing them (cache-built)
+		inline string   // logically-identical inline schema
+	}{
+		{
+			name: "recursive",
+			defs: []string{`{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]},{"name":"v","type":"int"}]}`},
+			ref:  `{"type":"record","name":"Wrap","fields":[{"name":"head","type":"Node"}]}`,
+			inline: `{"type":"record","name":"Wrap","fields":[{"name":"head","type":` +
+				`{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]},{"name":"v","type":"int"}]}}]}`,
+		},
+		{
+			name: "field-default",
+			defs: []string{`{"type":"record","name":"D","fields":[{"name":"x","type":"int","default":7}]}`},
+			ref:  `{"type":"record","name":"DW","fields":[{"name":"d","type":"D"}]}`,
+			inline: `{"type":"record","name":"DW","fields":[{"name":"d","type":` +
+				`{"type":"record","name":"D","fields":[{"name":"x","type":"int","default":7}]}}]}`,
+		},
+		{
+			name: "enum-and-fixed",
+			defs: []string{`{"type":"enum","name":"E","symbols":["A","B"]}`, `{"type":"fixed","name":"F","size":4}`},
+			ref:  `{"type":"record","name":"EF","fields":[{"name":"e","type":"E"},{"name":"f","type":"F"}]}`,
+			inline: `{"type":"record","name":"EF","fields":[` +
+				`{"name":"e","type":{"type":"enum","name":"E","symbols":["A","B"]}},` +
+				`{"name":"f","type":{"type":"fixed","name":"F","size":4}}]}`,
+		},
+		{
+			name: "namespaced",
+			defs: []string{`{"type":"record","name":"Inner","namespace":"a.b","fields":[{"name":"x","type":"int"}]}`},
+			ref:  `{"type":"record","name":"Outer","namespace":"a.b","fields":[{"name":"i","type":"Inner"}]}`,
+			inline: `{"type":"record","name":"Outer","namespace":"a.b","fields":[{"name":"i","type":` +
+				`{"type":"record","name":"Inner","namespace":"a.b","fields":[{"name":"x","type":"int"}]}}]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c avro.SchemaCache
+			for _, d := range tc.defs {
+				if _, err := c.Parse(d); err != nil {
+					t.Fatalf("register %s: %v", d, err)
+				}
+			}
+			viaCache, err := c.Parse(tc.ref)
+			if err != nil {
+				t.Fatalf("parse ref via cache: %v", err)
+			}
+			inline := avro.MustParse(tc.inline)
+			if string(viaCache.Canonical()) != string(inline.Canonical()) {
+				t.Errorf("Canonical diverges:\n cache : %s\n inline: %s", viaCache.Canonical(), inline.Canonical())
+			}
+			if string(viaCache.Fingerprint(avro.NewRabin())) != string(inline.Fingerprint(avro.NewRabin())) {
+				t.Errorf("Fingerprint diverges")
+			}
+			if _, err := avro.Parse(string(viaCache.Canonical())); err != nil {
+				t.Errorf("Parse(cache.Canonical()) FAILS: %v", err)
+			}
+			root := viaCache.Root()
+			if _, err := root.Schema(); err != nil {
+				t.Errorf("Root().Schema() FAILS: %v", err)
+			}
+		})
+	}
+}
+
+// TestRegression_SchemaCacheRebuildPreservesMetadata pins that making a
+// cache-referenced schema self-contained preserves every original attribute —
+// node doc, field doc/order/props, at both the outer and the inlined inner
+// level — exactly as the logically-identical inline schema does. (The first
+// self-containment fix rebuilt from the attribute-poor node tree and dropped
+// these; the JSON-inline approach preserves them.)
+func TestRegression_SchemaCacheRebuildPreservesMetadata(t *testing.T) {
+	innerDef := `{"type":"record","name":"ns.Inner","doc":"inner doc","fields":[` +
+		`{"name":"x","type":"int","doc":"x field doc","order":"descending","ns.fprop":"xfp"}]}`
+	outer := func(ref string) string {
+		return `{"type":"record","name":"Outer","doc":"outer doc","fields":[` +
+			`{"name":"i","type":` + ref + `,"doc":"i field doc","order":"ignore","ns.iprop":"ifp"}]}`
+	}
+	var c avro.SchemaCache
+	if _, err := c.Parse(innerDef); err != nil {
+		t.Fatalf("register Inner: %v", err)
+	}
+	viaCache, err := c.Parse(outer(`"ns.Inner"`))
+	if err != nil {
+		t.Fatalf("parse Outer via cache: %v", err)
+	}
+	inline := avro.MustParse(outer(innerDef))
+
+	rc, ri := viaCache.Root(), inline.Root()
+	if rc.Doc != ri.Doc {
+		t.Errorf("Outer.Doc: cache=%q inline=%q", rc.Doc, ri.Doc)
+	}
+	if rc.Fields[0].Doc != ri.Fields[0].Doc {
+		t.Errorf("Outer.i.Doc: cache=%q inline=%q", rc.Fields[0].Doc, ri.Fields[0].Doc)
+	}
+	if rc.Fields[0].Order != ri.Fields[0].Order {
+		t.Errorf("Outer.i.Order: cache=%q inline=%q", rc.Fields[0].Order, ri.Fields[0].Order)
+	}
+	if fmt.Sprint(rc.Fields[0].Props) != fmt.Sprint(ri.Fields[0].Props) {
+		t.Errorf("Outer.i.Props: cache=%v inline=%v", rc.Fields[0].Props, ri.Fields[0].Props)
+	}
+	// The inlined inner type's own metadata must survive too.
+	ci, ii := rc.Fields[0].Type, ri.Fields[0].Type
+	if ci.Doc != ii.Doc {
+		t.Errorf("Inner.Doc: cache=%q inline=%q", ci.Doc, ii.Doc)
+	}
+	if ci.Fields[0].Doc != ii.Fields[0].Doc {
+		t.Errorf("Inner.x.Doc: cache=%q inline=%q", ci.Fields[0].Doc, ii.Fields[0].Doc)
+	}
+	if ci.Fields[0].Order != ii.Fields[0].Order {
+		t.Errorf("Inner.x.Order: cache=%q inline=%q", ci.Fields[0].Order, ii.Fields[0].Order)
+	}
+	if fmt.Sprint(ci.Fields[0].Props) != fmt.Sprint(ii.Fields[0].Props) {
+		t.Errorf("Inner.x.Props: cache=%v inline=%v", ci.Fields[0].Props, ii.Fields[0].Props)
+	}
+}
+
+// TestRegression_SchemaCacheTransitiveRefs pins transitive cross-parse
+// references: C → B → A, each defined in its own Parse. C's self-contained form
+// must inline B (which itself inlines A), matching the fully-inline schema.
+func TestRegression_SchemaCacheTransitiveRefs(t *testing.T) {
+	var c avro.SchemaCache
+	aDef := `{"type":"record","name":"A","fields":[{"name":"x","type":"int"}]}`
+	bDef := `{"type":"record","name":"B","fields":[{"name":"a","type":"A"}]}`
+	if _, err := c.Parse(aDef); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	if _, err := c.Parse(bDef); err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	viaCache, err := c.Parse(`{"type":"record","name":"C","fields":[{"name":"b","type":"B"}]}`)
+	if err != nil {
+		t.Fatalf("C: %v", err)
+	}
+	inline := avro.MustParse(`{"type":"record","name":"C","fields":[{"name":"b","type":` +
+		`{"type":"record","name":"B","fields":[{"name":"a","type":` +
+		`{"type":"record","name":"A","fields":[{"name":"x","type":"int"}]}}]}}]}`)
+	if string(viaCache.Canonical()) != string(inline.Canonical()) {
+		t.Errorf("transitive Canonical diverges:\n cache : %s\n inline: %s", viaCache.Canonical(), inline.Canonical())
+	}
+	if string(viaCache.Fingerprint(avro.NewRabin())) != string(inline.Fingerprint(avro.NewRabin())) {
+		t.Errorf("transitive Fingerprint diverges")
+	}
+	if _, err := avro.Parse(string(viaCache.Canonical())); err != nil {
+		t.Errorf("Parse(transitive cache.Canonical()) FAILS: %v", err)
+	}
+}
+
+// TestRegression_SchemaCacheCrossNamespaceSplice pins that splicing an inherited
+// definition into a referencing schema preserves the definition's resolved
+// namespace, regardless of the enclosing namespace at the reference site. A
+// definition that inherited its namespace (or sat in the null namespace) is
+// stored with no explicit "namespace"; splicing it verbatim into a different
+// scope would re-inherit that scope's namespace and resolve to the wrong
+// fullname (e.g. com.a.Inner becoming com.b.Inner) — a self-contained-but-WRONG
+// form whose canonical/fingerprint silently diverge from the wire schema and
+// from every other Avro implementation. Stored definitions therefore carry an
+// explicit namespace. Each case must match the logically-identical inline
+// schema on wire (control), canonical, and fingerprint, and re-parse cleanly.
+func TestRegression_SchemaCacheCrossNamespaceSplice(t *testing.T) {
+	cases := []struct {
+		name   string
+		defs   []string
+		ref    string
+		inline string
+		value  any
+	}{
+		{
+			name:   "inherited-ns-referenced-from-other-ns",
+			defs:   []string{`{"type":"record","name":"P","namespace":"com.a","fields":[{"name":"inner","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}}]}`},
+			ref:    `{"type":"record","name":"Q","namespace":"com.b","fields":[{"name":"y","type":"com.a.Inner"}]}`,
+			inline: `{"type":"record","name":"Q","namespace":"com.b","fields":[{"name":"y","type":{"type":"record","name":"Inner","namespace":"com.a","fields":[{"name":"x","type":"int"}]}}]}`,
+			value:  map[string]any{"y": map[string]any{"x": int32(1)}},
+		},
+		{
+			name:   "null-ns-referenced-from-namespaced",
+			defs:   []string{`{"type":"record","name":"X","fields":[{"name":"v","type":"int"}]}`},
+			ref:    `{"type":"record","name":"Q","namespace":"com.b","fields":[{"name":"x","type":"X"}]}`,
+			inline: `{"type":"record","name":"Q","namespace":"com.b","fields":[{"name":"x","type":{"type":"record","name":"X","namespace":"","fields":[{"name":"v","type":"int"}]}}]}`,
+			value:  map[string]any{"x": map[string]any{"v": int32(2)}},
+		},
+		{
+			name:   "deep-inherited-chain-into-other-ns",
+			defs:   []string{`{"type":"record","name":"Root","namespace":"x.y","fields":[{"name":"m","type":{"type":"record","name":"Mid","fields":[{"name":"l","type":{"type":"record","name":"Leaf","fields":[{"name":"z","type":"int"}]}}]}}]}`},
+			ref:    `{"type":"record","name":"Q","namespace":"other","fields":[{"name":"mid","type":"x.y.Mid"}]}`,
+			inline: `{"type":"record","name":"Q","namespace":"other","fields":[{"name":"mid","type":{"type":"record","name":"Mid","namespace":"x.y","fields":[{"name":"l","type":{"type":"record","name":"Leaf","namespace":"x.y","fields":[{"name":"z","type":"int"}]}}]}}]}`,
+			value:  map[string]any{"mid": map[string]any{"l": map[string]any{"z": int32(4)}}},
+		},
+		{
+			name:   "recursive-inherited-ns-into-other-ns",
+			defs:   []string{`{"type":"record","name":"Holder","namespace":"r.s","fields":[{"name":"node","type":{"type":"record","name":"Node","fields":[{"name":"next","type":["null","Node"]},{"name":"v","type":"int"}]}}]}`},
+			ref:    `{"type":"record","name":"W","namespace":"diff","fields":[{"name":"head","type":"r.s.Node"}]}`,
+			inline: `{"type":"record","name":"W","namespace":"diff","fields":[{"name":"head","type":{"type":"record","name":"Node","namespace":"r.s","fields":[{"name":"next","type":["null","Node"]},{"name":"v","type":"int"}]}}]}`,
+			value:  map[string]any{"head": map[string]any{"next": nil, "v": int32(8)}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c avro.SchemaCache
+			for _, d := range tc.defs {
+				if _, err := c.Parse(d); err != nil {
+					t.Fatalf("register %q: %v", d, err)
+				}
+			}
+			viaCache, err := c.Parse(tc.ref)
+			if err != nil {
+				t.Fatalf("parse ref via cache: %v", err)
+			}
+			inline := avro.MustParse(tc.inline)
+
+			// Control: identical wire confirms the node tree resolved the same
+			// fullnames — so canonical/fingerprint MUST match too.
+			wc, errc := viaCache.Encode(tc.value)
+			wi, erri := inline.Encode(tc.value)
+			if errc != nil || erri != nil {
+				t.Fatalf("encode err: cache=%v inline=%v", errc, erri)
+			}
+			if fmt.Sprintf("%x", wc) != fmt.Sprintf("%x", wi) {
+				t.Fatalf("control wire mismatch:\n cache=%x\n inline=%x", wc, wi)
+			}
+			if string(viaCache.Canonical()) != string(inline.Canonical()) {
+				t.Errorf("Canonical diverges:\n cache : %s\n inline: %s", viaCache.Canonical(), inline.Canonical())
+			}
+			if string(viaCache.Fingerprint(avro.NewRabin())) != string(inline.Fingerprint(avro.NewRabin())) {
+				t.Errorf("Fingerprint diverges (namespace lost on splice)")
+			}
+			if _, err := avro.Parse(string(viaCache.Canonical())); err != nil {
+				t.Errorf("Parse(cache.Canonical()) FAILS: %v\n  %s", err, viaCache.Canonical())
+			}
+		})
+	}
+}
+
+// A cross-parse reference spelled as a props-carrying wrapped object
+// ({"type":"R","foo":1}) must splice to self-contained metadata like its
+// bare-string and sole-key-wrapped twins: the inherited definition
+// replaces the wrapper at that position and the wrapper's props ride on
+// the emitted definition (props are canonical-stripped, so the schema's
+// identity is unchanged; Java instead DROPS usage-site props at reference
+// sites — Schema.java's textual-reference arms return context.find(...)
+// without a properties pass — so preserving them is the more faithful
+// treatment of accepted input).
+func TestRegression_CacheSpliceWrappedRefProps(t *testing.T) {
+	t.Parallel()
+	def := `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`
+	for name, use := range map[string]string{
+		"field_pos": `{"type":"R","foo":1}`,
+		"union_pos": `["null",{"type":"R","foo":1}]`,
+		"items_pos": `{"type":"array","items":{"type":"R","foo":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var c avro.SchemaCache
+			if _, err := c.Parse(def); err != nil {
+				t.Fatalf("parse def: %v", err)
+			}
+			s, err := c.Parse(`{"type":"record","name":"Top","fields":[{"name":"a","type":` + use + `}]}`)
+			if err != nil {
+				t.Fatalf("parse use: %v", err)
+			}
+			if _, err := avro.Parse(s.String()); err != nil {
+				t.Errorf("String() not self-contained: %v\n%s", err, s.String())
+			}
+			if _, err := avro.Parse(string(s.Canonical())); err != nil {
+				t.Errorf("Canonical() not self-contained: %v\n%s", err, s.Canonical())
+			}
+			if !strings.Contains(s.String(), `"foo":1`) {
+				t.Errorf("wrapper props dropped by the splice: %s", s.String())
+			}
+		})
+	}
+}
+
+// The three reference spellings of the same schema — bare string,
+// sole-key wrapper, and props-carrying wrapper — must produce identical
+// canonical bytes: canonical form strips props and resolves references,
+// so spelling cannot be identity.
+func TestRegression_WrappedRefSpellingsCanonicalInvariant(t *testing.T) {
+	t.Parallel()
+	def := `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`
+	use := func(ref string) string {
+		return `{"type":"record","name":"Top","fields":[{"name":"a","type":` + ref + `}]}`
+	}
+	canonical := func(ref string) string {
+		var c avro.SchemaCache
+		if _, err := c.Parse(def); err != nil {
+			t.Fatalf("parse def: %v", err)
+		}
+		s, err := c.Parse(use(ref))
+		if err != nil {
+			t.Fatalf("parse use %s: %v", ref, err)
+		}
+		return string(s.Canonical())
+	}
+	bare := canonical(`"R"`)
+	sole := canonical(`{"type":"R"}`)
+	props := canonical(`{"type":"R","foo":1}`)
+	if bare != sole || bare != props {
+		t.Errorf("canonical bytes differ across reference spellings:\n bare:  %s\n sole:  %s\n props: %s", bare, sole, props)
+	}
+}
+
+// ---------- cache_overlap_test.go ----------
+
+// TestRegression_SchemaCacheOverlappingSpliceDefs pins self-containment when
+// two cache-inherited references carry overlapping definitions. Each cached
+// definition is stored self-contained (transitive definitions inlined), so a
+// schema referencing two types that share a transitive type — the diamond
+// A→{B,C}→D — or referencing a nested type and then its container would, with
+// a naive splice, define the shared name twice. The splice must instead keep
+// the first definition and rewrite later occurrences to name references,
+// exactly as the parser's node tree shares one resolved type (and as Java's
+// Schema toString emits via writeNameRef). The oracle is the logically
+// identical inline-defined twin: identical wire bytes, identical canonical
+// form and fingerprint, and re-parseable String()/Canonical()/Root().Schema().
+func TestRegression_SchemaCacheOverlappingSpliceDefs(t *testing.T) {
+	cases := []struct {
+		name   string
+		defs   []string // parsed into the cache first, in order
+		ref    string   // the schema under test (cache-built)
+		inline string   // logically-identical self-contained twin
+		val    map[string]any
+	}{
+		{
+			// Diamond with a shared record: D defined once (inside the first
+			// reference's splice), referenced from the second.
+			name: "diamond_record",
+			defs: []string{
+				`{"type":"record","name":"x.D","fields":[{"name":"n","type":"int"}]}`,
+				`{"type":"record","name":"x.B","fields":[{"name":"d","type":"x.D"}]}`,
+				`{"type":"record","name":"x.C","fields":[{"name":"d","type":"x.D"}]}`,
+			},
+			ref: `{"type":"record","name":"x.A","fields":[{"name":"b","type":"x.B"},{"name":"c","type":"x.C"}]}`,
+			inline: `{"type":"record","name":"x.A","fields":[
+				{"name":"b","type":{"type":"record","name":"x.B","fields":[
+					{"name":"d","type":{"type":"record","name":"x.D","fields":[{"name":"n","type":"int"}]}}]}},
+				{"name":"c","type":{"type":"record","name":"x.C","fields":[{"name":"d","type":"x.D"}]}}]}`,
+			val: map[string]any{
+				"b": map[string]any{"d": map[string]any{"n": 1}},
+				"c": map[string]any{"d": map[string]any{"n": 2}},
+			},
+		},
+		{
+			// The mechanism is kind-agnostic: shared enum.
+			name: "diamond_enum",
+			defs: []string{
+				`{"type":"enum","name":"x.D","symbols":["A","B"]}`,
+				`{"type":"record","name":"x.B","fields":[{"name":"d","type":"x.D"}]}`,
+				`{"type":"record","name":"x.C","fields":[{"name":"d","type":"x.D"}]}`,
+			},
+			ref: `{"type":"record","name":"x.A","fields":[{"name":"b","type":"x.B"},{"name":"c","type":"x.C"}]}`,
+			inline: `{"type":"record","name":"x.A","fields":[
+				{"name":"b","type":{"type":"record","name":"x.B","fields":[
+					{"name":"d","type":{"type":"enum","name":"x.D","symbols":["A","B"]}}]}},
+				{"name":"c","type":{"type":"record","name":"x.C","fields":[{"name":"d","type":"x.D"}]}}]}`,
+			val: map[string]any{
+				"b": map[string]any{"d": "A"},
+				"c": map[string]any{"d": "B"},
+			},
+		},
+		{
+			// Shared fixed.
+			name: "diamond_fixed",
+			defs: []string{
+				`{"type":"fixed","name":"x.D","size":2}`,
+				`{"type":"record","name":"x.B","fields":[{"name":"d","type":"x.D"}]}`,
+				`{"type":"record","name":"x.C","fields":[{"name":"d","type":"x.D"}]}`,
+			},
+			ref: `{"type":"record","name":"x.A","fields":[{"name":"b","type":"x.B"},{"name":"c","type":"x.C"}]}`,
+			inline: `{"type":"record","name":"x.A","fields":[
+				{"name":"b","type":{"type":"record","name":"x.B","fields":[
+					{"name":"d","type":{"type":"fixed","name":"x.D","size":2}}]}},
+				{"name":"c","type":{"type":"record","name":"x.C","fields":[{"name":"d","type":"x.D"}]}}]}`,
+			val: map[string]any{
+				"b": map[string]any{"d": []byte("xy")},
+				"c": map[string]any{"d": []byte("zw")},
+			},
+		},
+		{
+			// Null-namespace diamond: the duplicate's rewrite must emit a bare
+			// short-name reference (the only spelling a null-namespace type has).
+			name: "diamond_null_namespace",
+			defs: []string{
+				`{"type":"record","name":"D","fields":[{"name":"n","type":"int"}]}`,
+				`{"type":"record","name":"B","fields":[{"name":"d","type":"D"}]}`,
+				`{"type":"record","name":"C","fields":[{"name":"d","type":"D"}]}`,
+			},
+			ref: `{"type":"record","name":"A","fields":[{"name":"b","type":"B"},{"name":"c","type":"C"}]}`,
+			inline: `{"type":"record","name":"A","fields":[
+				{"name":"b","type":{"type":"record","name":"B","fields":[
+					{"name":"d","type":{"type":"record","name":"D","fields":[{"name":"n","type":"int"}]}}]}},
+				{"name":"c","type":{"type":"record","name":"C","fields":[{"name":"d","type":"D"}]}}]}`,
+			val: map[string]any{
+				"b": map[string]any{"d": map[string]any{"n": 1}},
+				"c": map[string]any{"d": map[string]any{"n": 2}},
+			},
+		},
+		{
+			// A nested type referenced BEFORE the container whose definition
+			// carries it: the standalone splice lands first, so the copy inside
+			// the container's splice is the duplicate.
+			name: "nested_ref_before_container",
+			defs: []string{
+				`{"type":"record","name":"x.Outer","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"n","type":"int"}]}}]}`,
+			},
+			ref: `{"type":"record","name":"x.Wrap","fields":[{"name":"f1","type":"x.Inner"},{"name":"f2","type":"x.Outer"}]}`,
+			inline: `{"type":"record","name":"x.Wrap","fields":[
+				{"name":"f1","type":{"type":"record","name":"x.Inner","fields":[{"name":"n","type":"int"}]}},
+				{"name":"f2","type":{"type":"record","name":"x.Outer","fields":[{"name":"i","type":"x.Inner"}]}}]}`,
+			val: map[string]any{
+				"f1": map[string]any{"n": 1},
+				"f2": map[string]any{"i": map[string]any{"n": 2}},
+			},
+		},
+		{
+			// Control (must keep working): container referenced first — the
+			// nested definition arrives with it, and the later standalone
+			// reference stays bare.
+			name: "container_ref_before_nested",
+			defs: []string{
+				`{"type":"record","name":"x.Outer","fields":[{"name":"i","type":{"type":"record","name":"Inner","fields":[{"name":"n","type":"int"}]}}]}`,
+			},
+			ref: `{"type":"record","name":"x.Wrap","fields":[{"name":"f2","type":"x.Outer"},{"name":"f1","type":"x.Inner"}]}`,
+			inline: `{"type":"record","name":"x.Wrap","fields":[
+				{"name":"f2","type":{"type":"record","name":"x.Outer","fields":[
+					{"name":"i","type":{"type":"record","name":"x.Inner","fields":[{"name":"n","type":"int"}]}}]}},
+				{"name":"f1","type":"x.Inner"}]}`,
+			val: map[string]any{
+				"f1": map[string]any{"n": 1},
+				"f2": map[string]any{"i": map[string]any{"n": 2}},
+			},
+		},
+		{
+			// A flat-form ("linkedin/goavro") field definition arriving as the
+			// duplicate: the field must rewrite to normal form with a name
+			// reference (a field object cannot be replaced by a bare string).
+			name: "flat_form_duplicate",
+			defs: []string{
+				// H's flat field both defines x.B and registers it in the
+				// cache (the def store captures the lifted form), so a later
+				// schema can reference x.B standalone AND through x.H.
+				`{"type":"record","name":"x.H","fields":[{"name":"B","type":"record","fields":[{"name":"v","type":"int"}]}]}`,
+			},
+			ref: `{"type":"record","name":"x.Wrap","fields":[{"name":"f1","type":"x.B"},{"name":"f2","type":"x.H"}]}`,
+			inline: `{"type":"record","name":"x.Wrap","fields":[
+				{"name":"f1","type":{"type":"record","name":"x.B","fields":[{"name":"v","type":"int"}]}},
+				{"name":"f2","type":{"type":"record","name":"x.H","fields":[{"name":"B","type":"x.B"}]}}]}`,
+			val: map[string]any{
+				"f1": map[string]any{"v": 1},
+				"f2": map[string]any{"B": map[string]any{"v": 2}},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c avro.SchemaCache
+			for i, d := range tc.defs {
+				if _, err := c.Parse(d); err != nil {
+					t.Fatalf("parse def %d: %v", i, err)
+				}
+			}
+			s, err := c.Parse(tc.ref)
+			if err != nil {
+				t.Fatalf("parse referencing schema: %v", err)
+			}
+			inline, err := avro.Parse(tc.inline)
+			if err != nil {
+				t.Fatalf("parse inline twin: %v", err)
+			}
+			assertSelfContained(t, s, inline, tc.val)
+		})
+	}
+}
+
+// TestRegression_SchemaCacheSpliceCascade pins that a self-contained schema
+// built from overlapping splices is itself a usable cache definition: a later
+// parse referencing it splices the (now coherent) definition and stays
+// self-contained. Before the duplicate-definition rewrite, the diamond's
+// failed rebuild recorded a DANGLING definition into the cache's def store,
+// so the breakage cascaded into every downstream referencing schema.
+func TestRegression_SchemaCacheSpliceCascade(t *testing.T) {
+	var c avro.SchemaCache
+	for i, d := range []string{
+		`{"type":"record","name":"x.D","fields":[{"name":"n","type":"int"}]}`,
+		`{"type":"record","name":"x.B","fields":[{"name":"d","type":"x.D"}]}`,
+		`{"type":"record","name":"x.C","fields":[{"name":"d","type":"x.D"}]}`,
+		`{"type":"record","name":"x.A","fields":[{"name":"b","type":"x.B"},{"name":"c","type":"x.C"}]}`,
+	} {
+		if _, err := c.Parse(d); err != nil {
+			t.Fatalf("parse def %d: %v", i, err)
+		}
+	}
+	e, err := c.Parse(`{"type":"record","name":"x.E","fields":[{"name":"a","type":"x.A"}]}`)
+	if err != nil {
+		t.Fatalf("parse E: %v", err)
+	}
+	inline, err := avro.Parse(`{"type":"record","name":"x.E","fields":[{"name":"a","type":
+		{"type":"record","name":"x.A","fields":[
+			{"name":"b","type":{"type":"record","name":"x.B","fields":[
+				{"name":"d","type":{"type":"record","name":"x.D","fields":[{"name":"n","type":"int"}]}}]}},
+			{"name":"c","type":{"type":"record","name":"x.C","fields":[{"name":"d","type":"x.D"}]}}]}}]}`)
+	if err != nil {
+		t.Fatalf("parse inline twin: %v", err)
+	}
+	assertSelfContained(t, e, inline, map[string]any{
+		"a": map[string]any{
+			"b": map[string]any{"d": map[string]any{"n": 1}},
+			"c": map[string]any{"d": map[string]any{"n": 2}},
+		},
+	})
+}
+
+// TestRegression_SchemaCacheShortNameShadowNoMisbind pins that the duplicate-
+// definition rewrite never emits a reference that would re-bind to a DIFFERENT
+// type. A null-namespace type's only reference spelling is its bare short
+// name, which the parser binds enclosing-namespace-first (scopedRefKeys) — so
+// when a same-short-name namespaced type is defined earlier in the document,
+// rewriting the null-namespace duplicate to a bare reference would silently
+// re-bind it to the namespaced type, making the metadata forms describe a
+// different schema than the wire codec. The rewrite must decline in exactly
+// that case; the metadata forms may then stay non-self-contained (the format
+// has no absolute-reference spelling for null-namespace names — Java has the
+// same limitation), but they must never describe the wrong schema.
+func TestRegression_SchemaCacheShortNameShadowNoMisbind(t *testing.T) {
+	var c avro.SchemaCache
+	for i, d := range []string{
+		// Null-namespace D, referenced from namespaced carriers F and G
+		// (legal at their parse time: x.D does not exist yet, so the bare
+		// "D" falls through to the null-namespace type).
+		`{"type":"record","name":"D","fields":[{"name":"n","type":"int"}]}`,
+		`{"type":"record","name":"x.F","fields":[{"name":"d","type":"D"}]}`,
+		`{"type":"record","name":"x.G","fields":[{"name":"d","type":"D"}]}`,
+		// A DIFFERENT type that shadows D's short name inside namespace x.
+		`{"type":"record","name":"x.D","fields":[{"name":"z","type":"string"}]}`,
+	} {
+		if _, err := c.Parse(d); err != nil {
+			t.Fatalf("parse def %d: %v", i, err)
+		}
+	}
+	// p splices x.D first (registering its name), then f and g each carry the
+	// null-namespace D definition: the duplicate inside g's splice cannot be
+	// rewritten to "D" (it would re-bind to x.D at that position).
+	a, err := c.Parse(`{"type":"record","name":"x.A","fields":[
+		{"name":"p","type":"x.D"},
+		{"name":"f","type":"x.F"},
+		{"name":"g","type":"x.G"}]}`)
+	if err != nil {
+		t.Fatalf("parse A: %v", err)
+	}
+
+	val := map[string]any{
+		"p": map[string]any{"z": "s"},
+		"f": map[string]any{"d": map[string]any{"n": 1}},
+		"g": map[string]any{"d": map[string]any{"n": 2}},
+	}
+	wire, err := a.Encode(val)
+	if err != nil {
+		t.Fatalf("wire path must be unaffected: %v", err)
+	}
+	var decoded any
+	if _, err := a.Decode(wire, &decoded); err != nil {
+		t.Fatalf("wire decode: %v", err)
+	}
+
+	// The correct schema here has NO self-contained JSON spelling: the
+	// null-namespace D inside g's subtree can only be written as a second
+	// definition (duplicate, rejected) or as the bare reference "D" (which
+	// re-binds to x.D at that position). The metadata forms are therefore
+	// allowed to stay non-self-contained — but if they DO re-parse, they
+	// must describe the same schema the wire codec implements: encoding the
+	// same value must produce the same wire bytes. A rewrite that emitted
+	// the bare "D" would re-parse successfully with g.d bound to x.D and
+	// fail this value-level check.
+	if reparsed, err := avro.Parse(a.String()); err == nil {
+		wire2, err := reparsed.Encode(val)
+		if err != nil {
+			t.Errorf("String() re-parses but rejects a value the wire codec accepts (mis-bound short-name reference): %v", err)
+		} else if string(wire2) != string(wire) {
+			t.Errorf("String() re-parses but produces different wire bytes for the same value (mis-bound short-name reference)")
+		}
+	}
+}
+
+// TestRegression_SchemaCacheWrappedFormCrossParseRefSelfContains pins that a
+// cross-parse reference spelled in the WRAPPED form {"type":"X"} self-contains
+// in the metadata exactly like the bare-string form "X". {"type":"X"} is a
+// documented-accepted name-reference spelling (including forward refs). The
+// splice replaces the whole wrapped object with the referenced definition; the
+// earlier bug recursed INTO the "type" value, producing the invalid
+// {"type":{X-def}}, so the rebuild Parse failed and String()/Canonical() fell
+// back to a dangling reference (wire codec worked, but Parse(s.String()) and
+// the fingerprint surface did not). The oracle is the inline-defined twin:
+// identical wire, identical canonical form + fingerprint, re-parseable
+// String()/Canonical(). Crosses every nesting position the splice walks.
+func TestRegression_SchemaCacheWrappedFormCrossParseRefSelfContains(t *testing.T) {
+	const xDef = `{"type":"record","name":"X","fields":[{"name":"n","type":"int"}]}`
+	cases := []struct {
+		name    string
+		wrapped string // Y referencing X via {"type":"X"}, cache-built after X
+		inline  string // logically-identical twin with X defined inline
+		val     map[string]any
+	}{
+		{
+			name:    "field",
+			wrapped: `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"X"}}]}`,
+			inline:  `{"type":"record","name":"Y","fields":[{"name":"f","type":` + xDef + `}]}`,
+			val:     map[string]any{"f": map[string]any{"n": int32(5)}},
+		},
+		{
+			name:    "union_branch",
+			wrapped: `{"type":"record","name":"Y","fields":[{"name":"f","type":["null",{"type":"X"}]}]}`,
+			inline:  `{"type":"record","name":"Y","fields":[{"name":"f","type":["null",` + xDef + `]}]}`,
+			val:     map[string]any{"f": map[string]any{"n": int32(6)}},
+		},
+		{
+			name:    "array_items",
+			wrapped: `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"array","items":{"type":"X"}}}]}`,
+			inline:  `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"array","items":` + xDef + `}}]}`,
+			val:     map[string]any{"f": []any{map[string]any{"n": int32(7)}}},
+		},
+		{
+			name:    "map_values",
+			wrapped: `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"map","values":{"type":"X"}}}]}`,
+			inline:  `{"type":"record","name":"Y","fields":[{"name":"f","type":{"type":"map","values":` + xDef + `}}]}`,
+			val:     map[string]any{"f": map[string]any{"k": map[string]any{"n": int32(8)}}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &avro.SchemaCache{}
+			if _, err := c.Parse(xDef); err != nil {
+				t.Fatalf("parse X into cache: %v", err)
+			}
+			y, err := c.Parse(tc.wrapped)
+			if err != nil {
+				t.Fatalf("parse wrapped Y: %v", err)
+			}
+			twin := avro.MustParse(tc.inline)
+
+			// Wire codec already worked pre-fix; assert it still matches the twin.
+			wire, err := y.Encode(tc.val)
+			if err != nil {
+				t.Fatalf("Y.Encode: %v", err)
+			}
+			twinWire, err := twin.Encode(tc.val)
+			if err != nil {
+				t.Fatalf("twin.Encode: %v", err)
+			}
+			if string(wire) != string(twinWire) {
+				t.Errorf("wrapped-form wire != inline-twin wire")
+			}
+
+			// Self-containment: String()/Canonical() must re-parse and match the
+			// twin's canonical form + fingerprint (the surfaces the bug broke).
+			if _, err := avro.Parse(y.String()); err != nil {
+				t.Errorf("Parse(Y.String()) failed (dangling metadata): %v\n  %s", err, y.String())
+			}
+			if _, err := avro.Parse(string(y.Canonical())); err != nil {
+				t.Errorf("Parse(Y.Canonical()) failed (dangling metadata): %v\n  %s", err, y.Canonical())
+			}
+			// Canonical-form equality is the fingerprint surface (the Rabin/SHA
+			// fingerprint is a hash of these bytes), so matching the inline twin
+			// here pins the SOE / schema-registry interop the bug broke.
+			if string(y.Canonical()) != string(twin.Canonical()) {
+				t.Errorf("wrapped-form Canonical != inline-twin Canonical:\n got:  %s\n want: %s", y.Canonical(), twin.Canonical())
+			}
+		})
+	}
+
+	// Boundary-1 control: the bare-string form already self-contains; it must
+	// stay correct (the fix must not regress it).
+	t.Run("bare_form_control", func(t *testing.T) {
+		c := &avro.SchemaCache{}
+		if _, err := c.Parse(xDef); err != nil {
+			t.Fatalf("parse X: %v", err)
+		}
+		y, err := c.Parse(`{"type":"record","name":"Y2","fields":[{"name":"f","type":"X"}]}`)
+		if err != nil {
+			t.Fatalf("parse bare Y2: %v", err)
+		}
+		if _, err := avro.Parse(y.String()); err != nil {
+			t.Errorf("control: Parse(bare Y2.String()) must succeed: %v", err)
+		}
+	})
+
+	// A type referencing the same cached type TWICE via the wrapped form. The
+	// FIRST occurrence inlines X's definition; a LATER wrapped occurrence resolves
+	// to an already-inlined type and so does not splice. Its wrapper must collapse
+	// to the bare "X" the inline twin carries — otherwise {"type":"X"} survives in
+	// String() where the canonical bare reference belongs (Canonical/PCF already
+	// emits bare, so only String saw it). Single-reference cases above can never
+	// reach this later-occurrence path.
+	t.Run("repeated_ref_collapses_in_string", func(t *testing.T) {
+		c := &avro.SchemaCache{}
+		if _, err := c.Parse(xDef); err != nil {
+			t.Fatalf("parse X: %v", err)
+		}
+		y, err := c.Parse(`{"type":"record","name":"Y3","fields":[{"name":"f1","type":{"type":"X"}},{"name":"f2","type":{"type":"X"}}]}`)
+		if err != nil {
+			t.Fatalf("parse wrapped Y3: %v", err)
+		}
+		twin := avro.MustParse(`{"type":"record","name":"Y3","fields":[{"name":"f1","type":` + xDef + `},{"name":"f2","type":"X"}]}`)
+
+		// The surviving-wrapper signature is the VALUE {"type":"X"} (a wrapped
+		// name reference). f1 inlines X's full record definition (whose "type" is
+		// "record" and whose only "X" is "name":"X"), and f2's bare reference is
+		// the string "X" — so {"type":"X"} appears nowhere unless a wrapper
+		// survived the rebuild.
+		if strings.Contains(y.String(), `{"type":"X"}`) {
+			t.Errorf("String() kept a wrapped {\"type\":\"X\"} reference; the later occurrence must collapse to bare \"X\":\n  %s", y.String())
+		}
+		if !strings.Contains(y.String(), `"name":"X"`) {
+			t.Errorf("String() lost X's inlined definition entirely:\n  %s", y.String())
+		}
+		// Wire (logical-identity anchor) and Canonical/fingerprint must match the
+		// inline twin — they always did; String is the surface the wrapper broke.
+		val := map[string]any{"f1": map[string]any{"n": int32(1)}, "f2": map[string]any{"n": int32(2)}}
+		yw, err := y.Encode(val)
+		if err != nil {
+			t.Fatalf("Y3.Encode: %v", err)
+		}
+		tw, err := twin.Encode(val)
+		if err != nil {
+			t.Fatalf("twin.Encode: %v", err)
+		}
+		if string(yw) != string(tw) {
+			t.Errorf("wrapped repeated-ref wire != inline-twin wire")
+		}
+		if string(y.Canonical()) != string(twin.Canonical()) {
+			t.Errorf("Canonical diverges:\n got:  %s\n want: %s", y.Canonical(), twin.Canonical())
+		}
+		if _, err := avro.Parse(y.String()); err != nil {
+			t.Errorf("Parse(Y3.String()) must succeed: %v\n  %s", err, y.String())
+		}
+	})
+}
+
+// TestMatrix_SpliceWrapperReservedKeyMerge drives the SchemaCache splice
+// merge's reserved-key routing (the shared schemaReservedKeyForObject
+// predicate at its cache call site) with wrapper props on cached
+// definitions. A wrapper key the def's kind/logical CONSUMES never survives
+// the splice (reserved usage-site attributes drop, matching Java's
+// reference arms, which return the found schema with no properties pass);
+// an UNCONSUMED key merges onto the definition as an ordinary custom
+// property, definition-wins on collision. A non-string logicalType is
+// unconsumed everywhere; precision/scale are consumed exactly on a decimal
+// carrier def. The decimal def omits "scale" on purpose (spec default 0):
+// a consumed wrapper "scale" must be dropped by the ROUTING, not masked by
+// the def-wins presence check. fastavro rejects the props-carrying
+// wrapped-reference spelling outright, so these cells have no differential
+// arm; Java is the reference (usage-site extras drop at reference sites).
+func TestMatrix_SpliceWrapperReservedKeyMerge(t *testing.T) {
+	plainDef := `{"type":"fixed","name":"F","size":4}`
+	decimalDef := `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":2}`
+
+	cases := []struct {
+		name    string
+		def     string
+		wrapper string
+		check   func(t *testing.T, n avro.SchemaNode)
+	}{
+		{
+			"nonstring-logicaltype-numeric-merges",
+			plainDef,
+			`{"type":"F","logicalType":123}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got := n.Props["logicalType"]; got != int64(123) {
+					t.Errorf("Props[logicalType] = %#v; want int64(123) merged as ordinary prop", got)
+				}
+				if n.LogicalType != "" {
+					t.Errorf("non-string logicalType activated: %q", n.LogicalType)
+				}
+			},
+		},
+		{
+			"nonstring-logicaltype-null-merges",
+			plainDef,
+			`{"type":"F","logicalType":null}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got, ok := n.Props["logicalType"]; !ok || got != nil {
+					t.Errorf("Props[logicalType] = %#v (present=%v); want JSON null merged as nil prop", got, ok)
+				}
+			},
+		},
+		{
+			"string-logicaltype-consumed-drops",
+			plainDef,
+			`{"type":"F","logicalType":"decimal"}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got, ok := n.Props["logicalType"]; ok {
+					t.Errorf("consumed usage-site logicalType survived the splice as a prop: %#v", got)
+				}
+				if n.LogicalType != "" {
+					t.Errorf("usage-site logicalType activated on the def: %q", n.LogicalType)
+				}
+			},
+		},
+		{
+			"unconsumed-precision-valid-merges",
+			plainDef,
+			`{"type":"F","precision":3}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got := n.Props["precision"]; got != int64(3) {
+					t.Errorf("Props[precision] = %#v; want int64(3)", got)
+				}
+				if n.Precision != 0 {
+					t.Errorf("unconsumed precision landed structurally: %d", n.Precision)
+				}
+			},
+		},
+		{
+			"unconsumed-precision-malformed-merges-verbatim",
+			plainDef,
+			`{"type":"F","precision":"x"}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got := n.Props["precision"]; got != "x" {
+					t.Errorf("Props[precision] = %#v; want verbatim \"x\"", got)
+				}
+				if n.Precision != 0 {
+					t.Errorf("malformed precision landed structurally: %d", n.Precision)
+				}
+			},
+		},
+		{
+			"consumed-scale-malformed-drops",
+			decimalDef,
+			`{"type":"D","scale":"bogus"}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got, ok := n.Props["scale"]; ok {
+					t.Errorf("consumed usage-site scale survived the splice as a prop: %#v", got)
+				}
+				if n.Scale != 0 {
+					t.Errorf("usage-site scale mutated the def: Scale = %d; want spec-default 0", n.Scale)
+				}
+			},
+		},
+		{
+			"consumed-scale-valid-drops-def-wins",
+			decimalDef,
+			`{"type":"D","scale":1}`,
+			func(t *testing.T, n avro.SchemaNode) {
+				if got, ok := n.Props["scale"]; ok {
+					t.Errorf("consumed usage-site scale survived the splice as a prop: %#v", got)
+				}
+				if n.Scale != 0 {
+					t.Errorf("usage-site scale mutated the def: Scale = %d; want spec-default 0", n.Scale)
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cache := &avro.SchemaCache{}
+			if _, err := cache.Parse(c.def); err != nil {
+				t.Fatalf("def Parse: %v", err)
+			}
+			s, err := cache.Parse(c.wrapper)
+			if err != nil {
+				t.Fatalf("wrapper Parse: %v", err)
+			}
+			n := s.Root()
+			c.check(t, *n)
+
+			// Wrapper props are metadata: the wire image is the def's own
+			// ([]byte is the opaque carrier for both plain and decimal
+			// fixed).
+			def := avro.MustParse(c.def)
+			got, err := s.Encode([]byte{1, 2, 3, 4})
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			want, err := def.Encode([]byte{1, 2, 3, 4})
+			if err != nil {
+				t.Fatalf("def Encode: %v", err)
+			}
+			if string(got) != string(want) {
+				t.Errorf("wrapper props changed the wire: %x vs %x", got, want)
+			}
+
+			// The spliced, self-contained metadata tree must rebuild to a
+			// schema that reparses and keeps the same routing.
+			rb, err := n.Schema()
+			if err != nil {
+				t.Fatalf("Root().Schema() rebuild: %v", err)
+			}
+			c.check(t, *rb.Root())
+		})
+	}
+}
+
+// A cached definition whose RECORD field carries an unconsumed malformed
+// precision splices through by-subtree: the field rides verbatim inside the
+// inlined definition, the spliced tree rebuilds, and the pair stays on the
+// field's Props — the splice merge touches only the WRAPPER's own keys,
+// never field attributes inside the definition.
+func TestRegression_SpliceDefFieldMalformedPrecisionRidesThrough(t *testing.T) {
+	cache := &avro.SchemaCache{}
+	if _, err := cache.Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int","precision":"x"}]}`); err != nil {
+		t.Fatalf("def Parse: %v", err)
+	}
+	s, err := cache.Parse(`{"type":"R","myprop":1}`)
+	if err != nil {
+		t.Fatalf("wrapper Parse: %v", err)
+	}
+	n := s.Root()
+	if got := n.Fields[0].Props["precision"]; got != "x" {
+		t.Errorf("spliced def's field Props[precision] = %#v; want verbatim \"x\"", got)
+	}
+	if got := n.Props["myprop"]; got != int64(1) {
+		t.Errorf("wrapper prop lost: %#v", got)
+	}
+	rb, err := n.Schema()
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := rb.Root().Fields[0].Props["precision"]; got != "x" {
+		t.Errorf("rebuild field Props[precision] = %#v; want \"x\"", got)
+	}
+}
+
+// ---------- wildcard_cache_test.go ----------
+
+// TestRegression_SchemaCacheWildcardConsistentRegistration pins that a wildcard
+// CustomType (empty LogicalType AND AvroType, ErrSkipCustomType — the
+// documented audit/metrics-hook use case) registered CONSISTENTLY across cache
+// parses resolves, like a non-wildcard does. The cache-boundary reverse guard
+// disagreed with itself on wildcards: the hadCustomType stamp counted any
+// wiring (len(b.custom)>0, which a wildcard populates), but
+// findCustomTypeMatchInSubtree SKIPS wildcards — so a cached wildcard-bearing
+// type, referenced with the SAME wildcard registered, hit
+// hadCustomType && currentMatches=="" and was rejected with an error telling
+// the user to register the CustomType they had already registered. A wildcard
+// bakes nothing onto the shared node (its conversion lives in the per-parse
+// overlay), so the stamp must exclude wildcard-only wiring.
+func TestRegression_SchemaCacheWildcardConsistentRegistration(t *testing.T) {
+	const innerJSON = `{"type":"record","name":"Inner","fields":[{"name":"v","type":"long","logicalType":"timestamp-millis"}]}`
+	const outerRefJSON = `{"type":"record","name":"Outer","fields":[{"name":"in","type":"Inner"}]}`
+
+	// CONTROL: a non-wildcard CustomType registered consistently on BOTH parses
+	// resolves (the already-pinned behavior).
+	t.Run("non-wildcard-consistent-resolves", func(t *testing.T) {
+		mk := func() avro.CustomType {
+			return avro.CustomType{
+				AvroType:    "long",
+				LogicalType: "timestamp-millis",
+				Decode:      func(v any, _ *avro.SchemaNode) (any, error) { return v, avro.ErrSkipCustomType },
+			}
+		}
+		c := &avro.SchemaCache{}
+		if _, err := c.Parse(innerJSON, mk()); err != nil {
+			t.Fatalf("inner parse: %v", err)
+		}
+		if _, err := c.Parse(outerRefJSON, mk()); err != nil {
+			t.Fatalf("non-wildcard consistent registration should resolve: %v", err)
+		}
+	})
+
+	// BUG: the SAME structure with a WILDCARD registered consistently on BOTH
+	// parses must also resolve.
+	t.Run("wildcard-consistent-resolves", func(t *testing.T) {
+		mk := func() avro.CustomType {
+			return avro.CustomType{
+				Decode: func(v any, _ *avro.SchemaNode) (any, error) { return v, avro.ErrSkipCustomType },
+			}
+		}
+		c := &avro.SchemaCache{}
+		if _, err := c.Parse(innerJSON, mk()); err != nil {
+			t.Fatalf("inner parse with wildcard: %v", err)
+		}
+		if _, err := c.Parse(outerRefJSON, mk()); err != nil {
+			t.Fatalf("wildcard registered consistently on BOTH parses must resolve, got: %v", err)
+		}
+	})
+}
+
+// ---------- slab_free_test.go ----------
+
+// Issue #41: Decode of a slab-free schema (scalar leaf, no custom wiring)
+// bypasses the internal slab pool entirely and runs on a nil *slab. These
+// tests pin the classifier and prove, two-sidedly against the matrix corpus,
+// that the classification exactly matches which compiled desers touch the
+// slab. Internal state is reached via the export_test.go bridges.
+
+// TestScalarDecodeNoAllocAfterGC pins issue #41: Decode of a scalar schema
+// must not allocate even when GC has drained the slab pool (primary and
+// victim caches), which is the steady state of a low-allocation application.
+// Before the fix, Decode unconditionally pulled a slab from the pool, so
+// every post-GC decode paid a fresh slab allocation that the decode never
+// used. The min-over-iterations guards against unrelated background mallocs:
+// a genuinely slab-free Decode hits 0 on every quiet iteration, while the
+// pre-fix pool refill allocates on EVERY iteration (two GCs empty both pool
+// halves, so Get must call New).
+func TestScalarDecodeNoAllocAfterGC(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	s := avro.MustParse(`"long"`)
+	wire := []byte{4}
+	var v int64
+	if _, err := s.Decode(wire, &v); err != nil { // warm one-time state
+		t.Fatal(err)
+	}
+	minMallocs := ^uint64(0)
+	var before, after runtime.MemStats
+	for i := 0; i < 5; i++ {
+		runtime.GC()
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		if _, err := s.Decode(wire, &v); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		minMallocs = min(minMallocs, after.Mallocs-before.Mallocs)
+	}
+	if v != 2 {
+		t.Fatalf("decoded %d, want 2", v)
+	}
+	if minMallocs != 0 {
+		t.Errorf("scalar Decode allocated on every post-GC iteration (min %d mallocs/op); slab pool should be bypassed for slab-free schemas", minMallocs)
+	}
+}
+
+// TestSlabFreeClassifier pins slab-free membership across the axes that
+// decide it: schema kind × logical type × custom wiring × cache-inherited
+// custom × resolution × opts presence.
+func TestSlabFreeClassifier(t *testing.T) {
+	free := []string{
+		`"null"`, `"boolean"`, `"int"`, `"long"`, `"float"`, `"double"`, `"bytes"`,
+		`{"type":"fixed","name":"F","size":4}`,
+		`{"type":"enum","name":"E","symbols":["A"]}`,
+		`{"type":"int","logicalType":"date"}`,
+		`{"type":"int","logicalType":"time-millis"}`,
+		`{"type":"long","logicalType":"time-micros"}`,
+		`{"type":"long","logicalType":"timestamp-millis"}`,
+		`{"type":"long","logicalType":"timestamp-nanos"}`,
+		`{"type":"long","logicalType":"local-timestamp-micros"}`,
+		`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`,
+		`{"type":"fixed","name":"FD","size":4,"logicalType":"decimal","precision":4,"scale":2}`,
+		`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`,
+		`{"type":"fixed","name":"D","size":12,"logicalType":"duration"}`,
+	}
+	needsSlab := []string{
+		`"string"`,
+		`{"type":"string","logicalType":"uuid"}`,
+		`{"type":"record","name":"R","fields":[{"name":"f","type":"long"}]}`,
+		`{"type":"array","items":"long"}`,
+		`{"type":"map","values":"long"}`,
+		`["null","long"]`,
+		// Recursive and diamond named-type shapes: the second-occurrence
+		// REFERENCE path can only appear under a composite kind, so it can
+		// never smuggle a slab-needing node beneath a slab-free top.
+		`{"type":"record","name":"L","fields":[{"name":"next","type":["null","L"]}]}`,
+		`{"type":"record","name":"Dia","fields":[{"name":"a","type":{"type":"fixed","name":"Sh","size":2}},{"name":"b","type":"Sh"}]}`,
+	}
+	for _, sch := range free {
+		if s := avro.MustParse(sch); !s.SlabFreeForTest() {
+			t.Errorf("schema %s: slabFree=false, want true", sch)
+		}
+	}
+	for _, sch := range needsSlab {
+		if s := avro.MustParse(sch); s.SlabFreeForTest() {
+			t.Errorf("schema %s: slabFree=true, want false", sch)
+		}
+	}
+
+	// A custom decoder on a scalar forces the pool: the wrapper reads and
+	// writes slab state (customMatches / bypassCustom).
+	ct := avro.CustomType{
+		AvroType: "fixed",
+		Decode:   func(v any, _ *avro.SchemaNode) (any, error) { return v, nil },
+	}
+	sc, err := avro.Parse(`{"type":"fixed","name":"CF","size":2}`, ct)
+	if err != nil {
+		t.Fatalf("custom parse: %v", err)
+	}
+	if sc.SlabFreeForTest() {
+		t.Error("custom-wired fixed: slabFree=true, want false")
+	}
+	var fxAny any
+	if _, err := sc.Decode([]byte{1, 2}, &fxAny); err != nil {
+		t.Errorf("custom-wired fixed decode: %v", err)
+	}
+
+	// Cache-inherited custom wraps: the DEFINING parse wires the custom; a
+	// later reference parse (re-registering the same custom, as the cache
+	// requires) inherits the baked deser while its own overlay may stay
+	// empty (applyCustomTypes visits only newly built nodes) — it must
+	// classify slab-needing via customBaked. The custom-free twin inherits
+	// a plain deser and stays slab-free.
+	ctEnum := avro.CustomType{
+		AvroType: "enum",
+		Decode:   func(v any, _ *avro.SchemaNode) (any, error) { return v, nil },
+	}
+	cc := &avro.SchemaCache{}
+	if _, err := cc.Parse(`{"type":"enum","name":"CE","symbols":["A","B"]}`, ctEnum); err != nil {
+		t.Fatalf("cache defining parse: %v", err)
+	}
+	ref, err := cc.Parse(`"CE"`, ctEnum)
+	if err != nil {
+		t.Fatalf("cache reference parse: %v", err)
+	}
+	if ref.SlabFreeForTest() {
+		t.Error("cache-inherited custom enum reference: slabFree=true, want false")
+	}
+	cc2 := &avro.SchemaCache{}
+	if _, err := cc2.Parse(`{"type":"enum","name":"CE","symbols":["A","B"]}`); err != nil {
+		t.Fatalf("cache defining parse (no custom): %v", err)
+	}
+	ref2, err := cc2.Parse(`"CE"`)
+	if err != nil {
+		t.Fatalf("cache reference parse (no custom): %v", err)
+	}
+	if !ref2.SlabFreeForTest() {
+		t.Error("cache-inherited plain enum reference: slabFree=false, want true")
+	}
+	var sym string
+	if _, err := ref2.Decode([]byte{2}, &sym); err != nil || sym != "B" {
+		t.Errorf("inherited enum nil-slab decode: %q, %v", sym, err)
+	}
+
+	// Non-identity resolution keeps the pool (zero value on the fresh
+	// Schema): promote/skip paths use the slab — bytes→string promotion
+	// slab-copies, and resolved record skips bump the recursion depth.
+	res, err := avro.Resolve(avro.MustParse(`"bytes"`), avro.MustParse(`"string"`))
+	if err != nil {
+		t.Fatalf("resolve bytes→string: %v", err)
+	}
+	if res.SlabFreeForTest() {
+		t.Error("resolved bytes→string: slabFree=true, want false")
+	}
+	var str string
+	if _, err := res.Decode([]byte{2, 'x'}, &str); err != nil || str != "x" {
+		t.Errorf("resolved bytes→string decode: %q, %v", str, err)
+	}
+	// Identity resolution returns the reader itself; its own
+	// classification applies because its own deser runs.
+	ident, err := avro.Resolve(avro.MustParse(`"long"`), avro.MustParse(`"long"`))
+	if err != nil {
+		t.Fatalf("identity resolve: %v", err)
+	}
+	if !ident.SlabFreeForTest() {
+		t.Error("identity-resolved long: slabFree=false, want true")
+	}
+
+	// Opts on a slab-free schema take the pooled path (opts only ever
+	// alter slab state) and must stay correct.
+	var lv int64
+	if _, err := avro.MustParse(`"long"`).Decode([]byte{4}, &lv, avro.TaggedUnions()); err != nil || lv != 2 {
+		t.Errorf("slab-free decode with opts: %d, %v", lv, err)
+	}
+}
+
+// TestSlabFreeMatchesNilSlabOracle is the two-sided generative net: for
+// every matrix fragment in every matrix context, the slab-free
+// classification must EXACTLY equal the independent oracle "decoding every
+// encoded value with a nil slab does not panic". A slab-free schema whose
+// deser secretly touches the slab panics (classification too eager: a
+// user-visible crash in Decode); a pooled schema whose deser never touches
+// it survives nil (classification too conservative: issue #41 regresses for
+// that shape). Composite kinds panic at entry via the recursion-depth bump
+// and string leaves via the slab string copy, so the oracle discriminates
+// every cell.
+//
+// Non-vacuity was verified by neutering: adding "string" to slabFreeKinds
+// makes the string cells fail here in the panicked direction, and hardcoding
+// slabFree=false makes every scalar cell fail in the other direction.
+func TestSlabFreeMatchesNilSlabOracle(t *testing.T) {
+	u := &uniq{}
+	var freeCells, pooledCells int
+	for _, fr := range matFrags() {
+		for _, cx := range matCtxs() {
+			if cx.skip != nil && cx.skip(fr.kind) {
+				continue
+			}
+			schema := cx.schema(fr.schema(u), fr.kind, u)
+			s, err := avro.Parse(schema)
+			if err != nil {
+				t.Fatalf("parse %s: %v", schema, err)
+			}
+			for _, val := range fr.values {
+				wv := cx.wrap(val)
+				wire, err := s.Encode(wv)
+				if err != nil {
+					t.Fatalf("encode %s %v: %v", schema, wv, err)
+				}
+				var nilGot any
+				panicked := false
+				var derr error
+				var rest []byte
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							panicked = true
+						}
+					}()
+					rest, derr = s.DeserNilSlabForTest(wire, &nilGot)
+				}()
+				if panicked == s.SlabFreeForTest() {
+					t.Fatalf("schema %s (frag %s, ctx %s): slabFree=%v but nil-slab decode panicked=%v",
+						schema, fr.label, cx.label, s.SlabFreeForTest(), panicked)
+				}
+				if panicked {
+					pooledCells++
+					continue
+				}
+				freeCells++
+				if derr != nil {
+					t.Fatalf("schema %s: nil-slab decode error: %v", schema, derr)
+				}
+				if len(rest) != 0 {
+					t.Fatalf("schema %s: nil-slab decode left %d bytes", schema, len(rest))
+				}
+				var poolGot any
+				if _, err := s.Decode(wire, &poolGot); err != nil {
+					t.Fatalf("schema %s: pooled decode error: %v", schema, err)
+				}
+				if !matEqual(nilGot, poolGot) {
+					t.Fatalf("schema %s value %v: nil-slab decode %v != pooled decode %v", schema, wv, nilGot, poolGot)
+				}
+			}
+		}
+	}
+	if freeCells == 0 || pooledCells == 0 {
+		t.Fatalf("vacuous net: %d slab-free cells, %d pooled cells — both sides must be exercised", freeCells, pooledCells)
+	}
+	t.Logf("oracle cells: %d slab-free, %d pooled", freeCells, pooledCells)
+}
+
+// ---------- cyclic_field_type_test.go ----------
+
+// A cyclic non-struct pointer type (type P *P, whose reflect type graph has
+// P.Elem() == P) used as a struct field must NOT crash the process. The unsafe
+// struct-field encode compiler walks the field's pointer type graph; without a
+// bound it recurses forever at compile time and overflows the goroutine stack
+// (a fatal, unrecoverable crash). The bound declines to the reflect slow path,
+// which errors cleanly on the nil cyclic value — matching every other indirect
+// walk in the package.
+type cyclicPtrFieldType *cyclicPtrFieldType
+
+type recordWithCyclicPtrField struct {
+	F cyclicPtrFieldType `avro:"F"`
+}
+
+func TestRegression_EncodeStructCyclicPointerFieldTerminates(t *testing.T) {
+	s := avro.MustParse(`{"type":"record","name":"S","fields":[{"name":"F","type":"int"}]}`)
+	// Run in a goroutine with a generous deadline so a regression (the bound
+	// removed) surfaces as a timeout rather than hanging the whole suite —
+	// though a true stack overflow is fatal and would abort the binary, which
+	// is itself an unmistakable failure signal.
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Encode(&recordWithCyclicPtrField{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("encode of a cyclic-pointer-typed field must error, got nil")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("encode of a cyclic-pointer-typed field did not terminate")
+	}
+}
+
+// The unsafe struct-field fast encode path must accept EXACTLY the pointer-chain
+// depths the reflect encoder accepts, and every accepted chain must round-trip
+// through Decode. Before the bound, the fast path accepted arbitrarily deep
+// chains the reflect encoder (and the package's own Decode) rejected — encoding
+// wire that could not be read back. This drives a struct field of int-pointer
+// depth 1..8 and asserts: struct-field encode succeeds IFF the reflect scalar
+// encode of the same value succeeds (fast ≡ reflect), and when it succeeds the
+// wire decodes back to the original int.
+func TestRegression_StructFieldPointerChainMatchesReflect(t *testing.T) {
+	rec := avro.MustParse(`{"type":"record","name":"S","fields":[{"name":"F","type":"int"}]}`)
+	scalar := avro.MustParse(`"int"`)
+	intType := reflect.TypeOf(int(0))
+
+	anyAccepted := false
+	for depth := 1; depth <= 8; depth++ {
+		ptrType := intType
+		for i := 0; i < depth; i++ {
+			ptrType = reflect.PointerTo(ptrType)
+		}
+		structType := reflect.StructOf([]reflect.StructField{
+			{Name: "F", Type: ptrType, Tag: `avro:"F"`},
+		})
+
+		// Build a fully-allocated chain ending in int(7).
+		leaf := reflect.New(intType)
+		leaf.Elem().SetInt(7)
+		cur := leaf
+		for i := 1; i < depth; i++ {
+			p := reflect.New(cur.Type())
+			p.Elem().Set(cur)
+			cur = p
+		}
+		sv := reflect.New(structType)
+		sv.Elem().Field(0).Set(cur)
+
+		_, structErr := rec.Encode(sv.Interface())
+		_, scalarErr := scalar.Encode(cur.Interface())
+
+		if (structErr == nil) != (scalarErr == nil) {
+			t.Fatalf("depth=%d: struct-field encode (err=%v) and reflect scalar encode (err=%v) disagree — fast path accepts a depth the reflect path rejects",
+				depth, structErr, scalarErr)
+		}
+		if structErr == nil {
+			anyAccepted = true
+			// Accepted: the wire must round-trip back to the int.
+			wire, err := rec.Encode(sv.Interface())
+			if err != nil {
+				t.Fatalf("depth=%d: re-encode failed: %v", depth, err)
+			}
+			out := reflect.New(structType)
+			if _, err := rec.Decode(wire, out.Interface()); err != nil {
+				t.Fatalf("depth=%d: struct-field encode accepted but Decode rejected the wire: %v", depth, err)
+			}
+		}
+	}
+	if !anyAccepted {
+		t.Fatal("expected at least the shallow pointer depths to be accepted")
+	}
+}
+
+// The same bound must cover the array-element route into the pointer arm: a
+// cyclic pointer as a SLICE element must not crash the field-type compile, and
+// a shallow pointer element must still round-trip.
+type cyclicSliceElem *cyclicSliceElem
+
+func TestRegression_SliceElementPointerChainBounded(t *testing.T) {
+	t.Run("cyclic_element_terminates", func(t *testing.T) {
+		type R struct {
+			F []cyclicSliceElem `avro:"f"`
+		}
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":"int"}}]}`)
+		done := make(chan struct{}, 1)
+		go func() {
+			s.Encode(&R{}) // nil slice; the compile of the cyclic element type must terminate
+			done <- struct{}{}
+		}()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("slice-of-cyclic-pointer field compile did not terminate")
+		}
+	})
+	t.Run("shallow_element_roundtrips", func(t *testing.T) {
+		type R struct {
+			F []*int32 `avro:"f"`
+		}
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":{"type":"array","items":"int"}}]}`)
+		v := int32(7)
+		wire, err := s.Encode(&R{F: []*int32{&v}})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out R
+		if _, err := s.Decode(wire, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(out.F) != 1 || out.F[0] == nil || *out.F[0] != 7 {
+			t.Fatalf("roundtrip wrong: %#v", out)
+		}
+	})
+}
+
+// Encode and decode must agree on the maximum pointer-chain depth they accept.
+// The encode-side indirect formerly accepted only maxIndirectDepth-1 levels
+// (it confirmed a non-pointer base on a FOLLOWING loop iteration the cap had
+// already spent), while the decode-side indirectAlloc accepted maxIndirectDepth
+// — so a value exactly maxIndirectDepth pointers deep DECODED but failed to
+// ENCODE, a round-trip break for a hand-written schema independent of SchemaFor.
+// Both now accept a chain bottoming at a non-pointer base within
+// maxIndirectDepth levels and reject one deeper, symmetrically, on binary AND
+// JSON.
+func TestRegression_PointerChainEncodeDecodeDepthParity(t *testing.T) {
+	s := avro.MustParse(`["null","int"]`)
+
+	// At maxIndirectDepth (5) levels: a non-nil chain must round-trip on both
+	// wires. Build *****int = &&&&&(7).
+	n := int64(7)
+	p1 := &n
+	p2 := &p1
+	p3 := &p2
+	p4 := &p3
+	p5 := &p4 // 5 pointers, non-nil all the way down
+
+	bin, err := s.Encode(p5)
+	if err != nil {
+		t.Fatalf("binary Encode of a %d-deep non-nil pointer must succeed (encode↔decode parity): %v", maxDepthLevels, err)
+	}
+	var bg *****int64
+	if _, err := s.Decode(bin, &bg); err != nil {
+		t.Fatalf("binary Decode into a %d-deep pointer must succeed: %v", maxDepthLevels, err)
+	}
+	if bg == nil || *****bg != 7 {
+		t.Fatalf("binary round-trip mismatch at depth %d", maxDepthLevels)
+	}
+
+	js, err := s.EncodeJSON(p5)
+	if err != nil {
+		t.Fatalf("JSON Encode of a %d-deep non-nil pointer must succeed: %v", maxDepthLevels, err)
+	}
+	var jg *****int64
+	if err := s.DecodeJSON(js, &jg); err != nil {
+		t.Fatalf("JSON Decode into a %d-deep pointer must succeed: %v", maxDepthLevels, err)
+	}
+	if jg == nil || *****jg != 7 {
+		t.Fatalf("JSON round-trip mismatch at depth %d", maxDepthLevels)
+	}
+
+	// One level deeper (6) must be rejected SYMMETRICALLY across both wires AND
+	// both directions: encode (indirect) and decode (indirectAlloc) refuse a
+	// chain past the cap (the cyclic-interface DoS guard is preserved). JSON
+	// matches binary on decode too — a union pointer target is indirected
+	// exactly once (unionTarget returns a concrete target un-peeled so the
+	// branch decode's single indirectAlloc caps it), not twice.
+	q6 := &p5 // 6 pointers
+	if _, err := s.Encode(q6); err == nil {
+		t.Fatalf("binary Encode of a %d-deep pointer must be rejected", maxDepthLevels+1)
+	}
+	var b6 ******int64
+	if _, err := s.Decode(bin, &b6); err == nil {
+		t.Fatalf("binary Decode into a %d-deep pointer must be rejected", maxDepthLevels+1)
+	}
+	if _, err := s.EncodeJSON(q6); err == nil {
+		t.Fatalf("JSON Encode of a %d-deep pointer must be rejected", maxDepthLevels+1)
+	}
+	var j6 ******int64
+	if err := s.DecodeJSON(js, &j6); err == nil {
+		t.Fatalf("JSON Decode into a %d-deep pointer must be rejected (parity with binary)", maxDepthLevels+1)
+	}
+}
+
+// Binary and JSON decode must accept the SAME set of pointer-target depths.
+// JSON decode of a UNION target formerly indirected at two stages (unionTarget
+// then the branch's decodeKind), so it peeled up to 2*maxIndirectDepth levels
+// and accepted targets binary rejected. Sweep every depth and assert the two
+// wires agree.
+func TestRegression_UnionPointerTargetDepthBinaryJSONParity(t *testing.T) {
+	s := avro.MustParse(`["null","int"]`)
+	bin, _ := s.Encode(int64(7))
+	js, _ := s.EncodeJSON(int64(7))
+	intType := reflect.TypeOf(int64(0))
+	for depth := 1; depth <= 9; depth++ {
+		pt := intType
+		for i := 0; i < depth; i++ {
+			pt = reflect.PointerTo(pt)
+		}
+		_, binErr := s.Decode(bin, reflect.New(pt).Interface())
+		jsonErr := s.DecodeJSON(js, reflect.New(pt).Interface())
+		if (binErr != nil) != (jsonErr != nil) {
+			t.Errorf("depth=%d: binary and JSON decode disagree on accept/reject (binErr=%v, jsonErr=%v)", depth, binErr, jsonErr)
+		}
+	}
+}
+
+// maxDepthLevels mirrors the package-internal maxIndirectDepth (5) for the
+// external test above; if the internal cap changes, the depth-parity test's
+// literal pointer types (*****T at the cap, ******T past it) must change with it.
+const maxDepthLevels = 5
+
+// An array<record> element's pointer chain must be capped at the same
+// maxIndirectDepth every other context enforces. The unsafe struct-field array
+// fast path peels one pointer level inline (usArrayRecord → usArrayPtrRecord on
+// encode, the case "record" arm → udArrayPtrRecord on decode) and then hands
+// the element to the record (de)serializer's own indirect/indirectAlloc budget.
+// Without declining a multi-level-pointer element it accepted a chain
+// 1+maxIndirectDepth deep — one past the cap the top-level reflect path, the
+// JSON encoder, and the nullunion array arms all enforce — so a []******Record
+// struct field encoded a binary wire that the struct's own JSON encoder, a
+// top-level encode of the same slice, and a top-level decode into the same type
+// all reject. Every context must agree on the accept/reject boundary; an
+// accepted chain must round-trip. The fast path stays single-pointer
+// ([]*Record); deeper-but-in-cap chains route to the reflect path.
+func TestRegression_ArrayRecordElementPointerChainDepthParity(t *testing.T) {
+	const recJSON = `{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}`
+	sArr := avro.MustParse(`{"type":"array","items":` + recJSON + `}`)
+	sOuter := avro.MustParse(`{"type":"record","name":"Outer","fields":[{"name":"arr","type":{"type":"array","items":` + recJSON + `}}]}`)
+
+	innerStruct := reflect.StructOf([]reflect.StructField{
+		{Name: "X", Type: reflect.TypeOf(int32(0)), Tag: `avro:"x"`},
+	})
+	// chain returns the slice element type at the given pointer depth and a
+	// non-nil value of that type bottoming at Inner{X:7}.
+	chain := func(depth int) (reflect.Type, reflect.Value) {
+		elemType := innerStruct
+		for range depth {
+			elemType = reflect.PointerTo(elemType)
+		}
+		v := reflect.New(innerStruct).Elem()
+		v.Field(0).SetInt(7)
+		for range depth {
+			p := reflect.New(v.Type())
+			p.Elem().Set(v)
+			v = p
+		}
+		return elemType, v
+	}
+
+	for depth := 0; depth <= maxDepthLevels+1; depth++ {
+		elemType, elemVal := chain(depth)
+		sliceType := reflect.SliceOf(elemType)
+
+		// Oracle: the same []*…*Inner value at top level goes through the reflect
+		// serArray path, which peels with a single indirect budget (caps at the
+		// cap). Its accept/reject is the boundary every other context must match.
+		topSlice := reflect.MakeSlice(sliceType, 1, 1)
+		topSlice.Index(0).Set(elemVal)
+		_, topErr := sArr.AppendEncode(nil, topSlice.Interface())
+
+		// Struct field exercises the unsafe usArrayRecord fast path (the value is
+		// addressable through reflect.New, so the unsafe compile is selected).
+		outerType := reflect.StructOf([]reflect.StructField{
+			{Name: "Arr", Type: sliceType, Tag: `avro:"arr"`},
+		})
+		outer := reflect.New(outerType)
+		sl := reflect.MakeSlice(sliceType, 1, 1)
+		sl.Index(0).Set(elemVal)
+		outer.Elem().Field(0).Set(sl)
+
+		binWire, binErr := sOuter.AppendEncode(nil, outer.Interface())
+		_, jsonErr := sOuter.AppendEncodeJSON(nil, outer.Interface())
+
+		if (binErr == nil) != (topErr == nil) {
+			t.Errorf("depth %d: struct-field unsafe encode and top-level reflect encode disagree (structErr=%v topErr=%v)", depth, binErr, topErr)
+		}
+		if (binErr == nil) != (jsonErr == nil) {
+			t.Errorf("depth %d: binary and JSON struct-field encode disagree (binErr=%v jsonErr=%v)", depth, binErr, jsonErr)
+		}
+
+		if depth <= maxDepthLevels {
+			// Within the cap: must encode and round-trip back to the value.
+			if binErr != nil {
+				t.Errorf("depth %d (<= cap %d) must encode: %v", depth, maxDepthLevels, binErr)
+				continue
+			}
+			got := reflect.New(outerType)
+			if _, err := sOuter.Decode(binWire, got.Interface()); err != nil {
+				t.Errorf("depth %d (<= cap) must decode: %v", depth, err)
+				continue
+			}
+			gv := got.Elem().Field(0).Index(0)
+			for gv.Kind() == reflect.Pointer {
+				if gv.IsNil() {
+					t.Errorf("depth %d round-trip produced a nil element", depth)
+					break
+				}
+				gv = gv.Elem()
+			}
+			if gv.Kind() == reflect.Struct && gv.Field(0).Int() != 7 {
+				t.Errorf("depth %d round-trip value mismatch: got %v", depth, gv.Field(0).Int())
+			}
+		} else if binErr == nil {
+			// depth == cap+1: every encode context must reject.
+			t.Errorf("depth %d (> cap %d) struct-field binary encode must reject; wire=%x", depth, maxDepthLevels, binWire)
+		}
+	}
+
+	// Decode-side neuter-proof: a valid wire (one record element) decoded into a
+	// struct whose array element is one level past the cap must reject — the fast
+	// udArrayPtrRecord must not peel 1+maxIndirectDepth levels.
+	depth0Slice := reflect.SliceOf(innerStruct)
+	d0 := reflect.New(reflect.StructOf([]reflect.StructField{
+		{Name: "Arr", Type: depth0Slice, Tag: `avro:"arr"`},
+	}))
+	one := reflect.New(innerStruct).Elem()
+	one.Field(0).SetInt(7)
+	s0 := reflect.MakeSlice(depth0Slice, 1, 1)
+	s0.Index(0).Set(one)
+	d0.Elem().Field(0).Set(s0)
+	validWire, err := sOuter.AppendEncode(nil, d0.Interface())
+	if err != nil {
+		t.Fatalf("setup: encode of []Inner must succeed: %v", err)
+	}
+	deepElem := innerStruct
+	for range maxDepthLevels + 1 {
+		deepElem = reflect.PointerTo(deepElem)
+	}
+	deepOuter := reflect.New(reflect.StructOf([]reflect.StructField{
+		{Name: "Arr", Type: reflect.SliceOf(deepElem), Tag: `avro:"arr"`},
+	}))
+	if _, err := sOuter.Decode(validWire, deepOuter.Interface()); err == nil {
+		t.Errorf("decode into an array field whose element is %d pointers deep must reject (cap %d)", maxDepthLevels+1, maxDepthLevels)
+	}
+}
+
+// A ["null", record] nullunion record FIELD's pointer chain must be capped at
+// maxIndirectDepth on decode, matching encode and every other context. The
+// unsafe udNullUnionRecord consumes the nullunion's outer pointer (goType.Elem)
+// and then indirectAllocs the remainder, so without declining a multi-level
+// pointer target it accepted a chain 1+maxIndirectDepth deep — one past the cap
+// the encode side (which already declines **…T to reflect), the reflect deser,
+// and the JSON paths all enforce. A valid wire decoded into a ******record
+// nullunion field then succeeded where encode of the same type rejected: an
+// encode/decode boundary asymmetry. Decode must reject at the same depth encode
+// does; the fast path stays single-pointer (*record), deeper-but-in-cap chains
+// route to the reflect deser.
+func TestRegression_NullUnionRecordFieldPointerChainDepthParity(t *testing.T) {
+	const recJSON = `{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}`
+	s := avro.MustParse(`{"type":"record","name":"Outer","fields":[{"name":"f","type":["null",` + recJSON + `]}]}`)
+
+	innerStruct := reflect.StructOf([]reflect.StructField{
+		{Name: "X", Type: reflect.TypeOf(int32(0)), Tag: `avro:"x"`},
+	})
+	ptrType := func(depth int) reflect.Type {
+		ft := innerStruct
+		for range depth {
+			ft = reflect.PointerTo(ft)
+		}
+		return ft
+	}
+	nonNilVal := func(depth int) reflect.Value {
+		v := reflect.New(innerStruct).Elem()
+		v.Field(0).SetInt(7)
+		for range depth {
+			p := reflect.New(v.Type())
+			p.Elem().Set(v)
+			v = p
+		}
+		return v
+	}
+	outerOf := func(fieldType reflect.Type) reflect.Type {
+		return reflect.StructOf([]reflect.StructField{{Name: "F", Type: fieldType, Tag: `avro:"f"`}})
+	}
+
+	// A valid wire: a depth-1 (*record) non-nil value encodes the value branch.
+	d1Type := outerOf(ptrType(1))
+	d1 := reflect.New(d1Type)
+	d1.Elem().Field(0).Set(nonNilVal(1))
+	validWire, err := s.AppendEncode(nil, d1.Interface())
+	if err != nil {
+		t.Fatalf("setup: encode of a *record nullunion value must succeed: %v", err)
+	}
+
+	for depth := 1; depth <= maxDepthLevels+1; depth++ {
+		outerType := outerOf(ptrType(depth))
+		outer := reflect.New(outerType)
+		outer.Elem().Field(0).Set(nonNilVal(depth))
+
+		binWire, binErr := s.AppendEncode(nil, outer.Interface())
+		_, jsonErr := s.AppendEncodeJSON(nil, outer.Interface())
+		// Decode the valid depth-1 wire into this depth's target type — the
+		// decode-side boundary, independent of whether encode produced a wire.
+		_, decErr := s.Decode(validWire, reflect.New(outerType).Interface())
+
+		if (binErr == nil) != (jsonErr == nil) {
+			t.Errorf("depth %d: binary vs JSON encode disagree (bin=%v json=%v)", depth, binErr, jsonErr)
+		}
+		if (binErr == nil) != (decErr == nil) {
+			t.Errorf("depth %d: encode and decode disagree on the cap boundary (encErr=%v decErr=%v)", depth, binErr, decErr)
+		}
+
+		if depth <= maxDepthLevels {
+			if binErr != nil {
+				t.Errorf("depth %d (<= cap %d) must encode: %v", depth, maxDepthLevels, binErr)
+				continue
+			}
+			got := reflect.New(outerType)
+			if _, err := s.Decode(binWire, got.Interface()); err != nil {
+				t.Errorf("depth %d (<= cap) must decode: %v", depth, err)
+				continue
+			}
+			gv := got.Elem().Field(0)
+			for gv.Kind() == reflect.Pointer {
+				if gv.IsNil() {
+					t.Errorf("depth %d round-trip produced a nil value", depth)
+					break
+				}
+				gv = gv.Elem()
+			}
+			if gv.Kind() == reflect.Struct && gv.Field(0).Int() != 7 {
+				t.Errorf("depth %d round-trip value mismatch: got %v", depth, gv.Field(0).Int())
+			}
+		} else if decErr == nil {
+			// depth == cap+1: decode into the too-deep target must reject (the
+			// decode-side neuter-proof), matching encode.
+			t.Errorf("depth %d (> cap %d) decode into a too-deep nullunion field must reject", depth, maxDepthLevels)
+		}
+	}
+}
+
+// ---------- named_byte_element_test.go ----------
+
+// A Go byte-container type whose ELEMENT type is a named byte (type B byte;
+// [N]B, []B) has element Kind Uint8 but an element type that is not exactly
+// uint8. The byte encoder accepts such types (serSize / doSerBytes /
+// appendAvroJSONBytes iterate elements via Uint), so by the encode/decode
+// target-type parity contract every decoder and the JSON encoder must accept
+// them too. The decode and JSON paths used reflect.Copy /
+// reflect.Value.Set(reflect.ValueOf([]byte)), which require the element type to
+// be EXACTLY uint8 and PANIC on a named element ("reflect.Copy: B != uint8") —
+// a panic reaching the caller of a public API on a valid Go value. These tests
+// pin that every fixed/bytes/uuid path round-trips a named-byte-element type on
+// both wires, scalar and as a struct field (the unsafe fast path), and through
+// bytes->string+uuid promotion.
+
+type nbeByte byte
+type nbeFix3 [3]nbeByte
+type nbeUUID [16]nbeByte
+type nbeSlice []nbeByte
+
+func TestRegression_NamedByteElementRoundTrip(t *testing.T) {
+	uuidWire := nbeUUID{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe}
+
+	t.Run("fixed/binary", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
+		in := nbeFix3{1, 2, 3}
+		b, err := s.AppendEncode(nil, in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out nbeFix3
+		if _, err := s.Decode(b, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != in {
+			t.Fatalf("round-trip: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("fixed/json", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
+		in := nbeFix3{1, 2, 3}
+		j, err := s.AppendEncodeJSON(nil, in)
+		if err != nil {
+			t.Fatalf("encode json: %v", err)
+		}
+		var out nbeFix3
+		if err := s.DecodeJSON(j, &out); err != nil {
+			t.Fatalf("decode json: %v", err)
+		}
+		if out != in {
+			t.Fatalf("round-trip json: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("bytes/array/binary", func(t *testing.T) {
+		s := avro.MustParse(`"bytes"`)
+		in := nbeFix3{4, 5, 6}
+		b, err := s.AppendEncode(nil, in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out nbeFix3
+		if _, err := s.Decode(b, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != in {
+			t.Fatalf("round-trip: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("bytes/slice/binary+json", func(t *testing.T) {
+		s := avro.MustParse(`"bytes"`)
+		in := nbeSlice{7, 8, 9}
+		b, err := s.AppendEncode(nil, in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out nbeSlice
+		if _, err := s.Decode(b, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal([]byte(toBytes(out)), []byte{7, 8, 9}) {
+			t.Fatalf("round-trip: got %v", out)
+		}
+		j, err := s.AppendEncodeJSON(nil, in)
+		if err != nil {
+			t.Fatalf("encode json: %v", err)
+		}
+		var outJ nbeSlice
+		if err := s.DecodeJSON(j, &outJ); err != nil {
+			t.Fatalf("decode json: %v", err)
+		}
+	})
+
+	t.Run("bytes/array->fixed-slice-target/binary", func(t *testing.T) {
+		// deserFixed's slice arm (was Set(reflect.ValueOf), now SetBytes).
+		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
+		b, err := s.AppendEncode(nil, nbeFix3{1, 2, 3})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out nbeSlice
+		if _, err := s.Decode(b, &out); err != nil {
+			t.Fatalf("decode into named-byte slice: %v", err)
+		}
+		if len(out) != 3 {
+			t.Fatalf("got %v", out)
+		}
+	})
+
+	t.Run("uuid-fixed/binary+json", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`)
+		b, err := s.AppendEncode(nil, uuidWire)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out nbeUUID
+		if _, err := s.Decode(b, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != uuidWire {
+			t.Fatalf("round-trip: got %v want %v", out, uuidWire)
+		}
+		j, err := s.AppendEncodeJSON(nil, uuidWire)
+		if err != nil {
+			t.Fatalf("encode json: %v", err)
+		}
+		var outJ nbeUUID
+		if err := s.DecodeJSON(j, &outJ); err != nil {
+			t.Fatalf("decode json: %v", err)
+		}
+		if outJ != uuidWire {
+			t.Fatalf("round-trip json: got %v want %v", outJ, uuidWire)
+		}
+	})
+
+	t.Run("uuid-string->[16]named/binary+json", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"string","logicalType":"uuid"}`)
+		str := "01234567-89ab-cdef-1032-547698badcfe"
+		b, err := s.AppendEncode(nil, str)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out nbeUUID
+		if _, err := s.Decode(b, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != uuidWire {
+			t.Fatalf("round-trip: got %v want %v", out, uuidWire)
+		}
+		j, err := s.AppendEncodeJSON(nil, str)
+		if err != nil {
+			t.Fatalf("encode json: %v", err)
+		}
+		var outJ nbeUUID
+		if err := s.DecodeJSON(j, &outJ); err != nil {
+			t.Fatalf("decode json: %v", err)
+		}
+		if outJ != uuidWire {
+			t.Fatalf("round-trip json: got %v want %v", outJ, uuidWire)
+		}
+	})
+
+	t.Run("struct-field-fixed/unsafe-path/binary", func(t *testing.T) {
+		type R struct {
+			F nbeFix3
+		}
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"F","type":{"type":"fixed","name":"F3","size":3}}]}`)
+		in := R{F: nbeFix3{1, 2, 3}}
+		b, err := s.AppendEncode(nil, in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out R
+		if _, err := s.Decode(b, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != in {
+			t.Fatalf("round-trip: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("struct-field-uuid/unsafe-path/binary", func(t *testing.T) {
+		type R struct {
+			U nbeUUID `avro:"u"`
+		}
+		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"u","type":{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}}]}`)
+		in := R{U: uuidWire}
+		b, err := s.AppendEncode(nil, in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out R
+		if _, err := s.Decode(b, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if out != in {
+			t.Fatalf("round-trip: got %v want %v", out, in)
+		}
+	})
+
+	t.Run("bytes->string+uuid promotion/[16]named", func(t *testing.T) {
+		// promoteBytesToStringUUID: writer bytes, reader string+uuid, target
+		// [16]named. Was reflect.Copy (panic), now copyBytesToArray.
+		w := avro.MustParse(`"bytes"`)
+		r := avro.MustParse(`{"type":"string","logicalType":"uuid"}`)
+		res, err := avro.Resolve(w, r)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		// Writer encodes the 36-char canonical UUID string AS bytes.
+		b, err := w.AppendEncode(nil, []byte("01234567-89ab-cdef-1032-547698badcfe"))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var out nbeUUID
+		if _, err := res.Decode(b, &out); err != nil {
+			t.Fatalf("promoted decode: %v", err)
+		}
+		if out != uuidWire {
+			t.Fatalf("promotion round-trip: got %v want %v", out, uuidWire)
+		}
+	})
+}
+
+// toBytes converts a named byte slice to []byte for comparison.
+func toBytes(s nbeSlice) []byte {
+	b := make([]byte, len(s))
+	for i := range s {
+		b[i] = byte(s[i])
+	}
+	return b
+}
+
+// TestRegression_ExactByteContainersStillRoundTrip is the boundary-1 control:
+// the exact-uint8 element fast path (the common [N]byte / []byte case) must keep
+// working unchanged after the named-byte-element fix relaxed the copy helpers.
+func TestRegression_ExactByteContainersStillRoundTrip(t *testing.T) {
+	t.Run("fixed/[3]byte", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"F","size":3}`)
+		in := [3]byte{1, 2, 3}
+		b, _ := s.AppendEncode(nil, in)
+		var out [3]byte
+		if _, err := s.Decode(b, &out); err != nil || out != in {
+			t.Fatalf("got %v err %v", out, err)
+		}
+		j, _ := s.AppendEncodeJSON(nil, in)
+		var outJ [3]byte
+		if err := s.DecodeJSON(j, &outJ); err != nil || outJ != in {
+			t.Fatalf("json got %v err %v", outJ, err)
+		}
+	})
+	t.Run("uuid-fixed/[16]byte", func(t *testing.T) {
+		s := avro.MustParse(`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`)
+		in := [16]byte{1, 2, 3, 4}
+		b, _ := s.AppendEncode(nil, in)
+		var out [16]byte
+		if _, err := s.Decode(b, &out); err != nil || out != in {
+			t.Fatalf("got %v err %v", out, err)
+		}
+	})
+	t.Run("bytes/[]byte", func(t *testing.T) {
+		s := avro.MustParse(`"bytes"`)
+		in := []byte{9, 8, 7}
+		b, _ := s.AppendEncode(nil, in)
+		var out []byte
+		if _, err := s.Decode(b, &out); err != nil || !bytes.Equal(out, in) {
+			t.Fatalf("got %v err %v", out, err)
+		}
+	})
+}
+
+// ---------- unsafe_nullunion_nil_test.go ----------
+
+// The 2-branch ["null",T] / [T,"null"] optimization treats a value as the null
+// branch exactly when avro's isNilValue reports it nil — which peels
+// pointer/interface layers and then nil-checks the bottom kind, so a non-nil
+// pointer to a nil slice/map (&(nilSlice)) is null. The reflect-binary and JSON
+// encoders both honor isNilValue. The unsafe struct fast path must agree: the
+// SAME value must encode to the SAME union branch whether the struct is passed
+// addressable (&v, which reaches the unsafe path) or by value (v, reflect), and
+// JSON must match too. A divergence is addressability-dependent wire corruption.
+//
+// These pin the slice-backed inner shapes (array, bytes) of the null-union field
+// optimization (usNullUnionPtr) and its array-element sibling (usArrayNullUnionPtr),
+// plus map/non-nil controls.
+
+// nullUnionParity encodes v addressable (unsafe) and by value (reflect) and as
+// JSON, and asserts all three pick the same union branch: the two binary wires
+// are byte-identical, the JSON wires are byte-identical, and the binary wire
+// decodes to wantNull (true => the field comes back nil/absent).
+func nullUnionParity(t *testing.T, schema string, v any, vptr any, wantNull bool) {
+	t.Helper()
+	s := avro.MustParse(schema)
+
+	wPtr, err := s.AppendEncode(nil, vptr) // addressable struct -> unsafe fast path
+	if err != nil {
+		t.Fatalf("Encode(&v): %v", err)
+	}
+	wVal, err := s.AppendEncode(nil, v) // non-addressable -> reflect path
+	if err != nil {
+		t.Fatalf("Encode(v): %v", err)
+	}
+	if !bytes.Equal(wPtr, wVal) {
+		t.Errorf("binary branch divergence (addressable vs value): Encode(&v)=% x  Encode(v)=% x", wPtr, wVal)
+	}
+
+	jPtr, err := s.AppendEncodeJSON(nil, vptr)
+	if err != nil {
+		t.Fatalf("EncodeJSON(&v): %v", err)
+	}
+	jVal, err := s.AppendEncodeJSON(nil, v)
+	if err != nil {
+		t.Fatalf("EncodeJSON(v): %v", err)
+	}
+	if !bytes.Equal(jPtr, jVal) {
+		t.Errorf("JSON branch divergence (addressable vs value): EncodeJSON(&v)=%s  EncodeJSON(v)=%s", jPtr, jVal)
+	}
+
+	// The unsafe binary wire must agree with JSON on the branch too. Decode the
+	// unsafe binary wire into a map and confirm the field is/isn't null.
+	var got map[string]any
+	if _, err := s.Decode(wPtr, &got); err != nil {
+		t.Fatalf("Decode(Encode(&v)): %v", err)
+	}
+	isNull := got["f"] == nil
+	if isNull != wantNull {
+		t.Errorf("decode(Encode(&v)).f null=%v, want null=%v (value=%#v; wire=% x)", isNull, wantNull, got["f"], wPtr)
+	}
+}
+
+func TestRegression_NullUnionPtrToNilSliceEncodeParity(t *testing.T) {
+	t.Run("ptr-to-nil-slice/array-null-first", func(t *testing.T) {
+		type Rec struct {
+			F *[]string `avro:"f"`
+		}
+		var nilSlice []string
+		nullUnionParity(t,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"array","items":"string"}]}]}`,
+			Rec{F: &nilSlice}, &Rec{F: &nilSlice}, true)
+	})
+
+	t.Run("ptr-to-nil-slice/array-null-second", func(t *testing.T) {
+		type Rec struct {
+			F *[]string `avro:"f"`
+		}
+		var nilSlice []string
+		nullUnionParity(t,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":[{"type":"array","items":"string"},"null"]}]}`,
+			Rec{F: &nilSlice}, &Rec{F: &nilSlice}, true)
+	})
+
+	t.Run("ptr-to-nil-bytes", func(t *testing.T) {
+		type Rec struct {
+			F *[]byte `avro:"f"`
+		}
+		var nilBytes []byte
+		nullUnionParity(t,
+			`{"type":"record","name":"R","fields":[{"name":"f","type":["null","bytes"]}]}`,
+			Rec{F: &nilBytes}, &Rec{F: &nilBytes}, true)
+	})
+
+	t.Run("array-element-ptr-to-nil-slice", func(t *testing.T) {
+		type Rec struct {
+			A []*[]string `avro:"a"`
+		}
+		var nilSlice []string
+		// One element: a non-nil pointer to a nil slice -> that element is the
+		// null branch; reflect/JSON agree, unsafe must too.
+		s := `{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":["null",{"type":"array","items":"string"}]}}]}`
+		sc := avro.MustParse(s)
+		wPtr, err := sc.AppendEncode(nil, &Rec{A: []*[]string{&nilSlice}})
+		if err != nil {
+			t.Fatalf("Encode(&v): %v", err)
+		}
+		wVal, err := sc.AppendEncode(nil, Rec{A: []*[]string{&nilSlice}})
+		if err != nil {
+			t.Fatalf("Encode(v): %v", err)
+		}
+		if !bytes.Equal(wPtr, wVal) {
+			t.Errorf("array-element branch divergence: Encode(&v)=% x  Encode(v)=% x", wPtr, wVal)
+		}
+		jPtr, _ := sc.AppendEncodeJSON(nil, &Rec{A: []*[]string{&nilSlice}})
+		jVal, _ := sc.AppendEncodeJSON(nil, Rec{A: []*[]string{&nilSlice}})
+		if !bytes.Equal(jPtr, jVal) {
+			t.Errorf("array-element JSON divergence: %s vs %s", jPtr, jVal)
+		}
+	})
+}
+
+func TestRegression_NullUnionPtrToNilMapEncodeParity(t *testing.T) {
+	type Rec struct {
+		F *map[string]string `avro:"f"`
+	}
+	var nilMap map[string]string
+	nullUnionParity(t,
+		`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"map","values":"string"}]}]}`,
+		Rec{F: &nilMap}, &Rec{F: &nilMap}, true)
+}
+
+func TestRegression_NullUnionPtrToNonNilSliceControl(t *testing.T) {
+	// Control: a non-nil slice behind the pointer is the VALUE branch on every
+	// path; the fix must not regress this (it currently agrees).
+	type Rec struct {
+		F *[]string `avro:"f"`
+	}
+	good := []string{"x"}
+	nullUnionParity(t,
+		`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"array","items":"string"}]}]}`,
+		Rec{F: &good}, &Rec{F: &good}, false)
+}
+
+// ---------- omitzero_bsoft_test.go ----------
+
+// TestRegression_OmitzeroFillsSchemaDefault pins the b-soft omitzero contract:
+// on a zero/IsZero value, omitzero encodes the field's default if it has one,
+// else null if the field is nullable, else nothing (encode the zero — a forced
+// no-op). It therefore matches map[string]any default-fill wherever a default
+// exists; it deliberately diverges for a nullable field with NO default, where
+// omitzero encodes null while map-fill errors ("missing key").
+func TestRegression_OmitzeroFillsSchemaDefault(t *testing.T) {
+	type R struct {
+		Count int `avro:"Count,omitzero"`
+	}
+	cases := []struct {
+		name, schema, wantHex string
+		mapParity             bool // struct-omitzero wire must equal map{} default-fill wire
+	}{
+		// WITH a default → fill it (was buggy: emitted 0 / null). Matches map-fill.
+		{"non-union int default", `{"type":"record","name":"R","fields":[{"name":"Count","type":"int","default":10}]}`, "14", true},
+		{"null-second union default", `{"type":"record","name":"R","fields":[{"name":"Count","type":["int","null"],"default":5}]}`, "000a", true},
+		// nullable NO default → null (preserved; diverges from map-fill, which errors).
+		{"null-second union no default", `{"type":"record","name":"R","fields":[{"name":"Count","type":["int","null"]}]}`, "02", false},
+		// non-union NO default → no-op, encode the zero (preserved).
+		{"non-union int no default", `{"type":"record","name":"R","fields":[{"name":"Count","type":"int"}]}`, "00", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := avro.MustParse(tc.schema)
+			structWire, err := s.AppendEncode(nil, R{Count: 0})
+			if err != nil {
+				t.Fatalf("encode struct: %v", err)
+			}
+			if got := fmt.Sprintf("%x", structWire); got != tc.wantHex {
+				t.Errorf("omitzero wire = %s, want %s", got, tc.wantHex)
+			}
+			// The unsafe (addressable) path must agree with the reflect path
+			// — it delegates actionable omitzero to the reflect slow path, so
+			// this pins that the delegation stays correct.
+			ptrWire, err := s.AppendEncode(nil, &R{Count: 0})
+			if err != nil {
+				t.Fatalf("encode &struct (unsafe path): %v", err)
+			}
+			if !bytes.Equal(structWire, ptrWire) {
+				t.Errorf("unsafe path diverges from reflect: value=%x ptr=%x", structWire, ptrWire)
+			}
+			if tc.mapParity {
+				// Binary parity with map[string]any default-fill (the oracle).
+				mapWire, err := s.AppendEncode(nil, map[string]any{})
+				if err != nil {
+					t.Fatalf("encode map{}: %v", err)
+				}
+				if !bytes.Equal(structWire, mapWire) {
+					t.Errorf("omitzero != map default-fill (binary): struct=%x map=%x", structWire, mapWire)
+				}
+				// JSON path parity with the same oracle.
+				sj, err := s.EncodeJSON(R{Count: 0})
+				if err != nil {
+					t.Fatalf("encode struct JSON: %v", err)
+				}
+				mj, err := s.EncodeJSON(map[string]any{})
+				if err != nil {
+					t.Fatalf("encode map{} JSON: %v", err)
+				}
+				if !bytes.Equal(sj, mj) {
+					t.Errorf("omitzero != map default-fill (JSON): struct=%s map=%s", sj, mj)
+				}
+			}
+		})
 	}
 }

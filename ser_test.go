@@ -3,17 +3,24 @@ package avro
 import (
 	"bytes"
 	"encoding"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math"
 	"math/big"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
-
 	"testing"
 	"time"
 )
+
+// ---------- ser_test.go ----------
 
 type Superhero struct {
 	ID            int32         `avro:"id"`
@@ -3036,4 +3043,2853 @@ func TestRegression_TextAppenderHeaderGrowth(t *testing.T) {
 			t.Fatalf("n=%d: record round-trip corrupted: len(S)=%d N=%#x (want len %d, 0x2a)", n, len(rout.S), rout.N, n)
 		}
 	}
+}
+
+// ---------- array_element_fastpath_test.go ----------
+
+// The array/map primitive encoders fast-path the exact natural Go element
+// type (int32 for "int", int64/int for "long", float32/float64, bool,
+// string) with a direct read+emit loop, bypassing the per-element
+// appendAvro* dispatch. A named element type of the same underlying kind
+// routes through the GENERAL appendAvro* path instead. This pins the
+// invariant that the two produce byte-identical wire — the fast loop must
+// never diverge from the general path, including at boundary values.
+
+type fpInt32 int32
+type fpInt64 int64
+type fpInt int
+type fpFloat32 float32
+type fpFloat64 float64
+type fpBool bool
+type fpString string
+
+func TestRegression_ArrayElementFastPathMatchesGeneral(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		fast   any // builtin element type → fast loop
+		gen    any // named element type → general appendAvro* path
+	}{
+		{"int", `{"type":"array","items":"int"}`,
+			[]int32{0, 1, -1, math.MaxInt32, math.MinInt32},
+			[]fpInt32{0, 1, -1, math.MaxInt32, math.MinInt32}},
+		{"long_int64", `{"type":"array","items":"long"}`,
+			[]int64{0, 1, -1, math.MaxInt64, math.MinInt64},
+			[]fpInt64{0, 1, -1, math.MaxInt64, math.MinInt64}},
+		{"long_int", `{"type":"array","items":"long"}`,
+			// Platform int extremes: identical to MaxInt64/MinInt64 on
+			// 64-bit, and the representable extremes (so the file still
+			// compiles) on 32-bit platforms.
+			[]int{0, 1, -1, math.MaxInt, math.MinInt},
+			[]fpInt{0, 1, -1, math.MaxInt, math.MinInt}},
+		{"float", `{"type":"array","items":"float"}`,
+			[]float32{0, 1, -1, math.MaxFloat32, float32(math.Inf(1)), float32(math.NaN())},
+			[]fpFloat32{0, 1, -1, math.MaxFloat32, fpFloat32(math.Inf(1)), fpFloat32(math.NaN())}},
+		{"double", `{"type":"array","items":"double"}`,
+			[]float64{0, 1, -1, math.MaxFloat64, math.Inf(-1), math.NaN()},
+			[]fpFloat64{0, 1, -1, math.MaxFloat64, fpFloat64(math.Inf(-1)), fpFloat64(math.NaN())}},
+		{"boolean", `{"type":"array","items":"boolean"}`,
+			[]bool{true, false, true},
+			[]fpBool{true, false, true}},
+		{"string", `{"type":"array","items":"string"}`,
+			[]string{"", "a", "héllo", "x\x00y"},
+			[]fpString{"", "a", "héllo", "x\x00y"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.schema)
+			fast, err := s.Encode(c.fast)
+			if err != nil {
+				t.Fatalf("fast encode: %v", err)
+			}
+			gen, err := s.Encode(c.gen)
+			if err != nil {
+				t.Fatalf("general encode: %v", err)
+			}
+			if !bytes.Equal(fast, gen) {
+				t.Fatalf("fast-loop wire diverges from general path:\n fast=% x\n gen =% x", fast, gen)
+			}
+			// Round-trip the fast wire back into the builtin slice type.
+			out := reflect.New(reflect.TypeOf(c.fast)).Interface()
+			if _, err := s.Decode(fast, out); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			re, err := s.Encode(reflect.ValueOf(out).Elem().Interface())
+			if err != nil {
+				t.Fatalf("re-encode: %v", err)
+			}
+			if !bytes.Equal(re, fast) {
+				t.Fatalf("round-trip wire mismatch:\n in =% x\n out=% x", fast, re)
+			}
+		})
+	}
+}
+
+// Decode-side native path: a builtin []V decodes via the concrete-slice loop
+// (s[i]=v); a named slice type and a named-element type must fall back to the
+// reflect loop (the unnamed-[]V assertion returns handled=false) and still
+// decode correctly with src untouched on the fallthrough.
+func TestRegression_ArrayDecodeNamedFallback(t *testing.T) {
+	type namedSlice []int32
+	type namedElem int32
+	s := MustParse(`{"type":"array","items":"int"}`)
+	want := []int32{0, 1, -1, math.MaxInt32, math.MinInt32}
+	wire, err := s.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var builtin []int32 // native loop
+	if _, err := s.Decode(wire, &builtin); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(builtin, want) {
+		t.Fatalf("native []int32: %v != %v", builtin, want)
+	}
+	var ns namedSlice // named slice type → fallback
+	if _, err := s.Decode(wire, &ns); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual([]int32(ns), want) {
+		t.Fatalf("named slice fallback: %v", ns)
+	}
+	var ne []namedElem // named elem type → fallback
+	if _, err := s.Decode(wire, &ne); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(ne, []namedElem{0, 1, -1, math.MaxInt32, math.MinInt32}) {
+		t.Fatalf("named elem fallback: %v", ne)
+	}
+}
+
+// Map builtin-string value fast path must match the general (named-value) path.
+func TestRegression_MapValueFastPathMatchesGeneral(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"string"}`)
+	fast, _ := s.Encode(map[string]string{"k": "v"})
+	gen, _ := s.Encode(map[string]fpString{"k": "v"})
+	if !bytes.Equal(fast, gen) {
+		t.Fatalf("map value fast-loop diverges: fast=% x gen=% x", fast, gen)
+	}
+}
+
+// ---------- array_zerobyte_compat_test.go ----------
+
+// TestRegression_ArrayZeroByteProducerCompliance pins producer-side compliance
+// with the decoder's zero-byte-item cap (checkArrayBlockBounds /
+// maxZeroByteItems). The decoder rejects an array of more than maxZeroByteItems
+// zero-byte items (array<null>, array<EmptyRecord>, array<size-0-fixed>) as a
+// deliberate DoS defense (BUG_AUDIT "DOS-resistance defense-in-depth"). The
+// core array ENCODER had no matching check, so s.Encode produced a tiny wire
+// (a count with no body) that s.Decode then rejected — a silent self-
+// incompatible round-trip. This is the same class as the OCF zero-byte writer
+// bound (TestWriterZeroByteDatumsSelfReadable): every reader-side cap needs a
+// producer-side compliance check. The encoder now rejects at encode time with
+// a clear error, and everything at or below the cap still round-trips.
+func TestRegression_ArrayZeroByteProducerCompliance(t *testing.T) {
+	zeroByteItemSchemas := []struct {
+		label  string
+		schema string
+		item   any // a single zero-byte item value for this schema
+	}{
+		{"null", `{"type":"array","items":"null"}`, nil},
+		{"empty-record", `{"type":"array","items":{"type":"record","name":"E","fields":[]}}`, map[string]any{}},
+		{"size-0-fixed", `{"type":"array","items":{"type":"fixed","name":"Z","size":0}}`, []byte{}},
+	}
+
+	fill := func(item any, n int) []any {
+		a := make([]any, n)
+		for i := range a {
+			a[i] = item
+		}
+		return a
+	}
+
+	for _, zb := range zeroByteItemSchemas {
+		t.Run(zb.label, func(t *testing.T) {
+			s := MustParse(zb.schema)
+
+			// At the cap: must encode AND round-trip (self-readable).
+			atCap := fill(zb.item, maxZeroByteItems)
+			wire, err := s.AppendEncode(nil, atCap)
+			if err != nil {
+				t.Fatalf("encode at the cap (%d) rejected: %v", maxZeroByteItems, err)
+			}
+			var back []any
+			if _, err := s.Decode(wire, &back); err != nil {
+				t.Fatalf("SELF-INCOMPATIBILITY: encoded %d zero-byte items it cannot decode: %v", maxZeroByteItems, err)
+			}
+			if len(back) != maxZeroByteItems {
+				t.Fatalf("round-trip length: got %d want %d", len(back), maxZeroByteItems)
+			}
+
+			// One past the cap: the encoder must REJECT (producer compliance),
+			// not emit a wire the decoder rejects.
+			over := fill(zb.item, maxZeroByteItems+1)
+			if _, err := s.AppendEncode(nil, over); err == nil {
+				t.Fatalf("encoder produced a %d zero-byte-item array the decoder rejects (self-incompatible); want an encode-time error", maxZeroByteItems+1)
+			} else if !strings.Contains(err.Error(), "zero-byte") {
+				t.Fatalf("over-cap encode rejected, but not with the zero-byte-cap reason: %v", err)
+			}
+		})
+	}
+}
+
+// TestRegression_ArrayZeroByteSkipPathCompliance covers the resolution skip
+// path: a writer record with an array<null> field the reader drops. Because
+// the encoder now refuses to PRODUCE an over-cap zero-byte array, no such wire
+// reaches the skip path from a twmb writer — the self-incompatibility is
+// resolved at its source. The under-cap case still resolves+skips cleanly.
+func TestRegression_ArrayZeroByteSkipPathCompliance(t *testing.T) {
+	wSchema := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"drop","type":{"type":"array","items":"null"}},
+		{"name":"keep","type":"int"}]}`)
+	rSchema := MustParse(`{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}`)
+	res, err := Resolve(wSchema, rSchema)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	// Under cap: encode, resolve-skip the dropped array, keep survives.
+	under := map[string]any{"drop": make([]any, maxZeroByteItems), "keep": int32(7)}
+	wire, err := wSchema.AppendEncode(nil, under)
+	if err != nil {
+		t.Fatalf("under-cap encode: %v", err)
+	}
+	var got map[string]any
+	if _, err := res.Decode(wire, &got); err != nil {
+		t.Fatalf("SELF-INCOMPATIBILITY (skip path): cannot skip a dropped array<null> field it produced: %v", err)
+	}
+	if got["keep"] != int32(7) {
+		t.Fatalf("keep field after skip: %v", got["keep"])
+	}
+
+	// Over cap: the encoder refuses to produce the unreadable wire.
+	over := map[string]any{"drop": make([]any, maxZeroByteItems+1), "keep": int32(7)}
+	if _, err := wSchema.AppendEncode(nil, over); err == nil {
+		t.Fatal("encoder produced a record whose dropped array<null> field exceeds the decoder cap; want an encode-time error")
+	}
+}
+
+// ---------- array_zerobyte_unsafe_test.go ----------
+
+// TestRegression_ArrayZeroByteUnsafePathCompliance covers the UNSAFE array
+// encoders (usArrayRecord / usArrayPtrRecord / usArrayDirect), reached when an
+// array of zero-byte items is an addressable struct field. The first fix added
+// the producer-side maxZeroByteItems check only to the reflect serArray.ser;
+// its unsafe twins write the count + body with no guard, so a struct field
+// []EmptyRecord / []*EmptyRecord / [][0]byte of more than maxZeroByteItems
+// elements still encoded to a tiny wire the decoder rejects. (Sibling sweep:
+// the reflect and unsafe array encoders must share one compliance helper so
+// they cannot drift — that is what this pins.)
+func TestRegression_ArrayZeroByteUnsafePathCompliance(t *testing.T) {
+	type emptyRec struct{}
+
+	cases := []struct {
+		label  string
+		schema string
+		atCap  any
+		over   any
+	}{
+		{
+			"slice-of-empty-record",
+			`{"type":"record","name":"H","fields":[{"name":"a","type":{"type":"array","items":{"type":"record","name":"E","fields":[]}}}]}`,
+			&struct {
+				A []emptyRec `avro:"a"`
+			}{A: make([]emptyRec, maxZeroByteItems)},
+			&struct {
+				A []emptyRec `avro:"a"`
+			}{A: make([]emptyRec, maxZeroByteItems+1)},
+		},
+		{
+			"slice-of-ptr-empty-record",
+			`{"type":"record","name":"H","fields":[{"name":"a","type":{"type":"array","items":{"type":"record","name":"E","fields":[]}}}]}`,
+			func() any {
+				a := make([]*emptyRec, maxZeroByteItems)
+				for i := range a {
+					a[i] = &emptyRec{}
+				}
+				return &struct {
+					A []*emptyRec `avro:"a"`
+				}{A: a}
+			}(),
+			func() any {
+				a := make([]*emptyRec, maxZeroByteItems+1)
+				for i := range a {
+					a[i] = &emptyRec{}
+				}
+				return &struct {
+					A []*emptyRec `avro:"a"`
+				}{A: a}
+			}(),
+		},
+		{
+			"slice-of-size0-fixed",
+			`{"type":"record","name":"H","fields":[{"name":"a","type":{"type":"array","items":{"type":"fixed","name":"Z","size":0}}}]}`,
+			&struct {
+				A [][0]byte `avro:"a"`
+			}{A: make([][0]byte, maxZeroByteItems)},
+			&struct {
+				A [][0]byte `avro:"a"`
+			}{A: make([][0]byte, maxZeroByteItems+1)},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.label, func(t *testing.T) {
+			s := MustParse(c.schema)
+
+			// At the cap: encodes and round-trips (self-readable).
+			wire, err := s.AppendEncode(nil, c.atCap)
+			if err != nil {
+				t.Fatalf("encode at cap: %v", err)
+			}
+			var sink any
+			if _, err := s.Decode(wire, &sink); err != nil {
+				t.Fatalf("SELF-INCOMPATIBILITY (unsafe path): encoded at the cap but cannot decode: %v", err)
+			}
+
+			// Over the cap: the unsafe encoder must REJECT, not emit a wire
+			// the decoder refuses.
+			if _, err := s.AppendEncode(nil, c.over); err == nil {
+				t.Fatal("unsafe array encoder produced an over-cap zero-byte array the decoder rejects; want an encode-time error")
+			} else if !strings.Contains(err.Error(), "zero-byte") {
+				t.Fatalf("over-cap unsafe encode rejected, but not with the zero-byte reason: %v", err)
+			}
+		})
+	}
+}
+
+// ---------- empty_bytes_identity_test.go ----------
+
+// Decoding empty Avro bytes into `any` must produce a NON-nil []byte.
+// A nil []byte is nil-equivalent on re-encode (the documented nil-first
+// union dispatch sends Go nil to the null branch), so a nil result flips
+// {"bytes": ""} to null through any decode→re-encode pipeline:
+//
+//	["null","bytes"] wire 02 00 (bytes branch, length 0)
+//	  → decode → []byte(nil) → re-encode → 00 (null branch)   ← corruption
+//
+// Java decodes empty bytes to an empty (non-null) ByteBuffer and fastavro
+// to b”, both re-encoding onto the bytes branch; twmb's JSON decoder,
+// deserFixed, and the unsafe udBytesDeser all already produce non-nil
+// empties via make+copy. setBytesValue's interface arm was the one
+// sibling manufacturing nil (append onto a nil base).
+func TestRegression_EmptyBytesDecodeNonNil(t *testing.T) {
+	s := MustParse(`"bytes"`)
+	wire, err := s.AppendEncode(nil, []byte{})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var a any
+	if _, err := s.Decode(wire, &a); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	b, ok := a.([]byte)
+	if !ok {
+		t.Fatalf("decoded %T", a)
+	}
+	if b == nil {
+		t.Fatal("empty bytes decoded into any as nil []byte; must be non-nil empty")
+	}
+
+	// The union round-trip consequence: the bytes branch survives a
+	// decode→re-encode cycle.
+	u := MustParse(`["null","bytes"]`)
+	w1 := []byte{0x02, 0x00} // bytes branch, length 0
+	var ua any
+	if _, err := u.Decode(w1, &ua); err != nil {
+		t.Fatalf("union decode: %v", err)
+	}
+	w2, err := u.AppendEncode(nil, ua)
+	if err != nil {
+		t.Fatalf("union re-encode: %v", err)
+	}
+	if !bytes.Equal(w2, w1) {
+		t.Fatalf("union re-encode flipped branch: w1=%x w2=%x (empty bytes became null)", w1, w2)
+	}
+
+	// JSON decoder parity: also non-nil.
+	var ja any
+	if err := s.DecodeJSON([]byte(`""`), &ja); err != nil {
+		t.Fatalf("decodeJSON: %v", err)
+	}
+	if jb, ok := ja.([]byte); !ok || jb == nil {
+		t.Fatalf("JSON decoded %T nil=%v; want non-nil []byte", ja, ja == nil)
+	}
+
+	// The string→bytes promotion path shares setBytesValue, so a
+	// promoted empty string also surfaces as non-nil bytes.
+	ws := MustParse(`"string"`)
+	rb := MustParse(`"bytes"`)
+	res, err := Resolve(ws, rb)
+	if err != nil {
+		t.Fatalf("Resolve(string→bytes): %v", err)
+	}
+	emptyStr, _ := ws.AppendEncode(nil, "")
+	var pa any
+	if _, err := res.Decode(emptyStr, &pa); err != nil {
+		t.Fatalf("promoted decode: %v", err)
+	}
+	if pb, ok := pa.([]byte); !ok || pb == nil {
+		t.Fatalf("promoted empty string decoded as %T nil=%v; want non-nil []byte", pa, pa == nil)
+	}
+
+	// Encoding a Go-nil []byte still picks the null branch (the
+	// documented nil-first dispatch is about ENCODE inputs, untouched).
+	wNil, err := u.AppendEncode(nil, []byte(nil))
+	if err != nil {
+		t.Fatalf("encode nil []byte: %v", err)
+	}
+	if !bytes.Equal(wNil, []byte{0x00}) {
+		t.Fatalf("nil []byte should encode to null branch: %x", wNil)
+	}
+}
+
+// ---------- min_bytes_standin_test.go ----------
+
+// A per-element minimum selects which block-count RULE applies, and the rules
+// are not ordered: zero takes the zero-byte cap, positive takes the
+// buffer-relative bound, and neither is uniformly looser. So the walk may never
+// round a minimum UP when it cannot compute one — reporting 1 for a type whose
+// true minimum is 0 does not loosen the bound, it moves a legitimately
+// zero-byte container onto a rule it cannot satisfy.
+//
+// The walk has two places it cannot compute: an unwired forward reference
+// (nil child) and an exhausted allowance. Both used to report 1.
+
+// standInSCC is a cyclic SCC deep enough that one walk over it exhausts the
+// min-bytes allowance. Defined first and fully wired, so a later container over
+// "L0" resolves to a built node on the BUILD path.
+func standInSCC(levels int) string {
+	inner := `["null","L0"]`
+	for i := levels - 1; i >= 0; i-- {
+		if i == levels-1 {
+			inner = fmt.Sprintf(`{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null","L0"]},{"name":"f1","type":["null","L0"]}]}`, i)
+			continue
+		}
+		inner = fmt.Sprintf(`{"type":"record","name":"L%d","fields":[{"name":"f0","type":["null",%s]},{"name":"f1","type":["null","L%d"]}]}`, i, inner, i+1)
+	}
+	return inner
+}
+
+const standInSCCLevels = 26
+
+// TestRegression_ZeroMinimumContainerAfterDrainedAllowance pins the exhaustion
+// stand-in. Two schemas differing ONLY in field order: the shared walk is
+// drained by the SCC container before the zero-byte container is reached in one
+// and after it in the other. Both must accept the array their own encoder
+// produced — an uncomputed minimum may change how loose a bound is, never
+// whether a valid wire passes.
+func TestRegression_ZeroMinimumContainerAfterDrainedAllowance(t *testing.T) {
+	mk := func(drainFirst bool) string {
+		var b strings.Builder
+		b.WriteString(`{"type":"record","name":"Root","fields":[{"name":"def","type":` + standInSCC(standInSCCLevels) + `}`)
+		zero := `,{"name":"z","type":{"type":"array","items":"null"}}`
+		drain := `,{"name":"a","type":{"type":"array","items":"L0"}}`
+		if drainFirst {
+			b.WriteString(drain + zero)
+		} else {
+			b.WriteString(zero + drain)
+		}
+		b.WriteString(`]}`)
+		return b.String()
+	}
+	for _, drainFirst := range []bool{false, true} {
+		name := map[bool]string{false: "zero-min container built first", true: "zero-min container built after the drain"}[drainFirst]
+		t.Run(name, func(t *testing.T) {
+			s := MustParse(mk(drainFirst))
+			val := map[string]any{
+				"def": map[string]any{"f0": nil, "f1": nil},
+				"a":   []any{},
+				"z":   make([]any, maxZeroByteItems),
+			}
+			wire, err := s.Encode(val)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			var out map[string]any
+			if _, err := s.Decode(wire, &out); err != nil {
+				t.Fatalf("own encoder produced %d bytes its own decoder rejects: %v", len(wire), err)
+			}
+			if got := len(out["z"].([]any)); got != maxZeroByteItems {
+				t.Fatalf("decoded %d zero-byte items, want %d", got, maxZeroByteItems)
+			}
+		})
+	}
+}
+
+// TestRegression_ZeroMinimumContainerBehindForwardRef pins the nil-child
+// stand-in. The forward reference must sit BELOW the container's direct child,
+// and that is the whole shape — do not "simplify" this to an
+// array-of-forward-reference.
+//
+// A container whose DIRECT child is the forward reference is registered in
+// containerFixups, and finalize re-derives its minimum from the resolved node
+// once the reference is wired; the build-time answer is overwritten and the nil
+// stand-in never reaches the wire path. That case is the "direct" control
+// below, and it is correct on both declaration orders even without this fix.
+//
+// One level down, nothing re-patches: the array's items is an inline record,
+// immediately resolvable, so the array is NOT a fixup — while that record's own
+// FIELD is the forward reference, so the walk sees a nil child at build and the
+// value it computes there is the value the decoder uses forever.
+func TestRegression_ZeroMinimumContainerBehindForwardRef(t *testing.T) {
+	const later = `{"type":"record","name":"Later","fields":[]}` // true minimum: 0 wire bytes
+	// nested: items is an inline record whose FIELD is the forward reference.
+	const nested = `{"type":"array","items":{"type":"record","name":"Inner","fields":[{"name":"g","type":"Later"}]}}`
+	// direct: items IS the forward reference — the fixup re-derives this one.
+	const direct = `{"type":"array","items":"Later"}`
+
+	for _, c := range []struct {
+		name    string
+		arr     string
+		elem    func() any
+		fixedUp bool // finalize re-derives the minimum for this shape
+	}{
+		{"nested (forward ref below the container's child)", nested,
+			func() any { return map[string]any{"g": map[string]any{}} }, false},
+		{"direct (forward ref IS the container's child — control)", direct,
+			func() any { return map[string]any{} }, true},
+	} {
+		for _, order := range []struct {
+			name    string
+			forward bool
+		}{{"Later declared after (forward ref)", true}, {"Later declared before (backward ref)", false}} {
+			t.Run(c.name+"/"+order.name, func(t *testing.T) {
+				z := `{"name":"z","type":` + c.arr + `}`
+				d := `{"name":"d","type":` + later + `}`
+				fields := z + "," + d
+				if !order.forward {
+					fields = d + "," + z
+				}
+				s := MustParse(`{"type":"record","name":"Root","fields":[` + fields + `]}`)
+				items := make([]any, maxZeroByteItems)
+				for i := range items {
+					items[i] = c.elem()
+				}
+				wire, err := s.Encode(map[string]any{"z": items, "d": map[string]any{}})
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				var out map[string]any
+				if _, err := s.Decode(wire, &out); err != nil {
+					t.Fatalf("own encoder produced %d bytes its own decoder rejects: %v", len(wire), err)
+				}
+				if got := len(out["z"].([]any)); got != maxZeroByteItems {
+					t.Fatalf("decoded %d zero-byte items, want %d", got, maxZeroByteItems)
+				}
+			})
+		}
+	}
+}
+
+// ---- the class matrix ----------------------------------------------------
+
+// standInCase is one cell: a schema whose container's per-element minimum is
+// reached through a named stand-in source, with a known true minimum.
+type standInCase struct {
+	name     string
+	src      string
+	value    func(n int) map[string]any // the record value carrying n elements
+	zeroMin  bool                       // the element's TRUE minimum is 0
+	countKey string                     // field holding the container under test
+}
+
+// standInCases crosses STAND-IN SOURCE x CONTAINER x ELEMENT-TRUE-MINIMUM.
+// The stand-in source is the axis the bug turned on; the element's true minimum
+// is the axis that decides which rule is correct, and holding it at "positive"
+// is why an over-reporting stand-in looked harmless.
+func standInCases() []standInCase {
+	scc := standInSCC(standInSCCLevels)
+	drainPrefix := `{"name":"def","type":` + scc + `},{"name":"a","type":{"type":"array","items":"L0"}},`
+	drainVal := func(m map[string]any) map[string]any {
+		m["def"] = map[string]any{"f0": nil, "f1": nil}
+		m["a"] = []any{}
+		return m
+	}
+	emptyRec := `{"type":"record","name":"E","fields":[]}`
+
+	arrVal := func(elem func() any) func(int) map[string]any {
+		return func(n int) map[string]any {
+			items := make([]any, n)
+			for i := range items {
+				items[i] = elem()
+			}
+			return map[string]any{"z": items}
+		}
+	}
+	mapVal := func(elem func() any) func(int) map[string]any {
+		return func(n int) map[string]any {
+			m := make(map[string]any, n)
+			for i := range n {
+				m[fmt.Sprintf("k%d", i)] = elem()
+			}
+			return map[string]any{"z": m}
+		}
+	}
+	nilElem := func() any { return nil }
+	recElem := func() any { return map[string]any{} }
+	intElem := func() any { return int32(1) }
+
+	rec := func(fields string) string {
+		return `{"type":"record","name":"Root","fields":[` + fields + `]}`
+	}
+
+	var cs []standInCase
+	for _, container := range []struct {
+		kind string
+		wrap func(elem string) string
+		val  func(func() any) func(int) map[string]any
+	}{
+		{"array", func(e string) string { return `{"type":"array","items":` + e + `}` }, arrVal},
+		{"map", func(e string) string { return `{"type":"map","values":` + e + `}` }, mapVal},
+	} {
+		for _, elem := range []struct {
+			kind string
+			src  string
+			mk   func() any
+			zero bool
+		}{
+			{"zero-min/null", `"null"`, nilElem, true},
+			{"zero-min/empty-record", emptyRec, recElem, true},
+			{"positive-min/int", `"int"`, intElem, false},
+		} {
+			z := `{"name":"z","type":` + container.wrap(elem.src) + `}`
+			// none: the control — nothing prevents the walk from computing.
+			cs = append(cs, standInCase{
+				name: "none/" + container.kind + "/" + elem.kind, src: rec(z),
+				value: container.val(elem.mk), zeroMin: elem.zero, countKey: "z",
+			})
+			// drained: the container is built after a walk-exhausting sibling.
+			cs = append(cs, standInCase{
+				name: "drained/" + container.kind + "/" + elem.kind, src: rec(drainPrefix + z),
+				value:   func(n int) map[string]any { return drainVal(container.val(elem.mk)(n)) },
+				zeroMin: elem.zero, countKey: "z",
+			})
+		}
+		// nil-child: the element's own subtree holds an unwired forward
+		// reference at build. Crossed against BOTH true minima, because the
+		// stand-in is only wrong for one of them.
+		for _, elem := range []struct {
+			kind   string
+			fields string
+			mk     func() any
+			zero   bool
+		}{
+			{"zero-min/fwd-ref-to-empty", `{"name":"g","type":"Later"}`,
+				func() any { return map[string]any{"g": map[string]any{}} }, true},
+			{"positive-min/fwd-ref-plus-int", `{"name":"p","type":"int"},{"name":"g","type":"Later"}`,
+				func() any { return map[string]any{"p": int32(1), "g": map[string]any{}} }, false},
+		} {
+			inner := `{"type":"record","name":"Inner","fields":[` + elem.fields + `]}`
+			z := `{"name":"z","type":` + container.wrap(inner) + `}`
+			later := `{"name":"d","type":{"type":"record","name":"Later","fields":[]}}`
+			cs = append(cs, standInCase{
+				name: "nil-child/" + container.kind + "/" + elem.kind, src: rec(z + "," + later),
+				value: func(n int) map[string]any {
+					m := container.val(elem.mk)(n)
+					m["d"] = map[string]any{}
+					return m
+				},
+				zeroMin: elem.zero, countKey: "z",
+			})
+		}
+	}
+	return cs
+}
+
+// TestMatrix_MinBytesStandInNeverOverReports is the class net. Its oracle is
+// ENCODE-IMPLIES-DECODE — this package's own encoder produces the wire, so its
+// own decoder must accept it — which is calibration-free and reads nothing off
+// the walk's current behavior.
+//
+// The DoS half runs on every cell too: a bound that stopped false-rejecting by
+// disappearing would pass the accept half alone.
+func TestMatrix_MinBytesStandInNeverOverReports(t *testing.T) {
+	for _, c := range standInCases() {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := Parse(c.src)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			// A count that exercises the rule: for a zero-minimum element the
+			// documented zero-byte cap is the only thing bounding it, so sit
+			// exactly ON the cap.
+			n := maxZeroByteItems
+			if !c.zeroMin {
+				n = 512
+			}
+			wire, err := s.Encode(c.value(n))
+			if err != nil {
+				t.Fatalf("encode %d elements: %v", n, err)
+			}
+			var out map[string]any
+			if _, err := s.Decode(wire, &out); err != nil {
+				t.Fatalf("ACCEPT half: own encoder produced %d bytes its own decoder rejects: %v", len(wire), err)
+			}
+
+			// DoS half: a declared count far past anything the buffer could
+			// hold must still be refused, whatever rule the cell landed on.
+			hostile := append([]byte(nil), wire...)
+			if i := indexOfBlockCount(wire, n); i >= 0 {
+				hostile = append(append(append([]byte(nil), wire[:i]...), dosVarlong(1<<40)...), wire[i+len(appendVarlong(nil, int64(n))):]...)
+				var sink map[string]any
+				if _, err := s.Decode(hostile, &sink); err == nil {
+					t.Fatalf("DoS half: a block count of 2^40 in a %d-byte buffer was accepted", len(hostile))
+				}
+			}
+		})
+	}
+}
+
+// indexOfBlockCount locates the container's block-count varint in the encoded
+// record so the DoS half can overwrite it. The count is the first occurrence of
+// n's own varint encoding, which is unambiguous here because every cell's
+// element count is far larger than any other number in the wire.
+func indexOfBlockCount(wire []byte, n int) int {
+	want := appendVarlong(nil, int64(n))
+	for i := 0; i+len(want) <= len(wire); i++ {
+		if string(wire[i:i+len(want)]) == string(want) {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestRegression_ZeroByteItemCapStillHolds is the boundary-1 half of the pins
+// above: the fix must not have bought acceptance by dropping the cap. AT the cap
+// accepts, one past it rejects — on a schema with no stand-in and on one where
+// the walk was drained, so the unknown RULE is held to the same limit as the
+// computed one.
+//
+// The over-cap wire is hand-built because the encoder enforces the same cap
+// (encoding 4097 zero-byte items is refused), which is itself the property that
+// makes the accept half's encode-implies-decode oracle meaningful.
+func TestRegression_ZeroByteItemCapStillHolds(t *testing.T) {
+	plain := `{"type":"record","name":"Root","fields":[{"name":"z","type":{"type":"array","items":"null"}}]}`
+	drained := `{"type":"record","name":"Root","fields":[{"name":"def","type":` + standInSCC(standInSCCLevels) +
+		`},{"name":"a","type":{"type":"array","items":"L0"}},{"name":"z","type":{"type":"array","items":"null"}}]}`
+	for _, c := range []struct {
+		name, src string
+		prefix    []byte // def (two null union indexes) + a (empty array), when present
+	}{
+		{"no stand-in", plain, nil},
+		{"drained allowance", drained, []byte{0, 0, 0}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.src)
+			wireFor := func(n int) []byte {
+				w := append([]byte(nil), c.prefix...)
+				w = appendVarlong(w, int64(n)) // one block of n zero-byte items
+				return append(w, 0)            // terminating zero block count
+			}
+			var out map[string]any
+			if _, err := s.Decode(wireFor(maxZeroByteItems), &out); err != nil {
+				t.Fatalf("AT the %d-element cap must accept: %v", maxZeroByteItems, err)
+			}
+			if got := len(out["z"].([]any)); got != maxZeroByteItems {
+				t.Fatalf("decoded %d items at the cap, want %d", got, maxZeroByteItems)
+			}
+			var sink map[string]any
+			if _, err := s.Decode(wireFor(maxZeroByteItems+1), &sink); err == nil {
+				t.Fatalf("one past the %d-element cap must reject, but decode succeeded", maxZeroByteItems)
+			}
+		})
+	}
+}
+
+// ---------- magnitude_arithmetic_test.go ----------
+
+// ---------------------------------------------------------------------------
+// The producer half of "integer arithmetic over a schema-declared magnitude",
+// and the source-derived registry that keeps the class closed.
+//
+// The behavioral cells live next door (magnitude_arithmetic_matrix_test.go);
+// they can only see arithmetic that reaches an observable outcome. Two things
+// they cannot see are here: the invariant the PRODUCER of a derived bound
+// owes its callers, and the enumeration of every site in the package where a
+// magnitude meets an arithmetic operator at all.
+// ---------------------------------------------------------------------------
+
+// TestInvariant_SchemaMinBytesSaturates is what makes a ceiling at the
+// producer sufficient. Two properties, both derived from what a per-element
+// minimum MEANS rather than from what the code returns:
+//
+//   - It is a byte count, so it is never negative, and `1 + it` (which three
+//     callers compute) is never zero — a zero divides, and a negative one
+//     turns a buffer-relative bound into its own opposite.
+//   - A value that provably occupies at least one wire byte must report at
+//     least one. Reporting zero or less for such an element is not a loose
+//     bound but a MISCLASSIFICATION: the zero-byte element cap and the
+//     buffer-relative bound are different rules with different limits, and a
+//     non-positive minimum silently routes an element through the wrong one.
+//     That half is invisible to a decode test, because both rules end in an
+//     error for a truncated wire.
+func TestInvariant_SchemaMinBytesSaturates(t *testing.T) {
+	const huge = `{"type":"fixed","name":"HF","size":9223372036854775807}`
+	// Sums that wrap: a small lead, then magnitudes large enough to carry the
+	// running total past the top of the range and back around.
+	const sumToZero = `{"type":"record","name":"WZ","fields":[
+		{"name":"lead","type":"long"},
+		{"name":"a","type":{"type":"fixed","name":"WZA","size":9223372036854775807}},
+		{"name":"b","type":{"type":"fixed","name":"WZB","size":9223372036854775807}}]}`
+	const sumToNeg = `{"type":"record","name":"WN","fields":[
+		{"name":"u","type":[{"type":"fixed","name":"WNU","size":9223372036854775807}]},
+		{"name":"a","type":{"type":"fixed","name":"WNA","size":9223372036854775807}}]}`
+
+	type probe struct {
+		name    string
+		schema  string
+		nonZero bool // every value of this schema occupies >= 1 wire byte
+	}
+	probes := []probe{
+		{"huge-fixed", huge, true},
+		{"sum-wraps-to-zero", sumToZero, true},
+		{"sum-wraps-negative", sumToNeg, true},
+		// A union reports one byte for its branch index plus its SMALLEST
+		// branch, so a union carrying a null branch reports 1 no matter what
+		// else is in it. Only a union whose every branch is huge drives the
+		// union arm's own arithmetic — the ["null", huge] shape below is the
+		// one that looks like it covers this and does not.
+		{"union-of-huge-only", `[` + huge + `]`, true},
+		{"union-of-two-huge", `[` + huge + `,{"type":"fixed","name":"HF2","size":9223372036854775806}]`, true},
+		{"huge-fixed-in-union", `["null",` + huge + `]`, true},
+		{"huge-fixed-in-array", `{"type":"array","items":` + huge + `}`, true},
+		{"huge-fixed-in-map", `{"type":"map","values":` + huge + `}`, true},
+		{"wrap-nested-in-record", `{"type":"record","name":"NW","fields":[{"name":"in","type":` + sumToZero + `}]}`, true},
+		{"wrap-behind-array", `{"type":"array","items":` + sumToZero + `}`, true},
+		{"wrap-behind-map", `{"type":"map","values":` + sumToZero + `}`, true},
+		{"many-huge-fields", `{"type":"record","name":"MH","fields":[
+			{"name":"a","type":"long"},
+			{"name":"b","type":{"type":"fixed","name":"MHB","size":9223372036854775807}},
+			{"name":"c","type":{"type":"fixed","name":"MHC","size":9223372036854775807}},
+			{"name":"d","type":{"type":"fixed","name":"MHD","size":9223372036854775807}},
+			{"name":"e","type":{"type":"fixed","name":"MHE","size":9223372036854775807}}]}`, true},
+		// Controls: genuinely zero-byte shapes must keep reporting zero, or
+		// the zero-byte element cap stops applying to the elements it exists
+		// for.
+		{"plain-int", `"int"`, true},
+		{"plain-null", `"null"`, false},
+		{"empty-record", `{"type":"record","name":"ER","fields":[]}`, false},
+		{"record-of-null", `{"type":"record","name":"RN","fields":[{"name":"n","type":"null"}]}`, false},
+	}
+	for _, p := range probes {
+		t.Run(p.name, func(t *testing.T) {
+			s, err := Parse(p.schema)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			got := schemaMinBytes(s.node)
+			if got < 0 {
+				t.Errorf("minimum wire bytes is %d; a byte count cannot be negative, and a negative one inverts every bound derived from it", got)
+			}
+			if 1+got <= 0 {
+				t.Errorf("minimum wire bytes is %d, so a caller's `1 + minimum` is %d; three callers compute that and one divides by it", got, 1+got)
+			}
+			if got > maxSchemaMagnitude {
+				t.Errorf("minimum wire bytes is %d, above the stated ceiling %d; callers add to this value and must not have to re-derive the headroom", got, maxSchemaMagnitude)
+			}
+			if p.nonZero && got < 1 {
+				t.Errorf("every value of this schema occupies at least one wire byte, but the minimum reports %d — "+
+					"a non-positive minimum routes the block bound through the zero-byte element cap instead of the buffer-relative one", got)
+			}
+			if !p.nonZero && got != 0 {
+				t.Errorf("this schema's values occupy no wire bytes, but the minimum reports %d — "+
+					"the zero-byte element cap exists for exactly these and stops applying if they report more", got)
+			}
+		})
+	}
+}
+
+// TestInvariant_UnionMinimumCoversItsBranches catches the one wrong answer a
+// range check cannot: a union arm that scans for the smallest branch starting
+// from a SENTINEL reports the no-branches answer whenever a branch's own
+// minimum happens to equal that sentinel — and the no-branches answer is 1,
+// which is small, plausible, and inside every bound anyone would assert.
+//
+// The property is calibration-free: a union writes a branch index and then a
+// branch, so it cannot cost less than its cheapest branch costs alone.
+func TestInvariant_UnionMinimumCoversItsBranches(t *testing.T) {
+	const huge = `{"type":"fixed","name":"UHF","size":9223372036854775807}`
+	for _, schema := range []string{
+		`[` + huge + `]`,
+		`[` + huge + `,{"type":"fixed","name":"UHF2","size":9223372036854775806}]`,
+		`["null",` + huge + `]`,
+		`["int","string"]`,
+		`["null","int"]`,
+		`[{"type":"fixed","name":"UF3","size":4},{"type":"fixed","name":"UF4","size":9}]`,
+	} {
+		s, err := Parse(schema)
+		if err != nil {
+			t.Fatalf("parse %s: %v", schema, err)
+		}
+		got := schemaMinBytes(s.node)
+		cheapest := -1
+		for _, b := range s.node.branches {
+			m := schemaMinBytes(b)
+			if cheapest < 0 || m < cheapest {
+				cheapest = m
+			}
+		}
+		if got < cheapest {
+			t.Errorf("union %s reports a minimum of %d, below its cheapest branch's own %d — "+
+				"a union writes a branch index AND a branch, so it cannot cost less than the branch does alone",
+				schema, got, cheapest)
+		}
+	}
+}
+
+// TestInvariant_SaturateSchemaMagnitudeIsTotal pins the accessor's own
+// contract, which every consumer leans on: the result is in range for ANY
+// input, including the ones no parse can produce today. A consumer that has
+// to ask whether its input was already validated is a consumer that will
+// eventually guess wrong.
+func TestInvariant_SaturateSchemaMagnitudeIsTotal(t *testing.T) {
+	const maxInt = int(^uint(0) >> 1)
+	const minInt = -maxInt - 1
+	for _, n := range []int{
+		minInt, minInt + 1, -maxSchemaMagnitude, -1, 0, 1,
+		maxSchemaMagnitude - 1, maxSchemaMagnitude, maxSchemaMagnitude + 1,
+		1 << 40, maxInt - 1, maxInt,
+	} {
+		got := saturateSchemaMagnitude(n)
+		if got < 0 || got > maxSchemaMagnitude {
+			t.Errorf("saturateSchemaMagnitude(%d) = %d, outside [0, %d]", n, got, maxSchemaMagnitude)
+		}
+		if n >= 0 && n <= maxSchemaMagnitude && got != n {
+			t.Errorf("saturateSchemaMagnitude(%d) = %d; a value already in range must pass through unchanged", n, got)
+		}
+	}
+}
+
+// TestInvariant_MagnitudeCeilingSurvivesItsLargestMultiplier is the reason the
+// ceiling has the value it does. The package's consumers do not just add
+// magnitudes, they scale them — the widest is bits-per-byte in the decimal
+// capacity calculation — and the ceiling has to leave that product inside a
+// 32-bit int so the arithmetic is safe on every build, not just the ones
+// where int happens to be 64 bits.
+func TestInvariant_MagnitudeCeilingSurvivesItsLargestMultiplier(t *testing.T) {
+	const int32Max = 1<<31 - 1
+	if got := int64(maxSchemaMagnitude) * magnitudeWidestMultiplier; got > int32Max {
+		t.Errorf("ceiling %d times the widest multiplier %d is %d, past a 32-bit int's %d — "+
+			"the ceiling no longer covers its own consumers", maxSchemaMagnitude, magnitudeWidestMultiplier, got, int32Max)
+	}
+	// And it must still be generous enough that no real schema is clipped:
+	// the largest fixed anyone writes is orders of magnitude below it.
+	if maxSchemaMagnitude < 1<<24 {
+		t.Errorf("ceiling %d is below 16 MiB; a legitimate large fixed would be clipped, loosening every bound derived from it", maxSchemaMagnitude)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The enumeration: every site in the package where a schema-declared magnitude
+// meets an arithmetic operator.
+//
+// WHAT DISTINGUISHES A HAZARDOUS SITE FROM A SAFE ONE. Three conditions, all
+// required:
+//
+//  1. An operand carries a magnitude the schema TEXT chose. The only primitive
+//     one is a `fixed` size (the parser leaves its upper bound open); the
+//     others — precision, scale — are parse-capped, and counts are bounded by
+//     the input length. But magnitude PROPAGATES: through arithmetic, through
+//     a function that returns it, and through a function it is passed into.
+//     A per-record sum over field minimums holds no `.size` anywhere in its
+//     expression and is the wrap this file exists for, which is why a set
+//     built by grepping `.size` is the wrong set.
+//  2. The operator can leave the integer range: + - * / % <<, or a make()
+//     length. Comparisons cannot — `a < b` has the same answer at every
+//     magnitude — and neither can formatting or assignment. This is why
+//     grepping `.size` OVER-reports: most of its reads are comparisons.
+//  3. The value is an INTEGER. A magnitude handed on as []byte, string or
+//     *big.Int has left the integer domain, and nothing downstream of it can
+//     wrap on the magnitude's account.
+//
+// So the rule is reachability, not a pattern, and it is derived below rather
+// than listed: seeds are the magnitude-bearing fields, and taint flows to
+// integer-typed returns and integer-typed parameters until it stops growing.
+// The derivation deliberately OVER-approximates — it has no types, so a
+// reflect.Type's Size() reads as a magnitude — and every over-report is a row
+// saying so. An enumeration with a reason per entry is auditable; the count
+// alone is what keeps costing rounds.
+// ---------------------------------------------------------------------------
+
+type magVerdict string
+
+const (
+	// The magnitude reaching this expression is saturated, so the operator
+	// cannot leave the range.
+	magSaturated magVerdict = "saturated"
+	// Bounded at this site for a reason of its own, stated in the row.
+	magBoundedHere magVerdict = "bounded-here"
+	// An over-report: the operand is not a schema-declared magnitude.
+	magNotAMagnitude magVerdict = "not-a-magnitude"
+	// Wrapping IS the operation's definition.
+	magWrapIsTheContract magVerdict = "wrap-is-the-contract"
+)
+
+type magnitudeSite struct {
+	where   string // "file.go::funcName"
+	count   int    // hazardous expressions the derivation finds there
+	verdict magVerdict
+	reason  string
+}
+
+// magnitudeSites classifies every site the derivation reports. A site that
+// appears with no row FAILS: that is a new consumer of a magnitude, and the
+// point of the table is that someone has to say what happens to it at the top
+// of the range. A row naming no site fails too, so the table cannot go stale
+// while reading as coverage.
+var magnitudeSites = []magnitudeSite{
+	{
+		where: "deser.go::minBytesWalk.minBytesFromChildren", count: 2, verdict: magSaturated,
+		reason: "the producer. `1 + m` over the smallest branch and the running sum over a record's fields; " +
+			"both are clamped by saturateSchemaMagnitude, and the sum is clamped per FIELD so the next addition " +
+			"starts in range. This is the wrap that reached a divisor. The recursion's own `depth+1` is not " +
+			"reported here and must not be: depth counts path length, which the fixpoint does not taint",
+	},
+	{
+		where: "deser.go::mapEntryMinBytes", count: 1, verdict: magSaturated,
+		reason: "`1 + valueMin` — the SINGLE constructor of the per-entry minimum for all four map sites. " +
+			"valueMin is either a saturated minimum or minBytesUnknown, and the unknown is peeled off before " +
+			"the addition, so the operand is in [0, maxSchemaMagnitude] and the sum cannot wrap. Its whole " +
+			"job is that checkMapBlockBounds' divisor is >= 1: routing every site through here is what keeps " +
+			"an unknown from arriving as 1 + (-1) = 0",
+	},
+	{
+		where: "deser.go::checkMapBlockBounds", count: 1, verdict: magSaturated,
+		reason: "divides by minEntryBytes, which is `1 + a saturated minimum` at all four call sites, so it is >= 1. " +
+			"This is the division the wrap turned into a panic",
+	},
+	{
+		where: "deser.go::checkArrayBlockBounds", count: 1, verdict: magSaturated,
+		reason: "divides by minItemBytes only inside `if minItemBytes > 0`; the saturated producer also makes the " +
+			"non-positive branch mean what it says, since only a genuinely zero-byte element can reach it now",
+	},
+	{
+		where: "schema.go::builder.buildComplex", count: 1, verdict: magNotAMagnitude,
+		reason: "`make(_, len(nd.fields))`, whose length is a field COUNT — bounded by the input, since every " +
+			"field costs bytes to write. The per-entry `1 + <minimum>` that used to live here (and separately " +
+			"in resolveMap and skipMap) is now the single mapEntryMinBytes rowed above: three sites each " +
+			"reasoning out the same ceiling is the shape that leaves the question with no owner",
+	},
+	{
+		where: "schema.go::maxDecimalDigits", count: 3, verdict: magSaturated,
+		reason: "`8*size - 1` and the float scale that follows. Asks the shared accessor rather than clamping to a " +
+			"ceiling of its own; magnitudeWidestMultiplier is this site's factor and is what the ceiling is chosen against",
+	},
+	{
+		where: "json_decode.go::jsonDecodeAppliesLogical", count: 1, verdict: magBoundedHere,
+		reason: "`make(_, probeLen)` is an ALLOCATION, not arithmetic: it needs a far tighter bound than the " +
+			"arithmetic ceiling, and caps at the largest length any fixed logical inspects. See the accessor's note " +
+			"on why allocation is a different question",
+	},
+	{
+		where: "unsafe.go::udArrayDirect", count: 1, verdict: magNotAMagnitude,
+		reason: "elemSize is reflect.Type.Size() — a Go type's in-memory width, fixed by the compiler. The " +
+			"derivation has no type information and reads the selector name as a schema size",
+	},
+	{
+		where: "unsafe.go::usArrayDirect", count: 1, verdict: magNotAMagnitude,
+		reason: "elemSize is reflect.Type.Size(); see udArrayDirect",
+	},
+	{
+		where: "unsafe.go::udArrayPtrRecord", count: 1, verdict: magNotAMagnitude,
+		reason: "innerSize is reflect.Type.Size(); see udArrayDirect",
+	},
+	{
+		where: "unsafe.go::usArrayRecord", count: 1, verdict: magNotAMagnitude,
+		reason: "elemSize is reflect.Type.Size(); see udArrayDirect",
+	},
+	{
+		where: "varint.go::appendVarlong", count: 1, verdict: magWrapIsTheContract,
+		reason: "`uint64(i) << 1` is the zigzag transform. It operates on a wire value, not a schema magnitude, and " +
+			"the shift discarding the top bit is what zigzag IS",
+	},
+}
+
+// magSeedFields are the schema-object fields that carry a caller-chosen
+// magnitude. `size` is the one with no parse-time ceiling; precision and scale
+// are capped during validation and are here so a site that starts doing
+// arithmetic on them has to say so rather than inherit the cap silently.
+var magSeedFields = map[string]bool{
+	"size": true, "Size": true,
+	"precision": true, "Precision": true,
+	"scale": true, "Scale": true,
+}
+
+var magArithOps = map[token.Token]bool{
+	token.ADD: true, token.SUB: true, token.MUL: true,
+	token.QUO: true, token.REM: true, token.SHL: true,
+}
+
+var magArithAssign = map[token.Token]bool{
+	token.ADD_ASSIGN: true, token.SUB_ASSIGN: true, token.MUL_ASSIGN: true,
+	token.QUO_ASSIGN: true, token.REM_ASSIGN: true, token.SHL_ASSIGN: true,
+}
+
+var magIntTypes = map[string]bool{
+	"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
+	"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+	"uintptr": true, "byte": true, "rune": true, "laxInt": true,
+}
+
+type magSrcFile struct {
+	name string
+	f    *ast.File
+}
+
+type magTaint struct {
+	fns    map[string]bool            // integer-returning fns that return a magnitude
+	params map[string]map[string]bool // "Recv.Fn" -> integer param names carrying one
+}
+
+// magReturnsInteger reports whether fd has an integer-typed result. Integer
+// overflow is the class, so a function whose results are all slices, strings,
+// errors or structs cannot carry a magnitude onward as an integer.
+func magReturnsInteger(fd *ast.FuncDecl) bool {
+	if fd.Type.Results == nil {
+		return false
+	}
+	for _, r := range fd.Type.Results.List {
+		if id, ok := r.Type.(*ast.Ident); ok && magIntTypes[id.Name] {
+			return true
+		}
+	}
+	return false
+}
+
+func magFuncName(fd *ast.FuncDecl) string {
+	if fd.Recv != nil && len(fd.Recv.List) > 0 {
+		t := fd.Recv.List[0].Type
+		if star, ok := t.(*ast.StarExpr); ok {
+			t = star.X
+		}
+		if id, ok := t.(*ast.Ident); ok {
+			return id.Name + "." + fd.Name.Name
+		}
+	}
+	return fd.Name.Name
+}
+
+func magHasSeed(n ast.Node) bool {
+	found := false
+	ast.Inspect(n, func(x ast.Node) bool {
+		if sel, ok := x.(*ast.SelectorExpr); ok && magSeedFields[sel.Sel.Name] {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func magCalleeName(call *ast.CallExpr) string {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		return fn.Name
+	case *ast.SelectorExpr:
+		return fn.Sel.Name
+	}
+	return ""
+}
+
+func magCallsMagnitude(n ast.Node, st *magTaint) bool {
+	found := false
+	ast.Inspect(n, func(x ast.Node) bool {
+		if call, ok := x.(*ast.CallExpr); ok && st.fns[magCalleeName(call)] {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+func magUsesIdent(n ast.Node, names map[string]bool) bool {
+	found := false
+	ast.Inspect(n, func(x ast.Node) bool {
+		if id, ok := x.(*ast.Ident); ok && names[id.Name] {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// magTainted returns every identifier in fd carrying a magnitude: its tainted
+// PARAMETERS plus locals assigned from a seed, a magnitude-returning call, or
+// another tainted identifier. The local loop runs to a fixpoint so order of
+// assignment inside the function does not matter.
+func magTainted(fd *ast.FuncDecl, st *magTaint) map[string]bool {
+	out := map[string]bool{}
+	for p := range st.params[magFuncName(fd)] {
+		out[p] = true
+	}
+	for {
+		grew := false
+		ast.Inspect(fd, func(n ast.Node) bool {
+			var lhs, rhs []ast.Expr
+			switch s := n.(type) {
+			case *ast.AssignStmt:
+				lhs, rhs = s.Lhs, s.Rhs
+			case *ast.ValueSpec:
+				for _, id := range s.Names {
+					lhs = append(lhs, id)
+				}
+				rhs = s.Values
+			default:
+				return true
+			}
+			hot := false
+			for _, r := range rhs {
+				if magHasSeed(r) || magCallsMagnitude(r, st) || magUsesIdent(r, out) {
+					hot = true
+				}
+			}
+			if !hot {
+				return true
+			}
+			for _, l := range lhs {
+				if id, ok := l.(*ast.Ident); ok && !out[id.Name] && id.Name != "_" {
+					out[id.Name] = true
+					grew = true
+				}
+			}
+			return true
+		})
+		if !grew {
+			return out
+		}
+	}
+}
+
+// magParamNames returns fd's parameter names positionally, blanking any whose
+// declared type is not an integer: a magnitude handed over as []byte, string
+// or *big.Int has left the integer domain and cannot wrap downstream.
+func magParamNames(fd *ast.FuncDecl) []string {
+	if fd.Type.Params == nil {
+		return nil
+	}
+	var out []string
+	for _, f := range fd.Type.Params.List {
+		id, isIdent := f.Type.(*ast.Ident)
+		isInt := isIdent && magIntTypes[id.Name]
+		if len(f.Names) == 0 {
+			out = append(out, "")
+			continue
+		}
+		for _, n := range f.Names {
+			if !isInt {
+				out = append(out, "")
+				continue
+			}
+			out = append(out, n.Name)
+		}
+	}
+	return out
+}
+
+// magScan derives the taint fixpoint and returns hazardous-expression counts
+// keyed "file.go::funcName", plus the magnitude-returning function set.
+func magScan(t *testing.T) (map[string]int, map[string]bool) {
+	t.Helper()
+	var files []magSrcFile
+	for _, dir := range []string{".", "ocf"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+				continue
+			}
+			p := filepath.Join(dir, e.Name())
+			f, err := parser.ParseFile(token.NewFileSet(), p, nil, 0)
+			if err != nil {
+				t.Fatalf("parse %s: %v", p, err)
+			}
+			name := e.Name()
+			if dir != "." {
+				name = dir + "/" + name
+			}
+			files = append(files, magSrcFile{name, f})
+		}
+	}
+
+	type decl struct {
+		file string
+		fd   *ast.FuncDecl
+	}
+	var decls []decl
+	byName := map[string]*ast.FuncDecl{}
+	for _, fl := range files {
+		for _, d := range fl.f.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Body != nil {
+				decls = append(decls, decl{fl.name, fd})
+				byName[fd.Name.Name] = fd
+			}
+		}
+	}
+
+	st := &magTaint{fns: map[string]bool{}, params: map[string]map[string]bool{}}
+	for {
+		grew := false
+		for _, d := range decls {
+			local := magTainted(d.fd, st)
+			if magReturnsInteger(d.fd) && !st.fns[d.fd.Name.Name] {
+				ast.Inspect(d.fd.Body, func(n ast.Node) bool {
+					rs, ok := n.(*ast.ReturnStmt)
+					if !ok {
+						return true
+					}
+					for _, r := range rs.Results {
+						if magHasSeed(r) || magCallsMagnitude(r, st) || magUsesIdent(r, local) {
+							st.fns[d.fd.Name.Name] = true
+							grew = true
+						}
+					}
+					return true
+				})
+			}
+			ast.Inspect(d.fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				target, known := byName[magCalleeName(call)]
+				if !known {
+					return true
+				}
+				names := magParamNames(target)
+				for i, a := range call.Args {
+					if i >= len(names) || names[i] == "" || names[i] == "_" {
+						continue
+					}
+					if !magHasSeed(a) && !magCallsMagnitude(a, st) && !magUsesIdent(a, local) {
+						continue
+					}
+					key := magFuncName(target)
+					if st.params[key] == nil {
+						st.params[key] = map[string]bool{}
+					}
+					if !st.params[key][names[i]] {
+						st.params[key][names[i]] = true
+						grew = true
+					}
+				}
+				return true
+			})
+		}
+		if !grew {
+			break
+		}
+	}
+
+	counts := map[string]int{}
+	for _, d := range decls {
+		local := magTainted(d.fd, st)
+		ast.Inspect(d.fd.Body, func(n ast.Node) bool {
+			hit := false
+			switch s := n.(type) {
+			case *ast.BinaryExpr:
+				if !magArithOps[s.Op] {
+					return true
+				}
+				hit = magHasSeed(s.X) || magHasSeed(s.Y) ||
+					magCallsMagnitude(s.X, st) || magCallsMagnitude(s.Y, st) ||
+					magUsesIdent(s.X, local) || magUsesIdent(s.Y, local)
+			case *ast.AssignStmt:
+				if !magArithAssign[s.Tok] {
+					return true
+				}
+				for _, r := range s.Rhs {
+					hit = hit || magHasSeed(r) || magCallsMagnitude(r, st) || magUsesIdent(r, local)
+				}
+				for _, l := range s.Lhs {
+					hit = hit || magUsesIdent(l, local)
+				}
+			case *ast.CallExpr:
+				id, ok := s.Fun.(*ast.Ident)
+				if !ok || id.Name != "make" || len(s.Args) < 2 {
+					return true
+				}
+				for _, a := range s.Args[1:] {
+					hit = hit || magHasSeed(a) || magCallsMagnitude(a, st) || magUsesIdent(a, local)
+				}
+			}
+			if hit {
+				counts[d.file+"::"+magFuncName(d.fd)]++
+			}
+			return true
+		})
+	}
+	return counts, st.fns
+}
+
+// TestInvariant_EveryMagnitudeArithmeticSiteIsClassified is the completeness
+// half. A new expression that puts a schema-declared magnitude under an
+// arithmetic operator lands with no row and fails here until someone says what
+// it does at the top of the range; a row that names no site fails too, so the
+// table cannot quietly describe code that no longer exists.
+func TestInvariant_EveryMagnitudeArithmeticSiteIsClassified(t *testing.T) {
+	counts, magFns := magScan(t)
+
+	// Anti-rot: the derivation is name-based, so a rename of the seed fields
+	// or of the producer would leave it scanning for nothing and reporting a
+	// clean table. These two functions ARE the class; if the fixpoint stops
+	// finding them, the guard is watching an empty set.
+	for _, want := range []string{"minBytesFromChildren", "maxDecimalDigits"} {
+		if !magFns[want] {
+			t.Fatalf("the taint fixpoint no longer reaches %s — the seed fields or the producer were renamed, "+
+				"and this guard is now watching nothing", want)
+		}
+	}
+	if len(counts) == 0 {
+		t.Fatal("the derivation found no arithmetic on any magnitude at all — it has rotted")
+	}
+
+	rows := map[string]magnitudeSite{}
+	for _, r := range magnitudeSites {
+		if _, dup := rows[r.where]; dup {
+			t.Errorf("duplicate row for %s", r.where)
+		}
+		rows[r.where] = r
+	}
+	for where, n := range counts {
+		row, ok := rows[where]
+		if !ok {
+			t.Errorf("%s puts a schema-declared magnitude under an arithmetic operator (%d expression(s)) and has no row.\n"+
+				"  Say what happens at the top of the range: saturated (asks saturateSchemaMagnitude), bounded-here\n"+
+				"  (with the reason its bound differs), not-a-magnitude (with what the operand really is), or\n"+
+				"  wrap-is-the-contract. A count alone is what keeps this class open.", where, n)
+			continue
+		}
+		if row.count != n {
+			t.Errorf("%s now has %d magnitude-arithmetic expression(s), the table says %d.\n"+
+				"  A changed count means an expression was added or removed here; re-read the row's reason (%q)\n"+
+				"  and confirm it still covers every expression at this site.", where, n, row.count, row.reason)
+		}
+	}
+	for where := range rows {
+		if _, ok := counts[where]; !ok {
+			t.Errorf("row %s names no magnitude arithmetic in the sources — the site moved or was deleted, "+
+				"and this row now reads as coverage it does not have", where)
+		}
+	}
+	t.Logf("classified %d sites: %d saturated, %d bounded-here, %d not-a-magnitude, %d wrap-is-the-contract",
+		len(magnitudeSites),
+		magCountVerdict(magSaturated), magCountVerdict(magBoundedHere),
+		magCountVerdict(magNotAMagnitude), magCountVerdict(magWrapIsTheContract))
+}
+
+func magCountVerdict(v magVerdict) int {
+	n := 0
+	for _, r := range magnitudeSites {
+		if r.verdict == v {
+			n++
+		}
+	}
+	return n
+}
+
+// TestInvariant_ClippedMagnitudeStillRejects is the control for the one thing
+// saturation gives up: a magnitude above the ceiling yields a LOOSER
+// buffer-relative bound than the true magnitude would. The bound still has to
+// refuse a block that cannot fit, which for any buffer below the ceiling it
+// does on the bound itself — so the concession costs an error message on
+// absurd schemas and nothing else.
+func TestInvariant_ClippedMagnitudeStillRejects(t *testing.T) {
+	// Each element needs 2^40 bytes; the ceiling clips that to 2^27.
+	s, err := Parse(`{"type":"array","items":{"type":"fixed","name":"CBF","size":1099511627776}}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, count := range []int{1, 4, 1000} {
+		wire := append([]byte{byte(count << 1)}, make([]byte, 1<<16)...)
+		var v any
+		if _, err := s.Decode(wire, &v); err == nil {
+			t.Errorf("a block claiming %d elements of 2^40 bytes was accepted from a 64 KiB buffer", count)
+		}
+	}
+}
+
+// ---------- union_tag_tiers_test.go ----------
+
+// ---------------------------------------------------------------------------
+// The tag namespace's TIER SET is derived, not listed.
+//
+// Two consumers read it: findUnionBranch resolves a caller-written name, and
+// fillUnionTagTables builds the binary tagged-map lookup. Both walk
+// unionTagTiers, so neither can grow a tier the other lacks. What remains
+// possible is someone adding a tier by HAND inside one of them, or adding one
+// to the slice that no test ever reaches — and those are what these guards
+// refuse.
+// ---------------------------------------------------------------------------
+
+// unionTagTierCount is the number of tiers the suite knows how to reach. It is
+// stated here so that adding a tier is a DECISION: the count fails, and the
+// person adding it has to extend the corpus in
+// TestInvariant_EveryUnionTagTierIsReachable rather than let a tier ship
+// unexercised.
+const unionTagTierCount = 3
+
+func TestInvariant_UnionTagTierCountIsStated(t *testing.T) {
+	if len(unionTagTiers) != unionTagTierCount {
+		t.Fatalf("unionTagTiers has %d tiers, the suite is written for %d.\n"+
+			"A tier is a new rule by which a caller's tag names a branch: extend the corpus in "+
+			"TestInvariant_EveryUnionTagTierIsReachable so the new tier is actually exercised on every "+
+			"wire, then raise this count.", len(unionTagTiers), unionTagTierCount)
+	}
+	seen := map[string]bool{}
+	for i, tier := range unionTagTiers {
+		if tier.name == "" {
+			t.Errorf("tier %d has no name; the guards report by name", i)
+		}
+		if seen[tier.name] {
+			t.Errorf("two tiers are both named %q", tier.name)
+		}
+		seen[tier.name] = true
+		if tier.claim == nil {
+			t.Errorf("tier %q has no claim function", tier.name)
+		}
+	}
+}
+
+// funcBody returns the source of the named top-level function in file.
+func funcBody(t *testing.T, file, fn string) string {
+	t.Helper()
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	start := strings.Index(string(src), "\nfunc "+fn+"(")
+	if start < 0 {
+		t.Fatalf("%s: no top-level func %s", file, fn)
+	}
+	rest := string(src)[start+1:]
+	end := strings.Index(rest, "\n}\n")
+	if end < 0 {
+		t.Fatalf("%s: func %s has no terminator", file, fn)
+	}
+	return rest[:end]
+}
+
+// TestInvariant_UnionTagTiersAreDerived is the source-level half: both
+// consumers must reach the tier set by WALKING it. A tier open-coded inside
+// either one is invisible to the other, which is the drift this whole
+// structure exists to remove — and it is exactly how the legacy
+// "<kind>.<logicalType>" spelling came to be honored by the resolver and not
+// by the lookup table.
+func TestInvariant_UnionTagTiersAreDerived(t *testing.T) {
+	resolver := funcBody(t, "json_codec.go", "scanUnionBranch")
+	if n := strings.Count(resolver, "range unionTagTiers"); n != 1 {
+		t.Errorf("scanUnionBranch walks the tier slice %d times, want exactly 1", n)
+	}
+	// One scan over the branches, and it must be the one INSIDE the tier walk.
+	// A second scan is a hand-written tier: it answers names the lookup table
+	// will never register.
+	if n := strings.Count(resolver, "range union.branches"); n != 1 {
+		t.Errorf("scanUnionBranch scans union.branches %d times, want exactly 1 (inside the tier walk).\n"+
+			"A scan outside the walk is a tier only the resolver knows about; move it into unionTagTiers "+
+			"so fillUnionTagTables honors it too.", n)
+	}
+	// The name a caller writes is resolved through the parse-time table, not
+	// by re-walking the tiers per value. A tier walk reappearing here is both
+	// a per-value cost linear in the branch count and a second place the tier
+	// rule could be stated.
+	lookup := funcBody(t, "json_codec.go", "findUnionBranch")
+	if n := strings.Count(lookup, "range unionTagTiers"); n != 0 {
+		t.Errorf("findUnionBranch walks the tier slice %d times, want 0 — it must ask the table the walk already built", n)
+	}
+	if !strings.Contains(lookup, "union.tags.byName[name]") {
+		t.Error("findUnionBranch no longer reads unionTags.byName; the per-value question has to be answered by the table")
+	}
+	builder := funcBody(t, "schema.go", "fillUnionTagTables")
+	if n := strings.Count(builder, "range unionTagTiers"); n != 1 {
+		t.Errorf("fillUnionTagTables walks the tier slice %d times, want exactly 1", n)
+	}
+	// The kind vocabulary the logical-qualifier tier is defined over must have
+	// exactly one copy, and it must live in the tier. A second copy is the
+	// same set written twice, which is how the two sides drifted before.
+	const kindList = `case "null", "boolean", "int", "long", "float", "double", "string", "bytes", "fixed":`
+	src, err := os.ReadFile("json_codec.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(src), kindList); n != 1 {
+		t.Errorf("the logical-qualifier kind vocabulary appears %d times in json_codec.go, want 1", n)
+	}
+	if !strings.Contains(tierSource(t, "logical qualifier"), kindList) {
+		t.Errorf("the logical-qualifier kind vocabulary is not inside its own tier")
+	}
+}
+
+// tierSource returns the source text of the named tier's literal.
+func tierSource(t *testing.T, name string) string {
+	t.Helper()
+	src, err := os.ReadFile("json_codec.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	i := strings.Index(s, "unionTagTiers = []unionTagTier{")
+	if i < 0 {
+		t.Fatal("no unionTagTiers literal")
+	}
+	j := strings.Index(s[i:], "\n}\n")
+	block := s[i : i+j]
+	k := strings.Index(block, "name:    "+`"`+name+`"`)
+	if k < 0 {
+		k = strings.Index(block, "name: "+`"`+name+`"`)
+	}
+	if k < 0 {
+		t.Fatalf("tier %q not found in the literal", name)
+	}
+	return block[k:]
+}
+
+// tierAnswering reports which tier resolves name against union, or -1.
+// It re-walks the tiers the way findUnionBranch does, so it can attribute a
+// resolution rather than guess at it.
+func tierAnswering(union *schemaNode, name string) int {
+	for ti, tier := range unionTagTiers {
+		var match bool
+		var found int
+		for _, b := range union.branches {
+			if b == nil {
+				continue
+			}
+			if !tierMatches(tier, b, name) {
+				continue
+			}
+			if !tier.guarded {
+				return ti
+			}
+			if match {
+				found = -1
+				break
+			}
+			match, found = true, ti
+		}
+		if match && found >= 0 {
+			return ti
+		}
+		if found == -1 {
+			return -1 // refused as ambiguous by this tier
+		}
+	}
+	return -1
+}
+
+// TestInvariant_EveryUnionTagTierIsReachable is the behavioral half: every
+// tier in the slice must actually answer for some (union, tag) in the corpus.
+// A tier nothing reaches is a rule nothing tests, and its guard would neuter
+// green. This is the assertion that has to be extended when a tier is added.
+func TestInvariant_EveryUnionTagTierIsReachable(t *testing.T) {
+	type cell struct{ schema, tag string }
+	corpus := []cell{
+		// exact name
+		{`["null","int"]`, "int"},
+		{`["null",{"type":"record","name":"R","namespace":"ns","fields":[{"name":"x","type":"int"}]}]`, "ns.R"},
+		// logical qualifier, primitive-backed and named-fixed-backed
+		{`["null",{"type":"long","logicalType":"timestamp-millis"}]`, "long.timestamp-millis"},
+		{`["null",{"type":"fixed","name":"F","namespace":"n","size":16,"logicalType":"uuid"}]`, "fixed.uuid"},
+		// unqualified short name
+		{`["null",{"type":"record","name":"R","namespace":"ns","fields":[{"name":"x","type":"int"}]}]`, "R"},
+	}
+	reached := make([]bool, len(unionTagTiers))
+	for _, c := range corpus {
+		s, err := Parse(c.schema)
+		if err != nil {
+			t.Fatalf("%s: %v", c.schema, err)
+		}
+		ti := tierAnswering(s.node, c.tag)
+		if ti < 0 {
+			t.Errorf("no tier answers %q for %s", c.tag, c.schema)
+			continue
+		}
+		reached[ti] = true
+		// The attribution must agree with the real resolver.
+		if got := findUnionBranch(s.node, c.tag); got == nil {
+			t.Errorf("tier %d attributed %q for %s, but findUnionBranch refuses it",
+				ti, c.tag, c.schema)
+		}
+	}
+	for i, ok := range reached {
+		if !ok {
+			t.Errorf("tier %q (index %d) is never reached by the corpus — it ships unexercised",
+				unionTagTiers[i].name, i)
+		}
+	}
+}
+
+// TestInvariant_GuardedTiersRefuseAmbiguity states the rule the guarded flag
+// encodes, over every guarded tier: a name two branches claim within one tier
+// resolves NOWHERE. Silently taking the first is a coin flip between two
+// branches the caller may have meant either of, and the two wires would have
+// to make the same coin flip to stay in agreement.
+func TestInvariant_GuardedTiersRefuseAmbiguity(t *testing.T) {
+	cells := []struct {
+		tier   string
+		schema string
+		tag    string
+	}{
+		{"logical qualifier",
+			`["null",{"type":"fixed","name":"A","size":16,"logicalType":"uuid"},{"type":"fixed","name":"B","size":16,"logicalType":"uuid"}]`,
+			"fixed.uuid"},
+		{"unqualified short name",
+			`["null",{"type":"record","name":"R","namespace":"n1","fields":[{"name":"x","type":"int"}]},{"type":"record","name":"R","namespace":"n2","fields":[{"name":"y","type":"int"}]}]`,
+			"R"},
+	}
+	guarded := map[string]bool{}
+	for _, tier := range unionTagTiers {
+		if tier.guarded {
+			guarded[tier.name] = true
+		}
+	}
+	covered := map[string]bool{}
+	for _, c := range cells {
+		if !guarded[c.tier] {
+			t.Errorf("cell names tier %q, which is not guarded", c.tier)
+			continue
+		}
+		covered[c.tier] = true
+		s, err := Parse(c.schema)
+		if err != nil {
+			t.Fatalf("%s: %v", c.schema, err)
+		}
+		if b := findUnionBranch(s.node, c.tag); b != nil {
+			t.Errorf("tier %q: %q is claimed by two branches yet resolved to %q — a guarded tier must refuse it",
+				c.tier, c.tag, b.name)
+		}
+		// The other wire has to refuse it too, or a caller gets a value on one
+		// and an error on the other. Probed through the public encoder rather
+		// than the table so the assertion is about what a caller sees.
+		if _, err := s.Encode(map[string]any{c.tag: []byte("0123456789abcdef")}); err == nil {
+			t.Errorf("tier %q: %q is claimed by two branches yet the binary tagged-map encode accepted it — "+
+				"the two wires disagree", c.tier, c.tag)
+		}
+	}
+	for name := range guarded {
+		if !covered[name] {
+			t.Errorf("guarded tier %q has no ambiguity cell; its guard is unexercised", name)
+		}
+	}
+}
+
+// TestInvariant_UnionTagResolveDoesNotAllocate locks the property that made it
+// safe to route the resolver through a shared tier slice rather than leaving
+// the rules open-coded: a tier appends its claim into a stack buffer and the
+// comparison `string(claimed) == name` is a compare, not a conversion, so
+// resolving a tag allocates nothing however many tiers exist. A tier that
+// builds its claim some other way — fmt, a map lookup, strings.Join — would
+// put an allocation on a per-value JSON path, and this is where that shows up.
+func TestInvariant_UnionTagResolveDoesNotAllocate(t *testing.T) {
+	s := MustParse(`["null",{"type":"long","logicalType":"timestamp-millis"},` +
+		`{"type":"fixed","name":"F","namespace":"n","size":16,"logicalType":"uuid"},` +
+		`{"type":"record","name":"R","namespace":"ns","fields":[{"name":"x","type":"int"}]}]`)
+	for _, tag := range []string{
+		"long.timestamp-millis", // logical qualifier, primitive
+		"fixed.uuid",            // logical qualifier, named fixed
+		"n.F",                   // exact
+		"R",                     // unqualified short name
+		"absent",                // no tier claims it: every tier runs
+	} {
+		got := testing.AllocsPerRun(50, func() {
+			findUnionBranch(s.node, tag)
+		})
+		if got != 0 {
+			t.Errorf("resolving %q allocates %.0f times per call; the tier walk must stay allocation-free", tag, got)
+		}
+	}
+}
+
+// ---------- text_appender_contract_test.go ----------
+
+// freshShortAppender violates the encoding.TextAppender contract by
+// returning a fresh slice instead of appending to its input — the
+// realistic implementation bug `return []byte(s), nil`. Its returned
+// slice is SHORTER than the accumulated output the encoder handed it.
+type freshShortAppender struct{}
+
+func (freshShortAppender) AppendText(b []byte) ([]byte, error) { return []byte("x"), nil }
+
+// TestRegression_AppendTextShortReturnNamedError pins that a
+// contract-violating TextAppender whose returned slice is SHORTER than
+// its input surfaces as a named *SemanticError from binary encode —
+// never a slice-bounds panic. appendAvroString's inline-write backfill
+// derives the text length from the returned slice; without the length
+// guard the arithmetic indexes dst[mark:...] past the end of the fresh
+// short slice and panics the calling goroutine. The record's first
+// field makes the accumulated output longer than the fresh return, the
+// shape that drives the arithmetic out of bounds.
+func TestRegression_AppendTextShortReturnNamedError(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Encode panicked, want named error: %v", r)
+		}
+	}()
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"string"},{"name":"b","type":"string"}]}`)
+	_, err := s.Encode(map[string]any{"a": "0123456789", "b": freshShortAppender{}})
+	if err == nil {
+		t.Fatal("want error for AppendText returning a shorter slice, got nil")
+	}
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *SemanticError, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "AppendText returned a slice shorter than its input") {
+		t.Fatalf("error does not name the AppendText contract violation: %v", err)
+	}
+}
+
+// contractAppender's mode selects the return shape of AppendText,
+// covering the legal contract forms and the violating ones.
+type contractAppender struct{ mode string }
+
+func (c contractAppender) AppendText(b []byte) ([]byte, error) {
+	switch c.mode {
+	case "legal-append":
+		return append(b, "hello"...), nil
+	case "legal-zero-append":
+		return b, nil
+	case "fresh-short":
+		return []byte("x"), nil
+	case "fresh-long":
+		return []byte(strings.Repeat("z", 64)), nil
+	case "fresh-equal-len":
+		return bytes.Repeat([]byte{'q'}, len(b)), nil
+	case "error-return":
+		return nil, errors.New("appender boom")
+	}
+	panic("unknown mode " + c.mode)
+}
+
+type appenderStruct struct {
+	A string           `avro:"a"`
+	B contractAppender `avro:"b"`
+}
+
+// TestMatrix_AppendTextReturnShapes crosses every AppendText return
+// shape with every encode position that reaches appendAvroString's
+// inline-write backfill. The contract:
+//
+//   - No return shape may panic, anywhere.
+//   - A legal append (including a zero-length append) produces wire
+//     bytes byte-identical to encoding the equivalent plain string —
+//     the happy path is untouched by the shrunk-return guard.
+//   - A fresh return SHORTER than the input is the detectable
+//     violation (the backfill length arithmetic would go negative):
+//     it yields the named *SemanticError at every position.
+//   - A fresh return >= the input length passes the length guard and
+//     is NOT detectable without comparing prefix bytes on every encode
+//     (a per-string memcmp of everything encoded so far — a cost the
+//     encoder deliberately does not pay for the caller's own contract
+//     violation; encoding/json/v2's jsontext.AppendRaw trusts the
+//     append contract the same way). Documenting: those shapes return
+//     err == nil with the accumulated output replaced by the fresh
+//     slice's content and the length header backfilled at the
+//     placeholder offset; the exact observed bytes are pinned below so
+//     any future change to this posture is a deliberate one.
+//   - An error return surfaces the appender's error.
+func TestMatrix_AppendTextReturnShapes(t *testing.T) {
+	recordSchema := `{"type":"record","name":"R","fields":[
+		{"name":"a","type":"string"},{"name":"b","type":"string"}]}`
+	positions := []struct {
+		name   string
+		schema string
+		val    func(v contractAppender) any
+		twin   func(tw string) any // same shape with a plain string standing in for the appender
+	}{
+		{"top-level", `"string"`,
+			func(v contractAppender) any { return v },
+			func(tw string) any { return tw }},
+		{"record-second-field", recordSchema,
+			func(v contractAppender) any { return map[string]any{"a": "0123456789", "b": v} },
+			func(tw string) any { return map[string]any{"a": "0123456789", "b": tw} }},
+		// A struct field routes through the reflect record path (the
+		// unsafe string fast paths exclude text-method types), reaching
+		// the same backfill; must behave identically to the map form.
+		{"record-struct-field", recordSchema,
+			func(v contractAppender) any { return appenderStruct{A: "0123456789", B: v} },
+			func(tw string) any { return map[string]any{"a": "0123456789", "b": tw} }},
+		{"array-element", `{"type":"array","items":"string"}`,
+			func(v contractAppender) any { return []any{"0123456789", v} },
+			func(tw string) any { return []any{"0123456789", tw} }},
+		{"map-value", `{"type":"map","values":"string"}`,
+			func(v contractAppender) any { return map[string]any{"k": v} },
+			func(tw string) any { return map[string]any{"k": tw} }},
+		{"union-branch", `["null","string"]`,
+			func(v contractAppender) any { return v },
+			func(tw string) any { return tw }},
+	}
+
+	// Observed outputs for the undetectable fresh-return shapes
+	// (Documenting, see the test doc): the fresh slice's bytes with the
+	// real length header backfilled at the placeholder offset, plus any
+	// container terminator appended after the corrupted element.
+	rep := strings.Repeat
+	goldens := map[string]string{
+		// Position-dependent detectability (Documenting): at top level
+		// the 1-byte fresh-short return has the same length as its input
+		// (the placeholder is the only accumulated byte), so the
+		// shorter-than-input violation is not length-detectable there —
+		// the cell lands in the documented undetectable class and
+		// encodes the empty string (the backfilled header is the entire
+		// output). At every other position the accumulated output
+		// exceeds the fresh return and the guard names the violation.
+		"top-level/fresh-short":               "00",
+		"top-level/fresh-long":                "7e" + rep("7a", 63),
+		"top-level/fresh-equal-len":           "00",
+		"record-second-field/fresh-long":      rep("7a", 11) + "68" + rep("7a", 52),
+		"record-second-field/fresh-equal-len": rep("71", 11) + "00",
+		"record-struct-field/fresh-long":      rep("7a", 11) + "68" + rep("7a", 52),
+		"record-struct-field/fresh-equal-len": rep("71", 11) + "00",
+		"array-element/fresh-long":            rep("7a", 12) + "66" + rep("7a", 51) + "00",
+		"array-element/fresh-equal-len":       rep("71", 12) + "0000",
+		"map-value/fresh-long":                rep("7a", 3) + "78" + rep("7a", 60) + "00",
+		"map-value/fresh-equal-len":           rep("71", 3) + "0000",
+		"union-branch/fresh-long":             "7a7c" + rep("7a", 62),
+		"union-branch/fresh-equal-len":        "7100",
+	}
+
+	shapes := []struct {
+		mode  string
+		class string // legal | guard | silent | error
+		twin  string // legal only: the plain-string equivalent
+	}{
+		{"legal-append", "legal", "hello"},
+		{"legal-zero-append", "legal", ""},
+		{"fresh-short", "guard", ""},
+		{"fresh-long", "silent", ""},
+		{"fresh-equal-len", "silent", ""},
+		{"error-return", "error", ""},
+	}
+
+	for _, pos := range positions {
+		s := MustParse(pos.schema)
+		for _, sh := range shapes {
+			t.Run(pos.name+"/"+sh.mode, func(t *testing.T) {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("Encode panicked: %v", r)
+					}
+				}()
+				out, err := s.Encode(pos.val(contractAppender{mode: sh.mode}))
+				class := sh.class
+				if class == "guard" {
+					// A guard cell whose observed output is pinned in
+					// goldens is a position where the length information
+					// does not exist (see the goldens doc) — silent there.
+					if _, undetectable := goldens[pos.name+"/"+sh.mode]; undetectable {
+						class = "silent"
+					}
+				}
+				switch class {
+				case "legal":
+					if err != nil {
+						t.Fatalf("legal shape errored: %v", err)
+					}
+					want, werr := s.Encode(pos.twin(sh.twin))
+					if werr != nil {
+						t.Fatalf("plain-string twin errored: %v", werr)
+					}
+					if !bytes.Equal(out, want) {
+						t.Fatalf("legal shape diverged from plain-string twin:\n got %x\nwant %x", out, want)
+					}
+				case "guard":
+					if err == nil {
+						t.Fatalf("want named error, got nil (out=%x)", out)
+					}
+					var se *SemanticError
+					if !errors.As(err, &se) {
+						t.Fatalf("want *SemanticError in chain, got %T: %v", err, err)
+					}
+					if !strings.Contains(err.Error(), "AppendText returned a slice shorter than its input") {
+						t.Fatalf("error does not name the violation: %v", err)
+					}
+				case "silent":
+					if err != nil {
+						t.Fatalf("documented-silent shape errored: %v", err)
+					}
+					if got := hex.EncodeToString(out); got != goldens[pos.name+"/"+sh.mode] {
+						t.Fatalf("observed silent output changed:\n got %s\nwant %s", got, goldens[pos.name+"/"+sh.mode])
+					}
+				case "error":
+					if err == nil || !strings.Contains(err.Error(), "appender boom") {
+						t.Fatalf("want appender's own error, got %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestMatrix_AppendTextReturnShapesJSONImmunity pins that the JSON
+// encoder cannot be affected by any AppendText return shape: it
+// materializes text via AppendText(nil) (textValue), so the returned
+// bytes simply ARE the text — there is no backfill arithmetic to
+// corrupt and nothing to guard. Documenting: for contract-violating
+// appenders the two wire formats legitimately differ — binary rejects
+// the shorter-than-input return via the backfill guard while JSON
+// emits the fresh slice's content verbatim.
+func TestMatrix_AppendTextReturnShapesJSONImmunity(t *testing.T) {
+	recordSchema := `{"type":"record","name":"R","fields":[
+		{"name":"a","type":"string"},{"name":"b","type":"string"}]}`
+	positions := []struct {
+		name   string
+		schema string
+		val    func(v contractAppender) any
+		wrap   func(cell string) string // cell JSON → full document
+	}{
+		{"top-level", `"string"`,
+			func(v contractAppender) any { return v },
+			func(cell string) string { return cell }},
+		{"record-second-field", recordSchema,
+			func(v contractAppender) any { return map[string]any{"a": "0123456789", "b": v} },
+			func(cell string) string { return `{"a":"0123456789","b":` + cell + `}` }},
+	}
+	shapes := []struct {
+		mode string
+		cell string // expected JSON for the appender's field; "" means expect the appender's error
+	}{
+		{"legal-append", `"hello"`},
+		{"legal-zero-append", `""`},
+		// AppendText(nil): a fresh return is the text, verbatim.
+		{"fresh-short", `"x"`},
+		{"fresh-long", `"` + strings.Repeat("z", 64) + `"`},
+		// len(nil) == 0, so the equal-len fresh return is empty.
+		{"fresh-equal-len", `""`},
+		{"error-return", ""},
+	}
+	for _, pos := range positions {
+		s := MustParse(pos.schema)
+		for _, sh := range shapes {
+			t.Run(pos.name+"/"+sh.mode, func(t *testing.T) {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("EncodeJSON panicked: %v", r)
+					}
+				}()
+				out, err := s.EncodeJSON(pos.val(contractAppender{mode: sh.mode}))
+				if sh.cell == "" {
+					if err == nil || !strings.Contains(err.Error(), "appender boom") {
+						t.Fatalf("want appender's own error, got %v", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if want := pos.wrap(sh.cell); string(out) != want {
+					t.Fatalf("json output:\n got %s\nwant %s", out, want)
+				}
+			})
+		}
+	}
+}
+
+// ---------- text_interface_precedence_test.go ----------
+
+// The text-interface (TextMarshaler / AppendText / TextUnmarshaler)
+// precedence contract, pinned here for the string / enum / uuid sites on
+// both the binary and JSON paths:
+//
+//   - For a bytes-shaped UUID wire (fixed+uuid), a [16]byte-shaped Go type
+//     is authoritative by its raw bytes; the text interface is NOT
+//     consulted. The 16 bytes ARE the UUID, so a MarshalText->parseUUID
+//     round trip would be redundant and would let a non-canonical text
+//     method diverge the binary and JSON wire.
+//   - Everywhere the text interface IS consulted, it is tried BEFORE the
+//     reflect.String fast path (and, for enum, before the int-ordinal
+//     arm), matching encoding/json's preference for TextMarshaler and
+//     Java's name-based enum matching.
+
+// nonCanonicalArrUUID is a [16]byte that also implements the text
+// interfaces, deliberately NON-canonically: MarshalText ignores the bytes
+// and returns the all-zero UUID; UnmarshalText ignores its input and
+// writes all-0xFF. For fixed+uuid the wire is the raw 16 bytes, so if
+// either text method fired the encoded/decoded value would reflect
+// zeros/0xFF and the binary and JSON paths would disagree.
+type nonCanonicalArrUUID [16]byte
+
+func (nonCanonicalArrUUID) MarshalText() ([]byte, error) {
+	return []byte("00000000-0000-0000-0000-000000000000"), nil
+}
+
+func (u *nonCanonicalArrUUID) UnmarshalText([]byte) error {
+	for i := range u {
+		u[i] = 0xFF
+	}
+	return nil
+}
+
+func TestRegression_FixedUUIDByteArrayTrustsRawBytes(t *testing.T) {
+	s := MustParse(`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`)
+	in := nonCanonicalArrUUID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("binary encode: %v", err)
+	}
+	// fixed has no length prefix; the wire is exactly the raw 16 bytes.
+	// If MarshalText fired the wire would be the all-zero UUID's bytes.
+	if len(bin) != 16 {
+		t.Fatalf("binary wire len = %d, want 16", len(bin))
+	}
+	for i := range bin {
+		if bin[i] != byte(i+1) {
+			t.Fatalf("binary wire = % x, want raw 01..10 (MarshalText must not fire)", bin)
+		}
+	}
+
+	jsonW, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("json encode: %v", err)
+	}
+
+	// Both wires decode back to the raw bytes; the [16]byte target trusts
+	// them (UnmarshalText, which would write 0xFF, must not fire). Binary
+	// and JSON must agree.
+	var binBack, jsonBack nonCanonicalArrUUID
+	if _, err := s.Decode(bin, &binBack); err != nil {
+		t.Fatalf("binary decode: %v", err)
+	}
+	if err := s.DecodeJSON(jsonW, &jsonBack); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if binBack != in {
+		t.Fatalf("binary round-trip = % x, want % x (UnmarshalText must not fire)", binBack[:], in[:])
+	}
+	if jsonBack != in {
+		t.Fatalf("json round-trip = % x, want % x (UnmarshalText must not fire)", jsonBack[:], in[:])
+	}
+	if binBack != jsonBack {
+		t.Fatalf("binary vs JSON decode diverge: % x vs % x", binBack[:], jsonBack[:])
+	}
+}
+
+// upperString is a string-kind type whose text methods transform the
+// value (MarshalText uppercases, UnmarshalText lowercases). A string-kind
+// type implementing TextMarshaler must use the marshaled form rather than
+// its raw underlying string, matching encoding/json and keeping binary and
+// JSON in lockstep.
+type upperString string
+
+func (u upperString) MarshalText() ([]byte, error) {
+	return []byte(strings.ToUpper(string(u))), nil
+}
+
+func (u *upperString) UnmarshalText(b []byte) error {
+	*u = upperString(strings.ToLower(string(b)))
+	return nil
+}
+
+func TestRegression_StringKindPrefersTextMarshaler(t *testing.T) {
+	s := MustParse(`"string"`)
+	in := upperString("hello")
+
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("binary encode: %v", err)
+	}
+	// 1-byte length prefix (zigzag(5)=0x0a), then the MARSHALED form
+	// "HELLO" — not the raw underlying string "hello".
+	if got := string(bin[1:]); got != "HELLO" {
+		t.Fatalf("binary wire body = %q, want HELLO (TextMarshaler, not the raw string)", got)
+	}
+	jsonW, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("json encode: %v", err)
+	}
+	if string(jsonW) != `"HELLO"` {
+		t.Fatalf("json wire = %s, want \"HELLO\"", jsonW)
+	}
+
+	// Decode applies UnmarshalText (lowercases): wire "HELLO" -> "hello"
+	// on both paths.
+	var binBack, jsonBack upperString
+	if _, err := s.Decode(bin, &binBack); err != nil {
+		t.Fatalf("binary decode: %v", err)
+	}
+	if err := s.DecodeJSON(jsonW, &jsonBack); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if binBack != "hello" {
+		t.Fatalf("binary decode = %q, want hello (UnmarshalText lowercases)", binBack)
+	}
+	if jsonBack != "hello" {
+		t.Fatalf("json decode = %q, want hello (UnmarshalText lowercases)", jsonBack)
+	}
+}
+
+// TestRegression_StringKindTextMarshalerConsistentAcrossContexts pins that
+// a string-kind type with text methods is handled identically whether it
+// appears as a scalar, a struct field, or a container element. The unsafe
+// struct fast paths (usString / udStringDeser) and the array/map fast loops
+// (which capture reflect.Value.SetString) bypass appendAvroString /
+// setStringValue, so they must be gated off for text-method types — else a
+// struct field or container element would encode/decode its raw string
+// while the same value as a scalar uses MarshalText/UnmarshalText.
+func TestRegression_StringKindTextMarshalerConsistentAcrossContexts(t *testing.T) {
+	// struct field — exercises usString / udStringDeser compile gates.
+	t.Run("struct field", func(t *testing.T) {
+		type rec struct {
+			F upperString `avro:"f"`
+		}
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"string"}]}`)
+		bin, err := s.Encode(rec{F: "hello"})
+		if err != nil {
+			t.Fatalf("binary encode: %v", err)
+		}
+		js, err := s.EncodeJSON(rec{F: "hello"})
+		if err != nil {
+			t.Fatalf("json encode: %v", err)
+		}
+		if !strings.Contains(string(bin), "HELLO") {
+			t.Fatalf("struct binary = %q, want the MarshalText form HELLO", bin)
+		}
+		if !strings.Contains(string(js), "HELLO") {
+			t.Fatalf("struct json = %s, want the MarshalText form HELLO", js)
+		}
+		var binBack, jsonBack rec
+		if _, err := s.Decode(bin, &binBack); err != nil {
+			t.Fatalf("binary decode: %v", err)
+		}
+		if err := s.DecodeJSON(js, &jsonBack); err != nil {
+			t.Fatalf("json decode: %v", err)
+		}
+		if binBack.F != "hello" || jsonBack.F != "hello" {
+			t.Fatalf("struct decode bin=%q json=%q, want hello (UnmarshalText)", binBack.F, jsonBack.F)
+		}
+	})
+
+	// array element — exercises the deserArrayStringLoop fast-loop gate.
+	t.Run("array element", func(t *testing.T) {
+		s := MustParse(`{"type":"array","items":"string"}`)
+		bin, err := s.Encode([]upperString{"hello", "world"})
+		if err != nil {
+			t.Fatalf("binary encode: %v", err)
+		}
+		js, err := s.EncodeJSON([]upperString{"hello", "world"})
+		if err != nil {
+			t.Fatalf("json encode: %v", err)
+		}
+		if string(js) != `["HELLO","WORLD"]` {
+			t.Fatalf("array json = %s, want [\"HELLO\",\"WORLD\"]", js)
+		}
+		var binBack, jsonBack []upperString
+		if _, err := s.Decode(bin, &binBack); err != nil {
+			t.Fatalf("binary decode: %v", err)
+		}
+		if err := s.DecodeJSON(js, &jsonBack); err != nil {
+			t.Fatalf("json decode: %v", err)
+		}
+		want := []upperString{"hello", "world"}
+		for i := range want {
+			if binBack[i] != want[i] || jsonBack[i] != want[i] {
+				t.Fatalf("array decode bin=%v json=%v, want %v (UnmarshalText)", binBack, jsonBack, want)
+			}
+		}
+	})
+
+	// map value — exercises the deserMapStringBlock fast-loop gate.
+	t.Run("map value", func(t *testing.T) {
+		s := MustParse(`{"type":"map","values":"string"}`)
+		bin, err := s.Encode(map[string]upperString{"k": "hello"})
+		if err != nil {
+			t.Fatalf("binary encode: %v", err)
+		}
+		js, err := s.EncodeJSON(map[string]upperString{"k": "hello"})
+		if err != nil {
+			t.Fatalf("json encode: %v", err)
+		}
+		if !strings.Contains(string(bin), "HELLO") || !strings.Contains(string(js), "HELLO") {
+			t.Fatalf("map encode bin=%q json=%s, want MarshalText form HELLO", bin, js)
+		}
+		var binBack, jsonBack map[string]upperString
+		if _, err := s.Decode(bin, &binBack); err != nil {
+			t.Fatalf("binary decode: %v", err)
+		}
+		if err := s.DecodeJSON(js, &jsonBack); err != nil {
+			t.Fatalf("json decode: %v", err)
+		}
+		if binBack["k"] != "hello" || jsonBack["k"] != "hello" {
+			t.Fatalf("map decode bin=%q json=%q, want hello (UnmarshalText)", binBack["k"], jsonBack["k"])
+		}
+	})
+}
+
+var errUnknownOrdinalColor = errors.New("unknown ordinalColor symbol")
+
+var enumColorNames = [...]string{"RED", "GREEN", "BLUE"}
+
+// ordinalColor is an int-kind enum carrier with name-based text methods.
+// Its Go integer values (ordRed=0, ordGreen=1, ordBlue=2) deliberately do
+// NOT line up with the Avro symbol order used in the test
+// (["BLUE","GREEN","RED"], where RED is ordinal 2). Name-based matching
+// via the text interface must win over trusting the Go int as the ordinal.
+type ordinalColor int
+
+const (
+	ordRed ordinalColor = iota
+	ordGreen
+	ordBlue
+)
+
+func (c ordinalColor) MarshalText() ([]byte, error) {
+	if int(c) < 0 || int(c) >= len(enumColorNames) {
+		return nil, errUnknownOrdinalColor
+	}
+	return []byte(enumColorNames[c]), nil
+}
+
+func (c *ordinalColor) UnmarshalText(b []byte) error {
+	for i, n := range enumColorNames {
+		if n == string(b) {
+			*c = ordinalColor(i)
+			return nil
+		}
+	}
+	return errUnknownOrdinalColor
+}
+
+func TestRegression_EnumTextMarshalerNameMatchOverOrdinal(t *testing.T) {
+	// Avro symbol order differs from the Go int order: "RED" is Avro
+	// ordinal 2 here, while ordRed is Go int 0.
+	s := MustParse(`{"type":"enum","name":"C","symbols":["BLUE","GREEN","RED"]}`)
+	in := ordRed // Go 0; symbol "RED"; Avro ordinal 2
+
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("binary encode: %v", err)
+	}
+	// zigzag(2) = 0x04. If the encoder trusted the Go int (0) as the
+	// ordinal, the wire would be zigzag(0) = 0x00 = "BLUE".
+	if len(bin) != 1 || bin[0] != 0x04 {
+		t.Fatalf("binary wire = % x, want 04 (RED = Avro ordinal 2, name-matched)", bin)
+	}
+	jsonW, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("json encode: %v", err)
+	}
+	if string(jsonW) != `"RED"` {
+		t.Fatalf("json wire = %s, want \"RED\"", jsonW)
+	}
+
+	// Round-trip: wire ordinal 2 = "RED" -> UnmarshalText -> ordRed (Go 0).
+	var binBack, jsonBack ordinalColor
+	if _, err := s.Decode(bin, &binBack); err != nil {
+		t.Fatalf("binary decode: %v", err)
+	}
+	if err := s.DecodeJSON(jsonW, &jsonBack); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if binBack != ordRed {
+		t.Fatalf("binary decode = %d, want ordRed=0 (name-matched UnmarshalText)", binBack)
+	}
+	if jsonBack != ordRed {
+		t.Fatalf("json decode = %d, want ordRed=0", jsonBack)
+	}
+}
+
+// SchemaFor must infer fixed(16) uuid for a ,uuid-tagged [16]byte EVEN WHEN
+// the type implements a text interface. The codec trusts the raw bytes of a
+// uuid-on-fixed [16]byte and never consults its text method (see
+// TestRegression_FixedUUIDByteArrayTrustsRawBytes), so inferring a plain Avro
+// "string" silently drops both the fixed(16) shape and the uuid logical type,
+// and produces a different wire format / fingerprint than an identical
+// text-less [16]byte field. The text-interface arm in inferType must not
+// intercept a uuid [16]byte headed for the fixed(16) Array case.
+func TestRegression_SchemaForUUIDByteArrayWithTextMethod(t *testing.T) {
+	// Bug case: nonCanonicalArrUUID is a [16]byte with MarshalText +
+	// UnmarshalText (mirrors github.com/google/uuid.UUID).
+	type recTexty struct {
+		ID nonCanonicalArrUUID `avro:"id,uuid"`
+	}
+	s, err := SchemaFor[recTexty]()
+	if err != nil {
+		t.Fatalf("SchemaFor[recTexty]: %v", err)
+	}
+	if ft := s.Root().Fields[0].Type; ft.Type != "fixed" || ft.Size != 16 || ft.LogicalType != "uuid" {
+		t.Fatalf("uuid [16]byte with a text method: want fixed(16) uuid, got Type=%q Size=%d LogicalType=%q",
+			ft.Type, ft.Size, ft.LogicalType)
+	}
+
+	// Boundary-1 control (must still hold): a plain [16]byte with no text
+	// method already infers fixed(16) uuid.
+	type recPlain struct {
+		ID [16]byte `avro:"id,uuid"`
+	}
+	sp, err := SchemaFor[recPlain]()
+	if err != nil {
+		t.Fatalf("SchemaFor[recPlain]: %v", err)
+	}
+	if fp := sp.Root().Fields[0].Type; fp.Type != "fixed" || fp.Size != 16 || fp.LogicalType != "uuid" {
+		t.Fatalf("plain uuid [16]byte: want fixed(16) uuid, got Type=%q Size=%d LogicalType=%q",
+			fp.Type, fp.Size, fp.LogicalType)
+	}
+}
+
+// ---------- decode_reencode_audit_test.go ----------
+
+// TestDecodeReencodeSymmetry verifies that values the decoder produces
+// can be re-encoded by the encoder. A pair where decode succeeds but
+// encode of the decoded value fails would be a round-trip asymmetry.
+//
+// Exercises every Avro type with *any and one or more representative
+// typed targets, then re-encodes each decoded value. Wire-byte
+// canonicalization on the encoder side is fine; the Go-value
+// round-trip is what we lock in.
+//
+// Documented intentional asymmetries are excluded here and pinned by their own
+// tests — [TestTextUnmarshalerOnlyDecodeOnly] below for the TextUnmarshaler-only
+// case, which is the one this sweep would otherwise report as a round-trip
+// failure. Both of this sentence's previous pointers had rotted: a
+// SKIPPED_FOLLOWUPS.md that no longer exists and a test name that never did, so
+// an exclusion the reader could not check read as one they could.
+func TestDecodeReencodeSymmetry(t *testing.T) {
+	type tc struct {
+		name   string
+		schema string
+		// build a fresh encoded payload for the test
+		encoded func() []byte
+		// list of decode target types to probe
+		targets []func() any
+	}
+
+	// shorthand encoder
+	enc := func(t *testing.T, schemaStr string, v any) []byte {
+		s := MustParse(schemaStr)
+		b, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatalf("setup encode failed: %v", err)
+		}
+		return b
+	}
+
+	cases := []tc{
+		{
+			"boolean",
+			`"boolean"`,
+			func() []byte { return enc(t, `"boolean"`, true) },
+			[]func() any{
+				func() any { v := false; return &v },
+				func() any { var v any; return &v },
+			},
+		},
+		{
+			"int",
+			`"int"`,
+			func() []byte { return enc(t, `"int"`, int32(42)) },
+			[]func() any{
+				func() any { var v int32; return &v },
+				func() any { var v int64; return &v },
+				func() any { var v float32; return &v },
+				func() any { var v json.Number; return &v },
+				func() any { var v any; return &v },
+			},
+		},
+		{
+			"long",
+			`"long"`,
+			func() []byte { return enc(t, `"long"`, int64(9007199254740993)) },
+			[]func() any{
+				func() any { var v int64; return &v },
+				func() any { var v json.Number; return &v },
+				func() any { var v any; return &v },
+			},
+		},
+		{
+			"double",
+			`"double"`,
+			func() []byte { return enc(t, `"double"`, 3.14) },
+			[]func() any{
+				func() any { var v float64; return &v },
+				func() any { var v int64; return &v }, // decode rejects (3.14 is not whole-number); test verifies the skip-on-rejection path
+				func() any { var v json.Number; return &v },
+				func() any { var v any; return &v },
+			},
+		},
+		{
+			"string",
+			`"string"`,
+			func() []byte { return enc(t, `"string"`, "hello") },
+			[]func() any{
+				func() any { var v string; return &v },
+				func() any { var v []byte; return &v },
+				func() any { var v any; return &v },
+			},
+		},
+		{
+			"bytes",
+			`"bytes"`,
+			func() []byte { return enc(t, `"bytes"`, []byte{0xC3, 0xA9}) },
+			[]func() any{
+				func() any { var v []byte; return &v },
+				func() any { var v string; return &v },
+				func() any { var v any; return &v },
+			},
+		},
+		{
+			"date",
+			`{"type":"int","logicalType":"date"}`,
+			func() []byte {
+				s := MustParse(`{"type":"int","logicalType":"date"}`)
+				b, err := s.AppendEncode(nil, time.Date(2025, 5, 21, 0, 0, 0, 0, time.UTC))
+				if err != nil {
+					t.Fatalf("date encode: %v", err)
+				}
+				return b
+			},
+			[]func() any{
+				func() any { var v time.Time; return &v },
+				func() any { var v int32; return &v },
+				func() any { var v string; return &v },
+				func() any { var v any; return &v },
+			},
+		},
+		{
+			"timestamp-millis",
+			`{"type":"long","logicalType":"timestamp-millis"}`,
+			func() []byte {
+				s := MustParse(`{"type":"long","logicalType":"timestamp-millis"}`)
+				b, err := s.AppendEncode(nil, time.Date(2025, 5, 21, 12, 30, 0, 0, time.UTC))
+				if err != nil {
+					t.Fatalf("ts encode: %v", err)
+				}
+				return b
+			},
+			[]func() any{
+				func() any { var v time.Time; return &v },
+				func() any { var v int64; return &v },
+				func() any { var v string; return &v },
+				func() any { var v any; return &v },
+			},
+		},
+		{
+			"fixed(16)+uuid",
+			`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`,
+			func() []byte {
+				s := MustParse(`{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`)
+				b, err := s.AppendEncode(nil, [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+				if err != nil {
+					t.Fatalf("uuid encode: %v", err)
+				}
+				return b
+			},
+			[]func() any{
+				func() any { var v [16]byte; return &v },
+				func() any { var v string; return &v },
+				func() any { var v any; return &v },
+			},
+		},
+	}
+
+	for _, c := range cases {
+		for _, mk := range c.targets {
+			target := mk()
+			name := c.name + "/" + reflect.TypeOf(target).Elem().String()
+			t.Run(name, func(t *testing.T) {
+				wire := c.encoded()
+				s := MustParse(c.schema)
+				if _, err := s.Decode(wire, target); err != nil {
+					// Decode rejection is fine; only
+					// decode-succeeds-but-encode-fails is an
+					// asymmetry.
+					t.Logf("decode skipped (target rejects): %v", err)
+					return
+				}
+				v := reflect.ValueOf(target).Elem().Interface()
+				if _, err := s.AppendEncode(nil, v); err != nil {
+					t.Fatalf("ASYMMETRY: decode produced %T(%v) but encode of that value rejects: %v", v, v, err)
+				}
+			})
+		}
+	}
+}
+
+// textUnmarshalerOnly implements UnmarshalText but not MarshalText or
+// AppendText — the standard Go pattern for parse-only types (config
+// values, enums, lookup keys, one-way ingest pipelines). Decode
+// accepts; encode of the produced value rejects because the type
+// provides no text-out method. This asymmetry matches Go's stdlib
+// idiom — TextUnmarshaler is explicitly a one-way interface — and
+// the library doesn't force users to write no-op MarshalText shims
+// on types they only ever decode into.
+type textUnmarshalerOnly struct{ Got string }
+
+func (t *textUnmarshalerOnly) UnmarshalText(b []byte) error {
+	t.Got = string(b)
+	return nil
+}
+
+// TestTextUnmarshalerOnlyDecodeOnly pins the documented one-way
+// pattern: Decode into a TextUnmarshaler-only target succeeds; the
+// caller doesn't need a sibling MarshalText. Re-encoding the produced
+// value would fail (no text-out method), but that's by user choice —
+// the type is decode-only.
+func TestTextUnmarshalerOnlyDecodeOnly(t *testing.T) {
+	s := MustParse(`"string"`)
+	wire, err := s.AppendEncode(nil, "hello")
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	var got textUnmarshalerOnly
+	if _, err := s.Decode(wire, &got); err != nil {
+		t.Fatalf("decode into TextUnmarshaler-only: %v", err)
+	}
+	if got.Got != "hello" {
+		t.Fatalf("UnmarshalText not called: got %q", got.Got)
+	}
+
+	// Re-encoding the value rejects because the type has no text-out
+	// method. Standard Go one-way pattern.
+	if _, err := s.AppendEncode(nil, &got); err == nil {
+		t.Fatalf("expected encode rejection of TextUnmarshaler-only value; got success")
+	}
+}
+
+// ptrMarshalerSymmetry has MarshalText and UnmarshalText both on the
+// pointer receiver. Used to verify symmetric encode/decode discovery
+// of pointer-receiver text methods.
+type ptrMarshalerSymmetry struct{ val string }
+
+func (m *ptrMarshalerSymmetry) MarshalText() ([]byte, error) { return []byte(m.val), nil }
+func (m *ptrMarshalerSymmetry) UnmarshalText(b []byte) error { m.val = string(b); return nil }
+
+// colorEnum demonstrates a type with both MarshalText and UnmarshalText
+// used as an Avro enum carrier (the text matches a symbol).
+type colorEnum struct{ symbol string }
+
+func (c colorEnum) MarshalText() ([]byte, error) { return []byte(c.symbol), nil }
+func (c *colorEnum) UnmarshalText(b []byte) error {
+	c.symbol = string(b)
+	return nil
+}
+
+// uuidViaText demonstrates a type that carries a UUID via the Text*
+// interfaces. The encode side parses the text as a UUID; the decode
+// side receives the canonical hex-dash form.
+type uuidViaText struct{ s string }
+
+func (u uuidViaText) MarshalText() ([]byte, error) { return []byte(u.s), nil }
+func (u *uuidViaText) UnmarshalText(b []byte) error {
+	u.s = string(b)
+	return nil
+}
+
+// TestTextInterfaceCoverageForEnumAndFixedUUID pins that the text-shaped
+// Avro sites — enum and fixed+uuid — accept Text* on both binary and
+// JSON paths. Parity with string and string+uuid which already accept.
+func TestTextInterfaceCoverageForEnumAndFixedUUID(t *testing.T) {
+	t.Run("enum binary round-trip via Text*", func(t *testing.T) {
+		s := MustParse(`{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]}`)
+		wire, err := s.AppendEncode(nil, colorEnum{symbol: "GREEN"})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got colorEnum
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.symbol != "GREEN" {
+			t.Fatalf("round-trip: got %q, want GREEN", got.symbol)
+		}
+	})
+	t.Run("enum binary unknown symbol rejects", func(t *testing.T) {
+		s := MustParse(`{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]}`)
+		if _, err := s.AppendEncode(nil, colorEnum{symbol: "PURPLE"}); err == nil {
+			t.Fatalf("expected encode rejection of unknown symbol")
+		}
+	})
+	t.Run("enum JSON round-trip via Text*", func(t *testing.T) {
+		s := MustParse(`{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]}`)
+		out, err := s.EncodeJSON(colorEnum{symbol: "BLUE"})
+		if err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		if string(out) != `"BLUE"` {
+			t.Fatalf("EncodeJSON got %s, want \"BLUE\"", out)
+		}
+		var got colorEnum
+		if err := s.DecodeJSON([]byte(`"RED"`), &got); err != nil {
+			t.Fatalf("DecodeJSON: %v", err)
+		}
+		if got.symbol != "RED" {
+			t.Fatalf("DecodeJSON got %q, want RED", got.symbol)
+		}
+	})
+
+	const uuidSchema = `{"type":"fixed","name":"U","size":16,"logicalType":"uuid"}`
+	const uuidStr = "12345678-1234-5678-1234-567812345678"
+
+	t.Run("fixed+uuid binary round-trip via Text*", func(t *testing.T) {
+		s := MustParse(uuidSchema)
+		wire, err := s.AppendEncode(nil, uuidViaText{s: uuidStr})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if len(wire) != 16 {
+			t.Fatalf("expected 16-byte wire, got %d", len(wire))
+		}
+		var got uuidViaText
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.s != uuidStr {
+			t.Fatalf("round-trip: got %q, want %q", got.s, uuidStr)
+		}
+	})
+	t.Run("fixed+uuid binary malformed text rejects", func(t *testing.T) {
+		s := MustParse(uuidSchema)
+		if _, err := s.AppendEncode(nil, uuidViaText{s: "not-a-uuid"}); err == nil {
+			t.Fatalf("expected encode rejection of non-UUID text")
+		}
+	})
+	t.Run("fixed+uuid JSON round-trip via Text*", func(t *testing.T) {
+		s := MustParse(uuidSchema)
+		out, err := s.EncodeJSON(uuidViaText{s: uuidStr})
+		if err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		var got uuidViaText
+		if err := s.DecodeJSON(out, &got); err != nil {
+			t.Fatalf("DecodeJSON: %v", err)
+		}
+		if got.s != uuidStr {
+			t.Fatalf("JSON round-trip: got %q, want %q", got.s, uuidStr)
+		}
+	})
+}
+
+// TestMapRecordEncodeIgnoresAliases pins that map-record encoding
+// looks up only by canonical field name across every map encode path
+// (binary map[string]any, binary typed-map with plain string key,
+// binary typed-map with a named string-key subtype, plus the JSON
+// equivalents). Aliases are a reader-side / decode concept (Avro 1.12
+// spec; Apache Avro Java GenericDatumWriter; fastavro write_record
+// — none of the three reference impls consult aliases on encode);
+// our encode matches that. Input keyed by an alias hits the missing-
+// field path just like any other unrecognized key. Canonical present
+// + extra alias key is silently accepted (the alias key is simply not
+// consulted — it's an unrecognized stray, not a collision).
+func TestMapRecordEncodeIgnoresAliases(t *testing.T) {
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"new_name","type":"long","aliases":["old_name"]}
+	]}`
+	s := MustParse(schema)
+
+	// --- binary encode ---
+
+	t.Run("binary map[string]any via alias key: missing-field error", func(t *testing.T) {
+		if _, err := s.AppendEncode(nil, map[string]any{"old_name": int64(42)}); err == nil {
+			t.Fatalf("expected missing-key error; encode silently accepted the alias")
+		}
+	})
+
+	t.Run("binary map[string]any via canonical key: succeeds", func(t *testing.T) {
+		if _, err := s.AppendEncode(nil, map[string]any{"new_name": int64(42)}); err != nil {
+			t.Fatalf("binary encode with canonical key: %v", err)
+		}
+	})
+
+	t.Run("binary map[string]any canonical+stray alias: alias silently ignored", func(t *testing.T) {
+		// Canonical present, alias also present; encoder iterates schema
+		// fields by canonical name, so the alias key is a stray and is
+		// simply not consulted. Same contract as any other unrecognized
+		// key in the input map.
+		out, err := s.AppendEncode(nil, map[string]any{"new_name": int64(42), "old_name": int64(99)})
+		if err != nil {
+			t.Fatalf("canonical+stray-alias should succeed: %v", err)
+		}
+		var got map[string]any
+		if _, err := s.Decode(out, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got["new_name"] != int64(42) {
+			t.Fatalf("expected new_name=42 (stray old_name ignored); got %v", got)
+		}
+	})
+
+	t.Run("binary map[string]int64 via alias key: missing-field error", func(t *testing.T) {
+		// Exercises the typed-map encode path (map[string]T with plain
+		// string key — different from map[string]any).
+		if _, err := s.AppendEncode(nil, map[string]int64{"old_name": 42}); err == nil {
+			t.Fatalf("expected missing-key error on typed-map encode; encode accepted alias")
+		}
+	})
+
+	t.Run("binary map[NK]int64 via alias key: missing-field error", func(t *testing.T) {
+		// Exercises the typed-map encode path with a named-string-key
+		// subtype (forces mapKeyAs.Convert).
+		type NK string
+		if _, err := s.AppendEncode(nil, map[NK]int64{"old_name": 42}); err == nil {
+			t.Fatalf("expected missing-key error on named-key typed-map encode; encode accepted alias")
+		}
+	})
+
+	t.Run("binary map[NK]int64 via canonical key: succeeds", func(t *testing.T) {
+		type NK string
+		if _, err := s.AppendEncode(nil, map[NK]int64{"new_name": 42}); err != nil {
+			t.Fatalf("named-key typed-map encode with canonical key: %v", err)
+		}
+	})
+
+	// --- JSON encode ---
+
+	t.Run("JSON map[string]any via alias key: missing-field error", func(t *testing.T) {
+		if _, err := s.EncodeJSON(map[string]any{"old_name": int64(42)}); err == nil {
+			t.Fatalf("expected missing-field error; JSON encode silently accepted the alias")
+		}
+	})
+
+	t.Run("JSON map[string]int64 via alias key: missing-field error", func(t *testing.T) {
+		// JSON typed-map (non-map[string]any) generic path.
+		if _, err := s.EncodeJSON(map[string]int64{"old_name": 42}); err == nil {
+			t.Fatalf("expected missing-field error on JSON typed-map encode; alias accepted")
+		}
+	})
+}
+
+// TestPointerReceiverTextMarshalerSymmetry verifies that the encoder
+// reaches a pointer-receiver MarshalText via v.Addr(), matching the
+// decoder's TextUnmarshaler lookup via v.Addr(). Without the Addr()
+// hop, only value-method-set MarshalText would resolve, silently
+// missing a pointer-receiver MarshalText on an addressable struct
+// field.
+func TestPointerReceiverTextMarshalerSymmetry(t *testing.T) {
+	t.Run("via pointer", func(t *testing.T) {
+		s := MustParse(`"string"`)
+		v := &ptrMarshalerSymmetry{val: "hello"}
+		wire, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got ptrMarshalerSymmetry
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.val != "hello" {
+			t.Fatalf("round-trip got %q, want %q", got.val, "hello")
+		}
+	})
+	t.Run("via struct field", func(t *testing.T) {
+		type wrapper struct {
+			Name ptrMarshalerSymmetry `avro:"name"`
+		}
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"name","type":"string"}]}`)
+		in := wrapper{Name: ptrMarshalerSymmetry{val: "world"}}
+		wire, err := s.AppendEncode(nil, &in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got wrapper
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.Name.val != "world" {
+			t.Fatalf("round-trip got %q, want %q", got.Name.val, "world")
+		}
+	})
 }

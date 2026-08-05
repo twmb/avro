@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding"
 	"encoding/binary"
-
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -19,6 +19,8 @@ import (
 	"time"
 	"unsafe"
 )
+
+// ---------- deser_test.go ----------
 
 // ptr returns a pointer to v. Used in tests instead of Go 1.26's new(v).
 func ptr[T any](v T) *T { return &v }
@@ -13818,4 +13820,7420 @@ func TestRegression_FloatDecodeIntegerTargetMatrix(t *testing.T) {
 	checkS("int64 -Inf", new(int64), math.Inf(-1), false, 0)
 	checkU("uint64 NaN", new(uint64), math.NaN(), false, 0)
 	checkU("uint64 +Inf", new(uint64), math.Inf(1), false, 0)
+}
+
+// ---------- resolve_test.go ----------
+
+func TestResolveIdenticalSchemas(t *testing.T) {
+	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(s, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != s {
+		t.Fatal("expected identical schemas to return reader directly")
+	}
+}
+
+func TestResolveFieldAddedWithDefault(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string","default":"hello"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode with writer schema.
+	encoded, err := writer.Encode(map[string]any{"a": 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Decode with resolved schema into interface.
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map, got %T", result)
+	}
+	if m["a"] != int32(42) {
+		t.Fatalf("expected a=42, got %v (%T)", m["a"], m["a"])
+	}
+	if m["b"] != "hello" {
+		t.Fatalf("expected b=hello, got %v", m["b"])
+	}
+}
+
+func TestResolveFieldRemoved(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 42, "b": "drop me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map, got %T", result)
+	}
+	if m["a"] != int32(42) {
+		t.Fatalf("expected a=42, got %v", m["a"])
+	}
+	if _, exists := m["b"]; exists {
+		t.Fatal("expected field b to be absent")
+	}
+}
+
+func TestResolveFieldRenamedViaAlias(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"old_name","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"new_name","type":"int","aliases":["old_name"]}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"old_name": 99})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := result.(map[string]any)
+	if m["new_name"] != int32(99) {
+		t.Fatalf("expected new_name=99, got %v", m["new_name"])
+	}
+}
+
+func TestResolveTypePromotion(t *testing.T) {
+	tests := []struct {
+		name       string
+		writerType string
+		readerType string
+		writerVal  any
+		expectVal  any
+	}{
+		{"int to long", `"int"`, `"long"`, int32(42), int64(42)},
+		{"int to float", `"int"`, `"float"`, int32(7), float32(7)},
+		{"int to double", `"int"`, `"double"`, int32(42), float64(42)},
+		{"long to float", `"long"`, `"float"`, int64(9), float32(9)},
+		{"long to double", `"long"`, `"double"`, int64(100), float64(100)},
+		{"float to double", `"float"`, `"double"`, float32(1.5), float64(float32(1.5))},
+		{"string to bytes", `"string"`, `"bytes"`, "abc", []byte("abc")},
+		{"bytes to string", `"bytes"`, `"string"`, []byte("xyz"), "xyz"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writer, err := Parse(tt.writerType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader, err := Parse(tt.readerType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := Resolve(writer, reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := writer.Encode(tt.writerVal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result any
+			_, err = resolved.Decode(encoded, &result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(result, tt.expectVal) {
+				t.Fatalf("expected %v (%T), got %v (%T)", tt.expectVal, tt.expectVal, result, result)
+			}
+		})
+	}
+}
+
+func TestResolveEnumEvolution(t *testing.T) {
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["A","B"],"default":"A"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode "C" with writer.
+	encoded, err := writer.Encode("C")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result string
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "A" {
+		t.Fatalf("expected default A, got %s", result)
+	}
+
+	// Known symbol should pass through.
+	encoded, err = writer.Encode("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "B" {
+		t.Fatalf("expected B, got %s", result)
+	}
+}
+
+func TestResolveNestedRecords(t *testing.T) {
+	writer, err := Parse(`{
+		"type":"record","name":"Outer","fields":[
+			{"name":"inner","type":{
+				"type":"record","name":"Inner","fields":[
+					{"name":"x","type":"int"}
+				]
+			}}
+		]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{
+		"type":"record","name":"Outer","fields":[
+			{"name":"inner","type":{
+				"type":"record","name":"Inner","fields":[
+					{"name":"x","type":"long"},
+					{"name":"y","type":"string","default":"default_y"}
+				]
+			}}
+		]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{
+		"inner": map[string]any{"x": 10},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer := result.(map[string]any)
+	inner := outer["inner"].(map[string]any)
+	if inner["x"] != int64(10) {
+		t.Fatalf("expected x=10 (int64), got %v (%T)", inner["x"], inner["x"])
+	}
+	if inner["y"] != "default_y" {
+		t.Fatalf("expected y=default_y, got %v", inner["y"])
+	}
+}
+
+func TestResolveUnionEvolution(t *testing.T) {
+	writer, err := Parse(`["null","int"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`["null","long"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode int value 42 (index 1 in writer union) using a pointer.
+	val := int32(42)
+	encoded, err := writer.Encode(&val)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result *int64
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || *result != 42 {
+		t.Fatalf("expected *int64(42), got %v", result)
+	}
+
+	// Encode null.
+	encoded, err = writer.Encode((*int32)(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != nil {
+		t.Fatalf("expected nil, got %v", *result)
+	}
+}
+
+func TestResolveSelfReferencingRecord(t *testing.T) {
+	schema := `{
+		"type":"record","name":"Node","fields":[
+			{"name":"value","type":"int"},
+			{"name":"next","type":["null","Node"]}
+		]
+	}`
+	writer, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{
+		"value": 1,
+		"next": map[string]any{
+			"value": 2,
+			"next":  nil,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := result.(map[string]any)
+	if root["value"] != int32(1) {
+		t.Fatalf("expected root value=1, got %v", root["value"])
+	}
+	next := root["next"].(map[string]any)
+	if next["value"] != int32(2) {
+		t.Fatalf("expected next value=2, got %v", next["value"])
+	}
+}
+
+func TestResolveDecodeIntoStruct(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"},{"name":"c","type":"double","default":3.14}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 42, "b": "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type Result struct {
+		A int64   `avro:"a"`
+		B string  `avro:"b"`
+		C float64 `avro:"c"`
+	}
+	var result Result
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.A != 42 {
+		t.Fatalf("expected A=42, got %d", result.A)
+	}
+	if result.B != "hello" {
+		t.Fatalf("expected B=hello, got %s", result.B)
+	}
+	if result.C != 3.14 {
+		t.Fatalf("expected C=3.14, got %f", result.C)
+	}
+}
+
+func TestResolveDecodeIntoMap(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"int","default":99}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(map[string]int32)
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["a"] != 10 {
+		t.Fatalf("expected a=10, got %d", result["a"])
+	}
+	if result["b"] != 99 {
+		t.Fatalf("expected b=99, got %d", result["b"])
+	}
+}
+
+func TestResolveArrayEvolution(t *testing.T) {
+	writer, err := Parse(`{"type":"array","items":"int"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"array","items":"long"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode([]int32{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result []int64
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 3 || result[0] != 1 || result[1] != 2 || result[2] != 3 {
+		t.Fatalf("unexpected result: %v", result)
+	}
+}
+
+func TestResolveMapEvolution(t *testing.T) {
+	writer, err := Parse(`{"type":"map","values":"float"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"map","values":"double"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]float32{"x": 1.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result map[string]float64
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := float64(float32(1.5))
+	if math.Abs(result["x"]-expected) > 1e-10 {
+		t.Fatalf("expected x=%v, got %v", expected, result["x"])
+	}
+}
+
+func TestEncodeDefault(t *testing.T) {
+	tests := []struct {
+		name    string
+		val     any
+		schema  string
+		checkFn func(t *testing.T, encoded []byte)
+	}{
+		{
+			name:   "null",
+			val:    nil,
+			schema: `"null"`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				if len(encoded) != 0 {
+					t.Fatalf("expected empty, got %v", encoded)
+				}
+			},
+		},
+		{
+			name:   "boolean true",
+			val:    true,
+			schema: `"boolean"`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				if len(encoded) != 1 || encoded[0] != 1 {
+					t.Fatalf("expected [1], got %v", encoded)
+				}
+			},
+		},
+		{
+			name:   "int",
+			val:    float64(42),
+			schema: `"int"`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`"int"`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v int32
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if v != 42 {
+					t.Fatalf("expected 42, got %d", v)
+				}
+			},
+		},
+		{
+			name:   "string",
+			val:    "hello",
+			schema: `"string"`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`"string"`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v string
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if v != "hello" {
+					t.Fatalf("expected hello, got %s", v)
+				}
+			},
+		},
+		{
+			name: "record",
+			val:  map[string]any{"x": float64(10), "y": "test"},
+			schema: `{"type":"record","name":"R","fields":[
+				{"name":"x","type":"int"},
+				{"name":"y","type":"string"}
+			]}`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"},{"name":"y","type":"string"}]}`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v any
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				m := v.(map[string]any)
+				if m["x"] != int32(10) {
+					t.Fatalf("expected x=10, got %v", m["x"])
+				}
+				if m["y"] != "test" {
+					t.Fatalf("expected y=test, got %v", m["y"])
+				}
+			},
+		},
+		{
+			name:   "enum",
+			val:    "B",
+			schema: `{"type":"enum","name":"E","symbols":["A","B","C"]}`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v string
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if v != "B" {
+					t.Fatalf("expected B, got %s", v)
+				}
+			},
+		},
+		{
+			name:   "array",
+			val:    []any{float64(1), float64(2)},
+			schema: `{"type":"array","items":"int"}`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`{"type":"array","items":"int"}`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v []int32
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(v) != 2 || v[0] != 1 || v[1] != 2 {
+					t.Fatalf("expected [1,2], got %v", v)
+				}
+			},
+		},
+		{
+			name:   "union (null first branch)",
+			val:    nil,
+			schema: `["null","int"]`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`["null","int"]`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v any
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if v != nil {
+					t.Fatalf("expected nil, got %v", v)
+				}
+			},
+		},
+		{
+			name:   "long",
+			val:    float64(100000),
+			schema: `"long"`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`"long"`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v int64
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if v != 100000 {
+					t.Fatalf("expected 100000, got %d", v)
+				}
+			},
+		},
+		{
+			name:   "float",
+			val:    float64(1.5),
+			schema: `"float"`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`"float"`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v float32
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if v != 1.5 {
+					t.Fatalf("expected 1.5, got %f", v)
+				}
+			},
+		},
+		{
+			name:   "double",
+			val:    float64(2.718),
+			schema: `"double"`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`"double"`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v float64
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if v != 2.718 {
+					t.Fatalf("expected 2.718, got %f", v)
+				}
+			},
+		},
+		{
+			name:   "bytes",
+			val:    "raw",
+			schema: `"bytes"`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`"bytes"`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v []byte
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(v) != "raw" {
+					t.Fatalf("expected raw, got %s", v)
+				}
+			},
+		},
+		{
+			name:   "fixed",
+			val:    "abcd",
+			schema: `{"type":"fixed","name":"F","size":4}`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`{"type":"fixed","name":"F","size":4}`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v [4]byte
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(v[:]) != "abcd" {
+					t.Fatalf("expected abcd, got %s", v[:])
+				}
+			},
+		},
+		{
+			name:   "map with entries",
+			val:    map[string]any{"x": float64(1), "y": float64(2)},
+			schema: `{"type":"map","values":"int"}`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				s, err := Parse(`{"type":"map","values":"int"}`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var v map[string]int32
+				_, err = s.Decode(encoded, &v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if v["x"] != 1 || v["y"] != 2 {
+					t.Fatalf("expected {x:1,y:2}, got %v", v)
+				}
+			},
+		},
+		{
+			name:   "boolean false",
+			val:    false,
+			schema: `"boolean"`,
+			checkFn: func(t *testing.T, encoded []byte) {
+				if len(encoded) != 1 || encoded[0] != 0 {
+					t.Fatalf("expected [0], got %v", encoded)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := encodeDefault(nil, tt.val, s.node)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.checkFn(t, encoded)
+		})
+	}
+}
+
+func TestSkipUnion(t *testing.T) {
+	s, err := Parse(`["null","int","string"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode an int value (index 1) via a generic union.
+	// The union ser tries each branch; int should succeed.
+	encoded, err := s.Encode(int32(42))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := byte(0xFE)
+	data := append(encoded, sentinel)
+
+	skip := buildSkip(s.node, newMinBytesWalk())
+	rem, err := skip(data, &slab{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rem) != 1 || rem[0] != sentinel {
+		t.Fatalf("expected sentinel, got %v", rem)
+	}
+}
+
+func TestSkipFunctions(t *testing.T) {
+	// Encode various types and verify skip advances past them correctly.
+	tests := []struct {
+		name   string
+		schema string
+		val    any
+	}{
+		{"boolean", `"boolean"`, true},
+		{"int", `"int"`, 42},
+		{"long", `"long"`, int64(12345)},
+		{"float", `"float"`, float32(1.5)},
+		{"double", `"double"`, float64(2.5)},
+		{"string", `"string"`, "hello"},
+		{"bytes", `"bytes"`, []byte("world")},
+		{"array", `{"type":"array","items":"int"}`, []int32{1, 2, 3}},
+		{"map", `{"type":"map","values":"string"}`, map[string]string{"k": "v"}},
+		{"enum", `{"type":"enum","name":"E","symbols":["A","B"]}`, "B"},
+		{"fixed", `{"type":"fixed","name":"F","size":4}`, [4]byte{1, 2, 3, 4}},
+		{
+			"record", `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`,
+			map[string]any{"a": 1, "b": "x"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := s.Encode(tt.val)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sentinel := byte(0xFE)
+			data := append(encoded, sentinel)
+
+			skip := buildSkip(s.node, newMinBytesWalk())
+			rem, err := skip(data, &slab{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rem) != 1 || rem[0] != sentinel {
+				t.Fatalf("expected sentinel byte remaining, got %v", rem)
+			}
+		})
+	}
+
+	// Null is zero bytes, test directly.
+	t.Run("null", func(t *testing.T) {
+		sentinel := byte(0xFE)
+		data := []byte{sentinel}
+		rem, err := skipNull(data, &slab{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rem) != 1 || rem[0] != sentinel {
+			t.Fatalf("expected sentinel byte remaining, got %v", rem)
+		}
+	})
+}
+
+func TestResolveRecordFieldReorder(t *testing.T) {
+	// Writer has fields in different order than reader.
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"b","type":"string"},
+		{"name":"a","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"b": "hello", "a": 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := result.(map[string]any)
+	if m["a"] != int32(42) {
+		t.Fatalf("expected a=42, got %v", m["a"])
+	}
+	if m["b"] != "hello" {
+		t.Fatalf("expected b=hello, got %v", m["b"])
+	}
+}
+
+func TestResolveComplexDefault(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"x","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"x","type":"int"},
+		{"name":"tags","type":{"type":"array","items":"string"},"default":[]},
+		{"name":"meta","type":{"type":"map","values":"int"},"default":{}}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"x": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := result.(map[string]any)
+	if m["x"] != int32(1) {
+		t.Fatalf("expected x=1, got %v", m["x"])
+	}
+	tags := m["tags"].([]any)
+	if len(tags) != 0 {
+		t.Fatalf("expected empty tags, got %v", tags)
+	}
+	meta := m["meta"].(map[string]any)
+	if len(meta) != 0 {
+		t.Fatalf("expected empty meta, got %v", meta)
+	}
+}
+
+func TestResolvePromotionInRecord(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"float"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"long"},
+		{"name":"b","type":"double"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 42, "b": float32(1.5)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type R struct {
+		A int64   `avro:"a"`
+		B float64 `avro:"b"`
+	}
+	var result R
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.A != 42 {
+		t.Fatalf("expected A=42, got %d", result.A)
+	}
+	expected := float64(float32(1.5))
+	if math.Abs(result.B-expected) > 1e-10 {
+		t.Fatalf("expected B=%v, got %v", expected, result.B)
+	}
+}
+
+func TestResolveRecordDefault(t *testing.T) {
+	// Test default for a record field whose type is also a record.
+	writer, err := Parse(`{"type":"record","name":"Outer","fields":[
+		{"name":"x","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"Outer","fields":[
+		{"name":"x","type":"int"},
+		{"name":"inner","type":{"type":"record","name":"Inner","fields":[
+			{"name":"a","type":"int","default":0},
+			{"name":"b","type":"string","default":""}
+		]},"default":{"a":10,"b":"def"}}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"x": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer := result.(map[string]any)
+	inner := outer["inner"].(map[string]any)
+	if inner["a"] != int32(10) {
+		t.Fatalf("expected inner.a=10, got %v", inner["a"])
+	}
+	if inner["b"] != "def" {
+		t.Fatalf("expected inner.b=def, got %v", inner["b"])
+	}
+}
+
+func TestResolveWriterUnionReaderNonUnion(t *testing.T) {
+	// Writer is ["null","int"], reader is just "int". The null branch
+	// is incompatible with the int reader, so Resolve must fail eagerly
+	// (fail-fast posture; see checkWriterUnion's doc comment).
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":["null","int"]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Resolve(writer, reader); err == nil {
+		t.Fatal("expected Resolve to fail eagerly: null branch is incompatible with int reader")
+	}
+}
+
+func TestResolveWriterUnionReaderNonUnionSuccess(t *testing.T) {
+	// Writer is ["int","long"], reader is "double". Both promote to double.
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":["int","long"]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"double"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode int32(7) through the writer union (will pick index 0 = int).
+	encoded, err := writer.Encode(map[string]any{"a": int32(7)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := result.(map[string]any)
+	if m["a"] != float64(7) {
+		t.Fatalf("expected a=7.0, got %v (%T)", m["a"], m["a"])
+	}
+}
+
+func TestResolveReaderUnionWriterNonUnion(t *testing.T) {
+	// Writer is "int", reader is ["null","long"].
+	writer, err := Parse(`"int"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`["null","long"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(int32(42))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != int64(42) {
+		t.Fatalf("expected int64(42), got %v (%T)", result, result)
+	}
+}
+
+func TestResolveReaderUnionTaggedUnions(t *testing.T) {
+	// Writer is "string", reader is ["null","string"].
+	// Schema evolution: writer non-union → reader union.
+	// TaggedUnions should wrap the result.
+	writer, err := Parse(`"string"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`["null","string"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode("hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Without TaggedUnions: bare value.
+	var bare any
+	if _, err := resolved.Decode(encoded, &bare); err != nil {
+		t.Fatal(err)
+	}
+	if bare != "hello" {
+		t.Fatalf("bare: expected \"hello\", got %v (%T)", bare, bare)
+	}
+
+	// With TaggedUnions: wrapped value.
+	var tagged any
+	if _, err := resolved.Decode(encoded, &tagged, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	wrapper, ok := tagged.(map[string]any)
+	if !ok {
+		t.Fatalf("tagged: expected map wrapper, got %T: %v", tagged, tagged)
+	}
+	if wrapper["string"] != "hello" {
+		t.Fatalf("tagged: expected {\"string\":\"hello\"}, got %v", wrapper)
+	}
+}
+
+// TestResolveReaderUnionTaggedWrapTargetParity verifies that decoding
+// through a resolved reader-union (writer non-union, reader union) treats
+// every decode-target shape exactly like the natural union path. The
+// TaggedUnions {branch: value} envelope applies only to targets that
+// map[string]any is assignable to; for every other target (concrete
+// types, non-empty interfaces) the wrap is skipped silently — the
+// contract documented on deserUnion.maybeWrap — never turned into an
+// error. The natural decode of the reader-shaped wire is the oracle for
+// each cell; resolved binary and resolved JSON (which funnels through the
+// same resolving deser) must agree with it.
+func TestResolveReaderUnionTaggedWrapTargetParity(t *testing.T) {
+	writer, err := Parse(`{"type":"long","logicalType":"timestamp-millis"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`["null",{"type":"long","logicalType":"timestamp-millis"}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.UnixMilli(5).UTC()
+	writerWire, err := writer.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerWire, err := reader.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type nanoer interface{ UnixNano() int64 } // satisfied by time.Time
+
+	t.Run("any_untagged", func(t *testing.T) {
+		var nat, res any
+		if _, err := reader.Decode(readerWire, &nat); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+	})
+
+	t.Run("any_tagged", func(t *testing.T) {
+		var nat, res any
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+		m, ok := res.(map[string]any)
+		if !ok || !m["long"].(time.Time).Equal(want) {
+			t.Fatalf("expected {\"long\": %v} envelope, got %#v", want, res)
+		}
+	})
+
+	t.Run("any_tagged_logical", func(t *testing.T) {
+		var nat, res any
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+		m, ok := res.(map[string]any)
+		if !ok || !m["long.timestamp-millis"].(time.Time).Equal(want) {
+			t.Fatalf("expected {\"long.timestamp-millis\": %v} envelope, got %#v", want, res)
+		}
+	})
+
+	t.Run("typed_interface_tagged", func(t *testing.T) {
+		var nat, res nanoer
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like the natural path: %v", err)
+		}
+		if !nat.(time.Time).Equal(want) || !res.(time.Time).Equal(want) {
+			t.Fatalf("natural %#v / resolved %#v, want bare %v", nat, res, want)
+		}
+	})
+
+	t.Run("typed_interface_tagged_logical", func(t *testing.T) {
+		var res nanoer
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like the natural path: %v", err)
+		}
+		if !res.(time.Time).Equal(want) {
+			t.Fatalf("resolved %#v, want bare %v", res, want)
+		}
+	})
+
+	t.Run("pointer_target_tagged", func(t *testing.T) {
+		var nat, res *time.Time
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if nat == nil || res == nil || !nat.Equal(want) || !res.Equal(want) {
+			t.Fatalf("natural %v / resolved %v, want %v", nat, res, want)
+		}
+	})
+
+	t.Run("json_typed_interface_tagged", func(t *testing.T) {
+		var res nanoer
+		if err := resolved.DecodeJSON([]byte(`5`), &res, TaggedUnions()); err != nil {
+			t.Fatalf("resolved DecodeJSON into non-empty interface must skip the tagged wrap silently: %v", err)
+		}
+		if !res.(time.Time).Equal(want) {
+			t.Fatalf("resolved JSON %#v, want bare %v", res, want)
+		}
+	})
+}
+
+// TestResolvedRecordIntoAnyMapReuseParity verifies the resolved record
+// decoder honors the documented map-reuse contract for *any targets: when
+// the target interface already wraps a map[string]any, schema fields are
+// written into the existing map and unrelated keys are retained (see
+// reuseOrMakeStringAnyMap and TestDecodeReuseAnyTargetStaleKeys, which pin
+// the natural decoder's behavior). The natural decode is the oracle;
+// resolved binary and resolved JSON decodes must match it.
+func TestResolvedRecordIntoAnyMapReuseParity(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"long","default":7}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerWire, err := writer.Encode(map[string]any{"a": int64(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerWire, err := reader.Encode(map[string]any{"a": int64(1), "b": int64(7)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"stale": int64(99), "a": int64(1), "b": int64(7)}
+
+	t.Run("binary_preseeded", func(t *testing.T) {
+		// "a" pre-seeded with a different value proves schema keys are
+		// overwritten while unrelated keys survive.
+		var nat any = map[string]any{"stale": int64(99), "a": int64(42)}
+		if _, err := reader.Decode(readerWire, &nat); err != nil {
+			t.Fatal(err)
+		}
+		var res any = map[string]any{"stale": int64(99), "a": int64(42)}
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+		if !reflect.DeepEqual(res, want) {
+			t.Fatalf("resolved %#v, want %#v", res, want)
+		}
+	})
+
+	t.Run("binary_fresh", func(t *testing.T) {
+		var res any
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(res, map[string]any{"a": int64(1), "b": int64(7)}) {
+			t.Fatalf("fresh decode got %#v", res)
+		}
+	})
+
+	t.Run("typed_map_preseeded", func(t *testing.T) {
+		nat := map[string]int64{"stale": 99}
+		if _, err := reader.Decode(readerWire, &nat); err != nil {
+			t.Fatal(err)
+		}
+		res := map[string]int64{"stale": 99}
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		exp := map[string]int64{"stale": 99, "a": 1, "b": 7}
+		if !reflect.DeepEqual(nat, exp) || !reflect.DeepEqual(res, exp) {
+			t.Fatalf("natural %v / resolved %v, want %v", nat, res, exp)
+		}
+	})
+
+	t.Run("json_preseeded", func(t *testing.T) {
+		var res any = map[string]any{"stale": int64(99)}
+		if err := resolved.DecodeJSON([]byte(`{"a":1}`), &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(res, want) {
+			t.Fatalf("resolved JSON %#v, want %#v", res, want)
+		}
+	})
+}
+
+// --- Direct skip function error path tests ---
+
+func TestSkipBooleanShortBuffer(t *testing.T) {
+	_, err := skipBoolean(nil, &slab{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipFloatShortBuffer(t *testing.T) {
+	_, err := skipFloat([]byte{1, 2}, &slab{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipDoubleShortBuffer(t *testing.T) {
+	_, err := skipDouble([]byte{1, 2, 3, 4}, &slab{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipBytesErrors(t *testing.T) {
+	// Empty buffer: readVarlong fails.
+	_, err := skipBytes(nil, &slab{})
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+
+	// Short buffer after reading length.
+	data := appendVarlong(nil, 100) // length=100 but no data
+	_, err = skipBytes(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for short data")
+	}
+}
+
+func TestSkipFixedShortBuffer(t *testing.T) {
+	skip := skipFixed(8)
+	_, err := skip([]byte{1, 2, 3}, &slab{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipArrayErrors(t *testing.T) {
+	intNode := &schemaNode{kind: "int"}
+	arrNode := &schemaNode{kind: "array", items: intNode}
+	skip := buildSkip(arrNode, newMinBytesWalk())
+
+	// Empty buffer: readVarlong fails.
+	_, err := skip(nil, &slab{})
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+
+	// Negative block count with byte-size skip.
+	// Encode: count=-3 (zigzag), byteSize=2, then 2 bytes of data, then 0 terminator.
+	var data []byte
+	data = appendVarlong(data, -3)  // negative count => abs(3) items, but skip by byte size
+	data = appendVarlong(data, 2)   // byte size = 2
+	data = append(data, 0x01, 0x02) // 2 bytes
+	data = appendVarlong(data, 0)   // terminator
+	rem, err := skip(data, &slab{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("expected empty remainder, got %d bytes", len(rem))
+	}
+
+	// Negative count byte-size exceeds available data.
+	data = data[:0]
+	data = appendVarlong(data, -2)
+	data = appendVarlong(data, 100) // byte size > available
+	_, err = skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for byte-size exceeding data")
+	}
+
+	// Negative count: error reading byte size.
+	data = data[:0]
+	data = appendVarlong(data, -2)
+	// No byte size follows.
+	_, err = skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for missing byte size")
+	}
+
+	// Positive count with item skip error (truncated int).
+	data = data[:0]
+	data = appendVarlong(data, 1) // 1 item
+	// No int data for the item.
+	_, err = skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for truncated item")
+	}
+}
+
+func TestSkipMapErrors(t *testing.T) {
+	intNode := &schemaNode{kind: "int"}
+	mapNode := &schemaNode{kind: "map", values: intNode}
+	skip := buildSkip(mapNode, newMinBytesWalk())
+
+	// Empty buffer.
+	_, err := skip(nil, &slab{})
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+
+	// Negative count with byte-size skip.
+	var data []byte
+	data = appendVarlong(data, -2)
+	data = appendVarlong(data, 3)
+	data = append(data, 0x01, 0x02, 0x03)
+	data = appendVarlong(data, 0)
+	rem, err := skip(data, &slab{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rem) != 0 {
+		t.Fatalf("expected empty remainder, got %d bytes", len(rem))
+	}
+
+	// Negative count byte-size exceeds data.
+	data = data[:0]
+	data = appendVarlong(data, -1)
+	data = appendVarlong(data, 100)
+	_, err = skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for oversized byte-size")
+	}
+
+	// Negative count: error reading byte size.
+	data = data[:0]
+	data = appendVarlong(data, -1)
+	_, err = skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for missing byte size")
+	}
+
+	// Positive count: key skip error.
+	data = data[:0]
+	data = appendVarlong(data, 1)
+	// No key string data.
+	_, err = skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for truncated key")
+	}
+
+	// Positive count: value skip error (key ok, value truncated).
+	data = data[:0]
+	data = appendVarlong(data, 1)
+	data = appendVarlong(data, 1) // key length=1
+	data = append(data, 'k')      // key data
+	// No value int data.
+	_, err = skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for truncated value")
+	}
+}
+
+func TestSkipUnionErrors(t *testing.T) {
+	node := &schemaNode{
+		kind: "union",
+		branches: []*schemaNode{
+			{kind: "null"},
+			{kind: "int"},
+		},
+	}
+	skip := buildSkip(node, newMinBytesWalk())
+
+	// Empty buffer: readVarint error.
+	_, err := skip(nil, &slab{})
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+
+	// Out of range index.
+	data := appendVarint(nil, 5)
+	_, err = skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for out-of-range index")
+	}
+
+	// Negative index.
+	data = appendVarint(nil, -1)
+	_, err = skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for negative index")
+	}
+}
+
+func TestBuildSkipUnknownType(t *testing.T) {
+	node := &schemaNode{kind: "unknown_type"}
+	skip := buildSkip(node, newMinBytesWalk())
+	_, err := skip([]byte{1, 2, 3}, &slab{})
+	if err == nil {
+		t.Fatal("expected error for unknown type")
+	}
+}
+
+func TestSkipToDeser(t *testing.T) {
+	deser := skipToDeser(skipBoolean)
+	rem, err := deser([]byte{1, 2, 3}, reflect.Value{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rem) != 2 {
+		t.Fatalf("expected 2 remaining bytes, got %d", len(rem))
+	}
+}
+
+func TestSkipRecordFieldError(t *testing.T) {
+	// Record with an int field, but pass truncated data.
+	node := &schemaNode{
+		kind: "record",
+		fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "int"}},
+		},
+	}
+	skip := buildSkip(node, newMinBytesWalk())
+	_, err := skip(nil, &slab{})
+	if err == nil {
+		t.Fatal("expected error for truncated record field")
+	}
+}
+
+// --- Direct promotion function typed-target and error path tests ---
+
+func TestPromoteIntToLongTyped(t *testing.T) {
+	data := appendVarint(nil, 42)
+
+	// CanInt path.
+	var i64 int64
+	v := reflect.ValueOf(&i64).Elem()
+	_, err := promoteIntToLong(data, v, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i64 != 42 {
+		t.Fatalf("expected 42, got %d", i64)
+	}
+
+	// CanUint path.
+	var u64 uint64
+	v = reflect.ValueOf(&u64).Elem()
+	_, err = promoteIntToLong(data, v, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u64 != 42 {
+		t.Fatalf("expected 42, got %d", u64)
+	}
+
+	// SemanticError: wrong type.
+	var s string
+	v = reflect.ValueOf(&s).Elem()
+	_, err = promoteIntToLong(data, v, nil)
+	if err == nil {
+		t.Fatal("expected error for string target")
+	}
+
+	// readVarint error.
+	_, err = promoteIntToLong(nil, v, nil)
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+func TestPromoteIntToFloatTyped(t *testing.T) {
+	data := appendVarint(nil, 7)
+
+	// SetFloat path.
+	var f32 float32
+	v := reflect.ValueOf(&f32).Elem()
+	_, err := promoteIntToFloat(data, v, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f32 != 7 {
+		t.Fatalf("expected 7, got %f", f32)
+	}
+
+	// SemanticError.
+	var s string
+	v = reflect.ValueOf(&s).Elem()
+	_, err = promoteIntToFloat(data, v, nil)
+	if err == nil {
+		t.Fatal("expected error for string target")
+	}
+
+	// readVarint error.
+	_, err = promoteIntToFloat(nil, v, nil)
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+func TestPromoteIntToDoubleTyped(t *testing.T) {
+	data := appendVarint(nil, 42)
+
+	var f64 float64
+	v := reflect.ValueOf(&f64).Elem()
+	_, err := promoteIntToDouble(data, v, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f64 != 42 {
+		t.Fatalf("expected 42, got %f", f64)
+	}
+
+	var s string
+	v = reflect.ValueOf(&s).Elem()
+	_, err = promoteIntToDouble(data, v, nil)
+	if err == nil {
+		t.Fatal("expected error for string target")
+	}
+
+	_, err = promoteIntToDouble(nil, v, nil)
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+func TestPromoteLongToFloatTyped(t *testing.T) {
+	data := appendVarlong(nil, 9)
+
+	var f32 float32
+	v := reflect.ValueOf(&f32).Elem()
+	_, err := promoteLongToFloat(data, v, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f32 != 9 {
+		t.Fatalf("expected 9, got %f", f32)
+	}
+
+	var s string
+	v = reflect.ValueOf(&s).Elem()
+	_, err = promoteLongToFloat(data, v, nil)
+	if err == nil {
+		t.Fatal("expected error for string target")
+	}
+
+	_, err = promoteLongToFloat(nil, v, nil)
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+func TestPromoteLongToDoubleTyped(t *testing.T) {
+	data := appendVarlong(nil, 100)
+
+	var f64 float64
+	v := reflect.ValueOf(&f64).Elem()
+	_, err := promoteLongToDouble(data, v, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f64 != 100 {
+		t.Fatalf("expected 100, got %f", f64)
+	}
+
+	var s string
+	v = reflect.ValueOf(&s).Elem()
+	_, err = promoteLongToDouble(data, v, nil)
+	if err == nil {
+		t.Fatal("expected error for string target")
+	}
+
+	_, err = promoteLongToDouble(nil, v, nil)
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+func TestPromoteFloatToDoubleErrors(t *testing.T) {
+	// readUint32 error.
+	var f64 float64
+	v := reflect.ValueOf(&f64).Elem()
+	_, err := promoteFloatToDouble([]byte{1}, v, nil)
+	if err == nil {
+		t.Fatal("expected error for short buffer")
+	}
+
+	// SetFloat typed path.
+	data := appendUint32(nil, math.Float32bits(2.5))
+	_, err = promoteFloatToDouble(data, v, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f64 != float64(float32(2.5)) {
+		t.Fatalf("expected %f, got %f", float64(float32(2.5)), f64)
+	}
+
+	// SemanticError.
+	var s string
+	v = reflect.ValueOf(&s).Elem()
+	_, err = promoteFloatToDouble(data, v, nil)
+	if err == nil {
+		t.Fatal("expected error for string target")
+	}
+}
+
+func TestPromoteStringToBytesTyped(t *testing.T) {
+	var data []byte
+	data = appendVarlong(data, 3)
+	data = append(data, "abc"...)
+
+	// SetBytes slice path.
+	var b []byte
+	v := reflect.ValueOf(&b).Elem()
+	_, err := promoteStringToBytes(data, v, &slab{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "abc" {
+		t.Fatalf("expected abc, got %s", b)
+	}
+
+	// SemanticError (wrong type).
+	var i int
+	v = reflect.ValueOf(&i).Elem()
+	_, err = promoteStringToBytes(data, v, &slab{})
+	if err == nil {
+		t.Fatal("expected error for int target")
+	}
+
+	// readVarlong error.
+	_, err = promoteStringToBytes(nil, v, &slab{})
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+
+	// Short buffer after length.
+	short := appendVarlong(nil, 100) // length=100 but no data
+	_, err = promoteStringToBytes(short, v, &slab{})
+	if err == nil {
+		t.Fatal("expected error for short buffer")
+	}
+}
+
+func TestPromoteBytesToStringTyped(t *testing.T) {
+	var data []byte
+	data = appendVarlong(data, 3)
+	data = append(data, "xyz"...)
+
+	// SetString path.
+	var s string
+	v := reflect.ValueOf(&s).Elem()
+	_, err := promoteBytesToString(data, v, &slab{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != "xyz" {
+		t.Fatalf("expected xyz, got %s", s)
+	}
+
+	// SemanticError (wrong type).
+	var i int
+	v = reflect.ValueOf(&i).Elem()
+	_, err = promoteBytesToString(data, v, &slab{})
+	if err == nil {
+		t.Fatal("expected error for int target")
+	}
+
+	// readVarlong error.
+	_, err = promoteBytesToString(nil, v, &slab{})
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+
+	// Short buffer after length.
+	short := appendVarlong(nil, 100)
+	_, err = promoteBytesToString(short, v, &slab{})
+	if err == nil {
+		t.Fatal("expected error for short buffer")
+	}
+}
+
+// --- Resolve edge case tests ---
+
+func TestResolveFixedIdentity(t *testing.T) {
+	writer, err := Parse(`{"type":"fixed","name":"F","size":4}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"fixed","name":"F","size":4}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := writer.Encode([4]byte{1, 2, 3, 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result [4]byte
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != [4]byte{1, 2, 3, 4} {
+		t.Fatalf("expected [1,2,3,4], got %v", result)
+	}
+}
+
+func TestResolveEnumIdentity(t *testing.T) {
+	// Identical enums should return reader directly (identity path).
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Make canonical forms different so Resolve doesn't short-circuit.
+	// Actually they'll be the same... so we need to use the resolveEnum directly.
+	// Let's test via resolveEnum.
+	resolved, err := resolveEnum(reader.node, writer.node, &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Identity: should return reader.node directly.
+	if resolved != reader.node {
+		t.Fatal("expected identity path to return reader node")
+	}
+}
+
+func TestResolveEnumDeserTyped(t *testing.T) {
+	// Non-identity enum to exercise the closure branches.
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode "A" (index 0 in writer).
+	encoded, err := writer.Encode("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Decode into string (SetString path).
+	var s string
+	_, err = resolved.Decode(encoded, &s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != "A" {
+		t.Fatalf("expected A, got %s", s)
+	}
+
+	// Decode into int (CanInt path).
+	var i int
+	_, err = resolved.Decode(encoded, &i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "A" maps to reader index 1 (B=0, A=1, C=2).
+	if i != 1 {
+		t.Fatalf("expected reader index 1, got %d", i)
+	}
+
+	// Decode into uint (CanUint path).
+	var u uint
+	_, err = resolved.Decode(encoded, &u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u != 1 {
+		t.Fatalf("expected reader index 1, got %d", u)
+	}
+
+	// Decode into incompatible type (SemanticError path).
+	var f float64
+	_, err = resolved.Decode(encoded, &f)
+	if err == nil {
+		t.Fatal("expected error for float64 target")
+	}
+}
+
+func TestResolveEnumDeserErrors(t *testing.T) {
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// readVarint error: empty input.
+	var s string
+	_, err = resolved.Decode(nil, &s)
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+
+	// Out-of-range index.
+	data := appendVarint(nil, 10)
+	_, err = resolved.Decode(data, &s)
+	if err == nil {
+		t.Fatal("expected error for out-of-range enum index")
+	}
+}
+
+func TestResolveArrayIdentity(t *testing.T) {
+	// Array with same items type should return reader node (identity path).
+	r := &schemaNode{kind: "int", deser: nil}
+	rArr := &schemaNode{kind: "array", items: r}
+	// resolveArray with same items node.
+	resolved, err := resolveArray(rArr, rArr, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != rArr {
+		t.Fatal("expected identity path")
+	}
+}
+
+func TestResolveMapIdentity(t *testing.T) {
+	r := &schemaNode{kind: "string", deser: nil}
+	rMap := &schemaNode{kind: "map", values: r}
+	resolved, err := resolveMap(rMap, rMap, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != rMap {
+		t.Fatal("expected identity path")
+	}
+}
+
+func TestResolveBuildDeserSemanticError(t *testing.T) {
+	// buildDeser with unsupported target type (e.g. slice).
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 42})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Decode into a slice (unsupported target for record).
+	var result []int
+	_, err = resolved.Decode(encoded, &result)
+	if err == nil {
+		t.Fatal("expected error for slice target")
+	}
+}
+
+func TestResolveSelfReferencingRecordDivergent(t *testing.T) {
+	// Self-referencing record where reader and writer differ to exercise cycle detection placeholder.
+	writerSchema := `{
+		"type":"record","name":"Node","fields":[
+			{"name":"value","type":"int"},
+			{"name":"next","type":["null","Node"]}
+		]
+	}`
+	readerSchema := `{
+		"type":"record","name":"Node","fields":[
+			{"name":"value","type":"long"},
+			{"name":"next","type":["null","Node"]}
+		]
+	}`
+	writer, err := Parse(writerSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(readerSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{
+		"value": 1,
+		"next": map[string]any{
+			"value": 2,
+			"next":  nil,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := result.(map[string]any)
+	if root["value"] != int64(1) {
+		t.Fatalf("expected root value=1 (int64), got %v (%T)", root["value"], root["value"])
+	}
+}
+
+func TestResolveWriterUnionNullUnionOptimization(t *testing.T) {
+	// Writer ["null","int"], reader "long" — exercises null-union optimization path in resolveWriterUnion.
+	writer, err := Parse(`["null","int"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`["null","long"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode non-null int.
+	val := int32(7)
+	encoded, err := writer.Encode(&val)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result *int64
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || *result != 7 {
+		t.Fatalf("expected *int64(7), got %v", result)
+	}
+}
+
+func TestEncodeDefaultErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		val    any
+		schema string
+	}{
+		{
+			name:   "boolean wrong type",
+			val:    "notbool",
+			schema: `"boolean"`,
+		},
+		{
+			name:   "int wrong type",
+			val:    "notnum",
+			schema: `"int"`,
+		},
+		{
+			name:   "long wrong type",
+			val:    true,
+			schema: `"long"`,
+		},
+		{
+			name:   "float wrong type",
+			val:    "x",
+			schema: `"float"`,
+		},
+		{
+			name:   "double wrong type",
+			val:    []int{1},
+			schema: `"double"`,
+		},
+		{
+			name:   "string wrong type",
+			val:    42,
+			schema: `"string"`,
+		},
+		{
+			name:   "bytes wrong type",
+			val:    42,
+			schema: `"bytes"`,
+		},
+		{
+			name:   "enum wrong type",
+			val:    42,
+			schema: `{"type":"enum","name":"E","symbols":["A","B"]}`,
+		},
+		{
+			name:   "enum unknown symbol",
+			val:    "UNKNOWN",
+			schema: `{"type":"enum","name":"E","symbols":["A","B"]}`,
+		},
+		{
+			name:   "fixed wrong type",
+			val:    42,
+			schema: `{"type":"fixed","name":"F","size":4}`,
+		},
+		{
+			name:   "fixed wrong length",
+			val:    "ab",
+			schema: `{"type":"fixed","name":"F","size":4}`,
+		},
+		{
+			name:   "array wrong type",
+			val:    "notarray",
+			schema: `{"type":"array","items":"int"}`,
+		},
+		{
+			name:   "map wrong type",
+			val:    "notmap",
+			schema: `{"type":"map","values":"int"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = encodeDefault(nil, tt.val, s.node)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestEncodeDefaultUnsupportedType(t *testing.T) {
+	// Unknown node kind.
+	node := &schemaNode{kind: "unknown_kind"}
+	_, err := encodeDefault(nil, nil, node)
+	if err == nil {
+		t.Fatal("expected error for unsupported type")
+	}
+}
+
+func TestEncodeDefaultEmptyUnion(t *testing.T) {
+	node := &schemaNode{kind: "union", branches: nil}
+	_, err := encodeDefault(nil, nil, node)
+	if err == nil {
+		t.Fatal("expected error for empty union")
+	}
+}
+
+func TestSkipBytesNegativeLength(t *testing.T) {
+	// Encode a negative varint as the length.
+	data := appendVarlong(nil, -5)
+	_, err := skipBytes(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for negative bytes length")
+	}
+}
+
+func TestPromoteStringToBytesNegativeLength(t *testing.T) {
+	data := appendVarlong(nil, -1)
+	var b []byte
+	v := reflect.ValueOf(&b).Elem()
+	_, err := promoteStringToBytes(data, v, &slab{})
+	if err == nil {
+		t.Fatal("expected error for negative length")
+	}
+}
+
+func TestPromoteBytesToStringNegativeLength(t *testing.T) {
+	data := appendVarlong(nil, -1)
+	var s string
+	v := reflect.ValueOf(&s).Elem()
+	_, err := promoteBytesToString(data, v, &slab{})
+	if err == nil {
+		t.Fatal("expected error for negative length")
+	}
+}
+
+func TestResolveDeserTruncatedData(t *testing.T) {
+	// Set up a resolved schema where writer has fields A (kept) and B (skipped),
+	// reader has fields A (promoted) and C (default).
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"long"},
+		{"name":"c","type":"int","default":0}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test with truncated data (read error on first wire field).
+	var result any
+	_, err = resolved.Decode(nil, &result)
+	if err == nil {
+		t.Fatal("expected error for empty data")
+	}
+
+	// Test with data that has first field but skip of second field fails.
+	data := appendVarint(nil, 42) // field a ok
+	// field b (string) is missing -> skip error
+	_, err = resolved.Decode(data, &result)
+	if err == nil {
+		t.Fatal("expected error for truncated skip data")
+	}
+
+	// Same tests decoding into map.
+	resultMap := make(map[string]int64)
+	_, err = resolved.Decode(nil, &resultMap)
+	if err == nil {
+		t.Fatal("expected error for empty data into map")
+	}
+	_, err = resolved.Decode(data, &resultMap)
+	if err == nil {
+		t.Fatal("expected error for truncated skip data into map")
+	}
+
+	// Same tests decoding into struct.
+	type R struct {
+		A int64 `avro:"a"`
+		C int32 `avro:"c"`
+	}
+	var resultStruct R
+	_, err = resolved.Decode(nil, &resultStruct)
+	if err == nil {
+		t.Fatal("expected error for empty data into struct")
+	}
+	_, err = resolved.Decode(data, &resultStruct)
+	if err == nil {
+		t.Fatal("expected error for truncated skip data into struct")
+	}
+}
+
+func TestResolveDeserReadError(t *testing.T) {
+	// Writer and reader both have field A but promoted (int→long).
+	// Test with truncated data to trigger read error.
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty data: read error.
+	var result any
+	_, err = resolved.Decode(nil, &result)
+	if err == nil {
+		t.Fatal("expected read error for empty data into interface")
+	}
+
+	m := make(map[string]int64)
+	_, err = resolved.Decode(nil, &m)
+	if err == nil {
+		t.Fatal("expected read error for empty data into map")
+	}
+
+	type R struct {
+		A int64 `avro:"a"`
+	}
+	var s R
+	_, err = resolved.Decode(nil, &s)
+	if err == nil {
+		t.Fatal("expected read error for empty data into struct")
+	}
+}
+
+func TestResolveDeserDefaultError(t *testing.T) {
+	// Set up a resolved schema where reader has a field with a default
+	// whose deser will fail due to bad encoded data. This is hard to trigger
+	// normally, so we test the deserMap/deserStruct error paths for defaults
+	// by using valid data that exercises the default code path.
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string","default":"hello"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Default into map[string]int32: type mismatch (string default into int32 value).
+	badMap := make(map[string]int32)
+	_, err = resolved.Decode(encoded, &badMap)
+	if err == nil {
+		t.Fatal("expected error for string default into int32 map")
+	}
+
+	// Default into struct with wrong field type.
+	type BadR struct {
+		A int32 `avro:"a"`
+		B int32 `avro:"b"` // wrong type for string default
+	}
+	var badStruct BadR
+	_, err = resolved.Decode(encoded, &badStruct)
+	if err == nil {
+		t.Fatal("expected error for string default into int32 struct field")
+	}
+}
+
+func TestResolveDeserMapNilInit(t *testing.T) {
+	// Test that a nil map gets initialized during deserialization.
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pass nil map pointer (v.IsNil() path).
+	var m map[string]int64
+	_, err = resolved.Decode(encoded, &m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m["a"] != 5 {
+		t.Fatalf("expected a=5, got %v", m["a"])
+	}
+}
+
+func TestEncodeDefaultArrayNil(t *testing.T) {
+	// Java, fastavro, and hamba all reject null as an array default
+	// (Schema.java ARRAY case: `if (!defaultValue.isArray()) return
+	// false;`). Accepting it lenient would make a union [Array,null]
+	// with default null match the Array branch (empty-array bytes)
+	// instead of falling through to the null branch.
+	node := &schemaNode{kind: "array", items: &schemaNode{kind: "int"}}
+	if _, err := encodeDefault(nil, nil, node); err == nil {
+		t.Fatal("expected error for nil array default")
+	}
+}
+
+func TestEncodeDefaultMapNil(t *testing.T) {
+	// Same rationale as TestEncodeDefaultArrayNil: nil is not a map.
+	node := &schemaNode{kind: "map", values: &schemaNode{kind: "int"}}
+	if _, err := encodeDefault(nil, nil, node); err == nil {
+		t.Fatal("expected error for nil map default")
+	}
+}
+
+func TestEncodeDefaultArrayItemError(t *testing.T) {
+	node := &schemaNode{kind: "array", items: &schemaNode{kind: "int"}}
+	// Array with wrong-type item.
+	_, err := encodeDefault(nil, []any{"not_a_number"}, node)
+	if err == nil {
+		t.Fatal("expected error for wrong item type in array")
+	}
+}
+
+func TestEncodeDefaultMapValueError(t *testing.T) {
+	node := &schemaNode{kind: "map", values: &schemaNode{kind: "int"}}
+	// Map with wrong-type value.
+	_, err := encodeDefault(nil, map[string]any{"k": "not_a_number"}, node)
+	if err == nil {
+		t.Fatal("expected error for wrong value type in map")
+	}
+}
+
+func TestEncodeDefaultRecordNilVal(t *testing.T) {
+	// nil is not a record. Java's isValidDefault rejects (RECORD case:
+	// `if (!defaultValue.isObject()) return false;`); fastavro requires
+	// isinstance(datum, Mapping); hamba returns false on type-assertion
+	// failure. The previous lenient path made unions like [Record,null]
+	// with default null incorrectly encode the Record branch instead of
+	// the null branch.
+	node := &schemaNode{
+		kind: "record",
+		name: "R",
+		fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "int"}, defaultVal: float64(0), hasDefault: true},
+		},
+	}
+	if _, err := encodeDefault(nil, nil, node); err == nil {
+		t.Fatal("expected error for nil record default")
+	}
+}
+
+func TestEncodeDefaultRecordMissingFieldNoDefault(t *testing.T) {
+	node := &schemaNode{
+		kind: "record",
+		name: "R",
+		fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "int"}, hasDefault: false},
+		},
+	}
+	_, err := encodeDefault(nil, map[string]any{}, node)
+	if err == nil {
+		t.Fatal("expected error for missing field with no default")
+	}
+}
+
+func TestEncodeDefaultRecordFieldSubError(t *testing.T) {
+	node := &schemaNode{
+		kind: "record",
+		name: "R",
+		fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "int"}},
+		},
+	}
+	// Provide wrong type for field.
+	_, err := encodeDefault(nil, map[string]any{"a": "not_a_number"}, node)
+	if err == nil {
+		t.Fatal("expected error for wrong field type")
+	}
+}
+
+func TestEncodeDefaultRecordFieldDefault(t *testing.T) {
+	node := &schemaNode{
+		kind: "record",
+		name: "R",
+		fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "int"}, defaultVal: float64(42), hasDefault: true},
+			{name: "b", node: &schemaNode{kind: "string"}},
+		},
+	}
+	// Provide "b" but not "a" — "a" has a default.
+	encoded, err := encodeDefault(nil, map[string]any{"b": "hello"}, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) == 0 {
+		t.Fatal("expected non-empty encoded output")
+	}
+}
+
+func TestResolveFieldRemovedIntoMap(t *testing.T) {
+	// Writer has fields [a, b], reader has field [a]. Field b gets skipped.
+	// Decode into map to exercise deserMap's skip-continue path.
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 42, "b": "drop me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := make(map[string]int32)
+	_, err = resolved.Decode(encoded, &m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m["a"] != 42 {
+		t.Fatalf("expected a=42, got %v", m["a"])
+	}
+}
+
+func TestResolveFieldRemovedIntoStruct(t *testing.T) {
+	// Same setup but decode into struct to exercise deserStruct skip-continue path.
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 42, "b": "drop me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type R struct {
+		A int32 `avro:"a"`
+	}
+	var result R
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.A != 42 {
+		t.Fatalf("expected A=42, got %d", result.A)
+	}
+}
+
+func TestResolveEnumDeserInterface(t *testing.T) {
+	// Non-identity enum decoded into interface.
+	writer, err := Parse(`{"type":"enum","name":"E","symbols":["A","B","C"]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"enum","name":"E","symbols":["B","A","C"],"default":"A"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != "B" {
+		t.Fatalf("expected B, got %v", result)
+	}
+}
+
+func TestSkipArrayMinInt64(t *testing.T) {
+	// Craft a varint encoding of math.MinInt64 as a zigzag-encoded block count.
+	// zigzag(math.MinInt64) = math.MaxUint64 (a 10-byte varint).
+	// After reading as negative and negating, -math.MinInt64 overflows to math.MinInt64 (still negative).
+	intNode := &schemaNode{kind: "int"}
+	arrNode := &schemaNode{kind: "array", items: intNode}
+	skip := buildSkip(arrNode, newMinBytesWalk())
+
+	// math.MinInt64 zigzag-encoded as varint.
+	data := appendVarlong(nil, math.MinInt64)
+	_, err := skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for math.MinInt64 block count")
+	}
+}
+
+func TestSkipMapMinInt64(t *testing.T) {
+	intNode := &schemaNode{kind: "int"}
+	mapNode := &schemaNode{kind: "map", values: intNode}
+	skip := buildSkip(mapNode, newMinBytesWalk())
+
+	data := appendVarlong(nil, math.MinInt64)
+	_, err := skip(data, &slab{})
+	if err == nil {
+		t.Fatal("expected error for math.MinInt64 block count")
+	}
+}
+
+func TestDoResolveFixed(t *testing.T) {
+	// Call doResolve directly for fixed schemas (unreachable through Resolve
+	// because fixed schemas with same name/size have identical canonical forms).
+	r := &schemaNode{kind: "fixed", name: "F", size: 4}
+	w := &schemaNode{kind: "fixed", name: "F", size: 4}
+	resolved, err := doResolve(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != r {
+		t.Fatal("expected reader node returned directly for fixed")
+	}
+}
+
+func TestDoResolveIncompatible(t *testing.T) {
+	// Call doResolve directly for incompatible types.
+	r := &schemaNode{kind: "int"}
+	w := &schemaNode{kind: "string"}
+	_, err := doResolve(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for incompatible types")
+	}
+}
+
+func TestResolveNodeError(t *testing.T) {
+	// Call resolveNode directly to trigger the doResolve error path.
+	r := &schemaNode{kind: "int"}
+	w := &schemaNode{kind: "boolean"}
+	_, err := resolveNode(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for incompatible types")
+	}
+}
+
+func TestResolveRecordFieldError(t *testing.T) {
+	// Call resolveRecord directly with incompatible field types.
+	r := &schemaNode{
+		kind: "record", name: "R",
+		fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "int"}},
+		},
+	}
+	w := &schemaNode{
+		kind: "record", name: "R",
+		fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "boolean"}},
+		},
+	}
+	_, err := resolveRecord(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for incompatible field types")
+	}
+}
+
+func TestResolveRecordDefaultError(t *testing.T) {
+	// Call resolveRecord directly with a field that has a bad default.
+	r := &schemaNode{
+		kind: "record", name: "R",
+		fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "int"}, defaultVal: "not_a_number", hasDefault: true},
+		},
+	}
+	w := &schemaNode{
+		kind: "record", name: "R",
+		fields: nil,
+	}
+	_, err := resolveRecord(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for bad default value")
+	}
+}
+
+func TestResolveEnumNoDefault(t *testing.T) {
+	// Call resolveEnum directly: writer has symbol not in reader, no default.
+	r := &schemaNode{kind: "enum", name: "E", symbols: []string{"A", "B"}}
+	w := &schemaNode{kind: "enum", name: "E", symbols: []string{"A", "B", "C"}}
+	_, err := resolveEnum(r, w, &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for writer symbol not in reader")
+	}
+}
+
+func TestResolveEnumBadDefault(t *testing.T) {
+	// Call resolveEnum directly: reader has default not in its own symbols.
+	r := &schemaNode{kind: "enum", name: "E", symbols: []string{"A", "B"}, enumDef: "MISSING", hasEnumDef: true}
+	w := &schemaNode{kind: "enum", name: "E", symbols: []string{"A", "B", "C"}}
+	_, err := resolveEnum(r, w, &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for invalid enum default")
+	}
+}
+
+func TestResolveArrayError(t *testing.T) {
+	// Call resolveArray directly with incompatible items.
+	r := &schemaNode{kind: "array", items: &schemaNode{kind: "int"}}
+	w := &schemaNode{kind: "array", items: &schemaNode{kind: "boolean"}}
+	_, err := resolveArray(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for incompatible array items")
+	}
+}
+
+func TestResolveMapError(t *testing.T) {
+	// Call resolveMap directly with incompatible values.
+	r := &schemaNode{kind: "map", values: &schemaNode{kind: "int"}}
+	w := &schemaNode{kind: "map", values: &schemaNode{kind: "boolean"}}
+	_, err := resolveMap(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for incompatible map values")
+	}
+}
+
+func TestResolveWriterUnionError(t *testing.T) {
+	// Call resolveWriterUnion directly: any incompatible branch causes
+	// Resolve to fail eagerly (fail-fast posture; see resolveWriterUnion
+	// doc comment).
+	r := &schemaNode{kind: "int"}
+	w := &schemaNode{kind: "union", branches: []*schemaNode{
+		{kind: "boolean"},
+	}}
+	_, err := resolveWriterUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error when a writer branch is incompatible")
+	}
+}
+
+func TestResolveReaderUnionError(t *testing.T) {
+	// Call resolveReaderUnion directly: no matching branch.
+	r := &schemaNode{kind: "union", branches: []*schemaNode{
+		{kind: "null"},
+		{kind: "int"},
+	}}
+	w := &schemaNode{kind: "boolean"}
+	_, err := resolveReaderUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for no matching reader union branch")
+	}
+}
+
+func TestResolveReaderUnionBranchError(t *testing.T) {
+	// Call resolveReaderUnion directly: matching branch found but resolveNode fails.
+	r := &schemaNode{kind: "union", branches: []*schemaNode{
+		{kind: "record", name: "R", fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "int"}},
+		}},
+	}}
+	w := &schemaNode{kind: "record", name: "R", fields: []fieldNode{
+		{name: "a", node: &schemaNode{kind: "boolean"}},
+	}}
+	_, err := resolveReaderUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for incompatible record in reader union")
+	}
+}
+
+func TestResolveUnionUnionNoMatch(t *testing.T) {
+	// Call resolveUnionUnion directly: writer branch has no match in reader.
+	r := &schemaNode{kind: "union", branches: []*schemaNode{
+		{kind: "null"},
+		{kind: "int"},
+	}}
+	w := &schemaNode{kind: "union", branches: []*schemaNode{
+		{kind: "boolean"},
+	}}
+	_, err := resolveUnionUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for unmatched writer union branch")
+	}
+}
+
+func TestResolveUnionUnionBranchError(t *testing.T) {
+	// Call resolveUnionUnion directly: branch matches by kind but resolveNode fails.
+	r := &schemaNode{kind: "union", branches: []*schemaNode{
+		{kind: "record", name: "R", fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "int"}},
+		}},
+	}}
+	w := &schemaNode{kind: "union", branches: []*schemaNode{
+		{kind: "record", name: "R", fields: []fieldNode{
+			{name: "a", node: &schemaNode{kind: "boolean"}},
+		}},
+	}}
+	_, err := resolveUnionUnion(r, w, "", &resolveCtx{seen: make(map[nodePair]*schemaNode)})
+	if err == nil {
+		t.Fatal("expected error for incompatible records in union-union")
+	}
+}
+
+func TestResolveDeserStructMissingField(t *testing.T) {
+	// Struct is missing a field the reader schema expects → typeFieldMapping error.
+	// Schemas must differ so Resolve doesn't short-circuit.
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"long"},
+		{"name":"b","type":"string"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"a": 1, "b": "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Struct only has field A, missing field B.
+	type Partial struct {
+		A int64 `avro:"a"`
+	}
+	var result Partial
+	_, err = resolved.Decode(encoded, &result)
+	if err == nil {
+		t.Fatal("expected error for struct missing field b")
+	}
+}
+
+func TestResolveNamespacedAlias(t *testing.T) {
+	// Reader uses a namespaced name with aliases, writer uses one of the aliases.
+	// This exercises qualifyAliases with a dot in fullname and unqualified aliases.
+	reader, err := Parse(`{
+		"type":"record",
+		"name":"com.example.NewName",
+		"aliases":["OldName"],
+		"fields":[{"name":"a","type":"int"}]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := Parse(`{
+		"type":"record",
+		"name":"com.example.OldName",
+		"fields":[{"name":"a","type":"int"}]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = CheckCompatibility(writer, reader)
+	if err != nil {
+		t.Fatalf("expected compatible via alias: %v", err)
+	}
+}
+
+func TestResolveFullyQualifiedAlias(t *testing.T) {
+	// Alias already contains a dot (fully qualified).
+	reader, err := Parse(`{
+		"type":"record",
+		"name":"com.example.NewName",
+		"aliases":["com.other.OldName"],
+		"fields":[{"name":"a","type":"int"}]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := Parse(`{
+		"type":"record",
+		"name":"com.other.OldName",
+		"fields":[{"name":"a","type":"int"}]
+	}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = CheckCompatibility(writer, reader)
+	if err != nil {
+		t.Fatalf("expected compatible via fully-qualified alias: %v", err)
+	}
+}
+
+// A namespace-qualified alias names exactly that fullname — spec "Aliases":
+// if a type named "a.b" has aliases of "c" and "x.y", the fully qualified
+// names of its aliases are "a.c" and "x.y". It must not match a
+// same-short-name type in a DIFFERENT namespace. Java rewrites writer names
+// through a fullname-keyed alias map (Schema.applyAliases); fastavro
+// matches the writer's fullname or bare short name against the alias
+// strings as written (match_schemas); both reject this pair. Only an alias
+// declared WITHOUT a dot short-matches across namespaces (fastavro's
+// raw-string tier, executed; Java is stricter and fullname-only).
+func TestResolveQualifiedAliasIsNamespaceScoped(t *testing.T) {
+	writer := MustParse(`{"type":"record","name":"n2.Old","fields":[{"name":"a","type":"int"}]}`)
+	reader := MustParse(`{"type":"record","name":"n1.New","aliases":["n1.Old"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writer, reader); err == nil {
+		t.Errorf("CheckCompatibility: qualified alias n1.Old matched writer n2.Old")
+	}
+	if _, err := Resolve(writer, reader); err == nil {
+		t.Errorf("Resolve: qualified alias n1.Old matched writer n2.Old")
+	}
+
+	// The union-branch matcher applies the same rule.
+	readerUnion := MustParse(`["int",{"type":"record","name":"n1.New","aliases":["n1.Old"],"fields":[{"name":"a","type":"int"}]}]`)
+	if err := CheckCompatibility(writer, readerUnion); err == nil {
+		t.Errorf("CheckCompatibility union branch: qualified alias n1.Old matched writer n2.Old")
+	}
+	if _, err := Resolve(writer, readerUnion); err == nil {
+		t.Errorf("Resolve union branch: qualified alias n1.Old matched writer n2.Old")
+	}
+
+	// Kept behaviors: an alias declared without a dot short-matches a
+	// foreign-namespace writer (fastavro's raw-string tier)...
+	readerBare := MustParse(`{"type":"record","name":"n1.New","aliases":["Old"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writer, readerBare); err != nil {
+		t.Errorf("bare alias must keep short-matching a foreign-namespace writer: %v", err)
+	}
+	// ...and a qualified alias matches its exact fullname.
+	writerN1 := MustParse(`{"type":"record","name":"n1.Old","fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writerN1, reader); err != nil {
+		t.Errorf("qualified alias must keep matching its exact fullname: %v", err)
+	}
+}
+
+// Aliases follow the names' dot rule (leadingDotName): a single leading dot
+// with a DOTLESS remainder is the null-namespace escape (".x" is the
+// fullname "x"), and any other dotted spelling is a fullname VERBATIM —
+// Java's Name constructor nulls the space only when it is empty (lastDot
+// split, then `if ("".equals(space)) space = null`), so ".a.b" keeps its
+// non-empty space ".a"; fastavro compares alias strings as written, so a
+// raw ".a.b" matches only a writer literally named ".a.b". Stripping the
+// dot from ".a.b" would match writer "a.b" — a match neither reference
+// makes.
+func TestResolveLeadingDotAliasDotRule(t *testing.T) {
+	lax := WithLaxNames(func(string) error { return nil })
+
+	// The escape spelling keeps working: ".x" aliases the null-namespace x.
+	writerX := MustParse(`{"type":"record","name":"x","fields":[{"name":"a","type":"int"}]}`)
+	readerEsc := MustParse(`{"type":"record","name":"n1.New","aliases":[".x"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writerX, readerEsc); err != nil {
+		t.Errorf(`alias ".x" must keep matching the null-namespace writer x: %v`, err)
+	}
+
+	// A multi-dot leading-dot alias is verbatim: it must NOT match the
+	// dotless-namespace writer a.b ...
+	writerAB := MustParse(`{"type":"record","name":"a.b","fields":[{"name":"a","type":"int"}]}`)
+	readerDot := MustParse(`{"type":"record","name":"n1.New","aliases":[".a.b"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writerAB, readerDot); err == nil {
+		t.Errorf(`alias ".a.b" matched writer "a.b"; the verbatim spelling denotes only a writer literally named ".a.b"`)
+	}
+	if _, err := Resolve(writerAB, readerDot); err == nil {
+		t.Errorf(`Resolve: alias ".a.b" matched writer "a.b"`)
+	}
+
+	// ... and it DOES match a (lax-named) writer literally called ".a.b".
+	writerDot, err := Parse(`{"type":"record","name":".a.b","fields":[{"name":"a","type":"int"}]}`, lax)
+	if err != nil {
+		t.Fatalf("lax writer .a.b: %v", err)
+	}
+	if err := CheckCompatibility(writerDot, readerDot); err != nil {
+		t.Errorf(`alias ".a.b" must match the writer literally named ".a.b": %v`, err)
+	}
+}
+
+func TestResolveNullUnionDefault(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"x","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"x","type":"int"},
+		{"name":"opt","type":["null","string"],"default":null}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	encoded, err := writer.Encode(map[string]any{"x": 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result any
+	_, err = resolved.Decode(encoded, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := result.(map[string]any)
+	if m["x"] != int32(5) {
+		t.Fatalf("expected x=5, got %v", m["x"])
+	}
+	// opt should be nil (null default).
+	if m["opt"] != nil {
+		t.Fatalf("expected opt=nil, got %v", m["opt"])
+	}
+}
+
+// ---------- map_setiter_test.go ----------
+
+type ptrTextString string
+
+func (p *ptrTextString) MarshalText() ([]byte, error) { return []byte("MT:" + string(*p)), nil }
+
+// long→int JSON native decode must never silently truncate: a wire value
+// outside int32 range into []int / map[string]int is preserved on 64-bit
+// (native) and rejected on 32-bit (reflect fallback) — but never garbage. The
+// int32 value type always rejects (parseJSONInt32 range-checks). Locks the
+// 32-bit narrowing fix.
+func TestRegression_JSONNativeLongIntNoTruncate(t *testing.T) {
+	const big = `5000000000` // > math.MaxInt32
+
+	// int32 value type: must error regardless of platform.
+	if err := MustParse(`{"type":"array","items":"int"}`).DecodeJSON([]byte("["+big+"]"), &[]int32{}); err == nil {
+		t.Fatal("[]int32: expected overflow error for 5000000000")
+	}
+
+	// []int "long":
+	var sl []int
+	errSl := MustParse(`{"type":"array","items":"long"}`).DecodeJSON([]byte("["+big+"]"), &sl)
+	// map[string]int "long":
+	var mp map[string]int
+	errMp := MustParse(`{"type":"map","values":"long"}`).DecodeJSON([]byte(`{"k":`+big+`}`), &mp)
+
+	if strconv.IntSize == 64 {
+		if errSl != nil || len(sl) != 1 || int64(sl[0]) != 5000000000 {
+			t.Fatalf("64-bit []int: err=%v val=%v (want [5000000000])", errSl, sl)
+		}
+		if errMp != nil || int64(mp["k"]) != 5000000000 {
+			t.Fatalf("64-bit map[string]int: err=%v val=%v", errMp, mp)
+		}
+	} else {
+		if errSl == nil {
+			t.Fatalf("32-bit []int: expected overflow error, got %v", sl)
+		}
+		if errMp == nil {
+			t.Fatalf("32-bit map[string]int: expected overflow error, got %v", mp)
+		}
+	}
+}
+
+// []fpString (named string, no text method) decodes via the array fast loop
+// (deserArrayStringLoop / JSON reflect) — the native loop's exact-string
+// assertion misses it. map[string]fpString covers the map fast block; this
+// covers the array path, binary and JSON.
+func TestRegression_ArrayNamedStringFastLoopDecode(t *testing.T) {
+	s := MustParse(`{"type":"array","items":"string"}`)
+	want := []fpString{"a", "", "b\x00c", "héllo"}
+	wire, err := s.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []fpString
+	if _, err := s.Decode(wire, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out, want) {
+		t.Fatalf("binary: %v != %v", out, want)
+	}
+	j, err := s.EncodeJSON(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jout []fpString
+	if err := s.DecodeJSON(j, &jout); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(jout, want) {
+		t.Fatalf("json: %v != %v", jout, want)
+	}
+}
+
+// A pointer-receiver MarshalText does not fire on a non-addressable by-value
+// scalar (the value's method set lacks the pointer method), so it encodes as
+// the raw string — matching encoding/json. By pointer (addressable) it fires.
+func TestRegression_PointerMarshalTextNonAddressableScalar(t *testing.T) {
+	s := MustParse(`"string"`)
+	v := ptrTextString("hi")
+
+	byVal, err := s.Encode(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawHi, _ := s.Encode("hi")
+	if !bytes.Equal(byVal, rawHi) {
+		t.Fatalf("by-value pointer-MarshalText fired: got % x, want raw % x", byVal, rawHi)
+	}
+	jv, err := json.Marshal(v) // parity baseline: encoding/json also doesn't fire
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(jv) != `"hi"` {
+		t.Fatalf("encoding/json parity broken: got %s want \"hi\"", jv)
+	}
+
+	byPtr, err := s.Encode(&v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawMT, _ := s.Encode("MT:hi")
+	if !bytes.Equal(byPtr, rawMT) {
+		t.Fatalf("by-pointer MarshalText did not fire: got % x, want % x", byPtr, rawMT)
+	}
+}
+
+// appendMapPrimitive, serMap.ser, and the JSON map encoder reuse two
+// addressable Values via SetIterKey/SetIterValue instead of allocating a
+// fresh Value per entry. Because the reused value Value is addressable
+// (iter.Value() is not), a struct-valued map now reaches serRecord's
+// unsafe fast path. These tests pin that the change is behavior-neutral:
+// every map shape round-trips (binary AND JSON) to a deep-equal value,
+// and the struct-valued map's record bytes match a standalone encode.
+//
+// Maps iterate in randomized order, so multi-entry wire is not
+// byte-stable across encodes — we compare decoded values, not bytes
+// (except the single-entry struct case, which is deterministic).
+
+type setIterRec struct {
+	A int32  `avro:"a"`
+	B string `avro:"b"`
+}
+
+const setIterRecSchema = `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`
+
+func TestRegression_MapSetIterRoundTrip(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		val    any
+	}{
+		{"builtinString", `{"type":"map","values":"string"}`,
+			map[string]string{"a": "1", "b": "two", "c": "", "d": "x\x00y"}},
+		{"namedString", `{"type":"map","values":"string"}`,
+			map[string]fpString{"a": "1", "b": "two", "c": ""}},
+		{"int", `{"type":"map","values":"int"}`,
+			map[string]int32{"a": 0, "b": -1, "c": math.MaxInt32, "d": math.MinInt32}},
+		{"long", `{"type":"map","values":"long"}`,
+			map[string]int64{"a": 0, "b": -1, "c": math.MaxInt64, "d": math.MinInt64}},
+		{"double", `{"type":"map","values":"double"}`,
+			map[string]float64{"a": 0, "b": -1.5, "c": math.MaxFloat64}},
+		{"float", `{"type":"map","values":"float"}`,
+			map[string]float32{"a": 0, "b": -1.5, "c": math.MaxFloat32}},
+		{"bool", `{"type":"map","values":"boolean"}`,
+			map[string]bool{"a": true, "b": false}},
+		{"structVal", `{"type":"map","values":` + setIterRecSchema + `}`,
+			map[string]setIterRec{"x": {1, "one"}, "y": {2, "two"}, "z": {-3, ""}}},
+		{"ptrStructVal", `{"type":"map","values":` + setIterRecSchema + `}`,
+			map[string]*setIterRec{"x": {1, "one"}, "y": {2, "two"}}},
+		{"nestedMap", `{"type":"map","values":{"type":"map","values":"int"}}`,
+			map[string]map[string]int32{"o": {"i": 1, "j": 2}, "p": {"k": 3}}},
+		{"jsonNumberKey", `{"type":"map","values":"string"}`,
+			map[json.Number]string{"1": "a", "22": "b", "-3": "c"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.schema)
+
+			// Binary round-trip.
+			b, err := s.Encode(c.val)
+			if err != nil {
+				t.Fatalf("binary encode: %v", err)
+			}
+			bOut := reflect.New(reflect.TypeOf(c.val)).Interface()
+			if _, err := s.Decode(b, bOut); err != nil {
+				t.Fatalf("binary decode: %v", err)
+			}
+			if got := reflect.ValueOf(bOut).Elem().Interface(); !reflect.DeepEqual(got, c.val) {
+				t.Fatalf("binary round-trip mismatch:\n got=%#v\n want=%#v", got, c.val)
+			}
+
+			// JSON round-trip.
+			j, err := s.EncodeJSON(c.val)
+			if err != nil {
+				t.Fatalf("json encode: %v", err)
+			}
+			jOut := reflect.New(reflect.TypeOf(c.val)).Interface()
+			if err := s.DecodeJSON(j, jOut); err != nil {
+				t.Fatalf("json decode: %v (json=%s)", err, j)
+			}
+			if got := reflect.ValueOf(jOut).Elem().Interface(); !reflect.DeepEqual(got, c.val) {
+				t.Fatalf("json round-trip mismatch:\n got=%#v\n want=%#v", got, c.val)
+			}
+		})
+	}
+}
+
+// The numeric/bool value switch in appendMapPrimitive must be byte-identical
+// to the general (named-type) path it replaced. Single-entry maps have
+// deterministic wire order, so bytes are directly comparable: a builtin
+// value type takes the switch, a same-underlying named type takes the
+// general appendFn path.
+func TestRegression_MapValueSwitchMatchesGeneral(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		fast   any
+		gen    any
+	}{
+		{"int", `{"type":"map","values":"int"}`,
+			map[string]int32{"k": -123456}, map[string]fpInt32{"k": -123456}},
+		{"long", `{"type":"map","values":"long"}`,
+			map[string]int64{"k": math.MinInt64}, map[string]fpInt64{"k": math.MinInt64}},
+		{"longFromInt", `{"type":"map","values":"long"}`,
+			map[string]int{"k": -1}, map[string]fpInt{"k": -1}},
+		{"float", `{"type":"map","values":"float"}`,
+			map[string]float32{"k": 3.14}, map[string]fpFloat32{"k": 3.14}},
+		{"floatSignalingNaN", `{"type":"map","values":"float"}`,
+			map[string]float32{"k": math.Float32frombits(0x7f800001)},
+			map[string]fpFloat32{"k": fpFloat32(math.Float32frombits(0x7f800001))}},
+		{"double", `{"type":"map","values":"double"}`,
+			map[string]float64{"k": 2.718281828}, map[string]fpFloat64{"k": 2.718281828}},
+		{"bool", `{"type":"map","values":"boolean"}`,
+			map[string]bool{"k": true}, map[string]fpBool{"k": true}},
+		{"string", `{"type":"map","values":"string"}`,
+			map[string]string{"k": "v"}, map[string]fpString{"k": "v"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.schema)
+			fast, err := s.Encode(c.fast)
+			if err != nil {
+				t.Fatalf("fast: %v", err)
+			}
+			gen, err := s.Encode(c.gen)
+			if err != nil {
+				t.Fatalf("gen: %v", err)
+			}
+			if !bytes.Equal(fast, gen) {
+				t.Fatalf("map value switch diverges from general path:\n fast=% x\n gen =% x", fast, gen)
+			}
+		})
+	}
+}
+
+type f32Field struct {
+	F float32 `avro:"f"`
+}
+
+// float32 must preserve exact bits (signaling-NaN payload included) on every
+// path — matching Java (floatToRawIntBits/intBitsToFloat), fastavro, and IEEE
+// "float is 4 opaque bytes." reflect.Value.Float()/SetFloat would quiet sNaN
+// via a float64 round-trip; the encode/decode paths avoid that. Pins that the
+// unsafe (addressable) and reflect (by-value) paths agree, and that maps and
+// arrays agree with both.
+func TestRegression_Float32SignalingNaNPreserved(t *testing.T) {
+	const bits = uint32(0x7f800001) // signaling NaN (quiet bit clear)
+	f := math.Float32frombits(bits)
+	wire := []byte{0x01, 0x00, 0x80, 0x7f} // little-endian 0x7f800001
+
+	// ENCODE: record field, both by-value (reflect) and by-pointer (unsafe).
+	rec := MustParse(`{"type":"record","name":"R","fields":[{"name":"f","type":"float"}]}`)
+	for _, enc := range []any{f32Field{f}, &f32Field{f}} {
+		b, err := rec.Encode(enc)
+		if err != nil {
+			t.Fatalf("encode %T: %v", enc, err)
+		}
+		if !bytes.Equal(b, wire) {
+			t.Fatalf("encode %T quieted sNaN: got % x want % x", enc, b, wire)
+		}
+	}
+	mapS := MustParse(`{"type":"map","values":"float"}`)
+	arrS := MustParse(`{"type":"array","items":"float"}`)
+	mb, _ := mapS.Encode(map[string]float32{"k": f})
+	if !bytes.Contains(mb, wire) {
+		t.Fatalf("map encode quieted sNaN: % x", mb)
+	}
+	ab, _ := arrS.Encode([]float32{f})
+	if !bytes.Contains(ab, wire) {
+		t.Fatalf("array encode quieted sNaN: % x", ab)
+	}
+
+	// DECODE: record field, map value, array element, interface — all preserve.
+	var sf f32Field
+	if _, err := rec.Decode(wire, &sf); err != nil {
+		t.Fatal(err)
+	}
+	if got := math.Float32bits(sf.F); got != bits {
+		t.Fatalf("record decode quieted: got %08x want %08x", got, bits)
+	}
+	var m map[string]float32
+	if _, err := mapS.Decode(mb, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := math.Float32bits(m["k"]); got != bits {
+		t.Fatalf("map decode quieted: got %08x want %08x", got, bits)
+	}
+	var a []float32
+	if _, err := arrS.Decode(ab, &a); err != nil {
+		t.Fatal(err)
+	}
+	if got := math.Float32bits(a[0]); got != bits {
+		t.Fatalf("array decode quieted: got %08x want %08x", got, bits)
+	}
+	var anyV any
+	if _, err := MustParse(`"float"`).Decode(wire, &anyV); err != nil {
+		t.Fatal(err)
+	}
+	if got := math.Float32bits(anyV.(float32)); got != bits {
+		t.Fatalf("interface decode quieted: got %08x want %08x", got, bits)
+	}
+
+	// Named float32 (fpFloat32): a non-addressable scalar encode hits
+	// float32WireBits's typedmemmove-into-temp branch — distinct from the
+	// builtin-float32 Interface() branch and the unsafe-addressable branch
+	// exercised above, and the only float32 path the rest of this test (and
+	// TestRegression_MapValueSwitchMatchesGeneral, which uses an addressable
+	// map elem) does not reach with a payload. Scalar decode and the
+	// []fpFloat32 reflect loop must preserve the raw bits too.
+	fltS := MustParse(`"float"`)
+	nb, err := fltS.Encode(fpFloat32(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(nb, wire) {
+		t.Fatalf("named float32 scalar encode quieted sNaN: got % x want % x", nb, wire)
+	}
+	var nf fpFloat32
+	if _, err := fltS.Decode(wire, &nf); err != nil {
+		t.Fatal(err)
+	}
+	if got := math.Float32bits(float32(nf)); got != bits {
+		t.Fatalf("named float32 scalar decode quieted: got %08x want %08x", got, bits)
+	}
+	nab, _ := arrS.Encode([]fpFloat32{fpFloat32(f)})
+	if !bytes.Contains(nab, wire) {
+		t.Fatalf("named []fpFloat32 encode quieted sNaN: % x", nab)
+	}
+	var na []fpFloat32
+	if _, err := arrS.Decode(nab, &na); err != nil {
+		t.Fatal(err)
+	}
+	if got := math.Float32bits(float32(na[0])); got != bits {
+		t.Fatalf("named []fpFloat32 decode quieted: got %08x want %08x", got, bits)
+	}
+}
+
+// JSON array encode native must be byte-identical to the reflect path.
+// Arrays are ordered, so the whole encoding is byte-comparable.
+func TestRegression_ArrayJSONNativeMatchesGeneral(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		fast   any
+		gen    any
+	}{
+		{"string", `{"type":"array","items":"string"}`,
+			[]string{"a", "b\"c\n", ""}, []fpString{"a", "b\"c\n", ""}},
+		{"int", `{"type":"array","items":"int"}`,
+			[]int32{0, -1, math.MaxInt32, math.MinInt32}, []fpInt32{0, -1, math.MaxInt32, math.MinInt32}},
+		{"long", `{"type":"array","items":"long"}`,
+			[]int64{0, math.MinInt64, math.MaxInt64}, []fpInt64{0, math.MinInt64, math.MaxInt64}},
+		{"float", `{"type":"array","items":"float"}`,
+			[]float32{3.5, -1, 0}, []fpFloat32{3.5, -1, 0}},
+		{"double", `{"type":"array","items":"double"}`,
+			[]float64{2.5, -1}, []fpFloat64{2.5, -1}},
+		{"bool", `{"type":"array","items":"boolean"}`,
+			[]bool{true, false, true}, []fpBool{true, false, true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.schema)
+			fast, err := s.EncodeJSON(c.fast)
+			if err != nil {
+				t.Fatalf("fast: %v", err)
+			}
+			gen, err := s.EncodeJSON(c.gen)
+			if err != nil {
+				t.Fatalf("gen: %v", err)
+			}
+			if !bytes.Equal(fast, gen) {
+				t.Fatalf("JSON array native diverges from reflect:\n fast=%s\n gen =%s", fast, gen)
+			}
+		})
+	}
+}
+
+// JSON map encode native must be byte-identical to the reflect path. Single
+// entry → deterministic order. A builtin value type takes the native path; a
+// same-underlying named type takes the reflect (appendAvroJSON) path.
+func TestRegression_MapJSONNativeMatchesGeneral(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		fast   any
+		gen    any
+	}{
+		{"string", `{"type":"map","values":"string"}`,
+			map[string]string{"k": "a\"b\n"}, map[string]fpString{"k": "a\"b\n"}},
+		{"int", `{"type":"map","values":"int"}`,
+			map[string]int32{"k": -123456}, map[string]fpInt32{"k": -123456}},
+		{"long", `{"type":"map","values":"long"}`,
+			map[string]int64{"k": math.MinInt64}, map[string]fpInt64{"k": math.MinInt64}},
+		{"float", `{"type":"map","values":"float"}`,
+			map[string]float32{"k": 3.5}, map[string]fpFloat32{"k": 3.5}},
+		{"double", `{"type":"map","values":"double"}`,
+			map[string]float64{"k": 2.5}, map[string]fpFloat64{"k": 2.5}},
+		{"bool", `{"type":"map","values":"boolean"}`,
+			map[string]bool{"k": true}, map[string]fpBool{"k": true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.schema)
+			fast, err := s.EncodeJSON(c.fast)
+			if err != nil {
+				t.Fatalf("fast: %v", err)
+			}
+			gen, err := s.EncodeJSON(c.gen)
+			if err != nil {
+				t.Fatalf("gen: %v", err)
+			}
+			if !bytes.Equal(fast, gen) {
+				t.Fatalf("JSON native diverges from reflect path:\n fast=%s\n gen =%s", fast, gen)
+			}
+		})
+	}
+}
+
+// JSON decode native (map[string]V via parse leaves, []V via append) must
+// round-trip, and named slice/elem/map types must fall back to reflect.
+func TestRegression_JSONDecodeNative(t *testing.T) {
+	type nsInt []int32
+	type nElem int32
+	arrS := MustParse(`{"type":"array","items":"int"}`)
+	in := []int32{0, 1, -1, math.MaxInt32, math.MinInt32}
+	aj, err := arrS.EncodeJSON(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var aOut []int32 // native slice
+	if err := arrS.DecodeJSON(aj, &aOut); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(aOut, in) {
+		t.Fatalf("json array native: %v != %v", aOut, in)
+	}
+	var nsOut nsInt // named slice → fallback
+	if err := arrS.DecodeJSON(aj, &nsOut); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual([]int32(nsOut), in) {
+		t.Fatalf("json named-slice fallback: %v", nsOut)
+	}
+	var neOut []nElem // named elem → fallback
+	if err := arrS.DecodeJSON(aj, &neOut); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(neOut, []nElem{0, 1, -1, math.MaxInt32, math.MinInt32}) {
+		t.Fatalf("json named-elem fallback: %v", neOut)
+	}
+
+	mapS := MustParse(`{"type":"map","values":"long"}`)
+	m := map[string]int64{"a": 1, "b": math.MinInt64, "c": math.MaxInt64}
+	mj, err := mapS.EncodeJSON(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mOut map[string]int64 // native map
+	if err := mapS.DecodeJSON(mj, &mOut); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(mOut, m) {
+		t.Fatalf("json map native: %v != %v", mOut, m)
+	}
+}
+
+// A named map type (type M map[string]int32) has Key()==string and
+// Elem()==int32, so it enters appendMapPrimitive's native switch — but
+// v.Interface() yields the named type, so the comma-ok assertion to the
+// unnamed map[string]int32 fails and it must fall through to the reflect
+// path (not panic, not mis-encode). Single-entry wire must match the
+// unnamed map.
+type namedIntMap map[string]int32
+
+func TestRegression_MapNamedTypeFallsThroughToReflect(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"int"}`)
+	m := namedIntMap{"a": 1, "b": -2, "c": math.MaxInt32}
+	b, err := s.Encode(m)
+	if err != nil {
+		t.Fatalf("encode named map: %v", err)
+	}
+	var out namedIntMap
+	if _, err := s.Decode(b, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(out, m) {
+		t.Fatalf("round-trip mismatch:\n got=%#v\n want=%#v", out, m)
+	}
+	got, _ := s.Encode(namedIntMap{"k": 7})
+	want, _ := s.Encode(map[string]int32{"k": 7})
+	if !bytes.Equal(got, want) {
+		t.Fatalf("named vs unnamed map wire differ:\n named  =% x\n unnamed=% x", got, want)
+	}
+}
+
+// The struct-valued-map flip: a single-entry map[string]Struct encodes its
+// value through serRecord's unsafe fast path (now that valV is
+// addressable). Its record bytes must be byte-identical to encoding that
+// struct standalone. Single entry → deterministic wire layout:
+// [count=1: 0x02][key "k": 0x02 'k'][record bytes...][terminator 0x00].
+func TestRegression_MapStructValueMatchesStandaloneRecord(t *testing.T) {
+	mapS := MustParse(`{"type":"map","values":` + setIterRecSchema + `}`)
+	recS := MustParse(setIterRecSchema)
+
+	val := setIterRec{A: 7, B: "hi"}
+	mapWire, err := mapS.Encode(map[string]setIterRec{"k": val})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recWire, err := recS.Encode(val)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Strip 3-byte prefix (count 0x02, keylen 0x02, 'k') and 1-byte
+	// terminator.
+	if len(mapWire) < 4 {
+		t.Fatalf("map wire too short: % x", mapWire)
+	}
+	inner := mapWire[3 : len(mapWire)-1]
+	if !bytes.Equal(inner, recWire) {
+		t.Fatalf("struct-valued map record bytes differ from standalone:\n map-inner=% x\n standalone=% x", inner, recWire)
+	}
+	if term := mapWire[len(mapWire)-1]; term != 0 {
+		t.Fatalf("expected 0x00 block terminator, got 0x%02x", term)
+	}
+}
+
+// ---------- union_branch_match_test.go ----------
+
+// Union-branch selection: the index must give the SCAN's verdict.
+//
+// Which reader branch a writer node selects is a rule with four ranks — full
+// name, alias, unqualified short name, bare-alias short name — plus numeric
+// and string/bytes promotion, and a fixed's SIZE folded into the match rather
+// than checked after it. Answering it by ranking every reader branch is a scan
+// inside the loop over writer branches that both Resolve and CheckCompatibility
+// run, so the answer is now indexed ahead of the questions.
+//
+// Indexing a rule is where a rule quietly changes. Java's
+// Resolver.firstMatchingBranch scans per writer branch too, so there is no
+// reference to re-derive the verdict from and no interop pressure that would
+// surface a drift — the only thing that can catch one is the scan itself,
+// stated independently and asked the same questions.
+
+// matchTierOracle ranks how strongly a reader branch matches a writer node.
+// This is the rule written out longhand, from the spec clauses and NOT_BUGS
+// #44's ruling, rather than read off branchMatchTiers — so it is an
+// independent statement of what the index is supposed to encode, and a
+// disagreement means the index changed a verdict rather than only its cost.
+type matchTierOracle int
+
+const (
+	oracleNone matchTierOracle = iota
+	oraclePromotion
+	oracleUnqualified
+	oracleExact
+)
+
+func (t matchTierOracle) String() string {
+	switch t {
+	case oracleExact:
+		return "exact"
+	case oracleUnqualified:
+		return "unqualified"
+	case oraclePromotion:
+		return "promotion"
+	}
+	return "none"
+}
+
+func oracleTier(r, w *schemaNode) matchTierOracle {
+	if r.kind == w.kind {
+		switch r.kind {
+		case "record", "enum", "fixed":
+			// Size is part of the MATCH predicate for fixed, not a
+			// post-selection check: a wrong-size same-name fixed must not
+			// match, so selection keeps looking and a later size-matching
+			// branch wins.
+			if r.kind == "fixed" && r.size != w.size {
+				return oracleNone
+			}
+			if r.name == w.name {
+				return oracleExact
+			}
+			for _, a := range r.aliases {
+				if a == w.name {
+					return oracleExact
+				}
+			}
+			if unqualified(r.name) == unqualified(w.name) {
+				return oracleUnqualified
+			}
+			for _, a := range r.bareAliases {
+				if a == unqualified(w.name) {
+					return oracleUnqualified
+				}
+			}
+			return oracleNone
+		default:
+			return oracleExact
+		}
+	}
+	if promotionDeser(w.kind, r.kind) != nil {
+		return oraclePromotion
+	}
+	return oracleNone
+}
+
+// oracleMatch is the best-tier scan: rank every reader branch, keep the best,
+// ties resolve by declaration order.
+func oracleMatch(r, w *schemaNode) (*schemaNode, matchTierOracle) {
+	best, bestTier := (*schemaNode)(nil), oracleNone
+	for _, rb := range r.branches {
+		if rb == nil {
+			continue
+		}
+		if t := oracleTier(rb, w); t > bestTier {
+			bestTier, best = t, rb
+		}
+	}
+	return best, bestTier
+}
+
+// branchMatchCorpus returns reader unions spanning every rank the rule has,
+// including the shapes where two ranks compete and where declaration order is
+// the only thing separating two candidates.
+func branchMatchCorpus() []string {
+	return []string{
+		`["null","int","string"]`,
+		`["long","double"]`,
+		`["double","long"]`,
+		`["string","bytes"]`,
+		`["float","double","long"]`,
+		// Same short name in two namespaces: exact must beat unqualified, and
+		// the reversed pair proves the winner is the NAME and not the order.
+		`[{"type":"record","name":"a.R","fields":[]},{"type":"record","name":"b.R","fields":[]}]`,
+		`[{"type":"record","name":"b.R","fields":[]},{"type":"record","name":"a.R","fields":[]}]`,
+		// A qualified alias matches a writer fullname exactly; a bare alias
+		// short-matches any namespace. Both live beside a plain branch so the
+		// tier that answers is observable.
+		`[{"type":"record","name":"a.Q","aliases":["a.R"],"fields":[]}]`,
+		`[{"type":"record","name":"a.Q","aliases":["R"],"fields":[]}]`,
+		`[{"type":"record","name":"z.Z","fields":[]},{"type":"record","name":"a.Q","aliases":["a.R"],"fields":[]}]`,
+		// Same short name, different sizes: the 4-size writer must skip PAST
+		// the 8-size branch rather than match and fail later.
+		`[{"type":"fixed","name":"b.F","size":8},{"type":"fixed","name":"a.F","size":4}]`,
+		`[{"type":"fixed","name":"a.F","size":4},{"type":"fixed","name":"b.F","size":8}]`,
+		`[{"type":"enum","name":"a.E","symbols":["A"]},"string"]`,
+		`[{"type":"enum","name":"b.E","symbols":["A"]}]`,
+		`["null",{"type":"map","values":"int"},{"type":"array","items":"int"}]`,
+		`[{"type":"record","name":"R","fields":[]}]`,
+		// A named branch that fails both name tiers must NOT fall through to
+		// promotion, so a union of only records answers nothing for a record
+		// writer of an unrelated name.
+		`[{"type":"record","name":"q.Q","fields":[]}]`,
+		`["int"]`,
+		`[]`,
+	}
+}
+
+func branchMatchWriters() []string {
+	return []string{
+		`"null"`, `"boolean"`, `"int"`, `"long"`, `"float"`, `"double"`, `"string"`, `"bytes"`,
+		`{"type":"record","name":"a.R","fields":[]}`,
+		`{"type":"record","name":"b.R","fields":[]}`,
+		`{"type":"record","name":"c.R","fields":[]}`,
+		`{"type":"record","name":"R","fields":[]}`,
+		`{"type":"fixed","name":"a.F","size":4}`,
+		`{"type":"fixed","name":"c.F","size":4}`,
+		`{"type":"fixed","name":"c.F","size":8}`,
+		`{"type":"enum","name":"a.E","symbols":["A"]}`,
+		`{"type":"enum","name":"c.E","symbols":["A"]}`,
+		`{"type":"map","values":"int"}`,
+		`{"type":"array","items":"int"}`,
+	}
+}
+
+// TestInvariant_ReaderBranchLookupMatchesTheScan is the verdict half. The
+// lookup exists to make selection constant-time per writer branch; the one
+// thing it may not do is select differently.
+func TestInvariant_ReaderBranchLookupMatchesTheScan(t *testing.T) {
+	tierHits := map[matchTierOracle]int{}
+	cells := 0
+	for _, readerText := range branchMatchCorpus() {
+		r := MustParse(readerText).node
+		lk := newReaderBranchLookup(r)
+		for _, writerText := range branchMatchWriters() {
+			w := MustParse(writerText).node
+			wantNode, wantTier := oracleMatch(r, w)
+			gotNode := lk.match(w)
+			cells++
+			tierHits[wantTier]++
+			if gotNode != wantNode {
+				t.Errorf("reader %s\nwriter %s\n  scan  → %s\n  index → %s\n  (tier %s)",
+					readerText, writerText, nodeDesc(wantNode), nodeDesc(gotNode), wantTier)
+			}
+		}
+	}
+	// A net that never reaches a rank cannot notice that rank changing. Every
+	// rank the rule has, plus the no-match verdict, has to appear.
+	for _, tier := range []matchTierOracle{oracleExact, oracleUnqualified, oraclePromotion, oracleNone} {
+		if tierHits[tier] == 0 {
+			t.Errorf("no corpus cell resolves at the %s rank — that rank ships undriven", tier)
+		}
+	}
+	t.Logf("cells=%d exact=%d unqualified=%d promotion=%d none=%d",
+		cells, tierHits[oracleExact], tierHits[oracleUnqualified], tierHits[oraclePromotion], tierHits[oracleNone])
+}
+
+func nodeDesc(n *schemaNode) string {
+	if n == nil {
+		return "<no branch>"
+	}
+	if n.name != "" {
+		return fmt.Sprintf("%s(%s)", n.kind, n.name)
+	}
+	return n.kind
+}
+
+// TestInvariant_EveryBranchMatchTierIsDriven derives the rank set from
+// branchMatchTiers rather than listing it, so a rank added there without a
+// corpus shape fails here instead of shipping unexercised. It also asserts each
+// rank actually ANSWERS for some cell: a rank whose writerName never returns a
+// registered key is present in source and absent from behavior.
+func TestInvariant_EveryBranchMatchTierIsDriven(t *testing.T) {
+	answered := make([]int, len(branchMatchTiers))
+	for _, readerText := range branchMatchCorpus() {
+		r := MustParse(readerText).node
+		lk := newReaderBranchLookup(r)
+		for _, writerText := range branchMatchWriters() {
+			w := MustParse(writerText).node
+			for ti, tier := range branchMatchTiers {
+				name, ok := tier.writerName(w)
+				if !ok {
+					continue
+				}
+				if _, hit := lk.byTier[ti][branchMatchKey{kind: w.kind, name: name, size: branchSizeKey(w)}]; hit {
+					answered[ti]++
+				}
+			}
+		}
+	}
+	for ti, tier := range branchMatchTiers {
+		if answered[ti] == 0 {
+			t.Errorf("rank %q (branchMatchTiers[%d]) answers no corpus cell — add a reader/writer pair that it selects, or the rank is unexercised", tier.name, ti)
+		}
+	}
+	// The promotion rank has no tier entry (it is keyed by kind alone), so its
+	// vocabulary is checked against the table it derives from.
+	if len(promotionTargetKinds) == 0 {
+		t.Fatal("promotionTargetKinds derived nothing from the promotions table")
+	}
+	for writerKind, readerKinds := range promotionTargetKinds {
+		for _, readerKind := range readerKinds {
+			if promotionDeser(writerKind, readerKind) == nil {
+				t.Errorf("promotionTargetKinds says %s→%s but the promotions table has no such entry", writerKind, readerKind)
+			}
+		}
+	}
+	for key := range promotions {
+		writerKind, readerKind, _ := strings.Cut(key, ">")
+		found := false
+		for _, k := range promotionTargetKinds[writerKind] {
+			if k == readerKind {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the promotions table has %s but promotionTargetKinds dropped it — the promotion rank would never select that reader kind", key)
+		}
+	}
+}
+
+// TestRegression_UnionBranchSelectionSurvivesIndexing pins the individual
+// verdicts the ranks exist to produce, so a future change that collapses two
+// ranks fails with the shape it broke rather than only as a corpus diff.
+func TestRegression_UnionBranchSelectionSurvivesIndexing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reader string
+		writer string
+		want   string // the selected branch, or "" for no match
+	}{
+		{"exact fullname beats same-short-name sibling",
+			`[{"type":"record","name":"b.R","fields":[]},{"type":"record","name":"a.R","fields":[]}]`,
+			`{"type":"record","name":"a.R","fields":[]}`, "record(a.R)"},
+		{"unqualified short name when no fullname matches",
+			`[{"type":"record","name":"b.R","fields":[]}]`,
+			`{"type":"record","name":"c.R","fields":[]}`, "record(b.R)"},
+		{"qualified alias matches the writer fullname exactly",
+			`[{"type":"record","name":"a.Q","aliases":["a.R"],"fields":[]}]`,
+			`{"type":"record","name":"a.R","fields":[]}`, "record(a.Q)"},
+		{"bare alias short-matches across namespaces",
+			`[{"type":"record","name":"a.Q","aliases":["R"],"fields":[]}]`,
+			`{"type":"record","name":"z.R","fields":[]}`, "record(a.Q)"},
+		{"fixed size is part of the match, so selection skips past a wrong-size sibling",
+			`[{"type":"fixed","name":"b.F","size":8},{"type":"fixed","name":"a.F","size":4}]`,
+			`{"type":"fixed","name":"c.F","size":4}`, "fixed(a.F)"},
+		{"no fixed of the writer's size matches at all",
+			`[{"type":"fixed","name":"b.F","size":8}]`,
+			`{"type":"fixed","name":"c.F","size":2}`, ""},
+		{"promotion is the last rank",
+			`["long","double"]`, `"int"`, "long"},
+		{"promotion takes the earliest promotable branch",
+			`["double","long"]`, `"int"`, "double"},
+		{"same kind outranks promotion",
+			`["long","int"]`, `"int"`, "int"},
+		{"a named branch that fails both name ranks does not fall through to promotion",
+			`[{"type":"record","name":"q.Q","fields":[]}]`,
+			`{"type":"record","name":"a.R","fields":[]}`, ""},
+		{"string and bytes promote to each other",
+			`["bytes"]`, `"string"`, "bytes"},
+		{"an empty union answers nothing",
+			`[]`, `"int"`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := MustParse(tc.reader).node
+			w := MustParse(tc.writer).node
+			got := ""
+			if n := newReaderBranchLookup(r).match(w); n != nil {
+				got = nodeDesc(n)
+			}
+			if got != tc.want {
+				t.Errorf("selected %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------- overflow_audit_test.go ----------
+
+// TestOverflowAuditAllPaths runs integer-overflow probes through every decode
+// entry point that accepts a Go integer target, ensuring silent wrap/truncation
+// cannot occur.
+func TestOverflowAuditAllPaths(t *testing.T) {
+	t.Run("binary deserInt: int->int8 overflow", func(t *testing.T) {
+		s := MustParse(`"int"`)
+		data, err := s.Encode(int32(200))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out int8
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow error, got %d", out)
+		}
+	})
+
+	t.Run("binary deserLong: long->int32 overflow", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		data, err := s.Encode(int64(1) << 33)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out int32
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow error, got %d", out)
+		}
+	})
+
+	t.Run("promote int->long with int16 target", func(t *testing.T) {
+		// Writer says int, reader says long. Reader Go target is int16.
+		// Value 100000 fits in int32 but overflows int16.
+		writer := MustParse(`"int"`)
+		reader := MustParse(`"long"`)
+		data, err := writer.Encode(int32(100000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := Resolve(writer, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out int16
+		if _, err := resolved.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow error, got %d", out)
+		}
+	})
+
+	t.Run("enum ordinal overflow", func(t *testing.T) {
+		// Build an enum with 200 symbols, target int8.
+		symbols := `["`
+		for i := range 200 {
+			if i > 0 {
+				symbols += `","`
+			}
+			symbols += `s` + itoa(i)
+		}
+		symbols += `"]`
+		s := MustParse(`{"type":"enum","name":"E","symbols":` + symbols + `}`)
+		// Encode symbol at ordinal 150.
+		data, err := s.Encode("s150")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out int8
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected enum overflow, got %d", out)
+		}
+	})
+
+	t.Run("logical-type decoder: timestamp-millis into int32 overflow", func(t *testing.T) {
+		// timestamp-millis values routinely exceed int32. Encode a modern
+		// timestamp (millis since epoch > 2^31).
+		s := MustParse(`{"type":"long","logicalType":"timestamp-millis"}`)
+		// ~2024 in millis since epoch is ~1.7e12, well beyond int32.
+		data, err := s.Encode(int64(1700000000000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out int32
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow, got %d", out)
+		}
+	})
+
+	t.Run("JSON decodeInt: int->int8 overflow", func(t *testing.T) {
+		s := MustParse(`"int"`)
+		var out int8
+		err := s.DecodeJSON([]byte(`200`), &out)
+		if err == nil {
+			t.Fatalf("expected overflow, got %d", out)
+		}
+	})
+
+	t.Run("JSON decodeLong: long->int32 overflow", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		var out int32
+		err := s.DecodeJSON([]byte(`2147483648`), &out)
+		if err == nil {
+			t.Fatalf("expected overflow, got %d", out)
+		}
+	})
+
+	t.Run("negative into unsigned target", func(t *testing.T) {
+		s := MustParse(`"int"`)
+		data, err := s.Encode(int32(-1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out uint32
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow, got %d", out)
+		}
+	})
+
+	t.Run("sanity: in-range values still decode", func(t *testing.T) {
+		s := MustParse(`"long"`)
+		data, err := s.Encode(int64(42))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out int32
+		if _, err := s.Decode(data, &out); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if out != 42 {
+			t.Fatalf("got %d, want 42", out)
+		}
+	})
+}
+
+// TestFloatOverflowAllPaths exercises every path where narrowing float64 to
+// float32 could silently produce ±Inf. Overflow must error; NaN/±Inf input
+// must pass through; normal precision-loss rounding is allowed.
+func TestFloatOverflowAllPaths(t *testing.T) {
+	overflow := math.MaxFloat32 * 2 // finite float64 that becomes +Inf in float32
+
+	t.Run("binary deserDouble: overflow into float32", func(t *testing.T) {
+		s := MustParse(`"double"`)
+		data, err := s.Encode(overflow)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out float32
+		if _, err := s.Decode(data, &out); err == nil {
+			t.Fatalf("expected overflow error, got %v", out)
+		}
+	})
+
+	t.Run("binary deserDouble: ±Inf passes through", func(t *testing.T) {
+		s := MustParse(`"double"`)
+		for _, v := range []float64{math.Inf(+1), math.Inf(-1)} {
+			data, err := s.Encode(v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out float32
+			if _, err := s.Decode(data, &out); err != nil {
+				t.Fatalf("unexpected error on %v: %v", v, err)
+			}
+			if !math.IsInf(float64(out), 0) {
+				t.Fatalf("%v did not round-trip: got %v", v, out)
+			}
+		}
+	})
+
+	t.Run("binary deserDouble: NaN passes through", func(t *testing.T) {
+		s := MustParse(`"double"`)
+		data, err := s.Encode(math.NaN())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out float32
+		if _, err := s.Decode(data, &out); err != nil {
+			t.Fatalf("unexpected error on NaN: %v", err)
+		}
+		if !math.IsNaN(float64(out)) {
+			t.Fatalf("NaN did not round-trip: got %v", out)
+		}
+	})
+
+	t.Run("binary deserDouble: in-range rounding is silent", func(t *testing.T) {
+		s := MustParse(`"double"`)
+		precise := 1.1234567890123456
+		data, err := s.Encode(precise)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out float32
+		if _, err := s.Decode(data, &out); err != nil {
+			t.Fatalf("in-range value errored: %v", err)
+		}
+	})
+
+	t.Run("serFloat: float64 overflow silently narrows to ±Inf", func(t *testing.T) {
+		// Lossy-destination policy: matches Java's
+		// GenericDatumWriter.writeFloat(Number.floatValue()) and fastavro's
+		// struct.pack("<f", v) — finite float64 → float32 silently narrows
+		// to ±Inf when out of range.
+		s := MustParse(`"float"`)
+		data, err := s.Encode(overflow)
+		if err != nil {
+			t.Fatalf("encode rejected overflow: %v", err)
+		}
+		var out float32
+		if _, err := s.Decode(data, &out); err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		if !math.IsInf(float64(out), +1) {
+			t.Fatalf("expected +Inf wire value, got %v", out)
+		}
+	})
+
+	t.Run("serFloat: ±Inf passes through", func(t *testing.T) {
+		s := MustParse(`"float"`)
+		for _, v := range []float64{math.Inf(+1), math.Inf(-1)} {
+			if _, err := s.Encode(v); err != nil {
+				t.Fatalf("unexpected error encoding %v: %v", v, err)
+			}
+		}
+	})
+
+	t.Run("JSON decodeDouble: overflow into float32", func(t *testing.T) {
+		s := MustParse(`"double"`)
+		var out float32
+		// Use a large exact-format number that parses but overflows float32.
+		if err := s.DecodeJSON([]byte(`6.805646932770577e+38`), &out); err == nil {
+			t.Fatalf("expected overflow, got %v", out)
+		}
+	})
+
+	t.Run("EncodeJSON float: float64 overflow silently narrows", func(t *testing.T) {
+		// Lossy-destination policy: float64 → float32 narrowing produces
+		// ±Inf, emitted via the dedicated "Infinity" JSON literal.
+		s := MustParse(`"float"`)
+		out, err := s.EncodeJSON(overflow)
+		if err != nil {
+			t.Fatalf("encode rejected overflow: %v", err)
+		}
+		if !strings.Contains(string(out), "Infinity") {
+			t.Fatalf("expected Infinity literal in output, got %s", out)
+		}
+	})
+
+	t.Run("EncodeJSON float: ±Inf and NaN pass through", func(t *testing.T) {
+		s := MustParse(`"float"`)
+		for _, v := range []float64{math.Inf(+1), math.Inf(-1), math.NaN()} {
+			if _, err := s.EncodeJSON(v); err != nil {
+				t.Fatalf("unexpected error encoding %v: %v", v, err)
+			}
+		}
+	})
+
+	t.Run("EncodeJSON float: json.Number overflow silently narrows", func(t *testing.T) {
+		// Lossy-destination policy: parseFloatAcceptOverflow returns +Inf
+		// for overflowing exponent-form input; encoded as "Infinity" literal.
+		s := MustParse(`"float"`)
+		out, err := s.EncodeJSON(json.Number("1e100"))
+		if err != nil {
+			t.Fatalf("encode rejected overflow: %v", err)
+		}
+		if !strings.Contains(string(out), "Infinity") {
+			t.Fatalf("expected Infinity literal in output, got %s", out)
+		}
+	})
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf []byte
+	for n > 0 {
+		buf = append([]byte{byte('0' + n%10)}, buf...)
+		n /= 10
+	}
+	return string(buf)
+}
+
+// ---------- enum_ordinal_overflow_test.go ----------
+
+// An integer-kind enum carrier is validated as an ordinal in [0, len(symbols))
+// in the carrier's own width BEFORE narrowing to int. Narrowing first
+// (int(v.Uint())) truncates a value ≥ 2^32 to its low bits on a 32-bit build,
+// so an out-of-range ordinal like uint64(1<<32+5) would wrap to 5 and encode
+// the wrong symbol there while erroring on 64-bit — a platform-dependent
+// silent-wrong-output divergence. The wide comparison rejects it on every
+// platform; this also pins that the error reports the TRUE value, not a
+// truncated/sign-wrapped one (the observable proxy on a 64-bit host).
+func TestRegression_EnumOrdinalOverflowRejected(t *testing.T) {
+	const schema = `{"type":"enum","name":"e","symbols":["a","b","c"]}` // len 3
+
+	// A uint64 ordinal whose low bits (mod 2^32) land inside [0,3): on a 32-bit
+	// build int(v.Uint()) would truncate to 1 and wrongly accept. Must reject,
+	// and the error must name the real value, not the truncated 1.
+	reject := func(t *testing.T, enc func(*Schema) ([]byte, error), wantInMsg string) {
+		t.Helper()
+		s := MustParse(schema)
+		_, err := enc(s)
+		if err == nil {
+			t.Fatal("expected out-of-range error, got nil (ordinal silently truncated and accepted)")
+		}
+		if !strings.Contains(err.Error(), wantInMsg) {
+			t.Errorf("error %q does not mention the true ordinal %q", err, wantInMsg)
+		}
+	}
+
+	t.Run("binary uint64 ordinal past 2^32", func(t *testing.T) {
+		v := uint64(1<<32 + 1) // 4294967297; low 32 bits = 1, which is a valid index
+		reject(t, func(s *Schema) ([]byte, error) { return s.AppendEncode(nil, &v) }, "4294967297")
+	})
+	t.Run("json uint64 ordinal past 2^32", func(t *testing.T) {
+		v := uint64(1<<32 + 1)
+		reject(t, func(s *Schema) ([]byte, error) { return s.AppendEncodeJSON(nil, &v) }, "4294967297")
+	})
+	t.Run("binary int64 ordinal past 2^32", func(t *testing.T) {
+		v := int64(1<<32 + 2) // low 32 bits = 2, a valid index on 32-bit
+		reject(t, func(s *Schema) ([]byte, error) { return s.AppendEncode(nil, &v) }, "4294967298")
+	})
+
+	// Boundaries that MUST still encode: valid ordinals across int/uint carriers.
+	for _, tc := range []struct {
+		name string
+		v    any
+	}{
+		{"uint 0", ptrAny(uint64(0))},
+		{"uint last", ptrAny(uint64(2))},
+		{"int 0", ptrAny(int64(0))},
+		{"int last", ptrAny(int64(2))},
+	} {
+		t.Run("accept "+tc.name, func(t *testing.T) {
+			s := MustParse(schema)
+			if _, err := s.AppendEncode(nil, tc.v); err != nil {
+				t.Errorf("binary encode of valid ordinal %v: %v", tc.v, err)
+			}
+			if _, err := s.AppendEncodeJSON(nil, tc.v); err != nil {
+				t.Errorf("json encode of valid ordinal %v: %v", tc.v, err)
+			}
+		})
+	}
+
+	// A negative int ordinal still rejects (unchanged behavior).
+	t.Run("negative int rejects", func(t *testing.T) {
+		v := int64(-1)
+		s := MustParse(schema)
+		if _, err := s.AppendEncode(nil, &v); err == nil {
+			t.Error("expected error for negative ordinal")
+		}
+	})
+}
+
+func ptrAny[T any](v T) *T { return &v }
+
+// ---------- unsafe_depth_test.go ----------
+
+// TestRegression_UnsafeDecodeDepthBounded gives end-to-end coverage of the
+// recursion-depth bound on the UNSAFE decode path: a self-referential record
+// nested past maxDepth, decoded into an addressable struct, must error and not
+// recurse unbounded. There was no such test before.
+//
+// Triage note: a scoped mutation run flagged the slab-depth bookkeeping
+// (sl.depth++ / sl.depth-- at the recursive-dispatch sites) as surviving. This
+// test does NOT kill those mutants — verified by neutering each: the decode
+// still errors with the bookkeeping flipped, because the depth limit is
+// enforced REDUNDANTLY (a primary guard fires regardless of those specific
+// lines). They are therefore equivalent/redundant mutants, not an exploitable
+// gap. The test stays for the genuine end-to-end coverage. The wire is hand-
+// built because encode cannot produce an over-deep value (its own depth guard
+// stops it first).
+func TestRegression_UnsafeDecodeDepthBounded(t *testing.T) {
+	// Node = record{ child: ["null", Node], v: int } — a self-referential
+	// type whose decode recurses once per nesting level.
+	s := MustParse(`{"type":"record","name":"Node","fields":[` +
+		`{"name":"child","type":["null","Node"]},{"name":"v","type":"int"}]}`)
+
+	// Build a wire nested deeper than maxDepth:
+	//   level: child-union-index=1 (Node) ... then v=0
+	//   leaf:  child-union-index=0 (null), v=0
+	// zigzag(1)=0x02, zigzag(0)=0x00.
+	const depth = maxDepth + 5
+	var wire []byte
+	for range depth {
+		wire = append(wire, 0x02) // child = the Node branch
+	}
+	wire = append(wire, 0x00, 0x00) // innermost: child = null, v = 0
+	for range depth {
+		wire = append(wire, 0x00) // v = 0 unwinding each level
+	}
+
+	// Node has a *Node field, so decoding into an addressable &Node routes
+	// through the unsafe null-union-record/record path that bumps sl.depth.
+	type Node struct {
+		Child *Node `avro:"child"`
+		V     int32 `avro:"v"`
+	}
+	var n Node
+	if _, err := s.Decode(wire, &n); err == nil {
+		t.Fatal("decode of a structure nested past maxDepth through the unsafe path must error (recursion-depth DoS guard); got nil — the depth guard is defeated")
+	}
+
+	// A shallow value must still decode (the guard must not false-trigger on
+	// the unwound path — catches the inverse sl.depth-- on enter / ++ on exit).
+	shallow := []byte{0x02, 0x00, 0x00, 0x00} // one level: child=Node{child=null,v=0}, v=0
+	var sn Node
+	if _, err := s.Decode(shallow, &sn); err != nil {
+		t.Fatalf("shallow nested decode falsely rejected (depth guard mis-restored): %v", err)
+	}
+}
+
+// ---------- logical_gate_test.go ----------
+
+// jsonDecodeAppliesLogical derives its answer by probing decodeLogical*, so it
+// can't drift from what decode actually does. This test independently pins the
+// probe's output against the HUMAN-KNOWN transform set for every logical — if
+// the probe's type-assertion logic is ever wrong (or a decodeLogical* change
+// flips a logical's transform behavior), one of these explicit expectations
+// fails, forcing a conscious review. Expected values are spelled out (not
+// re-probed) so this is a genuine check, not a tautology.
+func TestRegression_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
+	cases := []struct {
+		kind, logical string
+		size          int
+		want          bool
+	}{
+		// Transforming logicals (decode → enriched Go type).
+		{"int", "date", 0, true},                    // → time.Time
+		{"int", "time-millis", 0, true},             // → time.Duration
+		{"long", "time-micros", 0, true},            // → time.Duration
+		{"long", "timestamp-millis", 0, true},       // → time.Time
+		{"long", "timestamp-micros", 0, true},       // → time.Time
+		{"long", "timestamp-nanos", 0, true},        // → time.Time
+		{"long", "local-timestamp-millis", 0, true}, // → time.Time
+		{"long", "local-timestamp-micros", 0, true}, // → time.Time
+		{"long", "local-timestamp-nanos", 0, true},  // → time.Time
+		{"bytes", "decimal", 0, true},               // → *big.Rat
+		{"fixed", "decimal", 8, true},               // → *big.Rat
+		{"bytes", "big-decimal", 0, true},           // → *big.Rat
+		{"fixed", "uuid", 16, true},                 // → [16]byte
+		{"fixed", "duration", 12, true},             // → avro.Duration
+
+		// uuid-on-string transforms for a TYPED target — decodeString parses the
+		// hex-dash string into a [16]byte / UUID-typed target (into *any/string
+		// it is identity, but the gate must report the transform so a no-Decode
+		// CustomType installs the suppression wrapper and the raw decode matches
+		// binary's deserString, which has no [16]byte arm).
+		{"string", "uuid", 0, true},
+
+		// Non-transforming: no logical; and an unknown future logical
+		// (decodeLogical* returns raw).
+		{"int", "", 0, false},
+		{"long", "", 0, false},
+		{"bytes", "", 0, false},
+		{"string", "", 0, false},
+		{"fixed", "", 16, false},
+		{"long", "some-future-logical", 0, false},
+		{"bytes", "some-future-logical", 0, false},
+
+		// Logical types on a kind they are NOT spec-valid for — reachable only
+		// when a CustomType resurrects a soft-dropped non-standard placement.
+		// uuid/duration are fixed-only, big-decimal is bytes-only; on the wrong
+		// kind neither the *any decodeLogical{Bytes,Fixed} NOR the typed-target
+		// assignBytes transforms (assignBytes is kind-gated), so the decode is
+		// raw on both wire formats and the probe must report false — otherwise a
+		// no-Decode CustomType would over-install the suppression wrapper for a
+		// transform that no longer exists.
+		{"bytes", "uuid", 0, false},
+		{"bytes", "duration", 0, false},
+		{"fixed", "big-decimal", 8, false},
+
+		// Hostile fixed size: the probe must NOT allocate proportional to size.
+		// jsonDecodeAppliesLogical caps its probe buffer at maxFixedLogicalLen+1,
+		// so a size > maxFixedLogicalLen is neither the uuid(16) nor duration(12)
+		// length and yields the same answer the small non-match case does, while
+		// decimal still transforms at any length. fixed size is schema-controlled
+		// and only validated non-negative, so without the cap make([]byte, size)
+		// here is a parse-time DoS; at 1<<62 a regressed cap panics immediately
+		// with "makeslice: len out of range" (it exceeds the runtime max alloc).
+		{"fixed", "uuid", 1 << 62, false},
+		{"fixed", "duration", 1 << 62, false},
+		{"fixed", "decimal", 1 << 62, true},
+	}
+	for _, c := range cases {
+		node := &schemaNode{kind: c.kind, logical: c.logical, size: c.size}
+		if got := jsonDecodeAppliesLogical(node); got != c.want {
+			t.Errorf("jsonDecodeAppliesLogical(kind=%s logical=%q)=%v, want %v — probe disagrees with the known transform set (decodeLogical* changed?)", c.kind, c.logical, got, c.want)
+		}
+	}
+}
+
+// ---------- integration_test.go ----------
+
+// TestEncodeFromJSONUnmarshal tests that data from json.Unmarshal (which
+// produces float64 for all numbers) can be encoded for every schema type.
+// This catches coercion gaps in the json.Unmarshal → Encode pipeline.
+func TestEncodeFromJSONUnmarshal(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		json   string
+	}{
+		// Primitives.
+		{"null", `"null"`, `null`},
+		{"boolean", `"boolean"`, `true`},
+		{"int", `"int"`, `42`},
+		{"long", `"long"`, `100000`},
+		{"float", `"float"`, `1.5`},
+		{"double", `"double"`, `3.14`},
+		{"string", `"string"`, `"hello"`},
+		{"bytes from string", `"bytes"`, `"hello"`},
+
+		// Arrays of primitives (exercises specialized array serializers).
+		{"array of int", `{"type":"array","items":"int"}`, `[1,2,3]`},
+		{"array of long", `{"type":"array","items":"long"}`, `[100,200]`},
+		{"array of float", `{"type":"array","items":"float"}`, `[1.5,2.5]`},
+		{"array of double", `{"type":"array","items":"double"}`, `[3.14]`},
+		{"array of string", `{"type":"array","items":"string"}`, `["a","b"]`},
+		{"array of boolean", `{"type":"array","items":"boolean"}`, `[true,false]`},
+
+		// Maps of primitives (exercises specialized map serializers).
+		{"map of int", `{"type":"map","values":"int"}`, `{"k":42}`},
+		{"map of long", `{"type":"map","values":"long"}`, `{"k":100}`},
+		{"map of float", `{"type":"map","values":"float"}`, `{"k":1.5}`},
+		{"map of double", `{"type":"map","values":"double"}`, `{"k":3.14}`},
+		{"map of string", `{"type":"map","values":"string"}`, `{"k":"v"}`},
+		{"map of boolean", `{"type":"map","values":"boolean"}`, `{"k":true}`},
+
+		// Unions.
+		{"nullable string null", `["null","string"]`, `null`},
+		{"nullable string value", `["null","string"]`, `"hello"`},
+		{"nullable int null", `["null","int"]`, `null`},
+		{"nullable int value", `["null","int"]`, `42`},
+
+		// Enum.
+		{"enum", `{"type":"enum","name":"Color","symbols":["RED","GREEN"]}`, `"RED"`},
+
+		// Records.
+		{"simple record", `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`, `{"a":1,"b":"hello"}`},
+		{"record with nullable", `{"type":"record","name":"R","fields":[{"name":"a","type":"string"},{"name":"b","type":["null","int"]}]}`, `{"a":"x","b":42}`},
+		{"record with nullable null", `{"type":"record","name":"R","fields":[{"name":"a","type":"string"},{"name":"b","type":["null","int"]}]}`, `{"a":"x","b":null}`},
+		{"record with default", `{"type":"record","name":"R","fields":[{"name":"a","type":"int","default":0},{"name":"b","type":"string"}]}`, `{"b":"hello"}`},
+		{"record with bytes field", `{"type":"record","name":"R","fields":[{"name":"data","type":"bytes"}]}`, `{"data":"hello"}`},
+
+		// Nested records.
+		{"nested record", `{"type":"record","name":"O","fields":[{"name":"inner","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}}]}`, `{"inner":{"x":1}}`},
+
+		// Logical types.
+		{"timestamp-millis from number", `{"type":"long","logicalType":"timestamp-millis"}`, `1742385600000`},
+		{"timestamp-millis from string", `{"type":"long","logicalType":"timestamp-millis"}`, `"2026-03-19T10:00:00Z"`},
+		{"timestamp-micros from string", `{"type":"long","logicalType":"timestamp-micros"}`, `"2026-03-19T10:00:00Z"`},
+		{"timestamp-nanos from string", `{"type":"long","logicalType":"timestamp-nanos"}`, `"2026-03-19T10:00:00Z"`},
+		{"date from number", `{"type":"int","logicalType":"date"}`, `19435`},
+		{"date from RFC3339", `{"type":"int","logicalType":"date"}`, `"2026-03-19T00:00:00Z"`},
+		{"date from YYYY-MM-DD", `{"type":"int","logicalType":"date"}`, `"2026-03-19"`},
+
+		// Arrays/maps inside records.
+		{"record with array", `{"type":"record","name":"R","fields":[{"name":"tags","type":{"type":"array","items":"string"}}]}`, `{"tags":["a","b"]}`},
+		{"record with map", `{"type":"record","name":"R","fields":[{"name":"meta","type":{"type":"map","values":"int"}}]}`, `{"meta":{"k":1}}`},
+		{"record with array of int", `{"type":"record","name":"R","fields":[{"name":"nums","type":{"type":"array","items":"int"}}]}`, `{"nums":[1,2,3]}`},
+		{"record with map of long", `{"type":"record","name":"R","fields":[{"name":"counts","type":{"type":"map","values":"long"}}]}`, `{"counts":{"a":100}}`},
+
+		// Union inside array.
+		{"array of nullable string", `{"type":"array","items":["null","string"]}`, `["hello",null,"world"]`},
+
+		// Deeply nested.
+		{"deep nesting", `{
+			"type":"record","name":"L1","fields":[
+				{"name":"l2","type":{"type":"record","name":"L2","fields":[
+					{"name":"l3","type":{"type":"record","name":"L3","fields":[
+						{"name":"val","type":"int"}
+					]}}
+				]}}
+			]}`, `{"l2":{"l3":{"val":42}}}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			var native any
+			if err := json.Unmarshal([]byte(tt.json), &native); err != nil {
+				t.Fatalf("json.Unmarshal: %v", err)
+			}
+			binary, err := s.Encode(native)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			// Verify it decodes back.
+			var decoded any
+			if _, err := s.Decode(binary, &decoded); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+		})
+	}
+}
+
+// TestEncodeStringBytesCoercionInCollections tests []byte → string and
+// string → bytes coercion in arrays and maps.
+func TestEncodeStringBytesCoercionInCollections(t *testing.T) {
+	// []byte in array of strings.
+	t.Run("array of string from bytes", func(t *testing.T) {
+		s, _ := Parse(`{"type":"array","items":"string"}`)
+		data := []any{[]byte("hello"), []byte("world")}
+		binary, err := s.Encode(data)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var decoded any
+		s.Decode(binary, &decoded)
+		arr := decoded.([]any)
+		if arr[0] != "hello" || arr[1] != "world" {
+			t.Errorf("got %v", arr)
+		}
+	})
+
+	// []byte in map of strings.
+	t.Run("map of string from bytes", func(t *testing.T) {
+		s, _ := Parse(`{"type":"map","values":"string"}`)
+		data := map[string]any{"k": []byte("hello")}
+		binary, err := s.Encode(data)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var decoded any
+		s.Decode(binary, &decoded)
+		m := decoded.(map[string]any)
+		if m["k"] != "hello" {
+			t.Errorf("got %v", m["k"])
+		}
+	})
+
+	// string in array of bytes.
+	t.Run("array of bytes from string", func(t *testing.T) {
+		s, _ := Parse(`{"type":"array","items":"bytes"}`)
+		data := []any{"hello", "world"}
+		binary, err := s.Encode(data)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var decoded any
+		s.Decode(binary, &decoded)
+		arr := decoded.([]any)
+		if string(arr[0].([]byte)) != "hello" {
+			t.Errorf("got %v", arr)
+		}
+	})
+}
+
+// TestEncodeJSONEdgeCases covers paths in appendAvroJSON and DecodeJSON
+// that normal integration tests don't reach.
+func TestEncodeJSONEdgeCases(t *testing.T) {
+	// Null standalone.
+	t.Run("encode null", func(t *testing.T) {
+		s, _ := Parse(`"null"`)
+		b, err := s.EncodeJSON(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "null" {
+			t.Errorf("got %s", b)
+		}
+	})
+
+	// Nil pointer in union.
+	t.Run("nil pointer union", func(t *testing.T) {
+		s, _ := Parse(`["null","string"]`)
+		var p *string
+		b, err := s.EncodeJSON(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "null" {
+			t.Errorf("got %s", b)
+		}
+	})
+
+	// DecodeJSON with null union.
+	t.Run("decode null union", func(t *testing.T) {
+		s, _ := Parse(`["null","string"]`)
+		var got any
+		if err := s.DecodeJSON([]byte(`null`), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != nil {
+			t.Errorf("got %v", got)
+		}
+	})
+
+	// DecodeJSON float/double passthrough.
+	t.Run("decode float", func(t *testing.T) {
+		s, _ := Parse(`"float"`)
+		var got any
+		if err := s.DecodeJSON([]byte(`1.5`), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != float32(1.5) {
+			t.Errorf("got %v (%T)", got, got)
+		}
+	})
+
+	t.Run("decode double", func(t *testing.T) {
+		s, _ := Parse(`"double"`)
+		var got any
+		if err := s.DecodeJSON([]byte(`3.14`), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != 3.14 {
+			t.Errorf("got %v (%T)", got, got)
+		}
+	})
+
+	// DecodeJSON long overflow.
+	t.Run("decode long overflow", func(t *testing.T) {
+		s, _ := Parse(`"long"`)
+		var got any
+		err := s.DecodeJSON([]byte(`1e25`), &got)
+		if err == nil {
+			t.Fatal("expected overflow error")
+		}
+	})
+
+	// Uint values for int field via EncodeJSON.
+	t.Run("encode uint16 as int", func(t *testing.T) {
+		s, _ := Parse(`"int"`)
+		b, err := s.EncodeJSON(uint16(42))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "42" {
+			t.Errorf("got %s", b)
+		}
+	})
+
+	t.Run("encode uint32 as long", func(t *testing.T) {
+		s, _ := Parse(`"long"`)
+		b, err := s.EncodeJSON(uint32(100))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "100" {
+			t.Errorf("got %s", b)
+		}
+	})
+}
+
+// TestEncodeJSONCoercionPaths exercises type coercion paths in EncodeJSON
+// that aren't covered by the json.Unmarshal tests (which always produce
+// float64, not float32/uint/etc).
+func TestEncodeJSONCoercionPaths(t *testing.T) {
+	// float32 for int field.
+	t.Run("float32 to int", func(t *testing.T) {
+		s, _ := Parse(`"int"`)
+		b, err := s.EncodeJSON(float32(42))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "42" {
+			t.Errorf("got %s", b)
+		}
+	})
+
+	// float32 for long field.
+	t.Run("float32 to long", func(t *testing.T) {
+		s, _ := Parse(`"long"`)
+		b, err := s.EncodeJSON(float32(100))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "100" {
+			t.Errorf("got %s", b)
+		}
+	})
+
+	// local-timestamp-millis (hits the default case in timestamp switch).
+	t.Run("local-timestamp-millis", func(t *testing.T) {
+		s, _ := Parse(`{"type":"long","logicalType":"local-timestamp-millis"}`)
+		ts := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
+		b, err := s.EncodeJSON(ts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := strconv.FormatInt(ts.UnixMilli(), 10)
+		if string(b) != want {
+			t.Errorf("got %s, want %s", b, want)
+		}
+	})
+
+	// nil for non-nullable type.
+	t.Run("nil for int", func(t *testing.T) {
+		s, _ := Parse(`"int"`)
+		_, err := s.EncodeJSON(nil)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	// null schema.
+	t.Run("null schema", func(t *testing.T) {
+		s, _ := Parse(`"null"`)
+		b, err := s.EncodeJSON(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "null" {
+			t.Errorf("got %s", b)
+		}
+	})
+
+	// json.Number for bytes-backed decimal (from Decode → EncodeJSON round-trip).
+	t.Run("decimal round-trip", func(t *testing.T) {
+		s, _ := Parse(`{"type":"record","name":"R","fields":[
+			{"name":"v","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}}
+		]}`)
+		r := new(big.Rat).SetFrac64(314, 100)
+		binary, _ := s.Encode(map[string]any{"v": r})
+		var decoded any
+		s.Decode(binary, &decoded)
+		jb, err := s.EncodeJSON(decoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !json.Valid(jb) {
+			t.Fatalf("invalid JSON: %s", jb)
+		}
+	})
+
+	// []byte for string field — encode and decode round-trips.
+	t.Run("bytes to string to bytes", func(t *testing.T) {
+		s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"s","type":"string"}]}`)
+		type R struct {
+			S []byte `avro:"s"`
+		}
+		binary, err := s.Encode(&R{S: []byte("hello")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded R
+		s.Decode(binary, &decoded)
+		if string(decoded.S) != "hello" {
+			t.Errorf("got %s", decoded.S)
+		}
+	})
+
+	// string for bytes field — encode and decode round-trips.
+	t.Run("string to bytes to string", func(t *testing.T) {
+		s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"b","type":"bytes"}]}`)
+		type R struct {
+			B string `avro:"b"`
+		}
+		binary, err := s.Encode(&R{B: "hello"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded R
+		s.Decode(binary, &decoded)
+		if decoded.B != "hello" {
+			t.Errorf("got %s", decoded.B)
+		}
+	})
+}
+
+// TestDecodeStringIntoBytes tests deserString → []byte directly.
+func TestDecodeStringIntoBytes(t *testing.T) {
+	s, _ := Parse(`"string"`)
+	binary, _ := s.Encode("hello")
+	var got []byte
+	if _, err := s.Decode(binary, &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("got %s", got)
+	}
+}
+
+// TestDecodeBytesIntoString tests deserBytes → string directly.
+func TestDecodeBytesIntoString(t *testing.T) {
+	s, _ := Parse(`"bytes"`)
+	binary, _ := s.Encode([]byte("hello"))
+	var got string
+	if _, err := s.Decode(binary, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "hello" {
+		t.Errorf("got %s", got)
+	}
+}
+
+func TestDecodeBytesIntoWrongType(t *testing.T) {
+	s, _ := Parse(`"bytes"`)
+	binary, _ := s.Encode([]byte{1, 2})
+	var got int
+	_, err := s.Decode(binary, &got)
+	if err == nil {
+		t.Fatal("expected error decoding bytes into int")
+	}
+}
+
+func TestEncodeJSONNullSchema(t *testing.T) {
+	s, _ := Parse(`"null"`)
+	// Nil values produce "null" wire output.
+	t.Run("nil value", func(t *testing.T) {
+		b, err := s.EncodeJSON(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "null" {
+			t.Errorf("got %s", b)
+		}
+	})
+	// Non-nil values must error, matching binary serNull's errNonNil
+	// rejection — see TestRegression_EncodeJSONNullParity.
+	t.Run("non-nil value rejected", func(t *testing.T) {
+		if out, err := s.EncodeJSON("ignored"); err == nil {
+			t.Errorf("expected error encoding non-nil value into null schema, got %s", out)
+		}
+	})
+}
+
+func TestEncodeJSONDecimalFixedRoundTrip(t *testing.T) {
+	s, _ := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"v","type":{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}}
+	]}`)
+	r := new(big.Rat).SetFrac64(314, 100)
+	binary, _ := s.Encode(map[string]any{"v": r})
+	var decoded any
+	s.Decode(binary, &decoded)
+	// decoded has json.Number for the decimal — EncodeJSON should handle it.
+	jb, err := s.EncodeJSON(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(jb) {
+		t.Fatalf("invalid JSON: %s", jb)
+	}
+}
+
+func TestEncodeJSONNilPointerUnion(t *testing.T) {
+	type R struct {
+		V *string `avro:"v"`
+	}
+	s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"v","type":["null","string"]}]}`)
+	b, err := s.EncodeJSON(&R{V: nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(b) {
+		t.Fatalf("invalid JSON: %s", b)
+	}
+}
+
+func TestEncodeJSONStructFieldError(t *testing.T) {
+	type R struct {
+		A bool `avro:"a"` // schema says int — will fail
+	}
+	s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	_, err := s.EncodeJSON(&R{A: true})
+	if err == nil {
+		t.Fatal("expected error encoding bool as int in struct")
+	}
+}
+
+func TestEncodeJSONNilPointerTopLevel(t *testing.T) {
+	// Nil *string directly for a union — hits appendAvroJSONUnion with nil pointer.
+	s, _ := Parse(`["null","string"]`)
+	var p *string
+	b, err := s.EncodeJSON(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "null" {
+		t.Errorf("got %s", b)
+	}
+}
+
+func TestEncodeJSONNilInterfaceInUnion(t *testing.T) {
+	// Map with nil interface value for a union field — hits the IsNil check
+	// in appendAvroJSONUnion.
+	s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"v","type":["null","string"]}]}`)
+	data := map[string]any{"v": nil}
+	b, err := s.EncodeJSON(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]any
+	json.Unmarshal(b, &parsed)
+	if parsed["v"] != nil {
+		t.Errorf("expected null, got %v", parsed["v"])
+	}
+}
+
+func TestEncodeJSONStructMappingError(t *testing.T) {
+	// Struct missing a required field — hits typeFieldMapping error in record encoder.
+	type R struct {
+		A int `avro:"a"`
+	}
+	s, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`)
+	_, err := s.EncodeJSON(&R{A: 1})
+	if err == nil {
+		t.Fatal("expected error for struct missing field b")
+	}
+}
+
+func TestEncodeJSONNestedError(t *testing.T) {
+	// Array with wrong element type triggers error propagation.
+	s, _ := Parse(`{"type":"array","items":"int"}`)
+	_, err := s.EncodeJSON([]any{true}) // bool can't encode as int
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	// Map with wrong value type.
+	s2, _ := Parse(`{"type":"map","values":"int"}`)
+	_, err = s2.EncodeJSON(map[string]any{"k": true})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	// Record with wrong field type.
+	s3, _ := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`)
+	_, err = s3.EncodeJSON(map[string]any{"a": true})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecodeJSONNullStandalone(t *testing.T) {
+	s, _ := Parse(`"null"`)
+	var got any
+	err := s.DecodeJSON([]byte(`null`), &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDecodeJSONNullUnionTyped(t *testing.T) {
+	s, _ := Parse(`["null","string"]`)
+	input := `null`
+	var got *string
+	err := s.DecodeJSON([]byte(input), &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+func TestDecodeJSONArrayError(t *testing.T) {
+	s, _ := Parse(`{"type":"array","items":"int"}`)
+	// "hello" can't be an int.
+	var got any
+	err := s.DecodeJSON([]byte(`[1, "hello"]`), &got)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDeserFixedArrayNegativeBlock(t *testing.T) {
+	s, err := Parse(`{"type":"array","items":"int"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Craft binary with negative block count (indicates byte-size follows).
+	var elems []byte
+	elems = appendVarint(elems, 10)
+	elems = appendVarint(elems, 20)
+	elems = appendVarint(elems, 30)
+	var data []byte
+	data = appendVarlong(data, -3)                // negative count
+	data = appendVarlong(data, int64(len(elems))) // byte size
+	data = append(data, elems...)
+	data = append(data, 0) // terminator
+
+	var got [3]int32
+	if _, err := s.Decode(data, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != [3]int32{10, 20, 30} {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestDeserFixedArrayTruncated(t *testing.T) {
+	s, err := Parse(`{"type":"array","items":"int"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Truncated data — readVarlong fails.
+	var got [3]int32
+	_, err = s.Decode([]byte{}, &got)
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+func TestDeserFixedArrayNegBlockOverflow(t *testing.T) {
+	s, _ := Parse(`{"type":"array","items":"int"}`)
+	// MinInt64 zigzag-encoded: negating it still gives negative.
+	data := []byte{0x01} // zigzag for -1... actually need MinInt64.
+	// zigzag(MinInt64) = MaxUint64 which is 0xFF 0xFF ... 0xFF 0x01 (10 bytes)
+	data = appendVarlong(nil, math.MinInt64)
+	var got [1]int32
+	_, err := s.Decode(data, &got)
+	if err == nil {
+		t.Fatal("expected error for MinInt64 block count")
+	}
+}
+
+func TestDeserFixedArrayNegBlockTruncatedSize(t *testing.T) {
+	s, _ := Parse(`{"type":"array","items":"int"}`)
+	// Negative count but truncated byte-size varlong.
+	data := appendVarlong(nil, -3) // count=-3
+	// No byte-size follows — truncated.
+	var got [3]int32
+	_, err := s.Decode(data, &got)
+	if err == nil {
+		t.Fatal("expected error for truncated byte size")
+	}
+}
+
+func TestDeserFixedArrayItemError(t *testing.T) {
+	s, err := Parse(`{"type":"array","items":"string"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Craft a block with count=1 but truncated string data.
+	var data []byte
+	data = appendVarlong(data, 1)       // 1 element
+	data = appendVarlong(data, 1000000) // string length: huge, will fail
+	var got [1]string
+	_, err = s.Decode(data, &got)
+	if err == nil {
+		t.Fatal("expected error for truncated string in fixed array")
+	}
+}
+
+func TestDecodeJSONNullWithNonNilInput(t *testing.T) {
+	// Passing a non-null JSON value with a null schema.
+	// DecodeJSON sees 42 with a null schema.
+	s, _ := Parse(`"null"`)
+	var got any
+	err := s.DecodeJSON([]byte(`42`), &got)
+	// This may error during Encode(nil) or succeed with nil.
+	_ = err
+	// Just verify no panic.
+}
+
+func TestDecodeJSONArrayItemError(t *testing.T) {
+	// Array of union where an item has an unknown branch name.
+	s, _ := Parse(`{"type":"array","items":["null","int"]}`)
+	var got any
+	err := s.DecodeJSON([]byte(`[{"bogus":42}]`), &got)
+	if err == nil {
+		t.Fatal("expected error for unknown union branch in array item")
+	}
+}
+
+// TestDecodeJSONCoercionPaths exercises DecodeJSON coercion paths that normal
+// tests don't reach.
+func TestDecodeJSONCoercionPaths(t *testing.T) {
+	// Null for null schema.
+	t.Run("null schema", func(t *testing.T) {
+		s, _ := Parse(`"null"`)
+		var got any
+		if err := s.DecodeJSON([]byte(`null`), &got); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Null for union.
+	t.Run("null union", func(t *testing.T) {
+		s, _ := Parse(`["null","string"]`)
+		var got any
+		if err := s.DecodeJSON([]byte(`null`), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != nil {
+			t.Errorf("got %v", got)
+		}
+	})
+
+	// Float passthrough.
+	t.Run("float", func(t *testing.T) {
+		s, _ := Parse(`"float"`)
+		var got any
+		if err := s.DecodeJSON([]byte(`1.5`), &got); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Double passthrough.
+	t.Run("double", func(t *testing.T) {
+		s, _ := Parse(`"double"`)
+		var got any
+		if err := s.DecodeJSON([]byte(`3.14`), &got); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestEncodeFromJSONUseNumber tests that data from json.Decoder.UseNumber()
+// (which produces json.Number instead of float64) can be encoded for every
+// numeric schema type. This catches json.Number gaps in specialized serializers.
+func TestEncodeFromJSONUseNumber(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		json   string
+	}{
+		// Primitives.
+		{"int", `"int"`, `42`},
+		{"long", `"long"`, `100000`},
+		{"float", `"float"`, `1.5`},
+		{"double", `"double"`, `3.14`},
+
+		// Arrays.
+		{"array of int", `{"type":"array","items":"int"}`, `[1,2,3]`},
+		{"array of long", `{"type":"array","items":"long"}`, `[100,200]`},
+		{"array of float", `{"type":"array","items":"float"}`, `[1.5]`},
+		{"array of double", `{"type":"array","items":"double"}`, `[3.14]`},
+
+		// Maps.
+		{"map of int", `{"type":"map","values":"int"}`, `{"k":42}`},
+		{"map of long", `{"type":"map","values":"long"}`, `{"k":100}`},
+		{"map of float", `{"type":"map","values":"float"}`, `{"k":1.5}`},
+		{"map of double", `{"type":"map","values":"double"}`, `{"k":3.14}`},
+
+		// Record with numeric fields.
+		{"record with int", `{"type":"record","name":"R","fields":[{"name":"n","type":"int"}]}`, `{"n":42}`},
+		{"record with long", `{"type":"record","name":"R","fields":[{"name":"n","type":"long"}]}`, `{"n":100}`},
+		{"record with float", `{"type":"record","name":"R","fields":[{"name":"n","type":"float"}]}`, `{"n":1.5}`},
+		{"record with double", `{"type":"record","name":"R","fields":[{"name":"n","type":"double"}]}`, `{"n":3.14}`},
+
+		// Logical types.
+		{"timestamp-millis", `{"type":"long","logicalType":"timestamp-millis"}`, `1742385600000`},
+
+		// Nullable numeric.
+		{"nullable int", `["null","int"]`, `42`},
+		{"nullable long", `["null","long"]`, `100`},
+
+		// Record with map of long (the exact case that broke connect).
+		{"record with map of long", `{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"map","values":"long"}}]}`, `{"m":{"i":3}}`},
+
+		// Nested record with numeric fields.
+		{"nested numeric", `{"type":"record","name":"O","fields":[{"name":"inner","type":{"type":"record","name":"I","fields":[{"name":"x","type":"int"},{"name":"y","type":"long"}]}}]}`, `{"inner":{"x":1,"y":2}}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			// Use json.Decoder.UseNumber() to produce json.Number values.
+			dec := json.NewDecoder(bytes.NewReader([]byte(tt.json)))
+			dec.UseNumber()
+			var native any
+			if err := dec.Decode(&native); err != nil {
+				t.Fatalf("json.Decode: %v", err)
+			}
+			binary, err := s.Encode(native)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			var decoded any
+			if _, err := s.Decode(binary, &decoded); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+		})
+	}
+}
+
+// TestEncodeJSONFromDecoded tests the full pipeline: binary decode → EncodeJSON.
+// This catches gaps where decoded types (json.Number for decimals, int64 for
+// timestamps) aren't handled by the JSON encoder.
+func TestEncodeJSONFromDecoded(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+		value  any // Go value to encode to binary first
+	}{
+		{"simple record", `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`,
+			map[string]any{"a": int32(1), "b": "hello"}},
+		{"record with nullable", `{"type":"record","name":"R","fields":[{"name":"v","type":["null","string"]}]}`,
+			map[string]any{"v": "hello"}},
+		{"record with nullable null", `{"type":"record","name":"R","fields":[{"name":"v","type":["null","string"]}]}`,
+			map[string]any{"v": nil}},
+		{"record with array of unions", `{"type":"record","name":"R","fields":[{"name":"items","type":{"type":"array","items":["null","string"]}}]}`,
+			map[string]any{"items": []any{nil, "a", nil, "b"}}},
+		{"record with map of int", `{"type":"record","name":"R","fields":[{"name":"m","type":{"type":"map","values":"int"}}]}`,
+			map[string]any{"m": map[string]any{"k": int32(1)}}},
+		{"nested union record", `{"type":"record","name":"R","fields":[{"name":"inner","type":["null",{"type":"record","name":"I","fields":[{"name":"x","type":"int"}]}]}]}`,
+			map[string]any{"inner": map[string]any{"x": int32(42)}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := Parse(tt.schema)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			// Encode to binary.
+			binary, err := s.Encode(tt.value)
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			// Decode to any.
+			var decoded any
+			if _, err := s.Decode(binary, &decoded); err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			// EncodeJSON from the decoded value.
+			jb, err := s.EncodeJSON(decoded)
+			if err != nil {
+				t.Fatalf("EncodeJSON: %v", err)
+			}
+			// Verify valid JSON.
+			if !json.Valid(jb) {
+				t.Fatalf("invalid JSON: %s", jb)
+			}
+			// DecodeJSON back and re-encode to binary — full round trip.
+			var rt any
+			if err := s.DecodeJSON(jb, &rt); err != nil {
+				t.Fatalf("DecodeJSON: %v", err)
+			}
+			binary2, err := s.Encode(rt)
+			if err != nil {
+				t.Fatalf("re-Encode: %v", err)
+			}
+			// Binary should match.
+			if !bytes.Equal(binary, binary2) {
+				t.Errorf("binary mismatch:\n  original: %v\n  roundtrip: %v", binary, binary2)
+			}
+		})
+	}
+}
+
+// ---------- custom_type_test.go ----------
+
+type testMoney struct {
+	Cents    int64
+	Currency string
+}
+
+type testGeoPoint struct {
+	Lat, Lng float64
+}
+
+type testStatus int32
+
+var moneyCT = NewCustomType[testMoney, int64]("money",
+	func(m testMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
+	func(c int64, _ *SchemaNode) (testMoney, error) { return testMoney{Cents: c, Currency: "USD"}, nil },
+)
+
+func parseMoney(t *testing.T, schema string) *Schema {
+	t.Helper()
+	s, err := Parse(schema, moneyCT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestCustomTypeRoundTrip(t *testing.T) {
+	t.Run("struct", func(t *testing.T) {
+		type Order struct {
+			ID    int64     `avro:"id"`
+			Price testMoney `avro:"price"`
+		}
+		s := parseMoney(t, `{"type":"record","name":"Order","fields":[
+			{"name":"id","type":"long"},
+			{"name":"price","type":{"type":"long","logicalType":"money"}}
+		]}`)
+		input := Order{ID: 1, Price: testMoney{Cents: 500, Currency: "USD"}}
+		data, err := s.Encode(&input)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var out Order
+		if _, err := s.Decode(data, &out); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if out.ID != 1 || out.Price.Cents != 500 || out.Price.Currency != "USD" {
+			t.Errorf("got %+v", out)
+		}
+	})
+
+	t.Run("any", func(t *testing.T) {
+		s := parseMoney(t, `{"type":"long","logicalType":"money"}`)
+		data, err := s.Encode(testMoney{Cents: 999})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var v any
+		if _, err := s.Decode(data, &v); err != nil {
+			t.Fatal(err)
+		}
+		if m := v.(testMoney); m.Cents != 999 {
+			t.Errorf("got %d", m.Cents)
+		}
+	})
+
+	t.Run("double_pointer", func(t *testing.T) {
+		s := parseMoney(t, `{"type":"long","logicalType":"money"}`)
+		data, _ := s.Encode(int64(55))
+		var out *testMoney
+		if _, err := s.Decode(data, &out); err != nil {
+			t.Fatal(err)
+		}
+		if out == nil || out.Cents != 55 {
+			t.Fatalf("got %+v", out)
+		}
+	})
+}
+
+func TestCustomTypeJSON(t *testing.T) {
+	s := parseMoney(t, `{"type":"long","logicalType":"money"}`)
+
+	t.Run("encode", func(t *testing.T) {
+		j, err := s.EncodeJSON(testMoney{Cents: 1234})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(j) != "1234" {
+			t.Errorf("got %s", j)
+		}
+	})
+
+	t.Run("decode", func(t *testing.T) {
+		var v any
+		if err := s.DecodeJSON([]byte("5678"), &v); err != nil {
+			t.Fatal(err)
+		}
+		if m := v.(testMoney); m.Cents != 5678 {
+			t.Errorf("got %d", m.Cents)
+		}
+	})
+}
+
+func TestCustomTypeSchemaFor(t *testing.T) {
+	t.Run("basic", func(t *testing.T) {
+		type Order struct {
+			Price testMoney `avro:"price"`
+		}
+		s, err := SchemaFor[Order](moneyCT)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := s.Root().Fields[0]
+		if f.Type.Type != "long" || f.Type.LogicalType != "money" {
+			t.Errorf("got type=%q logical=%q", f.Type.Type, f.Type.LogicalType)
+		}
+	})
+
+	t.Run("pointer", func(t *testing.T) {
+		type R struct {
+			Price *testMoney `avro:"price"`
+		}
+		s, err := SchemaFor[R](moneyCT)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		json.Unmarshal([]byte(s.String()), &m)
+		typ := m["fields"].([]any)[0].(map[string]any)["type"].([]any)
+		if len(typ) != 2 || typ[0] != "null" {
+			t.Fatalf("expected nullable union, got %v", typ)
+		}
+		inner := typ[1].(map[string]any)
+		if inner["type"] != "long" || inner["logicalType"] != "money" {
+			t.Errorf("got %v", inner)
+		}
+	})
+
+	t.Run("with_schema", func(t *testing.T) {
+		type Data struct {
+			Addr testGeoPoint `avro:"addr"`
+		}
+		s, err := SchemaFor[Data](CustomType{
+			GoType: reflect.TypeFor[testGeoPoint](),
+			Schema: &SchemaNode{Type: "fixed", Name: "geo", Size: 16},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := s.Root().Fields[0]
+		if f.Type.Type != "fixed" || f.Type.Size != 16 {
+			t.Errorf("got type=%q size=%d", f.Type.Type, f.Type.Size)
+		}
+	})
+}
+
+func TestCustomTypeOverrideBuiltIn(t *testing.T) {
+	s, err := Parse(`{"type":"long","logicalType":"timestamp-millis"}`, CustomType{
+		LogicalType: "timestamp-millis",
+		GoType:      reflect.TypeFor[time.Time](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			return v.(time.Time).UnixMilli(), nil
+		},
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			return v, nil // pass through raw int64
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Truncate(time.Millisecond).UTC()
+	data, _ := s.Encode(now)
+	var v any
+	s.Decode(data, &v)
+	if v.(int64) != now.UnixMilli() {
+		t.Errorf("got %d, want %d", v, now.UnixMilli())
+	}
+}
+
+func TestCustomTypeNullableUnion(t *testing.T) {
+	type R struct {
+		Price *testMoney `avro:"price"`
+		Name  string     `avro:"name"`
+	}
+	schema := `{"type":"record","name":"R","fields":[
+		{"name":"price","type":["null",{"type":"long","logicalType":"money"}]},
+		{"name":"name","type":"string"}
+	]}`
+	s := parseMoney(t, schema)
+
+	t.Run("non_null", func(t *testing.T) {
+		m := testMoney{Cents: 999}
+		data, err := s.Encode(&R{Price: &m, Name: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out R
+		if _, err := s.Decode(data, &out); err != nil {
+			t.Fatal(err)
+		}
+		if out.Price == nil || out.Price.Cents != 999 || out.Name != "test" {
+			t.Errorf("got %+v", out)
+		}
+		// Encode again to exercise fast-path compilation.
+		data2, _ := s.Encode(&R{Price: &m, Name: "t2"})
+		var out2 R
+		s.Decode(data2, &out2)
+		if out2.Name != "t2" {
+			t.Errorf("got %q", out2.Name)
+		}
+	})
+
+	t.Run("null", func(t *testing.T) {
+		data, _ := s.Encode(&R{Price: nil, Name: "x"})
+		var out R
+		s.Decode(data, &out)
+		if out.Price != nil {
+			t.Errorf("got %+v, want nil", out.Price)
+		}
+	})
+
+	t.Run("any_target", func(t *testing.T) {
+		s2 := parseMoney(t, `{"type":"record","name":"R2","fields":[
+			{"name":"v","type":["null",{"type":"long","logicalType":"money"}]}
+		]}`)
+		data, _ := s2.Encode(map[string]any{"v": int64(100)})
+		var v any
+		s2.Decode(data, &v)
+		if m := v.(map[string]any); m["v"].(testMoney).Cents != 100 {
+			t.Errorf("got %v", m["v"])
+		}
+	})
+}
+
+func TestCustomTypeErrors(t *testing.T) {
+	t.Run("decode_fatal", func(t *testing.T) {
+		myErr := errors.New("boom")
+		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
+			LogicalType: "money",
+			Decode:      func(any, *SchemaNode) (any, error) { return nil, myErr },
+		})
+		data, _ := s.Encode(int64(1))
+		var v any
+		_, err := s.Decode(data, &v)
+		if !errors.Is(err, myErr) {
+			t.Fatalf("got %v", err)
+		}
+	})
+
+	t.Run("encode_fatal", func(t *testing.T) {
+		myErr := errors.New("encode boom")
+		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
+			LogicalType: "money",
+			GoType:      reflect.TypeFor[testMoney](),
+			Encode:      func(any, *SchemaNode) (any, error) { return nil, myErr },
+		})
+		_, err := s.Encode(testMoney{Cents: 1})
+		if !errors.Is(err, myErr) {
+			t.Fatalf("got %v", err)
+		}
+	})
+
+	t.Run("encode_json_fatal", func(t *testing.T) {
+		myErr := errors.New("json boom")
+		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
+			LogicalType: "money",
+			GoType:      reflect.TypeFor[testMoney](),
+			Encode:      func(any, *SchemaNode) (any, error) { return nil, myErr },
+		})
+		_, err := s.EncodeJSON(testMoney{Cents: 1})
+		if !errors.Is(err, myErr) {
+			t.Fatalf("got %v", err)
+		}
+	})
+
+	t.Run("encode_skip", func(t *testing.T) {
+		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
+			LogicalType: "money",
+			GoType:      reflect.TypeFor[testMoney](),
+			Encode:      func(any, *SchemaNode) (any, error) { return nil, ErrSkipCustomType },
+		})
+		_, err := s.Encode(testMoney{Cents: 1})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("decode_nil_result", func(t *testing.T) {
+		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
+			LogicalType: "money",
+			Decode:      func(any, *SchemaNode) (any, error) { return nil, nil },
+		})
+		data, _ := s.Encode(int64(42))
+		var v any
+		s.Decode(data, &v)
+		if v != nil {
+			t.Errorf("got %v", v)
+		}
+	})
+
+	t.Run("decode_short_buffer", func(t *testing.T) {
+		s := parseMoney(t, `{"type":"long","logicalType":"money"}`)
+		var v any
+		_, err := s.Decode(nil, &v)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("invalid_avro_type", func(t *testing.T) {
+		type Bad struct{}
+		ct := NewCustomType[Bad, complex128]("bad",
+			func(Bad, *SchemaNode) (complex128, error) { return 0, nil },
+			func(complex128, *SchemaNode) (Bad, error) { return Bad{}, nil },
+		)
+		_, err := Parse(`{"type":"long","logicalType":"bad"}`, ct)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func TestCustomTypeMatching(t *testing.T) {
+	t.Run("first_match_wins", func(t *testing.T) {
+		s, _ := Parse(`{"type":"long","logicalType":"money"}`,
+			NewCustomType[testMoney, int64]("money", nil,
+				func(c int64, _ *SchemaNode) (testMoney, error) { return testMoney{Cents: c, Currency: "FIRST"}, nil },
+			),
+			NewCustomType[testMoney, int64]("money", nil,
+				func(c int64, _ *SchemaNode) (testMoney, error) { return testMoney{Cents: c, Currency: "SECOND"}, nil },
+			),
+		)
+		data, _ := s.Encode(int64(100))
+		var v any
+		s.Decode(data, &v)
+		if v.(testMoney).Currency != "FIRST" {
+			t.Errorf("got %q", v.(testMoney).Currency)
+		}
+	})
+
+	t.Run("avro_type_mismatch", func(t *testing.T) {
+		s, _ := Parse(`{"type":"long","logicalType":"money"}`, CustomType{
+			LogicalType: "money",
+			AvroType:    "string",
+			Decode:      func(any, *SchemaNode) (any, error) { return "bad", nil },
+		})
+		data, _ := s.Encode(int64(42))
+		var v any
+		s.Decode(data, &v)
+		if _, ok := v.(int64); !ok {
+			t.Fatalf("expected int64, got %T", v)
+		}
+	})
+
+	t.Run("encode_gotype_skip", func(t *testing.T) {
+		s := parseMoney(t, `{"type":"long","logicalType":"money"}`)
+		// Raw int64 → GoType doesn't match → passes through.
+		data, err := s.Encode(int64(42))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) == 0 {
+			t.Fatal("empty")
+		}
+	})
+
+	t.Run("nil_encode_func", func(t *testing.T) {
+		s, _ := Parse(`{"type":"long","logicalType":"money"}`,
+			NewCustomType[testMoney, int64]("money", nil,
+				func(c int64, _ *SchemaNode) (testMoney, error) { return testMoney{Cents: c}, nil },
+			),
+		)
+		data, _ := s.Encode(int64(42))
+		var v any
+		s.Decode(data, &v)
+		if v.(testMoney).Cents != 42 {
+			t.Errorf("got %d", v.(testMoney).Cents)
+		}
+	})
+
+	t.Run("nil_decode_func", func(t *testing.T) {
+		s, _ := Parse(`{"type":"long","logicalType":"money"}`,
+			NewCustomType[testMoney, int64]("money",
+				func(m testMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil }, nil,
+			),
+		)
+		data, _ := s.Encode(testMoney{Cents: 77})
+		var v any
+		s.Decode(data, &v)
+		if _, ok := v.(int64); !ok {
+			t.Fatalf("expected int64, got %T", v)
+		}
+	})
+
+	t.Run("skip_fallthrough", func(t *testing.T) {
+		s, _ := Parse(`{"type":"long"}`, CustomType{
+			AvroType: "long",
+			Decode:   func(any, *SchemaNode) (any, error) { return nil, ErrSkipCustomType },
+		})
+		data, _ := s.Encode(int64(42))
+		var v any
+		s.Decode(data, &v)
+		if v.(int64) != 42 {
+			t.Errorf("got %v", v)
+		}
+	})
+
+	t.Run("empty_criteria", func(t *testing.T) {
+		calls := 0
+		s, _ := Parse(`{"type":"record","name":"R","fields":[
+			{"name":"a","type":"int"},{"name":"b","type":"string"}
+		]}`, CustomType{
+			Decode: func(any, *SchemaNode) (any, error) { calls++; return nil, ErrSkipCustomType },
+		})
+		data, _ := s.Encode(map[string]any{"a": int32(1), "b": "hello"})
+		var v any
+		s.Decode(data, &v)
+		if calls == 0 {
+			t.Error("expected calls")
+		}
+	})
+
+	t.Run("wildcard_preserves_builtins", func(t *testing.T) {
+		s, _ := Parse(`{"type":"long","logicalType":"timestamp-millis"}`, CustomType{
+			Decode: func(any, *SchemaNode) (any, error) { return nil, ErrSkipCustomType },
+		})
+		data, _ := s.Encode(int64(1687221496000))
+		var v any
+		s.Decode(data, &v)
+		if _, ok := v.(time.Time); !ok {
+			t.Fatalf("expected time.Time, got %T", v)
+		}
+	})
+}
+
+func TestCustomTypeBackedByRecord(t *testing.T) {
+	s, _ := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"loc","type":{"type":"record","name":"Loc","logicalType":"geo",
+			"fields":[{"name":"lat","type":"double"},{"name":"lng","type":"double"}]
+		}}
+	]}`, CustomType{
+		LogicalType: "geo",
+		AvroType:    "record",
+		GoType:      reflect.TypeFor[testGeoPoint](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			g := v.(testGeoPoint)
+			return map[string]any{"lat": g.Lat, "lng": g.Lng}, nil
+		},
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			m := v.(map[string]any)
+			return testGeoPoint{Lat: m["lat"].(float64), Lng: m["lng"].(float64)}, nil
+		},
+	})
+	data, _ := s.Encode(map[string]any{"loc": testGeoPoint{Lat: 37.7749, Lng: -122.4194}})
+	var v any
+	s.Decode(data, &v)
+	g := v.(map[string]any)["loc"].(testGeoPoint)
+	if math.Abs(g.Lat-37.7749) > 0.0001 || math.Abs(g.Lng+122.4194) > 0.0001 {
+		t.Errorf("got %+v", g)
+	}
+}
+
+func TestCustomTypeSchemaProps(t *testing.T) {
+	s, _ := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"ts","type":{"type":"long","connect.name":"io.debezium.time.Timestamp"}}
+	]}`, CustomType{
+		Decode: func(v any, sn *SchemaNode) (any, error) {
+			if sn.Props["connect.name"] == "io.debezium.time.Timestamp" {
+				return time.UnixMilli(v.(int64)).UTC(), nil
+			}
+			return nil, ErrSkipCustomType
+		},
+	})
+	data, _ := s.Encode(map[string]any{"ts": int64(1687221496000)})
+	var v any
+	s.Decode(data, &v)
+	if ts := v.(map[string]any)["ts"].(time.Time); ts.UnixMilli() != 1687221496000 {
+		t.Errorf("got %v", ts)
+	}
+}
+
+func TestCustomTypeSchemaCache(t *testing.T) {
+	t.Run("no_leak", func(t *testing.T) {
+		var cache SchemaCache
+		s1, _ := cache.Parse(`{"type":"long","logicalType":"money"}`)
+		s2, _ := cache.Parse(`{"type":"long","logicalType":"money"}`, moneyCT)
+		if s1 == s2 {
+			t.Error("should not return cached schema for custom parse")
+		}
+		data, _ := s1.Encode(int64(42))
+		var v1, v2 any
+		s1.Decode(data, &v1)
+		s2.Decode(data, &v2)
+		if _, ok := v1.(int64); !ok {
+			t.Errorf("s1: expected int64, got %T", v1)
+		}
+		if _, ok := v2.(testMoney); !ok {
+			t.Errorf("s2: expected testMoney, got %T", v2)
+		}
+		s3, _ := cache.Parse(`{"type":"long","logicalType":"money"}`)
+		if s1 != s3 {
+			t.Error("expected cached schema")
+		}
+	})
+
+	t.Run("reparse", func(t *testing.T) {
+		var cache SchemaCache
+		s1, err := cache.Parse(`{"type":"record","name":"Order","fields":[
+			{"name":"price","type":{"type":"long","logicalType":"money"}}
+		]}`, moneyCT)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2, err := cache.Parse(`{"type":"record","name":"Order","fields":[
+			{"name":"price","type":{"type":"long","logicalType":"money"}}
+		]}`, moneyCT)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := s1.Encode(map[string]any{"price": testMoney{Cents: 1}})
+		var v1, v2 any
+		s1.Decode(data, &v1)
+		s2.Decode(data, &v2)
+		if v1.(map[string]any)["price"].(testMoney).Cents != 1 {
+			t.Error("s1 failed")
+		}
+		if v2.(map[string]any)["price"].(testMoney).Cents != 1 {
+			t.Error("s2 failed")
+		}
+	})
+}
+
+func TestCustomTypeResolve(t *testing.T) {
+	t.Run("promotion", func(t *testing.T) {
+		writer, _ := Parse(`"int"`)
+		reader := parseMoney(t, `{"type":"long","logicalType":"money"}`)
+		resolved, _ := Resolve(writer, reader)
+		data, _ := writer.Encode(int32(500))
+		var v any
+		resolved.Decode(data, &v)
+		if v.(testMoney).Cents != 500 {
+			t.Errorf("got %d", v.(testMoney).Cents)
+		}
+	})
+
+	t.Run("same_kind", func(t *testing.T) {
+		writer := parseMoney(t, `{"type":"long","logicalType":"money"}`)
+		reader := parseMoney(t, `{"type":"long","logicalType":"money"}`)
+		resolved, _ := Resolve(writer, reader)
+		data, _ := writer.Encode(testMoney{Cents: 42})
+		var v any
+		resolved.Decode(data, &v)
+		if v.(testMoney).Cents != 42 {
+			t.Errorf("got %d", v.(testMoney).Cents)
+		}
+	})
+}
+
+func TestNewCustomTypeAllAvroTypes(t *testing.T) {
+	tests := []struct {
+		name, want string
+		ct         CustomType
+	}{
+		{"bool", "boolean", NewCustomType[testStatus, bool]("b", nil, nil)},
+		{"int32", "int", NewCustomType[testStatus, int32]("i", nil, nil)},
+		{"int64", "long", NewCustomType[testStatus, int64]("l", nil, nil)},
+		{"float32", "float", NewCustomType[testStatus, float32]("f", nil, nil)},
+		{"float64", "double", NewCustomType[testStatus, float64]("d", nil, nil)},
+		{"string", "string", NewCustomType[testStatus, string]("s", nil, nil)},
+		{"bytes", "bytes", NewCustomType[testStatus, []byte]("b2", nil, nil)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.ct.AvroType != tt.want {
+				t.Errorf("got %q", tt.ct.AvroType)
+			}
+		})
+	}
+}
+
+func TestCustomTypeSchemaCacheNonCustomAfterCustom(t *testing.T) {
+	var cache SchemaCache
+	_, err := cache.Parse(`{"type":"record","name":"Order","fields":[
+		{"name":"price","type":{"type":"long","logicalType":"money"}}
+	]}`, moneyCT)
+	if err != nil {
+		t.Fatalf("custom parse: %v", err)
+	}
+	s, err := cache.Parse(`{"type":"record","name":"Order","fields":[
+		{"name":"price","type":{"type":"long","logicalType":"money"}}
+	]}`)
+	if err != nil {
+		t.Fatalf("non-custom parse after custom: %v", err)
+	}
+	data, _ := s.Encode(map[string]any{"price": int64(42)})
+	var v any
+	s.Decode(data, &v)
+	if v.(map[string]any)["price"].(int64) != 42 {
+		t.Errorf("got %v", v)
+	}
+}
+
+func TestCustomTypePointerGoType(t *testing.T) {
+	type Wrapper struct{ V string }
+	ct := CustomType{
+		LogicalType: "wrapped",
+		AvroType:    "string",
+		GoType:      reflect.TypeFor[*Wrapper](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			return v.(*Wrapper).V, nil
+		},
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			return &Wrapper{V: v.(string)}, nil
+		},
+	}
+	s, err := Parse(`{"type":"string","logicalType":"wrapped"}`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &Wrapper{V: "hello"}
+	data, err := s.Encode(w)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// Decode into *any — exercises the customEncode pointer-level GoType match.
+	var out any
+	if _, err := s.Decode(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.(*Wrapper).V; got != "hello" {
+		t.Errorf("any: got %q", got)
+	}
+
+	// Decode into typed *Wrapper — exercises setCustomResult AssignableTo
+	// for pointer-valued results into pointer targets.
+	var typed *Wrapper
+	if _, err := s.Decode(data, &typed); err != nil {
+		t.Fatalf("typed decode: %v", err)
+	}
+	if typed == nil || typed.V != "hello" {
+		t.Errorf("typed: got %+v", typed)
+	}
+}
+
+func TestCustomTypePointerGoTypeEncodeError(t *testing.T) {
+	type Wrapper struct{ V string }
+	myErr := errors.New("ptr encode fail")
+	ct := CustomType{
+		LogicalType: "wrapped",
+		AvroType:    "string",
+		GoType:      reflect.TypeFor[*Wrapper](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			return nil, myErr
+		},
+	}
+	s, _ := Parse(`{"type":"string","logicalType":"wrapped"}`, ct)
+	_, err := s.Encode(&Wrapper{V: "x"})
+	if !errors.Is(err, myErr) {
+		t.Fatalf("expected myErr, got %v", err)
+	}
+}
+
+func TestCustomTypePointerGoTypeEncodeSkip(t *testing.T) {
+	type Wrapper struct{ V string }
+	ct := CustomType{
+		LogicalType: "wrapped",
+		AvroType:    "string",
+		GoType:      reflect.TypeFor[*Wrapper](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			return nil, ErrSkipCustomType
+		},
+	}
+	s, _ := Parse(`{"type":"string","logicalType":"wrapped"}`, ct)
+	// Pointer GoType match, but encoder skips → falls through to raw
+	// string ser which fails for *Wrapper.
+	_, err := s.Encode(&Wrapper{V: "x"})
+	if err == nil {
+		t.Fatal("expected error after skip")
+	}
+}
+
+func TestCustomTypeNilPointerEncode(t *testing.T) {
+	// Nil pointer value should pass through without panic.
+	s, _ := Parse(`{"type":"string","logicalType":"wrapped"}`, CustomType{
+		LogicalType: "wrapped",
+		GoType:      reflect.TypeFor[*testMoney](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			return "converted", nil
+		},
+	})
+	// Encode nil *testMoney via a map with nil value.
+	_, err := s.Encode((*testMoney)(nil))
+	// Should not panic. May error (nil for non-null string) but not panic.
+	_ = err
+}
+
+func TestWithCustomTypeWrapper(t *testing.T) {
+	// Exercises the WithCustomType discoverability wrapper.
+	ct := NewCustomType[testMoney, int64]("money",
+		func(m testMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
+		func(c int64, _ *SchemaNode) (testMoney, error) { return testMoney{Cents: c}, nil },
+	)
+	s, err := Parse(`{"type":"long","logicalType":"money"}`, WithCustomType(ct))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := s.Encode(testMoney{Cents: 1})
+	var v any
+	s.Decode(data, &v)
+	if v.(testMoney).Cents != 1 {
+		t.Errorf("got %v", v)
+	}
+}
+
+func TestCustomTypeArrayFastPathDisabled(t *testing.T) {
+	// Exercises schema.go array hasCustomType path.
+	s, err := Parse(`{"type":"array","items":{"type":"long","logicalType":"money"}}`, moneyCT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.Encode([]testMoney{{Cents: 1}, {Cents: 2}})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var out any
+	if _, err := s.Decode(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	arr := out.([]any)
+	if len(arr) != 2 || arr[0].(testMoney).Cents != 1 || arr[1].(testMoney).Cents != 2 {
+		t.Errorf("got %v", arr)
+	}
+}
+
+func TestCustomTypeMapFastPathDisabled(t *testing.T) {
+	s, err := Parse(`{"type":"map","values":{"type":"long","logicalType":"money"}}`, moneyCT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.Encode(map[string]testMoney{"a": {Cents: 10}})
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var out any
+	if _, err := s.Decode(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	m := out.(map[string]any)
+	if m["a"].(testMoney).Cents != 10 {
+		t.Errorf("got %v", m)
+	}
+}
+
+// An AvroType-only CustomType (no logicalType) must fire on the JSON
+// array/map element paths exactly as it does on binary. The binary
+// fast-path gate disables specialization when the element carries a custom
+// type (meta.hasCustomType); the JSON fast-path gate previously checked only
+// logical=="" and emitted/parsed the raw element, silently skipping the
+// custom codec — a binary↔JSON wire divergence. (The existing
+// TestCustomType{Array,Map}FastPathDisabled use a logicalType-bearing custom
+// type, so logical!="" also tripped the JSON gate and masked this gap.)
+func TestCustomTypeJSONArrayAvroTypeOnly(t *testing.T) {
+	ct := CustomType{
+		AvroType: "long",
+		Encode:   func(v any, _ *SchemaNode) (any, error) { return v.(int64) + 1000, nil },
+		Decode:   func(v any, _ *SchemaNode) (any, error) { return v.(int64) - 1000, nil },
+	}
+	s, err := Parse(`{"type":"array","items":"long"}`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := []int64{5, 6}
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("binary encode: %v", err)
+	}
+	js, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("json encode: %v", err)
+	}
+	// Read the raw wire values each encoder wrote, via a no-custom schema.
+	plain := MustParse(`{"type":"array","items":"long"}`)
+	var rawBin, rawJSON []int64
+	if _, err := plain.Decode(bin, &rawBin); err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.DecodeJSON(js, &rawJSON); err != nil {
+		t.Fatal(err)
+	}
+	want := []int64{1005, 1006} // custom Encode added 1000
+	if !reflect.DeepEqual(rawBin, want) {
+		t.Fatalf("binary raw wire = %v, want %v", rawBin, want)
+	}
+	if !reflect.DeepEqual(rawJSON, want) {
+		t.Fatalf("json raw wire = %v, want %v (custom Encode skipped on JSON array fast path)", rawJSON, want)
+	}
+	// JSON decode must apply the custom Decode (subtract 1000).
+	var out []int64
+	if err := s.DecodeJSON(js, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("json decode = %v, want %v (custom Decode skipped on JSON array fast path)", out, in)
+	}
+}
+
+func TestCustomTypeJSONMapAvroTypeOnly(t *testing.T) {
+	ct := CustomType{
+		AvroType: "long",
+		Encode:   func(v any, _ *SchemaNode) (any, error) { return v.(int64) + 1000, nil },
+		Decode:   func(v any, _ *SchemaNode) (any, error) { return v.(int64) - 1000, nil },
+	}
+	s, err := Parse(`{"type":"map","values":"long"}`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := map[string]int64{"a": 5}
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("binary encode: %v", err)
+	}
+	js, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatalf("json encode: %v", err)
+	}
+	plain := MustParse(`{"type":"map","values":"long"}`)
+	var rawBin, rawJSON map[string]int64
+	if _, err := plain.Decode(bin, &rawBin); err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.DecodeJSON(js, &rawJSON); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int64{"a": 1005}
+	if !reflect.DeepEqual(rawBin, want) {
+		t.Fatalf("binary raw wire = %v, want %v", rawBin, want)
+	}
+	if !reflect.DeepEqual(rawJSON, want) {
+		t.Fatalf("json raw wire = %v, want %v (custom Encode skipped on JSON map fast path)", rawJSON, want)
+	}
+	var out map[string]int64
+	if err := s.DecodeJSON(js, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out, in) {
+		t.Fatalf("json decode = %v, want %v (custom Decode skipped on JSON map fast path)", out, in)
+	}
+}
+
+func TestCustomTypeFixedLogicalType(t *testing.T) {
+	// Exercises hasMatchingCustomType("fixed", logical) path.
+	type PackedID [8]byte
+	ct := CustomType{
+		LogicalType: "packed-id",
+		AvroType:    "fixed",
+		GoType:      reflect.TypeFor[string](),
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			s := v.(string)
+			var b [8]byte
+			copy(b[:], s)
+			return b[:], nil
+		},
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			b := v.([]byte)
+			return string(b), nil
+		},
+	}
+	s, err := Parse(`{"type":"fixed","name":"pid","size":8,"logicalType":"packed-id"}`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.Encode("hello!!!")
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var v any
+	if _, err := s.Decode(data, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.(string) != "hello!!!" {
+		t.Errorf("got %q", v)
+	}
+}
+
+func TestCustomTypeJsonNumberInt64Validation(t *testing.T) {
+	// Exercises jsonNumberToInt64 non-whole-number error.
+	s, err := Parse(`{"type":"array","items":"long"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Encode([]any{json.Number("1.5")})
+	if err == nil {
+		t.Fatal("expected error for non-whole json.Number in long array")
+	}
+}
+
+func TestCustomTypeDecodeIntIntoAny(t *testing.T) {
+	// Exercises setIntValue interface path through custom decode wrapper.
+	ct := CustomType{
+		AvroType: "int",
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			return v, nil // pass through raw int32
+		},
+	}
+	s, err := Parse(`"int"`, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := s.Encode(int32(42))
+	var v any
+	if _, err := s.Decode(data, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.(int32) != 42 {
+		t.Errorf("got %v", v)
+	}
+}
+
+// TestRegression_DecodeJSONFillsDefaultThroughCustomDecoder locks in that
+// DecodeJSON applies a registered CustomType.Decode to a record field's
+// default value when the field is absent from the JSON input — matching
+// the binary side, where the field's pre-encoded defaultBytes roundtrip
+// through the same wrapped deserRecord.fields[i].fn as a present field's
+// wire bytes.
+//
+// Without this, applyFieldDefault dispatched through the unwrapped
+// node.fields[idx].node.deser (built before applyCustomTypes installed
+// the chain), bypassing CustomType.Decode and surfacing the raw
+// Avro-native value (int64 for a long-backed money type) directly into
+// a target Go type that expects the user's custom domain type — failing
+// with "cannot use X with Avro type Y" on any DecodeJSON of an empty or
+// partially-omitted record into a typed struct/typed-map whose field
+// type is the user's custom type.
+//
+// Sub-tests cover the three iterateRecordFields entry points:
+//   - into_struct: *struct → decodeRecordStruct → applyFieldDefault.
+//   - into_any: *any → decodeRecordAny.
+//   - into_map_string_any: *map[string]any → decodeRecordMap (any-typed elem).
+//
+// Each sub-test pairs JSON-decode with the binary-roundtrip equivalent
+// and asserts both produce the same user-domain Go value so the parity
+// guarantee survives schema/codec changes.
+func TestRegression_DecodeJSONFillsDefaultThroughCustomDecoder(t *testing.T) {
+	s := parseMoney(t, `{"type":"record","name":"R","fields":[
+		{"name":"price","type":{"type":"long","logicalType":"money"},"default":42}
+	]}`)
+
+	t.Run("into_struct", func(t *testing.T) {
+		type R struct {
+			Price testMoney `avro:"price"`
+		}
+		// Binary parity (default is encoded into wire then decoded through
+		// the wrapped deser): produces the user's domain type.
+		wire, err := s.AppendEncode(nil, map[string]any{})
+		if err != nil {
+			t.Fatalf("AppendEncode: %v", err)
+		}
+		var rBin R
+		if _, err := s.Decode(wire, &rBin); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if rBin.Price.Cents != 42 || rBin.Price.Currency != "USD" {
+			t.Fatalf("binary: Price=%+v, want {Cents:42, Currency:USD}", rBin.Price)
+		}
+
+		// JSON decode of empty object must materialize the same value.
+		var rJSON R
+		if err := s.DecodeJSON([]byte(`{}`), &rJSON); err != nil {
+			t.Fatalf("DecodeJSON({}): %v", err)
+		}
+		if rJSON.Price != rBin.Price {
+			t.Fatalf("JSON Price=%+v, want %+v (binary parity)", rJSON.Price, rBin.Price)
+		}
+	})
+
+	t.Run("into_any", func(t *testing.T) {
+		var v any
+		if err := s.DecodeJSON([]byte(`{}`), &v); err != nil {
+			t.Fatalf("DecodeJSON({}): %v", err)
+		}
+		got, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("decoded into %T, want map[string]any", v)
+		}
+		price, ok := got["price"].(testMoney)
+		if !ok {
+			t.Fatalf("price: got %T %#v, want testMoney", got["price"], got["price"])
+		}
+		if price.Cents != 42 || price.Currency != "USD" {
+			t.Fatalf("price=%+v, want {Cents:42, Currency:USD}", price)
+		}
+	})
+
+	t.Run("into_map_string_any", func(t *testing.T) {
+		var got map[string]any
+		if err := s.DecodeJSON([]byte(`{}`), &got); err != nil {
+			t.Fatalf("DecodeJSON({}): %v", err)
+		}
+		price, ok := got["price"].(testMoney)
+		if !ok {
+			t.Fatalf("price: got %T %#v, want testMoney", got["price"], got["price"])
+		}
+		if price.Cents != 42 {
+			t.Fatalf("price.Cents=%d, want 42", price.Cents)
+		}
+	})
+
+	t.Run("partial_fill_present_and_default", func(t *testing.T) {
+		// One field present, one filled from default — both must produce
+		// the user's domain type through the custom decoder.
+		s := parseMoney(t, `{"type":"record","name":"R","fields":[
+			{"name":"price","type":{"type":"long","logicalType":"money"},"default":42},
+			{"name":"shipping","type":{"type":"long","logicalType":"money"},"default":7}
+		]}`)
+		type R struct {
+			Price    testMoney `avro:"price"`
+			Shipping testMoney `avro:"shipping"`
+		}
+		var r R
+		if err := s.DecodeJSON([]byte(`{"price":100}`), &r); err != nil {
+			t.Fatalf("DecodeJSON: %v", err)
+		}
+		if r.Price.Cents != 100 || r.Shipping.Cents != 7 {
+			t.Fatalf("got %+v, want Price.Cents=100 (present) Shipping.Cents=7 (default)", r)
+		}
+	})
+}
+
+// TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill locks in
+// that AppendEncodeJSON does NOT invoke a registered CustomType.Encode
+// for default-filled record fields — matching binary's encodeDefault
+// which is a self-contained switch with no custom-wiring hook.
+//
+// Rationale: CustomType.Encode converts user-Go-type → Avro-native; the
+// parsed default value is already in Avro-native form (json.Number /
+// []byte / string per the schema's type) and never had a Go-domain-type
+// representation, so the directional contract has nothing to apply.
+// Pre-fix, appendJSONFieldDefault routed defaults through appendAvroJSON
+// with a non-nil custom map, firing the user's Encode once per
+// default-filled custom-typed field on JSON-encode of an empty map and
+// passing a json.Number the encoder's GoType filter doesn't recognize.
+// Binary-encode of the same empty map fired the encoder zero times.
+//
+// The asymmetry is silently benign for GoType-typed encoders that
+// fallthrough via ErrSkipCustomType on a type-assertion miss, but
+// surfaces as a behavioral surprise for GoType=nil encoders used for
+// logging / validation / property-based dispatch.
+func TestRegression_EncodeJSONBypassesCustomEncoderForDefaultFill(t *testing.T) {
+	// GoType=nil so the encoder fires on every value reaching the long+
+	// money node — instrumentation pattern that surfaces the asymmetry.
+	calls := 0
+	ct := CustomType{
+		LogicalType: "money",
+		AvroType:    "long",
+		Encode: func(v any, _ *SchemaNode) (any, error) {
+			calls++
+			return v, nil
+		},
+	}
+	s, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":{"type":"long","logicalType":"money"},"default":42}
+	]}`, ct)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	calls = 0
+	if _, err := s.AppendEncode(nil, map[string]any{}); err != nil {
+		t.Fatalf("AppendEncode: %v", err)
+	}
+	binaryCalls := calls
+	if binaryCalls != 0 {
+		t.Fatalf("binary AppendEncode fired the user encoder %d times on default-fill; defaults bypass encodeDefault", binaryCalls)
+	}
+
+	calls = 0
+	if _, err := s.AppendEncodeJSON(nil, map[string]any{}); err != nil {
+		t.Fatalf("AppendEncodeJSON: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("AppendEncodeJSON fired the user encoder %d times on default-fill; must match binary (0)", calls)
+	}
+
+	// User-supplied values still fire the encoder on both paths. Lock
+	// that the bypass only applies to defaults.
+	calls = 0
+	if _, err := s.AppendEncodeJSON(nil, map[string]any{"f": int64(99)}); err != nil {
+		t.Fatalf("AppendEncodeJSON with present field: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("AppendEncodeJSON with present field fired the user encoder %d times, want 1", calls)
+	}
+}
+
+// The decode-side companion to the encoder default-fill bypass: when a reader
+// field is ABSENT from the writer and filled from its default through schema
+// resolution, the field's custom Decode must fire EXACTLY ONCE on the SAME raw
+// (logical-suppressed) Avro-native value a natural decode would feed it — on
+// both the resolved binary and resolved JSON paths. This pins resolveRecord's
+// default-fill deser construction (resolve.go): the reader field node's deser
+// is the raw, logical-suppressed deser, and the custom decoder chain is wrapped
+// onto it once. A double-wrap (custom fires twice) or feeding the callback the
+// enriched logical value (instead of the raw int64) are the two regressions
+// this guards. The ×10 transform makes "the callback fired" distinguishable
+// from a plain raw coercion that happens to coincide in value.
+func TestRegression_ResolvedDefaultFillFiresCustomDecodeOnceRaw(t *testing.T) {
+	var decodeCalls int
+	var lastIn any
+	ct := CustomType{
+		LogicalType: "money",
+		AvroType:    "long",
+		Decode: func(v any, _ *SchemaNode) (any, error) {
+			decodeCalls++
+			lastIn = v
+			return v.(int64) * 10, nil
+		},
+	}
+	reader := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":{"type":"long","logicalType":"money"},"default":42}
+	]}`, ct)
+	writer := MustParse(`{"type":"record","name":"R","fields":[]}`)
+	res, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	// Reference: a NATURAL decode of an explicit f=42 fires the custom once on
+	// the raw int64(42) (the money logical is suppressed because a CustomType
+	// matched) and yields the ×10 transform.
+	wireExplicit, err := reader.AppendEncode(nil, map[string]any{"f": int64(42)})
+	if err != nil {
+		t.Fatalf("encode explicit: %v", err)
+	}
+	decodeCalls, lastIn = 0, nil
+	var natOut map[string]any
+	if _, err := reader.Decode(wireExplicit, &natOut); err != nil {
+		t.Fatalf("natural decode: %v", err)
+	}
+	if decodeCalls != 1 {
+		t.Fatalf("natural decode fired custom %d times, want 1", decodeCalls)
+	}
+	if _, ok := lastIn.(int64); !ok {
+		t.Fatalf("natural custom got %T, want raw int64 (logical suppressed)", lastIn)
+	}
+	if natOut["f"] != int64(420) {
+		t.Fatalf("natural out[f]=%v, want int64(420) (×10 of raw 42)", natOut["f"])
+	}
+
+	// Default-fill through Resolve must match the natural reference on both
+	// resolved wire formats: writer omits f, reader fills default 42.
+	wBin, err := writer.AppendEncode(nil, map[string]any{})
+	if err != nil {
+		t.Fatalf("encode empty bin: %v", err)
+	}
+	wJSON, err := writer.AppendEncodeJSON(nil, map[string]any{})
+	if err != nil {
+		t.Fatalf("encode empty json: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		decode func() (map[string]any, error)
+	}{
+		{"binary", func() (map[string]any, error) { var m map[string]any; _, e := res.Decode(wBin, &m); return m, e }},
+		{"json", func() (map[string]any, error) { m := map[string]any{}; e := res.DecodeJSON(wJSON, &m); return m, e }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decodeCalls, lastIn = 0, nil
+			out, err := tc.decode()
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if decodeCalls != 1 {
+				t.Fatalf("default-fill fired custom Decode %d times, want exactly 1 (double-wrap or skip)", decodeCalls)
+			}
+			if _, ok := lastIn.(int64); !ok {
+				t.Fatalf("default-fill custom got %T, want raw int64 matching natural decode (logical suppressed)", lastIn)
+			}
+			if out["f"] != int64(420) {
+				t.Fatalf("default-fill out[f]=%T(%v), want int64(420) — the ×10 transform of raw default 42, identical to natural decode", out["f"], out["f"])
+			}
+		})
+	}
+}
+
+// A custom-decoded value whose decode TARGET is a recursive pointer type
+// (cyclic type graph: ctRecursivePtr's element is itself) must terminate with
+// an error, not loop forever allocating a pointer level per iteration.
+// setCustomResult's pointer walk is bounded by maxIndirectDepth — the same
+// ceiling the non-custom indirect/indirectAlloc decode path uses, which
+// already errors for this target (so registering a CustomType must not turn a
+// clean error into an unbounded loop). Watchdog so a regression fails by
+// timeout rather than hanging the suite.
+type ctRecursivePtr *ctRecursivePtr
+
+func TestRegression_CustomDecodeBoundsRecursivePointerTarget(t *testing.T) {
+	s, err := Parse(`"long"`, CustomType{
+		AvroType: "long",
+		Decode:   func(v any, _ *SchemaNode) (any, error) { return v, nil },
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	wire, err := s.Encode(int64(5))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		var p ctRecursivePtr
+		_, derr := s.Decode(wire, &p)
+		done <- derr
+	}()
+	select {
+	case derr := <-done:
+		if derr == nil {
+			t.Fatal("decode into recursive pointer target must error, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("decode into recursive pointer target did not terminate (setCustomResult pointer walk unbounded)")
+	}
+}
+
+// ---------- callback_contract_matrix_test.go ----------
+
+// User-supplied callback contract matrix: every point where the encoders
+// and decoders do arithmetic, slicing, or a state transition on a value
+// returned by USER code — text-out methods (MarshalText / AppendText)
+// beyond the plain-string positions text_appender_contract_test.go pins,
+// TextUnmarshaler error returns, and CustomType Encode/Decode returns.
+// The invariant pinned per cell: a contract-violating return NEVER
+// panics through a public API and NEVER silently corrupts sibling data —
+// detectable violations yield named errors (*SemanticError with the
+// user's error preserved in the chain), and the fall-through / zeroing
+// shapes leave every sibling value intact.
+//
+// The lax-name validator (func(string) error), IsZero() bool, and the
+// wire-side use of map keys are structurally immune: the first two
+// return no value the library computes with, and map keys are read and
+// written as raw strings on every path — pinned by
+// TestRegression_MapKeysBypassTextMethods below.
+
+// symbolTexter's MarshalText names an enum symbol (or violates the
+// contract, per mode). The enum encoders look the returned text up in
+// the symbol table, so every wrong-content shape is detectable there.
+type symbolTexter struct{ mode string }
+
+func (e symbolTexter) MarshalText() ([]byte, error) {
+	switch e.mode {
+	case "valid":
+		return []byte("B"), nil
+	case "unknown":
+		return []byte("NOPE"), nil
+	case "nil-nil":
+		return nil, nil
+	case "error":
+		return nil, errors.New("texter boom")
+	}
+	panic("bad mode " + e.mode)
+}
+
+// uuidTexter's MarshalText yields UUID text (or violations). On a
+// fixed(16)+uuid schema the 16 wire bytes are DERIVED from the returned
+// text (parseUUID), so wrong content is detectable and must reject; on a
+// string+uuid schema the encoder is string-lenient (serUUID delegates
+// non-[16]byte sources to the string encoder), so arbitrary text encodes
+// verbatim — those cells assert byte-parity with the plain-string twin
+// rather than rejection.
+type uuidTexter struct{ mode string }
+
+func (u uuidTexter) MarshalText() ([]byte, error) {
+	switch u.mode {
+	case "valid":
+		return []byte("12345678-1234-1234-1234-123456789abc"), nil
+	case "garbage":
+		return []byte("not-a-uuid"), nil
+	case "nil-nil":
+		return nil, nil
+	case "error":
+		return nil, errors.New("uuid boom")
+	}
+	panic("bad mode " + u.mode)
+}
+
+func TestMatrix_TextOutCallbackReturnShapes(t *testing.T) {
+	encode := func(s *Schema, wire string, v any) ([]byte, error) {
+		if wire == "binary" {
+			return s.Encode(v)
+		}
+		return s.EncodeJSON(v)
+	}
+
+	t.Run("enum", func(t *testing.T) {
+		s := MustParse(`{"type":"enum","name":"E","symbols":["A","B"]}`)
+		for _, wire := range []string{"binary", "json"} {
+			for _, mode := range []string{"valid", "unknown", "nil-nil", "error"} {
+				t.Run(mode+"/"+wire, func(t *testing.T) {
+					out, err := encode(s, wire, symbolTexter{mode})
+					if mode == "valid" {
+						if err != nil {
+							t.Fatalf("valid symbol via MarshalText rejected: %v", err)
+						}
+						twin, _ := encode(s, wire, "B")
+						if !bytes.Equal(out, twin) {
+							t.Errorf("text-out enum diverged from plain-string twin: % x vs % x", out, twin)
+						}
+						return
+					}
+					// unknown and nil-nil (empty text) miss the symbol table;
+					// an error return is surfaced — all as *SemanticError.
+					if err == nil {
+						t.Fatalf("%s silently encoded: % x", mode, out)
+					}
+					var se *SemanticError
+					if !errors.As(err, &se) {
+						t.Errorf("not a SemanticError: %v", err)
+					}
+					if mode == "error" && !strings.Contains(err.Error(), "texter boom") {
+						t.Errorf("user error identity lost: %v", err)
+					}
+				})
+			}
+		}
+	})
+
+	// Every INPUT ARM of the enum encoders — plain string, named string
+	// without text methods, text-out (covered above), int ordinal — must
+	// produce the same *SemanticError{AvroType: "enum"} identity on both
+	// wires for a value naming no symbol / an out-of-range ordinal. The
+	// cells run at TOP LEVEL deliberately: record positions wrap any
+	// error in a SemanticError via the field-path wrapper, which would
+	// mask a plain-error arm; top level has no wrapper to hide behind.
+	t.Run("enum-arm-identity", func(t *testing.T) {
+		s := MustParse(`{"type":"enum","name":"E","symbols":["A","B"]}`)
+		type bare string // named string kind, no text methods
+		arms := []struct {
+			name string
+			val  any
+		}{
+			{"plain-string", "NOPE"},
+			{"named-string", bare("NOPE")},
+			{"int-ordinal", int64(99)},
+		}
+		for _, arm := range arms {
+			for _, wire := range []string{"binary", "json"} {
+				t.Run(arm.name+"/"+wire, func(t *testing.T) {
+					var err error
+					if wire == "binary" {
+						_, err = s.Encode(arm.val)
+					} else {
+						_, err = s.EncodeJSON(arm.val)
+					}
+					if err == nil {
+						t.Fatal("non-symbol value accepted")
+					}
+					var se *SemanticError
+					if !errors.As(err, &se) {
+						t.Fatalf("no SemanticError identity: %v", err)
+					}
+					if se.AvroType != "enum" {
+						t.Errorf("AvroType = %q, want enum: %v", se.AvroType, err)
+					}
+				})
+			}
+		}
+	})
+
+	// Sibling user-value failures with the same two-wire contract: a
+	// wrong-length source for fixed, and a source map missing a
+	// defaultless record field. Binary rejects both as *SemanticError
+	// (serSize's shape check; the record loop's "missing key"
+	// construction); JSON encode must carry the identical identity.
+	t.Run("fixed-size-mismatch-identity", func(t *testing.T) {
+		s := MustParse(`{"type":"fixed","name":"F","size":4}`)
+		for _, wire := range []string{"binary", "json"} {
+			t.Run(wire, func(t *testing.T) {
+				var err error
+				if wire == "binary" {
+					_, err = s.Encode([]byte("toolongvalue"))
+				} else {
+					_, err = s.EncodeJSON([]byte("toolongvalue"))
+				}
+				if err == nil {
+					t.Fatal("wrong-length fixed source accepted")
+				}
+				var se *SemanticError
+				if !errors.As(err, &se) {
+					t.Fatalf("no SemanticError identity: %v", err)
+				}
+				if se.AvroType != "fixed" {
+					t.Errorf("AvroType = %q, want fixed: %v", se.AvroType, err)
+				}
+			})
+		}
+	})
+	t.Run("missing-required-field-identity", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+		for _, wire := range []string{"binary", "json"} {
+			t.Run(wire, func(t *testing.T) {
+				var err error
+				if wire == "binary" {
+					_, err = s.Encode(map[string]any{})
+				} else {
+					_, err = s.EncodeJSON(map[string]any{})
+				}
+				if err == nil {
+					t.Fatal("missing defaultless field accepted")
+				}
+				var se *SemanticError
+				if !errors.As(err, &se) {
+					t.Fatalf("no SemanticError identity: %v", err)
+				}
+				if se.Field != "a" {
+					t.Errorf("Field = %q, want a: %v", se.Field, err)
+				}
+			})
+		}
+	})
+
+	// The remaining encode user-value failures already AGREE across the
+	// two wires — nil-for-non-nullable is plain on both (its own family),
+	// union no-match and numeric-content rejects are SemanticError on
+	// both. Pin the agreement (identity equality, not any specific shape)
+	// so neither wire drifts alone.
+	t.Run("cross-wire-identity-agreement", func(t *testing.T) {
+		identityOf := func(err error) string {
+			if err == nil {
+				return "nil"
+			}
+			var se *SemanticError
+			if errors.As(err, &se) {
+				return "semantic:" + se.AvroType
+			}
+			return "plain"
+		}
+		rows := []struct {
+			name   string
+			schema string
+			val    any
+		}{
+			{"nil-non-nullable", `"long"`, (*int64)(nil)},
+			{"union-no-match", `["null","long"]`, "zz"},
+			{"float-bad-string", `"float"`, "abc"},
+		}
+		for _, row := range rows {
+			t.Run(row.name, func(t *testing.T) {
+				s := MustParse(row.schema)
+				_, berr := s.Encode(row.val)
+				_, jerr := s.EncodeJSON(row.val)
+				if berr == nil || jerr == nil {
+					t.Fatalf("both wires must reject: bin=%v json=%v", berr, jerr)
+				}
+				if identityOf(berr) != identityOf(jerr) {
+					t.Errorf("error identity diverged: binary=%s (%v) vs json=%s (%v)",
+						identityOf(berr), berr, identityOf(jerr), jerr)
+				}
+			})
+		}
+	})
+
+	// The encode-side unknown-symbol reject is a USER-VALUE failure and
+	// carries *SemanticError identity on both wires (asserted above). The
+	// decode-side counterparts — a binary ordinal outside the symbol
+	// table, a JSON string naming no symbol — are WIRE-CONTENT failures,
+	// plain errors on both wires like the union-index and map-key-length
+	// rejects. Pin the two families' boundary so neither side drifts.
+	t.Run("enum-decode-content-errors-stay-plain", func(t *testing.T) {
+		s := MustParse(`{"type":"enum","name":"E","symbols":["A","B"]}`)
+		var got string
+		_, err := s.Decode([]byte{0x08}, &got) // ordinal 4: out of range
+		if err == nil {
+			t.Fatal("out-of-range ordinal accepted")
+		}
+		var se *SemanticError
+		if errors.As(err, &se) {
+			t.Errorf("binary wire-content error gained SemanticError identity: %v", err)
+		}
+		if err := s.DecodeJSON([]byte(`"NOPE"`), &got); err == nil {
+			t.Fatal("unknown wire symbol accepted")
+		} else if errors.As(err, &se) {
+			t.Errorf("JSON wire-content error gained SemanticError identity: %v", err)
+		}
+	})
+
+	t.Run("fixed-uuid", func(t *testing.T) {
+		s := MustParse(`{"type":"fixed","name":"F","size":16,"logicalType":"uuid"}`)
+		for _, wire := range []string{"binary", "json"} {
+			for _, mode := range []string{"valid", "garbage", "nil-nil", "error"} {
+				t.Run(mode+"/"+wire, func(t *testing.T) {
+					out, err := encode(s, wire, uuidTexter{mode})
+					if mode == "valid" {
+						if err != nil {
+							t.Fatalf("valid uuid text rejected: %v", err)
+						}
+						twin, _ := encode(s, wire, "12345678-1234-1234-1234-123456789abc")
+						if !bytes.Equal(out, twin) {
+							t.Errorf("diverged from plain-string twin: % x vs % x", out, twin)
+						}
+						return
+					}
+					if err == nil {
+						t.Fatalf("%s silently encoded: % x", mode, out)
+					}
+					if mode == "error" && !strings.Contains(err.Error(), "uuid boom") {
+						t.Errorf("user error identity lost: %v", err)
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("string-uuid-lenient", func(t *testing.T) {
+		s := MustParse(`{"type":"string","logicalType":"uuid"}`)
+		twinFor := map[string]string{"garbage": "not-a-uuid", "nil-nil": ""}
+		for _, wire := range []string{"binary", "json"} {
+			for mode, twinStr := range twinFor {
+				t.Run(mode+"/"+wire, func(t *testing.T) {
+					out, err := encode(s, wire, uuidTexter{mode})
+					if err != nil {
+						t.Fatalf("string+uuid is string-lenient for non-[16]byte sources: %v", err)
+					}
+					twin, _ := encode(s, wire, twinStr)
+					if !bytes.Equal(out, twin) {
+						t.Errorf("text-out diverged from plain-string twin: % x vs % x", out, twin)
+					}
+				})
+			}
+			t.Run("error/"+wire, func(t *testing.T) {
+				if _, err := encode(s, wire, uuidTexter{"error"}); err == nil ||
+					!strings.Contains(err.Error(), "uuid boom") {
+					t.Fatalf("user error not surfaced with identity: %v", err)
+				}
+			})
+		}
+	})
+
+	// A MarshalText-only type (no AppendText) on a plain string schema:
+	// the returned bytes are materialized and copied, so nil text with a
+	// nil error is simply the empty string; an error is surfaced.
+	t.Run("string-marshaler-only", func(t *testing.T) {
+		s := MustParse(`"string"`)
+		for _, wire := range []string{"binary", "json"} {
+			out, err := encode(s, wire, symbolTexter{"nil-nil"})
+			if err != nil {
+				t.Fatalf("nil text + nil error must encode the empty string: %v", err)
+			}
+			twin, _ := encode(s, wire, "")
+			if !bytes.Equal(out, twin) {
+				t.Errorf("nil-text encode diverged from empty-string twin: % x vs % x", out, twin)
+			}
+			if _, err := encode(s, wire, symbolTexter{"error"}); err == nil ||
+				!strings.Contains(err.Error(), "texter boom") {
+				t.Fatalf("user error not surfaced with identity: %v", err)
+			}
+		}
+	})
+}
+
+// failingUnmarshaler errors on any text not prefixed "ok". Its error
+// must surface — wrapped so the user's identity is preserved — from
+// every text-shaped decode position on both wire formats.
+type failingUnmarshaler struct{ S string }
+
+func (f *failingUnmarshaler) UnmarshalText(b []byte) error {
+	if strings.HasPrefix(string(b), "ok") {
+		f.S = string(b)
+		return nil
+	}
+	return errors.New("unmarshal boom")
+}
+
+func TestMatrix_TextUnmarshalerReturnShapes(t *testing.T) {
+	strS := MustParse(`"string"`)
+	recS := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"string"},{"name":"b","type":"string"},{"name":"c","type":"string"}]}`)
+	arrS := MustParse(`{"type":"array","items":"string"}`)
+	mapS := MustParse(`{"type":"map","values":"string"}`)
+	enumS := MustParse(`{"type":"enum","name":"E","symbols":["A","B"]}`)
+	uuidS := MustParse(`{"type":"string","logicalType":"uuid"}`)
+
+	type recTarget struct {
+		A string             `avro:"a"`
+		B failingUnmarshaler `avro:"b"`
+		C string             `avro:"c"`
+	}
+
+	t.Run("error-surfaces", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			decode func() error
+		}{
+			{"top/binary", func() error {
+				wire, _ := strS.Encode("bad")
+				var f failingUnmarshaler
+				_, err := strS.Decode(wire, &f)
+				return err
+			}},
+			{"top/json", func() error {
+				var f failingUnmarshaler
+				return strS.DecodeJSON([]byte(`"bad"`), &f)
+			}},
+			{"record-mid/binary", func() error {
+				wire, _ := recS.Encode(map[string]any{"a": "okA", "b": "bad", "c": "okC"})
+				var tg recTarget
+				_, err := recS.Decode(wire, &tg)
+				return err
+			}},
+			{"record-mid/json", func() error {
+				var tg recTarget
+				return recS.DecodeJSON([]byte(`{"a":"okA","b":"bad","c":"okC"}`), &tg)
+			}},
+			{"array-item/binary", func() error {
+				wire, _ := arrS.Encode([]string{"bad"})
+				var tg []failingUnmarshaler
+				_, err := arrS.Decode(wire, &tg)
+				return err
+			}},
+			{"map-value/binary", func() error {
+				wire, _ := mapS.Encode(map[string]string{"k": "bad"})
+				var tg map[string]failingUnmarshaler
+				_, err := mapS.Decode(wire, &tg)
+				return err
+			}},
+			{"enum/binary", func() error {
+				wire, _ := enumS.Encode("B")
+				var f failingUnmarshaler
+				_, err := enumS.Decode(wire, &f)
+				return err
+			}},
+			{"uuid-string/binary", func() error {
+				wire, _ := uuidS.Encode("12345678-1234-1234-1234-123456789abc")
+				var f failingUnmarshaler
+				_, err := uuidS.Decode(wire, &f)
+				return err
+			}},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				err := c.decode()
+				if err == nil {
+					t.Fatal("UnmarshalText error swallowed")
+				}
+				if !strings.Contains(err.Error(), "unmarshal boom") {
+					t.Errorf("user error identity lost: %v", err)
+				}
+			})
+		}
+	})
+
+	// Success control: the method fires and the value lands.
+	t.Run("control", func(t *testing.T) {
+		wire, _ := strS.Encode("okYes")
+		var f failingUnmarshaler
+		if _, err := strS.Decode(wire, &f); err != nil || f.S != "okYes" {
+			t.Fatalf("control: %v %q", err, f.S)
+		}
+	})
+}
+
+// contractLong is the GoType for the CustomType return-shape matrices.
+type contractLong int64
+
+func customEncodeReturning(shape string) CustomType {
+	return CustomType{
+		AvroType: "long",
+		GoType:   reflect.TypeFor[contractLong](),
+		Encode: func(v any, sn *SchemaNode) (any, error) {
+			switch shape {
+			case "ok":
+				return int64(v.(contractLong)) * 10, nil
+			case "untyped-nil":
+				return nil, nil
+			case "typed-nil":
+				return (*int64)(nil), nil
+			case "wrong-type":
+				return "zz", nil
+			case "err-with-value":
+				return int64(42), errors.New("enc boom")
+			case "skip-wrapped":
+				return nil, fmt.Errorf("wrapped: %w", ErrSkipCustomType)
+			}
+			panic("bad shape " + shape)
+		},
+	}
+}
+
+// TestMatrix_CustomTypeEncodeReturnShapes crosses CustomType.Encode
+// return shapes with encode positions on both wire formats. The
+// contract: an untyped nil return is the named "returned nil" reject; a
+// typed-nil or wrong-typed return re-enters the underlying serializer,
+// whose type validation names it; a non-nil error is fatal with the
+// value discarded and the user's identity preserved; an
+// ErrSkipCustomType return (wrapped counts — the chain matches with
+// errors.Is) falls through to the built-in encode of the original
+// value. No shape panics, and sibling values already encoded are
+// unaffected (an error aborts the whole Encode; success shapes place
+// only their own node).
+func TestMatrix_CustomTypeEncodeReturnShapes(t *testing.T) {
+	positions := []struct {
+		name   string
+		schema string
+		val    func() any
+		twin   func() any // plain value with contractLong(5)'s wire stand-in int64(5)
+	}{
+		{"top", `"long"`,
+			func() any { return contractLong(5) },
+			func() any { return int64(5) }},
+		{"record-mid", `{"type":"record","name":"R","fields":[
+			{"name":"a","type":"string"},{"name":"b","type":"long"},{"name":"c","type":"string"}]}`,
+			func() any { return map[string]any{"a": "AA", "b": contractLong(5), "c": "CC"} },
+			func() any { return map[string]any{"a": "AA", "b": int64(5), "c": "CC"} }},
+		{"array-item", `{"type":"array","items":"long"}`,
+			func() any { return []any{contractLong(5)} },
+			func() any { return []any{int64(5)} }},
+		{"map-value", `{"type":"map","values":"long"}`,
+			func() any { return map[string]any{"k": contractLong(5)} },
+			func() any { return map[string]any{"k": int64(5)} }},
+		{"union-branch", `["null","long"]`,
+			func() any { return contractLong(5) },
+			func() any { return int64(5) }},
+	}
+	shapes := []string{"ok", "untyped-nil", "typed-nil", "wrong-type", "err-with-value", "skip-wrapped"}
+
+	for _, pos := range positions {
+		plain := MustParse(pos.schema)
+		for _, shape := range shapes {
+			s, err := Parse(pos.schema, customEncodeReturning(shape))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, wire := range []string{"binary", "json"} {
+				t.Run(pos.name+"/"+shape+"/"+wire, func(t *testing.T) {
+					encode := func(sc *Schema, v any) ([]byte, error) {
+						if wire == "binary" {
+							return sc.Encode(v)
+						}
+						return sc.EncodeJSON(v)
+					}
+					out, err := encode(s, pos.val())
+					switch shape {
+					case "ok":
+						if err != nil {
+							t.Fatalf("transforming encode rejected: %v", err)
+						}
+						twin, _ := encode(plain, func() any {
+							switch pos.name {
+							case "record-mid":
+								return map[string]any{"a": "AA", "b": int64(50), "c": "CC"}
+							case "array-item":
+								return []any{int64(50)}
+							case "map-value":
+								return map[string]any{"k": int64(50)}
+							default:
+								return int64(50)
+							}
+						}())
+						if !bytes.Equal(out, twin) {
+							t.Errorf("transformed encode != plain x10 twin: % x vs % x", out, twin)
+						}
+					case "skip-wrapped":
+						if err != nil {
+							t.Fatalf("wrapped ErrSkipCustomType not honored: %v", err)
+						}
+						twin, _ := encode(plain, pos.twin())
+						if !bytes.Equal(out, twin) {
+							t.Errorf("fall-through encode != plain twin: % x vs % x", out, twin)
+						}
+					case "untyped-nil":
+						if err == nil {
+							t.Fatalf("untyped-nil return silently encoded: % x", out)
+						}
+						if !strings.Contains(err.Error(), "custom type encoder returned nil") {
+							t.Errorf("want the named returned-nil reject, got: %v", err)
+						}
+					case "err-with-value":
+						if err == nil {
+							t.Fatalf("error swallowed, value encoded: % x", out)
+						}
+						if !strings.Contains(err.Error(), "enc boom") {
+							t.Errorf("user error identity lost: %v", err)
+						}
+					case "typed-nil", "wrong-type":
+						// The returned value re-enters the underlying
+						// serializer; its type validation names the shape
+						// (nil for a non-nullable long / string vs long).
+						if err == nil {
+							t.Fatalf("%s return silently encoded: % x", shape, out)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func customDecodeReturning(shape string) CustomType {
+	return CustomType{
+		AvroType: "long",
+		Decode: func(v any, sn *SchemaNode) (any, error) {
+			switch shape {
+			case "ok":
+				return contractLong(v.(int64) * 10), nil
+			case "nil-nil":
+				return nil, nil
+			case "wrong-type":
+				return "zz", nil
+			case "err-with-value":
+				return contractLong(9), errors.New("dec boom")
+			case "skip-wrapped":
+				return nil, fmt.Errorf("wrapped: %w", ErrSkipCustomType)
+			}
+			panic("bad shape " + shape)
+		},
+	}
+}
+
+// TestMatrix_CustomTypeDecodeReturnShapes crosses CustomType.Decode
+// return shapes with a typed record target on both wire formats. The
+// contract: a nil result zeroes the target field; a result whose type
+// is not assignable to the target is the named *SemanticError (never a
+// reflect.Set panic); a non-nil error is fatal with the value discarded
+// and the user's identity preserved; a wrapped ErrSkipCustomType falls
+// through to the value a no-custom decode produces. Whenever Decode
+// returns nil error, sibling fields hold their decoded values — a
+// violating callback can never corrupt data beside its own node.
+func TestMatrix_CustomTypeDecodeReturnShapes(t *testing.T) {
+	const recSchema = `{"type":"record","name":"R","fields":[
+		{"name":"a","type":"string"},{"name":"b","type":"long"},{"name":"c","type":"string"}]}`
+	plain := MustParse(recSchema)
+	wire, err := plain.Encode(map[string]any{"a": "AA", "b": int64(5), "c": "CC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonWire := []byte(`{"a":"AA","b":5,"c":"CC"}`)
+
+	type target struct {
+		A string       `avro:"a"`
+		B contractLong `avro:"b"`
+		C string       `avro:"c"`
+	}
+
+	for _, shape := range []string{"ok", "nil-nil", "wrong-type", "err-with-value", "skip-wrapped"} {
+		s, err := Parse(recSchema, customDecodeReturning(shape))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, wk := range []string{"binary", "json"} {
+			t.Run(shape+"/"+wk, func(t *testing.T) {
+				var tg target
+				var derr error
+				if wk == "binary" {
+					_, derr = s.Decode(wire, &tg)
+				} else {
+					derr = s.DecodeJSON(jsonWire, &tg)
+				}
+				siblingsIntact := func() {
+					if tg.A != "AA" || tg.C != "CC" {
+						t.Errorf("sibling fields corrupted: %+v", tg)
+					}
+				}
+				switch shape {
+				case "ok":
+					if derr != nil || tg.B != 50 {
+						t.Fatalf("transforming decode: err=%v B=%d", derr, tg.B)
+					}
+					siblingsIntact()
+				case "nil-nil":
+					if derr != nil {
+						t.Fatalf("nil result must zero, not error: %v", derr)
+					}
+					if tg.B != 0 {
+						t.Errorf("nil result must zero the field: %d", tg.B)
+					}
+					siblingsIntact()
+				case "wrong-type":
+					if derr == nil {
+						t.Fatalf("unassignable result silently placed: %+v", tg)
+					}
+					var se *SemanticError
+					if !errors.As(derr, &se) {
+						t.Errorf("not a SemanticError: %v", derr)
+					}
+				case "err-with-value":
+					if derr == nil {
+						t.Fatalf("error swallowed: %+v", tg)
+					}
+					if !strings.Contains(derr.Error(), "dec boom") {
+						t.Errorf("user error identity lost: %v", derr)
+					}
+				case "skip-wrapped":
+					if derr != nil {
+						t.Fatalf("wrapped ErrSkipCustomType not honored: %v", derr)
+					}
+					if tg.B != 5 {
+						t.Errorf("fall-through must match no-custom decode: %d", tg.B)
+					}
+					siblingsIntact()
+				}
+			})
+		}
+	}
+
+	// An interface target accepts any result type — the callback's value
+	// is the user's own choice there, placed verbatim.
+	t.Run("wrong-type/any-target", func(t *testing.T) {
+		s, _ := Parse(`"long"`, customDecodeReturning("wrong-type"))
+		w2, _ := MustParse(`"long"`).Encode(int64(5))
+		var v any
+		if _, err := s.Decode(w2, &v); err != nil {
+			t.Fatalf("interface target must accept any result: %v", err)
+		}
+		if v != "zz" {
+			t.Errorf("callback result not placed verbatim: %v", v)
+		}
+	})
+}
+
+// rawKey carries transforming text methods that the map-key paths must
+// NOT consult: Avro map keys are already string-kind, and all four
+// paths (binary/JSON x encode/decode) read and write them as raw
+// strings. If any single path started consulting text methods, the
+// transform here would break the raw-key agreement across paths.
+type rawKey string
+
+func (k rawKey) MarshalText() ([]byte, error)  { return []byte(strings.ToUpper(string(k))), nil }
+func (k *rawKey) UnmarshalText(b []byte) error { *k = rawKey(strings.ToLower(string(b))); return nil }
+
+func TestRegression_MapKeysBypassTextMethods(t *testing.T) {
+	s := MustParse(`{"type":"map","values":"long"}`)
+	in := map[rawKey]int64{"Key": 7}
+
+	bin, err := s.Encode(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(bin, []byte("Key")) {
+		t.Errorf("binary map key not the raw string: % x", bin)
+	}
+	var back map[rawKey]int64
+	if _, err := s.Decode(bin, &back); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := back["Key"]; !ok {
+		t.Errorf("binary decode transformed the key: %v", back)
+	}
+
+	jout, err := s.EncodeJSON(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(jout, []byte(`"Key"`)) {
+		t.Errorf("JSON map key not the raw string: %s", jout)
+	}
+	var jback map[rawKey]int64
+	if err := s.DecodeJSON(jout, &jback); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := jback["Key"]; !ok {
+		t.Errorf("JSON decode transformed the key: %v", jback)
+	}
+}
+
+// TestRegression_SchemaNodePropsUnmarshalableValueNamedError pins that a
+// hand-built SchemaNode whose Props holds a value the schema rebuild
+// cannot marshal (a channel) surfaces as a named error from
+// SchemaNode.Schema, not a panic.
+func TestRegression_SchemaNodePropsUnmarshalableValueNamedError(t *testing.T) {
+	sn := &SchemaNode{Type: "record", Name: "R",
+		Fields: []SchemaField{{Name: "f", Type: SchemaNode{Type: "int"}}},
+		Props:  map[string]any{"x": make(chan int)},
+	}
+	if _, err := sn.Schema(); err == nil {
+		t.Fatal("unmarshalable Props value silently accepted")
+	}
+}
+
+// ---------- hidden_state_census_test.go ----------
+
+// Hidden state on a user-composable public struct is a correctness hazard:
+// a caller who sets an exported field expects that field to decide the
+// outcome, so unexported state must never silently win over it. A struct is
+// "user-composable" only if it has exported fields a caller sets; the rest
+// carry unexported state that no caller can contradict.
+//
+// This census freezes the enumeration. When a new exported struct gains both
+// exported fields and unexported state, this test fails and forces the same
+// analysis rather than letting the hazard land unexamined.
+
+type myMillis int64
+
+func fieldSplit(t reflect.Type) (exported, hidden []string) {
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if f.IsExported() {
+			exported = append(exported, f.Name)
+		} else {
+			hidden = append(hidden, f.Name)
+		}
+	}
+	return
+}
+
+func TestInvariant_HiddenStateOnPublicStructs(t *testing.T) {
+	// Every exported struct type in the package (and the two in ocf are
+	// covered by the same reasoning: zero exported fields).
+	types := []reflect.Type{
+		reflect.TypeFor[Schema](),
+		reflect.TypeFor[SchemaNode](),
+		reflect.TypeFor[SchemaField](),
+		reflect.TypeFor[SchemaCache](),
+		reflect.TypeFor[CustomType](),
+		reflect.TypeFor[SemanticError](),
+		reflect.TypeFor[CompatibilityError](),
+		reflect.TypeFor[ShortBufferError](),
+		reflect.TypeFor[Duration](),
+	}
+	// The ONLY types where a caller-set exported field coexists with
+	// unexported state. Each is justified below and pinned by a behavior
+	// test; adding a name here requires doing the same.
+	composableWithHiddenState := map[string]string{
+		"CustomType": "needsAvroType is fail-loud only: it can make Parse REJECT (when AvroType is empty), never silently substitute a value — pinned by TestInvariant_CustomTypeHiddenStateFailsLoud",
+		"SchemaNode": "refTarget (with refNS, the scope it was resolved in — the two are one stamp and are only meaningful together) is consulted only while the name resolver still binds the node's exported Type to it (nodeRefTargetAgrees), so an edited Type always wins — pinned by TestNodeRefSchema_EditedTypeIgnoresStaleStamp. " +
+			"present is PRESENCE-ONLY and value-transparent: one bit per attribute whose body can be its own destination's zero, deciding whether such an attribute gets written at all, never what any attribute says — so the value a caller sets is the value that comes back for every input, pinned by TestInvariant_PresenceStateIsValueTransparent",
+		"SchemaField": "docSet is the field-level twin of SchemaNode's, and carries the same proof: presence-only and value-transparent — pinned by TestInvariant_PresenceStateIsValueTransparent",
+	}
+	for _, ty := range types {
+		exported, hidden := fieldSplit(ty)
+		if len(hidden) == 0 || len(exported) == 0 {
+			continue // not user-composable, or no hidden state: no hazard
+		}
+		why, ok := composableWithHiddenState[ty.Name()]
+		if !ok {
+			t.Errorf("%s has BOTH exported fields (%v) and unexported state (%v), so hidden state could silently override a caller's edit. Prove it cannot, add it to composableWithHiddenState with the reason, and pin the behavior.",
+				ty.Name(), exported, hidden)
+			continue
+		}
+		t.Logf("%-12s exported=%d hidden=%v — %s", ty.Name(), len(exported), hidden, why)
+	}
+	// The census must not silently go vacuous if the types list rots.
+	if len(types) < 9 {
+		t.Fatal("types list shrank; the census only covers what it lists")
+	}
+}
+
+// TestInvariant_CustomTypeHiddenStateFailsLoud executes the claim that
+// CustomType's one unexported field cannot silently win: NewCustomType sets
+// needsAvroType, and a caller who copies that value and clears the exported
+// AvroType gets a loud parse error rather than a stale conversion.
+func TestInvariant_CustomTypeHiddenStateFailsLoud(t *testing.T) {
+	ct := NewCustomType("",
+		func(v myMillis, _ *SchemaNode) (int64, error) { return int64(v), nil },
+		func(v int64, _ *SchemaNode) (myMillis, error) { return myMillis(v), nil },
+	)
+	if ct.AvroType == "" {
+		// NewCustomType infers the Avro type from the Go types; if it did
+		// not set one, the "cleared" case below is not distinguishable.
+		t.Skip("NewCustomType did not infer an AvroType for this pair")
+	}
+	cleared := ct // struct copy: carries needsAvroType
+	cleared.AvroType = ""
+	_, err := Parse(`"string"`, cleared)
+	if err == nil {
+		t.Fatal("clearing AvroType on a NewCustomType value parsed silently; the hidden needsAvroType must make this fail loudly")
+	}
+	if !strings.Contains(err.Error(), "unsupported Avro native type") {
+		t.Fatalf("unexpected error %v; want the loud unsupported-Avro-native-type reject", err)
+	}
+	t.Logf("fails loud as required: %v", err)
+}
+
+// TestInvariant_PresenceStateIsValueTransparent executes the claim that the
+// presence flags cannot win over a caller.
+//
+// They differ in kind from refTarget, which selects a DEFINITION and so could
+// substitute one schema for another. A presence flag decides one thing only:
+// whether an attribute whose value is the field's own zero is written at all.
+// It never chooses a value, so for every value a caller can set, the value
+// that comes back is the value they set — with the flag set and with it
+// clear. That is the property proved here, over both a node extracted from a
+// parse (flags set) and the same node hand-composed (flags clear), including
+// the case a caller cannot otherwise reach: clearing the field to "".
+//
+// The wire, the canonical form and the fingerprint must be identical across
+// the pair as well: presence is a metadata-fidelity question, and none of
+// those surfaces carries doc or logicalType at all.
+func TestInvariant_PresenceStateIsValueTransparent(t *testing.T) {
+	// extracted carries every presence flag set; composed carries none.
+	extracted := MustParse(`{"type":"record","name":"R","doc":"","fields":[` +
+		`{"name":"f","type":{"type":"int","logicalType":""},"doc":""}]}`).Root()
+	if !extracted.present.has(presDoc) {
+		t.Fatal("the extracted node did not record a written doc; the control is broken")
+	}
+	if !extracted.Fields[0].docSet {
+		t.Fatal("the extracted field did not record a written doc; the control is broken")
+	}
+	if !extracted.Fields[0].Type.present.has(presLogicalType) {
+		t.Fatal("the extracted type did not record a written logicalType; the control is broken")
+	}
+
+	for _, docValue := range []string{"", "x", "a longer doc string"} {
+		for _, ltValue := range []string{"", "date", "not-a-logical"} {
+			withState := extracted
+			withState.Fields = append([]SchemaField(nil), extracted.Fields...)
+			withState.Fields[0].Type = extracted.Fields[0].Type
+			withState.Doc = docValue
+			withState.Fields[0].Doc = docValue
+			withState.Fields[0].Type.LogicalType = ltValue
+
+			clean := SchemaNode{Type: "record", Name: "R", Doc: docValue,
+				Fields: []SchemaField{{Name: "f", Doc: docValue,
+					Type: SchemaNode{Type: "int", LogicalType: ltValue}}}}
+
+			for label, n := range map[string]SchemaNode{"extracted": *withState, "composed": clean} {
+				s, err := n.Schema()
+				if err != nil {
+					t.Fatalf("%s doc=%q lt=%q: Schema(): %v", label, docValue, ltValue, err)
+				}
+				back := s.Root()
+				if back.Doc != docValue {
+					t.Errorf("%s: node Doc set to %q came back %q — hidden state changed a caller's value",
+						label, docValue, back.Doc)
+				}
+				if back.Fields[0].Doc != docValue {
+					t.Errorf("%s: field Doc set to %q came back %q", label, docValue, back.Fields[0].Doc)
+				}
+				if back.Fields[0].Type.LogicalType != ltValue {
+					t.Errorf("%s: LogicalType set to %q came back %q",
+						label, ltValue, back.Fields[0].Type.LogicalType)
+				}
+			}
+
+			// The surfaces presence must not reach.
+			sa, err := withState.Schema()
+			if err != nil {
+				t.Fatalf("extracted Schema(): %v", err)
+			}
+			sb, err := clean.Schema()
+			if err != nil {
+				t.Fatalf("composed Schema(): %v", err)
+			}
+			if string(sa.Canonical()) != string(sb.Canonical()) {
+				t.Errorf("presence state changed the canonical form:\n %s\n %s", sa.Canonical(), sb.Canonical())
+			}
+			if len(sa.Canonical()) == 0 {
+				t.Fatal("canonical form came back empty, so the comparison proved nothing")
+			}
+			fa, fb := sa.Fingerprint(NewRabin()), sb.Fingerprint(NewRabin())
+			if string(fa) != string(fb) {
+				t.Errorf("presence state changed the fingerprint: %x vs %x", fa, fb)
+			}
+			val := map[string]any{"f": 0}
+			ea, err := sa.AppendEncode(nil, val)
+			if err != nil {
+				t.Fatalf("extracted encode: %v", err)
+			}
+			eb, err := sb.AppendEncode(nil, val)
+			if err != nil {
+				t.Fatalf("composed encode: %v", err)
+			}
+			if string(ea) != string(eb) {
+				t.Errorf("presence state changed the wire: %x vs %x", ea, eb)
+			}
+		}
+	}
 }
