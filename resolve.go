@@ -187,9 +187,6 @@ func resolveNode(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, e
 	pair := nodePair{r, w}
 	if n, ok := ctx.seen[pair]; ok {
 		if n == nil {
-			// Cycle detected: create a placeholder with a
-			// trampoline deser that will forward to the real
-			// deserfn once resolution completes.
 			n = &schemaNode{}
 			n.deser = func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 				return n.deser(src, v, sl)
@@ -205,8 +202,6 @@ func resolveNode(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, e
 		return nil, err
 	}
 
-	// If a placeholder was created during cycle detection, copy the
-	// resolved contents into it so the trampoline now calls the real deser.
 	if placeholder := ctx.seen[pair]; placeholder != nil && placeholder != resolved {
 		*placeholder = *resolved
 		resolved = placeholder
@@ -216,20 +211,16 @@ func resolveNode(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, e
 }
 
 func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
-	// Writer union: unwrap if reader is not a union.
 	if w.kind == "union" && r.kind != "union" {
 		return resolveWriterUnion(r, w, path, ctx)
 	}
-	// Reader union: wrap.
 	if r.kind == "union" && w.kind != "union" {
 		return resolveReaderUnion(r, w, path, ctx)
 	}
-	// Both unions.
 	if r.kind == "union" && w.kind == "union" {
 		return resolveUnionUnion(r, w, path, ctx)
 	}
 
-	// Same kind.
 	if r.kind == w.kind {
 		switch r.kind {
 		case "record":
@@ -243,12 +234,10 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 		case "fixed":
 			return maybeWrapResolvedNode(r, ctx), nil
 		default:
-			// Same primitive: use reader directly.
 			return maybeWrapResolvedNode(r, ctx), nil
 		}
 	}
 
-	// Type promotion.
 	pd := promotionDeser(w.kind, r.kind)
 	if pd != nil {
 		deser := deserfn(pd)
@@ -311,11 +300,9 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 	readerMatched := make([]bool, len(r.fields))
 	matchedByWriterName := make([]string, len(r.fields))
 
-	// For each writer field (in wire order), find matching reader field.
 	for _, wf := range w.fields {
 		ri := readerByName.index(wf.name)
 		if ri < 0 {
-			// Writer field not in reader: skip it.
 			rr.wireOps = append(rr.wireOps, wireOp{
 				readerIdx: -1,
 				skip:      buildSkip(wf.node, ctx.minBytes),
@@ -356,7 +343,6 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 		})
 	}
 
-	// For unmatched reader fields, encode defaults.
 	for i, rf := range r.fields {
 		if readerMatched[i] {
 			continue
@@ -485,7 +471,6 @@ func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) 
 	var err error
 	elem := reflect.New(anyType).Elem()
 
-	// Process wire fields.
 	for _, op := range rr.wireOps {
 		if op.readerIdx < 0 {
 			if src, err = op.skip(src, sl); err != nil {
@@ -590,7 +575,6 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 }
 
 func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
-	// Build writer symbol index → reader symbol index mapping.
 	readerIdx := make(map[string]int, len(r.symbols))
 	for i, s := range r.symbols {
 		readerIdx[s] = i
@@ -606,7 +590,6 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 			}
 		} else {
 			identity = false
-			// Writer symbol not in reader: use reader default.
 			if !r.hasEnumDef {
 				return nil, &CompatibilityError{
 					Path:       r.name,
@@ -827,7 +810,6 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 	}
 	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
 	deser := du.deser
-	// Null-union optimization.
 	if len(w.branches) == 2 && w.branches[0].kind == "null" {
 		deser = deserNullUnion(du)
 	}
