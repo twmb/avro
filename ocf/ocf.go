@@ -262,7 +262,8 @@ func WithBlockBytes(n int) WriterOpt { return optBlockBytes{n} }
 func WithMetadata(m map[string][]byte) WriterOpt { return optMetadata{m} }
 
 // WithSyncMarker sets the 16-byte sync marker written between blocks. By
-// default a random marker is generated.
+// default a random marker is generated. This is primarily useful for
+// deterministic test output.
 func WithSyncMarker(sync [16]byte) WriterOpt { return optSyncMarker{sync} }
 
 // WithSchema overrides the schema JSON written to the file header. By default
