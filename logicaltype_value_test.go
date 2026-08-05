@@ -52,11 +52,11 @@ func TestMatrix_LogicalTypeValueTypes(t *testing.T) {
 	t.Parallel()
 
 	type cell struct {
-		name       string
-		val        string // raw JSON for the logicalType value
-		wantField  string // expected SchemaNode.LogicalType
-		wantProps  any    // expected Props["logicalType"] (nil = absent)
-		wireInert  bool   // int encode must match the logical-free twin
+		name      string
+		val       string // raw JSON for the logicalType value
+		wantField string // expected SchemaNode.LogicalType
+		wantProps any    // expected Props["logicalType"] (nil = absent)
+		wireInert bool   // int encode must match the logical-free twin
 	}
 	cells := []cell{
 		{"valid_string", `"date"`, "date", nil, false},

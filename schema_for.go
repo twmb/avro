@@ -1383,7 +1383,6 @@ func appendTypeAliasValues(s map[string]any, aliases []string) {
 	}
 }
 
-// inferType returns the Avro schema for a Go type.
 // baseTypeForLogical returns the underlying Avro type required by the
 // given logical type per the Avro 1.12 spec. Used by SchemaFor's
 // inferType to produce schemas that validateLogical (schema.go) will
@@ -1402,6 +1401,8 @@ func baseTypeForLogical(logical, fallback string) string {
 	return fallback
 }
 
+// inferType returns the Avro schema for a Go type.
+//
 // ptrChain is the number of CONSECUTIVE pointer levels already unwrapped to
 // reach t, reset to 0 at every record-field / array-item / map-value boundary
 // (the codec calls indirect/indirectAlloc fresh on each such leaf value). The
@@ -1549,12 +1550,10 @@ func inferType(t reflect.Type, logical string, decimal [2]int, namespace string,
 		}, nil
 
 	case jsonNumberType:
-		// json.Number's Kind() is reflect.String, so the Kind switch below
-		// would emit an Avro "string" — but the package's json.Number policy
-		// is numeric-only: string/bytes/fixed/enum reject it on both encode
-		// and decode (doc.go "Encoding from JSON input"). Emitting the one
-		// Avro type the codec is guaranteed to reject for this Go type is a
-		// build-accepts/encode-rejects deferred failure; reject up front,
+		// The jsonNumberType exclusion, at schema inference: the Kind switch
+		// below would emit an Avro "string", the one type the codec is
+		// guaranteed to reject for this Go type — a build-accepts/
+		// encode-rejects deferred failure. Reject up front instead,
 		// matching the uuid/decimal/time strictness. (A registered CustomType
 		// for json.Number still works — the loop above runs first; a NAMED
 		// alias `type N json.Number` is a distinct reflect.Type that the

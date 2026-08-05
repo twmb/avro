@@ -337,8 +337,8 @@ func parse(schema string, b *builder) (*Schema, error) {
 // the builder would accept; it short-circuits input deeper than the builder
 // accepts (and deeper than json's own ~10000 nesting cap) in one O(input)
 // pass. Parse itself is O(n) — see parseSchemaTree and canonicalBytes — so
-// this is a cheap early-reject, no longer the load-bearing DoS defense it was
-// when the unmarshal and canonical marshal were quadratic.
+// this is a cheap early-reject rather than the defense the DoS bound rests
+// on, as it was when the unmarshal and canonical marshal were quadratic.
 const maxSchemaJSONDepth = maxDepth * 4
 
 // checkSchemaNestingDepth reports an error if schema's JSON nests deeper than
@@ -377,10 +377,6 @@ func checkSchemaNestingDepth(schema string) error {
 	return nil
 }
 
-// Canonical returns the Parsing Canonical Form of the schema, stripping
-// doc, aliases, defaults, and other non-essential attributes. The result
-// is deterministic and matches Java's reference output byte-for-byte,
-// so [Schema.Fingerprint] values are interoperable across implementations.
 // canonicalFirstOccurrence rewrites the parse-time canon tree so each
 // named type's full definition is emitted at its FIRST occurrence in the
 // field-walk order, with bare (full)name references afterward — the rule
@@ -535,6 +531,10 @@ func rewriteCanonObj(o *aobject, ns string, defs map[string]*aobject, shortCount
 	return &no
 }
 
+// Canonical returns the Parsing Canonical Form of the schema, stripping
+// doc, aliases, defaults, and other non-essential attributes. The result
+// is deterministic and matches Java's reference output byte-for-byte,
+// so [Schema.Fingerprint] values are interoperable across implementations.
 func (s *Schema) Canonical() []byte {
 	// Single-pass writer emitting raw UTF-8 strings per the PCF [STRINGS]
 	// rule (see canonicalBytes). O(n) over the schema, vs the former
@@ -664,8 +664,8 @@ type afield struct {
 	hasDefault bool
 }
 
-// afieldKeys that signal a complex type definition at the field level
-// (the "flat" field format accepted by linkedin/goavro).
+// afieldComplexKeys are the keys that signal a complex type definition at
+// the field level (the "flat" field format accepted by linkedin/goavro).
 var afieldComplexKeys = map[string]string{
 	"symbols": "enum",
 	"items":   "array",
@@ -674,37 +674,6 @@ var afieldComplexKeys = map[string]string{
 	"size":    "fixed",
 }
 
-// liftFieldLogicalIntoType moves a field-level logicalType annotation (with
-// optional precision/scale for the decimal case) into the field's type
-// definition, so the rest of the parser sees the canonical nested form.
-// The form
-//
-//	{"name":"ts","type":"long","logicalType":"timestamp-millis"}
-//	{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}
-//
-// is documented as a common user error in AVRO-2015 / AVRO-3014; Apache
-// Avro's official parser (Schema.java:1871-1877) detects and warns but
-// does not lift, leaving the union bare. fastavro / hamba / linkedin-
-// goavro preserve it as a field property only without applying it to
-// any branch. The form is widely emitted by hand-written .avsc files,
-// older Java tooling, and tutorial code (Confluent's production
-// kafka-connect-avro-converter does NOT emit it — it puts logicalType on
-// the type object, producing canonical nested form). Twmb performs the
-// lift so these in-the-wild schemas round-trip correctly. Wire format
-// is identical (raw long varint); only the parsed schema's Go-type
-// interpretation differs.
-//
-// The on-wire encoding is identical to
-//
-//	{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}
-//	{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}
-//
-// — only the JSON layout differs.
-//
-// Conflict resolution: an annotation already present inside the type
-// definition wins (closer-to-the-type wins). After lifting, the
-// field-level copies are cleared so canonical re-emit does not duplicate
-// them.
 // liftTarget returns the aschema a field-level logicalType annotation lands
 // on, or nil when the field carries none or nothing can receive it.
 //
@@ -762,6 +731,35 @@ func (f *afield) liftEffectiveLogical() (kind, logical string, ok bool) {
 	return "", "", false
 }
 
+// liftFieldLogicalIntoType moves a field-level logicalType annotation (with
+// optional precision/scale for the decimal case) into the field's type
+// definition, so the rest of the parser sees the canonical nested form.
+// The form
+//
+//	{"name":"ts","type":"long","logicalType":"timestamp-millis"}
+//	{"name":"ts","type":["null","long"],"logicalType":"timestamp-millis"}
+//
+// is documented as a common user error in AVRO-2015 / AVRO-3014; Apache
+// Avro's official parser (Schema.java:1871-1877) detects and warns but
+// does not lift, leaving the union bare. fastavro / hamba / linkedin-
+// goavro preserve it as a field property only without applying it to
+// any branch. The form is widely emitted by hand-written .avsc files,
+// older Java tooling, and tutorial code (Confluent's production
+// kafka-connect-avro-converter does NOT emit it — it puts logicalType on
+// the type object, producing canonical nested form). Twmb performs the
+// lift so these in-the-wild schemas round-trip correctly.
+//
+// The on-wire encoding is identical to
+//
+//	{"name":"ts","type":{"type":"long","logicalType":"timestamp-millis"}}
+//	{"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-millis"}]}
+//
+// — only the JSON layout differs.
+//
+// Conflict resolution: an annotation already present inside the type
+// definition wins (closer-to-the-type wins). After lifting, the
+// field-level copies are cleared so canonical re-emit does not duplicate
+// them.
 func (f *afield) liftFieldLogicalIntoType() {
 	// The target comes from the SHARED navigation, so the lift and the
 	// consume verdict can never address different types. It is the FIRST
@@ -1381,13 +1379,6 @@ func (b *builder) registerNamed(name string, nt *namedType) {
 	}
 }
 
-// tryAssignNamedRef resolves a named-type reference, possibly with
-// namespace qualification against parentName. Returns true on hit (with
-// b.ser / b.deser / b.meta / b.node populated and, when setCanon is
-// true, b.canon set to the resolved name). Shared by buildPrimitive's
-// bare-string named-ref path and buildComplex's wrapped-form
-// {"type":"Name"} path so the rejectCachedRefIfCustomTypeWouldMatch
-// gate and the namespace-qualified retry agree.
 // leadingDotName reports whether name spells the explicit
 // null-namespace escape — a single leading dot with no other dot —
 // and returns the fullname it denotes: ".x" is the null-namespace
@@ -1464,6 +1455,13 @@ func (b *builder) resolveNamedRef(name, parentName string) (string, *namedType) 
 	return "", nil
 }
 
+// tryAssignNamedRef resolves a named-type reference, possibly with
+// namespace qualification against parentName. Returns true on hit (with
+// b.ser / b.deser / b.meta / b.node populated and, when setCanon is
+// true, b.canon set to the resolved name). Shared by buildPrimitive's
+// bare-string named-ref path and buildComplex's wrapped-form
+// {"type":"Name"} path so the rejectCachedRefIfCustomTypeWouldMatch
+// gate and the namespace-qualified retry agree.
 func (b *builder) tryAssignNamedRef(name, parentName string, setCanon bool) (bool, error) {
 	resolved, nt := b.resolveNamedRef(name, parentName)
 	if nt == nil {
@@ -1835,10 +1833,8 @@ func (b *builder) applyCustomTypes(node *schemaNode) error {
 		b.ser = makeCustomSer(wiring.encode, node.ser)
 	}
 
-	// jsonAppliesLogical narrows suppression to nodes whose JSON decoder
-	// actually transforms the raw value (a logical decodeKind would apply):
-	// only those need a JSON-side suppress-wrapper to mirror the binary raw
-	// decode. See buildCustomWiring for the suppression contract.
+	// See buildCustomWiring for what this narrowing buys and the
+	// suppression contract behind it.
 	jsonAppliesLogical := wiring.suppressLogical && jsonDecodeAppliesLogical(node)
 	if len(wiring.decoders) > 0 {
 		b.deser = wrapDeserWithCustomDecoders(node.deser, wiring.decoders, wiring.sn)
@@ -2059,14 +2055,10 @@ func (b *builder) buildPrimitive(parentName string, s *aschema) error {
 		}
 		return nil
 	}
-	// Check if this is a named type reference (record, enum, fixed).
-	// setCanon=false: the buildPrimitive path's canon was already set to
-	// s.primitive above; only the namespace-qualified retry needs to
-	// rewrite it, which tryAssignNamedRef handles internally when given
-	// setCanon=true. To keep the bare-name canon as written (only the
-	// qualified retry rewrites it), we tell the helper
-	// to setCanon for both branches and let the bare path overwrite with
-	// the identical name.
+	// A named type reference (record, enum, fixed). setCanon is passed for
+	// both branches: only the namespace-qualified retry needs to rewrite
+	// the canon, and the bare path overwrites it with the identical name
+	// already set above.
 	if found, err := b.tryAssignNamedRef(s.primitive, parentName, true); err != nil || found {
 		return err
 	}
@@ -3004,8 +2996,6 @@ func (b *builder) buildComplex(parentName string, s *aschema) error {
 		b.deser = dr.deser
 		b.meta = fieldMeta{avroType: "record", serRecord: sr, deserRecord: dr}
 
-		// Register early so self-referencing fields (e.g. array
-		// items, map values) can resolve the type by name.
 		nd := &schemaNode{
 			kind:        "record",
 			name:        o.Name,
@@ -4097,22 +4087,6 @@ func normalizeJSONNumber(n json.Number) any {
 	return n
 }
 
-// defaultAsInt32 / defaultAsInt64 / defaultAsFloat extract a numeric
-// default. After unmarshalDefault, a JSON number arrives as json.Number
-// (full precision); a few callers also pass float64 (e.g. round-tripped
-// through coerceDefault). Float-defaulted-from-string is accepted for
-// float / double (Java parser leniency).
-//
-// All three are precision-aware:
-//   - defaultAsInt32 / defaultAsInt64 reject overflow via
-//     parseInt{32,64}Lenient (which uses boundedRatFromString for
-//     arbitrary-precision parsing).
-//   - defaultAsFloat rejects integer-form magnitudes exceeding the
-//     target's mantissa precision (1<<24 for float, 1<<53 for double)
-//     so the schema's declared default is reachable at runtime via
-//     the equivalent json.Number / typed-int encode arms, which apply
-//     the same predicate.
-
 // numericDefault extracts a typed integer default. After
 // unmarshalDefault, a JSON number arrives as json.Number (full precision);
 // callers may also pass float64 (e.g. round-tripped through coerceDefault).
@@ -4562,9 +4536,6 @@ func validateDefault(val any, node *schemaNode) error {
 	return err
 }
 
-// validateLeaf is the per-node visit for validateDefault: primitive
-// kind validation, plus container-shape checks + per-field coercion
-// (walkDefault handles the actual recursion).
 // defaultObjectShape asserts val is a non-null JSON object for an Avro record
 // or map default, returning the canonical "expected object for <kind> default"
 // error. Shared by the parse-time validator (validateLeaf) and the wire encoder
@@ -4595,6 +4566,9 @@ func defaultArrayShape(val any) ([]any, error) {
 	return arr, nil
 }
 
+// validateLeaf is the per-node visit for validateDefault: primitive
+// kind validation, plus container-shape checks + per-field coercion
+// (walkDefault handles the actual recursion).
 func validateLeaf(val any, node *schemaNode) (any, error) {
 	switch node.kind {
 	case "null":

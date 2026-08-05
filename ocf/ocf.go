@@ -138,12 +138,11 @@ type BoundedDecompressor interface {
 	DecompressBounded(src []byte, max int64) ([]byte, error)
 }
 
-// NopCloser returns a Codec that wraps c but has a no-op Close method. This
-// is useful when sharing a single codec across multiple writers or readers
-// so that an individual [Writer.Close] or [Reader.Close] — or a constructor
-// that fails and releases the codec it was handed — does not release shared
-// resources. The caller is responsible for closing the underlying codec when
-// it is no longer needed.
+// NopCloser returns a Codec that wraps c but has a no-op Close method, so
+// that an individual [Writer.Close] or [Reader.Close] — or a constructor
+// that fails and releases the codec it was handed — does not release
+// resources shared with another writer or reader. The caller is responsible
+// for closing the underlying codec when it is no longer needed.
 //
 // If c implements [BoundedDecompressor], so does the returned Codec (the
 // reader's decompression bound is forwarded to c), so wrapping a built-in codec
@@ -231,11 +230,8 @@ func (optSchemaOpts) writerOpt() {}
 //
 // The consequence for a codec used more than once: a caller that shares one
 // codec across several writers, readers, or files must give it a Close that
-// returns nil, or wrap it in [NopCloser]. That was already true — an adopted
-// codec is closed by [Writer.Close] and [Reader.Close], so a shared codec passed
-// bare was already closed out from under the next user — and it now holds for a
-// codec that is offered and declined as well, which makes the rule the same one
-// everywhere instead of one that depends on whether the offer was taken.
+// returns nil, or wrap it in [NopCloser]. The rule does not depend on whether
+// the offer was taken.
 //
 // A nil codec is ignored, on every constructor, in both spellings: a nil
 // Codec, and a non-nil Codec holding a nil pointer. Such an offer is never
@@ -1069,7 +1065,6 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 		return nil, err
 	}
 
-	// Resolve codec.
 	codecName := "null"
 	if c, ok := meta["avro.codec"]; ok {
 		codecName = string(c)
@@ -1098,8 +1093,8 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 		maxDecompressed: maxDecompressed,
 	}
 
-	// If a reader-schema callback was provided, invoke it now that the
-	// header has been parsed so it can inspect writer schema and metadata.
+	// After the header parse, so the callback can inspect the writer schema
+	// and metadata through rd.
 	if readerSchemaFn != nil {
 		var chosen *avro.Schema
 		chosen, err = readerSchemaFn(rd)
@@ -1109,7 +1104,6 @@ func NewReader(r io.Reader, opts ...ReaderOpt) (_ *Reader, err error) {
 		readerSchema = chosen
 	}
 
-	// Apply schema evolution if a reader schema was provided.
 	if readerSchema != nil {
 		var resolved *avro.Schema
 		resolved, err = avro.Resolve(schema, readerSchema)
@@ -1340,8 +1334,10 @@ const maxOCFZeroByteSlack = 4 << 10
 
 // Memory bounds (security note).
 //
-// Two independent limits guard a block: WithMaxBlockBytes bounds the
+// Two independent limits guard a block. WithMaxBlockBytes bounds the
 // *compressed* size read off the wire (default 64 MiB), and
+// WithMaxDecompressedBlockBytes bounds what that block inflates to.
+//
 // Each built-in codec implements [BoundedDecompressor]: the reader passes its
 // WithMaxDecompressedBlockBytes cap to DecompressBounded, which refuses an
 // over-cap block BEFORE allocating it (a decompression bomb otherwise inflates

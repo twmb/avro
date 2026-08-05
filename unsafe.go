@@ -202,8 +202,6 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 // is reached on child edges that bypass deserRecord.deser, so it keeps
 // its own bump — it is the sole record-node entry on those paths).
 func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *slab) ([]byte, error) {
-	// No sl.depth++/guard here: deserRecord.deser (the only caller) already
-	// bumped and guarded for this exact record node. See the doc comment.
 	base := v.Addr().UnsafePointer()
 	var err error
 	for i := range fast.fields {
@@ -1813,7 +1811,6 @@ func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minIt
 						}
 					}
 				}
-				// Deserialize each element.
 				fast := rec.fastFor(innerType)
 				useFast := fast != nil && fast.allFast
 				var err error

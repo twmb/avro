@@ -515,8 +515,6 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 			tagged := name != ""
 			inline, oz := parseTagOptions(parts[1:])
 
-			// inline: recurse into the struct's fields like an
-			// anonymous embed.
 			if inline {
 				ft := sf.Type
 				if ft.Kind() == reflect.Pointer {
@@ -541,8 +539,6 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 	}
 	collect(t, nil, make(map[reflect.Type]bool))
 
-	// Build name -> index map. Tagged fields win over untagged, and
-	// shallower fields win over deeper ones.
 	type entry struct {
 		index    []int
 		tagged   bool
@@ -552,7 +548,6 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 	ambiguous := make(map[string][2]string) // name -> the two colliding Go field names
 	for _, f := range fields {
 		if existing, ok := m[f.name]; ok {
-			// Tagged beats untagged (a tiebreaker, so not ambiguous).
 			if f.tagged && !existing.tagged {
 				m[f.name] = entry{f.index, f.tagged, f.omitzero}
 				delete(ambiguous, f.name)
@@ -561,7 +556,6 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 			if !f.tagged && existing.tagged {
 				continue
 			}
-			// Same tagged status: shallower (shorter index) wins (a tiebreaker).
 			if len(f.index) < len(existing.index) {
 				m[f.name] = entry{f.index, f.tagged, f.omitzero}
 				delete(ambiguous, f.name)
@@ -569,11 +563,11 @@ func typeFieldMapping(fieldNames []string, cache *sync.Map, t reflect.Type) (*ca
 			}
 			if len(f.index) == len(existing.index) {
 				// Equal depth, same tagged status, no tiebreaker: AMBIGUOUS.
-				// Go makes the selector a compile error; encoding/json silently
-				// drops the field. We DEFER the error to lookup rather than
-				// rejecting here, so a coincidental collision on a field the
-				// schema never references (e.g. two embedded library structs
-				// that happen to share a name) does not break the whole struct
+				// encoding/json silently drops such a field. We DEFER the
+				// error to lookup rather than rejecting here, so a
+				// coincidental collision on a field the schema never
+				// references (e.g. two embedded library structs that
+				// happen to share a name) does not break the whole struct
 				// — but a schema field that DOES resolve here errors loudly
 				// (not a silent first-win or drop). SchemaFor's collectFields
 				// rejects eagerly because it must emit every field; the runtime

@@ -1584,7 +1584,6 @@ func (ctx *jsonDecoder) decodeUnion(v reflect.Value, node *schemaNode) error {
 }
 
 func (ctx *jsonDecoder) decodeUnionObject(v reflect.Value, node *schemaNode) error {
-	// Save position for backtracking.
 	savedPos := ctx.scanner.pos
 	// Preserve the deepest concrete decode error from a matched branch
 	// so a failed tagged interpretation surfaces the real reason (e.g.

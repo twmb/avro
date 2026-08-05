@@ -12,8 +12,7 @@ import (
 
 // SchemaCache accumulates named types across multiple [SchemaCache.Parse]
 // calls, allowing schemas to reference types defined in previously parsed
-// schemas. This is useful for Schema Registry integrations where schemas
-// have references to other schemas.
+// schemas — the shape a Schema Registry's inter-schema references take.
 //
 // Schemas must be parsed in dependency order: referenced types must be
 // parsed before the schemas that reference them.
@@ -113,8 +112,6 @@ func (c *SchemaCache) Parse(schema string, opts ...SchemaOpt) (*Schema, error) {
 	hasLaxNames := b.checkName != nil
 	skipDedup := hasCustomTypes || hasLaxNames
 
-	// Skip dedup when custom types or lax names are in play: both produce
-	// a compiled schema that the bare schema string alone doesn't identify.
 	h := sha256.Sum256([]byte(schema))
 	if !skipDedup {
 		if s, ok := c.dedup[h]; ok {

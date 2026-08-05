@@ -102,7 +102,7 @@ func timeToLocalTimestampNanos(t time.Time) (int64, error) {
 // typo (subtracts `nanos - 1_000_000` where the analogous millis/micros
 // branches subtract `scale` — `nanos - 1_000_000_000` for nanos), which
 // would corrupt every negative-second instant by ~999ms. Java's
-// Java's millis/micros conversions are correct; twmb implements the
+// millis/micros conversions are correct; twmb implements the
 // spec-correct "nanoseconds from epoch" (sec*1e9 + nsec) via
 // timeToTimestampScaled — the same formula as Java's correct millis/micros
 // branches. (This is not corroborated by the other Go-adjacent impls:

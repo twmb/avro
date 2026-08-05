@@ -442,7 +442,7 @@ func TestMatrix_LogicalStringCarrierRoundTripContract(t *testing.T) {
 
 	type sample struct {
 		name    string
-		val     any  // string or []byte
+		val     any // string or []byte
 		isBytes bool
 		reject  bool // encode MUST reject; otherwise MUST round-trip exactly
 	}

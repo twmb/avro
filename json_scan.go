@@ -517,7 +517,6 @@ func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 				return err
 			}
 			i += 4
-			// Handle UTF-16 surrogate pairs.
 			if r >= 0xD800 && r <= 0xDBFF && i+2 < len(raw) && raw[i+1] == '\\' && raw[i+2] == 'u' {
 				if i+6 < len(raw) {
 					r2, err := parseHex4(raw[i+3 : i+7])

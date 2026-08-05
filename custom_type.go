@@ -13,12 +13,10 @@ import (
 var ErrSkipCustomType = errors.New("avro: skip custom type")
 
 // CustomType defines a custom conversion between a Go type and an Avro
-// type. Use this when you need full control over the type mapping — for
-// example, to map a custom Go struct to/from an Avro fixed or record, to
-// handle complex Avro types (records, arrays, maps) as backing types, or
-// to dispatch on schema properties rather than logical type names. For
-// simpler cases where the backing type is a primitive, prefer
-// [NewCustomType] which infers the wiring from type parameters.
+// type. [NewCustomType] covers the primitive-backing-type case with the
+// wiring inferred from its type parameters; this struct is the general
+// form, and the only one that reaches records, fixed types, and
+// property-based dispatch.
 //
 // Pass to [Parse] or [SchemaFor] as a [SchemaOpt].
 //
@@ -38,10 +36,8 @@ var ErrSkipCustomType = errors.New("avro: skip custom type")
 // A matching CustomType replaces the built-in logical type
 // deserializer. Among user registrations, first match wins.
 //
-// For custom types backed by complex Avro types (records, arrays,
-// maps), use the struct form directly — the Encode function can return
-// map[string]any, []any, etc. [NewCustomType] is limited to primitive
-// backing types.
+// Backed by a complex Avro type, the Encode function returns
+// map[string]any, []any, and so on.
 type CustomType struct {
 	// LogicalType narrows matching to schema nodes with this logicalType.
 	LogicalType string
@@ -150,7 +146,7 @@ func (CustomType) schemaOpt() {}
 // WithCustomType registers a custom type conversion for use with
 // [Parse], [SchemaCache.Parse], or [SchemaFor]. [CustomType] and
 // [NewCustomType] both satisfy [SchemaOpt] directly, so this wrapper
-// is optional — it exists for discoverability.
+// is optional.
 func WithCustomType(ct CustomType) SchemaOpt { return ct }
 
 // matches returns true if ct's criteria match the given schema node.
@@ -165,9 +161,7 @@ func (ct CustomType) matches(node *schemaNode) bool {
 }
 
 // NewCustomType returns a type-safe [CustomType] for the common case of
-// mapping a custom Go type to/from a primitive Avro type. For example,
-// use this to decode Avro longs into a domain-specific ID type, or to
-// encode a Money type as Avro bytes with a "decimal" logical type.
+// mapping a custom Go type to/from a primitive Avro type.
 //
 // G is the custom Go type (e.g. Money). A is the Avro-native Go type:
 // int32 for int, int64 for long, float32 for float, float64 for double,
@@ -259,9 +253,7 @@ func inferAvroType(t reflect.Type) string {
 }
 
 // setCustomResult sets a custom type conversion result into the target
-// reflect.Value. For interface targets (e.g. *any), we set the interface
-// directly. For pointer targets, we allocate and set the pointee. For
-// concrete struct targets, we set the value directly. Returns a
+// reflect.Value, allocating pointees along the way. Returns a
 // SemanticError if the result type is not assignable to the final target
 // (rather than letting reflect.Value.Set panic).
 func setCustomResult(v reflect.Value, result any, avroType string) error {

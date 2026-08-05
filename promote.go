@@ -27,8 +27,7 @@ var promotions = map[string]deserfn{
 	"bytes>string": promoteBytesToString,
 }
 
-// promoteRead wraps a wire read + per-target setter into a deserfn. Each
-// promote* function below is a one-liner using this helper.
+// promoteRead wraps a wire read + per-target setter into a deserfn.
 func promoteRead[Wire any](
 	read func([]byte) (Wire, []byte, error),
 	apply func(reflect.Value, Wire) error,

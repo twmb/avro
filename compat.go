@@ -51,21 +51,17 @@ func checkCompat(r, w *schemaNode, path string, seen map[nodePair]bool) error {
 	}
 	seen[pair] = true
 
-	// Writer is union: every branch must match something in the reader.
 	if w.kind == "union" {
 		return checkWriterUnion(r, w, path, seen)
 	}
-	// Reader is union: at least one branch must match the writer.
 	if r.kind == "union" {
 		return checkReaderUnion(r, w, path, seen)
 	}
 
-	// Same kind: recurse for complex types.
 	if r.kind == w.kind {
 		return checkSameKind(r, w, path, seen)
 	}
 
-	// Different kinds: check promotion.
 	if promotionDeser(w.kind, r.kind) != nil {
 		return nil
 	}
@@ -150,7 +146,6 @@ func checkSameKind(r, w *schemaNode, path string, seen map[nodePair]bool) error 
 				"fixed sizes differ")
 		}
 	}
-	// Decimal logical types must match on precision and scale.
 	if r.logical == "decimal" && w.logical == "decimal" {
 		if r.precision != w.precision || r.scale != w.scale {
 			return compatErr(path,
@@ -163,7 +158,6 @@ func checkSameKind(r, w *schemaNode, path string, seen map[nodePair]bool) error 
 }
 
 func checkRecordCompat(r, w *schemaNode, path string, seen map[nodePair]bool) error {
-	// Build writer field lookup by name.
 	writerFields := make(map[string]*fieldNode, len(w.fields))
 	for i := range w.fields {
 		writerFields[w.fields[i].name] = &w.fields[i]
@@ -172,7 +166,6 @@ func checkRecordCompat(r, w *schemaNode, path string, seen map[nodePair]bool) er
 	for _, rf := range r.fields {
 		wf := findWriterField(rf, writerFields)
 		if wf == nil {
-			// Reader field not in writer: must have default.
 			if !rf.hasDefault {
 				return &CompatibilityError{
 					Path:       fieldPath(path, rf.name),

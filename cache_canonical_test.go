@@ -605,9 +605,9 @@ func TestRegression_CacheSpliceWrappedRefProps(t *testing.T) {
 	t.Parallel()
 	def := `{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`
 	for name, use := range map[string]string{
-		"field_pos":  `{"type":"R","foo":1}`,
-		"union_pos":  `["null",{"type":"R","foo":1}]`,
-		"items_pos":  `{"type":"array","items":{"type":"R","foo":1}}`,
+		"field_pos": `{"type":"R","foo":1}`,
+		"union_pos": `["null",{"type":"R","foo":1}]`,
+		"items_pos": `{"type":"array","items":{"type":"R","foo":1}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			var c avro.SchemaCache
