@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/twmb/avro"
 )
 
@@ -58,7 +59,23 @@ func FuzzOCFReader(f *testing.F) {
 	f.Add([]byte{'O', 'b', 'j', 1})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		r, err := NewReader(bytes.NewReader(data))
+		// Keep each execution fast and bounded so the reader LOGIC (header,
+		// block envelope, codec, count handling) is what gets explored — not
+		// throughput on a large input. Two bounds, both about fuzzer hygiene,
+		// not the reader's contract:
+		//   - cap the input size: a multi-MB OCF decodes proportionally many
+		//     records (correct, not a bug), but the coordinator's minimization
+		//     of such an interesting input re-runs it dozens of times, freezing
+		//     the fuzzer for tens of seconds and tripping the -fuzztime
+		//     shutdown deadline (the large-input-minimization class).
+		//   - a tight WithMaxDecompressedBlockBytes: bounds per-exec decode
+		//     work AND exercises the decompression-amplification rejection
+		//     (an inflate past this cap is rejected; pinned at the API level
+		//     by TestRegression_OCFDecompressionAmplificationBounded).
+		if len(data) > 256<<10 {
+			return
+		}
+		r, err := NewReader(bytes.NewReader(data), WithMaxDecompressedBlockBytes(1<<20))
 		if err != nil {
 			return
 		}
@@ -273,11 +290,13 @@ func FuzzOCFBlockEnvelope(f *testing.F) {
 		blk = append(blk, trailer[:]...)
 		f.Add(blk, syncMode)
 	}
-	// count=0 + good sync — should be clean EOF (post-fix).
+	// count=0 + good sync: a validated empty block is skipped; at the
+	// tail (as here) the next count read hits real EOF — clean end.
 	addCase(0, 0, nil, 0)
-	// count=0 + corrupt sync — should error (the new fix).
+	// count=0 + corrupt sync must error, not read as a clean end.
 	addCase(0, 0, nil, 1)
-	// count=0 with non-zero size and good sync — valid empty block.
+	// count=0 with non-zero size and good sync — valid empty block; the
+	// payload is consumed but never decompressed.
 	addCase(0, 5, []byte("hello"), 0)
 	// Negative count.
 	addCase(-1, 0, nil, 0)
@@ -308,7 +327,7 @@ func FuzzOCFBlockEnvelope(f *testing.F) {
 		// only asserts no panic / no hang. A bounded loop guards
 		// against any reader bug that could yield infinite zero-
 		// length blocks.
-		for i := 0; i < 10000; i++ {
+		for range 10000 {
 			var v any
 			if err := r.Decode(&v); err != nil {
 				break
@@ -335,11 +354,27 @@ func FuzzOCFWriterReaderCodecCycle(f *testing.F) {
 	}
 	// nil entry → default codec (null). Public codec constructors don't
 	// include a NullCodec wrapper; the default already exercises it.
+	//
+	// The zstd codec uses minimum-footprint options: the fuzz constructs and
+	// closes a codec PER EXECUTION (that lifecycle is the fuzzed surface), and
+	// default-option zstd costs ~573µs + 1.64MB of garbage per cycle (vs
+	// ~126µs + 0.30MB with these options; deflate is ~478µs + 1.26MB with no
+	// shrink knob). At fuzz rates across parallel workers that allocation
+	// churn keeps the GC saturated on small CI runners — exec rates slide and
+	// a starved worker can miss the coordinator's shutdown deadline at the
+	// -fuzztime boundary, failing the run with "context deadline exceeded"
+	// and no crasher input. The options only shrink buffers/effort; the
+	// construct→compress→decompress→Close surface is unchanged.
 	codecs := []func() WriterOpt{
 		nil,
 		func() WriterOpt { return WithCodec(DeflateCodec(1)) },
 		func() WriterOpt { return WithCodec(SnappyCodec()) },
-		func() WriterOpt { return WithCodec(MustZstdCodec(nil, nil)) },
+		func() WriterOpt {
+			return WithCodec(MustZstdCodec(
+				[]zstd.EOption{zstd.WithWindowSize(zstd.MinWindowSize), zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithLowerEncoderMem(true)},
+				[]zstd.DOption{zstd.WithDecoderLowmem(true)},
+			))
+		},
 	}
 
 	f.Add(uint8(0), uint8(0), uint16(0))
@@ -381,8 +416,9 @@ func FuzzOCFWriterReaderCodecCycle(f *testing.F) {
 				break
 			}
 		}
-		// Close is the new path: codec.Close must run even after a
-		// failed Encode poisons w.err. The fuzz cannot directly
+		// Close is the new path: codec.Close must run even when the
+		// writer is in a poisoned w.err state (I/O or compression
+		// errors; value errors recover). The fuzz cannot directly
 		// inject a poison, but it can drive enough variation that
 		// codec resource leaks would surface in -race + leak
 		// detector setups.

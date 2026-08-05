@@ -195,3 +195,88 @@ func TestSingleObjectFingerprintMatchesSpec(t *testing.T) {
 		t.Fatalf("SOE fingerprint does not match LE CRC-64-AVRO: got %x, want %x", got, want)
 	}
 }
+
+// TestRegression_ResolvedDecodeSingleObjectAcceptsWriterFingerprint pins
+// that a schema returned by Resolve(writer, reader) accepts SOE wire bytes
+// bearing the WRITER schema's fingerprint. The SOE wire format puts the
+// schema-that-produced-the-bytes' fingerprint on the wire (Avro spec),
+// which is the writer; the resolved schema is the right thing to decode
+// those bytes into a reader-shaped Go value. Java's BinaryMessageDecoder
+// dispatches the wire fingerprint via a writer-fingerprint→codec registry;
+// twmb stores the writer fingerprint on the resolved Schema so its
+// DecodeSingleObject accepts both writer and reader fingerprints.
+func TestRegression_ResolvedDecodeSingleObjectAcceptsWriterFingerprint(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"},
+		{"name":"b","type":"string"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[
+		{"name":"a","type":"int"}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Writer produces SOE wire bearing writer.soe.
+	wire, err := writer.AppendSingleObject(nil, map[string]any{
+		"a": int32(7),
+		"b": "hello",
+	})
+	if err != nil {
+		t.Fatalf("writer.AppendSingleObject: %v", err)
+	}
+	if [10]byte(wire[:10]) != writer.soe {
+		t.Fatalf("wire header is not writer.soe")
+	}
+
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	// Resolved schema must decode writer-fingerprinted wire (primary case).
+	var got map[string]any
+	rest, err := resolved.DecodeSingleObject(wire, &got)
+	if err != nil {
+		t.Fatalf("resolved.DecodeSingleObject(writer wire): %v", err)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("unexpected remaining bytes: %d", len(rest))
+	}
+	if got["a"] != int32(7) {
+		t.Fatalf("a: got %v, want int32(7)", got["a"])
+	}
+	if _, present := got["b"]; present {
+		t.Fatalf("b: expected projected out by reader, got %v", got["b"])
+	}
+
+	// A completely unrelated schema's fingerprint is still rejected.
+	other := MustParse(`{"type":"record","name":"Other","fields":[{"name":"x","type":"int"}]}`)
+	otherWire, err := other.AppendSingleObject(nil, map[string]any{"x": int32(1)})
+	if err != nil {
+		t.Fatalf("other.AppendSingleObject: %v", err)
+	}
+	if _, err := resolved.DecodeSingleObject(otherWire, &got); err == nil {
+		t.Fatalf("resolved.DecodeSingleObject(unrelated wire) accepted; want fingerprint mismatch")
+	}
+}
+
+// TestRegression_NonResolvedDecodeSingleObjectRejectsForeignFingerprint
+// pins that a non-resolved schema continues to reject SOE wire whose
+// fingerprint doesn't match its own — the zero-valued writerSoe must
+// never silently accept arbitrary input.
+func TestRegression_NonResolvedDecodeSingleObjectRejectsForeignFingerprint(t *testing.T) {
+	a := MustParse(`{"type":"record","name":"A","fields":[{"name":"f","type":"int"}]}`)
+	b := MustParse(`{"type":"record","name":"B","fields":[{"name":"f","type":"int"}]}`)
+	wire, err := a.AppendSingleObject(nil, map[string]any{"f": int32(1)})
+	if err != nil {
+		t.Fatalf("a.AppendSingleObject: %v", err)
+	}
+	var got map[string]any
+	if _, err := b.DecodeSingleObject(wire, &got); err == nil {
+		t.Fatalf("b.DecodeSingleObject(a-wire) accepted; want fingerprint mismatch")
+	}
+}

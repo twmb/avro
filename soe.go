@@ -12,16 +12,35 @@ func (s *Schema) AppendSingleObject(dst []byte, v any, opts ...Opt) ([]byte, err
 	return s.AppendEncode(dst, v, opts...)
 }
 
-// DecodeSingleObject decodes a Single Object Encoding message into v after
-// verifying the magic and fingerprint match this schema.
-func (s *Schema) DecodeSingleObject(data []byte, v any, opts ...Opt) ([]byte, error) {
+// validateSOEHeader checks that data has the 10-byte Single Object Encoding
+// header (length + magic bytes). Shared by DecodeSingleObject and
+// SingleObjectFingerprint so the two paths agree on the error shapes.
+func validateSOEHeader(data []byte) error {
 	if len(data) < 10 {
-		return nil, fmt.Errorf("avro: single-object encoding too short: need at least 10 bytes, have %d", len(data))
+		return fmt.Errorf("avro: single-object encoding too short: need at least 10 bytes, have %d", len(data))
 	}
 	if data[0] != 0xC3 || data[1] != 0x01 {
-		return nil, fmt.Errorf("avro: invalid single-object encoding magic: got [%#x, %#x], want [0xc3, 0x01]", data[0], data[1])
+		return fmt.Errorf("avro: invalid single-object encoding magic: got [%#x, %#x], want [0xc3, 0x01]", data[0], data[1])
 	}
-	if [10]byte(data[:10]) != s.soe {
+	return nil
+}
+
+// DecodeSingleObject decodes a Single Object Encoding message into v after
+// verifying the magic and fingerprint match this schema.
+//
+// For a schema returned by [Resolve], the writer's fingerprint is also
+// accepted — wire bytes carry the writer's fingerprint per the SOE spec,
+// and a resolved schema is the right place to decode them.
+func (s *Schema) DecodeSingleObject(data []byte, v any, opts ...Opt) ([]byte, error) {
+	if err := validateSOEHeader(data); err != nil {
+		return nil, err
+	}
+	header := [10]byte(data[:10])
+	// A valid SOE header has data[0] == 0xC3 (enforced by validateSOEHeader);
+	// the zero-value writerSoe has writerSoe[0] == 0x00, so a non-resolved
+	// schema's writerSoe can never match a valid header. The OR check works
+	// uniformly for both resolved and non-resolved schemas.
+	if header != s.soe && header != s.writerSoe {
 		return nil, errors.New("avro: single-object encoding fingerprint mismatch")
 	}
 	return s.Decode(data[10:], v, opts...)
@@ -30,11 +49,8 @@ func (s *Schema) DecodeSingleObject(data []byte, v any, opts ...Opt) ([]byte, er
 // SingleObjectFingerprint extracts the 8-byte CRC-64-AVRO fingerprint and
 // returns the remaining payload.
 func SingleObjectFingerprint(data []byte) (fp [8]byte, rest []byte, err error) {
-	if len(data) < 10 {
-		return fp, nil, fmt.Errorf("avro: single-object encoding too short: need at least 10 bytes, have %d", len(data))
-	}
-	if data[0] != 0xC3 || data[1] != 0x01 {
-		return fp, nil, fmt.Errorf("avro: invalid single-object encoding magic: got [%#x, %#x], want [0xc3, 0x01]", data[0], data[1])
+	if err := validateSOEHeader(data); err != nil {
+		return fp, nil, err
 	}
 	copy(fp[:], data[2:10])
 	return fp, data[10:], nil

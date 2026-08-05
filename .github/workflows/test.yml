@@ -1,6 +1,12 @@
 name: Test
 
 on:
+  # push is main-only ON PURPOSE. The concurrency group keys on github.ref,
+  # which is refs/heads/<branch> for a push and refs/pull/<n>/merge for a
+  # pull_request — different groups, so neither cancels the other and a push
+  # to a branch with an open PR ran the entire pipeline TWICE on the same
+  # commit. The pull_request trigger covers branch work; this covers main
+  # after a merge.
   push:
     branches: [main]
     paths-ignore:
@@ -9,24 +15,101 @@ on:
     branches: [main]
     paths-ignore:
       - "**.md"
+  workflow_dispatch: {}
+
+# Cancel an in-progress run when a newer commit lands on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # NOTE: there is no -fuzz step here, deliberately. `go test` WITHOUT -fuzz
+  # already runs every Fuzz target's f.Add seeds and every recorded crasher in
+  # testdata/fuzz/<Fuzz>/ as ordinary subtests, so the line below carries the
+  # full regression value of every input fuzzing has ever found. What -fuzz
+  # adds is DISCOVERY of new inputs, and discovery is not a gate: at the ~10s
+  # per target a PR can afford it found almost nothing while costing 7m36s of
+  # a 9m46s run. Discovery moved to fuzz.yml, which runs on a schedule with a
+  # budget that can actually find something.
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
 
       - run: go test -race ./...
 
-      - name: Fuzz
+  # Differential testing against fastavro (an independent reference impl).
+  # The fastavro oracle subprocess cross-checks twmb's encode/decode as Avro
+  # bytes; without it TestDifferentialFastavro skips, so the `test` job above
+  # stays meaningful on its own. See CORRECTNESS_PLAN.md §Tier 1.
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install fastavro
+      - name: fastavro differential
+        run: go test -count=1 -run 'TestDifferentialFastavro|TestDifferentialMatrix|TestDifferentialAcceptance|TestApacheSchemaTestsVectors' -v .
+
+  # CI-only Java differential (heavy: JVM + avro-tools fat jar). Cross-checks
+  # twmb's Parsing Canonical Form + Rabin fingerprint against the reference
+  # org.apache.avro.SchemaNormalization, including the multi-reference /
+  # forward-reference cases the static vectors omit. The test is behind the
+  # `cisuite` build tag so it never runs in a plain `go test ./...`.
+  java-differential:
+    runs-on: ubuntu-latest
+    env:
+      AVRO_TOOLS_VERSION: "1.12.0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Fetch avro-tools
         run: |
-          for pkg in . ./ocf; do
-            for fn in $(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep '^Fuzz'); do
-              go test -run='^$' -fuzz="^${fn}$" -fuzztime=10s "$pkg" &
-            done
-          done
-          wait
+          curl -fsSL -o avro-tools.jar \
+            "https://repo1.maven.org/maven2/org/apache/avro/avro-tools/${AVRO_TOOLS_VERSION}/avro-tools-${AVRO_TOOLS_VERSION}.jar"
+      - name: Build Java oracle
+        run: javac -cp avro-tools.jar -d testdata/oracle testdata/oracle/SchemaOracle.java
+      - name: Java fingerprint differential
+        env:
+          AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
+        run: go test -tags=cisuite -count=1 -run TestDifferentialJavaFingerprint -v .
+      # Value-level differentials against live Java via SchemaOracle's RT
+      # round-trip: the matrix sweeps (schema × value) across primitives,
+      # logicals, containers, records, and unions, asserting both wires;
+      # the invalid-UTF-8 test asserts the documented U+FFFD-on-JSON /
+      # verbatim-on-binary policy stays Java-identical; the wire-leniency
+      # pins hand-frame non-canonical writer bytes (boolean 0x02, overlong
+      # union-index varint, empty-record JsonEncoder zero-byte output) and
+      # assert Java's documented verdicts so an avro-tools upgrade that
+      # changes them fails here instead of silently rotting the citations.
+      - name: Java value differentials (matrix + invalid-UTF-8 + wire leniencies)
+        env:
+          AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
+        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaValueMatrix|TestDifferentialJavaInvalidUTF8|TestDifferentialJavaWireLeniencies' -v .
+      # The combinatorial matrix through the Java oracle: every composed
+      # (fragment × context) cell and every recursive shape — twmb's wire
+      # bytes must survive a Java decode→re-encode byte-identically, and
+      # Java's canonical form + Rabin fingerprint must match twmb's for
+      # every composed schema. Java is the one external oracle that accepts
+      # forward references, so the fwd-ref recursion shapes (which the
+      # fastavro differential must skip) are validated here.
+      - name: Java matrix differential
+        env:
+          AVRO_TOOLS_JAR: ${{ github.workspace }}/avro-tools.jar
+        run: go test -tags=cisuite -count=1 -run 'TestDifferentialJavaMatrix|TestDifferentialJavaAcceptance|TestDifferentialJavaJSONForm' .

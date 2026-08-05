@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"slices"
 	"sync"
 )
 
@@ -18,41 +17,84 @@ import (
 // removal (skip), renaming (aliases), reordering, and type promotion.
 // Encoding with it uses the reader's format.
 //
-// If the schemas have identical canonical forms, reader is returned as-is.
-// Otherwise [CheckCompatibility] is called first and any incompatibility is
-// returned as a [*CompatibilityError]. See the package-level documentation
-// for a full example.
+// [CheckCompatibility] is called first and any incompatibility is returned as a
+// [*CompatibilityError]; if it passes and the schemas have identical canonical
+// forms, reader is returned as-is. The compatibility check must precede the
+// canonical-form fast path because the parsing canonical form strips logical-
+// type attributes (logicalType, precision, scale): two schemas can have equal
+// canonical forms yet be logically incompatible — most importantly a decimal
+// precision/scale mismatch — which would otherwise pass the fast path and
+// silently rescale the decoded value. See the package-level documentation for
+// a full example.
 //
 // Note: the argument order is (writer, reader), matching source-then-destination
 // convention and Java's GenericDatumReader. This differs from the Avro spec
 // text and hamba/avro, which put reader first.
 func Resolve(writer, reader *Schema) (*Schema, error) {
-	if bytes.Equal(reader.Canonical(), writer.Canonical()) {
-		return reader, nil
-	}
 	if err := CheckCompatibility(writer, reader); err != nil {
 		return nil, err
 	}
+	if bytes.Equal(reader.Canonical(), writer.Canonical()) {
+		return reader, nil
+	}
 	ctx := &resolveCtx{
-		seen:           make(map[nodePair]*schemaNode),
-		customDecoders: reader.customDecoders,
-		customSNs:      reader.customSNs,
+		seen:     make(map[nodePair]*schemaNode),
+		custom:   reader.custom,
+		minBytes: newMinBytesWalk(),
 	}
 	resolved, err := resolveNode(reader.node, writer.node, "", ctx)
 	if err != nil {
 		return nil, err
 	}
 	s := &Schema{
-		ser:            reader.ser,
-		deser:          resolved.deser,
-		c:              reader.c,
-		node:           reader.node,
-		full:           reader.full,
-		customEncodes:  reader.customEncodes,
-		customDecoders: reader.customDecoders,
-		customSNs:      reader.customSNs,
+		ser:         reader.ser,
+		deser:       resolved.deser,
+		c:           reader.c,
+		node:        reader.node,
+		full:        reader.full,
+		custom:      reader.custom,
+		customBaked: reader.customBaked,
+	}
+	s.resolveWriter = writer
+	// decodeJSONResolved transforms writer-shaped JSON into RAW writer binary
+	// before the resolving decode; a writer carrying its own CustomType decoders
+	// would run them during that transform and then fail to re-encode the
+	// resulting Go-domain value (a Decode-only custom has no Encode to invert it).
+	// Re-parse the writer custom-free for that round-trip; the reader's custom
+	// types still apply in the final s.Decode. Names are accepted wholesale
+	// (internalReparseNames) so any writer the user's validator already accepted
+	// re-parses — names do not affect wire bytes. With no custom effects
+	// anywhere in the writer's tree there is nothing to suppress, so reuse it
+	// directly. customBaked, not len(writer.custom): a cache-parsed writer
+	// whose customs match only SchemaCache-inherited subtrees has an empty
+	// overlay while the inherited ser/deser still carry the baked conversions.
+	s.resolveWriterRaw = writer
+	if writer.customBaked {
+		raw, err := Parse(writer.full, internalReparseNames)
+		if err != nil {
+			return nil, fmt.Errorf("avro: building custom-free writer view for resolved JSON decode: %w", err)
+		}
+		s.resolveWriterRaw = raw
 	}
 	s.soe = reader.soe
+	// SOE wire bytes carry the writer's fingerprint per the Avro spec
+	// (the schema that produced the wire IS the writer). Storing
+	// writer.soe lets DecodeSingleObject accept writer-produced bytes
+	// and resolve them into reader-shaped Go. Java's BinaryMessageDecoder
+	// dispatches the wire fingerprint into a resolved (writer→reader)
+	// codec via a fingerprint registry; twmb's single-schema model bakes
+	// the equivalent dispatch into the resolved Schema's own check.
+	//
+	// The resolved Schema also accepts the reader's fingerprint, but the
+	// payload after it must still be WRITER-shaped: a resolved Schema
+	// decodes via the resolving s.deser, which consumes writer bytes.
+	// Feeding back reader.AppendSingleObject output (reader-shaped) is
+	// therefore NOT a supported round-trip — it errors on dropped writer
+	// fields or silently default-fills added ones, the same way feeding
+	// reader-shaped JSON to a resolved DecodeJSON does (see the resolved
+	// DecodeJSON divergence note). Use the reader schema directly for
+	// reader-shaped data.
+	s.writerSoe = writer.soe
 	return s, nil
 }
 
@@ -81,26 +123,52 @@ type defaultOp struct {
 
 // resolveCtx carries per-resolution state through the recursive resolve calls.
 type resolveCtx struct {
-	seen           map[nodePair]*schemaNode
-	customDecoders map[*schemaNode][]func(any, *SchemaNode) (any, error)
-	customSNs      map[*schemaNode]*SchemaNode
+	seen   map[nodePair]*schemaNode
+	custom map[*schemaNode]*customWiring
+	// minBytes is shared across every container this resolution derives a
+	// per-element bound for. resolveArray/resolveMap and the dropped-field
+	// skip compiler all consult it, so a writer pointing many containers at one
+	// subtree pays for that subtree once, not once per container. See
+	// newMinBytesWalk.
+	minBytes *minBytesWalk
+}
+
+// customDecodersFor returns the decoder chain registered against r, or
+// nil if none. Sibling of [resolveCtx.customSNFor].
+func (ctx *resolveCtx) customDecodersFor(r *schemaNode) []func(any, *SchemaNode) (any, error) {
+	if w := ctx.custom[r]; w != nil {
+		return w.decoders
+	}
+	return nil
 }
 
 // maybeWrapResolvedNode re-applies custom decoders from the reader
 // schema to a resolved node that uses the reader node directly.
 func maybeWrapResolvedNode(r *schemaNode, ctx *resolveCtx) *schemaNode {
-	decs := ctx.customDecoders[r]
-	if len(decs) == 0 {
+	if len(ctx.customDecodersFor(r)) == 0 {
 		return r
 	}
-	sn := ctx.customSNs[r]
-	return &schemaNode{
-		kind:       r.kind,
-		name:       r.name,
-		ser:        r.ser,
-		deser:      wrapDeserWithCustomDecoders(r.deser, decs, sn),
-		decodeJSON: wrapDecodeJSONWithCustomDecoders(decs, sn),
+	nd := &schemaNode{
+		kind:  r.kind,
+		name:  r.name,
+		ser:   r.ser,
+		deser: r.deser,
 	}
+	ctx.applyCustomToNode(nd, r)
+	return nd
+}
+
+// applyCustomToNode wraps nd.deser + nd.decodeJSON with the custom
+// decoders registered against r. No-op when no CT is registered.
+// Shared by the resolveArray/resolveMap/resolveEnum/promote sites in
+// doResolve so all four agree on the wrap pair.
+func (ctx *resolveCtx) applyCustomToNode(nd, r *schemaNode) {
+	w := ctx.custom[r]
+	if w == nil || len(w.decoders) == 0 {
+		return
+	}
+	nd.deser = wrapDeserWithCustomDecoders(nd.deser, w.decoders, w.sn)
+	nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(w.decoders, w.sn, w.suppressLogical)
 }
 
 // resolveNode resolves a (reader, writer) schema pair, handling cycles
@@ -187,27 +255,31 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 		// If the reader has a logical type, the bare promotion deser
 		// drops it — Java's Resolver.Action carries logicalType +
 		// conversion orthogonally to Promote and applies the conversion
-		// after the widening (Resolver.java:154-165). Pre-fix, a
+		// after the widening (Resolver.java:154-165). Without this wrap,
 		// writer "int" → reader {"long","logicalType":"timestamp-millis"}
-		// produced int64 instead of time.Time at every position
+		// would produce int64 instead of time.Time at every position
 		// (top-level, record field, array item, map value, reader-union
 		// branch). Wrap the promotion deser to re-apply the conversion.
+		// A matching CustomType that suppresses the reader's built-in logical
+		// decoder (the binary build fed the user the raw Avro-native value via
+		// hasMatchingCustomType) must keep suppressing through promotion: the
+		// bare promotion deser feeds the custom decoder (or, with no Decode
+		// callback, the user) the raw value, exactly as a direct, non-promoted
+		// decode does. Without this gate the custom decoder receives the
+		// enriched logical type (time.Time / *big.Rat) on a promoted wire but
+		// the raw type on a direct wire for the same reader+custom.
 		if pdLogical := promotionDeserForLogical(w.kind, r); pdLogical != nil {
-			deser = pdLogical
+			if cw := ctx.custom[r]; cw == nil || !cw.suppressLogical {
+				deser = pdLogical
+			}
 		}
-		var decodeJSON jsonDecodeFn
-		// Re-apply custom decoders from the reader schema to the promoted node.
-		if decs := ctx.customDecoders[r]; len(decs) > 0 {
-			sn := ctx.customSNs[r]
-			deser = wrapDeserWithCustomDecoders(deser, decs, sn)
-			decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
+		nd := &schemaNode{
+			kind:  r.kind,
+			ser:   r.ser,
+			deser: deser,
 		}
-		return &schemaNode{
-			kind:       r.kind,
-			ser:        r.ser,
-			deser:      deser,
-			decodeJSON: decodeJSON,
-		}, nil
+		ctx.applyCustomToNode(nd, r)
+		return nd, nil
 	}
 
 	return nil, &CompatibilityError{
@@ -219,15 +291,8 @@ func doResolve(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, err
 }
 
 func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
-	// Build writer field lookup.
-	type writerFieldInfo struct {
-		idx  int
-		node *fieldNode
-	}
-	writerByName := make(map[string]writerFieldInfo, len(w.fields))
-	for i := range w.fields {
-		writerByName[w.fields[i].name] = writerFieldInfo{i, &w.fields[i]}
-	}
+	// One lookup for the whole record, asked once per writer field below.
+	readerByName := newReaderFieldLookup(r)
 
 	rr := &resolvedRecord{
 		readerNames:    make([]string, len(r.fields)),
@@ -238,21 +303,48 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 		rr.readerNameVals[i] = reflect.ValueOf(rf.name)
 	}
 
-	// Track which reader fields are matched.
+	// Track which reader fields are matched. Also tracks WHICH writer
+	// field name claimed each reader slot, so a second writer field
+	// resolving to the same reader index (via the alias-rename collision
+	// described below) produces a useful error rather than a silent
+	// last-writer-wins overwrite.
 	readerMatched := make([]bool, len(r.fields))
+	matchedByWriterName := make([]string, len(r.fields))
 
 	// For each writer field (in wire order), find matching reader field.
 	for _, wf := range w.fields {
-		ri := findReaderFieldIndex(r, wf.name)
+		ri := readerByName.index(wf.name)
 		if ri < 0 {
 			// Writer field not in reader: skip it.
 			rr.wireOps = append(rr.wireOps, wireOp{
 				readerIdx: -1,
-				skip:      buildSkip(wf.node),
+				skip:      buildSkip(wf.node, ctx.minBytes),
 			})
 			continue
 		}
+		// Alias-rename collision: a previous writer field already
+		// resolved to this reader-field index (either by exact name
+		// match for one and alias match for the other, or both via
+		// aliases). Java applyAliases renames the writer field and
+		// then Schema.setFields rejects the resulting duplicate
+		// (Schema.java:978-981). fastavro deletes the reader-field
+		// from its lookup dict on first claim so the second falls
+		// through to skip_data (_read_py.py:553). twmb aligns with
+		// Java's fail-fast posture — matches the rest of the package
+		// (writer-union incompatibility, eager schema-resolution fail)
+		// and surfaces the configuration error at Resolve time rather
+		// than producing silent data loss on every decode.
+		if readerMatched[ri] {
+			return nil, &CompatibilityError{
+				Path:       pathOrRoot(path),
+				ReaderType: "record",
+				WriterType: "record",
+				Detail: fmt.Sprintf("writer fields %q and %q both resolve to reader field %q (via name + alias collision); rename the writer or drop the alias to disambiguate",
+					truncForError(matchedByWriterName[ri]), truncForError(wf.name), truncForError(r.fields[ri].name)),
+			}
+		}
 		readerMatched[ri] = true
+		matchedByWriterName[ri] = wf.name
 		rf := &r.fields[ri]
 		resolved, err := resolveNode(rf.node, wf.node, fieldPath(path, rf.name), ctx)
 		if err != nil {
@@ -271,11 +363,11 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 		}
 		encoded, err := encodeDefault(nil, rf.defaultVal, rf.node)
 		if err != nil {
-			return nil, fmt.Errorf("field %s: %w", fieldPath(path, rf.name), err)
+			return nil, fmt.Errorf("field %s: %w", truncForError(fieldPath(path, rf.name)), err)
 		}
 		deser := rf.node.deser
-		if decs := ctx.customDecoders[rf.node]; len(decs) > 0 {
-			deser = wrapDeserWithCustomDecoders(deser, decs, ctx.customSNs[rf.node])
+		if w := ctx.custom[rf.node]; w != nil && len(w.decoders) > 0 {
+			deser = wrapDeserWithCustomDecoders(deser, w.decoders, w.sn)
 		}
 		rr.defaults = append(rr.defaults, defaultOp{
 			readerIdx:      i,
@@ -288,27 +380,74 @@ func resolveRecord(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode,
 		kind:        "record",
 		name:        r.name,
 		aliases:     r.aliases,
+		bareAliases: r.bareAliases,
 		fields:      r.fields,
 		ser:         r.ser,
 		deser:       rr.buildDeser(),
 		serRecord:   r.serRecord,
 		deserRecord: r.deserRecord,
 	}
+	// Re-apply a record-level CustomType (AvroType:"record") to the resolved
+	// node, exactly as resolveEnum / resolveArray / resolveMap / fixed /
+	// promotion do via applyCustomToNode. The direct (non-resolved) build
+	// wires record nodes in applyCustomTypes, so a CustomType.Decode for a
+	// record node fires on a plain Decode; without this, any real evolution
+	// (which bypasses the canonical-equality fast path) silently returns the
+	// raw map[string]any instead of the callback's converted value — a
+	// direct-vs-resolved divergence. The resolved DecodeJSON funnels through
+	// this same deser, so both resolved wire formats gain the custom together.
+	ctx.applyCustomToNode(nd, r)
 	return nd, nil
 }
 
-// findReaderFieldIndex finds a writer field name in reader fields by name or
-// reader field aliases.
-func findReaderFieldIndex(r *schemaNode, writerFieldName string) int {
-	for i, rf := range r.fields {
-		if rf.name == writerFieldName {
-			return i
+// readerFieldLookup answers "which reader field does this writer field name?"
+// in constant time per question, for one reader record.
+//
+// The two maps are SEPARATE and consulted in that order, because the rule is
+// that EVERY field name outranks EVERY field alias — not that a name outranks
+// an alias on the same field. A single merged map cannot express that: a
+// writer name that is one reader field's alias and a LATER reader field's name
+// would resolve to whichever entry was written last, silently reversing the
+// routing. That routing is what the parse-time rejection of field name/alias
+// collisions is justified by, so it is a contract, not an implementation
+// detail. Within each map the FIRST field wins, matching the scan this
+// replaced; a parse rejects the collisions that would make that observable.
+//
+// It is built once per reader record and asked once per writer field. Building
+// it per question would be the same scan-inside-a-loop it exists to avoid,
+// since a record's field count is set by the schema text.
+type readerFieldLookup struct {
+	byName  map[string]int
+	byAlias map[string]int
+}
+
+func newReaderFieldLookup(r *schemaNode) readerFieldLookup {
+	lk := readerFieldLookup{byName: make(map[string]int, len(r.fields))}
+	for i := range r.fields {
+		if _, taken := lk.byName[r.fields[i].name]; !taken {
+			lk.byName[r.fields[i].name] = i
 		}
 	}
-	for i, rf := range r.fields {
-		if slices.Contains(rf.aliases, writerFieldName) {
-			return i
+	for i := range r.fields {
+		for _, alias := range r.fields[i].aliases {
+			if lk.byAlias == nil {
+				lk.byAlias = make(map[string]int, len(r.fields))
+			}
+			if _, taken := lk.byAlias[alias]; !taken {
+				lk.byAlias[alias] = i
+			}
 		}
+	}
+	return lk
+}
+
+// index reports the reader-field index writerFieldName resolves to, or -1.
+func (lk readerFieldLookup) index(writerFieldName string) int {
+	if i, ok := lk.byName[writerFieldName]; ok {
+		return i
+	}
+	if i, ok := lk.byAlias[writerFieldName]; ok {
+		return i
 	}
 	return -1
 }
@@ -338,7 +477,11 @@ func (rr *resolvedRecord) buildDeser() deserfn {
 }
 
 func (rr *resolvedRecord) deserInterface(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	m := make(map[string]any, len(rr.readerNames))
+	// Mirror the natural record decoder (deserRecord.deser): when the
+	// interface target already wraps a map[string]any, decode into the
+	// existing map so keys outside the schema are retained — the
+	// documented streaming-decode reuse contract.
+	m := reuseOrMakeStringAnyMap(v, len(rr.readerNames))
 	var err error
 	elem := reflect.New(anyType).Elem()
 
@@ -376,6 +519,7 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 	}
 	var err error
 	elem := reflect.New(t.Elem()).Elem()
+	keyType := t.Key()
 
 	for _, op := range rr.wireOps {
 		if op.readerIdx < 0 {
@@ -384,16 +528,24 @@ func (rr *resolvedRecord) deserMap(src []byte, v reflect.Value, t reflect.Type, 
 			}
 			continue
 		}
+		name := rr.readerNames[op.readerIdx]
+		if err := validateJSONNumberMapKey(name, keyType, "record"); err != nil {
+			return nil, err
+		}
 		if src, err = op.read(src, elem, sl); err != nil {
-			return nil, recordFieldError(nil, rr.readerNames[op.readerIdx], err)
+			return nil, recordFieldError(nil, name, err)
 		}
 		v.SetMapIndex(mapKeyAs(t, rr.readerNameVals[op.readerIdx]), elem)
 		elem.SetZero()
 	}
 
 	for _, d := range rr.defaults {
+		name := rr.readerNames[d.readerIdx]
+		if err := validateJSONNumberMapKey(name, keyType, "record"); err != nil {
+			return nil, err
+		}
 		if _, err = d.deser(d.encodedDefault, elem, sl); err != nil {
-			return nil, recordFieldError(nil, rr.readerNames[d.readerIdx], err)
+			return nil, recordFieldError(nil, name, err)
 		}
 		v.SetMapIndex(mapKeyAs(t, rr.readerNameVals[d.readerIdx]), elem)
 		elem.SetZero()
@@ -415,14 +567,20 @@ func (rr *resolvedRecord) deserStruct(src []byte, v reflect.Value, t reflect.Typ
 			}
 			continue
 		}
-		fv := fieldByIndex(v, mapping.indices[op.readerIdx])
+		fv, ferr := fieldByIndex(v, mapping.indices[op.readerIdx])
+		if ferr != nil {
+			return nil, recordFieldError(t, rr.readerNames[op.readerIdx], ferr)
+		}
 		if src, err = op.read(src, fv, sl); err != nil {
 			return nil, recordFieldError(t, rr.readerNames[op.readerIdx], err)
 		}
 	}
 
 	for _, d := range rr.defaults {
-		fv := fieldByIndex(v, mapping.indices[d.readerIdx])
+		fv, ferr := fieldByIndex(v, mapping.indices[d.readerIdx])
+		if ferr != nil {
+			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], ferr)
+		}
 		if _, err = d.deser(append([]byte(nil), d.encodedDefault...), fv, sl); err != nil {
 			return nil, recordFieldError(t, rr.readerNames[d.readerIdx], err)
 		}
@@ -454,12 +612,12 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 					Path:       r.name,
 					ReaderType: r.name,
 					WriterType: w.name,
-					Detail:     fmt.Sprintf("writer symbol %q not in reader and no default", ws),
+					Detail:     fmt.Sprintf("writer symbol %q not in reader and no default", truncForError(ws)),
 				}
 			}
 			defIdx, ok := readerIdx[r.enumDef]
 			if !ok {
-				return nil, fmt.Errorf("enum default %q not found in reader symbols", r.enumDef)
+				return nil, fmt.Errorf("enum default %q not found in reader symbols", truncForError(r.enumDef))
 			}
 			mapping[i] = defIdx
 		}
@@ -479,42 +637,23 @@ func resolveEnum(r, w *schemaNode, ctx *resolveCtx) (*schemaNode, error) {
 			return nil, fmt.Errorf("enum index %d out of range [0, %d)", idx, len(mapping))
 		}
 		ri := mapping[idx]
-		v = indirectAlloc(v)
-		switch {
-		case v.Kind() == reflect.Interface:
-			return src, setIface(v, reflect.ValueOf(readerSymbols[ri]), "enum")
-		case v.Kind() == reflect.String:
-			v.SetString(readerSymbols[ri])
-		case v.CanInt():
-			if v.OverflowInt(int64(ri)) {
-				return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", ri, v.Type())}
-			}
-			v.SetInt(int64(ri))
-		case v.CanUint():
-			if v.OverflowUint(uint64(ri)) {
-				return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", ri, v.Type())}
-			}
-			v.SetUint(uint64(ri))
-		default:
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
-		}
-		return src, nil
+		return src, setEnumTarget(indirectAlloc(v), ri, readerSymbols[ri])
 	})
-	var decodeJSON jsonDecodeFn
-	if decs := ctx.customDecoders[r]; len(decs) > 0 {
-		sn := ctx.customSNs[r]
-		deser = wrapDeserWithCustomDecoders(deser, decs, sn)
-		decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
+	nd := &schemaNode{
+		kind:        "enum",
+		name:        r.name,
+		aliases:     r.aliases,
+		bareAliases: r.bareAliases,
+		symbols:     r.symbols,
+		// The symbol slice is the reader's, so its lookup is too. A
+		// resolved node that carries the siblings without the table sends
+		// every consumer back to scanning them.
+		symbolIdx: r.symbolIdx,
+		ser:       r.ser,
+		deser:     deser,
 	}
-	return &schemaNode{
-		kind:       "enum",
-		name:       r.name,
-		aliases:    r.aliases,
-		symbols:    r.symbols,
-		ser:        r.ser,
-		deser:      deser,
-		decodeJSON: decodeJSON,
-	}, nil
+	ctx.applyCustomToNode(nd, r)
+	return nd, nil
 }
 
 func resolveArray(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
@@ -534,13 +673,9 @@ func resolveArray(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, 
 		// with the writer's type — an int-on-wire promoted to a double
 		// reader is still 1 byte minimum on the wire. Mirrors the
 		// resolveMap site below.
-		deser: (&deserArray{deserItem: resolved.deser, minItemBytes: schemaMinBytes(w.items)}).deser,
+		deser: (&deserArray{deserItem: resolved.deser, minItemBytes: ctx.minBytes.minBytesOf(w.items)}).deser,
 	}
-	if decs := ctx.customDecoders[r]; len(decs) > 0 {
-		sn := ctx.customSNs[r]
-		nd.deser = wrapDeserWithCustomDecoders(nd.deser, decs, sn)
-		nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
-	}
+	ctx.applyCustomToNode(nd, r)
 	return nd, nil
 }
 
@@ -559,13 +694,9 @@ func resolveMap(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, er
 		// minEntryBytes: bound against the WRITER's wire format, not the
 		// reader's resolved schema (a long-on-wire promoted to a double
 		// reader is still 1 byte minimum on the wire).
-		deser:  (&deserMap{deserItem: resolved.deser, minEntryBytes: 1 + schemaMinBytes(w.values)}).deser,
+		deser: (&deserMap{deserItem: resolved.deser, minEntryBytes: mapEntryMinBytes(ctx.minBytes.minBytesOf(w.values))}).deser,
 	}
-	if decs := ctx.customDecoders[r]; len(decs) > 0 {
-		sn := ctx.customSNs[r]
-		nd.deser = wrapDeserWithCustomDecoders(nd.deser, decs, sn)
-		nd.decodeJSON = wrapDecodeJSONWithCustomDecoders(decs, sn)
-	}
+	ctx.applyCustomToNode(nd, r)
 	return nd, nil
 }
 
@@ -597,7 +728,12 @@ func resolveWriterUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 		branchDesers[i] = resolved.deser
 		bnames[i], lnames[i] = unionBranchNames(wb)
 	}
-	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
+	// noWrap: reader is non-union, so the TaggedUnions wrap on
+	// du.deser would leak the WRITER's branch name onto a target that
+	// has no union to dispatch through. Sibling resolveReaderUnion
+	// handles its own wrap (with the READER's branch name) when the
+	// reader IS a union; resolveUnionUnion (both union) keeps wrap on.
+	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames, noWrap: true}
 	return &schemaNode{
 		kind:  r.kind,
 		name:  r.name,
@@ -608,17 +744,18 @@ func resolveWriterUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 
 // resolveReaderUnion: reader is union, writer is not.
 // Find first matching reader branch — two-pass to match Java's
-// bestBranch (exact-kind first, promotion fallback only if no exact
-// match exists). Single-pass would silently produce float64 for an
-// int writer when the reader is ["double","int"].
+// Resolver.firstMatchingBranch (exact match scanned first, numeric
+// promotion as a fallback pass only if no exact match exists,
+// Resolver.java:634/:666). Single-pass would silently produce float64
+// for an int writer when the reader is ["double","int"].
 func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaNode, error) {
-	rb := findMatchingBranch(r, w)
+	rb := newReaderBranchLookup(r).match(w)
 	if rb == nil {
 		return nil, &CompatibilityError{
 			Path:       pathOrRoot(path),
 			ReaderType: "union",
 			WriterType: w.kind,
-			Detail:     "writer type matches no reader union branch",
+			Detail:     detailWriterTypeNoReaderBranch,
 		}
 	}
 	resolved, err := resolveNode(rb, w, path, ctx)
@@ -627,25 +764,31 @@ func resolveReaderUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schema
 	}
 	// The wire format has no union index (writer wrote a non-union
 	// value), so we can't use deserUnion.deser which reads a varint
-	// index. Wrap the resolved deser to apply TaggedUnions when active.
-	bn, ln := unionBranchNames(rb)
+	// index. Wrap the resolved deser with deserUnion.maybeWrap on a
+	// single-branch name table — the same code the natural union path
+	// runs — so the two paths share one TaggedUnions contract: targets
+	// that map[string]any is not assignable to (concrete types,
+	// non-empty interfaces) skip the wrap silently rather than erroring.
+	// unionEmitTag, not the raw logical qualifier: the tag is resolved against
+	// the READER union, whose other branches may own that spelling exactly.
+	bn, _ := unionBranchNames(rb)
+	wrap := &deserUnion{branchNames: []string{bn}, logicalNames: []string{unionEmitTag(r, rb, true)}}
 	inner := resolved.deser
 	deser := func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		src, err := inner(src, v, sl)
-		if err != nil || !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
-			return src, err
+		if err == nil {
+			wrap.maybeWrap(v, sl, 0)
 		}
-		name := bn
-		if sl.tagLogicalTypes {
-			name = ln
-		}
-		return src, setIface(v, reflect.ValueOf(map[string]any{name: v.Elem().Interface()}), "union")
+		return src, err
 	}
 	return &schemaNode{
 		kind:     "union",
 		branches: r.branches,
-		ser:      r.ser,
-		deser:    deser,
+		// Same slice, same table: the indexes in tags address r.branches,
+		// which is exactly what this node carries.
+		tags:  r.tags,
+		ser:   r.ser,
+		deser: deser,
 	}, nil
 }
 
@@ -655,14 +798,17 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 	branchDesers := make([]deserfn, len(w.branches))
 	bnames := make([]string, len(w.branches))
 	lnames := make([]string, len(w.branches))
+	// Built once for the whole loop: this asks per WRITER branch, and the
+	// answer is a property of the READER union.
+	readerBranches := newReaderBranchLookup(r)
 	for i, wb := range w.branches {
-		rb := findMatchingBranch(r, wb)
+		rb := readerBranches.match(wb)
 		if rb == nil {
 			return nil, &CompatibilityError{
 				Path:       pathOrRoot(path),
 				ReaderType: "union",
 				WriterType: fmt.Sprintf("union[%d]:%s", i, wb.kind),
-				Detail:     "writer union branch has no matching reader branch",
+				Detail:     detailWriterBranchNoReaderBranch,
 			}
 		}
 		resolved, err := resolveNode(rb, wb, path, ctx)
@@ -671,11 +817,13 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 		}
 		branchDesers[i] = resolved.deser
 		// Tag name comes from the READER branch — what the consumer's
-		// schema declares — not the writer's. Sibling resolveReaderUnion
-		// already uses rb here; the prior wb here diverged silently so
-		// a promoted int→long branch decoded with TaggedUnions emitted
-		// {"int": ...} against a reader that knew the field as "long".
-		bnames[i], lnames[i] = unionBranchNames(rb)
+		// schema declares — not the writer's. Otherwise a promoted
+		// int→long branch decoded with TaggedUnions would emit
+		// {"int": ...} against a reader that knows the field as "long".
+		// The logical spelling goes through unionEmitTag so it degrades to
+		// the unqualified name when another READER branch owns it exactly.
+		bnames[i], _ = unionBranchNames(rb)
+		lnames[i] = unionEmitTag(r, rb, true)
 	}
 	du := &deserUnion{fns: branchDesers, branchNames: bnames, logicalNames: lnames}
 	deser := du.deser
@@ -686,13 +834,73 @@ func resolveUnionUnion(r, w *schemaNode, path string, ctx *resolveCtx) (*schemaN
 	return &schemaNode{
 		kind:     "union",
 		branches: r.branches,
-		ser:      r.ser,
-		deser:    deser,
+		// Same slice, same table: the indexes in tags address r.branches,
+		// which is exactly what this node carries.
+		tags:  r.tags,
+		ser:   r.ser,
+		deser: deser,
 	}, nil
 }
 
+// extractDefaultBytes converts the encodeDefault "bytes"/"fixed" arm's
+// raw default value into the wire-form []byte. A literal []byte passes
+// through; a string is codepoint-mapped via avroJSONBytesToBytes (the
+// fwd-ref fixup path that bypasses convertDefaultBytes); other types
+// yield a typed error. typeLabel is "bytes" or "fixed".
+func extractDefaultBytes(val any, typeLabel string) ([]byte, error) {
+	switch v := val.(type) {
+	case []byte:
+		return v, nil
+	case string:
+		return avroJSONBytesToBytes(v)
+	}
+	return nil, fmt.Errorf("expected []byte or string for %s default, got %T", typeLabel, val)
+}
+
+// defaultChargeSink collects producer-compliance verdicts raised while a field
+// default is pre-encoded, WITHOUT failing the walk.
+//
+// The two must stay separate. A default that cannot be WRITTEN is still a
+// schema that must PARSE — a reader dropping the field never writes it — and
+// the same walk is used by the union try-each, where an error means "this
+// branch does not accept the value" and a compliance verdict would silently
+// select a different branch. So the verdict rides out here and is surfaced by
+// the encode-side consumers of the pre-encoded bytes.
+type defaultChargeSink struct{ err error }
+
+func (s *defaultChargeSink) record(err error) {
+	if s != nil && err != nil && s.err == nil {
+		s.err = err
+	}
+}
 
 func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
+	return encodeDefaultDepth(dst, val, node, 0, nil)
+}
+
+// encodeDefaultCharged is encodeDefault for the one caller that installs the
+// result as a field's pre-encoded default: it additionally reports the
+// producer-compliance verdict for the payload it just built.
+func encodeDefaultCharged(val any, node *schemaNode) ([]byte, error, error) {
+	var sink defaultChargeSink
+	b, err := encodeDefaultDepth(nil, val, node, 0, &sink)
+	return b, sink.err, err
+}
+
+// encodeDefaultDepth bounds the recursion encodeDefault performs while filling
+// absent nested record fields from their own defaults. Unlike validateDefault
+// (which skips absent fields and so terminates vacuously), encodeDefault fills
+// them — so a default that has no finite encoding because a required field
+// recurses into its own type (e.g. record R{ R self = {} }, or
+// R{ array<R> kids = [{}] }) would recurse forever and overflow the stack.
+// The same maxDepth ceiling the wire codec enforces turns that into an
+// errTooDeep parse error. A legitimately finite default nests far below the
+// bound (each level resolves a concrete value), so this never false-rejects a
+// real default.
+func encodeDefaultDepth(dst []byte, val any, node *schemaNode, depth int, sink *defaultChargeSink) ([]byte, error) {
+	if depth >= maxDepth {
+		return nil, errTooDeep
+	}
 	switch node.kind {
 	case "null":
 		if val != nil {
@@ -721,17 +929,15 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		}
 		return appendVarlong(dst, n), nil
 	case "float":
-		f, err := defaultAsFloat64(val)
+		f, err := defaultAsFloat(val)
 		if err != nil {
 			return nil, fmt.Errorf("float default: %w", err)
 		}
-		// Match serFloat: reject silent narrowing to ±Inf.
-		if finiteFloat32Overflows(f) {
-			return nil, fmt.Errorf("float default %g overflows float32", f)
-		}
+		// Lossy-destination policy: float64 → float32 narrowing to ±Inf
+		// is accepted at encode (matches appendAvroFloat32 / Java).
 		return appendUint32(dst, math.Float32bits(float32(f))), nil
 	case "double":
-		f, err := defaultAsFloat64(val)
+		f, err := defaultAsFloat(val)
 		if err != nil {
 			return nil, fmt.Errorf("double default: %w", err)
 		}
@@ -744,22 +950,11 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 		dst = appendVarlong(dst, int64(len(s)))
 		return append(dst, s...), nil
 	case "bytes":
-		var b []byte
-		switch v := val.(type) {
-		case []byte:
-			b = v
-		case string:
-			// Fwd-ref fixup path stores the unconverted JSON string;
-			// convert here via codepoint mapping for consistency with
-			// the normal (post-convertDefaultBytes) []byte path.
-			var err error
-			b, err = avroJSONBytesToBytes(v)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("expected []byte or string for bytes default, got %T", val)
+		b, err := extractDefaultBytes(val, "bytes")
+		if err != nil {
+			return nil, err
 		}
+		sink.record(chargeDecimalLeaf(b, node.logical))
 		dst = appendVarlong(dst, int64(len(b)))
 		return append(dst, b...), nil
 	case "enum":
@@ -772,123 +967,123 @@ func encodeDefault(dst []byte, val any, node *schemaNode) ([]byte, error) {
 				return appendVarint(dst, int32(i)), nil
 			}
 		}
-		return nil, fmt.Errorf("unknown enum symbol %q in default", s)
+		return nil, fmt.Errorf("unknown enum symbol %q in default", truncForError(s))
 	case "fixed":
-		var b []byte
-		switch v := val.(type) {
-		case []byte:
-			b = v
-		case string:
-			// Fwd-ref fixup path; see "bytes" case for rationale.
-			var err error
-			b, err = avroJSONBytesToBytes(v)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("expected []byte or string for fixed default, got %T", val)
+		b, err := extractDefaultBytes(val, "fixed")
+		if err != nil {
+			return nil, err
 		}
 		if len(b) != node.size {
 			return nil, fmt.Errorf("fixed default length %d != size %d", len(b), node.size)
 		}
+		sink.record(chargeDecimalLeaf(b, node.logical))
 		return append(dst, b...), nil
 	case "array":
-		arr, ok := val.([]any)
-		if !ok {
-			if val == nil {
-				return appendVarlong(dst, 0), nil
-			}
-			return nil, fmt.Errorf("expected array for array default, got %T", val)
+		// null is not an array. Rejecting it here keeps the union try-
+		// each loop honest: a [Array,null] union with default null would
+		// otherwise match the Array branch (producing an empty-array
+		// wire form) instead of the null branch. Mirrors
+		// validateDefault's nil-reject for parse-time symmetry.
+		arr, err := defaultArrayShape(val)
+		if err != nil {
+			return nil, err
 		}
 		if len(arr) == 0 {
 			return appendVarlong(dst, 0), nil
 		}
 		dst = appendVarlong(dst, int64(len(arr)))
-		var err error
+		bodyStart := len(dst)
 		for _, item := range arr {
-			dst, err = encodeDefault(dst, item, node.items)
+			dst, err = encodeDefaultDepth(dst, item, node.items, depth+1, sink)
 			if err != nil {
 				return nil, err
 			}
 		}
+		// Ask the array encoders' own shared compliance helper, whose doc
+		// requires exactly this: every array encoder routes through it, or the
+		// paths drift. The default walk is one, and was the third to be missed.
+		sink.record(arrayZeroByteEncodeCompliance(len(dst) == bodyStart, len(arr)))
 		return append(dst, 0), nil
 	case "map":
-		m, ok := val.(map[string]any)
-		if !ok {
-			if val == nil {
-				return appendVarlong(dst, 0), nil
-			}
-			return nil, fmt.Errorf("expected object for map default, got %T", val)
+		m, err := defaultObjectShape(val, "map")
+		if err != nil {
+			return nil, err
 		}
 		if len(m) == 0 {
 			return appendVarlong(dst, 0), nil
 		}
 		dst = appendVarlong(dst, int64(len(m)))
-		var err error
 		for k, v := range m {
 			dst = appendVarlong(dst, int64(len(k)))
 			dst = append(dst, k...)
-			dst, err = encodeDefault(dst, v, node.values)
+			dst, err = encodeDefaultDepth(dst, v, node.values, depth+1, sink)
 			if err != nil {
 				return nil, err
 			}
 		}
 		return append(dst, 0), nil
 	case "record":
-		m, _ := val.(map[string]any)
-		if m == nil {
-			m = make(map[string]any)
+		m, err := defaultObjectShape(val, "record")
+		if err != nil {
+			return nil, err
 		}
-		var err error
 		for _, f := range node.fields {
 			fval, exists := m[f.name]
 			if !exists {
 				if !f.hasDefault {
-					return nil, fmt.Errorf("record default missing field %q with no default", f.name)
+					return nil, fmt.Errorf("record default missing field %q with no default", truncForError(f.name))
 				}
 				fval = f.defaultVal
 			}
-			dst, err = encodeDefault(dst, fval, f.node)
+			dst, err = encodeDefaultDepth(dst, fval, f.node, depth+1, sink)
 			if err != nil {
 				return nil, err
 			}
 		}
 		return dst, nil
 	case "union":
-		// Avro 1.12+: union defaults may match any branch (not just the
-		// first). We walk branches in declaration order and use the first
-		// that accepts the value, encoding its index as the wire prefix.
-		// Matches Java 1.12.0+ and fastavro; goavro still requires the
-		// first-branch default. See Apache Avro AVRO-3649 / PR #2503.
+		// Avro 1.12+ relaxed the union-default rule (AVRO-3649): the default
+		// may match any branch, not just the first. Walk in declaration
+		// order and pick the first that accepts; encode its index as the
+		// wire prefix.
 		//
-		// Type-name dispatch first (Java/fastavro/hamba parity, matching
-		// serUnion.ser and appendAvroJSONUnion). Try-each fallback
-		// preserves the documented whole-number-float / string-numeric
-		// coercion paths that defaultAsFloat64 / defaultAsInt32 etc.
-		// implement.
+		// No type-name fast path here. The runtime serUnion.ser and
+		// appendAvroJSONUnion dispatchers use unionTypeNameForValue to
+		// pick a kind-matching branch — correct for user-supplied values
+		// (the Go type names the user's intended branch). For stored
+		// defaults the chosen branch was decided at parse time by
+		// firstUnionBranchAcceptingDefault (used by validateDefault,
+		// coerceDefault, convertDefaultBytes, walkDefault, and the
+		// metadata-side branchAcceptsDefault), which iterates in
+		// declaration order without a kind filter. The wire branch index
+		// MUST agree with that picker; otherwise an [enum, string] default
+		// "A" picks enum at validate-time (the symbol matches) but the
+		// type-name shortcut picks the later string branch on the wire,
+		// producing wire bytes that name a different branch than the
+		// metadata API reports.
 		if len(node.branches) == 0 {
 			return nil, fmt.Errorf("empty union")
 		}
 		base := len(dst)
-		if name := unionTypeNameForValue(reflect.ValueOf(val)); name != "" {
-			for i, branch := range node.branches {
-				if branch.kind != name {
-					continue
-				}
-				attempt := appendVarlong(dst[:base], int64(i))
-				if encoded, err := encodeDefault(attempt, val, branch); err == nil {
-					return encoded, nil
-				}
-				break // primitive kinds are unique per union (Avro spec)
-			}
-		}
 		for i, branch := range node.branches {
 			attempt := appendVarlong(dst[:base], int64(i))
-			if encoded, err := encodeDefault(attempt, val, branch); err == nil {
+			// Each attempt charges into its OWN sink, and only the WINNER's
+			// verdict is merged. Selection must stay byte-identical: it is
+			// decided by err alone, so a compliance verdict — which says the
+			// payload is too large to read back, not that the branch rejects
+			// the value — can never move the branch index. Handing the verdict
+			// back as the attempt's err would look like a fix (no unreadable
+			// wire is emitted) while silently selecting a LATER branch, and the
+			// metadata API would then report a different branch than the wire
+			// names. Passing nil instead, as this loop first did, keeps
+			// selection right and charges nothing at all.
+			var attemptSink defaultChargeSink
+			if encoded, err := encodeDefaultDepth(attempt, val, branch, depth+1, &attemptSink); err == nil {
+				sink.record(attemptSink.err)
 				return encoded, nil
 			}
 		}
-		return nil, fmt.Errorf("union default does not match any branch: %T(%v)", val, val)
+		return nil, fmt.Errorf("union default does not match any branch: %T(%s)", val, truncValueForError(val))
 	default:
 		return nil, fmt.Errorf("unsupported default encoding for type %q", node.kind)
 	}

@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -585,6 +586,43 @@ func BenchmarkDecodeJSON_Struct(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		if err := s.DecodeJSON(benchDecodeJSONInput, &out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+const benchUnionTryEachSchema = `{
+	"name": "U",
+	"type": "record",
+	"fields": [
+		{"name": "id", "type": ["null","int"], "default": null},
+		{"name": "name", "type": ["null","string"], "default": null},
+		{"name": "tags", "type": ["null",{"type":"array","items":"string"}], "default": null},
+		{"name": "meta", "type": ["null",{"type":"map","values":"int"}], "default": null},
+		{"name": "kv", "type": ["null","int","string","double"], "default": null}
+	]
+}`
+
+// BenchmarkEncodeJSON_UnionTryEach exercises appendAvroJSONUnion's
+// try-each loop. json.Number forces unionTypeNameForValue → "" so the
+// value falls into try-each (the loop changed by the bare-nil parity
+// fix). map[string]int and []string also miss type-name dispatch.
+func BenchmarkEncodeJSON_UnionTryEach(b *testing.B) {
+	s, err := Parse(benchUnionTryEachSchema)
+	if err != nil {
+		b.Fatal(err)
+	}
+	val := map[string]any{
+		"id":   json.Number("12345"),
+		"name": "hello",
+		"tags": []string{"a", "b", "c"},
+		"meta": map[string]int{"x": 1, "y": 2},
+		"kv":   json.Number("4567"),
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := s.EncodeJSON(val); err != nil {
 			b.Fatal(err)
 		}
 	}

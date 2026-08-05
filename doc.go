@@ -32,7 +32,7 @@
 // # JSON encoding
 //
 // [Schema.EncodeJSON] is schema-aware and handles bytes, unions, and
-// NaN/Infinity floats correctly — use it instead of [encoding/json.Marshal]
+// NaN/Infinity floats correctly — use it instead of a generic JSON encoder
 // when serializing decoded Avro data to JSON. Options control the output
 // format: [TaggedUnions] for Avro JSON union wrappers ({"type": value}),
 // [TagLogicalTypes] for qualified branch names, and [LinkedinFloats] for
@@ -40,12 +40,13 @@
 //
 // # Encoding from JSON input
 //
-// Data from [encoding/json.Unmarshal] (map[string]any with float64 numbers
-// and string timestamps) can be encoded directly. Missing map keys are
-// filled from schema defaults, [encoding/json.Number] is accepted for all
-// numeric types, and timestamp fields accept RFC 3339 strings. String
-// fields accept [encoding.TextAppender] and [encoding.TextMarshaler]
-// implementations (with [encoding.TextUnmarshaler] on decode).
+// Generically-decoded JSON data (map[string]any with float64 numbers and
+// string timestamps) can be encoded directly. Missing map keys are filled
+// from schema defaults, [encoding/json.Number] is accepted for numeric Avro
+// types only (string, bytes, fixed, and enum reject it — use a Go string or
+// []byte for those), and timestamp fields accept RFC 3339 strings. String fields accept
+// [encoding.TextAppender] and [encoding.TextMarshaler] implementations
+// (with [encoding.TextUnmarshaler] on decode).
 //
 // # Schema evolution
 //
@@ -106,10 +107,18 @@
 // building a resolved schema, use [CheckCompatibility].
 //
 // A null union branch decodes to the target's Go zero value, always replacing
-// any prior value — matching [encoding/json/v2.Unmarshal]. Use *T to
-// distinguish null from zero. Numeric values that don't fit the Go target's
-// range return an error; values within range but without exact representation
-// are rounded silently, matching json/v2's "rounded or clamped" rule.
+// any prior value. Use *T to distinguish null from zero.
+//
+// The reader schema is the user's contract for precision. When the reader
+// schema is lossy — float or double — encode and decode both silently
+// IEEE-round to the destination's representable range, and an out-of-range
+// finite input becomes ±Inf on the wire. When the reader schema is exact —
+// int, long, bytes, string — decode requires the Go target to represent the
+// wire value without loss; values outside the target's range or values the
+// target can't represent exactly (for example, a long above 2^53 decoded into
+// a float64) return an error. Users who need exact round-trip of large
+// integers should choose a long reader schema with an int64 target rather
+// than relying on a float to round.
 //
 // # Struct tags
 //
@@ -122,7 +131,7 @@
 //	avro:"name"           // map to Avro field "name"
 //	avro:"-"              // exclude field
 //	avro:",inline"        // flatten nested struct fields into parent record
-//	avro:",omitzero"      // encode zero values as the schema default
+//	avro:",omitzero"      // encode a zero value as the field's default (or null)
 //
 // Schema inference options (used by [SchemaFor]):
 //
@@ -139,14 +148,30 @@
 // writer schema uses a different name for the same type — for example, a legacy
 // schema naming a record "r508" instead of "FieldSummary".
 //
-// When encoding a map[string]any as a record, missing keys are filled
-// from the schema's default values. For structs, omitzero does the same
-// for zero-valued fields (or fields whose IsZero() method returns true).
+// When encoding a map[string]any as a record, missing keys are filled from the
+// schema's default values. A ["null", T] union field declared without a
+// default has an implicit null default (Parse infers it for the canonical
+// nullable pattern), so a missing key there fills null rather than erroring.
+// The omitzero tag applies the same fill to a struct's zero-valued fields
+// (or fields whose IsZero() method returns true): a zero value encodes the
+// field's default, or null for a nullable field that has no default, or —
+// for a non-nullable field with no default — the zero value itself (there
+// is nothing to fill with). The one difference from map fill is the
+// nullable field with no EFFECTIVE default — a [T, "null"] union declared
+// without one, where no null default can exist (a union default must match
+// the first branch) and none is inferred: omitzero encodes null where map
+// fill instead errors on the missing key.
 //
 // Embedded (anonymous) struct fields are automatically inlined. To prevent
-// inlining, give the field an explicit name tag. When multiple fields at
-// different depths resolve to the same name, the shallowest wins; among
-// fields at the same depth, a tagged field wins over an untagged one.
+// inlining, give the field an explicit name tag. When multiple fields
+// resolve to the same name, a tagged field wins over an untagged one at any
+// depth; among fields with the same tagged status, the shallowest wins. Two
+// fields that resolve to the same name at the same depth with the same tagged
+// status are an ambiguous collision (Go itself makes such a field reference a
+// compile error). twmb errors rather than silently selecting one: [SchemaFor]
+// rejects the type, while encode and decode reject only when the schema
+// actually resolves a field to the ambiguous name — a coincidental collision
+// on a name the schema never references does not break the type.
 //
 // # Custom types
 //
@@ -186,6 +211,5 @@
 // decoder (lossy-by-design conversions, spec/interop choices, and
 // decoder-only leniencies).
 //
-// [encoding/json/v2.Unmarshal]: https://pkg.go.dev/encoding/json/v2#Unmarshal
 // [Avro specification]: https://avro.apache.org/docs/current/specification/
 package avro

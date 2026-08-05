@@ -4,6 +4,7 @@ import (
 	"math"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestResolveIdenticalSchemas(t *testing.T) {
@@ -793,7 +794,7 @@ func TestSkipUnion(t *testing.T) {
 	sentinel := byte(0xFE)
 	data := append(encoded, sentinel)
 
-	skip := buildSkip(s.node)
+	skip := buildSkip(s.node, newMinBytesWalk())
 	rem, err := skip(data, &slab{})
 	if err != nil {
 		t.Fatal(err)
@@ -840,7 +841,7 @@ func TestSkipFunctions(t *testing.T) {
 			sentinel := byte(0xFE)
 			data := append(encoded, sentinel)
 
-			skip := buildSkip(s.node)
+			skip := buildSkip(s.node, newMinBytesWalk())
 			rem, err := skip(data, &slab{})
 			if err != nil {
 				t.Fatal(err)
@@ -1167,6 +1168,220 @@ func TestResolveReaderUnionTaggedUnions(t *testing.T) {
 	}
 }
 
+// TestResolveReaderUnionTaggedWrapTargetParity verifies that decoding
+// through a resolved reader-union (writer non-union, reader union) treats
+// every decode-target shape exactly like the natural union path. The
+// TaggedUnions {branch: value} envelope applies only to targets that
+// map[string]any is assignable to; for every other target (concrete
+// types, non-empty interfaces) the wrap is skipped silently — the
+// contract documented on deserUnion.maybeWrap — never turned into an
+// error. The natural decode of the reader-shaped wire is the oracle for
+// each cell; resolved binary and resolved JSON (which funnels through the
+// same resolving deser) must agree with it.
+func TestResolveReaderUnionTaggedWrapTargetParity(t *testing.T) {
+	writer, err := Parse(`{"type":"long","logicalType":"timestamp-millis"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`["null",{"type":"long","logicalType":"timestamp-millis"}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.UnixMilli(5).UTC()
+	writerWire, err := writer.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerWire, err := reader.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type nanoer interface{ UnixNano() int64 } // satisfied by time.Time
+
+	t.Run("any_untagged", func(t *testing.T) {
+		var nat, res any
+		if _, err := reader.Decode(readerWire, &nat); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+	})
+
+	t.Run("any_tagged", func(t *testing.T) {
+		var nat, res any
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+		m, ok := res.(map[string]any)
+		if !ok || !m["long"].(time.Time).Equal(want) {
+			t.Fatalf("expected {\"long\": %v} envelope, got %#v", want, res)
+		}
+	})
+
+	t.Run("any_tagged_logical", func(t *testing.T) {
+		var nat, res any
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+		m, ok := res.(map[string]any)
+		if !ok || !m["long.timestamp-millis"].(time.Time).Equal(want) {
+			t.Fatalf("expected {\"long.timestamp-millis\": %v} envelope, got %#v", want, res)
+		}
+	})
+
+	t.Run("typed_interface_tagged", func(t *testing.T) {
+		var nat, res nanoer
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like the natural path: %v", err)
+		}
+		if !nat.(time.Time).Equal(want) || !res.(time.Time).Equal(want) {
+			t.Fatalf("natural %#v / resolved %#v, want bare %v", nat, res, want)
+		}
+	})
+
+	t.Run("typed_interface_tagged_logical", func(t *testing.T) {
+		var res nanoer
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like the natural path: %v", err)
+		}
+		if !res.(time.Time).Equal(want) {
+			t.Fatalf("resolved %#v, want bare %v", res, want)
+		}
+	})
+
+	t.Run("pointer_target_tagged", func(t *testing.T) {
+		var nat, res *time.Time
+		if _, err := reader.Decode(readerWire, &nat, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resolved.Decode(writerWire, &res, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		if nat == nil || res == nil || !nat.Equal(want) || !res.Equal(want) {
+			t.Fatalf("natural %v / resolved %v, want %v", nat, res, want)
+		}
+	})
+
+	t.Run("json_typed_interface_tagged", func(t *testing.T) {
+		var res nanoer
+		if err := resolved.DecodeJSON([]byte(`5`), &res, TaggedUnions()); err != nil {
+			t.Fatalf("resolved DecodeJSON into non-empty interface must skip the tagged wrap silently: %v", err)
+		}
+		if !res.(time.Time).Equal(want) {
+			t.Fatalf("resolved JSON %#v, want bare %v", res, want)
+		}
+	})
+}
+
+// TestResolvedRecordIntoAnyMapReuseParity verifies the resolved record
+// decoder honors the documented map-reuse contract for *any targets: when
+// the target interface already wraps a map[string]any, schema fields are
+// written into the existing map and unrelated keys are retained (see
+// reuseOrMakeStringAnyMap and TestDecodeReuseAnyTargetStaleKeys, which pin
+// the natural decoder's behavior). The natural decode is the oracle;
+// resolved binary and resolved JSON decodes must match it.
+func TestResolvedRecordIntoAnyMapReuseParity(t *testing.T) {
+	writer, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := Parse(`{"type":"record","name":"R","fields":[{"name":"a","type":"long"},{"name":"b","type":"long","default":7}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(writer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerWire, err := writer.Encode(map[string]any{"a": int64(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerWire, err := reader.Encode(map[string]any{"a": int64(1), "b": int64(7)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"stale": int64(99), "a": int64(1), "b": int64(7)}
+
+	t.Run("binary_preseeded", func(t *testing.T) {
+		// "a" pre-seeded with a different value proves schema keys are
+		// overwritten while unrelated keys survive.
+		var nat any = map[string]any{"stale": int64(99), "a": int64(42)}
+		if _, err := reader.Decode(readerWire, &nat); err != nil {
+			t.Fatal(err)
+		}
+		var res any = map[string]any{"stale": int64(99), "a": int64(42)}
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(nat, res) {
+			t.Fatalf("natural %#v != resolved %#v", nat, res)
+		}
+		if !reflect.DeepEqual(res, want) {
+			t.Fatalf("resolved %#v, want %#v", res, want)
+		}
+	})
+
+	t.Run("binary_fresh", func(t *testing.T) {
+		var res any
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(res, map[string]any{"a": int64(1), "b": int64(7)}) {
+			t.Fatalf("fresh decode got %#v", res)
+		}
+	})
+
+	t.Run("typed_map_preseeded", func(t *testing.T) {
+		nat := map[string]int64{"stale": 99}
+		if _, err := reader.Decode(readerWire, &nat); err != nil {
+			t.Fatal(err)
+		}
+		res := map[string]int64{"stale": 99}
+		if _, err := resolved.Decode(writerWire, &res); err != nil {
+			t.Fatal(err)
+		}
+		exp := map[string]int64{"stale": 99, "a": 1, "b": 7}
+		if !reflect.DeepEqual(nat, exp) || !reflect.DeepEqual(res, exp) {
+			t.Fatalf("natural %v / resolved %v, want %v", nat, res, exp)
+		}
+	})
+
+	t.Run("json_preseeded", func(t *testing.T) {
+		var res any = map[string]any{"stale": int64(99)}
+		if err := resolved.DecodeJSON([]byte(`{"a":1}`), &res); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(res, want) {
+			t.Fatalf("resolved JSON %#v, want %#v", res, want)
+		}
+	})
+}
+
 // --- Direct skip function error path tests ---
 
 func TestSkipBooleanShortBuffer(t *testing.T) {
@@ -1216,7 +1431,7 @@ func TestSkipFixedShortBuffer(t *testing.T) {
 func TestSkipArrayErrors(t *testing.T) {
 	intNode := &schemaNode{kind: "int"}
 	arrNode := &schemaNode{kind: "array", items: intNode}
-	skip := buildSkip(arrNode)
+	skip := buildSkip(arrNode, newMinBytesWalk())
 
 	// Empty buffer: readVarlong fails.
 	_, err := skip(nil, &slab{})
@@ -1270,7 +1485,7 @@ func TestSkipArrayErrors(t *testing.T) {
 func TestSkipMapErrors(t *testing.T) {
 	intNode := &schemaNode{kind: "int"}
 	mapNode := &schemaNode{kind: "map", values: intNode}
-	skip := buildSkip(mapNode)
+	skip := buildSkip(mapNode, newMinBytesWalk())
 
 	// Empty buffer.
 	_, err := skip(nil, &slab{})
@@ -1338,7 +1553,7 @@ func TestSkipUnionErrors(t *testing.T) {
 			{kind: "int"},
 		},
 	}
-	skip := buildSkip(node)
+	skip := buildSkip(node, newMinBytesWalk())
 
 	// Empty buffer: readVarint error.
 	_, err := skip(nil, &slab{})
@@ -1363,7 +1578,7 @@ func TestSkipUnionErrors(t *testing.T) {
 
 func TestBuildSkipUnknownType(t *testing.T) {
 	node := &schemaNode{kind: "unknown_type"}
-	skip := buildSkip(node)
+	skip := buildSkip(node, newMinBytesWalk())
 	_, err := skip([]byte{1, 2, 3}, &slab{})
 	if err == nil {
 		t.Fatal("expected error for unknown type")
@@ -1389,7 +1604,7 @@ func TestSkipRecordFieldError(t *testing.T) {
 			{name: "a", node: &schemaNode{kind: "int"}},
 		},
 	}
-	skip := buildSkip(node)
+	skip := buildSkip(node, newMinBytesWalk())
 	_, err := skip(nil, &slab{})
 	if err == nil {
 		t.Fatal("expected error for truncated record field")
@@ -2238,26 +2453,22 @@ func TestResolveDeserMapNilInit(t *testing.T) {
 }
 
 func TestEncodeDefaultArrayNil(t *testing.T) {
+	// Java, fastavro, and hamba all reject null as an array default
+	// (Schema.java ARRAY case: `if (!defaultValue.isArray()) return
+	// false;`). Accepting it lenient would make a union [Array,null]
+	// with default null match the Array branch (empty-array bytes)
+	// instead of falling through to the null branch.
 	node := &schemaNode{kind: "array", items: &schemaNode{kind: "int"}}
-	encoded, err := encodeDefault(nil, nil, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Nil array encodes as count=0.
-	if len(encoded) != 1 || encoded[0] != 0 {
-		t.Fatalf("expected [0], got %v", encoded)
+	if _, err := encodeDefault(nil, nil, node); err == nil {
+		t.Fatal("expected error for nil array default")
 	}
 }
 
 func TestEncodeDefaultMapNil(t *testing.T) {
+	// Same rationale as TestEncodeDefaultArrayNil: nil is not a map.
 	node := &schemaNode{kind: "map", values: &schemaNode{kind: "int"}}
-	encoded, err := encodeDefault(nil, nil, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Nil map encodes as count=0.
-	if len(encoded) != 1 || encoded[0] != 0 {
-		t.Fatalf("expected [0], got %v", encoded)
+	if _, err := encodeDefault(nil, nil, node); err == nil {
+		t.Fatal("expected error for nil map default")
 	}
 }
 
@@ -2280,6 +2491,12 @@ func TestEncodeDefaultMapValueError(t *testing.T) {
 }
 
 func TestEncodeDefaultRecordNilVal(t *testing.T) {
+	// nil is not a record. Java's isValidDefault rejects (RECORD case:
+	// `if (!defaultValue.isObject()) return false;`); fastavro requires
+	// isinstance(datum, Mapping); hamba returns false on type-assertion
+	// failure. The previous lenient path made unions like [Record,null]
+	// with default null incorrectly encode the Record branch instead of
+	// the null branch.
 	node := &schemaNode{
 		kind: "record",
 		name: "R",
@@ -2287,23 +2504,8 @@ func TestEncodeDefaultRecordNilVal(t *testing.T) {
 			{name: "a", node: &schemaNode{kind: "int"}, defaultVal: float64(0), hasDefault: true},
 		},
 	}
-	// nil val → uses field defaults.
-	encoded, err := encodeDefault(nil, nil, node)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Should encode field "a" with default 0.
-	s, err := Parse(`"int"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var v int32
-	_, err = s.Decode(encoded, &v)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v != 0 {
-		t.Fatalf("expected 0, got %d", v)
+	if _, err := encodeDefault(nil, nil, node); err == nil {
+		t.Fatal("expected error for nil record default")
 	}
 }
 
@@ -2465,7 +2667,7 @@ func TestSkipArrayMinInt64(t *testing.T) {
 	// After reading as negative and negating, -math.MinInt64 overflows to math.MinInt64 (still negative).
 	intNode := &schemaNode{kind: "int"}
 	arrNode := &schemaNode{kind: "array", items: intNode}
-	skip := buildSkip(arrNode)
+	skip := buildSkip(arrNode, newMinBytesWalk())
 
 	// math.MinInt64 zigzag-encoded as varint.
 	data := appendVarlong(nil, math.MinInt64)
@@ -2478,7 +2680,7 @@ func TestSkipArrayMinInt64(t *testing.T) {
 func TestSkipMapMinInt64(t *testing.T) {
 	intNode := &schemaNode{kind: "int"}
 	mapNode := &schemaNode{kind: "map", values: intNode}
-	skip := buildSkip(mapNode)
+	skip := buildSkip(mapNode, newMinBytesWalk())
 
 	data := appendVarlong(nil, math.MinInt64)
 	_, err := skip(data, &slab{})
@@ -2761,6 +2963,87 @@ func TestResolveFullyQualifiedAlias(t *testing.T) {
 	err = CheckCompatibility(writer, reader)
 	if err != nil {
 		t.Fatalf("expected compatible via fully-qualified alias: %v", err)
+	}
+}
+
+// A namespace-qualified alias names exactly that fullname — spec "Aliases":
+// if a type named "a.b" has aliases of "c" and "x.y", the fully qualified
+// names of its aliases are "a.c" and "x.y". It must not match a
+// same-short-name type in a DIFFERENT namespace. Java rewrites writer names
+// through a fullname-keyed alias map (Schema.applyAliases); fastavro
+// matches the writer's fullname or bare short name against the alias
+// strings as written (match_schemas); both reject this pair. Only an alias
+// declared WITHOUT a dot short-matches across namespaces (fastavro's
+// raw-string tier, executed; Java is stricter and fullname-only).
+func TestResolveQualifiedAliasIsNamespaceScoped(t *testing.T) {
+	writer := MustParse(`{"type":"record","name":"n2.Old","fields":[{"name":"a","type":"int"}]}`)
+	reader := MustParse(`{"type":"record","name":"n1.New","aliases":["n1.Old"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writer, reader); err == nil {
+		t.Errorf("CheckCompatibility: qualified alias n1.Old matched writer n2.Old")
+	}
+	if _, err := Resolve(writer, reader); err == nil {
+		t.Errorf("Resolve: qualified alias n1.Old matched writer n2.Old")
+	}
+
+	// The union-branch matcher applies the same rule.
+	readerUnion := MustParse(`["int",{"type":"record","name":"n1.New","aliases":["n1.Old"],"fields":[{"name":"a","type":"int"}]}]`)
+	if err := CheckCompatibility(writer, readerUnion); err == nil {
+		t.Errorf("CheckCompatibility union branch: qualified alias n1.Old matched writer n2.Old")
+	}
+	if _, err := Resolve(writer, readerUnion); err == nil {
+		t.Errorf("Resolve union branch: qualified alias n1.Old matched writer n2.Old")
+	}
+
+	// Kept behaviors: an alias declared without a dot short-matches a
+	// foreign-namespace writer (fastavro's raw-string tier)...
+	readerBare := MustParse(`{"type":"record","name":"n1.New","aliases":["Old"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writer, readerBare); err != nil {
+		t.Errorf("bare alias must keep short-matching a foreign-namespace writer: %v", err)
+	}
+	// ...and a qualified alias matches its exact fullname.
+	writerN1 := MustParse(`{"type":"record","name":"n1.Old","fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writerN1, reader); err != nil {
+		t.Errorf("qualified alias must keep matching its exact fullname: %v", err)
+	}
+}
+
+// Aliases follow the names' dot rule (leadingDotName): a single leading dot
+// with a DOTLESS remainder is the null-namespace escape (".x" is the
+// fullname "x"), and any other dotted spelling is a fullname VERBATIM —
+// Java's Name constructor nulls the space only when it is empty (lastDot
+// split, then `if ("".equals(space)) space = null`), so ".a.b" keeps its
+// non-empty space ".a"; fastavro compares alias strings as written, so a
+// raw ".a.b" matches only a writer literally named ".a.b". Stripping the
+// dot from ".a.b" would match writer "a.b" — a match neither reference
+// makes.
+func TestResolveLeadingDotAliasDotRule(t *testing.T) {
+	lax := WithLaxNames(func(string) error { return nil })
+
+	// The escape spelling keeps working: ".x" aliases the null-namespace x.
+	writerX := MustParse(`{"type":"record","name":"x","fields":[{"name":"a","type":"int"}]}`)
+	readerEsc := MustParse(`{"type":"record","name":"n1.New","aliases":[".x"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writerX, readerEsc); err != nil {
+		t.Errorf(`alias ".x" must keep matching the null-namespace writer x: %v`, err)
+	}
+
+	// A multi-dot leading-dot alias is verbatim: it must NOT match the
+	// dotless-namespace writer a.b ...
+	writerAB := MustParse(`{"type":"record","name":"a.b","fields":[{"name":"a","type":"int"}]}`)
+	readerDot := MustParse(`{"type":"record","name":"n1.New","aliases":[".a.b"],"fields":[{"name":"a","type":"int"}]}`)
+	if err := CheckCompatibility(writerAB, readerDot); err == nil {
+		t.Errorf(`alias ".a.b" matched writer "a.b"; the verbatim spelling denotes only a writer literally named ".a.b"`)
+	}
+	if _, err := Resolve(writerAB, readerDot); err == nil {
+		t.Errorf(`Resolve: alias ".a.b" matched writer "a.b"`)
+	}
+
+	// ... and it DOES match a (lax-named) writer literally called ".a.b".
+	writerDot, err := Parse(`{"type":"record","name":".a.b","fields":[{"name":"a","type":"int"}]}`, lax)
+	if err != nil {
+		t.Fatalf("lax writer .a.b: %v", err)
+	}
+	if err := CheckCompatibility(writerDot, readerDot); err != nil {
+		t.Errorf(`alias ".a.b" must match the writer literally named ".a.b": %v`, err)
 	}
 }
 

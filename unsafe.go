@@ -1,9 +1,9 @@
 package avro
 
 import (
-	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"reflect"
 	"sync"
 	"time"
@@ -33,8 +33,16 @@ type fastFieldSer struct {
 	ser      userfn // non-nil for unsafe-optimized fields (primitives)
 	slowFn   serfn  // non-nil for reflect-based fields (complex types)
 	slowIdx  []int  // field index path for FieldByIndex (used with slowFn)
-	omitzero bool   // if true and field is nullunion, check IsZero before ser
-	nullByte byte   // when omitzero fires, this is the null-branch index byte
+	omitzero bool   // true when omitzero acts on this field (fills a default or null)
+	// when omitzero fires on a zero value, the bytes to emit: the field's
+	// default (ozDefault) or the null-branch index byte (ozNull). Precomputed
+	// at compile from omitzeroAction so the fast path matches the reflect path.
+	omitzeroBytes []byte
+	// omitzeroErr carries serRecordField.defaultErr through the compile, so
+	// the fast path refuses exactly where the reflect path refuses. Copying
+	// the bytes without the verdict that governs them is how a fast path
+	// silently emits what its slow twin rejects.
+	omitzeroErr error
 }
 
 type fastRecordDeser struct {
@@ -61,10 +69,12 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 	for i := range fields {
 		f := &fields[i]
 		offset, goType, ok := computeFieldOffset(t, mapping.indices[i])
-		// omitzero + nullunion fields need a runtime zero check before
-		// encoding, which the unsafe fast path can't do — fall back to
-		// the reflect-based slow path for these fields.
-		oz := mapping.omitzero[i] && f.avroType == "nullunion"
+		// An omitzero field that actually acts (fills a default or a null
+		// branch — see omitzeroAction) needs a runtime zero check the
+		// unsafe fast path can't do, so fall back to the reflect slow path.
+		// A no-op omitzero (non-nullable, no default) just encodes the
+		// value, so it stays on the fast path.
+		oz := mapping.omitzero[i] && f.omitzeroAction() != ozNoop
 		var fn userfn
 		if ok && !oz {
 			fn = tryCompileFieldSer(f, goType)
@@ -84,7 +94,14 @@ func compileFastSer(fields []serRecordField, names []string, cache *sync.Map, t 
 				omitzero: oz,
 			}
 			if oz {
-				ffs.nullByte, _ = nullUnionBytes(f.meta != nil && f.meta.nullSecond)
+				switch f.omitzeroAction() {
+				case ozDefault:
+					ffs.omitzeroBytes = f.defaultBytes
+					ffs.omitzeroErr = f.defaultErr
+				case ozNull:
+					nb, _ := nullUnionBytes(f.meta != nil && f.meta.nullSecond)
+					ffs.omitzeroBytes = []byte{nb}
+				}
 			}
 			fast.fields[i] = ffs
 		}
@@ -153,12 +170,16 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 		if f.ser != nil {
 			dst, err = f.ser(dst, unsafe.Add(base, f.offset), depth+1)
 		} else {
-			fv := v.FieldByIndex(f.slowIdx)
+			fv := fieldByIndexZero(v, f.slowIdx)
 			if f.omitzero && valueIsZero(fv) {
-				// f.nullByte is populated at compile (compileFastSer)
-				// from fieldMeta.nullSecond — 0x00 for ["null",T],
-				// 0x02 for ["T","null"].
-				dst = append(dst, f.nullByte)
+				// f.omitzeroBytes is populated at compile (compileFastSer)
+				// from omitzeroAction — the field's default, or the
+				// null-branch byte (0x00 for ["null",T], 0x02 for
+				// ["T","null"]).
+				if f.omitzeroErr != nil {
+					return nil, recordFieldError(fast.typ, f.name, f.omitzeroErr)
+				}
+				dst = append(dst, f.omitzeroBytes...)
 				continue
 			}
 			dst, err = f.slowFn(dst, fv, depth+1)
@@ -170,12 +191,19 @@ func serRecordFast(dst []byte, fast *fastRecordSer, v reflect.Value, depth int) 
 	return dst, nil
 }
 
+// deserRecordFast is the unsafe fast body for ONE record node. Its only
+// caller is deserRecord.deser, which has already bumped sl.depth (and run
+// the maxDepth guard) for this exact record node. It therefore does NOT
+// bump again: a record is one schema node and must cost exactly one depth
+// unit regardless of whether it is decoded via the reflect body, the fast
+// body, or the reflect-body-then-fast-body chain. Double-bumping here
+// would halve the bound for struct-fast records vs the reflect/map path
+// and break depth uniformity (deserRecordFastPtr, the OTHER fast entry,
+// is reached on child edges that bypass deserRecord.deser, so it keeps
+// its own bump — it is the sole record-node entry on those paths).
 func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *slab) ([]byte, error) {
-	if sl.depth >= maxDepth {
-		return nil, errTooDeep
-	}
-	sl.depth++
-	defer func() { sl.depth-- }()
+	// No sl.depth++/guard here: deserRecord.deser (the only caller) already
+	// bumped and guarded for this exact record node. See the doc comment.
 	base := v.Addr().UnsafePointer()
 	var err error
 	for i := range fast.fields {
@@ -183,7 +211,11 @@ func deserRecordFast(src []byte, fast *fastRecordDeser, v reflect.Value, sl *sla
 		if f.deser != nil {
 			src, err = f.deser(src, unsafe.Add(base, f.offset), sl)
 		} else {
-			src, err = f.slowFn(src, fieldByIndex(v, f.slowIdx), sl)
+			fv, ferr := fieldByIndex(v, f.slowIdx)
+			if ferr != nil {
+				return nil, recordFieldError(fast.typ, f.name, ferr)
+			}
+			src, err = f.slowFn(src, fv, sl)
 		}
 		if err != nil {
 			return nil, recordFieldError(fast.typ, f.name, err)
@@ -227,6 +259,33 @@ func deserRecordFastPtr(src []byte, fast *fastRecordDeser, base unsafe.Pointer, 
 	return src, nil
 }
 
+// serRecordVia dispatches one record encode via the all-fast unsafe
+// path when available, falling back to the reflect-based path.
+// Callers pass pre-resolved fast (from rec.fastFor) so per-element
+// loops compute the lookup once outside the loop.
+//
+// Do NOT inline this into per-element array loops: the helper exceeds
+// the Go inline budget (cost ~290 vs 80) because reflect.NewAt+Elem
+// counts as interface method calls, and the t/rec parameters escape
+// to heap. The four array sites in this file (usArrayRecord,
+// usArrayPtrRecord, usArrayNullUnionRecord, udArrayPtrRecord) keep
+// the if/else open-coded with useFast hoisted outside the loop.
+func serRecordVia(dst []byte, fast *fastRecordSer, rec *serRecord, t reflect.Type, p unsafe.Pointer, depth int) ([]byte, error) {
+	if fast != nil && fast.allFast {
+		return serRecordFastPtr(dst, fast, p, depth)
+	}
+	return rec.ser(dst, reflect.NewAt(t, p).Elem(), depth)
+}
+
+// deserRecordVia is serRecordVia's decode-side mirror. The same
+// inline-budget caveat applies: do not use in per-element loops.
+func deserRecordVia(src []byte, fast *fastRecordDeser, rec *deserRecord, t reflect.Type, p unsafe.Pointer, sl *slab) ([]byte, error) {
+	if fast != nil && fast.allFast {
+		return deserRecordFastPtr(src, fast, p, sl)
+	}
+	return rec.deser(src, reflect.NewAt(t, p).Elem(), sl)
+}
+
 // tryCompileFieldSer returns a userfn for fields that can be fully handled
 // via unsafe pointer access. Returns nil for complex types that must use
 // the reflect-based slow path.
@@ -256,6 +315,20 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			return nil
 		}
 		innerGoType := goType.Elem()
+		// The inner is nil-able beyond the outer pointer: a non-nil *T
+		// wrapping a nil pointer (**T), a nil slice (*[]E), a nil map
+		// (*map[K]V), or a nil interface (*iface) is nil-equivalent per
+		// isNilValue, which peels the outer pointer then nil-checks the
+		// bottom kind — so the reflect path encodes the null branch. The
+		// unsafe enter (usNullUnionEnter) tests ONLY the outer pointer and
+		// would commit to the value branch (then either emit an empty
+		// slice/map or fault on the nil inner). Decline the whole nilable
+		// inner set to the reflect path, which consults isNilValue; this
+		// gate is the fifth dispatch site isNilValue's contract names, kept
+		// in lockstep via the shared isNilableKind predicate.
+		if isNilableKind(innerGoType.Kind()) {
+			return nil
+		}
 		if inner.serRecord != nil {
 			return usNullUnionRecord(inner.serRecord, innerGoType, nullByte, valByte)
 		}
@@ -279,6 +352,16 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 		switch inner.avroType {
 		case "nullunion":
 			if elemGoType.Kind() != reflect.Pointer {
+				return nil
+			}
+			// Element inner nil-able beyond the outer pointer ([]**T,
+			// []*[]E, []*map[K]V, []*iface): &(nilInner) is nil-equivalent
+			// per isNilValue (peels the outer pointer then nil-checks the
+			// bottom kind → null branch on reflect/JSON); the unsafe array
+			// enter tests only the outer pointer and would emit the value
+			// branch. Decline the whole nilable inner set to the reflect
+			// path. (See the field nullunion case; shared isNilableKind.)
+			if isNilableKind(elemGoType.Elem().Kind()) {
 				return nil
 			}
 			nullByte, valByte := nullUnionBytes(inner.nullSecond)
@@ -314,15 +397,43 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			return nil
 		}
 		rec := f.meta.serRecord
+		// depth (not depth+1): the field-pass call in serRecordFast/Ptr
+		// already incremented for the parent-record→child-record edge.
+		// The field IS the child record node, so its node depth equals the
+		// field-pass depth; serRecordVia treats its depth arg as the
+		// record's node depth. Adding +1 here would charge the single edge
+		// twice (the reflect path and every decode path charge it once),
+		// breaking depth uniformity for a directly-nested struct record.
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			if fast := rec.fast.Load(); fast != nil && fast.typ == goType && fast.allFast {
-				return serRecordFastPtr(dst, fast, p, depth+1)
-			}
-			return rec.ser(dst, reflect.NewAt(goType, p).Elem(), depth+1)
+			return serRecordVia(dst, rec.fastFor(goType), rec, goType, p, depth)
 		}
 	}
 
 	if k == reflect.Pointer {
+		// Bound the pointer-chain peel before recursing on the element type.
+		// A cyclic non-struct pointer type (type P *P, whose reflect graph has
+		// P.Elem() == P) would recurse here forever AT COMPILE TIME and
+		// overflow the goroutine stack — a fatal, unrecoverable crash. A
+		// non-cyclic chain too deep for the reflect encoder also matters: the
+		// reflect path (serIndirect → indirect) peels at most maxIndirectDepth
+		// levels and accepts a chain bottoming at a non-pointer base within
+		// that cap — maxIndirectDepth pointer levels — erroring only beyond it.
+		// An unbounded fast path would instead accept arbitrarily deep chains,
+		// diverging from the reflect encoder it must mirror byte-for-byte.
+		// Counting the consecutive pointer levels and declining BEYOND
+		// maxIndirectDepth terminates the cycle and keeps the fast path's accept
+		// set identical to the reflect encoder's: a chain within the cap
+		// compiles, a deeper one routes to the reflect slow path, which errors
+		// uniformly (errIndirectDeep / errIndirectNil). Mirrors
+		// tryCompileFieldDeser (declines all pointers) and the multi-pointer
+		// nullunion/array arms.
+		levels := 1
+		for e := goType.Elem(); e.Kind() == reflect.Pointer; e = e.Elem() {
+			levels++
+			if levels > maxIndirectDepth {
+				return nil
+			}
+		}
 		inner := tryCompileFieldSer(f, goType.Elem())
 		if inner == nil {
 			return nil
@@ -347,15 +458,23 @@ func tryCompileFieldSer(f *serRecordField, goType reflect.Type) userfn {
 			return usBool
 		}
 	case "int":
-		return usInt(k)
+		return usInt(goType)
 	case "long":
-		return usLong(k)
+		return usLong(goType)
 	case "float":
 		return usFloat(k)
 	case "double":
 		return usDouble(k)
 	case "string":
 		if k == reflect.String {
+			// json.Number and text-method string-kind types take the safe
+			// path: the unsafe *(*string)(p) read would write the raw
+			// underlying string, bypassing appendAvroString's json.Number
+			// reject and text-out arm — diverging a struct field from the
+			// scalar encode of the same value. See stringFastPathEligibleEncode.
+			if !stringFastPathEligibleEncode(goType) {
+				return nil
+			}
 			return usString
 		}
 	case "bytes":
@@ -398,6 +517,20 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 			return nil
 		}
 		innerGoType := goType.Elem()
+		// A multi-level-pointer target (**…T) declines to the reflect path,
+		// mirroring the encode field-nullunion decline. udNullUnionRecord/
+		// udNullUnionPtr consume the outer pointer (the nullunion optional) via
+		// goType.Elem() and then indirectAlloc the remainder — peeling one level
+		// past the cap, so a **…T target would accept 1+maxIndirectDepth levels
+		// where the reflect deser (deserNullUnionAt hands the un-indirected
+		// target to the branch fn, whose single indirectAlloc caps the whole
+		// chain at maxIndirectDepth), the encode side, and every other context
+		// reject. (A primitive inner already declines below when
+		// tryCompileFieldDeser refuses the *…T innerGoType; the record inner has
+		// its own branch, so the guard must precede it.)
+		if innerGoType.Kind() == reflect.Pointer {
+			return nil
+		}
 		if inner.deserRecord != nil {
 			return udNullUnionRecord(inner.deserRecord, innerGoType, valIdx, nullByte, valByte)
 		}
@@ -423,7 +556,16 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		elemGoType := goType.Elem()
 		switch inner.avroType {
 		case "record":
-			if inner.deserRecord != nil && elemGoType.Kind() == reflect.Pointer {
+			// A multi-level-pointer element ([]**…record) declines to the safe
+			// path: it falls to default → tryCompileFieldDeser rejects the
+			// **record element (the record arm needs a struct, the generic
+			// pointer arm declines all pointers), so the field's reflect deser
+			// handles it with a single indirectAlloc budget. The fast
+			// udArrayPtrRecord peels one pointer level inline and rec.deser peels
+			// a FURTHER maxIndirectDepth, accepting 1+maxIndirectDepth — one past
+			// the cap every other path enforces. Mirrors the encode usArrayRecord
+			// decline; the fast path stays single-pointer only ([]*record).
+			if inner.deserRecord != nil && elemGoType.Kind() == reflect.Pointer && elemGoType.Elem().Kind() != reflect.Pointer {
 				return udArrayPtrRecord(inner.deserRecord, elemGoType.Elem(), goType, inner.minBytes)
 			}
 		default:
@@ -445,10 +587,7 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 		}
 		rec := f.meta.deserRecord
 		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			if fast := rec.fast.Load(); fast != nil && fast.typ == goType && fast.allFast {
-				return deserRecordFastPtr(src, fast, p, sl)
-			}
-			return rec.deser(src, reflect.NewAt(goType, p).Elem(), sl)
+			return deserRecordVia(src, rec.fastFor(goType), rec, goType, p, sl)
 		}
 	}
 
@@ -468,15 +607,23 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 			return udBool
 		}
 	case "int":
-		return udInt(k)
+		return udInt(goType)
 	case "long":
-		return udLong(k)
+		return udLong(goType)
 	case "float":
 		return udFloat(k)
 	case "double":
-		return udDouble(k)
+		return udDouble(goType)
 	case "string":
 		if k == reflect.String {
+			// json.Number and TextUnmarshaler string-kind types take the
+			// safe path: the unsafe *(*string)(p)=... store would bypass
+			// setStringValue's json.Number RFC 8259 guard and UnmarshalText
+			// arm — diverging a struct field from the scalar decode of the
+			// same target. See stringFastPathEligibleDecode.
+			if !stringFastPathEligibleDecode(goType) {
+				return nil
+			}
 			return udStringDeser
 		}
 	case "bytes":
@@ -490,43 +637,31 @@ func tryCompileFieldDeser(f *deserRecordField, goType reflect.Type) udeserfn {
 
 // ---- Logical type unsafe serializers ----
 
+// usTimestampLogicals maps the six long-typed timestamp logicals to
+// their time.Time-target unsafe serializer. Non-time.Time targets fall
+// back to usLong(kind) at the dispatch site below.
+var usTimestampLogicals = map[string]userfn{
+	"timestamp-millis":       usTimestampMillis,
+	"timestamp-micros":       usTimestampMicros,
+	"timestamp-nanos":        usTimestampNanos,
+	"local-timestamp-millis": usLocalTimestampMillis,
+	"local-timestamp-micros": usLocalTimestampMicros,
+	"local-timestamp-nanos":  usLocalTimestampNanos,
+}
+
 func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn {
+	if fn, ok := usTimestampLogicals[logical]; ok {
+		if goType == timeType {
+			return fn
+		}
+		return usLong(goType)
+	}
 	switch logical {
-	case "timestamp-millis":
-		if goType == timeType {
-			return usTimestampMillis
-		}
-		return usLong(goType.Kind())
-	case "timestamp-micros":
-		if goType == timeType {
-			return usTimestampMicros
-		}
-		return usLong(goType.Kind())
-	case "timestamp-nanos":
-		if goType == timeType {
-			return usTimestampNanos
-		}
-		return usLong(goType.Kind())
-	case "local-timestamp-millis":
-		if goType == timeType {
-			return usLocalTimestampMillis
-		}
-		return usLong(goType.Kind())
-	case "local-timestamp-micros":
-		if goType == timeType {
-			return usLocalTimestampMicros
-		}
-		return usLong(goType.Kind())
-	case "local-timestamp-nanos":
-		if goType == timeType {
-			return usLocalTimestampNanos
-		}
-		return usLong(goType.Kind())
 	case "date":
 		if goType == timeType {
 			return usDate
 		}
-		return usInt(goType.Kind())
+		return usInt(goType)
 	case "time-millis":
 		if goType == durationType {
 			return usTimeMillis
@@ -534,7 +669,7 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 		if goType == timeType {
 			return usTimeMillisTime
 		}
-		return usInt(goType.Kind())
+		return usInt(goType)
 	case "time-micros":
 		if goType == durationType {
 			return usTimeMicros
@@ -542,7 +677,7 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 		if goType == timeType {
 			return usTimeMicrosTime
 		}
-		return usLong(goType.Kind())
+		return usLong(goType)
 	case "duration":
 		if goType == avroDurationType {
 			return usDuration
@@ -551,6 +686,13 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 	case "uuid":
 		if avroType == "fixed" {
 			if goType.Kind() == reflect.String {
+				// text-method (and json.Number) string-kind types take the
+				// safe path so serFixedUUIDReflect's text-before-string-kind
+				// order applies; json.Number reaches the same parseUUID
+				// outcome on either path. See stringFastPathEligibleEncode.
+				if !stringFastPathEligibleEncode(goType) {
+					return nil
+				}
 				return usFixedUUIDString
 			}
 			return nil // [16]byte, []byte handled by default fixed ser
@@ -559,34 +701,45 @@ func tryCompileLogicalSer(logical, avroType string, goType reflect.Type) userfn 
 			return usUUID
 		}
 		if goType.Kind() == reflect.String {
+			// json.Number/text string+uuid: usString would emit the raw
+			// underlying string as the wire UUID with no validation / no
+			// text-out; the safe path's serUUID → appendAvroString applies
+			// both. See stringFastPathEligibleEncode.
+			if !stringFastPathEligibleEncode(goType) {
+				return nil
+			}
 			return usString
 		}
 	}
 	return nil
 }
 
+// udTimestampLogicals maps the six long-typed timestamp logicals to
+// their time.Time-target unsafe deserializer (local-timestamp-* and
+// timestamp-* decode identically; the wire long is interpreted the same
+// way — see logical.go for the encode-side wall-clock vs instant note).
+var udTimestampLogicals = map[string]udeserfn{
+	"timestamp-millis":       udTimestampMillis,
+	"timestamp-micros":       udTimestampMicros,
+	"timestamp-nanos":        udTimestampNanos,
+	"local-timestamp-millis": udTimestampMillis,
+	"local-timestamp-micros": udTimestampMicros,
+	"local-timestamp-nanos":  udTimestampNanos,
+}
+
 func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udeserfn {
+	if fn, ok := udTimestampLogicals[logical]; ok {
+		if goType == timeType {
+			return fn
+		}
+		return udLong(goType)
+	}
 	switch logical {
-	case "timestamp-millis", "local-timestamp-millis":
-		if goType == timeType {
-			return udTimestampMillis
-		}
-		return udLong(goType.Kind())
-	case "timestamp-micros", "local-timestamp-micros":
-		if goType == timeType {
-			return udTimestampMicros
-		}
-		return udLong(goType.Kind())
-	case "timestamp-nanos", "local-timestamp-nanos":
-		if goType == timeType {
-			return udTimestampNanos
-		}
-		return udLong(goType.Kind())
 	case "date":
 		if goType == timeType {
 			return udDate
 		}
-		return udInt(goType.Kind())
+		return udInt(goType)
 	case "time-millis":
 		if goType == durationType {
 			return udTimeMillis
@@ -594,7 +747,7 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 		if goType == timeType {
 			return udTimeMillisTime
 		}
-		return udInt(goType.Kind())
+		return udInt(goType)
 	case "time-micros":
 		if goType == durationType {
 			return udTimeMicros
@@ -602,7 +755,7 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 		if goType == timeType {
 			return udTimeMicrosTime
 		}
-		return udLong(goType.Kind())
+		return udLong(goType)
 	case "duration":
 		if goType == avroDurationType {
 			return udDuration
@@ -614,6 +767,12 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 				return udFixedUUID
 			}
 			if goType.Kind() == reflect.String {
+				// Safe path enforces the json.Number guard and the
+				// TextUnmarshaler arm (deserFixedUUIDReflect tries
+				// UnmarshalText before the string-kind setStringTarget).
+				if !stringFastPathEligibleDecode(goType) {
+					return nil
+				}
 				return udFixedUUIDString
 			}
 			return nil // any, []byte etc. handled by reflect path
@@ -622,6 +781,11 @@ func tryCompileLogicalDeser(logical, avroType string, goType reflect.Type) udese
 			return udUUID
 		}
 		if goType.Kind() == reflect.String {
+			// Safe path enforces the json.Number guard and the
+			// TextUnmarshaler arm.
+			if !stringFastPathEligibleDecode(goType) {
+				return nil
+			}
 			return udStringDeser
 		}
 	}
@@ -684,9 +848,7 @@ func usTimeMillis(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 // time-of-day fields and encodes as time-millis, mirroring the
 // serTimeMillis(timeType) safe-path arm.
 func usTimeMillisTime(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-	t := *(*time.Time)(p)
-	d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
-	ms, err := durationToTimeMillis(d)
+	ms, err := durationToTimeMillis(timeOfDay(*(*time.Time)(p)))
 	if err != nil {
 		return nil, &SemanticError{GoType: timeType, AvroType: "time-millis", Err: err}
 	}
@@ -699,111 +861,81 @@ func usTimeMicros(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 
 // usTimeMicrosTime mirrors serTimeMicros(timeType).
 func usTimeMicrosTime(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-	t := *(*time.Time)(p)
-	d := time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute + time.Duration(t.Second())*time.Second + time.Duration(t.Nanosecond())
-	return appendVarlong(dst, d.Microseconds()), nil
+	return appendVarlong(dst, timeOfDay(*(*time.Time)(p)).Microseconds()), nil
 }
 
-func udTimestampMillis(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
+// udTimeFromVarint reads a varint and stores conv(val) into *T.
+func udTimeFromVarint[T any](conv func(int32) T) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		val, src, err := readVarint(src)
+		if err != nil {
+			return nil, err
+		}
+		*(*T)(p) = conv(val)
+		return src, nil
 	}
-	*(*time.Time)(p) = timestampMillisToTime(val)
-	return src, nil
 }
 
-func udTimestampMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
+// udTimeFromVarlong is udTimeFromVarint's varlong sibling.
+func udTimeFromVarlong[T any](conv func(int64) T) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		val, src, err := readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		*(*T)(p) = conv(val)
+		return src, nil
 	}
-	*(*time.Time)(p) = timestampMicrosToTime(val)
-	return src, nil
 }
 
-func udTimestampNanos(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
+// udTimeFromVarlongChecked is udTimeFromVarlong for fallible converters.
+func udTimeFromVarlongChecked[T any](conv func(int64) (T, error)) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		val, src, err := readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		out, err := conv(val)
+		if err != nil {
+			return nil, err
+		}
+		*(*T)(p) = out
+		return src, nil
 	}
-	*(*time.Time)(p) = timestampNanosToTime(val)
-	return src, nil
 }
 
-func udDate(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Time)(p) = dateToTime(val)
-	return src, nil
-}
-
-func udTimeMillis(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Duration)(p) = timeMillisToDuration(val)
-	return src, nil
-}
-
-// udTimeMillisTime is the time.Time variant of udTimeMillis, materializing
-// the time-of-day duration at epoch midnight (UTC). Mirrors
-// deserTimeMillis's timeType safe-path arm.
-func udTimeMillisTime(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Time)(p) = timeOfDayToTime(timeMillisToDuration(val))
-	return src, nil
-}
-
-func udTimeMicros(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
-	}
-	d, err := timeMicrosToDuration(val)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Duration)(p) = d
-	return src, nil
-}
-
-// udTimeMicrosTime is the time.Time variant of udTimeMicros.
-func udTimeMicrosTime(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
-	}
-	d, err := timeMicrosToDuration(val)
-	if err != nil {
-		return nil, err
-	}
-	*(*time.Time)(p) = timeOfDayToTime(d)
-	return src, nil
-}
+// *Time variants materialize the time-of-day count as a time.Time at
+// epoch midnight (UTC) — used when a struct field is typed as time.Time
+// but the schema is time-millis/time-micros.
+var (
+	udTimestampMillis = udTimeFromVarlong(timestampMillisToTime)
+	udTimestampMicros = udTimeFromVarlong(timestampMicrosToTime)
+	udTimestampNanos  = udTimeFromVarlong(timestampNanosToTime)
+	udDate            = udTimeFromVarint(dateToTime)
+	udTimeMillis      = udTimeFromVarint(timeMillisToDuration)
+	udTimeMillisTime  = udTimeFromVarint(func(v int32) time.Time {
+		return timeOfDayToTime(timeMillisToDuration(v))
+	})
+	udTimeMicros     = udTimeFromVarlongChecked(timeMicrosToDuration)
+	udTimeMicrosTime = udTimeFromVarlongChecked(func(v int64) (time.Time, error) {
+		d, err := timeMicrosToDuration(v)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return timeOfDayToTime(d), nil
+	})
+)
 
 func usDuration(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-	d := *(*Duration)(p)
-	dst = appendUint32(dst, d.Months)
-	dst = appendUint32(dst, d.Days)
-	dst = appendUint32(dst, d.Milliseconds)
-	return dst, nil
+	b := (*(*Duration)(p)).Bytes()
+	return append(dst, b[:]...), nil
 }
 
 func udDuration(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	if len(src) < 12 {
-		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
+	if err := needLen(src, 12, "duration"); err != nil {
+		return nil, err
 	}
-	d := (*Duration)(p)
-	d.Months = uint32(src[0]) | uint32(src[1])<<8 | uint32(src[2])<<16 | uint32(src[3])<<24
-	d.Days = uint32(src[4]) | uint32(src[5])<<8 | uint32(src[6])<<16 | uint32(src[7])<<24
-	d.Milliseconds = uint32(src[8]) | uint32(src[9])<<8 | uint32(src[10])<<16 | uint32(src[11])<<24
+	*(*Duration)(p) = DurationFromBytes(src[:12])
 	return src[12:], nil
 }
 
@@ -825,24 +957,34 @@ func udUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src[n:], nil
 }
 
+// readFixedUUID validates len(src) ≥ 16 and returns the next UUID bytes
+// plus the advanced source slice. Shared body of udFixedUUID (writes
+// [16]byte) and udFixedUUIDString (writes the canonical string form).
+func readFixedUUID(src []byte) ([16]byte, []byte, error) {
+	if err := needLen(src, 16, "uuid"); err != nil {
+		return [16]byte{}, nil, err
+	}
+	return [16]byte(src[:16]), src[16:], nil
+}
+
 // udFixedUUID reads 16 raw bytes from a fixed(16) UUID and writes a [16]byte.
 // Used when the target is [16]byte or any (interface).
 func udFixedUUID(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	if len(src) < 16 {
-		return nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	u, src, err := readFixedUUID(src)
+	if err == nil {
+		*(*[16]byte)(p) = u
 	}
-	*(*[16]byte)(p) = [16]byte(src[:16])
-	return src[16:], nil
+	return src, err
 }
 
 // udFixedUUIDString reads 16 raw bytes from a fixed(16) UUID and writes a
 // formatted UUID string (e.g. "550e8400-e29b-41d4-a716-446655440000").
 func udFixedUUIDString(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-	if len(src) < 16 {
-		return nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	u, src, err := readFixedUUID(src)
+	if err == nil {
+		*(*string)(p) = uuidToString(u)
 	}
-	*(*string)(p) = uuidToString([16]byte(src[:16]))
-	return src[16:], nil
+	return src, err
 }
 
 // usFixedUUIDString serializes a UUID string to 16 raw fixed bytes.
@@ -866,65 +1008,74 @@ func usBool(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 	return append(dst, 0), nil
 }
 
-func usInt(k reflect.Kind) userfn {
-	switch k {
+// usVarintFrom is udVarintTo's serialize-side mirror: reads a typed
+// integer via unsafe pointer, range-checks, writes as Avro int. t is the
+// Go field type, set on the SemanticError so the unsafe struct-field path
+// reports the same GoType as the reflect path (appendAvroInt in ser.go).
+func usVarintFrom[T intLike](lo, hi int64, t reflect.Type) userfn {
+	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
+		n := int64(*(*T)(p))
+		if n < lo || n > hi {
+			return nil, &SemanticError{GoType: t, AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
+		}
+		return appendVarint(dst, int32(n)), nil
+	}
+}
+
+// usVarlongFrom is usVarintFrom's varlong (Avro long) sibling.
+func usVarlongFrom[T intLike](lo, hi int64, t reflect.Type) userfn {
+	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
+		n := int64(*(*T)(p))
+		if n < lo || n > hi {
+			return nil, &SemanticError{GoType: t, AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
+		}
+		return appendVarlong(dst, n), nil
+	}
+}
+
+// usVarlongFromUnsigned is usVarlongFrom for unsigned T. The upper
+// bound is checked in uint64 space since uint64 > MaxInt64 can't
+// round-trip through int64.
+func usVarlongFromUnsigned[T uint | uint8 | uint16 | uint32 | uint64](t reflect.Type) userfn {
+	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
+		n := uint64(*(*T)(p))
+		if n > math.MaxInt64 {
+			return nil, &SemanticError{GoType: t, AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
+		}
+		return appendVarlong(dst, int64(n)), nil
+	}
+}
+
+func usInt(t reflect.Type) userfn {
+	switch t.Kind() {
 	case reflect.Int:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*int)(p)
-			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			return appendVarint(dst, int32(n)), nil
-		}
+		// On 64-bit int can exceed int32; bound check applies.
+		return usVarintFrom[int](math.MinInt32, math.MaxInt32, t)
 	case reflect.Int8:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, int32(*(*int8)(p))), nil
-		}
+		return usVarintFrom[int8](math.MinInt64, math.MaxInt64, t)
 	case reflect.Int16:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, int32(*(*int16)(p))), nil
-		}
+		return usVarintFrom[int16](math.MinInt64, math.MaxInt64, t)
 	case reflect.Int32:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, *(*int32)(p)), nil
-		}
+		return usVarintFrom[int32](math.MinInt64, math.MaxInt64, t)
 	case reflect.Int64:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*int64)(p)
-			if n < math.MinInt32 || n > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			return appendVarint(dst, int32(n)), nil
-		}
+		return usVarintFrom[int64](math.MinInt32, math.MaxInt32, t)
 	case reflect.Uint:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*uint)(p)
-			if n > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			return appendVarint(dst, int32(n)), nil
-		}
+		// uint as int64 max — bound applies on 64-bit too (uint > MaxInt32 possible).
+		return usVarintFrom[uint](0, math.MaxInt32, t)
 	case reflect.Uint8:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint8)(p))), nil
-		}
+		return usVarintFrom[uint8](math.MinInt64, math.MaxInt64, t)
 	case reflect.Uint16:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarint(dst, int32(*(*uint16)(p))), nil
-		}
+		return usVarintFrom[uint16](math.MinInt64, math.MaxInt64, t)
 	case reflect.Uint32:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*uint32)(p)
-			if n > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
-			}
-			return appendVarint(dst, int32(n)), nil
-		}
+		return usVarintFrom[uint32](0, math.MaxInt32, t)
 	case reflect.Uint64:
+		// uint64 > MaxInt64 can't be represented as int64 — but the
+		// usVarintFrom int64 cast already truncates negative-when-
+		// reinterpreted values. Use the unsigned-aware bound directly.
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 			n := *(*uint64)(p)
 			if n > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
+				return nil, &SemanticError{GoType: t, AvroType: "int", Err: fmt.Errorf("value %d overflows int32", n)}
 			}
 			return appendVarint(dst, int32(n)), nil
 		}
@@ -933,56 +1084,28 @@ func usInt(k reflect.Kind) userfn {
 	}
 }
 
-func usLong(k reflect.Kind) userfn {
-	switch k {
+func usLong(t reflect.Type) userfn {
+	switch t.Kind() {
 	case reflect.Int:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*int)(p))), nil
-		}
+		return usVarlongFrom[int](math.MinInt64, math.MaxInt64, t)
 	case reflect.Int8:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*int8)(p))), nil
-		}
+		return usVarlongFrom[int8](math.MinInt64, math.MaxInt64, t)
 	case reflect.Int16:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*int16)(p))), nil
-		}
+		return usVarlongFrom[int16](math.MinInt64, math.MaxInt64, t)
 	case reflect.Int32:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*int32)(p))), nil
-		}
+		return usVarlongFrom[int32](math.MinInt64, math.MaxInt64, t)
 	case reflect.Int64:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, *(*int64)(p)), nil
-		}
+		return usVarlongFrom[int64](math.MinInt64, math.MaxInt64, t)
 	case reflect.Uint:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*uint)(p)
-			if uint64(n) > math.MaxInt64 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
-			}
-			return appendVarlong(dst, int64(n)), nil
-		}
+		return usVarlongFromUnsigned[uint](t)
 	case reflect.Uint8:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*uint8)(p))), nil
-		}
+		return usVarlongFromUnsigned[uint8](t)
 	case reflect.Uint16:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*uint16)(p))), nil
-		}
+		return usVarlongFromUnsigned[uint16](t)
 	case reflect.Uint32:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			return appendVarlong(dst, int64(*(*uint32)(p))), nil
-		}
+		return usVarlongFromUnsigned[uint32](t)
 	case reflect.Uint64:
-		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			n := *(*uint64)(p)
-			if n > math.MaxInt64 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int64", n)}
-			}
-			return appendVarlong(dst, int64(n)), nil
-		}
+		return usVarlongFromUnsigned[uint64](t)
 	default:
 		return nil
 	}
@@ -996,12 +1119,9 @@ func usFloat(k reflect.Kind) userfn {
 		}
 	case reflect.Float64:
 		return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-			f := *(*float64)(p)
-			// Match serFloat: reject silent narrowing to ±Inf for finite inputs.
-			if finiteFloat32Overflows(f) {
-				return nil, &SemanticError{AvroType: "float", Err: fmt.Errorf("value %g overflows float32", f)}
-			}
-			return appendUint32(dst, math.Float32bits(float32(f))), nil
+			// Lossy-destination: finite float64 → float32 silently narrows
+			// to ±Inf when out of range (matches appendAvroFloat32 / Java).
+			return appendUint32(dst, math.Float32bits(float32(*(*float64)(p)))), nil
 		}
 	default:
 		return nil
@@ -1049,247 +1169,108 @@ func udBool(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 	return src[1:], nil
 }
 
-func udInt(k reflect.Kind) udeserfn {
-	switch k {
+// intLike covers all signed and unsigned integer kinds.
+type intLike interface {
+	~int | ~int8 | ~int16 | ~int32 | ~int64 |
+		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64
+}
+
+// udVarintTo reads a varint (int32 wire), range-checks against [lo, hi]
+// in int64 space, and stores the narrowed result into *T. lo=MinInt64 /
+// hi=MaxInt64 disables the range check.
+func udVarintTo[T intLike](lo, hi int64, avroType string, t reflect.Type) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		v, src, err := readVarint(src)
+		if err != nil {
+			return nil, err
+		}
+		if int64(v) < lo || int64(v) > hi {
+			return nil, &SemanticError{GoType: t, AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", v, t)}
+		}
+		*(*T)(p) = T(v)
+		return src, nil
+	}
+}
+
+// udVarlongTo is udVarintTo's varlong (int64 wire) sibling.
+func udVarlongTo[T intLike](lo, hi int64, avroType string, t reflect.Type) udeserfn {
+	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
+		v, src, err := readVarlong(src)
+		if err != nil {
+			return nil, err
+		}
+		if v < lo || v > hi {
+			return nil, &SemanticError{GoType: t, AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", v, t)}
+		}
+		*(*T)(p) = T(v)
+		return src, nil
+	}
+}
+
+func udInt(t reflect.Type) udeserfn {
+	switch t.Kind() {
 	case reflect.Int:
-		// int32 always fits in int (int is int32 or int64).
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			*(*int)(p) = int(v)
-			return src, nil
-		}
+		// int32 wire always fits in int (int is int32 or int64).
+		return udVarintTo[int](math.MinInt64, math.MaxInt64, "int", t)
 	case reflect.Int8:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt8 || v > math.MaxInt8 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int8", v)}
-			}
-			*(*int8)(p) = int8(v)
-			return src, nil
-		}
+		return udVarintTo[int8](math.MinInt8, math.MaxInt8, "int", t)
 	case reflect.Int16:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt16 || v > math.MaxInt16 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows int16", v)}
-			}
-			*(*int16)(p) = int16(v)
-			return src, nil
-		}
+		return udVarintTo[int16](math.MinInt16, math.MaxInt16, "int", t)
 	case reflect.Int32:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			*(*int32)(p) = v
-			return src, nil
-		}
+		return udVarintTo[int32](math.MinInt64, math.MaxInt64, "int", t)
 	case reflect.Int64:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			*(*int64)(p) = int64(v)
-			return src, nil
-		}
+		return udVarintTo[int64](math.MinInt64, math.MaxInt64, "int", t)
 	case reflect.Uint:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint", v)}
-			}
-			*(*uint)(p) = uint(v)
-			return src, nil
-		}
+		// Varint wire is int32; uint is always wide enough — only
+		// the lower-bound (v < 0) check matters. hi=MaxInt64 is
+		// effectively unbounded.
+		return udVarintTo[uint](0, math.MaxInt64, "int", t)
 	case reflect.Uint8:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint8 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint8", v)}
-			}
-			*(*uint8)(p) = uint8(v)
-			return src, nil
-		}
+		return udVarintTo[uint8](0, math.MaxUint8, "int", t)
 	case reflect.Uint16:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint16 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint16", v)}
-			}
-			*(*uint16)(p) = uint16(v)
-			return src, nil
-		}
+		return udVarintTo[uint16](0, math.MaxUint16, "int", t)
 	case reflect.Uint32:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint32", v)}
-			}
-			*(*uint32)(p) = uint32(v)
-			return src, nil
-		}
+		return udVarintTo[uint32](0, math.MaxInt64, "int", t)
 	case reflect.Uint64:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarint(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 {
-				return nil, &SemanticError{AvroType: "int", Err: fmt.Errorf("value %d overflows uint64", v)}
-			}
-			*(*uint64)(p) = uint64(v)
-			return src, nil
-		}
+		return udVarintTo[uint64](0, math.MaxInt64, "int", t)
 	default:
 		return nil
 	}
 }
 
-func udLong(k reflect.Kind) udeserfn {
-	switch k {
+func udLong(t reflect.Type) udeserfn {
+	switch t.Kind() {
 	case reflect.Int:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			// On 32-bit platforms int is int32; bound-check.
-			if v < math.MinInt || v > math.MaxInt {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int", v)}
-			}
-			*(*int)(p) = int(v)
-			return src, nil
-		}
+		// On 64-bit int holds any int64; on 32-bit int is int32 so
+		// the bound check is real. math.MinInt/MaxInt resolve per
+		// platform.
+		return udVarlongTo[int](math.MinInt, math.MaxInt, "long", t)
 	case reflect.Int8:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt8 || v > math.MaxInt8 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int8", v)}
-			}
-			*(*int8)(p) = int8(v)
-			return src, nil
-		}
+		return udVarlongTo[int8](math.MinInt8, math.MaxInt8, "long", t)
 	case reflect.Int16:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt16 || v > math.MaxInt16 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int16", v)}
-			}
-			*(*int16)(p) = int16(v)
-			return src, nil
-		}
+		return udVarlongTo[int16](math.MinInt16, math.MaxInt16, "long", t)
 	case reflect.Int32:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < math.MinInt32 || v > math.MaxInt32 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows int32", v)}
-			}
-			*(*int32)(p) = int32(v)
-			return src, nil
-		}
+		return udVarlongTo[int32](math.MinInt32, math.MaxInt32, "long", t)
 	case reflect.Int64:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			*(*int64)(p) = v
-			return src, nil
-		}
+		return udVarlongTo[int64](math.MinInt64, math.MaxInt64, "long", t)
 	case reflect.Uint:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			// On 64-bit uint can hold any non-negative int64; on 32-bit
-			// uint = uint32, so additionally cap at MaxUint32 via MaxUint.
-			if v < 0 || uint64(v) > math.MaxUint {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint", v)}
-			}
-			*(*uint)(p) = uint(v)
-			return src, nil
+		// On 64-bit uint = uint64 holds any non-negative int64; on
+		// 32-bit uint = uint32, so cap at MaxUint32. bits.UintSize
+		// is a compile-time constant so the branch resolves to
+		// dead code on the non-matching platform.
+		hi := int64(math.MaxInt64)
+		if bits.UintSize == 32 {
+			hi = math.MaxUint32
 		}
+		return udVarlongTo[uint](0, hi, "long", t)
 	case reflect.Uint8:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint8 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint8", v)}
-			}
-			*(*uint8)(p) = uint8(v)
-			return src, nil
-		}
+		return udVarlongTo[uint8](0, math.MaxUint8, "long", t)
 	case reflect.Uint16:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint16 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint16", v)}
-			}
-			*(*uint16)(p) = uint16(v)
-			return src, nil
-		}
+		return udVarlongTo[uint16](0, math.MaxUint16, "long", t)
 	case reflect.Uint32:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 || v > math.MaxUint32 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint32", v)}
-			}
-			*(*uint32)(p) = uint32(v)
-			return src, nil
-		}
+		return udVarlongTo[uint32](0, math.MaxUint32, "long", t)
 	case reflect.Uint64:
-		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-			v, src, err := readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if v < 0 {
-				return nil, &SemanticError{AvroType: "long", Err: fmt.Errorf("value %d overflows uint64", v)}
-			}
-			*(*uint64)(p) = uint64(v)
-			return src, nil
-		}
+		return udVarlongTo[uint64](0, math.MaxInt64, "long", t)
 	default:
 		return nil
 	}
@@ -1320,8 +1301,8 @@ func udFloat(k reflect.Kind) udeserfn {
 	}
 }
 
-func udDouble(k reflect.Kind) udeserfn {
-	switch k {
+func udDouble(t reflect.Type) udeserfn {
+	switch t.Kind() {
 	case reflect.Float32:
 		return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
 			u, src, err := readUint64(src)
@@ -1332,7 +1313,7 @@ func udDouble(k reflect.Kind) udeserfn {
 			// Match deserDouble (safe path): reject silent narrowing of a
 			// finite float64 to ±Inf when the destination is float32.
 			if finiteFloat32Overflows(f) {
-				return nil, &SemanticError{AvroType: "double", Err: fmt.Errorf("value %g overflows float32", f)}
+				return nil, &SemanticError{GoType: t, AvroType: "double", Err: fmt.Errorf("value %g overflows float32", f)}
 			}
 			*(*float32)(p) = float32(f)
 			return src, nil
@@ -1390,91 +1371,166 @@ func nullUnionBytes(nullSecond bool) (nullByte, valByte byte) {
 	return 0, 2
 }
 
+// usNullUnionEnter is the encode-side mirror of udNullUnionEnter:
+// emits null-branch byte when *(*unsafe.Pointer)(p) is nil, value-
+// branch byte otherwise. Returns (pp, dst-after-tag, isNull). When
+// isNull is true the caller returns dst directly; otherwise pp is
+// the inner *T address the per-branch ser fn fills.
+func usNullUnionEnter(dst []byte, p unsafe.Pointer, nullByte, valByte byte) (pp unsafe.Pointer, _ []byte, isNull bool) {
+	pp = *(*unsafe.Pointer)(p)
+	if pp == nil {
+		return nil, append(dst, nullByte), true
+	}
+	return pp, append(dst, valByte), false
+}
+
 // usNullUnionPtr handles null-union ser for *T where T has a primitive unsafe serializer.
 // nullByte/valByte are the varint-encoded index bytes for null and value branches.
 func usNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-		pp := *(*unsafe.Pointer)(p)
-		if pp == nil {
-			return append(dst, nullByte), nil
+		// Guard at the union node, mirroring the decode-side udNullUnionPtr
+		// and the reflect serNullUnionAt: the union is a schema node and
+		// must both charge its edge (depth+1 into the branch below) AND
+		// guard. See the depth-uniformity invariant in deserNullUnionAt.
+		if depth >= maxDepth {
+			return nil, errTooDeep
 		}
-		return inner(append(dst, valByte), pp, depth+1)
+		pp, dst, isNull := usNullUnionEnter(dst, p, nullByte, valByte)
+		if isNull {
+			return dst, nil
+		}
+		return inner(dst, pp, depth+1)
 	}
 }
 
 // usNullUnionRecord handles null-union ser for *T where T is a record.
 func usNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
-		pp := *(*unsafe.Pointer)(p)
-		if pp == nil {
-			return append(dst, nullByte), nil
+		// Guard at the union node, mirroring the decode-side
+		// udNullUnionRecord and the reflect serNullUnionAt. The union node
+		// is charged here (guard) and its edge to the inner record is
+		// charged by the depth+1 below; the record node self-charges on
+		// entry, so a ["null", Record] link costs two depth units on every
+		// path. See the depth-uniformity invariant in deserNullUnionAt.
+		if depth >= maxDepth {
+			return nil, errTooDeep
 		}
-		dst = append(dst, valByte)
-		if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
-			return serRecordFastPtr(dst, fast, pp, depth+1)
+		pp, dst, isNull := usNullUnionEnter(dst, p, nullByte, valByte)
+		if isNull {
+			return dst, nil
 		}
-		return rec.ser(dst, reflect.NewAt(innerType, pp).Elem(), depth+1)
+		return serRecordVia(dst, rec.fastFor(innerType), rec, innerType, pp, depth+1)
 	}
 }
 
+// udNullUnionEnter is the shared preamble for udNullUnionPtr / udNullUnionRecord:
+// read the union index, nil-out *T on the null branch, allocate inner
+// storage on the value branch. Returns (pp, src, isNull, err). When
+// isNull is true the caller should return src directly (the pointer
+// field has already been zeroed). Otherwise pp points at freshly-
+// allocated inner storage that the caller's per-branch decoder fills.
+func udNullUnionEnter(src []byte, p unsafe.Pointer, innerType reflect.Type, valIdx int, nullByte, valByte byte) (pp unsafe.Pointer, rest []byte, isNull bool, err error) {
+	isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !isVal {
+		*(*unsafe.Pointer)(p) = nil
+		return nil, src, true, nil
+	}
+	pp = *(*unsafe.Pointer)(p)
+	if pp == nil {
+		v := reflect.New(innerType)
+		pp = v.UnsafePointer()
+		*(*unsafe.Pointer)(p) = pp
+	}
+	return pp, src, false, nil
+}
+
 // udNullUnionPtr handles null-union deser for *T where T has a primitive unsafe deserializer.
+//
+// The union is a schema node and bumps sl.depth once, exactly like the
+// reflect deserNullUnionAt, the general deserUnion.deser, and the encode
+// side (usNullUnionPtr passes its branch at depth+1). See the depth-
+// uniformity invariant in deserNullUnionAt. The decrement is inline (not
+// deferred) for the same hot-path reason as udNullUnionRecord below.
 func udNullUnionPtr(inner udeserfn, innerType reflect.Type, valIdx int, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
-		if err != nil {
-			return nil, err
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
 		}
-		if !isVal {
-			*(*unsafe.Pointer)(p) = nil
-			return src, nil
+		sl.depth++
+		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
+		if err != nil || isNull {
+			sl.depth--
+			return src, err
 		}
-		pp := *(*unsafe.Pointer)(p)
-		if pp == nil {
-			v := reflect.New(innerType)
-			pp = v.UnsafePointer()
-			*(*unsafe.Pointer)(p) = pp
-		}
-		return inner(src, pp, sl)
+		src, err = inner(src, pp, sl)
+		sl.depth--
+		return src, err
 	}
 }
 
 // udNullUnionRecord handles null-union deser for *T where T is a record.
 //
-// Depth bookkeeping note: this function does NOT bump sl.depth itself.
-// It relies on the inner record-entry — deserRecordFastPtr (fast path)
-// or rec.deser (slow path) — to bump on the way in and decrement on
-// the way out. Both currently do. If a future change adds a third
-// record-entry path that's invoked here, that path MUST also bump
-// sl.depth, or recursive ["null", T] schemas will silently lose depth
-// tracking.
+// The union node bumps sl.depth once here (matching deserNullUnionAt,
+// deserUnion.deser, and the encode side usNullUnionRecord). The inner
+// record node bumps separately on its own entry (deserRecordFastPtr or
+// rec.deser via deserRecordVia), so a ["null", Record] link costs two
+// depth units — one for the union edge, one for the record edge — on
+// every encode/decode/JSON path. See the depth-uniformity invariant in
+// deserNullUnionAt.
+//
+// The decrement is inline (not deferred) on this and udNullUnionPtr: this
+// is the recursive-decode hot path (a linked-list "next" field decodes
+// through here once per link), and benchstat showed the open-coded defer
+// adds ~10% per link on BenchmarkDeserializeRecursive. Every post-bump
+// return point decrements first (the err/isNull early return and the
+// after-inner-branch return), so sl.depth is restored on success and on
+// error alike — identical net effect to a defer. The over-bound abort
+// returns before the bump, so there is nothing to undo there.
 func udNullUnionRecord(rec *deserRecord, innerType reflect.Type, valIdx int, nullByte, valByte byte) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
-		if err != nil {
-			return nil, err
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
 		}
-		if !isVal {
-			*(*unsafe.Pointer)(p) = nil
-			return src, nil
+		sl.depth++
+		pp, src, isNull, err := udNullUnionEnter(src, p, innerType, valIdx, nullByte, valByte)
+		if err != nil || isNull {
+			sl.depth--
+			return src, err
 		}
-		pp := *(*unsafe.Pointer)(p)
-		if pp == nil {
-			v := reflect.New(innerType)
-			pp = v.UnsafePointer()
-			*(*unsafe.Pointer)(p) = pp
-		}
-		if fast := rec.fast.Load(); fast != nil && fast.typ == innerType && fast.allFast {
-			return deserRecordFastPtr(src, fast, pp, sl)
-		}
-		return rec.deser(src, reflect.NewAt(innerType, pp).Elem(), sl)
+		src, err = deserRecordVia(src, rec.fastFor(innerType), rec, innerType, pp, sl)
+		sl.depth--
+		return src, err
 	}
 }
 
 // ---- Array unsafe ser/deser ----
+//
+// The five per-element loops (depth-check + length-prefix + early-exit
+// + per-element body + terminator) are intentionally inlined rather
+// than factored into a generic helper. A usSliceFrame[Elem] factoring
+// regressed BenchmarkLargeArrayEncode (the []*Record hot path) by ~16%:
+// the extra closure call per slice combined with the Go compiler
+// declining to inline the generic at each call site costs measurable
+// per-array work.
 
 // usArrayRecord handles array ser for []T or []*T where items are records.
 func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 	if elemGoType.Kind() == reflect.Pointer {
+		// A multi-level-pointer element ([]**…record) declines to the reflect
+		// path. usArrayPtrRecord peels one pointer level inline (the
+		// []unsafe.Pointer element read) and then hands the remainder to
+		// rec.ser, whose indirect peels a FURTHER maxIndirectDepth levels — so
+		// the element would accept a chain 1+maxIndirectDepth deep, one past the
+		// cap the leaf encoder, the JSON encoder, top-level reflect, and the
+		// nullunion array arms all enforce. The reflect serArray hands the
+		// element to rec.ser with a single indirect budget, capping at
+		// maxIndirectDepth. (Mirrors the []**…record nullunion array decline.)
+		if elemGoType.Elem().Kind() == reflect.Pointer {
+			return nil
+		}
 		return usArrayPtrRecord(rec, elemGoType.Elem())
 	}
 	elemSize := elemGoType.Size()
@@ -1488,9 +1544,10 @@ func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 		if n == 0 {
 			return dst, nil
 		}
+		bodyStart := len(dst)
 		data := unsafe.Pointer(unsafe.SliceData(bs))
-		fast := rec.fast.Load()
-		useFast := fast != nil && fast.typ == elemGoType && fast.allFast
+		fast := rec.fastFor(elemGoType)
+		useFast := fast != nil && fast.allFast
 		var err error
 		for i := range n {
 			elemP := unsafe.Add(data, uintptr(i)*elemSize)
@@ -1502,6 +1559,9 @@ func usArrayRecord(rec *serRecord, elemGoType reflect.Type) userfn {
 			if err != nil {
 				return nil, err
 			}
+		}
+		if err := arrayZeroByteEncodeCompliance(len(dst) == bodyStart, n); err != nil {
+			return nil, err
 		}
 		return append(dst, 0), nil
 	}
@@ -1519,8 +1579,9 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 		if n == 0 {
 			return dst, nil
 		}
-		fast := rec.fast.Load()
-		useFast := fast != nil && fast.typ == innerType && fast.allFast
+		bodyStart := len(dst)
+		fast := rec.fastFor(innerType)
+		useFast := fast != nil && fast.allFast
 		var err error
 		for _, pp := range s {
 			if pp == nil {
@@ -1535,11 +1596,24 @@ func usArrayPtrRecord(rec *serRecord, innerType reflect.Type) userfn {
 				return nil, err
 			}
 		}
+		if err := arrayZeroByteEncodeCompliance(len(dst) == bodyStart, n); err != nil {
+			return nil, err
+		}
 		return append(dst, 0), nil
 	}
 }
 
 // usArrayNullUnionRecord handles array ser for []*T where items are ["null", Record].
+//
+// The element type ["null", Record] is a union schema NODE between the
+// array and the record. It must cost one depth unit, exactly like the
+// decode path (udArrayDirect → udNullUnionRecord → record) and every JSON
+// path. The array node is entered at depth; each element's union node is
+// entered at depth+1 and the inner record at depth+2. The per-element
+// union guard (depth+1 >= maxDepth) is loop-invariant, so it is hoisted
+// before the loop — matching decode's udNullUnionRecord, which guards
+// before reading the index (so a null-branch element at the boundary
+// trips too); only the empty array (no element unions entered) escapes.
 func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		if depth >= maxDepth {
@@ -1551,22 +1625,26 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 		if n == 0 {
 			return dst, nil
 		}
-		fast := rec.fast.Load()
-		useFast := fast != nil && fast.typ == innerType && fast.allFast
+		// Per-element union node entered at depth+1; charge it.
+		if depth+1 >= maxDepth {
+			return nil, errTooDeep
+		}
+		fast := rec.fastFor(innerType)
+		useFast := fast != nil && fast.allFast
 		var err error
 		for _, pp := range s {
 			if pp == nil {
 				dst = append(dst, nullByte)
+				continue
+			}
+			dst = append(dst, valByte)
+			if useFast {
+				dst, err = serRecordFastPtr(dst, fast, pp, depth+2)
 			} else {
-				dst = append(dst, valByte)
-				if useFast {
-					dst, err = serRecordFastPtr(dst, fast, pp, depth+1)
-				} else {
-					dst, err = rec.ser(dst, reflect.NewAt(innerType, pp).Elem(), depth+1)
-				}
-				if err != nil {
-					return nil, err
-				}
+				dst, err = rec.ser(dst, reflect.NewAt(innerType, pp).Elem(), depth+2)
+			}
+			if err != nil {
+				return nil, err
 			}
 		}
 		return append(dst, 0), nil
@@ -1574,6 +1652,13 @@ func usArrayNullUnionRecord(rec *serRecord, innerType reflect.Type, nullByte, va
 }
 
 // usArrayNullUnionPtr handles array ser for []*T where items are ["null", primitive].
+//
+// Like usArrayNullUnionRecord, the ["null", primitive] element type is a
+// union schema node between the array and the primitive; it costs one
+// depth unit. The array node is entered at depth, each element's union
+// node at depth+1, the inner primitive at depth+2. The loop-invariant
+// union guard is hoisted before the loop (mirrors decode's udNullUnionPtr,
+// which guards before reading the index); the empty array escapes.
 func usArrayNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 	return func(dst []byte, p unsafe.Pointer, depth int) ([]byte, error) {
 		if depth >= maxDepth {
@@ -1585,15 +1670,19 @@ func usArrayNullUnionPtr(inner userfn, nullByte, valByte byte) userfn {
 		if n == 0 {
 			return dst, nil
 		}
+		// Per-element union node entered at depth+1; charge it.
+		if depth+1 >= maxDepth {
+			return nil, errTooDeep
+		}
 		var err error
 		for _, pp := range s {
 			if pp == nil {
 				dst = append(dst, nullByte)
-			} else {
-				dst, err = inner(append(dst, valByte), pp, depth+1)
-				if err != nil {
-					return nil, err
-				}
+				continue
+			}
+			dst, err = inner(append(dst, valByte), pp, depth+2)
+			if err != nil {
+				return nil, err
 			}
 		}
 		return append(dst, 0), nil
@@ -1612,6 +1701,7 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 		if n == 0 {
 			return dst, nil
 		}
+		bodyStart := len(dst)
 		data := unsafe.Pointer(unsafe.SliceData(bs))
 		var err error
 		for i := range n {
@@ -1620,7 +1710,77 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 				return nil, err
 			}
 		}
+		if err := arrayZeroByteEncodeCompliance(len(dst) == bodyStart, n); err != nil {
+			return nil, err
+		}
 		return append(dst, 0), nil
+	}
+}
+
+// udArrayBlocks drives the outer block loop for the unsafe array
+// deserializers. onBlock fills slots [start, start+n) of v's backing
+// array; src→advancedSrc is returned. Shared by udArrayPtrRecord and
+// udArrayDirect so the depth bookkeeping, length overflow guard,
+// MakeSlice/SetLen growth, and block-bounds check live in one place.
+//
+// minItemBytes is the schema-derived per-item wire-byte minimum (1 for
+// varint primitives, 4 for float, 8 for double, etc.) — bounds block
+// count to len(src)/minItemBytes, mirroring deserArray.deser. Without
+// it the loose count > len(src) check would let a hostile float-array
+// stream drive a 4× MakeSlice allocation per wire byte before the
+// per-element readUint32 loop fails on short buffer.
+//
+// Benchstat verified perf-neutral on BenchmarkLargeArrayDecode (sister
+// of LargeArrayEncode, exercising []*Record fast-path decode).
+func udArrayBlocks(
+	src []byte, p unsafe.Pointer, sl *slab,
+	sliceType reflect.Type, minItemBytes int,
+	onBlock func(src []byte, v reflect.Value, p unsafe.Pointer, start, n int, sl *slab) ([]byte, error),
+) ([]byte, error) {
+	if sl.depth >= maxDepth {
+		return nil, errTooDeep
+	}
+	sl.depth++
+	defer func() { sl.depth-- }()
+	v := reflect.NewAt(sliceType, p).Elem()
+	v.SetLen(0)
+	var totalItems int64
+	for {
+		count, _, rest, end, err := readBlockHeader(src, "array", false)
+		if err != nil {
+			return nil, err
+		}
+		src = rest
+		if end {
+			// Empty array → non-nil empty slice, matching deserArray.deser
+			// (the reflect path), the JSON array decoder, and the binary map
+			// decoder. Only the empty case reaches here with v still nil; a
+			// populated target already has a backing array. Once per array.
+			if v.IsNil() {
+				v.Set(reflect.MakeSlice(sliceType, 0, 0))
+			}
+			return src, nil
+		}
+		if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
+			return nil, err
+		}
+		totalItems += count
+		n := int(count)
+		start := v.Len()
+		if start > math.MaxInt-n {
+			return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
+		}
+		newLen := start + n
+		if v.Cap() < newLen {
+			ns := reflect.MakeSlice(sliceType, newLen, newLen)
+			reflect.Copy(ns, v)
+			v.Set(ns)
+		} else {
+			v.SetLen(newLen)
+		}
+		if src, err = onBlock(src, v, p, start, n, sl); err != nil {
+			return nil, err
+		}
 	}
 }
 
@@ -1629,156 +1789,69 @@ func usArrayDirect(inner userfn, elemSize uintptr) userfn {
 func udArrayPtrRecord(rec *deserRecord, innerType, sliceType reflect.Type, minItemBytes int) udeserfn {
 	innerSize := innerType.Size()
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		if sl.depth >= maxDepth {
-			return nil, errTooDeep
-		}
-		sl.depth++
-		defer func() { sl.depth-- }()
-		v := reflect.NewAt(sliceType, p).Elem()
-		v.SetLen(0)
-		var err error
-		var totalItems int64
-		for {
-			var count int64
-			count, src, err = readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if count == 0 {
-				return src, nil
-			}
-			if count < 0 {
-				count = -count
-				if count < 0 {
-					return nil, errors.New("invalid array block count")
-				}
-				_, src, err = readVarlong(src)
-				if err != nil {
-					return nil, err
-				}
-			}
-			if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
-				return nil, err
-			}
-			totalItems += count
-			n := int(count)
-			start := v.Len()
-			if start > math.MaxInt-n {
-				return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
-			}
-			newLen := start + n
-			if v.Cap() < newLen {
-				ns := reflect.MakeSlice(sliceType, newLen, newLen)
-				reflect.Copy(ns, v)
-				v.Set(ns)
-			} else {
-				v.SetLen(newLen)
-			}
-			s := *(*[]unsafe.Pointer)(p)
-			// Batch-allocate backing memory for nil pointer slots in
-			// one contiguous slice, then distribute pointers into the
-			// individual slots. This is much cheaper than allocating
-			// each element separately.
-			var need int
-			for i := range n {
-				if s[start+i] == nil {
-					need++
-				}
-			}
-			if need > 0 {
-				backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
-				backingBase := backing.Index(0).Addr().UnsafePointer()
-				j := 0
+		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
+			func(src []byte, _ reflect.Value, p unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
+				s := *(*[]unsafe.Pointer)(p)
+				// Batch-allocate backing memory for nil pointer slots in
+				// one contiguous slice, then distribute pointers into the
+				// individual slots. This is much cheaper than allocating
+				// each element separately.
+				var need int
 				for i := range n {
 					if s[start+i] == nil {
-						s[start+i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
-						j++
+						need++
 					}
 				}
-			}
-			// Deserialize each element.
-			fast := rec.fast.Load()
-			useFast := fast != nil && fast.typ == innerType && fast.allFast
-			for i := range n {
-				elemP := s[start+i]
-				if useFast {
-					src, err = deserRecordFastPtr(src, fast, elemP, sl)
-				} else {
-					src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)
+				if need > 0 {
+					backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
+					backingBase := backing.Index(0).Addr().UnsafePointer()
+					j := 0
+					for i := range n {
+						if s[start+i] == nil {
+							s[start+i] = unsafe.Add(backingBase, uintptr(j)*innerSize)
+							j++
+						}
+					}
 				}
-				if err != nil {
-					return nil, err
+				// Deserialize each element.
+				fast := rec.fastFor(innerType)
+				useFast := fast != nil && fast.allFast
+				var err error
+				for i := range n {
+					elemP := s[start+i]
+					if useFast {
+						src, err = deserRecordFastPtr(src, fast, elemP, sl)
+					} else {
+						src, err = rec.deser(src, reflect.NewAt(innerType, elemP).Elem(), sl)
+					}
+					if err != nil {
+						return nil, err
+					}
 				}
-			}
-		}
+				return src, nil
+			})
 	}
 }
 
 // udArrayDirect handles array deser for []T where items are primitives.
 // Uses reflect for slice management, unsafe for per-element deser.
-// minItemBytes is the schema-derived per-item wire-byte minimum (1 for
-// varint primitives, 4 for float, 8 for double, etc.) — bounds block
-// count to len(src)/minItemBytes, mirroring deserArray.deser. Without
-// it the loose count > len(src) check would let a hostile float-array
-// stream drive a 4× MakeSlice allocation per wire byte before the
-// per-element readUint32 loop fails on short buffer.
 func udArrayDirect(inner udeserfn, elemSize uintptr, sliceType reflect.Type, minItemBytes int) udeserfn {
 	return func(src []byte, p unsafe.Pointer, sl *slab) ([]byte, error) {
-		if sl.depth >= maxDepth {
-			return nil, errTooDeep
-		}
-		sl.depth++
-		defer func() { sl.depth-- }()
-		v := reflect.NewAt(sliceType, p).Elem()
-		v.SetLen(0)
-		var err error
-		var totalItems int64
-		for {
-			var count int64
-			count, src, err = readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
-			if count == 0 {
+		return udArrayBlocks(src, p, sl, sliceType, minItemBytes,
+			func(src []byte, v reflect.Value, _ unsafe.Pointer, start, n int, sl *slab) ([]byte, error) {
+				// Access data pointer after the slice growth in
+				// udArrayBlocks. v.UnsafePointer returns the slice's
+				// underlying-array pointer for any element type — avoids
+				// the type-pun via *(*[]byte)(p).
+				data := v.UnsafePointer()
+				var err error
+				for i := start; i < start+n; i++ {
+					src, err = inner(src, unsafe.Add(data, uintptr(i)*elemSize), sl)
+					if err != nil {
+						return nil, err
+					}
+				}
 				return src, nil
-			}
-			if count < 0 {
-				count = -count
-				if count < 0 {
-					return nil, errors.New("invalid array block count")
-				}
-				_, src, err = readVarlong(src)
-				if err != nil {
-					return nil, err
-				}
-			}
-			if err := checkArrayBlockBounds(count, totalItems, len(src), minItemBytes); err != nil {
-				return nil, err
-			}
-			totalItems += count
-			n := int(count)
-			start := v.Len()
-			if start > math.MaxInt-n {
-				return nil, fmt.Errorf("array length overflows int: start=%d count=%d", start, n)
-			}
-			newLen := start + n
-			if v.Cap() < newLen {
-				ns := reflect.MakeSlice(sliceType, newLen, newLen)
-				reflect.Copy(ns, v)
-				v.Set(ns)
-			} else {
-				v.SetLen(newLen)
-			}
-			// Access data pointer after potential reallocation. v.UnsafePointer
-			// returns the slice's underlying-array pointer for any element
-			// type — avoids the type-pun via *(*[]byte)(p).
-			data := v.UnsafePointer()
-			for i := start; i < newLen; i++ {
-				src, err = inner(src, unsafe.Add(data, uintptr(i)*elemSize), sl)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
+			})
 	}
 }

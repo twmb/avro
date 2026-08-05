@@ -1,0 +1,153 @@
+name: Fuzz
+
+# Fuzzing is DISCOVERY, and discovery is not a pull-request gate.
+#
+# Every input fuzzing has already found is regression-tested by the ordinary
+# suite: `go test` without -fuzz runs each target's f.Add seeds AND every
+# recorded crasher in testdata/fuzz/<Fuzz>/ as subtests, so test.yml's
+# `go test -race ./...` covers all of it in ~2 minutes. Running -fuzz on
+# every PR only re-searched for NEW inputs, at a budget (~10s per target)
+# too small to plausibly find any, for 7m36s of a 9m46s job.
+#
+# So it runs here instead, on a schedule, with a budget that can actually
+# find something. A finding is not urgent the way a failing test is: it is a
+# new input, and the fix lands as a normal change with the crasher committed
+# to testdata/fuzz/ where the PR suite replays it forever after.
+#
+# NOTE: GitHub runs scheduled workflows on the DEFAULT BRANCH only. This
+# fuzzes main. To fuzz a topic branch, dispatch it manually against that ref.
+
+on:
+  schedule:
+    # 07:00 UTC nightly.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "Per-target fuzzing budget (Go duration)"
+        default: "120s"
+      timeout:
+        description: "Per-target hard timeout; must exceed fuzztime with room to spare"
+        default: "15m"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # Worst case per shard is every target failing and retrying:
+    # ceil(39/4) targets x 2 x fuzztime. Sized for the 120s default; a
+    # hand-dispatched run with a much larger fuzztime needs this raised.
+    timeout-minutes: 60
+    strategy:
+      # A crasher in one shard must not cancel the others: another shard may
+      # be sitting on an independent finding, and cancelling it hides that
+      # until the first is fixed.
+      fail-fast: false
+      matrix:
+        # These values are only a job multiplier. Which targets a job runs
+        # comes from strategy.job-index / strategy.job-total below, so the
+        # shard count is changed by editing this list alone.
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      # Run fuzzers SEQUENTIALLY within a shard, not in parallel. Backgrounding
+      # every Fuzz target at once launched ~40 `go test -fuzz` processes, each
+      # spawning its own worker pool, which oversubscribed the 2-core runner
+      # badly enough that the step was killed (SIGTERM/143) before finishing.
+      # Each target gets a hard -timeout so a genuinely stuck single execution
+      # (which -fuzztime, a between-execs wall-clock budget, cannot interrupt)
+      # fails and names the offending fuzzer instead of hanging the step.
+      #
+      # -parallel=1 runs ONE fuzz worker process (default is GOMAXPROCS = 2 on
+      # ubuntu-latest). With 2 workers the worker pool saturates both cores, so
+      # at the -fuzztime boundary the coordinator process can be starved long
+      # enough to miss its worker-shutdown RPC deadline and fail the step with
+      # "context deadline exceeded" — intermittently, with a healthy exec rate
+      # and no crasher input. One worker leaves a core for the coordinator, but
+      # under heavy first-run discovery (an empty corpus on a fresh runner) the
+      # coordinator's minimization/bookkeeping can still race the boundary.
+      #
+      # PRINCIPLED single retry: a fuzzer that finds a real crasher writes the
+      # input to testdata/fuzz/<Fuzz>/ AND fails; the retry replays that seed
+      # first and fails AGAIN — deterministically. The shutdown-race flake
+      # leaves no crasher, so the retry passes. The retry therefore separates
+      # an infra flake (passes on retry) from a real finding (reproduces),
+      # rather than masking one. It was verified infra-only: three different
+      # fuzzers hit "context deadline exceeded" on CI while each passed every
+      # local CI-exact run (no crasher, healthy rate). A persistent failure
+      # across BOTH attempts is real and must be investigated, never retried
+      # further.
+      - name: Fuzz
+        env:
+          SHARD: ${{ strategy.job-index }}
+          SHARDS: ${{ strategy.job-total }}
+          FUZZTIME: ${{ inputs.fuzztime || '120s' }}
+          TIMEOUT: ${{ inputs.timeout || '15m' }}
+        run: |
+          run_fuzz() {
+            go test -run='^$' -fuzz="^$2\$" -fuzztime="$FUZZTIME" -timeout="$TIMEOUT" -parallel=1 "$1" && return 0
+            echo "::warning::fuzz $1 $2 failed once; retrying (Go-fuzzing shutdown race is intermittent on constrained runners — a real crasher reproduces on the retry's seed replay)"
+            go test -run='^$' -fuzz="^$2\$" -fuzztime="$FUZZTIME" -timeout="$TIMEOUT" -parallel=1 "$1"
+          }
+
+          # Enumerate every target first, and fail loudly on an empty list. A
+          # shard that silently runs zero targets reports green and reads as
+          # "fuzzed", which is the one outcome worse than a red.
+          targets=""
+          total=0
+          for pkg in . ./ocf; do
+            if ! listed=$(go test -list '^Fuzz' "$pkg"); then
+              echo "::error::go test -list failed for $pkg — cannot enumerate fuzz targets"
+              exit 1
+            fi
+            for fn in $(printf '%s\n' "$listed" | grep '^Fuzz' || true); do
+              targets="$targets $pkg=$fn"
+              total=$((total + 1))
+            done
+          done
+          if [ "$total" -eq 0 ]; then
+            echo "::error::no Fuzz targets enumerated"
+            exit 1
+          fi
+          echo "$total targets total; this is shard $SHARD of $SHARDS, $FUZZTIME each"
+
+          # Run every target in the shard even after one fails, so a single
+          # run surfaces every independent finding rather than just the first.
+          i=0 ran=0 failed=0
+          for t in $targets; do
+            if [ $((i % SHARDS)) -eq "$SHARD" ]; then
+              pkg=${t%%=*}
+              fn=${t#*=}
+              echo "::group::fuzz $pkg $fn"
+              run_fuzz "$pkg" "$fn" || {
+                failed=$((failed + 1))
+                echo "::error::fuzz $pkg $fn FAILED both attempts"
+              }
+              echo "::endgroup::"
+              ran=$((ran + 1))
+            fi
+            i=$((i + 1))
+          done
+
+          echo "shard $SHARD ran $ran of $total targets, $failed failed"
+          [ "$ran" -gt 0 ] || { echo "::error::shard $SHARD ran no targets"; exit 1; }
+          [ "$failed" -eq 0 ] || exit 1
+
+      # A crasher Go finds is written to testdata/fuzz/<Fuzz>/ on the runner
+      # and would otherwise die with it. Upload it so the input can be
+      # committed as a regression without transcribing it out of the log.
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers-shard-${{ strategy.job-index }}
+          path: testdata/fuzz/
+          if-no-files-found: ignore

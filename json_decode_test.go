@@ -152,7 +152,7 @@ func TestDecodeJSONTypedBytes(t *testing.T) {
 	t.Run("fixed duration to Duration", func(t *testing.T) {
 		s, _ := Parse(`{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`)
 		var d Duration
-		if err := s.DecodeJSON([]byte("\"\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\""), &d); err != nil {
+		if err := s.DecodeJSON([]byte(`"\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000"`), &d); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -308,6 +308,254 @@ func TestDecodeJSONEscapedStrings(t *testing.T) {
 			t.Fatalf("input %s: got %q, want %q", tt.input, got, tt.want)
 		}
 	}
+}
+
+// TestDecodeJSONInvalidEscapeRejected pins that an unrecognized escape
+// sequence (\x, \z, \q — none of the eight escapes JSON defines) is
+// REJECTED rather than silently decoded with the backslash dropped.
+// Dropping the backslash corrupts string content (e.g. "C:\dir" would
+// decode to "C:dir"), and the authoritative implementations reject:
+// Java's JsonDecoder uses Jackson with no backslash-escaping feature
+// enabled ("Unrecognized character escape"), and fastavro's
+// AvroJSONDecoder parses through Python's json (raises "Invalid \escape").
+// The rejection is uniform across every string-shaped target (string,
+// enum, map key, bytes/fixed) because all route through walkJSONEscapes.
+func TestDecodeJSONInvalidEscapeRejected(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		input  string
+	}{
+		{"string", `"string"`, `"\x41"`},
+		{"string mid", `"string"`, `"a\qb"`},
+		{"enum", `{"type":"enum","name":"E","symbols":["AZ"]}`, `"\AZ"`},
+		{"bytes", `"bytes"`, `"\z"`},
+		{"map key", `{"type":"map","values":"int"}`, `{"\qkey":1}`},
+		{"map value", `{"type":"map","values":"string"}`, `{"k":"\z"}`},
+		{"array item", `{"type":"array","items":"string"}`, `["\z"]`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.schema)
+			var out any
+			if err := s.DecodeJSON([]byte(c.input), &out); err == nil {
+				t.Fatalf("invalid escape in %s accepted (got %#v); want reject", c.input, out)
+			}
+		})
+	}
+
+	// The eight valid JSON escapes must still decode; rejecting bad
+	// escape *sequences* must not touch them.
+	s := MustParse(`"string"`)
+	for _, ok := range []struct{ in, want string }{
+		{`"a\nb"`, "a\nb"},
+		{`"a\tb"`, "a\tb"},
+		{`"a\\b"`, `a\b`},
+		{`"a\"b"`, `a"b`},
+		{`"a\/b"`, "a/b"},
+		{`"aAb"`, "aAb"},
+	} {
+		var out any
+		if err := s.DecodeJSON([]byte(ok.in), &out); err != nil {
+			t.Fatalf("valid input %q rejected: %v", ok.in, err)
+		} else if out != ok.want {
+			t.Fatalf("input %q: got %q, want %q", ok.in, out, ok.want)
+		}
+	}
+}
+
+// TestDecodeJSONRawControlCharRejected pins that an unescaped control
+// character (U+0000–U+001F) inside a JSON string is rejected, matching
+// encoding/json, Java (Jackson), fastavro, and RFC 8259 §7 (which
+// requires control chars to be escaped). The escaped forms, plus
+// 0x7F (DEL — not a JSON control char) stay accepted. The rejection is
+// uniform across string/enum/map-key/bytes (all route through
+// consumeStringRaw).
+func TestDecodeJSONRawControlCharRejected(t *testing.T) {
+	reject := []struct{ schema, input string }{
+		{`"string"`, "\"a\nb\""},
+		{`"string"`, "\"a\tb\""},
+		{`"string"`, "\"\x00\""},
+		{`"string"`, "\"\x1f\""},
+		{`{"type":"enum","name":"E","symbols":["AB"]}`, "\"A\nB\""},
+		{`{"type":"map","values":"int"}`, "{\"k\ny\":1}"},
+		{`"bytes"`, "\"a\nb\""},
+	}
+	for _, c := range reject {
+		var out any
+		if err := MustParse(c.schema).DecodeJSON([]byte(c.input), &out); err == nil {
+			t.Errorf("%s DecodeJSON(%q) accepted; want reject (unescaped control char)", c.schema, c.input)
+		}
+	}
+	accept := []struct{ in, want string }{
+		{`"a\nb"`, "a\nb"},
+		{`"a\tb"`, "a\tb"},
+		{`"\u0000"`, "\x00"},
+		{`"\u001f"`, "\x1f"},
+		{"\"a\x7fb\"", "a\x7fb"}, // 0x7F is allowed raw per RFC 8259
+	}
+	s := MustParse(`"string"`)
+	for _, c := range accept {
+		var out any
+		if err := s.DecodeJSON([]byte(c.in), &out); err != nil {
+			t.Errorf("DecodeJSON(%q) rejected: %v", c.in, err)
+		} else if out != c.want {
+			t.Errorf("DecodeJSON(%q): got %q want %q", c.in, out, c.want)
+		}
+	}
+}
+
+// TestDecodeJSONInvalidUTF8Rejected pins that invalid UTF-8 byte
+// sequences inside a JSON string are rejected. Valid multi-byte UTF-8
+// stays accepted, as do the \u00XX escapes the encoder produces for
+// non-ASCII bytes — so the encode→decode round-trip the bytes display
+// path relies on is preserved.
+func TestDecodeJSONInvalidUTF8Rejected(t *testing.T) {
+	s := MustParse(`"string"`)
+	for _, in := range []string{
+		"\"\x80\"",       // lone continuation byte
+		"\"\xff\xfe\"",   // two invalid bytes
+		"\"\xc3\"",       // truncated 2-byte sequence
+		"\"a\xe2\x82b\"", // truncated 3-byte sequence
+	} {
+		var out any
+		if err := s.DecodeJSON([]byte(in), &out); err == nil {
+			t.Errorf("DecodeJSON(% x) accepted; want reject (invalid UTF-8)", []byte(in))
+		}
+	}
+	for _, c := range []struct{ in, want string }{
+		{"\"é\"", "é"},
+		{"\"中文\"", "中文"},
+		{"\"😀\"", "😀"},
+		{`"Û"`, "Û"},
+		{`""`, ""},
+	} {
+		var out any
+		if err := s.DecodeJSON([]byte(c.in), &out); err != nil {
+			t.Errorf("DecodeJSON(%q) rejected: %v", c.in, err)
+		} else if out != c.want {
+			t.Errorf("DecodeJSON(%q): got %q want %q", c.in, out, c.want)
+		}
+	}
+	// Bytes round-trip: EncodeJSON escapes every non-ASCII byte; DecodeJSON
+	// reads it back exactly (the path console #2425 / rpk produce rely on).
+	bs := MustParse(`"bytes"`)
+	orig := string([]byte{0x00, 0x0a, 0xdb, 0x80, 0xff, 0x41})
+	enc, err := bs.AppendEncodeJSON(nil, []byte(orig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back []byte
+	if err := bs.DecodeJSON(enc, &back); err != nil {
+		t.Fatalf("bytes round-trip rejected: %v (enc=%s)", err, enc)
+	}
+	if string(back) != orig {
+		t.Fatalf("bytes round-trip mismatch: got % x want % x", back, []byte(orig))
+	}
+}
+
+// TestDecodeJSONTrailingContentRejected pins that trailing non-whitespace
+// after a single decoded value is rejected (matching encoding/json.Unmarshal
+// and fastavro). DecodeJSON decodes exactly one value and returns no
+// offset, so concatenated values cannot be streamed. Surrounding/trailing
+// whitespace stays accepted.
+func TestDecodeJSONTrailingContentRejected(t *testing.T) {
+	for _, c := range []struct{ schema, input string }{
+		{`"int"`, "5 6"},
+		{`"int"`, "5true"},
+		{`"int"`, "5null"},
+		{`{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`, `{"a":1}{"a":2}`},
+		{`{"type":"array","items":"int"}`, "[1,2] [3,4]"},
+	} {
+		var out any
+		if err := MustParse(c.schema).DecodeJSON([]byte(c.input), &out); err == nil {
+			t.Errorf("%s DecodeJSON(%q) accepted; want reject (trailing content)", c.schema, c.input)
+		}
+	}
+	for _, c := range []struct{ schema, input string }{
+		{`"int"`, "5"},
+		{`"int"`, "  5  "},
+		{`"int"`, "5\n"},
+		{`{"type":"array","items":"int"}`, "[1,2]"},
+	} {
+		var out any
+		if err := MustParse(c.schema).DecodeJSON([]byte(c.input), &out); err != nil {
+			t.Errorf("%s DecodeJSON(%q) rejected: %v", c.schema, c.input, err)
+		}
+	}
+}
+
+// TestDecodeJSONFloatGrammarRejected pins that a JSON number whose
+// grammar is invalid per RFC 8259 — a trailing dot with no fractional
+// digit ("5.", "5.e3", "1.e5") — is REJECTED when decoding into a
+// float/double target, the same as the int/long arms already reject it
+// and the same as Java (Jackson), fastavro (Python json), and goavro
+// (whose numberLength state machine requires a digit after the dot)
+// reject. Without the shared isJSONNumber gate, strconv.ParseFloat would
+// silently accept these. The IEEE special forms (±Inf from overflow,
+// NaN/Infinity tokens) remain accepted — those are semantic leniencies,
+// not grammar violations.
+func TestDecodeJSONFloatGrammarRejected(t *testing.T) {
+	bad := []string{"5.", "5.e3", "1.e5", "-5.", "0.", "5.E3"}
+	for _, schema := range []string{`"float"`, `"double"`, `"long"`, `"int"`} {
+		s := MustParse(schema)
+		for _, in := range bad {
+			var out any
+			if err := s.DecodeJSON([]byte(in), &out); err == nil {
+				t.Errorf("%s DecodeJSON(%q) accepted (=%v); want reject", schema, in, out)
+			}
+		}
+	}
+
+	// Valid grammar must still decode on float/double, including the
+	// overflow→±Inf and special-float forms that are deliberately lenient.
+	type fc struct {
+		in   string
+		want float64
+	}
+	for _, schema := range []string{`"float"`, `"double"`} {
+		s := MustParse(schema)
+		for _, c := range []fc{
+			{"5.5", 5.5}, {"5e3", 5000}, {"5.5e3", 5500}, {"0.0", 0}, {"-5.5", -5.5},
+			{"42", 42}, {"1e999", math.Inf(1)}, {"-1e999", math.Inf(-1)},
+			{`"NaN"`, math.NaN()}, {`"Infinity"`, math.Inf(1)}, {"NaN", math.NaN()},
+		} {
+			var out any
+			if err := s.DecodeJSON([]byte(c.in), &out); err != nil {
+				t.Errorf("%s DecodeJSON(%q) rejected: %v", schema, c.in, err)
+				continue
+			}
+			got := toF64(out)
+			if math.IsNaN(c.want) {
+				if !math.IsNaN(got) {
+					t.Errorf("%s DecodeJSON(%q): got %v, want NaN", schema, c.in, got)
+				}
+			} else if got != c.want {
+				t.Errorf("%s DecodeJSON(%q): got %v, want %v", schema, c.in, got, c.want)
+			}
+		}
+	}
+
+	// Encode/decode symmetry: EncodeJSON rejects json.Number("5.") and so
+	// must DecodeJSON — both now run the same isJSONNumber gate.
+	d := MustParse(`"double"`)
+	for _, in := range []string{"5.", "5.e3"} {
+		_, encErr := d.EncodeJSON(json.Number(in))
+		decErr := d.DecodeJSON([]byte(in), new(any))
+		if (encErr == nil) != (decErr == nil) {
+			t.Errorf("encode/decode disagree on %q: enc=%v dec=%v", in, encErr, decErr)
+		}
+	}
+}
+
+func toF64(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	}
+	return math.NaN()
 }
 
 // TestDecodeJSONUnionBareMatch exercises bare union matching by token type.
@@ -652,7 +900,7 @@ func TestDecodeJSONLogicalTypesAny(t *testing.T) {
 		// decodeLogicalLong: plain (no logical)
 		{`"long"`, `99`, func(v any) bool { return v == int64(99) }},
 		// decodeLogicalFixed: decimal (4 bytes: value 33, scale 2 → 0.33; precision must fit in 4 bytes: max 9)
-		{`{"type":"fixed","name":"d","size":4,"logicalType":"decimal","precision":9,"scale":2}`, "\"\u0000\u0000\u0000!\"", func(v any) bool { _, ok := v.(*big.Rat); return ok }},
+		{`{"type":"fixed","name":"d","size":4,"logicalType":"decimal","precision":9,"scale":2}`, `"\u0000\u0000\u0000!"`, func(v any) bool { _, ok := v.(*big.Rat); return ok }},
 		// decodeLogicalFixed: duration (12 bytes, all printable ASCII for simplicity)
 		{`{"type":"fixed","name":"dur","size":12,"logicalType":"duration"}`, "\"abcdefghijkl\"", func(v any) bool { _, ok := v.(Duration); return ok }},
 		// decodeLogicalFixed: plain (no logical)
@@ -802,6 +1050,96 @@ func TestDecodeJSONNullTypedTargets(t *testing.T) {
 		}
 		if sl != nil {
 			t.Fatal("expected nil")
+		}
+	})
+}
+
+// TestDecodeJSONNullIntoNonPointerZeroes is the JSON sibling of
+// TestDeserNullIntoNonPointerZeroes. doc.go states that a null union
+// branch decodes to the target's Go zero value, always replacing any
+// prior value. The binary path honors this unconditionally; the JSON
+// path historically only zeroed nilable kinds (pointer/map/slice/
+// interface), leaving non-nilable concrete targets (int, string, bool,
+// struct fields) at whatever prior value they held. That was a silent
+// value-bleed footgun across reused decode targets, contradicting the
+// public-API promise.
+//
+// Covers all three null-handling dispatch sites in json_decode.go:
+//   - decodeNull (top-level "null" schema and non-union null fields)
+//   - decodeUnion null branch (3+ branch unions and bare null in ["null", T])
+//   - assignAny nil value (toAny path)
+func TestDecodeJSONNullIntoNonPointerZeroes(t *testing.T) {
+	t.Run("top-level null", func(t *testing.T) {
+		s, _ := Parse(`"null"`)
+		out := 42
+		if err := s.DecodeJSON([]byte(`null`), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out != 0 {
+			t.Fatalf("top-level null into int target did not zero: got %d", out)
+		}
+	})
+
+	t.Run("null in union, non-pointer struct fields", func(t *testing.T) {
+		s, err := Parse(`{"type":"record","name":"R","fields":[
+			{"name":"a","type":["null","int"],"default":null},
+			{"name":"b","type":["int","null"]},
+			{"name":"c","type":["null","int","string"]},
+			{"name":"d","type":["null","string"],"default":null}
+		]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf, err := s.AppendEncodeJSON(nil, map[string]any{"a": nil, "b": nil, "c": nil, "d": nil})
+		if err != nil {
+			t.Fatal(err)
+		}
+		type Row struct {
+			A int32  `avro:"a"`
+			B int32  `avro:"b"`
+			C int32  `avro:"c"`
+			D string `avro:"d"`
+		}
+		got := Row{A: 99, B: 88, C: 77, D: "prior"}
+		if err := s.DecodeJSON(buf, &got); err != nil {
+			t.Fatal(err)
+		}
+		want := Row{}
+		if got != want {
+			t.Fatalf("null decoded into pre-populated struct: got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("null in 2-branch union, bare int target", func(t *testing.T) {
+		s, _ := Parse(`["null","int"]`)
+		out := int32(99)
+		if err := s.DecodeJSON([]byte(`null`), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out != 0 {
+			t.Fatalf("2-branch null union did not zero int target: got %d", out)
+		}
+	})
+
+	t.Run("null in 3-branch union, bare bool target", func(t *testing.T) {
+		s, _ := Parse(`["null","boolean","string"]`)
+		out := true
+		if err := s.DecodeJSON([]byte(`null`), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out {
+			t.Fatalf("3-branch null union did not zero bool target")
+		}
+	})
+
+	t.Run("null in union, bare string target", func(t *testing.T) {
+		s, _ := Parse(`["null","string"]`)
+		out := "prior"
+		if err := s.DecodeJSON([]byte(`null`), &out); err != nil {
+			t.Fatal(err)
+		}
+		if out != "" {
+			t.Fatalf("null did not zero string target: got %q", out)
 		}
 	})
 }
@@ -1306,19 +1644,16 @@ func TestDecodeJSONWalkEscapesEmitError(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONWalkEscapesDefaultChar exercises the default escape char.
+// TestDecodeJSONWalkEscapesDefaultChar exercises the default arm: an
+// unrecognized escape (\x is not one of JSON's eight escapes) is rejected,
+// not silently decoded with the backslash dropped.
 func TestDecodeJSONWalkEscapesDefaultChar(t *testing.T) {
-	// Construct raw bytes with \x (not valid JSON but walkJSONEscapes handles it).
-	var got []byte
 	err := walkJSONEscapes([]byte{'\\', 'x'}, func(r rune) error {
-		got = append(got, byte(r))
+		t.Fatalf("emit should not be called for an invalid escape; got %q", r)
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "x" {
-		t.Fatalf("got %q, want x", got)
+	if err == nil {
+		t.Fatal("expected error for invalid escape sequence \\x")
 	}
 }
 
@@ -1913,6 +2248,128 @@ func TestDecodeJSONMapTimeValues(t *testing.T) {
 		var m map[string]time.Duration
 		if err := s.DecodeJSON([]byte(`{"a":12345}`), &m); err != nil {
 			t.Fatal(err)
+		}
+	})
+}
+
+// DecodeJSON must honor TaggedUnions / TagLogicalTypes for a union field
+// that is FILLED FROM ITS DEFAULT (absent in the input) exactly as it does
+// for a present union field — and exactly as Schema.Decode (binary),
+// resolved DecodeJSON, and EncodeJSON already do. The default-fill path
+// routes through the binary deser fn, which reads the slab's taggedUnions
+// flag; DecodeJSON populated only the jsonDecoder's wrapUnions field and
+// left the slab flag at the pool default, so the envelope was dropped on
+// default-filled fields only.
+func TestRegression_DecodeJSONTaggedUnionDefaultFill(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":["null","string"],"default":"hello"},
+		{"name":"g","type":"int"}]}`)
+
+	t.Run("present field wraps", func(t *testing.T) {
+		var out map[string]any
+		if err := s.DecodeJSON([]byte(`{"f":{"string":"world"},"g":1}`), &out, TaggedUnions()); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got, ok := out["f"].(map[string]any); !ok || got["string"] != "world" {
+			t.Fatalf("present union field: got %#v, want {\"string\":\"world\"}", out["f"])
+		}
+	})
+	t.Run("default-filled field wraps", func(t *testing.T) {
+		var out map[string]any
+		if err := s.DecodeJSON([]byte(`{"g":1}`), &out, TaggedUnions()); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got, ok := out["f"].(map[string]any)
+		if !ok || got["string"] != "hello" {
+			t.Fatalf("default-filled union field: got %#v (%T), want {\"string\":\"hello\"}", out["f"], out["f"])
+		}
+	})
+
+	// TagLogicalTypes: a default-filled logical union field tags with the
+	// qualified name, not the bare logical string.
+	sl := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"t","type":["null",{"type":"long","logicalType":"timestamp-millis"}],"default":null},
+		{"name":"g","type":"int"}]}`)
+	t.Run("logical present field tags", func(t *testing.T) {
+		var out map[string]any
+		if err := sl.DecodeJSON([]byte(`{"t":{"long.timestamp-millis":0},"g":1}`), &out, TaggedUnions(), TagLogicalTypes()); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if _, ok := out["t"].(map[string]any)["long.timestamp-millis"]; !ok {
+			t.Fatalf("present logical union: got %#v", out["t"])
+		}
+	})
+}
+
+// TestDecodeJSONTaggedUnionTypedInterfaceTarget verifies that DecodeJSON
+// under TaggedUnions handles a non-empty interface target exactly like
+// binary Decode: the {branch: value} envelope applies only to targets
+// that map[string]any is assignable to, and is skipped silently for
+// every other interface target (deserUnion.maybeWrap's contract) — the
+// decoded branch value lands bare. Without the skip, a union value that
+// satisfies the caller's interface decodes through binary but errors
+// through JSON on the same option.
+func TestDecodeJSONTaggedUnionTypedInterfaceTarget(t *testing.T) {
+	type nanoer interface{ UnixNano() int64 } // satisfied by time.Time
+
+	s, err := Parse(`["null",{"type":"long","logicalType":"timestamp-millis"}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.UnixMilli(5).UTC()
+
+	// Binary reference: index 1 + long 5; the wrap is skipped silently.
+	wire, err := s.Encode(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bin nanoer
+	if _, err := s.Decode(wire, &bin, TaggedUnions()); err != nil {
+		t.Fatal(err)
+	}
+	if !bin.(time.Time).Equal(want) {
+		t.Fatalf("binary decode got %#v, want %v", bin, want)
+	}
+
+	t.Run("tagged_input", func(t *testing.T) {
+		var got nanoer
+		if err := s.DecodeJSON([]byte(`{"long":5}`), &got, TaggedUnions()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like binary Decode: %v", err)
+		}
+		if !got.(time.Time).Equal(want) {
+			t.Fatalf("got %#v, want bare %v", got, want)
+		}
+	})
+
+	t.Run("bare_input", func(t *testing.T) {
+		// The documented bare-union leniency composes with the same skip.
+		var got nanoer
+		if err := s.DecodeJSON([]byte(`5`), &got, TaggedUnions()); err != nil {
+			t.Fatalf("non-empty interface target must skip the tagged wrap silently like binary Decode: %v", err)
+		}
+		if !got.(time.Time).Equal(want) {
+			t.Fatalf("got %#v, want bare %v", got, want)
+		}
+	})
+
+	t.Run("any_still_wrapped", func(t *testing.T) {
+		var got any
+		if err := s.DecodeJSON([]byte(`{"long":5}`), &got, TaggedUnions()); err != nil {
+			t.Fatal(err)
+		}
+		m, ok := got.(map[string]any)
+		if !ok || !m["long"].(time.Time).Equal(want) {
+			t.Fatalf("expected {\"long\": %v} envelope for *any, got %#v", want, got)
+		}
+	})
+
+	t.Run("untagged_off", func(t *testing.T) {
+		var got nanoer
+		if err := s.DecodeJSON([]byte(`5`), &got); err != nil {
+			t.Fatal(err)
+		}
+		if !got.(time.Time).Equal(want) {
+			t.Fatalf("got %#v, want bare %v", got, want)
 		}
 	})
 }

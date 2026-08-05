@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -659,12 +660,11 @@ func FuzzDecodeJSONRoundTrip(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, idx uint8, input string) {
 		s := fuzzSchemas[int(idx)%len(fuzzSchemas)]
-		// Postel: input may be non-canonical (lenient decode is OK).
-		// Re-encoding produces canonical output. Test canonical
-		// idempotence: encode → decode → encode must be stable.
-		// Asserting bit-exact equality with the original bytes is
-		// wrong under Postel — non-canonical input legitimately
-		// canonicalizes on the first encode.
+		// Decode tolerates non-canonical-but-valid input (any boolean
+		// byte, bare unions, whole-number floats, etc.); invalid input
+		// is skipped via the return below. Re-encoding produces canonical
+		// output, so test canonical idempotence (encode → decode → encode
+		// is stable) rather than bit-exact equality with the original.
 		var v1 any
 		if err := s.DecodeJSON([]byte(input), &v1); err != nil {
 			return
@@ -681,8 +681,13 @@ func FuzzDecodeJSONRoundTrip(f *testing.F) {
 		if err != nil {
 			t.Fatalf("re-encode of canonical value failed: %v", err)
 		}
-		if !bytes.Equal(encoded1, encoded2) {
-			t.Fatalf("encode is not idempotent on canonical input:\n  encoded1: %s\n  encoded2: %s\n  input:    %s", encoded1, encoded2, input)
+		// Value-level fixpoint, NOT byte-level: Avro map encoding (binary and
+		// JSON) iterates Go map keys in randomized, spec-legal order, so a
+		// multi-key map re-encodes to a different byte ordering even though
+		// the value is identical. fuzzEqual is order-robust (maps) and
+		// NaN-robust, still catching real round-trip drift.
+		if !fuzzEqual(v1, v2) {
+			t.Fatalf("decode∘encode is not a value fixpoint:\n  v1: %#v\n  v2: %#v\n  input: %s\n  encoded1: %s\n  encoded2: %s", v1, v2, input, encoded1, encoded2)
 		}
 	})
 }
@@ -733,8 +738,14 @@ func FuzzEncodeTaggedUnion(f *testing.F) {
 		if err != nil {
 			t.Fatalf("re-encode of canonical value failed: %v", err)
 		}
-		if !bytes.Equal(encoded1, encoded2) {
-			t.Fatalf("encode is not idempotent on canonical input:\n  encoded1: %x\n  encoded2: %x", encoded1, encoded2)
+		// Value-level fixpoint, NOT byte-level: Avro map encoding iterates Go
+		// map keys in randomized, spec-legal order, so a multi-key map
+		// re-encodes to a different byte ordering even though the value is
+		// identical. fuzzEqual is order-robust (maps) and NaN-robust (a
+		// decoded float NaN round-trips to an identical NaN that
+		// reflect.DeepEqual would wrongly call unequal).
+		if !fuzzEqual(tagged1, tagged2) {
+			t.Fatalf("decode∘encode is not a value fixpoint:\n  tagged1: %#v\n  tagged2: %#v\n  encoded1: %x\n  encoded2: %x", tagged1, tagged2, encoded1, encoded2)
 		}
 	})
 }
@@ -1057,6 +1068,7 @@ func FuzzResolve(f *testing.F) {
 //   - panics when decoding into a struct with non-empty-interface fields
 //   - panics on re-decode into a populated *any (the inner unwraps to
 //     unaddressable Value)
+//
 // The driver's `mode` byte selects the target shape; data bytes are the
 // wire input. All schemas come from fuzzSchemas. No panic is ever
 // expected — every target/data combo must surface as a returned error.
@@ -1117,7 +1129,7 @@ func FuzzDecodeVariedTargets(f *testing.F) {
 	// Seed every (schema, target_kind) pair with a valid binary encoding
 	// plus an empty buffer.
 	for i := range fuzzSchemas {
-		for mode := uint8(0); mode < 12; mode++ {
+		for mode := range uint8(12) {
 			f.Add(uint8(i), mode, []byte{})
 			f.Add(uint8(i), mode, []byte{0})
 			f.Add(uint8(i), mode, []byte{2, 'x'})
@@ -1179,7 +1191,7 @@ func FuzzDecodeJSONVariedTargets(f *testing.F) {
 	}
 
 	for i := range fuzzSchemas {
-		for mode := uint8(0); mode < 9; mode++ {
+		for mode := range uint8(9) {
 			for _, src := range []string{
 				`null`, `42`, `"x"`, `true`, `[]`, `{}`,
 				`{"int":1}`, `{"null":null}`, `{"x":1}`,
@@ -1287,7 +1299,7 @@ func FuzzEncodeHostile(f *testing.F) {
 	}
 
 	for i := range fuzzSchemas {
-		for mode := uint8(0); mode < 16; mode++ {
+		for mode := range uint8(16) {
 			f.Add(uint8(i), mode)
 		}
 	}
@@ -1393,13 +1405,22 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 	f.Add(int32(-1), "ababab", uint8(2))
 
 	f.Fuzz(func(t *testing.T, a int32, b string, n uint8) {
+		// The concurrency surface is shared-schema state across goroutines,
+		// not payload size: cap the fuzz-grown string so a corpus-mutated
+		// multi-megabyte b doesn't turn one execution into seconds of
+		// memcpy across workers×iterations (observed as the fuzzer's exec
+		// counter freezing for whole intervals, risking the -fuzztime
+		// shutdown deadline).
+		if len(b) > 1024 {
+			b = b[:1024]
+		}
 		workers := 1 + int(n%8)
 		// Collect panics from worker goroutines via channel rather than
 		// calling t.Errorf directly: testing.T methods other than Log
 		// aren't safe for concurrent use from non-test goroutines.
 		panicCh := make(chan any, workers)
 		done := make(chan struct{}, workers)
-		for i := 0; i < workers; i++ {
+		for range workers {
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -1407,7 +1428,7 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 					}
 					done <- struct{}{}
 				}()
-				for j := 0; j < 20; j++ {
+				for j := range 20 {
 					rec := Record{A: a + int32(j), B: b}
 					data, err := s.AppendEncode(nil, &rec)
 					if err != nil {
@@ -1420,7 +1441,7 @@ func FuzzConcurrentEncodeDecode(f *testing.F) {
 				}
 			}()
 		}
-		for i := 0; i < workers; i++ {
+		for range workers {
 			<-done
 		}
 		close(panicCh)
@@ -1458,9 +1479,9 @@ func FuzzTimeDateEdgeCases(f *testing.F) {
 	f.Add(uint8(0), int64(1<<62))           // overflow risk
 	f.Add(uint8(0), int64(-1<<62))
 	f.Add(uint8(2), int64(1))
-	f.Add(uint8(3), int64(0))   // epoch
-	f.Add(uint8(3), int64(-1))  // pre-epoch date
-	f.Add(uint8(4), int64(0))   // midnight
+	f.Add(uint8(3), int64(0))  // epoch
+	f.Add(uint8(3), int64(-1)) // pre-epoch date
+	f.Add(uint8(4), int64(0))  // midnight
 	f.Add(uint8(4), int64(86400000))
 	f.Add(uint8(5), int64(86400000000))
 
@@ -1533,18 +1554,51 @@ func FuzzDepthBounds(f *testing.F) {
 		Value int32 `avro:"value"`
 		Next  *node `avro:"next"`
 	}
+	// Input-independent schemas/resolutions are built ONCE here: re-parsing
+	// and re-resolving them per execution added constant fixture cost to
+	// every iteration without exercising anything the first iteration
+	// didn't — the per-exec-cost class that starves fuzz workers into
+	// missing the coordinator's -fuzztime shutdown deadline.
+	resolvedSame, err := Resolve(rs, rs)
+	if err != nil {
+		f.Fatal(err)
+	}
+	rdrSchema, err := Parse(`{"type":"record","name":"Node","fields":[{"name":"value","type":"int"}]}`)
+	if err != nil {
+		f.Fatal(err)
+	}
+	resolvedDrop, err := Resolve(rs, rdrSchema)
+	if err != nil {
+		f.Fatal(err)
+	}
+	arrSchema, err := Parse(`{"type":"array","items":"int"}`)
+	if err != nil {
+		f.Fatal(err)
+	}
+	intS, err := Parse(`"int"`)
+	if err != nil {
+		f.Fatal(err)
+	}
+	nullableS, err := Parse(`["null","int"]`)
+	if err != nil {
+		f.Fatal(err)
+	}
 
 	f.Fuzz(func(t *testing.T, nesting, arrayCount, schemaDepth uint16, mode uint8) {
-		// Hard caps to keep individual fuzz iterations bounded. The
-		// schemaDepth cap is tight because encoding/json's recursive
-		// parser is O(N²) on nested-array JSON — well past maxDepth
-		// we just burn time in the stdlib without exercising more
-		// of our code.
-		if nesting > 20000 {
-			nesting = 20000
+		// Hard caps to keep individual fuzz iterations bounded. The depth
+		// guard trips at maxDepth, so nesting past maxDepth+margin buys no
+		// new coverage — it only linearly burns time building and walking
+		// input (at a 20000 cap a single execution averaged tens of
+		// milliseconds, sliding the exec rate low enough that a worker
+		// could miss the -fuzztime shutdown deadline). The schemaDepth cap
+		// is tight because encoding/json's recursive parser is O(N²) on
+		// nested-array JSON — well past maxDepth we just burn time in the
+		// stdlib without exercising more of our code.
+		if nesting > maxDepth+200 {
+			nesting = maxDepth + 200
 		}
-		if arrayCount > 5000 {
-			arrayCount = 5000
+		if arrayCount > 2000 {
+			arrayCount = 2000
 		}
 		if schemaDepth > maxDepth+10 {
 			schemaDepth = maxDepth + 10
@@ -1573,30 +1627,20 @@ func FuzzDepthBounds(f *testing.F) {
 				src = append(src, 0, 0x02)
 			}
 			src = append(src, 0)
-			resolved, err := Resolve(rs, rs)
-			if err != nil {
-				return
-			}
 			var n node
-			resolved.Decode(src, &n)
+			resolvedSame.Decode(src, &n)
 		case 2:
 			// Deeply nested binary skipped via resolve (reader drops "next").
-			rdrSchema, err := Parse(`{"type":"record","name":"Node","fields":[{"name":"value","type":"int"}]}`)
-			if err != nil {
-				return
-			}
-			resolved, err := Resolve(rs, rdrSchema)
-			if err != nil {
-				return
-			}
 			var src []byte
 			for range int(nesting) {
 				src = append(src, 0, 0x02)
 			}
 			src = append(src, 0)
-			type rR struct{ Value int32 `avro:"value"` }
+			type rR struct {
+				Value int32 `avro:"value"`
+			}
 			var rv rR
-			resolved.Decode(src, &rv)
+			resolvedDrop.Decode(src, &rv)
 		case 3:
 			// Deeply nested JSON into recursive struct.
 			var src []byte
@@ -1639,22 +1683,10 @@ func FuzzDepthBounds(f *testing.F) {
 				src = append(src, 0)    // single item: int(0)
 			}
 			src = append(src, 0) // terminator
-			arrSchema, err := Parse(`{"type":"array","items":"int"}`)
-			if err != nil {
-				return
-			}
 			var out []int32
 			arrSchema.Decode(src, &out)
 		case 7:
 			// Self-referential `any` against various schemas.
-			intS, err := Parse(`"int"`)
-			if err != nil {
-				return
-			}
-			nullableS, err := Parse(`["null","int"]`)
-			if err != nil {
-				return
-			}
 			var p any
 			p = &p
 			intS.AppendEncode(nil, p)
@@ -1673,9 +1705,9 @@ func FuzzDepthBounds(f *testing.F) {
 // long+time-micros, string→bytes+decimal, string→bytes+big-decimal,
 // and bytes→string+uuid promotion-plus-logical paths under fuzz
 // inputs — the regression tests pin specific values; this fuzz
-// surfaces variants. Pre-fix any of these decodes silently produced
-// the raw wire type (int64 / []byte / string) instead of the logical-
-// typed result (time.Time / *big.Rat / [16]byte).
+// surfaces variants. Without the wrap, the decode produces the raw
+// wire type (int64 / []byte / string) instead of the logical-typed
+// result (time.Time / *big.Rat / [16]byte).
 var fuzzPromoteLogicalPairs = []struct {
 	writer    string
 	reader    string
@@ -1696,8 +1728,8 @@ var fuzzPromoteLogicalPairs = []struct {
 // fuzzPromoteLogicalNesting wraps a primitive (writer, reader) pair in
 // each container the resolver dispatches through: top-level, record
 // field, array items, map values, and reader-side union branch. The
-// pre-fix bug surfaced uniformly across these nestings, so the fuzz
-// needs to cover every one.
+// logical-conversion wrap must apply uniformly across every nesting,
+// so the fuzz covers each container axis.
 func fuzzPromoteLogicalNesting(writer, reader string, nesting uint8) (string, string) {
 	switch nesting % 5 {
 	case 0:
@@ -1721,7 +1753,7 @@ func FuzzPromoteLogical(f *testing.F) {
 	// Seeds: one canonical per pair × nesting combo, plus a couple of
 	// adversarial wire payloads (varint overflow, length > buffer).
 	for idx := uint8(0); idx < uint8(len(fuzzPromoteLogicalPairs)); idx++ {
-		for n := uint8(0); n < 5; n++ {
+		for n := range uint8(5) {
 			pair := fuzzPromoteLogicalPairs[idx]
 			w, _ := fuzzPromoteLogicalNesting(pair.writer, pair.reader, n)
 			ws, err := Parse(w)
@@ -1915,15 +1947,14 @@ func FuzzBareSpecialFloat(f *testing.F) {
 }
 
 // FuzzBytesFixedUTF8RoundTrip exercises the JSON encoder bytes/fixed
-// arms that take Go strings as input — pre-fix Encode("é") with an
-// avro "bytes" schema serialized the UTF-8 representation as raw
-// bytes for the binary path (c3 a9) but the JSON path emitted the
-// pre-mapping codepoint string ("é"), producing JSON c3a9 byte
-// strings that re-decoded to two-codepoint garbage. The fix routes
-// the JSON bytes/fixed arms through avroStringValue so the wire form
-// is codepoint-per-byte and round-trips. The fuzz seeds cover
-// multibyte runes (2/3/4-byte UTF-8) inside arrays, maps, unions,
-// records, and verifies the binary↔JSON parity claim: encoding the
+// arms that take Go strings as input. The JSON bytes/fixed arms route
+// through avroStringValue so the wire form is codepoint-per-byte and
+// round-trips; without this routing, Encode("é") against avro "bytes"
+// would serialize the UTF-8 bytes c3 a9 on binary but emit the
+// pre-mapping codepoint string "é" on JSON, producing JSON byte
+// strings that re-decode to two-codepoint garbage. The fuzz seeds
+// cover multibyte runes (2/3/4-byte UTF-8) inside arrays, maps,
+// unions, records, and verifies binary↔JSON parity: encoding the
 // same input through both paths and decoding back must produce the
 // same Go value.
 func FuzzBytesFixedUTF8RoundTrip(f *testing.F) {
@@ -2110,7 +2141,7 @@ func FuzzSetValueTargets(f *testing.F) {
 
 	// Seed every (schema, target) combo with valid + empty wire.
 	for sIdx := range schemas {
-		for m := uint8(0); m < 14; m++ {
+		for m := range uint8(14) {
 			f.Add(uint8(sIdx), m, []byte{})
 			f.Add(uint8(sIdx), m, []byte{0})
 			// A 4-byte fixed seed (legal for fixedS, harmless for the
@@ -2156,7 +2187,7 @@ func FuzzFindUnionBranch(f *testing.F) {
 	// 2: two fixed branches differing by logical type (same kind, same-
 	//    kind pair-match: only legal for fixed)
 	// 3: two records with the same short name in different namespaces
-	//    (fastavro short-name ambiguity guard)
+	//    (short-name-leniency ambiguity guard)
 	// 4: enum + record (short-name fallback)
 	unions := []string{
 		`[{"type":"long","logicalType":"timestamp-millis"}]`,
@@ -2229,14 +2260,14 @@ func FuzzFindUnionBranch(f *testing.F) {
 }
 
 // FuzzUnionBranchErrorWrapping locks the decodeUnionObject / decode-
-// UnionBare error wrapping introduced this session. The fuzz only
-// asserts no panics — the error-message check belongs to a regression
-// test, not to fuzz. Pre-fix, a target-type mismatch inside a matched
-// tagged-union branch produced the generic "no union branch matched
-// at offset N" message hiding the real cause. The new wrapping
-// preserves the underlying error via errors.Is/Unwrap. Fuzz here
-// exercises every (union shape, tagged/bare input, target shape)
-// combination to surface any panic path the change introduced.
+// UnionBare error wrapping. The fuzz only asserts no panics — the
+// error-message check belongs to a regression test, not to fuzz.
+// A target-type mismatch inside a matched tagged-union branch must
+// preserve the underlying error via errors.Is/Unwrap rather than
+// surface the generic "no union branch matched at offset N" message
+// that hides the real cause. Fuzz here exercises every (union shape,
+// tagged/bare input, target shape) combination to surface any panic
+// path.
 func FuzzUnionBranchErrorWrapping(f *testing.F) {
 	unions := []*Schema{
 		MustParse(`["null","int"]`),
@@ -2282,7 +2313,7 @@ func FuzzUnionBranchErrorWrapping(f *testing.F) {
 
 	for uIdx := range unions {
 		for iIdx := range inputs {
-			for m := uint8(0); m < 6; m++ {
+			for m := range uint8(6) {
 				f.Add(uint8(uIdx), uint8(iIdx), m)
 			}
 		}
@@ -2300,9 +2331,9 @@ func FuzzUnionBranchErrorWrapping(f *testing.F) {
 }
 
 // FuzzResolveUnionUnionTags exercises resolveUnionUnion's reader-side
-// branch-name path under TaggedUnions. Pre-fix Resolve(["null","int"]
-// → ["null","long"]) decoded into *any with TaggedUnions emitted
-// {"int":42} (writer-side branch name) instead of {"long":42} (reader-
+// branch-name path under TaggedUnions. Resolve(["null","int"] →
+// ["null","long"]) decoded into *any with TaggedUnions must emit
+// {"long":42} (reader-side branch name) — not {"int":42} (writer-
 // side). The fuzz drives Resolve across writer×reader union pairs,
 // encodes a value against the writer, resolves+decodes with
 // TaggedUnions, and verifies the tagged map's key names a reader-side
@@ -2372,13 +2403,7 @@ func FuzzResolveUnionUnionTags(f *testing.F) {
 		for k := range m {
 			key = k
 		}
-		ok = false
-		for _, branchTxt := range readerBranchTags(readerJSON) {
-			if key == branchTxt {
-				ok = true
-				break
-			}
-		}
+		ok = slices.Contains(readerBranchTags(readerJSON), key)
 		if !ok {
 			t.Fatalf("TaggedUnions key %q not found in reader schema %s", key, readerJSON)
 		}
@@ -2422,15 +2447,14 @@ func branchTagFor(n SchemaNode) string {
 	}
 }
 
-
 // FuzzDecodeUnionObjectDeep stresses the depth-tracked recursive
 // descent through decodeUnionObject / decodeUnionBare with cyclic
 // JSON inputs. The errTooDeep propagation must not be masked by the
-// "try tagged then bare" fallback — pre-fix, the tagged-side errToo-
-// Deep was caught and the bare-side retry burned more depth. Now
-// errors.Is(err, errTooDeep) short-circuits before the bare retry.
-// Fuzz over deeply nested {"tag":{"tag":{...}}} sequences and assert
-// the library terminates (no panic, no stack overflow).
+// "try tagged then bare" fallback — errors.Is(err, errTooDeep)
+// short-circuits before the bare retry, otherwise the tagged-side
+// errTooDeep would be caught and the bare-side retry would burn
+// more depth. Fuzz over deeply nested {"tag":{"tag":{...}}} sequences
+// and assert the library terminates (no panic, no stack overflow).
 func FuzzDecodeUnionObjectDeep(f *testing.F) {
 	recursiveSchema := MustParse(`{"type":"record","name":"Node","fields":[
 		{"name":"value","type":"int"},
@@ -2471,6 +2495,28 @@ func FuzzDecodeUnionObjectDeep(f *testing.F) {
 // each carrier with adversarial numeric strings ("1e1000", "NaN",
 // "0.0000000000000000000000000001", "9".Repeat(40)) and asserts no
 // panic on encode or decode.
+// safeForBigNum reports whether s is small enough to hand to the stdlib
+// big.Rat.SetString / big.ParseFloat parsers without risking a multi-minute
+// or multi-gigabyte materialization. Those parsers eagerly build the full
+// mantissa and 10^exponent, so a 20-million-digit mantissa costs big.Rat
+// ~8 minutes and a short "1e2000000000" allocates gigabytes. twmb's own
+// numeric entry points are bounded (maxRatInputLen / decimalScaleLimit);
+// this mirrors that bound for the fuzzer's DIRECT stdlib construction so the
+// harness cannot DoS itself. (twmb's json.Number path above is exercised
+// unbounded since it is internally capped.)
+func safeForBigNum(s string) bool {
+	if len(s) > 1024 {
+		return false
+	}
+	if i := strings.IndexAny(s, "eE"); i >= 0 {
+		exp := strings.TrimLeft(s[i+1:], "+-")
+		if len(exp) > 4 { // |exponent| could exceed 9999 → huge 10^exp
+			return false
+		}
+	}
+	return true
+}
+
 func FuzzNumberCarriers(f *testing.F) {
 	floatS := MustParse(`"float"`)
 	doubleS := MustParse(`"double"`)
@@ -2498,16 +2544,26 @@ func FuzzNumberCarriers(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, schemaIdx uint8, numStr string) {
 		s := schemas[int(schemaIdx)%len(schemas)]
-		// As json.Number.
+		// As json.Number: twmb's own numeric entry points are length- and
+		// magnitude-bounded (maxRatInputLen / maxParseFloatLen /
+		// decimalScaleLimit), so any input is safe to hand to twmb here.
 		s.AppendEncode(nil, json.Number(numStr))
 		s.AppendEncodeJSON(nil, json.Number(numStr))
-		// As *big.Rat (round-trip if parseable).
+		// As *big.Rat / *big.Float the fuzzer builds the value DIRECTLY via
+		// stdlib parsers, which — unlike twmb — eagerly materialize the full
+		// mantissa and 10^exp: a 20-million-digit mantissa takes big.Rat
+		// ~8 minutes, and "1e2000000000" allocates gigabytes, OOM-ing the
+		// worker. Bound the input the way twmb itself does so the fuzzer
+		// exercises twmb's big.Rat/big.Float handling without DoSing its own
+		// harness (a 13-byte input could otherwise hang the whole run).
+		if !safeForBigNum(numStr) {
+			return
+		}
 		r := new(big.Rat)
 		if _, ok := r.SetString(numStr); ok {
 			s.AppendEncode(nil, r)
 			s.AppendEncodeJSON(nil, r)
 		}
-		// As *big.Float.
 		bf, _, err := big.ParseFloat(numStr, 10, 100, big.ToNearestEven)
 		if err == nil {
 			s.AppendEncode(nil, bf)

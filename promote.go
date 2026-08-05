@@ -27,73 +27,105 @@ var promotions = map[string]deserfn{
 	"bytes>string": promoteBytesToString,
 }
 
-func promoteIntToLong(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
+// promoteRead wraps a wire read + per-target setter into a deserfn. Each
+// promote* function below is a one-liner using this helper.
+func promoteRead[Wire any](
+	read func([]byte) (Wire, []byte, error),
+	apply func(reflect.Value, Wire) error,
+) deserfn {
+	return func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
+		val, src, err := read(src)
+		if err != nil {
+			return nil, err
+		}
+		return src, apply(indirectAlloc(v), val)
 	}
-	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		return src, setIface(v, reflect.ValueOf(int64(val)), "long")
-	}
-	return src, setLongValue(v, int64(val))
 }
 
-func promoteIntToFloat(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
+// promoteIntFloatMantissa is the int→float conversion shared by the
+// four int/long→float/double promotion arms. The READER schema is the
+// user's evolved-to type — by writing a reader schema of float/double
+// the user explicitly opted into IEEE-precision semantics, so wire
+// magnitudes the reader can't represent exactly silently IEEE-round.
+// Matches Java's ResolvingDecoder.readDouble's `(double) in.readLong()`
+// (`lang/java/avro/src/main/java/org/apache/avro/io/ResolvingDecoder.
+// java:192`), fastavro's `maybe_promote` returning `float(data)`
+// (`fastavro/_read_py.py:619-621`), and hamba's createDoubleConverter
+// `float64(r.ReadLong())` (`hamba/avro/converter.go:28`).
+//
+// Asymmetric with the natural same-schema decode case: `s.Decode(wire,
+// &f float64)` against `s = MustParse("long")` still rejects via
+// setLongValue's CanFloat arm because there the READER schema IS long
+// (exact) — the user did NOT evolve the schema, only chose a Go type
+// the wire doesn't fit. The principle: lossiness on decode is
+// acceptable when the READER SCHEMA (the user's contract) is lossy;
+// when the reader schema is exact and only the Go type is lossy, the
+// wire preserved a value the user shouldn't silently lose.
+//
+// Float32 narrowing for the bitSize=32 arm happens at setFloatValue's
+// `v.SetFloat(f)` when the Go target is *float32; the float64 cast
+// here preserves the long's full value before the assignment narrows
+// it to the reader-schema's float32 precision.
+func promoteIntFloatMantissa(v reflect.Value, n int64, avroType string, bitSize int) error {
+	var f float64
+	if bitSize == 32 {
+		f = float64(float32(n))
+	} else {
+		f = float64(n)
 	}
-	return src, setFloatValue(indirectAlloc(v), float64(val), "float", 32)
+	return setFloatValue(v, f, avroType, bitSize)
 }
 
-func promoteIntToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarint(src)
-	if err != nil {
-		return nil, err
-	}
-	return src, setFloatValue(indirectAlloc(v), float64(val), "double", 64)
-}
+var (
+	// setLongValue handles the Interface arm internally, so no special-case
+	// needed here.
+	promoteIntToLong = promoteRead(readVarint,
+		func(v reflect.Value, n int32) error { return setLongValue(v, int64(n)) })
+	promoteIntToFloat = promoteRead(readVarint,
+		func(v reflect.Value, n int32) error { return promoteIntFloatMantissa(v, int64(n), "float", 32) })
+	promoteIntToDouble = promoteRead(readVarint,
+		func(v reflect.Value, n int32) error { return promoteIntFloatMantissa(v, int64(n), "double", 64) })
+	promoteLongToFloat = promoteRead(readVarlong,
+		func(v reflect.Value, n int64) error { return promoteIntFloatMantissa(v, n, "float", 32) })
+	promoteLongToDouble = promoteRead(readVarlong,
+		func(v reflect.Value, n int64) error { return promoteIntFloatMantissa(v, n, "double", 64) })
+	promoteFloatToDouble = promoteRead(readUint32,
+		func(v reflect.Value, u uint32) error {
+			return setFloatValue(v, float64(math.Float32frombits(u)), "double", 64)
+		})
+)
 
-func promoteLongToFloat(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
+// readBytesPrefix reads a varlong length prefix and validates it against
+// the remaining buffer. Shared by the four promote*-with-length-prefix
+// helpers (promoteStringToBytes, promoteStringToBytesDecimal,
+// promoteStringToBytesBigDecimal, promoteBytesToStringUUID,
+// promoteBytesToString) so the trio of error shapes (varlong, negative,
+// overrun) is in one place. destAvroType labels the SemanticError for a
+// negative length; wireTypeName labels the ShortBufferError for buffer
+// overrun. They differ across promotion directions: a string→bytes
+// promotion tags negative-length as "bytes" (destination) and short-
+// buffer as "string" (writer's wire type), and vice versa for bytes→
+// string.
+func readBytesPrefix(src []byte, destAvroType, wireTypeName string) (n int, rest []byte, err error) {
+	length, rest, err := readVarlong(src)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
-	return src, setFloatValue(indirectAlloc(v), float64(val), "float", 32)
-}
-
-func promoteLongToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	val, src, err := readVarlong(src)
-	if err != nil {
-		return nil, err
+	if length < 0 {
+		return 0, nil, &SemanticError{AvroType: destAvroType}
 	}
-	return src, setFloatValue(indirectAlloc(v), float64(val), "double", 64)
-}
-
-func promoteFloatToDouble(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	u, src, err := readUint32(src)
-	if err != nil {
-		return nil, err
+	if length > int64(len(rest)) {
+		return 0, nil, &ShortBufferError{Type: wireTypeName, Need: int(length), Have: len(rest)}
 	}
-	return src, setFloatValue(indirectAlloc(v), float64(math.Float32frombits(u)), "double", 64)
+	return int(length), rest, nil
 }
 
 func promoteStringToBytes(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	length, src, err := readVarlong(src)
+	n, src, err := readBytesPrefix(src, "bytes", "string")
 	if err != nil {
 		return nil, err
 	}
-	if length < 0 {
-		return nil, &SemanticError{AvroType: "bytes"}
-	}
-	if length > int64(len(src)) {
-		return nil, &ShortBufferError{Type: "string", Need: int(length), Have: len(src)}
-	}
-	n := int(length)
-	b := make([]byte, n)
-	copy(b, src[:n])
-	if err := setBytesValue(indirectAlloc(v), b, "bytes"); err != nil {
+	if err := setBytesValue(indirectAlloc(v), src[:n], "bytes"); err != nil {
 		return nil, err
 	}
 	return src[n:], nil
@@ -172,23 +204,7 @@ func promoteIntToLongTimeMicros(src []byte, v reflect.Value, _ *slab) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	v = indirectAlloc(v)
-	if v.Type() == durationType || v.Type() == timeType || v.Kind() == reflect.Interface {
-		d, err := timeMicrosToDuration(int64(val))
-		if err != nil {
-			return nil, err
-		}
-		switch {
-		case v.Type() == durationType:
-			v.Set(reflect.ValueOf(d))
-		case v.Type() == timeType:
-			v.Set(reflect.ValueOf(timeOfDayToTime(d)))
-		default:
-			return src, setIface(v, reflect.ValueOf(d), "long")
-		}
-		return src, nil
-	}
-	return src, setLongValue(v, int64(val))
+	return src, setTimeMicrosTarget(indirectAlloc(v), int64(val))
 }
 
 // promoteStringToBytesDecimal reads the writer's varlong-length-
@@ -197,19 +213,11 @@ func promoteIntToLongTimeMicros(src []byte, v reflect.Value, _ *slab) ([]byte, e
 // length-read shape of promoteStringToBytes.
 func promoteStringToBytesDecimal(scale int) deserfn {
 	return func(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-		length, src, err := readVarlong(src)
+		n, src, err := readBytesPrefix(src, "bytes", "string")
 		if err != nil {
 			return nil, err
 		}
-		if length < 0 {
-			return nil, &SemanticError{AvroType: "bytes"}
-		}
-		if length > int64(len(src)) {
-			return nil, &ShortBufferError{Type: "string", Need: int(length), Have: len(src)}
-		}
-		n := int(length)
-		b := make([]byte, n)
-		copy(b, src[:n])
+		b := src[:n]
 		v = indirectAlloc(v)
 		ok, err := setDecimalValue(v, b, scale)
 		if err != nil {
@@ -231,31 +239,17 @@ func promoteStringToBytesDecimal(scale int) deserfn {
 // (parse as structured big-decimal payload, fall back to raw bytes
 // for opaque-pass-through targets).
 func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byte, error) {
-	length, src, err := readVarlong(src)
+	n, src, err := readBytesPrefix(src, "bytes", "string")
 	if err != nil {
 		return nil, err
 	}
-	if length < 0 {
-		return nil, &SemanticError{AvroType: "bytes"}
-	}
-	if length > int64(len(src)) {
-		return nil, &ShortBufferError{Type: "string", Need: int(length), Have: len(src)}
-	}
-	n := int(length)
-	payload := make([]byte, n)
-	copy(payload, src[:n])
+	payload := src[:n]
 	v = indirectAlloc(v)
-	if r, displayScale, perr := parseBigDecimalPayload(payload); perr == nil {
-		if ok, err := setDecimalRat(v, r, displayScale); ok {
-			if err != nil {
-				return nil, err
-			}
-			return src[n:], nil
-		}
-	} else if v.Kind() != reflect.Slice && v.Kind() != reflect.String && v.Kind() != reflect.Array {
-		return nil, perr
+	done, err := applyBigDecimalPayload(v, payload)
+	if !done {
+		err = setBytesValue(v, payload, "big-decimal")
 	}
-	if _, err := assignBytesTarget(v, payload, "big-decimal"); err != nil {
+	if err != nil {
 		return nil, err
 	}
 	return src[n:], nil
@@ -268,17 +262,10 @@ func promoteStringToBytesBigDecimal(src []byte, v reflect.Value, _ *slab) ([]byt
 // deserializer would handle the bytes if they'd been written as the
 // 36-char hex-dash form.
 func promoteBytesToStringUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	length, src, err := readVarlong(src)
+	n, src, err := readBytesPrefix(src, "string", "bytes")
 	if err != nil {
 		return nil, err
 	}
-	if length < 0 {
-		return nil, &SemanticError{AvroType: "string"}
-	}
-	if length > int64(len(src)) {
-		return nil, &ShortBufferError{Type: "bytes", Need: int(length), Have: len(src)}
-	}
-	n := int(length)
 	v = indirectAlloc(v)
 	// [16]byte target wants the parsed UUID bytes; everything else
 	// gets the canonical-string view (interface, string, []byte).
@@ -288,7 +275,7 @@ func promoteBytesToStringUUID(src []byte, v reflect.Value, sl *slab) ([]byte, er
 		if err != nil {
 			return nil, err
 		}
-		reflect.Copy(v, reflect.ValueOf(u))
+		copyBytesToArray(v, u[:])
 		return src[n:], nil
 	}
 	if err := setStringValue(v, src, n, sl); err != nil {
@@ -298,17 +285,10 @@ func promoteBytesToStringUUID(src []byte, v reflect.Value, sl *slab) ([]byte, er
 }
 
 func promoteBytesToString(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	length, src, err := readVarlong(src)
+	n, src, err := readBytesPrefix(src, "string", "bytes")
 	if err != nil {
 		return nil, err
 	}
-	if length < 0 {
-		return nil, &SemanticError{AvroType: "string"}
-	}
-	if length > int64(len(src)) {
-		return nil, &ShortBufferError{Type: "bytes", Need: int(length), Have: len(src)}
-	}
-	n := int(length)
 	if err := setStringValue(indirectAlloc(v), src, n, sl); err != nil {
 		return nil, err
 	}

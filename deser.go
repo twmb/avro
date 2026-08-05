@@ -1,7 +1,6 @@
 package avro
 
 import (
-	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -42,6 +40,44 @@ func readLength(src []byte, typeName string) (int, []byte, error) {
 	return int(length), src, nil
 }
 
+// readBlockHeader reads an Avro array/map block header: a varlong
+// count, plus (when the count is negative) a varlong byte-size for
+// the block. Returns:
+//   - (count > 0, byteSize, src, false, nil): a block follows.
+//   - (0, 0, src, true, nil): terminator (count==0) — series ended.
+//   - (0, 0, nil, false, err): read error / malformed count / bad
+//     byteSize.
+//
+// byteSize is 0 unless the wire used negative-count framing; skip
+// paths use it to fast-skip the block, deser paths ignore it.
+// validateByteSize=true bounds byteSize against len(src) (needed for
+// skip paths since they trust the wire's byte-count).
+func readBlockHeader(src []byte, blockType string, validateByteSize bool) (absCount int64, byteSize int64, _ []byte, end bool, err error) {
+	count, src, err := readVarlong(src)
+	if err != nil {
+		return 0, 0, nil, false, err
+	}
+	if count == 0 {
+		return 0, 0, src, true, nil
+	}
+	if count < 0 {
+		count = -count
+		if count < 0 {
+			return 0, 0, nil, false, fmt.Errorf("invalid %s block count", blockType)
+		}
+		byteSize, src, err = readVarlong(src)
+		if err != nil {
+			return 0, 0, nil, false, err
+		}
+		if validateByteSize {
+			if byteSize < 0 || byteSize > int64(len(src)) {
+				return 0, 0, nil, false, &ShortBufferError{Type: blockType, Need: int(byteSize), Have: len(src)}
+			}
+		}
+	}
+	return count, byteSize, src, false, nil
+}
+
 var anyType = reflect.TypeFor[any]()
 var sliceAnyType = reflect.SliceOf(anyType)
 
@@ -52,8 +88,25 @@ type slab struct {
 	depth           int // recursion depth; bumped at recursive dispatch sites
 	taggedUnions    bool
 	tagLogicalTypes bool
+	// customMatches counts CustomType decoders that MATCHED (returned a result
+	// rather than ErrSkipCustomType) during a decode. A custom-decoder wrapper
+	// saves it before probing and compares after: an unchanged count means no
+	// custom matched anywhere in the probed subtree, so the all-skip re-decode
+	// can bypass the chain for a single O(subtree) pass. See
+	// wrapDeserWithCustomDecoders.
+	customMatches int
+	// bypassCustom, when set, makes a custom-decoder wrapper skip its probe and
+	// chain and decode straight through its base deserializer. Set by a no-match
+	// all-skip re-decode so nested wrappers don't re-probe (keeping the re-decode
+	// O(subtree)); skipping the chain is faithful precisely because no custom
+	// matched in the subtree.
+	bypassCustom bool
 }
 
+// slabSize is the string-interning slab batch: short decoded strings are
+// sub-allocated from one shared buffer to amortize allocation. Perf-only —
+// not a correctness or safety bound; a larger value batches more, a smaller
+// one less.
 const slabSize = 1024
 
 func (s *slab) string(src []byte, n int) string {
@@ -68,12 +121,38 @@ func (s *slab) string(src []byte, n int) string {
 
 var slabPool = sync.Pool{New: func() any { return &slab{} }}
 
+// slabFreeKinds are the scalar leaf kinds whose desers never touch the
+// *slab, for any logical type and any target: the slab's string buffer is
+// used only by string decodes (setStringValue / readMapKey / readOneString),
+// its depth guard is bumped only at recursive dispatch (union / record /
+// array / map), and its remaining state is written only by option parsing
+// and custom-decoder wrappers. A schema whose top-level kind is in this set
+// therefore has no slab-touching path at all — barring custom wiring, which
+// Schema.slabFree excludes separately — and Decode passes a nil slab
+// (verified two-sidedly by TestSlabFreeMatchesNilSlabOracle: every frag ×
+// ctx cell must decode nil-slab iff classified slab-free). "string" is
+// deliberately absent; "bytes" is safe because a string TARGET of a bytes
+// schema copies via string(b), not the slab.
+var slabFreeKinds = map[string]bool{
+	"null":    true,
+	"boolean": true,
+	"int":     true,
+	"long":    true,
+	"float":   true,
+	"double":  true,
+	"bytes":   true,
+	"fixed":   true,
+	"enum":    true,
+}
+
 // put resets sl's per-call state and returns it to the pool. The buf field
 // is intentionally retained so subsequent callers reuse its backing memory.
 func (sl *slab) put() {
 	sl.depth = 0
 	sl.taggedUnions = false
 	sl.tagLogicalTypes = false
+	sl.customMatches = 0
+	sl.bypassCustom = false
 	slabPool.Put(sl)
 }
 
@@ -108,7 +187,7 @@ func (sl *slab) put() {
 //   - duration: [Duration]
 //
 // To produce JSON from decoded *any data, use [Schema.EncodeJSON] rather
-// than [encoding/json.Marshal]. EncodeJSON is schema-aware and converts
+// than a generic JSON encoder. EncodeJSON is schema-aware and converts
 // these types back to their Avro representations (e.g. time.Time to
 // epoch integers, []byte to \uXXXX strings).
 //
@@ -120,6 +199,15 @@ func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return nil, errors.New("decode requires a non-nil pointer")
+	}
+	// Slab-free schemas (scalar leaves, no custom wiring) never touch the
+	// slab, so skip the pool entirely: a nil slab keeps scalar decodes
+	// allocation-free even when GC has drained the pool. Opts only ever
+	// alter slab state (and are inert outside union paths, which are never
+	// slab-free), so their mere presence takes the pooled path to keep the
+	// nil-slab proof trivial.
+	if s.slabFree && len(opts) == 0 {
+		return s.deser(src, rv.Elem(), nil)
 	}
 	sl := slabPool.Get().(*slab)
 	if len(opts) > 0 {
@@ -140,6 +228,13 @@ type deserUnion struct {
 	fns          []deserfn
 	branchNames  []string // standard names: "null", "string", "com.example.Foo"
 	logicalNames []string // with logical type: "long.timestamp-millis"; empty if same as branchNames
+	// noWrap disables maybeWrap. Set by resolveWriterUnion when the
+	// reader is non-union — wrapping there would leak the writer's
+	// branch name onto a target that has no union to dispatch through.
+	// Default (zero value, false) is the natural-union and
+	// resolveUnionUnion behavior: wrap when TaggedUnions is active
+	// and the target is *any (or compatible interface).
+	noWrap bool
 }
 
 func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -169,7 +264,7 @@ func (s *deserUnion) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 // map). Non-interface targets and interfaces with methods are
 // skipped silently.
 func (s *deserUnion) maybeWrap(v reflect.Value, sl *slab, idx int32) {
-	if !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
+	if s.noWrap || !sl.taggedUnions || v.Kind() != reflect.Interface || !v.Elem().IsValid() {
 		return
 	}
 	// Skip silently if the wrapping map[string]any can't be assigned
@@ -241,6 +336,18 @@ func readNullUnionIndex(src []byte, valIdx int, nullByte, valByte byte) (bool, [
 // wire-format bytes for the null and value branches.
 func deserNullUnionAt(u *deserUnion, valIdx int, nullByte, valByte byte) deserfn {
 	return func(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
+		// The union is a schema node and costs one depth unit, exactly
+		// like the general deserUnion.deser and like the encode side
+		// (serNullUnionAt passes its branch at depth+1). Without this
+		// bump a ["null", Self] linked list would decode ~2x deeper than
+		// it (or another impl) can encode/JSON-decode — a round-trip
+		// break. The bump scopes to this union node only; the inner
+		// branch's own node self-bumps when entered.
+		if sl.depth >= maxDepth {
+			return nil, errTooDeep
+		}
+		sl.depth++
+		defer func() { sl.depth-- }()
 		isVal, src, err := readNullUnionIndex(src, valIdx, nullByte, valByte)
 		if err != nil {
 			return nil, err
@@ -249,12 +356,16 @@ func deserNullUnionAt(u *deserUnion, valIdx int, nullByte, valByte byte) deserfn
 			v.Set(reflect.Zero(v.Type()))
 			return src, nil
 		}
-		if v.Kind() == reflect.Pointer {
-			if v.IsNil() {
-				v.Set(reflect.New(v.Type().Elem()))
-			}
-			return u.fns[valIdx](src, v.Elem(), sl)
-		}
+		// Pass the UN-indirected target to the branch fn and let it indirect
+		// itself, exactly as the general deserUnion.deser does: a non-custom leaf
+		// (deserLong/deserRecord/...) calls indirectAlloc (reusing a *T in place,
+		// or allocating a nil one), and a custom wrapper's setCustomResult lands a
+		// pointer Decode result into a *T target. Pre-dereferencing a concrete
+		// pointer here (the former fast-path) handed the custom wrapper the pointee,
+		// so a CustomType.Decode returning a pointer FAILED into a *T field in this
+		// 2-branch null-union while SUCCEEDING in a 3+-branch union (deserUnion.deser)
+		// — an arbitrary 2-branch-vs-general inconsistency. maybeWrap is a no-op for
+		// non-interface targets, so the *T path is unaffected by it.
 		out, err := u.fns[valIdx](src, v, sl)
 		if err == nil {
 			u.maybeWrap(v, sl, int32(valIdx))
@@ -292,22 +403,10 @@ func deserBoolean(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	b := src[0] == 1
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
-		// Fast path: empty interface (any) — most decode targets.
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(b))
-			return src[1:], nil
-		}
-		// Slow path: non-empty interface — guard against panic in
-		// reflect.Value.Set when bool isn't assignable.
-		rv := reflect.ValueOf(b)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "boolean"}
-		}
-		v.Set(rv)
-		return src[1:], nil
+		return src[1:], setIface(v, reflect.ValueOf(b), "boolean")
 	}
 	if v.Kind() != reflect.Bool {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "boolean"}
+		return nil, semErr(v, "boolean")
 	}
 	v.SetBool(b)
 	return src[1:], nil
@@ -329,12 +428,29 @@ func deserLong(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	return src, setLongValue(indirectAlloc(v), val)
 }
 
+// setFloat32WireValue stores a 32-bit "float" wire value into v. For a
+// float32 target it writes the exact bit pattern, preserving signaling-NaN
+// payloads to match Java (Float.intBitsToFloat) and the unsafe path (udFloat);
+// reflect's SetFloat would round-trip through float64 and quiet them. float64
+// (widen) and integer (coerce) targets go through setFloatValue, and an
+// interface target boxes the raw float32 directly.
+func setFloat32WireValue(v reflect.Value, u uint32) error {
+	if v.Kind() == reflect.Float32 && v.CanAddr() {
+		*(*uint32)(unsafe.Pointer(v.UnsafeAddr())) = u
+		return nil
+	}
+	if v.Kind() == reflect.Interface {
+		return setIface(v, reflect.ValueOf(math.Float32frombits(u)), "float")
+	}
+	return setFloatValue(v, float64(math.Float32frombits(u)), "float", 32)
+}
+
 func deserFloat(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	u, src, err := readUint32(src)
 	if err != nil {
 		return nil, err
 	}
-	return src, setFloatValue(indirectAlloc(v), float64(math.Float32frombits(u)), "float", 32)
+	return src, setFloat32WireValue(indirectAlloc(v), u)
 }
 
 func deserDouble(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -350,9 +466,7 @@ func deserBytes(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := make([]byte, n)
-	copy(b, src[:n])
-	if err := setBytesValue(indirectAlloc(v), b, "bytes"); err != nil {
+	if err := setBytesValue(indirectAlloc(v), src[:n], "bytes"); err != nil {
 		return nil, err
 	}
 	return src[n:], nil
@@ -395,8 +509,31 @@ type deserRecordField struct {
 type deserRecord struct {
 	fields []deserRecordField
 	names  []string
-	cache  sync.Map                        // map[reflect.Type]*cachedMapping
-	fast   atomic.Pointer[fastRecordDeser] // lazily compiled unsafe fast path, atomic for concurrent decode
+	cache  sync.Map // map[reflect.Type]*cachedMapping
+	fast   sync.Map // map[reflect.Type]*fastRecordDeser — per-Go-type compiled unsafe path
+}
+
+// fastFor returns the compiled unsafe fast path for t, or nil if not
+// yet compiled. Sibling of [serRecord.fastFor]; see that comment.
+func (s *deserRecord) fastFor(t reflect.Type) *fastRecordDeser {
+	if v, ok := s.fast.Load(t); ok {
+		return v.(*fastRecordDeser)
+	}
+	return nil
+}
+
+// loadOrCompileFast returns the compiled fast path for t, compiling
+// and storing it on first call. Sibling of [serRecord.loadOrCompileFast].
+func (s *deserRecord) loadOrCompileFast(t reflect.Type) *fastRecordDeser {
+	if fast := s.fastFor(t); fast != nil {
+		return fast
+	}
+	fast := compileFastDeser(s.fields, s.names, &s.cache, t)
+	if fast == nil {
+		return nil
+	}
+	actual, _ := s.fast.LoadOrStore(t, fast)
+	return actual.(*fastRecordDeser)
 }
 
 func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -409,28 +546,16 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	k := v.Kind()
 	if k == reflect.Interface {
 		if v.Type().NumMethod() != 0 && !mapStringAnyType.AssignableTo(v.Type()) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "record"}
+			return nil, semErr(v, "record")
 		}
-		// Reuse the existing map[string]any if v already wraps one.
-		// This is the streaming-decode pattern (OCF reader, batch
-		// consumer reusing &out across many records). We do this
-		// explicitly here rather than in indirectAlloc — unwrapping a
-		// non-nil interface there would break decoders that
-		// v.Set(...) on the result (decodeNull, decodeArray's typed
-		// branch, etc.) since the unwrapped Value isn't addressable.
-		// Here we only need SetMapIndex, which works on the
-		// non-addressable Map.
-		//
-		// Reuse retains keys not present in the schema (matches
-		// encoding/json into a non-empty map). Callers that need a
-		// fresh decode should clear or replace the map before each
-		// call. Pinned by TestDecodeReuseAnyTargetStaleKeys.
-		var m map[string]any
-		if inner := v.Elem(); inner.IsValid() && inner.Type() == mapStringAnyType {
-			m = inner.Interface().(map[string]any)
-		} else {
-			m = make(map[string]any, len(s.fields))
-		}
+		// Reuse the existing map[string]any if v already wraps one
+		// (streaming-decode pattern, OCF reader, batch consumer
+		// reusing &out). Done here rather than in indirectAlloc
+		// because the unwrapped non-addressable interface payload
+		// would break decoders that v.Set(...) on the result; here
+		// we only SetMapIndex, which works on the non-addressable
+		// Map. See [reuseOrMakeStringAnyMap].
+		m := reuseOrMakeStringAnyMap(v, len(s.fields))
 		var elem reflect.Value
 		var err error
 		for _, f := range s.fields {
@@ -461,11 +586,15 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	}
 	var err error
 	if k == reflect.Map {
+		keyType := t.Key()
 		if v.IsNil() {
 			v.Set(reflect.MakeMapWithSize(t, len(s.fields)))
 		}
 		elem := reflect.New(t.Elem()).Elem()
 		for _, f := range s.fields {
+			if err := validateJSONNumberMapKey(f.name, keyType, "record"); err != nil {
+				return nil, err
+			}
 			if src, err = f.fn(src, elem, sl); err != nil {
 				return nil, recordFieldError(nil, f.name, err)
 			}
@@ -476,11 +605,7 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 	}
 	// Struct: try precompiled unsafe fast path.
 	if v.CanAddr() {
-		if fast := s.fast.Load(); fast != nil && fast.typ == t {
-			return deserRecordFast(src, fast, v, sl)
-		}
-		if fast := compileFastDeser(s.fields, s.names, &s.cache, t); fast != nil {
-			s.fast.Store(fast)
+		if fast := s.loadOrCompileFast(t); fast != nil {
 			return deserRecordFast(src, fast, v, sl)
 		}
 	}
@@ -494,6 +619,43 @@ type deserEnum struct {
 	symbols []string
 }
 
+// setEnumTarget assigns the (idx, symbol) pair to v per the enum target
+// matrix: Interface→symbol-as-string; String→symbol; Int/Uint→ordinal;
+// TextUnmarshaler→UnmarshalText(symbol). Shared by deserEnum (binary),
+// resolveEnum (binary with symbol remap), and decodeEnum (JSON) so the
+// target arms agree on overflow checks and SemanticError shapes.
+func setEnumTarget(v reflect.Value, idx int, symbol string) error {
+	if v.Kind() == reflect.Interface {
+		return setIface(v, reflect.ValueOf(symbol), "enum")
+	}
+	// TextUnmarshaler before the String/int arms: an enum target receiving
+	// a symbol name uses its text parsing, mirroring serEnum (which matches
+	// by symbol name first). A plain int target with no UnmarshalText falls
+	// through to the ordinal arm below. The implements-check gates the
+	// []byte(symbol) allocation off the common string/int paths.
+	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
+		_, err := tryTextUnmarshal(v, []byte(symbol))
+		return err
+	}
+	switch {
+	case v.Kind() == reflect.String:
+		return setStringTarget(v, symbol, "enum")
+	case v.CanInt():
+		if v.OverflowInt(int64(idx)) {
+			return &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
+		}
+		v.SetInt(int64(idx))
+		return nil
+	case v.CanUint():
+		if v.OverflowUint(uint64(idx)) {
+			return &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
+		}
+		v.SetUint(uint64(idx))
+		return nil
+	}
+	return semErr(v, "enum")
+}
+
 func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	idx, src, err := readVarint(src)
 	if err != nil {
@@ -502,40 +664,16 @@ func (s *deserEnum) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error)
 	if idx < 0 || int(idx) >= len(s.symbols) {
 		return nil, fmt.Errorf("enum index %d out of range [0, %d)", idx, len(s.symbols))
 	}
-	v = indirectAlloc(v)
-	switch {
-	case v.Kind() == reflect.Interface:
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(s.symbols[idx]))
-			return src, nil
-		}
-		rv := reflect.ValueOf(s.symbols[idx])
-		if !rv.Type().AssignableTo(v.Type()) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
-		}
-		v.Set(rv)
-		return src, nil
-	case v.Kind() == reflect.String:
-		v.SetString(s.symbols[idx])
-	case v.CanInt():
-		if v.OverflowInt(int64(idx)) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
-		}
-		v.SetInt(int64(idx))
-	case v.CanUint():
-		if v.OverflowUint(uint64(idx)) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: "enum", Err: fmt.Errorf("ordinal %d overflows %s", idx, v.Type())}
-		}
-		v.SetUint(uint64(idx))
-	default:
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "enum"}
-	}
-	return src, nil
+	return src, setEnumTarget(indirectAlloc(v), int(idx), s.symbols[idx])
 }
 
 type deserArray struct {
-	deserItem    deserfn
-	fastLoop     func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error)
+	deserItem deserfn
+	fastLoop  func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error)
+	// nativeLoop decodes one block straight into the concrete Go slice
+	// (s[i]=v) when its dynamic type is exactly []V; returns handled=false
+	// for named slice/elem types, which fall back to fastLoop.
+	nativeLoop   func(sliceVal reflect.Value, src []byte, start, count int, sl *slab) (bool, []byte, error)
 	fastElemKind reflect.Kind
 	// fastIfaceLoop decodes one block of items directly into a []any,
 	// bypassing reflect for primitive items. Selected at schema-build
@@ -567,7 +705,26 @@ const maxZeroByteItems = 4 << 10
 // totalItems after a non-error return. Used by skipArray, deserArray,
 // udArrayPtrRecord, and udArrayDirect to keep the four sites from
 // drifting on this rule.
+// minItemBytes selects the RULE, not just the magnitude: a positive value takes
+// the buffer-relative bound, zero takes the zero-byte cap, and the two are not
+// ordered — neither is uniformly the looser. That is why a per-item minimum may
+// never be rounded UP: reporting 1 for a type whose true minimum is 0 does not
+// loosen the bound, it moves a legitimately zero-byte array onto a
+// buffer-relative rule it cannot satisfy. minBytesUnknown is the third rule,
+// for when the walk could not compute one (see minBytes).
 func checkArrayBlockBounds(count int64, totalItems int64, srcLen int, minItemBytes int) error {
+	if minItemBytes == minBytesUnknown {
+		// Unknown: admit the union of what BOTH rules admit, so an
+		// uncomputed minimum can only ever loosen. A valid wire satisfies
+		// one of them — count <= srcLen/m for a true minimum m >= 1 (hence
+		// count <= srcLen), or count <= the zero-byte cap when m is 0 — so
+		// their union false-rejects neither, while still bounding the count
+		// by the input rather than by the declared number.
+		if lim := max(int64(srcLen), int64(maxZeroByteItems)-totalItems); count > lim {
+			return fmt.Errorf("array block count %d exceeds remaining buffer length %d with an uncomputed per-item minimum", count, srcLen)
+		}
+		return nil
+	}
 	if minItemBytes > 0 {
 		if count > int64(srcLen)/int64(minItemBytes) {
 			return fmt.Errorf("array block count %d exceeds remaining buffer length %d (min %d byte/item)", count, srcLen, minItemBytes)
@@ -576,6 +733,37 @@ func checkArrayBlockBounds(count int64, totalItems int64, srcLen int, minItemByt
 	}
 	if count > int64(maxZeroByteItems)-totalItems {
 		return fmt.Errorf("array of zero-byte items exceeds %d-element limit", maxZeroByteItems)
+	}
+	return nil
+}
+
+// mapEntryMinBytes converts a map VALUE's minimum into the per-ENTRY minimum
+// every map block bound uses. It is the single constructor of that number for
+// all four map sites (build, the forward-ref fixup, resolve, skip) so none of
+// them can reach checkMapBlockBounds' divisor with an unknown, which would
+// otherwise arrive as 1 + (-1) = 0 and divide by zero.
+//
+// Unknown collapses to a 1-byte entry, and that is exact rather than a
+// fallback: a map entry always carries its key's length varint, so the entry
+// minimum is at least 1 whatever the value type costs. Maps therefore need no
+// unknown RULE the way arrays do — the weakest sound bound is also the only one
+// they ever had.
+func mapEntryMinBytes(valueMin int) int {
+	if valueMin == minBytesUnknown {
+		return 1
+	}
+	return 1 + valueMin
+}
+
+// checkMapBlockBounds bounds a map block's declared entry count against the
+// remaining buffer. A map entry's key is at least 1 byte (minEntryBytes >= 1),
+// so — unlike arrays — there is no zero-byte-item case; the bound is always
+// buffer-relative and never false-rejects a valid block. Shared by deserMap and
+// skipMap so the two block-bound checks cannot drift (the array path already
+// factored its bound into checkArrayBlockBounds).
+func checkMapBlockBounds(count int64, srcLen int, minEntryBytes int) error {
+	if count > int64(srcLen)/int64(minEntryBytes) {
+		return fmt.Errorf("map block count %d exceeds remaining buffer length %d (min %d byte/entry)", count, srcLen, minEntryBytes)
 	}
 	return nil
 }
@@ -592,47 +780,163 @@ func checkArrayBlockBounds(count int64, totalItems int64, srcLen int, minItemByt
 // at decode time, so the cap has to live here.
 const decimalScaleLimit = 1 << 16
 
-// boundedRatFromString parses s into a *big.Rat, rejecting decimal-form
-// inputs whose net 10^exponent magnitude exceeds decimalScaleLimit.
-// big.Rat.SetString materializes 10^|net-exp| eagerly during parsing —
-// a 9-byte "1e1000000" allocates ~3 MB without this guard. Mirrors the
-// wire-side bound in parseBigDecimalPayload so every external decimal
-// path (JSON decode bytes/fixed decimal, encode of json.Number and
-// string-typed values) shares the same magnitude cap.
+// maxRatInputLen caps the byte length boundedRatFromString routes
+// through big.Rat.SetString. SetString is O(n²) over input length, so
+// 1 MiB of digits burns ~2 sec CPU; 128 KiB rejects in ~25 ms worst
+// case. Legitimate decimal use is bounded by decimalScaleLimit
+// (mantissa+exponent ≤ 65536), so a cap matched to twice that magnitude
+// covers every schema-conforming input with headroom while still
+// bounding the new helper's parse cost. Java/avro-rs don't materialize
+// 10^N during parsing so don't need this cap; twmb does, so the cap
+// has to live at the boundary the parsing actually crosses.
+const maxRatInputLen = 1 << 17 // 128 KiB
+
+// maxDecimalUnscaledBytes caps the byte length of a decimal / big-decimal
+// UNSCALED value accepted on decode — the orthogonal axis to decimalScaleLimit
+// (which caps the SCALE). A schema's precision is parse-capped at
+// decimalScaleLimit (schema.go), so a minimally-encoded unscaled value within
+// the declared precision needs at most ceil(decimalScaleLimit*log2(10)/8) ~=
+// 27 KiB; 32 KiB clears that with margin, so no parse-valid decimal is ever
+// rejected. Beyond it, materializing the big.Int and base-converting it via
+// big.Rat.FloatString (json.Number / string targets) or GCD-reducing
+// big.Rat.SetFrac (high-scale targets) is O(M(n)*log n) on a multi-megabit
+// integer — a 1 MiB unscaled value spends ~1 s — so reject before the
+// conversion. Java/fastavro/avro-rs store significand+scale and never
+// base-convert, so they have no such cost; this is twmb-specific DoS defense,
+// like decimalScaleLimit. (The bare-number JSON form is bounded separately by
+// maxRatInputLen via boundedRatFromString.)
+const maxDecimalUnscaledBytes = 32 << 10
+
+// checkDecimalUnscaledLen rejects an over-long decimal unscaled value before
+// the big.Int materialization / base conversion it would otherwise drive (see
+// maxDecimalUnscaledBytes). Shared by the bytes-, fixed-, and big-decimal
+// decode paths on both wire formats so the bound cannot drift between them.
+//
+// It is also the ENCODE-side gate, and that is what makes the bound a property
+// of the format rather than of the reader: every decimal emit path charges the
+// bytes this function will be handed on the way back in, through this same
+// function, before they reach the wire. Asking one function on both sides is
+// what makes over-rejection impossible — encode rejects EXACTLY the payloads
+// decode rejects, so a wire this package produces is a wire it can read.
+func checkDecimalUnscaledLen(b []byte) error {
+	return checkDecimalUnscaledSize(len(b))
+}
+
+// checkDecimalUnscaledSize is checkDecimalUnscaledLen for a caller that knows
+// the length before it has the bytes — a fixed carrier, whose padded width is
+// the schema's size and is therefore decidable without building the payload.
+func checkDecimalUnscaledSize(n int) error {
+	if n > maxDecimalUnscaledBytes {
+		return fmt.Errorf("decimal unscaled value of %d bytes exceeds %d byte limit", n, maxDecimalUnscaledBytes)
+	}
+	return nil
+}
+
+// isJSONNumber reports whether s is a JSON number per RFC 8259.
+// json.Valid validates the grammar; the boundary-whitespace and
+// first-char checks reject (a) whitespace-padded numbers (JSON's
+// "ws value ws" production accepts them as JSON-text but not as a
+// standalone number), and (b) other JSON values that are valid but
+// non-numeric (strings, booleans, null, arrays, objects).
+//
+// boundedRatFromString uses this gate because big.Rat.SetString's
+// accepted-input set is strictly broader than JSON: it accepts
+// hex ("0x10"), binary ("0b10"), octal ("0o10"), underscore-separated
+// ("1_000"), rational ("5/1"), and hex-float-with-binary-exponent
+// ("0x1p4") forms. None of these are valid JSON numbers, and all of
+// them silently produced an integer value when they leaked into the
+// integer / decimal / big-decimal encode paths via parseInt64Lenient,
+// jsonNumberToInt64, jsonCoerceToInt32/64, and tryCoerceToRat.
+func isJSONNumber(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	first := s[0]
+	if first == ' ' || first == '\t' || first == '\n' || first == '\r' {
+		return false
+	}
+	last := s[len(s)-1]
+	if last == ' ' || last == '\t' || last == '\n' || last == '\r' {
+		return false
+	}
+	if first != '-' && (first < '0' || first > '9') {
+		return false
+	}
+	// json.Valid is read-only; alias s's bytes to avoid the []byte(s) copy.
+	// Mirrors the parseUUID/parseUUIDBytes unsafe-slice pattern.
+	return json.Valid(unsafe.Slice(unsafe.StringData(s), len(s)))
+}
+
+// boundedRatFromString parses s into a *big.Rat, validating that s is
+// a JSON-spec number (via isJSONNumber) before reaching big.Rat.SetString
+// and rejecting decimal-form inputs whose net 10^exponent magnitude
+// exceeds decimalScaleLimit. SetString materializes 10^|net-exp| eagerly
+// during parsing — a 9-byte "1e1000000" allocates ~3 MB without the
+// magnitude guard, and 1 MiB of digits costs ~2 sec without the length
+// cap. Mirrors the wire-side bound in parseBigDecimalPayload so every
+// external decimal path (JSON decode bytes/fixed decimal, encode of
+// json.Number and string-typed values) shares the same caps.
 //
 // Three-valued return: (rat, true, nil) on success; (nil, false, nil)
-// when s is not parseable as a number (caller may fall back to raw
+// when s is not a number form at all (e.g. "abc", empty, or any input
+// that doesn't start with '-' or a digit — caller may fall back to raw
 // bytes for legitimate non-numeric inputs); (nil, false, err) when s
-// IS a number form but its magnitude exceeds decimalScaleLimit (caller
-// should propagate err — a hostile json.Number should not silently
-// re-encode as raw bytes). The rational form "p/q" is forwarded to
-// SetString unchanged: it has no 10^N materialization and is symmetric
-// with Java/avro-rs which store significand + scale separately.
+// IS number-shaped (leading '-' or digit) but rejected — JSON-invalid
+// grammar, length cap, or magnitude cap. Callers must propagate err
+// so hostile numeric-looking input cannot silently re-encode as raw
+// bytes via the fall-through path.
 func boundedRatFromString(s string) (*big.Rat, bool, error) {
-	if len(s) > 1<<20 {
-		return nil, false, fmt.Errorf("decimal value exceeds 1 MiB length cap")
+	if len(s) > maxRatInputLen {
+		return nil, false, fmt.Errorf("decimal value exceeds %d byte length cap", maxRatInputLen)
 	}
-	if !strings.ContainsRune(s, '/') {
-		netExp := int64(0)
-		body := s
-		if i := strings.IndexAny(body, "eE"); i >= 0 {
-			exp, err := strconv.ParseInt(body[i+1:], 10, 64)
-			if err != nil {
-				return nil, false, nil
+	if !isJSONNumber(s) {
+		// Numeric-looking but JSON-invalid (e.g. "0x10", "1_000",
+		// "5/1", "+5", ".5") surfaces as an error so the caller's
+		// typed-numeric path doesn't silently drop into the raw-bytes
+		// fallback. The "numeric-looking" predicate is broader than
+		// JSON-spec's number-start (which is just '-' or digit): it
+		// also includes '+' (Go/C-style sign that strconv accepts)
+		// and '.' (Python/JS-style leading dot that the user likely
+		// intended as a fractional). Genuinely non-numeric inputs
+		// (first char something like 'a', 'N', '{') stay in the
+		// (nil, false, nil) lane for the reflect.String → opaque
+		// raw-bytes fall-through.
+		if len(s) > 0 {
+			c := s[0]
+			if c == '-' || c == '+' || c == '.' || (c >= '0' && c <= '9') {
+				return nil, false, fmt.Errorf("invalid JSON number %q", truncForError(s))
 			}
-			netExp = exp
-			body = body[:i]
 		}
-		if i := strings.IndexByte(body, '.'); i >= 0 {
-			fracLen := int64(len(body) - i - 1)
-			if netExp < math.MinInt64+fracLen {
-				return nil, false, fmt.Errorf("decimal exponent overflow")
-			}
-			netExp -= fracLen
+		return nil, false, nil
+	}
+	netExp := int64(0)
+	body := s
+	if i := strings.IndexAny(body, "eE"); i >= 0 {
+		exp, err := strconv.ParseInt(body[i+1:], 10, 64)
+		if err != nil {
+			// isJSONNumber already established s IS a JSON-grammar-valid
+			// number with this exponent, so the only way ParseInt fails
+			// here is strconv.ErrRange — the exponent magnitude exceeds
+			// int64. Route through the (nil, false, err) "numeric but
+			// rejected" lane, not the (nil, false, nil) "non-numeric"
+			// lane: the latter is reserved for inputs that the caller
+			// may legitimately fall back to raw-bytes encoding, and a
+			// numeric-looking string with an out-of-range exponent
+			// must not silently re-encode as opaque bytes.
+			return nil, false, fmt.Errorf("decimal exponent %s overflows int64", truncForError(body[i+1:]))
 		}
-		if netExp > decimalScaleLimit || netExp < -decimalScaleLimit {
-			return nil, false, fmt.Errorf("decimal value 10^%d magnitude exceeds %d limit", netExp, decimalScaleLimit)
+		netExp = exp
+		body = body[:i]
+	}
+	if i := strings.IndexByte(body, '.'); i >= 0 {
+		fracLen := int64(len(body) - i - 1)
+		if netExp < math.MinInt64+fracLen {
+			return nil, false, fmt.Errorf("decimal exponent overflow")
 		}
+		netExp -= fracLen
+	}
+	if netExp > decimalScaleLimit || netExp < -decimalScaleLimit {
+		return nil, false, fmt.Errorf("decimal value 10^%d magnitude exceeds %d limit", netExp, decimalScaleLimit)
 	}
 	r, ok := new(big.Rat).SetString(s)
 	if !ok {
@@ -641,60 +945,411 @@ func boundedRatFromString(s string) (*big.Rat, bool, error) {
 	return r, true, nil
 }
 
+// magnitudeWidestMultiplier is the largest constant factor this package
+// applies to a single schema-declared magnitude: bits per byte, in
+// maxDecimalDigits' capacity calculation. maxSchemaMagnitude is chosen against
+// it, so a consumer that scales a saturated magnitude by up to this much
+// stays inside a 32-bit int on every build. A consumer needing a WIDER factor
+// belongs here, lowering the ceiling for everyone, rather than clamping to a
+// private ceiling of its own.
+const magnitudeWidestMultiplier = 8
+
+// maxSchemaMagnitude is the one ceiling every schema-declared magnitude is
+// saturated to before it enters arithmetic.
+//
+// A `fixed` size is the only parse-time quantity whose VALUE is not bounded by
+// the length of the text declaring it — nineteen characters name 2^63, and the
+// parser deliberately leaves the upper bound open to match the lenient
+// majority. Precision and scale are capped at decimalScaleLimit during
+// validation; field, branch and symbol counts each cost bytes to write. So an
+// unsaturated magnitude is the one way arithmetic here can leave the int
+// range, and it does not take a product to do it: a running SUM over a
+// record's fields wraps just as readily, and a guard testing only the positive
+// side of the range (`s >= someCeiling`) never sees the wrapped value, because
+// a negative number is not greater than a positive one.
+//
+// 1<<27 is the largest power of two that survives magnitudeWidestMultiplier
+// inside a 32-bit int (1<<27 * 8 == 1<<30, with the sign bit to spare). It is
+// also 128 MiB — orders of magnitude above any fixed anyone declares — so no
+// real schema is clipped.
+//
+// What clipping an absurd one costs, stated exactly rather than waved at: a
+// buffer-relative block bound derived from a clipped magnitude is looser than
+// one derived from the true magnitude, so for a buffer at least this large a
+// block count can pass the bound and then fail at the element decode instead
+// of at the bound. Both reject; only the error moves. For any buffer below the
+// ceiling — which is every buffer the bound was written for — the verdict is
+// identical, and TestInvariant_ClippedMagnitudeStillRejects pins that.
+const maxSchemaMagnitude = 1 << 27
+
+// saturateSchemaMagnitude clamps a schema-declared magnitude into
+// [0, maxSchemaMagnitude] so arithmetic on the result cannot wrap. It is TOTAL
+// on purpose: callers must not have to know whether their input was validated
+// upstream, since the whole failure mode is a site assuming someone else
+// bounded the value.
+//
+// This bounds ARITHMETIC RANGE, not allocation size. A magnitude that becomes
+// a make() length needs its own, far tighter bound — maxSchemaMagnitude is
+// 128 MiB, which is a fine addend and a terrible allocation — and that bound
+// belongs at the allocating site, where the reason for its size lives
+// (jsonDecodeAppliesLogical's probe buffer is the instance: it caps at the
+// largest length any fixed logical inspects, because it only has to tell 12
+// and 16 apart from everything else). The two are different questions; this
+// one is only the first.
+func saturateSchemaMagnitude(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > maxSchemaMagnitude {
+		return maxSchemaMagnitude
+	}
+	return n
+}
+
 // schemaMinBytes returns the minimum number of wire bytes required to
 // encode one value of node's type. Used at decode time to bound array
 // block counts. Cycles fall back to 1 (conservative — defaults to the
 // existing tight buffer-relative guard).
+//
+// The result is always in [0, maxSchemaMagnitude]. Three callers compute
+// `1 + schemaMinBytes(...)` and one of them divides by it, so a wrapped or
+// negative return is not a loose bound but a crash and a misclassification:
+// zero divides, and a negative value routes an element that occupies real
+// bytes through the ZERO-BYTE element cap instead of the buffer-relative one.
+// Saturating here rather than at each consumer is deliberate — the consumers
+// are four separate derivations of the same bound (parse, resolve, skip, and
+// the container reader's), and a ceiling applied at one leaves three open.
+//
+// This spins up a fresh walk for one node. A caller that computes minimums for
+// SEVERAL containers in one operation must instead share ONE walk across them —
+// see newMinBytesWalk. The container count is caller-chosen (every array/map is
+// one), and a fresh walk per container makes the operation's cost that count
+// times the per-walk allowance while capping only the second factor. The memo
+// and allowance are node-keyed and path-independent, so sharing is exact for the
+// acyclic case and gives the same conservative stand-in for the cyclic one.
 func schemaMinBytes(n *schemaNode) int {
-	return schemaMinBytesSeen(n, map[*schemaNode]struct{}{})
+	return newMinBytesWalk().minBytesOf(n)
 }
 
-func schemaMinBytesSeen(n *schemaNode, seen map[*schemaNode]struct{}) int {
+// newMinBytesWalk returns a walk carrying a full allowance and an empty memo.
+// One walk is threaded through all the container sites of a single operation —
+// a parse's finalize pass over its forward-referenced containers, one Resolve,
+// one record's skip compilation — so that the OPERATION's total min-bytes work
+// is what maxMinBytesWork bounds, not each container's independently. Reusing
+// the walk is what keeps a schema that points N containers at one shared
+// subtree from paying N times: the acyclic part is memoized after the first
+// container and the cyclic part exhausts the shared allowance once.
+func newMinBytesWalk() *minBytesWalk {
+	return &minBytesWalk{
+		path:      make(map[*schemaNode]bool),
+		done:      make(map[*schemaNode]int),
+		allowance: maxMinBytesWork,
+	}
+}
+
+// result returns node n's minimum wire bytes, consuming this walk's shared memo
+// and allowance so the cost joins that of every prior container computed on the
+// same walk.
+func (w *minBytesWalk) minBytesOf(n *schemaNode) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	v, _ := w.minBytes(n)
+	return v
+}
+
+// maxMinBytesWork bounds the WORK one walk may perform, counted in children
+// examined. Because one walk is shared across every container of an operation
+// (see newMinBytesWalk), this bounds the OPERATION's total, not each container's
+// — the count of containers is caller-chosen, so a per-container allowance
+// would cap the wrong factor of the product. The memo makes an acyclic graph
+// linear no matter how many paths reach a node, but a CYCLIC one cannot be
+// memoized at all (see minBytesWalk), and a chain whose levels are mutually
+// recursive still fans out per reference. This is the backstop for that residue.
+//
+// It is charged per CHILD, not per node entered, and that is the whole point of
+// the constant rather than an implementation detail. Entering a record iterates
+// its own fields, so an allowance spent one unit per entry bounds how many
+// nodes are entered while the cost of each is a SECOND magnitude the schema
+// author picks — and a bound on one factor of a product is not a bound. Charged
+// per child, the unit of the allowance is the unit of the work and the product
+// cannot reappear. walkBudget.takeNodes (schema_node.go) charges the same way
+// for the same reason.
+//
+// Exhausting it is sound in the one direction that matters. Reaching the cap
+// requires a subtree of cyclic references, which means the node the caller
+// asked about is a record, union or container above them — every one of which
+// costs at least one wire byte, since the reference closing a cycle can be
+// neither `null` nor an all-null record. So the stand-in below is never
+// ABOVE the true minimum, and a bound derived from it is loose rather than
+// wrong.
+//
+// The value is far above the work any schema that is not built to hit it costs:
+// the memo makes an acyclic graph cost the sum of its nodes' child counts,
+// which is bounded by the schema TEXT (a field costs bytes to write), so a
+// schema would have to run to tens of megabytes before an honest parse traded
+// its exact bound for the loose one. That headroom is what
+// TestInvariant_MemoAgreesWithUnmemoizedWalk relies on.
+const maxMinBytesWork = 1 << 22
+
+// minBytesUnknown is what the walk reports when it cannot compute a node's
+// minimum — an unwired forward reference, or an exhausted allowance. It is a
+// distinct rule rather than a number because the consumers do not treat the
+// minimum as a pure magnitude: checkArrayBlockBounds switches between the
+// zero-byte cap and the buffer-relative bound on whether it is 0, and those two
+// rules are incomparable. So there is no numeric stand-in that is safe in both
+// directions, and any guess false-rejects one of them.
+//
+// The rule every producer here obeys: a reported minimum must be a sound LOWER
+// bound on the true per-value wire size, and must never be positive unless the
+// true minimum is provably at least that. Under-reporting only loosens a
+// bound; over-reporting changes which bound applies.
+const minBytesUnknown = -1
+
+// minBytesWalk carries the shared state of one operation's min-bytes work,
+// reused across every container the operation computes a bound for.
+//
+// A named type referenced twice binds BOTH references to one *schemaNode, so
+// the graph the walk descends is a DAG, not a tree, and a walk that
+// re-descends per reference does 2^depth work on a schema whose text grows
+// linearly. Nothing about that requires deep nesting — every level can be
+// declared as a sibling field wired by forward reference — so the memo is the
+// only thing that bounds it.
+//
+// The memo is not simply "have I seen this node", because that is also what
+// detects cycles, and the two want opposite lifetimes. Cycle detection needs a
+// mark removed on the way back OUT (a node is only a cycle if it is on the
+// CURRENT path); a memo needs one that survives. That is `path` and `done`.
+//
+// WHICH results may be remembered is the whole subtlety, and the condition is
+// stricter than it first looks. A back-edge does not return the referenced
+// node's minimum — it cannot, that computation is still running — it returns a
+// conservative stand-in. So a result computed through one is a property of the
+// PATH, not of the node.
+//
+// It is not enough to ask whether a back-edge escaped ABOVE the node while it
+// was being computed. A result must also be safe to CONSUME later, and a
+// second entry has a different path: if any node currently being computed lies
+// inside n's subtree, recomputing n would hit it as a back-edge and get a
+// different answer. That is only possible when n's subtree contains a cycle —
+// an on-path node inside n's subtree that also reaches n is exactly a cycle
+// through n — so the exact condition is that n's subtree is entirely
+// cycle-free, and `minBytes` reports that alongside the value.
+//
+// The weaker "no back-edge escaped above me" condition is wrong in a way no
+// cost test can see, because a wrong memo is faster rather than slower:
+// mutually recursive A and X, where A is computed from outside and then
+// consumed from inside X, produce a total that differs from the walk with no
+// memo at all. TestInvariant_MemoAgreesWithUnmemoizedWalk is what settles it.
+type minBytesWalk struct {
+	// mu guards the three fields below. One walk is shared across a whole
+	// operation, and the SKIP path's share of that operation runs at DECODE
+	// time — a record's field set is compiled inside its sync.Once, which fires
+	// on whichever goroutine first reaches that record on the wire. Two
+	// different records of one resolved schema can therefore compile
+	// concurrently on one walk.
+	//
+	// It is uncontended in steady state: each record compiles exactly once, and
+	// every non-skip reaching path (build, finalize, resolve) is single-threaded
+	// by construction. Sharing the memo is the whole point — see newMinBytesWalk
+	// — so a per-record walk is not an alternative to the lock, it is a
+	// different (and unbounded) cost.
+	//
+	// Drain ORDER is deliberately not made deterministic. It does not need to
+	// be: an exhausted allowance yields minBytesUnknown, whose bound admits the
+	// union of what every computable answer would admit (checkArrayBlockBounds),
+	// so which record drains the walk can only ever LOOSEN a later record's
+	// bound and can never reject a wire another order would have accepted.
+	mu        sync.Mutex
+	path      map[*schemaNode]bool // the nodes currently being computed
+	done      map[*schemaNode]int  // results for nodes whose subtree has no cycle
+	allowance int                  // children left to examine; see maxMinBytesWork
+}
+
+// take charges n children about to be examined, reporting false once the
+// allowance cannot cover them. Mirrors walkBudget.takeNodes: an over-large
+// request drives the allowance to zero rather than partially spending it, so
+// exhaustion is permanent and every later entry takes the stand-in.
+func (w *minBytesWalk) take(n int) bool {
+	if n > w.allowance {
+		w.allowance = 0
+		return false
+	}
+	w.allowance -= n
+	return true
+}
+
+// minBytesChildren is how many children entering n will examine — the cost of
+// one entry, and so what it is charged. It is read off the same fields
+// minBytesFromChildren iterates, so the charge cannot drift from the work: an
+// arm that grows a new child list has to be added to both or neither. The
+// container arms are absent from both, deliberately — an array or a map
+// answers with its own terminator byte and never descends into its element.
+func minBytesChildren(n *schemaNode) int {
+	switch n.kind {
+	case "union":
+		return len(n.branches)
+	case "record":
+		return len(n.fields)
+	}
+	return 0
+}
+
+// minBytes returns node n's minimum wire bytes and whether n's subtree is
+// entirely free of cycles — the condition for remembering the result.
+func (w *minBytesWalk) minBytes(n *schemaNode) (int, bool) {
 	if n == nil {
-		return 1
+		// An unwired forward reference during build. Its subtree is not
+		// reachable yet, so its minimum is not merely expensive but unknown —
+		// and unknown is the only sound answer, because 0 and 1 select
+		// different block-bound RULES (see checkArrayBlockBounds) and this
+		// node's true minimum may be either.
+		return minBytesUnknown, false
 	}
-	if _, cycle := seen[n]; cycle {
-		return 1
+	if w.path[n] {
+		// A cycle through n. The stand-in is 1 because a cyclic type's true
+		// minimum is at least 1: every finite value of n must, somewhere on
+		// the path back to n, decline to re-enter it, and the only constructs
+		// that can are a union (which spends a branch-index varint) and an
+		// array or map (which spends a terminating zero block count) — each at
+		// least one byte, and each part of n's own encoding. A cycle offering
+		// neither is unencodable, so no wire can be false-rejected by any
+		// bound derived from it. The false travels back so every enclosing
+		// node learns its own result came through a back-edge and must not be
+		// remembered.
+		return 1, false
 	}
-	seen[n] = struct{}{}
-	defer delete(seen, n)
+	if v, ok := w.done[n]; ok {
+		return v, true
+	}
+	// Charged BEFORE descending, and charged for the whole child list: the
+	// loops below iterate a count the schema author chose, so charging one
+	// unit for the entry would bound the number of entries and leave the work
+	// each one does unbounded.
+	if !w.take(1 + minBytesChildren(n)) {
+		// Exhausted. Unknown, NOT a magnitude: exhaustion is permanent and
+		// global to the walk, so every later node takes this arm — including
+		// nodes with nothing cyclic about them, whose true minimum is 0. A
+		// numeric stand-in here would be a claim about a node the walk never
+		// looked at.
+		return minBytesUnknown, false
+	}
+	w.path[n] = true
+	v, acyclic := w.minBytesFromChildren(n)
+	delete(w.path, n)
+	if acyclic {
+		w.done[n] = v
+	}
+	return v, acyclic
+}
+
+func (w *minBytesWalk) minBytesFromChildren(n *schemaNode) (int, bool) {
 	switch n.kind {
 	case "null":
-		return 0
+		return 0, true
 	case "boolean", "int", "long", "enum":
-		return 1
+		return 1, true
 	case "float":
-		return 4
+		return 4, true
 	case "double":
-		return 8
+		return 8, true
 	case "bytes", "string":
-		return 1
+		return 1, true
 	case "fixed":
-		return n.size
+		// The declared size is the one magnitude here the schema text names
+		// outright and the parser leaves unbounded; every wrap below is built
+		// from it, so it is saturated at the point it enters.
+		return saturateSchemaMagnitude(n.size), true
 	case "array", "map":
-		return 1 // empty-collection terminator is 1 byte
+		return 1, true // empty-collection terminator is 1 byte
 	case "union":
-		m := math.MaxInt
+		// found, not a sentinel value: a branch minimum that happened to equal
+		// the sentinel would otherwise read as "no branches at all" and report
+		// the union as costing one byte.
+		m, found := 0, false
+		acyclic := true
+		unknown := false
 		for _, b := range n.branches {
-			if v := schemaMinBytesSeen(b, seen); v < m {
-				m = v
+			v, ba := w.minBytes(b)
+			acyclic = acyclic && ba
+			if v == minBytesUnknown {
+				unknown = true
+				continue
+			}
+			if !found || v < m {
+				m, found = v, true
 			}
 		}
-		if m == math.MaxInt {
-			return 1
+		if unknown {
+			// A union never needs the unknown rule: whatever the unreadable
+			// branch costs, it is at least 0, so the union is at least its own
+			// branch-index varint. 1 is a sound lower bound and — unlike a
+			// record's — it is positive, so it keeps the buffer-relative rule
+			// that a union's guaranteed byte justifies.
+			return 1, false
 		}
-		return 1 + m
+		if !found {
+			return 1, acyclic
+		}
+		return saturateSchemaMagnitude(1 + m), acyclic
 	case "record":
+		// Saturating the RUNNING SUM, not just the result: every term is
+		// already in range, so `s + term` cannot wrap, and the clamp keeps it
+		// that way for the next field. A guard on the result alone would test
+		// a value the wrap already destroyed.
 		var s int
+		acyclic := true
+		unknown := false
 		for i := range n.fields {
-			s += schemaMinBytesSeen(n.fields[i].node, seen)
-			if s >= math.MaxInt32 {
-				return math.MaxInt32
+			v, fa := w.minBytes(n.fields[i].node)
+			acyclic = acyclic && fa
+			if v == minBytesUnknown {
+				// Keep summing the readable fields: their total is still a
+				// sound lower bound on the record, since the unknown ones
+				// contribute at least 0.
+				unknown = true
+				continue
+			}
+			s = saturateSchemaMagnitude(s + v)
+			if s == maxSchemaMagnitude {
+				// Already at the ceiling from the readable fields alone, so
+				// the ceiling is a sound lower bound whatever the rest cost.
+				return maxSchemaMagnitude, acyclic && !unknown
 			}
 		}
-		return s
+		if unknown && s == 0 {
+			// Nothing readable to stand on. The record's true minimum may be
+			// 0 or positive, and those select different rules, so neither can
+			// be guessed.
+			return minBytesUnknown, false
+		}
+		if unknown {
+			// The readable fields alone guarantee s bytes; the unknown ones
+			// only add. A positive lower bound is all the buffer-relative
+			// rule needs.
+			return s, false
+		}
+		return s, acyclic
 	}
-	return 1
+	return 1, true
+}
+
+// fastPathSafeForElem reports whether a primitive fast loop with expected
+// kind fastElemKind is safe for slice/map elements of type elemType.
+// Returns false when the kind doesn't match. The string fast loops
+// (deserArrayStringLoop, deserMapStringBlock) capture reflect.Value.SetString
+// as a method expression, bypassing the per-element setStringValue logic, so
+// the eligibility decision is shared with the unsafe struct gates via
+// stringFastPathEligibleDecode (json.Number's RFC 8259 guard + any
+// TextUnmarshaler implementor's UnmarshalText arm). Evaluated once per decode
+// call (not per element).
+func fastPathSafeForElem(elemType reflect.Type, fastElemKind reflect.Kind) bool {
+	if elemType.Kind() != fastElemKind {
+		return false
+	}
+	if fastElemKind == reflect.String {
+		return stringFastPathEligibleDecode(elemType)
+	}
+	return true
 }
 
 func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -707,7 +1362,7 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	iface := v.Kind() == reflect.Interface
 	fixedArray := v.Kind() == reflect.Array
 	if !iface && !fixedArray && v.Kind() != reflect.Slice {
-		return nil, &SemanticError{GoType: v.Type(), AvroType: "array"}
+		return nil, semErr(v, "array")
 	}
 	// Fixed-size Go arrays: decode directly into array elements and
 	// verify the Avro data has exactly the right number of elements.
@@ -730,7 +1385,13 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	}
 	// For primitive item types with matching Go element types, use
 	// a specialized loop that avoids per-element function pointer calls.
-	useFast := !iface && s.fastLoop != nil && sliceType.Elem().Kind() == s.fastElemKind
+	// fastPathSafeForElem screens both the Kind match and the json.Number
+	// guard-bypass case — see its docstring.
+	useFast := !iface && s.fastLoop != nil && fastPathSafeForElem(sliceType.Elem(), s.fastElemKind)
+	// Native concrete path: write straight into []V. The unnamed-slice
+	// assertion in nativeLoop returns handled=false for named slice/elem
+	// types, which fall back to fastLoop.
+	useFastNative := useFast && s.nativeLoop != nil
 	// For interface targets with primitive avro items, use the iface
 	// fast loop that operates directly on []any.
 	useFastIface := iface && s.fastIfaceLoop != nil
@@ -741,29 +1402,29 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	var err error
 	var totalItems int64
 	for {
-		var count int64
-		count, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
+		count, _, rest, end, headerErr := readBlockHeader(src, "array", false)
+		if headerErr != nil {
+			return nil, headerErr
 		}
-		if count == 0 {
+		src = rest
+		if end {
 			if iface {
 				if !sliceVal.IsValid() {
 					sliceVal = reflect.MakeSlice(sliceType, 0, 0)
 				}
 				return src, setIface(v, sliceVal, "array")
 			}
+			// An empty Avro array decodes to a non-nil empty slice, matching
+			// the JSON array decoder and the binary map decoder (which uses
+			// MakeMap) — so a decoded empty array is distinguishable from an
+			// absent value and round-trips identically across wire formats.
+			// Only the empty case reaches here with v still nil; a populated
+			// or reused target already has a backing array. The IsNil check is
+			// once per array decode (not per element).
+			if v.IsNil() {
+				v.Set(reflect.MakeSlice(sliceType, 0, 0))
+			}
 			return src, nil
-		}
-		if count < 0 {
-			count = -count
-			if count < 0 {
-				return nil, errors.New("invalid array block count")
-			}
-			_, src, err = readVarlong(src) // skip block byte size
-			if err != nil {
-				return nil, err
-			}
 		}
 		if err := checkArrayBlockBounds(count, totalItems, len(src), s.minItemBytes); err != nil {
 			return nil, err
@@ -798,6 +1459,17 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		default:
 			sliceVal.SetLen(newLen)
 		}
+		if useFastNative {
+			handled, rest, nerr := s.nativeLoop(sliceVal, src, start, n, sl)
+			if nerr != nil {
+				return nil, nerr
+			}
+			if handled {
+				src = rest
+				continue
+			}
+			useFastNative = false // named slice/elem type: fall back to fastLoop henceforth
+		}
 		if useFast {
 			src, err = s.fastLoop(src, sliceVal, start, n, sl)
 			if err != nil {
@@ -819,9 +1491,28 @@ func (s *deserArray) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		elemType := sliceVal.Type().Elem()
 		if elemType.Kind() == reflect.Pointer {
 			innerType := elemType.Elem()
-			backing := reflect.MakeSlice(reflect.SliceOf(innerType), n, n)
+			// Batch-allocate backing for nil slots only; reuse any non-nil
+			// retained pointer so an element aliased from a prior decode is
+			// updated in place, matching the unsafe struct-field path
+			// (udArrayPtrRecord) and the documented pointer-reuse contract.
+			// On a freshly grown slice the new slots are nil, so they all get
+			// fresh backing.
+			var need int
 			for i := range n {
-				sliceVal.Index(start + i).Set(backing.Index(i).Addr())
+				if sliceVal.Index(start + i).IsNil() {
+					need++
+				}
+			}
+			if need > 0 {
+				backing := reflect.MakeSlice(reflect.SliceOf(innerType), need, need)
+				j := 0
+				for i := range n {
+					slot := sliceVal.Index(start + i)
+					if slot.IsNil() {
+						slot.Set(backing.Index(j).Addr())
+						j++
+					}
+				}
 			}
 		}
 		for i := start; i < newLen; i++ {
@@ -840,26 +1531,16 @@ func (s *deserArray) deserFixedArray(src []byte, v reflect.Value, sl *slab) ([]b
 	idx := 0
 	var err error
 	for {
-		var count int64
-		count, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
+		count, _, rest, end, headerErr := readBlockHeader(src, "array", false)
+		if headerErr != nil {
+			return nil, headerErr
 		}
-		if count == 0 {
+		src = rest
+		if end {
 			if idx != arrLen {
 				return nil, &SemanticError{GoType: v.Type(), AvroType: "array", Err: fmt.Errorf("expected %d elements, got %d", arrLen, idx)}
 			}
 			return src, nil
-		}
-		if count < 0 {
-			count = -count
-			if count < 0 {
-				return nil, errors.New("invalid array block count")
-			}
-			_, src, err = readVarlong(src)
-			if err != nil {
-				return nil, err
-			}
 		}
 		// Compare in int64-sized arithmetic before narrowing to int.
 		// idx+int(count) > arrLen wraps for huge count (e.g. count
@@ -880,168 +1561,113 @@ func (s *deserArray) deserFixedArray(src []byte, v reflect.Value, sl *slab) ([]b
 	}
 }
 
-// The following loop functions decode array items for primitive types,
-// avoiding per-element function pointer calls and type checks. Each is
-// selected at schema build time based on the array's item type.
-
-func deserArrayStringLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
-	var err error
-	for i := start; i < start+count; i++ {
-		var n int
-		n, src, err = readLength(src, "string")
-		if err != nil {
-			return nil, err
+// deserArrayLoop builds a per-primitive fast loop for typed slice
+// targets. set is called per element with the slice slot (sliceVal.Index(i))
+// and the decoded value; readOne reads one wire element from src. One
+// helper replaces six near-identical loops (String/Boolean/Int/Long/Float
+// /Double); the package vars below are pre-bound so schema build pays
+// no allocation per array.
+func deserArrayLoop[T any](readOne func(src []byte, sl *slab) (T, []byte, error), set func(reflect.Value, T)) func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
+	return func(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
+		for i := start; i < start+count; i++ {
+			v, rest, err := readOne(src, sl)
+			if err != nil {
+				return nil, err
+			}
+			set(sliceVal.Index(i), v)
+			src = rest
 		}
-		sliceVal.Index(i).SetString(sl.string(src, n))
-		src = src[n:]
+		return src, nil
 	}
-	return src, nil
 }
 
-func deserArrayBooleanLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
-	// The caller guarantees len(src) >= count (via the block count check),
-	// and each boolean consumes exactly 1 byte, so bounds are always safe.
-	for i := start; i < start+count; i++ {
-		sliceVal.Index(i).SetBool(src[0] == 1)
-		src = src[1:]
-	}
-	return src, nil
-}
-
-func deserArrayIntLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
-	var err error
-	for i := start; i < start+count; i++ {
-		var val int32
-		val, src, err = readVarint(src)
-		if err != nil {
-			return nil, err
+// deserArrayIfaceLoop is deserArrayLoop's []any sibling — stores
+// readOne(src) into slice[i] directly without wrapping in reflect.Value.
+func deserArrayIfaceLoop[T any](readOne func(src []byte, sl *slab) (T, []byte, error)) func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
+	return func(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
+		for i := start; i < start+count; i++ {
+			v, rest, err := readOne(src, sl)
+			if err != nil {
+				return nil, err
+			}
+			slice[i] = v
+			src = rest
 		}
-		sliceVal.Index(i).SetInt(int64(val))
+		return src, nil
 	}
-	return src, nil
 }
 
-func deserArrayLongLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
-	var err error
-	for i := start; i < start+count; i++ {
-		var val int64
-		val, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		sliceVal.Index(i).SetInt(val)
+// Per-primitive readOne functions feed both the typed-slice and iface
+// loops. Boolean trusts the caller's len(src) ≥ count bounds check via
+// the block-count guard.
+func readOneString(src []byte, sl *slab) (string, []byte, error) {
+	n, src, err := readLength(src, "string")
+	if err != nil {
+		return "", nil, err
 	}
-	return src, nil
+	return sl.string(src, n), src[n:], nil
 }
 
-func deserArrayFloatLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
-	var err error
-	for i := start; i < start+count; i++ {
-		var u uint32
-		u, src, err = readUint32(src)
-		if err != nil {
-			return nil, err
-		}
-		sliceVal.Index(i).SetFloat(float64(math.Float32frombits(u)))
+func readOneBool(src []byte, _ *slab) (bool, []byte, error) {
+	if len(src) < 1 {
+		return false, nil, &ShortBufferError{Type: "boolean"}
 	}
-	return src, nil
+	return src[0] == 1, src[1:], nil
 }
 
-func deserArrayDoubleLoop(src []byte, sliceVal reflect.Value, start, count int, sl *slab) ([]byte, error) {
-	var err error
-	for i := start; i < start+count; i++ {
-		var u uint64
-		u, src, err = readUint64(src)
-		if err != nil {
-			return nil, err
-		}
-		sliceVal.Index(i).SetFloat(math.Float64frombits(u))
-	}
-	return src, nil
+func readOneInt(src []byte, _ *slab) (int32, []byte, error) {
+	return readVarint(src)
 }
 
-// The following iface fast loops decode array items directly into a
-// []any, bypassing the reflect.Value wrapping that the generic loop
-// would do. Selected at schema-build time based on the avro item type.
-
-func deserArrayStringIfaceLoop(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
-	for i := start; i < start+count; i++ {
-		n, rest, err := readLength(src, "string")
-		if err != nil {
-			return nil, err
-		}
-		slice[i] = sl.string(rest, n)
-		src = rest[n:]
-	}
-	return src, nil
+func readOneLong(src []byte, _ *slab) (int64, []byte, error) {
+	return readVarlong(src)
 }
 
-func deserArrayBooleanIfaceLoop(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
-	// Caller guarantees len(src) >= count via block bounds check.
-	for i := start; i < start+count; i++ {
-		slice[i] = src[0] == 1
-		src = src[1:]
+func readOneFloat(src []byte, _ *slab) (float32, []byte, error) {
+	u, src, err := readUint32(src)
+	if err != nil {
+		return 0, nil, err
 	}
-	return src, nil
+	return math.Float32frombits(u), src, nil
 }
 
-func deserArrayIntIfaceLoop(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
-	for i := start; i < start+count; i++ {
-		val, rest, err := readVarint(src)
-		if err != nil {
-			return nil, err
-		}
-		slice[i] = val
-		src = rest
+func readOneDouble(src []byte, _ *slab) (float64, []byte, error) {
+	u, src, err := readUint64(src)
+	if err != nil {
+		return 0, nil, err
 	}
-	return src, nil
+	return math.Float64frombits(u), src, nil
 }
 
-func deserArrayLongIfaceLoop(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
-	for i := start; i < start+count; i++ {
-		val, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		slice[i] = val
-		src = rest
-	}
-	return src, nil
-}
+var (
+	deserArrayStringLoop  = deserArrayLoop(readOneString, reflect.Value.SetString)
+	deserArrayBooleanLoop = deserArrayLoop(readOneBool, reflect.Value.SetBool)
+	deserArrayIntLoop     = deserArrayLoop(readOneInt, func(v reflect.Value, x int32) { v.SetInt(int64(x)) })
+	deserArrayLongLoop    = deserArrayLoop(readOneLong, reflect.Value.SetInt)
+	deserArrayFloatLoop   = deserArrayLoop(readOneFloat, func(v reflect.Value, x float32) { *(*uint32)(unsafe.Pointer(v.UnsafeAddr())) = math.Float32bits(x) })
+	deserArrayDoubleLoop  = deserArrayLoop(readOneDouble, reflect.Value.SetFloat)
 
-func deserArrayFloatIfaceLoop(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
-	for i := start; i < start+count; i++ {
-		u, rest, err := readUint32(src)
-		if err != nil {
-			return nil, err
-		}
-		slice[i] = math.Float32frombits(u)
-		src = rest
-	}
-	return src, nil
-}
-
-func deserArrayDoubleIfaceLoop(src []byte, slice []any, start, count int, sl *slab) ([]byte, error) {
-	for i := start; i < start+count; i++ {
-		u, rest, err := readUint64(src)
-		if err != nil {
-			return nil, err
-		}
-		slice[i] = math.Float64frombits(u)
-		src = rest
-	}
-	return src, nil
-}
+	deserArrayStringIfaceLoop  = deserArrayIfaceLoop(readOneString)
+	deserArrayBooleanIfaceLoop = deserArrayIfaceLoop(readOneBool)
+	deserArrayIntIfaceLoop     = deserArrayIfaceLoop(readOneInt)
+	deserArrayLongIfaceLoop    = deserArrayIfaceLoop(readOneLong)
+	deserArrayFloatIfaceLoop   = deserArrayIfaceLoop(readOneFloat)
+	deserArrayDoubleIfaceLoop  = deserArrayIfaceLoop(readOneDouble)
+)
 
 type deserMap struct {
-	deserItem    deserfn
-	fastBlock    func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
+	deserItem deserfn
+	fastBlock func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error)
+	// nativeBlock decodes one block straight into the concrete Go map
+	// (m[k]=v) when its dynamic type is exactly map[string]V; returns
+	// handled=false for named map types, which fall back to fastBlock.
+	nativeBlock  func(mapVal reflect.Value, src []byte, count int, sl *slab) (bool, []byte, error)
 	fastElemKind reflect.Kind
-	// fastIfaceBlock decodes one block of entries directly into a
-	// map[string]any, bypassing reflect for primitive values. Selected
-	// at schema-build time based on the avro value type. nil for
-	// non-primitive value types; the generic reflect path handles those.
-	fastIfaceBlock func(src []byte, m map[string]any, count int, sl *slab) ([]byte, error)
+	// fastIfaceVal decodes one primitive value directly into a Go any,
+	// bypassing reflect; deserMapPrimitiveIfaceBlock drives the per-block
+	// loop. nil for non-primitive value types; the generic reflect path
+	// handles those.
+	fastIfaceVal deserIfaceFn
 	// minEntryBytes is 1 (key length varint, ≥1 byte for empty key)
 	// + schemaMinBytes(values). Used to bound block-count against
 	// remaining buffer length, preventing the same memory-amplification
@@ -1092,10 +1718,20 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	}
 	// For primitive value types with matching Go element types, use
 	// reusable reflect.Value containers to avoid per-entry allocations.
-	useFast := !iface && s.fastBlock != nil && elemTyp.Kind() == s.fastElemKind
+	// fastPathSafeForElem screens both the Kind match and the json.Number
+	// guard-bypass case — see its docstring. A json.Number map key also
+	// requires per-key validation (isJSONNumber check on each wire key),
+	// which the fastBlock loops can't perform without per-element setter
+	// indirection; route those to the slow path so the in-loop call to
+	// validateJSONNumberMapKey fires.
+	useFast := !iface && s.fastBlock != nil && fastPathSafeForElem(elemTyp, s.fastElemKind) && mapTyp.Key() != jsonNumberType
+	// Native concrete path: exact string key (so the unnamed map[string]V
+	// assertion can succeed) on top of the useFast eligibility. A named map
+	// or named key type returns handled=false and falls back to fastBlock.
+	useFastNative := useFast && s.nativeBlock != nil && mapTyp.Key() == stringType
 	// For interface targets with primitive avro values, use the
 	// iface-block fast path that operates directly on map[string]any.
-	useFastIface := iface && s.fastIfaceBlock != nil
+	useFastIface := iface && s.fastIfaceVal != nil
 	// Pre-allocate reusable key and elem containers to avoid
 	// per-entry reflect.ValueOf / reflect.New allocations.
 	// Construct keyVal with the user's actual map key type (e.g.
@@ -1109,12 +1745,12 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 	}
 	var err error
 	for {
-		var count int64
-		count, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
+		count, _, rest, end, headerErr := readBlockHeader(src, "map", false)
+		if headerErr != nil {
+			return nil, headerErr
 		}
-		if count == 0 {
+		src = rest
+		if end {
 			// Empty map: allocate zero-sized backing if we never saw a block.
 			if !mapVal.IsValid() {
 				mapVal = reflect.MakeMap(mapTyp)
@@ -1127,18 +1763,8 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			}
 			return src, nil
 		}
-		if count < 0 {
-			count = -count
-			if count < 0 {
-				return nil, errors.New("invalid map block count")
-			}
-			_, src, err = readVarlong(src) // skip block size
-			if err != nil {
-				return nil, err
-			}
-		}
-		if count > int64(len(src))/int64(s.minEntryBytes) {
-			return nil, fmt.Errorf("map block count %d exceeds remaining buffer length %d (min %d byte/entry)", count, len(src), s.minEntryBytes)
+		if err := checkMapBlockBounds(count, len(src), s.minEntryBytes); err != nil {
+			return nil, err
 		}
 		// Lazy-allocate on first block using its count as a size hint,
 		// capped to bound bucket-overhead amplification on hostile
@@ -1147,14 +1773,22 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 		// at the 2-byte minimum); without the cap the size hint would
 		// drive ~40x heap allocation per input byte for map[string]any.
 		if !mapVal.IsValid() {
-			hint := int(count)
-			if hint > maxMapPreAllocSize {
-				hint = maxMapPreAllocSize
-			}
+			hint := min(int(count), maxMapPreAllocSize)
 			mapVal = reflect.MakeMapWithSize(mapTyp, hint)
 			if !iface {
 				v.Set(mapVal)
 			}
+		}
+		if useFastNative {
+			handled, rest, nerr := s.nativeBlock(mapVal, src, int(count), sl)
+			if nerr != nil {
+				return nil, nerr
+			}
+			if handled {
+				src = rest
+				continue
+			}
+			useFastNative = false // named map type: fall back to fastBlock henceforth
 		}
 		if useFast {
 			src, err = s.fastBlock(src, mapVal, keyVal, elemVal, int(count), sl)
@@ -1168,15 +1802,19 @@ func (s *deserMap) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) 
 			// via the extracted Go map is visible through mapVal too,
 			// so the trailing setIface picks up all entries.
 			m := mapVal.Interface().(map[string]any)
-			src, err = s.fastIfaceBlock(src, m, int(count), sl)
+			src, err = deserMapPrimitiveIfaceBlock(src, m, int(count), sl, s.fastIfaceVal)
 			if err != nil {
 				return nil, err
 			}
 			continue
 		}
+		keyType := mapTyp.Key()
 		for range int(count) {
 			src, err = readMapKey(src, keyVal, sl)
 			if err != nil {
+				return nil, err
+			}
+			if err := validateJSONNumberMapKey(keyVal.String(), keyType, "map"); err != nil {
 				return nil, err
 			}
 			src, err = s.deserItem(src, elemVal, sl)
@@ -1205,133 +1843,121 @@ func readMapKey(src []byte, keyVal reflect.Value, sl *slab) ([]byte, error) {
 	return src[n:], nil
 }
 
-// The following block functions decode map entries for primitive value
-// types using reusable reflect.Value containers. Each is selected at
-// schema build time based on the map's value type.
-
-func deserMapStringBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
-	var err error
-	for range count {
-		src, err = readMapKey(src, keyVal, sl)
-		if err != nil {
-			return nil, err
-		}
-
-		var valLen int64
-		valLen, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if valLen < 0 || valLen > int64(len(src)) {
-			return nil, &ShortBufferError{Type: "string", Need: int(valLen), Have: len(src)}
-		}
-		n := int(valLen)
-		elemVal.SetString(sl.string(src, n))
-		src = src[n:]
-
-		mapVal.SetMapIndex(keyVal, elemVal)
+// readMapKeyString is readMapKey returning a Go string instead of
+// writing into a reflect.Value.
+func readMapKeyString(src []byte, sl *slab) (string, []byte, error) {
+	keyLen, src, err := readVarlong(src)
+	if err != nil {
+		return "", nil, err
 	}
-	return src, nil
+	if keyLen < 0 || keyLen > int64(len(src)) {
+		return "", nil, fmt.Errorf("invalid map key length %d", keyLen)
+	}
+	n := int(keyLen)
+	return sl.string(src, n), src[n:], nil
 }
 
-func deserMapBooleanBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
-	var err error
-	for range count {
-		src, err = readMapKey(src, keyVal, sl)
-		if err != nil {
-			return nil, err
+// deserMapBlock decodes one map block (count entries) for a primitive
+// value type, populating mapVal via SetMapIndex using reusable
+// keyVal/elemVal containers. One helper replaces six near-identical
+// blocks (String/Boolean/Int/Long/Float/Double). readOne returns the
+// next wire value of T; set assigns it to elemVal.
+func deserMapBlock[T any](readOne func(src []byte, sl *slab) (T, []byte, error), set func(reflect.Value, T)) func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
+	return func(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
+		var err error
+		for range count {
+			src, err = readMapKey(src, keyVal, sl)
+			if err != nil {
+				return nil, err
+			}
+			v, rest, err := readOne(src, sl)
+			if err != nil {
+				return nil, err
+			}
+			set(elemVal, v)
+			src = rest
+			mapVal.SetMapIndex(keyVal, elemVal)
 		}
-
-		if len(src) < 1 {
-			return nil, &ShortBufferError{Type: "boolean"}
-		}
-		elemVal.SetBool(src[0] == 1)
-		src = src[1:]
-
-		mapVal.SetMapIndex(keyVal, elemVal)
+		return src, nil
 	}
-	return src, nil
 }
 
-func deserMapIntBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
-	var err error
-	for range count {
-		src, err = readMapKey(src, keyVal, sl)
-		if err != nil {
-			return nil, err
-		}
+var (
+	deserMapStringBlock  = deserMapBlock(readOneString, reflect.Value.SetString)
+	deserMapBooleanBlock = deserMapBlock(readOneBool, reflect.Value.SetBool)
+	deserMapIntBlock     = deserMapBlock(readOneInt, func(v reflect.Value, x int32) { v.SetInt(int64(x)) })
+	deserMapLongBlock    = deserMapBlock(readOneLong, reflect.Value.SetInt)
+	deserMapFloatBlock   = deserMapBlock(readOneFloat, func(v reflect.Value, x float32) { *(*uint32)(unsafe.Pointer(v.UnsafeAddr())) = math.Float32bits(x) })
+	deserMapDoubleBlock  = deserMapBlock(readOneDouble, reflect.Value.SetFloat)
+)
 
-		var val int32
-		val, src, err = readVarint(src)
-		if err != nil {
-			return nil, err
-		}
-		elemVal.SetInt(int64(val))
+// Native concrete decode: write directly into the Go map/slice (m[k]=v /
+// s[i]=v), bypassing reflect SetMapIndex / Index(i).Set* and the reusable elem
+// Value. Selected at decode time when the container's dynamic type is the
+// unnamed map[string]V / []V; a named type returns handled=false (src
+// untouched) and the caller falls back to the reflect block/loop. Reuses the
+// readOneX leaves, so coercion is identical — including float32 raw-bit
+// preservation (readOneFloat returns the exact bits; m[k]=v / s[i]=v copies
+// them, no SetFloat round-trip).
 
-		mapVal.SetMapIndex(keyVal, elemVal)
+func nativeMapBlockFor[V any](readOne func([]byte, *slab) (V, []byte, error)) func(reflect.Value, []byte, int, *slab) (bool, []byte, error) {
+	return func(mapVal reflect.Value, src []byte, count int, sl *slab) (bool, []byte, error) {
+		m, ok := mapVal.Interface().(map[string]V)
+		if !ok {
+			return false, src, nil
+		}
+		var err error
+		for range count {
+			var k string
+			k, src, err = readMapKeyString(src, sl)
+			if err != nil {
+				return true, nil, err
+			}
+			var val V
+			val, src, err = readOne(src, sl)
+			if err != nil {
+				return true, nil, err
+			}
+			m[k] = val
+		}
+		return true, src, nil
 	}
-	return src, nil
 }
 
-func deserMapLongBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
-	var err error
-	for range count {
-		src, err = readMapKey(src, keyVal, sl)
-		if err != nil {
-			return nil, err
+func nativeArrayLoopFor[V any](readOne func([]byte, *slab) (V, []byte, error)) func(reflect.Value, []byte, int, int, *slab) (bool, []byte, error) {
+	return func(sliceVal reflect.Value, src []byte, start, count int, sl *slab) (bool, []byte, error) {
+		s, ok := sliceVal.Interface().([]V)
+		if !ok {
+			return false, src, nil
 		}
-
-		var val int64
-		val, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
+		var err error
+		for i := start; i < start+count; i++ {
+			var val V
+			val, src, err = readOne(src, sl)
+			if err != nil {
+				return true, nil, err
+			}
+			s[i] = val
 		}
-		elemVal.SetInt(val)
-
-		mapVal.SetMapIndex(keyVal, elemVal)
+		return true, src, nil
 	}
-	return src, nil
 }
 
-func deserMapFloatBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
-	var err error
-	for range count {
-		src, err = readMapKey(src, keyVal, sl)
-		if err != nil {
-			return nil, err
-		}
+var (
+	deserNativeMapStringBlock  = nativeMapBlockFor(readOneString)
+	deserNativeMapBooleanBlock = nativeMapBlockFor(readOneBool)
+	deserNativeMapIntBlock     = nativeMapBlockFor(readOneInt)
+	deserNativeMapLongBlock    = nativeMapBlockFor(readOneLong)
+	deserNativeMapFloatBlock   = nativeMapBlockFor(readOneFloat)
+	deserNativeMapDoubleBlock  = nativeMapBlockFor(readOneDouble)
 
-		var u uint32
-		u, src, err = readUint32(src)
-		if err != nil {
-			return nil, err
-		}
-		elemVal.SetFloat(float64(math.Float32frombits(u)))
-
-		mapVal.SetMapIndex(keyVal, elemVal)
-	}
-	return src, nil
-}
-
-func deserMapDoubleBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, count int, sl *slab) ([]byte, error) {
-	var err error
-	for range count {
-		src, err = readMapKey(src, keyVal, sl)
-		if err != nil {
-			return nil, err
-		}
-
-		var u uint64
-		u, src, err = readUint64(src)
-		if err != nil {
-			return nil, err
-		}
-		elemVal.SetFloat(math.Float64frombits(u))
-
-		mapVal.SetMapIndex(keyVal, elemVal)
-	}
-	return src, nil
-}
+	deserNativeArrayStringLoop  = nativeArrayLoopFor(readOneString)
+	deserNativeArrayBooleanLoop = nativeArrayLoopFor(readOneBool)
+	deserNativeArrayIntLoop     = nativeArrayLoopFor(readOneInt)
+	deserNativeArrayLongLoop    = nativeArrayLoopFor(readOneLong)
+	deserNativeArrayFloatLoop   = nativeArrayLoopFor(readOneFloat)
+	deserNativeArrayDoubleLoop  = nativeArrayLoopFor(readOneDouble)
+)
 
 // The following iface-block functions decode map entries directly into a
 // map[string]any, bypassing reflect.Value containers for primitive value
@@ -1339,174 +1965,47 @@ func deserMapDoubleBlock(src []byte, mapVal, keyVal, elemVal reflect.Value, coun
 // reading into the native Go map. Selected at schema build time based
 // on the avro value type.
 
-func deserMapStringIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
+// deserMapPrimitiveIfaceBlock decodes one map block into m using a
+// per-value decoder (the matching deser*Iface for each primitive).
+func deserMapPrimitiveIfaceBlock(src []byte, m map[string]any, count int, sl *slab, decodeVal deserIfaceFn) ([]byte, error) {
 	for range count {
-		keyLen, rest, err := readVarlong(src)
+		key, rest, err := readMapKeyString(src, sl)
 		if err != nil {
 			return nil, err
 		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		valLen, rest2, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if valLen < 0 || valLen > int64(len(rest2)) {
-			return nil, &ShortBufferError{Type: "string", Need: int(valLen), Have: len(rest2)}
-		}
-		vn := int(valLen)
-		m[key] = sl.string(rest2, vn)
-		src = rest2[vn:]
-	}
-	return src, nil
-}
-
-func deserMapBooleanIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-		if len(src) < 1 {
-			return nil, &ShortBufferError{Type: "boolean"}
-		}
-		m[key] = src[0] == 1
-		src = src[1:]
-	}
-	return src, nil
-}
-
-func deserMapIntIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		var val int32
-		val, src, err = readVarint(src)
+		val, rest, err := decodeVal(rest, sl)
 		if err != nil {
 			return nil, err
 		}
 		m[key] = val
+		src = rest
 	}
 	return src, nil
 }
 
-func deserMapLongIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
+// deserIface adapts a typed readOne into the (any, []byte, error)
+// deserIfaceFn shape — boxing T into any happens at the assignment so
+// each primitive doesn't need its own near-identical wrapper. The
+// boolean variant validates len(src) ≥ 1 inline since readOneBool
+// trusts the caller's bounds check, which iface callers don't perform.
+func deserIface[T any](readOne func(src []byte, sl *slab) (T, []byte, error)) deserIfaceFn {
+	return func(src []byte, sl *slab) (any, []byte, error) {
+		v, src, err := readOne(src, sl)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		var val int64
-		val, src, err = readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		m[key] = val
+		return v, src, nil
 	}
-	return src, nil
 }
 
-func deserMapFloatIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		var u uint32
-		u, src, err = readUint32(src)
-		if err != nil {
-			return nil, err
-		}
-		m[key] = math.Float32frombits(u)
-	}
-	return src, nil
-}
-
-// The following deserIfaceFn implementations decode primitive values
-// directly into Go `any`, skipping the reflect.Value wrapping that the
-// generic deserfn would do. They are wired into record/map iface paths
-// at schema-build time alongside the existing deserfn.
-
-func deserBooleanIface(src []byte, sl *slab) (any, []byte, error) {
-	if len(src) < 1 {
-		return nil, nil, &ShortBufferError{Type: "boolean"}
-	}
-	return src[0] == 1, src[1:], nil
-}
-
-func deserIntIface(src []byte, sl *slab) (any, []byte, error) {
-	v, src, err := readVarint(src)
-	if err != nil {
-		return nil, nil, err
-	}
-	return v, src, nil
-}
-
-func deserLongIface(src []byte, sl *slab) (any, []byte, error) {
-	v, src, err := readVarlong(src)
-	if err != nil {
-		return nil, nil, err
-	}
-	return v, src, nil
-}
-
-func deserFloatIface(src []byte, sl *slab) (any, []byte, error) {
-	u, src, err := readUint32(src)
-	if err != nil {
-		return nil, nil, err
-	}
-	return math.Float32frombits(u), src, nil
-}
-
-func deserDoubleIface(src []byte, sl *slab) (any, []byte, error) {
-	u, src, err := readUint64(src)
-	if err != nil {
-		return nil, nil, err
-	}
-	return math.Float64frombits(u), src, nil
-}
-
-func deserStringIface(src []byte, sl *slab) (any, []byte, error) {
-	n, src, err := readLength(src, "string")
-	if err != nil {
-		return nil, nil, err
-	}
-	return sl.string(src, n), src[n:], nil
-}
+var (
+	deserBooleanIface = deserIface(readOneBool)
+	deserIntIface     = deserIface(readOneInt)
+	deserLongIface    = deserIface(readOneLong)
+	deserFloatIface   = deserIface(readOneFloat)
+	deserDoubleIface  = deserIface(readOneDouble)
+	deserStringIface  = deserIface(readOneString)
+)
 
 // ifaceFnForPrimitive returns the iface-direct decoder for a plain
 // primitive avro type, or nil for complex/logical/custom types whose
@@ -1518,56 +2017,29 @@ func ifaceFnForPrimitive(meta *fieldMeta) deserIfaceFn {
 	return ifaceFnForKind(meta.avroType)
 }
 
+// deserIfaceFnByKind maps an Avro primitive kind name to its iface-direct
+// decoder. Built from the deser*Iface vars above so a new primitive only
+// gets wired in one place.
+var deserIfaceFnByKind = map[string]deserIfaceFn{
+	"boolean": deserBooleanIface,
+	"int":     deserIntIface,
+	"long":    deserLongIface,
+	"float":   deserFloatIface,
+	"double":  deserDoubleIface,
+	"string":  deserStringIface,
+}
+
 // ifaceFnForKind returns the iface-direct decoder for an avro kind
 // name, or nil if the kind isn't a plain primitive. Callers must verify
 // no logical type / custom decoder applies before using the result.
-func ifaceFnForKind(kind string) deserIfaceFn {
-	switch kind {
-	case "boolean":
-		return deserBooleanIface
-	case "int":
-		return deserIntIface
-	case "long":
-		return deserLongIface
-	case "float":
-		return deserFloatIface
-	case "double":
-		return deserDoubleIface
-	case "string":
-		return deserStringIface
-	}
-	return nil
-}
-
-func deserMapDoubleIfaceBlock(src []byte, m map[string]any, count int, sl *slab) ([]byte, error) {
-	for range count {
-		keyLen, rest, err := readVarlong(src)
-		if err != nil {
-			return nil, err
-		}
-		if keyLen < 0 || keyLen > int64(len(rest)) {
-			return nil, fmt.Errorf("invalid map key length %d", keyLen)
-		}
-		kn := int(keyLen)
-		key := sl.string(rest, kn)
-		src = rest[kn:]
-
-		var u uint64
-		u, src, err = readUint64(src)
-		if err != nil {
-			return nil, err
-		}
-		m[key] = math.Float64frombits(u)
-	}
-	return src, nil
-}
+func ifaceFnForKind(kind string) deserIfaceFn { return deserIfaceFnByKind[kind] }
 
 // deserFixedUUIDReflect decodes a fixed(16) UUID. Into any it returns
 // [16]byte; into [16]byte it copies the raw bytes; into string it
 // formats a hex-dash UUID string; into []byte it falls back to raw bytes.
 func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	if len(src) < 16 {
-		return nil, &ShortBufferError{Type: "uuid", Need: 16, Have: len(src)}
+	if err := needLen(src, 16, "uuid"); err != nil {
+		return nil, err
 	}
 	b := [16]byte(src[:16])
 	v = indirectAlloc(v)
@@ -1577,11 +2049,23 @@ func deserFixedUUIDReflect(src []byte, v reflect.Value, sl *slab) ([]byte, error
 			return nil, err
 		}
 	case isUUIDType(v.Type()):
-		// Concrete [16]byte target: rv.Type() == v.Type() by
-		// isUUIDType, so direct Set is safe (no interface check).
-		v.Set(reflect.ValueOf(b))
+		// [16]byte-shaped target trusts the raw bytes: no interface check and
+		// no UnmarshalText round trip — the bytes ARE the UUID. copyBytesToArray
+		// (not Set(reflect.ValueOf(b))) so a named byte element ([16]B, type B
+		// byte) — Kind Uint8 but not assignable from [16]byte — does not panic.
+		copyBytesToArray(v, b[:])
+	case v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType):
+		// TextUnmarshaler before the String / []byte arms (parity with the
+		// string decoders and serFixedUUIDReflect's text-before-string-kind
+		// order): pass the canonical hex-dash form so the same Go type can
+		// decode from either schema shape (fixed+uuid or string+uuid).
+		if _, err := tryTextUnmarshal(v, []byte(uuidToString(b))); err != nil {
+			return nil, err
+		}
 	case v.Kind() == reflect.String:
-		v.SetString(uuidToString(b))
+		if err := setStringTarget(v, uuidToString(b), "fixed"); err != nil {
+			return nil, err
+		}
 	case v.Type().Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8:
 		// Copy: SetBytes(src[:16]) would alias the caller's input buffer,
 		// so a later overwrite of src would silently corrupt the decoded
@@ -1600,8 +2084,8 @@ type deserFixed struct {
 }
 
 func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	if len(src) < s.n {
-		return nil, &ShortBufferError{Type: "fixed", Need: s.n, Have: len(src)}
+	if err := needLen(src, s.n, "fixed"); err != nil {
+		return nil, err
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
@@ -1613,7 +2097,11 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
 		b := make([]byte, s.n)
 		copy(b, src[:s.n])
-		v.Set(reflect.ValueOf(b))
+		// SetBytes (not Set(reflect.ValueOf(b))): a named byte-slice or
+		// named-byte-element slice (type B byte; []B) has element Kind Uint8 but
+		// is not assignable from []byte, so Set panics; SetBytes writes through
+		// the Kind. Mirrors setBytesValue's Slice arm.
+		v.SetBytes(b)
 		return src[s.n:], nil
 	}
 	if t.Kind() == reflect.String {
@@ -1621,7 +2109,9 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 		// string of the right length and writes raw bytes; decoder
 		// reads raw bytes and materializes them as a string. Same
 		// shape as deserBytes's reflect.String arm.
-		v.SetString(string(src[:s.n]))
+		if err := setStringTarget(v, string(src[:s.n]), "fixed"); err != nil {
+			return nil, err
+		}
 		return src[s.n:], nil
 	}
 	if t.Kind() != reflect.Array || t.Elem().Kind() != reflect.Uint8 {
@@ -1630,7 +2120,7 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 	if t.Len() != s.n {
 		return nil, &SemanticError{GoType: t, AvroType: "fixed"}
 	}
-	reflect.Copy(v, reflect.ValueOf(src[:s.n]))
+	copyBytesToArray(v, src[:s.n])
 	return src[s.n:], nil
 }
 
@@ -1638,13 +2128,88 @@ func (s *deserFixed) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error
 // LOGICAL TYPE DESERIALIZERS //
 ///////////////////////////////
 
+// rejectJSONNumberStringTarget reports a SemanticError when v is a
+// json.Number target receiving string-like wire content (string, bytes,
+// fixed, or enum-symbol). json.Number's encoding/json contract requires
+// the underlying string to be a valid RFC 8259 number literal; arbitrary
+// wire strings violate that and json.Marshal rejects later, far from the
+// decode site. Mirrors appendAvroString's encode-side reject. Consulted
+// by setStringValue / setBytesValue / setEnumTarget / decodeString.
+func rejectJSONNumberStringTarget(v reflect.Value, content, avroType string) error {
+	if v.Type() != jsonNumberType {
+		return nil
+	}
+	return &SemanticError{GoType: v.Type(), AvroType: avroType,
+		Err: fmt.Errorf("string-like value %q has no JSON number representation", truncForError(content))}
+}
+
+// setStringTarget is the combined "guard + SetString" applied at every
+// string-like-wire setter. Single entry point for the
+// rejectJSONNumberStringTarget + SetString pair across all 12 setter
+// sites — a future setter can't accidentally call SetString without
+// the guard. v.Kind() must be reflect.String.
+func setStringTarget(v reflect.Value, s, avroType string) error {
+	if err := rejectJSONNumberStringTarget(v, s, avroType); err != nil {
+		return err
+	}
+	v.SetString(s)
+	return nil
+}
+
+// validateJSONNumberMapKey is rejectJSONNumberStringTarget's key-axis
+// variant. When keyType is json.Number, key must be a valid JSON number
+// literal (per the same RFC 8259 contract enforced on string-target
+// values); arbitrary string content silently violates the invariant.
+// No-op for any other key type.
+//
+// Called per-key during both decode and encode so the round-trip is
+// content-symmetric: every map[json.Number]V key that encodes also
+// decodes back into the same target. Avro field names (used when a
+// record is encoded from or decoded into map[K]V) follow the Avro
+// naming rule [A-Za-z_][A-Za-z0-9_]*, so for the record-as-map case
+// the first field name always fails validation — effectively the same
+// outcome as a blanket reject for that shape, but the error names the
+// specific key.
+func validateJSONNumberMapKey(key string, keyType reflect.Type, avroType string) error {
+	if keyType != jsonNumberType {
+		return nil
+	}
+	if !isJSONNumber(key) {
+		return &SemanticError{GoType: keyType, AvroType: avroType,
+			Err: fmt.Errorf("map key %q is not a valid JSON number literal", truncForError(key))}
+	}
+	return nil
+}
+
+// formatToStringKindTarget formats content as a string into v if v is a
+// reflect.String-kind target that is NOT json.Number (arbitrary
+// formatted content like RFC3339Nano violates json.Number's RFC 8259
+// invariant). json.Number targets fall through (wrote=false) so the
+// caller routes the underlying numeric wire value through its integer/
+// float arm. Used by the time-logical String arms (setTimeAsLongTarget /
+// deserDate / JSON decodeInt+date / decodeLong+timestamp).
+func formatToStringKindTarget(v reflect.Value, content, avroType string) (wrote bool, err error) {
+	if v.Kind() != reflect.String || v.Type() == jsonNumberType {
+		return false, nil
+	}
+	return true, setStringTarget(v, content, avroType)
+}
+
 // setFloatValue sets v to f, handling interface, float, integer (whole-number),
 // and json.Number targets. bits is 32 or 64, the source width — used for
 // interface assignment, the float32-overflow check, and json.Number formatting.
 // Shared between natural float/double deser and float-promotion deserializers
-// so target-set parity stays in lock-step (regression: promote*To{Float,Double}
-// previously rejected integer + json.Number targets that deserFloat/deserDouble
-// accepted).
+// so target-set parity stays in lock-step across deserFloat / deserDouble /
+// promote*To{Float,Double}: every float-emitting deserializer accepts the
+// same integer and json.Number target shapes.
+//
+// Non-finite floats (±Inf, NaN) are rejected for integer AND json.Number
+// targets: neither type can faithfully hold the value (no integer representation;
+// json.Number's encoding/json contract requires a valid JSON number literal,
+// which RFC 8259 doesn't define for ±Inf/NaN). Float/Interface targets pass
+// non-finite values through unchanged. Users who need ±Inf/NaN round-trip
+// should decode into a typed float (float32/float64) and pick their own JSON
+// convention (twmb's quoted-string default, LinkedinFloats' 1e999, custom).
 func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error {
 	if v.Kind() == reflect.Interface {
 		var rv reflect.Value
@@ -1653,15 +2218,7 @@ func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error 
 		} else {
 			rv = reflect.ValueOf(f)
 		}
-		if v.Type().NumMethod() == 0 {
-			v.Set(rv)
-			return nil
-		}
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: avroType}
-		}
-		v.Set(rv)
-		return nil
+		return setIface(v, rv, avroType)
 	}
 	if v.CanFloat() {
 		if bits == 64 && v.Kind() == reflect.Float32 && finiteFloat32Overflows(f) {
@@ -1676,55 +2233,85 @@ func setFloatValue(v reflect.Value, f float64, avroType string, bits int) error 
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("non-finite %g into integer target", f)}
 		}
-		if f != float64(int64(f)) {
+		if f != math.Trunc(f) {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("non-whole %g into integer target", f)}
 		}
-		n := int64(f)
+		// Bound in float space BEFORE the int64/uint64 conversion. Go's
+		// float->integer conversion is implementation-defined on overflow
+		// (spec: "the result value is implementation-dependent"), so a
+		// round-trip check via float64(int64(f)) is platform-dependent: on
+		// saturating-conversion platforms (arm64) it silently accepts the
+		// out-of-range whole float 2^63 and stores int64(2^63-1). Mirror the
+		// encode-side floatFitsInt64, which checks the representable bound in
+		// float space and rejects out-of-range whole floats on every platform.
 		if v.CanInt() {
+			if f < -(1<<63) || f >= (1<<63) {
+				return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %g overflows %s", f, v.Type())}
+			}
+			n := int64(f)
 			if v.OverflowInt(n) {
 				return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", n, v.Type())}
 			}
 			v.SetInt(n)
 			return nil
 		}
-		if n < 0 || v.OverflowUint(uint64(n)) {
+		// Unsigned target: uint64(f) is well-defined for f in [0, 2^64) on
+		// every platform; the full uint64 range is supported.
+		if f < 0 || f >= (1<<64) {
+			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %g overflows %s", f, v.Type())}
+		}
+		n := uint64(f)
+		if v.OverflowUint(n) {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", n, v.Type())}
 		}
-		v.SetUint(uint64(n))
+		v.SetUint(n)
 		return nil
 	}
 	if v.Type() == jsonNumberType {
+		// Non-finite floats (±Inf, NaN) have no valid JSON number
+		// representation per RFC 8259: encoding/json.Marshal rejects
+		// json.Number values whose underlying string isn't a valid
+		// JSON number literal. Mirror the integer arm above which
+		// rejects for the structurally identical reason ("target type
+		// cannot represent this value"). Users who need ±Inf/NaN
+		// should decode into a typed float target instead.
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("non-finite %g has no JSON number representation", f)}
+		}
 		v.Set(reflect.ValueOf(json.Number(strconv.FormatFloat(f, 'g', -1, bits))))
 		return nil
 	}
 	return &SemanticError{GoType: v.Type(), AvroType: avroType}
 }
 
-// setBytesValue sets v to b, handling []byte slice, fixed-length byte array,
-// string, and (when applicable) empty/typed-interface targets. avroType is the
-// declared wire type ("bytes" / "fixed") and only affects error tagging — the
-// accepted target set is the same. Shared between natural deserBytes,
-// promoteStringToBytes, and JSON assignBytes so all paths agree on which Go
-// targets accept Avro bytes/fixed.
+// setBytesValue sets v to a fresh copy of b, handling interface, []byte
+// slice, fixed-length byte array, and string targets. b may alias the wire
+// buffer — the helper allocates owned storage for the Slice / Interface
+// arms (Array uses reflect.Copy; String's SetString already copies).
+// avroType is the declared wire type ("bytes" / "fixed") and only affects
+// error tagging. Shared between natural deserBytes, promoteStringToBytes,
+// the decimal/big-decimal opaque-bytes pass-throughs, and JSON assignBytes
+// so all paths agree on which Go targets accept Avro bytes/fixed AND on
+// the never-alias-the-wire-buffer invariant.
 func setBytesValue(v reflect.Value, b []byte, avroType string) error {
-	if v.Kind() == reflect.Interface {
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(b))
-			return nil
-		}
-		rv := reflect.ValueOf(b)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: avroType}
-		}
-		v.Set(rv)
-		return nil
-	}
 	switch v.Kind() {
+	case reflect.Interface:
+		// make+copy (not append onto a nil base): empty wire bytes must
+		// surface as a NON-nil empty []byte. A nil result is
+		// nil-equivalent on re-encode, so the nil-first union dispatch
+		// would flip a decoded {"bytes": ""} onto the null branch —
+		// silent value corruption through decode→re-encode. Mirrors the
+		// Slice arm below, deserFixed, and udBytesDeser.
+		owned := make([]byte, len(b))
+		copy(owned, b)
+		return setIface(v, reflect.ValueOf(owned), avroType)
 	case reflect.Slice:
 		if v.Type().Elem().Kind() != reflect.Uint8 {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType}
 		}
-		v.SetBytes(b)
+		owned := make([]byte, len(b))
+		copy(owned, b)
+		v.SetBytes(owned)
 	case reflect.Array:
 		if v.Type().Elem().Kind() != reflect.Uint8 {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType}
@@ -1732,9 +2319,9 @@ func setBytesValue(v reflect.Value, b []byte, avroType string) error {
 		if v.Len() != len(b) {
 			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("cannot decode %d bytes into array of length %d", len(b), v.Len())}
 		}
-		reflect.Copy(v, reflect.ValueOf(b))
+		copyBytesToArray(v, b)
 	case reflect.String:
-		v.SetString(string(b))
+		return setStringTarget(v, string(b), avroType)
 	default:
 		return &SemanticError{GoType: v.Type(), AvroType: avroType}
 	}
@@ -1748,28 +2335,24 @@ func setBytesValue(v reflect.Value, b []byte, avroType string) error {
 // arms allocate fresh storage so the target owns its bytes.
 func setStringValue(v reflect.Value, src []byte, n int, sl *slab) error {
 	if v.Kind() == reflect.Interface {
-		s := sl.string(src, n)
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(s))
-			return nil
-		}
-		rv := reflect.ValueOf(s)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: "string"}
-		}
-		v.Set(rv)
-		return nil
+		return setIface(v, reflect.ValueOf(sl.string(src, n)), "string")
 	}
-	if v.Kind() == reflect.String {
-		v.SetString(sl.string(src, n))
-		return nil
-	}
-	// TextUnmarshaler before []byte: named []byte subtypes like net.IP
-	// should use their text parsing, not raw byte assignment.
+	// TextUnmarshaler before the reflect.String fast path: a string-kind
+	// type implementing TextUnmarshaler uses its text parsing, mirroring the
+	// encoder (textValue is tried before reflect.String in appendAvroString)
+	// and encoding/json. Also covers named []byte subtypes like net.IP that
+	// prefer text parsing over raw byte assignment. The implements-check
+	// gates the []byte allocation so the common plain-string path stays
+	// alloc-free via the slab. json.Number has no UnmarshalText, so it falls
+	// through to setStringTarget below, whose guard rejects it.
 	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
 		b := make([]byte, n)
 		copy(b, src[:n])
-		return v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText(b)
+		_, err := tryTextUnmarshal(v, b)
+		return err
+	}
+	if v.Kind() == reflect.String {
+		return setStringTarget(v, sl.string(src, n), "string")
 	}
 	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		b := make([]byte, n)
@@ -1777,105 +2360,58 @@ func setStringValue(v reflect.Value, src []byte, n int, sl *slab) error {
 		v.SetBytes(b)
 		return nil
 	}
-	return &SemanticError{GoType: v.Type(), AvroType: "string"}
+	return semErr(v, "string")
 }
 
-// setLongValue sets v to val, handling interface, int, and uint targets.
-// Returns an error if val does not fit in v's Go type.
-func setLongValue(v reflect.Value, val int64) error {
+// setIntegerWire stores the wire integer into v, handling interface, int,
+// uint, float (whole-number with mantissa bound), and json.Number targets.
+// avroType is "int" or "long" for the SemanticError tag. Shared body of
+// setIntValue / setLongValue so the target-set dispatch and float-mantissa
+// bound live in one place.
+func setIntegerWire[T int32 | int64](v reflect.Value, val T, avroType string) error {
 	if v.Kind() == reflect.Interface {
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(val))
-			return nil
-		}
-		rv := reflect.ValueOf(val)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: "long"}
-		}
-		v.Set(rv)
-		return nil
+		return setIface(v, reflect.ValueOf(val), avroType)
 	}
+	v64 := int64(val)
 	if v.CanInt() {
-		if v.OverflowInt(val) {
-			return &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
+		if v.OverflowInt(v64) {
+			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
 		}
-		v.SetInt(val)
+		v.SetInt(v64)
 		return nil
 	}
 	if v.CanUint() {
-		if val < 0 || v.OverflowUint(uint64(val)) {
-			return &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
+		if v64 < 0 || v.OverflowUint(uint64(v64)) {
+			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
 		}
-		v.SetUint(uint64(val))
+		v.SetUint(uint64(v64))
 		return nil
 	}
 	if v.CanFloat() {
-		// Mirrors the documented whole-number-float-as-int encode
-		// leniency: AppendEncode(float64(42), "long") succeeds, so
-		// Decode("long" wire, *float64) must round-trip. Mantissa
-		// bounds protect the lossless guarantee.
-		precLimit := int64(1) << 53
-		if v.Type().Bits() == 32 {
-			precLimit = 1 << 24
+		// Natural-decoder rule (reader schema is exact, Go target is
+		// lossy): rejects when the wire value can't be represented
+		// exactly in the Go float target. This is asymmetric with the
+		// resolved-promotion path (promoteIntFloatMantissa in
+		// promote.go), which silently IEEE-rounds because there the
+		// reader schema itself is float/double — the user opted into
+		// IEEE-precision semantics at the schema layer. See
+		// BUG_AUDIT.md §"Precision: the READER schema decides".
+		f, err := intFitsFloat(v64, v.Type().Bits())
+		if err != nil {
+			return &SemanticError{GoType: v.Type(), AvroType: avroType, Err: err}
 		}
-		if val < -precLimit || val > precLimit {
-			return &SemanticError{GoType: v.Type(), AvroType: "long", Err: fmt.Errorf("value %d exceeds %s exact-precision range", val, v.Type())}
-		}
-		v.SetFloat(float64(val))
+		v.SetFloat(f)
 		return nil
 	}
 	if v.Type() == jsonNumberType {
-		v.Set(reflect.ValueOf(json.Number(strconv.FormatInt(val, 10))))
+		v.Set(reflect.ValueOf(json.Number(strconv.FormatInt(v64, 10))))
 		return nil
 	}
-	return &SemanticError{GoType: v.Type(), AvroType: "long"}
+	return &SemanticError{GoType: v.Type(), AvroType: avroType}
 }
 
-// setIntValue sets v to val, handling interface, int, and uint targets.
-// Returns an error if val does not fit in v's Go type.
-func setIntValue(v reflect.Value, val int32) error {
-	if v.Kind() == reflect.Interface {
-		if v.Type().NumMethod() == 0 {
-			v.Set(reflect.ValueOf(val))
-			return nil
-		}
-		rv := reflect.ValueOf(val)
-		if !rv.Type().AssignableTo(v.Type()) {
-			return &SemanticError{GoType: v.Type(), AvroType: "int"}
-		}
-		v.Set(rv)
-		return nil
-	}
-	if v.CanInt() {
-		if v.OverflowInt(int64(val)) {
-			return &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
-		}
-		v.SetInt(int64(val))
-		return nil
-	}
-	if v.CanUint() {
-		if val < 0 || v.OverflowUint(uint64(val)) {
-			return &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d overflows %s", val, v.Type())}
-		}
-		v.SetUint(uint64(val))
-		return nil
-	}
-	if v.CanFloat() {
-		// int32 always fits in float64; for float32 the int24 mantissa
-		// boundary is enforced for symmetry with the encoder's
-		// appendAvroFloat32 CanInt arm.
-		if v.Type().Bits() == 32 && (val < -(1<<24) || val > 1<<24) {
-			return &SemanticError{GoType: v.Type(), AvroType: "int", Err: fmt.Errorf("value %d exceeds float32 exact-precision range", val)}
-		}
-		v.SetFloat(float64(val))
-		return nil
-	}
-	if v.Type() == jsonNumberType {
-		v.Set(reflect.ValueOf(json.Number(strconv.FormatInt(int64(val), 10))))
-		return nil
-	}
-	return &SemanticError{GoType: v.Type(), AvroType: "int"}
-}
+func setLongValue(v reflect.Value, val int64) error { return setIntegerWire(v, val, "long") }
+func setIntValue(v reflect.Value, val int32) error  { return setIntegerWire(v, val, "int") }
 
 // deserTimeAsLong is the shared decoder for long-typed time logical
 // types (timestamp-millis/micros/nanos). It accepts time.Time targets,
@@ -1906,9 +2442,14 @@ func setTimeAsLongTarget(v reflect.Value, val int64, conv func(int64) time.Time)
 		v.Set(reflect.ValueOf(conv(val)))
 		return nil
 	}
-	if v.Kind() == reflect.String {
-		v.SetString(conv(val).Format(time.RFC3339Nano))
-		return nil
+	// String target (mirrors serTimeAsLong's RFC3339-string accept on encode):
+	// emit the formatted timestamp. json.Number targets are excluded by
+	// formatToStringKindTarget so they fall through to setLongValue's
+	// json.Number arm (which writes the raw integer wire value as a valid
+	// JSON number literal) — same routing as setTimeMillisTarget /
+	// setTimeMicrosTarget, which have no String intercept.
+	if wrote, err := formatToStringKindTarget(v, conv(val).Format(time.RFC3339Nano), "long"); wrote {
+		return err
 	}
 	return setLongValue(v, val)
 }
@@ -1940,12 +2481,58 @@ func deserDate(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	}
 	// String target mirrors serDate's tryParseDateString leniency
 	// (ser.go's date arm + JSON "int" date arm both accept a date
-	// string on encode); the decoder emits ISO 8601 date-only.
-	if v.Kind() == reflect.String {
-		v.SetString(dateToTime(val).Format(time.DateOnly))
+	// string on encode); the decoder emits ISO 8601 date-only. json.Number
+	// targets are excluded so they get the raw days-since-epoch as a JSON
+	// number literal via setIntValue's json.Number arm.
+	if wrote, err := formatToStringKindTarget(v, dateToTime(val).Format(time.DateOnly), "int"); wrote {
+		if err != nil {
+			return nil, err
+		}
 		return src, nil
 	}
 	return src, setIntValue(v, val)
+}
+
+// setTimeMillisTarget assigns an int32 time-millis wire value to v per
+// the documented target matrix: Interface→Duration; durationType→Duration;
+// timeType→time.Time at epoch UTC via timeOfDayToTime; integer fallback
+// → setIntValue. Shared by binary deserTimeMillis and JSON decodeInt's
+// time-millis arm (and udTimeMillisTime for the time-target unsafe path).
+func setTimeMillisTarget(v reflect.Value, val int32) error {
+	if v.Kind() == reflect.Interface {
+		return setIface(v, reflect.ValueOf(timeMillisToDuration(val)), "int")
+	}
+	if v.Type() == durationType {
+		v.Set(reflect.ValueOf(timeMillisToDuration(val)))
+		return nil
+	}
+	if v.Type() == timeType {
+		v.Set(reflect.ValueOf(timeOfDayToTime(timeMillisToDuration(val))))
+		return nil
+	}
+	return setIntValue(v, val)
+}
+
+// setTimeMicrosTarget mirrors setTimeMillisTarget for int64 time-micros.
+// The overflow guard lives in timeMicrosToDuration so every caller
+// (binary, unsafe, JSON-any, JSON-typed) rejects out-of-range uniformly.
+func setTimeMicrosTarget(v reflect.Value, val int64) error {
+	if v.Type() == durationType || v.Type() == timeType || v.Kind() == reflect.Interface {
+		d, err := timeMicrosToDuration(val)
+		if err != nil {
+			return err
+		}
+		switch {
+		case v.Type() == durationType:
+			v.Set(reflect.ValueOf(d))
+		case v.Type() == timeType:
+			v.Set(reflect.ValueOf(timeOfDayToTime(d)))
+		default:
+			return setIface(v, reflect.ValueOf(d), "long")
+		}
+		return nil
+	}
+	return setLongValue(v, val)
 }
 
 func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -1953,21 +2540,7 @@ func deserTimeMillis(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	v = indirectAlloc(v)
-	if v.Kind() == reflect.Interface {
-		return src, setIface(v, reflect.ValueOf(timeMillisToDuration(val)), "int")
-	}
-	if v.Type() == durationType {
-		v.Set(reflect.ValueOf(timeMillisToDuration(val)))
-		return src, nil
-	}
-	if v.Type() == timeType {
-		// Mirrors serTimeMillis's timeType arm: encoder extracts
-		// time-of-day fields, decoder materializes them at epoch UTC.
-		v.Set(reflect.ValueOf(timeOfDayToTime(timeMillisToDuration(val))))
-		return src, nil
-	}
-	return src, setIntValue(v, val)
+	return src, setTimeMillisTarget(indirectAlloc(v), val)
 }
 
 func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
@@ -1975,34 +2548,12 @@ func deserTimeMicros(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	v = indirectAlloc(v)
-	// time.Duration / time.Time / *any targets get the converted value;
-	// the overflow guard lives in timeMicrosToDuration so every caller
-	// (binary, unsafe, JSON-any, JSON-typed) rejects out-of-range
-	// uniformly. Plain integer targets bypass the conversion and
-	// store the raw long.
-	if v.Type() == durationType || v.Type() == timeType || v.Kind() == reflect.Interface {
-		d, err := timeMicrosToDuration(val)
-		if err != nil {
-			return nil, err
-		}
-		switch {
-		case v.Type() == durationType:
-			v.Set(reflect.ValueOf(d))
-		case v.Type() == timeType:
-			// Mirrors serTimeMicros's timeType arm.
-			v.Set(reflect.ValueOf(timeOfDayToTime(d)))
-		default:
-			return src, setIface(v, reflect.ValueOf(d), "long")
-		}
-		return src, nil
-	}
-	return src, setLongValue(v, val)
+	return src, setTimeMicrosTarget(indirectAlloc(v), val)
 }
 
 func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	if len(src) < 12 {
-		return nil, &ShortBufferError{Type: "duration", Need: 12, Have: len(src)}
+	if err := needLen(src, 12, "duration"); err != nil {
+		return nil, err
 	}
 	v = indirectAlloc(v)
 	if v.Kind() == reflect.Interface {
@@ -2020,6 +2571,14 @@ func deserDuration(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 // false if v's Go type is not supported by the decimal decoder (caller
 // may fall back to the underlying bytes/fixed handler).
 func setDecimalValue(v reflect.Value, b []byte, scale int) (bool, error) {
+	// Bound the unscaled length before bytesToRat materializes a big.Int and
+	// setDecimalRat base-converts it (see maxDecimalUnscaledBytes). Returning
+	// (true, err) makes the binary deserBytesDecimal / deserFixedDecimal and
+	// JSON assignBytes callers surface the error instead of falling through to
+	// the opaque-bytes path.
+	if err := checkDecimalUnscaledLen(b); err != nil {
+		return true, err
+	}
 	return setDecimalRat(v, bytesToRat(b, scale), scale)
 }
 
@@ -2047,7 +2606,7 @@ func setDecimalRat(v reflect.Value, r *big.Rat, scale int) (bool, error) {
 		// big.Rat.Float64 returns ±Inf when the rational is too large
 		// for float64; reject rather than silently writing Inf.
 		if math.IsInf(f, 0) {
-			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("decimal value %s overflows %s", r.RatString(), v.Kind())}
+			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("decimal value %s overflows %s", truncRatForError(r), v.Kind())}
 		}
 		if v.Kind() == reflect.Float32 && finiteFloat32Overflows(f) {
 			return true, &SemanticError{GoType: v.Type(), AvroType: "decimal", Err: fmt.Errorf("value %g overflows float32", f)}
@@ -2060,32 +2619,6 @@ func setDecimalRat(v reflect.Value, r *big.Rat, scale int) (bool, error) {
 		return true, nil
 	}
 	return false, nil
-}
-
-// assignBytesTarget materializes payload b into a []byte / [N]byte /
-// string target, mirroring deserBytes's target-type dispatch. Shared
-// fall-back for the decimal/big-decimal opaque-bytes pass-through —
-// the ser side falls through to serBytes when the input isn't
-// coercible, so the de side must accept the same target shapes when
-// the structured-decode fails. Returns SemanticError naming the
-// schema's logical avroType when no target matches.
-func assignBytesTarget(v reflect.Value, b []byte, avroType string) ([]byte, error) {
-	switch {
-	case v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8:
-		out := make([]byte, len(b))
-		copy(out, b)
-		v.SetBytes(out)
-	case v.Kind() == reflect.String:
-		v.SetString(string(b))
-	case v.Kind() == reflect.Array && v.Type().Elem().Kind() == reflect.Uint8:
-		if v.Len() != len(b) {
-			return nil, &SemanticError{GoType: v.Type(), AvroType: avroType, Err: fmt.Errorf("cannot decode %d bytes into array of length %d", len(b), v.Len())}
-		}
-		reflect.Copy(v, reflect.ValueOf(b))
-	default:
-		return nil, &SemanticError{GoType: v.Type(), AvroType: avroType}
-	}
-	return nil, nil
 }
 
 type deserBytesDecimal struct {
@@ -2103,11 +2636,15 @@ func (s *deserBytesDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	if ok, err := setDecimalValue(v, b, s.scale); ok {
 		return src, err
 	}
-	// Opaque-bytes pass-through: mirrors serBytesDecimal's fall-through
-	// to serBytes when the input isn't a coercible numeric type — see
-	// also deserFixedDecimal below. Without this, an []byte/string
-	// target encoded via the pass-through can't be decoded back.
-	return assignBytesTarget(v, b, "decimal")
+	// Opaque-bytes pass-through for a []byte target: mirrors
+	// serBytesDecimal's fall-through to serBytes for a []byte carrier (the
+	// opaque escape hatch) — see also deserFixedDecimal below. A string
+	// target never reaches here: setDecimalRat's string arm (above) always
+	// reads the wire as numeric decimal text, and the encoder rejects a
+	// non-numeric string for a decimal (rejectNonNumericStructuredString,
+	// ser.go), so string is numeric-text-only on BOTH sides while []byte is
+	// the sole opaque carrier, symmetric on both sides.
+	return src, setBytesValue(v, b, "decimal")
 }
 
 type deserBigDecimal struct{}
@@ -2120,20 +2657,46 @@ func (s *deserBigDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte, 
 	payload := src[:n]
 	src = src[n:]
 	v = indirectAlloc(v)
-	// Try the structured-rat decode first; if the target can't take a
-	// *big.Rat (e.g. []byte/string for opaque pass-through, mirroring
-	// serBigDecimal's serBytes fall-through), fall back to raw bytes.
-	// For raw-byte targets the validity of the payload doesn't matter
-	// (user is intentionally bypassing the framing), so the parse
-	// error is only surfaced when a structured target is rejected.
-	if r, displayScale, perr := parseBigDecimalPayload(payload); perr == nil {
-		if ok, err := setDecimalRat(v, r, displayScale); ok {
-			return src, err
-		}
-	} else if v.Kind() != reflect.Slice && v.Kind() != reflect.String && v.Kind() != reflect.Array {
-		return nil, perr
+	done, err := applyBigDecimalPayload(v, payload)
+	if !done {
+		err = setBytesValue(v, payload, "big-decimal")
 	}
-	return assignBytesTarget(v, payload, "big-decimal")
+	if err != nil {
+		return nil, err
+	}
+	return src, nil
+}
+
+// applyBigDecimalPayload tries the structured big-decimal decode first
+// (parse payload via parseBigDecimalPayload then setDecimalRat). Three
+// outcomes:
+//
+//   - (true, nil): structured set succeeded.
+//   - (true, err): the result is final — either setDecimalRat failed
+//     OR the parse failed AND the target is structured-only (not
+//     []byte/string/[N]byte). Caller must surface err.
+//   - (false, nil): the caller should fall through to setBytesValue
+//     for opaque-bytes pass-through. Happens when parse succeeded but
+//     no structured target matched, OR when parse failed and the
+//     target is byte-like (user is intentionally bypassing the
+//     framing, so the parse error doesn't matter).
+//
+// Shared by binary deserBigDecimal, JSON assignBytes's big-decimal
+// arm, and promote.go's promoteStringToBytesBigDecimal so the three
+// sites agree on the structured-vs-opaque dispatch and the parse-fail
+// surface-vs-suppress rule.
+func applyBigDecimalPayload(v reflect.Value, payload []byte) (done bool, err error) {
+	r, displayScale, perr := parseBigDecimalPayload(payload)
+	if perr == nil {
+		if ok, serr := setDecimalRat(v, r, displayScale); ok {
+			return true, serr
+		}
+		return false, nil
+	}
+	if v.Kind() != reflect.Slice && v.Kind() != reflect.String && v.Kind() != reflect.Array {
+		return true, perr
+	}
+	return false, nil
 }
 
 // parseBigDecimalPayload parses the big-decimal inner payload bytes
@@ -2147,6 +2710,9 @@ func parseBigDecimalPayload(payload []byte) (*big.Rat, int, error) {
 	}
 	uBytes := p[:uLen]
 	p = p[uLen:]
+	if err := checkDecimalUnscaledLen(uBytes); err != nil {
+		return nil, 0, err
+	}
 	scale, p, err := readVarlong(p)
 	if err != nil {
 		return nil, 0, fmt.Errorf("big-decimal scale: %w", err)
@@ -2157,19 +2723,8 @@ func parseBigDecimalPayload(payload []byte) (*big.Rat, int, error) {
 	if scale > decimalScaleLimit || scale < -decimalScaleLimit {
 		return nil, 0, fmt.Errorf("big-decimal scale %d exceeds %d limit", scale, decimalScaleLimit)
 	}
-	unscaled := bytesToBigInt(uBytes)
-	r := new(big.Rat).SetInt(unscaled)
-	if scale > 0 {
-		denom := new(big.Int).Exp(big.NewInt(10), big.NewInt(scale), nil)
-		r.Quo(r, new(big.Rat).SetInt(denom))
-	} else if scale < 0 {
-		mult := new(big.Int).Exp(big.NewInt(10), big.NewInt(-scale), nil)
-		r.Mul(r, new(big.Rat).SetInt(mult))
-	}
-	displayScale := int(scale)
-	if displayScale < 0 {
-		displayScale = 0
-	}
+	r := scaledRat(bytesToBigInt(uBytes), int(scale))
+	displayScale := max(int(scale), 0)
 	return r, displayScale, nil
 }
 
@@ -2179,8 +2734,8 @@ type deserFixedDecimal struct {
 }
 
 func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
-	if len(src) < s.size {
-		return nil, &ShortBufferError{Type: "decimal", Need: s.size, Have: len(src)}
+	if err := needLen(src, s.size, "decimal"); err != nil {
+		return nil, err
 	}
 	b := src[:s.size]
 	src = src[s.size:]
@@ -2188,8 +2743,18 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 	if ok, err := setDecimalValue(v, b, s.scale); ok {
 		return src, err
 	}
-	// Fall back to [N]byte fixed.
-	return (&deserFixed{s.size}).deser(append(b[:0:0], b...), v, sl)
+	// Fall back to [N]byte / []byte fixed (the opaque escape hatch). The
+	// delegate receives a synthesized COPY of just the payload (the copy
+	// isolates the target from the caller's src buffer, mirroring
+	// deserFixed's own never-alias-the-wire invariant), so ITS remainder is
+	// the copy's empty tail — return the outer src advanced above, never the
+	// delegate's remainder, or every byte after this value in the enclosing
+	// stream is dropped (empty rest at top level, short-buffer on the next
+	// record field / array element / map entry).
+	if _, err := (&deserFixed{s.size}).deser(append(b[:0:0], b...), v, sl); err != nil {
+		return nil, err
+	}
+	return src, nil
 }
 
 // RatFromBytes converts Avro decimal bytes (big-endian two's complement)
@@ -2200,14 +2765,14 @@ func (s *deserFixedDecimal) deser(src []byte, v reflect.Value, sl *slab) ([]byte
 //
 // Negative scale is interpreted as `unscaled * 10^|scale|` (matching
 // Java/avro-rs big-decimal semantics). |scale| is bounded by
-// decimalScaleLimit; scales beyond produce a zero *big.Rat rather
-// than allocating unbounded.
+// decimalScaleLimit and the unscaled byte length by maxDecimalUnscaledBytes;
+// inputs beyond either bound produce a zero *big.Rat rather than allocating /
+// base-converting unbounded.
 func RatFromBytes(b []byte, scale int) *big.Rat {
 	return bytesToRat(b, scale)
 }
 
 func bytesToRat(b []byte, scale int) *big.Rat {
-	unscaled := bytesToBigInt(b)
 	if scale > decimalScaleLimit || scale < -decimalScaleLimit {
 		// Public-API safety: bound the public RatFromBytes surface
 		// against attacker-controlled scale. Internal callers pass
@@ -2216,12 +2781,15 @@ func bytesToRat(b []byte, scale int) *big.Rat {
 		// RatFromBytes use with hostile input.
 		return new(big.Rat)
 	}
-	if scale < 0 {
-		mult := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-scale)), nil)
-		return new(big.Rat).SetFrac(new(big.Int).Mul(unscaled, mult), big.NewInt(1))
+	if len(b) > maxDecimalUnscaledBytes {
+		// Public-API safety: the decode paths reject an over-long unscaled
+		// value (via checkDecimalUnscaledLen) before reaching here, so this
+		// fires only for direct RatFromBytes use with hostile input — return a
+		// zero rat rather than driving an unbounded base conversion, mirroring
+		// the scale guard above.
+		return new(big.Rat)
 	}
-	s := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
-	return new(big.Rat).SetFrac(unscaled, s)
+	return scaledRat(bytesToBigInt(b), scale)
 }
 
 // bytesToBigInt decodes big-endian two's complement bytes into a *big.Int.
@@ -2253,22 +2821,22 @@ func parseUUID(s string) ([16]byte, error) {
 func parseUUIDBytes(s []byte) ([16]byte, error) {
 	var u [16]byte
 	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
-		return u, fmt.Errorf("invalid UUID %q", s)
+		return u, fmt.Errorf("invalid UUID %q", truncBytesForError(s))
 	}
 	if _, err := hex.Decode(u[0:4], s[0:8]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	if _, err := hex.Decode(u[4:6], s[9:13]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	if _, err := hex.Decode(u[6:8], s[14:18]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	if _, err := hex.Decode(u[8:10], s[19:23]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	if _, err := hex.Decode(u[10:16], s[24:36]); err != nil {
-		return u, fmt.Errorf("invalid UUID %q: %w", s, err)
+		return u, fmt.Errorf("invalid UUID %q: %w", truncBytesForError(s), err)
 	}
 	return u, nil
 }
@@ -2284,34 +2852,15 @@ func deserUUID(src []byte, v reflect.Value, sl *slab) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		reflect.Copy(v, reflect.ValueOf(u))
+		copyBytesToArray(v, u[:])
 		return src[n:], nil
 	}
-	if v.Kind() == reflect.Interface {
-		return src[n:], setIface(v, reflect.ValueOf(sl.string(src, n)), "string")
+	// Non-UUID targets share setStringValue's Interface / String /
+	// TextUnmarshaler / []byte chain. UUID-on-string is wire-equivalent
+	// to plain string; serUUID falls through to serString on the encode
+	// side. Symmetric.
+	if err := setStringValue(v, src, n, sl); err != nil {
+		return nil, err
 	}
-	if v.Kind() == reflect.String {
-		v.SetString(sl.string(src, n))
-		return src[n:], nil
-	}
-	if v.CanAddr() && v.Addr().Type().Implements(textUnmarshalerType) {
-		b := make([]byte, n)
-		copy(b, src[:n])
-		if err := v.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText(b); err != nil {
-			return nil, err
-		}
-		return src[n:], nil
-	}
-	// []byte target: mirror deserString's Slice byte arm. UUID-on-
-	// string is wire-equivalent to plain string, and serUUID falls
-	// through to serString (which accepts []byte source); the decode
-	// side needs the symmetric Slice byte arm for round-trip parity.
-	// TextUnmarshaler is checked first per deserString's precedence.
-	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
-		b := make([]byte, n)
-		copy(b, src[:n])
-		v.SetBytes(b)
-		return src[n:], nil
-	}
-	return nil, &SemanticError{GoType: v.Type(), AvroType: "string"}
+	return src[n:], nil
 }

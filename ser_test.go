@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/json"
 	"errors"
@@ -712,7 +713,8 @@ func TestSerNullNonNilableType(t *testing.T) {
 
 func TestSerNullGenericUnionNonNilable(t *testing.T) {
 	// 3-branch union takes the generic serUnion.ser path, which tries
-	// serNull first. This would panic on non-nilable types before the fix.
+	// serNull first. Pins that serNull tolerates non-nilable types
+	// (e.g. int32) without panicking, falling through to the int branch.
 	s, err := Parse(`["null","int","string"]`)
 	if err != nil {
 		t.Fatal(err)
@@ -1003,10 +1005,158 @@ func TestSerTaggedUnionMapBranchFallback(t *testing.T) {
 	}
 }
 
+// TestRegression_TaggedUnionEncodeIndirection locks in that the binary
+// union encoder peels Pointer/Interface chains before recognizing a
+// tagged-union map, matching the JSON encoder's entry-peel
+// (appendAvroJSON at json_codec.go) and isNilValue's loop (ser.go).
+// serUnion.tryUnwrapTagged must peel every Pointer and Interface layer
+// — &m and any(&m) wrapping a tagged-form map must encode identically
+// to m and any(m). Pins binary↔JSON parity at top-level, inside
+// arrays of unions, and inside record fields of union type.
+func TestRegression_TaggedUnionEncodeIndirection(t *testing.T) {
+	m := map[string]any{"int": int32(42)}
+	wantInt32 := int32(42)
+
+	t.Run("2-branch top-level", func(t *testing.T) {
+		s := MustParse(`["null","int"]`)
+		for _, tc := range []struct {
+			name string
+			in   any
+		}{
+			{"map (baseline)", m},
+			{"any(map) (baseline)", any(m)},
+			{"*map (was rejected)", &m},
+			{"any(*map) (was rejected)", any(&m)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				bin, err := s.AppendEncode(nil, tc.in)
+				if err != nil {
+					t.Fatalf("AppendEncode: %v", err)
+				}
+				jsonOut, err := s.AppendEncodeJSON(nil, tc.in)
+				if err != nil {
+					t.Fatalf("AppendEncodeJSON: %v", err)
+				}
+				// Binary↔binary round-trip: decode should produce the same int.
+				var out any
+				if _, err := s.Decode(bin, &out); err != nil {
+					t.Fatalf("Decode: %v", err)
+				}
+				if out != wantInt32 {
+					t.Fatalf("binary round-trip: got %v (%T), want %v", out, out, wantInt32)
+				}
+				// JSON parity: same byte output regardless of indirection.
+				if string(jsonOut) != "42" {
+					t.Fatalf("JSON: got %s, want 42", jsonOut)
+				}
+			})
+		}
+	})
+
+	t.Run("3-branch top-level", func(t *testing.T) {
+		s := MustParse(`["null","int","string"]`)
+		// 3-branch goes through the generic serUnion.ser path; 2-branch
+		// goes through serNullUnionAt. Both share tryUnwrapTagged so a
+		// single fix closes both, but lock both explicitly.
+		bin, err := s.AppendEncode(nil, &m)
+		if err != nil {
+			t.Fatalf("3-branch AppendEncode(&m): %v", err)
+		}
+		var out any
+		if _, err := s.Decode(bin, &out); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if out != wantInt32 {
+			t.Fatalf("got %v, want %v", out, wantInt32)
+		}
+	})
+
+	t.Run("array of unions", func(t *testing.T) {
+		s := MustParse(`{"type":"array","items":["null","int"]}`)
+		arr := []any{&m, m, any(&m)}
+		bin, err := s.AppendEncode(nil, arr)
+		if err != nil {
+			t.Fatalf("AppendEncode: %v", err)
+		}
+		var out any
+		if _, err := s.Decode(bin, &out); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		got, ok := out.([]any)
+		if !ok || len(got) != 3 {
+			t.Fatalf("got %v, want []any{42, 42, 42}", out)
+		}
+		for i, v := range got {
+			if v != wantInt32 {
+				t.Errorf("item %d: got %v (%T)", i, v, v)
+			}
+		}
+	})
+
+	t.Run("record field of union type", func(t *testing.T) {
+		s := MustParse(`{"type":"record","name":"R","fields":[{"name":"u","type":["null","int"]}]}`)
+		rec := map[string]any{"u": &m}
+		bin, err := s.AppendEncode(nil, rec)
+		if err != nil {
+			t.Fatalf("AppendEncode: %v", err)
+		}
+		var out any
+		if _, err := s.Decode(bin, &out); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		got, ok := out.(map[string]any)
+		if !ok || got["u"] != wantInt32 {
+			t.Fatalf("got %v, want map{u:42}", out)
+		}
+	})
+
+	t.Run("nil cases still picked up by nil-first dispatch", func(t *testing.T) {
+		// The peel-before-tagged-check must NOT route a nil pointer/
+		// interface into the tagged-map branch — it must fall through
+		// to the nil-first dispatch and pick the null branch. Pins
+		// that the peel never hijacks nil into try-each.
+		s := MustParse(`["null","int"]`)
+		var nilMap *map[string]any
+		bin, err := s.AppendEncode(nil, nilMap)
+		if err != nil {
+			t.Fatalf("AppendEncode(nilMap): %v", err)
+		}
+		// varint(0) = byte 0x00 → null branch.
+		if len(bin) != 1 || bin[0] != 0x00 {
+			t.Fatalf("nil *map: got %x, want [00] (null branch)", bin)
+		}
+		var ifaceNil any
+		bin, err = s.AppendEncode(nil, ifaceNil)
+		if err != nil {
+			t.Fatalf("AppendEncode(any(nil)): %v", err)
+		}
+		if len(bin) != 1 || bin[0] != 0x00 {
+			t.Fatalf("any(nil): got %x, want [00]", bin)
+		}
+	})
+
+	t.Run("non-tagged map shapes still rejected", func(t *testing.T) {
+		// A pointer to a map whose key matches NO branch must still
+		// fail (not silently match the wrong branch).
+		s := MustParse(`["null","int"]`)
+		unknown := map[string]any{"notABranch": int32(42)}
+		if _, err := s.AppendEncode(nil, &unknown); err == nil {
+			t.Fatalf("expected rejection for unknown branch key, got nil")
+		}
+		// A pointer to a multi-key map (Len != 1) must still fail.
+		multi := map[string]any{"int": int32(1), "x": int32(2)}
+		if _, err := s.AppendEncode(nil, &multi); err == nil {
+			t.Fatalf("expected rejection for multi-key map, got nil")
+		}
+	})
+}
+
 // TestJsonNumberExponentInInt locks in consistent handling of exponent-
 // notation json.Number values across scalar, array, and map int/long
-// encoders. Prior to the fix, scalar serInt rejected "1.5e3" with a
-// misleading "overflows int64" error while serArray.serInt accepted it.
+// encoders. All three paths must accept "1.5e3" identically; any
+// asymmetry between scalar serInt and serArray.serInt would produce
+// the "overflows int64" message on one path while another path
+// silently rounds.
 func TestJsonNumberExponentInInt(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -2095,7 +2245,12 @@ func TestSerIntCoercionToFloat(t *testing.T) {
 	}
 }
 
-func TestSerIntCoercionToFloatPrecisionOverflow(t *testing.T) {
+// TestSerIntCoercionToFloatPrecision verifies the lossy-destination
+// policy for int → float encode: values within the target's mantissa
+// preserve precision exactly, values beyond silently IEEE-round. Matches
+// Java's Number.floatValue()/doubleValue() and fastavro's float()
+// coercion — see [appendAvroFloat32] / [appendAvroFloat64].
+func TestSerIntCoercionToFloatPrecision(t *testing.T) {
 	sf, err := Parse(`"float"`)
 	if err != nil {
 		t.Fatal(err)
@@ -2106,7 +2261,6 @@ func TestSerIntCoercionToFloatPrecisionOverflow(t *testing.T) {
 	}
 
 	// float32: exact range is [-2^24, 2^24].
-	// Values at the boundary should work.
 	atFloat32Limit := int64(1 << 24)
 	if _, err := sf.AppendEncode(nil, atFloat32Limit); err != nil {
 		t.Fatalf("float32 at limit: %v", err)
@@ -2114,16 +2268,15 @@ func TestSerIntCoercionToFloatPrecisionOverflow(t *testing.T) {
 	if _, err := sf.AppendEncode(nil, -atFloat32Limit); err != nil {
 		t.Fatalf("float32 at negative limit: %v", err)
 	}
-	// One past the boundary should fail.
-	if _, err := sf.AppendEncode(nil, atFloat32Limit+1); err == nil {
-		t.Fatal("expected error for int64 overflowing float32 precision")
+	// One past the boundary silently IEEE-rounds.
+	if _, err := sf.AppendEncode(nil, atFloat32Limit+1); err != nil {
+		t.Fatalf("expected lossy round for int64 beyond float32 precision, got: %v", err)
 	}
-	if _, err := sf.AppendEncode(nil, -atFloat32Limit-1); err == nil {
-		t.Fatal("expected error for negative int64 overflowing float32 precision")
+	if _, err := sf.AppendEncode(nil, -atFloat32Limit-1); err != nil {
+		t.Fatalf("expected lossy round for negative int64 beyond float32 precision, got: %v", err)
 	}
-	// Large uint should fail.
-	if _, err := sf.AppendEncode(nil, uint64(1<<24+1)); err == nil {
-		t.Fatal("expected error for uint64 overflowing float32 precision")
+	if _, err := sf.AppendEncode(nil, uint64(1<<24+1)); err != nil {
+		t.Fatalf("expected lossy round for uint64 beyond float32 precision, got: %v", err)
 	}
 
 	// float64: exact range is [-2^53, 2^53].
@@ -2134,11 +2287,11 @@ func TestSerIntCoercionToFloatPrecisionOverflow(t *testing.T) {
 	if _, err := sd.AppendEncode(nil, -atFloat64Limit); err != nil {
 		t.Fatalf("float64 at negative limit: %v", err)
 	}
-	if _, err := sd.AppendEncode(nil, atFloat64Limit+1); err == nil {
-		t.Fatal("expected error for int64 overflowing float64 precision")
+	if _, err := sd.AppendEncode(nil, atFloat64Limit+1); err != nil {
+		t.Fatalf("expected lossy round for int64 beyond float64 precision, got: %v", err)
 	}
-	if _, err := sd.AppendEncode(nil, uint64(1<<53+1)); err == nil {
-		t.Fatal("expected error for uint64 overflowing float64 precision")
+	if _, err := sd.AppendEncode(nil, uint64(1<<53+1)); err != nil {
+		t.Fatalf("expected lossy round for uint64 beyond float64 precision, got: %v", err)
 	}
 }
 
@@ -2369,64 +2522,66 @@ func TestDurationBytesRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRegression_SerArrayFloatSilentInf locks in that the specialized
-// array<float> ser path rejects values that would silently clamp to ±Inf,
-// matching serFloat (top-level) and usFloat (unsafe). Pre-fix the
-// serArray.serFloat / serMap.serFloat specializations were the only
-// float-encode paths missing this guard, so encoding []float64{1e40}
-// into array<float> silently emitted +Inf bits on the wire.
+// TestRegression_SerArrayFloatSilentInf pins the lossy-destination
+// policy: array<float> with []float64{1e40} silently narrows to +Inf
+// on the wire (matches Java/fastavro). Parity check across serFloat
+// (top-level), serArray.serFloat (specialized array), serMap.serFloat
+// (specialized map), and usFloat (unsafe) — every float-encode path
+// must apply the same policy uniformly.
 func TestRegression_SerArrayFloatSilentInf(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"float"}`)
 	huge := 1e40
 	if !math.IsInf(float64(float32(huge)), 1) {
 		t.Fatalf("test assumption failed: float32(1e40) should be +Inf")
 	}
-	got, err := s.AppendEncode(nil, []float64{huge})
-	if err == nil {
-		t.Fatalf("expected float32 overflow error encoding []float64{1e40} into array<float>, got nil; encoded bytes = %x", got)
+	if _, err := s.AppendEncode(nil, []float64{huge}); err != nil {
+		t.Fatalf("expected lossy narrow to +Inf, got error: %v", err)
 	}
 }
 
-// TestRegression_SerMapFloatSilentInf is the map<float> parity test.
+// TestRegression_SerMapFloatSilentInf is the map<float> parity test for
+// the lossy-destination policy.
 func TestRegression_SerMapFloatSilentInf(t *testing.T) {
 	s := MustParse(`{"type":"map","values":"float"}`)
-	got, err := s.AppendEncode(nil, map[string]float64{"k": 1e40})
-	if err == nil {
-		t.Fatalf("expected float32 overflow error encoding map[string]float64{k:1e40} into map<float>, got nil; encoded bytes = %x", got)
+	if _, err := s.AppendEncode(nil, map[string]float64{"k": 1e40}); err != nil {
+		t.Fatalf("expected lossy narrow to +Inf, got error: %v", err)
 	}
 }
 
 // TestRegression_SerArrayFloatAcceptsInt verifies that the specialized
-// array<float> path accepts integer elements (with the float32-precision
-// bound), matching the single-value serFloat path. Pre-fix it errored
-// with "cannot use int64 with Avro type float" for any int slice.
+// array<float> path accepts integer elements (silently IEEE-rounding
+// beyond float32's 24-bit mantissa), matching the single-value serFloat
+// path. Pins int → float lossy-destination acceptance for the
+// specialized array path.
 func TestRegression_SerArrayFloatAcceptsInt(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"float"}`)
 	if _, err := s.AppendEncode(nil, []int64{1, 2, 3}); err != nil {
 		t.Fatalf("expected []int64{1,2,3} to encode as array<float>, got %v", err)
 	}
-	// And rejects values exceeding float32's 24-bit precision.
-	if _, err := s.AppendEncode(nil, []int64{1 << 25}); err == nil {
-		t.Fatalf("expected []int64{1<<25} to error on float32 precision bound")
+	// Lossy-destination: values exceeding float32's 24-bit mantissa
+	// silently IEEE-round (matches Java/fastavro).
+	if _, err := s.AppendEncode(nil, []int64{1 << 25}); err != nil {
+		t.Fatalf("expected []int64{1<<25} to silently round, got %v", err)
 	}
 }
 
 // TestRegression_SerArrayDoubleAcceptsInt verifies array<double> accepts
-// integer elements with the float64-precision bound.
+// integer elements (silently IEEE-rounding beyond float64's 53-bit
+// mantissa per the lossy-destination policy).
 func TestRegression_SerArrayDoubleAcceptsInt(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"double"}`)
 	if _, err := s.AppendEncode(nil, []int64{1, 2, 3}); err != nil {
 		t.Fatalf("expected []int64{1,2,3} to encode as array<double>, got %v", err)
 	}
-	if _, err := s.AppendEncode(nil, []int64{1 << 54}); err == nil {
-		t.Fatalf("expected []int64{1<<54} to error on float64 precision bound")
+	if _, err := s.AppendEncode(nil, []int64{1 << 54}); err != nil {
+		t.Fatalf("expected []int64{1<<54} to silently round, got %v", err)
 	}
 }
 
-// TestSafeUnsafeFloat32OverflowParity locks in that the unsafe fast path
-// (struct field of type float64 → Avro float) rejects values that would
-// silently clamp to ±Inf, matching serFloat's behavior. Pre-fix the unsafe
-// path encoded math.Float32bits(±Inf) without error; the safe path errored.
+// TestSafeUnsafeFloat32OverflowParity locks in that the safe and unsafe
+// encode paths agree on the lossy-destination policy: float64 → float32
+// narrowing produces ±Inf on the wire without error, matching Java's
+// (float)doubleValue() silent narrowing.
 func TestSafeUnsafeFloat32OverflowParity(t *testing.T) {
 	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"v","type":"float"}]}`)
 	if err != nil {
@@ -2435,23 +2590,23 @@ func TestSafeUnsafeFloat32OverflowParity(t *testing.T) {
 	const huge = math.MaxFloat64
 
 	// Safe path via map[string]any.
-	if _, err := s.AppendEncode(nil, map[string]any{"v": huge}); err == nil {
-		t.Fatalf("safe path: expected overflow error for %g, got nil", huge)
+	if _, err := s.AppendEncode(nil, map[string]any{"v": huge}); err != nil {
+		t.Fatalf("safe path: expected lossy narrow to +Inf, got error: %v", err)
 	}
 
 	// Unsafe fast path via struct.
 	type R struct {
 		V float64 `avro:"v"`
 	}
-	if _, err := s.AppendEncode(nil, &R{V: huge}); err == nil {
-		t.Fatalf("unsafe path: expected overflow error for %g (parity with safe path), got nil", huge)
+	if _, err := s.AppendEncode(nil, &R{V: huge}); err != nil {
+		t.Fatalf("unsafe path: expected lossy narrow to +Inf, got error: %v", err)
 	}
 }
 
 // TestSafeUnsafeUint64LongOverflowParity locks in that the unsafe fast path
 // rejects uint64 values that exceed math.MaxInt64 when encoding to Avro
-// long, matching serLong. Pre-fix the unsafe path silently wrapped to a
-// negative int64.
+// long, matching serLong. Without the parity, the unsafe path would
+// silently wrap to a negative int64 while the safe path rejected.
 func TestSafeUnsafeUint64LongOverflowParity(t *testing.T) {
 	s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"v","type":"long"}]}`)
 	if err != nil {
@@ -2491,9 +2646,9 @@ func (b *textBytesMarshaler) UnmarshalText(text []byte) error {
 // TestRegression_SerArrayStringTextMarshaler locks in that the
 // specialized array<string> ser path resolves a []byte-kind value that
 // also implements TextMarshaler via its text representation, not its
-// raw bytes. Pre-fix, serArray.serString diverged from the scalar
-// serString and silently encoded the raw bytes; the appendAvroString
-// helper consolidated all three sites.
+// raw bytes — matching scalar serString. The shared appendAvroString
+// helper enforces the precedence across all three sites (scalar,
+// array, map).
 func TestRegression_SerArrayStringTextMarshaler(t *testing.T) {
 	s := MustParse(`{"type":"array","items":"string"}`)
 	encoded, err := s.AppendEncode(nil, []textBytesMarshaler{textBytesMarshaler("hello")})
@@ -2530,10 +2685,8 @@ func TestRegression_SerMapStringTextMarshaler(t *testing.T) {
 
 // TestRegression_JSONEncodeStringTextMarshaler locks in that the JSON
 // encoder for "string" picks TextMarshaler over the []byte fallback for
-// types that implement both. Pre-fix, appendAvroJSON's "string" case
-// checked []byte before TextMarshaler, so net.IP-style values JSON-
-// encoded as their raw bytes (interpreted as UTF-8) instead of their
-// text form.
+// types that implement both. net.IP-style values must JSON-encode as
+// their text form, not their raw bytes (interpreted as UTF-8).
 func TestRegression_JSONEncodeStringTextMarshaler(t *testing.T) {
 	s := MustParse(`"string"`)
 	v := textBytesMarshaler("hello")
@@ -2549,9 +2702,8 @@ func TestRegression_JSONEncodeStringTextMarshaler(t *testing.T) {
 
 // TestRegression_JSONDecodeStringTextUnmarshaler locks in that the JSON
 // decoder for "string" routes into TextUnmarshaler when the target
-// implements it, mirroring deserString. Pre-fix, decodeString skipped
-// TextUnmarshaler entirely and would either set the raw bytes (for
-// []byte targets) or error.
+// implements it, mirroring deserString. Without this routing, the
+// target would receive raw bytes ([]byte-kind targets) or an error.
 func TestRegression_JSONDecodeStringTextUnmarshaler(t *testing.T) {
 	s := MustParse(`"string"`)
 	var v textBytesMarshaler
@@ -2560,5 +2712,328 @@ func TestRegression_JSONDecodeStringTextUnmarshaler(t *testing.T) {
 	}
 	if string(v) != "UNTEXT:hello" {
 		t.Fatalf("got %q, want %q; JSON decoder skipped TextUnmarshaler", string(v), "UNTEXT:hello")
+	}
+}
+
+// A nil pointer field with ,omitzero whose element type implements
+// IsZero() (e.g. *time.Time) must encode as the null branch, not panic.
+// valueIsZero must not call the promoted IsZero() on a nil pointer (the
+// value-receiver method dereferences nil). Covers the slow, unsafe, and
+// JSON encode paths, which all route zero-checks through valueIsZero.
+func TestRegression_OmitzeroNilPointerIsZero(t *testing.T) {
+	type R struct {
+		T *time.Time `avro:"t,omitzero"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"t","type":["null",{"type":"long","logicalType":"timestamp-millis"}],"default":null}]}`)
+	v := R{T: nil}
+
+	// unsafe (addressable) + slow (non-addressable) + JSON encode paths.
+	wireAddr, err := s.AppendEncode(nil, &v)
+	if err != nil {
+		t.Fatalf("encode &v (unsafe path): %v", err)
+	}
+	wireVal, err := s.AppendEncode(nil, v)
+	if err != nil {
+		t.Fatalf("encode v (reflect path): %v", err)
+	}
+	if !bytes.Equal(wireAddr, wireVal) {
+		t.Errorf("unsafe vs reflect wire differ: % x vs % x", wireAddr, wireVal)
+	}
+	if _, err := s.EncodeJSON(&v); err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+	// The null branch is index 0 → single 0x00 byte.
+	if len(wireAddr) != 1 || wireAddr[0] != 0x00 {
+		t.Errorf("nil omitzero field: got wire % x, want 00 (null branch)", wireAddr)
+	}
+	// A non-nil pointer to a zero time still takes the null branch (the
+	// pre-existing correct behavior).
+	var zero time.Time
+	w2, err := s.AppendEncode(nil, R{T: &zero})
+	if err != nil {
+		t.Fatalf("encode non-nil zero time: %v", err)
+	}
+	if len(w2) != 1 || w2[0] != 0x00 {
+		t.Errorf("non-nil zero time omitzero: got % x, want 00", w2)
+	}
+}
+
+// ozPtrCounter has a POINTER-receiver IsZero that treats the sentinel 7 as
+// "zero" — a value that DISAGREES with the structural zero (0). Honoring it is
+// therefore observable in both directions: 7 (structurally non-zero) must be
+// omitted, and 0 (structurally zero) must NOT be omitted.
+type ozPtrCounter int64
+
+func (c *ozPtrCounter) IsZero() bool { return *c == 7 }
+
+// ozValCounter is the value-receiver twin, pinning that the pre-existing
+// value-receiver path still works after the pointer-receiver path was added.
+type ozValCounter int64
+
+func (c ozValCounter) IsZero() bool { return c == 7 }
+
+// omitzero must honor an IsZero() method regardless of whether its receiver is
+// a value or a pointer (doc.go: "fields whose IsZero() method returns true").
+// A value-typed field whose type has a POINTER-receiver IsZero is addressable
+// when encoding &struct, so (&field).IsZero() is callable; valueIsZero reached
+// only the value method set, silently encoding the value instead of the
+// default/null. The sentinel (7) disagrees with structural zero (0) so both
+// directions are pinned: IsZero()==true omits a structurally-non-zero value,
+// IsZero()==false keeps a structurally-zero value. Covers the reflect, unsafe,
+// and JSON encode paths (all route through valueIsZero).
+func TestRegression_OmitzeroPointerReceiverIsZero(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"f","type":["null","long"],"default":null}]}`)
+	null := []byte{0x00}      // union index 0 (null branch) — omitzero acted
+	longZero := []byte{2, 0}  // union index 1 (long), value 0 — not omitted
+	longThree := []byte{2, 6} // union index 1 (long), value 3 (zigzag 6)
+
+	// encodeAll returns the reflect (value) and unsafe (&value, addressable)
+	// wire, asserting they agree, plus the JSON. The addressable path is the
+	// one where a pointer-receiver IsZero is legitimately reachable.
+	encodeAll := func(t *testing.T, v any, pv any) []byte {
+		t.Helper()
+		wireVal, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatalf("reflect encode: %v", err)
+		}
+		wireAddr, err := s.AppendEncode(nil, pv)
+		if err != nil {
+			t.Fatalf("unsafe encode: %v", err)
+		}
+		if !bytes.Equal(wireVal, wireAddr) {
+			t.Errorf("reflect vs unsafe wire differ: % x vs % x", wireVal, wireAddr)
+		}
+		if _, err := s.EncodeJSON(pv); err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		return wireAddr
+	}
+
+	t.Run("ptr-receiver IsZero true omits non-structural-zero", func(t *testing.T) {
+		type R struct {
+			F ozPtrCounter `avro:"f,omitzero"`
+		}
+		v := R{F: 7} // IsZero()==true, structurally non-zero
+		if got := encodeAll(t, v, &v); !bytes.Equal(got, null) {
+			t.Errorf("got % x, want % x (omitzero must honor pointer-receiver IsZero)", got, null)
+		}
+	})
+	t.Run("ptr-receiver IsZero false keeps structural-zero", func(t *testing.T) {
+		type R struct {
+			F ozPtrCounter `avro:"f,omitzero"`
+		}
+		v := R{F: 0} // IsZero()==false, structurally zero
+		if got := encodeAll(t, v, &v); !bytes.Equal(got, longZero) {
+			t.Errorf("got % x, want % x (IsZero()==false must override structural zero)", got, longZero)
+		}
+	})
+	t.Run("ptr-receiver IsZero false keeps nonzero", func(t *testing.T) {
+		type R struct {
+			F ozPtrCounter `avro:"f,omitzero"`
+		}
+		v := R{F: 3}
+		if got := encodeAll(t, v, &v); !bytes.Equal(got, longThree) {
+			t.Errorf("got % x, want % x", got, longThree)
+		}
+	})
+	t.Run("value-receiver IsZero still honored both ways", func(t *testing.T) {
+		type R struct {
+			F ozValCounter `avro:"f,omitzero"`
+		}
+		v7 := R{F: 7}
+		if got := encodeAll(t, v7, &v7); !bytes.Equal(got, null) {
+			t.Errorf("value-receiver IsZero()==true: got % x, want % x", got, null)
+		}
+		v0 := R{F: 0}
+		if got := encodeAll(t, v0, &v0); !bytes.Equal(got, longZero) {
+			t.Errorf("value-receiver IsZero()==false: got % x, want % x", got, longZero)
+		}
+	})
+}
+
+type EmbeddedInner struct {
+	A int32 `avro:"a"`
+}
+
+type withNilEmbedPtr struct {
+	*EmbeddedInner
+	C int32 `avro:"c"`
+}
+
+type unexportedInner struct {
+	A int32 `avro:"a"`
+}
+
+type withUnexportedEmbedPtr struct {
+	*unexportedInner
+	C int32 `avro:"c"`
+}
+
+// A nil anonymous embedded *struct must not panic on encode: its promoted
+// fields encode as zero (symmetric with decode allocating the embedded
+// pointer). Decode into a struct whose embedded pointer is named via an
+// UNEXPORTED type must error cleanly, not panic (Go reflection cannot
+// allocate/set through an unexported embedded pointer).
+func TestRegression_EmbeddedPointerStructNoPanic(t *testing.T) {
+	s := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"c","type":"int"}]}`)
+
+	t.Run("nil embedded encode zero-fills", func(t *testing.T) {
+		v := withNilEmbedPtr{C: 3}
+		// unsafe (addressable), reflect (value), and JSON encode paths.
+		wAddr, err := s.AppendEncode(nil, &v)
+		if err != nil {
+			t.Fatalf("encode &v: %v", err)
+		}
+		wVal, err := s.AppendEncode(nil, v)
+		if err != nil {
+			t.Fatalf("encode v: %v", err)
+		}
+		if !bytes.Equal(wAddr, wVal) {
+			t.Errorf("unsafe vs reflect: % x vs % x", wAddr, wVal)
+		}
+		if _, err := s.EncodeJSON(&v); err != nil {
+			t.Fatalf("EncodeJSON: %v", err)
+		}
+		// a=0 (zero-filled), c=3 → zig-zag 0x00, 0x06.
+		var got withNilEmbedPtr
+		if _, err := s.Decode(wAddr, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.EmbeddedInner == nil || got.A != 0 || got.C != 3 {
+			t.Errorf("round-trip: got %+v (A via embed=%v)", got, got.EmbeddedInner)
+		}
+	})
+
+	t.Run("unexported embedded decode errors cleanly", func(t *testing.T) {
+		wire, err := s.AppendEncode(nil, &withNilEmbedPtr{EmbeddedInner: &EmbeddedInner{A: 7}, C: 3})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got withUnexportedEmbedPtr
+		_, err = s.Decode(wire, &got) // must error, not panic
+		if err == nil {
+			t.Fatal("expected clean error decoding into unexported embedded pointer; got nil")
+		}
+	})
+
+	t.Run("unexported embedded decode works when pre-allocated", func(t *testing.T) {
+		// The refusal above is specific to a NIL unexported embedded
+		// pointer (reflection cannot allocate it — writing the pointer
+		// field itself is what's off-limits). Writing a promoted EXPORTED
+		// field through a non-nil unexported embed is permitted, so a
+		// caller who allocates the embed before decoding must succeed.
+		wire, err := s.AppendEncode(nil, &withNilEmbedPtr{EmbeddedInner: &EmbeddedInner{A: 7}, C: 3})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		got := withUnexportedEmbedPtr{unexportedInner: &unexportedInner{}}
+		if _, err := s.Decode(wire, &got); err != nil {
+			t.Fatalf("decode into pre-allocated unexported embed: %v", err)
+		}
+		if got.A != 7 || got.C != 3 {
+			t.Errorf("promoted field not filled through pre-allocated embed: got %+v", got)
+		}
+	})
+}
+
+// A multi-pointer field (**T / **Record) mapped to ["null", T] holding
+// &(*T)(nil) — a non-nil outer pointer wrapping a nil inner — is
+// nil-equivalent per isNilValue, so it must encode as the null branch.
+// The unsafe struct fast-path enter peeled only the outer pointer and
+// committed to the value branch (then faulted on the nil inner), diverging
+// from the reflect path (which emits null) and from JSON. Such fields now
+// decline to the reflect path.
+func TestRegression_UnsafeMultiPtrNullUnionNil(t *testing.T) {
+	type Inner struct {
+		X int32 `avro:"x"`
+	}
+	s := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"p","type":["null","int"]},
+		{"name":"r","type":["null",{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}]}]}`)
+	type R struct {
+		P  **int32 `avro:"p"`
+		Rr **Inner `avro:"r"`
+	}
+	nilInt := (*int32)(nil)
+	nilRec := (*Inner)(nil)
+	v := R{P: &nilInt, Rr: &nilRec} // &(*T)(nil) for both
+
+	wAddr, err := s.AppendEncode(nil, &v) // unsafe (addressable)
+	if err != nil {
+		t.Fatalf("encode &v (unsafe): %v", err)
+	}
+	wVal, err := s.AppendEncode(nil, v) // reflect (non-addressable)
+	if err != nil {
+		t.Fatalf("encode v (reflect): %v", err)
+	}
+	if !bytes.Equal(wAddr, wVal) {
+		t.Errorf("unsafe vs reflect diverge: % x vs % x", wAddr, wVal)
+	}
+	// Both null → two 0x00 bytes.
+	if len(wAddr) != 2 || wAddr[0] != 0x00 || wAddr[1] != 0x00 {
+		t.Errorf("got wire % x, want 00 00 (both null branches)", wAddr)
+	}
+	if _, err := s.EncodeJSON(&v); err != nil {
+		t.Fatalf("EncodeJSON: %v", err)
+	}
+}
+
+// TestRegression_TextAppenderHeaderGrowth pins appendAvroString's
+// AppendText inline-write slow path: it reserves a 1-byte length
+// placeholder, lets AppendText write directly into dst, then — when the
+// real text length needs MORE varint header bytes than the 1-byte
+// placeholder — grows dst by exactly (len(realHdr) - placeholderLen) and
+// shifts the text right. Every other AppendText test uses short values
+// (<64 bytes) that stay on the 1-byte-header fast path and never enter the
+// grow branch, so the grow arithmetic (ser.go: make([]byte, len(hdr)-
+// hdrLen)) had no wire-level coverage — an over- or under-grow there
+// leaves trailing garbage or truncates, corrupting the wire for the NEXT
+// field. This drives text lengths across both varint-width boundaries
+// (>=64 → 2-byte header, >=8192 → 3-byte header) and asserts an exact
+// round-trip both standalone and as the first field of a record (so a
+// length error shows up as a misread of the following field).
+func TestRegression_TextAppenderHeaderGrowth(t *testing.T) {
+	s := MustParse(`"string"`)
+	rec := MustParse(`{"type":"record","name":"R","fields":[
+		{"name":"s","type":"string"},{"name":"n","type":"int"}]}`)
+
+	for _, n := range []int{0, 1, 63, 64, 65, 127, 128, 8191, 8192, 8193, 70000} {
+		val := strings.Repeat("x", n)
+
+		// Standalone: encode the TextAppender, decode as a plain string,
+		// and confirm exact value + zero trailing bytes.
+		enc, err := s.AppendEncode(nil, testTextAppender{val: val})
+		if err != nil {
+			t.Fatalf("n=%d: encode: %v", n, err)
+		}
+		// The wire must be exactly varint(n) + n text bytes, nothing more.
+		plain, _ := s.AppendEncode(nil, val)
+		if !bytes.Equal(enc, plain) {
+			t.Fatalf("n=%d: AppendText wire differs from plain string wire:\n ta=%x\n  s=%x", n, enc, plain)
+		}
+		var out string
+		rest, err := s.Decode(enc, &out)
+		if err != nil || out != val || len(rest) != 0 {
+			t.Fatalf("n=%d: decode: err=%v len(out)=%d trailing=%d", n, err, len(out), len(rest))
+		}
+
+		// As the first field of a record: a header-length error here
+		// would desynchronize the following int field.
+		renc, err := rec.AppendEncode(nil, map[string]any{"s": testTextAppender{val: val}, "n": int32(0x2A)})
+		if err != nil {
+			t.Fatalf("n=%d: record encode: %v", n, err)
+		}
+		var rout struct {
+			S string `avro:"s"`
+			N int32  `avro:"n"`
+		}
+		if _, err := rec.Decode(renc, &rout); err != nil {
+			t.Fatalf("n=%d: record decode: %v", n, err)
+		}
+		if rout.S != val || rout.N != 0x2A {
+			t.Fatalf("n=%d: record round-trip corrupted: len(S)=%d N=%#x (want len %d, 0x2a)", n, len(rout.S), rout.N, n)
+		}
 	}
 }

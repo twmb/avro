@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math/big"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,6 +112,139 @@ func TestSchemaForNullable(t *testing.T) {
 			t.Errorf("expected nil email, got %v", *got.Email)
 		}
 	})
+}
+
+func TestSchemaForMultiLevelPointer(t *testing.T) {
+	// The codecs collapse a whole pointer chain (**T, ***T, ...) to a
+	// single nullable union via indirect/indirectAlloc, so SchemaFor must
+	// emit one ["null", T] — not a union nested inside a union, which Avro
+	// forbids ("unions cannot immediately contain other unions") and which
+	// would make the schema unusable. The chain is capped at the codec's
+	// own unwrap limit (maxIndirectDepth consecutive pointer levels); a
+	// deeper chain is refused at build (see
+	// TestRegression_SchemaForDeepPointerChainRefusedAtBuild) rather than
+	// emitting a ["null",T] the encoder would reject with errIndirectDeep.
+	t.Run("double pointer to int", func(t *testing.T) {
+		type Rec struct {
+			V **int32 `avro:"v"`
+		}
+		s, err := SchemaFor[Rec]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The emitted schema must itself parse.
+		if _, err := Parse(s.String()); err != nil {
+			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
+		}
+		n := int32(7)
+		p := &n
+		in := Rec{V: &p}
+		data, err := s.Encode(&in)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got Rec
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.V == nil || *got.V == nil || **got.V != 7 {
+			t.Fatalf("round-trip mismatch: got %v, want **int32(7)", got.V)
+		}
+	})
+
+	t.Run("double pointer to struct", func(t *testing.T) {
+		type Inner struct {
+			Value int32 `avro:"value"`
+		}
+		type Rec struct {
+			V **Inner `avro:"v"`
+		}
+		s, err := SchemaFor[Rec]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(s.String()); err != nil {
+			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
+		}
+	})
+
+	t.Run("triple pointer", func(t *testing.T) {
+		type Rec struct {
+			V ***int32 `avro:"v"`
+		}
+		s, err := SchemaFor[Rec]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(s.String()); err != nil {
+			t.Fatalf("emitted schema does not parse: %v\nschema: %s", err, s.String())
+		}
+	})
+}
+
+// A pointer chain deeper than the codec unwraps (maxIndirectDepth consecutive
+// levels) must be refused at BUILD, not emitted as a ["null",T] the encoder
+// then rejects. The codec's indirect/indirectAlloc accept a chain bottoming at
+// a non-pointer base within maxIndirectDepth levels, so a SchemaFor schema for
+// a deeper chain would build but fail Encode of a non-nil value — a
+// build-accepts/encode-rejects asymmetry. Boundary: a chain at the cap
+// (maxIndirectDepth levels) builds AND round-trips a non-nil value; one level
+// deeper is refused at build naming the pointer-chain cause.
+func TestRegression_SchemaForDeepPointerChainRefusedAtBuild(t *testing.T) {
+	// At-cap chain (maxIndirectDepth == 5 pointer levels) builds and round-trips
+	// a NON-NIL value — the exact depth a deeper chain breaks and the depth the
+	// encode↔decode off-by-one used to reject on encode while decode accepted.
+	type AtCap struct {
+		F *****int32 `avro:"f"`
+	}
+	s, err := SchemaFor[AtCap]()
+	if err != nil {
+		t.Fatalf("a %d-level pointer chain (at the cap) must build: %v", maxIndirectDepth, err)
+	}
+	if _, err := Parse(s.String()); err != nil {
+		t.Fatalf("at-cap schema must re-parse: %v\n%s", err, s.String())
+	}
+	n := int32(42)
+	p1 := &n
+	p2 := &p1
+	p3 := &p2
+	p4 := &p3
+	p5 := &p4
+	wire, err := s.Encode(&AtCap{F: p5}) // non-nil all the way down
+	if err != nil {
+		t.Fatalf("at-cap chain must Encode a non-nil value: %v", err)
+	}
+	var got AtCap
+	if _, err := s.Decode(wire, &got); err != nil {
+		t.Fatalf("at-cap chain must Decode: %v", err)
+	}
+	if got.F == nil || *****got.F != 42 {
+		t.Fatalf("at-cap round-trip mismatch: %v", got.F)
+	}
+
+	// One level past the cap (maxIndirectDepth+1 == 6 pointer levels) is refused
+	// at BUILD, naming the pointer-chain cause — not deferred to an Encode
+	// failure.
+	type PastCap struct {
+		F ******int32 `avro:"f"`
+	}
+	_, err = SchemaFor[PastCap]()
+	if err == nil {
+		t.Fatalf("a %d-level pointer chain (past the cap) must be refused at build", maxIndirectDepth+1)
+	}
+	if !strings.Contains(err.Error(), "pointer chain nests deeper") {
+		t.Fatalf("build error should name the pointer-chain cause, got: %v", err)
+	}
+
+	// The cap resets at container boundaries: a slice/map whose element is an
+	// at-cap pointer chain still builds (each element is unwrapped fresh).
+	type Resets struct {
+		A []*****int32          `avro:"a"`
+		B map[string]*****int32 `avro:"b"`
+	}
+	if _, err := SchemaFor[Resets](); err != nil {
+		t.Fatalf("per-element pointer chains under the cap must build (chain resets at container boundary): %v", err)
+	}
 }
 
 func TestSchemaForNullableDefaultNull(t *testing.T) {
@@ -397,6 +531,217 @@ func TestSchemaForDuration(t *testing.T) {
 	}
 }
 
+// avro.Duration is the dedicated Go type for the Avro "duration" logical type
+// (a fixed(12) carrying little-endian months/days/milliseconds — distinct from
+// the time.Duration→time-millis mapping in [TestSchemaForDuration] above).
+// SchemaFor recognizes it BY TYPE, with no tag, and must emit the duration
+// fixed wherever the type appears — bare field, *avro.Duration (nullable
+// union), slice/array element, map value, and nested-record field — never
+// decompose its exported uint32 fields into a {Months,Days,Milliseconds}
+// record. The metadata-tree assertions below are the neuter target: reverting
+// inferType's avroDurationType case turns every leaf back into that record and
+// reddens this test (the round-trips would still pass as a record, so the
+// shape assertion is what locks the behavior).
+func TestSchemaForAvroDuration(t *testing.T) {
+	dur := Duration{Months: 5, Days: 10, Milliseconds: 1234}
+
+	assertDurationFixed := func(t *testing.T, n SchemaNode) {
+		t.Helper()
+		if n.Type != "fixed" {
+			t.Fatalf("duration leaf Type = %q, want \"fixed\" (a record decomposition means the avroDurationType case did not fire)", n.Type)
+		}
+		if n.LogicalType != "duration" {
+			t.Errorf("duration leaf LogicalType = %q, want \"duration\"", n.LogicalType)
+		}
+		if n.Size != 12 {
+			t.Errorf("duration leaf Size = %d, want 12", n.Size)
+		}
+		if n.Name != "duration" {
+			t.Errorf("duration leaf Name = %q, want \"duration\"", n.Name)
+		}
+		if len(n.Fields) != 0 {
+			t.Errorf("duration leaf has %d record fields; it must not decompose into Months/Days/Milliseconds", len(n.Fields))
+		}
+	}
+
+	t.Run("bare", func(t *testing.T) {
+		type R struct {
+			D Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertDurationFixed(t, s.Root().Fields[0].Type)
+		// A single-field record's wire IS the field's encoding (no framing),
+		// so it must be exactly the 12-byte duration fixed — a decomposed
+		// record would emit three zig-zag varint longs (4 bytes here), so the
+		// length alone separates the two even before the byte compare.
+		w, err := s.Encode(R{D: dur})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		b := dur.Bytes()
+		if string(w) != string(b[:]) {
+			t.Fatalf("wire = %x, want the 12-byte duration fixed %x", w, b)
+		}
+		var got R
+		if _, err := s.Decode(w, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.D != dur {
+			t.Errorf("round-trip: got %v, want %v", got.D, dur)
+		}
+	})
+
+	t.Run("pointer-nullable", func(t *testing.T) {
+		type R struct {
+			D *Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ft := s.Root().Fields[0].Type
+		if ft.Type != "union" || len(ft.Branches) != 2 || ft.Branches[0].Type != "null" {
+			t.Fatalf("pointer field type = %+v, want [\"null\", duration]", ft)
+		}
+		assertDurationFixed(t, ft.Branches[1])
+		for _, v := range []*Duration{&dur, nil} {
+			w, err := s.Encode(R{D: v})
+			if err != nil {
+				t.Fatalf("encode %v: %v", v, err)
+			}
+			var got R
+			if _, err := s.Decode(w, &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if (v == nil) != (got.D == nil) || (v != nil && *got.D != *v) {
+				t.Errorf("round-trip ptr: got %v want %v", got.D, v)
+			}
+		}
+	})
+
+	t.Run("slice", func(t *testing.T) {
+		type R struct {
+			D []Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ft := s.Root().Fields[0].Type
+		if ft.Type != "array" || ft.Items == nil {
+			t.Fatalf("slice field type = %+v, want array of duration", ft)
+		}
+		assertDurationFixed(t, *ft.Items)
+		rt := R{D: []Duration{dur, {}}}
+		w, err := s.Encode(rt)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(w, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(got.D) != 2 || got.D[0] != dur || got.D[1] != (Duration{}) {
+			t.Errorf("round-trip slice: got %v", got.D)
+		}
+	})
+
+	t.Run("array", func(t *testing.T) {
+		type R struct {
+			D [2]Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ft := s.Root().Fields[0].Type
+		if ft.Type != "array" || ft.Items == nil {
+			t.Fatalf("array field type = %+v, want array of duration", ft)
+		}
+		assertDurationFixed(t, *ft.Items)
+		w, err := s.Encode(R{D: [2]Duration{dur, {}}})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(w, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.D[0] != dur || got.D[1] != (Duration{}) {
+			t.Errorf("round-trip array: got %v", got.D)
+		}
+	})
+
+	t.Run("map", func(t *testing.T) {
+		type R struct {
+			D map[string]Duration `avro:"d"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ft := s.Root().Fields[0].Type
+		if ft.Type != "map" || ft.Values == nil {
+			t.Fatalf("map field type = %+v, want map of duration", ft)
+		}
+		assertDurationFixed(t, *ft.Values)
+		w, err := s.Encode(R{D: map[string]Duration{"k": dur}})
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(w, &got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got.D["k"] != dur {
+			t.Errorf("round-trip map: got %v", got.D)
+		}
+	})
+
+	t.Run("nested-record-field", func(t *testing.T) {
+		type Inner struct {
+			D Duration `avro:"d"`
+		}
+		type R struct {
+			In Inner `avro:"in"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner := s.Root().Fields[0].Type
+		if inner.Type != "record" {
+			t.Fatalf("inner field type = %q, want record", inner.Type)
+		}
+		assertDurationFixed(t, inner.Fields[0].Type)
+	})
+}
+
+// A non-empty logical tag attached to an avro.Duration field is always a
+// mismatch — there is no "duration" tag option (recognition is purely by type),
+// so any tag the user wrote is one of uuid / decimal / a time logical, none of
+// which apply to the duration fixed. SchemaFor rejects it rather than silently
+// emitting the duration schema and dropping the tag, matching the strict-reject
+// posture of the time.Time/time.Duration/uuid/decimal arms.
+func TestSchemaForAvroDurationRejectsLogicalTag(t *testing.T) {
+	for _, tag := range []string{"uuid", "timestamp-millis", "date", "decimal(9,2)"} {
+		t.Run(tag, func(t *testing.T) {
+			st := reflect.StructOf([]reflect.StructField{{
+				Name: "D",
+				Type: avroDurationType,
+				Tag:  reflect.StructTag(`avro:"d,` + tag + `"`),
+			}})
+			seen := make(map[reflect.Type]seenForm)
+			if _, err := inferRecord(st, "R", "", seen, nil, make(appliedTypeAliases)); err == nil {
+				t.Fatalf("avro.Duration with %q tag should be rejected", tag)
+			}
+		})
+	}
+}
+
 func TestSchemaForDecimal(t *testing.T) {
 	type Product struct {
 		Name  string  `avro:"name"`
@@ -510,11 +855,11 @@ func TestSplitTag(t *testing.T) {
 
 	// Unclosed and mismatched delimiters should error.
 	for _, tag := range []string{
-		"name,alias=[a,b",       // unclosed [
-		"name,decimal(10,2",     // unclosed (
-		"name,alias=[a,b)",      // [ closed by )
-		"name,decimal(10,2]",    // ( closed by ]
-		"name,alias=[a)b]",      // ) inside [ context
+		"name,alias=[a,b",    // unclosed [
+		"name,decimal(10,2",  // unclosed (
+		"name,alias=[a,b)",   // [ closed by )
+		"name,decimal(10,2]", // ( closed by ]
+		"name,alias=[a)b]",   // ) inside [ context
 	} {
 		if _, err := splitTag(tag); err == nil {
 			t.Errorf("splitTag(%q) expected error for bad delimiters", tag)
@@ -713,7 +1058,7 @@ func TestSchemaForTypeAliasEnum(t *testing.T) {
 		State Status `avro:"state,type-alias=OldStatus"`
 	}
 	reader, err := SchemaFor[Outer](CustomType{
-		GoType: reflect.TypeOf(Status("")),
+		GoType: reflect.TypeFor[Status](),
 		Schema: &enumNode,
 	})
 	if err != nil {
@@ -989,6 +1334,219 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 		aliases, _ := hashField["aliases"].([]any)
 		if len(aliases) != 1 || aliases[0] != "old_hash" {
 			t.Fatalf("fixed aliases: got %v, want [old_hash]", aliases)
+		}
+	})
+
+	t.Run("namespaced identical aliases accepted", func(t *testing.T) {
+		// A configured namespace must not change whether two fields of the
+		// same named type with identical type-aliases are accepted: the
+		// defining field and the referencing field identify the type by the
+		// same identity (its fullname), so the dedup that recognizes
+		// "identical aliases, accept" must key on that same identity in both
+		// positions. (The defining field registers the type and the
+		// referencing field resolves to a name reference — both are the
+		// type's fullname com.example.Inner.)
+		type Outer struct {
+			A Inner `avro:"a,type-alias=old_inner"`
+			B Inner `avro:"b,type-alias=old_inner"`
+		}
+		s, err := SchemaFor[Outer](WithNamespace("com.example"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The alias must be present on the (namespaced) Inner definition.
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(s.String()), &raw); err != nil {
+			t.Fatal(err)
+		}
+		aField := raw["fields"].([]any)[0].(map[string]any)["type"].(map[string]any)
+		aliases, _ := aField["aliases"].([]any)
+		if len(aliases) != 1 || aliases[0] != "old_inner" {
+			t.Fatalf("namespaced Inner aliases: got %v, want [old_inner]", aliases)
+		}
+	})
+
+	t.Run("namespaced conflicting aliases rejected", func(t *testing.T) {
+		// The conflict detection must still fire under a namespace.
+		type Outer struct {
+			A Inner `avro:"a,type-alias=old_inner"`
+			B Inner `avro:"b,type-alias=different_inner"`
+		}
+		if _, err := SchemaFor[Outer](WithNamespace("com.example")); err == nil {
+			t.Fatal("expected error for conflicting type-alias under namespace")
+		}
+	})
+}
+
+// TestSchemaForTypeAliasCrossRecord pins type-alias dedup scope ACROSS record
+// boundaries. The dedup state (which type-aliases have been applied to each
+// named type) is keyed on a type's fullname and must span the whole inference,
+// exactly like the named-type registry (seen): a named type is defined once and
+// may be referenced from any record. TestSchemaForTypeAliasNamedRef covers only
+// the same-record case (defining and referencing field in one struct); this
+// covers a named type defined in one record and referenced — with the SAME
+// alias — from a DIFFERENT (nested) record reached through every inferType
+// recursion arm. Per-record dedup state spuriously rejected these: the nested
+// record never saw the earlier application, so a reference fell into the
+// "defined without type-alias" branch with a factually false message.
+func TestSchemaForTypeAliasCrossRecord(t *testing.T) {
+	type Inner struct {
+		Value int32 `avro:"value"`
+	}
+
+	// Identical alias across a record boundary is accepted, and the alias lands
+	// on the type DEFINITION exactly once while the cross-record occurrence is a
+	// bare name reference (not a second definition carrying the alias).
+	t.Run("nested struct identical alias accepted and aliased once", func(t *testing.T) {
+		type Nested struct {
+			Ref Inner `avro:"ref,type-alias=old_inner"`
+		}
+		type Outer struct {
+			Def    Inner  `avro:"def,type-alias=old_inner"` // defines Inner + alias (processed first)
+			Nested Nested `avro:"nested"`                    // its Ref references Inner from another record
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("cross-record identical alias rejected: %v", err)
+		}
+		js := s.String()
+		// The alias attaches to the single Inner definition; references are bare,
+		// so the alias text appears exactly once.
+		if n := strings.Count(js, "old_inner"); n != 1 {
+			t.Fatalf("alias should appear once (on the definition), got %d occurrences: %s", n, js)
+		}
+		// Structural proof: the defining field's type is the Inner object with the
+		// alias; the nested field's Ref is the bare string "Inner".
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(js), &raw); err != nil {
+			t.Fatal(err)
+		}
+		fields := raw["fields"].([]any)
+		defType := fields[0].(map[string]any)["type"].(map[string]any)
+		if defType["name"] != "Inner" {
+			t.Fatalf("def field type name: got %v, want Inner", defType["name"])
+		}
+		aliases, _ := defType["aliases"].([]any)
+		if len(aliases) != 1 || aliases[0] != "old_inner" {
+			t.Fatalf("Inner definition aliases: got %v, want [old_inner]", aliases)
+		}
+		nestedType := fields[1].(map[string]any)["type"].(map[string]any)
+		refType := nestedType["fields"].([]any)[0].(map[string]any)["type"]
+		if refType != "Inner" {
+			t.Fatalf("nested Ref should be the bare name reference %q, got %T %v", "Inner", refType, refType)
+		}
+	})
+
+	// Threading coverage: the alias'd type is defined at the top level and
+	// referenced from a record reached via each inferType recursion arm. A
+	// recursion call that fails to thread the dedup state would give the reached
+	// record a fresh (empty) state and spuriously reject the identical alias, so
+	// each of these reds independently if its arm is not threaded.
+	t.Run("cross-record via array element", func(t *testing.T) {
+		type Elem struct {
+			Ref Inner `avro:"ref,type-alias=old_inner"`
+		}
+		type Outer struct {
+			Def  Inner  `avro:"def,type-alias=old_inner"`
+			List []Elem `avro:"list"` // Elem record reached via array items
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("cross-record-via-array identical alias rejected: %v", err)
+		}
+		if n := strings.Count(s.String(), "old_inner"); n != 1 {
+			t.Fatalf("alias occurrences: got %d, want 1: %s", n, s.String())
+		}
+	})
+
+	t.Run("cross-record via map value", func(t *testing.T) {
+		type Val struct {
+			Ref Inner `avro:"ref,type-alias=old_inner"`
+		}
+		type Outer struct {
+			Def Inner          `avro:"def,type-alias=old_inner"`
+			M   map[string]Val `avro:"m"` // Val record reached via map values
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("cross-record-via-map identical alias rejected: %v", err)
+		}
+		if n := strings.Count(s.String(), "old_inner"); n != 1 {
+			t.Fatalf("alias occurrences: got %d, want 1: %s", n, s.String())
+		}
+	})
+
+	t.Run("cross-record via pointer", func(t *testing.T) {
+		type Target struct {
+			Ref Inner `avro:"ref,type-alias=old_inner"`
+		}
+		type Outer struct {
+			Def Inner   `avro:"def,type-alias=old_inner"`
+			P   *Target `avro:"p"` // Target record reached via pointer elem
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("cross-record-via-pointer identical alias rejected: %v", err)
+		}
+		if n := strings.Count(s.String(), "old_inner"); n != 1 {
+			t.Fatalf("alias occurrences: got %d, want 1: %s", n, s.String())
+		}
+	})
+
+	// A genuine cross-record conflict (same type, different aliases in two
+	// records) must be reported truthfully as a conflict — NOT as the false
+	// "defined without type-alias" message that per-record state produced (it
+	// never saw the earlier application, so it mistook a conflict for a
+	// no-earlier-alias case).
+	t.Run("cross-record conflict reported as conflict", func(t *testing.T) {
+		type Nested struct {
+			Ref Inner `avro:"ref,type-alias=different_inner"`
+		}
+		type Outer struct {
+			Def    Inner  `avro:"def,type-alias=old_inner"`
+			Nested Nested `avro:"nested"`
+		}
+		_, err := SchemaFor[Outer]()
+		if err == nil {
+			t.Fatal("expected error for conflicting cross-record type-alias")
+		}
+		if !strings.Contains(err.Error(), "conflicts") {
+			t.Errorf("conflict should be reported as a conflict, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "without type-alias") {
+			t.Errorf("conflict must not be reported as the false 'without type-alias' message: %v", err)
+		}
+	})
+
+	// When the type is genuinely defined WITHOUT an alias and then referenced
+	// WITH one from another record, the truthful "without type-alias" error
+	// still fires (the dedup state correctly has no application recorded for it).
+	t.Run("cross-record define-without then reference-with errors truthfully", func(t *testing.T) {
+		type Nested struct {
+			Ref Inner `avro:"ref,type-alias=late_inner"`
+		}
+		type Outer struct {
+			Def    Inner  `avro:"def"` // defines Inner with NO alias
+			Nested Nested `avro:"nested"`
+		}
+		_, err := SchemaFor[Outer]()
+		if err == nil {
+			t.Fatal("expected error for type-alias on a type already defined without one")
+		}
+		if !strings.Contains(err.Error(), "without type-alias") {
+			t.Errorf("expected truthful 'without type-alias' error, got: %v", err)
+		}
+	})
+
+	// Same-record identical control: the established contract (also pinned by
+	// TestSchemaForTypeAliasNamedRef) must continue to accept.
+	t.Run("same-record identical control still accepts", func(t *testing.T) {
+		type Outer struct {
+			A Inner `avro:"a,type-alias=old_inner"`
+			B Inner `avro:"b,type-alias=old_inner"`
+		}
+		if _, err := SchemaFor[Outer](); err != nil {
+			t.Fatalf("same-record identical alias control rejected: %v", err)
 		}
 	})
 }
@@ -1493,6 +2051,672 @@ func TestSchemaForUUID(t *testing.T) {
 	})
 }
 
+// TestSchemaForInlineRejectsOtherOptions locks the rule that the inline
+// directive removes the field at this position (the embedded struct's
+// fields are flattened into the parent). With no field at the inline
+// position, options that apply to a field (default=, alias=, type-alias=,
+// omitzero, logical-type tags) have no target — silently dropping them
+// would hide user typos and produce a schema that doesn't reflect the
+// user's tag. Reject any non-"inline" option (and any explicit name) on
+// an inline tag at SchemaFor time.
+func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"inline + default=", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,default=foo"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + alias=", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,alias=old"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + type-alias=", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,type-alias=old"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + omitzero", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,omitzero"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + date", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,date"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + uuid", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,uuid"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + timestamp-millis", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,timestamp-millis"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"inline + decimal(10,2)", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:",inline,decimal(10,2)"`
+			}
+			return SchemaFor[Outer]()
+		}},
+		{"explicit name + inline", func() (*Schema, error) {
+			type Embed struct {
+				A int32 `avro:"a"`
+			}
+			type Outer struct {
+				Embed `avro:"Name,inline"`
+			}
+			return SchemaFor[Outer]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+
+	// Positive control: plain inline (no other options) still works.
+	t.Run("plain inline still accepted", func(t *testing.T) {
+		type Embed struct {
+			A int32 `avro:"a"`
+		}
+		type Outer struct {
+			Embed `avro:",inline"`
+			B     string `avro:"b"`
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := s.String()
+		// Flattened: should have both a and b at the top level.
+		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"b"`) {
+			t.Errorf("expected flattened a + b fields; got %s", got)
+		}
+	})
+}
+
+// InlineScalarAlias is a named non-struct type used by
+// TestSchemaForInlineRejectsNonStructFieldType to exercise the
+// anonymous-embed-of-named-scalar shape. Must live at package scope
+// because Go field names for anonymous embeds come from the type name
+// and the embed has to be exported (start with an uppercase letter)
+// to reach the regular field-handling code path.
+type InlineScalarAlias string
+
+// TestSchemaForInlineRejectsNonStructFieldType locks the rule that the
+// inline directive requires a struct (or pointer-to-struct) field type.
+// Inline flattens an embedded struct's fields into the parent — on a
+// non-struct field there is no struct to flatten, so the user's tag has
+// no defensible meaning and the prior silent-drop produced a schema in
+// which the field simply disappeared. The rejection rationale mirrors
+// the sibling "inline is incompatible with X" errors: inline has nothing
+// to apply itself to. Covers Go scalar, slice, map, pointer-to-scalar,
+// and anonymous embed of a named non-struct exported type.
+func TestSchemaForInlineRejectsNonStructFieldType(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"string field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo string `avro:",inline"`
+				Bar int32  `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"int32 field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo int32 `avro:",inline"`
+				Bar int32 `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"slice field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo []int32 `avro:",inline"`
+				Bar int32   `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"map field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo map[string]int32 `avro:",inline"`
+				Bar int32            `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"*string field + ,inline", func() (*Schema, error) {
+			type R struct {
+				Foo *string `avro:",inline"`
+				Bar int32   `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"anon embed named-scalar + ,inline", func() (*Schema, error) {
+			type R struct {
+				InlineScalarAlias `avro:",inline"`
+				Bar               int32 `avro:"bar"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+
+	// Positive controls: ,inline on a struct and on a pointer-to-struct
+	// still flattens the embed's fields into the parent.
+	t.Run("struct field + ,inline still flattens", func(t *testing.T) {
+		type Embed struct {
+			A int32 `avro:"a"`
+		}
+		type R struct {
+			Foo Embed `avro:",inline"`
+			Bar int32 `avro:"bar"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := s.String()
+		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"bar"`) {
+			t.Errorf("expected flattened a + bar fields; got %s", got)
+		}
+	})
+	t.Run("*struct field + ,inline still flattens", func(t *testing.T) {
+		type Embed struct {
+			A int32 `avro:"a"`
+		}
+		type R struct {
+			Foo *Embed `avro:",inline"`
+			Bar int32  `avro:"bar"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		got := s.String()
+		if !strings.Contains(got, `"name":"a"`) || !strings.Contains(got, `"name":"bar"`) {
+			t.Errorf("expected flattened a + bar fields; got %s", got)
+		}
+	})
+}
+
+// TestSchemaForTimeTypesRejectNonTimeLogicals locks the rule that
+// time.Time and time.Duration accept only time/date logical-type
+// tags (date, time-millis, time-micros, timestamp-*, local-timestamp-*).
+// Non-time logicals (uuid, decimal) on time types previously produced
+// a schema declaring a wire/logical combination that isn't valid Avro
+// (e.g. {type:long, logicalType:uuid}) and would be soft-dropped at
+// Parse, losing the user's tag. Reject at SchemaFor time.
+func TestSchemaForTimeTypesRejectNonTimeLogicals(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"time.Time + uuid", func() (*Schema, error) {
+			type R struct {
+				T time.Time `avro:"t,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time.Time + decimal", func() (*Schema, error) {
+			type R struct {
+				T time.Time `avro:"t,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time.Duration + uuid", func() (*Schema, error) {
+			type R struct {
+				T time.Duration `avro:"t,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time.Duration + decimal", func() (*Schema, error) {
+			type R struct {
+				T time.Duration `avro:"t,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+
+	// Positive control: time-related logicals still work.
+	t.Run("time.Time + date still accepted", func(t *testing.T) {
+		type R struct {
+			T time.Time `avro:"t,date"`
+		}
+		_, err := SchemaFor[R]()
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+	t.Run("time.Duration + timestamp-millis still accepted", func(t *testing.T) {
+		type R struct {
+			T time.Duration `avro:"t,timestamp-millis"`
+		}
+		_, err := SchemaFor[R]()
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
+// TestSchemaForDecimalRejectsNonBigRat locks the rule that the decimal
+// logical type requires either *big.Rat or big.Rat. Other Go types (int,
+// string, []byte, etc.) carrying the ",decimal(p,s)" tag are rejected at
+// SchemaFor time. Prior behavior silently dropped the decimal tag,
+// producing a schema that didn't reflect the user's intent.
+func TestSchemaForDecimalRejectsNonBigRat(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"int32", func() (*Schema, error) {
+			type R struct {
+				X int32 `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"int64", func() (*Schema, error) {
+			type R struct {
+				X int64 `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"float64", func() (*Schema, error) {
+			type R struct {
+				X float64 `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"string", func() (*Schema, error) {
+			type R struct {
+				X string `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"[]byte", func() (*Schema, error) {
+			type R struct {
+				X []byte `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"[16]byte", func() (*Schema, error) {
+			type R struct {
+				X [16]byte `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"bool", func() (*Schema, error) {
+			type R struct {
+				X bool `avro:"x,decimal(10,2)"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for decimal on %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+}
+
+// TestSchemaForLogicalOnNumericKind locks the rule that integer-wire
+// logical types (date, time-millis, time-micros, timestamp-*,
+// local-timestamp-*) attached to a plain Go integer field produce a
+// schema carrying the logicalType annotation when the Go field's
+// natural Avro wire type matches the logical's required wire type.
+// Mismatched Go kinds (e.g., date on int64 — date requires int wire
+// but int64 naturally maps to long) are rejected at SchemaFor time
+// rather than silently dropping the user's logical-type tag.
+//
+// Acceptance and rejection both round-trip end-to-end for the
+// accepted shape: encode + decode against the inferred schema.
+func TestSchemaForLogicalOnNumericKind(t *testing.T) {
+	intWireAccepted := []struct {
+		name     string
+		logical  string
+		schemaFn func() (*Schema, error)
+	}{
+		{"date on int32", "date", func() (*Schema, error) {
+			type R struct {
+				D int32 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on int8", "date", func() (*Schema, error) {
+			type R struct {
+				D int8 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time-millis on int16", "time-millis", func() (*Schema, error) {
+			type R struct {
+				T int16 `avro:"t,time-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time-millis on uint16", "time-millis", func() (*Schema, error) {
+			type R struct {
+				T uint16 `avro:"t,time-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range intWireAccepted {
+		t.Run(tc.name+" accepted (int wire)", func(t *testing.T) {
+			s, err := tc.schemaFn()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := s.String()
+			if !strings.Contains(got, `"logicalType":"`+tc.logical+`"`) {
+				t.Errorf("schema missing logicalType:%s; got %s", tc.logical, got)
+			}
+			if !strings.Contains(got, `"type":"int"`) {
+				t.Errorf("schema missing int wire type; got %s", got)
+			}
+		})
+	}
+
+	longWireAccepted := []struct {
+		name     string
+		logical  string
+		schemaFn func() (*Schema, error)
+	}{
+		{"timestamp-millis on int64", "timestamp-millis", func() (*Schema, error) {
+			type R struct {
+				T int64 `avro:"t,timestamp-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-micros on int", "timestamp-micros", func() (*Schema, error) {
+			type R struct {
+				T int `avro:"t,timestamp-micros"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-nanos on uint64", "timestamp-nanos", func() (*Schema, error) {
+			type R struct {
+				T uint64 `avro:"t,timestamp-nanos"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"time-micros on uint32", "time-micros", func() (*Schema, error) {
+			type R struct {
+				T uint32 `avro:"t,time-micros"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"local-timestamp-millis on int64", "local-timestamp-millis", func() (*Schema, error) {
+			type R struct {
+				T int64 `avro:"t,local-timestamp-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range longWireAccepted {
+		t.Run(tc.name+" accepted (long wire)", func(t *testing.T) {
+			s, err := tc.schemaFn()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := s.String()
+			if !strings.Contains(got, `"logicalType":"`+tc.logical+`"`) {
+				t.Errorf("schema missing logicalType:%s; got %s", tc.logical, got)
+			}
+			if !strings.Contains(got, `"type":"long"`) {
+				t.Errorf("schema missing long wire type; got %s", got)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"date on int64 (long-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				D int64 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on int (long-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				D int `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on uint32 (long-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				D uint32 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-millis on int32 (int-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				T int32 `avro:"t,timestamp-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-micros on int16 (int-wired Go type)", func() (*Schema, error) {
+			type R struct {
+				T int16 `avro:"t,timestamp-micros"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on string", func() (*Schema, error) {
+			type R struct {
+				D string `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on float32", func() (*Schema, error) {
+			type R struct {
+				D float32 `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"date on bool", func() (*Schema, error) {
+			type R struct {
+				D bool `avro:"d,date"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"timestamp-millis on float64", func() (*Schema, error) {
+			type R struct {
+				T float64 `avro:"t,timestamp-millis"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name+" rejected", func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+
+	t.Run("date on int32 round-trip", func(t *testing.T) {
+		type R struct {
+			D int32 `avro:"d,date"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		enc, err := s.Encode(&R{D: 19723})
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(enc, &got); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if got.D != 19723 {
+			t.Errorf("got %d, want 19723", got.D)
+		}
+	})
+
+	t.Run("timestamp-millis on int64 round-trip", func(t *testing.T) {
+		type R struct {
+			T int64 `avro:"t,timestamp-millis"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		enc, err := s.Encode(&R{T: 1700000000000})
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(enc, &got); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if got.T != 1700000000000 {
+			t.Errorf("got %d, want 1700000000000", got.T)
+		}
+	})
+}
+
+// TestSchemaForUUIDRejectsUnsupportedKind locks the rule that the uuid
+// logical type requires either Go string, [16]byte, or a type that
+// implements TextMarshaler / TextUnmarshaler / TextAppender. Other Go
+// kinds would produce a schema that declares string (or fixed of a
+// non-16 size) while the Go field is something else — a schema that
+// lies about the field type and causes Encode to fail at runtime far
+// from the SchemaFor call.
+func TestSchemaForUUIDRejectsUnsupportedKind(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() (*Schema, error)
+	}{
+		{"int32", func() (*Schema, error) {
+			type R struct {
+				U int32 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"int64", func() (*Schema, error) {
+			type R struct {
+				U int64 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"uint32", func() (*Schema, error) {
+			type R struct {
+				U uint32 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"float64", func() (*Schema, error) {
+			type R struct {
+				U float64 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"bool", func() (*Schema, error) {
+			type R struct {
+				U bool `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"[]byte (slice)", func() (*Schema, error) {
+			type R struct {
+				U []byte `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"[32]byte (wrong size)", func() (*Schema, error) {
+			type R struct {
+				U [32]byte `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"plain struct (no text marshaler)", func() (*Schema, error) {
+			type Inner struct{ X int32 }
+			type R struct {
+				U Inner `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+		{"map", func() (*Schema, error) {
+			type R struct {
+				U map[string]int32 `avro:"u,uuid"`
+			}
+			return SchemaFor[R]()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if err == nil {
+				t.Errorf("expected error for uuid logical on %s; SchemaFor should reject", tc.name)
+			}
+		})
+	}
+}
+
 func TestSchemaForIgnored(t *testing.T) {
 	type Record struct {
 		Name    string `avro:"name"`
@@ -1769,6 +2993,48 @@ func TestSchemaForErrors(t *testing.T) {
 		}
 	})
 
+	// A decimal(...) tag must contain exactly two integers and nothing
+	// else. Trailing content after the scale (a third argument, junk
+	// characters, an exponent) was silently discarded, producing a
+	// decimal(precision,scale) schema that does not reflect what the user
+	// wrote — inconsistent with decimal()/decimal(9)/decimal(9,)/decimal(bad),
+	// which all error. Each of these must be rejected, not truncated.
+	t.Run("decimal tag rejects trailing content", func(t *testing.T) {
+		t.Run("three args", func(t *testing.T) {
+			type R struct {
+				Price *big.Rat `avro:"price,decimal(9,2,3)"`
+			}
+			if _, err := SchemaFor[R](); err == nil {
+				t.Fatal("expected error for decimal(9,2,3)")
+			}
+		})
+		t.Run("trailing junk", func(t *testing.T) {
+			type R struct {
+				Price *big.Rat `avro:"price,decimal(9,2x)"`
+			}
+			if _, err := SchemaFor[R](); err == nil {
+				t.Fatal("expected error for decimal(9,2x)")
+			}
+		})
+		t.Run("exponent scale", func(t *testing.T) {
+			type R struct {
+				Price *big.Rat `avro:"price,decimal(9,2e1)"`
+			}
+			if _, err := SchemaFor[R](); err == nil {
+				t.Fatal("expected error for decimal(9,2e1)")
+			}
+		})
+		// Boundary: the well-formed two-integer form must still parse.
+		t.Run("well formed still accepted", func(t *testing.T) {
+			type R struct {
+				Price *big.Rat `avro:"price,decimal(9,2)"`
+			}
+			if _, err := SchemaFor[R](); err != nil {
+				t.Fatalf("decimal(9,2) should parse: %v", err)
+			}
+		})
+	})
+
 	t.Run("unknown tag option", func(t *testing.T) {
 		type R struct {
 			X int32 `avro:"x,bogus"`
@@ -1822,7 +3088,6 @@ func TestSchemaForErrors(t *testing.T) {
 			t.Fatal("expected error")
 		}
 	})
-
 
 	t.Run("embedded bad tag", func(t *testing.T) {
 		type R struct {
@@ -2004,5 +3269,919 @@ func TestSchemaForCustomTypeNoAvroType(t *testing.T) {
 	_, err := SchemaFor[Rec](ct)
 	if err == nil {
 		t.Fatal("expected error for CustomType without AvroType or Schema")
+	}
+}
+
+// TestRegression_SchemaForShadowedEmbedShallowestWins pins the
+// shadowed-embed precedence rule: doc.go:147-149 documents "the
+// shallowest wins" for same-name fields, and reflect.go's
+// typeFieldMapping (line 322-323) implements it at runtime. Without
+// this, schema_for.go's collectFields dedup (line 313-321) would only
+// special-case tagged-beats-untagged and keep first-seen for
+// same-tagged-status — the deeper embedded field, because
+// collectFields appends nested-struct fields BEFORE outer fields.
+//
+// Observable consequence without the rule: encode of a legal outer.X
+// int64 value against the inferred schema fails with "overflows int32"
+// because the schema declares the embedded int32 type while the
+// runtime encoder uses the outer int64 value.
+func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
+	t.Run("both_tagged_outer_wins", func(t *testing.T) {
+		type Inner struct {
+			X int32 `avro:"x"`
+		}
+		type Outer struct {
+			Inner
+			X int64 `avro:"x"`
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		js := s.String()
+		if !strings.Contains(js, `"type":"long"`) {
+			t.Fatalf("expected outer field's int64→long; got: %s", js)
+		}
+
+		// Runtime encode of int64-fitting value should succeed.
+		o := Outer{}
+		o.X = 1 << 33 // beyond int32 range, fits int64
+		if _, err := s.Encode(&o); err != nil {
+			t.Fatalf("expected encode accept (schema is long, value fits int64); got: %v", err)
+		}
+	})
+
+	t.Run("both_untagged_outer_wins", func(t *testing.T) {
+		type Inner struct {
+			X int32
+		}
+		type Outer struct {
+			Inner
+			X int64
+		}
+		s, err := SchemaFor[Outer]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		js := s.String()
+		if !strings.Contains(js, `"type":"long"`) {
+			t.Fatalf("expected outer field's int64→long for untagged shadowed embed; got: %s", js)
+		}
+	})
+}
+
+// TestRegression_SchemaForSameDepthTaggedBeatsUntagged pins that SchemaFor
+// resolves a same-depth tagged-vs-untagged Avro-name collision via the tag
+// tiebreaker, matching the documented contract (doc.go: "among fields at the
+// same depth, a tagged field wins over an untagged one") and the runtime
+// field mapping (reflect.go's typeFieldMapping). Only a same-depth collision
+// with the SAME tagged status is the ambiguous case that errors; a
+// tagged/untagged pair at the same depth has a clear winner. Without the
+// tiebreaker ordering, collectFields raised "duplicate field name" before
+// the tag tiebreaker could fire, so SchemaFor rejected a type that
+// Encode/Decode handle.
+func TestRegression_SchemaForSameDepthTaggedBeatsUntagged(t *testing.T) {
+	type Collide struct {
+		Renamed int32 `avro:"Shared"` // tagged → Avro name "Shared"
+		Shared  int32 // untagged → Go field name is also "Shared"; the tagged field wins
+	}
+	s, err := SchemaFor[Collide]()
+	if err != nil {
+		t.Fatalf("SchemaFor rejected a same-depth tagged/untagged collision the runtime resolves: %v", err)
+	}
+	// The winning field is the tagged int32 (named "Shared").
+	if c := strings.Count(s.String(), `"name":"Shared"`); c != 1 {
+		t.Fatalf("want exactly one field named %q; got %d in %s", "Shared", c, s.String())
+	}
+
+	// The runtime must select the same (tagged) field — encode a value that
+	// only fits if "shared" maps to the int32-typed Renamed field, then
+	// confirm it round-trips into Renamed.
+	in := Collide{Renamed: 7, Shared: 99}
+	b, err := s.Encode(&in)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	var got Collide
+	if _, err := s.Decode(b, &got); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got.Renamed != 7 {
+		t.Fatalf("tagged field should own the Avro name: got Renamed=%d want 7", got.Renamed)
+	}
+
+	// Boundary: a same-depth collision with the SAME tagged status stays an
+	// ambiguous error (this is the case the tiebreaker does NOT resolve).
+	type Ambiguous struct {
+		A int32 `avro:"dup"`
+		B int32 `avro:"dup"`
+	}
+	if _, err := SchemaFor[Ambiguous](); err == nil {
+		t.Fatalf("same-depth same-tagged-status collision must remain an ambiguous error")
+	}
+}
+
+// A single Go [N]byte type can be referenced both ,uuid-tagged (Avro
+// fixed(16) + uuid logical, named "uuid") and plain (Avro fixed named after
+// the Go type). Those are distinct Avro types, so SchemaFor must emit a
+// definition for each form rather than a name reference under the other
+// form's name (which would dangle and fail Parse). Both field orders are
+// exercised because the definition/reference bookkeeping is order-sensitive.
+func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
+	type ID [16]byte
+
+	t.Run("uuid then plain round-trips", func(t *testing.T) {
+		type R struct {
+			A ID `avro:"a,uuid"`
+			B ID `avro:"b"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		// Two distinct fixed(16) definitions, not one definition + a
+		// dangling reference.
+		if c := strings.Count(s.String(), `"size":16`); c != 2 {
+			t.Fatalf("want 2 fixed(16) definitions, got %d in %s", c, s.String())
+		}
+		in := R{A: ID{1, 2, 3}, B: ID{4, 5, 6}}
+		data, err := s.Encode(&in)
+		if err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		var got R
+		if _, err := s.Decode(data, &got); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		if got != in {
+			t.Fatalf("round trip: got %+v want %+v", got, in)
+		}
+	})
+
+	t.Run("plain then uuid", func(t *testing.T) {
+		type R struct {
+			B ID `avro:"b"`
+			A ID `avro:"a,uuid"`
+		}
+		if _, err := SchemaFor[R](); err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+	})
+
+	// Boundary: the same type used the SAME way twice still collapses to
+	// one definition plus a name reference (no duplicate-name error).
+	t.Run("both uuid dedups to one definition", func(t *testing.T) {
+		type R struct {
+			A ID `avro:"a,uuid"`
+			B ID `avro:"b,uuid"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if c := strings.Count(s.String(), `"size":16`); c != 1 {
+			t.Fatalf("want 1 fixed(16) definition (rest references), got %d in %s", c, s.String())
+		}
+	})
+}
+
+// A [16]byte Go type whose name is exactly the uuid logical name ("uuid")
+// yields the SAME Avro fixed name ("uuid") for both its ,uuid-logical form and
+// its plain form, so using it both ways would emit two distinct Avro types
+// under one name — which Avro can't represent. SchemaFor rejects it rather than
+// silently merging (dropping the ,uuid logical, or adding it to a plain field).
+// Sibling of TestRegression_SchemaForMixedUUIDAndPlainSameType, which uses a
+// distinct name (ID) where the two forms coexist; the distinct-name pin
+// structurally cannot reach this name coincidence.
+func TestRegression_SchemaForUUIDNamedTypeMemoCollision(t *testing.T) {
+	type uuid [16]byte // Name() == "uuid", colliding with the hard-coded logical name
+
+	t.Run("uuid then plain rejected", func(t *testing.T) {
+		type R struct {
+			A uuid `avro:"a,uuid"`
+			B uuid `avro:"b"`
+		}
+		_, err := SchemaFor[R]()
+		if err == nil {
+			t.Fatal("want error: type uuid used as both a uuid-logical and a plain fixed")
+		}
+		if !strings.Contains(err.Error(), "uuid") {
+			t.Fatalf("error should name the conflict: %v", err)
+		}
+		// Lock that SchemaFor's dedup produced this, not Parse's fallback
+		// duplicate-name error — both name the type, so without this the pin
+		// passes even with dedupNamedTypes' conflict error reverted.
+		if !strings.Contains(err.Error(), "two different") {
+			t.Fatalf("conflict should be caught by SchemaFor's dedup, not the Parse fallback: %v", err)
+		}
+	})
+
+	t.Run("plain then uuid rejected", func(t *testing.T) {
+		type R struct {
+			A uuid `avro:"a"`
+			B uuid `avro:"b,uuid"`
+		}
+		_, err := SchemaFor[R]()
+		if err == nil {
+			t.Fatal("want error (plain first)")
+		}
+		if !strings.Contains(err.Error(), "two different") {
+			t.Fatalf("conflict should be caught by SchemaFor's dedup, not the Parse fallback: %v", err)
+		}
+	})
+
+	// No regression: a uuid-named type used CONSISTENTLY (all plain, or all
+	// ,uuid) has no name conflict and must still succeed.
+	t.Run("plain only ok", func(t *testing.T) {
+		type R struct {
+			A uuid `avro:"a"`
+			B uuid `avro:"b"`
+		}
+		if _, err := SchemaFor[R](); err != nil {
+			t.Fatalf("plain-only uuid-named type should succeed: %v", err)
+		}
+	})
+
+	t.Run("uuid only ok", func(t *testing.T) {
+		type R struct {
+			A uuid `avro:"a,uuid"`
+			B uuid `avro:"b,uuid"`
+		}
+		if _, err := SchemaFor[R](); err != nil {
+			t.Fatalf("uuid-only should succeed: %v", err)
+		}
+	})
+}
+
+// The "one Avro name -> one definition" invariant is enforced GENERALLY by
+// dedupNamedTypes, not just for uuid: two DIFFERENT Go types that map to the
+// same fixed/record/enum name with different content are rejected. Here an
+// anonymous [8]byte (auto-named "fixed_8") collides with a type literally named
+// fixed_8 of a different size. This is the same check that will guard
+// avro.Duration ("duration") against a plain [12]byte named "duration".
+func TestRegression_SchemaForNamedTypeNameCollision(t *testing.T) {
+	type fixed_8 [4]byte // the auto-name of an anonymous [8]byte is "fixed_8"
+	type R struct {
+		A [8]byte `avro:"a"` // -> fixed named "fixed_8", size 8
+		B fixed_8 `avro:"b"` // -> fixed named "fixed_8", size 4  (conflict)
+	}
+	_, err := SchemaFor[R]()
+	if err == nil {
+		t.Fatal("want error: two different fixeds both named \"fixed_8\"")
+	}
+	if !strings.Contains(err.Error(), "fixed_8") {
+		t.Fatalf("error should name the colliding type: %v", err)
+	}
+	// Lock that this is SchemaFor's dedup error (actionable: "rename a Go type"),
+	// not Parse's cryptic "duplicate named type" fallback — both contain the
+	// name, so without this the pin passes even if dedupNamedTypes is reverted.
+	if !strings.Contains(err.Error(), "two different") {
+		t.Fatalf("conflict should be caught by SchemaFor's dedup, not the Parse fallback: %v", err)
+	}
+}
+
+// The avro.Duration realization of the collision class the comment above
+// anticipates: avro.Duration infers a fixed named "duration" WITH
+// logicalType:"duration", and a plain `type duration [12]byte` field infers a
+// DIFFERENT fixed (size 12, no logicalType) also named "duration". Two
+// definitions claiming one Avro name is rejected by the same general
+// dedupNamedTypes check — not by any duration-specific code. The "two different"
+// assertion proves SchemaFor's dedup fired and not Parse's weaker
+// duplicate-name fallback: both messages contain "duration", so a bare
+// err != nil + name check would pass even with dedupNamedTypes' conflict arm
+// reverted (the exact hollow-pin failure mode a prior round shipped). Neuter-
+// confirm by reverting that arm: this pin must redden.
+func TestRegression_SchemaForAvroDurationCollision(t *testing.T) {
+	type duration [12]byte // plain fixed named "duration", NO logicalType
+	type R struct {
+		A Duration `avro:"a"` // avro.Duration -> fixed "duration" + logicalType:"duration"
+		B duration `avro:"b"` // plain [12]byte -> fixed "duration", no logicalType (conflict)
+	}
+	_, err := SchemaFor[R]()
+	if err == nil {
+		t.Fatal("want error: avro.Duration and a plain [12]byte both produce a fixed named \"duration\"")
+	}
+	if !strings.Contains(err.Error(), "duration") {
+		t.Fatalf("error should name the colliding type: %v", err)
+	}
+	if !strings.Contains(err.Error(), "two different") {
+		t.Fatalf("conflict should be caught by SchemaFor's dedup, not the Parse fallback: %v", err)
+	}
+}
+
+// default= takes the remainder of the tag verbatim, so a string default
+// whose value contains unbalanced parens/brackets — or commas, or JSON
+// object braces — must be preserved rather than rejected by the tag
+// bracket-balance scan (which exists only for the alias=[...] / decimal(...)
+// option forms).
+func TestRegression_SchemaForDefaultWithBrackets(t *testing.T) {
+	t.Run("unbalanced open paren", func(t *testing.T) {
+		type R struct {
+			X string `avro:"x,default=note (a"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if !strings.Contains(s.String(), "note (a") {
+			t.Fatalf("default not preserved: %s", s.String())
+		}
+	})
+
+	t.Run("unbalanced close bracket", func(t *testing.T) {
+		type R struct {
+			X string `avro:"x,default=a]b"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if !strings.Contains(s.String(), "a]b") {
+			t.Fatalf("default not preserved: %s", s.String())
+		}
+	})
+
+	t.Run("commas in value", func(t *testing.T) {
+		type R struct {
+			X string `avro:"x,default=a,b,c"`
+		}
+		s, err := SchemaFor[R]()
+		if err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+		if !strings.Contains(s.String(), "a,b,c") {
+			t.Fatalf("default not preserved: %s", s.String())
+		}
+	})
+
+	// Regression guard: a JSON-object default (internal commas + braces)
+	// still survives — default= rejoins everything after it.
+	t.Run("json object default", func(t *testing.T) {
+		type R struct {
+			M map[string]int32 `avro:"m,default={\"a\":1,\"b\":2}"`
+		}
+		if _, err := SchemaFor[R](); err != nil {
+			t.Fatalf("SchemaFor: %v", err)
+		}
+	})
+
+	// Boundary: a malformed bracketed NON-default option still errors — the
+	// scan is only suppressed once a segment begins with default=.
+	t.Run("non-default unbalanced bracket still errors", func(t *testing.T) {
+		type R struct {
+			X string `avro:"x,alias=[a,b"`
+		}
+		if _, err := SchemaFor[R](); err == nil {
+			t.Fatal("expected error for unbalanced bracket in alias= option")
+		}
+	})
+}
+
+// A narrow Go integer kind maps to a wider Avro type (int8/16, uint8/16 ->
+// int; uint32, uint -> long), so a default that fits the Avro type but not
+// the Go field would build a schema whose own default overflows the field
+// at decode-fill time. SchemaFor rejects it at build time, consistent with
+// its other Go-type/tag compatibility checks. The default is parsed with
+// the same lenient parser the wire path uses, so exponent / whole-number-
+// float forms are caught too.
+func TestRegression_SchemaForNarrowIntDefaultBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fn     func() (*Schema, error)
+		reject bool
+	}{
+		{"int8 in range", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=5"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"int8 at max", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=127"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"int8 over max", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=128"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"int8 at min", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=-128"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"int8 under min", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=-129"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"int8 far over (valid Avro int)", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=99999"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"int8 exponent form over", func() (*Schema, error) {
+			type R struct {
+				X int8 `avro:"x,default=1e3"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"uint8 at max", func() (*Schema, error) {
+			type R struct {
+				X uint8 `avro:"x,default=255"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"uint8 over max", func() (*Schema, error) {
+			type R struct {
+				X uint8 `avro:"x,default=256"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"uint8 negative", func() (*Schema, error) {
+			type R struct {
+				X uint8 `avro:"x,default=-1"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"uint32 over max (valid Avro long)", func() (*Schema, error) {
+			type R struct {
+				X uint32 `avro:"x,default=4294967296"`
+			}
+			return SchemaFor[R]()
+		}, true},
+		{"int32 full range ok (no narrowing)", func() (*Schema, error) {
+			type R struct {
+				X int32 `avro:"x,default=2147483647"`
+			}
+			return SchemaFor[R]()
+		}, false},
+		{"pointer narrow int over", func() (*Schema, error) {
+			type R struct {
+				X *int8 `avro:"x,default=200"`
+			}
+			return SchemaFor[R]()
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.fn()
+			if tc.reject && err == nil {
+				t.Fatal("expected SchemaFor to reject out-of-range default")
+			}
+			if !tc.reject && err != nil {
+				t.Fatalf("expected SchemaFor to accept in-range default, got: %v", err)
+			}
+		})
+	}
+}
+
+// A default= tag whose value is a valid JSON prefix followed by trailing
+// content must be preserved VERBATIM (the documented intent for non-JSON
+// defaults), not silently truncated to the JSON prefix. json.Decoder.Decode
+// stops at the end of the first value and ignores the rest, so "42 oops"
+// formerly became the number 42 with "oops" silently dropped.
+func TestRegression_SchemaForDefaultTrailingContentVerbatim(t *testing.T) {
+	type R struct {
+		X string `avro:"x,default=42 oops"`
+	}
+	s, err := SchemaFor[R]()
+	if err != nil {
+		t.Fatalf("SchemaFor: %v", err)
+	}
+	if !strings.Contains(s.String(), "oops") {
+		t.Errorf("trailing content silently truncated; want verbatim \"42 oops\": %s", s.String())
+	}
+
+	// A clean JSON default (no trailing content) still parses as JSON.
+	type Q struct {
+		N int64 `avro:"n,default=42"`
+	}
+	sq, err := SchemaFor[Q]()
+	if err != nil {
+		t.Fatalf("SchemaFor Q: %v", err)
+	}
+	if !strings.Contains(sq.String(), `"default":42`) {
+		t.Errorf("clean JSON default should stay numeric 42: %s", sq.String())
+	}
+}
+
+// TestSchemaForRejectsJSONNumber locks the rule that json.Number cannot be a
+// SchemaFor field type. json.Number's Kind() is reflect.String and it
+// implements no text interface, so the Kind switch's String arm would emit
+// an Avro "string" schema — but the package's documented json.Number policy
+// is numeric-only: string/bytes/fixed/enum reject json.Number on both encode
+// and decode. SchemaFor is the package's one builder; emitting the single
+// Avro type its own codec is guaranteed to reject for that Go type is a
+// build-accepts / encode-rejects deferred failure, exactly the shape the
+// uuid/decimal/time SchemaFor strictness eliminated. So SchemaFor rejects
+// json.Number up front, naming the alternatives.
+func TestSchemaForRejectsJSONNumber(t *testing.T) {
+	type Event struct {
+		Seq json.Number `avro:"seq"`
+	}
+	if _, err := SchemaFor[Event](); err == nil {
+		t.Fatal("SchemaFor[json.Number field] must reject at build time, not defer to Encode")
+	}
+
+	// Siblings: every shape that carries json.Number through inferType's
+	// recursion must reject for the same root reason.
+	type SliceR struct {
+		V []json.Number `avro:"v"`
+	}
+	type MapValR struct {
+		V map[string]json.Number `avro:"v"`
+	}
+	type PtrR struct {
+		V *json.Number `avro:"v"`
+	}
+	for name, build := range map[string]func() (*Schema, error){
+		"slice":     func() (*Schema, error) { return SchemaFor[SliceR]() },
+		"map-value": func() (*Schema, error) { return SchemaFor[MapValR]() },
+		"pointer":   func() (*Schema, error) { return SchemaFor[PtrR]() },
+		"top-level": func() (*Schema, error) { return SchemaFor[json.Number]() },
+	} {
+		if _, err := build(); err == nil {
+			t.Errorf("%s: SchemaFor with a json.Number must reject at build time", name)
+		}
+	}
+
+	// map[json.Number]V as a KEY is the documented exception: Avro map keys
+	// are strings whose json.Number form round-trips, so the key path must
+	// stay accepted. The fix must not touch it.
+	type KeyR struct {
+		V map[json.Number]int32 `avro:"v"`
+	}
+	ks, err := SchemaFor[KeyR]()
+	if err != nil {
+		t.Fatalf("map[json.Number]V key must remain accepted (documented exception): %v", err)
+	}
+	if _, err := ks.Encode(&KeyR{V: map[json.Number]int32{"7": 1}}); err != nil {
+		t.Errorf("map[json.Number]int32 must round-trip on encode: %v", err)
+	}
+
+	// A NAMED alias (type N json.Number) is a distinct reflect.Type that the
+	// codec treats as a plain string, so it must stay a plain "string"
+	// schema and round-trip — the reject is exact-type only.
+	type NamedNum json.Number
+	type NamedR struct {
+		V NamedNum `avro:"v"`
+	}
+	ns, err := SchemaFor[NamedR]()
+	if err != nil {
+		t.Fatalf("named json.Number alias must stay a plain string schema: %v", err)
+	}
+	if _, err := ns.Encode(&NamedR{V: "hello"}); err != nil {
+		t.Errorf("named-alias string field must round-trip: %v", err)
+	}
+}
+
+// schemaForFieldType mirrors SchemaFor's internal pipeline for a struct
+// type built at runtime via reflect.StructOf, so the parity sweep below can
+// enumerate field types the compile-time-generic SchemaFor[T] cannot reach
+// at runtime. It is faithful to SchemaFor's body (inferRecord →
+// dedupNamedTypes → Marshal → Parse) except it supplies an explicit record
+// name (a StructOf struct is anonymous).
+func schemaForFieldType(ft reflect.Type) (*Schema, error) {
+	st := reflect.StructOf([]reflect.StructField{
+		{Name: "F", Type: ft, Tag: `avro:"f"`},
+	})
+	seen := make(map[reflect.Type]seenForm)
+	s, err := inferRecord(st, "R", "", seen, nil, make(appliedTypeAliases))
+	if err != nil {
+		return nil, err
+	}
+	s, err = dedupNamedTypes(s, make(map[string]string), "")
+	if err != nil {
+		return nil, err
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	return Parse(string(b))
+}
+
+// sampleValue builds a NON-EMPTY value of t so the encode-parity sweep
+// actually materializes leaf types buried in pointers/slices/maps (a nil
+// pointer or empty slice never encodes its element type, which would hide a
+// build-accepts/encode-rejects bug on that element — e.g. *json.Number).
+func sampleValue(t reflect.Type) reflect.Value { return sampleValuePath(t, nil) }
+
+// sampleValuePath is sampleValue with a cycle guard so a recursive Go type
+// (a linked-list `Next *Node`, a `type S []S`, a `map[string]M`) terminates
+// instead of recursing forever: a type already on the construction path
+// yields the zero value at that point (a nil pointer / empty slice / empty
+// map / zero-filled array or struct), all of which are valid round-trip
+// values. For a NON-recursive type no type ever reaches itself, so the guard
+// never fires and the produced value is identical to the original
+// sampleValue — the existing TestSchemaForEncodeParity sweep is unchanged.
+// The cycle safety lets the round-trip-consistency net carry recursive-struct
+// leaves through the same shared sampler.
+func sampleValuePath(t reflect.Type, onPath map[reflect.Type]bool) reflect.Value {
+	if t == timeType {
+		// A representative IN-RANGE, whole-second, UTC time. The zero time.Time
+		// is year 1, which overflows int64-nanoseconds-since-epoch (~1678..2262
+		// AD): a timestamp-nanos schema — valid for in-range times, which
+		// SchemaFor rightly builds for the explicit tag — would then reject the
+		// zero value at Encode, masking a correct schema as a build-accepts/
+		// encode-rejects. A whole-second 2020 time is representable by every
+		// time/date logical (millis/micros/nanos, date, time-of-day) without
+		// overflow or sub-unit truncation. No monotonic reading, UTC location,
+		// so it round-trips identically.
+		return reflect.ValueOf(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC))
+	}
+	if t == avroDurationType {
+		// A representative NON-ZERO duration so the parity net exercises the
+		// 12-byte fixed payload rather than an all-zero wire. (Without this the
+		// Struct case below would zero each uint32 field — a valid round-trip
+		// but one that never moves a non-zero byte through the duration codec.)
+		return reflect.ValueOf(Duration{Months: 3, Days: 4, Milliseconds: 5})
+	}
+	switch t.Kind() {
+	case reflect.Pointer:
+		if onPath[t.Elem()] {
+			return reflect.Zero(t) // nil pointer breaks a *Node→Node→*Node cycle
+		}
+		p := reflect.New(t.Elem())
+		p.Elem().Set(sampleValuePath(t.Elem(), withSamplePath(onPath, t.Elem())))
+		return p
+	case reflect.Slice:
+		if onPath[t.Elem()] {
+			return reflect.MakeSlice(t, 0, 0) // empty slice breaks a []S→S cycle
+		}
+		sl := reflect.MakeSlice(t, 1, 1)
+		sl.Index(0).Set(sampleValuePath(t.Elem(), withSamplePath(onPath, t.Elem())))
+		return sl
+	case reflect.Array:
+		a := reflect.New(t).Elem()
+		if onPath[t.Elem()] {
+			return a // zero-filled array breaks an [N]A→A cycle
+		}
+		next := withSamplePath(onPath, t.Elem())
+		for i := 0; i < t.Len(); i++ {
+			a.Index(i).Set(sampleValuePath(t.Elem(), next))
+		}
+		return a
+	case reflect.Map:
+		m := reflect.MakeMap(t)
+		if onPath[t.Elem()] || onPath[t.Key()] {
+			return m // empty map breaks a map[K]M→M cycle
+		}
+		m.SetMapIndex(sampleValuePath(t.Key(), withSamplePath(onPath, t.Key())),
+			sampleValuePath(t.Elem(), withSamplePath(onPath, t.Elem())))
+		return m
+	case reflect.Struct:
+		v := reflect.New(t).Elem()
+		if onPath[t] {
+			return v // zero struct breaks a by-value struct cycle
+		}
+		next := withSamplePath(onPath, t)
+		for i := 0; i < t.NumField(); i++ {
+			if t.Field(i).IsExported() {
+				v.Field(i).Set(sampleValuePath(t.Field(i).Type, next))
+			}
+		}
+		return v
+	case reflect.String:
+		// "1" is a valid json.Number AND a valid string/map-key, so it works
+		// for every String-kind type the sweep carries.
+		return reflect.ValueOf("1").Convert(t)
+	default:
+		return reflect.New(t).Elem() // zero is representative for scalars/time
+	}
+}
+
+// withSamplePath returns a copy of onPath with t added (copy-on-descend so
+// sibling fields do not see each other's path — only a type reaching ITSELF
+// is cut).
+func withSamplePath(onPath map[reflect.Type]bool, t reflect.Type) map[reflect.Type]bool {
+	next := make(map[reflect.Type]bool, len(onPath)+1)
+	for k := range onPath {
+		next[k] = true
+	}
+	next[t] = true
+	return next
+}
+
+// TestSchemaForEncodeParity is the generative net for the build-accepts /
+// encode-rejects bug class (the shape of the json.Number SchemaFor bug):
+// SchemaFor is the package's one Go-type → schema builder, and it has no
+// wire-format counterpart, so the encode/decode-parity and oracle lenses
+// never reach it. The invariant that DOES reach it: if SchemaFor ACCEPTS a
+// field type, Encode of a value of that type MUST also accept — otherwise
+// the schema builds but every Encode fails far from the SchemaFor call.
+//
+// The sweep crosses every codec-special-cased / Kind-misleading Go type
+// (the high-risk surface — stdlib types whose reflect.Kind does not match
+// the Avro type the codec wants) plus named aliases, pointers, slices,
+// maps, and nesting. For each accepted type it encodes the zero value and
+// confirms the wire is readable; a reject is always safe (build-time
+// strictness cannot defer a failure to Encode). New field types are one
+// table line and inherit the invariant automatically.
+func TestSchemaForEncodeParity(t *testing.T) {
+	type namedString string
+	type namedInt int64
+	type namedNumber json.Number // distinct reflect.Type → plain string
+	type inner struct {
+		A int32 `avro:"a"`
+	}
+
+	types := []reflect.Type{
+		// primitives across every Kind the inference switch handles
+		reflect.TypeFor[bool](), reflect.TypeFor[int](), reflect.TypeFor[int8](),
+		reflect.TypeFor[int16](), reflect.TypeFor[int32](), reflect.TypeFor[int64](),
+		reflect.TypeFor[uint8](), reflect.TypeFor[uint16](), reflect.TypeFor[uint32](),
+		reflect.TypeFor[uint64](), reflect.TypeFor[uint](),
+		reflect.TypeFor[float32](), reflect.TypeFor[float64](), reflect.TypeFor[string](),
+		// byte containers
+		reflect.TypeFor[[]byte](), reflect.TypeFor[[4]byte](), reflect.TypeFor[[16]byte](),
+		// codec-special-cased stdlib types (Kind misleads)
+		reflect.TypeFor[json.Number](),   // Kind String, codec rejects → SchemaFor must reject
+		reflect.TypeFor[time.Time](),     // Kind Struct → logical long
+		reflect.TypeFor[time.Duration](), // Kind Int64 → logical
+		reflect.TypeFor[Duration](),      // Kind Struct → duration fixed(12), NOT a record
+		reflect.TypeFor[*Duration](),     // nullable duration fixed
+		reflect.TypeFor[[]Duration](),    // array of duration fixed
+		reflect.TypeFor[map[string]Duration](), // map of duration fixed
+		reflect.TypeFor[big.Rat](),             // requires decimal tag → reject untagged
+		reflect.TypeFor[*big.Rat](),            // requires decimal tag → reject untagged
+		// named aliases — distinct reflect.Type, must follow Kind honestly
+		reflect.TypeFor[namedString](), reflect.TypeFor[namedInt](), reflect.TypeFor[namedNumber](),
+		// pointers (nullable)
+		reflect.TypeFor[*int](), reflect.TypeFor[*string](), reflect.TypeFor[*time.Time](),
+		reflect.TypeFor[*json.Number](), // carries json.Number → reject
+		// slices / maps / nesting
+		reflect.TypeFor[[]int](), reflect.TypeFor[[]string](), reflect.TypeFor[[]time.Time](),
+		reflect.TypeFor[[]json.Number](),          // carries json.Number → reject
+		reflect.TypeFor[map[string]int](),         // value int
+		reflect.TypeFor[map[string]json.Number](), // value json.Number → reject
+		reflect.TypeFor[map[json.Number]int32](),  // KEY json.Number → documented exception, accept
+		reflect.TypeFor[inner](),                  // nested struct
+		reflect.TypeFor[[]inner](), reflect.TypeFor[map[string]inner](),
+	}
+
+	for _, ft := range types {
+		t.Run(ft.String(), func(t *testing.T) {
+			s, err := schemaForFieldType(ft)
+			if err != nil {
+				// Reject is always safe: a build-time error cannot become a
+				// deferred Encode failure. (The targeted reject-set is
+				// locked separately in TestSchemaForRejectsJSONNumber.)
+				return
+			}
+			// SchemaFor ACCEPTED → the parity invariant: a value of this
+			// type must Encode. The zero value is a representative input;
+			// for json.Number the zero value (json.Number("")) is exactly
+			// what the codec rejects, so the bug shape is caught here.
+			st := reflect.StructOf([]reflect.StructField{
+				{Name: "F", Type: ft, Tag: `avro:"f"`},
+			})
+			// A NON-EMPTY sample: pointers allocated, slices/maps with one
+			// element — so a json.Number buried in a *T / []T / map[K]T
+			// actually reaches the encoder. The zero value would leave those
+			// nil/empty and never exercise the leaf type (the exact gap a
+			// first version of this test had, revealed by neutering the fix:
+			// only top-level json.Number was caught).
+			sv := reflect.New(st).Elem()
+			sv.Field(0).Set(sampleValue(ft))
+			wire, encErr := s.Encode(sv.Interface())
+			if encErr != nil {
+				t.Fatalf("SchemaFor ACCEPTED field type %s but Encode of a value REJECTS it (build-accepts/encode-rejects deferred failure):\n schema: %s\n err: %v",
+					ft, s, encErr)
+			}
+			// The wire SchemaFor's own schema produced must be decodable by
+			// that same schema (no panic, consumes fully) — a sanity that
+			// the emitted schema is internally consistent end to end.
+			var sink any
+			if _, decErr := s.Decode(wire, &sink); decErr != nil {
+				t.Fatalf("SchemaFor schema for %s encoded but cannot decode its own wire: %v", ft, decErr)
+			}
+		})
+	}
+}
+
+// Recursive non-struct Go types have a cyclic type graph (sfRecursiveSlice's
+// element is itself, etc.). inferType's pointer/slice/map arms recurse on the
+// element type, so without a depth bound SchemaFor recurses until the
+// goroutine stack overflows and the whole process dies. The bound makes it
+// return a clean error instead. A recursive STRUCT is unaffected — inferRecord
+// registers the type name before recursing, so a self-reference becomes a name
+// reference (pinned by TestSchemaForRecursiveStructStillBuilds below).
+//
+// Non-vacuity: reverting the inferType depth bound makes each of these
+// stack-overflow at SchemaFor time, which kills the test binary rather than
+// failing one case — so these pins assert the post-fix clean error directly.
+type sfRecursiveSlice []sfRecursiveSlice
+type sfRecursivePtr *sfRecursivePtr
+type sfRecursiveMap map[string]sfRecursiveMap
+
+func TestRegression_SchemaForRecursiveNonStructTypeErrors(t *testing.T) {
+	wantErr := func(t *testing.T, _ *Schema, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("expected a recursion error, got nil")
+		}
+		// slice/map recurse to the maxDepth ceiling ("nests too deeply or is
+		// recursive"); a cyclic pointer type (type P *P) is an unbounded
+		// consecutive-pointer chain, caught earlier at the codec's unwrap cap
+		// ("pointer chain nests deeper than the codec supports"). Either names
+		// the recursion/depth cause.
+		if !strings.Contains(err.Error(), "recursive") &&
+			!strings.Contains(err.Error(), "nests too deeply") &&
+			!strings.Contains(err.Error(), "nests deeper") {
+			t.Fatalf("error should name the recursion/depth cause, got: %v", err)
+		}
+	}
+	t.Run("slice", func(t *testing.T) {
+		type R struct {
+			F sfRecursiveSlice `avro:"f"`
+		}
+		s, err := SchemaFor[R]()
+		wantErr(t, s, err)
+	})
+	t.Run("pointer", func(t *testing.T) {
+		type R struct {
+			F sfRecursivePtr `avro:"f"`
+		}
+		s, err := SchemaFor[R]()
+		wantErr(t, s, err)
+	})
+	t.Run("map", func(t *testing.T) {
+		type R struct {
+			F sfRecursiveMap `avro:"f"`
+		}
+		s, err := SchemaFor[R]()
+		wantErr(t, s, err)
+	})
+}
+
+// The depth bound must not false-reject ordinary nested non-struct containers
+// (a handful of pointer/slice/map levels, far under the cap). This is the
+// "still accepted" side of the boundary.
+func TestSchemaForNestedNonStructContainersStillBuild(t *testing.T) {
+	type R struct {
+		A [][]int32                    `avro:"a"`
+		B map[string][]*int64          `avro:"b"`
+		C map[string]map[string]string `avro:"c"`
+	}
+	if _, err := SchemaFor[R](); err != nil {
+		t.Fatalf("ordinary nested containers must build, got: %v", err)
+	}
+}
+
+// Control: a self-referential STRUCT (linked list) still builds and
+// round-trips — the depth bound must not break legitimate recursive structs,
+// which terminate via inferRecord's seen[t] name registration.
+func TestSchemaForRecursiveStructStillBuilds(t *testing.T) {
+	type LinkedNode struct {
+		Val  int32       `avro:"val"`
+		Next *LinkedNode `avro:"next"`
+	}
+	s, err := SchemaFor[LinkedNode]()
+	if err != nil {
+		t.Fatalf("recursive struct must build: %v", err)
+	}
+	in := &LinkedNode{Val: 1, Next: &LinkedNode{Val: 2}}
+	b, err := s.Encode(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var got LinkedNode
+	if _, err := s.Decode(b, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Val != 1 || got.Next == nil || got.Next.Val != 2 {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+}
+
+// checkIntDefaultFitsGoKind peels pointer levels off a field's Go type to
+// range-check an integer default. When a CustomType matches the field,
+// inferType returns before its own (bounded) recursion, so a recursive
+// pointer field carrying a default reaches this peel — which must terminate
+// (bounded by maxIndirectDepth), not loop forever. Watchdog so a regression
+// fails by timeout rather than hanging the suite.
+func TestRegression_SchemaForRecursivePtrDefaultTerminates(t *testing.T) {
+	type R struct {
+		F sfRecursivePtr `avro:"f,default=5"`
+	}
+	done := make(chan struct{}, 1)
+	go func() {
+		_, _ = SchemaFor[R](CustomType{
+			GoType:   reflect.TypeFor[sfRecursivePtr](),
+			AvroType: "long",
+		})
+		done <- struct{}{}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SchemaFor did not terminate (checkIntDefaultFitsGoKind pointer peel unbounded)")
 	}
 }
