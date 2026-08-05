@@ -501,7 +501,7 @@ func TestRegression_TypeLevelDefaultOrderSurviveTheRebuild(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
-			n := c.node(s.Root())
+			n := c.node(*s.Root())
 			got, ok := n.Props[c.key]
 			if !ok {
 				t.Fatalf("%q is absent from the node's only metadata surface: Props=%#v", c.key, n.Props)
@@ -602,7 +602,7 @@ func TestRegression_NonStringDocDroppedAtBothLevels(t *testing.T) {
 			if _, ok := n.Props["doc"]; ok {
 				t.Errorf(`"doc" reached Props: %#v — the key is bound on every kind, so Props is not its surface`, n.Props)
 			}
-			rb, err := (&n).Schema()
+			rb, err := n.Schema()
 			if err != nil {
 				t.Fatalf("rebuild: %v", err)
 			}
@@ -708,7 +708,7 @@ func TestRegression_StringDocConsumedAndSurfaced(t *testing.T) {
 				t.Fatalf("Parse: %v", err)
 			}
 			root := s.Root()
-			if got := c.doc(root); got != "d" {
+			if got := c.doc(*root); got != "d" {
 				t.Errorf("doc = %q, want %q — a string body must be consumed into the structural field", got, "d")
 			}
 			if _, ok := root.Props["doc"]; ok {
@@ -730,7 +730,7 @@ func TestRegression_StringDocConsumedAndSurfaced(t *testing.T) {
 			if err != nil {
 				t.Fatalf("re-parse of the rebuild: %v", err)
 			}
-			if got := c.doc(back.Root()); got != "d" {
+			if got := c.doc(*back.Root()); got != "d" {
 				t.Errorf("doc did not round-trip through the rebuild: %q", got)
 			}
 		})

@@ -1017,14 +1017,14 @@ var featureWalkerDrivers = []struct {
 			sF := fwParse(t, row.feature, row)
 			sT := fwParse(t, row.twin, row)
 			rootF, rootT := sF.Root(), sT.Root()
-			if nF, nT := fwCountNodes(&rootF), fwCountNodes(&rootT); nF != nT {
+			if nF, nT := fwCountNodes(rootF), fwCountNodes(rootT); nF != nT {
 				t.Errorf("Root() tree size diverges: feature=%d twin=%d nodes", nF, nT)
 			}
 			for _, spelled := range []struct {
 				which string
 				s     *avro.Schema
 				root  *avro.SchemaNode
-			}{{"feature", sF, &rootF}, {"twin", sT, &rootT}} {
+			}{{"feature", sF, rootF}, {"twin", sT, rootT}} {
 				rebuilt, err := spelled.root.Schema(row.opts...)
 				if err != nil {
 					t.Errorf("%s: Root().Schema() rebuild fails: %v", spelled.which, err)

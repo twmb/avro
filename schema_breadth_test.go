@@ -1043,7 +1043,7 @@ func TestDoSBattery_C10d_SiblingKindSurfaces(t *testing.T) {
 			})
 			var root SchemaNode
 			wantAcceptUnder(t, label("Root"), breadthBound, func() error {
-				root = s.Root()
+				root = *s.Root()
 				return nil
 			})
 			wantAcceptUnder(t, label("SchemaNode.Schema"), breadthBound, func() error {

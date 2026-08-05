@@ -36,7 +36,7 @@ func customSchemaFor(t *testing.T, goType reflect.Type, schemaJSON string) Custo
 		t.Fatalf("parse custom schema: %v", err)
 	}
 	root := s.Root()
-	return CustomType{GoType: goType, Schema: &root}
+	return CustomType{GoType: goType, Schema: root}
 }
 
 // namedFullname reports the fullname a field's type denotes: for a named

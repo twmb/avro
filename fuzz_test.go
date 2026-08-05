@@ -2421,7 +2421,7 @@ func readerBranchTags(unionJSON string) []string {
 	}
 	root := s.Root()
 	if len(root.Branches) == 0 {
-		return []string{branchTagFor(root)}
+		return []string{branchTagFor(*root)}
 	}
 	tags := make([]string, 0, len(root.Branches))
 	for i := range root.Branches {

@@ -770,14 +770,14 @@ func (c presenceCell) run(t *testing.T, b bodyClass) (presenceOutcome, string) {
 		return presenceOutcome{rejected: true}, src
 	}
 	n := s.Root()
-	props := c.props(n)
+	props := c.props(*n)
 	v, in := props[c.key]
 	raw, merr := json.Marshal(v)
 	if merr != nil {
 		raw = []byte(fmt.Sprintf("<unmarshalable %T>", v))
 	}
 	out := presenceOutcome{
-		structural: c.structural(n),
+		structural: c.structural(*n),
 		inProps:    in,
 		propJSON:   string(raw),
 		canonical:  string(s.Canonical()),

@@ -33,7 +33,7 @@ func TestDifferentialFastavroSchemaForScope(t *testing.T) {
 			t.Fatalf("parse custom schema: %v", err)
 		}
 		root := s.Root()
-		return avro.CustomType{GoType: reflect.TypeFor[scopeDiffMarker](), Schema: &root}
+		return avro.CustomType{GoType: reflect.TypeFor[scopeDiffMarker](), Schema: root}
 	}
 
 	cells := []struct {

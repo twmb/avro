@@ -323,7 +323,7 @@ func buildScopeCustomNode(t *testing.T, spelling, kind, shape string) (*SchemaNo
 	if shape == "nestedforeign" {
 		full = append(full, "q.Inner")
 	}
-	return &root, full
+	return root, full
 }
 
 // collectScopeNames walks the metadata tree with the parser's scope rules,
@@ -376,7 +376,7 @@ func assertScopeFullnames(t *testing.T, s *Schema, want []string) {
 	defs := make(map[string]bool)
 	var refs [][2]string
 	root := s.Root()
-	collectScopeNames(root, "", defs, &refs)
+	collectScopeNames(*root, "", defs, &refs)
 	wantSet := make(map[string]bool, len(want))
 	for _, w := range want {
 		wantSet[w] = true
@@ -507,7 +507,7 @@ func TestMatrix_SchemaForCustomSchemaScope(t *testing.T) {
 			}
 			customs := []CustomType{
 				{GoType: primary, Schema: aNode},
-				{GoType: partner, Schema: &bRoot},
+				{GoType: partner, Schema: bRoot},
 			}
 			s, err := schemaForScopeCell(t, fields, ns, customs)
 			if err != nil {

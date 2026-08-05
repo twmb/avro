@@ -49,7 +49,7 @@ func nullSpellCustom(t *testing.T, union string) CustomType {
 		t.Fatalf("parse custom union %s: %v", union, err)
 	}
 	root := s.Root()
-	return CustomType{GoType: reflect.TypeFor[nullSpellMarker](), Schema: &root}
+	return CustomType{GoType: reflect.TypeFor[nullSpellMarker](), Schema: root}
 }
 
 // TestRegression_SchemaForPointerCollapseWrappedNullBranch pins that the

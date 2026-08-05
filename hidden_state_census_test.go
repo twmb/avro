@@ -140,7 +140,7 @@ func TestInvariant_PresenceStateIsValueTransparent(t *testing.T) {
 				Fields: []SchemaField{{Name: "f", Doc: docValue,
 					Type: SchemaNode{Type: "int", LogicalType: ltValue}}}}
 
-			for label, n := range map[string]SchemaNode{"extracted": withState, "composed": clean} {
+			for label, n := range map[string]SchemaNode{"extracted": *withState, "composed": clean} {
 				s, err := n.Schema()
 				if err != nil {
 					t.Fatalf("%s doc=%q lt=%q: Schema(): %v", label, docValue, ltValue, err)

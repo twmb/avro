@@ -522,7 +522,7 @@ func TestMatrix_AttributePlacementCensus(t *testing.T) {
 						t.Errorf("captured reserved key %q leaked into Props: %#v", attr.key, root.Props)
 					}
 					if attr.surfaced != nil {
-						attr.surfaced(t, &root, "parsed")
+						attr.surfaced(t, root, "parsed")
 					}
 				}
 				if attr.key != "precision" && attr.key != "scale" {

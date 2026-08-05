@@ -79,7 +79,7 @@ func cacheSurfaces(t *testing.T, s *Schema, sample any) cacheSurfaceImage {
 		fp:        fmt.Sprintf("%x", s.Fingerprint(NewRabin())),
 		soe:       fmt.Sprintf("%x", b[:10]),
 		str:       s.String(),
-		root:      s.Root(),
+		root:      *s.Root(),
 	}
 }
 

@@ -130,19 +130,19 @@ func TestMatrix_MetadataPreservedThroughRebuild(t *testing.T) {
 		}
 	}
 	root := s.Root()
-	check(t, root, "first Root()")
+	check(t, *root, "first Root()")
 	rebuilt, err := root.Schema()
 	if err != nil {
 		t.Fatalf("Root().Schema(): %v", err)
 	}
-	check(t, rebuilt.Root(), "rebuilt Root()")
+	check(t, *rebuilt.Root(), "rebuilt Root()")
 	// Second-generation rebuild is stable too.
 	rb2root := rebuilt.Root()
 	rebuilt2, err := rb2root.Schema()
 	if err != nil {
 		t.Fatalf("second rebuild: %v", err)
 	}
-	check(t, rebuilt2.Root(), "second rebuilt Root()")
+	check(t, *rebuilt2.Root(), "second rebuilt Root()")
 }
 
 // Lax-name schemas: the wire paths work; the names survive Canonical()

@@ -158,7 +158,7 @@ func checkReservedDupCell(t *testing.T, cell string, carrier reservedDupCarrier,
 		t.Fatalf("encode probe value: %v", err)
 	}
 	root := s.Root()
-	node := findNodeByType(&root, carrier.typ, carrier.typName)
+	node := findNodeByType(root, carrier.typ, carrier.typName)
 	if node == nil {
 		t.Fatalf("carrier node %s/%s not found in Root()", carrier.typ, carrier.typName)
 	}
@@ -188,7 +188,7 @@ func checkReservedDupCell(t *testing.T, cell string, carrier reservedDupCarrier,
 		t.Fatalf("rebuild: %v", err)
 	}
 	rbRoot := rb.Root()
-	rbNode := findNodeByType(&rbRoot, carrier.typ, carrier.typName)
+	rbNode := findNodeByType(rbRoot, carrier.typ, carrier.typName)
 	if rbNode == nil {
 		t.Fatalf("carrier node %s/%s not found in rebuild", carrier.typ, carrier.typName)
 	}

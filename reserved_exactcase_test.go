@@ -368,7 +368,7 @@ func TestMatrix_ReservedKeyVariantOnly(t *testing.T) {
 			}
 			root := s.Root()
 			if row.check != nil {
-				row.check(t, root)
+				row.check(t, *root)
 			}
 			if got, ok := root.Props[row.variantKey]; !ok || !reflect.DeepEqual(got, row.wantVal) {
 				t.Errorf("Root().Props[%q] = %#v (present=%v); want %#v verbatim", row.variantKey, got, ok, row.wantVal)

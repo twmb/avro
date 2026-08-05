@@ -35,7 +35,7 @@ func TestRegression_TypeAliasAliasesValueGoTypes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build: %v", err)
 		}
-		return findNodeAliases(s.Root(), "F")
+		return findNodeAliases(*s.Root(), "F")
 	}
 
 	want := build(t, []any{"prior.P"})
@@ -272,7 +272,7 @@ func TestMatrix_TreeValueGoTypes(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			return findNodeAliases(s.Root(), "F"), nil
+			return findNodeAliases(*s.Root(), "F"), nil
 		}
 
 		want, err := build(t, []any{"prior.P"})
