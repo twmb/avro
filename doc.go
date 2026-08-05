@@ -166,11 +166,10 @@
 // resolve to the same name, a tagged field wins over an untagged one at any
 // depth; among fields with the same tagged status, the shallowest wins. Two
 // fields that resolve to the same name at the same depth with the same tagged
-// status are an ambiguous collision. twmb errors rather than silently
-// selecting one: [SchemaFor]
-// rejects the type, while encode and decode reject only when the schema
-// actually resolves a field to the ambiguous name — a coincidental collision
-// on a name the schema never references does not break the type.
+// status are an ambiguous collision. twmb errors rather than silently selecting
+// one: [SchemaFor] rejects the type, while encode and decode reject only when
+// the schema actually resolves a field to the ambiguous name — a coincidental
+// collision on a name the schema never references does not break the type.
 //
 // # Custom types
 //

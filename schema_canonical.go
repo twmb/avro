@@ -74,8 +74,7 @@ func appendCanonSchema(dst []byte, s *aschema) []byte {
 // directly in that mode by schema_test.go. The Canonical() entry point feeds
 // an already-stripped tree (canonicalFirstOccurrence), so on that path only
 // name/type/the required arrays appear and the attribute branches are not
-// reached. (The aobject.MarshalJSON method this once mirrored has been
-// deleted; this is now the single object writer.)
+// reached.
 func appendCanonObject(dst []byte, o *aobject) []byte {
 	dst = append(dst, '{')
 	first := true
@@ -180,8 +179,7 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 // attributes (aliases, default, order, logicalType, precision, scale) when
 // present. The Canonical() path feeds a stripped tree, so only name/type
 // appear there; the attribute branches exist for the general-purpose writer
-// mode (symmetric with appendCanonObject). (The afield.MarshalJSON method this
-// once mirrored has been deleted.)
+// mode (symmetric with appendCanonObject).
 func appendCanonField(dst []byte, f *afield) []byte {
 	dst = append(dst, '{')
 	dst = appendCanonString(dst, "name")

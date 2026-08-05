@@ -276,7 +276,6 @@ func appendAvroJSON(buf []byte, v reflect.Value, node *schemaNode, cfg *optConfi
 	if depth >= maxDepth {
 		return nil, errTooDeep
 	}
-	// Handle nil / invalid values.
 	if !v.IsValid() {
 		if node.kind == "null" {
 			return append(buf, "null"...), nil
@@ -1712,7 +1711,6 @@ func appendJSONString(buf []byte, s string) []byte {
 	for i := 0; i < len(s); {
 		c := s[i]
 		if c < utf8.RuneSelf {
-			// ASCII fast path.
 			if esc := jsonEscapeShort(c); esc != 0 {
 				buf = append(buf, '\\', esc)
 			} else if c < 0x20 {

@@ -192,7 +192,6 @@ func skipMap(w *schemaNode, mbw *minBytesWalk) skipfn {
 				return checkMapBlockBounds(count, srcLen, minEntryBytes)
 			},
 			func(src []byte, sl *slab) ([]byte, error) {
-				// Skip key (string), then value.
 				if src, err := skipString(src, sl); err != nil {
 					return nil, err
 				} else if src, err = valueSkip(src, sl); err != nil {

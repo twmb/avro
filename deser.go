@@ -603,7 +603,6 @@ func (s *deserRecord) deser(src []byte, v reflect.Value, sl *slab) ([]byte, erro
 		}
 		return src, nil
 	}
-	// Struct: try precompiled unsafe fast path.
 	if v.CanAddr() {
 		if fast := s.loadOrCompileFast(t); fast != nil {
 			return deserRecordFast(src, fast, v, sl)
