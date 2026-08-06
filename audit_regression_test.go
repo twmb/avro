@@ -3802,6 +3802,155 @@ func TestMatrix_CustomSkipDecodeMatchesNoCustom(t *testing.T) {
 
 type csTransformed struct{ Cents int64 }
 
+// Targets for the nested-match axis. Each pairs a container holding a
+// MARKED inner node with the sibling positions that must stay untouched.
+type (
+	csMatchField struct {
+		Amt  csTransformed `avro:"amt"`
+		Name string        `avro:"name"`
+	}
+	csMatchFieldRaw struct {
+		Amt  int64  `avro:"amt"`
+		Name string `avro:"name"`
+	}
+	csMatchInner struct {
+		Amt csTransformed `avro:"amt"`
+	}
+	csMatchInnerRaw struct {
+		Amt int64 `avro:"amt"`
+	}
+	csMatchOuter struct {
+		In csMatchInner `avro:"in"`
+		N  int64        `avro:"n"`
+	}
+	csMatchOuterRaw struct {
+		In csMatchInnerRaw `avro:"in"`
+		N  int64           `avro:"n"`
+	}
+)
+
+// TestMatrix_CustomSkipNestedMatchRedecodes adds the SELECTIVITY axis to
+// the skip-custom parity matrix. That matrix drives a wildcard custom that
+// skips at every node, so its corpus — thirty shapes, both wires, tagged
+// and untagged — only ever reaches the fall-through's bypass arm: nothing
+// matched anywhere, so one clean re-decode with customs off reproduces the
+// no-custom result.
+//
+// The other value of the axis is a custom that skips at the OUTER node but
+// matched somewhere in its subtree. The fall-through cannot bypass then —
+// bypassing would discard the nested match — so it re-decodes with customs
+// ACTIVE instead. Both wires have their own copy of that decision, and the
+// corpus reached neither.
+//
+// The axis crossed with it is the CONTAINER KIND, because the fall-through
+// sits in each container's decoder: a record field, a record nested one
+// level deeper, an array element and a map value each arrive at it
+// separately. The oracle is a no-custom decode into the raw-typed twin of
+// the same shape: the marked position must carry the transform of exactly
+// the value the raw decode saw there, and every sibling must be untouched.
+func TestMatrix_CustomSkipNestedMatchRedecodes(t *testing.T) {
+	t.Parallel()
+	money := avro.CustomType{
+		Decode: func(v any, sn *avro.SchemaNode) (any, error) {
+			if sn.Props["domain"] == "money" {
+				return csTransformed{Cents: v.(int64)}, nil
+			}
+			return nil, avro.ErrSkipCustomType
+		},
+	}
+	const marked = `{"type":"long","domain":"money"}`
+
+	rows := []struct {
+		name   string
+		schema string
+		// raw is the value encoded through the plain schema, typed so that
+		// the marked position is an ordinary int64.
+		raw any
+		// want is the same value as the custom-decoding target expects.
+		want any
+	}{
+		{
+			"record-field",
+			`{"type":"record","name":"R","fields":[{"name":"amt","type":` + marked + `},{"name":"name","type":"string"}]}`,
+			csMatchFieldRaw{Amt: 500, Name: "alice"},
+			csMatchField{Amt: csTransformed{Cents: 500}, Name: "alice"},
+		},
+		{
+			"record-nested",
+			`{"type":"record","name":"R","fields":[{"name":"in","type":{"type":"record","name":"In","fields":[{"name":"amt","type":` + marked + `}]}},{"name":"n","type":"long"}]}`,
+			csMatchOuterRaw{In: csMatchInnerRaw{Amt: 700}, N: 9},
+			csMatchOuter{In: csMatchInner{Amt: csTransformed{Cents: 700}}, N: 9},
+		},
+		{
+			"array-element",
+			`{"type":"array","items":` + marked + `}`,
+			[]int64{1, 2, 3},
+			[]csTransformed{{Cents: 1}, {Cents: 2}, {Cents: 3}},
+		},
+		{
+			"map-value",
+			`{"type":"map","values":` + marked + `}`,
+			map[string]int64{"k": 42},
+			map[string]csTransformed{"k": {Cents: 42}},
+		},
+	}
+
+	// Liveness floor, counted inside the cell: a row whose outer node
+	// stopped skipping, or whose inner node stopped matching, would take
+	// the bypass arm and pass every assertion below by accident.
+	redecoded := 0
+
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			plain := avro.MustParse(r.schema)
+			s := avro.MustParse(r.schema, money)
+
+			wireBin, err := plain.Encode(r.raw)
+			if err != nil {
+				t.Fatalf("encode binary: %v", err)
+			}
+			wireJSON, err := plain.EncodeJSON(r.raw)
+			if err != nil {
+				t.Fatalf("encode json: %v", err)
+			}
+
+			// The oracle: the raw-typed twin decoded with NO custom. The
+			// marked position's expected transform is read off it, so the
+			// expectation is not a restatement of what the custom did.
+			rawOut := reflect.New(reflect.TypeOf(r.raw))
+			if _, err := plain.Decode(wireBin, rawOut.Interface()); err != nil {
+				t.Fatalf("oracle decode: %v", err)
+			}
+			if !matEqual(rawOut.Elem().Interface(), r.raw) {
+				t.Fatalf("oracle decode did not round-trip the raw value:\n got  %#v\n want %#v", rawOut.Elem().Interface(), r.raw)
+			}
+
+			for _, w := range []struct {
+				name string
+				run  func(any) error
+			}{
+				{"binary", func(p any) error { _, err := s.Decode(wireBin, p); return err }},
+				{"json", func(p any) error { return s.DecodeJSON(wireJSON, p) }},
+			} {
+				t.Run(w.name, func(t *testing.T) {
+					p := reflect.New(reflect.TypeOf(r.want))
+					if err := w.run(p.Interface()); err != nil {
+						t.Fatalf("decode: %v", err)
+					}
+					got := p.Elem().Interface()
+					if !matEqual(got, r.want) {
+						t.Fatalf("the nested match did not survive the outer skip:\n got  %#v\n want %#v", got, r.want)
+					}
+					redecoded++
+				})
+			}
+		})
+	}
+	if want := len(rows) * 2; redecoded != want {
+		t.Errorf("%d of %d cells reached the re-decode; a row stopped exercising the nested-match arm", redecoded, want)
+	}
+}
+
 // TestRegression_CustomSkipDecodeMatchedTransformSurvives nets the deep-match
 // re-decode path — the main net's wildcard custom purely skips, so a
 // deeper-matched custom's transform is never carried through. A wildcard custom
