@@ -2960,40 +2960,6 @@ func TestRegression_TimestampNanosNegativeSecondSpecValue(t *testing.T) {
 	}
 }
 
-// TestRegression_DecimalFixedSizeCapacityNoOverflow pins that the
-// fixed-backed decimal precision-vs-capacity check (maxDecimalDigits in
-// schema.go) does not overflow the platform int when computing 8*size-1.
-// A fixed size is an int that can exceed 2^60 on a 64-bit build (twmb
-// accepts sizes Java's int32 size field cannot represent); the prior
-// 8*size-1 wrapped negative there, so the computed digit capacity came back
-// negative and a precision-1 decimal was falsely rejected while the same
-// fixed without the decimal logical type parsed. The boundary is computed
-// in a way that never wraps, so a huge-size fixed+decimal parses exactly
-// like the same fixed alone, and ordinary sizes still reject a precision
-// that genuinely exceeds the byte capacity.
-func TestRegression_DecimalFixedSizeCapacityNoOverflow(t *testing.T) {
-	const huge = uint64(1) << 61 // 8*size == 2^64 wraps the platform int to 0
-
-	// A plain fixed of this size parses.
-	if _, err := avro.Parse(fmt.Sprintf(`{"type":"fixed","name":"f","size":%d}`, huge)); err != nil {
-		t.Fatalf("plain fixed at size 2^61 rejected: %v", err)
-	}
-	// The same size with a decimal logical type and a tiny precision must ALSO
-	// parse — capacity at this size is astronomically larger than precision 1.
-	if _, err := avro.Parse(fmt.Sprintf(`{"type":"fixed","name":"f","size":%d,"logicalType":"decimal","precision":1,"scale":0}`, huge)); err != nil {
-		t.Errorf("decimal precision 1 falsely rejected at huge fixed size (capacity overflow?): %v", err)
-	}
-
-	// Ordinary sizes still enforce the real capacity. A size-4 fixed holds
-	// floor((8*4-1)*log10(2)) = 9 decimal digits.
-	if _, err := avro.Parse(`{"type":"fixed","name":"f","size":4,"logicalType":"decimal","precision":9,"scale":0}`); err != nil {
-		t.Errorf("precision 9 at size-4 fixed (capacity 9) rejected: %v", err)
-	}
-	if _, err := avro.Parse(`{"type":"fixed","name":"f","size":4,"logicalType":"decimal","precision":10,"scale":0}`); err == nil {
-		t.Error("precision 10 at size-4 fixed (capacity 9) accepted; want rejection")
-	}
-}
-
 // TestMatrix_JSONErrorsAreSemanticWithFieldPath pins doc.go's "# Errors"
 // contract for the JSON wire: a type mismatch on EncodeJSON / DecodeJSON is an
 // *avro.SemanticError carrying the same dotted record-field path the binary

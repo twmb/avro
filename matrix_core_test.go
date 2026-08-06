@@ -5954,6 +5954,143 @@ func TestMatrix_UnsafeArrayBlockBoundParity(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Decimal MAGNITUDE x TARGET parity across the wire axis.
+//
+// setDecimalRat is shared by the binary decoder and both JSON decimal arms, and
+// its float guards are the only thing standing between an out-of-range decimal
+// and a target silently set to +Inf. Sharing a helper is not the same as
+// reaching it: the JSON arms route to it from their own call sites, and a route
+// that stopped doing so would fall through to the byte/string handlers, which
+// still ERROR for a float target — so a test that only asks "did it fail" sees
+// nothing. The suite's overflow assertions were all on `Decode`.
+//
+// The oracle is the BINARY decode of the same value into the same Go type: no
+// expectation table, and the wire axis is what it measures. Where both accept,
+// the decoded values must match too — the guards are about a value being
+// silently changed, so a verdict-only comparison would miss the thing they
+// exist to prevent.
+// ---------------------------------------------------------------------------
+
+func TestMatrix_DecimalMagnitudeTargetParity(t *testing.T) {
+	// The fixed carrier is sized to hold the widest unscaled value here, so
+	// every magnitude rides both carriers and the axis stays crossed.
+	const fixedSize = 176
+
+	mags := []struct {
+		name      string
+		lit       string
+		precision int
+		scale     int
+	}{
+		{"in-range", "1234.56", 10, 2},
+		// Finite in float64, +Inf in float32: the narrowing guard.
+		{"float32-overflow", "1e39", 45, 0},
+		// Past float64 itself: big.Rat.Float64 returns +Inf, the other guard.
+		{"float64-overflow", "1e310", 400, 0},
+	}
+	carriers := []struct {
+		name   string
+		schema func(precision, scale int) string
+	}{
+		{"bytes", func(p, s int) string {
+			return fmt.Sprintf(`{"type":"bytes","logicalType":"decimal","precision":%d,"scale":%d}`, p, s)
+		}},
+		{"fixed", func(p, s int) string {
+			return fmt.Sprintf(`{"type":"fixed","name":"DM","size":%d,"logicalType":"decimal","precision":%d,"scale":%d}`, fixedSize, p, s)
+		}},
+	}
+	targets := []struct {
+		name string
+		make func() any
+	}{
+		{"big.Rat", func() any { return new(big.Rat) }},
+		{"float64", func() any { return new(float64) }},
+		{"float32", func() any { return new(float32) }},
+		{"string", func() any { return new(string) }},
+		{"json.Number", func() any { return new(json.Number) }},
+		{"any", func() any { return new(any) }},
+	}
+
+	for _, mag := range mags {
+		for _, c := range carriers {
+			s := avro.MustParse(c.schema(mag.precision, mag.scale))
+			r, ok := new(big.Rat).SetString(mag.lit)
+			if !ok {
+				t.Fatalf("%s: bad literal", mag.lit)
+			}
+			binWire, err := s.AppendEncode(nil, r)
+			if err != nil {
+				t.Fatalf("%s/%s binary encode: %v", mag.name, c.name, err)
+			}
+			specJSON, err := s.AppendEncodeJSON(nil, r)
+			if err != nil {
+				t.Fatalf("%s/%s json encode: %v", mag.name, c.name, err)
+			}
+			// The two JSON input forms a decimal accepts: the spec's
+			// codepoint-mapped string, and the lenient bare number. Both
+			// reach setDecimalRat, by different routes.
+			forms := []struct {
+				name string
+				body []byte
+			}{
+				{"json-spec", specJSON},
+				{"json-bare", []byte(mag.lit)},
+			}
+
+			for _, tgt := range targets {
+				for _, form := range forms {
+					t.Run(mag.name+"/"+c.name+"/"+tgt.name+"/"+form.name, func(t *testing.T) {
+						binDst := tgt.make()
+						_, binErr := s.Decode(binWire, binDst)
+
+						jsonDst := tgt.make()
+						jsonErr := s.DecodeJSON(form.body, jsonDst)
+
+						if (binErr == nil) != (jsonErr == nil) {
+							t.Fatalf("VERDICT DIVERGENCE:\n binary=%v\n json  =%v", binErr, jsonErr)
+						}
+						if binErr != nil {
+							return
+						}
+						got := reflect.ValueOf(jsonDst).Elem().Interface()
+						want := reflect.ValueOf(binDst).Elem().Interface()
+						if !matEqual(got, want) {
+							t.Fatalf("VALUE DIVERGENCE: json=%#v binary=%#v", got, want)
+						}
+						// Agreeing is not enough when the two paths agree by
+						// SHARING a helper: strip setDecimalRat's guards and
+						// binary and JSON accept in lockstep, so a
+						// cross-wire comparison stays green while both
+						// silently write +Inf. Every literal in the table is
+						// finite, which makes an infinite result a value the
+						// caller never supplied — checked against the input,
+						// not against the sibling path.
+						for _, v := range []struct {
+							wire string
+							val  any
+						}{{"binary", want}, {"json", got}} {
+							var f float64
+							switch n := v.val.(type) {
+							case float64:
+								f = n
+							case float32:
+								f = float64(n)
+							default:
+								continue
+							}
+							if math.IsInf(f, 0) {
+								t.Fatalf("%s decode of the finite decimal %s silently produced %v in a %s target",
+									v.wire, mag.lit, f, tgt.name)
+							}
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
 // ---------- matrix_evolution_test.go ----------
 
 // ---------------------------------------------------------------------------

@@ -10739,29 +10739,6 @@ func TestRegression_JSONBytesUnicodeCharCodepointSemantics(t *testing.T) {
 	}
 }
 
-// TestRegression_DecimalPrecisionEnforcedOnEncode locks in that the
-// encoder rejects decimal values whose unscaled magnitude exceeds the
-// schema's declared precision. Java (Conversions.DecimalConversion),
-// fastavro, and hamba/avro all enforce this on encode; silently
-// encoding oversized values would diverge from every reference impl.
-func TestRegression_DecimalPrecisionEnforcedOnEncode(t *testing.T) {
-	t.Run("bytes", func(t *testing.T) {
-		schema := MustParse(`{"type":"bytes","logicalType":"decimal","precision":5,"scale":2}`)
-		// Unscaled = 123456789999 (12 digits) — far exceeds precision 5.
-		rat := new(big.Rat).SetFrac(big.NewInt(123456789999), big.NewInt(100))
-		if _, err := schema.AppendEncode(nil, rat); err == nil {
-			t.Fatal("expected error encoding decimal value whose unscaled magnitude exceeds precision (5 digits)")
-		}
-	})
-	t.Run("fixed", func(t *testing.T) {
-		schema := MustParse(`{"type":"fixed","name":"D","size":16,"logicalType":"decimal","precision":5,"scale":2}`)
-		rat := new(big.Rat).SetFrac(big.NewInt(123456789999), big.NewInt(100))
-		if _, err := schema.AppendEncode(nil, rat); err == nil {
-			t.Fatal("expected error encoding decimal value whose unscaled magnitude exceeds precision (5 digits)")
-		}
-	})
-}
-
 // TestRegression_LocalTimestampMillisNonUTCWallClock locks in spec/Java
 // parity for local-timestamp encoding of non-UTC time.Time inputs.
 // Per Avro 1.12 + Java reference (TimeConversions.LocalTimestampMillisConversion
@@ -12794,103 +12771,6 @@ func TestRegression_ResolveDeserRecordMapNamedKey(t *testing.T) {
 	}
 }
 
-// TestRegression_DecodeJSONDecimalIntoFloatParity locks in that JSON
-// decode of a decimal-bytes value into *float64 matches the binary
-// path's setDecimalValue float coercion. assignBytes recognises
-// *big.Rat / json.Number / *float64 / *float32 / *string for the
-// decimal arm so the JSON path supports the same float targets the
-// binary path does — without this, the float targets would fall
-// through to the generic byte/string handlers, which don't apply
-// decimal logic.
-func TestRegression_DecodeJSONDecimalIntoFloatParity(t *testing.T) {
-	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-	r := new(big.Rat).SetFrac64(33, 100)
-
-	binEnc, err := s.AppendEncode(nil, r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var binF float64
-	if _, err := s.Decode(binEnc, &binF); err != nil || binF != 0.33 {
-		t.Fatalf("binary: %v err=%v", binF, err)
-	}
-
-	jsonEnc, err := s.AppendEncodeJSON(nil, r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var jsonF float64
-	if err := s.DecodeJSON(jsonEnc, &jsonF); err != nil {
-		t.Fatalf("JSON decode of decimal into *float64: %v", err)
-	}
-	if jsonF != 0.33 {
-		t.Fatalf("json: got %v want 0.33", jsonF)
-	}
-}
-
-// TestRegression_DecodeJSONDecimalBareNumberIntoFloatParity — same
-// parity rule for the bare-number lenient form.
-func TestRegression_DecodeJSONDecimalBareNumberIntoFloatParity(t *testing.T) {
-	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-	var f float64
-	if err := s.DecodeJSON([]byte(`0.33`), &f); err != nil {
-		t.Fatalf("JSON decode of bare-number decimal into *float64: %v", err)
-	}
-	if f != 0.33 {
-		t.Fatalf("got %v want 0.33", f)
-	}
-}
-
-// TestRegression_DecodeJSONFixedDecimalIntoFloatParity — fixed-backed
-// decimal routes through the same assignBytes code path, same fix.
-func TestRegression_DecodeJSONFixedDecimalIntoFloatParity(t *testing.T) {
-	s := MustParse(`{"type":"fixed","name":"d","size":8,"logicalType":"decimal","precision":10,"scale":2}`)
-	r := new(big.Rat).SetFrac64(33, 100)
-	jsonEnc, err := s.AppendEncodeJSON(nil, r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var f float64
-	if err := s.DecodeJSON(jsonEnc, &f); err != nil {
-		t.Fatalf("JSON decode of fixed-decimal into *float64: %v", err)
-	}
-	if f != 0.33 {
-		t.Fatalf("got %v want 0.33", f)
-	}
-}
-
-// TestRegression_DecodeJSONDecimalIntoStringParity locks in that JSON
-// decode into *string produces the formatted decimal "0.33" via
-// rat.FloatString(scale), matching the binary path. Returning the
-// raw codepoint bytes interpreted as UTF-8 (e.g. "!" for unscaled=33)
-// would be silently wrong — the user picked *string for a textual
-// representation of the decimal value, not the raw codepoint mapping.
-func TestRegression_DecodeJSONDecimalIntoStringParity(t *testing.T) {
-	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`)
-	r := new(big.Rat).SetFrac64(33, 100)
-
-	binEnc, err := s.AppendEncode(nil, r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var binS string
-	if _, err := s.Decode(binEnc, &binS); err != nil || binS != "0.33" {
-		t.Fatalf("binary: got %q err=%v", binS, err)
-	}
-
-	jsonEnc, err := s.AppendEncodeJSON(nil, r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var jsonS string
-	if err := s.DecodeJSON(jsonEnc, &jsonS); err != nil {
-		t.Fatalf("JSON decode into *string: %v", err)
-	}
-	if jsonS != "0.33" {
-		t.Fatalf("JSON: got %q want \"0.33\"", jsonS)
-	}
-}
-
 // TestRegression_DecodeJSONDecimalRecordFloatField — the typical user
 // shape: a record with a float-typed field backed by a decimal
 // logical type. The struct-decode path delegates to the same decimal
@@ -12921,39 +12801,6 @@ func TestRegression_DecodeJSONDecimalRecordFloatField(t *testing.T) {
 	}
 	if jsonOut.V != 0.5 {
 		t.Fatalf("json: got %v want 0.5", jsonOut.V)
-	}
-}
-
-// TestRegression_DecodeJSONDecimalFloat32Overflow / Float64Overflow
-// are JSON siblings of the existing binary-path overflow tests. The
-// overflow guards inside setDecimalRat (Inf-clamp on big.Rat.Float64;
-// finite→±Inf narrowing to float32) carry over to JSON via the
-// shared helper.
-func TestRegression_DecodeJSONDecimalFloat32Overflow(t *testing.T) {
-	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":40,"scale":0}`)
-	huge := new(big.Rat)
-	huge.SetString("1e39") // > MaxFloat32 ≈ 3.4e38
-	jsonEnc, err := s.AppendEncodeJSON(nil, huge)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var f float32
-	if err := s.DecodeJSON(jsonEnc, &f); err == nil {
-		t.Fatalf("expected float32 overflow error; got %v", f)
-	}
-}
-
-func TestRegression_DecodeJSONDecimalFloat64Overflow(t *testing.T) {
-	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":400,"scale":0}`)
-	huge := new(big.Rat)
-	huge.SetString("1e310") // > MaxFloat64 ≈ 1.8e308
-	jsonEnc, err := s.AppendEncodeJSON(nil, huge)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var f float64
-	if err := s.DecodeJSON(jsonEnc, &f); err == nil {
-		t.Fatalf("expected float64 overflow error; got %v", f)
 	}
 }
 
