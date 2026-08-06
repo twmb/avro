@@ -827,17 +827,6 @@ func (f *afield) fieldDecimalLiftConsumesPrecisionScale() bool {
 	return ok && decimalConsumesPrecisionScale(kind, logical)
 }
 
-// newLogicalObject builds an aobject describing the field's primitive type
-// promoted with the field-level logicalType / precision / scale.
-func (f *afield) newLogicalObject(primitiveType string) *aobject {
-	return &aobject{
-		Type:      primitiveType,
-		Logical:   f.Logical,
-		Scale:     clonePtrInt(f.Scale),
-		Precision: clonePtrInt(f.Precision),
-	}
-}
-
 func clonePtrInt(p *int) *int {
 	if p == nil {
 		return nil
