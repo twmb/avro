@@ -8044,6 +8044,294 @@ func TestMatrix_SpliceWrapperReservedKeyMerge(t *testing.T) {
 	}
 }
 
+// spliceStrayRoutedKeys is the SHAPE-CONDITIONAL reserved-key axis: the
+// keys that have a SchemaNode structural field to land on, so a stray
+// placement of one routes on whether its body parses as that key's schema
+// shape rather than on the key alone. It mirrors the parser's own
+// strayRoutedKeys list; TestInvariant_StrayRoutedKeyAxisMirrorsTheSource
+// (package avro) reds if the source list gains or loses a member, so a new
+// stray-routed key cannot ship without a cell here.
+//
+// The three keys the older cells above drive (logicalType, precision,
+// scale) are NOT in this list — their binding turns on the value or on the
+// logical type, never on shape — so every one of them short-circuits the
+// routing before the shape question is asked. That is the axis this table
+// adds: without a member of this list, the wrapper-key axis never reaches
+// the splice's shape verdict at all.
+var spliceStrayRoutedKeys = []string{
+	"items", "values", "fields", "symbols", "size", "name", "namespace", "aliases",
+}
+
+// spliceStrayOutcome is a cell's ruled verdict for a stray-routed key on a
+// cached definition.
+type spliceStrayOutcome string
+
+const (
+	// spliceReject: the wrapper carries a SHAPE-OK structural attribute, so
+	// it is no longer a bare reference object — the parse reads its "type"
+	// as a kind name and fails before any splice runs. This is the parse
+	// boundary that keeps a reference from being poisoned into a different
+	// kind by a usage-site attribute.
+	spliceReject spliceStrayOutcome = "reject"
+	// spliceDrop: the definition's kind BINDS the key, so it is a consumed
+	// usage-site attribute — it dies at the splice, reaching neither Props
+	// nor the definition's structural field.
+	spliceDrop spliceStrayOutcome = "drop"
+	// spliceMerge: the key is a stray on the definition's kind and its body
+	// does not parse as the key's schema shape, so it is an ordinary custom
+	// property and merges verbatim — asserted against the image the SAME
+	// body takes under a non-reserved key.
+	spliceMerge spliceStrayOutcome = "merge"
+)
+
+// spliceStrayBody is one body class per key. shapeOK parses as the key's
+// schema shape; badElem is the right CONTAINER with a wrong element; and
+// badScalar is the wrong container entirely. The two bad classes are
+// distinct arms of the shape decode — an array-valued key rejects a
+// non-array body before it ever inspects elements — so collapsing them
+// would leave the container check unexercised.
+type spliceStrayBody struct {
+	class string
+	json  string
+}
+
+var spliceStrayBodies = map[string][]spliceStrayBody{
+	"items":     {{"shapeOK", `"int"`}, {"badElem", `[1]`}, {"badScalar", `123`}},
+	"values":    {{"shapeOK", `"int"`}, {"badElem", `[1]`}, {"badScalar", `123`}},
+	"fields":    {{"shapeOK", `[{"name":"f","type":"int"}]`}, {"badElem", `[1]`}, {"badScalar", `123`}},
+	"symbols":   {{"shapeOK", `["A"]`}, {"badElem", `[1]`}, {"badScalar", `123`}},
+	"size":      {{"shapeOK", `8`}, {"badScalar", `"x"`}},
+	"name":      {{"shapeOK", `"nm"`}, {"badScalar", `12`}},
+	"namespace": {{"shapeOK", `"ns"`}, {"badScalar", `12`}},
+	"aliases":   {{"shapeOK", `["al"]`}, {"badElem", `[1]`}, {"badScalar", `12`}},
+}
+
+// spliceStrayDefs are the three named kinds a cached definition can be —
+// the kind axis, which is what decides BINDING. Each kind binds a different
+// subset of the stray-routed keys (size on fixed, symbols on enum, fields
+// on record, and name/namespace/aliases on all three), so a single kind
+// would leave both sides of the binding split untested for most keys.
+var spliceStrayDefs = []struct{ kind, schema string }{
+	{"fixed", `{"type":"fixed","name":"F","size":4}`},
+	{"enum", `{"type":"enum","name":"F","symbols":["A"]}`},
+	{"record", `{"type":"record","name":"F","fields":[{"name":"x","type":"int"}]}`},
+}
+
+// spliceStrayRuling is the ruled outcome per (def kind, key, body class).
+// Absent entries are spliceReject.
+var spliceStrayRuling = map[string]spliceStrayOutcome{
+	// fixed binds size / name / namespace / aliases.
+	"fixed/items/badElem": spliceMerge, "fixed/items/badScalar": spliceMerge,
+	"fixed/values/badElem": spliceMerge, "fixed/values/badScalar": spliceMerge,
+	"fixed/fields/badElem": spliceMerge, "fixed/fields/badScalar": spliceMerge,
+	"fixed/symbols/badElem": spliceMerge, "fixed/symbols/badScalar": spliceMerge,
+	"fixed/size/badScalar":    spliceDrop,
+	"fixed/name/badScalar":    spliceDrop,
+	"fixed/namespace/shapeOK": spliceDrop, "fixed/namespace/badScalar": spliceDrop,
+	"fixed/aliases/shapeOK": spliceDrop, "fixed/aliases/badElem": spliceDrop, "fixed/aliases/badScalar": spliceDrop,
+
+	// enum binds symbols / name / namespace / aliases.
+	"enum/items/badElem": spliceMerge, "enum/items/badScalar": spliceMerge,
+	"enum/values/badElem": spliceMerge, "enum/values/badScalar": spliceMerge,
+	"enum/fields/badElem": spliceMerge, "enum/fields/badScalar": spliceMerge,
+	"enum/symbols/badElem": spliceDrop, "enum/symbols/badScalar": spliceDrop,
+	"enum/size/badScalar":    spliceMerge,
+	"enum/name/badScalar":    spliceDrop,
+	"enum/namespace/shapeOK": spliceDrop, "enum/namespace/badScalar": spliceDrop,
+	"enum/aliases/shapeOK": spliceDrop, "enum/aliases/badElem": spliceDrop, "enum/aliases/badScalar": spliceDrop,
+
+	// record binds fields / name / namespace / aliases.
+	"record/items/badElem": spliceMerge, "record/items/badScalar": spliceMerge,
+	"record/values/badElem": spliceMerge, "record/values/badScalar": spliceMerge,
+	"record/fields/badElem": spliceDrop, "record/fields/badScalar": spliceDrop,
+	"record/symbols/badElem": spliceMerge, "record/symbols/badScalar": spliceMerge,
+	"record/size/badScalar":    spliceMerge,
+	"record/name/badScalar":    spliceDrop,
+	"record/namespace/shapeOK": spliceDrop, "record/namespace/badScalar": spliceDrop,
+	"record/aliases/shapeOK": spliceDrop, "record/aliases/badElem": spliceDrop, "record/aliases/badScalar": spliceDrop,
+}
+
+// TestMatrix_SpliceWrapperStrayRoutedKeyShape widens
+// TestMatrix_SpliceWrapperReservedKeyMerge's WRAPPER-KEY axis onto the
+// shape-conditional class. The older cells drive only logicalType,
+// precision and scale — the three keys whose binding turns on the value or
+// the logical type — and every one of them is settled before the routing
+// reaches its shape question, so the splice's shape verdict (the nil-verdict
+// arm, the one call site that has no recorded parse verdict to consult and
+// must decode the body afresh) never ran at all.
+//
+// The cross product is stray-routed key × definition kind × body class, and
+// each cell is checked against an INDEPENDENT image rather than against the
+// routing's own answer: a merged body must equal what the SAME body becomes
+// under a non-reserved key, and every cell — merged, dropped or rejected —
+// must leave the definition's own structural surface, wire image and
+// canonical form untouched, since a usage-site attribute is metadata and can
+// never redefine the type it references.
+func TestMatrix_SpliceWrapperStrayRoutedKeyShape(t *testing.T) {
+	t.Parallel()
+	counts := map[spliceStrayOutcome]int{}
+	shapeArms := map[string]int{}
+	for _, d := range spliceStrayDefs {
+		for _, key := range spliceStrayRoutedKeys {
+			for _, body := range spliceStrayBodies[key] {
+				cell := d.kind + "/" + key + "/" + body.class
+				want, ok := spliceStrayRuling[cell]
+				if !ok {
+					want = spliceReject
+				}
+				t.Run(cell, func(t *testing.T) {
+					wrapper := `{"type":"F","` + key + `":` + body.json + `}`
+					cache := &avro.SchemaCache{}
+					if _, err := cache.Parse(d.schema); err != nil {
+						t.Fatalf("def Parse: %v", err)
+					}
+					s, err := cache.Parse(wrapper)
+					if want == spliceReject {
+						if err == nil {
+							t.Fatalf("shape-OK stray %q on a %s reference accepted; want the parse to reject it as a kind name\n  surface: %+v", key, d.kind, *s.Root())
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("wrapper Parse: %v", err)
+					}
+					n := s.Root()
+
+					// The definition is never redefined by a usage-site
+					// attribute: structural surface, wire and canonical form
+					// all stay the plain definition's.
+					def := avro.MustParse(d.schema)
+					ctl := def.Root()
+					if n.Type != ctl.Type || n.Name != ctl.Name || n.Namespace != ctl.Namespace ||
+						n.Size != ctl.Size || !reflect.DeepEqual(n.Symbols, ctl.Symbols) ||
+						!reflect.DeepEqual(n.Aliases, ctl.Aliases) || len(n.Fields) != len(ctl.Fields) ||
+						(n.Items == nil) != (ctl.Items == nil) || (n.Values == nil) != (ctl.Values == nil) {
+						t.Fatalf("wrapper %q mutated the definition's structural surface:\n got:  %+v\n want: %+v", key, *n, *ctl)
+					}
+					if got, want := string(s.Canonical()), string(def.Canonical()); got != want {
+						t.Errorf("wrapper %q changed the canonical form:\n got:  %s\n want: %s", key, got, want)
+					}
+
+					got, inProps := n.Props[key]
+					switch want {
+					case spliceDrop:
+						if inProps {
+							t.Errorf("consumed usage-site %q survived the splice as a prop: %#v", key, got)
+						}
+					case spliceMerge:
+						// The independent image: the same body under a key
+						// the routing has no opinion about.
+						twinCache := &avro.SchemaCache{}
+						if _, err := twinCache.Parse(d.schema); err != nil {
+							t.Fatalf("twin def Parse: %v", err)
+						}
+						twin, err := twinCache.Parse(`{"type":"F","zzcustom":` + body.json + `}`)
+						if err != nil {
+							t.Fatalf("twin Parse: %v", err)
+						}
+						wantV := twin.Root().Props["zzcustom"]
+						if !inProps {
+							t.Fatalf("stray %q did not merge as a custom property; Props = %#v", key, n.Props)
+						}
+						if !reflect.DeepEqual(got, wantV) {
+							t.Errorf("Props[%q] = %#v; want the custom-prop image %#v", key, got, wantV)
+						}
+					}
+
+					// The spliced tree rebuilds and keeps the same routing.
+					rb, err := n.Schema()
+					if err != nil {
+						t.Fatalf("Root().Schema() rebuild: %v", err)
+					}
+					if _, again := rb.Root().Props[key]; again != inProps {
+						t.Errorf("rebuild changed the %q route: inProps %v -> %v", key, inProps, again)
+					}
+				})
+				counts[want]++
+				if want == spliceMerge {
+					shapeArms[spliceStrayShapeArm(key)]++
+				}
+			}
+		}
+	}
+	t.Logf("splice stray-routed cells: %d reject, %d drop, %d merge", counts[spliceReject], counts[spliceDrop], counts[spliceMerge])
+}
+
+// spliceStrayShapeArm groups the stray-routed keys by the arm of the shape
+// decode they run: the decode switches on the key, and keys sharing an arm
+// share the code the cell exercises.
+func spliceStrayShapeArm(key string) string {
+	switch key {
+	case "items", "values":
+		return "schema-position"
+	case "fields":
+		return "field-array"
+	case "symbols", "aliases":
+		return "string-array"
+	case "size":
+		return "lax-int"
+	}
+	return "string" // name, namespace
+}
+
+// TestMatrix_SpliceWrapperStrayRoutedKeyShapeIsNotVacuous is the liveness
+// floor. Every cell above is GENERATED, which says nothing about whether it
+// is EXERCISED: a ruling table that drifted to all-reject, or a body table
+// whose "bad" bodies quietly became shape-OK, would still generate 66 cells
+// and assert nothing about the splice's shape verdict. This fails when an
+// arm of that verdict stops being reached.
+func TestMatrix_SpliceWrapperStrayRoutedKeyShapeIsNotVacuous(t *testing.T) {
+	t.Parallel()
+	counts := map[spliceStrayOutcome]int{}
+	arms := map[string]int{}
+	keys := map[string]int{}
+	kinds := map[string]int{}
+	for _, d := range spliceStrayDefs {
+		for _, key := range spliceStrayRoutedKeys {
+			for _, body := range spliceStrayBodies[key] {
+				want, ok := spliceStrayRuling[d.kind+"/"+key+"/"+body.class]
+				if !ok {
+					want = spliceReject
+				}
+				counts[want]++
+				keys[key]++
+				kinds[d.kind]++
+				if want == spliceMerge {
+					arms[spliceStrayShapeArm(key)]++
+				}
+			}
+		}
+	}
+	if len(keys) != len(spliceStrayRoutedKeys) {
+		t.Errorf("the matrix drives %d keys, the axis names %d", len(keys), len(spliceStrayRoutedKeys))
+	}
+	if len(kinds) != len(spliceStrayDefs) {
+		t.Errorf("the matrix drives %d definition kinds, the axis names %d", len(kinds), len(spliceStrayDefs))
+	}
+	// All three outcomes must occur: a table that collapsed to one verdict
+	// would pass while asking nothing.
+	for _, o := range []spliceStrayOutcome{spliceReject, spliceDrop, spliceMerge} {
+		if counts[o] == 0 {
+			t.Errorf("no %q cells; the ruling table has collapsed to a single verdict", o)
+		}
+	}
+	// The merge cells are the ONLY ones that reach the splice's nil-verdict
+	// shape decode (a bound key is settled before the shape is asked, and a
+	// rejected one never reaches the splice), so each arm of that decode
+	// needs at least one. "string" is deliberately absent: name, namespace
+	// and aliases bind on every named kind, so no cached definition can
+	// carry one of them to the shape decode — the arm is reachable only
+	// from the parse-side verdict, which the older cells already drive.
+	for _, arm := range []string{"schema-position", "field-array", "string-array", "lax-int"} {
+		if arms[arm] == 0 {
+			t.Errorf("shape-decode arm %q has no merge cell; the splice never runs it", arm)
+		}
+	}
+	if counts[spliceMerge] < 12 {
+		t.Fatalf("only %d merge cells reach the shape decode; the wrapper-key axis has narrowed", counts[spliceMerge])
+	}
+}
+
 // A cached definition whose RECORD field carries an unconsumed malformed
 // precision splices through by-subtree: the field rides verbatim inside the
 // inlined definition, the spliced tree rebuilds, and the pair stays on the

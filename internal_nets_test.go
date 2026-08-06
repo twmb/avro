@@ -3288,6 +3288,16 @@ func structuralFieldFor(n *SchemaNode, key string) bool {
 		// field for it to reach — which is exactly why Props must be its
 		// surface. The absence is the answer, not a gap in this reader.
 		return false
+	case "items", "Items":
+		return n.Items != nil
+	case "values", "Values":
+		return n.Values != nil
+	case "fields", "Fields":
+		return len(n.Fields) > 0
+		// "name" and "namespace" are deliberately absent. Every definition has
+		// its own, so their fields are populated on any spliced result whether
+		// or not the wrapper's copy landed — presence is not evidence, and
+		// reporting it as one would make a correct drop read as a failure.
 	}
 	return false
 }
@@ -3458,6 +3468,12 @@ func spliceWrapperCells() []spliceWrapperCell {
 		{"doc", `"usage-site"`, false, usageSite, ""},
 		{"aliases", `["Other"]`, false, usageSite, ""},
 		{"namespace", `"z"`, false, usageSite, ""},
+		// A non-string body, so the cell reaches the splice at all: a
+		// shape-OK usage-site name stops the object being a reference and
+		// the parse rejects it outright. The drop here is decided by
+		// BINDING — every definition a wrapper can reference is named, so
+		// "name" never reaches the shape decode however malformed it is.
+		{"name", `12`, false, usageSite, ""},
 		{"logicalType", `"uuid"`, false, "#70: a STRING logicalType is first-class and consumed, so it is usage-site metadata here", ""},
 		{"logicalType", `123`, true, "#70: no value but a string can name a logical, so a non-string spelling is an ordinary prop", ""},
 		{"precision", `3`, true, "#71: precision/scale are reserved only on a recognized decimal carrier; unconsumed they ride verbatim", ""},
@@ -3485,6 +3501,25 @@ func spliceWrapperCells() []spliceWrapperCell {
 		// so the corpus proves the routing reads the DEFINITION's kind and
 		// not the key's name.
 		{"default", `"D"`, false, "#63 splice-merge, definition-wins: an enum consumes \"default\" as its evolution default, so a usage site cannot supply a second one", enumCarrierDef},
+		// The SHAPE-CONDITIONAL key class. Every cell above is settled by
+		// the key alone or by the definition's logical type, so the routing
+		// answers each one before it ever asks the third question — does
+		// this body parse as the key's schema shape? These keys are the only
+		// ones that reach it, and at a splice there is no recorded parse
+		// verdict to consult, so the body is decoded afresh here and nowhere
+		// else. Without this class the corpus never ran that decode.
+		//
+		// The bodies are deliberately NOT schema-shaped: a shape-OK body on
+		// a reference wrapper stops the object being a bare reference at
+		// all, and the parse rejects it as a kind name before any splice
+		// runs (TestMatrix_SpliceWrapperStrayRoutedKeyShape rules that
+		// boundary). So every cell that reaches a splice at all is a merge.
+		{"items", `123`, true, "#63(b): \"items\" is a stray on a fixed and its body does not parse as a schema, so it has no structural surface to take and rides in Props verbatim", ""},
+		{"values", `[1]`, true, "#63(b), same clause: a JSON array in schema position is a union, and 1 is not a schema, so the body is not schema-shaped", ""},
+		{"fields", `123`, true, "#63(b), same clause: a non-array cannot be a field list", ""},
+		{"symbols", `[1]`, true, "#63(b), same clause: the right container with a non-string element is not a symbol list", ""},
+		{"symbols", `123`, true, "#63(b), same clause: a non-array is rejected as a symbol list before any element is inspected — the container check and the element check are separate arms", ""},
+		{"size", `"x"`, true, "#63(b), same clause, on a definition whose kind does NOT bind size: an enum has no size, so an unreadable one is an ordinary custom property", enumCarrierDef},
 	}
 }
 
@@ -3672,6 +3707,52 @@ func TestCensus_Q17_CorpusIsNotVacuous(t *testing.T) {
 	}
 	if !split {
 		t.Fatal("no key appears with both verdicts; the corpus cannot tell name-conditional routing from body-conditional routing")
+	}
+	// The shape-conditional class is the source's own list, not a sample of
+	// it: strayRoutedKeys names every key that has a structural field to
+	// land on, and a key in that list which no cell drives is a routing arm
+	// the two answerers can disagree on unwatched. The guard reds in BOTH
+	// directions — a key added to the source with no cell here, and a cell
+	// whose key has been dropped from the source (which would mean the
+	// corpus is driving a spelling the routing no longer treats as
+	// shape-conditional at all).
+	//
+	// name/namespace/aliases carry a permanent exemption: they BIND on every
+	// named kind, and every definition a wrapper can reference is named, so
+	// no cell can carry one of them to the shape decode. They are recorded
+	// here rather than left to fall out of the count, so the exemption stays
+	// exactly three keys wide and a fourth cannot join it silently.
+	alwaysBoundOnNamedDefs := map[string]bool{"name": true, "namespace": true, "aliases": true}
+	driven := map[string]bool{}
+	for _, c := range spliceWrapperCells() {
+		if canonicalStrayKey(c.key) != "" {
+			driven[c.key] = true
+		}
+	}
+	for _, key := range strayRoutedKeys {
+		if alwaysBoundOnNamedDefs[key] {
+			if !driven[key] {
+				t.Errorf("stray-routed key %q is exempt from the shape decode but no cell drives it; the exemption must be exercised, not assumed", key)
+			}
+			continue
+		}
+		if !driven[key] {
+			t.Errorf("stray-routed key %q has no cell; the splice's shape decode never runs its arm, so the two answerers could route it differently unwatched", key)
+		}
+	}
+	for key := range driven {
+		if canonicalStrayKey(key) == "" {
+			t.Errorf("cell key %q is no longer stray-routed in the source; the corpus is driving a spelling the routing does not treat as shape-conditional", key)
+		}
+	}
+	var exemptSeen int
+	for key := range alwaysBoundOnNamedDefs {
+		if canonicalStrayKey(key) != "" {
+			exemptSeen++
+		}
+	}
+	if exemptSeen != len(alwaysBoundOnNamedDefs) {
+		t.Errorf("%d of the %d exempt keys are still stray-routed in the source; the exemption list has drifted", exemptSeen, len(alwaysBoundOnNamedDefs))
 	}
 }
 
