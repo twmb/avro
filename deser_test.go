@@ -10844,25 +10844,6 @@ func TestMatrix_TimestampDeserParity(t *testing.T) {
 	}
 }
 
-// TestRegression_DecimalBytesJSONEncodeSpecForm locks in that EncodeJSON
-// for a decimal-on-bytes logical type emits the spec / Java / fastavro
-// codepoint-mapped string form (e.g. "!" for unscaled=33 / scale=2),
-// not the bare-number form (0.33). The bare-number form is
-// incompatible with Java's JsonDecoder.readBytes (which throws on
-// VALUE_NUMBER_FLOAT) and fastavro's AvroJSONDecoder.read_bytes
-// (which calls .encode("iso-8859-1") on the JSON string). See
-// checkWriterUnion / decodeBytes doc comments for the spec citation.
-func TestRegression_DecimalBytesJSONEncodeSpecForm(t *testing.T) {
-	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
-	out, err := s.EncodeJSON(new(big.Rat).SetFrac64(33, 100))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(out) != `"!"` {
-		t.Fatalf("got %s, want %q (spec / Java / fastavro form for unscaled=33)", out, `"!"`)
-	}
-}
-
 // TestRegression_DecimalBytesUnionJSONRoundTrip locks in that
 // EncodeJSON / DecodeJSON round-trip a decimal-bytes value when it is
 // a non-null branch of a union. Two failure modes: EncodeJSON
@@ -10881,32 +10862,6 @@ func TestRegression_DecimalBytesUnionJSONRoundTrip(t *testing.T) {
 	var out any
 	if err := s.DecodeJSON(enc, &out); err != nil {
 		t.Fatalf("DecodeJSON failed to round-trip its own EncodeJSON output: %v\nencoded=%s", err, enc)
-	}
-}
-
-// TestRegression_DecimalBytesUnionJSONLenientNumberDecode locks in
-// that DecodeJSON accepts the bare-number form (0.33) inside a
-// union branch even when the encode-side emits the spec form. Hand-
-// edited JSON or alternate-tool input must keep working as a decode
-// input.
-func TestRegression_DecimalBytesUnionJSONLenientNumberDecode(t *testing.T) {
-	s := MustParse(`{"type":"record","name":"R","fields":[
-		{"name":"v","type":["null",{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}]}
-	]}`)
-	var out any
-	if err := s.DecodeJSON([]byte(`{"v":0.33}`), &out); err != nil {
-		t.Fatalf("lenient decode of bare 0.33 in union: %v", err)
-	}
-	r, ok := out.(map[string]any)
-	if !ok {
-		t.Fatalf("decoded value is not map[string]any: %T(%v)", out, out)
-	}
-	got, ok := r["v"].(*big.Rat)
-	if !ok {
-		t.Fatalf("v is not *big.Rat: %T(%v)", r["v"], r["v"])
-	}
-	if want := new(big.Rat).SetFrac64(33, 100); got.Cmp(want) != 0 {
-		t.Fatalf("got %s, want %s", got.FloatString(2), want.FloatString(2))
 	}
 }
 
@@ -13113,62 +13068,6 @@ func TestRegression_JSONEncodeNonStringKeyMap(t *testing.T) {
 	out, errJSON := s.EncodeJSON(in)
 	if errJSON == nil {
 		t.Fatalf("JSON path: expected error for map[int]int64, got nil; output=%q", out)
-	}
-}
-
-// TestRegression_DecimalBytesJSONStringIsCodepointForm locks in that
-// JSON decimal-bytes/decimal-fixed string-form decode interprets the
-// JSON string as the spec's codepoint-mapped raw bytes (each rune
-// 0-255 → one byte of the unscaled two's-complement integer), NOT
-// as a numeric-value string. Java's JsonDecoder.readBytes follows
-// the spec form strictly. The bare-number form (0.33 unquoted) is
-// separately supported as a leniency for hand-edited JSON; that
-// path is unaffected.
-//
-// linkedin/goavro emits "0.33" (a numeric-value string) when its
-// EnableDecimalBinarySpecCompliantEncoding flag is set; that form
-// is NOT accepted here because there's no way to disambiguate from
-// a spec-form byte sequence that happens to look like ASCII digits.
-// Producers targeting twmb/avro should emit either the spec form
-// (codepoint-mapped) or the bare-number form, not the goavro
-// quoted-numeric form.
-func TestRegression_DecimalBytesJSONStringIsCodepointForm(t *testing.T) {
-	s := MustParse(`{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}`)
-	// Spec form: codepoint string of the unscaled-int bytes.
-	// For unscaled=33, the byte is 0x21 = '!'.
-	var got *big.Rat
-	if err := s.DecodeJSON([]byte(`"!"`), &got); err != nil {
-		t.Fatalf("DecodeJSON of spec form: %v", err)
-	}
-	want := new(big.Rat).SetFrac64(33, 100)
-	if got.Cmp(want) != 0 {
-		t.Fatalf("spec form: got %s, want %s", got.RatString(), want.RatString())
-	}
-
-	// Bare-number form (lenient): no quotes. Separately supported
-	// path inside decodeBytes' decimal arm.
-	var got2 *big.Rat
-	if err := s.DecodeJSON([]byte(`0.33`), &got2); err != nil {
-		t.Fatalf("DecodeJSON of bare number: %v", err)
-	}
-	if got2.Cmp(want) != 0 {
-		t.Fatalf("bare number: got %s, want %s", got2.RatString(), want.RatString())
-	}
-
-	// goavro quoted-numeric form: NOT accepted as numeric. The string
-	// "0.33" is interpreted via codepoint mapping as bytes
-	// [0x30, 0x2e, 0x33, 0x33] = unscaled 808334131 → value
-	// 808334131/100. We don't promise this round-trips with goavro's
-	// spec-compliant-encoding mode; users should configure goavro to
-	// emit the codepoint form for cross-tool interop.
-	var got3 *big.Rat
-	if err := s.DecodeJSON([]byte(`"0.33"`), &got3); err != nil {
-		t.Fatalf("DecodeJSON of quoted-numeric: %v", err)
-	}
-	wrong := new(big.Rat).SetFrac64(808334131, 100)
-	if got3.Cmp(wrong) != 0 {
-		t.Fatalf("quoted-numeric is intentionally codepoint-interpreted: got %s, want %s",
-			got3.RatString(), wrong.RatString())
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -12086,25 +12087,187 @@ func TestMatrix_BigDecimalJSONBareNumberParity(t *testing.T) {
 		}
 	})
 
-	// Union dispatch: a bare-number must route to the big-decimal
-	// branch via jsonTokenMatchesBranch. The digit-token arm must
-	// include big-decimal-logical bytes alongside decimal-logical
-	// bytes/fixed.
-	t.Run("union dispatch bare-number to big-decimal branch", func(t *testing.T) {
-		us := avro.MustParse(`["null",{"type":"bytes","logicalType":"big-decimal"}]`)
-		var got any
-		if err := us.DecodeJSON([]byte("1.5"), &got); err != nil {
-			t.Fatalf("union bare-number decode: %v", err)
-		}
-		r, ok := got.(*big.Rat)
-		if !ok {
-			t.Fatalf("expected *big.Rat, got %T (%v)", got, got)
-		}
-		if r.Cmp(new(big.Rat).SetFrac64(3, 2)) != 0 {
-			t.Errorf("got %v, want 3/2", r)
-		}
-	})
+	// Union dispatch for the bare-number form is crossed over every
+	// carrier, logical and container context by
+	// TestMatrix_UnionBareNumberDispatchByLogicalCarrier.
+}
 
+// TestMatrix_UnionBareNumberDispatchByLogicalCarrier crosses the union JSON
+// dispatcher's digit-token arm with every verdict its predicate can produce,
+// in every container context that can hold a union.
+//
+// A bare number arriving at a union must be OFFERED to a branch whose
+// bytes/fixed carrier accepts the lenient bare-number form, and must NOT be
+// offered to one that does not. The offered set is derived from
+// hasDecimalBareNumberArm rather than listed: "decimal" qualifies on bytes
+// AND fixed, "big-decimal" is bytes-only per spec, so a big-decimal-on-fixed
+// branch — reachable only when a CustomType resurrects that non-standard
+// pairing — must stay unoffered and leave the union with nothing to match.
+//
+// Oracle: the SAME branch schema decoded STANDALONE, outside any union. The
+// union wrapper contributes dispatch, not semantics, so an offered branch
+// must yield exactly the value the bare branch yields. The standalone path
+// never consults the dispatcher, so it stays correct while the dispatcher is
+// wrong — the comparison is not blind to the mechanism under test. The
+// unoffered cells assert the SHAPE of the refusal ("no union branch
+// matched"), not merely that an error came back, so a downstream parse
+// failure cannot stand in for the dispatch decision.
+// bareUnionDeclinedEveryBranch matches the union error produced when NO
+// branch was entered — decodeUnionBare wraps the entered branch's cause
+// after the offset when one was, so the anchor is what separates the two.
+var bareUnionDeclinedEveryBranch = regexp.MustCompile(`no union branch matched at offset \d+$`)
+
+func TestMatrix_UnionBareNumberDispatchByLogicalCarrier(t *testing.T) {
+	const bare = "1.5"
+
+	branches := []struct {
+		name    string
+		branch  string
+		opts    []avro.SchemaOpt
+		offered bool
+	}{
+		{"decimal/bytes", `{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}`, nil, true},
+		{"decimal/fixed", `{"type":"fixed","name":"DF","size":8,"logicalType":"decimal","precision":10,"scale":2}`, nil, true},
+		{"big-decimal/bytes", `{"type":"bytes","logicalType":"big-decimal"}`, nil, true},
+		{
+			"big-decimal/fixed", `{"type":"fixed","name":"FBD","size":8,"logicalType":"big-decimal"}`,
+			[]avro.SchemaOpt{avro.CustomType{LogicalType: "big-decimal"}}, false,
+		},
+	}
+
+	// Each context wraps the union and supplies the matching bare-union
+	// wire plus the walk from the decoded root down to the union's value.
+	contexts := []struct {
+		name string
+		wrap func(union string) string
+		wire string
+		leaf func(t *testing.T, root any) any
+	}{
+		{
+			"top", func(u string) string { return u }, bare,
+			func(t *testing.T, root any) any { return root },
+		},
+		{
+			"record-field",
+			func(u string) string {
+				return `{"type":"record","name":"R","fields":[{"name":"v","type":` + u + `}]}`
+			},
+			`{"v":` + bare + `}`,
+			func(t *testing.T, root any) any {
+				t.Helper()
+				m, ok := root.(map[string]any)
+				if !ok {
+					t.Fatalf("record decoded to %T, want map[string]any", root)
+				}
+				return m["v"]
+			},
+		},
+		{
+			"array-element",
+			func(u string) string { return `{"type":"array","items":` + u + `}` },
+			`[` + bare + `]`,
+			func(t *testing.T, root any) any {
+				t.Helper()
+				s, ok := root.([]any)
+				if !ok || len(s) != 1 {
+					t.Fatalf("array decoded to %T(%v), want a 1-element []any", root, root)
+				}
+				return s[0]
+			},
+		},
+		{
+			"map-value",
+			func(u string) string { return `{"type":"map","values":` + u + `}` },
+			`{"k":` + bare + `}`,
+			func(t *testing.T, root any) any {
+				t.Helper()
+				m, ok := root.(map[string]any)
+				if !ok {
+					t.Fatalf("map decoded to %T, want map[string]any", root)
+				}
+				return m["k"]
+			},
+		},
+	}
+
+	// Liveness floors: an axis collapsed by the setup rather than the
+	// generator would otherwise pass silently.
+	var ranOffered, ranUnoffered int
+
+	for _, b := range branches {
+		// The oracle: the branch alone, with no union and so no dispatch.
+		var want *big.Rat
+		if b.offered {
+			standalone, err := avro.Parse(b.branch, b.opts...)
+			if err != nil {
+				t.Fatalf("%s: parse standalone branch: %v", b.name, err)
+			}
+			var got any
+			if err := standalone.DecodeJSON([]byte(bare), &got); err != nil {
+				t.Fatalf("%s: standalone bare-number decode (the oracle) failed: %v", b.name, err)
+			}
+			r, ok := got.(*big.Rat)
+			if !ok {
+				t.Fatalf("%s: standalone decode gave %T(%v), want *big.Rat", b.name, got, got)
+			}
+			want = r
+		}
+
+		for _, c := range contexts {
+			t.Run(b.name+"/"+c.name, func(t *testing.T) {
+				s, err := avro.Parse(c.wrap(`["null",`+b.branch+`]`), b.opts...)
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+				var root any
+				err = s.DecodeJSON([]byte(c.wire), &root)
+
+				if !b.offered {
+					ranUnoffered++
+					if err == nil {
+						t.Fatalf("an unoffered branch matched a bare number: decoded %v", root)
+					}
+					// The refusal must be the DISPATCHER declining, not the
+					// branch being tried and failing downstream — the two
+					// produce the same value (a scalar branch backtracks, so
+					// nothing observable changes) and the same leading
+					// message. They differ in exactly one place:
+					// decodeUnionBare appends the failed branch's cause only
+					// when some branch was actually entered. So a declined
+					// branch ENDS at "no union branch matched at offset N",
+					// while an entered-then-rejected one carries ": <cause>"
+					// after it. Asserting only the prefix passes in both
+					// directions and measures nothing.
+					if !bareUnionDeclinedEveryBranch.MatchString(err.Error()) {
+						t.Fatalf("branch was entered, not declined: %v\nwant a message ENDING at %q",
+							err, "no union branch matched at offset N")
+					}
+					return
+				}
+
+				ranOffered++
+				if err != nil {
+					t.Fatalf("offered branch did not receive the bare number: %v", err)
+				}
+				leaf := c.leaf(t, root)
+				got, ok := leaf.(*big.Rat)
+				if !ok {
+					t.Fatalf("union value is %T(%v), want *big.Rat", leaf, leaf)
+				}
+				if got.Cmp(want) != 0 {
+					t.Errorf("union dispatch changed the value: got %s, want %s (the same branch decoded standalone)",
+						got.RatString(), want.RatString())
+				}
+			})
+		}
+	}
+
+	if ranOffered != 12 {
+		t.Errorf("offered cells realized %d times, want 12 (3 offered branches x 4 contexts)", ranOffered)
+	}
+	if ranUnoffered != 4 {
+		t.Errorf("unoffered cells realized %d times, want 4 (1 unoffered branch x 4 contexts)", ranUnoffered)
+	}
 }
 
 // TestMatrix_DateEncodeWallClock locks the calendar-date

@@ -357,7 +357,7 @@ These are deliberate choices in this codebase. Findings against them are not bug
 
 - **`DecodeJSON` on a resolved schema consumes WRITER-shaped JSON and applies full writer→reader resolution.** A schema from `Resolve(writer, reader)` decodes binary via the resolving `s.deser` (`Schema.Decode`); its `DecodeJSON` mirrors that for JSON by composing already-validated paths — decode the writer-shaped JSON with the writer schema into a faithful intermediate, re-encode to writer binary, then run the resolving binary decode (`decodeJSONResolved` in json_codec.go; `s.resolveWriter` holds the writer, set in `Resolve` only when writer≠reader — an identity resolve returns the reader schema directly, so `resolveWriter` is nil and `DecodeJSON` decodes against the reader node normally). This matches Java's `ResolvingDecoder` wrapping a `JsonDecoder` constructed with the WRITER schema (`Resolver.EnumAdjust.resolve` at `lang/java/avro/src/main/java/org/apache/avro/Resolver.java:388-399` maps a writer enum symbol absent from the reader to the reader's enum default; fastavro `_read_py.py:281-288` does the same — both read the WRITER symbol first) and produces results byte-identical to `resolved.Decode` of the corresponding writer binary: promotion, enum-symbol→reader-default, field add/drop, aliases, and custom-type suppression all resolve. Two deliberate consequences future audits should NOT re-flag: (1) the input is writer-shaped (feeding reader-shaped JSON to a resolved schema may error on writer fields the reader dropped — that is correct, resolution consumes writer data); (2) the JSON path is a decode→re-encode→resolve round-trip, NOT a single-pass resolving JSON decoder — resolution is not throughput-critical, and reusing the tested binary resolver keeps the surface small and correct by construction (a single-pass resolving JSON decoder would be a large new-bug surface for no hot-path benefit). Pinned by `TestRegression_ResolvedDecodeJSONMatchesBinary` (binary-is-oracle across promotion / enum-default / structural / alias / custom-suppression shapes, plus the explicit enum→reader-default value).
 
-- **Decimal JSON decode accepts the spec form (codepoint-mapped string) and bare numbers (`0.33` unquoted).** Encode emits the spec form only. Java is strict (codepoint-only). The bare-number leniency handles hand-edited JSON and twmb/avro's pre-fix output that emitted bare numbers. Quoted-numeric strings (e.g. `"0.33"`, the form linkedin/goavro produces with `EnableDecimalBinarySpecCompliantEncoding`) are NOT accepted as numeric — the string is interpreted via codepoint mapping per the spec, since there's no way to disambiguate a quoted-numeric input from a spec-form byte sequence that happens to contain ASCII digits without ambiguity. Producers targeting twmb/avro should emit the spec form or the bare-number form. The codepoint-mapped string is accepted only as *valid JSON* — control chars / high bytes escaped as `\u00XX` (what the encoder emits); a raw unescaped codepoint form rejects per the JSON-string-strict entry below. See `decodeBytes` and `decodeFixed` in json_decode.go and `TestRegression_DecimalBytesJSONStringIsCodepointForm`.
+- **Decimal JSON decode accepts the spec form (codepoint-mapped string) and bare numbers (`0.33` unquoted).** Encode emits the spec form only. Java is strict (codepoint-only). The bare-number leniency handles hand-edited JSON and twmb/avro's pre-fix output that emitted bare numbers. Quoted-numeric strings (e.g. `"0.33"`, the form linkedin/goavro produces with `EnableDecimalBinarySpecCompliantEncoding`) are NOT accepted as numeric — the string is interpreted via codepoint mapping per the spec, since there's no way to disambiguate a quoted-numeric input from a spec-form byte sequence that happens to contain ASCII digits without ambiguity. Producers targeting twmb/avro should emit the spec form or the bare-number form. The codepoint-mapped string is accepted only as *valid JSON* — control chars / high bytes escaped as `\u00XX` (what the encoder emits); a raw unescaped codepoint form rejects per the JSON-string-strict entry below. See `decodeBytes` and `decodeFixed` in json_decode.go, `TestMatrix_BytesFixedDefaultParityNumericString` (the quoted-numeric-is-codepoint cells, crossed over top/array/map/record/union-branch) and `TestMatrix_DecimalMagnitudeTargetParity` (the json-spec vs json-bare wire axis).
 
 - **JSON decoder accepts non-canonical multi-byte varints** for null-union branch indices (e.g. `0x80 0x00` for index 0). Java's `BinaryDecoder.readIndex` does the same. Not a divergence — listed here to prevent re-finding it as one.
 
@@ -949,7 +949,7 @@ accumulation (274KB); the cap is the format, not discipline.
 
 ### Blind spot (distilled): CustomType logical-codec suppression, shapes (a)-(r)
 
-- **CustomType logical-codec suppression conditions must be mirrored on BOTH wire formats AND BOTH directions — and the conditions differ per build.** When a custom type matches a logical node, the binary builds SUPPRESS the built-in logical codec so the callback (or, for a nil callback, the user) sees the RAW Avro-native value. JSON encode (`appendAvroJSON`) and decode (`decodeKind` via `wrapDecodeJSONWithCustomDecoders`) must replicate each suppression condition or a binary↔JSON divergence appears. The conditions: **deser** suppressed for ANY match (`hasMatchingCustomType`); **ser** suppressed only when a custom Encode exists (`hasMatchingCustomTypeWithEncode`); the **fixed build** suppresses ser for ALL fixed logicals (decimal/duration/uuid → `serSize`) while **primitive/bytes builds** suppress only decimal/big-decimal. Probe: enumerate by `(build site × direction × logical kind)`, not the one shape a bug report exercised; for every `hasMatchingCustomType`/`hasMatchingCustomTypeWithEncode` gate, confirm the JSON encode arm gates on THREADED `encodeSuppresses` (= `hasMatchingCustomTypeWithEncode`, stored on `customWiring` — NOT the runtime proxy `custom[node].encode != nil`) and the JSON decode wrapper on THREADED `suppressLogical` (= `hasMatchingCustomType`, plus `jsonDecodeAppliesLogical` for scope — NOT the proxy `len(decoders) > 0`). **The trap: a runtime proxy includes wildcards; the binary gates exclude them. Gate on the EXACT threaded predicate. Meta-trap: sweep BOTH directions in the SAME pass.** `jsonDecodeAppliesLogical` DERIVES its answer by probing the `decodeLogical*` functions at parse time (correct by construction, can't drift; parse-time boxing cost only, off the hot path); pinned by `TestRegression_JSONDecodeAppliesLogicalMatchesDecode`. Twelve divergence shapes: (a) `Decode==nil` custom on a logical node — JSON returned transformed Go type, binary raw; (b) `Encode!=nil` custom with non-matching pass-through value — JSON ran the logical coercion binary suppressed; (c) pointer/interface-GoType custom at a UNION BRANCH — JSON peeled the pointer before union dispatch; fix dispatches union before the peel loop; (d) WILDCARD custom (empty LogicalType AND AvroType) over-suppressed on BOTH directions — binary gates EXCLUDE it (`ErrSkipCustomType`), JSON fixes used runtime proxies that INCLUDE it; (e) wildcard Encode DOUBLE-FIRES on `EncodeJSON` for 2-branch `["null", T]` null-first union — fix `if len(node.branches)==2 && branch.kind=="null" { continue }`; test callback INVOCATION COUNTS across union arities; (f) NO-CALLBACK non-wildcard custom — `applyCustomTypes` bailed at `if len(encoders)==0 && len(decoders)==0` BEFORE the wrapper-install; fix computes `suppressLogical`/`jsonAppliesLogical` BEFORE the early return; (g) schema-resolution PROMOTION re-applied the reader's logical unconditionally — `doResolve`'s `promotionDeserForLogical` fired under suppression; fix gates on `ctx.custom[r]==nil || !ctx.custom[r].suppressLogical`; compare VALUES the callback was fed, not result TYPES; (h) self-/forward-ref named type with a CT-matched logical in its subtree FAILED to Parse — `rejectCachedRefIfCustomTypeWouldMatch` read `hadCustomType` stamped at the wrong build phase; fix gates on `b.cachedNames[refName]` (cross-Parse names only); (i) FORWARD-REFERENCED named type dropped the binary custom wrap (JSON applied it) — `finalize`'s fixups wired the UNWRAPPED ser/deser; DRY fix: one shared `makeCustomSer`/`customWrappedSer`/`customWrappedDeser`; (j) no-Decode suppression into `[N]byte` diverged — fix decodes STRAIGHT INTO THE TARGET via `decodeKind`; (k) SchemaCache type cached WITH a CustomType, referenced WITHOUT it, silently inherited it on both formats — fix: symmetric cache-boundary custom-presence agreement guard; (l) custom Decode returning `*T` into a `*T` target diverged — JSON wrapped `setCustomResult` in `indirectAlloc(v)`, peeling a pointer level; fix drops `indirectAlloc` (call the shared helper identically); (m) no-Decode suppression into a SCALAR typed target (`*string`, `*big.Rat`, `avro.Duration`) still applied the logical arm on JSON — `assignBytes`/`decodeInt`/`decodeLong` ran the logical switch unconditionally for typed targets; worst case `time-millis` into `time.Duration` SILENTLY produced different values (both succeed, no error). Fix: thread the suppression `raw` flag and `return setBytesValue`/`setIntValue`/`setLongValue` BEFORE the logical switch; the SIBLING-DECODER sweep (mandatory after any fix) found the same gap across `decodeInt`/`decodeLong`. Lesson (Pattern 14a): the unit of analysis is every target the helper can land, not the report's input class; a both-succeed VALUE divergence hides from an error-parity-only check. (n) a RECORD-level custom (`AvroType:"record"`) was DROPPED by schema resolution — `resolveRecord` built its resolved node without re-applying the reader's custom wiring, while EVERY other resolve arm (enum/array/map/fixed/primitive/promotion) wrapped via `maybeWrapResolvedNode`/`applyCustomToNode`; so a record `Decode` callback fired on a direct decode but silently returned the raw `map[string]any` through any real evolution (the canonical-equality fast path masked it — reorder/add/drop bypasses it). Fix: `ctx.applyCustomToNode(nd, r)` in `resolveRecord`, mirroring the siblings; the resolved `DecodeJSON` funnels through the same deser, so both wire formats gain it. The sibling-sweep angle: when ANY resolve arm builds a node, audit whether EVERY arm re-applies custom — the unit is the arm set, and unions are the one deliberate non-wrap (customs don't match the union container; branches wrap during their own `resolveNode`). (o) a logical RESURRECTED on a kind it is NOT spec-valid for (`{"type":"bytes","logicalType":"uuid"}`/`"duration"`, `{"type":"fixed",...,"logicalType":"big-decimal"}`) decoded raw on binary but TRANSFORMED on JSON. `jsonDecodeAppliesLogical`'s *any-probe correctly returns false for the wrong-kind logical (so NO suppression wrapper installs and `raw` stays false — distinct from shape (m), which is the `raw==true` path), BUT the SHARED `assignBytes` typed-target helper (used by BOTH `decodeBytes` and `decodeFixed`) fired its uuid/duration/big-decimal arm regardless of `node.kind`; the per-kind `*any` `decodeLogical{Bytes,Fixed}` omit the wrong-kind arm but the one shared typed helper included all four. The trap: a typed-assign helper shared across two byte-container kinds breaks the probe's correct-by-construction guarantee, which only holds when the typed transform set per kind equals the `*any` set; `decodeInt`/`decodeLong` are immune (separate functions, kind-disjoint logicals). Fix: gate each `assignBytes` arm to its spec-valid kind (big-decimal→bytes; duration/uuid→fixed) so the typed set matches the `*any` set; the JSON encode side was already immune (`appendAvroJSON`'s bytes and fixed arms are separate per-kind switches) — but the BINARY encode side was NOT (shape (p)): "the encode side was already immune" verified only the JSON encoder. **The item-10 re-grep (`node.logical ==`/`switch .logical` across decode) caught the `[sibling-of-fix]` the assignBytes gate alone missed:** `hasDecimalBareNumberArm` (the lenient bare-number JSON arm, shared by `decodeBytes` AND `decodeFixed`) was kind-AGNOSTIC, so `fixed`+`big-decimal`+custom decoding a bare `123.45` still transformed to `*big.Rat` (the codepoint-string form went through the now-gated `assignBytes`, but the bare-number form bypassed it) — TWO decode FORMS per kind, both needing the gate; two call-site comments ("never reaches here"/"not eligible on a fixed branch") asserted the invariant the predicate didn't enforce. Fixed by making `hasDecimalBareNumberArm` kind-aware (big-decimal→bytes only). Lesson: a shared typed-assign helper has a shared LENIENT-FORM sibling (bare-number, alternate-encoding) reached through a DIFFERENT predicate; gate both, and re-grep `.logical` after the first gate. The metadata/parse-validate axes were checked CLEAN (a wrong-kind logical field default surfaces raw `[]byte` via `Root().Fields[].Default` and validates as raw, already consistent with the now-raw decode). Pinned by the extended `TestRegression_CustomSuppressionScalarTargetParity` (uuid-on-bytes/duration-on-bytes/big-decimal-on-fixed rows), `TestRegression_DecimalBareNumberArmHonorsKindValidity`, + the `{bytes,uuid}`/`{bytes,duration}`/`{fixed,big-decimal}` false rows in `TestRegression_JSONDecodeAppliesLogicalMatchesDecode`. (p) the BINARY-encode mirror of (o): a CustomType-RESURRECTED wrong-kind logical (uuid on bytes, a date/time/timestamp logical on string) encoded via the logical serializer on binary while JSON encoded raw and both decoders stayed raw — the general primitive build applied `logicalSer(o.Logical)` keyed only on the logical NAME (`schema.go`), kind-blind, whereas `appendAvroJSON` is per-kind. Binary thus disagreed with JSON, and a string-backed time logical produced a bare-varint wire its own `deserString` rejected (self-incompatible — missed by `TestMatrix_SelfReadableAtScale`, which has no wrong-kind-logical-with-custom generator). Fix: gate the `logicalSer` application on `logicalUnderlyingAccept[o.Logical](o)` — the same predicate `validateLogical` soft-drops a wrong-kind logical with — so a resurrected wrong-kind logical keeps the base (raw) serializer; `logicalSer` (schema.go) is the lone kind-blind logical-codec selector, the fixed build's per-logical `switch` and `appendAvroJSON`'s per-kind arms being already immune. Lesson: an "the other format/direction was already immune" claim is a claim (hard rule 5) — verify EACH of the four (format × direction) cells independently; the binary encoder selects its logical codec by name, the JSON encoder by kind, so they have different immunity. Pinned by `TestRegression_CustomSuppressionWrongKindLogicalEncodeParity` (all 10 `logicalSers` entries on a wrong kind, encode parity + self-readability) + `TestRegression_CustomSuppressionSpecValidLogicalStillApplied` (spec-valid placements not regressed). (q) the WRONG-SIZE sibling of (p) on the FIXED build — and proof that shape (p)'s OWN "the fixed build's per-logical `switch` and `appendAvroJSON`'s per-kind arms were already immune" parenthetical was the exact unverified "already immune" claim (p)'s own lesson warns against. uuid is fixed-valid only at size 16 and duration only at size 12 (`logicalUnderlyingAccept`); a no-Encode CustomType resurrects the soft-dropped wrong-size logical, and the fixed-build `case "uuid"`/`case "duration"` applied `serFixedUUIDReflect` (always 16 bytes) / `serDuration` (always 12) while the JSON fixed arms wrote the same — SIZE-blind — yet the suppressed decoder reads `deserFixed{size}`. So BOTH wires emitted a wire their own decoders rejected (16/12 bytes where `size` was declared), and registering a passive custom silently broke a round trip the plain (no-custom, soft-dropped-to-raw) fixed completes — the unit is `(format × logical) on the fixed build`, NOT just the primitive build (p) fixed. Fix: gate the fixed-switch logical-ser on `logicalUnderlyingAccept[logical](o)` (binary, schema.go) and the JSON uuid/duration arms on `node.size == 16/12` with raw fall-through (json_codec.go), mirroring (p) on the fixed path. decimal-on-fixed is immune (hard-errors on nil precision before resurrection; `serFixedDecimal` is size-aware); the unsafe fast path is immune (declined when `hasCustomType`); encodeDefault's fixed arm and the decode/metadata axes were already raw+size-checked. Meta-lesson: when shape (p)'s fix PARENTHETICALLY asserts a sibling path is immune, that parenthetical is a finding-in-waiting until a test exercises it — the next round's quarantine of (p) is where (q) surfaced. Pinned by `TestRegression_CustomSuppressionWrongSizeFixedLogicalEncodeParity` (passive custom must match the plain fixed for both a raw `[size]byte` AND the size-blind serializer's own logical-shaped input, on both wires) + the uuid-on-fixed16/duration-on-fixed12 boundary-1 rows in `TestRegression_CustomSuppressionSpecValidLogicalStillApplied`. Pinned by `TestRegression_Custom{Decode,Encode}*BinaryJSONParity`, `TestRegression_Wildcard*`, `TestRegression_CustomNoCallbackSuppressionBinaryJSONParity`, `TestRegression_CustomPromotionHonorsLogicalSuppression`, `TestRegression_RecursiveCustomTypeParsesAndParity`, `TestRegression_SchemaCacheCustomBoundaryGuard`, `TestRegression_CustomSuppressionScalarTargetParity`, `TestRegression_RecordCustomTypeThroughResolve`. (r) the all-decoders-skip (`ErrSkipCustomType`) fall-through DECODED the value into a probe `any` then gated on `AssignableTo`, so a skipped custom could NOT decode into a typed CONTAINER (struct / []T / map[string]T) or a NAMED scalar (`type Money int64`) — diverging from no-custom decode AND from the `Decode==nil` path (which decodes straight into the target), identically broken on binary, JSON, AND resolved (the shared `wrapDeserWithCustomDecoders` / `wrapDecodeJSONWithCustomDecoders`). `any` / `map[string]any` / exactly-assignable targets worked (assignable), masking it; the whole shape sits OUTSIDE (a)–(q) — it is neither a logical raw-vs-enriched nor a binary↔JSON divergence (both wires fail the same). The naive fix (re-decode the wire straight into the target) is O(depth²) for a CONTAINER-matching (wildcard) custom into a nested typed target — every level re-decodes its subtree into the probe AND into the target (measured ~356 ms at depth 500, vs ~3 ms after) — so the all-skip fall-through RE-DECODES the original wire into the typed target through the base deserializer (`wrapDeserWithCustomDecoders`/`wrapDecodeJSONWithCustomDecoders`; NOT_BUGS #48) — byte-identical to a no-custom decode, bounded by `maxDepth`, with a no-match `bypassCustom` fast path keeping the common case single-pass. An EARLIER attempt placed the already-decoded canonical value into the typed target via a shared recursive converter (`assignCanonical`, since REMOVED); it was abandoned because PLACING A VALUE diverged from a no-custom decode on four axes — a REUSED map kept fresh-map keys instead of its existing ones (reuse), a logical node was enriched instead of landing RAW in a base typed target (logical-into-base), an overlapping union lost its exact wire BRANCH-INDEX (branch-index), and under `TaggedUnions()` the probe `any` (which `maybeWrap` tags) leaked a `{branch:value}` envelope into the TYPED placement (which `maybeWrap` never tags), zero-valuing the branch — silently WRONG, worse than the pre-fix error. Re-decode is correct on all four because it re-runs the base deser straight into the target and DISCARDS the probe entirely (so the tagged-probe issue no longer needs the old "clear `sl.taggedUnions` around the probe" workaround — the tagged value is never placed). **Census lesson that survives the converter's removal: when enumerating a recursion's targets, count the reachable KINDS, not just the wrapped node's — a record/array/map field can be a union, the case the converter's "no union arm" assumption missed.** **Option-dimension pin: run the parity matrix under BOTH default and `TaggedUnions()` — the tagged-vs-untagged divergence is invisible in the default mode.** Probe: decode a wildcard-skip custom into every typed target the base decoder fills (struct / []T / map / named scalar / pointer / [N]byte) and assert == no-custom on binary, JSON, AND resolved; a custom-decoder fall-through that boxes into `any`+`AssignableTo` silently restricts the target set vs no-custom. Pinned by `TestRegression_CustomSkipDecodeMatchesNoCustom` (wildcard-skip == no-custom across the type matrix × binary/JSON/resolved, neuter-verified) + the flipped `TestRegression_DecodeJSONCustomDecoderConcreteTargetErrors` (compatible named-scalar now succeeds == no-custom; incompatible still errors-not-panics). Instance: shape (a) `Decode==nil` custom on a logical node; shape (n) record custom dropped through `Resolve`; shape (r) all-skip into a typed container/named-scalar boxed into `any`. Add to the yield-map under custom types.
+- **CustomType logical-codec suppression conditions must be mirrored on BOTH wire formats AND BOTH directions — and the conditions differ per build.** When a custom type matches a logical node, the binary builds SUPPRESS the built-in logical codec so the callback (or, for a nil callback, the user) sees the RAW Avro-native value. JSON encode (`appendAvroJSON`) and decode (`decodeKind` via `wrapDecodeJSONWithCustomDecoders`) must replicate each suppression condition or a binary↔JSON divergence appears. The conditions: **deser** suppressed for ANY match (`hasMatchingCustomType`); **ser** suppressed only when a custom Encode exists (`hasMatchingCustomTypeWithEncode`); the **fixed build** suppresses ser for ALL fixed logicals (decimal/duration/uuid → `serSize`) while **primitive/bytes builds** suppress only decimal/big-decimal. Probe: enumerate by `(build site × direction × logical kind)`, not the one shape a bug report exercised; for every `hasMatchingCustomType`/`hasMatchingCustomTypeWithEncode` gate, confirm the JSON encode arm gates on THREADED `encodeSuppresses` (= `hasMatchingCustomTypeWithEncode`, stored on `customWiring` — NOT the runtime proxy `custom[node].encode != nil`) and the JSON decode wrapper on THREADED `suppressLogical` (= `hasMatchingCustomType`, plus `jsonDecodeAppliesLogical` for scope — NOT the proxy `len(decoders) > 0`). **The trap: a runtime proxy includes wildcards; the binary gates exclude them. Gate on the EXACT threaded predicate. Meta-trap: sweep BOTH directions in the SAME pass.** `jsonDecodeAppliesLogical` DERIVES its answer by probing the `decodeLogical*` functions at parse time (correct by construction, can't drift; parse-time boxing cost only, off the hot path); pinned by `TestRegression_JSONDecodeAppliesLogicalMatchesDecode`. Twelve divergence shapes: (a) `Decode==nil` custom on a logical node — JSON returned transformed Go type, binary raw; (b) `Encode!=nil` custom with non-matching pass-through value — JSON ran the logical coercion binary suppressed; (c) pointer/interface-GoType custom at a UNION BRANCH — JSON peeled the pointer before union dispatch; fix dispatches union before the peel loop; (d) WILDCARD custom (empty LogicalType AND AvroType) over-suppressed on BOTH directions — binary gates EXCLUDE it (`ErrSkipCustomType`), JSON fixes used runtime proxies that INCLUDE it; (e) wildcard Encode DOUBLE-FIRES on `EncodeJSON` for 2-branch `["null", T]` null-first union — fix `if len(node.branches)==2 && branch.kind=="null" { continue }`; test callback INVOCATION COUNTS across union arities; (f) NO-CALLBACK non-wildcard custom — `applyCustomTypes` bailed at `if len(encoders)==0 && len(decoders)==0` BEFORE the wrapper-install; fix computes `suppressLogical`/`jsonAppliesLogical` BEFORE the early return; (g) schema-resolution PROMOTION re-applied the reader's logical unconditionally — `doResolve`'s `promotionDeserForLogical` fired under suppression; fix gates on `ctx.custom[r]==nil || !ctx.custom[r].suppressLogical`; compare VALUES the callback was fed, not result TYPES; (h) self-/forward-ref named type with a CT-matched logical in its subtree FAILED to Parse — `rejectCachedRefIfCustomTypeWouldMatch` read `hadCustomType` stamped at the wrong build phase; fix gates on `b.cachedNames[refName]` (cross-Parse names only); (i) FORWARD-REFERENCED named type dropped the binary custom wrap (JSON applied it) — `finalize`'s fixups wired the UNWRAPPED ser/deser; DRY fix: one shared `makeCustomSer`/`customWrappedSer`/`customWrappedDeser`; (j) no-Decode suppression into `[N]byte` diverged — fix decodes STRAIGHT INTO THE TARGET via `decodeKind`; (k) SchemaCache type cached WITH a CustomType, referenced WITHOUT it, silently inherited it on both formats — fix: symmetric cache-boundary custom-presence agreement guard; (l) custom Decode returning `*T` into a `*T` target diverged — JSON wrapped `setCustomResult` in `indirectAlloc(v)`, peeling a pointer level; fix drops `indirectAlloc` (call the shared helper identically); (m) no-Decode suppression into a SCALAR typed target (`*string`, `*big.Rat`, `avro.Duration`) still applied the logical arm on JSON — `assignBytes`/`decodeInt`/`decodeLong` ran the logical switch unconditionally for typed targets; worst case `time-millis` into `time.Duration` SILENTLY produced different values (both succeed, no error). Fix: thread the suppression `raw` flag and `return setBytesValue`/`setIntValue`/`setLongValue` BEFORE the logical switch; the SIBLING-DECODER sweep (mandatory after any fix) found the same gap across `decodeInt`/`decodeLong`. Lesson (Pattern 14a): the unit of analysis is every target the helper can land, not the report's input class; a both-succeed VALUE divergence hides from an error-parity-only check. (n) a RECORD-level custom (`AvroType:"record"`) was DROPPED by schema resolution — `resolveRecord` built its resolved node without re-applying the reader's custom wiring, while EVERY other resolve arm (enum/array/map/fixed/primitive/promotion) wrapped via `maybeWrapResolvedNode`/`applyCustomToNode`; so a record `Decode` callback fired on a direct decode but silently returned the raw `map[string]any` through any real evolution (the canonical-equality fast path masked it — reorder/add/drop bypasses it). Fix: `ctx.applyCustomToNode(nd, r)` in `resolveRecord`, mirroring the siblings; the resolved `DecodeJSON` funnels through the same deser, so both wire formats gain it. The sibling-sweep angle: when ANY resolve arm builds a node, audit whether EVERY arm re-applies custom — the unit is the arm set, and unions are the one deliberate non-wrap (customs don't match the union container; branches wrap during their own `resolveNode`). (o) a logical RESURRECTED on a kind it is NOT spec-valid for (`{"type":"bytes","logicalType":"uuid"}`/`"duration"`, `{"type":"fixed",...,"logicalType":"big-decimal"}`) decoded raw on binary but TRANSFORMED on JSON. `jsonDecodeAppliesLogical`'s *any-probe correctly returns false for the wrong-kind logical (so NO suppression wrapper installs and `raw` stays false — distinct from shape (m), which is the `raw==true` path), BUT the SHARED `assignBytes` typed-target helper (used by BOTH `decodeBytes` and `decodeFixed`) fired its uuid/duration/big-decimal arm regardless of `node.kind`; the per-kind `*any` `decodeLogical{Bytes,Fixed}` omit the wrong-kind arm but the one shared typed helper included all four. The trap: a typed-assign helper shared across two byte-container kinds breaks the probe's correct-by-construction guarantee, which only holds when the typed transform set per kind equals the `*any` set; `decodeInt`/`decodeLong` are immune (separate functions, kind-disjoint logicals). Fix: gate each `assignBytes` arm to its spec-valid kind (big-decimal→bytes; duration/uuid→fixed) so the typed set matches the `*any` set; the JSON encode side was already immune (`appendAvroJSON`'s bytes and fixed arms are separate per-kind switches) — but the BINARY encode side was NOT (shape (p)): "the encode side was already immune" verified only the JSON encoder. **The item-10 re-grep (`node.logical ==`/`switch .logical` across decode) caught the `[sibling-of-fix]` the assignBytes gate alone missed:** `hasDecimalBareNumberArm` (the lenient bare-number JSON arm, shared by `decodeBytes` AND `decodeFixed`) was kind-AGNOSTIC, so `fixed`+`big-decimal`+custom decoding a bare `123.45` still transformed to `*big.Rat` (the codepoint-string form went through the now-gated `assignBytes`, but the bare-number form bypassed it) — TWO decode FORMS per kind, both needing the gate; two call-site comments ("never reaches here"/"not eligible on a fixed branch") asserted the invariant the predicate didn't enforce. Fixed by making `hasDecimalBareNumberArm` kind-aware (big-decimal→bytes only). Lesson: a shared typed-assign helper has a shared LENIENT-FORM sibling (bare-number, alternate-encoding) reached through a DIFFERENT predicate; gate both, and re-grep `.logical` after the first gate. The metadata/parse-validate axes were checked CLEAN (a wrong-kind logical field default surfaces raw `[]byte` via `Root().Fields[].Default` and validates as raw, already consistent with the now-raw decode). Pinned by the extended `TestRegression_CustomSuppressionScalarTargetParity` (uuid-on-bytes/duration-on-bytes/big-decimal-on-fixed rows), `TestMatrix_UnionBareNumberDispatchByLogicalCarrier` (the logical x carrier verdict crossing, including the unoffered big-decimal-on-fixed cells), + the `{bytes,uuid}`/`{bytes,duration}`/`{fixed,big-decimal}` false rows in `TestRegression_JSONDecodeAppliesLogicalMatchesDecode`. (p) the BINARY-encode mirror of (o): a CustomType-RESURRECTED wrong-kind logical (uuid on bytes, a date/time/timestamp logical on string) encoded via the logical serializer on binary while JSON encoded raw and both decoders stayed raw — the general primitive build applied `logicalSer(o.Logical)` keyed only on the logical NAME (`schema.go`), kind-blind, whereas `appendAvroJSON` is per-kind. Binary thus disagreed with JSON, and a string-backed time logical produced a bare-varint wire its own `deserString` rejected (self-incompatible — missed by `TestMatrix_SelfReadableAtScale`, which has no wrong-kind-logical-with-custom generator). Fix: gate the `logicalSer` application on `logicalUnderlyingAccept[o.Logical](o)` — the same predicate `validateLogical` soft-drops a wrong-kind logical with — so a resurrected wrong-kind logical keeps the base (raw) serializer; `logicalSer` (schema.go) is the lone kind-blind logical-codec selector, the fixed build's per-logical `switch` and `appendAvroJSON`'s per-kind arms being already immune. Lesson: an "the other format/direction was already immune" claim is a claim (hard rule 5) — verify EACH of the four (format × direction) cells independently; the binary encoder selects its logical codec by name, the JSON encoder by kind, so they have different immunity. Pinned by `TestRegression_CustomSuppressionWrongKindLogicalEncodeParity` (all 10 `logicalSers` entries on a wrong kind, encode parity + self-readability) + `TestRegression_CustomSuppressionSpecValidLogicalStillApplied` (spec-valid placements not regressed). (q) the WRONG-SIZE sibling of (p) on the FIXED build — and proof that shape (p)'s OWN "the fixed build's per-logical `switch` and `appendAvroJSON`'s per-kind arms were already immune" parenthetical was the exact unverified "already immune" claim (p)'s own lesson warns against. uuid is fixed-valid only at size 16 and duration only at size 12 (`logicalUnderlyingAccept`); a no-Encode CustomType resurrects the soft-dropped wrong-size logical, and the fixed-build `case "uuid"`/`case "duration"` applied `serFixedUUIDReflect` (always 16 bytes) / `serDuration` (always 12) while the JSON fixed arms wrote the same — SIZE-blind — yet the suppressed decoder reads `deserFixed{size}`. So BOTH wires emitted a wire their own decoders rejected (16/12 bytes where `size` was declared), and registering a passive custom silently broke a round trip the plain (no-custom, soft-dropped-to-raw) fixed completes — the unit is `(format × logical) on the fixed build`, NOT just the primitive build (p) fixed. Fix: gate the fixed-switch logical-ser on `logicalUnderlyingAccept[logical](o)` (binary, schema.go) and the JSON uuid/duration arms on `node.size == 16/12` with raw fall-through (json_codec.go), mirroring (p) on the fixed path. decimal-on-fixed is immune (hard-errors on nil precision before resurrection; `serFixedDecimal` is size-aware); the unsafe fast path is immune (declined when `hasCustomType`); encodeDefault's fixed arm and the decode/metadata axes were already raw+size-checked. Meta-lesson: when shape (p)'s fix PARENTHETICALLY asserts a sibling path is immune, that parenthetical is a finding-in-waiting until a test exercises it — the next round's quarantine of (p) is where (q) surfaced. Pinned by `TestRegression_CustomSuppressionWrongSizeFixedLogicalEncodeParity` (passive custom must match the plain fixed for both a raw `[size]byte` AND the size-blind serializer's own logical-shaped input, on both wires) + the uuid-on-fixed16/duration-on-fixed12 boundary-1 rows in `TestRegression_CustomSuppressionSpecValidLogicalStillApplied`. Pinned by `TestRegression_Custom{Decode,Encode}*BinaryJSONParity`, `TestRegression_Wildcard*`, `TestRegression_CustomNoCallbackSuppressionBinaryJSONParity`, `TestRegression_CustomPromotionHonorsLogicalSuppression`, `TestRegression_RecursiveCustomTypeParsesAndParity`, `TestRegression_SchemaCacheCustomBoundaryGuard`, `TestRegression_CustomSuppressionScalarTargetParity`, `TestRegression_RecordCustomTypeThroughResolve`. (r) the all-decoders-skip (`ErrSkipCustomType`) fall-through DECODED the value into a probe `any` then gated on `AssignableTo`, so a skipped custom could NOT decode into a typed CONTAINER (struct / []T / map[string]T) or a NAMED scalar (`type Money int64`) — diverging from no-custom decode AND from the `Decode==nil` path (which decodes straight into the target), identically broken on binary, JSON, AND resolved (the shared `wrapDeserWithCustomDecoders` / `wrapDecodeJSONWithCustomDecoders`). `any` / `map[string]any` / exactly-assignable targets worked (assignable), masking it; the whole shape sits OUTSIDE (a)–(q) — it is neither a logical raw-vs-enriched nor a binary↔JSON divergence (both wires fail the same). The naive fix (re-decode the wire straight into the target) is O(depth²) for a CONTAINER-matching (wildcard) custom into a nested typed target — every level re-decodes its subtree into the probe AND into the target (measured ~356 ms at depth 500, vs ~3 ms after) — so the all-skip fall-through RE-DECODES the original wire into the typed target through the base deserializer (`wrapDeserWithCustomDecoders`/`wrapDecodeJSONWithCustomDecoders`; NOT_BUGS #48) — byte-identical to a no-custom decode, bounded by `maxDepth`, with a no-match `bypassCustom` fast path keeping the common case single-pass. An EARLIER attempt placed the already-decoded canonical value into the typed target via a shared recursive converter (`assignCanonical`, since REMOVED); it was abandoned because PLACING A VALUE diverged from a no-custom decode on four axes — a REUSED map kept fresh-map keys instead of its existing ones (reuse), a logical node was enriched instead of landing RAW in a base typed target (logical-into-base), an overlapping union lost its exact wire BRANCH-INDEX (branch-index), and under `TaggedUnions()` the probe `any` (which `maybeWrap` tags) leaked a `{branch:value}` envelope into the TYPED placement (which `maybeWrap` never tags), zero-valuing the branch — silently WRONG, worse than the pre-fix error. Re-decode is correct on all four because it re-runs the base deser straight into the target and DISCARDS the probe entirely (so the tagged-probe issue no longer needs the old "clear `sl.taggedUnions` around the probe" workaround — the tagged value is never placed). **Census lesson that survives the converter's removal: when enumerating a recursion's targets, count the reachable KINDS, not just the wrapped node's — a record/array/map field can be a union, the case the converter's "no union arm" assumption missed.** **Option-dimension pin: run the parity matrix under BOTH default and `TaggedUnions()` — the tagged-vs-untagged divergence is invisible in the default mode.** Probe: decode a wildcard-skip custom into every typed target the base decoder fills (struct / []T / map / named scalar / pointer / [N]byte) and assert == no-custom on binary, JSON, AND resolved; a custom-decoder fall-through that boxes into `any`+`AssignableTo` silently restricts the target set vs no-custom. Pinned by `TestRegression_CustomSkipDecodeMatchesNoCustom` (wildcard-skip == no-custom across the type matrix × binary/JSON/resolved, neuter-verified) + the flipped `TestRegression_DecodeJSONCustomDecoderConcreteTargetErrors` (compatible named-scalar now succeeds == no-custom; incompatible still errors-not-panics). Instance: shape (a) `Decode==nil` custom on a logical node; shape (n) record custom dropped through `Resolve`; shape (r) all-skip into a typed container/named-scalar boxed into `any`. Add to the yield-map under custom types.
 
 ### Blind spot (distilled): Two-mechanism recursion-depth accounting
 
@@ -8455,7 +8455,7 @@ this is the second tier of that same material.
     - (l) custom Decode returning `*T` into a `*T` target: JSON peeled a pointer level -- call the shared helper identically (drop indirectAlloc).
     - (m) no-Decode suppression into a SCALAR typed target still applied the logical arm on JSON (both-succeed VALUE divergence) -- thread the `raw` flag and return before the logical switch; sweep every sibling decoder -- TestRegression_CustomSuppressionScalarTargetParity.
     - (n) record-level custom DROPPED by schema resolution -- `applyCustomToNode` in resolveRecord, mirroring every other resolve arm (unions are the one deliberate non-wrap) -- TestRegression_RecordCustomTypeThroughResolve.
-    - (o) wrong-KIND resurrected logical (uuid/duration on bytes, big-decimal on fixed) transformed on JSON decode while binary stayed raw -- gate each shared `assignBytes` arm AND its lenient-form sibling `hasDecimalBareNumberArm` to spec-valid kinds -- TestRegression_DecimalBareNumberArmHonorsKindValidity + false rows in TestRegression_JSONDecodeAppliesLogicalMatchesDecode.
+    - (o) wrong-KIND resurrected logical (uuid/duration on bytes, big-decimal on fixed) transformed on JSON decode while binary stayed raw -- gate each shared `assignBytes` arm AND its lenient-form sibling `hasDecimalBareNumberArm` to spec-valid kinds -- TestMatrix_UnionBareNumberDispatchByLogicalCarrier + false rows in TestRegression_JSONDecodeAppliesLogicalMatchesDecode.
     - (p) wrong-kind resurrected logical encoded via the logical serializer on BINARY (`logicalSer` keyed on name, kind-blind; self-incompatible wire) -- gate on `logicalUnderlyingAccept` -- TestRegression_CustomSuppressionWrongKindLogicalEncodeParity + TestRegression_CustomSuppressionSpecValidLogicalStillApplied.
     - (q) wrong-SIZE fixed logical (uuid at size!=16, duration at size!=12) size-blind on BOTH wires -- gate the fixed-switch (binary) and the JSON uuid/duration arms on the declared size with raw fall-through -- TestRegression_CustomSuppressionWrongSizeFixedLogicalEncodeParity; proof of trap (5): (p)'s own "fixed build already immune" parenthetical was where (q) surfaced.
     - (r) all-skip (`ErrSkipCustomType`) fall-through boxed a probe `any` + `AssignableTo`, restricting typed targets vs no-custom -- RE-DECODE the original wire into the target through the base deser (NOT_BUGS #48; a value-PLACING converter diverged on reuse / logical-into-base / branch-index / TaggedUnions and was removed) -- TestRegression_CustomSkipDecodeMatchesNoCustom, neuter-verified. Census lesson: when enumerating a recursion's targets, count reachable KINDS (a record/array/map field can be a union). Option-dimension pin: run parity matrices under BOTH default and TaggedUnions.
@@ -12715,3 +12715,870 @@ factor.
   width-CONCENTRATED-at-leaf + zero-min fillers at once (`dagWideSCC`). Instance
   `maxMinBytesVisits` -> `maxMinBytesWork` (`1 + childCount` before descending);
   archive #57/#59; netted by the census.
+
+## Distillation archive (2026-08-02 #69) — the seven pre-convergence ledger lines, verbatim
+
+The §Round ledger lines for every round BEFORE the 8db5133 convergence anchor,
+compressed in AUDIT_CORE.md to a single pre-convergence anchor line when the
+size guard crossed 55000. Each line's own archive citations (#60-#68) remain
+the route to its full narrative.
+
+- 2026-07-01..30 · ea9a2ce→1b1933f · PRE-ERA + KEY-SPACE ERA.
+  CONVERGED→RESET→RE-CONVERGED; #53-#76 filed and fixed; P19-P24; R1 → the
+  PREDICATE CENSUS; the reserved-attribute ENUMERATION → **#74**, **PLACEMENT
+  AUTHORITY**, **rule 2a**, **RULE 7a**; convention 1 grew (e) then **(f)**.
+  Standing lessons: MEASUREMENT NEVER HAPPENED (the neuter rule became the
+  TRIPLE); a net that reds is not one that MEASURES. Verbatim: archive
+  (2026-08-02 #67).
+- 2026-07-30..31 · c17986f→299c392 · COST ERA, four rounds superseded by the
+  5bd3ac0 anchor. 0 behavioral until the last, then **1**: three DoS classes on
+  axes no column had — **P25**, **P26**, **P27** (census Q22). Verbatim: archive
+  (2026-08-02 #67).
+- 2026-07-31..08-01 · 5bd3ac0→0e526c2 · two FULL+FIX rounds superseded by the
+  a5dd23c anchor. The DAG-cost class opened here — a named type referenced twice
+  IS the DAG. **1 behavioral** (**B37**, census Q23; counter RESET to 0), plus
+  the min-bytes product's first two factors, **P28**/**G1** and **P29**/**G2**,
+  both closed. Verbatim: archive (2026-08-02 #67).
+- 2026-08-01 · a5dd23c (START head) · FULL+FIX · **0 behavioral; 1 DoS, P29 one
+  level up: a fresh `schemaMinBytes` walk per CALL, once per container, fixed the
+  same round on ALL FOUR construction paths.** The first landing missed build (a
+  BACKWARD name ref resolves to the fully-built cyclic node, so "cheap stub" held
+  one direction only). Escalated deliverable: **`budgeted_walk_census_test.go`**,
+  every budgeted walk rowed with cost-as-PRODUCT, the ONE bound that caps it, and
+  its REACHING PATHS. **P30**. Narrative: archive (2026-08-01 #60, #61).
+- 2026-08-01 · e9388a7 · FULL, read-only · **0 behavioral; 1 DoS: the min-bytes
+  product's FOURTH factor — the SKIP path's walk was per-RECORD behind a true
+  sentence no cell executed.** Fronts clean, each an EXECUTED claim. **G3 decided
+  by measurement.** Narrative: archive (2026-08-01 #62).
+- 2026-08-01 · e9388a7 (START head) · FIX · **1 BEHAVIORAL (counter RESET to 0)
+  + the record factor bounded + the census rule corrected.** Executing a premise
+  that outranked its own fix found it: **a per-element minimum is not a
+  magnitude, it SELECTS A RULE**, so the stand-in `1` false-rejected every
+  legitimately zero-byte container — sharpest, a 3-byte wire whose accept/reject
+  turned on field ORDER. **P31.** Ruling 2: census rows gained `factors`, each
+  naming the count and the CELL driving it at ≥2 values, read FROM the row.
+  Narrative: archive (2026-08-01 #63).
+- 2026-08-02 · 76acff6 (START head) · FIX · **the measured-bound rule applied to
+  the cost cells it was never applied to** — stated for the walk CONSTRUCTION
+  sites, the wall-clock cells kept one magnitude each and stayed green. Every
+  factor measured FLAT first. The derivation found SEVEN cells, not five, and one
+  was named for a bound it does not measure. Five neuters, five distinct red
+  sets. Verbatim: archive (2026-08-02 #65).
+
+## Distillation archive (2026-08-02 #70) — the four convergence-era ledger lines, verbatim
+
+The §Round ledger lines for the -race-gate FULL round, its FIX, and the two
+rounds that closed convergence, compressed in AUDIT_CORE.md to the format
+§Round ledger itself specifies when the size guard crossed 55000 a second
+time. Their own citations (archive #66, commit 43b0a40, NOT_BUGS #77) remain
+the route to the detail.
+
+- 2026-08-02 · 8db5133 · FULL, read-only · **0 behavioral; 4 net/doc findings,
+  one RED: the -race gate itself.** A 3s FLOOR left `breadthParseBound` cells at
+  2x headroom while every 500ms cell got 6x, so C10a redded on correct code (all
+  three tiers measured LINEAR under -race). The cost-cell guard passed its known
+  violators; G3's ruling rested on an amortization premise false for `SchemaFor`;
+  a conformance comment documented a JSON lenience that no longer exists. Fronts:
+  statement-coverage inverse density (a new metric), the stdlib-JSON
+  differential, the stray-shape question's three implementations. Verbatim:
+  archive (2026-08-02 #66).
+- 2026-08-02 · 8db5133 (START head) · FIX · **all four fixed; -race green and
+  now a MANDATORY recorded gate.** The relaxation became `max(3s, 10x)`, both
+  numbers measured, replacing a rule stated SEVEN times; the cost-cell
+  derivation went from a name prefix in one file to BY SHAPE over the module;
+  **G3 closed**; a false escape comment deleted and its class netted. Nine
+  neuters, nine distinct red sets, two finding holes in the new guards — both
+  surfaced by attacking with an ADDED member. B32c. Detail: commit 43b0a40.
+- 2026-08-02 · b655d12 · FULL, read-only · **0 BEHAVIORAL — the second
+  consecutive zero-behavioral FULL round: CONVERGED, freeze lifts.** 1 net +
+  1 doc finding, neither counter-resetting and BOTH test-only — which is what
+  provoked the rule above. Fronts: a new inverse-density metric (222
+  production funcs with zero by-name mention in the test corpus) →
+  logical.go, varint/soe/skip, schema_canonical, ocf metadata; the
+  safe/unsafe logical tables diffed cell by cell; compat.go. Its
+  order-dependent reader-union verdict was gated documented-intentional
+  after **fastavro EXECUTED gave the identical verdict** (#44). Base +
+  fastavro + -race green; Java un-netted (no JVM).
+- 2026-08-02 · b655d12 (START head) · FULL+FIX · **0 production findings.** Output
+  is the two dispositions only: NOT_BUGS **#77** (regex-spelling residual,
+  stop-signed) and the stale comment repointed at the export_test.go bridge; both
+  new rules recorded above. Production fronts, all EXECUTED against fastavro or a
+  calibration-free twin, all clean: JSON x logical (the repo's JSON differential
+  had ZERO logicalType cells; 15 measured, byte-identical to `json_writer`),
+  promotion x logical (29 cells vs the natural decode), resolved reader-field
+  defaults (28 shapes vs `readresolve`), canonical form (19 name/namespace/backref
+  corners — fingerprints agree). Read clean: ser.go's decimal/float helpers,
+  promote.go, the jsonRead* narrowings (gated on `strconv.IntSize == 64`). Base +
+  fastavro + -race green; Java un-netted.
+
+## Distillation archive (2026-08-03) — three post-convergence ledger lines, verbatim
+
+The §Round ledger lines for the three rounds after the b655d12 convergence
+anchor, compressed in AUDIT_CORE.md to one line each when the size guard
+crossed 55000 (59315, +4315). Each round's full narrative also lives in its
+own commit message; the SHAs are named in the compressed lines.
+
+- 2026-08-02 · 2b83e9e · FULL, read-only · **0 behavioral, 0 production; 1 doc
+  pin** — `fastavroRabinBytes`' comment and its `beHex`/`rabinBEHx` names label
+  the two endiannesses backwards: EXECUTED, fastavro prints LITTLE-endian
+  (`3715a01bf361b035`, byte-identical to twmb's SOE wire) while `Fingerprint`
+  returns BIG-endian. The reversal the helper performs is correct, so no test is
+  wrong. Fronts, all EXECUTED: a parse-ACCEPTANCE differential (141 edge schemas
+  vs fastavro — all 41 divergences map to documented postures); a NEW
+  inverse-density metric, 272/792 production funcs never named in ANY audit
+  doc (unsafe.go 38, ser.go 36, json_scan.go 16); 10k generated
+  schemas × {binary, 5 JSON option sets, resolve, SOE, canonical fixpoint,
+  Root()-rebuild, self-compat, 3 OCF codecs} with recursive + diamond refs;
+  44 carriers × Encode(v)-vs-Encode(&v). Base + fastavro + **-race GREEN**;
+  Java un-netted. Size guard CROSSED (+1886) → archive #69/#70.
+- 2026-08-03 · 38b0c95 · FULL, read-only · **1 production finding, 0
+  wire-behavioral** — `ocf.NewWriter` closes the codec on NONE of its three
+  error returns, while `NewReader` closes on every one (deferred, 2 pins) and
+  `NewAppendWriter` closes on its Seek path; `WithCodec` documents Close as the
+  constructor-or-Close job. Non-wire, so the convergence counter is untouched on
+  the strict behavioral reading — flagged for the maintainer to overrule.
+  Quarantine (38b0c95, doc-only) EXECUTED clean vs fastavro 1.12.2: PCF equal,
+  sha256 byte-identical, Rabin BE = reverse(fastavro LE), SOE header = fastavro's
+  bytes. Fronts, all EXECUTED: inverse-density walk of 289/806 never-named
+  production funcs (logical/varint/skip/promote/schema_canonical/errors/atype/
+  json_scan/ocf) — date/timestamp int32+int64 edges all guarded, varint and skip
+  slicing all pre-bounded, `promotionDeserForLogical` covers all 7 long logicals;
+  CheckCompatibility↔Resolve differential, 5197 pairs × 5 nesting positions, 0
+  divergences; json_scan grammar vs encoding/json, 71 literals × 13 targets + the
+  skip path, 0 unintended leaks (all 27 flags are the documented ±Inf / bare-NaN
+  acceptances). Base + fastavro + **-race GREEN** (299s); Java un-netted. Size
+  guard CROSSED by this line → distillation pass owed next round.
+- 2026-08-03 · 38b0c95 (START head — 38b0c95..HEAD quarantines the two fix
+  commits landed after this line) · FIX · **(1)** `ocf.NewWriter` now releases the adopted codec
+  on every error return (`NewReader`'s named-return + defer, registered BEFORE
+  the option loop so the closure covers the codec whenever the loop adopts it),
+  and the reserved-metadata-key rejection moved below that loop so the arm no
+  longer turns on where `WithCodec` sits. **Behavior change recorded**: with
+  `WithMetadata` written first, a failed `NewWriter` now closes the caller's
+  codec where before it never adopted it — from outside the codec those two
+  states are indistinguishable, which is exactly why uniform adoption is what
+  makes the release observable at all. The constructor set is DERIVED by go/ast
+  (a struct field of type `Codec` marks a codec-owning type; a top-level func
+  returning `*that` plus `error` is a constructor that can fail after adoption),
+  and the guard reds in all four directions plus on an alternate legal
+  declaration spelling (named results). TEN neuters, ten distinct red sets —
+  including the success cell (defer made unconditional) and the two pre-existing
+  `NewReader` pins, which the table links rather than duplicates.
+  `WithCodec`/`NopCloser` doc contracts widened to match. **(2)**
+  `Schema.Fingerprint` now `h.Reset()`s on ENTRY, so the digest is a function of
+  the schema and algorithm alone — a reused hash gave two different answers and
+  a caller-pre-written one a third. Entry not exit: exit fixes only the repeat
+  call and clears state callers read back, MEASURED — an exit reset reds
+  `TestFingerprintRabin` and `TestFingerprintArrayItemsMatchesSpecVector`, which
+  take `Sum64` off the hash they passed, handing them `rabinEmpty` instead of the
+  schema's CRC. No pin asserted the old behavior: every in-repo site either hands
+  over a fresh hash or writes an explicit `h.Reset()` between calls — the suite
+  worked AROUND the gap rather than depending on it — so the reset is a no-op for
+  all of them, the README and doc.go; pickaxe reaches only the two introducing
+  commits. Net crosses algorithm (6, spanning 4–64 output bytes) × prior hash
+  state (6) × schema shape (3, incl. a multi-block canonical form), oracle = a
+  fresh hash of the same algorithm over `Canonical()`; hash-taking entry points
+  DERIVED by go/ast (any exported func/method with a `hash`-package parameter),
+  guard fails both ways. Four neuters, four distinct red sets — the exit-reset
+  neuter reds 108 cells to the no-reset neuter's 72 while leaving the repeat pin
+  green, which is the two placements told apart in one observation. Base +
+  fastavro + **-race GREEN** on both fixes; Java un-netted. Detail: commits
+  5172647, 73f1dc8. Distillation still OWED (AUDIT_CORE over bound);
+  BUG_AUDIT.md deliberately untouched — it carries uncommitted maintainer edits,
+  so the archive move waits for a round that can take the whole file.
+
+## Distillation archive (2026-08-03 #2) — the 73f1dc8 FULL round, verbatim
+
+- 2026-08-03 · 73f1dc8 · FULL, read-only · **1 behavioral finding** — a
+  `time-millis`/`time-micros` wire value outside [0,24h) decoded into a
+  `time.Time` target and re-encoded SILENTLY changes value, identically on all
+  four paths (binary safe, unsafe struct field, JSON encode, JSON decode);
+  `time.Duration` and `any` are exact everywhere. It contradicts NOT_BUGS #52's
+  deciding premise ("twmb's own round trip is exact ... never silent
+  corruption"), which reasoned only about the `time.Duration` carrier — #52
+  RULED the out-of-domain wire acceptable precisely because nothing could
+  silently change it. Both references reject such a value LOUDLY in their
+  converters (Java `LocalTime.ofNanoOfDay` throws, fastavro `datetime.time`
+  raises), so the twmb behavior is the one shape neither the references nor #52
+  sanction. Reachable through `SchemaFor` (`,time-millis` on a `time.Time`
+  field is accepted per #38) and through a record DEFAULT (`"default":90000000`
+  → `{"t":3600000}` on re-encode), so axes 3 and 4 both carry it.
+  Class ELIMINATION: a calibration-free wire→target→wire byte-identity matrix
+  (oracle = this package's own encoder against its own decoder, no expectation
+  table) over 14 logical schemas × up to 5 Go targets × both wires. Exactly two
+  cells are silent — `time-millis`/`time-micros` × `time.Time` outside [0,24h);
+  every other cell is byte-identical or errors LOUDLY, including
+  `date`→`string` at the int32 extremes (the year-5881580 date string the
+  encoder cannot re-read, which errors rather than corrupting).
+  Second finding, non-wire: a codec handed to a SUCCEEDING ocf constructor that
+  does NOT adopt it is never Closed — measured 0 Close calls for all three
+  cells (`NewReader` and `NewAppendWriter` with a name that does not match the
+  header, `NewWriter` with a second `WithCodec` superseding the first). This is
+  the cell missing from the ownership enumeration `WithCodec`'s doc committed to
+  one round earlier ("Writer.Close, Reader.Close, and a constructor that takes
+  the codec and then fails"). The trade-off is real and is the maintainer's:
+  adopting-and-closing every supplied codec completes the rule, but a caller
+  looping over files with one shared codec then needs `NopCloser` — which the
+  doc already requires of sharers, since `Reader.Close` closes it anyway.
+  Fronts, all EXECUTED. (i) Quarantine of 5172647+73f1dc8: clean —
+  `Canonical()` recomputes a fresh slice per call (no aliasing into the
+  fingerprint), `h.Sum(nil)` allocates, every `NewWriter` error return including
+  the two `err`-shadowing `if` statements assigns the named result so the defer
+  sees it, and the moved reserved-key scan reads a caller-built map so it
+  amplifies nothing. (ii) NEW INSTRUMENT — inverse density by STATEMENT
+  COVERAGE (`-covermode=set` over the whole suite) rather than by
+  never-named-in-docs: 9700 statements, 303 uncovered, 97%. Every uncovered
+  block sampled is correct-and-unexercised: `timeToTimestampScaled`'s three
+  overflow guards (all three re-derived by hand — the nanos adjustment branch
+  rejects at exactly `MinInt64`, sec=-9223372037 nsec=145224192), the built-in
+  codecs' plain `Decompress` shims (dead only because the reader prefers
+  `DecompressBounded`), `nopCloser`'s honest-unbounded fallback, and
+  `appendCanonField`'s six attribute arms, which have NO production caller at
+  all — `canonicalBytes` is reached only from `Schema.Canonical()` on a stripped
+  tree, so the "general-purpose writer mode" its comment cites does not exist.
+  (iii) Resolution name matching against the spec's own words and Java's
+  `Resolver`: the spec says named types match on the UNQUALIFIED name, Java
+  agrees (`EnumAdjust`/`FixedAdjust` compare `getName()`; `RecordAdjust`'s
+  fullname check is commented out with "Current implementation doesn't do this
+  check"), and twmb's `namesMatch` already implements exactly that — EXECUTED:
+  `a.R`↔`b.R`, `a.E`↔`b.E`, `a.F`↔`b.F` and a nested pair all resolve, while
+  `a.R`↔`a.Q` rejects. (iv) `atype`'s logical-type vocabulary checked against
+  the spec's headings — complete and correctly spelled; the package is
+  constants only. Base + fastavro 1.12.2 (differentials confirmed EXECUTING,
+  not skipped) + **-race GREEN** (390.9s root, 54.3s ocf); Java un-netted (no
+  JVM on this host). Size guard was CROSSED (+4315) → the three preceding
+  ledger lines compressed, verbatim above.
+
+## Distillation archive (2026-08-06 #1) — AUDIT_CORE.md distillation pass, verbatim originals
+
+AUDIT_CORE.md crossed its 55,000-byte bound at 59,316 (+4,316), crossed by the
+1(e1)-(e6) amendment. §Feedback loop's size guard mandates a distillation pass
+at the top of the next round. Post-pass: 53,794 before the round's own ledger
+line. Nothing was deleted; every compressed block's original text is below, in
+document order. The compression is prose only — every grep target, test name,
+file path, identifier, artifact template field, shell snippet and imperative
+survives in the live file.
+
+### Header — file-system bullets and the PRODUCT premise (verbatim)
+
+> This is the always-loaded round driver for audit rounds: gates, scope,
+> convergence + the round ledger, conventions, formats, and the round template.
+> It is deliberately slim; the pattern material lives one tier down in
+> AUDIT_PATTERNS.md.
+>
+> **The file system:**
+>
+> - **AUDIT_CORE.md** (this file) — load at the start of every round.
+> - **AUDIT_PATTERNS.md** — the indexed pattern compendium: bug-shape patterns,
+>   structural blind spots, the yield map, the net inventory, and fuzz triage.
+>   Do NOT pre-load the whole file. Scan its `## Index` when planning fronts and
+>   when a candidate finding needs its pattern's structural question; pull only
+>   the matching entries.
+> - **NOT_BUGS.md** — the filing-time filter. Do NOT pre-load. Before filing
+>   ANY finding, check it against the `## Index`; a match is not a finding.
+> - **FIX.md** — the after-fix sweep playbook; run it after every fix.
+> - **CLEAN.md** — the cleanliness-pass driver (zero behavior change).
+> - **BUG_AUDIT.md** — frozen archive: full narrative history + the
+>   Distillation archive (verbatim originals of everything distilled or
+>   tombstoned). Never loaded during rounds; consult it when a distilled
+>   entry is too terse to act on.
+>
+> **THE PRODUCT IS THE LIBRARY — read this before anything else in this file.**
+> What ships to EXTERNAL callers is the only thing this audit exists to make
+> correct: the exported API, and the wire it reads and writes. The test suite, the
+> censuses, the DoS battery, the pattern compendium and these framework documents
+> are INSTRUMENTS. An instrument earns work only when it is failing to protect the
+> product, and the deliverable then is the PRODUCT DEFECT it was hiding — the
+> instrument fix rides along. **A round that improves an instrument and changes
+> nothing an external caller can reach has not moved the audit forward, however
+> sound the improvement.** Every rule below is downstream of this one; where a rule
+> seems to license work on the instruments for their own sake, this premise wins.
+
+### §Before changing behavior — gate preamble (verbatim)
+
+> **Read this section every time you are about to propose or apply a behavior change. The checks below are not advisory; skipping them is a process failure regardless of whether the change is correct.**
+>
+> A "behavior change" is any code edit that tightens, loosens, or alters what the encoder accepts, what the decoder accepts, what gets rejected/coerced, what the metadata API surfaces, or what wire bytes get produced — anything that would invalidate an existing call site. Pure DRY refactors that preserve identical behavior are not.
+>
+> For every proposed behavior change, produce — *before* writing the edit — the following artifact:
+
+### §Before changing behavior — pickaxe block, census-registration block, verdict arms (verbatim)
+
+>     Recent-commit pickaxe since the latest landed patch-set on main (REQUIRED — anti-ping-pong check):
+>       base: <the most recent large patch/merge commit on main (`git log --oneline --shortstat main` to spot it), SHA + subject>
+>       pickaxes ran: <`git log --oneline -S '<exact identifier / predicate / error string being changed>' <base>^..HEAD -- <file>` and/or `-G '<regex>'` — pickaxe the EXACT code being changed, not the general area; one pickaxe per identifier the edit touches>
+>       hits: <for every hit, SHA + subject + one line classifying what that commit did to this code: behavior-introduction | refactor/DRY | error-echo bounding | comment-only; or "none — predates the patch-set">
+>       verdict: <introduced-deliberately-in-range | only-refactored-in-range | untouched-in-range>
+>
+>       If "introduced-deliberately-in-range": do not silently apply the change, and do not silently drop it either — open a correct-behavior discussion with the maintainer before any edit. Quote the introducing commit's rationale, state what the proposed change would do differently and the evidence for it (spec text, Java/fastavro behavior, observable breakage), and lay out the trade-off between the two behaviors. The recent commit is evidence of intent, not proof of correctness; the proposed fix is evidence of a problem, not license to revert. The discussion decides which behavior is right — what the gate prevents is the silent ping-pong, not the reversal itself.
+>
+>   Census registration (REQUIRED when the edit ADDS or CHANGES a predicate):
+>     <the semantic question the predicate answers, and its censusRegistry id in
+>     predicate_census_test.go. A NEW question needs a new entry (canonical
+>     predicate / authority, every answerer per representation, corpus, driver);
+>     an existing question needs its answerer list and tell COUNTS updated. A
+>     predicate outside the registry is invisible to the only net that watches
+>     predicate drift, so "not registered" is an incomplete fix, not a style nit.>
+>
+>   Verdict: <documented as intentional | not documented | documented but contradicted by new evidence | REFERENCES SILENT>
+>
+>   If "documented as intentional": STOP. Do not apply the change. Surface the policy to the user and ask whether to propose a rationale change.
+>   If "not documented": proceed; treat the change as a new policy decision and note the new pin/doc entry it requires.
+>   If "documented but contradicted": cite the new evidence (deployed Java/fastavro divergence, real-world user report, cross-impl source) and ask the user before proceeding.
+>   If "REFERENCES SILENT": STOP and route to cross-impl rule 4 (decision table + HALT), NOT to rule 2. Silence is not permission — see NOT_BUGS §Cross-implementation divergence policy 2a. The check is mechanical: to claim a reference blesses the behavior you must name the FILE:LINE that reads that attribute at that placement, or performs that lift, or exposes that surface. If no such line exists, neither reference has an opinion, "either impl accepts" is unsatisfiable, and the permissive tiebreak has no input to break. Where this package's own adjudicated posture already covers the placement, that posture may decide — cited as THIS PACKAGE's, never laundered as the reference's.
+
+### §Before changing behavior — the DELEGATION rider and the json.Number bullet (verbatim)
+
+> The gate travels with DELEGATION: any sub-agent prompt that can produce findings must point the agent at §Known intentional divergences (and the in-test "Documenting"/"Intentional" pins) and require the quoted-search verdict per finding. (Instance: a fan-out agent not handed the gate re-filed the documented bare-union first-match dispatch as a new divergence; a sibling that had read this file gated the identical finding as documented-intentional and declined.)
+
+> - **json.Number** is a cross-cutting policy area. The deliberate design, in two
+>   sentences (full text: archive 2026-07-27 #5): **the Avro schema is the
+>   contract** — for numeric schemas including logical variants, json.Number
+>   carries the raw numeric wire value and logical formatting is bypassed;
+>   json.Number is **numeric-only**, rejected for stringy schemas
+>   (string/bytes/fixed/enum) on BOTH sides via one shared guard each
+>   (`rejectJSONNumberRawTarget` / `rejectJSONNumberStringTarget`), with map keys
+>   the one content-aware exception (validated per key, both sides). And **its
+>   content must always be a valid JSON number literal**, per the stdlib
+>   contract — decode rejects wire content with no valid JSON-number form, encode
+>   rejects content that doesn't parse as the schema's numeric type.
+
+### §Scope — the `_test.go` clause, the recency rationale, the git-allowance list (verbatim)
+
+> **`_test.go` is not the subject.** It is read constantly — to judge whether a cleared area is genuinely netted, to find the pin that already covers a candidate, to neuter and confirm a guard bites — but it is read AS AN INSTRUMENT, never walked as territory. This distinction is not pedantry: the sentence above once said `*.go`, which includes tests, and a walk took it literally for six consecutive commits that changed zero library lines.
+>
+> Why non-negotiable: bugs do not correlate with recency. The history is overwhelmingly bugs that survived multiple rounds *until* an audit walked code nobody had touched in months. A 2022 bug and a most-recent-commit bug are equally in scope. Recency is not evidence of risk; lack of recency is not evidence of safety.
+
+> **Git is allowed for:**
+>
+> - Understanding *why* a piece of code is the way it is (after you've already identified the line as suspect).
+> - Reading a commit message's claim and verifying it against the current code (per hard rule 5 — comments and commit messages are claims, not evidence).
+> - Finding the original landing of a code shape to understand surrounding context, *after* it's been flagged on its own merits.
+>
+> The Convergence section names recent rounds' findings only as a *catalog of bug shapes* — not a map of where to look. Re-derive candidate sites each round from structural patterns, never from "what changed."
+
+### §Convergence — Test-infrastructure class, convergence rule, quarantine bullets, closing paragraphs (verbatim)
+
+> - **Test-infrastructure**: a hole in a net, guard, census or harness. **Counts
+>   as a finding ONLY if the round DEMONSTRATES the production defect it hides.**
+>   Without that demonstration it is not a finding at all, however rigorously the
+>   hole is proved — proving the hole is the easy half and it is not the half
+>   that matters. §Scope's target is the codebase. (Maintainer, 2026-08-02, after
+>   two rounds produced six findings of which zero were production: "derive the
+>   set" generates its own next finding forever, because every derivation has a
+>   scope and there is no bottom. That regress is closed here, not by auditing
+>   the guards more carefully.) Judge a front by production defects per round;
+>   the honest denominator is DISTINCT defects, not commits — fourteen commits
+>   fixed five things, four of them one cost expression ruled a factor at a time.
+
+> **Convergence rule**: an area converges when a round files zero BEHAVIORAL
+> findings in it; the walk converges after two consecutive full rounds with
+> zero behavioral findings anywhere — read them off §Round ledger, which is
+> the sole source of truth (a clean round that isn't ledgered doesn't count,
+> because nothing can prove it happened across sessions). Doc pins,
+> battery-covered DoS bounds, and new NOT_BUGS entries (policy records) do
+> NOT reset the counter.
+
+> - **A fix generation is quarantined EXACTLY once — not zero times.**
+>   Commits at or before the newest ledger line's HEAD are cleared; never
+>   re-audit cleared work. The dual failure is a fix generation that is
+>   never quarantined AT ALL, and it happens silently whenever a FIX round
+>   ledgers its OWN post-fix HEAD: its commits are then "at or before the
+>   newest line's HEAD," so the next round computes an empty scope and the
+>   fixes go straight to cleared without any generation ever auditing them.
+>   **Therefore: a FIX round's ledger line MUST record its START head — the
+>   HEAD before its own commits — in the line's HEAD field**, so that "code
+>   commits since the newest ledger line's HEAD" naturally covers the fix
+>   commits. Precedent to copy verbatim: `2026-07-19 · 9f0fb26 (START head
+>   — 9f0fb26..HEAD quarantines the fix commit landed after this line)`. A
+>   FULL (read-only) round ledgers the HEAD it audited, since it adds no
+>   commits. When a past line got this wrong, the correcting round names
+>   the orphaned commits explicitly in its own line and folds them into the
+>   next quarantine scope rather than leaving them cleared-by-accident.
+>   Only after that is "no code commits since the newest line → scope is
+>   EMPTY: skip straight to the full-codebase walk" a sound conclusion.
+> - **The quarantine is a bounded prefix, not the round.** It is scoped to the
+>   unconverged fixes and should be a small fraction of the session; the
+>   round's primary deliverable remains the full-codebase audit per §Scope,
+>   every round, regardless of what the quarantine finds. If the quarantine
+>   alone fills a session, the prior round's fixes were defective wholesale —
+>   file THAT as a finding and stop, rather than silently spending the walk on
+>   rework.
+
+> **An audit round converges when it comes back clean.** The recurring bug
+> *shapes* are catalogued in AUDIT_PATTERNS.md as structural questions — use
+> them as the method, never as a map of where to look (recency is not a
+> signal; see §Scope). The rule: bugs persist until checked.
+>
+> Audit rounds bias toward finding real bugs over filler. "Verified" entries
+> are valuable when they document a specific area exhaustively checked against
+> the spec + at least one reference impl, with concrete inputs that could have
+> failed. Empty verifications ("checked X, looks fine") are noise — a short
+> clean report beats padding.
+>
+> The trap goes both ways: pattern-matching a comment or shape without proving
+> the bug is one failure mode (see convention 5 on comment-as-evidence);
+> assuming cleanness without verification is the other. Every `// matches
+> Java's X` comment, every "the test name implies it's covered" assumption,
+> and every "stdlib handles this" feeling is a hypothesis that needs testing
+> before it counts as verified.
+
+### §Round template — step 2's `-race` paragraph and step 6 (verbatim)
+
+>    **`-race` is MANDATORY and its result RECORDED in the ledger line**, run
+>    to completion to a file, never spot-checked. It is the sole oracle for
+>    data races AND the mode where every wall-clock cell is judged against a
+>    different bound, so it is the run that can red on correct code. A
+>    NONDETERMINISTIC red does not get to be a shrug: one commit passed at
+>    12.8s and failed at 3.06s against the same ceiling while the ledger said
+>    "green". Triage it with the measured-bound rule — drive the cell's factor
+>    at two values IN THAT MODE; superlinear is a code finding, flat means the
+>    ceiling is mis-sized and the ceiling is the fix.
+
+> 6. **Ledger**: append the round's line to §Round ledger. Fold new lessons
+>    per §Feedback loop. **SCALE THE OUTPUT TO THE YIELD — a round's output does
+>    not require a commit.** Zero production findings means the ledger LINE and
+>    nothing else: no narrative archive, no distillation unless a bound is
+>    actually crossed, no pattern minted for a lesson the next round will restate
+>    better. A round is entitled to end having changed nothing — see §Feedback
+>    loop for the commit counts that produced this rule.
+
+### §The executable net runs first (verbatim)
+
+> **What the net is.** Real findings are one of two classes: "disagrees with the reference" (catchable only by a real-impl oracle) or "path X drifted from path Y / edge input" (catchable by cross-path differential + property fuzzing). Both are automated — run that automation first.
+>
+> **How to run it:** `go test ./...`, plus — with `AVRO_FASTAVRO_PYTHON` set — the fastavro differential, and under `-tags=cisuite` the Java differential. It machine-checks whole classes against *independent* oracles: target-type parity (pattern 12), foreign-impl wire parity, canonical form + Rabin vectors, and the Tier-2 boundary/identity nets.
+>
+> The full per-wave matrix inventory — what each generative axis covers, with
+> its calibration constraints — lives in AUDIT_PATTERNS.md §Net inventory.
+> Consult it when planning fronts so manual effort concentrates on the
+> UNCOVERED intersections; the maintained list of known-uncovered
+> intersections is §Open net gaps below.
+>
+> What this buys the audit: these classes are caught at commit time, so manual effort should concentrate on the *uncovered intersections* instead of re-deriving what the suite already guards.
+>
+> **But a suite flag is a CANDIDATE, not a finding — exactly like the greps.** When an invariant fails or a differential mismatches, you still owe the §"Before changing behavior" documented-intentional gate before calling it a bug. (Instance: the parity invariant flagged `json.Number`→bytes encode/decode as an asymmetry; it was documented-and-pinned intentional. Declaring it a "bug" before running the gate was the exact error the gate exists to prevent.) The suite tells you WHERE to look; the gate tells you whether it's a bug or a policy.
+
+### §Audit conventions — rule 1 preamble, (e), (e1)-(e6), the label prohibition, (f) (verbatim)
+
+> 1. **Fix-application mode is opt-in.** Read-only is the default; the maintainer requests fixes explicitly ("fix" / "fix N" / "apply the patch"). When fixes are applied, the round isn't done until: (a) the full test suite (`go test -count=1 ./...`) passes after every edit, (b) the FIX.md after-fix sweep playbook has been worked through, and (c) every fix is paired with a positive regression test in the in-repo suite (not just the sandbox), pinning both the rejected boundary (or new acceptance) and the boundary-1 cases that must still pass, and (d) every "X is already immune / unaffected / the other path was already correct" claim in the fix's rationale is verified by a probe or test in the same round -- an unverified immunity parenthetical is a finding-in-waiting (see FIX.md item 13; shapes (p)→(q) in the CustomType entry are the canonical instance), and (e) every fix ships a CLASS-ELIMINATION MATRIX folded into the permanent suite, not just an instance pin. Sandbox tests prove a bug exists; in-repo tests lock the fix.
+>
+>    **(e) in full — the class-elimination rule, because a pin for the reported instance leaves the class open.** The fix's net must NAME ITS AXES and cross them, so the cell that was reported is one cell among many and its siblings are decided too. The axes are whatever could have made the instance behave differently — carrier / container / wire / target / context / boundary value — and the one that matters most is the axis the bug's own mechanism turns on, which is rarely the axis the report was written in. Two standing requirements: the expectations come from an oracle INDEPENDENT of this package (a reference, a cross-path twin, or a calibration-free invariant like encode-implies-decode), never read off current behavior; and the matrix is proved NON-VACUOUS by neutering the exact production arm and observing the TRIPLE — exit != 0, RUN > 0 under `-v`, no `panic:` — with the red set NAMING the neutered mechanism, so two different neuters do not produce the same red. A matrix whose cells all pass before the fix was measuring nothing.
+>
+>    **(e1) THE NET IS THE REGRESSION TEST; DO NOT ALSO ADD A PIN.** When (e)'s
+>    matrix sweeps axes that CONTAIN the reported instance, that instance is one
+>    cell among many and gets no test of its own. A pin is warranted only when the
+>    instance falls OUTSIDE every axis — and the round must then NAME that axis
+>    and say why widening it was rejected. "`reflect.StructOf` cannot synthesize
+>    unexported fields or cycles" is honest; "the pin reads more clearly" is not.
+>    Adding both is not belt-and-braces: the pin is redundant BY CONSTRUCTION the
+>    moment the net exists, and the pile it builds is what hides the cells that
+>    are genuinely un-netted — 645 `TestRegression_` funcs accumulated this way.
+>
+>    **(e2) NAME WHAT THE TEST IS, because the name is what later rounds grep.**
+>    `TestRegression_` means ONE instance; a table loop or a subtest fan is a net
+>    and takes a net prefix (`TestMatrix_`, `TestCensus_`, `TestInvariant_`,
+>    `TestGenerative_`). 236 of those 645 were structurally nets — one running
+>    1,290 subtests — so the name stopped discriminating and the pre-report grep
+>    in §Findings that don't count silently lost its meaning: a hit that meant
+>    "the class is netted" was read as "the instance is pinned." Renaming such a
+>    test closes a real hole; it is not tidying.
+>
+>    **(e3) WHEN THE MECHANISM IS A SHARED HELPER, THE AXIS IS ITS CALL-SITE
+>    SET.** (f) applies to the CALLERS: a helper's contract is re-entered once per
+>    site, so a site with no cell is a route on which the fix is simply unproven.
+>    Derive the sites from source (an AST scan for the helper's `CallExpr`), give
+>    each one a cell, and ship a guard that reds in BOTH directions — one that
+>    only notices removals lets the next caller ship unexercised. Instance:
+>    `fieldByIndex`'s refusal to write through a nil UNEXPORTED embedded pointer
+>    has five call sites (the compiled decoder in `unsafe.go`, JSON decode's
+>    present-key and default-fill arms, the resolved decoder's writer-op and
+>    reader-default arms); the fix proved one, and neutering the other four left
+>    the pin GREEN.
+>
+>    **(e4) AN AXIS CAN BE COLLAPSED BY THE NET'S SETUP, NOT ITS GENERATOR — SO
+>    EVERY AXIS NEEDS A RUNTIME LIVENESS FLOOR.** Read the VALUE builder as well
+>    as the shape builder: generating a value is not exercising it. This is an
+>    assertion, not advice — the net must COUNT how many times each arm was
+>    actually realized and FAIL when a count falls under a stated floor, so an arm
+>    that goes dead reds loudly instead of passing. Instance:
+>    `TestGenerative_EmbedShapeWalkerAgreement` generated a pointer embed on half
+>    of its 16,000 shapes and then called `allocPointers` on every one before
+>    encoding, so its OCCUPANCY axis carried a single value for the net's entire
+>    history while the shape axis looked fully crossed.
+>
+>    **(e5) A PARITY ORACLE IS BLIND UPSTREAM OF ITS FORK.** Wire A against wire B
+>    cannot see a bug in code the two SHARE: both sides break identically and
+>    agree, so the net stays green. When the mechanism under test sits BELOW the
+>    fork, the assertion must be answerable FROM THE INPUT, not from a sibling
+>    path. Instance: `setDecimalRat` is shared by the binary decoder and both JSON
+>    decimal arms, and a cross-wire parity matrix written specifically for its
+>    overflow guards stayed GREEN under the very neuter it was written for; what
+>    worked was an input-side invariant — every literal is finite, so a float
+>    returning +/-Inf is wrong regardless of what the sibling path did.
+>
+>    **(e6) FUZZ SEEDS ARE COVERAGE WITHOUT ASSERTION.** A seed corpus asserts
+>    only "did not crash," so when MEASURING whether the nets cover something,
+>    exclude `Fuzz*` from the net side — counting it hides exactly the
+>    executes-but-unchecked case the measurement exists to find. Instance:
+>    `json_decode.go`'s tagged-union container branch is lit by a seed and
+>    asserted by nothing, and including Fuzz on the net side made that real gap
+>    read as covered.
+
+>    **🚫 DO NOT REFERENCE AUDIT ROUNDS, FIX NUMBERS, COMMIT SHAs, OR ANY AUDIT-INTERNAL LABELS IN REGRESSION TEST NAMES OR COMMENTS. EVER.** No `F1` / `F2` / `F11` / `audit round 85` / `F-round` / `the F2-round` / `pre-F1-fix` / `post-fix re-audit of F11` / `commit ae99f46` / `the audit's 100ms threshold` / `across the audit rounds` / `next-round audit caught` / `prior round's working-tree fix` / `round-85 fix added`. These labels rot the moment another round happens and they bias future auditors toward "this area was already covered." Regression-test comments document the **structural reason the behavior is correct**: the invariant being pinned, the boundary value being tested, the reference impl being matched, the failure mode being prevented. Never the audit-round narrative. If you write "this locks the Fn fix" — delete it. A reader who has never heard of audit rounds should understand exactly what behavior is being pinned and why.
+
+>    **(f) DERIVE THE SET, DO NOT LIST IT.** Every fix's rule holds over a SET —
+>    the caps, the walk arms, the reserved attributes, the tag tiers — and every
+>    follow-on finding this walk has produced was a member of a set that was
+>    already enumerable IN SOURCE at fix time. So, per fix: name the set; name
+>    what in source ENUMERATES it (a switch, a constant vocabulary, a slice of
+>    rules, a set of call sites — **a written doc list is NOT an enumeration**,
+>    #11's cap list omitted ten bounds a scan found); have the FIX ask that
+>    enumeration and the NET cross it; and ship a guard that FAILS when a member
+>    appears unrouted. Attack the guard in BOTH directions yourself — add a
+>    member and remove one — because a guard that only notices removals lets the
+>    next member ship unexercised, and a count that only notices additions goes
+>    stale silently.
+>
+>    **THIS RULE HAS NO FIXED POINT, AND IT NEEDS A STOPPING CONDITION.** Every
+>    derivation has a scope of its own: a regex is a scope, an AST walk's file set
+>    is a scope, a module boundary is a scope. So each "derive it" produces a fresh
+>    hand-written edge, and a walk that keeps applying the rule to its own guards
+>    generates one finding per round forever — it did, four rounds running, each
+>    correct and each purely about the guard one level up. **STOP when the
+>    remaining scope is one an AUTHOR controls rather than one the GUARD controls,
+>    and say in the fix where you stopped and why.** A guard scoped to "every
+>    member of this switch" is finished; the switch is the author's. A guard
+>    scoped to "declarations matching this regex" is not, because the spelling is
+>    the guard's. And per §Findings that don't count, the next edge outward is not
+>    a finding unless it hides a production defect.
+>
+>    Two traps, both paid for. **A grep over one helper's CALLERS does not
+>    satisfy this**: a second implementation of the same question never calls the
+>    first one's helper, which is how the default walk's union arm survived a
+>    sweep of the emit paths. And **mirroring is not deriving**: two sides that
+>    restate one rule agree only until one is edited, so prefer the structure
+>    where both ASK the same value — the tag tiers became a slice both the
+>    resolver and the table walk, so neither can grow a tier the other lacks,
+>    which no amount of matching comments could guarantee.
+
+### §Audit conventions — rules 2, 3's oracle paragraph, 4, 5, 8 (verbatim)
+
+> 2. **Every claimed bug requires a runnable Go test verified failing against the codebase as it currently sits on disk.** Verification means: a sandbox module (typically `/tmp/avro_audit_verify/`) that imports `github.com/twmb/avro`, the test file go-vetted, `go test -run TestRegression_<name>` run, and the failure output observed and quoted in the report. A test written without running is not a confirmed finding. The current git branch is irrelevant — what matters is that the test fails against the source on disk.
+>
+>    This applies **per site, not per bug shape**: multiple sites with the same shape each need their own failing test, because a site may have a compensating downstream guard. "The same shape applies for defense in depth" without a failing test for that site is not a finding — write the test or drop the site.
+>
+>    **Sibling sweep is required, not optional.** After confirming a finding at site X, grep for the same shape (the dispatch arm, the stdlib call, the accumulator form) across the rest of the codebase, and either (a) confirm a second site fails with its own runnable test (now N findings, not 1), or (b) state which sites were grepped and name the compensating guard or structural reason each is unaffected. "Only looked at site X" is incomplete. (Instances: array zero-byte cap drift, 4 sites, 2 buggy; `big.Rat.SetString` DoS, 4 sites across decode + encode.)
+>
+>    **Callback-firing claims need a value-TRANSFORMING callback.** An identity/value-preserving CustomType callback cannot distinguish "the callback fired" from "the raw value was coerced into the target" — the values coincide, so the probe passes either way. Use a marker recording `%T`/`%v`, or an arithmetic transform. (Instance: an identity custom "confirmed" a union-branch custom fires on bare-JSON decode; a ×10 transform showed binary=70 vs JSON=7 — the custom was skipped and coercion produced the same number.)
+
+>    For VALUE-level Java behavior ("what bytes / what JSON does Java produce for input X"), the live oracle beats source archaeology: `testdata/oracle/SchemaOracle.java` accepts an `RT` command (binary-decode a value → re-encode to BOTH JSON and binary, base64 over the line protocol) driven from a `cisuite`-tagged test — `java_value_differential_test.go` is the pattern to copy. CI runs it against the real avro-tools jar; once a behavior becomes documented policy, ASSERT the parity in that test (not just log it) so an avro-tools upgrade that changes Java's behavior fails CI instead of silently rotting the rationale.
+>
+> 4. **Spec-divergence claims cite at least two implementations.** Java is mandatory; one of fastavro / goavro / avro-tools is the corroborating second. Prior auditors have made wrong claims about Java's behavior more than once — independent corroboration catches that. The rule applies in reverse: asserting "library X does Y" requires reading X's source, not reasoning from API similarity. (Prior false claim: twmb/avro is a hamba fork. It is not — `git log --reverse` is the only authoritative source for lineage.)
+>
+> 5. **Source comments, commit messages, AND public-API doc strings in twmb/avro are not authoritative evidence.** "matches Java's X", "unreachable: ...", "all four dispatch sites agree", a `TestRegression_` name, "mirrors helper X" — each is a claim made when it was written, which may have rotted or been wrong from the start. **Public-API doc strings are testable contracts**, not description: "Root preserves all metadata including doc strings, namespaces, and custom properties" is a value-preservation claim needing probes at boundaries (precision-edge ints, large strings, unusual unicode). Verification goes against the cited source (`apache/avro` / `fastavro` / `hamba/avro`, or the in-repo implementation) — list the helper's documented input shapes and test each. (Instances: (i) the union-default coercion comment claimed Java parity, three impls disagreed; (ii) a message said `serNull` reached parity with `isNilValue` but only Interface peeling was added, not Pointer; (iii) `Schema.Root`'s "preserves all metadata" while two `json.Unmarshal`-into-any sites rounded ints > 2^53.) Comments are starting points for intent; the source is what's true.
+
+> 8. **Reference-implementation clones live under `~/src/{org}/{repo}`** — preferred over WebFetch because `grep -r` and whole-file reads are faster and more thorough than `raw.githubusercontent.com` one-URL-at-a-time. WebFetch is the fallback when a clone is missing:
+>    - `~/src/apache/avro` — Java + Python + C + C++ in one repo (Java is the spec reference; `lang/java/avro/src/main/java/org/apache/avro/` is the path)
+>    - `~/src/apache/avro-rs` — Rust (separate repo)
+>    - `~/src/fastavro/fastavro` — most-used non-Java Python; the de-facto second-implementation cross-check
+>    - `~/src/linkedin/goavro` — Go-ecosystem reference, prior to twmb/avro
+>    - `~/src/hamba/avro` — Go-ecosystem reference, separate lineage; widely deployed
+>    - `~/src/iskorotkov/avro` — fork of hamba/avro with downstream changes worth diffing against hamba
+>
+>    twmb/avro's lineage: **not** a fork of hamba or goavro. `git log --reverse` shows `ab1f036 "initial avro code"` (2022) as the root with no inherited history; the code is original, even though the public API is naturally similar to other Go Avro libraries because Avro itself is the shared reference.
+
+### §Findings that don't count — preamble and three compressed bullets (verbatim)
+
+> Reminder: the §"Before changing behavior — required pre-action gate" section is the imperative form. Run it before proposing anything. The bullets here describe what gets rejected after the fact — but the work to *avoid* the rejection is the pre-action gate.
+>
+> These submissions don't qualify as findings:
+>
+> - **A defect in TEST INFRASTRUCTURE, unless you demonstrate the production defect
+>   it hides.** Name the defect and the public call reaching it. A guard that
+>   under-reports a declaration spelling nobody has written, a cell whose bound has
+>   slack, a net that would miss a member if one existed — these are maintenance,
+>   not findings, and they belong in the round's work rather than its report.
+> - **Re-finding something already pinned by a `TestRegression_*` test** — UNLESS the pin is itself the bug (pattern 13). The grep `TestRegression_` is the pre-report check, and it answers ONLY "is this INSTANCE pinned?" — a hit is not evidence the CLASS is eliminated. To ask whether the class is covered, grep the net prefixes (`TestMatrix_|TestCensus_|TestInvariant_|TestGenerative_`) and check that matrix's AXES against the instance in hand (rule 1(e1), 1(e2)). The exception is pattern 12: a pinned rejection that violates round-trip parity IS the finding (quote the pin, propose its replacement).
+> - **Re-litigating documented intentional behavior** — *what the pre-action gate exists to prevent.* If the gate's verdict is "documented as intentional," the change does not qualify however clean the asymmetry-fix looks. A genuine policy challenge needs concrete new evidence (a deployed producer emitting data twmb can't read, a user reporting wire divergence) that the rationale doesn't address — surfaced as a Suspected/Finding asking whether to revisit, never as a unilateral edit. In-test pins whose comments say `"Documenting"`, `"Intentional"`, `"Asymmetry: X (intentional)"`, or name §"Known intentional divergences" get the same treatment.
+> - **Encode/decode "asymmetry → fix" reflex on json.Number for documented-lenient cases** — the canonical statement is the "Known cross-cutting policies" list inside the pre-action gate; quote the named entries and bring new evidence.
+
+### §Finding format and §Pre-submission cross-checks (verbatim)
+
+> **Do NOT write an audit-report markdown file (e.g. `AUDIT_REPORT.md`, `ROUND_85.md`).** Findings go in the conversation reply, not to disk. The maintainer reads the findings in the chat, decides which to apply, and the fix lands as code + in-repo regression tests in the appropriate `_test.go` file — not as a separate `.md` artifact. If the audit produces zero findings, say so in the reply; don't leave a trail of report files. (The exception is BUG_AUDIT.md / FIX.md themselves, the *framework* documents, updated when a new lesson or playbook step needs codifying.)
+>
+> ### Reports are TERSE. The work is not.
+>
+> Every finding is still fully worked: the failing test is written, vetted,
+> and RUN; the references are read; the gate is executed. What shrinks is the
+> TRANSCRIPTION. The reader re-derives every finding with their own probes
+> before ruling, so pasted test source, pasted runnable demo programs, pasted
+> reference snippets, and pasted whole functions are re-read work, not
+> evidence. Give the coordinates and the verdict; keep the artifacts on disk.
+
+> 6. **Every reported clean area names the structural angle, not just the syntactic sweep.** "I ran `grep -n 'json.Unmarshal'` and the hits look fine" is not verified-clean. "I ran the grep, listed every hit, and for each hit applied pattern 1's structural question — does this site take user-controllable input that could exceed the parser's precision domain? Here are the answers" is. The greps in this document are candidate-generators, not bug-detectors.
+>
+> 7. **Every "no parity bug" conclusion checked the structural blind spots.** Pattern 13b: a passing test that pins a Go type for a user-facing numeric value may be locking the bug. Cross-check: what would the type-asserted value be if the input exceeded that type's representable range? When the cleared area falls into a named blind spot category, the corresponding probe is required even if encode/decode sweeps didn't surface anything.
+>
+> The bar is high because the loop is expensive — every false positive wastes a maintainer round-trip; every confirmed bug is genuinely valuable.
+
+### §Feedback loop — the no-commit premise and the posture-family bullet (verbatim)
+
+> **A ROUND'S OUTPUT DOES NOT REQUIRE A COMMIT.** Scale what gets written to
+> what the round FOUND. A round with zero production findings writes its ledger
+> LINE and nothing else — no narrative archive, no pattern entry, and no
+> distillation pass unless a bound is actually crossed by arithmetic. (Maintainer,
+> 2026-08-02: four of the last six commits exist because a round ran and wrote
+> something down, not because anything was wrong; across fourteen commits the
+> ratio was 7.4 lines of test-and-doc per production line.) The archive is for
+> narrative a later round could not reconstruct — a commit message usually already
+> holds it. Folding below is conditional on a finding, never automatic:
+>
+> After every round, fold what it taught back, distilled:
+
+> - **A NEW posture family adjudicated** (a ruling creating a class of
+>   inputs with its own documented treatment — the stray-structural-key
+>   family under NOT_BUGS #63 is the instance) → the adjudicating round's
+>   ledger line NAMES every existing census/matrix whose axis the family
+>   extends, and those rows are BACK-FILLED in that same round, never left
+>   for a later walk to rediscover. A census's rows freeze at its creation
+>   date; every posture adjudicated after that date is invisible to it
+>   unless explicitly folded in. Instance: the FEATURE × WALKER census
+>   predated #63, so the exact net built to catch cache-walker divergence
+>   had no stray-key rows, and the cache walkers' un-gated stray descent
+>   survived two generations of green census runs before an inverse-density
+>   walk found it.
+
+### §Round ledger — the two lines merged into the codec-ownership era line (verbatim)
+
+> - 2026-08-03 · 38b0c95 (START head) then 73f1dc8 · FIX then FULL · 1 production
+>   finding: `ocf.NewWriter` released the adopted codec on none of its error
+>   returns — fixed with `Schema.Fingerprint`'s `h.Reset()` on ENTRY. Then 1
+>   BEHAVIORAL, MAINTAINER-RULED NOT A BUG (#52 stands): a time-of-day wire outside
+>   [0,24h) into `time.Time` changes on re-encode, the only silent cell of 14
+>   logicals × ≤5 targets × both wires. Minted inverse density by STATEMENT
+>   COVERAGE. 5172647.
+> - 2026-08-04 · 73f1dc8 (START head) then 41aabfa · FIX then FULL · the
+>   DECLINED-offer half of codec ownership, all three ocf constructors:
+>   `resolveCodec` returns the adopted INDEX, release by DISTINCT codec (map when
+>   comparable, by TYPE when not), never by index; 21 cells, 13 neuters — 41aabfa.
+>   Then **2 production findings, one class: `ocf.WithCodec`'s nil SPELLING
+>   (P20)**, both fixed below. New instrument: inverse density by AUDITOR ATTENTION
+>   (262/763 funcs in no audit doc, 128 in no test); it picked compat.go, CLEAN on
+>   2809 `CheckCompatibility`/`Resolve` pairs.
+
+## Distillation archive (2026-08-06 #2) — pin-battery batch 3 narrative + the second-pass AUDIT_CORE originals
+
+### Round narrative — Phase-2 pin battery, batch 3 (the decimal remainder)
+
+Subject area: the decimal family left after batch 2 — JSON encode form, the
+bare-number arms, big-decimal, schema attribute plumbing, defaults. 384 pins
+standing at the start, 379 at the end. Zero production findings; this is
+instrument work whose deliverable is the assertion the instrument was missing.
+
+**The gap.** `jsonTokenMatchesBranch`'s digit-token arm decides whether a bare
+JSON number is OFFERED to a bytes/fixed union branch, by asking
+`hasDecimalBareNumberArm`. That predicate has four verdicts — decimal/bytes,
+decimal/fixed, big-decimal/bytes true; big-decimal/fixed false. The suite had
+exactly one cell for the whole arm: `TestMatrix_BigDecimalJSONBareNumberParity/
+union_dispatch_bare-number_to_big-decimal_branch`, top-level union, big-decimal
+only. A bare number into a plain *decimal* branch was covered by a pin and by
+nothing else.
+
+Proof of the gap: neuter the arm to `branch.logical == "big-decimal" &&
+hasDecimalBareNumberArm(branch)` — big-decimal still offered, decimal declined.
+That reds ONLY `TestRegression_DecimalBytesUnionJSONLenientNumberDecode`, zero
+net cells, with the exact message the removed offer produces: `avro: field v:
+cannot use any with Avro type record: avro json: no union branch matched at
+offset 5`.
+
+Closed by `TestMatrix_UnionBareNumberDispatchByLogicalCarrier`
+(conformance_test.go): logical x carrier DERIVED from the predicate's verdict
+set, crossed with context (top / record-field / array-element / map-value), 16
+cells, with liveness floors (12 offered realizations, 4 unoffered). The oracle
+is the SAME branch schema decoded STANDALONE — the union wrapper contributes
+dispatch, not semantics, and the standalone path never consults the dispatcher,
+so per rule 1(e5) the comparison is not blind to the mechanism under test.
+
+**Selectivity — three neuters, three disjoint red sets, TRIPLE held each time
+(exit != 0, RUN = 17, no panic):**
+  - decimal declined / big-decimal kept -> 8 cells, every decimal cell, no
+    big-decimal cell. Message: "offered branch did not receive the bare number".
+  - whole digit arm declined -> 12 cells, exactly the offered set.
+  - EVERYTHING offered (opposite direction) -> 4 cells, exactly the negatives,
+    with a DIFFERENT message: "branch was entered, not declined".
+
+**The opposite-direction attack caught a defect in the new matrix itself.** The
+negative cells first asserted that the error CONTAINED "no union branch
+matched". That passes in both directions: a `fixed` branch backtracks
+(`unionBranchRecurses` is false for it), so an offered-then-rejected branch
+leaves the value unchanged and emits the same leading message as a declined one.
+Measured under the all-offered neuter, the negative cells stayed GREEN — they
+measured nothing. The two cases differ in exactly one place: `decodeUnionBare`
+appends `: <cause>` only when some branch was actually entered. Anchoring the
+assertion at end-of-string (`no union branch matched at offset \d+$`) is what
+makes them bite. Probed both directions before adopting:
+  declined  : `avro json: no union branch matched at offset 0`
+  entered   : `avro json: no union branch matched at offset 0: avro json: expected string at offset 0`
+
+**The isolating neuter batch 2 could not find.** Batch 2 left four
+JSON-encode-form pins ungraded because swapping the emitted form reds ~35 cells
+across ten matrices — round-trip breakage, not a form assertion. The move that
+works: swap the emitted form for one that STILL ROUND-TRIPS. Decimal-on-bytes
+JSON decode accepts the lenient bare-number form, so emitting `r.FloatString(
+node.scale)` instead of the spec codepoint string (keeping the
+`decimalUnscaledBytes` guards intact, so precision/scale rejects still fire)
+leaves every round-trip green and reds only absolute-form assertions: 1 pin plus
+`TestLogicalTypeRoundTrips/decimal-bytes`, `TestMatrix_ConcurrentSchemaUse/
+decimal`, `TestMatrix_BytesFixedDefaultParityNumericString/runtime_user_input_
+still_decimal-interpreted`. (The Custom* matrices also red, but on decode under
+a suppressing CustomType — collateral, not form assertions.)
+
+**Graded, with the neuter and the covering cell:**
+  DecimalBytesJSONEncodeSpecForm        -> DELETE; TestLogicalTypeRoundTrips/
+                                           decimal-bytes makes the identical
+                                           absolute `"!"` assertion for
+                                           unscaled=33 and carries a
+                                           decimal-fixed sibling.
+  DecimalBytesJSONStringIsCodepointForm -> DELETE; arm (i) spec form ->
+                                           DecimalMagnitudeTargetParity json-spec
+                                           cells, arm (ii) bare number ->
+                                           its json-bare cells, arm (iii)
+                                           quoted-numeric-is-codepoint ->
+                                           BytesFixedDefaultParityNumericString
+                                           (5 contexts) + NamedTypeRefDefault
+                                           Parity (4), all asserting the same
+                                           808334131/100.
+  DecimalBytesUnionJSONLenientNumberDecode -> DELETE; the new matrix's
+                                           decimal/bytes/record-field cell.
+  DecimalBareNumberStillAcceptedNonCustom  -> DELETE; DecimalMagnitudeTarget
+                                           Parity/in-range/bytes/big.Rat/
+                                           json-bare.
+  DecimalBareNumberArmHonorsKindValidity   -> DELETE; all three subtests become
+                                           cells of the new matrix, STRICTLY
+                                           STRENGTHENED — the pin's negative arm
+                                           asserted only `err == nil`, the
+                                           matrix's asserts declined-not-entered.
+  FieldDecimalNotLandingIsInert            -> KEEP; the carrier-gate neuter
+                                           (decimalConsumesPrecisionScale ->
+                                           true) reds 14 net top-levels and only
+                                           ONE of its three subtests
+                                           ("malformed params are inert and
+                                           reach Props"). Its two wire-proof
+                                           subtests are ungraded.
+  DecodeJSONDecimalRecordFloatField        -> KEEP; batch 2's verdict stands.
+  DecimalBytesUnionJSONRoundTrip           -> UN-GRADABLE, kept. Green under all
+                                           five neuters. It asserts only that
+                                           encode and decode agree, which is
+                                           invariant under every change moving
+                                           both together; any neuter that reds
+                                           it reds dozens of net cells. Worth
+                                           recording that it is WEAKER than the
+                                           nets at its own coordinates: under
+                                           the form neuter, TestMatrix_Custom
+                                           Types/decimal-bytes/nullunion/* redded
+                                           and it did not.
+
+**Other neuters run, for the record.** decimalConsumesPrecisionScale -> true
+(the type-level carrier gate): 14 net top-levels red including
+AttributePlacementCensus/type/{precision,scale}/* across every kind — a densely
+netted area. fieldDecimalLiftConsumesPrecisionScale -> false (the field-level
+lift gate): TestCensus_Q5_DecimalLiftConsumeVerdictMatchesWhereTheLiftLanded
+(10 cells) + FieldDecimalConsumedMalformedParamReject +
+NullDecimalParamsRejectedWhereConsumed, plus one subtest of
+StrayFieldsElementPrecisionRouting.
+
+**Not reached** (~14 pins): the remaining schema-attribute-plumbing arms, the
+defaults arms, the custom-decimal arms, BigDecimalJSONOpaquePassThrough. Two
+cost pins carrying `raceRelaxed` wall-clock bounds
+(BigDecimalRatErrorMessageBounded, FiniteScaleCPUBound) were left untouched per
+the round's rules; DecimalJSONExpDoS is an allocation bound, also untouched.
+
+**Two shell-driven neuters produced WRONG measurements before the TRIPLE caught
+them.** (1) `perl -0pi -e` without `/g` replaces the FIRST match in the whole
+FILE: aiming at `jsonTokenMatchesBranch`'s `return true` it silently rewrote
+`jsonDecodeAppliesLogical`'s, corrupting an unrelated function. (2) `$1` inside
+a DOUBLE-quoted shell string is the shell's positional parameter, not perl's
+capture, so a replacement built as `"${1}$1"` emitted the comment prefix plus
+the argument and DROPPED the `return` keyword — the package stopped compiling
+and three runs reported exit 1 with RUN = 0. `RUN > 0` in the TRIPLE is exactly
+what separates a compile failure from a measured red; without it all three
+would have been recorded as reds. Fix adopted: drive neuters from a python
+heredoc anchored on a unique nearby comment, and `git diff --stat` after every
+restore.
+
+Gates: gofmt clean, `go vet ./...` clean, `go test ./... -count=1` green
+(root 38.7s, ocf 2.9s), `go test ./... -count=1 -race` GREEN (root 290.0s, ocf
+33.7s, 0 data races). Three BUG_AUDIT.md references naming deleted pins were
+re-pointed at the replacement net so the pre-action gate can still grep them.
+
+### Second-pass AUDIT_CORE originals (verbatim)
+
+The first distillation pass (archive #1) landed the file at 53,794. This round's
+own ledger line then re-crossed the bound, so a second pass followed; that
+lesson is now folded into §Feedback loop's size guard ("the pass must leave room
+for the round's OWN ledger line"). Originals compressed in the second pass:
+
+> This applies *recursively*: any time the gate's "verdict" would be "documented as intentional," the change is blocked. No "but symmetry would be cleaner," no "the documented behavior looks like a bug." The gate's job is to surface the maintainer's policy decision, not override it.
+
+> These policies cross many sites and are the ones audit rounds have re-litigated. Before changing *any* behavior touching these areas, grep the named entries below and quote them.
+
+> The **public call** line replaces the old runnable-program block and keeps
+> its filter: if no public API expression reaches the bug (internal machinery
+> only, no caller-observable consequence), it is not a finding.
+>
+> Suspected (no failing test) is 4 lines: title, file:line, why suspected,
+> what input would prove it. **Promotion bar is low** — if the proving input
+> fits in <30 lines of Go, write it, run it, and file a Finding. Reserve
+> Suspected for genuine policy calls no test can settle. **A *passing* test
+> that locks an observable divergence is Finding-grade** (which way to
+> resolve is what the finding ASKS); demote only when the evidence is too
+> thin to write any test.
+
+> 1. **Every claimed failing test was actually run.** Five `TestRegression_*` tests means five runs and five pasted failure outputs. Unran tests get demoted to Suspected.
+>
+> 2. **Every spec claim cites a specific file:line in `apache/avro:main`.** Not the spec website, not a release tag — the `main` branch. The spec text and the Java implementation both quoted with paths.
+>
+> 3. **`git log` and the `TestRegression_*` set checked for prior coverage.** When grep finds a regression test for the same area, the finding may be a misread of an existing fix.
+>
+> 4. **The failing test is copy-pasteable.** If a maintainer can't drop it into the repo and see it fail today, the finding isn't reproducible.
+>
+> 5. **The finding is a behavior bug, not "this could be cleaner".** Style and ergonomics get dropped.
+
+> Playbook: FIX.md. Premise: a fix's new shape is itself audit territory
+> (patterns 14a/15/16 all arose this way). Compare the patched function
+> against its fast/slow twin, its JSON/binary counterpart, the helper
+> docstring it claims to mirror (every shape the helper handles, not the
+> report's), the dispatchers routing into it, the cost of the new path on a
+> hostile 1 MiB input (<100ms reject per touched entry point), and pattern
+> 1's axes 3 & 4 in BOTH directions. Findings surfaced by re-audit ship in
+> the same round. Verbatim: archive (2026-07-25 #7).
+
+> Size guard — every round, by ARITHMETIC, not by eye. Stating the number is not
+> the check: a number just over a bound reads as "about right", so COMPUTE the
+> difference and name it. A positive difference is a CROSSING, and mandates a
+> distillation pass at the top of the next round (archive, never delete). The
+> pre-split document died of accumulation (274KB); the cap is the format.
+
+> - **Resource-bound (DoS)**: correct output, unbounded cost on hostile
+>   input. Closed WHOLESALE by the entry-point × hostile-input battery; a new
+>   one counts only if the battery missed an entry point — fix the battery
+>   too.
+> - **Doc/test pins**: a doc sentence provably false, or a missing pin for
+>   behavior already correct. Allowed with the contradiction cited; never
+>   extends the loop. Wording preferences are not findings at all.
+
+> Known uncovered intersections — where manual front-hours go FIRST. Each round
+> closes one (extend the net, delete the line, note it in the ledger) or defers
+> it consciously; a round that discovers a new gap ADDS it here, because a gap
+> buried inside a pattern entry is one no round will find. Closed gaps live in
+> AUDIT_PATTERNS §Net inventory (N1) — read them there to tell "covered" from
+> "never asked"; counts and neuter evidence stay in the closing round's ledger.
+>
+> - **The `-race` gate's own ceiling.** Root runs 360–586s against go's DEFAULT
+>   600s package timeout, so the mandatory gate reds on machine load, not code.
+>   Close by sizing the timeout or splitting the package.
+
+The (e1)–(e6) Instance narratives were compressed in the same pass; their full
+text is in archive #1 above, under "§Audit conventions — rule 1 preamble, (e),
+(e1)-(e6), the label prohibition, (f) (verbatim)".
