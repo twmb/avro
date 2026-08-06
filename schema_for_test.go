@@ -4184,6 +4184,125 @@ type sfRecursiveSlice []sfRecursiveSlice
 type sfRecursivePtr *sfRecursivePtr
 type sfRecursiveMap map[string]sfRecursiveMap
 
+// sfCyclicFamilies are the three shapes a Go type graph can close a cycle
+// in without a struct to break it. A struct terminates by registering its
+// name before recursing into its fields; these register nothing, so every
+// walker over a Go type graph has to carry its own ceiling.
+var sfCyclicFamilies = []struct {
+	name string
+	typ  reflect.Type
+}{
+	{"slice", reflect.TypeFor[sfRecursiveSlice]()},
+	{"pointer", reflect.TypeFor[sfRecursivePtr]()},
+	{"map", reflect.TypeFor[sfRecursiveMap]()},
+}
+
+// TestMatrix_CyclicGoTypeBoundedAtEveryEntryPoint crosses the cyclic
+// families with the ENTRY POINTS that walk a Go type graph. Each entry
+// point carries its own ceiling, its own constant and its own error, and
+// the suite reached them one at a time: the schema builder had a cell per
+// family, the custom-decode pointer walk had a single pointer cell, and
+// the plain decode and encode walks had none.
+//
+// The axis is the entry-point set, because a ceiling is not a property of
+// the type — it is a property of each walker, and a walker added without
+// one does not fail anywhere else. What every cell asserts is the same
+// thing in the same words: the call TERMINATES, and it terminates with an
+// error rather than a panic or a stack overflow. An unbounded walk on
+// these types does not return a wrong answer, it takes the process down,
+// so "returned at all" is the assertion and the timeout is a hang
+// detector rather than a performance claim.
+func TestMatrix_CyclicGoTypeBoundedAtEveryEntryPoint(t *testing.T) {
+	t.Parallel()
+	// Generous, because it is only distinguishing "returned" from "did
+	// not"; a bounded walk over these types returns in microseconds.
+	const hangTimeout = 10 * time.Second
+
+	customLong := CustomType{AvroType: "long", Decode: func(v any, _ *SchemaNode) (any, error) { return v, nil }}
+	plainLong := MustParse(`"long"`)
+	customSchema := MustParse(`"long"`, customLong)
+	wire, err := plainLong.Encode(int64(5))
+	if err != nil {
+		t.Fatalf("encode probe wire: %v", err)
+	}
+
+	entries := []struct {
+		name string
+		// namesBound marks an entry point whose error must say WHY, so a
+		// user hitting the ceiling can act on it. The decode and encode
+		// walks report the ordinary type mismatch instead, which is the
+		// documented shape there.
+		namesBound bool
+		run        func(reflect.Type) error
+	}{
+		{"schemafor", true, func(ft reflect.Type) error {
+			fields := []reflect.StructField{{Name: "F", Type: ft, Tag: `avro:"f"`}}
+			st := reflect.StructOf(fields)
+			seen := make(map[reflect.Type]seenForm)
+			_, err := inferRecord(st, "Top", "", seen, nil, make(appliedTypeAliases))
+			return err
+		}},
+		{"custom-decode", false, func(ft reflect.Type) error {
+			_, err := customSchema.Decode(wire, reflect.New(ft).Interface())
+			return err
+		}},
+		{"plain-decode", false, func(ft reflect.Type) error {
+			_, err := plainLong.Decode(wire, reflect.New(ft).Interface())
+			return err
+		}},
+		{"encode", false, func(ft reflect.Type) error {
+			_, err := plainLong.Encode(reflect.New(ft).Elem().Interface())
+			return err
+		}},
+	}
+
+	// Liveness floor, counted inside the cell: an entry point that started
+	// returning nil, or a family that stopped being cyclic, would leave
+	// its walker's ceiling unexercised.
+	bounded := 0
+
+	for _, fam := range sfCyclicFamilies {
+		for _, e := range entries {
+			t.Run(fam.name+"/"+e.name, func(t *testing.T) {
+				type result struct {
+					err   error
+					panic any
+				}
+				done := make(chan result, 1)
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							done <- result{panic: r}
+						}
+					}()
+					done <- result{err: e.run(fam.typ)}
+				}()
+				select {
+				case got := <-done:
+					if got.panic != nil {
+						t.Fatalf("walking a cyclic %s panicked instead of hitting a ceiling: %v", fam.name, got.panic)
+					}
+					if got.err == nil {
+						t.Fatalf("walking a cyclic %s returned no error; the walk either found a schema for a type that has none, or silently truncated one", fam.name)
+					}
+					if e.namesBound &&
+						!strings.Contains(got.err.Error(), "recursive") &&
+						!strings.Contains(got.err.Error(), "nests too deeply") &&
+						!strings.Contains(got.err.Error(), "nests deeper") {
+						t.Fatalf("error does not name the recursion or depth cause: %v", got.err)
+					}
+					bounded++
+				case <-time.After(hangTimeout):
+					t.Fatalf("walking a cyclic %s did not terminate: the %s walk has no ceiling", fam.name, e.name)
+				}
+			})
+		}
+	}
+	if want := len(sfCyclicFamilies) * len(entries); bounded != want {
+		t.Errorf("%d of %d entry-point cells reached a ceiling", bounded, want)
+	}
+}
+
 func TestRegression_SchemaForRecursiveNonStructTypeErrors(t *testing.T) {
 	wantErr := func(t *testing.T, _ *Schema, err error) {
 		t.Helper()
