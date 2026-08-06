@@ -11039,6 +11039,185 @@ func TestMatrix_MetadataStrayKeySurfacedAsWritten(t *testing.T) {
 	})
 }
 
+// strayFieldElementRoute is one cell of the ELEMENT-SHAPE axis of a stray
+// "fields" body. Every cell above spells its elements one way — a JSON
+// object with a "type" key — so the body-shape axis they cross says
+// nothing about what the walk does with the elements INSIDE a body that
+// passed the shape check. walkNodeChildren routes each element to exactly
+// one per-element callback, and route is the callback's name: the axis is
+// that callback set, not a sample of element spellings.
+type strayFieldElementRoute struct {
+	// route names the nodeChildVisitor callback this element shape fires.
+	// TestInvariant_StrayFieldElementRoutesAreSpanned derives the callback
+	// set from the struct itself and requires a cell per member, so a new
+	// per-element route cannot ship unexercised.
+	route string
+	elem  string
+	// want is the as-written surface the element must produce. It is
+	// spelled out per cell rather than derived from the element, so a
+	// walk that fabricated a plausible-looking field still fails.
+	want SchemaField
+}
+
+var strayFieldElementRoutes = []strayFieldElementRoute{
+	{
+		// The ordinary spelling: a JSON object naming its own type.
+		route: "field",
+		elem:  `{"name":"f","type":"int","doc":"normal"}`,
+		want:  SchemaField{Name: "f", Doc: "normal", Type: SchemaNode{Type: "int"}},
+	},
+	{
+		// A field with no "type" key. This never parses at a BOUND
+		// position — the record build rejects a nil field type — so it
+		// exists only inside a stray "fields", where the build never
+		// runs. Its attributes must surface as written, on a field whose
+		// Type is the zero node: the alternative is a fabricated zero
+		// element left in the pre-sized slot, which would read as a field
+		// the schema never wrote.
+		route: "fieldNoType",
+		elem:  `{"name":"x","doc":"typeless","myprop":1}`,
+		want:  SchemaField{Name: "x", Doc: "typeless", Props: map[string]any{"myprop": int64(1)}},
+	},
+	{
+		// Flat form: the element's own keys carry the lifted type
+		// definition, named after the field. The stray walk must lift it
+		// exactly as the parser would at a bound position.
+		route: "flatField",
+		elem:  `{"name":"g","type":"record","fields":[{"name":"y","type":"int"}]}`,
+		want: SchemaField{Name: "g", Type: SchemaNode{
+			Type: "record", Name: "g",
+			Fields: []SchemaField{{Name: "y", Type: SchemaNode{Type: "int"}}},
+		}},
+	},
+}
+
+// TestMatrix_StrayFieldElementRoutes crosses the element-shape axis: each
+// shape alone, and all of them together in one body. The mixed body is not
+// a repeat of the singles — the walk pre-sizes the field slice from the raw
+// array and fills slots by INDEX, so a route that declines to fill its slot
+// shows up only when a filled slot sits next to it, and only the mixed cell
+// can tell "surfaced as written" from "happened to land in slot 0".
+func TestMatrix_StrayFieldElementRoutes(t *testing.T) {
+	t.Parallel()
+	check := func(t *testing.T, got, want SchemaField, where string) {
+		t.Helper()
+		if got.Name != want.Name || got.Doc != want.Doc {
+			t.Errorf("%s: name/doc = %q/%q, want %q/%q", where, got.Name, got.Doc, want.Name, want.Doc)
+		}
+		if got.Type.Type != want.Type.Type || got.Type.Name != want.Type.Name {
+			t.Errorf("%s: type = %q/%q, want %q/%q", where, got.Type.Type, got.Type.Name, want.Type.Type, want.Type.Name)
+		}
+		if len(got.Type.Fields) != len(want.Type.Fields) {
+			t.Errorf("%s: lifted type has %d fields, want %d", where, len(got.Type.Fields), len(want.Type.Fields))
+		}
+		for k, wv := range want.Props {
+			if gv, ok := got.Props[k]; !ok || !reflect.DeepEqual(gv, wv) {
+				t.Errorf("%s: Props[%q] = %#v (present=%v), want %#v", where, k, gv, ok, wv)
+			}
+		}
+		if len(got.Props) != len(want.Props) {
+			t.Errorf("%s: Props = %#v, want exactly %#v", where, got.Props, want.Props)
+		}
+	}
+	carrier := func(body string) string {
+		return `{"type":"record","name":"Top","fields":[{"name":"a","type":{"type":"int","fields":[` + body + `]}}]}`
+	}
+	for _, c := range strayFieldElementRoutes {
+		t.Run(c.route, func(t *testing.T) {
+			s, err := Parse(carrier(c.elem))
+			if err != nil {
+				t.Fatalf("stray fields with a %s element rejected: %v", c.route, err)
+			}
+			n := s.Root().Fields[0].Type
+			if len(n.Fields) != 1 {
+				t.Fatalf("stray fields arity: got %d, want 1 (%+v)", len(n.Fields), n.Fields)
+			}
+			check(t, n.Fields[0], c.want, c.route)
+			if _, inProps := n.Props["fields"]; inProps {
+				t.Errorf("a shape-OK stray fields body also rode to Props: %v", n.Props)
+			}
+			// The stray is inert on the wire: the carrier still encodes
+			// as the bare int it says it is.
+			if _, err := s.Encode(map[string]any{"a": int32(3)}); err != nil {
+				t.Errorf("stray fields changed the wire behavior: %v", err)
+			}
+		})
+	}
+	t.Run("mixed", func(t *testing.T) {
+		var elems []string
+		for _, c := range strayFieldElementRoutes {
+			elems = append(elems, c.elem)
+		}
+		s, err := Parse(carrier(strings.Join(elems, ",")))
+		if err != nil {
+			t.Fatalf("mixed stray fields body rejected: %v", err)
+		}
+		n := s.Root().Fields[0].Type
+		if len(n.Fields) != len(strayFieldElementRoutes) {
+			t.Fatalf("mixed arity: got %d, want %d (%+v)", len(n.Fields), len(strayFieldElementRoutes), n.Fields)
+		}
+		for i, c := range strayFieldElementRoutes {
+			check(t, n.Fields[i], c.want, "mixed["+strconv.Itoa(i)+"]="+c.route)
+		}
+		// The rebuild must carry every route's surface through a second
+		// generation; a fabricated zero element would survive the first
+		// rebuild and only then diverge.
+		rb, err := n.Schema()
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+		rn := rb.Root()
+		if len(rn.Fields) != len(strayFieldElementRoutes) {
+			t.Fatalf("rebuild arity: got %d, want %d", len(rn.Fields), len(strayFieldElementRoutes))
+		}
+		for i, c := range strayFieldElementRoutes {
+			check(t, rn.Fields[i], c.want, "rebuilt["+strconv.Itoa(i)+"]="+c.route)
+		}
+	})
+}
+
+// TestInvariant_StrayFieldElementRoutesAreSpanned derives the per-element
+// route set from nodeChildVisitor itself — a callback taking the element
+// INDEX as its first argument is a per-element route, everything else fires
+// once per node — and requires the matrix above to drive each one. It reds
+// in both directions: a route added to the visitor with no cell, and a cell
+// naming a route the visitor no longer has.
+//
+// The route set is what the pins in this area kept proving one member of at
+// a time. Deriving it is the difference between a suite that covers the
+// routes it happens to know about and one that cannot fall behind the code.
+func TestInvariant_StrayFieldElementRoutesAreSpanned(t *testing.T) {
+	t.Parallel()
+	vt := reflect.TypeOf(nodeChildVisitor{})
+	perElement := map[string]bool{}
+	for i := range vt.NumField() {
+		f := vt.Field(i)
+		if f.Type.Kind() != reflect.Func || f.Type.NumIn() == 0 {
+			continue
+		}
+		if f.Type.In(0).Kind() == reflect.Int {
+			perElement[f.Name] = true
+		}
+	}
+	if len(perElement) == 0 {
+		t.Fatal("no per-element callbacks found on nodeChildVisitor; the derivation rule (first argument is the element index) no longer holds, so this guard is watching nothing")
+	}
+	driven := map[string]bool{}
+	for _, c := range strayFieldElementRoutes {
+		driven[c.route] = true
+	}
+	for name := range perElement {
+		if !driven[name] {
+			t.Errorf("walkNodeChildren route %q has no cell in strayFieldElementRoutes; a stray fields element taking that route is walked by nothing the suite asserts", name)
+		}
+	}
+	for name := range driven {
+		if !perElement[name] {
+			t.Errorf("strayFieldElementRoutes drives %q, which is not a per-element callback on nodeChildVisitor; the cell names a route that no longer exists", name)
+		}
+	}
+}
+
 // TestMatrix_CacheStrayStructuralKey crosses the stray-key gate's full
 // domain: carrier kind × stray key × definition relation, each cell
 // asserting every metadata surface against a stray-free control plus the
