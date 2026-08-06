@@ -6212,13 +6212,30 @@ func TestMatrix_MetadataPreservedThroughRebuild(t *testing.T) {
 	check(t, *rebuilt2.Root(), "second rebuilt Root()")
 }
 
+// laxNameSamples is the CHARACTER axis of the lax-name nets. It was a
+// hand-picked sample of six spellings, and the characters it happened to
+// pick (tab, backslash, quote) reach three of the canonical escaper's seven
+// short-form arms — so backspace and formfeed, which the escaper spells
+// \b and \f rather than  / , were emitted by no net at all.
+// A name is the only carrier that can hold them, and only under a
+// permissive lax-name checker, so nothing else in the suite could reach
+// them either.
+//
+// The escaper's arms are swept exhaustively by
+// TestMatrix_CanonicalStringEscapeSweep; this list stays a sample, but one
+// picked to hit every arm, so the full round trip (wire, JSON wire,
+// metadata rebuild) runs on each escape form rather than only on the
+// canonical bytes.
+var laxNameSamples = []string{
+	"with space", "tab\tname", `back\slash`, `qu"ote`, "uni🎉code", "1starts-digit",
+	"bs\bname", "ff\fname", "nl\nname", "cr\rname", "ctl\x01name", "del\x7fname",
+}
+
 // Lax-name schemas: the wire paths work; the names survive Canonical()
 // (escaped correctly) and the metadata rebuild.
 func TestMatrix_LaxNames(t *testing.T) {
 	lax := avro.WithLaxNames(nil)
-	for _, name := range []string{
-		"with space", "tab\tname", `back\slash`, `qu"ote`, "uni🎉code", "1starts-digit",
-	} {
+	for _, name := range laxNameSamples {
 		t.Run(name, func(t *testing.T) {
 			nameJSON, _ := json.Marshal(name)
 			schema := fmt.Sprintf(`{"type":"record","name":%s,"fields":[
@@ -6265,6 +6282,148 @@ func TestMatrix_LaxNames(t *testing.T) {
 			}
 		})
 	}
+}
+
+// canonShortForms are the SEVEN characters the canonical form spells with
+// a two-character escape rather than the six-character \u00xx. Every other
+// character below 0x20 takes the long form; everything at 0x20 and above
+// rides raw, including the solidus, which is legal to escape and which the
+// reference leaves alone.
+//
+// This is the reference spelling -- the parsing-canonical-form strings the
+// fingerprint is computed over -- written out so a cell asserts the FORM,
+// not merely that some escape was chosen: two spellings of one character
+// are both valid JSON and both decode to the same string, but they hash to
+// different fingerprints, so a round-trip check alone cannot see a
+// divergence from the reference.
+var canonShortForms = map[byte]string{
+	'"':  `\"`,
+	'\\': `\\`,
+	0x08: `\b`,
+	0x0c: `\f`,
+	'\n': `\n`,
+	'\r': `\r`,
+	'\t': `\t`,
+}
+
+// TestMatrix_CanonicalStringEscapeSweep sweeps the canonical string
+// escaper over EVERY byte it can be handed in a name, rather than over the
+// characters a sample happened to contain. The escaper is a switch with
+// seven short-form arms and a \u00xx default, and the lax-name sample above
+// historically reached three of them; the two that no net reached at all
+// were backspace and formfeed, whose short forms exist precisely because
+// the reference emits them that way.
+//
+// Two independent checks per character, because either alone is blind:
+// the canonical bytes must decode back to the exact original string (form-
+// agnostic — catches a mangled or dropped escape), and the escape must be
+// the reference SPELLING (catches a valid-but-divergent form, which
+// round-trips perfectly and still changes the fingerprint).
+//
+// Both canonical string carriers are swept. A name and an enum symbol take
+// different routes into the emitter, and a fix applied to one is not a fix
+// to the other.
+func TestMatrix_CanonicalStringEscapeSweep(t *testing.T) {
+	t.Parallel()
+	lax := avro.WithLaxNames(func(string) error { return nil })
+
+	// want is the reference spelling of one character inside a canonical
+	// string: a short form where the reference defines one, the six-
+	// character escape for every other C0 control, and the raw character
+	// otherwise.
+	want := func(b byte) string {
+		if s, ok := canonShortForms[b]; ok {
+			return s
+		}
+		if b < 0x20 {
+			const hex = "0123456789abcdef"
+			return `\u00` + string([]byte{hex[b>>4], hex[b&0xf]})
+		}
+		return string([]byte{b})
+	}
+
+	carriers := []struct {
+		name string
+		// build wraps the payload string into a schema; read pulls the
+		// same string back out of the parsed schema.
+		build func(payload string) string
+		read  func(s *avro.Schema) string
+	}{
+		{
+			"record-name",
+			func(p string) string {
+				return `{"type":"record","name":` + string(mustJSON(p)) + `,"fields":[]}`
+			},
+			func(s *avro.Schema) string { return s.Root().Name },
+		},
+		{
+			"enum-symbol",
+			func(p string) string {
+				return `{"type":"enum","name":"E","symbols":[` + string(mustJSON(p)) + `]}`
+			},
+			func(s *avro.Schema) string { return s.Root().Symbols[0] },
+		},
+	}
+
+	// Liveness floor. Every character below is GENERATED, which says nothing
+	// about whether it was EXERCISED: a carrier that started rejecting
+	// control characters would skip its way to a green sweep. These counters
+	// are therefore incremented INSIDE the cell, only once the assertion has
+	// actually been made against the emitted bytes. The subtests are
+	// sequential (no t.Parallel below), so the counts are exact.
+	shortFormHits := map[byte]int{}
+	longFormHits := 0
+
+	for _, c := range carriers {
+		for b := range 0x80 {
+			payload := "a" + string([]byte{byte(b)}) + "z"
+			t.Run(fmt.Sprintf("%s/%#02x", c.name, b), func(t *testing.T) {
+				s, err := avro.Parse(c.build(payload), lax)
+				if err != nil {
+					t.Skipf("carrier rejects %#02x even under a permissive lax checker: %v", b, err)
+				}
+				if got := c.read(s); got != payload {
+					t.Fatalf("parse did not preserve the payload: %q, want %q", got, payload)
+				}
+				canon := s.Canonical()
+				if !json.Valid(canon) {
+					t.Fatalf("canonical is not valid JSON: %q", canon)
+				}
+				// Form-agnostic: whatever escape was chosen must decode
+				// back to the character we put in.
+				var back any
+				if err := json.Unmarshal(canon, &back); err != nil {
+					t.Fatalf("canonical does not decode: %v (%q)", err, canon)
+				}
+				if !bytes.Contains(canon, []byte(`a`+want(byte(b))+`z`)) {
+					t.Fatalf("canonical spells %#02x as something other than the reference form %q:\n  %q", b, want(byte(b)), canon)
+				}
+				if _, short := canonShortForms[byte(b)]; short {
+					shortFormHits[byte(b)]++
+				} else if b < 0x20 {
+					longFormHits++
+				}
+			})
+		}
+	}
+
+	// All seven short-form arms — the five C0 controls with two-character
+	// escapes, plus quote and backslash — must have been asserted against
+	// real emitted bytes, or the sweep has narrowed back toward the sample
+	// it replaced.
+	for b := range canonShortForms {
+		if shortFormHits[b] == 0 {
+			t.Errorf("short-form arm %#02x was never asserted; the escaper's %q arm is unexercised again", b, canonShortForms[b])
+		}
+	}
+	if len(canonShortForms) != 7 {
+		t.Errorf("the reference table names %d short forms, not 7; a change to it is a change to the fingerprint and needs its own ruling", len(canonShortForms))
+	}
+	// 32 C0 controls minus the 5 with short forms, across both carriers.
+	if want := (32 - 5) * len(carriers); longFormHits != want {
+		t.Errorf("%d characters took the \\u00xx default, want %d; the sweep is no longer covering the C0 range on every carrier", longFormHits, want)
+	}
+	t.Logf("canonical escape sweep: %d short-form arms asserted, %d long-form characters", len(shortFormHits), longFormHits)
 }
 
 func mustJSON(v any) []byte {
