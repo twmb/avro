@@ -17393,6 +17393,47 @@ func TestMatrix_ArrayElementSwitchMatchesGeneral(t *testing.T) {
 				if !bytes.Equal(again, want) {
 					t.Errorf("%s decode lost information:\n got  % x\n want % x", shape.name, again, want)
 				}
+				// The JSON wire has its own native-vs-fallback dispatch,
+				// with its own test for the destination shape, so a shape
+				// proved on the binary wire is not proved here.
+				jsonWant, err := s.EncodeJSON(c.builtin)
+				if err != nil {
+					t.Fatalf("builtin encodeJSON: %v", err)
+				}
+				jsonGot, err := s.EncodeJSON(shape.v)
+				if err != nil {
+					t.Fatalf("%s encodeJSON: %v", shape.name, err)
+				}
+				if !bytes.Equal(jsonGot, jsonWant) {
+					t.Errorf("%s JSON encode diverges from the builtin slice:\n got  %s\n want %s", shape.name, jsonGot, jsonWant)
+				}
+				// The JSON round trip is compared against the BUILTIN
+				// shape's JSON round trip, not against the binary wire:
+				// the JSON representation of any NaN is the bare token
+				// NaN, which carries no payload, so a signaling NaN is
+				// quieted on that wire for every shape alike. That is a
+				// property of the representation, not a divergence
+				// between shapes, and the question here is whether the
+				// shapes agree.
+				jbuiltin := reflect.New(reflect.TypeOf(c.builtin))
+				if err := s.DecodeJSON(jsonWant, jbuiltin.Interface()); err != nil {
+					t.Fatalf("builtin decodeJSON: %v", err)
+				}
+				jbuiltinWire, err := s.Encode(jbuiltin.Elem().Interface())
+				if err != nil {
+					t.Fatalf("builtin re-encode after JSON: %v", err)
+				}
+				jout := reflect.New(reflect.TypeOf(shape.v))
+				if err := s.DecodeJSON(jsonWant, jout.Interface()); err != nil {
+					t.Fatalf("%s decodeJSON: %v", shape.name, err)
+				}
+				jagain, err := s.Encode(jout.Elem().Interface())
+				if err != nil {
+					t.Fatalf("%s re-encode after JSON: %v", shape.name, err)
+				}
+				if !bytes.Equal(jagain, jbuiltinWire) {
+					t.Errorf("%s JSON decode diverges from the builtin shape's:\n got  % x\n want % x", shape.name, jagain, jbuiltinWire)
+				}
 				shapeRuns[shape.name]++
 			}
 		})
