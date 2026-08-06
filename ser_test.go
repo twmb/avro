@@ -1012,7 +1012,7 @@ func TestSerTaggedUnionMapBranchFallback(t *testing.T) {
 	}
 }
 
-// TestRegression_TaggedUnionEncodeIndirection locks in that the binary
+// TestMatrix_TaggedUnionEncodeIndirection locks in that the binary
 // union encoder peels Pointer/Interface chains before recognizing a
 // tagged-union map, matching the JSON encoder's entry-peel
 // (appendAvroJSON at json_codec.go) and isNilValue's loop (ser.go).
@@ -1020,7 +1020,7 @@ func TestSerTaggedUnionMapBranchFallback(t *testing.T) {
 // — &m and any(&m) wrapping a tagged-form map must encode identically
 // to m and any(m). Pins binary↔JSON parity at top-level, inside
 // arrays of unions, and inside record fields of union type.
-func TestRegression_TaggedUnionEncodeIndirection(t *testing.T) {
+func TestMatrix_TaggedUnionEncodeIndirection(t *testing.T) {
 	m := map[string]any{"int": int32(42)}
 	wantInt32 := int32(42)
 
@@ -2789,7 +2789,7 @@ func (c ozValCounter) IsZero() bool { return c == 7 }
 // directions are pinned: IsZero()==true omits a structurally-non-zero value,
 // IsZero()==false keeps a structurally-zero value. Covers the reflect, unsafe,
 // and JSON encode paths (all route through valueIsZero).
-func TestRegression_OmitzeroPointerReceiverIsZero(t *testing.T) {
+func TestMatrix_OmitzeroPointerReceiverIsZero(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"f","type":["null","long"],"default":null}]}`)
 	null := []byte{0x00}      // union index 0 (null branch) — omitzero acted
@@ -2987,7 +2987,7 @@ func TestRegression_UnsafeMultiPtrNullUnionNil(t *testing.T) {
 	}
 }
 
-// TestRegression_TextAppenderHeaderGrowth pins appendAvroString's
+// TestMatrix_TextAppenderHeaderGrowth pins appendAvroString's
 // AppendText inline-write slow path: it reserves a 1-byte length
 // placeholder, lets AppendText write directly into dst, then — when the
 // real text length needs MORE varint header bytes than the 1-byte
@@ -3001,7 +3001,7 @@ func TestRegression_UnsafeMultiPtrNullUnionNil(t *testing.T) {
 // (>=64 → 2-byte header, >=8192 → 3-byte header) and asserts an exact
 // round-trip both standalone and as the first field of a record (so a
 // length error shows up as a misread of the following field).
-func TestRegression_TextAppenderHeaderGrowth(t *testing.T) {
+func TestMatrix_TextAppenderHeaderGrowth(t *testing.T) {
 	s := MustParse(`"string"`)
 	rec := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"s","type":"string"},{"name":"n","type":"int"}]}`)
@@ -3063,7 +3063,7 @@ type fpFloat64 float64
 type fpBool bool
 type fpString string
 
-func TestRegression_ArrayElementFastPathMatchesGeneral(t *testing.T) {
+func TestMatrix_ArrayElementFastPathMatchesGeneral(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
@@ -3517,7 +3517,7 @@ func TestRegression_ZeroMinimumContainerAfterDrainedAllowance(t *testing.T) {
 	}
 }
 
-// TestRegression_ZeroMinimumContainerBehindForwardRef pins the nil-child
+// TestMatrix_ZeroMinimumContainerBehindForwardRef pins the nil-child
 // stand-in. The forward reference must sit BELOW the container's direct child,
 // and that is the whole shape — do not "simplify" this to an
 // array-of-forward-reference.
@@ -3532,7 +3532,7 @@ func TestRegression_ZeroMinimumContainerAfterDrainedAllowance(t *testing.T) {
 // immediately resolvable, so the array is NOT a fixup — while that record's own
 // FIELD is the forward reference, so the walk sees a nil child at build and the
 // value it computes there is the value the decoder uses forever.
-func TestRegression_ZeroMinimumContainerBehindForwardRef(t *testing.T) {
+func TestMatrix_ZeroMinimumContainerBehindForwardRef(t *testing.T) {
 	const later = `{"type":"record","name":"Later","fields":[]}` // true minimum: 0 wire bytes
 	// nested: items is an inline record whose FIELD is the forward reference.
 	const nested = `{"type":"array","items":{"type":"record","name":"Inner","fields":[{"name":"g","type":"Later"}]}}`

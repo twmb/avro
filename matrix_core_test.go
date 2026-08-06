@@ -1227,7 +1227,7 @@ func TestMatrix_GenerativeTyped(t *testing.T) {
 // logical Go type in the tree where plain yields the raw underlying).
 // ===========================================================================
 
-func TestRegression_CustomResurrectedLogicalInContext(t *testing.T) {
+func TestMatrix_CustomResurrectedLogicalInContext(t *testing.T) {
 	ctxs := []struct {
 		label  string
 		schema func(inner string) string
@@ -1598,8 +1598,8 @@ func TestMatrix_GenerativeDefaultFill(t *testing.T) {
 // the schema parses: an overflow default the leaf rejects is held by the sibling and
 // the divergence surfaces. A same-class-rejecting sibling would reject the schema at
 // parse and hide the cell behind a parse error — exactly how these escaped (see
-// TestRegression_UnionContainerNestedIntDefaultOverflowMatchesWire and
-// TestRegression_UnionContainerNestedFloatDefaultSelectionMatchesWire, the
+// TestMatrix_UnionContainerNestedIntDefaultOverflowMatchesWire and
+// TestMatrix_UnionContainerNestedFloatDefaultSelectionMatchesWire, the
 // single-shape pins this matrix generalizes).
 func TestMatrix_GenerativeUnionContainerDefaultFill(t *testing.T) {
 	for _, c := range udfCells() {
@@ -2867,7 +2867,7 @@ func TestMatrix_NullUnionNilEquivalenceParity(t *testing.T) {
 // the canary (encode) or on the typed target (decode) — verified by reverting any
 // single fix in schema.go / json_decode.go.
 
-func TestRegression_CustomResurrectedLogicalFullMatrixParity(t *testing.T) {
+func TestCensus_CustomResurrectedLogicalFullMatrixParity(t *testing.T) {
 	for _, c := range resurrectionCells() {
 		t.Run(c.name, func(t *testing.T) {
 			runResurrectionCell(t, c)
@@ -4395,7 +4395,7 @@ func TestMatrix_SchemaCacheMultiParseSelfContained(t *testing.T) {
 	// reference. dupDefRef therefore declines, so NO re-parseable inline twin
 	// exists; the four-form check is skipped with that provable reason and the
 	// binding-safe check is asserted instead (matches
-	// TestRegression_SchemaCacheShortNameShadowNoMisbind, generated here).
+	// TestMatrix_SchemaCacheShortNameShadowNoMisbind, generated here).
 	{
 		D, xF, xG, xD, A := "D", "x.F", "x.G", "x.D", "x.A"
 		cases = append(cases, fwd{

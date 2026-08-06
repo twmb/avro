@@ -357,7 +357,7 @@ func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
 	}
 }
 
-// TestRegression_TaggedUnionsBareNullForNullBranch locks in that
+// TestMatrix_TaggedUnionsBareNullForNullBranch locks in that
 // EncodeJSON emits bare `null` for the null branch under TaggedUnions,
 // matching the doc commitment ("wraps non-null union values"),
 // Java's JsonEncoder.writeIndex (lang/java/avro/src/main/java/org/
@@ -376,7 +376,7 @@ func TestDecodeJSONUnionTaggedNullIntoAny(t *testing.T) {
 // `wrap iff cfg.tagged && branch.kind != "null"`, used at all four
 // dispatcher sites — so a future dispatcher addition inherits the
 // null special-case automatically.
-func TestRegression_TaggedUnionsBareNullForNullBranch(t *testing.T) {
+func TestMatrix_TaggedUnionsBareNullForNullBranch(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
@@ -1444,7 +1444,7 @@ func TestEncodeJSONLinkedinFloats(t *testing.T) {
 // union value; TaggedUnions disambiguates it. ±Inf encodes as the number
 // token ±1e999 and round-trips in a bare union regardless. This pins the
 // contract documented on LinkedinFloats.
-func TestRegression_LinkedinFloatsNaNUnionAmbiguity(t *testing.T) {
+func TestMatrix_LinkedinFloatsNaNUnionAmbiguity(t *testing.T) {
 	nan := float32(math.Float32frombits(0x7fc00000))
 
 	// Bare union WITH a null branch: NaN encodes as null and decodes to the
@@ -1804,7 +1804,7 @@ func TestDecodeJSONNaNInfRoundTrip(t *testing.T) {
 		{"double null → NaN", `"double"`, `null`},
 		// Lowercase quoted "nan" is rejected to match Java/fastavro/
 		// goavro (all of which exact-match "NaN"); see
-		// TestRegression_JSONDecodeBareNaNInfinityCasingParity.
+		// TestMatrix_JSONDecodeBareNaNInfinityCasingParity.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2945,7 +2945,7 @@ func TestEncodeJSONStringBytesEnumCoverage(t *testing.T) {
 	}
 }
 
-// TestRegression_BytesToAvroJSONStringCodepointPerByte pins that
+// TestMatrix_BytesToAvroJSONStringCodepointPerByte pins that
 // [bytesToAvroJSONString] emits each byte 0x00-0xFF as a separate
 // Unicode codepoint (not as a UTF-8-interpreted multi-byte sequence).
 // `string(b)` is NOT equivalent: it reinterprets the byte slice as a
@@ -2963,7 +2963,7 @@ func TestEncodeJSONStringBytesEnumCoverage(t *testing.T) {
 // bytes/fixed defaults round-trip through [SchemaNode.Schema]; the
 // naive string(b) path (or [encoding/json.Marshal]'s default base64)
 // breaks the round-trip for any default containing a byte ≥ 0x80.
-func TestRegression_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
+func TestMatrix_BytesToAvroJSONStringCodepointPerByte(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		in   []byte
@@ -5224,7 +5224,7 @@ func TestDecodeJSONErrorPaths(t *testing.T) {
 		t.Error("expected unknown symbol error")
 	}
 	// int / uint targets are accepted (ordinal) per binary parity —
-	// see TestRegression_JSONEnumDecodeIntoIntTargetParity. Only
+	// see TestMatrix_JSONEnumDecodeIntoIntTargetParity. Only
 	// genuinely unsupported targets (channel, slice, etc.) error.
 	if err := enumS.DecodeJSON([]byte(`"A"`), new([]int)); err == nil {
 		t.Error("expected unsupported target error for slice")
@@ -5251,7 +5251,7 @@ func TestDecodeJSONErrorPaths(t *testing.T) {
 	}
 	// int → float target is now supported (round-trip parity with
 	// documented encode-side whole-number divergence). See
-	// TestRegression_IntLongDecodeIntoFloatJSONNumber. Genuinely
+	// TestMatrix_IntLongDecodeIntoFloatJSONNumber. Genuinely
 	// unsupported targets (slice, struct without method, etc.) still
 	// error.
 	intS := MustParse(`"int"`)

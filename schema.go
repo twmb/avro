@@ -4343,7 +4343,7 @@ func firstUnionBranchAcceptingDefault(val any, node *schemaNode) *schemaNode {
 // string-double defaults where Java doesn't" or propose removing the nested
 // coercion — it is intentional and both surfaces agree; revisit only on a
 // real interop breakage with evidence. Pinned by
-// TestRegression_UnionContainerNestedFloatDefaultSelectionMatchesWire.
+// TestMatrix_UnionContainerNestedFloatDefaultSelectionMatchesWire.
 //
 // Walks *schemaNode so name-referenced nested fields coerce too (the
 // resolved type tree, not the canon — name-refs lose type info on the

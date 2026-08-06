@@ -2676,7 +2676,7 @@ func nodeFromJSONObject(m map[string]any, parentNS string, memo strayShapeMemo) 
 	// registers a name or mutates the tree, which is why the stray
 	// positions are safe for this walker and gated off for every other
 	// (see nodeChildVisitor.strayKeys and
-	// TestRegression_MetadataStrayKeySurfacedAsWritten).
+	// TestMatrix_MetadataStrayKeySurfacedAsWritten).
 	walkNodeChildren(m, parentNS, childNS, nodeChildVisitor{
 		strayKeys:      true,
 		strayShapeMemo: memo,

@@ -86,7 +86,7 @@ type serUnion struct {
 // parity gap at top level, inside arrays of unions, and inside record
 // fields. indirect's errIndirectNil / errIndirectDeep both surface as
 // "no match" so the caller's nil-first dispatch picks the null branch
-// (TestRegression_TaggedUnionEncodeIndirection pins both arms).
+// (TestMatrix_TaggedUnionEncodeIndirection pins both arms).
 func (s *serUnion) tryUnwrapTagged(v reflect.Value) (int, reflect.Value, bool) {
 	v, err := indirect(v)
 	if err != nil {

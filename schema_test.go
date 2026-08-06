@@ -437,7 +437,7 @@ func TestParseFloatDefaultFromString(t *testing.T) {
 	// coercion does NOT fire — the TextNode reaches isValidDefault
 	// (Schema.java:1751-1797) and rejects because no numeric
 	// branch's isNumber()/isIntegralNumber() returns true for a
-	// TextNode. See TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches.
+	// TextNode. See TestMatrix_UnionDefaultStringMatchesOnlyStringAcceptingBranches.
 	tests := []struct {
 		name   string
 		schema string
@@ -498,7 +498,7 @@ func TestParseFloatDefaultFromString(t *testing.T) {
 	// Union outer types reject string defaults for numeric branches —
 	// Java parity (parseField's text→DoubleNode coercion does not
 	// fire for UNION outer types). See
-	// TestRegression_UnionDefaultStringMatchesOnlyStringAcceptingBranches
+	// TestMatrix_UnionDefaultStringMatchesOnlyStringAcceptingBranches
 	// for the full matrix.
 	_, err = Parse(`{"type":"record","name":"R","fields":[
 		{"name":"f","type":["float","null"],"default":"1.5"}
@@ -933,7 +933,7 @@ func TestValidateLogical(t *testing.T) {
 		{"uuid wrong fixed size", aobject{Type: "fixed", Logical: "uuid", Size: ptr(laxInt(12))}, false, true},
 		// scale/precision on uuid (correct underlying type): inert
 		// metadata — the logical stays applied, the stray key surfaces
-		// as a custom property (see TestRegression_StrayPrecisionScaleParses).
+		// as a custom property (see TestMatrix_StrayPrecisionScaleParses).
 		{"uuid with scale", aobject{Type: "string", Logical: "uuid", Scale: &zeroPrec}, false, false},
 
 		// date / time-millis / time-micros / timestamp-* /
@@ -1526,7 +1526,7 @@ func TestSchemaValidationErrors(t *testing.T) {
 		schema string
 	}{
 		// (type/field aliases accept any string per Avro §Aliases — see
-		// TestRegression_AliasAcceptsAnyString — so they are NOT in this
+		// TestMatrix_AliasAcceptsAnyString — so they are NOT in this
 		// expected-error table; names and symbols stay strictly validated.)
 		{"empty field name", `{"type":"record","name":"R","fields":[{"name":"","type":"int"}]}`},
 		{"invalid field name", `{"type":"record","name":"R","fields":[{"name":"bad-field!","type":"int"}]}`},
@@ -2603,7 +2603,7 @@ func TestRegression_LeadingDotAliasNullNamespace(t *testing.T) {
 	}
 
 	// Aliases now accept any string (Avro §Aliases; see
-	// TestRegression_AliasAcceptsAnyString). The leading-dot null-namespace
+	// TestMatrix_AliasAcceptsAnyString). The leading-dot null-namespace
 	// escape still strips exactly one leading dot via qualifyAliases, so
 	// these dotted forms parse (previously they were name-validated and
 	// rejected) — the escape is a qualification rule, not a grammar gate.
@@ -2754,7 +2754,7 @@ func TestRegression_MetadataDefaultShortNameCollisionWalkOrder(t *testing.T) {
 // any namespace"); Java rejects it ("Schemas may not be named after
 // primitives"). A NAMESPACED type whose short name equals a primitive
 // (e.g. a.int) is fine — its fullname is not a primitive name.
-func TestRegression_NamedTypeNotPrimitiveName(t *testing.T) {
+func TestMatrix_NamedTypeNotPrimitiveName(t *testing.T) {
 	for _, prim := range []string{"int", "long", "string", "bytes", "boolean", "float", "double", "null"} {
 		for _, kind := range []string{"enum", "fixed", "record"} {
 			var schema string
@@ -2785,7 +2785,7 @@ func TestRegression_NamedTypeNotPrimitiveName(t *testing.T) {
 // Java's own spec divergence). twmb formerly rejected aliases that
 // weren't valid Avro names, breaking interop with schemas the spec
 // blesses. Names themselves stay strictly validated; only aliases relax.
-func TestRegression_AliasAcceptsAnyString(t *testing.T) {
+func TestMatrix_AliasAcceptsAnyString(t *testing.T) {
 	t.Run("field aliases any string", func(t *testing.T) {
 		for _, alias := range []string{"1stField", "com.example.legacy_x", "weird name!", "has.dots", ""} {
 			schema := `{"type":"record","name":"R","fields":[{"name":"x","type":"long","aliases":["` + alias + `"]}]}`
@@ -3680,7 +3680,7 @@ func TestRegression_SchemaNodeSchemaDeepAcyclicBounded(t *testing.T) {
 // the structural depth bound never sees it. The walk bounds the value at the
 // same maxSchemaJSONDepth ceiling, so an over-deep value stops with a bounded
 // error rather than crashing.
-func TestRegression_SchemaNodeSchemaDeepValueBounded(t *testing.T) {
+func TestMatrix_SchemaNodeSchemaDeepValueBounded(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("panicked: %v", r)
@@ -3822,7 +3822,7 @@ func TestRegression_SchemaNodeSchemaDeepValueBounded(t *testing.T) {
 // and the value walk must recurse into every container kind json.Marshal does
 // (map, slice, array, struct, pointer/interface) — this pins each cell so its
 // bound cannot be silently removed.
-func TestRegression_SchemaNodeWalkDepthAllChannels(t *testing.T) {
+func TestMatrix_SchemaNodeWalkDepthAllChannels(t *testing.T) {
 	const deep = maxSchemaJSONDepth + 50
 
 	// Each structural recursion must charge depth. A too-deep chain through any
@@ -3975,7 +3975,7 @@ func TestRegression_SchemaNodeWalkDepthAllChannels(t *testing.T) {
 // walk (structural plus every value), shared so the combined json.Marshal cost
 // stays bounded. This pins the expansion axis on every channel — the cell the
 // three prior depth bounds all missed.
-func TestRegression_SchemaNodeSharedDAGExpansionBounded(t *testing.T) {
+func TestMatrix_SchemaNodeSharedDAGExpansionBounded(t *testing.T) {
 	const fanout = 60 // 2^60 emitted nodes if unbounded; ~120 nodes in memory
 
 	// Run the build in a goroutine so a REGRESSION (a removed budget → an
@@ -4216,7 +4216,7 @@ func TestRegression_RootQuotedFixedSize(t *testing.T) {
 	}
 }
 
-// TestRegression_SchemaNodeWalkBudgetBattery is THE consolidated DoS battery for
+// TestMatrix_SchemaNodeWalkBudgetBattery is THE consolidated DoS battery for
 // the SchemaNode→JSON metadata walk reached via the public SchemaNode.Schema()
 // (dedup path, d != nil, errors) and the bare toJSON() SchemaFor reaches via a
 // hand-built CustomType.Schema (d == nil, truncates). The walk has THREE
@@ -4244,7 +4244,7 @@ func TestRegression_RootQuotedFixedSize(t *testing.T) {
 // other code emits (see grep in schema_node.go) — so a cell cannot pass on an
 // unrelated Parse error and a removed charge turns exactly its cell red. Boundary
 // cells pin that a usable schema is never false-rejected.
-func TestRegression_SchemaNodeWalkBudgetBattery(t *testing.T) {
+func TestMatrix_SchemaNodeWalkBudgetBattery(t *testing.T) {
 	wantBytes := fmt.Sprintf("supported %d bytes", maxSchemaJSONBytes)
 	wantNodes := fmt.Sprintf("supported %d nodes", maxSchemaJSONNodes)
 
@@ -4579,7 +4579,7 @@ func fingerprintRoundTrip(t *testing.T, schema string) {
 // (Name.writeName emits "namespace":"" for a null-namespace name inside a
 // non-null enclosing namespace); dropping the escape silently moves the
 // child into the parent's namespace.
-func TestRegression_SchemaNodeNullNamespaceEscapeRoundTrip(t *testing.T) {
+func TestMatrix_SchemaNodeNullNamespaceEscapeRoundTrip(t *testing.T) {
 	cases := []struct{ name, schema string }{
 		{"record child", `{"type":"record","name":"P","namespace":"x","fields":[{"name":"c","type":{"type":"record","name":"Child","namespace":"","fields":[{"name":"v","type":"int"}]}}]}`},
 		{"enum child", `{"type":"record","name":"P","namespace":"x","fields":[{"name":"e","type":{"type":"enum","name":"E","namespace":"","symbols":["A"]}}]}`},
@@ -4600,7 +4600,7 @@ func TestRegression_SchemaNodeNullNamespaceEscapeRoundTrip(t *testing.T) {
 // fullname: keying on the short name either reports a false "conflicting
 // definitions" error (different bodies) or emits a short name reference
 // that re-binds to the wrong type (identical bodies).
-func TestRegression_SchemaNodeSameShortNameDistinctNamespaces(t *testing.T) {
+func TestMatrix_SchemaNodeSameShortNameDistinctNamespaces(t *testing.T) {
 	cases := []struct{ name, schema string }{
 		{"different bodies", `{"type":"record","name":"P","namespace":"x","fields":[
 			{"name":"a","type":{"type":"fixed","name":"T","size":4}},
@@ -8396,11 +8396,11 @@ func treeValueSchemaForRecord(t *testing.T, node *SchemaNode) (*Schema, error) {
 	return schemaForScopeCell(t, fields, "", []CustomType{{GoType: primary, Schema: node}})
 }
 
-// TestRegression_NilContainerPropsPreserveNullImage: a nil container Props
+// TestMatrix_NilContainerPropsPreserveNullImage: a nil container Props
 // value (marshal image null) must survive the SchemaFor render exactly as
 // it survives the direct rebuild — null in the composed JSON, nil in the
 // re-read metadata.
-func TestRegression_NilContainerPropsPreserveNullImage(t *testing.T) {
+func TestMatrix_NilContainerPropsPreserveNullImage(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		v    any
@@ -10521,7 +10521,7 @@ func TestSchemaCacheConcurrent(t *testing.T) {
 // registration precedes applyCustomTypes) previously kept a stale false
 // flag, so the forward arm rejected a registration the documented
 // contract accepts ("a consistent registration resolves").
-func TestRegression_SchemaCacheConsistentCustomSelfMatch(t *testing.T) {
+func TestMatrix_SchemaCacheConsistentCustomSelfMatch(t *testing.T) {
 	dec := func(v any, sn *SchemaNode) (any, error) { return v, nil }
 	cases := []struct {
 		name, def, ref string
@@ -11004,7 +11004,7 @@ func TestRegression_MetadataNameTableIgnoresStrayKeyDef(t *testing.T) {
 // surfacing duty with no registration or mutation. This pin locks the
 // asymmetry so a uniformity change that gates the metadata walker too
 // fails here instead of silently dropping the surfacing.
-func TestRegression_MetadataStrayKeySurfacedAsWritten(t *testing.T) {
+func TestMatrix_MetadataStrayKeySurfacedAsWritten(t *testing.T) {
 	t.Parallel()
 	t.Run("items_ref", func(t *testing.T) {
 		s := MustParse(`{"type":"int","items":"long"}`)
@@ -11274,7 +11274,7 @@ func TestRegression_StrayKeySurvivesSchemaRebuild(t *testing.T) {
 // non-binding kinds — Schema.java's SCHEMA_RESERVED set — and fastavro
 // ignores them; rejecting was a twmb-only strictness.) Schema-shaped
 // bodies keep the structural-field surfacing.
-func TestRegression_MalformedStrayBodyAcceptedAsProps(t *testing.T) {
+func TestMatrix_MalformedStrayBodyAcceptedAsProps(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		carrier string
@@ -11351,7 +11351,7 @@ func TestRegression_MalformedStrayBodyOnWrappedRef(t *testing.T) {
 // container kind still rejects another kind's schema-shaped defining key;
 // a schema-shaped stray name on an unnamed container still rejects; and a
 // schema-shaped structural key on a wrapped reference still rejects.
-func TestRegression_StrayShapeRejectBoundaries(t *testing.T) {
+func TestMatrix_StrayShapeRejectBoundaries(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct{ schema, wantErr string }{
 		{`{"type":"array","items":3}`, "invalid schema"},
@@ -11994,12 +11994,12 @@ func TestInvariant_EveryFieldLookupBuilderHasABreadthCell(t *testing.T) {
 	t.Logf("field-lookup builders derived from source: %v", builders)
 }
 
-// TestRegression_ReaderFieldLookupPrefersNamesOverAliases pins the routing the
+// TestMatrix_ReaderFieldLookupPrefersNamesOverAliases pins the routing the
 // lookup's two maps exist to preserve: a writer name that is one reader
 // field's ALIAS and a different reader field's NAME resolves to the NAME. A
 // single merged map resolves it to whichever entry was written last, which is
 // a silent reversal — the writer's data lands in the wrong reader field.
-func TestRegression_ReaderFieldLookupPrefersNamesOverAliases(t *testing.T) {
+func TestMatrix_ReaderFieldLookupPrefersNamesOverAliases(t *testing.T) {
 	// Parse refuses a record whose field name collides with another field's
 	// alias, so the deciding shape cannot be reached through Parse. It is
 	// built directly: the ordering is the routing that the parse-time
@@ -13811,7 +13811,7 @@ var budgetedWalks = []budgetedWalk{
 	{fn: "toJSONWalk", file: "schema_node.go", class: schemaDAG,
 		factors: "nodes emitted x bytes per node",
 		binds: "walkBudget (nodes + bytes), charged by takeNode at the TOP of every entry so a DAG re-descent still spends budget; visited is only cycle detection. " +
-			"MEASURED BY TestRegression_SchemaNodeWalkBudgetBattery / _DuplicateNamedDefinitionBounded / TestRegression_SchemaForCustomSchemaBudgetAxes, which hand-build the trees Parse cannot express — " +
+			"MEASURED BY TestMatrix_SchemaNodeWalkBudgetBattery / TestRegression_SchemaNodeDuplicateNamedDefinitionBounded / TestMatrix_SchemaForCustomSchemaBudgetAxes, which hand-build the trees Parse cannot express — " +
 			"a PARSED schema is deduped before it reaches this walk, so no parse-driven cell can red this bound, and one that claimed to was renamed",
 		reachingPaths: "one walkBudget per metadata-API call (toJSONDedup), from Root().Schema()/String()/Canonical(); each walks the whole tree once"},
 	{fn: "collectLocalNames", file: "schema_node.go", class: schemaDAG,
@@ -14518,9 +14518,9 @@ var costCells = []costCell{
 		// Root+Schema ROUND TRIP, whose last step is a re-Parse of the rendered
 		// text (SchemaNode.Schema), which puts the min-bytes charge on its path
 		// — neutering that charge reds it. The node budget's own cells are
-		// TestRegression_SchemaNodeWalkBudgetBattery,
+		// TestMatrix_SchemaNodeWalkBudgetBattery,
 		// TestRegression_SchemaNodeDuplicateNamedDefinitionBounded and
-		// TestRegression_SchemaForCustomSchemaBudgetAxes, which hand-build the
+		// TestMatrix_SchemaForCustomSchemaBudgetAxes, which hand-build the
 		// trees Parse cannot express; all three red when takeNode stops charging.
 		factor: "dagWideSCC WIDTH through the metadata surfaces — Root+Schema (render, marshal, re-Parse), String and Canonical",
 		values: []int{80, 8000}, scaleTol: 4, floor: 400 * time.Millisecond},
@@ -14552,7 +14552,7 @@ var costCells = []costCell{
 		factor: "the header DAG's three magnitudes — reference DEPTH, cyclic record WIDTH, and CONTAINER count — each driven at two values",
 		values: []int{26, 30, 8000, 16000, 220, 440}, scaleTol: 4, floor: 400 * time.Millisecond},
 
-	{fn: "TestRegression_NestedStrayContainerKeyLinearCost",
+	{fn: "TestMatrix_NestedStrayContainerKeyLinearCost",
 		// Times inline rather than through a named helper, which is why the
 		// harness vocabulary includes time.Since: a cell that measures its own
 		// clock is still a timing cell, and an exemption must not be able to
@@ -15080,7 +15080,7 @@ func buildViaNodeSchema(node *SchemaNode) error {
 	return err
 }
 
-func TestRegression_WalkBudgetChargesEveryEmissionRoute(t *testing.T) {
+func TestMatrix_WalkBudgetChargesEveryEmissionRoute(t *testing.T) {
 	surfaces := []struct {
 		name  string
 		build func(*SchemaNode) error
@@ -15238,7 +15238,7 @@ func callNoPanic(fn func() (string, error)) (out string, err error, panicked any
 //
 // Single-key maps throughout: with one key there is no ordering question, so
 // a byte comparison against the authority is exact.
-func TestRegression_WalkBudgetMapKeyMatchesJSONKeyResolver(t *testing.T) {
+func TestMatrix_WalkBudgetMapKeyMatchesJSONKeyResolver(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		v    any
@@ -16792,7 +16792,7 @@ func TestRegression_EmptyEnumResolve(t *testing.T) {
 	}
 }
 
-func TestRegression_EmptyUnionParses(t *testing.T) {
+func TestMatrix_EmptyUnionParses(t *testing.T) {
 	s, err := Parse(`[]`)
 	if err != nil {
 		t.Fatalf("Parse rejected empty union (Java/fastavro/avro-rs accept): %v", err)
@@ -16940,7 +16940,7 @@ func TestRegression_EmptyUnionResolve(t *testing.T) {
 // independent: a short-name forward reference and a later inline
 // definition of the same type are the same union member, exactly as the
 // backward-ordered spelling is.
-func TestRegression_UnionForwardRefDuplicateOrderIndependent(t *testing.T) {
+func TestMatrix_UnionForwardRefDuplicateOrderIndependent(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string

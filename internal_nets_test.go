@@ -197,7 +197,7 @@ var censusRegistry = []censusQuestion{
 		id:       "Q3",
 		question: "What does json.Marshal emit as the object key for this Go map key?",
 		authority: "EXTERNAL: encoding/json's resolveKeyName. It is executed per corpus cell by " +
-			"TestRegression_WalkBudgetMapKeyMatchesJSONKeyResolver, which compares against json.Marshal's " +
+			"TestMatrix_WalkBudgetMapKeyMatchesJSONKeyResolver, which compares against json.Marshal's " +
 			"actual output rather than any restatement of its rules — the whole point, since the two bugs " +
 			"in this area were both a restatement that was narrower than the authority",
 		answerers: []censusAnswerer{
@@ -4215,7 +4215,7 @@ func TestDoSBattery_C3_NumberCPU(t *testing.T) {
 
 	// Decimal unscaled value on the wire: bounded by maxDecimalUnscaledBytes
 	// before the big.Int materialization / base conversion. Extreme:
-	// TestRegression_DecimalUnscaledLengthDoS, TestCoverage_RatFromBytesHostileScale.
+	// TestMatrix_DecimalUnscaledLengthDoS, TestCoverage_RatFromBytesHostileScale.
 	bytesDec := MustParse(`{"type":"bytes","logicalType":"decimal","precision":65536,"scale":0}`)
 	hostileUnscaled := avroBytesField(bytes.Repeat([]byte{0x55}, 1<<20)) // ~1 MiB unscaled
 	for _, tgt := range []struct {
@@ -4272,7 +4272,7 @@ func TestDoSBattery_C3_NumberCPU(t *testing.T) {
 
 	// Parse-time decimal scale/precision: 10^scale is materialized at decode,
 	// so the schema integer is capped at decimalScaleLimit at parse. Extreme:
-	// TestRegression_DecimalScaleAllocBound, TestRegression_DecimalExponentOverflowRejectsAcrossArms.
+	// TestMatrix_DecimalScaleAllocBound, TestMatrix_DecimalExponentOverflowRejectsAcrossArms.
 	wantReject(t, "Parse/decimal-scale-over-limit", func() error {
 		_, err := Parse(`{"type":"bytes","logicalType":"decimal","precision":2000000000,"scale":1000000000}`)
 		return err
@@ -4282,7 +4282,7 @@ func TestDoSBattery_C3_NumberCPU(t *testing.T) {
 	// survives Parse fast (caps reject the conversion, json.Number is preserved)
 	// and Root()/String()/Canonical() serialize it under the maxSchemaJSONBytes
 	// budget. Extreme: TestRegression_ParseFloatLengthCapDoS (Props case),
-	// TestRegression_SchemaMetadataExponentOverflowNormalizesToInf.
+	// TestMatrix_SchemaMetadataExponentOverflowNormalizesToInf.
 	wantTerminate(t, "Parse+Root+String/metadata-megabyte-number", func() error {
 		s, err := Parse(`{"type":"record","name":"R","fields":[{"name":"f","type":"int"}],"x":` + hostile1MiB + `}`)
 		if err != nil {
@@ -4304,7 +4304,7 @@ func TestDoSBattery_C5_ErrorEcho(t *testing.T) {
 
 	// Schema-parse error echoing a megabyte type token: bounded by
 	// boundJSONErrorEcho + boundErrorLen (maxParseErrorLen). Extreme:
-	// TestRegression_SchemaParseErrorBoundedForHostileInput.
+	// TestMatrix_SchemaParseErrorBoundedForHostileInput.
 	wantBoundedErr(t, "Parse/unknown-type-megabyte-name", func() error {
 		_, err := Parse(`{"type":"` + huge + `"}`)
 		return err
@@ -4312,7 +4312,7 @@ func TestDoSBattery_C5_ErrorEcho(t *testing.T) {
 
 	// Decode error echoing megabyte wire content: a json.Number target fed a
 	// megabyte string-typed wire value is rejected with truncForError(content).
-	// Extreme: TestRegression_ErrorMessageBoundedForHostileInput.
+	// Extreme: TestMatrix_ErrorMessageBoundedForHostileInput.
 	wantBoundedErr(t, "Decode/json.Number<-megabyte-string-error", func() error {
 		var v json.Number
 		_, err := MustParse(`"string"`).Decode(avroBytesField([]byte(huge)), &v)
@@ -4358,9 +4358,9 @@ func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
 	// reach through Parse at all (deep VALUES inside Props, duplicate named
 	// definitions), and they stay pinned by the dedicated battery in
 	// schema_node_test.go:
-	//   - TestRegression_SchemaNodeSchemaDeepValueBounded   (deep Props/Default value)
-	//   - TestRegression_SchemaNodeWalkDepthAllChannels     (all 4 structural channels + value sites)
-	//   - TestRegression_SchemaNodeSharedDAGExpansionBounded (shared-reference 2^depth fan-out)
+	//   - TestMatrix_SchemaNodeSchemaDeepValueBounded   (deep Props/Default value)
+	//   - TestMatrix_SchemaNodeWalkDepthAllChannels     (all 4 structural channels + value sites)
+	//   - TestMatrix_SchemaNodeSharedDAGExpansionBounded (shared-reference 2^depth fan-out)
 	//   - TestRegression_SchemaNodeDuplicateNamedDefinitionBounded (nested-marshal product blowup)
 	// Bounds: maxSchemaJSONNodes + maxSchemaJSONBytes (one shared walkBudget),
 	// valueWalkLimit, toJSONShared.

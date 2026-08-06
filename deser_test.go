@@ -931,7 +931,7 @@ func TestDecodeTypeMismatch(t *testing.T) {
 		// "int into float" used to be pinned as rejection; now
 		// supported (round-trip parity with the documented encode-side
 		// whole-number-float-as-int divergence). See
-		// TestRegression_IntLongDecodeIntoFloatJSONNumber.
+		// TestMatrix_IntLongDecodeIntoFloatJSONNumber.
 		{"fixed into int array", `{"type":"fixed","name":"f","size":6}`, []byte{1, 2, 3, 4, 5, 6}, ptr([6]int{})},
 		{"array into string", `{"type":"array","items":"int"}`, []byte{0x00}, ptr("")},
 		{"map into string", `{"type":"map","values":"int"}`, []byte{0x00}, ptr("")},
@@ -8350,7 +8350,7 @@ func TestTimestampNanosDecodeUint(t *testing.T) {
 // TestTimestampNanosDecodeIntoString pins decoder symmetry with the
 // encoder for timestamp-nanos into a *string. deserTimeAsLong has a
 // String arm that emits the RFC 3339 Nano form so the round-trip
-// succeeds. See TestRegression_TimeLogicalStringRoundTrip for the
+// succeeds. See TestMatrix_TimeLogicalStringRoundTrip for the
 // full matrix across all seven string-accepting time logicals; this
 // test keeps a single-cell schema/input shape as a sanity check.
 func TestTimestampNanosDecodeIntoString(t *testing.T) {
@@ -10610,7 +10610,7 @@ func TestRegression_LongDefaultPrecisionLoss(t *testing.T) {
 	}
 }
 
-// TestRegression_InvalidDecimalRejected verifies that malformed decimal
+// TestMatrix_InvalidDecimalRejected verifies that malformed decimal
 // logical types (precision <= 0, scale > precision, missing precision,
 // precision exceeding fixed capacity) are rejected at parse time,
 // aligning with fastavro's parse_schema hard-rejects (negative values
@@ -10619,7 +10619,7 @@ func TestRegression_LongDefaultPrecisionLoss(t *testing.T) {
 // catches the throw (fromSchemaIgnoreInvalid) and soft-drops the
 // logical — silently stripping the logical type and treating the schema
 // as plain bytes/fixed is exactly the interop hazard rejecting avoids.
-func TestRegression_InvalidDecimalRejected(t *testing.T) {
+func TestMatrix_InvalidDecimalRejected(t *testing.T) {
 	cases := []struct {
 		name, schema string
 	}{
@@ -10637,14 +10637,14 @@ func TestRegression_InvalidDecimalRejected(t *testing.T) {
 	}
 }
 
-// TestRegression_DecimalNaNInfNoPanic verifies that encoding non-finite
+// TestMatrix_DecimalNaNInfNoPanic verifies that encoding non-finite
 // floats (NaN, ±Inf) into decimal-typed schemas does not panic.
 // tryCoerceToRat must guard against (*big.Rat).SetFloat64 returning
 // nil for non-finite values; without the guard, downstream
 // serRat / FloatString dereferences the nil pointer. Java/fastavro/
 // goavro all reject these inputs with a typed error rather than
 // crash.
-func TestRegression_DecimalNaNInfNoPanic(t *testing.T) {
+func TestMatrix_DecimalNaNInfNoPanic(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
@@ -11011,13 +11011,13 @@ func TestRegression_UdArrayNullUnionPtrInt8Truncates(t *testing.T) {
 	}
 }
 
-// TestRegression_TimestampDeserParity locks in that
+// TestMatrix_TimestampDeserParity locks in that
 // deserTimestamp{Millis,Micros,Nanos} and deserDate handle the same
 // five target shapes (any, time.Time, typed-interface-implemented-by-
 // time.Time, typed-interface-not-implemented, plain integer) in lockstep.
 // All four sites route through deserTimeAsLong + setIface so the
 // interface guard is shared and can't drift across changes.
-func TestRegression_TimestampDeserParity(t *testing.T) {
+func TestMatrix_TimestampDeserParity(t *testing.T) {
 	type stringerIface interface{ String() string } // time.Time implements
 	type unsupported interface{ Mock() }            // time.Time does not
 
@@ -11679,7 +11679,7 @@ func TestRegression_NestedDefaultJSONIgnoresTaggedUnions(t *testing.T) {
 	}
 }
 
-// TestRegression_TimestampMillisMicrosSilentOverflow locks in that
+// TestMatrix_TimestampMillisMicrosSilentOverflow locks in that
 // timestamp-millis / timestamp-micros / local-timestamp-millis /
 // local-timestamp-micros encoders return an error for time.Time
 // values whose UnixMilli/UnixMicro would overflow int64, instead of
@@ -11691,7 +11691,7 @@ func TestRegression_NestedDefaultJSONIgnoresTaggedUnions(t *testing.T) {
 //
 // Year 300_000 overflows micros (MaxInt64µs ≈ year 294246); year
 // 300_000_000 overflows millis (MaxInt64ms ≈ year 292M).
-func TestRegression_TimestampMillisMicrosSilentOverflow(t *testing.T) {
+func TestMatrix_TimestampMillisMicrosSilentOverflow(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
@@ -11754,7 +11754,7 @@ func TestRegression_TimestampMillisMicrosUnsafeOverflow(t *testing.T) {
 	}
 }
 
-// TestRegression_DecodeJSONLongOverflowGap locks in that JSON-encoded
+// TestMatrix_DecodeJSONLongOverflowGap locks in that JSON-encoded
 // long values exceeding int64 are rejected, not silently wrapped.
 // parseJSONInt64 uses a per-digit pre-multiply bound that's safe near
 // 2^64/9 (the boundary where the naive "n*10+d wrapped if it went
@@ -11764,7 +11764,7 @@ func TestRegression_TimestampMillisMicrosUnsafeOverflow(t *testing.T) {
 //
 // Java: JsonParser.getLongValue throws InputCoercionException.
 // goavro: strconv.ParseInt rejects.
-func TestRegression_DecodeJSONLongOverflowGap(t *testing.T) {
+func TestMatrix_DecodeJSONLongOverflowGap(t *testing.T) {
 	t.Run("bare long exceeding MaxInt64", func(t *testing.T) {
 		s := MustParse(`"long"`)
 		var got int64
@@ -12165,7 +12165,7 @@ func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
 	}
 }
 
-// TestRegression_EncodeJSONNullParity locks binary↔JSON encode parity
+// TestMatrix_EncodeJSONNullParity locks binary↔JSON encode parity
 // for the plain "null" Avro type across every site that reaches serNull
 // or appendAvroJSON's case "null" arm. Both paths must:
 //
@@ -12197,7 +12197,7 @@ func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
 // deliberately strict here per TestSerNullNonNilableType (ser_test.go)
 // — bringing the JSON path into parity with our strict-binary choice
 // rather than weakening the binary side to match Java.
-func TestRegression_EncodeJSONNullParity(t *testing.T) {
+func TestMatrix_EncodeJSONNullParity(t *testing.T) {
 	// ---- Reject arm: non-nil non-nilable values must error on both paths ----
 
 	t.Run("plain null schema, non-nil int", func(t *testing.T) {
@@ -12316,8 +12316,8 @@ func TestRegression_EncodeJSONNullParity(t *testing.T) {
 	})
 }
 
-// TestRegression_EncodeJSONNullParityPointerToNilPointer extends
-// TestRegression_EncodeJSONNullParity to the **T-with-nil-inner shape:
+// TestMatrix_EncodeJSONNullParityPointerToNilPointer extends
+// TestMatrix_EncodeJSONNullParity to the **T-with-nil-inner shape:
 // a non-nil outer pointer whose Elem() is a nil pointer (e.g. `&p`
 // where `var p *int = nil`), with or without an enclosing any{}
 // wrapper. The 2-branch [null,T] optimization works via isNilValue
@@ -12327,7 +12327,7 @@ func TestRegression_EncodeJSONNullParity(t *testing.T) {
 // indirect loop already peeled both, so JSON encode succeeded —
 // binary↔JSON asymmetry. The fix extends serNull's peel loop to
 // include reflect.Pointer, mirroring isNilValue's behavior.
-func TestRegression_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
+func TestMatrix_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 	nilIntPtrPtr := func() any { var p *int; return &p }
 	nilMapPtrPtr := func() any { var p *map[string]any; return &p }
 
@@ -12376,7 +12376,7 @@ func TestRegression_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 	})
 }
 
-// TestRegression_EncodeJSONNullParityBareNilContainer locks parity between
+// TestMatrix_EncodeJSONNullParityBareNilContainer locks parity between
 // the binary union encoder (serUnion.ser, ser.go) and the JSON union
 // encoder (appendAvroJSONUnion, json_codec.go) for bare nil Map / nil
 // Slice / nil []byte inputs against a multi-branch union containing
@@ -12393,7 +12393,7 @@ func TestRegression_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 // loop mirrors serUnion.ser; the case "null" arm rejects non-nil with
 // errNonNil so non-nil inputs cleanly fall through to the next branch.
 //
-// This is distinct from TestRegression_EncodeJSONNullParity above, which
+// This is distinct from TestMatrix_EncodeJSONNullParity above, which
 // covers the TAGGED-union dispatch (`{"null": <typed-nil>}` flowing
 // through tryUnwrapTagged → case "null"). The bare-value form here goes
 // through unionTypeNameForValue (which returns "" for Map/Slice except
@@ -12402,7 +12402,7 @@ func TestRegression_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 // isNilValue without also updating the JSON dispatcher's try-each hides
 // the bug, because every existing parity test passes the typed-nil
 // through the tagged form, not the bare form.
-func TestRegression_EncodeJSONNullParityBareNilContainer(t *testing.T) {
+func TestMatrix_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 	tests := []struct {
 		name   string
 		schema string
@@ -12503,7 +12503,7 @@ func TestRegression_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 	}
 }
 
-// TestRegression_EncodeJSONNullBytesUnionParity locks the "Go nil =
+// TestMatrix_EncodeJSONNullBytesUnionParity locks the "Go nil =
 // absent → null branch" semantic uniformly across union arities and
 // encoders. All four dispatch sites must agree on nil-equivalence:
 // binary 2-branch (serNullUnionAt → isNilValue), binary N-branch
@@ -12525,7 +12525,7 @@ func TestRegression_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 // alone does not suffice: type-name dispatch fires before try-each
 // runs for nil Slice<uint8>. The nil-first short-circuit is the
 // general fix.
-func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
+func TestMatrix_EncodeJSONNullBytesUnionParity(t *testing.T) {
 	tests := []struct {
 		name     string
 		schema   string
@@ -12639,7 +12639,7 @@ func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
 	}
 }
 
-// TestRegression_EncodeNullParity2BranchNilChanFunc locks parity
+// TestMatrix_EncodeNullParity2BranchNilChanFunc locks parity
 // between the binary 2-branch [null,T] optimization (serNullUnion /
 // isNilValue at ser.go) and the binary 3-branch / JSON paths
 // (serUnion.ser / appendAvroJSONUnion → serNull / case "null") for
@@ -12661,7 +12661,7 @@ func TestRegression_EncodeJSONNullBytesUnionParity(t *testing.T) {
 // terminal switch leaves the helper's accept set narrower than
 // serNull's. isNilValue's terminal switch must include reflect.Chan
 // and reflect.Func so its accept set matches serNull's exactly.
-func TestRegression_EncodeNullParity2BranchNilChanFunc(t *testing.T) {
+func TestMatrix_EncodeNullParity2BranchNilChanFunc(t *testing.T) {
 	cases := []struct {
 		name    string
 		schema  string
@@ -13506,7 +13506,7 @@ func TestRegression_DecimalBytesJSONStringIsCodepointForm(t *testing.T) {
 	}
 }
 
-// TestRegression_ArrayMapMultiLevelPointerElements locks in that the
+// TestMatrix_ArrayMapMultiLevelPointerElements locks in that the
 // per-primitive serArray/serMap specializations accept multi-level
 // pointer element types (**T, ***T), matching the unsafe fast path
 // which chases arbitrarily-deep pointers via
@@ -13514,7 +13514,7 @@ func TestRegression_DecimalBytesJSONStringIsCodepointForm(t *testing.T) {
 // recurse through Elem() until reaching the concrete primitive type
 // — a single-level unwrap would reject **T as "cannot use *int32
 // with Avro type int".
-func TestRegression_ArrayMapMultiLevelPointerElements(t *testing.T) {
+func TestMatrix_ArrayMapMultiLevelPointerElements(t *testing.T) {
 	intArr := MustParse(`{"type":"array","items":"int"}`)
 	longArr := MustParse(`{"type":"array","items":"long"}`)
 	stringArr := MustParse(`{"type":"array","items":"string"}`)
@@ -13658,7 +13658,7 @@ func TestRegression_SerTimeMicrosAcceptsTime(t *testing.T) {
 	}
 }
 
-// TestRegression_FloatDecodeIntegerOverflowBoundary pins that decoding a
+// TestMatrix_FloatDecodeIntegerOverflowBoundary pins that decoding a
 // float/double wire value into an integer Go target performs its out-of-range
 // check in float space (like the encode-side floatFitsInt64), not via the
 // platform-dependent int64(f) round trip. Go's float->int conversion is
@@ -13669,7 +13669,7 @@ func TestRegression_SerTimeMicrosAcceptsTime(t *testing.T) {
 // stores int64(2^63-1) -- an off-by-one corruption of a value that is out of
 // int64 range and must be rejected, exactly as the encode side rejects
 // float64(2^63) against a long schema.
-func TestRegression_FloatDecodeIntegerOverflowBoundary(t *testing.T) {
+func TestMatrix_FloatDecodeIntegerOverflowBoundary(t *testing.T) {
 	doubleWire := func(f float64) []byte {
 		b := make([]byte, 8)
 		binary.LittleEndian.PutUint64(b, math.Float64bits(f))
@@ -13730,14 +13730,14 @@ func TestRegression_FloatDecodeIntegerOverflowBoundary(t *testing.T) {
 	})
 }
 
-// TestRegression_FloatDecodeIntegerTargetMatrix exercises the float/double ->
+// TestMatrix_FloatDecodeIntegerTargetMatrix exercises the float/double ->
 // integer-target decode arm (setFloatValue) across every integer width and at
 // each type's overflow boundary, including the int64/uint64 boundary the
 // platform-dependent conversion hid. Boundary-minus-one values must still
 // decode; boundary-plus-one must reject; non-whole and non-finite values must
 // reject for every integer target. The full uint64 range [0, 2^64) is decodable
 // (the int64 intermediate previously could not represent [2^63, 2^64)).
-func TestRegression_FloatDecodeIntegerTargetMatrix(t *testing.T) {
+func TestMatrix_FloatDecodeIntegerTargetMatrix(t *testing.T) {
 	doubleWire := func(f float64) []byte {
 		b := make([]byte, 8)
 		binary.LittleEndian.PutUint64(b, math.Float64bits(f))
@@ -17029,7 +17029,7 @@ type setIterRec struct {
 
 const setIterRecSchema = `{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","type":"string"}]}`
 
-func TestRegression_MapSetIterRoundTrip(t *testing.T) {
+func TestMatrix_MapSetIterRoundTrip(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
@@ -17096,7 +17096,7 @@ func TestRegression_MapSetIterRoundTrip(t *testing.T) {
 // deterministic wire order, so bytes are directly comparable: a builtin
 // value type takes the switch, a same-underlying named type takes the
 // general appendFn path.
-func TestRegression_MapValueSwitchMatchesGeneral(t *testing.T) {
+func TestMatrix_MapValueSwitchMatchesGeneral(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
@@ -17210,7 +17210,7 @@ func TestRegression_Float32SignalingNaNPreserved(t *testing.T) {
 	// float32WireBits's typedmemmove-into-temp branch — distinct from the
 	// builtin-float32 Interface() branch and the unsafe-addressable branch
 	// exercised above, and the only float32 path the rest of this test (and
-	// TestRegression_MapValueSwitchMatchesGeneral, which uses an addressable
+	// TestMatrix_MapValueSwitchMatchesGeneral, which uses an addressable
 	// map elem) does not reach with a payload. Scalar decode and the
 	// []fpFloat32 reflect loop must preserve the raw bits too.
 	fltS := MustParse(`"float"`)
@@ -17243,7 +17243,7 @@ func TestRegression_Float32SignalingNaNPreserved(t *testing.T) {
 
 // JSON array encode native must be byte-identical to the reflect path.
 // Arrays are ordered, so the whole encoding is byte-comparable.
-func TestRegression_ArrayJSONNativeMatchesGeneral(t *testing.T) {
+func TestMatrix_ArrayJSONNativeMatchesGeneral(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
@@ -17284,7 +17284,7 @@ func TestRegression_ArrayJSONNativeMatchesGeneral(t *testing.T) {
 // JSON map encode native must be byte-identical to the reflect path. Single
 // entry → deterministic order. A builtin value type takes the native path; a
 // same-underlying named type takes the reflect (appendAvroJSON) path.
-func TestRegression_MapJSONNativeMatchesGeneral(t *testing.T) {
+func TestMatrix_MapJSONNativeMatchesGeneral(t *testing.T) {
 	cases := []struct {
 		name   string
 		schema string
@@ -17677,10 +17677,10 @@ func TestInvariant_EveryBranchMatchTierIsDriven(t *testing.T) {
 	}
 }
 
-// TestRegression_UnionBranchSelectionSurvivesIndexing pins the individual
+// TestMatrix_UnionBranchSelectionSurvivesIndexing pins the individual
 // verdicts the ranks exist to produce, so a future change that collapses two
 // ranks fails with the shape it broke rather than only as a corpus diff.
-func TestRegression_UnionBranchSelectionSurvivesIndexing(t *testing.T) {
+func TestMatrix_UnionBranchSelectionSurvivesIndexing(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		reader string
@@ -18023,7 +18023,7 @@ func itoa(n int) string {
 // silent-wrong-output divergence. The wide comparison rejects it on every
 // platform; this also pins that the error reports the TRUE value, not a
 // truncated/sign-wrapped one (the observable proxy on a 64-bit host).
-func TestRegression_EnumOrdinalOverflowRejected(t *testing.T) {
+func TestMatrix_EnumOrdinalOverflowRejected(t *testing.T) {
 	const schema = `{"type":"enum","name":"e","symbols":["a","b","c"]}` // len 3
 
 	// A uint64 ordinal whose low bits (mod 2^32) land inside [0,3): on a 32-bit
@@ -18152,7 +18152,7 @@ func TestRegression_UnsafeDecodeDepthBounded(t *testing.T) {
 // flips a logical's transform behavior), one of these explicit expectations
 // fails, forcing a conscious review. Expected values are spelled out (not
 // re-probed) so this is a genuine check, not a tautology.
-func TestRegression_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
+func TestMatrix_JSONDecodeAppliesLogicalMatchesDecode(t *testing.T) {
 	cases := []struct {
 		kind, logical string
 		size          int
@@ -18645,7 +18645,7 @@ func TestEncodeJSONNullSchema(t *testing.T) {
 		}
 	})
 	// Non-nil values must error, matching binary serNull's errNonNil
-	// rejection — see TestRegression_EncodeJSONNullParity.
+	// rejection — see TestMatrix_EncodeJSONNullParity.
 	t.Run("non-nil value rejected", func(t *testing.T) {
 		if out, err := s.EncodeJSON("ignored"); err == nil {
 			t.Errorf("expected error encoding non-nil value into null schema, got %s", out)
@@ -19991,7 +19991,7 @@ func TestCustomTypeDecodeIntIntoAny(t *testing.T) {
 	}
 }
 
-// TestRegression_DecodeJSONFillsDefaultThroughCustomDecoder locks in that
+// TestMatrix_DecodeJSONFillsDefaultThroughCustomDecoder locks in that
 // DecodeJSON applies a registered CustomType.Decode to a record field's
 // default value when the field is absent from the JSON input — matching
 // the binary side, where the field's pre-encoded defaultBytes roundtrip
@@ -20015,7 +20015,7 @@ func TestCustomTypeDecodeIntIntoAny(t *testing.T) {
 // Each sub-test pairs JSON-decode with the binary-roundtrip equivalent
 // and asserts both produce the same user-domain Go value so the parity
 // guarantee survives schema/codec changes.
-func TestRegression_DecodeJSONFillsDefaultThroughCustomDecoder(t *testing.T) {
+func TestMatrix_DecodeJSONFillsDefaultThroughCustomDecoder(t *testing.T) {
 	s := parseMoney(t, `{"type":"record","name":"R","fields":[
 		{"name":"price","type":{"type":"long","logicalType":"money"},"default":42}
 	]}`)

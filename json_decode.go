@@ -93,7 +93,7 @@ func decodeLogicalBytes(b []byte, node *schemaNode) (any, error) {
 // parse-time-only cost (a handful of allocs per custom-typed logical node, one
 // time per schema) and never touches the encode/decode hot path — decodeKind
 // and the decodeLogical* functions are unchanged.
-// TestRegression_JSONDecodeAppliesLogicalMatchesDecode pins the result for
+// TestMatrix_JSONDecodeAppliesLogicalMatchesDecode pins the result for
 // every logical against the human-known expected set.
 func jsonDecodeAppliesLogical(node *schemaNode) bool {
 	if node.logical == "" {

@@ -3464,7 +3464,7 @@ func TestRegression_SchemaForMixedUUIDAndPlainSameType(t *testing.T) {
 // Sibling of TestRegression_SchemaForMixedUUIDAndPlainSameType, which uses a
 // distinct name (ID) where the two forms coexist; the distinct-name pin
 // structurally cannot reach this name coincidence.
-func TestRegression_SchemaForUUIDNamedTypeMemoCollision(t *testing.T) {
+func TestMatrix_SchemaForUUIDNamedTypeMemoCollision(t *testing.T) {
 	type uuid [16]byte // Name() == "uuid", colliding with the hard-coded logical name
 
 	t.Run("uuid then plain rejected", func(t *testing.T) {
@@ -3585,7 +3585,7 @@ func TestRegression_SchemaForAvroDurationCollision(t *testing.T) {
 // object braces — must be preserved rather than rejected by the tag
 // bracket-balance scan (which exists only for the alias=[...] / decimal(...)
 // option forms).
-func TestRegression_SchemaForDefaultWithBrackets(t *testing.T) {
+func TestMatrix_SchemaForDefaultWithBrackets(t *testing.T) {
 	t.Run("unbalanced open paren", func(t *testing.T) {
 		type R struct {
 			X string `avro:"x,default=note (a"`
@@ -3655,7 +3655,7 @@ func TestRegression_SchemaForDefaultWithBrackets(t *testing.T) {
 // its other Go-type/tag compatibility checks. The default is parsed with
 // the same lenient parser the wire path uses, so exponent / whole-number-
 // float forms are caught too.
-func TestRegression_SchemaForNarrowIntDefaultBounds(t *testing.T) {
+func TestMatrix_SchemaForNarrowIntDefaultBounds(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		fn     func() (*Schema, error)
@@ -4502,7 +4502,7 @@ func TestRegression_SchemaForOverBudgetCustomSchemaErrors(t *testing.T) {
 // (the same deduper-carrying walk): the BYTES axis (scalar payload), the
 // NODES axis (emitted node count), and the unnamed-cycle detection. A
 // modest schema stays well under every budget (the success control).
-func TestRegression_SchemaForCustomSchemaBudgetAxes(t *testing.T) {
+func TestMatrix_SchemaForCustomSchemaBudgetAxes(t *testing.T) {
 	build := func(node *SchemaNode) error {
 		ct := CustomType{GoType: reflect.TypeFor[scopePinMoney](), Schema: node}
 		_, err := SchemaFor[scopePinOneField](ct)
@@ -5992,7 +5992,7 @@ func TestMatrix_SchemaForTagGuardPathCensus(t *testing.T) {
 	}
 }
 
-// TestRegression_SchemaForEmbeddedSkipDirectiveExactMatch is the per-symptom
+// TestMatrix_SchemaForEmbeddedSkipDirectiveExactMatch is the per-symptom
 // pin for the census row that was open: the "-" skip directive is
 // exact-match only, and the anonymous-embed path must say so in the same
 // actionable terms as the named path rather than deferring to Avro's name
@@ -6000,7 +6000,7 @@ func TestMatrix_SchemaForTagGuardPathCensus(t *testing.T) {
 // the guard was shared the embed path emitted a field literally named "-"
 // carrying the whole embedded record — the opposite of the skip the tag
 // asked for.
-func TestRegression_SchemaForEmbeddedSkipDirectiveExactMatch(t *testing.T) {
+func TestMatrix_SchemaForEmbeddedSkipDirectiveExactMatch(t *testing.T) {
 	lax := WithLaxNames(func(string) error { return nil })
 
 	for _, mode := range []struct {
@@ -7367,13 +7367,13 @@ func nullSpellCustom(t *testing.T, union string) CustomType {
 	return CustomType{GoType: reflect.TypeFor[nullSpellMarker](), Schema: root}
 }
 
-// TestRegression_SchemaForPointerCollapseWrappedNullBranch pins that the
+// TestCensus_SchemaForPointerCollapseWrappedNullBranch pins that the
 // pointer arm's union collapse recognizes a null first branch in either
 // spelling. A *T field whose CustomType supplies a null-first union must
 // collapse to that union; keying the collapse on the bare spelling alone
 // emits ["null", [<union>]], which Avro forbids — the build then fails on a
 // schema whose bare-spelled twin builds fine.
-func TestRegression_SchemaForPointerCollapseWrappedNullBranch(t *testing.T) {
+func TestCensus_SchemaForPointerCollapseWrappedNullBranch(t *testing.T) {
 	ptrTo := reflect.PointerTo(reflect.TypeFor[nullSpellMarker]())
 	fields := []reflect.StructField{{Name: "F", Type: ptrTo}}
 
@@ -7398,7 +7398,7 @@ func TestRegression_SchemaForPointerCollapseWrappedNullBranch(t *testing.T) {
 	}
 }
 
-// TestRegression_SchemaForNullFirstDefaultWrappedNullBranch pins that the
+// TestCensus_SchemaForNullFirstDefaultWrappedNullBranch pins that the
 // null-first default fill recognizes both spellings. The assertion is on the
 // EMITTED SCHEMA TEXT, not on twmb's decode behavior: twmb synthesizes an
 // implicit null default for a nullable union at parse, so the omission is
@@ -7406,7 +7406,7 @@ func TestRegression_SchemaForPointerCollapseWrappedNullBranch(t *testing.T) {
 // registry or hands to another implementation — and Java and fastavro do not
 // infer the default. Without "default":null those readers cannot read data
 // written before the field existed.
-func TestRegression_SchemaForNullFirstDefaultWrappedNullBranch(t *testing.T) {
+func TestCensus_SchemaForNullFirstDefaultWrappedNullBranch(t *testing.T) {
 	fields := []reflect.StructField{{Name: "F", Type: reflect.TypeFor[nullSpellMarker]()}}
 
 	for _, tc := range nullSpellUnions() {
@@ -7796,11 +7796,11 @@ func TestMatrix_EmbedTagTierIsPlacementInvariant(t *testing.T) {
 	}
 }
 
-// TestRegression_EmbedCollisionBelowRootDoesNotPanic is the public-entry
+// TestMatrix_EmbedCollisionBelowRootDoesNotPanic is the public-entry
 // pin. SchemaFor is generic, so these are written out rather than generated;
 // the panic they lock is a reflect index path resolved against the wrong
 // type, and it needs no collision at the root to fire.
-func TestRegression_EmbedCollisionBelowRootDoesNotPanic(t *testing.T) {
+func TestMatrix_EmbedCollisionBelowRootDoesNotPanic(t *testing.T) {
 	cases := []struct {
 		name     string
 		fn       func() (*Schema, error)
@@ -7931,7 +7931,7 @@ type EmbedX1 struct{ EmbedX0 }
 type EmbedX2 struct{ EmbedX1 }
 type EmbedX3 struct{ EmbedX2 }
 
-// TestRegression_EmbedSelectionMatchesGoPromotion is the GENERATIVE net for
+// TestGenerative_EmbedSelectionMatchesGoPromotion is the GENERATIVE net for
 // embedded-field selection. It sweeps the embed lattice — structs embedding
 // every ordered subset of the depth carriers above, as value AND pointer
 // embeds, with and without a direct field — and for every shape asserts
@@ -7946,7 +7946,7 @@ type EmbedX3 struct{ EmbedX2 }
 // question both twmb and reflect answer identically. Out of scope (no
 // external oracle — twmb-DEFINED policy, pinned separately): tagged renames
 // colliding with promoted names, and equal-depth ties where reflect abstains.
-func TestRegression_EmbedSelectionMatchesGoPromotion(t *testing.T) {
+func TestGenerative_EmbedSelectionMatchesGoPromotion(t *testing.T) {
 	carriers := []reflect.Type{
 		reflect.TypeFor[EmbedX0](), reflect.TypeFor[EmbedX1](),
 		reflect.TypeFor[EmbedX2](), reflect.TypeFor[EmbedX3](),

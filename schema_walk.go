@@ -110,7 +110,7 @@ type nodeChildVisitor struct {
 	// container keys as-written on the matching structural field, a
 	// read-only surfacing duty with no registration or mutation. That
 	// asymmetry is deliberate and pinned
-	// (TestRegression_MetadataStrayKeySurfacedAsWritten); a uniformity
+	// (TestMatrix_MetadataStrayKeySurfacedAsWritten); a uniformity
 	// change that gates the metadata walker too breaks the surfacing
 	// contract.
 	strayKeys bool
