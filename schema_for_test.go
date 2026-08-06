@@ -3648,13 +3648,105 @@ func TestMatrix_SchemaForDefaultWithBrackets(t *testing.T) {
 	})
 }
 
-// A narrow Go integer kind maps to a wider Avro type (int8/16, uint8/16 ->
-// int; uint32, uint -> long), so a default that fits the Avro type but not
-// the Go field would build a schema whose own default overflows the field
-// at decode-fill time. SchemaFor rejects it at build time, consistent with
-// its other Go-type/tag compatibility checks. The default is parsed with
-// the same lenient parser the wire path uses, so exponent / whole-number-
-// float forms are caught too.
+// sfDefaultClass is the JSON-parse class of a default= tag body. The tag
+// text is offered to a JSON decoder, and what comes back decides whether
+// the default is a decoded VALUE or the verbatim TEXT. The bracket cells
+// above vary the tag's punctuation, which is a different question — every
+// one of them is non-JSON, so they all take the verbatim arm and the axis
+// they cross never reaches the decision itself.
+//
+// The classes, and why each is its own:
+//
+//	whole-json      the decoder consumes the entire tag -> the decoded value
+//	json-then-space trailing WHITESPACE only, still whole -> the decoded value
+//	json-then-junk  a valid JSON PREFIX with content after it -> verbatim
+//	not-json        the decoder fails outright -> verbatim
+//
+// json-then-junk is the class that separates "decoded the whole tag" from
+// "decoded as much as it could": the decoder stops at the end of the first
+// value and reports no error, so without the trailing check the tag would
+// silently truncate to its prefix and the rest of the user's text would
+// vanish. json-then-space is its boundary twin — the same shape minus the
+// content — and it must land on the OTHER side.
+//
+// The JSON spellings are all quote-free: a struct tag cannot carry a raw
+// double quote, so a bare JSON string is not expressible as a default= tag
+// at all and an array stands in for the container shape.
+//
+// Each class is paired with a field type its decoded form is valid for,
+// since a default that survives the parse must still typecheck against the
+// field. The verbatim classes therefore all sit on a string field: that is
+// the only field type their fallback text is valid for, and it is also
+// what makes the truncation visible — a truncated "42 oops" would emit the
+// number 42, which a string field rejects outright.
+type sfDefaultClass struct {
+	name string
+	tag  string
+	typ  reflect.Type
+	// verbatim says the whole tag text must survive as a JSON string.
+	// Otherwise the tag is decoded and decodedWant is the emitted form.
+	verbatim    bool
+	decodedWant string
+}
+
+var sfDefaultClasses = []sfDefaultClass{
+	{name: "whole-json-number", tag: `42`, typ: reflect.TypeFor[int64](), decodedWant: `"default":42`},
+	{name: "whole-json-array", tag: `[1,2]`, typ: reflect.TypeFor[[]int64](), decodedWant: `"default":[1,2]`},
+	{name: "whole-json-true", tag: `true`, typ: reflect.TypeFor[bool](), decodedWant: `"default":true`},
+	{name: "json-then-space", tag: "42 ", typ: reflect.TypeFor[int64](), decodedWant: `"default":42`},
+	{name: "json-then-junk-word", tag: `42 oops`, typ: reflect.TypeFor[string](), verbatim: true},
+	{name: "json-then-junk-number", tag: `42 43`, typ: reflect.TypeFor[string](), verbatim: true},
+	{name: "json-then-junk-array", tag: `[1,2] there`, typ: reflect.TypeFor[string](), verbatim: true},
+	{name: "not-json-bare", tag: `oops`, typ: reflect.TypeFor[string](), verbatim: true},
+	{name: "not-json-leading-junk", tag: `oops 42`, typ: reflect.TypeFor[string](), verbatim: true},
+}
+
+// TestMatrix_SchemaForDefaultParseClass drives the class axis above. A
+// verbatim cell's expected text comes from marshalling the tag as a JSON
+// string rather than from hand-escaping it, so the cell asserts "the whole
+// tag survived" without restating the emitter's escaping rules.
+func TestMatrix_SchemaForDefaultParseClass(t *testing.T) {
+	t.Parallel()
+	verbatim, decoded := 0, 0
+	for _, c := range sfDefaultClasses {
+		t.Run(c.name, func(t *testing.T) {
+			fields := []reflect.StructField{{
+				Name: "X",
+				Type: c.typ,
+				Tag:  reflect.StructTag(`avro:"x,default=` + c.tag + `"`),
+			}}
+			s, err := schemaForScopeCell(t, fields, "", nil)
+			if err != nil {
+				t.Fatalf("SchemaFor: %v", err)
+			}
+			want := c.decodedWant
+			if c.verbatim {
+				b, err := json.Marshal(c.tag)
+				if err != nil {
+					t.Fatalf("marshal tag: %v", err)
+				}
+				want = `"default":` + string(b)
+			}
+			if got := s.String(); !strings.Contains(got, want) {
+				t.Fatalf("emitted default is not %s:\n %s", want, got)
+			}
+			if c.verbatim {
+				verbatim++
+			} else {
+				decoded++
+			}
+		})
+	}
+	// Both arms must occur: a build that stopped decoding altogether, or
+	// stopped falling back, would satisfy every cell on one side.
+	if verbatim == 0 || decoded == 0 {
+		t.Fatalf("the parse-class axis collapsed: %d verbatim, %d decoded", verbatim, decoded)
+	}
+	if verbatim < 3 || decoded < 3 {
+		t.Errorf("the axis has thinned: %d verbatim, %d decoded", verbatim, decoded)
+	}
+}
+
 func TestMatrix_SchemaForNarrowIntDefaultBounds(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -5904,13 +5996,19 @@ type skipCensusInner struct{ A string }
 
 // skipCensusStruct builds `struct { F skipCensusInner "tag"; G string }` when
 // embed is false, and `struct { skipCensusInner "tag"; G string }` when true.
-func skipCensusStruct(tag string, embed bool) reflect.Type {
+func skipCensusStruct(tag string, embed bool, ft reflect.Type) reflect.Type {
+	if ft == nil {
+		ft = reflect.TypeFor[skipCensusInner]()
+	}
 	first := reflect.StructField{
 		Name: "F",
-		Type: reflect.TypeFor[skipCensusInner](),
+		Type: ft,
 		Tag:  reflect.StructTag(tag),
 	}
 	if embed {
+		// Only a struct type can be embedded and still carry fields, so
+		// the embed path keeps the census's own inner type; a row with a
+		// scalar field type is a named-path row.
 		first.Name = "SkipCensusInner"
 		first.Type = reflect.TypeFor[skipCensusInner]()
 		first.Anonymous = true
@@ -5924,12 +6022,25 @@ func skipCensusStruct(tag string, embed bool) reflect.Type {
 // skipCensusBuild runs the SchemaFor pipeline over a runtime-built struct.
 func skipCensusBuild(t *testing.T, tag string, embed bool, opts ...SchemaOpt) (*Schema, error) {
 	t.Helper()
-	st := skipCensusStruct(tag, embed)
+	return skipCensusBuildTyped(t, tag, embed, nil, nil, opts...)
+}
+
+// skipCensusBuildTyped is skipCensusBuild with the census field's Go type
+// chosen by the caller. The type decides which guards a tag can even reach:
+// a logical-type tag is checked against the Go type BEFORE the custom-match
+// question is asked, so a row that wants the custom-match verdict must
+// supply a type the logical tag is valid for.
+func skipCensusBuildTyped(t *testing.T, tag string, embed bool, ft reflect.Type, customs []CustomType, opts ...SchemaOpt) (*Schema, error) {
+	t.Helper()
+	st := skipCensusStruct(tag, embed, ft)
 	fields := make([]reflect.StructField, st.NumField())
 	for i := range fields {
 		fields[i] = st.Field(i)
 	}
-	return schemaForScopeCell(t, fields, "", nil, opts...)
+	// customs go to INFERENCE, which is where the custom-match question is
+	// asked; a CustomType handed in as a plain option reaches only the
+	// final parse and would never match a field.
+	return schemaForScopeCell(t, fields, "", customs, opts...)
 }
 
 // TestMatrix_SchemaForTagGuardPathCensus is the pattern-14a census: for every
@@ -5937,28 +6048,70 @@ func skipCensusBuild(t *testing.T, tag string, embed bool, opts ...SchemaOpt) (*
 // the same verdict. A row's wantErr is the substring the error must name; an
 // empty wantErr means the tag is valid and the build must succeed.
 func TestMatrix_SchemaForTagGuardPathCensus(t *testing.T) {
+	// The CUSTOM-MATCH axis. Every row below previously ran with no
+	// CustomType registered, so the field's match state had one value and
+	// the guard that rejects a logical-type tag on a custom-matched field
+	// — the field's tag has nothing to apply to, because the custom
+	// supplies the schema — was unreachable from this census. wantErrCustom
+	// is the verdict when a CustomType claims the field's Go type; an empty
+	// string means the same verdict as without one.
 	census := []struct {
-		guard   string
-		tag     string
-		wantErr string
+		guard         string
+		tag           string
+		wantErr       string
+		wantErrCustom string
+		customDiffers bool
+		// fieldType overrides the census field's Go type. Rows that want
+		// the custom-match verdict need a type their logical tag is valid
+		// for, since the Go-type check runs first.
+		fieldType reflect.Type
+		// namedOnly marks a row whose field type cannot be embedded.
+		namedOnly bool
 	}{
-		{"exact skip directive", `avro:"-"`, ""},
-		{"skip directive is exact-match only (options)", `avro:"-,omitzero"`, "exact-match only"},
-		{"skip directive is exact-match only (suffix)", `avro:"-foo"`, "exact-match only"},
-		{"splitTag unclosed bracket", `avro:"X,alias=[a"`, "unclosed"},
-		{"splitTag unexpected close", `avro:"X,alias=a]"`, "unexpected"},
-		{"inline with an explicit name", `avro:"X,inline"`, "inline is incompatible with an explicit field name"},
-		{"inline with another option", `avro:",inline,omitzero"`, "inline is incompatible with option"},
-		{"alias empty brackets", `avro:"X,alias=[]"`, "empty brackets"},
-		{"alias empty element", `avro:"X,alias=[a,]"`, "empty element"},
-		{"type-alias empty brackets", `avro:"X,type-alias=[]"`, "empty brackets"},
-		{"decimal trailing junk", `avro:"X,decimal(1,2,3)"`, "invalid decimal tag"},
-		{"unknown tag option", `avro:"X,bogusopt"`, "unknown avro tag option"},
-		{"uuid on an incompatible Go type", `avro:"X,uuid"`, "uuid logical type"},
-		{"decimal on an incompatible Go type", `avro:"X,decimal(4,2)"`, "decimal logical type requires"},
+		{guard: "exact skip directive", tag: `avro:"-"`, wantErr: ""},
+		{guard: "skip directive is exact-match only (options)", tag: `avro:"-,omitzero"`, wantErr: "exact-match only"},
+		{guard: "skip directive is exact-match only (suffix)", tag: `avro:"-foo"`, wantErr: "exact-match only"},
+		{guard: "splitTag unclosed bracket", tag: `avro:"X,alias=[a"`, wantErr: "unclosed"},
+		{guard: "splitTag unexpected close", tag: `avro:"X,alias=a]"`, wantErr: "unexpected"},
+		{guard: "inline with an explicit name", tag: `avro:"X,inline"`, wantErr: "inline is incompatible with an explicit field name"},
+		{guard: "inline with another option", tag: `avro:",inline,omitzero"`, wantErr: "inline is incompatible with option"},
+		{guard: "alias empty brackets", tag: `avro:"X,alias=[]"`, wantErr: "empty brackets"},
+		{guard: "alias empty element", tag: `avro:"X,alias=[a,]"`, wantErr: "empty element"},
+		{guard: "type-alias empty brackets", tag: `avro:"X,type-alias=[]"`, wantErr: "empty brackets"},
+		{guard: "decimal trailing junk", tag: `avro:"X,decimal(1,2,3)"`, wantErr: "invalid decimal tag"},
+		{guard: "unknown tag option", tag: `avro:"X,bogusopt"`, wantErr: "unknown avro tag option"},
+		// The custom-match question is asked BEFORE the Go-type check, so
+		// a matched field is rejected for the tag having nothing to apply
+		// to rather than for the type being wrong — even when the type is
+		// also wrong. The pair of verdicts per row is what records that
+		// order; a single verdict could not.
+		{guard: "uuid on an incompatible Go type", tag: `avro:"X,uuid"`, wantErr: "uuid logical type",
+			wantErrCustom: "has no effect", customDiffers: true},
+		{guard: "decimal on an incompatible Go type", tag: `avro:"X,decimal(4,2)"`, wantErr: "decimal logical type requires",
+			wantErrCustom: "has no effect", customDiffers: true},
+		// Compatible Go types, so the tag is valid on its own terms and
+		// the rejection can only be coming from the custom match. Without
+		// these the rows above could be rejecting for the type all along.
+		{guard: "uuid on a compatible Go type", tag: `avro:"X,uuid"`, wantErr: "",
+			wantErrCustom: "has no effect", customDiffers: true,
+			fieldType: reflect.TypeFor[string](), namedOnly: true},
+		{guard: "decimal on a compatible Go type", tag: `avro:"X,decimal(4,2)"`, wantErr: "",
+			wantErrCustom: "has no effect", customDiffers: true,
+			fieldType: reflect.TypeFor[big.Rat](), namedOnly: true},
+		// The control for the axis: with no logical tag, a custom-matched
+		// field builds. Without it the custom arm could reject everything
+		// and the rows above would pass for the wrong reason.
+		{guard: "no logical tag", tag: `avro:"X"`, wantErr: "", wantErrCustom: ""},
 	}
 
 	lax := WithLaxNames(func(string) error { return nil })
+	// A CustomType claiming the census field's own Go type, so the field
+	// arrives at inference already matched.
+	claimsField := customSchemaFor(t, reflect.TypeFor[skipCensusInner](),
+		`{"type":"record","name":"CM","fields":[{"name":"c","type":"long"}]}`)
+	// Liveness floor for the new axis: the rows whose verdict CHANGES under
+	// a matched custom must actually have been run on both sides.
+	differing := 0
 	for _, mode := range []struct {
 		name string
 		opts []SchemaOpt
@@ -5968,12 +6121,52 @@ func TestMatrix_SchemaForTagGuardPathCensus(t *testing.T) {
 	} {
 		for _, row := range census {
 			for _, embed := range []bool{false, true} {
+				if embed && row.namedOnly {
+					continue
+				}
 				path := "named"
 				if embed {
 					path = "embed"
 				}
+				for _, matched := range []bool{false, true} {
+					match := "unmatched"
+					opts := mode.opts
+					wantErr := row.wantErr
+					claim := claimsField
+					if row.fieldType != nil {
+						claim = customSchemaFor(t, row.fieldType,
+							`{"type":"record","name":"CM","fields":[{"name":"c","type":"long"}]}`)
+					}
+					var customs []CustomType
+					if matched {
+						match = "custom-matched"
+						customs = []CustomType{claim}
+						wantErr = row.wantErrCustom
+						if wantErr == "" && !row.customDiffers {
+							wantErr = row.wantErr
+						}
+					}
+					t.Run(fmt.Sprintf("%s/%s/%s/%s", mode.name, path, match, row.guard), func(t *testing.T) {
+						_, err := skipCensusBuildTyped(t, row.tag, embed, row.fieldType, customs, opts...)
+						switch {
+						case wantErr == "" && err != nil:
+							t.Fatalf("tag %s must build on the %s path (%s), got: %v", row.tag, path, match, err)
+						case wantErr == "":
+							return
+						case err == nil:
+							t.Fatalf("tag %s must be rejected on the %s path (%s) naming %q, but the build succeeded",
+								row.tag, path, match, wantErr)
+						case !strings.Contains(err.Error(), wantErr):
+							t.Fatalf("tag %s on the %s path (%s) rejected with %q, which does not name %q",
+								row.tag, path, match, err, wantErr)
+						}
+					})
+					if matched && row.customDiffers {
+						differing++
+					}
+				}
 				t.Run(fmt.Sprintf("%s/%s/%s", mode.name, path, row.guard), func(t *testing.T) {
-					_, err := skipCensusBuild(t, row.tag, embed, mode.opts...)
+					_, err := skipCensusBuildTyped(t, row.tag, embed, row.fieldType, nil, mode.opts...)
 					switch {
 					case row.wantErr == "" && err != nil:
 						t.Fatalf("tag %s must build on the %s path, got: %v", row.tag, path, err)
@@ -5989,6 +6182,15 @@ func TestMatrix_SchemaForTagGuardPathCensus(t *testing.T) {
 				})
 			}
 		}
+	}
+	// Rows whose verdict changes under a matched custom: 2 rows x 2 modes
+	// x 2 paths. A census that stopped registering the custom, or a row
+	// that stopped differing, would leave the custom-matched arm asserting
+	// only what the unmatched arm already did.
+	// 2 incompatible-type rows x 2 modes x 2 paths, plus 2 compatible-type
+	// rows x 2 modes x 1 path (a scalar field cannot be embedded).
+	if want := 2*2*2 + 2*2*1; differing != want {
+		t.Errorf("%d cells exercised a verdict that differs under a matched custom, want %d", differing, want)
 	}
 }
 
