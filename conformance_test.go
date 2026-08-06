@@ -25261,26 +25261,99 @@ func TestCrossPath_StructVsMapBytes(t *testing.T) {
 // TestCrossPath_FloatSignalingNaN isolates the float32/float64 signaling-NaN
 // case across struct (unsafe) and map (reflect) paths and a top-level encode,
 // pinning that the raw bits survive on every path.
+// cpNamedF32 is a DEFINED float32. The raw-bit read for a NaN splits on
+// whether the value is addressable and, when it is not, on whether its type
+// is exactly float32 — a defined type takes a third route (a bit copy into
+// an addressable temp) that a builtin float32 never reaches. Crossing the
+// carriers with a defined type is what makes that route run.
+type cpNamedF32 float32
+
+type cpF32Struct struct {
+	F float32 `avro:"f"`
+}
+
+type cpNamedF32Struct struct {
+	F cpNamedF32 `avro:"f"`
+}
+
 func TestCrossPath_FloatSignalingNaN(t *testing.T) {
 	floatS := avro.MustParse(`"float"`)
-	for _, bits := range []uint32{0x7f800001, 0x7fa00000, 0x7fbfffff, 0xff800001} {
-		want := bits
-		type fr struct {
-			F float32 `avro:"f"`
-		}
-		recS := avro.MustParse(`{"type":"record","name":"FR","fields":[{"name":"f","type":"float"}]}`)
-		v := math.Float32frombits(bits)
+	recS := avro.MustParse(`{"type":"record","name":"FR","fields":[{"name":"f","type":"float"}]}`)
+	arrS := avro.MustParse(`{"type":"array","items":"float"}`)
+	mapS := avro.MustParse(`{"type":"map","values":"float"}`)
 
-		sb, _ := recS.Encode(&fr{F: v})              // unsafe
-		mb, _ := recS.Encode(map[string]any{"f": v}) // reflect (record-as-map)
-		tb, _ := floatS.Encode(v)                    // top-level reflect
-		if string(sb) != string(mb) {
-			t.Errorf("bits %#08x: struct vs map differ: %x vs %x", bits, sb, mb)
+	// The carrier axis crossed with the Go type's DEFINEDNESS. Every cell
+	// before carried a builtin float32, so the defined-type route was
+	// reached by no carrier at all. Addressability is the other half of the
+	// split and varies by carrier: a slice element is addressable, a map
+	// value and a top-level scalar are not.
+	carriers := []struct {
+		name    string
+		defined bool
+		// encode returns the wire for the given float32 payload, and the
+		// offset at which its raw 4 bytes begin.
+		encode func(v float32) ([]byte, error)
+		off    int
+	}{
+		{"scalar-builtin", false, func(v float32) ([]byte, error) { return floatS.Encode(v) }, 0},
+		{"scalar-defined", true, func(v float32) ([]byte, error) { return floatS.Encode(cpNamedF32(v)) }, 0},
+		{"struct-builtin", false, func(v float32) ([]byte, error) { return recS.Encode(&cpF32Struct{F: v}) }, 0},
+		{"struct-defined", true, func(v float32) ([]byte, error) { return recS.Encode(&cpNamedF32Struct{F: cpNamedF32(v)}) }, 0},
+		{"record-as-map", false, func(v float32) ([]byte, error) { return recS.Encode(map[string]any{"f": v}) }, 0},
+		{"slice-builtin", false, func(v float32) ([]byte, error) { return arrS.Encode([]float32{v}) }, 1},
+		{"slice-defined", true, func(v float32) ([]byte, error) { return arrS.Encode([]cpNamedF32{cpNamedF32(v)}) }, 1},
+		{"map-builtin", false, func(v float32) ([]byte, error) { return mapS.Encode(map[string]float32{"k": v}) }, 3},
+		{"map-defined", true, func(v float32) ([]byte, error) { return mapS.Encode(map[string]cpNamedF32{"k": cpNamedF32(v)}) }, 3},
+	}
+
+	// Liveness floor, counted inside the cell after the assertion: a
+	// carrier that stopped encoding (or started erroring) would otherwise
+	// leave its half of the definedness axis silently unrun.
+	definedRuns, builtinRuns := 0, 0
+
+	payloadBits := []uint32{0x7f800001, 0x7fa00000, 0x7fbfffff, 0xff800001}
+	payloads := len(payloadBits)
+	for _, bits := range payloadBits {
+		v := math.Float32frombits(bits)
+		for _, c := range carriers {
+			t.Run(fmt.Sprintf("%#08x/%s", bits, c.name), func(t *testing.T) {
+				b, err := c.encode(v)
+				if err != nil {
+					t.Fatalf("encode: %v", err)
+				}
+				if len(b) < c.off+4 {
+					t.Fatalf("wire too short for a float: % x", b)
+				}
+				// The oracle is Go's own bit view of the input, not
+				// anything the encoder computed.
+				if got := leUint32(b[c.off:]); got != bits {
+					t.Fatalf("quieted the payload: got %#08x, want %#08x (wire % x)", got, bits, b)
+				}
+				if c.defined {
+					definedRuns++
+				} else {
+					builtinRuns++
+				}
+			})
 		}
-		// The 4 trailing wire bytes of the top-level float are the raw LE bits.
-		if got := fmt.Sprintf("%08x", leUint32(tb)); got != fmt.Sprintf("%08x", want) {
-			t.Errorf("bits %#08x: top-level encode quieted to %s", bits, got)
+	}
+	// The expected counts come from the table, not from a constant: a
+	// carrier added or removed changes them, and a carrier that stopped
+	// encoding does not.
+	var wantDefined, wantBuiltin int
+	for _, c := range carriers {
+		if c.defined {
+			wantDefined += payloads
+		} else {
+			wantBuiltin += payloads
 		}
+	}
+	if wantDefined == 0 || wantBuiltin == 0 {
+		t.Fatalf("the definedness axis has collapsed to one side: %d defined carriers, %d builtin", wantDefined, wantBuiltin)
+	}
+	if definedRuns != wantDefined || builtinRuns != wantBuiltin {
+		t.Errorf("cells that actually asserted: %d defined / %d builtin; the table declares %d / %d, so a carrier stopped exercising its route",
+			definedRuns, builtinRuns, wantDefined, wantBuiltin)
 	}
 }
 

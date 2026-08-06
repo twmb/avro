@@ -17139,6 +17139,130 @@ func TestMatrix_MapValueSwitchMatchesGeneral(t *testing.T) {
 	}
 }
 
+// Named slice and element types for the array destination-shape axis. A
+// DEFINED slice type and a builtin slice of a DEFINED element type both
+// leave the native loop, but by different tests, so they are separate axis
+// values rather than two spellings of one.
+type (
+	nsInt32   []int32
+	nsInt64   []int64
+	nsFloat32 []float32
+	nsFloat64 []float64
+	nsBool    []bool
+	nsString  []string
+)
+
+// TestMatrix_ArrayElementSwitchMatchesGeneral is the ARRAY sibling of
+// TestMatrix_MapValueSwitchMatchesGeneral. The map net crosses the Go
+// type's DEFINEDNESS — builtin value type against a defined one — over
+// every primitive; the array nets never did, so every array cell in the
+// suite handed the decoder a builtin slice of a builtin element and took
+// the native loop. The reflect-typed fallback loop, which is what a
+// defined slice or a defined element routes to, ran for no primitive: for
+// the two whose element setter is a closure rather than a method value
+// (int and float) that is directly visible as an unexecuted loop body.
+//
+// The axis is the destination SHAPE, and it has three values per
+// primitive, each selected by a different test in the decoder:
+//
+//	builtin-slice   []int32       native loop
+//	defined-slice   nsInt32       reflect loop (the slice type is not []int32)
+//	defined-elem    []fpInt32     reflect loop (the element type is not int32)
+//
+// The oracle is cross-shape agreement on both wires: every shape must
+// encode to the same bytes and decode to the same values as the builtin
+// one. Float carries a signaling-NaN payload, so a shape that routes
+// through a float64 round-trip is caught by the bits rather than by ==,
+// which cannot see a quieted NaN at all.
+func TestMatrix_ArrayElementSwitchMatchesGeneral(t *testing.T) {
+	const snan = uint32(0x7f800001)
+	f := math.Float32frombits(snan)
+	cases := []struct {
+		name    string
+		schema  string
+		builtin any
+		defSlic any
+		defElem any
+	}{
+		{"int", `{"type":"array","items":"int"}`,
+			[]int32{0, 1, -1, math.MaxInt32, math.MinInt32},
+			nsInt32{0, 1, -1, math.MaxInt32, math.MinInt32},
+			[]fpInt32{0, 1, -1, math.MaxInt32, math.MinInt32}},
+		{"long", `{"type":"array","items":"long"}`,
+			[]int64{0, 1, -1, math.MaxInt64, math.MinInt64},
+			nsInt64{0, 1, -1, math.MaxInt64, math.MinInt64},
+			[]fpInt64{0, 1, -1, math.MaxInt64, math.MinInt64}},
+		{"float", `{"type":"array","items":"float"}`,
+			[]float32{3.14, 0, -0},
+			nsFloat32{3.14, 0, -0},
+			[]fpFloat32{3.14, 0, -0}},
+		{"floatSignalingNaN", `{"type":"array","items":"float"}`,
+			[]float32{f, 1},
+			nsFloat32{fpFloat32Conv(f), 1},
+			[]fpFloat32{fpFloat32(f), 1}},
+		{"double", `{"type":"array","items":"double"}`,
+			[]float64{2.718281828, 0},
+			nsFloat64{2.718281828, 0},
+			[]fpFloat64{2.718281828, 0}},
+		{"boolean", `{"type":"array","items":"boolean"}`,
+			[]bool{true, false, true},
+			nsBool{true, false, true},
+			[]fpBool{true, false, true}},
+		{"string", `{"type":"array","items":"string"}`,
+			[]string{"a", "", "cde"},
+			nsString{"a", "", "cde"},
+			[]fpString{"a", "", "cde"}},
+	}
+	// Liveness floor: each shape must actually have been round-tripped, not
+	// merely listed. Counted inside the cell, after the assertion.
+	shapeRuns := map[string]int{}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := MustParse(c.schema)
+			want, err := s.Encode(c.builtin)
+			if err != nil {
+				t.Fatalf("builtin encode: %v", err)
+			}
+			for _, shape := range []struct {
+				name string
+				v    any
+			}{{"defined-slice", c.defSlic}, {"defined-elem", c.defElem}} {
+				got, err := s.Encode(shape.v)
+				if err != nil {
+					t.Fatalf("%s encode: %v", shape.name, err)
+				}
+				if !bytes.Equal(got, want) {
+					t.Errorf("%s encode diverges from the builtin slice:\n got  % x\n want % x", shape.name, got, want)
+				}
+				// Decode back into the same shape and re-encode: a loop
+				// that dropped or reordered elements survives an encode
+				// comparison but not this.
+				out := reflect.New(reflect.TypeOf(shape.v))
+				if _, err := s.Decode(want, out.Interface()); err != nil {
+					t.Fatalf("%s decode: %v", shape.name, err)
+				}
+				again, err := s.Encode(out.Elem().Interface())
+				if err != nil {
+					t.Fatalf("%s re-encode: %v", shape.name, err)
+				}
+				if !bytes.Equal(again, want) {
+					t.Errorf("%s decode lost information:\n got  % x\n want % x", shape.name, again, want)
+				}
+				shapeRuns[shape.name]++
+			}
+		})
+	}
+	for _, shape := range []string{"defined-slice", "defined-elem"} {
+		if shapeRuns[shape] != len(cases) {
+			t.Errorf("destination shape %q ran %d of %d cells; the axis is not spanning the primitives", shape, shapeRuns[shape], len(cases))
+		}
+	}
+}
+
+// fpFloat32Conv converts without going through a float64, so a signaling
+// NaN's payload survives into a nsFloat32 literal.
+func fpFloat32Conv(f float32) float32 { return f }
+
 type f32Field struct {
 	F float32 `avro:"f"`
 }
