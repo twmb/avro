@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	"reflect"
 	"runtime"
@@ -847,82 +846,6 @@ func TestMatrix_CanonicalRawUTF8ForHTMLChars(t *testing.T) {
 	if got, want := string(plain.Canonical()), `{"name":"P","type":"record","fields":[{"name":"x","type":"long"}]}`; got != want {
 		t.Errorf("plain canonical changed:\n got = %s\nwant = %s", got, want)
 	}
-}
-
-// The unsafe struct-field path and the reflect path must produce the same
-// SemanticError for the same overflow: the GoType field must name the Go field
-// type (not be nil), so an overflow surfaced through an addressable struct
-// reads identically to the same value encoded/decoded standalone.
-func TestRegression_UnsafeOverflowErrorCarriesGoType(t *testing.T) {
-	semGoType := func(t *testing.T, err error) reflect.Type {
-		t.Helper()
-		var se *avro.SemanticError
-		if !errors.As(err, &se) {
-			t.Fatalf("error is not *SemanticError: %T (%v)", err, err)
-		}
-		return se.GoType
-	}
-
-	t.Run("encode-int-overflow", func(t *testing.T) {
-		type R struct {
-			X int64 `avro:"x"`
-		}
-		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`)
-		r := R{X: math.MaxInt32 + 1}
-		_, ue := s.Encode(&r) // addressable → unsafe fast path
-		_, re := s.Encode(r)  // non-addressable → reflect path
-		if ue == nil || re == nil {
-			t.Fatalf("both paths must reject overflow: unsafe=%v reflect=%v", ue, re)
-		}
-		if got := semGoType(t, ue); got != reflect.TypeOf(int64(0)) {
-			t.Errorf("unsafe encode error GoType = %v, want int64", got)
-		}
-		if !strings.Contains(ue.Error(), "int64") {
-			t.Errorf("unsafe encode error omits Go type name: %q", ue.Error())
-		}
-	})
-
-	t.Run("decode-int-overflow", func(t *testing.T) {
-		type R struct {
-			X int8 `avro:"x"`
-		}
-		recS := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"int"}]}`)
-		intS := avro.MustParse(`"int"`)
-		wire, err := recS.Encode(map[string]any{"x": int32(300)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		var r R
-		_, ue := recS.Decode(wire, &r) // unsafe struct-field path
-		iwire, _ := intS.Encode(int32(300))
-		var i8 int8
-		_, re := intS.Decode(iwire, &i8) // reflect path
-		if ue == nil || re == nil {
-			t.Fatalf("both paths must reject overflow: unsafe=%v reflect=%v", ue, re)
-		}
-		if got := semGoType(t, ue); got != reflect.TypeOf(int8(0)) {
-			t.Errorf("unsafe decode error GoType = %v, want int8", got)
-		}
-	})
-
-	t.Run("decode-double-to-float32-overflow", func(t *testing.T) {
-		type R struct {
-			X float32 `avro:"x"`
-		}
-		recS := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"x","type":"double"}]}`)
-		wire, err := recS.Encode(map[string]any{"x": 1e300})
-		if err != nil {
-			t.Fatal(err)
-		}
-		var r R
-		_, ue := recS.Decode(wire, &r)
-		if ue == nil {
-			t.Fatal("double 1e300 into float32 field must reject")
-		}
-		if got := semGoType(t, ue); got != reflect.TypeOf(float32(0)) {
-			t.Errorf("unsafe decode error GoType = %v, want float32", got)
-		}
-	})
 }
 
 // A custom type with a nil Decode callback suppresses the built-in logical

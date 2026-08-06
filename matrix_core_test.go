@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -5445,6 +5446,511 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 				t.Fatalf("unsafe decode value mismatch for %s: got %#v, want %#v", r.label, got, want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unsafe struct-field NARROWING parity.
+//
+// The addressable-struct-field decode path (unsafe.go's ud* closures) carries
+// range guards of its own, written separately from the reflect path's. Nothing
+// in the type system ties the two sets together, so each is free to drift: a
+// missing bound there is a silent truncation or a sign wrap, which is
+// wrong-value-no-error rather than a failure.
+//
+// A single-field record's wire IS its field's wire, so the SAME BYTES decoded
+// into the SAME Go type through the two paths is the oracle, and it needs no
+// expectation table: whatever the reflect path decides about a value is what
+// the struct-field path must decide.
+//
+// Axes: narrowing pair (wire avro type × Go target type) × value class
+// (over-max / under-min / in-range) × route (scalar field, *T field, []T field,
+// []*T field). The routes are the axis a per-kind bound table cannot supply —
+// the guard lives in the leaf closure, but only the composed route proves the
+// leaf is still reached once a null-union or an array sits above it.
+//
+// Agreement is asserted on three things, not one. The accept/reject verdict;
+// the REJECTION'S SHAPE, since an error naming the wrong Go type reads
+// differently to a caller than the reflect path's does and a verdict-only check
+// cannot see the difference; and the decoded value, since two paths that both
+// accept can still land on different numbers.
+// ---------------------------------------------------------------------------
+
+// narrowRoute is one composition sitting between the record field and the
+// narrowing leaf. schema wraps the leaf's schema text, goType wraps the leaf's
+// Go type, and wide wraps a leaf-typed value into the shape the wrapped schema
+// encodes — the three must describe the same shape or the row does not build.
+type narrowRoute struct {
+	name   string
+	schema func(leaf string) string
+	goType func(leaf reflect.Type) reflect.Type
+	wide   func(leaf any) any
+}
+
+func narrowRoutes() []narrowRoute {
+	one := func(t reflect.Type, v any) reflect.Value {
+		s := reflect.MakeSlice(reflect.SliceOf(t), 1, 1)
+		s.Index(0).Set(reflect.ValueOf(v))
+		return s
+	}
+	ptr := func(v any) reflect.Value {
+		p := reflect.New(reflect.TypeOf(v))
+		p.Elem().Set(reflect.ValueOf(v))
+		return p
+	}
+	return []narrowRoute{{
+		name:   "scalar",
+		schema: func(leaf string) string { return leaf },
+		goType: func(leaf reflect.Type) reflect.Type { return leaf },
+		wide:   func(leaf any) any { return leaf },
+	}, {
+		name:   "ptr",
+		schema: func(leaf string) string { return `["null",` + leaf + `]` },
+		goType: reflect.PointerTo,
+		wide:   func(leaf any) any { return ptr(leaf).Interface() },
+	}, {
+		name:   "slice",
+		schema: func(leaf string) string { return `{"type":"array","items":` + leaf + `}` },
+		goType: reflect.SliceOf,
+		wide:   func(leaf any) any { return one(reflect.TypeOf(leaf), leaf).Interface() },
+	}, {
+		name:   "slice-ptr",
+		schema: func(leaf string) string { return `{"type":"array","items":["null",` + leaf + `]}` },
+		goType: func(leaf reflect.Type) reflect.Type { return reflect.SliceOf(reflect.PointerTo(leaf)) },
+		wide: func(leaf any) any {
+			return one(reflect.PointerTo(reflect.TypeOf(leaf)), ptr(leaf).Interface()).Interface()
+		},
+	}}
+}
+
+// narrowRows is the narrowing-pair axis: one row per (wire type, Go target)
+// crossing whose guard can reject. `wide` is a Go type the wire accepts without
+// narrowing, so the probe values are written faithfully and only the READ side
+// narrows. A nil over/under means the crossing has no such value — an int32
+// wire cannot exceed uint32's range — and the class is skipped rather than
+// faked.
+var narrowRows = []struct {
+	label              string
+	wire               string
+	narrow             reflect.Type
+	over, under, inRng any
+}{
+	// int wire (int32 carrier).
+	{"int/int8", `"int"`, reflect.TypeFor[int8](), int32(200), int32(-200), int32(100)},
+	{"int/int16", `"int"`, reflect.TypeFor[int16](), int32(40000), int32(-40000), int32(1000)},
+	{"int/int32", `"int"`, reflect.TypeFor[int32](), nil, nil, int32(1 << 30)},
+	{"int/int64", `"int"`, reflect.TypeFor[int64](), nil, nil, int32(1 << 30)},
+	{"int/int", `"int"`, reflect.TypeFor[int](), nil, nil, int32(1 << 30)},
+	{"int/uint8", `"int"`, reflect.TypeFor[uint8](), int32(300), int32(-1), int32(7)},
+	{"int/uint16", `"int"`, reflect.TypeFor[uint16](), int32(70000), int32(-1), int32(7)},
+	{"int/uint32", `"int"`, reflect.TypeFor[uint32](), nil, int32(-1), int32(7)},
+	{"int/uint64", `"int"`, reflect.TypeFor[uint64](), nil, int32(-1), int32(7)},
+	{"int/uint", `"int"`, reflect.TypeFor[uint](), nil, int32(-1), int32(7)},
+
+	// long wire (int64 carrier).
+	{"long/int8", `"long"`, reflect.TypeFor[int8](), int64(200), int64(-200), int64(100)},
+	{"long/int16", `"long"`, reflect.TypeFor[int16](), int64(40000), int64(-40000), int64(1000)},
+	{"long/int32", `"long"`, reflect.TypeFor[int32](), int64(1) << 33, -(int64(1) << 33), int64(1 << 30)},
+	{"long/int64", `"long"`, reflect.TypeFor[int64](), nil, nil, int64(1) << 40},
+	{"long/uint8", `"long"`, reflect.TypeFor[uint8](), int64(300), int64(-1), int64(7)},
+	{"long/uint16", `"long"`, reflect.TypeFor[uint16](), int64(100000), int64(-1), int64(7)},
+	{"long/uint32", `"long"`, reflect.TypeFor[uint32](), int64(1) << 33, int64(-1), int64(7)},
+	{"long/uint64", `"long"`, reflect.TypeFor[uint64](), nil, int64(-1), int64(7)},
+
+	// double wire (float64 carrier): the narrowing is range, not width — a
+	// finite float64 outside float32's range becomes ±Inf, which is a value
+	// change the caller did not ask for. ±Inf and NaN are NOT overflow and
+	// must pass, so they ride the in-range class of their own rows.
+	{"double/float32", `"double"`, reflect.TypeFor[float32](), 1e300, -1e300, 1.5},
+	{"double/float32-inf", `"double"`, reflect.TypeFor[float32](), nil, nil, math.Inf(1)},
+	{"double/float32-neginf", `"double"`, reflect.TypeFor[float32](), nil, nil, math.Inf(-1)},
+	{"double/float32-nan", `"double"`, reflect.TypeFor[float32](), nil, nil, math.NaN()},
+	{"double/float64", `"double"`, reflect.TypeFor[float64](), nil, nil, 2.5},
+
+	// float wire (float32 carrier): four bytes cannot overflow either Go
+	// float, so these rows are the control that the parity itself is not
+	// vacuously satisfied by two paths that both reject everything.
+	{"float/float32", `"float"`, reflect.TypeFor[float32](), nil, nil, float32(1.5)},
+	{"float/float64", `"float"`, reflect.TypeFor[float64](), nil, nil, float32(1.5)},
+}
+
+// narrowEqual compares two decoded route-shaped values. It peels the pointer
+// and slice compositions the routes build and leans on matEqual at the leaf,
+// which is where NaN's self-inequality has to be handled: reflect.DeepEqual
+// reports two NaN-carrying slices unequal, so the double/float32-nan rows need
+// the leaf rule carried through the composition rather than applied only at the
+// scalar route.
+func narrowEqual(a, b reflect.Value) bool {
+	if a.Type() != b.Type() {
+		return false
+	}
+	switch a.Kind() {
+	case reflect.Pointer:
+		if a.IsNil() || b.IsNil() {
+			return a.IsNil() == b.IsNil()
+		}
+		return narrowEqual(a.Elem(), b.Elem())
+	case reflect.Slice:
+		if a.Len() != b.Len() {
+			return false
+		}
+		for i := range a.Len() {
+			if !narrowEqual(a.Index(i), b.Index(i)) {
+				return false
+			}
+		}
+		return true
+	default:
+		return matEqual(a.Interface(), b.Interface())
+	}
+}
+
+// semShape reports the *SemanticError fields a caller reads off a rejection.
+// A non-SemanticError rejection reports ok=false, which is itself a divergence
+// when the other path produced one.
+func semShape(err error) (avroType string, goType reflect.Type, ok bool) {
+	var se *avro.SemanticError
+	if !errors.As(err, &se) {
+		return "", nil, false
+	}
+	return se.AvroType, se.GoType, true
+}
+
+func TestMatrix_UnsafeFieldNarrowingDecodeParity(t *testing.T) {
+	classes := []string{"over-max", "under-min", "in-range"}
+	for _, row := range narrowRows {
+		for _, rt := range narrowRoutes() {
+			for _, class := range classes {
+				var probe any
+				switch class {
+				case "over-max":
+					probe = row.over
+				case "under-min":
+					probe = row.under
+				default:
+					probe = row.inRng
+				}
+				if probe == nil {
+					continue // the crossing has no value in this class
+				}
+				t.Run(row.label+"/"+rt.name+"/"+class, func(t *testing.T) {
+					fieldSchema := rt.schema(row.wire)
+					leafS := avro.MustParse(fieldSchema)
+					recS := avro.MustParse(fmt.Sprintf(
+						`{"type":"record","name":"NR","fields":[{"name":"f","type":%s}]}`, fieldSchema))
+
+					// The wire is written through the WIDE Go type, so the
+					// bytes carry the probe value exactly and only the read
+					// side narrows.
+					wire, err := leafS.AppendEncode(nil, rt.wide(probe))
+					if err != nil {
+						t.Fatalf("encode probe %v: %v", probe, err)
+					}
+
+					target := rt.goType(row.narrow)
+
+					// Reflect path: a top-level target of the narrow type.
+					safeDst := reflect.New(target)
+					_, safeErr := leafS.Decode(wire, safeDst.Interface())
+
+					// Unsafe path: the same bytes as the single field of an
+					// addressable struct, which is what selects the ud* path.
+					st := reflect.StructOf([]reflect.StructField{
+						{Name: "F", Type: target, Tag: `avro:"f"`},
+					})
+					unsafeDst := reflect.New(st)
+					_, unsafeErr := recS.Decode(wire, unsafeDst.Interface())
+
+					if (safeErr == nil) != (unsafeErr == nil) {
+						t.Fatalf("VERDICT DIVERGENCE decoding %v into %s:\n reflect=%v\n unsafe =%v",
+							probe, target, safeErr, unsafeErr)
+					}
+					if safeErr != nil {
+						sAvro, sGo, sOK := semShape(safeErr)
+						uAvro, uGo, uOK := semShape(unsafeErr)
+						if !sOK || !uOK {
+							t.Fatalf("rejection is not a *SemanticError on both paths (reflect ok=%v, unsafe ok=%v):\n reflect=%v\n unsafe =%v",
+								sOK, uOK, safeErr, unsafeErr)
+						}
+						if sAvro != uAvro {
+							t.Errorf("AvroType divergence: reflect=%q unsafe=%q", sAvro, uAvro)
+						}
+						if sGo != uGo {
+							t.Errorf("GoType divergence: reflect=%v unsafe=%v", sGo, uGo)
+						}
+						if uGo == nil {
+							t.Errorf("unsafe rejection carries no GoType; the caller cannot tell which Go field overflowed")
+						}
+						return
+					}
+					if got, want := unsafeDst.Elem().Field(0), safeDst.Elem(); !narrowEqual(got, want) {
+						t.Fatalf("VALUE DIVERGENCE: unsafe=%#v reflect=%#v", got.Interface(), want.Interface())
+					}
+				})
+			}
+		}
+	}
+}
+
+// narrowEncodeRows is the decode matrix's mirror axis: a Go type WIDER than the
+// wire type it is written to, so the guard being crossed is the us* range check
+// rather than the ud* one. The float rows are the deliberate exception and the
+// control at once — the lossy-destination policy accepts a finite float64 that
+// becomes ±Inf on a float wire, so a matrix in which every out-of-range value
+// rejected would be describing a rule this package does not have.
+var narrowEncodeRows = []struct {
+	label              string
+	wire               string
+	over, under, inRng any
+}{
+	{"int64/int", `"int"`, int64(math.MaxInt32) + 1, int64(math.MinInt32) - 1, int64(7)},
+	{"uint32/int", `"int"`, uint32(math.MaxInt32) + 1, nil, uint32(7)},
+	{"uint64/int", `"int"`, uint64(math.MaxInt32) + 1, nil, uint64(7)},
+	{"uint64/long", `"long"`, uint64(math.MaxInt64) + 1, nil, uint64(7)},
+	{"int8/int", `"int"`, nil, nil, int8(7)},
+	{"uint8/int", `"int"`, nil, nil, uint8(7)},
+	{"int16/long", `"long"`, nil, nil, int16(7)},
+	{"float64/float", `"float"`, nil, nil, 1e300},
+	{"float64/double", `"double"`, nil, nil, 1e300},
+	{"float32/double", `"double"`, nil, nil, float32(1.5)},
+	// int and uint are int32-wide on a 32-bit build, where no value of theirs
+	// can overflow an int wire. math.MaxInt is an untyped constant, so the
+	// guard resolves at compile time and the rows carry a probe only where one
+	// exists rather than asserting an overflow that cannot happen.
+	{"int/int", `"int"`, intOverflowProbe(), intUnderflowProbe(), int(7)},
+	{"uint/int", `"int"`, uintOverflowProbe(), nil, uint(7)},
+}
+
+func intOverflowProbe() any {
+	if math.MaxInt > math.MaxInt32 {
+		return int(math.MaxInt32) + 1
+	}
+	return nil
+}
+
+func intUnderflowProbe() any {
+	if math.MinInt < math.MinInt32 {
+		return int(math.MinInt32) - 1
+	}
+	return nil
+}
+
+func uintOverflowProbe() any {
+	if math.MaxUint > math.MaxInt32 {
+		return uint(math.MaxInt32) + 1
+	}
+	return nil
+}
+
+func TestMatrix_UnsafeFieldNarrowingEncodeParity(t *testing.T) {
+	classes := []string{"over-max", "under-min", "in-range"}
+	for _, row := range narrowEncodeRows {
+		for _, rt := range narrowRoutes() {
+			for _, class := range classes {
+				var probe any
+				switch class {
+				case "over-max":
+					probe = row.over
+				case "under-min":
+					probe = row.under
+				default:
+					probe = row.inRng
+				}
+				if probe == nil {
+					continue
+				}
+				t.Run(row.label+"/"+rt.name+"/"+class, func(t *testing.T) {
+					fieldSchema := rt.schema(row.wire)
+					leafS := avro.MustParse(fieldSchema)
+					recS := avro.MustParse(fmt.Sprintf(
+						`{"type":"record","name":"NE","fields":[{"name":"f","type":%s}]}`, fieldSchema))
+
+					value := rt.wide(probe)
+					goType := rt.goType(reflect.TypeOf(probe))
+
+					// Reflect path: the value encoded at top level.
+					safeWire, safeErr := leafS.AppendEncode(nil, value)
+
+					// Unsafe path: the same value as the single field of an
+					// addressable struct.
+					st := reflect.StructOf([]reflect.StructField{
+						{Name: "F", Type: goType, Tag: `avro:"f"`},
+					})
+					pv := reflect.New(st)
+					pv.Elem().Field(0).Set(reflect.ValueOf(value))
+					unsafeWire, unsafeErr := recS.AppendEncode(nil, pv.Interface())
+
+					if (safeErr == nil) != (unsafeErr == nil) {
+						t.Fatalf("VERDICT DIVERGENCE encoding %v (%s):\n reflect=%v\n unsafe =%v",
+							probe, goType, safeErr, unsafeErr)
+					}
+					if safeErr != nil {
+						sAvro, sGo, sOK := semShape(safeErr)
+						uAvro, uGo, uOK := semShape(unsafeErr)
+						if !sOK || !uOK {
+							t.Fatalf("rejection is not a *SemanticError on both paths (reflect ok=%v, unsafe ok=%v):\n reflect=%v\n unsafe =%v",
+								sOK, uOK, safeErr, unsafeErr)
+						}
+						if sAvro != uAvro {
+							t.Errorf("AvroType divergence: reflect=%q unsafe=%q", sAvro, uAvro)
+						}
+						if sGo != uGo {
+							t.Errorf("GoType divergence: reflect=%v unsafe=%v", sGo, uGo)
+						}
+						if uGo == nil {
+							t.Errorf("unsafe rejection carries no GoType; the caller cannot tell which Go field overflowed")
+						}
+						return
+					}
+					// A single-field record's wire IS its field's wire.
+					if !bytes.Equal(safeWire, unsafeWire) {
+						t.Fatalf("WIRE DIVERGENCE: reflect=%x unsafe=%x", safeWire, unsafeWire)
+					}
+				})
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unsafe array BLOCK-COUNT bound parity.
+//
+// A block header states how many items follow. Believing it allocates that many
+// slots before a single item is read, so both array decoders bound the count by
+// what the remaining bytes could hold — and that bound is item-aware: it divides
+// by the element's minimum encoded size, which differs per element type. The
+// unsafe path computes its own copy of that minimum.
+//
+// A path that keeps the guard but loses the DIVISOR still rejects the wildly
+// hostile counts and admits the merely large ones, so the oracle here is the
+// reflect path's error TEXT rather than the bare verdict: the text carries the
+// minimum, which makes a drifting divisor visible where an accept/reject
+// comparison reports agreement.
+// ---------------------------------------------------------------------------
+
+func TestMatrix_UnsafeArrayBlockBoundParity(t *testing.T) {
+	// Element schemas chosen so the per-item minimum takes several distinct
+	// values: 4, 8, 1, the fixed's own size, and 0 — the last selecting the
+	// zero-byte element-count cap instead of the division, a different arm of
+	// the same guard.
+	//
+	// The fixed8 and null rows are carried by the reflect decoders on all
+	// three targets: dropping the unsafe path's divisor moves neither of them
+	// while it moves every other row, which is how their element types are
+	// known to decline the unsafe array path rather than assumed to. They stay
+	// as the typed-vs-any half of the parity, and as the cells that reach the
+	// zero-minimum arm at all.
+	// oneItem is the element's own smallest legal encoding, which the
+	// two-block cells put in front of the hostile header so the second block
+	// is reached with the slice already populated.
+	elems := []struct {
+		name    string
+		schema  string
+		goElem  reflect.Type
+		oneItem []byte
+	}{
+		{"float", `"float"`, reflect.TypeFor[float32](), []byte{0, 0, 0, 0}},
+		{"double", `"double"`, reflect.TypeFor[float64](), []byte{0, 0, 0, 0, 0, 0, 0, 0}},
+		{"long", `"long"`, reflect.TypeFor[int64](), []byte{0}},
+		{"boolean", `"boolean"`, reflect.TypeFor[bool](), []byte{0}},
+		{"string", `"string"`, reflect.TypeFor[string](), []byte{0}},
+		{"fixed8", `{"type":"fixed","name":"BB8","size":8}`, reflect.TypeFor[[8]byte](), []byte{0, 0, 0, 0, 0, 0, 0, 0}},
+		{"null", `"null"`, reflect.TypeFor[any](), nil},
+		// Record elements take the OTHER unsafe array decoder
+		// (udArrayPtrRecord, which is selected by a single-pointer element),
+		// so the element axis spans both of them rather than only the
+		// primitive one. The empty record is also a second zero-minimum
+		// element, reached through that decoder instead of the reflect one.
+		{"ptr-record-empty", `{"type":"record","name":"BPE","fields":[]}`, reflect.TypeFor[*struct{}](), nil},
+		{"ptr-record-long", `{"type":"record","name":"BPL","fields":[{"name":"n","type":"long"}]}`,
+			reflect.PointerTo(reflect.StructOf([]reflect.StructField{
+				{Name: "N", Type: reflect.TypeFor[int64](), Tag: `avro:"n"`},
+			})), []byte{0}},
+	}
+	// A case is a leading valid block (0 items = none) and the count the
+	// hostile block that follows it declares.
+	//
+	// Three hostile counts: one that only an item-aware bound rejects for the
+	// wider elements, one past every arm of the guard, and one within a few
+	// thousand of MaxInt64. Each is driven from both block positions, because a
+	// hostile FIRST block meets a full buffer and an empty slice while a hostile
+	// SECOND block meets a shortened buffer, a non-zero running item total, and
+	// a slice that already has a length to add to.
+	//
+	// cap-straddle is the case those six cannot express. The zero-byte element
+	// cap is the only arm of the guard the running total participates in, and it
+	// only shows when the two blocks are individually under the cap and jointly
+	// over it — 2000 then 2500. A count far above the cap is rejected whether or
+	// not the total accumulates, so it measures the cap and not the running sum.
+	type boundCase struct {
+		name        string
+		lead, count int64
+	}
+	var cases []boundCase
+	for _, c := range []int64{1000, 1 << 40, math.MaxInt64 - 3000} {
+		cases = append(cases,
+			boundCase{fmt.Sprintf("first-block/count=%d", c), 0, c},
+			boundCase{fmt.Sprintf("second-block/count=%d", c), 1, c})
+	}
+	cases = append(cases, boundCase{"cap-straddle", 2000, 2500})
+
+	for _, e := range elems {
+		{
+			for _, pos := range cases {
+				count := pos.count
+				t.Run(fmt.Sprintf("%s/%s", e.name, pos.name), func(t *testing.T) {
+					schema := fmt.Sprintf(`{"type":"array","items":%s}`, e.schema)
+					leafS := avro.MustParse(schema)
+					recS := avro.MustParse(fmt.Sprintf(
+						`{"type":"record","name":"BR","fields":[{"name":"f","type":%s}]}`, schema))
+
+					// Optionally a valid leading block, then a block whose
+					// header lies, eight payload bytes, then the end-of-blocks
+					// terminator.
+					var wire []byte
+					if pos.lead > 0 {
+						wire = binary.AppendVarint(wire, pos.lead)
+						for range pos.lead {
+							wire = append(wire, e.oneItem...)
+						}
+					}
+					wire = binary.AppendVarint(wire, count)
+					wire = append(wire, 0, 0, 0, 0, 0, 0, 0, 0)
+					wire = append(wire, 0)
+
+					var anyDst any
+					_, anyErr := leafS.Decode(wire, &anyDst)
+
+					typedDst := reflect.New(reflect.SliceOf(e.goElem))
+					_, typedErr := leafS.Decode(wire, typedDst.Interface())
+
+					st := reflect.StructOf([]reflect.StructField{
+						{Name: "F", Type: reflect.SliceOf(e.goElem), Tag: `avro:"f"`},
+					})
+					_, unsafeErr := recS.Decode(wire, reflect.New(st).Interface())
+
+					for _, other := range []struct {
+						name string
+						err  error
+					}{{"reflect-typed", typedErr}, {"unsafe-field", unsafeErr}} {
+						if (anyErr == nil) != (other.err == nil) {
+							t.Fatalf("VERDICT DIVERGENCE vs %s:\n reflect-any=%v\n %s=%v",
+								other.name, anyErr, other.name, other.err)
+						}
+						// The struct-field path prefixes the field's context
+						// onto whatever the field's decoder returned, so the
+						// bound text is the SUFFIX rather than the whole
+						// string. Requiring it verbatim there still pins the
+						// divisor: a per-item minimum that drifted would print
+						// a different number.
+						if anyErr != nil && !strings.HasSuffix(other.err.Error(), anyErr.Error()) {
+							t.Errorf("BOUND DIVERGENCE vs %s:\n reflect-any  = %s\n %-12s = %s",
+								other.name, anyErr.Error(), other.name, other.err.Error())
+						}
+					}
+				})
+			}
+		}
 	}
 }
 
