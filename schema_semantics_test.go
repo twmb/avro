@@ -11117,6 +11117,128 @@ func TestMatrix_UnionIndexWireGrammar(t *testing.T) {
 	}
 }
 
+// TestMatrix_NullUnionIndexWireGrammar is the union-SHAPE arm of the index
+// grammar above. That matrix drives one shape — a three-branch union of
+// non-null types — and a two-branch null union does not merely take a
+// narrower version of the same code: it takes a DIFFERENT decoder, with its
+// own single-byte fast path for the two canonical spellings and its own
+// varint fallback for everything else. The grammar was proved on the
+// general path and the specialization's copy of it was never read.
+//
+// Crossed with the null POSITION, because the specialized decoder does not
+// store which index means null; it stores the VALUE branch's index and
+// derives the other by subtraction. A cell that only ever put null first
+// cannot tell a correct derivation from one that ignores the position.
+//
+// The cells mirror the general matrix's names one for one — canonical,
+// overlong, out-of-range, negative, truncated — so the two shapes are
+// asked the same questions, and the guard below fails if they drift apart.
+func TestMatrix_NullUnionIndexWireGrammar(t *testing.T) {
+	t.Parallel()
+	shapes := []struct {
+		name    string
+		schema  string
+		nullIdx int64
+		valIdx  int64
+	}{
+		{"null-first", `["null","int"]`, 0, 1},
+		{"null-second", `["int","null"]`, 1, 0},
+	}
+	intPayload := putZigzag(nil, 7)
+
+	for _, sh := range shapes {
+		s := avro.MustParse(sh.schema)
+		canonicalNull, err := s.AppendEncode(nil, nil)
+		if err != nil {
+			t.Fatalf("%s: encode null: %v", sh.name, err)
+		}
+		canonicalVal, err := s.AppendEncode(nil, int32(7))
+		if err != nil {
+			t.Fatalf("%s: encode int: %v", sh.name, err)
+		}
+
+		cells := []struct {
+			name      string
+			wire      []byte
+			want      any
+			isNull    bool
+			canonical []byte
+			wantErr   string
+		}{
+			{name: "canonical-null", wire: putZigzag(nil, sh.nullIdx),
+				isNull: true, canonical: canonicalNull},
+			{name: "canonical-value", wire: append(putZigzag(nil, sh.valIdx), intPayload...),
+				want: int32(7), canonical: canonicalVal},
+			// The two spellings the fast path cannot serve: an overlong
+			// varint has no single byte, so both branches fall through to
+			// the varint arm — the null branch being the one the value
+			// index does not name.
+			{name: "overlong-null", wire: putZigzagOverlong(nil, sh.nullIdx),
+				isNull: true, canonical: canonicalNull},
+			{name: "overlong-value", wire: append(putZigzagOverlong(nil, sh.valIdx), intPayload...),
+				want: int32(7), canonical: canonicalVal},
+			// A single-byte out-of-range index is rejected by the FAST
+			// path, which reports the offending byte; the overlong
+			// spelling of the same index reaches the varint arm and
+			// reports the decoded index. Two arms, two messages, and the
+			// pair is what shows the fast path is not simply falling
+			// through to the general one.
+			{name: "index-eq-branch-count", wire: putZigzag(nil, 2), wantErr: "invalid null-union index byte"},
+			{name: "negative-index", wire: putZigzag(nil, -1), wantErr: "invalid null-union index byte"},
+			{name: "overlong-index-eq-branch-count", wire: putZigzagOverlong(nil, 2), wantErr: "union index 2 out of range"},
+			{name: "overlong-negative-index", wire: putZigzagOverlong(nil, -1), wantErr: "union index -1 out of range"},
+			{name: "width-overflow-varint", wire: putVarintWidthOverflow(), wantErr: ""},
+			{name: "truncated-varint", wire: []byte{0x80}, wantErr: ""},
+		}
+
+		// Liveness floor: the overlong cells are the reason this matrix
+		// exists, and an encoder change that made them canonical would
+		// leave the varint arm unread while every assertion still passed.
+		overlongFellThrough := 0
+
+		for _, c := range cells {
+			t.Run(sh.name+"/"+c.name, func(t *testing.T) {
+				var got any
+				_, err := s.Decode(c.wire, &got)
+				if c.want == nil && !c.isNull {
+					if err == nil {
+						t.Fatalf("accepted %x (got %#v), want an error", c.wire, got)
+					}
+					if c.wantErr != "" && !strings.Contains(err.Error(), c.wantErr) {
+						t.Fatalf("error %q does not contain %q", err, c.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("decode %x: %v", c.wire, err)
+				}
+				if c.isNull {
+					if got != nil {
+						t.Fatalf("decode %x = %#v, want nil (the null branch)", c.wire, got)
+					}
+				} else if got != c.want {
+					t.Fatalf("decode %x = %#v, want %#v", c.wire, got, c.want)
+				}
+				// A non-canonical spelling must re-encode canonically:
+				// the decoder recovered the branch, not merely a value.
+				re, err := s.AppendEncode(nil, got)
+				if err != nil || !bytes.Equal(re, c.canonical) {
+					t.Fatalf("re-encode not canonical: err=%v re=%x want=%x", err, re, c.canonical)
+				}
+				if strings.HasPrefix(c.name, "overlong-") {
+					if len(c.wire) < 2 {
+						t.Fatalf("%s is not actually overlong: %x", c.name, c.wire)
+					}
+					overlongFellThrough++
+				}
+			})
+		}
+		if overlongFellThrough != 2 {
+			t.Errorf("%s: %d of 2 overlong cells reached the varint arm; the fast path is swallowing them", sh.name, overlongFellThrough)
+		}
+	}
+}
+
 // TestMatrix_SkipHostileBlockFraming drives hostile array/map block-header
 // values through the resolution SKIP path (and, where the natural path has
 // no cell of its own, through natural decode too). The skip path has its own
