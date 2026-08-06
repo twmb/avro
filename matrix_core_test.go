@@ -11666,41 +11666,104 @@ type markerUUID [16]byte
 
 func (m markerUUID) MarshalText() ([]byte, error) { return []byte("IGNORED"), nil }
 
+// TestMatrix_UUIDByteArrayTrustsRawBytes crosses the uuid logical's CARRIER
+// with the Go spelling of the value. The carrier axis previously had one
+// value, a size-16 fixed, and the two carriers do not share an encoder: a
+// fixed uuid rides as opaque bytes on both wires, while a string uuid is
+// text, and the JSON string encoder holds its own [16]byte-to-canonical-text
+// conversion that the fixed carrier never reaches. Pinning the carrier left
+// that conversion unrun.
+//
+// The invariant is SOURCE-INDEPENDENCE: within one carrier and one wire, a
+// [16]byte and the canonical hex-dash string naming the same UUID must
+// encode to the same bytes. The oracle is that agreement, not a spelled-out
+// expectation, so neither spelling can be checked against a restatement of
+// its own encoder. The carriers legitimately differ from each other, which
+// is why the comparison is within a carrier and not across.
+//
+// markerUUID carries a MarshalText that returns "IGNORED", so a carrier that
+// reached for the text interface instead of the raw bytes is caught rather
+// than merely producing something plausible.
 func TestMatrix_UUIDByteArrayTrustsRawBytes(t *testing.T) {
-	s := avro.MustParse(`{"type":"fixed","name":"TUU","size":16,"logicalType":"uuid"}`)
-	var v markerUUID
-	for i := range v {
-		v[i] = byte(i + 1)
-	}
-	for _, enc := range []struct {
-		name   string
-		encode func(any) ([]byte, error)
-	}{
-		{"binary", func(x any) ([]byte, error) { return s.AppendEncode(nil, x) }},
-		{"json", func(x any) ([]byte, error) { return s.AppendEncodeJSON(nil, x) }},
-	} {
-		wire, err := enc.encode(v)
-		if err != nil {
-			t.Fatalf("%s encode: %v", enc.name, err)
-		}
-		if bytes.Contains(wire, []byte("IGNORED")) {
-			t.Fatalf("%s: [16]byte uuid used MarshalText instead of trusting raw bytes: %x", enc.name, wire)
-		}
-		// Round-trip: the raw bytes survive.
-		var out markerUUID
-		if _, err := s.Decode(mustBinUUID(t, s, v), &out); err == nil && out != v {
-			t.Fatalf("%s: uuid bytes not preserved: %x vs %x", enc.name, out, v)
-		}
-	}
-}
+	const canonical = "550e8400-e29b-41d4-a716-446655440000"
+	raw := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	marker := markerUUID(raw)
 
-func mustBinUUID(t *testing.T, s *avro.Schema, v markerUUID) []byte {
-	t.Helper()
-	b, err := s.AppendEncode(nil, v)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
+	carriers := []struct {
+		name   string
+		schema string
+		// jsonIsText records whether this carrier's JSON form is the
+		// canonical hex-dash text. A fixed uuid is opaque bytes on the
+		// JSON wire too, so only the string carrier is text there.
+		jsonIsText bool
+	}{
+		{"fixed16", `{"type":"fixed","name":"TUU","size":16,"logicalType":"uuid"}`, false},
+		{"string", `{"type":"string","logicalType":"uuid"}`, true},
 	}
-	return b
+	sources := []struct {
+		name string
+		v    any
+	}{
+		{"array", raw},
+		{"named-array-with-marshaltext", marker},
+		{"canonical-string", canonical},
+	}
+
+	// Liveness floor: every carrier must have been compared on every wire,
+	// or a carrier that started erroring would leave its encoder unasserted.
+	compared := 0
+
+	for _, c := range carriers {
+		s := avro.MustParse(c.schema)
+		for _, wire := range []struct {
+			name   string
+			encode func(any) ([]byte, error)
+		}{
+			{"binary", func(x any) ([]byte, error) { return s.AppendEncode(nil, x) }},
+			{"json", func(x any) ([]byte, error) { return s.AppendEncodeJSON(nil, x) }},
+		} {
+			t.Run(c.name+"/"+wire.name, func(t *testing.T) {
+				var want []byte
+				for i, src := range sources {
+					got, err := wire.encode(src.v)
+					if err != nil {
+						t.Fatalf("%s encode: %v", src.name, err)
+					}
+					if bytes.Contains(got, []byte("IGNORED")) {
+						t.Fatalf("%s used MarshalText instead of trusting the raw bytes: %x", src.name, got)
+					}
+					if i == 0 {
+						want = got
+						continue
+					}
+					if !bytes.Equal(got, want) {
+						t.Fatalf("%s encodes differently from the plain [16]byte:\n got  %s\n want %s", src.name, got, want)
+					}
+				}
+				if c.jsonIsText && wire.name == "json" {
+					if string(want) != `"`+canonical+`"` {
+						t.Fatalf("string-carrier JSON is not the canonical text: %s", want)
+					}
+				}
+				// The raw bytes survive a round trip on this carrier.
+				bin, err := s.AppendEncode(nil, raw)
+				if err != nil {
+					t.Fatalf("binary encode for round trip: %v", err)
+				}
+				var out markerUUID
+				if _, err := s.Decode(bin, &out); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if [16]byte(out) != raw {
+					t.Fatalf("uuid bytes not preserved: %x vs %x", out, raw)
+				}
+				compared++
+			})
+		}
+	}
+	if want := len(carriers) * 2; compared != want {
+		t.Errorf("%d of %d carrier/wire pairs were compared; a carrier stopped encoding", compared, want)
+	}
 }
 
 // ---------- matrix_typed_test.go ----------
