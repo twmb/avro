@@ -11189,6 +11189,151 @@ func TestRegression_TimeMicrosJSONOverflowAnyPath(t *testing.T) {
 	}
 }
 
+type tmDurField struct {
+	F time.Duration `avro:"f"`
+}
+
+type tmTimeField struct {
+	F time.Time `avro:"f"`
+}
+
+type tmIntField struct {
+	F int64 `avro:"f"`
+}
+
+// TestMatrix_TimeMicrosOverflowGuardIsUniform crosses the overflow guard's
+// three axes at once. The guard lives in one conversion helper so that
+// every caller rejects the same values, and "every caller" is the claim —
+// but the suite reached it one caller and one target at a time, each by a
+// separate cell, so no cell asked whether the four callers AGREE, and the
+// time.Time target's overflow arm was reached by nothing.
+//
+//	caller  binary safe, binary unsafe (a struct field), JSON typed, JSON any
+//	target  time.Duration, time.Time, any, and int64 as the control
+//	value   in range, both boundaries, and one past each boundary
+//
+// The rule is stated independently of the code: a value overflows exactly
+// when it cannot be scaled to nanoseconds inside an int64, and the guard
+// must fire for every target that MATERIALIZES a duration and for none
+// that does not. int64 is in the matrix precisely because it must keep
+// accepting the overflowing values — a guard that rejected everything
+// would otherwise satisfy every other cell.
+//
+// The boundary cells are the two values immediately inside the limit, so
+// an off-by-one in the comparison shows up as a rejected legal value
+// rather than only as an accepted illegal one.
+func TestMatrix_TimeMicrosOverflowGuardIsUniform(t *testing.T) {
+	const microsPerNano = int64(time.Microsecond) // 1000
+	values := []struct {
+		name     string
+		val      int64
+		overflow bool
+	}{
+		{"zero", 0, false},
+		{"typical", 12_345_678, false},
+		{"boundary-hi", math.MaxInt64 / microsPerNano, false},
+		{"boundary-lo", math.MinInt64 / microsPerNano, false},
+		{"overflow-hi", math.MaxInt64/microsPerNano + 1, true},
+		{"overflow-lo", math.MinInt64/microsPerNano - 1, true},
+	}
+	targets := []struct {
+		name string
+		// materializes reports whether this target converts the value into
+		// a duration, which is what the guard protects. A target that
+		// keeps the raw number is not protected and must accept.
+		materializes bool
+		scalar       func() any // fresh pointer for the bare-target callers
+		record       func() any // fresh pointer for the struct-field caller
+		field        func(any) any
+	}{
+		{"duration", true, func() any { return new(time.Duration) }, func() any { return new(tmDurField) }, nil},
+		{"time", true, func() any { return new(time.Time) }, func() any { return new(tmTimeField) }, nil},
+		{"any", true, func() any { return new(any) }, nil, nil},
+		{"int64", false, func() any { return new(int64) }, func() any { return new(tmIntField) }, nil},
+	}
+
+	scalarS := MustParse(`{"type":"long","logicalType":"time-micros"}`)
+	recS := MustParse(`{"type":"record","name":"TMR","fields":[{"name":"f","type":{"type":"long","logicalType":"time-micros"}}]}`)
+	// The wire is written through the PLAIN long schema, so the payload is
+	// whatever int64 the cell names — the encoder's own range checks cannot
+	// pre-filter the values this test is about.
+	plainScalarS := MustParse(`"long"`)
+	plainRecS := MustParse(`{"type":"record","name":"TMR","fields":[{"name":"f","type":"long"}]}`)
+
+	// Liveness floor, counted inside the cell after the verdict is checked.
+	rejected, accepted := 0, 0
+	callersRun := map[string]int{}
+
+	for _, v := range values {
+		binScalar, err := plainScalarS.Encode(v.val)
+		if err != nil {
+			t.Fatalf("%s: encode scalar: %v", v.name, err)
+		}
+		binRec, err := plainRecS.Encode(map[string]any{"f": v.val})
+		if err != nil {
+			t.Fatalf("%s: encode record: %v", v.name, err)
+		}
+		jsonScalar := []byte(strconv.FormatInt(v.val, 10))
+
+		for _, tg := range targets {
+			wantErr := v.overflow && tg.materializes
+
+			callers := []struct {
+				name string
+				run  func() error
+			}{
+				{"binary-safe", func() error {
+					_, err := scalarS.Decode(binScalar, tg.scalar())
+					return err
+				}},
+				{"json-typed", func() error { return scalarS.DecodeJSON(jsonScalar, tg.scalar()) }},
+			}
+			if tg.record != nil {
+				callers = append(callers, struct {
+					name string
+					run  func() error
+				}{"binary-unsafe", func() error {
+					_, err := recS.Decode(binRec, tg.record())
+					return err
+				}})
+			}
+
+			for _, c := range callers {
+				t.Run(v.name+"/"+tg.name+"/"+c.name, func(t *testing.T) {
+					err := c.run()
+					if wantErr && err == nil {
+						t.Fatalf("%d (%s) into a %s target via %s was accepted; %d microseconds cannot be scaled to nanoseconds inside an int64, and every other caller rejects it",
+							v.val, v.name, tg.name, c.name, v.val)
+					}
+					if !wantErr && err != nil {
+						t.Fatalf("%d (%s) into a %s target via %s was rejected: %v", v.val, v.name, tg.name, c.name, err)
+					}
+					if wantErr {
+						rejected++
+					} else {
+						accepted++
+					}
+					callersRun[c.name]++
+				})
+			}
+		}
+	}
+
+	// Both verdicts must occur, or the matrix proves only that the guard
+	// is consistent about one answer.
+	if rejected == 0 || accepted == 0 {
+		t.Fatalf("the verdict axis collapsed: %d rejected, %d accepted", rejected, accepted)
+	}
+	// Every caller must have run. The claim under test is that they agree,
+	// which a matrix missing one of them cannot make.
+	for _, name := range []string{"binary-safe", "binary-unsafe", "json-typed"} {
+		if callersRun[name] == 0 {
+			t.Errorf("caller %q never ran; the guard's uniformity across callers is unasserted", name)
+		}
+	}
+	t.Logf("time-micros overflow guard: %d rejected, %d accepted across %d callers", rejected, accepted, len(callersRun))
+}
+
 // TestDurationSubResolutionTruncatesTowardZero locks in that
 // time.Duration values whose nanosecond component is not a whole
 // multiple of the schema's resolution unit are silently truncated
