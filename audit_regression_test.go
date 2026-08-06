@@ -8424,7 +8424,7 @@ func TestRegression_EncodeStructCyclicPointerFieldTerminates(t *testing.T) {
 // depth 1..8 and asserts: struct-field encode succeeds IFF the reflect scalar
 // encode of the same value succeeds (fast ≡ reflect), and when it succeeds the
 // wire decodes back to the original int.
-func TestRegression_StructFieldPointerChainMatchesReflect(t *testing.T) {
+func TestGenerative_StructFieldPointerChainMatchesReflect(t *testing.T) {
 	rec := avro.MustParse(`{"type":"record","name":"S","fields":[{"name":"F","type":"int"}]}`)
 	scalar := avro.MustParse(`"int"`)
 	intType := reflect.TypeOf(int(0))
@@ -8591,7 +8591,7 @@ func TestRegression_PointerChainEncodeDecodeDepthParity(t *testing.T) {
 // then the branch's decodeKind), so it peeled up to 2*maxIndirectDepth levels
 // and accepted targets binary rejected. Sweep every depth and assert the two
 // wires agree.
-func TestRegression_UnionPointerTargetDepthBinaryJSONParity(t *testing.T) {
+func TestGenerative_UnionPointerTargetDepthBinaryJSONParity(t *testing.T) {
 	s := avro.MustParse(`["null","int"]`)
 	bin, _ := s.Encode(int64(7))
 	js, _ := s.EncodeJSON(int64(7))

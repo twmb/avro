@@ -8121,7 +8121,7 @@ func TestDifferentialFastavroEnumDefaultToken(t *testing.T) {
 // earlier record branch coerces a field (directly, or through an array element
 // / map value) and then fails, so a naive shared-value matcher leaks the
 // coercion into the next branch.
-func TestRegression_UnionDefaultBranchOrderIndependent(t *testing.T) {
+func TestGenerative_UnionDefaultBranchOrderIndependent(t *testing.T) {
 	type shape struct {
 		name      string
 		fail      string // a record branch that coerces a field then fails the default
