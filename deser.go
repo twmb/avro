@@ -186,15 +186,14 @@ func (sl *slab) put() {
 //   - uuid on fixed(16): [16]byte
 //   - duration: [Duration]
 //
-// To produce JSON from decoded *any data, use [Schema.EncodeJSON] rather
-// than a generic JSON encoder. EncodeJSON is schema-aware and converts
-// these types back to their Avro representations (e.g. time.Time to
-// epoch integers, []byte to \uXXXX strings).
+// To produce JSON from decoded *any data use [Schema.EncodeJSON], not a generic
+// JSON encoder: it is schema-aware and converts these types back to their Avro
+// representations (time.Time to epoch integers, []byte to \uXXXX strings).
 //
-// Decode is liberal in what it accepts: non-canonical input (e.g. a
-// non-0/1 boolean byte; the Java reference treats it as false, and so
-// does Decode) is tolerated rather than rejected. Encode is canonical,
-// so a non-canonical input round-trips to the canonical form on encode.
+// Decode is liberal in what it accepts. Non-canonical input, such as a non-0/1
+// boolean byte that Java also reads as false, is tolerated rather than
+// rejected. Encode is canonical, so such input round-trips to the canonical
+// form.
 func (s *Schema) Decode(src []byte, v any, opts ...Opt) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
@@ -694,23 +693,20 @@ type deserArray struct {
 // always a schema-design problem.
 const maxZeroByteItems = 4 << 10
 
-// checkArrayBlockBounds validates an array/map block's count against
-// (a) the buffer-relative cap for items with non-zero minimum wire
-// size, and (b) the cumulative zero-byte-element cap. The zero-byte
-// branch uses the pre-add form `count > maxZeroByteItems-totalItems`
-// so a hostile count near MaxInt64 cannot wrap totalItems past the cap
-// (the post-add form `totalItems += count; if totalItems > cap` wraps
-// to a negative int64 and bypasses the check). Caller updates
-// totalItems after a non-error return. Used by skipArray, deserArray,
-// udArrayPtrRecord, and udArrayDirect to keep the four sites from
-// drifting on this rule.
-// minItemBytes selects the RULE, not just the magnitude: a positive value takes
-// the buffer-relative bound, zero takes the zero-byte cap, and the two are not
-// ordered — neither is uniformly the looser. That is why a per-item minimum may
-// never be rounded UP: reporting 1 for a type whose true minimum is 0 does not
-// loosen the bound, it moves a legitimately zero-byte array onto a
-// buffer-relative rule it cannot satisfy. minBytesUnknown is the third rule,
-// for when the walk could not compute one (see minBytes).
+// checkArrayBlockBounds validates a block's count against the buffer-relative
+// cap for non-zero-minimum items and the cumulative zero-byte-element cap.
+// Shared by all four array sites so the rule cannot drift.
+//
+// The zero-byte branch uses the pre-add form `count > cap-totalItems`: the
+// post-add `totalItems += count` wraps negative for a hostile count near
+// MaxInt64 and bypasses the check. Caller updates totalItems after a non-error
+// return.
+//
+// minItemBytes selects the RULE, not just the magnitude — positive takes the
+// buffer-relative bound, zero takes the zero-byte cap, and neither is uniformly
+// looser. So a per-item minimum may NEVER be rounded up: reporting 1 where the
+// true minimum is 0 moves a legitimately zero-byte array onto a rule it cannot
+// satisfy. minBytesUnknown is the third rule, for an uncomputable minimum.
 func checkArrayBlockBounds(count int64, totalItems int64, srcLen int, minItemBytes int) error {
 	if minItemBytes == minBytesUnknown {
 		// Unknown: admit the union of what BOTH rules admit, so an
@@ -790,20 +786,15 @@ const decimalScaleLimit = 1 << 16
 // has to live at the boundary the parsing actually crosses.
 const maxRatInputLen = 1 << 17 // 128 KiB
 
-// maxDecimalUnscaledBytes caps the byte length of a decimal / big-decimal
-// UNSCALED value accepted on decode — the orthogonal axis to decimalScaleLimit
-// (which caps the SCALE). A schema's precision is parse-capped at
-// decimalScaleLimit (schema.go), so a minimally-encoded unscaled value within
-// the declared precision needs at most ceil(decimalScaleLimit*log2(10)/8) ~=
-// 27 KiB; 32 KiB clears that with margin, so no parse-valid decimal is ever
-// rejected. Beyond it, materializing the big.Int and base-converting it via
-// big.Rat.FloatString (json.Number / string targets) or GCD-reducing
-// big.Rat.SetFrac (high-scale targets) is O(M(n)*log n) on a multi-megabit
-// integer — a 1 MiB unscaled value spends ~1 s — so reject before the
-// conversion. Java/fastavro/avro-rs store significand+scale and never
-// base-convert, so they have no such cost; this is twmb-specific DoS defense,
-// like decimalScaleLimit. (The bare-number JSON form is bounded separately by
-// maxRatInputLen via boundedRatFromString.)
+// maxDecimalUnscaledBytes caps a decimal / big-decimal UNSCALED value on
+// decode, the orthogonal axis to decimalScaleLimit's cap on SCALE. Precision is
+// parse-capped at decimalScaleLimit, so a minimally-encoded value within the
+// declared precision needs at most ~27 KiB; 32 KiB clears that, and no
+// parse-valid decimal is rejected. Past it, materializing the big.Int and
+// base-converting is O(M(n)*log n) on a multi-megabit integer — a 1 MiB
+// unscaled value costs ~1 s — so reject before converting. Java, fastavro and
+// avro-rs store significand+scale and never base-convert, so this cost is
+// specific to here. The bare-number JSON form is bounded by maxRatInputLen.
 const maxDecimalUnscaledBytes = 32 << 10
 
 // checkDecimalUnscaledLen rejects an over-long decimal unscaled value before
@@ -995,21 +986,19 @@ func saturateSchemaMagnitude(n int) int {
 // existing tight buffer-relative guard).
 //
 // The result is always in [0, maxSchemaMagnitude]. Three callers compute
-// `1 + schemaMinBytes(...)` and one of them divides by it, so a wrapped or
-// negative return is not a loose bound but a crash and a misclassification:
-// zero divides, and a negative value routes an element that occupies real
-// bytes through the ZERO-BYTE element cap instead of the buffer-relative one.
-// Saturating here rather than at each consumer is deliberate — the consumers
-// are four separate derivations of the same bound (parse, resolve, skip, and
-// the container reader's), and a ceiling applied at one leaves three open.
+// `1 + schemaMinBytes(...)` and one divides by it, so a wrapped or negative
+// return is a crash and a misclassification rather than a loose bound: zero
+// divides, and a negative routes a real-byte element through the ZERO-BYTE cap
+// instead of the buffer-relative one. Saturating HERE rather than at each
+// consumer is deliberate — there are four separate derivations of this bound,
+// and a ceiling at one leaves three open.
 //
-// This spins up a fresh walk for one node. A caller that computes minimums for
-// SEVERAL containers in one operation must instead share ONE walk across them —
-// see newMinBytesWalk. The container count is caller-chosen (every array/map is
-// one), and a fresh walk per container makes the operation's cost that count
-// times the per-walk allowance while capping only the second factor. The memo
-// and allowance are node-keyed and path-independent, so sharing is exact for the
-// acyclic case and gives the same conservative stand-in for the cyclic one.
+// This spins up a fresh walk for one node. A caller computing minimums for
+// SEVERAL containers in one operation must share ONE walk (newMinBytesWalk):
+// the container count is caller-chosen, so a walk each makes the operation cost
+// that count times the per-walk allowance while capping only the second factor.
+// The memo and allowance are node-keyed and path-independent, so sharing is
+// exact for the acyclic case and gives the same stand-in for the cyclic one.
 func schemaMinBytes(n *schemaNode) int {
 	return newMinBytesWalk().minBytesOf(n)
 }
