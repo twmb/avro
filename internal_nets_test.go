@@ -406,27 +406,41 @@ var censusRegistry = []censusQuestion{
 		answerers: []censusAnswerer{
 			{repr: "shared predicates", site: "isNamedKind / isRecordKind", file: "schema_node.go"},
 			{
-				repr: "compat + JSON codec literal sets", site: `case "record", "enum", "fixed":`, file: "compat.go",
-				note: "different-by-design as a FORM, not as an answer: a switch arm cannot call a predicate and still be a switch arm. They owe the identical classification, which the driver checks through the property that defines it — whether a definition of that kind can be referenced by name.",
+				repr: "node-kind predicate", site: "branchIsNamedKind", file: "compat.go",
+				note: "the *schemaNode twin of isNamedKind, classifying three spellings rather than four because the builder has already normalized \"error\" into \"record\" by the time a node exists. The union-tag sites in json_codec.go ask it rather than spelling the set again.",
 			},
 			{
-				repr: "canonical + parse literal sets", site: `case "record", "error":`, file: "schema_canonical.go",
-				note: "same form-vs-answer split for the RECORD half: canonical emission and the parse arm both spell the record kinds literally.",
+				repr: "compat literal set", site: `case "record", "enum", "fixed":`, file: "compat.go",
+				note: "different-by-design as a FORM, not as an answer: a switch arm cannot call a predicate and still be a switch arm. It owes the identical classification, which the driver checks through the property that defines it — whether a definition of that kind can be referenced by name. This arm is branchIsNamedKind's own body, and is now the last literal copy of the NAMED set.",
+			},
+			{
+				repr: "parse + build literal sets", site: `case "record", "error":`, file: "schema.go",
+				note: "same form-vs-answer split for the RECORD half: the build arms and the parse grammar spell the record kinds literally where a switch cannot call isRecordKind.",
 			},
 		},
 		tells: []censusTell{
 			{pattern: `isNamedKind`, counts: map[string]int{
 				"cache.go": 3, "schema_canonical.go": 1, "schema_for.go": 4,
-				"schema_node.go": 13, "schema_parse.go": 1, "schema_walk.go": 2, "schema.go": 5,
+				"schema_node.go": 13, "schema_parse.go": 2, "schema_walk.go": 2, "schema.go": 5,
 			}},
 			{pattern: `isRecordKind`, counts: map[string]int{
-				"schema_for.go": 2, "schema_node.go": 10, "schema_parse.go": 1, "schema_walk.go": 1,
+				"schema_canonical.go": 1, "schema_for.go": 2, "schema_node.go": 10,
+				"schema_parse.go": 1, "schema_walk.go": 1,
+			}},
+			// branchIsNamedKind is the *schemaNode twin of isNamedKind: by the
+			// time a node exists the builder has normalized "error" into
+			// "record", so it classifies three spellings where isNamedKind
+			// classifies four. Tracked as its own tell because the union-tag
+			// sites in json_codec.go route through it instead of spelling the
+			// set again.
+			{pattern: `branchIsNamedKind`, counts: map[string]int{
+				"compat.go": 6, "json_codec.go": 4,
 			}},
 			{pattern: `"record", "enum", "fixed"`, counts: map[string]int{
-				"compat.go": 1, "json_codec.go": 2,
+				"compat.go": 1,
 			}},
 			{pattern: `"record", "error"`, counts: map[string]int{
-				"schema_canonical.go": 1, "schema_node.go": 3, "schema_parse.go": 1, "schema.go": 3,
+				"schema_node.go": 3, "schema_parse.go": 1, "schema.go": 3,
 			}},
 			// Rejected tell: `== "record"` — it also matches the RECURSION
 			// question (json_decode.go's `kind == "record" || kind == "array"
