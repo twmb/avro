@@ -832,11 +832,16 @@ func checkDecimalUnscaledSize(n int) error {
 }
 
 // isJSONNumber reports whether s is a JSON number per RFC 8259.
-// json.Valid validates the grammar; the boundary-whitespace and
-// first-char checks reject (a) whitespace-padded numbers (JSON's
-// "ws value ws" production accepts them as JSON-text but not as a
-// standalone number), and (b) other JSON values that are valid but
-// non-numeric (strings, booleans, null, arrays, objects).
+// json.Valid validates the grammar; the two checks around it reject
+// (a) whitespace-padded numbers (JSON's "ws value ws" production accepts
+// them as JSON-text but not as a standalone number), and (b) other JSON
+// values that are valid but non-numeric (strings, booleans, null, arrays,
+// objects).
+//
+// Only the TRAILING whitespace needs a test of its own. A JSON number's
+// first byte is '-' or a digit, and no whitespace byte is either, so the
+// first-byte check below rejects a leading-space input on its way to
+// rejecting every other non-numeric start.
 //
 // boundedRatFromString uses this gate because big.Rat.SetString's
 // accepted-input set is strictly broader than JSON: it accepts
@@ -850,15 +855,11 @@ func isJSONNumber(s string) bool {
 	if len(s) == 0 {
 		return false
 	}
-	first := s[0]
-	if first == ' ' || first == '\t' || first == '\n' || first == '\r' {
+	if first := s[0]; first != '-' && (first < '0' || first > '9') {
 		return false
 	}
-	last := s[len(s)-1]
-	if last == ' ' || last == '\t' || last == '\n' || last == '\r' {
-		return false
-	}
-	if first != '-' && (first < '0' || first > '9') {
+	switch s[len(s)-1] {
+	case ' ', '\t', '\n', '\r':
 		return false
 	}
 	// json.Valid is read-only; alias s's bytes to avoid the []byte(s) copy.
