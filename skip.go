@@ -59,16 +59,8 @@ func skipBytes(src []byte, _ *slab) ([]byte, error) {
 	return src[n:], nil
 }
 
-func skipString(src []byte, sl *slab) ([]byte, error) {
-	return skipBytes(src, sl)
-}
-
 func skipFixed(size int) skipfn {
 	return func(src []byte, _ *slab) ([]byte, error) { return skipBytesN(src, size, "fixed") }
-}
-
-func skipEnum(src []byte, sl *slab) ([]byte, error) {
-	return skipInt(src, sl)
 }
 
 type skipRecordFields struct {
@@ -192,13 +184,11 @@ func skipMap(w *schemaNode, mbw *minBytesWalk) skipfn {
 				return checkMapBlockBounds(count, srcLen, minEntryBytes)
 			},
 			func(src []byte, sl *slab) ([]byte, error) {
-				if src, err := skipString(src, sl); err != nil {
+				src, err := skipBytes(src, sl) // the entry key
+				if err != nil {
 					return nil, err
-				} else if src, err = valueSkip(src, sl); err != nil {
-					return nil, err
-				} else {
-					return src, nil
 				}
+				return valueSkip(src, sl)
 			})
 	}
 }
@@ -233,7 +223,10 @@ var primitiveSkips = map[string]skipfn{
 	"float":   skipFloat,
 	"double":  skipDouble,
 	"bytes":   skipBytes,
-	"string":  skipString,
+	// A string is a length-prefixed byte run on the wire, so skipping one
+	// IS skipping bytes — the shared reader already labels its
+	// short-buffer error "bytes" for both.
+	"string": skipBytes,
 }
 
 // buildSkip compiles a skipper for writer node w. mbw is the ONE min-bytes walk
@@ -251,7 +244,7 @@ func buildSkip(w *schemaNode, mbw *minBytesWalk) skipfn {
 	case "record":
 		return skipRecord(w, mbw)
 	case "enum":
-		return skipEnum
+		return skipInt // an enum is its symbol index, encoded as an int
 	case "array":
 		return skipArray(w, mbw)
 	case "map":

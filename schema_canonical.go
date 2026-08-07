@@ -172,52 +172,39 @@ func appendCanonObject(dst []byte, o *aobject) []byte {
 // mode (symmetric with appendCanonObject).
 func appendCanonField(dst []byte, f *afield) []byte {
 	dst = append(dst, '{')
+	// "name" leads, so every later key is comma-preceded — no first-key
+	// bookkeeping, unlike appendCanonObject's key closure.
+	key := func(dst []byte, k string) []byte {
+		dst = append(dst, ',')
+		dst = appendCanonString(dst, k)
+		return append(dst, ':')
+	}
 	dst = appendCanonString(dst, "name")
 	dst = append(dst, ':')
 	dst = appendCanonString(dst, f.Name)
-	dst = append(dst, ',')
-	dst = appendCanonString(dst, "type")
-	dst = append(dst, ':')
+	dst = key(dst, "type")
 	if f.Type != nil {
 		dst = appendCanonSchema(dst, f.Type)
 	} else {
 		dst = append(dst, '"', '"')
 	}
 	if len(f.Aliases) > 0 {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "aliases")
-		dst = append(dst, ':')
-		dst = appendCanonStringArray(dst, f.Aliases)
+		dst = appendCanonStringArray(key(dst, "aliases"), f.Aliases)
 	}
 	if len(f.Default) > 0 {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "default")
-		dst = append(dst, ':')
-		dst = appendCompactJSON(dst, f.Default)
+		dst = appendCompactJSON(key(dst, "default"), f.Default)
 	}
 	if f.Order != "" {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "order")
-		dst = append(dst, ':')
-		dst = appendCanonString(dst, f.Order)
+		dst = appendCanonString(key(dst, "order"), f.Order)
 	}
 	if f.Logical != "" {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "logicalType")
-		dst = append(dst, ':')
-		dst = appendCanonString(dst, f.Logical)
+		dst = appendCanonString(key(dst, "logicalType"), f.Logical)
 	}
 	if f.Precision != nil {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "precision")
-		dst = append(dst, ':')
-		dst = strconv.AppendInt(dst, int64(*f.Precision), 10)
+		dst = strconv.AppendInt(key(dst, "precision"), int64(*f.Precision), 10)
 	}
 	if f.Scale != nil {
-		dst = append(dst, ',')
-		dst = appendCanonString(dst, "scale")
-		dst = append(dst, ':')
-		dst = strconv.AppendInt(dst, int64(*f.Scale), 10)
+		dst = strconv.AppendInt(key(dst, "scale"), int64(*f.Scale), 10)
 	}
 	return append(dst, '}')
 }

@@ -1598,11 +1598,14 @@ func findUnionBranch(union *schemaNode, name string) *schemaNode {
 // so the two encoders route a Go value's canonical type name to one branch;
 // a table-less node takes the scan for the same answer.
 func unionBranchOfKind(union *schemaNode, kind string) *schemaNode {
-	if i, ok := union.tags.branchByKind(kind); ok {
-		return union.branches[i]
-	}
+	// Same shape as findUnionBranch: a table, when present, IS the answer —
+	// a miss there is a miss, not a reason to scan.
 	if union.tags != nil {
-		return nil
+		i, ok := union.tags.byKind[kind]
+		if !ok {
+			return nil
+		}
+		return union.branches[i]
 	}
 	for _, b := range union.branches {
 		if b != nil && b.kind == kind {
