@@ -315,9 +315,9 @@ var censusRegistry = []censusQuestion{
 		},
 		tells: []censusTell{
 			{pattern: `decimalConsumesPrecisionScale`, counts: map[string]int{
-				"schema_node.go":  5,
+				"schema_node.go":  4,
 				"schema_parse.go": 2,
-				"schema.go":       3,
+				"schema.go":       2,
 			}},
 			// Rejected tell: `Logical == ""` — 6 hits in schema.go, three of
 			// them the lift's closer-to-the-type gates and three unrelated
@@ -345,7 +345,7 @@ var censusRegistry = []censusQuestion{
 		},
 		tells: []censusTell{
 			{pattern: `isNilValue`, counts: map[string]int{
-				"ser.go":        13,
+				"ser.go":        12,
 				"json_codec.go": 5,
 				"unsafe.go":     4,
 				"reflect.go":    1,
@@ -440,7 +440,7 @@ var censusRegistry = []censusQuestion{
 				"compat.go": 1,
 			}},
 			{pattern: `"record", "error"`, counts: map[string]int{
-				"schema_node.go": 3, "schema_parse.go": 1, "schema.go": 3,
+				"schema_node.go": 2, "schema_parse.go": 1, "schema.go": 3,
 			}},
 			// Rejected tell: `== "record"` — it also matches the RECURSION
 			// question (json_decode.go's `kind == "record" || kind == "array"
@@ -494,10 +494,10 @@ var censusRegistry = []censusQuestion{
 		},
 		tells: []censusTell{
 			{pattern: `flatFieldNeedsLift`, counts: map[string]int{
-				"schema_parse.go": 4, "schema_walk.go": 3, "schema_node.go": 1,
+				"schema_parse.go": 4, "schema_walk.go": 3,
 			}},
 			{pattern: `flatLiftTypeMap`, counts: map[string]int{
-				"schema_parse.go": 5, "schema_walk.go": 2, "schema_node.go": 3, "cache.go": 2,
+				"schema_parse.go": 5, "schema_walk.go": 2, "schema_node.go": 1, "cache.go": 1,
 			}},
 			// Rejected tell: `liftFlatFieldType` — it names the MUTATOR, which
 			// only the parse path calls, so the walker and renderer sites
@@ -889,12 +889,12 @@ var censusRegistry = []censusQuestion{
 				"schema.go": 1, // maxDecimalDigits
 			}},
 			{pattern: `maxSchemaMagnitude`, counts: map[string]int{
-				"deser.go":  10, // the const and the accessor, plus the prose stating the ceiling once
-				"schema.go": 1,  // maxDecimalDigits' note that it asks the shared ceiling
+				"deser.go":  9, // the const and the accessor, plus the prose stating the ceiling once
+				"schema.go": 1, // maxDecimalDigits' note that it asks the shared ceiling
 			}},
 			{pattern: `magnitudeWidestMultiplier`, counts: map[string]int{
 				"deser.go":  3, // the const and the prose tying the ceiling to it
-				"schema.go": 2, // the multiply itself, and the note naming it
+				"schema.go": 1, // the multiply itself
 			}},
 		},
 	},
