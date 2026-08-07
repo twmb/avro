@@ -204,18 +204,13 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 
 // skipValue skips an entire JSON value (for unknown record fields).
 //
-// Accepts the same bare special-float tokens decodeJSONFloat accepts on
-// known float/double fields — NaN, Infinity, -Infinity, INF, -INF, Inf,
-// -Inf — so a record produced by fastavro (Python json.dumps with
-// allow_nan=True emits bare NaN/Infinity, observed) with such a token
-// in a writer-only field can be decoded against a reader that doesn't
-// have the field. (Java's JsonEncoder emits the QUOTED string form —
-// Jackson's default quotes non-numeric numbers — which the string arm
-// already skips as a plain JSON string.) It dispatches on the value
-// path's own [isBareSpecialFloatStart] and applies parseSpecialFloat's
-// exact-match gate, so invalid bare tokens (e.g. "Naive", lowercase
-// "nan") still error and the two paths cannot drift on which producer
-// conventions they accept.
+// Accepts the same bare special-float tokens decodeJSONFloat does — NaN,
+// Infinity, -Infinity, INF, -INF, Inf, -Inf — so a fastavro-written record
+// (json.dumps with allow_nan=True emits them bare, observed) decodes against a
+// reader lacking that field. Java emits the quoted form, which the string arm
+// already skips. Dispatches on the value path's [isBareSpecialFloatStart] and
+// parseSpecialFloat's exact-match gate, so "Naive" and lowercase "nan" still
+// error and the two paths cannot drift.
 func (s *jsonScanner) skipValue() error {
 	return s.skipValueDepth(0)
 }
@@ -418,18 +413,14 @@ func parseJSONInt64(b []byte) (int64, error) {
 	for ; i < len(b); i++ {
 		c := b[i]
 		if c == '.' || c == 'e' || c == 'E' {
-			// Has fractional/exponent part — parse with arbitrary precision
-			// so values near the int64 boundary aren't silently truncated
-			// or rejected via float64 rounding (e.g. "-9.2233720368547758e18"
-			// = -9223372036854775800 is a valid int64 that float64 would
-			// round to int64.Min; "9.2233720368547758e18" = 9223372036854775800
-			// would float64-round to int64.Max+1 and be rejected). See
-			// parseInt64Lenient for the full rationale.
+			// Fractional or exponent form: parse at arbitrary precision so
+			// values near the int64 boundary are not truncated or rejected by
+			// float64 rounding. "-9.2233720368547758e18" is the valid int64
+			// -9223372036854775800 that float64 rounds to int64.Min, and its
+			// positive twin rounds to int64.Max+1 and would be rejected.
 			//
-			// parseInt64Lenient (and its downstream boundedRatFromString /
-			// strconv.ParseInt / fmt.Errorf calls) treat s as read-only and
-			// don't retain it past the call, so alias b's bytes instead of
-			// copying.
+			// parseInt64Lenient and everything downstream treat s as read-only
+			// and do not retain it, so alias b rather than copying.
 			n, err := parseInt64Lenient(unsafe.String(unsafe.SliceData(b), len(b)))
 			if err != nil {
 				return 0, fmt.Errorf("avro json: %w", err)
@@ -458,14 +449,10 @@ func parseJSONInt64(b []byte) (int64, error) {
 // then calling emit for each code point. Used by both resolveJSONEscapes
 // (Avro string) and scanAvroJSONBytes (Avro bytes/fixed).
 //
-// The UTF-8 decoding is required for spec parity with Java/fastavro.
-// Per the Avro 1.12 JSON spec, "each character represents one byte"
-// and "Unicode code points 0-255 are mapped to unsigned 8-bit byte
-// values 0-255". Both Java and fastavro decode the JSON string into
-// Unicode characters first (Jackson getText() / Python str), then map
-// code points to bytes. A byte-by-byte walker would (wrongly) emit
-// JSON literal "é" (UTF-8 bytes c3 a9) as two output bytes [0xC3, 0xA9]
-// rather than the spec-correct one byte [0xE9].
+// The UTF-8 decoding is required for spec parity: "each character represents
+// one byte", with code points 0-255 mapping to byte values, and both Java and
+// fastavro decode to characters before mapping. A byte-by-byte walker emits
+// literal "é" as the two bytes [0xC3, 0xA9] instead of the correct [0xE9].
 func walkJSONEscapes(raw []byte, emit func(r rune) error) error {
 	for i := 0; i < len(raw); {
 		if raw[i] != '\\' {

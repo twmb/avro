@@ -9,19 +9,15 @@ import (
 	"strings"
 )
 
-// parseSchemaTree decodes a schema JSON string into the aschema parse tree
-// in a single O(n) pass. The prior path had aschema and afield implement
-// json.Unmarshaler, so the stdlib decoder did a full subtree re-scan
-// (d.skip) to delimit each nested node before recursing into its
-// UnmarshalJSON — O(depth) re-scans of O(size) content = O(depth*size)
-// over a nested schema. Decoding once into a generic tree (no custom
-// Unmarshaler, so no re-scan) and walking that tree is O(n).
+// parseSchemaTree decodes a schema JSON string into the aschema parse tree in a
+// single O(n) pass. A json.Unmarshaler on aschema/afield would instead make the
+// stdlib decoder re-scan each nested subtree to delimit it, O(depth*size);
+// decoding once into a generic tree and walking that is O(n).
 //
-// Scalar leaf fields (size, scale, precision, default) re-marshal their
-// small already-decoded value and reuse the existing stdlib decode
-// (laxInt, *int, json.RawMessage) so their accept/reject behavior is
-// identical to the prior path by construction; the re-marshal is
-// O(leaf) and summed over all leaves stays O(n).
+// Scalar leaves (size, scale, precision, default) re-marshal their small
+// decoded value and reuse the stdlib decode, so their accept/reject behavior
+// matches the typed decode by construction. That re-marshal is O(leaf) and
+// stays O(n) summed.
 func parseSchemaTree(schema string) (*aschema, error) {
 	dec := json.NewDecoder(strings.NewReader(schema))
 	dec.UseNumber() // preserve integer precision in defaults and extras
@@ -228,24 +224,16 @@ func aobjectFromMap(m map[string]any, memo strayShapeMemo) (o *aobject, err erro
 			return nil, schemaTypeMismatch("fields", "array")
 		}
 	}
-	// Extra (non-reserved) properties. The tree was decoded with
-	// UseNumber; normalizeJSONValue applies the same value-based numeric
-	// normalization (json.Number → int64/float64, exponent-overflow →
-	// ±Inf) the former unmarshalAnyPreservePrecision capture did.
-	// precision/scale count as extra everywhere except on a recognized
-	// decimal carrier (schemaReservedKeyForObject) — these extras feed
-	// node.props, so the CustomType-callback SchemaNode surfaces stray
-	// precision/scale in Props exactly like Root() does.
-	// The stray-body verdict is already recorded: the arms above set
-	// o.Items/o.Values/o.Fields/... exactly when the body parsed as the
-	// key's schema shape, an exact mirror of strayBodyShapeOK. Route on
-	// that recorded verdict so a stray body is decoded ONCE (by its arm),
-	// never a second time here — a second decode re-enters aschemaFromAny,
-	// which routes its own stray keys, so the two decodes per level
-	// compound to O(2^depth) over a nested-stray schema. Reserved keys
-	// match exact-lowercase only, so the verdict is consulted exactly for
-	// the spelling the arms read; a case-variant spelling is an ordinary
-	// custom property routed to extra verbatim.
+	// Extra (non-reserved) properties, numerically normalized by
+	// normalizeJSONValue. precision/scale are extra everywhere but a
+	// recognized decimal carrier, so a CustomType callback's SchemaNode
+	// surfaces a stray pair in Props exactly as Root() does.
+	//
+	// Route on the arms' RECORDED stray-body verdict, not a fresh check: the
+	// arms above set o.Items/o.Values/o.Fields exactly when the body parsed as
+	// the key's shape. A second decode re-enters aschemaFromAny, which routes
+	// its own stray keys, so two decodes per level compound to O(2^depth) on a
+	// nested-stray schema.
 	shapeOK := o.strayShapeRecorded(nameIsString)
 	for k, v := range m {
 		if schemaReservedKeyForObject(k, v, o.Type, o.Logical, shapeOK) {
@@ -453,27 +441,20 @@ func stringSliceFrom(m map[string]any, key string) ([]string, bool, error) {
 
 // jsonNullBody reports whether a decoded JSON body is the null literal.
 //
-// null is the one body shape a typed decode accepts in silence: encoding/json
-// documents that unmarshaling null into a destination other than a pointer,
-// interface or map "has no effect on the value and produces no error". So a
-// reader that decides PRESENCE by asking whether the decode failed reads a
-// present-but-unreadable attribute as an ABSENT one and keeps the
-// destination's zero value.
+// null is the one body a typed decode accepts in silence: encoding/json
+// documents that unmarshaling it into a non-pointer, non-interface, non-map
+// destination "has no effect on the value and produces no error". A reader
+// deciding PRESENCE by whether the decode failed therefore reads a
+// present-but-unreadable attribute as ABSENT and keeps the zero.
 //
-// That zero is not neutral here. Several Avro attributes have a legal,
-// meaningful zero — a fixed of size 0 is a distinct usable schema, and a
-// decimal of scale 0 is a distinct scale that changes what every value on
-// the wire means — so coercing a null body into one substitutes a schema
-// nobody wrote for the one that was written. Every read of a body into a
-// typed destination asks this first and treats a null as malformed, which
-// puts it on the same route as any other body of the wrong JSON type: a
-// hard reject where the kind binds the key, and a verbatim ride to props
-// where it does not.
+// That zero is not neutral. A fixed of size 0 is a usable schema and a decimal
+// of scale 0 changes what every wire value means, so coercing null into one
+// substitutes a schema nobody wrote. Every typed body read asks this first and
+// treats null as malformed, routing it like any wrong-typed body: hard reject
+// where the kind binds the key, verbatim to props where it does not.
 //
-// The keys whose bodies are read by type ASSERTION (name, namespace, doc,
-// logicalType, aliases, symbols, items, values, fields) need no such guard:
-// a JSON null decodes to a nil any, which satisfies no assertion, so those
-// reads already decline it exactly as they decline a wrong-typed body.
+// Keys read by type ASSERTION need no such guard — a JSON null is a nil any,
+// which satisfies no assertion.
 func jsonNullBody(v any) bool {
 	return v == nil
 }

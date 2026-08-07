@@ -59,21 +59,13 @@ func timeToTimestampMicros(t time.Time) (int64, error) {
 
 func timestampNanosToTime(val int64) time.Time { return time.Unix(val/1e9, val%1e9).UTC() }
 
-// Local-timestamp encoders interpret t's wall-clock fields as if they
-// were UTC, matching Java's reference behavior:
-//   Instant instant = timestamp.toInstant(ZoneOffset.UTC);
-// (See org.apache.avro.data.TimeConversions.LocalTimestampMillisConversion;
-// fastavro does the same via data.replace(tzinfo=datetime.timezone.utc).)
-//
-// Avro 1.12 spec: local-timestamp-* "represents a timestamp in a local
-// timezone, regardless of what specific time zone is considered local"
-// — i.e., the wire long encodes wall-clock components, not an instant.
-//
-// twmb/avro decodes local-timestamps to UTC time.Time, which already
-// preserves the wall-clock components, so a Java-encoded value
-// round-trips correctly. Encode treats the time.Time's wall-clock
-// fields as if UTC (see timeToLocalTimestamp* below) regardless of
-// the input's location.
+// The local-timestamp encoders read t's wall-clock fields as if UTC, whatever
+// t's location, matching Java's TimeConversions.LocalTimestamp*Conversion and
+// fastavro's tzinfo replace. Per the spec, local-timestamp-* "represents a
+// timestamp in a local timezone, regardless of what specific time zone is
+// considered local": the wire long encodes wall-clock components, not an
+// instant. Decode produces a UTC time.Time, which holds the same components, so
+// a Java-encoded value round-trips.
 
 // timeToLocalUTC re-anchors t's wall-clock components at UTC, matching
 // Java's TimeConversions.LocalTimestamp*Conversion behavior. Shared
@@ -94,21 +86,16 @@ func timeToLocalTimestampNanos(t time.Time) (int64, error) {
 	return timeToTimestampNanos(timeToLocalUTC(t))
 }
 
-// timeToTimestampNanos shares timeToTimestampScaled with subScale=1
-// (no sub-second scaling — the unit IS nanoseconds, so nsec/1 == nsec).
+// timeToTimestampNanos passes subScale=1: the unit IS nanoseconds, so nsec/1 ==
+// nsec.
 //
-// twmb deliberately diverges from Java's TimestampNanosConversion.toLong:
-// Java's adjustment branch at TimeConversions.java:238 has an off-by-1000
-// typo (subtracts `nanos - 1_000_000` where the analogous millis/micros
-// branches subtract `scale` — `nanos - 1_000_000_000` for nanos), which
-// would corrupt every negative-second instant by ~999ms. Java's
-// millis/micros conversions are correct; twmb implements the
-// spec-correct "nanoseconds from epoch" (sec*1e9 + nsec) via
-// timeToTimestampScaled — the same formula as Java's correct millis/micros
-// branches. (This is not corroborated by the other Go-adjacent impls:
-// fastavro has no timestamp-nanos support at all, and avro-rs stores the
-// raw int64 without an Instant conversion — twmb follows the spec and the
-// mathematically correct value, not Java's typo.)
+// Deliberately diverges from Java's TimestampNanosConversion.toLong, whose
+// adjustment branch (TimeConversions.java:238) subtracts `nanos - 1_000_000`
+// where the millis/micros branches subtract `scale` — an off-by-1000 typo that
+// corrupts every negative-second instant by ~999ms. This implements the
+// spec-correct sec*1e9 + nsec, the same formula as Java's correct branches.
+// Uncorroborated by the other impls: fastavro has no timestamp-nanos at all,
+// and avro-rs stores the raw int64 without converting.
 func timeToTimestampNanos(t time.Time) (int64, error) {
 	return timeToTimestampScaled(t, 1_000_000_000, 1, "nanoseconds")
 }
@@ -139,18 +126,14 @@ func timeLogicalToInt64(logical string) func(time.Time) (int64, error) {
 
 func dateToTime(val int32) time.Time { return time.Unix(int64(val)*86400, 0).UTC() }
 
-// timeToDate converts a time.Time to its Avro date logical value
-// (epoch-days since 1970-01-01). Calendar-date interpretation: takes
-// t's wall-clock year/month/day in t's own location, ignoring the
-// zone offset. Mirrors Java's LocalDate.toEpochDay and fastavro's
-// prepare_date (both calendar-only). Re-anchoring wall-clock fields
-// at UTC for the day count is the same shape used by
-// timeToLocalTimestamp* for the long-typed wall-clock logicals.
+// timeToDate converts t to epoch-days since 1970-01-01, taking its wall-clock
+// year/month/day in its own location and ignoring the zone offset. Java's
+// LocalDate.toEpochDay and fastavro's prepare_date are calendar-only the same
+// way.
 //
-// Returns an error when the day count exceeds int32 range —
-// possible for time.Time values whose year falls outside roughly
-// ±5.8 million. Without the bounds check, int32(...) silent
-// truncation would corrupt the wire value.
+// Errors when the day count leaves int32 range, reachable for a year outside
+// roughly ±5.8 million. Without the check, int32() truncation corrupts the wire
+// value silently.
 func timeToDate(t time.Time) (int32, error) {
 	utc := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 	days := utc.Unix() / 86400
