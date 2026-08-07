@@ -914,12 +914,10 @@ func mapKeyEmitLen(k reflect.Value, limit int) (int, bool) {
 	return 0, false
 }
 
-// valueWalkLimit walks v — a Props value or a SchemaField.Default, an arbitrary
-// user-supplied JSON tree — the way json.Marshal will, returning a non-OK code
-// when the value is unsafe to serialize at [SchemaNode.Schema]. It enforces
-// three orthogonal limits, because a value is handed to jsonSerializableValue
-// (needsJSONFixup/applyJSONFixup) and then to json.Marshal, neither of which
-// bounds anything:
+// valueWalkLimit walks an arbitrary user-supplied Props value or
+// SchemaField.Default the way json.Marshal will, returning a non-OK code when
+// it is unsafe to serialize. Neither jsonSerializableValue nor json.Marshal
+// bounds anything, so three orthogonal limits are enforced here:
 //
 //   - DEPTH (depthLeft): the longest container PATH. Nested far enough, the
 //     fixup walk or json.Marshal overflows the stack uncatchably — recover
@@ -1068,24 +1066,20 @@ func (n *SchemaNode) toJSONShared(b *walkBudget) any {
 }
 
 // toJSONWalk is the cycle-aware walker shared by toJSON and toJSONDedup.
-// visited is threaded through every recursive call so cycles introduced
-// via Items / Values pointers terminate — see
-// TestRegression_SchemaNodeToJSONCycleSafe for the invariant. When d is
-// non-nil it tracks named-type definitions and reports conflicting
-// redefinitions; when nil it just emits the JSON tree. enclosingNS is
-// the namespace scope at this node's position: named types emit their
-// namespace relative to it (omitted when inherited; "namespace":"" when
-// a null-namespace type sits inside a namespaced scope — Java's
-// Name.writeName escape), and name references emit the fullname so they
-// re-bind position-independently.
+// visited threads through every recursive call so Items/Values pointer cycles
+// terminate. A non-nil d tracks named-type definitions and reports conflicting
+// redefinitions; nil just emits the tree. enclosingNS is the scope at this
+// node's position: named types emit their namespace relative to it — omitted
+// when inherited, "namespace":"" for a null-namespace type inside a namespaced
+// scope — and name references emit the fullname so they re-bind
+// position-independently.
 //
-// depth is the structural nesting level. The visited map terminates only true
-// POINTER cycles; a distinct-node-per-level acyclic chain (a hand-built
-// array<array<…>> a million deep) repeats no pointer, so without this bound the
-// walk recurses until the stack overflows uncatchably — before Schema's
-// eventual Parse, which bounds bracket nesting at maxSchemaJSONDepth, ever
-// runs. The same ceiling applies here: any tree shallow enough to encode or
-// decode sits far below it (the wire codec's maxDepth is 4x smaller).
+// depth is the structural nesting level. visited terminates only POINTER
+// cycles, and a distinct-node-per-level chain (a hand-built array<array<…>> a
+// million deep) repeats none, so without this bound the walk overflows the
+// stack uncatchably before Parse's own bracket-nesting bound ever runs. The
+// same maxSchemaJSONDepth ceiling applies here; any tree shallow enough to
+// encode or decode sits far below it, since the codec's maxDepth is 4x smaller.
 //
 // stray is true when n was reached through a structural key its parent's kind
 // does not bind (a stray "items" on an "int", surfaced as-written by the
@@ -2021,23 +2015,20 @@ func nodeIsNameRefShape(n *SchemaNode) bool {
 // spliced in, hidden state silently beating the exported field they just set.
 //
 // Agreement is decided by ASKING THE RESOLVER — lookupNameRef against a
-// one-entry table holding only the stamped target — never by restating which
-// spellings it binds. That inherits every form scopedRefKeys admits, the
-// fullname-vs-Name distinction, and the structural-kind rejection, including
-// any later change to the resolver. A hand-written list of accepted spellings
-// silently under-accepts the day the resolver grows a form.
+// one-entry table holding the stamped target — never by restating which
+// spellings it binds. That inherits every form scopedRefKeys admits and any
+// later change to it; a hand-written list under-accepts the day the resolver
+// grows a form.
 //
-// The scope asked at is the one the stamp was MADE in (refNS), not the walk's
-// current enclosing namespace. Extraction is the whole point of the splice and
-// an extracted node is re-rooted at the null namespace, so asking at the
-// walk's scope would call a short-name reference stale purely for having been
-// lifted out of its namespace. Only the stamping scope can answer "is Type
-// still the spelling that produced this stamp".
+// The scope asked at is the stamp's own (refNS), not the walk's current one.
+// An extracted node is re-rooted at the null namespace, so asking at the walk's
+// scope would call a short-name reference stale purely for having been lifted
+// out of its namespace.
 //
 // Anything else — a primitive, a different name — means the node was edited
-// after Root() stamped it. The stamp is then stale and ignored, and the node
-// behaves exactly like a hand-built reference: binding to a definition the
-// converted tree provides, or dangling loudly.
+// after Root() stamped it. The stamp is stale and ignored, and the node behaves
+// like a hand-built reference: binding to a definition the converted tree
+// provides, or dangling loudly.
 func nodeRefTargetAgrees(n *SchemaNode) bool {
 	t := n.refTarget
 	if t == nil {
@@ -2152,12 +2143,11 @@ func defaultMatchesBytesOrFixedKind(t *SchemaNode, val any) bool {
 // order and takes the first that accepts, as Java's parseField does.
 //
 // The numeric arms delegate to defaultAsInt32 / defaultAsInt64 /
-// defaultAsFloat, so both selectors apply identical per-value predicates
-// (int32 bounds, whole-number, JSON grammar, ErrRange-with-Inf). float/double
+// defaultAsFloat, so both selectors apply identical predicates. float/double
 // accept any numeric input per the lossy-destination policy, so ["float","int"]
-// default 42 picks float on both surfaces. They REJECT string defaults here:
-// Java's text→Double coercion fires only for an outer float/double field type,
-// never a union branch. bytes/fixed accept a codepoint-mapped string or []byte.
+// default 42 picks float on both surfaces, and REJECT strings, since Java's
+// text→Double coercion fires only for an outer field type. bytes/fixed accept a
+// codepoint-mapped string or []byte.
 //
 // The structural arms recurse so per-element validity mirrors walkDefault —
 // record enforces required-field presence, array/map require every element to
@@ -2568,15 +2558,14 @@ func schemaKeyBinds(k string, v any, typ, logical string) bool {
 // case variants of reserved names included, is an ordinary custom property
 // that rides to Props verbatim whatever its body.
 //
-// There are exactly two ways a reserved key stays out of Props: the kind BINDS
-// it, or the kind does not bind it but SURFACES it as-written on a structural
-// field — which needs both a field to land on ([canonicalStrayKey]) and a body
-// parsing as that key's schema shape. A key that is neither has Props as its
-// only surface, which is where type-level "default" and "order" land: only
-// enum binds "default", no kind binds "order", and neither has a SchemaNode
-// field on a non-binding kind. Java keeps both as schema properties for the
-// same reason (SCHEMA_RESERVED omits both, Schema.java:175-176; ENUM_RESERVED
-// adds "default" alone, :178-180), as does fastavro 1.12.2 (executed).
+// Exactly two ways a reserved key stays out of Props: the kind BINDS it, or the
+// kind does not bind it but SURFACES it as-written on a structural field, which
+// needs both a field to land on and a body parsing as that key's shape. A key
+// that is neither has Props as its only surface — where type-level "default"
+// and "order" land, since only enum binds "default", no kind binds "order", and
+// neither has a SchemaNode field on a non-binding kind. Java keeps both as
+// schema properties (SCHEMA_RESERVED omits both, Schema.java:175-176;
+// ENUM_RESERVED adds "default" alone), as does fastavro 1.12.2 (executed).
 //
 // shapeOK answers the stray-body shape question from a verdict the caller
 // ALREADY computed, so it always describes the queried body. That is what
