@@ -4190,17 +4190,7 @@ func TestRegression_CacheSpliceEmptyShortName(t *testing.T) {
 		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
 	}
 	in := map[string]any{"i": map[string]any{"f": int64(7)}}
-	wire, err := s2.Encode(in)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	wireTwin, err := twin.Encode(in)
-	if err != nil {
-		t.Fatalf("twin encode: %v", err)
-	}
-	if !bytes.Equal(wire, wireTwin) {
-		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
-	}
+	assertTwinWire(t, s2, twin, in)
 }
 
 // AUDIT_PATTERNS.md B7 second instance, the stale-splice arm. A KEYLESS
@@ -4259,17 +4249,7 @@ func TestRegression_CacheKeylessDefStaleSplice(t *testing.T) {
 	// implements the LOCAL Inner{z:string} at both fields and rejects the
 	// stale inherited shape.
 	in := map[string]any{"a": map[string]any{"z": "p"}, "b": map[string]any{"z": "q"}}
-	wire, err := writer.Encode(in)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	wireTwin, err := twin.Encode(in)
-	if err != nil {
-		t.Fatalf("twin encode: %v", err)
-	}
-	if !bytes.Equal(wire, wireTwin) {
-		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
-	}
+	wire := assertTwinWire(t, writer, twin, in)
 	var out map[string]any
 	mustDecode(t, writer, wire, &out)
 	if !reflect.DeepEqual(out, in) {
@@ -4319,17 +4299,7 @@ func TestRegression_CacheKeylessDefCrossParseRef(t *testing.T) {
 		t.Errorf("Root() field a: got type=%q name=%q namespace=%q fields=%v, want the spliced x.Inner definition", fa.Type, fa.Name, fa.Namespace, fa.Fields)
 	}
 	in := map[string]any{"a": map[string]any{"w": int64(7)}}
-	wire, err := writer.Encode(in)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	wireTwin, err := twin.Encode(in)
-	if err != nil {
-		t.Fatalf("twin encode: %v", err)
-	}
-	if !bytes.Equal(wire, wireTwin) {
-		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
-	}
+	wire := assertTwinWire(t, writer, twin, in)
 	var out map[string]any
 	mustDecode(t, writer, wire, &out)
 	if !reflect.DeepEqual(out, in) {
@@ -4413,17 +4383,7 @@ func TestRegression_LeadingDotCrossParseRefSplices(t *testing.T) {
 		t.Errorf("rabin fingerprint diverges from directly-parsed twin: %x vs %x", fp, fpTwin)
 	}
 	in := map[string]any{"a": map[string]any{"w": int64(7)}}
-	wire, err := writer.Encode(in)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	wireTwin, err := twin.Encode(in)
-	if err != nil {
-		t.Fatalf("twin encode: %v", err)
-	}
-	if !bytes.Equal(wire, wireTwin) {
-		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
-	}
+	assertTwinWire(t, writer, twin, in)
 }
 
 // AUDIT_PATTERNS.md B7 third instance, arm three: the executed stale-splice
@@ -8804,4 +8764,18 @@ func TestMatrix_OmitzeroFillsSchemaDefault(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertTwinWire requires s and its directly-parsed twin to encode in to the
+// same bytes — the oracle-independent anchor for every cache/splice cell: equal
+// wire proves the two ARE the same logical schema, so a metadata divergence is
+// provably a metadata bug. It returns s's wire for callers that go on to decode
+// it.
+func assertTwinWire(t *testing.T, s, twin *avro.Schema, in any) []byte {
+	t.Helper()
+	wire, wireTwin := mustEncode(t, s, in), mustEncode(t, twin, in)
+	if !bytes.Equal(wire, wireTwin) {
+		t.Errorf("wire bytes diverge from directly-parsed twin: %x vs %x", wire, wireTwin)
+	}
+	return wire
 }

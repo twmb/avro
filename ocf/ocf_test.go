@@ -92,12 +92,7 @@ func TestMultipleBlocks(t *testing.T) {
 	const n = 250
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s) // default block length 100
-	for i := range n {
-		v := int32(i)
-		if err := w.Encode(&v); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeInts(t, w, n)
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
@@ -1071,12 +1066,7 @@ func TestWithBlockBytes(t *testing.T) {
 	// Set maxBytes=3 so that after 3 items, the block is flushed.
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(0), WithBlockBytes(3))
-	for i := range 7 {
-		v := int32(i)
-		if err := w.Encode(&v); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeInts(t, w, 7)
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
@@ -1093,12 +1083,7 @@ func TestWithBlockBytesAndBlockCount(t *testing.T) {
 	// Block count 2, block bytes very large — count triggers first.
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(2), WithBlockBytes(100000))
-	for i := range 5 {
-		v := int32(i)
-		if err := w.Encode(&v); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeInts(t, w, 5)
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
@@ -1115,12 +1100,7 @@ func TestWithBlockCountZero(t *testing.T) {
 	// Block count 0 + block bytes 2: only bytes triggers flush.
 	var buf bytes.Buffer
 	w := mustNewWriter(t, &buf, s, WithBlockCount(0), WithBlockBytes(2))
-	for i := range 5 {
-		v := int32(i)
-		if err := w.Encode(&v); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeInts(t, w, 5)
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
@@ -1275,12 +1255,7 @@ func TestAppendWriter(t *testing.T) {
 	// Write initial items.
 	sb := &seekBuf{}
 	w := mustNewWriter(t, sb, s)
-	for i := range 3 {
-		v := int32(i)
-		if err := w.Encode(&v); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeInts(t, w, 3)
 	mustClose(t, w)
 
 	// Append more items.
@@ -1320,12 +1295,7 @@ func TestAppendWriterCustomCodec(t *testing.T) {
 	// Write initial items with custom codec.
 	sb := &seekBuf{}
 	w := mustNewWriter(t, sb, s, WithCodec(codec), WithBlockCount(2))
-	for i := range 3 {
-		v := int32(i)
-		if err := w.Encode(&v); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeInts(t, w, 3)
 	mustClose(t, w)
 
 	// Append with the same codec.
@@ -9389,5 +9359,16 @@ func TestReaderZeroRunCapIndependentOfBlockLength(t *testing.T) {
 	// guard above) unboundedly after.
 	if consumed != maxOCFZeroByteSlack {
 		t.Fatalf("zeroRun cap fired after %d records, want exactly %d", consumed, maxOCFZeroByteSlack)
+	}
+}
+
+// writeInts encodes int32(0) through int32(n-1) into w.
+func writeInts(t testing.TB, w *Writer, n int) {
+	t.Helper()
+	for i := range n {
+		v := int32(i)
+		if err := w.Encode(&v); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
 	}
 }

@@ -11682,56 +11682,31 @@ func TestMatrix_PromoteLogical(t *testing.T) {
 	// the encoder accepts must produce the canonical Go type. Closes
 	// the cell-coverage gap from the original 6-cell expansion.
 	t.Run("int → long+timestamp-micros", func(t *testing.T) {
-		writer := avro.MustParse(`"int"`)
-		reader := avro.MustParse(`{"type":"long","logicalType":"timestamp-micros"}`)
-		resolved, _ := avro.Resolve(writer, reader)
-		wire, _ := writer.AppendEncode(nil, int32(1742385600))
-		var got any
-		mustDecode(t, resolved, wire, &got)
+		got := resolvedDecodeAny(t, `"int"`, `{"type":"long","logicalType":"timestamp-micros"}`, int32(1742385600))
 		if _, ok := got.(time.Time); !ok {
 			t.Fatalf("expected time.Time, got %T", got)
 		}
 	})
 	t.Run("int → long+timestamp-nanos", func(t *testing.T) {
-		writer := avro.MustParse(`"int"`)
-		reader := avro.MustParse(`{"type":"long","logicalType":"timestamp-nanos"}`)
-		resolved, _ := avro.Resolve(writer, reader)
-		wire, _ := writer.AppendEncode(nil, int32(1742385600))
-		var got any
-		mustDecode(t, resolved, wire, &got)
+		got := resolvedDecodeAny(t, `"int"`, `{"type":"long","logicalType":"timestamp-nanos"}`, int32(1742385600))
 		if _, ok := got.(time.Time); !ok {
 			t.Fatalf("expected time.Time, got %T", got)
 		}
 	})
 	t.Run("int → long+local-timestamp-millis", func(t *testing.T) {
-		writer := avro.MustParse(`"int"`)
-		reader := avro.MustParse(`{"type":"long","logicalType":"local-timestamp-millis"}`)
-		resolved, _ := avro.Resolve(writer, reader)
-		wire, _ := writer.AppendEncode(nil, int32(1742385600))
-		var got any
-		mustDecode(t, resolved, wire, &got)
+		got := resolvedDecodeAny(t, `"int"`, `{"type":"long","logicalType":"local-timestamp-millis"}`, int32(1742385600))
 		if _, ok := got.(time.Time); !ok {
 			t.Fatalf("expected time.Time, got %T", got)
 		}
 	})
 	t.Run("int → long+local-timestamp-micros", func(t *testing.T) {
-		writer := avro.MustParse(`"int"`)
-		reader := avro.MustParse(`{"type":"long","logicalType":"local-timestamp-micros"}`)
-		resolved, _ := avro.Resolve(writer, reader)
-		wire, _ := writer.AppendEncode(nil, int32(1742385600))
-		var got any
-		mustDecode(t, resolved, wire, &got)
+		got := resolvedDecodeAny(t, `"int"`, `{"type":"long","logicalType":"local-timestamp-micros"}`, int32(1742385600))
 		if _, ok := got.(time.Time); !ok {
 			t.Fatalf("expected time.Time, got %T", got)
 		}
 	})
 	t.Run("int → long+local-timestamp-nanos", func(t *testing.T) {
-		writer := avro.MustParse(`"int"`)
-		reader := avro.MustParse(`{"type":"long","logicalType":"local-timestamp-nanos"}`)
-		resolved, _ := avro.Resolve(writer, reader)
-		wire, _ := writer.AppendEncode(nil, int32(1742385600))
-		var got any
-		mustDecode(t, resolved, wire, &got)
+		got := resolvedDecodeAny(t, `"int"`, `{"type":"long","logicalType":"local-timestamp-nanos"}`, int32(1742385600))
 		if _, ok := got.(time.Time); !ok {
 			t.Fatalf("expected time.Time, got %T", got)
 		}
@@ -25473,4 +25448,17 @@ func TestDeepNestingLargeNestedCollections(t *testing.T) {
 	if len(got.Items) != 100 || got.Items[99].ID != 99 || len(got.Items[50].Attrs) != 10 {
 		t.Fatalf("got %d items, last=%d, attrs=%d", len(got.Items), got.Items[99].ID, len(got.Items[50].Attrs))
 	}
+}
+
+// resolvedDecodeAny encodes v against the writer schema, resolves writer to
+// reader, and decodes that wire into an any through the resolved schema — the
+// shape every promotion cell drives.
+func resolvedDecodeAny(t *testing.T, writer, reader string, v any) any {
+	t.Helper()
+	w, r := avro.MustParse(writer), avro.MustParse(reader)
+	resolved := mustResolve(t, w, r)
+	wire := mustAppendEncode(t, w, nil, v)
+	var got any
+	mustDecode(t, resolved, wire, &got)
+	return got
 }

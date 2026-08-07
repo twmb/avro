@@ -30,12 +30,7 @@ func TestSchemaForBasic(t *testing.T) {
 	t.Run("with namespace", func(t *testing.T) {
 		s := mustSchemaFor[User](t, WithNamespace("com.example"))
 		u := User{Name: "Alice", Age: 30, Score: 100}
-		data := mustEncode(t, s, &u)
-		var got User
-		mustDecode(t, s, data, &got)
-		if got != u {
-			t.Errorf("got %+v, want %+v", got, u)
-		}
+		roundTripEq(t, s, u)
 	})
 
 	t.Run("no namespace", func(t *testing.T) {
@@ -326,12 +321,7 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 
 		// Round-trip.
 		input := R{A: MD5{1}, B: SHA1{2}}
-		data := mustEncode(t, s, &input)
-		var got R
-		mustDecode(t, s, data, &got)
-		if got != input {
-			t.Errorf("got %+v, want %+v", got, input)
-		}
+		roundTripEq(t, s, input)
 	})
 
 	t.Run("same type dedup", func(t *testing.T) {
@@ -343,12 +333,7 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 		}
 		s := mustSchemaFor[R](t)
 		input := R{A: MD5{1}, B: MD5{2}}
-		data := mustEncode(t, s, &input)
-		var got R
-		mustDecode(t, s, data, &got)
-		if got != input {
-			t.Errorf("got %+v, want %+v", got, input)
-		}
+		roundTripEq(t, s, input)
 	})
 
 	t.Run("same type with alias dedup", func(t *testing.T) {
@@ -359,12 +344,7 @@ func TestSchemaForFixedTwoNamedTypes(t *testing.T) {
 		}
 		s := mustSchemaFor[R](t)
 		input := R{A: MD5{1}, B: MD5{2}}
-		data := mustEncode(t, s, &input)
-		var got R
-		mustDecode(t, s, data, &got)
-		if got != input {
-			t.Errorf("got %+v, want %+v", got, input)
-		}
+		roundTripEq(t, s, input)
 	})
 }
 
@@ -398,12 +378,7 @@ func TestSchemaForDuration(t *testing.T) {
 	}
 	s := mustSchemaFor[Record](t)
 	r := Record{Millis: 5 * time.Second, Micros: 5 * time.Second}
-	data := mustEncode(t, s, &r)
-	var got Record
-	mustDecode(t, s, data, &got)
-	if got != r {
-		t.Errorf("got %+v, want %+v", got, r)
-	}
+	roundTripEq(t, s, r)
 }
 
 // avro.Duration is the dedicated Go type for the Avro "duration" logical type —
@@ -1249,12 +1224,7 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 		}
 		s := mustSchemaFor[User](t)
 		u := User{Base: Base{ID: 123}, Name: "Alice"}
-		data := mustEncode(t, s, &u)
-		var got User
-		mustDecode(t, s, data, &got)
-		if got != u {
-			t.Errorf("got %+v, want %+v", got, u)
-		}
+		roundTripEq(t, s, u)
 	})
 
 	t.Run("inline", func(t *testing.T) {
@@ -1264,12 +1234,7 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 		}
 		s := mustSchemaFor[User](t)
 		u := User{Name: "Alice", Address: Addr{City: "Seattle", Zip: 98101}}
-		data := mustEncode(t, s, &u)
-		var got User
-		mustDecode(t, s, data, &got)
-		if got != u {
-			t.Errorf("got %+v, want %+v", got, u)
-		}
+		roundTripEq(t, s, u)
 	})
 
 	t.Run("pointer inline", func(t *testing.T) {
@@ -1311,12 +1276,7 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 		}
 		s := mustSchemaFor[Outer](t)
 		o := Outer{Inner: Inner{X: 1}, Y: 2}
-		data := mustEncode(t, s, &o)
-		var got Outer
-		mustDecode(t, s, data, &got)
-		if got != o {
-			t.Errorf("got %+v, want %+v", got, o)
-		}
+		roundTripEq(t, s, o)
 	})
 
 	t.Run("ignored embedded", func(t *testing.T) {
@@ -1345,12 +1305,7 @@ func TestSchemaForNestedRecord(t *testing.T) {
 	}
 	s := mustSchemaFor[User](t)
 	u := User{Name: "Alice", Address: Address{City: "Seattle", Zip: 98101}}
-	data := mustEncode(t, s, &u)
-	var got User
-	mustDecode(t, s, data, &got)
-	if got != u {
-		t.Errorf("got %+v, want %+v", got, u)
-	}
+	roundTripEq(t, s, u)
 }
 
 func TestSchemaForDeepNesting(t *testing.T) {
@@ -1368,12 +1323,7 @@ func TestSchemaForDeepNesting(t *testing.T) {
 	}
 	s := mustSchemaFor[User](t)
 	u := User{Name: "Alice", Address: Address{City: "Seattle", Street: Street{Name: "Main St", Number: 42}}}
-	data := mustEncode(t, s, &u)
-	var got User
-	mustDecode(t, s, data, &got)
-	if got != u {
-		t.Errorf("got %+v, want %+v", got, u)
-	}
+	roundTripEq(t, s, u)
 }
 
 func TestSchemaForDuplicateNestedType(t *testing.T) {
@@ -1387,12 +1337,7 @@ func TestSchemaForDuplicateNestedType(t *testing.T) {
 	}
 	s := mustSchemaFor[User](t)
 	u := User{Name: "Alice", Home: Address{City: "Seattle"}, Work: Address{City: "Portland"}}
-	data := mustEncode(t, s, &u)
-	var got User
-	mustDecode(t, s, data, &got)
-	if got != u {
-		t.Errorf("got %+v, want %+v", got, u)
-	}
+	roundTripEq(t, s, u)
 }
 
 func TestSchemaForFourLevelWithReuse(t *testing.T) {
@@ -1419,12 +1364,7 @@ func TestSchemaForFourLevelWithReuse(t *testing.T) {
 			Reuse: L2{V: 2},
 		},
 	}
-	data := mustEncode(t, s, &v)
-	var got L1
-	mustDecode(t, s, data, &got)
-	if got != v {
-		t.Errorf("got %+v, want %+v", got, v)
-	}
+	roundTripEq(t, s, v)
 }
 
 func TestSchemaForEmptyStruct(t *testing.T) {
@@ -1491,12 +1431,7 @@ func TestSchemaForCollections(t *testing.T) {
 		}
 		s := mustSchemaFor[Record](t)
 		r := Record{A: [3]int32{1, 2, 3}}
-		data := mustEncode(t, s, &r)
-		var got Record
-		mustDecode(t, s, data, &got)
-		if got != r {
-			t.Errorf("got %+v, want %+v", got, r)
-		}
+		roundTripEq(t, s, r)
 	})
 
 	t.Run("fixed byte array", func(t *testing.T) {
@@ -1531,12 +1466,7 @@ func TestSchemaForAllPrimitives(t *testing.T) {
 	}
 	s := mustSchemaFor[Prims](t)
 	p := Prims{B: true, I8: 1, I16: 2, I32: 3, I64: 4, I: 5, U8: 6, U16: 7, U32: 8, F32: 1.5, F64: 3.14, S: "hello"}
-	data := mustEncode(t, s, &p)
-	var got Prims
-	mustDecode(t, s, data, &got)
-	if got != p {
-		t.Errorf("got %+v, want %+v", got, p)
-	}
+	roundTripEq(t, s, p)
 }
 
 func TestSchemaForUUID(t *testing.T) {
@@ -9528,5 +9458,17 @@ func TestRegression_EmbedCycleStillTerminates(t *testing.T) {
 	}
 	if n.V != 7 {
 		t.Fatalf("cyclic-embed round-trip: V=%d, want 7", n.V)
+	}
+}
+
+// roundTripEq encodes v against s, decodes the wire back into a fresh T, and
+// requires the two to be equal.
+func roundTripEq[T comparable](t *testing.T, s *Schema, v T) {
+	t.Helper()
+	data := mustEncode(t, s, &v)
+	var got T
+	mustDecode(t, s, data, &got)
+	if got != v {
+		t.Errorf("got %+v, want %+v", got, v)
 	}
 }
