@@ -116,20 +116,19 @@ type Codec interface {
 	Close() error
 }
 
-// BoundedDecompressor is an optional capability a [Codec] may implement. If a
-// Codec implements it, the [Reader] calls DecompressBounded with its per-block
-// decompression cap (from [WithMaxDecompressedBlockBytes]) instead of
-// [Codec.Decompress], so the codec can refuse-early or stream-limit BEFORE
-// allocating the whole block. That is the only effective defense against a
-// decompression bomb — a post-decompression size check is false comfort, since
-// the over-cap allocation has already happened. A Codec that does NOT implement
-// BoundedDecompressor decompresses unbounded; for untrusted data, supply a
-// codec that bounds itself (all built-in codecs do).
+// BoundedDecompressor is an optional capability a [Codec] may implement. When
+// it does, the [Reader] calls DecompressBounded with its per-block cap (from
+// [WithMaxDecompressedBlockBytes]) instead of [Codec.Decompress], letting the
+// codec refuse early or stream-limit BEFORE allocating the block. That is the
+// only effective defense against a decompression bomb; checking the size
+// afterward is false comfort, because the allocation already happened. A Codec
+// without it decompresses unbounded, so for untrusted data supply one that
+// bounds itself. All built-in codecs do.
 //
-// A wrapper type that embeds [Codec] (e.g. a [NopCloser] result) does NOT
-// inherit this capability — embedding an interface promotes only that
-// interface's methods — so such a wrapper must forward DecompressBounded
-// explicitly or it silently disables bounding for the codec it wraps.
+// A wrapper that embeds [Codec], such as a [NopCloser] result, does NOT inherit
+// the capability — embedding an interface promotes only that interface's
+// methods — so it must forward DecompressBounded explicitly or it silently
+// disables bounding for the codec it wraps.
 //
 // max <= 0 means no limit. max is constant across all calls for a given
 // [Reader], so a codec that caches a configured decoder (e.g. a zstd decoder
@@ -218,20 +217,17 @@ func (optSchemaOpts) writerOpt() {}
 // registered for reading. A custom codec whose name matches a built-in
 // overrides it.
 //
-// Passing a codec hands it over. Whatever happens next, it is closed exactly
-// once: by [Writer.Close] or [Reader.Close] when the constructor returns a
-// usable one; by the constructor itself when it fails, since it returns no
-// Writer or Reader for the caller to close and the codec is often built inline
-// in the call; and by the constructor when it succeeds without using the codec
-// at all. That last case is easy to reach and gives no sign it happened —
-// [NewReader] and [NewAppendWriter] take a supplied codec only when its Name
-// matches the header's avro.codec, and NewWriter takes only the last WithCodec
-// written — so an offer that is declined is released rather than dropped.
+// Passing a codec hands it over, and it is closed exactly once whatever
+// happens: by [Writer.Close] or [Reader.Close] when the constructor returns a
+// usable one, by the constructor when it fails, and by the constructor when it
+// succeeds without using the codec at all. That last case is easy to reach and
+// gives no sign — [NewReader] and [NewAppendWriter] take a codec only when its
+// Name matches the header's avro.codec, and NewWriter takes only the last
+// WithCodec written — so a declined offer is released rather than dropped.
 //
-// The consequence for a codec used more than once: a caller that shares one
-// codec across several writers, readers, or files must give it a Close that
-// returns nil, or wrap it in [NopCloser]. The rule does not depend on whether
-// the offer was taken.
+// A caller sharing one codec across several writers, readers, or files must
+// therefore give it a Close that returns nil, or wrap it in [NopCloser]. The
+// rule holds whether or not the offer was taken.
 //
 // A nil codec is ignored, on every constructor, in both spellings: a nil
 // Codec, and a non-nil Codec holding a nil pointer. Such an offer is never
@@ -583,31 +579,17 @@ func NewWriter(w io.Writer, s *avro.Schema, opts ...WriterOpt) (_ *Writer, err e
 }
 
 func (w *Writer) writeHeader() error {
-	// Per Avro 1.11.3 spec ("Object Container Files → Header"): the
-	// `avro.schema` metadata entry stores the schema of objects in the
-	// file as JSON data. The spec is unqualified — Java writes
-	// Schema.toString() (full JSON via writeProps, preserving
-	// logicalType/precision/scale/doc/aliases/default; DataFileWriter.java
-	// setMetaInternal) and fastavro writes json.dumps(schema) (full
-	// schema dict; _write_py.py metadata["avro.schema"]).
+	// The spec's `avro.schema` entry is the schema as JSON, unqualified. Java
+	// writes Schema.toString() and fastavro json.dumps(schema) — both the full
+	// schema, logicalType/precision/scale/doc/aliases/default included.
 	//
-	// Pre-fix this used Schema.Canonical() — the Parsing Canonical Form
-	// — which the spec defines for FINGERPRINTING (SchemaNormalization
-	// section). PCF [STRIP] strips logicalType, precision, scale, doc,
-	// aliases, default, etc. Three observable consequences:
-	//   1. Downstream consumers relying on the self-describing OCF
-	//      header to convey logical-type info got the raw underlying
-	//      type (e.g. "long" instead of "long+timestamp-millis").
-	//   2. ocf.NewReader(..., WithSchemaOpts(CustomType{LogicalType:X}))
-	//      silently never matched, because the parsed header schema
-	//      had no logicalType to dispatch on.
-	//   3. Schema.Root().Fields[i].Type.Precision on a decoded OCF
-	//      returned 0 even when the writer specified precision=10.
+	// NOT Canonical(), which the spec defines for FINGERPRINTING and whose
+	// [STRIP] rule removes all of those. Stripping them costs the header its
+	// logical types, so a CustomType passed through WithSchemaOpts never
+	// matches and Root().Fields[i].Type.Precision reads 0.
 	//
-	// Schema.String() returns Schema.full = the original JSON passed
-	// to Parse, preserving every attribute that Java/fastavro also
-	// preserve. WithSchema override (w.schemaJSON) is honored for
-	// callers who deliberately want a different header schema text.
+	// Schema.String() is the original JSON passed to Parse. WithSchema
+	// (w.schemaJSON) overrides it for callers who want different header text.
 	schemaBytes := []byte(w.schema.String())
 	if w.schemaJSON != "" {
 		schemaBytes = []byte(w.schemaJSON)
@@ -1247,28 +1229,19 @@ func (rd *Reader) readBlock() error {
 			return errors.New("ocf: sync marker mismatch")
 		}
 		// A count=0 block still requires reading size + data + 16-byte sync
-		// first, per spec ("Each block consists of: count, size, objects,
-		// sync marker") — bailing on count alone would accept a
-		// tail-truncated file whose count byte reads as 0 as a clean end.
-		// Once the sync validates, the empty block is SKIPPED and reading
-		// continues: the spec leaves a block's object count unconstrained
-		// (unlike Avro arrays and maps, whose zero count is an explicit
-		// terminator, file data blocks have none — end of file is simply
-		// end of stream), so io.EOF comes only from the count read at the
-		// top of this loop. fastavro reads past empty blocks the same way
-		// (_read_py.py _iter_avro_records: a count-0 block yields no
-		// records, skip_sync validates the marker, the while loop
-		// continues). Java never writes one (DataFileWriter.writeBlock is
-		// guarded by blockCount > 0) and its for-each reader stops at one —
-		// though a re-called hasNext() advances past it — so treating the
-		// shape as end-of-stream silently truncated files only foreign
-		// writers produce; goavro errors on it, avro-rs stops. The skipped
-		// payload was consumed off the wire (bounded by WithMaxBlockBytes
-		// like any block) but is NOT handed to the codec: there are no
-		// records to decode, so nothing is decompressed. fastavro and Java
-		// both decompress count-0 payloads eagerly and so error on an
-		// undecompressable one that this reader skips — deliberate
-		// leniency, no records are lost either way.
+		// first, per spec: bailing on count alone accepts a tail-truncated
+		// file whose count byte reads 0 as a clean end. Once the sync
+		// validates, skip the empty block and keep reading — a block's object
+		// count is unconstrained, unlike an Avro array's terminating zero, so
+		// io.EOF comes only from the count read at the top of this loop.
+		// fastavro does the same; Java never writes one and its for-each
+		// reader stops, so treating the shape as end-of-stream would silently
+		// truncate files only foreign writers produce.
+		//
+		// The skipped payload is consumed off the wire, bounded like any
+		// block, but never handed to the codec. fastavro and Java decompress
+		// count-0 payloads eagerly and error on an undecompressable one this
+		// reader skips — deliberate leniency; no records are lost either way.
 		if count == 0 {
 			continue
 		}
@@ -1291,27 +1264,17 @@ func (rd *Reader) readBlock() error {
 			// silently shorter file).
 			return fmt.Errorf("ocf: decompressing block: %w", noEOF(err))
 		}
-		// Bound count against the decompressed block length plus a small
-		// slack for zero-byte-record schemas (EmptyRecord, records of all
-		// null-typed fields). Each Avro record encodes to at least 0 bytes;
-		// for non-zero-byte schemas count > len(block) is corruption, and
-		// for zero-byte schemas count can grow unboundedly relative to len
-		// (block) unless capped — without this check a 5-byte zigzag varint
-		// claiming count=10^9 against a zero-byte schema would force the
-		// user's `for rd.Decode(&v) == nil` loop to iterate that many times
-		// (each call advancing rd.block by 0 bytes), producing a ~10^9 CPU
-		// amplification on a tiny attacker input.
+		// Bound count against the decompressed length plus slack for
+		// zero-byte-record schemas. For non-zero-byte schemas count >
+		// len(block) is corruption; for zero-byte ones count is unbounded
+		// relative to len(block), and a 5-byte varint claiming 10^9 makes the
+		// caller's `for rd.Decode(&v) == nil` loop iterate that many times at
+		// 0 bytes each — ~10^9 CPU amplification from a tiny input.
 		//
-		// Mirrors the maxZeroByteItems philosophy in deser.go:558 (Avro
-		// array<null> / array<EmptyRecord> block-count cap): legitimate use
-		// of zero-byte records with more than a few thousand per block is
-		// essentially always a schema-design problem; tighter producers can
-		// split into multiple blocks.
-		//
-		// Java's DataFileStream (DataFileStream.java:303) and fastavro's
-		// _iter_avro_records (_read_py.py:807) leave this uncapped. twmb's
-		// defense-in-depth strategy already applies the same shape to Avro
-		// arrays and maps; OCF blocks are the structural twin.
+		// Same rule as deser.go's maxZeroByteItems: more than a few thousand
+		// zero-byte records per block is a schema-design problem, and a
+		// producer that wants more can split blocks. Java and fastavro leave
+		// this uncapped.
 		if count > int64(len(block))+maxOCFZeroByteSlack {
 			return fmt.Errorf("ocf: block claims %d records but decompressed block is %d bytes (zero-byte slack: %d)",
 				count, len(block), maxOCFZeroByteSlack)
@@ -1338,11 +1301,11 @@ const maxOCFZeroByteSlack = 4 << 10
 // *compressed* size read off the wire (default 64 MiB), and
 // WithMaxDecompressedBlockBytes bounds what that block inflates to.
 //
-// Each built-in codec implements [BoundedDecompressor]: the reader passes its
-// WithMaxDecompressedBlockBytes cap to DecompressBounded, which refuses an
-// over-cap block BEFORE allocating it (a decompression bomb otherwise inflates
-// a tiny compressed block to a huge allocation). Decompress is the unbounded
-// (max == 0) form, kept for the Codec interface and the trusted writer path:
+// Each built-in codec implements [BoundedDecompressor]. The reader passes its
+// cap to DecompressBounded, which refuses an over-cap block BEFORE allocating
+// it; otherwise a decompression bomb inflates a tiny block into a huge
+// allocation. Decompress is the unbounded (max == 0) form, kept for the Codec
+// interface and the trusted writer path:
 //
 //   - snappy: snappy.Decode pre-allocates from a varint header that can declare
 //     up to ~4 GiB inside a 5-byte frame; DecompressBounded rejects via a
@@ -1579,56 +1542,36 @@ func resolveCodec(name string, custom []Codec) (Codec, int, error) {
 // constructors, the last one written for [NewWriter] — so any other supplied
 // codec is dropped.
 //
-// A dropped codec has no owner. The constructor SUCCEEDS, so nothing signals the
-// caller that their codec went unused, and the documented inline form —
-// WithCodec(MustZstdCodec(nil, nil)) — leaves no handle to close it with. That is
-// the same argument that makes a failing constructor release the codec it DID
-// adopt; this is the other half of it, and stating it in one function is what
-// keeps a constructor added later from re-deriving it.
+// A dropped codec has no owner: the constructor SUCCEEDS, so nothing tells the
+// caller it went unused, and the documented inline form
+// WithCodec(MustZstdCodec(nil, nil)) leaves no handle to close it with.
 //
-// adopted is the INDEX of the offer that was taken, or -1 when none was — a
-// built-in resolved by name, or a constructor that failed before it chose, in
-// which case every supplied codec is released. An index rather than a codec
-// value because the position is what the choosers actually decide; but position
-// alone is not enough to decide whether to CLOSE, because the same codec can
-// occupy more than one position. What gets released is therefore each DISTINCT
-// supplied codec other than the adopted one, exactly once:
+// adopted is the INDEX of the taken offer, or -1 when none was, in which case
+// every supplied codec is released. Position is what the choosers decide, but
+// it is not enough to decide whether to CLOSE, since one codec can occupy
+// several positions. Released is each DISTINCT supplied codec but the adopted
+// one, exactly once:
 //
-//   - Skipping the adopted codec by identity, not just by index, is what keeps
-//     WithCodec(c), WithCodec(c) from closing c and then handing back a Writer
-//     that compresses with it. Same on the reader side, where two offers of one
-//     codec can straddle the name match.
-//   - Skipping an earlier identical offer keeps a codec from being closed twice.
-//     [Codec.Close] is documented to release the codec's resources; it is not
-//     documented to be idempotent, and a caller's codec need not be.
+//   - Skip the adopted codec by IDENTITY, not index, or WithCodec(c),
+//     WithCodec(c) closes c and then returns a Writer that compresses with it.
+//   - Skip an earlier identical offer, or the codec is closed twice.
+//     [Codec.Close] is not documented to be idempotent.
 //
-// A nil codec — WithCodec(nil) — is never closed: calling a method on it would
-// panic, and it holds nothing to release. Nil is asked through [isNilCodec]
-// because the interface being non-nil does not mean the codec is: an interface
-// holding a nil *T passes c != nil and then panics inside Close. Nils are also
-// kept out of the repeat bookkeeping below rather than merely left unclosed —
-// recording a nil of an UNCOMPARABLE type would put that TYPE in the seen list
-// and make a later REAL codec of the same type read as a repeat, leaking it.
+// A nil codec is never closed. Ask [isNilCodec], not c != nil: an interface
+// holding a nil *T passes that and panics inside Close. Nils also stay out of
+// the repeat bookkeeping — recording a nil of an UNCOMPARABLE type puts that
+// TYPE in the seen list and makes a later REAL codec of the type read as a
+// repeat, leaking it.
 //
-// Close errors are dropped: this runs on paths that already have an outcome to
-// report (a constructor error, or a Writer/Reader the caller is about to use),
-// and a codec whose Close fails is no more usable than one whose Close was never
-// called.
+// Close errors are dropped; every path here already has an outcome to report.
 //
-// Recognizing repeats is a set-membership question, so a comparable codec goes
-// in a map and costs one lookup — the map's key equality IS the == this would
-// otherwise write by hand. A codec whose dynamic type is UNCOMPARABLE (a struct
-// with a map, slice, or func field) cannot be a key at all, and comparing two of
-// them with == panics rather than answering, so those are tracked separately and
-// matched by TYPE: two values of one uncomparable type cannot be told apart by
-// anything, so identical types answer "same codec". That answer is conservative
-// in the safe direction — "same" means the caller SKIPS a Close, and a skipped
-// Close leaks where a wrong Close hands back a Writer or Reader built on a
-// released codec.
-//
-// The split is on reflect.Type.Comparable, a property of the type, not a guess
-// about how many options a caller writes; the ordinary case (every built-in, and
-// any codec held by pointer) stays linear.
+// Repeats are a set-membership question, so a comparable codec goes in a map. A
+// codec whose dynamic type is UNCOMPARABLE cannot be a key, and == panics on
+// two of them, so those are matched by TYPE instead: two values of one
+// uncomparable type are indistinguishable anyway. That answer is conservative
+// in the safe direction — "same" means SKIP a Close, and a skipped Close leaks
+// where a wrong Close hands back a Writer built on a released codec. The split
+// is on reflect.Type.Comparable, so the ordinary case stays linear.
 func releaseUnadopted(supplied []Codec, adopted int) {
 	var decided map[Codec]bool      // comparable codecs already accounted for
 	var uncomparable []reflect.Type // the rest, tracked by type
