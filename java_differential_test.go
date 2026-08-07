@@ -39,37 +39,7 @@ import (
 // logged rather than failed: there is no Java fingerprint to compare, and the
 // acceptance difference is surfaced for triage rather than asserted away.
 func TestDifferentialJavaFingerprint(t *testing.T) {
-	jar := os.Getenv("AVRO_TOOLS_JAR")
-	if jar == "" {
-		t.Skip("set AVRO_TOOLS_JAR to the avro-tools fat jar to run the Java differential")
-	}
-	javaBin := os.Getenv("AVRO_JAVA")
-	if javaBin == "" {
-		javaBin = "java"
-	}
-	if _, err := exec.LookPath(javaBin); err != nil {
-		t.Skipf("java (%q) not found: %v", javaBin, err)
-	}
-	classDir := os.Getenv("AVRO_ORACLE_CLASSDIR")
-	if classDir == "" {
-		classDir = "testdata/oracle"
-	}
-
-	cmd := exec.Command(javaBin, "-cp", jar+string(os.PathListSeparator)+classDir, "SchemaOracle")
-	in, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("stdin pipe: %v", err)
-	}
-	outPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start SchemaOracle: %v", err)
-	}
-	out := bufio.NewReader(outPipe)
-	t.Cleanup(func() { _ = in.Close(); _ = cmd.Wait() })
+	in, out := schemaOraclePipes(t, "set AVRO_TOOLS_JAR to the avro-tools fat jar to run the Java differential")
 
 	// ask sends one schema to the Java oracle and returns its response.
 	ask := func(t *testing.T, schema string) (ok bool, fp int64, canon, errMsg string) {
@@ -175,37 +145,7 @@ func startMatrixJavaOracle(t *testing.T) (
 	fpCanon func(t *testing.T, schema string) (ok bool, fp int64, canon, errMsg string),
 ) {
 	t.Helper()
-	jar := os.Getenv("AVRO_TOOLS_JAR")
-	if jar == "" {
-		t.Skip("set AVRO_TOOLS_JAR to the avro-tools fat jar to run the Java matrix differential")
-	}
-	javaBin := os.Getenv("AVRO_JAVA")
-	if javaBin == "" {
-		javaBin = "java"
-	}
-	if _, err := exec.LookPath(javaBin); err != nil {
-		t.Skipf("java (%q) not found: %v", javaBin, err)
-	}
-	classDir := os.Getenv("AVRO_ORACLE_CLASSDIR")
-	if classDir == "" {
-		classDir = "testdata/oracle"
-	}
-
-	cmd := exec.Command(javaBin, "-cp", jar+string(os.PathListSeparator)+classDir, "SchemaOracle")
-	in, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("stdin pipe: %v", err)
-	}
-	outPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start SchemaOracle: %v", err)
-	}
-	out := bufio.NewReader(outPipe)
-	t.Cleanup(func() { _ = in.Close(); _ = cmd.Wait() })
+	in, out := schemaOraclePipes(t, "set AVRO_TOOLS_JAR to the avro-tools fat jar to run the Java matrix differential")
 
 	// The oracle protocol is one request line per response line; schemas
 	// composed by the matrix contain newlines, so compact them first.
@@ -489,37 +429,7 @@ func TestDifferentialJavaJSONForm(t *testing.T) {
 // binary re-encode of the same datum.
 func startSchemaOracle(t *testing.T) func(t *testing.T, schema string, binary []byte) (ok bool, jsonOut, binOut []byte, errMsg string) {
 	t.Helper()
-	jar := os.Getenv("AVRO_TOOLS_JAR")
-	if jar == "" {
-		t.Skip("set AVRO_TOOLS_JAR to the avro-tools fat jar to run the Java value differential")
-	}
-	javaBin := os.Getenv("AVRO_JAVA")
-	if javaBin == "" {
-		javaBin = "java"
-	}
-	if _, err := exec.LookPath(javaBin); err != nil {
-		t.Skipf("java (%q) not found: %v", javaBin, err)
-	}
-	classDir := os.Getenv("AVRO_ORACLE_CLASSDIR")
-	if classDir == "" {
-		classDir = "testdata/oracle"
-	}
-
-	cmd := exec.Command(javaBin, "-cp", jar+string(os.PathListSeparator)+classDir, "SchemaOracle")
-	in, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("stdin pipe: %v", err)
-	}
-	outPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start SchemaOracle: %v", err)
-	}
-	out := bufio.NewReader(outPipe)
-	t.Cleanup(func() { _ = in.Close(); _ = cmd.Wait() })
+	in, out := schemaOraclePipes(t, "set AVRO_TOOLS_JAR to the avro-tools fat jar to run the Java value differential")
 
 	return func(t *testing.T, schema string, binary []byte) (ok bool, jsonOut, binOut []byte, errMsg string) {
 		t.Helper()
@@ -1024,4 +934,42 @@ func TestDifferentialJavaAcceptanceAttributePlacement(t *testing.T) {
 			t.Errorf("twmb accepted a stray name on an array; the documented keep-strict posture changed")
 		}
 	})
+}
+
+// startSchemaOracle launches the Java SchemaOracle subprocess and returns its
+// stdin plus a buffered reader over its stdout, skipping when the JVM or the
+// avro-tools jar is unavailable. Cleanup closes stdin and reaps the process.
+func schemaOraclePipes(t *testing.T, skipMsg string) (io.WriteCloser, *bufio.Reader) {
+	t.Helper()
+	jar := os.Getenv("AVRO_TOOLS_JAR")
+	if jar == "" {
+		t.Skip(skipMsg)
+	}
+	javaBin := os.Getenv("AVRO_JAVA")
+	if javaBin == "" {
+		javaBin = "java"
+	}
+	if _, err := exec.LookPath(javaBin); err != nil {
+		t.Skipf("java (%q) not found: %v", javaBin, err)
+	}
+	classDir := os.Getenv("AVRO_ORACLE_CLASSDIR")
+	if classDir == "" {
+		classDir = "testdata/oracle"
+	}
+
+	cmd := exec.Command(javaBin, "-cp", jar+string(os.PathListSeparator)+classDir, "SchemaOracle")
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	outPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start SchemaOracle: %v", err)
+	}
+	t.Cleanup(func() { _ = in.Close(); _ = cmd.Wait() })
+	return in, bufio.NewReader(outPipe)
 }

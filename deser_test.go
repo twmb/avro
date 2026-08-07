@@ -453,18 +453,7 @@ func TestRoundTripArray(t *testing.T) {
 }
 
 func TestRoundTripArrayRecords(t *testing.T) {
-	got := roundTrip(t, superheroUnionSchema, Superhero{
-		ID:            234765,
-		AffiliationID: 9867,
-		Name:          "Wolverine",
-		Life:          85.25,
-		Energy:        32.75,
-		Powers: []*Superpower{
-			{ID: 2345, Name: "Bone Claws", Damage: 5, Energy: 1.15, Passive: false},
-			{ID: 2346, Name: "Regeneration", Damage: -2, Energy: 0.55, Passive: true},
-			{ID: 2347, Name: "Adamant skeleton", Damage: -10, Energy: 0, Passive: true},
-		},
-	})
+	got := roundTrip(t, superheroUnionSchema, wolverine())
 
 	if got.ID != 234765 || got.Name != "Wolverine" {
 		t.Errorf("superhero mismatch: %+v", got)
@@ -1825,18 +1814,7 @@ func TestRoundTripLongWidths(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func BenchmarkDeserialize(b *testing.B) {
-	superhero := Superhero{
-		ID:            234765,
-		AffiliationID: 9867,
-		Name:          "Wolverine",
-		Life:          85.25,
-		Energy:        32.75,
-		Powers: []*Superpower{
-			{ID: 2345, Name: "Bone Claws", Damage: 5, Energy: 1.15, Passive: false},
-			{ID: 2346, Name: "Regeneration", Damage: -2, Energy: 0.55, Passive: true},
-			{ID: 2347, Name: "Adamant skeleton", Damage: -10, Energy: 0, Passive: true},
-		},
-	}
+	superhero := wolverine()
 
 	s, err := Parse(superheroUnionSchema)
 	if err != nil {
@@ -1951,18 +1929,7 @@ func BenchmarkSerializePrimitives(b *testing.B) {
 }
 
 func BenchmarkDeserializeGeneric(b *testing.B) {
-	superhero := Superhero{
-		ID:            234765,
-		AffiliationID: 9867,
-		Name:          "Wolverine",
-		Life:          85.25,
-		Energy:        32.75,
-		Powers: []*Superpower{
-			{ID: 2345, Name: "Bone Claws", Damage: 5, Energy: 1.15, Passive: false},
-			{ID: 2346, Name: "Regeneration", Damage: -2, Energy: 0.55, Passive: true},
-			{ID: 2347, Name: "Adamant skeleton", Damage: -10, Energy: 0, Passive: true},
-		},
-	}
+	superhero := wolverine()
 
 	s, err := Parse(superheroUnionSchema)
 	if err != nil {
@@ -17851,5 +17818,23 @@ func TestInvariant_PresenceStateIsValueTransparent(t *testing.T) {
 				t.Errorf("presence state changed the wire: %x vs %x", ea, eb)
 			}
 		}
+	}
+}
+
+// wolverine returns a fresh Superhero exercising every field of
+// superheroUnionSchema, including a populated union-typed Powers slice. Fresh
+// per call: the slice is caller-mutable.
+func wolverine() Superhero {
+	return Superhero{
+		ID:            234765,
+		AffiliationID: 9867,
+		Name:          "Wolverine",
+		Life:          85.25,
+		Energy:        32.75,
+		Powers: []*Superpower{
+			{ID: 2345, Name: "Bone Claws", Damage: 5, Energy: 1.15, Passive: false},
+			{ID: 2346, Name: "Regeneration", Damage: -2, Energy: 0.55, Passive: true},
+			{ID: 2347, Name: "Adamant skeleton", Damage: -10, Energy: 0, Passive: true},
+		},
 	}
 }
