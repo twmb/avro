@@ -145,13 +145,19 @@ func promotionDeserForLogical(writerKind string, r *schemaNode) deserfn {
 	if r.logical == "" {
 		return nil
 	}
-	switch r.kind {
-	case "long":
-		if writerKind != "int" {
-			// long→float, long→double, float→double don't have
-			// logical-type readers (no logicals on float/double).
-			return nil
-		}
+	// Keyed on the PROMOTION, using the same "writer>reader" key the
+	// promotions table itself is keyed by — not on the reader kind alone.
+	// Each wrapper below reads the WRITER's wire form (a varint for
+	// int→long, a varlong length prefix for string↔bytes) before applying
+	// the reader's conversion, so it is correct only for the exact pair it
+	// is written for. Keying on the pair is what makes that structural: a
+	// promotion added to the table with no arm here falls through to the
+	// bare widening deser instead of reaching a wrapper that would misread
+	// the wire. The pairs absent here have no reachable logical reader —
+	// long→float, long→double and float→double all land on float/double,
+	// which carry no logical types.
+	switch writerKind + ">" + r.kind {
+	case "int>long":
 		switch r.logical {
 		case "timestamp-millis", "local-timestamp-millis":
 			return promoteIntToLongTime(timestampMillisToTime)
@@ -162,20 +168,14 @@ func promotionDeserForLogical(writerKind string, r *schemaNode) deserfn {
 		case "time-micros":
 			return promoteIntToLongTimeMicros
 		}
-	case "bytes":
-		if writerKind != "string" {
-			return nil
-		}
+	case "string>bytes":
 		switch r.logical {
 		case "decimal":
 			return promoteStringToBytesDecimal(r.scale)
 		case "big-decimal":
 			return promoteStringToBytesBigDecimal
 		}
-	case "string":
-		if writerKind != "bytes" {
-			return nil
-		}
+	case "bytes>string":
 		switch r.logical {
 		case "uuid":
 			return promoteBytesToStringUUID
