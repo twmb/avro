@@ -75,19 +75,13 @@ func TestEncodeJSON(t *testing.T) {
 		},
 		{
 			"nested record with union",
-			`{"type":"record","name":"R","fields":[
-				{"name":"name","type":"string"},
-				{"name":"email","type":["null","string"]}
-			]}`,
+			recNameEmailSchema,
 			map[string]any{"name": "Alice", "email": "a@b.com"},
 			`{"name":"Alice","email":"a@b.com"}`,
 		},
 		{
 			"nested record with null union",
-			`{"type":"record","name":"R","fields":[
-				{"name":"name","type":"string"},
-				{"name":"email","type":["null","string"]}
-			]}`,
+			recNameEmailSchema,
 			map[string]any{"name": "Bob", "email": nil},
 			`{"name":"Bob","email":null}`,
 		},
@@ -152,10 +146,7 @@ func TestDecodeJSON(t *testing.T) {
 		},
 		{
 			"record with union",
-			`{"type":"record","name":"R","fields":[
-				{"name":"name","type":"string"},
-				{"name":"email","type":["null","string"]}
-			]}`,
+			recNameEmailSchema,
 			`{"name":"Alice","email":{"string":"a@b.com"}}`,
 			map[string]any{"name": "Alice", "email": "a@b.com"},
 		},
@@ -265,14 +256,7 @@ func TestAvroJSONNamedUnionBranch(t *testing.T) {
 }
 
 func TestDecodeJSONIntoStruct(t *testing.T) {
-	type Record struct {
-		Name  string  `avro:"name"`
-		Email *string `avro:"email"`
-	}
-	schema := `{"type":"record","name":"Record","fields":[
-		{"name":"name","type":"string"},
-		{"name":"email","type":["null","string"]}
-	]}`
+	schema := recordNameEmailSchema
 	s := mustParse(t, schema)
 
 	input := `{"name":"Alice","email":{"string":"a@b.com"}}`
@@ -415,13 +399,7 @@ func TestAvroJSONNamespacedUnionBranch(t *testing.T) {
 
 func TestAvroJSONNestedUnionRecord(t *testing.T) {
 	// Three-level nested record with union fields (like goavro's LongList test).
-	schema := `{
-		"type":"record","name":"Node",
-		"fields":[
-			{"name":"value","type":"int"},
-			{"name":"next","type":["null","Node"]}
-		]
-	}`
+	schema := nodeRecursiveSchema
 	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
@@ -885,9 +863,6 @@ func TestSchemaNodeErrors(t *testing.T) {
 }
 
 func TestEncodeJSONStruct(t *testing.T) {
-	type Inner struct {
-		X int32 `avro:"x"`
-	}
 	type Record struct {
 		Name   string   `avro:"name"`
 		Age    int32    `avro:"age"`
@@ -936,17 +911,7 @@ func TestEncodeJSONStruct(t *testing.T) {
 }
 
 func TestEncodeJSONStructNilPointer(t *testing.T) {
-	type Record struct {
-		Name  string  `avro:"name"`
-		Email *string `avro:"email"`
-	}
-	s := mustParse(t, `{
-		"type":"record","name":"Record",
-		"fields":[
-			{"name":"name","type":"string"},
-			{"name":"email","type":["null","string"]}
-		]
-	}`)
+	s := mustParse(t, recordNameEmailSchema)
 	r := Record{Name: "Bob", Email: nil}
 	encoded := mustEncodeJSON(t, s, &r)
 	var parsed map[string]any
@@ -1588,10 +1553,7 @@ func TestEncodeJSONBareUnionRecord(t *testing.T) {
 }
 
 func TestEncodeJSONRecordMissingRequiredField(t *testing.T) {
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recABSchema
 	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
@@ -2836,10 +2798,7 @@ func TestDecodeJSONTypedDouble(t *testing.T) {
 
 // TestDecodeJSONRecordMap exercises DecodeJSON into map[string]T.
 func TestDecodeJSONRecordMap(t *testing.T) {
-	s, _ := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`)
+	s, _ := Parse(recABSchema)
 	var m map[string]any
 	mustDecodeJSON(t, s, []byte(`{"a":1,"b":"hello"}`), &m)
 	if m["b"] != "hello" {
@@ -2879,9 +2838,7 @@ func TestDecodeJSONUnionBranchTyped(t *testing.T) {
 
 // TestDecodeJSONSkipCompound exercises skipping unknown object/array fields.
 func TestDecodeJSONSkipCompound(t *testing.T) {
-	s, _ := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"}
-	]}`)
+	s, _ := Parse(recASchema)
 	// Extra fields with nested objects and arrays should be skipped.
 	input := `{"a":1,"unknown_obj":{"nested":true},"unknown_arr":[1,2,3]}`
 	var out any
@@ -3943,9 +3900,7 @@ func TestDecodeJSONMapTypedErrors(t *testing.T) {
 
 // TestDecodeJSONIterateRecordFieldsErrors exercises field decode errors.
 func TestDecodeJSONIterateRecordFieldsErrors(t *testing.T) {
-	s, _ := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"}
-	]}`)
+	s, _ := Parse(recASchema)
 	var out any
 	if err := s.DecodeJSON([]byte(`{"a":"notanint"}`), &out); err == nil {
 		t.Fatal("expected error")
@@ -4485,10 +4440,7 @@ func TestDecodeJSONArrayAnyTruncated(t *testing.T) {
 
 // TestDecodeJSONRecordStructBadFieldMapping exercises struct with wrong field types.
 func TestDecodeJSONRecordStructBadFieldMapping(t *testing.T) {
-	s, _ := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`)
+	s, _ := Parse(recABSchema)
 	// Struct where field "a" is tagged but wrong avro field name won't match.
 	// Use a struct with no matching fields to trigger mapping error.
 	type Bad struct {

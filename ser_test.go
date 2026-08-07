@@ -53,40 +53,7 @@ func BenchmarkSerialize(b *testing.B) {
 		},
 	}
 
-	s, err := Parse(`
-
-["null",
-{
-
-"name": "Superhero",
-"type": "record",
-"fields": [
-
-	{"name": "id", "type": "int"},
-	{"name": "affiliation_id", "type": "int"},
-	{"name": "name", "type": "string"},
-	{"name": "life", "type": "float"},
-	{"name": "energy", "type": "float"},
-	{"name": "powers", "type": {
-		"type": "array",
-		"items": {
-			"name": "Superpower",
-			"type": "record",
-			"fields": [
-				{"name": "id", "type": "int"},
-				{"name": "name", "type": "string"},
-				{"name": "damage", "type": "float"},
-				{"name": "energy", "type": "float"},
-				{"name": "passive", "type": "boolean"}
-			]
-		}
-	}}
-]
-
-}
-
-]
-`)
+	s, err := Parse(superheroUnionSchema)
 	if err != nil {
 		b.Fatalf("unable to prime serializer: %v", err)
 	}
@@ -102,10 +69,6 @@ func BenchmarkSerialize(b *testing.B) {
 }
 
 func BenchmarkRecursive(b *testing.B) {
-	type LongList struct {
-		Value int64     `avro:"value"`
-		Next  *LongList `avro:"next"`
-	}
 	llist := LongList{
 		Value: 1,
 		Next: &LongList{
@@ -117,17 +80,7 @@ func BenchmarkRecursive(b *testing.B) {
 		},
 	}
 
-	s, err := Parse(`
-{
-  "type": "record",
-  "name": "LongList",
-  "aliases": ["LinkedLongs"],
-  "fields" : [
-    {"name": "value", "type": "long"},
-    {"name": "next", "type": ["null", "LongList"]}
-  ]
-}
-`)
+	s, err := Parse(longListAliasSchema)
 	if err != nil {
 		b.Fatalf("unable to prime serializer: %v", err)
 	}
@@ -281,10 +234,7 @@ func TestSerEnumErrors(t *testing.T) {
 }
 
 func TestSerRecordAsMap(t *testing.T) {
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recIntBSchema
 
 	t.Run("success", func(t *testing.T) {
 		s := mustParse(t, schema)
@@ -340,10 +290,7 @@ func TestSerRecordMapNullField(t *testing.T) {
 // recoverable via recover). The encoder now bails with a clean error.
 // Both the binary and JSON encoders are covered.
 func TestEncodeCyclicInput(t *testing.T) {
-	s := mustParse(t, `{"type":"record","name":"Node","fields":[
-		{"name":"value","type":"int"},
-		{"name":"next","type":["null","Node"]}
-	]}`)
+	s := mustParse(t, nodeRecursiveSchema)
 	node := map[string]any{"value": int32(1)}
 	node["next"] = node
 	t.Run("binary", func(t *testing.T) {
@@ -423,10 +370,7 @@ func TestEncodeCyclicInput(t *testing.T) {
 // TestEncodeCyclicInput on the decode side. Uses the binary fast-field
 // chain (udNullUnionRecord -> deserRecordFastPtr -> field fn -> ...).
 func TestDecodeDeepInputDoesntPanic(t *testing.T) {
-	s := mustParse(t, `{"type":"record","name":"Node","fields":[
-		{"name":"value","type":"int"},
-		{"name":"next","type":["null","Node"]}
-	]}`)
+	s := mustParse(t, nodeRecursiveSchema)
 	type node struct {
 		Value int32 `avro:"value"`
 		Next  *node `avro:"next"`
@@ -456,10 +400,7 @@ func TestDecodeDeepInputDoesntPanic(t *testing.T) {
 	// Resolved-decode path: same recursive schema for writer and reader,
 	// goes through resolvedRecord.buildDeser which has its own depth bump.
 	t.Run("resolved", func(t *testing.T) {
-		r, err := Parse(`{"type":"record","name":"Node","fields":[
-			{"name":"value","type":"int"},
-			{"name":"next","type":["null","Node"]}
-		]}`)
+		r, err := Parse(nodeRecursiveSchema)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1236,10 +1177,7 @@ func TestSerBytesNonAddressable(t *testing.T) {
 }
 
 func TestSerRecordFieldError(t *testing.T) {
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recIntBSchema
 	type R struct {
 		A int32 `avro:"a"`
 		B int32 `avro:"b"`
@@ -1313,10 +1251,7 @@ func TestSerRecordIndirectError(t *testing.T) {
 
 func TestSerRecordMapFieldError(t *testing.T) {
 	// Record-as-map where the value is wrong type, triggering fn error.
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recIntBSchema
 	m := map[string]any{"a": int32(1), "b": 42} // b should be string
 	encodeErr(t, schema, &m)
 }
@@ -1379,23 +1314,7 @@ func TestInterface(t *testing.T) {
 		S fmt.Stringer `avro:"s"`
 	}
 
-	s, err := Parse(`
-{
-  "type": "record",
-  "name": "iface",
-  "fields" : [
-    {
-      "name": "s", "type": {
-        "type": "record",
-        "name": "Foobar",
-        "fields": [
-          {"name": "f", "type": "int"}
-        ]
-      }
-    }
-  ]
-}
-`)
+	s, err := Parse(ifaceFoobarSchema)
 	if err != nil {
 		t.Fatalf("unable to prime serializer: %v", err)
 	}
@@ -2725,9 +2644,6 @@ func TestRegression_EmbeddedPointerStructNoPanic(t *testing.T) {
 // from the reflect path (which emits null) and from JSON. Such fields now
 // decline to the reflect path.
 func TestRegression_UnsafeMultiPtrNullUnionNil(t *testing.T) {
-	type Inner struct {
-		X int32 `avro:"x"`
-	}
 	s := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"p","type":["null","int"]},
 		{"name":"r","type":["null",{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}]}]}`)

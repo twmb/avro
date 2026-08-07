@@ -9024,9 +9024,6 @@ func nullUnionParity(t *testing.T, schema string, v any, vptr any, wantNull bool
 
 func TestMatrix_NullUnionPtrToNilSliceEncodeParity(t *testing.T) {
 	t.Run("ptr-to-nil-slice/array-null-first", func(t *testing.T) {
-		type Rec struct {
-			F *[]string `avro:"f"`
-		}
 		var nilSlice []string
 		nullUnionParity(t,
 			`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"array","items":"string"}]}]}`,
@@ -9034,9 +9031,6 @@ func TestMatrix_NullUnionPtrToNilSliceEncodeParity(t *testing.T) {
 	})
 
 	t.Run("ptr-to-nil-slice/array-null-second", func(t *testing.T) {
-		type Rec struct {
-			F *[]string `avro:"f"`
-		}
 		var nilSlice []string
 		nullUnionParity(t,
 			`{"type":"record","name":"R","fields":[{"name":"f","type":[{"type":"array","items":"string"},"null"]}]}`,
@@ -9094,9 +9088,6 @@ func TestRegression_NullUnionPtrToNilMapEncodeParity(t *testing.T) {
 func TestRegression_NullUnionPtrToNonNilSliceControl(t *testing.T) {
 	// Control: a non-nil slice behind the pointer is the VALUE branch on every
 	// path; the fix must not regress this (it currently agrees).
-	type Rec struct {
-		F *[]string `avro:"f"`
-	}
 	good := []string{"x"}
 	nullUnionParity(t,
 		`{"type":"record","name":"R","fields":[{"name":"f","type":["null",{"type":"array","items":"string"}]}]}`,

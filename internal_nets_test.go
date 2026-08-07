@@ -3983,10 +3983,7 @@ func hugeBlockCount() []byte { return dosVarlong(1 << 40) }
 
 // recursiveNodeSchema is `record Node { value:int, next:["null",Node] }` — the
 // canonical self-recursive shape for the deep-wire / cyclic-encode cells.
-const recursiveNodeSchema = `{"type":"record","name":"Node","fields":[
-	{"name":"value","type":"int"},
-	{"name":"next","type":["null","Node"]}
-]}`
+const recursiveNodeSchema = nodeRecursiveSchema
 
 // deepRecursiveWire is the binary encoding of `depth` nested Node records,
 // terminated by a null. Decoding it must trip errTooDeep, not recurse the
@@ -5473,10 +5470,7 @@ func init() {
 			{"name":"u2","type":"U"}
 		]}`,
 		// 30: recursive record (linked list via nullable self-reference)
-		`{"type":"record","name":"Node","fields":[
-			{"name":"value","type":"int"},
-			{"name":"next","type":["null","Node"]}
-		]}`,
+		nodeRecursiveSchema,
 		// 31: multi-level nested records (3 levels deep)
 		`{"type":"record","name":"L1","fields":[
 			{"name":"a","type":"int"},
@@ -6262,10 +6256,7 @@ func FuzzSchemaNode(f *testing.F) {
 		`{"type":"map","values":{"type":"enum","name":"E","symbols":["A","B"]}}`,
 		`["null","int","string",{"type":"fixed","name":"F","size":4}]`,
 		// Recursive linked list via self-reference.
-		`{"type":"record","name":"Node","fields":[
-			{"name":"value","type":"int"},
-			{"name":"next","type":["null","Node"]}
-		]}`,
+		nodeRecursiveSchema,
 		// 3-level nested records.
 		`{"type":"record","name":"L1","fields":[
 			{"name":"l2","type":{"type":"record","name":"L2","fields":[
@@ -6915,10 +6906,7 @@ func FuzzDepthBounds(f *testing.F) {
 	f.Add(uint16(10), uint16(maxDepth+50), uint16(0), uint8(6))
 	f.Add(uint16(0), uint16(0), uint16(0), uint8(7))
 
-	recursiveSchema := `{"type":"record","name":"Node","fields":[
-		{"name":"value","type":"int"},
-		{"name":"next","type":["null","Node"]}
-	]}`
+	recursiveSchema := nodeRecursiveSchema
 	rs := mustParse(f, recursiveSchema)
 	type node struct {
 		Value int32 `avro:"value"`
@@ -7808,10 +7796,7 @@ func branchTagFor(n SchemaNode) string {
 // more depth. Fuzz over deeply nested {"tag":{"tag":{...}}} sequences
 // and assert the library terminates (no panic, no stack overflow).
 func FuzzDecodeUnionObjectDeep(f *testing.F) {
-	recursiveSchema := MustParse(`{"type":"record","name":"Node","fields":[
-		{"name":"value","type":"int"},
-		{"name":"next","type":["null","Node"]}
-	]}`)
+	recursiveSchema := MustParse(nodeRecursiveSchema)
 	// Seeds: short, medium, deeper-than-maxDepth.
 	f.Add(uint16(10))
 	f.Add(uint16(100))
@@ -8011,15 +7996,7 @@ func BenchmarkSerializeGeneric(b *testing.B) {
 
 func BenchmarkParseSchema(b *testing.B) {
 	b.Run("Primitives", func(b *testing.B) {
-		schema := `{"type":"record","name":"prims","fields":[
-			{"name":"b","type":"boolean"},
-			{"name":"i","type":"int"},
-			{"name":"l","type":"long"},
-			{"name":"f","type":"float"},
-			{"name":"d","type":"double"},
-			{"name":"s","type":"string"},
-			{"name":"bs","type":"bytes"}
-		]}`
+		schema := primsSchema
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			mustParse(b, schema)
@@ -8147,18 +8124,7 @@ func BenchmarkStringHeavyEncode(b *testing.B) {
 		S9  string `avro:"s9"`
 		S10 string `avro:"s10"`
 	}
-	s := mustParse(b, `{"type":"record","name":"strings","fields":[
-		{"name":"s1","type":"string"},
-		{"name":"s2","type":"string"},
-		{"name":"s3","type":"string"},
-		{"name":"s4","type":"string"},
-		{"name":"s5","type":"string"},
-		{"name":"s6","type":"string"},
-		{"name":"s7","type":"string"},
-		{"name":"s8","type":"string"},
-		{"name":"s9","type":"string"},
-		{"name":"s10","type":"string"}
-	]}`)
+	s := mustParse(b, stringsSchema)
 	input := &StringRecord{
 		S1: strings.Repeat("hello ", 20), S2: strings.Repeat("world ", 20),
 		S3: strings.Repeat("avro ", 20), S4: strings.Repeat("bench ", 20),
@@ -8187,18 +8153,7 @@ func BenchmarkStringHeavyDecode(b *testing.B) {
 		S9  string `avro:"s9"`
 		S10 string `avro:"s10"`
 	}
-	s := mustParse(b, `{"type":"record","name":"strings","fields":[
-		{"name":"s1","type":"string"},
-		{"name":"s2","type":"string"},
-		{"name":"s3","type":"string"},
-		{"name":"s4","type":"string"},
-		{"name":"s5","type":"string"},
-		{"name":"s6","type":"string"},
-		{"name":"s7","type":"string"},
-		{"name":"s8","type":"string"},
-		{"name":"s9","type":"string"},
-		{"name":"s10","type":"string"}
-	]}`)
+	s := mustParse(b, stringsSchema)
 	input := &StringRecord{
 		S1: strings.Repeat("hello ", 20), S2: strings.Repeat("world ", 20),
 		S3: strings.Repeat("avro ", 20), S4: strings.Repeat("bench ", 20),
@@ -8269,12 +8224,7 @@ func BenchmarkCustomTypeEncode(b *testing.B) {
 		ID    int64      `avro:"id"`
 		Price benchMoney `avro:"price"`
 	}
-	s := mustParse(b, `{
-		"type":"record","name":"Order","fields":[
-			{"name":"id","type":"long"},
-			{"name":"price","type":{"type":"long","logicalType":"money"}}
-		]
-	}`, NewCustomType[benchMoney, int64]("money",
+	s := mustParse(b, orderIDPriceSchema, NewCustomType[benchMoney, int64]("money",
 		func(m benchMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
 		func(c int64, _ *SchemaNode) (benchMoney, error) { return benchMoney{Cents: c}, nil },
 	))
@@ -8291,12 +8241,7 @@ func BenchmarkCustomTypeDecode(b *testing.B) {
 		ID    int64      `avro:"id"`
 		Price benchMoney `avro:"price"`
 	}
-	s := mustParse(b, `{
-		"type":"record","name":"Order","fields":[
-			{"name":"id","type":"long"},
-			{"name":"price","type":{"type":"long","logicalType":"money"}}
-		]
-	}`, NewCustomType[benchMoney, int64]("money",
+	s := mustParse(b, orderIDPriceSchema, NewCustomType[benchMoney, int64]("money",
 		func(m benchMoney, _ *SchemaNode) (int64, error) { return m.Cents, nil },
 		func(c int64, _ *SchemaNode) (benchMoney, error) { return benchMoney{Cents: c}, nil },
 	))

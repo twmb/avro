@@ -177,10 +177,6 @@ func TestWireFormatBytes(t *testing.T) {
 }
 
 func TestWireFormatRecord(t *testing.T) {
-	type R struct {
-		A int64  `avro:"a"`
-		B string `avro:"b"`
-	}
 	schema := `{"type":"record","name":"test","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}]}`
 
 	// Record: long 27 (0x36), string "foo" (0x06 0x66 0x6f 0x6f)
@@ -384,9 +380,6 @@ func TestRoundTripRecord(t *testing.T) {
 }
 
 func TestRoundTripNestedRecord(t *testing.T) {
-	type Inner struct {
-		X int32 `avro:"x"`
-	}
 	type Outer struct {
 		Inner Inner  `avro:"inner"`
 		Label string `avro:"label"`
@@ -463,33 +456,7 @@ func TestRoundTripArray(t *testing.T) {
 }
 
 func TestRoundTripArrayRecords(t *testing.T) {
-	got := roundTrip(t, `
-["null",
-{
-"name": "Superhero",
-"type": "record",
-"fields": [
-	{"name": "id", "type": "int"},
-	{"name": "affiliation_id", "type": "int"},
-	{"name": "name", "type": "string"},
-	{"name": "life", "type": "float"},
-	{"name": "energy", "type": "float"},
-	{"name": "powers", "type": {
-		"type": "array",
-		"items": {
-			"name": "Superpower",
-			"type": "record",
-			"fields": [
-				{"name": "id", "type": "int"},
-				{"name": "name", "type": "string"},
-				{"name": "damage", "type": "float"},
-				{"name": "energy", "type": "float"},
-				{"name": "passive", "type": "boolean"}
-			]
-		}
-	}}
-]
-}]`, Superhero{
+	got := roundTrip(t, superheroUnionSchema, Superhero{
 		ID:            234765,
 		AffiliationID: 9867,
 		Name:          "Wolverine",
@@ -549,17 +516,7 @@ func TestRoundTripEnum(t *testing.T) {
 	type Wrapper struct {
 		Color string `avro:"color"`
 	}
-	schema := `{
-		"type": "record",
-		"name": "Wrapper",
-		"fields": [
-			{"name": "color", "type": {
-				"type": "enum",
-				"name": "Color",
-				"symbols": ["RED", "GREEN", "BLUE"]
-			}}
-		]
-	}`
+	schema := enumColorSchema
 	for _, color := range []string{"RED", "GREEN", "BLUE"} {
 		input := Wrapper{Color: color}
 		got := roundTrip(t, schema, input)
@@ -573,17 +530,7 @@ func TestRoundTripEnumInt(t *testing.T) {
 	type Wrapper struct {
 		Color int32 `avro:"color"`
 	}
-	schema := `{
-		"type": "record",
-		"name": "Wrapper",
-		"fields": [
-			{"name": "color", "type": {
-				"type": "enum",
-				"name": "Color",
-				"symbols": ["RED", "GREEN", "BLUE"]
-			}}
-		]
-	}`
+	schema := enumColorSchema
 	input := Wrapper{Color: 1}
 	got := roundTrip(t, schema, input)
 	if got != input {
@@ -613,13 +560,7 @@ func TestRoundTripUnionNull(t *testing.T) {
 	type Wrapper struct {
 		Value *int32 `avro:"value"`
 	}
-	schema := `{
-		"type": "record",
-		"name": "Wrapper",
-		"fields": [
-			{"name": "value", "type": ["null", "int"]}
-		]
-	}`
+	schema := nullableIntSchema
 
 	t.Run("null", func(t *testing.T) {
 		input := Wrapper{Value: nil}
@@ -640,19 +581,7 @@ func TestRoundTripUnionNull(t *testing.T) {
 }
 
 func TestRoundTripRecursive(t *testing.T) {
-	type LongList struct {
-		Value int64     `avro:"value"`
-		Next  *LongList `avro:"next"`
-	}
-	schema := `{
-		"type": "record",
-		"name": "LongList",
-		"aliases": ["LinkedLongs"],
-		"fields" : [
-			{"name": "value", "type": "long"},
-			{"name": "next", "type": ["null", "LongList"]}
-		]
-	}`
+	schema := longListAliasSchema
 	input := LongList{
 		Value: 1,
 		Next: &LongList{
@@ -682,21 +611,7 @@ func TestRoundTripInterface(t *testing.T) {
 	type Iface struct {
 		S fmt.Stringer `avro:"s"`
 	}
-	schema := `{
-		"type": "record",
-		"name": "iface",
-		"fields" : [
-			{
-				"name": "s", "type": {
-					"type": "record",
-					"name": "Foobar",
-					"fields": [
-						{"name": "f", "type": "int"}
-					]
-				}
-			}
-		]
-	}`
+	schema := ifaceFoobarSchema
 	s := mustParse(t, schema)
 	input := Iface{S: &IfaceF{F: 3}}
 	encoded := mustAppendEncode(t, s, nil, &input)
@@ -843,9 +758,7 @@ func TestDecodeShortBuffer(t *testing.T) {
 		type R struct {
 			ID [16]byte `avro:"id"`
 		}
-		s := MustParse(`{"type":"record","name":"R","fields":[
-			{"name":"id","type":{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}}
-		]}`)
+		s := MustParse(recUUIDFixedSchema)
 		var r R
 		_, err := s.Decode([]byte{0x01, 0x02, 0x03}, &r)
 		if err == nil {
@@ -856,9 +769,7 @@ func TestDecodeShortBuffer(t *testing.T) {
 		type R struct {
 			ID string `avro:"id"`
 		}
-		s := MustParse(`{"type":"record","name":"R","fields":[
-			{"name":"id","type":{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}}
-		]}`)
+		s := MustParse(recUUIDFixedSchema)
 		var r R
 		_, err := s.Decode([]byte{0x01, 0x02, 0x03}, &r)
 		if err == nil {
@@ -869,9 +780,7 @@ func TestDecodeShortBuffer(t *testing.T) {
 		type R struct {
 			ID string `avro:"id"`
 		}
-		s := MustParse(`{"type":"record","name":"R","fields":[
-			{"name":"id","type":{"type":"fixed","name":"u","size":16,"logicalType":"uuid"}}
-		]}`)
+		s := MustParse(recUUIDFixedSchema)
 		_, err := s.Encode(&R{ID: "not-a-uuid"})
 		if err == nil {
 			t.Fatal("expected error for bad UUID string")
@@ -945,10 +854,6 @@ func TestDecodeNonPointer(t *testing.T) {
 
 func TestDecodeRecordNilPointer(t *testing.T) {
 	// Decode into **Record where the inner pointer is nil → allocate through it.
-	type R struct {
-		A int64  `avro:"a"`
-		B string `avro:"b"`
-	}
 	schema := `{"type":"record","name":"r","fields":[{"name":"a","type":"long"},{"name":"b","type":"string"}]}`
 	data := []byte{0x36, 0x06, 0x66, 0x6f, 0x6f} // {a:27, b:"foo"}
 
@@ -1019,10 +924,6 @@ func TestDecodeEmbeddedPointerStructPreset(t *testing.T) {
 
 func TestDecodeTypeReference(t *testing.T) {
 	// Schema defines a named record, then references it by name.
-	type R struct {
-		A int64  `avro:"a"`
-		B string `avro:"b"`
-	}
 	type Parent struct {
 		X R `avro:"x"`
 		Y R `avro:"y"`
@@ -1112,10 +1013,6 @@ func TestDecodeUnionRecursive(t *testing.T) {
 }
 
 func TestDecodeMapOfStruct(t *testing.T) {
-	type R struct {
-		A int64  `avro:"a"`
-		B string `avro:"b"`
-	}
 	schema := `{"type":"map","values":{"type":"record","name":"r","fields":[
 		{"name":"a","type":"long"},{"name":"b","type":"string"}
 	]}}`
@@ -1127,10 +1024,6 @@ func TestDecodeMapOfStruct(t *testing.T) {
 }
 
 func TestDecodeArrayOfStruct(t *testing.T) {
-	type R struct {
-		A int64  `avro:"a"`
-		B string `avro:"b"`
-	}
 	schema := `{"type":"array","items":{"type":"record","name":"r","fields":[
 		{"name":"a","type":"long"},{"name":"b","type":"string"}
 	]}}`
@@ -1179,10 +1072,6 @@ func TestDecodeUnionNullableBytes(t *testing.T) {
 
 func TestDecodeUnionPtrReuse(t *testing.T) {
 	// When decoding a union into a pre-existing pointer, reuse the allocation.
-	type R struct {
-		A int64  `avro:"a"`
-		B string `avro:"b"`
-	}
 	schema := `["null",{"type":"record","name":"r","fields":[
 		{"name":"a","type":"long"},{"name":"b","type":"string"}
 	]}]`
@@ -1202,10 +1091,7 @@ func TestDecodeUnionPtrReuse(t *testing.T) {
 
 func TestDecodeRecordIntoMap(t *testing.T) {
 	// Decode a record schema into map[string]any.
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"long"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recLongBSchema
 	data := []byte{0x36, 0x06, 0x66, 0x6f, 0x6f} // a=27, b="foo"
 
 	var got map[string]any
@@ -1219,27 +1105,18 @@ func TestDecodeRecordIntoMap(t *testing.T) {
 }
 
 func TestDecodeRecordMapInvalidKey(t *testing.T) {
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"long"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recLongBSchema
 	decodeErr(t, schema, []byte{0x36, 0x06, 0x66, 0x6f, 0x6f}, ptr(map[int]any{}))
 }
 
 func TestDecodeRecordMapInvalidElem(t *testing.T) {
 	// map[string]string cannot hold a long value.
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"long"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recLongBSchema
 	decodeErr(t, schema, []byte{0x36, 0x06, 0x66, 0x6f, 0x6f}, ptr(map[string]string{}))
 }
 
 func TestDecodeRecordMapInvalidData(t *testing.T) {
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"long"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recLongBSchema
 	// Corrupt varint for field "a".
 	decodeErr(t, schema, []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, ptr(map[string]any{}))
 }
@@ -1344,14 +1221,7 @@ func TestDecodeEnumCorruptVarint(t *testing.T) {
 }
 
 func TestDecodeRecordStructInvalidData(t *testing.T) {
-	type R struct {
-		A int64  `avro:"a"`
-		B string `avro:"b"`
-	}
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"long"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recLongBSchema
 	// Corrupt varint.
 	decodeErr(t, schema, []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}, ptr(R{}))
 }
@@ -1608,18 +1478,12 @@ func TestDecodeMapKeyInvalid(t *testing.T) {
 
 func TestTypeFieldMappingAvroSkip(t *testing.T) {
 	// Fields tagged avro:"-" are skipped, both for regular and embedded fields.
-	type Embed struct {
-		A int32 `avro:"a"`
-	}
 	type R struct {
 		Embed
 		B       string `avro:"b"`
 		Ignored int    `avro:"-"`
 	}
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recIntBSchema
 	input := R{Embed: Embed{A: 42}, B: "hello"}
 	got := roundTrip(t, schema, input)
 	if got.A != 42 || got.B != "hello" {
@@ -1629,9 +1493,6 @@ func TestTypeFieldMappingAvroSkip(t *testing.T) {
 
 func TestTypeFieldMappingEmbedWithTag(t *testing.T) {
 	// Embedded struct with explicit avro tag is treated as a named field.
-	type Inner struct {
-		X int32 `avro:"x"`
-	}
 	type Outer struct {
 		Inner `avro:"inner"`
 	}
@@ -1805,10 +1666,7 @@ func TestDecodeBytesShortRead(t *testing.T) {
 
 func TestDecodeRecordIntoInterfaceWithError(t *testing.T) {
 	// Record decoded into any, but with corrupt field data.
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"long"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recLongBSchema
 	// Corrupt varlong for field "a".
 	data := []byte{0xE2, 0xA2, 0xF3, 0xAD, 0xAD, 0xAD, 0xE2, 0xA2, 0xF3, 0xAD, 0xAD}
 	var got any
@@ -1817,10 +1675,7 @@ func TestDecodeRecordIntoInterfaceWithError(t *testing.T) {
 
 func TestDecodeRecordIntoInterfaceSuccess(t *testing.T) {
 	// Record decoded into any should produce map[string]any.
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recIntBSchema
 	data := []byte{0x04, 0x06, 0x66, 0x6f, 0x6f} // a=2, b="foo"
 	var got any
 	decode(t, schema, data, &got)
@@ -2013,31 +1868,7 @@ func BenchmarkDeserialize(b *testing.B) {
 		},
 	}
 
-	s, err := Parse(`["null", {
-"name": "Superhero",
-"type": "record",
-"fields": [
-	{"name": "id", "type": "int"},
-	{"name": "affiliation_id", "type": "int"},
-	{"name": "name", "type": "string"},
-	{"name": "life", "type": "float"},
-	{"name": "energy", "type": "float"},
-	{"name": "powers", "type": {
-		"type": "array",
-		"items": {
-			"name": "Superpower",
-			"type": "record",
-			"fields": [
-				{"name": "id", "type": "int"},
-				{"name": "name", "type": "string"},
-				{"name": "damage", "type": "float"},
-				{"name": "energy", "type": "float"},
-				{"name": "passive", "type": "boolean"}
-			]
-		}
-	}}
-]
-}]`)
+	s, err := Parse(superheroUnionSchema)
 	if err != nil {
 		b.Fatalf("unable to prime: %v", err)
 	}
@@ -2072,10 +1903,6 @@ func BenchmarkDeserialize(b *testing.B) {
 }
 
 func BenchmarkDeserializeRecursive(b *testing.B) {
-	type LongList struct {
-		Value int64     `avro:"value"`
-		Next  *LongList `avro:"next"`
-	}
 	llist := LongList{
 		Value: 1,
 		Next: &LongList{
@@ -2087,15 +1914,7 @@ func BenchmarkDeserializeRecursive(b *testing.B) {
 		},
 	}
 
-	s, err := Parse(`{
-		"type": "record",
-		"name": "LongList",
-		"aliases": ["LinkedLongs"],
-		"fields" : [
-			{"name": "value", "type": "long"},
-			{"name": "next", "type": ["null", "LongList"]}
-		]
-	}`)
+	s, err := Parse(longListAliasSchema)
 	if err != nil {
 		b.Fatalf("unable to prime: %v", err)
 	}
@@ -2126,17 +1945,7 @@ func BenchmarkDeserializePrimitives(b *testing.B) {
 		S  string  `avro:"s"`
 		Bs []byte  `avro:"bs"`
 	}
-	s := mustParse(b, `{
-		"type":"record","name":"prims","fields":[
-			{"name":"b","type":"boolean"},
-			{"name":"i","type":"int"},
-			{"name":"l","type":"long"},
-			{"name":"f","type":"float"},
-			{"name":"d","type":"double"},
-			{"name":"s","type":"string"},
-			{"name":"bs","type":"bytes"}
-		]
-	}`)
+	s := mustParse(b, primsSchema)
 
 	input := Prims{B: true, I: 42, L: 123456789, F: 3.14, D: 2.718281828, S: "hello world", Bs: []byte{1, 2, 3, 4, 5}}
 	encoded := mustAppendEncode(b, s, nil, &input)
@@ -2160,17 +1969,7 @@ func BenchmarkSerializePrimitives(b *testing.B) {
 		S  string  `avro:"s"`
 		Bs []byte  `avro:"bs"`
 	}
-	s := mustParse(b, `{
-		"type":"record","name":"prims","fields":[
-			{"name":"b","type":"boolean"},
-			{"name":"i","type":"int"},
-			{"name":"l","type":"long"},
-			{"name":"f","type":"float"},
-			{"name":"d","type":"double"},
-			{"name":"s","type":"string"},
-			{"name":"bs","type":"bytes"}
-		]
-	}`)
+	s := mustParse(b, primsSchema)
 
 	input := Prims{B: true, I: 42, L: 123456789, F: 3.14, D: 2.718281828, S: "hello world", Bs: []byte{1, 2, 3, 4, 5}}
 	dst, _ := s.AppendEncode(nil, &input)
@@ -2195,31 +1994,7 @@ func BenchmarkDeserializeGeneric(b *testing.B) {
 		},
 	}
 
-	s, err := Parse(`["null", {
-"name": "Superhero",
-"type": "record",
-"fields": [
-	{"name": "id", "type": "int"},
-	{"name": "affiliation_id", "type": "int"},
-	{"name": "name", "type": "string"},
-	{"name": "life", "type": "float"},
-	{"name": "energy", "type": "float"},
-	{"name": "powers", "type": {
-		"type": "array",
-		"items": {
-			"name": "Superpower",
-			"type": "record",
-			"fields": [
-				{"name": "id", "type": "int"},
-				{"name": "name", "type": "string"},
-				{"name": "damage", "type": "float"},
-				{"name": "energy", "type": "float"},
-				{"name": "passive", "type": "boolean"}
-			]
-		}
-	}}
-]
-}]`)
+	s, err := Parse(superheroUnionSchema)
 	if err != nil {
 		b.Fatalf("unable to prime: %v", err)
 	}
@@ -3115,9 +2890,6 @@ func TestRoundTripArrayNullUnionPrimitive(t *testing.T) {
 // TestTopLevelArrayPtrDecode covers the reflect slow path for deserArray
 // when decoding a top-level array into []*T (batch pointer alloc path).
 func TestTopLevelArrayPtrDecode(t *testing.T) {
-	type Rec struct {
-		V int32 `avro:"v"`
-	}
 	schema := `{"type": "array", "items": {
 		"type": "record", "name": "Rec",
 		"fields": [{"name": "v", "type": "int"}]
@@ -3188,11 +2960,7 @@ func TestUnsafeNullUnionErrors(t *testing.T) {
 	type Wrapper struct {
 		Value *int32 `avro:"value"`
 	}
-	schema := `{
-		"type": "record",
-		"name": "Wrapper",
-		"fields": [{"name": "value", "type": ["null", "int"]}]
-	}`
+	schema := nullableIntSchema
 	s := mustParse(t, schema)
 
 	t.Run("short_buffer", func(t *testing.T) {
@@ -3222,17 +2990,7 @@ func TestUnsafeRecordFastPtrError(t *testing.T) {
 	type Outer struct {
 		Item *Inner `avro:"item"`
 	}
-	schema := `{
-		"type": "record",
-		"name": "Outer",
-		"fields": [{"name": "item", "type": ["null", {
-			"type": "record", "name": "Inner",
-			"fields": [
-				{"name": "x", "type": "int"},
-				{"name": "y", "type": "string"}
-			]
-		}]}]
-	}`
+	schema := nullableInnerSchema
 	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
@@ -3259,14 +3017,7 @@ func TestUnsafeRecordFastPtrError(t *testing.T) {
 // and struct-field round-trips (int, string).
 func TestArrayPrimitiveRoundTrips(t *testing.T) {
 	t.Run("int", func(t *testing.T) {
-		type Wrapper struct {
-			Vals []int32 `avro:"vals"`
-		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
-		}`
+		schema := arrayOfIntSchema
 		input := Wrapper{Vals: []int32{10, 20, 30}}
 		got := roundTrip(t, schema, input)
 		if !reflect.DeepEqual(got.Vals, input.Vals) {
@@ -4348,33 +4099,7 @@ func TestArrayRecordValueDeser(t *testing.T) {
 // goes through the serRecordFastPtr / deserRecordFastPtr branches inside
 // array and null-union callers after the inner record's fast path is compiled.
 func TestWarmFastPathArrayPtrRecord(t *testing.T) {
-	schema := `
-["null",
-{
-"name": "Superhero",
-"type": "record",
-"fields": [
-	{"name": "id", "type": "int"},
-	{"name": "affiliation_id", "type": "int"},
-	{"name": "name", "type": "string"},
-	{"name": "life", "type": "float"},
-	{"name": "energy", "type": "float"},
-	{"name": "powers", "type": {
-		"type": "array",
-		"items": {
-			"name": "Superpower",
-			"type": "record",
-			"fields": [
-				{"name": "id", "type": "int"},
-				{"name": "name", "type": "string"},
-				{"name": "damage", "type": "float"},
-				{"name": "energy", "type": "float"},
-				{"name": "passive", "type": "boolean"}
-			]
-		}
-	}}
-]
-}]`
+	schema := superheroUnionSchema
 	s := mustParse(t, schema)
 	hero := Superhero{
 		ID: 1, AffiliationID: 2, Name: "X", Life: 1, Energy: 2,
@@ -4398,18 +4123,7 @@ func TestWarmFastPathArrayPtrRecord(t *testing.T) {
 // record field to exercise the allFast serRecordFastPtr / deserRecordFastPtr
 // branches inside usNullUnionRecord / udNullUnionRecord.
 func TestWarmFastPathNullUnionRecord(t *testing.T) {
-	type LongList struct {
-		Value int64     `avro:"value"`
-		Next  *LongList `avro:"next"`
-	}
-	schema := `{
-		"type": "record",
-		"name": "LongList",
-		"fields": [
-			{"name": "value", "type": "long"},
-			{"name": "next", "type": ["null", "LongList"]}
-		]
-	}`
+	schema := longListSchema
 	s := mustParse(t, schema)
 	input := LongList{Value: 1, Next: &LongList{Value: 2}}
 	// First pass: compiles fast paths.
@@ -4429,9 +4143,6 @@ func TestWarmFastPathNullUnionRecord(t *testing.T) {
 // of null-union records to exercise the allFast branch inside
 // usArrayNullUnionRecord.
 func TestWarmFastPathArrayNullUnionRecord(t *testing.T) {
-	type Inner struct {
-		X int32 `avro:"x"`
-	}
 	type Outer struct {
 		Items []*Inner `avro:"items"`
 	}
@@ -4547,17 +4258,7 @@ func TestDeserRecordFastPtrError(t *testing.T) {
 	type Outer struct {
 		Item *Inner `avro:"item"`
 	}
-	schema := `{
-		"type": "record",
-		"name": "Outer",
-		"fields": [{"name": "item", "type": ["null", {
-			"type": "record", "name": "Inner",
-			"fields": [
-				{"name": "x", "type": "int"},
-				{"name": "y", "type": "string"}
-			]
-		}]}]
-	}`
+	schema := nullableInnerSchema
 	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
@@ -4581,9 +4282,6 @@ func TestDeserRecordFastPtrError(t *testing.T) {
 // TestArrayPtrRecordNilError covers the nil pointer error in usArrayPtrRecord
 // when an array element is nil but the schema items are a record (not null-union).
 func TestArrayPtrRecordNilError(t *testing.T) {
-	type Inner struct {
-		X int32 `avro:"x"`
-	}
 	type Outer struct {
 		Items []*Inner `avro:"items"`
 	}
@@ -4612,14 +4310,7 @@ func TestArrayPtrRecordNilError(t *testing.T) {
 func TestArrayNegativeCountBlock(t *testing.T) {
 	// Test with a value array ([]int32) to exercise udArrayDirect.
 	t.Run("direct", func(t *testing.T) {
-		type Wrapper struct {
-			Vals []int32 `avro:"vals"`
-		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
-		}`
+		schema := arrayOfIntSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -4655,20 +4346,10 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 
 	// Test with ptr record array to exercise udArrayPtrRecord.
 	t.Run("ptr_record", func(t *testing.T) {
-		type Rec struct {
-			V int32 `avro:"v"`
-		}
 		type Wrapper struct {
 			Items []*Rec `avro:"items"`
 		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "items", "type": {"type": "array", "items": {
-				"type": "record", "name": "Rec",
-				"fields": [{"name": "v", "type": "int"}]
-			}}}]
-		}`
+		schema := arrayOfPtrRecSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -4704,14 +4385,7 @@ func TestArrayNegativeCountBlock(t *testing.T) {
 // by feeding a two-block array through the fast deser path.
 func TestArrayMultiBlockDeser(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
-		type Wrapper struct {
-			Vals []int32 `avro:"vals"`
-		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
-		}`
+		schema := arrayOfIntSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -4739,20 +4413,10 @@ func TestArrayMultiBlockDeser(t *testing.T) {
 	})
 
 	t.Run("ptr_record", func(t *testing.T) {
-		type Rec struct {
-			V int32 `avro:"v"`
-		}
 		type Wrapper struct {
 			Items []*Rec `avro:"items"`
 		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "items", "type": {"type": "array", "items": {
-				"type": "record", "name": "Rec",
-				"fields": [{"name": "v", "type": "int"}]
-			}}}]
-		}`
+		schema := arrayOfPtrRecSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -4786,14 +4450,7 @@ func TestArrayMultiBlockDeser(t *testing.T) {
 // udArrayPtrRecord when the data is truncated mid-element.
 func TestArrayDeserTruncatedData(t *testing.T) {
 	t.Run("direct_truncated_count", func(t *testing.T) {
-		type Wrapper struct {
-			Vals []int32 `avro:"vals"`
-		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
-		}`
+		schema := arrayOfIntSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -4813,20 +4470,10 @@ func TestArrayDeserTruncatedData(t *testing.T) {
 	})
 
 	t.Run("ptr_record_truncated", func(t *testing.T) {
-		type Rec struct {
-			V int32 `avro:"v"`
-		}
 		type Wrapper struct {
 			Items []*Rec `avro:"items"`
 		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "items", "type": {"type": "array", "items": {
-				"type": "record", "name": "Rec",
-				"fields": [{"name": "v", "type": "int"}]
-			}}}]
-		}`
+		schema := arrayOfPtrRecSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -4849,14 +4496,7 @@ func TestArrayDeserTruncatedData(t *testing.T) {
 	})
 
 	t.Run("direct_truncated_readvarlong", func(t *testing.T) {
-		type Wrapper struct {
-			Vals []int32 `avro:"vals"`
-		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
-		}`
+		schema := arrayOfIntSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -4871,20 +4511,10 @@ func TestArrayDeserTruncatedData(t *testing.T) {
 	})
 
 	t.Run("ptr_record_truncated_readvarlong", func(t *testing.T) {
-		type Rec struct {
-			V int32 `avro:"v"`
-		}
 		type Wrapper struct {
 			Items []*Rec `avro:"items"`
 		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "items", "type": {"type": "array", "items": {
-				"type": "record", "name": "Rec",
-				"fields": [{"name": "v", "type": "int"}]
-			}}}]
-		}`
+		schema := arrayOfPtrRecSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -4910,14 +4540,7 @@ func TestArraySerError(t *testing.T) {
 	type Outer struct {
 		Items []Inner `avro:"items"` // value slice, not ptr slice
 	}
-	schema := `{
-		"type": "record",
-		"name": "Outer",
-		"fields": [{"name": "items", "type": {"type": "array", "items": {
-			"type": "record", "name": "Inner",
-			"fields": [{"name": "p", "type": "int"}]
-		}}}]
-	}`
+	schema := arrayOfPtrInnerSchema
 	s, err := Parse(schema)
 	if err != nil {
 		t.Fatal(err)
@@ -4935,11 +4558,7 @@ func TestNonPtrNullUnionField(t *testing.T) {
 	type Wrapper struct {
 		Value int32 `avro:"value"` // non-pointer for ["null","int"]
 	}
-	schema := `{
-		"type": "record",
-		"name": "Wrapper",
-		"fields": [{"name": "value", "type": ["null", "int"]}]
-	}`
+	schema := nullableIntSchema
 	s := mustParse(t, schema)
 	input := Wrapper{Value: 42}
 	encoded := mustAppendEncode(t, s, nil, &input)
@@ -4993,20 +4612,10 @@ func TestNullUnionMapField(t *testing.T) {
 
 // TestArrayEmptyPtrRecord covers the n==0 early return in usArrayPtrRecord.
 func TestArrayEmptyPtrRecord(t *testing.T) {
-	type Rec struct {
-		V int32 `avro:"v"`
-	}
 	type Wrapper struct {
 		Items []*Rec `avro:"items"`
 	}
-	schema := `{
-		"type": "record",
-		"name": "Wrapper",
-		"fields": [{"name": "items", "type": {"type": "array", "items": {
-			"type": "record", "name": "Rec",
-			"fields": [{"name": "v", "type": "int"}]
-		}}}]
-	}`
+	schema := arrayOfPtrRecSchema
 	input := Wrapper{Items: []*Rec{}}
 	got := roundTrip(t, schema, input)
 	if len(got.Items) != 0 {
@@ -5017,18 +4626,7 @@ func TestArrayEmptyPtrRecord(t *testing.T) {
 // TestUdNullUnionRecordErrors covers error paths in udNullUnionRecord
 // after the fast path has been warmed up.
 func TestUdNullUnionRecordErrors(t *testing.T) {
-	type LongList struct {
-		Value int64     `avro:"value"`
-		Next  *LongList `avro:"next"`
-	}
-	schema := `{
-		"type": "record",
-		"name": "LongList",
-		"fields": [
-			{"name": "value", "type": "long"},
-			{"name": "next", "type": ["null", "LongList"]}
-		]
-	}`
+	schema := longListSchema
 	s := mustParse(t, schema)
 	// Warm up: encode/decode twice to compile inner fast path.
 	input := LongList{Value: 1, Next: &LongList{Value: 2}}
@@ -5072,14 +4670,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		type Outer struct {
 			Items []*Inner `avro:"items"`
 		}
-		schema := `{
-			"type": "record",
-			"name": "Outer",
-			"fields": [{"name": "items", "type": {"type": "array", "items": {
-				"type": "record", "name": "Inner",
-				"fields": [{"name": "p", "type": "int"}]
-			}}}]
-		}`
+		schema := arrayOfPtrInnerSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -5106,14 +4697,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		type Outer struct {
 			Items []*Inner `avro:"items"`
 		}
-		schema := `{
-			"type": "record",
-			"name": "Outer",
-			"fields": [{"name": "items", "type": {"type": "array", "items": ["null", {
-				"type": "record", "name": "Inner",
-				"fields": [{"name": "p", "type": "int"}]
-			}]}}]
-		}`
+		schema := arrayOfNullableInnerSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -5140,14 +4724,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		type Outer struct {
 			Items []Inner `avro:"items"` // value slice
 		}
-		schema := `{
-			"type": "record",
-			"name": "Outer",
-			"fields": [{"name": "items", "type": {"type": "array", "items": {
-				"type": "record", "name": "Inner",
-				"fields": [{"name": "p", "type": "int"}]
-			}}}]
-		}`
+		schema := arrayOfPtrInnerSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -5172,14 +4749,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		type Outer struct {
 			Items []Inner `avro:"items"` // value slice
 		}
-		schema := `{
-			"type": "record",
-			"name": "Outer",
-			"fields": [{"name": "items", "type": {"type": "array", "items": {
-				"type": "record", "name": "Inner",
-				"fields": [{"name": "p", "type": "int"}]
-			}}}]
-		}`
+		schema := arrayOfPtrInnerSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -5201,14 +4771,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 		type Outer struct {
 			Items []*Inner `avro:"items"`
 		}
-		schema := `{
-			"type": "record",
-			"name": "Outer",
-			"fields": [{"name": "items", "type": {"type": "array", "items": ["null", {
-				"type": "record", "name": "Inner",
-				"fields": [{"name": "p", "type": "int"}]
-			}]}}]
-		}`
+		schema := arrayOfNullableInnerSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -5229,14 +4792,7 @@ func TestArraySerErrorWarm(t *testing.T) {
 // variable, so the second decode reuses the existing slice capacity.
 func TestArrayReusedSliceCap(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
-		type Wrapper struct {
-			Vals []int32 `avro:"vals"`
-		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
-		}`
+		schema := arrayOfIntSchema
 		s := mustParse(t, schema)
 		big := Wrapper{Vals: []int32{1, 2, 3, 4, 5}}
 		encBig, _ := s.AppendEncode(nil, &big)
@@ -5253,20 +4809,10 @@ func TestArrayReusedSliceCap(t *testing.T) {
 	})
 
 	t.Run("ptr_record", func(t *testing.T) {
-		type Rec struct {
-			V int32 `avro:"v"`
-		}
 		type Wrapper struct {
 			Items []*Rec `avro:"items"`
 		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "items", "type": {"type": "array", "items": {
-				"type": "record", "name": "Rec",
-				"fields": [{"name": "v", "type": "int"}]
-			}}}]
-		}`
+		schema := arrayOfPtrRecSchema
 		s := mustParse(t, schema)
 		big := Wrapper{Items: []*Rec{{V: 1}, {V: 2}, {V: 3}}}
 		encBig, _ := s.AppendEncode(nil, &big)
@@ -5287,14 +4833,7 @@ func TestArrayReusedSliceCap(t *testing.T) {
 // negative count block has a truncated byte-size field.
 func TestArrayNegativeCountReadVarlongError(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
-		type Wrapper struct {
-			Vals []int32 `avro:"vals"`
-		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "vals", "type": {"type": "array", "items": "int"}}]
-		}`
+		schema := arrayOfIntSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -5313,20 +4852,10 @@ func TestArrayNegativeCountReadVarlongError(t *testing.T) {
 	})
 
 	t.Run("ptr_record", func(t *testing.T) {
-		type Rec struct {
-			V int32 `avro:"v"`
-		}
 		type Wrapper struct {
 			Items []*Rec `avro:"items"`
 		}
-		schema := `{
-			"type": "record",
-			"name": "Wrapper",
-			"fields": [{"name": "items", "type": {"type": "array", "items": {
-				"type": "record", "name": "Rec",
-				"fields": [{"name": "v", "type": "int"}]
-			}}}]
-		}`
+		schema := arrayOfPtrRecSchema
 		s, err := Parse(schema)
 		if err != nil {
 			t.Fatal(err)
@@ -5375,14 +4904,7 @@ func TestRecordMappedToMap(t *testing.T) {
 	type Outer struct {
 		Inner map[string]any `avro:"inner"`
 	}
-	schema := `{
-		"type": "record",
-		"name": "Outer",
-		"fields": [{"name": "inner", "type": {
-			"type": "record", "name": "Inner",
-			"fields": [{"name": "x", "type": "int"}]
-		}}]
-	}`
+	schema := nestedInnerSchema
 	s := mustParse(t, schema)
 	input := Outer{Inner: map[string]any{"x": int32(42)}}
 	encoded := mustAppendEncode(t, s, nil, &input)
@@ -5570,9 +5092,6 @@ func TestAdversarialArrayCountLie(t *testing.T) {
 	})
 
 	t.Run("ptr_record", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type R struct {
 			Items []*Inner `avro:"items"`
 		}
@@ -5653,9 +5172,6 @@ func TestAdversarialMinInt64BlockCount(t *testing.T) {
 	})
 
 	t.Run("array_unsafe_ptr_record", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type R struct {
 			Items []*Inner `avro:"items"`
 		}
@@ -5729,9 +5245,6 @@ func TestAdversarialNullUnionBadIndex(t *testing.T) {
 	})
 
 	t.Run("record", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type R struct {
 			V *Inner `avro:"v"`
 		}
@@ -6674,10 +6187,7 @@ func TestInlineTag(t *testing.T) {
 	type Outer struct {
 		Inner Inner `avro:",inline"`
 	}
-	schema := `{"type":"record","name":"r","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`
+	schema := recIntBSchema
 
 	got := roundTrip(t, schema, Outer{Inner: Inner{A: 42, B: "hello"}})
 	if got.Inner.A != 42 || got.Inner.B != "hello" {
@@ -8445,9 +7955,7 @@ func TestUUIDStringInRecord(t *testing.T) {
 	type R struct {
 		ID string `avro:"id"`
 	}
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
-	]}`
+	schema := recUUIDStringSchema
 	input := R{ID: "550e8400-e29b-41d4-a716-446655440000"}
 	got := roundTrip(t, schema, input)
 	if got.ID != input.ID {
@@ -8568,9 +8076,6 @@ func TestUUIDFixed16EncodeFromBytes(t *testing.T) {
 // ---- Coverage: struct field shadowing (shallower wins) ----
 
 func TestStructFieldShadowing(t *testing.T) {
-	type Inner struct {
-		X int32 `avro:"x"`
-	}
 	type Outer struct {
 		Inner
 		X *int32 `avro:"x"`
@@ -8743,9 +8248,7 @@ func TestUnsafeUdUUIDShortBuffer(t *testing.T) {
 	type R struct {
 		ID [16]byte `avro:"id"`
 	}
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
-	]}`
+	schema := recUUIDStringSchema
 	s, _ := Parse(schema)
 	var r R
 	_, err := s.Decode(nil, &r)
@@ -8758,9 +8261,7 @@ func TestUnsafeUdUUIDNegativeLength(t *testing.T) {
 	type R struct {
 		ID [16]byte `avro:"id"`
 	}
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
-	]}`
+	schema := recUUIDStringSchema
 	s, _ := Parse(schema)
 	var r R
 	_, err := s.Decode([]byte{0x01}, &r) // -1 zigzag
@@ -8773,9 +8274,7 @@ func TestUnsafeUdUUIDTooShort(t *testing.T) {
 	type R struct {
 		ID [16]byte `avro:"id"`
 	}
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
-	]}`
+	schema := recUUIDStringSchema
 	s, _ := Parse(schema)
 	var r R
 	_, err := s.Decode([]byte{72, 'a', 'b'}, &r) // length 36, only 2 bytes
@@ -8790,9 +8289,7 @@ func TestUUIDUnsafeFallbackNil(t *testing.T) {
 	type R struct {
 		ID any `avro:"id"`
 	}
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
-	]}`
+	schema := recUUIDStringSchema
 	input := R{ID: "550e8400-e29b-41d4-a716-446655440000"}
 	got := roundTrip(t, schema, input)
 	if got.ID != input.ID {
@@ -8804,9 +8301,7 @@ func TestUnsafeUdUUIDInvalidHex(t *testing.T) {
 	type R struct {
 		ID [16]byte `avro:"id"`
 	}
-	schema := `{"type":"record","name":"R","fields":[
-		{"name":"id","type":{"type":"string","logicalType":"uuid"}}
-	]}`
+	schema := recUUIDStringSchema
 	s, _ := Parse(schema)
 	// Encode a valid-length but invalid-hex UUID string.
 	bad := "ZZZZZZZZ-e29b-41d4-a716-446655440000"
@@ -12409,15 +11904,7 @@ func TestResolveEnumEvolution(t *testing.T) {
 }
 
 func TestResolveNestedRecords(t *testing.T) {
-	writer := mustParse(t, `{
-		"type":"record","name":"Outer","fields":[
-			{"name":"inner","type":{
-				"type":"record","name":"Inner","fields":[
-					{"name":"x","type":"int"}
-				]
-			}}
-		]
-	}`)
+	writer := mustParse(t, nestedInnerSchema)
 	reader := mustParse(t, `{
 		"type":"record","name":"Outer","fields":[
 			{"name":"inner","type":{
@@ -12470,12 +11957,7 @@ func TestResolveUnionEvolution(t *testing.T) {
 }
 
 func TestResolveSelfReferencingRecord(t *testing.T) {
-	schema := `{
-		"type":"record","name":"Node","fields":[
-			{"name":"value","type":"int"},
-			{"name":"next","type":["null","Node"]}
-		]
-	}`
+	schema := nodeRecursiveSchema
 	writer := mustParse(t, schema)
 	reader := mustParse(t, schema)
 	resolved := mustResolve(t, writer, reader)
@@ -12877,14 +12359,8 @@ func TestSkipFunctions(t *testing.T) {
 
 func TestResolveRecordFieldReorder(t *testing.T) {
 	// Writer has fields in different order than reader.
-	writer := mustParse(t, `{"type":"record","name":"R","fields":[
-		{"name":"b","type":"string"},
-		{"name":"a","type":"int"}
-	]}`)
-	reader := mustParse(t, `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`)
+	writer := mustParse(t, recBASchema)
+	reader := mustParse(t, recABSchema)
 	resolved := mustResolve(t, writer, reader)
 
 	encoded := mustEncode(t, writer, map[string]any{"b": "hello", "a": 42})
@@ -12992,9 +12468,7 @@ func TestResolveWriterUnionReaderNonUnion(t *testing.T) {
 	writer := mustParse(t, `{"type":"record","name":"R","fields":[
 		{"name":"a","type":["null","int"]}
 	]}`)
-	reader := mustParse(t, `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"}
-	]}`)
+	reader := mustParse(t, recASchema)
 	if _, err := Resolve(writer, reader); err == nil {
 		t.Fatal("expected Resolve to fail eagerly: null branch is incompatible with int reader")
 	}
@@ -13883,12 +13357,7 @@ func TestResolveBuildDeserSemanticError(t *testing.T) {
 
 func TestResolveSelfReferencingRecordDivergent(t *testing.T) {
 	// Self-referencing record where reader and writer differ to exercise cycle detection placeholder.
-	writerSchema := `{
-		"type":"record","name":"Node","fields":[
-			{"name":"value","type":"int"},
-			{"name":"next","type":["null","Node"]}
-		]
-	}`
+	writerSchema := nodeRecursiveSchema
 	readerSchema := `{
 		"type":"record","name":"Node","fields":[
 			{"name":"value","type":"long"},
@@ -14068,10 +13537,7 @@ func TestPromoteBytesToStringNegativeLength(t *testing.T) {
 func TestResolveDeserTruncatedData(t *testing.T) {
 	// Set up a resolved schema where writer has fields A (kept) and B (skipped),
 	// reader has fields A (promoted) and C (default).
-	writer, err := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`)
+	writer, err := Parse(recABSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -14337,13 +13803,8 @@ func TestEncodeDefaultRecordFieldDefault(t *testing.T) {
 func TestResolveFieldRemovedIntoMap(t *testing.T) {
 	// Writer has fields [a, b], reader has field [a]. Field b gets skipped.
 	// Decode into map to exercise deserMap's skip-continue path.
-	writer := mustParse(t, `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`)
-	reader := mustParse(t, `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"}
-	]}`)
+	writer := mustParse(t, recABSchema)
+	reader := mustParse(t, recASchema)
 	resolved := mustResolve(t, writer, reader)
 
 	encoded := mustEncode(t, writer, map[string]any{"a": 42, "b": "drop me"})
@@ -14357,13 +13818,8 @@ func TestResolveFieldRemovedIntoMap(t *testing.T) {
 
 func TestResolveFieldRemovedIntoStruct(t *testing.T) {
 	// Same setup but decode into struct to exercise deserStruct skip-continue path.
-	writer := mustParse(t, `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`)
-	reader := mustParse(t, `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"}
-	]}`)
+	writer := mustParse(t, recABSchema)
+	reader := mustParse(t, recASchema)
 	resolved := mustResolve(t, writer, reader)
 
 	encoded := mustEncode(t, writer, map[string]any{"a": 42, "b": "drop me"})
@@ -14612,10 +14068,7 @@ func TestResolveUnionUnionBranchError(t *testing.T) {
 func TestResolveDeserStructMissingField(t *testing.T) {
 	// Struct is missing a field the reader schema expects → typeFieldMapping error.
 	// Schemas must differ so Resolve doesn't short-circuit.
-	writer, err := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`)
+	writer, err := Parse(recABSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -16957,10 +16410,7 @@ func TestCustomTypeRoundTrip(t *testing.T) {
 			ID    int64     `avro:"id"`
 			Price testMoney `avro:"price"`
 		}
-		s := parseMoney(t, `{"type":"record","name":"Order","fields":[
-			{"name":"id","type":"long"},
-			{"name":"price","type":{"type":"long","logicalType":"money"}}
-		]}`)
+		s := parseMoney(t, orderIDPriceSchema)
 		input := Order{ID: 1, Price: testMoney{Cents: 500, Currency: "USD"}}
 		data := mustEncode(t, s, &input)
 		var out Order
@@ -17299,9 +16749,7 @@ func TestCustomTypeMatching(t *testing.T) {
 
 	t.Run("empty_criteria", func(t *testing.T) {
 		calls := 0
-		s, _ := Parse(`{"type":"record","name":"R","fields":[
-			{"name":"a","type":"int"},{"name":"b","type":"string"}
-		]}`, CustomType{
+		s, _ := Parse(recABSchema, CustomType{
 			Decode: func(any, *SchemaNode) (any, error) { calls++; return nil, ErrSkipCustomType },
 		})
 		data, _ := s.Encode(map[string]any{"a": int32(1), "b": "hello"})
@@ -17397,12 +16845,8 @@ func TestCustomTypeSchemaCache(t *testing.T) {
 
 	t.Run("reparse", func(t *testing.T) {
 		var cache SchemaCache
-		s1 := mustCacheParse(t, &cache, `{"type":"record","name":"Order","fields":[
-			{"name":"price","type":{"type":"long","logicalType":"money"}}
-		]}`, moneyCT)
-		s2 := mustCacheParse(t, &cache, `{"type":"record","name":"Order","fields":[
-			{"name":"price","type":{"type":"long","logicalType":"money"}}
-		]}`, moneyCT)
+		s1 := mustCacheParse(t, &cache, orderPriceSchema, moneyCT)
+		s2 := mustCacheParse(t, &cache, orderPriceSchema, moneyCT)
 		data, _ := s1.Encode(map[string]any{"price": testMoney{Cents: 1}})
 		var v1, v2 any
 		s1.Decode(data, &v1)
@@ -17466,15 +16910,11 @@ func TestNewCustomTypeAllAvroTypes(t *testing.T) {
 
 func TestCustomTypeSchemaCacheNonCustomAfterCustom(t *testing.T) {
 	var cache SchemaCache
-	_, err := cache.Parse(`{"type":"record","name":"Order","fields":[
-		{"name":"price","type":{"type":"long","logicalType":"money"}}
-	]}`, moneyCT)
+	_, err := cache.Parse(orderPriceSchema, moneyCT)
 	if err != nil {
 		t.Fatalf("custom parse: %v", err)
 	}
-	s, err := cache.Parse(`{"type":"record","name":"Order","fields":[
-		{"name":"price","type":{"type":"long","logicalType":"money"}}
-	]}`)
+	s, err := cache.Parse(orderPriceSchema)
 	if err != nil {
 		t.Fatalf("non-custom parse after custom: %v", err)
 	}

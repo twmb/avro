@@ -60,10 +60,6 @@ func TestSchemaForBasic(t *testing.T) {
 }
 
 func TestSchemaForNullable(t *testing.T) {
-	type Record struct {
-		Name  string  `avro:"name"`
-		Email *string `avro:"email"`
-	}
 	s := mustSchemaFor[Record](t)
 
 	t.Run("non-nil", func(t *testing.T) {
@@ -1281,9 +1277,6 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 	})
 
 	t.Run("pointer inline", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			Name  string `avro:"name"`
 			Inner *Inner `avro:",inline"`
@@ -1300,9 +1293,6 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 	})
 
 	t.Run("pointer embedded", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			*Inner
 			Y int32 `avro:"y"`
@@ -1319,9 +1309,6 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 	})
 
 	t.Run("named embedded", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			Inner `avro:"inner"`
 			Y     int32 `avro:"y"`
@@ -1337,9 +1324,6 @@ func TestSchemaForEmbeddedAndInline(t *testing.T) {
 	})
 
 	t.Run("ignored embedded", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			Inner `avro:"-"`
 			Y     int32 `avro:"y"`
@@ -1603,81 +1587,54 @@ func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
 		fn   func() (*Schema, error)
 	}{
 		{"inline + default=", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,default=foo"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + alias=", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,alias=old"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + type-alias=", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,type-alias=old"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + omitzero", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,omitzero"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + date", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,date"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + uuid", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,uuid"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + timestamp-millis", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,timestamp-millis"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"inline + decimal(10,2)", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:",inline,decimal(10,2)"`
 			}
 			return SchemaFor[Outer]()
 		}},
 		{"explicit name + inline", func() (*Schema, error) {
-			type Embed struct {
-				A int32 `avro:"a"`
-			}
 			type Outer struct {
 				Embed `avro:"Name,inline"`
 			}
@@ -1695,9 +1652,6 @@ func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
 
 	// Positive control: plain inline (no other options) still works.
 	t.Run("plain inline still accepted", func(t *testing.T) {
-		type Embed struct {
-			A int32 `avro:"a"`
-		}
 		type Outer struct {
 			Embed `avro:",inline"`
 			B     string `avro:"b"`
@@ -1788,9 +1742,6 @@ func TestSchemaForInlineRejectsNonStructFieldType(t *testing.T) {
 	// Positive controls: ,inline on a struct and on a pointer-to-struct
 	// still flattens the embed's fields into the parent.
 	t.Run("struct field + ,inline still flattens", func(t *testing.T) {
-		type Embed struct {
-			A int32 `avro:"a"`
-		}
 		type R struct {
 			Foo Embed `avro:",inline"`
 			Bar int32 `avro:"bar"`
@@ -1802,9 +1753,6 @@ func TestSchemaForInlineRejectsNonStructFieldType(t *testing.T) {
 		}
 	})
 	t.Run("*struct field + ,inline still flattens", func(t *testing.T) {
-		type Embed struct {
-			A int32 `avro:"a"`
-		}
 		type R struct {
 			Foo *Embed `avro:",inline"`
 			Bar int32  `avro:"bar"`
@@ -2733,9 +2681,6 @@ func TestSchemaForCustomTypeNoAvroType(t *testing.T) {
 // runtime encoder uses the outer int64 value.
 func TestRegression_SchemaForShadowedEmbedShallowestWins(t *testing.T) {
 	t.Run("both_tagged_outer_wins", func(t *testing.T) {
-		type Inner struct {
-			X int32 `avro:"x"`
-		}
 		type Outer struct {
 			Inner
 			X int64 `avro:"x"`

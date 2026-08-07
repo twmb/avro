@@ -73,3 +73,22 @@ func mustClose(t testing.TB, c io.Closer) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+// drainAll decodes every remaining record in r into a slice, stopping at EOF.
+// A cell that wants to say what the reader returned at a particular record
+// index reads the loop itself instead.
+func drainAll[T any](t testing.TB, r *Reader) []T {
+	t.Helper()
+	var out []T
+	for {
+		var v T
+		if err := r.Decode(&v); err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("Decode: %v", err)
+		}
+		out = append(out, v)
+	}
+	return out
+}

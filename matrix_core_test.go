@@ -2666,23 +2666,14 @@ func TestMatrix_NullUnionNilEquivalenceParity(t *testing.T) {
 	}{
 		// ----- FIELD context: *Inner, slice base, both positions -----
 		{"field/slice/null-first/nil", func(t *testing.T) {
-			type rec struct {
-				F *[]string `avro:"f"`
-			}
 			var x []string
 			nilEqThreeWayParity(t, recField(nf(`{"type":"array","items":"string"}`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
 		}},
 		{"field/slice/null-second/nil", func(t *testing.T) {
-			type rec struct {
-				F *[]string `avro:"f"`
-			}
 			var x []string
 			nilEqThreeWayParity(t, recField(ns(`{"type":"array","items":"string"}`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
 		}},
 		{"field/slice/null-first/nonnil-control", func(t *testing.T) {
-			type rec struct {
-				F *[]string `avro:"f"`
-			}
 			x := []string{"a", "b"}
 			nilEqThreeWayParity(t, recField(nf(`{"type":"array","items":"string"}`)), &rec{F: &x}, rec{F: &x}, &rec{}, &rec{})
 		}},

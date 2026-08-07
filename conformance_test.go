@@ -188,10 +188,7 @@ func TestCompatFieldAddedWithDefault(t *testing.T) {
 
 func TestCompatFieldAddedNoDefault(t *testing.T) {
 	writer := `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`
-	reader := `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`
+	reader := recABSchema
 	err := avro.CheckCompatibility(mustParse(t, writer), mustParse(t, reader))
 	if err == nil {
 		t.Fatal("field added without default should be incompatible")
@@ -199,10 +196,7 @@ func TestCompatFieldAddedNoDefault(t *testing.T) {
 }
 
 func TestCompatFieldRemoved(t *testing.T) {
-	writer := `{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`
+	writer := recABSchema
 	reader := `{"type":"record","name":"R","fields":[{"name":"a","type":"int"}]}`
 	if err := avro.CheckCompatibility(mustParse(t, writer), mustParse(t, reader)); err != nil {
 		t.Fatalf("field removed should be compatible: %v", err)
@@ -3310,14 +3304,7 @@ func TestSpecPromotionInNestedContext(t *testing.T) {
 }
 
 func TestSpecSelfRefRecordEvolution(t *testing.T) {
-	writerSchema := `{
-		"type": "record",
-		"name": "Node",
-		"fields": [
-			{"name": "value", "type": "int"},
-			{"name": "next", "type": ["null", "Node"]}
-		]
-	}`
+	writerSchema := nodeRecursiveSchema
 	readerSchema := `{
 		"type": "record",
 		"name": "Node",
@@ -3568,14 +3555,7 @@ func TestSchemaForwardReference(t *testing.T) {
 
 func TestSchemaRecursiveSelfRef(t *testing.T) {
 	// A record that references itself (linked list).
-	schema := `{
-		"type": "record",
-		"name": "Node",
-		"fields": [
-			{"name": "value", "type": "int"},
-			{"name": "next", "type": ["null", "Node"]}
-		]
-	}`
+	schema := nodeRecursiveSchema
 	s := mustParse(t, schema)
 	type Node struct {
 		Value int32 `avro:"value"`
@@ -8588,9 +8568,6 @@ func TestMatrix_SchemaForLogicalBaseType(t *testing.T) {
 // — plus the working pointer paths as regression-guard controls.
 func TestMatrix_OmitzeroJSONEncodeValueFieldNullUnion(t *testing.T) {
 	t.Run("string with null-first union", func(t *testing.T) {
-		type R struct {
-			Name string `avro:"name,omitzero"`
-		}
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"name","type":["null","string"]}]}`)
 		bin := mustAppendEncode(t, s, nil, R{Name: ""})
 		if !bytes.Equal(bin, []byte{0x00}) {
@@ -8602,9 +8579,6 @@ func TestMatrix_OmitzeroJSONEncodeValueFieldNullUnion(t *testing.T) {
 		}
 	})
 	t.Run("string with null-second union", func(t *testing.T) {
-		type R struct {
-			Name string `avro:"name,omitzero"`
-		}
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"name","type":["string","null"]}]}`)
 		bin := mustAppendEncode(t, s, nil, R{Name: ""})
 		if !bytes.Equal(bin, []byte{0x02}) {
@@ -8666,9 +8640,6 @@ func TestMatrix_OmitzeroJSONEncodeValueFieldNullUnion(t *testing.T) {
 		}
 	})
 	t.Run("control: non-zero string still encoded", func(t *testing.T) {
-		type R struct {
-			Name string `avro:"name,omitzero"`
-		}
 		s := avro.MustParse(`{"type":"record","name":"R","fields":[{"name":"name","type":["null","string"]}]}`)
 		js := mustEncodeJSON(t, s, R{Name: "hello"})
 		if !strings.Contains(string(js), `"hello"`) {
@@ -10611,12 +10582,7 @@ func TestParity_SchemaRejectionMatrix(t *testing.T) {
 			{"type":"fixed","name":"F","size":4},
 			{"type":"fixed","name":"F","size":4}
 		]`, ""},
-		{"union ref+def same record", `{"type":"record","name":"R","fields":[
-			{"name":"f","type":[
-				{"type":"record","name":"A","fields":[{"name":"x","type":"int"}]},
-				"A"
-			]}
-		]}`, "duplicate"},
+		{"union ref+def same record", recUnionInlineThenRefSchema, "duplicate"},
 		{"union with two enum refs to same enum", `{"type":"record","name":"R","fields":[
 			{"name":"a","type":{"type":"enum","name":"E","symbols":["A"]}},
 			{"name":"f","type":["E","E"]}
@@ -13884,10 +13850,7 @@ func TestParity_PointerTargetMatrix(t *testing.T) {
 func TestParity_RecursiveSchemaMatrix(t *testing.T) {
 	t.Run("self-referential linked list", func(t *testing.T) {
 		// Node = {value: int, next: [null, Node]}
-		schema := `{"type":"record","name":"Node","fields":[
-			{"name":"value","type":"int"},
-			{"name":"next","type":["null","Node"]}
-		]}`
+		schema := nodeRecursiveSchema
 		s := avro.MustParse(schema)
 		// Build a list 1 → 2 → 3.
 		// Construct as map[string]any to avoid Go struct recursive-type issues.
@@ -14440,18 +14403,11 @@ func TestParity_CheckCompatibilityMatrix(t *testing.T) {
 		{"float → double promotion", `"float"`, `"double"`, true},
 		{"string → bytes", `"string"`, `"bytes"`, true},
 		{"bytes → string", `"bytes"`, `"string"`, true},
-		{"record add field with default", `{"type":"record","name":"R","fields":[
-			{"name":"x","type":"int"}
-		]}`, `{"type":"record","name":"R","fields":[
+		{"record add field with default", recXSchema, `{"type":"record","name":"R","fields":[
 			{"name":"x","type":"int"},
 			{"name":"y","type":"int","default":99}
 		]}`, true},
-		{"record drop field", `{"type":"record","name":"R","fields":[
-			{"name":"x","type":"int"},
-			{"name":"y","type":"int"}
-		]}`, `{"type":"record","name":"R","fields":[
-			{"name":"x","type":"int"}
-		]}`, true},
+		{"record drop field", recXYSchema, recXSchema, true},
 		{"reader union superset", `"int"`, `["null","int"]`, true},
 		{"enum reader superset", `{"type":"enum","name":"E","symbols":["A","B"]}`,
 			`{"type":"enum","name":"E","symbols":["A","B","C"]}`, true},
@@ -14463,12 +14419,7 @@ func TestParity_CheckCompatibilityMatrix(t *testing.T) {
 		{"boolean → int", `"boolean"`, `"int"`, false},
 		{"record name mismatch", `{"type":"record","name":"A","fields":[{"name":"x","type":"int"}]}`,
 			`{"type":"record","name":"B","fields":[{"name":"x","type":"int"}]}`, false},
-		{"record reader adds required field (no default)", `{"type":"record","name":"R","fields":[
-			{"name":"x","type":"int"}
-		]}`, `{"type":"record","name":"R","fields":[
-			{"name":"x","type":"int"},
-			{"name":"y","type":"int"}
-		]}`, false},
+		{"record reader adds required field (no default)", recXSchema, recXYSchema, false},
 		{"fixed size mismatch", `{"type":"fixed","name":"F","size":4}`,
 			`{"type":"fixed","name":"F","size":8}`, false},
 		{"enum reader missing symbol no-default", `{"type":"enum","name":"E","symbols":["A","B","C"]}`,
@@ -14663,9 +14614,7 @@ func TestParity_ResolveMatrix(t *testing.T) {
 		{"bytes → string", `"bytes"`, `"string"`, []byte("hello"), "hello"},
 		// ── record evolution: add field with default ────────────────
 		{"record add field with default",
-			`{"type":"record","name":"R","fields":[
-				{"name":"x","type":"int"}
-			]}`,
+			recXSchema,
 			`{"type":"record","name":"R","fields":[
 				{"name":"x","type":"int"},
 				{"name":"y","type":"int","default":99}
@@ -14674,13 +14623,8 @@ func TestParity_ResolveMatrix(t *testing.T) {
 			map[string]any{"x": int32(1), "y": int32(99)}},
 		// ── record evolution: drop field (projection) ───────────────
 		{"record drop field via projection",
-			`{"type":"record","name":"R","fields":[
-				{"name":"x","type":"int"},
-				{"name":"y","type":"int"}
-			]}`,
-			`{"type":"record","name":"R","fields":[
-				{"name":"x","type":"int"}
-			]}`,
+			recXYSchema,
+			recXSchema,
 			map[string]any{"x": int32(1), "y": int32(2)},
 			map[string]any{"x": int32(1)}},
 		// ── record evolution: alias (reader renames) ────────────────
@@ -15299,12 +15243,7 @@ func TestMatrix_DuplicateNamedTypeInUnion(t *testing.T) {
 		name   string
 		schema string
 	}{
-		{"record def then name ref", `{"type":"record","name":"R","fields":[
-			{"name":"f","type":[
-				{"type":"record","name":"A","fields":[{"name":"x","type":"int"}]},
-				"A"
-			]}
-		]}`},
+		{"record def then name ref", recUnionInlineThenRefSchema},
 		{"record ref then inline def", `{"type":"record","name":"R","fields":[
 			{"name":"a","type":{"type":"record","name":"A","fields":[{"name":"x","type":"int"}]}},
 			{"name":"f","type":[
@@ -17307,9 +17246,7 @@ func TestMatrix_PromotionInvalid(t *testing.T) {
 // union widening (writer's type is in reader's union).
 func TestMatrix_PromotionSchemaEvolution(t *testing.T) {
 	t.Run("default-fill new field", func(t *testing.T) {
-		writer := `{"type":"record","name":"R","fields":[
-			{"name":"a","type":"int"}
-		]}`
+		writer := recASchema
 		reader := `{"type":"record","name":"R","fields":[
 			{"name":"a","type":"int"},
 			{"name":"b","type":"int","default":99}
@@ -17326,13 +17263,8 @@ func TestMatrix_PromotionSchemaEvolution(t *testing.T) {
 	})
 
 	t.Run("removed field (writer has, reader doesn't)", func(t *testing.T) {
-		writer := `{"type":"record","name":"R","fields":[
-			{"name":"a","type":"int"},
-			{"name":"b","type":"string"}
-		]}`
-		reader := `{"type":"record","name":"R","fields":[
-			{"name":"a","type":"int"}
-		]}`
+		writer := recABSchema
+		reader := recASchema
 		w := avro.MustParse(writer)
 		r := avro.MustParse(reader)
 		wire := mustAppendEncode(t, w, nil, map[string]any{"a": int32(7), "b": "drop me"})
@@ -17345,9 +17277,7 @@ func TestMatrix_PromotionSchemaEvolution(t *testing.T) {
 	})
 
 	t.Run("missing reader field without default errors at Resolve", func(t *testing.T) {
-		writer := `{"type":"record","name":"R","fields":[
-			{"name":"a","type":"int"}
-		]}`
+		writer := recASchema
 		reader := `{"type":"record","name":"R","fields":[
 			{"name":"a","type":"int"},
 			{"name":"b","type":"int"}

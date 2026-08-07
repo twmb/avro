@@ -1442,9 +1442,6 @@ func TestForwardReferenceInRecord(t *testing.T) {
 		t.Fatalf("expected forward reference to work, got %v", err)
 	}
 	// Verify round-trip works.
-	type Inner struct {
-		X int32 `avro:"x"`
-	}
 	type Outer struct {
 		Ref      Inner `avro:"ref"`
 		InnerDef Inner `avro:"inner_def"`
@@ -1681,9 +1678,7 @@ func TestFieldLevelLogicalType_RoundTrip(t *testing.T) {
 		// than the logical Go types.
 		{
 			"primitive timestamp-millis",
-			`{"type":"record","name":"R","fields":[
-				{"name":"ts","type":"long","logicalType":"timestamp-millis"}
-			]}`,
+			recTimestampMillisSchema,
 		},
 		{
 			"primitive timestamp-micros",
@@ -1810,9 +1805,7 @@ func TestFieldLevelLogicalType_RoundTripValue(t *testing.T) {
 	}{
 		{
 			"primitive timestamp-millis",
-			`{"type":"record","name":"R","fields":[
-				{"name":"ts","type":"long","logicalType":"timestamp-millis"}
-			]}`,
+			recTimestampMillisSchema,
 			time.UnixMilli(baseMillis).UTC(),
 		},
 		{
@@ -2007,9 +2000,7 @@ func TestFieldLevelLogicalType_CanonicalDoesNotDuplicate(t *testing.T) {
 	}{
 		{
 			"primitive timestamp-millis",
-			`{"type":"record","name":"R","fields":[
-				{"name":"ts","type":"long","logicalType":"timestamp-millis"}
-			]}`,
+			recTimestampMillisSchema,
 		},
 		{
 			"union timestamp-millis",
@@ -2126,9 +2117,7 @@ func TestFieldLevelLogicalType_EncodeJSONMatchesNested(t *testing.T) {
 	}
 	val := &Row{TS: time.UnixMilli(1_700_000_000_000).UTC()}
 
-	flat, err := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"ts","type":"long","logicalType":"timestamp-millis"}
-	]}`)
+	flat, err := Parse(recTimestampMillisSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -9401,16 +9390,11 @@ func TestSingleObjectFingerprintMatchesSpec(t *testing.T) {
 // twmb stores the writer fingerprint on the resolved Schema so its
 // DecodeSingleObject accepts both writer and reader fingerprints.
 func TestRegression_ResolvedDecodeSingleObjectAcceptsWriterFingerprint(t *testing.T) {
-	writer, err := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"},
-		{"name":"b","type":"string"}
-	]}`)
+	writer, err := Parse(recABSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := Parse(`{"type":"record","name":"R","fields":[
-		{"name":"a","type":"int"}
-	]}`)
+	reader, err := Parse(recASchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -9482,14 +9466,7 @@ func TestSchemaCacheBasic(t *testing.T) {
 	cache := &SchemaCache{}
 
 	// Parse a leaf schema.
-	_, err := cache.Parse(`{
-		"type": "record",
-		"name": "Telephone",
-		"fields": [
-			{"name": "number", "type": "int"},
-			{"name": "label", "type": "string"}
-		]
-	}`)
+	_, err := cache.Parse(telephoneSchema)
 	if err != nil {
 		t.Fatalf("parse Telephone: %v", err)
 	}
@@ -9543,14 +9520,7 @@ func TestSchemaCacheBasic(t *testing.T) {
 func TestSchemaCacheMultipleRefs(t *testing.T) {
 	cache := &SchemaCache{}
 
-	_, err := cache.Parse(`{
-		"type": "record",
-		"name": "Telephone",
-		"fields": [
-			{"name": "number", "type": "int"},
-			{"name": "label", "type": "string"}
-		]
-	}`)
+	_, err := cache.Parse(telephoneSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -9832,14 +9802,7 @@ func TestSchemaCacheEnum(t *testing.T) {
 		"symbols": ["RED", "GREEN", "BLUE"]
 	}`)
 
-	s := mustCacheParse(t, cache, `{
-		"type": "record",
-		"name": "Item",
-		"fields": [
-			{"name": "name", "type": "string"},
-			{"name": "color", "type": "Color"}
-		]
-	}`)
+	s := mustCacheParse(t, cache, itemColorRefSchema)
 
 	input := map[string]any{"name": "shirt", "color": "GREEN"}
 	binary := mustEncode(t, s, input)
@@ -9964,14 +9927,7 @@ func TestSchemaCacheDiamondEnum(t *testing.T) {
 		t.Error("expected same *Schema pointer")
 	}
 
-	s, err := cache.Parse(`{
-		"type": "record",
-		"name": "Item",
-		"fields": [
-			{"name": "name", "type": "string"},
-			{"name": "color", "type": "Color"}
-		]
-	}`)
+	s, err := cache.Parse(itemColorRefSchema)
 	if err != nil {
 		t.Fatalf("parse Item: %v", err)
 	}
@@ -10140,14 +10096,7 @@ func TestSchemaCacheFieldOrderPreserved(t *testing.T) {
 	// schemas and must NOT be deduplicated.
 	cache := &SchemaCache{}
 
-	s1, err := cache.Parse(`{
-		"type": "record",
-		"name": "R",
-		"fields": [
-			{"name": "a", "type": "int"},
-			{"name": "b", "type": "string"}
-		]
-	}`)
+	s1, err := cache.Parse(recABSchema)
 	if err != nil {
 		t.Fatalf("first parse: %v", err)
 	}
@@ -10161,14 +10110,7 @@ func TestSchemaCacheFieldOrderPreserved(t *testing.T) {
 	// Parse a schema with swapped field order. This is a DIFFERENT schema
 	// (different binary layout), so it must not dedup. It will error
 	// because "R" is already in the cache — that's expected and correct.
-	_, err = cache.Parse(`{
-		"type": "record",
-		"name": "R",
-		"fields": [
-			{"name": "b", "type": "string"},
-			{"name": "a", "type": "int"}
-		]
-	}`)
+	_, err = cache.Parse(recBASchema)
 	if err == nil {
 		t.Fatal("expected error: swapped field order is a different schema")
 	}

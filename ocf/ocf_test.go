@@ -56,17 +56,7 @@ func TestRoundTrip(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
-	var out []person
-	for {
-		var p person
-		if err := r.Decode(&p); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		out = append(out, p)
-	}
+	out := drainAll[person](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("got %v, want %v", out, in)
 	}
@@ -90,17 +80,7 @@ func TestDeflate(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
-	var out []person
-	for {
-		var p person
-		if err := r.Decode(&p); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		out = append(out, p)
-	}
+	out := drainAll[person](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("got %v, want %v", out, in)
 	}
@@ -150,17 +130,7 @@ func TestCustomBlockCount(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
-	var got []string
-	for {
-		var v string
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		got = append(got, v)
-	}
+	got := drainAll[string](t, r)
 	if !reflect.DeepEqual(strs, got) {
 		t.Fatalf("got %v, want %v", got, strs)
 	}
@@ -257,17 +227,7 @@ func TestCustomCodec(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf, WithCodec(codec))
-	var out []int64
-	for {
-		var v int64
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		out = append(out, v)
-	}
+	out := drainAll[int64](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("got %v, want %v", out, in)
 	}
@@ -376,17 +336,7 @@ func TestPrimitiveSchema(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
-	var out []string
-	for {
-		var v string
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		out = append(out, v)
-	}
+	out := drainAll[string](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("got %v, want %v", out, in)
 	}
@@ -520,17 +470,7 @@ func TestDeflateRoundTripLarge(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
-	var out []string
-	for {
-		var v string
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		out = append(out, v)
-	}
+	out := drainAll[string](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatal("large deflate round trip mismatch")
 	}
@@ -1173,17 +1113,7 @@ func TestFlush(t *testing.T) {
 
 	// Read all three items back.
 	r := mustNewReader(t, &buf)
-	var got []int32
-	for {
-		var x int32
-		if err := r.Decode(&x); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		got = append(got, x)
-	}
+	got := drainAll[int32](t, r)
 	want := []int32{1, 2, 3}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -1271,17 +1201,7 @@ func TestWithBlockBytes(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
-	var got []int32
-	for {
-		var v int32
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		got = append(got, v)
-	}
+	got := drainAll[int32](t, r)
 	want := []int32{0, 1, 2, 3, 4, 5, 6}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -1303,17 +1223,7 @@ func TestWithBlockBytesAndBlockCount(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
-	var got []int32
-	for {
-		var v int32
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		got = append(got, v)
-	}
+	got := drainAll[int32](t, r)
 	want := []int32{0, 1, 2, 3, 4}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -1335,17 +1245,7 @@ func TestWithBlockCountZero(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
-	var got []int32
-	for {
-		var v int32
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		got = append(got, v)
-	}
+	got := drainAll[int32](t, r)
 	want := []int32{0, 1, 2, 3, 4}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -1518,17 +1418,7 @@ func TestAppendWriter(t *testing.T) {
 	// Read all items.
 	sb.pos = 0
 	r := mustNewReader(t, sb)
-	var got []int32
-	for {
-		var v int32
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		got = append(got, v)
-	}
+	got := drainAll[int32](t, r)
 	want := []int32{0, 1, 2, 3, 4, 5}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -1573,17 +1463,7 @@ func TestAppendWriterCustomCodec(t *testing.T) {
 	// Read all back.
 	sb.pos = 0
 	r := mustNewReader(t, sb, WithCodec(codec))
-	var got []int32
-	for {
-		var v int32
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		got = append(got, v)
-	}
+	got := drainAll[int32](t, r)
 	want := []int32{0, 1, 2, 3, 4}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -1713,17 +1593,7 @@ func TestAppendWriterBlockOpts(t *testing.T) {
 	// Read all items back.
 	sb.pos = 0
 	r := mustNewReader(t, sb)
-	var got []int32
-	for {
-		var x int32
-		if err := r.Decode(&x); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		got = append(got, x)
-	}
+	got := drainAll[int32](t, r)
 	want := []int32{1, 2}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -1901,17 +1771,7 @@ func TestWriteAutoFlush(t *testing.T) {
 	mustClose(t, w)
 
 	r := mustNewReader(t, &buf)
-	var got []int32
-	for {
-		var v int32
-		if err := r.Decode(&v); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		got = append(got, v)
-	}
+	got := drainAll[int32](t, r)
 	want := []int32{0, 1, 2, 3, 4}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -1957,17 +1817,7 @@ func TestSnappy(t *testing.T) {
 
 	// Reader auto-resolves snappy codec.
 	r := mustNewReader(t, &buf)
-	var out []person
-	for {
-		var p person
-		if err := r.Decode(&p); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		out = append(out, p)
-	}
+	out := drainAll[person](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("got %v, want %v", out, in)
 	}
@@ -2044,17 +1894,7 @@ func TestZstd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	var out []person
-	for {
-		var p person
-		if err := r.Decode(&p); err != nil {
-			if err == io.EOF {
-				break
-			}
-			t.Fatal(err)
-		}
-		out = append(out, p)
-	}
+	out := drainAll[person](t, r)
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("got %v, want %v", out, in)
 	}
@@ -2380,17 +2220,7 @@ func TestGoldenWeather(t *testing.T) {
 				}
 			}
 
-			var got []weather
-			for {
-				var w weather
-				if err := r.Decode(&w); err != nil {
-					if err == io.EOF {
-						break
-					}
-					t.Fatal(err)
-				}
-				got = append(got, w)
-			}
+			got := drainAll[weather](t, r)
 			if !reflect.DeepEqual(got, wantWeather) {
 				t.Fatalf("got %v, want %v", got, wantWeather)
 			}
