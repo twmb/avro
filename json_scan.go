@@ -211,16 +211,11 @@ func (s *jsonScanner) consumeNumberBytes() ([]byte, error) {
 // in a writer-only field can be decoded against a reader that doesn't
 // have the field. (Java's JsonEncoder emits the QUOTED string form —
 // Jackson's default quotes non-numeric numbers — which the string arm
-// already skips as a plain JSON string.) parseSpecialFloat's
-// exact-match gate is applied so invalid bare tokens (e.g. "Naive",
-// lowercase "nan") still error, matching the strict-JSON posture
-// decodeJSONFloat enforces.
-//
-// Case-sensitivity note: lowercase 'n' is unambiguously the JSON null
-// literal; lowercase 'i' isn't a valid token start (Java's JsonParser,
-// fastavro's Python json, and goavro all reject lowercase
-// nan/infinity/inf). Uppercase 'N' / 'I' / '-I' are the bare-special-
-// float starts.
+// already skips as a plain JSON string.) It dispatches on the value
+// path's own [isBareSpecialFloatStart] and applies parseSpecialFloat's
+// exact-match gate, so invalid bare tokens (e.g. "Naive", lowercase
+// "nan") still error and the two paths cannot drift on which producer
+// conventions they accept.
 func (s *jsonScanner) skipValue() error {
 	return s.skipValueDepth(0)
 }
@@ -248,26 +243,27 @@ func (s *jsonScanner) skipValueDepth(depth int) error {
 	if s.pos >= len(s.data) {
 		return fmt.Errorf("avro json: unexpected EOF")
 	}
-	switch s.data[s.pos] {
+	switch p := s.data[s.pos]; p {
 	case '"':
 		return s.skipStringStrict()
 	case 't', 'f':
 		_, err := s.consumeBool()
 		return err
 	case 'n':
+		// Unambiguously the null literal: lowercase is not a bare-token
+		// start on either path.
 		return s.consumeNull()
-	case 'N', 'I':
-		t, err := s.consumeBareSpecialFloat()
-		if err != nil {
-			return err
-		}
-		_, err = parseSpecialFloat(t)
-		return err
-	case '-':
-		// Disambiguate -<digit> (negative number) vs -I... (bare
-		// -Infinity / -INF / -Inf): the bare-special-float arm always
-		// starts uppercase 'I' after the leading '-'.
-		if s.peekAt(1) == 'I' {
+	case '[':
+		return s.skipArrayStrict(depth)
+	case '{':
+		return s.skipObjectStrict(depth)
+	default:
+		// A bare NaN/Infinity token and a number share this arm because
+		// they share a first byte: '-' begins both -Infinity and every
+		// negative number. isBareSpecialFloatStart is the value path's own
+		// predicate (json_decode.go), so the skip path splits them exactly
+		// where decodeJSONFloat does.
+		if isBareSpecialFloatStart(s, p) {
 			t, err := s.consumeBareSpecialFloat()
 			if err != nil {
 				return err
@@ -275,12 +271,6 @@ func (s *jsonScanner) skipValueDepth(depth int) error {
 			_, err = parseSpecialFloat(t)
 			return err
 		}
-		return s.skipNumberStrict()
-	case '[':
-		return s.skipArrayStrict(depth)
-	case '{':
-		return s.skipObjectStrict(depth)
-	default:
 		return s.skipNumberStrict()
 	}
 }

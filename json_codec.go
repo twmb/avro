@@ -1338,14 +1338,14 @@ tryAll:
 	return nil, e
 }
 
-// unionBranchName returns the Avro JSON type name for a union branch.
+// unionBranchName returns the Avro JSON type name for a union branch: a
+// named type answers to its declared name, everything else to its kind.
+// [branchIsNamedKind] is the one place that set of kinds is written down.
 func unionBranchName(node *schemaNode) string {
-	switch node.kind {
-	case "record", "enum", "fixed":
+	if branchIsNamedKind(node) {
 		return node.name
-	default:
-		return node.kind
 	}
+	return node.kind
 }
 
 // unionBranchNames returns the standard and logical branch names for a
@@ -1536,14 +1536,16 @@ var unionTagTiers = []unionTagTier{
 	{
 		// Unqualified short name for a namespaced named type — a twmb
 		// leniency for hand-written input; no reference emits or reads it.
+		// Only a named type has a short form of a name; the set is
+		// [branchIsNamedKind]'s, the same one the exact tier reaches
+		// through unionBranchName.
 		name:    "unqualified short name",
 		guarded: true,
 		claim: func(b *schemaNode) (string, string, bool) {
-			switch b.kind {
-			case "record", "enum", "fixed":
-				return unqualified(b.name), "", true
+			if !branchIsNamedKind(b) {
+				return "", "", false
 			}
-			return "", "", false
+			return unqualified(b.name), "", true
 		},
 	},
 }

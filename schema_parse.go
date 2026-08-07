@@ -391,7 +391,7 @@ func flatFieldNeedsLift(m map[string]any, tp string) bool {
 // sides cannot drift on WHAT the lift routes; flatFieldNeedsLift is the
 // shared WHEN.
 func flatLiftTypeMap(m map[string]any, tp string) map[string]any {
-	named := tp == "record" || tp == "error" || tp == "enum" || tp == "fixed"
+	named := isNamedKind(tp)
 	typeMap := make(map[string]any, len(m))
 	for k, v := range m {
 		switch k {

@@ -280,8 +280,11 @@ func avroNamedRef(typ string) bool {
 // prefix of a dotted name, else its "namespace" attribute, else inherited.
 // Keys are read by exact name, mirroring the parser.
 func nodeNamespace(obj map[string]any, enclosingNS string) string {
-	if name, ok := obj["name"].(string); ok && strings.Contains(name, ".") {
-		return name[:strings.LastIndex(name, ".")]
+	// A dotted name carries its own namespace and suppresses the attribute
+	// even when the prefix is empty (".x"), so presence of the dot — not a
+	// non-empty split — is what decides. namespaceOf performs the split.
+	if name, ok := obj["name"].(string); ok && strings.ContainsRune(name, '.') {
+		return namespaceOf(name)
 	}
 	if ns, ok := obj["namespace"].(string); ok {
 		return ns
@@ -292,10 +295,7 @@ func nodeNamespace(obj map[string]any, enclosingNS string) string {
 // nodeFullnameTree resolves a named-type object's fullname.
 func nodeFullnameTree(obj map[string]any, enclosingNS string) string {
 	name, _ := obj["name"].(string)
-	short := name
-	if i := strings.LastIndex(name, "."); i >= 0 {
-		short = name[i+1:]
-	}
+	short := unqualified(name)
 	if ns := nodeNamespace(obj, enclosingNS); ns != "" {
 		return ns + "." + short
 	}
