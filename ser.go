@@ -275,27 +275,22 @@ func serNullUnionAt(u *serUnion, valIdx int, nullByte, valByte byte) serfn {
 	}
 }
 
-// isNilValue reports whether v is nil-equivalent for the purposes of the
-// 2-branch [null,T] union optimization. It peels Pointer / Interface
-// layers (handling &nilPtr — a **T with non-nil outer pointer wrapping a
-// nil *T) and treats nil Map / Slice / Chan / Func as nil. The accept
-// set matches serNull (ser.go) and appendAvroJSON's case "null" arm
-// (json_codec.go) exactly so the five dispatch sites — binary 2-branch
-// optimization (serNullUnionAt), binary 3-branch try-each (serUnion.ser
-// → serNull), JSON 2-branch optimization (appendAvroJSONUnion's
-// 2-branch nil short-circuit), JSON try-each (case "null"), and the
-// unsafe struct fast path (usNullUnionEnter / usArrayNullUnionPtr) —
-// agree on what counts as nil. The unsafe site cannot call isNilValue
-// (it operates on an unsafe.Pointer, not a reflect.Value): it tests only
-// the outer pointer, which equals isNilValue exactly when the inner kind
-// is not itself nilable, so its tryCompileFieldSer gate declines every
-// isNilableKind inner to the reflect path — keeping it in lockstep
-// without re-implementing the peel.
+// isNilValue reports whether v is nil-equivalent for the 2-branch [null,T]
+// union optimization. It peels Pointer / Interface layers — &nilPtr, a **T
+// whose outer pointer wraps a nil *T, included — and treats nil Map / Slice /
+// Chan / Func as nil. The accept set matches serNull and appendAvroJSON's null
+// arm exactly, so all five dispatch sites agree on what counts as nil: both
+// binary paths, both JSON paths, and the unsafe struct fast path.
 //
-// Capped at maxIndirectDepth so a self-referential interface
-// (var p any; p = &p) terminates instead of looping forever; treat
-// the deeply-nested case as not-nil so the encoder reports a real
-// error downstream rather than silently encoding null.
+// The unsafe site cannot call this — it holds an unsafe.Pointer, not a
+// reflect.Value — so it tests the outer pointer alone, which equals isNilValue
+// exactly when the inner kind is not itself nilable. Its tryCompileFieldSer
+// gate therefore declines every isNilableKind inner to the reflect path,
+// staying in lockstep without re-implementing the peel.
+//
+// Capped at maxIndirectDepth so a self-referential interface (var p any; p =
+// &p) terminates. The over-deep case reports not-nil, so the encoder raises a
+// real error downstream instead of silently encoding null.
 func isNilValue(v reflect.Value) bool {
 	if !v.IsValid() {
 		return true
@@ -373,20 +368,15 @@ func serNull(dst []byte, v reflect.Value, _ int) ([]byte, error) {
 	if !v.IsValid() {
 		return dst, nil
 	}
-	// Peel pointer + interface layers so a typed-nil value reaching us
-	// inside an any wrapper (iter.Value() on a map[string]any in
-	// serUnion.tryUnwrapTagged, serArray.serItem over []any, serMap
-	// over map[string]any) or as **T-with-nil-inner (&p where var p
-	// *int = nil — a common shape from AppendEncode(&nilPtr)) is
-	// recognized as nil. Without the peel, any((*int)(nil)) has
-	// Kind()==Interface with IsNil()==false (the interface itself is
-	// non-nil — it holds type info) and &nilPtr has Kind()==Pointer
-	// with IsNil()==false (the outer pointer is non-nil); the kind
-	// switch below would return errNonNil for both even though the
-	// user clearly meant "null." Mirrors appendAvroJSON's indirect
-	// loop on the JSON side and isNilValue's loop on the 2-branch
-	// [null,T] optimization. Bounded by maxIndirectDepth so a self-
-	// referential interface (var p any; p = &p) terminates.
+	// Peel pointer + interface layers so a typed-nil arriving inside an any
+	// wrapper, or as **T with a nil inner (&p where var p *int = nil, the
+	// shape AppendEncode(&nilPtr) produces), is recognized as nil. Without the
+	// peel both look non-nil: any((*int)(nil)) is an Interface with
+	// IsNil()==false because the interface holds type info, and &nilPtr is a
+	// Pointer with IsNil()==false because the OUTER pointer is non-nil. The
+	// kind switch below would return errNonNil for both. Mirrors
+	// appendAvroJSON's indirect loop and isNilValue's. Bounded by
+	// maxIndirectDepth so a self-referential interface terminates.
 	for range maxIndirectDepth {
 		if v.Kind() != reflect.Interface && v.Kind() != reflect.Pointer {
 			break
@@ -1000,12 +990,9 @@ var serString = serPrim(appendAvroString)
 //  5. []byte slice → write bytes.
 //  6. Anything else → SemanticError.
 //
-// Text interfaces are tried BEFORE the reflect.String fast path so a
-// string-kind type that implements TextMarshaler uses its marshaled
-// form, matching encoding/json (which prefers TextMarshaler over the
-// default string encoding). json.Number is the one string-kind type
-// excluded — it is rejected up front so union dispatch routes it to a
-// numeric branch.
+// Text interfaces come BEFORE the reflect.String fast path so a string-kind
+// type implementing TextMarshaler uses its marshaled form, matching
+// encoding/json's preference.
 //
 // Used by serString (top-level), serArray.serString (array items),
 // and serMap.serString (map values). The JSON encoder uses
@@ -1598,16 +1585,14 @@ func appendArrayPrimitive(
 	if err != nil || l == 0 {
 		return dst, err
 	}
-	// Hoist the per-element type dispatch out of the loop when the element
-	// type is the exact natural Go type for this Avro primitive. The element
-	// type is uniform across the slice, so this resolves once per encode
-	// instead of once per element, and each fast loop is a direct read+emit
-	// with no coercion/bounds/overflow logic (the exact type provably fits
-	// the wire type — see the type-var block's rationale). Named / other-width
-	// / pointer / text / json.Number element types fall to the general
-	// per-element appendFn loop below, which applies the correct coercion.
-	// Native concrete fast path per case: assert the unnamed []V and range it
-	// directly (no per-element v.Index(i) reflect). The hoist loop below each
+	// Hoist the per-element type dispatch out of the loop when the element type
+	// is the exact natural Go type for this Avro primitive. The element type is
+	// uniform across the slice, so this resolves once per encode rather than
+	// per element, and each fast loop is a direct read+emit with no coercion or
+	// bounds logic — the exact type provably fits the wire type. Named,
+	// other-width, pointer, text and json.Number elements fall to the general
+	// appendFn loop below, which applies the right coercion. Each case first
+	// asserts the unnamed []V and ranges it natively; the hoist loop below each
 	// assertion handles [N]T fixed arrays (where the []V assertion fails) and
 	// non-interfaceable slices; a named element type misses the exact-type
 	// case entirely and uses the general appendFn loop. float32 emits raw bits
@@ -2326,26 +2311,20 @@ func decimalRatFor(v reflect.Value) (*big.Rat, bool, error) {
 // tryCoerceToRat attempts to convert a value to *big.Rat for decimal logical
 // types. Accepts float64, json.Number, and numeric strings (e.g. "3.14").
 //
-// For floats, the shortest-decimal formatting is used (strconv.FormatFloat
-// with prec=-1) rather than (*big.Rat).SetFloat64. SetFloat64 exposes the
-// exact binary mantissa: float64(0.33) becomes 5944751508129055/18014398509481984,
-// whose natural decimal scale is ~52 digits. ratToUnscaled would then
-// reject every non-power-of-2 float against any finite schema scale.
-// Java's BigDecimal.valueOf(double) takes the same shortest-decimal
-// approach via Double.toString; the user-visible value 0.33 becomes
-// the big.Rat 33/100, which rounds exactly at schema scale 2.
+// Floats use shortest-decimal formatting (strconv.FormatFloat, prec=-1) rather
+// than (*big.Rat).SetFloat64, which exposes the exact binary mantissa:
+// float64(0.33) becomes 5944751508129055/18014398509481984, a natural decimal
+// scale of ~52 digits, and ratToUnscaled would then reject every
+// non-power-of-2 float against any finite schema scale. Java's
+// BigDecimal.valueOf(double) takes the same route via Double.toString, so 0.33
+// becomes 33/100 and rounds exactly at schema scale 2.
 //
-// Cross-impl: fastavro requires decimal.Decimal, and hamba and
-// linkedin-goavro both require *big.Rat (goavro's textual decimal is
-// the wire form only — its encoder rejects any Go value that is not a
-// *big.Rat, logical_type.go "expected *big.Rat") — twmb is the only Go
-// impl accepting native float input for the decimal logical type. The float
-// arm bypasses boundedRatFromString's isJSONNumber / magnitude gates:
-// FormatFloat's 'f'-format output is JSON-valid by construction (≤310
-// chars, no hex / underscore / rational forms), and float64's bounded
-// exponent (~±308) keeps the magnitude well under decimalScaleLimit
-// (65536) — so the gates would pass anyway and skipping them avoids the
-// per-call allocation of an intermediate parse.
+// This package is the only Go impl accepting native float input for decimal —
+// fastavro wants decimal.Decimal, hamba and goavro want *big.Rat. The float arm
+// bypasses boundedRatFromString's isJSONNumber and magnitude gates because they
+// would pass anyway: FormatFloat's 'f' output is JSON-valid by construction and
+// float64's ~±308 exponent stays far under decimalScaleLimit. Skipping them
+// avoids a per-call intermediate parse.
 //
 // Returns (nil, false, err) when the input was clearly a number form
 // (json.Number, or a reflect.String that parses as a number) but its
@@ -2458,26 +2437,21 @@ func appendDecimalFixed(dst, b []byte, size int, goType reflect.Type) ([]byte, e
 	return append(dst, b...), nil
 }
 
-// rejectNonNumericStructuredString rejects a reflect.String carrier that reached
-// a decimal / big-decimal opaque fall-through. A numeric string is consumed by
-// decimalRatFor (ok==true) before this point, so a string that reaches here is
-// non-numeric — and the string DECODE target of both logicals reads the wire as
-// numeric text whenever it can (decimal: setDecimalRat always; big-decimal:
-// setDecimalRat via applyBigDecimalPayload whenever the payload parses as valid
-// framing). Encoding a non-numeric string opaquely therefore emits bytes the
-// decoder reads back as a number — and a crafted string whose raw bytes ARE a
-// valid framing (for big-decimal, e.g. the 3 bytes that spell unscaled 5) decode
-// to a different value, silently breaking the round trip. For both logicals the
-// string carrier is the numeric-text form ONLY; []byte is the opaque escape
-// hatch (Kind Slice, not matched here) and round-trips symmetrically on both
-// sides (its decode target reads raw bytes unconditionally). Mirrors
-// tryCoerceToRat's json.Number reject and keeps encode symmetric with decode.
+// rejectNonNumericStructuredString rejects a reflect.String carrier reaching a
+// decimal / big-decimal opaque fall-through. decimalRatFor consumes numeric
+// strings first, so anything arriving here is non-numeric — while the string
+// DECODE target of both logicals reads the wire as numeric text whenever it
+// can. Encoding such a string opaquely therefore emits bytes the decoder reads
+// back as a NUMBER, and a crafted string whose raw bytes happen to be valid
+// framing decodes to a different value, silently breaking the round trip. For
+// both logicals the string carrier is the numeric-text form ONLY; []byte is the
+// opaque escape hatch (Kind Slice, unmatched here) and round-trips
+// symmetrically, its decode target reading raw bytes unconditionally.
 //
-// This is deliberately stricter than the plain bytes/fixed encode-side string
-// leniency: there a string round-trips opaquely because a plain bytes/fixed
-// string DECODE target reads raw bytes, so accepting it is symmetric. Neither
-// Java nor fastavro accepts a native string for a decimal / big-decimal schema
-// at all, so there is no interop cost. logical labels the SemanticError message
+// Deliberately stricter than the plain bytes/fixed string leniency, where a
+// string round-trips opaquely because that decode target also reads raw bytes.
+// Neither Java nor fastavro accepts a native string for these schemas at all,
+// so there is no interop cost. logical labels the SemanticError message
 // ("decimal" or "big-decimal"); avroType is the underlying Avro type ("bytes" /
 // "fixed").
 func rejectNonNumericStructuredString(v reflect.Value, avroType, logical string) error {
@@ -2707,17 +2681,16 @@ const log2of5 = 2.321928094887362
 // from the caller's perspective).
 // For a reduced denominator d = 2^a * 5^b returns max(a, b).
 //
-// The factor-of-2 count a is one TrailingZeroBits() call. The odd part of
-// the denominator must be a pure power of 5 for the decimal to terminate;
-// rather than divide it by 5 one factor at a time (which is O(scale^2) on
-// the shrinking big.Int — ~1.4 CPU seconds for a 6-byte wire value at the
-// cap, an attacker amplification on the decode->re-encode path), estimate b
-// from the bit length (5^b has floor(b·log2 5)+1 bits), then verify with a
-// single 5^b == d comparison and a ≤1-step climb that absorbs the float
-// rounding. 5^b is strictly increasing, so at most one b can equal d; a miss
-// means d has a prime factor other than 5 and the value is non-terminating.
-// The whole derivation is O(M(scale)) — one big.Int exponentiation plus a
-// couple of multiplies, matching the regular-decimal encode path's cost.
+// The factor-of-2 count a is one TrailingZeroBits() call. The denominator's odd
+// part must be a pure power of 5 for the decimal to terminate. Dividing it by 5
+// one factor at a time is O(scale^2) on the shrinking big.Int — ~1.4 CPU
+// seconds for a 6-byte wire value at the cap, an attacker amplification on the
+// decode→re-encode path — so instead estimate b from the bit length (5^b has
+// floor(b·log2 5)+1 bits) and verify with a single 5^b == d comparison plus a
+// ≤1-step climb absorbing the float rounding. 5^b is strictly increasing, so at
+// most one b can equal d, and a miss means d has a prime factor other than 5
+// and the value is non-terminating. The derivation is O(M(scale)), matching the
+// regular-decimal encode path.
 // (Java/fastavro/avro-rs pay even less because their decimal types store the
 // scale and never factorize; big.Rat is a reduced fraction with no scale, so
 // the value-derived scale must be computed here — O(M) is the floor for that
