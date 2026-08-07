@@ -570,32 +570,25 @@ func innerCtxKind(label string) string {
 //
 // One generator, not hand-cases. The axes are tables; a new failing cell is a
 // generator gap fixed by extending a table, never a hand-written round. This
-// file RECONCILES (consumes + extends) the existing generative infrastructure
-// rather than duplicating it:
+// file RECONCILES (consumes + extends) the existing generative infrastructure:
+// matFrags / matCtxs / runCore / matEqual / uniq, typedFrags / typedPositions,
+// customFrags / customPositions, recShapes, and resurrectionCells — and adds the
+// axes those omit: underlying-validity {valid, wrong-kind, wrong-size},
+// CustomType config {absent, passive, encode-only, decode-only, both}, and the
+// boundary values current generators skip {2^53±1, MaxInt64/MinInt64, ±Inf,
+// signaling-NaN, empty, large}.
 //
-//   - matFrags / matCtxs / runCore / matEqual / uniq  (matrix_core_test.go)
-//   - typedFrags / typedPositions                     (matrix_typed_test.go)
-//   - customFrags / customPositions                   (matrix_custom_test.go)
-//   - recShapes                                       (matrix_recursion_test.go)
-//   - resurrectionCells                               (custom_resurrection_parity_test.go)
-//
-// and adds the axes those omit: underlying-validity {valid, wrong-kind,
-// wrong-size}, CustomType config {absent, passive, encode-only, decode-only,
-// both}, and the boundary values current generators skip {2^53±1, MaxInt64/
-// MinInt64, ±Inf, signaling-NaN, empty, large}.
-//
-// Per generated cell the matrix asserts THREE things:
-//   (a) every codec path — binary-safe (generic), binary-unsafe (addressable
-//       struct), JSON, resolved — plus the []T / map[string]T container
-//       specializations agree byte-identically (within a wire format) and
-//       value-identically (across formats), AND match an INDEPENDENT wire
-//       oracle where one can be computed (the calibration-free runCore cannot
-//       see encode-side canonicalization; the oracle can — e.g. a float32
-//       encoder that quiets a signaling NaN);
-//   (b) the wire round-trips through the schema's OWN reader (natural and
-//       identity-resolved);
-//   (c) parse-time / metadata-API observations (Root().Props, Fields[].Default,
-//       Canonical, Fingerprint) agree with the wire and are deterministic.
+// Per generated cell the matrix asserts three things:
+//   (a) every codec path — binary-safe, binary-unsafe (addressable struct),
+//       JSON, resolved — plus the []T / map[string]T specializations agree
+//       byte-identically within a wire format and value-identically across
+//       them, AND match an INDEPENDENT wire oracle where one can be computed
+//       (the calibration-free runCore cannot see encode-side canonicalization;
+//       the oracle can — e.g. a float32 encoder that quiets a signaling NaN);
+//   (b) the wire round-trips through the schema's OWN reader, natural and
+//       identity-resolved;
+//   (c) parse-time / metadata-API observations agree with the wire and are
+//       deterministic.
 // ===========================================================================
 
 // gval is one boundary-classified value for a type: the generic (any-tree)
@@ -1205,27 +1198,23 @@ func TestMatrix_GenerativeTyped(t *testing.T) {
 }
 
 // ===========================================================================
-// Layer 3a — resurrection regime × CONTEXT axis.
+// Layer 3a — resurrection regime x CONTEXT axis.
 //
 // A logical placed on an underlying it is not spec-valid for is soft-dropped to
-// the bare underlying (validateLogical) UNLESS a CustomType with the matching
-// LogicalType resurrects it. The contract: a resurrected wrong-kind/wrong-size
-// logical must fall through to the RAW kind/size-checked codec on EVERY axis.
-// custom_resurrection_parity_test.go proves this at TOP level across encode/
-// decode × binary/JSON × natural/resolved × targets × three matching shapes.
-//
-// This layer adds the axis that file omits: COMPOSITION CONTEXT. A wrong-kind
-// logical as an array element, map value, union branch, record field, or nested
-// field reaches the per-element / per-branch fast paths — a different dispatch
-// than the top-level codec — where a re-applied logical ser/deser would surface
-// as a wire-byte or value divergence from the plain (soft-dropped) schema.
+// the bare underlying UNLESS a CustomType with the matching LogicalType
+// resurrects it. The contract: a resurrected wrong-kind/wrong-size logical must
+// fall through to the RAW kind/size-checked codec on EVERY axis.
+// custom_resurrection_parity_test.go proves this at TOP level; this layer adds
+// the axis that file omits, COMPOSITION CONTEXT — a wrong-kind logical as an
+// array element, map value, union branch, record field, or nested field reaches
+// the per-element / per-branch fast paths, a different dispatch than the
+// top-level codec, where a re-applied logical ser/deser surfaces as a wire-byte
+// or value divergence from the plain schema.
 //
 // Oracle: the PLAIN schema (same JSON, no CustomType). For every resurrecting
 // shape the custom schema must be encode/decode-identical to plain in every
-// context, and its wire must read back through its own natural and identity-
-// resolved readers. Reuses resurrectionCells() and the encResult/decBin/decJSON
-// helpers; *any decode targets catch a wrongly-enriched value (it appears as a
-// logical Go type in the tree where plain yields the raw underlying).
+// context, and its wire must read back through its own natural and
+// identity-resolved readers. *any decode targets catch a wrongly-enriched value.
 // ===========================================================================
 
 func TestMatrix_CustomResurrectedLogicalInContext(t *testing.T) {
@@ -1570,38 +1559,28 @@ func TestMatrix_GenerativeDefaultFill(t *testing.T) {
 }
 
 // TestMatrix_GenerativeUnionContainerDefaultFill is the durable net for the
-// union-default metadata↔wire class: when a union field's branches are CONTAINERS
-// (record/array/map) holding a leaf and the field has a default, the branch+value
-// the metadata selector (branchAcceptsDefault → coerceMetadataDefault) reports must
-// match the branch+value the wire auto-fill produces, on BOTH wire formats. Two
-// findings landed in this class from the SAME uncovered cells — a float string→float
-// coercion in a nested branch, then an int64→int32 overflow wrap — both hidden
-// because the prior nets (the flat TestMatrix_GenerativeDefaultFill above, and the
-// matFrags×matCtxs core matrix) drove only IN-RANGE values. This matrix crosses the
-// boundary/overflow value classes those miss.
+// union-default metadata/wire class: when a union field's branches are
+// CONTAINERS holding a leaf and the field has a default, the branch+value the
+// metadata selector reports must match the branch+value the wire auto-fill
+// produces, on both wire formats. Two findings landed from the SAME uncovered
+// cells — a float string→float coercion in a nested branch, then an int64→int32
+// overflow wrap — both hidden because the prior nets drove only IN-RANGE values.
+// This matrix crosses the boundary/overflow classes those miss.
 //
-// Wire-as-oracle (the AUDIT_CORE matrix contract — the binary auto-fill decode is
-// canonical). Per cell × container:
-//   - Root().Schema() rebuild re-encodes the auto-fill BYTE-IDENTICALLY on binary
-//     AND JSON. This is the severe surface: a wrapped or wrong-branch default
-//     silently changes the schema's own wire through the documented "Root preserves
-//     all metadata" round-trip. Representation-agnostic, so it holds for a logical
-//     leaf whose Default surfaces the raw Avro-native value (NOT_BUGS #30) while the
-//     wire decodes the transformed value.
-//   - the direct JSON decode auto-fill (DecodeJSON of an empty object, which
-//     materializes the stored default via applyFieldDefault) agrees with the binary
-//     auto-fill (matEqual).
-//   - for non-logical leaves, Root().Fields[].Default equals the binary auto-fill
-//     decode type-exactly (matEqual) — the direct metadata pin the int64→int32 wrap
-//     violated (int32(-1294967296) where the wire decoded float64(3e9)).
+// Wire-as-oracle (the AUDIT_CORE matrix contract). Per cell x container:
+//   - Root().Schema() rebuild re-encodes the auto-fill BYTE-IDENTICALLY on both
+//     wires. The severe surface: a wrapped or wrong-branch default silently
+//     changes the schema's own wire through the documented "Root preserves all
+//     metadata" round-trip. Representation-agnostic, so it holds for a logical
+//     leaf whose Default surfaces the raw Avro-native value (NOT_BUGS #30).
+//   - the direct JSON decode auto-fill agrees with the binary auto-fill.
+//   - for non-logical leaves, Root().Fields[].Default equals the binary
+//     auto-fill decode type-exactly — the pin the int64→int32 wrap violated.
 //
-// Each cell pairs a leaf branch with a VALUE-ADMITTING wider/other sibling branch so
-// the schema parses: an overflow default the leaf rejects is held by the sibling and
-// the divergence surfaces. A same-class-rejecting sibling would reject the schema at
-// parse and hide the cell behind a parse error — exactly how these escaped (see
-// TestMatrix_UnionContainerNestedIntDefaultOverflowMatchesWire and
-// TestMatrix_UnionContainerNestedFloatDefaultSelectionMatchesWire, the
-// single-shape pins this matrix generalizes).
+// Each cell pairs a leaf branch with a VALUE-ADMITTING wider sibling so the
+// schema parses: an overflow default the leaf rejects is held by the sibling and
+// the divergence surfaces. A same-class-rejecting sibling would reject at parse
+// and hide the cell — exactly how these escaped.
 func TestMatrix_GenerativeUnionContainerDefaultFill(t *testing.T) {
 	for _, c := range udfCells() {
 		for _, cont := range udfContainers() {
@@ -2041,33 +2020,27 @@ func TestMatrix_GenerativeJSONNumberBoundary(t *testing.T) {
 }
 
 // ===========================================================================
-// Pointer-indirection depth × container context.
+// Pointer-indirection depth x container context.
 //
 // The codec peels a pointer/interface chain on BOTH the encode input and the
-// decode target, capped at maxIndirectDepth levels: a chain bottoming at a
-// non-pointer base WITHIN the cap is accepted, one level deeper is rejected.
-// That single cap must hold at EVERY context a value can sit in and across
-// EVERY path — binary encode, JSON encode, and natural + identity-resolved
-// decode of both wires — or a wire one path emits is a wire another path (or
-// the same path's own reader) refuses: a binary↔JSON / encode↔decode
-// round-trip break. The bug shape is a context-local peel that drifts from the
-// cap by re-indirecting an already-peeled value: a union target indirected at
-// two stages (unionTarget then the branch decode), or a container element
-// unwrapped one level inline then handed to a full-budget indirect — each
-// accepting up to one-or-two-times maxIndirectDepth where every leaf accepts
-// exactly the cap. Such a drift is invisible to round-trip-from-typed-input
+// decode target, capped at maxIndirectDepth: a chain bottoming at a non-pointer
+// base WITHIN the cap is accepted, one level deeper rejected. That single cap
+// must hold at EVERY context and across EVERY path — binary encode, JSON encode,
+// natural + identity-resolved decode of both wires — or a wire one path emits is
+// one another path refuses. The bug shape is a context-local peel that drifts by
+// re-indirecting an already-peeled value: a union target indirected at two
+// stages, or a container element unwrapped one level inline then handed to a
+// full-budget indirect. Such a drift is invisible to round-trip-from-typed-input
 // (the input never nests past the cap) and to value/wire sweeps (depth carries
-// no wire bytes); only crossing the depth axis with the context axis the peel
-// is supposed to be identical across exposes it.
+// no wire bytes); only crossing depth with context exposes it.
 //
-// Crosses pointer depth {0, 1, at-cap, past-cap} × context {top, record field,
-// 2-branch null union, 3+-branch union, array, map} × base primitive ×
-// {binary, JSON} encode × {binary, JSON} wire × {natural, identity-resolved}
-// decode, asserting (a) all six paths agree on accept/reject at each depth
-// AGAINST THE EXPLICIT CAP (so a "reject everything" regression is caught too,
-// not merely mutual agreement), (b) an accepted value round-trips to the
-// identical base on every path, and (c) pointer wrapping is wire-invariant — a
-// deep input encodes to the same bytes as the bare base.
+// Crosses depth {0, 1, at-cap, past-cap} x context {top, record field, 2-branch
+// null union, 3+-branch union, array, map} x base primitive x {binary, JSON}
+// encode x {binary, JSON} wire x {natural, identity-resolved} decode, asserting
+// (a) all six paths agree on accept/reject AGAINST THE EXPLICIT CAP, so a
+// "reject everything" regression is caught too, (b) an accepted value
+// round-trips to the identical base on every path, and (c) pointer wrapping is
+// wire-invariant.
 // ===========================================================================
 
 // ptrIndirectCap mirrors the package-internal maxIndirectDepth (reflect.go):
@@ -2331,33 +2304,29 @@ func TestMatrix_GenerativePointerIndirection(t *testing.T) {
 }
 
 // ===========================================================================
-// Pointer-indirection depth × FIELD-OF-CONTAINER context — the unsafe struct-
-// field CONTAINER fast paths.
+// Pointer-indirection depth x FIELD-OF-CONTAINER context — the unsafe
+// struct-field CONTAINER fast paths.
 //
-// TestMatrix_GenerativePointerIndirection crosses depth × context, but its
-// contexts all carry the chain at TOP LEVEL or as a SCALAR struct field, so they
-// reach only the reflect serArray/serMap and the unsafe SCALAR field-pointer fast
-// path — never the unsafe struct-field CONTAINER fast paths
-// (tryCompileFieldSer/tryCompileFieldDeser's usArrayRecord→usArrayPtrRecord /
-// udArrayPtrRecord, usNullUnionRecord / udNullUnionRecord, and
-// usArrayNullUnionRecord / usArrayNullUnionPtr). Those arms fire ONLY for an
-// array / null-union / array-of-null-union element INSIDE an ADDRESSABLE struct
-// field. Each hand-peels exactly one pointer level inline (the element or the
-// null-union optional) and delegates the remainder to a full-budget indirect
-// (rec.ser / rec.deser); the recurring family bug is a MISSING multi-level-
-// pointer decline at one such arm, so it accepts 1+maxIndirectDepth levels where
-// the reflect element handler, the encode side, and every other context cap at
-// maxIndirectDepth — emitting a wire the same struct encoded as a non-addressable
-// VALUE (reflect), a top-level encode, and the wire's own reader all refuse.
+// TestMatrix_GenerativePointerIndirection crosses depth x context, but its
+// contexts carry the chain at TOP LEVEL or as a SCALAR struct field, so they
+// reach only the reflect serArray/serMap and the unsafe SCALAR field-pointer
+// path — never the unsafe struct-field CONTAINER paths (usArrayRecord →
+// usArrayPtrRecord / udArrayPtrRecord, usNullUnionRecord / udNullUnionRecord,
+// usArrayNullUnionRecord / usArrayNullUnionPtr), which fire ONLY for an array /
+// null-union / array-of-null-union element inside an ADDRESSABLE struct field.
+// Each hand-peels exactly one pointer level inline and delegates the remainder
+// to a full-budget indirect, so the recurring family bug is a MISSING
+// multi-level decline at one arm: it accepts 1+maxIndirectDepth where the
+// reflect element handler, the encode side, and every other context cap at
+// maxIndirectDepth — emitting a wire that the same struct encoded as a
+// non-addressable value, a top-level encode, and the wire's own reader refuse.
 //
-// This net adds a RECORD base (so []*…*record / *…*record reach the record arms)
-// and FIELD-OF-CONTAINER contexts that encode BOTH the addressable *struct (=>
-// the unsafe container fast path) and the same struct as a non-addressable value
-// (=> reflect), asserting both agree with each other, with the generic any-tree
-// encode, and with the explicit cap at every depth {0,1,2,at-cap,past-cap}. A
-// double-peeling arm accepts the past-cap depth on the *struct path while the
-// reflect-value path rejects it: the divergence the scalar-field matrix above is
-// structurally blind to.
+// This net adds a RECORD base and FIELD-OF-CONTAINER contexts that encode BOTH
+// the addressable *struct and the same struct as a non-addressable value,
+// asserting both agree with each other, with the generic any-tree encode, and
+// with the explicit cap at every depth. A double-peeling arm accepts past-cap on
+// the *struct path while the reflect path rejects it — the divergence the
+// scalar-field matrix is structurally blind to.
 // ===========================================================================
 
 // ptrIndRec is the record base for the field-of-container pointer net: a minimal
@@ -2814,45 +2783,38 @@ func TestMatrix_NullUnionNilEquivalenceParity(t *testing.T) {
 // The CustomType-resurrected-logical parity battery — the WHOLE matrix in one
 // test, so this class can't dribble a cell at a time.
 //
-// Background. A logical type placed on an Avro underlying it is not spec-valid
-// for (uuid on bytes, duration on a size!=12 fixed, a date/timestamp on string,
-// big-decimal on fixed, …) is SOFT-DROPPED by validateLogical, leaving the bare
-// underlying — matching Java/fastavro/hamba. A registered CustomType whose
-// LogicalType matches RESURRECTS the dropped logical (schema.go buildComplex).
-// The contract: a resurrected wrong-kind / wrong-size logical must fall through
-// to the RAW size/kind-checked path on EVERY axis, applying logicalUnderlyingAccept
-// (validateLogical's own predicate) uniformly. Prior rounds closed this one cell
-// per round — JSON typed decode (25a6e66), binary primitive encode (8236008),
-// fixed-encode wrong size (ff86592). This battery drives every cell at once:
+// A logical placed on an Avro underlying it is not spec-valid for (uuid on
+// bytes, duration on a size!=12 fixed, a timestamp on string, big-decimal on
+// fixed) is SOFT-DROPPED by validateLogical, matching Java/fastavro/hamba. A
+// registered CustomType whose LogicalType matches RESURRECTS it. The contract: a
+// resurrected wrong-kind/wrong-size logical must fall through to the RAW
+// size/kind-checked path on EVERY axis, applying logicalUnderlyingAccept
+// uniformly. Prior rounds closed one cell per round (25a6e66, 8236008, ff86592);
+// this drives every cell at once:
 //
 //	  logical × {wrong-kind, wrong-size} × {encode, decode}
 //	         × {binary, JSON} × {natural, resolved deser}
 //	         × {decode-into-any, decode-into-logical-typed-target}
 //	         × {wildcard custom, AvroType-match custom, AvroType-mismatch custom}
 //
-// Oracle (independent of the code under test): the PLAIN schema — the same
-// schema string parsed with NO CustomType — which soft-drops the logical to its
-// bare underlying. Invariant: for EVERY resurrecting CustomType shape, the
-// custom schema must be byte/value/accept-identical to the plain schema on every
-// axis, and every wire it emits must round-trip through its own (natural AND
-// resolved) reader. A logical serializer or deserializer wrongly applied to the
-// wrong kind/size shows up as a wire-byte, accept, or value divergence from the
-// plain schema, or a wire its own reader can't read.
+// Oracle, independent of the code under test: the PLAIN schema — the same string
+// parsed with NO CustomType, which soft-drops the logical. For EVERY
+// resurrecting shape the custom schema must be byte/value/accept-identical to
+// plain on every axis, and every wire it emits must round-trip through its own
+// natural AND resolved reader.
 //
-// The three resurrecting custom shapes matter independently:
-//   - wildcard  ({LogicalType}):        resurrects AND suppresses (any kind).
-//   - AvroType-match ({LogicalType,kind}): resurrects AND suppresses (kind ==).
-//   - AvroType-mismatch ({LogicalType,"boolean"}): resurrects (LogicalType-keyed)
-//     but does NOT suppress (kind !=) — the decode-side gap, where the bare
-//     hasMatchingCustomType suppression doesn't fire but logicalUnderlyingAccept
-//     must still keep the codec raw.
+// The three resurrecting shapes matter independently: wildcard ({LogicalType})
+// resurrects and suppresses on any kind; AvroType-match resurrects and
+// suppresses when the kind matches; AvroType-mismatch resurrects (LogicalType-
+// keyed) but does NOT suppress — the decode-side gap, where the bare
+// hasMatchingCustomType suppression doesn't fire but logicalUnderlyingAccept
+// must still keep the codec raw.
 //
-// Non-vacuity: each cell feeds BOTH a raw underlying value AND a "canary" value
-// the wrongly-applied logical serializer would accept (a UUID string, an
-// avro.Duration, a time.Time, a *big.Rat). A neutered gate (logical ser/deser
-// applied kind/size-blind) makes the custom schema diverge from the plain one on
-// the canary (encode) or on the typed target (decode) — verified by reverting any
-// single fix in schema.go / json_decode.go.
+// Non-vacuity: each cell feeds BOTH a raw underlying value and a "canary" the
+// wrongly-applied logical serializer would accept (a UUID string, an
+// avro.Duration, a time.Time, a *big.Rat). A neutered gate makes the custom
+// schema diverge from plain on the canary or on the typed target — verified by
+// reverting any single fix in schema.go / json_decode.go.
 
 func TestCensus_CustomResurrectedLogicalFullMatrixParity(t *testing.T) {
 	for _, c := range resurrectionCells() {
@@ -3662,52 +3624,43 @@ func TestMatrix_CacheSelfContainedNamespaces(t *testing.T) {
 
 // ---------- matrix_cache_multiparse_test.go ----------
 
-// This file is the generative MULTI-PARSE SchemaCache net (Family 7:
-// 807c6d9 → 7cab9bd → de3dca3 → 254eee0). A schema built via a SchemaCache that
-// references named types defined in PRIOR Parse calls resolves those references
-// in the node tree (Encode/Decode work), but the JSON-derived metadata forms
-// (Fingerprint / Canonical / Root / String) used to keep a dangling bare
-// reference — non-self-contained, fingerprint-divergent, SOE/registry-interop-
-// broken. The four-commit dribble fixed it one shape at a time: splice the
-// inherited def in (807c6d9), preserve doc/order/props (7cab9bd), keep the
-// spliced def namespace-stable (de3dca3), and dedupe overlapping/diamond defs
-// (254eee0).
+// The generative MULTI-PARSE SchemaCache net (Family 7: 807c6d9 → 7cab9bd →
+// de3dca3 → 254eee0). A schema built via a SchemaCache that references named
+// types defined in PRIOR Parse calls resolves those references in the node tree,
+// but the JSON-derived metadata forms (Fingerprint / Canonical / Root / String)
+// used to keep a dangling bare reference — non-self-contained,
+// fingerprint-divergent, SOE/registry-interop-broken. The four-commit dribble
+// fixed it one shape at a time: splice the inherited def in, preserve
+// doc/order/props, keep the spliced def namespace-stable, dedupe
+// overlapping/diamond defs.
 //
-// The existing regressions pin those shapes as POINT cases, and
-// TestMatrix_CacheSelfContainedNamespaces crosses a SINGLE cross-parse
-// reference against namespace/position/kind. This net is the missing
-// CROSS-PRODUCT over the reference-graph TOPOLOGY — single, transitive chains,
-// diamonds, wide overlap, diamond-with-a-chain-arm, a nested type referenced
-// before its container, and a single type referencing the same leaf TWICE
-// (repeat2 / repeat_chain) — each crossed with the namespace regime
-// (null / single-namespace / split-namespace), the position the shared leaf
-// sits in (record field / array items / map values / union branch), the
-// leaf kind (record / enum / fixed), AND the cross-parse reference SPELLING
-// (bare "X" vs wrapped {"type":"X"}). Crossing topology with the other axes is
-// where a gap in the dribble would hide; a point test per topology cannot
-// reach it.
+// The existing regressions pin those as POINT cases and
+// TestMatrix_CacheSelfContainedNamespaces crosses a SINGLE reference against
+// namespace/position/kind. This net is the missing CROSS-PRODUCT over the
+// reference-graph TOPOLOGY — single, transitive chains, diamonds, wide overlap,
+// diamond-with-a-chain-arm, a nested type referenced before its container, and a
+// type referencing the same leaf TWICE — crossed with the namespace regime, the
+// position the shared leaf sits in, the leaf kind, AND the reference SPELLING
+// (bare "X" vs wrapped {"type":"X"}).
 //
-// The SPELLING axis is the one a later fix (collapse a non-splicing wrapped
-// reference to bare) exposed: a cross-parse reference is accepted both bare and
-// wrapped (NOT_BUGS #23), so the self-contained metadata must be identical for
-// either. The bug shape it catches has two layers — (1) a wrapped cross-parse
-// reference that splices must be replaced as a WHOLE (else it self-contains as
-// the invalid {"type":{X-def}} and the rebuild silently falls back to a dangling
-// reference); (2) a LATER wrapped occurrence of a type whose first occurrence was
-// inlined must COLLAPSE to bare "X", else {"type":"X"} survives in String() where
-// the canonical bare form belongs. Layer 2 is invisible to every single-reference
-// topology and is exactly what repeat2 / repeat_chain / local_forwardref add.
+// The SPELLING axis is the one a later fix exposed: a cross-parse reference is
+// accepted both ways (NOT_BUGS #23), so the self-contained metadata must be
+// identical for either. Two layers — a wrapped reference that splices must be
+// replaced as a WHOLE (else it self-contains as the invalid {"type":{X-def}} and
+// the rebuild falls back to a dangling reference), and a LATER wrapped
+// occurrence of an already-inlined type must COLLAPSE to bare "X". Layer 2 is
+// invisible to every single-reference topology; repeat2 / repeat_chain /
+// local_forwardref add it.
 //
 // For every shape the cache-built schema is compared to a logically-identical
-// inline twin emitted by an INDEPENDENT first-occurrence oracle (mpEmitTwin —
-// DFS pre-order, full at first occurrence, bare fullname after, exactly Java's
-// NamedSchema.writeNameRef rule). The twin is spelling-INDEPENDENT, so it anchors
-// both spellings to one canonical form. The wire bytes for a sample value are the
-// oracle-independent anchor: equal wire proves the two schemas ARE the same
-// logical schema (the node tree resolved identically), so ANY divergence in
-// Fingerprint / Canonical / Root / String is then provably a metadata-form bug,
-// not a different schema. Non-vacuity is verified by neutering each fix in
-// cache.go and observing the failures (see the test's closing comment).
+// inline twin from an INDEPENDENT first-occurrence oracle (mpEmitTwin — DFS
+// pre-order, full at first occurrence, bare fullname after, exactly Java's
+// NamedSchema.writeNameRef rule), which is spelling-INDEPENDENT and so anchors
+// both spellings to one canonical form. The wire bytes for a sample value are
+// the oracle-independent anchor: equal wire proves the two schemas ARE the same
+// logical schema, so any divergence in the metadata forms is provably a
+// metadata-form bug. Non-vacuity is verified by neutering each fix in cache.go
+// (see the test's closing comment).
 
 // mpNode is one named type in an abstract multi-parse reference graph.
 type mpNode struct {
@@ -5421,27 +5374,25 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 // Unsafe struct-field NARROWING parity.
 //
 // The addressable-struct-field decode path (unsafe.go's ud* closures) carries
-// range guards of its own, written separately from the reflect path's. Nothing
-// in the type system ties the two sets together, so each is free to drift: a
-// missing bound there is a silent truncation or a sign wrap, which is
-// wrong-value-no-error rather than a failure.
+// range guards written separately from the reflect path's. Nothing in the type
+// system ties the two sets together, so each is free to drift: a missing bound
+// there is a silent truncation or a sign wrap — wrong-value-no-error rather than
+// a failure.
 //
 // A single-field record's wire IS its field's wire, so the SAME BYTES decoded
 // into the SAME Go type through the two paths is the oracle, and it needs no
-// expectation table: whatever the reflect path decides about a value is what
-// the struct-field path must decide.
+// expectation table.
 //
-// Axes: narrowing pair (wire avro type × Go target type) × value class
-// (over-max / under-min / in-range) × route (scalar field, *T field, []T field,
+// Axes: narrowing pair (wire avro type x Go target type) x value class
+// (over-max / under-min / in-range) x route (scalar field, *T field, []T field,
 // []*T field). The routes are the axis a per-kind bound table cannot supply —
 // the guard lives in the leaf closure, but only the composed route proves the
 // leaf is still reached once a null-union or an array sits above it.
 //
-// Agreement is asserted on three things, not one. The accept/reject verdict;
-// the REJECTION'S SHAPE, since an error naming the wrong Go type reads
-// differently to a caller than the reflect path's does and a verdict-only check
-// cannot see the difference; and the decoded value, since two paths that both
-// accept can still land on different numbers.
+// Agreement is asserted on three things: the verdict; the REJECTION'S SHAPE,
+// since an error naming the wrong Go type reads differently to a caller; and the
+// decoded value, since two paths that both accept can still land on different
+// numbers.
 // ---------------------------------------------------------------------------
 
 // narrowRoute is one composition sitting between the record field and the
@@ -7104,63 +7055,45 @@ func TestMatrix_NilShapesAcrossUnions(t *testing.T) {
 
 // ---------- matrix_feature_walker_test.go ----------
 
-// The SCHEMA-FEATURE × WALKER parity net.
+// The SCHEMA-FEATURE x WALKER parity net.
 //
 // The library has one wire parser and many parallel schema consumers
 // ("walkers"): String()'s re-parse, Canonical() and fingerprints, the Root()
 // metadata tree and its Schema() rebuild, the SchemaCache self-containment
-// walkers (definition collection and reference splicing), schema resolution
-// (including the custom-free writer view built for resolved JSON decoding),
-// resolved DecodeJSON, CheckCompatibility, and single-object encoding. Every
-// schema FEATURE the wire parser understands — alternate spellings, lifts,
-// normalizations, acceptances — must mean the same thing to every walker.
-// Historically, each feature × walker intersection that no test crossed has
-// drifted independently: a walker gates on its own re-derivation of the
-// parser's rule and covers a subset of the feature's reach.
+// walkers, schema resolution (including the custom-free writer view built for
+// resolved JSON decoding), resolved DecodeJSON, CheckCompatibility, and
+// single-object encoding. Every schema FEATURE the wire parser understands must
+// mean the same thing to every walker. Historically each feature x walker
+// intersection that no test crossed drifted independently: a walker gates on its
+// own re-derivation of the parser's rule and covers a subset of the feature's
+// reach.
 //
-// Structure: a table of feature rows × a table of walker drivers, run as the
-// full cross product. Each row carries a schema spelled WITH the feature and
-// its vanilla ("twin") spelling of the same logical schema, plus fragments
-// for the cache directions (a cross-parse reference INTO the feature's
-// subtree, and a named definition INSIDE the feature's subtree) and a
-// resolve-compatible variant. Each driver asserts one consumer treats
-// feature and twin identically. The invariant in every cell is PARITY with
-// the wire parser / the vanilla twin — never a hardcoded expectation, so
-// rows stay cheap to add.
+// Structure: a table of feature rows x a table of walker drivers, run as the
+// full cross product. Each row carries a schema spelled WITH the feature and its
+// vanilla ("twin") spelling of the same logical schema, plus fragments for the
+// cache directions and a resolve-compatible variant. The invariant in every cell
+// is PARITY with the wire parser / the vanilla twin — never a hardcoded
+// expectation, so rows stay cheap to add. Adding a feature is adding a row.
 //
-// Adding a feature to the net = adding a row. Seeded families: the flat
-// (goavro field-format) lift across all six kinds plus composition and the
-// namespace-decoy trap; lax names (WithLaxNames-only shapes, split-vs-inline
-// fullname twins); the three field-level logicalType lift shapes;
-// case-variant reserved keys; wrapped ({"type":"X"}) and forward references
-// (diamond + recursive); aliases-any-string; degenerate cardinalities
-// (empty fields/symbols/branches, size-0 fixed); duplicate-key last-wins;
-// and implicit null defaults. Each family block below documents what its
-// twin means and where its feature survives to; drivers skip explicitly
-// (with the reason at the row or driver) where a row has no structural
-// position for them — a nil sample marks a parseable-but-unusable kind.
+// Seeded families: the flat (goavro field-format) lift across all six kinds plus
+// composition and the namespace-decoy trap; lax names; the three field-level
+// logicalType lift shapes; case-variant reserved keys; wrapped and forward
+// references (diamond + recursive); aliases-any-string; degenerate cardinalities;
+// duplicate-key last-wins; implicit null defaults. Drivers skip explicitly,
+// with the reason at the row or driver, where a row has no structural position
+// for them; a nil sample marks a parseable-but-unusable kind.
 //
-// One walker family lives OUTSIDE the row/driver shape because its
-// feature deliberately breaks twin parity on the as-written surfaces:
-// STRAY structural keys (a reserved container key on a kind that does not
-// bind it — inert to the parser, surfaced as-written by the metadata
-// walker: schema-shaped bodies structurally, non-schema-shaped bodies in
-// Props verbatim). Its walkers-must-not-consume-strays net is
-// TestMatrix_CacheStrayStructuralKey (SchemaCache collect / splice /
-// metadata name table, carrier × key × def relation × surface),
-// TestMatrix_CacheStrayRebuildSurface (the render + its dedup consult:
-// rebuild succeeds, preserves strays props-independently, stays stable
-// across generations), TestMatrix_StrayBodyShapeRouting (key × body
-// shape × carrier × surfacing route, with the fastavro differential
-// arm), TestMatrix_SchemaForStrayStructuralKey (the composition
-// walkers, props and typed planting routes), and — for SIMULTANEOUS
-// case-variant duplicate spellings of one reserved key, the axis the
-// single-spelling rows here never cross — TestMatrix_ReservedKeyDuplicateSpellings
-// + its field-level and cache-splice twins (only the CI pick is
-// consulted/consumed; every other spelling rides to Props verbatim); a
-// new consumer of walkNodeChildren — or any walker/consult of either
-// tree representation (FIX.md item 3's representation checklist) — owes
-// cells there, not a row here.
+// One walker family lives OUTSIDE the row/driver shape because its feature
+// deliberately breaks twin parity on the as-written surfaces: STRAY structural
+// keys (a reserved container key on a kind that does not bind it — inert to the
+// parser, surfaced as-written by the metadata walker). Its nets are
+// TestMatrix_CacheStrayStructuralKey, TestMatrix_CacheStrayRebuildSurface,
+// TestMatrix_StrayBodyShapeRouting, TestMatrix_SchemaForStrayStructuralKey, and
+// — for SIMULTANEOUS case-variant duplicate spellings of one reserved key, the
+// axis the single-spelling rows here never cross —
+// TestMatrix_ReservedKeyDuplicateSpellings plus its field-level and cache-splice
+// twins. A new consumer of walkNodeChildren, or any walker of either tree
+// representation (FIX.md item 3's checklist), owes cells there, not a row here.
 type featureWalkerRow struct {
 	name string
 
@@ -9424,24 +9357,18 @@ func jnStringSample(label string) any {
 // json.Number encode SOURCE identically to its underlying numeric type.
 //
 // json.Number is a numeric carrier (NOT_BUGS #35): its content must be a valid
-// RFC 8259 number, so a logical layered on a numeric base — date on int;
-// time-*/timestamp-*/local-timestamp-* on int/long — must never be MORE LENIENT
-// about non-numeric json.Number content than the plain int/long it wraps. The
-// ORACLE is calibration-free: the underlying numeric schema's own accept/reject
-// verdict for the same json.Number. No hardcoded "what is a number" list, so it
-// cannot rot as the numeric parser's grammar evolves.
+// RFC 8259 number, so a logical layered on a numeric base must never be MORE
+// LENIENT about non-numeric content than the plain int/long it wraps. The ORACLE
+// is calibration-free: the underlying numeric schema's own verdict for the same
+// json.Number, so there is no hardcoded "what is a number" list to rot.
 //
 // The discriminating input is content that is a valid TEMPORAL STRING but an
-// INVALID number ("2024-01-01", "2024-01-01T00:00:00Z"): the date/timestamp
-// encode string-convenience arms (tryParseDateString / tryParseTimeString) once
-// fired for json.Number (whose Kind() is reflect.String), encoding it as a
-// date/timestamp where the numeric twin rejects it. A generic non-numeric
-// battery ("xyz", "1.2.3") never reaches that arm — those fail time.Parse too,
-// so they reject with or without the leniency; only a temporal-shaped string
-// separates the buggy path from the correct one. This net is the differential
-// complement to TestMatrix_JSONNumberPolicy (which asserts the numeric base's
-// ABSOLUTE reject of non-numeric content); together they pin both "the base
-// rejects" and "the logical matches the base," across every encode context.
+// INVALID number ("2024-01-01T00:00:00Z"): the date/timestamp encode
+// string-convenience arms once fired for json.Number, whose Kind() is
+// reflect.String, encoding it where the numeric twin rejects. A generic
+// non-numeric battery never reaches that arm — those fail time.Parse too, so
+// they reject with or without the leniency. Differential complement to
+// TestMatrix_JSONNumberPolicy, which asserts the base's ABSOLUTE reject.
 func TestMatrix_JSONNumberLogicalMatchesNumericTwin(t *testing.T) {
 	logicals := []struct {
 		label, schema, twin string
@@ -10922,35 +10849,27 @@ func TestMatrix_DecodeTargetRejectionParity(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Resolved-schema DecodeJSON union matrix: input form {tagged envelope, bare
-// value} × colliding-branch union shapes × reader resolution
-// {identical-branch, per-branch-divergent}.
+// value} x colliding-branch union shapes x reader resolution {identical-branch,
+// per-branch-divergent}.
 //
 // The independent oracle for every cell is the resolved BINARY decode of the
-// equivalent writer wire: DecodeJSON on a schema returned by Resolve consumes
+// equivalent writer wire: DecodeJSON on a Resolve-returned schema consumes
 // writer-shaped JSON and must land exactly where resolved.Decode lands on the
-// writer binary carrying the same branch choice (the JSON is parsed against
-// the writer, then resolved — Java's ResolvingDecoder over a JsonDecoder
-// built with the writer schema).
+// writer binary carrying the same branch choice — Java's ResolvingDecoder over a
+// JsonDecoder built with the writer schema.
 //
 //   - TAGGED cells name a branch via the spec's {"branch": value} envelope.
-//     Every shape's branch pair accepts the same value, so the envelope is
-//     the only carrier of the writer's choice; each cell drives BOTH
-//     branches and asserts the resolved decode (plain and TaggedUnions
-//     projections) matches the binary oracle for the SAME tagged choice —
-//     branch identity must survive even though the value alone would
-//     first-match an earlier branch.
-//   - BARE cells carry the value without an envelope. The bare form does
-//     not name the writer's branch, so the decoder commits to the FIRST
-//     declaration-order branch of the matching JSON token class — the
-//     documented lossy leniency (see the TaggedUnions doc) — and
-//     resolution then applies to THAT branch. The oracle is the binary
-//     wire of the first-match branch. This holds on a resolved schema
-//     exactly as on a plain one, including where the first-match branch
-//     is an enum or fixed declared before a string/bytes sibling.
+//     Every shape's branch pair accepts the same value, so the envelope is the
+//     only carrier of the writer's choice; branch identity must survive even
+//     though the value alone would first-match an earlier branch.
+//   - BARE cells carry the value without an envelope, so the decoder commits to
+//     the FIRST declaration-order branch of the matching token class — the
+//     documented lossy leniency — and resolution applies to THAT branch. The
+//     oracle is the binary wire of the first-match branch, including where that
+//     branch is an enum or fixed declared before a string/bytes sibling.
 //
-// Shapes include a recursive record pair and a diamond (shared named-type
-// reference) pair so the dispatch is exercised on reference paths, not only
-// on first definitions.
+// Shapes include a recursive record pair and a diamond pair so the dispatch is
+// exercised on reference paths, not only on first definitions.
 // ---------------------------------------------------------------------------
 
 type resolvedUnionBranch struct {
@@ -11774,27 +11693,22 @@ func TestMatrix_SelfReadableAtScale(t *testing.T) {
 		})
 	}
 
-	// Decimal UNSCALED-LENGTH axis (maxDecimalUnscaledBytes = 32 KiB), the
-	// bound orthogonal to the scale generator above.
+	// Decimal UNSCALED-LENGTH axis (maxDecimalUnscaledBytes = 32 KiB), the bound
+	// orthogonal to the scale generator above.
 	//
-	// This axis has to sweep the CARRIER, because the carrier is what decides
-	// whether any upstream gate is reached at all — and the gates differ:
-	//
-	//   - a numeric carrier on "decimal" is bounded by the DECLARED PRECISION,
-	//     itself parse-capped, so it cannot reach the length bound;
-	//   - a numeric carrier on "big-decimal" is bounded by NOTHING, because
-	//     that logical type has no precision attribute to declare;
-	//   - the opaque []byte escape hatch is bounded by neither, on either.
-	//
-	// The fixed container is a third route again: it pads to the schema's SIZE
-	// whatever the value, so the size alone decides the emitted width and every
-	// carrier lands in the same place. A net that drove only *big.Rat on a
-	// bytes/decimal would see the precision gate fire and conclude the bound
-	// was unreachable from the producer side.
+	// This axis has to sweep the CARRIER, because the carrier decides whether any
+	// upstream gate is reached at all, and the gates differ: a numeric carrier on
+	// "decimal" is bounded by the DECLARED PRECISION, itself parse-capped, so it
+	// cannot reach the length bound; a numeric carrier on "big-decimal" is
+	// bounded by NOTHING, that logical having no precision attribute; the opaque
+	// []byte escape hatch is bounded by neither. The fixed container is a third
+	// route: it pads to the schema's SIZE whatever the value, so size alone
+	// decides the emitted width. A net driving only *big.Rat on a bytes/decimal
+	// would see the precision gate fire and conclude the bound was unreachable.
 	//
 	// The single-object and OCF wires are here because they re-frame the same
 	// encoder output: an escape that reaches them ships a FILE whose reader
-	// cannot open it, which is strictly worse than a rejected call.
+	// cannot open it, strictly worse than a rejected call.
 	const unscaledCap = 32 << 10
 	rawOf := func(n int) []byte {
 		b := make([]byte, n)
@@ -12755,24 +12669,22 @@ func TestMatrix_TypedContainersPerFragment(t *testing.T) {
 // Integer arithmetic over a schema-declared magnitude.
 //
 // A `fixed` size is an integer the schema text names outright, and the parser
-// deliberately leaves its upper bound open (schema.go's fixed arm: the lenient
-// majority, matching fastavro and avro-rs, since a size past the datum simply
-// fails at encode/decode). That makes it the one parse-time magnitude whose
-// VALUE is not bounded by the length of the text declaring it: nineteen
-// characters name 2^63. Every other schema-text quantity is bounded either by
-// a parse cap (precision and scale, at decimalScaleLimit) or by the input
-// length itself (field, branch and symbol counts each cost bytes to write).
+// deliberately leaves its upper bound open (the lenient majority, matching
+// fastavro and avro-rs, since a size past the datum simply fails at
+// encode/decode). That makes it the one parse-time magnitude whose VALUE is not
+// bounded by the length of the text declaring it: nineteen characters name 2^63.
+// Every other schema-text quantity is bounded either by a parse cap or by the
+// input length itself.
 //
-// So any arithmetic that can carry such a magnitude has to say what happens at
-// the top of the range. The failure this file pins is not the magnitude itself
-// but a SUM over it: a per-item wire minimum is accumulated field by field, and
-// an overflow guard that tests only `s >= MaxInt32` lets a wrapped-negative sum
-// through, because a negative number is not greater than a positive one. The
-// sum then reaches a divisor.
+// So any arithmetic carrying such a magnitude has to say what happens at the top
+// of the range. What this pins is not the magnitude but a SUM over it: a
+// per-item wire minimum accumulated field by field, where an overflow guard
+// testing only `s >= MaxInt32` lets a wrapped-negative sum through, because a
+// negative number is not greater than a positive one. The sum then reaches a
+// divisor.
 //
-// The pins below are behavioral. The producer invariant and the source-derived
-// site registry at the bottom are what keep the class closed rather than the
-// instance.
+// The pins below are behavioral; the producer invariant and the source-derived
+// site registry at the bottom keep the class closed rather than the instance.
 // ---------------------------------------------------------------------------
 
 // The three shapes a derived per-item minimum can take when the arithmetic

@@ -3608,34 +3608,27 @@ func TestInvariant_MagnitudeCeilingSurvivesItsLargestMultiplier(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // The enumeration: every site in the package where a schema-declared magnitude
-// meets an arithmetic operator.
-//
-// WHAT DISTINGUISHES A HAZARDOUS SITE FROM A SAFE ONE. Three conditions, all
-// required:
+// meets an arithmetic operator. Three conditions, all required:
 //
 //  1. An operand carries a magnitude the schema TEXT chose. The only primitive
-//     one is a `fixed` size (the parser leaves its upper bound open); the
-//     others — precision, scale — are parse-capped, and counts are bounded by
-//     the input length. But magnitude PROPAGATES: through arithmetic, through
-//     a function that returns it, and through a function it is passed into.
-//     A per-record sum over field minimums holds no `.size` anywhere in its
-//     expression and is the wrap this file exists for, which is why a set
-//     built by grepping `.size` is the wrong set.
+//     one is a `fixed` size, the parser leaving its upper bound open; precision
+//     and scale are parse-capped, and counts are bounded by the input length.
+//     But magnitude PROPAGATES: through arithmetic, through a function that
+//     returns it, and through one it is passed into. A per-record sum over field
+//     minimums holds no `.size` anywhere in its expression and is the wrap this
+//     file exists for, which is why a set built by grepping `.size` is wrong.
 //  2. The operator can leave the integer range: + - * / % <<, or a make()
 //     length. Comparisons cannot — `a < b` has the same answer at every
-//     magnitude — and neither can formatting or assignment. This is why
-//     grepping `.size` OVER-reports: most of its reads are comparisons.
+//     magnitude — and neither can formatting or assignment. This is why grepping
+//     `.size` OVER-reports: most of its reads are comparisons.
 //  3. The value is an INTEGER. A magnitude handed on as []byte, string or
-//     *big.Int has left the integer domain, and nothing downstream of it can
-//     wrap on the magnitude's account.
+//     *big.Int has left the integer domain.
 //
 // So the rule is reachability, not a pattern, and it is derived below rather
 // than listed: seeds are the magnitude-bearing fields, and taint flows to
-// integer-typed returns and integer-typed parameters until it stops growing.
-// The derivation deliberately OVER-approximates — it has no types, so a
-// reflect.Type's Size() reads as a magnitude — and every over-report is a row
-// saying so. An enumeration with a reason per entry is auditable; the count
-// alone is what keeps costing rounds.
+// integer-typed returns and parameters until it stops growing. The derivation
+// deliberately OVER-approximates — it has no types, so a reflect.Type's Size()
+// reads as a magnitude — and every over-report is a row saying so.
 // ---------------------------------------------------------------------------
 
 type magVerdict string
@@ -4492,27 +4485,23 @@ type appenderStruct struct {
 	B contractAppender `avro:"b"`
 }
 
-// TestMatrix_AppendTextReturnShapes crosses every AppendText return
-// shape with every encode position that reaches appendAvroString's
-// inline-write backfill. The contract:
+// TestMatrix_AppendTextReturnShapes crosses every AppendText return shape with
+// every encode position that reaches appendAvroString's inline-write backfill:
 //
 //   - No return shape may panic, anywhere.
-//   - A legal append (including a zero-length append) produces wire
-//     bytes byte-identical to encoding the equivalent plain string —
-//     the happy path is untouched by the shrunk-return guard.
-//   - A fresh return SHORTER than the input is the detectable
-//     violation (the backfill length arithmetic would go negative):
-//     it yields the named *SemanticError at every position.
-//   - A fresh return >= the input length passes the length guard and
-//     is NOT detectable without comparing prefix bytes on every encode
-//     (a per-string memcmp of everything encoded so far — a cost the
-//     encoder deliberately does not pay for the caller's own contract
-//     violation; encoding/json/v2's jsontext.AppendRaw trusts the
-//     append contract the same way). Documenting: those shapes return
-//     err == nil with the accumulated output replaced by the fresh
-//     slice's content and the length header backfilled at the
-//     placeholder offset; the exact observed bytes are pinned below so
-//     any future change to this posture is a deliberate one.
+//   - A legal append (including a zero-length one) produces wire bytes
+//     byte-identical to encoding the equivalent plain string.
+//   - A fresh return SHORTER than the input is the detectable violation (the
+//     backfill length arithmetic would go negative): it yields the named
+//     *SemanticError at every position.
+//   - A fresh return >= the input length passes the length guard and is NOT
+//     detectable without comparing prefix bytes on every encode — a per-string
+//     memcmp the encoder deliberately does not pay for the caller's own contract
+//     violation, the same way encoding/json/v2's jsontext.AppendRaw trusts the
+//     append contract. Those shapes return nil with the accumulated output
+//     replaced by the fresh slice's content and the length header backfilled at
+//     the placeholder offset; the exact observed bytes are pinned below so a
+//     future change to this posture is a deliberate one.
 //   - An error return surfaces the appender's error.
 func TestMatrix_AppendTextReturnShapes(t *testing.T) {
 	recordSchema := `{"type":"record","name":"R","fields":[

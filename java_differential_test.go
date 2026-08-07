@@ -625,28 +625,23 @@ func jsonValueEqual(a, b []byte) (bool, error) {
 	return eq(av, bv), nil
 }
 
-// TestDifferentialJavaValueMatrix sweeps a (schema × value) corpus through the
-// SchemaOracle RT command, asserting VALUE-level wire parity with the Java
-// reference on BOTH formats:
+// TestDifferentialJavaValueMatrix sweeps a (schema x value) corpus through the
+// SchemaOracle RT command, asserting VALUE-level wire parity with Java on both
+// formats:
 //
 //   - binary: Java binary-decodes twmb's Encode output and re-encodes it; the
-//     re-encode must be byte-identical (both impls produce the canonical
-//     single-block / varint forms), proving Java reads our binary AND agrees
-//     on the bytes. Multi-entry maps are exempt from the byte comparison
-//     (entry order is unspecified on both sides) and compare decoded-back.
+//     re-encode must be byte-identical, proving Java reads our binary AND agrees
+//     on the bytes. Multi-entry maps are exempt from the byte comparison (entry
+//     order is unspecified on both sides) and compare decoded-back.
 //   - JSON: twmb's EncodeJSON (TaggedUnions — the spec form Java emits) must
-//     match Java's JsonEncoder output. cmpJSON selects byte-identical
-//     comparison (where JSON text is canonical: ints, strings, containers,
-//     enum, tagged unions) or value-equal comparison (where equally-valid
-//     texts differ: float formatting "1" vs "1.0", \u00XX escaping style for
-//     the bytes/fixed codepoint string, U+2028 escaping, map key order).
+//     match Java's JsonEncoder. cmpJSON selects byte-identical comparison where
+//     the text is canonical, value-equal where equally-valid texts differ (float
+//     formatting, \u00XX escaping style, U+2028, map key order).
 //
 // Logical-typed values ride as their RAW base-type wire values through Java's
-// generic datum path (no Conversions registered), which is exactly what the
-// Avro JSON encoding of a logical type is — the base type's encoding.
-//
-// Every case failure is reported (Errorf, not Fatalf) so one CI run yields
-// the complete divergence list.
+// generic datum path (no Conversions registered), which is exactly what the Avro
+// JSON encoding of a logical type is. Every case failure is reported with Errorf
+// so one CI run yields the complete divergence list.
 func TestDifferentialJavaValueMatrix(t *testing.T) {
 	rt := startSchemaOracle(t)
 

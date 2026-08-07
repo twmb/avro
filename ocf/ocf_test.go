@@ -2932,28 +2932,21 @@ func TestRegression_OCFBlockEnvelopeInvariant(t *testing.T) {
 	}
 }
 
-// TestRegression_OCFBlockCountCap locks in the DoS-resistance cap on
-// the OCF block count, which was previously uncapped. For zero-byte
-// record schemas (EmptyRecord, records of all-null-typed fields) every
-// record encodes to 0 wire bytes; without the cap an attacker could
-// claim ~10^9 records in a 5-byte zigzag-varint count, forcing the
-// user's `for rd.Decode(&v) == nil` loop to iterate that many times
-// (each call advancing rd.block by 0 bytes) from a tiny attacker input
-// — ~10^9 CPU amplification.
+// TestRegression_OCFBlockCountCap locks the DoS-resistance cap on the OCF block
+// count, previously uncapped. For zero-byte record schemas every record encodes
+// to 0 wire bytes, so without the cap an attacker could claim ~10^9 records in a
+// 5-byte zigzag-varint count, forcing the user's `for rd.Decode(&v) == nil` loop
+// to iterate that many times from a tiny input — ~10^9 CPU amplification.
 //
-// The cap (readBlock in ocf.go) bounds count by
+// The cap (readBlock) bounds count by len(decompressed block) +
+// maxOCFZeroByteSlack, the slack matching deser.go:558's maxZeroByteItems
+// philosophy for array<null>/array<EmptyRecord> block counts. Legitimate
+// zero-byte schemas split into multiple blocks when the per-block count exceeds
+// the slack.
 //
-//	len(decompressed block) + maxOCFZeroByteSlack
-//
-// where the slack matches deser.go:558's maxZeroByteItems philosophy
-// for Avro array<null>/array<EmptyRecord> block-counts. Legitimate
-// zero-byte schemas split into multiple blocks when the per-block
-// record count exceeds the slack.
-//
-// Java's DataFileStream (lang/java/avro/src/main/java/org/apache/avro/
-// file/DataFileStream.java:303) and fastavro's _iter_avro_records
-// (_read_py.py:807) leave this uncapped — this cap is twmb's
-// defense-in-depth extension matching its existing array/map caps.
+// Java's DataFileStream (:303) and fastavro's _iter_avro_records (_read_py.py:807)
+// leave this uncapped; the cap is twmb's defense-in-depth extension matching its
+// existing array/map caps.
 func TestRegression_OCFBlockCountCap(t *testing.T) {
 	zigzag := func(n int64) []byte {
 		u := uint64(n<<1) ^ uint64(n>>63)
@@ -4344,25 +4337,18 @@ func TestMatrix_ReaderSchemaFuncReturnShapes(t *testing.T) {
 // Nil has two spellings, and an option is only "supported" if BOTH of them
 // behave the same on EVERY constructor.
 //
-// WithCodec takes an interface. A caller writes nil two ways without meaning
-// anything different by them:
-//
-//	WithCodec(nil)               // nil interface
-//	WithCodec(newMyCodec())      // non-nil interface holding a nil *myCodec,
-//	                             // when newMyCodec has a concrete return type
-//
-// The second is the ordinary Go typed-nil shape — a constructor that returns
-// *T and yields nil on a path the caller did not check. It passes c != nil.
+// WithCodec takes an interface, and a caller writes nil two ways without meaning
+// anything different by them: WithCodec(nil), and WithCodec(newMyCodec()) where
+// the constructor's concrete return type yields a non-nil interface holding a
+// nil *myCodec. The second passes c != nil.
 //
 // A method call on either is a crash, so the library must not make one. The
-// severity a CALLER sees, however, is not uniform, and this file records that
-// rather than leaving it to be rediscovered: whether an unwanted Close PANICS
-// depends on the caller's own code. A Close with a pointer receiver that touches
-// a field dies on a nil receiver; a Close written nil-safe returns cleanly and
-// the wrong call is INVISIBLE. So a matrix built only from dereferencing codecs
-// would measure "does it crash" and would pass, vacuously, against any nil-safe
-// codec. The nilSafe rows exist to make the library's mistake observable
-// WITHOUT a crash: they count the calls the library had no business making.
+// severity a CALLER sees is not uniform: a Close with a pointer receiver that
+// touches a field dies on a nil receiver, while a nil-safe Close returns cleanly
+// and the wrong call is INVISIBLE. So a matrix built only from dereferencing
+// codecs would measure "does it crash" and pass vacuously against any nil-safe
+// codec. The nilSafe rows make the library's mistake observable WITHOUT a crash:
+// they count the calls the library had no business making.
 // ---------------------------------------------------------------------------
 
 // nilSafeCloses counts Close calls that arrived on a NIL *nilSafeCodec. A nil
@@ -4529,36 +4515,28 @@ type ctorRunner struct {
 	run        func(t *testing.T, headerCodec string, opts []Opt) (io.Closer, error)
 }
 
-// TestMatrix_NilCodecOfferIgnoredEverySpelling is the class eliminator.
+// TestMatrix_NilCodecOfferIgnoredEverySpelling is the class eliminator, over
+// spelling x constructor x offer layout x reader-side adoption.
 //
-// Axes, and why each is one:
-//
-//	spelling  x  constructor  x  offer layout  x  reader-side adoption
-//
-// spelling: the axis the defect turned on and the one the report was NOT
-// written in — the reported instance was a typed nil, and the untyped nil was
-// already pinned as working, on one constructor.
-//
-// constructor: DERIVED, not listed — the set comes from codecOwningConstructors'
-// go/ast walk, and the cross-check at the end fails if the source grows a
-// constructor this matrix does not drive.
-//
+// spelling: the axis the defect turned on and the one the report was NOT written
+// in — the reported instance was a typed nil, and the untyped nil was already
+// pinned as working, on one constructor.
+// constructor: DERIVED, not listed — the set comes from
+// codecOwningConstructors' go/ast walk, and the cross-check at the end fails if
+// the source grows a constructor this matrix does not drive.
 // offer layout: where the nil sits. The writer adopts by position and the
 // readers adopt by name, so "the nil is last" is a superseded offer on one and
 // an ordinary declined offer on the others; an all-nil layout must fall through
 // to the built-in on all three.
-//
-// reader-side adoption: the header names the real codec or it does not, which
-// crosses adopted against declined underneath every nil spelling.
+// reader-side adoption: the header names the real codec or it does not.
 //
 // The oracle is not read off current behavior. WithCodec documents that a nil
 // offer behaves as though it were not written, and Codec.Close is documented to
-// release the codec's resources — so the two facts asserted are that the
-// constructor produces a usable object (a nil offer cannot break a call that
-// would otherwise work) and that the library never calls Close on a codec the
-// caller did not effectively supply. The real codec's own count is the CONTROL:
-// it must still be closed exactly once, so a fix that ignored everything would
-// fail here.
+// release the codec's resources — so the two asserted facts are that the
+// constructor produces a usable object and that the library never calls Close on
+// a codec the caller did not effectively supply. The real codec's own count is
+// the CONTROL: it must still be closed exactly once, so a fix that ignored
+// everything would fail here.
 func TestMatrix_NilCodecOfferIgnoredEverySpelling(t *testing.T) {
 	var drivenCtors []string
 
@@ -4713,9 +4691,8 @@ func TestRegression_NilCodecOfferUnknownCodecRatherThanPanic(t *testing.T) {
 }
 
 // TestInvariant_NilCodecAskedThroughOnePredicate is the source-level half: the
-// behavioral matrix proves the constructors agree TODAY, and this keeps them
-// agreeing by construction, because the two sites that reach into a caller's
-// offers must ask the same question.
+// behavioral matrix proves the constructors agree TODAY, this keeps them
+// agreeing by construction.
 //
 // Derived, not listed: every non-test function that REACHES INTO a []Codec —
 // ranging over one or indexing one — is handling caller-supplied offers and must
@@ -4724,20 +4701,15 @@ func TestRegression_NilCodecOfferUnknownCodecRatherThanPanic(t *testing.T) {
 //
 // Indexing counts, not just ranging, and that is not a detail: the site whose
 // missing check split the constructors was NewWriter's adoption, which walks the
-// offers backwards by index rather than ranging over them. A derivation that saw
-// only `range` would have reported full coverage of the exact class it exists to
-// catch. Functions that merely APPEND to such a slice and hand it on (the two
-// reader-side constructors) are correctly outside: they delegate the question.
+// offers backwards by index. A derivation that saw only `range` would have
+// reported full coverage of the exact class it exists to catch. Functions that
+// merely APPEND to such a slice and hand it on are correctly outside — they
+// delegate the question. It also rejects the regression's specific shape:
+// comparing a codec drawn from such a slice against nil with ==, which reads
+// only one of nil's two spellings.
 //
-// It also rejects the specific shape the regression had: comparing a codec
-// drawn from such a slice against nil with ==, which reads only one of nil's
-// two spellings.
-//
-// Where this stops, and why: the scope is "functions ranging over a []Codec",
-// which the TYPE decides, not the spelling of a name. A function handed a single
-// Codec by some future helper is outside it — that is an author's scope, not
-// this guard's, and the behavioral matrix above is what covers the constructors
-// regardless of how they are written internally.
+// Scope is "functions ranging over a []Codec", decided by the TYPE, not by a
+// name. A function handed a single Codec by some future helper is outside it.
 func TestInvariant_NilCodecAskedThroughOnePredicate(t *testing.T) {
 	files, names := parsePackageFiles(t, false)
 
@@ -5455,33 +5427,27 @@ type suppliedCodec struct {
 }
 
 // TestMatrix_SuppliedCodecClosedExactlyOnce crosses the axes a supplied codec's
-// fate can turn on:
-//
-//	constructor  x  disposition  x  outcome  x  offer count and position
+// fate can turn on: constructor x disposition x outcome x offer count and
+// position.
 //
 // constructor: every member of the derived codec-owning set, asserted against
 // that derivation at the end so the two cannot drift.
-//
 // disposition: adopted vs declined — the axis the defect turned on, and the one
 // no error-arm test reaches, since declining happens on the SUCCESS path.
-//
-// outcome: the constructor succeeds, fails after it has chosen a codec, or fails
-// before it has chosen one at all. The three differ in how many codecs are
-// unowned at the moment of return.
-//
+// outcome: the constructor succeeds, fails after choosing a codec, or fails
+// before choosing one; the three differ in how many codecs are unowned at
+// return.
 // offer count and position: one offer, and two with the adopted one first vs
 // last, so "release everything except index k" is driven with k at both ends and
-// with k absent entirely.
+// absent entirely.
 //
 // The expectation is not read off the code. Codec.Close is documented to release
-// the codec's resources, and a codec the caller passed to a constructor has
-// exactly one moment where that can happen — so "closed exactly once by the time
-// the caller is done with what the constructor returned" is the only state in
-// which the contract has been honored. Twice is a defect of its own, which is why
-// the count is asserted rather than a boolean. The adopted cells are the control:
-// they must NOT be closed while the returned Writer or Reader is still using
-// them, which is what keeps "adopted" and "declined" from being made to converge
-// by a later refactor that simply releases everything.
+// the codec's resources, and a codec passed to a constructor has exactly one
+// moment where that can happen — so "closed exactly once by the time the caller
+// is done with what the constructor returned" is the only state honoring the
+// contract. Twice is a defect of its own, which is why the count is asserted
+// rather than a boolean. The adopted cells are the control: they must NOT be
+// closed while the returned Writer or Reader is still using them.
 func TestMatrix_SuppliedCodecClosedExactlyOnce(t *testing.T) {
 	longSchema := avro.MustParse(`"long"`)
 
@@ -6857,29 +6823,25 @@ func TestDoSBattery_OCF_C5_ErrorEcho(t *testing.T) {
 // ---------------------------------------------------------------------------
 // FOREIGN block framing: container shapes no twmb writer produces (the writer
 // never emits a count-0 block — TestWriterBlockFramingContract), which the
-// reader must nevertheless handle because they are spec-valid: the spec
-// leaves a block's object count unconstrained (unlike Avro arrays and maps,
-// whose zero count is an explicit terminator, file data blocks have no
-// terminator — end of file is simply end of stream).
+// reader must nevertheless handle because they are spec-valid: the spec leaves a
+// block's object count unconstrained, and unlike Avro arrays and maps, file data
+// blocks have no terminator — end of file is end of stream.
 //
-// The matrix crosses empty-block POSITION {first, mid, tail, consecutive×3}
-// × CODEC {null, deflate, snappy, zstandard} × empty-block PAYLOAD {size 0,
-// >0 decompressing to zero bytes, >0 garbage}. Every accept cell asserts the
-// full file content is read (both records, in order, then io.EOF), and —
-// when a fastavro interpreter is available — that fastavro's record iterator
-// reads the identical bytes to the identical records. Cells where fastavro
-// itself errors are cross-checked as twmb-only, with fastavro's observed
-// verdict recorded on the cell: fastavro (like Java) decompresses a count-0
-// block's payload eagerly and so rejects an undecompressable one, while this
-// package's reader skips the block without consulting the codec — a
-// deliberate leniency; no records are lost either way.
+// Crosses empty-block POSITION {first, mid, tail, consecutive x3} x CODEC {null,
+// deflate, snappy, zstandard} x empty-block PAYLOAD {size 0, >0 decompressing to
+// zero bytes, >0 garbage}. Every accept cell asserts the full file content is
+// read, and — when a fastavro interpreter is available — that fastavro's
+// iterator reads the identical bytes to the identical records. Cells where
+// fastavro itself errors are cross-checked as twmb-only with its observed
+// verdict recorded: fastavro (like Java) decompresses a count-0 block's payload
+// eagerly and rejects an undecompressable one, while this reader skips the block
+// without consulting the codec — a deliberate leniency; no records are lost
+// either way.
 //
-// Which cells REACH the skip arm (readBlock's count==0 continue): every
-// empty-block cell in the matrix — the skip sits after payload + sync
-// validation and before decompression, so position, codec, and payload shape
-// all funnel through it. The corrupt-sync guard cell errors at sync
-// validation, BEFORE the skip arm, and the writer-side framing tests never
-// produce a count-0 block at all.
+// Every empty-block cell reaches the skip arm (readBlock's count==0 continue),
+// which sits after payload + sync validation and before decompression. The
+// corrupt-sync guard cell errors BEFORE the skip arm, and the writer-side
+// framing tests never produce a count-0 block at all.
 // ---------------------------------------------------------------------------
 
 var foreignSync = [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
@@ -9252,28 +9214,23 @@ func TestRegression_TruncatedLargeBlockDataNotEOF(t *testing.T) {
 
 // ---------- truncation_sweep_test.go ----------
 
-// TestMatrix_TruncationTerminalErrorIdentity sweeps a multi-block file cut
-// at EVERY byte offset from end-of-header to one byte short of the full
-// file, across codecs, pinning the terminal-error identity contract as a
-// class:
+// TestMatrix_TruncationTerminalErrorIdentity sweeps a multi-block file cut at
+// EVERY byte offset from end-of-header to one byte short of the full file,
+// across codecs, pinning the terminal-error identity contract as a class:
 //
-//   - a cut exactly at a block boundary (end of header, end of a record
-//     block, end of an empty block) is a clean end of stream: Decode's
-//     terminal error is BARE io.EOF, with exactly the records of the
-//     complete blocks before the cut;
-//   - every other cut is truncation: the terminal error is non-nil and
-//     does NOT satisfy errors.Is(err, io.EOF), so the idiomatic errors.Is
-//     termination check can never read a truncated stream as complete;
-//   - no cut ever yields records beyond the blocks complete before it
-//     (blocks are consumed wholesale, so a partial block contributes zero).
+//   - a cut exactly at a block boundary is a clean end of stream: the terminal
+//     error is BARE io.EOF, with exactly the records of the complete blocks
+//     before the cut;
+//   - every other cut is truncation: the terminal error does NOT satisfy
+//     errors.Is(err, io.EOF), so the idiomatic termination check can never read
+//     a truncated stream as complete;
+//   - no cut ever yields records beyond the blocks complete before it.
 //
-// The spliced count-0 block puts the skip arm's reads (count, size, sync of
-// a block that yields no records) inside the sweep: cuts inside it must
-// error, and the cut exactly after it is a clean boundary that still
-// reports only the prior blocks' records. Counts of 100 and 70 make the
-// block-header count varints multi-byte, so mid-varint cuts participate.
-// Both codecs share the invariant; they differ in the data-read arms the
-// sweep traverses (stored vs compressed payloads).
+// The spliced count-0 block puts the skip arm's reads inside the sweep: cuts
+// inside it must error, and the cut exactly after it is a clean boundary that
+// still reports only the prior blocks' records. Counts of 100 and 70 make the
+// block-header count varints multi-byte, so mid-varint cuts participate. Both
+// codecs share the invariant and differ in the data-read arms traversed.
 func TestMatrix_TruncationTerminalErrorIdentity(t *testing.T) {
 	s := mustParse(t, `"int"`)
 	for _, codec := range []struct {

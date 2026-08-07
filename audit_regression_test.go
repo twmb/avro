@@ -80,21 +80,15 @@ func TestRegression_DecimalCustomTypeWrongUnderlyingNoPanic(t *testing.T) {
 
 type auditMoney int64
 
-// A custom decoder that returns ErrSkipCustomType (no decoder matched) falls
-// through to built-in decode: the canonical Avro-native value is placed into the
-// target exactly as a no-custom decode would (CustomType.Decode docstring —
-// "the base Avro type decoder is used directly"). Two halves:
-//
-//   - A target the value FITS — long → a named integer (auditMoney) — now
-//     SUCCEEDS and equals the no-custom decode, identically on binary and JSON.
-//     (Previously the all-skip path boxed the canonical int64 into `any` and
-//     rejected it via AssignableTo, so even this compatible named-integer target
-//     errored — a divergence from no-custom decode. The all-skip fall-through now
-//     RE-DECODES the wire into the target through the base deserializer, so it is
-//     faithful to a no-custom decode by construction.)
-//   - A target the value genuinely does NOT fit — long → a string field — still
-//     errors GRACEFULLY (a SemanticError, never a panic in reflect.Set), and
-//     binary and JSON agree, matching the no-custom decode's own rejection.
+// A custom decoder returning ErrSkipCustomType falls through to built-in decode:
+// the canonical Avro-native value lands in the target exactly as a no-custom
+// decode would (CustomType.Decode: "the base Avro type decoder is used
+// directly"). A target the value FITS — long into a named integer — succeeds and
+// equals the no-custom decode on both wires; previously the all-skip path boxed
+// the canonical int64 into `any` and rejected it via AssignableTo. The
+// fall-through now RE-DECODES the wire through the base deserializer, so it is
+// faithful by construction. A target the value does NOT fit still errors
+// gracefully with a SemanticError, never a panic in reflect.Set.
 func TestRegression_DecodeJSONCustomDecoderConcreteTargetErrors(t *testing.T) {
 	ct := avro.CustomType{
 		LogicalType: "money",
@@ -1130,17 +1124,14 @@ func customLogicalCases() []customLogicalCase {
 	}
 }
 
-// A CustomType that MATCHES a logical node but provides NEITHER an Encode NOR a
-// Decode callback still suppresses the built-in logical DECODER on the binary
-// path (hasMatchingCustomType counts callback-less matchers; only wildcards are
-// excluded). Per CustomType.Decode ("If nil, the built-in logical type handler
-// is bypassed ... producing raw Avro-native values"), Decode yields the raw
-// Avro-native type — and DecodeJSON must yield the SAME raw type. The wiring for
-// a callback-less matcher used to return early before installing the JSON
-// suppress-wrapper, so DecodeJSON kept the logical transform (time.Time /
-// *big.Rat) while Decode produced the raw value: a binary<->JSON divergence on
-// the same schema. Driven across every logical type and both matcher forms
-// (LogicalType-only and AvroType-only).
+// A CustomType that MATCHES a logical node but provides NEITHER callback still
+// suppresses the built-in logical DECODER on binary (hasMatchingCustomType
+// counts callback-less matchers; only wildcards are excluded), so per
+// CustomType.Decode it yields the raw Avro-native type — and DecodeJSON must
+// yield the SAME one. The wiring for a callback-less matcher returned early
+// before installing the JSON suppress-wrapper, so DecodeJSON kept the logical
+// transform while Decode produced the raw value. Driven across every logical and
+// both matcher forms.
 func TestMatrix_CustomNoCallbackSuppressionBinaryJSONParity(t *testing.T) {
 	matchers := []struct {
 		name string
@@ -1251,17 +1242,13 @@ func TestMatrix_CustomPromotionHonorsLogicalSuppression(t *testing.T) {
 	}
 }
 
-// On a schema returned by Resolve, DecodeJSON consumes WRITER-shaped JSON and
+// On a Resolve-returned schema, DecodeJSON consumes WRITER-shaped JSON and
 // applies full writer->reader resolution, matching Java's ResolvingDecoder over
-// a JsonDecoder constructed with the writer schema (the JSON is parsed against
-// the writer, then resolved). Java maps a writer enum symbol absent from the
-// reader to the reader's enum default; promotes int->long etc.; drops writer-
-// only fields; fills reader defaults; and honors aliases. The binary resolved
-// decode (Schema.Decode, which has always resolved) is the oracle: for every
-// shape, resolved.DecodeJSON(writerJSON) must equal resolved.Decode(writerBinary).
-// Previously DecodeJSON on a resolved schema decoded against the bare reader
-// node, so a writer-only enum symbol errored ("unknown enum symbol") where
-// binary produced the reader default.
+// a JsonDecoder constructed with the writer schema. The binary resolved decode
+// is the oracle: for every shape, resolved.DecodeJSON(writerJSON) must equal
+// resolved.Decode(writerBinary). Previously DecodeJSON on a resolved schema
+// decoded against the bare reader node, so a writer-only enum symbol errored
+// where binary produced the reader default.
 func TestMatrix_ResolvedDecodeJSONMatchesBinary(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -1349,18 +1336,14 @@ func TestMatrix_ResolvedDecodeJSONMatchesBinary(t *testing.T) {
 
 // A resolved schema's DecodeJSON must preserve TAGGED union branch identity
 // through its decode→re-encode round trip, including the decoded VALUE when
-// writer→reader resolution differs per branch. The spec's JSON encoding names
-// the branch in a {"branch": value} envelope and Java's JsonDecoder.readIndex
-// reads that label into the exact branch index (unknown labels throw) — so
-// when two branches accept the same value (two enums sharing a symbol), the
-// envelope is the ONLY carrier of the writer's choice. Discarding it in the
-// intermediate and re-deriving the branch by first-match rewrites branch
-// identity, and when resolution differs per branch the value changes too:
-// here the writer says E2/"A", reader E2 drops "A" (enum default "Y"), so
-// resolving the true branch yields "Y" while a flip to E1 (which keeps "A")
-// yields "A". Binary Decode of the equivalent tagged wire and fastavro's
-// json_reader with writer→reader migration (executed against fastavro 1.12.2)
-// both produce "Y"; DecodeJSON must agree.
+// resolution differs per branch. The spec names the branch in a {"branch":
+// value} envelope and Java's JsonDecoder.readIndex reads that label into the
+// exact index, so when two branches accept the same value the envelope is the
+// ONLY carrier of the writer's choice. Re-deriving the branch by first-match
+// rewrites identity: here the writer says E2/"A", reader E2 drops "A" (enum
+// default "Y"), so the true branch yields "Y" while a flip to E1 yields "A".
+// Binary Decode of the equivalent tagged wire and fastavro's json_reader with
+// migration (executed, 1.12.2) both produce "Y".
 func TestRegression_ResolvedJSONTaggedUnionValueMatchesBinary(t *testing.T) {
 	w := avro.MustParse(`[{"type":"enum","name":"E1","symbols":["A"]},{"type":"enum","name":"E2","symbols":["A","Y"]}]`)
 	r := avro.MustParse(`[{"type":"enum","name":"E1","symbols":["A"]},{"type":"enum","name":"E2","symbols":["Y"],"default":"Y"}]`)
@@ -1492,21 +1475,17 @@ func unionEnvelopeKey(t *testing.T, out any) string {
 
 // A resolved schema's DecodeJSON must match its binary Decode (the oracle) even
 // when the WRITER carries a CustomType whose Decode the writer's own Encode
-// cannot reproduce — a Decode-only "read-side mapping" custom being the common
-// case. decodeJSONResolved performs a pure wire-shape transform (writer-JSON ->
+// cannot reproduce — a Decode-only read-side mapping being the common case.
+// decodeJSONResolved performs a pure wire-shape transform (writer-JSON ->
 // writer-binary) before the resolving decode, and that transform must run
 // against a CUSTOM-FREE view of the writer: decoding writer-JSON through the
-// writer's own custom Decode produces a Go-domain value the re-encode then
-// cannot invert, so DecodeJSON failed where binary Decode (which reads raw
-// writer bytes and applies the READER's custom) succeeded. The reader's custom
-// Decode still fires in the final resolving decode, so both wires land the same
-// domain value.
+// writer's own custom Decode produces a Go-domain value the re-encode cannot
+// invert. The reader's custom Decode still fires in the final resolving decode.
 //
 // Non-vacuity: the invertible-custom cells exercise the identical path and
-// round-tripped before the fix (their Encode reproduces the writer wire); the
-// decode-only cells are the ones that failed. Asserting both proves the fix
-// repairs the broken cells without regressing the working ones. (Neuter check:
-// reverting decodeJSONResolved to s.resolveWriter fails every decode-only cell.)
+// round-tripped before the fix, so asserting both proves the repair without
+// regressing them. Reverting decodeJSONResolved to s.resolveWriter fails every
+// decode-only cell.
 func TestMatrix_ResolvedDecodeJSONWriterCustomDecodeRawRoundTrip(t *testing.T) {
 	type domainTS struct{ ms int64 }
 	type domainDec struct{ raw string }
@@ -1706,18 +1685,14 @@ func TestMatrix_RecursiveCustomTypeParsesAndParity(t *testing.T) {
 	}
 }
 
-// A FORWARD-referenced named type (one used before its definition appears in the
-// schema) carrying a CustomType must encode AND decode identically to an
-// in-order reference — and to the JSON path. The finalize fixups that wire a
-// forward reference's ser/deser used the UNWRAPPED namedType functions and did
-// not re-apply the custom wrap, so the forward-referenced field encoded/decoded
-// RAW on binary while JSON applied the custom (silent binary↔JSON divergence:
-// for an enum with a reorder Encode, the field wrote a different ordinal on each
-// format). A named reference is position-independent in Avro (Java resolves
-// every reference to the same Schema object), so its encoding cannot depend on
-// whether the type was defined before or after. The fix routes both the
-// in-order and the three forward-ref fixup sites (union branch / record field /
-// array item) through one shared wrap (customWrappedSer / customWrappedDeser).
+// A FORWARD-referenced named type carrying a CustomType must encode and decode
+// identically to an in-order reference, and to the JSON path. The finalize
+// fixups that wire a forward reference used the UNWRAPPED namedType functions
+// and did not re-apply the custom wrap, so the field encoded RAW on binary while
+// JSON applied the custom — for an enum with a reorder Encode, a different
+// ordinal per format. A named reference is position-independent in Avro, so its
+// encoding cannot depend on definition order. The fix routes the in-order and
+// all three forward-ref fixup sites through one shared wrap.
 func TestMatrix_ForwardRefCustomTypeBinaryJSONParity(t *testing.T) {
 	// E used in field "a" (forward ref) BEFORE its definition in field "b".
 	enumPos := []struct{ name, schema string }{
@@ -1900,27 +1875,15 @@ func TestMatrix_SchemaCacheCustomBoundaryGuard(t *testing.T) {
 	})
 }
 
-// A self-referential schema cached WITHOUT a CustomType and then re-parsed
-// (the SAME string) WITH a matching CustomType must Parse AND apply the
-// custom. The re-parse RE-DEFINES the name (allowReRegister), so its
-// self-reference resolves to THIS parse's fresh node — which has the
-// CustomType in scope and will be wired at finalize — not to the stale cached
-// node. rejectCachedRefIfCustomTypeWouldMatch must therefore NOT fire.
-//
-// The guard keys "defined this parse" on definedSet membership of the
-// resolved *namedType, which is SHARED BY REFERENCE across the nested
-// builders (so it is already populated when the self-reference resolves
-// inside a nested builder — definedNamed would not be, since it merges up
-// only at unnest). cachedNames cannot be used for this test: a re-registered
-// name is in cachedNames (inherited) AND defines a fresh node here, so keying
-// on cachedNames false-rejected with "re-parse Node with the CustomType
-// first" — exactly what the caller is doing — and the rejection was field-
-// ORDER dependent (it fired only when the custom-matched field preceded the
-// self-reference, i.e. once the partially-built node already showed the
-// match). The genuine cross-parse hazard (a DIFFERENT schema REFERENCING a
-// clean cached type, whose resolved node is the stale clone, absent from
-// definedSet) must still reject — re-asserted below and in
-// TestMatrix_SchemaCacheCustomBoundaryGuard.
+// A self-referential schema cached WITHOUT a CustomType and re-parsed (the same
+// string) WITH a matching one must Parse and apply the custom: the re-parse
+// re-defines the name, so its self-reference resolves to this parse's fresh
+// node, and rejectCachedRefIfCustomTypeWouldMatch must NOT fire. The guard keys
+// "defined this parse" on definedSet, which is shared by reference across the
+// nested builders; keying on cachedNames instead false-rejected, and did so
+// field-ORDER dependently. The genuine cross-parse hazard — a DIFFERENT schema
+// referencing a clean cached type whose resolved node is the stale clone — must
+// still reject, asserted below.
 func TestMatrix_SchemaCacheSelfRefReParseWithCustom(t *testing.T) {
 	const ms = int64(1700000000000)
 	// A value-TRANSFORMING decoder: under suppression it receives the raw
@@ -2089,16 +2052,13 @@ func TestMatrix_SchemaCacheSelfRefReParseWithCustom(t *testing.T) {
 }
 
 // A CustomType whose Decode returns a POINTER, decoded into a POINTER target,
-// must succeed identically on binary and JSON. setCustomResult itself walks
-// pointer indirections to find the assignable level, so the JSON decoder-chain
-// must hand it the SAME un-indirected target the binary path does. The JSON path
-// pre-dereferenced the target with indirectAlloc before calling setCustomResult,
-// so a *wrap Decode result into a **wrap target had its outer pointer peeled away
-// and the *wrap result no longer matched ("cannot use wrap with Avro type
-// string") while binary accepted it — a binary<->JSON divergence. The fix drops
-// the extra indirectAlloc so the JSON decoder-chain mirrors binary's
-// setCustomResult(v, ...). Exercised through the multi-decoder wrap branch
-// (wrapDecodeJSONWithCustomDecoders), where the indirectAlloc lived.
+// must succeed identically on both wires. setCustomResult walks pointer
+// indirections to find the assignable level, so the JSON decoder-chain must hand
+// it the SAME un-indirected target binary does. The JSON path pre-dereferenced
+// with indirectAlloc, so a *wrap result into a **wrap target had its outer
+// pointer peeled and no longer matched, while binary accepted it. The fix drops
+// the extra indirectAlloc. Exercised through the multi-decoder wrap branch,
+// where it lived.
 func TestRegression_CustomDecodePointerResultPointerTargetParity(t *testing.T) {
 	type wrap struct{ V string }
 	ct := avro.CustomType{
@@ -2128,27 +2088,16 @@ func TestRegression_CustomDecodePointerResultPointerTargetParity(t *testing.T) {
 }
 
 // A no-Decode CustomType that suppresses a logical must yield the RAW
-// Avro-native value on BOTH wire formats for a SCALAR typed target, exactly like
-// binary's raw deser* (which build no logical deser under suppression). Each
-// per-kind JSON decoder honored the suppression flag in its decode-into-any
-// branch but applied the logical transform UNCONDITIONALLY for a TYPED target:
-//   - assignBytes (bytes/fixed): decimal/big-decimal/duration arms — a suppressed
-//     decimal into *string read the logical "123.45" on JSON while binary handed
-//     back the raw 2-byte payload "09"; into *big.Rat JSON coerced while binary
-//     rejected (no slice/array/string target).
-//   - decodeInt/decodeLong (int/long): date/time/timestamp arms — a suppressed
-//     date into time.Time succeeded on JSON (enriched) while binary rejected the
-//     raw int32, and time-millis into time.Duration SILENTLY produced a different
-//     value (binary's raw ns vs the JSON logical conversion) — no error, corrupt
-//     data, the worst kind of divergence.
-//
-// The fix threads the suppression flag into assignBytes/decodeInt/decodeLong so
-// each returns the raw value (setBytesValue/setIntValue/setLongValue) before its
-// logical switch. The [N]byte-array sibling is
-// TestMatrix_CustomSuppressionByteArrayTargetParity; this pins the scalar
-// (string / time.Time / time.Duration) targets and the now-invalid enriched
-// targets (*big.Rat / avro.Duration / time.Time), whose logical arm no longer
-// fires. Driven across bytes, fixed, int and long logicals uniformly.
+// Avro-native value on BOTH wire formats for a SCALAR typed target, as binary's
+// raw deser* already does. The JSON per-kind decoders honored suppression only
+// in their decode-into-any branch and applied the logical transform
+// unconditionally for a typed target: a suppressed decimal into *string read
+// "123.45" where binary handed back the raw payload, and time-millis into
+// time.Duration SILENTLY produced a different value — no error, corrupt data.
+// The fix threads the flag into assignBytes/decodeInt/decodeLong so each returns
+// the raw value before its logical switch. Driven across bytes, fixed, int and
+// long; the [N]byte-array sibling is
+// TestMatrix_CustomSuppressionByteArrayTargetParity.
 func TestMatrix_CustomSuppressionScalarTargetParity(t *testing.T) {
 	strT := reflect.TypeOf("")
 	ratT := reflect.TypeOf((*big.Rat)(nil))
@@ -2230,21 +2179,15 @@ func TestMatrix_CustomSuppressionScalarTargetParity(t *testing.T) {
 	}
 }
 
-// Encode-side complement of TestMatrix_CustomSuppressionScalarTargetParity.
-// A CustomType registered for a built-in logical name (uuid, or a
-// date/time/timestamp logical) resurrects that logical when validateLogical has
-// soft-dropped it for sitting on a kind it is not spec-valid for (uuid is
-// string/fixed-only; the date/time/timestamp logicals are int/long-only). The
-// resurrection suppresses the codec, so the contract is the RAW Avro-native
-// value on every path: the binary decoder is suppressed to raw, the per-kind
-// JSON encoder writes raw, and the JSON decoder reads raw. The binary ENCODER
-// must match — it must not apply the logical serializer onto a kind the logical
-// is invalid for. logicalSer is keyed only on the logical name, so without a
-// kind gate the binary encoder writes the logical form (serUUID emits a UUID
-// string into a bytes value; serTimestampMillis emits a bare varint long into a
-// string value), which (a) disagrees with the raw value JSON encodes and (b)
-// for a logical whose wire shape differs from the base kind's produces a wire
-// this schema's own decoder cannot read.
+// Encode-side complement of TestMatrix_CustomSuppressionScalarTargetParity. A
+// CustomType registered for a built-in logical name resurrects that logical when
+// validateLogical has soft-dropped it for sitting on a kind it is not spec-valid
+// for. The resurrection suppresses the codec, so the contract is the RAW
+// Avro-native value on every path — and the binary ENCODER must match. logicalSer
+// is keyed only on the logical name, so without a kind gate it writes the logical
+// form (serUUID emitting a UUID string into a bytes value), which disagrees with
+// the raw value JSON encodes and, where the logical's wire shape differs from the
+// base kind's, produces a wire this schema's own decoder cannot read.
 func TestMatrix_CustomSuppressionWrongKindLogicalEncodeParity(t *testing.T) {
 	uuid16 := [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
 	tm := time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)
@@ -2341,20 +2284,16 @@ func TestMatrix_CustomSuppressionSpecValidLogicalStillApplied(t *testing.T) {
 	}
 }
 
-// Wrong-SIZE complement of TestMatrix_CustomSuppressionWrongKindLogicalEncodeParity
-// (which covers wrong KIND on primitive underlyings). uuid is fixed-valid only
-// at size 16 and duration only at size 12 (logicalUnderlyingAccept, the same
-// predicate validateLogical soft-drops a wrong-size fixed logical with). A
-// no-Encode CustomType resurrects the soft-dropped logical, so the contract is
-// the RAW Avro-native value on every path. serFixedUUIDReflect always emits 16
-// bytes and serDuration always 12, regardless of the declared size; the JSON
-// fixed arms do the same. Without the size gate the binary and JSON encoders
-// write the 16/12-byte logical form into a differently-sized fixed, producing a
-// wire this schema's own decoders (which read `size` bytes) reject — and
-// diverging from the plain (no-custom) fixed, which soft-drops to raw and
-// round-trips. The fix keeps the base serSize{size} / size-checked raw JSON
-// path for a wrong-size resurrected logical, so registering the passive custom
-// does not change the wire at all.
+// Wrong-SIZE complement of the wrong-KIND encode parity net. uuid is fixed-valid
+// only at size 16 and duration only at 12 (logicalUnderlyingAccept, the same
+// predicate validateLogical soft-drops with). A no-Encode CustomType resurrects
+// the soft-dropped logical, so the contract is the RAW value on every path.
+// serFixedUUIDReflect always emits 16 bytes and serDuration always 12 regardless
+// of the declared size, so without the size gate both encoders write the logical
+// form into a differently-sized fixed, producing a wire this schema's own
+// decoders reject and diverging from the plain fixed, which soft-drops and
+// round-trips. The fix keeps the size-checked raw path, so registering the
+// passive custom does not change the wire at all.
 func TestRegression_CustomSuppressionWrongSizeFixedLogicalEncodeParity(t *testing.T) {
 	uuid16 := [16]byte{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
 	dur := avro.Duration{Months: 1, Days: 2, Milliseconds: 3}
@@ -2490,18 +2429,16 @@ func TestRegression_InvalidUTF8StringBinaryVerbatimJSONCoercion(t *testing.T) {
 type untaggedPinBig int64
 
 // A bare (untagged) JSON union value cannot name its branch, so DecodeJSON
-// commits to the FIRST declaration-order branch of the matching JSON token
-// class. DOCUMENTED INTENTIONAL (TaggedUnions and DecodeJSON docs;
-// BUG_AUDIT.md §Known intentional divergences): the untagged wire for
-// int32(7)-via-int and int64(7)-via-long is the identical byte `7`, so the
-// writer's branch is information-theoretically unrecoverable — do not "fix"
-// with branch-guessing heuristics. This pin spells out the consequences so a
-// future round surfaces the policy instead of re-flagging the asymmetry:
-// (1) untagged decode-into-any picks the first number-class branch (int64)
-// where binary recovers the writer's branch from the wire index (int32);
-// (2) a TRANSFORMING CustomType on a non-first same-class branch is skipped
-// even for a CONCRETE typed target (plain coercion fills it instead);
-// (3) TaggedUnions recovers the branch on both counts.
+// commits to the FIRST declaration-order branch of the matching token class.
+// DOCUMENTED INTENTIONAL (TaggedUnions and DecodeJSON docs; BUG_AUDIT.md §Known
+// intentional divergences): the untagged wire for int32(7)-via-int and
+// int64(7)-via-long is the identical byte `7`, so the writer's branch is
+// information-theoretically unrecoverable — do not "fix" with branch-guessing.
+// The consequences are spelled out so a future round surfaces the policy instead
+// of re-flagging the asymmetry: decode-into-any picks the first number-class
+// branch where binary recovers the writer's; a TRANSFORMING CustomType on a
+// non-first same-class branch is skipped even for a concrete typed target; and
+// TaggedUnions recovers the branch on both counts.
 func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
 	t.Run("decode-into-any-first-class-branch", func(t *testing.T) {
 		sc := avro.MustParse(`["long","int"]`)
@@ -2560,20 +2497,16 @@ func TestRegression_UntaggedUnionBranchClassFirstMatch(t *testing.T) {
 	})
 }
 
-// Schema parse must stay bounded in time regardless of how deeply an attacker
-// nests a schema. aschema.UnmarshalJSON's object case scans each node's full
-// JSON subtree to capture extra properties, so a chain of N nested schema
-// nodes costs O(N^2) over the input, and the build-time maxDepth guard only
-// fires AFTER that quadratic unmarshal runs — so a ~250 KB deeply-nested
-// schema took ~22s to parse-then-reject (and a ~1 MB one, minutes). A linear
-// pre-scan (checkSchemaNestingDepth) now rejects input nested past
-// maxSchemaJSONDepth before the unmarshal, making parse cost independent of
-// nesting depth. The limit (4*maxDepth brackets) clears the provable ceiling
-// of a build-acceptable schema (<= 3 brackets per schema level => <= 3*maxDepth
-// for <= maxDepth levels) by a full maxDepth, so a genuinely valid deep schema
-// is never falsely rejected. The timing assertion runs only without -race
-// (instrumentation makes a wall-clock budget non-deterministic); the
-// reject-fast and no-false-rejection invariants are checked in both modes.
+// Schema parse must stay bounded in time regardless of nesting depth.
+// aschema.UnmarshalJSON's object case scans each node's full JSON subtree to
+// capture extra properties, so a chain of N nested nodes costs O(N^2), and the
+// build-time maxDepth guard only fires AFTER that quadratic unmarshal — a ~250 KB
+// deeply-nested schema took ~22s to parse-then-reject. A linear pre-scan
+// (checkSchemaNestingDepth) now rejects past maxSchemaJSONDepth before the
+// unmarshal. The limit (4*maxDepth brackets) clears the provable ceiling of a
+// build-acceptable schema (<=3 brackets per level) by a full maxDepth, so a valid
+// deep schema is never falsely rejected. The timing assertion runs only without
+// -race; the reject-fast and no-false-rejection invariants run in both modes.
 func TestRegression_DeepSchemaNestingRejectedInBoundedTime(t *testing.T) {
 	arrayNest := func(d int) string {
 		return strings.Repeat(`{"type":"array","items":`, d) + `"int"` + strings.Repeat(`}`, d)
@@ -2939,18 +2872,14 @@ func TestRegression_FixedLogicalProbeSizeBounded(t *testing.T) {
 }
 
 // A bare (untagged) JSON union value commits to the FIRST token-class-matching
-// CONTAINER branch (record/array/map); it does NOT backtrack to re-decode the
-// whole subtree as each later container branch. Backtracking across container
-// branches is 2^depth for a recursive union-of-records — a ~120-byte bare
-// nested object that mismatches at the bottom would otherwise reject in seconds
-// (and a slightly deeper one in minutes/hours). The Avro JSON spec encodes a
-// non-null union as the tagged {"branch-name":value} form, and Java, fastavro,
-// and goavro all read the branch from that tag without branch-guessing; the
-// tagged decode path stays deterministic and a caller needing a later container
-// branch uses the tagged form. Scalar (number/string/bool token) branches keep
-// their bounded backtrack — they cannot recurse into the union, so they add no
-// blowup, and it preserves the numeric-width fall-through (e.g. ["int","long"]
-// accepting a value that overflows int via the long branch).
+// CONTAINER branch; it does NOT backtrack to re-decode the whole subtree as each
+// later container branch. Backtracking is 2^depth for a recursive
+// union-of-records — a ~120-byte bare nested object mismatching at the bottom
+// would reject in seconds. The spec encodes a non-null union as the tagged form,
+// and Java, fastavro and goavro all read the branch from that tag without
+// guessing. Scalar branches keep their bounded backtrack — they cannot recurse
+// into the union, so they add no blowup, and it preserves the numeric-width
+// fall-through.
 func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -3028,17 +2957,13 @@ func TestRegression_BareUnionJSONNoExponentialBacktrack(t *testing.T) {
 	}
 }
 
-// A schema written in the flat (goavro-style) field format — a bare string
-// complex-kind type with the kind's defining key (symbols / items / values /
-// fields / size) alongside the field's own keys — parses by design: the wire
-// parser lifts the defining keys into a nested type definition, naming a
-// lifted named type after the field (liftFlatFieldType, schema_parse.go).
-// Root() must describe that same post-lift schema (the type node carries the
-// name and defining content, not an empty shell with the defining keys
-// stranded in Field.Props), and Root().Schema() must rebuild it with an
-// identical canonical form. The metadata walker shares the wire parser's
-// lift predicate and key routing (flatFieldNeedsLift / flatLiftTypeMap), so
-// this pins that the two sides describe one schema.
+// A schema written in the flat (goavro-style) field format parses by design: the
+// wire parser lifts the defining keys into a nested type definition, naming the
+// lifted type after the field. Root() must describe that same post-lift schema —
+// the type node carrying the name and defining content, not an empty shell with
+// the keys stranded in Field.Props — and Root().Schema() must rebuild it with an
+// identical canonical form. The metadata walker shares the parser's lift
+// predicate and key routing, so this pins that the two sides describe one schema.
 func TestMatrix_FlatFieldRootSchemaRoundTrip(t *testing.T) {
 	for _, tt := range []struct {
 		name, schema string
@@ -3292,20 +3217,16 @@ type csUPtr struct {
 	P *namedI32 `avro:"p"`
 }
 
-// TestMatrix_CustomSkipDecodeMatchesNoCustom pins the contract that a custom
-// decoder returning ErrSkipCustomType (no decoder matched) falls through to
-// built-in decode: the value lands in the typed target EXACTLY as a no-custom
-// decode would, on binary, JSON, and resolved paths. A wildcard custom (empty
-// criteria) wraps every node and skips, so the all-skip fall-through re-decodes
-// every kind through the base deserializer; a wildcard does not suppress logicals
-// (suppressLogical=false), so its decode must equal the plain no-custom decode
-// value-for-value. Each row decodes the SAME wire with the plain schema and the
-// skip-custom schema into the SAME typed target and asserts equality.
-//
-// This is the net for the fall-through: a faithfulness regression (a zeroed
-// record/array/map, a dropped enum-ordinal, a mis-sized fixed) reds a row here.
-// Non-vacuity is proven by neutering the re-decode (placing a probe value instead)
-// and confirming rows go red.
+// TestMatrix_CustomSkipDecodeMatchesNoCustom pins that a custom decoder
+// returning ErrSkipCustomType falls through to built-in decode, landing the
+// value in the typed target EXACTLY as a no-custom decode would, on binary,
+// JSON, and resolved paths. A wildcard custom wraps every node and skips, so the
+// fall-through re-decodes every kind through the base deserializer; a wildcard
+// does not suppress logicals, so its decode must equal the plain no-custom
+// decode value-for-value. Each row decodes the SAME wire with both schemas into
+// the SAME target and asserts equality, so a faithfulness regression — a zeroed
+// record, a dropped enum ordinal, a mis-sized fixed — reds a row. Non-vacuity is
+// proven by neutering the re-decode to place a probe value instead.
 func TestMatrix_CustomSkipDecodeMatchesNoCustom(t *testing.T) {
 	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
 	ptr := func(x int32) *int32 { return &x }
@@ -3462,25 +3383,21 @@ type (
 	}
 )
 
-// TestMatrix_CustomSkipNestedMatchRedecodes adds the SELECTIVITY axis to
-// the skip-custom parity matrix. That matrix drives a wildcard custom that
-// skips at every node, so its corpus — thirty shapes, both wires, tagged
-// and untagged — only ever reaches the fall-through's bypass arm: nothing
-// matched anywhere, so one clean re-decode with customs off reproduces the
-// no-custom result.
+// TestMatrix_CustomSkipNestedMatchRedecodes adds the SELECTIVITY axis. The skip
+// matrix drives a wildcard that skips at every node, so its corpus only ever
+// reaches the fall-through's bypass arm: nothing matched anywhere, so one clean
+// re-decode with customs off reproduces the no-custom result.
 //
 // The other value of the axis is a custom that skips at the OUTER node but
 // matched somewhere in its subtree. The fall-through cannot bypass then —
 // bypassing would discard the nested match — so it re-decodes with customs
-// ACTIVE instead. Both wires have their own copy of that decision, and the
-// corpus reached neither.
+// ACTIVE. Both wires have their own copy of that decision, and the corpus
+// reached neither.
 //
-// The axis crossed with it is the CONTAINER KIND, because the fall-through
-// sits in each container's decoder: a record field, a record nested one
-// level deeper, an array element and a map value each arrive at it
-// separately. The oracle is a no-custom decode into the raw-typed twin of
-// the same shape: the marked position must carry the transform of exactly
-// the value the raw decode saw there, and every sibling must be untouched.
+// Crossed with CONTAINER KIND, because the fall-through sits in each container's
+// decoder. The oracle is a no-custom decode into the raw-typed twin: the marked
+// position must carry the transform of exactly the value the raw decode saw, and
+// every sibling must be untouched.
 func TestMatrix_CustomSkipNestedMatchRedecodes(t *testing.T) {
 	t.Parallel()
 	money := avro.CustomType{
@@ -3634,21 +3551,19 @@ func TestRegression_CustomSkipDecodeMatchedTransformSurvives(t *testing.T) {
 }
 
 // TestMatrix_CustomSkipDecodeReusesTarget pins that a wildcard all-skip custom
-// decode REUSES a pre-populated decode target identically to a no-custom decode.
-// A non-nil typed map and an interface already wrapping a map[string]any retain
+// decode REUSES a pre-populated target identically to a no-custom decode. A
+// non-nil typed map and an interface already wrapping a map[string]any retain
 // keys absent from the wire — deserMap's `mapVal = v` reuse and deserRecord's
-// reuseOrMakeStringAnyMap stale-key contract. The all-skip fall-through RE-DECODES
-// the wire into the same target through the base deserializer, so reuse is
-// inherited for free rather than re-implemented.
+// reuseOrMakeStringAnyMap stale-key contract. The fall-through RE-DECODES into
+// the same target through the base deserializer, so reuse is inherited rather
+// than re-implemented.
 //
-// This axis is invisible to TestMatrix_CustomSkipDecodeMatchesNoCustom, which
-// decodes only into fresh reflect.New targets. The oracle is a no-custom decode
-// into the SAME pre-populated target. The map[string]any subtest is the cell an
-// earlier assignable-fast-path placement swallowed (it replaced the whole map,
-// dropping stale keys); an Avro map decoded into `any` is the control: it does NOT
-// reuse (deserMap's iface arm allocates fresh), so the all-skip path matches that
-// too. Non-vacuity is verified by neutering the typed-target re-decode (placing the
-// probe value instead), which reds the map[string]any and record-into-any cells.
+// This axis is invisible to the main skip matrix, which decodes only into fresh
+// targets. The oracle is a no-custom decode into the SAME pre-populated target.
+// The map[string]any subtest is the cell an earlier assignable-fast-path
+// placement swallowed; an Avro map decoded into `any` is the control, since
+// deserMap's iface arm allocates fresh. Non-vacuity: neutering the typed-target
+// re-decode reds the map[string]any and record-into-any cells.
 func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
 
@@ -3737,19 +3652,16 @@ func TestMatrix_CustomSkipDecodeReusesTarget(t *testing.T) {
 }
 
 // TestMatrix_CustomSkipDecodeLogicalIntoBaseTypedTarget pins that a WILDCARD
-// all-skip custom — which does NOT suppress logicals — decoding a logical node
-// into a base TYPED target lands the value identically to a no-custom decode. The
-// base (logical) deserializer fills the typed target natively (deserDate→int32 raw
-// days, deserDuration→[12]byte, decimal→raw []byte); the all-skip fall-through
-// RE-DECODES the wire through it. A box-into-any placement could not: the probe
-// holds the ENRICHED type (time.Time / avro.Duration / *big.Rat), which no
+// all-skip custom — which does not suppress logicals — decoding a logical node
+// into a base TYPED target lands identically to a no-custom decode. The base
+// deserializer fills the typed target natively (deserDate→int32 raw days,
+// deserDuration→[12]byte), and the fall-through RE-DECODES through it. A
+// box-into-any placement could not: the probe holds the ENRICHED type, which no
 // base-kind setter accepts, so it ERRORED where no-custom succeeds.
 //
-// Held constant by TestMatrix_CustomSkipDecodeMatchesNoCustom (decode target =
-// the encode value's own type, so a timestamp decodes only into time.Time): this
-// crosses logical schema × base typed target, the foreclosed cell, on binary AND
-// JSON. Non-vacuity: neutering the typed re-decode to place the probe value reds
-// every row (the enriched probe value cannot fill the base target).
+// The main skip matrix holds the decode target equal to the encode value's own
+// type, so this crosses logical schema x base typed target — the foreclosed cell
+// — on both wires. Non-vacuity: neutering the typed re-decode reds every row.
 func TestMatrix_CustomSkipDecodeLogicalIntoBaseTypedTarget(t *testing.T) {
 	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
 	rows := []struct {
@@ -3798,15 +3710,11 @@ func TestMatrix_CustomSkipDecodeLogicalIntoBaseTypedTarget(t *testing.T) {
 
 // TestMatrix_CustomSkipDecodeTaggedUnionIntoAny pins that a wildcard all-skip
 // custom decode into an interface target under TaggedUnions reproduces the
-// {branch: value} envelope a no-custom decode emits (deserUnion.maybeWrap /
-// wrapUnion). A fresh interface target is decoded straight through the base
-// deserializer with the caller's TaggedUnions option in force, so the envelope is
-// produced natively — no re-tag step. The main skip matrix decodes only into typed
-// targets, which maybeWrap never tags, so this axis was unnetted.
-//
-// Non-vacuous: the oracle is a no-custom TaggedUnions decode into the same `any`
-// target; a regression that decoded the interface untagged (or boxed an untagged
-// value) reds every cell. The rows are distinct-Go-type / single-non-null unions.
+// {branch: value} envelope a no-custom decode emits. A fresh interface target
+// goes straight through the base deserializer with TaggedUnions in force, so the
+// envelope is produced natively. The main skip matrix decodes only into typed
+// targets, which maybeWrap never tags, so this axis was unnetted. The oracle is
+// a no-custom TaggedUnions decode into the same `any` target.
 func TestMatrix_CustomSkipDecodeTaggedUnionIntoAny(t *testing.T) {
 	skip := avro.CustomType{Decode: func(any, *avro.SchemaNode) (any, error) { return nil, avro.ErrSkipCustomType }}
 	p := func(x int32) *int32 { return &x }
@@ -4019,17 +3927,15 @@ func TestRegression_CustomSkipDecodeLogicalSuppression(t *testing.T) {
 
 // Internal re-parse surfaces vs user lax names.
 //
-// Two sites re-parse LIBRARY-PRODUCED schema text: Resolve builds a
-// custom-free writer view from writer.full for resolved DecodeJSON
-// (resolve.go), and SchemaCache.Parse rebuilds the metadata forms from the
-// self-contained spliced JSON (cache.go). Both re-parses once used
-// WithLaxNames(nil), assuming it subsumes any user lax validator — false
-// for empty name components (ns "a..b"), the only class lax(nil) rejects
-// that a user fn can accept. The original parse already validated those
-// names under the user's chosen validator; the internal validator has no
-// safety role, so both sites now parse with an accept-everything name
-// validator (internalReparseNames). These pins lock the two finding
-// shapes; TestMatrix_InternalReparseLaxNames covers the class.
+// Two sites re-parse LIBRARY-PRODUCED schema text: Resolve builds a custom-free
+// writer view from writer.full for resolved DecodeJSON, and SchemaCache.Parse
+// rebuilds the metadata forms from the spliced JSON. Both once used
+// WithLaxNames(nil), assuming it subsumes any user lax validator — false for
+// empty name components, the only class lax(nil) rejects that a user fn can
+// accept. The original parse already validated those names under the user's
+// validator, so the internal validator has no safety role and both sites now
+// parse with internalReparseNames. TestMatrix_InternalReparseLaxNames covers the
+// class.
 
 // ctLong is a decode-side domain type so the custom wiring in these tests
 // is observable, not just registered.
@@ -4048,17 +3954,14 @@ func ctLongDecodeOnly() avro.CustomType {
 	}
 }
 
-// The lax-view finding, site 1 (resolve.go's custom-free writer view).
-// A custom-typed writer parsed with a user WithLaxNames fn that accepts
-// empty name components (ns "a..b") is already-parsed, wire-valid text;
-// Resolve re-parses writer.full to build the custom-free view and must
-// not re-litigate the names. Pre-fix the WithLaxNames(nil) re-parse
-// rejected the empty component and Resolve HARD-FAILED ("building
-// custom-free writer view for resolved JSON decode: invalid record
-// namespace \"a..b\": name must be non-empty"), blocking binary
-// resolution too, while the no-custom control resolved. The reader
-// differs from the writer so Resolve's canonical fast path (return
-// reader as-is) cannot mask the view construction.
+// The lax-view finding, site 1 (resolve.go's custom-free writer view). A
+// custom-typed writer parsed with a user WithLaxNames fn accepting empty name
+// components is already-parsed, wire-valid text; Resolve re-parses writer.full
+// to build the custom-free view and must not re-litigate the names. Pre-fix the
+// WithLaxNames(nil) re-parse rejected the empty component and Resolve
+// HARD-FAILED, blocking binary resolution too, while the no-custom control
+// resolved. The reader differs from the writer so Resolve's canonical fast path
+// cannot mask the view construction.
 func TestRegression_ResolveCustomTypedLaxWriterView(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	writerJSON := `{"type":"record","name":"R","namespace":"a..b","fields":[{"name":"f","type":"long"}]}`
@@ -4198,18 +4101,15 @@ func TestRegression_CacheSpliceTransitiveLaxNames(t *testing.T) {
 	}
 }
 
-// Siblings of the canonical empty-name emission fix, in the metadata
-// rebuild: toJSONWalk (SchemaNode.Schema()) guarded its name-key,
-// namespace, cycle-reference, and dedup arms with Name != "", and
-// nsForChildren/collectNamedTypes/nodeFromJSONObject used the same idiom
-// — all conflating "structurally unnamed node" (array/map) with "named
-// kind whose short name is empty". Reachable damage through parsed
-// schemas: the "ok." class rebuilt to the WRONG schema silently (name +
-// namespace dropped, fullname "ok." became ""); recursive and diamond
-// "ok." shapes hard-failed the rebuilt re-parse ("unknown type"); a named
-// child inside an empty-named parent lost its inherited scope. The named
-// KIND, or a non-empty fullname where a reference must exist, is the
-// distinction — mirroring the canonical emitter fix.
+// Siblings of the canonical empty-name emission fix, in the metadata rebuild:
+// toJSONWalk guarded its name-key, namespace, cycle-reference and dedup arms
+// with Name != "", and nsForChildren/collectNamedTypes/nodeFromJSONObject used
+// the same idiom — all conflating "structurally unnamed node" with "named kind
+// whose short name is empty". Reachable damage: the "ok." class rebuilt to the
+// WRONG schema silently; recursive and diamond "ok." shapes hard-failed the
+// rebuilt re-parse; a named child inside an empty-named parent lost its
+// inherited scope. The named KIND, or a non-empty fullname where a reference
+// must exist, is the distinction.
 func TestMatrix_SchemaNodeRebuildEmptyNames(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	for _, c := range []struct{ desc, js string }{
@@ -4237,17 +4137,13 @@ func TestMatrix_SchemaNodeRebuildEmptyNames(t *testing.T) {
 	}
 }
 
-// The reader-side twin of the customBaked writer-trigger fix: resolved
-// decode DROPPED the reader's custom on SchemaCache-inherited subtrees.
-// resolveNode re-applies reader customs to REBUILT nodes through
-// resolveCtx.custom (= reader.custom), and a cache parse's overlay had no
-// entries for inherited nodes (applyCustomTypes visits only newly built
-// nodes; the guard-satisfying form registers the custom on BOTH parses,
-// but the referencing parse wires nothing new) — so a resolution against
-// a pre-evolution writer silently returned raw values where the direct
-// decode returned the custom-wrapped ones. tryAssignNamedRef now
-// completes the overlay for cross-parse inherited subtrees
-// (overlayInheritedCustom, the pure-wiring half of applyCustomTypes).
+// The reader-side twin of the customBaked writer-trigger fix: resolved decode
+// DROPPED the reader's custom on SchemaCache-inherited subtrees. resolveNode
+// re-applies reader customs to REBUILT nodes through resolveCtx.custom, and a
+// cache parse's overlay had no entries for inherited nodes (applyCustomTypes
+// visits only newly built ones), so a resolution against a pre-evolution writer
+// silently returned raw values where the direct decode returned wrapped ones.
+// tryAssignNamedRef now completes the overlay for cross-parse inherited subtrees.
 func TestRegression_ResolvedDecodeCacheInheritedReaderCustom(t *testing.T) {
 	var c avro.SchemaCache
 	if _, err := c.Parse(`{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}`, ctLongDecodeOnly()); err != nil {
@@ -4400,23 +4296,17 @@ func TestRegression_CacheSpliceEmptyShortName(t *testing.T) {
 }
 
 // AUDIT_PATTERNS.md B7 second instance, the stale-splice arm. A KEYLESS
-// definition — no "name" key at all, parseable only under a user
-// WithLaxNames fn accepting "" — registers the parser fullname "x." for
-// {"type":"record","namespace":"x",...} and builds its children under x,
-// so the nested Inner definition is x.Inner. collectTreeDefs gated both
-// the def visit and the child namespace scope on a string "name" KEY
-// being present, so parse-1's nested definition was misfiled in
-// SchemaCache.defs under the ENCLOSING-scoped fullname "Inner". A later
-// same-cache parse that references the short name "Inner" BEFORE locally
-// defining a DIFFERENT Inner is bound by the parser to the LOCAL later
-// definition (the cache's named table holds only x-scoped keys, so the
-// reference is a forward reference — eager, positional), and the wire
-// codec implements Inner{z:string}; the splice walker instead found the
-// misfiled stale def, inlined Inner{w:long} at the reference, and
-// rewrote the local definition to a reference (dupDefRef), shipping
-// String()/Root()/Canonical() that describe a field the wire rejects.
-// Post-fix the defs table holds only parser-scoped fullnames, nothing
-// splices, and every metadata form equals the directly-parsed twin's.
+// definition registers the parser fullname "x." for
+// {"type":"record","namespace":"x",...} and builds its children under x, so the
+// nested Inner is x.Inner. collectTreeDefs gated both the def visit and the child
+// namespace scope on a string "name" KEY being present, so parse-1's nested
+// definition was misfiled under the enclosing-scoped "Inner". A later same-cache
+// parse referencing the short name BEFORE locally defining a DIFFERENT Inner is
+// bound by the parser to the LOCAL definition, and the wire codec implements
+// Inner{z:string}; the splice walker instead found the misfiled stale def,
+// inlined Inner{w:long}, and rewrote the local definition to a reference —
+// shipping metadata describing a field the wire rejects. Post-fix the defs table
+// holds only parser-scoped fullnames and every metadata form equals the twin's.
 func TestRegression_CacheKeylessDefStaleSplice(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	var c avro.SchemaCache
@@ -4485,17 +4375,14 @@ func TestRegression_CacheKeylessDefStaleSplice(t *testing.T) {
 	}
 }
 
-// AUDIT_PATTERNS.md B7 second instance, the cross-parse dangle arm
-// (B9's coherent-degrade shape). Parse-1 (lax) defines x.Inner nested
-// inside a keyless record; parse-2 — no lax option, transitive
-// reachability is the point — references the parser-scoped fullname
-// "x.Inner", which the wire resolves from the cache's named table.
-// Pre-fix the definition sat misfiled in SchemaCache.defs under "Inner",
-// so the exact dotted lookup found nothing to splice and
-// String()/Canonical() kept the dangling reference (unresolvable under
-// any opts). Post-fix the splice fires and the metadata forms are
-// self-contained, strict-parseable (every spliced name here is
-// strict-valid), and byte-equal to the directly-parsed twin's.
+// AUDIT_PATTERNS.md B7 second instance, the cross-parse dangle arm (B9's
+// coherent-degrade shape). Parse-1 (lax) defines x.Inner nested inside a keyless
+// record; parse-2 — no lax option, transitive reachability being the point —
+// references the parser-scoped fullname, which the wire resolves from the
+// cache's named table. Pre-fix the definition sat misfiled under "Inner", so the
+// dotted lookup found nothing and the metadata kept a dangling reference
+// unresolvable under any opts. Post-fix the splice fires and the forms are
+// self-contained, strict-parseable, and byte-equal to the twin's.
 func TestRegression_CacheKeylessDefCrossParseRef(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	var c avro.SchemaCache
@@ -4547,19 +4434,14 @@ func TestRegression_CacheKeylessDefCrossParseRef(t *testing.T) {
 	}
 }
 
-// AUDIT_PATTERNS.md B7 third instance, arm one: parser self-consistency
-// for leading-dot names. One leading dot (and no other dot) is the
-// explicit null-namespace escape — the rule qualifyAliases already
-// applies to aliases and Java's Name constructor applies to every name
-// (Schema.java ~1455: lastDot split; `if ("".equals(space)) space =
-// null`) — so {"name":".x"} builds as name "x" in the null namespace
-// (lax-only: the empty leading component never passes strict
-// validation). Pre-fix the name registered VERBATIM as ".x" and child
-// registration prefixed parentName[:dot+1] (nested Inner registered
-// ".Inner") while reference resolution used namespaceOf(".x") = "" —
-// the parser disagreed with itself, and a bare sibling reference
-// inside ".x" failed to parse: unknown type "Inner". Post-fix children
-// build in the null namespace and the bare reference binds.
+// AUDIT_PATTERNS.md B7 third instance, arm one: parser self-consistency for
+// leading-dot names. One leading dot and no other is the explicit
+// null-namespace escape — the rule qualifyAliases already applies to aliases and
+// Java's Name constructor applies to every name (Schema.java ~1455) — so
+// {"name":".x"} builds as "x" in the null namespace, lax-only. Pre-fix the name
+// registered VERBATIM and child registration prefixed parentName[:dot+1] while
+// reference resolution used namespaceOf(".x") = "": the parser disagreed with
+// itself, and a bare sibling reference inside ".x" failed to parse.
 func TestRegression_LeadingDotSiblingRefResolves(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	src := `{"type":"record","name":".x","fields":[{"name":"k","type":{"type":"record","name":"Inner","fields":[{"name":"f","type":"long"}]}},{"name":"r","type":"Inner"}]}`
@@ -4643,17 +4525,15 @@ func TestRegression_LeadingDotCrossParseRefSplices(t *testing.T) {
 	}
 }
 
-// AUDIT_PATTERNS.md B7 third instance, arm three: the executed
-// stale-splice divergence heals. Pre-fix, parse-1's {"name":".x"}
-// registered ".x" in the parser but "x" in the def table, so a later
-// parse that references-then-locally-defines the bare "x" parsed (no
-// name conflict — ".x" != "x" in the parser's table), forward-bound
-// the reference to the LOCAL x{z:string}, and then spliced the STALE
-// misfiled def at the reference: canonical described x{w:long} while
-// the wire accepted {z:string} and rejected {w:long}. Post-fix ".x"
-// IS the fullname "x", so the local re-definition is a DUPLICATE of
-// the cache-inherited name and the parse is rejected outright — the
-// same verdict every other same-fullname redefinition gets.
+// AUDIT_PATTERNS.md B7 third instance, arm three: the executed stale-splice
+// divergence heals. Pre-fix, parse-1's {"name":".x"} registered ".x" in the
+// parser but "x" in the def table, so a later parse referencing-then-locally-
+// defining the bare "x" parsed (".x" != "x" in the parser's table), forward-bound
+// the reference to the LOCAL x{z:string}, then spliced the STALE misfiled def:
+// canonical described x{w:long} while the wire accepted {z:string}. Post-fix
+// ".x" IS the fullname "x", so the local re-definition is a duplicate and the
+// parse is rejected — the same verdict every other same-fullname redefinition
+// gets.
 func TestRegression_LeadingDotStaleSpliceHealed(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	var c avro.SchemaCache
@@ -4671,24 +4551,22 @@ func TestRegression_LeadingDotStaleSpliceHealed(t *testing.T) {
 
 // ---------- lax_internal_reparse_matrix_test.go ----------
 
-// Class matrix for the internal re-parse surfaces (Resolve's custom-free
-// writer view, resolve.go; SchemaCache's splice rebuild, cache.go) against
-// the full name class the ORIGINAL parse can accept:
+// Class matrix for the internal re-parse surfaces (Resolve's custom-free writer
+// view; SchemaCache's splice rebuild) against the full name class the ORIGINAL
+// parse can accept:
 //
 //	{site: resolve-view, cache-splice}
 //	  x {name class: strict, lax-nonempty, empty-component ns, empty-string name}
 //	  x {custom: none, decode-only, encode+decode}
 //	  x {reference: direct (recursive self-ref), transitive (diamond)}
-//	plus a cache cell whose OUTER parse itself carries the user lax fn, and
-//	pinned verdicts for the structurally-unreferenceable bare "" name.
+//	plus a cache cell whose OUTER parse carries the user lax fn, and pinned
+//	verdicts for the structurally-unreferenceable bare "" name.
 //
-// Every cell is framed as PARITY WITH THE ORIGINAL PARSE: whatever the
-// public parse accepted must survive Resolve, String()/Canonical()
-// re-parse, and resolved DecodeJSON, and the wire bytes and Rabin
-// fingerprints must equal the no-custom / directly-parsed twin — names
-// pass through verbatim (asserted, not assumed). The reader always
-// differs from the writer (an added defaulted field) so Resolve's
-// canonical fast path cannot mask the writer-view construction.
+// Every cell is framed as PARITY WITH THE ORIGINAL PARSE: whatever the public
+// parse accepted must survive Resolve, the String()/Canonical() re-parse, and
+// resolved DecodeJSON, and the wire bytes and fingerprints must equal the
+// no-custom / directly-parsed twin's. The reader always differs from the writer
+// so Resolve's canonical fast path cannot mask the writer-view construction.
 
 func ctLongEncDec() avro.CustomType {
 	return avro.CustomType{
@@ -4913,17 +4791,14 @@ func TestMatrix_InternalReparseLaxNames(t *testing.T) {
 	})
 }
 
-// Reader-side cells for the overlay-completion fix: a cache-parsed READER
-// whose custom matches only SchemaCache-inherited subtrees must apply the
-// custom on RESOLVED decode exactly as on direct decode. Every cell
-// asserts resolved == direct on value AND type (both against an explicit
-// custom-wrapped want), resolved DecodeJSON agreement, and that the
-// no-custom twin's wire bytes are unchanged by the custom registration.
-// The evolution axis lives INSIDE the inherited subtree and picks the
-// three resolve-time custom re-application families: added-field (a
-// custom-matched long default filled through defaultOp's wrap), promotion
-// (int→long through the promoted-node wrap + suppression gate), and
-// reorder (record rebuild + direct-reuse wrap).
+// Reader-side cells for the overlay-completion fix: a cache-parsed READER whose
+// custom matches only SchemaCache-inherited subtrees must apply the custom on
+// RESOLVED decode exactly as on direct decode. Every cell asserts resolved ==
+// direct on value AND type against an explicit want, resolved DecodeJSON
+// agreement, and that the no-custom twin's wire is unchanged by the
+// registration. The evolution axis lives INSIDE the inherited subtree and picks
+// the three resolve-time re-application families: added-field, promotion, and
+// reorder.
 func TestMatrix_CacheReaderInheritedCustomResolve(t *testing.T) {
 	type evo struct {
 		key         string
@@ -5180,33 +5055,22 @@ func TestMatrix_InternalReparseBareEmptyName(t *testing.T) {
 	}
 }
 
-// Class matrix for KEYLESS definitions in the SchemaCache def table —
-// named-kind nodes with NO "name" key at all, parseable only under a
-// user WithLaxNames fn accepting "" (AUDIT_PATTERNS.md B7 second
-// instance). The parser registers a fullname for them regardless
-// ("ns." from the namespace attribute, or "" bare) and scopes their
-// children by that namespace, so the def-collection and splice walkers
-// must do the same: collectTreeDefs's visit fires with the parser's
-// fullname and scopes children by nodeChildScope, and inlineTreeDefs's
-// local-definition registration (map arm and flat-field arm) has no
-// keyless carve-out.
+// Class matrix for KEYLESS definitions in the SchemaCache def table — named-kind
+// nodes with no "name" key at all, parseable only under a WithLaxNames fn
+// accepting "" (AUDIT_PATTERNS.md B7 second instance). The parser registers a
+// fullname for them regardless and scopes their children by it, so the
+// def-collection and splice walkers must do the same.
 //
 //	{namespace attr: present "x", absent}
-//	  x {parse-2 shape: cross-parse reference to the parser fullname
-//	     (define-then-reference), reference-then-LOCAL-define of the
-//	     nested short name, local-define-then-reference}
-//	plus keyless-def-visit cells (reference to "x." itself: recursive
-//	self-ref, diamond with the nested x.Inner), seen-parity cells
-//	(nested and flat keyless defs arriving inside a spliced subtree),
-//	and a same-string lax re-parse stability cell (dupDefRef on a
-//	keyless local definition).
+//	  x {parse-2 shape: cross-parse reference to the parser fullname,
+//	     reference-then-LOCAL-define of the nested short name,
+//	     local-define-then-reference}
+//	plus keyless-def-visit, seen-parity, and same-string lax re-parse cells.
 //
-// Invariant per cell, as everywhere in this file: the metadata forms
-// describe the wire codec's schema, twin-parity where a twin exists.
-// The bare-namespace reference-then-define orders have NO twin: the
-// parser itself rejects the parse (the cache's named table already
-// holds "Inner", so the local re-definition is a duplicate) — pinned
-// as the rejection.
+// Invariant per cell, as everywhere in this file: the metadata forms describe
+// the wire codec's schema, twin-parity where a twin exists. The bare-namespace
+// reference-then-define orders have NO twin — the parser rejects the parse — so
+// they are pinned as the rejection.
 func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	lax := avro.WithLaxNames(acceptAll)
@@ -5482,31 +5346,21 @@ func TestMatrix_CacheKeylessDefCollection(t *testing.T) {
 	})
 }
 
-// Class matrix for LEADING-DOT names (AUDIT_PATTERNS.md B7 third
-// instance). A single leading dot with no other dot is the explicit
-// null-namespace escape: {"name":".x"} builds as name "x" in the null
-// namespace and "." collapses to the bare empty name "" — the rule
-// qualifyAliases already applies to aliases and Java's Name constructor
-// applies to every name (Schema.java ~1455: lastDot split; `if
-// ("".equals(space)) space = null`). Lax-only: strict parses still
-// reject the empty leading component (twmb stays stricter than Java —
-// documented, not widened). fastavro 1.12.2 holds a THIRD posture,
-// executed 2026-07-14: it keeps ".x" VERBATIM in PCF (rabin
-// c69859279c1a5fbe) and rejects the bare-"x" reference (UnknownType)
-// while still scoping children in the null namespace; twmb follows
-// Java's normalized identity instead, so post-fix PCF/fingerprints for
-// the lax-only ".x" spelling match Java and diverge from fastavro
-// (pre-fix twmb matched fastavro's bytes on definition-only shapes but
-// was SELF-inconsistent on references: a bare sibling ref inside ".x"
-// could not parse at all).
+// Class matrix for LEADING-DOT names (AUDIT_PATTERNS.md B7 third instance). A
+// single leading dot with no other dot is the explicit null-namespace escape:
+// {"name":".x"} builds as "x" in the null namespace, and "." collapses to the
+// bare empty name — the rule qualifyAliases already applies to aliases and
+// Java's Name constructor applies to every name. Lax-only: strict parses still
+// reject the empty leading component. fastavro 1.12.2 holds a third posture,
+// executed 2026-07-14: it keeps ".x" verbatim in PCF and rejects the bare-"x"
+// reference. twmb follows Java's normalized identity, so post-fix fingerprints
+// for ".x" match Java and diverge from fastavro; pre-fix twmb matched fastavro
+// on definition-only shapes but was SELF-inconsistent on references.
 //
 //	{".x" definition x reference spelling {"x", ".x"} x cross-parse
 //	 x {pure reference, reference-then-define, define-then-reference}}
-//	plus same-parse spelling-equivalence cells (both orders, both ref
-//	spellings), the "." -> empty-name family cell (joins NOT_BUGS #60's
-//	adjudicated behavior numerically), a multi-dot verbatim control
-//	(".a.b" — all three implementations agree), and the
-//	Root()/nodeFullnameTree/parser agreement cell.
+//	plus same-parse equivalence, the "." -> empty-name cell (NOT_BUGS #60),
+//	a multi-dot verbatim control, and the Root()/parser agreement cell.
 func TestMatrix_LeadingDotNameNormalization(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	lax := avro.WithLaxNames(acceptAll)
@@ -5581,17 +5435,13 @@ func TestMatrix_LeadingDotNameNormalization(t *testing.T) {
 		})
 	}
 
-	// "." collapses into the adjudicated empty-name family (NOT_BUGS
-	// #60): its canonical form and Rabin fingerprint are byte-identical
-	// to the bare {"name":""} definition's — 3d741707ff4bfa45 is the
-	// fastavro-EXECUTED value pinned for that family — and the type
-	// stays unreferenceable in EVERY spelling: the "" reference is
-	// structurally rejected (pinned in
-	// TestMatrix_InternalReparseBareEmptyName) and the "." reference
-	// finds nothing to bind, same-parse and cross-parse. fastavro
-	// 1.12.2 keeps "." verbatim in PCF (executed 2026-07-14: rabin
-	// b1eae635ed69c128) — the same verbatim-identity divergence as the
-	// ".x" root, documented not adopted.
+	// "." collapses into the adjudicated empty-name family (NOT_BUGS #60): its
+	// canonical form and Rabin fingerprint are byte-identical to the bare
+	// {"name":""} definition's — 3d741707ff4bfa45 is the fastavro-EXECUTED value
+	// — and the type stays unreferenceable in EVERY spelling. fastavro 1.12.2
+	// keeps "." verbatim in PCF (executed 2026-07-14: rabin b1eae635ed69c128),
+	// the same verbatim-identity divergence as the ".x" root: documented, not
+	// adopted.
 	t.Run("dot-family", func(t *testing.T) {
 		s, err := avro.Parse(`{"type":"record","name":".","fields":[{"name":"f","type":"long"}]}`, lax)
 		if err != nil {
@@ -5828,17 +5678,14 @@ func fastavroRabinBytes(t *testing.T, leHex string) []byte {
 	return b
 }
 
-// Canonical-form parity for the empty-name classes against EXECUTED
-// fastavro 1.12.2 (2026-07-09): every twmb Canonical() must byte-match
-// fastavro's PCF and Rabin fingerprint for {class} × {position}, and
-// re-parse under the user's accept-all validator. The reference-position
-// bare cell is a DOCUMENTED DIVERGENCE: twmb structurally rejects the ""
-// reference spelling upstream of any validator, while fastavro accepts it
-// (its PCF keeps the bare "" ref; rabin f9afa0dabf6cd566) — pinned as
-// twmb's rejection. Forward references are twmb-only territory (fastavro
-// rejects ALL forward references — executed: UnknownType), so the fwd-ref
-// cell pins twmb's Java-rule first-occurrence form with no fastavro
-// comparison.
+// Canonical-form parity for the empty-name classes against EXECUTED fastavro
+// 1.12.2 (2026-07-09): every twmb Canonical() must byte-match fastavro's PCF and
+// Rabin fingerprint for {class} x {position}, and re-parse under the user's
+// accept-all validator. The reference-position bare cell is a DOCUMENTED
+// DIVERGENCE — twmb structurally rejects the "" reference spelling upstream of
+// any validator while fastavro accepts it (rabin f9afa0dabf6cd566). Forward
+// references are twmb-only territory (fastavro rejects all of them), so that
+// cell pins twmb's Java-rule first-occurrence form with no comparison.
 func TestMatrix_CanonicalEmptyNameFastavroParity(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	const (
@@ -5929,21 +5776,17 @@ func TestMatrix_CanonicalEmptyNameFastavroParity(t *testing.T) {
 	})
 }
 
-// Tagged-union JSON naming for an EMPTY-NAMED union branch (short name ""
-// with and without a namespace — reachable only under a user WithLaxNames
-// fn). The tag is the branch's FULLNAME, exactly as for any other named
-// branch: "ok." for the namespaced class and "" for the bare class —
-// matching fastavro's json_writer (1.12.2, executed: `{"ok.": "A"}`; its
-// reader resolves only that exact key, rejecting "" and the kind name).
-// fastavro cannot WRITE the bare class (its writer errors "No key was set"
-// on the falsy fullname) but its reader accepts the "" key, so twmb's
-// `{"":"A"}` emission is fastavro-readable on both classes.
+// Tagged-union JSON naming for an EMPTY-NAMED union branch (short name "" with
+// and without a namespace — reachable only under a user WithLaxNames fn). The
+// tag is the branch's FULLNAME, exactly as for any other named branch, matching
+// fastavro's json_writer (1.12.2, executed: `{"ok.": "A"}`). fastavro cannot
+// WRITE the bare class but its reader accepts the "" key, so twmb's `{"":"A"}`
+// is fastavro-readable on both classes.
 //
 //	{class: bare "", namespaced "ok."}
 //	  x {tagged encode emission (exact bytes),
 //	     decode of own emission (plain and TaggedUnions),
-//	     tagged-map encode routing (fullname key; "" short-name fallback),
-//	     resolved DecodeJSON routing (per-branch-divergent resolution)}
+//	     tagged-map encode routing, resolved DecodeJSON routing}
 func TestMatrix_EmptyNameTaggedUnion(t *testing.T) {
 	acceptAll := func(string) error { return nil }
 	for _, tc := range []struct {
@@ -6527,16 +6370,13 @@ func TestRegression_SchemaCacheSOEInterop(t *testing.T) {
 }
 
 // The cross-parse self-containment splice harvests inherited definitions by
-// walking the prior schema's JSON tree. It must mirror the parser EXACTLY,
-// which (a) reads object keys case-insensitively (lookupCI) and (b) accepts
-// the flat ("linkedin/goavro") field form, where a record field carries a
-// named type's defining key (symbols/fields/size) alongside its own keys and
-// the parser lifts it into a registered named type. A walker that only
-// descended into a field's "type" value (and read keys case-sensitively)
-// never collected those definitions, so a later cross-parse reference stayed
-// a dangling bare ref: Canonical()/String() failed to re-parse and the
-// fingerprint diverged from the logically-identical schema (SOE/registry
-// interop break).
+// walking the prior schema's JSON tree, so it must mirror the parser EXACTLY:
+// case-insensitive object keys (lookupCI), and the flat goavro field form, where
+// a field carries a named type's defining key alongside its own and the parser
+// lifts it into a registered type. A walker that only descended into a field's
+// "type" value, reading keys case-sensitively, never collected those
+// definitions, so a later cross-parse reference stayed a dangling bare ref:
+// Canonical()/String() failed to re-parse and the fingerprint diverged.
 func TestRegression_SchemaCacheSelfContainedFlatFormDef(t *testing.T) {
 	var c avro.SchemaCache
 	// Prior parse defines enum E in the FLAT field form.
@@ -6942,16 +6782,14 @@ func TestRegression_SchemaCacheTransitiveRefs(t *testing.T) {
 }
 
 // TestMatrix_SchemaCacheCrossNamespaceSplice pins that splicing an inherited
-// definition into a referencing schema preserves the definition's resolved
-// namespace, regardless of the enclosing namespace at the reference site. A
-// definition that inherited its namespace (or sat in the null namespace) is
+// definition preserves its resolved namespace regardless of the enclosing
+// namespace at the reference site. A definition that inherited its namespace is
 // stored with no explicit "namespace"; splicing it verbatim into a different
-// scope would re-inherit that scope's namespace and resolve to the wrong
-// fullname (e.g. com.a.Inner becoming com.b.Inner) — a self-contained-but-WRONG
-// form whose canonical/fingerprint silently diverge from the wire schema and
-// from every other Avro implementation. Stored definitions therefore carry an
-// explicit namespace. Each case must match the logically-identical inline
-// schema on wire (control), canonical, and fingerprint, and re-parse cleanly.
+// scope would re-inherit that scope and resolve to the wrong fullname — a
+// self-contained-but-WRONG form whose canonical and fingerprint silently diverge
+// from the wire schema. Stored definitions therefore carry an explicit
+// namespace. Each case must match the inline twin on wire, canonical, and
+// fingerprint, and re-parse cleanly.
 func TestMatrix_SchemaCacheCrossNamespaceSplice(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -7096,17 +6934,15 @@ func TestRegression_WrappedRefSpellingsCanonicalInvariant(t *testing.T) {
 
 // ---------- cache_overlap_test.go ----------
 
-// TestMatrix_SchemaCacheOverlappingSpliceDefs pins self-containment when
-// two cache-inherited references carry overlapping definitions. Each cached
-// definition is stored self-contained (transitive definitions inlined), so a
-// schema referencing two types that share a transitive type — the diamond
-// A→{B,C}→D — or referencing a nested type and then its container would, with
-// a naive splice, define the shared name twice. The splice must instead keep
-// the first definition and rewrite later occurrences to name references,
-// exactly as the parser's node tree shares one resolved type (and as Java's
-// Schema toString emits via writeNameRef). The oracle is the logically
-// identical inline-defined twin: identical wire bytes, identical canonical
-// form and fingerprint, and re-parseable String()/Canonical()/Root().Schema().
+// TestMatrix_SchemaCacheOverlappingSpliceDefs pins self-containment when two
+// cache-inherited references carry overlapping definitions. Each cached
+// definition is stored self-contained, so a schema referencing two types that
+// share a transitive type — the diamond A→{B,C}→D — would, with a naive splice,
+// define the shared name twice. The splice must keep the first definition and
+// rewrite later occurrences to name references, exactly as the parser's node
+// tree shares one resolved type and as Java's toString emits via writeNameRef.
+// The oracle is the inline-defined twin: identical wire, canonical form and
+// fingerprint, and a re-parseable String()/Canonical()/Root().Schema().
 func TestMatrix_SchemaCacheOverlappingSpliceDefs(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -7305,17 +7141,16 @@ func TestMatrix_SchemaCacheSpliceCascade(t *testing.T) {
 	})
 }
 
-// TestMatrix_SchemaCacheShortNameShadowNoMisbind pins that the duplicate-
-// definition rewrite never emits a reference that would re-bind to a DIFFERENT
-// type. A null-namespace type's only reference spelling is its bare short
-// name, which the parser binds enclosing-namespace-first (scopedRefKeys) — so
-// when a same-short-name namespaced type is defined earlier in the document,
-// rewriting the null-namespace duplicate to a bare reference would silently
-// re-bind it to the namespaced type, making the metadata forms describe a
-// different schema than the wire codec. The rewrite must decline in exactly
-// that case; the metadata forms may then stay non-self-contained (the format
-// has no absolute-reference spelling for null-namespace names — Java has the
-// same limitation), but they must never describe the wrong schema.
+// TestMatrix_SchemaCacheShortNameShadowNoMisbind pins that the
+// duplicate-definition rewrite never emits a reference that would re-bind to a
+// DIFFERENT type. A null-namespace type's only reference spelling is its bare
+// short name, which the parser binds enclosing-namespace-first — so when a
+// same-short-name namespaced type is defined earlier, rewriting the
+// null-namespace duplicate to a bare reference would silently re-bind it, making
+// the metadata describe a different schema than the wire codec. The rewrite must
+// decline in exactly that case; the forms may then stay non-self-contained (the
+// format has no absolute-reference spelling for null-namespace names, and Java
+// has the same limitation) but must never describe the wrong schema.
 func TestMatrix_SchemaCacheShortNameShadowNoMisbind(t *testing.T) {
 	var c avro.SchemaCache
 	for i, d := range []string{
@@ -7377,16 +7212,14 @@ func TestMatrix_SchemaCacheShortNameShadowNoMisbind(t *testing.T) {
 }
 
 // TestMatrix_SchemaCacheWrappedFormCrossParseRefSelfContains pins that a
-// cross-parse reference spelled in the WRAPPED form {"type":"X"} self-contains
-// in the metadata exactly like the bare-string form "X". {"type":"X"} is a
-// documented-accepted name-reference spelling (including forward refs). The
-// splice replaces the whole wrapped object with the referenced definition; the
-// earlier bug recursed INTO the "type" value, producing the invalid
-// {"type":{X-def}}, so the rebuild Parse failed and String()/Canonical() fell
-// back to a dangling reference (wire codec worked, but Parse(s.String()) and
-// the fingerprint surface did not). The oracle is the inline-defined twin:
-// identical wire, identical canonical form + fingerprint, re-parseable
-// String()/Canonical(). Crosses every nesting position the splice walks.
+// cross-parse reference spelled {"type":"X"} self-contains exactly like the bare
+// "X"; both are documented-accepted spellings, including for forward refs. The
+// splice replaces the whole wrapped object with the definition; the earlier bug
+// recursed INTO the "type" value, producing the invalid {"type":{X-def}}, so the
+// rebuild Parse failed and String()/Canonical() fell back to a dangling
+// reference — the wire codec worked, the fingerprint surface did not. The oracle
+// is the inline-defined twin, crossed over every nesting position the splice
+// walks.
 func TestMatrix_SchemaCacheWrappedFormCrossParseRefSelfContains(t *testing.T) {
 	const xDef = `{"type":"record","name":"X","fields":[{"name":"n","type":"int"}]}`
 	cases := []struct {
@@ -7530,20 +7363,17 @@ func TestMatrix_SchemaCacheWrappedFormCrossParseRefSelfContains(t *testing.T) {
 	})
 }
 
-// TestMatrix_SpliceWrapperReservedKeyMerge drives the SchemaCache splice
-// merge's reserved-key routing (the shared schemaReservedKeyForObject
-// predicate at its cache call site) with wrapper props on cached
-// definitions. A wrapper key the def's kind/logical CONSUMES never survives
-// the splice (reserved usage-site attributes drop, matching Java's
-// reference arms, which return the found schema with no properties pass);
-// an UNCONSUMED key merges onto the definition as an ordinary custom
-// property, definition-wins on collision. A non-string logicalType is
-// unconsumed everywhere; precision/scale are consumed exactly on a decimal
-// carrier def. The decimal def omits "scale" on purpose (spec default 0):
-// a consumed wrapper "scale" must be dropped by the ROUTING, not masked by
-// the def-wins presence check. fastavro rejects the props-carrying
-// wrapped-reference spelling outright, so these cells have no differential
-// arm; Java is the reference (usage-site extras drop at reference sites).
+// TestMatrix_SpliceWrapperReservedKeyMerge drives the splice merge's
+// reserved-key routing with wrapper props on cached definitions. A wrapper key
+// the def's kind/logical CONSUMES never survives the splice (reserved usage-site
+// attributes drop, matching Java's reference arms, which return the found schema
+// with no properties pass); an UNCONSUMED key merges onto the definition as an
+// ordinary custom property, definition-wins on collision. A non-string
+// logicalType is unconsumed everywhere; precision/scale are consumed exactly on
+// a decimal carrier. The decimal def omits "scale" on purpose (spec default 0):
+// a consumed wrapper "scale" must be dropped by the ROUTING, not masked by the
+// def-wins presence check. fastavro rejects the props-carrying wrapped-reference
+// spelling outright, so these cells have no differential arm.
 func TestMatrix_SpliceWrapperReservedKeyMerge(t *testing.T) {
 	plainDef := `{"type":"fixed","name":"F","size":4}`
 	decimalDef := `{"type":"fixed","name":"D","size":4,"logicalType":"decimal","precision":2}`
@@ -7683,20 +7513,17 @@ func TestMatrix_SpliceWrapperReservedKeyMerge(t *testing.T) {
 	}
 }
 
-// spliceStrayRoutedKeys is the SHAPE-CONDITIONAL reserved-key axis: the
-// keys that have a SchemaNode structural field to land on, so a stray
-// placement of one routes on whether its body parses as that key's schema
-// shape rather than on the key alone. It mirrors the parser's own
-// strayRoutedKeys list; TestInvariant_StrayRoutedKeyAxisMirrorsTheSource
-// (package avro) reds if the source list gains or loses a member, so a new
-// stray-routed key cannot ship without a cell here.
+// spliceStrayRoutedKeys is the SHAPE-CONDITIONAL reserved-key axis: the keys
+// that have a SchemaNode structural field to land on, so a stray placement
+// routes on whether its body parses as that key's schema shape rather than on
+// the key alone. It mirrors the parser's own strayRoutedKeys;
+// TestInvariant_StrayRoutedKeyAxisMirrorsTheSource reds if the source list
+// changes, so a new stray-routed key cannot ship without a cell here.
 //
-// The three keys the older cells above drive (logicalType, precision,
-// scale) are NOT in this list — their binding turns on the value or on the
-// logical type, never on shape — so every one of them short-circuits the
-// routing before the shape question is asked. That is the axis this table
-// adds: without a member of this list, the wrapper-key axis never reaches
-// the splice's shape verdict at all.
+// The three keys the older cells drive (logicalType, precision, scale) are NOT
+// in this list — their binding turns on the value or the logical type, never on
+// shape — so each short-circuits before the shape question is asked. That is the
+// axis this table adds.
 var spliceStrayRoutedKeys = []string{
 	"items", "values", "fields", "symbols", "size", "name", "namespace", "aliases",
 }
@@ -7790,22 +7617,19 @@ var spliceStrayRuling = map[string]spliceStrayOutcome{
 	"record/aliases/shapeOK": spliceDrop, "record/aliases/badElem": spliceDrop, "record/aliases/badScalar": spliceDrop,
 }
 
-// TestMatrix_SpliceWrapperStrayRoutedKeyShape widens
-// TestMatrix_SpliceWrapperReservedKeyMerge's WRAPPER-KEY axis onto the
-// shape-conditional class. The older cells drive only logicalType,
-// precision and scale — the three keys whose binding turns on the value or
-// the logical type — and every one of them is settled before the routing
-// reaches its shape question, so the splice's shape verdict (the nil-verdict
-// arm, the one call site that has no recorded parse verdict to consult and
-// must decode the body afresh) never ran at all.
+// TestMatrix_SpliceWrapperStrayRoutedKeyShape widens the wrapper-key axis onto
+// the shape-conditional class. The older cells drive only logicalType, precision
+// and scale, each settled before the routing reaches its shape question, so the
+// splice's shape verdict — the nil-verdict arm, the one call site with no
+// recorded parse verdict to consult, which must decode the body afresh — never
+// ran at all.
 //
-// The cross product is stray-routed key × definition kind × body class, and
-// each cell is checked against an INDEPENDENT image rather than against the
-// routing's own answer: a merged body must equal what the SAME body becomes
-// under a non-reserved key, and every cell — merged, dropped or rejected —
-// must leave the definition's own structural surface, wire image and
-// canonical form untouched, since a usage-site attribute is metadata and can
-// never redefine the type it references.
+// The cross product is stray-routed key x definition kind x body class, and each
+// cell is checked against an INDEPENDENT image rather than the routing's own
+// answer: a merged body must equal what the SAME body becomes under a
+// non-reserved key, and every cell — merged, dropped or rejected — must leave
+// the definition's structural surface, wire image and canonical form untouched,
+// since a usage-site attribute can never redefine the type it references.
 func TestMatrix_SpliceWrapperStrayRoutedKeyShape(t *testing.T) {
 	t.Parallel()
 	counts := map[spliceStrayOutcome]int{}
@@ -8004,17 +7828,15 @@ func TestRegression_SpliceDefFieldMalformedPrecisionRidesThrough(t *testing.T) {
 // ---------- wildcard_cache_test.go ----------
 
 // TestRegression_SchemaCacheWildcardConsistentRegistration pins that a wildcard
-// CustomType (empty LogicalType AND AvroType, ErrSkipCustomType — the
-// documented audit/metrics-hook use case) registered CONSISTENTLY across cache
-// parses resolves, like a non-wildcard does. The cache-boundary reverse guard
-// disagreed with itself on wildcards: the hadCustomType stamp counted any
-// wiring (len(b.custom)>0, which a wildcard populates), but
-// findCustomTypeMatchInSubtree SKIPS wildcards — so a cached wildcard-bearing
-// type, referenced with the SAME wildcard registered, hit
-// hadCustomType && currentMatches=="" and was rejected with an error telling
-// the user to register the CustomType they had already registered. A wildcard
-// bakes nothing onto the shared node (its conversion lives in the per-parse
-// overlay), so the stamp must exclude wildcard-only wiring.
+// CustomType (empty LogicalType AND AvroType, ErrSkipCustomType — the documented
+// audit/metrics-hook use case) registered CONSISTENTLY across cache parses
+// resolves, like a non-wildcard does. The cache-boundary reverse guard disagreed
+// with itself: the hadCustomType stamp counted any wiring, which a wildcard
+// populates, but findCustomTypeMatchInSubtree SKIPS wildcards — so a cached
+// wildcard-bearing type referenced with the SAME wildcard registered was
+// rejected with an error telling the user to register what they already had. A
+// wildcard bakes nothing onto the shared node, so the stamp must exclude
+// wildcard-only wiring.
 func TestRegression_SchemaCacheWildcardConsistentRegistration(t *testing.T) {
 	const innerJSON = `{"type":"record","name":"Inner","fields":[{"name":"v","type":"long","logicalType":"timestamp-millis"}]}`
 	const outerRefJSON = `{"type":"record","name":"Outer","fields":[{"name":"in","type":"Inner"}]}`
@@ -8229,20 +8051,18 @@ func TestSlabFreeClassifier(t *testing.T) {
 	}
 }
 
-// TestSlabFreeMatchesNilSlabOracle is the two-sided generative net: for
-// every matrix fragment in every matrix context, the slab-free
-// classification must EXACTLY equal the independent oracle "decoding every
-// encoded value with a nil slab does not panic". A slab-free schema whose
-// deser secretly touches the slab panics (classification too eager: a
-// user-visible crash in Decode); a pooled schema whose deser never touches
-// it survives nil (classification too conservative: issue #41 regresses for
-// that shape). Composite kinds panic at entry via the recursion-depth bump
-// and string leaves via the slab string copy, so the oracle discriminates
-// every cell.
+// TestSlabFreeMatchesNilSlabOracle is the two-sided generative net: for every
+// matrix fragment in every context, the slab-free classification must EXACTLY
+// equal the independent oracle "decoding every encoded value with a nil slab
+// does not panic". A slab-free schema whose deser secretly touches the slab
+// panics (too eager: a user-visible crash in Decode); a pooled schema whose
+// deser never touches it survives nil (too conservative: issue #41 regresses).
+// Composite kinds panic at entry via the recursion-depth bump and string leaves
+// via the slab string copy, so the oracle discriminates every cell.
 //
-// Non-vacuity was verified by neutering: adding "string" to slabFreeKinds
-// makes the string cells fail here in the panicked direction, and hardcoding
-// slabFree=false makes every scalar cell fail in the other direction.
+// Non-vacuity: adding "string" to slabFreeKinds fails the string cells in the
+// panicked direction, and hardcoding slabFree=false fails every scalar cell in
+// the other.
 func TestSlabFreeMatchesNilSlabOracle(t *testing.T) {
 	u := &uniq{}
 	var freeCells, pooledCells int
@@ -8536,17 +8356,14 @@ const maxDepthLevels = 5
 
 // An array<record> element's pointer chain must be capped at the same
 // maxIndirectDepth every other context enforces. The unsafe struct-field array
-// fast path peels one pointer level inline (usArrayRecord → usArrayPtrRecord on
-// encode, the case "record" arm → udArrayPtrRecord on decode) and then hands
-// the element to the record (de)serializer's own indirect/indirectAlloc budget.
-// Without declining a multi-level-pointer element it accepted a chain
-// 1+maxIndirectDepth deep — one past the cap the top-level reflect path, the
-// JSON encoder, and the nullunion array arms all enforce — so a []******Record
-// struct field encoded a binary wire that the struct's own JSON encoder, a
-// top-level encode of the same slice, and a top-level decode into the same type
-// all reject. Every context must agree on the accept/reject boundary; an
-// accepted chain must round-trip. The fast path stays single-pointer
-// ([]*Record); deeper-but-in-cap chains route to the reflect path.
+// fast path peels one pointer level inline and hands the element to the record
+// (de)serializer's own indirect budget. Without declining a multi-level element
+// it accepted a chain 1+maxIndirectDepth deep — one past the cap the top-level
+// reflect path, the JSON encoder, and the nullunion array arms enforce — so a
+// []******Record struct field encoded a wire that the struct's own JSON encoder,
+// a top-level encode of the same slice, and a top-level decode into the same
+// type all reject. The fast path stays single-pointer; deeper-but-in-cap chains
+// route to reflect.
 func TestRegression_ArrayRecordElementPointerChainDepthParity(t *testing.T) {
 	const recJSON = `{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}`
 	sArr := avro.MustParse(`{"type":"array","items":` + recJSON + `}`)
@@ -8661,15 +8478,13 @@ func TestRegression_ArrayRecordElementPointerChainDepthParity(t *testing.T) {
 
 // A ["null", record] nullunion record FIELD's pointer chain must be capped at
 // maxIndirectDepth on decode, matching encode and every other context. The
-// unsafe udNullUnionRecord consumes the nullunion's outer pointer (goType.Elem)
-// and then indirectAllocs the remainder, so without declining a multi-level
-// pointer target it accepted a chain 1+maxIndirectDepth deep — one past the cap
-// the encode side (which already declines **…T to reflect), the reflect deser,
-// and the JSON paths all enforce. A valid wire decoded into a ******record
-// nullunion field then succeeded where encode of the same type rejected: an
-// encode/decode boundary asymmetry. Decode must reject at the same depth encode
-// does; the fast path stays single-pointer (*record), deeper-but-in-cap chains
-// route to the reflect deser.
+// unsafe udNullUnionRecord consumes the nullunion's outer pointer and then
+// indirectAllocs the remainder, so without declining a multi-level target it
+// accepted a chain 1+maxIndirectDepth deep — one past the cap the encode side,
+// the reflect deser, and the JSON paths enforce. A valid wire decoded into a
+// ******record nullunion field then succeeded where encode of the same type
+// rejected. The fast path stays single-pointer; deeper-but-in-cap chains route
+// to reflect.
 func TestRegression_NullUnionRecordFieldPointerChainDepthParity(t *testing.T) {
 	const recJSON = `{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}`
 	s := avro.MustParse(`{"type":"record","name":"Outer","fields":[{"name":"f","type":["null",` + recJSON + `]}]}`)
@@ -8756,18 +8571,16 @@ func TestRegression_NullUnionRecordFieldPointerChainDepthParity(t *testing.T) {
 
 // ---------- named_byte_element_test.go ----------
 
-// A Go byte-container type whose ELEMENT type is a named byte (type B byte;
-// [N]B, []B) has element Kind Uint8 but an element type that is not exactly
-// uint8. The byte encoder accepts such types (serSize / doSerBytes /
-// appendAvroJSONBytes iterate elements via Uint), so by the encode/decode
-// target-type parity contract every decoder and the JSON encoder must accept
-// them too. The decode and JSON paths used reflect.Copy /
-// reflect.Value.Set(reflect.ValueOf([]byte)), which require the element type to
-// be EXACTLY uint8 and PANIC on a named element ("reflect.Copy: B != uint8") —
-// a panic reaching the caller of a public API on a valid Go value. These tests
-// pin that every fixed/bytes/uuid path round-trips a named-byte-element type on
-// both wires, scalar and as a struct field (the unsafe fast path), and through
-// bytes->string+uuid promotion.
+// A Go byte-container type whose ELEMENT type is a named byte (type B byte; [N]B,
+// []B) has element Kind Uint8 but an element type that is not exactly uint8. The
+// byte encoder accepts such types (serSize / doSerBytes / appendAvroJSONBytes
+// iterate via Uint), so by the encode/decode target-type parity contract every
+// decoder and the JSON encoder must too. The decode and JSON paths used
+// reflect.Copy / Set(reflect.ValueOf([]byte)), which require the element type to
+// be EXACTLY uint8 and PANIC on a named element — a panic reaching the caller of
+// a public API on a valid Go value. These pin that every fixed/bytes/uuid path
+// round-trips a named-byte-element type on both wires, scalar and as a struct
+// field, and through bytes->string+uuid promotion.
 
 type nbeByte byte
 type nbeFix3 [3]nbeByte
@@ -8965,18 +8778,15 @@ func TestRegression_ExactByteContainersStillRoundTrip(t *testing.T) {
 
 // ---------- unsafe_nullunion_nil_test.go ----------
 
-// The 2-branch ["null",T] / [T,"null"] optimization treats a value as the null
-// branch exactly when avro's isNilValue reports it nil — which peels
-// pointer/interface layers and then nil-checks the bottom kind, so a non-nil
-// pointer to a nil slice/map (&(nilSlice)) is null. The reflect-binary and JSON
-// encoders both honor isNilValue. The unsafe struct fast path must agree: the
-// SAME value must encode to the SAME union branch whether the struct is passed
-// addressable (&v, which reaches the unsafe path) or by value (v, reflect), and
-// JSON must match too. A divergence is addressability-dependent wire corruption.
-//
-// These pin the slice-backed inner shapes (array, bytes) of the null-union field
-// optimization (usNullUnionPtr) and its array-element sibling (usArrayNullUnionPtr),
-// plus map/non-nil controls.
+// The 2-branch ["null",T] optimization treats a value as the null branch exactly
+// when isNilValue reports it nil — which peels pointer/interface layers and then
+// nil-checks the bottom kind, so a non-nil pointer to a nil slice/map is null.
+// The reflect-binary and JSON encoders both honor isNilValue, and the unsafe
+// struct fast path must agree: the SAME value must encode to the SAME branch
+// whether the struct is passed addressable (reaching the unsafe path) or by
+// value, and JSON must match. A divergence is addressability-dependent wire
+// corruption. These pin the slice-backed inner shapes of usNullUnionPtr and its
+// array-element sibling, plus map/non-nil controls.
 
 // nullUnionParity encodes v addressable (unsafe) and by value (reflect) and as
 // JSON, and asserts all three pick the same union branch: the two binary wires

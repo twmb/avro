@@ -32,59 +32,47 @@ import (
 //
 // Every attribute the Avro spec defines somewhere (precision, scale, items,
 // values, symbols, size, fields, order, default, aliases, namespace,
-// logicalType, and the enum-level default) placed on every OTHER kind, at
-// both levels (a type object and a record-field object), skipping only the
-// placements where the attribute is defined. Per accepted cell the census
-// asserts the routing (where the stray attribute surfaces on the metadata
-// API), the String() reparse and Root().Schema() rebuild round trips, and
-// wire/Canonical()/Rabin identity with the stray-free twin — a stray
-// attribute must be INERT. Reject cells assert their documented policy
-// (NOT_BUGS #63 structural-key exclusivity). The fastavro differential arm
-// executes every cell against fastavro's parser; the cisuite arm drives a
+// logicalType, and the enum-level default) placed on every OTHER kind, at both
+// levels (a type object and a record-field object), skipping only the placements
+// where the attribute is defined. Per accepted cell the census asserts the
+// routing, the String() reparse and Root().Schema() rebuild round trips, and
+// wire/Canonical()/Rabin identity with the stray-free twin — a stray attribute
+// must be INERT. Reject cells assert their documented policy (NOT_BUGS #63). The
+// fastavro differential arm executes every cell; the cisuite arm drives a
 // representative subset through the Java oracle.
 //
-// The routing rule (one rule, both parse surfaces — aobjectFromMap extras
-// and the Root() metadata walker share schemaReservedKeyForObject):
+// The routing rule — one rule, both parse surfaces, since aobjectFromMap extras
+// and the Root() metadata walker share schemaReservedKeyForObject:
 //
 //   - Reserved keys the node's kind CONSUMES are consumed (items on array,
-//     symbols on enum, size on fixed, fields on record/error, values on
-//     map, namespace/aliases on named kinds, default on enum — #54,
-//     precision/scale on recognized decimal carriers — #55).
-//   - precision/scale anywhere else are custom properties (Props), at both
-//     levels — including malformed (non-int) bodies at the FIELD level
-//     when no decimal lift consumes them; the body-shape axis for the
-//     pair lives in the strayPS placement matrix
-//     (stray_precision_scale_test.go, NOT_BUGS #71).
-//   - Every OTHER reserved key on a kind that does not consume it is
-//     captured and surfaced AS-WRITTEN on the matching SchemaNode field
-//     where one exists (items/values/symbols/size/fields; name/namespace;
-//     aliases; logicalType), and rides to Props verbatim where none does
-//     (order on every kind, default on every kind but enum — the two
-//     field attributes, which no type object has a structural field for).
-//     Exactly one surface per key, never both and never neither. None of
-//     them reach the wire, the canonical form strips them, and the
-//     Root().Schema() rebuild emits the defined-placement attributes plus
-//     the Props-routed ones — so the rebuild is canonical-identical, not
-//     text-identical. NOT_BUGS #63 records the structural-key edges.
-//   - A container kind carrying ANOTHER container kind's defining
-//     structural key hard-rejects ("invalid <kind> has schema for other
-//     types") — NOT_BUGS #63, the cache/metadata walkers' kind-keyed
-//     soundness premise; fastavro and Java accept these as props (the
-//     documented divergence). A stray "name" on an unnamed CONTAINER kind
-//     rejects for the same walker-parity reason (the metadata walkers
-//     deliberately scope children by any non-empty Name); a stray
-//     "namespace" there is inert and accepted.
-//   - At the FIELD level every non-field-reserved key is a field custom
-//     property (SchemaField.Props), as written; the field's type node
-//     stays clean. (The flat goavro-style lift consumes defining keys only
-//     when the field's "type" is a bare string naming the matching kind —
-//     that family is netted by flat_field_lift_test.go and the
-//     FEATURE x WALKER harness; the census spells field types nested or
+//     symbols on enum, size on fixed, fields on record/error, values on map,
+//     namespace/aliases on named kinds, default on enum — #54, precision/scale
+//     on recognized decimal carriers — #55).
+//   - precision/scale anywhere else are custom properties at both levels,
+//     including malformed bodies at the FIELD level when no decimal lift
+//     consumes them; the body-shape axis lives in the strayPS placement matrix
+//     (NOT_BUGS #71).
+//   - Every OTHER reserved key on a kind that does not consume it is captured
+//     and surfaced AS-WRITTEN on the matching SchemaNode field where one exists,
+//     and rides to Props verbatim where none does (order on every kind, default
+//     on every kind but enum). Exactly one surface per key, never both and never
+//     neither. None reach the wire, the canonical form strips them, and the
+//     rebuild emits the defined-placement attributes plus the Props-routed ones
+//     — so the rebuild is canonical-identical, not text-identical.
+//   - A container kind carrying ANOTHER container kind's defining structural key
+//     hard-rejects — NOT_BUGS #63, the cache/metadata walkers' kind-keyed
+//     soundness premise; fastavro and Java accept these as props (the documented
+//     divergence). A stray "name" on an unnamed CONTAINER kind rejects for the
+//     same walker-parity reason; a stray "namespace" there is inert.
+//   - At the FIELD level every non-field-reserved key is a field custom property
+//     as written, and the field's type node stays clean. (The flat goavro-style
+//     lift consumes defining keys only when the field's "type" is a bare string
+//     naming the matching kind; the census spells field types nested or
 //     bare-primitive so no cell is lift-eligible.)
 //
 // Field-level order/default/aliases are DEFINED field attributes (skipped);
-// field-level logicalType is the #33 lift (netted by the harness's
-// field-logical rows; skipped here with that citation).
+// field-level logicalType is the #33 lift, netted by the harness's
+// field-logical rows.
 // ---------------------------------------------------------------------------
 
 // censusKinds are the type-level kinds; censusFieldKinds adds union (which
@@ -804,47 +792,43 @@ func TestDifferentialFastavroAttributePlacement(t *testing.T) {
 // ---------------------------------------------------------------------------
 // The reserved-attribute enumeration.
 //
-// The question this answers is a CLASS, not a list of remembered cases: for a
-// reserved attribute A with body shape B at level L on kind K, what is the
-// outcome on every surface? The corpus below is that cross product, and every
-// expected value in it was DERIVED FROM THE REFERENCE IMPLEMENTATIONS rather
-// than read off this package's behavior — an expectation copied from the code
-// under test asserts only that nothing changed, which is what let each of
-// these families drift in the first place.
+// The question is a CLASS, not a list of remembered cases: for a reserved
+// attribute A with body shape B at level L on kind K, what is the outcome on
+// every surface? The corpus is that cross product, and every expected value in
+// it was DERIVED FROM THE REFERENCE IMPLEMENTATIONS rather than read off this
+// package — an expectation copied from the code under test asserts only that
+// nothing changed, which is what let each of these families drift.
 //
 // How each expectation was obtained, and how to redo it:
 //
 //   - Apache Avro (Java) is a SOURCE-DERIVED model of Schema.java on
-//     apache/avro:main, because the check runs without a JVM. Every rule in it
-//     carries the line it came from, and the model is validated against the
+//     apache/avro:main, because the check runs without a JVM. Every rule carries
+//     the line it came from, and the model is validated against the
 //     already-adjudicated cells before any of its new answers are used. The
 //     rules that matter most are the EMISSION conditions, which differ per
-//     attribute: doc emits when non-null (:1039/:1154/:1367/:1062), aliases
-//     when non-empty (:886/:1070), order is decided on the JSON node
-//     (:1895-1897), and anything absent from SCHEMA_RESERVED (:175-176)
-//     survives as an ordinary property through parseProperties (:1983).
+//     attribute: doc emits when non-null (:1039/:1154/:1367/:1062), aliases when
+//     non-empty (:886/:1070), order is decided on the JSON node (:1895-1897),
+//     and anything absent from SCHEMA_RESERVED (:175-176) survives through
+//     parseProperties (:1983).
 //   - fastavro 1.12.2 was EXECUTED per cell.
 //   - Where the two disagree, the expectation is one of THEIR answers and the
 //     provenance table records which. This package never invents a third.
 //   - Where neither can adjudicate — a stray structural key has no analogue in
-//     either, since neither exposes a metadata tree — the standing rulings
-//     govern and the provenance says so.
+//     either — the standing rulings govern and the provenance says so.
 //   - Where NEITHER reference has the placement at all, PLACEMENT AUTHORITY
-//     decides: the authority for a placement is whichever reference actually
-//     HAS it, and it governs the empty and the non-empty body alike. Where
-//     neither has it — a structural key on a kind that binds nothing, which
-//     Apache Avro skips wholesale and fastavro keeps wholesale — this
-//     package's own adjudicated posture governs, and the provenance says so.
+//     decides: whichever reference actually HAS it governs, for the empty and
+//     the non-empty body alike. Where neither has it, this package's own
+//     adjudicated posture governs, and the provenance says so.
 //
-// Every cell the enumeration produces is now settled. The UNRULED code stays
-// in the vocabulary because a later round widening an axis will produce cells
-// nothing rules yet, and recording one is the honest move; what may not
-// happen is a cell quietly acquiring today's behavior as its expectation.
+// Every cell the enumeration produces is now settled. The UNRULED code stays in
+// the vocabulary because a later round widening an axis will produce cells
+// nothing rules yet; what may not happen is a cell quietly acquiring today's
+// behavior as its expectation.
 //
 // The surfaces are read through the REBUILD (Root().Schema()), because that is
 // the one that loses things. String() is the schema's own source text and
-// carries every written key whatever the parse did with it, so asking it would
-// report every accepted cell as preserved and prove nothing.
+// carries every written key whatever the parse did, so asking it would report
+// every accepted cell as preserved and prove nothing.
 // ---------------------------------------------------------------------------
 
 // Outcome codes, one character per body class in reservedBodyClasses order.
@@ -2747,34 +2731,30 @@ func TestDifferentialFastavroReservedExactCase(t *testing.T) {
 // ---------- stray_precision_scale_test.go ----------
 
 // Stray "precision"/"scale" schema attributes are inert metadata, not parse
-// errors. Per the Avro spec ("Attributes not defined in this document are
-// permitted as metadata", Specification/_index.md:43), an attribute the
-// parser does not consume is a plain custom property. twmb consumes
-// precision/scale as decimal parameters exactly when the node is a
-// recognized decimal carrier — logicalType "decimal" on bytes or fixed,
-// where NOT_BUGS #55 validates them — and every other placement surfaces
-// them in Props, matching the field level and both references (fastavro
-// 1.12.2 executed 9/9 accepts; Java's LogicalTypes.fromSchemaImpl returns
-// null when logicalType is absent so precision is never consulted,
-// LogicalTypes.java:127-130, and extra attributes are props).
+// errors. Per the spec ("Attributes not defined in this document are permitted
+// as metadata", Specification/_index.md:43), an attribute the parser does not
+// consume is a plain custom property. twmb consumes precision/scale as decimal
+// parameters exactly when the node is a recognized decimal carrier — logicalType
+// "decimal" on bytes or fixed, where NOT_BUGS #55 validates them — and every
+// other placement surfaces them in Props, matching the field level and both
+// references (fastavro 1.12.2 executed 9/9 accepts; Java's
+// LogicalTypes.fromSchemaImpl returns null when logicalType is absent so
+// precision is never consulted, LogicalTypes.java:127-130).
 //
-// The FIELD level follows the same consumed-conditional rule with the
-// consumer being the decimal lift: the pair is consumed exactly when the
-// field declares logicalType "decimal" and the lift target is a
-// bytes/fixed carrier as-written; there a malformed body rejects loudly
-// naming the key (treating it as absent would silently parse as
-// decimal(p,0), scale being optional), and everywhere else any body shape
-// is an ordinary SchemaField.Props property (NOT_BUGS #71; Java's
-// FIELD_RESERVED never includes the pair, Schema.java:503-504). The
-// placement matrix below crosses a BODY-SHAPE axis over every placement,
-// kind, and level for exactly this reason.
+// The FIELD level follows the same consumed-conditional rule with the consumer
+// being the decimal lift: the pair is consumed exactly when the field declares
+// logicalType "decimal" and the lift target is a bytes/fixed carrier as-written,
+// where a malformed body rejects loudly naming the key (treating it as absent
+// would silently parse as decimal(p,0), scale being optional); everywhere else
+// any body shape is an ordinary SchemaField.Props property (NOT_BUGS #71; Java's
+// FIELD_RESERVED never includes the pair, Schema.java:503-504). The matrix below
+// crosses a BODY-SHAPE axis over every placement for exactly this reason.
 //
-// Pre-fix, validateLogical's tail rejected any leftover precision/scale
-// ("invalid scale or precision specified") exactly when NO logical — or a
-// valid non-decimal logical — accompanied them, while the SAME stray keys
-// parsed when the logical placement was invalid (unknown logical,
-// decimal-on-int), and the field level already treated them as inert
-// props: twmb disagreed with itself across levels and across placements.
+// Pre-fix, validateLogical's tail rejected any leftover precision/scale exactly
+// when NO logical — or a valid non-decimal logical — accompanied them, while the
+// SAME stray keys parsed when the logical placement was invalid, and the field
+// level already treated them as inert props: twmb disagreed with itself across
+// levels and across placements.
 func TestMatrix_StrayPrecisionScaleParses(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -4133,24 +4113,24 @@ func TestRegression_StraySizeMalformedNotStructurallySurfaced(t *testing.T) {
 // Apache Avro has no such gap, because it decides on the JSON NODE rather than
 // on the parsed value, and its emission condition DIFFERS PER ATTRIBUTE:
 //
-//   - doc emits when non-NULL (Schema.java:1039 record, :1154 enum, :1367
-//     fixed, :1062 field), so a doc written as "" survives;
-//   - aliases emits when non-EMPTY (:886 named, :1070 field), so an alias
-//     list written as [] is dropped;
+//   - doc emits when non-NULL (:1039 record, :1154 enum, :1367 fixed, :1062
+//     field), so a doc written as "" survives;
+//   - aliases emits when non-EMPTY (:886 named, :1070 field), so an alias list
+//     written as [] is dropped;
 //   - order is decided on the node — `if (orderNode != null)
-//     Order.valueOf(node.textValue().toUpperCase())` (:1895-1897) — so an
-//     order written as "" reaches valueOf and throws;
-//   - logicalType is not reserved at all (:175-176), so parseProperties keeps
-//     it as an ordinary schema property whatever its content, "" included.
+//     Order.valueOf(node.textValue().toUpperCase())` (:1895-1897) — so an order
+//     written as "" reaches valueOf and throws;
+//   - logicalType is not reserved at all (:175-176), so parseProperties keeps it
+//     as an ordinary schema property whatever its content, "" included.
 //
 // One blanket "was it written" rule for every attribute would therefore ship a
-// divergence rather than fix one. These tests pin the four answers separately,
-// each against the reference behavior that decides it.
+// divergence rather than fix one. These pin the four answers separately, each
+// against the reference behavior that decides it.
 //
 // fastavro 1.12.2 preserves every one of these bodies verbatim (executed), so
 // where Java and fastavro disagree the entry naming the deciding rule is the
 // authority, and the cases this package deliberately keeps dropping are pinned
-// here as such rather than left to look like oversights.
+// as such rather than left to look like oversights.
 // ---------------------------------------------------------------------------
 
 // TestMatrix_EmptyOrderRejected pins the validator half: presence and
@@ -4545,37 +4525,34 @@ func TestMatrix_NamespaceStrictnessIsUniform(t *testing.T) {
 // "default" and "order" at the TYPE level.
 //
 // Both keys are FIELD attributes: a record field binds each of them, and the
-// Avro spec's only type-level binding of either is the enum evolution default.
-// A type object of any other kind binds neither, so neither has a structural
-// field to land on — and the routing rule the reserved-key rulings share is a
-// biconditional: the structural field is set IFF the key was consumed, and
-// Props holds exactly the raw keys that were not. Never both, never neither.
+// spec's only type-level binding of either is the enum evolution default. A type
+// object of any other kind binds neither, so neither has a structural field to
+// land on — and the routing rule the reserved-key rulings share is a
+// biconditional: the structural field is set IFF the key was consumed, and Props
+// holds exactly the raw keys that were not.
 //
 // Both references agree on preserving them where the kind does not bind:
 //
-//   - Java's SCHEMA_RESERVED (Schema.java:175-176) is
-//     {doc, fields, items, name, namespace, size, symbols, values, type,
-//     aliases} — it omits BOTH keys, so parsePropertiesAndLogicalType keeps
-//     each as a schema PROPERTY on primitives (:1857), records (:1880),
-//     arrays (:1940), maps (:1950) and fixed (:1963). ENUM_RESERVED
-//     (:178-180) is SCHEMA_RESERVED plus "default" alone, applied at :1928 —
-//     so an enum consumes "default" and keeps "order" as a property.
+//   - Java's SCHEMA_RESERVED (Schema.java:175-176) omits BOTH keys, so
+//     parsePropertiesAndLogicalType keeps each as a schema PROPERTY on
+//     primitives (:1857), records (:1880), arrays (:1940), maps (:1950) and
+//     fixed (:1963). ENUM_RESERVED (:178-180) is SCHEMA_RESERVED plus "default"
+//     alone, applied at :1928 — so an enum consumes "default" and keeps "order".
 //   - fastavro 1.12.2 keeps both keys on the parsed schema of every kind
 //     (executed; TestDifferentialFastavroTypeLevelBindingRouting drives the
 //     matrix through it per accepted cell).
 //
 // The FIELD level is the boundary this must not cross: Java's FIELD_RESERVED
-// (Schema.java:503-504) is {default, doc, name, order, type, aliases}, which
-// binds both, and so does twmb — a field's "default" and "order" are consumed
-// into SchemaField.Default / SchemaField.Order and must never appear in
-// SchemaField.Props. The matrix below crosses the binding axis precisely so
-// that boundary is asserted rather than assumed.
+// (:503-504) binds both, and so does twmb — a field's "default" and "order" are
+// consumed into SchemaField.Default / SchemaField.Order and must never appear in
+// SchemaField.Props. The matrix crosses the binding axis precisely so that
+// boundary is asserted rather than assumed.
 //
-// Neither key reaches the wire, the Parsing Canonical Form, or the
-// fingerprint on either side of the change: PCF keeps only
-// type/name/fields/symbols/items/values/size, and no codec reads an
-// unconsumed attribute. Every cell asserts that identity against a twin
-// spelled without the key.
+// Neither key reaches the wire, the Parsing Canonical Form, or the fingerprint
+// on either side of the change: PCF keeps only
+// type/name/fields/symbols/items/values/size, and no codec reads an unconsumed
+// attribute. Every cell asserts that identity against a twin spelled without the
+// key.
 // ---------------------------------------------------------------------------
 
 // bindingLevel is where a cell writes the attribute.
@@ -5075,31 +5052,25 @@ func TestRegression_FieldLevelDefaultOrderStayConsumed(t *testing.T) {
 // ---------------------------------------------------------------------------
 // "doc" is the one reserved key that BINDS on every kind while its capture
 // silently declines a non-string body — so a non-string doc reaches neither
-// structural field nor Props, and is the single documented exception to the
-// "never neither" half of the reserved-key routing rule.
+// structural field nor Props, the single documented exception to the "never
+// neither" half of the reserved-key routing rule.
 //
-// This is exact Apache Avro (Java) behavior, and the two tests below pin both
-// directions of it so neither can drift alone:
+// This is exact Apache Avro behavior, and the two tests pin both directions so
+// neither can drift alone. Java reads doc ONLY through parseDoc
+// (Schema.java:1996-1998, called at :1864/:1912/:1956 and, for a field, :1888),
+// which is getOptionalText (:2039-2042) = jsonNode.textValue(), null for ANY
+// non-text node including an explicit JSON null; and doc is a member of
+// SCHEMA_RESERVED (:176) and FIELD_RESERVED (:504), so parseProperties skips it
+// at every call site.
 //
-//   - Java reads doc ONLY through parseDoc (Schema.java:1996-1998, called at
-//     :1864 for records, :1912 for enums, :1956 for fixed) and, for a field,
-//     at :1888. Both are getOptionalText (:2039-2042), which is
-//     jsonNode.textValue() — null for ANY non-text node, including an
-//     explicit JSON null.
-//   - doc is then a member of SCHEMA_RESERVED (:176) and of FIELD_RESERVED
-//     (:504), so parseProperties (:1982-1988) skips it at every call site.
-//
-// Those two facts together mean Java keeps a non-string doc nowhere, and the
-// same membership fact is what makes a non-string logicalType behave the
-// OPPOSITE way: logicalType is absent from SCHEMA_RESERVED, so Java's
-// parseProperties keeps it as an ordinary schema property. One reserved-set
-// membership test predicts both routings, which is why the two must not be
-// "made consistent" with each other.
+// The same membership fact makes a non-string logicalType behave the OPPOSITE
+// way: logicalType is absent from SCHEMA_RESERVED, so parseProperties keeps it
+// as an ordinary property. One reserved-set membership test predicts both
+// routings, which is why the two must not be "made consistent" with each other.
 //
 // fastavro 1.12.2 preserves a non-string doc verbatim at both levels; the
-// references disagree and this package follows Java. Nothing observable on
-// the wire depends on it: the canonical form and the fingerprint never carry
-// doc, which each case asserts against a doc-free twin.
+// references disagree and this package follows Java. Nothing observable on the
+// wire depends on it, which each case asserts against a doc-free twin.
 // ---------------------------------------------------------------------------
 
 // docBodiesNonString spans the JSON token classes a doc can be written as
@@ -5695,51 +5666,41 @@ func mapKeys(m map[string]any) []string {
 // ---------- null_body_presence_test.go ----------
 
 // ---------------------------------------------------------------------------
-// An explicit JSON null is a PRESENT attribute whose body names no value, and
-// it is the one body shape a typed decode accepts in silence.
+// An explicit JSON null is a PRESENT attribute whose body names no value, and it
+// is the one body shape a typed decode accepts in silence.
 //
-// encoding/json documents it: "To unmarshal JSON into a pointer, Unmarshal
-// first handles the case of the JSON being the JSON literal null. In that
-// case, Unmarshal sets the pointer to nil." — and unmarshaling null into any
-// non-pointer destination "has no effect on the value and produces no error".
-// So a reader that decides presence by asking "did the decode fail" reads a
-// present-but-undecodable attribute as an ABSENT one and hands back the
-// destination's zero value.
+// encoding/json documents it: unmarshaling null into a pointer sets the pointer
+// to nil, and into any non-pointer destination "has no effect on the value and
+// produces no error". So a reader that decides presence by asking "did the
+// decode fail" reads a present-but-undecodable attribute as ABSENT and hands
+// back the destination's zero.
 //
-// That zero value is not neutral for Avro schema attributes. A fixed's size 0
-// is a legal, distinct schema (a zero-width fixed, which encodes and decodes),
-// and a decimal's scale 0 is a legal, distinct scale that changes the wire
-// meaning of every value written against it. Coercing a null body to either
-// one silently substitutes a different schema for the one that was written.
+// That zero is not neutral for Avro schema attributes. A fixed's size 0 is a
+// legal, distinct schema, and a decimal's scale 0 is a legal, distinct scale
+// that changes the wire meaning of every value written against it. Coercing a
+// null body to either silently substitutes a different schema for the one
+// written.
 //
 // The references never produce those schemas:
 //
-//   - Java REJECTS a null size outright: parseFixed reads
-//     `JsonNode sizeNode = schema.get("size"); if (sizeNode == null ||
-//     !sizeNode.isInt()) throw new SchemaParseException("Invalid or no size")`
+//   - Java REJECTS a null size outright: parseFixed requires sizeNode.isInt()
 //     (Schema.java:1957-1960), and NullNode.isInt() is false.
 //   - Java never builds decimal(p,0) from a null scale either: the Decimal
-//     logical type reads each parameter through getInt, which throws unless
-//     the prop is an Integer (LogicalTypes.java:414-421), and a JSON null prop
-//     comes back as Java null. Schema parse calls fromSchemaIgnoreInvalid
-//     (Schema.java:1979), which swallows the throw and drops the logical
-//     entirely, leaving plain bytes. Silently dropping a decimal annotation is
-//     the hazard this package already declined to copy, so it rejects loudly
-//     where Java soft-drops — but neither behavior produces the decimal(p,0)
-//     that a coerced zero produces.
-//   - fastavro 1.12.2 accepts these at parse and then FAILS every write
-//     against the result (executed: a null-size fixed reports "data of length
-//     N does not match schema size: None" for every input length, and a
-//     null-scale decimal raises TypeError inside its scale arithmetic). Its
-//     accept is not a usable accept, so the permissive lean has nothing to
-//     lean toward. TestDifferentialFastavroNullBodyIsNotUsable executes that
-//     calibration so it fails here if fastavro ever changes it.
+//     logical reads each parameter through getInt, which throws unless the prop
+//     is an Integer (LogicalTypes.java:414-421), and parse calls
+//     fromSchemaIgnoreInvalid (Schema.java:1979), which swallows the throw and
+//     drops the logical, leaving plain bytes. Silently dropping a decimal
+//     annotation is the hazard this package declined to copy, so it rejects
+//     loudly where Java soft-drops — but neither produces decimal(p,0).
+//   - fastavro 1.12.2 accepts these at parse and then FAILS every write against
+//     the result (executed). Its accept is not a usable accept, so the
+//     permissive lean has nothing to lean toward.
+//     TestDifferentialFastavroNullBodyIsNotUsable executes that calibration.
 //
-// The rule these tests pin is one sentence: a null body is a MALFORMED body,
-// never an absent one — so it reaches exactly the verdict its wrong-typed
-// siblings reach, at every key and placement. The boundary that must NOT
-// move: a written 0 is a value, not a null, and every zero-valued attribute
-// keeps parsing.
+// The rule: a null body is a MALFORMED body, never an absent one, so it reaches
+// exactly the verdict its wrong-typed siblings reach at every key and placement.
+// The boundary that must NOT move: a written 0 is a value, not a null, and every
+// zero-valued attribute keeps parsing.
 // ---------------------------------------------------------------------------
 
 // TestRegression_NullSizeRejectedOnFixed holds the fixed-size boundary from
@@ -7281,29 +7242,27 @@ func TestRegression_SemanticErrorFieldRenderBounded(t *testing.T) {
 // ---------------------------------------------------------------------------
 // The empty string is a legal NAME COMPONENT.
 //
-// [avro.WithLaxNames] takes a caller-supplied validator and calls it per name
-// component; a validator that accepts "" makes the empty string a legal
-// record name, field name, namespace component, enum symbol, or alias. The
-// package relies on that being carriable: its own internal re-parses of
-// library-produced schema text use an accept-everything validator precisely so
-// a name the caller's validator accepted cannot be rejected later.
+// [avro.WithLaxNames] takes a caller-supplied validator called per name
+// component; one that accepts "" makes the empty string a legal record name,
+// field name, namespace component, enum symbol, or alias. The package relies on
+// that being carriable: its own internal re-parses of library-produced schema
+// text use an accept-everything validator precisely so a name the caller's
+// validator accepted cannot be rejected later.
 //
-// That makes "" a value like any other, and it forbids a common shortcut:
-// using a name string's ZERO VALUE as an absence sentinel. A guard written as
+// That makes "" a value like any other, and it forbids a common shortcut: using
+// a name string's ZERO VALUE as an absence sentinel. A guard written as
 // `claimedName[i] != ""` cannot tell "no one claimed slot i" from "the field
 // named "" claimed slot i", so it silently skips its own check. Presence and
 // identity have to be separate variables.
 //
-// The nets below put "" in every name-shaped position and hold the package to
-// invariants that need no reference implementation:
+// The nets put "" in every name-shaped position and hold the package to
+// invariants needing no reference implementation:
 //
 //   - CheckCompatibility and Resolve must AGREE. They are two independent
-//     implementations of the same compatibility rules, so they are each
-//     other's oracle; a disagreement is a defect regardless of which one is
-//     right. Resolve calls CheckCompatibility first, so the only reachable
-//     disagreement is "CheckCompatibility accepts, Resolve rejects" — a caller
-//     using CheckCompatibility as an admission gate is told a pair is fine and
-//     then fails at Resolve.
+//     implementations of the same rules, so they are each other's oracle. Resolve
+//     calls CheckCompatibility first, so the only reachable disagreement is
+//     "CheckCompatibility accepts, Resolve rejects" — a caller using it as an
+//     admission gate is told a pair is fine and then fails at Resolve.
 //   - A schema's own String() must re-parse, and Root().Schema() must rebuild,
 //     to the same canonical form and fingerprint.
 //
@@ -8215,28 +8174,26 @@ func fixedBytesEqual(v any, want []byte) bool {
 // ---------------------------------------------------------------------------
 // Union tag tables — one namespace, three consumers, one precedence rule.
 //
-// A union branch is addressed on the tagged wires by a NAME. Two different
-// spellings can produce the same name: the "<kind>.<logicalType>" qualifier
+// A union branch is addressed on the tagged wires by a NAME, and two different
+// spellings can produce the same one: the "<kind>.<logicalType>" qualifier
 // TagLogicalTypes emits for a primitive-backed logical branch, and the
 // "<namespace>.<name>" fullname of a named type. "bytes.decimal" is both the
 // qualifier of a decimal-on-bytes branch and the fullname of a fixed named
-// "decimal" in namespace "bytes"; every name involved is valid under the
-// strict Avro name regex, and the union is legal Avro that the reference
-// implementations parse.
+// "decimal" in namespace "bytes"; every name involved is valid under the strict
+// Avro name regex, and the union is legal Avro that the references parse.
 //
 // Three tables read that one namespace — the JSON emitter, the decoder's
-// tagged-map wrap, and the encoder's tagged-map lookup — so all three must
-// agree on which branch owns a tag. The oracle here is calibration-free and
-// needs no reference implementation: A VALUE'S JSON TAGGED ROUND TRIP MUST
-// LAND ON THE BRANCH IT LEFT FROM. The binary branch index is the observable,
-// read straight off the wire, so a tag that resolves to a different branch
-// shows up as a changed index rather than having to be inferred from a Go
-// type.
+// tagged-map wrap, and the encoder's tagged-map lookup — so all three must agree
+// on which branch owns a tag. The oracle is calibration-free: A VALUE'S JSON
+// TAGGED ROUND TRIP MUST LAND ON THE BRANCH IT LEFT FROM. The binary branch
+// index is the observable, read straight off the wire, so a tag resolving to a
+// different branch shows up as a changed index rather than being inferred from a
+// Go type.
 //
 // The second half is the over-correction guard: dropping the qualifier
-// everywhere would satisfy the round trip too, and it would silently undo
-// TagLogicalTypes. So the unambiguous case is pinned to still emit the
-// qualified form.
+// everywhere would satisfy the round trip too, and silently undo
+// TagLogicalTypes. So the unambiguous case is pinned to still emit the qualified
+// form.
 // ---------------------------------------------------------------------------
 
 // unionBranchIndexOf reads the leading zig-zag varint of an Avro union wire,
@@ -9305,33 +9262,28 @@ func TestRegression_NegativeZeroFloat32AndProps(t *testing.T) {
 // The flat (goavro-style) field format puts a complex kind's defining key
 // (symbols / items / values / fields / size) on the FIELD object alongside a
 // bare string type. The wire parser lifts those keys into a nested type
-// definition (liftFlatFieldType, schema_parse.go), and the metadata walker
-// applies the same lift through the same shared helpers (flatFieldNeedsLift /
-// flatLiftTypeMap), so Root() describes the post-lift schema. The tests in
-// this file drive that contract as a matrix:
+// definition (liftFlatFieldType), and the metadata walker applies the same lift
+// through the same shared helpers, so Root() describes the post-lift schema. The
+// tests here drive that contract as a matrix:
 //
-//   - TestMatrix_FlatFieldLift: kind × namespace-mode. Per cell: the flat
-//     form and its handwritten nested twin are wire-identical (Canonical +
-//     Rabin — the lift lives entirely in the parser, so the metadata walk
-//     must not affect the wire tree); Root()'s type node carries the name
-//     and defining content; routed keys (defining key, doc, custom props,
-//     namespace-for-named) do NOT appear in SchemaField.Props;
-//     Root().Schema() rebuilds canonical-identically; and the rebuilt
-//     schema's wire bytes match the original's.
-//   - TestMatrix_FlatFieldLiftLogicals: logicalType / precision / scale
-//     route into the lifted type (flat fixed + duration, flat fixed +
-//     decimal).
-//   - TestMatrix_FlatFieldLiftNameRefDefaults: a lifted named type is
-//     registered in the metadata name table, so name-referencing fields'
-//     defaults coerce per the SchemaField.Default contract (fixed →
-//     []byte), across sibling / cross-record diamond / recursive /
-//     SchemaCache cross-parse reference shapes.
-//   - TestMatrix_FlatFieldLiftNoLiftParity: the boundary cases where the
-//     lift must NOT fire — on either side. The wire parser and the metadata
-//     walker share one predicate, so a field the wire treats as a name
-//     reference (or rejects) is never half-lifted in the metadata tree.
-//   - TestMatrix_FlatFieldLiftDegenerate: degenerate-cardinality content
-//     (an empty symbols list) lifts and round-trips like any other.
+//   - TestMatrix_FlatFieldLift: kind x namespace-mode. Per cell the flat form
+//     and its handwritten nested twin are wire-identical (Canonical + Rabin —
+//     the lift lives entirely in the parser, so the metadata walk must not
+//     affect the wire tree); Root()'s type node carries the name and defining
+//     content; routed keys do NOT appear in SchemaField.Props; Root().Schema()
+//     rebuilds canonical-identically; and the rebuild's wire matches.
+//   - TestMatrix_FlatFieldLiftLogicals: logicalType / precision / scale route
+//     into the lifted type.
+//   - TestMatrix_FlatFieldLiftNameRefDefaults: a lifted named type is registered
+//     in the metadata name table, so name-referencing fields' defaults coerce
+//     per the SchemaField.Default contract, across sibling / cross-record
+//     diamond / recursive / SchemaCache cross-parse shapes.
+//   - TestMatrix_FlatFieldLiftNoLiftParity: the boundary cases where the lift
+//     must NOT fire, on either side. Parser and metadata walker share one
+//     predicate, so a field the wire treats as a name reference is never
+//     half-lifted in the metadata tree.
+//   - TestMatrix_FlatFieldLiftDegenerate: degenerate-cardinality content lifts
+//     and round-trips like any other.
 func TestMatrix_FlatFieldLift(t *testing.T) {
 	type kindCell struct {
 		kind      string // SchemaNode.Type expected on the lifted node
@@ -10614,24 +10566,20 @@ func TestRegression_JSONSkipDepthBounded(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Reader-grammar boundary matrices: hand-framed wire for the index and
 // block-header productions, driven through every consuming path — natural
-// decode, resolved decode, and the resolution SKIP path (a writer field the
-// reader drops). The framing matrix (matrix_framing_test.go) covers the
-// spec's legal container framings; these matrices cover the index VALUE
-// space (branch-count boundary, negative, overlong, width-overflow) and the
-// hostile block-header values (negative/lying byte sizes, count overflow,
-// zero-byte-item caps) that no twmb writer produces.
+// decode, resolved decode, and the resolution SKIP path. The framing matrix
+// covers the spec's legal container framings; these cover the index VALUE space
+// (branch-count boundary, negative, overlong, width-overflow) and the hostile
+// block-header values that no twmb writer produces.
 //
 // The invariant per cell: a loud error or a value-faithful accept — never a
 // silent truncation, silent wrong value, or panic. Accept cells re-encode
-// canonically. The skip path may be MORE lenient than the value path only
-// where the discarded content does not affect framing (an enum's index is a
-// self-contained varint), and that leniency must match the references:
-// Java's ResolvingDecoder skips an enum via readEnum() = readInt() with no
-// symbol check, and fastavro's skip_enum is a bare read_long() (compiled
-// _read.pyx skip_enum; the pure-Python _read_py.py fallback is read_enum()
-// = read_long() likewise) — neither validates discarded enum indices.
-// Union indices DO affect framing (they select the branch skipper),
-// so the skip path validates them exactly like the value path.
+// canonically. The skip path may be MORE lenient than the value path only where
+// the discarded content does not affect framing (an enum's index is a
+// self-contained varint), and that leniency must match the references: Java's
+// ResolvingDecoder skips an enum via readEnum() = readInt() with no symbol
+// check, and fastavro's skip_enum is a bare read_long() — neither validates
+// discarded enum indices. Union indices DO affect framing, so the skip path
+// validates them exactly like the value path.
 // TestDifferentialFastavroReaderGrammar executes the fastavro side of each
 // calibrated claim.
 // ---------------------------------------------------------------------------
@@ -11154,31 +11102,24 @@ func TestMatrix_SkipHostileBlockFraming(t *testing.T) {
 	})
 }
 
-// TestMatrix_SkipByteSizeAuthority pins which authority each path trusts
-// when a size-prefixed block's byte size DISAGREES with its items — an
-// inconsistency only a corrupt or adversarial writer produces, where the
-// spec's dual framing (count for the value path, size for the skip path)
-// genuinely diverges:
+// TestMatrix_SkipByteSizeAuthority pins which authority each path trusts when a
+// size-prefixed block's byte size DISAGREES with its items — an inconsistency
+// only a corrupt or adversarial writer produces, where the spec's dual framing
+// (count for the value path, size for the skip path) genuinely diverges:
 //
-//   - twmb's VALUE path decodes |count| items and ignores the size — like
-//     Java's readArrayStart/arrayNext and fastavro's read path.
-//   - twmb's SKIP path jumps the declared size and ignores the items — like
-//     Java's skip (BinaryDecoder.doSkipItems: `final long bytecount =
-//     readLong(); doSkipBytes(bytecount);`, BinaryDecoder.java:436-444) and
-//     like fastavro's compiled skip (_read.pyx skip_array: `block_size =
-//     read_long(fo); fo.read(block_size)`; observed 1.12.2 — note its
-//     PURE-PYTHON fallback, _read_py.py's _iter_array_or_map, is instead
-//     item-driven, "# Read block size, unused", so a no-C-extension
-//     fastavro install lands where the items end).
+//   - twmb's VALUE path decodes |count| items and ignores the size, like Java's
+//     readArrayStart/arrayNext and fastavro's read path.
+//   - twmb's SKIP path jumps the declared size and ignores the items, like
+//     Java's skip (BinaryDecoder.java:436-444) and compiled fastavro's skip
+//     (_read.pyx skip_array, observed 1.12.2 — its PURE-PYTHON fallback is
+//     instead item-driven, so a no-C-extension install lands where the items
+//     end).
 //
-// On a lying-size wire each authority lands at a different offset, so the
-// two twmb paths (and Java's, and compiled-fastavro's) read DIFFERENT
-// trailing fields — pinned here so a future "fix" aligning one path onto
-// the other trips this cell and forces the cross-impl discussion (aligning
-// skip onto items would diverge from every reference's skip; read onto
-// size, from every reference's read).
-// TestDifferentialFastavroReaderGrammar executes fastavro's size-driven
-// skip verdict on this exact wire.
+// On a lying-size wire each authority lands at a different offset, so the two
+// twmb paths read DIFFERENT trailing fields — pinned so a future "fix" aligning
+// one path onto the other trips this cell and forces the cross-impl discussion.
+// TestDifferentialFastavroReaderGrammar executes fastavro's size-driven skip
+// verdict on this exact wire.
 func TestMatrix_SkipByteSizeAuthority(t *testing.T) {
 	item, err := avro.MustParse(`"string"`).AppendEncode(nil, "x")
 	if err != nil {
@@ -11399,29 +11340,25 @@ func TestDifferentialFastavroReaderGrammar(t *testing.T) {
 	})
 }
 
-// TestDifferentialFastavroPromotion executes every spec promotion pair, plus
-// the two value-level resolution features (enum reader-default, reader field
-// default-fill), against fastavro's resolved read. Per cell: the writer wire
-// is byte-parity-checked between the implementations, then the SAME wire is
-// resolved-read by both and the decoded values compared. A third leg drives
-// the WRITER-SHAPED JSON of the same value through the resolved schema's
-// DecodeJSON, which must land exactly where the binary resolved read lands —
-// the wire format cannot change the resolution semantics (Java runs the same
-// ResolvingDecoder over a JsonDecoder built with the writer schema).
+// TestDifferentialFastavroPromotion executes every spec promotion pair, plus the
+// two value-level resolution features (enum reader-default, reader field
+// default-fill), against fastavro's resolved read. Per cell the writer wire is
+// byte-parity-checked, then the SAME wire is resolved-read by both and the
+// values compared. A third leg drives the WRITER-SHAPED JSON of the same value
+// through the resolved schema's DecodeJSON, which must land exactly where the
+// binary resolved read lands — the wire format cannot change the resolution
+// semantics.
 //
 // Mantissa-boundary values make the reader-width contract observable. twmb
-// converts through the reader's width — float64(float32(n)) for a float
-// reader, matching Java's ResolvingDecoder readDouble(): `return (double)
-// readFloat()` on a promoted int/long (the float32 cast is Java's) — while
-// fastavro (observed 1.12.2) returns the writer's value at full precision
-// with no float32 narrowing. That divergence and the bytes→string one below
-// are pinned at the observed verdicts so a fastavro release that changes
-// either flips the cell and forces a deliberate recalibration.
+// converts through the reader's width — float64(float32(n)) for a float reader,
+// matching Java's ResolvingDecoder readDouble() — while fastavro (observed
+// 1.12.2) returns the writer's value at full precision. That divergence and the
+// bytes→string one are pinned at the observed verdicts so a fastavro release
+// that changes either flips the cell and forces a deliberate recalibration.
 //
-// bytes→string with invalid UTF-8: twmb preserves the raw bytes in the
-// resulting Go string (Java's Utf8 carries raw bytes likewise); fastavro's
-// strict utf-8 decode rejects the wire (observed 1.12.2, its default
-// handle_unicode_errors="strict").
+// bytes→string with invalid UTF-8: twmb preserves the raw bytes in the Go string
+// (Java's Utf8 carries raw bytes likewise); fastavro's strict utf-8 decode
+// rejects the wire.
 func TestDifferentialFastavroPromotion(t *testing.T) {
 	o := startOracle(t)
 
@@ -11815,31 +11752,28 @@ func TestMatrix_EncodeErrorIdentityCensus(t *testing.T) {
 // ---------------------------------------------------------------------------
 // The DoS-cap PRODUCER-COMPLIANCE table.
 //
-// The rule this drives is one sentence: every reader-side cap needs a
-// producer-side compliance check, with one documented exception. What the table
-// adds is that the rule is asked of every cap and of every CARRIER, because a
-// cap is not one question — the same bound is reachable through a wire VALUE
-// and through a schema DEFAULT, and defaults are pre-encoded by a separate walk
-// that shares no code with the serializers. Four rounds in a row found the
-// value-carrier face of a cap, fixed it, and left the default-carrier face for
-// the next round to rediscover.
+// The rule: every reader-side cap needs a producer-side compliance check, with
+// one documented exception. What the table adds is that the rule is asked of
+// every cap and of every CARRIER, because a cap is not one question — the same
+// bound is reachable through a wire VALUE and through a schema DEFAULT, and
+// defaults are pre-encoded by a separate walk sharing no code with the
+// serializers. Four rounds in a row found the value-carrier face of a cap, fixed
+// it, and left the default-carrier face for the next round.
 //
 // Three things make this a table rather than a pile of pins:
 //
 //   - Every cap carries an APPLICABILITY verdict with its reason. Not every cap
-//     in the family bounds a wire value: one bounds a Go target type, another
-//     bounds a pre-allocation hint and refuses nothing. "Not applicable,
-//     because X" is a real cell; a forced cell would be vacuous.
+//     bounds a wire value: one bounds a Go target type, another a pre-allocation
+//     hint that refuses nothing. "Not applicable, because X" is a real cell.
 //   - Expectations come from the RULE, not from what the code does today. The
 //     invariant is PER-WIRE self-consistency — if Encode on a wire succeeds,
-//     Decode on that same wire must succeed — which is exactly what the rule
-//     says and no more. It is deliberately NOT "the cap rejects on every wire":
-//     maxZeroByteItems is binary-only, because JSON text cannot amplify, and a
-//     net demanding uniform rejection would encode a false invariant and fail a
-//     correct implementation.
-//   - A cap added later lands with no row and FAILS until someone classifies
-//     it (TestInvariant_EveryCapIsClassified). Without that the table is a
-//     snapshot of today's caps and the next one repeats the last four rounds.
+//     Decode on that same wire must — and no more. It is deliberately NOT "the
+//     cap rejects on every wire": maxZeroByteItems is binary-only, because JSON
+//     text cannot amplify, and demanding uniform rejection would encode a false
+//     invariant and fail a correct implementation.
+//   - A cap added later lands with no row and FAILS until someone classifies it
+//     (TestInvariant_EveryCapIsClassified). Without that the table is a snapshot
+//     of today's caps and the next one repeats the last four rounds.
 // ---------------------------------------------------------------------------
 
 type capApplicability string

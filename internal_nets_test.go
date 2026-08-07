@@ -27,41 +27,34 @@ import (
 
 // The predicate-agreement census.
 //
-// A schema question — "is this branch the null type", "does this Type name
-// this definition", "what will json.Marshal emit for this value" — usually
-// has to be answered in more than one place, because the same schema exists
-// in several REPRESENTATIONS at once: the as-written parse tree (aschema),
-// the compiled wire tree (schemaNode), the metadata tree (SchemaNode), the
-// pre-Parse `any` tree SchemaFor composes, and the cache's raw JSON tree.
-// Every answerer is written by hand, and a hand-written answer is a snapshot
-// of the rule at the moment it was typed.
+// A schema question — "is this branch the null type", "does this Type name this
+// definition", "what will json.Marshal emit for this value" — usually has to be
+// answered in more than one place, because the same schema exists in several
+// REPRESENTATIONS at once: the as-written parse tree (aschema), the compiled
+// wire tree (schemaNode), the metadata tree (SchemaNode), the pre-Parse `any`
+// tree SchemaFor composes, and the cache's raw JSON tree. Every answerer is
+// hand-written, and a hand-written answer is a snapshot of the rule at the
+// moment it was typed. Two failure modes follow, and both have shipped: two
+// answerers of one question DISAGREE, so identical inputs take different paths
+// depending on which representation the code consulted; or an answerer restates
+// an EXTERNAL authority's accept-set — the name resolver's spellings,
+// encoding/json's key resolver — more narrowly than the authority, so valid
+// input is refused or an unguarded case panics.
 //
-// Two failure modes follow, and both have shipped:
-//
-//   - two answerers of one question DISAGREE, so semantically identical
-//     inputs take different paths depending on which representation the code
-//     happened to consult;
-//   - an answerer restates an EXTERNAL authority's accept-set — the name
-//     resolver's binding spellings, encoding/json's key resolver — and the
-//     restatement is narrower than the authority, so valid input is refused
-//     or an unguarded case panics.
-//
-// Neither is reachable by generating more INPUTS, which is what every other
-// net in this package does: an input matrix is derived from the bug that
-// motivated it, so it holds the set of implementations constant and cannot
-// see a new one. This census generates over IMPLEMENTATIONS instead. For
-// each question it names the canonical predicate (or the external
-// authority), every answerer across every representation, and a corpus
-// spanning the question's domain; the driver runs every answerer over the
+// Neither is reachable by generating more INPUTS, which is what every other net
+// here does: an input matrix is derived from the bug that motivated it, so it
+// holds the set of implementations constant. This census generates over
+// IMPLEMENTATIONS instead. For each question it names the canonical predicate
+// (or the external authority), every answerer across every representation, and a
+// corpus spanning the question's domain; the driver runs every answerer over the
 // whole corpus and requires identical verdicts, and where the authority is
-// external it is EXECUTED and compared against, never restated.
+// external it is EXECUTED, never restated.
 //
-// The drift guard (TestCensus_NoUnregisteredAnswerers) reads the package
-// sources and requires every syntactic occurrence of a question's tell to be
-// a registered site, so a new hand-written answerer cannot land unexamined.
-//
-// Adding a predicate, or editing one, means updating this registry. That is
-// the point: the registry is the list of places an answer can drift.
+// TestCensus_NoUnregisteredAnswerers reads the package sources and requires
+// every syntactic occurrence of a question's tell to be a registered site, so a
+// new hand-written answerer cannot land unexamined. Adding or editing a
+// predicate means updating this registry — that is the point: the registry is
+// the list of places an answer can drift.
 
 // censusAnswerer is one site that answers a question. note is empty when the
 // site routes through the question's canonical predicate; a non-empty note
@@ -1065,28 +1058,21 @@ func TestCensus_OutstandingIsRecorded(t *testing.T) {
 }
 
 // perLevelRanges returns the source ranges in file whose code runs once per
-// recursion level: the body of every function that calls itself, and the body
-// of every func literal that is called through the variable holding it. The
-// second shape is the one a name-only scan misses, and it is the one that
-// matters here — a function can DECLARE a recursive closure and still run a
-// rule outside it, which is exactly the correct arrangement.
-// callGraph is what the placement check is really asking about: not where a
-// rule is WRITTEN, but whether a body that repeats per recursion level can
-// reach it. Extracting the rule into its own function and calling it from
-// inside the walk moves the text and changes nothing, so a check that only
-// looked at containment would bless exactly the arrangement it exists to
-// forbid.
-// repeatingBody locates the body of the named walk in file — either a
-// function that calls itself, or a func literal called through the variable
-// holding it — and reports its byte range plus the names it calls directly.
+// recursion level: the body of every self-calling function, and the body of
+// every func literal called through the variable holding it. The second shape is
+// what a name-only scan misses, and it is the one that matters — a function can
+// DECLARE a recursive closure and still run a rule outside it, which is exactly
+// the correct arrangement. callGraph is what the placement check is really
+// asking: not where a rule is WRITTEN, but whether a body that repeats per level
+// can reach it.
 //
-// The walk has to be NAMED rather than derived, and that is the point rather
-// than a shortcut. "Reachable from some recursion" is a different question:
-// schema inference recurses too, and a field collector running once per level
-// of THAT walk is correct, because each level is a different record. What
-// makes a placement right or wrong is the recursion whose collected set the
-// rule ranges over, and only the author knows which one that is. Stating it
-// is the fact; everything below checks it.
+// repeatingBody locates the body of the named walk in file and reports its byte
+// range plus the names it calls directly. The walk has to be NAMED rather than
+// derived: "reachable from some recursion" is a different question — schema
+// inference recurses too, and a field collector running once per level of THAT
+// walk is correct, because each level is a different record. What makes a
+// placement right or wrong is the recursion whose collected set the rule ranges
+// over, and only the author knows which one that is.
 func repeatingBody(t *testing.T, file, walk string) (lo, hi int, calls map[string]bool) {
 	t.Helper()
 	fset := token.NewFileSet()
@@ -1185,26 +1171,20 @@ func enclosingFunc(t *testing.T, file string, offset int) string {
 // TestCensus_PlacementFactsMatchSource turns a registered placement into a
 // checked fact.
 //
-// Some questions are answered by a rule that ranges over a whole collected
-// SET, not over one value: which promoted field owns a name cannot be decided
-// from one embedded struct's own fields, because a shallower field declared
-// anywhere above takes it. Such a rule has a second property besides its
-// content — WHERE it runs — and two implementations can match on the rule and
-// differ on that. Nothing that compares answers can see it, because at the
-// outermost call the two placements agree; the divergence only shows for the
-// same construct nested one level deeper.
+// Some questions are answered by a rule that ranges over a whole collected SET,
+// not over one value: which promoted field owns a name cannot be decided from
+// one embedded struct's own fields, because a shallower field declared anywhere
+// above takes it. Such a rule has a second property besides its content — WHERE
+// it runs — and two implementations can match on the rule and differ on that.
+// Nothing that compares answers can see it, because at the outermost call the
+// two placements agree; the divergence only shows one level deeper.
 //
-// So the registry states the placement, and this asserts it against source in
-// both directions, at the position of the question's own tell rather than at
-// its function's name: a rule claiming to run over the complete set must not
-// sit inside a body that repeats per level, and one claiming to run per level
-// must. The distinction is finer than "does this function recurse" — a
-// function may declare a recursive closure and run the rule after it, which is
-// the correct arrangement and the one the fixed collector copies.
-//
-// Moving a whole-set resolution back inside its walk fails here as well as in
-// the behavioural matrix, and the two fail for different reasons: this one
-// names the structure, that one the verdict.
+// So the registry states the placement and this asserts it against source in
+// both directions, at the position of the question's own tell rather than at its
+// function's name: a rule claiming to run over the complete set must not sit
+// inside a body that repeats per level, and one claiming to run per level must.
+// The distinction is finer than "does this function recurse" — a function may
+// declare a recursive closure and run the rule after it.
 func TestCensus_PlacementFactsMatchSource(t *testing.T) {
 	stated := 0
 	for _, q := range censusRegistry {
@@ -3082,43 +3062,34 @@ func TestCensus_Q7_CorpusIsNotVacuous(t *testing.T) {
 // Q4 — is this key RESERVED on this kind, or an ordinary custom property?
 // ---------------------------------------------------------------------
 
-// The most heavily adjudicated question in the package, and the corpus is
-// defined by the rulings rather than re-derived from the code:
+// The most heavily adjudicated question in the package; the corpus is defined by
+// the rulings rather than re-derived from the code:
 //
-//   - NOT_BUGS #46: reserved names match ONLY their exact lowercase
-//     spelling. A case-variant is an ordinary custom property on EVERY
-//     reading surface, body-independent; exact and variant together means
-//     the exact one is consumed and the variant is a prop.
+//   - NOT_BUGS #46: reserved names match ONLY their exact lowercase spelling. A
+//     case-variant is an ordinary custom property on EVERY reading surface,
+//     body-independent.
 //   - NOT_BUGS #63(b): on a kind that does NOT bind the key, routing is
-//     shape-conditional — a schema-shaped body surfaces structurally
-//     as-written as its only surface, a malformed body rides in Props
-//     verbatim as its only surface, and the structural field stays ZERO.
-//   - NOT_BUGS #63(f): routing is placement-conditional, never
-//     case-conditional.
+//     shape-conditional — a schema-shaped body surfaces structurally as-written,
+//     a malformed body rides in Props verbatim, and the structural field stays
+//     ZERO.
+//   - NOT_BUGS #63(f): routing is placement-conditional, never case-conditional.
 //
-// The invariant those clauses share is a biconditional, and that is what the
-// driver asserts: the structural field is set IFF the key was consumed, and
-// Props holds exactly the raw keys that were not. Two surfaces, one rule.
-// strayKeyBinds is the binding predicate and schemaReservedKeyForObject the
-// routing one; both are callable, so the driver checks them against the
-// parse's observable rather than against each other.
+// The invariant those share is a biconditional, and that is what the driver
+// asserts: the structural field is set IFF the key was consumed, and Props holds
+// exactly the raw keys that were not. strayKeyBinds is the binding predicate and
+// schemaReservedKeyForObject the routing one; both are callable, so the driver
+// checks them against the parse's observable rather than against each other.
 //
-// The biconditional decomposes into three implications, and only two of them
-// are universal:
-//
-//   - consumed => NOT in Props            (universal)
-//   - structural field set => consumed    (universal)
-//   - consumed => structural field set    (one documented exception)
-//
-// The exception is NOT_BUGS #72: "doc" is bound on every kind, but its
-// capture is a silently-declining string read, so a NON-STRING doc is
-// consumed and yet lands nowhere — neither surface. That is exact Apache
-// Avro behavior (parseDoc reads through getOptionalText, which is
-// jsonNode.textValue() and null for a non-text node, Schema.java:1996-1998
-// and :2039-2042; "doc" is then in SCHEMA_RESERVED :176 and FIELD_RESERVED
-// :504, so parseProperties skips it). It is spelled here as a cell OUTCOME
-// rather than left to fall through the corpus counters, so the exception is
-// counted, cannot widen unnoticed, and cannot close itself silently.
+// Two of the three implications are universal — consumed => NOT in Props, and
+// structural field set => consumed. The third, consumed => structural field set,
+// has one documented exception, NOT_BUGS #72: "doc" is bound on every kind, but
+// its capture is a silently-declining string read, so a NON-STRING doc is
+// consumed and lands on neither surface. That is exact Apache Avro behavior
+// (parseDoc reads through getOptionalText — jsonNode.textValue(), null for a
+// non-text node, Schema.java:1996-1998 and :2039-2042 — and "doc" is in
+// SCHEMA_RESERVED :176 / FIELD_RESERVED :504 so parseProperties skips it). It is
+// spelled as a cell OUTCOME rather than left to fall through the corpus
+// counters, so the exception is counted and cannot widen or close unnoticed.
 type reservedKeyCell struct {
 	name string
 	kind string // the type object's kind
@@ -3818,10 +3789,10 @@ func TestCensus_Q22_MagnitudeConsumersAgreeOnTheCeiling(t *testing.T) {
 
 // DoS entry-point battery.
 //
-// This file is the single executable matrix of every PUBLIC entry point ×
-// every hostile-input class. It exists to end the one-DoS-fix-per-round
-// dribble: a resource-bound (DoS) finding is correct output at unbounded cost
-// on hostile input, and those are closed WHOLESALE here, not one at a time.
+// The single executable matrix of every PUBLIC entry point x every hostile-input
+// class. It exists to end the one-DoS-fix-per-round dribble: a resource-bound
+// finding is correct output at unbounded cost on hostile input, and those are
+// closed WHOLESALE here.
 //
 // Rows (entry points): Parse / MustParse / SchemaCache.Parse / SchemaFor /
 // Decode / DecodeJSON / DecodeSingleObject (safe + unsafe targets) / Encode /
@@ -3832,37 +3803,31 @@ func TestCensus_Q22_MagnitudeConsumersAgreeOnTheCeiling(t *testing.T) {
 // Columns (hostile-input classes):
 //   C1 deep nesting          — schema JSON brackets, wire value, Go encode
 //                              value, JSON value: stack overflow / O(depth^2).
-//   C2 large count / length  — array/map block count, bytes/string/fixed
-//                              length prefix: pre-bound memory allocation,
-//                              zero-byte-item loops, count wraparound.
+//   C2 large count / length  — array/map block count, bytes/string/fixed length
+//                              prefix: pre-bound allocation, zero-byte-item
+//                              loops, count wraparound.
 //   C3 number CPU amplif.    — decimal/json.Number/float strings driving
 //                              big.Rat/big.Int/big.Float: O(n^2) / 10^scale.
-//   C4 decompression amplif. — OCF codecs (lives in ocf/dos_battery_test.go).
-//   C5 error-message echo    — hostile input echoed verbatim into an error
-//                              string: 1:1 log/RPC/metric-label amplification.
+//   C4 decompression amplif. — OCF codecs (ocf/dos_battery_test.go).
+//   C5 error-message echo    — hostile input echoed verbatim into an error:
+//                              1:1 log/RPC/metric-label amplification.
 //   C6 metadata DAG / value  — SchemaNode->JSON walk: shared-reference fan-out,
 //                              deep per-node Props/Default value.
 //   C7 cyclic Go type        — decode target / SchemaFor field type whose
 //                              reflect graph is cyclic: unbounded recursion.
-//   C9 registration-scaled   — a registered CustomType must not change
-//      parse cost              Parse's complexity class: the custom-match
-//                              subtree walks (finalize stamping, the cache
-//                              boundary guard, the inherited-overlay
-//                              completion) share one per-parse memo, else a
+//   C9 registration-scaled   — a registered CustomType must not change Parse's
+//      parse cost              complexity class: the custom-match subtree walks
+//                              share one per-parse memo, else a
 //                              backward-reference chain or a many-refs cache
-//                              parse goes quadratic. Absolute wall-clock
-//                              bounds, not ratios.
+//                              parse goes quadratic. Absolute wall-clock bounds,
+//                              not ratios.
 //
 // Each cell drives the real public API with a hostile input and asserts the
-// bound holds: it returns (an error, or terminates) FAST, never hangs, never
-// panics, never crashes the process. Where a dedicated regression test already
-// pins the extreme case, the cell's comment cites it — the battery is the
-// consolidated, runnable index of the whole posture, not a replacement for the
-// targeted pins.
+// bound holds: it returns FAST, never hangs, panics, or crashes the process.
+// Where a dedicated regression already pins the extreme case, the cell cites it.
 //
-// RULE: nothing here is ever "closed". A later DoS find does not invalidate the
-// sweep; it EXTENDS this battery with the missed cell (and the bound that fixes
-// it). Add the row/column, never delete one.
+// RULE: nothing here is ever "closed". A later DoS find EXTENDS this battery
+// with the missed cell and its bound. Add the row/column, never delete one.
 
 // dosBudget is the per-cell ceiling separating a working bound (rejects in
 // single-digit milliseconds) from a missing one (seconds-to-forever). It is
@@ -4405,29 +4370,23 @@ func TestDoSBattery_C5_ErrorEcho(t *testing.T) {
 //////////////////////////////////////////////////////////////////////////////
 
 func TestDoSBattery_C6_MetadataWalk(t *testing.T) {
-	// A shared-reference DAG needs no hand-built SchemaNode and no deep JSON.
-	// A named type REFERENCED TWICE binds both references to one node, so
-	// ordinary schema text expresses the fan-out directly, and it can be
-	// written flat — every level a sibling field wired by forward reference —
-	// which puts it past any bracket pre-scan or nesting bound. So this axis
-	// is not one walker's problem: it belongs to EVERY walk a schema drives,
-	// and the cells below cross it with the entry-point list rather than with
-	// the metadata walk alone.
+	// A shared-reference DAG needs no hand-built SchemaNode and no deep JSON: a
+	// named type REFERENCED TWICE binds both references to one node, so ordinary
+	// schema text expresses the fan-out directly, and it can be written flat —
+	// every level a sibling field wired by forward reference — which puts it past
+	// any bracket pre-scan or nesting bound. So this axis belongs to EVERY walk a
+	// schema drives, and the cells below cross it with the entry-point list
+	// rather than with the metadata walk alone.
 	//
 	// The hand-built constructions still matter for the axes a caller cannot
 	// reach through Parse at all (deep VALUES inside Props, duplicate named
-	// definitions), and they stay pinned by the dedicated battery in
-	// schema_node_test.go:
-	//   - TestMatrix_SchemaNodeSchemaDeepValueBounded   (deep Props/Default value)
-	//   - TestMatrix_SchemaNodeWalkDepthAllChannels     (all 4 structural channels + value sites)
-	//   - TestMatrix_SchemaNodeSharedDAGExpansionBounded (shared-reference 2^depth fan-out)
-	//   - TestRegression_SchemaNodeDuplicateNamedDefinitionBounded (nested-marshal product blowup)
-	// Bounds: maxSchemaJSONNodes + maxSchemaJSONBytes (one shared walkBudget),
-	// valueWalkLimit, toJSONShared.
+	// definitions); those stay pinned by the dedicated battery in
+	// schema_node_test.go — SchemaNodeSchemaDeepValueBounded,
+	// SchemaNodeWalkDepthAllChannels, SchemaNodeSharedDAGExpansionBounded,
+	// SchemaNodeDuplicateNamedDefinitionBounded. Bounds: maxSchemaJSONNodes +
+	// maxSchemaJSONBytes (one shared walkBudget), valueWalkLimit, toJSONShared.
 	//
-	// This cell exercises the PUBLIC round-trip a normal caller reaches: Parse a
-	// legal schema carrying real Props/defaults, then re-serialize via every
-	// metadata surface, confirming the walk runs and terminates fast.
+	// This cell exercises the PUBLIC round-trip a normal caller reaches.
 	s := MustParse(`{"type":"record","name":"R","doc":"d","x":{"a":[1,2,3],"b":"y"},"fields":[
 		{"name":"e","type":{"type":"enum","name":"E","symbols":["A","B","C"]},"default":"A"},
 		{"name":"f","type":"int","default":7}

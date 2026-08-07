@@ -2996,37 +2996,31 @@ func TestMatrix_SchemaForDefaultWithBrackets(t *testing.T) {
 	})
 }
 
-// sfDefaultClass is the JSON-parse class of a default= tag body. The tag
-// text is offered to a JSON decoder, and what comes back decides whether
-// the default is a decoded VALUE or the verbatim TEXT. The bracket cells
-// above vary the tag's punctuation, which is a different question — every
-// one of them is non-JSON, so they all take the verbatim arm and the axis
-// they cross never reaches the decision itself.
-//
-// The classes, and why each is its own:
+// sfDefaultClass is the JSON-parse class of a default= tag body. The tag text is
+// offered to a JSON decoder, and what comes back decides whether the default is
+// a decoded VALUE or the verbatim TEXT. The bracket cells above vary the tag's
+// punctuation — a different question, since every one of them is non-JSON and so
+// takes the verbatim arm without ever reaching the decision.
 //
 //	whole-json      the decoder consumes the entire tag -> the decoded value
 //	json-then-space trailing WHITESPACE only, still whole -> the decoded value
 //	json-then-junk  a valid JSON PREFIX with content after it -> verbatim
 //	not-json        the decoder fails outright -> verbatim
 //
-// json-then-junk is the class that separates "decoded the whole tag" from
-// "decoded as much as it could": the decoder stops at the end of the first
-// value and reports no error, so without the trailing check the tag would
-// silently truncate to its prefix and the rest of the user's text would
-// vanish. json-then-space is its boundary twin — the same shape minus the
-// content — and it must land on the OTHER side.
+// json-then-junk separates "decoded the whole tag" from "decoded as much as it
+// could": the decoder stops at the end of the first value and reports no error,
+// so without the trailing check the tag would silently truncate to its prefix.
+// json-then-space is its boundary twin and must land on the OTHER side.
 //
-// The JSON spellings are all quote-free: a struct tag cannot carry a raw
-// double quote, so a bare JSON string is not expressible as a default= tag
-// at all and an array stands in for the container shape.
+// The JSON spellings are quote-free: a struct tag cannot carry a raw double
+// quote, so a bare JSON string is not expressible as a default= tag and an array
+// stands in for the container shape.
 //
-// Each class is paired with a field type its decoded form is valid for,
-// since a default that survives the parse must still typecheck against the
-// field. The verbatim classes therefore all sit on a string field: that is
-// the only field type their fallback text is valid for, and it is also
-// what makes the truncation visible — a truncated "42 oops" would emit the
-// number 42, which a string field rejects outright.
+// Each class is paired with a field type its decoded form is valid for, since a
+// default that survives the parse must still typecheck. The verbatim classes sit
+// on a string field: the only type their fallback text is valid for, and also
+// what makes truncation visible — a truncated "42 oops" would emit the number
+// 42, which a string field rejects.
 type sfDefaultClass struct {
 	name string
 	tag  string
@@ -4675,68 +4669,50 @@ func TestMatrix_TypeAliasAliasOwnership(t *testing.T) {
 // ===========================================================================
 // The generative SchemaFor round-trip self-consistency net.
 //
-// SchemaFor (Go type -> Avro schema) is twmb-unique: there is no spec, no Java,
-// and no fastavro counterpart to differential against (Go->Avro inference is not
-// a standardized transform), so the schema->value matrix, the encode/decode
-// parity invariant, the fastavro/Java oracles, and a byte-fuzzer all sail past
-// it (a fuzzer cannot synthesize a Go field type; SchemaFor[T] is compile-time
-// generic). Its one machine-checkable contract is ROUND-TRIP SELF-CONSISTENCY:
-// for every Go type T, SchemaFor[T] must EITHER
+// SchemaFor (Go type -> Avro schema) is twmb-unique: Go->Avro inference is not a
+// standardized transform, so there is no spec, Java, or fastavro counterpart to
+// differential against, and the schema->value matrix, the encode/decode parity
+// invariant, the external oracles, and a byte-fuzzer all sail past it (a fuzzer
+// cannot synthesize a Go field type; SchemaFor[T] is compile-time generic). Its
+// one machine-checkable contract is ROUND-TRIP SELF-CONSISTENCY: for every Go
+// type T, SchemaFor[T] must EITHER
 //
 //	(a) build a schema that twmb's OWN codecs round-trip a value of T — through
-//	    BOTH the binary (Encode/Decode) AND the JSON (EncodeJSON/DecodeJSON)
-//	    wire, so a binary-vs-JSON path divergence is caught too — OR
-//	(b) reject cleanly at build time (a non-empty error, no panic).
+//	    BOTH the binary AND the JSON wire, so a path divergence is caught too —
+//	(b) or reject cleanly at build time (a non-empty error, no panic).
 //
-// The forbidden outcome is the highest-yield SchemaFor bug shape, build-accepts/
-// encode-rejects: SchemaFor returns a schema, but Encode (or Decode) of a value
-// of that very type fails far from the SchemaFor call — the schema "lies" about
-// the Go type. Every historical SchemaFor bug is an instance: json.Number
-// inferred as "string" (the codec rejects it), a one-directional text type
-// inferred as "string" (encode XOR decode fails), a pointer chain deeper than
-// the codec unwraps inferred as ["null",T] (Encode of a non-nil value fails).
+// The forbidden outcome is the highest-yield SchemaFor bug shape,
+// build-accepts/encode-rejects: the schema "lies" about the Go type and the
+// failure lands far from the SchemaFor call. Every historical SchemaFor bug is
+// an instance — json.Number inferred as "string", a one-directional text type
+// inferred as "string", a pointer chain deeper than the codec unwraps inferred
+// as ["null",T].
 //
-// ONE generator crosses the four axes those bugs live at, and the SAME oracle
-// runs on every cell:
-//
-//	Go type shape  x  struct tag  x  text interface  x  logical type
+// ONE generator crosses the four axes those bugs live at, same oracle per cell:
 //
 //	shape   : direct, *L, **L, at-cap and past-cap pointer chains, []L, [N]L,
-//	          map[string]L, []*L (and recursive-struct + named-struct leaves)
+//	          map[string]L, []*L (plus recursive-struct and named-struct leaves)
 //	tag     : none, rename, alias=, default=, every logical (valid- AND
 //	          wrong-underlying for the leaf), decimal(p,s), and malformed forms
-//	          (unknown option, unclosed bracket, decimal trailing junk, empty
-//	          alias, the "-,opt" skip-with-options)
 //	text    : a leaf implementing none / MarshalText-only / UnmarshalText-only /
 //	          both, over string / []byte / non-string(struct) base kinds
-//	logical : a logical whose required underlying wire MATCHES the leaf
-//	          (date-on-int, uuid-on-[16]byte, timestamp-on-time.Time) and one
-//	          whose underlying is WRONG for it (uuid-on-int, decimal-on-string)
+//	logical : one whose required underlying MATCHES the leaf (date-on-int,
+//	          uuid-on-[16]byte) and one whose underlying is WRONG (uuid-on-int)
 //
-// RECONCILIATION (not duplication): this net reuses the package's existing
-// SchemaFor infrastructure rather than re-deriving it —
-//   - schemaForType (embed_shape_generative_test.go): the reflect.Type-driven
-//     replica of SchemaFor, pinned byte-identical to the generic entry point by
-//     TestGenerative_SchemaForReplicaParity. The bulk of the cross is built from
-//     reflect.StructOf types that SchemaFor[T] cannot take at run time;
-//     rtRealEntryPointCells additionally drives the REAL SchemaFor[T] on the
-//     compile-time-nameable leaves so the replica's fidelity is bridged.
-//   - sampleValue (schema_for_test.go, made cycle-safe): the non-empty value
-//     builder, so a leaf buried in *T / []T / map[K]T actually reaches the codec.
-//   - the malformed-tag alphabet is the same family embed_shape_tagedge_test.go's
-//     tagDefects pins for WALKER AGREEMENT; here the same tags are crossed with
-//     the whole leaf x shape space under the ROUND-TRIP oracle instead.
+// RECONCILIATION, not duplication: it reuses schemaForType (the reflect.Type
+// replica of SchemaFor, pinned byte-identical by
+// TestGenerative_SchemaForReplicaParity, since the bulk of the cross is
+// reflect.StructOf types SchemaFor[T] cannot take at run time —
+// rtRealEntryPointCells drives the REAL SchemaFor[T] on the nameable leaves to
+// bridge the replica's fidelity), sampleValue (made cycle-safe) so a leaf buried
+// in *T / []T / map[K]T reaches the codec, and the same malformed-tag alphabet
+// embed_shape_tagedge_test.go pins for WALKER AGREEMENT.
 //
-// The per-axis nets each fix ONE axis: TestGenerative_EmbedShapeWalkerAgreement
-// crosses struct SHAPE with an int32 leaf (field-selection), TestSchemaFor-
-// EncodeParity crosses LEAF TYPE at direct depth (no tag/shape/text cross),
-// TestGenerative_TagEdgeWalkerAgreement crosses TAGS with int leaves. None
-// crosses leaf x shape x tag x text x logical, where the build-accepts/encode-
-// rejects interactions hide (a one-way-text type behind a pointer or inside a
-// slice; a logical tag on a pointer-to-named-int; uuid on []string; decimal on a
-// map). That product is this net's job. Non-vacuity is recorded at the bottom:
-// reverting the one-way-text refusal, the json.Number reject, or the pointer-
-// chain cap each turns a measured set of cells red.
+// The per-axis nets each fix ONE axis, and none crosses leaf x shape x tag x
+// text x logical, where the build-accepts/encode-rejects interactions hide.
+// Non-vacuity is recorded at the bottom: reverting the one-way-text refusal, the
+// json.Number reject, or the pointer-chain cap each turns a measured set of
+// cells red.
 // ===========================================================================
 
 // ---- text-interface leaf alphabet -----------------------------------------
@@ -5392,48 +5368,39 @@ func TestRegression_SchemaForUnexportedEmbedPointerDecodeConstraint(t *testing.T
 // ---- neutering record (non-vacuity proof) ----------------------------------
 //
 // The round-trip oracle is proven to FAIL when each historical SchemaFor fix is
-// reverted in inferType (schema_for.go). Counts below are MEASURED over the
-// 7326-cell leaf x shape x tag cross by switching the divergence report from
-// t.Fatal to a count. With every fix intact, divergences == 0.
+// reverted in inferType. Counts are MEASURED over the 7326-cell leaf x shape x
+// tag cross by switching the divergence report from t.Fatal to a count. With
+// every fix intact, divergences == 0.
 //
-//	NEUTER-1  One-way-text refusal (the text-interface x shape axis). Replace the
-//	          inferType text block's enc/dec switch with an unconditional
-//	          `return "string", nil` (revert 962f7b6):
-//	            48 cells red (24 encode-rejects + 24 typed-decode) — the
-//	            rtStructMarshal (encode-only) and rtStructUnmarshal (decode-only)
-//	            non-string-base leaves now infer "string" and build, then Encode
-//	            (decode-only) or typed Decode (encode-only) fails, across all 8
-//	            leaf-materializing shapes (direct, ptr, ptr2, ptrAtCap, slice,
-//	            array2, map, slicePtr) x the 3 string-building tags (none, name,
-//	            alias). The string- and []byte-base one-directional leaves stay
-//	            GREEN (their kind covers the missing direction), and the inline
-//	            tag flattens the struct rather than inferring a string — proving
-//	            the refusal is scoped to exactly the non-round-trippable types.
+//	NEUTER-1  One-way-text refusal: replace the inferType text block's enc/dec
+//	          switch with an unconditional `return "string", nil` (revert
+//	          962f7b6). 48 cells red (24 encode-rejects + 24 typed-decode) — the
+//	          encode-only and decode-only non-string-base leaves infer "string"
+//	          and build, then the missing direction fails, across all 8
+//	          leaf-materializing shapes x the 3 string-building tags. The string-
+//	          and []byte-base one-directional leaves stay GREEN (their kind
+//	          covers the missing direction) and the inline tag flattens the
+//	          struct — the refusal is scoped to exactly the non-round-trippable
+//	          types.
 //
-//	NEUTER-2  json.Number reject. Make the `case jsonNumberType:` arm return
-//	          `"string", nil` (revert the json.Number fix):
-//	            68 cells red, all encode-rejects, all on the json.Number leaf —
-//	            it infers "string" (its Kind) and builds for every non-malformed
-//	            tag (the case returns before the logical/text checks, so even
-//	            uuid/timestamp-*/decimal build as a bare string), but the codec
-//	            rejects json.Number against a string schema on encode, across
-//	            every shape that materializes the leaf.
+//	NEUTER-2  json.Number reject: make `case jsonNumberType:` return
+//	          `"string", nil`. 68 cells red, all encode-rejects, all on the
+//	          json.Number leaf — it infers its Kind and builds for every
+//	          non-malformed tag (the case returns before the logical/text
+//	          checks), but the codec rejects json.Number against a string schema.
 //
-//	NEUTER-3  Pointer-chain cap. Remove the `ptrChain >= maxIndirectDepth`
-//	          refusal in inferType's pointer arm:
-//	            179 cells red, all encode-rejects, all on the ptrPastCap shape
-//	            (6 pointer levels) — every leaf that itself builds now produces a
-//	            ["null",T], then Encode of the non-nil sampled value fails with
-//	            errIndirectDeep. ptr2 / ptrAtCap (within the cap) stay GREEN, so
-//	            the boundary is exactly at the codec's unwrap depth. (The
-//	            depth>=maxDepth ceiling still prevents any stack overflow, so the
-//	            measurement is a clean count, not a crash.)
+//	NEUTER-3  Pointer-chain cap: remove the `ptrChain >= maxIndirectDepth`
+//	          refusal. 179 cells red, all encode-rejects, all on ptrPastCap (6
+//	          levels) — every leaf that builds now produces a ["null",T] and
+//	          Encode of the non-nil sample fails with errIndirectDeep. ptr2 /
+//	          ptrAtCap stay GREEN, so the boundary is exactly the codec's unwrap
+//	          depth. The depth>=maxDepth ceiling still prevents a stack overflow,
+//	          so the measurement is a clean count, not a crash.
 //
 // The three counts are unchanged whether or not the JSON wire is exercised: each
-// of these bugs manifests on the BINARY path, which rtRunCell checks first and
-// which short-circuits the cell — so the JSON checks add coverage only for a
-// hypothetical binary-passes/JSON-fails bug (none of the three are), and the
-// full net currently finds zero such cells.
+// manifests on the BINARY path, which rtRunCell checks first and which
+// short-circuits the cell. The JSON checks add coverage only for a hypothetical
+// binary-passes/JSON-fails bug, of which the net currently finds none.
 
 // ---------- schemafor_skip_directive_test.go ----------
 
@@ -5754,35 +5721,28 @@ func TestRegression_SkipDirectiveGuardIsSchemaForScoped(t *testing.T) {
 
 // ---------- matrix_schemafor_exactcase_test.go ----------
 
-// TestMatrix_SchemaForReservedKeyExactCase pins the contract that SchemaFor's
-// composition walkers (resolveNameScope, pinCustomSchemaScope,
-// dedupNamedTypes, normalizeSchemaScope) read reserved attribute keys the
-// way the Parse they feed does: by exact lowercase name only. A Props key
-// differing from a reserved name only by letter case is an ordinary custom
-// property (see Schema.Root's doc) — the walkers must neither key, descend,
-// nor inject through it, and it must survive composition verbatim.
+// TestMatrix_SchemaForReservedKeyExactCase pins that SchemaFor's composition
+// walkers (resolveNameScope, pinCustomSchemaScope, dedupNamedTypes,
+// normalizeSchemaScope) read reserved attribute keys the way the Parse they feed
+// does: by exact lowercase name only. A Props key differing from a reserved name
+// only by letter case is an ordinary custom property, so the walkers must
+// neither key, descend, nor inject through it, and it must survive composition
+// verbatim.
 //
-// Axes: reserved key {namespace — the identity axis: only the exact
-// spelling scopes the type; items / values / a union slice under items —
-// the descent routes; fields — the field-descent axis} × spelling
-// {exact-case, UPPER, mIxed} × occurrences {1, 2} × SchemaFor scope
-// {default, WithNamespace}.
+// Axes: reserved key {namespace — the identity axis; items / values / a union
+// slice under items — the descent routes; fields — field descent} x spelling
+// {exact-case, UPPER, mIxed} x occurrences {1, 2} x SchemaFor scope {default,
+// WithNamespace}.
 //
-// Oracles per cell family:
-//   - namespace: the EXACT spelling declares identity x.y.F
-//     (canonical-visible, one definition + a dotted reference at two
-//     occurrences). A VARIANT spelling declares nothing: the identity is
-//     the null-namespace F for every variant cell — byte-identical to the
-//     no-namespace control — and the variant key rides to the composed
-//     definition's Props verbatim. The exact and variant identities MUST
-//     diverge; asserting that divergence is what makes a reintroduced
-//     case-fold visible.
-//   - items/values/union-slice/fields: an exact-spelled stray keeps the
-//     structural-key inertness posture (composition passes it through
-//     untouched), and a variant spelling is a plain prop — both compose
-//     verbatim with identical verdicts, canonicals, and inline-body
-//     counts, because NO spelling of a key on a kind that does not bind it
-//     may be walked, registered, or deduped.
+// Oracles: for namespace, the EXACT spelling declares identity x.y.F while a
+// VARIANT declares nothing — the identity is the null-namespace F, byte-identical
+// to the no-namespace control, with the variant key riding to Props verbatim.
+// The two identities MUST diverge; asserting that is what makes a reintroduced
+// case-fold visible. For items/values/union-slice/fields, an exact-spelled stray
+// keeps the structural-key inertness posture and a variant is a plain prop —
+// both compose verbatim with identical verdicts, canonicals, and inline-body
+// counts, because NO spelling of a key on a kind that does not bind it may be
+// walked, registered, or deduped.
 func TestMatrix_SchemaForReservedKeyExactCase(t *testing.T) {
 	primary := reflect.TypeFor[scopeMatrixPrimary]()
 	variants := map[string]func(string) string{
@@ -6107,31 +6067,25 @@ func TestRegression_TypeAliasVariantAliasesInert(t *testing.T) {
 	}
 }
 
-// TestMatrix_TypeAliasExactCase extends the reserved-key exact-case
-// contract (TestMatrix_SchemaForReservedKeyExactCase) with the type-alias
-// axis: the type-alias tag's walk routes through a container's binding key
-// and reads/extends the aliases attribute exactly as Parse binds them — by
+// TestMatrix_TypeAliasExactCase extends the reserved-key exact-case contract
+// with the type-alias axis: the tag's walk routes through a container's binding
+// key and reads/extends the aliases attribute exactly as Parse binds them, by
 // exact name only.
 //
-// Axes:
-//   - binding-key routing: carrier {array, map, union whose first named
-//     type sits behind the carrier's binding key} × spelling {exact,
-//     upper, mixed} × structural-field {nil — only the spelled Props key
-//     exists; set — the real field renders exact-case and the spelled
-//     Props key rides along}. Exact-spelling cells and every
-//     structural=set cell build with the alias on X; a variant-only cell
-//     (structural=nil, variant spelling) has no binding key and fails its
-//     parse loudly. All accepting cells of one carrier agree on canonical
-//     bytes (props are canonical-stripped).
-//   - aliases-attribute routes: the field route and the exact-Props route
-//     are EXTENDED identically; a variant-Props route gets a fresh exact
-//     "aliases" with the variant preserved verbatim.
-//   - name/namespace case-variant Props riding beside the real attributes:
-//     inert (the exact attributes win; the variants ride as props).
+//   - binding-key routing: carrier {array, map, union whose first named type
+//     sits behind the carrier's binding key} x spelling {exact, upper, mixed} x
+//     structural-field {nil — only the spelled Props key exists; set — the real
+//     field renders exact-case and the spelled Props key rides along}. Exact
+//     cells and every structural=set cell build with the alias on X; a
+//     variant-only cell has no binding key and fails its parse loudly. All
+//     accepting cells of one carrier agree on canonical bytes.
+//   - aliases-attribute routes: the field route and the exact-Props route are
+//     EXTENDED identically; a variant-Props route gets a fresh exact "aliases"
+//     with the variant preserved verbatim.
+//   - name/namespace case-variant Props beside the real attributes: inert.
 //   - two tagged fields sharing the custom type: the namespace-field route
 //     composes one x.y.X definition + one dotted reference; a "NameSpace"
-//     variant-Props route declares nothing — the type is null-namespace X,
-//     one definition + one bare reference, variant preserved.
+//     variant declares nothing.
 func TestMatrix_TypeAliasExactCase(t *testing.T) {
 	primary := reflect.TypeFor[scopeMatrixPrimary]()
 	tagged := []reflect.StructField{{Name: "L", Type: primary, Tag: `avro:"l,type-alias=Old"`}}
@@ -6363,34 +6317,28 @@ func assertOneIntValue(t *testing.T, name string, got map[string]int) {
 
 // ---------- matrix_schemafor_scope_test.go ----------
 
-// TestMatrix_SchemaForCustomSchemaScope crosses the namespace-composition
-// space of CustomType.Schema embedding: a custom schema is an independently
-// authored tree with its own namespace scoping, and SchemaFor must preserve
-// every declared fullname when composing it into the inferred tree.
+// TestMatrix_SchemaForCustomSchemaScope crosses the namespace-composition space
+// of CustomType.Schema embedding: a custom schema is an independently authored
+// tree with its own namespace scoping, and SchemaFor must preserve every
+// declared fullname when composing it into the inferred tree.
 //
 // Axes: custom-schema spelling {split Root()-derived, dotted hand-built
-// SchemaNode, null-namespace} × kind {record, enum, fixed} × occurrences
-// {one, two fields} × SchemaFor scope {default, WithNamespace} × shape
-// {flat; recursive — the custom schema references itself, so its internal
-// references must still bind after embedding; a nested named type in a
-// DIFFERENT namespace inside the custom subtree}, plus coexistence cells
-// (a.X + null-namespace X; a.X + b.X; two customs carrying IDENTICAL
-// definitions dedup to one definition + a reference) and the
-// unrepresentable corner: a null-namespace type recurring under
-// WithNamespace has no reference spelling (a bare name binds in the
-// enclosing namespace; references have no "namespace":"" escape), so that
-// cell must produce exactly the named error — never a dangling reference or
-// a namespace capture.
+// SchemaNode, null-namespace} x kind {record, enum, fixed} x occurrences {one,
+// two fields} x SchemaFor scope {default, WithNamespace} x shape {flat;
+// recursive, so internal references must still bind after embedding; a nested
+// named type in a DIFFERENT namespace inside the custom subtree}, plus
+// coexistence cells (a.X + null-namespace X; a.X + b.X; two customs carrying
+// IDENTICAL definitions dedup to one definition + a reference) and the
+// unrepresentable corner: a null-namespace type recurring under WithNamespace
+// has no reference spelling, so that cell must produce exactly the named error —
+// never a dangling reference or a namespace capture.
 //
-// Oracle per cell: the SchemaFor pipeline succeeds (or hits exactly the
-// corner error); the output re-parses; the parsed metadata preserves every
-// declared fullname; split and dotted spellings of the same schema produce
-// byte-identical Canonical() — the spec ("Names") makes the two spellings
-// one name, so their canonical forms must agree; and an EXECUTED fastavro
-// arm parses representative outputs (which carry dotted references and
-// "namespace":"" escapes) and must agree on the full parsing canonical
-// form, which subsumes fingerprint equality without any byte-order
-// presentation trap.
+// Oracle per cell: the pipeline succeeds (or hits exactly the corner error); the
+// output re-parses; the parsed metadata preserves every declared fullname; split
+// and dotted spellings produce byte-identical Canonical(), since the spec makes
+// the two spellings one name; and an EXECUTED fastavro arm parses representative
+// outputs and must agree on the full parsing canonical form, which subsumes
+// fingerprint equality without any byte-order presentation trap.
 
 // Marker Go types the matrix's CustomTypes match on. Identity only matters
 // within one cell, so two markers cover every layout.
@@ -7229,27 +7177,25 @@ func nullSpellDefaults(t *testing.T, s *Schema) string {
 
 // Embedded-field name collisions: WHERE the decision is made.
 //
-// Two implementations answer "which of two same-named promoted fields wins,
-// and when is the collision ambiguous?" — collectFields, for SchemaFor, and
+// Two implementations answer "which of two same-named promoted fields wins, and
+// when is the collision ambiguous?" — collectFields, for SchemaFor, and
 // typeFieldMapping, the shared field map for encode and decode. They agree on
-// the RULE. What this file guards is that they agree on where the rule RUNS.
+// the RULE; what this guards is that they agree on where the rule RUNS.
 //
-// The rule ranges over the whole collected field set: shallowest depth wins,
-// and only a tie at the winning depth is ambiguous. A resolution step that
-// ranges over the whole set but is written as the trailing block of the
-// RECURSIVE collector runs once per level instead of once per type, on a
-// partial set — so a collision one level below the root is decided before the
-// level that resolves it has been read, and any index the step resolves is in
-// the root's coordinate space while its receiver is the nested type.
-//
-// No verdict-comparison net can see that: at the root both placements agree.
-// The discriminating observation is the SAME construct at several nesting
+// The rule ranges over the whole collected field set: shallowest depth wins, and
+// only a tie at the winning depth is ambiguous. A resolution step written as the
+// trailing block of the RECURSIVE collector runs once per level instead of once
+// per type, on a partial set — so a collision one level below the root is
+// decided before the level that resolves it has been read, and any index it
+// resolves is in the root's coordinate space while its receiver is the nested
+// type. No verdict-comparison net can see that: at the root both placements
+// agree. The discriminating observation is the SAME construct at several nesting
 // depths, which is the axis this matrix drives.
 //
-// The oracle is Go itself. reflect.Type.FieldByName implements the language's
-// promotion rule and reports an ambiguous promoted name by returning false;
-// it is placement-blind by construction, so it decides every untagged cell
-// here without reference to anything this package does.
+// The oracle is Go itself: reflect.Type.FieldByName implements the language's
+// promotion rule and reports an ambiguous promoted name by returning false. It
+// is placement-blind by construction, so it decides every untagged cell without
+// reference to anything this package does.
 
 // ---------- the shapes ----------
 //
@@ -7947,45 +7893,36 @@ func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
 // The generative adversarial-struct-shape net for SchemaFor's field selection.
 //
 // ONE generator (genStructuralShapes / genTagEdgeShapes), not hand cases. Every
-// shape is a reflect.StructOf type built by crossing the axes that the embedded-
-// field selection bugs lived in:
-//
-//   - diamond embeds            (a base reached through two arms at EQUAL depth)
-//   - equal-depth collisions    (two DISTINCT types promoting the same name)
-//   - repeated-type two-depth   (one type reached directly AND through an embed)
-//   - embedded vs named fields  (a direct field colliding with a promoted one)
-//   - tagged vs untagged         (a rename colliding with a promoted Go name)
-//   - malformed / edge tags      (genTagEdgeShapes: inline-on-non-struct, name+
-//                                 inline, decimal trailing junk, dash+options,
-//                                 narrow-int default bounds, uuid/plain dedup)
+// shape is a reflect.StructOf type built by crossing the axes the embedded-field
+// selection bugs lived in: diamond embeds (a base reached through two arms at
+// EQUAL depth), equal-depth collisions, repeated-type two-depth (one type
+// reached directly AND through an embed), embedded vs named fields, tagged vs
+// untagged, and malformed / edge tags.
 //
 // For every shape the net asserts the two field-mapping walkers AGREE:
 //
-//     SchemaFor's    collectFields  (schema_for.go)   -- the schema builder
-//     the runtime's  typeFieldMapping (reflect.go)    -- shared by encode AND
-//                                                         decode (ser/deser/
-//                                                         json_codec/json_decode/
-//                                                         resolve/unsafe)
+//     SchemaFor's    collectFields    (schema_for.go)  -- the schema builder
+//     the runtime's  typeFieldMapping (reflect.go)     -- shared by encode AND
+//                                                         decode
 //
-// on (1) WHICH Go field each Avro name resolves to, and (2) the RESOLVED schema
-// (exercised end-to-end through the real Encode/Decode path). The two diverging
-// is the failure mode Family 5 keeps hitting (commits 692b039, a1c4b25,
-// 6ce8257): a silently-picked wrong field, an embed pruned by a marked-forever
-// visited map, an ambiguity one walker rejects and the other first-wins.
+// on (1) WHICH Go field each Avro name resolves to and (2) the RESOLVED schema,
+// exercised end-to-end through the real Encode/Decode path. The two diverging is
+// the failure mode Family 5 keeps hitting (692b039, a1c4b25, 6ce8257): a
+// silently-picked wrong field, an embed pruned by a marked-forever visited map,
+// an ambiguity one walker rejects and the other first-wins.
 //
 // Non-vacuity is NOT self-asserted: the walkers are cross-checked against an
 // INDEPENDENT oracle — Go's own field promotion (reflect.FieldByName) for the
 // untagged shapes, and a from-scratch precedence resolver (oracleResolve,
-// validated against FieldByName on the untagged shapes) for the tagged ones.
-// If the two walkers ever drifted in lockstep, the FieldByName oracle still
-// catches it. The neutering record at the bottom of this file documents the
-// exact reverts that turn cells red, and what they were measured to do.
+// validated against FieldByName on those) for the tagged ones. If the two
+// walkers drifted in lockstep, FieldByName still catches it. The neutering
+// record at the bottom documents the exact reverts that turn cells red.
 //
 // The eager/lazy split is part of the contract, not a divergence: SchemaFor
-// REJECTS any ambiguous collision (it must emit every field), while the runtime
-// defers — it errors only when a schema field actually RESOLVES to an ambiguous
-// name, so a coincidental collision the schema never references does not break
-// the struct. The net asserts BOTH halves.
+// REJECTS any ambiguous collision, since it must emit every field, while the
+// runtime defers and errors only when a schema field actually RESOLVES to an
+// ambiguous name, so a coincidental collision the schema never references does
+// not break the struct. The net asserts BOTH halves.
 // ===========================================================================
 
 // ---- carrier alphabet -----------------------------------------------------
@@ -8655,22 +8592,19 @@ var embedIndexSites = map[string]int{
 //
 // The verdict is a property of the Go SHAPE, not of the wire, so every route
 // reaching those helpers owes the same answer — and the routes are not one path.
-// Binary decode reaches fieldByIndex only through the COMPILED record
-// (deserRecordFast's slow-field arm); JSON decode has a present-key arm and a
-// separate default-fill arm; the RESOLVED decoder has its own writer-op and
-// reader-default arms. Five decode sites, three encode sites, all in
-// embedIndexSites.
+// Binary decode reaches fieldByIndex only through the COMPILED record; JSON
+// decode has a present-key arm and a separate default-fill arm; the RESOLVED
+// decoder has its own writer-op and reader-default arms. Five decode sites,
+// three encode sites, all in embedIndexSites.
 //
-// AXES: occupancy {nil, pre-allocated} x embed exportedness {exported,
-// unexported} x route {the eight sites above}.
+// AXES: occupancy {nil, pre-allocated} x embed exportedness x route.
 //
-// ORACLE: encoding/json, decoded into the SAME Go types. It is an independent
+// ORACLE: encoding/json, decoded into the SAME Go types — an independent
 // implementation of the same Go-reflection constraint, and fieldByIndex's own
-// comment claims parity with it — so the accept/reject verdict is taken from it
-// cell for cell rather than read off this package. Its ENCODE behavior is
-// deliberately NOT the oracle: json omits a nil embed's promoted fields, while
-// an Avro record has no absent field and writes the zero. The encode arm uses
-// the all-zero map twin instead (a path that never touches fieldByIndexZero).
+// comment claims parity with it, so the verdict is taken from it cell for cell.
+// Its ENCODE behavior is deliberately NOT the oracle: json omits a nil embed's
+// promoted fields, while an Avro record has no absent field and writes the zero.
+// The encode arm uses the all-zero map twin instead.
 func TestMatrix_NilEmbedPointerRouteAgreement(t *testing.T) {
 	full := MustParse(`{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"c","type":"int"}]}`)
 	// withDefault carries a default for "a" so the JSON decoder's default-fill
@@ -9079,57 +9013,52 @@ func TestGenerative_SchemaForReplicaParity(t *testing.T) {
 //
 // This net is proven to FAIL when each Family-5 fix is reverted in the
 // production walkers. Measured over the 16000 generated structural shapes with a
-// temporary count-don't-fatal harness (the live test fatals at the first red
-// cell). With both fixes intact all four counts below are 0.
+// temporary count-don't-fatal harness. With both fixes intact all four counts
+// are 0.
 //
-//	NEUTER-1  Remove `defer delete(visited, t)` from BOTH walkers
-//	          (reflect.go + schema_for.go) — revert 6ce8257, restoring the
-//	          marked-forever visited map:
-//	            collectFields wrong-winner ......... 200 shapes (100 of them inline)
+//	NEUTER-1  Remove `defer delete(visited, t)` from BOTH walkers (revert
+//	          6ce8257, restoring the marked-forever visited map):
+//	            collectFields wrong-winner ......... 200 shapes (100 inline)
 //	            collectFields accepted-ambiguous ... 304 shapes
 //	            typeFieldMapping mirrors both (200 / 304)
 //	          A type reached through two embed paths has its SHALLOW occurrence
-//	          pruned, so the deeper field wins (caught by the FieldByName oracle
-//	          on the embed shapes and by oracleResolve on the inline shapes, where
-//	          FieldByName does not apply — hence the 100 inline reds); a diamond's
-//	          second arm is pruned, so the collision is silently first-won instead
-//	          of flagged ambiguous.
+//	          pruned, so the deeper field wins — caught by FieldByName on the
+//	          embed shapes and by oracleResolve on the inline shapes, where
+//	          FieldByName does not apply, hence the 100 inline reds — and a
+//	          diamond's second arm is pruned, so the collision is silently
+//	          first-won instead of flagged ambiguous.
 //
-//	NEUTER-2  Drop the equal-depth `ambiguous[...]` mark in BOTH walkers
-//	          (revert 692b039 + a1c4b25), restoring silent first-win:
+//	NEUTER-2  Drop the equal-depth `ambiguous[...]` mark in BOTH walkers (revert
+//	          692b039 + a1c4b25), restoring silent first-win:
 //	            collectFields accepted-ambiguous ... 912 shapes
 //	            typeFieldMapping accepted-ambiguous  912 names
-//	          Every ambiguous shape the net asserts must reject is silently
-//	          first-won instead. 912 == the net's own ambiguity-rejection count,
-//	          i.e. EVERY ambiguous cell goes red.
+//	          912 == the net's own ambiguity-rejection count, i.e. EVERY
+//	          ambiguous cell goes red.
 
 // ---------- embed_shape_tagedge_test.go ----------
 
 // ===========================================================================
 // The tag-edge half of the generative net: malformed / edge struct tags.
 //
-// SchemaFor's parser (collectFields -> parseSchemaTag/splitTag, then
-// inferField/inferType) is STRICT: it rejects inline-on-non-struct, inline with
-// an explicit name, a decimal tag with trailing junk, a "-" skip carrying
-// options, an unknown option, a default that overflows the Go field's narrow
-// integer kind, a logical type on an incompatible Go type, an empty alias list.
-// The runtime field-mapper (typeFieldMapping -> splitFieldTag/parseTagOptions)
-// is LENIENT: it needs only the field name, inline, and omitzero, and ignores
-// everything else; on an unbalanced-bracket tag splitTag rejects but
-// splitFieldTag falls back to a naive split so the runtime never NEWLY errors
-// on a tag a hand-written-schema user already relies on.
+// SchemaFor's parser is STRICT: it rejects inline-on-non-struct, inline with an
+// explicit name, a decimal tag with trailing junk, a "-" skip carrying options,
+// an unknown option, a default overflowing the field's narrow integer kind, a
+// logical type on an incompatible Go type, an empty alias list. The runtime
+// field-mapper is LENIENT: it needs only name, inline, and omitzero, ignores the
+// rest, and on an unbalanced-bracket tag falls back to a naive split so the
+// runtime never NEWLY errors on a tag a hand-written-schema user already relies
+// on.
 //
 // That strict/lenient split is the tag-dimension analog of the eager/lazy
 // ambiguity split, and it is SAFE only as long as it never becomes a
 // both-succeed-DISAGREE: the two walkers share splitTag's tokenization and
 // extract name/inline/omitzero with identical logic, so whenever SchemaFor
 // builds a field the runtime must map the SAME name to the SAME Go field. This
-// family proves that across the cross-product (defect x placement): for every
-// shape where collectFields succeeds, typeFieldMapping agrees on every name; and
-// the documented SchemaFor verdict (accept/reject) is pinned so a regression in
-// the strict parser is caught. Where collectFields rejects, the runtime is
-// asserted non-corrupting — it errors loudly or maps a syntactically-valid name
-// to a real field, never silently picks a contradictory winner.
+// family proves that across defect x placement: where collectFields succeeds,
+// typeFieldMapping agrees on every name, and the documented verdict is pinned;
+// where collectFields rejects, the runtime is asserted non-corrupting — it
+// errors loudly or maps a syntactically-valid name to a real field, never
+// silently picks a contradictory winner.
 // ===========================================================================
 
 type GUUID [16]byte
@@ -9362,33 +9291,27 @@ func fieldNamesOf(t reflect.Type) []string {
 // The reflect collectors' cost is a PRODUCT, and only one of its factors was
 // ever driven.
 //
-// Both collectors — collectFieldsRaw (schema_for.go, behind SchemaFor) and
-// typeFieldMapping's collect (reflect.go, behind a record decode/encode) —
-// mark the type they are descending PER PATH and unmark on the way out
-// (`defer delete(visited, t)`). That is correct for embed CYCLES and
-// deliberate: a type reached through two SIBLING embed paths has to be
-// collected at each occurrence, so the shallower one reaches the
-// shallowest-wins dedup and a type genuinely inlined twice surfaces as the
-// duplicate-field collision it is. The consequence is that a Go type graph
-// which is a DAG — no cycle at all — is re-descended once per PATH, and a
-// diamond of embeds has 2^depth of them.
+// Both collectors — collectFieldsRaw (behind SchemaFor) and typeFieldMapping's
+// collect (behind a record decode/encode) — mark the type they are descending
+// PER PATH and unmark on the way out. That is correct for embed CYCLES and
+// deliberate: a type reached through two SIBLING embed paths has to be collected
+// at each occurrence, so the shallower one reaches the shallowest-wins dedup and
+// a type genuinely inlined twice surfaces as the duplicate-field collision it
+// is. The consequence is that a Go type graph which is a DAG is re-descended
+// once per PATH, and a diamond of embeds has 2^depth of them.
 //
-// That is a cost, not a bug: the carrier is a Go type, fixed at compile time,
-// so nothing an attacker sends can grow it. What made it worth a permanent
-// cell is that the ruling closing it rested on the two collectors being
-// equivalent, and they are not. The cost is
+// That is a cost, not a bug: the carrier is a Go type fixed at compile time, so
+// nothing an attacker sends can grow it. What made it worth a permanent cell is
+// that the ruling closing it rested on the two collectors being equivalent, and
+// they are not. The cost is paths-through-the-embed-DAG x CALLS, and the second
+// factor differs: typeFieldMapping's result is memoized per reflect.Type in a
+// sync.Map, so a decode pays the walk once; collectFieldsRaw has no memo, so
+// every SchemaFor call re-pays it in full. Driving depth alone cannot see that.
 //
-//	paths-through-the-embed-DAG  x  CALLS
-//
-// and the second factor differs between them: typeFieldMapping's result is
-// memoized per reflect.Type in a sync.Map (deser.go, ser.go), so a decode pays
-// the walk once and never again; collectFieldsRaw has no memo at all, so every
-// SchemaFor call re-pays it in full. Driving depth alone cannot see that, which
-// is why the cell drives both.
-// Sibling-embed diamond: T_k embeds A_k and B_k, both of which embed T_{k+1},
-// so T1 reaches the leaf by 2^depth distinct paths while the type GRAPH is
-// linear in the depth. The leaf is empty, so the type is ACCEPTED and the
-// walk runs to completion rather than stopping at a duplicate-field error.
+// Sibling-embed diamond: T_k embeds A_k and B_k, both embedding T_{k+1}, so T1
+// reaches the leaf by 2^depth distinct paths while the type GRAPH is linear in
+// the depth. The leaf is empty, so the type is ACCEPTED and the walk runs to
+// completion rather than stopping at a duplicate-field error.
 type embedDiamondLeaf struct{}
 
 type T13 = embedDiamondLeaf
@@ -9468,36 +9391,30 @@ type T1 struct {
 // TestInvariant_EmbedDiamondCostFactors drives BOTH factors of the reflect
 // collectors' cost.
 //
-// What it asserts, and what it deliberately does not. It does NOT assert the
-// depth factor is flat — it is not, by design, and a cell claiming otherwise
-// would be asserting a property the package does not have. It asserts the two
-// things that ARE invariants:
+// It does NOT assert the depth factor is flat — it is not, by design, and a cell
+// claiming otherwise would assert a property the package does not have. It
+// asserts the two things that ARE invariants:
 //
-//   - the DECODE collector is amortized. A second decode into the same Go type
-//     must cost a small fraction of the first.
+//   - the DECODE collector is amortized: a second decode into the same Go type
+//     must cost a small fraction of the first. TWO caches in SERIES produce
+//     that, and neither can be discriminated alone — deserRecord.fast holds the
+//     compiled unsafe path per Go type and is consulted first, and
+//     typeFieldMapping's sync.Map holds the field mapping behind it. Disabling
+//     either measured 375ns and 583ns on the second decode, unchanged, because
+//     the survivor still answers; disabling BOTH gives 3.9ms against a 4.3ms
+//     first decode. So what is asserted is the COMBINATION, and the naming
+//     matters: a comment crediting the mapping cache alone would name a bound it
+//     does not measure.
 //
-//     TWO caches in SERIES produce that, and neither can be discriminated
-//     alone: deserRecord.fast holds the compiled unsafe path per Go type and
-//     is consulted first, and typeFieldMapping's own sync.Map holds the field
-//     mapping behind it. Disabling either one measured 375ns and 583ns on the
-//     second decode — unchanged — because the survivor still answers.
-//     Disabling BOTH gives 3.9ms against a 4.3ms first decode, i.e. the walk
-//     running again. So what this asserts is the COMBINATION, and the naming
-//     matters: a comment crediting the mapping cache alone would be a cell
-//     named for a bound it does not measure, which is how the last one in this
-//     file got renamed.
-//
-//   - neither collector ACCUMULATES across calls. Call N must cost about what
-//     call 1 did, so a per-call cost that grew with the number of calls — a
-//     cache keyed on something that is not the type, a leak — reds. This is
-//     the form that leaves room for the improvement rather than forbidding it:
-//     adding a memo to collectFieldsRaw makes later calls cheaper, which
-//     passes.
+//   - neither collector ACCUMULATES across calls: call N must cost about what
+//     call 1 did, so a per-call cost growing with the number of calls — a cache
+//     keyed on something that is not the type, a leak — reds. This form leaves
+//     room for the improvement rather than forbidding it: adding a memo to
+//     collectFieldsRaw makes later calls cheaper, which passes.
 //
 // The depth pair is measured and LOGGED rather than bounded, so the 2^depth
-// shape is visible to a reader of the output instead of living only in a
-// comment, and the absolute ceiling still catches a regression that made the
-// walk worse than exponential in the depth.
+// shape is visible in the output instead of only in a comment, and the absolute
+// ceiling still catches a regression worse than exponential in the depth.
 func TestInvariant_EmbedDiamondCostFactors(t *testing.T) {
 	depths := costFactorValues(t, "TestInvariant_EmbedDiamondCostFactors")
 	if len(depths) < 2 {

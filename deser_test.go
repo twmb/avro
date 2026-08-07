@@ -9198,27 +9198,25 @@ type tmIntField struct {
 	F int64 `avro:"f"`
 }
 
-// TestMatrix_TimeMicrosOverflowGuardIsUniform crosses the overflow guard's
-// three axes at once. The guard lives in one conversion helper so that
-// every caller rejects the same values, and "every caller" is the claim —
-// but the suite reached it one caller and one target at a time, each by a
-// separate cell, so no cell asked whether the four callers AGREE, and the
-// time.Time target's overflow arm was reached by nothing.
+// TestMatrix_TimeMicrosOverflowGuardIsUniform crosses the overflow guard's three
+// axes at once. The guard lives in one conversion helper so that every caller
+// rejects the same values, and "every caller" is the claim — but the suite
+// reached it one caller and one target at a time, so no cell asked whether the
+// four callers AGREE, and the time.Time target's overflow arm was reached by
+// nothing.
 //
 //	caller  binary safe, binary unsafe (a struct field), JSON typed, JSON any
 //	target  time.Duration, time.Time, any, and int64 as the control
 //	value   in range, both boundaries, and one past each boundary
 //
-// The rule is stated independently of the code: a value overflows exactly
-// when it cannot be scaled to nanoseconds inside an int64, and the guard
-// must fire for every target that MATERIALIZES a duration and for none
-// that does not. int64 is in the matrix precisely because it must keep
-// accepting the overflowing values — a guard that rejected everything
-// would otherwise satisfy every other cell.
-//
-// The boundary cells are the two values immediately inside the limit, so
-// an off-by-one in the comparison shows up as a rejected legal value
-// rather than only as an accepted illegal one.
+// The rule is stated independently of the code: a value overflows exactly when
+// it cannot be scaled to nanoseconds inside an int64, and the guard must fire
+// for every target that MATERIALIZES a duration and none that does not. int64 is
+// in the matrix precisely because it must keep accepting the overflowing values
+// — a guard that rejected everything would otherwise satisfy every other cell.
+// The boundary cells are the two values immediately inside the limit, so an
+// off-by-one shows up as a rejected legal value, not only as an accepted illegal
+// one.
 func TestMatrix_TimeMicrosOverflowGuardIsUniform(t *testing.T) {
 	const microsPerNano = int64(time.Microsecond) // 1000
 	values := []struct {
@@ -10204,38 +10202,28 @@ func TestRegression_EncodeJSONNilPtrIntoNullableUnion(t *testing.T) {
 	}
 }
 
-// TestMatrix_EncodeJSONNullParity locks binary↔JSON encode parity
-// for the plain "null" Avro type across every site that reaches serNull
-// or appendAvroJSON's case "null" arm. Both paths must:
+// TestMatrix_EncodeJSONNullParity locks binary/JSON encode parity for the plain
+// "null" type across every site reaching serNull or appendAvroJSON's case
+// "null". Both must (1) reject non-nil non-nilable values with errNonNil — the
+// JSON arm cannot just emit literal `null` regardless of v — and (2) accept
+// typed-nil values arriving via an Interface wrapper, since generic serUnion /
+// serArray / serMap dispatch calls serNull with Kind=Interface and both sides
+// must peel before the kind switch.
 //
-//	(1) reject non-nil non-nilable values with errNonNil (the JSON
-//	    arm cannot just emit literal `null` regardless of v's content).
-//	(2) accept typed-nil values arriving via an Interface wrapper —
-//	    generic serUnion / serArray / serMap dispatch calls serNull
-//	    with iter.Value() Kind=Interface wrapping a typed-nil, and
-//	    both sides must peel the interface before the kind switch.
+// The 2-branch [null,T] optimization is unaffected (serNullUnionAt → isNilValue
+// peels interfaces); the concern is 3+ branch dispatch and the
+// array<null>/map<null>/null-typed-field cases.
 //
-// The 2-branch [null,T] optimization is unaffected (serNullUnionAt →
-// isNilValue peels interfaces); the parity concern is the 3+ branch
-// union dispatch and the array<null>/map<null>/null-typed-field cases.
+// The matrix covers both directions at the four sites routing through serNull's
+// kind-switch: a top-level "null" schema, a null-typed record field, a
+// tagged-union null branch in a 3+ branch union, and array<null> items /
+// map<null> values.
 //
-// The matrix covers both directions (reject and accept) at the four
-// sites that route through serNull's kind-switch:
-//
-//  1. Top-level "null" schema (Schema.Encode / Schema.EncodeJSON).
-//  2. Null-typed record field — value goes through f.fn = serNull.
-//  3. Tagged-union null branch in a 3+ branch union — inner from
-//     tryUnwrapTagged is wrapped in Interface kind, not the 2-branch
-//     fast path.
-//  4. array<null> items (serArray.serItem = serNull) and map<null>
-//     values (similar).
-//
-// Cross-impl note: Java/fastavro are silently lenient on both binary
-// and JSON (GenericDatumWriter.NULL writes the marker without checking
-// datum; same in fastavro's write_null). twmb's binary path is
-// deliberately strict here per TestSerNullNonNilableType (ser_test.go)
-// — bringing the JSON path into parity with our strict-binary choice
-// rather than weakening the binary side to match Java.
+// Cross-impl: Java and fastavro are silently lenient on both wires
+// (GenericDatumWriter.NULL writes the marker without checking datum; same in
+// write_null). twmb's binary path is deliberately strict per
+// TestSerNullNonNilableType, so this brings JSON to the strict choice rather
+// than weakening binary.
 func TestMatrix_EncodeJSONNullParity(t *testing.T) {
 	// ---- Reject arm: non-nil non-nilable values must error on both paths ----
 
@@ -10415,32 +10403,23 @@ func TestMatrix_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 	})
 }
 
-// TestMatrix_EncodeJSONNullParityBareNilContainer locks parity between
-// the binary union encoder (serUnion.ser, ser.go) and the JSON union
-// encoder (appendAvroJSONUnion, json_codec.go) for bare nil Map / nil
-// Slice / nil []byte inputs against a multi-branch union containing
-// "null". The bug: appendAvroJSONUnion's try-each loop unconditionally
-// skipped the null branch (`if branch.kind == "null" continue`), and
-// the upstream peel loop in appendAvroJSON only peels Pointer / Interface
-// — not Map / Slice / Chan / Func — so a bare nil Map / nil Slice never
-// landed on case "null". Binary serUnion.ser tries every branch
-// including null; serNull's post-2995c67 peel-loop + kind-switch accepts
-// nil Map / Slice / Chan / Func — so the binary path picked the null
-// branch while the JSON path returned "no union branch matched" (for
-// non-bytes nils) or silently picked the string/bytes branch and emitted
-// "" (for nil []byte). Fix: drop the null-skip in the try-each so the
-// loop mirrors serUnion.ser; the case "null" arm rejects non-nil with
-// errNonNil so non-nil inputs cleanly fall through to the next branch.
+// TestMatrix_EncodeJSONNullParityBareNilContainer locks parity between the
+// binary union encoder (serUnion.ser) and the JSON one (appendAvroJSONUnion) for
+// bare nil Map / nil Slice / nil []byte against a multi-branch union containing
+// "null". appendAvroJSONUnion's try-each loop unconditionally skipped the null
+// branch, and the upstream peel in appendAvroJSON only peels Pointer/Interface —
+// not Map/Slice/Chan/Func — so a bare nil Map or Slice never landed on case
+// "null". Binary tries every branch including null and serNull's peel accepts
+// those kinds, so binary picked null while JSON returned "no union branch
+// matched", or silently picked the string/bytes branch and emitted "" for nil
+// []byte. The fix drops the null-skip; case "null" rejects non-nil with errNonNil
+// so non-nil inputs fall cleanly through.
 //
-// This is distinct from TestMatrix_EncodeJSONNullParity above, which
-// covers the TAGGED-union dispatch (`{"null": <typed-nil>}` flowing
-// through tryUnwrapTagged → case "null"). The bare-value form here goes
-// through unionTypeNameForValue (which returns "" for Map/Slice except
-// []byte) → try-each, which is exactly where the null-skip blocked the
-// dispatch. Bringing the binary serNull's peel into matching shape with
-// isNilValue without also updating the JSON dispatcher's try-each hides
-// the bug, because every existing parity test passes the typed-nil
-// through the tagged form, not the bare form.
+// Distinct from TestMatrix_EncodeJSONNullParity, which covers TAGGED dispatch.
+// The bare form goes through unionTypeNameForValue (which returns "" for
+// Map/Slice except []byte) into try-each, exactly where the null-skip blocked
+// it: every existing parity test passes the typed-nil through the tagged form,
+// so widening serNull's peel without the dispatcher hides the bug.
 func TestMatrix_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -10542,28 +10521,20 @@ func TestMatrix_EncodeJSONNullParityBareNilContainer(t *testing.T) {
 	}
 }
 
-// TestMatrix_EncodeJSONNullBytesUnionParity locks the "Go nil =
-// absent → null branch" semantic uniformly across union arities and
-// encoders. All four dispatch sites must agree on nil-equivalence:
-// binary 2-branch (serNullUnionAt → isNilValue), binary N-branch
-// (serUnion.ser), JSON N-branch (appendAvroJSONUnion), and JSON
-// tagged-form (decodeUnionObject).
+// TestMatrix_EncodeJSONNullBytesUnionParity locks the "Go nil = absent → null
+// branch" semantic uniformly across union arities and encoders. All four
+// dispatch sites must agree: binary 2-branch (serNullUnionAt → isNilValue),
+// binary N-branch (serUnion.ser), JSON N-branch (appendAvroJSONUnion), and JSON
+// tagged (decodeUnionObject).
 //
-// The general rule "nil → null when null branch present" applies via
-// a nil-first short-circuit at the entry of both serUnion.ser and
-// appendAvroJSONUnion. Without this, three near-identical schemas
-// could produce three distinct results for `[]byte(nil)`:
+// A nil-first short-circuit at the entry of serUnion.ser and appendAvroJSONUnion
+// applies the general rule. Without it, three near-identical schemas give three
+// results for []byte(nil): 2-branch reaches null via isNilValue, while N-branch
+// type-name dispatch names Slice<uint8> "bytes" regardless of IsNil and picks
+// the bytes branch — a JSON/binary gap and a 2-branch/N-branch inconsistency.
 //
-//   - 2-branch [null,bytes]: isNilValue → null. ✓
-//   - N-branch via type-name dispatch: unionTypeNameForValue names
-//     Slice<uint8> as "bytes" regardless of IsNil → bytes branch.
-//   - JSON without nil-first: same as above. JSON↔binary gap and
-//     2-branch↔N-branch internal inconsistency.
-//
-// Removing `if branch.kind == "null" continue` from the try-each loop
-// alone does not suffice: type-name dispatch fires before try-each
-// runs for nil Slice<uint8>. The nil-first short-circuit is the
-// general fix.
+// Dropping the null-skip from try-each alone does not suffice: type-name
+// dispatch fires first for nil Slice<uint8>.
 func TestMatrix_EncodeJSONNullBytesUnionParity(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -10672,28 +10643,20 @@ func TestMatrix_EncodeJSONNullBytesUnionParity(t *testing.T) {
 	}
 }
 
-// TestMatrix_EncodeNullParity2BranchNilChanFunc locks parity
-// between the binary 2-branch [null,T] optimization (serNullUnion /
-// isNilValue at ser.go) and the binary 3-branch / JSON paths
-// (serUnion.ser / appendAvroJSONUnion → serNull / case "null") for
-// nil Chan and nil Func inputs.
+// TestMatrix_EncodeNullParity2BranchNilChanFunc locks parity between the binary
+// 2-branch [null,T] optimization (serNullUnion / isNilValue) and the binary
+// 3-branch / JSON paths for nil Chan and nil Func.
 //
-// Background: serNull (ser.go) and appendAvroJSON's case "null"
-// arm (json_codec.go) both accept v.IsNil() for kinds
-// {Pointer, Interface, Map, Slice, Chan, Func}. isNilValue (ser.go)
-// — used uniquely by the 2-branch optimization serNullUnionAt — peels
-// Pointer/Interface but its terminal kind switch previously covered
-// only {Map, Slice}, missing Chan/Func. Result: 2-branch [null,T]
-// + nil Chan/Func fell to fns[valIdx] (e.g. serInt) which then
-// errored on the non-numeric Kind, while the 3-branch try-each and
-// the JSON try-each both reached the case "null" arm that DID accept
-// Chan/Func nil.
+// serNull and appendAvroJSON's case "null" both accept v.IsNil() for
+// {Pointer, Interface, Map, Slice, Chan, Func}. isNilValue — used only by the
+// 2-branch optimization — peeled Pointer/Interface but its terminal kind switch
+// covered only {Map, Slice}. So 2-branch [null,T] with a nil Chan/Func fell to
+// fns[valIdx] (e.g. serInt) and errored, while both try-each paths reached the
+// arm that accepts them.
 //
-// Adding the Interface peel and then the Pointer peel to serNull (to
-// match isNilValue's docstring) without broadening isNilValue's
-// terminal switch leaves the helper's accept set narrower than
-// serNull's. isNilValue's terminal switch must include reflect.Chan
-// and reflect.Func so its accept set matches serNull's exactly.
+// Adding peels to serNull without broadening isNilValue's terminal switch leaves
+// the helper's accept set narrower than serNull's; it must include reflect.Chan
+// and reflect.Func so the two match exactly.
 func TestMatrix_EncodeNullParity2BranchNilChanFunc(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -14146,27 +14109,25 @@ type (
 )
 
 // TestMatrix_ArrayElementSwitchMatchesGeneral is the ARRAY sibling of
-// TestMatrix_MapValueSwitchMatchesGeneral. The map net crosses the Go
-// type's DEFINEDNESS — builtin value type against a defined one — over
-// every primitive; the array nets never did, so every array cell in the
-// suite handed the decoder a builtin slice of a builtin element and took
-// the native loop. The reflect-typed fallback loop, which is what a
-// defined slice or a defined element routes to, ran for no primitive: for
-// the two whose element setter is a closure rather than a method value
-// (int and float) that is directly visible as an unexecuted loop body.
+// TestMatrix_MapValueSwitchMatchesGeneral. The map net crosses the Go type's
+// DEFINEDNESS — builtin value type against a defined one — over every primitive;
+// the array nets never did, so every array cell handed the decoder a builtin
+// slice of a builtin element and took the native loop. The reflect-typed
+// fallback, which a defined slice or defined element routes to, ran for no
+// primitive; for the two whose element setter is a closure rather than a method
+// value (int and float) that is visible as an unexecuted loop body.
 //
-// The axis is the destination SHAPE, and it has three values per
-// primitive, each selected by a different test in the decoder:
+// The axis is the destination SHAPE, three values per primitive, each selected
+// by a different test in the decoder:
 //
 //	builtin-slice   []int32       native loop
 //	defined-slice   nsInt32       reflect loop (the slice type is not []int32)
 //	defined-elem    []fpInt32     reflect loop (the element type is not int32)
 //
-// The oracle is cross-shape agreement on both wires: every shape must
-// encode to the same bytes and decode to the same values as the builtin
-// one. Float carries a signaling-NaN payload, so a shape that routes
-// through a float64 round-trip is caught by the bits rather than by ==,
-// which cannot see a quieted NaN at all.
+// The oracle is cross-shape agreement on both wires: every shape must encode to
+// the same bytes and decode to the same values as the builtin one. Float carries
+// a signaling-NaN payload, so a shape routing through a float64 round-trip is
+// caught by the bits rather than by ==, which cannot see a quieted NaN.
 func TestMatrix_ArrayElementSwitchMatchesGeneral(t *testing.T) {
 	const snan = uint32(0x7f800001)
 	f := math.Float32frombits(snan)
@@ -16831,30 +16792,21 @@ func TestCustomTypeDecodeIntIntoAny(t *testing.T) {
 	}
 }
 
-// TestMatrix_DecodeJSONFillsDefaultThroughCustomDecoder locks in that
-// DecodeJSON applies a registered CustomType.Decode to a record field's
-// default value when the field is absent from the JSON input — matching
-// the binary side, where the field's pre-encoded defaultBytes roundtrip
-// through the same wrapped deserRecord.fields[i].fn as a present field's
-// wire bytes.
+// TestMatrix_DecodeJSONFillsDefaultThroughCustomDecoder locks that DecodeJSON
+// applies a registered CustomType.Decode to a record field's default when the
+// field is absent — matching binary, where the pre-encoded defaultBytes
+// round-trip through the same wrapped deserRecord.fields[i].fn as a present
+// field's wire bytes.
 //
-// Without this, applyFieldDefault dispatched through the unwrapped
-// node.fields[idx].node.deser (built before applyCustomTypes installed
-// the chain), bypassing CustomType.Decode and surfacing the raw
-// Avro-native value (int64 for a long-backed money type) directly into
-// a target Go type that expects the user's custom domain type — failing
-// with "cannot use X with Avro type Y" on any DecodeJSON of an empty or
-// partially-omitted record into a typed struct/typed-map whose field
-// type is the user's custom type.
+// Without it, applyFieldDefault dispatched through the UNWRAPPED
+// node.fields[idx].node.deser, built before applyCustomTypes installed the
+// chain, so the raw Avro-native value (int64 for a long-backed money type)
+// reached a target expecting the user's domain type — "cannot use X with Avro
+// type Y" on any DecodeJSON of a partially-omitted record.
 //
-// Sub-tests cover the three iterateRecordFields entry points:
-//   - into_struct: *struct → decodeRecordStruct → applyFieldDefault.
-//   - into_any: *any → decodeRecordAny.
-//   - into_map_string_any: *map[string]any → decodeRecordMap (any-typed elem).
-//
-// Each sub-test pairs JSON-decode with the binary-roundtrip equivalent
-// and asserts both produce the same user-domain Go value so the parity
-// guarantee survives schema/codec changes.
+// Subtests cover the three iterateRecordFields entry points (struct, any,
+// map[string]any) and each pairs the JSON decode with its binary round-trip
+// equivalent, asserting the same user-domain value.
 func TestMatrix_DecodeJSONFillsDefaultThroughCustomDecoder(t *testing.T) {
 	s := parseMoney(t, `{"type":"record","name":"R","fields":[
 		{"name":"price","type":{"type":"long","logicalType":"money"},"default":42}

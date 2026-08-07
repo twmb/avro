@@ -1643,27 +1643,22 @@ func TestDefaultValidationErrors(t *testing.T) {
 	}
 }
 
-// TestFieldLevelLogicalType_RoundTrip exercises the Java/JDBC Avro idiom
-// where the `logicalType` annotation (and, for decimal, `precision`/
-// `scale`) sits as a sibling of `type` on the field object rather than
-// nested inside the type definition. Apache Avro JIRA AVRO-2015 and
-// AVRO-3014 document this as "a common error" users make; the Java
-// reference impl detects and warns (Schema.java:1874, AVRO-3014 fix
-// commit 72654bf73c, Feb 2021) but does not lift. The form is widely
-// emitted by hand-written .avsc files, older Java tooling, and tutorial
-// code; Confluent's production kafka-connect-avro-converter
-// (AvroData.java) does NOT emit this shape — it puts logicalType on the
-// type object, producing canonical nested form. The on-wire encoding is
-// identical between the two; only the JSON layout differs, so lifting
-// is a strict superset of the spec-blessed behaviour.
+// TestFieldLevelLogicalType_RoundTrip exercises the Java/JDBC Avro idiom where
+// the `logicalType` annotation (and, for decimal, `precision`/`scale`) sits as a
+// sibling of `type` on the field object rather than nested inside the type
+// definition. AVRO-2015 and AVRO-3014 document this as "a common error" users
+// make; the Java reference detects and warns (Schema.java:1874, fix 72654bf73c)
+// but does not lift. The form is widely emitted by hand-written .avsc files,
+// older Java tooling, and tutorial code; Confluent's
+// kafka-connect-avro-converter does NOT emit it. The on-wire encoding is
+// identical between the two — only the JSON layout differs — so lifting is a
+// strict superset of the spec-blessed behavior.
 //
-// Each case constructs a strongly-typed Go value, encodes through the
-// flat-form schema, and decodes back through the same schema. Before
-// the lift, encoding a `time.Time` (or `time.Duration` etc.) against a
-// flat-form schema produced "avro: field x: cannot use <Go type> with
-// Avro type long/int/string" because the parser dropped the field-level
-// annotation and built a plain-primitive schema. After the lift the
-// schema knows the field is logical and the round-trip succeeds.
+// Each case encodes a strongly-typed Go value through the flat-form schema and
+// decodes back through the same schema. Before the lift, encoding a time.Time
+// against a flat-form schema produced "cannot use <Go type> with Avro type
+// long/int/string" because the parser dropped the field-level annotation and
+// built a plain-primitive schema.
 func TestFieldLevelLogicalType_RoundTrip(t *testing.T) {
 	// Each case asserts a schema parses successfully and that an encode/
 	// decode round-trip via the schema produces the expected Go-side type
@@ -4052,8 +4047,8 @@ func TestRegression_RootQuotedFixedSize(t *testing.T) {
 	}
 }
 
-// TestMatrix_SchemaNodeWalkBudgetBattery is THE consolidated DoS battery for
-// the SchemaNode→JSON metadata walk reached via the public SchemaNode.Schema()
+// TestMatrix_SchemaNodeWalkBudgetBattery is THE consolidated DoS battery for the
+// SchemaNode→JSON metadata walk, reached via the public SchemaNode.Schema()
 // (dedup path, d != nil, errors) and the bare toJSON() SchemaFor reaches via a
 // hand-built CustomType.Schema (d == nil, truncates). The walk has THREE
 // independently-unbounded axes, and a hand-built node drives cost through every
@@ -4061,25 +4056,21 @@ func TestRegression_RootQuotedFixedSize(t *testing.T) {
 //
 //   - DEPTH (maxSchemaJSONDepth): the longest container PATH. Unbounded → the
 //     fixup walk or json.Marshal overflows the goroutine stack uncatchably.
-//   - NODES (maxSchemaJSONNodes): the COUNT of emitted JSON nodes (objects,
-//     array elements, every enum symbol and alias). Unbounded → a shared-
-//     reference DAG, tiny in memory, fans out into a 2^depth tree.
-//   - BYTES (maxSchemaJSONBytes): the SIZE of every emitted scalar payload
-//     (type/name/namespace/doc/.../symbols/aliases strings, Props keys, string/
-//     []byte values). Unbounded → a huge or widely-shared string/slice — stored
-//     by reference, invisible to the node count, re-expanded by json.Marshal —
-//     blows the output past memory while the node count stays tiny.
+//   - NODES (maxSchemaJSONNodes): the COUNT of emitted JSON nodes. Unbounded → a
+//     shared-reference DAG, tiny in memory, fans out into a 2^depth tree.
+//   - BYTES (maxSchemaJSONBytes): the SIZE of every emitted scalar payload.
+//     Unbounded → a huge or widely-shared string/slice, stored by reference and
+//     invisible to the node count, blows the output past memory while the node
+//     count stays tiny.
 //
-// Five prior rounds each dribbled ONE bound here (structural depth 46d4dde,
-// value depth 7f13cf9, typed-value depth 01b0b32, node fan-out 885e132, dedup
-// conflict-marshal e76cd84) — a process failure. This battery drives the whole
-// surface at once: a later schema_node-walk DoS find is expected to EXTEND it
-// (proving the enumeration here was incomplete), not to be bounded from scratch
-// in a fresh one-off test. Every cell isolates ONE hostile payload to ONE charge
-// site (everything else tiny) and asserts the bound-specific message — which no
-// other code emits (see grep in schema_node.go) — so a cell cannot pass on an
-// unrelated Parse error and a removed charge turns exactly its cell red. Boundary
-// cells pin that a usable schema is never false-rejected.
+// Five prior rounds each dribbled ONE bound here (46d4dde, 7f13cf9, 01b0b32,
+// 885e132, e76cd84) — a process failure. This drives the whole surface at once:
+// a later schema_node-walk DoS find is expected to EXTEND it, not to be bounded
+// from scratch in a fresh one-off. Every cell isolates ONE hostile payload to
+// ONE charge site and asserts the bound-specific message — which no other code
+// emits — so a cell cannot pass on an unrelated Parse error and a removed charge
+// turns exactly its cell red. Boundary cells pin that a usable schema is never
+// false-rejected.
 func TestMatrix_SchemaNodeWalkBudgetBattery(t *testing.T) {
 	wantBytes := fmt.Sprintf("supported %d bytes", maxSchemaJSONBytes)
 	wantNodes := fmt.Sprintf("supported %d nodes", maxSchemaJSONNodes)
@@ -6234,31 +6225,29 @@ func setNonZeroForTest(name string, fv reflect.Value) bool {
 
 // The caller-COMPOSED and caller-EDITED SchemaNode matrix.
 //
-// Every other node matrix drives the tree one direction: text → Parse →
-// Root() → rebuild, compared against the parse. Two input shapes are outside
-// that loop entirely and are the ones a caller actually writes:
+// Every other node matrix drives the tree one direction: text → Parse → Root() →
+// rebuild, compared against the parse. Two input shapes are outside that loop
+// and are the ones a caller actually writes:
 //
 //   - HAND-BUILT: a SchemaNode the caller assembled, whose field combinations
 //     Parse can never produce (a stray Symbols on an int, a Size on a map).
-//   - EXTRACTED-THEN-EDITED: sub := s.Root().Fields[i].Type, then a write to
-//     an exported field. The struct copy carries hidden state — the
-//     name-reference stamp — so the edit and the stamp can disagree, and the
-//     node splices a definition that never sees the edit.
+//   - EXTRACTED-THEN-EDITED: sub := s.Root().Fields[i].Type, then a write to an
+//     exported field. The struct copy carries hidden state — the name-reference
+//     stamp — so the edit and the stamp can disagree, and the node splices a
+//     definition that never sees the edit.
 //
-// The cross is {hand-built, extracted-unedited, extracted-edited} × {every
-// exported field} × {Schema, String, Canonical, Fingerprint, JSON}, over
-// structures that include the shapes a flat schema cannot exercise: a
-// RECURSIVE definition (the reference reaches back through the extraction
-// point) and a DIAMOND (two records referencing one definition that lives
-// inside a third). A flat schema only ever exercises a type as a DEFINITION;
-// these exercise the second-occurrence REFERENCE path, which is where the
+// The cross is {hand-built, extracted-unedited, extracted-edited} x {every
+// exported field} x {Schema, String, Canonical, Fingerprint, JSON}, over
+// structures including the shapes a flat schema cannot exercise: a RECURSIVE
+// definition and a DIAMOND. A flat schema only ever exercises a type as a
+// DEFINITION; these exercise the second-occurrence REFERENCE path, where the
 // stamp lives.
 //
-// What every cell asserts: a value or a NAMED error, never a panic, and
-// never a silent drop. Which of those a cell is entitled to is read off the
-// two classification tables the predicates are derived from
-// (bareEmissionFieldRules, nameRefSpliceFieldRules), so a field added to
-// SchemaNode later cannot be silently absent from this cross either.
+// Every cell asserts a value or a NAMED error, never a panic and never a silent
+// drop. Which of those a cell is entitled to is read off the two classification
+// tables the predicates derive from (bareEmissionFieldRules,
+// nameRefSpliceFieldRules), so a field added to SchemaNode later cannot be
+// silently absent from this cross either.
 
 // callerNodeStructure is one enclosing schema plus the coordinates of a
 // name-REFERENCE node inside it — the node whose Schema() must splice.
@@ -6704,43 +6693,41 @@ func sortedStrings(in []string) []string {
 // ---------- caller_value_structure_test.go ----------
 
 // ---------------------------------------------------------------------------
-// Caller-supplied VALUE domain × STRUCTURE.
+// Caller-supplied VALUE domain x STRUCTURE.
 //
-// Two nets already exist on either side of this cross and neither spans it. The
+// Two nets exist on either side of this cross and neither spans it. The
 // caller-node matrix drives which FIELD a caller writes across every structure
-// (second occurrence, forward reference, recursive, diamond, cache cross-parse)
 // but writes one ORDINARY value into each. The tree-value census drives the
 // hostile Go value domain — erroring marshalers, cycles, non-string map keys,
 // unmarshalable kinds — but at ONE flat position.
 //
-// The untested claim is that they compose: that a value which fails cleanly at
-// a flat node also fails cleanly when the node it sits on is a stamped
-// reference about to be spliced, a definition inside a recursive cycle, or one
-// arm of a diamond. Those paths do extra work with the node — merging props
-// onto a spliced definition, walking a visited set, comparing bodies for a
-// dedup conflict — and that work runs BEFORE any marshal error surfaces.
+// The untested claim is that they compose: that a value failing cleanly at a
+// flat node also fails cleanly when the node it sits on is a stamped reference
+// about to be spliced, a definition inside a recursive cycle, or one arm of a
+// diamond. Those paths do extra work with the node — merging props onto a
+// spliced definition, walking a visited set, comparing bodies for a dedup
+// conflict — and that work runs BEFORE any marshal error surfaces.
 //
 // The oracle is ABSOLUTE, and it has to be. An earlier version asserted only
-// no-panic plus verdict-class AGREEMENT across the members, which is a relative
-// property that any uniform change satisfies: removing the bad-map-key guard
-// flipped two values reject->accept at every member INCLUDING the flat baseline,
-// so the verdicts still agreed and the net stayed green while the map-key
-// regression pin red through the same neuter. A baseline that is a member of the
-// agreement set is not an anchor.
+// no-panic plus verdict-class AGREEMENT across the members, which any uniform
+// change satisfies: removing the bad-map-key guard flipped two values
+// reject->accept at every member INCLUDING the flat baseline, so the verdicts
+// still agreed and the net stayed green while the map-key regression pin red
+// through the same neuter. A baseline that is a member of the agreement set is
+// not an anchor.
 //
 // So each value carries an EXPECTED verdict derived from an authority outside
-// this package. For almost all of them that authority is executed rather than
-// written down: the package emits caller values through encoding/json, so
-// whether json.Marshal accepts the value decides whether it can reach the wire
-// at all, and the expectation is computed per cell by calling it. Two values
-// have a documented package rule that overrides the stdlib, and each says so —
-// non-finite floats, which a documented fixup rewrites into JSON-expressible
-// form, and a deeply nested value, which the documented walk budget refuses
-// even though the stdlib would marshal it.
+// this package, and for almost all of them that authority is executed rather
+// than written down: the package emits caller values through encoding/json, so
+// whether json.Marshal accepts the value decides whether it can reach the wire,
+// and the expectation is computed per cell by calling it. Two values have a
+// documented package rule that overrides the stdlib and each says so —
+// non-finite floats, which a documented fixup rewrites, and a deeply nested
+// value, which the documented walk budget refuses.
 //
 // Agreement across structures is kept as a SECOND assertion, because it catches
-// something the absolute one cannot: a verdict that depends on which structure
-// the value sits in.
+// what the absolute one cannot: a verdict that depends on which structure the
+// value sits in.
 // ---------------------------------------------------------------------------
 
 type cvErrMarshaler struct{}
@@ -8715,42 +8702,31 @@ func TestMatrix_TreeValueMapKeyShapes(t *testing.T) {
 
 // ---------- matrix_alias_resolution_test.go ----------
 
-// TestMatrix_AliasResolutionCensus crosses reader-alias spelling × writer
-// namespace × named kind × match site × API over the resolution matchers
-// (namesMatch for a direct writer/reader pair, kindsMatchTier for reader-
-// union branch selection; Resolve routes through CheckCompatibility, both
-// APIs asserted per cell).
+// TestMatrix_AliasResolutionCensus crosses reader-alias spelling x writer
+// namespace x named kind x match site x API over the resolution matchers
+// (namesMatch for a direct writer/reader pair, kindsMatchTier for reader-union
+// branch selection; Resolve routes through CheckCompatibility, both APIs
+// asserted per cell). The executed fastavro arm lives in
+// matrix_alias_differential_test.go; Java citations are given where the two
+// references disagree.
 //
-// The alias-matching semantics, per cell family (the executed fastavro arm
-// lives in matrix_alias_differential_test.go; Java citations are given for
-// the cells where the two references disagree):
-//
-//   - an alias always matches the writer's exact FULLNAME. Aliases are
-//     stored fully qualified — a bare alias qualifies into the reader
-//     type's own namespace, a dotted alias stays verbatim, and a single
-//     leading dot is the null-namespace escape (".Old" is the fullname
-//     "Old"; Java's Name constructor rule, Schema.java ~1455, the same
-//     rule qualifyAliases applies) — so the exact tier covers the
+//   - an alias always matches the writer's exact FULLNAME. Aliases are stored
+//     fully qualified — a bare alias qualifies into the reader type's own
+//     namespace, a dotted alias stays verbatim, and a single leading dot is the
+//     null-namespace escape (Java's Name constructor rule, Schema.java ~1455,
+//     the same rule qualifyAliases applies) — so the exact tier covers the
 //     same-namespace bare cell and both dotted cells.
-//
-//   - an alias DECLARED without any dot additionally short-name-matches
-//     the writer's unqualified name in ANY namespace. This is fastavro's
-//     raw-string tier (match_schemas: `w_unqual_name in r_aliases`,
-//     executed in the differential); Java has no short tier (applyAliases
-//     renames through a fullname-keyed Name map, Schema.java ~2093), and
-//     the permissive reference wins for a safely-decodable value.
-//
-//   - an explicitly-qualified alias NEVER short-matches: the spec
-//     ("Aliases") gives a type named "a.b" with aliases "c" and "x.y" the
-//     fully qualified alias names "a.c" and "x.y" — "n1.Old" denotes
-//     exactly n1.Old. Both references reject the foreign-namespace pair
-//     (Java: fullname-keyed map; fastavro: raw-string comparison finds
-//     neither the writer fullname nor its short name among the aliases).
-//
+//   - an alias DECLARED without any dot additionally short-name-matches the
+//     writer's unqualified name in ANY namespace. This is fastavro's raw-string
+//     tier (match_schemas, executed in the differential); Java has no short tier
+//     (applyAliases renames through a fullname-keyed map, Schema.java ~2093),
+//     and the permissive reference wins for a safely-decodable value.
+//   - an explicitly-qualified alias NEVER short-matches: the spec gives a type
+//     named "a.b" with aliases "c" and "x.y" the fully qualified names "a.c" and
+//     "x.y". Both references reject the foreign-namespace pair.
 //   - the leading-dot spelling matches ONLY the null-namespace writer
-//     (Java-aligned; fastavro keeps the alias verbatim and matches
-//     nothing — the documented divergence, recorded in NOT_BUGS with the
-//     executed evidence).
+//     (Java-aligned; fastavro keeps the alias verbatim and matches nothing — the
+//     documented divergence, recorded in NOT_BUGS with the executed evidence).
 func TestMatrix_AliasResolutionCensus(t *testing.T) {
 	writerName := map[string]string{"samens": "n1.Old", "foreignns": "n2.Old", "nullns": "Old"}
 	aliasSpelling := map[string]string{
@@ -13096,43 +13072,38 @@ func TestInvariant_EveryMinBytesEntryPointIsBounded(t *testing.T) {
 
 // ---------- the WIDTH axis ----------
 
-// dagWideSCC crosses the cyclic shapes with the axis the other cost cells
-// hold constant: how many children ONE node has.
+// dagWideSCC crosses the cyclic shapes with the axis the other cost cells hold
+// constant: how many children ONE node has.
 //
-// dagSingleSCC and dagSelfRecursive fix fan at 2 or 3 because fan is what
-// drives DEPTH — the number of distinct root-to-leaf paths — so every cyclic
-// cell measures the visit allowance times two. But the work a single node
-// costs is its own child count, and that is a SECOND number the schema author
-// picks independently. This shape separates them: the chain stays fan-narrow
-// so the path count still exhausts the allowance, and the record every path
-// ENDS at carries `width` extra fields, so each recomputation of that one
-// record pays `width`.
+// dagSingleSCC and dagSelfRecursive fix fan at 2 or 3 because fan is what drives
+// DEPTH — the number of distinct root-to-leaf paths — so every cyclic cell
+// measures the visit allowance times two. But the work a single node costs is
+// its own child count, a SECOND number the schema author picks independently.
+// This shape separates them: the chain stays fan-narrow so the path count still
+// exhausts the allowance, and the record every path ENDS at carries `width`
+// extra fields, so each recomputation of that one record pays `width`.
 //
-// Three properties decide whether this shape measures anything at all, and
-// each was MEASURED at a matched text size of ~124 KB rather than reasoned
-// about — the whole point being that a plausible-looking variant of this
-// schema costs milliseconds and proves the opposite of what it looks like:
+// Three properties decide whether this shape measures anything at all, each
+// MEASURED at a matched text size of ~124 KB rather than reasoned about — the
+// point being that a plausible-looking variant costs milliseconds and proves the
+// opposite of what it looks like:
 //
-//   - CYCLIC, and that is the enabling one: the wide record closes back to L0,
-//     so every node in the chain is in one strongly-connected component and
-//     nothing is memoizable. Point that back-edge at "int" instead and the
-//     same 124 KB parses in 10.7 ms rather than 6.5 s — 600x — because the
-//     memo then answers each node once and there is no repetition for the
-//     width to multiply.
-//   - CONCENTRATED, and that is the dominant one: a node is recomputed once
-//     per path that reaches it, so revisits are highest at the node every
-//     root-to-leaf path ENDS at. Putting the whole width there is what makes
-//     the most-revisited node also the widest. Spreading the same total width
-//     evenly over the levels instead costs 435 ms against 6.5 s — 15x — since
-//     the allowance is spent on computations, and spreading width over D
-//     levels makes each computation cost width/D.
-//   - ZERO-MINIMUM fillers (`null`), worth 3x on top of the other two (6.5 s
-//     vs 2.2 s for `double`). Not, as it first appears, because a wide record
-//     saturates its own running sum — 4000 doubles is 32000, far under the
-//     ceiling — but because the CHAIN above it doubles that figure per level
-//     and reaches the ceiling a dozen levels up, and a saturated sum returns
-//     EARLY, before the field that continues the fan-out. Nulls keep every
-//     level's minimum small enough that no level short-circuits.
+//   - CYCLIC, the enabling one: the wide record closes back to L0, so every node
+//     in the chain is in one strongly-connected component and nothing is
+//     memoizable. Point that back-edge at "int" and the same 124 KB parses in
+//     10.7 ms rather than 6.5 s — 600x — because the memo then answers each node
+//     once.
+//   - CONCENTRATED, the dominant one: a node is recomputed once per path
+//     reaching it, so revisits peak at the node every path ENDS at. Spreading
+//     the same total width evenly over the levels costs 435 ms against 6.5 s —
+//     15x — since spreading width over D levels makes each computation cost
+//     width/D.
+//   - ZERO-MINIMUM fillers (`null`), worth 3x on top (6.5 s vs 2.2 s for
+//     `double`). Not because a wide record saturates its own running sum — 4000
+//     doubles is 32000, far under the ceiling — but because the CHAIN above it
+//     doubles that figure per level and reaches the ceiling a dozen levels up,
+//     and a saturated sum returns EARLY, before the field that continues the
+//     fan-out.
 func dagWideSCC(levels, fan, width int) string {
 	var wide strings.Builder
 	wide.WriteString(`{"type":"record","name":"W","fields":[{"name":"back","type":"L0"}`)
@@ -13517,41 +13488,37 @@ func manyContainersMinimalWire(narrays, levels int) []byte {
 //
 //	containers x paths-per-walk x children-per-node,
 //
-// and a bound that caps any single factor leaves the rest to multiply. Three
-// consecutive fixes each capped ONE factor of that one walk (the paths, then the
-// children, then the containers) before the shape was seen whole. The lesson is
-// not about that walk: it is that EVERY budgeted walk in the package needs its
-// cost written as a product and needs one bound that caps the product rather
-// than a factor.
+// and a bound capping any single factor leaves the rest to multiply. Three
+// consecutive fixes each capped ONE factor of that one walk before the shape was
+// seen whole. The lesson is not about that walk: EVERY budgeted walk in the
+// package needs its cost written as a product and one bound that caps the
+// product rather than a factor.
 //
-// This file is that enumeration, made executable. budgetedWalks is the registry:
-// one row per walk, naming the state it carries, what it traverses, the factors
-// of its cost, and the single bound that caps their product. The guards below
-// DERIVE the walk set from source two ways and fail when a walk appears that is
-// not rowed — so a fourth factor, or a wholly new walk, cannot land without a
-// cost expression:
+// budgetedWalks is the registry: one row per walk, naming the state it carries,
+// what it traverses, the factors of its cost, and the single bound capping their
+// product. The guards DERIVE the walk set from source two ways and fail when a
+// walk appears that is not rowed, so a fourth factor or a wholly new walk cannot
+// land without a cost expression:
 //
-//   - by COST MARKER: a walk that carries an allowance, a walkBudget, a
+//   - by COST MARKER: a walk carrying an allowance, a walkBudget, a
 //     (reader,writer) pair memo, a visited/seen set over a graph node type, or a
-//     defer-delete cycle mark. These are the states that bound a graph walk, and
-//     every occurrence must belong to a rowed walk or an allow-listed non-walk.
-//   - by RECURSION: a function that recurses over the schema graph
-//     (*schemaNode / *SchemaNode). These are the walks themselves, marker or not,
-//     so a new one with no cost state at all is still caught.
+//     defer-delete cycle mark — the states that bound a graph walk.
+//   - by RECURSION: a function that recurses over the schema graph, marker or
+//     not, so a new walk with no cost state at all is still caught.
 //
-// The discriminator that decides whether a bound is enough is WHAT the walk
+// The discriminator deciding whether a bound is enough is WHAT the walk
 // traverses:
 //
 //   - schemaDAG: the shared *schemaNode/*SchemaNode graph, where a named type
 //     referenced twice is one node on two paths. Depth cannot bound this (the
 //     fan-out is reachable flat); only a MEMO over the nodes, or a BUDGET over
 //     the work, caps the paths factor. Every schemaDAG row must name one.
-//   - goTypeDAG: a reflect.Type graph. Same DAG shape, but the type is fixed at
-//     COMPILE time and its result is amortized by a per-type sync.Map, so the
-//     bound is that it is not attacker-grown at runtime (see G3).
+//   - goTypeDAG: a reflect.Type graph. Same shape, but fixed at COMPILE time and
+//     amortized by a per-type sync.Map, so the bound is that it is not
+//     attacker-grown at runtime (see G3).
 //   - valueTree / wire / textTree: a caller VALUE, the wire bytes, or the schema
 //     TEXT — none of which shares sub-structure, so node count IS input size and
-//     a depth cap plus the input length bounds the walk. No product hides here.
+//     a depth cap plus the input length bounds the walk.
 
 type walkClass string
 
@@ -14441,36 +14408,30 @@ func wantCostDoesNotScale(t *testing.T, fn, label string, build func(n int) func
 	}
 }
 
-// costGenerators derives the cost-generator vocabulary BY SHAPE, and returns
-// it with the file each was found in.
+// costGenerators derives the cost-generator vocabulary BY SHAPE, and returns it
+// with the file each was found in.
 //
-// A cost generator is a function that turns a caller-chosen MAGNITUDE into
-// AVRO SCHEMA TEXT: at least one int parameter, exactly one string result, and
-// a body that writes an Avro `type` key. All three conditions are structural.
-// The `type` key is what separates a schema builder from an integer formatter
-// of the same signature — there are several of those, and they drive nothing.
+// A cost generator is a function that turns a caller-chosen MAGNITUDE into AVRO
+// SCHEMA TEXT: at least one int parameter, exactly one string result, and a body
+// that writes an Avro `type` key. All three are structural. The `type` key is
+// what separates a schema builder from an integer formatter of the same
+// signature — there are several of those, and they drive nothing.
 //
-// SCOPE OF THIS DERIVATION, stated because it has one and because the previous
-// three attempts at this class each fixed one level and hand-scoped the next.
-// It reads every *_test.go file of this module, in every package
-// (moduleTestFiles). What it therefore CANNOT see, named rather than left to be
-// discovered:
+// SCOPE, stated because the previous three attempts at this class each fixed one
+// level and hand-scoped the next. It reads every *_test.go file of this module,
+// in every package. What it therefore CANNOT see:
 //
-//   - a magnitude that reaches production as something other than schema text
-//     — a []byte wire builder, a reflect.Type, a hand-built *schemaNode. Those
-//     are cost drivers this predicate does not match, and three of the value
-//     oracles rowed below are exactly that shape.
-//   - a generator that composes schema text without ever writing a `type` key
-//     itself, by delegating every fragment to a helper.
-//   - a magnitude spelled as a package-level constant with no int parameter at
-//     all, which is a generator of ONE size and so cannot drive a factor.
-//   - anything outside this module: the Java and fastavro oracle harnesses
-//     under testdata are a different language and a different module.
+//   - a magnitude that reaches production as something other than schema text —
+//     a []byte wire builder, a reflect.Type, a hand-built *schemaNode. Three of
+//     the value oracles rowed below are exactly that shape.
+//   - a generator that composes schema text without writing a `type` key itself.
+//   - a magnitude spelled as a package-level constant with no int parameter,
+//     which is a generator of ONE size and so cannot drive a factor.
+//   - anything outside this module.
 //
 // The guard against the derivation silently collapsing is a floor on what it
 // finds AND a requirement that more than one package is represented — the
-// single-package scope is the specific way the previous version failed, so it
-// is the specific thing asserted.
+// single-package scope is the specific way the previous version failed.
 func costGenerators(t *testing.T, src map[string]string) (map[string]bool, map[string]string) {
 	t.Helper()
 	decl := regexp.MustCompile(`(?m)^func ([A-Za-z_][A-Za-z0-9_]*)\(([^)]*)\) string \{`)
@@ -15090,28 +15051,24 @@ func TestMatrix_WalkBudgetMapKeyMatchesJSONKeyResolver(t *testing.T) {
 
 // ---------- depth_uniformity_test.go ----------
 
-// This file pins the structural invariant that the recursion bound
-// (errTooDeep / maxDepth) is UNIFORM: for any recursive schema, the
-// SAME nesting depth must trip errTooDeep on every code path —
-// binary encode, binary typed-struct decode, binary decode-into-any,
-// JSON encode, JSON decode — and the safe (reflect) and unsafe
-// (compiled-field) variants must agree.
+// This file pins the structural invariant that the recursion bound (errTooDeep /
+// maxDepth) is UNIFORM: for any recursive schema, the SAME nesting depth must
+// trip errTooDeep on every code path — binary encode, binary typed-struct
+// decode, binary decode-into-any, JSON encode, JSON decode — and the safe
+// (reflect) and unsafe (compiled-field) variants must agree.
 //
-// The bound counts ONE increment per parent→child schema EDGE. A
-// linked-list record `{next:["null",Self], v:int}` has TWO edges per
-// link (record→union, union→record), so it costs 2 depth units per
-// link on every path. A tree `{v:int, kids:array<Self>}` has TWO edges
-// per level (record→array, array→record), so 2 per level. The absolute
-// VALUE (maxDepth) is a deliberate DoS bound; this test does not pin
-// the value, only that the trip depth is IDENTICAL across directions
-// and container shapes.
+// The bound counts ONE increment per parent→child schema EDGE. A linked-list
+// record `{next:["null",Self], v:int}` has TWO edges per link, so it costs 2
+// depth units per link on every path; a tree `{v:int, kids:array<Self>}` has two
+// per level. The absolute VALUE is a deliberate DoS bound; this does not pin the
+// value, only that the trip depth is IDENTICAL across directions and container
+// shapes.
 //
 // Why an oracle with HAND-ASSEMBLED wire rather than an encode→decode
-// round-trip: a round-trip can only feed decode the depth encode
-// produced, so it measures min(encode,decode) and reports a false
-// "uniform" when decode actually accepts deeper than encode (or vice
-// versa). The decode probes below build wire INDEPENDENTLY of the
-// encoder so each direction's true trip depth is observed.
+// round-trip: a round-trip can only feed decode the depth encode produced, so it
+// measures min(encode,decode) and reports a false "uniform" when decode accepts
+// deeper than encode. The decode probes build wire INDEPENDENTLY of the encoder
+// so each direction's true trip depth is observed.
 
 // isTooDeep reports whether err is the recursion-bound error (possibly
 // wrapped by union try-each / record-field error context).
