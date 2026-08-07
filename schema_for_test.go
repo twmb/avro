@@ -1045,9 +1045,8 @@ func TestSchemaForTypeAliasNamedRef(t *testing.T) {
 // once and may be referenced from any record. TestSchemaForTypeAliasNamedRef
 // covers only the same-record case; this covers a named type defined in one
 // record and referenced with the SAME alias from a DIFFERENT nested record
-// reached through every inferType recursion arm. Per-record dedup state
-// spuriously rejected these, the nested record never seeing the earlier
-// application.
+// reached through every inferType recursion arm, which per-record dedup state
+// spuriously rejected.
 func TestSchemaForTypeAliasCrossRecord(t *testing.T) {
 	type Inner struct {
 		Value int32 `avro:"value"`
@@ -1599,15 +1598,14 @@ func TestSchemaForInlineRejectsOtherOptions(t *testing.T) {
 // to reach the regular field-handling code path.
 type InlineScalarAlias string
 
-// TestSchemaForInlineRejectsNonStructFieldType locks the rule that the
-// inline directive requires a struct (or pointer-to-struct) field type.
-// Inline flattens an embedded struct's fields into the parent — on a
-// non-struct field there is no struct to flatten, so the user's tag has
-// no defensible meaning and the prior silent-drop produced a schema in
-// which the field simply disappeared. The rejection rationale mirrors
-// the sibling "inline is incompatible with X" errors: inline has nothing
-// to apply itself to. Covers Go scalar, slice, map, pointer-to-scalar,
-// and anonymous embed of a named non-struct exported type.
+// TestSchemaForInlineRejectsNonStructFieldType locks the rule that the inline
+// directive requires a struct (or pointer-to-struct) field type. Inline flattens
+// an embedded struct's fields into the parent, so on a non-struct field there is
+// no struct to flatten, the user's tag has no defensible meaning, and the prior
+// silent-drop produced a schema in which the field simply disappeared — the
+// rejection mirrors the sibling "inline is incompatible with X" errors. Covers Go
+// scalar, slice, map, pointer-to-scalar, and anonymous embed of a named
+// non-struct exported type.
 func TestSchemaForInlineRejectsNonStructFieldType(t *testing.T) {
 	cases := []struct {
 		name string
@@ -3132,15 +3130,13 @@ func TestRegression_SchemaForDefaultTrailingContentVerbatim(t *testing.T) {
 }
 
 // TestSchemaForRejectsJSONNumber locks the rule that json.Number cannot be a
-// SchemaFor field type. json.Number's Kind() is reflect.String and it
-// implements no text interface, so the Kind switch's String arm would emit
-// an Avro "string" schema — but the package's documented json.Number policy
-// is numeric-only: string/bytes/fixed/enum reject json.Number on both encode
-// and decode. SchemaFor is the package's one builder; emitting the single
-// Avro type its own codec is guaranteed to reject for that Go type is a
-// build-accepts / encode-rejects deferred failure, exactly the shape the
-// uuid/decimal/time SchemaFor strictness eliminated. So SchemaFor rejects
-// json.Number up front, naming the alternatives.
+// SchemaFor field type. json.Number's Kind() is reflect.String and it implements
+// no text interface, so the Kind switch's String arm would emit an Avro "string"
+// schema — but the package's documented json.Number policy is numeric-only, with
+// string/bytes/fixed/enum rejecting it on both encode and decode. SchemaFor is
+// the package's one builder, so emitting the single Avro type its own codec is
+// guaranteed to reject is a build-accepts / encode-rejects deferred failure,
+// exactly the shape the uuid/decimal/time SchemaFor strictness eliminated.
 func TestSchemaForRejectsJSONNumber(t *testing.T) {
 	type Event struct {
 		Seq json.Number `avro:"seq"`
@@ -3251,9 +3247,8 @@ func sampleValuePath(t reflect.Type, onPath map[reflect.Type]bool) reflect.Value
 		// SchemaFor rightly builds for the explicit tag — would then reject the
 		// zero value at Encode, masking a correct schema as a build-accepts/
 		// encode-rejects. A whole-second 2020 time is representable by every
-		// time/date logical (millis/micros/nanos, date, time-of-day) without
-		// overflow or sub-unit truncation. No monotonic reading, UTC location,
-		// so it round-trips identically.
+		// time/date logical without overflow or sub-unit truncation, with no
+		// monotonic reading and a UTC location, so it round-trips identically.
 		return reflect.ValueOf(time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC))
 	}
 	if t == avroDurationType {
@@ -4784,14 +4779,13 @@ func rtShapes() []rtShape {
 
 // ---- tag specs -------------------------------------------------------------
 //
-// "f" is the field name so a missing-name fallback never masks a tag effect.
-// The logical set is applied uniformly: for a leaf whose wire matches it the
-// cell must round-trip; for a leaf whose wire is wrong the cell must REJECT
+// "f" is the field name so a missing-name fallback never masks a tag effect. The
+// logical set is applied uniformly: for a leaf whose wire matches it the cell
+// must round-trip, and for a leaf whose wire is wrong the cell must REJECT
 // (uuid-on-int, decimal-on-bool) — never build a schema the codec then fights.
-// The malformed forms must all reject. omitzero is deliberately absent: it is a
-// runtime encode directive (skip-when-zero) that does not shape the schema, and
-// is netted by omitzero_bsoft_test.go + tag_grammar_runtime_test.go; the only
-// omitzero here is the malformed "-,omitzero" build-reject.
+// omitzero is deliberately absent: it is a runtime encode directive that does not
+// shape the schema, netted by omitzero_bsoft_test.go + tag_grammar_runtime_test.go,
+// so the only omitzero here is the malformed "-,omitzero" build-reject.
 
 type rtTag struct {
 	label string
@@ -7679,14 +7673,13 @@ func TestRegression_EmbedEqualDepthAmbiguity(t *testing.T) {
 
 // A name that a higher-priority field unambiguously OWNS is not an ambiguous
 // collision, even when lower-priority fields collide among themselves at a
-// deeper-or-equal level. SchemaFor must accept such a struct and infer the
-// single winning field, matching the runtime field mapper (typeFieldMapping)
-// and Go's own field promotion — both of which resolve the name. The
-// resolution is DEFERRED: the resolving field may be declared AFTER the
-// colliding pair (the common "embeds first, own fields after" layout), so
-// erroring the instant two deep fields collide wrongly rejects a struct whose
-// name a shallower or tagged field owns. The encode/decode round-trip is the
-// parity oracle: SchemaFor's inferred mapping must match what the codec uses.
+// deeper-or-equal level. SchemaFor must accept such a struct and infer the single
+// winning field, matching the runtime field mapper (typeFieldMapping) and Go's
+// own field promotion. The resolution is DEFERRED: the resolving field may be
+// declared AFTER the colliding pair (the common "embeds first, own fields after"
+// layout), so erroring the instant two deep fields collide wrongly rejects a
+// struct whose name a shallower or tagged field owns. The encode/decode round
+// trip is the parity oracle for SchemaFor's inferred mapping.
 func TestRegression_SchemaForResolvableCollisionNotAmbiguous(t *testing.T) {
 	t.Run("shallower field declared last resolves a deep collision", func(t *testing.T) {
 		type EmbA struct{ Name string } // depth 2, untagged

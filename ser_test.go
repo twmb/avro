@@ -2447,15 +2447,13 @@ type ozValCounter int64
 
 func (c ozValCounter) IsZero() bool { return c == 7 }
 
-// omitzero must honor an IsZero() method regardless of whether its receiver is
-// a value or a pointer (doc.go: "fields whose IsZero() method returns true").
-// A value-typed field whose type has a POINTER-receiver IsZero is addressable
-// when encoding &struct, so (&field).IsZero() is callable; valueIsZero reached
-// only the value method set, silently encoding the value instead of the
-// default/null. The sentinel (7) disagrees with structural zero (0) so both
-// directions are pinned: IsZero()==true omits a structurally-non-zero value,
-// IsZero()==false keeps a structurally-zero value. Covers the reflect, unsafe,
-// and JSON encode paths (all route through valueIsZero).
+// omitzero must honor an IsZero() method regardless of whether its receiver is a
+// value or a pointer (doc.go: "fields whose IsZero() method returns true"). A
+// value-typed field whose type has a POINTER-receiver IsZero is addressable when
+// encoding &struct, so (&field).IsZero() is callable; valueIsZero reached only the
+// value method set, silently encoding the value instead of the default/null. The
+// sentinel (7) disagrees with structural zero (0) so both directions are pinned,
+// and the reflect, unsafe and JSON encode paths all route through valueIsZero.
 func TestMatrix_OmitzeroPointerReceiverIsZero(t *testing.T) {
 	s := MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"f","type":["null","long"],"default":null}]}`)
@@ -2809,13 +2807,12 @@ func TestRegression_MapValueFastPathMatchesGeneral(t *testing.T) {
 // ---------- array_zerobyte_compat_test.go ----------
 
 // TestRegression_ArrayZeroByteProducerCompliance pins producer-side compliance
-// with the decoder's zero-byte-item cap. The decoder rejects an array of more
-// than maxZeroByteItems zero-byte items as a deliberate DoS defense, but the
-// core array ENCODER had no matching check, so s.Encode produced a tiny wire
-// that s.Decode then rejected — a silent self-incompatible round trip. Same
-// class as the OCF zero-byte writer bound: every reader-side cap needs a
-// producer-side compliance check. The encoder now rejects at encode time, and
-// everything at or below the cap still round-trips.
+// with the decoder's zero-byte-item cap. The decoder rejects an array of more than
+// maxZeroByteItems zero-byte items as a deliberate DoS defense, but the core array
+// ENCODER had no matching check, so s.Encode produced a tiny wire that s.Decode
+// then rejected — a silent self-incompatible round trip, the same class as the OCF
+// zero-byte writer bound: every reader-side cap needs a producer-side compliance
+// check. Everything at or below the cap still round-trips.
 func TestRegression_ArrayZeroByteProducerCompliance(t *testing.T) {
 	zeroByteItemSchemas := []struct {
 		label  string
@@ -3073,15 +3070,13 @@ func TestRegression_EmptyBytesDecodeNonNil(t *testing.T) {
 
 // ---------- min_bytes_standin_test.go ----------
 
-// A per-element minimum selects which block-count RULE applies, and the rules
-// are not ordered: zero takes the zero-byte cap, positive takes the
-// buffer-relative bound, and neither is uniformly looser. So the walk may never
-// round a minimum UP when it cannot compute one — reporting 1 for a type whose
-// true minimum is 0 does not loosen the bound, it moves a legitimately
-// zero-byte container onto a rule it cannot satisfy.
-//
-// The walk has two places it cannot compute: an unwired forward reference
-// (nil child) and an exhausted allowance. Both used to report 1.
+// A per-element minimum selects which block-count RULE applies, and the rules are
+// not ordered: zero takes the zero-byte cap, positive takes the buffer-relative
+// bound, and neither is uniformly looser. So the walk may never round a minimum UP
+// when it cannot compute one — reporting 1 for a type whose true minimum is 0 does
+// not loosen the bound, it moves a legitimately zero-byte container onto a rule it
+// cannot satisfy. The walk has two places it cannot compute: an unwired forward
+// reference (nil child) and an exhausted allowance. Both used to report 1.
 
 // standInSCC is a cyclic SCC deep enough that one walk over it exhausts the
 // min-bytes allowance. Defined first and fully wired, so a later container over
@@ -4122,11 +4117,10 @@ func TestInvariant_ClippedMagnitudeStillRejects(t *testing.T) {
 // The tag namespace's TIER SET is derived, not listed.
 //
 // Two consumers read it: findUnionBranch resolves a caller-written name, and
-// fillUnionTagTables builds the binary tagged-map lookup. Both walk
-// unionTagTiers, so neither can grow a tier the other lacks. What remains
-// possible is someone adding a tier by HAND inside one of them, or adding one
-// to the slice that no test ever reaches — and those are what these guards
-// refuse.
+// fillUnionTagTables builds the binary tagged-map lookup. Both walk unionTagTiers,
+// so neither can grow a tier the other lacks. What remains possible is someone
+// adding a tier by HAND inside one of them, or adding one to the slice that no
+// test ever reaches — and those are what these guards refuse.
 // ---------------------------------------------------------------------------
 
 // unionTagTierCount is the number of tiers the suite knows how to reach. It is

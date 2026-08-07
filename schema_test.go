@@ -406,16 +406,13 @@ func TestParseFixedStringSizeRoundTrip(t *testing.T) {
 }
 
 func TestParseFloatDefaultFromString(t *testing.T) {
-	// Java's parseField at Schema.java:1899-1902 coerces TextNode →
-	// DoubleNode when the OUTER fieldSchema.getType() is FLOAT or
-	// DOUBLE directly. Spec 1.12 §"Record" default-values table marks
-	// JSON string as invalid for float/double defaults; the
-	// coercion is a deployed-Java interop carveout. avro-rs and
-	// goavro do not implement it. For UNION outer types the
-	// coercion does NOT fire — the TextNode reaches isValidDefault
-	// (Schema.java:1751-1797) and rejects because no numeric
-	// branch's isNumber()/isIntegralNumber() returns true for a
-	// TextNode. See TestMatrix_UnionDefaultStringMatchesOnlyStringAcceptingBranches.
+	// Java's parseField at Schema.java:1899-1902 coerces TextNode → DoubleNode when
+	// the OUTER fieldSchema.getType() is FLOAT or DOUBLE directly. Spec 1.12
+	// §"Record" default-values table marks JSON string as invalid for float/double
+	// defaults, so the coercion is a deployed-Java interop carveout that avro-rs and
+	// goavro do not implement. For UNION outer types it does NOT fire — the TextNode
+	// reaches isValidDefault (Schema.java:1751-1797) and rejects, no numeric branch's
+	// isNumber()/isIntegralNumber() returning true for a TextNode.
 	tests := []struct {
 		name   string
 		schema string
@@ -2653,14 +2650,13 @@ func TestMatrix_NamedTypeNotPrimitiveName(t *testing.T) {
 	}
 }
 
-// Avro §Aliases: "any string is accepted as an alias" — so a reader can
-// alias its valid name to a writer's illegal/legacy name during evolution.
-// fastavro does no alias validation (observed 1.12.2), and Java stores
-// FIELD aliases as raw strings (Field.addAlias, Schema.java:674-677;
-// its default parser does validate TYPE aliases via NameValidator —
-// Java's own spec divergence). twmb formerly rejected aliases that
-// weren't valid Avro names, breaking interop with schemas the spec
-// blesses. Names themselves stay strictly validated; only aliases relax.
+// Avro §Aliases: "any string is accepted as an alias" — so a reader can alias its
+// valid name to a writer's illegal/legacy name during evolution. fastavro does no
+// alias validation (observed 1.12.2), and Java stores FIELD aliases as raw strings
+// (Field.addAlias, Schema.java:674-677), its default parser validating only TYPE
+// aliases via NameValidator — Java's own spec divergence. twmb formerly rejected
+// aliases that weren't valid Avro names, breaking interop with schemas the spec
+// blesses; names themselves stay strictly validated, only aliases relax.
 func TestMatrix_AliasAcceptsAnyString(t *testing.T) {
 	t.Run("field aliases any string", func(t *testing.T) {
 		for _, alias := range []string{"1stField", "com.example.legacy_x", "weird name!", "has.dots", ""} {
@@ -3758,13 +3754,12 @@ func TestMatrix_SchemaNodeWalkDepthAllChannels(t *testing.T) {
 
 // Depth is not the only unbounded axis: a shared-reference DAG nests SHALLOW yet
 // fans out into a 2^depth tree when serialized, because neither toJSONWalk nor
-// json.Marshal memoizes shared references. The depth bound (which caps the
-// longest PATH) is blind to it — depth 60 here is ~120 allocated nodes but 2^60
-// emitted nodes, which would hang/OOM the process before Schema's eventual Parse
-// runs. The node-count budget bounds the total emitted nodes across the whole
-// walk (structural plus every value), shared so the combined json.Marshal cost
-// stays bounded. This pins the expansion axis on every channel — the cell the
-// three prior depth bounds all missed.
+// json.Marshal memoizes shared references. The depth bound (which caps the longest
+// PATH) is blind to it — depth 60 here is ~120 allocated nodes but 2^60 emitted
+// nodes, which would hang/OOM the process before Schema's eventual Parse runs. The
+// node-count budget bounds the total emitted nodes across the whole walk, shared
+// so the combined json.Marshal cost stays bounded. This pins the expansion axis on
+// every channel — the cell the three prior depth bounds all missed.
 func TestMatrix_SchemaNodeSharedDAGExpansionBounded(t *testing.T) {
 	const fanout = 60 // 2^60 emitted nodes if unbounded; ~120 nodes in memory
 
@@ -5003,14 +4998,12 @@ func TestInvariant_EnumSymbolIndexMatchesTheScan(t *testing.T) {
 }
 
 // resolveSynthesizedNode runs resolution at the NODE level, which is the only
-// place the synthesized nodes are observable.
-//
-// Resolve returns a Schema whose node field is the READER's node and keeps only
-// the resolved tree's deser closure (resolve.go). A check that walks Resolve's
-// result therefore walks the PARSE's output: it would pass with every resolved
-// node built bare, which is what a neuter of the carry proved before this
-// helper existed. Driving resolveNode directly is what makes the assertion
-// below about the nodes it names.
+// place the synthesized nodes are observable. Resolve returns a Schema whose node
+// field is the READER's node and keeps only the resolved tree's deser closure
+// (resolve.go), so a check that walks Resolve's result walks the PARSE's output:
+// it would pass with every resolved node built bare, which is what a neuter of the
+// carry proved before this helper existed. Driving resolveNode directly is what
+// makes the assertion below about the nodes it names.
 func resolveSynthesizedNode(t *testing.T, writer, reader *Schema) *schemaNode {
 	t.Helper()
 	ctx := &resolveCtx{seen: make(map[nodePair]*schemaNode), custom: reader.custom}
@@ -5319,12 +5312,11 @@ func TestNodeRefSchema_HandBuiltStillDangles(t *testing.T) {
 }
 
 // The refTarget stamp is hidden state that survives a struct copy, which is
-// exactly how a caller extracts a sub-node. If the caller then edits the
-// node's exported Type, the stamp is STALE: it still points at whatever the
-// ORIGINAL spelling named. Honoring it would let hidden state silently beat
-// the exported field the caller just set, so the stamp is used only while it
-// still names the node's Type. An edited node behaves hand-built — it
-// resolves against the tree being converted, or dangles loudly.
+// exactly how a caller extracts a sub-node. If the caller then edits the node's
+// exported Type, the stamp is STALE: it still points at whatever the ORIGINAL
+// spelling named, and honoring it would let hidden state silently beat the
+// exported field the caller just set. So the stamp is used only while it still
+// names the node's Type; an edited node behaves hand-built.
 func TestNodeRefSchema_EditedTypeIgnoresStaleStamp(t *testing.T) {
 	const twoNamed = `{"type":"record","name":"R","fields":[
 		{"name":"f","type":{"type":"fixed","name":"Dec","size":8}},
@@ -5876,15 +5868,14 @@ func TestInvariant_BareEmissionCoversEverySchemaNodeField(t *testing.T) {
 }
 
 // presenceOnlyFields names the fields whose content can be entirely INVISIBLE in
-// the field's value: an attribute written as the field's own zero. Each entry is
-// a schema that writes exactly that, and the key the rebuild must still carry.
+// the field's value: an attribute written as the field's own zero. Each entry is a
+// schema that writes exactly that, and the key the rebuild must still carry.
 //
 // This is the half the loop above structurally cannot reach: it populates every
 // field with a NON-ZERO value, the only way it can tell "blocks" from "does not
-// block", so the zero is the axis it holds constant and a node whose only
-// content is presence looks empty to it. reachesCollapse marks the cells whose
-// probe node carries NOTHING but the presence, so the bare-emission shortcut is
-// actually on the path — a cell that does not reach it tests only the emitter.
+// block", so the zero is the axis it holds constant and a node whose only content
+// is presence looks empty to it. reachesCollapse marks the cells whose probe node
+// carries NOTHING but the presence, so the shortcut is actually on the path.
 var presenceOnlyFields = map[string]struct {
 	src             string // a schema whose node carries the attribute written as the zero
 	key             string // the JSON key the rebuild must still carry
@@ -6035,14 +6026,13 @@ var nameRefSpliceFieldRules = map[string]schemaNodeFieldRule{
 }
 
 // The sibling invariant, for the other predicate on the same walk. A stamped
-// name-reference node splices the definition it names in place of itself, so
-// every field the node carries that the splice does not merge is DISCARDED.
+// name-reference node splices the definition it names in place of itself, so every
+// field the node carries that the splice does not merge is DISCARDED.
 // nodeIsNameRefShape decides whether that is allowed, and it too used to be a
-// hand-written list of eight fields, silently discarding the seven it did not
-// name. The probe has to REACH the splice: the stamp must be present (extraction
-// from Root, not a hand-built node), Type must be left alone, and the extracted
-// sub-tree must not define the name locally, since a whole-schema walk never
-// splices.
+// hand-written list of eight fields, silently discarding the seven it did not name.
+// The probe has to REACH the splice: the stamp must be present (extraction from
+// Root, not a hand-built node), Type must be left alone, and the extracted sub-tree
+// must not define the name locally, since a whole-schema walk never splices.
 func TestInvariant_NameRefSpliceCoversEverySchemaNodeField(t *testing.T) {
 	const src = `{"type":"record","name":"Root","namespace":"x.y","fields":[
 		{"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"q","type":"int"}]}},
@@ -6367,16 +6357,14 @@ func TestMatrix_CallerComposedAndEditedNodes(t *testing.T) {
 			s := st.build(t)
 			want := MustParse(st.def)
 
-			// extracted-unedited: the control. The field axis does not apply
-			// — nothing is written — so it runs once per structure, and it is
-			// what proves every "blocked" verdict below is a real change of
-			// outcome rather than a node that never spliced to begin with.
-			//
-			// The precondition is the probe-reaches-the-path check, asserted
-			// rather than assumed: the picked node must BE a stamped bare
-			// reference. A structure whose pick lands on the DEFINITION (the
-			// cache inlines its first occurrence) never splices at all, so
-			// every verdict below would be answering a different question.
+			// extracted-unedited: the control. The field axis does not apply —
+			// nothing is written — so it runs once per structure, and it is what
+			// proves every "blocked" verdict below is a real change of outcome
+			// rather than a node that never spliced to begin with. The precondition
+			// is the probe-reaches-the-path check, asserted rather than assumed: the
+			// picked node must BE a stamped bare reference, since a structure whose
+			// pick lands on the DEFINITION (the cache inlines its first occurrence)
+			// never splices at all.
 			ctrl := st.pick(*s.Root())
 			if !nodeIsNameRefShape(&ctrl) || !nodeRefTargetAgrees(&ctrl) {
 				t.Fatalf("structure %q does not pick a stamped bare reference (Type=%q shape=%v stamp=%v); the probe never reaches the splice",
@@ -6786,10 +6774,9 @@ func cvVerdict(rep surfaceReport) string {
 // Every other exported SchemaNode field is typed, so the hostile domain cannot
 // reach it. Each slot returns THE NODE TO DRIVE, and that return is why the slot
 // is a function rather than a field name: st.pick returns a COPY, exactly as a
-// caller gets, so writing into the picked node and then driving the ROOT
-// exercises nothing at all. The picked slot must be driven on the picked node,
-// which is also the only slot that reaches the splice — a neuter that drops
-// caller props at the splice reds it and nothing else.
+// caller gets, so writing into the picked node and then driving the ROOT exercises
+// nothing at all. The picked slot is also the only one that reaches the splice —
+// a neuter that drops caller props at the splice reds it and nothing else.
 var cvSlots = []struct {
 	name string
 	// typeChecked marks a position whose value is additionally validated
@@ -8903,13 +8890,12 @@ func TestMatrix_AliasResolutionCensus(t *testing.T) {
 // ---------- fingerprint_purity_test.go ----------
 
 // A fingerprint is the digest of a schema's canonical form, so its value must
-// depend on the schema and the algorithm alone. Nothing else a caller did with
-// the hash beforehand may reach the answer: not a previous fingerprint taken
-// with the same hash, and not bytes the caller wrote into it directly.
-//
-// The expectation is not read off Fingerprint. Each cell's oracle is a FRESH
-// hash of the same algorithm fed the schema's canonical form — the definition
-// of the digest, computed without the code under test.
+// depend on the schema and the algorithm alone. Nothing else a caller did with the
+// hash beforehand may reach the answer: not a previous fingerprint taken with the
+// same hash, and not bytes the caller wrote into it directly. The expectation is
+// not read off Fingerprint — each cell's oracle is a FRESH hash of the same
+// algorithm fed the schema's canonical form, the definition of the digest,
+// computed without the code under test.
 func TestFingerprintIsAFunctionOfTheSchemaAlone(t *testing.T) {
 	algos := []struct {
 		name string
@@ -10280,15 +10266,14 @@ func TestRegression_SchemaCacheLocalShadowNotSplicedFromCache(t *testing.T) {
 	}
 }
 
-// TestRegression_SchemaCacheLaxNameStickyNotDangling pins that a type defined
-// with WithLaxNames and referenced by a later strict Parse yields a SELF-
-// CONTAINED metadata form (String/Canonical contain the spliced definition,
-// not a dangling reference), re-parseable WITH WithLaxNames. Lax names are
-// sticky: a schema containing one is not parseable without WithLaxNames whether
-// or not a cache produced it. The strict re-parse used to inline the body then
-// reject the lax NAME, silently falling back to a dangling reference no parser
-// could resolve; the splice now retries permissively so the metadata forms
-// describe the full schema. Encode/Decode are unaffected throughout.
+// TestRegression_SchemaCacheLaxNameStickyNotDangling pins that a type defined with
+// WithLaxNames and referenced by a later strict Parse yields a SELF-CONTAINED
+// metadata form (String/Canonical contain the spliced definition, not a dangling
+// reference), re-parseable WITH WithLaxNames. Lax names are sticky: a schema
+// containing one is not parseable without WithLaxNames whether or not a cache
+// produced it. The strict re-parse used to inline the body then reject the lax
+// NAME, silently falling back to a dangling reference no parser could resolve; the
+// splice now retries permissively. Encode/Decode are unaffected throughout.
 func TestRegression_SchemaCacheLaxNameStickyNotDangling(t *testing.T) {
 	var c SchemaCache
 	mustCacheParse(t, &c, `{"type":"record","name":"bad-name","fields":[{"name":"x","type":"int"}]}`, WithLaxNames(nil))
@@ -10710,16 +10695,14 @@ func TestMatrix_StrayFieldElementRoutes(t *testing.T) {
 	})
 }
 
-// TestInvariant_StrayFieldElementRoutesAreSpanned derives the per-element
-// route set from nodeChildVisitor itself — a callback taking the element
-// INDEX as its first argument is a per-element route, everything else fires
-// once per node — and requires the matrix above to drive each one. It reds
-// in both directions: a route added to the visitor with no cell, and a cell
-// naming a route the visitor no longer has.
-//
-// The route set is what the pins in this area kept proving one member of at
-// a time. Deriving it is the difference between a suite that covers the
-// routes it happens to know about and one that cannot fall behind the code.
+// TestInvariant_StrayFieldElementRoutesAreSpanned derives the per-element route
+// set from nodeChildVisitor itself — a callback taking the element INDEX as its
+// first argument is a per-element route, everything else fires once per node — and
+// requires the matrix above to drive each one. It reds in both directions: a route
+// added to the visitor with no cell, and a cell naming a route the visitor no
+// longer has. That set is what the pins in this area kept proving one member of at
+// a time; deriving it is the difference between a suite that covers the routes it
+// happens to know about and one that cannot fall behind the code.
 func TestInvariant_StrayFieldElementRoutesAreSpanned(t *testing.T) {
 	t.Parallel()
 	vt := reflect.TypeOf(nodeChildVisitor{})
@@ -11279,14 +11262,12 @@ const breadthParseBound = 1500 * time.Millisecond
 // The entry-point axis, derived from the battery's other columns
 //////////////////////////////////////////////////////////////////////////////
 
-// The set of public entry points this column has to cover is not listed here.
-// It is READ OFF the cells the rest of the battery already drives, so an entry
-// point added to any other column arrives here with no breadth cell and fails,
-// rather than being covered by whoever remembers to add it.
-//
-// batteryCellLabel matches a battery cell's name argument. Every cell is
-// named "<entry point>/<case>", which is what makes the entry-point axis
-// recoverable from source.
+// The set of public entry points this column has to cover is not listed here. It
+// is READ OFF the cells the rest of the battery already drives, so an entry point
+// added to any other column arrives here with no breadth cell and fails, rather
+// than being covered by whoever remembers to add it. batteryCellLabel matches a
+// battery cell's name argument; every cell is named "<entry point>/<case>", which
+// is what makes the entry-point axis recoverable from source.
 var batteryCellLabel = regexp.MustCompile(`want(?:Reject|RejectIs|Terminate|BoundedErr|AcceptUnder)\(t, "([^"/]+)`)
 
 // breadthEntryAlias folds the spellings the battery uses for one entry point
@@ -12071,12 +12052,11 @@ var breadthSiblingKinds = []breadthSiblingKind{
 
 // breadthSiblingExempt names schemaNode slice fields with no schema-text length,
 // and why. An exemption is a claim that the field cannot grow with what a caller
-// writes. It is empty today, and that is the honest state rather than an
-// oversight: every slice schemaNode carries is filled from something the schema
-// declares. The map stays because the next slice field added may not be, and an
-// exemption without a reason is how a cell goes missing quietly. Slices on the
-// SERIALIZERS are sized by the branch count and grown by the branches row; they
-// are not schemaNode fields, so the reflection does not read them.
+// writes; it is empty today, and that is the honest state rather than an
+// oversight, since every slice schemaNode carries is filled from something the
+// schema declares. The map stays because the next slice field added may not be,
+// and an exemption without a reason is how a cell goes missing quietly. Slices on
+// the SERIALIZERS are not schemaNode fields, so the reflection does not read them.
 var breadthSiblingExempt = map[string]string{}
 
 // breadthSiblingFieldSet reads every slice-valued schemaNode field out of the
@@ -12608,16 +12588,15 @@ func minBytesNoMemo(n *schemaNode, path map[*schemaNode]bool) int {
 	return 1
 }
 
-// TestInvariant_DagMinBytesIsExactAtScale separates the two mechanisms that
-// bound this walk, which no cost cell can tell apart. The visit budget bounds
-// COST for every shape, including one the memo cannot help with, so with the
-// memo removed the cost cells still pass. What the budget cannot do is answer
-// correctly: past it the walk stops deriving and falls back to a stand-in, so
-// the bound comes back far too loose. The memo is what makes a schema of this
-// size come back with the real number. The expected value is arithmetic on the
-// schema's own definition rather than anything read off this package: every
-// level has `fan` fields of the next and the deepest level's fields are ints, so
-// the minimum is fan^levels.
+// TestInvariant_DagMinBytesIsExactAtScale separates the two mechanisms that bound
+// this walk, which no cost cell can tell apart. The visit budget bounds COST for
+// every shape, including one the memo cannot help with, so with the memo removed
+// the cost cells still pass — what the budget cannot do is answer correctly: past
+// it the walk stops deriving and falls back to a stand-in, so the bound comes back
+// far too loose, and the memo is what makes a schema of this size come back with
+// the real number. The expected value is arithmetic on the schema's own
+// definition: every level has `fan` fields of the next and the deepest level's
+// fields are ints, so the minimum is fan^levels.
 func TestInvariant_DagMinBytesIsExactAtScale(t *testing.T) {
 	cases := []struct {
 		levels, fan int
@@ -12865,26 +12844,24 @@ func TestInvariant_MinBytesCallSites(t *testing.T) {
 	}
 }
 
-// TestInvariant_DagCostMatrixDrivesEveryEntryPoint crosses the derived
-// carrier set with the matrix's own cells, so an entry point that gains a
-// caller cannot stay undriven. It reads the matrix's own source rather than
-// trusting a count: the failure it prevents is a row added to
-// minBytesCallSites with no cell behind it.
+// TestInvariant_DagCostMatrixDrivesEveryEntryPoint crosses the derived carrier set
+// with the matrix's own cells, so an entry point that gains a caller cannot stay
+// undriven. It reads the matrix's own source rather than trusting a count: the
+// failure it prevents is a row added to minBytesCallSites with no cell behind it.
 //
 // It reads the SECTION, not the enclosing file. "cache.Parse(" is one of the
-// cells, and the schema_test.go the matrix now lives in uses that string
-// fifty-six more times outside this section — reading the whole file would
-// keep this guard green with the cell deleted.
+// cells, and the schema_test.go the matrix now lives in uses that string fifty-six
+// more times outside this section — reading the whole file would keep this guard
+// green with the cell deleted.
 func TestInvariant_DagCostMatrixDrivesEveryEntryPoint(t *testing.T) {
 	body := testFileSection(t, "schema_test.go", "schema_dag_cost_test.go")
 
-	// Cut THIS function out of what is searched. The want list below sits
-	// inside the very section being read, so every entry matched itself and
-	// the guard could not go red in any circumstance: renaming all six real
-	// "ocf-header" cells left it green. One entry, "Parse(dag)", never had a
-	// second occurrence at all — it was satisfied only by its own list line,
-	// so it asserted nothing from the day it was written. The wants below are
-	// the cells' LABELS, which is what the matrix actually names them.
+	// Cut THIS function out of what is searched. The want list below sits inside
+	// the very section being read, so every entry matched itself and the guard
+	// could not go red in any circumstance: renaming all six real "ocf-header"
+	// cells left it green, and one entry, "Parse(dag)", never had a second
+	// occurrence at all — it asserted nothing from the day it was written. The
+	// wants below are the cells' LABELS, which is what the matrix names them.
 	if i := strings.Index(body, "func "+t.Name()); i >= 0 {
 		if j := strings.Index(body[i:], "\n}\n"); j >= 0 {
 			body = body[:i] + body[i+j:]
@@ -13147,15 +13124,14 @@ func TestInvariant_MinBytesChargeCoversEveryChildArm(t *testing.T) {
 	}
 }
 
-// TestInvariant_MetadataSurfacesBoundedByWidth is the measured half of an
-// immunity claim rather than a read of it. The SchemaNode->JSON walk carries its
-// own allowance, and the reason it has no width residue is structural: it
-// charges takeNode at the TOP of every entry, ahead of the cycle and dedup
-// checks that can return early, so a child costs a unit whether or not the walk
-// descends through it. The min-bytes walk charged AFTER its memo, which is
-// exactly how a memo hit could examine a child for free. A claim like that is
-// worth no more than the probe behind it, so the same wide cyclic shape is
-// driven through the metadata surfaces here.
+// TestInvariant_MetadataSurfacesBoundedByWidth is the measured half of an immunity
+// claim rather than a read of it. The SchemaNode->JSON walk carries its own
+// allowance, and the reason it has no width residue is structural: it charges
+// takeNode at the TOP of every entry, ahead of the cycle and dedup checks that can
+// return early, so a child costs a unit whether or not the walk descends through
+// it. The min-bytes walk charged AFTER its memo, which is exactly how a memo hit
+// could examine a child for free. A claim like that is worth no more than the
+// probe behind it, so the same wide cyclic shape is driven here.
 func TestInvariant_MetadataSurfacesBoundedByWidth(t *testing.T) {
 	const cell = "TestInvariant_MetadataSurfacesBoundedByWidth"
 	at := func(width int) *Schema {
@@ -13738,12 +13714,11 @@ var sectionBanner = regexp.MustCompile(`(?m)^// -{10} (\S+_test\.go) -{10}$`)
 // orig, i.e. the text between orig's banner and the next file banner.
 //
 // A few guards below derive a claim from ONE file's source. Those files are now
-// sections of larger ones, and reading the whole enclosing file instead would
-// let an unrelated section satisfy the claim: the DAG-cost guard looks for
+// sections of larger ones, and reading the whole enclosing file instead would let
+// an unrelated section satisfy the claim: the DAG-cost guard looks for
 // "cache.Parse(", which its own section uses twice and the rest of schema_test.go
-// uses fifty-six more times. That is a false pass in the direction that matters,
-// so the section is what gets read, and a missing banner is fatal rather than
-// silently the whole file.
+// uses fifty-six more times. So the section is what gets read, and a missing
+// banner is fatal rather than silently the whole file.
 func testFileSection(t *testing.T, file, orig string) string {
 	t.Helper()
 	src := readFile(t, file)
@@ -13762,26 +13737,24 @@ func testFileSection(t *testing.T, file, orig string) string {
 	return ""
 }
 
-// minBytesConstructionSite rows one place the min-bytes walk STATE is
-// constructed — a reaching path of the walk. The walk is one, but a schema
-// reaches it by building a container, finalizing a forward reference, resolving,
-// or compiling a dropped-field skip, and the container FACTOR is bounded only if
-// each of those constructs the walk once per OPERATION and shares it across that
-// operation's containers. A fresh construction per container is the bug the
-// forward/backward split exposed. The `context` is a source substring the
-// construction line must contain, so a construction that drifts to a
-// per-container scope fails to match its row.
+// minBytesConstructionSite rows one place the min-bytes walk STATE is constructed
+// — a reaching path of the walk. The walk is one, but a schema reaches it by
+// building a container, finalizing a forward reference, resolving, or compiling a
+// dropped-field skip, and the container FACTOR is bounded only if each of those
+// constructs the walk once per OPERATION and shares it across that operation's
+// containers; a fresh construction per container is the bug the forward/backward
+// split exposed. The `context` is a source substring the construction line must
+// contain, so a construction that drifts to a per-container scope fails to match.
 type minBytesConstructionSite struct {
 	file    string
 	context string // a substring uniquely identifying the construction line
 	scope   string // what operation the constructed walk is shared across
 	// factors is what this path's ONE walk is shared ACROSS, and every entry
-	// carries the cell that MEASURES it. A row may not state its bound in
-	// prose: a sentence is a claim, and the whole purpose of this census is to
-	// reject claims. The seventh row of this table once read "cross-record cost
-	// is wire-bounded" — true, and it bounded nothing, because reaching a record
-	// costs O(1) wire bytes while draining a full allowance. No cell drove a
-	// record count, so nothing contradicted it.
+	// carries the cell that MEASURES it. A row may not state its bound in prose: a
+	// sentence is a claim, and the whole purpose of this census is to reject claims.
+	// The seventh row of this table once read "cross-record cost is wire-bounded" —
+	// true, and it bounded nothing, because reaching a record costs O(1) wire bytes
+	// while draining a full allowance, and no cell drove a record count.
 	//
 	// Empty only when exempt is set.
 	factors []reachFactor
@@ -13791,15 +13764,14 @@ type minBytesConstructionSite struct {
 	exempt string
 }
 
-// reachFactor is one caller-chosen count a shared walk is spread across, with
-// the cell that drives it.
+// reachFactor is one caller-chosen count a shared walk is spread across, with the
+// cell that drives it.
 //
-// values must hold at least TWO distinct numbers. One value can only ask
-// "does this finish?" — it cannot tell a bound from a cost that is merely
-// linear with a small constant, and it cannot see a factor it never varies.
-// The cell reads its values FROM here rather than from its own constant, so
-// "the cell drives two values" is not a second claim to be checked against the
-// first; it is the same fact read once.
+// values must hold at least TWO distinct numbers. One value can only ask "does
+// this finish?" — it cannot tell a bound from a cost that is merely linear with a
+// small constant, and it cannot see a factor it never varies. The cell reads its
+// values FROM here rather than from its own constant, so "the cell drives two
+// values" is the same fact read once, not a second claim to be checked.
 type reachFactor struct {
 	name   string
 	values []int
@@ -14104,31 +14076,28 @@ type costCell struct {
 	// cross-checks it against whether the cell actually takes the wall-clock
 	// harness, so an exemption cannot be pasted onto a timing cell.
 	exempt string
-	// carrier names what carries this cell's magnitude when it is NOT schema
-	// text. The derivation below finds cells by their calls to a cost
-	// GENERATOR (a func turning an int into schema text), which is the shape
-	// almost every magnitude here takes — but not all of them: a Go type, a
-	// hand-built node, a wire buffer. Those cells cannot be DISCOVERED by that
-	// derivation, so they are rowed by hand and this field is the declaration
-	// that they were. It is the one thing in this registry the source cannot
-	// check for us, which is why it has to be written down rather than
-	// inferred; everything else about such a row (two values, the harness, the
-	// self-naming) is checked exactly as for any other cell.
+	// carrier names what carries this cell's magnitude when it is NOT schema text.
+	// The derivation below finds cells by their calls to a cost GENERATOR (a func
+	// turning an int into schema text), which is the shape almost every magnitude
+	// here takes — but not all: a Go type, a hand-built node, a wire buffer. Those
+	// cells cannot be DISCOVERED by that derivation, so they are rowed by hand and
+	// this field is the declaration that they were. It is the one thing in this
+	// registry the source cannot check for us; everything else about such a row is
+	// checked exactly as for any other cell.
 	carrier string
 	// scaleTol bounds cost(max)/cost(min). Every one of these factors measured
 	// FLAT with a correct bound even where the schema TEXT grows with the factor
 	// (width 80 -> 8000 grows the text 65x and the parse 1.4x, because the walk
 	// dominates and the allowance caps it), so a small tolerance is honest.
 	scaleTol int
-	// floor is the largest cost the BOUND ITSELF permits at the top of the
-	// range, and the limit is max(scaleTol*cost(min), floor). For a cell whose
-	// shapes are all memoizable it is just machine noise. For one that includes
-	// an UN-memoizable shape it is one exhausted allowance (~120ms measured),
-	// because a cyclic subtree cannot be cached and legitimately walks until
-	// maxMinBytesWork stops it — that is the bound ENGAGING, not the cost
-	// scaling, and a cell spanning both regimes has to be judged against the
-	// looser of them. It stays orders of magnitude under an unbounded walk,
-	// which is seconds.
+	// floor is the largest cost the BOUND ITSELF permits at the top of the range,
+	// and the limit is max(scaleTol*cost(min), floor). For a cell whose shapes are
+	// all memoizable it is just machine noise; for one that includes an
+	// UN-memoizable shape it is one exhausted allowance (~120ms measured), because
+	// a cyclic subtree cannot be cached and legitimately walks until maxMinBytesWork
+	// stops it — that is the bound ENGAGING, not the cost scaling, and a cell
+	// spanning both regimes has to be judged against the looser of them. It stays
+	// orders of magnitude under an unbounded walk, which is seconds.
 	floor time.Duration
 }
 
@@ -14152,8 +14121,7 @@ var costCells = []costCell{
 		// entirely leaves this cell green. What it exercises is the Root+Schema
 		// ROUND TRIP, whose last step is a re-Parse of the rendered text, putting
 		// the min-bytes charge on its path — neutering that charge reds it. The
-		// node budget's own cells hand-build the trees Parse cannot express, and
-		// all three red when takeNode stops charging.
+		// node budget's own cells hand-build the trees Parse cannot express.
 		factor: "dagWideSCC WIDTH through the metadata surfaces — Root+Schema (render, marshal, re-Parse), String and Canonical",
 		values: []int{80, 8000}, scaleTol: 4, floor: 400 * time.Millisecond},
 
@@ -14407,14 +14375,12 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 		}
 		return ""
 	}
-	// A cell that takes the wall-clock harness is asserting a COST.
 	// A cell that takes the wall-clock harness is asserting a COST. The set is
-	// every helper that TIMES something; wantAcceptUnder was missing from it,
-	// which is how the one cell driving a generator at a single magnitude
-	// through an absolute ceiling stayed invisible.
-	// time.Since( is in the set because a cell may time inline rather than
-	// through a named helper, and a timing cell that does so is still a timing
-	// cell — leaving it out would let an exemption sit on one.
+	// every helper that TIMES something; wantAcceptUnder was missing from it, which
+	// is how the one cell driving a generator at a single magnitude through an
+	// absolute ceiling stayed invisible. time.Since( is in the set because a cell
+	// may time inline rather than through a named helper, and a timing cell that
+	// does so is still one — leaving it out would let an exemption sit on it.
 	harnesses := []string{"wantTerminate(", "dosRun(", "wantCostDoesNotScale(", "wantAcceptUnder(", "time.Since("}
 	takesHarness := func(code string) bool {
 		for _, h := range harnesses {
@@ -14453,15 +14419,14 @@ func TestInvariant_EveryCostCellDrivesItsFactor(t *testing.T) {
 		if len(seen) < 2 {
 			t.Errorf("%s drives %d distinct value(s) of %q.\nOne value asks only whether the cell finishes, which a cost merely LINEAR in the factor also answers.", fn, len(seen), c.factor)
 		}
-		// The cell has to be tied to its row. A cell in this package READS the row
-		// — it names itself to costFactorValues/wantCostDoesNotScale — so the two
+		// The cell has to be tied to its row. A cell in this package READS the row —
+		// it names itself to costFactorValues/wantCostDoesNotScale — so the two
 		// cannot disagree. A cell in another package cannot reach this registry, so
 		// there the tie is checked the other way round: every value the row claims
 		// must appear as a literal in the cell. That is weaker, but it still fails
-		// when a cell stops driving what its row promises, the direction that turns
-		// a row into false coverage. The discriminator is the PACKAGE, not the
-		// directory: the external avro_test package shares the directory while
-		// being just as unable to reach this registry as ocf is.
+		// when a cell stops driving what its row promises. The discriminator is the
+		// PACKAGE, not the directory: the external avro_test package shares the
+		// directory while being just as unable to reach this registry as ocf is.
 		if pkg := filePackage(src[bodyFile[fn]]); pkg == "avro" {
 			if !strings.Contains(raw, `"`+fn+`"`) {
 				t.Errorf("%s does not name itself to costFactorValues/wantCostDoesNotScale — its magnitudes are not read from its row, so the row and the cell can disagree.", fn)
@@ -14918,14 +14883,12 @@ func TestMatrix_WalkBudgetMapKeyMatchesJSONKeyResolver(t *testing.T) {
 // wrapped by union try-each / record-field error context).
 func isTooDeep(err error) bool { return errors.Is(err, errTooDeep) }
 
-// largestOK returns the largest depth d in [0, hi] for which ok(d)
-// returns (true, nil), requiring that every depth below the first
-// errTooDeep also succeeds and that the failure is exactly errTooDeep
-// (not some unrelated decode/encode error). It walks upward so a
-// non-monotone or non-errTooDeep failure is reported precisely.
-//
-// ok(d) must return (true, nil) on success, (false, errTooDeep-wrapped)
-// at/over the bound. Any other error fails the probe loudly.
+// largestOK returns the largest depth d in [0, hi] for which ok(d) returns (true,
+// nil), requiring that every depth below the first errTooDeep also succeeds and
+// that the failure is exactly errTooDeep (not some unrelated decode/encode error).
+// It walks upward so a non-monotone or non-errTooDeep failure is reported
+// precisely. ok(d) must return (true, nil) on success and (false,
+// errTooDeep-wrapped) at/over the bound; any other error fails the probe loudly.
 func largestOK(t *testing.T, name string, hi int, ok func(d int) error) int {
 	t.Helper()
 	last := -1
@@ -15589,16 +15552,15 @@ func mapArrNUJSON(d int) []byte {
 // The oracle.
 //////////////////////////////////////////////////////////////////////
 
-// shapeProbe describes one recursive schema and how to build depth-d encodings
-// of it. encodeVal returns a fresh Go value of depth d; wire/json build depth-d
+// shapeProbe describes one recursive schema and how to build depth-d encodings of
+// it. encodeVal returns a fresh Go value of depth d; wire/json build depth-d
 // encodings INDEPENDENT of the encoder, so decode's true trip depth is observed
 // rather than min(encode,decode). newTyped is a fresh typed *struct destination.
 //
 // readerSchema (optional) is a writer→reader resolution target: a structurally
 // compatible reader — the same shape plus an extra defaulted field — that forces
-// Resolve to build the resolving deser pipeline, since Resolve returns the
-// reader directly for identical schemas. Empty readerSchema skips the resolved
-// probe.
+// Resolve to build the resolving deser pipeline, since Resolve returns the reader
+// directly for identical schemas. Empty readerSchema skips the resolved probe.
 type shapeProbe struct {
 	name             string
 	schema           string

@@ -915,15 +915,13 @@ func TestDifferentialJavaWireLeniencies(t *testing.T) {
 
 	t.Run("empty record JsonEncoder emits zero bytes", func(t *testing.T) {
 		// avro-tools 1.12.0's JsonEncoder emits NOTHING for a datum that is
-		// entirely empty records: the grammar's implicit actions only run
-		// when a terminal pulls advance(), and an empty record has no
-		// terminals (JsonGrammarGenerator.java:83-90; the flush drain's
-		// `while (pos > 1)` guard at Parser.java:108 never fires). twmb's
-		// "{}" is the only valid JSON for an empty record and matches
-		// fastavro. This cell pins Java's CURRENT zero-byte output — the
-		// reason rec0 is excluded from the JSON-form parity sweep in
-		// TestDifferentialJavaJSONForm. When a Java release fixes the bug,
-		// this cell flips: re-include rec0 there and retire this pin.
+		// entirely empty records: the grammar's implicit actions only run when a
+		// terminal pulls advance(), and an empty record has no terminals
+		// (JsonGrammarGenerator.java:83-90; the flush drain's `while (pos > 1)`
+		// guard at Parser.java:108 never fires). twmb's "{}" is the only valid JSON
+		// for an empty record and matches fastavro. This cell pins Java's CURRENT
+		// zero-byte output — why rec0 is excluded from TestDifferentialJavaJSONForm
+		// — and flips when a Java release fixes the bug.
 		ok, jsonOut, binOut, errMsg := rt(t, `{"type":"record","name":"E0","fields":[]}`, nil)
 		if !ok {
 			t.Fatalf("Java rejected the empty-record round-trip: %q", errMsg)

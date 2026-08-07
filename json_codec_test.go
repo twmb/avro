@@ -1183,14 +1183,13 @@ func TestEncodeJSONLinkedinFloats(t *testing.T) {
 	}
 }
 
-// LinkedinFloats encodes NaN as a bare JSON null. Inside a bare (untagged)
-// union a bare null is claimed by the union's null branch — or rejected
-// when the union has none — before the float branch's null→NaN rule runs,
-// so a union-member NaN does not round-trip. This is the inherent
-// ambiguity of the null-for-NaN convention when null is also a structural
-// union value; TaggedUnions disambiguates it. ±Inf encodes as the number
-// token ±1e999 and round-trips in a bare union regardless. This pins the
-// contract documented on LinkedinFloats.
+// LinkedinFloats encodes NaN as a bare JSON null. Inside a bare (untagged) union
+// a bare null is claimed by the union's null branch — or rejected when the union
+// has none — before the float branch's null→NaN rule runs, so a union-member NaN
+// does not round-trip. That is the inherent ambiguity of the null-for-NaN
+// convention when null is also a structural union value, which TaggedUnions
+// disambiguates; ±Inf encodes as the number token ±1e999 and round-trips in a
+// bare union regardless. This pins the contract documented on LinkedinFloats.
 func TestMatrix_LinkedinFloatsNaNUnionAmbiguity(t *testing.T) {
 	nan := float32(math.Float32frombits(0x7fc00000))
 
@@ -3551,12 +3550,11 @@ func TestDecodeJSONNullTypedTargets(t *testing.T) {
 
 // TestDecodeJSONNullIntoNonPointerZeroes is the JSON sibling of
 // TestDeserNullIntoNonPointerZeroes. doc.go states that a null union branch
-// decodes to the target's Go zero value, always replacing any prior value. The
-// binary path honors this unconditionally; the JSON path historically zeroed
-// only nilable kinds, leaving non-nilable concrete targets at whatever they held
-// — a silent value-bleed footgun across reused decode targets. Covers all three
-// null-handling dispatch sites: decodeNull, the decodeUnion null branch, and
-// assignAny's nil value.
+// decodes to the target's Go zero value, always replacing any prior value: the
+// binary path honors this unconditionally, while the JSON path historically
+// zeroed only nilable kinds, leaving non-nilable concrete targets at whatever
+// they held — a silent value-bleed footgun across reused decode targets. Covers
+// decodeNull, the decodeUnion null branch, and assignAny's nil value.
 func TestDecodeJSONNullIntoNonPointerZeroes(t *testing.T) {
 	t.Run("top-level null", func(t *testing.T) {
 		s, _ := Parse(`"null"`)

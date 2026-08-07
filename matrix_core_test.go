@@ -1454,13 +1454,12 @@ func boxRawTree(pos customPos, rawTree any) any {
 // ===========================================================================
 // Layer 4 — metadata-API agreement with the wire (assertion (c) completion).
 //
-// gMetadata pins Canonical/Fingerprint determinism. This layer pins the two
-// remaining metadata surfaces the user named: Fields[].Default and Root().Props.
-//
-// Fields[].Default: the contract is that the metadata default value, used AS a
-// field value, encodes to the SAME wire as resolution/auto fill — i.e. the
-// observed default agrees with the wire. Crossed with the resolution default-
-// fill (writer lacks the field) and Resolve⇔CheckCompatibility agreement.
+// gMetadata pins Canonical/Fingerprint determinism; this layer pins the two
+// remaining metadata surfaces: Fields[].Default and Root().Props. For
+// Fields[].Default the contract is that the metadata default value, used AS a
+// field value, encodes to the SAME wire as resolution/auto fill — crossed with
+// the resolution default-fill (writer lacks the field) and Resolve⇔
+// CheckCompatibility agreement.
 // ===========================================================================
 
 func TestMatrix_GenerativeDefaultFill(t *testing.T) {
@@ -1946,12 +1945,12 @@ func TestMatrix_GenerativePromotionBoundary(t *testing.T) {
 // ===========================================================================
 // Layer 7 — the json.Number overflow boundary input (the "1e1000" axis value).
 //
-// gtypes covers the ±Inf VALUE; this covers the textual overflow INPUT that
-// must narrow TO ±Inf. json.Number is a valid encode input and a bare JSON
-// number is a valid decode input, so "1e1000" exercises a distinct narrow-to-Inf
-// path on the float/double arms and an exact-or-reject path on the int/long
-// arms. Oracle: the Go-parsed value's bits (float) or exact zigzag (integer),
-// computed independently of the codec.
+// gtypes covers the ±Inf VALUE; this covers the textual overflow INPUT that must
+// narrow TO ±Inf. json.Number is a valid encode input and a bare JSON number a
+// valid decode input, so "1e1000" exercises a distinct narrow-to-Inf path on the
+// float/double arms and an exact-or-reject path on the int/long arms. Oracle: the
+// Go-parsed value's bits (float) or exact zigzag (integer), computed
+// independently of the codec.
 // ===========================================================================
 
 func TestMatrix_GenerativeJSONNumberBoundary(t *testing.T) {
@@ -3040,14 +3039,13 @@ func runResurrectionCell(t *testing.T, c resurrectionCell) {
 				}
 			}
 
-			// --- RESOLVED via TYPE PROMOTION. When the reader kind is a
-			// promotion target (writer int→long, string→bytes, bytes→string),
-			// doResolve wraps the widening deser with promotionDeserForLogical to
-			// re-apply the reader's logical. A resurrected wrong-kind logical
-			// must NOT be re-applied there either: the promoted decode must equal
-			// the plain (soft-dropped) reader's promoted decode. This is the
-			// resolved-deser axis the identity resolve above does not reach (it
-			// hits the promotion branch, not maybeWrapResolvedNode). ---
+			// --- RESOLVED via TYPE PROMOTION. When the reader kind is a promotion
+			// target (writer int→long, string→bytes, bytes→string), doResolve wraps
+			// the widening deser with promotionDeserForLogical to re-apply the
+			// reader's logical. A resurrected wrong-kind logical must NOT be
+			// re-applied there either: the promoted decode must equal the plain
+			// (soft-dropped) reader's promoted decode. This is the resolved-deser
+			// axis the identity resolve above does not reach. ---
 			if src, ok := promotionSourceFor(c.kind); ok {
 				w := avro.MustParse(src.schema)
 				wire, werr := w.Encode(src.value)
@@ -4273,13 +4271,12 @@ func TestMatrix_SchemaCacheMultiParseSelfContained(t *testing.T) {
 	// Pure within-parse forward reference crossed with spelling: a parse that
 	// references a cached type C (cross-parse, so the self-containment rebuild
 	// runs) AND references a LOCAL type Q before Q's own definition. The forward
-	// reference must NOT splice (Q is local, not inherited) — it stays a bare
-	// reference to the later definition. The wrapped spelling exercises the
+	// reference must NOT splice — Q is local, not inherited — so it stays a bare
+	// reference to the later definition, and the wrapped spelling exercises the
 	// splice's no-splice fall-through directly: {"type":"Q"} must collapse to the
-	// bare "Q" the canonical / inline twin carries, not survive the rebuild as a
-	// wrapped object. The twin is written in the SAME reference-before-definition
-	// order (the cache preserves source order; it does not reorder to def-first),
-	// so the four forms compare field-for-field.
+	// bare "Q" the canonical / inline twin carries. The twin is written in the SAME
+	// reference-before-definition order (the cache preserves source order), so the
+	// four forms compare field-for-field.
 	for _, spelling := range spellings {
 		for _, k := range kinds {
 			C, Q, R := "x.C", "x.Q", "x.R"
@@ -5254,13 +5251,11 @@ func TestMatrix_ReflectUnsafePathParity(t *testing.T) {
 
 	// Most rows round-trip value-faithfully, so the decoded field must equal the
 	// input. The two TIME-OF-DAY logicals are the exception: time-millis and
-	// time-micros encode only the clock time (ms/µs since midnight), and the
-	// decoder reconstructs that time-of-day at the 1970-01-01 UTC epoch
-	// reference — so a time.Time input keeps its time-of-day but NOT its date.
-	// Compare those rows against the epoch-dated expected value rather than the
-	// 2020-dated input (the input stays realistic; the date drop is documented
-	// here, not hidden by picking a 1970 input). Other rows fall through to
-	// r.value.
+	// time-micros encode only the clock time (ms/µs since midnight) and the decoder
+	// reconstructs that time-of-day at the 1970-01-01 UTC epoch reference, so a
+	// time.Time input keeps its time-of-day but NOT its date. Those rows compare
+	// against the epoch-dated expected value rather than the 2020-dated input, so
+	// the input stays realistic and the date drop is documented rather than hidden.
 	expectedDecode := map[string]any{
 		"time-millis/time": time.Date(1970, 1, 1, 3, 14, 15, 0, time.UTC),
 		"time-micros/time": time.Date(1970, 1, 1, 3, 14, 15, 926000, time.UTC),
@@ -6712,14 +6707,13 @@ func TestMatrix_MetadataPreservedThroughRebuild(t *testing.T) {
 	check(t, *rebuilt2.Root(), "second rebuilt Root()")
 }
 
-// laxNameSamples is the CHARACTER axis of the lax-name nets. It was a
-// hand-picked sample of six spellings whose characters reach three of the
-// canonical escaper's seven short-form arms, so backspace and formfeed — spelled
-// \b and \f — were emitted by no net at all. A name is the only carrier that can
-// hold them, and only under a permissive lax-name checker, so nothing else in
-// the suite could reach them either. The escaper's arms are swept exhaustively
-// by TestMatrix_CanonicalStringEscapeSweep; this list stays a sample, but one
-// picked to hit every arm.
+// laxNameSamples is the CHARACTER axis of the lax-name nets. It was a hand-picked
+// sample of six spellings whose characters reach three of the canonical escaper's
+// seven short-form arms, so backspace and formfeed — spelled \b and \f — were
+// emitted by no net at all: a name is the only carrier that can hold them, and
+// only under a permissive lax-name checker, so nothing else in the suite could
+// reach them either. TestMatrix_CanonicalStringEscapeSweep sweeps the arms
+// exhaustively; this list stays a sample, but one picked to hit every arm.
 var laxNameSamples = []string{
 	"with space", "tab\tname", `back\slash`, `qu"ote`, "uni🎉code", "1starts-digit",
 	"bs\bname", "ff\fname", "nl\nname", "cr\rname", "ctl\x01name", "del\x7fname",
@@ -7397,11 +7391,10 @@ var featureWalkerImplicitNullRows = []featureWalkerRow{
 // behave the same). The duplicates survive in the schema text every walker
 // independently re-consumes, so each walker's own decode must collapse to the
 // same LAST value the wire parser used; a walker swapped to an order-sensitive
-// scanner that takes the FIRST occurrence diverges. Twins spell the single-key
+// scanner taking the FIRST occurrence diverges. Twins spell the single-key
 // last-value form, and first values are decoys chosen so a first-wins reading
-// produces a structurally DIFFERENT schema rather than a coincidentally-equal
-// one. Non-vacuity comes from the twin-flip check rather than an arm neuter: the
-// collapse lives in the stdlib decoder, which has no production arm of ours.
+// produces a structurally DIFFERENT schema. Non-vacuity comes from the twin-flip
+// check rather than an arm neuter: the collapse lives in the stdlib decoder.
 var featureWalkerDupKeyRows = []featureWalkerRow{
 	{
 		// Type-defining keys duplicated: record name, fields (empty decoy
@@ -7718,13 +7711,12 @@ var featureWalkerCaseKeyRows = []featureWalkerRow{
 // The three supported field-level logicalType lift shapes: an annotation whose
 // type is a primitive STRING form, a union STRING form (first non-null branch),
 // or a SINGLE OBJECT without its own annotation, is lifted into the type
-// definition at parse. Twins spell the canonical nested form. The lift happens
-// in the wire parser, so the LIFTED schema reaches the codec, canonical form,
-// resolution and SOE walkers while the AS-WRITTEN spelling survives in the text
-// String() and the Root() tree re-consume — both sides of that split must keep
-// describing the same wire behavior as the nested twin. Sample values encode
-// only if the logical is EFFECTIVE, so every encode-bearing cell dies if the
-// lift is dropped.
+// definition at parse, with twins spelling the canonical nested form. The lift
+// happens in the wire parser, so the LIFTED schema reaches the codec, canonical
+// form, resolution and SOE walkers while the AS-WRITTEN spelling survives in the
+// text String() and the Root() tree — both sides of that split must keep
+// describing the same wire behavior as the nested twin. Sample values encode only
+// if the logical is EFFECTIVE, so every encode-bearing cell dies if it is dropped.
 var featureWalkerLiftRows = []featureWalkerRow{
 	{
 		// Shape 1: primitive string form. No reference can appear inside
@@ -11743,13 +11735,12 @@ func TestMatrix_SelfReadableAtScale(t *testing.T) {
 	}
 
 	// UNSAFE struct-field path. The generators above pass top-level []any /
-	// map[string]any values, which route through the REFLECT encoders. A
-	// zero-byte array that is an addressable struct field instead routes
-	// through the UNSAFE encoders (usArrayRecord / usArrayPtrRecord /
-	// usArrayDirect) — a structurally distinct code path that the first
-	// producer-compliance fix missed, and which this net was blind to until
-	// it drove typed struct fields. Each wrapper holds the same zero-byte
-	// array element type as a TYPED slice field, swept across the cap.
+	// map[string]any values, which route through the REFLECT encoders; a zero-byte
+	// array that is an addressable struct field instead routes through the UNSAFE
+	// encoders (usArrayRecord / usArrayPtrRecord / usArrayDirect) — a structurally
+	// distinct code path the first producer-compliance fix missed, and which this
+	// net was blind to until it drove typed struct fields. Each wrapper holds the
+	// same zero-byte array element type as a TYPED slice field, swept across the cap.
 	for _, uc := range unsafeArrayCases() {
 		for _, n := range []int{4096, 4097, 10000} {
 			t.Run(fmt.Sprintf("unsafe-field/%s×%d", uc.label, n), func(t *testing.T) {

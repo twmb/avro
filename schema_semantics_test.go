@@ -1784,8 +1784,7 @@ func TestMatrix_ReservedAttributeEnumerationIsNotVacuous(t *testing.T) {
 // so Props == all raw keys minus the consumed exact-lowercase ones. Both reading
 // surfaces — the parse-side props handed to CustomType callbacks and the Root()
 // metadata walk — apply the same rule and must agree. Java's reserved sets are
-// exact-lowercase HashSets, so a case-variant is an ordinary preserved property
-// there too; fastavro and goavro likewise read known keys by exact name.
+// exact-lowercase HashSets, and fastavro and goavro read known keys by exact name.
 
 // propsCaptureCustom returns a match-all CustomType whose Encode records
 // the Props of the node matching typ (+ name, when non-empty) and then
@@ -3032,16 +3031,15 @@ func TestRegression_FlatFieldMalformedPrecisionMatchesNestedTwin(t *testing.T) {
 	}
 }
 
-// Consumed placements keep the loud shape reject, fired from the recorded
-// per-key shape error and naming the key. The scale cell is the guard against
-// "treat malformed as absent": scale is OPTIONAL, so silently dropping a
-// malformed one beside a valid precision would parse as decimal(p,0) — a silent
-// wire-semantics change (#55 anti-silent-drop). Consumption follows what the
-// lift LANDS, not where it points: the pair is consumed exactly where the
-// target's EFFECTIVE logical — its own when it has one, else the field's — is
-// "decimal" on a bytes/fixed carrier. The own-logical-is-decimal cells here are
-// what keep the rule from being loosened into "any annotation of its own is
-// inert".
+// Consumed placements keep the loud shape reject, fired from the recorded per-key
+// shape error and naming the key. The scale cell is the guard against "treat
+// malformed as absent": scale is OPTIONAL, so silently dropping a malformed one
+// beside a valid precision would parse as decimal(p,0), a silent wire-semantics
+// change (#55 anti-silent-drop). Consumption follows what the lift LANDS, not
+// where it points: the pair is consumed exactly where the target's EFFECTIVE
+// logical — its own when it has one, else the field's — is "decimal" on a
+// bytes/fixed carrier, and the own-logical-is-decimal cells keep that rule from
+// being loosened into "any annotation of its own is inert".
 func TestMatrix_FieldDecimalConsumedMalformedParamReject(t *testing.T) {
 	cases := []struct{ name, src, key string }{
 		{
@@ -8008,16 +8006,15 @@ func permuteStrings(in []string) [][]string {
 
 // ---------- union_fixed_size_select_test.go ----------
 
-// Per the Avro spec, a reader-union branch matches a writer fixed only when
-// "both schemas are fixed whose sizes and (unqualified) names match", and
-// resolution selects "the first schema in the reader's union that matches". So
-// fixed SIZE is part of the match predicate: a wrong-size same-name branch does
-// NOT match and selection must continue to a later size-matching branch.
-// fastavro implements this (and the spec mandates it); branch selection that
-// matched on name alone and only rejected on size afterward let a wrong-size
-// branch MASK a correct-size one, erroring on a value that is fully decodable
-// (and decodable just by reordering the reader union). This pins that size is
-// folded into selection for both Resolve and CheckCompatibility, both wires.
+// Per the Avro spec, a reader-union branch matches a writer fixed only when "both
+// schemas are fixed whose sizes and (unqualified) names match", and resolution
+// selects "the first schema in the reader's union that matches" — so fixed SIZE
+// is part of the match predicate, and a wrong-size same-name branch does NOT match
+// and selection must continue to a later size-matching branch. fastavro implements
+// this; branch selection that matched on name alone and only rejected on size
+// afterward let a wrong-size branch MASK a correct-size one, erroring on a value
+// that is fully decodable. This pins that size is folded into selection for both
+// Resolve and CheckCompatibility, both wires.
 func TestRegression_UnionFixedSizeFoldedIntoSelection(t *testing.T) {
 	writer := avro.MustParse(`{"type":"fixed","name":"F","namespace":"ns0","size":4}`)
 	// The wrong-size branch (size 8) is declared BEFORE the correct-size (size 4):
@@ -8674,16 +8671,15 @@ func TestMatrix_ForwardRefFieldDefaultEncodes(t *testing.T) {
 	})
 }
 
-// A field default whose type subtree references a record still under
-// construction — a self- or mutual-recursive reference — must encode its
-// binary defaultBytes against the COMPLETE record node, not the partial node
-// that exists while the enclosing record's field loop is still running.
-// Encoding inline at build time sees only the fields declared before the
-// current one and silently drops the rest, producing truncated wire that the
-// same schema cannot decode. The default-encode must defer to finalize (where
-// every in-construction record is whole), exactly as a not-yet-wired
-// forward-ref child already does. EncodeJSON re-encodes the default at runtime
-// against the complete node and was already correct, so it is the parity oracle.
+// A field default whose type subtree references a record still under construction
+// — a self- or mutual-recursive reference — must encode its binary defaultBytes
+// against the COMPLETE record node, not the partial node that exists while the
+// enclosing record's field loop is still running. Encoding inline at build time
+// sees only the fields declared before the current one and silently drops the
+// rest, producing truncated wire the same schema cannot decode, so the
+// default-encode defers to finalize exactly as a not-yet-wired forward-ref child
+// already does. EncodeJSON re-encodes the default at runtime against the complete
+// node and was already correct, so it is the parity oracle.
 func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 	// roundTrip encodes a record that omits the defaulted field (triggering
 	// binary default-fill from the precomputed bytes) and asserts the bytes
@@ -8842,12 +8838,11 @@ func TestMatrix_SelfRefContainerDefaultEncodes(t *testing.T) {
 
 // A default with no finite encoding — a required field whose default recurses
 // into its own type — must be rejected at Parse, not stack-overflow and not
-// silently produce truncated bytes. encodeDefault fills absent nested fields
-// from their own defaults (unlike validateDefault, which skips absent fields
-// and terminates vacuously), so without a recursion bound such a default
-// recurses until the goroutine stack overflows and the process dies. The
-// maxDepth ceiling turns it into an errTooDeep parse error instead. Each case
-// is a schema whose default can never be finitely materialized.
+// silently produce truncated bytes. encodeDefault fills absent nested fields from
+// their own defaults (unlike validateDefault, which skips absent fields and
+// terminates vacuously), so without a recursion bound such a default recurses
+// until the goroutine stack overflows and the process dies; the maxDepth ceiling
+// turns it into an errTooDeep parse error instead.
 func TestMatrix_InfiniteRecursiveDefaultRejected(t *testing.T) {
 	cases := []struct{ name, schema string }{
 		{"self_record", `{"type":"record","name":"R","fields":[
@@ -12046,15 +12041,13 @@ func capCheckWires(t *testing.T, s *avro.Schema, val any, over bool) {
 	}
 }
 
-// TestInvariant_OCFBlockCapsStayReaderOnly asserts the EXCEPTION as a cell.
-//
-// The block-size pair is reader-only BY DESIGN, and the type system already
-// says so: WithMaxBlockBytes is a ReaderOpt, so it cannot even be handed to
-// NewWriter. That is a stronger statement of the exception than any behavioral
-// probe — producer enforcement is not merely absent, it is unexpressible.
-// Producer enforcement was implemented once and reverted (it traps data at
-// flush and leaves an unclosable compressed-size residual), so this cell exists
-// to fail if a later round re-adds it.
+// TestInvariant_OCFBlockCapsStayReaderOnly asserts the EXCEPTION as a cell. The
+// block-size pair is reader-only BY DESIGN, and the type system already says so:
+// WithMaxBlockBytes is a ReaderOpt, so it cannot even be handed to NewWriter —
+// a stronger statement of the exception than any behavioral probe, since producer
+// enforcement is not merely absent but unexpressible. It was implemented once and
+// reverted (it traps data at flush and leaves an unclosable compressed-size
+// residual), so this cell exists to fail if a later round re-adds it.
 func TestInvariant_OCFBlockCapsStayReaderOnly(t *testing.T) {
 	var _ ocf.ReaderOpt = ocf.WithMaxBlockBytes(1 << 10)
 	var _ ocf.ReaderOpt = ocf.WithMaxDecompressedBlockBytes(1 << 10)
@@ -12236,13 +12229,12 @@ func scanDefaultWalkCompositeArms(src string) []string {
 
 // TestInvariant_EveryDefaultWalkArmHasANestingCell is the completeness half of
 // the NESTING axis, mirroring the cap classifier: every composite arm of the
-// default walk must be driven by a nesting, or land with no cell and FAIL.
-//
-// The union arm is why this exists. It recursed like the other three, behaved
+// default walk must be driven by a nesting, or land with no cell and FAIL. The
+// union arm is why this exists — it recursed like the other three, behaved
 // differently from all of them (it selects a branch by trying each), and was
-// simply absent from a hand-written axis — so the table stayed green over an
-// open hole. An axis that exists but omits the shape a bug lives in is worse
-// than no axis, because it reads as coverage.
+// simply absent from a hand-written axis, so the table stayed green over an open
+// hole. An axis that omits the shape a bug lives in is worse than no axis,
+// because it reads as coverage.
 func TestInvariant_EveryDefaultWalkArmHasANestingCell(t *testing.T) {
 	src, err := os.ReadFile("resolve.go")
 	if err != nil {
@@ -12276,15 +12268,13 @@ func TestInvariant_EveryDefaultWalkArmHasANestingCell(t *testing.T) {
 // ---------- error_bound_test.go ----------
 
 // Tier-2 error-message DoS bound (CORRECTNESS_PLAN.md DoS gap). Every
-// fmt.Errorf("...%q...", x) that interpolates wire- or schema-controlled
-// content x is a 1:1 amplification vector: a hostile N-byte input rejected
-// into an N-byte error message floods logging pipelines, RPC error channels,
-// metric labels, and traces. The trunc*ForError helpers exist to cap that
-// echo, but the recurring regression is a call site that forgets to use them.
-// The invariant pinned here: the error from a rejected hostile input is
-// bounded by a small constant, INDEPENDENT of the input size. A call site
-// that drops its trunc wrapper makes the message scale with the 1 MiB input
-// and trips the cap.
+// fmt.Errorf("...%q...", x) interpolating wire- or schema-controlled content is a
+// 1:1 amplification vector: a hostile N-byte input rejected into an N-byte error
+// message floods logging pipelines, RPC error channels, metric labels and traces.
+// The trunc*ForError helpers exist to cap that echo, but the recurring regression
+// is a call site that forgets to use them. The invariant pinned here: the error
+// from a rejected hostile input is bounded by a small constant, INDEPENDENT of
+// input size, so a call site that drops its trunc wrapper trips the cap.
 func TestErrorMessageBounded(t *testing.T) {
 	const hostileLen = 1 << 20 // 1 MiB
 	// Legit messages from these paths are ~100 bytes (an ~80-char truncated
@@ -12411,14 +12401,13 @@ func jsonEscapeForTest(s string) string {
 	return string(b[1 : len(b)-1]) // strip surrounding quotes
 }
 
-// SchemaNode.Schema() (the Root().Schema() metadata round-trip) must be O(n)
-// in schema size, not O(depth*subtree). toJSONWalk snapshotted every named
-// type's full marshaled body for conflict detection; on a nested record chain
-// each enclosing record re-marshaled everything below it (O(n^2)) even though
-// the snapshot map is only ever read on a duplicate fullname. Parse() and
-// Canonical() of the same schema are already linear (microseconds); this pins
-// the metadata emitter to match. A 900-deep, ~318KB record chain that parses
-// in ~12ms regressed to >1.3s through Root().Schema().
+// SchemaNode.Schema() (the Root().Schema() metadata round-trip) must be O(n) in
+// schema size, not O(depth*subtree). toJSONWalk snapshotted every named type's
+// full marshaled body for conflict detection, so on a nested record chain each
+// enclosing record re-marshaled everything below it (O(n^2)) even though the
+// snapshot map is only ever read on a duplicate fullname. Parse() and Canonical()
+// of the same schema are already linear, and this pins the metadata emitter to
+// match: a 900-deep, ~318KB record chain that parses in ~12ms regressed to >1.3s.
 func TestRegression_RootSchemaEmitterLinearOnDeepNesting(t *testing.T) {
 	const depth = 900
 	var sb strings.Builder
@@ -12600,14 +12589,13 @@ func TestMatrix_NestedStrayContainerKeyLinearCost(t *testing.T) {
 		}
 	}
 
-	// Growth shape: doubling the depth must ~double the time (linear), not
-	// square or explode it. Measured at ms scale (best-of-N minimum, so a
-	// scheduler hiccup on one sample doesn't skew the ratio) where the signal
-	// is clean. The pre-fix exponential blows this ratio to astronomical; a
-	// quadratic regression (the metadata walker re-validating each subtree per
-	// enclosing level) lands near 4. Skipped under -race: instrumentation
-	// distorts the ratio, and the absolute ceilings above still catch the
-	// exponential there.
+	// Growth shape: doubling the depth must ~double the time (linear), not square
+	// or explode it. Measured at ms scale (best-of-N minimum, so a scheduler hiccup
+	// on one sample doesn't skew the ratio) where the signal is clean: the pre-fix
+	// exponential blows this ratio to astronomical, and a quadratic regression (the
+	// metadata walker re-validating each subtree per enclosing level) lands near 4.
+	// Skipped under -race, where instrumentation distorts the ratio and the absolute
+	// ceilings above still catch the exponential.
 	if isRaceEnabled() {
 		return
 	}

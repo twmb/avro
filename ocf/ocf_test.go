@@ -2458,15 +2458,14 @@ func TestWriterSchema(t *testing.T) {
 }
 
 // TestWithSchemaOptsCustomType verifies that [WithSchemaOpts] passes
-// [avro.CustomType] through to the reader-schema parse so the registered
-// callback fires on the matching logical-typed field during Decode.
+// [avro.CustomType] through to the reader-schema parse so the registered callback
+// fires on the matching logical-typed field during Decode.
 //
-// Pre-fix the OCF writer wrote PCF to the header, which strips logicalType, so
-// the reader's parsed-from-header schema had no logical type to dispatch on and
-// the built-in date-on-int default produced an int32. The old assertion
+// Pre-fix the OCF writer wrote PCF to the header, which strips logicalType, so the
+// reader's parsed-from-header schema had no logical type to dispatch on and the
+// built-in date-on-int default produced an int32. The old assertion
 // `out["d"].(int32)` was tautological, succeeding whether or not the CustomType
-// fired. This now tracks via a captured bool that Decode was invoked AND asserts
-// the returned type is what the handler produced.
+// fired; this tracks via a captured bool AND asserts the handler's return type.
 func TestWithSchemaOptsCustomType(t *testing.T) {
 	schema := avro.MustParse(`{"type":"record","name":"R","fields":[
 		{"name":"d","type":{"type":"int","logicalType":"date"}}
@@ -2648,14 +2647,13 @@ func TestRegression_BlockCountZeroValidatesSync(t *testing.T) {
 }
 
 // TestRegression_EmptyBlockMidStreamSkipped verifies that a count=0 block whose
-// sync marker validates is SKIPPED rather than treated as end-of-stream. The
-// spec places no constraint on a block's object count: unlike Avro arrays and
-// maps, file blocks have no terminator, so a zero-count block is valid framing.
-// fastavro's record iterator reads straight past one, so treating it as EOF
-// silently dropped every record after it. Java never emits the shape and its
-// for-each reader stops at one, while goavro errors and avro-rs stops; skipping
-// reads everything a foreign writer put in the file and loses nothing. A corrupt
-// sync on the same shape still errors.
+// sync marker validates is SKIPPED rather than treated as end-of-stream. The spec
+// places no constraint on a block's object count: unlike Avro arrays and maps,
+// file blocks have no terminator, so a zero-count block is valid framing, and
+// fastavro's record iterator reads straight past one — treating it as EOF silently
+// dropped every record after it. Java never emits the shape and its for-each
+// reader stops at one, while goavro errors and avro-rs stops; skipping reads
+// everything a foreign writer put in the file and loses nothing.
 func TestRegression_EmptyBlockMidStreamSkipped(t *testing.T) {
 	sync := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	s := avro.MustParse(`"string"`)
@@ -2703,11 +2701,10 @@ func TestRegression_EmptyBlockMidStreamSkipped(t *testing.T) {
 // testdata/bigdec.avro is the same vendored file avro-rs uses in
 // test_avro_3779_from_java_file; it holds one record {field_name: 2.24}. The
 // wire-format byte match for 2.24 is pinned at the payload level in
-// TestSpecBigDecimalWireFormat; this extends the guarantee end-to-end through
-// the OCF framing.
+// TestSpecBigDecimalWireFormat; this extends the guarantee end-to-end through the
+// OCF framing.
 //
-// leakDetectCodec records whether Close() has been called, for the
-// leak-on-error regression tests below.
+// leakDetectCodec records whether Close() has been called, for the tests below.
 type leakDetectCodec struct {
 	name   string
 	closes int
@@ -3441,9 +3438,8 @@ func TestRegression_OCFWriterValueErrorRecovers(t *testing.T) {
 // same — Java's appendTo copies schema/sync/meta from the file and its setMeta
 // throws once appending, and fastavro's append mode silently drops its metadata
 // kwarg (executed against 1.12.2). This pin locks the ignore, so a future change
-// that honors or rejects these options is a deliberate flip. The appended records
-// decoding cleanly is the sync-marker assertion: blocks appended under a
-// different marker would fail the reader's per-block check.
+// that honors or rejects these options is a deliberate flip; the appended records
+// decoding cleanly is the sync-marker assertion.
 func TestAppendWriterIgnoresHeaderOptions(t *testing.T) {
 	schema := `{"type":"record","name":"R","fields":[{"name":"f","type":"string"}]}`
 	var buf bytes.Buffer
@@ -5814,16 +5810,15 @@ func TestRegression_OCFNewWriterReleasesSupersededCodec(t *testing.T) {
 	}
 }
 
-// TestRegression_OCFNilCodecOfferIsNeverClosed pins the one shape where a
-// release would be a method call on a nil interface. WithCodec(nil) compiles,
-// and when a later WithCodec supersedes it the constructor succeeds — the nil
-// never reaches a call site — so this call works and must keep working. Closing
-// the superseded offer without checking would turn a working call into a panic.
+// TestRegression_OCFNilCodecOfferIsNeverClosed pins the one shape where a release
+// would be a method call on a nil interface. WithCodec(nil) compiles, and when a
+// later WithCodec supersedes it the constructor succeeds — the nil never reaches a
+// call site — so this call works and must keep working; closing the superseded
+// offer without checking would turn a working call into a panic.
 //
 // Only the superseded position is asserted. A nil codec that is ADOPTED is a
 // nil-method call in writeHeader (writer side) and in the name scan of
-// resolveCodec (reader side), both of which are reached before any release and
-// are not what this pins.
+// resolveCodec (reader side), both reached before any release.
 func TestRegression_OCFNilCodecOfferIsNeverClosed(t *testing.T) {
 	real := &leakDetectCodec{name: "null"}
 
@@ -6043,13 +6038,12 @@ func TestRegression_OCFDecompressionAmplificationBounded(t *testing.T) {
 }
 
 // A user expressing "no practical decompressed-size limit" as math.MaxInt64
-// (rather than the documented 0) must still read a valid deflate-compressed
-// OCF. deflateCodec.DecompressBounded reads io.LimitReader(r, max+1) to detect
-// over-limit without materializing the bomb; at max==MaxInt64 the +1
-// overflows to MinInt64, LimitReader returns 0 bytes, the block decodes as
-// empty, and a valid file fails to read. The bound must not invert at its own
-// extreme value. The default-limit and limit==0 (unlimited) paths are the
-// boundary-1 controls that must keep working.
+// (rather than the documented 0) must still read a valid deflate-compressed OCF.
+// deflateCodec.DecompressBounded reads io.LimitReader(r, max+1) to detect
+// over-limit without materializing the bomb; at max==MaxInt64 the +1 overflows to
+// MinInt64, LimitReader returns 0 bytes, the block decodes as empty, and a valid
+// file fails to read. The bound must not invert at its own extreme value; the
+// default-limit and limit==0 paths are the boundary-1 controls.
 func TestRegression_OCFDeflateDecompressLimitMaxInt(t *testing.T) {
 	s := avro.MustParse(`"string"`)
 	payload := strings.Repeat("hello world ", 2000) // ~24 KiB, compresses well
@@ -6420,15 +6414,14 @@ func TestDoSBattery_OCF_C2_BlockCountSize(t *testing.T) {
 		return r.Decode(&v)
 	})
 
-	// Same hostile block, but with the reader's cap RAISED above the declared
-	// size — as a caller setting a very large / "unlimited" WithMaxBlockBytes
-	// would. The size > maxBlockBytes guard no longer fires, so readBlock must
-	// still reject gracefully instead of eagerly make([]byte, declaredSize):
-	// near the MaxInt64 ceiling that allocation is an unrecoverable fatal OOM,
-	// and even at realistic raised caps a tiny file forces a multi-GiB spike.
-	// Bound: readBlock reads incrementally beyond ocfEagerBlockAllocLimit, so a
-	// declared-but-absent size fails after consuming the bytes actually present.
-	// Extreme: TestRegression_OCFRaisedBlockCapDoesNotEagerAllocate.
+	// Same hostile block, but with the reader's cap RAISED above the declared size
+	// — as a caller setting a very large / "unlimited" WithMaxBlockBytes would. The
+	// size > maxBlockBytes guard no longer fires, so readBlock must still reject
+	// gracefully instead of eagerly make([]byte, declaredSize): near the MaxInt64
+	// ceiling that allocation is an unrecoverable fatal OOM, and even at realistic
+	// raised caps a tiny file forces a multi-GiB spike. readBlock reads
+	// incrementally beyond ocfEagerBlockAllocLimit, so a declared-but-absent size
+	// fails after consuming the bytes actually present.
 	hdrRaised, syncRaised := ocfHeaderSync(t, `"long"`)
 	var raisedHuge []byte
 	raisedHuge = append(raisedHuge, hdrRaised...)
@@ -6507,14 +6500,13 @@ func TestDoSBattery_OCF_C1_Header(t *testing.T) {
 	}
 	// The same DAG with the WIDTH axis turned up. Depth alone is half of what a
 	// walk over this graph costs: a node is recomputed once per path that reaches
-	// it and each recomputation iterates that node's OWN field list, so the cost
-	// is a product of two magnitudes the header's author chooses independently.
-	// Holding the second at two leaves the product untested. Here the chain is
-	// cyclic, so nothing memoizes, and the record every path ends at is wide,
-	// making the most-revisited node also the most expensive. WIDTH is driven at
-	// two values because a per-node charge makes the cost allowance x width while
-	// a per-child charge makes it flat. Measured 210ms at 8000 and 295ms at
-	// 16000 — the schema TEXT doubles while the walk does not.
+	// it and each recomputation iterates that node's OWN field list, so the cost is
+	// a product of two magnitudes the header's author chooses independently, and
+	// holding the second at two leaves the product untested. Here the chain is
+	// cyclic, so nothing memoizes, and the record every path ends at is wide, making
+	// the most-revisited node also the most expensive. WIDTH is driven at two values
+	// because a per-node charge makes the cost allowance x width while a per-child
+	// charge makes it flat. Measured 210ms at 8000 and 295ms at 16000.
 	for _, width := range headerWidths {
 		wantTerminate(t, fmt.Sprintf("NewReader/wide-cyclic-header-schema/width=%d", width), func() error {
 			r, err := NewReader(bytes.NewReader(ocfWith(dagWideCyclicHeader(16, width), "null", 0, nil)))
@@ -8027,16 +8019,14 @@ func validOCFHeader(sync [16]byte) []byte {
 	return out
 }
 
-// FuzzOCFBlockEnvelope fuzzes the block-level state machine in
-// readBlock: count varint, size varint, data, sync marker. The fuzz
-// builds a valid header and then appends a fuzz-driven block payload,
-// so every iteration explores the block envelope rather than the
-// header parser. Targets the count=0 sync-validation path
-// (TestRegression_BlockCountZeroValidatesSync) — pre-fix readBlock
-// bailed at count==0 without reading size + sync, so a tail-truncated
-// file whose count byte happened to read as 0 was silently accepted.
-// Also exercises the negative-count / negative-size / size>max guards
-// (TestRegression_OCFBlockEnvelopeInvariant).
+// FuzzOCFBlockEnvelope fuzzes the block-level state machine in readBlock: count
+// varint, size varint, data, sync marker. The fuzz builds a valid header and then
+// appends a fuzz-driven block payload, so every iteration explores the block
+// envelope rather than the header parser. Targets the count=0 sync-validation path
+// (TestRegression_BlockCountZeroValidatesSync) — pre-fix readBlock bailed at
+// count==0 without reading size + sync, so a tail-truncated file whose count byte
+// happened to read as 0 was silently accepted — and exercises the negative-count /
+// negative-size / size>max guards (TestRegression_OCFBlockEnvelopeInvariant).
 func FuzzOCFBlockEnvelope(f *testing.F) {
 	// Seeds: each chosen to hit a specific control-flow arm.
 	// (count, size, data, hasGoodSync) → fuzz format:
@@ -8132,13 +8122,12 @@ func FuzzOCFWriterReaderCodecCycle(f *testing.F) {
 	// nil entry → default codec (null). Public codec constructors don't include a
 	// NullCodec wrapper; the default already exercises it.
 	//
-	// The zstd codec uses minimum-footprint options because the fuzz constructs
-	// and closes a codec PER EXECUTION — that lifecycle being the fuzzed surface —
-	// and default-option zstd costs ~573µs + 1.64MB of garbage per cycle against
-	// ~126µs + 0.30MB with these. At fuzz rates that churn keeps the GC saturated
-	// on small CI runners, and a starved worker can miss the coordinator's
-	// shutdown deadline. The options only shrink buffers and effort; the
-	// construct→compress→decompress→Close surface is unchanged.
+	// The zstd codec uses minimum-footprint options because the fuzz constructs and
+	// closes a codec PER EXECUTION — that lifecycle being the fuzzed surface — and
+	// default-option zstd costs ~573µs + 1.64MB of garbage per cycle against ~126µs
+	// + 0.30MB with these. At fuzz rates that churn keeps the GC saturated on small
+	// CI runners, and a starved worker can miss the coordinator's shutdown deadline.
+	// The options only shrink buffers and effort; the surface is unchanged.
 	codecs := []func() WriterOpt{
 		nil,
 		func() WriterOpt { return WithCodec(DeflateCodec(1)) },
@@ -8972,14 +8961,13 @@ func TestRegression_OCFMetadataKeyErrorBounded(t *testing.T) {
 // ---------- truncation_eof_test.go ----------
 
 // io.EOF is Decode's end-of-stream sentinel: it must be returned only when the
-// stream ends cleanly at a block boundary. A block-header truncation is an
-// error, and that error must NOT satisfy errors.Is(err, io.EOF) — otherwise the
-// idiomatic termination check reads a truncated stream as complete and silently
-// drops the promised tail. The hazard is specific to the zero-bytes-available
-// cuts: io.ReadFull and binary.ReadVarint return bare io.EOF when no bytes
-// remain, so exactly those would leak the sentinel through a %w wrap. fastavro
-// errors at every one of these cuts, and the spec makes all four block parts
-// mandatory.
+// stream ends cleanly at a block boundary. A block-header truncation is an error,
+// and that error must NOT satisfy errors.Is(err, io.EOF) — otherwise the idiomatic
+// termination check reads a truncated stream as complete and silently drops the
+// promised tail. The hazard is specific to the zero-bytes-available cuts:
+// io.ReadFull and binary.ReadVarint return bare io.EOF when no bytes remain, so
+// exactly those would leak the sentinel through a %w wrap. fastavro errors at
+// every one of these cuts, and the spec makes all four block parts mandatory.
 func TestRegression_TruncatedBlockHeaderNotEOF(t *testing.T) {
 	s := mustParse(t, `"int"`)
 	// One complete block with one record.

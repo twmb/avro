@@ -5888,16 +5888,13 @@ func TestOmitzeroStringValue(t *testing.T) {
 	}
 }
 
-// TestRegression_OmitzeroNullSecondUnion locks in that omitzero on a
-// null-SECOND union (["T","null"]) emits the correct null-branch index
-// (0x02 = zigzag 1), not 0x00. Both the slow path (serRecord.ser at
-// ser.go:704) and the fast-path slow-fn fallback (serRecordFast at
-// unsafe.go:152) must look up the null branch's actual index;
-// unconditionally emitting 0x00 would corrupt the wire for null-
-// second unions — twmb couldn't even decode its own output.
-//
-// Slow-path case: bare struct value (non-addressable in some call
-// paths or hitting the reflect fallback). Triggers the ser.go shortcut.
+// TestRegression_OmitzeroNullSecondUnion locks in that omitzero on a null-SECOND
+// union (["T","null"]) emits the correct null-branch index (0x02 = zigzag 1), not
+// 0x00. Both the slow path (serRecord.ser at ser.go:704) and the fast-path
+// slow-fn fallback (serRecordFast at unsafe.go:152) must look up the null
+// branch's actual index; unconditionally emitting 0x00 would corrupt the wire for
+// null-second unions — twmb couldn't decode its own output. The slow-path case is
+// a bare struct value, hitting the ser.go shortcut through the reflect fallback.
 func TestRegression_OmitzeroNullSecondUnion(t *testing.T) {
 	type R struct {
 		Name string `avro:"name,omitzero"`
@@ -8565,13 +8562,12 @@ func TestRegression_UnionDefaultAcceptsAnyBranch_Avro112(t *testing.T) {
 	}
 }
 
-// TestRegression_EncodeJSONBareUnionsByDefault locks in the deliberate
-// design choice that EncodeJSON emits bare (non-tagged) unions by
-// default. This diverges from the Avro 1.12 JSON-encoding spec, which
-// requires {"type_name": value}. Spec-compliant tagged output is opt-in
-// via TaggedUnions(); see TaggedUnions doc for rationale. This test
-// exists so the choice can't drift silently — flipping it to tagged
-// would be a behavior change for existing users and must be deliberate.
+// TestRegression_EncodeJSONBareUnionsByDefault locks in the deliberate design
+// choice that EncodeJSON emits bare (non-tagged) unions by default, diverging
+// from the Avro 1.12 JSON-encoding spec's {"type_name": value}; spec-compliant
+// tagged output is opt-in via TaggedUnions(), whose doc carries the rationale.
+// This exists so the choice can't drift silently — flipping it would be a
+// behavior change for existing users.
 func TestRegression_EncodeJSONBareUnionsByDefault(t *testing.T) {
 	schema := MustParse(`{
 		"type":"record","name":"R",
@@ -8657,15 +8653,13 @@ func TestRegression_DecodeJSONUnionTagAmbiguousShortName(t *testing.T) {
 	}
 }
 
-// TestRegression_WriterUnionBranchMismatchFailsFast locks in this
-// library's fail-fast posture for writer-union resolution. Every writer
-// branch must be compatible with the reader at Resolve time; the first
-// incompatibility is returned eagerly. This deliberately diverges from
-// Java's Resolver.WriterUnion (per-branch ErrorAction deferred to
-// decode time) and fastavro's read_union — see checkWriterUnion's doc
-// comment for the rationale. A producer that narrowed during evolution
-// but never emits the dropped branch must update its schema before
-// Resolve will accept the pair.
+// TestRegression_WriterUnionBranchMismatchFailsFast locks in this library's
+// fail-fast posture for writer-union resolution: every writer branch must be
+// compatible with the reader at Resolve time, and the first incompatibility is
+// returned eagerly. This deliberately diverges from Java's Resolver.WriterUnion
+// (per-branch ErrorAction deferred to decode time) and fastavro's read_union —
+// see checkWriterUnion's doc for the rationale. A producer that narrowed during
+// evolution but never emits the dropped branch must update its schema first.
 func TestRegression_WriterUnionBranchMismatchFailsFast(t *testing.T) {
 	writer := MustParse(`["null","string"]`)
 	reader := MustParse(`"string"`)
@@ -8842,14 +8836,12 @@ func TestRegression_UnionResolutionPrefersExactKindOverPromotion(t *testing.T) {
 	})
 }
 
-// TestRegression_DecodeJSON_FixedLengthMismatch locks in JSON-decoder
-// length validation for fixed types. Per Avro 1.12 JSON spec, a fixed
-// value is encoded as a JSON string whose code points are the bytes
-// of the value; length must equal schema's size. Java's
-// JsonDecoder.readFixed throws when the lengths differ; fastavro
-// raises ValueError. Without the length check, the decoder would
-// silently truncate, zero-pad, or return the wrong length depending
-// on the target type.
+// TestRegression_DecodeJSON_FixedLengthMismatch locks in JSON-decoder length
+// validation for fixed types. Per Avro 1.12 JSON spec a fixed value is a JSON
+// string whose code points are the bytes of the value, so its length must equal
+// the schema's size; Java's JsonDecoder.readFixed throws when they differ and
+// fastavro raises ValueError. Without the check the decoder would silently
+// truncate, zero-pad, or return the wrong length depending on the target type.
 func TestRegression_DecodeJSON_FixedLengthMismatch(t *testing.T) {
 	schema := `{"type":"fixed","name":"F","size":4}`
 	s := MustParse(schema)
@@ -9322,11 +9314,10 @@ func TestMatrix_TimeMicrosOverflowGuardIsUniform(t *testing.T) {
 // TestDurationSubResolutionTruncatesTowardZero locks that time.Duration values
 // whose nanosecond component is not a whole multiple of the schema's resolution
 // unit are silently truncated toward zero at encode, matching
-// time.Duration.Milliseconds() and .Microseconds(). The wire format cannot
-// represent sub-resolution precision, so encode must truncate, round, or reject;
-// this implementation truncates, consistent with the standard library's integer
-// conversion methods. Locked in README §Logical Types and the serTimeMillis
-// doc-string. A whole-millisecond Duration round-trips exactly.
+// time.Duration.Milliseconds() and .Microseconds(). The wire cannot represent
+// sub-resolution precision, so encode must truncate, round, or reject; this
+// implementation truncates, as README §Logical Types and the serTimeMillis
+// doc-string record. A whole-millisecond Duration round-trips exactly.
 func TestDurationSubResolutionTruncatesTowardZero(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -9848,16 +9839,13 @@ func TestRegression_TimestampMillisMicrosUnsafeOverflow(t *testing.T) {
 	}
 }
 
-// TestMatrix_DecodeJSONLongOverflowGap locks in that JSON-encoded
-// long values exceeding int64 are rejected, not silently wrapped.
-// parseJSONInt64 uses a per-digit pre-multiply bound that's safe near
-// 2^64/9 (the boundary where the naive "n*10+d wrapped if it went
-// down" post-multiply check has a gap — n*10+d can wrap mod 2^64 to
-// a value still ≥ prev, evading detection). The 20-digit family
-// 2049638230412172402d (d ∈ 0..9) probes that boundary.
-//
-// Java: JsonParser.getLongValue throws InputCoercionException.
-// goavro: strconv.ParseInt rejects.
+// TestMatrix_DecodeJSONLongOverflowGap locks in that JSON-encoded long values
+// exceeding int64 are rejected, not silently wrapped. parseJSONInt64 uses a
+// per-digit pre-multiply bound that is safe near 2^64/9 — the boundary where the
+// naive "n*10+d wrapped if it went down" post-multiply check has a gap, since
+// n*10+d can wrap mod 2^64 to a value still ≥ prev. The 20-digit family
+// 2049638230412172402d (d ∈ 0..9) probes that boundary. Java's
+// JsonParser.getLongValue throws InputCoercionException; goavro's ParseInt rejects.
 func TestMatrix_DecodeJSONLongOverflowGap(t *testing.T) {
 	t.Run("bare long exceeding MaxInt64", func(t *testing.T) {
 		s := MustParse(`"long"`)
@@ -10033,16 +10021,15 @@ func TestRegression_DeserArraySliceBlockCountOverflow(t *testing.T) {
 	}
 }
 
-// TestRegression_TimestampMillisMinInt64 locks in that
-// timeToTimestampMillis accepts time.Time values constructed from
-// MinInt64 milliseconds since epoch. Go's time normalization makes
-// the seconds component of time.UnixMilli(MinInt64) = -maxSec - 1
-// (since the remainder is negative, normalization decrements sec by
-// 1 and adds 1e9 to nsec). We mirror Java's Instant.toEpochMilli
-// adjustment branch for sec < 0 && nsec > 0 —
-// `(sec+1)*1000 + (nsec/1e6 - 1000)` — which accepts the full int64
-// range. A naive symmetric guard `sec > maxSec || sec < -maxSec`
-// would reject sec = -maxSec - 1.
+// TestRegression_TimestampMillisMinInt64 locks in that timeToTimestampMillis
+// accepts time.Time values constructed from MinInt64 milliseconds since epoch.
+// Go's time normalization makes the seconds component of
+// time.UnixMilli(MinInt64) = -maxSec - 1 (the remainder being negative,
+// normalization decrements sec and adds 1e9 to nsec), so we mirror Java's
+// Instant.toEpochMilli adjustment branch for sec < 0 && nsec > 0 —
+// `(sec+1)*1000 + (nsec/1e6 - 1000)` — which accepts the full int64 range. A
+// naive symmetric guard `sec > maxSec || sec < -maxSec` would reject
+// sec = -maxSec - 1.
 func TestRegression_TimestampMillisMinInt64(t *testing.T) {
 	in := time.UnixMilli(math.MinInt64).UTC()
 	type R struct {
@@ -10330,10 +10317,9 @@ func TestMatrix_EncodeJSONNullParity(t *testing.T) {
 // to the **T-with-nil-inner shape: a non-nil outer pointer whose Elem() is a nil
 // pointer, with or without an enclosing any{} wrapper. The 2-branch [null,T]
 // optimization works via isNilValue, which peels both Pointer and Interface, but
-// the prior serNull peeled only Interface, so the outer Pointer's IsNil()==false
-// reached the kind switch and errNonNil came back. JSON's appendAvroJSON
-// indirect loop already peeled both, so JSON succeeded — a binary/JSON
-// asymmetry. The fix extends serNull's peel loop to reflect.Pointer.
+// serNull peeled only Interface, so the outer Pointer's IsNil()==false reached
+// the kind switch and errNonNil came back — while JSON's appendAvroJSON indirect
+// loop already peeled both and succeeded, a binary/JSON asymmetry.
 func TestMatrix_EncodeJSONNullParityPointerToNilPointer(t *testing.T) {
 	nilIntPtrPtr := func() any { var p *int; return &p }
 	nilMapPtrPtr := func() any { var p *map[string]any; return &p }
@@ -10977,11 +10963,9 @@ func TestRegression_MapDecodeBucketAmplificationDoS(t *testing.T) {
 // per-item minimum, not the reader's resolved item size — the wire was produced
 // by the writer, so its minimum is what the bound must use. Using the reader's
 // resolved node would reject array<int> writer → array<double> reader on a valid
-// 18-byte stream of 16 small ints, because the reader's min is 8 bytes.
-// resolveMap uses the same writer-min rule.
-//
-// Java, fastavro and avro-rs all decode promoted arrays with no per-block
-// count-times-item-size check at all.
+// 18-byte stream of 16 small ints, because the reader's min is 8 bytes;
+// resolveMap uses the same writer-min rule. Java, fastavro and avro-rs all
+// decode promoted arrays with no per-block count-times-item-size check at all.
 func TestRegression_ResolveArrayPromotion_MinItemBytesBoundTooStrict(t *testing.T) {
 	w := MustParse(`{"type":"array","items":"int"}`)
 	r := MustParse(`{"type":"array","items":"double"}`)
@@ -13717,15 +13701,14 @@ func TestResolveFullyQualifiedAlias(t *testing.T) {
 	}
 }
 
-// A namespace-qualified alias names exactly that fullname — spec "Aliases":
-// if a type named "a.b" has aliases of "c" and "x.y", the fully qualified
-// names of its aliases are "a.c" and "x.y". It must not match a
-// same-short-name type in a DIFFERENT namespace. Java rewrites writer names
-// through a fullname-keyed alias map (Schema.applyAliases); fastavro
-// matches the writer's fullname or bare short name against the alias
-// strings as written (match_schemas); both reject this pair. Only an alias
-// declared WITHOUT a dot short-matches across namespaces (fastavro's
-// raw-string tier, executed; Java is stricter and fullname-only).
+// A namespace-qualified alias names exactly that fullname — spec "Aliases": if a
+// type named "a.b" has aliases "c" and "x.y", their fully qualified names are
+// "a.c" and "x.y". It must not match a same-short-name type in a DIFFERENT
+// namespace: Java rewrites writer names through a fullname-keyed alias map
+// (Schema.applyAliases) and fastavro matches the writer's fullname or bare short
+// name against the alias strings as written (match_schemas), and both reject this
+// pair. Only an alias declared WITHOUT a dot short-matches across namespaces
+// (fastavro's raw-string tier, executed; Java is fullname-only).
 func TestResolveQualifiedAliasIsNamespaceScoped(t *testing.T) {
 	writer := MustParse(`{"type":"record","name":"n2.Old","fields":[{"name":"a","type":"int"}]}`)
 	reader := MustParse(`{"type":"record","name":"n1.New","aliases":["n1.Old"],"fields":[{"name":"a","type":"int"}]}`)
@@ -17691,15 +17674,13 @@ func TestRegression_SchemaNodePropsUnmarshalableValueNamedError(t *testing.T) {
 
 // ---------- hidden_state_census_test.go ----------
 
-// Hidden state on a user-composable public struct is a correctness hazard:
-// a caller who sets an exported field expects that field to decide the
-// outcome, so unexported state must never silently win over it. A struct is
-// "user-composable" only if it has exported fields a caller sets; the rest
-// carry unexported state that no caller can contradict.
-//
-// This census freezes the enumeration. When a new exported struct gains both
-// exported fields and unexported state, this test fails and forces the same
-// analysis rather than letting the hazard land unexamined.
+// Hidden state on a user-composable public struct is a correctness hazard: a
+// caller who sets an exported field expects that field to decide the outcome, so
+// unexported state must never silently win over it. A struct is
+// "user-composable" only if it has exported fields a caller sets; the rest carry
+// unexported state no caller can contradict. This census freezes the
+// enumeration, so a new exported struct gaining both fails here and forces the
+// same analysis rather than letting the hazard land unexamined.
 
 type myMillis int64
 
@@ -17787,12 +17768,11 @@ func TestInvariant_CustomTypeHiddenStateFailsLoud(t *testing.T) {
 // presence flags cannot win over a caller. They differ in kind from refTarget,
 // which selects a DEFINITION and so could substitute one schema for another: a
 // presence flag decides only whether an attribute whose value is the field's own
-// zero is written at all, never which value. So for every value a caller can
-// set, the value that comes back is the value they set, flag set and flag clear
-// — proved over both a node extracted from a parse and the same node
-// hand-composed, including the case a caller cannot otherwise reach, clearing
-// the field to "". Wire, canonical form and fingerprint must be identical across
-// the pair as well.
+// zero is written at all, never which value. So for every value a caller can set,
+// the value that comes back is the value they set, flag set and flag clear —
+// proved over a node extracted from a parse and the same node hand-composed,
+// including the case a caller cannot otherwise reach, clearing the field to "".
+// Wire, canonical form and fingerprint must be identical across the pair too.
 func TestInvariant_PresenceStateIsValueTransparent(t *testing.T) {
 	// extracted carries every presence flag set; composed carries none.
 	extracted := MustParse(`{"type":"record","name":"R","doc":"","fields":[` +
